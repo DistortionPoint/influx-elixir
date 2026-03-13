@@ -1,0 +1,1033 @@
+defmodule InfluxElixir.Client.Local do
+  @moduledoc """
+  In-memory InfluxDB client for fast testing.
+
+  Stores data in ETS tables, enabling safe `async: true` tests with full
+  isolation between test instances. Each call to `start/1` creates an
+  independent ETS table.
+
+  Parses real line protocol on write, stores points as maps, and responds
+  with realistic InfluxDB response formats on query.
+
+  ## Usage
+
+      setup do
+        {:ok, conn} = InfluxElixir.Client.Local.start(databases: ["test_db"])
+        on_exit(fn -> InfluxElixir.Client.Local.stop(conn) end)
+        {:ok, conn: conn}
+      end
+
+  ## ETS Key Layout
+
+    * `:databases` => `MapSet.t(binary())` — set of created database names
+    * `:buckets` => `MapSet.t(binary())` — set of created bucket names
+    * `:tokens` => `[map()]` — list of token maps
+    * `{:points, database, measurement}` => `[point_map()]` — stored points
+
+  ## SQL Query Support
+
+  `query_sql/3` understands a subset of SQL:
+
+    * `SELECT * FROM measurement`
+    * `WHERE tag = 'value'` or `WHERE field > N`
+    * `ORDER BY time ASC|DESC`
+    * `LIMIT N`
+    * `$param` placeholders via `params: %{"$name" => value}` in opts
+
+  ## Gzip Decompression
+
+  If a write payload begins with gzip magic bytes (0x1F 0x8B) it is
+  automatically decompressed before line protocol parsing.
+
+  ## Timestamp Precision
+
+  Pass `precision: :nanosecond | :microsecond | :millisecond | :second`
+  in opts to normalise stored timestamps to nanoseconds.
+  """
+
+  @behaviour InfluxElixir.Client
+
+  @type point_map :: %{
+          measurement: binary(),
+          tags: %{binary() => binary()},
+          fields: %{binary() => term()},
+          timestamp: integer() | nil
+        }
+
+  @type conn :: %{
+          table: :ets.table(),
+          databases: MapSet.t(binary())
+        }
+
+  # Gzip magic bytes
+  @gzip_magic <<0x1F, 0x8B>>
+
+  # Measurement names may contain escaped spaces (e.g. "my\ measurement").
+  # This captures everything up to the first unescaped space or end-of-line.
+  @measurement_pattern ~r/(?i)SELECT\s+\*\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)/s
+
+  # ---------------------------------------------------------------------------
+  # Lifecycle
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Starts a new LocalClient instance with isolated ETS storage.
+
+  ## Options
+
+    * `:databases` - list of database names to pre-create (default: `[]`)
+
+  ## Examples
+
+      iex> {:ok, conn} = InfluxElixir.Client.Local.start(databases: ["mydb"])
+      iex> is_reference(conn.table)
+      true
+  """
+  @spec start(keyword()) :: {:ok, conn()}
+  def start(opts \\ []) do
+    table = :ets.new(:influx_local, [:set, :public])
+    # Always include "default" so writes without an explicit database: opt succeed.
+    databases =
+      opts
+      |> Keyword.get(:databases, [])
+      |> then(&["default" | &1])
+      |> MapSet.new()
+
+    :ets.insert(table, {:databases, databases})
+    :ets.insert(table, {:buckets, MapSet.new()})
+    :ets.insert(table, {:tokens, []})
+
+    conn = %{table: table, databases: databases}
+    {:ok, conn}
+  end
+
+  @doc """
+  Stops a LocalClient instance and cleans up its ETS table.
+
+  Safe to call multiple times; a no-op if the table is already deleted.
+  """
+  @spec stop(conn()) :: :ok
+  def stop(%{table: table}) do
+    if :ets.info(table) != :undefined do
+      :ets.delete(table)
+    end
+
+    :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Write
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Parses line protocol binary and stores the resulting points in ETS.
+
+  The `database` is read from `opts[:database]`. If the database does not
+  exist an `{:error, %{status: 404, body: ...}}` is returned. If line protocol
+  cannot be parsed an `{:error, %{status: 400, body: ...}}` is returned.
+
+  Payloads beginning with gzip magic bytes are automatically decompressed.
+  Pass `precision: :nanosecond | :microsecond | :millisecond | :second` to
+  control how numeric timestamps are interpreted (default: `:nanosecond`).
+  """
+  @impl true
+  @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
+          InfluxElixir.Client.write_result()
+  def write(%{table: table} = _conn, payload, opts \\ []) do
+    database = Keyword.get(opts, :database, "default")
+    precision = Keyword.get(opts, :precision, :nanosecond)
+
+    with {:ok, text} <- maybe_decompress(payload),
+         :ok <- assert_database_exists(table, database),
+         {:ok, points} <- parse_line_protocol(text, precision) do
+      Enum.each(points, &store_point(table, database, &1))
+      {:ok, :written}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SQL Query
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Executes a SQL-like query against stored ETS points and returns rows.
+
+  Supports:
+
+    * `SELECT * FROM measurement`
+    * `WHERE key = 'value'` / `WHERE key > N` / `WHERE key < N`
+    * `ORDER BY time ASC|DESC`
+    * `LIMIT N`
+    * `$param` placeholder substitution via `params: %{"$name" => value}`
+  """
+  @impl true
+  @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
+          InfluxElixir.Client.query_result()
+  def query_sql(%{table: table}, sql, opts \\ []) do
+    params = Keyword.get(opts, :params, %{})
+    resolved_sql = resolve_params(sql, params)
+
+    case parse_select(resolved_sql) do
+      {:ok, query} -> {:ok, execute_query(table, query)}
+      {:error, _reason} = err -> err
+    end
+  end
+
+  @doc """
+  Executes a SQL query and returns results as a lazy `Stream`.
+
+  Delegates to `query_sql/3` then wraps the list in a stream.
+  """
+  @impl true
+  @spec query_sql_stream(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: Enumerable.t()
+  def query_sql_stream(conn, sql, opts \\ []) do
+    case query_sql(conn, sql, opts) do
+      {:ok, rows} -> Stream.map(rows, & &1)
+      {:error, _reason} -> Stream.map([], & &1)
+    end
+  end
+
+  @doc """
+  Executes a raw SQL statement (e.g. `DELETE FROM measurement`) and returns
+  a summary map. In the local client this is a no-op that returns
+  `%{rows_affected: 0}`.
+  """
+  @impl true
+  @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def execute_sql(_conn, _sql, _opts \\ []) do
+    {:ok, %{rows_affected: 0}}
+  end
+
+  # ---------------------------------------------------------------------------
+  # InfluxQL / Flux queries (delegate to SQL engine)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Executes an InfluxQL query. Delegates to the same SQL engine as
+  `query_sql/3` — both query languages share the `SELECT … FROM …` form.
+  """
+  @impl true
+  @spec query_influxql(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: InfluxElixir.Client.query_result()
+  def query_influxql(conn, influxql, opts \\ []) do
+    query_sql(conn, influxql, opts)
+  end
+
+  @doc """
+  Executes a Flux query. For the local client, only the measurement name
+  embedded in `from(bucket: "…") |> …` forms is used as a lookup key;
+  all stored points for that measurement are returned.
+  """
+  @impl true
+  @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
+          InfluxElixir.Client.query_result()
+  def query_flux(%{table: table}, flux, _opts \\ []) do
+    database = extract_flux_bucket(flux)
+    measurement = extract_flux_measurement(flux)
+
+    rows =
+      case {database, measurement} do
+        {nil, _any} -> all_points(table)
+        {db, nil} -> all_points_in_db(table, db)
+        {db, m} -> fetch_points(table, db, m)
+      end
+
+    {:ok, rows}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Database admin
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Creates a named database in this local instance.
+
+  Always succeeds — creating an already-existing database is idempotent.
+  """
+  @impl true
+  @spec create_database(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: :ok | {:error, term()}
+  def create_database(%{table: table}, name, _opts \\ []) do
+    databases = get_databases(table)
+    :ets.insert(table, {:databases, MapSet.put(databases, name)})
+    :ok
+  end
+
+  @doc """
+  Returns all databases created in this local instance as a list of maps
+  with a single `:name` key.
+  """
+  @impl true
+  @spec list_databases(InfluxElixir.Client.connection()) ::
+          {:ok, [map()]} | {:error, term()}
+  def list_databases(%{table: table}) do
+    dbs =
+      table
+      |> get_databases()
+      |> Enum.map(&%{name: &1})
+
+    {:ok, dbs}
+  end
+
+  @doc """
+  Deletes a database from this local instance.
+
+  Returns `{:error, %{status: 404, body: "database not found: name"}}` if
+  the database does not exist.
+  """
+  @impl true
+  @spec delete_database(InfluxElixir.Client.connection(), binary()) ::
+          :ok | {:error, term()}
+  def delete_database(%{table: table}, name) do
+    databases = get_databases(table)
+
+    if MapSet.member?(databases, name) do
+      :ets.insert(table, {:databases, MapSet.delete(databases, name)})
+      :ok
+    else
+      {:error, %{status: 404, body: "database not found: #{name}"}}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Bucket admin (v2 compat)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Creates a named bucket in this local instance.
+
+  Creating an already-existing bucket is idempotent.
+  """
+  @impl true
+  @spec create_bucket(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: :ok | {:error, term()}
+  def create_bucket(%{table: table}, name, _opts \\ []) do
+    buckets = get_buckets(table)
+    :ets.insert(table, {:buckets, MapSet.put(buckets, name)})
+    :ok
+  end
+
+  @doc """
+  Returns all buckets in this local instance as a list of maps with a
+  single `:name` key.
+  """
+  @impl true
+  @spec list_buckets(InfluxElixir.Client.connection()) ::
+          {:ok, [map()]} | {:error, term()}
+  def list_buckets(%{table: table}) do
+    bkts =
+      table
+      |> get_buckets()
+      |> Enum.map(&%{name: &1})
+
+    {:ok, bkts}
+  end
+
+  @doc """
+  Deletes a bucket from this local instance.
+
+  Returns `:ok` whether or not the bucket exists, matching the idempotent
+  delete semantics of the v2 API.
+  """
+  @impl true
+  @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
+          :ok | {:error, term()}
+  def delete_bucket(%{table: table}, name) do
+    buckets = get_buckets(table)
+    :ets.insert(table, {:buckets, MapSet.delete(buckets, name)})
+    :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Token admin
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Creates a synthetic API token and stores it in ETS.
+
+  Returns `{:ok, %{id: id, token: token_string, description: desc}}`.
+  """
+  @impl true
+  @spec create_token(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: {:ok, map()} | {:error, term()}
+  def create_token(%{table: table}, description, _opts \\ []) do
+    id = generate_id()
+    token_string = "local-token-#{id}"
+    token = %{id: id, token: token_string, description: description}
+    tokens = get_tokens(table)
+    :ets.insert(table, {:tokens, [token | tokens]})
+    {:ok, token}
+  end
+
+  @doc """
+  Deletes a token by its `id` field. Returns `:ok` even if the token was
+  not found, matching real InfluxDB delete semantics.
+  """
+  @impl true
+  @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
+          :ok | {:error, term()}
+  def delete_token(%{table: table}, token_id) do
+    tokens = get_tokens(table)
+    updated = Enum.reject(tokens, &(&1.id == token_id))
+    :ets.insert(table, {:tokens, updated})
+    :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Health
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Returns a passing health status map.
+  """
+  @impl true
+  @spec health(InfluxElixir.Client.connection()) ::
+          {:ok, map()} | {:error, term()}
+  def health(_conn) do
+    {:ok, %{status: "pass"}}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private — ETS helpers
+  # ---------------------------------------------------------------------------
+
+  @spec get_databases(:ets.table()) :: MapSet.t(binary())
+  defp get_databases(table) do
+    case :ets.lookup(table, :databases) do
+      [{:databases, dbs}] -> dbs
+      [] -> MapSet.new()
+    end
+  end
+
+  @spec get_buckets(:ets.table()) :: MapSet.t(binary())
+  defp get_buckets(table) do
+    case :ets.lookup(table, :buckets) do
+      [{:buckets, bkts}] -> bkts
+      [] -> MapSet.new()
+    end
+  end
+
+  @spec get_tokens(:ets.table()) :: [map()]
+  defp get_tokens(table) do
+    case :ets.lookup(table, :tokens) do
+      [{:tokens, ts}] -> ts
+      [] -> []
+    end
+  end
+
+  @spec assert_database_exists(:ets.table(), binary()) :: :ok | {:error, map()}
+  defp assert_database_exists(table, database) do
+    databases = get_databases(table)
+
+    if MapSet.member?(databases, database) do
+      :ok
+    else
+      {:error, %{status: 404, body: "database not found: #{database}"}}
+    end
+  end
+
+  @spec store_point(:ets.table(), binary(), point_map()) :: true
+  defp store_point(table, database, point) do
+    key = {:points, database, point.measurement}
+
+    existing =
+      case :ets.lookup(table, key) do
+        [{^key, pts}] -> pts
+        [] -> []
+      end
+
+    :ets.insert(table, {key, [point | existing]})
+  end
+
+  @spec fetch_points(:ets.table(), binary(), binary()) :: [point_map()]
+  defp fetch_points(table, database, measurement) do
+    key = {:points, database, measurement}
+
+    case :ets.lookup(table, key) do
+      [{^key, pts}] -> pts
+      [] -> []
+    end
+  end
+
+  @spec all_points_in_db(:ets.table(), binary()) :: [point_map()]
+  defp all_points_in_db(table, database) do
+    :ets.match_object(table, {{:points, database, :_}, :_})
+    |> Enum.flat_map(fn {_key, pts} -> pts end)
+  end
+
+  @spec all_points(:ets.table()) :: [point_map()]
+  defp all_points(table) do
+    :ets.match_object(table, {{:points, :_, :_}, :_})
+    |> Enum.flat_map(fn {_key, pts} -> pts end)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private — gzip decompression
+  # ---------------------------------------------------------------------------
+
+  @spec maybe_decompress(binary()) :: {:ok, binary()} | {:error, map()}
+  defp maybe_decompress(<<@gzip_magic, _rest::binary>> = compressed) do
+    {:ok, :zlib.gunzip(compressed)}
+  rescue
+    _err -> {:error, %{status: 400, body: "invalid gzip payload"}}
+  end
+
+  defp maybe_decompress(plain), do: {:ok, plain}
+
+  # ---------------------------------------------------------------------------
+  # Private — line protocol parser
+  # ---------------------------------------------------------------------------
+
+  @spec parse_line_protocol(binary(), atom()) ::
+          {:ok, [point_map()]} | {:error, map()}
+  defp parse_line_protocol(text, precision) do
+    lines =
+      text
+      |> String.split("\n")
+      |> Enum.reject(&(String.trim(&1) == "" or String.starts_with?(&1, "#")))
+
+    lines
+    |> Enum.reduce_while({:ok, []}, fn line, {:ok, acc} ->
+      case parse_line(line, precision) do
+        {:ok, point} -> {:cont, {:ok, [point | acc]}}
+        {:error, _reason} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      {:ok, pts} -> {:ok, Enum.reverse(pts)}
+      {:error, _reason} = err -> err
+    end
+  end
+
+  # Parses a single line protocol line into a point map.
+  #
+  # Format: measurement[,tag=val...] field=val[,...] [timestamp]
+  @spec parse_line(binary(), atom()) :: {:ok, point_map()} | {:error, map()}
+  defp parse_line(line, precision) do
+    case split_line_parts(line) do
+      [key_part, fields_part | rest] ->
+        ts_raw = List.first(rest)
+
+        with {:ok, {measurement, tags}} <- parse_key_part(key_part),
+             {:ok, fields} <- parse_fields_part(fields_part),
+             {:ok, timestamp} <- parse_timestamp(ts_raw, precision) do
+          {:ok,
+           %{
+             measurement: measurement,
+             tags: tags,
+             fields: fields,
+             timestamp: timestamp
+           }}
+        end
+
+      _parts ->
+        {:error, %{status: 400, body: "invalid line protocol: #{line}"}}
+    end
+  end
+
+  # Splits a line into [key_part, fields_part, optional_timestamp] by
+  # unescaped spaces that are not inside double-quoted strings.
+  @spec split_line_parts(binary()) :: [binary()]
+  defp split_line_parts(line) do
+    do_lp_split(line, [], [], false)
+  end
+
+  # End of input — flush remaining token.
+  defp do_lp_split(<<>>, current, acc, _in_quotes) do
+    token = current |> Enum.reverse() |> IO.iodata_to_binary()
+    Enum.reverse([token | acc])
+  end
+
+  # Escaped backslash — keep both chars, quote state unchanged.
+  defp do_lp_split(<<"\\\\", rest::binary>>, current, acc, in_quotes) do
+    do_lp_split(rest, ["\\", "\\" | current], acc, in_quotes)
+  end
+
+  # Escaped double-quote — keep both chars, do not toggle quote state.
+  defp do_lp_split(<<"\\\"", rest::binary>>, current, acc, in_quotes) do
+    do_lp_split(rest, ["\"", "\\" | current], acc, in_quotes)
+  end
+
+  # Escaped space outside quotes — keep both chars, no split.
+  defp do_lp_split(<<"\\ ", rest::binary>>, current, acc, false) do
+    do_lp_split(rest, [" ", "\\" | current], acc, false)
+  end
+
+  # Unescaped double-quote — toggle in_quotes flag.
+  defp do_lp_split(<<"\"", rest::binary>>, current, acc, in_quotes) do
+    do_lp_split(rest, ["\"" | current], acc, !in_quotes)
+  end
+
+  # Unescaped space outside a quoted string — emit token.
+  defp do_lp_split(<<" ", rest::binary>>, current, acc, false) do
+    token = current |> Enum.reverse() |> IO.iodata_to_binary()
+    do_lp_split(rest, [], [token | acc], false)
+  end
+
+  # All other characters — accumulate.
+  defp do_lp_split(<<c::binary-size(1), rest::binary>>, current, acc, in_quotes) do
+    do_lp_split(rest, [c | current], acc, in_quotes)
+  end
+
+  # Parses the "measurement[,tag=val...]" part.
+  @spec parse_key_part(binary()) :: {:ok, {binary(), map()}} | {:error, map()}
+  defp parse_key_part(key_part) do
+    case split_first_unescaped_comma(key_part) do
+      {measurement_raw, ""} ->
+        {:ok, {unescape_measurement(measurement_raw), %{}}}
+
+      {measurement_raw, tags_raw} ->
+        with {:ok, tags} <- parse_tags(tags_raw) do
+          {:ok, {unescape_measurement(measurement_raw), tags}}
+        end
+    end
+  end
+
+  # Splits at the first unescaped comma.
+  @spec split_first_unescaped_comma(binary()) :: {binary(), binary()}
+  defp split_first_unescaped_comma(str) do
+    do_split_comma(str, [])
+  end
+
+  defp do_split_comma(<<>>, acc) do
+    {acc |> Enum.reverse() |> IO.iodata_to_binary(), ""}
+  end
+
+  defp do_split_comma(<<"\\,", rest::binary>>, acc) do
+    do_split_comma(rest, [",", "\\" | acc])
+  end
+
+  defp do_split_comma(<<",", rest::binary>>, acc) do
+    left = acc |> Enum.reverse() |> IO.iodata_to_binary()
+    {left, rest}
+  end
+
+  defp do_split_comma(<<c::binary-size(1), rest::binary>>, acc) do
+    do_split_comma(rest, [c | acc])
+  end
+
+  # Parses "tag1=v1,tag2=v2,..." into a map.
+  @spec parse_tags(binary()) :: {:ok, map()} | {:error, map()}
+  defp parse_tags(tags_str) do
+    pairs = split_unescaped_comma(tags_str)
+
+    Enum.reduce_while(pairs, {:ok, %{}}, fn pair, {:ok, acc} ->
+      case split_first_unescaped_equals(pair) do
+        {k, v} when k != "" and v != "" ->
+          {:cont, {:ok, Map.put(acc, unescape_tag(k), unescape_tag(v))}}
+
+        _invalid ->
+          {:halt, {:error, %{status: 400, body: "invalid tag pair: #{pair}"}}}
+      end
+    end)
+  end
+
+  # Parses the "field=val[,...]" section.
+  @spec parse_fields_part(binary()) :: {:ok, map()} | {:error, map()}
+  defp parse_fields_part(fields_str) do
+    pairs = split_unescaped_comma(fields_str)
+
+    Enum.reduce_while(pairs, {:ok, %{}}, fn pair, {:ok, acc} ->
+      case split_first_unescaped_equals(pair) do
+        {k, v} when k != "" and v != "" ->
+          case parse_field_value(v) do
+            {:ok, typed} -> {:cont, {:ok, Map.put(acc, unescape_tag(k), typed)}}
+            {:error, _reason} = err -> {:halt, err}
+          end
+
+        _invalid ->
+          {:halt, {:error, %{status: 400, body: "invalid field pair: #{pair}"}}}
+      end
+    end)
+  end
+
+  # Splits a CSV-like string on unescaped commas, respecting quoted strings.
+  @spec split_unescaped_comma(binary()) :: [binary()]
+  defp split_unescaped_comma(str) do
+    do_csv_split(str, [], [], false)
+  end
+
+  defp do_csv_split(<<>>, current, acc, _in_quotes) do
+    token = current |> Enum.reverse() |> IO.iodata_to_binary()
+    Enum.reverse([token | acc])
+  end
+
+  defp do_csv_split(<<"\\\"", rest::binary>>, current, acc, in_quotes) do
+    do_csv_split(rest, ["\"", "\\" | current], acc, in_quotes)
+  end
+
+  defp do_csv_split(<<"\"", rest::binary>>, current, acc, in_quotes) do
+    do_csv_split(rest, ["\"" | current], acc, !in_quotes)
+  end
+
+  defp do_csv_split(<<"\\,", rest::binary>>, current, acc, in_quotes) do
+    do_csv_split(rest, [",", "\\" | current], acc, in_quotes)
+  end
+
+  defp do_csv_split(<<",", rest::binary>>, current, acc, false) do
+    token = current |> Enum.reverse() |> IO.iodata_to_binary()
+    do_csv_split(rest, [], [token | acc], false)
+  end
+
+  defp do_csv_split(<<c::binary-size(1), rest::binary>>, current, acc, in_quotes) do
+    do_csv_split(rest, [c | current], acc, in_quotes)
+  end
+
+  # Splits at the first unescaped = sign.
+  @spec split_first_unescaped_equals(binary()) :: {binary(), binary()}
+  defp split_first_unescaped_equals(str) do
+    do_split_eq(str, [])
+  end
+
+  defp do_split_eq(<<>>, acc) do
+    {acc |> Enum.reverse() |> IO.iodata_to_binary(), ""}
+  end
+
+  defp do_split_eq(<<"\\=", rest::binary>>, acc) do
+    do_split_eq(rest, ["=", "\\" | acc])
+  end
+
+  defp do_split_eq(<<"=", rest::binary>>, acc) do
+    left = acc |> Enum.reverse() |> IO.iodata_to_binary()
+    {left, rest}
+  end
+
+  defp do_split_eq(<<c::binary-size(1), rest::binary>>, acc) do
+    do_split_eq(rest, [c | acc])
+  end
+
+  # Parses a field value string into its typed Elixir equivalent.
+  @spec parse_field_value(binary()) :: {:ok, term()} | {:error, map()}
+  defp parse_field_value(str) do
+    cond do
+      String.ends_with?(str, "i") ->
+        case Integer.parse(String.slice(str, 0..-2//1)) do
+          {n, ""} -> {:ok, n}
+          _err -> {:error, %{status: 400, body: "invalid integer field: #{str}"}}
+        end
+
+      String.starts_with?(str, "\"") and String.ends_with?(str, "\"") ->
+        inner =
+          str
+          |> String.slice(1..-2//1)
+          |> String.replace("\\\"", "\"")
+          |> String.replace("\\\\", "\\")
+
+        {:ok, inner}
+
+      str in ["true", "True", "TRUE"] ->
+        {:ok, true}
+
+      str in ["false", "False", "FALSE"] ->
+        {:ok, false}
+
+      true ->
+        case Float.parse(str) do
+          {f, ""} -> {:ok, f}
+          _err -> {:error, %{status: 400, body: "invalid field value: #{str}"}}
+        end
+    end
+  end
+
+  # Parses a raw timestamp string, normalising to nanoseconds.
+  @spec parse_timestamp(binary() | nil, atom()) ::
+          {:ok, integer() | nil} | {:error, map()}
+  defp parse_timestamp(nil, _prec), do: {:ok, nil}
+  defp parse_timestamp("", _prec), do: {:ok, nil}
+
+  defp parse_timestamp(ts_str, precision) do
+    case Integer.parse(ts_str) do
+      {ts, ""} -> {:ok, to_nanoseconds(ts, precision)}
+      _err -> {:error, %{status: 400, body: "invalid timestamp: #{ts_str}"}}
+    end
+  end
+
+  @spec to_nanoseconds(integer(), atom()) :: integer()
+  defp to_nanoseconds(ts, :nanosecond), do: ts
+  defp to_nanoseconds(ts, :microsecond), do: ts * 1_000
+  defp to_nanoseconds(ts, :millisecond), do: ts * 1_000_000
+  defp to_nanoseconds(ts, :second), do: ts * 1_000_000_000
+
+  # Unescape a measurement name (backslash, comma, space).
+  @spec unescape_measurement(binary()) :: binary()
+  defp unescape_measurement(str) do
+    str
+    |> String.replace("\\ ", " ")
+    |> String.replace("\\,", ",")
+    |> String.replace("\\\\", "\\")
+  end
+
+  # Unescape a tag key or value (backslash, comma, equals, space).
+  @spec unescape_tag(binary()) :: binary()
+  defp unescape_tag(str) do
+    str
+    |> String.replace("\\ ", " ")
+    |> String.replace("\\,", ",")
+    |> String.replace("\\=", "=")
+    |> String.replace("\\\\", "\\")
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private — SQL query engine
+  # ---------------------------------------------------------------------------
+
+  @type parsed_query :: %{
+          measurement: binary(),
+          where: [{:eq | :gt | :lt | :gte | :lte | :ne, binary(), term()}],
+          order_by: {:time, :asc | :desc} | nil,
+          limit: pos_integer() | nil
+        }
+
+  @spec parse_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
+  defp parse_select(sql) do
+    normalised = String.trim(sql)
+
+    case Regex.run(@measurement_pattern, normalised) do
+      [_full_match, measurement_raw, rest] ->
+        measurement = unescape_measurement(measurement_raw)
+
+        {:ok,
+         %{
+           measurement: measurement,
+           where: parse_where(rest),
+           order_by: parse_order_by(rest),
+           limit: parse_limit(rest)
+         }}
+
+      _no_match ->
+        {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
+    end
+  end
+
+  @spec parse_where(binary()) :: [{atom(), binary(), term()}]
+  defp parse_where(rest) do
+    case Regex.run(~r/(?i)WHERE\s+(.+?)(?:\s+ORDER|\s+LIMIT|$)/s, rest) do
+      [_full_match, clauses_str] -> parse_where_clauses(clauses_str)
+      _no_match -> []
+    end
+  end
+
+  @spec parse_where_clauses(binary()) :: [{atom(), binary(), term()}]
+  defp parse_where_clauses(str) do
+    str
+    |> String.split(~r/\s+AND\s+/i)
+    |> Enum.flat_map(&parse_single_where_clause/1)
+  end
+
+  @spec parse_single_where_clause(binary()) :: [{atom(), binary(), term()}]
+  defp parse_single_where_clause(clause) do
+    trimmed = String.trim(clause)
+
+    # Multi-char operators must be tried before their single-char prefixes.
+    operators = [{">=", :gte}, {"<=", :lte}, {"!=", :ne}, {">", :gt}, {"<", :lt}, {"=", :eq}]
+
+    result =
+      Enum.find_value(operators, fn {op_str, op_atom} ->
+        case String.split(trimmed, op_str, parts: 2) do
+          [left, right] when left != trimmed ->
+            k = String.trim(left)
+            v = parse_where_value(String.trim(right))
+            {op_atom, k, v}
+
+          _no_match ->
+            nil
+        end
+      end)
+
+    case result do
+      nil -> []
+      condition -> [condition]
+    end
+  end
+
+  @spec parse_where_value(binary()) :: term()
+  defp parse_where_value(str) do
+    cond do
+      String.starts_with?(str, "'") and String.ends_with?(str, "'") ->
+        String.slice(str, 1..-2//1)
+
+      String.starts_with?(str, "\"") and String.ends_with?(str, "\"") ->
+        String.slice(str, 1..-2//1)
+
+      str == "true" ->
+        true
+
+      str == "false" ->
+        false
+
+      true ->
+        case Integer.parse(str) do
+          {n, ""} ->
+            n
+
+          _no_int ->
+            case Float.parse(str) do
+              {f, ""} -> f
+              _no_parse -> str
+            end
+        end
+    end
+  end
+
+  @spec parse_order_by(binary()) :: {:time, :asc | :desc} | nil
+  defp parse_order_by(rest) do
+    case Regex.run(~r/(?i)ORDER\s+BY\s+time\s+(ASC|DESC)/s, rest) do
+      [_full_match, direction] ->
+        case String.upcase(direction) do
+          "ASC" -> {:time, :asc}
+          "DESC" -> {:time, :desc}
+          _other -> nil
+        end
+
+      _no_match ->
+        nil
+    end
+  end
+
+  @spec parse_limit(binary()) :: pos_integer() | nil
+  defp parse_limit(rest) do
+    case Regex.run(~r/(?i)LIMIT\s+(\d+)/s, rest) do
+      [_full_match, n_str] ->
+        case Integer.parse(n_str) do
+          {n, ""} when n > 0 -> n
+          _bad_n -> nil
+        end
+
+      _no_match ->
+        nil
+    end
+  end
+
+  @spec execute_query(:ets.table(), parsed_query()) :: [map()]
+  defp execute_query(table, %{measurement: m} = query) do
+    points =
+      :ets.match_object(table, {{:points, :_, m}, :_})
+      |> Enum.flat_map(fn {_key, pts} -> pts end)
+
+    points
+    |> apply_where(query.where)
+    |> apply_order_by(query.order_by)
+    |> apply_limit(query.limit)
+    |> Enum.map(&point_to_row/1)
+  end
+
+  @spec apply_where([point_map()], [{atom(), binary(), term()}]) :: [point_map()]
+  defp apply_where(points, []), do: points
+
+  defp apply_where(points, conditions) do
+    Enum.filter(points, fn point ->
+      Enum.all?(conditions, &matches_condition?(point, &1))
+    end)
+  end
+
+  @spec matches_condition?(point_map(), {atom(), binary(), term()}) :: boolean()
+  defp matches_condition?(point, {op, key, value}) do
+    actual = Map.get(point.tags, key) || Map.get(point.fields, key)
+    compare(actual, op, value)
+  end
+
+  @spec compare(term(), atom(), term()) :: boolean()
+  defp compare(nil, _op, _value), do: false
+  defp compare(actual, :eq, value), do: actual == value
+  defp compare(actual, :ne, value), do: actual != value
+  defp compare(actual, :gt, value), do: actual > value
+  defp compare(actual, :lt, value), do: actual < value
+  defp compare(actual, :gte, value), do: actual >= value
+  defp compare(actual, :lte, value), do: actual <= value
+
+  @spec apply_order_by([point_map()], {:time, :asc | :desc} | nil) :: [point_map()]
+  defp apply_order_by(points, nil), do: points
+
+  defp apply_order_by(points, {:time, :asc}) do
+    Enum.sort_by(points, & &1.timestamp)
+  end
+
+  defp apply_order_by(points, {:time, :desc}) do
+    Enum.sort_by(points, & &1.timestamp, :desc)
+  end
+
+  @spec apply_limit([point_map()], pos_integer() | nil) :: [point_map()]
+  defp apply_limit(points, nil), do: points
+  defp apply_limit(points, n), do: Enum.take(points, n)
+
+  @spec point_to_row(point_map()) :: map()
+  defp point_to_row(point) do
+    point.fields
+    |> Map.merge(point.tags)
+    |> Map.put("time", point.timestamp)
+    |> Map.put("_measurement", point.measurement)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private — Flux helpers
+  # ---------------------------------------------------------------------------
+
+  @spec extract_flux_bucket(binary()) :: binary() | nil
+  defp extract_flux_bucket(flux) do
+    case Regex.run(~r/from\s*\(\s*bucket\s*:\s*"([^"]+)"/, flux) do
+      [_full_match, bucket] -> bucket
+      _no_match -> nil
+    end
+  end
+
+  @spec extract_flux_measurement(binary()) :: binary() | nil
+  defp extract_flux_measurement(flux) do
+    pattern = ~r/filter\s*\(\s*fn\s*:\s*\(r\)\s*=>\s*r\._measurement\s*==\s*"([^"]+)"/
+
+    case Regex.run(pattern, flux) do
+      [_full_match, m] -> m
+      _no_match -> nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private — param substitution
+  # ---------------------------------------------------------------------------
+
+  @spec resolve_params(binary(), map()) :: binary()
+  defp resolve_params(sql, params) when map_size(params) == 0, do: sql
+
+  defp resolve_params(sql, params) do
+    Enum.reduce(params, sql, fn {key, value}, acc ->
+      if is_binary(key) do
+        String.replace(acc, key, to_sql_literal(value))
+      else
+        acc
+      end
+    end)
+  end
+
+  @spec to_sql_literal(term()) :: binary()
+  defp to_sql_literal(value) when is_binary(value), do: "'#{value}'"
+  defp to_sql_literal(value) when is_integer(value), do: Integer.to_string(value)
+  defp to_sql_literal(value) when is_float(value), do: Float.to_string(value)
+  defp to_sql_literal(true), do: "true"
+  defp to_sql_literal(false), do: "false"
+  defp to_sql_literal(value), do: inspect(value)
+
+  # ---------------------------------------------------------------------------
+  # Private — utilities
+  # ---------------------------------------------------------------------------
+
+  @spec generate_id() :: binary()
+  defp generate_id do
+    :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+  end
+end

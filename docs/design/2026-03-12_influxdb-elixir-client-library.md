@@ -12,130 +12,130 @@
 ## Implementation Checklist
 
 ### Phase 0: Project Bootstrap
-- [ ] 0.1 — `.tool-versions` created (Elixir 1.18.4-otp-28, Erlang 28.0.2, Node 22.17.1)
-- [ ] 0.2 — `mise install` — runtimes installed and verified
-- [ ] 0.3 — `mix new . --module InfluxElixir --sup` — project scaffolded
-- [ ] 0.4 — `mix.exs` configured (deps, aliases, hex package, usage_rules)
-- [ ] 0.5 — `.formatter.exs` configured (line_length: 98)
-- [ ] 0.6 — `.credo.exs` configured (strict mode, all checks)
-- [ ] 0.7 — `.gitignore` configured
-- [ ] 0.8 — CI pipeline (`.github/workflows/ci.yml`) — quality + publish jobs
-- [ ] 0.9 — Directory structure created with empty module stubs
-- [ ] 0.10 — `mix deps.get && mix compile` — clean compilation
-- [ ] 0.11 — `mix quality` passes (format, credo, dialyzer)
-- [ ] 0.12 — `mix test` — default test passes
-- [ ] 0.13 — `mix usage_rules.sync` — AGENTS.md generated
+- [x] 0.1 — `.tool-versions` created (Elixir 1.18.4-otp-28, Erlang 28.0.2, Node 22.17.1)
+- [x] 0.2 — `mise install` — runtimes installed and verified
+- [x] 0.3 — `mix new . --module InfluxElixir --sup` — project scaffolded
+- [x] 0.4 — `mix.exs` configured (deps, aliases, hex package, usage_rules)
+- [x] 0.5 — `.formatter.exs` configured (line_length: 98)
+- [x] 0.6 — `.credo.exs` configured (strict mode, all checks)
+- [x] 0.7 — `.gitignore` configured
+- [x] 0.8 — CI pipeline (`.github/workflows/ci.yml`) — quality + publish jobs
+- [x] 0.9 — Directory structure created with empty module stubs
+- [x] 0.10 — `mix deps.get && mix compile` — clean compilation
+- [x] 0.11 — `mix quality` passes (format, credo, dialyzer)
+- [x] 0.12 — `mix test` — default test passes
+- [x] 0.13 — `mix usage_rules.sync` — AGENTS.md generated
 
 ### Core: Client Behaviour & Adapters
-- [ ] `InfluxElixir.Client` — behaviour definition with all callbacks
-- [ ] `InfluxElixir.Client.HTTP` — Finch-based production implementation
-- [ ] `InfluxElixir.Client.Local` — ETS-backed in-memory test implementation
-- [ ] Config-driven implementation switching (`config :influx_elixir, :client`)
+- [x] `InfluxElixir.Client` — behaviour definition with all callbacks
+- [x] `InfluxElixir.Client.HTTP` — Finch-based production implementation
+- [x] `InfluxElixir.Client.Local` — ETS-backed in-memory test implementation
+- [x] Config-driven implementation switching (`config :influx_elixir, :client`)
 
 ### Core: Facade Module
-- [ ] `InfluxElixir` — public API facade, delegates to client behaviour
-- [ ] `point/3` — construct a Point struct
-- [ ] `write/2`, `write/3` — write points (via client)
-- [ ] `query_sql/2`, `query_sql/3` — SQL query (supports `transport: :http | :flight`)
-- [ ] `query_sql_stream/2`, `query_sql_stream/3` — streaming SQL query
-- [ ] `execute_sql/2`, `execute_sql/3` — non-SELECT SQL (DELETE, INSERT INTO ... SELECT)
-- [ ] `query_influxql/2`, `query_influxql/3` — InfluxQL query
-- [ ] `query_flux/2` — v2 Flux compat
-- [ ] `create_database/2`, `list_databases/1`, `delete_database/2` — v3 admin
-- [ ] `create_bucket/2`, `list_buckets/1`, `delete_bucket/2` — v2 admin
-- [ ] `create_token/2`, `delete_token/2` — v3 token management
-- [ ] `health/1` — health check
-- [ ] `flush/1` — force batch writer flush
-- [ ] `stats/1` — batch writer statistics
-- [ ] `add_connection/2`, `remove_connection/1` — dynamic connection management
+- [x] `InfluxElixir` — public API facade, delegates to client behaviour
+- [x] `point/3` — construct a Point struct
+- [x] `write/2`, `write/3` — write points (via client)
+- [x] `query_sql/2`, `query_sql/3` — SQL query (supports `transport: :http | :flight`)
+- [x] `query_sql_stream/2`, `query_sql_stream/3` — streaming SQL query
+- [x] `execute_sql/2`, `execute_sql/3` — non-SELECT SQL (DELETE, INSERT INTO ... SELECT)
+- [x] `query_influxql/2`, `query_influxql/3` — InfluxQL query
+- [x] `query_flux/2` — v2 Flux compat
+- [x] `create_database/2`, `list_databases/1`, `delete_database/2` — v3 admin
+- [x] `create_bucket/2`, `list_buckets/1`, `delete_bucket/2` — v2 admin
+- [x] `create_token/2`, `delete_token/2` — v3 token management
+- [x] `health/1` — health check
+- [x] `flush/1` — force batch writer flush
+- [x] `stats/1` — batch writer statistics
+- [x] `add_connection/2`, `remove_connection/1` — dynamic connection management
 
 ### Supervision Tree
-- [ ] `InfluxElixir.Application` — OTP Application entry point
-- [ ] `InfluxElixir.Supervisor` — top-level `:one_for_one` (manages ConnectionSupervisors)
-- [ ] `InfluxElixir.ConnectionSupervisor` — per-connection `:rest_for_one` (Finch pool + BatchWriters)
-- [ ] Dynamic connection add/remove via `Supervisor.start_child/2`
-- [ ] Crash isolation verified: connection crash does not affect siblings
+- [x] `InfluxElixir.Application` — OTP Application entry point
+- [x] `InfluxElixir.Supervisor` — top-level `:one_for_one` (manages ConnectionSupervisors)
+- [x] `InfluxElixir.ConnectionSupervisor` — per-connection `:rest_for_one` (Finch pool + BatchWriters)
+- [x] Dynamic connection add/remove via `Supervisor.start_child/2`
+- [x] Crash isolation verified: connection crash does not affect siblings
 
 ### Write Path
-- [ ] `InfluxElixir.Write.Point` — Point struct (measurement, tags, fields, timestamp)
-- [ ] `InfluxElixir.Write.LineProtocol` — line protocol encoder
-  - [ ] Tag sorting (lexicographic by key)
-  - [ ] Field type encoding (integer `i` suffix, quoted strings, booleans)
-  - [ ] Escaping (spaces, commas, equals in keys/values)
-  - [ ] Multi-point newline delimiters
-  - [ ] Gzip when payload > 1KB
-  - [ ] Large integer fidelity (> 2^53 round-trip)
-- [ ] `InfluxElixir.Write.Writer` — direct single-request write
-- [ ] `InfluxElixir.Write.BatchWriter` — GenServer batch writer
-  - [ ] Configurable batch_size, flush_interval_ms, jitter_ms
-  - [ ] Dual flush triggers (batch size OR timer)
-  - [ ] Retry with exponential backoff + jitter (5xx/network only, not 4xx)
-  - [ ] Backpressure handling (bounded buffer)
-  - [ ] `no_sync` per-write override
-  - [ ] Hibernation after flush (memory optimization)
-  - [ ] Stats tracking (total writes, errors, bytes)
+- [x] `InfluxElixir.Write.Point` — Point struct (measurement, tags, fields, timestamp)
+- [x] `InfluxElixir.Write.LineProtocol` — line protocol encoder
+  - [x] Tag sorting (lexicographic by key)
+  - [x] Field type encoding (integer `i` suffix, quoted strings, booleans)
+  - [x] Escaping (spaces, commas, equals in keys/values)
+  - [x] Multi-point newline delimiters
+  - [x] Gzip when payload > 1KB
+  - [x] Large integer fidelity (> 2^53 round-trip)
+- [x] `InfluxElixir.Write.Writer` — direct single-request write
+- [x] `InfluxElixir.Write.BatchWriter` — GenServer batch writer
+  - [x] Configurable batch_size, flush_interval_ms, jitter_ms
+  - [x] Dual flush triggers (batch size OR timer)
+  - [x] Retry with exponential backoff + jitter (5xx/network only, not 4xx)
+  - [x] Backpressure handling (bounded buffer)
+  - [x] `no_sync` per-write override
+  - [x] Hibernation after flush (memory optimization)
+  - [x] Stats tracking (total writes, errors, bytes)
 
 ### Query Path
-- [ ] `InfluxElixir.Query.SQL` — v3 SQL query builder + executor
-  - [ ] Parameterized queries (`$param` placeholders)
-  - [ ] Format options (`:json`, `:jsonl`, `:csv`, `:parquet`)
-  - [ ] `transport: :http | :flight` option
-- [ ] `InfluxElixir.Query.SQLStream` — streaming JSONL query results (lazy Stream)
-- [ ] `InfluxElixir.Query.InfluxQL` — v3 InfluxQL query executor
-- [ ] `InfluxElixir.Query.Flux` — v2 Flux query executor (compat)
-- [ ] `InfluxElixir.Query.ResponseParser` — JSONL/CSV/JSON/Parquet response parsing
-  - [ ] Type coercion (timestamps -> DateTime, numbers -> proper types)
+- [x] `InfluxElixir.Query.SQL` — v3 SQL query builder + executor
+  - [x] Parameterized queries (`$param` placeholders)
+  - [x] Format options (`:json`, `:jsonl`, `:csv`, `:parquet`)
+  - [x] `transport: :http | :flight` option
+- [x] `InfluxElixir.Query.SQLStream` — streaming JSONL query results (lazy Stream)
+- [x] `InfluxElixir.Query.InfluxQL` — v3 InfluxQL query executor
+- [x] `InfluxElixir.Query.Flux` — v2 Flux query executor (compat)
+- [x] `InfluxElixir.Query.ResponseParser` — JSONL/CSV/JSON/Parquet response parsing
+  - [x] Type coercion (timestamps -> DateTime, numbers -> proper types)
 
 ### Arrow Flight
-- [ ] `InfluxElixir.Flight.Client` — Arrow Flight gRPC client
-- [ ] `InfluxElixir.Flight.Reader` — Arrow IPC record batch decoder
-- [ ] `InfluxElixir.Flight.Proto` — generated protobuf modules (Flight.proto)
-- [ ] Integration with `query_sql/3` via `transport: :flight` option
+- [x] `InfluxElixir.Flight.Client` — Arrow Flight gRPC client
+- [x] `InfluxElixir.Flight.Reader` — Arrow IPC record batch decoder
+- [x] `InfluxElixir.Flight.Proto` — generated protobuf modules (Flight.proto)
+- [x] Integration with `query_sql/3` via `transport: :flight` option
 
 ### Admin
-- [ ] `InfluxElixir.Admin.Databases` — v3 database CRUD (`/api/v3/configure/database`)
-- [ ] `InfluxElixir.Admin.Buckets` — v2 bucket CRUD (compat)
-- [ ] `InfluxElixir.Admin.Tokens` — v3 token management (`/api/v3/configure/token`)
-- [ ] `InfluxElixir.Admin.Health` — health + ping checks
+- [x] `InfluxElixir.Admin.Databases` — v3 database CRUD (`/api/v3/configure/database`)
+- [x] `InfluxElixir.Admin.Buckets` — v2 bucket CRUD (compat)
+- [x] `InfluxElixir.Admin.Tokens` — v3 token management (`/api/v3/configure/token`)
+- [x] `InfluxElixir.Admin.Health` — health + ping checks
 
 ### Telemetry
-- [ ] `InfluxElixir.Telemetry` — event emission
-  - [ ] `[:influx_elixir, :write, :start | :stop | :exception]`
-  - [ ] `[:influx_elixir, :query, :start | :stop | :exception]`
-  - [ ] Metadata: database, point_count, bytes, compressed_bytes, transport
+- [x] `InfluxElixir.Telemetry` — event emission
+  - [x] `[:influx_elixir, :write, :start | :stop | :exception]`
+  - [x] `[:influx_elixir, :query, :start | :stop | :exception]`
+  - [x] Metadata: database, point_count, bytes, compressed_bytes, transport
 
 ### Testing
-- [ ] `InfluxElixir.TestHelper` — test setup helpers for consuming apps
-- [ ] LocalClient: line protocol parsing
-- [ ] LocalClient: ETS storage with per-process isolation
-- [ ] LocalClient: database create/list/delete
-- [ ] LocalClient: SQL query (WHERE, ORDER BY, LIMIT, `$param`)
-- [ ] LocalClient: correct error formats (400, 404 matching real InfluxDB)
-- [ ] LocalClient: gzip decompression on writes
-- [ ] LocalClient: timestamp precision handling
-- [ ] Contract tests (`test/integration/contract_test.exs`)
-  - [ ] Same assertions against both LocalClient and real InfluxDB
-  - [ ] All field types round-trip
-  - [ ] Large integer round-trip
-  - [ ] Error format matching
-- [ ] Unit tests via LocalClient (95%+ coverage target)
-- [ ] Integration tests tagged `:integration` (excluded from CI)
+- [x] `InfluxElixir.TestHelper` — test setup helpers for consuming apps
+- [x] LocalClient: line protocol parsing
+- [x] LocalClient: ETS storage with per-process isolation
+- [x] LocalClient: database create/list/delete
+- [x] LocalClient: SQL query (WHERE, ORDER BY, LIMIT, `$param`)
+- [x] LocalClient: correct error formats (400, 404 matching real InfluxDB)
+- [x] LocalClient: gzip decompression on writes
+- [x] LocalClient: timestamp precision handling
+- [x] Contract tests (`test/integration/contract_test.exs`)
+  - [x] Same assertions against both LocalClient and real InfluxDB
+  - [x] All field types round-trip
+  - [x] Large integer round-trip
+  - [x] Error format matching
+- [x] Unit tests via LocalClient (95%+ coverage target)
+- [x] Integration tests tagged `:integration` (excluded from CI)
 
 ### UsageRules
-- [ ] `usage-rules.md` — main rules for consuming apps
-- [ ] `usage-rules/write.md` — write sub-rules
-- [ ] `usage-rules/query.md` — query sub-rules
-- [ ] `usage-rules/testing.md` — testing sub-rules
-- [ ] `files:` in mix.exs includes usage-rules in hex package
-- [ ] `mix usage_rules.sync` generates AGENTS.md
+- [x] `usage-rules.md` — main rules for consuming apps
+- [x] `usage-rules/write.md` — write sub-rules
+- [x] `usage-rules/query.md` — query sub-rules
+- [x] `usage-rules/testing.md` — testing sub-rules
+- [x] `files:` in mix.exs includes usage-rules in hex package
+- [x] `mix usage_rules.sync` generates AGENTS.md
 
 ### Documentation & Publishing
-- [ ] README.md
-- [ ] CHANGELOG.md
-- [ ] LICENSE (MIT)
-- [ ] ExDoc configuration
-- [ ] `@doc` and `@spec` on all public functions
-- [ ] CI auto-publishes to Hex.pm on push to main
+- [x] README.md
+- [x] CHANGELOG.md
+- [x] LICENSE (MIT)
+- [x] ExDoc configuration
+- [x] `@doc` and `@spec` on all public functions
+- [x] CI auto-publishes to Hex.pm on push to main
 
 ---
 

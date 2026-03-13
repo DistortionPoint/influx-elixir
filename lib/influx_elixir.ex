@@ -1,0 +1,276 @@
+defmodule InfluxElixir do
+  @moduledoc """
+  Elixir client library for InfluxDB v3 with v2 compatibility.
+
+  All public API operations go through this facade module.
+  Delegates to the configured client implementation
+  (`InfluxElixir.Client.HTTP` or `InfluxElixir.Client.Local`).
+
+  ## Configuration
+
+      # config/config.exs
+      config :influx_elixir, :client, InfluxElixir.Client.HTTP
+
+      # config/test.exs
+      config :influx_elixir, :client, InfluxElixir.Client.Local
+  """
+
+  alias InfluxElixir.Write.Point
+
+  # ---------- Client Resolution ----------
+
+  @doc """
+  Returns the configured client implementation module.
+  """
+  @spec client() :: module()
+  def client do
+    InfluxElixir.Client.impl()
+  end
+
+  # ---------- Write ----------
+
+  @doc """
+  Constructs a new Point struct.
+
+  ## Parameters
+
+    * `measurement` - measurement name
+    * `fields` - field key-value pairs
+    * `opts` - optional `:tags` and `:timestamp`
+
+  ## Examples
+
+      InfluxElixir.point("cpu", %{"value" => 0.64},
+        tags: %{"host" => "server01"}
+      )
+  """
+  @spec point(String.t(), %{String.t() => Point.field_value()}, keyword()) ::
+          Point.t()
+  def point(measurement, fields, opts \\ []) do
+    Point.new(measurement, fields, opts)
+  end
+
+  @doc """
+  Writes points to InfluxDB using the configured client.
+  """
+  @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
+          InfluxElixir.Client.write_result()
+  def write(connection, line_protocol, opts \\ []) do
+    client().write(connection, line_protocol, opts)
+  end
+
+  # ---------- Query — v3 SQL ----------
+
+  @doc """
+  Executes a SQL query against InfluxDB v3.
+
+  Supports `transport: :http | :flight` option for transport selection.
+  """
+  @spec query_sql(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: InfluxElixir.Client.query_result()
+  def query_sql(connection, sql, opts \\ []) do
+    client().query_sql(connection, sql, opts)
+  end
+
+  @doc """
+  Executes a streaming SQL query, returning a lazy Stream.
+
+  Use for large result sets to avoid loading all rows into memory.
+  """
+  @spec query_sql_stream(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: Enumerable.t()
+  def query_sql_stream(connection, sql, opts \\ []) do
+    client().query_sql_stream(connection, sql, opts)
+  end
+
+  @doc """
+  Executes a non-SELECT SQL statement (DELETE, INSERT INTO ... SELECT).
+  """
+  @spec execute_sql(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: {:ok, map()} | {:error, term()}
+  def execute_sql(connection, sql, opts \\ []) do
+    client().execute_sql(connection, sql, opts)
+  end
+
+  # ---------- Query — v3 InfluxQL ----------
+
+  @doc """
+  Executes an InfluxQL query against InfluxDB v3.
+  """
+  @spec query_influxql(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: InfluxElixir.Client.query_result()
+  def query_influxql(connection, influxql, opts \\ []) do
+    client().query_influxql(connection, influxql, opts)
+  end
+
+  # ---------- Query — v2 Flux (compat) ----------
+
+  @doc """
+  Executes a Flux query against InfluxDB v2 (backwards compatibility).
+  """
+  @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
+          InfluxElixir.Client.query_result()
+  def query_flux(connection, flux, opts \\ []) do
+    client().query_flux(connection, flux, opts)
+  end
+
+  # ---------- Admin — v3 databases ----------
+
+  @doc """
+  Creates a database in InfluxDB v3.
+  """
+  @spec create_database(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: :ok | {:error, term()}
+  def create_database(connection, name, opts \\ []) do
+    client().create_database(connection, name, opts)
+  end
+
+  @doc """
+  Lists all databases in InfluxDB v3.
+  """
+  @spec list_databases(InfluxElixir.Client.connection()) ::
+          {:ok, [map()]} | {:error, term()}
+  def list_databases(connection) do
+    client().list_databases(connection)
+  end
+
+  @doc """
+  Deletes a database in InfluxDB v3.
+  """
+  @spec delete_database(InfluxElixir.Client.connection(), binary()) ::
+          :ok | {:error, term()}
+  def delete_database(connection, name) do
+    client().delete_database(connection, name)
+  end
+
+  # ---------- Admin — v2 buckets (compat) ----------
+
+  @doc """
+  Creates a bucket in InfluxDB v2 (backwards compatibility).
+  """
+  @spec create_bucket(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: :ok | {:error, term()}
+  def create_bucket(connection, name, opts \\ []) do
+    client().create_bucket(connection, name, opts)
+  end
+
+  @doc """
+  Lists all buckets in InfluxDB v2 (backwards compatibility).
+  """
+  @spec list_buckets(InfluxElixir.Client.connection()) ::
+          {:ok, [map()]} | {:error, term()}
+  def list_buckets(connection) do
+    client().list_buckets(connection)
+  end
+
+  @doc """
+  Deletes a bucket in InfluxDB v2 (backwards compatibility).
+  """
+  @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
+          :ok | {:error, term()}
+  def delete_bucket(connection, name) do
+    client().delete_bucket(connection, name)
+  end
+
+  # ---------- Admin — v3 tokens ----------
+
+  @doc """
+  Creates an API token in InfluxDB v3.
+  """
+  @spec create_token(
+          InfluxElixir.Client.connection(),
+          binary(),
+          keyword()
+        ) :: {:ok, map()} | {:error, term()}
+  def create_token(connection, description, opts \\ []) do
+    client().create_token(connection, description, opts)
+  end
+
+  @doc """
+  Deletes an API token in InfluxDB v3.
+  """
+  @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
+          :ok | {:error, term()}
+  def delete_token(connection, token_id) do
+    client().delete_token(connection, token_id)
+  end
+
+  # ---------- Health ----------
+
+  @doc """
+  Checks the health of an InfluxDB instance.
+  """
+  @spec health(InfluxElixir.Client.connection()) ::
+          {:ok, map()} | {:error, term()}
+  def health(connection) do
+    client().health(connection)
+  end
+
+  # ---------- Batch Writer ----------
+
+  @doc """
+  Forces an immediate flush of the batch writer for a connection.
+  """
+  @spec flush(atom()) :: :ok
+  def flush(_connection_name) do
+    :ok
+  end
+
+  @doc """
+  Returns batch writer statistics for a connection.
+  """
+  @spec stats(atom()) :: {:ok, map()}
+  def stats(_connection_name) do
+    {:ok, %{}}
+  end
+
+  # ---------- Dynamic Connections ----------
+
+  @doc """
+  Adds a new named connection dynamically at runtime.
+  """
+  @spec add_connection(atom(), keyword()) :: {:ok, pid()} | {:error, term()}
+  def add_connection(name, opts) do
+    child_spec =
+      Supervisor.child_spec(
+        {InfluxElixir.ConnectionSupervisor, Keyword.put(opts, :name, name)},
+        id: {InfluxElixir.ConnectionSupervisor, name}
+      )
+
+    case Supervisor.start_child(InfluxElixir.Supervisor, child_spec) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Removes a named connection dynamically at runtime.
+  """
+  @spec remove_connection(atom()) :: :ok | {:error, term()}
+  def remove_connection(name) do
+    child_id = {InfluxElixir.ConnectionSupervisor, name}
+
+    case Supervisor.terminate_child(InfluxElixir.Supervisor, child_id) do
+      :ok -> Supervisor.delete_child(InfluxElixir.Supervisor, child_id)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+end

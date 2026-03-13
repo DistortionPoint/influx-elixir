@@ -1,0 +1,556 @@
+defmodule InfluxElixir.Client.LocalTest do
+  use ExUnit.Case, async: true
+
+  alias InfluxElixir.Client.Local
+
+  setup do
+    {:ok, conn} = Local.start(databases: ["test_db"])
+    on_exit(fn -> Local.stop(conn) end)
+    {:ok, conn: conn}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Lifecycle
+  # ---------------------------------------------------------------------------
+
+  describe "start/1 and stop/1" do
+    test "creates and cleans up ETS table" do
+      {:ok, conn} = Local.start()
+      assert is_reference(conn.table)
+      assert :ok = Local.stop(conn)
+      assert :ets.info(conn.table) == :undefined
+    end
+
+    test "pre-creates databases from options" do
+      {:ok, conn} = Local.start(databases: ["db1", "db2"])
+      assert MapSet.member?(conn.databases, "db1")
+      assert MapSet.member?(conn.databases, "db2")
+      Local.stop(conn)
+    end
+
+    test "stop is safe to call twice" do
+      {:ok, conn} = Local.start()
+      assert :ok = Local.stop(conn)
+      assert :ok = Local.stop(conn)
+    end
+
+    test "each instance is isolated" do
+      {:ok, conn_a} = Local.start(databases: ["only_a"])
+      {:ok, conn_b} = Local.start(databases: ["only_b"])
+
+      {:ok, dbs_a} = Local.list_databases(conn_a)
+      {:ok, dbs_b} = Local.list_databases(conn_b)
+
+      names_a = Enum.map(dbs_a, & &1.name)
+      names_b = Enum.map(dbs_b, & &1.name)
+
+      assert "only_a" in names_a
+      refute "only_b" in names_a
+      assert "only_b" in names_b
+      refute "only_a" in names_b
+
+      Local.stop(conn_a)
+      Local.stop(conn_b)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Write — basic
+  # ---------------------------------------------------------------------------
+
+  describe "write/3 — basic" do
+    test "returns {:ok, :written} for valid line protocol", %{conn: conn} do
+      assert {:ok, :written} = Local.write(conn, "cpu value=1.0", database: "test_db")
+    end
+
+    test "returns error when database does not exist", %{conn: conn} do
+      assert {:error, %{status: 404, body: body}} =
+               Local.write(conn, "cpu value=1.0", database: "no_such_db")
+
+      assert body =~ "database not found"
+      assert body =~ "no_such_db"
+    end
+
+    test "returns error for invalid line protocol", %{conn: conn} do
+      assert {:error, %{status: 400}} =
+               Local.write(conn, "this_is_not_valid_lp_at_all!", database: "test_db")
+    end
+
+    test "stores points that are later queryable", %{conn: conn} do
+      :ok = Local.create_database(conn, "metrics")
+
+      assert {:ok, :written} =
+               Local.write(conn, "cpu value=1.0", database: "metrics")
+
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu")
+      assert row["value"] == 1.0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Write — line protocol round-trips
+  # ---------------------------------------------------------------------------
+
+  describe "write/3 — line protocol round-trip" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "rt")
+      {:ok, db: "rt"}
+    end
+
+    test "integer field", %{conn: conn, db: db} do
+      Local.write(conn, "m count=42i", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["count"] == 42
+    end
+
+    test "float field", %{conn: conn, db: db} do
+      Local.write(conn, "m temp=98.6", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["temp"] == 98.6
+    end
+
+    test "string field", %{conn: conn, db: db} do
+      Local.write(conn, ~S(m label="hello world"), database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["label"] == "hello world"
+    end
+
+    test "boolean true field", %{conn: conn, db: db} do
+      Local.write(conn, "m active=true", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["active"] == true
+    end
+
+    test "boolean false field", %{conn: conn, db: db} do
+      Local.write(conn, "m active=false", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["active"] == false
+    end
+
+    test "tag is preserved", %{conn: conn, db: db} do
+      Local.write(conn, "m,host=server01 value=1i", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["host"] == "server01"
+    end
+
+    test "multiple tags are preserved", %{conn: conn, db: db} do
+      Local.write(conn, "m,host=s1,region=us-east value=1i", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["host"] == "s1"
+      assert row["region"] == "us-east"
+    end
+
+    test "multiple fields are preserved", %{conn: conn, db: db} do
+      Local.write(conn, "m a=1i,b=2.0,c=\"hi\"", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["a"] == 1
+      assert row["b"] == 2.0
+      assert row["c"] == "hi"
+    end
+
+    test "timestamp is stored in nanoseconds", %{conn: conn, db: db} do
+      ts = 1_630_424_257_000_000_000
+      Local.write(conn, "m value=1.0 #{ts}", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["time"] == ts
+    end
+
+    test "multi-line write stores multiple points", %{conn: conn, db: db} do
+      lp = "m value=1.0\nm value=2.0\nm value=3.0"
+      Local.write(conn, lp, database: db)
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM m")
+      assert length(rows) == 3
+    end
+
+    test "measurement with escaped space in name", %{conn: conn, db: db} do
+      Local.write(conn, "my\\ measurement value=1i", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM my\\ measurement")
+      assert row["_measurement"] == "my measurement"
+    end
+
+    test "string field with escaped quotes", %{conn: conn, db: db} do
+      Local.write(conn, ~S(m msg="say \"hi\""), database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["msg"] == ~s(say "hi")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Write — gzip decompression
+  # ---------------------------------------------------------------------------
+
+  describe "write/3 — gzip" do
+    test "decompresses gzipped line protocol", %{conn: conn} do
+      :ok = Local.create_database(conn, "gz_db")
+      lp = "cpu value=1.0"
+      compressed = :zlib.gzip(lp)
+      assert {:ok, :written} = Local.write(conn, compressed, database: "gz_db")
+      assert {:ok, [_row]} = Local.query_sql(conn, "SELECT * FROM cpu")
+    end
+
+    test "invalid gzip returns 400 error", %{conn: conn} do
+      # gzip magic bytes but garbage body
+      bad = <<0x1F, 0x8B, 0x00, 0xFF, 0xFF>>
+      assert {:error, %{status: 400}} = Local.write(conn, bad, database: "test_db")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Write — timestamp precision
+  # ---------------------------------------------------------------------------
+
+  describe "write/3 — timestamp precision" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "prec")
+      {:ok, db: "prec"}
+    end
+
+    test "nanosecond precision is stored as-is", %{conn: conn, db: db} do
+      ts = 1_000_000_000
+      Local.write(conn, "m value=1i #{ts}", database: db, precision: :nanosecond)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["time"] == 1_000_000_000
+    end
+
+    test "microsecond precision is multiplied by 1_000", %{conn: conn, db: db} do
+      ts = 1_000_000
+      Local.write(conn, "m value=1i #{ts}", database: db, precision: :microsecond)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["time"] == 1_000_000_000
+    end
+
+    test "millisecond precision is multiplied by 1_000_000", %{conn: conn, db: db} do
+      ts = 1_000
+      Local.write(conn, "m value=1i #{ts}", database: db, precision: :millisecond)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["time"] == 1_000_000_000
+    end
+
+    test "second precision is multiplied by 1_000_000_000", %{conn: conn, db: db} do
+      ts = 1
+      Local.write(conn, "m value=1i #{ts}", database: db, precision: :second)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["time"] == 1_000_000_000
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — SELECT
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — SELECT" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "qdb")
+
+      lp = """
+      cpu,host=web01,region=us-east usage=10i,idle=90i 1000
+      cpu,host=web02,region=us-west usage=20i,idle=80i 2000
+      cpu,host=web01,region=us-east usage=30i,idle=70i 3000
+      """
+
+      Local.write(conn, String.trim(lp), database: "qdb", precision: :nanosecond)
+      {:ok, db: "qdb"}
+    end
+
+    test "returns empty list for unknown measurement", %{conn: conn} do
+      assert {:ok, []} = Local.query_sql(conn, "SELECT * FROM no_such_measurement")
+    end
+
+    test "returns all rows for bare SELECT *", %{conn: conn} do
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM cpu")
+      assert length(rows) == 3
+    end
+
+    test "WHERE tag = 'value' filters rows", %{conn: conn} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM cpu WHERE host = 'web01'")
+
+      assert length(rows) == 2
+      assert Enum.all?(rows, &(&1["host"] == "web01"))
+    end
+
+    test "WHERE field > N filters rows", %{conn: conn} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage > 15")
+
+      assert length(rows) == 2
+    end
+
+    test "WHERE field < N filters rows", %{conn: conn} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage < 15")
+
+      assert length(rows) == 1
+      assert hd(rows)["usage"] == 10
+    end
+
+    test "WHERE field >= N filters rows", %{conn: conn} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage >= 20")
+
+      assert length(rows) == 2
+    end
+
+    test "WHERE field <= N filters rows", %{conn: conn} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage <= 20")
+
+      assert length(rows) == 2
+    end
+
+    test "ORDER BY time ASC", %{conn: conn} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time ASC")
+
+      times = Enum.map(rows, & &1["time"])
+      assert times == Enum.sort(times)
+    end
+
+    test "ORDER BY time DESC", %{conn: conn} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time DESC")
+
+      times = Enum.map(rows, & &1["time"])
+      assert times == Enum.sort(times, :desc)
+    end
+
+    test "LIMIT reduces number of results", %{conn: conn} do
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM cpu LIMIT 2")
+      assert length(rows) == 2
+    end
+
+    test "combined WHERE + ORDER BY + LIMIT", %{conn: conn} do
+      sql = "SELECT * FROM cpu WHERE region = 'us-east' ORDER BY time DESC LIMIT 1"
+      assert {:ok, [row]} = Local.query_sql(conn, sql)
+      assert row["region"] == "us-east"
+      assert row["time"] == 3000
+    end
+
+    test "each row includes _measurement key", %{conn: conn} do
+      assert {:ok, [row | _rest]} = Local.query_sql(conn, "SELECT * FROM cpu")
+      assert row["_measurement"] == "cpu"
+    end
+
+    test "unsupported SQL returns error", %{conn: conn} do
+      assert {:error, _reason} = Local.query_sql(conn, "INSERT INTO cpu VALUES (1)")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — parameterised queries
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — parameterised queries" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "pdb")
+
+      Local.write(
+        conn,
+        "cpu,host=web01 usage=10i\ncpu,host=web02 usage=20i",
+        database: "pdb"
+      )
+
+      {:ok, db: "pdb"}
+    end
+
+    test "string param substitution", %{conn: conn} do
+      sql = "SELECT * FROM cpu WHERE host = $host"
+      params = %{"$host" => "web01"}
+      assert {:ok, rows} = Local.query_sql(conn, sql, params: params)
+      assert length(rows) == 1
+      assert hd(rows)["host"] == "web01"
+    end
+
+    test "integer param substitution", %{conn: conn} do
+      sql = "SELECT * FROM cpu WHERE usage > $min"
+      params = %{"$min" => 15}
+      assert {:ok, rows} = Local.query_sql(conn, sql, params: params)
+      assert length(rows) == 1
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql_stream/3
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql_stream/3" do
+    test "returns an enumerable", %{conn: conn} do
+      stream = Local.query_sql_stream(conn, "SELECT * FROM cpu")
+      assert Enumerable.impl_for(stream)
+    end
+
+    test "stream yields same rows as query_sql", %{conn: conn} do
+      :ok = Local.create_database(conn, "sdb")
+      Local.write(conn, "m value=1i\nm value=2i", database: "sdb")
+
+      {:ok, direct} = Local.query_sql(conn, "SELECT * FROM m")
+      stream_rows = conn |> Local.query_sql_stream("SELECT * FROM m") |> Enum.to_list()
+      assert length(stream_rows) == length(direct)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # execute_sql/3
+  # ---------------------------------------------------------------------------
+
+  describe "execute_sql/3" do
+    test "returns {:ok, map} for any statement", %{conn: conn} do
+      assert {:ok, result} = Local.execute_sql(conn, "DELETE FROM cpu")
+      assert is_map(result)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_influxql/3
+  # ---------------------------------------------------------------------------
+
+  describe "query_influxql/3" do
+    test "returns {:ok, rows}", %{conn: conn} do
+      assert {:ok, rows} = Local.query_influxql(conn, "SELECT * FROM cpu")
+      assert is_list(rows)
+    end
+
+    test "delegates to SQL engine — data is visible", %{conn: conn} do
+      :ok = Local.create_database(conn, "iqldb")
+      Local.write(conn, "m value=1i", database: "iqldb")
+      assert {:ok, [row]} = Local.query_influxql(conn, "SELECT * FROM m")
+      assert row["value"] == 1
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_flux/3
+  # ---------------------------------------------------------------------------
+
+  describe "query_flux/3" do
+    test "returns {:ok, rows} for any flux query", %{conn: conn} do
+      flux = "from(bucket: \"test\") |> range(start: -1h)"
+      assert {:ok, rows} = Local.query_flux(conn, flux)
+      assert is_list(rows)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Database admin
+  # ---------------------------------------------------------------------------
+
+  describe "database admin" do
+    test "create_database/3 returns :ok", %{conn: conn} do
+      assert :ok = Local.create_database(conn, "new_db")
+    end
+
+    test "list_databases/1 includes pre-created databases", %{conn: conn} do
+      assert {:ok, dbs} = Local.list_databases(conn)
+      names = Enum.map(dbs, & &1.name)
+      assert "test_db" in names
+    end
+
+    test "create then list reflects new database", %{conn: conn} do
+      Local.create_database(conn, "fresh_db")
+      assert {:ok, dbs} = Local.list_databases(conn)
+      names = Enum.map(dbs, & &1.name)
+      assert "fresh_db" in names
+    end
+
+    test "create is idempotent", %{conn: conn} do
+      assert :ok = Local.create_database(conn, "same_db")
+      assert :ok = Local.create_database(conn, "same_db")
+      {:ok, dbs} = Local.list_databases(conn)
+      assert Enum.count(dbs, &(&1.name == "same_db")) == 1
+    end
+
+    test "delete_database/2 removes existing database", %{conn: conn} do
+      Local.create_database(conn, "gone_db")
+      assert :ok = Local.delete_database(conn, "gone_db")
+      {:ok, dbs} = Local.list_databases(conn)
+      refute Enum.any?(dbs, &(&1.name == "gone_db"))
+    end
+
+    test "delete_database/2 returns 404 for non-existent database", %{conn: conn} do
+      assert {:error, %{status: 404, body: body}} =
+               Local.delete_database(conn, "not_here")
+
+      assert body =~ "database not found"
+      assert body =~ "not_here"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Bucket admin
+  # ---------------------------------------------------------------------------
+
+  describe "bucket admin" do
+    test "create_bucket/3 returns :ok", %{conn: conn} do
+      assert :ok = Local.create_bucket(conn, "new_bucket")
+    end
+
+    test "list_buckets/1 returns {:ok, list}", %{conn: conn} do
+      assert {:ok, buckets} = Local.list_buckets(conn)
+      assert is_list(buckets)
+    end
+
+    test "create then list reflects new bucket", %{conn: conn} do
+      Local.create_bucket(conn, "my_bucket")
+      assert {:ok, buckets} = Local.list_buckets(conn)
+      names = Enum.map(buckets, & &1.name)
+      assert "my_bucket" in names
+    end
+
+    test "create is idempotent", %{conn: conn} do
+      Local.create_bucket(conn, "dup_bucket")
+      Local.create_bucket(conn, "dup_bucket")
+      {:ok, buckets} = Local.list_buckets(conn)
+      assert Enum.count(buckets, &(&1.name == "dup_bucket")) == 1
+    end
+
+    test "delete_bucket/2 removes existing bucket", %{conn: conn} do
+      Local.create_bucket(conn, "to_delete")
+      assert :ok = Local.delete_bucket(conn, "to_delete")
+      {:ok, buckets} = Local.list_buckets(conn)
+      refute Enum.any?(buckets, &(&1.name == "to_delete"))
+    end
+
+    test "delete_bucket/2 is idempotent for non-existent bucket", %{conn: conn} do
+      assert :ok = Local.delete_bucket(conn, "no_such_bucket")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Token admin
+  # ---------------------------------------------------------------------------
+
+  describe "token admin" do
+    test "create_token/3 returns {:ok, map} with id, token, description", %{conn: conn} do
+      assert {:ok, token} = Local.create_token(conn, "my token")
+      assert is_map(token)
+      assert is_binary(token.id)
+      assert is_binary(token.token)
+      assert token.description == "my token"
+    end
+
+    test "each created token has a unique id", %{conn: conn} do
+      {:ok, t1} = Local.create_token(conn, "first")
+      {:ok, t2} = Local.create_token(conn, "second")
+      assert t1.id != t2.id
+    end
+
+    test "delete_token/2 returns :ok for known token", %{conn: conn} do
+      {:ok, token} = Local.create_token(conn, "disposable")
+      assert :ok = Local.delete_token(conn, token.id)
+    end
+
+    test "delete_token/2 returns :ok even for unknown token id", %{conn: conn} do
+      assert :ok = Local.delete_token(conn, "not-a-real-id")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Health
+  # ---------------------------------------------------------------------------
+
+  describe "health/1" do
+    test "returns {:ok, %{status: 'pass'}}", %{conn: conn} do
+      assert {:ok, %{status: "pass"}} = Local.health(conn)
+    end
+  end
+end

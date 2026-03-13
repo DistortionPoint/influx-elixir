@@ -1,0 +1,43 @@
+# Build and deps
+/_build/
+/deps/
+*.ez
+*.beam
+
+# Test and coverage
+/cover/
+
+# Documentation
+/doc/
+
+# Hex package artifacts
+influx_elixir-*.tar
+
+# Dialyzer PLTs
+priv/plts/
+
+# Crash dumps
+erl_crash.dump
+
+# Temporary files
+/tmp/
+*.swp
+*.swo
+*~
+
+# Mix fetch marker
+/.fetch
+
+# IDE / editor
+.elixir_ls/
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
