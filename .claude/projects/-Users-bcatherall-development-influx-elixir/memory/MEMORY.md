@@ -1,2 +1,5 @@
 - [feedback_no_single_work_refs.md](feedback_no_single_work_refs.md) — CLAUDE.md should not reference individual design docs or work items
 - [feedback_no_mocking.md](feedback_no_mocking.md) — Never use mocking libraries (Mox, Bypass, etc.) — test against real services
+- [project_influx_elixir_design.md](project_influx_elixir_design.md) — Library naming, LocalClient pattern, UsageRules, consuming app context
+- [reference_github_repo.md](reference_github_repo.md) — GitHub repo is DistortionPoint/influx-elixir
+- [user_tooling.md](user_tooling.md) — Uses Mise for runtime versions (Elixir 1.18/OTP 28)
