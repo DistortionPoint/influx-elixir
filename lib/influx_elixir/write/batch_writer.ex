@@ -24,8 +24,10 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   ## Retry Policy
 
-  Only 5xx and network errors are retried using exponential backoff with
-  optional jitter. 4xx errors are discarded and logged.
+  Only 5xx and network errors are retried using asynchronous exponential
+  backoff with optional jitter. 4xx errors are discarded and logged.
+  Retries are non-blocking — the GenServer continues to accept messages
+  between retry attempts.
 
   ## Stats
 
@@ -48,7 +50,24 @@ defmodule InfluxElixir.Write.BatchWriter do
   @type stat_key :: :total_writes | :total_errors | :total_bytes
   @type stats :: %{stat_key() => non_neg_integer()}
 
-  @type state :: %{
+  defstruct [
+    :connection,
+    :database,
+    :timer_ref,
+    :pending_sync,
+    buffer: [],
+    buffer_size: 0,
+    batch_size: @default_batch_size,
+    flush_interval_ms: @default_flush_interval_ms,
+    jitter_ms: @default_jitter_ms,
+    max_retries: @default_max_retries,
+    no_sync: false,
+    stats: %{total_writes: 0, total_errors: 0, total_bytes: 0},
+    retry_payload: nil,
+    retry_attempt: 0
+  ]
+
+  @type t :: %__MODULE__{
           buffer: [binary()],
           buffer_size: non_neg_integer(),
           connection: term(),
@@ -60,7 +79,9 @@ defmodule InfluxElixir.Write.BatchWriter do
           no_sync: boolean(),
           stats: stats(),
           timer_ref: reference() | nil,
-          pending_sync: {pid(), term()} | nil
+          pending_sync: {pid(), term()} | nil,
+          retry_payload: binary() | nil,
+          retry_attempt: non_neg_integer()
         }
 
   # ---------------------------------------------------------------------------
@@ -89,10 +110,11 @@ defmodule InfluxElixir.Write.BatchWriter do
   end
 
   @doc """
-  Asynchronously buffers a point (or line protocol binary) for writing.
+  Buffers a point (or line protocol binary) for writing.
 
-  Returns `:ok` immediately, or `{:error, :buffer_full}` when backpressure
-  kicks in.
+  Blocks until the buffer accepts the point, then returns. Does not wait
+  for the data to be flushed to InfluxDB. Returns `{:error, :buffer_full}`
+  when the buffer exceeds the backpressure threshold.
 
   ## Parameters
 
@@ -171,30 +193,26 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   @impl GenServer
   def init(opts) do
-    batch_size = Keyword.get(opts, :batch_size, @default_batch_size)
-    flush_interval_ms = Keyword.get(opts, :flush_interval_ms, @default_flush_interval_ms)
-    jitter_ms = Keyword.get(opts, :jitter_ms, @default_jitter_ms)
-
-    state = %{
-      buffer: [],
-      buffer_size: 0,
+    state = %__MODULE__{
       connection: Keyword.get(opts, :connection),
       database: Keyword.get(opts, :database),
-      batch_size: batch_size,
-      flush_interval_ms: flush_interval_ms,
-      jitter_ms: jitter_ms,
+      batch_size: Keyword.get(opts, :batch_size, @default_batch_size),
+      flush_interval_ms: Keyword.get(opts, :flush_interval_ms, @default_flush_interval_ms),
+      jitter_ms: Keyword.get(opts, :jitter_ms, @default_jitter_ms),
       max_retries: Keyword.get(opts, :max_retries, @default_max_retries),
-      no_sync: Keyword.get(opts, :no_sync, false),
-      stats: %{total_writes: 0, total_errors: 0, total_bytes: 0},
-      timer_ref: nil,
-      pending_sync: nil
+      no_sync: Keyword.get(opts, :no_sync, false)
     }
 
-    {:ok, schedule_flush(state)}
+    {:ok, state, {:continue, :schedule_initial_flush}}
   end
 
   @impl GenServer
-  def handle_call({:write, payload}, _from, state) do
+  def handle_continue(:schedule_initial_flush, state) do
+    {:noreply, schedule_flush(state)}
+  end
+
+  @impl GenServer
+  def handle_call({:write, payload}, _from, %__MODULE__{} = state) do
     max_buffer = state.batch_size * @backpressure_multiplier
 
     if state.buffer_size >= max_buffer do
@@ -211,7 +229,8 @@ defmodule InfluxElixir.Write.BatchWriter do
     end
   end
 
-  def handle_call({:write_sync, payload}, from, state) do
+  @impl GenServer
+  def handle_call({:write_sync, payload}, from, %__MODULE__{} = state) do
     max_buffer = state.batch_size * @backpressure_multiplier
 
     cond do
@@ -230,23 +249,58 @@ defmodule InfluxElixir.Write.BatchWriter do
     end
   end
 
-  def handle_call(:flush, _from, state) do
+  @impl GenServer
+  def handle_call(:flush, _from, %__MODULE__{} = state) do
     new_state = do_flush(state)
     {:reply, :ok, new_state}
   end
 
-  def handle_call(:stats, _from, state) do
+  @impl GenServer
+  def handle_call(:stats, _from, %__MODULE__{} = state) do
     {:reply, {:ok, state.stats}, state}
   end
 
   @impl GenServer
-  def handle_info(:flush, state) do
+  def handle_info(:flush, %__MODULE__{} = state) do
     new_state =
       state
       |> do_flush()
       |> schedule_flush()
 
     {:noreply, new_state, :hibernate}
+  end
+
+  @impl GenServer
+  def handle_info({:retry, payload, attempt}, %__MODULE__{} = state) do
+    case Writer.write(state.connection, payload) do
+      {:ok, :written} ->
+        finish_flush(state, payload, :ok)
+
+      {:error, {:http_error, status}} when status >= 400 and status < 500 ->
+        Logger.warning("[BatchWriter] 4xx error (#{status}) — discarding batch")
+
+        finish_flush(state, payload, {:error, {:http_error, status}})
+
+      {:error, reason} when attempt < state.max_retries ->
+        Logger.warning(
+          "[BatchWriter] Write error (attempt #{attempt + 1}): " <>
+            inspect(reason)
+        )
+
+        schedule_retry(payload, attempt + 1, state.jitter_ms)
+        {:noreply, %{state | retry_payload: payload, retry_attempt: attempt + 1}}
+
+      {:error, reason} ->
+        Logger.error("[BatchWriter] Flush failed after retries: #{inspect(reason)}")
+
+        finish_flush(state, payload, {:error, reason})
+    end
+  end
+
+  @impl GenServer
+  def terminate(_reason, %__MODULE__{} = state) do
+    do_flush(state)
+    :ok
   end
 
   # ---------------------------------------------------------------------------
@@ -260,108 +314,152 @@ defmodule InfluxElixir.Write.BatchWriter do
     InfluxElixir.Write.LineProtocol.encode!(point)
   end
 
-  @spec append_to_buffer(state(), binary()) :: state()
-  defp append_to_buffer(state, line) do
+  @spec append_to_buffer(t(), binary()) :: t()
+  defp append_to_buffer(%__MODULE__{} = state, line) do
     %{state | buffer: [line | state.buffer], buffer_size: state.buffer_size + 1}
   end
 
-  @spec maybe_flush_on_batch(state()) :: state()
-  defp maybe_flush_on_batch(%{buffer_size: size, batch_size: batch} = state)
+  @spec maybe_flush_on_batch(t()) :: t()
+  defp maybe_flush_on_batch(%__MODULE__{buffer_size: size, batch_size: batch} = state)
        when size >= batch do
     do_flush(state)
   end
 
-  defp maybe_flush_on_batch(state), do: state
+  defp maybe_flush_on_batch(%__MODULE__{} = state), do: state
 
-  @spec do_flush(state()) :: state()
-  defp do_flush(%{buffer_size: 0} = state) do
+  @spec do_flush(t()) :: t()
+  defp do_flush(%__MODULE__{buffer_size: 0} = state) do
     reply_sync(state, :ok)
     %{state | pending_sync: nil}
   end
 
-  defp do_flush(state) do
+  defp do_flush(%__MODULE__{} = state) do
     state = cancel_timer(state)
     lines = state.buffer |> Enum.reverse() |> Enum.join("\n")
-    bytes = byte_size(lines)
 
-    new_state =
-      case flush_with_retry(state.connection, lines, state.max_retries, state.jitter_ms) do
-        {:ok, :written} ->
-          stats =
-            state.stats
-            |> Map.update!(:total_writes, &(&1 + 1))
-            |> Map.update!(:total_bytes, &(&1 + bytes))
+    case Writer.write(state.connection, lines) do
+      {:ok, :written} ->
+        finish_flush_immediate(state, lines, :ok)
 
-          reply_sync(state, :ok)
-          %{state | buffer: [], buffer_size: 0, stats: stats, pending_sync: nil}
+      {:error, {:http_error, status}} when status >= 400 and status < 500 ->
+        Logger.warning("[BatchWriter] 4xx error (#{status}) — discarding batch")
 
-        {:error, reason} ->
-          Logger.error("[BatchWriter] Flush failed after retries: #{inspect(reason)}")
+        finish_flush_immediate(state, lines, {:error, {:http_error, status}})
 
-          stats = Map.update!(state.stats, :total_errors, &(&1 + 1))
-          reply_sync(state, {:error, reason})
-          %{state | buffer: [], buffer_size: 0, stats: stats, pending_sync: nil}
-      end
+      {:error, reason} when state.max_retries > 0 ->
+        Logger.warning("[BatchWriter] Write error (attempt 1): #{inspect(reason)}")
 
-    new_state
+        schedule_retry(lines, 1, state.jitter_ms)
+
+        %{
+          state
+          | buffer: [],
+            buffer_size: 0,
+            retry_payload: lines,
+            retry_attempt: 1
+        }
+
+      {:error, reason} ->
+        Logger.error("[BatchWriter] Flush failed: #{inspect(reason)}")
+
+        finish_flush_immediate(state, lines, {:error, reason})
+    end
   end
 
-  @spec reply_sync(state(), term()) :: :ok
-  defp reply_sync(%{pending_sync: nil}, _reply), do: :ok
+  @spec finish_flush_immediate(t(), binary(), :ok | {:error, term()}) :: t()
+  defp finish_flush_immediate(%__MODULE__{} = state, lines, result) do
+    bytes = byte_size(lines)
+    stats = update_stats(state.stats, result, bytes)
+    reply_sync(state, result)
 
-  defp reply_sync(%{pending_sync: from}, reply) do
+    %{
+      state
+      | buffer: [],
+        buffer_size: 0,
+        stats: stats,
+        pending_sync: nil,
+        retry_payload: nil,
+        retry_attempt: 0
+    }
+  end
+
+  @spec finish_flush(t(), binary(), :ok | {:error, term()}) ::
+          {:noreply, t()}
+  defp finish_flush(%__MODULE__{} = state, payload, result) do
+    bytes = byte_size(payload)
+    stats = update_stats(state.stats, result, bytes)
+    reply_sync(state, result)
+
+    new_state = %{
+      state
+      | stats: stats,
+        pending_sync: nil,
+        retry_payload: nil,
+        retry_attempt: 0
+    }
+
+    {:noreply, new_state}
+  end
+
+  @spec update_stats(stats(), :ok | {:error, term()}, non_neg_integer()) ::
+          stats()
+  defp update_stats(stats, :ok, bytes) do
+    stats
+    |> Map.update!(:total_writes, &(&1 + 1))
+    |> Map.update!(:total_bytes, &(&1 + bytes))
+  end
+
+  defp update_stats(stats, {:error, _reason}, _bytes) do
+    Map.update!(stats, :total_errors, &(&1 + 1))
+  end
+
+  @spec reply_sync(t(), term()) :: :ok
+  defp reply_sync(%__MODULE__{pending_sync: nil}, _reply), do: :ok
+
+  defp reply_sync(%__MODULE__{pending_sync: from}, reply) do
     GenServer.reply(from, reply)
     :ok
   end
 
-  @spec flush_with_retry(term(), binary(), non_neg_integer(), non_neg_integer()) ::
-          InfluxElixir.Client.write_result()
-  defp flush_with_retry(connection, payload, max_retries, jitter_ms) do
-    do_retry(connection, payload, 0, max_retries, jitter_ms)
+  @spec schedule_retry(binary(), non_neg_integer(), non_neg_integer()) :: :ok
+  defp schedule_retry(payload, attempt, jitter_ms) do
+    delay = backoff_delay(attempt, jitter_ms)
+    Process.send_after(self(), {:retry, payload, attempt}, delay)
+    :ok
   end
 
-  @spec do_retry(term(), binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ::
-          InfluxElixir.Client.write_result()
-  defp do_retry(connection, payload, attempt, max_retries, jitter_ms) do
-    case Writer.write(connection, payload) do
-      {:ok, :written} ->
-        {:ok, :written}
-
-      {:error, {:http_error, status}} when status >= 400 and status < 500 ->
-        Logger.warning("[BatchWriter] 4xx error (#{status}) — discarding batch, not retrying")
-        {:error, {:http_error, status}}
-
-      {:error, reason} when attempt < max_retries ->
-        delay = backoff_delay(attempt, jitter_ms)
-        Logger.warning("[BatchWriter] Write error (attempt #{attempt + 1}): #{inspect(reason)}")
-        Process.sleep(delay)
-        do_retry(connection, payload, attempt + 1, max_retries, jitter_ms)
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  @spec backoff_delay(non_neg_integer(), non_neg_integer()) :: non_neg_integer()
+  @spec backoff_delay(non_neg_integer(), non_neg_integer()) ::
+          non_neg_integer()
   defp backoff_delay(attempt, jitter_ms) do
     base = (@base_retry_delay_ms * :math.pow(2, attempt)) |> round()
     jitter = if jitter_ms > 0, do: :rand.uniform(jitter_ms), else: 0
     base + jitter
   end
 
-  @spec schedule_flush(state()) :: state()
-  defp schedule_flush(state) do
+  @spec schedule_flush(t()) :: t()
+  defp schedule_flush(%__MODULE__{} = state) do
     jitter = if state.jitter_ms > 0, do: :rand.uniform(state.jitter_ms), else: 0
     delay = state.flush_interval_ms + jitter
     ref = Process.send_after(self(), :flush, delay)
     %{state | timer_ref: ref}
   end
 
-  @spec cancel_timer(state()) :: state()
-  defp cancel_timer(%{timer_ref: nil} = state), do: state
+  @spec cancel_timer(t()) :: t()
+  defp cancel_timer(%__MODULE__{timer_ref: nil} = state), do: state
 
-  defp cancel_timer(%{timer_ref: ref} = state) do
-    Process.cancel_timer(ref)
+  defp cancel_timer(%__MODULE__{timer_ref: ref} = state) do
+    case Process.cancel_timer(ref) do
+      false ->
+        receive do
+          :flush -> :ok
+        after
+          0 -> :ok
+        end
+
+      _time_left ->
+        :ok
+    end
+
     %{state | timer_ref: nil}
   end
 end

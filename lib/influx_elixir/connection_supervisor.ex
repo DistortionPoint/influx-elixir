@@ -42,13 +42,27 @@ defmodule InfluxElixir.ConnectionSupervisor do
     finch_name = finch_name(name)
     pool_size = Keyword.get(config, :pool_size, 10)
 
-    children = [
+    finch_child =
       {Finch,
        name: finch_name,
        pools: %{
          :default => [size: pool_size]
        }}
-    ]
+
+    batch_opts = Keyword.get(config, :batch_writer)
+
+    children =
+      if batch_opts do
+        writer_opts =
+          Keyword.merge(batch_opts,
+            connection: config,
+            name: batch_writer_name(name)
+          )
+
+        [finch_child, {InfluxElixir.Write.BatchWriter, writer_opts}]
+      else
+        [finch_child]
+      end
 
     Supervisor.init(children, strategy: :rest_for_one)
   end
@@ -57,6 +71,12 @@ defmodule InfluxElixir.ConnectionSupervisor do
   @spec finch_name(atom()) :: atom()
   def finch_name(connection_name) do
     :"influx_elixir_#{connection_name}_finch"
+  end
+
+  @doc false
+  @spec batch_writer_name(atom()) :: atom()
+  def batch_writer_name(connection_name) do
+    :"influx_elixir_#{connection_name}_batch_writer"
   end
 
   @doc false

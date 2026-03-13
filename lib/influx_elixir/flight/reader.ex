@@ -14,45 +14,49 @@ defmodule InfluxElixir.Flight.Reader do
       contain `RecordBatch` messages with buffer offset/length metadata.
     * `data_body` — raw column buffer bytes referenced by the batch metadata.
 
-  A full Arrow IPC decoder requires a flatbuffers parser to read the binary
-  metadata layout. This module implements a pragmatic, self-contained approach:
-
-    1. **Schema extraction** — parses the Arrow IPC `Schema` message header
-       to extract column names and type IDs via heuristic binary scanning.
-    2. **Record batch decoding** — reads fixed-size typed columns (int64,
-       float64, bool, timestamp) directly from `data_body` buffers.
-       Variable-length columns (utf8 strings) are decoded from their
-       offset + value buffers.
-    3. **Row assembly** — zips column vectors into row maps keyed by name.
+  Schema and record batch metadata is parsed using a proper FlatBuffer
+  binary reader (`InfluxElixir.Flight.FlatBuffer`), following the Arrow
+  IPC FlatBuffer schema specification exactly.
 
   ## Supported Column Types
 
-  | Arrow Type ID | Elixir type    |
-  |---------------|----------------|
-  | 6  (Int64)    | `integer()`    |
-  | 12 (Float64)  | `float()`      |
-  | 14 (Bool)     | `boolean()`    |
-  | 15 (Utf8)     | `binary()`     |
-  | 20 (Timestamp)| `integer()`    |
+  | Arrow Type | Elixir type    |
+  |------------|----------------|
+  | Int8-64    | `integer()`    |
+  | UInt8-64   | `integer()`    |
+  | Float32/64 | `float()`      |
+  | Bool       | `boolean()`    |
+  | Utf8       | `binary()`     |
+  | Timestamp  | `integer()`    |
 
   Null bitmaps are supported; null values become `nil`.
 
   ## Limitations
 
-  - Dictionary-encoded columns (type 18) are not yet decoded.
+  - Dictionary-encoded columns are not yet decoded.
   - Nested / list / struct types are not supported.
-  - The flatbuffer header parser uses heuristic binary scanning; it works
-    reliably for InfluxDB's simple flat schemas.
   """
 
   import Bitwise
 
+  alias InfluxElixir.Flight.FlatBuffer, as: FB
   alias InfluxElixir.Flight.Proto.FlightData
 
-  # Arrow IPC stream continuation marker (proto stream format)
+  # Arrow IPC stream continuation marker
   @continuation_marker <<0xFF, 0xFF, 0xFF, 0xFF>>
 
-  # Arrow IPC type IDs we handle
+  # Arrow FlatBuffer Type union discriminator values
+  @fb_type_int 2
+  @fb_type_floating_point 3
+  @fb_type_utf8 5
+  @fb_type_bool 6
+  @fb_type_timestamp 10
+
+  # Arrow FlatBuffer MessageHeader union discriminator values
+  @msg_header_schema 1
+  @msg_header_record_batch 3
+
+  # Internal type IDs used by column decoders
   @type_int8 2
   @type_int16 3
   @type_int32 4
@@ -67,7 +71,7 @@ defmodule InfluxElixir.Flight.Reader do
   @type_utf8 15
   @type_timestamp 20
 
-  # Fixed byte widths per Arrow type ID (bool uses a bitmap — 0 here)
+  # Fixed byte widths per internal type ID (bool uses a bitmap — 0 here)
   @byte_widths %{
     @type_int8 => 1,
     @type_int16 => 2,
@@ -97,14 +101,16 @@ defmodule InfluxElixir.Flight.Reader do
 
   ## Parameters
 
-    * `flight_data_list` — ordered list of `FlightData` structs from a DoGet stream
+    * `flight_data_list` — ordered list of `FlightData` structs from a DoGet
+      stream
 
   ## Example
 
       iex> InfluxElixir.Flight.Reader.decode_flight_data([])
       {:ok, []}
   """
-  @spec decode_flight_data([FlightData.t()]) :: {:ok, [map()]} | {:error, term()}
+  @spec decode_flight_data([FlightData.t()]) ::
+          {:ok, [map()]} | {:error, term()}
   def decode_flight_data([]), do: {:ok, []}
 
   def decode_flight_data([schema_msg | batch_msgs]) do
@@ -114,104 +120,172 @@ defmodule InfluxElixir.Flight.Reader do
   end
 
   # ---------------------------------------------------------------------------
-  # Schema parsing
+  # Schema parsing (FlatBuffer-based)
   # ---------------------------------------------------------------------------
 
   @doc """
   Extracts column name/type pairs from an Arrow IPC `Schema` message header.
 
-  The header is a serialised flatbuffer. This function locates field metadata
-  using heuristic binary pattern matching without a full flatbuffers library.
+  Parses the FlatBuffer metadata according to the Arrow IPC specification:
+  Message → Schema → Field[] → name + Type union.
 
   Returns `{:ok, [column_schema()]}` or `{:error, reason}`.
   """
-  @spec parse_schema(binary() | nil) :: {:ok, [column_schema()]} | {:error, term()}
+  @spec parse_schema(binary() | nil) ::
+          {:ok, [column_schema()]} | {:error, term()}
   def parse_schema(nil), do: {:ok, []}
   def parse_schema(<<>>), do: {:ok, []}
 
   def parse_schema(header) when is_binary(header) do
-    cols = header |> strip_continuation() |> extract_columns_heuristic()
-    {:ok, cols}
+    fb = strip_continuation(header)
+
+    if byte_size(fb) < 8 do
+      {:ok, []}
+    else
+      parse_message_schema(fb)
+    end
   rescue
     _err -> {:error, :schema_parse_failed}
   end
 
-  # ---------------------------------------------------------------------------
-  # Private: schema helpers
-  # ---------------------------------------------------------------------------
+  @spec parse_message_schema(binary()) ::
+          {:ok, [column_schema()]} | {:error, term()}
+  defp parse_message_schema(fb) do
+    # Read root Message table
+    msg_pos = FB.root_table_pos(fb)
+    {vt_pos, vt_size} = FB.read_vtable(fb, msg_pos)
 
-  # Strip IPC stream continuation marker and metadata-length prefix.
-  # Format: <<0xFF, 0xFF, 0xFF, 0xFF, len::little-32, flatbuffer...>>
-  @spec strip_continuation(binary()) :: binary()
-  defp strip_continuation(<<@continuation_marker, _meta_len::little-32, rest::binary>>),
-    do: rest
+    # Message field 1: header_type (union discriminator, uint8)
+    header_type =
+      case FB.field_pos(fb, msg_pos, vt_pos, vt_size, 1) do
+        nil -> 0
+        pos -> FB.read_uint8(fb, pos)
+      end
 
-  defp strip_continuation(bin), do: bin
+    if header_type == @msg_header_schema do
+      # Message field 2: header (union value, offset to Schema table)
+      case FB.field_pos(fb, msg_pos, vt_pos, vt_size, 2) do
+        nil ->
+          {:ok, []}
 
-  # Heuristic column extractor.
-  @spec extract_columns_heuristic(binary()) :: [column_schema()]
-  defp extract_columns_heuristic(data) do
-    data
-    |> scan_for_names([])
-    |> Enum.map(fn {name, type_id} -> %{name: name, type_id: type_id} end)
-  end
-
-  @spec scan_for_names(binary(), [{binary(), non_neg_integer()}]) ::
-          [{binary(), non_neg_integer()}]
-  defp scan_for_names(<<>>, acc), do: Enum.reverse(acc)
-
-  defp scan_for_names(<<len::little-16, rest::binary>>, acc)
-       when len > 0 and len < 256 and byte_size(rest) >= len do
-    candidate = binary_part(rest, 0, len)
-    after_name = binary_part(rest, len, byte_size(rest) - len)
-
-    if printable_ascii?(candidate) do
-      type_id = peek_type_byte(after_name)
-      updated = if type_id, do: [{candidate, type_id} | acc], else: acc
-      <<_consumed::binary-size(len), rest2::binary>> = rest
-      scan_for_names(rest2, updated)
+        header_offset_pos ->
+          schema_pos = FB.read_offset(fb, header_offset_pos)
+          parse_schema_table(fb, schema_pos)
+      end
     else
-      <<_first_byte::8, rest2::binary>> = rest
-      scan_for_names(<<len::little-16, rest2::binary>>, acc)
+      {:ok, []}
     end
   end
 
-  defp scan_for_names(<<_byte::8, rest::binary>>, acc), do: scan_for_names(rest, acc)
+  @spec parse_schema_table(binary(), non_neg_integer()) ::
+          {:ok, [column_schema()]}
+  defp parse_schema_table(fb, schema_pos) do
+    {vt_pos, vt_size} = FB.read_vtable(fb, schema_pos)
 
-  @spec printable_ascii?(binary()) :: boolean()
-  defp printable_ascii?(<<>>), do: false
+    # Schema field 1: fields (vector of Field table offsets)
+    case FB.field_pos(fb, schema_pos, vt_pos, vt_size, 1) do
+      nil ->
+        {:ok, []}
 
-  defp printable_ascii?(bin) do
-    Enum.all?(:binary.bin_to_list(bin), fn b -> b >= 0x20 and b <= 0x7E end)
+      fields_offset_pos ->
+        {elem_start, count} = FB.read_vector_header(fb, fields_offset_pos)
+
+        columns =
+          for i <- 0..(count - 1) do
+            field_pos = FB.read_vector_table(fb, elem_start, i)
+            parse_field_table(fb, field_pos)
+          end
+
+        {:ok, columns}
+    end
   end
 
-  @known_types [
-    @type_int8,
-    @type_int16,
-    @type_int32,
-    @type_int64,
-    @type_uint8,
-    @type_uint16,
-    @type_uint32,
-    @type_uint64,
-    @type_float32,
-    @type_float64,
-    @type_bool,
-    @type_utf8,
-    @type_timestamp
-  ]
+  @spec parse_field_table(binary(), non_neg_integer()) :: column_schema()
+  defp parse_field_table(fb, field_pos) do
+    {vt_pos, vt_size} = FB.read_vtable(fb, field_pos)
 
-  # Peek into a 16-byte window after the name for a recognised type byte.
-  @spec peek_type_byte(binary()) :: non_neg_integer() | nil
-  defp peek_type_byte(data) do
-    data
-    |> :binary.bin_to_list()
-    |> Enum.take(16)
-    |> Enum.find(fn b -> b in @known_types end)
+    # Field slot 0: name (string)
+    name =
+      case FB.field_pos(fb, field_pos, vt_pos, vt_size, 0) do
+        nil -> ""
+        pos -> FB.read_string(fb, pos)
+      end
+
+    # Field slot 2: type_type (union discriminator, uint8)
+    type_type =
+      case FB.field_pos(fb, field_pos, vt_pos, vt_size, 2) do
+        nil -> 0
+        pos -> FB.read_uint8(fb, pos)
+      end
+
+    # Field slot 3: type (union value, offset to type-specific table)
+    type_table_pos =
+      case FB.field_pos(fb, field_pos, vt_pos, vt_size, 3) do
+        nil -> nil
+        pos -> FB.read_offset(fb, pos)
+      end
+
+    type_id = resolve_type_id(fb, type_type, type_table_pos)
+    %{name: name, type_id: type_id}
   end
+
+  @spec resolve_type_id(binary(), non_neg_integer(), non_neg_integer() | nil) ::
+          non_neg_integer()
+  defp resolve_type_id(fb, @fb_type_int, type_pos) when type_pos != nil do
+    {vt_pos, vt_size} = FB.read_vtable(fb, type_pos)
+
+    # Int slot 0: bitWidth (int32)
+    bit_width =
+      case FB.field_pos(fb, type_pos, vt_pos, vt_size, 0) do
+        nil -> 32
+        pos -> FB.read_int32(fb, pos)
+      end
+
+    # Int slot 1: is_signed (bool)
+    is_signed =
+      case FB.field_pos(fb, type_pos, vt_pos, vt_size, 1) do
+        nil -> true
+        pos -> FB.read_bool(fb, pos)
+      end
+
+    map_int_type(bit_width, is_signed)
+  end
+
+  defp resolve_type_id(fb, @fb_type_floating_point, type_pos)
+       when type_pos != nil do
+    {vt_pos, vt_size} = FB.read_vtable(fb, type_pos)
+
+    # FloatingPoint slot 0: precision (int16 enum: HALF=0, SINGLE=1, DOUBLE=2)
+    precision =
+      case FB.field_pos(fb, type_pos, vt_pos, vt_size, 0) do
+        nil -> 2
+        pos -> FB.read_int16(fb, pos)
+      end
+
+    case precision do
+      1 -> @type_float32
+      _other -> @type_float64
+    end
+  end
+
+  defp resolve_type_id(_fb, @fb_type_bool, _type_pos), do: @type_bool
+  defp resolve_type_id(_fb, @fb_type_utf8, _type_pos), do: @type_utf8
+  defp resolve_type_id(_fb, @fb_type_timestamp, _type_pos), do: @type_timestamp
+  defp resolve_type_id(_fb, _type_type, _type_pos), do: 0
+
+  @spec map_int_type(integer(), boolean()) :: non_neg_integer()
+  defp map_int_type(8, true), do: @type_int8
+  defp map_int_type(16, true), do: @type_int16
+  defp map_int_type(32, true), do: @type_int32
+  defp map_int_type(64, true), do: @type_int64
+  defp map_int_type(8, false), do: @type_uint8
+  defp map_int_type(16, false), do: @type_uint16
+  defp map_int_type(32, false), do: @type_uint32
+  defp map_int_type(64, false), do: @type_uint64
+  defp map_int_type(_width, _signed), do: 0
 
   # ---------------------------------------------------------------------------
-  # Private: record batch decoding
+  # Record batch parsing (FlatBuffer-based)
   # ---------------------------------------------------------------------------
 
   @spec decode_batches([FlightData.t()], [column_schema()]) ::
@@ -227,56 +301,112 @@ defmodule InfluxElixir.Flight.Reader do
     end)
   end
 
-  @spec decode_batch(FlightData.t(), [column_schema()]) :: {:ok, [map()]} | {:error, term()}
-  defp decode_batch(%FlightData{data_header: header, data_body: body}, columns) do
-    with {:ok, row_count, buffer_specs} <- parse_record_batch_header(header, columns),
-         {:ok, col_vectors} <- decode_columns(columns, buffer_specs, body, row_count) do
+  @spec decode_batch(FlightData.t(), [column_schema()]) ::
+          {:ok, [map()]} | {:error, term()}
+  defp decode_batch(
+         %FlightData{data_header: header, data_body: body},
+         columns
+       ) do
+    with {:ok, row_count, buffer_specs} <-
+           parse_record_batch_header(header),
+         {:ok, col_vectors} <-
+           decode_columns(columns, buffer_specs, body, row_count) do
       {:ok, zip_columns(columns, col_vectors, row_count)}
     end
   rescue
     e -> {:error, {:decode_error, Exception.message(e)}}
   end
 
-  @spec parse_record_batch_header(binary() | nil, [column_schema()]) ::
-          {:ok, non_neg_integer(), list()} | {:error, term()}
-  defp parse_record_batch_header(nil, _cols), do: {:ok, 0, []}
-  defp parse_record_batch_header(<<>>, _cols), do: {:ok, 0, []}
+  @spec parse_record_batch_header(binary() | nil) ::
+          {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}]}
+          | {:error, term()}
+  defp parse_record_batch_header(nil), do: {:ok, 0, []}
+  defp parse_record_batch_header(<<>>), do: {:ok, 0, []}
 
-  defp parse_record_batch_header(header, columns) do
-    stripped = strip_continuation(header)
-    {row_count, rest} = scan_for_row_count(stripped)
-    buffer_specs = extract_buffer_specs(rest, length(columns))
-    {:ok, row_count, buffer_specs}
+  defp parse_record_batch_header(header) do
+    fb = strip_continuation(header)
+
+    if byte_size(fb) < 8 do
+      {:ok, 0, []}
+    else
+      parse_message_record_batch(fb)
+    end
   rescue
     _err -> {:error, :batch_header_parse_failed}
   end
 
-  @spec scan_for_row_count(binary()) :: {non_neg_integer(), binary()}
-  defp scan_for_row_count(data), do: do_scan_row_count(data)
+  @spec parse_message_record_batch(binary()) ::
+          {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}]}
+          | {:error, term()}
+  defp parse_message_record_batch(fb) do
+    msg_pos = FB.root_table_pos(fb)
+    {vt_pos, vt_size} = FB.read_vtable(fb, msg_pos)
 
-  @spec do_scan_row_count(binary()) :: {non_neg_integer(), binary()}
-  defp do_scan_row_count(<<count::little-64, rest::binary>>)
-       when count > 0 and count < 1_000_000_000,
-       do: {count, rest}
+    # Message field 1: header_type
+    header_type =
+      case FB.field_pos(fb, msg_pos, vt_pos, vt_size, 1) do
+        nil -> 0
+        pos -> FB.read_uint8(fb, pos)
+      end
 
-  defp do_scan_row_count(<<_byte::8, rest::binary>>), do: do_scan_row_count(rest)
-  defp do_scan_row_count(<<>>), do: {0, <<>>}
+    if header_type == @msg_header_record_batch do
+      case FB.field_pos(fb, msg_pos, vt_pos, vt_size, 2) do
+        nil ->
+          {:ok, 0, []}
 
-  @spec extract_buffer_specs(binary(), non_neg_integer()) ::
-          [{non_neg_integer(), non_neg_integer()}]
-  defp extract_buffer_specs(data, num_columns) do
-    data |> scan_buffer_pairs([]) |> Enum.take(num_columns * 3)
+        header_offset_pos ->
+          rb_pos = FB.read_offset(fb, header_offset_pos)
+          parse_record_batch_table(fb, rb_pos)
+      end
+    else
+      {:ok, 0, []}
+    end
   end
 
-  @spec scan_buffer_pairs(binary(), list()) :: [{non_neg_integer(), non_neg_integer()}]
-  defp scan_buffer_pairs(<<>>, acc), do: Enum.reverse(acc)
+  @spec parse_record_batch_table(binary(), non_neg_integer()) ::
+          {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}]}
+  defp parse_record_batch_table(fb, rb_pos) do
+    {vt_pos, vt_size} = FB.read_vtable(fb, rb_pos)
 
-  defp scan_buffer_pairs(<<offset::little-64, len::little-64, rest::binary>>, acc)
-       when offset >= 0 and len >= 0 and
-              offset < 1_000_000_000 and len < 100_000_000,
-       do: scan_buffer_pairs(rest, [{offset, len} | acc])
+    # RecordBatch slot 0: length (int64)
+    row_count =
+      case FB.field_pos(fb, rb_pos, vt_pos, vt_size, 0) do
+        nil -> 0
+        pos -> FB.read_int64(fb, pos)
+      end
 
-  defp scan_buffer_pairs(<<_byte::8, rest::binary>>, acc), do: scan_buffer_pairs(rest, acc)
+    # RecordBatch slot 2: buffers (vector of Buffer structs, 16 bytes each)
+    buffer_specs =
+      case FB.field_pos(fb, rb_pos, vt_pos, vt_size, 2) do
+        nil ->
+          []
+
+        buffers_offset_pos ->
+          {elem_start, count} =
+            FB.read_vector_header(fb, buffers_offset_pos)
+
+          for i <- 0..(count - 1) do
+            pos = elem_start + i * 16
+            offset = FB.read_int64(fb, pos)
+            len = FB.read_int64(fb, pos + 8)
+            {offset, len}
+          end
+      end
+
+    {:ok, row_count, buffer_specs}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private: IPC stream helpers
+  # ---------------------------------------------------------------------------
+
+  # Strip IPC stream continuation marker and metadata-length prefix.
+  # Format: <<0xFF, 0xFF, 0xFF, 0xFF, len::little-32, flatbuffer...>>
+  @spec strip_continuation(binary()) :: binary()
+  defp strip_continuation(<<@continuation_marker, _meta_len::little-32, rest::binary>>),
+    do: rest
+
+  defp strip_continuation(bin), do: bin
 
   # ---------------------------------------------------------------------------
   # Private: column decoding
@@ -304,29 +434,53 @@ defmodule InfluxElixir.Flight.Reader do
   end
 
   @spec allocate_buffers(non_neg_integer(), list()) :: {list(), list()}
-  defp allocate_buffers(@type_utf8, specs), do: {Enum.take(specs, 3), Enum.drop(specs, 3)}
-  defp allocate_buffers(_type_id, specs), do: {Enum.take(specs, 2), Enum.drop(specs, 2)}
+  defp allocate_buffers(@type_utf8, specs) do
+    {Enum.take(specs, 3), Enum.drop(specs, 3)}
+  end
 
-  @spec decode_column(non_neg_integer(), list(), binary(), non_neg_integer()) :: [term()]
+  defp allocate_buffers(_type_id, specs) do
+    {Enum.take(specs, 2), Enum.drop(specs, 2)}
+  end
+
+  @spec decode_column(non_neg_integer(), list(), binary(), non_neg_integer()) ::
+          [term()]
   defp decode_column(_type_id, [], _body, n), do: List.duplicate(nil, n)
 
   defp decode_column(type_id, [{_voff, vlen} | data_specs], body, n) do
     validity =
       case data_specs do
-        [{off, _len} | _rest] when vlen > 0 -> safe_slice(body, off - vlen, vlen)
-        _other -> nil
+        [{off, _len} | _rest] when vlen > 0 ->
+          safe_slice(body, off - vlen, vlen)
+
+        _other ->
+          nil
       end
 
     values = decode_column_values(type_id, data_specs, body, n)
     apply_nulls(values, validity, n)
   end
 
-  @spec decode_column_values(non_neg_integer(), list(), binary(), non_neg_integer()) :: [term()]
-  defp decode_column_values(@type_utf8, [{oo, ol}, {doff, dlen} | _rest], body, _n) do
+  @spec decode_column_values(
+          non_neg_integer(),
+          list(),
+          binary(),
+          non_neg_integer()
+        ) :: [term()]
+  defp decode_column_values(
+         @type_utf8,
+         [{oo, ol}, {doff, dlen} | _rest],
+         body,
+         _n
+       ) do
     decode_utf8_column(safe_slice(body, oo, ol), safe_slice(body, doff, dlen))
   end
 
-  defp decode_column_values(@type_utf8, [{oo, _off_len} | _rest], body, _n) do
+  defp decode_column_values(
+         @type_utf8,
+         [{oo, _off_len} | _rest],
+         body,
+         _n
+       ) do
     decode_utf8_column(<<>>, safe_slice(body, oo, byte_size(body) - oo))
   end
 
@@ -336,34 +490,73 @@ defmodule InfluxElixir.Flight.Reader do
     decode_fixed_column(type_id, data, width, n)
   end
 
-  defp decode_column_values(_type_id, [], _body, n), do: List.duplicate(nil, n)
+  defp decode_column_values(_type_id, [], _body, n) do
+    List.duplicate(nil, n)
+  end
 
-  @spec decode_fixed_column(non_neg_integer(), binary(), non_neg_integer(), non_neg_integer()) ::
-          [term()]
-  defp decode_fixed_column(@type_int64, d, 8, n), do: decode_ints(d, n, 8, :signed)
-  defp decode_fixed_column(@type_timestamp, d, 8, n), do: decode_ints(d, n, 8, :signed)
-  defp decode_fixed_column(@type_uint64, d, 8, n), do: decode_ints(d, n, 8, :unsigned)
+  @spec decode_fixed_column(
+          non_neg_integer(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: [term()]
+  defp decode_fixed_column(@type_int64, d, 8, n) do
+    decode_ints(d, n, 8, :signed)
+  end
+
+  defp decode_fixed_column(@type_timestamp, d, 8, n) do
+    decode_ints(d, n, 8, :signed)
+  end
+
+  defp decode_fixed_column(@type_uint64, d, 8, n) do
+    decode_ints(d, n, 8, :unsigned)
+  end
+
   defp decode_fixed_column(@type_float64, d, 8, n), do: decode_floats(d, n, 8)
   defp decode_fixed_column(@type_float32, d, 4, n), do: decode_floats(d, n, 4)
-  defp decode_fixed_column(@type_int32, d, 4, n), do: decode_ints(d, n, 4, :signed)
-  defp decode_fixed_column(@type_uint32, d, 4, n), do: decode_ints(d, n, 4, :unsigned)
-  defp decode_fixed_column(@type_int16, d, 2, n), do: decode_ints(d, n, 2, :signed)
-  defp decode_fixed_column(@type_uint16, d, 2, n), do: decode_ints(d, n, 2, :unsigned)
-  defp decode_fixed_column(@type_int8, d, 1, n), do: decode_ints(d, n, 1, :signed)
-  defp decode_fixed_column(@type_uint8, d, 1, n), do: decode_ints(d, n, 1, :unsigned)
+
+  defp decode_fixed_column(@type_int32, d, 4, n) do
+    decode_ints(d, n, 4, :signed)
+  end
+
+  defp decode_fixed_column(@type_uint32, d, 4, n) do
+    decode_ints(d, n, 4, :unsigned)
+  end
+
+  defp decode_fixed_column(@type_int16, d, 2, n) do
+    decode_ints(d, n, 2, :signed)
+  end
+
+  defp decode_fixed_column(@type_uint16, d, 2, n) do
+    decode_ints(d, n, 2, :unsigned)
+  end
+
+  defp decode_fixed_column(@type_int8, d, 1, n) do
+    decode_ints(d, n, 1, :signed)
+  end
+
+  defp decode_fixed_column(@type_uint8, d, 1, n) do
+    decode_ints(d, n, 1, :unsigned)
+  end
+
   defp decode_fixed_column(@type_bool, d, 0, n), do: decode_bools(d, n)
   defp decode_fixed_column(_type_id, _d, _w, n), do: List.duplicate(nil, n)
 
-  @spec decode_ints(binary(), non_neg_integer(), pos_integer(), :signed | :unsigned) ::
-          [integer() | nil]
+  @spec decode_ints(
+          binary(),
+          non_neg_integer(),
+          pos_integer(),
+          :signed | :unsigned
+        ) :: [integer() | nil]
   defp decode_ints(data, n, width, signedness) do
-    for i <- 0..(n - 1) do
+    for i <- 0..(n - 1)//1 do
       chunk = safe_slice(data, i * width, width)
       decode_int_chunk(chunk, width, signedness)
     end
   end
 
-  @spec decode_int_chunk(binary(), pos_integer(), :signed | :unsigned) :: integer() | nil
+  @spec decode_int_chunk(binary(), pos_integer(), :signed | :unsigned) ::
+          integer() | nil
   defp decode_int_chunk(<<v::little-signed-64>>, 8, :signed), do: v
   defp decode_int_chunk(<<v::little-unsigned-64>>, 8, :unsigned), do: v
   defp decode_int_chunk(<<v::little-signed-32>>, 4, :signed), do: v
@@ -374,9 +567,10 @@ defmodule InfluxElixir.Flight.Reader do
   defp decode_int_chunk(<<v::little-unsigned-8>>, 1, :unsigned), do: v
   defp decode_int_chunk(_chunk, _width, _sign), do: nil
 
-  @spec decode_floats(binary(), non_neg_integer(), pos_integer()) :: [float() | nil]
+  @spec decode_floats(binary(), non_neg_integer(), pos_integer()) ::
+          [float() | nil]
   defp decode_floats(data, n, width) do
-    for i <- 0..(n - 1) do
+    for i <- 0..(n - 1)//1 do
       chunk = safe_slice(data, i * width, width)
       decode_float_chunk(chunk, width)
     end
@@ -389,7 +583,7 @@ defmodule InfluxElixir.Flight.Reader do
 
   @spec decode_bools(binary(), non_neg_integer()) :: [boolean() | nil]
   defp decode_bools(data, n) do
-    for i <- 0..(n - 1) do
+    for i <- 0..(n - 1)//1 do
       byte_idx = div(i, 8)
       bit_idx = rem(i, 8)
 
@@ -435,7 +629,7 @@ defmodule InfluxElixir.Flight.Reader do
   defp apply_nulls(values, <<>>, _n), do: values
 
   defp apply_nulls(values, validity, n) do
-    0..(n - 1)
+    0..(n - 1)//1
     |> Enum.zip(values)
     |> Enum.map(fn {i, value} ->
       byte_idx = div(i, 8)
@@ -453,13 +647,14 @@ defmodule InfluxElixir.Flight.Reader do
   # Private: row assembly
   # ---------------------------------------------------------------------------
 
-  @spec zip_columns([column_schema()], [[term()]], non_neg_integer()) :: [map()]
+  @spec zip_columns([column_schema()], [[term()]], non_neg_integer()) ::
+          [map()]
   defp zip_columns(_columns, _vectors, 0), do: []
 
   defp zip_columns(columns, vectors, n) do
     names = Enum.map(columns, & &1.name)
 
-    for i <- 0..(n - 1) do
+    for i <- 0..(n - 1)//1 do
       names
       |> Enum.zip(vectors)
       |> Enum.map(fn {name, col} -> {name, Enum.at(col, i)} end)
@@ -472,7 +667,8 @@ defmodule InfluxElixir.Flight.Reader do
   # ---------------------------------------------------------------------------
 
   @spec safe_slice(binary(), non_neg_integer(), non_neg_integer()) :: binary()
-  defp safe_slice(bin, offset, len) when is_binary(bin) and offset >= 0 and len >= 0 do
+  defp safe_slice(bin, offset, len)
+       when is_binary(bin) and offset >= 0 and len >= 0 do
     available = byte_size(bin) - offset
 
     cond do

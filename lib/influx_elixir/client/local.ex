@@ -85,6 +85,10 @@ defmodule InfluxElixir.Client.Local do
   """
   @spec start(keyword()) :: {:ok, conn()}
   def start(opts \\ []) do
+    # :public access is intentional — allows async: true tests where
+    # the test process and the LocalClient caller are different processes.
+    # A GenServer wrapper would be correct for production but adds latency
+    # and complexity to a test-only client.
     table = :ets.new(:influx_local, [:set, :public])
     # Always include "default" so writes without an explicit database: opt succeed.
     databases =

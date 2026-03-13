@@ -69,9 +69,6 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
 
     test "rejects writes when buffer is at capacity", %{conn: conn} do
-      # To test backpressure, we artificially fill the GenServer's
-      # buffer using :sys.replace_state, since with instant LocalClient
-      # flushes, auto-flush prevents the buffer from naturally filling.
       pid =
         start_writer(conn,
           batch_size: 3,
@@ -95,7 +92,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert :ok = BatchWriter.write_sync(pid, "cpu value=1.0")
     end
 
-    test "increments total_writes after successful sync write", %{conn: conn} do
+    test "increments total_writes after successful sync write",
+         %{conn: conn} do
       pid = start_writer(conn)
       :ok = BatchWriter.write_sync(pid, "cpu value=1.0")
 
@@ -121,7 +119,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert :ok = BatchWriter.flush(pid)
     end
 
-    test "flushes buffered writes and increments total_writes", %{conn: conn} do
+    test "flushes buffered writes and increments total_writes",
+         %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 60_000)
       :ok = BatchWriter.write(pid, "cpu value=1.0")
       :ok = BatchWriter.write(pid, "cpu value=2.0")
@@ -187,12 +186,60 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
+  describe "handle_continue/2" do
+    test "schedules flush timer after init", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 50)
+
+      # The timer should be set — verify by checking state
+      state = :sys.get_state(pid)
+      assert state.timer_ref != nil
+    end
+  end
+
+  describe "terminate/2" do
+    test "flushes buffered data on shutdown", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000)
+      :ok = BatchWriter.write(pid, "cpu value=42.0")
+
+      # Stop the GenServer — terminate/2 should flush
+      GenServer.stop(pid)
+
+      # Verify the data was written to the LocalClient
+      {:ok, rows} =
+        Local.query_sql(conn, "SELECT * FROM cpu", database: "default")
+
+      assert rows != []
+    end
+  end
+
   describe "GenServer lifecycle" do
     test "can be stopped cleanly", %{conn: conn} do
       pid = start_writer(conn)
       assert Process.alive?(pid)
       GenServer.stop(pid)
       refute Process.alive?(pid)
+    end
+  end
+
+  describe "struct-based state" do
+    test "state is a BatchWriter struct", %{conn: conn} do
+      pid = start_writer(conn)
+      state = :sys.get_state(pid)
+      assert %BatchWriter{} = state
+    end
+
+    test "struct fields match configured options", %{conn: conn} do
+      pid =
+        start_writer(conn,
+          batch_size: 42,
+          flush_interval_ms: 500,
+          max_retries: 5
+        )
+
+      state = :sys.get_state(pid)
+      assert state.batch_size == 42
+      assert state.flush_interval_ms == 500
+      assert state.max_retries == 5
     end
   end
 end

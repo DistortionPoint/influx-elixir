@@ -152,15 +152,14 @@ defmodule InfluxElixirTest do
   end
 
   describe "flush/1" do
-    test "returns :ok" do
-      assert :ok = InfluxElixir.flush(:default)
+    test "returns {:error, :no_batch_writer} when no writer configured" do
+      assert {:error, :no_batch_writer} = InfluxElixir.flush(:default)
     end
   end
 
   describe "stats/1" do
-    test "returns {:ok, map}" do
-      assert {:ok, stats} = InfluxElixir.stats(:default)
-      assert is_map(stats)
+    test "returns {:error, :no_batch_writer} when no writer configured" do
+      assert {:error, :no_batch_writer} = InfluxElixir.stats(:default)
     end
   end
 

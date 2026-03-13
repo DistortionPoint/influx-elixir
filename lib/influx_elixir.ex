@@ -228,18 +228,36 @@ defmodule InfluxElixir do
 
   @doc """
   Forces an immediate flush of the batch writer for a connection.
+
+  Returns `:ok` on success or `{:error, :no_batch_writer}` if no
+  batch writer is configured for the given connection.
   """
-  @spec flush(atom()) :: :ok
-  def flush(_connection_name) do
-    :ok
+  @spec flush(atom()) :: :ok | {:error, :no_batch_writer}
+  def flush(connection_name) do
+    bw = InfluxElixir.ConnectionSupervisor.batch_writer_name(connection_name)
+
+    if Process.whereis(bw) do
+      InfluxElixir.Write.BatchWriter.flush(bw)
+    else
+      {:error, :no_batch_writer}
+    end
   end
 
   @doc """
   Returns batch writer statistics for a connection.
+
+  Returns `{:ok, stats_map}` or `{:error, :no_batch_writer}` if no
+  batch writer is configured for the given connection.
   """
-  @spec stats(atom()) :: {:ok, map()}
-  def stats(_connection_name) do
-    {:ok, %{}}
+  @spec stats(atom()) :: {:ok, map()} | {:error, :no_batch_writer}
+  def stats(connection_name) do
+    bw = InfluxElixir.ConnectionSupervisor.batch_writer_name(connection_name)
+
+    if Process.whereis(bw) do
+      InfluxElixir.Write.BatchWriter.stats(bw)
+    else
+      {:error, :no_batch_writer}
+    end
   end
 
   # ---------- Dynamic Connections ----------
