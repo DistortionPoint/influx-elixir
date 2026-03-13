@@ -1,0 +1,2 @@
+- [feedback_no_single_work_refs.md](feedback_no_single_work_refs.md) — CLAUDE.md should not reference individual design docs or work items
+- [feedback_no_mocking.md](feedback_no_mocking.md) — Never use mocking libraries (Mox, Bypass, etc.) — test against real services
