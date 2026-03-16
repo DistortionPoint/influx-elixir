@@ -53,7 +53,7 @@ defmodule InfluxElixir.ContractTest do
     test "includes databases that were pre-created at start", %{conn: conn} do
       {:ok, dbs} = Local.list_databases(conn)
 
-      names = Enum.map(dbs, & &1.name)
+      names = Enum.map(dbs, & &1["name"])
       assert "contract_db" in names
     end
 
@@ -61,16 +61,16 @@ defmodule InfluxElixir.ContractTest do
       :ok = Local.create_database(conn, "extra_db", [])
       {:ok, dbs} = Local.list_databases(conn)
 
-      names = Enum.map(dbs, & &1.name)
+      names = Enum.map(dbs, & &1["name"])
       assert "extra_db" in names
     end
 
-    test "each entry is a map with a :name key containing a string", %{conn: conn} do
+    test "each entry is a map with a string name key", %{conn: conn} do
       {:ok, dbs} = Local.list_databases(conn)
 
       Enum.each(dbs, fn db ->
         assert is_map(db)
-        assert is_binary(db.name)
+        assert is_binary(db["name"])
       end)
     end
   end
@@ -89,7 +89,7 @@ defmodule InfluxElixir.ContractTest do
       :ok = Local.create_database(conn, "gone_db", [])
       :ok = Local.delete_database(conn, "gone_db")
       {:ok, dbs} = Local.list_databases(conn)
-      names = Enum.map(dbs, & &1.name)
+      names = Enum.map(dbs, & &1["name"])
       refute "gone_db" in names
     end
   end
@@ -324,14 +324,14 @@ defmodule InfluxElixir.ContractTest do
   # ---------------------------------------------------------------------------
 
   describe "health/1" do
-    test "returns {:ok, map} with a :status key", %{conn: conn} do
+    test "returns {:ok, map} with a string status key", %{conn: conn} do
       {:ok, result} = Local.health(conn)
       assert is_map(result)
-      assert Map.has_key?(result, :status)
+      assert Map.has_key?(result, "status")
     end
 
     test "reports a passing status", %{conn: conn} do
-      {:ok, %{status: status}} = Local.health(conn)
+      {:ok, %{"status" => status}} = Local.health(conn)
       assert status == "pass"
     end
   end
@@ -343,7 +343,7 @@ defmodule InfluxElixir.ContractTest do
   @tag :integration
   test "real InfluxDB: health returns passing status" do
     conn = build_real_conn()
-    {:ok, %{status: status}} = InfluxElixir.Client.HTTP.health(conn)
+    {:ok, %{"status" => status}} = InfluxElixir.Client.HTTP.health(conn)
     assert status in ["pass", "ok"]
   end
 
@@ -369,13 +369,11 @@ defmodule InfluxElixir.ContractTest do
   # Private helpers used only by @tag :integration tests
   # ---------------------------------------------------------------------------
 
-  @spec build_real_conn() :: map()
+  @spec build_real_conn() :: keyword()
   defp build_real_conn do
-    %{
-      host: System.get_env("INFLUXDB_HOST", "http://localhost:8086"),
-      token: System.fetch_env!("INFLUXDB_TOKEN"),
-      org: System.get_env("INFLUXDB_ORG", "")
-    }
+    InfluxElixir.IntegrationHelper.start_finch()
+
+    InfluxElixir.IntegrationHelper.v3_core_conn(database: integration_database())
   end
 
   @spec integration_database() :: binary()

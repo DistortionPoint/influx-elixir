@@ -39,33 +39,34 @@ defmodule InfluxElixir.Client.HTTP do
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(connection, line_protocol, opts \\ []) do
-    database = Keyword.get(opts, :database, conn_val(connection, :database))
-    precision = Keyword.get(opts, :precision, "nanosecond")
-    gzip? = Keyword.get(opts, :gzip, false)
+    with {:ok, database} <- resolve_database(opts, connection) do
+      precision = Keyword.get(opts, :precision, "nanosecond")
+      gzip? = Keyword.get(opts, :gzip, false)
 
-    url =
-      base_url(connection) <>
-        "/api/v2/write?db=#{URI.encode(database)}" <>
-        "&precision=#{precision}"
+      url =
+        base_url(connection) <>
+          "/api/v2/write?db=#{URI.encode(database)}" <>
+          "&precision=#{precision}"
 
-    headers = auth_headers(connection)
+      headers = auth_headers(connection)
 
-    {body, headers} =
-      if gzip? do
-        {line_protocol, [{"content-encoding", "gzip"} | headers]}
-      else
-        {line_protocol, headers}
+      {body, headers} =
+        if gzip? do
+          {line_protocol, [{"content-encoding", "gzip"} | headers]}
+        else
+          {line_protocol, headers}
+        end
+
+      case do_request(:post, url, headers, body, connection) do
+        {:ok, %Finch.Response{status: status}} when status in [200, 204] ->
+          {:ok, :written}
+
+        {:ok, %Finch.Response{status: status, body: resp_body}} ->
+          {:error, %{status: status, body: resp_body}}
+
+        {:error, reason} ->
+          {:error, {:connection_error, reason}}
       end
-
-    case do_request(:post, url, headers, body, connection) do
-      {:ok, %Finch.Response{status: status}} when status in [200, 204] ->
-        {:ok, :written}
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
     end
   end
 
@@ -77,30 +78,31 @@ defmodule InfluxElixir.Client.HTTP do
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_sql(connection, sql, opts \\ []) do
-    database = Keyword.get(opts, :database, conn_val(connection, :database))
-    params = Keyword.get(opts, :params, %{})
-    format = Keyword.get(opts, :format, :json)
+    with {:ok, database} <- resolve_database(opts, connection) do
+      params = Keyword.get(opts, :params, %{})
+      format = Keyword.get(opts, :format, :json)
 
-    body =
-      Jason.encode!(%{
-        "database" => database,
-        "sql" => sql,
-        "params" => params,
-        "format" => to_string(format)
-      })
+      body =
+        Jason.encode!(%{
+          "database" => database,
+          "sql" => sql,
+          "params" => params,
+          "format" => to_string(format)
+        })
 
-    url = base_url(connection) <> "/api/v3/query_sql"
-    headers = json_headers(connection)
+      url = base_url(connection) <> "/api/v3/query_sql"
+      headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection) do
-      {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-        ResponseParser.parse(resp_body, format)
+      case do_request(:post, url, headers, body, connection) do
+        {:ok, %Finch.Response{status: 200, body: resp_body}} ->
+          ResponseParser.parse(resp_body, format)
 
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
+        {:ok, %Finch.Response{status: status, body: resp_body}} ->
+          {:error, %{status: status, body: resp_body}}
 
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+        {:error, reason} ->
+          {:error, {:connection_error, reason}}
+      end
     end
   end
 
@@ -111,48 +113,53 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: Enumerable.t()
   def query_sql_stream(connection, sql, opts \\ []) do
-    database = Keyword.get(opts, :database, conn_val(connection, :database))
-    params = Keyword.get(opts, :params, %{})
+    case resolve_database(opts, connection) do
+      {:ok, database} ->
+        params = Keyword.get(opts, :params, %{})
 
-    body =
-      Jason.encode!(%{
-        "database" => database,
-        "sql" => sql,
-        "params" => params,
-        "format" => "jsonl"
-      })
+        body =
+          Jason.encode!(%{
+            "database" => database,
+            "sql" => sql,
+            "params" => params,
+            "format" => "jsonl"
+          })
 
-    url = base_url(connection) <> "/api/v3/query_sql"
-    headers = json_headers(connection)
-    finch_name = resolve_finch(connection)
+        url = base_url(connection) <> "/api/v3/query_sql"
+        headers = json_headers(connection)
+        finch_name = resolve_finch(connection)
 
-    Stream.resource(
-      fn -> start_stream(finch_name, url, headers, body) end,
-      &stream_next/1,
-      &stream_cleanup/1
-    )
+        Stream.resource(
+          fn -> start_stream(finch_name, url, headers, body) end,
+          &stream_next/1,
+          &stream_cleanup/1
+        )
+
+      {:error, _reason} ->
+        Stream.map([], & &1)
+    end
   end
 
   @impl true
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def execute_sql(connection, sql, opts \\ []) do
-    database = Keyword.get(opts, :database, conn_val(connection, :database))
+    with {:ok, database} <- resolve_database(opts, connection) do
+      body = Jason.encode!(%{"database" => database, "sql" => sql})
 
-    body = Jason.encode!(%{"database" => database, "sql" => sql})
+      url = base_url(connection) <> "/api/v3/query_sql"
+      headers = json_headers(connection)
 
-    url = base_url(connection) <> "/api/v3/query_sql"
-    headers = json_headers(connection)
+      case do_request(:post, url, headers, body, connection) do
+        {:ok, %Finch.Response{status: 200, body: resp_body}} ->
+          Jason.decode(resp_body)
 
-    case do_request(:post, url, headers, body, connection) do
-      {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-        Jason.decode(resp_body)
+        {:ok, %Finch.Response{status: status, body: resp_body}} ->
+          {:error, %{status: status, body: resp_body}}
 
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+        {:error, reason} ->
+          {:error, {:connection_error, reason}}
+      end
     end
   end
 
@@ -167,28 +174,29 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(connection, influxql, opts \\ []) do
-    database = Keyword.get(opts, :database, conn_val(connection, :database))
-    format = Keyword.get(opts, :format, :json)
+    with {:ok, database} <- resolve_database(opts, connection) do
+      format = Keyword.get(opts, :format, :json)
 
-    body =
-      Jason.encode!(%{
-        "database" => database,
-        "query" => influxql,
-        "format" => to_string(format)
-      })
+      body =
+        Jason.encode!(%{
+          "database" => database,
+          "query" => influxql,
+          "format" => to_string(format)
+        })
 
-    url = base_url(connection) <> "/api/v3/query_influxql"
-    headers = json_headers(connection)
+      url = base_url(connection) <> "/api/v3/query_influxql"
+      headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection) do
-      {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-        ResponseParser.parse(resp_body, format)
+      case do_request(:post, url, headers, body, connection) do
+        {:ok, %Finch.Response{status: 200, body: resp_body}} ->
+          ResponseParser.parse(resp_body, format)
 
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
+        {:ok, %Finch.Response{status: status, body: resp_body}} ->
+          {:error, %{status: status, body: resp_body}}
 
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+        {:error, reason} ->
+          {:error, {:connection_error, reason}}
+      end
     end
   end
 
@@ -511,6 +519,15 @@ defmodule InfluxElixir.Client.HTTP do
   @spec conn_val(keyword(), atom(), term()) :: term()
   defp conn_val(connection, key, default \\ nil) do
     Keyword.get(connection, key, default)
+  end
+
+  @spec resolve_database(keyword(), keyword()) ::
+          {:ok, binary()} | {:error, :no_database_specified}
+  defp resolve_database(opts, connection) do
+    case Keyword.get(opts, :database, conn_val(connection, :database)) do
+      nil -> {:error, :no_database_specified}
+      db -> {:ok, db}
+    end
   end
 
   # ---------------------------------------------------------------------------

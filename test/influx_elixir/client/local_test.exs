@@ -41,8 +41,8 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, dbs_a} = Local.list_databases(conn_a)
       {:ok, dbs_b} = Local.list_databases(conn_b)
 
-      names_a = Enum.map(dbs_a, & &1.name)
-      names_b = Enum.map(dbs_b, & &1.name)
+      names_a = Enum.map(dbs_a, & &1["name"])
+      names_b = Enum.map(dbs_b, & &1["name"])
 
       assert "only_a" in names_a
       refute "only_b" in names_a
@@ -82,7 +82,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, :written} =
                Local.write(conn, "cpu value=1.0", database: "metrics")
 
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: "metrics")
       assert row["value"] == 1.0
     end
   end
@@ -99,50 +99,50 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "integer field", %{conn: conn, db: db} do
       Local.write(conn, "m count=42i", database: db)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["count"] == 42
     end
 
     test "float field", %{conn: conn, db: db} do
       Local.write(conn, "m temp=98.6", database: db)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["temp"] == 98.6
     end
 
     test "string field", %{conn: conn, db: db} do
       Local.write(conn, ~S(m label="hello world"), database: db)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["label"] == "hello world"
     end
 
     test "boolean true field", %{conn: conn, db: db} do
       Local.write(conn, "m active=true", database: db)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["active"] == true
     end
 
     test "boolean false field", %{conn: conn, db: db} do
       Local.write(conn, "m active=false", database: db)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["active"] == false
     end
 
     test "tag is preserved", %{conn: conn, db: db} do
       Local.write(conn, "m,host=server01 value=1i", database: db)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["host"] == "server01"
     end
 
     test "multiple tags are preserved", %{conn: conn, db: db} do
       Local.write(conn, "m,host=s1,region=us-east value=1i", database: db)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["host"] == "s1"
       assert row["region"] == "us-east"
     end
 
     test "multiple fields are preserved", %{conn: conn, db: db} do
       Local.write(conn, "m a=1i,b=2.0,c=\"hi\"", database: db)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["a"] == 1
       assert row["b"] == 2.0
       assert row["c"] == "hi"
@@ -151,26 +151,26 @@ defmodule InfluxElixir.Client.LocalTest do
     test "timestamp is stored in nanoseconds", %{conn: conn, db: db} do
       ts = 1_630_424_257_000_000_000
       Local.write(conn, "m value=1.0 #{ts}", database: db)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["time"] == ts
     end
 
     test "multi-line write stores multiple points", %{conn: conn, db: db} do
       lp = "m value=1.0\nm value=2.0\nm value=3.0"
       Local.write(conn, lp, database: db)
-      assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert length(rows) == 3
     end
 
     test "measurement with escaped space in name", %{conn: conn, db: db} do
       Local.write(conn, "my\\ measurement value=1i", database: db)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM my\\ measurement")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM my\\ measurement", database: db)
       assert row["_measurement"] == "my measurement"
     end
 
     test "string field with escaped quotes", %{conn: conn, db: db} do
       Local.write(conn, ~S(m msg="say \"hi\""), database: db)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["msg"] == ~s(say "hi")
     end
   end
@@ -185,7 +185,7 @@ defmodule InfluxElixir.Client.LocalTest do
       lp = "cpu value=1.0"
       compressed = :zlib.gzip(lp)
       assert {:ok, :written} = Local.write(conn, compressed, database: "gz_db")
-      assert {:ok, [_row]} = Local.query_sql(conn, "SELECT * FROM cpu")
+      assert {:ok, [_row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: "gz_db")
     end
 
     test "invalid gzip returns 400 error", %{conn: conn} do
@@ -208,28 +208,28 @@ defmodule InfluxElixir.Client.LocalTest do
     test "nanosecond precision is stored as-is", %{conn: conn, db: db} do
       ts = 1_000_000_000
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :nanosecond)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["time"] == 1_000_000_000
     end
 
     test "microsecond precision is multiplied by 1_000", %{conn: conn, db: db} do
       ts = 1_000_000
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :microsecond)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["time"] == 1_000_000_000
     end
 
     test "millisecond precision is multiplied by 1_000_000", %{conn: conn, db: db} do
       ts = 1_000
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :millisecond)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["time"] == 1_000_000_000
     end
 
     test "second precision is multiplied by 1_000_000_000", %{conn: conn, db: db} do
       ts = 1
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :second)
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["time"] == 1_000_000_000
     end
   end
@@ -252,87 +252,93 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "qdb"}
     end
 
-    test "returns empty list for unknown measurement", %{conn: conn} do
-      assert {:ok, []} = Local.query_sql(conn, "SELECT * FROM no_such_measurement")
+    test "returns empty list for unknown measurement", %{conn: conn, db: db} do
+      assert {:ok, []} =
+               Local.query_sql(conn, "SELECT * FROM no_such_measurement", database: db)
     end
 
-    test "returns all rows for bare SELECT *", %{conn: conn} do
-      assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM cpu")
+    test "returns all rows for bare SELECT *", %{conn: conn, db: db} do
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
       assert length(rows) == 3
     end
 
-    test "WHERE tag = 'value' filters rows", %{conn: conn} do
+    test "WHERE tag = 'value' filters rows", %{conn: conn, db: db} do
       assert {:ok, rows} =
-               Local.query_sql(conn, "SELECT * FROM cpu WHERE host = 'web01'")
+               Local.query_sql(conn, "SELECT * FROM cpu WHERE host = 'web01'", database: db)
 
       assert length(rows) == 2
       assert Enum.all?(rows, &(&1["host"] == "web01"))
     end
 
-    test "WHERE field > N filters rows", %{conn: conn} do
+    test "WHERE field > N filters rows", %{conn: conn, db: db} do
       assert {:ok, rows} =
-               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage > 15")
+               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage > 15", database: db)
 
       assert length(rows) == 2
     end
 
-    test "WHERE field < N filters rows", %{conn: conn} do
+    test "WHERE field < N filters rows", %{conn: conn, db: db} do
       assert {:ok, rows} =
-               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage < 15")
+               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage < 15", database: db)
 
       assert length(rows) == 1
       assert hd(rows)["usage"] == 10
     end
 
-    test "WHERE field >= N filters rows", %{conn: conn} do
+    test "WHERE field >= N filters rows", %{conn: conn, db: db} do
       assert {:ok, rows} =
-               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage >= 20")
+               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage >= 20", database: db)
 
       assert length(rows) == 2
     end
 
-    test "WHERE field <= N filters rows", %{conn: conn} do
+    test "WHERE field <= N filters rows", %{conn: conn, db: db} do
       assert {:ok, rows} =
-               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage <= 20")
+               Local.query_sql(conn, "SELECT * FROM cpu WHERE usage <= 20", database: db)
 
       assert length(rows) == 2
     end
 
-    test "ORDER BY time ASC", %{conn: conn} do
+    test "ORDER BY time ASC", %{conn: conn, db: db} do
       assert {:ok, rows} =
-               Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time ASC")
+               Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time ASC", database: db)
 
       times = Enum.map(rows, & &1["time"])
       assert times == Enum.sort(times)
     end
 
-    test "ORDER BY time DESC", %{conn: conn} do
+    test "ORDER BY time DESC", %{conn: conn, db: db} do
       assert {:ok, rows} =
-               Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time DESC")
+               Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time DESC", database: db)
 
       times = Enum.map(rows, & &1["time"])
       assert times == Enum.sort(times, :desc)
     end
 
-    test "LIMIT reduces number of results", %{conn: conn} do
-      assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM cpu LIMIT 2")
+    test "LIMIT reduces number of results", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM cpu LIMIT 2", database: db)
+
       assert length(rows) == 2
     end
 
-    test "combined WHERE + ORDER BY + LIMIT", %{conn: conn} do
+    test "combined WHERE + ORDER BY + LIMIT", %{conn: conn, db: db} do
       sql = "SELECT * FROM cpu WHERE region = 'us-east' ORDER BY time DESC LIMIT 1"
-      assert {:ok, [row]} = Local.query_sql(conn, sql)
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
       assert row["region"] == "us-east"
       assert row["time"] == 3000
     end
 
-    test "each row includes _measurement key", %{conn: conn} do
-      assert {:ok, [row | _rest]} = Local.query_sql(conn, "SELECT * FROM cpu")
+    test "each row includes _measurement key", %{conn: conn, db: db} do
+      assert {:ok, [row | _rest]} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+
       assert row["_measurement"] == "cpu"
     end
 
-    test "unsupported SQL returns error", %{conn: conn} do
-      assert {:error, _reason} = Local.query_sql(conn, "INSERT INTO cpu VALUES (1)")
+    test "unsupported SQL returns error", %{conn: conn, db: db} do
+      assert {:error, _reason} =
+               Local.query_sql(conn, "INSERT INTO cpu VALUES (1)", database: db)
     end
   end
 
@@ -353,18 +359,18 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "pdb"}
     end
 
-    test "string param substitution", %{conn: conn} do
+    test "string param substitution", %{conn: conn, db: db} do
       sql = "SELECT * FROM cpu WHERE host = $host"
       params = %{"$host" => "web01"}
-      assert {:ok, rows} = Local.query_sql(conn, sql, params: params)
+      assert {:ok, rows} = Local.query_sql(conn, sql, params: params, database: db)
       assert length(rows) == 1
       assert hd(rows)["host"] == "web01"
     end
 
-    test "integer param substitution", %{conn: conn} do
+    test "integer param substitution", %{conn: conn, db: db} do
       sql = "SELECT * FROM cpu WHERE usage > $min"
       params = %{"$min" => 15}
-      assert {:ok, rows} = Local.query_sql(conn, sql, params: params)
+      assert {:ok, rows} = Local.query_sql(conn, sql, params: params, database: db)
       assert length(rows) == 1
     end
   end
@@ -383,8 +389,13 @@ defmodule InfluxElixir.Client.LocalTest do
       :ok = Local.create_database(conn, "sdb")
       Local.write(conn, "m value=1i\nm value=2i", database: "sdb")
 
-      {:ok, direct} = Local.query_sql(conn, "SELECT * FROM m")
-      stream_rows = conn |> Local.query_sql_stream("SELECT * FROM m") |> Enum.to_list()
+      {:ok, direct} = Local.query_sql(conn, "SELECT * FROM m", database: "sdb")
+
+      stream_rows =
+        conn
+        |> Local.query_sql_stream("SELECT * FROM m", database: "sdb")
+        |> Enum.to_list()
+
       assert length(stream_rows) == length(direct)
     end
   end
@@ -413,7 +424,7 @@ defmodule InfluxElixir.Client.LocalTest do
     test "delegates to SQL engine — data is visible", %{conn: conn} do
       :ok = Local.create_database(conn, "iqldb")
       Local.write(conn, "m value=1i", database: "iqldb")
-      assert {:ok, [row]} = Local.query_influxql(conn, "SELECT * FROM m")
+      assert {:ok, [row]} = Local.query_influxql(conn, "SELECT * FROM m", database: "iqldb")
       assert row["value"] == 1
     end
   end
@@ -441,14 +452,14 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "list_databases/1 includes pre-created databases", %{conn: conn} do
       assert {:ok, dbs} = Local.list_databases(conn)
-      names = Enum.map(dbs, & &1.name)
+      names = Enum.map(dbs, & &1["name"])
       assert "test_db" in names
     end
 
     test "create then list reflects new database", %{conn: conn} do
       Local.create_database(conn, "fresh_db")
       assert {:ok, dbs} = Local.list_databases(conn)
-      names = Enum.map(dbs, & &1.name)
+      names = Enum.map(dbs, & &1["name"])
       assert "fresh_db" in names
     end
 
@@ -456,14 +467,14 @@ defmodule InfluxElixir.Client.LocalTest do
       assert :ok = Local.create_database(conn, "same_db")
       assert :ok = Local.create_database(conn, "same_db")
       {:ok, dbs} = Local.list_databases(conn)
-      assert Enum.count(dbs, &(&1.name == "same_db")) == 1
+      assert Enum.count(dbs, &(&1["name"] == "same_db")) == 1
     end
 
     test "delete_database/2 removes existing database", %{conn: conn} do
       Local.create_database(conn, "gone_db")
       assert :ok = Local.delete_database(conn, "gone_db")
       {:ok, dbs} = Local.list_databases(conn)
-      refute Enum.any?(dbs, &(&1.name == "gone_db"))
+      refute Enum.any?(dbs, &(&1["name"] == "gone_db"))
     end
 
     test "delete_database/2 returns 404 for non-existent database", %{conn: conn} do
@@ -492,7 +503,7 @@ defmodule InfluxElixir.Client.LocalTest do
     test "create then list reflects new bucket", %{conn: conn} do
       Local.create_bucket(conn, "my_bucket")
       assert {:ok, buckets} = Local.list_buckets(conn)
-      names = Enum.map(buckets, & &1.name)
+      names = Enum.map(buckets, & &1["name"])
       assert "my_bucket" in names
     end
 
@@ -500,14 +511,14 @@ defmodule InfluxElixir.Client.LocalTest do
       Local.create_bucket(conn, "dup_bucket")
       Local.create_bucket(conn, "dup_bucket")
       {:ok, buckets} = Local.list_buckets(conn)
-      assert Enum.count(buckets, &(&1.name == "dup_bucket")) == 1
+      assert Enum.count(buckets, &(&1["name"] == "dup_bucket")) == 1
     end
 
     test "delete_bucket/2 removes existing bucket", %{conn: conn} do
       Local.create_bucket(conn, "to_delete")
       assert :ok = Local.delete_bucket(conn, "to_delete")
       {:ok, buckets} = Local.list_buckets(conn)
-      refute Enum.any?(buckets, &(&1.name == "to_delete"))
+      refute Enum.any?(buckets, &(&1["name"] == "to_delete"))
     end
 
     test "delete_bucket/2 is idempotent for non-existent bucket", %{conn: conn} do
@@ -520,23 +531,23 @@ defmodule InfluxElixir.Client.LocalTest do
   # ---------------------------------------------------------------------------
 
   describe "token admin" do
-    test "create_token/3 returns {:ok, map} with id, token, description", %{conn: conn} do
+    test "create_token/3 returns {:ok, map} with string keys", %{conn: conn} do
       assert {:ok, token} = Local.create_token(conn, "my token")
       assert is_map(token)
-      assert is_binary(token.id)
-      assert is_binary(token.token)
-      assert token.description == "my token"
+      assert is_binary(token["id"])
+      assert is_binary(token["token"])
+      assert token["description"] == "my token"
     end
 
     test "each created token has a unique id", %{conn: conn} do
       {:ok, t1} = Local.create_token(conn, "first")
       {:ok, t2} = Local.create_token(conn, "second")
-      assert t1.id != t2.id
+      assert t1["id"] != t2["id"]
     end
 
     test "delete_token/2 returns :ok for known token", %{conn: conn} do
       {:ok, token} = Local.create_token(conn, "disposable")
-      assert :ok = Local.delete_token(conn, token.id)
+      assert :ok = Local.delete_token(conn, token["id"])
     end
 
     test "delete_token/2 returns :ok even for unknown token id", %{conn: conn} do
@@ -549,8 +560,309 @@ defmodule InfluxElixir.Client.LocalTest do
   # ---------------------------------------------------------------------------
 
   describe "health/1" do
-    test "returns {:ok, %{status: 'pass'}}", %{conn: conn} do
-      assert {:ok, %{status: "pass"}} = Local.health(conn)
+    test "returns {:ok, map} with string keys matching HTTP client shape", %{conn: conn} do
+      assert {:ok, %{"status" => "pass"}} = Local.health(conn)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # execute_sql/3 — DELETE support
+  # ---------------------------------------------------------------------------
+
+  describe "execute_sql/3 — DELETE" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "del_db")
+
+      Local.write(
+        conn,
+        "cpu,host=web01 value=10i\ncpu,host=web02 value=20i\ncpu,host=web01 value=30i",
+        database: "del_db"
+      )
+
+      {:ok, db: "del_db"}
+    end
+
+    test "DELETE FROM removes all points for a measurement", %{conn: conn, db: db} do
+      assert {:ok, %{"rows_affected" => 3}} =
+               Local.execute_sql(conn, "DELETE FROM cpu", database: db)
+
+      assert {:ok, []} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+    end
+
+    test "DELETE FROM with WHERE removes matching points only",
+         %{conn: conn, db: db} do
+      assert {:ok, %{"rows_affected" => 2}} =
+               Local.execute_sql(
+                 conn,
+                 "DELETE FROM cpu WHERE host = 'web01'",
+                 database: db
+               )
+
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+      assert row["host"] == "web02"
+    end
+
+    test "DELETE FROM non-existent measurement returns 0 rows_affected",
+         %{conn: conn, db: db} do
+      assert {:ok, %{"rows_affected" => 0}} =
+               Local.execute_sql(conn, "DELETE FROM no_such", database: db)
+    end
+
+    test "unknown statement returns 0 rows_affected", %{conn: conn, db: db} do
+      assert {:ok, %{"rows_affected" => 0}} =
+               Local.execute_sql(conn, "CREATE TABLE foo (id INT)", database: db)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — WHERE clause edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — WHERE edge cases" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "where_db")
+
+      Local.write(
+        conn,
+        "m,host=alpha active=true,temp=98.6,count=10i 1000\n" <>
+          "m,host=beta active=false,temp=37.2,count=20i 2000\n" <>
+          "m,host=gamma active=true,temp=100.1,count=30i 3000",
+        database: "where_db"
+      )
+
+      {:ok, db: "where_db"}
+    end
+
+    test "WHERE field != value", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM m WHERE host != 'alpha'", database: db)
+
+      assert length(rows) == 2
+      refute Enum.any?(rows, &(&1["host"] == "alpha"))
+    end
+
+    test "WHERE with boolean value", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM m WHERE active = true", database: db)
+
+      assert length(rows) == 2
+    end
+
+    test "WHERE with float comparison", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM m WHERE temp > 98.5", database: db)
+
+      assert length(rows) == 2
+    end
+
+    test "WHERE compound AND conditions", %{conn: conn, db: db} do
+      sql = "SELECT * FROM m WHERE active = true AND count > 15"
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["host"] == "gamma"
+    end
+
+    test "case insensitive SELECT", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, "select * from m where host = 'alpha'", database: db)
+
+      assert length(rows) == 1
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # write/3 — line protocol edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "write/3 — line protocol edge cases" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "lp_edge")
+      {:ok, db: "lp_edge"}
+    end
+
+    test "tag value with escaped equals sign", %{conn: conn, db: db} do
+      Local.write(conn, "m,k=v\\=1 f=1i", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
+      assert row["k"] == "v=1"
+    end
+
+    test "tag value with escaped comma", %{conn: conn, db: db} do
+      Local.write(conn, "m,k=v\\,1 f=1i", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
+      assert row["k"] == "v,1"
+    end
+
+    test "empty tag set — just measurement + fields", %{conn: conn, db: db} do
+      Local.write(conn, "m field=1i", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
+      assert row["field"] == 1
+    end
+
+    test "measurement name with escaped comma", %{conn: conn, db: db} do
+      Local.write(conn, "my\\,measurement field=1i", database: db)
+
+      assert {:ok, [row]} =
+               Local.query_sql(conn, "SELECT * FROM my\\,measurement", database: db)
+
+      assert row["_measurement"] == "my,measurement"
+    end
+
+    test "field with negative integer", %{conn: conn, db: db} do
+      Local.write(conn, "m value=-42i", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
+      assert row["value"] == -42
+    end
+
+    test "field with negative float", %{conn: conn, db: db} do
+      Local.write(conn, "m value=-3.14", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
+      assert_in_delta row["value"], -3.14, 1.0e-10
+    end
+
+    test "field with scientific notation", %{conn: conn, db: db} do
+      Local.write(conn, "m value=1.5e10", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
+      assert_in_delta row["value"], 1.5e10, 1.0
+    end
+
+    test "comments and blank lines are ignored", %{conn: conn, db: db} do
+      lp = "# This is a comment\n\nm value=1i\n\n# Another comment\nm value=2i\n"
+      Local.write(conn, lp, database: db)
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM m", database: db)
+      assert length(rows) == 2
+    end
+
+    test "gzip: true option is accepted without error", %{conn: conn, db: db} do
+      assert {:ok, :written} =
+               Local.write(conn, "m value=1i", database: db, gzip: true)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — multi-database isolation
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — multi-database isolation" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "db_a")
+      :ok = Local.create_database(conn, "db_b")
+      Local.write(conn, "m value=1i", database: "db_a")
+      Local.write(conn, "m value=2i", database: "db_b")
+      :ok
+    end
+
+    test "points in db_a are NOT visible from db_b", %{conn: conn} do
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: "db_a")
+      assert row["value"] == 1
+
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: "db_b")
+      assert row["value"] == 2
+    end
+
+    test "same measurement in two databases returns different data", %{conn: conn} do
+      {:ok, rows_a} = Local.query_sql(conn, "SELECT * FROM m", database: "db_a")
+      {:ok, rows_b} = Local.query_sql(conn, "SELECT * FROM m", database: "db_b")
+      assert hd(rows_a)["value"] != hd(rows_b)["value"]
+    end
+
+    test "query without explicit database uses 'default'", %{conn: conn} do
+      Local.write(conn, "m value=99i", database: "default")
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
+      assert row["value"] == 99
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_influxql/3 — InfluxQL-specific commands
+  # ---------------------------------------------------------------------------
+
+  describe "query_influxql/3 — InfluxQL commands" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "iql_db")
+      Local.write(conn, "cpu,host=web01,region=us value=1i", database: "iql_db")
+      Local.write(conn, "mem,host=web01 used=512i", database: "iql_db")
+      {:ok, db: "iql_db"}
+    end
+
+    test "SHOW DATABASES returns all databases", %{conn: conn} do
+      assert {:ok, dbs} = Local.query_influxql(conn, "SHOW DATABASES")
+      names = Enum.map(dbs, & &1["name"])
+      assert "iql_db" in names
+      assert "test_db" in names
+    end
+
+    test "SHOW MEASUREMENTS returns measurement names", %{conn: conn, db: db} do
+      assert {:ok, measurements} =
+               Local.query_influxql(conn, "SHOW MEASUREMENTS", database: db)
+
+      names = Enum.map(measurements, & &1["name"])
+      assert "cpu" in names
+      assert "mem" in names
+    end
+
+    test "SHOW TAG KEYS FROM measurement returns tag keys", %{conn: conn, db: db} do
+      assert {:ok, tag_keys} =
+               Local.query_influxql(conn, "SHOW TAG KEYS FROM cpu", database: db)
+
+      keys = Enum.map(tag_keys, & &1["tagKey"])
+      assert "host" in keys
+      assert "region" in keys
+    end
+
+    test "SELECT delegates to SQL engine", %{conn: conn, db: db} do
+      assert {:ok, [row]} =
+               Local.query_influxql(conn, "SELECT * FROM cpu", database: db)
+
+      assert row["value"] == 1
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_flux/3 — predicate support
+  # ---------------------------------------------------------------------------
+
+  describe "query_flux/3 — predicates" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "flux_db")
+
+      now = System.os_time(:nanosecond)
+      old = now - 7_200_000_000_000
+
+      Local.write(
+        conn,
+        "cpu,host=web01 value=10i #{now}\ncpu,host=web02 value=20i #{old}",
+        database: "flux_db"
+      )
+
+      {:ok, db: "flux_db", now: now, old: old}
+    end
+
+    test "filter by tag equality", %{conn: conn} do
+      flux =
+        "from(bucket: \"flux_db\") |> range(start: -24h) |> filter(fn: (r) => r.host == \"web01\")"
+
+      assert {:ok, rows} = Local.query_flux(conn, flux)
+      assert length(rows) == 1
+      assert hd(rows)["host"] == "web01"
+    end
+
+    test "range(start: -1h) filters old points", %{conn: conn} do
+      flux = "from(bucket: \"flux_db\") |> range(start: -1h)"
+      assert {:ok, rows} = Local.query_flux(conn, flux)
+      assert length(rows) == 1
+      assert hd(rows)["value"] == 10
+    end
+
+    test "flux query returns row maps with string keys", %{conn: conn} do
+      flux = "from(bucket: \"flux_db\") |> range(start: -24h)"
+      assert {:ok, [row | _rest]} = Local.query_flux(conn, flux)
+      assert is_binary(row["_measurement"])
+      assert Map.has_key?(row, "time")
+    end
+
+    test "flux query with no matching bucket returns empty list", %{conn: conn} do
+      flux = "from(bucket: \"no_such_bucket\") |> range(start: -1h)"
+      assert {:ok, []} = Local.query_flux(conn, flux)
     end
   end
 end

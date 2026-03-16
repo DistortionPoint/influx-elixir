@@ -9,6 +9,7 @@ defmodule InfluxElixir.MixProject do
       app: :influx_elixir,
       version: @version,
       elixir: "~> 1.18",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
@@ -44,6 +45,9 @@ defmodule InfluxElixir.MixProject do
       mod: {InfluxElixir.Application, []}
     ]
   end
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_env), do: ["lib"]
 
   defp deps do
     [

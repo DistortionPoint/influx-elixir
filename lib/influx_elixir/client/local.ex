@@ -169,10 +169,11 @@ defmodule InfluxElixir.Client.Local do
           InfluxElixir.Client.query_result()
   def query_sql(%{table: table}, sql, opts \\ []) do
     params = Keyword.get(opts, :params, %{})
+    database = Keyword.get(opts, :database, "default")
     resolved_sql = resolve_params(sql, params)
 
     case parse_select(resolved_sql) do
-      {:ok, query} -> {:ok, execute_query(table, query)}
+      {:ok, query} -> {:ok, execute_query(table, query, database)}
       {:error, _reason} = err -> err
     end
   end
@@ -196,15 +197,31 @@ defmodule InfluxElixir.Client.Local do
   end
 
   @doc """
-  Executes a raw SQL statement (e.g. `DELETE FROM measurement`) and returns
-  a summary map. In the local client this is a no-op that returns
-  `%{rows_affected: 0}`.
+  Executes a SQL statement and returns a summary map.
+
+  Supports `DELETE FROM <measurement>` and
+  `DELETE FROM <measurement> WHERE ...` — matching points are removed
+  from ETS and the count is returned in `%{"rows_affected" => N}`.
+
+  Unknown statements return `%{"rows_affected" => 0}`.
   """
   @impl true
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map()} | {:error, term()}
-  def execute_sql(_conn, _sql, _opts \\ []) do
-    {:ok, %{rows_affected: 0}}
+  def execute_sql(%{table: table}, sql, opts \\ []) do
+    database = Keyword.get(opts, :database, "default")
+    trimmed = String.trim(sql)
+
+    case Regex.run(~r/^(?i)DELETE\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)$/s, trimmed) do
+      [_full, measurement_raw, rest] ->
+        measurement = unescape_measurement(measurement_raw)
+        where = parse_where(rest)
+        count = delete_points(table, database, measurement, where)
+        {:ok, %{"rows_affected" => count}}
+
+      _no_match ->
+        {:ok, %{"rows_affected" => 0}}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -212,8 +229,14 @@ defmodule InfluxElixir.Client.Local do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Executes an InfluxQL query. Delegates to the same SQL engine as
-  `query_sql/3` — both query languages share the `SELECT … FROM …` form.
+  Executes an InfluxQL query.
+
+  Supports InfluxQL-specific commands:
+
+    * `SHOW DATABASES` — returns all databases
+    * `SHOW MEASUREMENTS` — returns all measurement names
+    * `SHOW TAG KEYS FROM <measurement>` — returns distinct tag keys
+    * `SELECT ...` — delegates to the SQL engine
   """
   @impl true
   @spec query_influxql(
@@ -221,14 +244,60 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           keyword()
         ) :: InfluxElixir.Client.query_result()
-  def query_influxql(conn, influxql, opts \\ []) do
-    query_sql(conn, influxql, opts)
+  def query_influxql(%{table: table} = conn, influxql, opts \\ []) do
+    trimmed = String.trim(influxql)
+    database = Keyword.get(opts, :database, "default")
+
+    cond do
+      String.match?(trimmed, ~r/^(?i)SHOW\s+DATABASES\s*$/) ->
+        dbs =
+          table
+          |> get_databases()
+          |> Enum.map(&%{"name" => &1})
+
+        {:ok, dbs}
+
+      String.match?(trimmed, ~r/^(?i)SHOW\s+MEASUREMENTS\s*$/) ->
+        measurements =
+          :ets.match_object(table, {{:points, database, :_}, :_})
+          |> Enum.map(fn {{:points, _db, m}, _pts} -> m end)
+          |> Enum.uniq()
+          |> Enum.map(&%{"name" => &1})
+
+        {:ok, measurements}
+
+      match?(
+        [_full, _capture],
+        Regex.run(~r/^(?i)SHOW\s+TAG\s+KEYS\s+FROM\s+(\S+)\s*$/, trimmed)
+      ) ->
+        [_full, measurement_raw] =
+          Regex.run(~r/^(?i)SHOW\s+TAG\s+KEYS\s+FROM\s+(\S+)\s*$/, trimmed)
+
+        measurement = unescape_measurement(measurement_raw)
+        points = fetch_points(table, database, measurement)
+
+        tag_keys =
+          points
+          |> Enum.flat_map(&Map.keys(&1.tags))
+          |> Enum.uniq()
+          |> Enum.map(&%{"tagKey" => &1})
+
+        {:ok, tag_keys}
+
+      true ->
+        query_sql(conn, influxql, opts)
+    end
   end
 
   @doc """
-  Executes a Flux query. For the local client, only the measurement name
-  embedded in `from(bucket: "…") |> …` forms is used as a lookup key;
-  all stored points for that measurement are returned.
+  Executes a Flux query with support for common predicates.
+
+  Parses and applies:
+
+    * `from(bucket: "...")` — scopes to a database
+    * `range(start: -1h)` — filters by timestamp (supports `-Nh`, `-Nd`, `-Nm`)
+    * `filter(fn: (r) => r._measurement == "...")` — filters by measurement
+    * `filter(fn: (r) => r.<key> == "...")` — filters by any tag/field equality
   """
   @impl true
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
@@ -237,14 +306,18 @@ defmodule InfluxElixir.Client.Local do
     database = extract_flux_bucket(flux)
     measurement = extract_flux_measurement(flux)
 
-    rows =
+    points =
       case {database, measurement} do
         {nil, _any} -> all_points(table)
         {db, nil} -> all_points_in_db(table, db)
         {db, m} -> fetch_points(table, db, m)
       end
 
-    {:ok, rows}
+    points
+    |> apply_flux_range(flux)
+    |> apply_flux_filters(flux)
+    |> Enum.map(&point_to_row/1)
+    |> then(&{:ok, &1})
   end
 
   # ---------------------------------------------------------------------------
@@ -279,7 +352,7 @@ defmodule InfluxElixir.Client.Local do
     dbs =
       table
       |> get_databases()
-      |> Enum.map(&%{name: &1})
+      |> Enum.map(&%{"name" => &1})
 
     {:ok, dbs}
   end
@@ -336,7 +409,9 @@ defmodule InfluxElixir.Client.Local do
     bkts =
       table
       |> get_buckets()
-      |> Enum.map(&%{name: &1})
+      |> Enum.map(fn name ->
+        %{"id" => bucket_id(name), "name" => name}
+      end)
 
     {:ok, bkts}
   end
@@ -374,7 +449,13 @@ defmodule InfluxElixir.Client.Local do
   def create_token(%{table: table}, description, _opts \\ []) do
     id = generate_id()
     token_string = "local-token-#{id}"
-    token = %{id: id, token: token_string, description: description}
+
+    token = %{
+      "id" => id,
+      "token" => token_string,
+      "description" => description
+    }
+
     tokens = get_tokens(table)
     :ets.insert(table, {:tokens, [token | tokens]})
     {:ok, token}
@@ -389,7 +470,7 @@ defmodule InfluxElixir.Client.Local do
           :ok | {:error, term()}
   def delete_token(%{table: table}, token_id) do
     tokens = get_tokens(table)
-    updated = Enum.reject(tokens, &(&1.id == token_id))
+    updated = Enum.reject(tokens, &(&1["id"] == token_id))
     :ets.insert(table, {:tokens, updated})
     :ok
   end
@@ -399,13 +480,14 @@ defmodule InfluxElixir.Client.Local do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Returns a passing health status map.
+  Returns a passing health status map with string keys, matching the
+  JSON-decoded shape returned by the HTTP client.
   """
   @impl true
   @spec health(InfluxElixir.Client.connection()) ::
           {:ok, map()} | {:error, term()}
   def health(_conn) do
-    {:ok, %{status: "pass"}}
+    {:ok, %{"status" => "pass", "version" => "local"}}
   end
 
   # ---------------------------------------------------------------------------
@@ -919,11 +1001,9 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec execute_query(:ets.table(), parsed_query()) :: [map()]
-  defp execute_query(table, %{measurement: m} = query) do
-    points =
-      :ets.match_object(table, {{:points, :_, m}, :_})
-      |> Enum.flat_map(fn {_key, pts} -> pts end)
+  @spec execute_query(:ets.table(), parsed_query(), binary()) :: [map()]
+  defp execute_query(table, %{measurement: m} = query, database) do
+    points = fetch_points(table, database, m)
 
     points
     |> apply_where(query.where)
@@ -1001,6 +1081,49 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
+  @spec apply_flux_range([point_map()], binary()) :: [point_map()]
+  defp apply_flux_range(points, flux) do
+    case Regex.run(~r/range\s*\(\s*start\s*:\s*(-?\d+)([smhd])/, flux) do
+      [_full, amount_str, unit] ->
+        {amount, ""} = Integer.parse(amount_str)
+        now_ns = System.os_time(:nanosecond)
+        offset_ns = duration_to_ns(amount, unit)
+        cutoff = now_ns + offset_ns
+
+        Enum.filter(points, fn point ->
+          case point.timestamp do
+            nil -> true
+            ts -> ts >= cutoff
+          end
+        end)
+
+      _no_match ->
+        points
+    end
+  end
+
+  @spec duration_to_ns(integer(), binary()) :: integer()
+  defp duration_to_ns(amount, "s"), do: amount * 1_000_000_000
+  defp duration_to_ns(amount, "m"), do: amount * 60 * 1_000_000_000
+  defp duration_to_ns(amount, "h"), do: amount * 3_600 * 1_000_000_000
+  defp duration_to_ns(amount, "d"), do: amount * 86_400 * 1_000_000_000
+
+  @spec apply_flux_filters([point_map()], binary()) :: [point_map()]
+  defp apply_flux_filters(points, flux) do
+    # Extract all filter predicates of the form r.<key> == "<value>"
+    # (excluding _measurement which is handled separately)
+    pattern = ~r/filter\s*\(\s*fn\s*:\s*\(r\)\s*=>\s*r\.(\w+)\s*==\s*"([^"]+)"/
+
+    Regex.scan(pattern, flux)
+    |> Enum.reject(fn [_full, key, _val] -> key == "_measurement" end)
+    |> Enum.reduce(points, fn [_full, key, value], acc ->
+      Enum.filter(acc, fn point ->
+        Map.get(point.tags, key) == value or
+          Map.get(point.fields, key) == value
+      end)
+    end)
+  end
+
   # ---------------------------------------------------------------------------
   # Private — param substitution
   # ---------------------------------------------------------------------------
@@ -1030,8 +1153,44 @@ defmodule InfluxElixir.Client.Local do
   # Private — utilities
   # ---------------------------------------------------------------------------
 
+  @spec delete_points(:ets.table(), binary(), binary(), [{atom(), binary(), term()}]) ::
+          non_neg_integer()
+  defp delete_points(table, database, measurement, where) do
+    key = {:points, database, measurement}
+
+    case :ets.lookup(table, key) do
+      [{^key, pts}] ->
+        {to_keep, to_delete} =
+          if where == [] do
+            {[], pts}
+          else
+            Enum.split_with(pts, fn point ->
+              not Enum.all?(where, &matches_condition?(point, &1))
+            end)
+          end
+
+        count = length(to_delete)
+
+        if to_keep == [] do
+          :ets.delete(table, key)
+        else
+          :ets.insert(table, {key, to_keep})
+        end
+
+        count
+
+      [] ->
+        0
+    end
+  end
+
   @spec generate_id() :: binary()
   defp generate_id do
     :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+  end
+
+  @spec bucket_id(binary()) :: binary()
+  defp bucket_id(name) do
+    :crypto.hash(:sha256, name) |> binary_part(0, 8) |> Base.encode16(case: :lower)
   end
 end

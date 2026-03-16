@@ -147,7 +147,7 @@ defmodule InfluxElixirTest do
 
   describe "health/1" do
     test "delegates to configured client", %{conn: conn} do
-      assert {:ok, %{status: "pass"}} = InfluxElixir.health(conn)
+      assert {:ok, %{"status" => "pass"}} = InfluxElixir.health(conn)
     end
   end
 
