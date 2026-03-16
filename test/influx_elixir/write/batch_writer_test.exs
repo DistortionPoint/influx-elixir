@@ -242,4 +242,139 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert state.max_retries == 5
     end
   end
+
+  describe "write_sync edge cases" do
+    test "write_sync with no_sync triggers batch flush at batch_size",
+         %{conn: conn} do
+      pid =
+        start_writer(conn,
+          no_sync: true,
+          batch_size: 2,
+          flush_interval_ms: 60_000
+        )
+
+      :ok = BatchWriter.write_sync(pid, "cpu value=1.0")
+      :ok = BatchWriter.write_sync(pid, "cpu value=2.0")
+
+      # batch_size=2, no_sync=true → maybe_flush_on_batch triggers do_flush
+      {:ok, stats} = BatchWriter.stats(pid)
+      assert stats.total_writes >= 1
+    end
+
+    test "write_sync with no_sync under batch_size does not flush",
+         %{conn: conn} do
+      pid =
+        start_writer(conn,
+          no_sync: true,
+          batch_size: 10,
+          flush_interval_ms: 60_000
+        )
+
+      :ok = BatchWriter.write_sync(pid, "cpu value=1.0")
+
+      {:ok, stats} = BatchWriter.stats(pid)
+      assert stats.total_writes == 0
+
+      state = :sys.get_state(pid)
+      assert state.buffer_size == 1
+    end
+
+    test "write_sync rejects when buffer is full", %{conn: conn} do
+      pid =
+        start_writer(conn,
+          batch_size: 3,
+          flush_interval_ms: 60_000,
+          max_retries: 0
+        )
+
+      :sys.replace_state(pid, fn state ->
+        %{state | buffer_size: 30}
+      end)
+
+      assert {:error, :buffer_full} =
+               BatchWriter.write_sync(pid, "cpu value=999.0")
+    end
+  end
+
+  describe "jitter" do
+    test "jitter_ms is applied to flush scheduling", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 50, jitter_ms: 10)
+
+      state = :sys.get_state(pid)
+      assert state.timer_ref != nil
+      assert state.jitter_ms == 10
+    end
+  end
+
+  describe "error paths via invalid line protocol" do
+    test "flush with unparseable payload and max_retries: 0 increments errors",
+         %{conn: conn} do
+      pid =
+        start_writer(conn,
+          flush_interval_ms: 60_000,
+          max_retries: 0
+        )
+
+      # Inject invalid line protocol directly into the buffer via write
+      # "!!!" is not valid line protocol — Local returns {:error, %{status: 400, ...}}
+      :ok = BatchWriter.write(pid, "!!!")
+      :ok = BatchWriter.flush(pid)
+
+      {:ok, stats} = BatchWriter.stats(pid)
+      assert stats.total_errors == 1
+      assert stats.total_writes == 0
+    end
+
+    test "flush with unparseable payload and max_retries > 0 schedules retry",
+         %{conn: conn} do
+      pid =
+        start_writer(conn,
+          flush_interval_ms: 60_000,
+          max_retries: 2
+        )
+
+      :ok = BatchWriter.write(pid, "!!!")
+      :ok = BatchWriter.flush(pid)
+
+      state = :sys.get_state(pid)
+      assert state.retry_attempt == 1
+      assert state.retry_payload != nil
+      assert state.buffer == []
+      assert state.buffer_size == 0
+    end
+
+    test "retry exhausts max_retries and records error", %{conn: conn} do
+      pid =
+        start_writer(conn,
+          flush_interval_ms: 60_000,
+          max_retries: 1
+        )
+
+      :ok = BatchWriter.write(pid, "!!!")
+      :ok = BatchWriter.flush(pid)
+
+      # Wait for retry to fire and exhaust (base delay ~200ms for attempt 1)
+      :timer.sleep(500)
+
+      {:ok, stats} = BatchWriter.stats(pid)
+      assert stats.total_errors == 1
+
+      state = :sys.get_state(pid)
+      assert state.retry_payload == nil
+      assert state.retry_attempt == 0
+    end
+
+    test "write_sync with pending_sync gets reply on error flush",
+         %{conn: conn} do
+      pid =
+        start_writer(conn,
+          flush_interval_ms: 60_000,
+          max_retries: 0
+        )
+
+      # write_sync should return the error (not hang)
+      result = BatchWriter.write_sync(pid, "!!!")
+      assert {:error, _reason} = result
+    end
+  end
 end

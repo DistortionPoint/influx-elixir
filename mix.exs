@@ -16,6 +16,22 @@ defmodule InfluxElixir.MixProject do
       dialyzer: dialyzer(),
       preferred_cli_env: preferred_cli_env(),
 
+      # Test coverage — exclude modules that require external services
+      test_coverage: [
+        threshold: 90,
+        ignore_modules: [
+          # Requires a live InfluxDB instance (integration-only)
+          InfluxElixir.Client.HTTP,
+          # Auto-generated gRPC stub (no logic to test)
+          InfluxElixir.Flight.Proto.FlightService.Stub,
+          # Requires a live gRPC server (integration-only)
+          InfluxElixir.Flight.Client,
+          # Test support modules (not library code)
+          InfluxElixir.InfluxCase,
+          InfluxElixir.IntegrationHelper
+        ]
+      ],
+
       # Hex.pm
       name: "InfluxElixir",
       description: "Elixir client library for InfluxDB v3 with v2 compatibility",

@@ -437,6 +437,75 @@ defmodule InfluxElixir.Flight.ReaderTest do
     {body, buf_specs}
   end
 
+  defp int32_column(values) do
+    data = Enum.reduce(values, <<>>, fn v, acc -> acc <> <<v::little-signed-32>> end)
+    {data, [{0, 0}, {0, byte_size(data)}]}
+  end
+
+  defp int16_column(values) do
+    data = Enum.reduce(values, <<>>, fn v, acc -> acc <> <<v::little-signed-16>> end)
+    {data, [{0, 0}, {0, byte_size(data)}]}
+  end
+
+  defp int8_column(values) do
+    data = Enum.reduce(values, <<>>, fn v, acc -> acc <> <<v::little-signed-8>> end)
+    {data, [{0, 0}, {0, byte_size(data)}]}
+  end
+
+  defp uint64_column(values) do
+    data = Enum.reduce(values, <<>>, fn v, acc -> acc <> <<v::little-unsigned-64>> end)
+    {data, [{0, 0}, {0, byte_size(data)}]}
+  end
+
+  defp uint32_column(values) do
+    data = Enum.reduce(values, <<>>, fn v, acc -> acc <> <<v::little-unsigned-32>> end)
+    {data, [{0, 0}, {0, byte_size(data)}]}
+  end
+
+  defp uint16_column(values) do
+    data = Enum.reduce(values, <<>>, fn v, acc -> acc <> <<v::little-unsigned-16>> end)
+    {data, [{0, 0}, {0, byte_size(data)}]}
+  end
+
+  defp uint8_column(values) do
+    data = Enum.reduce(values, <<>>, fn v, acc -> acc <> <<v::little-unsigned-8>> end)
+    {data, [{0, 0}, {0, byte_size(data)}]}
+  end
+
+  defp float32_column(values) do
+    data = Enum.reduce(values, <<>>, fn v, acc -> acc <> <<v::little-float-32>> end)
+    {data, [{0, 0}, {0, byte_size(data)}]}
+  end
+
+  # Build a column with a validity bitmap marking some values as null.
+  # null_indices is a MapSet of 0-based indices that should be null.
+  defp with_validity_bitmap({data, [{_voff, _vlen} | data_specs]}, n, null_indices) do
+    bitmap_bytes = div(n + 7, 8)
+
+    bitmap =
+      for byte_idx <- 0..(bitmap_bytes - 1), into: <<>> do
+        byte =
+          Enum.reduce(0..7, 0, fn bit_idx, acc ->
+            row = byte_idx * 8 + bit_idx
+
+            if row < n and not MapSet.member?(null_indices, row) do
+              acc ||| 1 <<< bit_idx
+            else
+              acc
+            end
+          end)
+
+        <<byte::8>>
+      end
+
+    # Validity bitmap comes before data; shift data offsets accordingly
+    shifted_specs =
+      Enum.map(data_specs, fn {off, len} -> {off + bitmap_bytes, len} end)
+
+    body = bitmap <> data
+    {body, [{0, bitmap_bytes} | shifted_specs]}
+  end
+
   # Shift all buffer offsets by delta bytes (pack multiple columns into one body).
   defp shift_specs(specs, delta) do
     Enum.map(specs, fn {off, len} -> {off + delta, len} end)
@@ -894,6 +963,182 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = %FlightData{data_header: batch_msg(0, [{0, 0}, {0, 0}]), data_body: nil}
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
       assert rows == []
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Tests: decode_flight_data/1 — smaller integer types
+  # ---------------------------------------------------------------------------
+
+  describe "decode_flight_data/1 — Int32 columns" do
+    test "decodes Int32 values" do
+      schema = schema_fd([{"count", 2, [bit_width: 32, is_signed: true]}])
+      {body, specs} = int32_column([100, -200, 0])
+      batch = batch_fd(body, specs, 3)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.map(rows, & &1["count"]) == [100, -200, 0]
+    end
+  end
+
+  describe "decode_flight_data/1 — Int16 columns" do
+    test "decodes Int16 values" do
+      schema = schema_fd([{"small", 2, [bit_width: 16, is_signed: true]}])
+      {body, specs} = int16_column([1, -1, 32_767])
+      batch = batch_fd(body, specs, 3)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.map(rows, & &1["small"]) == [1, -1, 32_767]
+    end
+  end
+
+  describe "decode_flight_data/1 — Int8 columns" do
+    test "decodes Int8 values" do
+      schema = schema_fd([{"tiny", 2, [bit_width: 8, is_signed: true]}])
+      {body, specs} = int8_column([1, -1, 127])
+      batch = batch_fd(body, specs, 3)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.map(rows, & &1["tiny"]) == [1, -1, 127]
+    end
+  end
+
+  describe "decode_flight_data/1 — UInt64 columns" do
+    test "decodes UInt64 values" do
+      schema = schema_fd([{"big", 2, [bit_width: 64, is_signed: false]}])
+      {body, specs} = uint64_column([0, 18_446_744_073_709_551_615])
+      batch = batch_fd(body, specs, 2)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.at(rows, 0)["big"] == 0
+      assert Enum.at(rows, 1)["big"] == 18_446_744_073_709_551_615
+    end
+  end
+
+  describe "decode_flight_data/1 — UInt32 columns" do
+    test "decodes UInt32 values" do
+      schema = schema_fd([{"u", 2, [bit_width: 32, is_signed: false]}])
+      {body, specs} = uint32_column([0, 4_294_967_295])
+      batch = batch_fd(body, specs, 2)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.map(rows, & &1["u"]) == [0, 4_294_967_295]
+    end
+  end
+
+  describe "decode_flight_data/1 — UInt16 columns" do
+    test "decodes UInt16 values" do
+      schema = schema_fd([{"u16", 2, [bit_width: 16, is_signed: false]}])
+      {body, specs} = uint16_column([0, 65_535])
+      batch = batch_fd(body, specs, 2)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.map(rows, & &1["u16"]) == [0, 65_535]
+    end
+  end
+
+  describe "decode_flight_data/1 — UInt8 columns" do
+    test "decodes UInt8 values" do
+      schema = schema_fd([{"byte", 2, [bit_width: 8, is_signed: false]}])
+      {body, specs} = uint8_column([0, 255])
+      batch = batch_fd(body, specs, 2)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.map(rows, & &1["byte"]) == [0, 255]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Tests: decode_flight_data/1 — Float32 column round-trip
+  # ---------------------------------------------------------------------------
+
+  describe "decode_flight_data/1 — Float32 columns" do
+    test "decodes Float32 values" do
+      schema = schema_fd([{"reading", 3, [precision: 1]}])
+      {body, specs} = float32_column([1.0, -2.5])
+      batch = batch_fd(body, specs, 2)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert length(rows) == 2
+      assert_in_delta Enum.at(rows, 0)["reading"], 1.0, 1.0e-5
+      assert_in_delta Enum.at(rows, 1)["reading"], -2.5, 1.0e-5
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Tests: decode_flight_data/1 — null/validity bitmap
+  # ---------------------------------------------------------------------------
+
+  describe "decode_flight_data/1 — validity bitmap (nulls)" do
+    test "marks null Int64 values based on validity bitmap" do
+      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
+      # Three values, but index 1 is null
+      {body, specs} = int64_column([10, 99, 30])
+      {body, specs} = with_validity_bitmap({body, specs}, 3, MapSet.new([1]))
+      batch = batch_fd(body, specs, 3)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.at(rows, 0)["v"] == 10
+      assert Enum.at(rows, 1)["v"] == nil
+      assert Enum.at(rows, 2)["v"] == 30
+    end
+
+    test "marks null Float64 values based on validity bitmap" do
+      schema = schema_fd([{"f", 3, [precision: 2]}])
+      {body, specs} = float64_column([1.0, 2.0, 3.0])
+      {body, specs} = with_validity_bitmap({body, specs}, 3, MapSet.new([0, 2]))
+      batch = batch_fd(body, specs, 3)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.at(rows, 0)["f"] == nil
+      assert_in_delta Enum.at(rows, 1)["f"], 2.0, 1.0e-9
+      assert Enum.at(rows, 2)["f"] == nil
+    end
+
+    test "all-null column via validity bitmap" do
+      schema = schema_fd([{"n", 2, [bit_width: 64, is_signed: true]}])
+      {body, specs} = int64_column([0, 0])
+      {body, specs} = with_validity_bitmap({body, specs}, 2, MapSet.new([0, 1]))
+      batch = batch_fd(body, specs, 2)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.all?(rows, fn r -> r["n"] == nil end)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Tests: parse_schema/1 — error/edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "parse_schema/1 — error handling" do
+    test "returns {:error, :schema_parse_failed} for corrupt binary" do
+      # Binary long enough to attempt parsing but with invalid structure
+      corrupt = <<0xFF, 0xFF, 0xFF, 0xFF, 20::little-32>> <> :binary.copy(<<0xFF>>, 20)
+      assert {:error, :schema_parse_failed} = Reader.parse_schema(corrupt)
+    end
+
+    test "schema without continuation marker still parses" do
+      # A bare FlatBuffer < 8 bytes returns empty
+      assert {:ok, []} = Reader.parse_schema(<<0, 0, 0, 0>>)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Tests: decode_flight_data/1 — unknown type fallback
+  # ---------------------------------------------------------------------------
+
+  describe "decode_flight_data/1 — unknown type columns" do
+    test "unknown type_type produces nil values" do
+      # type_type 99 is not recognized — should produce type_id 0
+      schema = schema_fd([{"mystery", 99, []}])
+      # Provide some dummy data; unknown type decodes to nils
+      dummy_data = :binary.copy(<<0>>, 16)
+      specs = [{0, 0}, {0, 16}]
+      batch = batch_fd(dummy_data, specs, 2)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert length(rows) == 2
+      assert Enum.all?(rows, fn r -> r["mystery"] == nil end)
     end
   end
 end
