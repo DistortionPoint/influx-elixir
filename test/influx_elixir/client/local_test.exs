@@ -434,50 +434,21 @@ defmodule InfluxElixir.Client.LocalTest do
   # ---------------------------------------------------------------------------
 
   describe "query_flux/3" do
-    test "returns {:ok, rows} for any flux query", %{conn: conn} do
+    test "returns {:ok, rows} for any flux query" do
+      {:ok, v2_conn} = Local.start(profile: :v2)
+      on_exit(fn -> Local.stop(v2_conn) end)
       flux = "from(bucket: \"test\") |> range(start: -1h)"
-      assert {:ok, rows} = Local.query_flux(conn, flux)
+      assert {:ok, rows} = Local.query_flux(v2_conn, flux)
       assert is_list(rows)
     end
   end
 
   # ---------------------------------------------------------------------------
-  # Database admin
+  # Database admin — LocalClient-specific (error shape details)
   # ---------------------------------------------------------------------------
 
-  describe "database admin" do
-    test "create_database/3 returns :ok", %{conn: conn} do
-      assert :ok = Local.create_database(conn, "new_db")
-    end
-
-    test "list_databases/1 includes pre-created databases", %{conn: conn} do
-      assert {:ok, dbs} = Local.list_databases(conn)
-      names = Enum.map(dbs, & &1["name"])
-      assert "test_db" in names
-    end
-
-    test "create then list reflects new database", %{conn: conn} do
-      Local.create_database(conn, "fresh_db")
-      assert {:ok, dbs} = Local.list_databases(conn)
-      names = Enum.map(dbs, & &1["name"])
-      assert "fresh_db" in names
-    end
-
-    test "create is idempotent", %{conn: conn} do
-      assert :ok = Local.create_database(conn, "same_db")
-      assert :ok = Local.create_database(conn, "same_db")
-      {:ok, dbs} = Local.list_databases(conn)
-      assert Enum.count(dbs, &(&1["name"] == "same_db")) == 1
-    end
-
-    test "delete_database/2 removes existing database", %{conn: conn} do
-      Local.create_database(conn, "gone_db")
-      assert :ok = Local.delete_database(conn, "gone_db")
-      {:ok, dbs} = Local.list_databases(conn)
-      refute Enum.any?(dbs, &(&1["name"] == "gone_db"))
-    end
-
-    test "delete_database/2 returns 404 for non-existent database", %{conn: conn} do
+  describe "database admin — error details" do
+    test "delete_database/2 returns 404 with descriptive body", %{conn: conn} do
       assert {:error, %{status: 404, body: body}} =
                Local.delete_database(conn, "not_here")
 
@@ -486,84 +457,11 @@ defmodule InfluxElixir.Client.LocalTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Bucket admin
-  # ---------------------------------------------------------------------------
+  # Bucket admin covered by contract tests (contract_local_v2_test.exs)
 
-  describe "bucket admin" do
-    test "create_bucket/3 returns :ok", %{conn: conn} do
-      assert :ok = Local.create_bucket(conn, "new_bucket")
-    end
+  # Token admin covered by contract tests (contract_local_v3_enterprise_test.exs)
 
-    test "list_buckets/1 returns {:ok, list}", %{conn: conn} do
-      assert {:ok, buckets} = Local.list_buckets(conn)
-      assert is_list(buckets)
-    end
-
-    test "create then list reflects new bucket", %{conn: conn} do
-      Local.create_bucket(conn, "my_bucket")
-      assert {:ok, buckets} = Local.list_buckets(conn)
-      names = Enum.map(buckets, & &1["name"])
-      assert "my_bucket" in names
-    end
-
-    test "create is idempotent", %{conn: conn} do
-      Local.create_bucket(conn, "dup_bucket")
-      Local.create_bucket(conn, "dup_bucket")
-      {:ok, buckets} = Local.list_buckets(conn)
-      assert Enum.count(buckets, &(&1["name"] == "dup_bucket")) == 1
-    end
-
-    test "delete_bucket/2 removes existing bucket", %{conn: conn} do
-      Local.create_bucket(conn, "to_delete")
-      assert :ok = Local.delete_bucket(conn, "to_delete")
-      {:ok, buckets} = Local.list_buckets(conn)
-      refute Enum.any?(buckets, &(&1["name"] == "to_delete"))
-    end
-
-    test "delete_bucket/2 is idempotent for non-existent bucket", %{conn: conn} do
-      assert :ok = Local.delete_bucket(conn, "no_such_bucket")
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Token admin
-  # ---------------------------------------------------------------------------
-
-  describe "token admin" do
-    test "create_token/3 returns {:ok, map} with string keys", %{conn: conn} do
-      assert {:ok, token} = Local.create_token(conn, "my token")
-      assert is_map(token)
-      assert is_binary(token["id"])
-      assert is_binary(token["token"])
-      assert token["description"] == "my token"
-    end
-
-    test "each created token has a unique id", %{conn: conn} do
-      {:ok, t1} = Local.create_token(conn, "first")
-      {:ok, t2} = Local.create_token(conn, "second")
-      assert t1["id"] != t2["id"]
-    end
-
-    test "delete_token/2 returns :ok for known token", %{conn: conn} do
-      {:ok, token} = Local.create_token(conn, "disposable")
-      assert :ok = Local.delete_token(conn, token["id"])
-    end
-
-    test "delete_token/2 returns :ok even for unknown token id", %{conn: conn} do
-      assert :ok = Local.delete_token(conn, "not-a-real-id")
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Health
-  # ---------------------------------------------------------------------------
-
-  describe "health/1" do
-    test "returns {:ok, map} with string keys matching HTTP client shape", %{conn: conn} do
-      assert {:ok, %{"status" => "pass"}} = Local.health(conn)
-    end
-  end
+  # Health covered by contract tests (all contract_local_*_test.exs)
 
   # ---------------------------------------------------------------------------
   # execute_sql/3 — DELETE support
@@ -822,22 +720,24 @@ defmodule InfluxElixir.Client.LocalTest do
   # ---------------------------------------------------------------------------
 
   describe "query_flux/3 — predicates" do
-    setup %{conn: conn} do
-      :ok = Local.create_database(conn, "flux_db")
+    setup do
+      {:ok, v2_conn} =
+        Local.start(databases: ["flux_db"], profile: :v2)
 
       now = System.os_time(:nanosecond)
       old = now - 7_200_000_000_000
 
       Local.write(
-        conn,
+        v2_conn,
         "cpu,host=web01 value=10i #{now}\ncpu,host=web02 value=20i #{old}",
         database: "flux_db"
       )
 
-      {:ok, db: "flux_db", now: now, old: old}
+      on_exit(fn -> Local.stop(v2_conn) end)
+      {:ok, v2_conn: v2_conn, db: "flux_db", now: now, old: old}
     end
 
-    test "filter by tag equality", %{conn: conn} do
+    test "filter by tag equality", %{v2_conn: conn} do
       flux =
         "from(bucket: \"flux_db\") |> range(start: -24h) |> filter(fn: (r) => r.host == \"web01\")"
 
@@ -846,21 +746,21 @@ defmodule InfluxElixir.Client.LocalTest do
       assert hd(rows)["host"] == "web01"
     end
 
-    test "range(start: -1h) filters old points", %{conn: conn} do
+    test "range(start: -1h) filters old points", %{v2_conn: conn} do
       flux = "from(bucket: \"flux_db\") |> range(start: -1h)"
       assert {:ok, rows} = Local.query_flux(conn, flux)
       assert length(rows) == 1
       assert hd(rows)["value"] == 10
     end
 
-    test "flux query returns row maps with string keys", %{conn: conn} do
+    test "flux query returns row maps with string keys", %{v2_conn: conn} do
       flux = "from(bucket: \"flux_db\") |> range(start: -24h)"
       assert {:ok, [row | _rest]} = Local.query_flux(conn, flux)
       assert is_binary(row["_measurement"])
       assert Map.has_key?(row, "time")
     end
 
-    test "flux query with no matching bucket returns empty list", %{conn: conn} do
+    test "flux query with no matching bucket returns empty list", %{v2_conn: conn} do
       flux = "from(bucket: \"no_such_bucket\") |> range(start: -1h)"
       assert {:ok, []} = Local.query_flux(conn, flux)
     end

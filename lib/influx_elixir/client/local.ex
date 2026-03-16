@@ -1,6 +1,6 @@
 defmodule InfluxElixir.Client.Local do
   @moduledoc """
-  In-memory InfluxDB client for fast testing.
+  In-memory InfluxDB client for fast, isolated testing.
 
   Stores data in ETS tables, enabling safe `async: true` tests with full
   isolation between test instances. Each call to `start/1` creates an
@@ -9,12 +9,39 @@ defmodule InfluxElixir.Client.Local do
   Parses real line protocol on write, stores points as maps, and responds
   with realistic InfluxDB response formats on query.
 
+  ## Profiles
+
+  LocalClient enforces an InfluxDB **version profile** that determines
+  which operations are available. This prevents tests from accidentally
+  using operations that the real InfluxDB backend doesn't support.
+
+  | Profile | Write | SQL | InfluxQL | Flux | DB CRUD | Bucket CRUD | Tokens |
+  |---|---|---|---|---|---|---|---|
+  | `:v3_core` | yes | yes | yes | no | yes | no | no |
+  | `:v3_enterprise` | yes | yes | yes | no | yes | no | yes |
+  | `:v2` | yes | no | no | yes | no | yes | no |
+
+  Operations outside the configured profile return
+  `{:error, :unsupported_operation}`.
+
   ## Usage
 
+      # Match your production InfluxDB version
       setup do
-        {:ok, conn} = InfluxElixir.Client.Local.start(databases: ["test_db"])
+        {:ok, conn} = InfluxElixir.Client.Local.start(
+          databases: ["test_db"],
+          profile: :v3_core
+        )
         on_exit(fn -> InfluxElixir.Client.Local.stop(conn) end)
         {:ok, conn: conn}
+      end
+
+  ## Checking Profile Support
+
+  Use `supports?/2` to check if an operation is available:
+
+      if Local.supports?(conn, :query_sql) do
+        Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
       end
 
   ## ETS Key Layout
@@ -54,10 +81,50 @@ defmodule InfluxElixir.Client.Local do
           timestamp: integer() | nil
         }
 
+  @type profile :: :v3_core | :v3_enterprise | :v2
+
   @type conn :: %{
           table: :ets.table(),
-          databases: MapSet.t(binary())
+          databases: MapSet.t(binary()),
+          profile: profile()
         }
+
+  # Operations supported by each profile.
+  # An operation not in the list returns {:error, :unsupported_operation}.
+  @profile_capabilities %{
+    v3_core: [
+      :health,
+      :write,
+      :query_sql,
+      :query_sql_stream,
+      :execute_sql,
+      :query_influxql,
+      :create_database,
+      :list_databases,
+      :delete_database
+    ],
+    v3_enterprise: [
+      :health,
+      :write,
+      :query_sql,
+      :query_sql_stream,
+      :execute_sql,
+      :query_influxql,
+      :create_database,
+      :list_databases,
+      :delete_database,
+      :create_token,
+      :delete_token
+    ],
+    v2: [
+      :health,
+      :write,
+      :query_flux,
+      :create_bucket,
+      :list_buckets,
+      :delete_bucket
+    ]
+  }
 
   # Gzip magic bytes
   @gzip_magic <<0x1F, 0x8B>>
@@ -76,15 +143,33 @@ defmodule InfluxElixir.Client.Local do
   ## Options
 
     * `:databases` - list of database names to pre-create (default: `[]`)
+    * `:profile` - InfluxDB version profile to emulate. Determines which
+      operations are available. Operations outside the profile return
+      `{:error, :unsupported_operation}`. Valid values:
+      - `:v3_core` (default) — write, SQL, InfluxQL, database CRUD
+      - `:v3_enterprise` — everything in v3_core plus token management
+      - `:v2` — write, Flux, bucket CRUD
 
   ## Examples
 
       iex> {:ok, conn} = InfluxElixir.Client.Local.start(databases: ["mydb"])
-      iex> is_reference(conn.table)
-      true
+      iex> conn.profile
+      :v3_core
+
+      iex> {:ok, conn} = InfluxElixir.Client.Local.start(profile: :v2)
+      iex> conn.profile
+      :v2
   """
   @spec start(keyword()) :: {:ok, conn()}
   def start(opts \\ []) do
+    profile = Keyword.get(opts, :profile, :v3_core)
+
+    unless Map.has_key?(@profile_capabilities, profile) do
+      raise ArgumentError,
+            "invalid profile: #{inspect(profile)}. " <>
+              "Must be one of: :v3_core, :v3_enterprise, :v2"
+    end
+
     # :public access is intentional — allows async: true tests where
     # the test process and the LocalClient caller are different processes.
     # A GenServer wrapper would be correct for production but adds latency
@@ -101,8 +186,22 @@ defmodule InfluxElixir.Client.Local do
     :ets.insert(table, {:buckets, MapSet.new()})
     :ets.insert(table, {:tokens, []})
 
-    conn = %{table: table, databases: databases}
+    conn = %{table: table, databases: databases, profile: profile}
     {:ok, conn}
+  end
+
+  @doc """
+  Returns `true` if the given operation is supported by the connection's profile.
+  """
+  @spec supports?(conn(), atom()) :: boolean()
+  def supports?(%{profile: profile}, operation) do
+    operation in Map.fetch!(@profile_capabilities, profile)
+  end
+
+  @spec require_capability(conn(), atom()) ::
+          :ok | {:error, :unsupported_operation}
+  defp require_capability(conn, operation) do
+    if supports?(conn, operation), do: :ok, else: {:error, :unsupported_operation}
   end
 
   @doc """
@@ -137,11 +236,12 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()
-  def write(%{table: table} = _conn, payload, opts \\ []) do
+  def write(%{table: table} = conn, payload, opts \\ []) do
     database = Keyword.get(opts, :database, "default")
     precision = Keyword.get(opts, :precision, :nanosecond)
 
-    with {:ok, text} <- maybe_decompress(payload),
+    with :ok <- require_capability(conn, :write),
+         {:ok, text} <- maybe_decompress(payload),
          :ok <- assert_database_exists(table, database),
          {:ok, points} <- parse_line_protocol(text, precision) do
       Enum.each(points, &store_point(table, database, &1))
@@ -167,14 +267,16 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
-  def query_sql(%{table: table}, sql, opts \\ []) do
-    params = Keyword.get(opts, :params, %{})
-    database = Keyword.get(opts, :database, "default")
-    resolved_sql = resolve_params(sql, params)
+  def query_sql(%{table: table} = conn, sql, opts \\ []) do
+    with :ok <- require_capability(conn, :query_sql) do
+      params = Keyword.get(opts, :params, %{})
+      database = Keyword.get(opts, :database, "default")
+      resolved_sql = resolve_params(sql, params)
 
-    case parse_select(resolved_sql) do
-      {:ok, query} -> {:ok, execute_query(table, query, database)}
-      {:error, _reason} = err -> err
+      case parse_select(resolved_sql) do
+        {:ok, query} -> {:ok, execute_query(table, query, database)}
+        {:error, _reason} = err -> err
+      end
     end
   end
 
@@ -190,9 +292,15 @@ defmodule InfluxElixir.Client.Local do
           keyword()
         ) :: Enumerable.t()
   def query_sql_stream(conn, sql, opts \\ []) do
-    case query_sql(conn, sql, opts) do
-      {:ok, rows} -> Stream.map(rows, & &1)
-      {:error, _reason} -> Stream.map([], & &1)
+    case require_capability(conn, :query_sql_stream) do
+      :ok ->
+        case query_sql(conn, sql, opts) do
+          {:ok, rows} -> Stream.map(rows, & &1)
+          {:error, _reason} -> Stream.map([], & &1)
+        end
+
+      {:error, :unsupported_operation} ->
+        Stream.map([], & &1)
     end
   end
 
@@ -208,19 +316,21 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map()} | {:error, term()}
-  def execute_sql(%{table: table}, sql, opts \\ []) do
-    database = Keyword.get(opts, :database, "default")
-    trimmed = String.trim(sql)
+  def execute_sql(%{table: table} = conn, sql, opts \\ []) do
+    with :ok <- require_capability(conn, :execute_sql) do
+      database = Keyword.get(opts, :database, "default")
+      trimmed = String.trim(sql)
 
-    case Regex.run(~r/^(?i)DELETE\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)$/s, trimmed) do
-      [_full, measurement_raw, rest] ->
-        measurement = unescape_measurement(measurement_raw)
-        where = parse_where(rest)
-        count = delete_points(table, database, measurement, where)
-        {:ok, %{"rows_affected" => count}}
+      case Regex.run(~r/^(?i)DELETE\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)$/s, trimmed) do
+        [_full, measurement_raw, rest] ->
+          measurement = unescape_measurement(measurement_raw)
+          where = parse_where(rest)
+          count = delete_points(table, database, measurement, where)
+          {:ok, %{"rows_affected" => count}}
 
-      _no_match ->
-        {:ok, %{"rows_affected" => 0}}
+        _no_match ->
+          {:ok, %{"rows_affected" => 0}}
+      end
     end
   end
 
@@ -245,6 +355,12 @@ defmodule InfluxElixir.Client.Local do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(%{table: table} = conn, influxql, opts \\ []) do
+    with :ok <- require_capability(conn, :query_influxql) do
+      do_query_influxql(table, conn, influxql, opts)
+    end
+  end
+
+  defp do_query_influxql(table, conn, influxql, opts) do
     trimmed = String.trim(influxql)
     database = Keyword.get(opts, :database, "default")
 
@@ -302,22 +418,24 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
-  def query_flux(%{table: table}, flux, _opts \\ []) do
-    database = extract_flux_bucket(flux)
-    measurement = extract_flux_measurement(flux)
+  def query_flux(%{table: table} = conn, flux, _opts \\ []) do
+    with :ok <- require_capability(conn, :query_flux) do
+      database = extract_flux_bucket(flux)
+      measurement = extract_flux_measurement(flux)
 
-    points =
-      case {database, measurement} do
-        {nil, _any} -> all_points(table)
-        {db, nil} -> all_points_in_db(table, db)
-        {db, m} -> fetch_points(table, db, m)
-      end
+      points =
+        case {database, measurement} do
+          {nil, _any} -> all_points(table)
+          {db, nil} -> all_points_in_db(table, db)
+          {db, m} -> fetch_points(table, db, m)
+        end
 
-    points
-    |> apply_flux_range(flux)
-    |> apply_flux_filters(flux)
-    |> Enum.map(&point_to_row/1)
-    |> then(&{:ok, &1})
+      points
+      |> apply_flux_range(flux)
+      |> apply_flux_filters(flux)
+      |> Enum.map(&point_to_row/1)
+      |> then(&{:ok, &1})
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -335,10 +453,12 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           keyword()
         ) :: :ok | {:error, term()}
-  def create_database(%{table: table}, name, _opts \\ []) do
-    databases = get_databases(table)
-    :ets.insert(table, {:databases, MapSet.put(databases, name)})
-    :ok
+  def create_database(%{table: table} = conn, name, _opts \\ []) do
+    with :ok <- require_capability(conn, :create_database) do
+      databases = get_databases(table)
+      :ets.insert(table, {:databases, MapSet.put(databases, name)})
+      :ok
+    end
   end
 
   @doc """
@@ -348,13 +468,15 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec list_databases(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
-  def list_databases(%{table: table}) do
-    dbs =
-      table
-      |> get_databases()
-      |> Enum.map(&%{"name" => &1})
+  def list_databases(%{table: table} = conn) do
+    with :ok <- require_capability(conn, :list_databases) do
+      dbs =
+        table
+        |> get_databases()
+        |> Enum.map(&%{"name" => &1})
 
-    {:ok, dbs}
+      {:ok, dbs}
+    end
   end
 
   @doc """
@@ -366,14 +488,16 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec delete_database(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_database(%{table: table}, name) do
-    databases = get_databases(table)
+  def delete_database(%{table: table} = conn, name) do
+    with :ok <- require_capability(conn, :delete_database) do
+      databases = get_databases(table)
 
-    if MapSet.member?(databases, name) do
-      :ets.insert(table, {:databases, MapSet.delete(databases, name)})
-      :ok
-    else
-      {:error, %{status: 404, body: "database not found: #{name}"}}
+      if MapSet.member?(databases, name) do
+        :ets.insert(table, {:databases, MapSet.delete(databases, name)})
+        :ok
+      else
+        {:error, %{status: 404, body: "database not found: #{name}"}}
+      end
     end
   end
 
@@ -392,10 +516,12 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           keyword()
         ) :: :ok | {:error, term()}
-  def create_bucket(%{table: table}, name, _opts \\ []) do
-    buckets = get_buckets(table)
-    :ets.insert(table, {:buckets, MapSet.put(buckets, name)})
-    :ok
+  def create_bucket(%{table: table} = conn, name, _opts \\ []) do
+    with :ok <- require_capability(conn, :create_bucket) do
+      buckets = get_buckets(table)
+      :ets.insert(table, {:buckets, MapSet.put(buckets, name)})
+      :ok
+    end
   end
 
   @doc """
@@ -405,15 +531,17 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec list_buckets(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
-  def list_buckets(%{table: table}) do
-    bkts =
-      table
-      |> get_buckets()
-      |> Enum.map(fn name ->
-        %{"id" => bucket_id(name), "name" => name}
-      end)
+  def list_buckets(%{table: table} = conn) do
+    with :ok <- require_capability(conn, :list_buckets) do
+      bkts =
+        table
+        |> get_buckets()
+        |> Enum.map(fn name ->
+          %{"id" => bucket_id(name), "name" => name}
+        end)
 
-    {:ok, bkts}
+      {:ok, bkts}
+    end
   end
 
   @doc """
@@ -425,10 +553,12 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_bucket(%{table: table}, name) do
-    buckets = get_buckets(table)
-    :ets.insert(table, {:buckets, MapSet.delete(buckets, name)})
-    :ok
+  def delete_bucket(%{table: table} = conn, name) do
+    with :ok <- require_capability(conn, :delete_bucket) do
+      buckets = get_buckets(table)
+      :ets.insert(table, {:buckets, MapSet.delete(buckets, name)})
+      :ok
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -446,19 +576,21 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           keyword()
         ) :: {:ok, map()} | {:error, term()}
-  def create_token(%{table: table}, description, _opts \\ []) do
-    id = generate_id()
-    token_string = "local-token-#{id}"
+  def create_token(%{table: table} = conn, description, _opts \\ []) do
+    with :ok <- require_capability(conn, :create_token) do
+      id = generate_id()
+      token_string = "local-token-#{id}"
 
-    token = %{
-      "id" => id,
-      "token" => token_string,
-      "description" => description
-    }
+      token = %{
+        "id" => id,
+        "token" => token_string,
+        "description" => description
+      }
 
-    tokens = get_tokens(table)
-    :ets.insert(table, {:tokens, [token | tokens]})
-    {:ok, token}
+      tokens = get_tokens(table)
+      :ets.insert(table, {:tokens, [token | tokens]})
+      {:ok, token}
+    end
   end
 
   @doc """
@@ -468,11 +600,13 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_token(%{table: table}, token_id) do
-    tokens = get_tokens(table)
-    updated = Enum.reject(tokens, &(&1["id"] == token_id))
-    :ets.insert(table, {:tokens, updated})
-    :ok
+  def delete_token(%{table: table} = conn, token_id) do
+    with :ok <- require_capability(conn, :delete_token) do
+      tokens = get_tokens(table)
+      updated = Enum.reject(tokens, &(&1["id"] == token_id))
+      :ets.insert(table, {:tokens, updated})
+      :ok
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -486,8 +620,10 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec health(InfluxElixir.Client.connection()) ::
           {:ok, map()} | {:error, term()}
-  def health(_conn) do
-    {:ok, %{"status" => "pass", "version" => "local"}}
+  def health(conn) do
+    with :ok <- require_capability(conn, :health) do
+      {:ok, %{"status" => "pass", "version" => "local"}}
+    end
   end
 
   # ---------------------------------------------------------------------------

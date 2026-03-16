@@ -106,7 +106,14 @@ defmodule InfluxElixir.MixProject do
   defp docs do
     [
       main: "InfluxElixir",
-      extras: ["README.md", "CHANGELOG.md"],
+      extras: [
+        "README.md",
+        "CHANGELOG.md",
+        "docs/guides/testing-with-local-client.md"
+      ],
+      groups_for_extras: [
+        Guides: ~r/docs\/guides\/.*/
+      ],
       source_ref: "v#{@version}"
     ]
   end

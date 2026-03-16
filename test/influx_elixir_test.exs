@@ -81,10 +81,13 @@ defmodule InfluxElixirTest do
   end
 
   describe "query_flux/3" do
-    test "delegates to configured client", %{conn: conn} do
+    test "delegates to configured client" do
+      {:ok, v2_conn} = Local.start(profile: :v2)
+      on_exit(fn -> Local.stop(v2_conn) end)
+
       assert {:ok, rows} =
                InfluxElixir.query_flux(
-                 conn,
+                 v2_conn,
                  "from(bucket: \"test\") |> range(start: -1h)"
                )
 
@@ -112,36 +115,47 @@ defmodule InfluxElixirTest do
   end
 
   describe "create_bucket/3" do
-    test "delegates to configured client", %{conn: conn} do
-      assert :ok = InfluxElixir.create_bucket(conn, "new_bucket")
+    test "delegates to configured client" do
+      {:ok, v2_conn} = Local.start(profile: :v2)
+      on_exit(fn -> Local.stop(v2_conn) end)
+      assert :ok = InfluxElixir.create_bucket(v2_conn, "new_bucket")
     end
   end
 
   describe "list_buckets/1" do
-    test "delegates to configured client", %{conn: conn} do
-      assert {:ok, buckets} = InfluxElixir.list_buckets(conn)
+    test "delegates to configured client" do
+      {:ok, v2_conn} = Local.start(profile: :v2)
+      on_exit(fn -> Local.stop(v2_conn) end)
+      assert {:ok, buckets} = InfluxElixir.list_buckets(v2_conn)
       assert is_list(buckets)
     end
   end
 
   describe "delete_bucket/2" do
-    test "delegates to configured client", %{conn: conn} do
-      assert :ok = InfluxElixir.delete_bucket(conn, "test_bucket")
+    test "delegates to configured client" do
+      {:ok, v2_conn} = Local.start(profile: :v2)
+      on_exit(fn -> Local.stop(v2_conn) end)
+      assert :ok = InfluxElixir.delete_bucket(v2_conn, "test_bucket")
     end
   end
 
   describe "create_token/3" do
-    test "delegates to configured client", %{conn: conn} do
+    test "delegates to configured client" do
+      {:ok, ent_conn} = Local.start(profile: :v3_enterprise)
+      on_exit(fn -> Local.stop(ent_conn) end)
+
       assert {:ok, token} =
-               InfluxElixir.create_token(conn, "test token")
+               InfluxElixir.create_token(ent_conn, "test token")
 
       assert is_map(token)
     end
   end
 
   describe "delete_token/2" do
-    test "delegates to configured client", %{conn: conn} do
-      assert :ok = InfluxElixir.delete_token(conn, "token_id")
+    test "delegates to configured client" do
+      {:ok, ent_conn} = Local.start(profile: :v3_enterprise)
+      on_exit(fn -> Local.stop(ent_conn) end)
+      assert :ok = InfluxElixir.delete_token(ent_conn, "token_id")
     end
   end
 

@@ -30,6 +30,30 @@ children = [
 ]
 ```
 
+## Testing
+
+This library ships with `InfluxElixir.Client.Local`, an in-memory InfluxDB
+client that enables fast, isolated tests with `async: true` and no external
+dependencies. Configure it in `config/test.exs`:
+
+```elixir
+config :influx_elixir, :client, InfluxElixir.Client.Local
+```
+
+LocalClient enforces an InfluxDB **version profile** matching your production
+backend, so your tests fail if you use operations your real InfluxDB doesn't
+support:
+
+```elixir
+{:ok, conn} = InfluxElixir.Client.Local.start(
+  databases: ["myapp_test"],
+  profile: :v3_core
+)
+```
+
+See the [Testing with LocalClient](testing-with-local-client.html)
+guide for full setup instructions, shared case templates, and contract testing.
+
 ## Documentation
 
 Full documentation available at [HexDocs](https://hexdocs.pm/influx_elixir).

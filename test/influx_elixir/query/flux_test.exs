@@ -5,7 +5,7 @@ defmodule InfluxElixir.Query.FluxTest do
   alias InfluxElixir.Query.Flux
 
   setup do
-    {:ok, conn} = Local.start(databases: ["test_db"])
+    {:ok, conn} = Local.start(databases: ["test_db"], profile: :v2)
     on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn}
   end

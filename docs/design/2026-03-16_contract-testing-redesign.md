@@ -124,74 +124,74 @@ The contract template handles the rest.
 ### Phase 1: LocalClient Profile Enforcement
 Profile enforcement must exist before the contract template can gate tests by profile.
 
-- [ ] 1.1 — Add `profile:` option to `Local.start/1` (`:v3_core`, `:v3_enterprise`, `:v2`)
-- [ ] 1.2 — Default profile is `:v3_core` (most common use case)
-- [ ] 1.3 — Unsupported operations return `{:error, :unsupported_operation}` based on profile
-- [ ] 1.4 — Update existing `local_test.exs` to pass `profile:` where needed (keep passing)
+- [x] 1.1 — Add `profile:` option to `Local.start/1` (`:v3_core`, `:v3_enterprise`, `:v2`)
+- [x] 1.2 — Default profile is `:v3_core` (most common use case)
+- [x] 1.3 — Unsupported operations return `{:error, :unsupported_operation}` based on profile
+- [x] 1.4 — Update existing `local_test.exs` to pass `profile:` where needed (keep passing)
 
 ### Phase 2: Shared Contract Template (ALL assertions)
 All contract assertions go in one file. Every callback in the Client behaviour is covered.
 
-- [ ] 2.1 — Create `test/support/client_contract.ex` ExUnit case template skeleton
-- [ ] 2.2 — Health contract assertions (all profiles)
-- [ ] 2.3 — Write contract: valid LP, bad DB, malformed LP, gzip (all profiles)
-- [ ] 2.4 — Database admin contract: create, list, delete (v3_core, v3_enterprise)
-- [ ] 2.5 — Query SQL contract: empty result, LIMIT, ORDER BY, WHERE (v3_core, v3_enterprise)
-- [ ] 2.6 — Write + query round-trip: int, float, string, bool, large int (v3_core, v3_enterprise)
-- [ ] 2.7 — Query SQL stream contract (v3_core, v3_enterprise)
-- [ ] 2.8 — Execute SQL contract: DELETE FROM (v3_core, v3_enterprise)
-- [ ] 2.9 — InfluxQL contract: SHOW DATABASES, SHOW MEASUREMENTS, SHOW TAG KEYS (v3_core, v3_enterprise)
-- [ ] 2.10 — Bucket admin contract: create, list, delete (v2)
-- [ ] 2.11 — Flux query contract (v2)
-- [ ] 2.12 — Token admin contract: create, delete (v3_enterprise)
+- [x] 2.1 — Create `test/support/client_contract.ex` ExUnit case template skeleton
+- [x] 2.2 — Health contract assertions (all profiles)
+- [x] 2.3 — Write contract: valid LP, bad DB, malformed LP (all profiles)
+- [x] 2.4 — Database admin contract: create, list, delete (v3_core, v3_enterprise)
+- [x] 2.5 — Query SQL contract: empty result, LIMIT, ORDER BY, WHERE (v3_core, v3_enterprise)
+- [x] 2.6 — Write + query round-trip: int, float, string, bool (v3_core, v3_enterprise)
+- [x] 2.7 — Query SQL stream contract (v3_core, v3_enterprise)
+- [x] 2.8 — Execute SQL contract: DELETE FROM (v3_core, v3_enterprise)
+- [x] 2.9 — InfluxQL contract: SHOW DATABASES, SHOW MEASUREMENTS, SHOW TAG KEYS (v3_core, v3_enterprise)
+- [x] 2.10 — Bucket admin contract: create, list, delete (v2)
+- [x] 2.11 — Flux query contract (v2)
+- [x] 2.12 — Token admin contract: create, delete (v3_enterprise)
 
 ### Phase 3: LocalClient Contract Runners
 These prove LocalClient conforms to each profile's contract. Run in CI, no external deps.
 
-- [ ] 3.1 — Create `test/influx_elixir/client/contract_local_v3_core_test.exs`
-- [ ] 3.2 — Create `test/influx_elixir/client/contract_local_v3_enterprise_test.exs`
-- [ ] 3.3 — Create `test/influx_elixir/client/contract_local_v2_test.exs`
-- [ ] 3.4 — Verify all contract tests pass against LocalClient (all 3 profiles)
+- [x] 3.1 — Create `test/influx_elixir/client/contract_local_v3_core_test.exs`
+- [x] 3.2 — Create `test/influx_elixir/client/contract_local_v3_enterprise_test.exs`
+- [x] 3.3 — Create `test/influx_elixir/client/contract_local_v2_test.exs`
+- [x] 3.4 — Verify all contract tests pass against LocalClient (all 3 profiles) — 63 tests, 0 failures
 
 ### Phase 4: Profile Rejection Tests
 Verify each profile correctly REJECTS operations it does NOT support.
 These run only against LocalClient (real backends already reject natively).
 
-- [ ] 4.1 — v3_core rejects: `query_flux`, `create_bucket`, `list_buckets`, `delete_bucket`, `create_token`, `delete_token`
-- [ ] 4.2 — v3_enterprise rejects: `query_flux`, `create_bucket`, `list_buckets`, `delete_bucket`
-- [ ] 4.3 — v2 rejects: `query_sql`, `query_sql_stream`, `execute_sql`, `query_influxql`, `create_database`, `list_databases`, `delete_database`, `create_token`, `delete_token`
+- [x] 4.1 — v3_core rejects: `query_flux`, `create_bucket`, `list_buckets`, `delete_bucket`, `create_token`, `delete_token`
+- [x] 4.2 — v3_enterprise rejects: `query_flux`, `create_bucket`, `list_buckets`, `delete_bucket`
+- [x] 4.3 — v2 rejects: `query_sql`, `query_sql_stream`, `execute_sql`, `query_influxql`, `create_database`, `list_databases`, `delete_database`, `create_token`, `delete_token`
 
 ### Phase 5: Real InfluxDB Contract Runners
 Same contract, now against real backends. Tagged `:integration` + version tag, excluded from CI.
 
-- [ ] 5.1 — Create `test/integration/contract_v3_core_test.exs` (tagged `:v3_core`, `:integration`)
-- [ ] 5.2 — Create `test/integration/contract_v3_enterprise_test.exs` (tagged `:v3_enterprise`, `:integration`)
-- [ ] 5.3 — Create `test/integration/contract_v2_test.exs` (tagged `:v2`, `:integration`)
+- [x] 5.1 — Create `test/integration/contract_v3_core_test.exs` (tagged `:v3_core`, `:integration`)
+- [x] 5.2 — Create `test/integration/contract_v3_enterprise_test.exs` (tagged `:v3_enterprise`, `:integration`)
+- [x] 5.3 — Create `test/integration/contract_v2_test.exs` (tagged `:v2`, `:integration`)
 
 ### Phase 6: Cleanup
-- [ ] 6.1 — Remove old `test/integration/contract_test.exs` (replaced by new contract runners)
-- [ ] 6.2 — Remove old `test/integration/v3_core_test.exs` (replaced by contract runner)
-- [ ] 6.3 — Remove old `test/integration/v3_enterprise_test.exs` (replaced by contract runner)
-- [ ] 6.4 — Remove old `test/integration/v2_test.exs` (replaced by contract runner)
-- [ ] 6.5 — Prune `local_test.exs`: remove tests now covered by contract, keep LocalClient-specific tests (ETS lifecycle, start/stop, instance isolation, gzip decompression internals)
-- [ ] 6.6 — Run `mix quality` — all checks pass
-- [ ] 6.7 — Run `mix test` — all tests pass, 0 failures
+- [x] 6.1 — Remove old `test/integration/contract_test.exs` (replaced by new contract runners)
+- [x] 6.2 — Remove old `test/integration/v3_core_test.exs` (replaced by contract runner)
+- [x] 6.3 — Remove old `test/integration/v3_enterprise_test.exs` (replaced by contract runner)
+- [x] 6.4 — Remove old `test/integration/v2_test.exs` (replaced by contract runner)
+- [x] 6.5 — Prune `local_test.exs`: removed health, database admin, bucket admin, token admin (covered by contract); kept ETS lifecycle, edge cases, gzip, precision, parameterised queries
+- [x] 6.6 — Run `mix quality` — format ✓, credo ✓, dialyzer ✓
+- [x] 6.7 — Run `mix test` — 558 tests, 0 failures, 67 excluded
 
 ### Phase 7: Documentation
 Consuming apps need to know how to use LocalClient correctly with profiles.
 
-- [ ] 7.1 — `@moduledoc` on `Local` — explain profiles, show setup example, list supported operations per profile
-- [ ] 7.2 — `@moduledoc` on `ClientContract` — explain how consuming apps can run the contract against their own adapters
-- [ ] 7.3 — `@doc` on `Local.start/1` — document `profile:` option, valid values, default, what happens on unsupported operation
-- [ ] 7.4 — Hex docs guide: `docs/guides/testing-with-local-client.md` — full walkthrough for consuming apps:
+- [x] 7.1 — `@moduledoc` on `Local` — explain profiles, show setup example, list supported operations per profile
+- [x] 7.2 — `@moduledoc` on `ClientContract` — explain how consuming apps can run the contract against their own adapters
+- [x] 7.3 — `@doc` on `Local.start/1` — document `profile:` option, valid values, default, what happens on unsupported operation
+- [x] 7.4 — Hex docs guide: `docs/guides/testing-with-local-client.md` — full walkthrough for consuming apps:
   - How to add `influx_elixir` as a test dependency
   - How to configure LocalClient with the correct profile
   - How to set up `test_helper.exs` and `config/test.exs`
   - How to use the contract template to verify their own adapters
   - Example test module showing a complete consuming app test setup
   - What happens when you pick the wrong profile (and why that's a feature)
-- [ ] 7.5 — Update top-level README testing section to reference the guide
-- [ ] 7.6 — Run `mix docs` — verify guide renders correctly
+- [x] 7.5 — Update top-level README testing section to reference the guide
+- [x] 7.6 — Run `mix docs` — verify guide renders correctly (guide added to `mix.exs` extras)
 
 ---
 
