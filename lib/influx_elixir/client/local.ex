@@ -280,6 +280,7 @@ defmodule InfluxElixir.Client.Local do
   Supports:
 
     * `SELECT * FROM measurement`
+    * `SELECT DISTINCT column FROM measurement`
     * `WHERE key = 'value'` / `WHERE key > N` / `WHERE key < N`
     * `ORDER BY time ASC|DESC`
     * `LIMIT N`
@@ -1012,6 +1013,7 @@ defmodule InfluxElixir.Client.Local do
   @spec unescape_measurement(binary()) :: binary()
   defp unescape_measurement(str) do
     str
+    |> String.trim("\"")
     |> String.replace("\\ ", " ")
     |> String.replace("\\,", ",")
     |> String.replace("\\\\", "\\")
@@ -1042,7 +1044,8 @@ defmodule InfluxElixir.Client.Local do
           order_by: {:time, :asc | :desc} | nil,
           limit: pos_integer() | nil,
           group_by_interval: pos_integer() | nil,
-          select_columns: [select_column()] | nil
+          select_columns: [select_column()] | nil,
+          distinct_column: binary() | nil
         }
 
   # Aggregate function names recognised by the parser.
@@ -1052,11 +1055,16 @@ defmodule InfluxElixir.Client.Local do
   defp parse_select(sql) do
     normalised = String.trim(sql)
 
-    if aggregate_query?(normalised) do
-      parse_aggregate_select(normalised)
-    else
-      parse_star_select(normalised)
+    cond do
+      distinct_query?(normalised) -> parse_distinct_select(normalised)
+      aggregate_query?(normalised) -> parse_aggregate_select(normalised)
+      true -> parse_star_select(normalised)
     end
+  end
+
+  @spec distinct_query?(binary()) :: boolean()
+  defp distinct_query?(sql) do
+    String.match?(sql, ~r/(?i)^\s*SELECT\s+DISTINCT\s+/)
   end
 
   @spec aggregate_query?(binary()) :: boolean()
@@ -1082,7 +1090,8 @@ defmodule InfluxElixir.Client.Local do
          order_by: parse_order_by(rest),
          limit: parse_limit(rest),
          group_by_interval: interval_ns,
-         select_columns: columns
+         select_columns: columns,
+         distinct_column: nil
        }}
     end
   end
@@ -1278,6 +1287,41 @@ defmodule InfluxElixir.Client.Local do
 
   defp interval_unit_to_ns(_unknown), do: nil
 
+  @distinct_pattern ~r/(?i)SELECT\s+DISTINCT\s+(\w+)\s+FROM\s+(?:"([^"]+)"|(\S+))\s*(.*)/s
+
+  @spec parse_distinct_select(binary()) ::
+          {:ok, parsed_query()} | {:error, term()}
+  defp parse_distinct_select(sql) do
+    case Regex.run(@distinct_pattern, sql) do
+      [_full, column, quoted, "", rest] ->
+        {:ok,
+         %{
+           measurement: quoted,
+           where: parse_where(rest),
+           order_by: nil,
+           limit: parse_limit(rest),
+           group_by_interval: nil,
+           select_columns: nil,
+           distinct_column: column
+         }}
+
+      [_full, column, "", unquoted, rest] ->
+        {:ok,
+         %{
+           measurement: unescape_measurement(unquoted),
+           where: parse_where(rest),
+           order_by: nil,
+           limit: parse_limit(rest),
+           group_by_interval: nil,
+           select_columns: nil,
+           distinct_column: column
+         }}
+
+      _no_match ->
+        {:error, %{status: 400, body: "unsupported DISTINCT query: #{sql}"}}
+    end
+  end
+
   @spec parse_star_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
   defp parse_star_select(sql) do
     case Regex.run(@measurement_pattern, sql) do
@@ -1291,7 +1335,8 @@ defmodule InfluxElixir.Client.Local do
            order_by: parse_order_by(rest),
            limit: parse_limit(rest),
            group_by_interval: nil,
-           select_columns: nil
+           select_columns: nil,
+           distinct_column: nil
          }}
 
       _no_match ->
@@ -1403,14 +1448,39 @@ defmodule InfluxElixir.Client.Local do
     points = fetch_points(table, database, m)
     filtered = apply_where(points, query.where)
 
-    if query.select_columns do
-      execute_aggregate_query(filtered, query)
-    else
-      filtered
-      |> apply_order_by(query.order_by)
-      |> apply_limit(query.limit)
-      |> Enum.map(&point_to_row/1)
+    cond do
+      query.distinct_column ->
+        execute_distinct_query(filtered, query)
+
+      query.select_columns ->
+        execute_aggregate_query(filtered, query)
+
+      true ->
+        filtered
+        |> apply_order_by(query.order_by)
+        |> apply_limit(query.limit)
+        |> Enum.map(&point_to_row/1)
     end
+  end
+
+  @spec execute_distinct_query([point_map()], parsed_query()) :: [map()]
+  defp execute_distinct_query(points, query) do
+    col = query.distinct_column
+
+    points
+    |> Enum.map(fn point ->
+      Map.get(point.fields, col) || Map.get(point.tags, col)
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> then(fn values ->
+      case query.limit do
+        nil -> values
+        n -> Enum.take(values, n)
+      end
+    end)
+    |> Enum.map(fn value -> %{col => value} end)
   end
 
   @spec execute_aggregate_query([point_map()], parsed_query()) :: [map()]

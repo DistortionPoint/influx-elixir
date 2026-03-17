@@ -168,6 +168,20 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["_measurement"] == "my measurement"
     end
 
+    test "quoted measurement name in SELECT *", %{conn: conn, db: db} do
+      Local.write(conn, "prices value=100.0", database: db)
+
+      assert {:ok, [row]} =
+               Local.query_sql(
+                 conn,
+                 ~s(SELECT * FROM "prices"),
+                 database: db
+               )
+
+      assert row["value"] == 100.0
+      assert row["_measurement"] == "prices"
+    end
+
     test "string field with escaped quotes", %{conn: conn, db: db} do
       Local.write(conn, ~S(m msg="say \"hi\""), database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
@@ -763,6 +777,109 @@ defmodule InfluxElixir.Client.LocalTest do
     test "flux query with no matching bucket returns empty list", %{v2_conn: conn} do
       flux = "from(bucket: \"no_such_bucket\") |> range(start: -1h)"
       assert {:ok, []} = Local.query_flux(conn, flux)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — SELECT DISTINCT
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — SELECT DISTINCT" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "dist_db")
+
+      lines =
+        Enum.join(
+          [
+            "prices,symbol=AAPL price=150.0 1000000000",
+            "prices,symbol=GOOG price=2800.0 2000000000",
+            "prices,symbol=AAPL price=151.0 3000000000",
+            "prices,symbol=MSFT price=300.0 4000000000",
+            "prices,symbol=GOOG price=2810.0 5000000000"
+          ],
+          "\n"
+        )
+
+      {:ok, :written} =
+        Local.write(conn, lines, database: "dist_db")
+
+      {:ok, db: "dist_db"}
+    end
+
+    test "returns unique values for a tag column", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          ~s(SELECT DISTINCT symbol FROM "prices"),
+          database: db
+        )
+
+      values = Enum.map(rows, & &1["symbol"])
+      assert length(values) == 3
+      assert "AAPL" in values
+      assert "GOOG" in values
+      assert "MSFT" in values
+    end
+
+    test "returns unique values for a field column", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          ~s(SELECT DISTINCT price FROM "prices"),
+          database: db
+        )
+
+      values = Enum.map(rows, & &1["price"])
+      assert length(values) == 5
+    end
+
+    test "applies WHERE filter", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          ~s(SELECT DISTINCT symbol FROM "prices" WHERE price > 200),
+          database: db
+        )
+
+      values = Enum.map(rows, & &1["symbol"])
+      assert length(values) == 2
+      assert "GOOG" in values
+      assert "MSFT" in values
+      refute "AAPL" in values
+    end
+
+    test "applies LIMIT", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          ~s(SELECT DISTINCT symbol FROM "prices" LIMIT 2),
+          database: db
+        )
+
+      assert length(rows) == 2
+    end
+
+    test "unquoted measurement name", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT DISTINCT symbol FROM prices",
+          database: db
+        )
+
+      values = Enum.map(rows, & &1["symbol"])
+      assert length(values) == 3
+    end
+
+    test "returns empty list for no matching data", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          ~s(SELECT DISTINCT symbol FROM "nonexistent"),
+          database: db
+        )
+
+      assert rows == []
     end
   end
 
