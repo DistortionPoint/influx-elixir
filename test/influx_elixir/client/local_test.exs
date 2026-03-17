@@ -583,6 +583,121 @@ defmodule InfluxElixir.Client.LocalTest do
   end
 
   # ---------------------------------------------------------------------------
+  # query_sql/3 — WHERE time conditions
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — WHERE time conditions" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "time_db")
+
+      # Three points at known timestamps:
+      # t1 = 2026-03-17T12:00:00Z = 1773748800000000000 ns
+      # t2 = 2026-03-17T12:01:00Z = 1773748860000000000 ns
+      # t3 = 2026-03-17T12:02:00Z = 1773748920000000000 ns
+      lines =
+        Enum.join(
+          [
+            "prices,symbol=AAPL price=150.0 1773748800000000000",
+            "prices,symbol=GOOG price=2800.0 1773748860000000000",
+            "prices,symbol=MSFT price=300.0 1773748920000000000"
+          ],
+          "\n"
+        )
+
+      {:ok, :written} = Local.write(conn, lines, database: "time_db")
+      {:ok, db: "time_db"}
+    end
+
+    test "SELECT * with time >= and time <", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM prices WHERE time >= 1773748800000000000 AND time < 1773748920000000000",
+          database: db
+        )
+
+      assert length(rows) == 2
+      symbols = Enum.map(rows, & &1["symbol"])
+      assert "AAPL" in symbols
+      assert "GOOG" in symbols
+    end
+
+    test "SELECT * with ISO 8601 time params", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM prices WHERE time >= $start AND time < $end",
+          database: db,
+          params: %{
+            "$start" => "2026-03-17T12:00:00Z",
+            "$end" => "2026-03-17T12:02:00Z"
+          }
+        )
+
+      assert length(rows) == 2
+      symbols = Enum.map(rows, & &1["symbol"])
+      assert "AAPL" in symbols
+      assert "GOOG" in symbols
+    end
+
+    test "aggregate query with time WHERE", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 minute', time) AS time,
+        AVG(price) AS avg_price
+      FROM "prices"
+      WHERE time >= $start AND time < $end
+      GROUP BY DATE_BIN(INTERVAL '1 minute', time)
+      ORDER BY time ASC
+      """
+
+      {:ok, rows} =
+        Local.query_sql(conn, sql,
+          database: db,
+          params: %{
+            "$start" => "2026-03-17T12:00:00Z",
+            "$end" => "2026-03-17T12:02:00Z"
+          }
+        )
+
+      assert length(rows) == 2
+      assert [first_row | _rest] = rows
+      assert first_row["avg_price"] == 150.0
+    end
+
+    test "time WHERE combined with tag filter", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM prices WHERE time >= $start AND time < $end AND symbol = 'AAPL'",
+          database: db,
+          params: %{
+            "$start" => "2026-03-17T12:00:00Z",
+            "$end" => "2026-03-17T12:05:00Z"
+          }
+        )
+
+      assert length(rows) == 1
+      assert hd(rows)["symbol"] == "AAPL"
+    end
+
+    test "time WHERE excludes all points", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM prices WHERE time >= $start AND time < $end",
+          database: db,
+          params: %{
+            "$start" => "2026-03-18T00:00:00Z",
+            "$end" => "2026-03-18T01:00:00Z"
+          }
+        )
+
+      assert rows == []
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # write/3 — line protocol edge cases
   # ---------------------------------------------------------------------------
 

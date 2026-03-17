@@ -1606,10 +1606,33 @@ defmodule InfluxElixir.Client.Local do
   end
 
   @spec matches_condition?(point_map(), {atom(), binary(), term()}) :: boolean()
+  defp matches_condition?(point, {op, "time", value}) do
+    compare(point.timestamp, op, to_nanoseconds(value))
+  end
+
   defp matches_condition?(point, {op, key, value}) do
     actual = Map.get(point.tags, key) || Map.get(point.fields, key)
     compare(actual, op, value)
   end
+
+  # Convert various time representations to nanosecond integers.
+  @spec to_nanoseconds(term()) :: integer() | nil
+  defp to_nanoseconds(value) when is_integer(value), do: value
+
+  defp to_nanoseconds(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _offset} ->
+        DateTime.to_unix(dt, :nanosecond)
+
+      {:error, _reason} ->
+        case Integer.parse(value) do
+          {n, ""} -> n
+          _not_int -> nil
+        end
+    end
+  end
+
+  defp to_nanoseconds(_other), do: nil
 
   @spec compare(term(), atom(), term()) :: boolean()
   defp compare(nil, _op, _value), do: false
