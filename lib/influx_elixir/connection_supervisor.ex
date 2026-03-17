@@ -46,9 +46,11 @@ defmodule InfluxElixir.ConnectionSupervisor do
     finch_name = finch_name(name)
     pool_size = Keyword.get(config, :pool_size, 10)
 
-    # Register this connection in the persistent_term registry so that
-    # callers can resolve it by name via Connection.fetch!/1.
-    InfluxElixir.Connection.put(name, config)
+    # Initialize the connection via the configured client implementation
+    # and register it in the persistent_term registry so that callers can
+    # resolve it by name via Connection.fetch!/1.
+    {:ok, conn} = InfluxElixir.Client.impl().init_connection(config)
+    InfluxElixir.Connection.put(name, conn)
 
     finch_child =
       {Finch,

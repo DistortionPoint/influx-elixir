@@ -32,6 +32,18 @@ defmodule InfluxElixir.Client.HTTP do
   alias InfluxElixir.Query.ResponseParser
 
   # ---------------------------------------------------------------------------
+  # Connection lifecycle
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  @spec init_connection(keyword()) :: {:ok, keyword()}
+  def init_connection(config), do: {:ok, config}
+
+  @impl true
+  @spec shutdown_connection(keyword()) :: :ok
+  def shutdown_connection(_connection), do: :ok
+
+  # ---------------------------------------------------------------------------
   # Write
   # ---------------------------------------------------------------------------
 

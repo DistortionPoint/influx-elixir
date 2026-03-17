@@ -167,6 +167,51 @@ The contract tests verify health, write, query, admin, and round-trip
 operations. They run the same assertions against every backend — if both
 LocalClient and real InfluxDB pass, LocalClient is proven faithful.
 
+## Named Connections via the Facade
+
+LocalClient works seamlessly with the facade's named connection system.
+When `Client.Local` is the configured client, `ConnectionSupervisor`
+calls `Local.init_connection/1` to create an ETS-backed connection and
+registers it under the given name. All facade functions then work
+transparently:
+
+```elixir
+# config/test.exs
+config :influx_elixir, :client, InfluxElixir.Client.Local
+
+config :influx_elixir, :connections,
+  test_db: [
+    databases: ["myapp_test"],
+    profile: :v3_core
+  ]
+```
+
+```elixir
+defmodule MyApp.FacadeTest do
+  use ExUnit.Case
+
+  test "write and query via named connection" do
+    {:ok, :written} = InfluxElixir.write(
+      :test_db,
+      "sensors temp=22.5",
+      database: "myapp_test"
+    )
+
+    {:ok, [row]} = InfluxElixir.query_sql(
+      :test_db,
+      "SELECT * FROM sensors LIMIT 1",
+      database: "myapp_test"
+    )
+
+    assert row["temp"] == 22.5
+  end
+end
+```
+
+This lets you test your application code that uses `InfluxElixir.write/3`
+and `InfluxElixir.query_sql/3` without any code changes — just swap the
+client in config.
+
 ## Aggregate Queries
 
 LocalClient supports `DATE_BIN` time-bucketed aggregate queries — the same

@@ -16,11 +16,30 @@ defmodule InfluxElixir.Client do
 
   - `InfluxElixir.Client.HTTP` — production Finch-based client
   - `InfluxElixir.Client.Local` — in-memory ETS-backed test client
+
+  ## Connection Lifecycle
+
+  Each implementation defines how connections are created and destroyed:
+
+  - `init_connection/1` — converts raw keyword config into the
+    implementation's native connection type. Called by
+    `ConnectionSupervisor` during startup.
+    - `Client.HTTP` returns the keyword config as-is
+    - `Client.Local` creates an ETS table and returns a conn map
+
+  - `shutdown_connection/1` — cleans up resources when a connection
+    is removed. Called by `InfluxElixir.remove_connection/1`.
+    - `Client.HTTP` is a no-op (Finch pool has its own supervisor)
+    - `Client.Local` deletes the ETS table
   """
 
   @type connection :: term()
   @type query_result :: {:ok, [map()]} | {:error, term()}
   @type write_result :: {:ok, :written} | {:error, term()}
+
+  # Connection lifecycle
+  @callback init_connection(keyword()) :: {:ok, connection()} | {:error, term()}
+  @callback shutdown_connection(connection()) :: :ok
 
   # Write
   @callback write(connection, binary(), keyword()) :: write_result()

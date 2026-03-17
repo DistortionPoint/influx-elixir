@@ -139,6 +139,22 @@ defmodule InfluxElixir.Client.Local do
   @measurement_pattern ~r/(?i)SELECT\s+\*\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)/s
 
   # ---------------------------------------------------------------------------
+  # Connection lifecycle (behaviour callbacks)
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  @spec init_connection(keyword()) :: {:ok, conn()}
+  def init_connection(config) do
+    databases = Keyword.get(config, :databases, [])
+    profile = Keyword.get(config, :profile, :v3_core)
+    start(databases: databases, profile: profile)
+  end
+
+  @impl true
+  @spec shutdown_connection(conn()) :: :ok
+  def shutdown_connection(conn), do: stop(conn)
+
+  # ---------------------------------------------------------------------------
   # Lifecycle
   # ---------------------------------------------------------------------------
 

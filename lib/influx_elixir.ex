@@ -333,6 +333,12 @@ defmodule InfluxElixir do
     case Supervisor.terminate_child(InfluxElixir.Supervisor, child_id) do
       :ok ->
         result = Supervisor.delete_child(InfluxElixir.Supervisor, child_id)
+
+        case InfluxElixir.Connection.get(name) do
+          {:ok, conn} -> client().shutdown_connection(conn)
+          {:error, :not_found} -> :ok
+        end
+
         InfluxElixir.Connection.delete(name)
         result
 

@@ -8,7 +8,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
   end
 
   describe "init/1 — registry population" do
-    test "registers connection config in persistent_term on start" do
+    test "registers initialized connection in persistent_term on start" do
       name = unique_name()
 
       config = [
@@ -27,12 +27,13 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
 
       assert Process.alive?(pid)
 
-      # Connection should be resolvable by name
+      # Connection should be resolvable by name and be an initialized
+      # connection (Client.Local returns a map with :table, :databases, :profile)
       assert {:ok, registered} = Connection.get(name)
-      assert registered[:host] == "localhost"
-      assert registered[:token] == "test-token"
-      assert registered[:default_database] == "mydb"
-      assert registered[:name] == name
+      assert is_map(registered)
+      assert Map.has_key?(registered, :table)
+      assert Map.has_key?(registered, :databases)
+      assert Map.has_key?(registered, :profile)
     end
 
     test "fetch!/1 works for a started connection" do
@@ -48,8 +49,10 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
         InfluxElixir.remove_connection(name)
       end)
 
-      config = Connection.fetch!(name)
-      assert config[:host] == "influx.local"
+      conn = Connection.fetch!(name)
+      # Returns an initialized connection, usable by the configured client
+      assert is_map(conn)
+      assert Map.has_key?(conn, :table)
     end
 
     test "finch pool name is derivable from registered connection" do

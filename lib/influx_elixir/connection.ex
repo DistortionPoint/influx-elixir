@@ -2,14 +2,25 @@ defmodule InfluxElixir.Connection do
   @moduledoc """
   Named connection manager for InfluxDB instances.
 
-  Stores and retrieves validated connection configuration keyed by name.
-  Connection configs are stored in a persistent term for fast, lock-free
-  reads from any process.
+  Stores and retrieves **initialized connections** keyed by name.
+  Values are stored in a persistent term for fast, lock-free reads
+  from any process.
+
+  ## Important
+
+  Stored values are **initialized connections** (the result of
+  `Client.init_connection/1`), not raw keyword configs. The type
+  depends on the configured client implementation:
+
+  - `Client.HTTP` — keyword list (host, token, etc.)
+  - `Client.Local` — map with ETS table reference (`%{table: _, databases: _, profile: _}`)
 
   ## Usage
 
   Connections are automatically registered by
-  `InfluxElixir.ConnectionSupervisor` during startup. The facade module
+  `InfluxElixir.ConnectionSupervisor` during startup. The supervisor
+  calls `Client.init_connection/1` to convert raw config into a
+  usable connection before storing it here. The facade module
   (`InfluxElixir`) resolves atom names transparently, so most consumer
   code simply passes the connection name:
 
@@ -18,8 +29,8 @@ defmodule InfluxElixir.Connection do
 
   For direct registry access:
 
-      {:ok, config} = InfluxElixir.Connection.get(:trading)
-      config = InfluxElixir.Connection.fetch!(:trading)
+      {:ok, conn} = InfluxElixir.Connection.get(:trading)
+      conn = InfluxElixir.Connection.fetch!(:trading)
 
   ## Storage
 
@@ -34,23 +45,23 @@ defmodule InfluxElixir.Connection do
   ## Parameters
 
     * `name` - atom identifying the connection
-    * `config` - keyword list of validated connection options
+    * `connection` - initialized connection value (from `Client.init_connection/1`)
 
   ## Examples
 
       iex> InfluxElixir.Connection.put(:test, host: "localhost", token: "t")
       :ok
   """
-  @spec put(atom(), keyword()) :: :ok
-  def put(name, config) when is_atom(name) do
-    :persistent_term.put({__MODULE__, name}, config)
+  @spec put(atom(), term()) :: :ok
+  def put(name, connection) when is_atom(name) do
+    :persistent_term.put({__MODULE__, name}, connection)
     :ok
   end
 
   @doc """
   Retrieves the connection config for the given name.
 
-  Returns `{:ok, config}` or `{:error, :not_found}`.
+  Returns `{:ok, connection}` or `{:error, :not_found}`.
 
   ## Parameters
 
@@ -59,11 +70,11 @@ defmodule InfluxElixir.Connection do
   ## Examples
 
       iex> InfluxElixir.Connection.put(:test, host: "localhost", token: "t")
-      iex> {:ok, config} = InfluxElixir.Connection.get(:test)
-      iex> config[:host]
+      iex> {:ok, conn} = InfluxElixir.Connection.get(:test)
+      iex> conn[:host]
       "localhost"
   """
-  @spec get(atom()) :: {:ok, keyword()} | {:error, :not_found}
+  @spec get(atom()) :: {:ok, term()} | {:error, :not_found}
   def get(name) when is_atom(name) do
     {:ok, :persistent_term.get({__MODULE__, name})}
   rescue
@@ -80,11 +91,11 @@ defmodule InfluxElixir.Connection do
   ## Examples
 
       iex> InfluxElixir.Connection.put(:test, host: "localhost", token: "t")
-      iex> config = InfluxElixir.Connection.fetch!(:test)
-      iex> config[:host]
+      iex> conn = InfluxElixir.Connection.fetch!(:test)
+      iex> conn[:host]
       "localhost"
   """
-  @spec fetch!(atom()) :: keyword()
+  @spec fetch!(atom()) :: term()
   def fetch!(name) when is_atom(name) do
     :persistent_term.get({__MODULE__, name})
   end
