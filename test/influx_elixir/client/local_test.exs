@@ -698,6 +698,111 @@ defmodule InfluxElixir.Client.LocalTest do
   end
 
   # ---------------------------------------------------------------------------
+  # query_sql/3 — coverage for error/edge branches
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — error and edge branches" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "edge_db")
+      {:ok, db: "edge_db"}
+    end
+
+    test "invalid DISTINCT syntax returns error", %{conn: conn, db: db} do
+      assert {:error, %{status: 400}} =
+               Local.query_sql(
+                 conn,
+                 "SELECT DISTINCT FROM prices",
+                 database: db
+               )
+    end
+
+    test "WHERE time with integer-string param", %{conn: conn, db: db} do
+      Local.write(conn, "m val=1i 5000", database: db)
+
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM m WHERE time >= $t",
+          database: db,
+          params: %{"$t" => 5000}
+        )
+
+      assert length(rows) == 1
+    end
+
+    test "WHERE time with non-matching filter returns empty",
+         %{conn: conn, db: db} do
+      Local.write(conn, "m val=1i 5000", database: db)
+
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM m WHERE time > 9999",
+          database: db
+        )
+
+      assert rows == []
+    end
+
+    test "aggregate on empty measurement returns empty",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        AVG(val) AS avg_val
+      FROM "empty_m"
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      """
+
+      {:ok, rows} =
+        Local.query_sql(conn, sql, database: db)
+
+      assert rows == []
+    end
+
+    test "double-quoted WHERE value parsed as string",
+         %{conn: conn, db: db} do
+      Local.write(conn, ~s(m,tag=hello val=1i), database: db)
+
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          ~s(SELECT * FROM m WHERE tag = "hello"),
+          database: db
+        )
+
+      assert length(rows) == 1
+    end
+
+    test "boolean false param in WHERE", %{conn: conn, db: db} do
+      Local.write(conn, "m,active=true val=1i", database: db)
+
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM m WHERE active = false",
+          database: db
+        )
+
+      assert rows == []
+    end
+
+    test "float param in SQL literal", %{conn: conn, db: db} do
+      Local.write(conn, "m val=3.14", database: db)
+
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM m WHERE val > $v",
+          database: db,
+          params: %{"$v" => 3.0}
+        )
+
+      assert length(rows) == 1
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # write/3 — line protocol edge cases
   # ---------------------------------------------------------------------------
 
