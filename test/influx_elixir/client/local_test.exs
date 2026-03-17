@@ -765,4 +765,313 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, []} = Local.query_flux(conn, flux)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — DATE_BIN + aggregate functions
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — aggregate queries" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "agg_db")
+
+      # 6 points at half-hour offsets to avoid bucket boundary collisions
+      # 0.5h, 1.5h, 2.5h, 3.5h, 4.5h, 5.5h
+      hour = 3_600_000_000_000
+      half = div(hour, 2)
+
+      lines =
+        [
+          "cpu,host=web01 usage=10i,idle=90i #{0 * hour + half}",
+          "cpu,host=web01 usage=20i,idle=80i #{1 * hour + half}",
+          "cpu,host=web01 usage=30i,idle=70i #{2 * hour + half}",
+          "cpu,host=web02 usage=40i,idle=60i #{3 * hour + half}",
+          "cpu,host=web02 usage=50i,idle=50i #{4 * hour + half}",
+          "cpu,host=web02 usage=60i,idle=40i #{5 * hour + half}"
+        ]
+        |> Enum.join("\n")
+
+      Local.write(conn, lines, database: "agg_db", precision: :nanosecond)
+      {:ok, db: "agg_db", hour: hour}
+    end
+
+    test "AVG with 2-hour buckets", %{conn: conn, db: db, hour: hour} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '2 hours', time) AS time,
+        AVG(usage) AS avg_usage
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '2 hours', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      # 0.5h,1.5h → bucket 0; 2.5h,3.5h → bucket 2h; 4.5h,5.5h → bucket 4h
+      assert length(rows) == 3
+
+      [b1, b2, b3] = rows
+      assert b1["time"] == 0
+      assert b1["avg_usage"] == 15.0
+      assert b2["time"] == 2 * hour
+      assert b2["avg_usage"] == 35.0
+      assert b3["time"] == 4 * hour
+      assert b3["avg_usage"] == 55.0
+    end
+
+    test "SUM aggregate", %{conn: conn, db: db, hour: hour} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '3 hours', time) AS time,
+        SUM(usage) AS total
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '3 hours', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      # 0.5h,1.5h,2.5h → bucket 0; 3.5h,4.5h,5.5h → bucket 3h
+      assert length(rows) == 2
+
+      [b1, b2] = rows
+      assert b1["time"] == 0
+      assert b1["total"] == 60
+      assert b2["time"] == 3 * hour
+      assert b2["total"] == 150
+    end
+
+    test "COUNT aggregate", %{conn: conn, db: db, hour: hour} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '3 hours', time) AS time,
+        COUNT(usage) AS cnt
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '3 hours', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+
+      [b1, b2] = rows
+      assert b1["time"] == 0
+      assert b1["cnt"] == 3
+      assert b2["time"] == 3 * hour
+      assert b2["cnt"] == 3
+    end
+
+    test "MIN and MAX aggregates", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '6 hours', time) AS time,
+        MIN(usage) AS min_val,
+        MAX(usage) AS max_val
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '6 hours', time)
+      ORDER BY time ASC
+      """
+
+      # All points at 0.5h-5.5h → all in bucket 0
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["time"] == 0
+      assert row["min_val"] == 10
+      assert row["max_val"] == 60
+    end
+
+    test "multiple aggregates in one query",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '6 hours', time) AS time,
+        AVG(usage) AS avg_val,
+        SUM(usage) AS sum_val,
+        COUNT(usage) AS cnt
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '6 hours', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["avg_val"] == 35.0
+      assert row["sum_val"] == 210
+      assert row["cnt"] == 6
+    end
+
+    test "aggregate with WHERE filter",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '3 hours', time) AS time,
+        AVG(usage) AS avg_usage
+      FROM "cpu"
+      WHERE host = 'web01'
+      GROUP BY DATE_BIN(INTERVAL '3 hours', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      # web01 has points at 0.5h, 1.5h, 2.5h → all in bucket 0
+      assert length(rows) == 1
+      [row] = rows
+      assert row["time"] == 0
+      assert row["avg_usage"] == 20.0
+    end
+
+    test "ORDER BY time DESC", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '3 hours', time) AS time,
+        COUNT(usage) AS cnt
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '3 hours', time)
+      ORDER BY time DESC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      times = Enum.map(rows, & &1["time"])
+      assert times == Enum.sort(times, :desc)
+    end
+
+    test "LIMIT on aggregate results",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        AVG(usage) AS avg_usage
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      ORDER BY time ASC
+      LIMIT 2
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      assert length(rows) == 2
+    end
+
+    test "interval with singular unit name (hour vs hours)",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        COUNT(usage) AS cnt
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      assert length(rows) == 6
+    end
+
+    test "minute interval", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '60 minutes', time) AS time,
+        COUNT(usage) AS cnt
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '60 minutes', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      # 60 min == 1 hour, so 6 buckets
+      assert length(rows) == 6
+    end
+
+    test "unquoted measurement name", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '6 hours', time) AS time,
+        AVG(usage) AS avg_usage
+      FROM cpu
+      GROUP BY DATE_BIN(INTERVAL '6 hours', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["avg_usage"] == 35.0
+    end
+
+    test "empty result set returns empty list",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        AVG(usage) AS avg_usage
+      FROM "nonexistent"
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, []} = Local.query_sql(conn, sql, database: db)
+    end
+
+    test "day interval buckets", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 day', time) AS time,
+        SUM(usage) AS total
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '1 day', time)
+      ORDER BY time ASC
+      """
+
+      # All 6 points at 0.5h-5.5h → all in day bucket 0
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["time"] == 0
+      assert row["total"] == 210
+    end
+
+    test "second interval", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '3600 seconds', time) AS time,
+        COUNT(usage) AS cnt
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '3600 seconds', time)
+      ORDER BY time ASC
+      """
+
+      # 3600 seconds == 1 hour, same as 1-hour buckets → 6 buckets
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      assert length(rows) == 6
+    end
+
+    test "aggregate without ORDER BY returns results", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '6 hours', time) AS time,
+        SUM(usage) AS total
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '6 hours', time)
+      """
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["total"] == 210
+    end
+
+    test "missing GROUP BY returns error", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        AVG(usage) AS avg_usage
+      FROM "cpu"
+      """
+
+      assert {:error, %{status: 400, body: body}} =
+               Local.query_sql(conn, sql, database: db)
+
+      assert body =~ "GROUP BY"
+    end
+
+    test "invalid interval unit returns error", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 fortnight', time) AS time,
+        AVG(usage) AS avg_usage
+      FROM "cpu"
+      GROUP BY DATE_BIN(INTERVAL '1 fortnight', time)
+      ORDER BY time ASC
+      """
+
+      assert {:error, %{status: 400}} =
+               Local.query_sql(conn, sql, database: db)
+    end
+  end
 end

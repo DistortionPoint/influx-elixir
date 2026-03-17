@@ -56,10 +56,14 @@ defmodule InfluxElixir.Client.Local do
   `query_sql/3` understands a subset of SQL:
 
     * `SELECT * FROM measurement`
-    * `WHERE tag = 'value'` or `WHERE field > N`
+    * `WHERE tag = 'value'` or `WHERE field > N` (supports AND)
     * `ORDER BY time ASC|DESC`
     * `LIMIT N`
     * `$param` placeholders via `params: %{"$name" => value}` in opts
+    * `DATE_BIN(INTERVAL 'N unit', time)` time bucketing
+    * Aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`
+    * `GROUP BY DATE_BIN(INTERVAL 'N unit', time)`
+    * Interval units: `seconds`, `minutes`, `hours`, `days`
 
   ## Gzip Decompression
 
@@ -1010,18 +1014,234 @@ defmodule InfluxElixir.Client.Local do
   # Private — SQL query engine
   # ---------------------------------------------------------------------------
 
+  @type select_column ::
+          {:time_bucket, binary()}
+          | {:aggregate, :avg | :sum | :count | :min | :max, binary(), binary()}
+
   @type parsed_query :: %{
           measurement: binary(),
           where: [{:eq | :gt | :lt | :gte | :lte | :ne, binary(), term()}],
           order_by: {:time, :asc | :desc} | nil,
-          limit: pos_integer() | nil
+          limit: pos_integer() | nil,
+          group_by_interval: pos_integer() | nil,
+          select_columns: [select_column()] | nil
         }
+
+  # Aggregate function names recognised by the parser.
+  @aggregate_functions ~w(AVG SUM COUNT MIN MAX)
 
   @spec parse_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
   defp parse_select(sql) do
     normalised = String.trim(sql)
 
-    case Regex.run(@measurement_pattern, normalised) do
+    if aggregate_query?(normalised) do
+      parse_aggregate_select(normalised)
+    else
+      parse_star_select(normalised)
+    end
+  end
+
+  @spec aggregate_query?(binary()) :: boolean()
+  defp aggregate_query?(sql) do
+    upper = String.upcase(sql)
+
+    String.contains?(upper, "DATE_BIN") or
+      Enum.any?(@aggregate_functions, &String.contains?(upper, &1 <> "("))
+  end
+
+  @spec parse_aggregate_select(binary()) ::
+          {:ok, parsed_query()} | {:error, term()}
+  defp parse_aggregate_select(sql) do
+    with {:ok, columns} <- parse_select_columns(sql),
+         {:ok, measurement} <- parse_aggregate_from(sql),
+         {:ok, interval_ns} <- parse_group_by_interval(sql) do
+      rest = extract_after_from(sql)
+
+      {:ok,
+       %{
+         measurement: measurement,
+         where: parse_where(rest),
+         order_by: parse_order_by(rest),
+         limit: parse_limit(rest),
+         group_by_interval: interval_ns,
+         select_columns: columns
+       }}
+    end
+  end
+
+  # Extract the measurement name from: FROM "name" or FROM name
+  @spec parse_aggregate_from(binary()) :: {:ok, binary()} | {:error, term()}
+  defp parse_aggregate_from(sql) do
+    pattern = ~r/(?i)FROM\s+(?:"([^"]+)"|(\S+?))\s*(?:WHERE|GROUP|ORDER|LIMIT|$)/
+
+    case Regex.run(pattern, sql) do
+      [_full, quoted, ""] -> {:ok, quoted}
+      [_full, "", unquoted] -> {:ok, unescape_measurement(unquoted)}
+      [_full, quoted] when quoted != "" -> {:ok, quoted}
+      _no_match -> {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
+    end
+  end
+
+  # Extract everything after FROM <measurement> for WHERE/ORDER/LIMIT parsing
+  @spec extract_after_from(binary()) :: binary()
+  defp extract_after_from(sql) do
+    case Regex.run(~r/(?i)FROM\s+(?:"[^"]+"|[^\s]+)\s*(.*)/s, sql) do
+      [_full, rest] -> rest
+      _no_match -> ""
+    end
+  end
+
+  # Parse SELECT columns: DATE_BIN(...) AS alias, AGG(field) AS alias
+  @spec parse_select_columns(binary()) ::
+          {:ok, [select_column()]} | {:error, term()}
+  defp parse_select_columns(sql) do
+    case Regex.run(~r/(?i)SELECT\s+(.+?)\s+FROM\s/s, sql) do
+      [_full, columns_str] ->
+        columns =
+          columns_str
+          |> split_top_level_commas()
+          |> Enum.map(&String.trim/1)
+          |> Enum.map(&parse_single_column/1)
+
+        if Enum.any?(columns, &match?({:error, _}, &1)) do
+          Enum.find(columns, &match?({:error, _}, &1))
+        else
+          {:ok, Enum.map(columns, fn {:ok, col} -> col end)}
+        end
+
+      _no_match ->
+        {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
+    end
+  end
+
+  # Split column list by commas, respecting parentheses nesting
+  @spec split_top_level_commas(binary()) :: [binary()]
+  defp split_top_level_commas(str) do
+    {last, acc} =
+      str
+      |> String.graphemes()
+      |> Enum.reduce({[], [], 0}, fn
+        ",", {current, acc, 0} ->
+          token = current |> Enum.reverse() |> Enum.join()
+          {[], [token | acc], 0}
+
+        "(", {current, acc, depth} ->
+          {["(" | current], acc, depth + 1}
+
+        ")", {current, acc, depth} ->
+          {[")" | current], acc, max(depth - 1, 0)}
+
+        char, {current, acc, depth} ->
+          {[char | current], acc, depth}
+      end)
+      |> then(fn {current, acc, _depth} ->
+        token = current |> Enum.reverse() |> Enum.join()
+        {token, acc}
+      end)
+
+    Enum.reverse([last | acc])
+  end
+
+  # Parse a single SELECT column expression
+  @spec parse_single_column(binary()) ::
+          {:ok, select_column()} | {:error, term()}
+  defp parse_single_column(col) do
+    cond do
+      String.match?(col, ~r/(?i)DATE_BIN\s*\(/) ->
+        parse_date_bin_column(col)
+
+      String.match?(col, ~r/(?i)(AVG|SUM|COUNT|MIN|MAX)\s*\(/) ->
+        parse_agg_column(col)
+
+      true ->
+        {:error, %{status: 400, body: "unsupported column expression: #{col}"}}
+    end
+  end
+
+  # Parse: DATE_BIN(INTERVAL 'N unit', time) AS alias
+  @spec parse_date_bin_column(binary()) ::
+          {:ok, select_column()} | {:error, term()}
+  defp parse_date_bin_column(col) do
+    pattern =
+      ~r/(?i)DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)\s+AS\s+(\w+)/
+
+    case Regex.run(pattern, col) do
+      [_full, _interval, alias_name] ->
+        {:ok, {:time_bucket, alias_name}}
+
+      _no_match ->
+        {:error, %{status: 400, body: "invalid DATE_BIN: #{col}"}}
+    end
+  end
+
+  # Parse: AGG(field) AS alias
+  @spec parse_agg_column(binary()) ::
+          {:ok, select_column()} | {:error, term()}
+  defp parse_agg_column(col) do
+    pattern = ~r/(?i)(AVG|SUM|COUNT|MIN|MAX)\s*\(\s*(\w+)\s*\)\s+AS\s+(\w+)/
+
+    case Regex.run(pattern, col) do
+      [_full, func, field, alias_name] ->
+        agg_atom =
+          func |> String.downcase() |> String.to_existing_atom()
+
+        {:ok, {:aggregate, agg_atom, field, alias_name}}
+
+      _no_match ->
+        {:error, %{status: 400, body: "invalid aggregate: #{col}"}}
+    end
+  end
+
+  # Parse GROUP BY DATE_BIN(INTERVAL 'N unit', time) → interval in nanoseconds
+  @spec parse_group_by_interval(binary()) ::
+          {:ok, pos_integer()} | {:error, term()}
+  defp parse_group_by_interval(sql) do
+    pattern =
+      ~r/(?i)GROUP\s+BY\s+DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)/
+
+    case Regex.run(pattern, sql) do
+      [_full, interval_str] -> parse_interval(interval_str)
+      _no_match -> {:error, %{status: 400, body: "missing GROUP BY DATE_BIN"}}
+    end
+  end
+
+  # Convert "N unit" → nanoseconds
+  @spec parse_interval(binary()) :: {:ok, pos_integer()} | {:error, term()}
+  defp parse_interval(interval_str) do
+    case Regex.run(~r/^\s*(\d+)\s+(\w+)\s*$/, interval_str) do
+      [_full, n_str, unit] ->
+        {n, ""} = Integer.parse(n_str)
+        multiplier = interval_unit_to_ns(String.downcase(unit))
+
+        if multiplier do
+          {:ok, n * multiplier}
+        else
+          {:error, %{status: 400, body: "unknown interval unit: #{unit}"}}
+        end
+
+      _no_match ->
+        {:error, %{status: 400, body: "invalid interval: #{interval_str}"}}
+    end
+  end
+
+  @spec interval_unit_to_ns(binary()) :: pos_integer() | nil
+  defp interval_unit_to_ns(unit) when unit in ["second", "seconds"],
+    do: 1_000_000_000
+
+  defp interval_unit_to_ns(unit) when unit in ["minute", "minutes"],
+    do: 60_000_000_000
+
+  defp interval_unit_to_ns(unit) when unit in ["hour", "hours"],
+    do: 3_600_000_000_000
+
+  defp interval_unit_to_ns(unit) when unit in ["day", "days"],
+    do: 86_400_000_000_000
+
+  defp interval_unit_to_ns(_unknown), do: nil
+
+  @spec parse_star_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
+  defp parse_star_select(sql) do
+    case Regex.run(@measurement_pattern, sql) do
       [_full_match, measurement_raw, rest] ->
         measurement = unescape_measurement(measurement_raw)
 
@@ -1030,7 +1250,9 @@ defmodule InfluxElixir.Client.Local do
            measurement: measurement,
            where: parse_where(rest),
            order_by: parse_order_by(rest),
-           limit: parse_limit(rest)
+           limit: parse_limit(rest),
+           group_by_interval: nil,
+           select_columns: nil
          }}
 
       _no_match ->
@@ -1040,7 +1262,7 @@ defmodule InfluxElixir.Client.Local do
 
   @spec parse_where(binary()) :: [{atom(), binary(), term()}]
   defp parse_where(rest) do
-    case Regex.run(~r/(?i)WHERE\s+(.+?)(?:\s+ORDER|\s+LIMIT|$)/s, rest) do
+    case Regex.run(~r/(?i)WHERE\s+(.+?)(?:\s+GROUP|\s+ORDER|\s+LIMIT|$)/s, rest) do
       [_full_match, clauses_str] -> parse_where_clauses(clauses_str)
       _no_match -> []
     end
@@ -1140,12 +1362,95 @@ defmodule InfluxElixir.Client.Local do
   @spec execute_query(:ets.table(), parsed_query(), binary()) :: [map()]
   defp execute_query(table, %{measurement: m} = query, database) do
     points = fetch_points(table, database, m)
+    filtered = apply_where(points, query.where)
+
+    if query.select_columns do
+      execute_aggregate_query(filtered, query)
+    else
+      filtered
+      |> apply_order_by(query.order_by)
+      |> apply_limit(query.limit)
+      |> Enum.map(&point_to_row/1)
+    end
+  end
+
+  @spec execute_aggregate_query([point_map()], parsed_query()) :: [map()]
+  defp execute_aggregate_query(points, query) do
+    interval_ns = query.group_by_interval
+
+    time_alias = find_time_bucket_alias(query.select_columns)
 
     points
-    |> apply_where(query.where)
-    |> apply_order_by(query.order_by)
+    |> bucket_by_interval(interval_ns)
+    |> aggregate_per_bucket(query.select_columns)
+    |> apply_order_by_rows(query.order_by, time_alias)
     |> apply_limit(query.limit)
-    |> Enum.map(&point_to_row/1)
+  end
+
+  # Group points into buckets by flooring timestamp to interval boundary
+  @spec bucket_by_interval([point_map()], pos_integer()) :: %{
+          integer() => [point_map()]
+        }
+  defp bucket_by_interval(points, interval_ns) do
+    Enum.group_by(points, fn point ->
+      case point.timestamp do
+        nil -> 0
+        ts -> div(ts, interval_ns) * interval_ns
+      end
+    end)
+  end
+
+  # Compute aggregates for each bucket and return result rows
+  @spec aggregate_per_bucket(
+          %{integer() => [point_map()]},
+          [select_column()]
+        ) :: [map()]
+  defp aggregate_per_bucket(buckets, columns) do
+    Enum.map(buckets, fn {bucket_ts, bucket_points} ->
+      Enum.reduce(columns, %{}, fn
+        {:time_bucket, alias_name}, row ->
+          Map.put(row, alias_name, bucket_ts)
+
+        {:aggregate, agg, field, alias_name}, row ->
+          values =
+            bucket_points
+            |> Enum.map(fn p -> Map.get(p.fields, field) end)
+            |> Enum.reject(&is_nil/1)
+
+          Map.put(row, alias_name, compute_aggregate(agg, values))
+      end)
+    end)
+  end
+
+  @spec compute_aggregate(atom(), [number()]) :: number() | nil
+  defp compute_aggregate(_agg, []), do: nil
+  defp compute_aggregate(:avg, vals), do: Enum.sum(vals) / length(vals)
+  defp compute_aggregate(:sum, vals), do: Enum.sum(vals)
+  defp compute_aggregate(:count, vals), do: length(vals)
+  defp compute_aggregate(:min, vals), do: Enum.min(vals)
+  defp compute_aggregate(:max, vals), do: Enum.max(vals)
+
+  # Find the alias of the time_bucket column from select_columns
+  @spec find_time_bucket_alias([select_column()]) :: binary() | nil
+  defp find_time_bucket_alias(columns) do
+    Enum.find_value(columns, fn
+      {:time_bucket, alias_name} -> alias_name
+      _other -> nil
+    end)
+  end
+
+  # Order aggregate result rows by the time bucket column
+  @spec apply_order_by_rows([map()], {:time, :asc | :desc} | nil, binary() | nil) ::
+          [map()]
+  defp apply_order_by_rows(rows, nil, _time_alias), do: rows
+  defp apply_order_by_rows(rows, _order, nil), do: rows
+
+  defp apply_order_by_rows(rows, {:time, :asc}, time_alias) do
+    Enum.sort_by(rows, &Map.get(&1, time_alias))
+  end
+
+  defp apply_order_by_rows(rows, {:time, :desc}, time_alias) do
+    Enum.sort_by(rows, &Map.get(&1, time_alias), :desc)
   end
 
   @spec apply_where([point_map()], [{atom(), binary(), term()}]) :: [point_map()]

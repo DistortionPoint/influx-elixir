@@ -28,7 +28,8 @@ defmodule InfluxElixir.MixProject do
           InfluxElixir.Flight.Client,
           # Test support modules (not library code)
           InfluxElixir.InfluxCase,
-          InfluxElixir.IntegrationHelper
+          InfluxElixir.IntegrationHelper,
+          InfluxElixir.TestHelper
         ]
       ],
 

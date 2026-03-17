@@ -167,10 +167,43 @@ The contract tests verify health, write, query, admin, and round-trip
 operations. They run the same assertions against every backend — if both
 LocalClient and real InfluxDB pass, LocalClient is proven faithful.
 
+## Aggregate Queries
+
+LocalClient supports `DATE_BIN` time-bucketed aggregate queries — the same
+pattern used in InfluxDB v3 SQL:
+
+```elixir
+test "hourly average temperature", %{conn: conn} do
+  # Write some data points
+  lines = """
+  sensors,location=lab temp=20.0 1000000000000
+  sensors,location=lab temp=22.0 2000000000000
+  sensors,location=lab temp=24.0 5000000000000
+  """
+  {:ok, :written} = Local.write(conn, lines, database: "test_db")
+
+  sql = """
+  SELECT
+    DATE_BIN(INTERVAL '1 hour', time) AS time,
+    AVG(temp) AS avg_temp
+  FROM "sensors"
+  WHERE location = 'lab'
+  GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+  ORDER BY time ASC
+  """
+
+  {:ok, rows} = Local.query_sql(conn, sql, database: "test_db")
+  assert [%{"time" => _, "avg_temp" => _} | _] = rows
+end
+```
+
+Supported aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`.
+Supported interval units: `seconds`, `minutes`, `hours`, `days`.
+
 ## Key Differences from Real InfluxDB
 
 - **No WAL flush delay**: Writes are immediately queryable (set `query_delay: 0`)
 - **In-memory only**: Data is lost when `stop/1` is called
-- **Simplified SQL parser**: Supports `SELECT *`, `WHERE`, `ORDER BY time`, `LIMIT`
+- **Simplified SQL parser**: Supports `SELECT *`, `WHERE`, `ORDER BY time`, `LIMIT`, `DATE_BIN` + aggregate functions (`AVG`, `SUM`, `COUNT`, `MIN`, `MAX`) with `GROUP BY`
 - **No authentication**: All operations succeed regardless of token
 - **ETS-based**: Each `start/1` creates an isolated ETS table
