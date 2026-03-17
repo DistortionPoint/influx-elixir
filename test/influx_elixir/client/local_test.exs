@@ -1074,4 +1074,180 @@ defmodule InfluxElixir.Client.LocalTest do
                Local.query_sql(conn, sql, database: db)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — first() and last() ordered aggregates
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — first/last aggregates" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "ohlcv_db")
+
+      hour = 3_600_000_000_000
+
+      # Simulate trades within two 1-hour windows
+      lines =
+        [
+          # Hour 0: trades at 10m, 30m, 50m
+          "trades price=100.0,volume=10i #{div(hour, 6)}",
+          "trades price=105.0,volume=20i #{div(hour, 2)}",
+          "trades price=102.0,volume=15i #{div(5 * hour, 6)}",
+          # Hour 1: trades at 1h10m, 1h30m, 1h50m
+          "trades price=110.0,volume=5i #{hour + div(hour, 6)}",
+          "trades price=108.0,volume=25i #{hour + div(hour, 2)}",
+          "trades price=112.0,volume=30i #{hour + div(5 * hour, 6)}"
+        ]
+        |> Enum.join("\n")
+
+      Local.write(conn, lines,
+        database: "ohlcv_db",
+        precision: :nanosecond
+      )
+
+      {:ok, db: "ohlcv_db", hour: hour}
+    end
+
+    test "first(field, time) returns value at earliest timestamp",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        first(price, time) AS open
+      FROM "trades"
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      assert length(rows) == 2
+
+      [h0, h1] = rows
+      assert h0["open"] == 100.0
+      assert h1["open"] == 110.0
+    end
+
+    test "last(field, time) returns value at latest timestamp",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        last(price, time) AS close
+      FROM "trades"
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      assert length(rows) == 2
+
+      [h0, h1] = rows
+      assert h0["close"] == 102.0
+      assert h1["close"] == 112.0
+    end
+
+    test "full OHLCV candle query",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        first(price, time) AS open,
+        MAX(price) AS high,
+        MIN(price) AS low,
+        last(price, time) AS close,
+        SUM(volume) AS volume
+      FROM "trades"
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      assert length(rows) == 2
+
+      [h0, h1] = rows
+
+      # Hour 0: prices 100, 105, 102 — volumes 10, 20, 15
+      assert h0["open"] == 100.0
+      assert h0["high"] == 105.0
+      assert h0["low"] == 100.0
+      assert h0["close"] == 102.0
+      assert h0["volume"] == 45
+
+      # Hour 1: prices 110, 108, 112 — volumes 5, 25, 30
+      assert h1["open"] == 110.0
+      assert h1["high"] == 112.0
+      assert h1["low"] == 108.0
+      assert h1["close"] == 112.0
+      assert h1["volume"] == 60
+    end
+
+    test "single-arg first(field) defaults ordering to time",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        first(price) AS open
+      FROM "trades"
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      [h0, _h1] = rows
+      assert h0["open"] == 100.0
+    end
+
+    test "single-arg last(field) defaults ordering to time",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        last(price) AS close
+      FROM "trades"
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      [h0, _h1] = rows
+      assert h0["close"] == 102.0
+    end
+
+    test "first/last with WHERE filter",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '2 hours', time) AS time,
+        first(price, time) AS open,
+        last(price, time) AS close
+      FROM "trades"
+      WHERE price > 104
+      GROUP BY DATE_BIN(INTERVAL '2 hours', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+
+      # Prices > 104: 105 (0.5h), 110 (1h10m), 108 (1h30m), 112 (1h50m)
+      # All in bucket 0 (2-hour window)
+      assert length(rows) == 1
+      [row] = rows
+      assert row["open"] == 105.0
+      assert row["close"] == 112.0
+    end
+
+    test "first/last on empty result returns nil values",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        first(price, time) AS open,
+        last(price, time) AS close
+      FROM "nonexistent"
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      ORDER BY time ASC
+      """
+
+      assert {:ok, []} = Local.query_sql(conn, sql, database: db)
+    end
+  end
 end

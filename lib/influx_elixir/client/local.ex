@@ -62,6 +62,7 @@ defmodule InfluxElixir.Client.Local do
     * `$param` placeholders via `params: %{"$name" => value}` in opts
     * `DATE_BIN(INTERVAL 'N unit', time)` time bucketing
     * Aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`
+    * Ordered aggregates: `first(field, time)`, `last(field, time)`
     * `GROUP BY DATE_BIN(INTERVAL 'N unit', time)`
     * Interval units: `seconds`, `minutes`, `hours`, `days`
 
@@ -1017,6 +1018,7 @@ defmodule InfluxElixir.Client.Local do
   @type select_column ::
           {:time_bucket, binary()}
           | {:aggregate, :avg | :sum | :count | :min | :max, binary(), binary()}
+          | {:ordered_aggregate, :first | :last, binary(), binary(), binary()}
 
   @type parsed_query :: %{
           measurement: binary(),
@@ -1028,7 +1030,7 @@ defmodule InfluxElixir.Client.Local do
         }
 
   # Aggregate function names recognised by the parser.
-  @aggregate_functions ~w(AVG SUM COUNT MIN MAX)
+  @aggregate_functions ~w(AVG SUM COUNT MIN MAX FIRST LAST)
 
   @spec parse_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
   defp parse_select(sql) do
@@ -1150,7 +1152,7 @@ defmodule InfluxElixir.Client.Local do
       String.match?(col, ~r/(?i)DATE_BIN\s*\(/) ->
         parse_date_bin_column(col)
 
-      String.match?(col, ~r/(?i)(AVG|SUM|COUNT|MIN|MAX)\s*\(/) ->
+      String.match?(col, ~r/(?i)(AVG|SUM|COUNT|MIN|MAX|FIRST|LAST)\s*\(/) ->
         parse_agg_column(col)
 
       true ->
@@ -1174,21 +1176,42 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  # Parse: AGG(field) AS alias
+  # Parse: AGG(field) AS alias  or  AGG(field, ordering) AS alias
   @spec parse_agg_column(binary()) ::
           {:ok, select_column()} | {:error, term()}
   defp parse_agg_column(col) do
-    pattern = ~r/(?i)(AVG|SUM|COUNT|MIN|MAX)\s*\(\s*(\w+)\s*\)\s+AS\s+(\w+)/
+    two_arg =
+      ~r/(?i)(AVG|SUM|COUNT|MIN|MAX|FIRST|LAST)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s+AS\s+(\w+)/
 
-    case Regex.run(pattern, col) do
-      [_full, func, field, alias_name] ->
-        agg_atom =
-          func |> String.downcase() |> String.to_existing_atom()
+    one_arg =
+      ~r/(?i)(AVG|SUM|COUNT|MIN|MAX|FIRST|LAST)\s*\(\s*(\w+)\s*\)\s+AS\s+(\w+)/
 
-        {:ok, {:aggregate, agg_atom, field, alias_name}}
+    case Regex.run(two_arg, col) do
+      [_full, func, field, ordering, alias_name] ->
+        agg_atom = func |> String.downcase() |> String.to_existing_atom()
 
-      _no_match ->
-        {:error, %{status: 400, body: "invalid aggregate: #{col}"}}
+        if agg_atom in [:first, :last] do
+          {:ok, {:ordered_aggregate, agg_atom, field, ordering, alias_name}}
+        else
+          # Non-ordered aggregates ignore the second arg (not standard SQL)
+          {:ok, {:aggregate, agg_atom, field, alias_name}}
+        end
+
+      _no_two_arg ->
+        case Regex.run(one_arg, col) do
+          [_full, func, field, alias_name] ->
+            agg_atom = func |> String.downcase() |> String.to_existing_atom()
+
+            if agg_atom in [:first, :last] do
+              # Single-arg first/last defaults ordering to "time"
+              {:ok, {:ordered_aggregate, agg_atom, field, "time", alias_name}}
+            else
+              {:ok, {:aggregate, agg_atom, field, alias_name}}
+            end
+
+          _no_match ->
+            {:error, %{status: 400, body: "invalid aggregate: #{col}"}}
+        end
     end
   end
 
@@ -1418,6 +1441,12 @@ defmodule InfluxElixir.Client.Local do
             |> Enum.reject(&is_nil/1)
 
           Map.put(row, alias_name, compute_aggregate(agg, values))
+
+        {:ordered_aggregate, agg, field, ordering, alias_name}, row ->
+          value =
+            compute_ordered_aggregate(agg, field, ordering, bucket_points)
+
+          Map.put(row, alias_name, value)
       end)
     end)
   end
@@ -1429,6 +1458,34 @@ defmodule InfluxElixir.Client.Local do
   defp compute_aggregate(:count, vals), do: length(vals)
   defp compute_aggregate(:min, vals), do: Enum.min(vals)
   defp compute_aggregate(:max, vals), do: Enum.max(vals)
+
+  # Ordered aggregates: return the field value from the point with
+  # the min (first) or max (last) ordering column value.
+  @spec compute_ordered_aggregate(
+          :first | :last,
+          binary(),
+          binary(),
+          [point_map()]
+        ) :: term() | nil
+  defp compute_ordered_aggregate(_agg, _field, _ordering, []), do: nil
+
+  defp compute_ordered_aggregate(agg, field, ordering, points) do
+    sorter = if agg == :first, do: :asc, else: :desc
+
+    points
+    |> Enum.sort_by(&ordering_value(&1, ordering), sorter)
+    |> hd()
+    |> then(fn p -> Map.get(p.fields, field) || Map.get(p.tags, field) end)
+  end
+
+  # Resolve the ordering column value from a point.
+  # "time" maps to the point's timestamp; anything else is a field/tag.
+  @spec ordering_value(point_map(), binary()) :: term()
+  defp ordering_value(point, "time"), do: point.timestamp || 0
+
+  defp ordering_value(point, col) do
+    Map.get(point.fields, col) || Map.get(point.tags, col) || 0
+  end
 
   # Find the alias of the time_bucket column from select_columns
   @spec find_time_bucket_alias([select_column()]) :: binary() | nil

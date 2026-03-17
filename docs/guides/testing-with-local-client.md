@@ -198,12 +198,13 @@ end
 ```
 
 Supported aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`.
+Ordered aggregates: `first(field, time)`, `last(field, time)` — for OHLCV candle queries.
 Supported interval units: `seconds`, `minutes`, `hours`, `days`.
 
 ## Key Differences from Real InfluxDB
 
 - **No WAL flush delay**: Writes are immediately queryable (set `query_delay: 0`)
 - **In-memory only**: Data is lost when `stop/1` is called
-- **Simplified SQL parser**: Supports `SELECT *`, `WHERE`, `ORDER BY time`, `LIMIT`, `DATE_BIN` + aggregate functions (`AVG`, `SUM`, `COUNT`, `MIN`, `MAX`) with `GROUP BY`
+- **Simplified SQL parser**: Supports `SELECT *`, `WHERE`, `ORDER BY time`, `LIMIT`, `DATE_BIN` + aggregate functions (`AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `first`, `last`) with `GROUP BY`
 - **No authentication**: All operations succeed regardless of token
 - **ETS-based**: Each `start/1` creates an isolated ETS table
