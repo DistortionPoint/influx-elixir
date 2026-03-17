@@ -6,16 +6,58 @@ defmodule InfluxElixir do
   Delegates to the configured client implementation
   (`InfluxElixir.Client.HTTP` or `InfluxElixir.Client.Local`).
 
+  ## Named Connections
+
+  All facade functions accept either a **keyword config** or an **atom name**.
+  When an atom is passed, it is resolved via `InfluxElixir.Connection.fetch!/1`
+  from the persistent-term registry (populated automatically by
+  `InfluxElixir.ConnectionSupervisor` on startup).
+
+      # Using a named connection (registered at startup)
+      InfluxElixir.health(:trading)
+      InfluxElixir.write(:trading, "cpu value=1.0", database: "prices")
+
+      # Using a raw config (e.g. LocalClient in tests)
+      InfluxElixir.health(conn)
+
   ## Configuration
 
       # config/config.exs
       config :influx_elixir, :client, InfluxElixir.Client.HTTP
+
+      config :influx_elixir, :connections,
+        trading: [
+          host: "influx-trading:8086",
+          token: "...",
+          default_database: "prices"
+        ]
 
       # config/test.exs
       config :influx_elixir, :client, InfluxElixir.Client.Local
   """
 
   alias InfluxElixir.Write.Point
+
+  # ---------- Connection Resolution ----------
+
+  @doc """
+  Resolves a connection reference to a config keyword list.
+
+  Accepts either an atom name (looked up via `Connection.fetch!/1`)
+  or a keyword/map config (returned as-is).
+
+  ## Examples
+
+      resolve_connection(:trading)
+      resolve_connection(host: "localhost", token: "t")
+  """
+  @spec resolve_connection(atom() | InfluxElixir.Client.connection()) ::
+          InfluxElixir.Client.connection()
+  def resolve_connection(name) when is_atom(name) do
+    InfluxElixir.Connection.fetch!(name)
+  end
+
+  def resolve_connection(connection), do: connection
 
   # ---------- Client Resolution ----------
 
@@ -56,7 +98,7 @@ defmodule InfluxElixir do
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(connection, line_protocol, opts \\ []) do
-    client().write(connection, line_protocol, opts)
+    client().write(resolve_connection(connection), line_protocol, opts)
   end
 
   # ---------- Query — v3 SQL ----------
@@ -72,7 +114,7 @@ defmodule InfluxElixir do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_sql(connection, sql, opts \\ []) do
-    client().query_sql(connection, sql, opts)
+    client().query_sql(resolve_connection(connection), sql, opts)
   end
 
   @doc """
@@ -86,7 +128,7 @@ defmodule InfluxElixir do
           keyword()
         ) :: Enumerable.t()
   def query_sql_stream(connection, sql, opts \\ []) do
-    client().query_sql_stream(connection, sql, opts)
+    client().query_sql_stream(resolve_connection(connection), sql, opts)
   end
 
   @doc """
@@ -98,7 +140,7 @@ defmodule InfluxElixir do
           keyword()
         ) :: {:ok, map()} | {:error, term()}
   def execute_sql(connection, sql, opts \\ []) do
-    client().execute_sql(connection, sql, opts)
+    client().execute_sql(resolve_connection(connection), sql, opts)
   end
 
   # ---------- Query — v3 InfluxQL ----------
@@ -112,7 +154,7 @@ defmodule InfluxElixir do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(connection, influxql, opts \\ []) do
-    client().query_influxql(connection, influxql, opts)
+    client().query_influxql(resolve_connection(connection), influxql, opts)
   end
 
   # ---------- Query — v2 Flux (compat) ----------
@@ -123,7 +165,7 @@ defmodule InfluxElixir do
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_flux(connection, flux, opts \\ []) do
-    client().query_flux(connection, flux, opts)
+    client().query_flux(resolve_connection(connection), flux, opts)
   end
 
   # ---------- Admin — v3 databases ----------
@@ -136,8 +178,8 @@ defmodule InfluxElixir do
           binary(),
           keyword()
         ) :: :ok | {:error, term()}
-  def create_database(connection, name, opts \\ []) do
-    client().create_database(connection, name, opts)
+  def create_database(connection, db_name, opts \\ []) do
+    client().create_database(resolve_connection(connection), db_name, opts)
   end
 
   @doc """
@@ -146,7 +188,7 @@ defmodule InfluxElixir do
   @spec list_databases(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
   def list_databases(connection) do
-    client().list_databases(connection)
+    client().list_databases(resolve_connection(connection))
   end
 
   @doc """
@@ -154,8 +196,8 @@ defmodule InfluxElixir do
   """
   @spec delete_database(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_database(connection, name) do
-    client().delete_database(connection, name)
+  def delete_database(connection, db_name) do
+    client().delete_database(resolve_connection(connection), db_name)
   end
 
   # ---------- Admin — v2 buckets (compat) ----------
@@ -168,8 +210,8 @@ defmodule InfluxElixir do
           binary(),
           keyword()
         ) :: :ok | {:error, term()}
-  def create_bucket(connection, name, opts \\ []) do
-    client().create_bucket(connection, name, opts)
+  def create_bucket(connection, bucket_name, opts \\ []) do
+    client().create_bucket(resolve_connection(connection), bucket_name, opts)
   end
 
   @doc """
@@ -178,7 +220,7 @@ defmodule InfluxElixir do
   @spec list_buckets(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
   def list_buckets(connection) do
-    client().list_buckets(connection)
+    client().list_buckets(resolve_connection(connection))
   end
 
   @doc """
@@ -186,8 +228,8 @@ defmodule InfluxElixir do
   """
   @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_bucket(connection, name) do
-    client().delete_bucket(connection, name)
+  def delete_bucket(connection, bucket_name) do
+    client().delete_bucket(resolve_connection(connection), bucket_name)
   end
 
   # ---------- Admin — v3 tokens ----------
@@ -201,7 +243,7 @@ defmodule InfluxElixir do
           keyword()
         ) :: {:ok, map()} | {:error, term()}
   def create_token(connection, description, opts \\ []) do
-    client().create_token(connection, description, opts)
+    client().create_token(resolve_connection(connection), description, opts)
   end
 
   @doc """
@@ -210,7 +252,7 @@ defmodule InfluxElixir do
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_token(connection, token_id) do
-    client().delete_token(connection, token_id)
+    client().delete_token(resolve_connection(connection), token_id)
   end
 
   # ---------- Health ----------
@@ -221,7 +263,7 @@ defmodule InfluxElixir do
   @spec health(InfluxElixir.Client.connection()) ::
           {:ok, map()} | {:error, term()}
   def health(connection) do
-    client().health(connection)
+    client().health(resolve_connection(connection))
   end
 
   # ---------- Batch Writer ----------
@@ -267,9 +309,11 @@ defmodule InfluxElixir do
   """
   @spec add_connection(atom(), keyword()) :: {:ok, pid()} | {:error, term()}
   def add_connection(name, opts) do
+    config = Keyword.put(opts, :name, name)
+
     child_spec =
       Supervisor.child_spec(
-        {InfluxElixir.ConnectionSupervisor, Keyword.put(opts, :name, name)},
+        {InfluxElixir.ConnectionSupervisor, config},
         id: {InfluxElixir.ConnectionSupervisor, name}
       )
 
@@ -287,8 +331,13 @@ defmodule InfluxElixir do
     child_id = {InfluxElixir.ConnectionSupervisor, name}
 
     case Supervisor.terminate_child(InfluxElixir.Supervisor, child_id) do
-      :ok -> Supervisor.delete_child(InfluxElixir.Supervisor, child_id)
-      {:error, reason} -> {:error, reason}
+      :ok ->
+        result = Supervisor.delete_child(InfluxElixir.Supervisor, child_id)
+        InfluxElixir.Connection.delete(name)
+        result
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 end

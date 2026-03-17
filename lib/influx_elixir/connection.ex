@@ -8,11 +8,18 @@ defmodule InfluxElixir.Connection do
 
   ## Usage
 
-  Connections are typically registered by `InfluxElixir.ConnectionSupervisor`
-  during startup. Consumer code looks up connections by name:
+  Connections are automatically registered by
+  `InfluxElixir.ConnectionSupervisor` during startup. The facade module
+  (`InfluxElixir`) resolves atom names transparently, so most consumer
+  code simply passes the connection name:
 
-      config = InfluxElixir.Connection.get(:my_influx)
-      InfluxElixir.Client.HTTP.write(config, "cpu value=1.0")
+      InfluxElixir.health(:trading)
+      InfluxElixir.write(:trading, "cpu value=1.0", database: "prices")
+
+  For direct registry access:
+
+      {:ok, config} = InfluxElixir.Connection.get(:trading)
+      config = InfluxElixir.Connection.fetch!(:trading)
 
   ## Storage
 

@@ -189,4 +189,60 @@ defmodule InfluxElixirTest do
       refute Process.alive?(pid)
     end
   end
+
+  describe "resolve_connection/1" do
+    test "passes through a keyword config unchanged", %{conn: conn} do
+      assert InfluxElixir.resolve_connection(conn) == conn
+    end
+
+    test "resolves an atom name via Connection registry" do
+      name = :"resolve_test_#{System.unique_integer([:positive])}"
+      config = [host: "resolve-host", token: "t"]
+
+      InfluxElixir.Connection.put(name, config)
+      on_exit(fn -> InfluxElixir.Connection.delete(name) end)
+
+      resolved = InfluxElixir.resolve_connection(name)
+      assert resolved[:host] == "resolve-host"
+    end
+
+    test "raises ArgumentError for unregistered atom name" do
+      assert_raise ArgumentError, fn ->
+        InfluxElixir.resolve_connection(:no_such_connection)
+      end
+    end
+  end
+
+  describe "facade with named connections" do
+    test "health/1 accepts an atom name" do
+      name = :"facade_test_#{System.unique_integer([:positive])}"
+
+      # Register a LocalClient connection under the name
+      {:ok, local_conn} = Local.start(databases: ["facade_db"])
+      on_exit(fn -> Local.stop(local_conn) end)
+
+      InfluxElixir.Connection.put(name, local_conn)
+      on_exit(fn -> InfluxElixir.Connection.delete(name) end)
+
+      assert {:ok, %{"status" => "pass"}} = InfluxElixir.health(name)
+    end
+
+    test "write/3 and query_sql/3 accept an atom name" do
+      name = :"facade_rw_#{System.unique_integer([:positive])}"
+
+      {:ok, local_conn} = Local.start(databases: ["facade_rw_db"])
+      on_exit(fn -> Local.stop(local_conn) end)
+
+      InfluxElixir.Connection.put(name, local_conn)
+      on_exit(fn -> InfluxElixir.Connection.delete(name) end)
+
+      assert {:ok, :written} =
+               InfluxElixir.write(name, "cpu value=1.0", database: "facade_rw_db")
+
+      assert {:ok, [row]} =
+               InfluxElixir.query_sql(name, "SELECT * FROM cpu", database: "facade_rw_db")
+
+      assert row["value"] == 1.0
+    end
+  end
 end

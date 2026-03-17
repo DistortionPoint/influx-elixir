@@ -25,6 +25,7 @@ defmodule InfluxElixir.SupervisorTest do
         {InfluxElixir.ConnectionSupervisor, :isolation_a}
       )
 
+      InfluxElixir.Connection.delete(:isolation_a)
       InfluxElixir.remove_connection(:isolation_b)
     end
 

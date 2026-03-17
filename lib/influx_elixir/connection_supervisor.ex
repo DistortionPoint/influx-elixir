@@ -5,6 +5,10 @@ defmodule InfluxElixir.ConnectionSupervisor do
   Manages a Finch pool and BatchWriter GenServers for a
   single named InfluxDB connection with crash isolation.
 
+  On init, registers the connection config in
+  `InfluxElixir.Connection` so it can be resolved by name
+  from any process via `Connection.fetch!/1` or the facade.
+
   If a Finch pool crashes, all BatchWriters under that connection
   restart (they depend on the pool). A single BatchWriter crash
   does NOT take down the pool or sibling writers.
@@ -41,6 +45,10 @@ defmodule InfluxElixir.ConnectionSupervisor do
     name = Keyword.fetch!(config, :name)
     finch_name = finch_name(name)
     pool_size = Keyword.get(config, :pool_size, 10)
+
+    # Register this connection in the persistent_term registry so that
+    # callers can resolve it by name via Connection.fetch!/1.
+    InfluxElixir.Connection.put(name, config)
 
     finch_child =
       {Finch,
