@@ -1740,13 +1740,15 @@ defmodule InfluxElixir.Client.Local do
 
   defp resolve_params(sql, params) do
     Enum.reduce(params, sql, fn {key, value}, acc ->
-      if is_binary(key) do
-        String.replace(acc, key, to_sql_literal(value))
-      else
-        acc
-      end
+      placeholder = normalize_param_key(key)
+      String.replace(acc, placeholder, to_sql_literal(value))
     end)
   end
+
+  @spec normalize_param_key(atom() | binary()) :: binary()
+  defp normalize_param_key(key) when is_atom(key), do: "$#{key}"
+  defp normalize_param_key("$" <> _rest = key), do: key
+  defp normalize_param_key(key) when is_binary(key), do: "$#{key}"
 
   @spec to_sql_literal(term()) :: binary()
   defp to_sql_literal(value) when is_binary(value), do: "'#{value}'"

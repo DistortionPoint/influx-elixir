@@ -387,6 +387,30 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, rows} = Local.query_sql(conn, sql, params: params, database: db)
       assert length(rows) == 1
     end
+
+    test "atom key params without $ prefix", %{conn: conn, db: db} do
+      sql = "SELECT * FROM cpu WHERE host = $host"
+      params = %{host: "web01"}
+      assert {:ok, rows} = Local.query_sql(conn, sql, params: params, database: db)
+      assert length(rows) == 1
+      assert hd(rows)["host"] == "web01"
+    end
+
+    test "string key params without $ prefix", %{conn: conn, db: db} do
+      sql = "SELECT * FROM cpu WHERE host = $host"
+      params = %{"host" => "web01"}
+      assert {:ok, rows} = Local.query_sql(conn, sql, params: params, database: db)
+      assert length(rows) == 1
+      assert hd(rows)["host"] == "web01"
+    end
+
+    test "atom key params with multiple conditions", %{conn: conn, db: db} do
+      sql = "SELECT * FROM cpu WHERE host = $host AND usage > $min"
+      params = %{host: "web02", min: 15}
+      assert {:ok, rows} = Local.query_sql(conn, sql, params: params, database: db)
+      assert length(rows) == 1
+      assert hd(rows)["host"] == "web02"
+    end
   end
 
   # ---------------------------------------------------------------------------
