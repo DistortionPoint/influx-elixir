@@ -1740,14 +1740,14 @@ defmodule InfluxElixir.Client.LocalTest do
                Local.write(conn, "cpu value=1i badtimestamp", database: db)
     end
 
-    test "empty string timestamp is treated as nil — point stored without timestamp",
+    test "missing timestamp gets server-assigned time (matches real InfluxDB)",
          %{conn: conn, db: db} do
-      # A line with an empty-looking timestamp segment is actually just parsed
-      # as no timestamp (nil). We verify the write succeeds and the point is stored.
+      # Real InfluxDB assigns a server timestamp when none is provided.
+      # LocalClient must do the same.
       Local.write(conn, "cpu value=42i", database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
       assert row["value"] == 42
-      assert row["time"] == nil
+      assert is_binary(row["time"]), "time should be a string, not nil"
     end
   end
 
@@ -2069,9 +2069,10 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, []} = Local.query_sql(conn, sql, database: db)
     end
 
-    test "aggregate on measurement with nil timestamps buckets at 0",
+    test "aggregate on measurement without explicit timestamps uses server time",
          %{conn: conn, db: db} do
-      # Write points without timestamps — they get nil timestamp → bucket 0
+      # Points without timestamps get server-assigned time (like real InfluxDB).
+      # Both points land in the same 1-hour bucket since they're written together.
       Local.write(conn, "no_ts val=10i\nno_ts val=20i", database: db)
 
       sql = """
@@ -2084,8 +2085,9 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
       assert row["total"] == 30
-      # bucket at timestamp 0 → epoch
-      assert row["time"] == "1970-01-01T00:00:00"
+      # Bucket time should be a valid ISO8601 string, not epoch
+      assert is_binary(row["time"])
+      refute row["time"] == "1970-01-01T00:00:00"
     end
   end
 

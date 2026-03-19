@@ -720,6 +720,8 @@ defmodule InfluxElixir.Client.Local do
 
   @spec store_point(:ets.table(), binary(), point_map()) :: true
   defp store_point(table, database, point) do
+    # Real InfluxDB assigns a server timestamp when none is provided.
+    point = assign_default_timestamp(point)
     key = {:points, database, point.measurement}
 
     existing =
@@ -730,6 +732,13 @@ defmodule InfluxElixir.Client.Local do
 
     :ets.insert(table, {key, [point | existing]})
   end
+
+  @spec assign_default_timestamp(point_map()) :: point_map()
+  defp assign_default_timestamp(%{timestamp: nil} = point) do
+    %{point | timestamp: System.system_time(:nanosecond)}
+  end
+
+  defp assign_default_timestamp(point), do: point
 
   @spec fetch_points(:ets.table(), binary(), binary()) :: [point_map()]
   @spec measurement_exists?(:ets.table(), binary(), binary()) :: boolean()

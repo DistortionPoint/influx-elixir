@@ -195,6 +195,17 @@ defmodule InfluxElixir.ClientContract do
                      database: ctx.database
                    )
         end
+
+        test "assigns server timestamp when none provided", ctx do
+          lp = "auto_ts,host=a value=1i"
+
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     lp,
+                     database: ctx.database
+                   )
+        end
       end
     end
   end
@@ -328,6 +339,27 @@ defmodule InfluxElixir.ClientContract do
   defp sql_tests(client) do
     quote do
       describe "query_sql/3 — basic SELECT contract" do
+        test "server-assigned timestamp is queryable", ctx do
+          unquote(client).write(
+            ctx.conn,
+            "auto_ts_sql,host=a value=1i",
+            database: ctx.database
+          )
+
+          if ctx[:query_delay] && ctx.query_delay > 0,
+            do: Process.sleep(ctx.query_delay)
+
+          assert {:ok, [row]} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT * FROM auto_ts_sql",
+                     database: ctx.database
+                   )
+
+          assert is_binary(row["time"]),
+                 "time must be server-assigned, got: #{inspect(row["time"])}"
+        end
+
         test "returns error for non-existent measurement", ctx do
           result =
             unquote(client).query_sql(
