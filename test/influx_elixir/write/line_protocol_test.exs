@@ -242,6 +242,20 @@ defmodule InfluxElixir.Write.LineProtocolTest do
     end
   end
 
+  describe "encode/1 — float normalization" do
+    test "large float with no fractional part still includes decimal separator" do
+      # :erlang.float_to_binary(1.0e17, [:compact, {:decimals, 17}]) produces
+      # "100000000000000000" — no dot, no 'e'.  normalize_float_string/1 appends
+      # ".0" to satisfy the line protocol requirement that float values contain
+      # a decimal point.
+      point = Point.new("cpu", %{"big" => 1.0e17})
+      assert {:ok, lp} = LineProtocol.encode(point)
+      assert lp =~ "big="
+      encoded_value = lp |> String.split("big=") |> List.last()
+      assert String.contains?(encoded_value, ".") or String.contains?(encoded_value, "e")
+    end
+  end
+
   describe "encode!/1" do
     test "returns binary on success" do
       point = Point.new("cpu", %{"v" => 1.0})

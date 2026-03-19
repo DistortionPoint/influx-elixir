@@ -57,7 +57,7 @@ defmodule InfluxElixir.Client.HTTP do
 
       url =
         base_url(connection) <>
-          "/api/v2/write?db=#{URI.encode(database)}" <>
+          "/api/v3/write_lp?db=#{URI.encode(database)}" <>
           "&precision=#{precision}"
 
       headers = auth_headers(connection)
@@ -96,8 +96,8 @@ defmodule InfluxElixir.Client.HTTP do
 
       body =
         Jason.encode!(%{
-          "database" => database,
-          "sql" => sql,
+          "db" => database,
+          "q" => sql,
           "params" => params,
           "format" => to_string(format)
         })
@@ -131,8 +131,8 @@ defmodule InfluxElixir.Client.HTTP do
 
         body =
           Jason.encode!(%{
-            "database" => database,
-            "sql" => sql,
+            "db" => database,
+            "q" => sql,
             "params" => params,
             "format" => "jsonl"
           })
@@ -157,7 +157,7 @@ defmodule InfluxElixir.Client.HTTP do
           {:ok, map()} | {:error, term()}
   def execute_sql(connection, sql, opts \\ []) do
     with {:ok, database} <- resolve_database(opts, connection) do
-      body = Jason.encode!(%{"database" => database, "sql" => sql})
+      body = Jason.encode!(%{"db" => database, "q" => sql})
 
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
@@ -186,29 +186,37 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(connection, influxql, opts \\ []) do
-    with {:ok, database} <- resolve_database(opts, connection) do
-      format = Keyword.get(opts, :format, :json)
-
-      body =
-        Jason.encode!(%{
-          "database" => database,
-          "query" => influxql,
-          "format" => to_string(format)
-        })
-
-      url = base_url(connection) <> "/api/v3/query_influxql"
-      headers = json_headers(connection)
-
-      case do_request(:post, url, headers, body, connection) do
-        {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-          ResponseParser.parse(resp_body, format)
-
-        {:ok, %Finch.Response{status: status, body: resp_body}} ->
-          {:error, %{status: status, body: resp_body}}
-
-        {:error, reason} ->
-          {:error, {:connection_error, reason}}
+    database =
+      case resolve_database(opts, connection) do
+        {:ok, db} -> db
+        {:error, :no_database_specified} -> ""
       end
+
+    format = Keyword.get(opts, :format, :json)
+
+    body_map = %{"q" => influxql, "format" => to_string(format)}
+
+    body_map =
+      if database != "" do
+        Map.put(body_map, "db", database)
+      else
+        body_map
+      end
+
+    body = Jason.encode!(body_map)
+
+    url = base_url(connection) <> "/api/v3/query_influxql"
+    headers = json_headers(connection)
+
+    case do_request(:post, url, headers, body, connection) do
+      {:ok, %Finch.Response{status: 200, body: resp_body}} ->
+        ResponseParser.parse(resp_body, format)
+
+      {:ok, %Finch.Response{status: status, body: resp_body}} ->
+        {:error, %{status: status, body: resp_body}}
+
+      {:error, reason} ->
+        {:error, {:connection_error, reason}}
     end
   end
 
@@ -254,19 +262,21 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: :ok | {:error, term()}
   def create_database(connection, name, opts \\ []) do
-    retention = Keyword.get(opts, :retention, 0)
+    body_map = %{"db" => name}
 
-    body =
-      Jason.encode!(%{
-        "name" => name,
-        "retentionPeriod" => retention
-      })
+    body_map =
+      case Keyword.get(opts, :retention) do
+        nil -> body_map
+        retention -> Map.put(body_map, "retention_period", retention)
+      end
+
+    body = Jason.encode!(body_map)
 
     url = base_url(connection) <> "/api/v3/configure/database"
     headers = json_headers(connection)
 
     case do_request(:post, url, headers, body, connection) do
-      {:ok, %Finch.Response{status: status}} when status in [200, 201] ->
+      {:ok, %Finch.Response{status: status}} when status in [200, 201, 409] ->
         :ok
 
       {:ok, %Finch.Response{status: status, body: resp_body}} ->
@@ -281,12 +291,18 @@ defmodule InfluxElixir.Client.HTTP do
   @spec list_databases(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
   def list_databases(connection) do
-    url = base_url(connection) <> "/api/v3/configure/database"
+    url = base_url(connection) <> "/api/v3/configure/database?format=json"
     headers = auth_headers(connection)
 
     case do_request(:get, url, headers, nil, connection) do
       {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-        Jason.decode(resp_body)
+        case Jason.decode(resp_body) do
+          {:ok, rows} ->
+            {:ok, Enum.map(rows, fn row -> %{"name" => row["iox::database"]} end)}
+
+          error ->
+            error
+        end
 
       {:ok, %Finch.Response{status: status, body: resp_body}} ->
         {:error, %{status: status, body: resp_body}}
@@ -302,7 +318,7 @@ defmodule InfluxElixir.Client.HTTP do
   def delete_database(connection, name) do
     url =
       base_url(connection) <>
-        "/api/v3/configure/database?name=#{URI.encode(name)}"
+        "/api/v3/configure/database?db=#{URI.encode(name)}"
 
     headers = auth_headers(connection)
 
@@ -469,7 +485,13 @@ defmodule InfluxElixir.Client.HTTP do
 
     case do_request(:get, url, headers, nil, connection) do
       {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-        Jason.decode(resp_body)
+        case Jason.decode(resp_body) do
+          {:ok, map} ->
+            {:ok, map}
+
+          {:error, _json_err} ->
+            {:ok, %{"status" => "pass"}}
+        end
 
       {:ok, %Finch.Response{status: status, body: resp_body}} ->
         {:error, %{status: status, body: resp_body}}
@@ -519,8 +541,11 @@ defmodule InfluxElixir.Client.HTTP do
 
   @spec auth_headers(keyword()) :: [{binary(), binary()}]
   defp auth_headers(connection) do
-    token = conn_val(connection, :token)
-    [{"authorization", "Bearer #{token}"}]
+    case conn_val(connection, :token) do
+      nil -> []
+      "" -> []
+      token -> [{"authorization", "Bearer #{token}"}]
+    end
   end
 
   @spec json_headers(keyword()) :: [{binary(), binary()}]

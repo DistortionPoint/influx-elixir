@@ -63,12 +63,33 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, :written} = Local.write(conn, "cpu value=1.0", database: "test_db")
     end
 
-    test "returns error when database does not exist", %{conn: conn} do
-      assert {:error, %{status: 404, body: body}} =
+    test "auto-creates database on write (v3 Core behavior)", %{conn: conn} do
+      assert {:ok, :written} =
                Local.write(conn, "cpu value=1.0", database: "no_such_db")
+    end
+
+    test "v2 profile rejects write to non-existent database" do
+      {:ok, v2_conn} = Local.start(databases: ["v2_db"], profile: :v2)
+      on_exit(fn -> Local.stop(v2_conn) end)
+
+      assert {:error, %{status: 404, body: body}} =
+               Local.write(v2_conn, "cpu value=1.0", database: "missing_db")
 
       assert body =~ "database not found"
-      assert body =~ "no_such_db"
+    end
+
+    test "v3_enterprise profile auto-creates database on write" do
+      {:ok, ent_conn} =
+        Local.start(databases: ["ent_db"], profile: :v3_enterprise)
+
+      on_exit(fn -> Local.stop(ent_conn) end)
+
+      assert {:ok, :written} =
+               Local.write(ent_conn, "cpu value=1.0", database: "auto_db")
+
+      assert {:ok, dbs} = Local.list_databases(ent_conn)
+      names = Enum.map(dbs, & &1["name"])
+      assert "auto_db" in names
     end
 
     test "returns error for invalid line protocol", %{conn: conn} do
@@ -148,11 +169,11 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["c"] == "hi"
     end
 
-    test "timestamp is stored in nanoseconds", %{conn: conn, db: db} do
+    test "timestamp is returned as ISO 8601 string", %{conn: conn, db: db} do
       ts = 1_630_424_257_000_000_000
       Local.write(conn, "m value=1.0 #{ts}", database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["time"] == ts
+      assert row["time"] == "2021-08-31T15:37:37"
     end
 
     test "multi-line write stores multiple points", %{conn: conn, db: db} do
@@ -165,7 +186,7 @@ defmodule InfluxElixir.Client.LocalTest do
     test "measurement with escaped space in name", %{conn: conn, db: db} do
       Local.write(conn, "my\\ measurement value=1i", database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM my\\ measurement", database: db)
-      assert row["_measurement"] == "my measurement"
+      assert row["value"] == 1
     end
 
     test "quoted measurement name in SELECT *", %{conn: conn, db: db} do
@@ -179,7 +200,6 @@ defmodule InfluxElixir.Client.LocalTest do
                )
 
       assert row["value"] == 100.0
-      assert row["_measurement"] == "prices"
     end
 
     test "string field with escaped quotes", %{conn: conn, db: db} do
@@ -223,28 +243,28 @@ defmodule InfluxElixir.Client.LocalTest do
       ts = 1_000_000_000
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :nanosecond)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["time"] == 1_000_000_000
+      assert row["time"] == "1970-01-01T00:00:01"
     end
 
     test "microsecond precision is multiplied by 1_000", %{conn: conn, db: db} do
       ts = 1_000_000
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :microsecond)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["time"] == 1_000_000_000
+      assert row["time"] == "1970-01-01T00:00:01"
     end
 
     test "millisecond precision is multiplied by 1_000_000", %{conn: conn, db: db} do
       ts = 1_000
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :millisecond)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["time"] == 1_000_000_000
+      assert row["time"] == "1970-01-01T00:00:01"
     end
 
     test "second precision is multiplied by 1_000_000_000", %{conn: conn, db: db} do
       ts = 1
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :second)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["time"] == 1_000_000_000
+      assert row["time"] == "1970-01-01T00:00:01"
     end
   end
 
@@ -266,8 +286,8 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "qdb"}
     end
 
-    test "returns empty list for unknown measurement", %{conn: conn, db: db} do
-      assert {:ok, []} =
+    test "returns error for non-existent measurement", %{conn: conn, db: db} do
+      assert {:error, {:table_not_found, "no_such_measurement"}} =
                Local.query_sql(conn, "SELECT * FROM no_such_measurement", database: db)
     end
 
@@ -340,14 +360,17 @@ defmodule InfluxElixir.Client.LocalTest do
       sql = "SELECT * FROM cpu WHERE region = 'us-east' ORDER BY time DESC LIMIT 1"
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
       assert row["region"] == "us-east"
-      assert row["time"] == 3000
+      assert row["time"] == "1970-01-01T00:00:00.000003000"
     end
 
-    test "each row includes _measurement key", %{conn: conn, db: db} do
+    test "each row has fields, tags, and time but no _measurement key",
+         %{conn: conn, db: db} do
       assert {:ok, [row | _rest]} =
                Local.query_sql(conn, "SELECT * FROM cpu", database: db)
 
-      assert row["_measurement"] == "cpu"
+      assert is_binary(row["time"])
+      assert Map.has_key?(row, "usage")
+      refute Map.has_key?(row, "_measurement")
     end
 
     test "unsupported SQL returns error", %{conn: conn, db: db} do
@@ -443,8 +466,13 @@ defmodule InfluxElixir.Client.LocalTest do
   # ---------------------------------------------------------------------------
 
   describe "execute_sql/3" do
-    test "returns {:ok, map} for any statement", %{conn: conn} do
-      assert {:ok, result} = Local.execute_sql(conn, "DELETE FROM cpu")
+    test "returns error for DELETE on v3_core", %{conn: conn} do
+      assert {:error, :delete_not_supported} =
+               Local.execute_sql(conn, "DELETE FROM cpu")
+    end
+
+    test "returns {:ok, map} for unknown statement", %{conn: conn} do
+      assert {:ok, result} = Local.execute_sql(conn, "ALTER TABLE foo")
       assert is_map(result)
     end
   end
@@ -455,7 +483,8 @@ defmodule InfluxElixir.Client.LocalTest do
 
   describe "query_influxql/3" do
     test "returns {:ok, rows}", %{conn: conn} do
-      assert {:ok, rows} = Local.query_influxql(conn, "SELECT * FROM cpu")
+      Local.write(conn, "cpu value=1i", database: "test_db")
+      assert {:ok, rows} = Local.query_influxql(conn, "SELECT * FROM cpu", database: "test_db")
       assert is_list(rows)
     end
 
@@ -505,7 +534,7 @@ defmodule InfluxElixir.Client.LocalTest do
   # execute_sql/3 — DELETE support
   # ---------------------------------------------------------------------------
 
-  describe "execute_sql/3 — DELETE" do
+  describe "execute_sql/3 — DELETE (v3_core rejects)" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "del_db")
 
@@ -518,11 +547,40 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "del_db"}
     end
 
-    test "DELETE FROM removes all points for a measurement", %{conn: conn, db: db} do
+    test "DELETE FROM returns error on v3_core profile",
+         %{conn: conn, db: db} do
+      assert {:error, :delete_not_supported} =
+               Local.execute_sql(conn, "DELETE FROM cpu", database: db)
+    end
+
+    test "unknown statement returns 0 rows_affected", %{conn: conn, db: db} do
+      assert {:ok, %{"rows_affected" => 0}} =
+               Local.execute_sql(conn, "CREATE TABLE foo (id INT)", database: db)
+    end
+  end
+
+  describe "execute_sql/3 — DELETE (v3_enterprise supports)" do
+    setup do
+      {:ok, conn} =
+        Local.start(
+          databases: ["del_db"],
+          profile: :v3_enterprise
+        )
+
+      Local.write(
+        conn,
+        "cpu,host=web01 value=10i\ncpu,host=web02 value=20i\ncpu,host=web01 value=30i",
+        database: "del_db"
+      )
+
+      on_exit(fn -> Local.stop(conn) end)
+      {:ok, conn: conn, db: "del_db"}
+    end
+
+    test "DELETE FROM removes all points for a measurement",
+         %{conn: conn, db: db} do
       assert {:ok, %{"rows_affected" => 3}} =
                Local.execute_sql(conn, "DELETE FROM cpu", database: db)
-
-      assert {:ok, []} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
     end
 
     test "DELETE FROM with WHERE removes matching points only",
@@ -534,19 +592,10 @@ defmodule InfluxElixir.Client.LocalTest do
                  database: db
                )
 
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+      assert {:ok, [row]} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+
       assert row["host"] == "web02"
-    end
-
-    test "DELETE FROM non-existent measurement returns 0 rows_affected",
-         %{conn: conn, db: db} do
-      assert {:ok, %{"rows_affected" => 0}} =
-               Local.execute_sql(conn, "DELETE FROM no_such", database: db)
-    end
-
-    test "unknown statement returns 0 rows_affected", %{conn: conn, db: db} do
-      assert {:ok, %{"rows_affected" => 0}} =
-               Local.execute_sql(conn, "CREATE TABLE foo (id INT)", database: db)
     end
   end
 
@@ -768,7 +817,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert rows == []
     end
 
-    test "aggregate on empty measurement returns empty",
+    test "aggregate on non-existent measurement returns error",
          %{conn: conn, db: db} do
       sql = """
       SELECT
@@ -778,10 +827,8 @@ defmodule InfluxElixir.Client.LocalTest do
       GROUP BY DATE_BIN(INTERVAL '1 hour', time)
       """
 
-      {:ok, rows} =
-        Local.query_sql(conn, sql, database: db)
-
-      assert rows == []
+      assert {:error, {:table_not_found, "empty_m"}} =
+               Local.query_sql(conn, sql, database: db)
     end
 
     test "double-quoted WHERE value parsed as string",
@@ -860,7 +907,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, [row]} =
                Local.query_sql(conn, "SELECT * FROM my\\,measurement", database: db)
 
-      assert row["_measurement"] == "my,measurement"
+      assert row["field"] == 1
     end
 
     test "field with negative integer", %{conn: conn, db: db} do
@@ -940,29 +987,40 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "iql_db"}
     end
 
-    test "SHOW DATABASES returns all databases", %{conn: conn} do
+    test "SHOW DATABASES returns all databases with iox::database key",
+         %{conn: conn} do
       assert {:ok, dbs} = Local.query_influxql(conn, "SHOW DATABASES")
-      names = Enum.map(dbs, & &1["name"])
+      names = Enum.map(dbs, & &1["iox::database"])
       assert "iql_db" in names
       assert "test_db" in names
     end
 
-    test "SHOW MEASUREMENTS returns measurement names", %{conn: conn, db: db} do
+    test "SHOW MEASUREMENTS returns measurement names with iox::measurement key",
+         %{conn: conn, db: db} do
       assert {:ok, measurements} =
                Local.query_influxql(conn, "SHOW MEASUREMENTS", database: db)
 
       names = Enum.map(measurements, & &1["name"])
       assert "cpu" in names
       assert "mem" in names
+
+      Enum.each(measurements, fn m ->
+        assert m["iox::measurement"] == "measurements"
+      end)
     end
 
-    test "SHOW TAG KEYS FROM measurement returns tag keys", %{conn: conn, db: db} do
+    test "SHOW TAG KEYS FROM returns tag keys with iox::measurement key",
+         %{conn: conn, db: db} do
       assert {:ok, tag_keys} =
                Local.query_influxql(conn, "SHOW TAG KEYS FROM cpu", database: db)
 
       keys = Enum.map(tag_keys, & &1["tagKey"])
       assert "host" in keys
       assert "region" in keys
+
+      Enum.each(tag_keys, fn tk ->
+        assert tk["iox::measurement"] == "cpu"
+      end)
     end
 
     test "SELECT delegates to SQL engine", %{conn: conn, db: db} do
@@ -1115,15 +1173,13 @@ defmodule InfluxElixir.Client.LocalTest do
       assert length(values) == 3
     end
 
-    test "returns empty list for no matching data", %{conn: conn, db: db} do
-      {:ok, rows} =
-        Local.query_sql(
-          conn,
-          ~s(SELECT DISTINCT symbol FROM "nonexistent"),
-          database: db
-        )
-
-      assert rows == []
+    test "returns error for non-existent measurement", %{conn: conn, db: db} do
+      assert {:error, {:table_not_found, "nonexistent"}} =
+               Local.query_sql(
+                 conn,
+                 ~s(SELECT DISTINCT symbol FROM "nonexistent"),
+                 database: db
+               )
     end
   end
 
@@ -1170,11 +1226,11 @@ defmodule InfluxElixir.Client.LocalTest do
       assert length(rows) == 3
 
       [b1, b2, b3] = rows
-      assert b1["time"] == 0
+      assert b1["time"] == "1970-01-01T00:00:00"
       assert b1["avg_usage"] == 15.0
-      assert b2["time"] == 2 * hour
+      assert b2["time"] == "1970-01-01T02:00:00"
       assert b2["avg_usage"] == 35.0
-      assert b3["time"] == 4 * hour
+      assert b3["time"] == "1970-01-01T04:00:00"
       assert b3["avg_usage"] == 55.0
     end
 
@@ -1193,9 +1249,9 @@ defmodule InfluxElixir.Client.LocalTest do
       assert length(rows) == 2
 
       [b1, b2] = rows
-      assert b1["time"] == 0
+      assert b1["time"] == "1970-01-01T00:00:00"
       assert b1["total"] == 60
-      assert b2["time"] == 3 * hour
+      assert b2["time"] == "1970-01-01T03:00:00"
       assert b2["total"] == 150
     end
 
@@ -1212,9 +1268,9 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
       [b1, b2] = rows
-      assert b1["time"] == 0
+      assert b1["time"] == "1970-01-01T00:00:00"
       assert b1["cnt"] == 3
-      assert b2["time"] == 3 * hour
+      assert b2["time"] == "1970-01-01T03:00:00"
       assert b2["cnt"] == 3
     end
 
@@ -1231,7 +1287,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       # All points at 0.5h-5.5h → all in bucket 0
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["time"] == 0
+      assert row["time"] == "1970-01-01T00:00:00"
       assert row["min_val"] == 10
       assert row["max_val"] == 60
     end
@@ -1271,7 +1327,7 @@ defmodule InfluxElixir.Client.LocalTest do
       # web01 has points at 0.5h, 1.5h, 2.5h → all in bucket 0
       assert length(rows) == 1
       [row] = rows
-      assert row["time"] == 0
+      assert row["time"] == "1970-01-01T00:00:00"
       assert row["avg_usage"] == 20.0
     end
 
@@ -1350,7 +1406,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["avg_usage"] == 35.0
     end
 
-    test "empty result set returns empty list",
+    test "non-existent measurement returns error",
          %{conn: conn, db: db} do
       sql = """
       SELECT
@@ -1361,7 +1417,8 @@ defmodule InfluxElixir.Client.LocalTest do
       ORDER BY time ASC
       """
 
-      assert {:ok, []} = Local.query_sql(conn, sql, database: db)
+      assert {:error, {:table_not_found, "nonexistent"}} =
+               Local.query_sql(conn, sql, database: db)
     end
 
     test "day interval buckets", %{conn: conn, db: db} do
@@ -1376,7 +1433,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       # All 6 points at 0.5h-5.5h → all in day bucket 0
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["time"] == 0
+      assert row["time"] == "1970-01-01T00:00:00"
       assert row["total"] == 210
     end
 
@@ -1596,7 +1653,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["close"] == 112.0
     end
 
-    test "first/last on empty result returns nil values",
+    test "first/last on non-existent measurement returns error",
          %{conn: conn, db: db} do
       sql = """
       SELECT
@@ -1608,7 +1665,478 @@ defmodule InfluxElixir.Client.LocalTest do
       ORDER BY time ASC
       """
 
+      assert {:error, {:table_not_found, "nonexistent"}} =
+               Local.query_sql(conn, sql, database: db)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # start/1 — invalid profile validation
+  # ---------------------------------------------------------------------------
+
+  describe "start/1 — invalid profile" do
+    test "raises ArgumentError for unknown profile" do
+      assert_raise ArgumentError, ~r/invalid profile/, fn ->
+        Local.start(profile: :invalid_thing)
+      end
+    end
+
+    test "error message lists valid profiles" do
+      assert_raise ArgumentError, ~r/:v3_core.*:v3_enterprise.*:v2/s, fn ->
+        Local.start(profile: :nonexistent_profile)
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # write/3 — line protocol parse error edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "write/3 — line protocol parse errors" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "lp_err")
+      {:ok, db: "lp_err"}
+    end
+
+    test "escaped backslash in measurement name is stored correctly",
+         %{conn: conn, db: db} do
+      # cpu,host=web\\01 has a literal backslash in the host tag value
+      Local.write(conn, "cpu,host=web\\\\01 value=1i", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+      assert row["host"] == "web\\01"
+    end
+
+    test "tag with empty key returns 400 error", %{conn: conn, db: db} do
+      assert {:error, %{status: 400}} =
+               Local.write(conn, "cpu,=val value=1i", database: db)
+    end
+
+    test "tag with empty value returns 400 error", %{conn: conn, db: db} do
+      assert {:error, %{status: 400}} =
+               Local.write(conn, "cpu,key= value=1i", database: db)
+    end
+
+    test "field value that is not a valid type returns 400 error",
+         %{conn: conn, db: db} do
+      # Not quoted string, not int (no i suffix), not bool, not float
+      assert {:error, %{status: 400}} =
+               Local.write(conn, "cpu value=notanumber", database: db)
+    end
+
+    test "field value with i suffix but non-numeric body returns 400 error",
+         %{conn: conn, db: db} do
+      assert {:error, %{status: 400}} =
+               Local.write(conn, "cpu value=abci", database: db)
+    end
+
+    test "field pair with empty key returns 400 error", %{conn: conn, db: db} do
+      assert {:error, %{status: 400}} =
+               Local.write(conn, "cpu =val", database: db)
+    end
+
+    test "write with non-numeric trailing timestamp returns 400 error",
+         %{conn: conn, db: db} do
+      assert {:error, %{status: 400}} =
+               Local.write(conn, "cpu value=1i badtimestamp", database: db)
+    end
+
+    test "empty string timestamp is treated as nil — point stored without timestamp",
+         %{conn: conn, db: db} do
+      # A line with an empty-looking timestamp segment is actually just parsed
+      # as no timestamp (nil). We verify the write succeeds and the point is stored.
+      Local.write(conn, "cpu value=42i", database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+      assert row["value"] == 42
+      assert row["time"] == nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — aggregate SQL parse error edge cases
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — aggregate parse errors" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "agg_err_db")
+      Local.write(conn, "sensors temp=22i 1000000000", database: "agg_err_db")
+      {:ok, db: "agg_err_db"}
+    end
+
+    test "aggregate column with unsupported expression returns error",
+         %{conn: conn, db: db} do
+      # A column that is neither DATE_BIN nor a known aggregate function
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        some_weird_expr AS alias
+      FROM sensors
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      """
+
+      assert {:error, %{status: 400}} = Local.query_sql(conn, sql, database: db)
+    end
+
+    test "DATE_BIN column missing INTERVAL keyword returns error",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN('1 hour', time) AS time,
+        AVG(temp) AS avg_temp
+      FROM sensors
+      GROUP BY DATE_BIN('1 hour', time)
+      """
+
+      assert {:error, %{status: 400}} = Local.query_sql(conn, sql, database: db)
+    end
+
+    test "malformed aggregate expression with unknown function returns error",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        INVALID_FUNC(temp) AS bad
+      FROM sensors
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      """
+
+      # INVALID_FUNC contains none of the aggregate keywords so parse_single_column
+      # falls through to the error branch
+      assert {:error, %{status: 400}} = Local.query_sql(conn, sql, database: db)
+    end
+
+    test "aggregate with invalid interval unit returns error",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 fortnight', time) AS time,
+        AVG(temp) AS avg_temp
+      FROM sensors
+      GROUP BY DATE_BIN(INTERVAL '1 fortnight', time)
+      """
+
+      assert {:error, %{status: 400, body: body}} =
+               Local.query_sql(conn, sql, database: db)
+
+      assert body =~ "fortnight"
+    end
+
+    test "aggregate with malformed interval (no number) returns error",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL 'lots of hours', time) AS time,
+        AVG(temp) AS avg_temp
+      FROM sensors
+      GROUP BY DATE_BIN(INTERVAL 'lots of hours', time)
+      """
+
+      assert {:error, %{status: 400}} = Local.query_sql(conn, sql, database: db)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — WHERE value parsing coverage
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — WHERE value type parsing" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "where_val_db")
+
+      Local.write(
+        conn,
+        "sensors,device=alpha temp=98.6,count=5i 1000000000\n" <>
+          "sensors,device=beta temp=37.2,count=10i 2000000000",
+        database: "where_val_db"
+      )
+
+      {:ok, db: "where_val_db"}
+    end
+
+    test "WHERE with float comparison filters correctly", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM sensors WHERE temp > 1.5",
+                 database: db
+               )
+
+      assert length(rows) == 2
+    end
+
+    test "WHERE with float boundary excludes low values", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM sensors WHERE temp > 50.0",
+                 database: db
+               )
+
+      assert length(rows) == 1
+      assert hd(rows)["device"] == "alpha"
+    end
+
+    test "WHERE with unparseable string value is treated as string literal",
+         %{conn: conn, db: db} do
+      # A value like 'alpha' matches tag values as a string
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM sensors WHERE device = 'alpha'",
+                 database: db
+               )
+
+      assert length(rows) == 1
+      assert hd(rows)["device"] == "alpha"
+    end
+
+    test "WHERE clause that matches nothing returns empty list",
+         %{conn: conn, db: db} do
+      assert {:ok, []} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM sensors WHERE temp > 9999.9",
+                 database: db
+               )
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_flux/3 — range unit coverage
+  # ---------------------------------------------------------------------------
+
+  describe "query_flux/3 — range time units" do
+    setup do
+      {:ok, v2_conn} = Local.start(databases: ["flux_range_db"], profile: :v2)
+      now = System.os_time(:nanosecond)
+
+      # Two points: one recent (5 seconds ago), one old (2 hours ago)
+      recent = now - 5_000_000_000
+      old = now - 7_200_000_000_000
+
+      Local.write(
+        v2_conn,
+        "sensors,host=new value=1i #{recent}\nsensors,host=old value=2i #{old}",
+        database: "flux_range_db"
+      )
+
+      on_exit(fn -> Local.stop(v2_conn) end)
+      {:ok, v2_conn: v2_conn}
+    end
+
+    test "range with seconds unit filters correctly", %{v2_conn: conn} do
+      flux = "from(bucket: \"flux_range_db\") |> range(start: -30s)"
+      assert {:ok, rows} = Local.query_flux(conn, flux)
+      assert length(rows) == 1
+      assert hd(rows)["host"] == "new"
+    end
+
+    test "range with minutes unit filters correctly", %{v2_conn: conn} do
+      flux = "from(bucket: \"flux_range_db\") |> range(start: -1m)"
+      assert {:ok, rows} = Local.query_flux(conn, flux)
+      assert length(rows) == 1
+      assert hd(rows)["host"] == "new"
+    end
+
+    test "range with days unit includes all recent points", %{v2_conn: conn} do
+      flux = "from(bucket: \"flux_range_db\") |> range(start: -1d)"
+      assert {:ok, rows} = Local.query_flux(conn, flux)
+      assert length(rows) == 2
+    end
+
+    test "flux query with no range clause returns all points", %{v2_conn: conn} do
+      # No range() pipe — passthrough
+      flux = "from(bucket: \"flux_range_db\")"
+      assert {:ok, rows} = Local.query_flux(conn, flux)
+      assert length(rows) == 2
+    end
+
+    test "flux filter predicate on tag field", %{v2_conn: conn} do
+      flux =
+        "from(bucket: \"flux_range_db\") |> range(start: -1d) |> filter(fn: (r) => r.host == \"new\")"
+
+      assert {:ok, rows} = Local.query_flux(conn, flux)
+      assert length(rows) == 1
+      assert hd(rows)["host"] == "new"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — boolean parameter substitution
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — boolean and nil parameter substitution" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "bool_param_db")
+
+      Local.write(
+        conn,
+        "devices,id=d1 active=true\ndevices,id=d2 active=false",
+        database: "bool_param_db"
+      )
+
+      {:ok, db: "bool_param_db"}
+    end
+
+    test "boolean true param substituted correctly", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM devices WHERE active = $flag",
+                 database: db,
+                 params: %{"$flag" => true}
+               )
+
+      assert length(rows) == 1
+      assert hd(rows)["id"] == "d1"
+    end
+
+    test "boolean false param substituted correctly", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM devices WHERE active = $flag",
+                 database: db,
+                 params: %{"$flag" => false}
+               )
+
+      assert length(rows) == 1
+      assert hd(rows)["id"] == "d2"
+    end
+
+    test "nil param falls back to inspect representation", %{conn: conn, db: db} do
+      # nil is not a recognised type — to_sql_literal/1 uses inspect(nil) = "nil"
+      # The WHERE clause will not match any rows since no field equals "nil"
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM devices WHERE id = $val",
+                 database: db,
+                 params: %{"$val" => nil}
+               )
+
+      assert rows == []
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # execute_sql/3 — DELETE on non-existent measurement (v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  describe "execute_sql/3 — DELETE non-existent measurement" do
+    setup do
+      {:ok, conn} = Local.start(databases: ["del_ne_db"], profile: :v3_enterprise)
+      on_exit(fn -> Local.stop(conn) end)
+      {:ok, conn: conn, db: "del_ne_db"}
+    end
+
+    test "DELETE FROM non-existent measurement returns 0 rows affected",
+         %{conn: conn, db: db} do
+      assert {:ok, %{"rows_affected" => 0}} =
+               Local.execute_sql(conn, "DELETE FROM nonexistent", database: db)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — aggregate on empty bucket (WHERE filters all points)
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — aggregate on empty filtered bucket" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "empty_agg_db")
+
+      # Write points that will be completely filtered out by the WHERE clause
+      Local.write(
+        conn,
+        "sensors temp=22i 1000000000\nsensors temp=25i 2000000000",
+        database: "empty_agg_db"
+      )
+
+      {:ok, db: "empty_agg_db"}
+    end
+
+    test "aggregate where WHERE filters out all points returns empty list",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        AVG(temp) AS avg_temp
+      FROM sensors
+      WHERE temp > 9999
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      ORDER BY time ASC
+      """
+
       assert {:ok, []} = Local.query_sql(conn, sql, database: db)
+    end
+
+    test "aggregate on measurement with nil timestamps buckets at 0",
+         %{conn: conn, db: db} do
+      # Write points without timestamps — they get nil timestamp → bucket 0
+      Local.write(conn, "no_ts val=10i\nno_ts val=20i", database: db)
+
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        SUM(val) AS total
+      FROM no_ts
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      """
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["total"] == 30
+      # bucket at timestamp 0 → epoch
+      assert row["time"] == "1970-01-01T00:00:00"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — first/last with non-time ordering field
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — first/last with non-time ordering" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "ord_db")
+      hour = 3_600_000_000_000
+
+      # Points with a custom numeric field "priority" for ordering
+      lines = [
+        "events,type=a value=100i,priority=3i #{div(hour, 4)}",
+        "events,type=b value=200i,priority=1i #{div(hour, 2)}",
+        "events,type=c value=300i,priority=2i #{div(3 * hour, 4)}"
+      ]
+
+      Local.write(conn, Enum.join(lines, "\n"), database: "ord_db")
+      {:ok, db: "ord_db"}
+    end
+
+    test "first(value, priority) returns value from point with lowest priority",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        first(value, priority) AS first_val
+      FROM events
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      """
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      # priority=1 (type=b) is the minimum → first value is 200
+      assert row["first_val"] == 200
+    end
+
+    test "last(value, priority) returns value from point with highest priority",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 hour', time) AS time,
+        last(value, priority) AS last_val
+      FROM events
+      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
+      """
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      # priority=3 (type=a) is the maximum → last value is 100
+      assert row["last_val"] == 100
     end
   end
 end

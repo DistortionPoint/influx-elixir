@@ -306,6 +306,84 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
+  describe "retry handler — direct :retry message" do
+    test "successful retry clears retry state and increments total_writes",
+         %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000, max_retries: 3)
+
+      # Inject a valid payload directly as a :retry message, bypassing the
+      # initial flush.  The handler at handle_info({:retry, ...}) calls
+      # Writer.write/2 directly; a valid payload succeeds immediately.
+      send(pid, {:retry, "cpu value=1.0", 1})
+
+      # Allow the GenServer to process the message
+      :sys.get_state(pid)
+
+      state = :sys.get_state(pid)
+      assert state.retry_payload == nil
+      assert state.retry_attempt == 0
+
+      {:ok, stats} = BatchWriter.stats(pid)
+      assert stats.total_writes == 1
+    end
+
+    test "LocalClient error during retry does not match 4xx discard clause",
+         %{conn: conn} do
+      # LocalClient returns {:error, %{status: 400, body: "..."}} for bad input.
+      # The retry handler matches {:error, {:http_error, status}} for 4xx discard,
+      # which LocalClient never produces.  With max_retries: 1 and attempt already
+      # at 1, the general exhaustion clause fires instead, recording an error.
+      pid = start_writer(conn, flush_interval_ms: 60_000, max_retries: 1)
+
+      send(pid, {:retry, "!!!", 1})
+
+      # Block until the GenServer has processed the message
+      :sys.get_state(pid)
+
+      state = :sys.get_state(pid)
+      assert state.retry_payload == nil
+      assert state.retry_attempt == 0
+
+      {:ok, stats} = BatchWriter.stats(pid)
+      assert stats.total_errors == 1
+    end
+
+    test "LocalClient error during retry below max_retries schedules another retry",
+         %{conn: conn} do
+      # With attempt=1 and max_retries=3, another retry is scheduled.
+      pid = start_writer(conn, flush_interval_ms: 60_000, max_retries: 3)
+
+      send(pid, {:retry, "!!!", 1})
+
+      :sys.get_state(pid)
+
+      state = :sys.get_state(pid)
+      # Another retry has been scheduled; retry_attempt should be 2
+      assert state.retry_attempt == 2
+      assert state.retry_payload == "!!!"
+    end
+  end
+
+  describe "4xx error during immediate flush" do
+    test "invalid payload with max_retries: 1 causes do_flush to schedule retry",
+         %{conn: conn} do
+      # do_flush handles {:error, reason} when max_retries > 0 by scheduling retry.
+      # LocalClient bad-input errors do not match the {:http_error, status} 4xx
+      # clause (lines 344-347), so they flow to the retry-scheduling branch.
+      pid = start_writer(conn, flush_interval_ms: 60_000, max_retries: 1)
+
+      :ok = BatchWriter.write(pid, "!!!")
+
+      # Flush synchronously to observe the state after do_flush completes
+      BatchWriter.flush(pid)
+
+      state = :sys.get_state(pid)
+      # The flush was scheduled for retry, so retry_attempt == 1 and payload set
+      assert state.retry_attempt == 1
+      assert state.retry_payload != nil
+    end
+  end
+
   describe "error paths via invalid line protocol" do
     test "flush with unparseable payload and max_retries: 0 increments errors",
          %{conn: conn} do

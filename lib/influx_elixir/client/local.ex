@@ -136,7 +136,7 @@ defmodule InfluxElixir.Client.Local do
 
   # Measurement names may contain escaped spaces (e.g. "my\ measurement").
   # This captures everything up to the first unescaped space or end-of-line.
-  @measurement_pattern ~r/(?i)SELECT\s+\*\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)/s
+  @measurement_pattern ~r/(?i)SELECT\s+\*\s+FROM\s+(?:"([^"]+)"|((?:[^\s\\]|\\.)+))(.*)/s
 
   # ---------------------------------------------------------------------------
   # Connection lifecycle (behaviour callbacks)
@@ -257,13 +257,13 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()
-  def write(%{table: table} = conn, payload, opts \\ []) do
+  def write(%{table: table, profile: profile} = conn, payload, opts \\ []) do
     database = Keyword.get(opts, :database, "default")
     precision = Keyword.get(opts, :precision, :nanosecond)
 
     with :ok <- require_capability(conn, :write),
          {:ok, text} <- maybe_decompress(payload),
-         :ok <- assert_database_exists(table, database),
+         :ok <- ensure_database(table, database, profile),
          {:ok, points} <- parse_line_protocol(text, precision) do
       Enum.each(points, &store_point(table, database, &1))
       {:ok, :written}
@@ -296,8 +296,14 @@ defmodule InfluxElixir.Client.Local do
       resolved_sql = resolve_params(sql, params)
 
       case parse_select(resolved_sql) do
-        {:ok, query} -> {:ok, execute_query(table, query, database)}
-        {:error, _reason} = err -> err
+        {:ok, query} ->
+          case execute_query(table, query, database) do
+            {:error, _reason} = err -> err
+            rows -> {:ok, rows}
+          end
+
+        {:error, _reason} = err ->
+          err
       end
     end
   end
@@ -333,22 +339,31 @@ defmodule InfluxElixir.Client.Local do
   `DELETE FROM <measurement> WHERE ...` — matching points are removed
   from ETS and the count is returned in `%{"rows_affected" => N}`.
 
+  On `:v3_core` profile, DELETE is not supported (matches real InfluxDB v3
+  Core behavior) and returns `{:error, :delete_not_supported}`.
+
+  On `:v3_enterprise` profile, DELETE is supported.
+
   Unknown statements return `%{"rows_affected" => 0}`.
   """
   @impl true
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map()} | {:error, term()}
-  def execute_sql(%{table: table} = conn, sql, opts \\ []) do
+  def execute_sql(%{table: table, profile: profile} = conn, sql, opts \\ []) do
     with :ok <- require_capability(conn, :execute_sql) do
       database = Keyword.get(opts, :database, "default")
       trimmed = String.trim(sql)
 
       case Regex.run(~r/^(?i)DELETE\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)$/s, trimmed) do
         [_full, measurement_raw, rest] ->
-          measurement = unescape_measurement(measurement_raw)
-          where = parse_where(rest)
-          count = delete_points(table, database, measurement, where)
-          {:ok, %{"rows_affected" => count}}
+          if profile == :v3_core do
+            {:error, :delete_not_supported}
+          else
+            measurement = unescape_measurement(measurement_raw)
+            where = parse_where(rest)
+            count = delete_points(table, database, measurement, where)
+            {:ok, %{"rows_affected" => count}}
+          end
 
         _no_match ->
           {:ok, %{"rows_affected" => 0}}
@@ -391,7 +406,7 @@ defmodule InfluxElixir.Client.Local do
         dbs =
           table
           |> get_databases()
-          |> Enum.map(&%{"name" => &1})
+          |> Enum.map(&%{"iox::database" => &1})
 
         {:ok, dbs}
 
@@ -400,7 +415,7 @@ defmodule InfluxElixir.Client.Local do
           :ets.match_object(table, {{:points, database, :_}, :_})
           |> Enum.map(fn {{:points, _db, m}, _pts} -> m end)
           |> Enum.uniq()
-          |> Enum.map(&%{"name" => &1})
+          |> Enum.map(&%{"iox::measurement" => "measurements", "name" => &1})
 
         {:ok, measurements}
 
@@ -418,7 +433,7 @@ defmodule InfluxElixir.Client.Local do
           points
           |> Enum.flat_map(&Map.keys(&1.tags))
           |> Enum.uniq()
-          |> Enum.map(&%{"tagKey" => &1})
+          |> Enum.map(&%{"iox::measurement" => measurement, "tagKey" => &1})
 
         {:ok, tag_keys}
 
@@ -455,7 +470,7 @@ defmodule InfluxElixir.Client.Local do
       points
       |> apply_flux_range(flux)
       |> apply_flux_filters(flux)
-      |> Enum.map(&point_to_row/1)
+      |> Enum.map(&flux_point_to_row/1)
       |> then(&{:ok, &1})
     end
   end
@@ -687,6 +702,22 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
+  # v3 Core/Enterprise auto-create databases on write; v2 requires pre-existing
+  @spec ensure_database(:ets.table(), binary(), profile()) :: :ok | {:error, term()}
+  defp ensure_database(table, database, profile) when profile in [:v3_core, :v3_enterprise] do
+    databases = get_databases(table)
+
+    unless MapSet.member?(databases, database) do
+      :ets.insert(table, {:databases, MapSet.put(databases, database)})
+    end
+
+    :ok
+  end
+
+  defp ensure_database(table, database, _profile) do
+    assert_database_exists(table, database)
+  end
+
   @spec store_point(:ets.table(), binary(), point_map()) :: true
   defp store_point(table, database, point) do
     key = {:points, database, point.measurement}
@@ -701,6 +732,12 @@ defmodule InfluxElixir.Client.Local do
   end
 
   @spec fetch_points(:ets.table(), binary(), binary()) :: [point_map()]
+  @spec measurement_exists?(:ets.table(), binary(), binary()) :: boolean()
+  defp measurement_exists?(table, database, measurement) do
+    key = {:points, database, measurement}
+    :ets.lookup(table, key) != []
+  end
+
   defp fetch_points(table, database, measurement) do
     key = {:points, database, measurement}
 
@@ -1325,23 +1362,31 @@ defmodule InfluxElixir.Client.Local do
   @spec parse_star_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
   defp parse_star_select(sql) do
     case Regex.run(@measurement_pattern, sql) do
-      [_full_match, measurement_raw, rest] ->
-        measurement = unescape_measurement(measurement_raw)
+      [_full_match, quoted, "", rest] when quoted != "" ->
+        {:ok, build_star_query(quoted, rest)}
 
-        {:ok,
-         %{
-           measurement: measurement,
-           where: parse_where(rest),
-           order_by: parse_order_by(rest),
-           limit: parse_limit(rest),
-           group_by_interval: nil,
-           select_columns: nil,
-           distinct_column: nil
-         }}
+      [_full_match, "", unquoted, rest] ->
+        {:ok, build_star_query(unescape_measurement(unquoted), rest)}
+
+      [_full_match, quoted, rest] when quoted != "" ->
+        {:ok, build_star_query(quoted, rest)}
 
       _no_match ->
         {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
     end
+  end
+
+  @spec build_star_query(binary(), binary()) :: parsed_query()
+  defp build_star_query(measurement, rest) do
+    %{
+      measurement: measurement,
+      where: parse_where(rest),
+      order_by: parse_order_by(rest),
+      limit: parse_limit(rest),
+      group_by_interval: nil,
+      select_columns: nil,
+      distinct_column: nil
+    }
   end
 
   @spec parse_where(binary()) :: [{atom(), binary(), term()}]
@@ -1443,23 +1488,28 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec execute_query(:ets.table(), parsed_query(), binary()) :: [map()]
+  @spec execute_query(:ets.table(), parsed_query(), binary()) ::
+          [map()] | {:error, term()}
   defp execute_query(table, %{measurement: m} = query, database) do
-    points = fetch_points(table, database, m)
-    filtered = apply_where(points, query.where)
+    if measurement_exists?(table, database, m) do
+      points = fetch_points(table, database, m)
+      filtered = apply_where(points, query.where)
 
-    cond do
-      query.distinct_column ->
-        execute_distinct_query(filtered, query)
+      cond do
+        query.distinct_column ->
+          execute_distinct_query(filtered, query)
 
-      query.select_columns ->
-        execute_aggregate_query(filtered, query)
+        query.select_columns ->
+          execute_aggregate_query(filtered, query)
 
-      true ->
-        filtered
-        |> apply_order_by(query.order_by)
-        |> apply_limit(query.limit)
-        |> Enum.map(&point_to_row/1)
+        true ->
+          filtered
+          |> apply_order_by(query.order_by)
+          |> apply_limit(query.limit)
+          |> Enum.map(&point_to_row/1)
+      end
+    else
+      {:error, {:table_not_found, m}}
     end
   end
 
@@ -1518,7 +1568,7 @@ defmodule InfluxElixir.Client.Local do
     Enum.map(buckets, fn {bucket_ts, bucket_points} ->
       Enum.reduce(columns, %{}, fn
         {:time_bucket, alias_name}, row ->
-          Map.put(row, alias_name, bucket_ts)
+          Map.put(row, alias_name, nanoseconds_to_iso8601(bucket_ts))
 
         {:aggregate, agg, field, alias_name}, row ->
           values =
@@ -1662,8 +1712,32 @@ defmodule InfluxElixir.Client.Local do
   defp point_to_row(point) do
     point.fields
     |> Map.merge(point.tags)
-    |> Map.put("time", point.timestamp)
+    |> Map.put("time", nanoseconds_to_iso8601(point.timestamp))
+  end
+
+  # Flux responses include _measurement (v2 compatibility format)
+  defp flux_point_to_row(point) do
+    point
+    |> point_to_row()
     |> Map.put("_measurement", point.measurement)
+  end
+
+  @spec nanoseconds_to_iso8601(integer() | nil) :: binary() | nil
+  defp nanoseconds_to_iso8601(nil), do: nil
+
+  defp nanoseconds_to_iso8601(ns) when is_integer(ns) do
+    seconds = div(ns, 1_000_000_000)
+    nanos = rem(ns, 1_000_000_000)
+
+    dt = DateTime.from_unix!(seconds)
+    base = Calendar.strftime(dt, "%Y-%m-%dT%H:%M:%S")
+
+    if nanos == 0 do
+      base
+    else
+      frac = nanos |> Integer.to_string() |> String.pad_leading(9, "0")
+      "#{base}.#{frac}"
+    end
   end
 
   # ---------------------------------------------------------------------------

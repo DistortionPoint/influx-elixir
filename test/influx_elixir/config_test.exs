@@ -19,9 +19,9 @@ defmodule InfluxElixir.ConfigTest do
                Config.validate(token: "my-token")
     end
 
-    test "returns {:error, validation_error} when :token is missing" do
-      assert {:error, %NimbleOptions.ValidationError{}} =
-               Config.validate(host: "localhost")
+    test "succeeds when :token is omitted (defaults to empty string)" do
+      assert {:ok, opts} = Config.validate(host: "localhost")
+      assert opts[:token] == ""
     end
 
     test "returns {:error, validation_error} when both required fields are missing" do
@@ -136,10 +136,9 @@ defmodule InfluxElixir.ConfigTest do
       end
     end
 
-    test "raises NimbleOptions.ValidationError for missing :token" do
-      assert_raise NimbleOptions.ValidationError, fn ->
-        Config.validate!(host: "localhost")
-      end
+    test "succeeds when :token is omitted" do
+      opts = Config.validate!(host: "localhost")
+      assert opts[:token] == ""
     end
 
     test "raises NimbleOptions.ValidationError for invalid :scheme" do

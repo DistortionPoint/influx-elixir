@@ -5,6 +5,7 @@ defmodule InfluxElixirTest do
 
   setup do
     {:ok, conn} = Local.start(databases: ["test_db"])
+    Local.write(conn, "cpu value=1i", database: "test_db")
     on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn}
   end
@@ -40,14 +41,14 @@ defmodule InfluxElixirTest do
   describe "write/3" do
     test "delegates to configured client", %{conn: conn} do
       assert {:ok, :written} =
-               InfluxElixir.write(conn, "cpu value=1.0")
+               InfluxElixir.write(conn, "cpu value=1.0", database: "test_db")
     end
   end
 
   describe "query_sql/3" do
     test "delegates to configured client", %{conn: conn} do
       assert {:ok, rows} =
-               InfluxElixir.query_sql(conn, "SELECT * FROM cpu")
+               InfluxElixir.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
 
       assert is_list(rows)
     end
@@ -56,7 +57,7 @@ defmodule InfluxElixirTest do
   describe "query_sql_stream/3" do
     test "returns an enumerable", %{conn: conn} do
       stream =
-        InfluxElixir.query_sql_stream(conn, "SELECT * FROM cpu")
+        InfluxElixir.query_sql_stream(conn, "SELECT * FROM cpu", database: "test_db")
 
       assert Enumerable.impl_for(stream)
     end
@@ -64,17 +65,15 @@ defmodule InfluxElixirTest do
 
   describe "execute_sql/3" do
     test "delegates to configured client", %{conn: conn} do
-      assert {:ok, result} =
-               InfluxElixir.execute_sql(conn, "DELETE FROM cpu")
-
-      assert is_map(result)
+      assert {:error, :delete_not_supported} =
+               InfluxElixir.execute_sql(conn, "DELETE FROM cpu", database: "test_db")
     end
   end
 
   describe "query_influxql/3" do
     test "delegates to configured client", %{conn: conn} do
       assert {:ok, rows} =
-               InfluxElixir.query_influxql(conn, "SELECT * FROM cpu")
+               InfluxElixir.query_influxql(conn, "SELECT * FROM cpu", database: "test_db")
 
       assert is_list(rows)
     end

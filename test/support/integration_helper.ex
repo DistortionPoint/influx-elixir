@@ -107,7 +107,7 @@ defmodule InfluxElixir.IntegrationHelper do
     request = Finch.build(:get, url)
 
     case Finch.request(request, :integration_finch, receive_timeout: 2_000) do
-      {:ok, %Finch.Response{status: 200}} -> true
+      {:ok, %Finch.Response{}} -> true
       _other -> false
     end
   rescue

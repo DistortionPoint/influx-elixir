@@ -83,6 +83,21 @@ defmodule InfluxElixir.Query.ResponseParserTest do
     end
   end
 
+  describe "parse/1 — default format" do
+    test "omitting format argument defaults to :json parsing" do
+      body = ~s([{"measurement":"cpu","value":1.5}])
+
+      assert {:ok, [row]} = ResponseParser.parse(body)
+      assert row["measurement"] == "cpu"
+      assert row["value"] == 1.5
+    end
+
+    test "invalid JSON body with default format returns json parse error" do
+      assert {:error, {:json_parse_error, _reason}} =
+               ResponseParser.parse("not valid json")
+    end
+  end
+
   describe "coerce_types/1" do
     test "converts time field to DateTime" do
       row = %{"time" => "2026-03-12T10:00:00Z", "value" => 42}

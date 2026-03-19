@@ -35,8 +35,9 @@ defmodule InfluxElixir.Config do
     ],
     token: [
       type: :string,
-      required: true,
-      doc: "Authentication token"
+      required: false,
+      default: "",
+      doc: "Authentication token (omit for unauthenticated instances)"
     ],
     org: [
       type: :string,
