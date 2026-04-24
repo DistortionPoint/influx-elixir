@@ -446,16 +446,13 @@ defmodule InfluxElixir.Flight.Reader do
           [term()]
   defp decode_column(_type_id, [], _body, n), do: List.duplicate(nil, n)
 
-  defp decode_column(type_id, [{_voff, vlen} | data_specs], body, n) do
-    validity =
-      case data_specs do
-        [{off, _len} | _rest] when vlen > 0 ->
-          safe_slice(body, off - vlen, vlen)
-
-        _other ->
-          nil
-      end
-
+  # The validity buffer's position is taken directly from the RecordBatch
+  # buffer metadata. Arrow IPC aligns each buffer (8-byte minimum, 64-byte
+  # recommended), so the validity offset cannot be derived from the data
+  # buffer offset by subtracting the validity length — that arithmetic lands
+  # in alignment padding, which would mask every value to nil.
+  defp decode_column(type_id, [{voff, vlen} | data_specs], body, n) do
+    validity = if vlen > 0, do: safe_slice(body, voff, vlen), else: nil
     values = decode_column_values(type_id, data_specs, body, n)
     apply_nulls(values, validity, n)
   end

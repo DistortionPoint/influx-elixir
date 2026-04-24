@@ -506,6 +506,48 @@ defmodule InfluxElixir.Flight.ReaderTest do
     {body, [{0, bitmap_bytes} | shifted_specs]}
   end
 
+  # Same as with_validity_bitmap/3 but inserts alignment padding between the
+  # validity bitmap and the data buffer, matching how real Arrow IPC producers
+  # lay out record batch bodies (Arrow mandates 8-byte minimum, 64-byte
+  # recommended buffer alignment). The `alignment` argument specifies the
+  # boundary to which the data buffer is aligned relative to the start of the
+  # body.
+  defp with_padded_validity_bitmap(
+         {data, [{_voff, _vlen} | data_specs]},
+         n,
+         null_indices,
+         alignment
+       ) do
+    bitmap_bytes = div(n + 7, 8)
+
+    bitmap =
+      for byte_idx <- 0..(bitmap_bytes - 1), into: <<>> do
+        byte =
+          Enum.reduce(0..7, 0, fn bit_idx, acc ->
+            row = byte_idx * 8 + bit_idx
+
+            if row < n and not MapSet.member?(null_indices, row) do
+              acc ||| 1 <<< bit_idx
+            else
+              acc
+            end
+          end)
+
+        <<byte::8>>
+      end
+
+    rem_bytes = rem(bitmap_bytes, alignment)
+    pad = if rem_bytes == 0, do: 0, else: alignment - rem_bytes
+    prefix = bitmap <> :binary.copy(<<0>>, pad)
+    prefix_size = byte_size(prefix)
+
+    shifted_specs =
+      Enum.map(data_specs, fn {off, len} -> {off + prefix_size, len} end)
+
+    body = prefix <> data
+    {body, [{0, bitmap_bytes} | shifted_specs]}
+  end
+
   # Shift all buffer offsets by delta bytes (pack multiple columns into one body).
   defp shift_specs(specs, delta) do
     Enum.map(specs, fn {off, len} -> {off + delta, len} end)
@@ -1103,6 +1145,73 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
       assert Enum.all?(rows, fn r -> r["n"] == nil end)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Tests: decode_flight_data/1 — validity bitmap with buffer alignment padding
+  #
+  # Regression coverage for issue #1: Arrow IPC aligns each buffer on an 8- or
+  # 64-byte boundary inside the record batch body, so the validity buffer's
+  # offset must be read from the RecordBatch metadata — it cannot be derived
+  # from the data buffer offset by subtracting the validity length.
+  # ---------------------------------------------------------------------------
+
+  describe "decode_flight_data/1 — validity bitmap with alignment padding" do
+    test "decodes Int64 COUNT(*) result when validity buffer is 64-byte aligned" do
+      schema = schema_fd([{"n", 2, [bit_width: 64, is_signed: true]}])
+      {body, specs} = int64_column([547_808])
+
+      {body, specs} =
+        with_padded_validity_bitmap({body, specs}, 1, MapSet.new([]), 64)
+
+      batch = batch_fd(body, specs, 1)
+
+      assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
+      assert row["n"] == 547_808
+    end
+
+    test "marks null Int64 value with 64-byte alignment padding" do
+      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
+      {body, specs} = int64_column([10, 99, 30])
+
+      {body, specs} =
+        with_padded_validity_bitmap({body, specs}, 3, MapSet.new([1]), 64)
+
+      batch = batch_fd(body, specs, 3)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.at(rows, 0)["v"] == 10
+      assert Enum.at(rows, 1)["v"] == nil
+      assert Enum.at(rows, 2)["v"] == 30
+    end
+
+    test "decodes Float64 values with 64-byte alignment padding" do
+      schema = schema_fd([{"f", 3, [precision: 2]}])
+      {body, specs} = float64_column([1.5, 2.5])
+
+      {body, specs} =
+        with_padded_validity_bitmap({body, specs}, 2, MapSet.new([]), 64)
+
+      batch = batch_fd(body, specs, 2)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert_in_delta Enum.at(rows, 0)["f"], 1.5, 1.0e-9
+      assert_in_delta Enum.at(rows, 1)["f"], 2.5, 1.0e-9
+    end
+
+    test "decodes Int64 values with 8-byte alignment padding" do
+      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
+      {body, specs} = int64_column([42, 7])
+
+      {body, specs} =
+        with_padded_validity_bitmap({body, specs}, 2, MapSet.new([]), 8)
+
+      batch = batch_fd(body, specs, 2)
+
+      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
+      assert Enum.at(rows, 0)["v"] == 42
+      assert Enum.at(rows, 1)["v"] == 7
     end
   end
 
