@@ -91,6 +91,7 @@ defmodule InfluxElixir.Client.Local do
   @type conn :: %{
           table: :ets.table(),
           databases: MapSet.t(binary()),
+          database: binary() | nil,
           profile: profile()
         }
 
@@ -145,9 +146,11 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec init_connection(keyword()) :: {:ok, conn()}
   def init_connection(config) do
-    databases = Keyword.get(config, :databases, [])
-    profile = Keyword.get(config, :profile, :v3_core)
-    start(databases: databases, profile: profile)
+    start(
+      database: Keyword.get(config, :database),
+      databases: Keyword.get(config, :databases, []),
+      profile: Keyword.get(config, :profile, :v3_core)
+    )
   end
 
   @impl true
@@ -163,6 +166,8 @@ defmodule InfluxElixir.Client.Local do
 
   ## Options
 
+    * `:database` - connection-level default database name. Used when the
+      caller does not pass `database:` in opts. Pre-created automatically.
     * `:databases` - list of database names to pre-create (default: `[]`)
     * `:profile` - InfluxDB version profile to emulate. Determines which
       operations are available. Operations outside the profile return
@@ -180,6 +185,10 @@ defmodule InfluxElixir.Client.Local do
       iex> {:ok, conn} = InfluxElixir.Client.Local.start(profile: :v2)
       iex> conn.profile
       :v2
+
+      iex> {:ok, conn} = InfluxElixir.Client.Local.start(database: "metrics")
+      iex> conn.database
+      "metrics"
   """
   @spec start(keyword()) :: {:ok, conn()}
   def start(opts \\ []) do
@@ -196,18 +205,28 @@ defmodule InfluxElixir.Client.Local do
     # A GenServer wrapper would be correct for production but adds latency
     # and complexity to a test-only client.
     table = :ets.new(:influx_local, [:set, :public])
-    # Always include "default" so writes without an explicit database: opt succeed.
+
+    # "default" is always pre-created so writes without an explicit
+    # database: opt succeed. The connection-level :database (if given)
+    # is also pre-created so it can be used as a query target.
+    database = Keyword.get(opts, :database)
+
     databases =
-      opts
-      |> Keyword.get(:databases, [])
-      |> then(&["default" | &1])
+      [Keyword.get(opts, :databases, []), List.wrap(database), ["default"]]
+      |> Enum.concat()
       |> MapSet.new()
 
     :ets.insert(table, {:databases, databases})
     :ets.insert(table, {:buckets, MapSet.new()})
     :ets.insert(table, {:tokens, []})
 
-    conn = %{table: table, databases: databases, profile: profile}
+    conn = %{
+      table: table,
+      databases: databases,
+      database: database,
+      profile: profile
+    }
+
     {:ok, conn}
   end
 
@@ -223,6 +242,13 @@ defmodule InfluxElixir.Client.Local do
           :ok | {:error, :unsupported_operation}
   defp require_capability(conn, operation) do
     if supports?(conn, operation), do: :ok, else: {:error, :unsupported_operation}
+  end
+
+  # Mirrors HTTP's resolve_database/2: prefer opts[:database], then the
+  # connection-level default, then "default" (which is always pre-created).
+  @spec resolve_database(keyword(), conn()) :: binary()
+  defp resolve_database(opts, conn) do
+    Keyword.get(opts, :database) || Map.get(conn, :database) || "default"
   end
 
   @doc """
@@ -258,7 +284,7 @@ defmodule InfluxElixir.Client.Local do
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(%{table: table, profile: profile} = conn, payload, opts \\ []) do
-    database = Keyword.get(opts, :database, "default")
+    database = resolve_database(opts, conn)
     precision = Keyword.get(opts, :precision, :nanosecond)
 
     with :ok <- require_capability(conn, :write),
@@ -292,7 +318,7 @@ defmodule InfluxElixir.Client.Local do
   def query_sql(%{table: table} = conn, sql, opts \\ []) do
     with :ok <- require_capability(conn, :query_sql) do
       params = Keyword.get(opts, :params, %{})
-      database = Keyword.get(opts, :database, "default")
+      database = resolve_database(opts, conn)
       resolved_sql = resolve_params(sql, params)
 
       case parse_select(resolved_sql) do
@@ -351,7 +377,7 @@ defmodule InfluxElixir.Client.Local do
           {:ok, map()} | {:error, term()}
   def execute_sql(%{table: table, profile: profile} = conn, sql, opts \\ []) do
     with :ok <- require_capability(conn, :execute_sql) do
-      database = Keyword.get(opts, :database, "default")
+      database = resolve_database(opts, conn)
       trimmed = String.trim(sql)
 
       case Regex.run(~r/^(?i)DELETE\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)$/s, trimmed) do
@@ -399,7 +425,7 @@ defmodule InfluxElixir.Client.Local do
 
   defp do_query_influxql(table, conn, influxql, opts) do
     trimmed = String.trim(influxql)
-    database = Keyword.get(opts, :database, "default")
+    database = resolve_database(opts, conn)
 
     cond do
       String.match?(trimmed, ~r/^(?i)SHOW\s+DATABASES\s*$/) ->

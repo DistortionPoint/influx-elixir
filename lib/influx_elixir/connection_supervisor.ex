@@ -24,7 +24,8 @@ defmodule InfluxElixir.ConnectionSupervisor do
     * `:name` - connection name (atom, required)
     * `:host` - InfluxDB host URL
     * `:token` - authentication token
-    * `:default_database` - default database for writes/queries
+    * `:database` - default database for writes/queries
+    * `:databases` - list of database names (see `InfluxElixir.Config`)
     * `:pool_size` - Finch connection pool size (default: 10)
   """
   @spec start_link(keyword()) :: Supervisor.on_start()

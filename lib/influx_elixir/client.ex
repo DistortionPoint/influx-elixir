@@ -31,6 +31,22 @@ defmodule InfluxElixir.Client do
     is removed. Called by `InfluxElixir.remove_connection/1`.
     - `Client.HTTP` is a no-op (Finch pool has its own supervisor)
     - `Client.Local` deletes the ETS table
+
+  ## Canonical Connection Config Schema
+
+  Every implementation must accept the same keys from `init_connection/1`
+  so a config is a drop-in replacement across implementations. See
+  `InfluxElixir.Config` for the canonical schema. Keys consumed by both
+  implementations:
+
+    * `:database` — connection-level default database name. When the
+      caller does not pass `database:` in opts, this value is used.
+    * `:databases` — list of database names. `Client.Local` pre-creates
+      each; `Client.HTTP` defaults `:database` to the first item when
+      `:database` is not set.
+    * `:profile` — `Client.Local` only; ignored by `Client.HTTP`.
+
+  Implementations must not silently ignore the singular `:database` key.
   """
 
   @type connection :: term()

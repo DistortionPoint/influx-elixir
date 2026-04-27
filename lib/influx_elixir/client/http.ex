@@ -37,7 +37,24 @@ defmodule InfluxElixir.Client.HTTP do
 
   @impl true
   @spec init_connection(keyword()) :: {:ok, keyword()}
-  def init_connection(config), do: {:ok, config}
+  def init_connection(config) do
+    # Mirror Client.Local: when :database (singular) is absent but
+    # :databases (list) is provided, default the connection-level
+    # database to the first item so resolve_database/2 picks it up.
+    case Keyword.get(config, :database) do
+      nil ->
+        case Keyword.get(config, :databases) do
+          [first | _rest] when is_binary(first) ->
+            {:ok, Keyword.put(config, :database, first)}
+
+          _other ->
+            {:ok, config}
+        end
+
+      _existing ->
+        {:ok, config}
+    end
+  end
 
   @impl true
   @spec shutdown_connection(keyword()) :: :ok

@@ -38,6 +38,44 @@ defmodule InfluxElixir.Client.HTTPTest do
   end
 
   # ---------------------------------------------------------------------------
+  # init_connection — :database resolution parity with Client.Local
+  #
+  # Regression coverage for issue #2: both impls must resolve the same default
+  # database for the same config so a config is a drop-in replacement.
+  # ---------------------------------------------------------------------------
+
+  describe "init_connection/1 — :database resolution" do
+    test "passes :database through unchanged" do
+      {:ok, conn} = HTTP.init_connection(host: "h", token: "t", database: "primary")
+      assert Keyword.get(conn, :database) == "primary"
+    end
+
+    test "defaults :database to first of :databases when singular missing" do
+      {:ok, conn} =
+        HTTP.init_connection(host: "h", token: "t", databases: ["a", "b"])
+
+      assert Keyword.get(conn, :database) == "a"
+    end
+
+    test "preserves :database when both keys are given" do
+      {:ok, conn} =
+        HTTP.init_connection(
+          host: "h",
+          token: "t",
+          database: "primary",
+          databases: ["a", "b"]
+        )
+
+      assert Keyword.get(conn, :database) == "primary"
+    end
+
+    test "leaves :database absent when neither key is given" do
+      {:ok, conn} = HTTP.init_connection(host: "h", token: "t")
+      assert Keyword.get(conn, :database) == nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Integration — requires a live InfluxDB v3 instance
   #
   # Set the following environment variables to run these tests:

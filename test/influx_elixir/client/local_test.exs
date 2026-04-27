@@ -52,6 +52,90 @@ defmodule InfluxElixir.Client.LocalTest do
       Local.stop(conn_a)
       Local.stop(conn_b)
     end
+
+    test "stores :database singular as connection-level default" do
+      {:ok, conn} = Local.start(database: "metrics")
+      assert conn.database == "metrics"
+      assert MapSet.member?(conn.databases, "metrics")
+      Local.stop(conn)
+    end
+
+    test ":database is nil when not specified" do
+      {:ok, conn} = Local.start(databases: ["x"])
+      assert conn.database == nil
+      Local.stop(conn)
+    end
+
+    test "pre-creates both :database and :databases when both are given" do
+      {:ok, conn} = Local.start(database: "primary", databases: ["a", "b"])
+      assert conn.database == "primary"
+      assert MapSet.member?(conn.databases, "primary")
+      assert MapSet.member?(conn.databases, "a")
+      assert MapSet.member?(conn.databases, "b")
+      Local.stop(conn)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Connection-level :database resolution
+  #
+  # Regression coverage for issue #2: Local previously ignored connection
+  # config's singular :database key. Both impls must resolve the same database
+  # for the same config, so a typo (e.g. :default_database) cannot silently
+  # pass tests against Local while breaking against HTTP.
+  # ---------------------------------------------------------------------------
+
+  describe "init_connection/1 — :database resolution parity" do
+    test "init_connection passes :database through to conn-level default" do
+      {:ok, conn} = Local.init_connection(database: "metrics")
+      assert conn.database == "metrics"
+      Local.stop(conn)
+    end
+
+    test "write uses connection-level :database when opts omits it" do
+      {:ok, conn} = Local.init_connection(database: "primary")
+      assert {:ok, :written} = Local.write(conn, "cpu value=1.0")
+
+      {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu")
+      assert row["value"] == 1.0
+
+      # Other databases don't see the write — still report no table
+      assert {:error, {:table_not_found, "cpu"}} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: "default")
+
+      Local.stop(conn)
+    end
+
+    test "opts :database still wins over connection-level default" do
+      {:ok, conn} = Local.init_connection(database: "primary", databases: ["other"])
+
+      assert {:ok, :written} =
+               Local.write(conn, "cpu value=1.0", database: "other")
+
+      assert {:error, {:table_not_found, "cpu"}} =
+               Local.query_sql(conn, "SELECT * FROM cpu")
+
+      assert {:ok, [_row]} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: "other")
+
+      Local.stop(conn)
+    end
+
+    test "falls back to \"default\" when neither opts nor conn specifies database" do
+      {:ok, conn} = Local.init_connection([])
+      assert {:ok, :written} = Local.write(conn, "cpu value=1.0")
+      {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu")
+      assert row["value"] == 1.0
+      Local.stop(conn)
+    end
+
+    test "init_connection ignores unknown keys without auto-pre-creating them" do
+      # A typo like :default_database must not silently become a database.
+      {:ok, conn} = Local.init_connection(default_database: "typo_db")
+      assert conn.database == nil
+      refute MapSet.member?(conn.databases, "typo_db")
+      Local.stop(conn)
+    end
   end
 
   # ---------------------------------------------------------------------------
