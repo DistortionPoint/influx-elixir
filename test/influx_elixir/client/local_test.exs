@@ -464,6 +464,75 @@ defmodule InfluxElixir.Client.LocalTest do
   end
 
   # ---------------------------------------------------------------------------
+  # query_sql/3 — multi-column projection (issue #3)
+  #
+  # Selecting specific columns instead of `*` must work for production-realistic
+  # SQL: SELECT a, b, time FROM x WHERE ... ORDER BY time DESC LIMIT 1.
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — multi-column projection" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "proj_db")
+
+      lp = """
+      account_balances,account_id=abc net_value=100.0,total_balance=120.0 1000
+      account_balances,account_id=abc net_value=110.0,total_balance=130.0 2000
+      account_balances,account_id=xyz net_value=50.0,total_balance=55.0 3000
+      """
+
+      Local.write(conn, String.trim(lp), database: "proj_db", precision: :nanosecond)
+      {:ok, db: "proj_db"}
+    end
+
+    test "selects specific columns by name", %{conn: conn, db: db} do
+      sql = "SELECT net_value, total_balance, time FROM account_balances"
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      assert length(rows) == 3
+
+      Enum.each(rows, fn row ->
+        assert Map.keys(row) |> Enum.sort() ==
+                 ["net_value", "time", "total_balance"]
+      end)
+    end
+
+    test "respects WHERE, ORDER BY, LIMIT (issue #3 reproduction)",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT net_value, total_balance, time
+      FROM account_balances
+      WHERE account_id = 'abc'
+      ORDER BY time DESC
+      LIMIT 1
+      """
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["net_value"] == 110.0
+      assert row["total_balance"] == 130.0
+      assert is_binary(row["time"])
+    end
+
+    test "supports AS aliases on projection columns", %{conn: conn, db: db} do
+      sql =
+        "SELECT net_value AS nv, total_balance AS tb FROM account_balances WHERE account_id = 'xyz'"
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert Map.keys(row) |> Enum.sort() == ["nv", "tb"]
+      assert row["nv"] == 50.0
+      assert row["tb"] == 55.0
+    end
+
+    test "selecting a tag column returns the tag value",
+         %{conn: conn, db: db} do
+      sql = "SELECT account_id, net_value FROM account_balances WHERE account_id = 'xyz'"
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["account_id"] == "xyz"
+      assert row["net_value"] == 50.0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # query_sql/3 — parameterised queries
   # ---------------------------------------------------------------------------
 
@@ -1549,17 +1618,55 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["total"] == 210
     end
 
-    test "missing GROUP BY returns error", %{conn: conn, db: db} do
+    test "scalar aggregate without GROUP BY DATE_BIN returns one row",
+         %{conn: conn, db: db} do
       sql = """
       SELECT
         AVG(usage) AS avg_usage
       FROM "cpu"
       """
 
-      assert {:error, %{status: 400, body: body}} =
-               Local.query_sql(conn, sql, database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert is_float(row["avg_usage"])
+    end
 
-      assert body =~ "GROUP BY"
+    test "scalar aggregate honours WHERE filtering", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        SUM(usage) AS total_usage,
+        COUNT(usage) AS row_count
+      FROM "cpu"
+      WHERE host = 'web01'
+      """
+
+      # web01 has usage values 10, 20, 30 → total 60, count 3
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["total_usage"] == 60
+      assert row["row_count"] == 3
+    end
+
+    test "scalar COUNT returns 0 when no rows match", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        COUNT(usage) AS row_count
+      FROM "cpu"
+      WHERE host = 'no_such_host'
+      """
+
+      assert {:ok, [%{"row_count" => 0}]} =
+               Local.query_sql(conn, sql, database: db)
+    end
+
+    test "scalar AVG returns nil when no rows match", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        AVG(usage) AS avg_usage
+      FROM "cpu"
+      WHERE host = 'no_such_host'
+      """
+
+      assert {:ok, [%{"avg_usage" => nil}]} =
+               Local.query_sql(conn, sql, database: db)
     end
 
     test "invalid interval unit returns error", %{conn: conn, db: db} do

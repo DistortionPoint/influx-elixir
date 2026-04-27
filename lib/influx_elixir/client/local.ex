@@ -56,6 +56,8 @@ defmodule InfluxElixir.Client.Local do
   `query_sql/3` understands a subset of SQL:
 
     * `SELECT * FROM measurement`
+    * `SELECT col1, col2 [, ...] FROM measurement` with optional `AS alias`
+      (projects fields and tags; `time` is selectable)
     * `WHERE tag = 'value'` or `WHERE field > N` (supports AND)
     * `ORDER BY time ASC|DESC`
     * `LIMIT N`
@@ -63,7 +65,9 @@ defmodule InfluxElixir.Client.Local do
     * `DATE_BIN(INTERVAL 'N unit', time)` time bucketing
     * Aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`
     * Ordered aggregates: `first(field, time)`, `last(field, time)`
-    * `GROUP BY DATE_BIN(INTERVAL 'N unit', time)`
+    * `GROUP BY DATE_BIN(INTERVAL 'N unit', time)` — optional. When omitted,
+      aggregate queries return a single scalar row (`COUNT` over an empty
+      result set is `0`; other aggregates return `nil`).
     * Interval units: `seconds`, `minutes`, `hours`, `days`
 
   ## Gzip Decompression
@@ -1117,7 +1121,8 @@ defmodule InfluxElixir.Client.Local do
           limit: pos_integer() | nil,
           group_by_interval: pos_integer() | nil,
           select_columns: [select_column()] | nil,
-          distinct_column: binary() | nil
+          distinct_column: binary() | nil,
+          projection_columns: [{binary(), binary()}] | nil
         }
 
   # Aggregate function names recognised by the parser.
@@ -1130,13 +1135,19 @@ defmodule InfluxElixir.Client.Local do
     cond do
       distinct_query?(normalised) -> parse_distinct_select(normalised)
       aggregate_query?(normalised) -> parse_aggregate_select(normalised)
-      true -> parse_star_select(normalised)
+      star_query?(normalised) -> parse_star_select(normalised)
+      true -> parse_columns_select(normalised)
     end
   end
 
   @spec distinct_query?(binary()) :: boolean()
   defp distinct_query?(sql) do
     String.match?(sql, ~r/(?i)^\s*SELECT\s+DISTINCT\s+/)
+  end
+
+  @spec star_query?(binary()) :: boolean()
+  defp star_query?(sql) do
+    String.match?(sql, ~r/(?i)^\s*SELECT\s+\*\s+FROM\s/)
   end
 
   @spec aggregate_query?(binary()) :: boolean()
@@ -1152,7 +1163,7 @@ defmodule InfluxElixir.Client.Local do
   defp parse_aggregate_select(sql) do
     with {:ok, columns} <- parse_select_columns(sql),
          {:ok, measurement} <- parse_aggregate_from(sql),
-         {:ok, interval_ns} <- parse_group_by_interval(sql) do
+         {:ok, interval_ns} <- resolve_aggregate_interval(sql) do
       rest = extract_after_from(sql)
 
       {:ok,
@@ -1163,8 +1174,22 @@ defmodule InfluxElixir.Client.Local do
          limit: parse_limit(rest),
          group_by_interval: interval_ns,
          select_columns: columns,
-         distinct_column: nil
+         distinct_column: nil,
+         projection_columns: nil
        }}
+    end
+  end
+
+  # GROUP BY DATE_BIN is optional. Without the clause, return nil so the
+  # executor produces a single scalar row. With the clause, propagate any
+  # interval-parsing error so malformed intervals still surface.
+  @spec resolve_aggregate_interval(binary()) ::
+          {:ok, pos_integer() | nil} | {:error, term()}
+  defp resolve_aggregate_interval(sql) do
+    if String.match?(sql, ~r/(?i)GROUP\s+BY\s+DATE_BIN/) do
+      parse_group_by_interval(sql)
+    else
+      {:ok, nil}
     end
   end
 
@@ -1374,7 +1399,8 @@ defmodule InfluxElixir.Client.Local do
            limit: parse_limit(rest),
            group_by_interval: nil,
            select_columns: nil,
-           distinct_column: column
+           distinct_column: column,
+           projection_columns: nil
          }}
 
       [_full, column, "", unquoted, rest] ->
@@ -1386,7 +1412,8 @@ defmodule InfluxElixir.Client.Local do
            limit: parse_limit(rest),
            group_by_interval: nil,
            select_columns: nil,
-           distinct_column: column
+           distinct_column: column,
+           projection_columns: nil
          }}
 
       _no_match ->
@@ -1420,8 +1447,78 @@ defmodule InfluxElixir.Client.Local do
       limit: parse_limit(rest),
       group_by_interval: nil,
       select_columns: nil,
-      distinct_column: nil
+      distinct_column: nil,
+      projection_columns: nil
     }
+  end
+
+  @columns_select_pattern ~r/(?i)SELECT\s+(.+?)\s+FROM\s+(?:"([^"]+)"|((?:[^\s\\]|\\.)+))(.*)/s
+
+  @spec parse_columns_select(binary()) ::
+          {:ok, parsed_query()} | {:error, term()}
+  defp parse_columns_select(sql) do
+    case Regex.run(@columns_select_pattern, sql) do
+      [_full, columns_str, quoted, "", rest] when quoted != "" ->
+        build_columns_query(columns_str, quoted, rest, sql)
+
+      [_full, columns_str, "", unquoted, rest] ->
+        build_columns_query(columns_str, unescape_measurement(unquoted), rest, sql)
+
+      [_full, columns_str, quoted, rest] when quoted != "" ->
+        build_columns_query(columns_str, quoted, rest, sql)
+
+      _no_match ->
+        {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
+    end
+  end
+
+  @spec build_columns_query(binary(), binary(), binary(), binary()) ::
+          {:ok, parsed_query()} | {:error, term()}
+  defp build_columns_query(columns_str, measurement, rest, sql) do
+    case parse_projection_columns(columns_str) do
+      {:ok, projection} ->
+        {:ok,
+         %{
+           measurement: measurement,
+           where: parse_where(rest),
+           order_by: parse_order_by(rest),
+           limit: parse_limit(rest),
+           group_by_interval: nil,
+           select_columns: nil,
+           distinct_column: nil,
+           projection_columns: projection
+         }}
+
+      {:error, _reason} ->
+        {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
+    end
+  end
+
+  @spec parse_projection_columns(binary()) ::
+          {:ok, [{binary(), binary()}]} | {:error, term()}
+  defp parse_projection_columns(columns_str) do
+    columns =
+      columns_str
+      |> split_top_level_commas()
+      |> Enum.map(&String.trim/1)
+      |> Enum.map(&parse_projection_column/1)
+
+    if Enum.any?(columns, &match?({:error, _}, &1)) do
+      Enum.find(columns, &match?({:error, _}, &1))
+    else
+      {:ok, Enum.map(columns, fn {:ok, col} -> col end)}
+    end
+  end
+
+  # Parse `name` or `name AS alias`, returning `{source, output}`.
+  @spec parse_projection_column(binary()) ::
+          {:ok, {binary(), binary()}} | {:error, term()}
+  defp parse_projection_column(col) do
+    case Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/i, String.trim(col)) do
+      [_full, name] -> {:ok, {name, name}}
+      [_full, name, alias_name] -> {:ok, {name, alias_name}}
+      _no_match -> {:error, %{status: 400, body: "unsupported column: #{col}"}}
+    end
   end
 
   @spec parse_where(binary()) :: [{atom(), binary(), term()}]
@@ -1537,6 +1634,13 @@ defmodule InfluxElixir.Client.Local do
         query.select_columns ->
           execute_aggregate_query(filtered, query)
 
+        query.projection_columns ->
+          filtered
+          |> apply_order_by(query.order_by)
+          |> apply_limit(query.limit)
+          |> Enum.map(&point_to_row/1)
+          |> Enum.map(&project_row(&1, query.projection_columns))
+
         true ->
           filtered
           |> apply_order_by(query.order_by)
@@ -1546,6 +1650,13 @@ defmodule InfluxElixir.Client.Local do
     else
       {:error, {:table_not_found, m}}
     end
+  end
+
+  @spec project_row(map(), [{binary(), binary()}]) :: map()
+  defp project_row(row, projection) do
+    Enum.reduce(projection, %{}, fn {source, output}, acc ->
+      Map.put(acc, output, Map.get(row, source))
+    end)
   end
 
   @spec execute_distinct_query([point_map()], parsed_query()) :: [map()]
@@ -1569,6 +1680,12 @@ defmodule InfluxElixir.Client.Local do
   end
 
   @spec execute_aggregate_query([point_map()], parsed_query()) :: [map()]
+  defp execute_aggregate_query(points, %{group_by_interval: nil} = query) do
+    # Scalar aggregate: all filtered points form a single bucket. Always
+    # produce one row, even when no points matched (so COUNT returns 0).
+    [aggregate_one_bucket(points, query.select_columns)]
+  end
+
   defp execute_aggregate_query(points, query) do
     interval_ns = query.group_by_interval
 
@@ -1601,28 +1718,43 @@ defmodule InfluxElixir.Client.Local do
         ) :: [map()]
   defp aggregate_per_bucket(buckets, columns) do
     Enum.map(buckets, fn {bucket_ts, bucket_points} ->
-      Enum.reduce(columns, %{}, fn
-        {:time_bucket, alias_name}, row ->
-          Map.put(row, alias_name, nanoseconds_to_iso8601(bucket_ts))
+      reduce_aggregate_columns(columns, bucket_points, bucket_ts)
+    end)
+  end
 
-        {:aggregate, agg, field, alias_name}, row ->
-          values =
-            bucket_points
-            |> Enum.map(fn p -> Map.get(p.fields, field) end)
-            |> Enum.reject(&is_nil/1)
+  # Compute aggregates over a single (un-bucketed) set of points. Used for
+  # scalar aggregates (no GROUP BY DATE_BIN) — always yields exactly one row.
+  @spec aggregate_one_bucket([point_map()], [select_column()]) :: map()
+  defp aggregate_one_bucket(points, columns) do
+    reduce_aggregate_columns(columns, points, nil)
+  end
 
-          Map.put(row, alias_name, compute_aggregate(agg, values))
+  @spec reduce_aggregate_columns(
+          [select_column()],
+          [point_map()],
+          integer() | nil
+        ) :: map()
+  defp reduce_aggregate_columns(columns, points, bucket_ts) do
+    Enum.reduce(columns, %{}, fn
+      {:time_bucket, alias_name}, row ->
+        Map.put(row, alias_name, nanoseconds_to_iso8601(bucket_ts))
 
-        {:ordered_aggregate, agg, field, ordering, alias_name}, row ->
-          value =
-            compute_ordered_aggregate(agg, field, ordering, bucket_points)
+      {:aggregate, agg, field, alias_name}, row ->
+        values =
+          points
+          |> Enum.map(fn p -> Map.get(p.fields, field) end)
+          |> Enum.reject(&is_nil/1)
 
-          Map.put(row, alias_name, value)
-      end)
+        Map.put(row, alias_name, compute_aggregate(agg, values))
+
+      {:ordered_aggregate, agg, field, ordering, alias_name}, row ->
+        value = compute_ordered_aggregate(agg, field, ordering, points)
+        Map.put(row, alias_name, value)
     end)
   end
 
   @spec compute_aggregate(atom(), [number()]) :: number() | nil
+  defp compute_aggregate(:count, []), do: 0
   defp compute_aggregate(_agg, []), do: nil
   defp compute_aggregate(:avg, vals), do: Enum.sum(vals) / length(vals)
   defp compute_aggregate(:sum, vals), do: Enum.sum(vals)

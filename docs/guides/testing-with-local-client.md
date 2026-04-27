@@ -113,6 +113,26 @@ defmodule MyApp.SensorTest do
 end
 ```
 
+## Connection-Level Default Database
+
+Both `Client.HTTP` and `Client.Local` honour the `:database` config key
+as a connection-level default. When the caller doesn't pass `database:`
+in opts, this value is used:
+
+```elixir
+{:ok, conn} = Local.start(database: "myapp_test")
+
+# No explicit `database:` opt — uses "myapp_test"
+{:ok, :written} = Local.write(conn, "sensors temp=22.5")
+{:ok, rows} = Local.query_sql(conn, "SELECT * FROM sensors")
+```
+
+`:databases` (list) is also accepted by both implementations:
+`Client.Local` pre-creates each entry; `Client.HTTP` uses the first
+entry as the default when `:database` is not set. This makes a config
+like `database: "primary", databases: ["primary", "backup"]` a true
+drop-in across implementations.
+
 ## Profile Enforcement
 
 If you pick the wrong profile, operations fail the same way they would
@@ -246,10 +266,46 @@ Supported aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`.
 Ordered aggregates: `first(field, time)`, `last(field, time)` — for OHLCV candle queries.
 Supported interval units: `seconds`, `minutes`, `hours`, `days`.
 
+`GROUP BY DATE_BIN` is optional. When omitted, aggregate queries return a
+single scalar row over all matching points:
+
+```elixir
+sql = """
+SELECT AVG(net_value) AS average_balance
+FROM account_balances
+WHERE account_id = 'abc'
+"""
+
+{:ok, [%{"average_balance" => avg}]} = Local.query_sql(conn, sql, database: "test_db")
+```
+
+`COUNT` over zero matching rows returns `0`; other aggregates return `nil`,
+matching real InfluxDB SQL semantics.
+
+## Multi-Column Projection
+
+Specific columns can be projected by name (with optional `AS alias`):
+
+```elixir
+sql = """
+SELECT net_value, total_balance, time
+FROM account_balances
+WHERE account_id = 'abc'
+ORDER BY time DESC
+LIMIT 1
+"""
+
+{:ok, [row]} = Local.query_sql(conn, sql, database: "test_db")
+# => row has keys "net_value", "total_balance", "time" only
+```
+
+Both fields and tags are selectable. Aliasing renames the output key:
+`SELECT net_value AS nv FROM x` produces rows keyed by `"nv"`.
+
 ## Key Differences from Real InfluxDB
 
 - **No WAL flush delay**: Writes are immediately queryable (set `query_delay: 0`)
 - **In-memory only**: Data is lost when `stop/1` is called
-- **Simplified SQL parser**: Supports `SELECT *`, `WHERE`, `ORDER BY time`, `LIMIT`, `DATE_BIN` + aggregate functions (`AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `first`, `last`) with `GROUP BY`
+- **Simplified SQL parser**: Supports `SELECT *`, multi-column projection (with optional `AS alias`), `WHERE`, `ORDER BY time`, `LIMIT`, `DATE_BIN` + aggregate functions (`AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `first`, `last`) with optional `GROUP BY DATE_BIN`
 - **No authentication**: All operations succeed regardless of token
 - **ETS-based**: Each `start/1` creates an isolated ETS table
