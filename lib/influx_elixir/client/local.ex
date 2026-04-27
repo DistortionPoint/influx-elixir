@@ -72,7 +72,17 @@ defmodule InfluxElixir.Client.Local do
     * `GROUP BY DATE_BIN(INTERVAL 'N unit', time)` — optional. When omitted,
       aggregate queries return a single scalar row (`COUNT` over an empty
       result set is `0`; other aggregates return `nil`).
+    * `GROUP BY <col>[, <col>...]` — bucket points by tag/field values.
+      Bare column names (with optional `AS alias`) are also valid in the
+      `SELECT` list alongside aggregate functions.
     * Interval units: `seconds`, `minutes`, `hours`, `days`
+
+  ## SQL Param Types
+
+  `params:` values are serialised to SQL literals before query execution.
+  Supported types: `binary`, `integer`, `float`, `boolean`, and `Decimal`
+  (when the optional `:decimal` dependency is loaded — `Decimal` values
+  are emitted as bare numeric literals via `Decimal.to_string(:normal)`).
 
   ## Gzip Decompression
 
@@ -1117,6 +1127,7 @@ defmodule InfluxElixir.Client.Local do
           {:time_bucket, binary()}
           | {:aggregate, :avg | :sum | :count | :min | :max, binary(), binary()}
           | {:ordered_aggregate, :first | :last, binary(), binary(), binary()}
+          | {:grouping_column, binary(), binary()}
 
   @type where_op :: :eq | :gt | :lt | :gte | :lte | :ne | :in | :not_in
   @type where_clause :: {where_op(), binary(), term()}
@@ -1127,6 +1138,7 @@ defmodule InfluxElixir.Client.Local do
           order_by: {:time, :asc | :desc} | nil,
           limit: pos_integer() | nil,
           group_by_interval: pos_integer() | nil,
+          group_by_columns: [binary()] | nil,
           select_columns: [select_column()] | nil,
           distinct_column: binary() | nil,
           projection_columns: [{binary(), binary()}] | nil
@@ -1180,10 +1192,39 @@ defmodule InfluxElixir.Client.Local do
          order_by: parse_order_by(rest),
          limit: parse_limit(rest),
          group_by_interval: interval_ns,
+         group_by_columns: parse_group_by_columns(sql),
          select_columns: columns,
          distinct_column: nil,
          projection_columns: nil
        }}
+    end
+  end
+
+  # Extract the bare-column GROUP BY list, e.g. "GROUP BY ticker, holding_type".
+  # Returns nil when no GROUP BY exists or when the clause is DATE_BIN(...)
+  # (handled separately by resolve_aggregate_interval).
+  @spec parse_group_by_columns(binary()) :: [binary()] | nil
+  defp parse_group_by_columns(sql) do
+    case Regex.run(
+           ~r/(?i)GROUP\s+BY\s+(.+?)(?:\s+ORDER|\s+LIMIT|$)/s,
+           sql
+         ) do
+      [_full, columns_str] ->
+        if String.match?(columns_str, ~r/^\s*DATE_BIN\s*\(/i) do
+          nil
+        else
+          columns_str
+          |> split_top_level_commas()
+          |> Enum.map(&String.trim/1)
+          |> Enum.reject(&(&1 == ""))
+          |> case do
+            [] -> nil
+            cols -> cols
+          end
+        end
+
+      _no_match ->
+        nil
     end
   end
 
@@ -1284,8 +1325,22 @@ defmodule InfluxElixir.Client.Local do
       String.match?(col, ~r/(?i)(AVG|SUM|COUNT|MIN|MAX|FIRST|LAST)\s*\(/) ->
         parse_agg_column(col)
 
+      String.match?(col, ~r/^\s*\w+(\s+AS\s+\w+)?\s*$/i) ->
+        parse_grouping_column(col)
+
       true ->
         {:error, %{status: 400, body: "unsupported column expression: #{col}"}}
+    end
+  end
+
+  # Parse a bare grouping column: `name` or `name AS alias`.
+  @spec parse_grouping_column(binary()) ::
+          {:ok, select_column()} | {:error, term()}
+  defp parse_grouping_column(col) do
+    case Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/i, String.trim(col)) do
+      [_full, name] -> {:ok, {:grouping_column, name, name}}
+      [_full, name, alias_name] -> {:ok, {:grouping_column, name, alias_name}}
+      _no_match -> {:error, %{status: 400, body: "invalid column: #{col}"}}
     end
   end
 
@@ -1405,6 +1460,7 @@ defmodule InfluxElixir.Client.Local do
            order_by: nil,
            limit: parse_limit(rest),
            group_by_interval: nil,
+           group_by_columns: nil,
            select_columns: nil,
            distinct_column: column,
            projection_columns: nil
@@ -1418,6 +1474,7 @@ defmodule InfluxElixir.Client.Local do
            order_by: nil,
            limit: parse_limit(rest),
            group_by_interval: nil,
+           group_by_columns: nil,
            select_columns: nil,
            distinct_column: column,
            projection_columns: nil
@@ -1453,6 +1510,7 @@ defmodule InfluxElixir.Client.Local do
       order_by: parse_order_by(rest),
       limit: parse_limit(rest),
       group_by_interval: nil,
+      group_by_columns: nil,
       select_columns: nil,
       distinct_column: nil,
       projection_columns: nil
@@ -1491,6 +1549,7 @@ defmodule InfluxElixir.Client.Local do
            order_by: parse_order_by(rest),
            limit: parse_limit(rest),
            group_by_interval: nil,
+           group_by_columns: nil,
            select_columns: nil,
            distinct_column: nil,
            projection_columns: projection
@@ -1604,10 +1663,10 @@ defmodule InfluxElixir.Client.Local do
   defp parse_where_value(str) do
     cond do
       String.starts_with?(str, "'") and String.ends_with?(str, "'") ->
-        String.slice(str, 1..-2//1)
+        coerce_value(String.slice(str, 1..-2//1))
 
       String.starts_with?(str, "\"") and String.ends_with?(str, "\"") ->
-        String.slice(str, 1..-2//1)
+        coerce_value(String.slice(str, 1..-2//1))
 
       str == "true" ->
         true
@@ -1616,15 +1675,24 @@ defmodule InfluxElixir.Client.Local do
         false
 
       true ->
-        case Integer.parse(str) do
-          {n, ""} ->
-            n
+        coerce_value(str)
+    end
+  end
 
-          _no_int ->
-            case Float.parse(str) do
-              {f, ""} -> f
-              _no_parse -> str
-            end
+  # Coerce a bare or quote-stripped value: try integer, then float, else
+  # leave as string. Quoting alone shouldn't trap a numeric literal as a
+  # string — that would silently turn `amount >= '1000.00'` into a string
+  # comparison via Elixir term ordering.
+  @spec coerce_value(binary()) :: term()
+  defp coerce_value(str) do
+    case Integer.parse(str) do
+      {n, ""} ->
+        n
+
+      _no_int ->
+        case Float.parse(str) do
+          {f, ""} -> f
+          _no_parse -> str
         end
     end
   end
@@ -1718,6 +1786,16 @@ defmodule InfluxElixir.Client.Local do
   end
 
   @spec execute_aggregate_query([point_map()], parsed_query()) :: [map()]
+  defp execute_aggregate_query(points, %{group_by_columns: cols} = query)
+       when is_list(cols) and cols != [] do
+    # GROUP BY <col, ...>: bucket points by the tuple of grouping-column
+    # values (mirroring how real InfluxDB v3 partitions by tags/fields).
+    points
+    |> bucket_by_columns(cols)
+    |> aggregate_per_column_bucket(query.select_columns)
+    |> apply_limit(query.limit)
+  end
+
   defp execute_aggregate_query(points, %{group_by_interval: nil} = query) do
     # Scalar aggregate: all filtered points form a single bucket. Always
     # produce one row, even when no points matched (so COUNT returns 0).
@@ -1734,6 +1812,27 @@ defmodule InfluxElixir.Client.Local do
     |> aggregate_per_bucket(query.select_columns)
     |> apply_order_by_rows(query.order_by, time_alias)
     |> apply_limit(query.limit)
+  end
+
+  # Group points by the tuple of values for the GROUP BY columns. Each
+  # column is resolved against tags first, then fields.
+  @spec bucket_by_columns([point_map()], [binary()]) :: %{[term()] => [point_map()]}
+  defp bucket_by_columns(points, columns) do
+    Enum.group_by(points, fn point ->
+      Enum.map(columns, fn col ->
+        Map.get(point.tags, col) || Map.get(point.fields, col)
+      end)
+    end)
+  end
+
+  @spec aggregate_per_column_bucket(
+          %{[term()] => [point_map()]},
+          [select_column()]
+        ) :: [map()]
+  defp aggregate_per_column_bucket(buckets, columns) do
+    Enum.map(buckets, fn {_key, bucket_points} ->
+      reduce_aggregate_columns(columns, bucket_points, nil)
+    end)
   end
 
   # Group points into buckets by flooring timestamp to interval boundary
@@ -1776,6 +1875,20 @@ defmodule InfluxElixir.Client.Local do
     Enum.reduce(columns, %{}, fn
       {:time_bucket, alias_name}, row ->
         Map.put(row, alias_name, nanoseconds_to_iso8601(bucket_ts))
+
+      {:grouping_column, source, alias_name}, row ->
+        # All points in a column-grouped bucket share the same value for
+        # this column; sample from the first point.
+        value =
+          case points do
+            [first | _rest] ->
+              Map.get(first.tags, source) || Map.get(first.fields, source)
+
+            [] ->
+              nil
+          end
+
+        Map.put(row, alias_name, value)
 
       {:aggregate, agg, field, alias_name}, row ->
         values =
@@ -2084,6 +2197,7 @@ defmodule InfluxElixir.Client.Local do
   defp normalize_param_key(key) when is_binary(key), do: "$#{key}"
 
   @spec to_sql_literal(term()) :: binary()
+  defp to_sql_literal(%Decimal{} = value), do: Decimal.to_string(value, :normal)
   defp to_sql_literal(value) when is_binary(value), do: "'#{value}'"
   defp to_sql_literal(value) when is_integer(value), do: Integer.to_string(value)
   defp to_sql_literal(value) when is_float(value), do: Float.to_string(value)

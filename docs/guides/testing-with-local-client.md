@@ -282,6 +282,39 @@ WHERE account_id = 'abc'
 `COUNT` over zero matching rows returns `0`; other aggregates return `nil`,
 matching real InfluxDB SQL semantics.
 
+## GROUP BY Tag/Field Columns
+
+`GROUP BY` on bare tag/field columns is supported alongside `DATE_BIN`
+time bucketing. The grouping columns can also appear in the `SELECT`
+list (with optional `AS alias`):
+
+```elixir
+sql = """
+SELECT ticker, AVG(value) AS average_balance, holding_type
+FROM account_holdings
+WHERE account_id = 'abc'
+GROUP BY ticker, holding_type
+"""
+
+{:ok, rows} = Local.query_sql(conn, sql, database: "test_db")
+# => one row per unique (ticker, holding_type) pair
+```
+
+## Decimal Params
+
+`Decimal` values pass through `params:` as bare numeric literals — no
+quoting, so `WHERE amount >= $min` performs a numeric comparison even
+when `$min` is a `%Decimal{}`:
+
+```elixir
+params = %{"$min" => Decimal.new("1000.00")}
+{:ok, rows} = Local.query_sql(conn, sql, database: "test_db", params: params)
+```
+
+Pre-stringified numeric values (`"1000.00"`) are also coerced back to
+numbers before comparison, so callers using `Decimal.to_string/1` for
+serialisation aren't penalised with silent string-vs-float comparisons.
+
 ## Multi-Column Projection
 
 Specific columns can be projected by name (with optional `AS alias`):

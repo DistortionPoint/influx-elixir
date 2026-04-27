@@ -1073,6 +1073,153 @@ defmodule InfluxElixir.Client.LocalTest do
   end
 
   # ---------------------------------------------------------------------------
+  # query_sql/3 — non-time GROUP BY (issue #6)
+  #
+  # Real InfluxDB v3 SQL allows GROUP BY on tag/field columns alongside
+  # aggregates. LocalClient must match so that production-realistic
+  # group-and-aggregate queries can be tested.
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — GROUP BY column" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "group_db")
+
+      lines =
+        Enum.join(
+          [
+            "account_holdings,ticker=AAPL,holding_type=stock,account_id=abc value=100.0 1000",
+            "account_holdings,ticker=AAPL,holding_type=stock,account_id=abc value=200.0 2000",
+            "account_holdings,ticker=GOOG,holding_type=stock,account_id=abc value=300.0 3000",
+            "account_holdings,ticker=AAPL,holding_type=etf,account_id=abc value=50.0 4000"
+          ],
+          "\n"
+        )
+
+      Local.write(conn, lines, database: "group_db", precision: :nanosecond)
+      {:ok, db: "group_db"}
+    end
+
+    test "single column GROUP BY emits one row per unique value",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT ticker, AVG(value) AS avg_value
+      FROM account_holdings
+      WHERE account_id = 'abc'
+      GROUP BY ticker
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      by_ticker = rows |> Enum.map(&{&1["ticker"], &1["avg_value"]}) |> Map.new()
+
+      # AAPL: (100 + 200 + 50) / 3 = 116.666...
+      assert_in_delta by_ticker["AAPL"], 350.0 / 3, 1.0e-9
+      assert by_ticker["GOOG"] == 300.0
+    end
+
+    test "multi-column GROUP BY uses tuple of values (issue #6 reproduction)",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT ticker, AVG(value) AS average_balance, holding_type
+      FROM account_holdings
+      WHERE account_id = 'abc'
+      GROUP BY ticker, holding_type
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+
+      groups =
+        rows
+        |> Enum.map(fn row ->
+          {{row["ticker"], row["holding_type"]}, row["average_balance"]}
+        end)
+        |> Map.new()
+
+      assert groups[{"AAPL", "stock"}] == 150.0
+      assert groups[{"GOOG", "stock"}] == 300.0
+      assert groups[{"AAPL", "etf"}] == 50.0
+    end
+
+    test "GROUP BY supports AS alias on grouping columns",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT ticker AS sym, COUNT(value) AS n
+      FROM account_holdings
+      GROUP BY ticker
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      counts = rows |> Enum.map(&{&1["sym"], &1["n"]}) |> Map.new()
+      assert counts["AAPL"] == 3
+      assert counts["GOOG"] == 1
+    end
+
+    test "GROUP BY with no matching rows yields no rows",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT ticker, COUNT(value) AS n
+      FROM account_holdings
+      WHERE account_id = 'no_such'
+      GROUP BY ticker
+      """
+
+      assert {:ok, []} = Local.query_sql(conn, sql, database: db)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — Decimal SQL params (issue #7)
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — Decimal params" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "dec_db")
+
+      lines =
+        Enum.join(
+          [
+            "cash_flows,account_id=abc amount=500.0 1000",
+            "cash_flows,account_id=abc amount=5000.0 2000",
+            "cash_flows,account_id=abc amount=12000.0 3000"
+          ],
+          "\n"
+        )
+
+      Local.write(conn, lines, database: "dec_db", precision: :nanosecond)
+      {:ok, db: "dec_db"}
+    end
+
+    test "Decimal param serialises as numeric literal (issue #7 reproduction)",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT amount FROM cash_flows
+      WHERE account_id = $a AND amount >= $min
+      """
+
+      params = %{"$a" => "abc", "$min" => Decimal.new("1000.00")}
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db, params: params)
+      amounts = rows |> Enum.map(& &1["amount"]) |> Enum.sort()
+      assert amounts == [5000.0, 12_000.0]
+    end
+
+    test "Decimal pre-stringified by caller still compares numerically",
+         %{conn: conn, db: db} do
+      # Some callers Decimal.to_string/1 their values before passing them.
+      # The quoted form must still parse as a number to avoid a silent
+      # string-vs-float comparison via Elixir term ordering.
+      sql = """
+      SELECT amount FROM cash_flows
+      WHERE amount >= $min
+      """
+
+      params = %{"$min" => "1000.00"}
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db, params: params)
+      assert length(rows) == 2
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # query_sql/3 — coverage for error/edge branches
   # ---------------------------------------------------------------------------
 
@@ -2104,11 +2251,11 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "aggregate column with unsupported expression returns error",
          %{conn: conn, db: db} do
-      # A column that is neither DATE_BIN nor a known aggregate function
+      # A function call that is not DATE_BIN nor a recognised aggregate
       sql = """
       SELECT
         DATE_BIN(INTERVAL '1 hour', time) AS time,
-        some_weird_expr AS alias
+        weird_func(temp) AS alias
       FROM sensors
       GROUP BY DATE_BIN(INTERVAL '1 hour', time)
       """

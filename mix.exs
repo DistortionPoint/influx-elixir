@@ -79,6 +79,10 @@ defmodule InfluxElixir.MixProject do
       {:grpc, "~> 0.11"},
       {:protobuf, "~> 0.12"},
 
+      # Optional — consumers passing %Decimal{} as SQL params get
+      # numeric serialisation. Consumers without Decimal are unaffected.
+      {:decimal, "~> 2.0", optional: true},
+
       # Dev/Test
       {:usage_rules, "~> 1.2", only: :dev},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false},
