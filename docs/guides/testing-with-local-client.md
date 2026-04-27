@@ -302,10 +302,41 @@ LIMIT 1
 Both fields and tags are selectable. Aliasing renames the output key:
 `SELECT net_value AS nv FROM x` produces rows keyed by `"nv"`.
 
+## IN / NOT IN Clauses
+
+`WHERE col IN (...)` and `WHERE col NOT IN (...)` are supported on tags
+and fields. Combine with binary operators via `AND`:
+
+```elixir
+sql = """
+SELECT * FROM holdings
+WHERE ticker IN ('AAPL', 'MSFT') AND shares > 5
+"""
+
+{:ok, rows} = Local.query_sql(conn, sql, database: "test_db")
+```
+
+`IN ()` (empty list) matches no rows; `NOT IN ()` matches all rows.
+
+## Time Filters with Bare Dates
+
+`WHERE time` accepts three formats: integer nanoseconds, full ISO-8601
+datetimes, and bare ISO dates (interpreted as midnight UTC):
+
+```elixir
+# All three are equivalent if your data is at exactly the day boundary:
+"WHERE time >= '2026-03-31'"
+"WHERE time >= '2026-03-31T00:00:00Z'"
+"WHERE time >= 1774915200000000000"
+```
+
+Unparseable date strings filter out all rows (fail-closed) instead of
+silently producing wrong results via Elixir term ordering.
+
 ## Key Differences from Real InfluxDB
 
 - **No WAL flush delay**: Writes are immediately queryable (set `query_delay: 0`)
 - **In-memory only**: Data is lost when `stop/1` is called
-- **Simplified SQL parser**: Supports `SELECT *`, multi-column projection (with optional `AS alias`), `WHERE`, `ORDER BY time`, `LIMIT`, `DATE_BIN` + aggregate functions (`AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `first`, `last`) with optional `GROUP BY DATE_BIN`
+- **Simplified SQL parser**: Supports `SELECT *`, multi-column projection (with optional `AS alias`), `WHERE` with binary ops + `IN` / `NOT IN`, `ORDER BY time`, `LIMIT`, `DATE_BIN` + aggregate functions (`AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `first`, `last`) with optional `GROUP BY DATE_BIN`
 - **No authentication**: All operations succeed regardless of token
 - **ETS-based**: Each `start/1` creates an isolated ETS table

@@ -921,6 +921,155 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert rows == []
     end
+
+    # Regression coverage for issue #4: bare ISO dates ("YYYY-MM-DD") must
+    # be parsed as midnight UTC. Previously they returned nil from
+    # to_nanoseconds and Elixir term ordering produced wrong-but-plausible
+    # results in compare/3 (e.g. `5 > nil` is `true`).
+    test "bare ISO date in WHERE includes points on or before midnight UTC",
+         %{conn: conn, db: db} do
+      # All three points are 2026-03-17. A WHERE time <= '2026-03-18'
+      # accepts all three; WHERE time <= '2026-03-17' accepts none
+      # (since midnight 03-17 is before all three timestamps).
+      {:ok, all_rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM prices WHERE time <= '2026-03-18'",
+          database: db
+        )
+
+      assert length(all_rows) == 3
+
+      {:ok, none_rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM prices WHERE time <= '2026-03-17'",
+          database: db
+        )
+
+      assert none_rows == []
+    end
+
+    test "bare ISO date range filters across day boundaries",
+         %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM prices WHERE time >= '2026-03-17' AND time <= '2026-03-18'",
+          database: db
+        )
+
+      assert length(rows) == 3
+    end
+
+    test "unparseable date string filters out all rows (no term-order leak)",
+         %{conn: conn, db: db} do
+      # Without the compare(_, _, nil) → false guard, term-ordering would
+      # silently make `actual > nil` true and return spurious rows.
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM prices WHERE time > 'totally garbage'",
+          database: db
+        )
+
+      assert rows == []
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # query_sql/3 — IN / NOT IN clauses (issue #5)
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — IN / NOT IN clauses" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "in_db")
+
+      lines =
+        Enum.join(
+          [
+            "holdings,ticker=AAPL,account=acct1 shares=10i 1000",
+            "holdings,ticker=GOOG,account=acct1 shares=5i 2000",
+            "holdings,ticker=MSFT,account=acct2 shares=20i 3000"
+          ],
+          "\n"
+        )
+
+      Local.write(conn, lines, database: "in_db", precision: :nanosecond)
+      {:ok, db: "in_db"}
+    end
+
+    test "IN with multiple tag values filters correctly",
+         %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM holdings WHERE ticker IN ('AAPL', 'MSFT')",
+          database: db
+        )
+
+      tickers = rows |> Enum.map(& &1["ticker"]) |> Enum.sort()
+      assert tickers == ["AAPL", "MSFT"]
+    end
+
+    test "IN with a single value matches one row", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM holdings WHERE ticker IN ('GOOG')",
+          database: db
+        )
+
+      assert length(rows) == 1
+      assert hd(rows)["ticker"] == "GOOG"
+    end
+
+    test "empty IN () matches no rows", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM holdings WHERE ticker IN ()",
+          database: db
+        )
+
+      assert rows == []
+    end
+
+    test "IN works on field columns", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM holdings WHERE shares IN (10, 20)",
+          database: db
+        )
+
+      tickers = rows |> Enum.map(& &1["ticker"]) |> Enum.sort()
+      assert tickers == ["AAPL", "MSFT"]
+    end
+
+    test "NOT IN excludes listed values", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM holdings WHERE ticker NOT IN ('AAPL', 'GOOG')",
+          database: db
+        )
+
+      assert length(rows) == 1
+      assert hd(rows)["ticker"] == "MSFT"
+    end
+
+    test "IN combines with binary operators via AND", %{conn: conn, db: db} do
+      {:ok, rows} =
+        Local.query_sql(
+          conn,
+          "SELECT * FROM holdings WHERE ticker IN ('AAPL', 'GOOG', 'MSFT') AND shares > 5",
+          database: db
+        )
+
+      tickers = rows |> Enum.map(& &1["ticker"]) |> Enum.sort()
+      assert tickers == ["AAPL", "MSFT"]
+    end
   end
 
   # ---------------------------------------------------------------------------

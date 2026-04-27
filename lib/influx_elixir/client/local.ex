@@ -59,6 +59,10 @@ defmodule InfluxElixir.Client.Local do
     * `SELECT col1, col2 [, ...] FROM measurement` with optional `AS alias`
       (projects fields and tags; `time` is selectable)
     * `WHERE tag = 'value'` or `WHERE field > N` (supports AND)
+    * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)`
+    * `WHERE time <op> '<datetime>'` accepts ISO-8601 datetimes
+      (`'2026-03-31T12:00:00Z'`), bare ISO dates (`'2026-03-31'`,
+      interpreted as midnight UTC), and integer-as-string nanoseconds
     * `ORDER BY time ASC|DESC`
     * `LIMIT N`
     * `$param` placeholders via `params: %{"$name" => value}` in opts
@@ -1114,9 +1118,12 @@ defmodule InfluxElixir.Client.Local do
           | {:aggregate, :avg | :sum | :count | :min | :max, binary(), binary()}
           | {:ordered_aggregate, :first | :last, binary(), binary(), binary()}
 
+  @type where_op :: :eq | :gt | :lt | :gte | :lte | :ne | :in | :not_in
+  @type where_clause :: {where_op(), binary(), term()}
+
   @type parsed_query :: %{
           measurement: binary(),
-          where: [{:eq | :gt | :lt | :gte | :lte | :ne, binary(), term()}],
+          where: [where_clause()],
           order_by: {:time, :asc | :desc} | nil,
           limit: pos_integer() | nil,
           group_by_interval: pos_integer() | nil,
@@ -1521,7 +1528,7 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec parse_where(binary()) :: [{atom(), binary(), term()}]
+  @spec parse_where(binary()) :: [where_clause()]
   defp parse_where(rest) do
     case Regex.run(~r/(?i)WHERE\s+(.+?)(?:\s+GROUP|\s+ORDER|\s+LIMIT|$)/s, rest) do
       [_full_match, clauses_str] -> parse_where_clauses(clauses_str)
@@ -1529,17 +1536,39 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec parse_where_clauses(binary()) :: [{atom(), binary(), term()}]
+  @spec parse_where_clauses(binary()) :: [where_clause()]
   defp parse_where_clauses(str) do
     str
     |> String.split(~r/\s+AND\s+/i)
     |> Enum.flat_map(&parse_single_where_clause/1)
   end
 
-  @spec parse_single_where_clause(binary()) :: [{atom(), binary(), term()}]
+  # IN / NOT IN must be matched before binary operators because they don't
+  # contain any of {=, <, >, !} characters that the binary-op scanner looks
+  # for. Order: NOT IN before IN (NOT IN substring contains IN).
+  @not_in_pattern ~r/^(\w+)\s+NOT\s+IN\s*\((.*)\)\s*$/is
+  @in_pattern ~r/^(\w+)\s+IN\s*\((.*)\)\s*$/is
+
+  @spec parse_single_where_clause(binary()) :: [where_clause()]
   defp parse_single_where_clause(clause) do
     trimmed = String.trim(clause)
 
+    cond do
+      match = Regex.run(@not_in_pattern, trimmed) ->
+        [_full, key, list_str] = match
+        [{:not_in, key, parse_in_values(list_str)}]
+
+      match = Regex.run(@in_pattern, trimmed) ->
+        [_full, key, list_str] = match
+        [{:in, key, parse_in_values(list_str)}]
+
+      true ->
+        parse_binary_where_clause(trimmed)
+    end
+  end
+
+  @spec parse_binary_where_clause(binary()) :: [where_clause()]
+  defp parse_binary_where_clause(trimmed) do
     # Multi-char operators must be tried before their single-char prefixes.
     operators = [{">=", :gte}, {"<=", :lte}, {"!=", :ne}, {">", :gt}, {"<", :lt}, {"=", :eq}]
 
@@ -1560,6 +1589,15 @@ defmodule InfluxElixir.Client.Local do
       nil -> []
       condition -> [condition]
     end
+  end
+
+  @spec parse_in_values(binary()) :: [term()]
+  defp parse_in_values(str) do
+    str
+    |> split_top_level_commas()
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.map(&parse_where_value/1)
   end
 
   @spec parse_where_value(binary()) :: term()
@@ -1813,7 +1851,7 @@ defmodule InfluxElixir.Client.Local do
     Enum.sort_by(rows, &Map.get(&1, time_alias), :desc)
   end
 
-  @spec apply_where([point_map()], [{atom(), binary(), term()}]) :: [point_map()]
+  @spec apply_where([point_map()], [where_clause()]) :: [point_map()]
   defp apply_where(points, []), do: points
 
   defp apply_where(points, conditions) do
@@ -1822,7 +1860,25 @@ defmodule InfluxElixir.Client.Local do
     end)
   end
 
-  @spec matches_condition?(point_map(), {atom(), binary(), term()}) :: boolean()
+  @spec matches_condition?(point_map(), where_clause()) :: boolean()
+  defp matches_condition?(point, {:in, "time", values}) do
+    point_in_time_set?(point, values)
+  end
+
+  defp matches_condition?(point, {:not_in, "time", values}) do
+    not point_in_time_set?(point, values)
+  end
+
+  defp matches_condition?(point, {:in, key, values}) do
+    actual = Map.get(point.tags, key) || Map.get(point.fields, key)
+    Enum.member?(values, actual)
+  end
+
+  defp matches_condition?(point, {:not_in, key, values}) do
+    actual = Map.get(point.tags, key) || Map.get(point.fields, key)
+    not Enum.member?(values, actual)
+  end
+
   defp matches_condition?(point, {op, "time", value}) do
     compare(point.timestamp, op, to_nanoseconds(value))
   end
@@ -1832,27 +1888,63 @@ defmodule InfluxElixir.Client.Local do
     compare(actual, op, value)
   end
 
+  @spec point_in_time_set?(point_map(), [term()]) :: boolean()
+  defp point_in_time_set?(point, values) do
+    ts = point.timestamp
+    Enum.any?(values, fn v -> ts == to_nanoseconds(v) end)
+  end
+
   # Convert various time representations to nanosecond integers.
+  # Accepts: integer ns, ISO-8601 datetime ("2026-03-31T12:00:00Z"),
+  # bare ISO date ("2026-03-31" → midnight UTC), or integer-as-string.
   @spec to_nanoseconds(term()) :: integer() | nil
   defp to_nanoseconds(value) when is_integer(value), do: value
 
   defp to_nanoseconds(value) when is_binary(value) do
-    case DateTime.from_iso8601(value) do
-      {:ok, dt, _offset} ->
-        DateTime.to_unix(dt, :nanosecond)
-
-      {:error, _reason} ->
-        case Integer.parse(value) do
-          {n, ""} -> n
-          _not_int -> nil
-        end
+    with :error <- iso_datetime_to_ns(value),
+         :error <- iso_date_to_ns(value),
+         :error <- int_string_to_ns(value) do
+      nil
     end
   end
 
   defp to_nanoseconds(_other), do: nil
 
+  @spec iso_datetime_to_ns(binary()) :: integer() | :error
+  defp iso_datetime_to_ns(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _offset} -> DateTime.to_unix(dt, :nanosecond)
+      {:error, _reason} -> :error
+    end
+  end
+
+  @spec iso_date_to_ns(binary()) :: integer() | :error
+  defp iso_date_to_ns(value) do
+    case Date.from_iso8601(value) do
+      {:ok, date} ->
+        date
+        |> DateTime.new!(~T[00:00:00], "Etc/UTC")
+        |> DateTime.to_unix(:nanosecond)
+
+      {:error, _reason} ->
+        :error
+    end
+  end
+
+  @spec int_string_to_ns(binary()) :: integer() | :error
+  defp int_string_to_ns(value) do
+    case Integer.parse(value) do
+      {n, ""} -> n
+      _not_int -> :error
+    end
+  end
+
+  # Both nil-actual (missing column) and nil-value (unparseable comparand)
+  # short-circuit to false. Without this guard, Elixir term ordering would
+  # silently produce wrong results (e.g. `5 > nil` is `true`).
   @spec compare(term(), atom(), term()) :: boolean()
   defp compare(nil, _op, _value), do: false
+  defp compare(_actual, _op, nil), do: false
   defp compare(actual, :eq, value), do: actual == value
   defp compare(actual, :ne, value), do: actual != value
   defp compare(actual, :gt, value), do: actual > value
@@ -2003,7 +2095,7 @@ defmodule InfluxElixir.Client.Local do
   # Private — utilities
   # ---------------------------------------------------------------------------
 
-  @spec delete_points(:ets.table(), binary(), binary(), [{atom(), binary(), term()}]) ::
+  @spec delete_points(:ets.table(), binary(), binary(), [where_clause()]) ::
           non_neg_integer()
   defp delete_points(table, database, measurement, where) do
     key = {:points, database, measurement}
