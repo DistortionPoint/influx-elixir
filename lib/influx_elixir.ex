@@ -107,6 +107,13 @@ defmodule InfluxElixir do
   Executes a SQL query against InfluxDB v3.
 
   Supports `transport: :http | :flight` option for transport selection.
+
+  ## Common Options
+
+    * `:database` — overrides the connection-level default database.
+    * `:timeout` — per-call receive timeout in milliseconds. Both the
+      HTTP and Flight transports honour this; default is `30_000` ms.
+    * `:params` — map of `$name => value` placeholder substitutions.
   """
   @spec query_sql(
           InfluxElixir.Client.connection(),
@@ -273,13 +280,17 @@ defmodule InfluxElixir do
 
   Returns `:ok` on success or `{:error, :no_batch_writer}` if no
   batch writer is configured for the given connection.
+
+  The optional `timeout` is forwarded to `BatchWriter.flush/2` and
+  bounds the underlying `GenServer.call`. See `BatchWriter.flush/2`
+  for the default and semantics.
   """
-  @spec flush(atom()) :: :ok | {:error, :no_batch_writer}
-  def flush(connection_name) do
+  @spec flush(atom(), timeout()) :: :ok | {:error, :no_batch_writer}
+  def flush(connection_name, timeout \\ 60_000) do
     bw = InfluxElixir.ConnectionSupervisor.batch_writer_name(connection_name)
 
     if Process.whereis(bw) do
-      InfluxElixir.Write.BatchWriter.flush(bw)
+      InfluxElixir.Write.BatchWriter.flush(bw, timeout)
     else
       {:error, :no_batch_writer}
     end

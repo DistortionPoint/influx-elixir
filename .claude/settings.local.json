@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mix test:*)",
+      "Bash(mix compile:*)",
+      "Bash(mix credo:*)",
+      "Bash(MIX_ENV=test mix test:*)",
+      "Bash(tail:*)",
+      "Bash(mix dialyzer:*)",
+      "Bash(mix format:*)",
+      "Bash(curl:*)",
+      "Bash(mix assets.deploy:*)",
+      "Bash(open:*)",
+      "Bash(mix hex.info:*)",
+      "WebFetch(domain:hexdocs.pm)",
+      "Bash(mix usage_rules.sync:*)",
+      "Bash(mix usage_rules.search_docs:*)",
+      "Bash(mix deps.get:*)",
+      "Bash(mix deps.compile:*)",
+      "Bash(MIX_ENV=test mix run:*)",
+      "WebFetch(domain:variantsystems.io)",
+      "WebFetch(domain:medium.com)",
+      "WebSearch",
+      "WebFetch(domain:webcache.googleusercontent.com)",
+      "Bash(mix:*)",
+      "Bash(MIX_ENV=test mix:*)"
+    ],
+    "deny": [
+      "Bash(git:*)"
+    ]
+  }
+}

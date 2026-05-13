@@ -25,11 +25,33 @@ defmodule InfluxElixir.Client.HTTP do
 
     * Flux: `POST /api/v2/query` (JSON body)
     * Buckets: `GET/POST/DELETE /api/v2/buckets`
+
+  ## Request Timeout
+
+  Every request uses `Finch`'s `:receive_timeout` option. The value is
+  resolved with this precedence on each call:
+
+    1. `opts[:timeout]` (per-call override)
+    2. `connection[:timeout]` (connection-level default)
+    3. `30_000` ms (module default, matching `InfluxElixir.Flight.Client`)
+
+  Finch's own default of 15s is bypassed — most production InfluxDB v3
+  queries need longer. To use the Finch default, pass `timeout: 15_000`
+  explicitly. Admin callbacks that don't accept opts (`list_databases`,
+  `delete_database`, `health`, etc.) use the connection-level default
+  or fall back to 30s.
   """
 
   @behaviour InfluxElixir.Client
 
   alias InfluxElixir.Query.ResponseParser
+
+  # Default `Finch.request/3` receive timeout, mirroring
+  # `InfluxElixir.Flight.Client`'s default so HTTP and Flight transports
+  # have parity. Finch's own default is 15s, which is too short for many
+  # production queries. Override with the `:timeout` opt on a per-call
+  # basis, or via a `:timeout` key on the connection config.
+  @default_timeout 30_000
 
   # ---------------------------------------------------------------------------
   # Connection lifecycle
@@ -86,7 +108,7 @@ defmodule InfluxElixir.Client.HTTP do
           {line_protocol, headers}
         end
 
-      case do_request(:post, url, headers, body, connection) do
+      case do_request(:post, url, headers, body, connection, opts) do
         {:ok, %Finch.Response{status: status}} when status in [200, 204] ->
           {:ok, :written}
 
@@ -122,7 +144,7 @@ defmodule InfluxElixir.Client.HTTP do
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
 
-      case do_request(:post, url, headers, body, connection) do
+      case do_request(:post, url, headers, body, connection, opts) do
         {:ok, %Finch.Response{status: 200, body: resp_body}} ->
           ResponseParser.parse(resp_body, format)
 
@@ -157,9 +179,10 @@ defmodule InfluxElixir.Client.HTTP do
         url = base_url(connection) <> "/api/v3/query_sql"
         headers = json_headers(connection)
         finch_name = resolve_finch(connection)
+        timeout = resolve_timeout(opts, connection)
 
         Stream.resource(
-          fn -> start_stream(finch_name, url, headers, body) end,
+          fn -> start_stream(finch_name, url, headers, body, timeout) end,
           &stream_next/1,
           &stream_cleanup/1
         )
@@ -179,7 +202,7 @@ defmodule InfluxElixir.Client.HTTP do
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
 
-      case do_request(:post, url, headers, body, connection) do
+      case do_request(:post, url, headers, body, connection, opts) do
         {:ok, %Finch.Response{status: 200, body: resp_body}} ->
           Jason.decode(resp_body)
 
@@ -225,7 +248,7 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v3/query_influxql"
     headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection) do
+    case do_request(:post, url, headers, body, connection, opts) do
       {:ok, %Finch.Response{status: 200, body: resp_body}} ->
         ResponseParser.parse(resp_body, format)
 
@@ -256,7 +279,7 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v2/query?org=#{URI.encode(org)}"
     headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection) do
+    case do_request(:post, url, headers, body, connection, opts) do
       {:ok, %Finch.Response{status: 200, body: resp_body}} ->
         ResponseParser.parse(resp_body, :csv)
 
@@ -292,7 +315,7 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v3/configure/database"
     headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection) do
+    case do_request(:post, url, headers, body, connection, opts) do
       {:ok, %Finch.Response{status: status}} when status in [200, 201, 409] ->
         :ok
 
@@ -375,7 +398,7 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v2/buckets"
     headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection) do
+    case do_request(:post, url, headers, body, connection, opts) do
       {:ok, %Finch.Response{status: status}} when status in [200, 201] ->
         :ok
 
@@ -454,7 +477,7 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v3/configure/token"
     headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection) do
+    case do_request(:post, url, headers, body, connection, opts) do
       {:ok, %Finch.Response{status: status, body: resp_body}}
       when status in [200, 201] ->
         Jason.decode(resp_body)
@@ -527,13 +550,27 @@ defmodule InfluxElixir.Client.HTTP do
           binary(),
           [{binary(), binary()}],
           binary() | nil,
+          keyword(),
           keyword()
         ) :: {:ok, Finch.Response.t()} | {:error, term()}
-  defp do_request(method, url, headers, body, connection) do
+  defp do_request(method, url, headers, body, connection, opts \\ []) do
     finch_name = resolve_finch(connection)
+    timeout = resolve_timeout(opts, connection)
 
     request = Finch.build(method, url, headers, body)
-    Finch.request(request, finch_name)
+    Finch.request(request, finch_name, receive_timeout: timeout)
+  end
+
+  @doc false
+  # Resolves the receive timeout in milliseconds. Precedence:
+  #   opts[:timeout] → connection[:timeout] → @default_timeout
+  # Exposed (with @doc false) so the precedence logic is unit-testable
+  # without spinning up a network fixture.
+  @spec resolve_timeout(keyword(), keyword()) :: non_neg_integer()
+  def resolve_timeout(opts, connection) do
+    Keyword.get(opts, :timeout) ||
+      Keyword.get(connection, :timeout) ||
+      @default_timeout
   end
 
   @spec resolve_finch(keyword()) :: atom()
@@ -588,12 +625,12 @@ defmodule InfluxElixir.Client.HTTP do
   # Private: streaming helpers
   # ---------------------------------------------------------------------------
 
-  @spec start_stream(atom(), binary(), list(), binary()) ::
+  @spec start_stream(atom(), binary(), list(), binary(), non_neg_integer()) ::
           {:ok, Finch.Response.t()} | {:error, term()}
-  defp start_stream(finch_name, url, headers, body) do
+  defp start_stream(finch_name, url, headers, body, timeout) do
     request = Finch.build(:post, url, headers, body)
 
-    case Finch.request(request, finch_name) do
+    case Finch.request(request, finch_name, receive_timeout: timeout) do
       {:ok, %Finch.Response{status: 200, body: resp_body} = resp} ->
         lines =
           resp_body

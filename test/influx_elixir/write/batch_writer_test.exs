@@ -139,6 +139,102 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       # A second flush on empty buffer should also succeed
       assert :ok = BatchWriter.flush(pid)
     end
+
+    test "flush/2 accepts an explicit timeout", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000)
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
+
+      # Generous timeout — verifies the new arity accepts and forwards it.
+      assert :ok = BatchWriter.flush(pid, 10_000)
+    end
+
+    test "write/3 accepts an explicit timeout", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000)
+      assert :ok = BatchWriter.write(pid, "cpu value=1.0", 10_000)
+    end
+
+    test "write_sync/3 accepts an explicit timeout", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000)
+      assert :ok = BatchWriter.write_sync(pid, "cpu value=1.0", 10_000)
+    end
+
+    test "GenServer.call timeout fires when the wait bound is exceeded",
+         %{conn: conn} do
+      # Spawn a writer with a queue of writes that the call-side cannot
+      # process before a 1ms timeout — verifies the bound is honoured
+      # rather than being capped by a hardcoded value.
+      pid = start_writer(conn, flush_interval_ms: 60_000)
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
+
+      # GenServer.call with timeout: 0 will exit with :timeout if the
+      # handler doesn't reply within 0ms. We trap exits and verify.
+      Process.flag(:trap_exit, true)
+      caller = self()
+
+      spawn_link(fn ->
+        result =
+          try do
+            BatchWriter.flush(pid, 0)
+          catch
+            :exit, reason -> {:exit, reason}
+          end
+
+        send(caller, {:done, result})
+      end)
+
+      assert_receive {:done, {:exit, {:timeout, _}}}, 1_000
+    end
+
+    test "forwards :write_opts to Writer.write/3 on flush" do
+      # Use a conn with two databases. Without :write_opts, Local would
+      # fall back to the conn-level default ("default"). With
+      # write_opts: [database: "metrics"], the flush must land there.
+      {:ok, conn} = Local.start(databases: ["metrics"])
+      on_exit(fn -> Local.stop(conn) end)
+
+      pid =
+        start_supervised!(
+          {BatchWriter,
+           connection: conn,
+           database: "ignored",
+           batch_size: 10,
+           flush_interval_ms: 60_000,
+           jitter_ms: 0,
+           max_retries: 0,
+           write_opts: [database: "metrics"]}
+        )
+
+      :ok = BatchWriter.write_sync(pid, "cpu value=1.0")
+
+      # Data should be in "metrics", not "default"
+      assert {:ok, [row]} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: "metrics")
+
+      assert row["value"] == 1.0
+
+      assert {:error, {:table_not_found, "cpu"}} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: "default")
+    end
+  end
+
+  describe "backoff_delay/3" do
+    test "base_retry_delay_ms controls the backoff scale" do
+      # base=100, attempt=1, no jitter → 100 * 2 = 200
+      assert BatchWriter.backoff_delay(1, 0, 100) == 200
+
+      # base=10, attempt=1, no jitter → 10 * 2 = 20
+      assert BatchWriter.backoff_delay(1, 0, 10) == 20
+
+      # base=100, attempt=3, no jitter → 100 * 8 = 800
+      assert BatchWriter.backoff_delay(3, 0, 100) == 800
+    end
+
+    test "jitter adds randomness within the bound" do
+      # base=100, attempt=1, jitter=50 → between 200 and 250
+      delay = BatchWriter.backoff_delay(1, 50, 100)
+      assert delay >= 200
+      assert delay <= 250
+    end
   end
 
   describe "stats/1" do

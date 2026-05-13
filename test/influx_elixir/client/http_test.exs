@@ -76,6 +76,33 @@ defmodule InfluxElixir.Client.HTTPTest do
   end
 
   # ---------------------------------------------------------------------------
+  # resolve_timeout/2 precedence (issue #8)
+  #
+  # The HTTP transport previously dropped :timeout on the floor (Finch's 15s
+  # default applied unconditionally). Now opts > connection > 30s default.
+  # ---------------------------------------------------------------------------
+
+  describe "resolve_timeout/2" do
+    test "uses opts :timeout when both opts and conn have it" do
+      assert HTTP.resolve_timeout([timeout: 5_000], timeout: 60_000) == 5_000
+    end
+
+    test "falls back to connection :timeout when opts has none" do
+      assert HTTP.resolve_timeout([], timeout: 60_000) == 60_000
+    end
+
+    test "falls back to 30s default when neither has it" do
+      assert HTTP.resolve_timeout([], host: "h") == 30_000
+    end
+
+    test "ignores nil :timeout in opts" do
+      # Keyword.get(opts, :timeout) returns nil when absent OR when explicitly
+      # set to nil; both should fall through to conn / default.
+      assert HTTP.resolve_timeout([timeout: nil], timeout: 7_000) == 7_000
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Integration — requires a live InfluxDB v3 instance
   #
   # Set the following environment variables to run these tests:

@@ -111,4 +111,54 @@ defmodule InfluxElixir.Flight.ClientTest do
       assert {:error, _reason} = result
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # resolve_connect_timeout/1 precedence
+  # ---------------------------------------------------------------------------
+
+  describe "resolve_connect_timeout/1" do
+    test "uses :connect_timeout when set" do
+      assert Client.resolve_connect_timeout(connect_timeout: 100, timeout: 5_000) ==
+               100
+    end
+
+    test "falls back to :timeout when :connect_timeout is absent" do
+      assert Client.resolve_connect_timeout(timeout: 5_000) == 5_000
+    end
+
+    test "falls back to 30s default when neither is set" do
+      assert Client.resolve_connect_timeout([]) == 30_000
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # bounded_connect/2 wall-clock guarantee
+  #
+  # The grpc 0.11 adapter does not expose a connect-phase timeout, so we wrap
+  # the call in Task.async/yield. The bound applies regardless of what the
+  # underlying gRPC stub does internally.
+  # ---------------------------------------------------------------------------
+
+  describe "bounded_connect/2" do
+    test "returns the fn's result when it completes in time" do
+      assert {:ok, :channel} =
+               Client.bounded_connect(fn -> {:ok, :channel} end, 1_000)
+    end
+
+    test "propagates the fn's error tuple" do
+      assert {:error, :nxdomain} =
+               Client.bounded_connect(fn -> {:error, :nxdomain} end, 1_000)
+    end
+
+    test "returns {:error, :connect_timeout} when fn exceeds the bound" do
+      started = System.monotonic_time(:millisecond)
+
+      assert {:error, :connect_timeout} =
+               Client.bounded_connect(fn -> Process.sleep(:infinity) end, 50)
+
+      elapsed = System.monotonic_time(:millisecond) - started
+      # Bound is 50ms; allow ample slack for scheduler jitter on CI.
+      assert elapsed < 1_000
+    end
+  end
 end

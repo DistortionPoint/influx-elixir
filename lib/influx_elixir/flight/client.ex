@@ -28,6 +28,10 @@ defmodule InfluxElixir.Flight.Client do
   ## Options
 
     * `:timeout` — per-call timeout in milliseconds (default: `30_000`)
+    * `:connect_timeout` — bound on the gRPC channel establishment phase
+      (default: same value as `:timeout`). Without this bound, a stuck TLS
+      handshake against an unresponsive host can hang far longer than
+      the in-stream `:timeout` would suggest.
     * `:tls` — `true` to use TLS (default: `true` when port is 443)
   """
 
@@ -107,6 +111,7 @@ defmodule InfluxElixir.Flight.Client do
     host = Map.fetch!(connection, :host)
     port = Map.get(connection, :port, @default_port)
     use_tls = Keyword.get(opts, :tls, port == 443)
+    connect_timeout = resolve_connect_timeout(opts)
 
     addr = "#{host}:#{port}"
 
@@ -117,7 +122,37 @@ defmodule InfluxElixir.Flight.Client do
         []
       end
 
-    GRPC.Stub.connect(addr, grpc_opts)
+    bounded_connect(fn -> GRPC.Stub.connect(addr, grpc_opts) end, connect_timeout)
+  end
+
+  @doc false
+  # Resolves the connect-phase timeout: :connect_timeout → :timeout → default.
+  @spec resolve_connect_timeout(keyword()) :: non_neg_integer()
+  def resolve_connect_timeout(opts) do
+    Keyword.get(opts, :connect_timeout) ||
+      Keyword.get(opts, :timeout) ||
+      @default_timeout
+  end
+
+  @doc false
+  # Bounds the wall-clock duration of `fun`. Returns whatever `fun` returns
+  # if it completes in time, or `{:error, :connect_timeout}` if not. Uses
+  # Task.async/yield so the bound is library-version-agnostic — it does
+  # not rely on the underlying gRPC adapter exposing a connect-timeout
+  # knob (which `grpc 0.11` does not).
+  #
+  # `Task.async` links the task to the caller, so a crash inside `fun`
+  # propagates to the caller — matching today's direct-call behaviour
+  # when `GRPC.Stub.connect/2` raises.
+  @spec bounded_connect((-> result), non_neg_integer()) :: result | {:error, :connect_timeout}
+        when result: term()
+  def bounded_connect(fun, timeout) when is_function(fun, 0) do
+    task = Task.async(fun)
+
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      nil -> {:error, :connect_timeout}
+    end
   end
 
   @spec do_get(GRPC.Channel.t(), connection(), binary(), non_neg_integer()) ::

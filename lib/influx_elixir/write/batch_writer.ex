@@ -15,7 +15,12 @@ defmodule InfluxElixir.Write.BatchWriter do
     * `:flush_interval_ms` - timer interval in milliseconds (default: `1000`)
     * `:jitter_ms` - random jitter added to flush timer (default: `0`)
     * `:max_retries` - max retry attempts for 5xx errors (default: `3`)
-    * `:no_sync` - when `true`, `write_sync/2` behaves like `write/2` (default: `false`)
+    * `:base_retry_delay_ms` - base for exponential retry backoff. Delay
+      for attempt N is roughly `base * 2^N`. Default: `100`.
+    * `:no_sync` - when `true`, `write_sync/3` behaves like `write/3` (default: `false`)
+    * `:write_opts` - keyword list forwarded to `InfluxElixir.Write.Writer.write/3`
+      on every flush. Useful for setting `:database`, `:timeout`, `:precision`
+      per BatchWriter without baking them into the connection. Default: `[]`.
 
   ## Backpressure
 
@@ -45,7 +50,15 @@ defmodule InfluxElixir.Write.BatchWriter do
   @default_jitter_ms 0
   @default_max_retries 3
   @backpressure_multiplier 10
-  @base_retry_delay_ms 100
+  @default_base_retry_delay_ms 100
+
+  # GenServer.call wait-bound defaults. Generous enough to cover one HTTP
+  # write at the default `Client.HTTP.@default_timeout` (30s). `write_sync`
+  # waits through the full retry chain so its default scales accordingly.
+  # All three are overridable per call.
+  @default_write_timeout 60_000
+  @default_flush_timeout 60_000
+  @default_write_sync_timeout 300_000
 
   @type stat_key :: :total_writes | :total_errors | :total_bytes
   @type stats :: %{stat_key() => non_neg_integer()}
@@ -61,7 +74,9 @@ defmodule InfluxElixir.Write.BatchWriter do
     flush_interval_ms: @default_flush_interval_ms,
     jitter_ms: @default_jitter_ms,
     max_retries: @default_max_retries,
+    base_retry_delay_ms: @default_base_retry_delay_ms,
     no_sync: false,
+    write_opts: [],
     stats: %{total_writes: 0, total_errors: 0, total_bytes: 0},
     retry_payload: nil,
     retry_attempt: 0
@@ -76,7 +91,9 @@ defmodule InfluxElixir.Write.BatchWriter do
           flush_interval_ms: pos_integer(),
           jitter_ms: non_neg_integer(),
           max_retries: non_neg_integer(),
+          base_retry_delay_ms: non_neg_integer(),
           no_sync: boolean(),
+          write_opts: keyword(),
           stats: stats(),
           timer_ref: reference() | nil,
           pending_sync: {pid(), term()} | nil,
@@ -112,59 +129,85 @@ defmodule InfluxElixir.Write.BatchWriter do
   @doc """
   Buffers a point (or line protocol binary) for writing.
 
-  Blocks until the buffer accepts the point, then returns. Does not wait
-  for the data to be flushed to InfluxDB. Returns `{:error, :buffer_full}`
-  when the buffer exceeds the backpressure threshold.
+  Returns immediately after buffering unless the buffer reaches `batch_size`,
+  in which case `handle_call` triggers a synchronous `do_flush` that calls
+  the HTTP client. The `timeout` argument bounds the `GenServer.call/3`
+  wait — defaults to `#{@default_write_timeout}` ms, generous enough to
+  cover a single HTTP write at `Client.HTTP`'s 30s default.
 
   ## Parameters
 
     * `server` - PID or registered name of the BatchWriter
     * `payload` - a `InfluxElixir.Write.Point.t()` or pre-encoded binary
+    * `timeout` - `GenServer.call` wait bound in ms (default: `60_000`)
 
   ## Examples
 
       iex> InfluxElixir.Write.BatchWriter.write(pid, "cpu value=1.0")
       :ok
   """
-  @spec write(GenServer.server(), InfluxElixir.Write.Point.t() | binary()) ::
-          :ok | {:error, :buffer_full}
-  def write(server, payload) do
-    GenServer.call(server, {:write, payload})
+  @spec write(
+          GenServer.server(),
+          InfluxElixir.Write.Point.t() | binary(),
+          timeout()
+        ) :: :ok | {:error, :buffer_full}
+  def write(server, payload, timeout \\ @default_write_timeout) do
+    GenServer.call(server, {:write, payload}, timeout)
   end
 
   @doc """
   Synchronously writes a point and waits for the next flush to complete.
 
   Blocks until the buffered data has been flushed and the write is confirmed.
-  When `no_sync: true` is configured, behaves identically to `write/2`.
+  When `no_sync: true` is configured, behaves identically to `write/3`.
+
+  The caller waits through the full retry chain. The default `timeout`
+  of `#{@default_write_sync_timeout}` ms covers up to `max_retries + 1`
+  HTTP writes at the default 30s HTTP timeout plus exponential backoff.
+  Override for endpoints with longer expected tail latencies.
 
   ## Parameters
 
     * `server` - PID or registered name of the BatchWriter
     * `payload` - a `InfluxElixir.Write.Point.t()` or pre-encoded binary
+    * `timeout` - `GenServer.call` wait bound in ms (default: `300_000`).
+      Pass `:infinity` for unbounded blocking.
 
   ## Examples
 
       iex> InfluxElixir.Write.BatchWriter.write_sync(pid, "cpu value=1.0")
       :ok
   """
-  @spec write_sync(GenServer.server(), InfluxElixir.Write.Point.t() | binary()) ::
-          :ok | {:error, term()}
-  def write_sync(server, payload) do
-    GenServer.call(server, {:write_sync, payload}, 30_000)
+  @spec write_sync(
+          GenServer.server(),
+          InfluxElixir.Write.Point.t() | binary(),
+          timeout()
+        ) :: :ok | {:error, term()}
+  def write_sync(server, payload, timeout \\ @default_write_sync_timeout) do
+    GenServer.call(server, {:write_sync, payload}, timeout)
   end
 
   @doc """
   Forces an immediate flush of the buffer.
+
+  Bounded by `timeout` (default: `#{@default_flush_timeout}` ms). Returns
+  `:ok` once the underlying HTTP write completes (or schedules a retry).
+  Retries scheduled by `do_flush` are asynchronous and do NOT extend the
+  caller's wait.
+
+  ## Parameters
+
+    * `server` - PID or registered name of the BatchWriter
+    * `timeout` - `GenServer.call` wait bound in ms (default: `60_000`)
 
   ## Examples
 
       iex> InfluxElixir.Write.BatchWriter.flush(pid)
       :ok
   """
-  @spec flush(GenServer.server()) :: :ok
-  def flush(server) do
-    GenServer.call(server, :flush)
+  @spec flush(GenServer.server(), timeout()) :: :ok
+  def flush(server, timeout \\ @default_flush_timeout) do
+    GenServer.call(server, :flush, timeout)
   end
 
   @doc """
@@ -200,7 +243,9 @@ defmodule InfluxElixir.Write.BatchWriter do
       flush_interval_ms: Keyword.get(opts, :flush_interval_ms, @default_flush_interval_ms),
       jitter_ms: Keyword.get(opts, :jitter_ms, @default_jitter_ms),
       max_retries: Keyword.get(opts, :max_retries, @default_max_retries),
-      no_sync: Keyword.get(opts, :no_sync, false)
+      base_retry_delay_ms: Keyword.get(opts, :base_retry_delay_ms, @default_base_retry_delay_ms),
+      no_sync: Keyword.get(opts, :no_sync, false),
+      write_opts: Keyword.get(opts, :write_opts, [])
     }
 
     {:ok, state, {:continue, :schedule_initial_flush}}
@@ -272,7 +317,7 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   @impl GenServer
   def handle_info({:retry, payload, attempt}, %__MODULE__{} = state) do
-    case Writer.write(state.connection, payload) do
+    case Writer.write(state.connection, payload, state.write_opts) do
       {:ok, :written} ->
         finish_flush(state, payload, :ok)
 
@@ -287,7 +332,8 @@ defmodule InfluxElixir.Write.BatchWriter do
             inspect(reason)
         )
 
-        schedule_retry(payload, attempt + 1, state.jitter_ms)
+        schedule_retry(payload, attempt + 1, state.jitter_ms, state.base_retry_delay_ms)
+
         {:noreply, %{state | retry_payload: payload, retry_attempt: attempt + 1}}
 
       {:error, reason} ->
@@ -337,7 +383,7 @@ defmodule InfluxElixir.Write.BatchWriter do
     state = cancel_timer(state)
     lines = state.buffer |> Enum.reverse() |> Enum.join("\n")
 
-    case Writer.write(state.connection, lines) do
+    case Writer.write(state.connection, lines, state.write_opts) do
       {:ok, :written} ->
         finish_flush_immediate(state, lines, :ok)
 
@@ -349,7 +395,7 @@ defmodule InfluxElixir.Write.BatchWriter do
       {:error, reason} when state.max_retries > 0 ->
         Logger.warning("[BatchWriter] Write error (attempt 1): #{inspect(reason)}")
 
-        schedule_retry(lines, 1, state.jitter_ms)
+        schedule_retry(lines, 1, state.jitter_ms, state.base_retry_delay_ms)
 
         %{
           state
@@ -421,17 +467,23 @@ defmodule InfluxElixir.Write.BatchWriter do
     :ok
   end
 
-  @spec schedule_retry(binary(), non_neg_integer(), non_neg_integer()) :: :ok
-  defp schedule_retry(payload, attempt, jitter_ms) do
-    delay = backoff_delay(attempt, jitter_ms)
+  @spec schedule_retry(
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) :: :ok
+  defp schedule_retry(payload, attempt, jitter_ms, base_retry_delay_ms) do
+    delay = backoff_delay(attempt, jitter_ms, base_retry_delay_ms)
     Process.send_after(self(), {:retry, payload, attempt}, delay)
     :ok
   end
 
-  @spec backoff_delay(non_neg_integer(), non_neg_integer()) ::
+  @doc false
+  @spec backoff_delay(non_neg_integer(), non_neg_integer(), non_neg_integer()) ::
           non_neg_integer()
-  defp backoff_delay(attempt, jitter_ms) do
-    base = (@base_retry_delay_ms * :math.pow(2, attempt)) |> round()
+  def backoff_delay(attempt, jitter_ms, base_retry_delay_ms) do
+    base = (base_retry_delay_ms * :math.pow(2, attempt)) |> round()
     jitter = if jitter_ms > 0, do: :rand.uniform(jitter_ms), else: 0
     base + jitter
   end
