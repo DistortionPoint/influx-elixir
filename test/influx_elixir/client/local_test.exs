@@ -2628,4 +2628,265 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["last_val"] == 100
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Regression coverage for bug reports filed by consuming applications.
+  # Each scenario reproduces a real downstream failure. See:
+  # /Users/bcatherall/development/dp_crypto_management/docs/bugs
+  # ---------------------------------------------------------------------------
+
+  describe "bug regression — write preserves provided timestamps" do
+    # Bug: ignores-write-timestamp. Writes of N points at fixed spacing
+    # returned timestamps microseconds apart because store_point/3 substituted
+    # System.os_time/1 over the parsed timestamp.
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "ts_keep_db")
+      {:ok, db: "ts_keep_db"}
+    end
+
+    test "six points written 900 seconds apart roundtrip with original spacing",
+         %{conn: conn, db: db} do
+      base_ns = 1_700_000_000_000_000_000
+      step_ns = 900 * 1_000_000_000
+
+      lines =
+        for i <- 0..5 do
+          ts = base_ns + i * step_ns
+          "candles,symbol=BTC close=#{100 + i}.0 #{ts}"
+        end
+
+      Local.write(conn, Enum.join(lines, "\n"), database: db)
+
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM candles ORDER BY time ASC",
+                 database: db
+               )
+
+      times = Enum.map(rows, & &1["time"])
+      assert length(times) == 6
+      assert times == Enum.uniq(times), "timestamps must remain distinct"
+
+      datetimes = Enum.map(times, &NaiveDateTime.from_iso8601!(&1))
+
+      pairs = Enum.zip(datetimes, tl(datetimes))
+
+      for {a, b} <- pairs do
+        diff_seconds = NaiveDateTime.diff(b, a)
+        assert diff_seconds == 900, "expected 900s spacing, got #{diff_seconds}s"
+      end
+    end
+
+    test "ORDER BY time ASC returns oldest-first with explicit timestamps",
+         %{conn: conn, db: db} do
+      base_ns = 1_700_000_000_000_000_000
+      step_ns = 60 * 1_000_000_000
+
+      lp =
+        Enum.map_join(0..3, "\n", fn i ->
+          "obs val=#{i}i #{base_ns + i * step_ns}"
+        end)
+
+      Local.write(conn, lp, database: db)
+
+      assert {:ok, rows} =
+               Local.query_sql(conn, "SELECT * FROM obs ORDER BY time ASC", database: db)
+
+      assert Enum.map(rows, & &1["val"]) == [0, 1, 2, 3]
+    end
+  end
+
+  describe "bug regression — IN operator is parsed and enforced" do
+    # Bug: in-operator. parse_single_where_clause silently dropped IN clauses
+    # because none of the binary operators matched "IN", so wrong rows came back.
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "in_op_db")
+
+      Local.write(
+        conn,
+        Enum.join(
+          [
+            "traces,strategy_id=s1,decision=entered prob=0.9 1000000000",
+            "traces,strategy_id=s1,decision=rejected prob=0.1 2000000000",
+            "traces,strategy_id=s1,decision=skipped prob=0.4 3000000000"
+          ],
+          "\n"
+        ),
+        database: "in_op_db"
+      )
+
+      {:ok, db: "in_op_db"}
+    end
+
+    test "IN list narrows to listed values only", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM traces WHERE decision IN ('entered')",
+                 database: db
+               )
+
+      assert length(rows) == 1
+      assert hd(rows)["decision"] == "entered"
+    end
+
+    test "IN list with parameter substitution narrows correctly",
+         %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM traces WHERE decision IN ($d0, $d1)",
+                 database: db,
+                 params: %{"$d0" => "entered", "$d1" => "skipped"}
+               )
+
+      assert Enum.map(rows, & &1["decision"]) |> Enum.sort() ==
+               ["entered", "skipped"]
+    end
+  end
+
+  describe "bug regression — unrecognised WHERE clauses do not silently drop" do
+    # Bug: in-operator (corollary). The fix list says: clauses the parser cannot
+    # recognise must not produce wrong rows. Today they yield []; with this
+    # regression test we lock in that behaviour into an explicit error so a
+    # future "LIKE 'foo%'" clause cannot silently match everything.
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "where_strict_db")
+
+      Local.write(
+        conn,
+        "alerts,severity=high msg=\"fire\" 1000000000\n" <>
+          "alerts,severity=low msg=\"info\" 2000000000",
+        database: "where_strict_db"
+      )
+
+      {:ok, db: "where_strict_db"}
+    end
+
+    test "unknown WHERE clause returns an error rather than wrong rows",
+         %{conn: conn, db: db} do
+      assert {:error, %{status: 400, body: body}} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM alerts WHERE severity LIKE 'h%'",
+                 database: db
+               )
+
+      assert body =~ "WHERE"
+    end
+  end
+
+  describe "bug regression — explicit column-list SELECT" do
+    # Bug: explicit-column-select. parse_columns_select/1 now handles SELECT
+    # col1, col2 ... FROM "measurement" WHERE ... ORDER BY ... LIMIT N.
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "cols_db")
+
+      Local.write(
+        conn,
+        Enum.join(
+          [
+            "decision_traces,strategy_id=s1,symbol=BTC decision=\"entered\",trace_json=\"{}\" 1000000000",
+            "decision_traces,strategy_id=s1,symbol=ETH decision=\"rejected\",trace_json=\"{}\" 2000000000"
+          ],
+          "\n"
+        ),
+        database: "cols_db"
+      )
+
+      {:ok, db: "cols_db"}
+    end
+
+    test "explicit column list projects only requested columns",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT time, strategy_id, symbol, decision, trace_json
+      FROM "decision_traces"
+      WHERE strategy_id = $strategy_id
+        AND time >= $start_time
+      ORDER BY time DESC
+      LIMIT 100
+      """
+
+      assert {:ok, rows} =
+               Local.query_sql(conn, sql,
+                 database: db,
+                 params: %{
+                   "$strategy_id" => "s1",
+                   "$start_time" => "1970-01-01T00:00:00Z"
+                 }
+               )
+
+      assert length(rows) == 2
+      [first | _rest] = rows
+
+      assert Map.keys(first) |> Enum.sort() ==
+               ["decision", "strategy_id", "symbol", "time", "trace_json"]
+    end
+  end
+
+  describe "bug regression — COUNT(*) aggregate" do
+    # Bug: count-star. parse_agg_column/1 required \w+ inside the parens, so
+    # COUNT(*) failed parsing and the query 400'd.
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "count_star_db")
+
+      day_ns = 86_400_000_000_000
+
+      lines =
+        for i <- 0..4 do
+          # Two days, 3 rows on day 1 and 2 rows on day 2
+          day = if i < 3, do: 0, else: 1
+          offset = rem(i, 3)
+          ts = day * day_ns + offset * 3_600_000_000_000
+          "decision_traces,strategy_id=s1 prob=#{0.1 + i / 10} #{ts}"
+        end
+
+      Local.write(conn, Enum.join(lines, "\n"), database: "count_star_db")
+      {:ok, db: "count_star_db"}
+    end
+
+    test "scalar COUNT(*) returns total row count", %{conn: conn, db: db} do
+      assert {:ok, [row]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT COUNT(*) AS n FROM "decision_traces"|,
+                 database: db
+               )
+
+      assert row["n"] == 5
+    end
+
+    test "COUNT(*) with DATE_BIN buckets by day", %{conn: conn, db: db} do
+      sql = """
+      SELECT DATE_BIN(INTERVAL '1 day', time) AS day, COUNT(*) AS n
+      FROM "decision_traces"
+      GROUP BY DATE_BIN(INTERVAL '1 day', time)
+      ORDER BY day ASC
+      """
+
+      assert {:ok, [b1, b2]} = Local.query_sql(conn, sql, database: db)
+      assert b1["n"] == 3
+      assert b2["n"] == 2
+    end
+
+    test "COUNT(*) ignores field nullity (counts rows missing the field)",
+         %{conn: conn, db: db} do
+      # Add a row whose field is a different name — COUNT(prob) would skip it,
+      # COUNT(*) must include it.
+      Local.write(
+        conn,
+        "decision_traces,strategy_id=s1 other_field=1i 5000000000",
+        database: db
+      )
+
+      assert {:ok, [%{"n" => 6}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT COUNT(*) AS n FROM "decision_traces"|,
+                 database: db
+               )
+    end
+  end
 end

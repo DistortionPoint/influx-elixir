@@ -400,18 +400,30 @@ defmodule InfluxElixir.Client.Local do
 
       case Regex.run(~r/^(?i)DELETE\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)$/s, trimmed) do
         [_full, measurement_raw, rest] ->
-          if profile == :v3_core do
-            {:error, :delete_not_supported}
-          else
-            measurement = unescape_measurement(measurement_raw)
-            where = parse_where(rest)
-            count = delete_points(table, database, measurement, where)
-            {:ok, %{"rows_affected" => count}}
-          end
+          execute_delete(table, database, profile, measurement_raw, rest)
 
         _no_match ->
           {:ok, %{"rows_affected" => 0}}
       end
+    end
+  end
+
+  @spec execute_delete(
+          :ets.table(),
+          binary(),
+          profile(),
+          binary(),
+          binary()
+        ) :: {:ok, map()} | {:error, term()}
+  defp execute_delete(_table, _database, :v3_core, _measurement_raw, _rest),
+    do: {:error, :delete_not_supported}
+
+  defp execute_delete(table, database, _profile, measurement_raw, rest) do
+    measurement = unescape_measurement(measurement_raw)
+
+    with {:ok, where} <- parse_where(rest) do
+      count = delete_points(table, database, measurement, where)
+      {:ok, %{"rows_affected" => count}}
     end
   end
 
@@ -1126,6 +1138,7 @@ defmodule InfluxElixir.Client.Local do
   @type select_column ::
           {:time_bucket, binary()}
           | {:aggregate, :avg | :sum | :count | :min | :max, binary(), binary()}
+          | {:count_star, binary()}
           | {:ordered_aggregate, :first | :last, binary(), binary(), binary()}
           | {:grouping_column, binary(), binary()}
 
@@ -1182,13 +1195,13 @@ defmodule InfluxElixir.Client.Local do
   defp parse_aggregate_select(sql) do
     with {:ok, columns} <- parse_select_columns(sql),
          {:ok, measurement} <- parse_aggregate_from(sql),
-         {:ok, interval_ns} <- resolve_aggregate_interval(sql) do
-      rest = extract_after_from(sql)
-
+         {:ok, interval_ns} <- resolve_aggregate_interval(sql),
+         rest = extract_after_from(sql),
+         {:ok, where} <- parse_where(rest) do
       {:ok,
        %{
          measurement: measurement,
-         where: parse_where(rest),
+         where: where,
          order_by: parse_order_by(rest),
          limit: parse_limit(rest),
          group_by_interval: interval_ns,
@@ -1360,10 +1373,28 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  # Parse: AGG(field) AS alias  or  AGG(field, ordering) AS alias
+  # Parse: AGG(field) AS alias  or  AGG(field, ordering) AS alias.
+  # COUNT(*) is special-cased — it counts rows regardless of field nullity
+  # (matching real InfluxDB v3 / SQL semantics), so it doesn't fit the
+  # `\w+`-inside-parens shape used for the other aggregates.
   @spec parse_agg_column(binary()) ::
           {:ok, select_column()} | {:error, term()}
   defp parse_agg_column(col) do
+    count_star =
+      ~r/(?i)^\s*COUNT\s*\(\s*\*\s*\)\s+AS\s+(\w+)\s*$/
+
+    case Regex.run(count_star, col) do
+      [_full, alias_name] ->
+        {:ok, {:count_star, alias_name}}
+
+      nil ->
+        parse_agg_column_arg(col)
+    end
+  end
+
+  @spec parse_agg_column_arg(binary()) ::
+          {:ok, select_column()} | {:error, term()}
+  defp parse_agg_column_arg(col) do
     two_arg =
       ~r/(?i)(AVG|SUM|COUNT|MIN|MAX|FIRST|LAST)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s+AS\s+(\w+)/
 
@@ -1453,35 +1484,32 @@ defmodule InfluxElixir.Client.Local do
   defp parse_distinct_select(sql) do
     case Regex.run(@distinct_pattern, sql) do
       [_full, column, quoted, "", rest] ->
-        {:ok,
-         %{
-           measurement: quoted,
-           where: parse_where(rest),
-           order_by: nil,
-           limit: parse_limit(rest),
-           group_by_interval: nil,
-           group_by_columns: nil,
-           select_columns: nil,
-           distinct_column: column,
-           projection_columns: nil
-         }}
+        build_distinct_query(column, quoted, rest)
 
       [_full, column, "", unquoted, rest] ->
-        {:ok,
-         %{
-           measurement: unescape_measurement(unquoted),
-           where: parse_where(rest),
-           order_by: nil,
-           limit: parse_limit(rest),
-           group_by_interval: nil,
-           group_by_columns: nil,
-           select_columns: nil,
-           distinct_column: column,
-           projection_columns: nil
-         }}
+        build_distinct_query(column, unescape_measurement(unquoted), rest)
 
       _no_match ->
         {:error, %{status: 400, body: "unsupported DISTINCT query: #{sql}"}}
+    end
+  end
+
+  @spec build_distinct_query(binary(), binary(), binary()) ::
+          {:ok, parsed_query()} | {:error, map()}
+  defp build_distinct_query(column, measurement, rest) do
+    with {:ok, where} <- parse_where(rest) do
+      {:ok,
+       %{
+         measurement: measurement,
+         where: where,
+         order_by: nil,
+         limit: parse_limit(rest),
+         group_by_interval: nil,
+         group_by_columns: nil,
+         select_columns: nil,
+         distinct_column: column,
+         projection_columns: nil
+       }}
     end
   end
 
@@ -1489,32 +1517,36 @@ defmodule InfluxElixir.Client.Local do
   defp parse_star_select(sql) do
     case Regex.run(@measurement_pattern, sql) do
       [_full_match, quoted, "", rest] when quoted != "" ->
-        {:ok, build_star_query(quoted, rest)}
+        build_star_query(quoted, rest)
 
       [_full_match, "", unquoted, rest] ->
-        {:ok, build_star_query(unescape_measurement(unquoted), rest)}
+        build_star_query(unescape_measurement(unquoted), rest)
 
       [_full_match, quoted, rest] when quoted != "" ->
-        {:ok, build_star_query(quoted, rest)}
+        build_star_query(quoted, rest)
 
       _no_match ->
         {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
     end
   end
 
-  @spec build_star_query(binary(), binary()) :: parsed_query()
+  @spec build_star_query(binary(), binary()) ::
+          {:ok, parsed_query()} | {:error, map()}
   defp build_star_query(measurement, rest) do
-    %{
-      measurement: measurement,
-      where: parse_where(rest),
-      order_by: parse_order_by(rest),
-      limit: parse_limit(rest),
-      group_by_interval: nil,
-      group_by_columns: nil,
-      select_columns: nil,
-      distinct_column: nil,
-      projection_columns: nil
-    }
+    with {:ok, where} <- parse_where(rest) do
+      {:ok,
+       %{
+         measurement: measurement,
+         where: where,
+         order_by: parse_order_by(rest),
+         limit: parse_limit(rest),
+         group_by_interval: nil,
+         group_by_columns: nil,
+         select_columns: nil,
+         distinct_column: nil,
+         projection_columns: nil
+       }}
+    end
   end
 
   @columns_select_pattern ~r/(?i)SELECT\s+(.+?)\s+FROM\s+(?:"([^"]+)"|((?:[^\s\\]|\\.)+))(.*)/s
@@ -1542,18 +1574,20 @@ defmodule InfluxElixir.Client.Local do
   defp build_columns_query(columns_str, measurement, rest, sql) do
     case parse_projection_columns(columns_str) do
       {:ok, projection} ->
-        {:ok,
-         %{
-           measurement: measurement,
-           where: parse_where(rest),
-           order_by: parse_order_by(rest),
-           limit: parse_limit(rest),
-           group_by_interval: nil,
-           group_by_columns: nil,
-           select_columns: nil,
-           distinct_column: nil,
-           projection_columns: projection
-         }}
+        with {:ok, where} <- parse_where(rest) do
+          {:ok,
+           %{
+             measurement: measurement,
+             where: where,
+             order_by: parse_order_by(rest),
+             limit: parse_limit(rest),
+             group_by_interval: nil,
+             group_by_columns: nil,
+             select_columns: nil,
+             distinct_column: nil,
+             projection_columns: projection
+           }}
+        end
 
       {:error, _reason} ->
         {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
@@ -1587,19 +1621,29 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec parse_where(binary()) :: [where_clause()]
+  @spec parse_where(binary()) ::
+          {:ok, [where_clause()]} | {:error, map()}
   defp parse_where(rest) do
     case Regex.run(~r/(?i)WHERE\s+(.+?)(?:\s+GROUP|\s+ORDER|\s+LIMIT|$)/s, rest) do
       [_full_match, clauses_str] -> parse_where_clauses(clauses_str)
-      _no_match -> []
+      _no_match -> {:ok, []}
     end
   end
 
-  @spec parse_where_clauses(binary()) :: [where_clause()]
+  # Fold each AND-split clause into either an accumulating list or the first
+  # error encountered. Unrecognised clauses bubble up as 400 errors rather
+  # than being silently dropped (which previously returned wrong rows).
+  @spec parse_where_clauses(binary()) ::
+          {:ok, [where_clause()]} | {:error, map()}
   defp parse_where_clauses(str) do
     str
     |> String.split(~r/\s+AND\s+/i)
-    |> Enum.flat_map(&parse_single_where_clause/1)
+    |> Enum.reduce_while({:ok, []}, fn clause, {:ok, acc} ->
+      case parse_single_where_clause(clause) do
+        {:ok, conds} -> {:cont, {:ok, acc ++ conds}}
+        {:error, _reason} = err -> {:halt, err}
+      end
+    end)
   end
 
   # IN / NOT IN must be matched before binary operators because they don't
@@ -1608,25 +1652,27 @@ defmodule InfluxElixir.Client.Local do
   @not_in_pattern ~r/^(\w+)\s+NOT\s+IN\s*\((.*)\)\s*$/is
   @in_pattern ~r/^(\w+)\s+IN\s*\((.*)\)\s*$/is
 
-  @spec parse_single_where_clause(binary()) :: [where_clause()]
+  @spec parse_single_where_clause(binary()) ::
+          {:ok, [where_clause()]} | {:error, map()}
   defp parse_single_where_clause(clause) do
     trimmed = String.trim(clause)
 
     cond do
       match = Regex.run(@not_in_pattern, trimmed) ->
         [_full, key, list_str] = match
-        [{:not_in, key, parse_in_values(list_str)}]
+        {:ok, [{:not_in, key, parse_in_values(list_str)}]}
 
       match = Regex.run(@in_pattern, trimmed) ->
         [_full, key, list_str] = match
-        [{:in, key, parse_in_values(list_str)}]
+        {:ok, [{:in, key, parse_in_values(list_str)}]}
 
       true ->
         parse_binary_where_clause(trimmed)
     end
   end
 
-  @spec parse_binary_where_clause(binary()) :: [where_clause()]
+  @spec parse_binary_where_clause(binary()) ::
+          {:ok, [where_clause()]} | {:error, map()}
   defp parse_binary_where_clause(trimmed) do
     # Multi-char operators must be tried before their single-char prefixes.
     operators = [{">=", :gte}, {"<=", :lte}, {"!=", :ne}, {">", :gt}, {"<", :lt}, {"=", :eq}]
@@ -1645,8 +1691,11 @@ defmodule InfluxElixir.Client.Local do
       end)
 
     case result do
-      nil -> []
-      condition -> [condition]
+      nil ->
+        {:error, %{status: 400, body: "unsupported WHERE clause: #{trimmed}"}}
+
+      condition ->
+        {:ok, [condition]}
     end
   end
 
@@ -1897,6 +1946,10 @@ defmodule InfluxElixir.Client.Local do
           |> Enum.reject(&is_nil/1)
 
         Map.put(row, alias_name, compute_aggregate(agg, values))
+
+      {:count_star, alias_name}, row ->
+        # COUNT(*) — every matching row counts, regardless of field nullity.
+        Map.put(row, alias_name, length(points))
 
       {:ordered_aggregate, agg, field, ordering, alias_name}, row ->
         value = compute_ordered_aggregate(agg, field, ordering, points)
