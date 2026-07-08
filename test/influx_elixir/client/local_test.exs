@@ -612,6 +612,62 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert length(stream_rows) == length(direct)
     end
+
+    # Parity with Client.HTTP (issue #11): a query error must raise
+    # InfluxElixir.StreamError on enumeration, never surface as an empty stream.
+    test "raises StreamError on a query error instead of yielding []",
+         %{conn: conn} do
+      # An unrecognised WHERE clause yields {:error, %{status: 400, ...}}.
+      stream =
+        Local.query_sql_stream(
+          conn,
+          "SELECT * FROM cpu WHERE x LIKE 'y'",
+          database: "test_db"
+        )
+
+      error =
+        try do
+          Enum.to_list(stream)
+          nil
+        rescue
+          e in InfluxElixir.StreamError -> e
+        end
+
+      assert error.kind == :http_status
+      assert error.status == 400
+    end
+
+    test "construction is lazy — the raise is deferred to enumeration",
+         %{conn: conn} do
+      # Building the stream must not raise; only consuming it does.
+      stream =
+        Local.query_sql_stream(
+          conn,
+          "SELECT * FROM cpu WHERE x LIKE 'y'",
+          database: "test_db"
+        )
+
+      assert Enumerable.impl_for(stream)
+      assert_raise InfluxElixir.StreamError, fn -> Enum.to_list(stream) end
+    end
+
+    test "raises StreamError with :unsupported when the profile lacks streaming" do
+      {:ok, v2_conn} = Local.start(profile: :v2, databases: ["v2_db"])
+      on_exit(fn -> Local.stop(v2_conn) end)
+
+      stream = Local.query_sql_stream(v2_conn, "SELECT * FROM cpu")
+
+      error =
+        try do
+          Enum.to_list(stream)
+          nil
+        rescue
+          e in InfluxElixir.StreamError -> e
+        end
+
+      assert error.kind == :unsupported
+      assert error.reason == :unsupported_operation
+    end
   end
 
   # ---------------------------------------------------------------------------

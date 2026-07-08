@@ -115,9 +115,22 @@ defmodule InfluxElixir.Client.ProfileRejectionTest do
                Local.query_sql(conn, "SELECT * FROM cpu")
     end
 
-    test "query_sql_stream returns empty stream", %{conn: conn} do
+    test "query_sql_stream raises StreamError :unsupported when enumerated",
+         %{conn: conn} do
+      # Streaming returns an Enumerable, so it cannot return an error tuple.
+      # Parity with Client.HTTP (issue #11): an unsupported operation raises on
+      # enumeration rather than swallowing the failure as an empty stream.
       stream = Local.query_sql_stream(conn, "SELECT * FROM cpu")
-      assert Enum.to_list(stream) == []
+
+      error =
+        try do
+          Enum.to_list(stream)
+          nil
+        rescue
+          e in InfluxElixir.StreamError -> e
+        end
+
+      assert error.kind == :unsupported
     end
 
     test "execute_sql returns {:error, :unsupported_operation}",

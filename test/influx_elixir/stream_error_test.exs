@@ -47,10 +47,41 @@ defmodule InfluxElixir.StreamErrorTest do
       assert error.message =~ ~s(%{"e" => 1})
     end
 
+    test "builds an :unsupported error carrying the reason" do
+      error = StreamError.exception(kind: :unsupported, reason: :unsupported_operation)
+
+      assert error.kind == :unsupported
+      assert error.reason == :unsupported_operation
+      assert error.message =~ "not supported"
+    end
+
     test "is raisable and rescuable" do
       assert_raise StreamError, fn ->
         raise StreamError, kind: :no_database
       end
+    end
+  end
+
+  describe "stream/1" do
+    test "returns an enumerable that does not raise on construction" do
+      stream = StreamError.stream(kind: :http_status, status: 500, body: "boom")
+      assert Enumerable.impl_for(stream)
+    end
+
+    test "raises the configured error when enumerated" do
+      stream = StreamError.stream(kind: :http_status, status: 500, body: "boom")
+
+      error =
+        try do
+          Enum.to_list(stream)
+          nil
+        rescue
+          e in StreamError -> e
+        end
+
+      assert error.kind == :http_status
+      assert error.status == 500
+      assert error.body == "boom"
     end
   end
 end

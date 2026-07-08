@@ -356,6 +356,15 @@ defmodule InfluxElixir.Client.Local do
   Executes a SQL query and returns results as a lazy `Stream`.
 
   Delegates to `query_sql/3` then wraps the list in a stream.
+
+  Mirrors the error semantics of `InfluxElixir.Client.HTTP.query_sql_stream/3`:
+  because the return type is an `Enumerable.t()`, errors cannot be returned as a
+  tuple. Instead a failure — an underlying query error or an operation the
+  connection's profile does not support — is raised as an
+  `InfluxElixir.StreamError` when the stream is enumerated, never swallowed as an
+  empty result. This keeps `Client.Local` a faithful drop-in test double for
+  `Client.HTTP`, so consumer code that rescues `InfluxElixir.StreamError` can be
+  exercised against it.
   """
   @impl true
   @spec query_sql_stream(
@@ -368,13 +377,28 @@ defmodule InfluxElixir.Client.Local do
       :ok ->
         case query_sql(conn, sql, opts) do
           {:ok, rows} -> Stream.map(rows, & &1)
-          {:error, _reason} -> Stream.map([], & &1)
+          {:error, reason} -> InfluxElixir.StreamError.stream(stream_error_opts(reason))
         end
 
       {:error, :unsupported_operation} ->
-        Stream.map([], & &1)
+        InfluxElixir.StreamError.stream(kind: :unsupported, reason: :unsupported_operation)
     end
   end
+
+  # Maps a `query_sql/3` error reason to `InfluxElixir.StreamError` options,
+  # mirroring how `Client.HTTP` classifies the same failures. Query errors that
+  # a real InfluxDB surfaces as an HTTP status (bad SQL, missing table) map to
+  # `:http_status`; a missing database maps to `:no_database`.
+  @spec stream_error_opts(term()) :: keyword()
+  defp stream_error_opts(%{status: status, body: body}),
+    do: [kind: :http_status, status: status, body: body]
+
+  defp stream_error_opts(:no_database_specified), do: [kind: :no_database]
+
+  defp stream_error_opts({:table_not_found, measurement}),
+    do: [kind: :http_status, status: 404, body: "table not found: #{measurement}"]
+
+  defp stream_error_opts(reason), do: [kind: :transport, reason: reason]
 
   @doc """
   Executes a SQL statement and returns a summary map.

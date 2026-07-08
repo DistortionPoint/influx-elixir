@@ -834,10 +834,6 @@ defmodule InfluxElixir.Client.HTTP do
   # that must surface as an error rather than an empty result.
   @spec raise_stream(keyword()) :: Enumerable.t()
   defp raise_stream(error_opts) do
-    Stream.resource(
-      fn -> error_opts end,
-      fn opts -> raise InfluxElixir.StreamError, opts end,
-      fn _opts -> :ok end
-    )
+    InfluxElixir.StreamError.stream(error_opts)
   end
 end

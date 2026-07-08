@@ -17,13 +17,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoding JSONL line-by-line with back-pressure (constant memory), and raises an
   `InfluxElixir.StreamError` on a missing database, a non-success HTTP status, or a
   transport error when the stream is enumerated.
+- **`InfluxElixir.Client.Local.query_sql_stream/3` now mirrors the HTTP client's
+  error semantics** (#11). `Client.Local` is the documented drop-in test double for
+  `Client.HTTP`, but it still returned an empty stream on a query error or an
+  unsupported operation while `Client.HTTP` raised — so consumer code that rescues
+  `InfluxElixir.StreamError` (to avoid treating an outage as "no data") could not be
+  exercised against the test double. It now raises `InfluxElixir.StreamError` on
+  enumeration for both cases, matching `Client.HTTP`.
 
 ### Added
 - `InfluxElixir.StreamError` exception, raised while consuming a streaming query
   that cannot produce rows. Carries a `:kind` (`:no_database | :http_status |
-  :transport | :decode`) plus `:status`/`:body`/`:reason` context.
-- Tests covering the `:no_database` and `:transport` error paths (real Finch pool,
-  no mocking) and the `StreamError` message construction.
+  :transport | :decode | :unsupported`) plus `:status`/`:body`/`:reason` context.
+  `InfluxElixir.StreamError.stream/1` builds an `Enumerable.t()` that defers the
+  raise to enumeration, shared by both client implementations.
+- Tests covering the HTTP `:no_database`/`:transport` paths (real Finch pool, no
+  mocking), the Local `:http_status`/`:unsupported` paths, lazy (deferred) raising,
+  and `StreamError` message construction.
 
 ## [0.1.17] - 2026-06-30
 

@@ -17,6 +17,8 @@ defmodule InfluxElixir.StreamError do
     * `:transport` — a Finch/Mint transport error occurred; `:reason` carries it
     * `:decode` — a JSONL line could not be decoded as JSON; `:reason` carries
       the decode error
+    * `:unsupported` — the operation is not supported by the connection's
+      profile (raised by `InfluxElixir.Client.Local` for capability parity)
 
   ## Example
 
@@ -31,7 +33,7 @@ defmodule InfluxElixir.StreamError do
       end
   """
 
-  @type kind :: :no_database | :http_status | :transport | :decode
+  @type kind :: :no_database | :http_status | :transport | :decode | :unsupported
 
   @type t :: %__MODULE__{
           kind: kind(),
@@ -42,6 +44,27 @@ defmodule InfluxElixir.StreamError do
         }
 
   defexception kind: :transport, status: nil, body: nil, reason: nil, message: nil
+
+  @doc """
+  Builds an `Enumerable.t()` that raises this error the moment it is enumerated.
+
+  Streaming query functions return an `Enumerable.t()`, so a pre-request failure
+  (no database, unsupported operation, an already-known error) cannot be
+  returned as an `{:error, reason}` tuple. Wrapping it in this stream defers the
+  raise to consumption time — matching the lazy semantics of a real streamed
+  response — instead of yielding an empty list that looks like "zero rows".
+
+  `opts` are the same keyword options accepted by `exception/1`
+  (`:kind`, `:status`, `:body`, `:reason`).
+  """
+  @spec stream(keyword()) :: Enumerable.t()
+  def stream(opts) do
+    Stream.resource(
+      fn -> opts end,
+      fn error_opts -> raise __MODULE__, error_opts end,
+      fn _error_opts -> :ok end
+    )
+  end
 
   @impl true
   def exception(opts) do
@@ -75,6 +98,10 @@ defmodule InfluxElixir.StreamError do
 
   defp build_message(:decode, _status, _body, reason) do
     "failed to decode JSONL row in streaming response: #{inspect(reason)}"
+  end
+
+  defp build_message(:unsupported, _status, _body, reason) do
+    "streaming query is not supported by this connection: #{inspect(reason)}"
   end
 
   @spec format_body(term()) :: String.t()
