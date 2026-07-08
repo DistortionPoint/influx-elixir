@@ -115,11 +115,16 @@ defmodule InfluxElixir.Flight.Client do
 
     addr = "#{host}:#{port}"
 
+    # Default to the Mint adapter so we don't depend on `:gun`. Mint is a hard
+    # dep in `grpc 0.11` and reaches us transitively via `finch` on `grpc 1.0`
+    # (where the Gun adapter became optional and isn't pulled in by default).
+    base_opts = [adapter: GRPC.Client.Adapters.Mint]
+
     grpc_opts =
       if use_tls do
-        [cred: GRPC.Credential.new(ssl: [])]
+        [{:cred, GRPC.Credential.new(ssl: [])} | base_opts]
       else
-        []
+        base_opts
       end
 
     bounded_connect(fn -> GRPC.Stub.connect(addr, grpc_opts) end, connect_timeout)

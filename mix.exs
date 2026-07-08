@@ -76,12 +76,12 @@ defmodule InfluxElixir.MixProject do
       {:nimble_options, "~> 1.0"},
 
       # Runtime — Arrow Flight
-      {:grpc, "~> 0.11"},
+      {:grpc, "~> 0.11 or ~> 1.0"},
       {:protobuf, "~> 0.12"},
 
       # Optional — consumers passing %Decimal{} as SQL params get
       # numeric serialisation. Consumers without Decimal are unaffected.
-      {:decimal, "~> 2.0", optional: true},
+      {:decimal, "~> 2.0 or ~> 3.0", optional: true},
 
       # Dev/Test
       {:usage_rules, "~> 1.2", only: :dev},

@@ -127,7 +127,23 @@ defmodule InfluxElixir do
   @doc """
   Executes a streaming SQL query, returning a lazy Stream.
 
-  Use for large result sets to avoid loading all rows into memory.
+  Use for large result sets to avoid loading all rows into memory. On the HTTP
+  transport the JSONL response is decoded incrementally with back-pressure, so
+  only one chunk plus a partial line is held in memory regardless of result
+  size.
+
+  Because the return value is an `Enumerable.t()`, errors cannot be returned as
+  an `{:error, reason}` tuple. Instead, failure classes — a missing database, a
+  non-success HTTP status, or a transport error — are raised as an
+  `InfluxElixir.StreamError` when the stream is enumerated. This mirrors the
+  `{:error, reason}` contract of `query_sql/3`: an outage surfaces as an
+  exception, never as a silent empty result.
+
+  ## Options
+
+    * `:database` — overrides the connection-level default database.
+    * `:params` — map of `$name => value` placeholder substitutions.
+    * `:timeout` — per-call receive timeout in milliseconds.
   """
   @spec query_sql_stream(
           InfluxElixir.Client.connection(),

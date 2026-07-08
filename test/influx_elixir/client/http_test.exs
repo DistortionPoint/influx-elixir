@@ -103,6 +103,63 @@ defmodule InfluxElixir.Client.HTTPTest do
   end
 
   # ---------------------------------------------------------------------------
+  # query_sql_stream/3 — error surfacing (issue #10)
+  #
+  # The stream must never swallow errors as "zero rows". Each error class is
+  # raised as an InfluxElixir.StreamError when the stream is enumerated. These
+  # tests use a real Finch pool (no mocking) — the transport case points at a
+  # closed port so the failure is a genuine connection error.
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql_stream/3 — error surfacing" do
+    test "raises :no_database when no database can be resolved" do
+      conn = [host: "h", token: "t", finch_name: :unused_finch]
+
+      stream = HTTP.query_sql_stream(conn, "SELECT 1")
+
+      assert_raise InfluxElixir.StreamError, fn -> Enum.to_list(stream) end
+
+      error =
+        try do
+          Enum.to_list(stream)
+          nil
+        rescue
+          e in InfluxElixir.StreamError -> e
+        end
+
+      assert error.kind == :no_database
+    end
+
+    test "raises :transport on a connection failure rather than yielding []" do
+      finch = :stream_transport_finch
+      start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
+
+      # Port 1 is not listening — Finch will fail to connect.
+      conn = [
+        host: "127.0.0.1",
+        port: 1,
+        scheme: :http,
+        token: "t",
+        database: "test_db",
+        finch_name: finch
+      ]
+
+      stream = HTTP.query_sql_stream(conn, "SELECT 1")
+
+      error =
+        try do
+          Enum.to_list(stream)
+          nil
+        rescue
+          e in InfluxElixir.StreamError -> e
+        end
+
+      assert error.kind == :transport
+      refute is_nil(error.reason)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Integration — requires a live InfluxDB v3 instance
   #
   # Set the following environment variables to run these tests:

@@ -36,8 +36,19 @@ defmodule InfluxElixir.Supervisor do
       end)
 
     # GRPC.Client.Supervisor manages outbound gRPC connections for Arrow Flight.
-    children = [{GRPC.Client.Supervisor, []} | connection_children]
+    # grpc 1.0+ auto-starts it via GRPC.Client.Application; only add the child
+    # when running against grpc 0.11.x, where the consumer is responsible.
+    children = grpc_supervisor_child() ++ connection_children
 
     Supervisor.init(children, strategy: :one_for_one)
+  end
+
+  @spec grpc_supervisor_child() :: [Supervisor.child_spec() | {module(), term()}]
+  defp grpc_supervisor_child do
+    if Code.ensure_loaded?(GRPC.Client.Application) do
+      []
+    else
+      [{GRPC.Client.Supervisor, []}]
+    end
   end
 end

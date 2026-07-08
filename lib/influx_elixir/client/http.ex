@@ -187,8 +187,11 @@ defmodule InfluxElixir.Client.HTTP do
           &stream_cleanup/1
         )
 
-      {:error, _reason} ->
-        Stream.map([], & &1)
+      {:error, :no_database_specified} ->
+        # The return type is Enumerable.t(), so we cannot return an error
+        # tuple. Surface the failure by raising when the stream is enumerated
+        # rather than yielding an empty list that looks like "zero rows".
+        raise_stream(kind: :no_database)
     end
   end
 
@@ -623,37 +626,218 @@ defmodule InfluxElixir.Client.HTTP do
 
   # ---------------------------------------------------------------------------
   # Private: streaming helpers
+  #
+  # True incremental streaming with constant memory. `Finch.stream/5` is
+  # push-based (it invokes a callback as chunks arrive), while `Stream.resource`
+  # is pull-based. We bridge the two with a producer process: the producer runs
+  # `Finch.stream/5` and, for each status/data chunk, sends a message to the
+  # consumer and blocks until the consumer acks. Because the callback blocks
+  # inside the HTTP receive loop, this gives real back-pressure — a chunk is
+  # only pulled off the socket when the downstream consumer asks for the next
+  # element. JSONL is decoded line-by-line as bytes arrive; only one chunk plus
+  # a partial-line buffer is ever held in memory.
+  #
+  # Errors are never swallowed: a non-2xx status or a transport error raises an
+  # `InfluxElixir.StreamError` when the stream is consumed, mirroring the
+  # `{:error, reason}` contract of `query_sql/3`.
   # ---------------------------------------------------------------------------
 
+  @typep stream_state :: %{
+           producer: pid(),
+           ref: reference(),
+           monitor: reference(),
+           status: non_neg_integer() | nil,
+           buffer: binary(),
+           error_body: iodata(),
+           phase: :streaming | :halt
+         }
+
   @spec start_stream(atom(), binary(), list(), binary(), non_neg_integer()) ::
-          {:ok, Finch.Response.t()} | {:error, term()}
+          stream_state()
   defp start_stream(finch_name, url, headers, body, timeout) do
+    parent = self()
+    ref = make_ref()
+
+    producer =
+      spawn(fn ->
+        run_producer(parent, ref, finch_name, url, headers, body, timeout)
+      end)
+
+    monitor = Process.monitor(producer)
+
+    %{
+      producer: producer,
+      ref: ref,
+      monitor: monitor,
+      status: nil,
+      buffer: "",
+      error_body: [],
+      phase: :streaming
+    }
+  end
+
+  # Producer process body. Runs the blocking Finch stream, forwarding each
+  # chunk to the consumer with back-pressure, then signalling completion.
+  @spec run_producer(pid(), reference(), atom(), binary(), list(), binary(), non_neg_integer()) ::
+          :ok
+  defp run_producer(parent, ref, finch_name, url, headers, body, timeout) do
     request = Finch.build(:post, url, headers, body)
 
-    case Finch.request(request, finch_name, receive_timeout: timeout) do
-      {:ok, %Finch.Response{status: 200, body: resp_body} = resp} ->
-        lines =
-          resp_body
-          |> String.split("\n", trim: true)
-          |> Enum.map(&Jason.decode!/1)
+    outcome =
+      Finch.stream(
+        request,
+        finch_name,
+        :ok,
+        fn
+          {:status, status}, acc ->
+            emit_and_wait(parent, ref, {:status, status})
+            acc
 
-        {:lines, lines, resp}
+          {:headers, _headers}, acc ->
+            acc
 
-      {:ok, resp} ->
-        {:done, resp}
+          {:data, data}, acc ->
+            emit_and_wait(parent, ref, {:data, data})
+            acc
 
-      {:error, reason} ->
-        {:error, reason}
+          {:trailers, _trailers}, acc ->
+            acc
+        end,
+        receive_timeout: timeout
+      )
+
+    case outcome do
+      {:ok, _acc} -> send(parent, {ref, :done})
+      {:error, reason, _acc} -> send(parent, {ref, {:transport_error, reason}})
+    end
+
+    :ok
+  end
+
+  # Send a chunk to the consumer and block until it acks. If the consumer has
+  # abandoned the stream it is killed by `stream_cleanup/1`, which unblocks this
+  # receive by terminating the process.
+  @spec emit_and_wait(pid(), reference(), term()) :: :ok
+  defp emit_and_wait(parent, ref, msg) do
+    send(parent, {ref, msg})
+
+    receive do
+      {:ack, ^ref} -> :ok
     end
   end
 
-  @spec stream_next(term()) ::
-          {[map()], term()} | {:halt, term()}
-  defp stream_next({:lines, [], resp}), do: {:halt, resp}
-  defp stream_next({:lines, lines, resp}), do: {lines, {:lines, [], resp}}
-  defp stream_next({:done, resp}), do: {:halt, resp}
-  defp stream_next({:error, _reason} = err), do: {:halt, err}
+  @spec stream_next(stream_state()) :: {[map()], stream_state()} | {:halt, stream_state()}
+  defp stream_next(%{phase: :halt} = state), do: {:halt, state}
 
-  @spec stream_cleanup(term()) :: :ok
+  defp stream_next(%{ref: ref, producer: producer, monitor: monitor} = state) do
+    receive do
+      {^ref, {:status, status}} ->
+        ack(producer, ref)
+        {[], %{state | status: status}}
+
+      {^ref, {:data, data}} ->
+        ack(producer, ref)
+        handle_data(state, data)
+
+      {^ref, :done} ->
+        finish(state)
+
+      {^ref, {:transport_error, reason}} ->
+        raise InfluxElixir.StreamError, kind: :transport, reason: reason
+
+      {:DOWN, ^monitor, :process, ^producer, :normal} ->
+        {:halt, %{state | phase: :halt}}
+
+      {:DOWN, ^monitor, :process, ^producer, reason} ->
+        raise InfluxElixir.StreamError, kind: :transport, reason: reason
+    end
+  end
+
+  # Decode a data chunk. On a 200 response, complete JSONL lines are decoded
+  # and emitted while the trailing partial line is buffered. On a non-2xx
+  # response, the body is accumulated so it can be reported when the stream ends.
+  @spec handle_data(stream_state(), binary()) :: {[map()], stream_state()}
+  defp handle_data(%{status: 200, buffer: buffer} = state, data) do
+    {lines, rest} = split_lines(buffer <> data)
+    {Enum.map(lines, &decode_line/1), %{state | buffer: rest}}
+  end
+
+  defp handle_data(%{error_body: acc} = state, data) do
+    {[], %{state | error_body: [acc, data]}}
+  end
+
+  # Producer signalled a clean end-of-response.
+  @spec finish(stream_state()) :: {[map()], stream_state()}
+  defp finish(%{status: 200, buffer: buffer} = state) do
+    rows =
+      case String.trim(buffer) do
+        "" -> []
+        line -> [decode_line(line)]
+      end
+
+    {rows, %{state | buffer: "", phase: :halt}}
+  end
+
+  defp finish(%{status: status, error_body: acc}) do
+    raise InfluxElixir.StreamError,
+      kind: :http_status,
+      status: status,
+      body: IO.iodata_to_binary(acc)
+  end
+
+  # Split accumulated bytes into complete lines plus a trailing remainder that
+  # has not yet been terminated by a newline. Blank lines are dropped.
+  @spec split_lines(binary()) :: {[binary()], binary()}
+  defp split_lines(data) do
+    parts = String.split(data, "\n")
+    {complete, [rest]} = Enum.split(parts, length(parts) - 1)
+    {Enum.reject(complete, &(&1 == "")), rest}
+  end
+
+  @spec decode_line(binary()) :: map()
+  defp decode_line(line) do
+    case Jason.decode(line) do
+      {:ok, row} -> row
+      {:error, reason} -> raise InfluxElixir.StreamError, kind: :decode, reason: reason
+    end
+  end
+
+  @spec ack(pid(), reference()) :: :ok
+  defp ack(producer, ref) do
+    send(producer, {:ack, ref})
+    :ok
+  end
+
+  # Tear down the producer and drain any of its messages from the consumer's
+  # mailbox. The stream runs in the caller's process, so leftover chunk or
+  # :DOWN messages would otherwise pollute that mailbox.
+  @spec stream_cleanup(stream_state() | term()) :: :ok
+  defp stream_cleanup(%{producer: producer, ref: ref, monitor: monitor}) do
+    Process.exit(producer, :kill)
+    Process.demonitor(monitor, [:flush])
+    flush_ref(ref)
+  end
+
   defp stream_cleanup(_state), do: :ok
+
+  @spec flush_ref(reference()) :: :ok
+  defp flush_ref(ref) do
+    receive do
+      {^ref, _msg} -> flush_ref(ref)
+    after
+      0 -> :ok
+    end
+  end
+
+  # Build a stream that raises the given `InfluxElixir.StreamError` as soon as it
+  # is enumerated. Used for pre-request failures (e.g. no database resolved)
+  # that must surface as an error rather than an empty result.
+  @spec raise_stream(keyword()) :: Enumerable.t()
+  defp raise_stream(error_opts) do
+    Stream.resource(
+      fn -> error_opts end,
+      fn opts -> raise InfluxElixir.StreamError, opts end,
+      fn _opts -> :ok end
+    )
+  end
 end
