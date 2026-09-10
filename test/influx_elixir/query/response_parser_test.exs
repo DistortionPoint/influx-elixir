@@ -23,6 +23,11 @@ defmodule InfluxElixir.Query.ResponseParserTest do
                ResponseParser.parse("not json", :json)
     end
 
+    test "returns error for a JSON scalar instead of crashing" do
+      assert {:error, {:unexpected_json, nil}} = ResponseParser.parse("null", :json)
+      assert {:error, {:unexpected_json, 42}} = ResponseParser.parse("42", :json)
+    end
+
     test "coerces time fields to DateTime" do
       body =
         ~s([{"time":"2026-03-12T10:00:00Z","value":1}])
@@ -57,15 +62,45 @@ defmodule InfluxElixir.Query.ResponseParserTest do
   end
 
   describe "parse/2 with :csv format" do
-    test "parses CSV with header row" do
+    test "parses plain CSV with a header row, cells stay strings" do
       body = "name,value\ncpu,0.64\nmem,0.85"
-      assert {:ok, rows} = ResponseParser.parse(body, :csv)
-      assert length(rows) == 2
-      assert hd(rows)["name"] == "cpu"
+
+      assert {:ok, [%{"name" => "cpu", "value" => "0.64"}, %{"name" => "mem", "value" => "0.85"}]} =
+               ResponseParser.parse(body, :csv)
     end
 
     test "returns empty list for empty body" do
       assert {:ok, []} = ResponseParser.parse("", :csv)
+    end
+
+    test "parses Flux annotated CSV: CRLF, multiple tables, quoted cells, typed columns" do
+      # Captured verbatim from InfluxDB 2.7 with dialect annotations: ["datatype"].
+      body =
+        "#datatype,string,long,dateTime:RFC3339,string,string,string,string\r\n" <>
+          ",result,table,_time,_value,_field,_measurement,host\r\n" <>
+          ",_result,0,2023-11-14T22:13:20Z,\"x, y\",label,probe_flux,a\r\n" <>
+          "\r\n" <>
+          "#datatype,string,long,dateTime:RFC3339,double,string,string,string\r\n" <>
+          ",result,table,_time,_value,_field,_measurement,host\r\n" <>
+          ",_result,1,2023-11-14T22:13:20Z,42.5,value,probe_flux,a\r\n" <>
+          "\r\n"
+
+      assert {:ok, [label_row, value_row]} = ResponseParser.parse(body, :csv)
+
+      assert %{"table" => 0, "_value" => "x, y", "_field" => "label", "host" => "a"} = label_row
+      assert %{"table" => 1, "_value" => 42.5, "_field" => "value"} = value_row
+      assert value_row["_time"] == ~U[2023-11-14 22:13:20Z]
+      refute Map.has_key?(value_row, "")
+    end
+
+    test "types long, unsignedLong and boolean columns and maps empty cells to nil" do
+      body =
+        "#datatype,string,long,unsignedLong,boolean,double\n" <>
+          ",result,count,ucount,flag,ratio\n" <>
+          ",_result,3,7,true,\n"
+
+      assert {:ok, [%{"count" => 3, "ucount" => 7, "flag" => true, "ratio" => nil}]} =
+               ResponseParser.parse(body, :csv)
     end
   end
 
@@ -115,6 +150,20 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       row = %{"time" => "not a date"}
       result = ResponseParser.coerce_types(row)
       assert result["time"] == "not a date"
+    end
+
+    test "converts the Flux _time, _start and _stop columns too" do
+      row = %{
+        "_time" => "2026-03-12T10:00:00Z",
+        "_start" => "2026-03-12T09:00:00Z",
+        "_stop" => "2026-03-12T11:00:00Z"
+      }
+
+      assert %{
+               "_time" => ~U[2026-03-12 10:00:00Z],
+               "_start" => ~U[2026-03-12 09:00:00Z],
+               "_stop" => ~U[2026-03-12 11:00:00Z]
+             } = ResponseParser.coerce_types(row)
     end
   end
 end

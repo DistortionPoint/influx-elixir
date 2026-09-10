@@ -1,5 +1,5 @@
 defmodule InfluxElixir.ConnectionSupervisorTest do
-  use ExUnit.Case
+  use ExUnit.Case, async: true
 
   alias InfluxElixir.{Connection, ConnectionSupervisor}
 

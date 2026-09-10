@@ -740,7 +740,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       flux = "from(bucket: \"test\") |> range(start: -1h)"
 
-      assert {:ok, [%{"_measurement" => "cpu", "value" => 1.0}]} =
+      assert {:ok, [%{"_measurement" => "cpu", "_field" => "value", "_value" => 1.0}]} =
                Local.query_flux(v2_conn, flux)
     end
   end
@@ -1596,16 +1596,32 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "range(start: -1h) filters old points", %{v2_conn: conn} do
       flux = "from(bucket: \"flux_db\") |> range(start: -1h)"
-      assert {:ok, rows} = Local.query_flux(conn, flux)
-      assert length(rows) == 1
-      assert hd(rows)["value"] == 10
+
+      assert {:ok, [%{"_field" => "value", "_value" => 10, "host" => "web01"}]} =
+               Local.query_flux(conn, flux)
     end
 
-    test "flux query returns row maps with string keys", %{v2_conn: conn} do
+    test "rows are long-format with one table per series", %{v2_conn: conn, now: now} do
       flux = "from(bucket: \"flux_db\") |> range(start: -24h)"
-      assert {:ok, [row | _rest]} = Local.query_flux(conn, flux)
-      assert is_binary(row["_measurement"])
-      assert Map.has_key?(row, "time")
+      assert {:ok, rows} = Local.query_flux(conn, flux)
+
+      # Two series (host=web01, host=web02) → tables 0 and 1, ordered.
+      assert Enum.map(rows, & &1["table"]) == [0, 1]
+      assert Enum.all?(rows, &(&1["_measurement"] == "cpu" and &1["result"] == "_result"))
+
+      web01 = Enum.find(rows, &(&1["host"] == "web01"))
+      assert web01["_time"] == DateTime.from_unix!(now, :nanosecond)
+    end
+
+    test "filter on _field keeps only that field", %{v2_conn: conn} do
+      Local.write(conn, "mem,host=web01 used=5i,free=7i", database: "flux_db")
+
+      flux =
+        "from(bucket: \"flux_db\") |> range(start: -1h) " <>
+          "|> filter(fn: (r) => r._measurement == \"mem\") " <>
+          "|> filter(fn: (r) => r._field == \"free\")"
+
+      assert {:ok, [%{"_field" => "free", "_value" => 7}]} = Local.query_flux(conn, flux)
     end
 
     test "flux query with no matching bucket returns empty list", %{v2_conn: conn} do

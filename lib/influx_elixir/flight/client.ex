@@ -94,9 +94,14 @@ defmodule InfluxElixir.Flight.Client do
     _token = Map.fetch!(connection, :token)
     _database = Map.fetch!(connection, :database)
 
-    with {:ok, channel} <- connect(connection, opts),
-         {:ok, flight_data_list} <- do_get(channel, connection, sql, timeout) do
-      result = Reader.decode_flight_data(flight_data_list)
+    # The channel is closed on every path after connect; a failed DoGet
+    # used to leak it.
+    with {:ok, channel} <- connect(connection, opts) do
+      result =
+        with {:ok, flight_data_list} <- do_get(channel, connection, sql, timeout) do
+          Reader.decode_flight_data(flight_data_list)
+        end
+
       :ok = disconnect(channel)
       result
     end

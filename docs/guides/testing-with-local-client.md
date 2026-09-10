@@ -326,6 +326,33 @@ GROUP BY ticker, holding_type
 # => one row per unique (ticker, holding_type) pair
 ```
 
+## Flux Queries (`:v2` profile)
+
+`query_flux/3` returns the same **long** rows a real InfluxDB 2.x returns: one
+row per field, with `_field` / `_value`, `_measurement`, `_time` (a `DateTime`),
+the tags, `result`, and a `table` index per series:
+
+```elixir
+{:ok, conn} = Local.start(profile: :v2)
+:ok = Local.create_bucket(conn, "metrics")
+{:ok, :written} = Local.write(conn, "cpu,host=web01 value=1.0,count=3i", database: "metrics")
+
+{:ok, rows} =
+  Local.query_flux(conn, """
+  from(bucket: "metrics")
+    |> range(start: -1h)
+    |> filter(fn: (r) => r._measurement == "cpu")
+    |> filter(fn: (r) => r._field == "value")
+  """)
+
+assert [%{"_field" => "value", "_value" => 1.0, "host" => "web01", "table" => 0}] = rows
+```
+
+Supported predicates: `from(bucket:)`, `range(start: -N[smhd])`,
+`r._measurement == "..."`, `r._field == "..."`, and `r.<tag_or_field> == "..."`.
+Against a real server, set `api_version: :v2` on the connection so writes go to
+`/api/v2/write`.
+
 ## Decimal Params
 
 `Decimal` values pass through `params:` as bare numeric literals — no

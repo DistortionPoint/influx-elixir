@@ -24,6 +24,13 @@ defmodule InfluxElixir.TelemetryTest do
     on_exit(fn -> :telemetry.detach(handler_id) end)
   end
 
+  # `system_time` must be wall-clock time (native units), i.e. within a few
+  # seconds of now — monotonic time is an arbitrary offset and would fail this.
+  defp assert_wall_clock(value) do
+    tolerance = System.convert_time_unit(5, :second, :native)
+    assert abs(value - System.system_time()) < tolerance
+  end
+
   # ---------- span_write/2 ----------
 
   describe "span_write/2" do
@@ -186,7 +193,8 @@ defmodule InfluxElixir.TelemetryTest do
       Telemetry.write_start(meta)
 
       assert_receive {:telemetry, [:influx_elixir, :write, :start], measurements, recv_meta}
-      assert is_integer(measurements.system_time)
+      assert_wall_clock(measurements.system_time)
+      assert is_integer(measurements.monotonic_time)
       assert recv_meta == meta
     end
   end
@@ -231,7 +239,8 @@ defmodule InfluxElixir.TelemetryTest do
       Telemetry.query_start(meta)
 
       assert_receive {:telemetry, [:influx_elixir, :query, :start], measurements, recv_meta}
-      assert is_integer(measurements.system_time)
+      assert_wall_clock(measurements.system_time)
+      assert is_integer(measurements.monotonic_time)
       assert recv_meta == meta
     end
   end

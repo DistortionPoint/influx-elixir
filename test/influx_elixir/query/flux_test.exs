@@ -18,7 +18,7 @@ defmodule InfluxElixir.Query.FluxTest do
       flux_query =
         "from(bucket: \"test\") |> range(start: -1h)"
 
-      assert {:ok, [%{"_measurement" => "cpu", "value" => 1.0}]} =
+      assert {:ok, [%{"_measurement" => "cpu", "_field" => "value", "_value" => 1.0}]} =
                Flux.query(conn, flux_query)
     end
   end

@@ -32,6 +32,7 @@ defmodule InfluxElixir.IntegrationHelper do
       token: env("INFLUX_V2_TOKEN", "dev-influx-token-123456789"),
       org: env("INFLUX_V2_ORG", "dev-influx"),
       database: env("INFLUX_V2_BUCKET", "metrics"),
+      api_version: :v2,
       scheme: :http,
       name: :integration_v2,
       finch_name: :integration_finch

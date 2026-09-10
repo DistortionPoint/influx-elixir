@@ -83,7 +83,7 @@ defmodule InfluxElixirTest do
       :ok = InfluxElixir.create_bucket(v2_conn, "test")
       {:ok, :written} = InfluxElixir.write(v2_conn, "cpu value=1.0", database: "test")
 
-      assert {:ok, [%{"_measurement" => "cpu", "value" => 1.0}]} =
+      assert {:ok, [%{"_measurement" => "cpu", "_field" => "value", "_value" => 1.0}]} =
                InfluxElixir.query_flux(
                  v2_conn,
                  "from(bucket: \"test\") |> range(start: -1h)"

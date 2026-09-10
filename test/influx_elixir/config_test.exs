@@ -58,12 +58,25 @@ defmodule InfluxElixir.ConfigTest do
       assert {:ok, opts} = Config.validate(base_opts)
       refute Keyword.has_key?(opts, :database)
     end
+
+    test "applies :api_version default of :v3", %{base_opts: base_opts} do
+      assert {:ok, opts} = Config.validate(base_opts)
+      assert opts[:api_version] == :v3
+    end
   end
 
   describe "validate/1 — type validation" do
     test "rejects :scheme value that is not :http or :https" do
       assert {:error, %NimbleOptions.ValidationError{}} =
                Config.validate(host: "h", token: "t", scheme: :ftp)
+    end
+
+    test "accepts :api_version :v2 and rejects anything else" do
+      assert {:ok, opts} = Config.validate(host: "h", token: "t", api_version: :v2)
+      assert opts[:api_version] == :v2
+
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Config.validate(host: "h", token: "t", api_version: :v1)
     end
 
     test "rejects :port that is not a positive integer" do

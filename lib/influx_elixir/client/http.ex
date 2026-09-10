@@ -12,19 +12,26 @@ defmodule InfluxElixir.Client.HTTP do
   resolve the Finch pool. These are typically produced by
   `InfluxElixir.Config.validate!/1`.
 
-  ## InfluxDB v3 API Endpoints
+  ## InfluxDB v3 API Endpoints (`api_version: :v3`, the default)
 
-    * Write: `POST /api/v2/write?db=DATABASE&precision=PRECISION`
+    * Write: `POST /api/v3/write_lp?db=DATABASE&precision=PRECISION`
     * SQL Query: `POST /api/v3/query_sql` (JSON body)
     * InfluxQL: `POST /api/v3/query_influxql` (JSON body)
     * Databases: `GET/POST/DELETE /api/v3/configure/database`
     * Tokens: `POST/DELETE /api/v3/configure/token`
     * Health: `GET /health`
 
-  ## InfluxDB v2 Compatibility
+  ## InfluxDB v2 (`api_version: :v2`)
 
-    * Flux: `POST /api/v2/query` (JSON body)
-    * Buckets: `GET/POST/DELETE /api/v2/buckets`
+  Set `api_version: :v2` on the connection. A v2 server answers `200` to the
+  v3 write path **without storing anything**, so the version must be explicit.
+
+    * Write: `POST /api/v2/write?org=ORG&bucket=DATABASE&precision=ns|us|ms|s`
+      (the connection's `:org` and the `:database` opt name the bucket)
+    * Flux: `POST /api/v2/query` (JSON body, `#datatype`-annotated CSV back)
+    * Buckets: `GET/POST/DELETE /api/v2/buckets`. `create_bucket/3` resolves
+      the org ID from the connection's `:org` name (override with `org_id:`);
+      `delete_bucket/2` accepts a bucket name or a 16-hex bucket ID.
 
   ## Request Timeout
 
@@ -92,28 +99,51 @@ defmodule InfluxElixir.Client.HTTP do
   def write(connection, line_protocol, opts \\ []) do
     with {:ok, database} <- resolve_database(opts, connection) do
       precision = Keyword.get(opts, :precision, "nanosecond")
-      gzip? = Keyword.get(opts, :gzip, false)
+      url = write_url(connection, database, precision)
 
-      url =
-        base_url(connection) <>
-          "/api/v3/write_lp?db=#{URI.encode(database)}" <>
-          "&precision=#{precision}"
-
-      headers = auth_headers(connection)
-
-      {body, headers} =
-        if gzip? do
-          {line_protocol, [{"content-encoding", "gzip"} | headers]}
+      headers =
+        if Keyword.get(opts, :gzip, false) do
+          [{"content-encoding", "gzip"} | auth_headers(connection)]
         else
-          {line_protocol, headers}
+          auth_headers(connection)
         end
 
       with {:ok, _response} <-
-             request(:post, url, headers, body, connection, opts, [200, 204]) do
+             request(:post, url, headers, line_protocol, connection, opts, [200, 204]) do
         {:ok, :written}
       end
     end
   end
+
+  # v3 writes go to /api/v3/write_lp. v2 only has /api/v2/write, which is
+  # org/bucket scoped and spells precision as ns/us/ms/s. A v2 server
+  # answers 200 to the v3 path without storing anything, so the version has
+  # to be declared on the connection rather than sniffed.
+  @spec write_url(keyword(), binary(), atom() | binary()) :: binary()
+  defp write_url(connection, database, precision) do
+    case api_version(connection) do
+      :v2 ->
+        org = conn_val(connection, :org, "")
+
+        base_url(connection) <>
+          "/api/v2/write?org=#{URI.encode(org)}&bucket=#{URI.encode(database)}" <>
+          "&precision=#{v2_precision(precision)}"
+
+      :v3 ->
+        base_url(connection) <>
+          "/api/v3/write_lp?db=#{URI.encode(database)}&precision=#{precision}"
+    end
+  end
+
+  @spec api_version(keyword()) :: :v2 | :v3
+  defp api_version(connection), do: conn_val(connection, :api_version, :v3)
+
+  @spec v2_precision(atom() | binary()) :: binary()
+  defp v2_precision(p) when p in [:nanosecond, "nanosecond", :ns, "ns"], do: "ns"
+  defp v2_precision(p) when p in [:microsecond, "microsecond", :us, "us"], do: "us"
+  defp v2_precision(p) when p in [:millisecond, "millisecond", :ms, "ms"], do: "ms"
+  defp v2_precision(p) when p in [:second, "second", :s, "s"], do: "s"
+  defp v2_precision(other), do: to_string(other)
 
   # ---------------------------------------------------------------------------
   # Query — v3 SQL
@@ -249,10 +279,13 @@ defmodule InfluxElixir.Client.HTTP do
   def query_flux(connection, flux, opts \\ []) do
     org = Keyword.get(opts, :org, conn_val(connection, :org, ""))
 
+    # The `#datatype` annotation lets ResponseParser type each column
+    # (double/long/boolean/RFC3339) instead of returning every cell as text.
     body =
       Jason.encode!(%{
         "query" => flux,
-        "type" => "flux"
+        "type" => "flux",
+        "dialect" => %{"annotations" => ["datatype"], "header" => true, "delimiter" => ","}
       })
 
     url = base_url(connection) <> "/api/v2/query?org=#{URI.encode(org)}"
@@ -336,22 +369,55 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: :ok | {:error, term()}
   def create_bucket(connection, name, opts \\ []) do
-    org_id = Keyword.get(opts, :org_id, "")
     retention = Keyword.get(opts, :retention, 0)
 
-    body =
-      Jason.encode!(%{
-        "name" => name,
-        "orgID" => org_id,
-        "retentionRules" => [%{"everySeconds" => retention}]
-      })
+    with {:ok, org_id} <- resolve_org_id(connection, opts) do
+      body =
+        Jason.encode!(%{
+          "name" => name,
+          "orgID" => org_id,
+          "retentionRules" => [%{"everySeconds" => retention}]
+        })
 
-    url = base_url(connection) <> "/api/v2/buckets"
-    headers = json_headers(connection)
+      url = base_url(connection) <> "/api/v2/buckets"
+      headers = json_headers(connection)
 
-    with {:ok, _response} <-
-           request(:post, url, headers, body, connection, opts, [200, 201]) do
-      :ok
+      case request(:post, url, headers, body, connection, opts, [200, 201]) do
+        {:ok, _response} ->
+          :ok
+
+        # Creating a bucket that already exists is idempotent, matching
+        # Client.Local and the 409 handling in create_database/3.
+        {:error, %{status: 422, body: resp_body}} = error ->
+          if String.contains?(to_string(resp_body), "already exists"), do: :ok, else: error
+
+        error ->
+          error
+      end
+    end
+  end
+
+  # v2 buckets belong to an org by ID, not name. `opts[:org_id]` wins;
+  # otherwise the ID is looked up from the connection's `:org` name.
+  @spec resolve_org_id(keyword(), keyword()) :: {:ok, binary()} | {:error, term()}
+  defp resolve_org_id(connection, opts) do
+    case Keyword.get(opts, :org_id) do
+      nil -> lookup_org_id(connection, conn_val(connection, :org, ""))
+      org_id -> {:ok, org_id}
+    end
+  end
+
+  @spec lookup_org_id(keyword(), binary()) :: {:ok, binary()} | {:error, term()}
+  defp lookup_org_id(connection, org) do
+    url = base_url(connection) <> "/api/v2/orgs?org=#{URI.encode(org)}"
+
+    with {:ok, %Finch.Response{body: body}} <-
+           request(:get, url, auth_headers(connection), nil, connection, [], [200]),
+         {:ok, %{"orgs" => [%{"id" => id} | _rest]}} <- Jason.decode(body) do
+      {:ok, id}
+    else
+      {:ok, _no_orgs} -> {:error, {:org_not_found, org}}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -375,16 +441,44 @@ defmodule InfluxElixir.Client.HTTP do
   @impl true
   @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_bucket(connection, bucket_id) do
-    url =
-      base_url(connection) <>
-        "/api/v2/buckets/#{URI.encode(bucket_id)}"
+  def delete_bucket(connection, bucket) do
+    with {:ok, bucket_id} <- resolve_bucket_id(connection, bucket) do
+      url = base_url(connection) <> "/api/v2/buckets/#{URI.encode(bucket_id)}"
+      headers = auth_headers(connection)
 
-    headers = auth_headers(connection)
+      with {:ok, _response} <-
+             request(:delete, url, headers, nil, connection, [], [200, 204]) do
+        :ok
+      end
+    end
+  end
 
-    with {:ok, _response} <-
-           request(:delete, url, headers, nil, connection, [], [200, 204]) do
-      :ok
+  # The v2 API deletes by 16-hex bucket ID, while Client.Local deletes by
+  # name. Accept either so callers can pass the name against both clients.
+  @spec resolve_bucket_id(keyword(), binary()) :: {:ok, binary()} | {:error, term()}
+  defp resolve_bucket_id(connection, bucket) do
+    if String.match?(bucket, ~r/^[0-9a-f]{16}$/) do
+      {:ok, bucket}
+    else
+      lookup_bucket_id(connection, bucket)
+    end
+  end
+
+  @spec lookup_bucket_id_error(binary()) :: {:error, term()}
+  defp lookup_bucket_id_error(name),
+    do: {:error, %{status: 404, body: "bucket not found: #{name}"}}
+
+  @spec lookup_bucket_id(keyword(), binary()) :: {:ok, binary()} | {:error, term()}
+  defp lookup_bucket_id(connection, name) do
+    url = base_url(connection) <> "/api/v2/buckets?name=#{URI.encode(name)}"
+
+    with {:ok, %Finch.Response{body: body}} <-
+           request(:get, url, auth_headers(connection), nil, connection, [], [200]),
+         {:ok, %{"buckets" => [%{"id" => id} | _rest]}} <- Jason.decode(body) do
+      {:ok, id}
+    else
+      {:ok, _no_buckets} -> lookup_bucket_id_error(name)
+      {:error, _reason} = error -> error
     end
   end
 

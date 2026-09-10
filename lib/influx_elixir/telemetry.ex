@@ -128,11 +128,15 @@ defmodule InfluxElixir.Telemetry do
   """
   @spec write_start(map()) :: :ok
   def write_start(metadata) do
-    :telemetry.execute(
-      @write_event ++ [:start],
-      %{system_time: System.monotonic_time()},
-      metadata
-    )
+    :telemetry.execute(@write_event ++ [:start], start_measurements(), metadata)
+  end
+
+  # Same measurements `:telemetry.span/3` emits on :start. `system_time` is
+  # wall-clock (it was monotonic time before, which is an arbitrary offset
+  # and useless as a timestamp); `monotonic_time` is for duration maths.
+  @spec start_measurements() :: %{system_time: integer(), monotonic_time: integer()}
+  defp start_measurements do
+    %{system_time: System.system_time(), monotonic_time: System.monotonic_time()}
   end
 
   @doc """
@@ -207,11 +211,7 @@ defmodule InfluxElixir.Telemetry do
   """
   @spec query_start(map()) :: :ok
   def query_start(metadata) do
-    :telemetry.execute(
-      @query_event ++ [:start],
-      %{system_time: System.monotonic_time()},
-      metadata
-    )
+    :telemetry.execute(@query_event ++ [:start], start_measurements(), metadata)
   end
 
   @doc """

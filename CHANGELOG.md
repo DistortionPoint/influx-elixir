@@ -7,7 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`Client.Local.query_flux/3` returns the long row shape real Flux returns**:
+  one row per field with `_field`/`_value`, `_measurement`, `_time` (a
+  `DateTime`), the tags, `result` and a per-series `table` index, ordered by
+  table then time. `filter(fn: (r) => r._field == "...")` is honoured. The old
+  wide rows (`%{"_measurement", "<field>" => v, "time"}`) could not exercise
+  consumer Flux handling; verified against InfluxDB 2.7.
+- **`Client.HTTP.query_flux/3` requests `#datatype` annotations** so CSV cells
+  come back typed (`double`, `long`, `unsignedLong`, `boolean`, RFC3339 →
+  `DateTime`) instead of as strings.
+- `Query.ResponseParser.coerce_types/1` also converts `_time`, `_start` and
+  `_stop`. `parse/2` returns `{:error, {:unexpected_json, term}}` for a JSON
+  scalar body instead of raising `CaseClauseError`.
+
+### Added
+- `api_version: :v2 | :v3` connection option (`InfluxElixir.Config`). Required
+  for InfluxDB 2.x: a v2 server answers `200` to the v3 write path **without
+  storing anything**, so writes silently vanished and malformed line protocol
+  or an unknown bucket reported success. With `:v2` the client uses
+  `POST /api/v2/write?org=&bucket=&precision=ns|us|ms|s`.
+
 ### Fixed
+- **`Client.HTTP.create_bucket/3` works against real InfluxDB v2.** It sent
+  `"orgID": ""`, which v2 rejects (`id must have a length of 16 bytes`). The org
+  ID is now resolved from the connection's `:org` name (`org_id:` overrides).
+  Creating a bucket that already exists is treated as success, matching
+  `Client.Local`.
+- **`Client.HTTP.delete_bucket/2` accepts a bucket name.** v2 deletes by ID;
+  the name is resolved via `GET /api/v2/buckets?name=`, so the same call works
+  against `Client.Local`. A 16-hex argument is used as an ID directly.
+- **Flux CSV parsing uses NimbleCSV.** The hand-rolled splitter left `\r` on
+  every last cell and header, turned the blank line between tables into a row
+  and the next table's header into data, and broke quoted cells containing
+  commas. All were observed against InfluxDB 2.7.
+- **`LineProtocol` floats no longer lose precision.** `{:decimals, 17}`
+  formatting wrote `1.0e-20` as `0.0`; the shortest round-trip form is used
+  (`1.0e-20`, `2.5e-7`), which InfluxDB 3 Core accepts and reads back exactly.
+- **`Telemetry.write_start/1` and `query_start/1` emit wall-clock
+  `system_time`.** They emitted `System.monotonic_time/0` under that key, an
+  arbitrary offset that is useless as a timestamp. A `monotonic_time`
+  measurement is emitted alongside, matching `:telemetry.span/3`.
+- **`Flight.Client.query/3` closes the gRPC channel when `DoGet` fails**; it
+  was only disconnected on success.
 - **`Flight.Reader` row assembly is linear in the batch's row count.** Cells
   were read with `Enum.at/2` on the column lists for every row, which made
   decoding a record batch quadratic; columns are now tuples read with `elem/2`.

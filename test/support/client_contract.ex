@@ -801,12 +801,13 @@ defmodule InfluxElixir.ClientContract do
   defp flux_tests(client) do
     quote do
       describe "query_flux/3 — contract" do
-        test "returns {:ok, rows} for a flux query", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_flux value=42.0",
-            database: ctx.database
-          )
+        test "returns long-format rows with typed values", ctx do
+          {:ok, :written} =
+            unquote(client).write(
+              ctx.conn,
+              "contract_flux,host=web01 value=42.0,count=3i",
+              database: ctx.database
+            )
 
           if ctx[:query_delay] && ctx.query_delay > 0,
             do: Process.sleep(ctx.query_delay)
@@ -818,7 +819,38 @@ defmodule InfluxElixir.ClientContract do
           """
 
           {:ok, rows} = unquote(client).query_flux(ctx.conn, flux)
-          assert is_list(rows)
+
+          # One row per field, values typed, timestamps as DateTime.
+          by_field = Map.new(rows, &{&1["_field"], &1})
+          assert %{"_value" => 42.0, "host" => "web01"} = by_field["value"]
+          assert %{"_value" => 3, "_measurement" => "contract_flux"} = by_field["count"]
+          assert %DateTime{} = by_field["value"]["_time"]
+          assert Enum.all?(rows, &(&1["result"] == "_result" and is_integer(&1["table"])))
+        end
+
+        test "filters on _field keep only that field", ctx do
+          # Unique measurement: a real server keeps data between runs.
+          measurement = "contract_flux_field_#{System.unique_integer([:positive])}"
+
+          {:ok, :written} =
+            unquote(client).write(
+              ctx.conn,
+              "#{measurement} a=1.0,b=2.0",
+              database: ctx.database
+            )
+
+          if ctx[:query_delay] && ctx.query_delay > 0,
+            do: Process.sleep(ctx.query_delay)
+
+          flux = """
+          from(bucket: "#{ctx.database}")
+            |> range(start: -1h)
+            |> filter(fn: (r) => r._measurement == "#{measurement}")
+            |> filter(fn: (r) => r._field == "b")
+          """
+
+          {:ok, rows} = unquote(client).query_flux(ctx.conn, flux)
+          assert [%{"_field" => "b", "_value" => 2.0}] = rows
         end
       end
     end

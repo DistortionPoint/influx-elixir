@@ -49,12 +49,7 @@ defmodule InfluxElixir.Write.LineProtocol do
       "cpu,host=server01 count=42i 1630424257000000000"
   """
   @spec encode(Point.t() | [Point.t()]) :: encode_result()
-  def encode(%Point{} = point) do
-    case encode_point(point) do
-      {:ok, line} -> {:ok, line}
-      {:error, reason} -> {:error, reason}
-    end
-  end
+  def encode(%Point{} = point), do: encode_point(point)
 
   def encode(points) when is_list(points) do
     points
@@ -193,10 +188,11 @@ defmodule InfluxElixir.Write.LineProtocol do
     "#{value}i"
   end
 
+  # `:short` is the shortest representation that round-trips exactly and
+  # always contains a `.` or an exponent. The previous `{:decimals, 17}`
+  # rounded to 17 decimal places, so 1.0e-20 was written as 0.0.
   defp encode_field_value(value) when is_float(value) do
-    # Use Erlang's float_to_list for full precision
-    :erlang.float_to_binary(value, [:compact, {:decimals, 17}])
-    |> normalize_float_string()
+    :erlang.float_to_binary(value, [:short])
   end
 
   defp encode_field_value(value) when is_binary(value) do
@@ -210,14 +206,4 @@ defmodule InfluxElixir.Write.LineProtocol do
 
   defp encode_field_value(true), do: "true"
   defp encode_field_value(false), do: "false"
-
-  # Ensure the float string always has a decimal point
-  @spec normalize_float_string(binary()) :: binary()
-  defp normalize_float_string(str) do
-    if String.contains?(str, ".") or String.contains?(str, "e") do
-      str
-    else
-      str <> ".0"
-    end
-  end
 end

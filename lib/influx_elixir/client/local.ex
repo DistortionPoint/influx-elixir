@@ -543,7 +543,17 @@ defmodule InfluxElixir.Client.Local do
     * `from(bucket: "...")` — scopes to a database
     * `range(start: -1h)` — filters by timestamp (supports `-Nh`, `-Nd`, `-Nm`)
     * `filter(fn: (r) => r._measurement == "...")` — filters by measurement
+    * `filter(fn: (r) => r._field == "...")` — keeps only that field
     * `filter(fn: (r) => r.<key> == "...")` — filters by any tag/field equality
+
+  Rows use the same **long** shape real Flux returns — one row per field,
+  ordered by `table` then `_time`:
+
+      %{"result" => "_result", "table" => 0, "_time" => %DateTime{},
+        "_measurement" => "cpu", "_field" => "value", "_value" => 1.0,
+        "host" => "web01"}
+
+  `table` numbers each series (measurement + tags + field) from `0`.
   """
   @impl true
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
@@ -563,8 +573,58 @@ defmodule InfluxElixir.Client.Local do
       points
       |> apply_flux_range(flux)
       |> apply_flux_filters(flux)
-      |> Enum.map(&flux_point_to_row/1)
+      |> flux_rows(extract_flux_field(flux))
       |> then(&{:ok, &1})
+    end
+  end
+
+  # Real Flux output is long: one row per field carrying `_field`/`_value`,
+  # `_measurement`, `_time`, the tags, and a `table` index per series.
+  # Emitting the same shape means a consumer's Flux handling can be
+  # exercised against the double.
+  @spec flux_rows([point_map()], binary() | nil) :: [map()]
+  defp flux_rows(points, only_field) do
+    {rows, _tables} =
+      points
+      |> Enum.flat_map(fn point ->
+        for {field, value} <- point.fields,
+            only_field in [nil, field],
+            do: {point, field, value}
+      end)
+      |> Enum.map_reduce(%{}, fn {point, field, value}, tables ->
+        series = {point.measurement, point.tags, field}
+
+        {table, tables} =
+          Map.get_and_update(tables, series, &{&1 || map_size(tables), &1 || map_size(tables)})
+
+        row =
+          Map.merge(point.tags, %{
+            "result" => "_result",
+            "table" => table,
+            "_time" => nanoseconds_to_datetime(point.timestamp),
+            "_value" => value,
+            "_field" => field,
+            "_measurement" => point.measurement
+          })
+
+        {row, tables}
+      end)
+
+    Enum.sort_by(rows, &{&1["table"], &1["_time"]}, fn
+      {t1, %DateTime{} = a}, {t2, %DateTime{} = b} when t1 == t2 -> DateTime.compare(a, b) != :gt
+      {t1, _a}, {t2, _b} -> t1 <= t2
+    end)
+  end
+
+  @spec nanoseconds_to_datetime(integer() | nil) :: DateTime.t() | nil
+  defp nanoseconds_to_datetime(nil), do: nil
+  defp nanoseconds_to_datetime(ns), do: DateTime.from_unix!(ns, :nanosecond)
+
+  @spec extract_flux_field(binary()) :: binary() | nil
+  defp extract_flux_field(flux) do
+    case Regex.run(~r/filter\s*\(\s*fn\s*:\s*\(r\)\s*=>\s*r\._field\s*==\s*"([^"]+)"/, flux) do
+      [_full, field] -> field
+      _no_match -> nil
     end
   end
 
@@ -2261,11 +2321,6 @@ defmodule InfluxElixir.Client.Local do
   end
 
   # Flux responses include _measurement (v2 compatibility format)
-  defp flux_point_to_row(point) do
-    point
-    |> point_to_row()
-    |> Map.put("_measurement", point.measurement)
-  end
 
   @spec nanoseconds_to_iso8601(integer() | nil) :: binary() | nil
   defp nanoseconds_to_iso8601(nil), do: nil
@@ -2341,7 +2396,7 @@ defmodule InfluxElixir.Client.Local do
     pattern = ~r/filter\s*\(\s*fn\s*:\s*\(r\)\s*=>\s*r\.(\w+)\s*==\s*"([^"]+)"/
 
     Regex.scan(pattern, flux)
-    |> Enum.reject(fn [_full, key, _val] -> key == "_measurement" end)
+    |> Enum.reject(fn [_full, key, _val] -> key in ["_measurement", "_field"] end)
     |> Enum.reduce(points, fn [_full, key, value], acc ->
       Enum.filter(acc, fn point ->
         Map.get(point.tags, key) == value or

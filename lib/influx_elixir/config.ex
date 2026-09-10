@@ -19,6 +19,9 @@ defmodule InfluxElixir.Config do
     * `:port` - Port number (default: `8086`)
     * `:scheme` - `:http` or `:https` (default: `:https`)
     * `:pool_size` - Finch connection pool size (default: `10`)
+    * `:api_version` - `:v3` (default) or `:v2`. Selects the write endpoint
+      in `InfluxElixir.Client.HTTP`; a v2 server accepts the v3 write path
+      with `200` but stores nothing, so declare `:v2` for InfluxDB 2.x.
 
   ## Example
 
@@ -72,6 +75,11 @@ defmodule InfluxElixir.Config do
       type: :pos_integer,
       default: 10,
       doc: "Finch connection pool size"
+    ],
+    api_version: [
+      type: {:in, [:v2, :v3]},
+      default: :v3,
+      doc: "InfluxDB API generation: :v3 (default) or :v2"
     ],
     name: [
       type: :atom,
