@@ -262,9 +262,35 @@ test "hourly average temperature", %{conn: conn} do
 end
 ```
 
-Supported aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`.
-Ordered aggregates: `first(field, time)`, `last(field, time)` — for OHLCV candle queries.
+Supported aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX` (one argument).
+Ordered aggregates use the InfluxDB v3 SQL (DataFusion) spelling:
+`first_value(field ORDER BY col [ASC|DESC])` and
+`last_value(field ORDER BY col [ASC|DESC])` — for OHLCV candles and
+"latest value per group" queries:
+
+```elixir
+sql = """
+SELECT symbol, last_value(price ORDER BY time) AS price
+FROM prices
+WHERE time >= $start
+GROUP BY symbol, provider
+"""
+```
+
+The `ORDER BY` inside the call is required. Without it the real engine
+returns an *arbitrary* row from each group, which the double cannot
+reproduce, so it rejects the query instead of certifying a
+non-deterministic result. InfluxQL-style `FIRST(field, time)` /
+`LAST(field, time)` are rejected too: InfluxDB v3 SQL has no such
+functions (the real engine fails planning with `Invalid function 'last'`),
+and a double that accepted them would pass tests for a query that 400s in
+production.
+
 Supported interval units: `seconds`, `minutes`, `hours`, `days`.
+
+Anything outside the supported subset is rejected with
+`{:error, %{status: 400, body: "Client.Local: ..."}}`. The `Client.Local:`
+prefix tells you the double, not InfluxDB, refused the query.
 
 `GROUP BY DATE_BIN` is optional. When omitted, aggregate queries return a
 single scalar row over all matching points:
@@ -311,9 +337,26 @@ params = %{"$min" => Decimal.new("1000.00")}
 {:ok, rows} = Local.query_sql(conn, sql, database: "test_db", params: params)
 ```
 
-Pre-stringified numeric values (`"1000.00"`) are also coerced back to
-numbers before comparison, so callers using `Decimal.to_string/1` for
-serialisation aren't penalised with silent string-vs-float comparisons.
+Do **not** pass pre-stringified numbers (`"1000.00"`) as params. A string
+param becomes a string literal, and InfluxDB v3 compares a numeric column
+against a string literal by casting the column to text — so
+`amount >= '1000.00'` is a lexical comparison in which `500.0` matches.
+`Client.Local` reproduces that so the mistake fails in tests rather than
+in production.
+
+## WHERE Literal Typing
+
+Quoted literals are always strings, exactly as in InfluxDB v3. A
+zero-padded identifier keeps its leading zero and matches a string tag:
+
+```elixir
+sql = "SELECT * FROM accounts WHERE repcode IN ($rc)"
+{:ok, rows} = Local.query_sql(conn, sql, database: "test_db", params: %{rc: "08338636"})
+```
+
+Bare literals are typed (`42` integer, `1.5` float, `true` boolean). A bare
+numeric literal never matches a string tag (`WHERE repcode = 08338636`
+returns no rows), again matching the real engine.
 
 ## Multi-Column Projection
 

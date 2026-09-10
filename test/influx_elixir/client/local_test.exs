@@ -587,6 +587,29 @@ defmodule InfluxElixir.Client.LocalTest do
       assert length(rows) == 1
       assert hd(rows)["host"] == "web02"
     end
+
+    test "a placeholder that prefixes another is substituted whole",
+         %{conn: conn, db: db} do
+      # Sequential replacement rewrote `$h` inside `$hmin`, producing
+      # `'web02'min` and a parse failure.
+      sql = "SELECT * FROM cpu WHERE host = $h AND usage > $hmin"
+      params = %{h: "web02", hmin: 15}
+      assert {:ok, [row]} = Local.query_sql(conn, sql, params: params, database: db)
+      assert row["host"] == "web02"
+    end
+
+    test "an unbound placeholder is left untouched", %{conn: conn, db: db} do
+      sql = "SELECT * FROM cpu WHERE host = $host AND usage > $min"
+      params = %{min: 15}
+      assert {:ok, []} = Local.query_sql(conn, sql, params: params, database: db)
+    end
+
+    test "a substituted value is never re-substituted", %{conn: conn, db: db} do
+      # A string value containing another placeholder's name must stay literal.
+      sql = "SELECT * FROM cpu WHERE host = $host AND usage > $min"
+      params = %{host: "$min", min: 15}
+      assert {:ok, []} = Local.query_sql(conn, sql, params: params, database: db)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -1716,7 +1739,7 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "agg_db", hour: hour}
     end
 
-    test "AVG with 2-hour buckets", %{conn: conn, db: db, hour: hour} do
+    test "AVG with 2-hour buckets", %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '2 hours', time) AS time,
@@ -1739,7 +1762,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert b3["avg_usage"] == 55.0
     end
 
-    test "SUM aggregate", %{conn: conn, db: db, hour: hour} do
+    test "SUM aggregate", %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '3 hours', time) AS time,
@@ -1760,7 +1783,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert b2["total"] == 150
     end
 
-    test "COUNT aggregate", %{conn: conn, db: db, hour: hour} do
+    test "COUNT aggregate", %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '3 hours', time) AS time,
@@ -2037,10 +2060,10 @@ defmodule InfluxElixir.Client.LocalTest do
   end
 
   # ---------------------------------------------------------------------------
-  # query_sql/3 — first() and last() ordered aggregates
+  # query_sql/3 — first_value() and last_value() ordered aggregates
   # ---------------------------------------------------------------------------
 
-  describe "query_sql/3 — first/last aggregates" do
+  describe "query_sql/3 — first_value/last_value aggregates" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "ohlcv_db")
 
@@ -2068,12 +2091,12 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "ohlcv_db", hour: hour}
     end
 
-    test "first(field, time) returns value at earliest timestamp",
+    test "first_value(field ORDER BY time) returns value at earliest timestamp",
          %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '1 hour', time) AS time,
-        first(price, time) AS open
+        first_value(price ORDER BY time) AS open
       FROM "trades"
       GROUP BY DATE_BIN(INTERVAL '1 hour', time)
       ORDER BY time ASC
@@ -2087,12 +2110,12 @@ defmodule InfluxElixir.Client.LocalTest do
       assert h1["open"] == 110.0
     end
 
-    test "last(field, time) returns value at latest timestamp",
+    test "last_value(field ORDER BY time) returns value at latest timestamp",
          %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '1 hour', time) AS time,
-        last(price, time) AS close
+        last_value(price ORDER BY time) AS close
       FROM "trades"
       GROUP BY DATE_BIN(INTERVAL '1 hour', time)
       ORDER BY time ASC
@@ -2111,10 +2134,10 @@ defmodule InfluxElixir.Client.LocalTest do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '1 hour', time) AS time,
-        first(price, time) AS open,
+        first_value(price ORDER BY time) AS open,
         MAX(price) AS high,
         MIN(price) AS low,
-        last(price, time) AS close,
+        last_value(price ORDER BY time) AS close,
         SUM(volume) AS volume
       FROM "trades"
       GROUP BY DATE_BIN(INTERVAL '1 hour', time)
@@ -2141,45 +2164,116 @@ defmodule InfluxElixir.Client.LocalTest do
       assert h1["volume"] == 60
     end
 
-    test "single-arg first(field) defaults ordering to time",
+    test "first_value(field ORDER BY time DESC) returns value at latest timestamp",
          %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '1 hour', time) AS time,
-        first(price) AS open
+        first_value(price ORDER BY time DESC) AS latest
       FROM "trades"
       GROUP BY DATE_BIN(INTERVAL '1 hour', time)
       ORDER BY time ASC
       """
 
-      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
-      [h0, _h1] = rows
-      assert h0["open"] == 100.0
+      assert {:ok, [h0, h1]} = Local.query_sql(conn, sql, database: db)
+      assert h0["latest"] == 102.0
+      assert h1["latest"] == 112.0
     end
 
-    test "single-arg last(field) defaults ordering to time",
+    test "last_value(field ORDER BY time DESC) returns value at earliest timestamp",
          %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '1 hour', time) AS time,
-        last(price) AS close
+        last_value(price ORDER BY time DESC) AS earliest
       FROM "trades"
       GROUP BY DATE_BIN(INTERVAL '1 hour', time)
       ORDER BY time ASC
       """
 
-      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
-      [h0, _h1] = rows
-      assert h0["close"] == 102.0
+      assert {:ok, [h0, h1]} = Local.query_sql(conn, sql, database: db)
+      assert h0["earliest"] == 100.0
+      assert h1["earliest"] == 110.0
     end
 
-    test "first/last with WHERE filter",
+    test "latest value per group via GROUP BY columns", %{conn: conn, db: db} do
+      # The shape from #13: server-side "latest per (symbol, provider)".
+      Local.write(
+        conn,
+        "quotes,symbol=BTC,provider=a price=1.0 100\n" <>
+          "quotes,symbol=BTC,provider=a price=2.0 200\n" <>
+          "quotes,symbol=ETH,provider=a price=9.0 300\n" <>
+          "quotes,symbol=ETH,provider=a price=8.0 150",
+        database: db
+      )
+
+      sql = """
+      SELECT symbol, last_value(price ORDER BY time) AS price
+      FROM quotes
+      GROUP BY symbol, provider
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      by_symbol = Map.new(rows, &{&1["symbol"], &1["price"]})
+      assert by_symbol == %{"BTC" => 2.0, "ETH" => 9.0}
+    end
+
+    test "first_value without ORDER BY is rejected as non-deterministic",
+         %{conn: conn, db: db} do
+      # Real DataFusion returns an arbitrary group member here. Certifying
+      # "earliest" would be a lie, so the double refuses and says why.
+      sql = "SELECT first_value(price) AS open FROM \"trades\""
+
+      assert {:error, %{status: 400, body: body}} =
+               Local.query_sql(conn, sql, database: db)
+
+      assert body =~ "Client.Local:"
+      assert body =~ "ORDER BY"
+      assert body =~ "first_value(field ORDER BY time)"
+    end
+
+    test "InfluxQL FIRST()/LAST() are rejected with a pointer to the v3 spelling",
+         %{conn: conn, db: db} do
+      # InfluxDB v3 SQL fails planning with "Invalid function 'last'" (#13).
+      for sql <- [
+            "SELECT FIRST(price, time) AS open FROM \"trades\"",
+            "SELECT last(price) AS close FROM \"trades\""
+          ] do
+        assert {:error, %{status: 400, body: body}} =
+                 Local.query_sql(conn, sql, database: db)
+
+        assert body =~ "Client.Local:"
+        assert body =~ "InfluxQL"
+        assert body =~ "last_value(field ORDER BY time)"
+      end
+    end
+
+    test "a malformed first_value call is rejected", %{conn: conn, db: db} do
+      sql = "SELECT first_value(price ORDER BY time, symbol) AS open FROM \"trades\""
+
+      assert {:error, %{status: 400, body: body}} =
+               Local.query_sql(conn, sql, database: db)
+
+      assert body =~ "Client.Local: invalid aggregate"
+    end
+
+    test "a second argument to a plain aggregate is rejected", %{conn: conn, db: db} do
+      # AVG(price, time) is not SQL; the real engine rejects it.
+      sql = "SELECT AVG(price, time) AS avg FROM \"trades\""
+
+      assert {:error, %{status: 400, body: body}} =
+               Local.query_sql(conn, sql, database: db)
+
+      assert body =~ "Client.Local: invalid aggregate"
+    end
+
+    test "first_value/last_value with WHERE filter",
          %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '2 hours', time) AS time,
-        first(price, time) AS open,
-        last(price, time) AS close
+        first_value(price ORDER BY time) AS open,
+        last_value(price ORDER BY time) AS close
       FROM "trades"
       WHERE price > 104
       GROUP BY DATE_BIN(INTERVAL '2 hours', time)
@@ -2196,13 +2290,13 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["close"] == 112.0
     end
 
-    test "first/last on non-existent measurement returns error",
+    test "first_value/last_value on non-existent measurement returns error",
          %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '1 hour', time) AS time,
-        first(price, time) AS open,
-        last(price, time) AS close
+        first_value(price ORDER BY time) AS open,
+        last_value(price ORDER BY time) AS close
       FROM "nonexistent"
       GROUP BY DATE_BIN(INTERVAL '1 hour', time)
       ORDER BY time ASC
@@ -2444,6 +2538,101 @@ defmodule InfluxElixir.Client.LocalTest do
   end
 
   # ---------------------------------------------------------------------------
+  # query_sql/3 — quoted literals are strings (#12)
+  #
+  # Every expectation below was checked against a live InfluxDB 3 Core
+  # (/api/v3/query_sql). DataFusion never re-types a quoted literal, and it
+  # compares a numeric column against a string literal by casting the
+  # column to text.
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — quoted literals stay strings" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "lit_db")
+
+      Local.write(
+        conn,
+        "acct,repcode=08338636 amount=500.0 1000\n" <>
+          "acct,repcode=12345678 amount=5000.0 2000",
+        database: "lit_db"
+      )
+
+      {:ok, db: "lit_db"}
+    end
+
+    test "= keeps the leading zero and matches the string tag", %{conn: conn, db: db} do
+      sql = "SELECT * FROM acct WHERE repcode = '08338636'"
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["repcode"] == "08338636"
+    end
+
+    test "!= excludes only the matching string tag", %{conn: conn, db: db} do
+      sql = "SELECT * FROM acct WHERE repcode != '08338636'"
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["repcode"] == "12345678"
+    end
+
+    test "IN / NOT IN compare zero-padded literals as strings", %{conn: conn, db: db} do
+      assert {:ok, [in_row]} =
+               Local.query_sql(conn, "SELECT * FROM acct WHERE repcode IN ('08338636')",
+                 database: db
+               )
+
+      assert in_row["repcode"] == "08338636"
+
+      assert {:ok, [out_row]} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM acct WHERE repcode NOT IN ('08338636')",
+                 database: db
+               )
+
+      assert out_row["repcode"] == "12345678"
+    end
+
+    test "a bound string param keeps its leading zero", %{conn: conn, db: db} do
+      # The exact repro from #12: params %{"rc" => "08338636"}.
+      sql = "SELECT * FROM acct WHERE repcode IN ($rc)"
+
+      assert {:ok, [row]} =
+               Local.query_sql(conn, sql, database: db, params: %{"rc" => "08338636"})
+
+      assert row["repcode"] == "08338636"
+    end
+
+    test "a bare numeric literal does not match a string tag", %{conn: conn, db: db} do
+      # Real engine: WHERE repcode = 08338636 returns no rows.
+      sql = "SELECT * FROM acct WHERE repcode = 08338636"
+      assert {:ok, []} = Local.query_sql(conn, sql, database: db)
+    end
+
+    test "a string literal against a float field compares as text", %{conn: conn, db: db} do
+      # Real engine: '500.0' >= '1000.00' lexically, so BOTH rows come back.
+      # The double reproduces the footgun so tests fail the way prod does.
+      sql = "SELECT * FROM acct WHERE amount >= '1000.00'"
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      assert length(rows) == 2
+
+      # Real engine: 500.0 renders as "500.0", so '500' is not equal ...
+      assert {:ok, []} =
+               Local.query_sql(conn, "SELECT * FROM acct WHERE amount = '500'", database: db)
+
+      # ... but '500.0' is.
+      assert {:ok, [row]} =
+               Local.query_sql(conn, "SELECT * FROM acct WHERE amount IN ('500.0')", database: db)
+
+      assert row["amount"] == 500.0
+    end
+
+    test "a bare numeric literal against a float field compares numerically",
+         %{conn: conn, db: db} do
+      sql = "SELECT * FROM acct WHERE amount >= 1000.0"
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["amount"] == 5000.0
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # query_flux/3 — range unit coverage
   # ---------------------------------------------------------------------------
 
@@ -2638,7 +2827,7 @@ defmodule InfluxElixir.Client.LocalTest do
   # query_sql/3 — first/last with non-time ordering field
   # ---------------------------------------------------------------------------
 
-  describe "query_sql/3 — first/last with non-time ordering" do
+  describe "query_sql/3 — first_value/last_value with non-time ordering" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "ord_db")
       hour = 3_600_000_000_000
@@ -2654,12 +2843,12 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "ord_db"}
     end
 
-    test "first(value, priority) returns value from point with lowest priority",
+    test "first_value(value ORDER BY priority) returns value at lowest priority",
          %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '1 hour', time) AS time,
-        first(value, priority) AS first_val
+        first_value(value ORDER BY priority) AS first_val
       FROM events
       GROUP BY DATE_BIN(INTERVAL '1 hour', time)
       """
@@ -2669,12 +2858,12 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["first_val"] == 200
     end
 
-    test "last(value, priority) returns value from point with highest priority",
+    test "last_value(value ORDER BY priority) returns value at highest priority",
          %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '1 hour', time) AS time,
-        last(value, priority) AS last_val
+        last_value(value ORDER BY priority) AS last_val
       FROM events
       GROUP BY DATE_BIN(INTERVAL '1 hour', time)
       """

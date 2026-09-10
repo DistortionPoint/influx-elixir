@@ -7,7 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`Client.Local` ordered aggregates now use the InfluxDB v3 SQL spelling**
+  (#13). `first_value(field ORDER BY col [ASC|DESC])` and
+  `last_value(field ORDER BY col [ASC|DESC])` are parsed and executed, including
+  `GROUP BY <columns>` for "latest value per group" queries. The InfluxQL-style
+  `FIRST(field, time)` / `LAST(field, time)` the double previously accepted are
+  **rejected**: InfluxDB v3 fails planning on them (`Invalid function 'last'`),
+  so accepting them let a query pass tests and 400 in production. The rejection
+  names the v3 spelling. `first_value`/`last_value` without an inner `ORDER BY`
+  are also rejected — DataFusion returns an arbitrary group member in that case,
+  which the double cannot reproduce. Verified against a live InfluxDB 3 Core;
+  the shared contract suite now passes against the real engine (it previously
+  failed on the two `FIRST`/`LAST` tests).
+- **`Client.Local` parser rejections are prefixed `Client.Local:`** so an
+  `unsupported column expression` error reads as a limitation of the test double
+  rather than of InfluxDB. Plain aggregates (`AVG`, `SUM`, `COUNT`, `MIN`,
+  `MAX`) now reject a second argument, as the real engine does.
+
 ### Fixed
+- **`Client.Local` no longer re-types quoted string literals** (#12). A bound
+  string param or quoted literal such as `'08338636'` was parsed back through
+  `Integer.parse`, dropping the leading zero and changing the type, so
+  `WHERE repcode = $rc` / `IN ($rc)` over zero-padded identifiers never matched
+  while real InfluxDB v3 matched correctly. Quoted literals are now strings;
+  only bare literals are typed. Comparing a string literal against a numeric
+  field compares the field's text rendering, which is what DataFusion does
+  (`amount >= '1000.00'` is lexical and matches `500.0` on the real engine
+  too), so that footgun now fails in tests the same way it fails in production.
+- **`Client.Local` param substitution is whole-placeholder and single-pass.**
+  `$h` was previously replaced inside `$hmin`, and a substituted string value
+  containing another placeholder's name could be re-substituted.
 - **`query_sql_stream/3` (HTTP transport) now truly streams and no longer swallows
   errors** (#10). Previously it used `Finch.request/3`, which buffered the entire
   response body and eagerly decoded every JSONL line before yielding — giving zero

@@ -1,5 +1,12 @@
 # LocalClient `first()` / `last()` Ordered Aggregate Support
 
+> **Superseded (2026-09-10)** by
+> [`2026-09-10_localclient-v3-sql-fidelity.md`](2026-09-10_localclient-v3-sql-fidelity.md).
+> The premise below is wrong: `first(f, t)` / `last(f, t)` are InfluxQL
+> selectors, not InfluxDB v3 SQL. The real engine rejects them
+> (`Invalid function 'last'`), and the v3 spelling is
+> `first_value(f ORDER BY t)` / `last_value(f ORDER BY t)`. See GitHub #13.
+
 **Date**: 2026-03-17
 **Scope**: `InfluxElixir.Client.Local` — add `first(field, ordering)` and `last(field, ordering)` aggregate functions
 

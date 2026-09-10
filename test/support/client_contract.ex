@@ -59,6 +59,7 @@ defmodule InfluxElixir.ClientContract do
     ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
     distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
     param_tests = if v3_sql, do: param_tests(client), else: nil
+    literal_tests = if v3_sql, do: literal_tests(client), else: nil
     precision_tests = if v3_sql, do: precision_tests(client), else: nil
     gzip_tests = if v3_sql, do: gzip_tests(client), else: nil
     escaping_tests = if v3_sql, do: escaping_tests(client), else: nil
@@ -90,6 +91,7 @@ defmodule InfluxElixir.ClientContract do
         ordered_agg_tests,
         distinct_tests,
         param_tests,
+        literal_tests,
         precision_tests,
         gzip_tests,
         escaping_tests,
@@ -987,6 +989,91 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
+  # WHERE literal typing (v3_core, v3_enterprise)
+  #
+  # Pins the DataFusion rules a test double must reproduce (#12): a quoted
+  # literal is a string and is never re-typed; a string literal against a
+  # numeric column compares the column's text rendering.
+  # ---------------------------------------------------------------------------
+
+  defp literal_tests(client) do
+    quote do
+      describe "query_sql/3 — WHERE literal typing contract" do
+        setup ctx do
+          unquote(client).write(
+            ctx.conn,
+            "contract_lit,repcode=08338636 amount=500.0 1700000000000000000\n" <>
+              "contract_lit,repcode=12345678 amount=5000.0 1700000100000000000",
+            database: ctx.database
+          )
+
+          if ctx[:query_delay] && ctx.query_delay > 0,
+            do: Process.sleep(ctx.query_delay)
+
+          :ok
+        end
+
+        test "a zero-padded quoted literal matches a string tag", ctx do
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT * FROM contract_lit WHERE repcode = '08338636'",
+              database: ctx.database
+            )
+
+          assert [%{"repcode" => "08338636"}] = rows
+        end
+
+        test "IN with a bound string param keeps the leading zero", ctx do
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT * FROM contract_lit WHERE repcode IN ($rc)",
+              database: ctx.database,
+              params: %{rc: "08338636"}
+            )
+
+          assert [%{"repcode" => "08338636"}] = rows
+        end
+
+        test "a bare numeric literal does not match a string tag", ctx do
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT * FROM contract_lit WHERE repcode = 08338636",
+              database: ctx.database
+            )
+
+          assert rows == []
+        end
+
+        test "a string literal against a float field compares as text", ctx do
+          # '500.0' >= '1000.00' lexically — both rows match. Bind a number
+          # (or write a bare literal) to get a numeric comparison.
+          {:ok, lexical} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT * FROM contract_lit WHERE amount >= '1000.00'",
+              database: ctx.database
+            )
+
+          assert length(lexical) == 2
+
+          {:ok, numeric} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT * FROM contract_lit WHERE amount >= $min",
+              database: ctx.database,
+              params: %{min: 1000.0}
+            )
+
+          assert [%{"amount" => 5000.0}] = numeric
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Timestamp precision (v3_core, v3_enterprise)
   # ---------------------------------------------------------------------------
 
@@ -1071,7 +1158,7 @@ defmodule InfluxElixir.ClientContract do
 
   defp ordered_agg_tests(client) do
     quote do
-      describe "query_sql/3 — FIRST/LAST aggregate contract" do
+      describe "query_sql/3 — first_value/last_value aggregate contract" do
         setup ctx do
           base_ts = 1_700_000_000_000_000_000
 
@@ -1091,11 +1178,11 @@ defmodule InfluxElixir.ClientContract do
           :ok
         end
 
-        test "FIRST returns the earliest value by time", ctx do
+        test "first_value(ORDER BY time) returns the earliest value", ctx do
           sql = """
           SELECT
             DATE_BIN(INTERVAL '1 hour', time) AS time,
-            FIRST(value, time) AS first_val
+            first_value(value ORDER BY time) AS first_val
           FROM contract_fl
           GROUP BY DATE_BIN(INTERVAL '1 hour', time)
           """
@@ -1111,11 +1198,11 @@ defmodule InfluxElixir.ClientContract do
           assert hd(rows)["first_val"] == 10
         end
 
-        test "LAST returns the latest value by time", ctx do
+        test "last_value(ORDER BY time) returns the latest value", ctx do
           sql = """
           SELECT
             DATE_BIN(INTERVAL '1 hour', time) AS time,
-            LAST(value, time) AS last_val
+            last_value(value ORDER BY time) AS last_val
           FROM contract_fl
           GROUP BY DATE_BIN(INTERVAL '1 hour', time)
           """
@@ -1129,6 +1216,55 @@ defmodule InfluxElixir.ClientContract do
 
           assert rows != []
           assert hd(rows)["last_val"] == 30
+        end
+
+        test "first_value(ORDER BY time DESC) returns the latest value", ctx do
+          sql = """
+          SELECT first_value(value ORDER BY time DESC) AS latest
+          FROM contract_fl
+          """
+
+          {:ok, [row]} =
+            unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+
+          assert row["latest"] == 30
+        end
+
+        test "latest value per group (the #13 shape)", ctx do
+          unquote(client).write(
+            ctx.conn,
+            "contract_latest,symbol=BTC price=1.0 1700000000000000000\n" <>
+              "contract_latest,symbol=BTC price=2.0 1700000100000000000\n" <>
+              "contract_latest,symbol=ETH price=9.0 1700000200000000000\n" <>
+              "contract_latest,symbol=ETH price=8.0 1700000050000000000",
+            database: ctx.database
+          )
+
+          if ctx[:query_delay] && ctx.query_delay > 0,
+            do: Process.sleep(ctx.query_delay)
+
+          sql = """
+          SELECT symbol, last_value(price ORDER BY time) AS price
+          FROM contract_latest
+          GROUP BY symbol
+          """
+
+          {:ok, rows} =
+            unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+
+          assert Map.new(rows, &{&1["symbol"], &1["price"]}) ==
+                   %{"BTC" => 2.0, "ETH" => 9.0}
+        end
+
+        test "InfluxQL FIRST()/LAST() are not v3 SQL and are rejected", ctx do
+          # Real engine: "Error during planning: Invalid function 'last'".
+          for sql <- [
+                "SELECT FIRST(value, time) AS v FROM contract_fl",
+                "SELECT LAST(value) AS v FROM contract_fl"
+              ] do
+            assert {:error, %{status: 400}} =
+                     unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+          end
         end
       end
     end
@@ -1292,9 +1428,19 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert {:error, reason} = result
-          # Error must provide some diagnostic information
-          assert reason != nil
+          # Local reports a missing table as a tagged tuple; the real engine
+          # fails planning with a 400 whose body names the table.
+          case result do
+            {:error, {:table_not_found, "totally_nonexistent_table_xyz"}} ->
+              :ok
+
+            {:error, %{status: 400, body: body}} ->
+              assert body =~ "totally_nonexistent_table_xyz"
+              assert body =~ "not found"
+
+            other ->
+              flunk("unexpected error shape: #{inspect(other)}")
+          end
         end
 
         test "malformed line protocol returns {:error, _} with status info",
@@ -1306,9 +1452,9 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert {:error, reason} = result
-          # Must be a map with status (HTTP) or a descriptive term
-          assert is_map(reason) or is_tuple(reason) or is_atom(reason)
+          # Both clients reject with an HTTP-shaped 400 and a non-empty body.
+          assert {:error, %{status: 400, body: body}} = result
+          assert is_binary(body) and body != ""
         end
 
         test "delete_database for non-existent DB returns {:error, _}",
@@ -1319,8 +1465,9 @@ defmodule InfluxElixir.ClientContract do
               "contract_db_that_never_existed_xyz"
             )
 
-          assert {:error, reason} = result
-          assert reason != nil
+          # 404 from both clients, body naming the database.
+          assert {:error, %{status: 404, body: body}} = result
+          assert body =~ "contract_db_that_never_existed_xyz"
         end
       end
     end

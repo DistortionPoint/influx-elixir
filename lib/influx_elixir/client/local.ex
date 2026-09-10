@@ -58,7 +58,12 @@ defmodule InfluxElixir.Client.Local do
     * `SELECT * FROM measurement`
     * `SELECT col1, col2 [, ...] FROM measurement` with optional `AS alias`
       (projects fields and tags; `time` is selectable)
-    * `WHERE tag = 'value'` or `WHERE field > N` (supports AND)
+    * `WHERE tag = 'value'` or `WHERE field > N` (supports AND). A quoted
+      literal is always a **string**, exactly as in InfluxDB v3: `'08338636'`
+      keeps its leading zero and matches a string tag, and comparing it
+      against a numeric field compares the field's text rendering (so
+      `amount >= '1000.00'` is a lexical comparison — DataFusion casts the
+      numeric side to Utf8). Bare literals (`42`, `1.5`, `true`) are typed.
     * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)`
     * `WHERE time <op> '<datetime>'` accepts ISO-8601 datetimes
       (`'2026-03-31T12:00:00Z'`), bare ISO dates (`'2026-03-31'`,
@@ -67,8 +72,14 @@ defmodule InfluxElixir.Client.Local do
     * `LIMIT N`
     * `$param` placeholders via `params: %{"$name" => value}` in opts
     * `DATE_BIN(INTERVAL 'N unit', time)` time bucketing
-    * Aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`
-    * Ordered aggregates: `first(field, time)`, `last(field, time)`
+    * Aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX` (one argument)
+    * Ordered aggregates: `first_value(field ORDER BY col [ASC|DESC])` and
+      `last_value(field ORDER BY col [ASC|DESC])` — the InfluxDB v3 SQL
+      (DataFusion) spelling. The `ORDER BY` is required: without it the real
+      engine returns an arbitrary row from the group, which the double cannot
+      reproduce, so it rejects the query rather than certify a
+      non-deterministic result. InfluxQL-style `FIRST(f, t)` / `LAST(f, t)`
+      are rejected because InfluxDB v3 SQL has no such functions.
     * `GROUP BY DATE_BIN(INTERVAL 'N unit', time)` — optional. When omitted,
       aggregate queries return a single scalar row (`COUNT` over an empty
       result set is `0`; other aggregates return `nil`).
@@ -76,6 +87,11 @@ defmodule InfluxElixir.Client.Local do
       Bare column names (with optional `AS alias`) are also valid in the
       `SELECT` list alongside aggregate functions.
     * Interval units: `seconds`, `minutes`, `hours`, `days`
+
+  Anything outside this subset is rejected with
+  `{:error, %{status: 400, body: "Client.Local: ..."}}`. The `Client.Local:`
+  prefix marks the rejection as a limitation of the test double rather than
+  of InfluxDB — the real engine may well accept the query.
 
   ## SQL Param Types
 
@@ -1182,7 +1198,16 @@ defmodule InfluxElixir.Client.Local do
         }
 
   # Aggregate function names recognised by the parser.
-  @aggregate_functions ~w(AVG SUM COUNT MIN MAX FIRST LAST)
+  @aggregate_functions ~w(AVG SUM COUNT MIN MAX FIRST_VALUE LAST_VALUE)
+
+  # InfluxQL selector functions that InfluxDB v3 SQL does not provide. They are
+  # routed into the aggregate parser only so the rejection can name the fix.
+  @influxql_only_functions ~w(FIRST LAST)
+
+  # first_value(field ORDER BY col [ASC|DESC]) AS alias  (and last_value).
+  # The ORDER BY group is optional in the grammar so a missing one can be
+  # reported specifically instead of as a generic parse failure.
+  @ordered_agg_pattern ~r/(?i)^\s*(FIRST_VALUE|LAST_VALUE)\s*\(\s*(\w+)\s*(?:ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?\s*)?\)\s+AS\s+(\w+)\s*$/
 
   @spec parse_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
   defp parse_select(sql) do
@@ -1211,7 +1236,10 @@ defmodule InfluxElixir.Client.Local do
     upper = String.upcase(sql)
 
     String.contains?(upper, "DATE_BIN") or
-      Enum.any?(@aggregate_functions, &String.contains?(upper, &1 <> "("))
+      Enum.any?(
+        @aggregate_functions ++ @influxql_only_functions,
+        &String.contains?(upper, &1 <> "(")
+      )
   end
 
   @spec parse_aggregate_select(binary()) ::
@@ -1287,7 +1315,7 @@ defmodule InfluxElixir.Client.Local do
       [_full, quoted, ""] -> {:ok, quoted}
       [_full, "", unquoted] -> {:ok, unescape_measurement(unquoted)}
       [_full, quoted] when quoted != "" -> {:ok, quoted}
-      _no_match -> {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
+      _no_match -> {:error, local_error("unsupported SQL: #{sql}")}
     end
   end
 
@@ -1319,7 +1347,7 @@ defmodule InfluxElixir.Client.Local do
         end
 
       _no_match ->
-        {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
+        {:error, local_error("unsupported SQL: #{sql}")}
     end
   end
 
@@ -1359,14 +1387,73 @@ defmodule InfluxElixir.Client.Local do
       String.match?(col, ~r/(?i)DATE_BIN\s*\(/) ->
         parse_date_bin_column(col)
 
-      String.match?(col, ~r/(?i)(AVG|SUM|COUNT|MIN|MAX|FIRST|LAST)\s*\(/) ->
+      String.match?(col, ~r/(?i)\b(FIRST_VALUE|LAST_VALUE)\s*\(/) ->
+        parse_ordered_agg_column(col)
+
+      String.match?(col, ~r/(?i)\b(FIRST|LAST)\s*\(/) ->
+        {:error, influxql_selector_error(col)}
+
+      String.match?(col, ~r/(?i)\b(AVG|SUM|COUNT|MIN|MAX)\s*\(/) ->
         parse_agg_column(col)
 
       String.match?(col, ~r/^\s*\w+(\s+AS\s+\w+)?\s*$/i) ->
         parse_grouping_column(col)
 
       true ->
-        {:error, %{status: 400, body: "unsupported column expression: #{col}"}}
+        {:error, local_error("unsupported column expression: #{col}")}
+    end
+  end
+
+  # FIRST()/LAST() are InfluxQL selectors. Accepting them here would certify a
+  # query the real engine rejects ("Invalid function 'last'"), so refuse and
+  # point at the v3 SQL spelling.
+  @spec influxql_selector_error(binary()) :: map()
+  defp influxql_selector_error(col) do
+    local_error(
+      "FIRST()/LAST() are InfluxQL selector functions that InfluxDB v3 SQL " <>
+        "does not provide (the real engine fails planning with " <>
+        "\"Invalid function\"). Use first_value(field ORDER BY time) / " <>
+        "last_value(field ORDER BY time) instead: #{col}"
+    )
+  end
+
+  # Parse: first_value(field ORDER BY col [ASC|DESC]) AS alias  (and last_value).
+  #
+  # Direction is folded into the aggregate atom at parse time: `:first` always
+  # means "the point with the smallest ordering value" and `:last` the largest,
+  # so first_value(... DESC) and last_value(... ASC) share one executor.
+  #
+  # ORDER BY is mandatory. DataFusion returns an arbitrary group member when it
+  # is omitted, which the double cannot reproduce — accepting the query would
+  # certify a non-deterministic result.
+  @spec parse_ordered_agg_column(binary()) ::
+          {:ok, select_column()} | {:error, term()}
+  defp parse_ordered_agg_column(col) do
+    case Regex.run(@ordered_agg_pattern, col) do
+      [_full, func, field, ordering, direction, alias_name] when ordering != "" ->
+        agg = ordered_agg_end(func, direction)
+        {:ok, {:ordered_aggregate, agg, field, ordering, alias_name}}
+
+      [_full, func, _field, "", _direction, _alias] ->
+        {:error,
+         local_error(
+           "#{func}() needs ORDER BY inside the call: InfluxDB v3 returns an " <>
+             "arbitrary row from the group without one, which this test double " <>
+             "cannot reproduce. Write #{func}(field ORDER BY time): #{col}"
+         )}
+
+      _no_match ->
+        {:error, local_error("invalid aggregate: #{col}")}
+    end
+  end
+
+  @spec ordered_agg_end(binary(), binary()) :: :first | :last
+  defp ordered_agg_end(func, direction) do
+    case {String.downcase(func), String.upcase(direction)} do
+      {"first_value", "DESC"} -> :last
+      {"first_value", _asc} -> :first
+      {"last_value", "DESC"} -> :first
+      {"last_value", _asc} -> :last
     end
   end
 
@@ -1377,7 +1464,7 @@ defmodule InfluxElixir.Client.Local do
     case Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/i, String.trim(col)) do
       [_full, name] -> {:ok, {:grouping_column, name, name}}
       [_full, name, alias_name] -> {:ok, {:grouping_column, name, alias_name}}
-      _no_match -> {:error, %{status: 400, body: "invalid column: #{col}"}}
+      _no_match -> {:error, local_error("invalid column: #{col}")}
     end
   end
 
@@ -1393,11 +1480,11 @@ defmodule InfluxElixir.Client.Local do
         {:ok, {:time_bucket, alias_name}}
 
       _no_match ->
-        {:error, %{status: 400, body: "invalid DATE_BIN: #{col}"}}
+        {:error, local_error("invalid DATE_BIN: #{col}")}
     end
   end
 
-  # Parse: AGG(field) AS alias  or  AGG(field, ordering) AS alias.
+  # Parse: AGG(field) AS alias.
   # COUNT(*) is special-cased — it counts rows regardless of field nullity
   # (matching real InfluxDB v3 / SQL semantics), so it doesn't fit the
   # `\w+`-inside-parens shape used for the other aggregates.
@@ -1416,41 +1503,20 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
+  # Exactly one argument: `AVG(field, other)` is not SQL and the real engine
+  # rejects it, so the double must not quietly accept it either.
   @spec parse_agg_column_arg(binary()) ::
           {:ok, select_column()} | {:error, term()}
   defp parse_agg_column_arg(col) do
-    two_arg =
-      ~r/(?i)(AVG|SUM|COUNT|MIN|MAX|FIRST|LAST)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s+AS\s+(\w+)/
+    one_arg = ~r/(?i)^\s*(AVG|SUM|COUNT|MIN|MAX)\s*\(\s*(\w+)\s*\)\s+AS\s+(\w+)\s*$/
 
-    one_arg =
-      ~r/(?i)(AVG|SUM|COUNT|MIN|MAX|FIRST|LAST)\s*\(\s*(\w+)\s*\)\s+AS\s+(\w+)/
-
-    case Regex.run(two_arg, col) do
-      [_full, func, field, ordering, alias_name] ->
+    case Regex.run(one_arg, col) do
+      [_full, func, field, alias_name] ->
         agg_atom = func |> String.downcase() |> String.to_existing_atom()
+        {:ok, {:aggregate, agg_atom, field, alias_name}}
 
-        if agg_atom in [:first, :last] do
-          {:ok, {:ordered_aggregate, agg_atom, field, ordering, alias_name}}
-        else
-          # Non-ordered aggregates ignore the second arg (not standard SQL)
-          {:ok, {:aggregate, agg_atom, field, alias_name}}
-        end
-
-      _no_two_arg ->
-        case Regex.run(one_arg, col) do
-          [_full, func, field, alias_name] ->
-            agg_atom = func |> String.downcase() |> String.to_existing_atom()
-
-            if agg_atom in [:first, :last] do
-              # Single-arg first/last defaults ordering to "time"
-              {:ok, {:ordered_aggregate, agg_atom, field, "time", alias_name}}
-            else
-              {:ok, {:aggregate, agg_atom, field, alias_name}}
-            end
-
-          _no_match ->
-            {:error, %{status: 400, body: "invalid aggregate: #{col}"}}
-        end
+      _no_match ->
+        {:error, local_error("invalid aggregate: #{col}")}
     end
   end
 
@@ -1463,7 +1529,7 @@ defmodule InfluxElixir.Client.Local do
 
     case Regex.run(pattern, sql) do
       [_full, interval_str] -> parse_interval(interval_str)
-      _no_match -> {:error, %{status: 400, body: "missing GROUP BY DATE_BIN"}}
+      _no_match -> {:error, local_error("missing GROUP BY DATE_BIN")}
     end
   end
 
@@ -1478,11 +1544,11 @@ defmodule InfluxElixir.Client.Local do
         if multiplier do
           {:ok, n * multiplier}
         else
-          {:error, %{status: 400, body: "unknown interval unit: #{unit}"}}
+          {:error, local_error("unknown interval unit: #{unit}")}
         end
 
       _no_match ->
-        {:error, %{status: 400, body: "invalid interval: #{interval_str}"}}
+        {:error, local_error("invalid interval: #{interval_str}")}
     end
   end
 
@@ -1514,7 +1580,7 @@ defmodule InfluxElixir.Client.Local do
         build_distinct_query(column, unescape_measurement(unquoted), rest)
 
       _no_match ->
-        {:error, %{status: 400, body: "unsupported DISTINCT query: #{sql}"}}
+        {:error, local_error("unsupported DISTINCT query: #{sql}")}
     end
   end
 
@@ -1550,7 +1616,7 @@ defmodule InfluxElixir.Client.Local do
         build_star_query(quoted, rest)
 
       _no_match ->
-        {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
+        {:error, local_error("unsupported SQL: #{sql}")}
     end
   end
 
@@ -1589,7 +1655,7 @@ defmodule InfluxElixir.Client.Local do
         build_columns_query(columns_str, quoted, rest, sql)
 
       _no_match ->
-        {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
+        {:error, local_error("unsupported SQL: #{sql}")}
     end
   end
 
@@ -1614,7 +1680,7 @@ defmodule InfluxElixir.Client.Local do
         end
 
       {:error, _reason} ->
-        {:error, %{status: 400, body: "unsupported SQL: #{sql}"}}
+        {:error, local_error("unsupported SQL: #{sql}")}
     end
   end
 
@@ -1641,7 +1707,7 @@ defmodule InfluxElixir.Client.Local do
     case Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/i, String.trim(col)) do
       [_full, name] -> {:ok, {name, name}}
       [_full, name, alias_name] -> {:ok, {name, alias_name}}
-      _no_match -> {:error, %{status: 400, body: "unsupported column: #{col}"}}
+      _no_match -> {:error, local_error("unsupported column: #{col}")}
     end
   end
 
@@ -1716,7 +1782,7 @@ defmodule InfluxElixir.Client.Local do
 
     case result do
       nil ->
-        {:error, %{status: 400, body: "unsupported WHERE clause: #{trimmed}"}}
+        {:error, local_error("unsupported WHERE clause: #{trimmed}")}
 
       condition ->
         {:ok, [condition]}
@@ -1732,14 +1798,18 @@ defmodule InfluxElixir.Client.Local do
     |> Enum.map(&parse_where_value/1)
   end
 
+  # A quoted literal is a string, full stop — exactly as in InfluxDB v3.
+  # Re-typing `'08338636'` as an integer would drop the leading zero and
+  # change the type, so `WHERE repcode = '08338636'` could never match a
+  # string tag (#12). Only bare literals are typed.
   @spec parse_where_value(binary()) :: term()
   defp parse_where_value(str) do
     cond do
       String.starts_with?(str, "'") and String.ends_with?(str, "'") ->
-        coerce_value(String.slice(str, 1..-2//1))
+        String.slice(str, 1..-2//1)
 
       String.starts_with?(str, "\"") and String.ends_with?(str, "\"") ->
-        coerce_value(String.slice(str, 1..-2//1))
+        String.slice(str, 1..-2//1)
 
       str == "true" ->
         true
@@ -1752,10 +1822,7 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  # Coerce a bare or quote-stripped value: try integer, then float, else
-  # leave as string. Quoting alone shouldn't trap a numeric literal as a
-  # string — that would silently turn `amount >= '1000.00'` into a string
-  # comparison via Elixir term ordering.
+  # Type a bare literal: integer, then float, else leave it as a string.
   @spec coerce_value(binary()) :: term()
   defp coerce_value(str) do
     case Integer.parse(str) do
@@ -2061,12 +2128,12 @@ defmodule InfluxElixir.Client.Local do
 
   defp matches_condition?(point, {:in, key, values}) do
     actual = Map.get(point.tags, key) || Map.get(point.fields, key)
-    Enum.member?(values, actual)
+    Enum.any?(values, &compare(actual, :eq, &1))
   end
 
   defp matches_condition?(point, {:not_in, key, values}) do
     actual = Map.get(point.tags, key) || Map.get(point.fields, key)
-    not Enum.member?(values, actual)
+    not Enum.any?(values, &compare(actual, :eq, &1))
   end
 
   defp matches_condition?(point, {op, "time", value}) do
@@ -2132,9 +2199,19 @@ defmodule InfluxElixir.Client.Local do
   # Both nil-actual (missing column) and nil-value (unparseable comparand)
   # short-circuit to false. Without this guard, Elixir term ordering would
   # silently produce wrong results (e.g. `5 > nil` is `true`).
+  #
+  # A string literal against a non-string column compares the column's text
+  # rendering, which is what DataFusion does (it casts the numeric side to
+  # Utf8): `amount >= '1000.00'` is lexical, so 500.0 matches. The double
+  # reproduces that so a test written against it fails the same way
+  # production would.
   @spec compare(term(), atom(), term()) :: boolean()
   defp compare(nil, _op, _value), do: false
   defp compare(_actual, _op, nil), do: false
+
+  defp compare(actual, op, value) when is_binary(value) and not is_binary(actual),
+    do: compare(to_string(actual), op, value)
+
   defp compare(actual, :eq, value), do: actual == value
   defp compare(actual, :ne, value), do: actual != value
   defp compare(actual, :gt, value), do: actual > value
@@ -2261,10 +2338,17 @@ defmodule InfluxElixir.Client.Local do
   @spec resolve_params(binary(), map()) :: binary()
   defp resolve_params(sql, params) when map_size(params) == 0, do: sql
 
+  # One pass over the SQL, whole placeholders only: a sequential
+  # String.replace/3 per param rewrote `$a` inside `$ab` and could
+  # re-substitute inside an already-substituted value.
   defp resolve_params(sql, params) do
-    Enum.reduce(params, sql, fn {key, value}, acc ->
-      placeholder = normalize_param_key(key)
-      String.replace(acc, placeholder, to_sql_literal(value))
+    lookup = Map.new(params, fn {key, value} -> {normalize_param_key(key), value} end)
+
+    Regex.replace(~r/\$\w+/, sql, fn placeholder ->
+      case Map.fetch(lookup, placeholder) do
+        {:ok, value} -> to_sql_literal(value)
+        :error -> placeholder
+      end
     end)
   end
 
@@ -2316,6 +2400,11 @@ defmodule InfluxElixir.Client.Local do
         0
     end
   end
+
+  # Every parser rejection carries this prefix so a consumer reading
+  # "unsupported ..." knows the test double, not InfluxDB, refused the query.
+  @spec local_error(binary()) :: %{status: 400, body: binary()}
+  defp local_error(message), do: %{status: 400, body: "Client.Local: " <> message}
 
   @spec generate_id() :: binary()
   defp generate_id do
