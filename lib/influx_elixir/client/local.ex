@@ -292,11 +292,14 @@ defmodule InfluxElixir.Client.Local do
   """
   @spec stop(conn()) :: :ok
   def stop(%{table: table}) do
-    if :ets.info(table) != :undefined do
-      :ets.delete(table)
-    end
-
+    # The table dies with its owner process. An `on_exit` callback runs after
+    # the test process has exited, so checking `:ets.info/1` first still
+    # races the owner's cleanup; `:ets.delete/1` raising ArgumentError means
+    # the table is already gone, which is the outcome we want.
+    :ets.delete(table)
     :ok
+  rescue
+    ArgumentError -> :ok
   end
 
   # ---------------------------------------------------------------------------

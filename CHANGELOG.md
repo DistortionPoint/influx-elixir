@@ -50,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measurement is emitted alongside, matching `:telemetry.span/3`.
 - **`Flight.Client.query/3` closes the gRPC channel when `DoGet` fails**; it
   was only disconnected on success.
+- **`Client.Local.stop/1` no longer races the owner process's ETS cleanup.**
+  Called from an `on_exit` after the test process had exited, the
+  `:ets.info/1` guard could pass and `:ets.delete/1` then raise
+  `ArgumentError`, failing the test intermittently.
 - **`Flight.Reader` row assembly is linear in the batch's row count.** Cells
   were read with `Enum.at/2` on the column lists for every row, which made
   decoding a record batch quadratic; columns are now tuples read with `elem/2`.

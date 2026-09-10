@@ -93,6 +93,23 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       refute Map.has_key?(value_row, "")
     end
 
+    test "other annotations without #datatype leave cells as strings" do
+      body = "#group,false,false\n,result,value\n,_result,42.5\n"
+
+      assert {:ok, [%{"result" => "_result", "value" => "42.5"}]} =
+               ResponseParser.parse(body, :csv)
+    end
+
+    test "a table with only annotation rows yields no rows" do
+      body = "#datatype,string,double\n\n,result,value\n,_result,1.5\n"
+      assert {:ok, [%{"value" => "1.5"}]} = ResponseParser.parse(body, :csv)
+    end
+
+    test "a typed cell that does not parse falls back to the raw string" do
+      body = "#datatype,string,double,long\n,result,ratio,count\n,_result,abc,1.5\n"
+      assert {:ok, [%{"ratio" => "abc", "count" => "1.5"}]} = ResponseParser.parse(body, :csv)
+    end
+
     test "types long, unsignedLong and boolean columns and maps empty cells to nil" do
       body =
         "#datatype,string,long,unsignedLong,boolean,double\n" <>
