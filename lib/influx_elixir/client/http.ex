@@ -108,15 +108,9 @@ defmodule InfluxElixir.Client.HTTP do
           {line_protocol, headers}
         end
 
-      case do_request(:post, url, headers, body, connection, opts) do
-        {:ok, %Finch.Response{status: status}} when status in [200, 204] ->
-          {:ok, :written}
-
-        {:ok, %Finch.Response{status: status, body: resp_body}} ->
-          {:error, %{status: status, body: resp_body}}
-
-        {:error, reason} ->
-          {:error, {:connection_error, reason}}
+      with {:ok, _response} <-
+             request(:post, url, headers, body, connection, opts, [200, 204]) do
+        {:ok, :written}
       end
     end
   end
@@ -144,15 +138,9 @@ defmodule InfluxElixir.Client.HTTP do
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
 
-      case do_request(:post, url, headers, body, connection, opts) do
-        {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-          ResponseParser.parse(resp_body, format)
-
-        {:ok, %Finch.Response{status: status, body: resp_body}} ->
-          {:error, %{status: status, body: resp_body}}
-
-        {:error, reason} ->
-          {:error, {:connection_error, reason}}
+      with {:ok, %Finch.Response{body: resp_body}} <-
+             request(:post, url, headers, body, connection, opts, [200]) do
+        ResponseParser.parse(resp_body, format)
       end
     end
   end
@@ -205,15 +193,9 @@ defmodule InfluxElixir.Client.HTTP do
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
 
-      case do_request(:post, url, headers, body, connection, opts) do
-        {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-          Jason.decode(resp_body)
-
-        {:ok, %Finch.Response{status: status, body: resp_body}} ->
-          {:error, %{status: status, body: resp_body}}
-
-        {:error, reason} ->
-          {:error, {:connection_error, reason}}
+      with {:ok, %Finch.Response{body: resp_body}} <-
+             request(:post, url, headers, body, connection, opts, [200]) do
+        Jason.decode(resp_body)
       end
     end
   end
@@ -251,15 +233,9 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v3/query_influxql"
     headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection, opts) do
-      {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-        ResponseParser.parse(resp_body, format)
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+    with {:ok, %Finch.Response{body: resp_body}} <-
+           request(:post, url, headers, body, connection, opts, [200]) do
+      ResponseParser.parse(resp_body, format)
     end
   end
 
@@ -282,15 +258,9 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v2/query?org=#{URI.encode(org)}"
     headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection, opts) do
-      {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-        ResponseParser.parse(resp_body, :csv)
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+    with {:ok, %Finch.Response{body: resp_body}} <-
+           request(:post, url, headers, body, connection, opts, [200]) do
+      ResponseParser.parse(resp_body, :csv)
     end
   end
 
@@ -318,15 +288,10 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v3/configure/database"
     headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection, opts) do
-      {:ok, %Finch.Response{status: status}} when status in [200, 201, 409] ->
-        :ok
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+    # 409 = already exists, which is success for an idempotent create.
+    with {:ok, _response} <-
+           request(:post, url, headers, body, connection, opts, [200, 201, 409]) do
+      :ok
     end
   end
 
@@ -337,21 +302,10 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v3/configure/database?format=json"
     headers = auth_headers(connection)
 
-    case do_request(:get, url, headers, nil, connection) do
-      {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-        case Jason.decode(resp_body) do
-          {:ok, rows} ->
-            {:ok, Enum.map(rows, fn row -> %{"name" => row["iox::database"]} end)}
-
-          error ->
-            error
-        end
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+    with {:ok, %Finch.Response{body: resp_body}} <-
+           request(:get, url, headers, nil, connection, [], [200]),
+         {:ok, rows} <- Jason.decode(resp_body) do
+      {:ok, Enum.map(rows, fn row -> %{"name" => row["iox::database"]} end)}
     end
   end
 
@@ -365,15 +319,9 @@ defmodule InfluxElixir.Client.HTTP do
 
     headers = auth_headers(connection)
 
-    case do_request(:delete, url, headers, nil, connection) do
-      {:ok, %Finch.Response{status: status}} when status in [200, 204] ->
-        :ok
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+    with {:ok, _response} <-
+           request(:delete, url, headers, nil, connection, [], [200, 204]) do
+      :ok
     end
   end
 
@@ -401,15 +349,9 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v2/buckets"
     headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection, opts) do
-      {:ok, %Finch.Response{status: status}} when status in [200, 201] ->
-        :ok
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+    with {:ok, _response} <-
+           request(:post, url, headers, body, connection, opts, [200, 201]) do
+      :ok
     end
   end
 
@@ -420,19 +362,13 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v2/buckets"
     headers = auth_headers(connection)
 
-    case do_request(:get, url, headers, nil, connection) do
-      {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-        case Jason.decode(resp_body) do
-          {:ok, %{"buckets" => buckets}} -> {:ok, buckets}
-          {:ok, other} -> {:ok, List.wrap(other)}
-          error -> error
-        end
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+    with {:ok, %Finch.Response{body: resp_body}} <-
+           request(:get, url, headers, nil, connection, [], [200]),
+         {:ok, decoded} <- Jason.decode(resp_body) do
+      case decoded do
+        %{"buckets" => buckets} -> {:ok, buckets}
+        other -> {:ok, List.wrap(other)}
+      end
     end
   end
 
@@ -446,15 +382,9 @@ defmodule InfluxElixir.Client.HTTP do
 
     headers = auth_headers(connection)
 
-    case do_request(:delete, url, headers, nil, connection) do
-      {:ok, %Finch.Response{status: status}} when status in [200, 204] ->
-        :ok
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+    with {:ok, _response} <-
+           request(:delete, url, headers, nil, connection, [], [200, 204]) do
+      :ok
     end
   end
 
@@ -480,16 +410,9 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/api/v3/configure/token"
     headers = json_headers(connection)
 
-    case do_request(:post, url, headers, body, connection, opts) do
-      {:ok, %Finch.Response{status: status, body: resp_body}}
-      when status in [200, 201] ->
-        Jason.decode(resp_body)
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+    with {:ok, %Finch.Response{body: resp_body}} <-
+           request(:post, url, headers, body, connection, opts, [200, 201]) do
+      Jason.decode(resp_body)
     end
   end
 
@@ -503,15 +426,9 @@ defmodule InfluxElixir.Client.HTTP do
 
     headers = auth_headers(connection)
 
-    case do_request(:delete, url, headers, nil, connection) do
-      {:ok, %Finch.Response{status: status}} when status in [200, 204] ->
-        :ok
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+    with {:ok, _response} <-
+           request(:delete, url, headers, nil, connection, [], [200, 204]) do
+      :ok
     end
   end
 
@@ -526,27 +443,47 @@ defmodule InfluxElixir.Client.HTTP do
     url = base_url(connection) <> "/health"
     headers = auth_headers(connection)
 
-    case do_request(:get, url, headers, nil, connection) do
-      {:ok, %Finch.Response{status: 200, body: resp_body}} ->
-        case Jason.decode(resp_body) do
-          {:ok, map} ->
-            {:ok, map}
-
-          {:error, _json_err} ->
-            {:ok, %{"status" => "pass"}}
-        end
-
-      {:ok, %Finch.Response{status: status, body: resp_body}} ->
-        {:error, %{status: status, body: resp_body}}
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
+    with {:ok, %Finch.Response{body: resp_body}} <-
+           request(:get, url, headers, nil, connection, [], [200]) do
+      # A 200 with a non-JSON body (older builds answer plain text) is
+      # still a passing health check.
+      case Jason.decode(resp_body) do
+        {:ok, map} -> {:ok, map}
+        {:error, _json_err} -> {:ok, %{"status" => "pass"}}
+      end
     end
   end
 
   # ---------------------------------------------------------------------------
   # Private: HTTP helpers
   # ---------------------------------------------------------------------------
+
+  # Runs a request and normalises the outcome: `{:ok, response}` when the
+  # status is one of `ok_statuses`, `{:error, %{status, body}}` for any other
+  # status, and `{:error, {:connection_error, reason}}` for a transport
+  # failure. Every public function used to repeat this three-clause case.
+  @spec request(
+          :get | :post | :delete,
+          binary(),
+          [{binary(), binary()}],
+          binary() | nil,
+          keyword(),
+          keyword(),
+          [non_neg_integer()]
+        ) :: {:ok, Finch.Response.t()} | {:error, term()}
+  defp request(method, url, headers, body, connection, opts, ok_statuses) do
+    case do_request(method, url, headers, body, connection, opts) do
+      {:ok, %Finch.Response{status: status} = response} ->
+        if status in ok_statuses do
+          {:ok, response}
+        else
+          {:error, %{status: status, body: response.body}}
+        end
+
+      {:error, reason} ->
+        {:error, {:connection_error, reason}}
+    end
+  end
 
   @spec do_request(
           :get | :post | :delete,
@@ -556,7 +493,7 @@ defmodule InfluxElixir.Client.HTTP do
           keyword(),
           keyword()
         ) :: {:ok, Finch.Response.t()} | {:error, term()}
-  defp do_request(method, url, headers, body, connection, opts \\ []) do
+  defp do_request(method, url, headers, body, connection, opts) do
     finch_name = resolve_finch(connection)
     timeout = resolve_timeout(opts, connection)
 

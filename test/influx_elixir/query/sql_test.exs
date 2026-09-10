@@ -12,10 +12,9 @@ defmodule InfluxElixir.Query.SQLTest do
   end
 
   describe "query/3" do
-    test "returns {:ok, rows} from client", %{conn: conn} do
-      assert {:ok, rows} = SQL.query(conn, "SELECT * FROM cpu", database: "test_db")
-      assert is_list(rows)
-      assert length(rows) == 1
+    test "returns the stored rows", %{conn: conn} do
+      assert {:ok, [%{"host" => "web01", "value" => 1}]} =
+               SQL.query(conn, "SELECT * FROM cpu", database: "test_db")
     end
 
     test "passes params through to client", %{conn: conn} do

@@ -29,11 +29,6 @@ defmodule InfluxElixir.Flight.ClientTest do
       payload = Client.build_ticket_payload("db", "SELECT 1")
       assert Jason.decode!(payload)["query_type"] == "sql"
     end
-
-    test "returns a binary" do
-      payload = Client.build_ticket_payload("db", "SELECT 1")
-      assert is_binary(payload)
-    end
   end
 
   describe "build_ticket/2" do
@@ -49,15 +44,9 @@ defmodule InfluxElixir.Flight.ClientTest do
       assert decoded["sql_query"] == "SELECT 1"
     end
 
-    test "ticket field is a binary" do
-      ticket = Client.build_ticket("mydb", "SELECT 1")
-      assert is_binary(ticket.ticket)
-    end
-
     test "ticket can be protobuf-encoded" do
       ticket = Client.build_ticket("sensors", "SELECT * FROM temp")
       encoded = Protobuf.encode(ticket)
-      assert is_binary(encoded)
       decoded = Protobuf.decode(encoded, Ticket)
       assert Jason.decode!(decoded.ticket)["database"] == "sensors"
     end

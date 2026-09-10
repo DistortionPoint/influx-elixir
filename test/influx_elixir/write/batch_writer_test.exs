@@ -253,15 +253,6 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   end
 
   describe "stats/1" do
-    test "returns {:ok, stats_map}", %{conn: conn} do
-      pid = start_writer(conn)
-      assert {:ok, stats} = BatchWriter.stats(pid)
-      assert is_map(stats)
-      assert Map.has_key?(stats, :total_writes)
-      assert Map.has_key?(stats, :total_errors)
-      assert Map.has_key?(stats, :total_bytes)
-    end
-
     test "total_bytes accumulates correctly", %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 60_000)
       payload = "cpu value=1.0"

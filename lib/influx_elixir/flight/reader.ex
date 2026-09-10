@@ -655,16 +655,25 @@ defmodule InfluxElixir.Flight.Reader do
           [map()]
   defp zip_columns(_columns, _vectors, 0), do: []
 
+  # Columns are converted to tuples once so each cell is an O(1) `elem/2`;
+  # `Enum.at/2` on the column lists made row assembly quadratic in the
+  # batch's row count. A column shorter than `n` still yields `nil` cells.
   defp zip_columns(columns, vectors, n) do
-    names = Enum.map(columns, & &1.name)
+    named_tuples =
+      columns
+      |> Enum.map(& &1.name)
+      |> Enum.zip(Enum.map(vectors, &List.to_tuple/1))
 
     for i <- 0..(n - 1)//1 do
-      names
-      |> Enum.zip(vectors)
-      |> Enum.map(fn {name, col} -> {name, Enum.at(col, i)} end)
+      named_tuples
+      |> Enum.map(fn {name, col} -> {name, cell(col, i)} end)
       |> Map.new()
     end
   end
+
+  @spec cell(tuple(), non_neg_integer()) :: term()
+  defp cell(col, i) when i < tuple_size(col), do: elem(col, i)
+  defp cell(_col, _i), do: nil
 
   # ---------------------------------------------------------------------------
   # Private: binary utilities

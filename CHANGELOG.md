@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+- **`Flight.Reader` row assembly is linear in the batch's row count.** Cells
+  were read with `Enum.at/2` on the column lists for every row, which made
+  decoding a record batch quadratic; columns are now tuples read with `elem/2`.
+
+### Changed
+- `Client.HTTP` routes every request through one `request/7` helper that maps
+  the status to `{:ok, response}` / `{:error, %{status, body}}` /
+  `{:error, {:connection_error, reason}}`, replacing fourteen copies of the same
+  three-clause `case`. No behavioural change.
 
 ## [0.1.20] - 2026-09-10
 

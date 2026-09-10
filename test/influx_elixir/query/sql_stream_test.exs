@@ -24,8 +24,7 @@ defmodule InfluxElixir.Query.SQLStreamTest do
         |> SQLStream.stream("SELECT * FROM cpu", database: "test_db")
         |> Enum.to_list()
 
-      assert is_list(result)
-      assert length(result) == 2
+      assert Enum.sort(Enum.map(result, & &1["value"])) == [1, 2]
     end
 
     # Parity with Client.HTTP (issue #11): querying a missing table surfaces as

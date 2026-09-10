@@ -265,8 +265,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
-      assert is_integer(pos)
-      assert pos > 0
+      assert FB.read_int32(buf, pos) == 77
     end
 
     test "returns nil for an absent field (offset 0 in vtable)" do
@@ -293,9 +292,9 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       pos0 = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
       pos1 = FB.field_pos(buf, table_pos, vt_pos, vt_size, 1)
-      assert is_integer(pos0)
-      assert is_integer(pos1)
-      assert pos0 != pos1
+      # slot 0 is an int32, slot 1 an int16 (see build_two_field_table/2)
+      assert FB.read_int32(buf, pos0) == 10
+      assert FB.read_int16(buf, pos1) == 20
     end
 
     test "field position differs from table_pos" do

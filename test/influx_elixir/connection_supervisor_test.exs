@@ -27,13 +27,11 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
 
       assert Process.alive?(pid)
 
-      # Connection should be resolvable by name and be an initialized
-      # connection (Client.Local returns a map with :table, :databases, :profile)
+      # The registered term is an initialised connection the configured
+      # client can use straight away.
       assert {:ok, registered} = Connection.get(name)
-      assert is_map(registered)
-      assert Map.has_key?(registered, :table)
-      assert Map.has_key?(registered, :databases)
-      assert Map.has_key?(registered, :profile)
+      assert {:ok, %{"status" => "pass"}} = InfluxElixir.health(registered)
+      assert {:ok, %{"status" => "pass"}} = InfluxElixir.health(name)
     end
 
     test "fetch!/1 works for a started connection" do
@@ -50,9 +48,8 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       end)
 
       conn = Connection.fetch!(name)
-      # Returns an initialized connection, usable by the configured client
-      assert is_map(conn)
-      assert Map.has_key?(conn, :table)
+      # Returns an initialised connection, usable by the configured client
+      assert {:ok, %{"status" => "pass"}} = InfluxElixir.health(conn)
     end
 
     test "finch pool name is derivable from registered connection" do

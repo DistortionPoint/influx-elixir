@@ -170,23 +170,12 @@ defmodule InfluxElixir.ConnectionTest do
   # ---------------------------------------------------------------------------
 
   describe "finch_name/1" do
-    test "returns an atom incorporating the connection name" do
-      result = Connection.finch_name(:my_conn)
-      assert is_atom(result)
-    end
-
-    test "returns the same atom for the same connection name" do
-      assert Connection.finch_name(:prod) == Connection.finch_name(:prod)
+    test "derives the pool name from the connection name" do
+      assert Connection.finch_name(:my_conn) == :influx_elixir_my_conn_finch
     end
 
     test "returns different atoms for different connection names" do
       refute Connection.finch_name(:conn_a) == Connection.finch_name(:conn_b)
-    end
-
-    test "delegates to ConnectionSupervisor.finch_name/1" do
-      name = :some_connection
-      expected = InfluxElixir.ConnectionSupervisor.finch_name(name)
-      assert Connection.finch_name(name) == expected
     end
   end
 end

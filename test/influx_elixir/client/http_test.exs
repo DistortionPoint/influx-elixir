@@ -1,41 +1,7 @@
 defmodule InfluxElixir.Client.HTTPTest do
   use ExUnit.Case, async: true
 
-  alias InfluxElixir.Client
   alias InfluxElixir.Client.HTTP
-
-  setup_all do
-    Code.ensure_loaded!(HTTP)
-    :ok
-  end
-
-  # ---------------------------------------------------------------------------
-  # Behaviour contract
-  # ---------------------------------------------------------------------------
-
-  describe "behaviour implementation" do
-    test "HTTP module declares the InfluxElixir.Client behaviour" do
-      behaviours =
-        HTTP.__info__(:attributes)
-        |> Keyword.get_values(:behaviour)
-        |> List.flatten()
-
-      assert Client in behaviours
-    end
-
-    test "all Client behaviour callbacks are implemented" do
-      required_callbacks = Client.behaviour_info(:callbacks)
-      exported = HTTP.__info__(:functions)
-
-      missing =
-        Enum.reject(required_callbacks, fn {name, arity} ->
-          Keyword.get_values(exported, name) |> Enum.member?(arity)
-        end)
-
-      assert missing == [],
-             "HTTP is missing these Client callbacks: #{inspect(missing)}"
-    end
-  end
 
   # ---------------------------------------------------------------------------
   # init_connection — :database resolution parity with Client.Local

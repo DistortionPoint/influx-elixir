@@ -51,6 +51,32 @@ Tightening the type-only assertions is what exposed bugs 1 and 2: the Flux
 delegation tests could not write to a created bucket, and the timer-flush test
 could not find its row in the configured database.
 
+## Second pass (same day)
+
+### Bug: quadratic Flight row assembly
+
+`Flight.Reader.zip_columns/3` built each row by calling `Enum.at(col, i)` on
+every column list, so decoding a record batch of `n` rows cost `O(n²)` per
+column. Columns are now converted to tuples once and cells read with `elem/2`;
+a column shorter than `n` still yields `nil`, as before.
+
+### Refactor: one request path in `Client.HTTP`
+
+Fourteen public functions repeated the same three-clause `case` on
+`do_request/6` (success status → result, other status → `%{status, body}`,
+transport failure → `{:connection_error, reason}`). `request/7` takes the list
+of success statuses and returns `{:ok, %Finch.Response{}}` or the normalised
+error; every function is now a `with` over it. No behavioural change, verified
+by the contract suite against a live InfluxDB 3 Core.
+
+### More test-rule fixes
+
+| Rule | Violation | Fix |
+|---|---|---|
+| Testing function exports is BAD | `http_test.exs` asserted the behaviour attribute and callback exports | Removed with its `setup_all` |
+| Testing tests is BAD | `connection_test.exs` compared `finch_name/1` to the function it delegates to | Asserts the concrete atom |
+| Just asserting `true` is useless | `is_binary`/`is_integer`/`is_map` assertions in Flight, FlatBuffer, BatchWriter, SQL, stream and supervisor tests | Assert decoded values, field contents, row values, or a working health call |
+
 ## Documentation corrected
 
 - `CLAUDE.md` claimed there is no `application.ex`; there is one, and it starts

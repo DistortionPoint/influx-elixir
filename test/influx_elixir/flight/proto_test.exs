@@ -18,7 +18,6 @@ defmodule InfluxElixir.Flight.ProtoTest do
       payload = ~s({"database":"mydb","sql_query":"SELECT 1","query_type":"sql"})
       ticket = %Ticket{ticket: payload}
       encoded = Protobuf.encode(ticket)
-      assert is_binary(encoded)
       decoded = Protobuf.decode(encoded, Ticket)
       assert decoded.ticket == payload
     end
