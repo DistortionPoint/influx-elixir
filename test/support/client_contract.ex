@@ -1428,19 +1428,10 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          # Local reports a missing table as a tagged tuple; the real engine
-          # fails planning with a 400 whose body names the table.
-          case result do
-            {:error, {:table_not_found, "totally_nonexistent_table_xyz"}} ->
-              :ok
-
-            {:error, %{status: 400, body: body}} ->
-              assert body =~ "totally_nonexistent_table_xyz"
-              assert body =~ "not found"
-
-            other ->
-              flunk("unexpected error shape: #{inspect(other)}")
-          end
+          # Planning error: HTTP 400 whose body names the table.
+          assert {:error, %{status: 400, body: body}} = result
+          assert body =~ "totally_nonexistent_table_xyz"
+          assert body =~ "not found"
         end
 
         test "malformed line protocol returns {:error, _} with status info",

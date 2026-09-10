@@ -212,7 +212,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       assert row["value"] == 1.0
 
-      assert {:error, {:table_not_found, "cpu"}} =
+      assert {:error,
+              %{status: 400, body: "Error during planning: table 'public.iox.cpu' not found"}} =
                Local.query_sql(conn, "SELECT * FROM cpu", database: "default")
     end
   end

@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unsupported column expression` error reads as a limitation of the test double
   rather than of InfluxDB. Plain aggregates (`AVG`, `SUM`, `COUNT`, `MIN`,
   `MAX`) now reject a second argument, as the real engine does.
+- **`Client.Local` reports a missing table the way the real engine does.**
+  `query_sql/3` on an unknown measurement returned
+  `{:error, {:table_not_found, name}}` while `Client.HTTP` returns
+  `{:error, %{status: 400, body: "Error during planning: table ... not found"}}`,
+  and the streaming path mapped it to a 404. Both now produce the 400 planning
+  error, so consumer code that matches `%{status: 400}` can be exercised against
+  the double. Code matching the old tuple must be updated.
 
 ### Fixed
 - **`Client.Local` no longer re-types quoted string literals** (#12). A bound

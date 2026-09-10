@@ -27,7 +27,8 @@ defmodule InfluxElixir.Query.SQLTest do
     end
 
     test "returns error for non-existent measurement", %{conn: conn} do
-      assert {:error, {:table_not_found, "nope"}} =
+      assert {:error,
+              %{status: 400, body: "Error during planning: table 'public.iox.nope' not found"}} =
                SQL.query(conn, "SELECT * FROM nope", database: "test_db")
     end
   end

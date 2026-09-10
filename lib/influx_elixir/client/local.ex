@@ -411,9 +411,6 @@ defmodule InfluxElixir.Client.Local do
 
   defp stream_error_opts(:no_database_specified), do: [kind: :no_database]
 
-  defp stream_error_opts({:table_not_found, measurement}),
-    do: [kind: :http_status, status: 404, body: "table not found: #{measurement}"]
-
   defp stream_error_opts(reason), do: [kind: :transport, reason: reason]
 
   @doc """
@@ -1894,8 +1891,19 @@ defmodule InfluxElixir.Client.Local do
           |> Enum.map(&point_to_row/1)
       end
     else
-      {:error, {:table_not_found, m}}
+      {:error, table_not_found(m)}
     end
+  end
+
+  # The same shape and wording the real engine returns for a missing table
+  # (HTTP 400, planning error), so consumer code matching `%{status: 400}`
+  # can be exercised against the double.
+  @spec table_not_found(binary()) :: %{status: 400, body: binary()}
+  defp table_not_found(measurement) do
+    %{
+      status: 400,
+      body: "Error during planning: table 'public.iox.#{measurement}' not found"
+    }
   end
 
   @spec project_row(map(), [{binary(), binary()}]) :: map()

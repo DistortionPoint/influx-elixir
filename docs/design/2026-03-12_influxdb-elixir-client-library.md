@@ -1582,8 +1582,8 @@ InfluxElixir.execute_sql(client,
 InfluxElixir.execute_sql(client, """
   INSERT INTO candles
   SELECT date_bin('5 minutes', time) AS time, symbol, '5m' AS timeframe,
-         first(open) AS open, max(high) AS high, min(low) AS low,
-         last(close) AS close, sum(volume) AS volume
+         first_value(open ORDER BY time) AS open, max(high) AS high, min(low) AS low,
+         last_value(close ORDER BY time) AS close, sum(volume) AS volume
   FROM candles WHERE timeframe = '1m' AND time >= $start AND time < $end
   GROUP BY date_bin('5 minutes', time), symbol
   """,
@@ -1724,7 +1724,7 @@ These are the specific needs from a real-world consuming application (trading sy
 | Trade records | `SELECT * FROM strategy_trades WHERE strategy=$s AND mode=$m ORDER BY time DESC` | Trade history display, P&L calculation | `strategy_trades` |
 | Backtest equity curve | `SELECT * FROM backtest_equity WHERE backtest_id=$id ORDER BY time ASC` | Backtest results display | `backtests` |
 | Candle retention cleanup | `DELETE FROM candles WHERE timeframe='1m' AND time < $cutoff` | Daily Quantum job (Plan-020.5) | `candles` |
-| Candle aggregation (SQL fallback) | `INSERT INTO candles SELECT date_bin('5m', time), first(open), max(high)... FROM candles WHERE timeframe='1m' GROUP BY ...` | Quantum job if Processing Engine not used | `candles` |
+| Candle aggregation (SQL fallback) | `INSERT INTO candles SELECT date_bin('5m', time), first_value(open ORDER BY time), max(high)... FROM candles WHERE timeframe='1m' GROUP BY ...` | Quantum job if Processing Engine not used | `candles` |
 | AI weight audit | `SELECT * FROM weight_changes WHERE strategy=$s ORDER BY time DESC` | AI audit trail display | `signals` |
 
 **Library features needed for queries**:

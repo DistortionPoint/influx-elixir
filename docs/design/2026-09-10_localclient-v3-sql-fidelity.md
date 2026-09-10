@@ -90,15 +90,32 @@ those mirror what the real write endpoint returns.
 rewritten inside `$hmin` and a substituted string containing `$min` could be
 re-substituted. It is now one `Regex.replace/3` over `\$\w+` with a map lookup.
 
+### Missing-table error shape (found during review)
+
+`execute_query/3` returned `{:error, {:table_not_found, name}}` and the stream
+path mapped that to a 404, while the real engine (and therefore `Client.HTTP`)
+returns HTTP 400 with `Error during planning: table 'public.iox.<name>' not
+found`. `table_not_found/1` now builds that exact shape, the special-case
+`stream_error_opts/1` clause is gone (the generic `%{status, body}` clause
+covers it), and the contract test pins the single shape for both clients.
+
+### Stale SQL in the original design doc
+
+`2026-03-12_influxdb-elixir-client-library.md` carried `first(open)` /
+`last(close)` in its candle-aggregation examples; rewritten to the
+`first_value(... ORDER BY time)` spelling.
+
 ## Files Modified
 
 | File | Change |
 |------|--------|
-| `lib/influx_elixir/client/local.ex` | Parser, comparison, params, error prefix, moduledoc |
-| `test/influx_elixir/client/local_test.exs` | Rewritten ordered-aggregate tests, new literal-typing and param tests |
-| `test/support/client_contract.ex` | `first_value`/`last_value` contract, new `literal_tests` group |
+| `lib/influx_elixir/client/local.ex` | Parser, comparison, params, error prefix, missing-table shape, moduledoc |
+| `test/influx_elixir/client/local_test.exs` | Rewritten ordered-aggregate tests, new literal-typing and param tests, 400 missing-table shape |
+| `test/influx_elixir/query/sql_test.exs`, `test/influx_elixir/write/batch_writer_test.exs` | 400 missing-table shape |
+| `test/support/client_contract.ex` | `first_value`/`last_value` contract, new `literal_tests` group, pinned error shapes |
 | `docs/guides/testing-with-local-client.md` | Ordered aggregates, literal typing, param warning |
 | `docs/design/2026-03-17_localclient-first-last-aggregates.md` | Superseded banner |
+| `docs/design/2026-03-12_influxdb-elixir-client-library.md` | Candle SQL examples use `first_value`/`last_value` |
 | `CHANGELOG.md` | Unreleased entries |
 
 ## Verification

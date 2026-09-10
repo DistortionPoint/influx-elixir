@@ -26,7 +26,6 @@
       "Bash(MIX_ENV=test mix:*)"
     ],
     "deny": [
-      "Bash(git:*)"
     ]
   }
 }

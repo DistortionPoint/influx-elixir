@@ -100,7 +100,8 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["value"] == 1.0
 
       # Other databases don't see the write — still report no table
-      assert {:error, {:table_not_found, "cpu"}} =
+      assert {:error,
+              %{status: 400, body: "Error during planning: table 'public.iox.cpu' not found"}} =
                Local.query_sql(conn, "SELECT * FROM cpu", database: "default")
 
       Local.stop(conn)
@@ -112,7 +113,8 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, :written} =
                Local.write(conn, "cpu value=1.0", database: "other")
 
-      assert {:error, {:table_not_found, "cpu"}} =
+      assert {:error,
+              %{status: 400, body: "Error during planning: table 'public.iox.cpu' not found"}} =
                Local.query_sql(conn, "SELECT * FROM cpu")
 
       assert {:ok, [_row]} =
@@ -371,7 +373,11 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "returns error for non-existent measurement", %{conn: conn, db: db} do
-      assert {:error, {:table_not_found, "no_such_measurement"}} =
+      assert {:error,
+              %{
+                status: 400,
+                body: "Error during planning: table 'public.iox.no_such_measurement' not found"
+              }} =
                Local.query_sql(conn, "SELECT * FROM no_such_measurement", database: db)
     end
 
@@ -1355,7 +1361,8 @@ defmodule InfluxElixir.Client.LocalTest do
       GROUP BY DATE_BIN(INTERVAL '1 hour', time)
       """
 
-      assert {:error, {:table_not_found, "empty_m"}} =
+      assert {:error,
+              %{status: 400, body: "Error during planning: table 'public.iox.empty_m' not found"}} =
                Local.query_sql(conn, sql, database: db)
     end
 
@@ -1702,7 +1709,11 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "returns error for non-existent measurement", %{conn: conn, db: db} do
-      assert {:error, {:table_not_found, "nonexistent"}} =
+      assert {:error,
+              %{
+                status: 400,
+                body: "Error during planning: table 'public.iox.nonexistent' not found"
+              }} =
                Local.query_sql(
                  conn,
                  ~s(SELECT DISTINCT symbol FROM "nonexistent"),
@@ -1945,7 +1956,11 @@ defmodule InfluxElixir.Client.LocalTest do
       ORDER BY time ASC
       """
 
-      assert {:error, {:table_not_found, "nonexistent"}} =
+      assert {:error,
+              %{
+                status: 400,
+                body: "Error during planning: table 'public.iox.nonexistent' not found"
+              }} =
                Local.query_sql(conn, sql, database: db)
     end
 
@@ -2302,7 +2317,11 @@ defmodule InfluxElixir.Client.LocalTest do
       ORDER BY time ASC
       """
 
-      assert {:error, {:table_not_found, "nonexistent"}} =
+      assert {:error,
+              %{
+                status: 400,
+                body: "Error during planning: table 'public.iox.nonexistent' not found"
+              }} =
                Local.query_sql(conn, sql, database: db)
     end
   end
