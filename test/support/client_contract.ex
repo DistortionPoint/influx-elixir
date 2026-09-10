@@ -779,6 +779,17 @@ defmodule InfluxElixir.ClientContract do
                      "contract_del_bkt"
                    )
         end
+
+        test "a bucket created via create_bucket accepts writes", ctx do
+          :ok = unquote(client).create_bucket(ctx.conn, "contract_write_bkt", [])
+
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_bkt_write value=1i",
+                     database: "contract_write_bkt"
+                   )
+        end
       end
     end
   end

@@ -25,9 +25,11 @@ defmodule InfluxElixir.Admin.BucketsTest do
   end
 
   describe "list/1" do
-    test "returns {:ok, list} from client", %{conn: conn} do
+    test "lists created buckets by name", %{conn: conn} do
+      :ok = Buckets.create(conn, "my_bucket")
+
       assert {:ok, buckets} = Buckets.list(conn)
-      assert is_list(buckets)
+      assert "my_bucket" in Enum.map(buckets, & &1["name"])
     end
   end
 

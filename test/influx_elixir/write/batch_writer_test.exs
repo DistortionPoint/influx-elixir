@@ -31,6 +31,20 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert Process.alive?(pid)
     end
 
+    test "the :database option is the write target for every flush", %{conn: conn} do
+      # Regression: :database was stored but never forwarded, so flushes
+      # landed in the connection default ("default") instead.
+      pid = start_writer(conn, database: "target_db")
+
+      :ok = BatchWriter.write_sync(pid, "cpu value=7.0")
+
+      assert {:ok, [%{"value" => 7.0}]} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: "target_db")
+
+      assert {:error, %{status: 400}} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: "default")
+    end
+
     test "starts with empty buffer and zeroed stats", %{conn: conn} do
       pid = start_writer(conn)
       assert {:ok, stats} = BatchWriter.stats(pid)
@@ -271,15 +285,40 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
+  # Poll a public-API predicate until it holds, with a hard deadline. This
+  # replaces fixed sleeps: it never waits longer than needed and never
+  # passes by luck on a slow machine.
+  defp wait_until(fun, deadline_ms \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + deadline_ms
+    do_wait_until(fun, deadline)
+  end
+
+  defp do_wait_until(fun, deadline) do
+    cond do
+      fun.() ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("condition not met within deadline")
+
+      true ->
+        Process.sleep(5)
+        do_wait_until(fun, deadline)
+    end
+  end
+
   describe "timer-based flush" do
     test "automatically flushes after flush_interval_ms", %{conn: conn} do
-      pid = start_writer(conn, flush_interval_ms: 50)
+      pid = start_writer(conn, flush_interval_ms: 10)
       :ok = BatchWriter.write(pid, "cpu value=1.0")
 
-      :timer.sleep(200)
+      wait_until(fn ->
+        {:ok, stats} = BatchWriter.stats(pid)
+        stats.total_writes >= 1
+      end)
 
-      {:ok, stats} = BatchWriter.stats(pid)
-      assert stats.total_writes >= 1
+      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
+      assert row["value"] == 1.0
     end
   end
 
@@ -301,11 +340,9 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       # Stop the GenServer — terminate/2 should flush
       GenServer.stop(pid)
 
-      # Verify the data was written to the LocalClient
-      {:ok, rows} =
-        Local.query_sql(conn, "SELECT * FROM cpu", database: "default")
-
-      assert rows != []
+      # Verify the data was written to the writer's configured database
+      assert {:ok, [%{"value" => 42.0}]} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
     end
   end
 
@@ -522,17 +559,18 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       pid =
         start_writer(conn,
           flush_interval_ms: 60_000,
-          max_retries: 1
+          max_retries: 1,
+          base_retry_delay_ms: 1
         )
 
       :ok = BatchWriter.write(pid, "!!!")
       :ok = BatchWriter.flush(pid)
 
-      # Wait for retry to fire and exhaust (base delay ~200ms for attempt 1)
-      :timer.sleep(500)
-
-      {:ok, stats} = BatchWriter.stats(pid)
-      assert stats.total_errors == 1
+      # The single retry fires after ~2ms and exhausts max_retries.
+      wait_until(fn ->
+        {:ok, stats} = BatchWriter.stats(pid)
+        stats.total_errors == 1
+      end)
 
       state = :sys.get_state(pid)
       assert state.retry_payload == nil

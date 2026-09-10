@@ -25,9 +25,9 @@ defmodule InfluxElixir.Admin.DatabasesTest do
   end
 
   describe "list/1" do
-    test "returns {:ok, list} from client", %{conn: conn} do
+    test "lists existing databases by name", %{conn: conn} do
       assert {:ok, dbs} = Databases.list(conn)
-      assert is_list(dbs)
+      assert %{"name" => "test_db"} in dbs
     end
   end
 

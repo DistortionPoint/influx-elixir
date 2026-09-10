@@ -807,8 +807,15 @@ defmodule InfluxElixir.Client.Local do
     :ok
   end
 
-  defp ensure_database(table, database, _profile) do
-    assert_database_exists(table, database)
+  # v2 writes target buckets, so anything registered via `create_bucket/3` is a
+  # valid target. Names seeded through `databases:` at start are accepted too,
+  # so a v2 connection can be prepared either way.
+  defp ensure_database(table, bucket, :v2) do
+    if MapSet.member?(get_buckets(table), bucket) do
+      :ok
+    else
+      assert_database_exists(table, bucket)
+    end
   end
 
   @spec store_point(:ets.table(), binary(), point_map()) :: true
@@ -1727,10 +1734,14 @@ defmodule InfluxElixir.Client.Local do
     |> String.split(~r/\s+AND\s+/i)
     |> Enum.reduce_while({:ok, []}, fn clause, {:ok, acc} ->
       case parse_single_where_clause(clause) do
-        {:ok, conds} -> {:cont, {:ok, acc ++ conds}}
+        {:ok, condition} -> {:cont, {:ok, [condition | acc]}}
         {:error, _reason} = err -> {:halt, err}
       end
     end)
+    |> case do
+      {:ok, conditions} -> {:ok, Enum.reverse(conditions)}
+      {:error, _reason} = err -> err
+    end
   end
 
   # IN / NOT IN must be matched before binary operators because they don't
@@ -1740,18 +1751,18 @@ defmodule InfluxElixir.Client.Local do
   @in_pattern ~r/^(\w+)\s+IN\s*\((.*)\)\s*$/is
 
   @spec parse_single_where_clause(binary()) ::
-          {:ok, [where_clause()]} | {:error, map()}
+          {:ok, where_clause()} | {:error, map()}
   defp parse_single_where_clause(clause) do
     trimmed = String.trim(clause)
 
     cond do
       match = Regex.run(@not_in_pattern, trimmed) ->
         [_full, key, list_str] = match
-        {:ok, [{:not_in, key, parse_in_values(list_str)}]}
+        {:ok, {:not_in, key, parse_in_values(list_str)}}
 
       match = Regex.run(@in_pattern, trimmed) ->
         [_full, key, list_str] = match
-        {:ok, [{:in, key, parse_in_values(list_str)}]}
+        {:ok, {:in, key, parse_in_values(list_str)}}
 
       true ->
         parse_binary_where_clause(trimmed)
@@ -1759,7 +1770,7 @@ defmodule InfluxElixir.Client.Local do
   end
 
   @spec parse_binary_where_clause(binary()) ::
-          {:ok, [where_clause()]} | {:error, map()}
+          {:ok, where_clause()} | {:error, map()}
   defp parse_binary_where_clause(trimmed) do
     # Multi-char operators must be tried before their single-char prefixes.
     operators = [{">=", :gte}, {"<=", :lte}, {"!=", :ne}, {">", :gt}, {"<", :lt}, {"=", :eq}]
@@ -1782,7 +1793,7 @@ defmodule InfluxElixir.Client.Local do
         {:error, local_error("unsupported WHERE clause: #{trimmed}")}
 
       condition ->
-        {:ok, [condition]}
+        {:ok, condition}
     end
   end
 

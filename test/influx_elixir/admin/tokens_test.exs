@@ -11,16 +11,16 @@ defmodule InfluxElixir.Admin.TokensTest do
   end
 
   describe "create/3" do
-    test "returns {:ok, map} from client", %{conn: conn} do
-      assert {:ok, token} = Tokens.create(conn, "my token description")
-      assert is_map(token)
+    test "returns a token carrying the description and a secret", %{conn: conn} do
+      assert {:ok, %{"token" => secret, "description" => "my token description"}} =
+               Tokens.create(conn, "my token description")
+
+      assert byte_size(secret) > 0
     end
 
     test "accepts optional opts", %{conn: conn} do
-      assert {:ok, token} =
+      assert {:ok, %{"description" => "read-only token"}} =
                Tokens.create(conn, "read-only token", permissions: ["read"])
-
-      assert is_map(token)
     end
 
     test "defaults opts to empty list", %{conn: conn} do

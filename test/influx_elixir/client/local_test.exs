@@ -709,9 +709,8 @@ defmodule InfluxElixir.Client.LocalTest do
                Local.execute_sql(conn, "DELETE FROM cpu")
     end
 
-    test "returns {:ok, map} for unknown statement", %{conn: conn} do
-      assert {:ok, result} = Local.execute_sql(conn, "ALTER TABLE foo")
-      assert is_map(result)
+    test "returns zero rows affected for an unknown statement", %{conn: conn} do
+      assert {:ok, %{"rows_affected" => 0}} = Local.execute_sql(conn, "ALTER TABLE foo")
     end
   end
 
@@ -720,12 +719,6 @@ defmodule InfluxElixir.Client.LocalTest do
   # ---------------------------------------------------------------------------
 
   describe "query_influxql/3" do
-    test "returns {:ok, rows}", %{conn: conn} do
-      Local.write(conn, "cpu value=1i", database: "test_db")
-      assert {:ok, rows} = Local.query_influxql(conn, "SELECT * FROM cpu", database: "test_db")
-      assert is_list(rows)
-    end
-
     test "delegates to SQL engine — data is visible", %{conn: conn} do
       :ok = Local.create_database(conn, "iqldb")
       Local.write(conn, "m value=1i", database: "iqldb")
@@ -739,12 +732,16 @@ defmodule InfluxElixir.Client.LocalTest do
   # ---------------------------------------------------------------------------
 
   describe "query_flux/3" do
-    test "returns {:ok, rows} for any flux query" do
+    test "returns the bucket's rows tagged with their measurement" do
       {:ok, v2_conn} = Local.start(profile: :v2)
       on_exit(fn -> Local.stop(v2_conn) end)
+      :ok = Local.create_bucket(v2_conn, "test")
+      {:ok, :written} = Local.write(v2_conn, "cpu value=1.0", database: "test")
+
       flux = "from(bucket: \"test\") |> range(start: -1h)"
-      assert {:ok, rows} = Local.query_flux(v2_conn, flux)
-      assert is_list(rows)
+
+      assert {:ok, [%{"_measurement" => "cpu", "value" => 1.0}]} =
+               Local.query_flux(v2_conn, flux)
     end
   end
 

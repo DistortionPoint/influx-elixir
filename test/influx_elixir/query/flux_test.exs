@@ -11,12 +11,15 @@ defmodule InfluxElixir.Query.FluxTest do
   end
 
   describe "query/3" do
-    test "returns {:ok, rows} from client", %{conn: conn} do
+    test "returns the rows in the bucket's range", %{conn: conn} do
+      :ok = Local.create_bucket(conn, "test")
+      {:ok, :written} = Local.write(conn, "cpu value=1.0", database: "test")
+
       flux_query =
         "from(bucket: \"test\") |> range(start: -1h)"
 
-      assert {:ok, rows} = Flux.query(conn, flux_query)
-      assert is_list(rows)
+      assert {:ok, [%{"_measurement" => "cpu", "value" => 1.0}]} =
+               Flux.query(conn, flux_query)
     end
   end
 end

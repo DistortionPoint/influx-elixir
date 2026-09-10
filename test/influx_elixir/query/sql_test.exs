@@ -53,10 +53,8 @@ defmodule InfluxElixir.Query.SQLTest do
     end
 
     test "returns {:ok, map} for non-SELECT statement", %{conn: conn} do
-      assert {:ok, result} =
+      assert {:ok, %{"rows_affected" => 0}} =
                SQL.execute(conn, "ALTER TABLE foo", database: "test_db")
-
-      assert is_map(result)
     end
   end
 end

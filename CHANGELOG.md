@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the double. Code matching the old tuple must be updated.
 
 ### Fixed
+- **`BatchWriter` now honours its `:database` option.** The value was stored in
+  state and never forwarded to the write, so every flush landed in the
+  connection's default database. It is now the write target unless
+  `:write_opts` names a `:database` explicitly.
+- **`Client.Local` (`:v2` profile) accepts writes to buckets created with
+  `create_bucket/3`.** Writes only checked the `databases:` seeded at start, so a
+  bucket created through the API returned `404 database not found`.
 - **`Client.Local` no longer re-types quoted string literals** (#12). A bound
   string param or quoted literal such as `'08338636'` was parsed back through
   `Integer.parse`, dropping the leading zero and changing the type, so
@@ -42,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field compares the field's text rendering, which is what DataFusion does
   (`amount >= '1000.00'` is lexical and matches `500.0` on the real engine
   too), so that footgun now fails in tests the same way it fails in production.
+- **Linear-time accumulation in `Client.Local` WHERE parsing and
+  `Flight.Reader` batch decoding.** Both appended with `++` inside a reduce,
+  which is quadratic in the number of clauses / record batches.
 - **`Client.Local` param substitution is whole-placeholder and single-pass.**
   `$h` was previously replaced inside `$hmin`, and a substituted string value
   containing another placeholder's name could be re-substituted.

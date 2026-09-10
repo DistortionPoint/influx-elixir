@@ -47,10 +47,8 @@ defmodule InfluxElixirTest do
 
   describe "query_sql/3" do
     test "delegates to configured client", %{conn: conn} do
-      assert {:ok, rows} =
+      assert {:ok, [%{"value" => 1}]} =
                InfluxElixir.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
-
-      assert is_list(rows)
     end
   end
 
@@ -72,10 +70,8 @@ defmodule InfluxElixirTest do
 
   describe "query_influxql/3" do
     test "delegates to configured client", %{conn: conn} do
-      assert {:ok, rows} =
+      assert {:ok, [%{"value" => 1}]} =
                InfluxElixir.query_influxql(conn, "SELECT * FROM cpu", database: "test_db")
-
-      assert is_list(rows)
     end
   end
 
@@ -84,13 +80,14 @@ defmodule InfluxElixirTest do
       {:ok, v2_conn} = Local.start(profile: :v2)
       on_exit(fn -> Local.stop(v2_conn) end)
 
-      assert {:ok, rows} =
+      :ok = InfluxElixir.create_bucket(v2_conn, "test")
+      {:ok, :written} = InfluxElixir.write(v2_conn, "cpu value=1.0", database: "test")
+
+      assert {:ok, [%{"_measurement" => "cpu", "value" => 1.0}]} =
                InfluxElixir.query_flux(
                  v2_conn,
                  "from(bucket: \"test\") |> range(start: -1h)"
                )
-
-      assert is_list(rows)
     end
   end
 
@@ -103,7 +100,7 @@ defmodule InfluxElixirTest do
   describe "list_databases/1" do
     test "delegates to configured client", %{conn: conn} do
       assert {:ok, dbs} = InfluxElixir.list_databases(conn)
-      assert is_list(dbs)
+      assert %{"name" => "test_db"} in dbs
     end
   end
 
@@ -125,8 +122,10 @@ defmodule InfluxElixirTest do
     test "delegates to configured client" do
       {:ok, v2_conn} = Local.start(profile: :v2)
       on_exit(fn -> Local.stop(v2_conn) end)
+      :ok = InfluxElixir.create_bucket(v2_conn, "listed_bucket")
+
       assert {:ok, buckets} = InfluxElixir.list_buckets(v2_conn)
-      assert is_list(buckets)
+      assert "listed_bucket" in Enum.map(buckets, & &1["name"])
     end
   end
 
@@ -143,10 +142,10 @@ defmodule InfluxElixirTest do
       {:ok, ent_conn} = Local.start(profile: :v3_enterprise)
       on_exit(fn -> Local.stop(ent_conn) end)
 
-      assert {:ok, token} =
+      assert {:ok, %{"token" => secret, "description" => "test token"}} =
                InfluxElixir.create_token(ent_conn, "test token")
 
-      assert is_map(token)
+      assert byte_size(secret) > 0
     end
   end
 

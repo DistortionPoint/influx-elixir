@@ -13,10 +13,8 @@ defmodule InfluxElixir.Query.InfluxQLTest do
 
   describe "query/3" do
     test "returns {:ok, rows} from client", %{conn: conn} do
-      assert {:ok, rows} =
+      assert {:ok, [%{"host" => "web01", "value" => 1}]} =
                InfluxQL.query(conn, "SELECT * FROM cpu", database: "test_db")
-
-      assert is_list(rows)
     end
 
     test "SHOW DATABASES works without database option", %{conn: conn} do

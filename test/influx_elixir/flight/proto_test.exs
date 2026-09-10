@@ -214,20 +214,4 @@ defmodule InfluxElixir.Flight.ProtoTest do
       assert resp_stream? == false
     end
   end
-
-  describe "FlightService.Stub" do
-    test "is defined as a module" do
-      assert Code.ensure_loaded?(FlightService.Stub)
-    end
-
-    test "has do_get function generated" do
-      Code.ensure_loaded!(FlightService.Stub)
-      assert function_exported?(FlightService.Stub, :do_get, 3)
-    end
-
-    test "has get_flight_info function generated" do
-      Code.ensure_loaded!(FlightService.Stub)
-      assert function_exported?(FlightService.Stub, :get_flight_info, 3)
-    end
-  end
 end

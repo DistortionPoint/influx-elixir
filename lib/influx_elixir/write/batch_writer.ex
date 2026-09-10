@@ -10,7 +10,8 @@ defmodule InfluxElixir.Write.BatchWriter do
   ## Options
 
     * `:connection` - connection term passed to `InfluxElixir.Write.Writer`
-    * `:database` - default database name (binary)
+    * `:database` - database every flush writes to (binary). A `:database`
+      inside `:write_opts` takes precedence.
     * `:batch_size` - maximum points per flush (default: `5000`)
     * `:flush_interval_ms` - timer interval in milliseconds (default: `1000`)
     * `:jitter_ms` - random jitter added to flush timer (default: `0`)
@@ -245,10 +246,23 @@ defmodule InfluxElixir.Write.BatchWriter do
       max_retries: Keyword.get(opts, :max_retries, @default_max_retries),
       base_retry_delay_ms: Keyword.get(opts, :base_retry_delay_ms, @default_base_retry_delay_ms),
       no_sync: Keyword.get(opts, :no_sync, false),
-      write_opts: Keyword.get(opts, :write_opts, [])
+      write_opts: resolve_write_opts(opts)
     }
 
     {:ok, state, {:continue, :schedule_initial_flush}}
+  end
+
+  # `:database` is the writer's target unless `:write_opts` names one
+  # explicitly. It used to be stored and never forwarded, so every flush
+  # silently landed in the connection's default database.
+  @spec resolve_write_opts(keyword()) :: keyword()
+  defp resolve_write_opts(opts) do
+    write_opts = Keyword.get(opts, :write_opts, [])
+
+    case Keyword.get(opts, :database) do
+      nil -> write_opts
+      database -> Keyword.put_new(write_opts, :database, database)
+    end
   end
 
   @impl GenServer

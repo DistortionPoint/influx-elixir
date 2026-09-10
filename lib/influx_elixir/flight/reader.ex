@@ -292,13 +292,20 @@ defmodule InfluxElixir.Flight.Reader do
           {:ok, [map()]} | {:error, term()}
   defp decode_batches([], _columns), do: {:ok, []}
 
+  # Batches are collected newest-first and concatenated once at the end;
+  # appending each batch with `++` was quadratic in the number of batches.
   defp decode_batches(batch_msgs, columns) do
-    Enum.reduce_while(batch_msgs, {:ok, []}, fn msg, {:ok, acc} ->
+    batch_msgs
+    |> Enum.reduce_while({:ok, []}, fn msg, {:ok, acc} ->
       case decode_batch(msg, columns) do
-        {:ok, rows} -> {:cont, {:ok, acc ++ rows}}
+        {:ok, rows} -> {:cont, {:ok, [rows | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
+    |> case do
+      {:ok, batches} -> {:ok, batches |> Enum.reverse() |> Enum.concat()}
+      {:error, _reason} = err -> err
+    end
   end
 
   @spec decode_batch(FlightData.t(), [column_schema()]) ::

@@ -1,37 +1,44 @@
 defmodule InfluxElixir.SupervisorTest do
-  use ExUnit.Case
+  use ExUnit.Case, async: true
+
+  alias InfluxElixir.{Connection, ConnectionSupervisor}
+
+  defp unique_name(prefix) do
+    :"#{prefix}_#{System.unique_integer([:positive])}"
+  end
 
   describe "crash isolation" do
     test "terminating one connection does not affect siblings" do
-      {:ok, _pid_a} =
-        InfluxElixir.add_connection(:isolation_a, [])
+      name_a = unique_name(:isolation_a)
+      name_b = unique_name(:isolation_b)
 
-      {:ok, pid_b} =
-        InfluxElixir.add_connection(:isolation_b, [])
+      {:ok, _pid_a} = InfluxElixir.add_connection(name_a, [])
+      {:ok, pid_b} = InfluxElixir.add_connection(name_b, [])
 
-      # Terminate connection A
+      on_exit(fn ->
+        Supervisor.delete_child(InfluxElixir.Supervisor, {ConnectionSupervisor, name_a})
+        Connection.delete(name_a)
+        InfluxElixir.remove_connection(name_b)
+      end)
+
       :ok =
         Supervisor.terminate_child(
           InfluxElixir.Supervisor,
-          {InfluxElixir.ConnectionSupervisor, :isolation_a}
+          {ConnectionSupervisor, name_a}
         )
 
-      # Connection B must still be alive
       assert Process.alive?(pid_b)
-
-      # Clean up
-      Supervisor.delete_child(
-        InfluxElixir.Supervisor,
-        {InfluxElixir.ConnectionSupervisor, :isolation_a}
-      )
-
-      InfluxElixir.Connection.delete(:isolation_a)
-      InfluxElixir.remove_connection(:isolation_b)
+      assert {:ok, _conn} = Connection.get(name_b)
     end
 
-    test "supervisor uses :one_for_one strategy" do
-      children = Supervisor.which_children(InfluxElixir.Supervisor)
-      assert is_list(children)
+    test "init/1 builds a :one_for_one supervisor with one child per connection" do
+      assert {:ok, {%{strategy: :one_for_one}, children}} =
+               InfluxElixir.Supervisor.init(connections: [alpha: [host: "a"], beta: [host: "b"]])
+
+      connection_ids =
+        for %{id: {ConnectionSupervisor, name}} <- children, do: name
+
+      assert connection_ids == [:alpha, :beta]
     end
   end
 end

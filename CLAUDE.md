@@ -55,10 +55,12 @@ mix docs                    # Generate ExDoc documentation
 ## Architecture
 
 ### Library Structure
-This is a library, not an OTP application. Key distinctions:
-- **No `application.ex`** supervision tree started by default
-- Consumers start their own Finch pools and optionally supervised batch writers
-- All modules are designed for embedding into consumer supervision trees
+This is a library consumed as a dependency. Key distinctions:
+- `application.ex` starts `InfluxElixir.Supervisor`, which only has children for
+  connections listed under `config :influx_elixir, :connections` (none by default)
+- Each connection gets its own `ConnectionSupervisor` (Finch pool + optional
+  BatchWriter); `add_connection/2` / `remove_connection/1` manage them at runtime
+- Consumers may instead pass explicit connection keyword lists and run their own pools
 
 ### Module Organization
 ```
