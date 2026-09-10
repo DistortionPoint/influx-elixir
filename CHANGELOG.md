@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.20] - 2026-09-10
+
 ### Changed
 - **`Client.Local` ordered aggregates now use the InfluxDB v3 SQL spelling**
   (#13). `first_value(field ORDER BY col [ASC|DESC])` and
@@ -55,15 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Client.Local` param substitution is whole-placeholder and single-pass.**
   `$h` was previously replaced inside `$hmin`, and a substituted string value
   containing another placeholder's name could be re-substituted.
-- **`query_sql_stream/3` (HTTP transport) now truly streams and no longer swallows
-  errors** (#10). Previously it used `Finch.request/3`, which buffered the entire
-  response body and eagerly decoded every JSONL line before yielding — giving zero
-  memory benefit over `query_sql/3` — and it halted to an empty list on non-2xx
-  statuses, transport errors, and unresolved databases, so every failure class
-  looked like "zero rows". It now consumes the response with `Finch.stream/5`,
-  decoding JSONL line-by-line with back-pressure (constant memory), and raises an
-  `InfluxElixir.StreamError` on a missing database, a non-success HTTP status, or a
-  transport error when the stream is enumerated.
+
+## [0.1.19] - 2026-07-08
+
+### Fixed
 - **`InfluxElixir.Client.Local.query_sql_stream/3` now mirrors the HTTP client's
   error semantics** (#11). `Client.Local` is the documented drop-in test double for
   `Client.HTTP`, but it still returned an empty stream on a query error or an
@@ -73,14 +72,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enumeration for both cases, matching `Client.HTTP`.
 
 ### Added
+- Tests covering the Local `:http_status`/`:unsupported` stream-error paths and
+  lazy (deferred) raising.
+
+## [0.1.18] - 2026-07-08
+
+### Fixed
+- **`query_sql_stream/3` (HTTP transport) now truly streams and no longer swallows
+  errors** (#10). Previously it used `Finch.request/3`, which buffered the entire
+  response body and eagerly decoded every JSONL line before yielding — giving zero
+  memory benefit over `query_sql/3` — and it halted to an empty list on non-2xx
+  statuses, transport errors, and unresolved databases, so every failure class
+  looked like "zero rows". It now consumes the response with `Finch.stream/5`,
+  decoding JSONL line-by-line with back-pressure (constant memory), and raises an
+  `InfluxElixir.StreamError` on a missing database, a non-success HTTP status, or a
+  transport error when the stream is enumerated.
+
+### Added
 - `InfluxElixir.StreamError` exception, raised while consuming a streaming query
   that cannot produce rows. Carries a `:kind` (`:no_database | :http_status |
   :transport | :decode | :unsupported`) plus `:status`/`:body`/`:reason` context.
   `InfluxElixir.StreamError.stream/1` builds an `Enumerable.t()` that defers the
   raise to enumeration, shared by both client implementations.
 - Tests covering the HTTP `:no_database`/`:transport` paths (real Finch pool, no
-  mocking), the Local `:http_status`/`:unsupported` paths, lazy (deferred) raising,
-  and `StreamError` message construction.
+  mocking) and `StreamError` message construction.
 
 ## [0.1.17] - 2026-06-30
 
