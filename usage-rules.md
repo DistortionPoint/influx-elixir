@@ -20,7 +20,7 @@
 
 ## Testing
 - Configure `:influx_elixir, :client` to use the LocalClient in `config/test.exs` — no real InfluxDB needed
-- Use `InfluxElixir.TestHelper.setup_local/1` in test setup for isolated per-test state
+- Use `InfluxElixir.TestHelper.setup_influx/1` in test setup for isolated per-test state
 - LocalClient stores data in ETS and responds like a real InfluxDB server
 - Run integration tests against real InfluxDB with `--include integration` tag
 

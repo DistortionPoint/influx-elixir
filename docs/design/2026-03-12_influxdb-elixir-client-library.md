@@ -581,7 +581,7 @@ When a consuming app runs `mix usage_rules.sync` and includes `:influx_elixir` i
 
 ## Testing
 - Configure `:influx_elixir, :client` to use the LocalClient in `config/test.exs` — no real InfluxDB needed
-- Use `InfluxElixir.TestHelper.setup_local/1` in test setup for isolated per-test state
+- Use `InfluxElixir.TestHelper.setup_influx/1` in test setup for isolated per-test state
 - LocalClient stores data in ETS and responds like a real InfluxDB server
 - Run integration tests against real InfluxDB with `--include integration` tag
 
@@ -885,7 +885,7 @@ The library ships a test helper that consuming apps can use:
 
 ```elixir
 # In consuming app's test/test_helper.exs:
-InfluxElixir.TestHelper.setup_local()
+InfluxElixir.TestHelper.setup_influx()
 
 # Or in individual test modules:
 use InfluxElixir.TestCase

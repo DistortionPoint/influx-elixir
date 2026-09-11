@@ -74,6 +74,21 @@ defmodule MyApp.InfluxTest do
 end
 ```
 
+The library ships `InfluxElixir.TestHelper.setup_influx/1`, which does the
+same start / `on_exit` dance in one line and accepts every
+`Local.start/1` option:
+
+```elixir
+defmodule MyApp.InfluxTest do
+  use ExUnit.Case, async: true
+  import InfluxElixir.TestHelper
+
+  setup do
+    setup_influx(databases: ["myapp_test"], profile: :v3_core)
+  end
+end
+```
+
 ### 4. Use the shared case template (optional)
 
 If you have many test modules that need InfluxDB, create a shared setup:

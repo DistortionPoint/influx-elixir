@@ -6,7 +6,7 @@
 - Each test process gets isolated ETS tables for `async: true` safety
 
 ## Test Helpers
-- Use `InfluxElixir.TestHelper.setup_local/1` in test setup blocks
+- Use `InfluxElixir.TestHelper.setup_influx/1` in test setup blocks
 - This creates isolated ETS tables and cleans them up after the test
 
 ## Contract Tests

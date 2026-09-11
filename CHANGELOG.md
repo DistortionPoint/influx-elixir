@@ -8,11 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Removed the unused internal `InfluxElixir.InfluxCase` case template from
+  `test/support/` (never shipped; no test used it).
 - `Client.Local`'s line-protocol splitters accumulate tokens in binaries
   (runtime-optimised append) instead of one list cell per byte plus a
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`InfluxElixir.TestHelper` now ships in the package.** It was documented
+  (CLAUDE.md, usage rules, the original design) as a helper for consuming
+  applications' test suites, but lived under `test/support/`, which is only
+  compiled in this repository's test environment — no consumer ever received
+  it. It is now under `lib/`. The usage rules also named a nonexistent
+  `setup_local/1`; the function is `setup_influx/1`, which passes its options
+  straight to `Client.Local.start/1`. Covered by its own test module.
 - `InfluxElixir.Admin.Health` documented an atom-keyed `%{status: "pass"}`
   result; both clients return string keys (`%{"status" => "pass"}`), as the
   2026-03-13 integration plan already required.
