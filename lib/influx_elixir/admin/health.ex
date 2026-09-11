@@ -9,7 +9,7 @@ defmodule InfluxElixir.Admin.Health do
 
       {:ok, conn} = InfluxElixir.Client.Local.start()
 
-      {:ok, %{status: "pass"}} = InfluxElixir.Admin.Health.check(conn)
+      {:ok, %{"status" => "pass"}} = InfluxElixir.Admin.Health.check(conn)
   """
 
   @doc """
@@ -21,7 +21,8 @@ defmodule InfluxElixir.Admin.Health do
 
   ## Returns
 
-    * `{:ok, map()}` with status details on success (e.g. `%{status: "pass"}`)
+    * `{:ok, map()}` with string keys, as decoded from the server's JSON
+      (e.g. `%{"status" => "pass"}`); `Client.Local` returns the same shape
     * `{:error, reason}` if the instance is unreachable or unhealthy
   """
   @spec check(InfluxElixir.Client.connection()) :: {:ok, map()} | {:error, term()}

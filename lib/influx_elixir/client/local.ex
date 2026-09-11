@@ -998,48 +998,50 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
+  # The splitters below accumulate the current token in a binary. Appending
+  # to a binary the process owns is optimised by the runtime (no copy), so
+  # this is one pass with one allocation per token — the previous
+  # one-byte-per-list-cell accumulation plus reverse/join was several
+  # allocations per byte on every write.
+
   # Splits a line into [key_part, fields_part, optional_timestamp] by
   # unescaped spaces that are not inside double-quoted strings.
   @spec split_line_parts(binary()) :: [binary()]
   defp split_line_parts(line) do
-    do_lp_split(line, [], [], false)
+    do_lp_split(line, <<>>, [], false)
   end
 
   # End of input — flush remaining token.
-  defp do_lp_split(<<>>, current, acc, _in_quotes) do
-    token = current |> Enum.reverse() |> IO.iodata_to_binary()
-    Enum.reverse([token | acc])
-  end
+  defp do_lp_split(<<>>, current, acc, _in_quotes), do: Enum.reverse([current | acc])
 
   # Escaped backslash — keep both chars, quote state unchanged.
   defp do_lp_split(<<"\\\\", rest::binary>>, current, acc, in_quotes) do
-    do_lp_split(rest, ["\\", "\\" | current], acc, in_quotes)
+    do_lp_split(rest, <<current::binary, "\\\\">>, acc, in_quotes)
   end
 
   # Escaped double-quote — keep both chars, do not toggle quote state.
   defp do_lp_split(<<"\\\"", rest::binary>>, current, acc, in_quotes) do
-    do_lp_split(rest, ["\"", "\\" | current], acc, in_quotes)
+    do_lp_split(rest, <<current::binary, "\\\"">>, acc, in_quotes)
   end
 
   # Escaped space outside quotes — keep both chars, no split.
   defp do_lp_split(<<"\\ ", rest::binary>>, current, acc, false) do
-    do_lp_split(rest, [" ", "\\" | current], acc, false)
+    do_lp_split(rest, <<current::binary, "\\ ">>, acc, false)
   end
 
   # Unescaped double-quote — toggle in_quotes flag.
   defp do_lp_split(<<"\"", rest::binary>>, current, acc, in_quotes) do
-    do_lp_split(rest, ["\"" | current], acc, !in_quotes)
+    do_lp_split(rest, <<current::binary, "\"">>, acc, !in_quotes)
   end
 
   # Unescaped space outside a quoted string — emit token.
   defp do_lp_split(<<" ", rest::binary>>, current, acc, false) do
-    token = current |> Enum.reverse() |> IO.iodata_to_binary()
-    do_lp_split(rest, [], [token | acc], false)
+    do_lp_split(rest, <<>>, [current | acc], false)
   end
 
-  # All other characters — accumulate.
-  defp do_lp_split(<<c::binary-size(1), rest::binary>>, current, acc, in_quotes) do
-    do_lp_split(rest, [c | current], acc, in_quotes)
+  # All other bytes — accumulate.
+  defp do_lp_split(<<c, rest::binary>>, current, acc, in_quotes) do
+    do_lp_split(rest, <<current::binary, c>>, acc, in_quotes)
   end
 
   # Parses the "measurement[,tag=val...]" part.
@@ -1059,24 +1061,19 @@ defmodule InfluxElixir.Client.Local do
   # Splits at the first unescaped comma.
   @spec split_first_unescaped_comma(binary()) :: {binary(), binary()}
   defp split_first_unescaped_comma(str) do
-    do_split_comma(str, [])
+    do_split_comma(str, <<>>)
   end
 
-  defp do_split_comma(<<>>, acc) do
-    {acc |> Enum.reverse() |> IO.iodata_to_binary(), ""}
-  end
+  defp do_split_comma(<<>>, acc), do: {acc, ""}
 
   defp do_split_comma(<<"\\,", rest::binary>>, acc) do
-    do_split_comma(rest, [",", "\\" | acc])
+    do_split_comma(rest, <<acc::binary, "\\,">>)
   end
 
-  defp do_split_comma(<<",", rest::binary>>, acc) do
-    left = acc |> Enum.reverse() |> IO.iodata_to_binary()
-    {left, rest}
-  end
+  defp do_split_comma(<<",", rest::binary>>, acc), do: {acc, rest}
 
-  defp do_split_comma(<<c::binary-size(1), rest::binary>>, acc) do
-    do_split_comma(rest, [c | acc])
+  defp do_split_comma(<<c, rest::binary>>, acc) do
+    do_split_comma(rest, <<acc::binary, c>>)
   end
 
   # Parses "tag1=v1,tag2=v2,..." into a map.
@@ -1117,56 +1114,47 @@ defmodule InfluxElixir.Client.Local do
   # Splits a CSV-like string on unescaped commas, respecting quoted strings.
   @spec split_unescaped_comma(binary()) :: [binary()]
   defp split_unescaped_comma(str) do
-    do_csv_split(str, [], [], false)
+    do_csv_split(str, <<>>, [], false)
   end
 
-  defp do_csv_split(<<>>, current, acc, _in_quotes) do
-    token = current |> Enum.reverse() |> IO.iodata_to_binary()
-    Enum.reverse([token | acc])
-  end
+  defp do_csv_split(<<>>, current, acc, _in_quotes), do: Enum.reverse([current | acc])
 
   defp do_csv_split(<<"\\\"", rest::binary>>, current, acc, in_quotes) do
-    do_csv_split(rest, ["\"", "\\" | current], acc, in_quotes)
+    do_csv_split(rest, <<current::binary, "\\\"">>, acc, in_quotes)
   end
 
   defp do_csv_split(<<"\"", rest::binary>>, current, acc, in_quotes) do
-    do_csv_split(rest, ["\"" | current], acc, !in_quotes)
+    do_csv_split(rest, <<current::binary, "\"">>, acc, !in_quotes)
   end
 
   defp do_csv_split(<<"\\,", rest::binary>>, current, acc, in_quotes) do
-    do_csv_split(rest, [",", "\\" | current], acc, in_quotes)
+    do_csv_split(rest, <<current::binary, "\\,">>, acc, in_quotes)
   end
 
   defp do_csv_split(<<",", rest::binary>>, current, acc, false) do
-    token = current |> Enum.reverse() |> IO.iodata_to_binary()
-    do_csv_split(rest, [], [token | acc], false)
+    do_csv_split(rest, <<>>, [current | acc], false)
   end
 
-  defp do_csv_split(<<c::binary-size(1), rest::binary>>, current, acc, in_quotes) do
-    do_csv_split(rest, [c | current], acc, in_quotes)
+  defp do_csv_split(<<c, rest::binary>>, current, acc, in_quotes) do
+    do_csv_split(rest, <<current::binary, c>>, acc, in_quotes)
   end
 
   # Splits at the first unescaped = sign.
   @spec split_first_unescaped_equals(binary()) :: {binary(), binary()}
   defp split_first_unescaped_equals(str) do
-    do_split_eq(str, [])
+    do_split_eq(str, <<>>)
   end
 
-  defp do_split_eq(<<>>, acc) do
-    {acc |> Enum.reverse() |> IO.iodata_to_binary(), ""}
-  end
+  defp do_split_eq(<<>>, acc), do: {acc, ""}
 
   defp do_split_eq(<<"\\=", rest::binary>>, acc) do
-    do_split_eq(rest, ["=", "\\" | acc])
+    do_split_eq(rest, <<acc::binary, "\\=">>)
   end
 
-  defp do_split_eq(<<"=", rest::binary>>, acc) do
-    left = acc |> Enum.reverse() |> IO.iodata_to_binary()
-    {left, rest}
-  end
+  defp do_split_eq(<<"=", rest::binary>>, acc), do: {acc, rest}
 
-  defp do_split_eq(<<c::binary-size(1), rest::binary>>, acc) do
-    do_split_eq(rest, [c | acc])
+  defp do_split_eq(<<c, rest::binary>>, acc) do
+    do_split_eq(rest, <<acc::binary, c>>)
   end
 
   # Parses a field value string into its typed Elixir equivalent.

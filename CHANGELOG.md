@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `Client.Local`'s line-protocol splitters accumulate tokens in binaries
+  (runtime-optimised append) instead of one list cell per byte plus a
+  reverse and join, cutting allocations on every write to the double.
+
+### Fixed
+- `InfluxElixir.Admin.Health` documented an atom-keyed `%{status: "pass"}`
+  result; both clients return string keys (`%{"status" => "pass"}`), as the
+  2026-03-13 integration plan already required.
+
+## [0.1.21] - 2026-09-11
+
 ### Added
 - **Telemetry is actually emitted.** `InfluxElixir.Telemetry` documented
   `[:influx_elixir, :write | :query, ...]` events, but nothing in the library
