@@ -132,14 +132,19 @@ defmodule InfluxElixir do
   @doc """
   Executes a SQL query against InfluxDB v3.
 
-  Supports `transport: :http | :flight` option for transport selection.
+  Supports `transport: :http | :flight` option for transport selection
+  (`InfluxElixir.Client.HTTP` only; `Client.Local` is in-memory and ignores it).
 
   ## Common Options
 
     * `:database` — overrides the connection-level default database.
     * `:timeout` — per-call receive timeout in milliseconds. Both the
       HTTP and Flight transports honour this; default is `30_000` ms.
-    * `:params` — map of `$name => value` placeholder substitutions.
+    * `:params` — map of `$name => value` placeholder substitutions
+      (HTTP transport only; Flight returns `{:error, :params_unsupported_over_flight}`).
+    * `:transport` — `:http` (default) or `:flight` (Arrow Flight gRPC).
+    * `:flight_port` — gRPC port for `:flight`; falls back to the connection's
+      `:flight_port`, then `443`. Pass `tls: false` for plaintext ports.
   """
   @spec query_sql(
           InfluxElixir.Client.connection(),

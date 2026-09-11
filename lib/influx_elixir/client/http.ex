@@ -153,6 +153,48 @@ defmodule InfluxElixir.Client.HTTP do
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_sql(connection, sql, opts \\ []) do
+    case Keyword.get(opts, :transport, :http) do
+      :flight -> flight_query_sql(connection, sql, opts)
+      :http -> http_query_sql(connection, sql, opts)
+      other -> {:error, {:unknown_transport, other}}
+    end
+  end
+
+  # `transport: :flight` runs the query over Arrow Flight gRPC. The Flight
+  # endpoint shares the host and token; its port comes from
+  # `opts[:flight_port]`, then the connection's `:flight_port`, then 443.
+  # Params are not supported by the Flight ticket, so they are rejected
+  # rather than silently dropped.
+  @spec flight_query_sql(keyword(), binary(), keyword()) ::
+          {:ok, [map()]} | {:error, term()}
+  defp flight_query_sql(connection, sql, opts) do
+    with {:ok, database} <- resolve_database(opts, connection),
+         :ok <- reject_flight_params(opts) do
+      flight_conn = %{
+        host: conn_val(connection, :host),
+        token: conn_val(connection, :token, ""),
+        database: database,
+        port: Keyword.get(opts, :flight_port, conn_val(connection, :flight_port, 443))
+      }
+
+      InfluxElixir.Flight.Client.query(
+        flight_conn,
+        sql,
+        Keyword.take(opts, [:timeout, :connect_timeout, :tls])
+      )
+    end
+  end
+
+  @spec reject_flight_params(keyword()) :: :ok | {:error, :params_unsupported_over_flight}
+  defp reject_flight_params(opts) do
+    case Keyword.get(opts, :params, %{}) do
+      params when map_size(params) == 0 -> :ok
+      _params -> {:error, :params_unsupported_over_flight}
+    end
+  end
+
+  @spec http_query_sql(keyword(), binary(), keyword()) :: InfluxElixir.Client.query_result()
+  defp http_query_sql(connection, sql, opts) do
     with {:ok, database} <- resolve_database(opts, connection) do
       params = Keyword.get(opts, :params, %{})
       format = Keyword.get(opts, :format, :json)

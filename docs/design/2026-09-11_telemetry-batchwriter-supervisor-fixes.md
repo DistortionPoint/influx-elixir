@@ -59,7 +59,20 @@ connection legitimately has no host). The schema gained the keys the
 supervisor and HTTP client actually read: `:timeout`, `:batch_writer`,
 `:finch_name`. Docs corrected to `database:`.
 
-### 5. Test isolation for telemetry
+### 5. `transport: :flight` was documented but ignored
+
+The facade, `Query.SQL` and `usage-rules/query.md` all described a
+`transport: :flight` option; `Flight.Client` existed; nothing read the option,
+so every query went over HTTP. **Fix**: `Client.HTTP.query_sql/3` dispatches
+on `:transport`. For `:flight` it builds the Flight connection map from the
+HTTP connection (host, token, resolved database) and `flight_port` (per-call
+opt → connection → 443), forwards `:timeout`/`:connect_timeout`/`:tls`, and
+rejects `params:` (the Flight ticket has no parameter slot) rather than
+dropping them. `Config` gains `:flight_port`. Verified against InfluxDB 3 Core,
+which serves Flight on its HTTP port without TLS: the Flight rows equal the
+HTTP rows for the same query. `Client.Local` ignores the option (in-memory).
+
+### 6. Test isolation for telemetry
 
 Handlers are global, so once the facade emitted spans, an async test in
 `telemetry_test.exs` received a `:stop` from another module. Both test files

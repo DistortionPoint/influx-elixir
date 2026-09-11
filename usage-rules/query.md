@@ -17,5 +17,6 @@
 - Use `:parquet` for S3/Athena pipeline integration
 
 ## Arrow Flight
-- Use `transport: :flight` option for high-throughput queries
-- Arrow Flight uses gRPC — requires separate port configuration
+- Use `transport: :flight` on `InfluxElixir.query_sql/3` for high-throughput queries (HTTP client only)
+- Arrow Flight uses gRPC on its own port: set `flight_port:` on the connection (or per call); InfluxDB 3 Core serves it on 8181 with `tls: false`
+- `params:` are not supported over Flight — the call returns `{:error, :params_unsupported_over_flight}`

@@ -45,6 +45,18 @@ defmodule InfluxElixir.Query.SQLTest do
     end
   end
 
+  describe "connection-level default database" do
+    test "query/2, query_stream/2 and execute/2 use it" do
+      {:ok, conn} = Local.start(database: "dflt_db")
+      on_exit(fn -> Local.stop(conn) end)
+      {:ok, :written} = Local.write(conn, "cpu value=7i")
+
+      assert {:ok, [%{"value" => 7}]} = SQL.query(conn, "SELECT * FROM cpu")
+      assert [%{"value" => 7}] = conn |> SQL.query_stream("SELECT * FROM cpu") |> Enum.to_list()
+      assert {:ok, %{"rows_affected" => 0}} = SQL.execute(conn, "ALTER TABLE cpu")
+    end
+  end
+
   describe "execute/3" do
     test "returns {:error, _} for DELETE on v3_core", %{conn: conn} do
       assert {:error, :delete_not_supported} =

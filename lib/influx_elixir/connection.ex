@@ -111,10 +111,9 @@ defmodule InfluxElixir.Connection do
   """
   @spec delete(atom()) :: :ok
   def delete(name) when is_atom(name) do
+    # erase/1 returns false for a missing key; it never raises.
     :persistent_term.erase({__MODULE__, name})
     :ok
-  rescue
-    ArgumentError -> :ok
   end
 
   @doc """

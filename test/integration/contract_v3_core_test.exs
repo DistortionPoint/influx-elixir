@@ -48,4 +48,43 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
         flunk("Failed to create test database: #{inspect(reason)}")
     end
   end
+
+  # Arrow Flight is HTTP-client only (Local is in-memory), so it lives
+  # outside the shared contract. InfluxDB 3 Core serves Flight gRPC on the
+  # same port as HTTP, without TLS.
+  describe "query_sql/3 with transport: :flight" do
+    test "returns the same rows as the HTTP transport", ctx do
+      {:ok, :written} =
+        HTTP.write(
+          ctx.conn,
+          "flight_probe,host=a value=1.5,count=2i 1700000000000000000",
+          database: ctx.database
+        )
+
+      Process.sleep(ctx.query_delay)
+      sql = "SELECT host, value, count FROM flight_probe"
+
+      assert {:ok, [http_row]} = HTTP.query_sql(ctx.conn, sql, database: ctx.database)
+
+      assert {:ok, [flight_row]} =
+               HTTP.query_sql(ctx.conn, sql,
+                 database: ctx.database,
+                 transport: :flight,
+                 flight_port: ctx.conn[:port],
+                 tls: false
+               )
+
+      assert flight_row == http_row
+      assert %{"host" => "a", "value" => 1.5, "count" => 2} = flight_row
+    end
+
+    test "rejects params over Flight instead of dropping them", ctx do
+      assert {:error, :params_unsupported_over_flight} =
+               HTTP.query_sql(ctx.conn, "SELECT 1",
+                 database: ctx.database,
+                 transport: :flight,
+                 params: %{x: 1}
+               )
+    end
+  end
 end

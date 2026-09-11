@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `InfluxElixir.Config` knows `:timeout`, `:batch_writer` and `:finch_name`.
 
 ### Fixed
+- **`transport: :flight` was documented but ignored** by the facade,
+  `Query.SQL` and the usage rules; every query went over HTTP.
+  `Client.HTTP.query_sql/3` now dispatches to `Flight.Client` when
+  `transport: :flight` is given, using the connection's host/token, the resolved
+  database, and `flight_port` (opt, connection, or 443). `params:` are rejected
+  over Flight instead of being dropped. Verified against InfluxDB 3 Core's
+  Flight endpoint.
 - **`BatchWriter` retried 4xx responses.** The discard clause matched
   `{:error, {:http_error, status}}`, a shape no client produces, so a rejected
   batch (bad line protocol, unknown database) was retried with backoff until
