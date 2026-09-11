@@ -255,11 +255,11 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["c"] == "hi"
     end
 
-    test "timestamp is returned as ISO 8601 string", %{conn: conn, db: db} do
-      ts = 1_630_424_257_000_000_000
+    test "timestamp is returned as a microsecond-precision DateTime", %{conn: conn, db: db} do
+      ts = 1_630_424_257_123_456_789
       Local.write(conn, "m value=1.0 #{ts}", database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["time"] == "2021-08-31T15:37:37"
+      assert row["time"] == ~U[2021-08-31 15:37:37.123456Z]
     end
 
     test "multi-line write stores multiple points", %{conn: conn, db: db} do
@@ -329,28 +329,28 @@ defmodule InfluxElixir.Client.LocalTest do
       ts = 1_000_000_000
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :nanosecond)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["time"] == "1970-01-01T00:00:01"
+      assert row["time"] == ~U[1970-01-01 00:00:01.000000Z]
     end
 
     test "microsecond precision is multiplied by 1_000", %{conn: conn, db: db} do
       ts = 1_000_000
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :microsecond)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["time"] == "1970-01-01T00:00:01"
+      assert row["time"] == ~U[1970-01-01 00:00:01.000000Z]
     end
 
     test "millisecond precision is multiplied by 1_000_000", %{conn: conn, db: db} do
       ts = 1_000
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :millisecond)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["time"] == "1970-01-01T00:00:01"
+      assert row["time"] == ~U[1970-01-01 00:00:01.000000Z]
     end
 
     test "second precision is multiplied by 1_000_000_000", %{conn: conn, db: db} do
       ts = 1
       Local.write(conn, "m value=1i #{ts}", database: db, precision: :second)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["time"] == "1970-01-01T00:00:01"
+      assert row["time"] == ~U[1970-01-01 00:00:01.000000Z]
     end
   end
 
@@ -428,7 +428,7 @@ defmodule InfluxElixir.Client.LocalTest do
                Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time ASC", database: db)
 
       times = Enum.map(rows, & &1["time"])
-      assert times == Enum.sort(times)
+      assert times == Enum.sort(times, DateTime)
     end
 
     test "ORDER BY time DESC", %{conn: conn, db: db} do
@@ -436,7 +436,7 @@ defmodule InfluxElixir.Client.LocalTest do
                Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time DESC", database: db)
 
       times = Enum.map(rows, & &1["time"])
-      assert times == Enum.sort(times, :desc)
+      assert times == Enum.sort(times, {:desc, DateTime})
     end
 
     test "LIMIT reduces number of results", %{conn: conn, db: db} do
@@ -450,7 +450,7 @@ defmodule InfluxElixir.Client.LocalTest do
       sql = "SELECT * FROM cpu WHERE region = 'us-east' ORDER BY time DESC LIMIT 1"
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
       assert row["region"] == "us-east"
-      assert row["time"] == "1970-01-01T00:00:00.000003000"
+      assert row["time"] == ~U[1970-01-01 00:00:00.000003Z]
     end
 
     test "each row has fields, tags, and time but no _measurement key",
@@ -458,7 +458,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, [row | _rest]} =
                Local.query_sql(conn, "SELECT * FROM cpu", database: db)
 
-      assert is_binary(row["time"])
+      assert %DateTime{} = row["time"]
       assert Map.has_key?(row, "usage")
       refute Map.has_key?(row, "_measurement")
     end
@@ -515,7 +515,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
       assert row["net_value"] == 110.0
       assert row["total_balance"] == 130.0
-      assert is_binary(row["time"])
+      assert %DateTime{} = row["time"]
     end
 
     test "supports AS aliases on projection columns", %{conn: conn, db: db} do
@@ -1778,11 +1778,11 @@ defmodule InfluxElixir.Client.LocalTest do
       assert length(rows) == 3
 
       [b1, b2, b3] = rows
-      assert b1["time"] == "1970-01-01T00:00:00"
+      assert b1["time"] == ~U[1970-01-01 00:00:00.000000Z]
       assert b1["avg_usage"] == 15.0
-      assert b2["time"] == "1970-01-01T02:00:00"
+      assert b2["time"] == ~U[1970-01-01 02:00:00.000000Z]
       assert b2["avg_usage"] == 35.0
-      assert b3["time"] == "1970-01-01T04:00:00"
+      assert b3["time"] == ~U[1970-01-01 04:00:00.000000Z]
       assert b3["avg_usage"] == 55.0
     end
 
@@ -1801,9 +1801,9 @@ defmodule InfluxElixir.Client.LocalTest do
       assert length(rows) == 2
 
       [b1, b2] = rows
-      assert b1["time"] == "1970-01-01T00:00:00"
+      assert b1["time"] == ~U[1970-01-01 00:00:00.000000Z]
       assert b1["total"] == 60
-      assert b2["time"] == "1970-01-01T03:00:00"
+      assert b2["time"] == ~U[1970-01-01 03:00:00.000000Z]
       assert b2["total"] == 150
     end
 
@@ -1820,9 +1820,9 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
       [b1, b2] = rows
-      assert b1["time"] == "1970-01-01T00:00:00"
+      assert b1["time"] == ~U[1970-01-01 00:00:00.000000Z]
       assert b1["cnt"] == 3
-      assert b2["time"] == "1970-01-01T03:00:00"
+      assert b2["time"] == ~U[1970-01-01 03:00:00.000000Z]
       assert b2["cnt"] == 3
     end
 
@@ -1839,7 +1839,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       # All points at 0.5h-5.5h → all in bucket 0
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["time"] == "1970-01-01T00:00:00"
+      assert row["time"] == ~U[1970-01-01 00:00:00.000000Z]
       assert row["min_val"] == 10
       assert row["max_val"] == 60
     end
@@ -1879,7 +1879,7 @@ defmodule InfluxElixir.Client.LocalTest do
       # web01 has points at 0.5h, 1.5h, 2.5h → all in bucket 0
       assert length(rows) == 1
       [row] = rows
-      assert row["time"] == "1970-01-01T00:00:00"
+      assert row["time"] == ~U[1970-01-01 00:00:00.000000Z]
       assert row["avg_usage"] == 20.0
     end
 
@@ -1895,7 +1895,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
       times = Enum.map(rows, & &1["time"])
-      assert times == Enum.sort(times, :desc)
+      assert times == Enum.sort(times, {:desc, DateTime})
     end
 
     test "LIMIT on aggregate results",
@@ -1989,7 +1989,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       # All 6 points at 0.5h-5.5h → all in day bucket 0
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["time"] == "1970-01-01T00:00:00"
+      assert row["time"] == ~U[1970-01-01 00:00:00.000000Z]
       assert row["total"] == 210
     end
 
@@ -2416,7 +2416,7 @@ defmodule InfluxElixir.Client.LocalTest do
       Local.write(conn, "cpu value=42i", database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
       assert row["value"] == 42
-      assert is_binary(row["time"]), "time should be a string, not nil"
+      assert %DateTime{} = row["time"]
     end
   end
 
@@ -2849,9 +2849,9 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
       assert row["total"] == 30
-      # Bucket time should be a valid ISO8601 string, not epoch
-      assert is_binary(row["time"])
-      refute row["time"] == "1970-01-01T00:00:00"
+      # Bucket time should be the server-assigned hour, not the epoch
+      assert %DateTime{} = row["time"]
+      refute row["time"] == ~U[1970-01-01 00:00:00.000000Z]
     end
   end
 
@@ -2945,12 +2945,10 @@ defmodule InfluxElixir.Client.LocalTest do
       assert length(times) == 6
       assert times == Enum.uniq(times), "timestamps must remain distinct"
 
-      datetimes = Enum.map(times, &NaiveDateTime.from_iso8601!(&1))
-
-      pairs = Enum.zip(datetimes, tl(datetimes))
+      pairs = Enum.zip(times, tl(times))
 
       for {a, b} <- pairs do
-        diff_seconds = NaiveDateTime.diff(b, a)
+        diff_seconds = DateTime.diff(b, a)
         assert diff_seconds == 900, "expected 900s spacing, got #{diff_seconds}s"
       end
     end

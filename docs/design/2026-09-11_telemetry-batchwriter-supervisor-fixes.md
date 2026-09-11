@@ -72,7 +72,30 @@ dropping them. `Config` gains `:flight_port`. Verified against InfluxDB 3 Core,
 which serves Flight on its HTTP port without TLS: the Flight rows equal the
 HTTP rows for the same query. `Client.Local` ignores the option (in-memory).
 
-### 6. Test isolation for telemetry
+### 6. `time` differed between transports
+
+With Flight implemented, selecting `time` showed the gap: `Flight.Reader`
+returned Timestamp columns as raw integers, and the HTTP path *also* failed to
+convert — InfluxDB 3 renders JSON timestamps without a zone
+(`"2023-11-14T22:13:20.123456789"`), which `DateTime.from_iso8601/1` rejects,
+so `ResponseParser` had been leaving `time` as a string. **Fix**: the reader
+parses the Arrow `TimeUnit` from the Timestamp table and converts with
+`DateTime.from_unix!/2`; the parser falls back to `NaiveDateTime` and stamps
+UTC. Both truncate to microseconds, so rows are identical — the integration
+test asserts `flight_row == http_row` including `time`. The reader's
+fixed-width decoders were also rewritten as binary comprehensions.
+
+Fixing HTTP exposed the third divergence: `Client.Local` rendered `time` and
+`DATE_BIN` buckets as ISO 8601 strings, so the contract suite had been
+asserting `is_binary(row["time"])` against a string on Local and (by accident
+of the zone-less parsing bug) a string on HTTP. Local now returns `DateTime`
+too, sorts bucket rows with the `DateTime` comparator (term order on structs
+is not chronological), and every timestamp the library returns is normalised
+to microsecond precision so values from JSON, Flight and Local are `==`.
+Contract tests assert the single instant `~U[2023-11-14 22:13:20.000000Z]`
+across all three.
+
+### 7. Test isolation for telemetry
 
 Handlers are global, so once the facade emitted spans, an async test in
 `telemetry_test.exs` received a `:stop` from another module. Both test files

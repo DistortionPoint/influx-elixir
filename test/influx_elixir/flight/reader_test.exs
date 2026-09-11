@@ -87,8 +87,18 @@ defmodule InfluxElixir.Flight.ReaderTest do
     {vtable <> inline, @fp_vtable_size}
   end
 
+  defp build_type_blob(10, opts) do
+    # Timestamp table: slot 0 = unit (int16 TimeUnit: 0=s, 1=ms, 2=us, 3=ns);
+    # slot 1 (timezone) absent. Same shape as FloatingPoint.
+    unit = Keyword.get(opts, :unit, 3)
+    vtable = <<6::little-16, 8::little-16, 4::little-16>>
+    soffset = byte_size(vtable)
+    inline = <<soffset::little-signed-32, unit::little-signed-16, 0::16>>
+    {vtable <> inline, @fp_vtable_size}
+  end
+
   defp build_type_blob(_type_type, _opts) do
-    # Bool, Utf8, Timestamp, other: empty table
+    # Bool, Utf8, other: empty table
     # vtable: 2 × u16 = 4 bytes, vtable_size=4, obj_size=4
     vtable = <<4::little-16, 4::little-16>>
     soffset = byte_size(vtable)
@@ -892,16 +902,33 @@ defmodule InfluxElixir.Flight.ReaderTest do
   # ---------------------------------------------------------------------------
 
   describe "decode_flight_data/1 — Timestamp columns" do
-    test "decodes nanosecond timestamp values" do
-      ts1 = 1_630_424_257_000_000_000
+    test "decodes nanosecond timestamps to DateTime (microsecond precision)" do
+      ts1 = 1_630_424_257_123_456_789
       ts2 = 1_630_424_258_000_000_000
-      schema = schema_fd([{"time", 10, []}])
+      schema = schema_fd([{"time", 10, [unit: 3]}])
       {body, specs} = int64_column([ts1, ts2])
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["time"] == ts1
-      assert Enum.at(rows, 1)["time"] == ts2
+      assert {:ok, [row1, row2]} = Reader.decode_flight_data([schema, batch])
+      assert row1["time"] == ~U[2021-08-31 15:37:37.123456Z]
+      assert row2["time"] == ~U[2021-08-31 15:37:38.000000Z]
+    end
+
+    test "honours the column's TimeUnit (milliseconds)" do
+      schema = schema_fd([{"time", 10, [unit: 1]}])
+      {body, specs} = int64_column([1_630_424_257_500])
+      batch = batch_fd(body, specs, 1)
+
+      assert {:ok, [%{"time" => ~U[2021-08-31 15:37:37.500000Z]}]} =
+               Reader.decode_flight_data([schema, batch])
+    end
+
+    test "parses the unit into the column schema" do
+      assert {:ok, [%{name: "time", type_id: 20, unit: :nanosecond}]} =
+               Reader.parse_schema(schema_fd([{"time", 10, [unit: 3]}]).data_header)
+
+      assert {:ok, [%{name: "v", type_id: 6, unit: nil}]} =
+               Reader.parse_schema(schema_fd([{"v", 2, [bit_width: 64]}]).data_header)
     end
   end
 

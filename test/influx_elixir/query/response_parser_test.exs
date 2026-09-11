@@ -89,7 +89,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
 
       assert %{"table" => 0, "_value" => "x, y", "_field" => "label", "host" => "a"} = label_row
       assert %{"table" => 1, "_value" => 42.5, "_field" => "value"} = value_row
-      assert value_row["_time"] == ~U[2023-11-14 22:13:20Z]
+      assert value_row["_time"] == ~U[2023-11-14 22:13:20.000000Z]
       refute Map.has_key?(value_row, "")
     end
 
@@ -163,6 +163,14 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       assert ResponseParser.coerce_types(row) == row
     end
 
+    test "treats a zone-less time (InfluxDB 3's JSON rendering) as UTC" do
+      # Captured from InfluxDB 3 Core: no "Z", nanosecond fraction.
+      row = %{"time" => "2023-11-14T22:13:20.123456789"}
+
+      assert %{"time" => ~U[2023-11-14 22:13:20.123456Z]} =
+               ResponseParser.coerce_types(row)
+    end
+
     test "leaves invalid time strings as-is" do
       row = %{"time" => "not a date"}
       result = ResponseParser.coerce_types(row)
@@ -176,11 +184,12 @@ defmodule InfluxElixir.Query.ResponseParserTest do
         "_stop" => "2026-03-12T11:00:00Z"
       }
 
+      # Always microsecond precision, so values compare equal across transports.
       assert %{
-               "_time" => ~U[2026-03-12 10:00:00Z],
-               "_start" => ~U[2026-03-12 09:00:00Z],
-               "_stop" => ~U[2026-03-12 11:00:00Z]
-             } = ResponseParser.coerce_types(row)
+               "_time" => ~U[2026-03-12 10:00:00.000000Z],
+               "_start" => ~U[2026-03-12 09:00:00.000000Z],
+               "_stop" => ~U[2026-03-12 11:00:00.000000Z]
+             } == ResponseParser.coerce_types(row)
     end
   end
 end

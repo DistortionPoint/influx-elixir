@@ -27,7 +27,8 @@ defmodule InfluxElixir.Flight.Reader do
   | Float32/64 | `float()`      |
   | Bool       | `boolean()`    |
   | Utf8       | `binary()`     |
-  | Timestamp  | `integer()`    |
+  | Timestamp  | `DateTime.t()` (converted with the column's unit; nanoseconds
+    are truncated to microseconds, as on the HTTP transport) |
 
   Null bitmaps are supported; null values become `nil`.
 
@@ -87,8 +88,15 @@ defmodule InfluxElixir.Flight.Reader do
     @type_timestamp => 8
   }
 
-  @typedoc "Parsed column schema entry"
-  @type column_schema :: %{name: binary(), type_id: non_neg_integer()}
+  # Arrow TimeUnit enum (Timestamp table slot 0)
+  @time_units %{0 => :second, 1 => :millisecond, 2 => :microsecond, 3 => :nanosecond}
+
+  @typedoc "Parsed column schema entry (`unit` is set for Timestamp columns)"
+  @type column_schema :: %{
+          name: binary(),
+          type_id: non_neg_integer(),
+          unit: System.time_unit() | nil
+        }
 
   @doc """
   Decodes a list of `FlightData` messages into row maps.
@@ -226,8 +234,24 @@ defmodule InfluxElixir.Flight.Reader do
       end
 
     type_id = resolve_type_id(fb, type_type, type_table_pos)
-    %{name: name, type_id: type_id}
+    %{name: name, type_id: type_id, unit: timestamp_unit(fb, type_type, type_table_pos)}
   end
+
+  # Timestamp slot 0: unit (int16 TimeUnit enum). Absent means SECOND per
+  # the Arrow schema default; InfluxDB writes NANOSECOND explicitly.
+  @spec timestamp_unit(binary(), non_neg_integer(), non_neg_integer() | nil) ::
+          System.time_unit() | nil
+  defp timestamp_unit(fb, @fb_type_timestamp, type_pos) when type_pos != nil do
+    {vt_pos, vt_size} = FB.read_vtable(fb, type_pos)
+
+    case FB.field_pos(fb, type_pos, vt_pos, vt_size, 0) do
+      nil -> :second
+      pos -> Map.get(@time_units, FB.read_int16(fb, pos), :nanosecond)
+    end
+  end
+
+  defp timestamp_unit(_fb, @fb_type_timestamp, nil), do: :second
+  defp timestamp_unit(_fb, _type_type, _type_pos), do: nil
 
   @spec resolve_type_id(binary(), non_neg_integer(), non_neg_integer() | nil) ::
           non_neg_integer()
@@ -431,7 +455,12 @@ defmodule InfluxElixir.Flight.Reader do
     {col_vectors, _remaining} =
       Enum.map_reduce(columns, buffer_specs, fn col, specs ->
         {allocated, rest} = allocate_buffers(col.type_id, specs)
-        vector = decode_column(col.type_id, allocated, body, row_count)
+
+        vector =
+          col.type_id
+          |> decode_column(allocated, body, row_count)
+          |> to_datetimes(col)
+
         {vector, rest}
       end)
 
@@ -439,6 +468,24 @@ defmodule InfluxElixir.Flight.Reader do
   rescue
     e -> {:error, {:column_decode_error, Exception.message(e)}}
   end
+
+  # Timestamps come off the wire as integers in the column's unit. They are
+  # converted to DateTime so a row is the same whether it arrived over
+  # Flight or HTTP (where ResponseParser converts the RFC3339 string).
+  @spec to_datetimes([term()], column_schema()) :: [term()]
+  defp to_datetimes(values, %{type_id: @type_timestamp, unit: unit}) do
+    Enum.map(values, fn
+      nil ->
+        nil
+
+      value ->
+        value
+        |> DateTime.from_unix!(unit || :nanosecond)
+        |> InfluxElixir.Query.ResponseParser.microsecond_precision()
+    end)
+  end
+
+  defp to_datetimes(values, _column), do: values
 
   @spec allocate_buffers(non_neg_integer(), list()) :: {list(), list()}
   defp allocate_buffers(@type_utf8, specs) do
@@ -546,44 +593,40 @@ defmodule InfluxElixir.Flight.Reader do
   defp decode_fixed_column(@type_bool, d, 0, n), do: decode_bools(d, n)
   defp decode_fixed_column(_type_id, _d, _w, n), do: List.duplicate(nil, n)
 
+  # Fixed-width columns are decoded with a binary comprehension — one pass
+  # over the buffer with no per-element slicing. A short buffer yields
+  # fewer values; `fit/2` pads with nil (or trims) to the batch length.
   @spec decode_ints(
           binary(),
           non_neg_integer(),
           pos_integer(),
           :signed | :unsigned
         ) :: [integer() | nil]
-  defp decode_ints(data, n, width, signedness) do
-    for i <- 0..(n - 1)//1 do
-      chunk = safe_slice(data, i * width, width)
-      decode_int_chunk(chunk, width, signedness)
-    end
+  defp decode_ints(data, n, width, :signed) do
+    bits = width * 8
+    fit(for(<<v::little-signed-size(bits) <- data>>, do: v), n)
   end
 
-  @spec decode_int_chunk(binary(), pos_integer(), :signed | :unsigned) ::
-          integer() | nil
-  defp decode_int_chunk(<<v::little-signed-64>>, 8, :signed), do: v
-  defp decode_int_chunk(<<v::little-unsigned-64>>, 8, :unsigned), do: v
-  defp decode_int_chunk(<<v::little-signed-32>>, 4, :signed), do: v
-  defp decode_int_chunk(<<v::little-unsigned-32>>, 4, :unsigned), do: v
-  defp decode_int_chunk(<<v::little-signed-16>>, 2, :signed), do: v
-  defp decode_int_chunk(<<v::little-unsigned-16>>, 2, :unsigned), do: v
-  defp decode_int_chunk(<<v::little-signed-8>>, 1, :signed), do: v
-  defp decode_int_chunk(<<v::little-unsigned-8>>, 1, :unsigned), do: v
-  defp decode_int_chunk(_chunk, _width, _sign), do: nil
+  defp decode_ints(data, n, width, :unsigned) do
+    bits = width * 8
+    fit(for(<<v::little-unsigned-size(bits) <- data>>, do: v), n)
+  end
 
   @spec decode_floats(binary(), non_neg_integer(), pos_integer()) ::
           [float() | nil]
   defp decode_floats(data, n, width) do
-    for i <- 0..(n - 1)//1 do
-      chunk = safe_slice(data, i * width, width)
-      decode_float_chunk(chunk, width)
-    end
+    bits = width * 8
+    fit(for(<<v::little-float-size(bits) <- data>>, do: v), n)
   end
 
-  @spec decode_float_chunk(binary(), pos_integer()) :: float() | nil
-  defp decode_float_chunk(<<v::little-float-64>>, 8), do: v
-  defp decode_float_chunk(<<v::little-float-32>>, 4), do: v * 1.0
-  defp decode_float_chunk(_chunk, _width), do: nil
+  @spec fit([term()], non_neg_integer()) :: [term()]
+  defp fit(values, n) do
+    case length(values) do
+      ^n -> values
+      len when len > n -> Enum.take(values, n)
+      len -> values ++ List.duplicate(nil, n - len)
+    end
+  end
 
   @spec decode_bools(binary(), non_neg_integer()) :: [boolean() | nil]
   defp decode_bools(data, n) do
@@ -608,11 +651,7 @@ defmodule InfluxElixir.Flight.Reader do
     if n_offsets < 2 do
       []
     else
-      offsets =
-        for i <- 0..(n_offsets - 1) do
-          <<v::little-signed-32>> = binary_part(offsets_bin, i * 4, 4)
-          v
-        end
+      offsets = for <<v::little-signed-32 <- offsets_bin>>, do: v
 
       offsets
       |> Enum.zip(Enum.drop(offsets, 1))

@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `InfluxElixir.Config` knows `:timeout`, `:batch_writer` and `:finch_name`.
 
 ### Fixed
+- **Flight and HTTP now return the same `time` values.** `Flight.Reader`
+  decoded Timestamp columns to raw integers while the HTTP path yields
+  `DateTime`; the reader now reads the Arrow `TimeUnit` and converts.
+  `Query.ResponseParser` also treated InfluxDB 3's zone-less JSON timestamps
+  (`"2023-11-14T22:13:20.123456789"`) as opaque strings because
+  `DateTime.from_iso8601/1` rejects them; they are now parsed as UTC. Verified
+  against InfluxDB 3 Core: identical rows on both transports.
 - **`transport: :flight` was documented but ignored** by the facade,
   `Query.SQL` and the usage rules; every query went over HTTP.
   `Client.HTTP.query_sql/3` now dispatches to `Flight.Client` when
@@ -43,8 +50,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NimbleOptions.ValidationError`. `Client.Local` configs are not validated.
 
 ### Changed
+- **`time` is a `DateTime` on every client and transport.** `Client.Local`
+  returned `time` and `DATE_BIN` buckets as ISO 8601 strings, while the HTTP
+  path (once its zone-less parsing was fixed, see below) and Flight return
+  `DateTime`. All three now return `DateTime` with microsecond precision, so
+  the contract suite asserts one instant across Local, HTTP and Flight. Code
+  that compared Local's `time` to a string must use a `DateTime` (six-digit
+  sigil or `DateTime.compare/2`).
 - `InfluxElixir.write/3` goes through `Write.Writer`, so payloads over 1 KB
   are gzipped like `BatchWriter` flushes already were.
+- `Flight.Reader` decodes fixed-width columns with binary comprehensions
+  (one pass, no per-element slicing) instead of indexed `binary_part/3`.
 - **`Client.Local.query_flux/3` returns the long row shape real Flux returns**:
   one row per field with `_field`/`_value`, `_measurement`, `_time` (a
   `DateTime`), the tags, `result` and a per-series `table` index, ordered by

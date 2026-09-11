@@ -77,15 +77,31 @@ defmodule InfluxElixir.Query.ResponseParser do
   # Private helpers
   # ---------------------------------------------------------------------------
 
+  # InfluxDB 3 renders `time` without a zone ("2023-11-14T22:13:20.123456789"),
+  # which `DateTime.from_iso8601/1` rejects; such values are UTC. v2 Flux
+  # timestamps carry a "Z". Fractional seconds beyond microseconds are
+  # truncated by the calendar types.
   @spec coerce_value(String.t(), term()) :: term()
   defp coerce_value(key, value) when key in @time_keys and is_binary(value) do
-    case DateTime.from_iso8601(value) do
-      {:ok, dt, _offset} -> dt
-      _error -> value
+    with {:error, _not_zoned} <- DateTime.from_iso8601(value),
+         {:ok, naive} <- NaiveDateTime.from_iso8601(value) do
+      naive |> DateTime.from_naive!("Etc/UTC") |> microsecond_precision()
+    else
+      {:ok, dt, _offset} -> microsecond_precision(dt)
+      {:error, _reason} -> value
     end
   end
 
   defp coerce_value(_key, value), do: value
+
+  # Every timestamp the library returns carries microsecond precision, so a
+  # value from JSON ("…:20" → precision 0) equals the same instant from
+  # Flight or Client.Local (`DateTime.from_unix!/2` → precision 6). Two
+  # DateTimes that differ only in precision are not `==`.
+  @doc false
+  @spec microsecond_precision(DateTime.t()) :: DateTime.t()
+  def microsecond_precision(%DateTime{microsecond: {us, _precision}} = dt),
+    do: %{dt | microsecond: {us, 6}}
 
   # Flux annotated CSV: tables are separated by an empty line; each table
   # starts with optional `#`-prefixed annotation rows, then a header row.

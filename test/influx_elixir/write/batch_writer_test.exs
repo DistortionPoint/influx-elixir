@@ -1,6 +1,10 @@
 defmodule InfluxElixir.Write.BatchWriterTest do
   use ExUnit.Case, async: true
 
+  # The writer logs every discarded batch and retry; the error-path tests
+  # below trigger those deliberately, so keep the output out of the run.
+  @moduletag capture_log: true
+
   alias InfluxElixir.Client.Local
   alias InfluxElixir.Write.{BatchWriter, Point}
 

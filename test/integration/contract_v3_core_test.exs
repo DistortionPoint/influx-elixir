@@ -62,7 +62,7 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
         )
 
       Process.sleep(ctx.query_delay)
-      sql = "SELECT host, value, count FROM flight_probe"
+      sql = "SELECT time, host, value, count FROM flight_probe"
 
       assert {:ok, [http_row]} = HTTP.query_sql(ctx.conn, sql, database: ctx.database)
 
@@ -74,8 +74,10 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
                  tls: false
                )
 
+      # Same rows on both transports, including `time` as a DateTime.
       assert flight_row == http_row
       assert %{"host" => "a", "value" => 1.5, "count" => 2} = flight_row
+      assert flight_row["time"] == ~U[2023-11-14 22:13:20.000000Z]
     end
 
     test "rejects params over Flight instead of dropping them", ctx do

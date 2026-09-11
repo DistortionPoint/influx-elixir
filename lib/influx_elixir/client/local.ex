@@ -57,7 +57,10 @@ defmodule InfluxElixir.Client.Local do
 
     * `SELECT * FROM measurement`
     * `SELECT col1, col2 [, ...] FROM measurement` with optional `AS alias`
-      (projects fields and tags; `time` is selectable)
+      (projects fields and tags; `time` is selectable). `time` and
+      `DATE_BIN` buckets are `DateTime` values with microsecond precision,
+      the same as the HTTP and Flight transports return; compare them with
+      `DateTime.compare/2` or a six-digit sigil (`~U[... .000000Z]`).
     * `WHERE tag = 'value'` or `WHERE field > N` (supports AND). A quoted
       literal is always a **string**, exactly as in InfluxDB v3: `'08338636'`
       keeps its leading zero and matches a string tag, and comparing it
@@ -2096,7 +2099,7 @@ defmodule InfluxElixir.Client.Local do
   defp reduce_aggregate_columns(columns, points, bucket_ts) do
     Enum.reduce(columns, %{}, fn
       {:time_bucket, alias_name}, row ->
-        Map.put(row, alias_name, nanoseconds_to_iso8601(bucket_ts))
+        Map.put(row, alias_name, nanoseconds_to_datetime(bucket_ts))
 
       {:grouping_column, source, alias_name}, row ->
         # All points in a column-grouped bucket share the same value for
@@ -2182,12 +2185,14 @@ defmodule InfluxElixir.Client.Local do
   defp apply_order_by_rows(rows, nil, _time_alias), do: rows
   defp apply_order_by_rows(rows, _order, nil), do: rows
 
+  # Bucket timestamps are DateTimes; structural term order would sort them
+  # by calendar/day/hour, so the DateTime comparator is required.
   defp apply_order_by_rows(rows, {:time, :asc}, time_alias) do
-    Enum.sort_by(rows, &Map.get(&1, time_alias))
+    Enum.sort_by(rows, &Map.get(&1, time_alias), {:asc, DateTime})
   end
 
   defp apply_order_by_rows(rows, {:time, :desc}, time_alias) do
-    Enum.sort_by(rows, &Map.get(&1, time_alias), :desc)
+    Enum.sort_by(rows, &Map.get(&1, time_alias), {:desc, DateTime})
   end
 
   @spec apply_where([point_map()], [where_clause()]) :: [point_map()]
@@ -2317,31 +2322,15 @@ defmodule InfluxElixir.Client.Local do
   defp apply_limit(points, n), do: Enum.take(points, n)
 
   @spec point_to_row(point_map()) :: map()
+  # `time` is a DateTime (microsecond precision), as on the HTTP and Flight
+  # transports, so consumer code sees one type whichever client is configured.
   defp point_to_row(point) do
     point.fields
     |> Map.merge(point.tags)
-    |> Map.put("time", nanoseconds_to_iso8601(point.timestamp))
+    |> Map.put("time", nanoseconds_to_datetime(point.timestamp))
   end
 
   # Flux responses include _measurement (v2 compatibility format)
-
-  @spec nanoseconds_to_iso8601(integer() | nil) :: binary() | nil
-  defp nanoseconds_to_iso8601(nil), do: nil
-
-  defp nanoseconds_to_iso8601(ns) when is_integer(ns) do
-    seconds = div(ns, 1_000_000_000)
-    nanos = rem(ns, 1_000_000_000)
-
-    dt = DateTime.from_unix!(seconds)
-    base = Calendar.strftime(dt, "%Y-%m-%dT%H:%M:%S")
-
-    if nanos == 0 do
-      base
-    else
-      frac = nanos |> Integer.to_string() |> String.pad_leading(9, "0")
-      "#{base}.#{frac}"
-    end
-  end
 
   # ---------------------------------------------------------------------------
   # Private — Flux helpers

@@ -358,8 +358,7 @@ defmodule InfluxElixir.ClientContract do
                      database: ctx.database
                    )
 
-          assert is_binary(row["time"]),
-                 "time must be server-assigned, got: #{inspect(row["time"])}"
+          assert %DateTime{} = row["time"]
         end
 
         test "returns error for non-existent measurement", ctx do
@@ -415,7 +414,8 @@ defmodule InfluxElixir.ClientContract do
             )
 
           timestamps = Enum.map(rows, & &1["time"])
-          assert timestamps == Enum.sort(timestamps, :desc)
+          assert Enum.all?(timestamps, &match?(%DateTime{}, &1))
+          assert timestamps == Enum.sort(timestamps, {:desc, DateTime})
         end
 
         test "WHERE clause filters by tag value", ctx do
@@ -903,7 +903,7 @@ defmodule InfluxElixir.ClientContract do
 
           assert rows != []
           assert is_number(hd(rows)["avg_val"])
-          assert is_binary(hd(rows)["time"])
+          assert %DateTime{} = hd(rows)["time"]
         end
 
         test "SUM aggregate returns total", ctx do
@@ -1142,10 +1142,8 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert length(rows) == 1
-          # Time should be an ISO 8601 string matching the epoch second
-          assert is_binary(hd(rows)["time"])
-          assert String.contains?(hd(rows)["time"], "2023-11-14")
+          # 1700000000 s → the same instant on every client and transport
+          assert [%{"time" => ~U[2023-11-14 22:13:20.000000Z]}] = rows
         end
 
         test "millisecond precision writes correctly", ctx do
@@ -1166,8 +1164,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert length(rows) == 1
-          assert String.contains?(hd(rows)["time"], "2023-11-14")
+          assert [%{"time" => ~U[2023-11-14 22:13:20.000000Z]}] = rows
         end
 
         test "microsecond precision writes correctly", ctx do
@@ -1188,8 +1185,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert length(rows) == 1
-          assert String.contains?(hd(rows)["time"], "2023-11-14")
+          assert [%{"time" => ~U[2023-11-14 22:13:20.000000Z]}] = rows
         end
       end
     end
