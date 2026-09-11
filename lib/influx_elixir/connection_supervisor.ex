@@ -22,11 +22,19 @@ defmodule InfluxElixir.ConnectionSupervisor do
   ## Config
 
     * `:name` - connection name (atom, required)
-    * `:host` - InfluxDB host URL
+    * `:host` - InfluxDB host (no scheme)
     * `:token` - authentication token
     * `:database` - default database for writes/queries
     * `:databases` - list of database names (see `InfluxElixir.Config`)
     * `:pool_size` - Finch connection pool size (default: 10)
+    * `:batch_writer` - keyword options for an `InfluxElixir.Write.BatchWriter`
+      child; omitted means no writer
+    * any other `InfluxElixir.Config` option (`:api_version`, `:scheme`, ...)
+
+  When the configured client is `InfluxElixir.Client.HTTP` the config is
+  validated with `InfluxElixir.Config.validate!/1`, so a typo such as
+  `default_database:` fails at startup instead of being silently ignored.
+  `InfluxElixir.Client.Local` needs no host, so its config is not validated.
   """
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(config) do
@@ -43,6 +51,8 @@ defmodule InfluxElixir.ConnectionSupervisor do
   @spec init(keyword()) ::
           {:ok, {Supervisor.sup_flags(), [Supervisor.child_spec() | {module(), term()}]}}
   def init(config) do
+    client = InfluxElixir.Client.impl()
+    config = validate_config(client, config)
     name = Keyword.fetch!(config, :name)
     finch_name = finch_name(name)
     pool_size = Keyword.get(config, :pool_size, 10)
@@ -50,7 +60,7 @@ defmodule InfluxElixir.ConnectionSupervisor do
     # Initialize the connection via the configured client implementation
     # and register it in the persistent_term registry so that callers can
     # resolve it by name via Connection.fetch!/1.
-    {:ok, conn} = InfluxElixir.Client.impl().init_connection(config)
+    {:ok, conn} = client.init_connection(config)
     InfluxElixir.Connection.put(name, conn)
 
     finch_child =
@@ -62,11 +72,14 @@ defmodule InfluxElixir.ConnectionSupervisor do
 
     batch_opts = Keyword.get(config, :batch_writer)
 
+    # The writer gets the *initialised* connection, not the raw config: for
+    # Client.Local that is the ETS-backed map, and the raw keyword list would
+    # not match `Local.write/3`.
     children =
       if batch_opts do
         writer_opts =
           Keyword.merge(batch_opts,
-            connection: config,
+            connection: conn,
             name: batch_writer_name(name)
           )
 
@@ -77,6 +90,12 @@ defmodule InfluxElixir.ConnectionSupervisor do
 
     Supervisor.init(children, strategy: :rest_for_one)
   end
+
+  @spec validate_config(module(), keyword()) :: keyword()
+  defp validate_config(InfluxElixir.Client.HTTP, config),
+    do: InfluxElixir.Config.validate!(config)
+
+  defp validate_config(_client, config), do: config
 
   @doc false
   @spec finch_name(atom()) :: atom()
@@ -91,7 +110,7 @@ defmodule InfluxElixir.ConnectionSupervisor do
   end
 
   @doc false
-  @spec via(atom()) :: {:via, Registry, term()} | atom()
+  @spec via(atom()) :: atom()
   def via(name) do
     :"influx_elixir_conn_#{name}"
   end

@@ -15,7 +15,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
         name: name,
         host: "localhost",
         token: "test-token",
-        default_database: "mydb"
+        database: "mydb"
       ]
 
       {:ok, pid} =
@@ -64,6 +64,31 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
 
       finch_name = ConnectionSupervisor.finch_name(name)
       assert Process.whereis(finch_name) != nil
+    end
+  end
+
+  describe "init/1 — batch writer child" do
+    test "the writer flushes through the initialised connection", %{} do
+      # Regression: the writer received the raw config keyword list, which
+      # Client.Local.write/3 cannot use (it needs the ETS-backed map).
+      name = unique_name()
+
+      {:ok, _pid} =
+        InfluxElixir.add_connection(name,
+          database: "bw_db",
+          batch_writer: [flush_interval_ms: 60_000, batch_size: 10]
+        )
+
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+
+      writer = ConnectionSupervisor.batch_writer_name(name)
+      :ok = InfluxElixir.Write.BatchWriter.write_sync(writer, "cpu value=1.0")
+
+      assert {:ok, [%{"value" => 1.0}]} =
+               InfluxElixir.query_sql(name, "SELECT * FROM cpu", database: "bw_db")
+
+      assert {:ok, %{total_writes: 1, total_errors: 0}} = InfluxElixir.stats(name)
+      assert :ok = InfluxElixir.flush(name)
     end
   end
 

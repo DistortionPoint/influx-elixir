@@ -9,9 +9,9 @@ defmodule InfluxElixir.Application do
 
       config :influx_elixir, :connections,
         trading: [
-          host: "influx-trading:8086",
+          host: "influx-trading",
           token: "...",
-          default_database: "prices"
+          database: "prices"
         ]
   """
 

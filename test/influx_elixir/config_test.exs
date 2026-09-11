@@ -71,6 +71,23 @@ defmodule InfluxElixir.ConfigTest do
                Config.validate(host: "h", token: "t", scheme: :ftp)
     end
 
+    test "accepts the supervisor-level keys and rejects unknown ones" do
+      assert {:ok, opts} =
+               Config.validate(
+                 host: "h",
+                 token: "t",
+                 timeout: 5_000,
+                 batch_writer: [batch_size: 10],
+                 finch_name: :my_finch
+               )
+
+      assert opts[:batch_writer] == [batch_size: 10]
+
+      # The typo that used to be silently ignored.
+      assert {:error, %NimbleOptions.ValidationError{}} =
+               Config.validate(host: "h", token: "t", default_database: "prices")
+    end
+
     test "accepts :api_version :v2 and rejects anything else" do
       assert {:ok, opts} = Config.validate(host: "h", token: "t", api_version: :v2)
       assert opts[:api_version] == :v2

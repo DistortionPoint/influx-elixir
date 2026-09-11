@@ -15,13 +15,16 @@ defmodule InfluxElixir.Write.BatchWriter do
     * `:batch_size` - maximum points per flush (default: `5000`)
     * `:flush_interval_ms` - timer interval in milliseconds (default: `1000`)
     * `:jitter_ms` - random jitter added to flush timer (default: `0`)
-    * `:max_retries` - max retry attempts for 5xx errors (default: `3`)
+    * `:max_retries` - max retry attempts for 5xx and transport errors
+      (default: `3`). 4xx responses are never retried.
     * `:base_retry_delay_ms` - base for exponential retry backoff. Delay
       for attempt N is roughly `base * 2^N`. Default: `100`.
     * `:no_sync` - when `true`, `write_sync/3` behaves like `write/3` (default: `false`)
     * `:write_opts` - keyword list forwarded to `InfluxElixir.Write.Writer.write/3`
       on every flush. Useful for setting `:database`, `:timeout`, `:precision`
       per BatchWriter without baking them into the connection. Default: `[]`.
+    * `:client` - client module to write with instead of the configured one
+      (`InfluxElixir.Client.impl/0`).
 
   ## Backpressure
 
@@ -257,13 +260,15 @@ defmodule InfluxElixir.Write.BatchWriter do
   # silently landed in the connection's default database.
   @spec resolve_write_opts(keyword()) :: keyword()
   defp resolve_write_opts(opts) do
-    write_opts = Keyword.get(opts, :write_opts, [])
-
-    case Keyword.get(opts, :database) do
-      nil -> write_opts
-      database -> Keyword.put_new(write_opts, :database, database)
-    end
+    opts
+    |> Keyword.get(:write_opts, [])
+    |> put_new_opt(:database, Keyword.get(opts, :database))
+    |> put_new_opt(:client, Keyword.get(opts, :client))
   end
+
+  @spec put_new_opt(keyword(), atom(), term()) :: keyword()
+  defp put_new_opt(write_opts, _key, nil), do: write_opts
+  defp put_new_opt(write_opts, key, value), do: Keyword.put_new(write_opts, key, value)
 
   @impl GenServer
   def handle_continue(:schedule_initial_flush, state) do
@@ -335,10 +340,10 @@ defmodule InfluxElixir.Write.BatchWriter do
       {:ok, :written} ->
         finish_flush(state, payload, :ok)
 
-      {:error, {:http_error, status}} when status >= 400 and status < 500 ->
+      {:error, %{status: status}} = error when status in 400..499 ->
         Logger.warning("[BatchWriter] 4xx error (#{status}) — discarding batch")
 
-        finish_flush(state, payload, {:error, {:http_error, status}})
+        finish_flush(state, payload, error)
 
       {:error, reason} when attempt < state.max_retries ->
         Logger.warning(
@@ -401,10 +406,14 @@ defmodule InfluxElixir.Write.BatchWriter do
       {:ok, :written} ->
         finish_flush_immediate(state, lines, :ok)
 
-      {:error, {:http_error, status}} when status >= 400 and status < 500 ->
+      # Clients report HTTP failures as %{status, body}. A 4xx is the
+      # payload's fault and will never succeed on retry, so it is discarded.
+      # (The clause used to match {:http_error, status}, a shape no client
+      # produces, so bad batches were retried with backoff.)
+      {:error, %{status: status}} = error when status in 400..499 ->
         Logger.warning("[BatchWriter] 4xx error (#{status}) — discarding batch")
 
-        finish_flush_immediate(state, lines, {:error, {:http_error, status}})
+        finish_flush_immediate(state, lines, error)
 
       {:error, reason} when state.max_retries > 0 ->
         Logger.warning("[BatchWriter] Write error (attempt 1): #{inspect(reason)}")

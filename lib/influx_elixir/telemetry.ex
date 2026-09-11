@@ -2,35 +2,43 @@ defmodule InfluxElixir.Telemetry do
   @moduledoc """
   Telemetry event emission for write and query operations.
 
+  `InfluxElixir.Write.Writer.write/3` (and therefore `InfluxElixir.write/3`
+  and every `BatchWriter` flush) emits the write span; `InfluxElixir.query_sql/3`,
+  `execute_sql/3`, `query_influxql/3` and `query_flux/3` emit the query span.
+  Streaming queries are not spanned.
+
   ## Events
 
   ### Write Events
   - `[:influx_elixir, :write, :start]` — emitted before a write
-    - Measurements: `%{system_time: integer()}`
-    - Metadata: `%{database: binary(), point_count: integer(), bytes: integer()}`
+    - Measurements: `%{system_time: integer(), monotonic_time: integer()}`
+    - Metadata: `%{database: binary() | nil, point_count: integer(), bytes: integer()}`
+      (`bytes` is the uncompressed payload size)
 
-  - `[:influx_elixir, :write, :stop]` — emitted after a successful write
-    - Measurements: `%{duration: integer()}`
-    - Metadata: `%{database: binary(), point_count: integer(), bytes: integer(),
-        compressed_bytes: integer()}`
+  - `[:influx_elixir, :write, :stop]` — emitted after the client returned
+    - Measurements: `%{duration: integer(), monotonic_time: integer()}`
+    - Metadata: start metadata plus `result: :ok | :error`. A client error
+      tuple is a `:stop` with `result: :error`, not an `:exception`.
 
-  - `[:influx_elixir, :write, :exception]` — emitted on write failure
-    - Measurements: `%{duration: integer()}`
-    - Metadata: `%{database: binary(), kind: atom(), reason: term(), stacktrace: list()}`
+  - `[:influx_elixir, :write, :exception]` — emitted when the client raised
+    - Measurements: `%{duration: integer(), monotonic_time: integer()}`
+    - Metadata: start metadata plus `kind: atom(), reason: term(), stacktrace: list()`
 
   ### Query Events
   - `[:influx_elixir, :query, :start]` — emitted before a query
-    - Measurements: `%{system_time: integer()}`
-    - Metadata: `%{database: binary(), transport: atom()}`
+    - Measurements: `%{system_time: integer(), monotonic_time: integer()}`
+    - Metadata: `%{database: binary() | nil, transport: module()}` where
+      `transport` is the client module (`InfluxElixir.Client.HTTP`,
+      `InfluxElixir.Client.Local`, ...)
 
-  - `[:influx_elixir, :query, :stop]` — emitted after a successful query
-    - Measurements: `%{duration: integer()}`
-    - Metadata: `%{database: binary(), transport: atom(), row_count: integer()}`
+  - `[:influx_elixir, :query, :stop]` — emitted after the client returned
+    - Measurements: `%{duration: integer(), monotonic_time: integer()}`
+    - Metadata: start metadata plus `result: :ok | :error` and, for list
+      results, `row_count: integer()`
 
-  - `[:influx_elixir, :query, :exception]` — emitted on query failure
-    - Measurements: `%{duration: integer()}`
-    - Metadata: `%{database: binary(), transport: atom(), kind: atom(), reason: term(),
-        stacktrace: list()}`
+  - `[:influx_elixir, :query, :exception]` — emitted when the client raised
+    - Measurements: `%{duration: integer(), monotonic_time: integer()}`
+    - Metadata: start metadata plus `kind: atom(), reason: term(), stacktrace: list()`
 
   ## Usage
 
@@ -82,9 +90,20 @@ defmodule InfluxElixir.Telemetry do
   def span_write(metadata, fun) do
     :telemetry.span(@write_event, metadata, fn ->
       result = fun.()
-      {result, metadata}
+      {result, stop_metadata(metadata, result)}
     end)
   end
+
+  # :stop metadata = start metadata + outcome. Error tuples are normal
+  # results (the client did not raise), so they surface as :stop with
+  # result: :error rather than as :exception.
+  @spec stop_metadata(map(), term()) :: map()
+  defp stop_metadata(metadata, {:ok, rows}) when is_list(rows),
+    do: Map.merge(metadata, %{result: :ok, row_count: length(rows)})
+
+  defp stop_metadata(metadata, {:ok, _value}), do: Map.put(metadata, :result, :ok)
+  defp stop_metadata(metadata, :ok), do: Map.put(metadata, :result, :ok)
+  defp stop_metadata(metadata, _error), do: Map.put(metadata, :result, :error)
 
   @doc """
   Wraps a query operation with telemetry start, stop, and exception events.
@@ -109,7 +128,7 @@ defmodule InfluxElixir.Telemetry do
   def span_query(metadata, fun) do
     :telemetry.span(@query_event, metadata, fn ->
       result = fun.()
-      {result, metadata}
+      {result, stop_metadata(metadata, result)}
     end)
   end
 

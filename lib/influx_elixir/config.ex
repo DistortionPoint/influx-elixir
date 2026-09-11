@@ -22,6 +22,13 @@ defmodule InfluxElixir.Config do
     * `:api_version` - `:v3` (default) or `:v2`. Selects the write endpoint
       in `InfluxElixir.Client.HTTP`; a v2 server accepts the v3 write path
       with `200` but stores nothing, so declare `:v2` for InfluxDB 2.x.
+    * `:timeout` - connection-level receive timeout in milliseconds
+    * `:batch_writer` - `InfluxElixir.Write.BatchWriter` options; when given,
+      `InfluxElixir.ConnectionSupervisor` starts a writer for the connection
+    * `:finch_name` - use an existing Finch pool instead of a per-connection one
+
+  `InfluxElixir.ConnectionSupervisor` validates the config with this schema
+  when the client is `InfluxElixir.Client.HTTP`; unknown keys are errors.
 
   ## Example
 
@@ -80,6 +87,18 @@ defmodule InfluxElixir.Config do
       type: {:in, [:v2, :v3]},
       default: :v3,
       doc: "InfluxDB API generation: :v3 (default) or :v2"
+    ],
+    timeout: [
+      type: :pos_integer,
+      doc: "Connection-level receive timeout in ms (default: 30_000 in the HTTP client)"
+    ],
+    batch_writer: [
+      type: :keyword_list,
+      doc: "InfluxElixir.Write.BatchWriter options; starts a writer under the connection"
+    ],
+    finch_name: [
+      type: :atom,
+      doc: "Finch pool to use instead of the one ConnectionSupervisor starts"
     ],
     name: [
       type: :atom,

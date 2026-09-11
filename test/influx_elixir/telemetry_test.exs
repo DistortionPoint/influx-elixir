@@ -9,19 +9,24 @@ defmodule InfluxElixir.TelemetryTest do
     "influx-elixir-test-#{inspect(self())}-#{suffix}"
   end
 
+  # Telemetry handlers are global, so events from other async test modules
+  # (the facade emits spans too) would leak in. The handler runs in the
+  # emitting process, so forwarding only when that is the test process
+  # keeps each test isolated. A module capture avoids telemetry's
+  # "local function" info log on every attach.
   defp attach_handler(handler_id, event) do
-    test_pid = self()
-
-    :telemetry.attach(
-      handler_id,
-      event,
-      fn ev, measurements, metadata, _config ->
-        send(test_pid, {:telemetry, ev, measurements, metadata})
-      end,
-      nil
-    )
-
+    :telemetry.attach(handler_id, event, &__MODULE__.forward_event/4, %{test_pid: self()})
     on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  @doc false
+  @spec forward_event([atom()], map(), map(), %{test_pid: pid()}) :: :ok
+  def forward_event(event, measurements, metadata, %{test_pid: test_pid}) do
+    if self() == test_pid do
+      send(test_pid, {:telemetry, event, measurements, metadata})
+    end
+
+    :ok
   end
 
   # `system_time` must be wall-clock time (native units), i.e. within a few

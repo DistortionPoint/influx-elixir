@@ -163,6 +163,68 @@ defmodule InfluxElixirTest do
     end
   end
 
+  describe "telemetry" do
+    setup do
+      handler_id = "influx-elixir-facade-#{inspect(self())}"
+
+      # Handlers are global; forward only events emitted by this test
+      # process so concurrent modules cannot leak spans in.
+      :telemetry.attach_many(
+        handler_id,
+        [[:influx_elixir, :write, :stop], [:influx_elixir, :query, :stop]],
+        &__MODULE__.forward_event/4,
+        %{test_pid: self()}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+      :ok
+    end
+
+    @doc false
+    @spec forward_event([atom()], map(), map(), %{test_pid: pid()}) :: :ok
+    def forward_event(event, measurements, metadata, %{test_pid: test_pid}) do
+      if self() == test_pid do
+        send(test_pid, {:telemetry, event, measurements, metadata})
+      end
+
+      :ok
+    end
+
+    test "write/3 emits a write span with database, bytes and point count", %{conn: conn} do
+      lp = "cpu value=1.0\ncpu value=2.0"
+      assert {:ok, :written} = InfluxElixir.write(conn, lp, database: "test_db")
+
+      assert_receive {:telemetry, [:influx_elixir, :write, :stop], %{duration: duration},
+                      %{database: "test_db", bytes: bytes, point_count: 2, result: :ok}}
+
+      assert bytes == byte_size(lp)
+      assert duration >= 0
+    end
+
+    test "query_sql/3 emits a query span with transport and row count", %{conn: conn} do
+      assert {:ok, [_row]} =
+               InfluxElixir.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
+
+      assert_receive {:telemetry, [:influx_elixir, :query, :stop], _measurements,
+                      %{
+                        database: "test_db",
+                        transport: InfluxElixir.Client.Local,
+                        row_count: 1,
+                        result: :ok
+                      }}
+    end
+
+    test "a client error is a :stop with result: :error, not an exception", %{conn: conn} do
+      assert {:error, _reason} =
+               InfluxElixir.query_sql(conn, "SELECT * FROM nope", database: "test_db")
+
+      assert_receive {:telemetry, [:influx_elixir, :query, :stop], _measurements,
+                      %{result: :error} = metadata}
+
+      refute Map.has_key?(metadata, :row_count)
+    end
+  end
+
   describe "flush/1" do
     test "returns {:error, :no_batch_writer} when no writer configured" do
       assert {:error, :no_batch_writer} = InfluxElixir.flush(:default)
@@ -175,7 +237,35 @@ defmodule InfluxElixirTest do
     end
   end
 
+  describe "connection-level default database" do
+    test "write and query functions fall back to it when opts omit :database" do
+      {:ok, conn} = Local.start(database: "dflt_db")
+      on_exit(fn -> Local.stop(conn) end)
+
+      assert {:ok, :written} = InfluxElixir.write(conn, "cpu value=1i")
+      assert {:ok, [%{"value" => 1}]} = InfluxElixir.query_sql(conn, "SELECT * FROM cpu")
+      assert {:ok, [%{"value" => 1}]} = InfluxElixir.query_influxql(conn, "SELECT * FROM cpu")
+      assert {:ok, %{"rows_affected" => 0}} = InfluxElixir.execute_sql(conn, "ALTER TABLE cpu")
+
+      assert [%{"value" => 1}] =
+               conn |> InfluxElixir.query_sql_stream("SELECT * FROM cpu") |> Enum.to_list()
+    end
+  end
+
   describe "add_connection/2 and remove_connection/1" do
+    test "remove_connection/1 for an unknown name returns {:error, :not_found}" do
+      assert {:error, :not_found} = InfluxElixir.remove_connection(:never_added_connection)
+    end
+
+    test "remove_connection/1 succeeds when the registry entry is already gone" do
+      name = :"orphan_registry_#{System.unique_integer([:positive])}"
+      {:ok, _pid} = InfluxElixir.add_connection(name, [])
+
+      InfluxElixir.Connection.delete(name)
+
+      assert :ok = InfluxElixir.remove_connection(name)
+    end
+
     test "dynamically adds and removes a connection" do
       assert {:ok, pid} =
                InfluxElixir.add_connection(:dynamic_test, [])

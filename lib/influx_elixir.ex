@@ -27,16 +27,22 @@ defmodule InfluxElixir do
 
       config :influx_elixir, :connections,
         trading: [
-          host: "influx-trading:8086",
+          host: "influx-trading",
           token: "...",
-          default_database: "prices"
+          database: "prices"
         ]
 
       # config/test.exs
       config :influx_elixir, :client, InfluxElixir.Client.Local
+
+  ## Telemetry
+
+  `write/3` and the query functions emit `[:influx_elixir, :write | :query,
+  :start | :stop | :exception]` events; see `InfluxElixir.Telemetry`.
   """
 
-  alias InfluxElixir.Write.Point
+  alias InfluxElixir.Telemetry
+  alias InfluxElixir.Write.{Point, Writer}
 
   # ---------- Connection Resolution ----------
 
@@ -93,13 +99,33 @@ defmodule InfluxElixir do
   end
 
   @doc """
-  Writes points to InfluxDB using the configured client.
+  Writes line protocol to InfluxDB using the configured client.
+
+  Goes through `InfluxElixir.Write.Writer`, so payloads over 1 KB are
+  gzipped and a `[:influx_elixir, :write, ...]` telemetry span is emitted.
   """
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(connection, line_protocol, opts \\ []) do
-    client().write(resolve_connection(connection), line_protocol, opts)
+    Writer.write(resolve_connection(connection), line_protocol, opts)
   end
+
+  # Wraps a query in a `[:influx_elixir, :query, ...]` span. The :stop event
+  # carries `row_count` for list results and `result: :ok | :error`.
+  @spec query_span(InfluxElixir.Client.connection(), keyword(), (-> result)) :: result
+        when result: term()
+  defp query_span(connection, opts, fun) do
+    metadata = %{
+      database: Keyword.get(opts, :database) || connection_database(connection),
+      transport: client()
+    }
+
+    Telemetry.span_query(metadata, fun)
+  end
+
+  # Keyword list (HTTP) or map (Local); Access handles both.
+  @spec connection_database(term()) :: binary() | nil
+  defp connection_database(connection), do: connection[:database]
 
   # ---------- Query — v3 SQL ----------
 
@@ -121,7 +147,8 @@ defmodule InfluxElixir do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_sql(connection, sql, opts \\ []) do
-    client().query_sql(resolve_connection(connection), sql, opts)
+    connection = resolve_connection(connection)
+    query_span(connection, opts, fn -> client().query_sql(connection, sql, opts) end)
   end
 
   @doc """
@@ -163,7 +190,8 @@ defmodule InfluxElixir do
           keyword()
         ) :: {:ok, map()} | {:error, term()}
   def execute_sql(connection, sql, opts \\ []) do
-    client().execute_sql(resolve_connection(connection), sql, opts)
+    connection = resolve_connection(connection)
+    query_span(connection, opts, fn -> client().execute_sql(connection, sql, opts) end)
   end
 
   # ---------- Query — v3 InfluxQL ----------
@@ -177,7 +205,8 @@ defmodule InfluxElixir do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(connection, influxql, opts \\ []) do
-    client().query_influxql(resolve_connection(connection), influxql, opts)
+    connection = resolve_connection(connection)
+    query_span(connection, opts, fn -> client().query_influxql(connection, influxql, opts) end)
   end
 
   # ---------- Query — v2 Flux (compat) ----------
@@ -188,7 +217,8 @@ defmodule InfluxElixir do
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_flux(connection, flux, opts \\ []) do
-    client().query_flux(resolve_connection(connection), flux, opts)
+    connection = resolve_connection(connection)
+    query_span(connection, opts, fn -> client().query_flux(connection, flux, opts) end)
   end
 
   # ---------- Admin — v3 databases ----------
@@ -334,7 +364,7 @@ defmodule InfluxElixir do
   @doc """
   Adds a new named connection dynamically at runtime.
   """
-  @spec add_connection(atom(), keyword()) :: {:ok, pid()} | {:error, term()}
+  @spec add_connection(atom(), keyword()) :: Supervisor.on_start_child()
   def add_connection(name, opts) do
     config = Keyword.put(opts, :name, name)
 
@@ -344,10 +374,7 @@ defmodule InfluxElixir do
         id: {InfluxElixir.ConnectionSupervisor, name}
       )
 
-    case Supervisor.start_child(InfluxElixir.Supervisor, child_spec) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, reason} -> {:error, reason}
-    end
+    Supervisor.start_child(InfluxElixir.Supervisor, child_spec)
   end
 
   @doc """

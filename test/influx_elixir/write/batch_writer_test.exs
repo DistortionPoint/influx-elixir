@@ -452,17 +452,13 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert stats.total_writes == 1
     end
 
-    test "LocalClient error during retry does not match 4xx discard clause",
-         %{conn: conn} do
-      # LocalClient returns {:error, %{status: 400, body: "..."}} for bad input.
-      # The retry handler matches {:error, {:http_error, status}} for 4xx discard,
-      # which LocalClient never produces.  With max_retries: 1 and attempt already
-      # at 1, the general exhaustion clause fires instead, recording an error.
-      pid = start_writer(conn, flush_interval_ms: 60_000, max_retries: 1)
+    test "a 4xx during retry is discarded, not retried again", %{conn: conn} do
+      # "!!!" is invalid line protocol: Local answers %{status: 400}. Retrying
+      # cannot help, so the batch is dropped and counted as one error even
+      # though retries remain.
+      pid = start_writer(conn, flush_interval_ms: 60_000, max_retries: 3)
 
       send(pid, {:retry, "!!!", 1})
-
-      # Block until the GenServer has processed the message
       :sys.get_state(pid)
 
       state = :sys.get_state(pid)
@@ -472,54 +468,29 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       {:ok, stats} = BatchWriter.stats(pid)
       assert stats.total_errors == 1
     end
-
-    test "LocalClient error during retry below max_retries schedules another retry",
-         %{conn: conn} do
-      # With attempt=1 and max_retries=3, another retry is scheduled.
-      pid = start_writer(conn, flush_interval_ms: 60_000, max_retries: 3)
-
-      send(pid, {:retry, "!!!", 1})
-
-      :sys.get_state(pid)
-
-      state = :sys.get_state(pid)
-      # Another retry has been scheduled; retry_attempt should be 2
-      assert state.retry_attempt == 2
-      assert state.retry_payload == "!!!"
-    end
   end
 
-  describe "4xx error during immediate flush" do
-    test "invalid payload with max_retries: 1 causes do_flush to schedule retry",
+  describe "4xx responses" do
+    test "invalid line protocol is discarded on the first flush even with retries left",
          %{conn: conn} do
-      # do_flush handles {:error, reason} when max_retries > 0 by scheduling retry.
-      # LocalClient bad-input errors do not match the {:http_error, status} 4xx
-      # clause (lines 344-347), so they flow to the retry-scheduling branch.
-      pid = start_writer(conn, flush_interval_ms: 60_000, max_retries: 1)
+      pid = start_writer(conn, flush_interval_ms: 60_000, max_retries: 2)
 
       :ok = BatchWriter.write(pid, "!!!")
-
-      # Flush synchronously to observe the state after do_flush completes
-      BatchWriter.flush(pid)
+      :ok = BatchWriter.flush(pid)
 
       state = :sys.get_state(pid)
-      # The flush was scheduled for retry, so retry_attempt == 1 and payload set
-      assert state.retry_attempt == 1
-      assert state.retry_payload != nil
+      assert state.retry_attempt == 0
+      assert state.retry_payload == nil
+      assert state.buffer == []
+
+      {:ok, stats} = BatchWriter.stats(pid)
+      assert stats.total_errors == 1
+      assert stats.total_writes == 0
     end
-  end
 
-  describe "error paths via invalid line protocol" do
-    test "flush with unparseable payload and max_retries: 0 increments errors",
-         %{conn: conn} do
-      pid =
-        start_writer(conn,
-          flush_interval_ms: 60_000,
-          max_retries: 0
-        )
+    test "with max_retries: 0 the error is recorded immediately", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000, max_retries: 0)
 
-      # Inject invalid line protocol directly into the buffer via write
-      # "!!!" is not valid line protocol — Local returns {:error, %{status: 400, ...}}
       :ok = BatchWriter.write(pid, "!!!")
       :ok = BatchWriter.flush(pid)
 
@@ -527,37 +498,51 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert stats.total_errors == 1
       assert stats.total_writes == 0
     end
+  end
 
-    test "flush with unparseable payload and max_retries > 0 schedules retry",
-         %{conn: conn} do
+  # Transport errors come from a real HTTP client pointed at a closed port
+  # (nothing listens on 127.0.0.1:1) — no mocking. The :client option lets
+  # one writer use Client.HTTP while the suite's configured client is Local.
+  describe "retry path — transport errors" do
+    setup do
+      finch = :"bw_retry_finch_#{System.unique_integer([:positive])}"
+      start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
+
+      conn = [host: "127.0.0.1", port: 1, scheme: :http, token: "t", finch_name: finch]
+      {:ok, http_conn: conn}
+    end
+
+    test "a transport error schedules a retry and clears the buffer", %{http_conn: conn} do
       pid =
         start_writer(conn,
+          client: InfluxElixir.Client.HTTP,
           flush_interval_ms: 60_000,
-          max_retries: 2
+          max_retries: 2,
+          base_retry_delay_ms: 60_000
         )
 
-      :ok = BatchWriter.write(pid, "!!!")
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
       :ok = BatchWriter.flush(pid)
 
       state = :sys.get_state(pid)
       assert state.retry_attempt == 1
-      assert state.retry_payload != nil
+      assert state.retry_payload == "cpu value=1.0"
       assert state.buffer == []
       assert state.buffer_size == 0
     end
 
-    test "retry exhausts max_retries and records error", %{conn: conn} do
+    test "retries exhaust max_retries and record one error", %{http_conn: conn} do
       pid =
         start_writer(conn,
+          client: InfluxElixir.Client.HTTP,
           flush_interval_ms: 60_000,
           max_retries: 1,
           base_retry_delay_ms: 1
         )
 
-      :ok = BatchWriter.write(pid, "!!!")
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
       :ok = BatchWriter.flush(pid)
 
-      # The single retry fires after ~2ms and exhausts max_retries.
       wait_until(fn ->
         {:ok, stats} = BatchWriter.stats(pid)
         stats.total_errors == 1
@@ -567,7 +552,9 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert state.retry_payload == nil
       assert state.retry_attempt == 0
     end
+  end
 
+  describe "error paths via invalid line protocol" do
     test "write_sync with pending_sync gets reply on error flush",
          %{conn: conn} do
       pid =

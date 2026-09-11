@@ -7,7 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Telemetry is actually emitted.** `InfluxElixir.Telemetry` documented
+  `[:influx_elixir, :write | :query, ...]` events, but nothing in the library
+  called it. `Write.Writer.write/3` (hence `InfluxElixir.write/3` and every
+  `BatchWriter` flush) now emits the write span with `database`, `bytes` and
+  `point_count`; `InfluxElixir.query_sql/3`, `execute_sql/3`, `query_influxql/3`
+  and `query_flux/3` emit the query span with `database`, `transport` (the client
+  module) and, for list results, `row_count`. `:stop` metadata carries
+  `result: :ok | :error`.
+- `BatchWriter` and `Write.Writer` accept a `:client` option to write with a
+  specific client module instead of the configured one.
+- `InfluxElixir.Config` knows `:timeout`, `:batch_writer` and `:finch_name`.
+
+### Fixed
+- **`BatchWriter` retried 4xx responses.** The discard clause matched
+  `{:error, {:http_error, status}}`, a shape no client produces, so a rejected
+  batch (bad line protocol, unknown database) was retried with backoff until
+  `max_retries` ran out. It now matches the clients' `%{status: 4xx}` and drops
+  the batch on the first response. The retry path is covered by a real
+  transport error against a closed port.
+- **`ConnectionSupervisor` handed the batch writer the raw config instead of
+  the initialised connection**, so a `batch_writer:` under `Client.Local`
+  crashed on its first flush. Covered by a supervisor-level test.
+- **`ConnectionSupervisor` validates HTTP connection config.** A typo such as
+  `default_database:` (which the facade and application docs themselves used)
+  was silently ignored; with `Client.HTTP` it now fails at startup with a
+  `NimbleOptions.ValidationError`. `Client.Local` configs are not validated.
+
 ### Changed
+- `InfluxElixir.write/3` goes through `Write.Writer`, so payloads over 1 KB
+  are gzipped like `BatchWriter` flushes already were.
 - **`Client.Local.query_flux/3` returns the long row shape real Flux returns**:
   one row per field with `_field`/`_value`, `_measurement`, `_time` (a
   `DateTime`), the tags, `result` and a per-series `table` index, ordered by
