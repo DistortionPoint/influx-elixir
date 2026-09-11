@@ -140,6 +140,8 @@ defmodule InfluxElixir do
     * `:database` — overrides the connection-level default database.
     * `:timeout` — per-call receive timeout in milliseconds. Both the
       HTTP and Flight transports honour this; default is `30_000` ms.
+    * `:pool_timeout` — per-call Finch pool checkout timeout in milliseconds
+      (HTTP transport; default `5_000`). Applies before `:timeout`.
     * `:params` — map of `$name => value` placeholder substitutions
       (HTTP transport only; Flight returns `{:error, :params_unsupported_over_flight}`).
     * `:transport` — `:http` (default) or `:flight` (Arrow Flight gRPC).

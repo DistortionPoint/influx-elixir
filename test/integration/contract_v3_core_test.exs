@@ -49,6 +49,75 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
     end
   end
 
+  # Proves :pool_timeout reaches Finch (#14). A pool of size 1 is held by a
+  # streaming request that sleeps inside its chunk callback; a second request
+  # must then wait on checkout, and its :pool_timeout decides its fate
+  # regardless of how generous :timeout is.
+  describe "query_sql/3 with :pool_timeout" do
+    setup ctx do
+      finch = :"pool_timeout_finch_#{System.unique_integer([:positive])}"
+      start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
+      conn = Keyword.put(ctx.conn, :finch_name, finch)
+
+      holder =
+        Task.async(fn ->
+          request =
+            Finch.build(
+              :post,
+              "http://#{conn[:host]}:#{conn[:port]}/api/v3/query_sql",
+              [{"content-type", "application/json"}],
+              Jason.encode!(%{"db" => ctx.database, "q" => "SELECT 1", "format" => "json"})
+            )
+
+          Finch.stream(request, finch, nil, fn _chunk, acc ->
+            Process.sleep(1_500)
+            acc
+          end)
+        end)
+
+      # Give the holder time to check the only connection out.
+      Process.sleep(200)
+      {:ok, conn: conn, holder: holder}
+    end
+
+    test "a short :pool_timeout fails at checkout even with a long :timeout", ctx do
+      started = System.monotonic_time(:millisecond)
+
+      # Finch raises on checkout timeout; the client maps it to a tuple.
+      assert {:error, {:connection_error, :pool_timeout}} =
+               HTTP.query_sql(ctx.conn, "SELECT 1",
+                 database: ctx.database,
+                 timeout: 180_000,
+                 pool_timeout: 100
+               )
+
+      assert System.monotonic_time(:millisecond) - started < 1_000
+
+      # The streaming path reports the same failure as a StreamError.
+      error =
+        assert_raise InfluxElixir.StreamError, fn ->
+          ctx.conn
+          |> HTTP.query_sql_stream("SELECT 1", database: ctx.database, pool_timeout: 100)
+          |> Enum.to_list()
+        end
+
+      assert error.kind == :transport
+      assert error.reason == :pool_timeout
+
+      Task.await(ctx.holder, 10_000)
+    end
+
+    test "a generous :pool_timeout waits for the connection and succeeds", ctx do
+      assert {:ok, [%{"one" => 1}]} =
+               HTTP.query_sql(ctx.conn, "SELECT 1 AS one",
+                 database: ctx.database,
+                 pool_timeout: 10_000
+               )
+
+      Task.await(ctx.holder, 10_000)
+    end
+  end
+
   # Arrow Flight is HTTP-client only (Local is in-memory), so it lives
   # outside the shared contract. InfluxDB 3 Core serves Flight gRPC on the
   # same port as HTTP, without TLS.

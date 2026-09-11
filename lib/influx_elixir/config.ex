@@ -23,6 +23,8 @@ defmodule InfluxElixir.Config do
       in `InfluxElixir.Client.HTTP`; a v2 server accepts the v3 write path
       with `200` but stores nothing, so declare `:v2` for InfluxDB 2.x.
     * `:timeout` - connection-level receive timeout in milliseconds
+    * `:pool_timeout` - connection-level Finch pool checkout timeout in
+      milliseconds (default `5_000`, Finch's own); applies before `:timeout`
     * `:flight_port` - Arrow Flight gRPC port for `transport: :flight` queries
       (default: `443`; InfluxDB 3 Core serves Flight on its HTTP port, 8181)
     * `:batch_writer` - `InfluxElixir.Write.BatchWriter` options; when given,
@@ -93,6 +95,10 @@ defmodule InfluxElixir.Config do
     timeout: [
       type: :pos_integer,
       doc: "Connection-level receive timeout in ms (default: 30_000 in the HTTP client)"
+    ],
+    pool_timeout: [
+      type: :pos_integer,
+      doc: "Connection-level Finch pool checkout timeout in ms (default: 5_000)"
     ],
     flight_port: [
       type: :pos_integer,

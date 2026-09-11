@@ -48,6 +48,24 @@ defmodule InfluxElixir.Client.HTTPTest do
   # default applied unconditionally). Now opts > connection > 30s default.
   # ---------------------------------------------------------------------------
 
+  describe "resolve_pool_timeout/2" do
+    test "uses opts :pool_timeout when both opts and conn have it" do
+      assert HTTP.resolve_pool_timeout([pool_timeout: 250], pool_timeout: 9_000) == 250
+    end
+
+    test "falls back to connection :pool_timeout when opts has none" do
+      assert HTTP.resolve_pool_timeout([], pool_timeout: 9_000) == 9_000
+    end
+
+    test "falls back to Finch's 5s default when neither has it" do
+      assert HTTP.resolve_pool_timeout([], []) == 5_000
+    end
+
+    test "is independent of :timeout" do
+      assert HTTP.resolve_pool_timeout([timeout: 180_000], timeout: 180_000) == 5_000
+    end
+  end
+
   describe "resolve_timeout/2" do
     test "uses opts :timeout when both opts and conn have it" do
       assert HTTP.resolve_timeout([timeout: 5_000], timeout: 60_000) == 5_000

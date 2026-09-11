@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `InfluxElixir.Config` knows `:timeout`, `:batch_writer` and `:finch_name`.
 
 ### Fixed
+- **`Client.HTTP` never set Finch's `pool_timeout`** (#14), so every request
+  waited at most Finch's default 5 s to check a connection out of the pool no
+  matter how generous `:timeout` was, and against a slow multi-node endpoint
+  failed with a transport `:timeout` at five seconds. A `:pool_timeout` option
+  now resolves like `:timeout` (per-call opt → connection → 5_000) and is passed
+  on every request, including the streaming query. Verified against InfluxDB 3
+  Core with a size-1 pool held by a sleeping stream — which also showed that
+  Finch **raises** on a checkout timeout rather than returning an error, so the
+  exception used to escape `query_sql/3`. It is now
+  `{:error, {:connection_error, :pool_timeout}}`, and the streaming query
+  raises `InfluxElixir.StreamError` with `reason: :pool_timeout`.
 - **Flight and HTTP now return the same `time` values.** `Flight.Reader`
   decoded Timestamp columns to raw integers while the HTTP path yields
   `DateTime`; the reader now reads the Arrow `TimeUnit` and converts.

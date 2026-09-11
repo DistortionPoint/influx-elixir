@@ -47,6 +47,23 @@ defmodule InfluxElixir.Client.HTTP do
   explicitly. Admin callbacks that don't accept opts (`list_databases`,
   `delete_database`, `health`, etc.) use the connection-level default
   or fall back to 30s.
+
+  ## Pool Checkout Timeout
+
+  Finch also bounds how long a request waits to check a connection out of
+  the pool (`pool_timeout`, Finch default 5 s). That bound applies before
+  `receive_timeout` and is independent of it, so against a slow or
+  multi-node endpoint a request can fail with a transport `:timeout` after
+  5 s no matter how large `:timeout` is. It resolves the same way:
+
+    1. `opts[:pool_timeout]` (per-call override)
+    2. `connection[:pool_timeout]` (connection-level default)
+    3. `5_000` ms (Finch's default)
+
+  A checkout that times out is reported as
+  `{:error, {:connection_error, :pool_timeout}}` (Finch itself raises in
+  that case). The streaming query uses both timeouts as well and raises an
+  `InfluxElixir.StreamError` with `reason: :pool_timeout`.
   """
 
   @behaviour InfluxElixir.Client
@@ -59,6 +76,10 @@ defmodule InfluxElixir.Client.HTTP do
   # production queries. Override with the `:timeout` opt on a per-call
   # basis, or via a `:timeout` key on the connection config.
   @default_timeout 30_000
+
+  # Finch's own default for waiting on a pool checkout. Kept as the default
+  # so behaviour is unchanged unless configured; see `:pool_timeout`.
+  @default_pool_timeout 5_000
 
   # ---------------------------------------------------------------------------
   # Connection lifecycle
@@ -239,10 +260,10 @@ defmodule InfluxElixir.Client.HTTP do
         url = base_url(connection) <> "/api/v3/query_sql"
         headers = json_headers(connection)
         finch_name = resolve_finch(connection)
-        timeout = resolve_timeout(opts, connection)
+        finch_opts = finch_opts(opts, connection)
 
         Stream.resource(
-          fn -> start_stream(finch_name, url, headers, body, timeout) end,
+          fn -> start_stream(finch_name, url, headers, body, finch_opts) end,
           &stream_next/1,
           &stream_cleanup/1
         )
@@ -631,10 +652,32 @@ defmodule InfluxElixir.Client.HTTP do
         ) :: {:ok, Finch.Response.t()} | {:error, term()}
   defp do_request(method, url, headers, body, connection, opts) do
     finch_name = resolve_finch(connection)
-    timeout = resolve_timeout(opts, connection)
-
     request = Finch.build(method, url, headers, body)
-    Finch.request(request, finch_name, receive_timeout: timeout)
+    Finch.request(request, finch_name, finch_opts(opts, connection))
+  rescue
+    # Finch does not return an error tuple when no connection can be checked
+    # out within :pool_timeout — it converts NimblePool's exit into a
+    # RuntimeError. Map it back into the library's tagged-tuple contract.
+    error in RuntimeError -> {:error, classify_finch_error(error)}
+  end
+
+  @pool_timeout_message "Finch was unable to provide a connection within the timeout"
+
+  @spec classify_finch_error(Exception.t()) :: :pool_timeout | Exception.t()
+  defp classify_finch_error(%RuntimeError{message: @pool_timeout_message <> _rest}),
+    do: :pool_timeout
+
+  defp classify_finch_error(error), do: error
+
+  # Both Finch timeouts, resolved with the same precedence. Without an
+  # explicit `pool_timeout` Finch waits at most 5 s to check a connection out
+  # of the pool, regardless of how generous `receive_timeout` is (#14).
+  @spec finch_opts(keyword(), keyword()) :: keyword()
+  defp finch_opts(opts, connection) do
+    [
+      receive_timeout: resolve_timeout(opts, connection),
+      pool_timeout: resolve_pool_timeout(opts, connection)
+    ]
   end
 
   @doc false
@@ -647,6 +690,16 @@ defmodule InfluxElixir.Client.HTTP do
     Keyword.get(opts, :timeout) ||
       Keyword.get(connection, :timeout) ||
       @default_timeout
+  end
+
+  @doc false
+  # Resolves the pool checkout timeout in milliseconds. Precedence:
+  #   opts[:pool_timeout] → connection[:pool_timeout] → @default_pool_timeout
+  @spec resolve_pool_timeout(keyword(), keyword()) :: non_neg_integer()
+  def resolve_pool_timeout(opts, connection) do
+    Keyword.get(opts, :pool_timeout) ||
+      Keyword.get(connection, :pool_timeout) ||
+      @default_pool_timeout
   end
 
   @spec resolve_finch(keyword()) :: atom()
@@ -725,15 +778,15 @@ defmodule InfluxElixir.Client.HTTP do
            phase: :streaming | :halt
          }
 
-  @spec start_stream(atom(), binary(), list(), binary(), non_neg_integer()) ::
+  @spec start_stream(atom(), binary(), list(), binary(), keyword()) ::
           stream_state()
-  defp start_stream(finch_name, url, headers, body, timeout) do
+  defp start_stream(finch_name, url, headers, body, finch_opts) do
     parent = self()
     ref = make_ref()
 
     producer =
       spawn(fn ->
-        run_producer(parent, ref, finch_name, url, headers, body, timeout)
+        run_producer(parent, ref, finch_name, url, headers, body, finch_opts)
       end)
 
     monitor = Process.monitor(producer)
@@ -751,9 +804,9 @@ defmodule InfluxElixir.Client.HTTP do
 
   # Producer process body. Runs the blocking Finch stream, forwarding each
   # chunk to the consumer with back-pressure, then signalling completion.
-  @spec run_producer(pid(), reference(), atom(), binary(), list(), binary(), non_neg_integer()) ::
+  @spec run_producer(pid(), reference(), atom(), binary(), list(), binary(), keyword()) ::
           :ok
-  defp run_producer(parent, ref, finch_name, url, headers, body, timeout) do
+  defp run_producer(parent, ref, finch_name, url, headers, body, finch_opts) do
     request = Finch.build(:post, url, headers, body)
 
     outcome =
@@ -776,7 +829,7 @@ defmodule InfluxElixir.Client.HTTP do
           {:trailers, _trailers}, acc ->
             acc
         end,
-        receive_timeout: timeout
+        finch_opts
       )
 
     case outcome do
@@ -820,6 +873,11 @@ defmodule InfluxElixir.Client.HTTP do
 
       {:DOWN, ^monitor, :process, ^producer, :normal} ->
         {:halt, %{state | phase: :halt}}
+
+      # The producer crashed. A pool checkout timeout surfaces here because
+      # Finch raises inside the producer; report it by name.
+      {:DOWN, ^monitor, :process, ^producer, {%RuntimeError{} = error, _stack}} ->
+        raise InfluxElixir.StreamError, kind: :transport, reason: classify_finch_error(error)
 
       {:DOWN, ^monitor, :process, ^producer, reason} ->
         raise InfluxElixir.StreamError, kind: :transport, reason: reason
