@@ -130,7 +130,7 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
           database: ctx.database
         )
 
-      Process.sleep(ctx.query_delay)
+      InfluxElixir.ClientContract.settle(ctx)
       sql = "SELECT time, host, value, count FROM flight_probe"
 
       assert {:ok, [http_row]} = HTTP.query_sql(ctx.conn, sql, database: ctx.database)

@@ -110,6 +110,21 @@ defmodule InfluxElixir.ClientContract do
     end
   end
 
+  @doc """
+  Waits for a write to become visible to queries on the client under test.
+
+  `Client.Local` is synchronous, so its contexts set `query_delay: 0` and this
+  returns immediately. Real servers ingest asynchronously and their contexts
+  set a delay in milliseconds. Kept in one place so the wait strategy can be
+  changed without touching every test.
+  """
+  @spec settle(map()) :: :ok
+  def settle(%{query_delay: delay}) when is_integer(delay) and delay > 0 do
+    Process.sleep(delay)
+  end
+
+  def settle(_ctx), do: :ok
+
   # ---------------------------------------------------------------------------
   # Health (all profiles)
   # ---------------------------------------------------------------------------
@@ -348,8 +363,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           assert {:ok, [row]} =
                    unquote(client).query_sql(
@@ -381,8 +395,7 @@ defmodule InfluxElixir.ClientContract do
             )
           end)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -403,8 +416,7 @@ defmodule InfluxElixir.ClientContract do
             )
           end)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -431,8 +443,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -461,8 +472,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows_a} =
             unquote(client).query_sql(
@@ -501,8 +511,7 @@ defmodule InfluxElixir.ClientContract do
           {:ok, :written} =
             unquote(client).write(ctx.conn, lp, database: ctx.database)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -522,8 +531,7 @@ defmodule InfluxElixir.ClientContract do
           {:ok, :written} =
             unquote(client).write(ctx.conn, lp, database: ctx.database)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -542,8 +550,7 @@ defmodule InfluxElixir.ClientContract do
           {:ok, :written} =
             unquote(client).write(ctx.conn, lp, database: ctx.database)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -562,8 +569,7 @@ defmodule InfluxElixir.ClientContract do
           {:ok, :written} =
             unquote(client).write(ctx.conn, lp, database: ctx.database)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -595,8 +601,7 @@ defmodule InfluxElixir.ClientContract do
             )
           end)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           stream =
             unquote(client).query_sql_stream(
@@ -626,8 +631,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           assert {:error, _reason} =
                    unquote(client).execute_sql(
@@ -650,8 +654,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           assert {:ok, result} =
                    unquote(client).execute_sql(
@@ -688,8 +691,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, measurements} =
             unquote(client).query_influxql(
@@ -713,8 +715,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, tag_keys} =
             unquote(client).query_influxql(
@@ -809,8 +810,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           flux = """
           from(bucket: "#{ctx.database}")
@@ -839,8 +839,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           flux = """
           from(bucket: "#{ctx.database}")
@@ -878,8 +877,7 @@ defmodule InfluxElixir.ClientContract do
             )
           end)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, agg_base_ts: base_ts}
         end
@@ -990,8 +988,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -1013,8 +1010,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -1050,8 +1046,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           :ok
         end
@@ -1132,8 +1127,7 @@ defmodule InfluxElixir.ClientContract do
             precision: :second
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -1154,8 +1148,7 @@ defmodule InfluxElixir.ClientContract do
             precision: :millisecond
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -1175,8 +1168,7 @@ defmodule InfluxElixir.ClientContract do
             precision: :microsecond
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -1211,8 +1203,7 @@ defmodule InfluxElixir.ClientContract do
             )
           end)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           :ok
         end
@@ -1279,8 +1270,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           sql = """
           SELECT symbol, last_value(price ORDER BY time) AS price
@@ -1323,8 +1313,7 @@ defmodule InfluxElixir.ClientContract do
             database: ctx.database
           )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -1361,8 +1350,7 @@ defmodule InfluxElixir.ClientContract do
               gzip: true
             )
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -1391,8 +1379,7 @@ defmodule InfluxElixir.ClientContract do
           {:ok, :written} =
             unquote(client).write(ctx.conn, lp, database: ctx.database)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -1412,8 +1399,7 @@ defmodule InfluxElixir.ClientContract do
           {:ok, :written} =
             unquote(client).write(ctx.conn, lp, database: ctx.database)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(
@@ -1434,8 +1420,7 @@ defmodule InfluxElixir.ClientContract do
           {:ok, :written} =
             unquote(client).write(ctx.conn, lp, database: ctx.database)
 
-          if ctx[:query_delay] && ctx.query_delay > 0,
-            do: Process.sleep(ctx.query_delay)
+          InfluxElixir.ClientContract.settle(ctx)
 
           {:ok, rows} =
             unquote(client).query_sql(

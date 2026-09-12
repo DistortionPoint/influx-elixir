@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`Client.Local` split into three modules.** The 2,470-line module now owns
+  storage, capability checks and query execution (1,450 lines); the SQL parser
+  is `InfluxElixir.Client.Local.SQLParser` and the line-protocol parser is
+  `InfluxElixir.Client.Local.LineProtocolParser`, both pure. Public behaviour
+  is unchanged; the contract suites prove it.
+- `Client.Local.query_influxql/3` matches each `SHOW` pattern once.
 - Removed the unused internal `InfluxElixir.InfluxCase` case template from
   `test/support/` (never shipped; no test used it).
 - `Client.Local`'s line-protocol splitters accumulate tokens in binaries

@@ -7,7 +7,10 @@ defmodule InfluxElixir.Client.Local do
   independent ETS table.
 
   Parses real line protocol on write, stores points as maps, and responds
-  with realistic InfluxDB response formats on query.
+  with realistic InfluxDB response formats on query. Parsing is split out:
+  `InfluxElixir.Client.Local.LineProtocolParser` handles writes and
+  `InfluxElixir.Client.Local.SQLParser` handles the SQL subset; this module
+  owns storage, capability checks and query execution.
 
   ## Profiles
 
@@ -116,12 +119,9 @@ defmodule InfluxElixir.Client.Local do
 
   @behaviour InfluxElixir.Client
 
-  @type point_map :: %{
-          measurement: binary(),
-          tags: %{binary() => binary()},
-          fields: %{binary() => term()},
-          timestamp: integer() | nil
-        }
+  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLParser}
+
+  @type point_map :: LineProtocolParser.point()
 
   @type profile :: :v3_core | :v3_enterprise | :v2
 
@@ -171,10 +171,6 @@ defmodule InfluxElixir.Client.Local do
 
   # Gzip magic bytes
   @gzip_magic <<0x1F, 0x8B>>
-
-  # Measurement names may contain escaped spaces (e.g. "my\ measurement").
-  # This captures everything up to the first unescaped space or end-of-line.
-  @measurement_pattern ~r/(?i)SELECT\s+\*\s+FROM\s+(?:"([^"]+)"|((?:[^\s\\]|\\.)+))(.*)/s
 
   # ---------------------------------------------------------------------------
   # Connection lifecycle (behaviour callbacks)
@@ -330,7 +326,7 @@ defmodule InfluxElixir.Client.Local do
     with :ok <- require_capability(conn, :write),
          {:ok, text} <- maybe_decompress(payload),
          :ok <- ensure_database(table, database, profile),
-         {:ok, points} <- parse_line_protocol(text, precision) do
+         {:ok, points} <- LineProtocolParser.parse(text, precision) do
       Enum.each(points, &store_point(table, database, &1))
       {:ok, :written}
     end
@@ -359,9 +355,9 @@ defmodule InfluxElixir.Client.Local do
     with :ok <- require_capability(conn, :query_sql) do
       params = Keyword.get(opts, :params, %{})
       database = resolve_database(opts, conn)
-      resolved_sql = resolve_params(sql, params)
+      resolved_sql = SQLParser.resolve_params(sql, params)
 
-      case parse_select(resolved_sql) do
+      case SQLParser.parse_select(resolved_sql) do
         {:ok, query} ->
           case execute_query(table, query, database) do
             {:error, _reason} = err -> err
@@ -462,9 +458,9 @@ defmodule InfluxElixir.Client.Local do
     do: {:error, :delete_not_supported}
 
   defp execute_delete(table, database, _profile, measurement_raw, rest) do
-    measurement = unescape_measurement(measurement_raw)
+    measurement = LineProtocolParser.unescape_measurement(measurement_raw)
 
-    with {:ok, where} <- parse_where(rest) do
+    with {:ok, where} <- SQLParser.parse_where(rest) do
       count = delete_points(table, database, measurement, where)
       {:ok, %{"rows_affected" => count}}
     end
@@ -496,49 +492,50 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
+  @show_databases ~r/^(?i)SHOW\s+DATABASES\s*$/
+  @show_measurements ~r/^(?i)SHOW\s+MEASUREMENTS\s*$/
+  @show_tag_keys ~r/^(?i)SHOW\s+TAG\s+KEYS\s+FROM\s+(\S+)\s*$/
+
+  # The SHOW commands are InfluxQL-only; any other statement is handed to the
+  # SQL engine. Each pattern is matched once.
   defp do_query_influxql(table, conn, influxql, opts) do
     trimmed = String.trim(influxql)
     database = resolve_database(opts, conn)
 
     cond do
-      String.match?(trimmed, ~r/^(?i)SHOW\s+DATABASES\s*$/) ->
-        dbs =
-          table
-          |> get_databases()
-          |> Enum.map(&%{"iox::database" => &1})
+      String.match?(trimmed, @show_databases) ->
+        {:ok, table |> get_databases() |> Enum.map(&%{"iox::database" => &1})}
 
-        {:ok, dbs}
+      String.match?(trimmed, @show_measurements) ->
+        {:ok, show_measurements(table, database)}
 
-      String.match?(trimmed, ~r/^(?i)SHOW\s+MEASUREMENTS\s*$/) ->
-        measurements =
-          :ets.match_object(table, {{:points, database, :_}, :_})
-          |> Enum.map(fn {{:points, _db, m}, _pts} -> m end)
-          |> Enum.uniq()
-          |> Enum.map(&%{"iox::measurement" => "measurements", "name" => &1})
+      match = Regex.run(@show_tag_keys, trimmed) ->
+        [_full, measurement_raw] = match
 
-        {:ok, measurements}
-
-      match?(
-        [_full, _capture],
-        Regex.run(~r/^(?i)SHOW\s+TAG\s+KEYS\s+FROM\s+(\S+)\s*$/, trimmed)
-      ) ->
-        [_full, measurement_raw] =
-          Regex.run(~r/^(?i)SHOW\s+TAG\s+KEYS\s+FROM\s+(\S+)\s*$/, trimmed)
-
-        measurement = unescape_measurement(measurement_raw)
-        points = fetch_points(table, database, measurement)
-
-        tag_keys =
-          points
-          |> Enum.flat_map(&Map.keys(&1.tags))
-          |> Enum.uniq()
-          |> Enum.map(&%{"iox::measurement" => measurement, "tagKey" => &1})
-
-        {:ok, tag_keys}
+        {:ok,
+         show_tag_keys(table, database, LineProtocolParser.unescape_measurement(measurement_raw))}
 
       true ->
         query_sql(conn, influxql, opts)
     end
+  end
+
+  @spec show_measurements(:ets.table(), binary()) :: [map()]
+  defp show_measurements(table, database) do
+    table
+    |> :ets.match_object({{:points, database, :_}, :_})
+    |> Enum.map(fn {{:points, _db, m}, _pts} -> m end)
+    |> Enum.uniq()
+    |> Enum.map(&%{"iox::measurement" => "measurements", "name" => &1})
+  end
+
+  @spec show_tag_keys(:ets.table(), binary(), binary()) :: [map()]
+  defp show_tag_keys(table, database, measurement) do
+    table
+    |> fetch_points(database, measurement)
+    |> Enum.flat_map(&Map.keys(&1.tags))
+    |> Enum.uniq()
+    |> Enum.map(&%{"iox::measurement" => measurement, "tagKey" => &1})
   end
 
   @doc """
@@ -948,987 +945,10 @@ defmodule InfluxElixir.Client.Local do
   defp maybe_decompress(plain), do: {:ok, plain}
 
   # ---------------------------------------------------------------------------
-  # Private — line protocol parser
+  # Private — SQL query executor (parsing lives in SQLParser)
   # ---------------------------------------------------------------------------
 
-  @spec parse_line_protocol(binary(), atom()) ::
-          {:ok, [point_map()]} | {:error, map()}
-  defp parse_line_protocol(text, precision) do
-    lines =
-      text
-      |> String.split("\n")
-      |> Enum.reject(&(String.trim(&1) == "" or String.starts_with?(&1, "#")))
-
-    lines
-    |> Enum.reduce_while({:ok, []}, fn line, {:ok, acc} ->
-      case parse_line(line, precision) do
-        {:ok, point} -> {:cont, {:ok, [point | acc]}}
-        {:error, _reason} = err -> {:halt, err}
-      end
-    end)
-    |> case do
-      {:ok, pts} -> {:ok, Enum.reverse(pts)}
-      {:error, _reason} = err -> err
-    end
-  end
-
-  # Parses a single line protocol line into a point map.
-  #
-  # Format: measurement[,tag=val...] field=val[,...] [timestamp]
-  @spec parse_line(binary(), atom()) :: {:ok, point_map()} | {:error, map()}
-  defp parse_line(line, precision) do
-    case split_line_parts(line) do
-      [key_part, fields_part | rest] ->
-        ts_raw = List.first(rest)
-
-        with {:ok, {measurement, tags}} <- parse_key_part(key_part),
-             {:ok, fields} <- parse_fields_part(fields_part),
-             {:ok, timestamp} <- parse_timestamp(ts_raw, precision) do
-          {:ok,
-           %{
-             measurement: measurement,
-             tags: tags,
-             fields: fields,
-             timestamp: timestamp
-           }}
-        end
-
-      _parts ->
-        {:error, %{status: 400, body: "invalid line protocol: #{line}"}}
-    end
-  end
-
-  # The splitters below accumulate the current token in a binary. Appending
-  # to a binary the process owns is optimised by the runtime (no copy), so
-  # this is one pass with one allocation per token — the previous
-  # one-byte-per-list-cell accumulation plus reverse/join was several
-  # allocations per byte on every write.
-
-  # Splits a line into [key_part, fields_part, optional_timestamp] by
-  # unescaped spaces that are not inside double-quoted strings.
-  @spec split_line_parts(binary()) :: [binary()]
-  defp split_line_parts(line) do
-    do_lp_split(line, <<>>, [], false)
-  end
-
-  # End of input — flush remaining token.
-  defp do_lp_split(<<>>, current, acc, _in_quotes), do: Enum.reverse([current | acc])
-
-  # Escaped backslash — keep both chars, quote state unchanged.
-  defp do_lp_split(<<"\\\\", rest::binary>>, current, acc, in_quotes) do
-    do_lp_split(rest, <<current::binary, "\\\\">>, acc, in_quotes)
-  end
-
-  # Escaped double-quote — keep both chars, do not toggle quote state.
-  defp do_lp_split(<<"\\\"", rest::binary>>, current, acc, in_quotes) do
-    do_lp_split(rest, <<current::binary, "\\\"">>, acc, in_quotes)
-  end
-
-  # Escaped space outside quotes — keep both chars, no split.
-  defp do_lp_split(<<"\\ ", rest::binary>>, current, acc, false) do
-    do_lp_split(rest, <<current::binary, "\\ ">>, acc, false)
-  end
-
-  # Unescaped double-quote — toggle in_quotes flag.
-  defp do_lp_split(<<"\"", rest::binary>>, current, acc, in_quotes) do
-    do_lp_split(rest, <<current::binary, "\"">>, acc, !in_quotes)
-  end
-
-  # Unescaped space outside a quoted string — emit token.
-  defp do_lp_split(<<" ", rest::binary>>, current, acc, false) do
-    do_lp_split(rest, <<>>, [current | acc], false)
-  end
-
-  # All other bytes — accumulate.
-  defp do_lp_split(<<c, rest::binary>>, current, acc, in_quotes) do
-    do_lp_split(rest, <<current::binary, c>>, acc, in_quotes)
-  end
-
-  # Parses the "measurement[,tag=val...]" part.
-  @spec parse_key_part(binary()) :: {:ok, {binary(), map()}} | {:error, map()}
-  defp parse_key_part(key_part) do
-    case split_first_unescaped_comma(key_part) do
-      {measurement_raw, ""} ->
-        {:ok, {unescape_measurement(measurement_raw), %{}}}
-
-      {measurement_raw, tags_raw} ->
-        with {:ok, tags} <- parse_tags(tags_raw) do
-          {:ok, {unescape_measurement(measurement_raw), tags}}
-        end
-    end
-  end
-
-  # Splits at the first unescaped comma.
-  @spec split_first_unescaped_comma(binary()) :: {binary(), binary()}
-  defp split_first_unescaped_comma(str) do
-    do_split_comma(str, <<>>)
-  end
-
-  defp do_split_comma(<<>>, acc), do: {acc, ""}
-
-  defp do_split_comma(<<"\\,", rest::binary>>, acc) do
-    do_split_comma(rest, <<acc::binary, "\\,">>)
-  end
-
-  defp do_split_comma(<<",", rest::binary>>, acc), do: {acc, rest}
-
-  defp do_split_comma(<<c, rest::binary>>, acc) do
-    do_split_comma(rest, <<acc::binary, c>>)
-  end
-
-  # Parses "tag1=v1,tag2=v2,..." into a map.
-  @spec parse_tags(binary()) :: {:ok, map()} | {:error, map()}
-  defp parse_tags(tags_str) do
-    pairs = split_unescaped_comma(tags_str)
-
-    Enum.reduce_while(pairs, {:ok, %{}}, fn pair, {:ok, acc} ->
-      case split_first_unescaped_equals(pair) do
-        {k, v} when k != "" and v != "" ->
-          {:cont, {:ok, Map.put(acc, unescape_tag(k), unescape_tag(v))}}
-
-        _invalid ->
-          {:halt, {:error, %{status: 400, body: "invalid tag pair: #{pair}"}}}
-      end
-    end)
-  end
-
-  # Parses the "field=val[,...]" section.
-  @spec parse_fields_part(binary()) :: {:ok, map()} | {:error, map()}
-  defp parse_fields_part(fields_str) do
-    pairs = split_unescaped_comma(fields_str)
-
-    Enum.reduce_while(pairs, {:ok, %{}}, fn pair, {:ok, acc} ->
-      case split_first_unescaped_equals(pair) do
-        {k, v} when k != "" and v != "" ->
-          case parse_field_value(v) do
-            {:ok, typed} -> {:cont, {:ok, Map.put(acc, unescape_tag(k), typed)}}
-            {:error, _reason} = err -> {:halt, err}
-          end
-
-        _invalid ->
-          {:halt, {:error, %{status: 400, body: "invalid field pair: #{pair}"}}}
-      end
-    end)
-  end
-
-  # Splits a CSV-like string on unescaped commas, respecting quoted strings.
-  @spec split_unescaped_comma(binary()) :: [binary()]
-  defp split_unescaped_comma(str) do
-    do_csv_split(str, <<>>, [], false)
-  end
-
-  defp do_csv_split(<<>>, current, acc, _in_quotes), do: Enum.reverse([current | acc])
-
-  defp do_csv_split(<<"\\\"", rest::binary>>, current, acc, in_quotes) do
-    do_csv_split(rest, <<current::binary, "\\\"">>, acc, in_quotes)
-  end
-
-  defp do_csv_split(<<"\"", rest::binary>>, current, acc, in_quotes) do
-    do_csv_split(rest, <<current::binary, "\"">>, acc, !in_quotes)
-  end
-
-  defp do_csv_split(<<"\\,", rest::binary>>, current, acc, in_quotes) do
-    do_csv_split(rest, <<current::binary, "\\,">>, acc, in_quotes)
-  end
-
-  defp do_csv_split(<<",", rest::binary>>, current, acc, false) do
-    do_csv_split(rest, <<>>, [current | acc], false)
-  end
-
-  defp do_csv_split(<<c, rest::binary>>, current, acc, in_quotes) do
-    do_csv_split(rest, <<current::binary, c>>, acc, in_quotes)
-  end
-
-  # Splits at the first unescaped = sign.
-  @spec split_first_unescaped_equals(binary()) :: {binary(), binary()}
-  defp split_first_unescaped_equals(str) do
-    do_split_eq(str, <<>>)
-  end
-
-  defp do_split_eq(<<>>, acc), do: {acc, ""}
-
-  defp do_split_eq(<<"\\=", rest::binary>>, acc) do
-    do_split_eq(rest, <<acc::binary, "\\=">>)
-  end
-
-  defp do_split_eq(<<"=", rest::binary>>, acc), do: {acc, rest}
-
-  defp do_split_eq(<<c, rest::binary>>, acc) do
-    do_split_eq(rest, <<acc::binary, c>>)
-  end
-
-  # Parses a field value string into its typed Elixir equivalent.
-  @spec parse_field_value(binary()) :: {:ok, term()} | {:error, map()}
-  defp parse_field_value(str) do
-    cond do
-      String.ends_with?(str, "i") ->
-        case Integer.parse(String.slice(str, 0..-2//1)) do
-          {n, ""} -> {:ok, n}
-          _err -> {:error, %{status: 400, body: "invalid integer field: #{str}"}}
-        end
-
-      String.starts_with?(str, "\"") and String.ends_with?(str, "\"") ->
-        inner =
-          str
-          |> String.slice(1..-2//1)
-          |> String.replace("\\\"", "\"")
-          |> String.replace("\\\\", "\\")
-
-        {:ok, inner}
-
-      str in ["true", "True", "TRUE"] ->
-        {:ok, true}
-
-      str in ["false", "False", "FALSE"] ->
-        {:ok, false}
-
-      true ->
-        case Float.parse(str) do
-          {f, ""} -> {:ok, f}
-          _err -> {:error, %{status: 400, body: "invalid field value: #{str}"}}
-        end
-    end
-  end
-
-  # Parses a raw timestamp string, normalising to nanoseconds.
-  @spec parse_timestamp(binary() | nil, atom()) ::
-          {:ok, integer() | nil} | {:error, map()}
-  defp parse_timestamp(nil, _prec), do: {:ok, nil}
-  defp parse_timestamp("", _prec), do: {:ok, nil}
-
-  defp parse_timestamp(ts_str, precision) do
-    case Integer.parse(ts_str) do
-      {ts, ""} -> {:ok, to_nanoseconds(ts, precision)}
-      _err -> {:error, %{status: 400, body: "invalid timestamp: #{ts_str}"}}
-    end
-  end
-
-  @spec to_nanoseconds(integer(), atom()) :: integer()
-  defp to_nanoseconds(ts, :nanosecond), do: ts
-  defp to_nanoseconds(ts, :microsecond), do: ts * 1_000
-  defp to_nanoseconds(ts, :millisecond), do: ts * 1_000_000
-  defp to_nanoseconds(ts, :second), do: ts * 1_000_000_000
-
-  # Unescape a measurement name (backslash, comma, space).
-  @spec unescape_measurement(binary()) :: binary()
-  defp unescape_measurement(str) do
-    str
-    |> String.trim("\"")
-    |> String.replace("\\ ", " ")
-    |> String.replace("\\,", ",")
-    |> String.replace("\\\\", "\\")
-  end
-
-  # Unescape a tag key or value (backslash, comma, equals, space).
-  @spec unescape_tag(binary()) :: binary()
-  defp unescape_tag(str) do
-    str
-    |> String.replace("\\ ", " ")
-    |> String.replace("\\,", ",")
-    |> String.replace("\\=", "=")
-    |> String.replace("\\\\", "\\")
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private — SQL query engine
-  # ---------------------------------------------------------------------------
-
-  @type select_column ::
-          {:time_bucket, binary()}
-          | {:aggregate, :avg | :sum | :count | :min | :max, binary(), binary()}
-          | {:count_star, binary()}
-          | {:ordered_aggregate, :first | :last, binary(), binary(), binary()}
-          | {:grouping_column, binary(), binary()}
-
-  @type where_op :: :eq | :gt | :lt | :gte | :lte | :ne | :in | :not_in
-  @type where_clause :: {where_op(), binary(), term()}
-
-  @type parsed_query :: %{
-          measurement: binary(),
-          where: [where_clause()],
-          order_by: {:time, :asc | :desc} | nil,
-          limit: pos_integer() | nil,
-          group_by_interval: pos_integer() | nil,
-          group_by_columns: [binary()] | nil,
-          select_columns: [select_column()] | nil,
-          distinct_column: binary() | nil,
-          projection_columns: [{binary(), binary()}] | nil
-        }
-
-  # Aggregate function names recognised by the parser.
-  @aggregate_functions ~w(AVG SUM COUNT MIN MAX FIRST_VALUE LAST_VALUE)
-
-  # InfluxQL selector functions that InfluxDB v3 SQL does not provide. They are
-  # routed into the aggregate parser only so the rejection can name the fix.
-  @influxql_only_functions ~w(FIRST LAST)
-
-  # first_value(field ORDER BY col [ASC|DESC]) AS alias  (and last_value).
-  # The ORDER BY group is optional in the grammar so a missing one can be
-  # reported specifically instead of as a generic parse failure.
-  @ordered_agg_pattern ~r/(?i)^\s*(FIRST_VALUE|LAST_VALUE)\s*\(\s*(\w+)\s*(?:ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?\s*)?\)\s+AS\s+(\w+)\s*$/
-
-  @spec parse_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
-  defp parse_select(sql) do
-    normalised = String.trim(sql)
-
-    cond do
-      distinct_query?(normalised) -> parse_distinct_select(normalised)
-      aggregate_query?(normalised) -> parse_aggregate_select(normalised)
-      star_query?(normalised) -> parse_star_select(normalised)
-      true -> parse_columns_select(normalised)
-    end
-  end
-
-  @spec distinct_query?(binary()) :: boolean()
-  defp distinct_query?(sql) do
-    String.match?(sql, ~r/(?i)^\s*SELECT\s+DISTINCT\s+/)
-  end
-
-  @spec star_query?(binary()) :: boolean()
-  defp star_query?(sql) do
-    String.match?(sql, ~r/(?i)^\s*SELECT\s+\*\s+FROM\s/)
-  end
-
-  @spec aggregate_query?(binary()) :: boolean()
-  defp aggregate_query?(sql) do
-    upper = String.upcase(sql)
-
-    String.contains?(upper, "DATE_BIN") or
-      Enum.any?(
-        @aggregate_functions ++ @influxql_only_functions,
-        &String.contains?(upper, &1 <> "(")
-      )
-  end
-
-  @spec parse_aggregate_select(binary()) ::
-          {:ok, parsed_query()} | {:error, term()}
-  defp parse_aggregate_select(sql) do
-    with {:ok, columns} <- parse_select_columns(sql),
-         {:ok, measurement} <- parse_aggregate_from(sql),
-         {:ok, interval_ns} <- resolve_aggregate_interval(sql),
-         rest = extract_after_from(sql),
-         {:ok, where} <- parse_where(rest) do
-      {:ok,
-       %{
-         measurement: measurement,
-         where: where,
-         order_by: parse_order_by(rest),
-         limit: parse_limit(rest),
-         group_by_interval: interval_ns,
-         group_by_columns: parse_group_by_columns(sql),
-         select_columns: columns,
-         distinct_column: nil,
-         projection_columns: nil
-       }}
-    end
-  end
-
-  # Extract the bare-column GROUP BY list, e.g. "GROUP BY ticker, holding_type".
-  # Returns nil when no GROUP BY exists or when the clause is DATE_BIN(...)
-  # (handled separately by resolve_aggregate_interval).
-  @spec parse_group_by_columns(binary()) :: [binary()] | nil
-  defp parse_group_by_columns(sql) do
-    case Regex.run(
-           ~r/(?i)GROUP\s+BY\s+(.+?)(?:\s+ORDER|\s+LIMIT|$)/s,
-           sql
-         ) do
-      [_full, columns_str] ->
-        if String.match?(columns_str, ~r/^\s*DATE_BIN\s*\(/i) do
-          nil
-        else
-          columns_str
-          |> split_top_level_commas()
-          |> Enum.map(&String.trim/1)
-          |> Enum.reject(&(&1 == ""))
-          |> case do
-            [] -> nil
-            cols -> cols
-          end
-        end
-
-      _no_match ->
-        nil
-    end
-  end
-
-  # GROUP BY DATE_BIN is optional. Without the clause, return nil so the
-  # executor produces a single scalar row. With the clause, propagate any
-  # interval-parsing error so malformed intervals still surface.
-  @spec resolve_aggregate_interval(binary()) ::
-          {:ok, pos_integer() | nil} | {:error, term()}
-  defp resolve_aggregate_interval(sql) do
-    if String.match?(sql, ~r/(?i)GROUP\s+BY\s+DATE_BIN/) do
-      parse_group_by_interval(sql)
-    else
-      {:ok, nil}
-    end
-  end
-
-  # Extract the measurement name from: FROM "name" or FROM name
-  @spec parse_aggregate_from(binary()) :: {:ok, binary()} | {:error, term()}
-  defp parse_aggregate_from(sql) do
-    pattern = ~r/(?i)FROM\s+(?:"([^"]+)"|(\S+?))\s*(?:WHERE|GROUP|ORDER|LIMIT|$)/
-
-    case Regex.run(pattern, sql) do
-      [_full, quoted, ""] -> {:ok, quoted}
-      [_full, "", unquoted] -> {:ok, unescape_measurement(unquoted)}
-      [_full, quoted] when quoted != "" -> {:ok, quoted}
-      _no_match -> {:error, local_error("unsupported SQL: #{sql}")}
-    end
-  end
-
-  # Extract everything after FROM <measurement> for WHERE/ORDER/LIMIT parsing
-  @spec extract_after_from(binary()) :: binary()
-  defp extract_after_from(sql) do
-    case Regex.run(~r/(?i)FROM\s+(?:"[^"]+"|[^\s]+)\s*(.*)/s, sql) do
-      [_full, rest] -> rest
-      _no_match -> ""
-    end
-  end
-
-  # Parse SELECT columns: DATE_BIN(...) AS alias, AGG(field) AS alias
-  @spec parse_select_columns(binary()) ::
-          {:ok, [select_column()]} | {:error, term()}
-  defp parse_select_columns(sql) do
-    case Regex.run(~r/(?i)SELECT\s+(.+?)\s+FROM\s/s, sql) do
-      [_full, columns_str] ->
-        columns =
-          columns_str
-          |> split_top_level_commas()
-          |> Enum.map(&String.trim/1)
-          |> Enum.map(&parse_single_column/1)
-
-        if Enum.any?(columns, &match?({:error, _}, &1)) do
-          Enum.find(columns, &match?({:error, _}, &1))
-        else
-          {:ok, Enum.map(columns, fn {:ok, col} -> col end)}
-        end
-
-      _no_match ->
-        {:error, local_error("unsupported SQL: #{sql}")}
-    end
-  end
-
-  # Split column list by commas, respecting parentheses nesting
-  @spec split_top_level_commas(binary()) :: [binary()]
-  defp split_top_level_commas(str) do
-    {last, acc} =
-      str
-      |> String.graphemes()
-      |> Enum.reduce({[], [], 0}, fn
-        ",", {current, acc, 0} ->
-          token = current |> Enum.reverse() |> Enum.join()
-          {[], [token | acc], 0}
-
-        "(", {current, acc, depth} ->
-          {["(" | current], acc, depth + 1}
-
-        ")", {current, acc, depth} ->
-          {[")" | current], acc, max(depth - 1, 0)}
-
-        char, {current, acc, depth} ->
-          {[char | current], acc, depth}
-      end)
-      |> then(fn {current, acc, _depth} ->
-        token = current |> Enum.reverse() |> Enum.join()
-        {token, acc}
-      end)
-
-    Enum.reverse([last | acc])
-  end
-
-  # Parse a single SELECT column expression
-  @spec parse_single_column(binary()) ::
-          {:ok, select_column()} | {:error, term()}
-  defp parse_single_column(col) do
-    cond do
-      String.match?(col, ~r/(?i)DATE_BIN\s*\(/) ->
-        parse_date_bin_column(col)
-
-      String.match?(col, ~r/(?i)\b(FIRST_VALUE|LAST_VALUE)\s*\(/) ->
-        parse_ordered_agg_column(col)
-
-      String.match?(col, ~r/(?i)\b(FIRST|LAST)\s*\(/) ->
-        {:error, influxql_selector_error(col)}
-
-      String.match?(col, ~r/(?i)\b(AVG|SUM|COUNT|MIN|MAX)\s*\(/) ->
-        parse_agg_column(col)
-
-      String.match?(col, ~r/^\s*\w+(\s+AS\s+\w+)?\s*$/i) ->
-        parse_grouping_column(col)
-
-      true ->
-        {:error, local_error("unsupported column expression: #{col}")}
-    end
-  end
-
-  # FIRST()/LAST() are InfluxQL selectors. Accepting them here would certify a
-  # query the real engine rejects ("Invalid function 'last'"), so refuse and
-  # point at the v3 SQL spelling.
-  @spec influxql_selector_error(binary()) :: map()
-  defp influxql_selector_error(col) do
-    local_error(
-      "FIRST()/LAST() are InfluxQL selector functions that InfluxDB v3 SQL " <>
-        "does not provide (the real engine fails planning with " <>
-        "\"Invalid function\"). Use first_value(field ORDER BY time) / " <>
-        "last_value(field ORDER BY time) instead: #{col}"
-    )
-  end
-
-  # Parse: first_value(field ORDER BY col [ASC|DESC]) AS alias  (and last_value).
-  #
-  # Direction is folded into the aggregate atom at parse time: `:first` always
-  # means "the point with the smallest ordering value" and `:last` the largest,
-  # so first_value(... DESC) and last_value(... ASC) share one executor.
-  #
-  # ORDER BY is mandatory. DataFusion returns an arbitrary group member when it
-  # is omitted, which the double cannot reproduce — accepting the query would
-  # certify a non-deterministic result.
-  @spec parse_ordered_agg_column(binary()) ::
-          {:ok, select_column()} | {:error, term()}
-  defp parse_ordered_agg_column(col) do
-    case Regex.run(@ordered_agg_pattern, col) do
-      [_full, func, field, ordering, direction, alias_name] when ordering != "" ->
-        agg = ordered_agg_end(func, direction)
-        {:ok, {:ordered_aggregate, agg, field, ordering, alias_name}}
-
-      [_full, func, _field, "", _direction, _alias] ->
-        {:error,
-         local_error(
-           "#{func}() needs ORDER BY inside the call: InfluxDB v3 returns an " <>
-             "arbitrary row from the group without one, which this test double " <>
-             "cannot reproduce. Write #{func}(field ORDER BY time): #{col}"
-         )}
-
-      _no_match ->
-        {:error, local_error("invalid aggregate: #{col}")}
-    end
-  end
-
-  @spec ordered_agg_end(binary(), binary()) :: :first | :last
-  defp ordered_agg_end(func, direction) do
-    case {String.downcase(func), String.upcase(direction)} do
-      {"first_value", "DESC"} -> :last
-      {"first_value", _asc} -> :first
-      {"last_value", "DESC"} -> :first
-      {"last_value", _asc} -> :last
-    end
-  end
-
-  # Parse a bare grouping column: `name` or `name AS alias`.
-  @spec parse_grouping_column(binary()) ::
-          {:ok, select_column()} | {:error, term()}
-  defp parse_grouping_column(col) do
-    case Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/i, String.trim(col)) do
-      [_full, name] -> {:ok, {:grouping_column, name, name}}
-      [_full, name, alias_name] -> {:ok, {:grouping_column, name, alias_name}}
-      _no_match -> {:error, local_error("invalid column: #{col}")}
-    end
-  end
-
-  # Parse: DATE_BIN(INTERVAL 'N unit', time) AS alias
-  @spec parse_date_bin_column(binary()) ::
-          {:ok, select_column()} | {:error, term()}
-  defp parse_date_bin_column(col) do
-    pattern =
-      ~r/(?i)DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)\s+AS\s+(\w+)/
-
-    case Regex.run(pattern, col) do
-      [_full, _interval, alias_name] ->
-        {:ok, {:time_bucket, alias_name}}
-
-      _no_match ->
-        {:error, local_error("invalid DATE_BIN: #{col}")}
-    end
-  end
-
-  # Parse: AGG(field) AS alias.
-  # COUNT(*) is special-cased — it counts rows regardless of field nullity
-  # (matching real InfluxDB v3 / SQL semantics), so it doesn't fit the
-  # `\w+`-inside-parens shape used for the other aggregates.
-  @spec parse_agg_column(binary()) ::
-          {:ok, select_column()} | {:error, term()}
-  defp parse_agg_column(col) do
-    count_star =
-      ~r/(?i)^\s*COUNT\s*\(\s*\*\s*\)\s+AS\s+(\w+)\s*$/
-
-    case Regex.run(count_star, col) do
-      [_full, alias_name] ->
-        {:ok, {:count_star, alias_name}}
-
-      nil ->
-        parse_agg_column_arg(col)
-    end
-  end
-
-  # Exactly one argument: `AVG(field, other)` is not SQL and the real engine
-  # rejects it, so the double must not quietly accept it either.
-  @spec parse_agg_column_arg(binary()) ::
-          {:ok, select_column()} | {:error, term()}
-  defp parse_agg_column_arg(col) do
-    one_arg = ~r/(?i)^\s*(AVG|SUM|COUNT|MIN|MAX)\s*\(\s*(\w+)\s*\)\s+AS\s+(\w+)\s*$/
-
-    case Regex.run(one_arg, col) do
-      [_full, func, field, alias_name] ->
-        agg_atom = func |> String.downcase() |> String.to_existing_atom()
-        {:ok, {:aggregate, agg_atom, field, alias_name}}
-
-      _no_match ->
-        {:error, local_error("invalid aggregate: #{col}")}
-    end
-  end
-
-  # Parse GROUP BY DATE_BIN(INTERVAL 'N unit', time) → interval in nanoseconds
-  @spec parse_group_by_interval(binary()) ::
-          {:ok, pos_integer()} | {:error, term()}
-  defp parse_group_by_interval(sql) do
-    pattern =
-      ~r/(?i)GROUP\s+BY\s+DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)/
-
-    case Regex.run(pattern, sql) do
-      [_full, interval_str] -> parse_interval(interval_str)
-      _no_match -> {:error, local_error("missing GROUP BY DATE_BIN")}
-    end
-  end
-
-  # Convert "N unit" → nanoseconds
-  @spec parse_interval(binary()) :: {:ok, pos_integer()} | {:error, term()}
-  defp parse_interval(interval_str) do
-    case Regex.run(~r/^\s*(\d+)\s+(\w+)\s*$/, interval_str) do
-      [_full, n_str, unit] ->
-        {n, ""} = Integer.parse(n_str)
-        multiplier = interval_unit_to_ns(String.downcase(unit))
-
-        if multiplier do
-          {:ok, n * multiplier}
-        else
-          {:error, local_error("unknown interval unit: #{unit}")}
-        end
-
-      _no_match ->
-        {:error, local_error("invalid interval: #{interval_str}")}
-    end
-  end
-
-  @spec interval_unit_to_ns(binary()) :: pos_integer() | nil
-  defp interval_unit_to_ns(unit) when unit in ["second", "seconds"],
-    do: 1_000_000_000
-
-  defp interval_unit_to_ns(unit) when unit in ["minute", "minutes"],
-    do: 60_000_000_000
-
-  defp interval_unit_to_ns(unit) when unit in ["hour", "hours"],
-    do: 3_600_000_000_000
-
-  defp interval_unit_to_ns(unit) when unit in ["day", "days"],
-    do: 86_400_000_000_000
-
-  defp interval_unit_to_ns(_unknown), do: nil
-
-  @distinct_pattern ~r/(?i)SELECT\s+DISTINCT\s+(\w+)\s+FROM\s+(?:"([^"]+)"|(\S+))\s*(.*)/s
-
-  @spec parse_distinct_select(binary()) ::
-          {:ok, parsed_query()} | {:error, term()}
-  defp parse_distinct_select(sql) do
-    case Regex.run(@distinct_pattern, sql) do
-      [_full, column, quoted, "", rest] ->
-        build_distinct_query(column, quoted, rest)
-
-      [_full, column, "", unquoted, rest] ->
-        build_distinct_query(column, unescape_measurement(unquoted), rest)
-
-      _no_match ->
-        {:error, local_error("unsupported DISTINCT query: #{sql}")}
-    end
-  end
-
-  @spec build_distinct_query(binary(), binary(), binary()) ::
-          {:ok, parsed_query()} | {:error, map()}
-  defp build_distinct_query(column, measurement, rest) do
-    with {:ok, where} <- parse_where(rest) do
-      {:ok,
-       %{
-         measurement: measurement,
-         where: where,
-         order_by: nil,
-         limit: parse_limit(rest),
-         group_by_interval: nil,
-         group_by_columns: nil,
-         select_columns: nil,
-         distinct_column: column,
-         projection_columns: nil
-       }}
-    end
-  end
-
-  @spec parse_star_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
-  defp parse_star_select(sql) do
-    case Regex.run(@measurement_pattern, sql) do
-      [_full_match, quoted, "", rest] when quoted != "" ->
-        build_star_query(quoted, rest)
-
-      [_full_match, "", unquoted, rest] ->
-        build_star_query(unescape_measurement(unquoted), rest)
-
-      [_full_match, quoted, rest] when quoted != "" ->
-        build_star_query(quoted, rest)
-
-      _no_match ->
-        {:error, local_error("unsupported SQL: #{sql}")}
-    end
-  end
-
-  @spec build_star_query(binary(), binary()) ::
-          {:ok, parsed_query()} | {:error, map()}
-  defp build_star_query(measurement, rest) do
-    with {:ok, where} <- parse_where(rest) do
-      {:ok,
-       %{
-         measurement: measurement,
-         where: where,
-         order_by: parse_order_by(rest),
-         limit: parse_limit(rest),
-         group_by_interval: nil,
-         group_by_columns: nil,
-         select_columns: nil,
-         distinct_column: nil,
-         projection_columns: nil
-       }}
-    end
-  end
-
-  @columns_select_pattern ~r/(?i)SELECT\s+(.+?)\s+FROM\s+(?:"([^"]+)"|((?:[^\s\\]|\\.)+))(.*)/s
-
-  @spec parse_columns_select(binary()) ::
-          {:ok, parsed_query()} | {:error, term()}
-  defp parse_columns_select(sql) do
-    case Regex.run(@columns_select_pattern, sql) do
-      [_full, columns_str, quoted, "", rest] when quoted != "" ->
-        build_columns_query(columns_str, quoted, rest, sql)
-
-      [_full, columns_str, "", unquoted, rest] ->
-        build_columns_query(columns_str, unescape_measurement(unquoted), rest, sql)
-
-      [_full, columns_str, quoted, rest] when quoted != "" ->
-        build_columns_query(columns_str, quoted, rest, sql)
-
-      _no_match ->
-        {:error, local_error("unsupported SQL: #{sql}")}
-    end
-  end
-
-  @spec build_columns_query(binary(), binary(), binary(), binary()) ::
-          {:ok, parsed_query()} | {:error, term()}
-  defp build_columns_query(columns_str, measurement, rest, sql) do
-    case parse_projection_columns(columns_str) do
-      {:ok, projection} ->
-        with {:ok, where} <- parse_where(rest) do
-          {:ok,
-           %{
-             measurement: measurement,
-             where: where,
-             order_by: parse_order_by(rest),
-             limit: parse_limit(rest),
-             group_by_interval: nil,
-             group_by_columns: nil,
-             select_columns: nil,
-             distinct_column: nil,
-             projection_columns: projection
-           }}
-        end
-
-      {:error, _reason} ->
-        {:error, local_error("unsupported SQL: #{sql}")}
-    end
-  end
-
-  @spec parse_projection_columns(binary()) ::
-          {:ok, [{binary(), binary()}]} | {:error, term()}
-  defp parse_projection_columns(columns_str) do
-    columns =
-      columns_str
-      |> split_top_level_commas()
-      |> Enum.map(&String.trim/1)
-      |> Enum.map(&parse_projection_column/1)
-
-    if Enum.any?(columns, &match?({:error, _}, &1)) do
-      Enum.find(columns, &match?({:error, _}, &1))
-    else
-      {:ok, Enum.map(columns, fn {:ok, col} -> col end)}
-    end
-  end
-
-  # Parse `name` or `name AS alias`, returning `{source, output}`.
-  @spec parse_projection_column(binary()) ::
-          {:ok, {binary(), binary()}} | {:error, term()}
-  defp parse_projection_column(col) do
-    case Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/i, String.trim(col)) do
-      [_full, name] -> {:ok, {name, name}}
-      [_full, name, alias_name] -> {:ok, {name, alias_name}}
-      _no_match -> {:error, local_error("unsupported column: #{col}")}
-    end
-  end
-
-  @spec parse_where(binary()) ::
-          {:ok, [where_clause()]} | {:error, map()}
-  defp parse_where(rest) do
-    case Regex.run(~r/(?i)WHERE\s+(.+?)(?:\s+GROUP|\s+ORDER|\s+LIMIT|$)/s, rest) do
-      [_full_match, clauses_str] -> parse_where_clauses(clauses_str)
-      _no_match -> {:ok, []}
-    end
-  end
-
-  # Fold each AND-split clause into either an accumulating list or the first
-  # error encountered. Unrecognised clauses bubble up as 400 errors rather
-  # than being silently dropped (which previously returned wrong rows).
-  @spec parse_where_clauses(binary()) ::
-          {:ok, [where_clause()]} | {:error, map()}
-  defp parse_where_clauses(str) do
-    str
-    |> String.split(~r/\s+AND\s+/i)
-    |> Enum.reduce_while({:ok, []}, fn clause, {:ok, acc} ->
-      case parse_single_where_clause(clause) do
-        {:ok, condition} -> {:cont, {:ok, [condition | acc]}}
-        {:error, _reason} = err -> {:halt, err}
-      end
-    end)
-    |> case do
-      {:ok, conditions} -> {:ok, Enum.reverse(conditions)}
-      {:error, _reason} = err -> err
-    end
-  end
-
-  # IN / NOT IN must be matched before binary operators because they don't
-  # contain any of {=, <, >, !} characters that the binary-op scanner looks
-  # for. Order: NOT IN before IN (NOT IN substring contains IN).
-  @not_in_pattern ~r/^(\w+)\s+NOT\s+IN\s*\((.*)\)\s*$/is
-  @in_pattern ~r/^(\w+)\s+IN\s*\((.*)\)\s*$/is
-
-  @spec parse_single_where_clause(binary()) ::
-          {:ok, where_clause()} | {:error, map()}
-  defp parse_single_where_clause(clause) do
-    trimmed = String.trim(clause)
-
-    cond do
-      match = Regex.run(@not_in_pattern, trimmed) ->
-        [_full, key, list_str] = match
-        {:ok, {:not_in, key, parse_in_values(list_str)}}
-
-      match = Regex.run(@in_pattern, trimmed) ->
-        [_full, key, list_str] = match
-        {:ok, {:in, key, parse_in_values(list_str)}}
-
-      true ->
-        parse_binary_where_clause(trimmed)
-    end
-  end
-
-  @spec parse_binary_where_clause(binary()) ::
-          {:ok, where_clause()} | {:error, map()}
-  defp parse_binary_where_clause(trimmed) do
-    # Multi-char operators must be tried before their single-char prefixes.
-    operators = [{">=", :gte}, {"<=", :lte}, {"!=", :ne}, {">", :gt}, {"<", :lt}, {"=", :eq}]
-
-    result =
-      Enum.find_value(operators, fn {op_str, op_atom} ->
-        case String.split(trimmed, op_str, parts: 2) do
-          [left, right] when left != trimmed ->
-            k = String.trim(left)
-            v = parse_where_value(String.trim(right))
-            {op_atom, k, v}
-
-          _no_match ->
-            nil
-        end
-      end)
-
-    case result do
-      nil ->
-        {:error, local_error("unsupported WHERE clause: #{trimmed}")}
-
-      condition ->
-        {:ok, condition}
-    end
-  end
-
-  @spec parse_in_values(binary()) :: [term()]
-  defp parse_in_values(str) do
-    str
-    |> split_top_level_commas()
-    |> Enum.map(&String.trim/1)
-    |> Enum.reject(&(&1 == ""))
-    |> Enum.map(&parse_where_value/1)
-  end
-
-  # A quoted literal is a string, full stop — exactly as in InfluxDB v3.
-  # Re-typing `'08338636'` as an integer would drop the leading zero and
-  # change the type, so `WHERE repcode = '08338636'` could never match a
-  # string tag (#12). Only bare literals are typed.
-  @spec parse_where_value(binary()) :: term()
-  defp parse_where_value(str) do
-    cond do
-      String.starts_with?(str, "'") and String.ends_with?(str, "'") ->
-        String.slice(str, 1..-2//1)
-
-      String.starts_with?(str, "\"") and String.ends_with?(str, "\"") ->
-        String.slice(str, 1..-2//1)
-
-      str == "true" ->
-        true
-
-      str == "false" ->
-        false
-
-      true ->
-        coerce_value(str)
-    end
-  end
-
-  # Type a bare literal: integer, then float, else leave it as a string.
-  @spec coerce_value(binary()) :: term()
-  defp coerce_value(str) do
-    case Integer.parse(str) do
-      {n, ""} ->
-        n
-
-      _no_int ->
-        case Float.parse(str) do
-          {f, ""} -> f
-          _no_parse -> str
-        end
-    end
-  end
-
-  @spec parse_order_by(binary()) :: {:time, :asc | :desc} | nil
-  defp parse_order_by(rest) do
-    case Regex.run(~r/(?i)ORDER\s+BY\s+time\s+(ASC|DESC)/s, rest) do
-      [_full_match, direction] ->
-        case String.upcase(direction) do
-          "ASC" -> {:time, :asc}
-          "DESC" -> {:time, :desc}
-          _other -> nil
-        end
-
-      _no_match ->
-        nil
-    end
-  end
-
-  @spec parse_limit(binary()) :: pos_integer() | nil
-  defp parse_limit(rest) do
-    case Regex.run(~r/(?i)LIMIT\s+(\d+)/s, rest) do
-      [_full_match, n_str] ->
-        case Integer.parse(n_str) do
-          {n, ""} when n > 0 -> n
-          _bad_n -> nil
-        end
-
-      _no_match ->
-        nil
-    end
-  end
-
-  @spec execute_query(:ets.table(), parsed_query(), binary()) ::
+  @spec execute_query(:ets.table(), SQLParser.parsed_query(), binary()) ::
           [map()] | {:error, term()}
   defp execute_query(table, %{measurement: m} = query, database) do
     if measurement_exists?(table, database, m) do
@@ -1978,7 +998,7 @@ defmodule InfluxElixir.Client.Local do
     end)
   end
 
-  @spec execute_distinct_query([point_map()], parsed_query()) :: [map()]
+  @spec execute_distinct_query([point_map()], SQLParser.parsed_query()) :: [map()]
   defp execute_distinct_query(points, query) do
     col = query.distinct_column
 
@@ -1998,7 +1018,7 @@ defmodule InfluxElixir.Client.Local do
     |> Enum.map(fn value -> %{col => value} end)
   end
 
-  @spec execute_aggregate_query([point_map()], parsed_query()) :: [map()]
+  @spec execute_aggregate_query([point_map()], SQLParser.parsed_query()) :: [map()]
   defp execute_aggregate_query(points, %{group_by_columns: cols} = query)
        when is_list(cols) and cols != [] do
     # GROUP BY <col, ...>: bucket points by the tuple of grouping-column
@@ -2040,7 +1060,7 @@ defmodule InfluxElixir.Client.Local do
 
   @spec aggregate_per_column_bucket(
           %{[term()] => [point_map()]},
-          [select_column()]
+          [SQLParser.select_column()]
         ) :: [map()]
   defp aggregate_per_column_bucket(buckets, columns) do
     Enum.map(buckets, fn {_key, bucket_points} ->
@@ -2064,7 +1084,7 @@ defmodule InfluxElixir.Client.Local do
   # Compute aggregates for each bucket and return result rows
   @spec aggregate_per_bucket(
           %{integer() => [point_map()]},
-          [select_column()]
+          [SQLParser.select_column()]
         ) :: [map()]
   defp aggregate_per_bucket(buckets, columns) do
     Enum.map(buckets, fn {bucket_ts, bucket_points} ->
@@ -2074,13 +1094,13 @@ defmodule InfluxElixir.Client.Local do
 
   # Compute aggregates over a single (un-bucketed) set of points. Used for
   # scalar aggregates (no GROUP BY DATE_BIN) — always yields exactly one row.
-  @spec aggregate_one_bucket([point_map()], [select_column()]) :: map()
+  @spec aggregate_one_bucket([point_map()], [SQLParser.select_column()]) :: map()
   defp aggregate_one_bucket(points, columns) do
     reduce_aggregate_columns(columns, points, nil)
   end
 
   @spec reduce_aggregate_columns(
-          [select_column()],
+          [SQLParser.select_column()],
           [point_map()],
           integer() | nil
         ) :: map()
@@ -2159,7 +1179,7 @@ defmodule InfluxElixir.Client.Local do
   end
 
   # Find the alias of the time_bucket column from select_columns
-  @spec find_time_bucket_alias([select_column()]) :: binary() | nil
+  @spec find_time_bucket_alias([SQLParser.select_column()]) :: binary() | nil
   defp find_time_bucket_alias(columns) do
     Enum.find_value(columns, fn
       {:time_bucket, alias_name} -> alias_name
@@ -2183,7 +1203,7 @@ defmodule InfluxElixir.Client.Local do
     Enum.sort_by(rows, &Map.get(&1, time_alias), {:desc, DateTime})
   end
 
-  @spec apply_where([point_map()], [where_clause()]) :: [point_map()]
+  @spec apply_where([point_map()], [SQLParser.where_clause()]) :: [point_map()]
   defp apply_where(points, []), do: points
 
   defp apply_where(points, conditions) do
@@ -2192,7 +1212,7 @@ defmodule InfluxElixir.Client.Local do
     end)
   end
 
-  @spec matches_condition?(point_map(), where_clause()) :: boolean()
+  @spec matches_condition?(point_map(), SQLParser.where_clause()) :: boolean()
   defp matches_condition?(point, {:in, "time", values}) do
     point_in_time_set?(point, values)
   end
@@ -2386,45 +1406,10 @@ defmodule InfluxElixir.Client.Local do
   end
 
   # ---------------------------------------------------------------------------
-  # Private — param substitution
-  # ---------------------------------------------------------------------------
-
-  @spec resolve_params(binary(), map()) :: binary()
-  defp resolve_params(sql, params) when map_size(params) == 0, do: sql
-
-  # One pass over the SQL, whole placeholders only: a sequential
-  # String.replace/3 per param rewrote `$a` inside `$ab` and could
-  # re-substitute inside an already-substituted value.
-  defp resolve_params(sql, params) do
-    lookup = Map.new(params, fn {key, value} -> {normalize_param_key(key), value} end)
-
-    Regex.replace(~r/\$\w+/, sql, fn placeholder ->
-      case Map.fetch(lookup, placeholder) do
-        {:ok, value} -> to_sql_literal(value)
-        :error -> placeholder
-      end
-    end)
-  end
-
-  @spec normalize_param_key(atom() | binary()) :: binary()
-  defp normalize_param_key(key) when is_atom(key), do: "$#{key}"
-  defp normalize_param_key("$" <> _rest = key), do: key
-  defp normalize_param_key(key) when is_binary(key), do: "$#{key}"
-
-  @spec to_sql_literal(term()) :: binary()
-  defp to_sql_literal(%Decimal{} = value), do: Decimal.to_string(value, :normal)
-  defp to_sql_literal(value) when is_binary(value), do: "'#{value}'"
-  defp to_sql_literal(value) when is_integer(value), do: Integer.to_string(value)
-  defp to_sql_literal(value) when is_float(value), do: Float.to_string(value)
-  defp to_sql_literal(true), do: "true"
-  defp to_sql_literal(false), do: "false"
-  defp to_sql_literal(value), do: inspect(value)
-
-  # ---------------------------------------------------------------------------
   # Private — utilities
   # ---------------------------------------------------------------------------
 
-  @spec delete_points(:ets.table(), binary(), binary(), [where_clause()]) ::
+  @spec delete_points(:ets.table(), binary(), binary(), [SQLParser.where_clause()]) ::
           non_neg_integer()
   defp delete_points(table, database, measurement, where) do
     key = {:points, database, measurement}
@@ -2454,11 +1439,6 @@ defmodule InfluxElixir.Client.Local do
         0
     end
   end
-
-  # Every parser rejection carries this prefix so a consumer reading
-  # "unsupported ..." knows the test double, not InfluxDB, refused the query.
-  @spec local_error(binary()) :: %{status: 400, body: binary()}
-  defp local_error(message), do: %{status: 400, body: "Client.Local: " <> message}
 
   @spec generate_id() :: binary()
   defp generate_id do
