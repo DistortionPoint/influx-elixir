@@ -13,6 +13,29 @@ defmodule InfluxElixir.Client.LocalTest do
   # Lifecycle
   # ---------------------------------------------------------------------------
 
+  describe "supports?/2" do
+    test "answers per profile, matching the capability table in the moduledoc" do
+      {:ok, core} = Local.start(profile: :v3_core)
+      {:ok, enterprise} = Local.start(profile: :v3_enterprise)
+      {:ok, v2} = Local.start(profile: :v2)
+      on_exit(fn -> Enum.each([core, enterprise, v2], &Local.stop/1) end)
+
+      assert Local.supports?(core, :query_sql)
+      refute Local.supports?(core, :query_flux)
+      refute Local.supports?(core, :create_token)
+
+      assert Local.supports?(enterprise, :create_token)
+      refute Local.supports?(enterprise, :create_bucket)
+
+      assert Local.supports?(v2, :query_flux)
+      assert Local.supports?(v2, :create_bucket)
+      refute Local.supports?(v2, :query_sql)
+
+      # An operation no profile knows is simply unsupported.
+      refute Local.supports?(core, :not_an_operation)
+    end
+  end
+
   describe "start/1 and stop/1" do
     test "creates and cleans up ETS table" do
       {:ok, conn} = Local.start()

@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- The testing guide's "Key Differences" still listed `first`/`last` as
+  supported aggregates and omitted `DISTINCT`, `GROUP BY <columns>`,
+  `COUNT(*)` and `$param` substitution; corrected to the current parser.
 - **README usage example could not work.** It placed `{InfluxElixir, ...}` in
   a supervision tree (the facade has no `child_spec/1`; the library is an OTP
   application configured via `config :influx_elixir, :connections`), put a

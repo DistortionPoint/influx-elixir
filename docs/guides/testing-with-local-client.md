@@ -455,6 +455,13 @@ silently producing wrong results via Elixir term ordering.
 
 - **No WAL flush delay**: Writes are immediately queryable (set `query_delay: 0`)
 - **In-memory only**: Data is lost when `stop/1` is called
-- **Simplified SQL parser**: Supports `SELECT *`, multi-column projection (with optional `AS alias`), `WHERE` with binary ops + `IN` / `NOT IN`, `ORDER BY time`, `LIMIT`, `DATE_BIN` + aggregate functions (`AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `first`, `last`) with optional `GROUP BY DATE_BIN`
+- **Simplified SQL parser**: Supports `SELECT *`, multi-column projection (with
+  optional `AS alias`), `SELECT DISTINCT col`, `WHERE` with binary ops + `IN` /
+  `NOT IN` (quoted literals are strings, bare literals are typed), `ORDER BY
+  time`, `LIMIT`, `$param` substitution, `DATE_BIN` + aggregate functions
+  (`AVG`, `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`, `first_value` /
+  `last_value` with an inner `ORDER BY`) with optional `GROUP BY DATE_BIN` or
+  `GROUP BY <columns>`. Anything else is rejected with a `Client.Local:`
+  prefixed 400 — see `InfluxElixir.Client.Local.SQLParser`.
 - **No authentication**: All operations succeed regardless of token
 - **ETS-based**: Each `start/1` creates an isolated ETS table
