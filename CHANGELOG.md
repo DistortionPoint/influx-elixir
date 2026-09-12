@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **README usage example could not work.** It placed `{InfluxElixir, ...}` in
+  a supervision tree (the facade has no `child_spec/1`; the library is an OTP
+  application configured via `config :influx_elixir, :connections`), put a
+  scheme in `host:` and used the nonexistent `default_database:` key, which
+  HTTP config validation now rejects at startup. Rewritten with a working
+  configuration, a write/query example, the v2 options and the shipped test
+  helper.
 - **`InfluxElixir.TestHelper` now ships in the package.** It was documented
   (CLAUDE.md, usage rules, the original design) as a helper for consuming
   applications' test suites, but lived under `test/support/`, which is only

@@ -2908,8 +2908,8 @@ defmodule InfluxElixir.Client.LocalTest do
 
   # ---------------------------------------------------------------------------
   # Regression coverage for bug reports filed by consuming applications.
-  # Each scenario reproduces a real downstream failure. See:
-  # /Users/bcatherall/development/dp_crypto_management/docs/bugs
+  # Each scenario reproduces a real downstream failure reported against this
+  # library (see the GitHub issues and CHANGELOG for the original reports).
   # ---------------------------------------------------------------------------
 
   describe "bug regression — write preserves provided timestamps" do
