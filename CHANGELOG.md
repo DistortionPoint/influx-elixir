@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` lost concurrent writes to the same database** (#15). Points
+  were stored as one list per measurement and every write read the list,
+  prepended and wrote it back, so parallel writers overwrote each other's
+  inserts while all reported `{:ok, :written}` (159 of 480 survived in the
+  report). The ETS layout is now one object per point, database, bucket and
+  token, so every mutation is a single atomic insert or delete. The same
+  change removes the quadratic copy on bulk writes: 20,000 lines took 63 s
+  and now take well under a second. Points scan in insertion order.
 - The testing guide's "Key Differences" still listed `first`/`last` as
   supported aggregates and omitted `DISTINCT`, `GROUP BY <columns>`,
   `COUNT(*)` and `$param` substitution; corrected to the current parser.

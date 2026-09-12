@@ -2935,6 +2935,70 @@ defmodule InfluxElixir.Client.LocalTest do
   # library (see the GitHub issues and CHANGELOG for the original reports).
   # ---------------------------------------------------------------------------
 
+  describe "bug regression — concurrent writes to one database (#15)" do
+    # Points were stored as one list per measurement and every write
+    # read-modify-wrote it, so parallel writers overwrote each other:
+    # 159 of 480 rows survived while every call returned {:ok, :written}.
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "shared_db")
+      {:ok, db: "shared_db"}
+    end
+
+    test "every one of 480 parallel writes is stored", %{conn: conn, db: db} do
+      writers = 8
+      per_writer = 60
+
+      tasks =
+        for w <- 1..writers do
+          Task.async(fn ->
+            for i <- 1..per_writer do
+              {:ok, :written} =
+                Local.write(conn, "prices,symbol=W#{w}X#{i} price=1.0", database: db)
+            end
+          end)
+        end
+
+      Enum.each(tasks, &Task.await(&1, 30_000))
+
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT symbol FROM prices", database: db)
+      assert length(rows) == writers * per_writer
+      assert rows |> Enum.map(& &1["symbol"]) |> Enum.uniq() |> length() == writers * per_writer
+    end
+
+    test "parallel create_database calls all register", %{conn: conn} do
+      names = for i <- 1..16, do: "par_db_#{i}"
+
+      names
+      |> Enum.map(&Task.async(fn -> Local.create_database(conn, &1) end))
+      |> Enum.each(&Task.await/1)
+
+      assert {:ok, dbs} = Local.list_databases(conn)
+      listed = Enum.map(dbs, & &1["name"])
+      assert Enum.all?(names, &(&1 in listed))
+    end
+
+    test "a DELETE running beside writes only removes what it matched", %{conn: conn, db: db} do
+      {:ok, ent} = Local.start(databases: [db], profile: :v3_enterprise)
+      on_exit(fn -> Local.stop(ent) end)
+
+      Local.write(ent, Enum.map_join(1..50, "\n", &"m,k=old v=#{&1}i"), database: db)
+
+      writer =
+        Task.async(fn ->
+          for i <- 1..50, do: Local.write(ent, "m,k=new v=#{i}i", database: db)
+        end)
+
+      {:ok, %{"rows_affected" => 50}} =
+        Local.execute_sql(ent, "DELETE FROM m WHERE k = 'old'", database: db)
+
+      Task.await(writer)
+
+      assert {:ok, rows} = Local.query_sql(ent, "SELECT k FROM m", database: db)
+      assert length(rows) == 50
+      assert Enum.all?(rows, &(&1["k"] == "new"))
+    end
+  end
+
   describe "bug regression — write preserves provided timestamps" do
     # Bug: ignores-write-timestamp. Writes of N points at fixed spacing
     # returned timestamps microseconds apart because store_point/3 substituted
