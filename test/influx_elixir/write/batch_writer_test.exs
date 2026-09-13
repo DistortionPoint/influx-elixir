@@ -317,16 +317,6 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
-  describe "handle_continue/2" do
-    test "schedules flush timer after init", %{conn: conn} do
-      pid = start_writer(conn, flush_interval_ms: 50)
-
-      # The timer should be set — verify by checking state
-      state = :sys.get_state(pid)
-      assert state.timer_ref != nil
-    end
-  end
-
   describe "terminate/2" do
     test "flushes buffered data on shutdown", %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 60_000)
@@ -347,28 +337,6 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert Process.alive?(pid)
       GenServer.stop(pid)
       refute Process.alive?(pid)
-    end
-  end
-
-  describe "struct-based state" do
-    test "state is a BatchWriter struct", %{conn: conn} do
-      pid = start_writer(conn)
-      state = :sys.get_state(pid)
-      assert %BatchWriter{} = state
-    end
-
-    test "struct fields match configured options", %{conn: conn} do
-      pid =
-        start_writer(conn,
-          batch_size: 42,
-          flush_interval_ms: 500,
-          max_retries: 5
-        )
-
-      state = :sys.get_state(pid)
-      assert state.batch_size == 42
-      assert state.flush_interval_ms == 500
-      assert state.max_retries == 5
     end
   end
 
@@ -426,12 +394,17 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   end
 
   describe "jitter" do
-    test "jitter_ms is applied to flush scheduling", %{conn: conn} do
-      pid = start_writer(conn, flush_interval_ms: 50, jitter_ms: 10)
+    test "the timer still flushes when jitter is configured", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 10, jitter_ms: 20)
+      :ok = BatchWriter.write(pid, "cpu value=3.0")
 
-      state = :sys.get_state(pid)
-      assert state.timer_ref != nil
-      assert state.jitter_ms == 10
+      wait_until(fn ->
+        {:ok, stats} = BatchWriter.stats(pid)
+        stats.total_writes >= 1
+      end)
+
+      assert {:ok, [%{"value" => 3.0}]} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
     end
   end
 

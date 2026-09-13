@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `BatchWriter` tests no longer inspect GenServer state to check that
+  configuration was stored; scheduling and jitter are asserted through the
+  observable flush instead.
 - **`Client.Local` split into three modules.** The 2,470-line module now owns
   storage, capability checks and query execution (1,450 lines); the SQL parser
   is `InfluxElixir.Client.Local.SQLParser` and the line-protocol parser is
