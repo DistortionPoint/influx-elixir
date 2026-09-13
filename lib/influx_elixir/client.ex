@@ -24,7 +24,8 @@ defmodule InfluxElixir.Client do
   - `init_connection/1` — converts raw keyword config into the
     implementation's native connection type. Called by
     `ConnectionSupervisor` during startup.
-    - `Client.HTTP` returns the keyword config as-is
+    - `Client.HTTP` returns the keyword config, defaulting `:database` to
+      the first of `:databases` when it is unset
     - `Client.Local` creates an ETS table and returns a conn map
 
   - `shutdown_connection/1` — cleans up resources when a connection

@@ -208,16 +208,24 @@ defmodule InfluxElixir.Client.HTTP do
 
   @spec reject_flight_params(keyword()) :: :ok | {:error, :params_unsupported_over_flight}
   defp reject_flight_params(opts) do
-    case Keyword.get(opts, :params, %{}) do
-      params when map_size(params) == 0 -> :ok
-      _params -> {:error, :params_unsupported_over_flight}
+    if map_size(query_params(opts)) == 0 do
+      :ok
+    else
+      {:error, :params_unsupported_over_flight}
     end
   end
+
+  # `params:` may be a map or a keyword list. Jason cannot encode the tuples
+  # of a keyword list, so a keyword list used to raise here while
+  # `Client.Local` accepted it — a query could pass tests and crash in
+  # production. Both shapes are accepted by both clients.
+  @spec query_params(keyword()) :: map()
+  defp query_params(opts), do: opts |> Keyword.get(:params, %{}) |> Map.new()
 
   @spec http_query_sql(keyword(), binary(), keyword()) :: InfluxElixir.Client.query_result()
   defp http_query_sql(connection, sql, opts) do
     with {:ok, database} <- resolve_database(opts, connection) do
-      params = Keyword.get(opts, :params, %{})
+      params = query_params(opts)
       format = Keyword.get(opts, :format, :json)
 
       body =
@@ -247,7 +255,7 @@ defmodule InfluxElixir.Client.HTTP do
   def query_sql_stream(connection, sql, opts \\ []) do
     case resolve_database(opts, connection) do
       {:ok, database} ->
-        params = Keyword.get(opts, :params, %{})
+        params = query_params(opts)
 
         body =
           Jason.encode!(%{

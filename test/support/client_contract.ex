@@ -1003,6 +1003,28 @@ defmodule InfluxElixir.ClientContract do
           assert hd(rows)["value"] == 1
         end
 
+        test "accepts params as a keyword list as well as a map", ctx do
+          unquote(client).write(
+            ctx.conn,
+            "contract_params_kw,host=alpha value=1i\ncontract_params_kw,host=beta value=2i",
+            database: ctx.database
+          )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          # Jason cannot encode tuples, so a keyword list used to raise in
+          # Client.HTTP while Client.Local accepted it.
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT * FROM contract_params_kw WHERE host = $host",
+              database: ctx.database,
+              params: [host: "beta"]
+            )
+
+          assert [%{"host" => "beta", "value" => 2}] = rows
+        end
+
         test "filters by integer parameter", ctx do
           unquote(client).write(
             ctx.conn,

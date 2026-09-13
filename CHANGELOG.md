@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **The shipped usage rules made false claims.** They told consumers to
+  start a Finch pool themselves (the supervisor starts one per connection),
+  that booleans encode as `t`/`f` (they are `true`/`false`), to pass params as
+  a keyword list (a map), and that write errors carry `:retryable` /
+  `:non_retryable` atoms (no such atoms exist; errors are `%{status, body}` or
+  `{:connection_error, reason}`). All three rule files rewritten against the
+  current code.
+- **`Client.HTTP` raised on keyword-list `params:`.** Jason cannot encode the
+  tuples, so `params: [tag: "v"]` crashed the HTTP client while `Client.Local`
+  accepted it — exactly the shape the old usage rules recommended. Both clients
+  now accept a map or a keyword list; the contract suite proves it against the
+  real engine.
 - **`Client.Local` lost concurrent writes to the same database** (#15). Points
   were stored as one list per measurement and every write read the list,
   prepended and wrote it back, so parallel writers overwrote each other's
