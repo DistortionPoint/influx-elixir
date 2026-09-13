@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- `CLAUDE.md` described a `/docs` layout (`architecture/`, `api/`,
+  `development/`, per-directory READMEs, a design template) that did not exist.
+  The READMEs and template now exist, `docs/design/README.md` indexes every
+  design document and carries the real-engine Docker one-liners, and
+  `CLAUDE.md` describes the actual layout.
 - **The shipped usage rules made false claims.** They told consumers to
   start a Finch pool themselves (the supervisor starts one per connection),
   that booleans encode as `t`/`f` (they are `true`/`false`), to pass params as

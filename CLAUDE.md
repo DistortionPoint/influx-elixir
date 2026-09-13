@@ -166,18 +166,18 @@ No legacy deps. No hackney, poolboy, or HTTPoison.
 
 ## Documentation Standards
 
-The project maintains comprehensive documentation in the `/docs` directory. Each subdirectory contains a README.md with specific guidelines.
+The project maintains its documentation in the `/docs` directory. Each subdirectory contains a README.md with specific guidelines and an index.
 
 ### Documentation Structure
-- **`/docs/architecture/`** - System design, technical specs, decision records
-- **`/docs/design/`** - Collaborative design documents and implementation planning
-- **`/docs/api/`** - API reference, endpoints, integration guides
-- **`/docs/development/`** - Setup instructions, coding standards, testing
+- **`/docs/design/`** - Dated design documents (one per change that needed a decision) with the verification that closed it; `README.md` indexes them and holds the Docker one-liners for verifying against real InfluxDB
+- **`/docs/guides/`** - Consumer-facing guides published as HexDocs extras (listed in `mix.exs`)
+- API reference is the module documentation (`@moduledoc` / `@doc`), published by `mix docs`; architecture decisions live in the design documents
 
 ### Design Document Format
 Design documents follow the naming convention: `YYYY-MM-DD_design-topic-name.md`
 - Use the template at `/docs/design/templates/design-document-template.md`
-- Include matching code samples in `YYYY-MM-DD_design-topic-name/` directory
+- Add the document to the index in `/docs/design/README.md`
+- Verify any claim about server behaviour against a real InfluxDB before writing it down
 - Follow the collaborative design workflow (initiation → design → planning → review → implementation)
 
 ### Documentation Guidelines
