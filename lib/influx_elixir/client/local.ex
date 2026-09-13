@@ -1134,13 +1134,17 @@ defmodule InfluxElixir.Client.Local do
         ) :: term() | nil
   defp compute_ordered_aggregate(_agg, _field, _ordering, []), do: nil
 
+  # A single pass for the extreme element; sorting the whole bucket to take
+  # its head was O(n log n) per aggregate column. Ties resolve to the first
+  # point in scan (insertion) order, as the stable sort did.
   defp compute_ordered_aggregate(agg, field, ordering, points) do
-    sorter = if agg == :first, do: :asc, else: :desc
+    picked =
+      case agg do
+        :first -> Enum.min_by(points, &ordering_value(&1, ordering))
+        :last -> Enum.max_by(points, &ordering_value(&1, ordering))
+      end
 
-    points
-    |> Enum.sort_by(&ordering_value(&1, ordering), sorter)
-    |> hd()
-    |> then(fn p -> Map.get(p.fields, field) || Map.get(p.tags, field) end)
+    Map.get(picked.fields, field) || Map.get(picked.tags, field)
   end
 
   # Resolve the ordering column value from a point.
