@@ -80,11 +80,22 @@ defmodule InfluxElixir.Client.Local do
     * `WHERE time <op> '<datetime>'` accepts ISO-8601 datetimes
       (`'2026-03-31T12:00:00Z'`), bare ISO dates (`'2026-03-31'`,
       interpreted as midnight UTC), and integer-as-string nanoseconds
-    * `ORDER BY time ASC|DESC`
+    * `SELECT DISTINCT col[, col ...] FROM measurement` (sorted combinations)
+    * `ORDER BY <column> [ASC|DESC]` — `time` or any output column/alias
     * `LIMIT N`
     * `$param` placeholders via `params: %{"$name" => value}` in opts
     * `DATE_BIN(INTERVAL 'N unit', time)` time bucketing
-    * Aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX` (one argument)
+    * Aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `STDDEV` /
+      `STDDEV_SAMP` (sample), `STDDEV_POP`, `VAR` / `VAR_SAMP` (sample),
+      `VAR_POP`. The argument may be an arithmetic expression over fields
+      and numeric literals (`SUM(value * value)`, `AVG(bid + ask)`); two
+      integer operands divide as integers (`3 / 2 = 1`), as in DataFusion.
+      Division by zero is null in the double, where InfluxDB returns IEEE
+      infinity for floats (serialised as JSON `null` but counted by
+      `COUNT`) and fails the query for integers. A sample
+      statistic over one value is null.
+    * Selector functions: `selector_first|last|min|max(field, time)['value']`
+      and `['time']`
     * Ordered aggregates: `first_value(field ORDER BY col [ASC|DESC])` and
       `last_value(field ORDER BY col [ASC|DESC])` — the InfluxDB v3 SQL
       (DataFusion) spelling. The `ORDER BY` is required: without it the real
@@ -100,10 +111,16 @@ defmodule InfluxElixir.Client.Local do
       `SELECT` list alongside aggregate functions.
     * Interval units: `seconds`, `minutes`, `hours`, `days`
 
+  A null column is omitted from the row rather than present as `nil`,
+  exactly as InfluxDB 3's JSON and JSONL responses do (`COUNT` is `0`, never
+  null).
+
   Anything outside this subset is rejected with
   `{:error, %{status: 400, body: "Client.Local: ..."}}`. The `Client.Local:`
   prefix marks the rejection as a limitation of the test double rather than
-  of InfluxDB — the real engine may well accept the query.
+  of InfluxDB — the real engine may well accept the query. `check_sql/1`
+  answers the same question without executing, so a test can skip with a
+  reason and the query can be covered in the integration tier instead.
 
   ## SQL Param Types
 
@@ -269,6 +286,30 @@ defmodule InfluxElixir.Client.Local do
   end
 
   @doc """
+  Reports whether the SQL subset can express `sql`, without executing it.
+
+  Returns `:ok` or the same `{:error, %{status: 400, body: "Client.Local: ..."}}`
+  that `query_sql/3` would return. Use it to skip a test *with a reason*
+  instead of tagging it excluded:
+
+      case InfluxElixir.Client.Local.check_sql(sql) do
+        :ok -> run_against_local(sql)
+        {:error, %{body: why}} -> ExUnit.Callbacks.on_exit(fn -> :ok end); flunk(why)
+      end
+
+  Queries outside the subset (CTEs, joins, window functions, `median`, ...)
+  belong in an integration test against a real InfluxDB; see the testing
+  guide.
+  """
+  @spec check_sql(binary()) :: :ok | {:error, %{status: 400, body: binary()}}
+  def check_sql(sql) do
+    case SQLParser.parse_select(sql) do
+      {:ok, _query} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc """
   Returns `true` if the given operation is supported by the connection's profile.
   """
   @spec supports?(conn(), atom()) :: boolean()
@@ -380,7 +421,7 @@ defmodule InfluxElixir.Client.Local do
 
   Delegates to `query_sql/3` then wraps the list in a stream.
 
-  Mirrors the error semantics of `InfluxElixir.Client.HTTP.query_sql_stream/3`:
+  Mirrors the error semantics of the HTTP client's streaming query:
   because the return type is an `Enumerable.t()`, errors cannot be returned as a
   tuple. Instead a failure — an underlying query error or an operation the
   connection's profile does not support — is raised as an
@@ -930,7 +971,7 @@ defmodule InfluxElixir.Client.Local do
       filtered = apply_where(points, query.where)
 
       cond do
-        query.distinct_column ->
+        query.distinct_columns ->
           execute_distinct_query(filtered, query)
 
         query.select_columns ->
@@ -968,29 +1009,40 @@ defmodule InfluxElixir.Client.Local do
   @spec project_row(map(), [{binary(), binary()}]) :: map()
   defp project_row(row, projection) do
     Enum.reduce(projection, %{}, fn {source, output}, acc ->
-      Map.put(acc, output, Map.get(row, source))
+      put_column(acc, output, Map.get(row, source))
     end)
   end
 
+  # InfluxDB 3 omits a null column from the row entirely (verified on both
+  # the JSON and JSONL formats), so a nil never becomes a key here.
+  @spec put_column(map(), binary(), term()) :: map()
+  defp put_column(row, _key, nil), do: row
+  defp put_column(row, key, value), do: Map.put(row, key, value)
+
+  # SELECT DISTINCT a[, b ...]: one row per distinct combination, sorted.
+  # A row whose columns are all null is dropped, as the real engine does.
   @spec execute_distinct_query([point_map()], SQLParser.parsed_query()) :: [map()]
   defp execute_distinct_query(points, query) do
-    col = query.distinct_column
+    columns = query.distinct_columns
 
     points
-    |> Enum.map(fn point ->
-      Map.get(point.fields, col) || Map.get(point.tags, col)
-    end)
-    |> Enum.reject(&is_nil/1)
+    |> Enum.map(fn point -> Enum.map(columns, &point_value(point, &1)) end)
+    |> Enum.reject(&Enum.all?(&1, fn value -> is_nil(value) end))
     |> Enum.uniq()
     |> Enum.sort()
-    |> then(fn values ->
-      case query.limit do
-        nil -> values
-        n -> Enum.take(values, n)
-      end
+    |> apply_limit(query.limit)
+    |> Enum.map(fn values ->
+      columns
+      |> Enum.zip(values)
+      |> Enum.reduce(%{}, fn {column, value}, row -> put_column(row, column, value) end)
     end)
-    |> Enum.map(fn value -> %{col => value} end)
   end
+
+  @spec point_value(point_map(), binary()) :: term()
+  defp point_value(point, "time"), do: nanoseconds_to_datetime(point.timestamp)
+
+  defp point_value(point, column),
+    do: Map.get(point.tags, column) || Map.get(point.fields, column)
 
   @spec execute_aggregate_query([point_map()], SQLParser.parsed_query()) :: [map()]
   defp execute_aggregate_query(points, %{group_by_columns: cols} = query)
@@ -1078,51 +1130,117 @@ defmodule InfluxElixir.Client.Local do
           [point_map()],
           integer() | nil
         ) :: map()
+  # Null results (an aggregate over no values, a sample statistic of one
+  # value, a missing grouping value) are omitted from the row, as the real
+  # engine does; COUNT is 0, never null.
   defp reduce_aggregate_columns(columns, points, bucket_ts) do
     Enum.reduce(columns, %{}, fn
       {:time_bucket, alias_name}, row ->
-        Map.put(row, alias_name, nanoseconds_to_datetime(bucket_ts))
+        put_column(row, alias_name, nanoseconds_to_datetime(bucket_ts))
 
       {:grouping_column, source, alias_name}, row ->
         # All points in a column-grouped bucket share the same value for
         # this column; sample from the first point.
         value =
           case points do
-            [first | _rest] ->
-              Map.get(first.tags, source) || Map.get(first.fields, source)
-
-            [] ->
-              nil
+            [first | _rest] -> point_value(first, source)
+            [] -> nil
           end
 
-        Map.put(row, alias_name, value)
+        put_column(row, alias_name, value)
 
-      {:aggregate, agg, field, alias_name}, row ->
-        values =
-          points
-          |> Enum.map(fn p -> Map.get(p.fields, field) end)
-          |> Enum.reject(&is_nil/1)
-
-        Map.put(row, alias_name, compute_aggregate(agg, values))
+      {:aggregate, agg, expr, alias_name}, row ->
+        values = points |> Enum.map(&eval_expr(expr, &1)) |> Enum.reject(&is_nil/1)
+        put_column(row, alias_name, compute_aggregate(agg, values))
 
       {:count_star, alias_name}, row ->
         # COUNT(*) — every matching row counts, regardless of field nullity.
-        Map.put(row, alias_name, length(points))
+        put_column(row, alias_name, length(points))
 
       {:ordered_aggregate, agg, field, ordering, alias_name}, row ->
-        value = compute_ordered_aggregate(agg, field, ordering, points)
-        Map.put(row, alias_name, value)
+        put_column(row, alias_name, compute_ordered_aggregate(agg, field, ordering, points))
+
+      {:selector, kind, field, ordering, access, alias_name}, row ->
+        put_column(row, alias_name, compute_selector(kind, field, ordering, access, points))
     end)
   end
 
-  @spec compute_aggregate(atom(), [number()]) :: number() | nil
-  defp compute_aggregate(:count, []), do: 0
+  # Evaluates an aggregate argument for one point. A missing field or a
+  # non-numeric operand makes the value null, which the aggregate skips.
+  @spec eval_expr(SQLParser.expr(), point_map()) :: number() | nil
+  defp eval_expr({:field, name}, point), do: Map.get(point.fields, name)
+  defp eval_expr({:lit, value}, _point), do: value
+
+  defp eval_expr({:op, op, left, right}, point) do
+    with l when is_number(l) <- eval_expr(left, point),
+         r when is_number(r) <- eval_expr(right, point) do
+      arithmetic(op, l, r)
+    else
+      _non_number -> nil
+    end
+  end
+
+  @spec arithmetic(:+ | :- | :* | :/, number(), number()) :: number() | nil
+  defp arithmetic(:+, l, r), do: l + r
+  defp arithmetic(:-, l, r), do: l - r
+  defp arithmetic(:*, l, r), do: l * r
+  # DataFusion divides two integers as integers (3 / 2 = 1), so the double
+  # must not promote to float. Division by zero is null here; the real
+  # engine's behaviour differs and is documented in the moduledoc.
+  defp arithmetic(:/, _l, 0), do: nil
+  defp arithmetic(:/, _l, +0.0), do: nil
+  defp arithmetic(:/, l, r) when is_integer(l) and is_integer(r), do: div(l, r)
+  defp arithmetic(:/, l, r), do: l / r
+
+  @spec compute_aggregate(SQLParser.aggregate(), [number()]) :: number() | nil
+  defp compute_aggregate(:count, vals), do: length(vals)
   defp compute_aggregate(_agg, []), do: nil
   defp compute_aggregate(:avg, vals), do: Enum.sum(vals) / length(vals)
   defp compute_aggregate(:sum, vals), do: Enum.sum(vals)
-  defp compute_aggregate(:count, vals), do: length(vals)
   defp compute_aggregate(:min, vals), do: Enum.min(vals)
   defp compute_aggregate(:max, vals), do: Enum.max(vals)
+  # Sample forms need at least two values, exactly as the real engine
+  # (STDDEV of one row is null); population forms are defined for one.
+  defp compute_aggregate(:var, [_one]), do: nil
+  defp compute_aggregate(:stddev, [_one]), do: nil
+  defp compute_aggregate(:var, vals), do: sum_of_squares(vals) / (length(vals) - 1)
+  defp compute_aggregate(:stddev, vals), do: :math.sqrt(compute_aggregate(:var, vals))
+  defp compute_aggregate(:var_pop, vals), do: sum_of_squares(vals) / length(vals)
+  defp compute_aggregate(:stddev_pop, vals), do: :math.sqrt(compute_aggregate(:var_pop, vals))
+
+  @spec sum_of_squares([number()]) :: float()
+  defp sum_of_squares(vals) do
+    mean = Enum.sum(vals) / length(vals)
+    Enum.reduce(vals, 0.0, fn v, acc -> acc + (v - mean) * (v - mean) end)
+  end
+
+  # selector_first/last pick by the ordering column, selector_min/max by the
+  # field itself; `['value']` returns the field, `['time']` the row's time.
+  @spec compute_selector(
+          :first | :last | :min | :max,
+          binary(),
+          binary(),
+          :value | :time,
+          [point_map()]
+        ) :: term() | nil
+  defp compute_selector(kind, field, ordering, access, points) do
+    candidates = Enum.reject(points, &is_nil(Map.get(&1.fields, field)))
+
+    picked =
+      case {kind, candidates} do
+        {_kind, []} -> nil
+        {:first, pts} -> Enum.min_by(pts, &ordering_value(&1, ordering))
+        {:last, pts} -> Enum.max_by(pts, &ordering_value(&1, ordering))
+        {:min, pts} -> Enum.min_by(pts, &Map.get(&1.fields, field))
+        {:max, pts} -> Enum.max_by(pts, &Map.get(&1.fields, field))
+      end
+
+    case {picked, access} do
+      {nil, _access} -> nil
+      {point, :value} -> Map.get(point.fields, field)
+      {point, :time} -> nanoseconds_to_datetime(point.timestamp)
+    end
+  end
 
   # Ordered aggregates: return the field value from the point with
   # the min (first) or max (last) ordering column value.
@@ -1165,21 +1283,25 @@ defmodule InfluxElixir.Client.Local do
     end)
   end
 
-  # Order aggregate result rows by the time bucket column
-  @spec apply_order_by_rows([map()], {:time, :asc | :desc} | nil, binary() | nil) ::
-          [map()]
+  # Order aggregate result rows by any output column. `ORDER BY time` on a
+  # DATE_BIN query refers to the bucket, whatever its alias.
+  @spec apply_order_by_rows([map()], SQLParser.order_by(), binary() | nil) :: [map()]
   defp apply_order_by_rows(rows, nil, _time_alias), do: rows
-  defp apply_order_by_rows(rows, _order, nil), do: rows
 
-  # Bucket timestamps are DateTimes; structural term order would sort them
-  # by calendar/day/hour, so the DateTime comparator is required.
-  defp apply_order_by_rows(rows, {:time, :asc}, time_alias) do
-    Enum.sort_by(rows, &Map.get(&1, time_alias), {:asc, DateTime})
+  defp apply_order_by_rows(rows, {column, direction}, time_alias) do
+    key = if column == "time" and time_alias, do: time_alias, else: column
+    Enum.sort_by(rows, &Map.get(&1, key), sorter(direction))
   end
 
-  defp apply_order_by_rows(rows, {:time, :desc}, time_alias) do
-    Enum.sort_by(rows, &Map.get(&1, time_alias), {:desc, DateTime})
-  end
+  # DateTime structs must be compared chronologically; everything else uses
+  # term order (nil, an omitted column, sorts first).
+  @spec value_order(term(), term()) :: boolean()
+  defp value_order(%DateTime{} = a, %DateTime{} = b), do: DateTime.compare(a, b) != :gt
+  defp value_order(a, b), do: a <= b
+
+  @spec sorter(:asc | :desc) :: (term(), term() -> boolean())
+  defp sorter(:asc), do: &value_order/2
+  defp sorter(:desc), do: fn a, b -> value_order(b, a) end
 
   @spec apply_where([point_map()], [SQLParser.where_clause()]) :: [point_map()]
   defp apply_where(points, []), do: points
@@ -1292,15 +1414,17 @@ defmodule InfluxElixir.Client.Local do
   defp compare(actual, :gte, value), do: actual >= value
   defp compare(actual, :lte, value), do: actual <= value
 
-  @spec apply_order_by([point_map()], {:time, :asc | :desc} | nil) :: [point_map()]
+  # ORDER BY any column on raw rows: `time` sorts by timestamp, anything
+  # else by the tag/field value (nil first, as the real engine sorts nulls).
+  @spec apply_order_by([point_map()], SQLParser.order_by()) :: [point_map()]
   defp apply_order_by(points, nil), do: points
 
-  defp apply_order_by(points, {:time, :asc}) do
-    Enum.sort_by(points, & &1.timestamp)
+  defp apply_order_by(points, {"time", direction}) do
+    Enum.sort_by(points, & &1.timestamp, direction)
   end
 
-  defp apply_order_by(points, {:time, :desc}) do
-    Enum.sort_by(points, & &1.timestamp, :desc)
+  defp apply_order_by(points, {column, direction}) do
+    Enum.sort_by(points, &point_value(&1, column), sorter(direction))
   end
 
   @spec apply_limit([point_map()], pos_integer() | nil) :: [point_map()]

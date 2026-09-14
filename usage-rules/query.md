@@ -13,7 +13,10 @@
 - `query_flux/2,3` — v2 Flux queries; rows are long format (`_field` / `_value` per field)
 
 ## Results
-- Rows are maps with string keys; `time` (and Flux `_time`) is a `DateTime` with microsecond precision on every client and transport — compare with `DateTime.compare/2` or a six-digit sigil
+- Rows are maps with string keys; every timestamp column — `time`, Flux `_time`, a `DATE_BIN(...) AS bucket` alias, `selector_*(...)['time']`, `MAX(time)` — is a `DateTime` with microsecond precision on every client and transport; compare with `DateTime.compare/2` or a six-digit sigil
+- A null column is absent from the row, not present as `nil` (`COUNT` is `0`, never null); assert with `refute Map.has_key?(row, "col")`
+- `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `STDDEV[_SAMP|_POP]`, `VAR[_SAMP|_POP]` accept field arithmetic (`SUM(price * volume)`); `VARIANCE` does not exist in v3 SQL
+- Selectors: `selector_first|last|min|max(field, time)['value' | 'time'] AS alias`; the InfluxQL `FIRST()`/`LAST()` are not v3 SQL
 - Default response format is JSON; `:jsonl`, `:csv` and `:parquet` (raw binary) are also supported
 
 ## Arrow Flight

@@ -27,6 +27,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-11 | [`http-pool-timeout`](2026-09-11_http-pool-timeout.md) | Finch `pool_timeout` and checkout-timeout error mapping (#14) |
 | 2026-09-12 | [`local-parser-extraction`](2026-09-12_local-parser-extraction.md) | `SQLParser` and `LineProtocolParser` split out of `Client.Local` |
 | 2026-09-12 | [`local-atomic-ets-layout`](2026-09-12_local-atomic-ets-layout.md) | Per-key ETS layout: no lost concurrent writes, linear bulk writes (#15) |
+| 2026-09-14 | [`local-sql-stats-selectors-distinct`](2026-09-14_local-sql-stats-selectors-distinct.md) | `STDDEV`/`VAR` family, field arithmetic, selectors, multi-column `DISTINCT`, null omission, `check_sql/1`, HTTP timestamp typing (#16, #17) |
 
 ## Verifying against a real engine
 

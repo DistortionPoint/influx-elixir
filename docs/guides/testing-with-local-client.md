@@ -277,7 +277,46 @@ test "hourly average temperature", %{conn: conn} do
 end
 ```
 
-Supported aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX` (one argument).
+Supported aggregate functions: `AVG`, `SUM`, `COUNT`, `COUNT(*)`, `MIN`,
+`MAX`, `STDDEV` / `STDDEV_SAMP` (sample), `STDDEV_POP`, `VAR` / `VAR_SAMP`
+(sample) and `VAR_POP`. The argument may be an arithmetic expression over
+fields and numeric literals, evaluated per row before aggregation:
+
+```elixir
+sql = """
+SELECT
+  STDDEV(price) AS volatility,
+  SUM(price * volume) AS notional,
+  AVG(bid + ask) AS mid
+FROM "trades"
+"""
+```
+
+Two integer operands divide as integers (`3 / 2 = 1`), as in DataFusion.
+`VARIANCE` is not a DataFusion function and is rejected, as it is by the
+real engine.
+
+Selector functions return the value, or the timestamp, of the row a
+selector picks — `selector_first` / `selector_last` by time,
+`selector_min` / `selector_max` by the field. Either accessor works:
+
+```elixir
+sql = """
+SELECT
+  DATE_BIN(INTERVAL '1 minute', time) AS bucket,
+  selector_first(price, time)['value'] AS open,
+  selector_max(price, time)['value']   AS high,
+  selector_min(price, time)['value']   AS low,
+  selector_last(price, time)['value']  AS close,
+  selector_max(price, time)['time']    AS high_at
+FROM "trades"
+GROUP BY DATE_BIN(INTERVAL '1 minute', time)
+ORDER BY bucket DESC
+"""
+```
+
+`ORDER BY` accepts `time` or any output column or alias (`bucket`,
+`volatility`), ascending or descending.
 Ordered aggregates use the InfluxDB v3 SQL (DataFusion) spelling:
 `first_value(field ORDER BY col [ASC|DESC])` and
 `last_value(field ORDER BY col [ASC|DESC])` — for OHLCV candles and
@@ -320,8 +359,12 @@ WHERE account_id = 'abc'
 {:ok, [%{"average_balance" => avg}]} = Local.query_sql(conn, sql, database: "test_db")
 ```
 
-`COUNT` over zero matching rows returns `0`; other aggregates return `nil`,
-matching real InfluxDB SQL semantics.
+`COUNT` over zero matching rows returns `0`. Every other aggregate is null
+over zero rows — and so is a sample statistic (`STDDEV`, `VAR`) over one
+row — and a null column is **absent from the row**, not present as `nil`,
+exactly as InfluxDB 3's JSON responses omit null columns. Assert with
+`refute Map.has_key?(row, "avg_usage")`, not `row["avg_usage"] == nil`
+(the latter passes for both shapes and proves nothing).
 
 ## GROUP BY Tag/Field Columns
 
@@ -451,17 +494,102 @@ datetimes, and bare ISO dates (interpreted as midnight UTC):
 Unparseable date strings filter out all rows (fail-closed) instead of
 silently producing wrong results via Elixir term ordering.
 
+## Checking a Query Before Running It
+
+`InfluxElixir.Client.Local.check_sql/1` parses a query without executing it
+and returns `:ok` or the same `{:error, %{status: 400, body: "Client.Local:
+..."}}` that `query_sql/3` would. Use it to fail a test *with the reason*
+when a query is outside the double's subset, instead of tagging the test
+excluded and forgetting why:
+
+```elixir
+test "median latency", %{conn: conn} do
+  sql = ~s|SELECT median(latency) AS p50 FROM "requests"|
+
+  case Local.check_sql(sql) do
+    :ok -> assert {:ok, [%{"p50" => _}]} = Local.query_sql(conn, sql, database: "test_db")
+    {:error, %{body: why}} -> flunk("cover this in the integration tier: #{why}")
+  end
+end
+```
+
+Queries the double cannot express (CTEs, joins, window functions, `median`,
+`percentile_cont`, ...) belong in the integration tier below.
+
+## Running Against a Real InfluxDB
+
+The double proves the *shape* of your code; only a real engine proves the
+query. Keep a second, tagged test tier that runs the same test bodies against
+InfluxDB via `InfluxElixir.Client.HTTP`, and skip it when no server is
+reachable:
+
+```elixir
+defmodule MyApp.Integration.CandlesTest do
+  use ExUnit.Case, async: false
+  @moduletag :integration
+
+  alias InfluxElixir.Client.HTTP
+
+  setup_all do
+    conn = [
+      host: System.get_env("INFLUX_V3_CORE_HOST", "localhost"),
+      port: String.to_integer(System.get_env("INFLUX_V3_CORE_PORT", "8181")),
+      token: System.get_env("INFLUX_V3_CORE_TOKEN", "")
+    ]
+
+    case HTTP.health(conn) do
+      {:ok, _status} -> {:ok, conn: conn}
+      {:error, _down} -> {:ok, skip: true, conn: conn}
+    end
+  end
+
+  setup ctx do
+    if ctx[:skip], do: flunk("InfluxDB 3 Core not reachable on #{ctx.conn[:host]}")
+    db = "candles_#{System.unique_integer([:positive])}"
+    :ok = HTTP.create_database(ctx.conn, db)
+    on_exit(fn -> HTTP.delete_database(ctx.conn, db) end)
+    # Real servers ingest asynchronously: wait before querying a fresh write.
+    {:ok, database: db, query_delay: 500}
+  end
+end
+```
+
+Exclude the tag by default in `test/test_helper.exs`
+(`ExUnit.start(exclude: [:integration])`) and include it when a server is up:
+
+```bash
+# InfluxDB 3 Core on 8181, no auth, data in memory
+docker run -d --rm --name influx3 -p 8181:8181 influxdb:3-core \
+  influxdb3 serve --node-id node0 --object-store memory --without-auth
+
+mix test --include integration
+docker stop influx3
+```
+
+This library's own contract suite is that second tier:
+`test/integration/contract_v3_core_test.exs` runs the same assertions as
+`test/influx_elixir/client/contract_local_v3_core_test.exs` against the
+server, and reads `INFLUX_V3_CORE_HOST` / `INFLUX_V3_CORE_PORT` (defaults
+`localhost` / `8181`); the v2 suite reads `INFLUX_V2_HOST`, `INFLUX_V2_PORT`,
+`INFLUX_V2_TOKEN`, `INFLUX_V2_ORG` and `INFLUX_V2_BUCKET`. Every statement
+in this guide about what the real engine returns was recorded that way.
+
 ## Key Differences from Real InfluxDB
 
 - **No WAL flush delay**: Writes are immediately queryable (set `query_delay: 0`)
 - **In-memory only**: Data is lost when `stop/1` is called
 - **Simplified SQL parser**: Supports `SELECT *`, multi-column projection (with
-  optional `AS alias`), `SELECT DISTINCT col`, `WHERE` with binary ops + `IN` /
-  `NOT IN` (quoted literals are strings, bare literals are typed), `ORDER BY
-  time`, `LIMIT`, `$param` substitution, `DATE_BIN` + aggregate functions
-  (`AVG`, `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`, `first_value` /
-  `last_value` with an inner `ORDER BY`) with optional `GROUP BY DATE_BIN` or
-  `GROUP BY <columns>`. Anything else is rejected with a `Client.Local:`
-  prefixed 400 — see `InfluxElixir.Client.Local.SQLParser`.
+  optional `AS alias`), `SELECT DISTINCT col[, col ...]`, `WHERE` with binary
+  ops + `IN` / `NOT IN` (quoted literals are strings, bare literals are typed),
+  `ORDER BY <column>`, `LIMIT`, `$param` substitution, `DATE_BIN` + aggregate
+  functions (`AVG`, `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`,
+  `STDDEV[_SAMP|_POP]`, `VAR[_SAMP|_POP]` over field arithmetic,
+  `selector_first|last|min|max`, `first_value` / `last_value` with an inner
+  `ORDER BY`) with optional `GROUP BY DATE_BIN` or `GROUP BY <columns>`.
+  Anything else is rejected with a `Client.Local:` prefixed 400 — see
+  `InfluxElixir.Client.Local.SQLParser` and `check_sql/1` above.
+- **Division by zero**: null in the double. InfluxDB returns IEEE infinity
+  for a float divided by zero (serialised as JSON `null`, but counted by
+  `COUNT`) and fails the query for an integer divided by zero.
 - **No authentication**: All operations succeed regardless of token
 - **ETS-based**: Each `start/1` creates an isolated ETS table

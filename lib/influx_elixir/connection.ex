@@ -120,7 +120,7 @@ defmodule InfluxElixir.Connection do
   Returns the Finch pool name for a given connection name.
 
   This is a convenience wrapper around
-  `InfluxElixir.ConnectionSupervisor.finch_name/1`.
+  the connection supervisor's pool naming (`:"influx_elixir_<name>_finch"`).
 
   ## Parameters
 

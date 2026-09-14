@@ -130,7 +130,8 @@ defmodule InfluxElixir.MixProject do
       extras: [
         "README.md",
         "CHANGELOG.md",
-        "docs/guides/testing-with-local-client.md"
+        "docs/guides/testing-with-local-client.md",
+        "LICENSE"
       ],
       groups_for_extras: [
         Guides: ~r/docs\/guides\/.*/

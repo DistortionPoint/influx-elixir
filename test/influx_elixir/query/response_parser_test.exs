@@ -177,6 +177,29 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       assert result["time"] == "not a date"
     end
 
+    test "decodes InfluxDB 3's zone-less timestamp under any column name" do
+      # Captured from InfluxDB 3 Core for
+      #   DATE_BIN(...) AS bucket, selector_min(value, time)['time'] AS low_at
+      row = %{
+        "bucket" => "2023-11-14T22:12:00",
+        "low_at" => "2023-11-14T22:13:20.5",
+        "label" => "bucket"
+      }
+
+      assert %{
+               "bucket" => ~U[2023-11-14 22:12:00.000000Z],
+               "low_at" => ~U[2023-11-14 22:13:20.500000Z],
+               "label" => "bucket"
+             } == ResponseParser.coerce_types(row)
+    end
+
+    test "a zoned RFC3339 string outside the time keys stays a string" do
+      # Only InfluxDB 3's zone-less rendering is evidence of a timestamp
+      # column; a string field carrying an RFC3339 value is left alone.
+      row = %{"created_at" => "2026-03-12T10:00:00Z", "note" => "2026-03-12"}
+      assert ResponseParser.coerce_types(row) == row
+    end
+
     test "converts the Flux _time, _start and _stop columns too" do
       row = %{
         "_time" => "2026-03-12T10:00:00Z",

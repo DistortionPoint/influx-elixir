@@ -17,30 +17,63 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # This captures everything up to the first unescaped space or end-of-line.
   @measurement_pattern ~r/(?i)SELECT\s+\*\s+FROM\s+(?:"([^"]+)"|((?:[^\s\\]|\\.)+))(.*)/s
 
+  @typedoc """
+  An arithmetic expression inside an aggregate: a field reference, a numeric
+  literal, or a binary operation over two expressions.
+  """
+  @type expr :: {:field, binary()} | {:lit, number()} | {:op, :+ | :- | :* | :/, expr(), expr()}
+
+  @typedoc "Plain aggregates; `:stddev`/`:var` are the sample forms, as in InfluxDB."
+  @type aggregate ::
+          :avg | :sum | :count | :min | :max | :stddev | :stddev_pop | :var | :var_pop
+
   @type select_column ::
           {:time_bucket, binary()}
-          | {:aggregate, :avg | :sum | :count | :min | :max, binary(), binary()}
+          | {:aggregate, aggregate(), expr(), binary()}
           | {:count_star, binary()}
           | {:ordered_aggregate, :first | :last, binary(), binary(), binary()}
+          | {:selector, :first | :last | :min | :max, binary(), binary(), :value | :time,
+             binary()}
           | {:grouping_column, binary(), binary()}
 
   @type where_op :: :eq | :gt | :lt | :gte | :lte | :ne | :in | :not_in
   @type where_clause :: {where_op(), binary(), term()}
 
+  @typedoc "`ORDER BY <column> [ASC|DESC]`; the column may be `time` or any output alias."
+  @type order_by :: {binary(), :asc | :desc} | nil
+
   @type parsed_query :: %{
           measurement: binary(),
           where: [where_clause()],
-          order_by: {:time, :asc | :desc} | nil,
+          order_by: order_by(),
           limit: pos_integer() | nil,
           group_by_interval: pos_integer() | nil,
           group_by_columns: [binary()] | nil,
           select_columns: [select_column()] | nil,
-          distinct_column: binary() | nil,
+          distinct_columns: [binary()] | nil,
           projection_columns: [{binary(), binary()}] | nil
         }
 
-  # Aggregate function names recognised by the parser.
-  @aggregate_functions ~w(AVG SUM COUNT MIN MAX FIRST_VALUE LAST_VALUE)
+  # Aggregate function names recognised by the parser (all verified against
+  # InfluxDB 3 Core; VARIANCE is *not* one of them).
+  @aggregate_functions ~w(AVG SUM COUNT MIN MAX STDDEV STDDEV_SAMP STDDEV_POP VAR_SAMP VAR_POP VAR FIRST_VALUE LAST_VALUE SELECTOR_FIRST SELECTOR_LAST SELECTOR_MIN SELECTOR_MAX)
+
+  @aggregate_atoms %{
+    "avg" => :avg,
+    "sum" => :sum,
+    "count" => :count,
+    "min" => :min,
+    "max" => :max,
+    "stddev" => :stddev,
+    "stddev_samp" => :stddev,
+    "stddev_pop" => :stddev_pop,
+    "var" => :var,
+    "var_samp" => :var,
+    "var_pop" => :var_pop
+  }
+
+  # selector_first|last|min|max(field, time)['value'|'time'] AS alias
+  @selector_pattern ~r/(?i)^\s*SELECTOR_(FIRST|LAST|MIN|MAX)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*\[\s*'(value|time)'\s*\]\s+AS\s+(\w+)\s*$/
 
   # InfluxQL selector functions that InfluxDB v3 SQL does not provide. They are
   # routed into the aggregate parser only so the rejection can name the fix.
@@ -102,7 +135,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          group_by_interval: interval_ns,
          group_by_columns: parse_group_by_columns(sql),
          select_columns: columns,
-         distinct_column: nil,
+         distinct_columns: nil,
          projection_columns: nil
        }}
     end
@@ -233,10 +266,16 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       String.match?(col, ~r/(?i)\b(FIRST_VALUE|LAST_VALUE)\s*\(/) ->
         parse_ordered_agg_column(col)
 
+      String.match?(col, ~r/(?i)\bSELECTOR_(FIRST|LAST|MIN|MAX)\s*\(/) ->
+        parse_selector_column(col)
+
       String.match?(col, ~r/(?i)\b(FIRST|LAST)\s*\(/) ->
         {:error, influxql_selector_error(col)}
 
-      String.match?(col, ~r/(?i)\b(AVG|SUM|COUNT|MIN|MAX)\s*\(/) ->
+      String.match?(
+        col,
+        ~r/(?i)\b(AVG|SUM|COUNT|MIN|MAX|STDDEV|STDDEV_SAMP|STDDEV_POP|VAR|VAR_SAMP|VAR_POP)\s*\(/
+      ) ->
         parse_agg_column(col)
 
       String.match?(col, ~r/^\s*\w+(\s+AS\s+\w+)?\s*$/i) ->
@@ -346,22 +385,131 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  # Exactly one argument: `AVG(field, other)` is not SQL and the real engine
-  # rejects it, so the double must not quietly accept it either.
+  # One argument, which may be an arithmetic expression over fields and
+  # numeric literals (`SUM(value * value)`), as the real engine allows.
+  # `AVG(field, other)` is not SQL: the expression parser rejects the comma.
   @spec parse_agg_column_arg(binary()) ::
           {:ok, select_column()} | {:error, term()}
   defp parse_agg_column_arg(col) do
-    one_arg = ~r/(?i)^\s*(AVG|SUM|COUNT|MIN|MAX)\s*\(\s*(\w+)\s*\)\s+AS\s+(\w+)\s*$/
+    one_arg =
+      ~r/(?i)^\s*(AVG|SUM|COUNT|MIN|MAX|STDDEV_SAMP|STDDEV_POP|STDDEV|VAR_SAMP|VAR_POP|VAR)\s*\((.+)\)\s+AS\s+(\w+)\s*$/s
 
-    case Regex.run(one_arg, col) do
-      [_full, func, field, alias_name] ->
-        agg_atom = func |> String.downcase() |> String.to_existing_atom()
-        {:ok, {:aggregate, agg_atom, field, alias_name}}
-
-      _no_match ->
-        {:error, local_error("invalid aggregate: #{col}")}
+    with [_full, func, expr_str, alias_name] <- Regex.run(one_arg, col),
+         {:ok, expr} <- parse_expr(expr_str) do
+      {:ok, {:aggregate, Map.fetch!(@aggregate_atoms, String.downcase(func)), expr, alias_name}}
+    else
+      _no_match -> {:error, local_error("invalid aggregate: #{col}")}
     end
   end
+
+  # Parse: selector_first|last|min|max(field, time)['value' | 'time'] AS alias.
+  # selector_first/last pick the row with the smallest/largest second
+  # argument; selector_min/max pick the row with the smallest/largest field.
+  @spec parse_selector_column(binary()) :: {:ok, select_column()} | {:error, term()}
+  defp parse_selector_column(col) do
+    case Regex.run(@selector_pattern, col) do
+      [_full, kind, field, ordering, access, alias_name] ->
+        selector = String.to_existing_atom(String.downcase(kind))
+        {:ok, {:selector, selector, field, ordering, String.to_existing_atom(access), alias_name}}
+
+      _no_match ->
+        {:error,
+         local_error(
+           "selector functions are supported as " <>
+             "selector_first|last|min|max(field, time)['value' | 'time'] AS alias: #{col}"
+         )}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Arithmetic expressions inside aggregates
+  #
+  # Grammar (recursive descent, standard precedence):
+  #   expr   := term   (('+' | '-') term)*
+  #   term   := factor (('*' | '/') factor)*
+  #   factor := number | identifier | '(' expr ')'
+  # ---------------------------------------------------------------------------
+
+  @expr_token ~r/\s*(?:(\d+\.\d+|\d+)|(\w+)|([()+\-*\/]))/
+
+  @doc false
+  @spec parse_expr(binary()) :: {:ok, expr()} | {:error, term()}
+  def parse_expr(str) do
+    with {:ok, tokens} <- tokenize_expr(str),
+         {:ok, ast, []} <- parse_sum(tokens) do
+      {:ok, ast}
+    else
+      {:ok, _ast, _leftover} -> {:error, :trailing_tokens}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  # Every non-blank byte must belong to a token; anything the scanner skipped
+  # (a comma, a quote) makes the expression invalid.
+  @spec tokenize_expr(binary()) :: {:ok, [term()]} | {:error, term()}
+  defp tokenize_expr(str) do
+    matches = Regex.scan(@expr_token, str)
+
+    consumed =
+      matches |> Enum.map(fn [full | _groups] -> byte_size(String.trim(full)) end) |> Enum.sum()
+
+    if consumed == byte_size(String.replace(str, ~r/\s/, "")) do
+      {:ok, Enum.map(matches, &expr_token/1)}
+    else
+      {:error, :unexpected_character}
+    end
+  end
+
+  @spec expr_token([binary()]) :: term()
+  defp expr_token([_full, num, "", ""]), do: {:lit, coerce_value(num)}
+  defp expr_token([_full, "", ident, ""]), do: {:field, ident}
+  defp expr_token([_full, "", "", op]), do: {:tok, op}
+  defp expr_token([_full, "", ident]), do: {:field, ident}
+  defp expr_token([_full, num]), do: {:lit, coerce_value(num)}
+
+  @spec parse_sum([term()]) :: {:ok, expr(), [term()]} | {:error, term()}
+  defp parse_sum(tokens) do
+    with {:ok, left, rest} <- parse_product(tokens) do
+      parse_sum_tail(left, rest)
+    end
+  end
+
+  defp parse_sum_tail(left, [{:tok, op} | rest]) when op in ["+", "-"] do
+    with {:ok, right, rest} <- parse_product(rest) do
+      parse_sum_tail({:op, String.to_existing_atom(op), left, right}, rest)
+    end
+  end
+
+  defp parse_sum_tail(left, rest), do: {:ok, left, rest}
+
+  @spec parse_product([term()]) :: {:ok, expr(), [term()]} | {:error, term()}
+  defp parse_product(tokens) do
+    with {:ok, left, rest} <- parse_factor(tokens) do
+      parse_product_tail(left, rest)
+    end
+  end
+
+  defp parse_product_tail(left, [{:tok, op} | rest]) when op in ["*", "/"] do
+    with {:ok, right, rest} <- parse_factor(rest) do
+      parse_product_tail({:op, String.to_existing_atom(op), left, right}, rest)
+    end
+  end
+
+  defp parse_product_tail(left, rest), do: {:ok, left, rest}
+
+  @spec parse_factor([term()]) :: {:ok, expr(), [term()]} | {:error, term()}
+  defp parse_factor([{:lit, _value} = lit | rest]), do: {:ok, lit, rest}
+  defp parse_factor([{:field, _name} = field | rest]), do: {:ok, field, rest}
+
+  defp parse_factor([{:tok, "("} | rest]) do
+    case parse_sum(rest) do
+      {:ok, inner, [{:tok, ")"} | rest]} -> {:ok, inner, rest}
+      {:ok, _inner, _rest} -> {:error, :unbalanced_parenthesis}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp parse_factor(_tokens), do: {:error, :unexpected_token}
 
   # Parse GROUP BY DATE_BIN(INTERVAL 'N unit', time) → interval in nanoseconds
   @spec parse_group_by_interval(binary()) ::
@@ -410,26 +558,31 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   defp interval_unit_to_ns(_unknown), do: nil
 
-  @distinct_pattern ~r/(?i)SELECT\s+DISTINCT\s+(\w+)\s+FROM\s+(?:"([^"]+)"|(\S+))\s*(.*)/s
+  # SELECT DISTINCT col[, col ...] FROM measurement ...
+  @distinct_pattern ~r/(?i)SELECT\s+DISTINCT\s+(\w+(?:\s*,\s*\w+)*)\s+FROM\s+(?:"([^"]+)"|(\S+))\s*(.*)/s
 
   @spec parse_distinct_select(binary()) ::
           {:ok, parsed_query()} | {:error, term()}
   defp parse_distinct_select(sql) do
     case Regex.run(@distinct_pattern, sql) do
-      [_full, column, quoted, "", rest] ->
-        build_distinct_query(column, quoted, rest)
+      [_full, columns, quoted, "", rest] ->
+        build_distinct_query(split_columns(columns), quoted, rest)
 
-      [_full, column, "", unquoted, rest] ->
-        build_distinct_query(column, LineProtocolParser.unescape_measurement(unquoted), rest)
+      [_full, columns, "", unquoted, rest] ->
+        measurement = LineProtocolParser.unescape_measurement(unquoted)
+        build_distinct_query(split_columns(columns), measurement, rest)
 
       _no_match ->
         {:error, local_error("unsupported DISTINCT query: #{sql}")}
     end
   end
 
-  @spec build_distinct_query(binary(), binary(), binary()) ::
+  @spec split_columns(binary()) :: [binary()]
+  defp split_columns(columns), do: columns |> String.split(",") |> Enum.map(&String.trim/1)
+
+  @spec build_distinct_query([binary()], binary(), binary()) ::
           {:ok, parsed_query()} | {:error, map()}
-  defp build_distinct_query(column, measurement, rest) do
+  defp build_distinct_query(columns, measurement, rest) do
     with {:ok, where} <- parse_where(rest) do
       {:ok,
        %{
@@ -440,7 +593,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          group_by_interval: nil,
          group_by_columns: nil,
          select_columns: nil,
-         distinct_column: column,
+         distinct_columns: columns,
          projection_columns: nil
        }}
     end
@@ -476,7 +629,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          group_by_interval: nil,
          group_by_columns: nil,
          select_columns: nil,
-         distinct_column: nil,
+         distinct_columns: nil,
          projection_columns: nil
        }}
     end
@@ -522,7 +675,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
              group_by_interval: nil,
              group_by_columns: nil,
              select_columns: nil,
-             distinct_column: nil,
+             distinct_columns: nil,
              projection_columns: projection
            }}
         end
@@ -690,19 +843,20 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  @spec parse_order_by(binary()) :: {:time, :asc | :desc} | nil
+  # ORDER BY <column> [ASC|DESC]. The column is `time` or an output alias
+  # (e.g. the DATE_BIN alias); direction defaults to ASC as in SQL.
+  @spec parse_order_by(binary()) :: order_by()
   defp parse_order_by(rest) do
-    case Regex.run(~r/(?i)ORDER\s+BY\s+time\s+(ASC|DESC)/s, rest) do
-      [_full_match, direction] ->
-        case String.upcase(direction) do
-          "ASC" -> {:time, :asc}
-          "DESC" -> {:time, :desc}
-          _other -> nil
-        end
-
-      _no_match ->
-        nil
+    case Regex.run(~r/(?i)ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?/s, rest) do
+      [_full_match, column] -> {column, :asc}
+      [_full_match, column, direction] -> {column, direction_atom(direction)}
+      _no_match -> nil
     end
+  end
+
+  @spec direction_atom(binary()) :: :asc | :desc
+  defp direction_atom(direction) do
+    if String.upcase(direction) == "DESC", do: :desc, else: :asc
   end
 
   @spec parse_limit(binary()) :: pos_integer() | nil

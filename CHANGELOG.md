@@ -24,6 +24,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` rejected valid InfluxDB 3 SQL (#16, #17).** Verified
+  against InfluxDB 3 Core: `STDDEV` / `STDDEV_SAMP` / `STDDEV_POP` /
+  `VAR` / `VAR_SAMP` / `VAR_POP`, arithmetic inside an aggregate
+  (`SUM(value * value)`, `AVG(bid + ask)`, integer operands dividing as
+  integers), `selector_first|last|min|max(field, time)['value' | 'time']`,
+  `SELECT DISTINCT a, b`, and `ORDER BY` a projected alias (`ORDER BY bucket
+  DESC`) all work on the server and were all `Client.Local:` 400s in the
+  double. All are now supported with the values the engine returns; `VARIANCE`
+  stays rejected because DataFusion has no such function.
+- **`Client.Local` returned `nil` columns the real engine omits.** InfluxDB 3
+  leaves a null column out of the JSON row entirely (an empty group carries
+  only `COUNT: 0`; a sample statistic over one row has no key). The double now
+  omits them too, so `refute Map.has_key?(row, "avg")` means the same thing
+  on both.
+- **HTTP JSON responses left timestamp columns other than `time` as strings.**
+  A `DATE_BIN(...) AS bucket` alias or `selector_*(...)['time']` came back as
+  `"2023-11-14T22:12:00"` over HTTP but as a `DateTime` over Flight and from
+  `Client.Local`. `Query.ResponseParser` now decodes InfluxDB 3's zone-less
+  timestamp rendering under any column name (zoned RFC3339 strings are still
+  decoded only under `time` / `_time` / `_start` / `_stop`).
+- `mix docs` warned that the README's `LICENSE` link had no target; the
+  licence is now an ExDoc extra.
+
+### Added
+- `InfluxElixir.Client.Local.check_sql/1` — parse a query without running it
+  and get the same `Client.Local:` error `query_sql/3` would, so a test can
+  `flunk/1` with the reason instead of being silently excluded.
+- Testing guide: "Checking a Query Before Running It" and "Running Against a
+  Real InfluxDB" (the integration tier, `INFLUX_V3_CORE_HOST` / `_PORT`,
+  Docker one-liners), and the new aggregate, selector and null-omission
+  semantics with the values recorded from the engine.
 - `CLAUDE.md` described a `/docs` layout (`architecture/`, `api/`,
   `development/`, per-directory READMEs, a design template) that did not exist.
   The READMEs and template now exist, `docs/design/README.md` indexes every

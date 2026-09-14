@@ -2083,7 +2083,7 @@ defmodule InfluxElixir.Client.LocalTest do
                Local.query_sql(conn, sql, database: db)
     end
 
-    test "scalar AVG returns nil when no rows match", %{conn: conn, db: db} do
+    test "scalar AVG omits the column when no rows match", %{conn: conn, db: db} do
       sql = """
       SELECT
         AVG(usage) AS avg_usage
@@ -2091,8 +2091,8 @@ defmodule InfluxElixir.Client.LocalTest do
       WHERE host = 'no_such_host'
       """
 
-      assert {:ok, [%{"avg_usage" => nil}]} =
-               Local.query_sql(conn, sql, database: db)
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      refute Map.has_key?(row, "avg_usage")
     end
 
     test "invalid interval unit returns error", %{conn: conn, db: db} do
@@ -3249,6 +3249,316 @@ defmodule InfluxElixir.Client.LocalTest do
                  ~s|SELECT COUNT(*) AS n FROM "decision_traces"|,
                  database: db
                )
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Issues #16 and #17: statistical aggregates, arithmetic inside aggregates,
+  # selector functions, multi-column DISTINCT, ORDER BY alias, null omission.
+  # Expected values were recorded from InfluxDB 3 Core (see
+  # docs/design/2026-09-14_local-sql-stats-selectors-distinct.md).
+  # ---------------------------------------------------------------------------
+
+  describe "bug regression — statistical aggregates (#16)" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "stats_db")
+
+      lines =
+        Enum.join(
+          [
+            "m,provider=a,symbol=X value=10.0 1000000000",
+            "m,provider=a,symbol=X value=20.0 2000000000",
+            "m,provider=a,symbol=X value=30.0 3000000000",
+            "m,provider=b,symbol=Y value=5.0 4000000000"
+          ],
+          "\n"
+        )
+
+      {:ok, :written} = Local.write(conn, lines, database: "stats_db")
+      {:ok, db: "stats_db"}
+    end
+
+    test "STDDEV, STDDEV_SAMP, STDDEV_POP, VAR, VAR_SAMP and VAR_POP match v3",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        STDDEV(value) AS sd,
+        STDDEV_SAMP(value) AS sd_samp,
+        STDDEV_POP(value) AS sd_pop,
+        VAR(value) AS v,
+        VAR_SAMP(value) AS v_samp,
+        VAR_POP(value) AS v_pop
+      FROM "m"
+      WHERE provider = 'a'
+      """
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["sd"] == 10.0
+      assert row["sd_samp"] == 10.0
+      assert_in_delta row["sd_pop"], 8.16496580927726, 1.0e-12
+      assert row["v"] == 100.0
+      assert row["v_samp"] == 100.0
+      assert_in_delta row["v_pop"], 66.66666666666667, 1.0e-12
+    end
+
+    test "sample statistics over one row are null and the column is omitted",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT STDDEV(value) AS sd, VAR(value) AS v, VAR_POP(value) AS v_pop
+      FROM "m"
+      WHERE provider = 'b'
+      """
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      refute Map.has_key?(row, "sd")
+      refute Map.has_key?(row, "v")
+      assert row["v_pop"] == 0.0
+    end
+
+    test "an empty group keeps only COUNT (0); every other aggregate is omitted",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT COUNT(value) AS n, AVG(value) AS a, STDDEV(value) AS sd
+      FROM "m"
+      WHERE provider = 'none'
+      """
+
+      assert {:ok, [%{"n" => 0} = row]} = Local.query_sql(conn, sql, database: db)
+      refute Map.has_key?(row, "a")
+      refute Map.has_key?(row, "sd")
+    end
+
+    test "VARIANCE is not a DataFusion function and is rejected", %{conn: conn, db: db} do
+      assert {:error, %{status: 400, body: "Client.Local: " <> _reason}} =
+               Local.query_sql(conn, ~s|SELECT VARIANCE(value) AS v FROM "m"|, database: db)
+    end
+
+    test "arithmetic inside an aggregate is evaluated per row", %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        SUM(value * value) AS sum_sq,
+        AVG(value / 2) AS half_avg,
+        MAX(value - 1) AS max_less_one,
+        MIN((value + 10) * 2) AS min_shifted
+      FROM "m"
+      WHERE provider = 'a'
+      """
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["sum_sq"] == 1400.0
+      assert row["half_avg"] == 10.0
+      assert row["max_less_one"] == 29.0
+      assert row["min_shifted"] == 40.0
+    end
+
+    test "integer operands divide as integers, like DataFusion", %{conn: conn, db: db} do
+      {:ok, :written} =
+        Local.write(conn, "ints n=3i 1000000000\nints n=5i 2000000000", database: db)
+
+      sql = ~s|SELECT SUM(n / 2) AS halves, SUM(n * n) AS squares, AVG(n) AS a FROM "ints"|
+
+      assert {:ok, [%{"halves" => 3, "squares" => 34, "a" => 4.0}]} =
+               Local.query_sql(conn, sql, database: db)
+    end
+
+    test "division by zero inside an aggregate yields null, not a crash",
+         %{conn: conn, db: db} do
+      sql = ~s|SELECT SUM(value / 0) AS s, COUNT(value / 0) AS n FROM "m"|
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      refute Map.has_key?(row, "s")
+      assert row["n"] == 0
+    end
+
+    test "a malformed expression is rejected with a Client.Local error", %{conn: conn, db: db} do
+      for sql <- [
+            ~s|SELECT AVG(value, other) AS a FROM "m"|,
+            ~s|SELECT AVG(value +) AS a FROM "m"|,
+            ~s|SELECT AVG((value) AS a FROM "m"|,
+            ~s|SELECT AVG(value $ 2) AS a FROM "m"|
+          ] do
+        assert {:error, %{status: 400, body: "Client.Local: " <> _reason}} =
+                 Local.query_sql(conn, sql, database: db),
+               sql
+      end
+    end
+
+    test "ORDER BY a non-time projected column sorts groups", %{conn: conn, db: db} do
+      sql = """
+      SELECT provider, SUM(value) AS total
+      FROM "m"
+      GROUP BY provider
+      ORDER BY total DESC
+      """
+
+      assert {:ok, [first, second]} = Local.query_sql(conn, sql, database: db)
+      assert first["provider"] == "a"
+      assert first["total"] == 60.0
+      assert second["provider"] == "b"
+    end
+  end
+
+  describe "bug regression — selector functions and DATE_BIN ordering (#17)" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "sel_db")
+
+      # Two 1-minute buckets: [10, 30, 20] then [5]. Timestamps are seconds
+      # after the epoch so bucket boundaries are obvious.
+      lines =
+        Enum.join(
+          [
+            "m,symbol=X value=10.0 0",
+            "m,symbol=X value=30.0 20000000000",
+            "m,symbol=X value=20.0 40000000000",
+            "m,symbol=X value=5.0 70000000000"
+          ],
+          "\n"
+        )
+
+      {:ok, :written} = Local.write(conn, lines, database: "sel_db")
+      {:ok, db: "sel_db"}
+    end
+
+    test "selector_first/last/min/max return the chosen row's value or time",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        selector_first(value, time)['value'] AS first_v,
+        selector_first(value, time)['time'] AS first_t,
+        selector_last(value, time)['value'] AS last_v,
+        selector_last(value, time)['time'] AS last_t,
+        selector_min(value, time)['value'] AS min_v,
+        selector_min(value, time)['time'] AS min_t,
+        selector_max(value, time)['value'] AS max_v,
+        selector_max(value, time)['time'] AS max_t
+      FROM "m"
+      """
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      assert row["first_v"] == 10.0
+      assert row["first_t"] == ~U[1970-01-01 00:00:00.000000Z]
+      assert row["last_v"] == 5.0
+      assert row["last_t"] == ~U[1970-01-01 00:01:10.000000Z]
+      assert row["min_v"] == 5.0
+      assert row["min_t"] == ~U[1970-01-01 00:01:10.000000Z]
+      assert row["max_v"] == 30.0
+      assert row["max_t"] == ~U[1970-01-01 00:00:20.000000Z]
+    end
+
+    test "selectors combine with DATE_BIN and ORDER BY the bin alias DESC",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT
+        DATE_BIN(INTERVAL '1 minute', time) AS bucket,
+        selector_first(value, time)['value'] AS open,
+        selector_max(value, time)['value'] AS high,
+        selector_min(value, time)['value'] AS low,
+        selector_last(value, time)['value'] AS close,
+        COUNT(value) AS n
+      FROM "m"
+      GROUP BY DATE_BIN(INTERVAL '1 minute', time)
+      ORDER BY bucket DESC
+      """
+
+      assert {:ok, [late, early]} = Local.query_sql(conn, sql, database: db)
+
+      assert late["bucket"] == ~U[1970-01-01 00:01:00.000000Z]
+      assert late["open"] == 5.0 and late["close"] == 5.0 and late["n"] == 1
+
+      assert early["bucket"] == ~U[1970-01-01 00:00:00.000000Z]
+      assert early["open"] == 10.0
+      assert early["high"] == 30.0
+      assert early["low"] == 10.0
+      assert early["close"] == 20.0
+      assert early["n"] == 3
+    end
+
+    test "an empty selector group omits the column", %{conn: conn, db: db} do
+      sql = ~s|SELECT selector_last(value, time)['value'] AS v FROM "m" WHERE symbol = 'nope'|
+
+      assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
+      refute Map.has_key?(row, "v")
+    end
+
+    test "a selector without the ['value'|'time'] accessor is rejected", %{conn: conn, db: db} do
+      assert {:error, %{status: 400, body: "Client.Local: selector functions" <> _reason}} =
+               Local.query_sql(conn, ~s|SELECT selector_last(value, time) AS v FROM "m"|,
+                 database: db
+               )
+    end
+  end
+
+  describe "bug regression — multi-column DISTINCT and null omission (#17)" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "md_db")
+
+      lines =
+        Enum.join(
+          [
+            "m,provider=a,symbol=X value=1.0 1000000000",
+            "m,provider=a,symbol=X value=2.0 2000000000",
+            "m,provider=b,symbol=Y value=3.0 3000000000",
+            "m,provider=b,symbol=Y other=4.0 4000000000"
+          ],
+          "\n"
+        )
+
+      {:ok, :written} = Local.write(conn, lines, database: "md_db")
+      {:ok, db: "md_db"}
+    end
+
+    test "SELECT DISTINCT a, b returns unique combinations", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, ~s|SELECT DISTINCT provider, symbol FROM "m"|, database: db)
+
+      assert Enum.sort_by(rows, & &1["provider"]) == [
+               %{"provider" => "a", "symbol" => "X"},
+               %{"provider" => "b", "symbol" => "Y"}
+             ]
+    end
+
+    test "SELECT * omits a column that is null for that row, like v3", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, ~s|SELECT * FROM "m" WHERE provider = 'b'|, database: db)
+
+      [with_value, with_other] = Enum.sort_by(rows, & &1["time"], DateTime)
+      assert with_value["value"] == 3.0
+      refute Map.has_key?(with_value, "other")
+      assert with_other["other"] == 4.0
+      refute Map.has_key?(with_other, "value")
+    end
+
+    test "an explicit column list omits a missing field rather than nil-filling it",
+         %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT provider, other FROM "m" WHERE provider = 'a'|,
+                 database: db
+               )
+
+      assert rows == [%{"provider" => "a"}, %{"provider" => "a"}]
+    end
+  end
+
+  describe "check_sql/1" do
+    test "returns :ok for a query inside the supported subset" do
+      assert :ok =
+               Local.check_sql("""
+               SELECT DATE_BIN(INTERVAL '5 minutes', time) AS t, STDDEV(value) AS sd
+               FROM "m" GROUP BY DATE_BIN(INTERVAL '5 minutes', time) ORDER BY t DESC
+               """)
+    end
+
+    test "returns the same 400 Client.Local error query_sql/3 would" do
+      sql = ~s|SELECT median(value) AS m FROM "m"|
+
+      assert {:error, %{status: 400, body: "Client.Local: " <> _reason} = err} =
+               Local.check_sql(sql)
+
+      {:ok, conn} = Local.start(databases: ["chk"])
+      on_exit(fn -> Local.stop(conn) end)
+      assert {:error, ^err} = Local.query_sql(conn, sql, database: "chk")
     end
   end
 end

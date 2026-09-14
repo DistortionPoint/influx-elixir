@@ -5,7 +5,14 @@ defmodule InfluxElixir.Query.ResponseParser do
 
   ## Type Coercion
 
-    * `time`, `_time`, `_start`, `_stop` RFC3339 strings → `DateTime.t()`
+    * Timestamps → `DateTime.t()` with microsecond precision. JSON carries no
+      column types, so this is by shape and by name: any string in InfluxDB 3's
+      zone-less timestamp rendering (`2023-11-14T22:13:20[.fraction]`) is a
+      timestamp whatever its column is called (`DATE_BIN` aliases,
+      `selector_*(...)['time']`, `MAX(time)`); the zoned RFC3339 form is
+      decoded only under `time`, `_time`, `_start` and `_stop`, where v2 emits
+      it. A *string field* holding exactly that zone-less shape is decoded
+      too — store zoned RFC3339 strings if the distinction matters.
     * JSON / JSONL numbers and booleans keep the types Jason decodes
     * CSV cells are typed from the Flux `#datatype` annotation row when the
       query requested one (`double`, `long`, `unsignedLong`, `boolean`,
@@ -65,8 +72,9 @@ defmodule InfluxElixir.Query.ResponseParser do
   @doc """
   Coerces known value types in a row map.
 
-  Converts RFC3339 strings under `time`, `_time`, `_start` and `_stop` to
-  `DateTime`; leaves everything else as-is.
+  Converts timestamp strings to `DateTime` (see "Type Coercion" in the
+  moduledoc for which strings count as timestamps); leaves everything else
+  as-is.
   """
   @spec coerce_types(map()) :: map()
   def coerce_types(row) when is_map(row) do
@@ -77,22 +85,35 @@ defmodule InfluxElixir.Query.ResponseParser do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  # InfluxDB 3 renders `time` without a zone ("2023-11-14T22:13:20.123456789"),
-  # which `DateTime.from_iso8601/1` rejects; such values are UTC. v2 Flux
-  # timestamps carry a "Z". Fractional seconds beyond microseconds are
-  # truncated by the calendar types.
+  # InfluxDB 3 renders every timestamp column without a zone
+  # ("2023-11-14T22:13:20.123456789"), which `DateTime.from_iso8601/1`
+  # rejects; such values are UTC. The JSON body has no schema, so that shape
+  # is the only evidence a non-`time` column (a `DATE_BIN` alias, a
+  # `selector_*['time']`) is a timestamp at all. v2 Flux timestamps carry a
+  # "Z" and are only decoded under the well-known time keys. Fractional
+  # seconds beyond microseconds are truncated by the calendar types.
+  @datafusion_timestamp ~r/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?$/
+
   @spec coerce_value(String.t(), term()) :: term()
   defp coerce_value(key, value) when key in @time_keys and is_binary(value) do
-    with {:error, _not_zoned} <- DateTime.from_iso8601(value),
-         {:ok, naive} <- NaiveDateTime.from_iso8601(value) do
-      naive |> DateTime.from_naive!("Etc/UTC") |> microsecond_precision()
-    else
+    case DateTime.from_iso8601(value) do
       {:ok, dt, _offset} -> microsecond_precision(dt)
-      {:error, _reason} -> value
+      {:error, _not_zoned} -> coerce_naive(value)
     end
   end
 
+  defp coerce_value(_key, value) when is_binary(value), do: coerce_naive(value)
   defp coerce_value(_key, value), do: value
+
+  @spec coerce_naive(binary()) :: DateTime.t() | binary()
+  defp coerce_naive(value) do
+    with true <- Regex.match?(@datafusion_timestamp, value),
+         {:ok, naive} <- NaiveDateTime.from_iso8601(value) do
+      naive |> DateTime.from_naive!("Etc/UTC") |> microsecond_precision()
+    else
+      _not_a_timestamp -> value
+    end
+  end
 
   # Every timestamp the library returns carries microsecond precision, so a
   # value from JSON ("…:20" → precision 0) equals the same instant from

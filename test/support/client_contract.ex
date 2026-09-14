@@ -56,6 +56,7 @@ defmodule InfluxElixir.ClientContract do
     roundtrip_tests = if v3_sql, do: roundtrip_tests(client), else: nil
     stream_tests = if v3_sql, do: stream_tests(client), else: nil
     aggregate_tests = if v3_sql, do: aggregate_tests(client), else: nil
+    stats_tests = if v3_sql, do: stats_tests(client), else: nil
     ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
     distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
     param_tests = if v3_sql, do: param_tests(client), else: nil
@@ -88,6 +89,7 @@ defmodule InfluxElixir.ClientContract do
         roundtrip_tests,
         stream_tests,
         aggregate_tests,
+        stats_tests,
         ordered_agg_tests,
         distinct_tests,
         param_tests,
@@ -975,6 +977,127 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Statistical aggregates, expressions, selectors, ORDER BY alias (#16, #17)
+  # ---------------------------------------------------------------------------
+
+  defp stats_tests(client) do
+    quote do
+      describe "query_sql/3 — statistics and selectors contract" do
+        setup ctx do
+          # Same six points as the aggregate contract: 10..60 one minute apart.
+          base_ts = 1_700_000_000_000_000_000
+
+          Enum.each(0..5, fn i ->
+            ts = base_ts + i * 60_000_000_000
+            val = (i + 1) * 10
+
+            unquote(client).write(
+              ctx.conn,
+              "contract_agg value=#{val}i #{ts}",
+              database: ctx.database
+            )
+          end)
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, agg_base_ts: base_ts}
+        end
+
+        test "STDDEV / VAR family, expression arguments and null omission (#16)",
+             ctx do
+          sql = """
+          SELECT
+            COUNT(value) AS n,
+            STDDEV(value) AS sd,
+            STDDEV_POP(value) AS sd_pop,
+            VAR(value) AS v,
+            VAR_POP(value) AS v_pop,
+            SUM(value * value) AS sum_sq,
+            AVG(value / 2) AS half_avg,
+            MAX(value - 1) AS max_less_one
+          FROM contract_agg
+          """
+
+          {:ok, [row]} =
+            unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+
+          # values 10..60 step 10
+          assert row["n"] == 6
+          assert_in_delta row["sd"], 18.708286933869708, 1.0e-9
+          assert_in_delta row["sd_pop"], 17.07825127659933, 1.0e-9
+          assert_in_delta row["v"], 350.0, 1.0e-9
+          assert_in_delta row["v_pop"], 291.6666666666667, 1.0e-9
+          assert row["sum_sq"] == 9100
+          assert row["half_avg"] == 17.5
+          assert row["max_less_one"] == 59
+
+          # A sample statistic over one row is null, and a null column is
+          # absent from the row rather than present as nil.
+          sql_one = """
+          SELECT STDDEV(value) AS sd, COUNT(value) AS n
+          FROM contract_agg
+          WHERE value = 10
+          """
+
+          {:ok, [one]} =
+            unquote(client).query_sql(ctx.conn, sql_one, database: ctx.database)
+
+          assert one["n"] == 1
+          refute Map.has_key?(one, "sd")
+        end
+
+        test "selector functions and ORDER BY the DATE_BIN alias (#17)", ctx do
+          sql = """
+          SELECT
+            DATE_BIN(INTERVAL '3 minutes', time) AS bucket,
+            selector_first(value, time)['value'] AS open,
+            selector_max(value, time)['value'] AS high,
+            selector_min(value, time)['time'] AS low_at,
+            selector_last(value, time)['value'] AS close
+          FROM contract_agg
+          GROUP BY DATE_BIN(INTERVAL '3 minutes', time)
+          ORDER BY bucket DESC
+          """
+
+          {:ok, [late, mid, early]} =
+            unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+
+          # base_ts is 22:13:20, so 3-minute bins hold [10,20], [30,40,50], [60].
+          assert DateTime.compare(late["bucket"], mid["bucket"]) == :gt
+          assert DateTime.compare(mid["bucket"], early["bucket"]) == :gt
+          assert early["open"] == 10 and early["high"] == 20 and early["close"] == 20
+          assert mid["open"] == 30 and mid["high"] == 50 and mid["close"] == 50
+          assert late["open"] == 60 and late["high"] == 60 and late["close"] == 60
+
+          # selector_*['time'] is a DateTime on every transport.
+          assert early["low_at"] ==
+                   ctx.agg_base_ts
+                   |> DateTime.from_unix!(:nanosecond)
+                   |> DateTime.truncate(:microsecond)
+        end
+
+        test "ORDER BY a projected aggregate alias", ctx do
+          sql = """
+          SELECT
+            DATE_BIN(INTERVAL '3 minutes', time) AS bucket,
+            SUM(value) AS total
+          FROM contract_agg
+          GROUP BY DATE_BIN(INTERVAL '3 minutes', time)
+          ORDER BY total DESC
+          """
+
+          {:ok, rows} =
+            unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+
+          assert Enum.map(rows, & &1["total"]) == [120, 60, 30]
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Parameterized SQL queries (v3_core, v3_enterprise)
   # ---------------------------------------------------------------------------
 
@@ -1348,6 +1471,33 @@ defmodule InfluxElixir.ClientContract do
           assert "a" in values
           assert "b" in values
           assert length(values) == 2
+        end
+
+        test "SELECT DISTINCT over two columns returns unique combinations", ctx do
+          lp =
+            Enum.join(
+              [
+                "contract_dist2,provider=p1,symbol=A value=1i",
+                "contract_dist2,provider=p1,symbol=A value=2i",
+                "contract_dist2,provider=p2,symbol=B value=3i"
+              ],
+              "\n"
+            )
+
+          unquote(client).write(ctx.conn, lp, database: ctx.database)
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT DISTINCT provider, symbol FROM contract_dist2",
+              database: ctx.database
+            )
+
+          assert Enum.sort_by(rows, & &1["provider"]) == [
+                   %{"provider" => "p1", "symbol" => "A"},
+                   %{"provider" => "p2", "symbol" => "B"}
+                 ]
         end
       end
     end
