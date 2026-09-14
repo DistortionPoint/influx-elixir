@@ -49,6 +49,16 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @typedoc "`ORDER BY <column> [ASC|DESC]`; the column may be `time` or any output alias."
   @type order_by :: {binary(), :asc | :desc} | nil
 
+  @typedoc """
+  A projected column: `{source, output}` where `source` is a column name or
+  an arithmetic `t:expr/0` (`(bid + ask) / 2 AS mid`).
+  """
+  @type projection :: {binary() | expr(), binary()}
+
+  @typedoc """
+  One `SELECT`. `ctes` holds the `WITH name AS (...)` queries that precede
+  it, in order; `measurement` may name one of them.
+  """
   @type parsed_query :: %{
           measurement: binary(),
           where: [where_clause()],
@@ -58,7 +68,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           group_by_columns: [binary()] | nil,
           select_columns: [select_column()] | nil,
           distinct_columns: [binary()] | nil,
-          projection_columns: [{binary(), binary()}] | nil
+          projection_columns: [projection()] | nil,
+          ctes: [{binary(), parsed_query()}]
         }
 
   # Aggregate function names recognised by the parser (all verified against
@@ -91,17 +102,178 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # reported specifically instead of as a generic parse failure.
   @ordered_agg_pattern ~r/(?i)^\s*(FIRST_VALUE|LAST_VALUE)\s*\(\s*(\w+)\s*(?:ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?\s*)?\)\s+AS\s+(\w+)\s*$/
 
-  @doc "Parses a SELECT statement into a `t:parsed_query/0`."
+  @doc """
+  Parses a statement — an optional `WITH` list of non-recursive CTEs followed
+  by one `SELECT` — into a `t:parsed_query/0`.
+  """
   @spec parse_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
   def parse_select(sql) do
-    normalised = String.trim(sql)
-
-    cond do
-      distinct_query?(normalised) -> parse_distinct_select(normalised)
-      aggregate_query?(normalised) -> parse_aggregate_select(normalised)
-      star_query?(normalised) -> parse_star_select(normalised)
-      true -> parse_columns_select(normalised)
+    with {:ok, cte_sources, main_sql} <- split_ctes(String.trim(sql)),
+         {:ok, ctes} <- parse_ctes(cte_sources),
+         {:ok, main} <- parse_single_select(main_sql) do
+      {:ok, %{main | ctes: ctes}}
     end
+  end
+
+  # ---------------------------------------------------------------------------
+  # WITH name AS (<select>)[, name AS (<select>)] <select>
+  #
+  # Each body is a query in the same subset, run in order over the store or
+  # an earlier CTE; the main query may read from any of them. Joins, and a
+  # body that is not a SELECT, are outside the subset.
+  # ---------------------------------------------------------------------------
+
+  @spec split_ctes(binary()) :: {:ok, [{binary(), binary()}], binary()} | {:error, term()}
+  defp split_ctes(sql) do
+    case Regex.run(~r/^WITH\s+(.*)$/is, sql) do
+      [_full, rest] -> take_ctes(rest, [], sql)
+      nil -> {:ok, [], sql}
+    end
+  end
+
+  @spec take_ctes(binary(), [{binary(), binary()}], binary()) ::
+          {:ok, [{binary(), binary()}], binary()} | {:error, term()}
+  defp take_ctes(str, acc, sql) do
+    with [_full, name, after_open] <- Regex.run(~r/^\s*(\w+)\s+AS\s*\((.*)$/is, str),
+         {:ok, body, after_close} <- take_balanced(after_open) do
+      cte = {name, String.trim(body)}
+
+      case Regex.run(~r/^\s*,(.*)$/s, after_close) do
+        [_full, more] -> take_ctes(more, [cte | acc], sql)
+        nil -> {:ok, Enum.reverse([cte | acc]), String.trim(after_close)}
+      end
+    else
+      _no_match -> {:error, local_error("unsupported WITH clause: #{sql}")}
+    end
+  end
+
+  # Splits `str` at the parenthesis that closes the one already opened.
+  @spec take_balanced(binary()) :: {:ok, binary(), binary()} | :error
+  defp take_balanced(str), do: take_balanced(str, 1, [])
+
+  defp take_balanced(<<>>, _depth, _acc), do: :error
+
+  defp take_balanced(<<")", rest::binary>>, 1, acc),
+    do: {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary(), rest}
+
+  defp take_balanced(<<")", rest::binary>>, depth, acc),
+    do: take_balanced(rest, depth - 1, [")" | acc])
+
+  defp take_balanced(<<"(", rest::binary>>, depth, acc),
+    do: take_balanced(rest, depth + 1, ["(" | acc])
+
+  defp take_balanced(<<c::utf8, rest::binary>>, depth, acc),
+    do: take_balanced(rest, depth, [<<c::utf8>> | acc])
+
+  @spec parse_ctes([{binary(), binary()}]) ::
+          {:ok, [{binary(), parsed_query()}]} | {:error, term()}
+  defp parse_ctes(sources) do
+    Enum.reduce_while(sources, {:ok, []}, fn {name, body}, {:ok, acc} ->
+      case parse_single_select(body) do
+        {:ok, query} -> {:cont, {:ok, acc ++ [{name, query}]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  @spec parse_single_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
+  defp parse_single_select(sql) do
+    normalised = sql |> String.trim() |> strip_table_qualifiers()
+
+    with :ok <- check_clauses(normalised) do
+      cond do
+        distinct_query?(normalised) -> parse_distinct_select(normalised)
+        aggregate_query?(normalised) -> parse_aggregate_select(normalised)
+        star_query?(normalised) -> parse_star_select(normalised)
+        true -> parse_columns_select(normalised)
+      end
+    end
+  end
+
+  # One table, then only WHERE / GROUP BY / ORDER BY / LIMIT. A join, set
+  # operation or window would otherwise be ignored and the query answered
+  # from the first table alone, which is a wrong result, not a refusal.
+  @unsupported_construct ~r/(?i)\b(JOIN|UNION|EXCEPT|INTERSECT|HAVING|OFFSET|OVER|QUALIFY)\b/
+  @first_from ~r/(?i)\bFROM\s+(?:"[^"]+"|(?:[^\s\\]|\\.)+)\s*(\w*)/s
+  @clause_keywords ~w(WHERE GROUP ORDER LIMIT)
+
+  @spec check_clauses(binary()) :: :ok | {:error, term()}
+  defp check_clauses(sql) do
+    with :ok <- check_constructs(sql),
+         :ok <- check_single_select(sql) do
+      case Regex.run(@first_from, sql) do
+        [_full, next] when next == "" ->
+          :ok
+
+        [_full, next] ->
+          if String.upcase(next) in @clause_keywords, do: :ok, else: unsupported(sql)
+
+        nil ->
+          unsupported(sql)
+      end
+    end
+  end
+
+  @spec check_constructs(binary()) :: :ok | {:error, term()}
+  defp check_constructs(sql) do
+    case Regex.run(@unsupported_construct, sql) do
+      [_full, construct] ->
+        {:error, local_error("unsupported SQL construct #{String.upcase(construct)}: #{sql}")}
+
+      nil ->
+        :ok
+    end
+  end
+
+  # After the CTEs are split off, one query holds exactly one SELECT; a
+  # second one is a subquery (`WHERE x IN (SELECT ...)`), which would
+  # otherwise be read as a string literal.
+  @spec check_single_select(binary()) :: :ok | {:error, term()}
+  defp check_single_select(sql) do
+    if length(Regex.scan(~r/(?i)\bSELECT\b/, sql)) > 1,
+      do: {:error, local_error("unsupported SQL construct SUBQUERY: #{sql}")},
+      else: :ok
+  end
+
+  @spec unsupported(binary()) :: {:error, term()}
+  defp unsupported(sql), do: {:error, local_error("unsupported SQL: #{sql}")}
+
+  # `SELECT w.bid FROM q AS w WHERE w.provider = 'a'` — one table per query,
+  # so a qualifier (the table name or its alias) adds nothing: drop the
+  # alias from FROM and the `qualifier.` prefixes outside string literals.
+  # A keyword after the table is a clause (or an unsupported construct that
+  # `check_clauses/1` will name), never an alias.
+  @not_an_alias ~w(WHERE GROUP ORDER LIMIT JOIN CROSS INNER LEFT RIGHT FULL OUTER NATURAL UNION EXCEPT INTERSECT HAVING OFFSET ON USING)
+  @from_alias_pattern ~r/(?i)(FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+))(?:\s+(?:AS\s+)?(?!(?:#{Enum.join(@not_an_alias, "|")})\b)(\w+))?/
+
+  @spec strip_table_qualifiers(binary()) :: binary()
+  defp strip_table_qualifiers(sql) do
+    case Regex.run(@from_alias_pattern, sql) do
+      [_full, from_clause, table, alias_name] ->
+        alias_pattern =
+          ~r/(?i)(#{Regex.escape(from_clause)})\s+(?:AS\s+)?#{Regex.escape(alias_name)}\b/
+
+        sql
+        |> String.replace(alias_pattern, "\\1")
+        |> drop_qualifiers([String.trim(table, "\""), alias_name])
+
+      [_full, _from_clause, table] ->
+        drop_qualifiers(sql, [String.trim(table, "\"")])
+
+      nil ->
+        sql
+    end
+  end
+
+  @spec drop_qualifiers(binary(), [binary()]) :: binary()
+  defp drop_qualifiers(sql, qualifiers) do
+    names = qualifiers |> Enum.map(&Regex.escape/1) |> Enum.join("|")
+    pattern = ~r/'[^']*'|(?<![\w."])(?:#{names})\.(?=\w)/
+
+    Regex.replace(pattern, sql, fn
+      "'" <> _rest = literal -> literal
+      _qualifier -> ""
+    end)
   end
 
   @spec distinct_query?(binary()) :: boolean()
@@ -143,7 +315,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          group_by_columns: parse_group_by_columns(sql),
          select_columns: columns,
          distinct_columns: nil,
-         projection_columns: nil
+         projection_columns: nil,
+         ctes: []
        }}
     end
   end
@@ -662,7 +835,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          group_by_columns: nil,
          select_columns: nil,
          distinct_columns: columns,
-         projection_columns: nil
+         projection_columns: nil,
+         ctes: []
        }}
     end
   end
@@ -698,7 +872,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          group_by_columns: nil,
          select_columns: nil,
          distinct_columns: nil,
-         projection_columns: nil
+         projection_columns: nil,
+         ctes: []
        }}
     end
   end
@@ -710,27 +885,26 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp parse_columns_select(sql) do
     case Regex.run(@columns_select_pattern, sql) do
       [_full, columns_str, quoted, "", rest] when quoted != "" ->
-        build_columns_query(columns_str, quoted, rest, sql)
+        build_columns_query(columns_str, quoted, rest)
 
       [_full, columns_str, "", unquoted, rest] ->
         build_columns_query(
           columns_str,
           LineProtocolParser.unescape_measurement(unquoted),
-          rest,
-          sql
+          rest
         )
 
       [_full, columns_str, quoted, rest] when quoted != "" ->
-        build_columns_query(columns_str, quoted, rest, sql)
+        build_columns_query(columns_str, quoted, rest)
 
       _no_match ->
         {:error, local_error("unsupported SQL: #{sql}")}
     end
   end
 
-  @spec build_columns_query(binary(), binary(), binary(), binary()) ::
+  @spec build_columns_query(binary(), binary(), binary()) ::
           {:ok, parsed_query()} | {:error, term()}
-  defp build_columns_query(columns_str, measurement, rest, sql) do
+  defp build_columns_query(columns_str, measurement, rest) do
     case parse_projection_columns(columns_str) do
       {:ok, projection} ->
         with {:ok, where} <- parse_where(rest) do
@@ -744,17 +918,18 @@ defmodule InfluxElixir.Client.Local.SQLParser do
              group_by_columns: nil,
              select_columns: nil,
              distinct_columns: nil,
-             projection_columns: projection
+             projection_columns: projection,
+             ctes: []
            }}
         end
 
-      {:error, _reason} ->
-        {:error, local_error("unsupported SQL: #{sql}")}
+      {:error, _reason} = error ->
+        error
     end
   end
 
   @spec parse_projection_columns(binary()) ::
-          {:ok, [{binary(), binary()}]} | {:error, term()}
+          {:ok, [projection()]} | {:error, term()}
   defp parse_projection_columns(columns_str) do
     columns =
       columns_str
@@ -769,14 +944,31 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  # Parse `name` or `name AS alias`, returning `{source, output}`.
-  @spec parse_projection_column(binary()) ::
-          {:ok, {binary(), binary()}} | {:error, term()}
+  # Parse `name`, `name AS alias` or `<arithmetic> AS alias`, returning
+  # `{source, output}`. An expression needs an alias: DataFusion names an
+  # unaliased one after its own rendering (`q.bid * Int64(2)`), which the
+  # double will not guess.
+  @spec parse_projection_column(binary()) :: {:ok, projection()} | {:error, term()}
   defp parse_projection_column(col) do
-    case Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/i, String.trim(col)) do
-      [_full, name] -> {:ok, {name, name}}
-      [_full, name, alias_name] -> {:ok, {name, alias_name}}
-      _no_match -> {:error, local_error("unsupported column: #{col}")}
+    trimmed = String.trim(col)
+
+    cond do
+      match = Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/i, trimmed) ->
+        case match do
+          [_full, name] -> {:ok, {name, name}}
+          [_full, name, alias_name] -> {:ok, {name, alias_name}}
+        end
+
+      match = Regex.run(~r/^(.+?)\s+AS\s+(\w+)$/is, trimmed) ->
+        [_full, expr_str, alias_name] = match
+
+        case parse_expr(expr_str) do
+          {:ok, expr} -> {:ok, {expr, alias_name}}
+          {:error, _reason} -> {:error, local_error("unsupported column: #{col}")}
+        end
+
+      true ->
+        {:error, local_error("unsupported column (an expression needs AS alias): #{col}")}
     end
   end
 

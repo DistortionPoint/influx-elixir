@@ -70,6 +70,18 @@ defmodule InfluxElixir.Client.Local do
       `DATE_BIN` buckets are `DateTime` values with microsecond precision,
       the same as the HTTP and Flight transports return; compare them with
       `DateTime.compare/2` or a six-digit sigil (`~U[... .000000Z]`).
+      A projected column may be an arithmetic expression with an alias
+      (`(bid + ask) / 2 AS mid`); a null operand makes the column null
+      (omitted). `ORDER BY` may name a projected alias.
+    * `WITH name AS (<select>)[, name AS (<select>)] <select>` — non-recursive
+      CTEs. Each body is a query in this subset, run in order over the store
+      or an earlier CTE; the final `SELECT` may read from any of them
+      (`FROM w`). A CTE's output columns are its fields (`time` stays
+      `time`). Joins, set operations, `HAVING`, `OFFSET` and window
+      functions are rejected by name rather than silently ignored.
+    * Table qualifiers and aliases: `FROM q AS w` / `FROM q w`, and
+      `w.time`, `q.bid` in any clause — one table per query, so the prefix
+      is dropped.
     * `WHERE tag = 'value'` or `WHERE field > N` (supports AND). A quoted
       literal is always a **string**, exactly as in InfluxDB v3: `'08338636'`
       keeps its leading zero and matches a string tag, and comparing it
@@ -976,36 +988,110 @@ defmodule InfluxElixir.Client.Local do
   # Private — SQL query executor (parsing lives in SQLParser)
   # ---------------------------------------------------------------------------
 
+  # CTEs run first, in order, each over the store or an earlier CTE; their
+  # rows become the points the next query reads (a CTE shadows a measurement
+  # of the same name, as in SQL).
   @spec execute_query(:ets.table(), SQLParser.parsed_query(), binary()) ::
           [map()] | {:error, term()}
-  defp execute_query(table, %{measurement: m} = query, database) do
-    if measurement_exists?(table, database, m) do
-      points = fetch_points(table, database, m)
-      filtered = apply_where(points, query.where)
-
-      cond do
-        query.distinct_columns ->
-          execute_distinct_query(filtered, query)
-
-        query.select_columns ->
-          execute_aggregate_query(filtered, query)
-
-        query.projection_columns ->
-          filtered
-          |> apply_order_by(query.order_by)
-          |> apply_limit(query.limit)
-          |> Enum.map(&point_to_row/1)
-          |> Enum.map(&project_row(&1, query.projection_columns))
-
-        true ->
-          filtered
-          |> apply_order_by(query.order_by)
-          |> apply_limit(query.limit)
-          |> Enum.map(&point_to_row/1)
+  defp execute_query(table, query, database) do
+    query.ctes
+    |> Enum.reduce_while({:ok, %{}}, fn {name, cte_query}, {:ok, sources} ->
+      case execute_select(table, cte_query, database, sources) do
+        {:error, _reason} = error -> {:halt, error}
+        rows -> {:cont, {:ok, Map.put(sources, name, rows_to_points(name, rows))}}
       end
-    else
-      {:error, table_not_found(m)}
+    end)
+    |> case do
+      {:ok, sources} -> execute_select(table, query, database, sources)
+      {:error, _reason} = error -> error
     end
+  end
+
+  @spec execute_select(:ets.table(), SQLParser.parsed_query(), binary(), %{
+          binary() => [point_map()]
+        }) :: [map()] | {:error, term()}
+  defp execute_select(table, %{measurement: m} = query, database, cte_sources) do
+    case source_points(table, database, m, cte_sources) do
+      {:ok, points} ->
+        filtered = apply_where(points, query.where)
+
+        cond do
+          query.distinct_columns ->
+            execute_distinct_query(filtered, query)
+
+          query.select_columns ->
+            execute_aggregate_query(filtered, query)
+
+          query.projection_columns ->
+            execute_projection_query(filtered, query)
+
+          true ->
+            filtered
+            |> apply_order_by(query.order_by)
+            |> apply_limit(query.limit)
+            |> Enum.map(&point_to_row/1)
+        end
+
+      :error ->
+        {:error, table_not_found(m)}
+    end
+  end
+
+  @spec source_points(:ets.table(), binary(), binary(), %{binary() => [point_map()]}) ::
+          {:ok, [point_map()]} | :error
+  defp source_points(table, database, measurement, cte_sources) do
+    cond do
+      Map.has_key?(cte_sources, measurement) ->
+        {:ok, Map.fetch!(cte_sources, measurement)}
+
+      measurement_exists?(table, database, measurement) ->
+        {:ok, fetch_points(table, database, measurement)}
+
+      true ->
+        :error
+    end
+  end
+
+  # A CTE's output rows, read back as points: every column but `time` is a
+  # field (tag/field is a storage distinction the next query cannot see).
+  @spec rows_to_points(binary(), [map()]) :: [point_map()]
+  defp rows_to_points(name, rows) do
+    Enum.map(rows, fn row ->
+      timestamp =
+        case Map.get(row, "time") do
+          %DateTime{} = dt -> DateTime.to_unix(dt, :nanosecond)
+          nil -> nil
+        end
+
+      %{measurement: name, tags: %{}, fields: Map.delete(row, "time"), timestamp: timestamp}
+    end)
+  end
+
+  # SELECT col, expr AS alias, ...: rows are projected first so ORDER BY can
+  # name a projected alias (`ORDER BY mid DESC`) as well as any source column.
+  @spec execute_projection_query([point_map()], SQLParser.parsed_query()) :: [map()]
+  defp execute_projection_query(points, query) do
+    projection = query.projection_columns
+    outputs = Enum.map(projection, fn {_source, output} -> output end)
+
+    points
+    |> Enum.map(fn point -> {point, project_point(point, projection)} end)
+    |> order_projected(query.order_by, outputs)
+    |> apply_limit(query.limit)
+    |> Enum.map(fn {_point, row} -> row end)
+  end
+
+  @spec order_projected([{point_map(), map()}], SQLParser.order_by(), [binary()]) ::
+          [{point_map(), map()}]
+  defp order_projected(pairs, nil, _outputs), do: pairs
+
+  defp order_projected(pairs, {column, direction}, outputs) do
+    key =
+      if column in outputs,
+        do: fn {_point, row} -> Map.get(row, column) end,
+        else: fn {point, _row} -> point_value(point, column) end
+
+    Enum.sort_by(pairs, key, sorter(direction))
   end
 
   # The same shape and wording the real engine returns for a missing table
@@ -1019,10 +1105,14 @@ defmodule InfluxElixir.Client.Local do
     }
   end
 
-  @spec project_row(map(), [{binary(), binary()}]) :: map()
-  defp project_row(row, projection) do
-    Enum.reduce(projection, %{}, fn {source, output}, acc ->
-      put_column(acc, output, Map.get(row, source))
+  @spec project_point(point_map(), [SQLParser.projection()]) :: map()
+  defp project_point(point, projection) do
+    Enum.reduce(projection, %{}, fn
+      {source, output}, acc when is_binary(source) ->
+        put_column(acc, output, point_value(point, source))
+
+      {expr, output}, acc ->
+        put_column(acc, output, eval_expr(expr, point))
     end)
   end
 
@@ -1433,7 +1523,7 @@ defmodule InfluxElixir.Client.Local do
   defp point_to_row(point) do
     point.fields
     |> Map.merge(point.tags)
-    |> Map.put("time", nanoseconds_to_datetime(point.timestamp))
+    |> put_column("time", nanoseconds_to_datetime(point.timestamp))
   end
 
   # Flux responses include _measurement (v2 compatibility format)

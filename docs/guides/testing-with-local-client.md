@@ -478,6 +478,51 @@ LIMIT 1
 Both fields and tags are selectable. Aliasing renames the output key:
 `SELECT net_value AS nv FROM x` produces rows keyed by `"nv"`.
 
+## Projected Expressions, CTEs and Table Aliases
+
+A projected column may be an arithmetic expression, with an alias; a null
+operand makes the column null, which is omitted from the row. `ORDER BY` may
+name the alias:
+
+```elixir
+{:ok, rows} =
+  Local.query_sql(conn, ~s|SELECT (bid + ask) / 2 AS mid, time FROM "quotes" ORDER BY mid DESC|,
+    database: "test_db"
+  )
+```
+
+Non-recursive CTEs run in order; each body is a query in the supported
+subset over a measurement or an earlier CTE, and the final `SELECT` reads
+from any of them. Table aliases and `alias.column` qualifiers are accepted in
+every clause. The candle shape — derive a mid price, then bin it — is:
+
+```elixir
+sql = """
+WITH w AS (
+  SELECT (bid + ask) / 2 AS mid, time
+  FROM "quotes"
+  WHERE symbol = $symbol AND bid IS NOT NULL AND ask IS NOT NULL
+)
+SELECT
+  DATE_BIN(INTERVAL '1 minute', w.time) AS time,
+  selector_first(w.mid, w.time)['value'] AS open,
+  MAX(w.mid) AS high,
+  MIN(w.mid) AS low,
+  selector_last(w.mid, w.time)['value'] AS close
+FROM w
+GROUP BY DATE_BIN(INTERVAL '1 minute', w.time)
+ORDER BY time ASC
+"""
+
+{:ok, candles} = Local.query_sql(conn, sql, database: "test_db", params: %{symbol: "BTC-USD"})
+```
+
+Joins (`CROSS JOIN`, `INNER JOIN`, ...), set operations, subqueries in
+`WHERE`, `HAVING`, `OFFSET` and window functions are outside the subset and
+are rejected **by name** (`Client.Local: unsupported SQL construct JOIN`)
+rather than ignored, so a query the double cannot run never returns rows
+computed from its first table alone. Cover those in the integration tier.
+
 ## IN / NOT IN Clauses
 
 `WHERE col IN (...)` and `WHERE col NOT IN (...)` are supported on tags

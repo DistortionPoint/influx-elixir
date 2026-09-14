@@ -19,6 +19,7 @@
 - Selectors: `selector_first|last|min|max(field, time)['value' | 'time'] AS alias`; the InfluxQL `FIRST()`/`LAST()` are not v3 SQL
 - `WHERE time` compares only with a quoted ISO-8601 datetime or date, or `now() +/- INTERVAL 'N unit'`; a bare integer or integer param is a planning error on the server and is rejected by `Client.Local` too — bind a `DateTime`
 - `COUNT(DISTINCT col)`, `MIN(time)` / `MAX(time)` (a `DateTime`) and `WHERE col IS [NOT] NULL` work on both clients; `AVG(time)` and arithmetic on `time` do not
+- `Client.Local` also runs projected arithmetic with an alias (`(bid + ask) / 2 AS mid`), non-recursive `WITH` CTEs read in order, and `alias.column` qualifiers; joins, set operations, subqueries, `HAVING`, `OFFSET` and window functions are rejected by name — cover those against a real server
 - Default response format is JSON; `:jsonl`, `:csv` and `:parquet` (raw binary) are also supported
 
 ## Arrow Flight

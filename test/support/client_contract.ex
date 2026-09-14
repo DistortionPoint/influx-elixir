@@ -58,6 +58,7 @@ defmodule InfluxElixir.ClientContract do
     aggregate_tests = if v3_sql, do: aggregate_tests(client), else: nil
     stats_tests = if v3_sql, do: stats_tests(client), else: nil
     time_filter_tests = if v3_sql, do: time_filter_tests(client), else: nil
+    cte_tests = if v3_sql, do: cte_tests(client), else: nil
     ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
     distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
     param_tests = if v3_sql, do: param_tests(client), else: nil
@@ -92,6 +93,7 @@ defmodule InfluxElixir.ClientContract do
         aggregate_tests,
         stats_tests,
         time_filter_tests,
+        cte_tests,
         ordered_agg_tests,
         distinct_tests,
         param_tests,
@@ -1246,6 +1248,107 @@ defmodule InfluxElixir.ClientContract do
                      "SELECT DISTINCT provider FROM contract_tf ORDER BY price",
                      database: ctx.database
                    )
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Projected expressions, CTEs and table qualifiers (#18)
+  # ---------------------------------------------------------------------------
+
+  defp cte_tests(client) do
+    quote do
+      describe "query_sql/3 — projected expression and CTE contract" do
+        setup ctx do
+          lp =
+            Enum.join(
+              [
+                "contract_cte,provider=a bid=1.0,ask=3.0 1700000000000000000",
+                "contract_cte,provider=a bid=2.0,ask=4.0 1700000060000000000",
+                "contract_cte,provider=b bid=10.0 1700000120000000000",
+                "contract_cte,provider=b bid=5.0,ask=7.0 1700000121000000000"
+              ],
+              "\n"
+            )
+
+          {:ok, :written} = unquote(client).write(ctx.conn, lp, database: ctx.database)
+          InfluxElixir.ClientContract.settle(ctx)
+          :ok
+        end
+
+        test "arithmetic in a projected column, null omitted, ORDER BY alias", ctx do
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT (bid + ask) / 2 AS mid, time FROM contract_cte ORDER BY time",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, &Map.get(&1, "mid")) == [2.0, 3.0, nil, 6.0]
+          refute Map.has_key?(Enum.at(rows, 2), "mid")
+
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT (bid + ask) / 2 AS mid FROM contract_cte ORDER BY mid DESC",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, &Map.get(&1, "mid")) == [nil, 6.0, 3.0, 2.0]
+        end
+
+        test "a CTE with a qualified DATE_BIN GROUP BY", ctx do
+          sql = """
+          WITH w AS (SELECT bid, time FROM contract_cte)
+          SELECT DATE_BIN(INTERVAL '1 minute', w.time) AS time, MAX(w.bid) AS hi
+          FROM w GROUP BY DATE_BIN(INTERVAL '1 minute', w.time) ORDER BY time
+          """
+
+          {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+          assert Enum.map(rows, & &1["hi"]) == [1.0, 2.0, 10.0]
+          assert Enum.all?(rows, &match?(%DateTime{}, &1["time"]))
+        end
+
+        test "the candle shape: derived mid in a CTE, selectors over it", ctx do
+          sql = """
+          WITH w AS (SELECT (bid + ask) / 2 AS mid, time FROM contract_cte WHERE ask IS NOT NULL)
+          SELECT
+            DATE_BIN(INTERVAL '1 minute', time) AS time,
+            selector_first(mid, time)['value'] AS open,
+            MAX(mid) AS high,
+            selector_last(mid, time)['value'] AS close
+          FROM w
+          GROUP BY DATE_BIN(INTERVAL '1 minute', time)
+          ORDER BY time
+          """
+
+          {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+
+          assert Enum.map(rows, &{&1["open"], &1["high"], &1["close"]}) ==
+                   [{2.0, 2.0, 2.0}, {3.0, 3.0, 3.0}, {6.0, 6.0, 6.0}]
+        end
+
+        test "chained CTEs and table aliases", ctx do
+          sql = """
+          WITH w AS (SELECT bid, provider, time FROM contract_cte),
+               x AS (SELECT provider, MAX(bid) AS mb FROM w GROUP BY provider)
+          SELECT * FROM x ORDER BY provider
+          """
+
+          {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+          assert rows == [%{"provider" => "a", "mb" => 2.0}, %{"provider" => "b", "mb" => 10.0}]
+
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT t.bid FROM contract_cte t WHERE t.provider = 'b' ORDER BY t.bid",
+              database: ctx.database
+            )
+
+          assert rows == [%{"bid" => 5.0}, %{"bid" => 10.0}]
         end
       end
     end

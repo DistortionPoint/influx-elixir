@@ -24,6 +24,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` refused projected arithmetic and CTEs InfluxDB 3 runs
+  (#18).** Verified against InfluxDB 3 Core: `SELECT (bid + ask) / 2 AS mid,
+  time FROM q` and `WITH w AS (SELECT bid, time FROM q) SELECT
+  DATE_BIN(INTERVAL '1 minute', w.time) AS time, MAX(w.bid) AS hi FROM w
+  GROUP BY DATE_BIN(INTERVAL '1 minute', w.time)` both return rows on the
+  server and were `Client.Local:` 400s. The double now supports an arithmetic
+  expression as a projected column (with an alias; `ORDER BY` may name it),
+  non-recursive `WITH` CTEs executed in order (a later CTE or the final
+  `SELECT` reads an earlier one), table aliases (`FROM q AS w`, `FROM q w`)
+  and `alias.column` qualifiers in every clause.
+- **`Client.Local` silently ignored everything after the table name.**
+  `SELECT * FROM w CROSS JOIN q` answered from `w` alone, `... UNION SELECT
+  ...` took `UNION` as a table alias, and `WHERE x IN (SELECT ...)` compared
+  against the string `"SELECT ..."`. Joins, set operations, subqueries,
+  `HAVING`, `OFFSET` and window functions are now rejected by name
+  (`Client.Local: unsupported SQL construct JOIN`).
+- `Client.Local` returned `"time" => nil` for a row without a timestamp (a
+  CTE that did not project `time`); the column is omitted, as everywhere
+  else.
 - **`Client.Local` accepted `time` comparands InfluxDB rejects, and silently
   matched nothing for ones it accepts.** Verified against InfluxDB 3 Core:
   a bare integer (`time > 1700000000`) or integer param fails planning on

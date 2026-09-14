@@ -3727,4 +3727,171 @@ defmodule InfluxElixir.Client.LocalTest do
                )
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Issue #18: projected arithmetic, CTEs, table qualifiers. Expected values
+  # recorded from InfluxDB 3 Core (docs/design/2026-09-15_local-ctes-projected-expressions.md).
+  # ---------------------------------------------------------------------------
+
+  describe "bug regression — projected expressions, CTEs and qualifiers (#18)" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "cte_db")
+
+      lines =
+        Enum.join(
+          [
+            "q,provider=a bid=1.0,ask=3.0 1000000000",
+            "q,provider=a bid=2.0,ask=4.0 61000000000",
+            "q,provider=b bid=10.0 121000000000",
+            "q,provider=b bid=5.0,ask=7.0 122000000000"
+          ],
+          "\n"
+        )
+
+      {:ok, :written} = Local.write(conn, lines, database: "cte_db")
+      {:ok, db: "cte_db"}
+    end
+
+    test "arithmetic in a projected column; a null operand omits the column",
+         %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT (bid + ask) / 2 AS mid, time FROM "q" ORDER BY time|,
+                 database: db
+               )
+
+      assert Enum.map(rows, & &1["mid"]) == [2.0, 3.0, nil, 6.0]
+      refute Map.has_key?(Enum.at(rows, 2), "mid")
+      assert Enum.all?(rows, &match?(%DateTime{}, &1["time"]))
+    end
+
+    test "ORDER BY a projected alias", %{conn: conn, db: db} do
+      assert {:ok, [%{}, %{"mid" => 6.0}, %{"mid" => 3.0}, %{"mid" => 2.0}]} =
+               Local.query_sql(conn, ~s|SELECT (bid + ask) / 2 AS mid FROM "q" ORDER BY mid DESC|,
+                 database: db
+               )
+    end
+
+    test "an expression without AS alias is rejected with the reason", %{conn: conn, db: db} do
+      assert {:error,
+              %{
+                status: 400,
+                body: "Client.Local: unsupported column (an expression needs AS alias)" <> _rest
+              }} =
+               Local.query_sql(conn, ~s|SELECT bid * 2 FROM "q"|, database: db)
+    end
+
+    test "a CTE feeds GROUP BY DATE_BIN qualified by the CTE alias", %{conn: conn, db: db} do
+      sql = """
+      WITH w AS (SELECT bid, time FROM "q")
+      SELECT DATE_BIN(INTERVAL '1 minute', w.time) AS time, MAX(w.bid) AS hi
+      FROM w GROUP BY DATE_BIN(INTERVAL '1 minute', w.time) ORDER BY time
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      assert Enum.map(rows, & &1["hi"]) == [1.0, 2.0, 10.0]
+      assert hd(rows)["time"] == ~U[1970-01-01 00:00:00.000000Z]
+    end
+
+    test "the candle shape: a derived mid in a CTE, then selectors over it", %{conn: conn, db: db} do
+      sql = """
+      WITH w AS (SELECT (bid + ask) / 2 AS mid, time FROM "q" WHERE ask IS NOT NULL)
+      SELECT
+        DATE_BIN(INTERVAL '1 minute', time) AS time,
+        selector_first(mid, time)['value'] AS open,
+        MAX(mid) AS high,
+        selector_last(mid, time)['value'] AS close
+      FROM w
+      GROUP BY DATE_BIN(INTERVAL '1 minute', time)
+      ORDER BY time
+      """
+
+      assert {:ok, [b0, b1, b2]} = Local.query_sql(conn, sql, database: db)
+      assert %{"open" => 2.0, "high" => 2.0, "close" => 2.0} = b0
+      assert %{"open" => 3.0, "high" => 3.0, "close" => 3.0} = b1
+      assert %{"open" => 6.0, "high" => 6.0, "close" => 6.0} = b2
+    end
+
+    test "CTEs chain in order and a later one may read an earlier one", %{conn: conn, db: db} do
+      sql = """
+      WITH w AS (SELECT bid, provider, time FROM "q"),
+           x AS (SELECT provider, MAX(bid) AS mb FROM w GROUP BY provider)
+      SELECT * FROM x ORDER BY provider
+      """
+
+      assert {:ok,
+              [%{"provider" => "a", "mb" => 2.0} = first, %{"provider" => "b", "mb" => 10.0}]} =
+               Local.query_sql(conn, sql, database: db)
+
+      # x has no time column; none is invented.
+      refute Map.has_key?(first, "time")
+    end
+
+    test "a CTE shadows nothing it does not name", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(conn, ~s|WITH w AS (SELECT bid FROM "q") SELECT * FROM "q"|,
+                 database: db
+               )
+
+      assert length(rows) == 4
+
+      assert {:ok, [%{"n" => 4}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|WITH w AS (SELECT bid FROM "q") SELECT COUNT(*) AS n FROM w|,
+                 database: db
+               )
+    end
+
+    test "a CTE over a missing table reports the engine's table-not-found error",
+         %{conn: conn, db: db} do
+      assert {:error,
+              %{status: 400, body: "Error during planning: table 'public.iox.nope' not found"}} =
+               Local.query_sql(conn, ~s|WITH w AS (SELECT bid FROM nope) SELECT * FROM w|,
+                 database: db
+               )
+    end
+
+    test "table aliases and qualified columns are accepted in every clause", %{conn: conn, db: db} do
+      assert {:ok, [%{"bid" => 1.0, "time" => %DateTime{}}]} =
+               Local.query_sql(conn, ~s|SELECT q.bid, q.time FROM q AS q ORDER BY q.time LIMIT 1|,
+                 database: db
+               )
+
+      assert {:ok, [%{"bid" => 5.0}, %{"bid" => 10.0}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT t.bid FROM q t WHERE t.provider = 'b' ORDER BY t.bid|,
+                 database: db
+               )
+
+      assert {:ok, [_b0, _b1, %{"n" => 2}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT DATE_BIN(INTERVAL '1 minute', q.time) AS b, COUNT(*) AS n FROM q GROUP BY DATE_BIN(INTERVAL '1 minute', q.time) ORDER BY b|,
+                 database: db
+               )
+
+      # A qualifier-looking string literal is untouched.
+      assert {:ok, []} =
+               Local.query_sql(conn, ~s|SELECT provider FROM q WHERE provider = 'q.x'|,
+                 database: db
+               )
+    end
+
+    test "joins, set operations and windows are rejected by name, not ignored",
+         %{conn: conn, db: db} do
+      for {sql, construct} <- [
+            {~s|WITH w AS (SELECT bid FROM "q") SELECT * FROM w CROSS JOIN q|, "JOIN"},
+            {~s|SELECT bid FROM "q" UNION SELECT ask FROM "q"|, "UNION"},
+            {~s|SELECT provider, COUNT(*) AS n FROM "q" GROUP BY provider HAVING n > 1|,
+             "HAVING"},
+            {~s|SELECT bid FROM "q" LIMIT 1 OFFSET 1|, "OFFSET"}
+          ] do
+        assert {:error, %{status: 400, body: body}} = Local.query_sql(conn, sql, database: db)
+        assert body =~ "Client.Local: unsupported SQL construct #{construct}", sql
+      end
+    end
+  end
 end
