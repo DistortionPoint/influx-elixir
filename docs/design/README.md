@@ -28,6 +28,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-12 | [`local-parser-extraction`](2026-09-12_local-parser-extraction.md) | `SQLParser` and `LineProtocolParser` split out of `Client.Local` |
 | 2026-09-12 | [`local-atomic-ets-layout`](2026-09-12_local-atomic-ets-layout.md) | Per-key ETS layout: no lost concurrent writes, linear bulk writes (#15) |
 | 2026-09-14 | [`local-sql-stats-selectors-distinct`](2026-09-14_local-sql-stats-selectors-distinct.md) | `STDDEV`/`VAR` family, field arithmetic, selectors, multi-column `DISTINCT`, null omission, `check_sql/1`, HTTP timestamp typing (#16, #17) |
+| 2026-09-14 | [`local-time-filters-count-distinct`](2026-09-14_local-time-filters-count-distinct.md) | `now()` and strict `time` comparands, `COUNT(DISTINCT)`, `IS NULL`, `MAX(time)`, `DISTINCT ORDER BY`, real `BatchWriter` backpressure |
 
 ## Verifying against a real engine
 

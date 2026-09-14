@@ -158,4 +158,114 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
                )
     end
   end
+
+  # A retry chain end to end: a pool of size 1 is held by a streaming request,
+  # so the writer's first flush fails at checkout (a transport error, retried);
+  # by the time the backoff fires the holder has released the connection and
+  # the retry reaches the server. No fake server is involved.
+  describe "BatchWriter retry against the server" do
+    setup ctx do
+      finch = :"bw_int_finch_#{System.unique_integer([:positive])}"
+      start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
+      conn = Keyword.put(ctx.conn, :finch_name, finch)
+
+      holder =
+        Task.async(fn ->
+          request =
+            Finch.build(
+              :post,
+              "http://#{conn[:host]}:#{conn[:port]}/api/v3/query_sql",
+              [{"content-type", "application/json"}],
+              Jason.encode!(%{"db" => ctx.database, "q" => "SELECT 1", "format" => "json"})
+            )
+
+          Finch.stream(request, finch, nil, fn _chunk, acc ->
+            Process.sleep(1_000)
+            acc
+          end)
+        end)
+
+      Process.sleep(200)
+      {:ok, conn: conn, holder: holder}
+    end
+
+    test "a transport error is retried and the retry succeeds", ctx do
+      pid =
+        start_supervised!(
+          {InfluxElixir.Write.BatchWriter,
+           connection: ctx.conn,
+           client: HTTP,
+           database: ctx.database,
+           batch_size: 1,
+           flush_interval_ms: 60_000,
+           max_retries: 3,
+           base_retry_delay_ms: 1_000,
+           write_opts: [pool_timeout: 100]}
+        )
+
+      # batch_size 1 flushes at once; checkout times out; chain starts.
+      :ok = InfluxElixir.Write.BatchWriter.write(pid, "bw_retry value=1.0")
+
+      assert {:ok, %{total_writes: 0, total_errors: 0}} =
+               InfluxElixir.Write.BatchWriter.stats(pid)
+
+      wait_until(fn ->
+        {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(pid)
+        stats.total_writes == 1
+      end)
+
+      InfluxElixir.ClientContract.settle(ctx)
+
+      assert {:ok, [%{"value" => 1.0}]} =
+               HTTP.query_sql(ctx.conn, "SELECT value FROM bw_retry", database: ctx.database)
+
+      Task.await(ctx.holder, 10_000)
+    end
+
+    test "a 4xx answered on retry discards the batch instead of retrying again", ctx do
+      pid =
+        start_supervised!(
+          {InfluxElixir.Write.BatchWriter,
+           connection: ctx.conn,
+           client: HTTP,
+           database: ctx.database,
+           batch_size: 1,
+           flush_interval_ms: 60_000,
+           max_retries: 3,
+           base_retry_delay_ms: 1_000,
+           write_opts: [pool_timeout: 100]}
+        )
+
+      :ok = InfluxElixir.Write.BatchWriter.write(pid, "not line protocol!!!")
+
+      wait_until(fn ->
+        {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(pid)
+        stats.total_errors == 1
+      end)
+
+      # The chain is over: a valid batch goes straight through.
+      assert :ok = InfluxElixir.Write.BatchWriter.write_sync(pid, "bw_retry value=2.0")
+
+      assert {:ok, %{total_errors: 1, total_writes: 1}} =
+               InfluxElixir.Write.BatchWriter.stats(pid)
+    end
+  end
+
+  defp wait_until(fun, deadline_ms \\ 10_000) do
+    deadline = System.monotonic_time(:millisecond) + deadline_ms
+    do_wait_until(fun, deadline)
+  end
+
+  defp do_wait_until(fun, deadline) do
+    cond do
+      fun.() ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("condition not met within deadline")
+
+      true ->
+        Process.sleep(20) && do_wait_until(fun, deadline)
+    end
+  end
 end

@@ -57,6 +57,7 @@ defmodule InfluxElixir.ClientContract do
     stream_tests = if v3_sql, do: stream_tests(client), else: nil
     aggregate_tests = if v3_sql, do: aggregate_tests(client), else: nil
     stats_tests = if v3_sql, do: stats_tests(client), else: nil
+    time_filter_tests = if v3_sql, do: time_filter_tests(client), else: nil
     ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
     distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
     param_tests = if v3_sql, do: param_tests(client), else: nil
@@ -90,6 +91,7 @@ defmodule InfluxElixir.ClientContract do
         stream_tests,
         aggregate_tests,
         stats_tests,
+        time_filter_tests,
         ordered_agg_tests,
         distinct_tests,
         param_tests,
@@ -1092,6 +1094,158 @@ defmodule InfluxElixir.ClientContract do
             unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
 
           assert Enum.map(rows, & &1["total"]) == [120, 60, 30]
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Time comparands, null checks, COUNT(DISTINCT), aggregates over `time`,
+  # DISTINCT ordering — every value recorded from InfluxDB 3 Core first.
+  # ---------------------------------------------------------------------------
+
+  defp time_filter_tests(client) do
+    quote do
+      describe "query_sql/3 — time comparand, null check and COUNT DISTINCT contract" do
+        setup ctx do
+          now_ns = System.os_time(:nanosecond)
+
+          lp =
+            Enum.join(
+              [
+                "contract_tf,provider=a,symbol=X price=1.0,bid=1.0 #{now_ns - 60_000_000_000}",
+                "contract_tf,provider=a,symbol=X price=2.0 #{now_ns - 600_000_000_000}",
+                "contract_tf,provider=b,symbol=Y price=3.0,bid=3.0 #{now_ns - 3_600_000_000_000}",
+                "contract_tf,provider=c,symbol=Z price=4.0 #{now_ns - 7_200_000_000_000}"
+              ],
+              "\n"
+            )
+
+          {:ok, :written} = unquote(client).write(ctx.conn, lp, database: ctx.database)
+          InfluxElixir.ClientContract.settle(ctx)
+          :ok
+        end
+
+        test "now() - INTERVAL filters relative to the query time", ctx do
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT price FROM contract_tf WHERE time >= now() - INTERVAL '2 minutes'",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, & &1["price"]) == [1.0]
+        end
+
+        test "a bare integer time comparand is rejected", ctx do
+          assert {:error, %{status: 400}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT price FROM contract_tf WHERE time > 1000000000",
+                     database: ctx.database
+                   )
+        end
+
+        test "an integer param against time is rejected", ctx do
+          assert {:error, %{status: 400}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT price FROM contract_tf WHERE time > $start",
+                     database: ctx.database,
+                     params: %{start: 1_000_000_000}
+                   )
+        end
+
+        test "a DateTime param against time selects by instant", ctx do
+          start = DateTime.add(DateTime.utc_now(), -120, :second)
+
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT price FROM contract_tf WHERE time >= $start",
+              database: ctx.database,
+              params: %{start: start}
+            )
+
+          assert Enum.map(rows, & &1["price"]) == [1.0]
+        end
+
+        test "IS NULL and IS NOT NULL", ctx do
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT price FROM contract_tf WHERE bid IS NOT NULL ORDER BY price",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, & &1["price"]) == [1.0, 3.0]
+
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT price FROM contract_tf WHERE bid IS NULL ORDER BY price",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, & &1["price"]) == [2.0, 4.0]
+        end
+
+        test "COUNT(DISTINCT col) counts distinct non-null values", ctx do
+          {:ok, [row]} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT COUNT(DISTINCT provider) AS n, COUNT(DISTINCT bid) AS b FROM contract_tf",
+              database: ctx.database
+            )
+
+          assert row["n"] == 3
+          assert row["b"] == 2
+        end
+
+        test "MAX(time) and MIN(time) are DateTimes; AVG(time) is rejected", ctx do
+          {:ok, [row]} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT MAX(time) AS mx, MIN(time) AS mn, COUNT(time) AS n FROM contract_tf",
+              database: ctx.database
+            )
+
+          assert %DateTime{} = row["mx"]
+          assert %DateTime{} = row["mn"]
+          assert DateTime.compare(row["mx"], row["mn"]) == :gt
+          assert row["n"] == 4
+
+          assert {:error, %{status: 400}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT AVG(time) AS a FROM contract_tf",
+                     database: ctx.database
+                   )
+        end
+
+        test "SELECT DISTINCT honours ORDER BY DESC and LIMIT", ctx do
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT DISTINCT provider, symbol FROM contract_tf ORDER BY symbol DESC LIMIT 2",
+              database: ctx.database
+            )
+
+          assert rows == [
+                   %{"provider" => "c", "symbol" => "Z"},
+                   %{"provider" => "b", "symbol" => "Y"}
+                 ]
+        end
+
+        test "SELECT DISTINCT rejects ORDER BY a column outside the select list", ctx do
+          assert {:error, %{status: 400}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT DISTINCT provider FROM contract_tf ORDER BY price",
+                     database: ctx.database
+                   )
         end
       end
     end

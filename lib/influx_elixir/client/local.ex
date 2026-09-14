@@ -77,13 +77,23 @@ defmodule InfluxElixir.Client.Local do
       `amount >= '1000.00'` is a lexical comparison — DataFusion casts the
       numeric side to Utf8). Bare literals (`42`, `1.5`, `true`) are typed.
     * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)`
-    * `WHERE time <op> '<datetime>'` accepts ISO-8601 datetimes
-      (`'2026-03-31T12:00:00Z'`), bare ISO dates (`'2026-03-31'`,
-      interpreted as midnight UTC), and integer-as-string nanoseconds
-    * `SELECT DISTINCT col[, col ...] FROM measurement` (sorted combinations)
+    * `WHERE col IS NULL` and `WHERE col IS NOT NULL`
+    * `WHERE time <op> <comparand>` — exactly what InfluxDB 3 accepts against
+      a Timestamp: a quoted ISO-8601 datetime (`'2026-03-31T12:00:00Z'`,
+      zone-less or fractional forms too), a quoted date (`'2026-03-31'`,
+      midnight UTC), or `now()` offset by `+`/`-` `INTERVAL 'N unit'` terms
+      (`now() - INTERVAL '5 minutes'`). A bare integer (`time > 1700000000`)
+      and an integer-as-string are **rejected**, as DataFusion rejects them
+      ("Cannot infer common argument type for comparison operation
+      Timestamp(ns) > Int64"), rather than silently matching nothing.
+    * `SELECT DISTINCT col[, col ...] FROM measurement` (sorted combinations;
+      `ORDER BY` must name a selected column, as in DataFusion)
     * `ORDER BY <column> [ASC|DESC]` — `time` or any output column/alias
     * `LIMIT N`
-    * `$param` placeholders via `params: %{"$name" => value}` in opts
+    * `$param` placeholders via `params: %{"$name" => value}` in opts. A
+      `DateTime`, `NaiveDateTime` or `Date` param renders as the ISO-8601
+      string Jason sends over HTTP, so `time >= $start` works the same on
+      both clients; an integer param against `time` is rejected on both.
     * `DATE_BIN(INTERVAL 'N unit', time)` time bucketing
     * Aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `STDDEV` /
       `STDDEV_SAMP` (sample), `STDDEV_POP`, `VAR` / `VAR_SAMP` (sample),
@@ -93,7 +103,10 @@ defmodule InfluxElixir.Client.Local do
       Division by zero is null in the double, where InfluxDB returns IEEE
       infinity for floats (serialised as JSON `null` but counted by
       `COUNT`) and fails the query for integers. A sample
-      statistic over one value is null.
+      statistic over one value is null. `COUNT(DISTINCT col)` counts
+      distinct non-null values. `MIN(time)`, `MAX(time)` and `COUNT(time)`
+      work (a `DateTime` result); every other aggregate over `time`, and
+      any arithmetic on it, is rejected as DataFusion rejects it.
     * Selector functions: `selector_first|last|min|max(field, time)['value']`
       and `['time']`
     * Ordered aggregates: `first_value(field ORDER BY col [ASC|DESC])` and
@@ -1019,8 +1032,9 @@ defmodule InfluxElixir.Client.Local do
   defp put_column(row, _key, nil), do: row
   defp put_column(row, key, value), do: Map.put(row, key, value)
 
-  # SELECT DISTINCT a[, b ...]: one row per distinct combination, sorted.
-  # A row whose columns are all null is dropped, as the real engine does.
+  # SELECT DISTINCT a[, b ...]: one row per distinct combination, sorted
+  # unless ORDER BY (one of the selected columns) says otherwise. A row
+  # whose columns are all null is dropped, as the real engine does.
   @spec execute_distinct_query([point_map()], SQLParser.parsed_query()) :: [map()]
   defp execute_distinct_query(points, query) do
     columns = query.distinct_columns
@@ -1030,12 +1044,13 @@ defmodule InfluxElixir.Client.Local do
     |> Enum.reject(&Enum.all?(&1, fn value -> is_nil(value) end))
     |> Enum.uniq()
     |> Enum.sort()
-    |> apply_limit(query.limit)
     |> Enum.map(fn values ->
       columns
       |> Enum.zip(values)
       |> Enum.reduce(%{}, fn {column, value}, row -> put_column(row, column, value) end)
     end)
+    |> apply_order_by_rows(query.order_by, nil)
+    |> apply_limit(query.limit)
   end
 
   @spec point_value(point_map(), binary()) :: term()
@@ -1157,6 +1172,15 @@ defmodule InfluxElixir.Client.Local do
         # COUNT(*) — every matching row counts, regardless of field nullity.
         put_column(row, alias_name, length(points))
 
+      {:count_distinct, column, alias_name}, row ->
+        distinct =
+          points
+          |> Enum.map(&point_value(&1, column))
+          |> Enum.reject(&is_nil/1)
+          |> Enum.uniq()
+
+        put_column(row, alias_name, length(distinct))
+
       {:ordered_aggregate, agg, field, ordering, alias_name}, row ->
         put_column(row, alias_name, compute_ordered_aggregate(agg, field, ordering, points))
 
@@ -1167,7 +1191,10 @@ defmodule InfluxElixir.Client.Local do
 
   # Evaluates an aggregate argument for one point. A missing field or a
   # non-numeric operand makes the value null, which the aggregate skips.
-  @spec eval_expr(SQLParser.expr(), point_map()) :: number() | nil
+  # `time` is the point's timestamp; the parser only lets it reach MIN, MAX
+  # and COUNT, the aggregates DataFusion accepts over a Timestamp.
+  @spec eval_expr(SQLParser.expr(), point_map()) :: number() | DateTime.t() | nil
+  defp eval_expr({:field, "time"}, point), do: nanoseconds_to_datetime(point.timestamp)
   defp eval_expr({:field, name}, point), do: Map.get(point.fields, name)
   defp eval_expr({:lit, value}, _point), do: value
 
@@ -1192,13 +1219,15 @@ defmodule InfluxElixir.Client.Local do
   defp arithmetic(:/, l, r) when is_integer(l) and is_integer(r), do: div(l, r)
   defp arithmetic(:/, l, r), do: l / r
 
-  @spec compute_aggregate(SQLParser.aggregate(), [number()]) :: number() | nil
+  @spec compute_aggregate(SQLParser.aggregate(), [number() | DateTime.t()]) ::
+          number() | DateTime.t() | nil
   defp compute_aggregate(:count, vals), do: length(vals)
   defp compute_aggregate(_agg, []), do: nil
   defp compute_aggregate(:avg, vals), do: Enum.sum(vals) / length(vals)
   defp compute_aggregate(:sum, vals), do: Enum.sum(vals)
-  defp compute_aggregate(:min, vals), do: Enum.min(vals)
-  defp compute_aggregate(:max, vals), do: Enum.max(vals)
+  # MIN/MAX also run over `time`, so the comparison must be DateTime-aware.
+  defp compute_aggregate(:min, vals), do: Enum.min(vals, &value_order/2)
+  defp compute_aggregate(:max, vals), do: Enum.max(vals, sorter(:desc))
   # Sample forms need at least two values, exactly as the real engine
   # (STDDEV of one row is null); population forms are defined for one.
   defp compute_aggregate(:var, [_one]), do: nil
@@ -1331,6 +1360,11 @@ defmodule InfluxElixir.Client.Local do
     not Enum.any?(values, &compare(actual, :eq, &1))
   end
 
+  defp matches_condition?(point, {:is_null, key, _nil}), do: is_nil(point_value(point, key))
+
+  defp matches_condition?(point, {:is_not_null, key, _nil}),
+    do: not is_nil(point_value(point, key))
+
   defp matches_condition?(point, {op, "time", value}) do
     compare(point.timestamp, op, to_nanoseconds(value))
   end
@@ -1346,50 +1380,12 @@ defmodule InfluxElixir.Client.Local do
     Enum.any?(values, fn v -> ts == to_nanoseconds(v) end)
   end
 
-  # Convert various time representations to nanosecond integers.
-  # Accepts: integer ns, ISO-8601 datetime ("2026-03-31T12:00:00Z"),
-  # bare ISO date ("2026-03-31" → midnight UTC), or integer-as-string.
-  @spec to_nanoseconds(term()) :: integer() | nil
+  # The parser has already turned every `time` comparand into nanoseconds or
+  # a `now()` offset; `now()` is resolved here, at execution, as the engine
+  # does.
+  @spec to_nanoseconds(SQLParser.time_value()) :: integer()
   defp to_nanoseconds(value) when is_integer(value), do: value
-
-  defp to_nanoseconds(value) when is_binary(value) do
-    with :error <- iso_datetime_to_ns(value),
-         :error <- iso_date_to_ns(value),
-         :error <- int_string_to_ns(value) do
-      nil
-    end
-  end
-
-  defp to_nanoseconds(_other), do: nil
-
-  @spec iso_datetime_to_ns(binary()) :: integer() | :error
-  defp iso_datetime_to_ns(value) do
-    case DateTime.from_iso8601(value) do
-      {:ok, dt, _offset} -> DateTime.to_unix(dt, :nanosecond)
-      {:error, _reason} -> :error
-    end
-  end
-
-  @spec iso_date_to_ns(binary()) :: integer() | :error
-  defp iso_date_to_ns(value) do
-    case Date.from_iso8601(value) do
-      {:ok, date} ->
-        date
-        |> DateTime.new!(~T[00:00:00], "Etc/UTC")
-        |> DateTime.to_unix(:nanosecond)
-
-      {:error, _reason} ->
-        :error
-    end
-  end
-
-  @spec int_string_to_ns(binary()) :: integer() | :error
-  defp int_string_to_ns(value) do
-    case Integer.parse(value) do
-      {n, ""} -> n
-      _not_int -> :error
-    end
-  end
+  defp to_nanoseconds({:now, offset_ns}), do: System.os_time(:nanosecond) + offset_ns
 
   # Both nil-actual (missing column) and nil-value (unparseable comparand)
   # short-circuit to false. Without this guard, Elixir term ordering would

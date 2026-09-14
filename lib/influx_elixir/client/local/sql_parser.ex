@@ -31,13 +31,20 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           {:time_bucket, binary()}
           | {:aggregate, aggregate(), expr(), binary()}
           | {:count_star, binary()}
+          | {:count_distinct, binary(), binary()}
           | {:ordered_aggregate, :first | :last, binary(), binary(), binary()}
           | {:selector, :first | :last | :min | :max, binary(), binary(), :value | :time,
              binary()}
           | {:grouping_column, binary(), binary()}
 
-  @type where_op :: :eq | :gt | :lt | :gte | :lte | :ne | :in | :not_in
+  @type where_op :: :eq | :gt | :lt | :gte | :lte | :ne | :in | :not_in | :is_null | :is_not_null
   @type where_clause :: {where_op(), binary(), term()}
+
+  @typedoc """
+  A `time` comparand: nanoseconds since the epoch, or `now()` plus an offset
+  in nanoseconds, resolved when the query runs.
+  """
+  @type time_value :: integer() | {:now, integer()}
 
   @typedoc "`ORDER BY <column> [ASC|DESC]`; the column may be `time` or any output alias."
   @type order_by :: {binary(), :asc | :desc} | nil
@@ -376,11 +383,19 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     count_star =
       ~r/(?i)^\s*COUNT\s*\(\s*\*\s*\)\s+AS\s+(\w+)\s*$/
 
-    case Regex.run(count_star, col) do
-      [_full, alias_name] ->
+    count_distinct =
+      ~r/(?i)^\s*COUNT\s*\(\s*DISTINCT\s+(\w+)\s*\)\s+AS\s+(\w+)\s*$/
+
+    cond do
+      match = Regex.run(count_star, col) ->
+        [_full, alias_name] = match
         {:ok, {:count_star, alias_name}}
 
-      nil ->
+      match = Regex.run(count_distinct, col) ->
+        [_full, column, alias_name] = match
+        {:ok, {:count_distinct, column, alias_name}}
+
+      true ->
         parse_agg_column_arg(col)
     end
   end
@@ -395,12 +410,44 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       ~r/(?i)^\s*(AVG|SUM|COUNT|MIN|MAX|STDDEV_SAMP|STDDEV_POP|STDDEV|VAR_SAMP|VAR_POP|VAR)\s*\((.+)\)\s+AS\s+(\w+)\s*$/s
 
     with [_full, func, expr_str, alias_name] <- Regex.run(one_arg, col),
-         {:ok, expr} <- parse_expr(expr_str) do
-      {:ok, {:aggregate, Map.fetch!(@aggregate_atoms, String.downcase(func)), expr, alias_name}}
+         {:ok, expr} <- parse_expr(expr_str),
+         agg = Map.fetch!(@aggregate_atoms, String.downcase(func)),
+         :ok <- check_time_argument(agg, expr, col) do
+      {:ok, {:aggregate, agg, expr, alias_name}}
     else
+      {:error, %{status: 400}} = error -> error
       _no_match -> {:error, local_error("invalid aggregate: #{col}")}
     end
   end
+
+  # `time` is a Timestamp column. DataFusion computes MIN, MAX and COUNT over
+  # it but fails planning for AVG, SUM and the statistics ("does not support
+  # inputs of type Timestamp(ns)") and for any arithmetic on it ("Cannot
+  # coerce arithmetic expression Timestamp(ns) - Int64"), so the double
+  # refuses those rather than certify a query the engine rejects.
+  @spec check_time_argument(aggregate(), expr(), binary()) :: :ok | {:error, term()}
+  defp check_time_argument(agg, {:field, "time"}, _col) when agg in [:min, :max, :count],
+    do: :ok
+
+  defp check_time_argument(_agg, expr, col) do
+    if references_time?(expr) do
+      {:error,
+       local_error(
+         "InfluxDB rejects this aggregate over `time` (Timestamp): only " <>
+           "MIN(time), MAX(time) and COUNT(time) are valid: #{col}"
+       )}
+    else
+      :ok
+    end
+  end
+
+  @spec references_time?(expr()) :: boolean()
+  defp references_time?({:field, "time"}), do: true
+
+  defp references_time?({:op, _op, left, right}),
+    do: references_time?(left) or references_time?(right)
+
+  defp references_time?(_leaf), do: false
 
   # Parse: selector_first|last|min|max(field, time)['value' | 'time'] AS alias.
   # selector_first/last pick the row with the smallest/largest second
@@ -580,15 +627,36 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec split_columns(binary()) :: [binary()]
   defp split_columns(columns), do: columns |> String.split(",") |> Enum.map(&String.trim/1)
 
+  # DataFusion: "For SELECT DISTINCT, ORDER BY expressions must appear in
+  # select list".
+  @spec parse_distinct_order_by([binary()], binary()) :: {:ok, order_by()} | {:error, term()}
+  defp parse_distinct_order_by(columns, rest) do
+    case parse_order_by(rest) do
+      nil ->
+        {:ok, nil}
+
+      {column, _direction} = order_by ->
+        if column in columns do
+          {:ok, order_by}
+        else
+          {:error,
+           local_error(
+             "For SELECT DISTINCT, ORDER BY expressions must appear in select list: #{column}"
+           )}
+        end
+    end
+  end
+
   @spec build_distinct_query([binary()], binary(), binary()) ::
           {:ok, parsed_query()} | {:error, map()}
   defp build_distinct_query(columns, measurement, rest) do
-    with {:ok, where} <- parse_where(rest) do
+    with {:ok, where} <- parse_where(rest),
+         {:ok, order_by} <- parse_distinct_order_by(columns, rest) do
       {:ok,
        %{
          measurement: measurement,
          where: where,
-         order_by: nil,
+         order_by: order_by,
          limit: parse_limit(rest),
          group_by_interval: nil,
          group_by_columns: nil,
@@ -747,6 +815,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # for. Order: NOT IN before IN (NOT IN substring contains IN).
   @not_in_pattern ~r/^(\w+)\s+NOT\s+IN\s*\((.*)\)\s*$/is
   @in_pattern ~r/^(\w+)\s+IN\s*\((.*)\)\s*$/is
+  @is_not_null_pattern ~r/^(\w+)\s+IS\s+NOT\s+NULL$/i
+  @is_null_pattern ~r/^(\w+)\s+IS\s+NULL$/i
 
   @spec parse_single_where_clause(binary()) ::
           {:ok, where_clause()} | {:error, map()}
@@ -754,13 +824,21 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     trimmed = String.trim(clause)
 
     cond do
+      match = Regex.run(@is_not_null_pattern, trimmed) ->
+        [_full, key] = match
+        {:ok, {:is_not_null, key, nil}}
+
+      match = Regex.run(@is_null_pattern, trimmed) ->
+        [_full, key] = match
+        {:ok, {:is_null, key, nil}}
+
       match = Regex.run(@not_in_pattern, trimmed) ->
         [_full, key, list_str] = match
-        {:ok, {:not_in, key, parse_in_values(list_str)}}
+        with {:ok, values} <- parse_in_values(key, list_str), do: {:ok, {:not_in, key, values}}
 
       match = Regex.run(@in_pattern, trimmed) ->
         [_full, key, list_str] = match
-        {:ok, {:in, key, parse_in_values(list_str)}}
+        with {:ok, values} <- parse_in_values(key, list_str), do: {:ok, {:in, key, values}}
 
       true ->
         parse_binary_where_clause(trimmed)
@@ -773,35 +851,130 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     # Multi-char operators must be tried before their single-char prefixes.
     operators = [{">=", :gte}, {"<=", :lte}, {"!=", :ne}, {">", :gt}, {"<", :lt}, {"=", :eq}]
 
-    result =
+    split =
       Enum.find_value(operators, fn {op_str, op_atom} ->
         case String.split(trimmed, op_str, parts: 2) do
-          [left, right] when left != trimmed ->
-            k = String.trim(left)
-            v = parse_where_value(String.trim(right))
-            {op_atom, k, v}
-
-          _no_match ->
-            nil
+          [left, right] -> {op_atom, String.trim(left), String.trim(right)}
+          _no_match -> nil
         end
       end)
 
-    case result do
+    case split do
       nil ->
         {:error, local_error("unsupported WHERE clause: #{trimmed}")}
 
-      condition ->
-        {:ok, condition}
+      {op, "time", right} ->
+        with {:ok, value} <- parse_time_comparand(right), do: {:ok, {op, "time", value}}
+
+      {op, key, right} ->
+        {:ok, {op, key, parse_where_value(right)}}
     end
   end
 
-  @spec parse_in_values(binary()) :: [term()]
-  defp parse_in_values(str) do
-    str
-    |> split_top_level_commas()
-    |> Enum.map(&String.trim/1)
-    |> Enum.reject(&(&1 == ""))
-    |> Enum.map(&parse_where_value/1)
+  @spec parse_in_values(binary(), binary()) :: {:ok, [term()]} | {:error, map()}
+  defp parse_in_values(key, str) do
+    items =
+      str
+      |> split_top_level_commas()
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    if key == "time" do
+      Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
+        case parse_time_comparand(item) do
+          {:ok, value} -> {:cont, {:ok, acc ++ [value]}}
+          {:error, _reason} = error -> {:halt, error}
+        end
+      end)
+    else
+      {:ok, Enum.map(items, &parse_where_value/1)}
+    end
+  end
+
+  # What the engine accepts as a `time` comparand: a quoted ISO-8601
+  # datetime (zoned or not, optional fraction), a quoted date (midnight
+  # UTC), or `now()` offset by `+`/`-` `INTERVAL 'N unit'` terms. DataFusion
+  # fails planning for a bare integer ("Cannot infer common argument type
+  # for comparison operation Timestamp(ns) > Int64") and fails execution for
+  # any other string ("Error parsing timestamp"), so those are refused here
+  # instead of silently matching no rows.
+  @now_pattern ~r/^now\(\)((?:\s*[+-]\s*INTERVAL\s*'[^']*')*)$/i
+  @interval_term ~r/([+-])\s*INTERVAL\s*'([^']*)'/i
+
+  @spec parse_time_comparand(binary()) :: {:ok, time_value()} | {:error, map()}
+  defp parse_time_comparand(str) do
+    cond do
+      quoted?(str) -> parse_time_literal(String.slice(str, 1..-2//1), str)
+      match = Regex.run(@now_pattern, str) -> parse_now_offset(match)
+      true -> {:error, invalid_time_error(str)}
+    end
+  end
+
+  @spec quoted?(binary()) :: boolean()
+  defp quoted?(str) do
+    byte_size(str) >= 2 and
+      ((String.starts_with?(str, "'") and String.ends_with?(str, "'")) or
+         (String.starts_with?(str, "\"") and String.ends_with?(str, "\"")))
+  end
+
+  @spec parse_time_literal(binary(), binary()) :: {:ok, integer()} | {:error, map()}
+  defp parse_time_literal(literal, original) do
+    with :error <- zoned_to_ns(literal),
+         :error <- naive_to_ns(literal),
+         :error <- date_to_ns(literal) do
+      {:error, invalid_time_error(original)}
+    end
+  end
+
+  @spec zoned_to_ns(binary()) :: {:ok, integer()} | :error
+  defp zoned_to_ns(literal) do
+    case DateTime.from_iso8601(literal) do
+      {:ok, dt, _offset} -> {:ok, DateTime.to_unix(dt, :nanosecond)}
+      {:error, _reason} -> :error
+    end
+  end
+
+  @spec naive_to_ns(binary()) :: {:ok, integer()} | :error
+  defp naive_to_ns(literal) do
+    case NaiveDateTime.from_iso8601(literal) do
+      {:ok, naive} ->
+        {:ok, naive |> DateTime.from_naive!("Etc/UTC") |> DateTime.to_unix(:nanosecond)}
+
+      {:error, _reason} ->
+        :error
+    end
+  end
+
+  @spec date_to_ns(binary()) :: {:ok, integer()} | :error
+  defp date_to_ns(literal) do
+    case Date.from_iso8601(literal) do
+      {:ok, date} ->
+        {:ok, date |> DateTime.new!(~T[00:00:00], "Etc/UTC") |> DateTime.to_unix(:nanosecond)}
+
+      {:error, _reason} ->
+        :error
+    end
+  end
+
+  @spec parse_now_offset([binary()]) :: {:ok, {:now, integer()}} | {:error, map()}
+  defp parse_now_offset([_full, terms]) do
+    @interval_term
+    |> Regex.scan(terms)
+    |> Enum.reduce_while({:ok, {:now, 0}}, fn [_term, sign, interval], {:ok, {:now, acc}} ->
+      case parse_interval(interval) do
+        {:ok, ns} when sign == "-" -> {:cont, {:ok, {:now, acc - ns}}}
+        {:ok, ns} -> {:cont, {:ok, {:now, acc + ns}}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  @spec invalid_time_error(binary()) :: %{status: 400, body: binary()}
+  defp invalid_time_error(str) do
+    local_error(
+      "InfluxDB rejects this `time` comparand (a Timestamp compares only with an " <>
+        "ISO-8601 string or now() +/- INTERVAL 'N unit', never a bare integer): #{str}"
+    )
   end
 
   # A quoted literal is a string, full stop — exactly as in InfluxDB v3.
@@ -896,8 +1069,13 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp normalize_param_key("$" <> _rest = key), do: key
   defp normalize_param_key(key) when is_binary(key), do: "$#{key}"
 
+  # Calendar params render as the ISO-8601 strings Jason sends over HTTP, so
+  # `time >= $start` with a DateTime behaves the same on both clients.
   @spec to_sql_literal(term()) :: binary()
   defp to_sql_literal(%Decimal{} = value), do: Decimal.to_string(value, :normal)
+  defp to_sql_literal(%DateTime{} = value), do: "'#{DateTime.to_iso8601(value)}'"
+  defp to_sql_literal(%NaiveDateTime{} = value), do: "'#{NaiveDateTime.to_iso8601(value)}'"
+  defp to_sql_literal(%Date{} = value), do: "'#{Date.to_iso8601(value)}'"
   defp to_sql_literal(value) when is_binary(value), do: "'#{value}'"
   defp to_sql_literal(value) when is_integer(value), do: Integer.to_string(value)
   defp to_sql_literal(value) when is_float(value), do: Float.to_string(value)

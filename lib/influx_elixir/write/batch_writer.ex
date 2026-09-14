@@ -28,15 +28,22 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   ## Backpressure
 
-  When the buffer exceeds `10 * batch_size` entries, new writes are rejected
-  with `{:error, :buffer_full}`.
+  While a batch is being retried, the automatic flushes (batch size reached,
+  timer fired) wait for that retry chain to finish instead of starting
+  another chain against a server that is already failing; writes keep
+  buffering meanwhile. Once the buffer holds `10 * batch_size` entries,
+  `write/3` and `write_sync/3` return `{:error, :buffer_full}` until the
+  chain ends. An explicit `flush/2`, and `write_sync/3` without `:no_sync`,
+  always flush immediately. When the chain ends the deferred buffer is
+  flushed if it has reached `batch_size`; otherwise the timer takes it.
 
   ## Retry Policy
 
   Only 5xx and network errors are retried using asynchronous exponential
   backoff with optional jitter. 4xx errors are discarded and logged.
   Retries are non-blocking — the GenServer continues to accept messages
-  between retry attempts.
+  between retry attempts. A `write_sync/3` caller whose batch is being
+  retried is answered with that chain's final result.
 
   ## Stats
 
@@ -283,13 +290,7 @@ defmodule InfluxElixir.Write.BatchWriter do
       {:reply, {:error, :buffer_full}, state}
     else
       line = encode_payload(payload)
-      new_state = append_to_buffer(state, line)
-
-      if new_state.buffer_size >= new_state.batch_size do
-        {:reply, :ok, do_flush(new_state)}
-      else
-        {:reply, :ok, new_state}
-      end
+      {:reply, :ok, state |> append_to_buffer(line) |> maybe_flush_on_batch()}
     end
   end
 
@@ -324,8 +325,9 @@ defmodule InfluxElixir.Write.BatchWriter do
     {:reply, {:ok, state.stats}, state}
   end
 
+  # The timer flush waits for an in-flight retry chain (see "Backpressure").
   @impl GenServer
-  def handle_info(:flush, %__MODULE__{} = state) do
+  def handle_info(:flush, %__MODULE__{retry_payload: nil} = state) do
     new_state =
       state
       |> do_flush()
@@ -334,16 +336,22 @@ defmodule InfluxElixir.Write.BatchWriter do
     {:noreply, new_state, :hibernate}
   end
 
+  def handle_info(:flush, %__MODULE__{} = state) do
+    {:noreply, schedule_flush(state), :hibernate}
+  end
+
+  # `from` is the write_sync caller waiting on this chain (or nil); it
+  # travels with the chain so a later chain cannot answer it by mistake.
   @impl GenServer
-  def handle_info({:retry, payload, attempt}, %__MODULE__{} = state) do
+  def handle_info({:retry, payload, attempt, from}, %__MODULE__{} = state) do
     case Writer.write(state.connection, payload, state.write_opts) do
       {:ok, :written} ->
-        finish_flush(state, payload, :ok)
+        finish_flush(state, payload, :ok, from)
 
       {:error, %{status: status}} = error when status in 400..499 ->
         Logger.warning("[BatchWriter] 4xx error (#{status}) — discarding batch")
 
-        finish_flush(state, payload, error)
+        finish_flush(state, payload, error, from)
 
       {:error, reason} when attempt < state.max_retries ->
         Logger.warning(
@@ -351,14 +359,14 @@ defmodule InfluxElixir.Write.BatchWriter do
             inspect(reason)
         )
 
-        schedule_retry(payload, attempt + 1, state.jitter_ms, state.base_retry_delay_ms)
+        schedule_retry(state, payload, attempt + 1, from)
 
         {:noreply, %{state | retry_payload: payload, retry_attempt: attempt + 1}}
 
       {:error, reason} ->
         Logger.error("[BatchWriter] Flush failed after retries: #{inspect(reason)}")
 
-        finish_flush(state, payload, {:error, reason})
+        finish_flush(state, payload, {:error, reason}, from)
     end
   end
 
@@ -384,8 +392,12 @@ defmodule InfluxElixir.Write.BatchWriter do
     %{state | buffer: [line | state.buffer], buffer_size: state.buffer_size + 1}
   end
 
+  # A batch-size flush is deferred while a retry chain is in flight; the
+  # buffer keeps filling up to the backpressure bound instead.
   @spec maybe_flush_on_batch(t()) :: t()
-  defp maybe_flush_on_batch(%__MODULE__{buffer_size: size, batch_size: batch} = state)
+  defp maybe_flush_on_batch(
+         %__MODULE__{buffer_size: size, batch_size: batch, retry_payload: nil} = state
+       )
        when size >= batch do
     do_flush(state)
   end
@@ -418,12 +430,13 @@ defmodule InfluxElixir.Write.BatchWriter do
       {:error, reason} when state.max_retries > 0 ->
         Logger.warning("[BatchWriter] Write error (attempt 1): #{inspect(reason)}")
 
-        schedule_retry(lines, 1, state.jitter_ms, state.base_retry_delay_ms)
+        schedule_retry(state, lines, 1, state.pending_sync)
 
         %{
           state
           | buffer: [],
             buffer_size: 0,
+            pending_sync: nil,
             retry_payload: lines,
             retry_attempt: 1
         }
@@ -452,20 +465,19 @@ defmodule InfluxElixir.Write.BatchWriter do
     }
   end
 
-  @spec finish_flush(t(), binary(), :ok | {:error, term()}) ::
+  # Ends a retry chain: answers the chain's write_sync caller, then flushes
+  # whatever accumulated while the chain was in flight if it has reached
+  # batch_size (the timer takes anything smaller).
+  @spec finish_flush(t(), binary(), :ok | {:error, term()}, GenServer.from() | nil) ::
           {:noreply, t()}
-  defp finish_flush(%__MODULE__{} = state, payload, result) do
+  defp finish_flush(%__MODULE__{} = state, payload, result, from) do
     bytes = byte_size(payload)
     stats = update_stats(state.stats, result, bytes)
-    reply_sync(state, result)
+    reply_sync(%{state | pending_sync: from}, result)
 
-    new_state = %{
-      state
-      | stats: stats,
-        pending_sync: nil,
-        retry_payload: nil,
-        retry_attempt: 0
-    }
+    new_state =
+      %{state | stats: stats, retry_payload: nil, retry_attempt: 0}
+      |> maybe_flush_on_batch()
 
     {:noreply, new_state}
   end
@@ -490,15 +502,10 @@ defmodule InfluxElixir.Write.BatchWriter do
     :ok
   end
 
-  @spec schedule_retry(
-          binary(),
-          non_neg_integer(),
-          non_neg_integer(),
-          non_neg_integer()
-        ) :: :ok
-  defp schedule_retry(payload, attempt, jitter_ms, base_retry_delay_ms) do
-    delay = backoff_delay(attempt, jitter_ms, base_retry_delay_ms)
-    Process.send_after(self(), {:retry, payload, attempt}, delay)
+  @spec schedule_retry(t(), binary(), non_neg_integer(), GenServer.from() | nil) :: :ok
+  defp schedule_retry(%__MODULE__{} = state, payload, attempt, from) do
+    delay = backoff_delay(attempt, state.jitter_ms, state.base_retry_delay_ms)
+    Process.send_after(self(), {:retry, payload, attempt, from}, delay)
     :ok
   end
 

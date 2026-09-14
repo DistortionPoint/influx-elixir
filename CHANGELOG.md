@@ -24,6 +24,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` accepted `time` comparands InfluxDB rejects, and silently
+  matched nothing for ones it accepts.** Verified against InfluxDB 3 Core:
+  a bare integer (`time > 1700000000`) or integer param fails planning on
+  the server ("Cannot infer common argument type for comparison operation
+  Timestamp(ns) > Int64") and an unparseable string fails execution, while
+  the double returned `{:ok, []}` for both; `now() - INTERVAL '2 minutes'`
+  runs on the server but was compared as the literal string, so it too
+  returned `{:ok, []}`. The parser now accepts exactly the engine's forms —
+  quoted ISO-8601 datetimes (zoned, zone-less, fractional), quoted dates,
+  `now()` offset by `INTERVAL` terms, evaluated at query time — and rejects
+  the rest with a `Client.Local:` 400 that names the engine's rule.
+- **`DateTime` params rendered as `~U[...]` in `Client.Local`.** Jason sends
+  them as ISO-8601 strings over HTTP; the double now renders `DateTime`,
+  `NaiveDateTime` and `Date` params the same way.
+- **`SELECT DISTINCT ... ORDER BY` was ignored by `Client.Local`**: rows came
+  back ascending whatever the direction. `ORDER BY` on a selected column is
+  honoured; on any other column it is rejected with DataFusion's own
+  message.
+- **`MAX(time)` / `MIN(time)` returned an empty row from `Client.Local`**
+  (the timestamp is not a field, so the aggregate saw only nulls). They now
+  return the `DateTime`, as the engine does; `AVG(time)`, `SUM(time)`, the
+  statistics over `time` and arithmetic on `time` are rejected as DataFusion
+  rejects them.
+- **`Client.Local` refused `COUNT(DISTINCT col)` and `WHERE col IS [NOT]
+  NULL`**, both ordinary SQL the engine runs. Both are supported.
+- **HTTP JSON left aliased timestamp columns as strings** — see the entry
+  above for #16/#17; this sweep's contract tests cover `MAX(time)` too.
+- **`BatchWriter` documented a backpressure it could never apply.** The
+  buffer emptied on every flush, so `{:error, :buffer_full}` was
+  unreachable and the tests that "proved" it forged the GenServer state.
+  Automatic flushes now wait for an in-flight retry chain instead of
+  opening a new chain per batch against a failing server, the buffer is
+  bounded at `10 * batch_size` while a chain is in flight, and the deferred
+  buffer is flushed when the chain ends. A `write_sync/3` caller is answered
+  by its own chain's result (the caller's reference travels with the chain;
+  before, a later chain could answer it).
+- `BatchWriter` tests no longer inject `:retry` messages or read GenServer
+  state: retries are exercised through a closed port (unit) and through a
+  Finch pool checkout timeout that resolves before the backoff fires
+  (integration, against the real server).
 - **`Client.Local` rejected valid InfluxDB 3 SQL (#16, #17).** Verified
   against InfluxDB 3 Core: `STDDEV` / `STDDEV_SAMP` / `STDDEV_POP` /
   `VAR` / `VAR_SAMP` / `VAR_POP`, arithmetic inside an aggregate

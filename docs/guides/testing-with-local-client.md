@@ -294,7 +294,22 @@ FROM "trades"
 
 Two integer operands divide as integers (`3 / 2 = 1`), as in DataFusion.
 `VARIANCE` is not a DataFusion function and is rejected, as it is by the
-real engine.
+real engine. `COUNT(DISTINCT col)` counts distinct non-null values.
+`MIN(time)`, `MAX(time)` and `COUNT(time)` work and return a `DateTime`;
+`AVG(time)`, `SUM(time)`, the statistics over `time` and any arithmetic on
+`time` are rejected, exactly as DataFusion rejects them ("does not support
+inputs of type Timestamp").
+
+`SELECT DISTINCT a, b` returns each distinct combination, sorted, and honours
+`ORDER BY` on a selected column (`ORDER BY` on any other column is rejected
+with DataFusion's own message):
+
+```elixir
+{:ok, rows} =
+  Local.query_sql(conn, ~s|SELECT DISTINCT provider, symbol FROM "prices" ORDER BY symbol DESC LIMIT 5|,
+    database: "test_db"
+  )
+```
 
 Selector functions return the value, or the timestamp, of the row a
 selector picks — `selector_first` / `selector_last` by time,
@@ -479,20 +494,38 @@ WHERE ticker IN ('AAPL', 'MSFT') AND shares > 5
 
 `IN ()` (empty list) matches no rows; `NOT IN ()` matches all rows.
 
-## Time Filters with Bare Dates
+## Time Filters
 
-`WHERE time` accepts three formats: integer nanoseconds, full ISO-8601
-datetimes, and bare ISO dates (interpreted as midnight UTC):
+`WHERE time` accepts exactly what InfluxDB 3 accepts against a Timestamp
+column: a quoted ISO-8601 datetime (zoned, zone-less or fractional), a quoted
+date (midnight UTC), and `now()` offset by `INTERVAL` terms, which the double
+evaluates when the query runs:
 
 ```elixir
-# All three are equivalent if your data is at exactly the day boundary:
 "WHERE time >= '2026-03-31'"
 "WHERE time >= '2026-03-31T00:00:00Z'"
-"WHERE time >= 1774915200000000000"
+"WHERE time >= now() - INTERVAL '5 minutes'"
+"WHERE time >= now() - INTERVAL '1 day' - INTERVAL '1 hour' AND time < now()"
 ```
 
-Unparseable date strings filter out all rows (fail-closed) instead of
-silently producing wrong results via Elixir term ordering.
+A bare integer (`WHERE time >= 1774915200000000000`), an integer-as-string,
+and any unparseable string are **rejected** with a `Client.Local:` 400, because
+DataFusion rejects them too ("Cannot infer common argument type for comparison
+operation Timestamp(ns) >= Int64"; "Error parsing timestamp"). Returning no
+rows for those would let a query pass tests and fail in production.
+
+The same holds for params: bind a `DateTime` (rendered as the ISO-8601 string
+Jason sends over HTTP), never an integer:
+
+```elixir
+Local.query_sql(conn, ~s|SELECT * FROM "prices" WHERE time >= $start|,
+  database: "test_db",
+  params: %{start: DateTime.add(DateTime.utc_now(), -300, :second)}
+)
+```
+
+`WHERE col IS NULL` and `WHERE col IS NOT NULL` test whether the row has the
+field or tag.
 
 ## Checking a Query Before Running It
 

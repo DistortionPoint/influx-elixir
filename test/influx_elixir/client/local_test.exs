@@ -943,7 +943,7 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, rows} =
         Local.query_sql(
           conn,
-          "SELECT * FROM prices WHERE time >= 1773748800000000000 AND time < 1773748920000000000",
+          "SELECT * FROM prices WHERE time >= '2026-03-17T12:00:00Z' AND time < '2026-03-17T12:02:00Z'",
           database: db
         )
 
@@ -951,6 +951,18 @@ defmodule InfluxElixir.Client.LocalTest do
       symbols = Enum.map(rows, & &1["symbol"])
       assert "AAPL" in symbols
       assert "GOOG" in symbols
+    end
+
+    test "a bare integer comparand is rejected, as DataFusion rejects it", %{conn: conn, db: db} do
+      # InfluxDB 3: "Cannot infer common argument type for comparison
+      # operation Timestamp(ns) >= Int64". Matching nothing here would let a
+      # query pass tests and 400 in production.
+      assert {:error, %{status: 400, body: "Client.Local: InfluxDB rejects" <> _rest}} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM prices WHERE time >= 1773748800000000000",
+                 database: db
+               )
     end
 
     test "SELECT * with ISO 8601 time params", %{conn: conn, db: db} do
@@ -1067,18 +1079,16 @@ defmodule InfluxElixir.Client.LocalTest do
       assert length(rows) == 3
     end
 
-    test "unparseable date string filters out all rows (no term-order leak)",
+    test "an unparseable date string is rejected, as the engine rejects it",
          %{conn: conn, db: db} do
-      # Without the compare(_, _, nil) → false guard, term-ordering would
-      # silently make `actual > nil` true and return spurious rows.
-      {:ok, rows} =
-        Local.query_sql(
-          conn,
-          "SELECT * FROM prices WHERE time > 'totally garbage'",
-          database: db
-        )
-
-      assert rows == []
+      # InfluxDB 3 fails the query ("Error parsing timestamp from 'totally
+      # garbage'"); returning [] would hide the mistake.
+      assert {:error, %{status: 400, body: "Client.Local: InfluxDB rejects" <> _rest}} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM prices WHERE time > 'totally garbage'",
+                 database: db
+               )
     end
   end
 
@@ -1343,18 +1353,33 @@ defmodule InfluxElixir.Client.LocalTest do
                )
     end
 
-    test "WHERE time with integer-string param", %{conn: conn, db: db} do
+    test "WHERE time with an integer param is rejected, as over HTTP", %{conn: conn, db: db} do
+      # The engine plans `Timestamp(ns) >= UInt64` as an error for a JSON
+      # integer param; the double must not accept what production refuses.
       Local.write(conn, "m val=1i 5000", database: db)
+
+      assert {:error, %{status: 400, body: "Client.Local: InfluxDB rejects" <> _rest}} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM m WHERE time >= $t",
+                 database: db,
+                 params: %{"$t" => 5000}
+               )
+    end
+
+    test "WHERE time with a DateTime param renders as the ISO string Jason sends",
+         %{conn: conn, db: db} do
+      Local.write(conn, "m val=1i 5000\nm val=2i 6000", database: db)
 
       {:ok, rows} =
         Local.query_sql(
           conn,
           "SELECT * FROM m WHERE time >= $t",
           database: db,
-          params: %{"$t" => 5000}
+          params: %{"$t" => ~U[1970-01-01 00:00:00.000006Z]}
         )
 
-      assert length(rows) == 1
+      assert [%{"val" => 2}] = rows
     end
 
     test "WHERE time with non-matching filter returns empty",
@@ -1364,7 +1389,7 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, rows} =
         Local.query_sql(
           conn,
-          "SELECT * FROM m WHERE time > 9999",
+          "SELECT * FROM m WHERE time > '1970-01-01T00:00:00.000009999Z'",
           database: db
         )
 
@@ -3559,6 +3584,147 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, conn} = Local.start(databases: ["chk"])
       on_exit(fn -> Local.stop(conn) end)
       assert {:error, ^err} = Local.query_sql(conn, sql, database: "chk")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Quality sweep 2026-09-14: divergences found by probing the double against
+  # InfluxDB 3 Core (see docs/design/2026-09-14_local-time-filters-count-distinct.md).
+  # ---------------------------------------------------------------------------
+
+  describe "bug regression — now() time filters, IS NULL, COUNT(DISTINCT), time aggregates" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "sweep_db")
+      now_ns = System.os_time(:nanosecond)
+
+      lines =
+        Enum.join(
+          [
+            "q,provider=a,symbol=X price=1.0,bid=1.0 #{now_ns - 60_000_000_000}",
+            "q,provider=a,symbol=X price=2.0 #{now_ns - 600_000_000_000}",
+            "q,provider=b,symbol=Y price=3.0,bid=3.0 #{now_ns - 3_600_000_000_000}",
+            "q,provider=c,symbol=Z price=4.0 #{now_ns - 7_200_000_000_000}"
+          ],
+          "\n"
+        )
+
+      {:ok, :written} = Local.write(conn, lines, database: "sweep_db")
+      {:ok, db: "sweep_db"}
+    end
+
+    test "now() - INTERVAL is evaluated at query time", %{conn: conn, db: db} do
+      assert {:ok, [%{"price" => 1.0}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT price FROM "q" WHERE time >= now() - INTERVAL '2 minutes'|,
+                 database: db
+               )
+
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT price FROM "q" WHERE time >= now() - INTERVAL '1 hour' - INTERVAL '30 minutes' AND time < NOW() + INTERVAL '1 day'|,
+                 database: db
+               )
+
+      assert length(rows) == 3
+    end
+
+    test "an unknown function as a time comparand is rejected", %{conn: conn, db: db} do
+      assert {:error, %{status: 400, body: "Client.Local: InfluxDB rejects" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT price FROM "q" WHERE time >= foo()|, database: db)
+    end
+
+    test "IS NULL and IS NOT NULL filter on field presence", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT price FROM "q" WHERE bid IS NOT NULL ORDER BY price|,
+                 database: db
+               )
+
+      assert Enum.map(rows, & &1["price"]) == [1.0, 3.0]
+
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT price FROM "q" WHERE bid IS NULL AND provider != 'c'|,
+                 database: db
+               )
+
+      assert Enum.map(rows, & &1["price"]) == [2.0]
+    end
+
+    test "COUNT(DISTINCT col) counts distinct non-null values", %{conn: conn, db: db} do
+      assert {:ok, [%{"n" => 3, "b" => 2}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT COUNT(DISTINCT provider) AS n, COUNT(DISTINCT bid) AS b FROM "q"|,
+                 database: db
+               )
+
+      assert {:ok, [%{"n" => 0}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT COUNT(DISTINCT provider) AS n FROM "q" WHERE provider = 'zzz'|,
+                 database: db
+               )
+
+      assert {:ok, [%{"provider" => "a", "n" => 1} | _rest]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT provider, COUNT(DISTINCT symbol) AS n FROM "q" GROUP BY provider ORDER BY provider|,
+                 database: db
+               )
+    end
+
+    test "MAX(time), MIN(time) and COUNT(time) work; other aggregates over time are rejected",
+         %{conn: conn, db: db} do
+      assert {:ok, [%{"mx" => %DateTime{} = mx, "mn" => %DateTime{} = mn, "n" => 4}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT MAX(time) AS mx, MIN(time) AS mn, COUNT(time) AS n FROM "q"|,
+                 database: db
+               )
+
+      assert DateTime.compare(mx, mn) == :gt
+
+      for sql <- [
+            ~s|SELECT AVG(time) AS a FROM "q"|,
+            ~s|SELECT SUM(time) AS s FROM "q"|,
+            ~s|SELECT STDDEV(time) AS s FROM "q"|,
+            ~s|SELECT MAX(time - 1) AS s FROM "q"|
+          ] do
+        assert {:error, %{status: 400, body: "Client.Local: InfluxDB rejects" <> _rest}} =
+                 Local.query_sql(conn, sql, database: db),
+               sql
+      end
+    end
+
+    test "SELECT DISTINCT honours ORDER BY on a selected column", %{conn: conn, db: db} do
+      assert {:ok, [%{"provider" => "c"}, %{"provider" => "b"}, %{"provider" => "a"}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT DISTINCT provider FROM "q" ORDER BY provider DESC|,
+                 database: db
+               )
+
+      assert {:ok, [%{"provider" => "c", "symbol" => "Z"}, %{"provider" => "b", "symbol" => "Y"}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT DISTINCT provider, symbol FROM "q" ORDER BY symbol DESC LIMIT 2|,
+                 database: db
+               )
+    end
+
+    test "SELECT DISTINCT rejects ORDER BY a column outside the select list",
+         %{conn: conn, db: db} do
+      assert {:error, %{status: 400, body: "Client.Local: For SELECT DISTINCT" <> _rest}} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT DISTINCT provider FROM "q" ORDER BY price|,
+                 database: db
+               )
     end
   end
 end
