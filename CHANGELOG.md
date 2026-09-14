@@ -39,7 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ...` took `UNION` as a table alias, and `WHERE x IN (SELECT ...)` compared
   against the string `"SELECT ..."`. Joins, set operations, subqueries,
   `HAVING`, `OFFSET` and window functions are now rejected by name
-  (`Client.Local: unsupported SQL construct JOIN`).
+  (`Client.Local: unsupported SQL construct JOIN`). Keywords are matched
+  by the shape only a clause can have (`OFFSET 1`, `OVER (`) and string
+  literals are ignored, so a column named `offset` or `over` and a value
+  such as `'select from join'` — both fine on the engine — still work.
 - `Client.Local` returned `"time" => nil` for a row without a timestamp (a
   CTE that did not project `time`); the column is omitted, as everywhere
   else.

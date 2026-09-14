@@ -64,6 +64,13 @@ HAVING | OFFSET | OVER | QUALIFY`, and only `WHERE` / `GROUP BY` / `ORDER
 BY` / `LIMIT` after the table. Anything else is a `Client.Local: unsupported
 SQL construct <NAME>` 400 — the honest answer the double gives for
 everything else it cannot express, and what `check_sql/1` reports so the
+
+The engine accepts `offset` and `over` as plain column names and keywords
+inside string literals (verified: `SELECT offset, over FROM m`, `WHERE
+note = 'select from join'`), so the checks blank string literals first
+and match `OFFSET` and `OVER` only in clause shape (`OFFSET <n>`,
+`OVER (`). `union` and `having` are schema errors on the engine, so
+refusing them by word costs nothing.
 query can go to the integration tier.
 
 Rejected: emulating `median` and `CROSS JOIN` for the full production query

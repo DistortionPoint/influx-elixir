@@ -168,12 +168,17 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_ctes([{binary(), binary()}]) ::
           {:ok, [{binary(), parsed_query()}]} | {:error, term()}
   defp parse_ctes(sources) do
-    Enum.reduce_while(sources, {:ok, []}, fn {name, body}, {:ok, acc} ->
+    sources
+    |> Enum.reduce_while({:ok, []}, fn {name, body}, {:ok, acc} ->
       case parse_single_select(body) do
-        {:ok, query} -> {:cont, {:ok, acc ++ [{name, query}]}}
+        {:ok, query} -> {:cont, {:ok, [{name, query} | acc]}}
         {:error, _reason} = error -> {:halt, error}
       end
     end)
+    |> case do
+      {:ok, ctes} -> {:ok, Enum.reverse(ctes)}
+      {:error, _reason} = error -> error
+    end
   end
 
   @spec parse_single_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
@@ -193,15 +198,21 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # One table, then only WHERE / GROUP BY / ORDER BY / LIMIT. A join, set
   # operation or window would otherwise be ignored and the query answered
   # from the first table alone, which is a wrong result, not a refusal.
-  @unsupported_construct ~r/(?i)\b(JOIN|UNION|EXCEPT|INTERSECT|HAVING|OFFSET|OVER|QUALIFY)\b/
+  # Keywords are matched by the shape only a clause can have, so a column
+  # called `offset` or `over` (both fine on the engine) is not mistaken for
+  # one; string literals are blanked first so `note = 'select from join'`
+  # is not either.
+  @unsupported_construct ~r/(?i)\b(JOIN|UNION|EXCEPT|INTERSECT|HAVING)\b|\b(OFFSET)\s+\d|\b(OVER)\s*\(/
   @first_from ~r/(?i)\bFROM\s+(?:"[^"]+"|(?:[^\s\\]|\\.)+)\s*(\w*)/s
   @clause_keywords ~w(WHERE GROUP ORDER LIMIT)
 
   @spec check_clauses(binary()) :: :ok | {:error, term()}
   defp check_clauses(sql) do
-    with :ok <- check_constructs(sql),
-         :ok <- check_single_select(sql) do
-      case Regex.run(@first_from, sql) do
+    scannable = blank_literals(sql)
+
+    with :ok <- check_constructs(scannable, sql),
+         :ok <- check_single_select(scannable, sql) do
+      case Regex.run(@first_from, scannable) do
         [_full, next] when next == "" ->
           :ok
 
@@ -214,23 +225,27 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  @spec check_constructs(binary()) :: :ok | {:error, term()}
-  defp check_constructs(sql) do
-    case Regex.run(@unsupported_construct, sql) do
-      [_full, construct] ->
-        {:error, local_error("unsupported SQL construct #{String.upcase(construct)}: #{sql}")}
+  @spec blank_literals(binary()) :: binary()
+  defp blank_literals(sql), do: Regex.replace(~r/'[^']*'/, sql, "''")
 
+  @spec check_constructs(binary(), binary()) :: :ok | {:error, term()}
+  defp check_constructs(scannable, sql) do
+    case Regex.run(@unsupported_construct, scannable) do
       nil ->
         :ok
+
+      [_full | groups] ->
+        construct = groups |> Enum.reject(&(&1 == "")) |> List.first() |> String.upcase()
+        {:error, local_error("unsupported SQL construct #{construct}: #{sql}")}
     end
   end
 
   # After the CTEs are split off, one query holds exactly one SELECT; a
   # second one is a subquery (`WHERE x IN (SELECT ...)`), which would
   # otherwise be read as a string literal.
-  @spec check_single_select(binary()) :: :ok | {:error, term()}
-  defp check_single_select(sql) do
-    if length(Regex.scan(~r/(?i)\bSELECT\b/, sql)) > 1,
+  @spec check_single_select(binary(), binary()) :: :ok | {:error, term()}
+  defp check_single_select(scannable, sql) do
+    if length(Regex.scan(~r/(?i)\bSELECT\b/, scannable)) > 1,
       do: {:error, local_error("unsupported SQL construct SUBQUERY: #{sql}")},
       else: :ok
   end
@@ -306,19 +321,33 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          rest = extract_after_from(sql),
          {:ok, where} <- parse_where(rest) do
       {:ok,
-       %{
-         measurement: measurement,
-         where: where,
-         order_by: parse_order_by(rest),
-         limit: parse_limit(rest),
+       new_query(measurement, where, rest,
          group_by_interval: interval_ns,
          group_by_columns: parse_group_by_columns(sql),
-         select_columns: columns,
-         distinct_columns: nil,
-         projection_columns: nil,
-         ctes: []
-       }}
+         select_columns: columns
+       )}
     end
+  end
+
+  # Every query shape shares this skeleton; `ORDER BY` and `LIMIT` come from
+  # the text after the table unless the caller overrides them.
+  @spec new_query(binary(), [where_clause()], binary(), keyword()) :: parsed_query()
+  defp new_query(measurement, where, rest, overrides) do
+    Map.merge(
+      %{
+        measurement: measurement,
+        where: where,
+        order_by: parse_order_by(rest),
+        limit: parse_limit(rest),
+        group_by_interval: nil,
+        group_by_columns: nil,
+        select_columns: nil,
+        distinct_columns: nil,
+        projection_columns: nil,
+        ctes: []
+      },
+      Map.new(overrides)
+    )
   end
 
   # Extract the bare-column GROUP BY list, e.g. "GROUP BY ticker, holding_type".
@@ -825,19 +854,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp build_distinct_query(columns, measurement, rest) do
     with {:ok, where} <- parse_where(rest),
          {:ok, order_by} <- parse_distinct_order_by(columns, rest) do
-      {:ok,
-       %{
-         measurement: measurement,
-         where: where,
-         order_by: order_by,
-         limit: parse_limit(rest),
-         group_by_interval: nil,
-         group_by_columns: nil,
-         select_columns: nil,
-         distinct_columns: columns,
-         projection_columns: nil,
-         ctes: []
-       }}
+      {:ok, new_query(measurement, where, rest, order_by: order_by, distinct_columns: columns)}
     end
   end
 
@@ -862,19 +879,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           {:ok, parsed_query()} | {:error, map()}
   defp build_star_query(measurement, rest) do
     with {:ok, where} <- parse_where(rest) do
-      {:ok,
-       %{
-         measurement: measurement,
-         where: where,
-         order_by: parse_order_by(rest),
-         limit: parse_limit(rest),
-         group_by_interval: nil,
-         group_by_columns: nil,
-         select_columns: nil,
-         distinct_columns: nil,
-         projection_columns: nil,
-         ctes: []
-       }}
+      {:ok, new_query(measurement, where, rest, [])}
     end
   end
 
@@ -905,26 +910,9 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec build_columns_query(binary(), binary(), binary()) ::
           {:ok, parsed_query()} | {:error, term()}
   defp build_columns_query(columns_str, measurement, rest) do
-    case parse_projection_columns(columns_str) do
-      {:ok, projection} ->
-        with {:ok, where} <- parse_where(rest) do
-          {:ok,
-           %{
-             measurement: measurement,
-             where: where,
-             order_by: parse_order_by(rest),
-             limit: parse_limit(rest),
-             group_by_interval: nil,
-             group_by_columns: nil,
-             select_columns: nil,
-             distinct_columns: nil,
-             projection_columns: projection,
-             ctes: []
-           }}
-        end
-
-      {:error, _reason} = error ->
-        error
+    with {:ok, projection} <- parse_projection_columns(columns_str),
+         {:ok, where} <- parse_where(rest) do
+      {:ok, new_query(measurement, where, rest, projection_columns: projection)}
     end
   end
 

@@ -267,13 +267,16 @@ defmodule InfluxElixirTest do
     end
 
     test "dynamically adds and removes a connection" do
-      assert {:ok, pid} =
-               InfluxElixir.add_connection(:dynamic_test, [])
+      # The supervisor registry is VM-global: a unique name keeps this test
+      # isolated from every other async module.
+      name = :"dynamic_test_#{System.unique_integer([:positive])}"
+
+      assert {:ok, pid} = InfluxElixir.add_connection(name, [])
 
       assert is_pid(pid)
       assert Process.alive?(pid)
 
-      assert :ok = InfluxElixir.remove_connection(:dynamic_test)
+      assert :ok = InfluxElixir.remove_connection(name)
       refute Process.alive?(pid)
     end
   end

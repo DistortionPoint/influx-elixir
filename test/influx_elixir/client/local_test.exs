@@ -3894,4 +3894,46 @@ defmodule InfluxElixir.Client.LocalTest do
       end
     end
   end
+
+  describe "bug regression — keyword-like column names and literals are not constructs" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "kw_db")
+
+      {:ok, :written} =
+        Local.write(
+          conn,
+          ~s|m,tag=x offset=1i,over=2i,note="select from join" 1000000000\n| <>
+            ~s|m,tag=y offset=3i,over=4i,note="plain" 2000000000|,
+          database: "kw_db"
+        )
+
+      {:ok, db: "kw_db"}
+    end
+
+    test "columns named offset and over are selectable, as on the engine", %{conn: conn, db: db} do
+      assert {:ok, [%{"offset" => 1, "over" => 2}, %{"offset" => 3, "over" => 4}]} =
+               Local.query_sql(conn, ~s|SELECT offset, over FROM "m" ORDER BY time|, database: db)
+    end
+
+    test "keywords inside a string literal are just text", %{conn: conn, db: db} do
+      assert {:ok, [%{"tag" => "x"}]} =
+               Local.query_sql(conn, ~s|SELECT tag FROM "m" WHERE note = 'select from join'|,
+                 database: db
+               )
+    end
+
+    test "the real OFFSET clause and OVER () are still refused by name", %{conn: conn, db: db} do
+      assert {:error,
+              %{status: 400, body: "Client.Local: unsupported SQL construct OFFSET" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT tag FROM "m" LIMIT 1 OFFSET 1|, database: db)
+
+      assert {:error,
+              %{status: 400, body: "Client.Local: unsupported SQL construct OVER" <> _rest}} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT tag, ROW_NUMBER() OVER (ORDER BY time) AS n FROM "m"|,
+                 database: db
+               )
+    end
+  end
 end
