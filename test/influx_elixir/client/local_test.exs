@@ -9,6 +9,12 @@ defmodule InfluxElixir.Client.LocalTest do
     {:ok, conn: conn}
   end
 
+  # Host tags of the rows a query returns, in order.
+  defp hosts(conn, db, sql) do
+    {:ok, rows} = Local.query_sql(conn, sql, database: db)
+    Enum.map(rows, & &1["host"])
+  end
+
   # ---------------------------------------------------------------------------
   # Lifecycle
   # ---------------------------------------------------------------------------
@@ -3970,11 +3976,6 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "where_db"}
     end
 
-    defp hosts(conn, db, sql) do
-      {:ok, rows} = Local.query_sql(conn, sql, database: db)
-      Enum.map(rows, & &1["host"])
-    end
-
     test "OR, and AND binding tighter than OR", %{conn: conn, db: db} do
       assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE v > 3 OR v < 2 ORDER BY host|) ==
                ["a", "d", "e"]
@@ -4276,6 +4277,144 @@ defmodule InfluxElixir.Client.LocalTest do
          %{conn: conn, db: db} do
       assert {:error, %{status: 500, body: "Schema error: No field named prod." <> _rest}} =
                Local.query_sql(conn, ~s|SELECT price FROM "p" WHERE symbol = prod|, database: db)
+    end
+  end
+
+  describe "bug regression — an unknown column anywhere is the engine's schema error" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "schema_db")
+
+      {:ok, :written} =
+        Local.write(
+          conn,
+          "p,host=a v=1.0 1700000000000000000\np,host=b v=2.0 1700000001000000000",
+          database: "schema_db",
+          precision: :nanosecond
+        )
+
+      {:ok, db: "schema_db"}
+    end
+
+    test "SELECT, aggregates, selectors, WHERE, GROUP BY, ORDER BY and DISTINCT",
+         %{conn: conn, db: db} do
+      # Every one of these is a 500 "Schema error: No field named nosuch" on
+      # InfluxDB 3 Core; before, the double answered with rows, no rows, or
+      # unsorted rows, depending on the clause.
+      for sql <- [
+            ~s|SELECT nosuch FROM "p"|,
+            ~s|SELECT host, nosuch AS n FROM "p"|,
+            ~s|SELECT * FROM "p" WHERE nosuch = 1|,
+            ~s|SELECT * FROM "p" WHERE nosuch IS NULL|,
+            ~s|SELECT * FROM "p" WHERE nosuch IN ('a')|,
+            ~s|SELECT * FROM "p" WHERE v > 0 OR nosuch LIKE 'a%'|,
+            ~s|SELECT * FROM "p" ORDER BY nosuch|,
+            ~s|SELECT host FROM "p" GROUP BY nosuch|,
+            ~s|SELECT MAX(nosuch) AS m FROM "p"|,
+            ~s|SELECT MAX(v + nosuch) AS m FROM "p"|,
+            ~s|SELECT nosuch, COUNT(*) AS n FROM "p" GROUP BY nosuch|,
+            ~s|SELECT DISTINCT nosuch FROM "p"|,
+            ~s|SELECT selector_first(nosuch, time)['value'] AS f FROM "p"|,
+            ~s|SELECT selector_first(v, nosuch)['value'] AS f FROM "p"|,
+            ~s|SELECT first_value(nosuch ORDER BY time) AS f FROM "p"|,
+            ~s|SELECT COUNT(DISTINCT nosuch) AS n FROM "p"|,
+            ~s|WITH w AS (SELECT host FROM "p") SELECT nosuch FROM w|
+          ] do
+        assert {:error, %{status: 500, body: "Schema error: No field named nosuch." <> _rest}} =
+                 Local.query_sql(conn, sql, database: db),
+               sql
+      end
+    end
+
+    test "an output alias is a valid ORDER BY target and a source column need not be projected",
+         %{conn: conn, db: db} do
+      assert {:ok, [%{"h" => "b"}, %{"h" => "a"}]} =
+               Local.query_sql(conn, ~s|SELECT host AS h FROM "p" ORDER BY h DESC|, database: db)
+
+      assert {:ok, [%{"host" => "b"}, %{"host" => "a"}]} =
+               Local.query_sql(conn, ~s|SELECT host FROM "p" ORDER BY v DESC|, database: db)
+
+      assert {:ok, [%{"n" => 2}]} =
+               Local.query_sql(conn, ~s|SELECT COUNT(*) AS n FROM "p" ORDER BY n|, database: db)
+    end
+
+    test "with no rows the schema is unknown and nothing is checked", %{conn: conn, db: db} do
+      assert {:ok, []} =
+               Local.query_sql(
+                 conn,
+                 ~s|WITH w AS (SELECT host FROM "p" WHERE v > 100) SELECT nosuch FROM w|,
+                 database: db
+               )
+    end
+  end
+
+  describe "bug regression — GROUP BY without an aggregate, ungrouped projections, grouped ORDER BY" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "grp_db")
+
+      {:ok, :written} =
+        Local.write(
+          conn,
+          Enum.join(
+            [
+              "p,host=a v=1.0 1700000000000000000",
+              "p,host=b v=2.0 1700000001000000000",
+              "p,host=b v=5.0 1700000002000000000"
+            ],
+            "\n"
+          ),
+          database: "grp_db",
+          precision: :nanosecond
+        )
+
+      {:ok, db: "grp_db"}
+    end
+
+    test "GROUP BY without an aggregate yields one row per group", %{conn: conn, db: db} do
+      # Before, GROUP BY on a plain projection was silently ignored.
+      assert {:ok, [%{"host" => "a"}, %{"host" => "b"}]} =
+               Local.query_sql(conn, ~s|SELECT host FROM "p" GROUP BY host ORDER BY host|,
+                 database: db
+               )
+
+      assert {:ok, [%{"h" => "b"}, %{"h" => "a"}]} =
+               Local.query_sql(conn, ~s|SELECT host AS h FROM "p" GROUP BY host ORDER BY h DESC|,
+                 database: db
+               )
+    end
+
+    test "a projected column that is neither grouped nor aggregated is the engine's planning error",
+         %{conn: conn, db: db} do
+      for sql <- [
+            ~s|SELECT host, v FROM "p" GROUP BY host|,
+            ~s|SELECT host, MAX(v) AS m FROM "p"|,
+            ~s|SELECT host, DATE_BIN(INTERVAL '1 minute', time) AS t, MAX(v) AS m FROM "p" GROUP BY DATE_BIN(INTERVAL '1 minute', time)|
+          ] do
+        assert {:error,
+                %{
+                  status: 400,
+                  body: "Error during planning: Column in SELECT must be in GROUP BY" <> _rest
+                }} =
+                 Local.query_sql(conn, sql, database: db),
+               sql
+      end
+
+      assert {:error, %{status: 400}} =
+               Local.query_sql(conn, ~s|SELECT * FROM "p" GROUP BY host|, database: db)
+    end
+
+    test "ORDER BY is honoured on GROUP BY <column> aggregates", %{conn: conn, db: db} do
+      # Before, only DATE_BIN groups were ordered; column groups came back in map order.
+      assert {:ok, [%{"host" => "b", "t" => 7.0}, %{"host" => "a", "t" => 1.0}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT host, SUM(v) AS t FROM "p" GROUP BY host ORDER BY t DESC|,
+                 database: db
+               )
+
+      assert {:ok, [%{"n" => 1}, %{"n" => 2}]} =
+               Local.query_sql(conn, ~s|SELECT COUNT(*) AS n FROM "p" GROUP BY host ORDER BY n|,
+                 database: db
+               )
     end
   end
 end

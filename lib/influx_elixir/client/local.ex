@@ -100,10 +100,13 @@ defmodule InfluxElixir.Client.Local do
       does not match `"10"`). Bare literals (`42`, `1.5`, `true`) are typed
       and compare numerically against numeric fields. Either side may be an
       arithmetic expression over columns (`price <= med * 3`,
-      `2 * price > volume`); a bare word is a column reference, as in SQL,
-      and one that no row has is the engine's schema error ("No field named
-      prod"), which is what a forgotten pair of quotes produces in
-      production. `col = NULL` (a `nil` param) is never true.
+      `2 * price > volume`); a bare word is a column reference, as in SQL.
+      A column that no row has — named anywhere: `SELECT`, an aggregate,
+      `WHERE`, `GROUP BY`, `ORDER BY`, `DISTINCT` — is the engine's schema
+      error ("No field named prod", HTTP 500), which is what a typo or a
+      forgotten pair of quotes produces in production. With no rows the
+      schema is unknown and nothing is checked. `col = NULL` (a `nil`
+      param) is never true.
     * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)`
     * `WHERE col IS NULL` and `WHERE col IS NOT NULL`
     * `WHERE col [NOT] BETWEEN low AND high` (inclusive; `time` too)
@@ -155,9 +158,13 @@ defmodule InfluxElixir.Client.Local do
     * `GROUP BY DATE_BIN(INTERVAL 'N unit', time)` — optional. When omitted,
       aggregate queries return a single scalar row (`COUNT` over an empty
       result set is `0`; other aggregates return `nil`).
-    * `GROUP BY <col>[, <col>...]` — bucket points by tag/field values.
-      Bare column names (with optional `AS alias`) are also valid in the
-      `SELECT` list alongside aggregate functions.
+    * `GROUP BY <col>[, <col>...]` — bucket points by tag/field values,
+      with or without an aggregate (`SELECT host FROM m GROUP BY host` is
+      one row per host). Bare column names (with optional `AS alias`) are
+      valid in the `SELECT` list only when grouped; a projected column that
+      is neither grouped nor aggregated is the engine's planning error
+      ("must appear in the GROUP BY clause or must be part of an aggregate
+      function"). `ORDER BY` applies to grouped rows too.
     * Interval units: `seconds`, `minutes`, `hours`, `days`
 
   A null column is omitted from the row rather than present as `nil`,
@@ -1037,7 +1044,8 @@ defmodule InfluxElixir.Client.Local do
   defp execute_select(table, %{measurement: m} = query, database, cte_sources) do
     with {:ok, points} <- source_points(table, database, m, cte_sources),
          {:ok, joined} <- cross_join(table, database, points, query.cross_join, cte_sources),
-         :ok <- check_where_columns(joined, query.where),
+         :ok <- check_query_columns(joined, query),
+         :ok <- check_grouping_columns(query),
          {:ok, filtered} <- apply_where(joined, query.where) do
       cond do
         query.distinct_columns ->
@@ -1148,16 +1156,18 @@ defmodule InfluxElixir.Client.Local do
       else: columns
   end
 
-  # A column referenced by an expression in WHERE that no row has is the
-  # engine's schema error ("No field named prod"), not an empty result — the
-  # usual cause is a forgotten pair of quotes around a string literal.
-  @spec check_where_columns([point_map()], [SQLParser.where_node()]) :: :ok | {:error, term()}
-  defp check_where_columns([], _where), do: :ok
+  # A column the query names that no row has — in SELECT, an aggregate,
+  # WHERE, GROUP BY, ORDER BY or DISTINCT — is the engine's schema error
+  # ("No field named prod"), not an empty or unsorted result. The usual
+  # cause is a typo or a forgotten pair of quotes around a string literal.
+  # With no rows the schema is unknown, so nothing is checked.
+  @spec check_query_columns([point_map()], SQLParser.parsed_query()) :: :ok | {:error, term()}
+  defp check_query_columns([], _query), do: :ok
 
-  defp check_where_columns(points, where) do
+  defp check_query_columns(points, query) do
     known = points |> point_columns() |> MapSet.put("time")
 
-    case where |> where_expr_fields() |> Enum.reject(&MapSet.member?(known, &1)) do
+    case Enum.reject(referenced_columns(query), &MapSet.member?(known, &1)) do
       [] ->
         :ok
 
@@ -1172,11 +1182,87 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec where_expr_fields([SQLParser.where_node()]) :: [binary()]
-  defp where_expr_fields(nodes) do
+  # A projected plain column in an aggregate query must be grouped: the
+  # engine fails planning otherwise ("must appear in the GROUP BY clause or
+  # must be part of an aggregate function"). Before, the double sampled the
+  # group's first row, which is a wrong answer, not a refusal.
+  @spec check_grouping_columns(SQLParser.parsed_query()) :: :ok | {:error, term()}
+  defp check_grouping_columns(%{select_columns: nil}), do: :ok
+
+  defp check_grouping_columns(query) do
+    grouped = query.group_by_columns || []
+
+    ungrouped =
+      Enum.find_value(query.select_columns, fn
+        {:grouping_column, source, _alias} -> if source in grouped, do: nil, else: source
+        _other -> nil
+      end)
+
+    case ungrouped do
+      nil ->
+        :ok
+
+      column ->
+        {:error,
+         %{
+           status: 400,
+           body:
+             "Error during planning: Column in SELECT must be in GROUP BY or an aggregate " <>
+               "function: column \"#{column}\" must appear in the GROUP BY clause or must be " <>
+               "part of an aggregate function"
+         }}
+    end
+  end
+
+  # Every source column the query refers to. ORDER BY may name an output
+  # alias instead, which is not a source column.
+  @spec referenced_columns(SQLParser.parsed_query()) :: [binary()]
+  defp referenced_columns(query) do
+    order_by_refs =
+      case query.order_by do
+        {column, _direction} -> if column in output_aliases(query), do: [], else: [column]
+        nil -> []
+      end
+
+    Enum.flat_map(query.projection_columns || [], &projection_refs/1) ++
+      Enum.flat_map(query.select_columns || [], &select_column_refs/1) ++
+      where_refs(query.where) ++
+      (query.group_by_columns || []) ++
+      (query.distinct_columns || []) ++
+      order_by_refs
+  end
+
+  @spec output_aliases(SQLParser.parsed_query()) :: [binary()]
+  defp output_aliases(query) do
+    Enum.map(query.projection_columns || [], fn {_source, output} -> output end) ++
+      Enum.map(query.select_columns || [], &elem(&1, tuple_size(&1) - 1)) ++
+      (query.distinct_columns || [])
+  end
+
+  @spec projection_refs(SQLParser.projection()) :: [binary()]
+  defp projection_refs({source, _output}) when is_binary(source), do: [source]
+  defp projection_refs({expr, _output}), do: expr_fields(expr)
+
+  @spec select_column_refs(SQLParser.select_column()) :: [binary()]
+  defp select_column_refs({:time_bucket, _alias}), do: ["time"]
+  defp select_column_refs({:aggregate, _agg, expr, _alias}), do: expr_fields(expr)
+  defp select_column_refs({:count_star, _alias}), do: []
+  defp select_column_refs({:count_distinct, column, _alias}), do: [column]
+
+  defp select_column_refs({:ordered_aggregate, _agg, field, ordering, _alias}),
+    do: [field, ordering]
+
+  defp select_column_refs({:selector, _kind, field, ordering, _access, _alias}),
+    do: [field, ordering]
+
+  defp select_column_refs({:grouping_column, source, _alias}), do: [source]
+
+  @spec where_refs([SQLParser.where_node()]) :: [binary()]
+  defp where_refs(nodes) do
     Enum.flat_map(nodes, fn
-      {:or, branches} -> Enum.flat_map(branches, &where_expr_fields/1)
-      {:not, conjunction} -> where_expr_fields(conjunction)
+      {:or, branches} -> Enum.flat_map(branches, &where_refs/1)
+      {:not, conjunction} -> where_refs(conjunction)
+      {_op, left, right} when is_binary(left) -> [left | expr_fields(right)]
       {_op, left, right} -> expr_fields(left) ++ expr_fields(right)
     end)
   end
@@ -1292,6 +1378,7 @@ defmodule InfluxElixir.Client.Local do
     points
     |> bucket_by_columns(cols)
     |> aggregate_per_column_bucket(query.select_columns)
+    |> apply_order_by_rows(query.order_by, nil)
     |> apply_limit(query.limit)
   end
 

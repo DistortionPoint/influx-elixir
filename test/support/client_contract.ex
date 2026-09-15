@@ -1592,6 +1592,34 @@ defmodule InfluxElixir.ClientContract do
                      "SELECT price FROM contract_mj WHERE symbol = prod",
                      database: ctx.database
                    )
+
+          # An unknown column in any clause is the engine's schema error.
+          for sql <- [
+                "SELECT nosuch FROM contract_mj",
+                "SELECT price FROM contract_mj ORDER BY nosuch",
+                "SELECT symbol FROM contract_mj GROUP BY nosuch",
+                "SELECT MAX(nosuch) AS m FROM contract_mj"
+              ] do
+            assert {:error, %{status: 500}} =
+                     unquote(client).query_sql(ctx.conn, sql, database: ctx.database),
+                   sql
+          end
+
+          # A projected column must be grouped or aggregated; GROUP BY without
+          # an aggregate is one row per group.
+          assert {:error, %{status: 400}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT symbol, price FROM contract_mj GROUP BY symbol",
+                     database: ctx.database
+                   )
+
+          assert {:ok, [%{"symbol" => "X"}]} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT symbol FROM contract_mj GROUP BY symbol",
+                     database: ctx.database
+                   )
         end
       end
     end

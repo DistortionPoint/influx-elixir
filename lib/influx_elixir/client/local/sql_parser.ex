@@ -386,10 +386,13 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   @spec aggregate_query?(binary()) :: boolean()
+  # A GROUP BY without an aggregate (`SELECT host FROM p GROUP BY host`) is
+  # still a grouped query: one row per group, the grouping columns projected.
   defp aggregate_query?(sql) do
     upper = String.upcase(sql)
 
     String.contains?(upper, "DATE_BIN") or
+      Regex.match?(~r/\bGROUP\s+BY\b/, upper) or
       Enum.any?(
         @aggregate_functions ++ @influxql_only_functions,
         &String.contains?(upper, &1 <> "(")

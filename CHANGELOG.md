@@ -24,6 +24,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` ignored `GROUP BY` on a plain projection and `ORDER BY`
+  on column-grouped aggregates, and sampled a row for an ungrouped
+  column.** `SELECT host FROM p GROUP BY host` returned every row; `SELECT
+  host, SUM(v) AS t FROM p GROUP BY host ORDER BY t DESC` came back in map
+  order; `SELECT host, MAX(v) FROM p` (no `GROUP BY`) picked the first
+  row's host. The engine returns one row per group, honours the ordering,
+  and fails planning for the ungrouped column ("must appear in the GROUP BY
+  clause or must be part of an aggregate function"); the double now does
+  all three.
+- **`Client.Local` answered queries that name a column no row has.**
+  `SELECT nosuch`, `MAX(nosuch)`, `WHERE nosuch = 1`, `GROUP BY nosuch`,
+  `ORDER BY nosuch` and `DISTINCT nosuch` are all the same 500 schema error
+  on InfluxDB 3 ("No field named nosuch"); the double returned rows without
+  the column, no rows, or unsorted rows depending on the clause. Every
+  column reference in a query is now checked against the rows' columns
+  (the check added for `WHERE` expressions in 0.1.24 generalised), and an
+  output alias remains a valid `ORDER BY` target.
 - **An unbound `$placeholder` matched nothing in `Client.Local`**; the
   engine fails planning ("No value found for placeholder with name $host").
   The double now returns that error, so a missing binding cannot pass a

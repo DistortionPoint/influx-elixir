@@ -21,7 +21,7 @@
 - `COUNT(DISTINCT col)`, `MIN(time)` / `MAX(time)` (a `DateTime`) and `WHERE col IS [NOT] NULL` work on both clients; `AVG(time)` and arithmetic on `time` do not
 - `WHERE` supports `AND` / `OR` / `NOT` / parentheses (AND binds tighter), `<>`, `[NOT] BETWEEN`, `[NOT] LIKE` / `ILIKE`; a string tag against a bare number compares lexically on both clients (`rack > 3` does not match `"10"`) — quote the literal or compare numbers to numeric fields
 - `Client.Local` also runs projected arithmetic with an alias (`(bid + ask) / 2 AS mid`), non-recursive `WITH` CTEs read in order, `alias.column` qualifiers, `median()`, `CROSS JOIN` (broadcast a one-row CTE; a column on both sides is refused as ambiguous) and arithmetic on either side of a `WHERE` comparison; other joins, set operations, subqueries, `HAVING`, `OFFSET` and window functions are rejected by name — cover those against a real server
-- A bare word in `WHERE` is a column reference on both clients; an unknown one is the engine's schema error, not an empty result — quote string literals
+- A bare word is a column reference on both clients; a column no row has, named in any clause, is the engine's schema error (HTTP 500), not an empty or unsorted result — quote string literals
 - Default response format is JSON; `:jsonl`, `:csv` and `:parquet` (raw binary) are also supported
 
 ## Arrow Flight

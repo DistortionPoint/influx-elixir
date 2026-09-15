@@ -556,9 +556,11 @@ functions are outside the subset and are rejected **by name**
 query the double cannot run never returns rows computed from its first
 table alone. Cover those in the integration tier.
 
-A bare word in `WHERE` is a column reference, as in SQL. One that no row has
-is the engine's schema error (`No field named prod`) — the usual cause is a
-forgotten pair of quotes — rather than an empty result.
+A bare word is a column reference, as in SQL. A column that no row has —
+named anywhere, in `SELECT`, an aggregate, `WHERE`, `GROUP BY`, `ORDER BY` or
+`DISTINCT` — is the engine's schema error (`No field named prod`, HTTP 500)
+rather than an empty or unsorted result; the usual cause is a typo or a
+forgotten pair of quotes.
 
 ## WHERE Clauses
 
