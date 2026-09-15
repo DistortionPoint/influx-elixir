@@ -24,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` returned wrong rows for `OR`, `NOT`, parentheses and
+  `<>` in `WHERE`, and for `LIMIT 0`.** The clause splitter only knew `AND`:
+  `v > 3 OR v < 2` was read as one predicate against the string
+  `"3 OR v < 2"`, `NOT host = 'a'` and `v <> 1.0` matched nothing, and
+  `LIMIT 0` returned every row where the engine returns none. `WHERE` is now
+  parsed as a boolean expression — `AND` binding tighter than `OR`, `NOT`,
+  parentheses, string literals opaque — and `<>`, `[NOT] BETWEEN ... AND
+  ...` (including `time`) and `[NOT] LIKE` / `ILIKE` are supported with the
+  engine's semantics (`LIKE` case-sensitive, `_` one character, `LIKE` over a
+  numeric column reproduces the engine's planning error). `LIMIT 0` returns
+  no rows; a negative or non-numeric `LIMIT` is rejected as the engine
+  rejects it. A malformed expression is rejected, never truncated.
+- **`Client.Local` compared a string tag against a bare number by Erlang
+  term order**, so `rack > 3` matched every tag. The engine keeps the column
+  as text and renders the literal (`rack = 2` matches `"2"`; `rack > 3`
+  does not match `"10"`); the double now does the same.
 - **`Flight.Reader` walked empty FlatBuffer vectors at bogus indices.**
   `for i <- 0..(count - 1)` with `count == 0` is the descending range
   `[0, -1]` in Elixir, so a schema with no fields or a record batch with an

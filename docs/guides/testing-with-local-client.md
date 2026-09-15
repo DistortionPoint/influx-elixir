@@ -454,9 +454,13 @@ sql = "SELECT * FROM accounts WHERE repcode IN ($rc)"
 {:ok, rows} = Local.query_sql(conn, sql, database: "test_db", params: %{rc: "08338636"})
 ```
 
-Bare literals are typed (`42` integer, `1.5` float, `true` boolean). A bare
-numeric literal never matches a string tag (`WHERE repcode = 08338636`
-returns no rows), again matching the real engine.
+Bare literals are typed (`42` integer, `1.5` float, `true` boolean) and
+compare numerically against numeric fields (`v = 1` matches `1.0`). Against a
+string tag the engine keeps the column as text and renders the literal, so
+the comparison is lexical: `WHERE rack = 2` matches the tag `"2"`,
+`WHERE rack > 3` does not match `"10"`, and `WHERE repcode = 08338636`
+returns no rows because the literal renders as `"8338636"`. The double
+reproduces all three.
 
 ## Multi-Column Projection
 
@@ -523,21 +527,30 @@ are rejected **by name** (`Client.Local: unsupported SQL construct JOIN`)
 rather than ignored, so a query the double cannot run never returns rows
 computed from its first table alone. Cover those in the integration tier.
 
-## IN / NOT IN Clauses
+## WHERE Clauses
 
-`WHERE col IN (...)` and `WHERE col NOT IN (...)` are supported on tags
-and fields. Combine with binary operators via `AND`:
+Predicates are `=`, `!=` / `<>`, `<`, `<=`, `>`, `>=`, `IN (...)`,
+`NOT IN (...)`, `IS [NOT] NULL`, `[NOT] BETWEEN low AND high` and
+`[NOT] LIKE` / `ILIKE`, combined with `AND`, `OR`, `NOT` and parentheses.
+`AND` binds tighter than `OR`, as in SQL:
 
 ```elixir
 sql = """
 SELECT * FROM holdings
-WHERE ticker IN ('AAPL', 'MSFT') AND shares > 5
+WHERE (ticker IN ('AAPL', 'MSFT') OR sector = 'tech')
+  AND shares BETWEEN 5 AND 500
+  AND NOT account LIKE 'test_%'
 """
 
 {:ok, rows} = Local.query_sql(conn, sql, database: "test_db")
 ```
 
-`IN ()` (empty list) matches no rows; `NOT IN ()` matches all rows.
+`IN ()` (empty list) matches no rows; `NOT IN ()` matches all rows. `LIKE`
+is case-sensitive and `ILIKE` is not; `%` matches any run and `_` one
+character. `LIKE` over a numeric column is rejected with the engine's own
+planning error. A malformed expression (an unbalanced parenthesis, a
+trailing `AND`) is rejected rather than truncated. `LIMIT 0` returns no
+rows; a negative or non-numeric `LIMIT` is rejected.
 
 ## Time Filters
 

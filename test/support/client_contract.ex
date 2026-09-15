@@ -59,6 +59,7 @@ defmodule InfluxElixir.ClientContract do
     stats_tests = if v3_sql, do: stats_tests(client), else: nil
     time_filter_tests = if v3_sql, do: time_filter_tests(client), else: nil
     cte_tests = if v3_sql, do: cte_tests(client), else: nil
+    where_tests = if v3_sql, do: where_tests(client), else: nil
     ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
     distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
     param_tests = if v3_sql, do: param_tests(client), else: nil
@@ -94,6 +95,7 @@ defmodule InfluxElixir.ClientContract do
         stats_tests,
         time_filter_tests,
         cte_tests,
+        where_tests,
         ordered_agg_tests,
         distinct_tests,
         param_tests,
@@ -1349,6 +1351,112 @@ defmodule InfluxElixir.ClientContract do
             )
 
           assert rows == [%{"bid" => 5.0}, %{"bid" => 10.0}]
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # WHERE boolean logic, BETWEEN, LIKE, <>, LIMIT 0, string-vs-number
+  # ---------------------------------------------------------------------------
+
+  defp where_tests(client) do
+    quote do
+      describe "query_sql/3 — WHERE boolean logic contract" do
+        setup ctx do
+          lp =
+            Enum.join(
+              [
+                "contract_wh,host=a,rack=1 v=1.0 1700000001000000000",
+                "contract_wh,host=b,rack=2 v=2.5 1700000002000000000",
+                "contract_wh,host=c v=3.0 1700000003000000000",
+                "contract_wh,host=d,rack=4 v=4.0 1700000004000000000",
+                "contract_wh,host=e,rack=10 v=5.0 1700000005000000000"
+              ],
+              "\n"
+            )
+
+          {:ok, :written} = unquote(client).write(ctx.conn, lp, database: ctx.database)
+          InfluxElixir.ClientContract.settle(ctx)
+          :ok
+        end
+
+        test "OR, NOT, parentheses and precedence", ctx do
+          hosts = fn sql ->
+            {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+            Enum.map(rows, & &1["host"])
+          end
+
+          assert hosts.("SELECT host FROM contract_wh WHERE v > 3 OR v < 2 ORDER BY host") ==
+                   ["a", "d", "e"]
+
+          assert hosts.(
+                   "SELECT host FROM contract_wh WHERE host = 'a' OR host = 'b' AND v > 2 ORDER BY host"
+                 ) ==
+                   ["a", "b"]
+
+          assert hosts.("SELECT host FROM contract_wh WHERE (host = 'a' OR host = 'b') AND v > 2") ==
+                   ["b"]
+
+          assert hosts.(
+                   "SELECT host FROM contract_wh WHERE NOT (host = 'a' OR host = 'b') ORDER BY host"
+                 ) ==
+                   ["c", "d", "e"]
+
+          assert hosts.("SELECT host FROM contract_wh WHERE v <> 1.0 ORDER BY host") ==
+                   ["b", "c", "d", "e"]
+        end
+
+        test "BETWEEN, LIKE, ILIKE and string-vs-number comparison", ctx do
+          hosts = fn sql ->
+            {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+            Enum.map(rows, & &1["host"])
+          end
+
+          assert hosts.("SELECT host FROM contract_wh WHERE v BETWEEN 2 AND 3 ORDER BY host") ==
+                   ["b", "c"]
+
+          assert hosts.("SELECT host FROM contract_wh WHERE v NOT BETWEEN 2 AND 3 ORDER BY host") ==
+                   ["a", "d", "e"]
+
+          assert hosts.(
+                   "SELECT host FROM contract_wh WHERE time BETWEEN '2023-11-14T22:13:22Z' AND '2023-11-14T22:13:23Z' ORDER BY host"
+                 ) ==
+                   ["b", "c"]
+
+          assert hosts.("SELECT host FROM contract_wh WHERE host LIKE 'a%'") == ["a"]
+          assert hosts.("SELECT host FROM contract_wh WHERE host LIKE 'A%'") == []
+          assert hosts.("SELECT host FROM contract_wh WHERE host ILIKE 'A%'") == ["a"]
+
+          assert hosts.("SELECT host FROM contract_wh WHERE host NOT LIKE 'a%' ORDER BY host") ==
+                   ["b", "c", "d", "e"]
+
+          assert hosts.("SELECT host FROM contract_wh WHERE rack = 2") == ["b"]
+          assert hosts.("SELECT host FROM contract_wh WHERE rack > 3 ORDER BY host") == ["d"]
+
+          assert hosts.("SELECT host FROM contract_wh WHERE rack >= 10 ORDER BY host") ==
+                   ["b", "d", "e"]
+
+          assert {:error, %{status: 400}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT host FROM contract_wh WHERE v LIKE '1%'",
+                     database: ctx.database
+                   )
+        end
+
+        test "LIMIT 0 returns no rows and LIMIT -1 is rejected", ctx do
+          assert {:ok, []} =
+                   unquote(client).query_sql(ctx.conn, "SELECT host FROM contract_wh LIMIT 0",
+                     database: ctx.database
+                   )
+
+          assert {:error, %{status: 400}} =
+                   unquote(client).query_sql(ctx.conn, "SELECT host FROM contract_wh LIMIT -1",
+                     database: ctx.database
+                   )
         end
       end
     end

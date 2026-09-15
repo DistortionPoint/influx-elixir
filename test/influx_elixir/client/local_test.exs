@@ -3156,7 +3156,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:error, %{status: 400, body: body}} =
                Local.query_sql(
                  conn,
-                 "SELECT * FROM alerts WHERE severity LIKE 'h%'",
+                 "SELECT * FROM alerts WHERE severity SIMILAR TO 'h%'",
                  database: db
                )
 
@@ -3934,6 +3934,177 @@ defmodule InfluxElixir.Client.LocalTest do
                  ~s|SELECT tag, ROW_NUMBER() OVER (ORDER BY time) AS n FROM "m"|,
                  database: db
                )
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # WHERE boolean logic, BETWEEN, LIKE, <>, LIMIT 0 and string-vs-number
+  # comparison. Every expected value recorded from InfluxDB 3 Core first
+  # (docs/design/2026-09-15_local-where-boolean-logic.md).
+  # ---------------------------------------------------------------------------
+
+  describe "bug regression — WHERE OR / NOT / parentheses, BETWEEN, LIKE, <>, LIMIT 0" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "where_db")
+
+      lines =
+        Enum.join(
+          [
+            "m,host=a,rack=1 v=1.0,n=1i 1000000000",
+            "m,host=b,rack=2 v=2.5,n=2i 2000000000",
+            "m,host=c v=3.0,n=3i 3000000000",
+            "m,host=d,rack=4 v=4.0,n=4i 4000000000",
+            "m,host=e,rack=10 v=5.0,n=5i 5000000000"
+          ],
+          "\n"
+        )
+
+      {:ok, :written} = Local.write(conn, lines, database: "where_db")
+      {:ok, db: "where_db"}
+    end
+
+    defp hosts(conn, db, sql) do
+      {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      Enum.map(rows, & &1["host"])
+    end
+
+    test "OR, and AND binding tighter than OR", %{conn: conn, db: db} do
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE v > 3 OR v < 2 ORDER BY host|) ==
+               ["a", "d", "e"]
+
+      assert hosts(
+               conn,
+               db,
+               ~s|SELECT host FROM "m" WHERE host = 'a' OR host = 'b' AND v > 2 ORDER BY host|
+             ) ==
+               ["a", "b"]
+
+      assert hosts(
+               conn,
+               db,
+               ~s|SELECT host FROM "m" WHERE v > 3 OR v < 2 AND host = 'a' ORDER BY host|
+             ) ==
+               ["a", "d", "e"]
+
+      assert hosts(
+               conn,
+               db,
+               ~s|SELECT host FROM "m" WHERE host IN ('a', 'c') OR v = 4.0 ORDER BY host|
+             ) ==
+               ["a", "c", "d"]
+    end
+
+    test "parentheses group, NOT negates a predicate or a group", %{conn: conn, db: db} do
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE (host = 'a' OR host = 'b') AND v > 2|) ==
+               ["b"]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE NOT host = 'a' ORDER BY host|) ==
+               ["b", "c", "d", "e"]
+
+      assert hosts(
+               conn,
+               db,
+               ~s|SELECT host FROM "m" WHERE NOT (host = 'a' OR host = 'b') ORDER BY host|
+             ) ==
+               ["c", "d", "e"]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE NOT rack IS NULL ORDER BY host|) ==
+               ["a", "b", "d", "e"]
+
+      assert hosts(
+               conn,
+               db,
+               ~s|SELECT host FROM "m" WHERE host NOT IN ('a', 'b') AND v > 3 ORDER BY host|
+             ) ==
+               ["d", "e"]
+    end
+
+    test "<> is not-equal", %{conn: conn, db: db} do
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE v <> 1.0 ORDER BY host|) ==
+               ["b", "c", "d", "e"]
+    end
+
+    test "BETWEEN and NOT BETWEEN, on fields and on time", %{conn: conn, db: db} do
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE v BETWEEN 2 AND 3 ORDER BY host|) ==
+               ["b", "c"]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE v NOT BETWEEN 2 AND 3 ORDER BY host|) ==
+               ["a", "d", "e"]
+
+      assert hosts(
+               conn,
+               db,
+               ~s|SELECT host FROM "m" WHERE time BETWEEN '1970-01-01T00:00:02Z' AND '1970-01-01T00:00:03Z' ORDER BY host|
+             ) == ["b", "c"]
+    end
+
+    test "LIKE is case-sensitive, ILIKE is not, _ is one character, NOT LIKE negates",
+         %{conn: conn, db: db} do
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host LIKE 'a%'|) == ["a"]
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host LIKE 'A%'|) == []
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host ILIKE 'A%'|) == ["a"]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host LIKE '_' ORDER BY host|) ==
+               ~w(a b c d e)
+
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host NOT LIKE 'a%' ORDER BY host|) ==
+               ["b", "c", "d", "e"]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE rack LIKE '1%' ORDER BY host|) ==
+               ["a", "e"]
+    end
+
+    test "LIKE over a numeric column is the engine's planning error", %{conn: conn, db: db} do
+      assert {:error,
+              %{status: 400, body: "Error during planning: There isn't a common type" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT host FROM "m" WHERE v LIKE '1%'|, database: db)
+    end
+
+    test "a string column against a numeric literal compares the literal's text, lexically",
+         %{conn: conn, db: db} do
+      # rack is a tag: "1", "2", "4", "10". DataFusion keeps the column Utf8
+      # and renders the literal, so 10 > 3 is false ("10" < "3") but "2" >= "10".
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE rack = 2|) == ["b"]
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE rack > 3 ORDER BY host|) == ["d"]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE rack >= 10 ORDER BY host|) == [
+               "b",
+               "d",
+               "e"
+             ]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE rack BETWEEN 1 AND 3 ORDER BY host|) ==
+               ["a", "b", "e"]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host > 1 ORDER BY host|) ==
+               ~w(a b c d e)
+
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host = 2|) == []
+    end
+
+    test "keywords inside string literals are text", %{conn: conn, db: db} do
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host = 'x AND y' OR host = 'a'|) == [
+               "a"
+             ]
+    end
+
+    test "LIMIT 0 returns no rows; a negative or non-numeric LIMIT is rejected",
+         %{conn: conn, db: db} do
+      assert {:ok, []} = Local.query_sql(conn, ~s|SELECT host FROM "m" LIMIT 0|, database: db)
+
+      assert {:error, %{status: 400, body: "Client.Local: LIMIT must be >= 0" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT host FROM "m" LIMIT -1|, database: db)
+
+      assert {:error, %{status: 400, body: "Client.Local: unsupported LIMIT" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT host FROM "m" LIMIT abc|, database: db)
+    end
+
+    test "malformed boolean expressions are rejected, not truncated", %{conn: conn, db: db} do
+      assert {:error, %{status: 400, body: "Client.Local: unbalanced parenthesis" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT host FROM "m" WHERE (host = 'a'|, database: db)
+
+      assert {:error, %{status: 400, body: "Client.Local: unsupported WHERE clause" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT host FROM "m" WHERE host = 'a' AND|, database: db)
     end
   end
 end

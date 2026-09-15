@@ -37,8 +37,28 @@ defmodule InfluxElixir.Client.Local.SQLParser do
              binary()}
           | {:grouping_column, binary(), binary()}
 
-  @type where_op :: :eq | :gt | :lt | :gte | :lte | :ne | :in | :not_in | :is_null | :is_not_null
+  @type where_op ::
+          :eq
+          | :gt
+          | :lt
+          | :gte
+          | :lte
+          | :ne
+          | :in
+          | :not_in
+          | :is_null
+          | :is_not_null
+          | :between
+          | :not_between
+          | :like
+          | :not_like
   @type where_clause :: {where_op(), binary(), term()}
+
+  @typedoc """
+  A WHERE conjunction is a list of nodes: a predicate, an `{:or, branches}`
+  node whose branches are conjunctions, or a `{:not, conjunction}` node.
+  """
+  @type where_node :: where_clause() | {:or, [[where_node()]]} | {:not, [where_node()]}
 
   @typedoc """
   A `time` comparand: nanoseconds since the epoch, or `now()` plus an offset
@@ -61,7 +81,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   """
   @type parsed_query :: %{
           measurement: binary(),
-          where: [where_clause()],
+          where: [where_node()],
           order_by: order_by(),
           limit: pos_integer() | nil,
           group_by_interval: pos_integer() | nil,
@@ -211,7 +231,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     scannable = blank_literals(sql)
 
     with :ok <- check_constructs(scannable, sql),
-         :ok <- check_single_select(scannable, sql) do
+         :ok <- check_single_select(scannable, sql),
+         :ok <- check_limit(scannable, sql) do
       case Regex.run(@first_from, scannable) do
         [_full, next] when next == "" ->
           :ok
@@ -248,6 +269,25 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     if length(Regex.scan(~r/(?i)\bSELECT\b/, scannable)) > 1,
       do: {:error, local_error("unsupported SQL construct SUBQUERY: #{sql}")},
       else: :ok
+  end
+
+  # The engine plans `LIMIT -1` as "LIMIT must be >= 0" and anything but a
+  # number as a schema error; `LIMIT 0` is valid and returns no rows.
+  @spec check_limit(binary(), binary()) :: :ok | {:error, term()}
+  defp check_limit(scannable, sql) do
+    cond do
+      not Regex.match?(~r/(?i)\bLIMIT\b/, scannable) ->
+        :ok
+
+      Regex.match?(~r/(?i)\bLIMIT\s+\d+\s*$/, scannable) ->
+        :ok
+
+      Regex.match?(~r/(?i)\bLIMIT\s+-\d+/, scannable) ->
+        {:error, local_error("LIMIT must be >= 0: #{sql}")}
+
+      true ->
+        {:error, local_error("unsupported LIMIT (a non-negative integer is required): #{sql}")}
+    end
   end
 
   @spec unsupported(binary()) :: {:error, term()}
@@ -331,7 +371,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   # Every query shape shares this skeleton; `ORDER BY` and `LIMIT` come from
   # the text after the table unless the caller overrides them.
-  @spec new_query(binary(), [where_clause()], binary(), keyword()) :: parsed_query()
+  @spec new_query(binary(), [where_node()], binary(), keyword()) :: parsed_query()
   defp new_query(measurement, where, rest, overrides) do
     Map.merge(
       %{
@@ -962,7 +1002,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @doc "Parses the `WHERE ...` clause (if any) out of the text after `FROM <table>`."
   @spec parse_where(binary()) ::
-          {:ok, [where_clause()]} | {:error, map()}
+          {:ok, [where_node()]} | {:error, map()}
   def parse_where(rest) do
     case Regex.run(~r/(?i)WHERE\s+(.+?)(?:\s+GROUP|\s+ORDER|\s+LIMIT|$)/s, rest) do
       [_full_match, clauses_str] -> parse_where_clauses(clauses_str)
@@ -970,25 +1010,167 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  # Fold each AND-split clause into either an accumulating list or the first
-  # error encountered. Unrecognised clauses bubble up as 400 errors rather
-  # than being silently dropped (which previously returned wrong rows).
-  @spec parse_where_clauses(binary()) ::
-          {:ok, [where_clause()]} | {:error, map()}
+  # ---------------------------------------------------------------------------
+  # WHERE: a boolean expression over predicates
+  #
+  #   expr   := term (OR term)*
+  #   term   := factor (AND factor)*
+  #   factor := NOT factor | '(' expr ')' | predicate
+  #
+  # AND binds tighter than OR, as in SQL. The result is a conjunction list;
+  # OR and NOT appear as nodes inside it, so a plain `a AND b` is still the
+  # flat list every executor path already understands.
+  # ---------------------------------------------------------------------------
+
+  @spec parse_where_clauses(binary()) :: {:ok, [where_node()]} | {:error, map()}
   defp parse_where_clauses(str) do
-    str
-    |> String.split(~r/\s+AND\s+/i)
-    |> Enum.reduce_while({:ok, []}, fn clause, {:ok, acc} ->
-      case parse_single_where_clause(clause) do
-        {:ok, condition} -> {:cont, {:ok, [condition | acc]}}
-        {:error, _reason} = err -> {:halt, err}
-      end
-    end)
-    |> case do
-      {:ok, conditions} -> {:ok, Enum.reverse(conditions)}
-      {:error, _reason} = err -> err
+    with {:ok, tokens} <- tokenize_where(str),
+         {:ok, conj, []} <- where_or(tokens) do
+      {:ok, conj}
+    else
+      {:ok, _conj, _leftover} -> {:error, local_error("unsupported WHERE clause: #{str}")}
+      {:error, _reason} = error -> error
     end
   end
+
+  @typep where_token :: :lparen | :rparen | :and | :or | :not | {:pred, binary()}
+
+  # Scans the clause text into grouping parentheses, the three keywords and
+  # predicate text. Parentheses that belong to a predicate (`IN (...)`,
+  # `now()`) and keywords that belong to one (`NOT IN`, `NOT LIKE`, the AND of
+  # `BETWEEN a AND b`) stay inside its text; string literals are opaque.
+  @spec tokenize_where(binary()) :: {:ok, [where_token()]} | {:error, map()}
+  defp tokenize_where(str) do
+    scan_where(str, %{buf: "", depth: 0, between: false, tokens: []})
+  end
+
+  @spec scan_where(binary(), map()) :: {:ok, [where_token()]} | {:error, map()}
+  defp scan_where(<<>>, state),
+    do: {:ok, state |> flush_pred() |> Map.fetch!(:tokens) |> Enum.reverse()}
+
+  defp scan_where(<<"'", rest::binary>>, state) do
+    case String.split(rest, "'", parts: 2) do
+      [literal, after_quote] -> scan_where(after_quote, append(state, "'" <> literal <> "'"))
+      [_unterminated] -> {:error, local_error("unterminated string literal in WHERE: #{rest}")}
+    end
+  end
+
+  defp scan_where(<<"(", rest::binary>>, %{depth: 0} = state) do
+    if String.trim(state.buf) == "",
+      do: scan_where(rest, emit(state, :lparen)),
+      else: scan_where(rest, %{append(state, "(") | depth: 1})
+  end
+
+  defp scan_where(<<"(", rest::binary>>, state),
+    do: scan_where(rest, %{append(state, "(") | depth: state.depth + 1})
+
+  defp scan_where(<<")", rest::binary>>, %{depth: 0} = state),
+    do: scan_where(rest, state |> flush_pred() |> emit(:rparen))
+
+  defp scan_where(<<")", rest::binary>>, state),
+    do: scan_where(rest, %{append(state, ")") | depth: state.depth - 1})
+
+  defp scan_where(str, %{depth: 0} = state) do
+    case {word_boundary?(state.buf), Regex.run(~r/^(AND|OR|NOT)(?=\s|\(|$)/i, str)} do
+      {true, [keyword, _word]} ->
+        rest = binary_part(str, byte_size(keyword), byte_size(str) - byte_size(keyword))
+        scan_keyword(String.upcase(keyword), rest, state)
+
+      _not_a_keyword ->
+        <<c::utf8, rest::binary>> = str
+        scan_where(rest, append(state, <<c::utf8>>))
+    end
+  end
+
+  defp scan_where(<<c::utf8, rest::binary>>, state),
+    do: scan_where(rest, append(state, <<c::utf8>>))
+
+  @spec scan_keyword(binary(), binary(), map()) :: {:ok, [where_token()]} | {:error, map()}
+  defp scan_keyword("AND", rest, %{between: true} = state),
+    do: scan_where(rest, %{append(state, "AND") | between: false})
+
+  defp scan_keyword("AND", rest, state), do: scan_where(rest, state |> flush_pred() |> emit(:and))
+  defp scan_keyword("OR", rest, state), do: scan_where(rest, state |> flush_pred() |> emit(:or))
+
+  # A leading NOT negates; one inside a predicate is `NOT IN` / `NOT LIKE` /
+  # `NOT BETWEEN`.
+  defp scan_keyword("NOT", rest, state) do
+    if String.trim(state.buf) == "",
+      do: scan_where(rest, emit(state, :not)),
+      else: scan_where(rest, append(state, "NOT"))
+  end
+
+  @spec word_boundary?(binary()) :: boolean()
+  defp word_boundary?(""), do: true
+  defp word_boundary?(buf), do: String.ends_with?(buf, [" ", "\n", "\t", "("])
+
+  @spec append(map(), binary()) :: map()
+  defp append(state, text) do
+    buf = state.buf <> text
+    between = state.between or Regex.match?(~r/\bBETWEEN\s*$/i, buf)
+    %{state | buf: buf, between: between}
+  end
+
+  @spec emit(map(), where_token()) :: map()
+  defp emit(state, token), do: %{state | tokens: [token | state.tokens]}
+
+  @spec flush_pred(map()) :: map()
+  defp flush_pred(state) do
+    case String.trim(state.buf) do
+      "" -> %{state | buf: "", between: false}
+      text -> %{state | buf: "", between: false, tokens: [{:pred, text} | state.tokens]}
+    end
+  end
+
+  @spec where_or([where_token()]) :: {:ok, [where_node()], [where_token()]} | {:error, map()}
+  defp where_or(tokens) do
+    with {:ok, first, rest} <- where_and(tokens) do
+      where_collect_or(rest, [first])
+    end
+  end
+
+  defp where_collect_or([:or | rest], branches) do
+    with {:ok, branch, rest} <- where_and(rest), do: where_collect_or(rest, [branch | branches])
+  end
+
+  defp where_collect_or(rest, [single]), do: {:ok, single, rest}
+  defp where_collect_or(rest, branches), do: {:ok, [{:or, Enum.reverse(branches)}], rest}
+
+  @spec where_and([where_token()]) :: {:ok, [where_node()], [where_token()]} | {:error, map()}
+  defp where_and(tokens) do
+    with {:ok, first, rest} <- where_factor(tokens) do
+      where_collect_and(rest, first)
+    end
+  end
+
+  defp where_collect_and([:and | rest], conj) do
+    with {:ok, next, rest} <- where_factor(rest), do: where_collect_and(rest, conj ++ next)
+  end
+
+  defp where_collect_and(rest, conj), do: {:ok, conj, rest}
+
+  @spec where_factor([where_token()]) :: {:ok, [where_node()], [where_token()]} | {:error, map()}
+  defp where_factor([:not | rest]) do
+    with {:ok, conj, rest} <- where_factor(rest), do: {:ok, [{:not, conj}], rest}
+  end
+
+  defp where_factor([:lparen | rest]) do
+    case where_or(rest) do
+      {:ok, conj, [:rparen | rest]} -> {:ok, conj, rest}
+      {:ok, _conj, _rest} -> {:error, local_error("unbalanced parenthesis in WHERE")}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp where_factor([{:pred, text} | rest]) do
+    with {:ok, clause} <- parse_single_where_clause(text), do: {:ok, [clause], rest}
+  end
+
+  defp where_factor(_tokens), do: {:error, local_error("unsupported WHERE clause")}
+
+  # ---------------------------------------------------------------------------
+  # Predicates
+  # ---------------------------------------------------------------------------
 
   # IN / NOT IN must be matched before binary operators because they don't
   # contain any of {=, <, >, !} characters that the binary-op scanner looks
@@ -997,6 +1179,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @in_pattern ~r/^(\w+)\s+IN\s*\((.*)\)\s*$/is
   @is_not_null_pattern ~r/^(\w+)\s+IS\s+NOT\s+NULL$/i
   @is_null_pattern ~r/^(\w+)\s+IS\s+NULL$/i
+  @between_pattern ~r/^(\w+)\s+(NOT\s+)?BETWEEN\s+(.+?)\s+AND\s+(.+)$/is
+  @like_pattern ~r/^(\w+)\s+(NOT\s+)?(I?LIKE)\s+'(.*)'$/is
 
   @spec parse_single_where_clause(binary()) ::
           {:ok, where_clause()} | {:error, map()}
@@ -1020,16 +1204,66 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         [_full, key, list_str] = match
         with {:ok, values} <- parse_in_values(key, list_str), do: {:ok, {:in, key, values}}
 
+      match = Regex.run(@between_pattern, trimmed) ->
+        [_full, key, negated, low, high] = match
+        parse_between(key, negated != "", String.trim(low), String.trim(high))
+
+      match = Regex.run(@like_pattern, trimmed) ->
+        [_full, key, negated, kind, pattern] = match
+        {:ok, {like_op(negated != ""), key, like_regex(pattern, String.upcase(kind) == "ILIKE")}}
+
       true ->
         parse_binary_where_clause(trimmed)
     end
+  end
+
+  @spec parse_between(binary(), boolean(), binary(), binary()) ::
+          {:ok, where_clause()} | {:error, map()}
+  defp parse_between(key, negated, low, high) do
+    op = if negated, do: :not_between, else: :between
+
+    if key == "time" do
+      with {:ok, lo} <- parse_time_comparand(low),
+           {:ok, hi} <- parse_time_comparand(high),
+           do: {:ok, {op, "time", {lo, hi}}}
+    else
+      {:ok, {op, key, {parse_where_value(low), parse_where_value(high)}}}
+    end
+  end
+
+  @spec like_op(boolean()) :: :like | :not_like
+  defp like_op(true), do: :not_like
+  defp like_op(false), do: :like
+
+  # SQL LIKE: `%` is any run, `_` any single character; everything else is
+  # literal. LIKE is case-sensitive on the engine, ILIKE is not.
+  @spec like_regex(binary(), boolean()) :: Regex.t()
+  defp like_regex(pattern, case_insensitive) do
+    source =
+      pattern
+      |> String.graphemes()
+      |> Enum.map_join(fn
+        "%" -> ".*"
+        "_" -> "."
+        char -> Regex.escape(char)
+      end)
+
+    Regex.compile!("\\A" <> source <> "\\z", if(case_insensitive, do: "is", else: "s"))
   end
 
   @spec parse_binary_where_clause(binary()) ::
           {:ok, where_clause()} | {:error, map()}
   defp parse_binary_where_clause(trimmed) do
     # Multi-char operators must be tried before their single-char prefixes.
-    operators = [{">=", :gte}, {"<=", :lte}, {"!=", :ne}, {">", :gt}, {"<", :lt}, {"=", :eq}]
+    operators = [
+      {">=", :gte},
+      {"<=", :lte},
+      {"!=", :ne},
+      {"<>", :ne},
+      {">", :gt},
+      {"<", :lt},
+      {"=", :eq}
+    ]
 
     split =
       Enum.find_value(operators, fn {op_str, op_atom} ->
@@ -1219,7 +1453,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     case Regex.run(~r/(?i)LIMIT\s+(\d+)/s, rest) do
       [_full_match, n_str] ->
         case Integer.parse(n_str) do
-          {n, ""} when n > 0 -> n
+          {n, ""} when n >= 0 -> n
           _bad_n -> nil
         end
 

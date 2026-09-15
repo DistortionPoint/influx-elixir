@@ -82,14 +82,23 @@ defmodule InfluxElixir.Client.Local do
     * Table qualifiers and aliases: `FROM q AS w` / `FROM q w`, and
       `w.time`, `q.bid` in any clause — one table per query, so the prefix
       is dropped.
-    * `WHERE tag = 'value'` or `WHERE field > N` (supports AND). A quoted
-      literal is always a **string**, exactly as in InfluxDB v3: `'08338636'`
-      keeps its leading zero and matches a string tag, and comparing it
-      against a numeric field compares the field's text rendering (so
-      `amount >= '1000.00'` is a lexical comparison — DataFusion casts the
-      numeric side to Utf8). Bare literals (`42`, `1.5`, `true`) are typed.
+    * `WHERE` with `=`, `!=` / `<>`, `<`, `<=`, `>`, `>=`, combined with
+      `AND`, `OR`, `NOT` and parentheses (`AND` binds tighter than `OR`, as
+      in SQL). A quoted literal is always a **string**, exactly as in
+      InfluxDB v3: `'08338636'` keeps its leading zero and matches a string
+      tag, and comparing it against a numeric field compares the field's
+      text rendering (so `amount >= '1000.00'` is a lexical comparison —
+      DataFusion casts the numeric side to Utf8). The other way round, a
+      string column against a bare number compares the number's text
+      rendering, also lexically (`rack = 2` matches the tag `"2"`; `rack > 3`
+      does not match `"10"`). Bare literals (`42`, `1.5`, `true`) are typed
+      and compare numerically against numeric fields.
     * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)`
     * `WHERE col IS NULL` and `WHERE col IS NOT NULL`
+    * `WHERE col [NOT] BETWEEN low AND high` (inclusive; `time` too)
+    * `WHERE col [NOT] LIKE 'pattern'` and `ILIKE` (`%` any run, `_` one
+      character; `LIKE` is case-sensitive, `ILIKE` is not). `LIKE` over a
+      numeric column is the engine's planning error, reproduced.
     * `WHERE time <op> <comparand>` — exactly what InfluxDB 3 accepts against
       a Timestamp: a quoted ISO-8601 datetime (`'2026-03-31T12:00:00Z'`,
       zone-less or fractional forms too), a quoted date (`'2026-03-31'`,
@@ -101,7 +110,8 @@ defmodule InfluxElixir.Client.Local do
     * `SELECT DISTINCT col[, col ...] FROM measurement` (sorted combinations;
       `ORDER BY` must name a selected column, as in DataFusion)
     * `ORDER BY <column> [ASC|DESC]` — `time` or any output column/alias
-    * `LIMIT N`
+    * `LIMIT N` — `LIMIT 0` returns no rows; a negative or non-numeric
+      limit is rejected, as the engine rejects it
     * `$param` placeholders via `params: %{"$name" => value}` in opts. A
       `DateTime`, `NaiveDateTime` or `Date` param renders as the ISO-8601
       string Jason sends over HTTP, so `time >= $start` works the same on
@@ -1011,29 +1021,27 @@ defmodule InfluxElixir.Client.Local do
           binary() => [point_map()]
         }) :: [map()] | {:error, term()}
   defp execute_select(table, %{measurement: m} = query, database, cte_sources) do
-    case source_points(table, database, m, cte_sources) do
-      {:ok, points} ->
-        filtered = apply_where(points, query.where)
+    with {:ok, points} <- source_points(table, database, m, cte_sources),
+         {:ok, filtered} <- apply_where(points, query.where) do
+      cond do
+        query.distinct_columns ->
+          execute_distinct_query(filtered, query)
 
-        cond do
-          query.distinct_columns ->
-            execute_distinct_query(filtered, query)
+        query.select_columns ->
+          execute_aggregate_query(filtered, query)
 
-          query.select_columns ->
-            execute_aggregate_query(filtered, query)
+        query.projection_columns ->
+          execute_projection_query(filtered, query)
 
-          query.projection_columns ->
-            execute_projection_query(filtered, query)
-
-          true ->
-            filtered
-            |> apply_order_by(query.order_by)
-            |> apply_limit(query.limit)
-            |> Enum.map(&point_to_row/1)
-        end
-
-      :error ->
-        {:error, table_not_found(m)}
+        true ->
+          filtered
+          |> apply_order_by(query.order_by)
+          |> apply_limit(query.limit)
+          |> Enum.map(&point_to_row/1)
+      end
+    else
+      :error -> {:error, table_not_found(m)}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -1422,16 +1430,60 @@ defmodule InfluxElixir.Client.Local do
   defp sorter(:asc), do: &value_order/2
   defp sorter(:desc), do: fn a, b -> value_order(b, a) end
 
-  @spec apply_where([point_map()], [SQLParser.where_clause()]) :: [point_map()]
-  defp apply_where(points, []), do: points
+  # A predicate the engine refuses at planning time (LIKE over a number) is
+  # only discoverable here, per value, so it is thrown out of the filter and
+  # turned into the same 400 the engine returns.
+  @spec apply_where([point_map()], [SQLParser.where_node()]) ::
+          {:ok, [point_map()]} | {:error, %{status: 400, body: binary()}}
+  defp apply_where(points, []), do: {:ok, points}
 
-  defp apply_where(points, conditions) do
-    Enum.filter(points, fn point ->
-      Enum.all?(conditions, &matches_condition?(point, &1))
-    end)
+  defp apply_where(points, conjunction) do
+    {:ok, Enum.filter(points, &matches_all?(&1, conjunction))}
+  catch
+    {:where_error, message} -> {:error, %{status: 400, body: message}}
   end
 
+  @spec matches_all?(point_map(), [SQLParser.where_node()]) :: boolean()
+  defp matches_all?(point, conjunction), do: Enum.all?(conjunction, &node_matches?(point, &1))
+
+  @spec node_matches?(point_map(), SQLParser.where_node()) :: boolean()
+  defp node_matches?(point, {:or, branches}), do: Enum.any?(branches, &matches_all?(point, &1))
+  defp node_matches?(point, {:not, conjunction}), do: not matches_all?(point, conjunction)
+  defp node_matches?(point, clause), do: matches_condition?(point, clause)
+
   @spec matches_condition?(point_map(), SQLParser.where_clause()) :: boolean()
+  defp matches_condition?(point, {:between, "time", {low, high}}) do
+    ts = point.timestamp
+    not is_nil(ts) and ts >= to_nanoseconds(low) and ts <= to_nanoseconds(high)
+  end
+
+  defp matches_condition?(point, {:not_between, "time", range}),
+    do: not matches_condition?(point, {:between, "time", range})
+
+  defp matches_condition?(point, {:between, key, {low, high}}) do
+    actual = point_value(point, key)
+    compare(actual, :gte, low) and compare(actual, :lte, high)
+  end
+
+  defp matches_condition?(point, {:not_between, key, range}),
+    do: not matches_condition?(point, {:between, key, range})
+
+  defp matches_condition?(point, {:like, key, regex}) do
+    case point_value(point, key) do
+      nil -> false
+      text when is_binary(text) -> Regex.match?(regex, text)
+      _number -> throw({:where_error, like_type_error(key)})
+    end
+  end
+
+  defp matches_condition?(point, {:not_like, key, regex}) do
+    case point_value(point, key) do
+      nil -> false
+      text when is_binary(text) -> not Regex.match?(regex, text)
+      _number -> throw({:where_error, like_type_error(key)})
+    end
+  end
+
   defp matches_condition?(point, {:in, "time", values}) do
     point_in_time_set?(point, values)
   end
@@ -1477,6 +1529,14 @@ defmodule InfluxElixir.Client.Local do
   defp to_nanoseconds(value) when is_integer(value), do: value
   defp to_nanoseconds({:now, offset_ns}), do: System.os_time(:nanosecond) + offset_ns
 
+  # DataFusion: "There isn't a common type to coerce Float64 and Utf8 in
+  # LIKE expression".
+  @spec like_type_error(binary()) :: binary()
+  defp like_type_error(key) do
+    "Error during planning: There isn't a common type to coerce a numeric column and " <>
+      "Utf8 in LIKE expression: #{key}"
+  end
+
   # Both nil-actual (missing column) and nil-value (unparseable comparand)
   # short-circuit to false. Without this guard, Elixir term ordering would
   # silently produce wrong results (e.g. `5 > nil` is `true`).
@@ -1486,12 +1546,20 @@ defmodule InfluxElixir.Client.Local do
   # Utf8): `amount >= '1000.00'` is lexical, so 500.0 matches. The double
   # reproduces that so a test written against it fails the same way
   # production would.
+  #
+  # The other way round — a string column against a numeric literal — the
+  # engine keeps the column as text and renders the literal (`rack = 2`
+  # matches the tag "2"; `rack > 3` is lexical, so "10" does not match), so
+  # the literal is rendered here too.
   @spec compare(term(), atom(), term()) :: boolean()
   defp compare(nil, _op, _value), do: false
   defp compare(_actual, _op, nil), do: false
 
   defp compare(actual, op, value) when is_binary(value) and not is_binary(actual),
     do: compare(to_string(actual), op, value)
+
+  defp compare(actual, op, value) when is_binary(actual) and is_number(value),
+    do: compare(actual, op, to_string(value))
 
   defp compare(actual, :eq, value), do: actual == value
   defp compare(actual, :ne, value), do: actual != value
