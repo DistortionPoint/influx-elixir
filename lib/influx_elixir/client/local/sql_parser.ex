@@ -25,7 +25,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @typedoc "Plain aggregates; `:stddev`/`:var` are the sample forms, as in InfluxDB."
   @type aggregate ::
-          :avg | :sum | :count | :min | :max | :stddev | :stddev_pop | :var | :var_pop
+          :avg | :sum | :count | :min | :max | :median | :stddev | :stddev_pop | :var | :var_pop
 
   @type select_column ::
           {:time_bucket, binary()}
@@ -89,12 +89,19 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           select_columns: [select_column()] | nil,
           distinct_columns: [binary()] | nil,
           projection_columns: [projection()] | nil,
-          ctes: [{binary(), parsed_query()}]
+          ctes: [{binary(), parsed_query()}],
+          cross_join: {binary(), [binary()]} | nil
         }
+
+  @typedoc """
+  A `WHERE` operand: a column name, or an arithmetic expression over columns
+  and literals (`price <= med * 3`).
+  """
+  @type operand :: binary() | {:expr, expr()}
 
   # Aggregate function names recognised by the parser (all verified against
   # InfluxDB 3 Core; VARIANCE is *not* one of them).
-  @aggregate_functions ~w(AVG SUM COUNT MIN MAX STDDEV STDDEV_SAMP STDDEV_POP VAR_SAMP VAR_POP VAR FIRST_VALUE LAST_VALUE SELECTOR_FIRST SELECTOR_LAST SELECTOR_MIN SELECTOR_MAX)
+  @aggregate_functions ~w(AVG SUM COUNT MIN MAX MEDIAN STDDEV STDDEV_SAMP STDDEV_POP VAR_SAMP VAR_POP VAR FIRST_VALUE LAST_VALUE SELECTOR_FIRST SELECTOR_LAST SELECTOR_MIN SELECTOR_MAX)
 
   @aggregate_atoms %{
     "avg" => :avg,
@@ -107,7 +114,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     "stddev_pop" => :stddev_pop,
     "var" => :var,
     "var_samp" => :var,
-    "var_pop" => :var_pop
+    "var_pop" => :var_pop,
+    "median" => :median
   }
 
   # selector_first|last|min|max(field, time)['value'|'time'] AS alias
@@ -203,15 +211,46 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @spec parse_single_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
   defp parse_single_select(sql) do
-    normalised = sql |> String.trim() |> strip_table_qualifiers()
+    {sql, cross_join} = sql |> String.trim() |> split_cross_join()
+    normalised = strip_table_qualifiers(sql, cross_join)
 
-    with :ok <- check_clauses(normalised) do
-      cond do
-        distinct_query?(normalised) -> parse_distinct_select(normalised)
-        aggregate_query?(normalised) -> parse_aggregate_select(normalised)
-        star_query?(normalised) -> parse_star_select(normalised)
-        true -> parse_columns_select(normalised)
-      end
+    with :ok <- check_clauses(normalised),
+         {:ok, query} <- dispatch_select(normalised) do
+      {:ok, %{query | cross_join: cross_join}}
+    end
+  end
+
+  @spec dispatch_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
+  defp dispatch_select(sql) do
+    cond do
+      distinct_query?(sql) -> parse_distinct_select(sql)
+      aggregate_query?(sql) -> parse_aggregate_select(sql)
+      star_query?(sql) -> parse_star_select(sql)
+      true -> parse_columns_select(sql)
+    end
+  end
+
+  # `FROM w CROSS JOIN ref [AS r]`: the right side is taken out of the text
+  # (the rest of the parser sees one table) and recorded with its alias so
+  # its qualifiers can be dropped like the left side's.
+  # Keywords that can follow a table name are clauses (or constructs), never an alias.
+  @not_an_alias ~w(WHERE GROUP ORDER LIMIT JOIN CROSS INNER LEFT RIGHT FULL OUTER NATURAL UNION EXCEPT INTERSECT HAVING OFFSET ON USING)
+
+  @cross_join_pattern ~r/(?i)(\bFROM\s+(?:"[^"]+"|(?:[^\s\\]|\\.)+)(?:\s+(?:AS\s+)?(?!CROSS\b)\w+)?)\s+CROSS\s+JOIN\s+("[^"]+"|(?:[^\s\\]|\\.)+)(?:\s+(?:AS\s+)?(?!(?:#{Enum.join(@not_an_alias, "|")})\b)(\w+))?/
+
+  @spec split_cross_join(binary()) :: {binary(), {binary(), [binary()]} | nil}
+  defp split_cross_join(sql) do
+    case Regex.run(@cross_join_pattern, sql) do
+      [full, left, table] ->
+        name = String.trim(table, "\"")
+        {String.replace(sql, full, left), {name, [name]}}
+
+      [full, left, table, alias_name] ->
+        name = String.trim(table, "\"")
+        {String.replace(sql, full, left), {name, [name, alias_name]}}
+
+      nil ->
+        {sql, nil}
     end
   end
 
@@ -298,11 +337,16 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # alias from FROM and the `qualifier.` prefixes outside string literals.
   # A keyword after the table is a clause (or an unsupported construct that
   # `check_clauses/1` will name), never an alias.
-  @not_an_alias ~w(WHERE GROUP ORDER LIMIT JOIN CROSS INNER LEFT RIGHT FULL OUTER NATURAL UNION EXCEPT INTERSECT HAVING OFFSET ON USING)
   @from_alias_pattern ~r/(?i)(FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+))(?:\s+(?:AS\s+)?(?!(?:#{Enum.join(@not_an_alias, "|")})\b)(\w+))?/
 
-  @spec strip_table_qualifiers(binary()) :: binary()
-  defp strip_table_qualifiers(sql) do
+  @spec strip_table_qualifiers(binary(), {binary(), [binary()]} | nil) :: binary()
+  defp strip_table_qualifiers(sql, cross_join) do
+    joined_names =
+      case cross_join do
+        {_table, names} -> names
+        nil -> []
+      end
+
     case Regex.run(@from_alias_pattern, sql) do
       [_full, from_clause, table, alias_name] ->
         alias_pattern =
@@ -310,10 +354,10 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
         sql
         |> String.replace(alias_pattern, "\\1")
-        |> drop_qualifiers([String.trim(table, "\""), alias_name])
+        |> drop_qualifiers([String.trim(table, "\""), alias_name | joined_names])
 
       [_full, _from_clause, table] ->
-        drop_qualifiers(sql, [String.trim(table, "\"")])
+        drop_qualifiers(sql, [String.trim(table, "\"") | joined_names])
 
       nil ->
         sql
@@ -384,7 +428,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         select_columns: nil,
         distinct_columns: nil,
         projection_columns: nil,
-        ctes: []
+        ctes: [],
+        cross_join: nil
       },
       Map.new(overrides)
     )
@@ -523,7 +568,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
       String.match?(
         col,
-        ~r/(?i)\b(AVG|SUM|COUNT|MIN|MAX|STDDEV|STDDEV_SAMP|STDDEV_POP|VAR|VAR_SAMP|VAR_POP)\s*\(/
+        ~r/(?i)\b(AVG|SUM|COUNT|MIN|MAX|MEDIAN|STDDEV|STDDEV_SAMP|STDDEV_POP|VAR|VAR_SAMP|VAR_POP)\s*\(/
       ) ->
         parse_agg_column(col)
 
@@ -649,7 +694,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           {:ok, select_column()} | {:error, term()}
   defp parse_agg_column_arg(col) do
     one_arg =
-      ~r/(?i)^\s*(AVG|SUM|COUNT|MIN|MAX|STDDEV_SAMP|STDDEV_POP|STDDEV|VAR_SAMP|VAR_POP|VAR)\s*\((.+)\)\s+AS\s+(\w+)\s*$/s
+      ~r/(?i)^\s*(AVG|SUM|COUNT|MIN|MAX|MEDIAN|STDDEV_SAMP|STDDEV_POP|STDDEV|VAR_SAMP|VAR_POP|VAR)\s*\((.+)\)\s+AS\s+(\w+)\s*$/s
 
     with [_full, func, expr_str, alias_name] <- Regex.run(one_arg, col),
          {:ok, expr} <- parse_expr(expr_str),
@@ -1281,7 +1326,49 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         with {:ok, value} <- parse_time_comparand(right), do: {:ok, {op, "time", value}}
 
       {op, key, right} ->
-        {:ok, {op, key, parse_where_value(right)}}
+        with {:ok, left} <- parse_operand(key),
+             {:ok, value} <- parse_comparand(right),
+             do: {:ok, {op, left, value}}
+    end
+  end
+
+  # The left side is a column, or an arithmetic expression over columns
+  # (`2 * price > volume`).
+  @spec parse_operand(binary()) :: {:ok, operand()} | {:error, map()}
+  defp parse_operand(text) do
+    cond do
+      Regex.match?(~r/^\w+$/, text) ->
+        {:ok, text}
+
+      match?({:ok, _expr}, parse_expr(text)) ->
+        {:ok, expr} = parse_expr(text)
+        {:ok, {:expr, expr}}
+
+      true ->
+        {:error, local_error("unsupported WHERE clause: #{text}")}
+    end
+  end
+
+  # The right side is a literal, or an expression over columns and literals.
+  # A bare word is a column reference, as in SQL — never a string.
+  @spec parse_comparand(binary()) :: {:ok, term()} | {:error, map()}
+  defp parse_comparand(text) do
+    cond do
+      quoted?(text) or text in ["true", "false"] ->
+        {:ok, parse_where_value(text)}
+
+      String.upcase(text) == "NULL" ->
+        {:ok, nil}
+
+      is_number(coerce_value(text)) ->
+        {:ok, coerce_value(text)}
+
+      match?({:ok, _expr}, parse_expr(text)) ->
+        {:ok, expr} = parse_expr(text)
+        {:ok, {:expr, expr}}
+
+      true ->
+        {:error, local_error("unsupported WHERE clause: #{text}")}
     end
   end
 
@@ -1462,6 +1549,19 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
+  @doc """
+  The first `$name` placeholder left in `sql` after substitution, or `nil`.
+  String literals are ignored: a substituted value that happens to contain
+  `$` is text.
+  """
+  @spec unbound_placeholder(binary()) :: binary() | nil
+  def unbound_placeholder(sql) do
+    case Regex.run(~r/\$\w+/, blank_literals(sql)) do
+      [name] -> name
+      nil -> nil
+    end
+  end
+
   @doc "Substitutes `$name` placeholders with SQL literals built from `params`."
   @spec resolve_params(binary(), map()) :: binary()
   def resolve_params(sql, params) when map_size(params) == 0, do: sql
@@ -1497,6 +1597,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp to_sql_literal(value) when is_float(value), do: Float.to_string(value)
   defp to_sql_literal(true), do: "true"
   defp to_sql_literal(false), do: "false"
+  # Jason sends nil as JSON null; `col = NULL` is never true on the engine.
+  defp to_sql_literal(nil), do: "NULL"
   defp to_sql_literal(value), do: inspect(value)
 
   # Every parser rejection carries this prefix so a consumer reading

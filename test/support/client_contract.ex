@@ -60,6 +60,7 @@ defmodule InfluxElixir.ClientContract do
     time_filter_tests = if v3_sql, do: time_filter_tests(client), else: nil
     cte_tests = if v3_sql, do: cte_tests(client), else: nil
     where_tests = if v3_sql, do: where_tests(client), else: nil
+    median_join_tests = if v3_sql, do: median_join_tests(client), else: nil
     ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
     distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
     param_tests = if v3_sql, do: param_tests(client), else: nil
@@ -96,6 +97,7 @@ defmodule InfluxElixir.ClientContract do
         time_filter_tests,
         cte_tests,
         where_tests,
+        median_join_tests,
         ordered_agg_tests,
         distinct_tests,
         param_tests,
@@ -1455,6 +1457,139 @@ defmodule InfluxElixir.ClientContract do
 
           assert {:error, %{status: 400}} =
                    unquote(client).query_sql(ctx.conn, "SELECT host FROM contract_wh LIMIT -1",
+                     database: ctx.database
+                   )
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # median(), CROSS JOIN, expression comparands (#19)
+  # ---------------------------------------------------------------------------
+
+  defp median_join_tests(client) do
+    quote do
+      describe "query_sql/3 — median and CROSS JOIN contract" do
+        setup ctx do
+          lp =
+            Enum.join(
+              [
+                "contract_mj,symbol=X price=1.0,volume=10.0 1700000000000000000",
+                "contract_mj,symbol=X price=2.5,volume=20.0 1700000010000000000",
+                "contract_mj,symbol=X price=3.0,volume=30.0 1700000070000000000",
+                "contract_mj,symbol=X price=4.0,volume=40.0 1700000080000000000",
+                "contract_mj,symbol=X price=100.0,volume=1.0 1700000090000000000",
+                "contract_mj_int n=1i 1700000000000000000",
+                "contract_mj_int n=2i 1700000001000000000",
+                "contract_mj_int n=3i 1700000002000000000",
+                "contract_mj_int n=4i 1700000003000000000"
+              ],
+              "\n"
+            )
+
+          {:ok, :written} = unquote(client).write(ctx.conn, lp, database: ctx.database)
+          InfluxElixir.ClientContract.settle(ctx)
+          :ok
+        end
+
+        test "median over floats, integers, an empty set and an expression", ctx do
+          {:ok, [row]} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT median(price) AS med, median(volume) AS mv, median(price * 2) AS twice FROM contract_mj",
+              database: ctx.database
+            )
+
+          assert row == %{"med" => 3.0, "mv" => 20.0, "twice" => 6.0}
+
+          {:ok, [row]} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT median(n) AS med FROM contract_mj_int",
+              database: ctx.database
+            )
+
+          assert row == %{"med" => 2}
+
+          {:ok, [row]} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT median(price) AS med FROM contract_mj WHERE price > 1000",
+              database: ctx.database
+            )
+
+          refute Map.has_key?(row, "med")
+        end
+
+        test "the median-screened candle query", ctx do
+          sql = """
+          WITH w AS (SELECT price, volume, time FROM contract_mj WHERE symbol = 'X'),
+          ref AS (SELECT median(price) AS med FROM w)
+          SELECT
+            DATE_BIN(INTERVAL '1 minute', w.time) AS time,
+            selector_first(w.price, w.time)['value'] AS open,
+            max(w.price) AS high,
+            min(w.price) AS low,
+            selector_last(w.price, w.time)['value'] AS close,
+            sum(w.volume) AS volume
+          FROM w CROSS JOIN ref
+          WHERE ref.med <= 0 OR (w.price <= ref.med * 3 AND w.price >= ref.med / 3)
+          GROUP BY DATE_BIN(INTERVAL '1 minute', w.time)
+          ORDER BY time ASC
+          """
+
+          {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+
+          assert Enum.map(rows, &Map.drop(&1, ["time"])) == [
+                   %{
+                     "open" => 1.0,
+                     "high" => 2.5,
+                     "low" => 1.0,
+                     "close" => 2.5,
+                     "volume" => 30.0
+                   },
+                   %{"open" => 3.0, "high" => 4.0, "low" => 3.0, "close" => 4.0, "volume" => 70.0}
+                 ]
+        end
+
+        test "CROSS JOIN cartesian product, ambiguity and expression comparands", ctx do
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "WITH r AS (SELECT n FROM contract_mj_int WHERE n <= 2) SELECT p.price, r.n FROM contract_mj p CROSS JOIN r WHERE p.price >= 4 ORDER BY p.price, r.n",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, &{&1["price"], &1["n"]}) == [
+                   {4.0, 1},
+                   {4.0, 2},
+                   {100.0, 1},
+                   {100.0, 2}
+                 ]
+
+          assert {:error, %{status: 500}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "WITH ref AS (SELECT median(price) AS price FROM contract_mj) SELECT price FROM contract_mj CROSS JOIN ref",
+                     database: ctx.database
+                   )
+
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT price FROM contract_mj WHERE price <= volume * 0.2 ORDER BY price",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, & &1["price"]) == [1.0, 2.5, 3.0, 4.0]
+
+          assert {:error, %{status: 500}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT price FROM contract_mj WHERE symbol = prod",
                      database: ctx.database
                    )
         end

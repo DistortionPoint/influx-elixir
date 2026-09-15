@@ -627,10 +627,17 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["host"] == "web02"
     end
 
-    test "an unbound placeholder is left untouched", %{conn: conn, db: db} do
+    test "an unbound placeholder is the engine's planning error", %{conn: conn, db: db} do
+      # InfluxDB 3: "No value found for placeholder with name $host". Matching
+      # nothing would hide a missing binding.
       sql = "SELECT * FROM cpu WHERE host = $host AND usage > $min"
       params = %{min: 15}
-      assert {:ok, []} = Local.query_sql(conn, sql, params: params, database: db)
+
+      assert {:error,
+              %{
+                status: 400,
+                body: "Error during planning: No value found for placeholder with name $host"
+              }} = Local.query_sql(conn, sql, params: params, database: db)
     end
 
     test "a substituted value is never re-substituted", %{conn: conn, db: db} do
@@ -2815,9 +2822,9 @@ defmodule InfluxElixir.Client.LocalTest do
       assert hd(rows)["id"] == "d2"
     end
 
-    test "nil param falls back to inspect representation", %{conn: conn, db: db} do
-      # nil is not a recognised type — to_sql_literal/1 uses inspect(nil) = "nil"
-      # The WHERE clause will not match any rows since no field equals "nil"
+    test "a nil param renders as NULL, which never matches", %{conn: conn, db: db} do
+      # Jason sends nil as JSON null and `id = NULL` is never true on the
+      # engine; the double renders NULL and matches nothing either.
       assert {:ok, rows} =
                Local.query_sql(
                  conn,
@@ -3576,7 +3583,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "returns the same 400 Client.Local error query_sql/3 would" do
-      sql = ~s|SELECT median(value) AS m FROM "m"|
+      sql = ~s|SELECT approx_median(value) AS m FROM "m"|
 
       assert {:error, %{status: 400, body: "Client.Local: " <> _reason} = err} =
                Local.check_sql(sql)
@@ -3883,7 +3890,7 @@ defmodule InfluxElixir.Client.LocalTest do
     test "joins, set operations and windows are rejected by name, not ignored",
          %{conn: conn, db: db} do
       for {sql, construct} <- [
-            {~s|WITH w AS (SELECT bid FROM "q") SELECT * FROM w CROSS JOIN q|, "JOIN"},
+            {~s|SELECT bid FROM "q" INNER JOIN "q" AS r ON q.time = r.time|, "JOIN"},
             {~s|SELECT bid FROM "q" UNION SELECT ask FROM "q"|, "UNION"},
             {~s|SELECT provider, COUNT(*) AS n FROM "q" GROUP BY provider HAVING n > 1|,
              "HAVING"},
@@ -4105,6 +4112,170 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:error, %{status: 400, body: "Client.Local: unsupported WHERE clause" <> _rest}} =
                Local.query_sql(conn, ~s|SELECT host FROM "m" WHERE host = 'a' AND|, database: db)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Issue #19: median(), CROSS JOIN, expression comparands. Expected values
+  # recorded from InfluxDB 3 Core (docs/design/2026-09-15_local-median-cross-join.md).
+  # ---------------------------------------------------------------------------
+
+  describe "bug regression — median, CROSS JOIN and expression comparands (#19)" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "med_db")
+
+      lines =
+        Enum.join(
+          [
+            "p,symbol=X,provider=a price=1.0,volume=10.0 1700000000000000000",
+            "p,symbol=X,provider=a price=2.5,volume=20.0 1700000010000000000",
+            "p,symbol=X,provider=a price=3.0,volume=30.0 1700000070000000000",
+            "p,symbol=X,provider=a price=4.0,volume=40.0 1700000080000000000",
+            "p,symbol=X,provider=a price=100.0,volume=1.0 1700000090000000000",
+            "q n=1i 1700000000000000000",
+            "q n=2i 1700000001000000000",
+            "q n=3i 1700000002000000000",
+            "q n=4i 1700000003000000000"
+          ],
+          "\n"
+        )
+
+      {:ok, :written} = Local.write(conn, lines, database: "med_db", precision: :nanosecond)
+      {:ok, db: "med_db"}
+    end
+
+    test "median: middle value, mean of the two middles in the column's type, null when empty",
+         %{conn: conn, db: db} do
+      assert {:ok, [%{"med" => 3.0, "mv" => 20.0}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT median(price) AS med, median(volume) AS mv FROM "p"|,
+                 database: db
+               )
+
+      assert {:ok, [%{"med" => 2.5}]} =
+               Local.query_sql(conn, ~s|SELECT median(price) AS med FROM "p" WHERE price < 4|,
+                 database: db
+               )
+
+      # Integers: (2 + 3) / 2 and (1 + 4) / 2 with integer division.
+      assert {:ok, [%{"med" => 2}]} =
+               Local.query_sql(conn, ~s|SELECT median(n) AS med FROM "q"|, database: db)
+
+      assert {:ok, [%{"med" => 2}]} =
+               Local.query_sql(conn, ~s|SELECT median(n) AS med FROM "q" WHERE n IN (1, 4)|,
+                 database: db
+               )
+
+      assert {:ok, [row]} =
+               Local.query_sql(conn, ~s|SELECT median(price) AS med FROM "p" WHERE price > 1000|,
+                 database: db
+               )
+
+      refute Map.has_key?(row, "med")
+
+      assert {:ok, [%{"med" => 6.0}]} =
+               Local.query_sql(conn, ~s|SELECT median(price * 2) AS med FROM "p"|, database: db)
+
+      assert {:ok, [%{"med" => 1.75}, %{"med" => 4.0}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT DATE_BIN(INTERVAL '1 minute', time) AS t, median(price) AS med FROM "p" GROUP BY DATE_BIN(INTERVAL '1 minute', time) ORDER BY t|,
+                 database: db
+               )
+
+      assert {:error, %{status: 400, body: "Client.Local: InfluxDB rejects" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT median(time) AS med FROM "q"|, database: db)
+    end
+
+    test "the median-screened candle query from the issue", %{conn: conn, db: db} do
+      sql = """
+      WITH w AS (
+        SELECT price, volume, time FROM "p"
+        WHERE time >= $start AND time < $end AND symbol = $symbol AND provider = $provider
+      ),
+      ref AS (SELECT median(price) AS med FROM w)
+      SELECT
+        DATE_BIN(INTERVAL '1 minute', w.time) AS time,
+        selector_first(w.price, w.time)['value'] AS open,
+        max(w.price) AS high,
+        min(w.price) AS low,
+        selector_last(w.price, w.time)['value'] AS close,
+        sum(w.volume) AS volume
+      FROM w CROSS JOIN ref
+      WHERE ref.med <= 0
+         OR (w.price <= ref.med * 3 AND w.price >= ref.med / 3)
+      GROUP BY DATE_BIN(INTERVAL '1 minute', w.time)
+      ORDER BY time ASC
+      """
+
+      params = %{
+        start: ~U[2023-11-14 00:00:00Z],
+        end: ~U[2023-11-15 00:00:00Z],
+        symbol: "X",
+        provider: "a"
+      }
+
+      # The 100.0 outlier (median 3.0, bound 9.0) is screened out of the second candle.
+      assert {:ok,
+              [
+                %{"open" => 1.0, "high" => 2.5, "low" => 1.0, "close" => 2.5, "volume" => 30.0},
+                %{"open" => 3.0, "high" => 4.0, "low" => 3.0, "close" => 4.0, "volume" => 70.0}
+              ]} = Local.query_sql(conn, sql, database: db, params: params)
+    end
+
+    test "CROSS JOIN is a cartesian product; a column on both sides is ambiguous",
+         %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 ~s|WITH r AS (SELECT n FROM "q" WHERE n <= 2) SELECT p.price, r.n FROM "p" CROSS JOIN r WHERE p.price >= 4 ORDER BY p.price|,
+                 database: db
+               )
+
+      assert Enum.map(rows, &{&1["price"], &1["n"]}) == [
+               {4.0, 1},
+               {4.0, 2},
+               {100.0, 1},
+               {100.0, 2}
+             ]
+
+      assert {:error, %{status: 500, body: "Schema error: Ambiguous reference" <> _rest}} =
+               Local.query_sql(
+                 conn,
+                 ~s|WITH ref AS (SELECT median(price) AS price FROM "p") SELECT price FROM "p" CROSS JOIN ref|,
+                 database: db
+               )
+
+      # Both sides carry `time`.
+      assert {:error, %{status: 500, body: "Schema error: Ambiguous reference" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT price FROM "p" CROSS JOIN "q"|, database: db)
+
+      assert {:error,
+              %{status: 400, body: "Error during planning: table 'public.iox.nope' not found"}} =
+               Local.query_sql(conn, ~s|SELECT price FROM "p" CROSS JOIN nope|, database: db)
+    end
+
+    test "arithmetic on either side of a WHERE comparison", %{conn: conn, db: db} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT price FROM "p" WHERE price <= volume * 0.2 ORDER BY price|,
+                 database: db
+               )
+
+      assert Enum.map(rows, & &1["price"]) == [1.0, 2.5, 3.0, 4.0]
+
+      assert {:ok, [%{"price" => 100.0}]} =
+               Local.query_sql(conn, ~s|SELECT price FROM "p" WHERE 2 * price > volume|,
+                 database: db
+               )
+    end
+
+    test "a bare word is a column; an unknown one is the engine's schema error",
+         %{conn: conn, db: db} do
+      assert {:error, %{status: 500, body: "Schema error: No field named prod." <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT price FROM "p" WHERE symbol = prod|, database: db)
     end
   end
 end

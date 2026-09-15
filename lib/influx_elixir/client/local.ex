@@ -77,8 +77,14 @@ defmodule InfluxElixir.Client.Local do
       CTEs. Each body is a query in this subset, run in order over the store
       or an earlier CTE; the final `SELECT` may read from any of them
       (`FROM w`). A CTE's output columns are its fields (`time` stays
-      `time`). Joins, set operations, `HAVING`, `OFFSET` and window
-      functions are rejected by name rather than silently ignored.
+      `time`).
+    * `FROM a CROSS JOIN b` — every row of `a` paired with every row of `b`
+      (the usual use is broadcasting a one-row CTE such as a median across
+      the rows it screens). A column present on both sides is refused as
+      ambiguous, because qualifiers are dropped and the two could not be
+      told apart; the engine refuses the unqualified reference too. Other
+      joins, set operations, `HAVING`, `OFFSET` and window functions are
+      rejected by name rather than silently ignored.
     * Table qualifiers and aliases: `FROM q AS w` / `FROM q w`, and
       `w.time`, `q.bid` in any clause — one table per query, so the prefix
       is dropped.
@@ -92,7 +98,12 @@ defmodule InfluxElixir.Client.Local do
       string column against a bare number compares the number's text
       rendering, also lexically (`rack = 2` matches the tag `"2"`; `rack > 3`
       does not match `"10"`). Bare literals (`42`, `1.5`, `true`) are typed
-      and compare numerically against numeric fields.
+      and compare numerically against numeric fields. Either side may be an
+      arithmetic expression over columns (`price <= med * 3`,
+      `2 * price > volume`); a bare word is a column reference, as in SQL,
+      and one that no row has is the engine's schema error ("No field named
+      prod"), which is what a forgotten pair of quotes produces in
+      production. `col = NULL` (a `nil` param) is never true.
     * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)`
     * `WHERE col IS NULL` and `WHERE col IS NOT NULL`
     * `WHERE col [NOT] BETWEEN low AND high` (inclusive; `time` too)
@@ -117,9 +128,12 @@ defmodule InfluxElixir.Client.Local do
       string Jason sends over HTTP, so `time >= $start` works the same on
       both clients; an integer param against `time` is rejected on both.
     * `DATE_BIN(INTERVAL 'N unit', time)` time bucketing
-    * Aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `STDDEV` /
-      `STDDEV_SAMP` (sample), `STDDEV_POP`, `VAR` / `VAR_SAMP` (sample),
-      `VAR_POP`. The argument may be an arithmetic expression over fields
+    * Aggregate functions: `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `MEDIAN`
+      (the middle value; for an even count the mean of the two middle
+      values in the column's type, so two integers average with integer
+      division), `STDDEV` / `STDDEV_SAMP` (sample), `STDDEV_POP`, `VAR` /
+      `VAR_SAMP` (sample), `VAR_POP`. The argument may be an arithmetic
+      expression over fields
       and numeric literals (`SUM(value * value)`, `AVG(bid + ask)`); two
       integer operands divide as integers (`3 / 2 = 1`), as in DataFusion.
       Division by zero is null in the double, where InfluxDB returns IEEE
@@ -438,15 +452,15 @@ defmodule InfluxElixir.Client.Local do
       database = resolve_database(opts, conn)
       resolved_sql = SQLParser.resolve_params(sql, params)
 
-      case SQLParser.parse_select(resolved_sql) do
-        {:ok, query} ->
-          case execute_query(table, query, database) do
-            {:error, _reason} = err -> err
-            rows -> {:ok, rows}
-          end
-
-        {:error, _reason} = err ->
-          err
+      with nil <- SQLParser.unbound_placeholder(resolved_sql),
+           {:ok, query} <- SQLParser.parse_select(resolved_sql) do
+        case execute_query(table, query, database) do
+          {:error, _reason} = err -> err
+          rows -> {:ok, rows}
+        end
+      else
+        {:error, _reason} = err -> err
+        name when is_binary(name) -> {:error, unbound_placeholder_error(name)}
       end
     end
   end
@@ -1022,7 +1036,9 @@ defmodule InfluxElixir.Client.Local do
         }) :: [map()] | {:error, term()}
   defp execute_select(table, %{measurement: m} = query, database, cte_sources) do
     with {:ok, points} <- source_points(table, database, m, cte_sources),
-         {:ok, filtered} <- apply_where(points, query.where) do
+         {:ok, joined} <- cross_join(table, database, points, query.cross_join, cte_sources),
+         :ok <- check_where_columns(joined, query.where),
+         {:ok, filtered} <- apply_where(joined, query.where) do
       cond do
         query.distinct_columns ->
           execute_distinct_query(filtered, query)
@@ -1059,6 +1075,117 @@ defmodule InfluxElixir.Client.Local do
         :error
     end
   end
+
+  # `FROM w CROSS JOIN ref`: every left point paired with every right point,
+  # the right side's columns merged in as fields. Qualifiers were dropped
+  # at parse time, so a column present on both sides cannot be told apart
+  # any more; the engine refuses an unqualified ambiguous reference and the
+  # double refuses the join. A right side that carries `time` is a
+  # collision too. Rows are the left side's measurement and timestamp.
+  @spec cross_join(
+          :ets.table(),
+          binary(),
+          [point_map()],
+          {binary(), [binary()]} | nil,
+          %{binary() => [point_map()]}
+        ) :: {:ok, [point_map()]} | {:error, term()}
+  defp cross_join(_table, _database, points, nil, _cte_sources), do: {:ok, points}
+
+  defp cross_join(table, database, points, {right_name, _aliases}, cte_sources) do
+    with {:ok, right_points} <- fetch_source(table, database, right_name, cte_sources),
+         :ok <- check_join_collisions(points, right_points, right_name) do
+      {:ok,
+       for left <- points, right <- right_points do
+         %{
+           left
+           | tags: Map.merge(left.tags, right.tags),
+             fields: Map.merge(left.fields, right.fields)
+         }
+       end}
+    end
+  end
+
+  @spec fetch_source(:ets.table(), binary(), binary(), %{binary() => [point_map()]}) ::
+          {:ok, [point_map()]} | {:error, term()}
+  defp fetch_source(table, database, name, cte_sources) do
+    case source_points(table, database, name, cte_sources) do
+      {:ok, points} -> {:ok, points}
+      :error -> {:error, table_not_found(name)}
+    end
+  end
+
+  @spec check_join_collisions([point_map()], [point_map()], binary()) :: :ok | {:error, term()}
+  defp check_join_collisions(left, right, right_name) do
+    right_columns = point_columns(right) |> maybe_add_time(right)
+    shared = MapSet.intersection(point_columns(left) |> maybe_add_time(left), right_columns)
+
+    if MapSet.size(shared) == 0 do
+      :ok
+    else
+      {:error,
+       %{
+         status: 500,
+         body:
+           "Schema error: Ambiguous reference to unqualified field " <>
+             "#{Enum.join(Enum.sort(shared), ", ")} (present on both sides of CROSS JOIN #{right_name})"
+       }}
+    end
+  end
+
+  @spec point_columns([point_map()]) :: MapSet.t(binary())
+  defp point_columns(points) do
+    Enum.reduce(points, MapSet.new(), fn point, acc ->
+      acc
+      |> MapSet.union(MapSet.new(Map.keys(point.tags)))
+      |> MapSet.union(MapSet.new(Map.keys(point.fields)))
+    end)
+  end
+
+  @spec maybe_add_time(MapSet.t(binary()), [point_map()]) :: MapSet.t(binary())
+  defp maybe_add_time(columns, points) do
+    if Enum.any?(points, &(not is_nil(&1.timestamp))),
+      do: MapSet.put(columns, "time"),
+      else: columns
+  end
+
+  # A column referenced by an expression in WHERE that no row has is the
+  # engine's schema error ("No field named prod"), not an empty result — the
+  # usual cause is a forgotten pair of quotes around a string literal.
+  @spec check_where_columns([point_map()], [SQLParser.where_node()]) :: :ok | {:error, term()}
+  defp check_where_columns([], _where), do: :ok
+
+  defp check_where_columns(points, where) do
+    known = points |> point_columns() |> MapSet.put("time")
+
+    case where |> where_expr_fields() |> Enum.reject(&MapSet.member?(known, &1)) do
+      [] ->
+        :ok
+
+      [missing | _rest] ->
+        {:error,
+         %{
+           status: 500,
+           body:
+             "Schema error: No field named #{missing}. Valid fields are " <>
+               Enum.join(Enum.sort(known), ", ") <> "."
+         }}
+    end
+  end
+
+  @spec where_expr_fields([SQLParser.where_node()]) :: [binary()]
+  defp where_expr_fields(nodes) do
+    Enum.flat_map(nodes, fn
+      {:or, branches} -> Enum.flat_map(branches, &where_expr_fields/1)
+      {:not, conjunction} -> where_expr_fields(conjunction)
+      {_op, left, right} -> expr_fields(left) ++ expr_fields(right)
+    end)
+  end
+
+  @spec expr_fields(term()) :: [binary()]
+  defp expr_fields({:expr, expr}), do: expr_fields(expr)
+  defp expr_fields({:field, name}), do: [name]
+  defp expr_fields({:op, _op, left, right}), do: expr_fields(left) ++ expr_fields(right)
+  defp expr_fields(_other), do: []
 
   # A CTE's output rows, read back as points: every column but `time` is a
   # field (tag/field is a storage distinction the next query cannot see).
@@ -1326,6 +1453,7 @@ defmodule InfluxElixir.Client.Local do
   # MIN/MAX also run over `time`, so the comparison must be DateTime-aware.
   defp compute_aggregate(:min, vals), do: Enum.min(vals, &value_order/2)
   defp compute_aggregate(:max, vals), do: Enum.max(vals, sorter(:desc))
+  defp compute_aggregate(:median, vals), do: median(vals)
   # Sample forms need at least two values, exactly as the real engine
   # (STDDEV of one row is null); population forms are defined for one.
   defp compute_aggregate(:var, [_one]), do: nil
@@ -1334,6 +1462,24 @@ defmodule InfluxElixir.Client.Local do
   defp compute_aggregate(:stddev, vals), do: :math.sqrt(compute_aggregate(:var, vals))
   defp compute_aggregate(:var_pop, vals), do: sum_of_squares(vals) / length(vals)
   defp compute_aggregate(:stddev_pop, vals), do: :math.sqrt(compute_aggregate(:var_pop, vals))
+
+  # DataFusion's median: the middle value, or for an even count the mean of
+  # the two middle values — computed in the column's type, so two integers
+  # average with integer division (median of 1 and 4 is 2, not 2.5).
+  @spec median([number()]) :: number()
+  defp median(vals) do
+    sorted = Enum.sort(vals)
+    n = length(sorted)
+    mid = div(n, 2)
+
+    if rem(n, 2) == 1 do
+      Enum.at(sorted, mid)
+    else
+      low = Enum.at(sorted, mid - 1)
+      high = Enum.at(sorted, mid)
+      if is_integer(low) and is_integer(high), do: div(low + high, 2), else: (low + high) / 2
+    end
+  end
 
   @spec sum_of_squares([number()]) :: float()
   defp sum_of_squares(vals) do
@@ -1511,10 +1657,19 @@ defmodule InfluxElixir.Client.Local do
     compare(point.timestamp, op, to_nanoseconds(value))
   end
 
-  defp matches_condition?(point, {op, key, value}) do
-    actual = Map.get(point.tags, key) || Map.get(point.fields, key)
-    compare(actual, op, value)
+  defp matches_condition?(point, {op, left, right}) do
+    compare(left_value(point, left), op, right_value(point, right))
   end
+
+  # The left operand is a column name or an arithmetic expression; the right
+  # one is a literal unless the parser tagged it as an expression.
+  @spec left_value(point_map(), SQLParser.operand()) :: term()
+  defp left_value(point, {:expr, expr}), do: eval_expr(expr, point)
+  defp left_value(point, key), do: point_value(point, key)
+
+  @spec right_value(point_map(), term()) :: term()
+  defp right_value(point, {:expr, expr}), do: eval_expr(expr, point)
+  defp right_value(_point, literal), do: literal
 
   @spec point_in_time_set?(point_map(), [term()]) :: boolean()
   defp point_in_time_set?(point, values) do
@@ -1528,6 +1683,16 @@ defmodule InfluxElixir.Client.Local do
   @spec to_nanoseconds(SQLParser.time_value()) :: integer()
   defp to_nanoseconds(value) when is_integer(value), do: value
   defp to_nanoseconds({:now, offset_ns}), do: System.os_time(:nanosecond) + offset_ns
+
+  # The engine's exact wording; a placeholder with no binding is a planning
+  # error there, never an empty result.
+  @spec unbound_placeholder_error(binary()) :: %{status: 400, body: binary()}
+  defp unbound_placeholder_error(name) do
+    %{
+      status: 400,
+      body: "Error during planning: No value found for placeholder with name #{name}"
+    }
+  end
 
   # DataFusion: "There isn't a common type to coerce Float64 and Utf8 in
   # LIKE expression".

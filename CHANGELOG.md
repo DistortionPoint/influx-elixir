@@ -24,6 +24,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **An unbound `$placeholder` matched nothing in `Client.Local`**; the
+  engine fails planning ("No value found for placeholder with name $host").
+  The double now returns that error, so a missing binding cannot pass a
+  test as an empty result.
+- **`Client.Local` refused `median()` and `CROSS JOIN`, which InfluxDB 3
+  runs (#19).** Verified against InfluxDB 3 Core: `median` returns the
+  middle value, or for an even count the mean of the two middle values in
+  the column's type (two integers average with integer division: the median
+  of 1 and 4 is 2), null over no rows, and is rejected over `time`;
+  `FROM w CROSS JOIN ref` pairs every row with every row of `ref`. Both are
+  supported, so the median-screened candle query in the issue now runs on
+  the double with the same rows as the server. A column present on both
+  sides of the join is refused as ambiguous, as the engine refuses the
+  unqualified reference.
+- **`Client.Local` compared a bare word in `WHERE` as a string.**
+  `price <= med * 3` compared `price` with the text `"med * 3"` and
+  `host = prod` with `"prod"` — both silently wrong. Either side of a
+  comparison may now be an arithmetic expression over columns, a bare word
+  is a column reference, and a column no row has is the engine's schema
+  error ("No field named prod"), which is what production returns for a
+  forgotten pair of quotes.
+- A `nil` param rendered as the word `nil` in `Client.Local`; it now renders
+  as `NULL`, which never matches, as the JSON `null` Jason sends over HTTP
+  never matches.
 - **`Client.Local` returned wrong rows for `OR`, `NOT`, parentheses and
   `<>` in `WHERE`, and for `LIMIT 0`.** The clause splitter only knew `AND`:
   `v > 3 OR v < 2` was read as one predicate against the string

@@ -521,11 +521,44 @@ ORDER BY time ASC
 {:ok, candles} = Local.query_sql(conn, sql, database: "test_db", params: %{symbol: "BTC-USD"})
 ```
 
-Joins (`CROSS JOIN`, `INNER JOIN`, ...), set operations, subqueries in
-`WHERE`, `HAVING`, `OFFSET` and window functions are outside the subset and
-are rejected **by name** (`Client.Local: unsupported SQL construct JOIN`)
-rather than ignored, so a query the double cannot run never returns rows
-computed from its first table alone. Cover those in the integration tier.
+`FROM a CROSS JOIN b` pairs every row of `a` with every row of `b`. Its
+everyday use is broadcasting a one-row CTE across the rows it screens — here
+a median-based outlier guard, with `median()` and arithmetic on both sides of
+the comparison:
+
+```elixir
+sql = """
+WITH w AS (
+  SELECT price, volume, time FROM "prices"
+  WHERE time >= $start AND time < $end AND symbol = $symbol
+),
+ref AS (SELECT median(price) AS med FROM w)
+SELECT
+  DATE_BIN(INTERVAL '1 minute', w.time) AS time,
+  selector_first(w.price, w.time)['value'] AS open,
+  max(w.price) AS high,
+  min(w.price) AS low,
+  selector_last(w.price, w.time)['value'] AS close,
+  sum(w.volume) AS volume
+FROM w CROSS JOIN ref
+WHERE ref.med <= 0 OR (w.price <= ref.med * 3 AND w.price >= ref.med / 3)
+GROUP BY DATE_BIN(INTERVAL '1 minute', w.time)
+ORDER BY time ASC
+"""
+```
+
+A column present on both sides of the join is refused as ambiguous
+(qualifiers are dropped, so the two could not be told apart; the engine
+refuses the unqualified reference as well). Other joins (`INNER JOIN`, ...),
+set operations, subqueries in `WHERE`, `HAVING`, `OFFSET` and window
+functions are outside the subset and are rejected **by name**
+(`Client.Local: unsupported SQL construct JOIN`) rather than ignored, so a
+query the double cannot run never returns rows computed from its first
+table alone. Cover those in the integration tier.
+
+A bare word in `WHERE` is a column reference, as in SQL. One that no row has
+is the engine's schema error (`No field named prod`) — the usual cause is a
+forgotten pair of quotes — rather than an empty result.
 
 ## WHERE Clauses
 
