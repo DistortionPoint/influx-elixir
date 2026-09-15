@@ -2044,4 +2044,24 @@ defmodule InfluxElixir.Flight.ReaderTest do
       assert row["v"] == nil
     end
   end
+
+  describe "empty FlatBuffer vectors" do
+    # `0..(count - 1)` with count 0 is the descending range [0, -1] in Elixir,
+    # so an empty vector used to be walked twice at bogus indices. The step
+    # must be explicit.
+    test "a schema with an empty fields vector has no columns and decodes no rows" do
+      schema = schema_fd([])
+      assert {:ok, []} = Reader.parse_schema(schema.data_header)
+
+      batch = batch_fd(<<>>, [], 0)
+      assert {:ok, []} = Reader.decode_flight_data([schema, batch])
+    end
+
+    test "a record batch with an empty buffers vector decodes every column as null" do
+      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
+      batch = batch_fd(<<>>, [], 2)
+
+      assert {:ok, [%{"v" => nil}, %{"v" => nil}]} = Reader.decode_flight_data([schema, batch])
+    end
+  end
 end

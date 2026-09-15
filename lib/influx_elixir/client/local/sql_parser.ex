@@ -1060,9 +1060,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       |> Enum.reject(&(&1 == ""))
 
     if key == "time" do
+      # Membership is order-independent, so the reduced (reversed) list is
+      # returned as is.
       Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
         case parse_time_comparand(item) do
-          {:ok, value} -> {:cont, {:ok, acc ++ [value]}}
+          {:ok, value} -> {:cont, {:ok, [value | acc]}}
           {:error, _reason} = error -> {:halt, error}
         end
       end)

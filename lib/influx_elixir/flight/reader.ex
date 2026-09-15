@@ -199,7 +199,7 @@ defmodule InfluxElixir.Flight.Reader do
         {elem_start, count} = FB.read_vector_header(fb, fields_offset_pos)
 
         columns =
-          for i <- 0..(count - 1) do
+          for i <- 0..(count - 1)//1 do
             field_pos = FB.read_vector_table(fb, elem_start, i)
             parse_field_table(fb, field_pos)
           end
@@ -416,7 +416,7 @@ defmodule InfluxElixir.Flight.Reader do
           {elem_start, count} =
             FB.read_vector_header(fb, buffers_offset_pos)
 
-          for i <- 0..(count - 1) do
+          for i <- 0..(count - 1)//1 do
             pos = elem_start + i * 16
             offset = FB.read_int64(fb, pos)
             len = FB.read_int64(fb, pos + 8)

@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Flight.Reader` walked empty FlatBuffer vectors at bogus indices.**
+  `for i <- 0..(count - 1)` with `count == 0` is the descending range
+  `[0, -1]` in Elixir, so a schema with no fields or a record batch with an
+  empty buffers vector was read twice at invalid positions instead of not
+  at all. The ranges now carry an explicit `//1` step, as the other
+  comprehensions in the module already did.
 - **`Client.Local` refused projected arithmetic and CTEs InfluxDB 3 runs
   (#18).** Verified against InfluxDB 3 Core: `SELECT (bid + ask) / 2 AS mid,
   time FROM q` and `WITH w AS (SELECT bid, time FROM q) SELECT
