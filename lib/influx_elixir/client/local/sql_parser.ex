@@ -13,9 +13,13 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   alias InfluxElixir.Client.Local.LineProtocolParser
 
-  # Measurement names may contain escaped spaces (e.g. "my\ measurement").
-  # This captures everything up to the first unescaped space or end-of-line.
-  @measurement_pattern ~r/(?i)SELECT\s+\*\s+FROM\s+(?:"([^"]+)"|((?:[^\s\\]|\\.)+))(.*)/s
+  # The one place a SELECT is cut into its parts. A measurement name is
+  # quoted, or bare with escaped spaces ("my\ measurement") — everything up
+  # to the first unescaped space. `rest` is whatever follows the table.
+  @select_pattern ~r/(?i)^\s*SELECT\s+(?<distinct>DISTINCT\s+)?(?<columns>.+?)\s+FROM\s+(?:"(?<quoted>[^"]+)"|(?<bare>(?:[^\s\\]|\\.)+))\s*(?<rest>.*)$/s
+
+  @typedoc false
+  @typep split :: %{distinct: boolean(), columns: binary(), table: binary(), rest: binary()}
 
   @typedoc """
   An arithmetic expression inside an aggregate: a field reference, a numeric
@@ -222,18 +226,40 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     normalised = strip_table_qualifiers(sql, cross_join)
 
     with :ok <- check_clauses(normalised),
-         {:ok, query} <- dispatch_select(normalised) do
+         {:ok, split} <- split_select(normalised),
+         {:ok, query} <- dispatch_select(split, normalised) do
       {:ok, %{query | cross_join: cross_join}}
     end
   end
 
-  @spec dispatch_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
-  defp dispatch_select(sql) do
+  @spec split_select(binary()) :: {:ok, split()} | {:error, term()}
+  defp split_select(sql) do
+    case Regex.named_captures(@select_pattern, sql) do
+      %{
+        "distinct" => distinct,
+        "columns" => columns,
+        "quoted" => quoted,
+        "bare" => bare,
+        "rest" => rest
+      } ->
+        table = if quoted != "", do: quoted, else: LineProtocolParser.unescape_measurement(bare)
+
+        {:ok,
+         %{distinct: distinct != "", columns: String.trim(columns), table: table, rest: rest}}
+
+      nil ->
+        unsupported(sql)
+    end
+  end
+
+  @spec dispatch_select(split(), binary()) :: {:ok, parsed_query()} | {:error, term()}
+  defp dispatch_select(%{distinct: true} = split, sql), do: parse_distinct_select(split, sql)
+
+  defp dispatch_select(split, sql) do
     cond do
-      distinct_query?(sql) -> parse_distinct_select(sql)
-      aggregate_query?(sql) -> parse_aggregate_select(sql)
-      star_query?(sql) -> parse_star_select(sql)
-      true -> parse_columns_select(sql)
+      aggregate_query?(sql) -> parse_aggregate_select(split, sql)
+      split.columns == "*" -> build_star_query(split.table, split.rest)
+      true -> build_columns_query(split.columns, split.table, split.rest)
     end
   end
 
@@ -269,7 +295,6 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # one; string literals are blanked first so `note = 'select from join'`
   # is not either.
   @unsupported_construct ~r/(?i)\b(JOIN|UNION|EXCEPT|INTERSECT|HAVING)\b|\b(OFFSET)\s+\d|\b(OVER)\s*\(/
-  @first_from ~r/(?i)\bFROM\s+(?:"[^"]+"|(?:[^\s\\]|\\.)+)\s*(\w*)/s
   @clause_keywords ~w(WHERE GROUP ORDER LIMIT)
 
   @spec check_clauses(binary()) :: :ok | {:error, term()}
@@ -278,17 +303,10 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
     with :ok <- check_constructs(scannable, sql),
          :ok <- check_single_select(scannable, sql),
-         :ok <- check_limit(scannable, sql) do
-      case Regex.run(@first_from, scannable) do
-        [_full, next] when next == "" ->
-          :ok
-
-        [_full, next] ->
-          if String.upcase(next) in @clause_keywords, do: :ok, else: unsupported(sql)
-
-        nil ->
-          unsupported(sql)
-      end
+         :ok <- check_limit(scannable, sql),
+         {:ok, %{rest: rest}} <- split_select(scannable) do
+      [next] = Regex.run(~r/^\w*/, rest)
+      if next == "" or String.upcase(next) in @clause_keywords, do: :ok, else: unsupported(sql)
     end
   end
 
@@ -382,16 +400,6 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end)
   end
 
-  @spec distinct_query?(binary()) :: boolean()
-  defp distinct_query?(sql) do
-    String.match?(sql, ~r/(?i)^\s*SELECT\s+DISTINCT\s+/)
-  end
-
-  @spec star_query?(binary()) :: boolean()
-  defp star_query?(sql) do
-    String.match?(sql, ~r/(?i)^\s*SELECT\s+\*\s+FROM\s/)
-  end
-
   @spec aggregate_query?(binary()) :: boolean()
   # A GROUP BY without an aggregate (`SELECT host FROM p GROUP BY host`) is
   # still a grouped query: one row per group, the grouping columns projected.
@@ -406,13 +414,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       )
   end
 
-  @spec parse_aggregate_select(binary()) ::
+  @spec parse_aggregate_select(split(), binary()) ::
           {:ok, parsed_query()} | {:error, term()}
-  defp parse_aggregate_select(sql) do
-    with {:ok, columns} <- parse_select_columns(sql),
-         {:ok, measurement} <- parse_aggregate_from(sql),
+  defp parse_aggregate_select(%{table: measurement, rest: rest} = split, sql) do
+    with {:ok, columns} <- parse_select_list(split.columns),
          {:ok, interval_ns} <- resolve_aggregate_interval(sql),
-         rest = extract_after_from(sql),
          {:ok, where} <- parse_where(rest),
          :ok <- reject_expr_order(parse_order_by(rest)) do
       {:ok,
@@ -487,48 +493,19 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  # Extract the measurement name from: FROM "name" or FROM name
-  @spec parse_aggregate_from(binary()) :: {:ok, binary()} | {:error, term()}
-  defp parse_aggregate_from(sql) do
-    pattern = ~r/(?i)FROM\s+(?:"([^"]+)"|(\S+?))\s*(?:WHERE|GROUP|ORDER|LIMIT|$)/
+  # The aggregate SELECT list: DATE_BIN(...) AS alias, AGG(expr) AS alias,
+  # selectors, grouping columns.
+  @spec parse_select_list(binary()) :: {:ok, [select_column()]} | {:error, term()}
+  defp parse_select_list(columns_str) do
+    columns =
+      columns_str
+      |> split_top_level_commas()
+      |> Enum.map(&String.trim/1)
+      |> Enum.map(&parse_single_column/1)
 
-    case Regex.run(pattern, sql) do
-      [_full, quoted, ""] -> {:ok, quoted}
-      [_full, "", unquoted] -> {:ok, LineProtocolParser.unescape_measurement(unquoted)}
-      [_full, quoted] when quoted != "" -> {:ok, quoted}
-      _no_match -> {:error, local_error("unsupported SQL: #{sql}")}
-    end
-  end
-
-  # Extract everything after FROM <measurement> for WHERE/ORDER/LIMIT parsing
-  @spec extract_after_from(binary()) :: binary()
-  defp extract_after_from(sql) do
-    case Regex.run(~r/(?i)FROM\s+(?:"[^"]+"|[^\s]+)\s*(.*)/s, sql) do
-      [_full, rest] -> rest
-      _no_match -> ""
-    end
-  end
-
-  # Parse SELECT columns: DATE_BIN(...) AS alias, AGG(field) AS alias
-  @spec parse_select_columns(binary()) ::
-          {:ok, [select_column()]} | {:error, term()}
-  defp parse_select_columns(sql) do
-    case Regex.run(~r/(?i)SELECT\s+(.+?)\s+FROM\s/s, sql) do
-      [_full, columns_str] ->
-        columns =
-          columns_str
-          |> split_top_level_commas()
-          |> Enum.map(&String.trim/1)
-          |> Enum.map(&parse_single_column/1)
-
-        if Enum.any?(columns, &match?({:error, _}, &1)) do
-          Enum.find(columns, &match?({:error, _}, &1))
-        else
-          {:ok, Enum.map(columns, fn {:ok, col} -> col end)}
-        end
-
-      _no_match ->
-        {:error, local_error("unsupported SQL: #{sql}")}
+    case Enum.find(columns, &match?({:error, _}, &1)) do
+      nil -> {:ok, Enum.map(columns, fn {:ok, col} -> col end)}
+      error -> error
     end
   end
 
@@ -935,21 +912,14 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp interval_unit_to_ns(_unknown), do: nil
 
   # SELECT DISTINCT col[, col ...] FROM measurement ...
-  @distinct_pattern ~r/(?i)SELECT\s+DISTINCT\s+(\w+(?:\s*,\s*\w+)*)\s+FROM\s+(?:"([^"]+)"|(\S+))\s*(.*)/s
-
-  @spec parse_distinct_select(binary()) ::
+  # SELECT DISTINCT a[, b ...]: plain column names only.
+  @spec parse_distinct_select(split(), binary()) ::
           {:ok, parsed_query()} | {:error, term()}
-  defp parse_distinct_select(sql) do
-    case Regex.run(@distinct_pattern, sql) do
-      [_full, columns, quoted, "", rest] ->
-        build_distinct_query(split_columns(columns), quoted, rest)
-
-      [_full, columns, "", unquoted, rest] ->
-        measurement = LineProtocolParser.unescape_measurement(unquoted)
-        build_distinct_query(split_columns(columns), measurement, rest)
-
-      _no_match ->
-        {:error, local_error("unsupported DISTINCT query: #{sql}")}
+  defp parse_distinct_select(%{columns: columns, table: table, rest: rest}, sql) do
+    if Regex.match?(~r/^\w+(\s*,\s*\w+)*$/, columns) do
+      build_distinct_query(split_columns(columns), table, rest)
+    else
+      {:error, local_error("unsupported DISTINCT query: #{sql}")}
     end
   end
 
@@ -998,52 +968,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  @spec parse_star_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
-  defp parse_star_select(sql) do
-    case Regex.run(@measurement_pattern, sql) do
-      [_full_match, quoted, "", rest] when quoted != "" ->
-        build_star_query(quoted, rest)
-
-      [_full_match, "", unquoted, rest] ->
-        build_star_query(LineProtocolParser.unescape_measurement(unquoted), rest)
-
-      [_full_match, quoted, rest] when quoted != "" ->
-        build_star_query(quoted, rest)
-
-      _no_match ->
-        {:error, local_error("unsupported SQL: #{sql}")}
-    end
-  end
-
   @spec build_star_query(binary(), binary()) ::
           {:ok, parsed_query()} | {:error, map()}
   defp build_star_query(measurement, rest) do
     with {:ok, where} <- parse_where(rest) do
       {:ok, new_query(measurement, where, rest, [])}
-    end
-  end
-
-  @columns_select_pattern ~r/(?i)SELECT\s+(.+?)\s+FROM\s+(?:"([^"]+)"|((?:[^\s\\]|\\.)+))(.*)/s
-
-  @spec parse_columns_select(binary()) ::
-          {:ok, parsed_query()} | {:error, term()}
-  defp parse_columns_select(sql) do
-    case Regex.run(@columns_select_pattern, sql) do
-      [_full, columns_str, quoted, "", rest] when quoted != "" ->
-        build_columns_query(columns_str, quoted, rest)
-
-      [_full, columns_str, "", unquoted, rest] ->
-        build_columns_query(
-          columns_str,
-          LineProtocolParser.unescape_measurement(unquoted),
-          rest
-        )
-
-      [_full, columns_str, quoted, rest] when quoted != "" ->
-        build_columns_query(columns_str, quoted, rest)
-
-      _no_match ->
-        {:error, local_error("unsupported SQL: #{sql}")}
     end
   end
 

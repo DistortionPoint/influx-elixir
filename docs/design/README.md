@@ -34,6 +34,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-15 | [`local-median-cross-join`](2026-09-15_local-median-cross-join.md) | `median()`, `CROSS JOIN`, arithmetic on either side of a `WHERE` comparison, schema error for unknown columns (#19) |
 | 2026-09-15 | [`local-schema-errors`](2026-09-15_local-schema-errors.md) | Unknown column in any clause is the engine's schema error; `GROUP BY` without an aggregate, ungrouped projections, grouped `ORDER BY` |
 | 2026-09-16 | [`local-cast-order-by`](2026-09-16_local-cast-order-by.md) | `CAST` / `::TYPE` everywhere an expression is allowed, multi-term `ORDER BY`, run-time cast failure shape (#20) |
+| 2026-09-16 | [`parser-single-select-split`](2026-09-16_parser-single-select-split.md) | One `split_select/1` replaces eight table-after-FROM regexes |
 
 ## Verifying against a real engine
 

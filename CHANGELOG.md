@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`Client.Local.SQLParser` cuts a SELECT into its parts in one place.**
+  Eight regexes each found "the table after FROM" for their own dispatcher
+  (star, column list, aggregate, DISTINCT, the clause check, the alias
+  stripper, two helpers); `split_select/1` now does it once and the
+  dispatchers work from its parts. No behaviour change; 71 lines fewer.
 - `BatchWriter` tests no longer inspect GenServer state to check that
   configuration was stored; scheduling and jitter are asserted through the
   observable flush instead.
