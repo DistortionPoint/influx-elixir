@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `Client.Local` checks a query's column references against the first
+  row before scanning every row's columns; the scan now runs only when a
+  name is missing there, which is also when the error message needs the
+  full list. Per-query fixed cost at 10k points drops from about 20 ms to
+  under 5 ms; results are unchanged.
 - **`Client.Local.SQLParser` cuts a SELECT into its parts in one place.**
   Eight regexes each found "the table after FROM" for their own dispatcher
   (star, column list, aggregate, DISTINCT, the clause check, the alias

@@ -1163,10 +1163,13 @@ defmodule InfluxElixir.Client.Local do
   @spec point_columns([point_map()]) :: MapSet.t(binary())
   defp point_columns(points) do
     Enum.reduce(points, MapSet.new(), fn point, acc ->
-      acc
-      |> MapSet.union(MapSet.new(Map.keys(point.tags)))
-      |> MapSet.union(MapSet.new(Map.keys(point.fields)))
+      MapSet.union(acc, point_columns_of(point))
     end)
+  end
+
+  @spec point_columns_of(point_map()) :: MapSet.t(binary())
+  defp point_columns_of(point) do
+    MapSet.new(Map.keys(point.tags) ++ Map.keys(point.fields))
   end
 
   @spec maybe_add_time(MapSet.t(binary()), [point_map()]) :: MapSet.t(binary())
@@ -1184,10 +1187,23 @@ defmodule InfluxElixir.Client.Local do
   @spec check_query_columns([point_map()], SQLParser.parsed_query()) :: :ok | {:error, term()}
   defp check_query_columns([], _query), do: :ok
 
-  defp check_query_columns(points, query) do
+  defp check_query_columns([first | _rest] = points, query) do
+    # Almost every query names only columns the first row has, so that row
+    # answers first; the full scan (every row's columns) runs only when a
+    # name is missing there, which is also when the error message needs it.
+    first_row_columns = first |> point_columns_of() |> MapSet.put("time")
+
+    case Enum.reject(referenced_columns(query), &MapSet.member?(first_row_columns, &1)) do
+      [] -> :ok
+      candidates -> check_against_all_rows(points, candidates)
+    end
+  end
+
+  @spec check_against_all_rows([point_map()], [binary()]) :: :ok | {:error, term()}
+  defp check_against_all_rows(points, candidates) do
     known = points |> point_columns() |> MapSet.put("time")
 
-    case Enum.reject(referenced_columns(query), &MapSet.member?(known, &1)) do
+    case Enum.reject(candidates, &MapSet.member?(known, &1)) do
       [] ->
         :ok
 
