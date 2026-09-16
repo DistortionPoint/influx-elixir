@@ -21,7 +21,14 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   An arithmetic expression inside an aggregate: a field reference, a numeric
   literal, or a binary operation over two expressions.
   """
-  @type expr :: {:field, binary()} | {:lit, number()} | {:op, :+ | :- | :* | :/, expr(), expr()}
+  @type expr ::
+          {:field, binary()}
+          | {:lit, number()}
+          | {:op, :+ | :- | :* | :/, expr(), expr()}
+          | {:cast, expr(), cast_type()}
+
+  @typedoc "`CAST(expr AS INTEGER | DOUBLE | VARCHAR)` targets (and their synonyms)."
+  @type cast_type :: :integer | :float | :string
 
   @typedoc "Plain aggregates; `:stddev`/`:var` are the sample forms, as in InfluxDB."
   @type aggregate ::
@@ -66,8 +73,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   """
   @type time_value :: integer() | {:now, integer()}
 
-  @typedoc "`ORDER BY <column> [ASC|DESC]`; the column may be `time` or any output alias."
-  @type order_by :: {binary(), :asc | :desc} | nil
+  @typedoc "`ORDER BY` terms in order; a target is `time`, a column, an output alias or an expression."
+  @type order_by :: [{binary() | {:expr, expr()}, :asc | :desc}]
 
   @typedoc """
   A projected column: `{source, output}` where `source` is a column name or
@@ -406,7 +413,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          {:ok, measurement} <- parse_aggregate_from(sql),
          {:ok, interval_ns} <- resolve_aggregate_interval(sql),
          rest = extract_after_from(sql),
-         {:ok, where} <- parse_where(rest) do
+         {:ok, where} <- parse_where(rest),
+         :ok <- reject_expr_order(parse_order_by(rest)) do
       {:ok,
        new_query(measurement, where, rest,
          group_by_interval: interval_ns,
@@ -737,6 +745,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp references_time?({:op, _op, left, right}),
     do: references_time?(left) or references_time?(right)
 
+  defp references_time?({:cast, inner, _type}), do: references_time?(inner)
   defp references_time?(_leaf), do: false
 
   # Parse: selector_first|last|min|max(field, time)['value' | 'time'] AS alias.
@@ -769,6 +778,9 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @expr_token ~r/\s*(?:(\d+\.\d+|\d+)|(\w+)|([()+\-*\/]))/
 
+  # `col::INTEGER` is DataFusion's shorthand for `CAST(col AS INTEGER)`.
+  @shorthand_cast ~r/(\w+)::(\w+)/
+
   @doc false
   @spec parse_expr(binary()) :: {:ok, expr()} | {:error, term()}
   def parse_expr(str) do
@@ -785,6 +797,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # (a comma, a quote) makes the expression invalid.
   @spec tokenize_expr(binary()) :: {:ok, [term()]} | {:error, term()}
   defp tokenize_expr(str) do
+    str = Regex.replace(@shorthand_cast, str, "CAST(\\1 AS \\2)")
     matches = Regex.scan(@expr_token, str)
 
     consumed =
@@ -836,6 +849,20 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @spec parse_factor([term()]) :: {:ok, expr(), [term()]} | {:error, term()}
   defp parse_factor([{:lit, _value} = lit | rest]), do: {:ok, lit, rest}
+
+  # CAST(expr AS type): the tokens are `CAST`, `(`, the expression, `AS`,
+  # the type name and `)`.
+  defp parse_factor([{:field, cast}, {:tok, "("} | rest]) when cast in ["CAST", "cast", "Cast"] do
+    with {:ok, inner, [{:field, as_kw}, {:field, type}, {:tok, ")"} | rest]}
+         when as_kw in ["AS", "as", "As"] <- parse_sum(rest),
+         {:ok, target} <- cast_type(type) do
+      {:ok, {:cast, inner, target}, rest}
+    else
+      {:error, _reason} = error -> error
+      _shape -> {:error, :invalid_cast}
+    end
+  end
+
   defp parse_factor([{:field, _name} = field | rest]), do: {:ok, field, rest}
 
   defp parse_factor([{:tok, "("} | rest]) do
@@ -847,6 +874,18 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   defp parse_factor(_tokens), do: {:error, :unexpected_token}
+
+  # The SQL type names DataFusion accepts for the three casts the double
+  # performs; anything else (BOOLEAN, TIMESTAMP, ...) is outside the subset.
+  @spec cast_type(binary()) :: {:ok, cast_type()} | {:error, term()}
+  defp cast_type(type) do
+    case String.upcase(type) do
+      t when t in ~w(INTEGER INT BIGINT SMALLINT TINYINT) -> {:ok, :integer}
+      t when t in ~w(DOUBLE FLOAT REAL) -> {:ok, :float}
+      t when t in ~w(VARCHAR STRING TEXT CHAR) -> {:ok, :string}
+      _other -> {:error, {:unsupported_cast_type, type}}
+    end
+  end
 
   # Parse GROUP BY DATE_BIN(INTERVAL 'N unit', time) → interval in nanoseconds
   @spec parse_group_by_interval(binary()) ::
@@ -921,20 +960,33 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # select list".
   @spec parse_distinct_order_by([binary()], binary()) :: {:ok, order_by()} | {:error, term()}
   defp parse_distinct_order_by(columns, rest) do
-    case parse_order_by(rest) do
-      nil ->
-        {:ok, nil}
+    order_by = parse_order_by(rest)
 
-      {column, _direction} = order_by ->
-        if column in columns do
-          {:ok, order_by}
-        else
-          {:error,
-           local_error(
-             "For SELECT DISTINCT, ORDER BY expressions must appear in select list: #{column}"
-           )}
-        end
+    case Enum.find(order_by, fn {target, _dir} ->
+           not (is_binary(target) and target in columns)
+         end) do
+      nil ->
+        {:ok, order_by}
+
+      {target, _direction} ->
+        {:error,
+         local_error(
+           "For SELECT DISTINCT, ORDER BY expressions must appear in select list: " <>
+             order_target_text(target)
+         )}
     end
+  end
+
+  @spec order_target_text(binary() | {:expr, expr()}) :: binary()
+  defp order_target_text({:expr, _expr}), do: "expression"
+  defp order_target_text(column), do: column
+
+  # Grouped rows have no source point to evaluate an expression against.
+  @spec reject_expr_order(order_by()) :: :ok | {:error, term()}
+  defp reject_expr_order(order_by) do
+    if Enum.any?(order_by, &match?({{:expr, _expr}, _direction}, &1)),
+      do: {:error, local_error("ORDER BY an expression is not supported in an aggregate query")},
+      else: :ok
   end
 
   @spec build_distinct_query([binary()], binary(), binary()) ::
@@ -1227,8 +1279,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @in_pattern ~r/^(\w+)\s+IN\s*\((.*)\)\s*$/is
   @is_not_null_pattern ~r/^(\w+)\s+IS\s+NOT\s+NULL$/i
   @is_null_pattern ~r/^(\w+)\s+IS\s+NULL$/i
-  @between_pattern ~r/^(\w+)\s+(NOT\s+)?BETWEEN\s+(.+?)\s+AND\s+(.+)$/is
-  @like_pattern ~r/^(\w+)\s+(NOT\s+)?(I?LIKE)\s+'(.*)'$/is
+  @between_pattern ~r/^(.+?)\s+(NOT\s+)?BETWEEN\s+(.+?)\s+AND\s+(.+)$/is
+  @like_pattern ~r/^(.+?)\s+(NOT\s+)?(I?LIKE)\s+'(.*)'$/is
 
   @spec parse_single_where_clause(binary()) ::
           {:ok, where_clause()} | {:error, map()}
@@ -1253,29 +1305,36 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         with {:ok, values} <- parse_in_values(key, list_str), do: {:ok, {:in, key, values}}
 
       match = Regex.run(@between_pattern, trimmed) ->
-        [_full, key, negated, low, high] = match
-        parse_between(key, negated != "", String.trim(low), String.trim(high))
+        [_full, left, negated, low, high] = match
+
+        with {:ok, operand} <- parse_operand(String.trim(left)),
+             do: parse_between(operand, negated != "", String.trim(low), String.trim(high))
 
       match = Regex.run(@like_pattern, trimmed) ->
-        [_full, key, negated, kind, pattern] = match
-        {:ok, {like_op(negated != ""), key, like_regex(pattern, String.upcase(kind) == "ILIKE")}}
+        [_full, left, negated, kind, pattern] = match
+
+        with {:ok, operand} <- parse_operand(String.trim(left)),
+             do:
+               {:ok,
+                {like_op(negated != ""), operand,
+                 like_regex(pattern, String.upcase(kind) == "ILIKE")}}
 
       true ->
         parse_binary_where_clause(trimmed)
     end
   end
 
-  @spec parse_between(binary(), boolean(), binary(), binary()) ::
+  @spec parse_between(operand(), boolean(), binary(), binary()) ::
           {:ok, where_clause()} | {:error, map()}
-  defp parse_between(key, negated, low, high) do
+  defp parse_between(operand, negated, low, high) do
     op = if negated, do: :not_between, else: :between
 
-    if key == "time" do
+    if operand == "time" do
       with {:ok, lo} <- parse_time_comparand(low),
            {:ok, hi} <- parse_time_comparand(high),
            do: {:ok, {op, "time", {lo, hi}}}
     else
-      {:ok, {op, key, {parse_where_value(low), parse_where_value(high)}}}
+      {:ok, {op, operand, {parse_where_value(low), parse_where_value(high)}}}
     end
   end
 
@@ -1525,11 +1584,41 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # ORDER BY <column> [ASC|DESC]. The column is `time` or an output alias
   # (e.g. the DATE_BIN alias); direction defaults to ASC as in SQL.
   @spec parse_order_by(binary()) :: order_by()
+  # `ORDER BY a [ASC|DESC][, b [ASC|DESC] ...]`; a target may be a column,
+  # an output alias or an expression (`CAST(level AS INTEGER) DESC`). A
+  # target the expression parser cannot read is left as a column name so
+  # the schema check names it.
   defp parse_order_by(rest) do
-    case Regex.run(~r/(?i)ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?/s, rest) do
-      [_full_match, column] -> {column, :asc}
-      [_full_match, column, direction] -> {column, direction_atom(direction)}
-      _no_match -> nil
+    case Regex.run(~r/(?i)ORDER\s+BY\s+(.+?)\s*(?:\bLIMIT\b.*)?$/s, rest) do
+      [_full_match, list] ->
+        list
+        |> split_top_level_commas()
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+        |> Enum.map(&parse_order_term/1)
+
+      _no_match ->
+        []
+    end
+  end
+
+  @spec parse_order_term(binary()) :: {binary() | {:expr, expr()}, :asc | :desc}
+  defp parse_order_term(term) do
+    case Regex.run(~r/^(.+?)(?:\s+(ASC|DESC))?$/is, term) do
+      [_full, target] -> {order_target(String.trim(target)), :asc}
+      [_full, target, direction] -> {order_target(String.trim(target)), direction_atom(direction)}
+    end
+  end
+
+  @spec order_target(binary()) :: binary() | {:expr, expr()}
+  defp order_target(target) do
+    if Regex.match?(~r/^\w+$/, target) do
+      target
+    else
+      case parse_expr(target) do
+        {:ok, expr} -> {:expr, expr}
+        {:error, _reason} -> target
+      end
     end
   end
 

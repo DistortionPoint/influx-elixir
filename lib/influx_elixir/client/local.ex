@@ -123,7 +123,22 @@ defmodule InfluxElixir.Client.Local do
       Timestamp(ns) > Int64"), rather than silently matching nothing.
     * `SELECT DISTINCT col[, col ...] FROM measurement` (sorted combinations;
       `ORDER BY` must name a selected column, as in DataFusion)
-    * `ORDER BY <column> [ASC|DESC]` — `time` or any output column/alias
+    * `ORDER BY a [ASC|DESC][, b [ASC|DESC] ...]` — each term `time`, a
+      column, an output alias, or (on raw and projected rows) an expression
+      such as `CAST(level AS INTEGER) DESC`; every term applies, each with
+      its own direction
+    * `CAST(expr AS INTEGER | INT | BIGINT | DOUBLE | FLOAT | VARCHAR | STRING)`
+      and DataFusion's `col::TYPE` shorthand, wherever an expression is
+      allowed: `WHERE` (`CAST(level AS INTEGER) <= 20` compares a numeric tag
+      numerically), `BETWEEN`, `LIKE`, projections, aggregates, arithmetic
+      and `ORDER BY`. Text converts only when the whole string is a number,
+      a float truncates to an integer, a number renders to text, null stays
+      null. A cast that cannot be performed (`'abc'` to `INTEGER`, `time` to
+      `INTEGER`) makes InfluxDB 3 Core drop the connection mid-response,
+      which `Client.HTTP` reports as `{:error, {:connection_error,
+      %Mint.TransportError{reason: :closed}}}`; the double reports
+      `{:error, {:connection_error, :closed}}`. `BOOLEAN` and `TIMESTAMP`
+      targets are outside the subset.
     * `LIMIT N` — `LIMIT 0` returns no rows; a negative or non-numeric
       limit is rejected, as the engine rejects it
     * `$param` placeholders via `params: %{"$name" => value}` in opts. A
@@ -1067,6 +1082,11 @@ defmodule InfluxElixir.Client.Local do
       :error -> {:error, table_not_found(m)}
       {:error, _reason} = error -> error
     end
+  catch
+    # Errors only discoverable per value (a LIKE over a number, a CAST that
+    # cannot be performed) are thrown from the evaluator and become the
+    # engine's error here.
+    {:query_error, error} -> {:error, error}
   end
 
   @spec source_points(:ets.table(), binary(), binary(), %{binary() => [point_map()]}) ::
@@ -1218,11 +1238,13 @@ defmodule InfluxElixir.Client.Local do
   # alias instead, which is not a source column.
   @spec referenced_columns(SQLParser.parsed_query()) :: [binary()]
   defp referenced_columns(query) do
+    aliases = output_aliases(query)
+
     order_by_refs =
-      case query.order_by do
-        {column, _direction} -> if column in output_aliases(query), do: [], else: [column]
-        nil -> []
-      end
+      Enum.flat_map(query.order_by, fn
+        {{:expr, expr}, _direction} -> expr_fields(expr)
+        {column, _direction} -> if column in aliases, do: [], else: [column]
+      end)
 
     Enum.flat_map(query.projection_columns || [], &projection_refs/1) ++
       Enum.flat_map(query.select_columns || [], &select_column_refs/1) ++
@@ -1271,6 +1293,7 @@ defmodule InfluxElixir.Client.Local do
   defp expr_fields({:expr, expr}), do: expr_fields(expr)
   defp expr_fields({:field, name}), do: [name]
   defp expr_fields({:op, _op, left, right}), do: expr_fields(left) ++ expr_fields(right)
+  defp expr_fields({:cast, inner, _type}), do: expr_fields(inner)
   defp expr_fields(_other), do: []
 
   # A CTE's output rows, read back as points: every column but `time` is a
@@ -1304,15 +1327,42 @@ defmodule InfluxElixir.Client.Local do
 
   @spec order_projected([{point_map(), map()}], SQLParser.order_by(), [binary()]) ::
           [{point_map(), map()}]
-  defp order_projected(pairs, nil, _outputs), do: pairs
+  defp order_projected(pairs, [], _outputs), do: pairs
 
-  defp order_projected(pairs, {column, direction}, outputs) do
-    key =
-      if column in outputs,
-        do: fn {_point, row} -> Map.get(row, column) end,
-        else: fn {point, _row} -> point_value(point, column) end
+  defp order_projected(pairs, order_by, outputs) do
+    keys =
+      Enum.map(order_by, fn
+        {{:expr, expr}, direction} ->
+          {fn {point, _row} -> eval_expr(expr, point) end, direction}
 
-    Enum.sort_by(pairs, key, sorter(direction))
+        {column, direction} ->
+          if column in outputs,
+            do: {fn {_point, row} -> Map.get(row, column) end, direction},
+            else: {fn {point, _row} -> point_value(point, column) end, direction}
+      end)
+
+    sort_by_keys(pairs, keys)
+  end
+
+  # Stable multi-key sort with a direction per key; `DateTime`s compare
+  # chronologically and nil (an omitted column) sorts first.
+  @spec sort_by_keys([term()], [{(term() -> term()), :asc | :desc}]) :: [term()]
+  defp sort_by_keys(items, keys) do
+    Enum.sort(items, fn a, b -> keys_before?(a, b, keys) end)
+  end
+
+  @spec keys_before?(term(), term(), [{(term() -> term()), :asc | :desc}]) :: boolean()
+  defp keys_before?(_a, _b, []), do: true
+
+  defp keys_before?(a, b, [{key_fn, direction} | rest]) do
+    x = key_fn.(a)
+    y = key_fn.(b)
+
+    cond do
+      value_order(x, y) and value_order(y, x) -> keys_before?(a, b, rest)
+      direction == :asc -> value_order(x, y)
+      true -> value_order(y, x)
+    end
   end
 
   # The same shape and wording the real engine returns for a missing table
@@ -1505,10 +1555,10 @@ defmodule InfluxElixir.Client.Local do
   # non-numeric operand makes the value null, which the aggregate skips.
   # `time` is the point's timestamp; the parser only lets it reach MIN, MAX
   # and COUNT, the aggregates DataFusion accepts over a Timestamp.
-  @spec eval_expr(SQLParser.expr(), point_map()) :: number() | DateTime.t() | nil
-  defp eval_expr({:field, "time"}, point), do: nanoseconds_to_datetime(point.timestamp)
-  defp eval_expr({:field, name}, point), do: Map.get(point.fields, name)
+  @spec eval_expr(SQLParser.expr(), point_map()) :: number() | binary() | DateTime.t() | nil
+  defp eval_expr({:field, name}, point), do: point_value(point, name)
   defp eval_expr({:lit, value}, _point), do: value
+  defp eval_expr({:cast, inner, type}, point), do: cast(eval_expr(inner, point), type)
 
   defp eval_expr({:op, op, left, right}, point) do
     with l when is_number(l) <- eval_expr(left, point),
@@ -1518,6 +1568,41 @@ defmodule InfluxElixir.Client.Local do
       _non_number -> nil
     end
   end
+
+  # CAST as DataFusion performs it: text to a number only when the whole
+  # string is one ("2.5" is not an integer), a float to an integer by
+  # truncation, a number to text by rendering. Null stays null. A cast that
+  # cannot be performed — text that is not a number, a timestamp — fails
+  # the query on the engine mid-response: InfluxDB 3 Core closes the
+  # connection, which `Client.HTTP` reports as a transport error, so the
+  # double reports the same shape.
+  @spec cast(term(), SQLParser.cast_type()) :: term()
+  defp cast(nil, _type), do: nil
+  defp cast(value, :integer) when is_integer(value), do: value
+  defp cast(value, :integer) when is_float(value), do: trunc(value)
+  defp cast(value, :float) when is_float(value), do: value
+  defp cast(value, :float) when is_integer(value), do: value * 1.0
+  defp cast(value, :string) when is_binary(value), do: value
+  defp cast(value, :string) when is_number(value), do: to_string(value)
+
+  defp cast(value, :integer) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {n, ""} -> n
+      _not_an_integer -> cast_failure()
+    end
+  end
+
+  defp cast(value, :float) when is_binary(value) do
+    case Float.parse(String.trim(value)) do
+      {f, ""} -> f
+      _not_a_number -> cast_failure()
+    end
+  end
+
+  defp cast(_value, _type), do: cast_failure()
+
+  @spec cast_failure() :: no_return()
+  defp cast_failure, do: throw({:query_error, {:connection_error, :closed}})
 
   @spec arithmetic(:+ | :- | :* | :/, number(), number()) :: number() | nil
   defp arithmetic(:+, l, r), do: l + r
@@ -1539,7 +1624,7 @@ defmodule InfluxElixir.Client.Local do
   defp compute_aggregate(:sum, vals), do: Enum.sum(vals)
   # MIN/MAX also run over `time`, so the comparison must be DateTime-aware.
   defp compute_aggregate(:min, vals), do: Enum.min(vals, &value_order/2)
-  defp compute_aggregate(:max, vals), do: Enum.max(vals, sorter(:desc))
+  defp compute_aggregate(:max, vals), do: Enum.max(vals, fn a, b -> value_order(b, a) end)
   defp compute_aggregate(:median, vals), do: median(vals)
   # Sample forms need at least two values, exactly as the real engine
   # (STDDEV of one row is null); population forms are defined for one.
@@ -1646,11 +1731,16 @@ defmodule InfluxElixir.Client.Local do
   # Order aggregate result rows by any output column. `ORDER BY time` on a
   # DATE_BIN query refers to the bucket, whatever its alias.
   @spec apply_order_by_rows([map()], SQLParser.order_by(), binary() | nil) :: [map()]
-  defp apply_order_by_rows(rows, nil, _time_alias), do: rows
+  defp apply_order_by_rows(rows, [], _time_alias), do: rows
 
-  defp apply_order_by_rows(rows, {column, direction}, time_alias) do
-    key = if column == "time" and time_alias, do: time_alias, else: column
-    Enum.sort_by(rows, &Map.get(&1, key), sorter(direction))
+  defp apply_order_by_rows(rows, order_by, time_alias) do
+    keys =
+      Enum.map(order_by, fn {column, direction} ->
+        key = if column == "time" and time_alias, do: time_alias, else: column
+        {&Map.get(&1, key), direction}
+      end)
+
+    sort_by_keys(rows, keys)
   end
 
   # DateTime structs must be compared chronologically; everything else uses
@@ -1659,21 +1749,13 @@ defmodule InfluxElixir.Client.Local do
   defp value_order(%DateTime{} = a, %DateTime{} = b), do: DateTime.compare(a, b) != :gt
   defp value_order(a, b), do: a <= b
 
-  @spec sorter(:asc | :desc) :: (term(), term() -> boolean())
-  defp sorter(:asc), do: &value_order/2
-  defp sorter(:desc), do: fn a, b -> value_order(b, a) end
-
-  # A predicate the engine refuses at planning time (LIKE over a number) is
-  # only discoverable here, per value, so it is thrown out of the filter and
-  # turned into the same 400 the engine returns.
-  @spec apply_where([point_map()], [SQLParser.where_node()]) ::
-          {:ok, [point_map()]} | {:error, %{status: 400, body: binary()}}
+  # Per-value failures (a LIKE over a number, a CAST that cannot be
+  # performed) are thrown from the evaluator and caught in execute_select/4.
+  @spec apply_where([point_map()], [SQLParser.where_node()]) :: {:ok, [point_map()]}
   defp apply_where(points, []), do: {:ok, points}
 
   defp apply_where(points, conjunction) do
     {:ok, Enum.filter(points, &matches_all?(&1, conjunction))}
-  catch
-    {:where_error, message} -> {:error, %{status: 400, body: message}}
   end
 
   @spec matches_all?(point_map(), [SQLParser.where_node()]) :: boolean()
@@ -1693,27 +1775,27 @@ defmodule InfluxElixir.Client.Local do
   defp matches_condition?(point, {:not_between, "time", range}),
     do: not matches_condition?(point, {:between, "time", range})
 
-  defp matches_condition?(point, {:between, key, {low, high}}) do
-    actual = point_value(point, key)
+  defp matches_condition?(point, {:between, left, {low, high}}) do
+    actual = left_value(point, left)
     compare(actual, :gte, low) and compare(actual, :lte, high)
   end
 
   defp matches_condition?(point, {:not_between, key, range}),
     do: not matches_condition?(point, {:between, key, range})
 
-  defp matches_condition?(point, {:like, key, regex}) do
-    case point_value(point, key) do
+  defp matches_condition?(point, {:like, left, regex}) do
+    case left_value(point, left) do
       nil -> false
       text when is_binary(text) -> Regex.match?(regex, text)
-      _number -> throw({:where_error, like_type_error(key)})
+      _number -> throw({:query_error, %{status: 400, body: like_type_error(left)}})
     end
   end
 
-  defp matches_condition?(point, {:not_like, key, regex}) do
-    case point_value(point, key) do
+  defp matches_condition?(point, {:not_like, left, regex}) do
+    case left_value(point, left) do
       nil -> false
       text when is_binary(text) -> not Regex.match?(regex, text)
-      _number -> throw({:where_error, like_type_error(key)})
+      _number -> throw({:query_error, %{status: 400, body: like_type_error(left)}})
     end
   end
 
@@ -1783,10 +1865,10 @@ defmodule InfluxElixir.Client.Local do
 
   # DataFusion: "There isn't a common type to coerce Float64 and Utf8 in
   # LIKE expression".
-  @spec like_type_error(binary()) :: binary()
-  defp like_type_error(key) do
+  @spec like_type_error(SQLParser.operand()) :: binary()
+  defp like_type_error(left) do
     "Error during planning: There isn't a common type to coerce a numeric column and " <>
-      "Utf8 in LIKE expression: #{key}"
+      "Utf8 in LIKE expression: #{inspect(left)}"
   end
 
   # Both nil-actual (missing column) and nil-value (unparseable comparand)
@@ -1823,14 +1905,16 @@ defmodule InfluxElixir.Client.Local do
   # ORDER BY any column on raw rows: `time` sorts by timestamp, anything
   # else by the tag/field value (nil first, as the real engine sorts nulls).
   @spec apply_order_by([point_map()], SQLParser.order_by()) :: [point_map()]
-  defp apply_order_by(points, nil), do: points
+  defp apply_order_by(points, []), do: points
 
-  defp apply_order_by(points, {"time", direction}) do
-    Enum.sort_by(points, & &1.timestamp, direction)
-  end
+  defp apply_order_by(points, order_by) do
+    keys =
+      Enum.map(order_by, fn
+        {{:expr, expr}, direction} -> {&eval_expr(expr, &1), direction}
+        {column, direction} -> {&point_value(&1, column), direction}
+      end)
 
-  defp apply_order_by(points, {column, direction}) do
-    Enum.sort_by(points, &point_value(&1, column), sorter(direction))
+    sort_by_keys(points, keys)
   end
 
   @spec apply_limit([point_map()], pos_integer() | nil) :: [point_map()]

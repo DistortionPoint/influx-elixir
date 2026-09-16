@@ -61,6 +61,7 @@ defmodule InfluxElixir.ClientContract do
     cte_tests = if v3_sql, do: cte_tests(client), else: nil
     where_tests = if v3_sql, do: where_tests(client), else: nil
     median_join_tests = if v3_sql, do: median_join_tests(client), else: nil
+    cast_tests = if v3_sql, do: cast_tests(client), else: nil
     ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
     distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
     param_tests = if v3_sql, do: param_tests(client), else: nil
@@ -98,6 +99,7 @@ defmodule InfluxElixir.ClientContract do
         cte_tests,
         where_tests,
         median_join_tests,
+        cast_tests,
         ordered_agg_tests,
         distinct_tests,
         param_tests,
@@ -1618,6 +1620,89 @@ defmodule InfluxElixir.ClientContract do
                    unquote(client).query_sql(
                      ctx.conn,
                      "SELECT symbol FROM contract_mj GROUP BY symbol",
+                     database: ctx.database
+                   )
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # CAST, ::TYPE, ORDER BY expressions and multiple terms (#20)
+  # ---------------------------------------------------------------------------
+
+  defp cast_tests(client) do
+    quote do
+      describe "query_sql/3 — CAST and ORDER BY contract" do
+        setup ctx do
+          lp =
+            Enum.join(
+              [
+                "contract_cast,symbol=X,level=5 price=2.7,qty=1i 1700000000000000000",
+                "contract_cast,symbol=X,level=20 price=3.2,qty=2i 1700000001000000000",
+                "contract_cast,symbol=X,level=100 price=9.9,qty=3i 1700000002000000000",
+                "contract_cast,symbol=Y,level=20 price=1.1,qty=9i 1700000003000000000",
+                "contract_cast_bad,level=abc price=1.0 1700000000000000000"
+              ],
+              "\n"
+            )
+
+          {:ok, :written} = unquote(client).write(ctx.conn, lp, database: ctx.database)
+          InfluxElixir.ClientContract.settle(ctx)
+          :ok
+        end
+
+        test "CAST(tag AS INTEGER) compares numerically in WHERE, ORDER BY and an aggregate",
+             ctx do
+          levels = fn sql ->
+            {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+            Enum.map(rows, & &1["level"])
+          end
+
+          assert levels.(
+                   "SELECT level FROM contract_cast WHERE CAST(level AS INTEGER) <= 20 AND symbol = 'X' ORDER BY time"
+                 ) ==
+                   ["5", "20"]
+
+          assert levels.(
+                   "SELECT level FROM contract_cast WHERE level::INTEGER <= 20 AND symbol = 'X' ORDER BY time"
+                 ) ==
+                   ["5", "20"]
+
+          assert levels.(
+                   "SELECT level FROM contract_cast WHERE symbol = 'X' ORDER BY CAST(level AS INTEGER) DESC"
+                 ) ==
+                   ["100", "20", "5"]
+
+          {:ok, [row]} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT MAX(CAST(level AS INTEGER)) AS m, MAX(CAST(price AS INTEGER)) AS p FROM contract_cast",
+              database: ctx.database
+            )
+
+          assert row == %{"m" => 100, "p" => 9}
+
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT symbol, level FROM contract_cast ORDER BY symbol DESC, CAST(level AS INTEGER) ASC",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, &{&1["symbol"], &1["level"]}) ==
+                   [{"Y", "20"}, {"X", "5"}, {"X", "20"}, {"X", "100"}]
+        end
+
+        test "a cast that cannot be performed is a transport-level failure", ctx do
+          # InfluxDB 3 Core closes the connection mid-response instead of
+          # sending an error body; both clients report a connection error.
+          assert {:error, {:connection_error, _reason}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT level FROM contract_cast_bad WHERE CAST(level AS INTEGER) <= 20",
                      database: ctx.database
                    )
         end

@@ -24,6 +24,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`CAST(col AS INTEGER)` in `WHERE` was rejected by 0.1.24 (#20) — and
+  silently matched nothing in 0.1.23.** The report is right that 0.1.24
+  refuses the orderbook depth query with `Client.Local: unsupported WHERE
+  clause: CAST(level AS INTEGER)`. It was never a working query on the
+  double: 0.1.23 read `CAST(level AS INTEGER)` as a column named that and
+  returned no rows for it, so tests passing against 0.1.23 were passing on
+  an empty result. `CAST` (and DataFusion's `col::TYPE` shorthand) now works
+  wherever an expression is allowed — `WHERE`, `BETWEEN`, `LIKE`, projections,
+  aggregates, arithmetic and `ORDER BY` — with the engine's semantics,
+  verified against InfluxDB 3 Core: `INTEGER` / `INT` / `BIGINT`, `DOUBLE` /
+  `FLOAT`, `VARCHAR` / `STRING` / `TEXT`; text converts only when the whole
+  string is a number, a float truncates to an integer, a number renders to
+  text. A cast that cannot be performed (`'abc'` to `INTEGER`, `time` to
+  `INTEGER`) makes InfluxDB 3 Core drop the connection mid-response, which
+  `Client.HTTP` reports as `{:error, {:connection_error, %Mint.TransportError{
+  reason: :closed}}}`; the double reports `{:error, {:connection_error,
+  :closed}}`.
+- **`ORDER BY` ignored every term after the first in `Client.Local`.**
+  `ORDER BY symbol DESC, level` sorted by `symbol` only. All terms apply,
+  each with its own direction, and a term may be an expression
+  (`ORDER BY CAST(level AS INTEGER) DESC`) on raw and projected rows.
 - **`Client.Local` ignored `GROUP BY` on a plain projection and `ORDER BY`
   on column-grouped aggregates, and sampled a row for an ungrouped
   column.** `SELECT host FROM p GROUP BY host` returned every row; `SELECT

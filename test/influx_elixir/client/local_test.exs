@@ -15,6 +15,12 @@ defmodule InfluxElixir.Client.LocalTest do
     Enum.map(rows, & &1["host"])
   end
 
+  # Level tags of the rows a query returns, in order.
+  defp levels(conn, db, sql) do
+    {:ok, rows} = Local.query_sql(conn, sql, database: db)
+    Enum.map(rows, & &1["level"])
+  end
+
   # ---------------------------------------------------------------------------
   # Lifecycle
   # ---------------------------------------------------------------------------
@@ -4413,6 +4419,227 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, [%{"n" => 1}, %{"n" => 2}]} =
                Local.query_sql(conn, ~s|SELECT COUNT(*) AS n FROM "p" GROUP BY host ORDER BY n|,
+                 database: db
+               )
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Issue #20: CAST in WHERE (and everywhere an expression is allowed),
+  # `::TYPE`, ORDER BY expressions and multiple terms. Expected values
+  # recorded from InfluxDB 3 Core (docs/design/2026-09-16_local-cast-order-by.md).
+  # ---------------------------------------------------------------------------
+
+  describe "bug regression — CAST, ::TYPE and multi-term ORDER BY (#20)" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "cast_db")
+
+      lines =
+        Enum.join(
+          [
+            "orderbooks,symbol=X,provider=a,level=5 price=2.7,qty=1i 1700000000000000000",
+            "orderbooks,symbol=X,provider=a,level=20 price=3.2,qty=2i 1700000001000000000",
+            "orderbooks,symbol=X,provider=a,level=100 price=9.9,qty=3i 1700000002000000000",
+            "orderbooks,symbol=Y,provider=a,level=20 price=1.1,qty=9i 1700000003000000000",
+            "bad,level=abc price=1.0 1700000000000000000",
+            "bad,level=2.5 price=1.0 1700000001000000000"
+          ],
+          "\n"
+        )
+
+      {:ok, :written} = Local.write(conn, lines, database: "cast_db", precision: :nanosecond)
+      {:ok, db: "cast_db"}
+    end
+
+    test "the reported orderbook query: CAST(level AS INTEGER) <= $depth on a string tag",
+         %{conn: conn, db: db} do
+      sql = """
+      SELECT *
+      FROM "orderbooks"
+      WHERE time >= $start_time
+        AND symbol = $symbol
+        AND provider = $provider
+        AND CAST(level AS INTEGER) <= $depth
+      ORDER BY time DESC
+      LIMIT $row_limit
+      """
+
+      params = %{
+        start_time: ~U[2023-01-01 00:00:00Z],
+        symbol: "X",
+        provider: "a",
+        depth: 20,
+        row_limit: 10
+      }
+
+      # Numeric depth: "100" is excluded although it sorts before "20" as text.
+      assert {:ok, [%{"level" => "20"}, %{"level" => "5"}]} =
+               Local.query_sql(conn, sql, database: db, params: params)
+
+      # The uncast comparison is the lexical one the report describes.
+      assert levels(
+               conn,
+               db,
+               ~s|SELECT level FROM "orderbooks" WHERE level <= '20' ORDER BY time|
+             ) ==
+               ["20", "100", "20"]
+    end
+
+    test "CAST spellings and targets", %{conn: conn, db: db} do
+      for sql <- [
+            ~s|SELECT level FROM "orderbooks" WHERE CAST(level AS INTEGER) <= 20 AND symbol = 'X' ORDER BY time|,
+            ~s|SELECT level FROM "orderbooks" WHERE CAST(level AS BIGINT) <= 20 AND symbol = 'X' ORDER BY time|,
+            ~s|SELECT level FROM "orderbooks" WHERE CAST(level AS INT) <= 20 AND symbol = 'X' ORDER BY time|,
+            ~s|SELECT level FROM "orderbooks" WHERE level::INTEGER <= 20 AND symbol = 'X' ORDER BY time|,
+            ~s|SELECT level FROM "orderbooks" WHERE CAST(level AS DOUBLE) <= 20.5 AND symbol = 'X' ORDER BY time|,
+            ~s|SELECT level FROM "orderbooks" WHERE CAST(level AS INTEGER) * 2 <= 40 AND symbol = 'X' ORDER BY time|,
+            ~s|SELECT level FROM "orderbooks" WHERE CAST(level AS INTEGER) BETWEEN 5 AND 20 AND symbol = 'X' ORDER BY time|
+          ] do
+        assert levels(conn, db, sql) == ["5", "20"], sql
+      end
+
+      assert levels(conn, db, ~s|SELECT level FROM "orderbooks" WHERE CAST(qty AS VARCHAR) = '2'|) ==
+               ["20"]
+
+      assert levels(
+               conn,
+               db,
+               ~s|SELECT level FROM "orderbooks" WHERE CAST(qty AS VARCHAR) LIKE '2%'|
+             ) == ["20"]
+    end
+
+    test "CAST in a projection, an aggregate and arithmetic", %{conn: conn, db: db} do
+      assert {:ok, [%{"lvl" => 5}, %{"lvl" => 20}, %{"lvl" => 20}, %{"lvl" => 100}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT CAST(level AS INTEGER) AS lvl FROM "orderbooks" ORDER BY lvl|,
+                 database: db
+               )
+
+      assert {:ok, [%{"m" => 100}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT MAX(CAST(level AS INTEGER)) AS m FROM "orderbooks"|,
+                 database: db
+               )
+
+      # float -> integer truncates; integer -> double widens
+      assert {:ok, [%{"p" => 1}, %{"p" => 2}, %{"p" => 3}, %{"p" => 9}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT CAST(price AS INTEGER) AS p FROM "orderbooks" ORDER BY p|,
+                 database: db
+               )
+
+      assert {:ok, [%{"q" => 1.0} | _rest]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT CAST(qty AS DOUBLE) AS q FROM "orderbooks" ORDER BY q|,
+                 database: db
+               )
+
+      assert {:ok, [%{"s" => 6}, %{"s" => 22}, %{"s" => 29}, %{"s" => 103}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT CAST(level AS INTEGER) + qty AS s FROM "orderbooks" ORDER BY s|,
+                 database: db
+               )
+    end
+
+    test "a cast that cannot be performed fails the query as the engine does", %{
+      conn: conn,
+      db: db
+    } do
+      # InfluxDB 3 Core drops the connection mid-response; Client.HTTP reports
+      # {:connection_error, %Mint.TransportError{reason: :closed}}.
+      assert {:error, {:connection_error, :closed}} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT level FROM "bad" WHERE CAST(level AS INTEGER) <= 20|,
+                 database: db
+               )
+
+      assert {:error, {:connection_error, :closed}} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT CAST(time AS INTEGER) AS t FROM "orderbooks" LIMIT 1|,
+                 database: db
+               )
+
+      # A whole-string float is a DOUBLE, not an INTEGER.
+      assert levels(
+               conn,
+               db,
+               ~s|SELECT level FROM "bad" WHERE level = '2.5' AND CAST(level AS DOUBLE) <= 20|
+             ) ==
+               ["2.5"]
+
+      assert {:error, %{status: 400, body: "Client.Local: unsupported column" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT CAST(level AS BOOLEAN) AS b FROM "orderbooks"|,
+                 database: db
+               )
+    end
+
+    test "ORDER BY an expression, and by several terms with their own directions",
+         %{conn: conn, db: db} do
+      assert levels(
+               conn,
+               db,
+               ~s|SELECT level FROM "orderbooks" WHERE symbol = 'X' ORDER BY CAST(level AS INTEGER)|
+             ) ==
+               ["5", "20", "100"]
+
+      assert levels(
+               conn,
+               db,
+               ~s|SELECT level FROM "orderbooks" ORDER BY CAST(level AS INTEGER) DESC LIMIT 2|
+             ) ==
+               ["100", "20"]
+
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT symbol, level FROM "orderbooks" ORDER BY symbol DESC, CAST(level AS INTEGER) ASC|,
+                 database: db
+               )
+
+      assert Enum.map(rows, &{&1["symbol"], &1["level"]}) == [
+               {"Y", "20"},
+               {"X", "5"},
+               {"X", "20"},
+               {"X", "100"}
+             ]
+
+      # Before, only the first ORDER BY term was applied and the rest ignored.
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT symbol, level FROM "orderbooks" ORDER BY level, symbol DESC|,
+                 database: db
+               )
+
+      assert Enum.map(rows, &{&1["symbol"], &1["level"]}) == [
+               {"X", "100"},
+               {"Y", "20"},
+               {"X", "20"},
+               {"X", "5"}
+             ]
+
+      assert {:ok, [%{"m" => 9.9, "symbol" => "X"}, %{"m" => 1.1, "symbol" => "Y"}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT symbol, MAX(price) AS m FROM "orderbooks" GROUP BY symbol ORDER BY m DESC, symbol|,
+                 database: db
+               )
+
+      assert {:error,
+              %{
+                status: 400,
+                body: "Client.Local: ORDER BY an expression is not supported" <> _rest
+              }} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT level, MAX(price) AS m FROM "orderbooks" GROUP BY level ORDER BY CAST(level AS INTEGER)|,
                  database: db
                )
     end

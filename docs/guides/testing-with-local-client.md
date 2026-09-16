@@ -587,6 +587,43 @@ planning error. A malformed expression (an unbalanced parenthesis, a
 trailing `AND`) is rejected rather than truncated. `LIMIT 0` returns no
 rows; a negative or non-numeric `LIMIT` is rejected.
 
+## CAST and Ordering
+
+A tag is always a string, so `level <= 20` compares text (`"100"` sorts
+before `"20"`). Cast it, as you would on the server, wherever an expression
+is allowed — `WHERE`, `BETWEEN`, `LIKE`, projections, aggregates and
+`ORDER BY`; `col::INTEGER` is the same as `CAST(col AS INTEGER)`:
+
+```elixir
+sql = """
+SELECT *
+FROM "orderbooks"
+WHERE time >= $start_time
+  AND symbol = $symbol
+  AND CAST(level AS INTEGER) <= $depth
+ORDER BY time DESC, CAST(level AS INTEGER) ASC
+LIMIT $row_limit
+"""
+
+{:ok, rows} =
+  Local.query_sql(conn, sql,
+    database: "test_db",
+    params: %{start_time: ~U[2026-01-01 00:00:00Z], symbol: "BTC-USD", depth: 20, row_limit: 100}
+  )
+```
+
+Targets are `INTEGER` (`INT`, `BIGINT`), `DOUBLE` (`FLOAT`) and `VARCHAR`
+(`STRING`, `TEXT`). Text converts only when the whole string is a number, a
+float truncates to an integer, and a number renders to text. A cast that
+cannot be performed — `'abc'` to `INTEGER`, `time` to `INTEGER` — makes
+InfluxDB 3 Core drop the connection mid-response rather than send an error;
+`Client.HTTP` reports `{:error, {:connection_error, %Mint.TransportError{
+reason: :closed}}}` and the double reports `{:error, {:connection_error,
+:closed}}`, so a test that handles the production failure handles the
+double's.
+
+`ORDER BY` takes several terms, each with its own direction.
+
 ## Time Filters
 
 `WHERE time` accepts exactly what InfluxDB 3 accepts against a Timestamp
