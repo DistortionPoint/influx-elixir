@@ -27,7 +27,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   """
   @type expr ::
           {:field, binary()}
-          | {:lit, number()}
+          | {:lit, number() | binary()}
           | {:op, :+ | :- | :* | :/, expr(), expr()}
           | {:cast, expr(), cast_type()}
 
@@ -47,6 +47,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           | {:selector, :first | :last | :min | :max, binary(), binary(), :value | :time,
              binary()}
           | {:grouping_column, binary(), binary()}
+          | {:constant, term(), binary()}
 
   @type where_op ::
           :eq
@@ -538,6 +539,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   # Parse a single SELECT column expression
+  # A constant in the select list (`0.0 AS volume`, `'x' AS label`) needs an
+  # alias: DataFusion names an unaliased one after its own rendering
+  # (`Int64(1)`), which the double will not guess.
+  @constant_column ~r/^\s*(-?\d+(?:\.\d+)?|'[^']*')\s+AS\s+(\w+)\s*$/i
+
   @spec parse_single_column(binary()) ::
           {:ok, select_column()} | {:error, term()}
   defp parse_single_column(col) do
@@ -559,6 +565,10 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         ~r/(?i)\b(AVG|SUM|COUNT|MIN|MAX|MEDIAN|STDDEV|STDDEV_SAMP|STDDEV_POP|VAR|VAR_SAMP|VAR_POP)\s*\(/
       ) ->
         parse_agg_column(col)
+
+      match = Regex.run(@constant_column, col) ->
+        [_full, literal, alias_name] = match
+        {:ok, {:constant, parse_where_value(literal), alias_name}}
 
       String.match?(col, ~r/^\s*\w+(\s+AS\s+\w+)?\s*$/i) ->
         parse_grouping_column(col)
@@ -1010,6 +1020,13 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     trimmed = String.trim(col)
 
     cond do
+      match = Regex.run(@constant_column, trimmed) ->
+        [_full, literal, alias_name] = match
+        {:ok, {{:lit, parse_where_value(literal)}, alias_name}}
+
+      Regex.match?(~r/^(?:-?\d+(?:\.\d+)?|'[^']*')$/, trimmed) ->
+        {:error, local_error("unsupported column (a constant needs AS alias): #{col}")}
+
       match = Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/i, trimmed) ->
         case match do
           [_full, name] -> {:ok, {name, name}}
@@ -1371,17 +1388,21 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       |> Enum.map(&String.trim/1)
       |> Enum.reject(&(&1 == ""))
 
-    if key == "time" do
-      # Membership is order-independent, so the reduced (reversed) list is
-      # returned as is.
-      Enum.reduce_while(items, {:ok, []}, fn item, {:ok, acc} ->
-        case parse_time_comparand(item) do
-          {:ok, value} -> {:cont, {:ok, [value | acc]}}
-          {:error, _reason} = error -> {:halt, error}
-        end
-      end)
-    else
-      {:ok, Enum.map(items, &parse_where_value/1)}
+    # Each item is a comparand: a literal, or — as in SQL — a column
+    # reference or expression (`v IN (1, other)`). Source order is kept so
+    # the schema check names the first unknown column, as the engine does.
+    parse_item = if key == "time", do: &parse_time_comparand/1, else: &parse_comparand/1
+
+    items
+    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+      case parse_item.(item) do
+        {:ok, value} -> {:cont, {:ok, [value | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      {:error, _reason} = error -> error
     end
   end
 

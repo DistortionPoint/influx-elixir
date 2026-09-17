@@ -278,6 +278,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     do: [field, ordering]
 
   defp select_column_refs({:grouping_column, source, _alias}), do: [source]
+  defp select_column_refs({:constant, _value, _alias}), do: []
 
   @spec where_refs([SQLParser.where_node()]) :: [binary()]
   defp where_refs(nodes) do
@@ -294,6 +295,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp expr_fields({:field, name}), do: [name]
   defp expr_fields({:op, _op, left, right}), do: expr_fields(left) ++ expr_fields(right)
   defp expr_fields({:cast, inner, _type}), do: expr_fields(inner)
+  defp expr_fields(items) when is_list(items), do: Enum.flat_map(items, &expr_fields/1)
   defp expr_fields(_other), do: []
 
   # A CTE's output rows, read back as points: every column but `time` is a
@@ -533,6 +535,9 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
       {:count_star, alias_name}, row ->
         # COUNT(*) — every matching row counts, regardless of field nullity.
         put_column(row, alias_name, length(points))
+
+      {:constant, value, alias_name}, row ->
+        put_column(row, alias_name, value)
 
       {:count_distinct, column, alias_name}, row ->
         distinct =
@@ -810,13 +815,13 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   end
 
   defp matches_condition?(point, {:in, key, values}) do
-    actual = Map.get(point.tags, key) || Map.get(point.fields, key)
-    Enum.any?(values, &compare(actual, :eq, &1))
+    actual = point_value(point, key)
+    Enum.any?(values, &compare(actual, :eq, right_value(point, &1)))
   end
 
   defp matches_condition?(point, {:not_in, key, values}) do
-    actual = Map.get(point.tags, key) || Map.get(point.fields, key)
-    not Enum.any?(values, &compare(actual, :eq, &1))
+    actual = point_value(point, key)
+    not Enum.any?(values, &compare(actual, :eq, right_value(point, &1)))
   end
 
   defp matches_condition?(point, {:is_null, key, _nil}), do: is_nil(point_value(point, key))

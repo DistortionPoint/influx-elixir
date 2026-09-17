@@ -36,6 +36,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-16 | [`local-cast-order-by`](2026-09-16_local-cast-order-by.md) | `CAST` / `::TYPE` everywhere an expression is allowed, multi-term `ORDER BY`, run-time cast failure shape (#20) |
 | 2026-09-16 | [`parser-single-select-split`](2026-09-16_parser-single-select-split.md) | One `split_select/1` replaces eight table-after-FROM regexes |
 | 2026-09-17 | [`local-sql-executor-extraction`](2026-09-17_local-sql-executor-extraction.md) | SQL execution split into `SQLExecutor`; `DELETE` with `OR` crash fixed |
+| 2026-09-17 | [`local-in-lists-and-constants`](2026-09-17_local-in-lists-and-constants.md) | `IN`-list items as comparands; constants in select lists |
 
 ## Verifying against a real engine
 

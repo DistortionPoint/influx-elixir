@@ -4666,4 +4666,82 @@ defmodule InfluxElixir.Client.LocalTest do
                )
     end
   end
+
+  describe "bug regression — IN-list items are comparands; constants in a select list" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "const_db")
+
+      {:ok, :written} =
+        Local.write(
+          conn,
+          "p,host=a,rack=2 v=1.0,other=1.0 1700000000000000000\n" <>
+            "p,host=b,rack=4 v=2.0,other=5.0 1700000001000000000",
+          database: "const_db",
+          precision: :nanosecond
+        )
+
+      {:ok, db: "const_db"}
+    end
+
+    test "a bare word in an IN list is a column reference, as on the engine", %{
+      conn: conn,
+      db: db
+    } do
+      # `host IN (a, b)` was read as the strings "a" and "b"; the engine
+      # resolves columns and fails on the unknown one.
+      assert {:error, %{status: 500, body: "Schema error: No field named a." <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT host FROM "p" WHERE host IN (a, b)|, database: db)
+
+      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE v IN (1, other) ORDER BY host|) == [
+               "a"
+             ]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE v IN (other * 2)|) == []
+
+      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE rack IN (2, 4) ORDER BY host|) == [
+               "a",
+               "b"
+             ]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE host NOT IN ('a') ORDER BY host|) == [
+               "b"
+             ]
+    end
+
+    test "constants with an alias in projections and aggregates", %{conn: conn, db: db} do
+      assert {:ok, [%{"one" => 1}]} =
+               Local.query_sql(conn, ~s|SELECT 1 AS one FROM "p" LIMIT 1|, database: db)
+
+      assert {:ok, [%{"host" => "a", "label" => "x"}, %{"host" => "b", "label" => "x"}]} =
+               Local.query_sql(conn, ~s|SELECT host, 'x' AS label FROM "p" ORDER BY host|,
+                 database: db
+               )
+
+      assert {:ok, [%{"host" => "a", "volume" => 0.0}, %{"host" => "b", "volume" => 0.0}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT host, 0.0 AS volume FROM "p" GROUP BY host ORDER BY host|,
+                 database: db
+               )
+
+      assert {:ok, [%{"volume" => 0.0, "m" => 2.0}]} =
+               Local.query_sql(conn, ~s|SELECT 0.0 AS volume, MAX(v) AS m FROM "p"|, database: db)
+
+      assert {:ok, [%{"volume" => 0.0, "m" => 2.0, "t" => %DateTime{}}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT DATE_BIN(INTERVAL '1 minute', time) AS t, 0.0 AS volume, MAX(v) AS m FROM "p" GROUP BY DATE_BIN(INTERVAL '1 minute', time)|,
+                 database: db
+               )
+    end
+
+    test "a constant without an alias is refused with the reason", %{conn: conn, db: db} do
+      assert {:error,
+              %{
+                status: 400,
+                body: "Client.Local: unsupported column (a constant needs AS alias)" <> _rest
+              }} =
+               Local.query_sql(conn, ~s|SELECT 1 FROM "p"|, database: db)
+    end
+  end
 end

@@ -62,6 +62,7 @@ defmodule InfluxElixir.ClientContract do
     where_tests = if v3_sql, do: where_tests(client), else: nil
     median_join_tests = if v3_sql, do: median_join_tests(client), else: nil
     cast_tests = if v3_sql, do: cast_tests(client), else: nil
+    schema_rule_tests = if v3_sql, do: schema_rule_tests(client), else: nil
     ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
     distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
     param_tests = if v3_sql, do: param_tests(client), else: nil
@@ -100,6 +101,7 @@ defmodule InfluxElixir.ClientContract do
         where_tests,
         median_join_tests,
         cast_tests,
+        schema_rule_tests,
         ordered_agg_tests,
         distinct_tests,
         param_tests,
@@ -1594,34 +1596,6 @@ defmodule InfluxElixir.ClientContract do
                      "SELECT price FROM contract_mj WHERE symbol = prod",
                      database: ctx.database
                    )
-
-          # An unknown column in any clause is the engine's schema error.
-          for sql <- [
-                "SELECT nosuch FROM contract_mj",
-                "SELECT price FROM contract_mj ORDER BY nosuch",
-                "SELECT symbol FROM contract_mj GROUP BY nosuch",
-                "SELECT MAX(nosuch) AS m FROM contract_mj"
-              ] do
-            assert {:error, %{status: 500}} =
-                     unquote(client).query_sql(ctx.conn, sql, database: ctx.database),
-                   sql
-          end
-
-          # A projected column must be grouped or aggregated; GROUP BY without
-          # an aggregate is one row per group.
-          assert {:error, %{status: 400}} =
-                   unquote(client).query_sql(
-                     ctx.conn,
-                     "SELECT symbol, price FROM contract_mj GROUP BY symbol",
-                     database: ctx.database
-                   )
-
-          assert {:ok, [%{"symbol" => "X"}]} =
-                   unquote(client).query_sql(
-                     ctx.conn,
-                     "SELECT symbol FROM contract_mj GROUP BY symbol",
-                     database: ctx.database
-                   )
         end
       end
     end
@@ -1703,6 +1677,81 @@ defmodule InfluxElixir.ClientContract do
                    unquote(client).query_sql(
                      ctx.conn,
                      "SELECT level FROM contract_cast_bad WHERE CAST(level AS INTEGER) <= 20",
+                     database: ctx.database
+                   )
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Schema and grouping rules: unknown columns, IN-list items, constants,
+  # ungrouped projections
+  # ---------------------------------------------------------------------------
+
+  defp schema_rule_tests(client) do
+    quote do
+      describe "query_sql/3 — schema and grouping rules contract" do
+        setup ctx do
+          lp =
+            Enum.join(
+              [
+                "contract_rules,symbol=X price=1.0 1700000000000000000",
+                "contract_rules,symbol=X price=100.0 1700000001000000000"
+              ],
+              "\n"
+            )
+
+          {:ok, :written} = unquote(client).write(ctx.conn, lp, database: ctx.database)
+          InfluxElixir.ClientContract.settle(ctx)
+          :ok
+        end
+
+        test "unknown columns, IN-list items, constants and ungrouped projections", ctx do
+          # An unknown column in any clause is the engine's schema error.
+          for sql <- [
+                "SELECT nosuch FROM contract_rules",
+                "SELECT price FROM contract_rules ORDER BY nosuch",
+                "SELECT symbol FROM contract_rules GROUP BY nosuch",
+                "SELECT MAX(nosuch) AS m FROM contract_rules"
+              ] do
+            assert {:error, %{status: 500}} =
+                     unquote(client).query_sql(ctx.conn, sql, database: ctx.database),
+                   sql
+          end
+
+          # IN-list items are comparands; constants need an alias.
+          assert {:error, %{status: 500}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT symbol FROM contract_rules WHERE symbol IN (a, b)",
+                     database: ctx.database
+                   )
+
+          {:ok, [row]} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT 0.0 AS volume, 'x' AS label, MAX(price) AS m FROM contract_rules",
+              database: ctx.database
+            )
+
+          assert row == %{"volume" => 0.0, "label" => "x", "m" => 100.0}
+
+          # A projected column must be grouped or aggregated; GROUP BY without
+          # an aggregate is one row per group.
+          assert {:error, %{status: 400}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT symbol, price FROM contract_rules GROUP BY symbol",
+                     database: ctx.database
+                   )
+
+          assert {:ok, [%{"symbol" => "X"}]} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT symbol FROM contract_rules GROUP BY symbol",
                      database: ctx.database
                    )
         end

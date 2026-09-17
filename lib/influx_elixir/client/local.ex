@@ -108,7 +108,12 @@ defmodule InfluxElixir.Client.Local do
       forgotten pair of quotes produces in production. With no rows the
       schema is unknown and nothing is checked. `col = NULL` (a `nil`
       param) is never true.
-    * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)`
+    * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)` — each
+      item a literal, a column or an expression, as in SQL (a bare word is
+      a column reference, never a string)
+    * A constant with an alias in any select list (`0.0 AS volume`,
+      `'x' AS label`); an unaliased constant is refused because DataFusion
+      names it after its own rendering
     * `WHERE col IS NULL` and `WHERE col IS NOT NULL`
     * `WHERE col [NOT] BETWEEN low AND high` (inclusive; `time` too)
     * `WHERE col [NOT] LIKE 'pattern'` and `ILIKE` (`%` any run, `_` one

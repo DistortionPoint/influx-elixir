@@ -39,6 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` read a bare word inside `IN (...)` as a string.**
+  `host IN (a, b)` compared against `"a"` and `"b"`; on the engine the
+  items are column references (`v IN (1, other)` works, `host IN (a, b)`
+  is a schema error). Items are now parsed like every other comparand.
+- **`Client.Local` refused a constant in a select list.** `0.0 AS volume`
+  (the #17 candle query's placeholder volume) was "unsupported column
+  expression" in an aggregate and a schema error in a projection; the
+  engine returns the constant on every row. Supported with an alias in
+  every query shape; an unaliased constant is refused with the reason.
 - **`DELETE ... WHERE a OR b` crashed `Client.Local`** (`:v3_enterprise`)
   with a `FunctionClauseError`: the delete path still folded predicates
   with the helper from before `WHERE` became a boolean expression. It now
