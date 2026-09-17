@@ -41,7 +41,7 @@ defmodule InfluxElixirTest do
   describe "write/3" do
     test "delegates to configured client", %{conn: conn} do
       assert {:ok, :written} =
-               InfluxElixir.write(conn, "cpu value=1.0", database: "test_db")
+               InfluxElixir.write(conn, "cpu value=2i", database: "test_db")
     end
   end
 
@@ -191,7 +191,7 @@ defmodule InfluxElixirTest do
     end
 
     test "write/3 emits a write span with database, bytes and point count", %{conn: conn} do
-      lp = "cpu value=1.0\ncpu value=2.0"
+      lp = "cpu value=1i\ncpu value=2i"
       assert {:ok, :written} = InfluxElixir.write(conn, lp, database: "test_db")
 
       assert_receive {:telemetry, [:influx_elixir, :write, :stop], %{duration: duration},

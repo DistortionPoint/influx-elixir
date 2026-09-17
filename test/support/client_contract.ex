@@ -63,6 +63,7 @@ defmodule InfluxElixir.ClientContract do
     median_join_tests = if v3_sql, do: median_join_tests(client), else: nil
     cast_tests = if v3_sql, do: cast_tests(client), else: nil
     schema_rule_tests = if v3_sql, do: schema_rule_tests(client), else: nil
+    write_rule_tests = if v3_sql, do: write_rule_tests(client), else: nil
     ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
     distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
     param_tests = if v3_sql, do: param_tests(client), else: nil
@@ -102,6 +103,7 @@ defmodule InfluxElixir.ClientContract do
         median_join_tests,
         cast_tests,
         schema_rule_tests,
+        write_rule_tests,
         ordered_agg_tests,
         distinct_tests,
         param_tests,
@@ -1754,6 +1756,81 @@ defmodule InfluxElixir.ClientContract do
                      "SELECT symbol FROM contract_rules GROUP BY symbol",
                      database: ctx.database
                    )
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Write rules: partial writes, column schema, reserved time, int64 range
+  # ---------------------------------------------------------------------------
+
+  defp write_rule_tests(client) do
+    quote do
+      describe "write/3 — schema and partial-write contract" do
+        test "a type conflict is a 400 partial write that keeps the other lines", ctx do
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, "contract_wr v=1i 1700000000000000000",
+              database: ctx.database
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          lp = "contract_wr v=2.0 1700000000000000001\ncontract_wr v=3i 1700000000000000002"
+
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).write(ctx.conn, lp, database: ctx.database)
+
+          assert %{"error" => "partial write of line protocol occurred", "data" => [entry]} =
+                   Jason.decode!(body)
+
+          assert entry["line_number"] == 1
+
+          assert entry["error_message"] ==
+                   "invalid column type for column 'v', expected iox::column_type::field::integer, " <>
+                     "got iox::column_type::field::float"
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, rows} =
+            unquote(client).query_sql(ctx.conn, "SELECT v FROM contract_wr ORDER BY time",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, & &1["v"]) == [1, 3]
+        end
+
+        test "reserved time, tag-and-field key, int64 overflow and an empty payload are 400",
+             ctx do
+          for lp <- [
+                "contract_wr2,time=x v=1i",
+                "contract_wr2 time=5i,v=1i",
+                "contract_wr2,host=a host=1i",
+                "contract_wr2 v=9223372036854775808i",
+                ""
+              ] do
+            assert {:error, %{status: 400}} =
+                     unquote(client).write(ctx.conn, lp, database: ctx.database),
+                   lp
+          end
+        end
+
+        test "a newline inside a quoted string value is part of the value", ctx do
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, ~s|contract_nl s="a\nb" 1700000000000000000|,
+              database: ctx.database
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, [row]} =
+            unquote(client).query_sql(ctx.conn, "SELECT s FROM contract_nl",
+              database: ctx.database
+            )
+
+          assert row["s"] == "a\nb"
         end
       end
     end

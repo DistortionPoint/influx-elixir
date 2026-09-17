@@ -21,6 +21,12 @@ defmodule InfluxElixir.Client.LocalTest do
     Enum.map(rows, & &1["level"])
   end
 
+  # {line_number, error_message} pairs from a partial-write response body.
+  defp partial_errors(body) do
+    %{"error" => "partial write of line protocol occurred", "data" => data} = Jason.decode!(body)
+    Enum.map(data, &{&1["line_number"], &1["error_message"]})
+  end
+
   # ---------------------------------------------------------------------------
   # Lifecycle
   # ---------------------------------------------------------------------------
@@ -4742,6 +4748,150 @@ defmodule InfluxElixir.Client.LocalTest do
                 body: "Client.Local: unsupported column (a constant needs AS alias)" <> _rest
               }} =
                Local.query_sql(conn, ~s|SELECT 1 FROM "p"|, database: db)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Write rules verified against InfluxDB 3 Core: partial writes, the column
+  # schema fixed by first write, reserved `time`, int64 range, newlines in
+  # quoted values (docs/design/2026-09-17_local-write-schema-and-partial-writes.md).
+  # ---------------------------------------------------------------------------
+
+  describe "write/3 — schema and partial-write rules" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "wr_db")
+      {:ok, db: "wr_db"}
+    end
+
+    test "a field's type is fixed by the first write; a later conflict is rejected with the engine's message",
+         %{conn: conn, db: db} do
+      {:ok, :written} = Local.write(conn, "c v=1i 1700000000000000000", database: db)
+
+      assert {:error, %{status: 400, body: body}} =
+               Local.write(conn, "c v=2.0 1700000000000000001", database: db)
+
+      assert partial_errors(body) == [
+               {1,
+                "invalid column type for column 'v', expected iox::column_type::field::integer, " <>
+                  "got iox::column_type::field::float"}
+             ]
+
+      # tag then field, field then tag, string then float, boolean then integer
+      for {first, second, expected, got} <- [
+            {"t,host=a v=1i", ~s|t host="b",v=2i|, "iox::column_type::tag",
+             "iox::column_type::field::string"},
+            {~s|f host="a",v=1i|, "f,host=b v=2i", "iox::column_type::field::string",
+             "iox::column_type::tag"},
+            {~s|s s="x"|, "s s=1.0", "iox::column_type::field::string",
+             "iox::column_type::field::float"},
+            {"b b=true", "b b=1i", "iox::column_type::field::boolean",
+             "iox::column_type::field::integer"}
+          ] do
+        {:ok, :written} = Local.write(conn, first, database: db)
+        assert {:error, %{status: 400, body: body}} = Local.write(conn, second, database: db)
+        [{1, message}] = partial_errors(body)
+        assert message =~ "expected #{expected}, got #{got}", second
+      end
+
+      # A new column, and the same measurement in another database, are fine.
+      {:ok, :written} = Local.write(conn, "c w=1.0 1700000000000000002", database: db)
+      :ok = Local.create_database(conn, "wr_other")
+      {:ok, :written} = Local.write(conn, "c v=2.0 1700000000000000000", database: "wr_other")
+    end
+
+    test "a bad line is dropped and reported; the other lines are stored", %{conn: conn, db: db} do
+      lp = "p v=1i 1700000000000000000\np v=2.0 1700000000000000001\np v=3i 1700000000000000002"
+      assert {:error, %{status: 400, body: body}} = Local.write(conn, lp, database: db)
+
+      assert [{2, "invalid column type for column 'v'" <> _rest}] = partial_errors(body)
+
+      assert {:ok, [%{"v" => 1}, %{"v" => 3}]} =
+               Local.query_sql(conn, ~s|SELECT v FROM "p" ORDER BY time|, database: db)
+
+      # A syntax error is reported the same way, with every bad line listed.
+      lp =
+        "q v=1i 1700000000000000000\nq v=\nq v=2.0 1700000000000000002\nq v=3i 1700000000000000003"
+
+      assert {:error, %{status: 400, body: body}} = Local.write(conn, lp, database: db)
+
+      assert [{2, "No fields were provided"}, {3, "invalid column type" <> _rest}] =
+               partial_errors(body)
+
+      assert {:ok, [%{"v" => 1}, %{"v" => 3}]} =
+               Local.query_sql(conn, ~s|SELECT v FROM "q" ORDER BY time|, database: db)
+    end
+
+    test "the original line in a report is truncated to 20 characters, as the engine does",
+         %{conn: conn, db: db} do
+      assert {:error, %{status: 400, body: body}} =
+               Local.write(conn, "r,host=a,rack=1 v=abc 1700000000000000000", database: db)
+
+      %{"data" => [%{"original_line" => original}]} = Jason.decode!(body)
+      assert original == "r,host=a,rack=1 v=ab"
+    end
+
+    test "time is a reserved column; a key cannot be both tag and field; an integer must fit int64",
+         %{conn: conn, db: db} do
+      for {lp, message} <- [
+            {"m,time=x v=1i", "'time' is a reserved column"},
+            {"m time=5i,v=1i",
+             "invalid column type for column 'time', expected iox::column_type::timestamp, got iox::column_type::field::integer"},
+            {"m,host=a host=1i",
+             "invalid column type for column 'host', expected iox::column_type::tag, got iox::column_type::field::integer"},
+            {"m v=9223372036854775808i", "Unable to parse integer value `9223372036854775808`"},
+            {"m,host= v=1i", "Expected tag value, got `host=`"},
+            {"m,=a v=1i", "Expected tag key, got `=a`"},
+            {"m =1i", "No fields were provided"}
+          ] do
+        assert {:error, %{status: 400, body: body}} = Local.write(conn, lp, database: db)
+        assert [{1, ^message}] = partial_errors(body), lp
+      end
+    end
+
+    test "int64 extremes, unsigned integers and a newline inside a quoted value are accepted",
+         %{conn: conn, db: db} do
+      {:ok, :written} =
+        Local.write(
+          conn,
+          "n big=9223372036854775807i,small=-9223372036854775808i,u=18446744073709551615u 1700000000000000000",
+          database: db
+        )
+
+      assert {:ok,
+              [
+                %{
+                  "big" => 9_223_372_036_854_775_807,
+                  "small" => -9_223_372_036_854_775_808,
+                  "u" => 18_446_744_073_709_551_615
+                }
+              ]} =
+               Local.query_sql(conn, ~s|SELECT big, small, u FROM "n"|, database: db)
+
+      {:ok, :written} = Local.write(conn, ~s|nl s="a\nb" 1700000000000000000|, database: db)
+
+      assert {:ok, [%{"s" => "a\nb"}]} =
+               Local.query_sql(conn, ~s|SELECT s FROM "nl"|, database: db)
+    end
+
+    test "an empty payload is rejected", %{conn: conn, db: db} do
+      assert {:error, %{status: 400, body: "incoming write was empty"}} =
+               Local.write(conn, "", database: db)
+
+      assert {:error, %{status: 400, body: "incoming write was empty"}} =
+               Local.write(conn, "# c\n\n", database: db)
+    end
+
+    test "deleting a database drops its points and its schema", %{conn: conn, db: db} do
+      {:ok, :written} = Local.write(conn, "d v=1i 1700000000000000000", database: db)
+      :ok = Local.delete_database(conn, db)
+      :ok = Local.create_database(conn, db)
+
+      assert {:error,
+              %{status: 400, body: "Error during planning: table 'public.iox.d' not found"}} =
+               Local.query_sql(conn, ~s|SELECT v FROM "d"|, database: db)
+
+      # The old integer schema is gone: a float is the first writer now.
+      assert {:ok, :written} = Local.write(conn, "d v=2.0 1700000000000000000", database: db)
     end
   end
 end

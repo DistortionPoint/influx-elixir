@@ -4,8 +4,13 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
 
   Turns a line-protocol payload into point maps, honouring the escaping rules
   of the format (escaped spaces, commas, equals signs, backslashes and quotes)
-  and the write precision. Errors have the same `%{status: 400, body: ...}`
-  shape a real InfluxDB write endpoint returns.
+  and the write precision. Each line is parsed on its own so a caller can
+  store the good lines and report the bad ones, which is what InfluxDB 3
+  does ("partial write of line protocol occurred").
+
+  Per-line rules verified against InfluxDB 3 Core: an integer must fit in
+  64 bits (`u` marks an unsigned one), `time` is a reserved column, and a
+  key cannot be both a tag and a field on one line.
   """
 
   @typedoc "A parsed point: fields and tags as string-keyed maps, timestamp in ns."
@@ -16,66 +21,149 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
           timestamp: integer() | nil
         }
 
+  @typedoc """
+  One rejected line, in the shape InfluxDB 3's partial-write response lists
+  (the original line is truncated to 20 characters, as the engine does).
+  """
+  @type line_error :: %{
+          error_message: binary(),
+          line_number: pos_integer(),
+          original_line: binary()
+        }
+
+  @typedoc "A line's outcome: the point with its line number and text, or the error."
+  @type line_result :: {:ok, point(), pos_integer(), binary()} | {:error, line_error()}
+
+  @int64_max 9_223_372_036_854_775_807
+  @int64_min -9_223_372_036_854_775_808
+  @uint64_max 18_446_744_073_709_551_615
+
   @doc """
-  Parses a line-protocol payload into points.
+  Parses a line-protocol payload line by line.
 
   Blank lines and `#` comments are skipped. `precision` is one of
   `:nanosecond | :microsecond | :millisecond | :second` and scales numeric
   timestamps to nanoseconds. A point without a timestamp keeps `nil`; the
-  caller assigns the server time.
-  """
-  @spec parse(binary(), atom()) ::
-          {:ok, [point()]} | {:error, map()}
-  def parse(text, precision) do
-    lines =
-      text
-      |> String.split("\n")
-      |> Enum.reject(&(String.trim(&1) == "" or String.starts_with?(&1, "#")))
+  caller assigns the server time. A newline inside a quoted string field
+  value is part of the value, as the engine reads it.
 
-    lines
-    |> Enum.reduce_while({:ok, []}, fn line, {:ok, acc} ->
-      case parse_line(line, precision) do
-        {:ok, point} -> {:cont, {:ok, [point | acc]}}
-        {:error, _reason} = err -> {:halt, err}
-      end
-    end)
-    |> case do
-      {:ok, pts} -> {:ok, Enum.reverse(pts)}
-      {:error, _reason} = err -> err
+  Returns `{:error, ...}` only for a payload with no lines at all ("incoming
+  write was empty" on the engine); every other problem is a per-line
+  `{:error, line_error}` in the list, numbered as the engine numbers it.
+  """
+  @spec parse_lines(binary(), atom()) :: {:ok, [line_result()]} | {:error, map()}
+  def parse_lines(text, precision) do
+    results =
+      text
+      |> split_lines()
+      |> Enum.with_index(1)
+      |> Enum.reject(fn {line, _n} ->
+        String.trim(line) == "" or String.starts_with?(line, "#")
+      end)
+      |> Enum.map(fn {line, n} -> parse_line(line, n, precision) end)
+
+    case results do
+      [] -> {:error, %{status: 400, body: "incoming write was empty"}}
+      results -> {:ok, results}
     end
   end
+
+  # Splits the payload at newlines that are not inside a quoted string
+  # field value.
+  @spec split_lines(binary()) :: [binary()]
+  defp split_lines(text), do: do_split_lines(text, <<>>, [], false)
+
+  defp do_split_lines(<<>>, current, acc, _in_quotes), do: Enum.reverse([current | acc])
+
+  defp do_split_lines(<<"\\\\", rest::binary>>, current, acc, in_quotes),
+    do: do_split_lines(rest, <<current::binary, "\\\\">>, acc, in_quotes)
+
+  defp do_split_lines(<<"\\\"", rest::binary>>, current, acc, in_quotes),
+    do: do_split_lines(rest, <<current::binary, "\\\"">>, acc, in_quotes)
+
+  defp do_split_lines(<<"\"", rest::binary>>, current, acc, in_quotes),
+    do: do_split_lines(rest, <<current::binary, "\"">>, acc, !in_quotes)
+
+  defp do_split_lines(<<"\n", rest::binary>>, current, acc, false),
+    do: do_split_lines(rest, <<>>, [current | acc], false)
+
+  defp do_split_lines(<<c, rest::binary>>, current, acc, in_quotes),
+    do: do_split_lines(rest, <<current::binary, c>>, acc, in_quotes)
 
   # Parses a single line protocol line into a point map.
   #
   # Format: measurement[,tag=val...] field=val[,...] [timestamp]
-  @spec parse_line(binary(), atom()) :: {:ok, point()} | {:error, map()}
-  defp parse_line(line, precision) do
-    case split_line_parts(line) do
-      [key_part, fields_part | rest] ->
-        ts_raw = List.first(rest)
+  @spec parse_line(binary(), pos_integer(), atom()) :: line_result()
+  defp parse_line(line, number, precision) do
+    result =
+      case split_line_parts(line) do
+        [key_part, fields_part | rest] ->
+          ts_raw = List.first(rest)
 
-        with {:ok, {measurement, tags}} <- parse_key_part(key_part),
-             {:ok, fields} <- parse_fields_part(fields_part),
-             {:ok, timestamp} <- parse_timestamp(ts_raw, precision) do
-          {:ok,
-           %{
-             measurement: measurement,
-             tags: tags,
-             fields: fields,
-             timestamp: timestamp
-           }}
-        end
+          with {:ok, {measurement, tags}} <- parse_key_part(key_part),
+               {:ok, fields} <- parse_fields_part(fields_part),
+               :ok <- check_columns(tags, fields),
+               {:ok, timestamp} <- parse_timestamp(ts_raw, precision) do
+            {:ok, %{measurement: measurement, tags: tags, fields: fields, timestamp: timestamp}}
+          end
 
-      _parts ->
-        {:error, %{status: 400, body: "invalid line protocol: #{line}"}}
+        _parts ->
+          {:error, "Expected at least one space character, got end of input"}
+      end
+
+    case result do
+      {:ok, point} -> {:ok, point, number, line}
+      {:error, message} -> {:error, line_error(message, number, line)}
     end
   end
 
+  @doc "Builds a `t:line_error/0` the way the engine reports one."
+  @spec line_error(binary(), pos_integer(), binary()) :: line_error()
+  def line_error(message, number, line) do
+    %{error_message: message, line_number: number, original_line: String.slice(line, 0, 20)}
+  end
+
+  # `time` is the timestamp column and a key is one column, so a key used as
+  # both a tag and a field cannot be typed.
+  @spec check_columns(map(), map()) :: :ok | {:error, binary()}
+  defp check_columns(tags, fields) do
+    cond do
+      Map.has_key?(tags, "time") ->
+        {:error, "'time' is a reserved column"}
+
+      Map.has_key?(fields, "time") ->
+        {:error,
+         "invalid column type for column 'time', expected iox::column_type::timestamp, got " <>
+           column_type(:field, Map.fetch!(fields, "time"))}
+
+      true ->
+        case Enum.find(Map.keys(fields), &Map.has_key?(tags, &1)) do
+          nil ->
+            :ok
+
+          key ->
+            {:error,
+             "invalid column type for column '#{key}', expected iox::column_type::tag, got " <>
+               column_type(:field, Map.fetch!(fields, key))}
+        end
+    end
+  end
+
+  @doc """
+  The engine's name for a column kind: `iox::column_type::tag` or
+  `iox::column_type::field::<integer | uinteger | float | string | boolean>`.
+  """
+  @spec column_type(:tag | :field, term()) :: binary()
+  def column_type(:tag, _value), do: "iox::column_type::tag"
+  def column_type(:field, {:uint, _n}), do: "iox::column_type::field::uinteger"
+  def column_type(:field, value) when is_integer(value), do: "iox::column_type::field::integer"
+  def column_type(:field, value) when is_float(value), do: "iox::column_type::field::float"
+  def column_type(:field, value) when is_binary(value), do: "iox::column_type::field::string"
+  def column_type(:field, value) when is_boolean(value), do: "iox::column_type::field::boolean"
+
   # The splitters below accumulate the current token in a binary. Appending
   # to a binary the process owns is optimised by the runtime (no copy), so
-  # this is one pass with one allocation per token — the previous
-  # one-byte-per-list-cell accumulation plus reverse/join was several
-  # allocations per byte on every write.
+  # this is one pass with one allocation per token.
 
   # Splits a line into [key_part, fields_part, optional_timestamp] by
   # unescaped spaces that are not inside double-quoted strings.
@@ -118,7 +206,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   end
 
   # Parses the "measurement[,tag=val...]" part.
-  @spec parse_key_part(binary()) :: {:ok, {binary(), map()}} | {:error, map()}
+  @spec parse_key_part(binary()) :: {:ok, {binary(), map()}} | {:error, binary()}
   defp parse_key_part(key_part) do
     case split_first_unescaped_comma(key_part) do
       {measurement_raw, ""} ->
@@ -150,23 +238,21 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   end
 
   # Parses "tag1=v1,tag2=v2,..." into a map.
-  @spec parse_tags(binary()) :: {:ok, map()} | {:error, map()}
+  @spec parse_tags(binary()) :: {:ok, map()} | {:error, binary()}
   defp parse_tags(tags_str) do
     pairs = split_unescaped_comma(tags_str)
 
     Enum.reduce_while(pairs, {:ok, %{}}, fn pair, {:ok, acc} ->
       case split_first_unescaped_equals(pair) do
-        {k, v} when k != "" and v != "" ->
-          {:cont, {:ok, Map.put(acc, unescape_tag(k), unescape_tag(v))}}
-
-        _invalid ->
-          {:halt, {:error, %{status: 400, body: "invalid tag pair: #{pair}"}}}
+        {"", _v} -> {:halt, {:error, "Expected tag key, got `#{pair}`"}}
+        {_k, ""} -> {:halt, {:error, "Expected tag value, got `#{pair}`"}}
+        {k, v} -> {:cont, {:ok, Map.put(acc, unescape_tag(k), unescape_tag(v))}}
       end
     end)
   end
 
   # Parses the "field=val[,...]" section.
-  @spec parse_fields_part(binary()) :: {:ok, map()} | {:error, map()}
+  @spec parse_fields_part(binary()) :: {:ok, map()} | {:error, binary()}
   defp parse_fields_part(fields_str) do
     pairs = split_unescaped_comma(fields_str)
 
@@ -179,7 +265,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
           end
 
         _invalid ->
-          {:halt, {:error, %{status: 400, body: "invalid field pair: #{pair}"}}}
+          {:halt, {:error, "No fields were provided"}}
       end
     end)
   end
@@ -230,15 +316,18 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
     do_split_eq(rest, <<acc::binary, c>>)
   end
 
-  # Parses a field value string into its typed Elixir equivalent.
-  @spec parse_field_value(binary()) :: {:ok, term()} | {:error, map()}
+  # Parses a field value string into its typed Elixir equivalent. An
+  # unsigned integer (`7u`) is stored as the integer; its kind is remembered
+  # for the schema check only.
+  @spec parse_field_value(binary()) :: {:ok, term()} | {:error, binary()}
   defp parse_field_value(str) do
     cond do
       String.ends_with?(str, "i") ->
-        case Integer.parse(String.slice(str, 0..-2//1)) do
-          {n, ""} -> {:ok, n}
-          _err -> {:error, %{status: 400, body: "invalid integer field: #{str}"}}
-        end
+        parse_integer(String.slice(str, 0..-2//1), @int64_min, @int64_max)
+
+      String.ends_with?(str, "u") ->
+        with {:ok, n} <- parse_integer(String.slice(str, 0..-2//1), 0, @uint64_max),
+             do: {:ok, {:uint, n}}
 
       String.starts_with?(str, "\"") and String.ends_with?(str, "\"") ->
         inner =
@@ -249,30 +338,37 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
 
         {:ok, inner}
 
-      str in ["true", "True", "TRUE"] ->
+      str in ["true", "True", "TRUE", "t", "T"] ->
         {:ok, true}
 
-      str in ["false", "False", "FALSE"] ->
+      str in ["false", "False", "FALSE", "f", "F"] ->
         {:ok, false}
 
       true ->
         case Float.parse(str) do
           {f, ""} -> {:ok, f}
-          _err -> {:error, %{status: 400, body: "invalid field value: #{str}"}}
+          _err -> {:error, "Unable to parse field value `#{str}`"}
         end
     end
   end
 
+  @spec parse_integer(binary(), integer(), integer()) :: {:ok, integer()} | {:error, binary()}
+  defp parse_integer(digits, min, max) do
+    case Integer.parse(digits) do
+      {n, ""} when n >= min and n <= max -> {:ok, n}
+      _out_of_range -> {:error, "Unable to parse integer value `#{digits}`"}
+    end
+  end
+
   # Parses a raw timestamp string, normalising to nanoseconds.
-  @spec parse_timestamp(binary() | nil, atom()) ::
-          {:ok, integer() | nil} | {:error, map()}
+  @spec parse_timestamp(binary() | nil, atom()) :: {:ok, integer() | nil} | {:error, binary()}
   defp parse_timestamp(nil, _prec), do: {:ok, nil}
   defp parse_timestamp("", _prec), do: {:ok, nil}
 
   defp parse_timestamp(ts_str, precision) do
     case Integer.parse(ts_str) do
       {ts, ""} -> {:ok, to_nanoseconds(ts, precision)}
-      _err -> {:error, %{status: 400, body: "invalid timestamp: #{ts_str}"}}
+      _err -> {:error, "Unable to parse timestamp value `#{ts_str}`"}
     end
   end
 

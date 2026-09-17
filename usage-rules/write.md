@@ -17,3 +17,8 @@
 - Use `InfluxElixir.write/2,3` for immediate single-request writes; pass `database:` in opts or set it on the connection
 - Every write emits `[:influx_elixir, :write, :start | :stop | :exception]` telemetry
 - Prefer the batch writer for high-throughput scenarios
+
+## Schema
+- A column's kind (tag, or integer / unsigned / float / string / boolean field) is fixed by the first write that names it, per database and measurement; a later write with another kind is rejected line by line ("invalid column type for column 'v', expected …, got …") on the server and on `Client.Local` alike — keep field types consistent in fixtures
+- A rejected line does not fail the batch: the other lines are stored and the call returns `{:error, %{status: 400, body: json}}` with `"partial write of line protocol occurred"` and one `data` entry per bad line — treat a write error as "some lines were dropped", not "nothing was written"
+- `time` is a reserved column, a key cannot be both a tag and a field, integers must fit in 64 bits (`u` for unsigned), an empty payload is a 400

@@ -737,6 +737,41 @@ server, and reads `INFLUX_V3_CORE_HOST` / `INFLUX_V3_CORE_PORT` (defaults
 `INFLUX_V2_TOKEN`, `INFLUX_V2_ORG` and `INFLUX_V2_BUCKET`. Every statement
 in this guide about what the real engine returns was recorded that way.
 
+## Write Rules
+
+A write is applied line by line, as on InfluxDB 3. A line with a syntax error,
+or a column whose kind conflicts with the measurement's schema, is dropped and
+reported while the other lines are stored; the call then returns the engine's
+partial-write response:
+
+```elixir
+{:ok, :written} = Local.write(conn, "cpu value=1i", database: "test_db")
+
+{:error, %{status: 400, body: body}} =
+  Local.write(conn, "cpu value=2.0\ncpu value=3i", database: "test_db")
+
+%{
+  "error" => "partial write of line protocol occurred",
+  "data" => [
+    %{
+      "line_number" => 1,
+      "original_line" => "cpu value=2.0",
+      "error_message" =>
+        "invalid column type for column 'value', expected iox::column_type::field::integer, got iox::column_type::field::float"
+    }
+  ]
+} = Jason.decode!(body)
+# `cpu value=3i` was stored.
+```
+
+A column's kind — tag, or integer / unsigned / float / string / boolean field —
+is fixed by the first write that names it, per database and measurement, and
+a fixture that writes `value=1i` and later `value=2.0` fails in the double the
+way it fails in production. Deleting the database drops the schema with the
+data. `time` is a reserved column, a key cannot be both a tag and a field on
+one line, an integer must fit in 64 bits (`7u` is unsigned), a newline inside
+a quoted string value is part of the value, and an empty payload is rejected.
+
 ## Key Differences from Real InfluxDB
 
 - **No WAL flush delay**: Writes are immediately queryable (set `query_delay: 0`)

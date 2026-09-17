@@ -60,6 +60,31 @@ defmodule InfluxElixir.Client.Local do
     * `{:token, id}` => `map()` — the token map
     * `{:point, database, measurement, seq}` => `point_map()` — `seq` is a
       monotonic integer, so points scan in insertion order
+    * `{:column, database, measurement, column}` => the column's kind
+      (`iox::column_type::tag` or `iox::column_type::field::<type>`), fixed
+      by the first write that names the column
+
+  ## Write Rules
+
+  What a write accepts is what InfluxDB 3 accepts, verified against the
+  engine:
+
+    * A payload is applied line by line. A line with a syntax error, or a
+      column whose kind conflicts with the measurement's schema, is dropped
+      and reported; the other lines are stored. The result is then
+      `{:error, %{status: 400, body: json}}` with the engine's body —
+      `"partial write of line protocol occurred"` and one `data` entry per
+      bad line (`error_message`, `line_number`, `original_line`).
+    * A column's kind is fixed by the first write that names it, per
+      database and measurement: a tag stays a tag, an integer field stays
+      an integer (`v=1i` then `v=2.0` is "invalid column type for column
+      'v', expected iox::column_type::field::integer, got
+      iox::column_type::field::float"). Deleting the database drops the
+      schema with the data.
+    * `time` is a reserved column; a key cannot be both a tag and a field on
+      one line; an integer must fit in 64 bits (`7u` is unsigned); a newline
+      inside a quoted string value is part of the value; an empty payload is
+      "incoming write was empty".
 
   ## SQL Query Support
 
@@ -449,10 +474,91 @@ defmodule InfluxElixir.Client.Local do
     with :ok <- require_capability(conn, :write),
          {:ok, text} <- maybe_decompress(payload),
          :ok <- ensure_database(table, database, profile),
-         {:ok, points} <- LineProtocolParser.parse(text, precision) do
-      Enum.each(points, &store_point(table, database, &1))
-      {:ok, :written}
+         {:ok, lines} <- LineProtocolParser.parse_lines(text, precision) do
+      store_lines(table, database, lines)
     end
+  end
+
+  # Every accepted line is stored and every rejected one reported, as the
+  # engine does ("partial write of line protocol occurred", HTTP 400, one
+  # entry per bad line): a syntax error or a column whose kind conflicts
+  # with the measurement's schema drops that line only. The response body
+  # is the engine's JSON so consumer code that reads it can be exercised.
+  @spec store_lines(:ets.table(), binary(), [LineProtocolParser.line_result()]) ::
+          InfluxElixir.Client.write_result()
+  defp store_lines(table, database, lines) do
+    errors =
+      Enum.reduce(lines, [], fn
+        {:error, line_error}, errors ->
+          [line_error | errors]
+
+        {:ok, point, number, line}, errors ->
+          case check_schema(table, database, point) do
+            :ok ->
+              store_point(table, database, strip_uint_markers(point))
+              errors
+
+            {:error, message} ->
+              [LineProtocolParser.line_error(message, number, line) | errors]
+          end
+      end)
+
+    case errors do
+      [] ->
+        {:ok, :written}
+
+      errors ->
+        {:error,
+         %{
+           status: 400,
+           body:
+             Jason.encode!(%{
+               "error" => "partial write of line protocol occurred",
+               "data" => Enum.reverse(errors)
+             })
+         }}
+    end
+  end
+
+  # The measurement's schema, one ETS object per column so the first writer
+  # of a column fixes its kind atomically (`insert_new`) and a concurrent
+  # writer never loses a column. A later line whose kind differs is
+  # rejected with the engine's message.
+  @spec check_schema(:ets.table(), binary(), point_map()) :: :ok | {:error, binary()}
+  defp check_schema(table, database, point) do
+    columns =
+      Enum.map(point.tags, fn {k, _v} -> {k, :tag, nil} end) ++
+        Enum.map(point.fields, fn {k, v} -> {k, :field, v} end)
+
+    Enum.find_value(columns, :ok, fn {column, kind, value} ->
+      type = LineProtocolParser.column_type(kind, value)
+      key = {:column, database, point.measurement, column}
+
+      if :ets.insert_new(table, {key, type}) do
+        nil
+      else
+        [{^key, existing}] = :ets.lookup(table, key)
+
+        if existing == type,
+          do: nil,
+          else:
+            {:error,
+             "invalid column type for column '#{column}', expected #{existing}, got #{type}"}
+      end
+    end)
+  end
+
+  # An unsigned integer is stored as the integer; the marker only served
+  # the schema check.
+  @spec strip_uint_markers(point_map()) :: point_map()
+  defp strip_uint_markers(point) do
+    fields =
+      Map.new(point.fields, fn
+        {k, {:uint, n}} -> {k, n}
+        {k, v} -> {k, v}
+      end)
+
+    %{point | fields: fields}
   end
 
   # ---------------------------------------------------------------------------
@@ -801,6 +907,10 @@ defmodule InfluxElixir.Client.Local do
   def delete_database(%{table: table} = conn, name) do
     with :ok <- require_capability(conn, :delete_database) do
       if :ets.member(table, {:database, name}) do
+        # Dropping a database drops its tables: the points and the column
+        # schema go with it, so a re-created database starts empty.
+        :ets.match_delete(table, {{:point, name, :_, :_}, :_})
+        :ets.match_delete(table, {{:column, name, :_, :_}, :_})
         :ets.delete(table, {:database, name})
         :ok
       else

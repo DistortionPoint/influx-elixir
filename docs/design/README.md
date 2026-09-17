@@ -37,6 +37,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-16 | [`parser-single-select-split`](2026-09-16_parser-single-select-split.md) | One `split_select/1` replaces eight table-after-FROM regexes |
 | 2026-09-17 | [`local-sql-executor-extraction`](2026-09-17_local-sql-executor-extraction.md) | SQL execution split into `SQLExecutor`; `DELETE` with `OR` crash fixed |
 | 2026-09-17 | [`local-in-lists-and-constants`](2026-09-17_local-in-lists-and-constants.md) | `IN`-list items as comparands; constants in select lists |
+| 2026-09-17 | [`local-write-schema-and-partial-writes`](2026-09-17_local-write-schema-and-partial-writes.md) | Column schema fixed by first write, partial writes, reserved `time`, int64 range, `delete_database` drops data |
 
 ## Verifying against a real engine
 

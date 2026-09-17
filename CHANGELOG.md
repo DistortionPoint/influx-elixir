@@ -39,6 +39,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` accepted writes InfluxDB 3 rejects, and rejected one it
+  accepts.** Verified against the engine: a field written as an integer and
+  later as a float (or tag then field, string then float, boolean then
+  integer) is refused line by line with "invalid column type for column
+  'v', expected iox::column_type::field::integer, got
+  iox::column_type::field::float"; `time` as a tag or field, a key used as
+  both tag and field on one line, an integer outside int64 and an empty
+  payload are refused; a rejected line drops only itself — the other lines
+  are stored and the response is the partial-write JSON with one entry per
+  bad line. The double accepted all of those (and stored every line), and
+  refused a newline inside a quoted string value, which the engine keeps.
+  It now keeps a per-measurement column schema (`{:column, database,
+  measurement, column}`, fixed atomically by the first writer), applies a
+  payload line by line, returns the engine's body, and drops the schema
+  with the data when the database is deleted. Unsigned integers (`7u`) are
+  accepted.
+- **`Client.Local.delete_database/2` kept the deleted database's points**,
+  so a re-created database was not empty. The points and schema go with it.
 - **`Client.Local` read a bare word inside `IN (...)` as a string.**
   `host IN (a, b)` compared against `"a"` and `"b"`; on the engine the
   items are column references (`v IN (1, other)` works, `host IN (a, b)`
