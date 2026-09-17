@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **SQL execution split out of `Client.Local`.** The 900-line executor —
+  CTEs, joins, the `WHERE` evaluator, aggregates, casts, ordering, schema
+  checks — is `InfluxElixir.Client.Local.SQLExecutor`, pure over the points
+  it is handed through a fetch function; `Client.Local` keeps storage,
+  profiles and the InfluxQL and Flux paths. Public behaviour is unchanged.
 - `Client.Local` checks a query's column references against the first
   row before scanning every row's columns; the scan now runs only when a
   name is missing there, which is also when the error message needs the
@@ -34,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`DELETE ... WHERE a OR b` crashed `Client.Local`** (`:v3_enterprise`)
+  with a `FunctionClauseError`: the delete path still folded predicates
+  with the helper from before `WHERE` became a boolean expression. It now
+  evaluates the same expression tree `SELECT` does.
 - **`CAST(col AS INTEGER)` in `WHERE` was rejected by 0.1.24 (#20) — and
   silently matched nothing in 0.1.23.** The report is right that 0.1.24
   refuses the orderbook depth query with `Client.Local: unsupported WHERE

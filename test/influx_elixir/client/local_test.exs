@@ -2865,6 +2865,28 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, %{"rows_affected" => 0}} =
                Local.execute_sql(conn, "DELETE FROM nonexistent", database: db)
     end
+
+    test "DELETE honours OR, NOT and parentheses in its WHERE", %{conn: conn, db: db} do
+      # The delete path folded predicates with the pre-boolean-expression
+      # helper and crashed on an {:or, _} node.
+      {:ok, :written} =
+        Local.write(conn, "m,host=a v=1i\nm,host=b v=2i\nm,host=c v=3i\nm,host=d v=4i",
+          database: db
+        )
+
+      assert {:ok, %{"rows_affected" => 2}} =
+               Local.execute_sql(conn, "DELETE FROM m WHERE host = 'a' OR host = 'b'",
+                 database: db
+               )
+
+      assert {:ok, %{"rows_affected" => 1}} =
+               Local.execute_sql(conn, "DELETE FROM m WHERE NOT (host = 'c' OR v > 9)",
+                 database: db
+               )
+
+      assert {:ok, [%{"host" => "c"}]} =
+               Local.query_sql(conn, "SELECT host FROM m", database: db)
+    end
   end
 
   # ---------------------------------------------------------------------------
