@@ -39,6 +39,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local`'s `:v2` profile applied InfluxDB 3's write rules.**
+  Verified against InfluxDB 2.7, which differs on nearly every point: a
+  field type conflict is HTTP 422 (`"unprocessable entity"`, message ending
+  in `dropped=N`) with the other lines stored; a line that fails to parse
+  rejects the whole payload with HTTP 400 (`"code":"invalid"`, `unable to
+  parse '<line>': ...`) and nothing is stored; `time` as a field is dropped
+  silently and as a tag is a 400; a tag and a field may share a name; an
+  empty payload is accepted. The double now applies those rules under
+  `:v2` and InfluxDB 3's under `:v3_core` / `:v3_enterprise`.
 - **`Client.Local` refused `LIMIT n OFFSET m`, which InfluxDB 3 runs (#21).**
   Verified against the engine: `OFFSET` skips rows before `LIMIT` takes
   them, in either order, on plain, projected, grouped and `DISTINCT` rows;

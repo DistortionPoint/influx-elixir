@@ -22,6 +22,10 @@ defmodule InfluxElixir.Client.LocalTest do
   end
 
   # {line_number, error_message} pairs from a partial-write response body.
+  defp v2_flux(measurement) do
+    ~s'from(bucket: "metrics") |> range(start: 0) |> filter(fn: (r) => r._measurement == "#{measurement}")'
+  end
+
   defp partial_errors(body) do
     %{"error" => "partial write of line protocol occurred", "data" => data} = Jason.decode!(body)
     Enum.map(data, &{&1["line_number"], &1["error_message"]})
@@ -3049,7 +3053,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert Enum.all?(names, &(&1 in listed))
     end
 
-    test "a DELETE running beside writes only removes what it matched", %{conn: conn, db: db} do
+    test "a DELETE running beside writes only removes what it matched", %{db: db} do
       {:ok, ent} = Local.start(databases: [db], profile: :v3_enterprise)
       on_exit(fn -> Local.stop(ent) end)
 
@@ -4717,17 +4721,17 @@ defmodule InfluxElixir.Client.LocalTest do
                  database: db
                )
 
-      assert {:ok, [%{"host" => "a", "volume" => 0.0}, %{"host" => "b", "volume" => 0.0}]} =
+      assert {:ok, [%{"host" => "a", "volume" => +0.0}, %{"host" => "b", "volume" => +0.0}]} =
                Local.query_sql(
                  conn,
                  ~s|SELECT host, 0.0 AS volume FROM "p" GROUP BY host ORDER BY host|,
                  database: db
                )
 
-      assert {:ok, [%{"volume" => 0.0, "m" => 2.0}]} =
+      assert {:ok, [%{"volume" => +0.0, "m" => 2.0}]} =
                Local.query_sql(conn, ~s|SELECT 0.0 AS volume, MAX(v) AS m FROM "p"|, database: db)
 
-      assert {:ok, [%{"volume" => 0.0, "m" => 2.0, "t" => %DateTime{}}]} =
+      assert {:ok, [%{"volume" => +0.0, "m" => 2.0, "t" => %DateTime{}}]} =
                Local.query_sql(
                  conn,
                  ~s|SELECT DATE_BIN(INTERVAL '1 minute', time) AS t, 0.0 AS volume, MAX(v) AS m FROM "p" GROUP BY DATE_BIN(INTERVAL '1 minute', time)|,
@@ -4971,6 +4975,104 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:error, %{status: 400, body: "Client.Local: unsupported LIMIT / OFFSET" <> _rest}} =
                Local.query_sql(conn, ~s|SELECT host FROM "p" LIMIT 2 OFFSET abc|, database: db)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Write rules under the :v2 profile, verified against InfluxDB 2.7
+  # (docs/design/2026-09-22_local-v2-write-rules.md).
+  # ---------------------------------------------------------------------------
+
+  describe "write/3 — :v2 profile schema and partial-write rules" do
+    setup do
+      {:ok, conn} = Local.start(profile: :v2)
+      :ok = Local.create_bucket(conn, "metrics")
+      on_exit(fn -> Local.stop(conn) end)
+      {:ok, conn: conn}
+    end
+
+    test "a field type conflict is a 422 partial write naming the first conflict and the dropped count",
+         %{conn: conn} do
+      {:ok, :written} = Local.write(conn, "d1 v=1i 1700000000000000000", database: "metrics")
+
+      lp =
+        "d1 v=2.0 1700000000000000001\nd1 v=3.0 1700000000000000002\nd1 v=4i 1700000000000000003"
+
+      assert {:error, %{status: 422, body: body}} = Local.write(conn, lp, database: "metrics")
+
+      assert Jason.decode!(body) == %{
+               "code" => "unprocessable entity",
+               "message" =>
+                 "failure writing points to database: partial write: field type conflict: " <>
+                   ~s|input field "v" on measurement "d1" is type float, already exists as type | <>
+                   "integer dropped=2"
+             }
+
+      # The good lines were stored (Flux returns one row per field value).
+      assert {:ok, rows} =
+               Local.query_flux(conn, v2_flux("d1"))
+
+      assert Enum.map(rows, & &1["_value"]) == [1, 4]
+
+      for {first, second, existing, got} <- [
+            {~s|s s="x"|, "s s=1.0", "string", "float"},
+            {"b b=true", "b b=1i", "boolean", "integer"},
+            {"u v=1i", "u v=2u", "integer", "unsigned"}
+          ] do
+        {:ok, :written} = Local.write(conn, first, database: "metrics")
+
+        assert {:error, %{status: 422, body: body}} =
+                 Local.write(conn, second, database: "metrics")
+
+        assert Jason.decode!(body)["message"] =~
+                 "is type #{got}, already exists as type #{existing} dropped=1"
+      end
+    end
+
+    test "a line that fails to parse rejects the whole payload with 400 and stores nothing",
+         %{conn: conn} do
+      lp = "p2 v=1i 1700000000000000000\np2 v=\np2 v=3i 1700000000000000002"
+      assert {:error, %{status: 400, body: body}} = Local.write(conn, lp, database: "metrics")
+
+      assert %{
+               "code" => "invalid",
+               "message" => "unable to parse 'p2 v=': No fields were provided"
+             } =
+               Jason.decode!(body)
+
+      assert {:ok, []} =
+               Local.query_flux(conn, v2_flux("p2"))
+
+      assert {:error, %{status: 400, body: body}} =
+               Local.write(conn, "p3 v=9223372036854775808i 1700000000000000000",
+                 database: "metrics"
+               )
+
+      assert Jason.decode!(body)["message"] =~
+               "unable to parse 'p3 v=9223372036854775808i 1700000000000000000': Unable to parse integer"
+    end
+
+    test "time as a tag is refused; time as a field is dropped silently; a tag and a field may share a name; an empty payload is accepted",
+         %{conn: conn} do
+      assert {:error, %{status: 400, body: body}} =
+               Local.write(conn, "t1,time=x v=1i 1700000000000000000", database: "metrics")
+
+      assert Jason.decode!(body)["message"] =~ ~s|cannot use reserved tag key "time"|
+
+      {:ok, :written} =
+        Local.write(conn, "t2 time=5i,v=1i 1700000000000000000", database: "metrics")
+
+      assert {:ok, [%{"_field" => "v", "_value" => 1}]} =
+               Local.query_flux(conn, v2_flux("t2"))
+
+      {:ok, :written} =
+        Local.write(conn, "t3,host=a host=1i 1700000000000000000", database: "metrics")
+
+      {:ok, :written} =
+        Local.write(conn, "t3,host=b v=2i 1700000000000000001", database: "metrics")
+
+      assert {:ok, :written} = Local.write(conn, "", database: "metrics")
+      assert {:ok, :written} = Local.write(conn, "# only a comment\n", database: "metrics")
     end
   end
 end

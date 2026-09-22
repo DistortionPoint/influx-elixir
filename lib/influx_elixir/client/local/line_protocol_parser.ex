@@ -28,11 +28,19 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   @type line_error :: %{
           error_message: binary(),
           line_number: pos_integer(),
-          original_line: binary()
+          original_line: binary(),
+          line: binary()
         }
 
   @typedoc "A line's outcome: the point with its line number and text, or the error."
   @type line_result :: {:ok, point(), pos_integer(), binary()} | {:error, line_error()}
+
+  @typedoc """
+  Whose rules apply. InfluxDB 3 refuses `time` as a field and a key that is
+  both tag and field; InfluxDB 2 drops a `time` field silently and lets a
+  tag and a field share a name.
+  """
+  @type dialect :: :v3 | :v2
 
   @int64_max 9_223_372_036_854_775_807
   @int64_min -9_223_372_036_854_775_808
@@ -51,8 +59,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   write was empty" on the engine); every other problem is a per-line
   `{:error, line_error}` in the list, numbered as the engine numbers it.
   """
-  @spec parse_lines(binary(), atom()) :: {:ok, [line_result()]} | {:error, map()}
-  def parse_lines(text, precision) do
+  @spec parse_lines(binary(), atom(), dialect()) :: {:ok, [line_result()]} | {:error, map()}
+  def parse_lines(text, precision, dialect \\ :v3) do
     results =
       text
       |> split_lines()
@@ -60,7 +68,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
       |> Enum.reject(fn {line, _n} ->
         String.trim(line) == "" or String.starts_with?(line, "#")
       end)
-      |> Enum.map(fn {line, n} -> parse_line(line, n, precision) end)
+      |> Enum.map(fn {line, n} -> parse_line(line, n, precision, dialect) end)
 
     case results do
       [] -> {:error, %{status: 400, body: "incoming write was empty"}}
@@ -93,8 +101,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   # Parses a single line protocol line into a point map.
   #
   # Format: measurement[,tag=val...] field=val[,...] [timestamp]
-  @spec parse_line(binary(), pos_integer(), atom()) :: line_result()
-  defp parse_line(line, number, precision) do
+  @spec parse_line(binary(), pos_integer(), atom(), dialect()) :: line_result()
+  defp parse_line(line, number, precision, dialect) do
     result =
       case split_line_parts(line) do
         [key_part, fields_part | rest] ->
@@ -102,7 +110,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
 
           with {:ok, {measurement, tags}} <- parse_key_part(key_part),
                {:ok, fields} <- parse_fields_part(fields_part),
-               :ok <- check_columns(tags, fields),
+               {:ok, fields} <- check_columns(tags, fields, dialect),
                {:ok, timestamp} <- parse_timestamp(ts_raw, precision) do
             {:ok, %{measurement: measurement, tags: tags, fields: fields, timestamp: timestamp}}
           end
@@ -117,16 +125,30 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
     end
   end
 
-  @doc "Builds a `t:line_error/0` the way the engine reports one."
+  @doc """
+  Builds a `t:line_error/0` the way InfluxDB 3 reports one. The full line
+  is kept under `:line` for InfluxDB 2's report, which quotes it whole.
+  """
   @spec line_error(binary(), pos_integer(), binary()) :: line_error()
   def line_error(message, number, line) do
-    %{error_message: message, line_number: number, original_line: String.slice(line, 0, 20)}
+    %{
+      error_message: message,
+      line_number: number,
+      original_line: String.slice(line, 0, 20),
+      line: line
+    }
   end
 
   # `time` is the timestamp column and a key is one column, so a key used as
-  # both a tag and a field cannot be typed.
-  @spec check_columns(map(), map()) :: :ok | {:error, binary()}
-  defp check_columns(tags, fields) do
+  # both a tag and a field cannot be typed — on InfluxDB 3. InfluxDB 2 keeps
+  # tags and fields in separate namespaces and drops a `time` field.
+  @spec check_columns(map(), map(), dialect()) :: {:ok, map()} | {:error, binary()}
+  defp check_columns(tags, _fields, :v2) when is_map_key(tags, "time"),
+    do: {:error, "cannot use reserved tag key \"time\""}
+
+  defp check_columns(_tags, fields, :v2), do: {:ok, Map.delete(fields, "time")}
+
+  defp check_columns(tags, fields, :v3) do
     cond do
       Map.has_key?(tags, "time") ->
         {:error, "'time' is a reserved column"}
@@ -139,7 +161,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
       true ->
         case Enum.find(Map.keys(fields), &Map.has_key?(tags, &1)) do
           nil ->
-            :ok
+            {:ok, fields}
 
           key ->
             {:error,
@@ -155,11 +177,17 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   """
   @spec column_type(:tag | :field, term()) :: binary()
   def column_type(:tag, _value), do: "iox::column_type::tag"
+
   def column_type(:field, {:uint, _n}), do: "iox::column_type::field::uinteger"
   def column_type(:field, value) when is_integer(value), do: "iox::column_type::field::integer"
   def column_type(:field, value) when is_float(value), do: "iox::column_type::field::float"
   def column_type(:field, value) when is_binary(value), do: "iox::column_type::field::string"
   def column_type(:field, value) when is_boolean(value), do: "iox::column_type::field::boolean"
+
+  @doc "InfluxDB 2's name for a field type (`integer`, `unsigned`, `float`, `string`, `boolean`)."
+  @spec v2_field_type(binary()) :: binary()
+  def v2_field_type("iox::column_type::field::uinteger"), do: "unsigned"
+  def v2_field_type("iox::column_type::field::" <> type), do: type
 
   # The splitters below accumulate the current token in a binary. Appending
   # to a binary the process owns is optimised by the runtime (no copy), so

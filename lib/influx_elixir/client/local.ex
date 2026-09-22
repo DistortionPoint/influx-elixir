@@ -85,6 +85,15 @@ defmodule InfluxElixir.Client.Local do
       one line; an integer must fit in 64 bits (`7u` is unsigned); a newline
       inside a quoted string value is part of the value; an empty payload is
       "incoming write was empty".
+    * Under the `:v2` profile the rules are InfluxDB 2's, verified against
+      2.7: a field type conflict is HTTP 422 (`{"code":"unprocessable
+      entity","message":"... field type conflict: input field \"v\" on
+      measurement \"m\" is type float, already exists as type integer
+      dropped=N"}`) with the other lines stored; a line that fails to parse
+      rejects the whole payload with HTTP 400 (`{"code":"invalid","message":
+      "unable to parse '<line>': ..."}`) and nothing is stored; `time` as a
+      field is dropped silently and as a tag is a 400; a tag and a field may
+      share a name; an empty payload is accepted.
 
   ## SQL Query Support
 
@@ -475,27 +484,87 @@ defmodule InfluxElixir.Client.Local do
 
     with :ok <- require_capability(conn, :write),
          {:ok, text} <- maybe_decompress(payload),
-         :ok <- ensure_database(table, database, profile),
-         {:ok, lines} <- LineProtocolParser.parse_lines(text, precision) do
-      store_lines(table, database, lines)
+         :ok <- ensure_database(table, database, profile) do
+      case LineProtocolParser.parse_lines(text, precision, dialect(profile)) do
+        {:ok, lines} -> store_lines(table, database, lines, profile)
+        # InfluxDB 2 answers 204 to an empty payload; InfluxDB 3 refuses it.
+        {:error, _empty} when profile == :v2 -> {:ok, :written}
+        {:error, _reason} = error -> error
+      end
     end
   end
 
-  # Every accepted line is stored and every rejected one reported, as the
-  # engine does ("partial write of line protocol occurred", HTTP 400, one
-  # entry per bad line): a syntax error or a column whose kind conflicts
-  # with the measurement's schema drops that line only. The response body
-  # is the engine's JSON so consumer code that reads it can be exercised.
-  @spec store_lines(:ets.table(), binary(), [LineProtocolParser.line_result()]) ::
+  @spec dialect(profile()) :: LineProtocolParser.dialect()
+  defp dialect(:v2), do: :v2
+  defp dialect(_v3), do: :v3
+
+  # InfluxDB 3: every accepted line is stored and every rejected one
+  # reported ("partial write of line protocol occurred", HTTP 400, one entry
+  # per bad line) — a syntax error or a column whose kind conflicts with the
+  # measurement's schema drops that line only.
+  #
+  # InfluxDB 2: a line that fails to parse rejects the whole payload (HTTP
+  # 400 `{"code":"invalid","message":"unable to parse '<line>': ..."}`,
+  # nothing stored); a field type conflict drops the conflicting lines and
+  # answers 422 with the first conflict and `dropped=N`.
+  #
+  # Both bodies are the engine's JSON so consumer code that reads them can
+  # be exercised.
+  @spec store_lines(:ets.table(), binary(), [LineProtocolParser.line_result()], profile()) ::
           InfluxElixir.Client.write_result()
-  defp store_lines(table, database, lines) do
+  defp store_lines(table, database, lines, :v2) do
+    case Enum.find(lines, &match?({:error, _line_error}, &1)) do
+      {:error, %{error_message: message, line: line}} ->
+        {:error,
+         %{
+           status: 400,
+           body:
+             Jason.encode!(%{
+               "code" => "invalid",
+               "message" => "unable to parse '#{line}': #{message}"
+             })
+         }}
+
+      nil ->
+        conflicts =
+          Enum.reduce(lines, [], fn {:ok, point, _number, _line}, conflicts ->
+            case check_schema(table, database, point, :v2) do
+              :ok ->
+                store_point(table, database, strip_uint_markers(point))
+                conflicts
+
+              {:error, conflict} ->
+                [conflict | conflicts]
+            end
+          end)
+
+        case Enum.reverse(conflicts) do
+          [] ->
+            {:ok, :written}
+
+          [{field, measurement, existing, got} | _rest] = dropped ->
+            message =
+              "failure writing points to database: partial write: field type conflict: " <>
+                ~s|input field "#{field}" on measurement "#{measurement}" is type #{got}, | <>
+                "already exists as type #{existing} dropped=#{length(dropped)}"
+
+            {:error,
+             %{
+               status: 422,
+               body: Jason.encode!(%{"code" => "unprocessable entity", "message" => message})
+             }}
+        end
+    end
+  end
+
+  defp store_lines(table, database, lines, _v3) do
     errors =
       Enum.reduce(lines, [], fn
         {:error, line_error}, errors ->
           [line_error | errors]
 
         {:ok, point, number, line}, errors ->
-          case check_schema(table, database, point) do
+          case check_schema(table, database, point, :v3) do
             :ok ->
               store_point(table, database, strip_uint_markers(point))
               errors
@@ -516,7 +585,7 @@ defmodule InfluxElixir.Client.Local do
            body:
              Jason.encode!(%{
                "error" => "partial write of line protocol occurred",
-               "data" => Enum.reverse(errors)
+               "data" => errors |> Enum.reverse() |> Enum.map(&Map.delete(&1, :line))
              })
          }}
     end
@@ -524,13 +593,14 @@ defmodule InfluxElixir.Client.Local do
 
   # The measurement's schema, one ETS object per column so the first writer
   # of a column fixes its kind atomically (`insert_new`) and a concurrent
-  # writer never loses a column. A later line whose kind differs is
-  # rejected with the engine's message.
-  @spec check_schema(:ets.table(), binary(), point_map()) :: :ok | {:error, binary()}
-  defp check_schema(table, database, point) do
-    columns =
-      Enum.map(point.tags, fn {k, _v} -> {k, :tag, nil} end) ++
-        Enum.map(point.fields, fn {k, v} -> {k, :field, v} end)
+  # writer never loses a column. InfluxDB 3 types tags and fields in one
+  # namespace and reports a conflict with its column-type wording; InfluxDB
+  # 2 types fields only and reports `{field, measurement, existing, got}`.
+  @spec check_schema(:ets.table(), binary(), point_map(), LineProtocolParser.dialect()) ::
+          :ok | {:error, binary() | {binary(), binary(), binary(), binary()}}
+  defp check_schema(table, database, point, dialect) do
+    tags = if dialect == :v3, do: Enum.map(point.tags, fn {k, _v} -> {k, :tag, nil} end), else: []
+    columns = tags ++ Enum.map(point.fields, fn {k, v} -> {k, :field, v} end)
 
     Enum.find_value(columns, :ok, fn {column, kind, value} ->
       type = LineProtocolParser.column_type(kind, value)
@@ -543,11 +613,19 @@ defmodule InfluxElixir.Client.Local do
 
         if existing == type,
           do: nil,
-          else:
-            {:error,
-             "invalid column type for column '#{column}', expected #{existing}, got #{type}"}
+          else: {:error, conflict(dialect, column, point, existing, type)}
       end
     end)
+  end
+
+  @spec conflict(LineProtocolParser.dialect(), binary(), point_map(), binary(), binary()) ::
+          binary() | {binary(), binary(), binary(), binary()}
+  defp conflict(:v3, column, _point, existing, type),
+    do: "invalid column type for column '#{column}', expected #{existing}, got #{type}"
+
+  defp conflict(:v2, column, point, existing, type) do
+    {column, point.measurement, LineProtocolParser.v2_field_type(existing),
+     LineProtocolParser.v2_field_type(type)}
   end
 
   # An unsigned integer is stored as the integer; the marker only served

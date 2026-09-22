@@ -774,6 +774,13 @@ data. `time` is a reserved column, a key cannot be both a tag and a field on
 one line, an integer must fit in 64 bits (`7u` is unsigned), a newline inside
 a quoted string value is part of the value, and an empty payload is rejected.
 
+Under the `:v2` profile the rules are InfluxDB 2's (verified against 2.7): a
+field type conflict is HTTP 422 with `"code": "unprocessable entity"` and a
+message ending in `dropped=N`, the other lines stored; a line that fails to
+parse rejects the whole payload with HTTP 400 (`"code": "invalid"`) and
+nothing is stored; `time` as a field is dropped silently, as a tag it is a
+400; a tag and a field may share a name; an empty payload is accepted.
+
 ## Key Differences from Real InfluxDB
 
 - **No WAL flush delay**: Writes are immediately queryable (set `query_delay: 0`)

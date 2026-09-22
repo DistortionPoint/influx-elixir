@@ -85,6 +85,7 @@ defmodule InfluxElixir.ClientContract do
     db_admin_tests = if v3_sql, do: db_admin_tests(client), else: nil
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
+    v2_write_rule_tests = if v2_ops, do: v2_write_rule_tests(client), else: nil
     flux_tests = if v2_ops, do: flux_tests(client), else: nil
 
     token_tests = if enterprise_ops, do: token_tests(client), else: nil
@@ -118,6 +119,7 @@ defmodule InfluxElixir.ClientContract do
         influxql_tests,
         db_admin_tests,
         bucket_tests,
+        v2_write_rule_tests,
         flux_tests,
         token_tests
       ]
@@ -1890,6 +1892,105 @@ defmodule InfluxElixir.ClientContract do
                      "SELECT host FROM contract_off LIMIT 2 OFFSET -1",
                      database: ctx.database
                    )
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # InfluxDB 2 write rules (v2)
+  # ---------------------------------------------------------------------------
+
+  defp v2_write_rule_tests(client) do
+    quote do
+      describe "write/3 — v2 schema and partial-write contract" do
+        test "a field type conflict is 422 with the dropped count; the other lines are stored",
+             ctx do
+          m = "contract_v2wr_#{System.unique_integer([:positive])}"
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, "#{m} v=1i 1700000000000000000",
+              database: ctx.database
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          lp = "#{m} v=2.0 1700000000000000001\n#{m} v=3i 1700000000000000002"
+
+          assert {:error, %{status: 422, body: body}} =
+                   unquote(client).write(ctx.conn, lp, database: ctx.database)
+
+          assert %{"code" => "unprocessable entity", "message" => message} = Jason.decode!(body)
+
+          assert message ==
+                   "failure writing points to database: partial write: field type conflict: " <>
+                     ~s|input field "v" on measurement "#{m}" is type float, already exists as | <>
+                     "type integer dropped=1"
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, rows} =
+            unquote(client).query_flux(
+              ctx.conn,
+              ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) \|> filter(fn: (r) => r._measurement == "#{m}")|
+            )
+
+          assert Enum.map(rows, & &1["_value"]) == [1, 3]
+        end
+
+        test "a parse error rejects the whole payload with 400 and nothing is stored", ctx do
+          m = "contract_v2pe_#{System.unique_integer([:positive])}"
+          lp = "#{m} v=1i 1700000000000000000\n#{m} v=\n#{m} v=3i 1700000000000000002"
+
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).write(ctx.conn, lp, database: ctx.database)
+
+          assert %{"code" => "invalid", "message" => "unable to parse '" <> _rest} =
+                   Jason.decode!(body)
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, rows} =
+            unquote(client).query_flux(
+              ctx.conn,
+              ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) \|> filter(fn: (r) => r._measurement == "#{m}")|
+            )
+
+          assert rows == []
+        end
+
+        test "time as a tag is 400; time as a field is dropped; a tag and a field may share a name; an empty payload is accepted",
+             ctx do
+          m = "contract_v2t_#{System.unique_integer([:positive])}"
+
+          assert {:error, %{status: 400}} =
+                   unquote(client).write(ctx.conn, "#{m},time=x v=1i 1700000000000000000",
+                     database: ctx.database
+                   )
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, "#{m} time=5i,v=1i 1700000000000000000",
+                     database: ctx.database
+                   )
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, "#{m},host=a host=1i 1700000000000000001",
+                     database: ctx.database
+                   )
+
+          assert {:ok, :written} = unquote(client).write(ctx.conn, "", database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, rows} =
+            unquote(client).query_flux(
+              ctx.conn,
+              ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) \|> filter(fn: (r) => r._measurement == "#{m}")|
+            )
+
+          assert Enum.sort(Enum.map(rows, & &1["_field"])) == ["host", "v"]
         end
       end
     end
