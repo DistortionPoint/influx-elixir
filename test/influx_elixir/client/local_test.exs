@@ -3932,9 +3932,7 @@ defmodule InfluxElixir.Client.LocalTest do
       for {sql, construct} <- [
             {~s|SELECT bid FROM "q" INNER JOIN "q" AS r ON q.time = r.time|, "JOIN"},
             {~s|SELECT bid FROM "q" UNION SELECT ask FROM "q"|, "UNION"},
-            {~s|SELECT provider, COUNT(*) AS n FROM "q" GROUP BY provider HAVING n > 1|,
-             "HAVING"},
-            {~s|SELECT bid FROM "q" LIMIT 1 OFFSET 1|, "OFFSET"}
+            {~s|SELECT provider, COUNT(*) AS n FROM "q" GROUP BY provider HAVING n > 1|, "HAVING"}
           ] do
         assert {:error, %{status: 400, body: body}} = Local.query_sql(conn, sql, database: db)
         assert body =~ "Client.Local: unsupported SQL construct #{construct}", sql
@@ -3969,11 +3967,7 @@ defmodule InfluxElixir.Client.LocalTest do
                )
     end
 
-    test "the real OFFSET clause and OVER () are still refused by name", %{conn: conn, db: db} do
-      assert {:error,
-              %{status: 400, body: "Client.Local: unsupported SQL construct OFFSET" <> _rest}} =
-               Local.query_sql(conn, ~s|SELECT tag FROM "m" LIMIT 1 OFFSET 1|, database: db)
-
+    test "a window function is still refused by name", %{conn: conn, db: db} do
       assert {:error,
               %{status: 400, body: "Client.Local: unsupported SQL construct OVER" <> _rest}} =
                Local.query_sql(
@@ -4892,6 +4886,91 @@ defmodule InfluxElixir.Client.LocalTest do
 
       # The old integer schema is gone: a float is the first writer now.
       assert {:ok, :written} = Local.write(conn, "d v=2.0 1700000000000000000", database: db)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Issue #21: LIMIT n OFFSET m. Expected values recorded from InfluxDB 3 Core
+  # (docs/design/2026-09-22_local-offset.md).
+  # ---------------------------------------------------------------------------
+
+  describe "bug regression — LIMIT and OFFSET (#21)" do
+    setup %{conn: conn} do
+      :ok = Local.create_database(conn, "off_db")
+
+      lines =
+        for {host, i} <- Enum.with_index(~w(a b c d e)),
+            do: "p,host=#{host} v=#{i + 1}i #{1_700_000_000_000_000_000 + i * 1_000_000_000}"
+
+      {:ok, :written} =
+        Local.write(conn, Enum.join(lines, "\n"), database: "off_db", precision: :nanosecond)
+
+      {:ok, db: "off_db"}
+    end
+
+    test "OFFSET skips rows before LIMIT takes them, in either order", %{conn: conn, db: db} do
+      assert hosts(conn, db, ~s|SELECT host FROM "p" ORDER BY time LIMIT 2 OFFSET 1|) == [
+               "b",
+               "c"
+             ]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "p" ORDER BY time LIMIT 2 OFFSET 0|) == [
+               "a",
+               "b"
+             ]
+
+      assert hosts(conn, db, ~s|SELECT host FROM "p" ORDER BY time LIMIT 2 OFFSET 4|) == ["e"]
+      assert hosts(conn, db, ~s|SELECT host FROM "p" ORDER BY time LIMIT 2 OFFSET 10|) == []
+      assert hosts(conn, db, ~s|SELECT host FROM "p" ORDER BY time OFFSET 3|) == ["d", "e"]
+      assert hosts(conn, db, ~s|SELECT host FROM "p" ORDER BY time OFFSET 3 LIMIT 1|) == ["d"]
+      assert hosts(conn, db, ~s|SELECT host FROM "p" LIMIT 2 OFFSET 1|) == ["b", "c"]
+    end
+
+    test "OFFSET applies to grouped, DISTINCT and projected rows too", %{conn: conn, db: db} do
+      assert {:ok, [%{"host" => "b", "n" => 1}, %{"host" => "c", "n" => 1}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT host, COUNT(*) AS n FROM "p" GROUP BY host ORDER BY host LIMIT 2 OFFSET 1|,
+                 database: db
+               )
+
+      assert {:ok, [%{"host" => "c"}, %{"host" => "d"}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT DISTINCT host FROM "p" ORDER BY host LIMIT 2 OFFSET 2|,
+                 database: db
+               )
+
+      assert {:ok, [%{"twice" => 6}, %{"twice" => 8}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT v * 2 AS twice FROM "p" ORDER BY v LIMIT 2 OFFSET 2|,
+                 database: db
+               )
+    end
+
+    test "the reported pagination query", %{conn: conn, db: db} do
+      sql = """
+      SELECT *
+      FROM "p"
+      WHERE time >= '2023-11-14T00:00:00Z'
+        AND time < '2023-11-15T00:00:00Z'
+
+      ORDER BY time DESC
+      LIMIT 100
+      OFFSET 1
+      """
+
+      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
+      assert Enum.map(rows, & &1["host"]) == ["d", "c", "b", "a"]
+    end
+
+    test "a negative or non-numeric OFFSET is the engine's error", %{conn: conn, db: db} do
+      assert {:error, %{status: 400, body: "Client.Local: OFFSET must be >=0" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT host FROM "p" LIMIT 2 OFFSET -1|, database: db)
+
+      assert {:error, %{status: 400, body: "Client.Local: unsupported LIMIT / OFFSET" <> _rest}} =
+               Local.query_sql(conn, ~s|SELECT host FROM "p" LIMIT 2 OFFSET abc|, database: db)
     end
   end
 end

@@ -70,7 +70,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
         true ->
           filtered
           |> apply_order_by(query.order_by)
-          |> apply_limit(query.limit)
+          |> apply_limit(query.limit, query.offset)
           |> Enum.map(&point_to_row/1)
       end
     else
@@ -323,7 +323,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     points
     |> Enum.map(fn point -> {point, project_point(point, projection)} end)
     |> order_projected(query.order_by, outputs)
-    |> apply_limit(query.limit)
+    |> apply_limit(query.limit, query.offset)
     |> Enum.map(fn {_point, row} -> row end)
   end
 
@@ -413,7 +413,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
       |> Enum.reduce(%{}, fn {column, value}, row -> put_column(row, column, value) end)
     end)
     |> apply_order_by_rows(query.order_by, nil)
-    |> apply_limit(query.limit)
+    |> apply_limit(query.limit, query.offset)
   end
 
   @spec point_value(point(), binary()) :: term()
@@ -431,7 +431,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     |> bucket_by_columns(cols)
     |> aggregate_per_column_bucket(query.select_columns)
     |> apply_order_by_rows(query.order_by, nil)
-    |> apply_limit(query.limit)
+    |> apply_limit(query.limit, query.offset)
   end
 
   defp execute_aggregate_query(points, %{group_by_interval: nil} = query) do
@@ -449,7 +449,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     |> bucket_by_interval(interval_ns)
     |> aggregate_per_bucket(query.select_columns)
     |> apply_order_by_rows(query.order_by, time_alias)
-    |> apply_limit(query.limit)
+    |> apply_limit(query.limit, query.offset)
   end
 
   # Group points by the tuple of values for the GROUP BY columns. Each
@@ -914,9 +914,13 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     sort_by_keys(points, keys)
   end
 
-  @spec apply_limit([point()], pos_integer() | nil) :: [point()]
-  defp apply_limit(points, nil), do: points
-  defp apply_limit(points, n), do: Enum.take(points, n)
+  # OFFSET skips first, then LIMIT takes, whichever order they were written.
+  @spec apply_limit([term()], non_neg_integer() | nil, non_neg_integer() | nil) :: [term()]
+  defp apply_limit(items, limit, offset) do
+    items
+    |> Enum.drop(offset || 0)
+    |> then(fn skipped -> if limit, do: Enum.take(skipped, limit), else: skipped end)
+  end
 
   @spec point_to_row(point()) :: map()
   # `time` is a DateTime (microsecond precision), as on the HTTP and Flight

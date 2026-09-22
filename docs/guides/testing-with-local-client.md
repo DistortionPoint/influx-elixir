@@ -550,7 +550,7 @@ ORDER BY time ASC
 A column present on both sides of the join is refused as ambiguous
 (qualifiers are dropped, so the two could not be told apart; the engine
 refuses the unqualified reference as well). Other joins (`INNER JOIN`, ...),
-set operations, subqueries in `WHERE`, `HAVING`, `OFFSET` and window
+set operations, subqueries in `WHERE`, `HAVING` and window
 functions are outside the subset and are rejected **by name**
 (`Client.Local: unsupported SQL construct JOIN`) rather than ignored, so a
 query the double cannot run never returns rows computed from its first
@@ -585,7 +585,9 @@ is case-sensitive and `ILIKE` is not; `%` matches any run and `_` one
 character. `LIKE` over a numeric column is rejected with the engine's own
 planning error. A malformed expression (an unbalanced parenthesis, a
 trailing `AND`) is rejected rather than truncated. `LIMIT 0` returns no
-rows; a negative or non-numeric `LIMIT` is rejected.
+rows; `LIMIT n OFFSET m` (or `OFFSET m LIMIT n`) pages through the ordered
+rows as on the server; a negative or non-numeric `LIMIT` or `OFFSET` is
+rejected.
 
 ## CAST and Ordering
 

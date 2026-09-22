@@ -95,7 +95,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           measurement: binary(),
           where: [where_node()],
           order_by: order_by(),
-          limit: pos_integer() | nil,
+          limit: non_neg_integer() | nil,
+          offset: non_neg_integer() | nil,
           group_by_interval: pos_integer() | nil,
           group_by_columns: [binary()] | nil,
           select_columns: [select_column()] | nil,
@@ -295,8 +296,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # called `offset` or `over` (both fine on the engine) is not mistaken for
   # one; string literals are blanked first so `note = 'select from join'`
   # is not either.
-  @unsupported_construct ~r/(?i)\b(JOIN|UNION|EXCEPT|INTERSECT|HAVING)\b|\b(OFFSET)\s+\d|\b(OVER)\s*\(/
-  @clause_keywords ~w(WHERE GROUP ORDER LIMIT)
+  @unsupported_construct ~r/(?i)\b(JOIN|UNION|EXCEPT|INTERSECT|HAVING)\b|\b(OVER)\s*\(/
+  @clause_keywords ~w(WHERE GROUP ORDER LIMIT OFFSET)
 
   @spec check_clauses(binary()) :: :ok | {:error, term()}
   defp check_clauses(sql) do
@@ -336,22 +337,35 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       else: :ok
   end
 
-  # The engine plans `LIMIT -1` as "LIMIT must be >= 0" and anything but a
-  # number as a schema error; `LIMIT 0` is valid and returns no rows.
+  # `LIMIT n` and `OFFSET m`, in either order, end the statement. A clause
+  # is the keyword followed by a number — a column called `offset` stays a
+  # column. The engine plans a negative value as "LIMIT must be >= 0" /
+  # "OFFSET must be >=0" and accepts 0 for both.
   @spec check_limit(binary(), binary()) :: :ok | {:error, term()}
   defp check_limit(scannable, sql) do
     cond do
-      not Regex.match?(~r/(?i)\bLIMIT\b/, scannable) ->
-        :ok
-
-      Regex.match?(~r/(?i)\bLIMIT\s+\d+\s*$/, scannable) ->
-        :ok
-
       Regex.match?(~r/(?i)\bLIMIT\s+-\d+/, scannable) ->
         {:error, local_error("LIMIT must be >= 0: #{sql}")}
 
-      true ->
+      Regex.match?(~r/(?i)\bOFFSET\s+-\d+/, scannable) ->
+        {:error, local_error("OFFSET must be >=0: #{sql}")}
+
+      Regex.match?(~r/(?i)\bLIMIT\s+(?!\d)\S/, scannable) ->
         {:error, local_error("unsupported LIMIT (a non-negative integer is required): #{sql}")}
+
+      match = Regex.run(~r/(?i)\b((?:LIMIT|OFFSET)\s+\d+.*)$/s, scannable) ->
+        [_full, tail] = match
+
+        if Regex.match?(~r/(?i)^(?:(?:LIMIT|OFFSET)\s+\d+\s*){1,2}$/, tail),
+          do: :ok,
+          else:
+            {:error,
+             local_error(
+               "unsupported LIMIT / OFFSET (non-negative integers are required): #{sql}"
+             )}
+
+      true ->
+        :ok
     end
   end
 
@@ -441,6 +455,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         where: where,
         order_by: parse_order_by(rest),
         limit: parse_limit(rest),
+        offset: parse_offset(rest),
         group_by_interval: nil,
         group_by_columns: nil,
         select_columns: nil,
@@ -459,7 +474,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_group_by_columns(binary()) :: [binary()] | nil
   defp parse_group_by_columns(sql) do
     case Regex.run(
-           ~r/(?i)GROUP\s+BY\s+(.+?)(?:\s+ORDER|\s+LIMIT|$)/s,
+           ~r/(?i)GROUP\s+BY\s+(.+?)(?:\s+ORDER\b|\s+LIMIT\s+\d|\s+OFFSET\s+\d|$)/s,
            sql
          ) do
       [_full, columns_str] ->
@@ -1050,7 +1065,10 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_where(binary()) ::
           {:ok, [where_node()]} | {:error, map()}
   def parse_where(rest) do
-    case Regex.run(~r/(?i)WHERE\s+(.+?)(?:\s+GROUP|\s+ORDER|\s+LIMIT|$)/s, rest) do
+    case Regex.run(
+           ~r/(?i)WHERE\s+(.+?)(?:\s+GROUP\b|\s+ORDER\b|\s+LIMIT\s+\d|\s+OFFSET\s+\d|$)/s,
+           rest
+         ) do
       [_full_match, clauses_str] -> parse_where_clauses(clauses_str)
       _no_match -> {:ok, []}
     end
@@ -1539,7 +1557,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # target the expression parser cannot read is left as a column name so
   # the schema check names it.
   defp parse_order_by(rest) do
-    case Regex.run(~r/(?i)ORDER\s+BY\s+(.+?)\s*(?:\bLIMIT\b.*)?$/s, rest) do
+    case Regex.run(~r/(?i)ORDER\s+BY\s+(.+?)\s*(?:\b(?:LIMIT|OFFSET)\s+\d.*)?$/s, rest) do
       [_full_match, list] ->
         list
         |> split_top_level_commas()
@@ -1577,17 +1595,17 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     if String.upcase(direction) == "DESC", do: :desc, else: :asc
   end
 
-  @spec parse_limit(binary()) :: pos_integer() | nil
-  defp parse_limit(rest) do
-    case Regex.run(~r/(?i)LIMIT\s+(\d+)/s, rest) do
-      [_full_match, n_str] ->
-        case Integer.parse(n_str) do
-          {n, ""} when n >= 0 -> n
-          _bad_n -> nil
-        end
+  @spec parse_limit(binary()) :: non_neg_integer() | nil
+  defp parse_limit(rest), do: clause_count(~r/(?i)\bLIMIT\s+(\d+)/s, rest)
 
-      _no_match ->
-        nil
+  @spec parse_offset(binary()) :: non_neg_integer() | nil
+  defp parse_offset(rest), do: clause_count(~r/(?i)\bOFFSET\s+(\d+)/s, rest)
+
+  @spec clause_count(Regex.t(), binary()) :: non_neg_integer() | nil
+  defp clause_count(pattern, rest) do
+    case Regex.run(pattern, rest) do
+      [_full_match, n_str] -> String.to_integer(n_str)
+      _no_match -> nil
     end
   end
 

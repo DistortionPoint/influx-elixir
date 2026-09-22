@@ -64,6 +64,7 @@ defmodule InfluxElixir.ClientContract do
     cast_tests = if v3_sql, do: cast_tests(client), else: nil
     schema_rule_tests = if v3_sql, do: schema_rule_tests(client), else: nil
     write_rule_tests = if v3_sql, do: write_rule_tests(client), else: nil
+    offset_tests = if v3_sql, do: offset_tests(client), else: nil
     ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
     distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
     param_tests = if v3_sql, do: param_tests(client), else: nil
@@ -104,6 +105,7 @@ defmodule InfluxElixir.ClientContract do
         cast_tests,
         schema_rule_tests,
         write_rule_tests,
+        offset_tests,
         ordered_agg_tests,
         distinct_tests,
         param_tests,
@@ -1831,6 +1833,63 @@ defmodule InfluxElixir.ClientContract do
             )
 
           assert row["s"] == "a\nb"
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # LIMIT / OFFSET pagination (#21)
+  # ---------------------------------------------------------------------------
+
+  defp offset_tests(client) do
+    quote do
+      describe "query_sql/3 — LIMIT and OFFSET contract" do
+        setup ctx do
+          lines =
+            for {host, i} <- Enum.with_index(~w(a b c d e)),
+                do:
+                  "contract_off,host=#{host} v=#{i + 1}i #{1_700_000_000_000_000_000 + i * 1_000_000_000}"
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, Enum.join(lines, "\n"), database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+          :ok
+        end
+
+        test "OFFSET pages through ordered rows and grouped rows", ctx do
+          hosts = fn sql ->
+            {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+            Enum.map(rows, & &1["host"])
+          end
+
+          assert hosts.("SELECT host FROM contract_off ORDER BY time LIMIT 2 OFFSET 1") == [
+                   "b",
+                   "c"
+                 ]
+
+          assert hosts.("SELECT host FROM contract_off ORDER BY time LIMIT 2 OFFSET 4") == ["e"]
+          assert hosts.("SELECT host FROM contract_off ORDER BY time LIMIT 2 OFFSET 10") == []
+          assert hosts.("SELECT host FROM contract_off ORDER BY time OFFSET 3") == ["d", "e"]
+          assert hosts.("SELECT host FROM contract_off ORDER BY time OFFSET 3 LIMIT 1") == ["d"]
+
+          assert hosts.(
+                   "SELECT host, COUNT(*) AS n FROM contract_off GROUP BY host ORDER BY host LIMIT 2 OFFSET 1"
+                 ) ==
+                   ["b", "c"]
+
+          assert hosts.("SELECT DISTINCT host FROM contract_off ORDER BY host LIMIT 2 OFFSET 2") ==
+                   ["c", "d"]
+
+          assert {:error, %{status: 400}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT host FROM contract_off LIMIT 2 OFFSET -1",
+                     database: ctx.database
+                   )
         end
       end
     end

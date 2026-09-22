@@ -109,7 +109,7 @@ defmodule InfluxElixir.Client.Local do
       the rows it screens). A column present on both sides is refused as
       ambiguous, because qualifiers are dropped and the two could not be
       told apart; the engine refuses the unqualified reference too. Other
-      joins, set operations, `HAVING`, `OFFSET` and window functions are
+      joins, set operations, `HAVING` and window functions are
       rejected by name rather than silently ignored.
     * Table qualifiers and aliases: `FROM q AS w` / `FROM q w`, and
       `w.time`, `q.bid` in any clause — one table per query, so the prefix
@@ -170,7 +170,9 @@ defmodule InfluxElixir.Client.Local do
       %Mint.TransportError{reason: :closed}}}`; the double reports
       `{:error, {:connection_error, :closed}}`. `BOOLEAN` and `TIMESTAMP`
       targets are outside the subset.
-    * `LIMIT N` — `LIMIT 0` returns no rows; a negative or non-numeric
+    * `LIMIT n` and `OFFSET m`, in either order — `OFFSET` skips rows before
+      `LIMIT` takes them, on plain, projected, grouped and `DISTINCT` rows
+      alike; `LIMIT 0` returns no rows; a negative or non-numeric
       limit is rejected, as the engine rejects it
     * `$param` placeholders via `params: %{"$name" => value}` in opts. A
       `DateTime`, `NaiveDateTime` or `Date` param renders as the ISO-8601

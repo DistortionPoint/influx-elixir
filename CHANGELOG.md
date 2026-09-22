@@ -39,6 +39,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` refused `LIMIT n OFFSET m`, which InfluxDB 3 runs (#21).**
+  Verified against the engine: `OFFSET` skips rows before `LIMIT` takes
+  them, in either order, on plain, projected, grouped and `DISTINCT` rows;
+  `OFFSET 0` is a no-op, an offset past the end is an empty result, a
+  negative offset is "OFFSET must be >=0" and a bare word is a schema
+  error. All of that is now mirrored, so a paginated read can be tested
+  against the double instead of re-implementing the offset in Elixir.
 - **`Client.Local` accepted writes InfluxDB 3 rejects, and rejected one it
   accepts.** Verified against the engine: a field written as an integer and
   later as a float (or tag then field, string then float, boolean then

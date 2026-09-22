@@ -38,6 +38,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-17 | [`local-sql-executor-extraction`](2026-09-17_local-sql-executor-extraction.md) | SQL execution split into `SQLExecutor`; `DELETE` with `OR` crash fixed |
 | 2026-09-17 | [`local-in-lists-and-constants`](2026-09-17_local-in-lists-and-constants.md) | `IN`-list items as comparands; constants in select lists |
 | 2026-09-17 | [`local-write-schema-and-partial-writes`](2026-09-17_local-write-schema-and-partial-writes.md) | Column schema fixed by first write, partial writes, reserved `time`, int64 range, `delete_database` drops data |
+| 2026-09-22 | [`local-offset`](2026-09-22_local-offset.md) | `LIMIT n OFFSET m` pagination (#21) |
 
 ## Verifying against a real engine
 
