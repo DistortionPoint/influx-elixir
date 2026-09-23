@@ -43,6 +43,9 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   """
   @type dialect :: :v3 | :v2
 
+  @typedoc "The unit numeric timestamps are in; `:auto` guesses it from the magnitude."
+  @type precision :: :nanosecond | :microsecond | :millisecond | :second | :auto
+
   @int64_max 9_223_372_036_854_775_807
   @int64_min -9_223_372_036_854_775_808
   @uint64_max 18_446_744_073_709_551_615
@@ -50,9 +53,9 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   @doc """
   Parses a line-protocol payload line by line.
 
-  Blank lines and `#` comments are skipped. `precision` is one of
-  `:nanosecond | :microsecond | :millisecond | :second` and scales numeric
-  timestamps to nanoseconds. A point without a timestamp keeps `nil`; the
+  Blank lines and `#` comments are skipped. `precision` is a `t:precision/0`:
+  a unit scales numeric timestamps to nanoseconds and `:auto` guesses the unit
+  from the magnitude as InfluxDB 3 does. A point without a timestamp keeps `nil`; the
   caller assigns the server time. A newline inside a quoted string field
   value is part of the value, as the engine reads it.
 
@@ -60,7 +63,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   write was empty" on the engine); every other problem is a per-line
   `{:error, line_error}` in the list, numbered as the engine numbers it.
   """
-  @spec parse_lines(binary(), atom(), dialect()) :: {:ok, [line_result()]} | {:error, map()}
+  @spec parse_lines(binary(), precision(), dialect()) ::
+          {:ok, [line_result()]} | {:error, map()}
   def parse_lines(text, precision, dialect \\ :v3) do
     results =
       text
@@ -102,7 +106,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   # Parses a single line protocol line into a point map.
   #
   # Format: measurement[,tag=val...] field=val[,...] [timestamp]
-  @spec parse_line(binary(), pos_integer(), atom(), dialect()) :: line_result()
+  @spec parse_line(binary(), pos_integer(), precision(), dialect()) :: line_result()
   defp parse_line(line, number, precision, dialect) do
     result =
       case split_line_parts(line) do
@@ -381,7 +385,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   end
 
   # Parses a raw timestamp string, normalising to nanoseconds.
-  @spec parse_timestamp(binary() | nil, atom()) :: {:ok, integer() | nil} | {:error, binary()}
+  @spec parse_timestamp(binary() | nil, precision()) ::
+          {:ok, integer() | nil} | {:error, binary()}
   defp parse_timestamp(nil, _prec), do: {:ok, nil}
   defp parse_timestamp("", _prec), do: {:ok, nil}
 
@@ -392,7 +397,19 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
     end
   end
 
-  @spec to_nanoseconds(integer(), atom()) :: integer()
+  # `:auto` is InfluxDB 3's guess from the magnitude, verified against the
+  # engine: |ts| below 5e9 is seconds, below 5e12 milliseconds, below 5e15
+  # microseconds, otherwise nanoseconds.
+  @spec to_nanoseconds(integer(), precision()) :: integer()
+  defp to_nanoseconds(ts, :auto) when abs(ts) < 5_000_000_000, do: to_nanoseconds(ts, :second)
+
+  defp to_nanoseconds(ts, :auto) when abs(ts) < 5_000_000_000_000,
+    do: to_nanoseconds(ts, :millisecond)
+
+  defp to_nanoseconds(ts, :auto) when abs(ts) < 5_000_000_000_000_000,
+    do: to_nanoseconds(ts, :microsecond)
+
+  defp to_nanoseconds(ts, :auto), do: ts
   defp to_nanoseconds(ts, :nanosecond), do: ts
   defp to_nanoseconds(ts, :microsecond), do: ts * 1_000
   defp to_nanoseconds(ts, :millisecond), do: ts * 1_000_000

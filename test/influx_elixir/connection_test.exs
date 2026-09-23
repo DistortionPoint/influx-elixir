@@ -102,12 +102,14 @@ defmodule InfluxElixir.ConnectionTest do
       assert config[:host] == "h"
     end
 
-    test "raises ArgumentError for an unknown name" do
+    test "raises an ArgumentError that names the missing connection" do
       name = unique_name(:fetch_raise)
 
-      assert_raise ArgumentError, fn ->
-        Connection.fetch!(name)
-      end
+      assert_raise ArgumentError,
+                   ~r/no InfluxElixir connection named :influx_conn_test_.*_fetch_raise/,
+                   fn ->
+                     Connection.fetch!(name)
+                   end
     end
 
     test "raises ArgumentError after the entry has been deleted" do

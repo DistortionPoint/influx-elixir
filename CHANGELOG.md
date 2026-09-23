@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `Connection.get/1` reads `:persistent_term` with a default instead of
+  rescuing `ArgumentError`.
+- `Writer` tests assert what a write does — every point of a gzipped
+  payload is stored, `precision:` changes the stored time, `:client`
+  selects the client — instead of `{:ok, :written}` alone.
 - `ResponseParser` tests every string cell for InfluxDB 3's zone-less
   timestamp shape before deciding whether to decode it; a one-clause binary
   pattern now screens out strings that cannot match before the regex runs
@@ -47,6 +52,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` kept duplicate points as separate rows.** InfluxDB 3
+  and 2.7 both treat a measurement's points with the same tag set and
+  timestamp as one point — fields merge, the later write wins per field,
+  the last of two such lines in a payload wins (verified) — and the double
+  returned one row per write, so a fixture that rewrote a point saw two
+  rows and doubled its aggregates. Points are still stored as written, one
+  ETS insert each, and are merged on every read; `DELETE` removes the
+  merged point and counts it once.
+- **`Client.Local` crashed on precision spellings the engine accepts.**
+  `HTTP.write/3` passes `precision:` to InfluxDB 3 verbatim, which takes
+  `ns | n | nanosecond | us | u | microsecond | ms | millisecond | s |
+  second | auto` (verified), and maps the long names onto InfluxDB 2's
+  `ns | us | ms | s`. The double accepted only the four long atoms and
+  raised `FunctionClauseError` on `:ms`, `"ms"`, `"nanosecond"` or
+  `:auto`, so a write that works in production crashed in tests. It now
+  accepts what each profile's server accepts, implements `auto` at the
+  engine's thresholds (|ts| below 5e9 seconds, 5e12 milliseconds, 5e15
+  microseconds, else nanoseconds; verified), and answers an unknown
+  precision with the server's 400 body (`serde error: unknown variant …`
+  on v3, `invalid precision; valid precision units are ns, us, ms, and s`
+  on v2).
+- **`ConnectionSupervisor` started a Finch pool the connection never used.**
+  With `:finch_name` pointing at an existing pool, a second idle pool was
+  still started per connection, and the batch writer restarted with it
+  under `rest_for_one`. No per-connection pool is started when
+  `:finch_name` is set.
+- `Connection.fetch!/1` raised `:persistent_term`'s bare `ArgumentError`
+  for an unknown name; it now names the missing connection and says how
+  to register one.
+- The manual telemetry emitters `write_stop/2`, `write_exception/2`,
+  `query_stop/2` and `query_exception/2` emitted `%{duration}` only, while
+  the spans (and the documented events) carry `monotonic_time` too. They
+  now emit the same measurements. `write_stop/2`'s docs mentioned a
+  `compressed_bytes` metadata key that nothing emits (removed from the
+  event docs on 2026-09-11); the leftover is gone.
 - **`LineProtocol.encode/1` emitted lines no server accepts.** An empty tag
   value (`host=`), an empty tag key or field key, the reserved tag key
   `time`, and a newline in a measurement, tag key, tag value or field key

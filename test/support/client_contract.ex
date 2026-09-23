@@ -64,6 +64,7 @@ defmodule InfluxElixir.ClientContract do
     cast_tests = if v3_sql, do: cast_tests(client), else: nil
     schema_rule_tests = if v3_sql, do: schema_rule_tests(client), else: nil
     write_rule_tests = if v3_sql, do: write_rule_tests(client), else: nil
+    duplicate_tests = if v3_sql, do: duplicate_tests(client), else: nil
     offset_tests = if v3_sql, do: offset_tests(client), else: nil
     ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
     distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
@@ -86,6 +87,8 @@ defmodule InfluxElixir.ClientContract do
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
     v2_write_rule_tests = if v2_ops, do: v2_write_rule_tests(client), else: nil
+    v2_precision_tests = if v2_ops, do: v2_precision_tests(client), else: nil
+    v2_duplicate_tests = if v2_ops, do: v2_duplicate_tests(client), else: nil
     flux_tests = if v2_ops, do: flux_tests(client), else: nil
 
     token_tests = if enterprise_ops, do: token_tests(client), else: nil
@@ -106,6 +109,7 @@ defmodule InfluxElixir.ClientContract do
         cast_tests,
         schema_rule_tests,
         write_rule_tests,
+        duplicate_tests,
         offset_tests,
         ordered_agg_tests,
         distinct_tests,
@@ -120,6 +124,8 @@ defmodule InfluxElixir.ClientContract do
         db_admin_tests,
         bucket_tests,
         v2_write_rule_tests,
+        v2_precision_tests,
+        v2_duplicate_tests,
         flux_tests,
         token_tests
       ]
@@ -1997,6 +2003,122 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # InfluxDB 2 precision spellings (v2)
+  # ---------------------------------------------------------------------------
+
+  defp v2_precision_tests(client) do
+    quote do
+      describe "write/3 — v2 precision contract" do
+        test "ms and millisecond both mean milliseconds; auto is refused with 400", ctx do
+          m = "contract_v2prec_#{System.unique_integer([:positive])}"
+
+          for precision <- [:ms, "millisecond"] do
+            assert {:ok, :written} =
+                     unquote(client).write(ctx.conn, "#{m} v=1i 1700000000000",
+                       database: ctx.database,
+                       precision: precision
+                     )
+          end
+
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).write(ctx.conn, "#{m} v=1i 1",
+                     database: ctx.database,
+                     precision: :auto
+                   )
+
+          assert %{"code" => "invalid", "message" => "invalid precision" <> _rest} =
+                   Jason.decode!(body)
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, rows} =
+            unquote(client).query_flux(
+              ctx.conn,
+              ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) \|> filter(fn: (r) => r._measurement == "#{m}")|
+            )
+
+          assert Enum.map(rows, & &1["_time"]) == [~U[2023-11-14 22:13:20.000000Z]]
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Duplicate points (v3_core, v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  defp duplicate_tests(client) do
+    quote do
+      describe "write/3 — duplicate point contract" do
+        test "a point rewritten at the same tags and time merges, the later write winning",
+             ctx do
+          m = "contract_dup_#{System.unique_integer([:positive])}"
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, "#{m},h=x v=1i,w=1i 1700000000000000000",
+              database: ctx.database
+            )
+
+          {:ok, :written} =
+            unquote(client).write(
+              ctx.conn,
+              "#{m},h=x v=2i 1700000000000000000\n#{m},h=y v=3i 1700000000000000000",
+              database: ctx.database
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, rows} =
+            unquote(client).query_sql(ctx.conn, "SELECT h, v, w FROM #{m} ORDER BY h",
+              database: ctx.database
+            )
+
+          assert rows == [%{"h" => "x", "v" => 2, "w" => 1}, %{"h" => "y", "v" => 3}]
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Duplicate points (v2)
+  # ---------------------------------------------------------------------------
+
+  defp v2_duplicate_tests(client) do
+    quote do
+      describe "write/3 — v2 duplicate point contract" do
+        test "a point rewritten at the same tags and time merges, the later write winning",
+             ctx do
+          m = "contract_v2dup_#{System.unique_integer([:positive])}"
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, "#{m},h=x v=1i,w=1i 1700000000000000000",
+              database: ctx.database
+            )
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, "#{m},h=x v=2i 1700000000000000000",
+              database: ctx.database
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, rows} =
+            unquote(client).query_flux(
+              ctx.conn,
+              ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) \|> filter(fn: (r) => r._measurement == "#{m}")|
+            )
+
+          assert Enum.sort(Enum.map(rows, &{&1["_field"], &1["_value"]})) == [{"v", 2}, {"w", 1}]
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Parameterized SQL queries (v3_core, v3_enterprise)
   # ---------------------------------------------------------------------------
 
@@ -2222,6 +2344,36 @@ defmodule InfluxElixir.ClientContract do
             )
 
           assert [%{"time" => ~U[2023-11-14 22:13:20.000000Z]}] = rows
+        end
+
+        test "short spellings, strings and auto are the engine's; an unknown precision is 400",
+             ctx do
+          m = "contract_prec2_#{System.unique_integer([:positive])}"
+
+          for {precision, ts} <- [
+                {:ms, 1_700_000_000_000},
+                {"s", 1_700_000_000},
+                {:auto, 1_700_000_000}
+              ] do
+            assert {:ok, :written} =
+                     unquote(client).write(ctx.conn, "#{m} value=1i #{ts}",
+                       database: ctx.database,
+                       precision: precision
+                     )
+          end
+
+          assert {:error, %{status: 400, body: "serde error: unknown variant `bogus`" <> _rest}} =
+                   unquote(client).write(ctx.conn, "#{m} value=1i 1",
+                     database: ctx.database,
+                     precision: :bogus
+                   )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, rows} =
+            unquote(client).query_sql(ctx.conn, "SELECT time FROM #{m}", database: ctx.database)
+
+          assert Enum.map(rows, & &1["time"]) == [~U[2023-11-14 22:13:20.000000Z]]
         end
       end
     end

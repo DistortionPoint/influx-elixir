@@ -87,6 +87,12 @@ defmodule InfluxElixir.Client.Local do
       one line; an integer must fit in 64 bits (`7u` is unsigned); a newline
       inside a quoted string value is part of the value; an empty payload is
       "incoming write was empty".
+    * Points with the same measurement, tag set and timestamp are one point,
+      on both versions (verified): their fields merge and the later write
+      wins per field — `v=1i,w=1i` then `v=2i` at the same instant reads
+      back as `v=2, w=1`, and the last of two such lines in one payload
+      wins. A different tag value is a different point. `DELETE` removes
+      the merged point.
     * Under the `:v2` profile the rules are InfluxDB 2's, verified against
       2.7: a field type conflict is HTTP 422 (`{"code":"unprocessable
       entity","message":"... field type conflict: input field \"v\" on
@@ -251,8 +257,15 @@ defmodule InfluxElixir.Client.Local do
 
   ## Timestamp Precision
 
-  Pass `precision: :nanosecond | :microsecond | :millisecond | :second`
-  in opts to normalise stored timestamps to nanoseconds.
+  Pass `precision:` in opts to say what unit numeric timestamps are in.
+  The spellings are the engine's, verified: InfluxDB 3 (`:v3_core`,
+  `:v3_enterprise`) takes `ns | n | nanosecond | us | u | microsecond |
+  ms | millisecond | s | second | auto` as an atom or a string, where
+  `auto` guesses the unit from the magnitude (below 5e9 seconds, 5e12
+  milliseconds, 5e15 microseconds, else nanoseconds); anything else is the
+  engine's 400 `serde error: unknown variant`. InfluxDB 2 (`:v2`) takes
+  `ns | us | ms | s` and the long names `HTTP.write/3` maps onto them, and
+  answers 400 `invalid precision` to the rest. Default: nanoseconds.
   """
 
   @behaviour InfluxElixir.Client
@@ -474,18 +487,19 @@ defmodule InfluxElixir.Client.Local do
   cannot be parsed an `{:error, %{status: 400, body: ...}}` is returned.
 
   Payloads beginning with gzip magic bytes are automatically decompressed.
-  Pass `precision: :nanosecond | :microsecond | :millisecond | :second` to
-  control how numeric timestamps are interpreted (default: `:nanosecond`).
+  Pass `precision:` to say what unit numeric timestamps are in (default
+  nanoseconds); see "Timestamp Precision" in the moduledoc for the
+  spellings each profile accepts and `auto`.
   """
   @impl true
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(%{table: table, profile: profile} = conn, payload, opts \\ []) do
     database = resolve_database(opts, conn)
-    precision = Keyword.get(opts, :precision, :nanosecond)
 
     with :ok <- require_capability(conn, :write),
          {:ok, text} <- maybe_decompress(payload),
+         {:ok, precision} <- normalize_precision(Keyword.get(opts, :precision), profile),
          :ok <- ensure_database(table, database, profile) do
       case LineProtocolParser.parse_lines(text, precision, dialect(profile)) do
         {:ok, lines} -> store_lines(table, database, lines, profile)
@@ -493,6 +507,67 @@ defmodule InfluxElixir.Client.Local do
         {:error, _empty} when profile == :v2 -> {:ok, :written}
         {:error, _reason} = error -> error
       end
+    end
+  end
+
+  # What `HTTP.write/3` plus the engine accept for `:precision`, verified:
+  # InfluxDB 3 takes the spellings below verbatim (case-sensitive) and
+  # answers 400 to anything else; InfluxDB 2 takes only `ns|us|ms|s`, which
+  # `HTTP.write/3` maps the long names onto, and answers 400 to the rest.
+  @v3_precisions %{
+    "auto" => :auto,
+    "s" => :second,
+    "second" => :second,
+    "ms" => :millisecond,
+    "millisecond" => :millisecond,
+    "u" => :microsecond,
+    "us" => :microsecond,
+    "microsecond" => :microsecond,
+    "n" => :nanosecond,
+    "ns" => :nanosecond,
+    "nanosecond" => :nanosecond
+  }
+
+  @v2_precisions Map.take(
+                   @v3_precisions,
+                   ~w(ns nanosecond us microsecond ms millisecond s second)
+                 )
+
+  @spec normalize_precision(atom() | binary() | nil, profile()) ::
+          {:ok, LineProtocolParser.precision()} | {:error, map()}
+  defp normalize_precision(nil, _profile), do: {:ok, :nanosecond}
+
+  defp normalize_precision(precision, :v2) do
+    case Map.fetch(@v2_precisions, to_string(precision)) do
+      {:ok, unit} ->
+        {:ok, unit}
+
+      :error ->
+        {:error,
+         %{
+           status: 400,
+           body:
+             Jason.encode!(%{
+               "code" => "invalid",
+               "message" => "invalid precision; valid precision units are ns, us, ms, and s"
+             })
+         }}
+    end
+  end
+
+  defp normalize_precision(precision, _v3) do
+    case Map.fetch(@v3_precisions, to_string(precision)) do
+      {:ok, unit} ->
+        {:ok, unit}
+
+      :error ->
+        {:error,
+         %{
+           status: 400,
+           body:
+             "serde error: unknown variant `#{precision}`, expected one of `auto`, `s`, " <>
+               "`second`, `millisecond`, `ms`, `microsecond`, `u`, `us`, `n`, `nanosecond`, `ns`"
+         }}
     end
   end
 
@@ -1238,9 +1313,39 @@ defmodule InfluxElixir.Client.Local do
     :ets.select(table, spec, 1) != :"$end_of_table"
   end
 
-  # Points come back in key (= insertion) order.
+  # InfluxDB — both versions, verified — treats a measurement's points with
+  # the same tag set and timestamp as one point: their fields merge and the
+  # later write wins per field, within a payload and across payloads.
+  # Points are stored as written, one insert each (see `store_point/3`), and
+  # merged here on read; the merged point keeps the first write's position.
+  @spec merge_duplicates([point_map()]) :: [point_map()]
+  defp merge_duplicates(points) do
+    {merged, order} =
+      Enum.reduce(points, {%{}, []}, fn point, {merged, order} ->
+        key = {point.measurement, point.tags, point.timestamp}
+
+        case merged do
+          %{^key => earlier} ->
+            later = %{earlier | fields: Map.merge(earlier.fields, point.fields)}
+            {Map.put(merged, key, later), order}
+
+          _first ->
+            {Map.put(merged, key, point), [key | order]}
+        end
+      end)
+
+    order |> Enum.reverse() |> Enum.map(&Map.fetch!(merged, &1))
+  end
+
+  # Points come back in key (= insertion) order, duplicates merged.
   @spec fetch_points(:ets.table(), binary(), binary()) :: [point_map()]
   defp fetch_points(table, database, measurement) do
+    table |> raw_points(database, measurement) |> merge_duplicates()
+  end
+
+  # Every stored object for a measurement, as written.
+  @spec raw_points(:ets.table(), binary(), binary()) :: [point_map()]
+  defp raw_points(table, database, measurement) do
     :ets.select(table, [{{{:point, database, measurement, :_}, :"$1"}, [], [:"$1"]}])
   end
 
@@ -1256,12 +1361,19 @@ defmodule InfluxElixir.Client.Local do
 
   @spec all_points_in_db(:ets.table(), binary()) :: [point_map()]
   defp all_points_in_db(table, database) do
-    :ets.select(table, [{{{:point, database, :_, :_}, :"$1"}, [], [:"$1"]}])
+    table
+    |> :ets.select([{{{:point, database, :_, :_}, :"$1"}, [], [:"$1"]}])
+    |> merge_duplicates()
   end
 
   @spec all_points(:ets.table()) :: [point_map()]
   defp all_points(table) do
-    :ets.select(table, [{{{:point, :_, :_, :_}, :"$1"}, [], [:"$1"]}])
+    # Merged per database: the same series and time in two databases are
+    # two points.
+    table
+    |> :ets.select([{{{:point, :"$1", :_, :_}, :_}, [], [:"$1"]}])
+    |> Enum.uniq()
+    |> Enum.flat_map(&all_points_in_db(table, &1))
   end
 
   # ---------------------------------------------------------------------------
@@ -1360,16 +1472,25 @@ defmodule InfluxElixir.Client.Local do
 
   @spec delete_points(:ets.table(), binary(), binary(), [SQLParser.where_node()]) ::
           non_neg_integer()
-  # Each matching point is deleted by its own key, so a concurrent write to
-  # the same measurement is never lost to a rewrite of the whole list.
+  # The WHERE is evaluated over merged points, as the engine sees them; every
+  # stored object behind a matching point is then deleted by its own key, so
+  # a concurrent write to the same measurement is never lost to a rewrite of
+  # the whole list. The count is of points as the engine counts them.
   defp delete_points(table, database, measurement, where) do
-    table
-    |> :ets.select([{{{:point, database, measurement, :_}, :_}, [], [:"$_"]}])
-    |> Enum.filter(fn {_key, point} ->
-      SQLExecutor.matches_all?(point, where)
-    end)
-    |> Enum.map(fn {key, _point} -> :ets.delete(table, key) end)
-    |> length()
+    stored = :ets.select(table, [{{{:point, database, measurement, :_}, :_}, [], [:"$_"]}])
+
+    doomed =
+      stored
+      |> Enum.map(fn {_key, point} -> point end)
+      |> merge_duplicates()
+      |> Enum.filter(&SQLExecutor.matches_all?(&1, where))
+      |> MapSet.new(&{&1.tags, &1.timestamp})
+
+    for {key, point} <- stored, MapSet.member?(doomed, {point.tags, point.timestamp}) do
+      :ets.delete(table, key)
+    end
+
+    MapSet.size(doomed)
   end
 
   @spec generate_id() :: binary()

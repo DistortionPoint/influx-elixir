@@ -163,23 +163,23 @@ defmodule InfluxElixir.Telemetry do
 
   ## Parameters
 
-    * `duration` - elapsed time in native units (from `System.monotonic_time/0`)
-    * `metadata` - map with `:database`, `:point_count`, `:bytes`, and
-      `:compressed_bytes` keys
+    * `duration` - elapsed time in native units (from `System.monotonic_time/0`);
+      emitted with `monotonic_time`, the same measurements `:telemetry.span/3` emits
+    * `metadata` - map with `:database`, `:point_count` and `:bytes` keys
 
   ## Examples
 
       start = System.monotonic_time()
       # ... perform write ...
       InfluxElixir.Telemetry.write_stop(System.monotonic_time() - start,
-        %{database: "mydb", point_count: 1, bytes: 42, compressed_bytes: 30}
+        %{database: "mydb", point_count: 1, bytes: 42}
       )
   """
   @spec write_stop(integer(), map()) :: :ok
   def write_stop(duration, metadata) do
     :telemetry.execute(
       @write_event ++ [:stop],
-      %{duration: duration},
+      %{duration: duration, monotonic_time: System.monotonic_time()},
       metadata
     )
   end
@@ -189,7 +189,8 @@ defmodule InfluxElixir.Telemetry do
 
   ## Parameters
 
-    * `duration` - elapsed time in native units (from `System.monotonic_time/0`)
+    * `duration` - elapsed time in native units (from `System.monotonic_time/0`);
+      emitted with `monotonic_time`, the same measurements `:telemetry.span/3` emits
     * `metadata` - map with `:database`, `:kind`, `:reason`, and `:stacktrace` keys
 
   ## Examples
@@ -210,7 +211,7 @@ defmodule InfluxElixir.Telemetry do
   def write_exception(duration, metadata) do
     :telemetry.execute(
       @write_event ++ [:exception],
-      %{duration: duration},
+      %{duration: duration, monotonic_time: System.monotonic_time()},
       metadata
     )
   end
@@ -238,7 +239,8 @@ defmodule InfluxElixir.Telemetry do
 
   ## Parameters
 
-    * `duration` - elapsed time in native units (from `System.monotonic_time/0`)
+    * `duration` - elapsed time in native units (from `System.monotonic_time/0`);
+      emitted with `monotonic_time`, the same measurements `:telemetry.span/3` emits
     * `metadata` - map with `:database`, `:transport`, and `:row_count` keys
 
   ## Examples
@@ -253,7 +255,7 @@ defmodule InfluxElixir.Telemetry do
   def query_stop(duration, metadata) do
     :telemetry.execute(
       @query_event ++ [:stop],
-      %{duration: duration},
+      %{duration: duration, monotonic_time: System.monotonic_time()},
       metadata
     )
   end
@@ -263,7 +265,8 @@ defmodule InfluxElixir.Telemetry do
 
   ## Parameters
 
-    * `duration` - elapsed time in native units (from `System.monotonic_time/0`)
+    * `duration` - elapsed time in native units (from `System.monotonic_time/0`);
+      emitted with `monotonic_time`, the same measurements `:telemetry.span/3` emits
     * `metadata` - map with `:database`, `:transport`, `:kind`, `:reason`, and
       `:stacktrace` keys
 
@@ -286,7 +289,7 @@ defmodule InfluxElixir.Telemetry do
   def query_exception(duration, metadata) do
     :telemetry.execute(
       @query_event ++ [:exception],
-      %{duration: duration},
+      %{duration: duration, monotonic_time: System.monotonic_time()},
       metadata
     )
   end

@@ -2,7 +2,8 @@ defmodule InfluxElixir.ConnectionSupervisor do
   @moduledoc """
   Per-connection supervisor using `:rest_for_one` strategy.
 
-  Manages a Finch pool and BatchWriter GenServers for a
+  Manages a Finch pool (unless the config names an existing one with
+  `:finch_name`) and a BatchWriter GenServer for a
   single named InfluxDB connection with crash isolation.
 
   On init, registers the connection config in
@@ -27,6 +28,7 @@ defmodule InfluxElixir.ConnectionSupervisor do
     * `:database` - default database for writes/queries
     * `:databases` - list of database names (see `InfluxElixir.Config`)
     * `:pool_size` - Finch connection pool size (default: 10)
+    * `:finch_name` - an existing Finch pool to use; no per-connection pool is started
     * `:batch_writer` - keyword options for an `InfluxElixir.Write.BatchWriter`
       child; omitted means no writer
     * any other `InfluxElixir.Config` option (`:api_version`, `:scheme`, ...)
@@ -63,12 +65,15 @@ defmodule InfluxElixir.ConnectionSupervisor do
     {:ok, conn} = client.init_connection(config)
     InfluxElixir.Connection.put(name, conn)
 
-    finch_child =
-      {Finch,
-       name: finch_name,
-       pools: %{
-         :default => [size: pool_size]
-       }}
+    # `:finch_name` points at a pool the consumer runs; starting another one
+    # here would leave an idle pool per connection and make the writer
+    # depend (rest_for_one) on a pool it never uses.
+    finch_children =
+      if Keyword.has_key?(config, :finch_name) do
+        []
+      else
+        [{Finch, name: finch_name, pools: %{default: [size: pool_size]}}]
+      end
 
     batch_opts = Keyword.get(config, :batch_writer)
 
@@ -83,9 +88,9 @@ defmodule InfluxElixir.ConnectionSupervisor do
             name: batch_writer_name(name)
           )
 
-        [finch_child, {InfluxElixir.Write.BatchWriter, writer_opts}]
+        finch_children ++ [{InfluxElixir.Write.BatchWriter, writer_opts}]
       else
-        [finch_child]
+        finch_children
       end
 
     Supervisor.init(children, strategy: :rest_for_one)

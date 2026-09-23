@@ -76,13 +76,17 @@ defmodule InfluxElixir.Connection do
   """
   @spec get(atom()) :: {:ok, term()} | {:error, :not_found}
   def get(name) when is_atom(name) do
-    {:ok, :persistent_term.get({__MODULE__, name})}
-  rescue
-    ArgumentError -> {:error, :not_found}
+    missing = make_ref()
+
+    case :persistent_term.get({__MODULE__, name}, missing) do
+      ^missing -> {:error, :not_found}
+      connection -> {:ok, connection}
+    end
   end
 
   @doc """
-  Retrieves the connection config for the given name, raising on miss.
+  Retrieves the connection config for the given name, raising an
+  `ArgumentError` that names the missing connection.
 
   ## Parameters
 
@@ -97,7 +101,16 @@ defmodule InfluxElixir.Connection do
   """
   @spec fetch!(atom()) :: term()
   def fetch!(name) when is_atom(name) do
-    :persistent_term.get({__MODULE__, name})
+    case get(name) do
+      {:ok, connection} ->
+        connection
+
+      {:error, :not_found} ->
+        raise ArgumentError,
+              "no InfluxElixir connection named #{inspect(name)}: list it under " <>
+                "`config :influx_elixir, :connections` or add it with " <>
+                "InfluxElixir.add_connection/2"
+    end
   end
 
   @doc """

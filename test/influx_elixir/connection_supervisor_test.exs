@@ -65,10 +65,24 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       finch_name = ConnectionSupervisor.finch_name(name)
       assert Process.whereis(finch_name) != nil
     end
+
+    test "no per-connection Finch pool is started when :finch_name names an existing one" do
+      name = unique_name()
+      finch = :"conn_sup_existing_finch_#{System.unique_integer([:positive])}"
+      start_supervised!({Finch, name: finch})
+
+      {:ok, _pid} =
+        InfluxElixir.add_connection(name, host: "h", token: "t", finch_name: finch)
+
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+
+      assert Process.whereis(ConnectionSupervisor.finch_name(name)) == nil
+      assert {:ok, %{"status" => "pass"}} = InfluxElixir.health(name)
+    end
   end
 
   describe "init/1 — batch writer child" do
-    test "the writer flushes through the initialised connection", %{} do
+    test "the writer flushes through the initialised connection" do
       # Regression: the writer received the raw config keyword list, which
       # Client.Local.write/3 cannot use (it needs the ETS-backed map).
       name = unique_name()

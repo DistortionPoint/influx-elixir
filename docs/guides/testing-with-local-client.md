@@ -775,6 +775,9 @@ table, a column-type conflict with the timestamp column on an existing one),
 a key cannot be both a tag and a field on
 one line, an integer must fit in 64 bits (`7u` is unsigned), a newline inside
 a quoted string value is part of the value, and an empty payload is rejected.
+Points with the same measurement, tag set and timestamp are one point on both
+versions (verified): their fields merge and the later write wins per field,
+so a fixture that rewrites `v=2i` at an existing instant reads back one row.
 
 Under the `:v2` profile the rules are InfluxDB 2's (verified against 2.7): a
 field type conflict is HTTP 422 with `"code": "unprocessable entity"` and a

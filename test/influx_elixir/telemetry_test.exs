@@ -209,11 +209,12 @@ defmodule InfluxElixir.TelemetryTest do
       handler_id = unique_handler_id("write_stop")
       attach_handler(handler_id, [:influx_elixir, :write, :stop])
 
-      meta = %{database: "mydb", point_count: 5, bytes: 200, compressed_bytes: 120}
+      meta = %{database: "mydb", point_count: 5, bytes: 200}
       Telemetry.write_stop(12_345, meta)
 
       assert_receive {:telemetry, [:influx_elixir, :write, :stop], measurements, recv_meta}
       assert measurements.duration == 12_345
+      assert is_integer(measurements.monotonic_time)
       assert recv_meta == meta
     end
   end
@@ -229,6 +230,7 @@ defmodule InfluxElixir.TelemetryTest do
       assert_receive {:telemetry, [:influx_elixir, :write, :exception], measurements, recv_meta}
 
       assert measurements.duration == 99_999
+      assert is_integer(measurements.monotonic_time)
       assert recv_meta == meta
     end
   end
@@ -260,6 +262,7 @@ defmodule InfluxElixir.TelemetryTest do
 
       assert_receive {:telemetry, [:influx_elixir, :query, :stop], measurements, recv_meta}
       assert measurements.duration == 55_000
+      assert is_integer(measurements.monotonic_time)
       assert recv_meta == meta
     end
   end
@@ -282,6 +285,7 @@ defmodule InfluxElixir.TelemetryTest do
       assert_receive {:telemetry, [:influx_elixir, :query, :exception], measurements, recv_meta}
 
       assert measurements.duration == 77_777
+      assert is_integer(measurements.monotonic_time)
       assert recv_meta == meta
     end
   end

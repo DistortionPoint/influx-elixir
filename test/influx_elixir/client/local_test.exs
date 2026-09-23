@@ -397,6 +397,68 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert row["time"] == ~U[1970-01-01 00:00:01.000000Z]
     end
+
+    test "the engine's spellings are accepted as atoms or strings; the unit is the same",
+         %{conn: conn, db: db} do
+      # Verified against InfluxDB 3: every spelling below is a 204 there.
+      for {{precision, ts}, i} <-
+            Enum.with_index([
+              {:ns, 1_000_000_000},
+              {"n", 1_000_000_000},
+              {"nanosecond", 1_000_000_000},
+              {:us, 1_000_000},
+              {:u, 1_000_000},
+              {"microsecond", 1_000_000},
+              {:ms, 1_000},
+              {"millisecond", 1_000},
+              {:s, 1},
+              {"second", 1}
+            ]) do
+        {:ok, :written} =
+          Local.write(conn, "p,s=#{i} value=1i #{ts}", database: db, precision: precision)
+      end
+
+      assert {:ok, [%{"n" => 10}]} =
+               Local.query_sql(
+                 conn,
+                 "SELECT COUNT(value) AS n FROM p WHERE time = '1970-01-01T00:00:01'",
+                 database: db
+               )
+    end
+
+    test ":auto guesses the unit from the magnitude at the engine's thresholds",
+         %{conn: conn, db: db} do
+      # Verified against InfluxDB 3: |ts| < 5e9 is seconds, < 5e12 milliseconds,
+      # < 5e15 microseconds, else nanoseconds.
+      for {ts, expected} <- [
+            {4_999_999_999, ~U[2128-06-11 08:53:19.000000Z]},
+            {5_000_000_000, ~U[1970-02-27 20:53:20.000000Z]},
+            {4_999_999_999_999, ~U[2128-06-11 08:53:19.999000Z]},
+            {5_000_000_000_000, ~U[1970-02-27 20:53:20.000000Z]},
+            {4_999_999_999_999_999, ~U[2128-06-11 08:53:19.999999Z]},
+            {5_000_000_000_000_000, ~U[1970-02-27 20:53:20.000000Z]},
+            {-9_999_999_999, ~U[1969-09-07 06:13:20.001000Z]},
+            {1_700_000_000, ~U[2023-11-14 22:13:20.000000Z]}
+          ] do
+        m = "auto_#{System.unique_integer([:positive])}"
+        {:ok, :written} = Local.write(conn, "#{m} value=1i #{ts}", database: db, precision: :auto)
+
+        assert {:ok, [%{"time" => ^expected}]} =
+                 Local.query_sql(conn, "SELECT time FROM #{m}", database: db),
+               inspect(ts)
+      end
+    end
+
+    test "an unknown precision is the engine's 400, case-sensitively", %{conn: conn, db: db} do
+      for precision <- [:bogus, "NS", "nanoseconds"] do
+        assert {:error, %{status: 400, body: body}} =
+                 Local.write(conn, "q value=1i 1", database: db, precision: precision)
+
+        assert body ==
+                 "serde error: unknown variant `#{precision}`, expected one of `auto`, `s`, " <>
+                   "`second`, `millisecond`, `ms`, `microsecond`, `u`, `us`, `n`, `nanosecond`, `ns`"
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -5100,6 +5162,109 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, :written} = Local.write(conn, "", database: "metrics")
       assert {:ok, :written} = Local.write(conn, "# only a comment\n", database: "metrics")
+    end
+
+    test "precision takes ns, us, ms, s and the long names; auto and the rest are the v2 400",
+         %{conn: conn} do
+      for precision <- [:ms, "ms", :millisecond, "millisecond"] do
+        {:ok, :written} =
+          Local.write(conn, "pr value=1i 1700000000000",
+            database: "metrics",
+            precision: precision
+          )
+      end
+
+      assert {:ok, rows} = Local.query_flux(conn, v2_flux("pr"))
+      assert Enum.map(rows, & &1["_time"]) |> Enum.uniq() == [~U[2023-11-14 22:13:20.000000Z]]
+
+      for precision <- [:auto, :bogus, "NS"] do
+        assert {:error, %{status: 400, body: body}} =
+                 Local.write(conn, "pr value=1i 1", database: "metrics", precision: precision)
+
+        assert Jason.decode!(body) == %{
+                 "code" => "invalid",
+                 "message" => "invalid precision; valid precision units are ns, us, ms, and s"
+               }
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Duplicate points: same measurement, tags and timestamp are one point.
+  # Verified against InfluxDB 3 and 2.7
+  # (docs/design/2026-09-23_precision-spellings-and-connection-plumbing.md).
+  # ---------------------------------------------------------------------------
+
+  describe "write/3 — a point rewritten at the same tags and time" do
+    setup do
+      {:ok, conn} = Local.start(databases: ["dup"], profile: :v3_enterprise)
+      on_exit(fn -> Local.stop(conn) end)
+      {:ok, conn: conn, db: "dup"}
+    end
+
+    @t "1700000000000000000"
+
+    test "the later write wins per field and the fields merge", %{conn: conn, db: db} do
+      {:ok, :written} = Local.write(conn, "a,h=x v=1i #{@t}", database: db)
+      {:ok, :written} = Local.write(conn, "a,h=x v=2i #{@t}", database: db)
+
+      assert {:ok, [%{"h" => "x", "v" => 2}]} =
+               Local.query_sql(conn, "SELECT * FROM a", database: db)
+
+      {:ok, :written} = Local.write(conn, "b,h=x v=1i #{@t}", database: db)
+      {:ok, :written} = Local.write(conn, "b,h=x w=2i #{@t}", database: db)
+
+      assert {:ok, [%{"v" => 1, "w" => 2}]} =
+               Local.query_sql(conn, "SELECT * FROM b", database: db)
+
+      {:ok, :written} = Local.write(conn, "c,h=x v=1i,w=1i #{@t}", database: db)
+      {:ok, :written} = Local.write(conn, "c,h=x v=2i #{@t}", database: db)
+
+      assert {:ok, [%{"v" => 2, "w" => 1}]} =
+               Local.query_sql(conn, "SELECT * FROM c", database: db)
+    end
+
+    test "a different tag value is another point; the same series at another time too",
+         %{conn: conn, db: db} do
+      {:ok, :written} = Local.write(conn, "d,h=x v=1i #{@t}\nd,h=y v=2i #{@t}", database: db)
+      {:ok, :written} = Local.write(conn, "d,h=x v=3i 1700000000000000001", database: db)
+
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT h, v FROM d ORDER BY v", database: db)
+      assert rows == [%{"h" => "x", "v" => 1}, %{"h" => "y", "v" => 2}, %{"h" => "x", "v" => 3}]
+    end
+
+    test "within one payload the last line wins; aggregates see one point", %{conn: conn, db: db} do
+      {:ok, :written} = Local.write(conn, "e,h=x v=1i #{@t}\ne,h=x v=2i #{@t}", database: db)
+      {:ok, :written} = Local.write(conn, "e v=5i #{@t}\ne v=6i #{@t}", database: db)
+
+      assert {:ok, [%{"n" => 2, "s" => 8}]} =
+               Local.query_sql(conn, "SELECT COUNT(v) AS n, SUM(v) AS s FROM e", database: db)
+
+      assert {:ok, [%{"v" => 6}]} =
+               Local.query_sql(conn, "SELECT v FROM e WHERE h IS NULL", database: db)
+    end
+
+    test "DELETE removes the merged point and counts it once", %{conn: conn, db: db} do
+      {:ok, :written} =
+        Local.write(conn, "f,h=x v=1i #{@t}\nf,h=x w=1i #{@t}\nf,h=y v=9i #{@t}", database: db)
+
+      assert {:ok, %{"rows_affected" => 1}} =
+               Local.execute_sql(conn, "DELETE FROM f WHERE w = 1", database: db)
+
+      assert {:ok, [%{"h" => "y", "v" => 9}]} =
+               Local.query_sql(conn, "SELECT * FROM f", database: db)
+    end
+
+    test "the :v2 profile merges the same way and Flux reads one row per field" do
+      {:ok, conn} = Local.start(profile: :v2)
+      on_exit(fn -> Local.stop(conn) end)
+      :ok = Local.create_bucket(conn, "metrics")
+
+      {:ok, :written} = Local.write(conn, "g,h=x v=1i,w=1i #{@t}", database: "metrics")
+      {:ok, :written} = Local.write(conn, "g,h=x v=2i #{@t}", database: "metrics")
+
+      assert {:ok, rows} = Local.query_flux(conn, v2_flux("g"))
+      assert Enum.sort(Enum.map(rows, &{&1["_field"], &1["_value"]})) == [{"v", 2}, {"w", 1}]
     end
   end
 end
