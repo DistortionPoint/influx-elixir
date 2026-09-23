@@ -42,6 +42,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-22 | [`local-v2-write-rules`](2026-09-22_local-v2-write-rules.md) | `:v2` profile write rules verified against InfluxDB 2.7: 422 conflicts, all-or-nothing parse errors, `time` field dropped |
 | 2026-09-22 | [`encoder-validation-and-reserved-time`](2026-09-22_encoder-validation-and-reserved-time.md) | `LineProtocol.encode/1` refuses lines no server accepts (newline corruption verified); Local's `time` wording per table state; `ResponseParser` timestamp shape guard |
 | 2026-09-23 | [`precision-spellings-and-connection-plumbing`](2026-09-23_precision-spellings-and-connection-plumbing.md) | Local accepts the engines' precision spellings and `auto` (thresholds verified); duplicate points merge on read as both engines do; bucket retention and 404s as the engines answer; admin `:retention` docs; no idle Finch pool with `:finch_name`; clearer `fetch!/1`; observable Writer and admin tests |
+| 2026-09-23 | [`flight-null-columns`](2026-09-23_flight-null-columns.md) | Flight rows omit null columns as HTTP does; verified identical on 25,000 mixed-type rows |
 
 ## Verifying against a real engine
 

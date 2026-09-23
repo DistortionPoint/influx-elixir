@@ -1148,7 +1148,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
       assert Enum.at(rows, 0)["v"] == 10
-      assert Enum.at(rows, 1)["v"] == nil
+      refute Map.has_key?(Enum.at(rows, 1), "v")
       assert Enum.at(rows, 2)["v"] == 30
     end
 
@@ -1159,9 +1159,9 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 3)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["f"] == nil
+      refute Map.has_key?(Enum.at(rows, 0), "f")
       assert_in_delta Enum.at(rows, 1)["f"], 2.0, 1.0e-9
-      assert Enum.at(rows, 2)["f"] == nil
+      refute Map.has_key?(Enum.at(rows, 2), "f")
     end
 
     test "all-null column via validity bitmap" do
@@ -1171,7 +1171,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.all?(rows, fn r -> r["n"] == nil end)
+      assert rows == [%{}, %{}]
     end
   end
 
@@ -1209,7 +1209,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
       assert Enum.at(rows, 0)["v"] == 10
-      assert Enum.at(rows, 1)["v"] == nil
+      refute Map.has_key?(Enum.at(rows, 1), "v")
       assert Enum.at(rows, 2)["v"] == 30
     end
 
@@ -1995,7 +1995,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
       assert Enum.at(rows, 0)["v"] == nil
-      assert Enum.at(rows, 1)["v"] == nil
+      refute Map.has_key?(Enum.at(rows, 1), "v")
     end
   end
 
@@ -2057,11 +2057,11 @@ defmodule InfluxElixir.Flight.ReaderTest do
       assert {:ok, []} = Reader.decode_flight_data([schema, batch])
     end
 
-    test "a record batch with an empty buffers vector decodes every column as null" do
+    test "a record batch with an empty buffers vector decodes every column as null (absent)" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
       batch = batch_fd(<<>>, [], 2)
 
-      assert {:ok, [%{"v" => nil}, %{"v" => nil}]} = Reader.decode_flight_data([schema, batch])
+      assert {:ok, [%{}, %{}]} = Reader.decode_flight_data([schema, batch])
     end
   end
 end

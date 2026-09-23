@@ -149,6 +149,33 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
       assert flight_row["time"] == ~U[2023-11-14 22:13:20.000000Z]
     end
 
+    test "a null column is absent from the row, as over HTTP, for every field type", ctx do
+      # A second series with no `region` tag and no `s`, `b`, `u` fields:
+      # its row must not carry those keys at all, over either transport.
+      lp = """
+      flight_nulls,host=a,region=r1 v=1.5,c=1i,u=7u,s="x",b=true 1700000000000000000
+      flight_nulls,host=b v=2.5,c=2i 1700000000000000001
+      """
+
+      {:ok, :written} = HTTP.write(ctx.conn, String.trim(lp), database: ctx.database)
+      InfluxElixir.ClientContract.settle(ctx)
+      sql = "SELECT * FROM flight_nulls ORDER BY time"
+
+      assert {:ok, http_rows} = HTTP.query_sql(ctx.conn, sql, database: ctx.database)
+
+      assert {:ok, flight_rows} =
+               HTTP.query_sql(ctx.conn, sql,
+                 database: ctx.database,
+                 transport: :flight,
+                 flight_port: ctx.conn[:port],
+                 tls: false
+               )
+
+      assert flight_rows == http_rows
+      assert [_full, sparse] = flight_rows
+      assert Enum.sort(Map.keys(sparse)) == ["c", "host", "time", "v"]
+    end
+
     test "rejects params over Flight instead of dropping them", ctx do
       assert {:error, :params_unsupported_over_flight} =
                HTTP.query_sql(ctx.conn, "SELECT 1",

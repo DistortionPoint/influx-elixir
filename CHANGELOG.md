@@ -56,6 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`transport: :flight` returned null columns as `nil` keys.** Over
+  HTTP, InfluxDB 3 leaves a null column out of the row, and the library
+  documents that a null column is absent, not `nil`. The Flight reader
+  put every schema column in every row, so the same query gave different
+  maps per transport, and code matching on `Map.has_key?/2` or comparing
+  rows broke when switching. Verified on 25,000 rows mixing tags, integer,
+  unsigned, float, string and boolean fields and nulls across several
+  record batches: the rows differed only in `nil` keys, and now they are
+  identical. The reader's null tests asserted `row["v"] == nil`, which
+  passes whether the key is absent or `nil`; they now assert the key is
+  absent.
 - **`Admin.Databases` and `Admin.Buckets` documented options that did not
   exist.** The docs named `:retention_period` and `:retention_seconds`;
   `Client.HTTP` reads `:retention`, so a consumer following the docs got

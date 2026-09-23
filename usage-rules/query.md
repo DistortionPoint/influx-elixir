@@ -14,7 +14,7 @@
 
 ## Results
 - Rows are maps with string keys; every timestamp column — `time`, Flux `_time`, a `DATE_BIN(...) AS bucket` alias, `selector_*(...)['time']`, `MAX(time)` — is a `DateTime` with microsecond precision on every client and transport; compare with `DateTime.compare/2` or a six-digit sigil
-- A null column is absent from the row, not present as `nil` (`COUNT` is `0`, never null); assert with `refute Map.has_key?(row, "col")`
+- A null column is absent from the row, not present as `nil` (`COUNT` is `0`, never null), over HTTP and `transport: :flight` alike; assert with `refute Map.has_key?(row, "col")`
 - `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `STDDEV[_SAMP|_POP]`, `VAR[_SAMP|_POP]` accept field arithmetic (`SUM(price * volume)`); `VARIANCE` does not exist in v3 SQL
 - Selectors: `selector_first|last|min|max(field, time)['value' | 'time'] AS alias`; the InfluxQL `FIRST()`/`LAST()` are not v3 SQL
 - `WHERE time` compares only with a quoted ISO-8601 datetime or date, or `now() +/- INTERVAL 'N unit'`; a bare integer or integer param is a planning error on the server and is rejected by `Client.Local` too — bind a `DateTime`

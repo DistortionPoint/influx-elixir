@@ -30,7 +30,9 @@ defmodule InfluxElixir.Flight.Reader do
   | Timestamp  | `DateTime.t()` (converted with the column's unit; nanoseconds
     are truncated to microseconds, as on the HTTP transport) |
 
-  Null bitmaps are supported; null values become `nil`.
+  Null bitmaps are supported. A null cell is left out of the row map, the
+  same as a null column in InfluxDB 3's JSON, so a row is identical over
+  Flight and HTTP; assert with `refute Map.has_key?(row, "col")`.
 
   ## Limitations
 
@@ -696,7 +698,9 @@ defmodule InfluxElixir.Flight.Reader do
 
   # Columns are converted to tuples once so each cell is an O(1) `elem/2`;
   # `Enum.at/2` on the column lists made row assembly quadratic in the
-  # batch's row count. A column shorter than `n` still yields `nil` cells.
+  # batch's row count. A null cell (or a column shorter than `n`) is left
+  # out of the row, as InfluxDB 3's JSON leaves a null column out: a row is
+  # the same map over Flight and HTTP (verified against the engine).
   defp zip_columns(columns, vectors, n) do
     named_tuples =
       columns
@@ -704,9 +708,12 @@ defmodule InfluxElixir.Flight.Reader do
       |> Enum.zip(Enum.map(vectors, &List.to_tuple/1))
 
     for i <- 0..(n - 1)//1 do
-      named_tuples
-      |> Enum.map(fn {name, col} -> {name, cell(col, i)} end)
-      |> Map.new()
+      Enum.reduce(named_tuples, %{}, fn {name, col}, row ->
+        case cell(col, i) do
+          nil -> row
+          value -> Map.put(row, name, value)
+        end
+      end)
     end
   end
 
