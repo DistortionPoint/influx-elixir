@@ -4832,8 +4832,7 @@ defmodule InfluxElixir.Client.LocalTest do
          %{conn: conn, db: db} do
       for {lp, message} <- [
             {"m,time=x v=1i", "'time' is a reserved column"},
-            {"m time=5i,v=1i",
-             "invalid column type for column 'time', expected iox::column_type::timestamp, got iox::column_type::field::integer"},
+            {"m time=5i,v=1i", "'time' is a reserved column"},
             {"m,host=a host=1i",
              "invalid column type for column 'host', expected iox::column_type::tag, got iox::column_type::field::integer"},
             {"m v=9223372036854775808i", "Unable to parse integer value `9223372036854775808`"},
@@ -4844,6 +4843,34 @@ defmodule InfluxElixir.Client.LocalTest do
         assert {:error, %{status: 400, body: body}} = Local.write(conn, lp, database: db)
         assert [{1, ^message}] = partial_errors(body), lp
       end
+    end
+
+    test "on an existing table, time as a tag or field is a column-type conflict with the timestamp",
+         %{conn: conn, db: db} do
+      {:ok, :written} = Local.write(conn, "e,host=a v=1i 1700000000000000000", database: db)
+
+      for {lp, got} <- [
+            {"e,time=x v=1i", "iox::column_type::tag"},
+            {"e time=5i,v=1i", "iox::column_type::field::integer"}
+          ] do
+        assert {:error, %{status: 400, body: body}} = Local.write(conn, lp, database: db)
+
+        assert [{1, message}] = partial_errors(body)
+
+        assert message ==
+                 "invalid column type for column 'time', expected iox::column_type::timestamp, got " <>
+                   got
+      end
+
+      # A rejected line still registers the new columns it names, as the
+      # engine does: `n` became a tag on the line that failed on `v`.
+      assert {:error, _conflict} = Local.write(conn, "e,n=x v=2.0", database: db)
+      assert {:error, %{body: body}} = Local.write(conn, "e n=1i", database: db)
+
+      assert [
+               {1,
+                "invalid column type for column 'n', expected iox::column_type::tag, got iox::column_type::field::integer"}
+             ] = partial_errors(body)
     end
 
     test "int64 extremes, unsigned integers and a newline inside a quoted value are accepted",

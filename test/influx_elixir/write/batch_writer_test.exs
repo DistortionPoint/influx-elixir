@@ -515,6 +515,38 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       assert {:ok, %{total_errors: 1}} = BatchWriter.stats(pid)
     end
+
+    test "errors are counted per chain, not per attempt", %{http_conn: conn} do
+      pid =
+        start_writer(conn,
+          client: InfluxElixir.Client.HTTP,
+          flush_interval_ms: 60_000,
+          max_retries: 2,
+          base_retry_delay_ms: 1
+        )
+
+      # First attempt plus two retries all fail; the chain records one error.
+      assert {:error, {:connection_error, _reason}} =
+               BatchWriter.write_sync(pid, "cpu value=1.0")
+
+      assert {:ok, %{total_errors: 1, total_writes: 0}} = BatchWriter.stats(pid)
+      assert Process.alive?(pid)
+    end
+
+    test "with max_retries: 0 a transport error is recorded on the first flush",
+         %{http_conn: conn} do
+      pid =
+        start_writer(conn,
+          client: InfluxElixir.Client.HTTP,
+          flush_interval_ms: 60_000,
+          max_retries: 0
+        )
+
+      assert {:error, {:connection_error, _reason}} =
+               BatchWriter.write_sync(pid, "cpu value=1.0")
+
+      assert {:ok, %{total_errors: 1, total_writes: 0}} = BatchWriter.stats(pid)
+    end
   end
 
   describe "error paths via invalid line protocol" do

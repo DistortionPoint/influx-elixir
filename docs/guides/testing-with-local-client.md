@@ -770,7 +770,9 @@ A column's kind — tag, or integer / unsigned / float / string / boolean field 
 is fixed by the first write that names it, per database and measurement, and
 a fixture that writes `value=1i` and later `value=2.0` fails in the double the
 way it fails in production. Deleting the database drops the schema with the
-data. `time` is a reserved column, a key cannot be both a tag and a field on
+data. `time` is a reserved column (`'time' is a reserved column` on a new
+table, a column-type conflict with the timestamp column on an existing one),
+a key cannot be both a tag and a field on
 one line, an integer must fit in 64 bits (`7u` is unsigned), a newline inside
 a quoted string value is part of the value, and an empty payload is rejected.
 

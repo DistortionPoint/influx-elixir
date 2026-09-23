@@ -81,7 +81,9 @@ defmodule InfluxElixir.Client.Local do
       'v', expected iox::column_type::field::integer, got
       iox::column_type::field::float"). Deleting the database drops the
       schema with the data.
-    * `time` is a reserved column; a key cannot be both a tag and a field on
+    * `time` is a reserved column ("'time' is a reserved column" on a new table;
+      on an existing one the engine words it as a column-type conflict with
+      `iox::column_type::timestamp`); a key cannot be both a tag and a field on
       one line; an integer must fit in 64 bits (`7u` is unsigned); a newline
       inside a quoted string value is part of the value; an empty payload is
       "incoming write was empty".
@@ -591,14 +593,57 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
+  # InfluxDB 3 reserves `time` for the timestamp column. The wording
+  # depends on whether the table exists (verified): a new table refuses
+  # the line outright, an existing one reports a column-type conflict.
+  @spec check_schema(:ets.table(), binary(), point_map(), LineProtocolParser.dialect()) ::
+          :ok | {:error, binary() | {binary(), binary(), binary(), binary()}}
+  defp check_schema(table, database, point, :v3) do
+    case reserved_time(table, database, point) do
+      :ok -> check_column_types(table, database, point, :v3)
+      {:error, _message} = error -> error
+    end
+  end
+
+  defp check_schema(table, database, point, :v2),
+    do: check_column_types(table, database, point, :v2)
+
+  @spec reserved_time(:ets.table(), binary(), point_map()) :: :ok | {:error, binary()}
+  defp reserved_time(table, database, %{tags: tags, fields: fields} = point) do
+    cond do
+      Map.has_key?(tags, "time") ->
+        reserved_time_error(table, database, point.measurement, "iox::column_type::tag")
+
+      Map.has_key?(fields, "time") ->
+        got = LineProtocolParser.column_type(:field, Map.fetch!(fields, "time"))
+        reserved_time_error(table, database, point.measurement, got)
+
+      true ->
+        :ok
+    end
+  end
+
+  @spec reserved_time_error(:ets.table(), binary(), binary(), binary()) :: {:error, binary()}
+  defp reserved_time_error(table, database, measurement, got) do
+    case :ets.match(table, {{:column, database, measurement, :_}, :_}, 1) do
+      :"$end_of_table" ->
+        {:error, "'time' is a reserved column"}
+
+      _existing_columns ->
+        {:error,
+         "invalid column type for column 'time', expected iox::column_type::timestamp, got " <>
+           got}
+    end
+  end
+
   # The measurement's schema, one ETS object per column so the first writer
   # of a column fixes its kind atomically (`insert_new`) and a concurrent
   # writer never loses a column. InfluxDB 3 types tags and fields in one
   # namespace and reports a conflict with its column-type wording; InfluxDB
   # 2 types fields only and reports `{field, measurement, existing, got}`.
-  @spec check_schema(:ets.table(), binary(), point_map(), LineProtocolParser.dialect()) ::
+  @spec check_column_types(:ets.table(), binary(), point_map(), LineProtocolParser.dialect()) ::
           :ok | {:error, binary() | {binary(), binary(), binary(), binary()}}
-  defp check_schema(table, database, point, dialect) do
+  defp check_column_types(table, database, point, dialect) do
     tags = if dialect == :v3, do: Enum.map(point.tags, fn {k, _v} -> {k, :tag, nil} end), else: []
     columns = tags ++ Enum.map(point.fields, fn {k, v} -> {k, :field, v} end)
 

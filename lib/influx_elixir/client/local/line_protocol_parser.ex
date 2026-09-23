@@ -36,8 +36,9 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   @type line_result :: {:ok, point(), pos_integer(), binary()} | {:error, line_error()}
 
   @typedoc """
-  Whose rules apply. InfluxDB 3 refuses `time` as a field and a key that is
-  both tag and field; InfluxDB 2 drops a `time` field silently and lets a
+  Whose rules apply. InfluxDB 3 refuses a key that is
+  both tag and field (and, in the store, `time` as a column); InfluxDB 2
+  drops a `time` field silently and lets a
   tag and a field share a name.
   """
   @type dialect :: :v3 | :v2
@@ -139,9 +140,11 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
     }
   end
 
-  # `time` is the timestamp column and a key is one column, so a key used as
-  # both a tag and a field cannot be typed — on InfluxDB 3. InfluxDB 2 keeps
-  # tags and fields in separate namespaces and drops a `time` field.
+  # A key is one column, so a key used as both a tag and a field cannot be
+  # typed — on InfluxDB 3. InfluxDB 2 keeps tags and fields in separate
+  # namespaces and drops a `time` field. `time` on InfluxDB 3 is checked
+  # by the store, because the engine's wording depends on whether the
+  # table already exists.
   @spec check_columns(map(), map(), dialect()) :: {:ok, map()} | {:error, binary()}
   defp check_columns(tags, _fields, :v2) when is_map_key(tags, "time"),
     do: {:error, "cannot use reserved tag key \"time\""}
@@ -149,25 +152,14 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   defp check_columns(_tags, fields, :v2), do: {:ok, Map.delete(fields, "time")}
 
   defp check_columns(tags, fields, :v3) do
-    cond do
-      Map.has_key?(tags, "time") ->
-        {:error, "'time' is a reserved column"}
+    case Enum.find(Map.keys(fields), &Map.has_key?(tags, &1)) do
+      nil ->
+        {:ok, fields}
 
-      Map.has_key?(fields, "time") ->
+      key ->
         {:error,
-         "invalid column type for column 'time', expected iox::column_type::timestamp, got " <>
-           column_type(:field, Map.fetch!(fields, "time"))}
-
-      true ->
-        case Enum.find(Map.keys(fields), &Map.has_key?(tags, &1)) do
-          nil ->
-            {:ok, fields}
-
-          key ->
-            {:error,
-             "invalid column type for column '#{key}', expected iox::column_type::tag, got " <>
-               column_type(:field, Map.fetch!(fields, key))}
-        end
+         "invalid column type for column '#{key}', expected iox::column_type::tag, got " <>
+           column_type(:field, Map.fetch!(fields, key))}
     end
   end
 

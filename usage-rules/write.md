@@ -11,6 +11,7 @@
 - Use `InfluxElixir.point/3` to build points and `InfluxElixir.Write.LineProtocol.encode/1` to encode them — do not construct line protocol strings manually
 - Tags are automatically sorted lexicographically by key
 - Field types are inferred: integers get the `i` suffix, floats use the shortest exact representation (`1.0e-20` is valid), strings are double-quoted, booleans are `true` / `false`
+- `encode/1` refuses a point no server accepts, with a tagged error: an empty or newline-carrying measurement, tag key, tag value or field key (`{:invalid_tag_value, key, value}` etc.), the reserved tag key `time` (`{:reserved_tag_key, "time"}`), and a field value that is not an integer, float, string or boolean — a newline outside a quoted string value would otherwise split the line and store a bogus second point
 - Payloads over 1KB are automatically gzip-compressed
 
 ## Direct Writes
@@ -21,5 +22,5 @@
 ## Schema
 - A column's kind (tag, or integer / unsigned / float / string / boolean field) is fixed by the first write that names it, per database and measurement; a later write with another kind is rejected line by line ("invalid column type for column 'v', expected …, got …") on the server and on `Client.Local` alike — keep field types consistent in fixtures
 - A rejected line does not fail the batch: the other lines are stored and the call returns `{:error, %{status: 400, body: json}}` with `"partial write of line protocol occurred"` and one `data` entry per bad line — treat a write error as "some lines were dropped", not "nothing was written"
-- `time` is a reserved column, a key cannot be both a tag and a field, integers must fit in 64 bits (`u` for unsigned), an empty payload is a 400
+- `time` is a reserved column ("'time' is a reserved column" on a new table, a column-type conflict with `iox::column_type::timestamp` on an existing one), a key cannot be both a tag and a field, integers must fit in 64 bits (`u` for unsigned), an empty payload is a 400
 - Under `api_version: :v2` (and the `:v2` Local profile) a field type conflict is HTTP 422 with `dropped=N` and the other lines stored, while a parse error is HTTP 400 and nothing is stored; `time` as a field is dropped silently there

@@ -40,6 +40,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-17 | [`local-write-schema-and-partial-writes`](2026-09-17_local-write-schema-and-partial-writes.md) | Column schema fixed by first write, partial writes, reserved `time`, int64 range, `delete_database` drops data |
 | 2026-09-22 | [`local-offset`](2026-09-22_local-offset.md) | `LIMIT n OFFSET m` pagination (#21) |
 | 2026-09-22 | [`local-v2-write-rules`](2026-09-22_local-v2-write-rules.md) | `:v2` profile write rules verified against InfluxDB 2.7: 422 conflicts, all-or-nothing parse errors, `time` field dropped |
+| 2026-09-22 | [`encoder-validation-and-reserved-time`](2026-09-22_encoder-validation-and-reserved-time.md) | `LineProtocol.encode/1` refuses lines no server accepts (newline corruption verified); Local's `time` wording per table state; `ResponseParser` timestamp shape guard |
 
 ## Verifying against a real engine
 

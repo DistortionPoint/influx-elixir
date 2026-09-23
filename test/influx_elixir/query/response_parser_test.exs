@@ -177,6 +177,11 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       assert result["time"] == "not a date"
     end
 
+    test "a date-shaped string that is not a timestamp stays a string" do
+      row = %{"label" => "2023-11-14Tomorrow", "code" => "2023-11-14T22:13"}
+      assert ResponseParser.coerce_types(row) == row
+    end
+
     test "decodes InfluxDB 3's zone-less timestamp under any column name" do
       # Captured from InfluxDB 3 Core for
       #   DATE_BIN(...) AS bucket, selector_min(value, time)['time'] AS low_at

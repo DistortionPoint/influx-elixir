@@ -208,6 +208,61 @@ defmodule InfluxElixir.Write.LineProtocolTest do
     end
   end
 
+  # Verified against InfluxDB 3: each of these lines is rejected by the
+  # server, and a newline outside a quoted value splits the line so the
+  # remainder is stored as a second, bogus point
+  # (docs/design/2026-09-22_encoder-validation-and-reserved-time.md).
+  describe "encode/1 — refuses what no server accepts" do
+    test "an empty, non-string or newline-carrying measurement" do
+      assert {:error, {:invalid_measurement, "a\nb"}} =
+               LineProtocol.encode(%Point{measurement: "a\nb", fields: %{"v" => 1}})
+
+      assert {:error, {:invalid_measurement, :cpu}} =
+               LineProtocol.encode(%Point{measurement: :cpu, fields: %{"v" => 1}})
+    end
+
+    test "an empty, non-string or newline-carrying tag key or value" do
+      for {tags, error} <- [
+            {%{"" => "x"}, {:invalid_tag_key, ""}},
+            {%{"a\nb" => "x"}, {:invalid_tag_key, "a\nb"}},
+            {%{host: "x"}, {:invalid_tag_key, :host}},
+            {%{"host" => ""}, {:invalid_tag_value, "host", ""}},
+            {%{"host" => "a\nb v=2i"}, {:invalid_tag_value, "host", "a\nb v=2i"}},
+            {%{"host" => 1}, {:invalid_tag_value, "host", 1}}
+          ] do
+        point = Point.new("cpu", %{"v" => 1}, tags: tags)
+        assert {:error, ^error} = LineProtocol.encode(point)
+      end
+    end
+
+    test "time as a tag key is reserved on every InfluxDB version" do
+      point = Point.new("cpu", %{"v" => 1}, tags: %{"time" => "x"})
+      assert {:error, {:reserved_tag_key, "time"}} = LineProtocol.encode(point)
+    end
+
+    test "an empty, non-string or newline-carrying field key" do
+      for key <- ["", "a\nb", :v] do
+        assert {:error, {:invalid_field_key, ^key}} =
+                 LineProtocol.encode(Point.new("cpu", %{key => 1}))
+      end
+    end
+
+    test "a field value that is not an integer, float, string or boolean" do
+      for value <- [nil, :up, [1], %{}, Decimal.new("1.5")] do
+        assert {:error, {:invalid_field_value, "v", ^value}} =
+                 LineProtocol.encode(Point.new("cpu", %{"v" => value}))
+      end
+    end
+
+    test "a newline inside a string field value is quoted and accepted" do
+      assert {:ok, ~s|cpu s="a\nb"|} = LineProtocol.encode(Point.new("cpu", %{"s" => "a\nb"}))
+    end
+
+    test "a field named time is left to the server" do
+      assert {:ok, "cpu time=1i"} = LineProtocol.encode(Point.new("cpu", %{"time" => 1}))
+    end
+  end
+
   describe "encode/1 — list of points" do
     test "encodes an empty list to empty string" do
       assert {:ok, ""} = LineProtocol.encode([])

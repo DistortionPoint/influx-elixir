@@ -105,8 +105,13 @@ defmodule InfluxElixir.Query.ResponseParser do
   defp coerce_value(_key, value) when is_binary(value), do: coerce_naive(value)
   defp coerce_value(_key, value), do: value
 
+  # Only a string shaped `dddd-dd-ddT...` is worth the regex; every other
+  # string cell (the common case) is returned after one pattern match.
   @spec coerce_naive(binary()) :: DateTime.t() | binary()
-  defp coerce_naive(value) do
+  defp coerce_naive(
+         <<_year::binary-size(4), ?-, _month::binary-size(2), ?-, _day::binary-size(2), ?T,
+           _rest::binary>> = value
+       ) do
     with true <- Regex.match?(@datafusion_timestamp, value),
          {:ok, naive} <- NaiveDateTime.from_iso8601(value) do
       naive |> DateTime.from_naive!("Etc/UTC") |> microsecond_precision()
@@ -114,6 +119,8 @@ defmodule InfluxElixir.Query.ResponseParser do
       _not_a_timestamp -> value
     end
   end
+
+  defp coerce_naive(value), do: value
 
   # Every timestamp the library returns carries microsecond precision, so a
   # value from JSON ("…:20" → precision 0) equals the same instant from

@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `ResponseParser` tests every string cell for InfluxDB 3's zone-less
+  timestamp shape before deciding whether to decode it; a one-clause binary
+  pattern now screens out strings that cannot match before the regex runs
+  (about 14 ns instead of 340 ns per ordinary string cell). Results are
+  unchanged.
+- `BatchWriter` tests cover a chain that exhausts more than one retry
+  (errors are counted per chain, not per attempt) and `max_retries: 0`
+  against a transport error.
 - **SQL execution split out of `Client.Local`.** The 900-line executor —
   CTEs, joins, the `WHERE` evaluator, aggregates, casts, ordering, schema
   checks — is `InfluxElixir.Client.Local.SQLExecutor`, pure over the points
@@ -39,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`LineProtocol.encode/1` emitted lines no server accepts.** An empty tag
+  value (`host=`), an empty tag key or field key, the reserved tag key
+  `time`, and a newline in a measurement, tag key, tag value or field key
+  all encoded without complaint and failed at the server — and a newline
+  splits the line, so `tags: %{"host" => "a\nb"}` stored a bogus
+  measurement `b` on InfluxDB 3 (verified). A non-string tag value or an
+  unsupported field value (`nil`, an atom) crashed the encoder with a
+  `FunctionClauseError`. Each is now a tagged error from `encode/1`
+  (`{:invalid_tag_value, key, value}`, `{:reserved_tag_key, "time"}`,
+  `{:invalid_field_value, key, value}`, …); see "Validation" in the
+  moduledoc.
+- **`Client.Local` worded a `time` field on a new table as a column-type
+  conflict.** InfluxDB 3 says `'time' is a reserved column` for a tag or a
+  field on a table that does not exist yet, and reports the column-type
+  conflict with `iox::column_type::timestamp` only on an existing table.
+  The double now does the same (the check moved from the parser into the
+  store, which knows whether the table exists).
 - **`Client.Local`'s `:v2` profile applied InfluxDB 3's write rules.**
   Verified against InfluxDB 2.7, which differs on nearly every point: a
   field type conflict is HTTP 422 (`"unprocessable entity"`, message ending

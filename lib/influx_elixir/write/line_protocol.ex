@@ -22,6 +22,32 @@ defmodule InfluxElixir.Write.LineProtocol do
   - Tag keys/values: spaces, commas, equals, backslashes
   - Field keys: spaces, commas, equals, backslashes
   - Field string values: double-quotes, backslashes
+
+  ## Validation
+
+  A point that no InfluxDB accepts is refused here, with a tagged error,
+  rather than encoded into a line the server rejects — or worse, one it
+  misreads. Line protocol has no escape for a newline outside a quoted
+  string value, so a newline in a measurement, tag key, tag value or field
+  key ends the line early and the remainder is parsed as a *second* line:
+  verified against InfluxDB 3, `tags: %{"host" => "a\\nb"}` stores a bogus
+  measurement `b`. The checks, each verified against the engine:
+
+  | Problem | Error |
+  |---|---|
+  | No fields | `:empty_fields` |
+  | Empty measurement | `:empty_measurement` |
+  | Measurement not a string, or containing a newline | `{:invalid_measurement, value}` |
+  | Tag key empty, not a string, or containing a newline | `{:invalid_tag_key, key}` |
+  | Tag value empty, not a string, or containing a newline | `{:invalid_tag_value, key, value}` |
+  | Tag key `time` (reserved on every version) | `{:reserved_tag_key, "time"}` |
+  | Field key empty, not a string, or containing a newline | `{:invalid_field_key, key}` |
+  | Field value not an integer, float, string or boolean | `{:invalid_field_value, key, value}` |
+  | Timestamp not a `DateTime`, integer or `nil` | `{:invalid_timestamp, value}` |
+
+  A field named `time` is left to the server: InfluxDB 3 rejects it and
+  InfluxDB 2 drops it silently. A newline inside a *string field value* is
+  fine — it is quoted, and both versions store it.
   """
 
   alias InfluxElixir.Write.Point
@@ -31,7 +57,8 @@ defmodule InfluxElixir.Write.LineProtocol do
   @doc """
   Encodes a Point or list of Points into InfluxDB line protocol binary.
 
-  Returns `{:ok, binary}` on success or `{:error, reason}` on failure.
+  Returns `{:ok, binary}` on success or `{:error, reason}` on failure; see
+  "Validation" in the moduledoc for the reasons.
 
   ## Examples
 
@@ -47,6 +74,10 @@ defmodule InfluxElixir.Write.LineProtocol do
       iex> {:ok, lp} = InfluxElixir.Write.LineProtocol.encode(point)
       iex> lp
       "cpu,host=server01 count=42i 1630424257000000000"
+
+      iex> point = InfluxElixir.Write.Point.new("cpu", %{"v" => 1}, tags: %{"host" => ""})
+      iex> InfluxElixir.Write.LineProtocol.encode(point)
+      {:error, {:invalid_tag_value, "host", ""}}
   """
   @spec encode(Point.t() | [Point.t()]) :: encode_result()
   def encode(%Point{} = point), do: encode_point(point)
@@ -113,17 +144,29 @@ defmodule InfluxElixir.Write.LineProtocol do
 
   defp validate_fields(_fields), do: :ok
 
-  @spec encode_measurement(String.t()) :: {:ok, binary()} | {:error, term()}
+  # A name that can stand outside quotes: a non-empty string with no
+  # newline (there is no escape for one, so it would end the line).
+  @spec name?(term()) :: boolean()
+  defp name?(value) when is_binary(value) and value != "",
+    do: not String.contains?(value, "\n")
+
+  defp name?(_value), do: false
+
+  @spec encode_measurement(term()) :: {:ok, binary()} | {:error, term()}
   defp encode_measurement(""), do: {:error, :empty_measurement}
 
   defp encode_measurement(name) do
-    escaped =
-      name
-      |> String.replace("\\", "\\\\")
-      |> String.replace(",", "\\,")
-      |> String.replace(" ", "\\ ")
+    if name?(name) do
+      escaped =
+        name
+        |> String.replace("\\", "\\\\")
+        |> String.replace(",", "\\,")
+        |> String.replace(" ", "\\ ")
 
-    {:ok, escaped}
+      {:ok, escaped}
+    else
+      {:error, {:invalid_measurement, name}}
+    end
   end
 
   @spec encode_tags(%{String.t() => String.t()}) :: {:ok, binary()} | {:error, term()}
@@ -132,19 +175,57 @@ defmodule InfluxElixir.Write.LineProtocol do
   defp encode_tags(tags) do
     tags
     |> Enum.sort_by(fn {k, _v} -> k end)
-    |> Enum.map(fn {k, v} -> "#{escape_tag_key(k)}=#{escape_tag_value(v)}" end)
-    |> Enum.join(",")
-    |> then(&{:ok, &1})
+    |> Enum.reduce_while({:ok, []}, fn {k, v}, {:ok, acc} ->
+      case encode_tag(k, v) do
+        {:ok, pair} -> {:cont, {:ok, [pair | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, pairs} -> {:ok, pairs |> Enum.reverse() |> Enum.join(",")}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec encode_tag(term(), term()) :: {:ok, binary()} | {:error, term()}
+  defp encode_tag("time", _value), do: {:error, {:reserved_tag_key, "time"}}
+
+  defp encode_tag(key, value) do
+    cond do
+      not name?(key) -> {:error, {:invalid_tag_key, key}}
+      not name?(value) -> {:error, {:invalid_tag_value, key, value}}
+      true -> {:ok, "#{escape_tag_key(key)}=#{escape_tag_value(value)}"}
+    end
   end
 
   @spec encode_fields(%{String.t() => Point.field_value()}) ::
           {:ok, binary()} | {:error, term()}
   defp encode_fields(fields) do
     fields
-    |> Enum.map(fn {k, v} -> "#{escape_field_key(k)}=#{encode_field_value(v)}" end)
-    |> Enum.join(",")
-    |> then(&{:ok, &1})
+    |> Enum.reduce_while({:ok, []}, fn {k, v}, {:ok, acc} ->
+      case encode_field(k, v) do
+        {:ok, pair} -> {:cont, {:ok, [pair | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, pairs} -> {:ok, pairs |> Enum.reverse() |> Enum.join(",")}
+      {:error, _reason} = error -> error
+    end
   end
+
+  @spec encode_field(term(), term()) :: {:ok, binary()} | {:error, term()}
+  defp encode_field(key, value) do
+    cond do
+      not name?(key) -> {:error, {:invalid_field_key, key}}
+      not field_value?(value) -> {:error, {:invalid_field_value, key, value}}
+      true -> {:ok, "#{escape_field_key(key)}=#{encode_field_value(value)}"}
+    end
+  end
+
+  @spec field_value?(term()) :: boolean()
+  defp field_value?(value),
+    do: is_integer(value) or is_float(value) or is_binary(value) or is_boolean(value)
 
   @spec encode_timestamp(DateTime.t() | integer() | nil) ::
           {:ok, binary()} | {:error, term()}
