@@ -1,7 +1,7 @@
 defmodule InfluxElixir.MixProject do
   use Mix.Project
 
-  @version "0.1.28"
+  @version "0.1.29"
   @source_url "https://github.com/DistortionPoint/influx-elixir"
 
   def project do
