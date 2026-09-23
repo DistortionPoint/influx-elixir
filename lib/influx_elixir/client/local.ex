@@ -56,7 +56,7 @@ defmodule InfluxElixir.Client.Local do
   read-modify-write a shared value and no write is ever lost:
 
     * `{:database, name}` => `true`
-    * `{:bucket, name}` => `true`
+    * `{:bucket, name}` => `%{retention: seconds}`
     * `{:token, id}` => `map()` — the token map
     * `{:point, database, measurement, seq}` => `point_map()` — `seq` is a
       monotonic integer, so points scan in insertion order
@@ -1098,8 +1098,9 @@ defmodule InfluxElixir.Client.Local do
   @doc """
   Deletes a database from this local instance.
 
-  Returns `{:error, %{status: 404, body: "database not found: name"}}` if
-  the database does not exist.
+  Returns `{:error, %{status: 404, body: "the requested resource was not
+  found: name"}}` — the engine's answer (verified) — if the database does
+  not exist.
   """
   @impl true
   @spec delete_database(InfluxElixir.Client.connection(), binary()) ::
@@ -1114,7 +1115,7 @@ defmodule InfluxElixir.Client.Local do
         :ets.delete(table, {:database, name})
         :ok
       else
-        {:error, %{status: 404, body: "database not found: #{name}"}}
+        {:error, %{status: 404, body: "the requested resource was not found: #{name}"}}
       end
     end
   end
@@ -1126,6 +1127,9 @@ defmodule InfluxElixir.Client.Local do
   @doc """
   Creates a named bucket in this local instance.
 
+  `retention:` is the expiry in seconds (default `0`, none). InfluxDB 2
+  refuses a period between 1 and 3599 seconds with a 500 `retention policy
+  duration must be at least 1h0m0s` (verified), and so does this.
   Creating an already-existing bucket is idempotent.
   """
   @impl true
@@ -1134,16 +1138,31 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           keyword()
         ) :: :ok | {:error, term()}
-  def create_bucket(%{table: table} = conn, name, _opts \\ []) do
+  def create_bucket(%{table: table} = conn, name, opts \\ []) do
     with :ok <- require_capability(conn, :create_bucket) do
-      :ets.insert(table, {{:bucket, name}, true})
-      :ok
+      case Keyword.get(opts, :retention, 0) do
+        seconds when seconds in 1..3599 ->
+          {:error,
+           %{
+             status: 500,
+             body:
+               Jason.encode!(%{
+                 "code" => "internal error",
+                 "message" => "retention policy duration must be at least 1h0m0s"
+               })
+           }}
+
+        seconds ->
+          :ets.insert(table, {{:bucket, name}, %{retention: seconds}})
+          :ok
+      end
     end
   end
 
   @doc """
-  Returns all buckets in this local instance as a list of maps with a
-  single `:name` key.
+  Returns all buckets in this local instance as maps with `"id"`, `"name"`
+  and `"retentionRules"` (`[%{"type" => "expire", "everySeconds" => n}]`,
+  the shape InfluxDB 2 lists; verified).
   """
   @impl true
   @spec list_buckets(InfluxElixir.Client.connection()) ::
@@ -1152,9 +1171,14 @@ defmodule InfluxElixir.Client.Local do
     with :ok <- require_capability(conn, :list_buckets) do
       bkts =
         table
-        |> get_buckets()
-        |> Enum.map(fn name ->
-          %{"id" => bucket_id(name), "name" => name}
+        |> :ets.select([{{{:bucket, :"$1"}, :"$2"}, [], [{{:"$1", :"$2"}}]}])
+        |> Enum.sort()
+        |> Enum.map(fn {name, %{retention: seconds}} ->
+          %{
+            "id" => bucket_id(name),
+            "name" => name,
+            "retentionRules" => [%{"type" => "expire", "everySeconds" => seconds}]
+          }
         end)
 
       {:ok, bkts}
@@ -1164,16 +1188,21 @@ defmodule InfluxElixir.Client.Local do
   @doc """
   Deletes a bucket from this local instance.
 
-  Returns `:ok` whether or not the bucket exists, matching the idempotent
-  delete semantics of the v2 API.
+  Returns `{:error, %{status: 404, body: "bucket not found: name"}}` for a
+  bucket that does not exist — InfluxDB 2 answers 404 (verified), which
+  `InfluxElixir.Client.HTTP` reports with this body.
   """
   @impl true
   @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_bucket(%{table: table} = conn, name) do
     with :ok <- require_capability(conn, :delete_bucket) do
-      :ets.delete(table, {:bucket, name})
-      :ok
+      if :ets.member(table, {:bucket, name}) do
+        :ets.delete(table, {:bucket, name})
+        :ok
+      else
+        {:error, %{status: 404, body: "bucket not found: #{name}"}}
+      end
     end
   end
 
@@ -1253,22 +1282,6 @@ defmodule InfluxElixir.Client.Local do
     |> MapSet.new()
   end
 
-  @spec get_buckets(:ets.table()) :: MapSet.t(binary())
-  defp get_buckets(table) do
-    table
-    |> :ets.select([{{{:bucket, :"$1"}, :_}, [], [:"$1"]}])
-    |> MapSet.new()
-  end
-
-  @spec assert_database_exists(:ets.table(), binary()) :: :ok | {:error, map()}
-  defp assert_database_exists(table, database) do
-    if :ets.member(table, {:database, database}) do
-      :ok
-    else
-      {:error, %{status: 404, body: "database not found: #{database}"}}
-    end
-  end
-
   # v3 Core/Enterprise auto-create databases on write; v2 requires pre-existing
   @spec ensure_database(:ets.table(), binary(), profile()) :: :ok | {:error, term()}
   defp ensure_database(table, database, profile) when profile in [:v3_core, :v3_enterprise] do
@@ -1280,10 +1293,24 @@ defmodule InfluxElixir.Client.Local do
   # valid target. Names seeded through `databases:` at start are accepted too,
   # so a v2 connection can be prepared either way.
   defp ensure_database(table, bucket, :v2) do
-    if :ets.member(table, {:bucket, bucket}) do
-      :ok
-    else
-      assert_database_exists(table, bucket)
+    cond do
+      :ets.member(table, {:bucket, bucket}) ->
+        :ok
+
+      :ets.member(table, {:database, bucket}) ->
+        :ok
+
+      true ->
+        # The engine's answer for a bucket that does not exist (verified).
+        {:error,
+         %{
+           status: 404,
+           body:
+             Jason.encode!(%{
+               "code" => "not found",
+               "message" => "bucket \"#{bucket}\" not found"
+             })
+         }}
     end
   end
 

@@ -371,6 +371,13 @@ defmodule InfluxElixir.ClientContract do
           names = Enum.map(dbs, & &1["name"])
           refute "contract_gone_db" in names
         end
+
+        test "deleting a database that does not exist is the engine's 404", ctx do
+          name = "contract_nodb_#{System.unique_integer([:positive])}"
+
+          assert {:error, %{status: 404, body: "the requested resource was not found: " <> ^name}} =
+                   unquote(client).delete_database(ctx.conn, name)
+        end
       end
     end
   end
@@ -816,6 +823,40 @@ defmodule InfluxElixir.ClientContract do
                      "contract_bkt_write value=1i",
                      database: "contract_write_bkt"
                    )
+        end
+
+        test "a retention rule is stored in seconds; under one hour is refused", ctx do
+          name = "contract_ret_#{System.unique_integer([:positive])}"
+          :ok = unquote(client).create_bucket(ctx.conn, name, retention: 3600)
+
+          {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
+          bucket = Enum.find(buckets, &(&1["name"] == name))
+          assert [%{"type" => "expire", "everySeconds" => 3600}] = bucket["retentionRules"]
+
+          assert {:error, %{status: 500, body: body}} =
+                   unquote(client).create_bucket(ctx.conn, name <> "_short", retention: 60)
+
+          assert %{"message" => "retention policy duration must be at least 1h0m0s"} =
+                   Jason.decode!(body)
+        end
+
+        test "deleting a bucket that does not exist is a 404", ctx do
+          name = "contract_nobkt_#{System.unique_integer([:positive])}"
+
+          assert {:error, %{status: 404, body: "bucket not found: " <> ^name}} =
+                   unquote(client).delete_bucket(ctx.conn, name)
+        end
+
+        test "a write to a bucket that does not exist is the engine's 404", ctx do
+          name = "contract_nowrite_#{System.unique_integer([:positive])}"
+
+          assert {:error, %{status: 404, body: body}} =
+                   unquote(client).write(ctx.conn, "m v=1i", database: name)
+
+          assert Jason.decode!(body) == %{
+                   "code" => "not found",
+                   "message" => ~s|bucket "#{name}" not found|
+                 }
         end
       end
     end

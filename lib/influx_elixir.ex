@@ -231,7 +231,8 @@ defmodule InfluxElixir do
   # ---------- Admin — v3 databases ----------
 
   @doc """
-  Creates a database in InfluxDB v3.
+  Creates a database in InfluxDB v3. `opts` may carry `retention:` as a
+  duration string such as `"30d"`; see `InfluxElixir.Admin.Databases.create/3`.
   """
   @spec create_database(
           InfluxElixir.Client.connection(),
@@ -263,7 +264,8 @@ defmodule InfluxElixir do
   # ---------- Admin — v2 buckets (compat) ----------
 
   @doc """
-  Creates a bucket in InfluxDB v2 (backwards compatibility).
+  Creates a bucket in InfluxDB v2 (backwards compatibility). `opts` may carry
+  `retention:` in seconds and `org_id:`; see `InfluxElixir.Admin.Buckets.create/3`.
   """
   @spec create_bucket(
           InfluxElixir.Client.connection(),

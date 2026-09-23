@@ -206,7 +206,10 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:error, %{status: 404, body: body}} =
                Local.write(v2_conn, "cpu value=1.0", database: "missing_db")
 
-      assert body =~ "database not found"
+      assert Jason.decode!(body) == %{
+               "code" => "not found",
+               "message" => ~s|bucket "missing_db" not found|
+             }
     end
 
     test "v3_enterprise profile auto-creates database on write" do
@@ -864,12 +867,11 @@ defmodule InfluxElixir.Client.LocalTest do
   # ---------------------------------------------------------------------------
 
   describe "database admin — error details" do
-    test "delete_database/2 returns 404 with descriptive body", %{conn: conn} do
+    test "delete_database/2 returns 404 with the engine's body", %{conn: conn} do
       assert {:error, %{status: 404, body: body}} =
                Local.delete_database(conn, "not_here")
 
-      assert body =~ "database not found"
-      assert body =~ "not_here"
+      assert body == "the requested resource was not found: not_here"
     end
   end
 

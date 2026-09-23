@@ -64,7 +64,7 @@ defmodule InfluxElixir.Flight.ClientTest do
   end
 
   describe "query/3 — connection validation" do
-    test "returns {:error, _} when host is missing" do
+    test "raises KeyError when host is missing" do
       conn = %{token: "tok", database: "db"}
 
       assert_raise KeyError, fn ->
@@ -72,7 +72,7 @@ defmodule InfluxElixir.Flight.ClientTest do
       end
     end
 
-    test "returns {:error, _} when token is missing" do
+    test "raises KeyError when token is missing" do
       conn = %{host: "localhost", database: "db"}
 
       assert_raise KeyError, fn ->
@@ -80,7 +80,7 @@ defmodule InfluxElixir.Flight.ClientTest do
       end
     end
 
-    test "returns {:error, _} when database is missing" do
+    test "raises KeyError when database is missing" do
       conn = %{host: "localhost", token: "tok"}
 
       assert_raise KeyError, fn ->

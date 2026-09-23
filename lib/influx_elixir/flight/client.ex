@@ -171,14 +171,7 @@ defmodule InfluxElixir.Flight.Client do
     database = Map.fetch!(connection, :database)
     token = Map.fetch!(connection, :token)
 
-    ticket_payload =
-      Jason.encode!(%{
-        "database" => database,
-        "sql_query" => sql,
-        "query_type" => "sql"
-      })
-
-    ticket = %Ticket{ticket: ticket_payload}
+    ticket = build_ticket(database, sql)
 
     metadata = [{"authorization", "Bearer #{token}"}]
     call_opts = [timeout: timeout, metadata: metadata]

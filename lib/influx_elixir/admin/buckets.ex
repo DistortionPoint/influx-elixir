@@ -21,7 +21,12 @@ defmodule InfluxElixir.Admin.Buckets do
 
     * `connection` - a client connection term
     * `name` - the bucket name to create
-    * `opts` - optional keyword list (e.g. `:org_id`, `:retention_seconds`)
+    * `opts` - optional keyword list:
+      * `:retention` - retention in seconds (default `0`, no expiry). InfluxDB 2
+        refuses anything between 1 and 3599 with a 500 `retention policy
+        duration must be at least 1h0m0s` (verified); the bucket lists its
+        rule as `"retentionRules" => [%{"type" => "expire", "everySeconds" => n}]`
+      * `:org_id` - the org ID; looked up from the connection's `:org` when omitted
 
   ## Returns
 

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `Flight.Client` builds its `DoGet` ticket through `build_ticket/2`
+  instead of a second inline copy of the JSON. Admin tests assert what a
+  call does (the bucket is listed with its rule, the database is gone)
+  rather than `:ok` alone.
 - `Connection.get/1` reads `:persistent_term` with a default instead of
   rescuing `ArgumentError`.
 - `Writer` tests assert what a write does — every point of a gzipped
@@ -52,6 +56,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Admin.Databases` and `Admin.Buckets` documented options that did not
+  exist.** The docs named `:retention_period` and `:retention_seconds`;
+  `Client.HTTP` reads `:retention`, so a consumer following the docs got
+  the option silently ignored. The docs now name `:retention` and its
+  verified format: a duration string such as `"30d"` for InfluxDB 3 (an
+  integer is a 400), seconds for InfluxDB 2 (1–3599 is a 500 `retention
+  policy duration must be at least 1h0m0s`; `0` is no expiry).
+- **`Client.Local.delete_bucket/2` returned `:ok` for a missing bucket**,
+  claiming to match "the idempotent delete semantics of the v2 API".
+  InfluxDB 2 answers 404 (verified) and `Client.HTTP` reports it as
+  `{:error, %{status: 404, body: "bucket not found: <name>"}}`; the double
+  now does the same. `create_bucket/3` keeps `:retention`, refuses 1–3599
+  seconds as the engine does, and `list_buckets/1` lists each bucket's
+  `"retentionRules"` in the engine's shape. `delete_database/2`'s 404 body
+  is the engine's `the requested resource was not found: <name>`, and a v2
+  write to a missing bucket answers the engine's JSON 404 (`bucket "<name>"
+  not found`) instead of a plain "database not found".
 - **`Client.Local` kept duplicate points as separate rows.** InfluxDB 3
   and 2.7 both treat a measurement's points with the same tag set and
   timestamp as one point — fields merge, the later write wins per field,

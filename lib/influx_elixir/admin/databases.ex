@@ -22,7 +22,10 @@ defmodule InfluxElixir.Admin.Databases do
 
     * `connection` - a client connection term
     * `name` - the database name to create
-    * `opts` - optional keyword list (e.g. `:retention_period`)
+    * `opts` - optional keyword list:
+      * `:retention` - retention period as a duration string, e.g. `"30d"` or
+        `"1h"` (InfluxDB 3 rejects an integer with a 400; verified). Omit for
+        no expiry.
 
   ## Returns
 

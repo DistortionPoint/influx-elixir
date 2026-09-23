@@ -96,11 +96,41 @@ executor's source, the Flux and InfluxQL paths — goes through it, per
 database. `DELETE` evaluates its `WHERE` over the merged points and deletes
 every stored object behind a match, counting merged points. The v3 and v2
 contract suites carry the case against the real engines.
+
+## Admin Options and Not-Found Answers
+
+`Admin.Databases.create/3` documented `:retention_period` and
+`Admin.Buckets.create/3` documented `:retention_seconds`; `Client.HTTP`
+reads `:retention` for both, so the documented option was ignored. Probed:
+
+| Call | InfluxDB 3 | InfluxDB 2.7 |
+|---|---|---|
+| create database, `retention_period: "30d"` / `"1h"` | 200 | — |
+| create database, `retention_period: 3600` | 400 `serde json error: invalid type: integer … expected a duration` | — |
+| create bucket, `everySeconds: 3600` | — | 201, `retentionRules: [{type: "expire", everySeconds: 3600, shardGroupDurationSeconds: 3600}]` |
+| create bucket, `everySeconds: 60` | — | 500 `retention policy duration must be at least 1h0m0s` |
+| create bucket, `everySeconds: 0` | — | 201, no expiry |
+| delete missing database / bucket | 404 `the requested resource was not found: <name>` | 404 |
+| write to a missing bucket | — (v3 auto-creates) | 404 `{"code":"not found","message":"bucket \"<name>\" not found"}` |
+
+`Client.Local.delete_bucket/2` returned `:ok` for a missing bucket, with a
+doc comment claiming that matched v2. It now returns the 404 body
+`Client.HTTP` produces for a missing name (`bucket not found: <name>`,
+from its ID lookup). `create_bucket/3` stores `retention:` under
+`{:bucket, name}` and refuses 1–3599 seconds with the engine's 500 body;
+`list_buckets/1` lists `"retentionRules"` in the engine's shape (without
+`shardGroupDurationSeconds`, which the engine derives and the double does
+not model). `delete_database/2`'s body is the engine's wording. The docs
+name `:retention` with each version's format; the contract suites verify
+the rule, the refusal and both 404s against the real engines.
 ## Files Modified
 
 | File | Change |
 |------|--------|
-| `lib/influx_elixir/client/local.ex` | `normalize_precision/2`, `@v3_precisions`, `@v2_precisions`; `merge_duplicates/1` on every read, `delete_points/4`; docs |
+| `lib/influx_elixir/client/local.ex` | `normalize_precision/2`, `@v3_precisions`, `@v2_precisions`; `merge_duplicates/1` on every read, `delete_points/4`; bucket retention, 404s; docs |
+| `lib/influx_elixir/admin/databases.ex`, `lib/influx_elixir/admin/buckets.ex`, `lib/influx_elixir.ex` | `:retention` documented with the verified formats |
+| `lib/influx_elixir/flight/client.ex` | `do_get/4` uses `build_ticket/2` |
+| `test/influx_elixir/admin/*_test.exs`, `test/influx_elixir_test.exs`, `test/influx_elixir/flight/client_test.exs` | observable assertions; honest test names |
 | `lib/influx_elixir/client/local/line_protocol_parser.ex` | `t:precision/0`, `:auto` in `to_nanoseconds/2` |
 | `lib/influx_elixir/connection_supervisor.ex` | no Finch child with `:finch_name`; docs |
 | `lib/influx_elixir/connection.ex` | `get/1` sentinel read, `fetch!/1` message |

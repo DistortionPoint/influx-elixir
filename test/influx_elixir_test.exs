@@ -133,7 +133,9 @@ defmodule InfluxElixirTest do
     test "delegates to configured client" do
       {:ok, v2_conn} = Local.start(profile: :v2)
       on_exit(fn -> Local.stop(v2_conn) end)
+      :ok = InfluxElixir.create_bucket(v2_conn, "test_bucket")
       assert :ok = InfluxElixir.delete_bucket(v2_conn, "test_bucket")
+      assert {:error, %{status: 404}} = InfluxElixir.delete_bucket(v2_conn, "test_bucket")
     end
   end
 
