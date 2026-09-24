@@ -7,53 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- `Flight.Client` builds its `DoGet` ticket through `build_ticket/2`
-  instead of a second inline copy of the JSON. Admin tests assert what a
-  call does (the bucket is listed with its rule, the database is gone)
-  rather than `:ok` alone.
-- `Connection.get/1` reads `:persistent_term` with a default instead of
-  rescuing `ArgumentError`.
-- `Writer` tests assert what a write does — every point of a gzipped
-  payload is stored, `precision:` changes the stored time, `:client`
-  selects the client — instead of `{:ok, :written}` alone.
-- `ResponseParser` tests every string cell for InfluxDB 3's zone-less
-  timestamp shape before deciding whether to decode it; a one-clause binary
-  pattern now screens out strings that cannot match before the regex runs
-  (about 14 ns instead of 340 ns per ordinary string cell). Results are
-  unchanged.
-- `BatchWriter` tests cover a chain that exhausts more than one retry
-  (errors are counted per chain, not per attempt) and `max_retries: 0`
-  against a transport error.
-- **SQL execution split out of `Client.Local`.** The 900-line executor —
-  CTEs, joins, the `WHERE` evaluator, aggregates, casts, ordering, schema
-  checks — is `InfluxElixir.Client.Local.SQLExecutor`, pure over the points
-  it is handed through a fetch function; `Client.Local` keeps storage,
-  profiles and the InfluxQL and Flux paths. Public behaviour is unchanged.
-- `Client.Local` checks a query's column references against the first
-  row before scanning every row's columns; the scan now runs only when a
-  name is missing there, which is also when the error message needs the
-  full list. Per-query fixed cost at 10k points drops from about 20 ms to
-  under 5 ms; results are unchanged.
-- **`Client.Local.SQLParser` cuts a SELECT into its parts in one place.**
-  Eight regexes each found "the table after FROM" for their own dispatcher
-  (star, column list, aggregate, DISTINCT, the clause check, the alias
-  stripper, two helpers); `split_select/1` now does it once and the
-  dispatchers work from its parts. No behaviour change; 71 lines fewer.
-- `BatchWriter` tests no longer inspect GenServer state to check that
-  configuration was stored; scheduling and jitter are asserted through the
-  observable flush instead.
-- **`Client.Local` split into three modules.** The 2,470-line module now owns
-  storage, capability checks and query execution (1,450 lines); the SQL parser
-  is `InfluxElixir.Client.Local.SQLParser` and the line-protocol parser is
-  `InfluxElixir.Client.Local.LineProtocolParser`, both pure. Public behaviour
-  is unchanged; the contract suites prove it.
-- `Client.Local.query_influxql/3` matches each `SHOW` pattern once.
-- Removed the unused internal `InfluxElixir.InfluxCase` case template from
-  `test/support/` (never shipped; no test used it).
-- `Client.Local`'s line-protocol splitters accumulate tokens in binaries
-  (runtime-optimised append) instead of one list cell per byte plus a
-  reverse and join, cutting allocations on every write to the double.
+### Fixed
+- **No release since 0.1.21 had a CHANGELOG heading (#22).** The publish
+  job bumped the version and published without touching `CHANGELOG.md`,
+  so 0.1.22 through 0.1.31 were all released with their entries under
+  `[Unreleased]` and a consumer could not tell which version changed what.
+  Every entry is now under the release that first shipped it, worked out
+  from the `[Unreleased]` block at each release tag (all 71 entries
+  placed, their text unchanged). The publish job now writes
+  `## [x.y.z] - date` under `[Unreleased]` before publishing, fails the
+  release if the heading is missing, and commits it with the bump; a test
+  fails CI if the version in `mix.exs` has no heading or the headings are
+  out of order.
+
+## [0.1.31] - 2026-09-24
 
 ### Fixed
 - **`query_sql_stream/3` over HTTP returned timestamps as strings.** Each
@@ -115,6 +82,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identical. The reader's null tests asserted `row["v"] == nil`, which
   passes whether the key is absent or `nil`; they now assert the key is
   absent.
+
+## [0.1.30] - 2026-09-23
+
+### Changed
+- `Flight.Client` builds its `DoGet` ticket through `build_ticket/2`
+  instead of a second inline copy of the JSON. Admin tests assert what a
+  call does (the bucket is listed with its rule, the database is gone)
+  rather than `:ok` alone.
+- `Connection.get/1` reads `:persistent_term` with a default instead of
+  rescuing `ArgumentError`.
+- `Writer` tests assert what a write does — every point of a gzipped
+  payload is stored, `precision:` changes the stored time, `:client`
+  selects the client — instead of `{:ok, :written}` alone.
+- `ResponseParser` tests every string cell for InfluxDB 3's zone-less
+  timestamp shape before deciding whether to decode it; a one-clause binary
+  pattern now screens out strings that cannot match before the regex runs
+  (about 14 ns instead of 340 ns per ordinary string cell). Results are
+  unchanged.
+- `BatchWriter` tests cover a chain that exhausts more than one retry
+  (errors are counted per chain, not per attempt) and `max_retries: 0`
+  against a transport error.
+
+### Fixed
 - **`Admin.Databases` and `Admin.Buckets` documented options that did not
   exist.** The docs named `:retention_period` and `:retention_seconds`;
   `Client.HTTP` reads `:retention`, so a consumer following the docs got
@@ -184,6 +174,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conflict with `iox::column_type::timestamp` only on an existing table.
   The double now does the same (the check moved from the parser into the
   store, which knows whether the table exists).
+
+## [0.1.29] - 2026-09-22
+
+### Fixed
 - **`Client.Local`'s `:v2` profile applied InfluxDB 3's write rules.**
   Verified against InfluxDB 2.7, which differs on nearly every point: a
   field type conflict is HTTP 422 (`"unprocessable entity"`, message ending
@@ -193,6 +187,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently and as a tag is a 400; a tag and a field may share a name; an
   empty payload is accepted. The double now applies those rules under
   `:v2` and InfluxDB 3's under `:v3_core` / `:v3_enterprise`.
+
+## [0.1.28] - 2026-09-22
+
+### Fixed
 - **`Client.Local` refused `LIMIT n OFFSET m`, which InfluxDB 3 runs (#21).**
   Verified against the engine: `OFFSET` skips rows before `LIMIT` takes
   them, in either order, on plain, projected, grouped and `DISTINCT` rows;
@@ -200,6 +198,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   negative offset is "OFFSET must be >=0" and a bare word is a schema
   error. All of that is now mirrored, so a paginated read can be tested
   against the double instead of re-implementing the offset in Elixir.
+
+## [0.1.27] - 2026-09-18
+
+### Fixed
 - **`Client.Local` accepted writes InfluxDB 3 rejects, and rejected one it
   accepts.** Verified against the engine: a field written as an integer and
   later as a float (or tag then field, string then float, boolean then
@@ -218,6 +220,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted.
 - **`Client.Local.delete_database/2` kept the deleted database's points**,
   so a re-created database was not empty. The points and schema go with it.
+
+## [0.1.26] - 2026-09-17
+
+### Changed
+- **SQL execution split out of `Client.Local`.** The 900-line executor —
+  CTEs, joins, the `WHERE` evaluator, aggregates, casts, ordering, schema
+  checks — is `InfluxElixir.Client.Local.SQLExecutor`, pure over the points
+  it is handed through a fetch function; `Client.Local` keeps storage,
+  profiles and the InfluxQL and Flux paths. Public behaviour is unchanged.
+- `Client.Local` checks a query's column references against the first
+  row before scanning every row's columns; the scan now runs only when a
+  name is missing there, which is also when the error message needs the
+  full list. Per-query fixed cost at 10k points drops from about 20 ms to
+  under 5 ms; results are unchanged.
+- **`Client.Local.SQLParser` cuts a SELECT into its parts in one place.**
+  Eight regexes each found "the table after FROM" for their own dispatcher
+  (star, column list, aggregate, DISTINCT, the clause check, the alias
+  stripper, two helpers); `split_select/1` now does it once and the
+  dispatchers work from its parts. No behaviour change; 71 lines fewer.
+
+### Fixed
 - **`Client.Local` read a bare word inside `IN (...)` as a string.**
   `host IN (a, b)` compared against `"a"` and `"b"`; on the engine the
   items are column references (`v IN (1, other)` works, `host IN (a, b)`
@@ -252,6 +275,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ORDER BY symbol DESC, level` sorted by `symbol` only. All terms apply,
   each with its own direction, and a term may be an expression
   (`ORDER BY CAST(level AS INTEGER) DESC`) on raw and projected rows.
+
+## [0.1.25] - 2026-09-15
+
+### Fixed
 - **`Client.Local` ignored `GROUP BY` on a plain projection and `ORDER BY`
   on column-grouped aggregates, and sampled a row for an ungrouped
   column.** `SELECT host FROM p GROUP BY host` returned every row; `SELECT
@@ -269,6 +296,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column reference in a query is now checked against the rows' columns
   (the check added for `WHERE` expressions in 0.1.24 generalised), and an
   output alias remains a valid `ORDER BY` target.
+
+## [0.1.24] - 2026-09-15
+
+### Fixed
 - **An unbound `$placeholder` matched nothing in `Client.Local`**; the
   engine fails planning ("No value found for placeholder with name $host").
   The double now returns that error, so a missing binding cannot pass a
@@ -293,6 +324,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `nil` param rendered as the word `nil` in `Client.Local`; it now renders
   as `NULL`, which never matches, as the JSON `null` Jason sends over HTTP
   never matches.
+
+## [0.1.23] - 2026-09-15
+
+### Fixed
 - **`Client.Local` returned wrong rows for `OR`, `NOT`, parentheses and
   `<>` in `WHERE`, and for `LIMIT 0`.** The clause splitter only knew `AND`:
   `v > 3 OR v < 2` was read as one predicate against the string
@@ -337,6 +372,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Client.Local` returned `"time" => nil` for a row without a timestamp (a
   CTE that did not project `time`); the column is omitted, as everywhere
   else.
+
+## [0.1.22] - 2026-09-14
+
+### Changed
+- `BatchWriter` tests no longer inspect GenServer state to check that
+  configuration was stored; scheduling and jitter are asserted through the
+  observable flush instead.
+- **`Client.Local` split into three modules.** The 2,470-line module now owns
+  storage, capability checks and query execution (1,450 lines); the SQL parser
+  is `InfluxElixir.Client.Local.SQLParser` and the line-protocol parser is
+  `InfluxElixir.Client.Local.LineProtocolParser`, both pure. Public behaviour
+  is unchanged; the contract suites prove it.
+- `Client.Local.query_influxql/3` matches each `SHOW` pattern once.
+- Removed the unused internal `InfluxElixir.InfluxCase` case template from
+  `test/support/` (never shipped; no test used it).
+- `Client.Local`'s line-protocol splitters accumulate tokens in binaries
+  (runtime-optimised append) instead of one list cell per byte plus a
+  reverse and join, cutting allocations on every write to the double.
+
+### Fixed
 - **`Client.Local` accepted `time` comparands InfluxDB rejects, and silently
   matched nothing for ones it accepts.** Verified against InfluxDB 3 Core:
   a bare integer (`time > 1700000000`) or integer param fails planning on

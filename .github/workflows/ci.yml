@@ -98,6 +98,17 @@ jobs:
           sed -i "s/@version \"$current\"/@version \"$new_version\"/" mix.exs
           echo "VERSION=$new_version" >> "$GITHUB_ENV"
 
+      # Every release gets its own heading over the entries it ships, so a
+      # consumer can review a bump as "what's new in x.y.z" (#22). Runs
+      # before publishing so the Hex package carries the heading; fails the
+      # release if the heading did not land.
+      - name: Date the CHANGELOG release
+        run: |
+          heading="## [$VERSION] - $(date -u +%Y-%m-%d)"
+          awk -v heading="$heading" '{ print } $0 == "## [Unreleased]" && !done { print ""; print heading; done = 1 }' CHANGELOG.md > CHANGELOG.md.new
+          mv CHANGELOG.md.new CHANGELOG.md
+          grep -qxF "$heading" CHANGELOG.md
+
       - name: Publish to Hex.pm
         run: mix hex.publish --yes
         env:
@@ -107,7 +118,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add mix.exs
+          git add mix.exs CHANGELOG.md
           git commit -m "Release v${{ env.VERSION }} [skip ci]"
           git tag "v${{ env.VERSION }}"
           git push origin main --tags
