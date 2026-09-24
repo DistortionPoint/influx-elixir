@@ -318,29 +318,41 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec execute_projection_query([point()], SQLParser.parsed_query()) :: [map()]
   defp execute_projection_query(points, query) do
     projection = query.projection_columns
-    outputs = Enum.map(projection, fn {_source, output} -> output end)
 
     points
     |> Enum.map(fn point -> {point, project_point(point, projection)} end)
-    |> order_projected(query.order_by, outputs)
+    |> order_projected(query.order_by, projection)
     |> apply_limit(query.limit, query.offset)
     |> Enum.map(fn {_point, row} -> row end)
   end
 
-  @spec order_projected([{point(), map()}], SQLParser.order_by(), [binary()]) ::
+  @spec order_projected([{point(), map()}], SQLParser.order_by(), [SQLParser.projection()]) ::
           [{point(), map()}]
-  defp order_projected(pairs, [], _outputs), do: pairs
+  defp order_projected(pairs, [], _projection), do: pairs
 
-  defp order_projected(pairs, order_by, outputs) do
+  # A key that is the point's own time (`time`, or an alias of it) sorts on
+  # the stored nanoseconds: the projected DateTime has microsecond
+  # precision, so points less than a microsecond apart would tie and keep
+  # insertion order, where the engine orders them by time (verified).
+  defp order_projected(pairs, order_by, projection) do
+    outputs = Enum.map(projection, fn {_source, output} -> output end)
+
     keys =
       Enum.map(order_by, fn
         {{:expr, expr}, direction} ->
           {fn {point, _row} -> eval_expr(expr, point) end, direction}
 
         {column, direction} ->
-          if column in outputs,
-            do: {fn {_point, row} -> Map.get(row, column) end, direction},
-            else: {fn {point, _row} -> point_value(point, column) end, direction}
+          cond do
+            {"time", column} in projection or (column == "time" and column not in outputs) ->
+              {fn {point, _row} -> point.timestamp end, direction}
+
+            column in outputs ->
+              {fn {_point, row} -> Map.get(row, column) end, direction}
+
+            true ->
+              {fn {point, _row} -> point_value(point, column) end, direction}
+          end
       end)
 
     sort_by_keys(pairs, keys)
@@ -904,10 +916,12 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec apply_order_by([point()], SQLParser.order_by()) :: [point()]
   defp apply_order_by(points, []), do: points
 
+  # `time` sorts on the stored nanoseconds, as in `order_projected/3`.
   defp apply_order_by(points, order_by) do
     keys =
       Enum.map(order_by, fn
         {{:expr, expr}, direction} -> {&eval_expr(expr, &1), direction}
+        {"time", direction} -> {& &1.timestamp, direction}
         {column, direction} -> {&point_value(&1, column), direction}
       end)
 

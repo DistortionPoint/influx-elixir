@@ -83,6 +83,7 @@ defmodule InfluxElixir.ClientContract do
       end
 
     influxql_tests = if v3_sql, do: influxql_tests(client), else: nil
+    influxql_select_tests = if v3_sql, do: influxql_select_tests(client), else: nil
     db_admin_tests = if v3_sql, do: db_admin_tests(client), else: nil
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
@@ -121,6 +122,7 @@ defmodule InfluxElixir.ClientContract do
         error_shape_tests,
         execute_tests,
         influxql_tests,
+        influxql_select_tests,
         db_admin_tests,
         bucket_tests,
         v2_write_rule_tests,
@@ -2154,6 +2156,122 @@ defmodule InfluxElixir.ClientContract do
             )
 
           assert Enum.sort(Enum.map(rows, &{&1["_field"], &1["_value"]})) == [{"v", 2}, {"w", 1}]
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # InfluxQL SELECT shapes and sub-microsecond time (v3_core, v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  defp influxql_select_tests(client) do
+    quote do
+      describe "query_influxql/3 — SELECT shape contract" do
+        setup ctx do
+          m = "contract_iqs_#{System.unique_integer([:positive])}"
+
+          lp = """
+          #{m},h=x v=3i 1700000000000003000
+          #{m},h=y v=1i 1700000000000001000
+          #{m},h=x v=2i 1700000000000002000
+          #{m},h=y w=9i,s="x" 1700000000000004000
+          """
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, String.trim(lp), database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+          {:ok, m: m}
+        end
+
+        test "rows carry iox::measurement and time, in time order", ctx do
+          {:ok, rows} =
+            unquote(client).query_influxql(ctx.conn, "SELECT v FROM #{ctx.m}",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, &{&1["iox::measurement"], &1["v"]}) == [
+                   {ctx.m, 1},
+                   {ctx.m, 2},
+                   {ctx.m, 3}
+                 ]
+
+          assert Enum.all?(rows, &match?(%DateTime{}, &1["time"]))
+        end
+
+        test "aggregates are named after the function, a lone selector keeps its point", ctx do
+          epoch = DateTime.from_unix!(0, :microsecond)
+
+          {:ok, [row]} =
+            unquote(client).query_influxql(
+              ctx.conn,
+              "SELECT SUM(v), MEAN(v), COUNT(*) FROM #{ctx.m}",
+              database: ctx.database
+            )
+
+          assert %{"time" => ^epoch, "sum" => 6, "mean" => 2.0, "count_v" => 3, "count_w" => 1} =
+                   row
+
+          {:ok, [max]} =
+            unquote(client).query_influxql(ctx.conn, "SELECT MAX(v), h FROM #{ctx.m}",
+              database: ctx.database
+            )
+
+          assert %{"max" => 3, "h" => "x"} = max
+          assert max["time"] == DateTime.from_unix!(1_700_000_000_000_003, :microsecond)
+        end
+
+        test "GROUP BY with a per-series LIMIT; unknown names are empty; field keys", ctx do
+          {:ok, rows} =
+            unquote(client).query_influxql(ctx.conn, "SELECT v FROM #{ctx.m} GROUP BY h LIMIT 1",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, &{&1["h"], &1["v"]}) == [{"x", 2}, {"y", 1}]
+
+          for statement <- ["SELECT nothere FROM #{ctx.m}", "SELECT v FROM #{ctx.m}_missing"] do
+            assert {:ok, []} =
+                     unquote(client).query_influxql(ctx.conn, statement, database: ctx.database)
+          end
+
+          {:ok, keys} =
+            unquote(client).query_influxql(ctx.conn, "SHOW FIELD KEYS FROM #{ctx.m}",
+              database: ctx.database
+            )
+
+          assert Enum.map(keys, &{&1["fieldKey"], &1["fieldType"]}) ==
+                   [{"s", "string"}, {"v", "integer"}, {"w", "integer"}]
+        end
+      end
+
+      describe "query_sql/3 — sub-microsecond time contract" do
+        test "ORDER BY time and a time literal use the nanoseconds", ctx do
+          m = "contract_ns_#{System.unique_integer([:positive])}"
+
+          lp =
+            "#{m} v=3i 1700000000000000300\n#{m} v=1i 1700000000000000100\n#{m} v=2i 1700000000000000200"
+
+          {:ok, :written} = unquote(client).write(ctx.conn, lp, database: ctx.database)
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, ordered} =
+            unquote(client).query_sql(ctx.conn, "SELECT * FROM #{m} ORDER BY time",
+              database: ctx.database
+            )
+
+          assert Enum.map(ordered, & &1["v"]) == [1, 2, 3]
+
+          {:ok, later} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT v FROM #{m} WHERE time >= '2023-11-14T22:13:20.0000002Z' ORDER BY v",
+              database: ctx.database
+            )
+
+          assert Enum.map(later, & &1["v"]) == [2, 3]
         end
       end
     end

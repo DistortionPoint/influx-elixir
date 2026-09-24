@@ -681,6 +681,28 @@ end
 Queries the double cannot express (CTEs, joins, window functions, `median`,
 `percentile_cont`, ...) belong in the integration tier below.
 
+## InfluxQL
+
+`query_influxql/3` answers in InfluxDB 3's InfluxQL shape, which is not the
+SQL shape (every row below was taken from `influxdb:3-core`):
+
+```elixir
+Local.query_influxql(conn, "SELECT v FROM o", database: "db")
+#=> {:ok, [%{"iox::measurement" => "o", "time" => ~U[...], "v" => 1}, ...]}
+
+Local.query_influxql(conn, "SELECT SUM(v), COUNT(*) FROM o", database: "db")
+#=> {:ok, [%{"iox::measurement" => "o", "time" => ~U[1970-01-01 00:00:00.000000Z],
+#            "sum" => 6, "count_v" => 3, "count_w" => 1}]}
+```
+
+Rows come in time order and drop when they carry no selected field. A lone
+selector (`MAX`, `MIN`, `FIRST`, `LAST`) returns its point's time and the
+columns beside it. `LIMIT` and `OFFSET` apply per `GROUP BY` series. An
+unknown column or measurement is `{:ok, []}`. `SHOW DATABASES`,
+`SHOW MEASUREMENTS`, `SHOW TAG KEYS [FROM m]` and `SHOW FIELD KEYS [FROM m]`
+are answered from the schema. `GROUP BY time(...)`, regular expressions,
+`fill()`, `INTO` and subqueries are refused by name.
+
 ## Running Against a Real InfluxDB
 
 The double proves the *shape* of your code; only a real engine proves the

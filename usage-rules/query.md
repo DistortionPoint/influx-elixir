@@ -9,10 +9,11 @@
 - `query_sql/2,3` — v3 SQL queries, returns `{:ok, rows}` or `{:error, reason}`
 - `query_sql_stream/2,3` — returns a lazy `Stream` for large result sets; failures raise `InfluxElixir.StreamError` when the stream is enumerated
 - `execute_sql/2,3` — non-SELECT SQL (DELETE, INSERT INTO ... SELECT)
-- `query_influxql/2,3` — legacy InfluxQL queries
+- `query_influxql/2,3` — legacy InfluxQL queries. InfluxQL rows are not SQL rows: each carries `"iox::measurement"` and `"time"`, rows come in time order, aggregates are named `mean`, `count`, `sum`, ... (`COUNT(*)` gives `count_<field>`) with `time` at the epoch unless a lone selector returns its point, `LIMIT` applies per `GROUP BY` series, and an unknown column or measurement is `{:ok, []}` — on the server and `Client.Local` alike. `Client.Local` refuses `GROUP BY time(...)`, regular expressions and `fill()` by name
 - `query_flux/2,3` — v2 Flux queries; rows are long format (`_field` / `_value` per field)
 
 ## Results
+- A `time` is stored to the nanosecond: `ORDER BY time` and a literal such as `'…:20.0000002Z'` compare the full value even though the returned `DateTime` stops at the microsecond
 - Rows are maps with string keys; every timestamp column — `time`, Flux `_time`, a `DATE_BIN(...) AS bucket` alias, `selector_*(...)['time']`, `MAX(time)` — is a `DateTime` with microsecond precision on every client and transport; compare with `DateTime.compare/2` or a six-digit sigil
 - A null column is absent from the row, not present as `nil` (`COUNT` is `0`, never null), over HTTP and `transport: :flight` alike; assert with `refute Map.has_key?(row, "col")`
 - `AVG`, `SUM`, `COUNT`, `MIN`, `MAX`, `STDDEV[_SAMP|_POP]`, `VAR[_SAMP|_POP]` accept field arithmetic (`SUM(price * volume)`); `VARIANCE` does not exist in v3 SQL

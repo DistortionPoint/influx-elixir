@@ -1451,11 +1451,31 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   @spec parse_time_literal(binary(), binary()) :: {:ok, integer()} | {:error, map()}
+  # Elixir's calendar types stop at microseconds, so fraction digits seven
+  # to nine are split off and added back as nanoseconds: the engine compares
+  # '...:20.0000002Z' exactly (verified), and so must the double.
   defp parse_time_literal(literal, original) do
+    {literal, extra_ns} = split_sub_microseconds(literal)
+
     with :error <- zoned_to_ns(literal),
          :error <- naive_to_ns(literal),
          :error <- date_to_ns(literal) do
       {:error, invalid_time_error(original)}
+    else
+      {:ok, ns} -> {:ok, ns + extra_ns}
+    end
+  end
+
+  @sub_microsecond ~r/^(?<head>.*T\d{2}:\d{2}:\d{2}\.\d{6})(?<sub>\d{1,3})\d*(?<zone>Z|[+-]\d{2}:?\d{2})?$/
+
+  @spec split_sub_microseconds(binary()) :: {binary(), non_neg_integer()}
+  defp split_sub_microseconds(literal) do
+    case Regex.named_captures(@sub_microsecond, literal) do
+      %{"head" => head, "sub" => sub, "zone" => zone} ->
+        {head <> zone, sub |> String.pad_trailing(3, "0") |> String.to_integer()}
+
+      nil ->
+        {literal, 0}
     end
   end
 

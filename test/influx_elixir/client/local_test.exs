@@ -5269,4 +5269,161 @@ defmodule InfluxElixir.Client.LocalTest do
       assert Enum.sort(Enum.map(rows, &{&1["_field"], &1["_value"]})) == [{"v", 2}, {"w", 1}]
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # InfluxQL answers in InfluxDB 3's shape, and sub-microsecond time in SQL.
+  # Every expectation below was taken from influxdb:3-core
+  # (docs/design/2026-09-23_local-influxql.md).
+  # ---------------------------------------------------------------------------
+
+  describe "query_influxql/3 — the engine's InfluxQL answers" do
+    setup do
+      {:ok, conn} = Local.start(databases: ["iq"])
+      on_exit(fn -> Local.stop(conn) end)
+
+      lp = """
+      o,h=x v=3i 1700000000000003000
+      o,h=y v=1i 1700000000000001000
+      o,h=x v=2i 1700000000000002000
+      o,h=y w=9i 1700000000000004000
+      u x=5u 1700000000000000000
+      """
+
+      {:ok, :written} = Local.write(conn, String.trim(lp), database: "iq")
+      {:ok, conn: conn}
+    end
+
+    defp iq(conn, statement), do: Local.query_influxql(conn, statement, database: "iq")
+
+    defp t(us), do: DateTime.from_unix!(1_700_000_000_000_000 + us, :microsecond)
+
+    test "a SELECT carries iox::measurement and time, in time order, dropping rows with no selected field",
+         %{conn: conn} do
+      assert {:ok, rows} = iq(conn, "SELECT v FROM o")
+
+      assert rows == [
+               %{"iox::measurement" => "o", "time" => t(1), "v" => 1},
+               %{"iox::measurement" => "o", "time" => t(2), "v" => 2},
+               %{"iox::measurement" => "o", "time" => t(3), "v" => 3}
+             ]
+
+      assert {:ok, [%{"vee" => 1} | _rest]} = iq(conn, "SELECT v AS vee FROM o")
+      assert {:ok, [%{"w" => 9, "time" => time}]} = iq(conn, "SELECT w FROM o")
+      assert time == t(4)
+      assert {:ok, []} = iq(conn, "SELECT h FROM o")
+    end
+
+    test "an unknown column or measurement is an empty result, not an error", %{conn: conn} do
+      assert {:ok, []} = iq(conn, "SELECT nothere FROM o")
+      assert {:ok, []} = iq(conn, "SELECT v FROM nope WHERE h = 'x'")
+      assert {:ok, []} = iq(conn, "SELECT v FROM o WHERE nosuch = 'x'")
+      assert {:ok, []} = iq(conn, "SELECT MEAN(nothere) FROM o")
+    end
+
+    test "aggregates are named after the function and put time at the epoch", %{conn: conn} do
+      epoch = DateTime.from_unix!(0, :microsecond)
+
+      assert {:ok,
+              [
+                %{
+                  "iox::measurement" => "o",
+                  "time" => ^epoch,
+                  "sum" => 6,
+                  "mean" => 2.0,
+                  "count" => 3
+                }
+              ]} =
+               iq(conn, "SELECT SUM(v), MEAN(v), COUNT(v) FROM o")
+
+      assert {:ok, [%{"total" => 6}]} = iq(conn, "SELECT SUM(v) AS total FROM o")
+      assert {:ok, [%{"min" => 1, "min_1" => 9}]} = iq(conn, "SELECT MIN(v), MIN(w) FROM o")
+
+      assert {:ok, [%{"time" => ^epoch, "count_v" => 3, "count_w" => 1}]} =
+               iq(conn, "SELECT COUNT(*) FROM o")
+    end
+
+    test "a lone selector returns its point's time and the columns beside it", %{conn: conn} do
+      assert {:ok, [%{"max" => 3, "h" => "x", "time" => time}]} =
+               iq(conn, "SELECT MAX(v), h FROM o")
+
+      assert time == t(3)
+      assert {:ok, [%{"first" => 1, "time" => first}]} = iq(conn, "SELECT FIRST(v) FROM o")
+      assert first == t(1)
+    end
+
+    test "GROUP BY orders series by tag, and LIMIT applies per series", %{conn: conn} do
+      assert {:ok, rows} = iq(conn, "SELECT v FROM o GROUP BY h LIMIT 1")
+      assert Enum.map(rows, &{&1["h"], &1["v"]}) == [{"x", 2}, {"y", 1}]
+
+      assert {:ok, rows} = iq(conn, "SELECT v FROM o GROUP BY h ORDER BY time DESC")
+      assert Enum.map(rows, &{&1["h"], &1["v"]}) == [{"x", 3}, {"x", 2}, {"y", 1}]
+
+      assert {:ok, rows} = iq(conn, "SELECT MEAN(v) FROM o GROUP BY h")
+      assert Enum.map(rows, &{&1["h"], &1["mean"]}) == [{"x", 2.5}, {"y", 1.0}]
+    end
+
+    test "SHOW FIELD KEYS, SHOW TAG KEYS and SHOW DATABASES", %{conn: conn} do
+      assert {:ok, [%{"iox::measurement" => "u", "fieldKey" => "x", "fieldType" => "unsigned"}]} =
+               iq(conn, "SHOW FIELD KEYS FROM u")
+
+      assert {:ok, keys} = iq(conn, "SHOW FIELD KEYS")
+
+      assert Enum.map(keys, &{&1["iox::measurement"], &1["fieldKey"]}) == [
+               {"o", "v"},
+               {"o", "w"},
+               {"u", "x"}
+             ]
+
+      assert {:ok, [%{"iox::measurement" => "o", "tagKey" => "h"}]} = iq(conn, "SHOW TAG KEYS")
+      assert {:ok, []} = iq(conn, "SHOW TAG KEYS FROM nope")
+      assert {:ok, dbs} = iq(conn, "SHOW DATABASES")
+      assert %{"iox::database" => "iq", "deleted" => false} in dbs
+    end
+
+    test "constructs the double does not model are refused by name", %{conn: conn} do
+      for {statement, name} <- [
+            {"SELECT MEAN(v) FROM o WHERE time > 0 GROUP BY time(1m)", "GROUP BY time(...)"},
+            {"SELECT v FROM o WHERE h =~ /x/", "regular expressions"},
+            {"SELECT MEDIAN(v) FROM o", "function"},
+            {"SELECT SUM(*) FROM o", "sum(*)"},
+            {"SELECT MEAN(v), h FROM o", "columns beside aggregates"}
+          ] do
+        assert {:error, %{status: 400, body: body}} = iq(conn, statement)
+        assert body =~ name, statement
+      end
+    end
+  end
+
+  describe "query_sql/3 — time below a microsecond" do
+    setup do
+      {:ok, conn} = Local.start(databases: ["ns"])
+      on_exit(fn -> Local.stop(conn) end)
+      lp = "o v=3i 1700000000000000300\no v=1i 1700000000000000100\no v=2i 1700000000000000200"
+      {:ok, :written} = Local.write(conn, lp, database: "ns")
+      {:ok, conn: conn}
+    end
+
+    test "ORDER BY time orders points less than a microsecond apart by their nanoseconds",
+         %{conn: conn} do
+      for {sql, expected} <- [
+            {"SELECT v FROM o ORDER BY time", [1, 2, 3]},
+            {"SELECT * FROM o ORDER BY time DESC", [3, 2, 1]},
+            {"SELECT time AS t, v FROM o ORDER BY t", [1, 2, 3]}
+          ] do
+        assert {:ok, rows} = Local.query_sql(conn, sql, database: "ns")
+        assert Enum.map(rows, & &1["v"]) == expected, sql
+      end
+    end
+
+    test "a time literal keeps its digits past the microsecond", %{conn: conn} do
+      assert {:ok, rows} =
+               Local.query_sql(
+                 conn,
+                 "SELECT v FROM o WHERE time >= '2023-11-14T22:13:20.0000002Z' ORDER BY v",
+                 database: "ns"
+               )
+
+      assert Enum.map(rows, & &1["v"]) == [2, 3]
+    end
+  end
 end

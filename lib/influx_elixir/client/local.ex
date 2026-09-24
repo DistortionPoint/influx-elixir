@@ -270,7 +270,7 @@ defmodule InfluxElixir.Client.Local do
 
   @behaviour InfluxElixir.Client
 
-  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLExecutor, SQLParser}
+  alias InfluxElixir.Client.Local.{InfluxQL, LineProtocolParser, SQLExecutor, SQLParser}
 
   @type point_map :: LineProtocolParser.point()
 
@@ -902,12 +902,17 @@ defmodule InfluxElixir.Client.Local do
   @doc """
   Executes an InfluxQL query.
 
-  Supports InfluxQL-specific commands:
+  Answers what InfluxDB 3 answers, verified against the engine:
 
-    * `SHOW DATABASES` — returns all databases
-    * `SHOW MEASUREMENTS` — returns all measurement names
-    * `SHOW TAG KEYS FROM <measurement>` — returns distinct tag keys
-    * `SELECT ...` — delegates to the SQL engine
+    * `SHOW DATABASES` — `%{"iox::database" => name, "deleted" => false}`
+    * `SHOW MEASUREMENTS` — `%{"iox::measurement" => "measurements", "name" => m}`
+    * `SHOW TAG KEYS [FROM m]` — `%{"iox::measurement" => m, "tagKey" => k}`
+    * `SHOW FIELD KEYS [FROM m]` — `%{"iox::measurement" => m, "fieldKey" => k,
+      "fieldType" => "integer" | "unsigned" | "float" | "string" | "boolean"}`
+    * `SELECT ...` — InfluxQL, not SQL: see `InfluxElixir.Client.Local.InfluxQL`
+      for the row shape (`iox::measurement` and `time` on every row, time
+      order, `mean`/`count`/... aggregates, an unknown column or measurement
+      is `{:ok, []}`) and for what is refused by name
   """
   @impl true
   @spec query_influxql(
@@ -917,35 +922,31 @@ defmodule InfluxElixir.Client.Local do
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(%{table: table} = conn, influxql, opts \\ []) do
     with :ok <- require_capability(conn, :query_influxql) do
-      do_query_influxql(table, conn, influxql, opts)
+      do_query_influxql(table, conn, String.trim(influxql), opts)
     end
   end
 
-  @show_databases ~r/^(?i)SHOW\s+DATABASES\s*$/
-  @show_measurements ~r/^(?i)SHOW\s+MEASUREMENTS\s*$/
-  @show_tag_keys ~r/^(?i)SHOW\s+TAG\s+KEYS\s+FROM\s+(\S+)\s*$/
+  @show_databases ~r/^(?i)SHOW\s+DATABASES\s*;?$/
+  @show_measurements ~r/^(?i)SHOW\s+MEASUREMENTS\s*;?$/
+  @show_keys ~r/^(?i)SHOW\s+(TAG|FIELD)\s+KEYS(?:\s+FROM\s+("(?:[^"\\]|\\.)+"|\S+?))?\s*;?$/
 
-  # The SHOW commands are InfluxQL-only; any other statement is handed to the
-  # SQL engine. Each pattern is matched once.
+  @spec do_query_influxql(:ets.table(), map(), binary(), keyword()) ::
+          InfluxElixir.Client.query_result()
   defp do_query_influxql(table, conn, influxql, opts) do
-    trimmed = String.trim(influxql)
     database = resolve_database(opts, conn)
 
     cond do
-      String.match?(trimmed, @show_databases) ->
-        {:ok, table |> get_databases() |> Enum.map(&%{"iox::database" => &1})}
+      String.match?(influxql, @show_databases) ->
+        {:ok, Enum.map(get_databases(table), &%{"iox::database" => &1, "deleted" => false})}
 
-      String.match?(trimmed, @show_measurements) ->
+      String.match?(influxql, @show_measurements) ->
         {:ok, show_measurements(table, database)}
 
-      match = Regex.run(@show_tag_keys, trimmed) ->
-        [_full, measurement_raw] = match
-
-        {:ok,
-         show_tag_keys(table, database, LineProtocolParser.unescape_measurement(measurement_raw))}
+      match = Regex.run(@show_keys, influxql) ->
+        {:ok, show_keys(table, database, match)}
 
       true ->
-        query_sql(conn, influxql, opts)
+        influxql_select(table, conn, influxql, opts)
     end
   end
 
@@ -957,13 +958,80 @@ defmodule InfluxElixir.Client.Local do
     |> Enum.map(&%{"iox::measurement" => "measurements", "name" => &1})
   end
 
-  @spec show_tag_keys(:ets.table(), binary(), binary()) :: [map()]
-  defp show_tag_keys(table, database, measurement) do
+  # Tag and field keys come from the column schema, in (measurement, key)
+  # order — the `{:column, ...}` keys of the ordered set.
+  @spec show_keys(:ets.table(), binary(), [binary()]) :: [map()]
+  defp show_keys(table, database, [_full, kind | from]) do
+    only =
+      case from do
+        [m] -> m |> String.trim("\"") |> LineProtocolParser.unescape_measurement()
+        [] -> nil
+      end
+
+    for [m, column, type] <- :ets.match(table, {{:column, database, :"$1", :"$2"}, :"$3"}),
+        only in [nil, m],
+        row = key_row(String.upcase(kind), m, column, type),
+        row != nil do
+      row
+    end
+  end
+
+  @spec key_row(binary(), term(), binary(), binary()) :: map() | nil
+  defp key_row("TAG", m, column, "iox::column_type::tag"),
+    do: %{"iox::measurement" => m, "tagKey" => column}
+
+  defp key_row("FIELD", m, column, "iox::column_type::field::" <> _type = kind),
+    do: %{
+      "iox::measurement" => m,
+      "fieldKey" => column,
+      "fieldType" => LineProtocolParser.v2_field_type(kind)
+    }
+
+  defp key_row(_kind, _m, _column, _type), do: nil
+
+  # The statement's WHERE is evaluated by the SQL engine (the grammar the two
+  # share: comparisons, AND/OR/NOT, time literals, now()); InfluxQL then
+  # shapes the rows. A measurement or column the engine does not know is an
+  # empty InfluxQL result, not an error (verified).
+  @spec influxql_select(:ets.table(), map(), binary(), keyword()) ::
+          InfluxElixir.Client.query_result()
+  defp influxql_select(table, conn, influxql, opts) do
+    with {:ok, query} <- influxql_parse(influxql) do
+      where = if query.where, do: " WHERE " <> query.where, else: ""
+      # ORDER BY time sorts on the stored nanoseconds; rows carry microsecond
+      # DateTimes, so sorting those alone would tie sub-microsecond points.
+      sql = ~s|SELECT * FROM "#{query.measurement}"| <> where <> " ORDER BY time"
+
+      case query_sql(conn, sql, Keyword.delete(opts, :params)) do
+        {:ok, rows} ->
+          tags = measurement_tags(table, resolve_database(opts, conn), query.measurement)
+          {:ok, InfluxQL.run(query, rows, tags)}
+
+        {:error, %{body: "Error during planning: table " <> _rest}} ->
+          {:ok, []}
+
+        {:error, %{body: "Schema error: No field named" <> _rest}} ->
+          {:ok, []}
+
+        error ->
+          error
+      end
+    end
+  end
+
+  @spec influxql_parse(binary()) :: {:ok, InfluxQL.query()} | {:error, map()}
+  defp influxql_parse(influxql) do
+    case InfluxQL.parse(influxql) do
+      {:ok, query} -> {:ok, query}
+      {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}: #{influxql}"}}
+    end
+  end
+
+  @spec measurement_tags(:ets.table(), binary(), binary()) :: MapSet.t(binary())
+  defp measurement_tags(table, database, measurement) do
     table
-    |> fetch_points(database, measurement)
-    |> Enum.flat_map(&Map.keys(&1.tags))
-    |> Enum.uniq()
-    |> Enum.map(&%{"iox::measurement" => measurement, "tagKey" => &1})
+    |> :ets.match({{:column, database, measurement, :"$1"}, "iox::column_type::tag"})
+    |> MapSet.new(fn [column] -> column end)
   end
 
   @doc """

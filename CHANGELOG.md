@@ -56,6 +56,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` answered InfluxQL `SELECT` as SQL.** Verified against
+  InfluxDB 3 over 50 statements, 28 of which differed: rows lacked
+  `"iox::measurement"`, a projection lost `time`, `MEAN`/`COUNT` were
+  refused, aggregates were not named `mean`/`count`/`sum`, a lone selector
+  did not return its point's time, `LIMIT` did not apply per `GROUP BY`
+  series, an unknown column or measurement was an error instead of
+  `{:ok, []}`, `SHOW FIELD KEYS` and bare `SHOW TAG KEYS` were
+  unsupported, and `SHOW DATABASES` lacked `"deleted"`. The new
+  `Client.Local.InfluxQL` module answers all 50 identically;
+  `GROUP BY time(...)`, regular expressions, `fill()` and other
+  constructs it does not model are refused by name.
+- **`Client.Local` compared `time` at microsecond precision in SQL.**
+  `ORDER BY time` sorted the projected `DateTime`, so points less than a
+  microsecond apart came back in insertion order, and a literal such as
+  `'…:20.0000002Z'` lost its last three digits. The engine uses the
+  nanoseconds (verified); so does the double now, on every `ORDER BY time`
+  form (`*`, a projection, an alias of `time`) and in every time literal.
 - **`transport: :flight` returned null columns as `nil` keys.** Over
   HTTP, InfluxDB 3 leaves a null column out of the row, and the library
   documents that a null column is absent, not `nil`. The Flight reader
