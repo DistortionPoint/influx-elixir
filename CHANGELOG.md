@@ -56,6 +56,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`Client.Local` skipped every Flux stage it did not understand.** The
+  double matched a few regexes anywhere in the query and ignored the rest,
+  so `|> mean()`, `last()`, `limit()`, `count()`, `aggregateWindow()`,
+  `pivot()` and `group()` all returned the raw rows; `or` behaved like
+  `and`; `!=`, `not`, `r._value > 2.0` and `range(stop:)` were ignored; a
+  query without `range()` or on a missing bucket returned rows or `[]`.
+  Verified against InfluxDB 2.7, the new `Client.Local.Flux` runs the
+  pipeline in order — `range`, `filter` with a real expression grammar
+  and three-valued logic, `first`/`last`/`min`/`max`, `mean`/`sum`/`count`,
+  `limit`, `yield` — numbers tables in the engine's series order, adds
+  `_start`/`_stop`, and answers 24 of 24 comparison queries identically.
+  Any other stage is a 400 naming it; no `range()` is the engine's
+  unbounded-read 400; a missing bucket is its 404; `mean()` over strings is
+  its 400. Two tests that asserted the old behaviour (all rows without
+  `range()`, `[]` for a missing bucket) now assert the engine's answers.
 - **`Client.Local` answered InfluxQL `SELECT` as SQL.** Verified against
   InfluxDB 3 over 50 statements, 28 of which differed: rows lacked
   `"iox::measurement"`, a projection lost `time`, `MEAN`/`COUNT` were

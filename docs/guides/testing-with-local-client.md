@@ -402,7 +402,7 @@ GROUP BY ticker, holding_type
 ## Flux Queries (`:v2` profile)
 
 `query_flux/3` returns the same **long** rows a real InfluxDB 2.x returns: one
-row per field, with `_field` / `_value`, `_measurement`, `_time` (a `DateTime`),
+row per field, with `_field` / `_value`, `_measurement`, `_time`, `_start` and `_stop` (`DateTime`s),
 the tags, `result`, and a `table` index per series:
 
 ```elixir
@@ -421,10 +421,18 @@ the tags, `result`, and a `table` index per series:
 assert [%{"_field" => "value", "_value" => 1.0, "host" => "web01", "table" => 0}] = rows
 ```
 
-Supported predicates: `from(bucket:)`, `range(start: -N[smhd])`,
-`r._measurement == "..."`, `r._field == "..."`, and `r.<tag_or_field> == "..."`.
-Against a real server, set `api_version: :v2` on the connection so writes go to
-`/api/v2/write`.
+The whole pipeline runs or is refused; a stage is never skipped (verified
+against InfluxDB 2.7). Supported stages: `range` (required, as on the
+engine; Unix seconds, RFC3339, `-1h`-style durations, `now()`; rows carry
+`_start` and `_stop`), `filter` (`r.key` / `r["key"]` with
+`== != < <= > >=`, `and`, `or`, `not`, parentheses; a key the row lacks
+never matches), `first`, `last`, `min`, `max` (the selected row per table),
+`mean`, `sum`, `count` (one row per table, without `_time`), `limit(n:,
+offset:)` per table, and `yield(name:)`. Tables are numbered per series in
+measurement, tag, field order. Any other stage, such as `aggregateWindow`,
+`pivot`, `group` or `sort`, is a 400 naming it; a missing bucket is the
+engine's 404. Against a real server, set `api_version: :v2` on the
+connection so writes go to `/api/v2/write`.
 
 ## Decimal Params
 

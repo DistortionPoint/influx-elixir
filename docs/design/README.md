@@ -44,6 +44,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-23 | [`precision-spellings-and-connection-plumbing`](2026-09-23_precision-spellings-and-connection-plumbing.md) | Local accepts the engines' precision spellings and `auto` (thresholds verified); duplicate points merge on read as both engines do; bucket retention and 404s as the engines answer; admin `:retention` docs; no idle Finch pool with `:finch_name`; clearer `fetch!/1`; observable Writer and admin tests |
 | 2026-09-23 | [`flight-null-columns`](2026-09-23_flight-null-columns.md) | Flight rows omit null columns as HTTP does; verified identical on 25,000 mixed-type rows |
 | 2026-09-23 | [`local-influxql`](2026-09-23_local-influxql.md) | Local answers InfluxQL in the engine's shape (50/50 verified); SQL `ORDER BY time` and time literals keep nanoseconds |
+| 2026-09-24 | [`local-flux-pipeline`](2026-09-24_local-flux-pipeline.md) | Local runs every Flux stage or refuses it (24/24 verified against InfluxDB 2.7); filter grammar, `_start`/`_stop`, series table order |
 
 ## Verifying against a real engine
 

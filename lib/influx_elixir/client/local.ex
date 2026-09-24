@@ -270,7 +270,7 @@ defmodule InfluxElixir.Client.Local do
 
   @behaviour InfluxElixir.Client
 
-  alias InfluxElixir.Client.Local.{InfluxQL, LineProtocolParser, SQLExecutor, SQLParser}
+  alias InfluxElixir.Client.Local.{Flux, InfluxQL, LineProtocolParser, SQLExecutor, SQLParser}
 
   @type point_map :: LineProtocolParser.point()
 
@@ -896,7 +896,7 @@ defmodule InfluxElixir.Client.Local do
   end
 
   # ---------------------------------------------------------------------------
-  # InfluxQL / Flux queries (delegate to SQL engine)
+  # InfluxQL and Flux queries
   # ---------------------------------------------------------------------------
 
   @doc """
@@ -1035,93 +1035,57 @@ defmodule InfluxElixir.Client.Local do
   end
 
   @doc """
-  Executes a Flux query with support for common predicates.
+  Executes a Flux query as InfluxDB 2 does; see `InfluxElixir.Client.Local.Flux`
+  for the stages supported. Every stage is applied or the query is refused
+  (`{:error, %{status: 400, body: json}}` naming it) — a stage is never
+  skipped. Rows use the engine's long shape, one per field value:
 
-  Parses and applies:
+      %{"result" => "_result", "table" => 0, "_start" => %DateTime{},
+        "_stop" => %DateTime{}, "_time" => %DateTime{}, "_measurement" => "cpu",
+        "_field" => "value", "_value" => 1.0, "host" => "web01"}
 
-    * `from(bucket: "...")` — scopes to a database
-    * `range(start: -1h)` — filters by timestamp (supports `-Nh`, `-Nd`, `-Nm`)
-    * `filter(fn: (r) => r._measurement == "...")` — filters by measurement
-    * `filter(fn: (r) => r._field == "...")` — keeps only that field
-    * `filter(fn: (r) => r.<key> == "...")` — filters by any tag/field equality
-
-  Rows use the same **long** shape real Flux returns — one row per field,
-  ordered by `table` then `_time`:
-
-      %{"result" => "_result", "table" => 0, "_time" => %DateTime{},
-        "_measurement" => "cpu", "_field" => "value", "_value" => 1.0,
-        "host" => "web01"}
-
-  `table` numbers each series (measurement + tags + field) from `0`.
+  A bucket that does not exist is the engine's 404.
   """
   @impl true
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_flux(%{table: table} = conn, flux, _opts \\ []) do
-    with :ok <- require_capability(conn, :query_flux) do
-      database = extract_flux_bucket(flux)
-      measurement = extract_flux_measurement(flux)
-
-      points =
-        case {database, measurement} do
-          {nil, _any} -> all_points(table)
-          {db, nil} -> all_points_in_db(table, db)
-          {db, m} -> fetch_points(table, db, m)
-        end
-
-      points
-      |> apply_flux_range(flux)
-      |> apply_flux_filters(flux)
-      |> flux_rows(extract_flux_field(flux))
-      |> then(&{:ok, &1})
+    with :ok <- require_capability(conn, :query_flux),
+         {:ok, query} <- flux_parse(flux),
+         :ok <- flux_bucket_exists(table, query.bucket) do
+      case Flux.run(query, all_points_in_db(table, query.bucket)) do
+        {:ok, rows} -> {:ok, rows}
+        {:error, message} -> {:error, flux_error(400, "invalid", message)}
+      end
     end
   end
 
-  # Real Flux output is long: one row per field carrying `_field`/`_value`,
-  # `_measurement`, `_time`, the tags, and a `table` index per series.
-  # Emitting the same shape means a consumer's Flux handling can be
-  # exercised against the double.
-  @spec flux_rows([point_map()], binary() | nil) :: [map()]
-  defp flux_rows(points, only_field) do
-    {rows, _tables} =
-      points
-      |> Enum.flat_map(fn point ->
-        for {field, value} <- point.fields,
-            only_field in [nil, field],
-            do: {point, field, value}
-      end)
-      |> Enum.map_reduce(%{}, fn {point, field, value}, tables ->
-        series = {point.measurement, point.tags, field}
-
-        {table, tables} =
-          Map.get_and_update(tables, series, &{&1 || map_size(tables), &1 || map_size(tables)})
-
-        row =
-          Map.merge(point.tags, %{
-            "result" => "_result",
-            "table" => table,
-            "_time" => SQLExecutor.nanoseconds_to_datetime(point.timestamp),
-            "_value" => value,
-            "_field" => field,
-            "_measurement" => point.measurement
-          })
-
-        {row, tables}
-      end)
-
-    Enum.sort_by(rows, &{&1["table"], &1["_time"]}, fn
-      {t1, %DateTime{} = a}, {t2, %DateTime{} = b} when t1 == t2 -> DateTime.compare(a, b) != :gt
-      {t1, _a}, {t2, _b} -> t1 <= t2
-    end)
-  end
-
-  @spec extract_flux_field(binary()) :: binary() | nil
-  defp extract_flux_field(flux) do
-    case Regex.run(~r/filter\s*\(\s*fn\s*:\s*\(r\)\s*=>\s*r\._field\s*==\s*"([^"]+)"/, flux) do
-      [_full, field] -> field
-      _no_match -> nil
+  @spec flux_parse(binary()) :: {:ok, Flux.query()} | {:error, map()}
+  defp flux_parse(flux) do
+    # The clock `store_point/3` stamps untimed points with, so a point
+    # written a moment ago is inside `range(start: -1h)`.
+    case Flux.parse(flux, System.system_time(:nanosecond)) do
+      {:ok, query} -> {:ok, query}
+      {:error, message} -> {:error, flux_error(400, "invalid", message)}
     end
   end
+
+  @spec flux_bucket_exists(:ets.table(), binary()) :: :ok | {:error, map()}
+  defp flux_bucket_exists(table, bucket) do
+    if :ets.member(table, {:bucket, bucket}) or :ets.member(table, {:database, bucket}),
+      do: :ok,
+      else:
+        {:error,
+         flux_error(
+           404,
+           "not found",
+           "failed to initialize execute state: could not find bucket \"#{bucket}\""
+         )}
+  end
+
+  @spec flux_error(pos_integer(), binary(), binary()) :: map()
+  defp flux_error(status, code, message),
+    do: %{status: status, body: Jason.encode!(%{"code" => code, "message" => message})}
 
   # ---------------------------------------------------------------------------
   # Database admin
@@ -1461,16 +1425,6 @@ defmodule InfluxElixir.Client.Local do
     |> merge_duplicates()
   end
 
-  @spec all_points(:ets.table()) :: [point_map()]
-  defp all_points(table) do
-    # Merged per database: the same series and time in two databases are
-    # two points.
-    table
-    |> :ets.select([{{{:point, :"$1", :_, :_}, :_}, [], [:"$1"]}])
-    |> Enum.uniq()
-    |> Enum.flat_map(&all_points_in_db(table, &1))
-  end
-
   # ---------------------------------------------------------------------------
   # Private — gzip decompression
   # ---------------------------------------------------------------------------
@@ -1485,71 +1439,6 @@ defmodule InfluxElixir.Client.Local do
   defp maybe_decompress(plain), do: {:ok, plain}
 
   # Flux responses include _measurement (v2 compatibility format)
-
-  # ---------------------------------------------------------------------------
-  # Private — Flux helpers
-  # ---------------------------------------------------------------------------
-
-  @spec extract_flux_bucket(binary()) :: binary() | nil
-  defp extract_flux_bucket(flux) do
-    case Regex.run(~r/from\s*\(\s*bucket\s*:\s*"([^"]+)"/, flux) do
-      [_full_match, bucket] -> bucket
-      _no_match -> nil
-    end
-  end
-
-  @spec extract_flux_measurement(binary()) :: binary() | nil
-  defp extract_flux_measurement(flux) do
-    pattern = ~r/filter\s*\(\s*fn\s*:\s*\(r\)\s*=>\s*r\._measurement\s*==\s*"([^"]+)"/
-
-    case Regex.run(pattern, flux) do
-      [_full_match, m] -> m
-      _no_match -> nil
-    end
-  end
-
-  @spec apply_flux_range([point_map()], binary()) :: [point_map()]
-  defp apply_flux_range(points, flux) do
-    case Regex.run(~r/range\s*\(\s*start\s*:\s*(-?\d+)([smhd])/, flux) do
-      [_full, amount_str, unit] ->
-        {amount, ""} = Integer.parse(amount_str)
-        now_ns = System.os_time(:nanosecond)
-        offset_ns = duration_to_ns(amount, unit)
-        cutoff = now_ns + offset_ns
-
-        Enum.filter(points, fn point ->
-          case point.timestamp do
-            nil -> true
-            ts -> ts >= cutoff
-          end
-        end)
-
-      _no_match ->
-        points
-    end
-  end
-
-  @spec duration_to_ns(integer(), binary()) :: integer()
-  defp duration_to_ns(amount, "s"), do: amount * 1_000_000_000
-  defp duration_to_ns(amount, "m"), do: amount * 60 * 1_000_000_000
-  defp duration_to_ns(amount, "h"), do: amount * 3_600 * 1_000_000_000
-  defp duration_to_ns(amount, "d"), do: amount * 86_400 * 1_000_000_000
-
-  @spec apply_flux_filters([point_map()], binary()) :: [point_map()]
-  defp apply_flux_filters(points, flux) do
-    # Extract all filter predicates of the form r.<key> == "<value>"
-    # (excluding _measurement which is handled separately)
-    pattern = ~r/filter\s*\(\s*fn\s*:\s*\(r\)\s*=>\s*r\.(\w+)\s*==\s*"([^"]+)"/
-
-    Regex.scan(pattern, flux)
-    |> Enum.reject(fn [_full, key, _val] -> key in ["_measurement", "_field"] end)
-    |> Enum.reduce(points, fn [_full, key, value], acc ->
-      Enum.filter(acc, fn point ->
-        Map.get(point.tags, key) == value or
-          Map.get(point.fields, key) == value
-      end)
-    end)
-  end
 
   # ---------------------------------------------------------------------------
   # Private — utilities

@@ -1765,9 +1765,15 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, [%{"_field" => "free", "_value" => 7}]} = Local.query_flux(conn, flux)
     end
 
-    test "flux query with no matching bucket returns empty list", %{v2_conn: conn} do
+    test "a bucket that does not exist is the engine's 404", %{v2_conn: conn} do
       flux = "from(bucket: \"no_such_bucket\") |> range(start: -1h)"
-      assert {:ok, []} = Local.query_flux(conn, flux)
+      assert {:error, %{status: 404, body: body}} = Local.query_flux(conn, flux)
+
+      assert Jason.decode!(body) == %{
+               "code" => "not found",
+               "message" =>
+                 ~s|failed to initialize execute state: could not find bucket "no_such_bucket"|
+             }
     end
   end
 
@@ -2848,11 +2854,12 @@ defmodule InfluxElixir.Client.LocalTest do
       assert length(rows) == 2
     end
 
-    test "flux query with no range clause returns all points", %{v2_conn: conn} do
-      # No range() pipe — passthrough
-      flux = "from(bucket: \"flux_range_db\")"
-      assert {:ok, rows} = Local.query_flux(conn, flux)
-      assert length(rows) == 2
+    test "a query without range() is refused as unbounded, as the engine refuses it",
+         %{v2_conn: conn} do
+      assert {:error, %{status: 400, body: body}} =
+               Local.query_flux(conn, "from(bucket: \"flux_range_db\")")
+
+      assert Jason.decode!(body)["message"] =~ "cannot submit unbounded read"
     end
 
     test "flux filter predicate on tag field", %{v2_conn: conn} do
@@ -5424,6 +5431,134 @@ defmodule InfluxElixir.Client.LocalTest do
                )
 
       assert Enum.map(rows, & &1["v"]) == [2, 3]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Flux pipelines: every stage applied or refused. Expectations taken from
+  # influxdb:2.7 (docs/design/2026-09-24_local-flux-pipeline.md).
+  # ---------------------------------------------------------------------------
+
+  describe "query_flux/3 — every stage is applied or refused" do
+    setup do
+      {:ok, conn} = Local.start(profile: :v2)
+      on_exit(fn -> Local.stop(conn) end)
+      :ok = Local.create_bucket(conn, "b")
+
+      lp = """
+      cpu,host=a v=1.0,n=1i 1700000000000000000
+      cpu,host=a v=3.0,n=2i 1700000060000000000
+      cpu,host=b v=5.0,n=3i 1700000000000000000
+      """
+
+      {:ok, :written} = Local.write(conn, String.trim(lp), database: "b")
+      {:ok, conn: conn}
+    end
+
+    defp fx(conn, tail),
+      do:
+        Local.query_flux(
+          conn,
+          ~s|from(bucket: "b") \|> range(start: 0, stop: 1800000000)| <> tail
+        )
+
+    defp values(rows), do: Enum.map(rows, &{&1["table"], &1["host"], &1["_value"]})
+
+    test "tables are series in measurement, tag, field order; rows carry _start and _stop",
+         %{conn: conn} do
+      assert {:ok, rows} = fx(conn, "")
+
+      assert Enum.map(rows, &{&1["table"], &1["host"], &1["_field"]}) == [
+               {0, "a", "n"},
+               {0, "a", "n"},
+               {1, "a", "v"},
+               {1, "a", "v"},
+               {2, "b", "n"},
+               {3, "b", "v"}
+             ]
+
+      assert Enum.all?(rows, &(&1["_start"] == ~U[1970-01-01 00:00:00.000000Z]))
+      assert Enum.all?(rows, &(&1["_stop"] == ~U[2027-01-15 08:00:00.000000Z]))
+    end
+
+    test "filter predicates: or, !=, not, numeric _value, r[\"key\"], a missing key",
+         %{conn: conn} do
+      v = ~s| \|> filter(fn: (r) => r._field == "v"|
+
+      assert {:ok, rows} = fx(conn, v <> ~s| and (r.host == "a" or r.host == "b"))|)
+      assert length(rows) == 3
+      assert {:ok, [%{"host" => "b"}]} = fx(conn, v <> ~s| and r.host != "a")|)
+      assert {:ok, rows} = fx(conn, ~s| \|> filter(fn: (r) => r._value > 2.0)|)
+      assert values(rows) == [{0, "a", 3.0}, {1, "b", 3}, {2, "b", 5.0}]
+      assert {:ok, rows} = fx(conn, ~s| \|> filter(fn: (r) => not (r.host == "a"))|)
+      assert Enum.map(rows, & &1["host"]) == ["b", "b"]
+      assert {:ok, [_n, _v]} = fx(conn, ~s| \|> filter(fn: (r) => r["host"] == "b")|)
+      assert {:ok, []} = fx(conn, ~s| \|> filter(fn: (r) => r.nosuch == "x")|)
+    end
+
+    test "selectors keep their row; mean, sum and count drop _time; limit is per table",
+         %{conn: conn} do
+      v = ~s| \|> filter(fn: (r) => r._field == "v")|
+      assert {:ok, rows} = fx(conn, v <> " |> last()")
+      assert values(rows) == [{0, "a", 3.0}, {1, "b", 5.0}]
+      assert Enum.all?(rows, &match?(%DateTime{}, &1["_time"]))
+      assert {:ok, rows} = fx(conn, v <> " |> max()")
+      assert values(rows) == [{0, "a", 3.0}, {1, "b", 5.0}]
+
+      assert {:ok, rows} = fx(conn, v <> " |> mean()")
+      assert values(rows) == [{0, "a", 2.0}, {1, "b", 5.0}]
+      refute Enum.any?(rows, &Map.has_key?(&1, "_time"))
+      assert {:ok, rows} = fx(conn, ~s| \|> filter(fn: (r) => r._field == "n") \|> sum()|)
+      assert values(rows) == [{0, "a", 3}, {1, "b", 3}]
+      assert {:ok, rows} = fx(conn, v <> " |> count()")
+      assert values(rows) == [{0, "a", 2}, {1, "b", 1}]
+
+      assert {:ok, [%{"host" => "a", "_value" => 3.0}]} =
+               fx(conn, v <> " |> limit(n: 1, offset: 1)")
+
+      assert {:ok, [%{"_value" => 5.0, "table" => 0}]} =
+               fx(conn, v <> " |> mean() |> filter(fn: (r) => r._value > 2.0)")
+
+      assert {:ok, [%{"result" => "x"} | _rest]} = fx(conn, v <> ~s| \|> yield(name: "x")|)
+    end
+
+    test "range(stop:) and an RFC3339 start bound the rows", %{conn: conn} do
+      assert {:ok, rows} =
+               Local.query_flux(
+                 conn,
+                 ~s|from(bucket: "b") \|> range(start: 0, stop: 1700000030) \|> filter(fn: (r) => r._field == "v")|
+               )
+
+      assert Enum.map(rows, & &1["_value"]) == [1.0, 5.0]
+
+      assert {:ok, [%{"_value" => 3.0}]} =
+               Local.query_flux(
+                 conn,
+                 ~s|from(bucket: "b") \|> range(start: 2023-11-14T22:14:00Z) \|> filter(fn: (r) => r._field == "v")|
+               )
+    end
+
+    test "a stage the double does not model is refused by name, never skipped", %{conn: conn} do
+      for {tail, name} <- [
+            {" |> aggregateWindow(every: 1m, fn: mean)", "aggregateWindow()"},
+            {~s| \|> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")|,
+             "pivot()"},
+            {" |> group()", "group()"},
+            {" |> sort()", "sort()"},
+            {~s| \|> filter(fn: (r) => r.host =~ /a/)|, "filter predicate"}
+          ] do
+        assert {:error, %{status: 400, body: body}} = fx(conn, tail)
+        assert Jason.decode!(body)["message"] =~ name, tail
+      end
+    end
+
+    test "mean() over strings is an error, not a crash", %{conn: conn} do
+      {:ok, :written} = Local.write(conn, ~s|txt s="x" 1700000000000000000|, database: "b")
+
+      assert {:error, %{status: 400, body: body}} =
+               fx(conn, ~s| \|> filter(fn: (r) => r._measurement == "txt") \|> mean()|)
+
+      assert Jason.decode!(body)["message"] =~ "unsupported input type for mean aggregate: string"
     end
   end
 end

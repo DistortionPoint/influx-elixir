@@ -90,6 +90,7 @@ defmodule InfluxElixir.ClientContract do
     v2_write_rule_tests = if v2_ops, do: v2_write_rule_tests(client), else: nil
     v2_precision_tests = if v2_ops, do: v2_precision_tests(client), else: nil
     v2_duplicate_tests = if v2_ops, do: v2_duplicate_tests(client), else: nil
+    v2_flux_pipeline_tests = if v2_ops, do: v2_flux_pipeline_tests(client), else: nil
     flux_tests = if v2_ops, do: flux_tests(client), else: nil
 
     token_tests = if enterprise_ops, do: token_tests(client), else: nil
@@ -128,6 +129,7 @@ defmodule InfluxElixir.ClientContract do
         v2_write_rule_tests,
         v2_precision_tests,
         v2_duplicate_tests,
+        v2_flux_pipeline_tests,
         flux_tests,
         token_tests
       ]
@@ -2272,6 +2274,107 @@ defmodule InfluxElixir.ClientContract do
             )
 
           assert Enum.map(later, & &1["v"]) == [2, 3]
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # Flux pipelines (v2)
+  # ---------------------------------------------------------------------------
+
+  defp v2_flux_pipeline_tests(client) do
+    quote do
+      describe "query_flux/3 — pipeline contract" do
+        setup ctx do
+          m = "contract_fx_#{System.unique_integer([:positive])}"
+
+          lp = """
+          #{m},host=a v=1.0,n=1i 1700000000000000000
+          #{m},host=a v=3.0,n=2i 1700000060000000000
+          #{m},host=b v=5.0,n=3i 1700000000000000000
+          """
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, String.trim(lp), database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          head =
+            ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 1800000000) | <>
+              ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
+
+          {:ok, head: head}
+        end
+
+        test "tables, _start/_stop and the filter grammar", ctx do
+          {:ok, rows} = unquote(client).query_flux(ctx.conn, ctx.head)
+
+          assert Enum.map(rows, &{&1["table"], &1["_field"]}) == [
+                   {0, "n"},
+                   {0, "n"},
+                   {1, "v"},
+                   {1, "v"},
+                   {2, "n"},
+                   {3, "v"}
+                 ]
+
+          assert Enum.all?(rows, &(&1["_stop"] == ~U[2027-01-15 08:00:00.000000Z]))
+
+          {:ok, rows} =
+            unquote(client).query_flux(
+              ctx.conn,
+              ctx.head <>
+                ~s| \|> filter(fn: (r) => r._field == "v" and (r.host != "a" or r._value > 2.0))|
+            )
+
+          assert Enum.map(rows, & &1["_value"]) == [3.0, 5.0]
+        end
+
+        test "mean drops _time, last keeps its row, limit is per table", ctx do
+          v = ~s| \|> filter(fn: (r) => r._field == "v")|
+          {:ok, means} = unquote(client).query_flux(ctx.conn, ctx.head <> v <> " |> mean()")
+          assert Enum.map(means, &{&1["host"], &1["_value"]}) == [{"a", 2.0}, {"b", 5.0}]
+          refute Enum.any?(means, &Map.has_key?(&1, "_time"))
+
+          {:ok, lasts} = unquote(client).query_flux(ctx.conn, ctx.head <> v <> " |> last()")
+          assert Enum.map(lasts, &{&1["host"], &1["_value"]}) == [{"a", 3.0}, {"b", 5.0}]
+
+          {:ok, limited} =
+            unquote(client).query_flux(ctx.conn, ctx.head <> v <> " |> limit(n: 1)")
+
+          assert Enum.map(limited, & &1["_value"]) == [1.0, 5.0]
+        end
+
+        test "no range() is 400; a missing bucket is 404; mean of strings is 400", ctx do
+          assert {:error, %{status: 400}} =
+                   unquote(client).query_flux(ctx.conn, ~s|from(bucket: "#{ctx.database}")|)
+
+          assert {:error, %{status: 404}} =
+                   unquote(client).query_flux(
+                     ctx.conn,
+                     ~s|from(bucket: "nope_#{System.unique_integer([:positive])}") \|> range(start: 0)|
+                   )
+
+          m = "contract_fxs_#{System.unique_integer([:positive])}"
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, ~s|#{m} s="x" 1700000000000000000|,
+              database: ctx.database
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).query_flux(
+                     ctx.conn,
+                     ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) \|> filter(fn: (r) => r._measurement == "#{m}") \|> mean()|
+                   )
+
+          assert Jason.decode!(body)["message"] ==
+                   "unsupported input type for mean aggregate: string"
         end
       end
     end
