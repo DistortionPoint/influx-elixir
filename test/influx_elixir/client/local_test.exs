@@ -5561,4 +5561,68 @@ defmodule InfluxElixir.Client.LocalTest do
       assert Jason.decode!(body)["message"] =~ "unsupported input type for mean aggregate: string"
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # GROUP BY / ORDER BY by position and alias; DATE_BIN with grouping
+  # columns. Expectations taken from influxdb:3-core
+  # (docs/design/2026-09-24_sql-references-and-stream-types.md).
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — GROUP BY and ORDER BY references" do
+    setup do
+      {:ok, conn} = Local.start(databases: ["g"])
+      on_exit(fn -> Local.stop(conn) end)
+
+      lp = """
+      m,h=a v=1.5,n=2i 1700000000000000000
+      m,h=b v=2.5,n=4i 1700000000123456789
+      m,h=a v=3.5,n=6i 1700000090000000000
+      """
+
+      {:ok, :written} = Local.write(conn, String.trim(lp), database: "g")
+      {:ok, conn: conn}
+    end
+
+    defp q(conn, sql), do: Local.query_sql(conn, sql, database: "g")
+
+    test "DATE_BIN with a grouping column gives a row per bucket per value", %{conn: conn} do
+      expected = [
+        %{"bucket" => ~U[2023-11-14 22:13:00.000000Z], "h" => "a", "c" => 1},
+        %{"bucket" => ~U[2023-11-14 22:13:00.000000Z], "h" => "b", "c" => 1},
+        %{"bucket" => ~U[2023-11-14 22:14:00.000000Z], "h" => "a", "c" => 1}
+      ]
+
+      select = "SELECT DATE_BIN(INTERVAL '1 minute', time) AS bucket, h, COUNT(v) AS c FROM m"
+
+      for group <- ["DATE_BIN(INTERVAL '1 minute', time), h", "bucket, h", "1, 2"] do
+        assert {:ok, ^expected} = q(conn, "#{select} GROUP BY #{group} ORDER BY bucket, h"), group
+      end
+    end
+
+    test "a select alias or a position names the grouping column", %{conn: conn} do
+      expected = [%{"host" => "a", "s" => 8}, %{"host" => "b", "s" => 4}]
+
+      assert {:ok, ^expected} =
+               q(conn, "SELECT h AS host, SUM(n) AS s FROM m GROUP BY host ORDER BY host")
+
+      assert {:ok, ^expected} =
+               q(conn, "SELECT h AS host, SUM(n) AS s FROM m GROUP BY 1 ORDER BY 1")
+    end
+
+    test "ORDER BY a position sorts by that select item", %{conn: conn} do
+      assert {:ok, rows} = q(conn, "SELECT h, v FROM m ORDER BY 2 DESC")
+      assert Enum.map(rows, & &1["v"]) == [3.5, 2.5, 1.5]
+
+      assert {:ok, [%{"h" => "a", "c" => 2}, %{"h" => "b"}]} =
+               q(conn, "SELECT h, COUNT(v) AS c FROM m GROUP BY h ORDER BY 2 DESC")
+    end
+
+    test "a position outside the select list is the engine's planning error", %{conn: conn} do
+      assert {:error, %{status: 400, body: body}} = q(conn, "SELECT h, v FROM m GROUP BY 3")
+
+      assert body ==
+               "Error during planning: Cannot find column with position 3 in SELECT clause. " <>
+                 "Valid columns: 1 to 2"
+    end
+  end
 end

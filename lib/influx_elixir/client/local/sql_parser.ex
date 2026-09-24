@@ -229,8 +229,130 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
     with :ok <- check_clauses(normalised),
          {:ok, split} <- split_select(normalised),
+         {:ok, split, normalised} <- resolve_references(split, normalised),
          {:ok, query} <- dispatch_select(split, normalised) do
       {:ok, %{query | cross_join: cross_join}}
+    end
+  end
+
+  # `GROUP BY 1`, `ORDER BY 2 DESC` and `GROUP BY bucket` (a select alias)
+  # are rewritten to the select items they name before anything else reads
+  # the clauses, as DataFusion resolves them (verified): a position becomes
+  # the item's expression in GROUP BY and its output name in ORDER BY, an
+  # alias in GROUP BY becomes its expression. A position outside the
+  # select list is the engine's planning error.
+  @group_clause ~r/(?i)(\bGROUP\s+BY\s+)(.+?)(?=\s+ORDER\b|\s+LIMIT\s+\d|\s+OFFSET\s+\d|\s*$)/s
+  @order_clause ~r/(?i)(\bORDER\s+BY\s+)(.+?)(?=\s+LIMIT\s+\d|\s+OFFSET\s+\d|\s*$)/s
+
+  @spec resolve_references(split(), binary()) ::
+          {:ok, split(), binary()} | {:error, map()}
+  defp resolve_references(%{columns: "*"} = split, sql), do: {:ok, split, sql}
+
+  defp resolve_references(%{rest: rest} = split, sql) do
+    items =
+      split.columns
+      |> split_top_level_commas()
+      |> Enum.map(&(&1 |> String.trim() |> select_item()))
+
+    with {:ok, rest} <- rewrite_clause(rest, @group_clause, &group_term(&1, items)),
+         {:ok, rest} <- rewrite_clause(rest, @order_clause, &order_term(&1, items)) do
+      {:ok, %{split | rest: rest}, String.replace_suffix(sql, split.rest, rest)}
+    end
+  end
+
+  # {expression, output name} of one select item.
+  @spec select_item(binary()) :: {binary(), binary()}
+  defp select_item(item) do
+    case Regex.run(~r/^(.+?)\s+AS\s+"?(\w+)"?$/is, item) do
+      [_full, expr, alias_name] -> {String.trim(expr), alias_name}
+      nil -> {item, item}
+    end
+  end
+
+  @spec rewrite_clause(binary(), Regex.t(), (binary() -> {:ok, binary()} | {:error, map()})) ::
+          {:ok, binary()} | {:error, map()}
+  defp rewrite_clause(rest, pattern, rewrite_term) do
+    case Regex.run(pattern, rest, return: :index) do
+      [{start, len}, {_kw_start, kw_len}, {_list_start, _list_len}] ->
+        clause = binary_part(rest, start, len)
+        keyword = binary_part(clause, 0, kw_len)
+        list = binary_part(clause, kw_len, len - kw_len)
+
+        list
+        |> split_top_level_commas()
+        |> Enum.reduce_while({:ok, []}, fn term, {:ok, acc} ->
+          case rewrite_term.(String.trim(term)) do
+            {:ok, term} -> {:cont, {:ok, [term | acc]}}
+            {:error, _reason} = error -> {:halt, error}
+          end
+        end)
+        |> case do
+          {:ok, terms} ->
+            new_clause = keyword <> (terms |> Enum.reverse() |> Enum.join(", "))
+
+            {:ok,
+             binary_part(rest, 0, start) <>
+               new_clause <> binary_part(rest, start + len, byte_size(rest) - start - len)}
+
+          error ->
+            error
+        end
+
+      nil ->
+        {:ok, rest}
+    end
+  end
+
+  @spec group_term(binary(), [{binary(), binary()}]) :: {:ok, binary()} | {:error, map()}
+  defp group_term(term, items) do
+    case positional(term, items) do
+      {:ok, {expr, _name}} ->
+        {:ok, expr}
+
+      :not_positional ->
+        case Enum.find(items, fn {expr, name} -> name == term and expr != term end) do
+          {expr, _name} -> {:ok, expr}
+          nil -> {:ok, term}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @spec order_term(binary(), [{binary(), binary()}]) :: {:ok, binary()} | {:error, map()}
+  defp order_term(term, items) do
+    {target, direction} =
+      case Regex.run(~r/^(.+?)\s+(ASC|DESC)$/is, term) do
+        [_full, target, direction] -> {target, " " <> direction}
+        nil -> {term, ""}
+      end
+
+    case positional(target, items) do
+      {:ok, {_expr, name}} -> {:ok, name <> direction}
+      :not_positional -> {:ok, term}
+      error -> error
+    end
+  end
+
+  @spec positional(binary(), [{binary(), binary()}]) ::
+          {:ok, {binary(), binary()}} | :not_positional | {:error, map()}
+  defp positional(term, items) do
+    case Integer.parse(term) do
+      {n, ""} when n >= 1 and n <= length(items) ->
+        {:ok, Enum.at(items, n - 1)}
+
+      {n, ""} ->
+        {:error,
+         %{
+           status: 400,
+           body:
+             "Error during planning: Cannot find column with position #{n} in SELECT clause. " <>
+               "Valid columns: 1 to #{length(items)}"
+         }}
+
+      _not_integer ->
+        :not_positional
     end
   end
 
@@ -468,44 +590,41 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     )
   end
 
-  # Extract the bare-column GROUP BY list, e.g. "GROUP BY ticker, holding_type".
-  # Returns nil when no GROUP BY exists or when the clause is DATE_BIN(...)
-  # (handled separately by resolve_aggregate_interval).
-  @spec parse_group_by_columns(binary()) :: [binary()] | nil
-  defp parse_group_by_columns(sql) do
-    case Regex.run(
-           ~r/(?i)GROUP\s+BY\s+(.+?)(?:\s+ORDER\b|\s+LIMIT\s+\d|\s+OFFSET\s+\d|$)/s,
-           sql
-         ) do
-      [_full, columns_str] ->
-        if String.match?(columns_str, ~r/^\s*DATE_BIN\s*\(/i) do
-          nil
-        else
-          columns_str
-          |> split_top_level_commas()
-          |> Enum.map(&String.trim/1)
-          |> Enum.reject(&(&1 == ""))
-          |> case do
-            [] -> nil
-            cols -> cols
-          end
-        end
+  # The GROUP BY items, after positions and aliases were resolved. A
+  # `DATE_BIN(...)` item sets the bucket interval; the others are grouping
+  # columns, and the two combine (`GROUP BY DATE_BIN(...), host`: one row
+  # per bucket per host, verified).
+  @spec group_by_items(binary()) :: [binary()]
+  defp group_by_items(sql) do
+    case Regex.run(@group_clause, sql) do
+      [_full, _keyword, list] ->
+        list |> split_top_level_commas() |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
 
-      _no_match ->
-        nil
+      nil ->
+        []
     end
   end
 
-  # GROUP BY DATE_BIN is optional. Without the clause, return nil so the
-  # executor produces a single scalar row. With the clause, propagate any
-  # interval-parsing error so malformed intervals still surface.
+  @spec date_bin_item?(binary()) :: boolean()
+  defp date_bin_item?(item), do: Regex.match?(~r/^DATE_BIN\s*\(/i, item)
+
+  # The bare-column GROUP BY items, or nil when there are none.
+  @spec parse_group_by_columns(binary()) :: [binary()] | nil
+  defp parse_group_by_columns(sql) do
+    case sql |> group_by_items() |> Enum.reject(&date_bin_item?/1) do
+      [] -> nil
+      columns -> columns
+    end
+  end
+
+  # GROUP BY DATE_BIN is optional. Without it the executor groups by columns
+  # or produces a single scalar row; a malformed interval still surfaces.
   @spec resolve_aggregate_interval(binary()) ::
           {:ok, pos_integer() | nil} | {:error, term()}
   defp resolve_aggregate_interval(sql) do
-    if String.match?(sql, ~r/(?i)GROUP\s+BY\s+DATE_BIN/) do
-      parse_group_by_interval(sql)
-    else
-      {:ok, nil}
+    case Enum.find(group_by_items(sql), &date_bin_item?/1) do
+      nil -> {:ok, nil}
+      item -> parse_group_by_interval(item)
     end
   end
 
@@ -889,14 +1008,14 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  # Parse GROUP BY DATE_BIN(INTERVAL 'N unit', time) → interval in nanoseconds
+  # DATE_BIN(INTERVAL 'N unit', time) → the interval in nanoseconds
   @spec parse_group_by_interval(binary()) ::
           {:ok, pos_integer()} | {:error, term()}
-  defp parse_group_by_interval(sql) do
+  defp parse_group_by_interval(item) do
     pattern =
-      ~r/(?i)GROUP\s+BY\s+DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)/
+      ~r/(?i)^DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)$/
 
-    case Regex.run(pattern, sql) do
+    case Regex.run(pattern, item) do
       [_full, interval_str] -> parse_interval(interval_str)
       _no_match -> {:error, local_error("missing GROUP BY DATE_BIN")}
     end

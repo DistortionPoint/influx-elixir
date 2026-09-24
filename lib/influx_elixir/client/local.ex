@@ -229,7 +229,12 @@ defmodule InfluxElixir.Client.Local do
       valid in the `SELECT` list only when grouped; a projected column that
       is neither grouped nor aggregated is the engine's planning error
       ("must appear in the GROUP BY clause or must be part of an aggregate
-      function"). `ORDER BY` applies to grouped rows too.
+      function"). `ORDER BY` applies to grouped rows too. Grouping columns
+      combine with `DATE_BIN` (a row per bucket per value).
+    * A `GROUP BY` item may be a select alias (`GROUP BY bucket`) or a
+      1-based position (`GROUP BY 1, 2`), and an `ORDER BY` item a position
+      (`ORDER BY 2 DESC`), as DataFusion resolves them; a position outside
+      the select list is the engine's planning error.
     * Interval units: `seconds`, `minutes`, `hours`, `days`
 
   A null column is omitted from the row rather than present as `nil`,

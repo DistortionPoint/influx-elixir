@@ -399,6 +399,23 @@ GROUP BY ticker, holding_type
 # => one row per unique (ticker, holding_type) pair
 ```
 
+Grouping columns combine with `DATE_BIN` — a row per bucket per value —
+and a `GROUP BY` or `ORDER BY` item may be a select alias or a 1-based
+position, as in DataFusion (verified against InfluxDB 3):
+
+```elixir
+sql = """
+SELECT DATE_BIN(INTERVAL '1 minute', time) AS bucket, host, COUNT(v) AS c
+FROM cpu
+GROUP BY bucket, host
+ORDER BY 1, 2
+"""
+```
+
+A position outside the select list is the engine's planning error
+("Cannot find column with position 3 in SELECT clause. Valid columns: 1 to
+2").
+
 ## Flux Queries (`:v2` profile)
 
 `query_flux/3` returns the same **long** rows a real InfluxDB 2.x returns: one

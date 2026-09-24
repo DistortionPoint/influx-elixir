@@ -84,6 +84,7 @@ defmodule InfluxElixir.ClientContract do
 
     influxql_tests = if v3_sql, do: influxql_tests(client), else: nil
     influxql_select_tests = if v3_sql, do: influxql_select_tests(client), else: nil
+    reference_tests = if v3_sql, do: reference_tests(client), else: nil
     db_admin_tests = if v3_sql, do: db_admin_tests(client), else: nil
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
@@ -124,6 +125,7 @@ defmodule InfluxElixir.ClientContract do
         execute_tests,
         influxql_tests,
         influxql_select_tests,
+        reference_tests,
         db_admin_tests,
         bucket_tests,
         v2_write_rule_tests,
@@ -2375,6 +2377,70 @@ defmodule InfluxElixir.ClientContract do
 
           assert Jason.decode!(body)["message"] ==
                    "unsupported input type for mean aggregate: string"
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # GROUP BY / ORDER BY references and streamed row types (v3_core, v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  defp reference_tests(client) do
+    quote do
+      describe "query_sql/3 — GROUP BY and ORDER BY references contract" do
+        setup ctx do
+          m = "contract_ref_#{System.unique_integer([:positive])}"
+
+          lp = """
+          #{m},h=a v=1.5,n=2i 1700000000000000000
+          #{m},h=b v=2.5,n=4i 1700000000123456789
+          #{m},h=a v=3.5,n=6i 1700000090000000000
+          """
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, String.trim(lp), database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+          {:ok, m: m}
+        end
+
+        test "GROUP BY an alias, a position, or DATE_BIN with a column", ctx do
+          select =
+            "SELECT DATE_BIN(INTERVAL '1 minute', time) AS bucket, h, COUNT(v) AS c FROM #{ctx.m}"
+
+          for group <- ["DATE_BIN(INTERVAL '1 minute', time), h", "bucket, h", "1, 2"] do
+            {:ok, rows} =
+              unquote(client).query_sql(ctx.conn, "#{select} GROUP BY #{group} ORDER BY 1, 2",
+                database: ctx.database
+              )
+
+            assert Enum.map(rows, &{&1["h"], &1["c"]}) == [{"a", 1}, {"b", 1}, {"a", 1}], group
+          end
+
+          assert {:error,
+                  %{
+                    status: 400,
+                    body: "Error during planning: Cannot find column with position 3" <> _rest
+                  }} =
+                   unquote(client).query_sql(ctx.conn, "SELECT h, v FROM #{ctx.m} GROUP BY 3",
+                     database: ctx.database
+                   )
+        end
+
+        test "a streamed row is the same map as the queried row", ctx do
+          sql = "SELECT * FROM #{ctx.m} ORDER BY time"
+          {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+
+          streamed =
+            ctx.conn
+            |> unquote(client).query_sql_stream(sql, database: ctx.database)
+            |> Enum.to_list()
+
+          assert streamed == rows
+          assert Enum.all?(streamed, &match?(%DateTime{}, &1["time"]))
         end
       end
     end

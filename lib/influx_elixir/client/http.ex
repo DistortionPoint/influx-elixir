@@ -933,10 +933,12 @@ defmodule InfluxElixir.Client.HTTP do
     {Enum.reject(complete, &(&1 == "")), rest}
   end
 
+  # The same coercion `query_sql/3` applies (timestamps become DateTimes),
+  # so a row is the same map streamed or not; it used to be the raw JSON.
   @spec decode_line(binary()) :: map()
   defp decode_line(line) do
     case Jason.decode(line) do
-      {:ok, row} -> row
+      {:ok, row} -> ResponseParser.coerce_types(row)
       {:error, reason} -> raise InfluxElixir.StreamError, kind: :decode, reason: reason
     end
   end

@@ -435,79 +435,37 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     do: Map.get(point.tags, column) || Map.get(point.fields, column)
 
   @spec execute_aggregate_query([point()], SQLParser.parsed_query()) :: [map()]
-  defp execute_aggregate_query(points, %{group_by_columns: cols} = query)
-       when is_list(cols) and cols != [] do
-    # GROUP BY <col, ...>: bucket points by the tuple of grouping-column
-    # values (mirroring how real InfluxDB v3 partitions by tags/fields).
-    points
-    |> bucket_by_columns(cols)
-    |> aggregate_per_column_bucket(query.select_columns)
-    |> apply_order_by_rows(query.order_by, nil)
-    |> apply_limit(query.limit, query.offset)
-  end
-
-  defp execute_aggregate_query(points, %{group_by_interval: nil} = query) do
+  defp execute_aggregate_query(points, %{group_by_interval: nil, group_by_columns: nil} = query) do
     # Scalar aggregate: all filtered points form a single bucket. Always
     # produce one row, even when no points matched (so COUNT returns 0).
     [aggregate_one_bucket(points, query.select_columns)]
   end
 
+  # One group per (DATE_BIN bucket, grouping-column values) — either part
+  # may be absent. `GROUP BY DATE_BIN(...), host` gives a row per bucket per
+  # host, as the engine does (verified).
   defp execute_aggregate_query(points, query) do
     interval_ns = query.group_by_interval
-
-    time_alias = find_time_bucket_alias(query.select_columns)
+    columns = query.group_by_columns || []
+    time_alias = if interval_ns, do: find_time_bucket_alias(query.select_columns)
 
     points
-    |> bucket_by_interval(interval_ns)
-    |> aggregate_per_bucket(query.select_columns)
+    |> Enum.group_by(fn point ->
+      {bucket_start(point, interval_ns),
+       Enum.map(columns, &(Map.get(point.tags, &1) || Map.get(point.fields, &1)))}
+    end)
+    |> Enum.map(fn {{bucket_ts, _values}, bucket_points} ->
+      reduce_aggregate_columns(query.select_columns, bucket_points, bucket_ts)
+    end)
     |> apply_order_by_rows(query.order_by, time_alias)
     |> apply_limit(query.limit, query.offset)
   end
 
-  # Group points by the tuple of values for the GROUP BY columns. Each
-  # column is resolved against tags first, then fields.
-  @spec bucket_by_columns([point()], [binary()]) :: %{[term()] => [point()]}
-  defp bucket_by_columns(points, columns) do
-    Enum.group_by(points, fn point ->
-      Enum.map(columns, fn col ->
-        Map.get(point.tags, col) || Map.get(point.fields, col)
-      end)
-    end)
-  end
-
-  @spec aggregate_per_column_bucket(
-          %{[term()] => [point()]},
-          [SQLParser.select_column()]
-        ) :: [map()]
-  defp aggregate_per_column_bucket(buckets, columns) do
-    Enum.map(buckets, fn {_key, bucket_points} ->
-      reduce_aggregate_columns(columns, bucket_points, nil)
-    end)
-  end
-
-  # Group points into buckets by flooring timestamp to interval boundary
-  @spec bucket_by_interval([point()], pos_integer()) :: %{
-          integer() => [point()]
-        }
-  defp bucket_by_interval(points, interval_ns) do
-    Enum.group_by(points, fn point ->
-      case point.timestamp do
-        nil -> 0
-        ts -> div(ts, interval_ns) * interval_ns
-      end
-    end)
-  end
-
-  # Compute aggregates for each bucket and return result rows
-  @spec aggregate_per_bucket(
-          %{integer() => [point()]},
-          [SQLParser.select_column()]
-        ) :: [map()]
-  defp aggregate_per_bucket(buckets, columns) do
-    Enum.map(buckets, fn {bucket_ts, bucket_points} ->
-      reduce_aggregate_columns(columns, bucket_points, bucket_ts)
-    end)
-  end
+  # The start of the point's DATE_BIN bucket (nil when there is no bucket).
+  @spec bucket_start(point(), pos_integer() | nil) :: integer() | nil
+  defp bucket_start(_point, nil), do: nil
+  defp bucket_start(%{timestamp: nil}, _interval_ns), do: 0
+  defp bucket_start(%{timestamp: ts}, interval_ns), do: div(ts, interval_ns) * interval_ns
 
   # Compute aggregates over a single (un-bucketed) set of points. Used for
   # scalar aggregates (no GROUP BY DATE_BIN) — always yields exactly one row.

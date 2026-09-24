@@ -56,6 +56,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverse and join, cutting allocations on every write to the double.
 
 ### Fixed
+- **`query_sql_stream/3` over HTTP returned timestamps as strings.** Each
+  streamed JSONL row was only `Jason.decode`d, so `time` (and every
+  `DATE_BIN` alias or `MAX(time)`) was `"2023-11-14T22:13:20"` while
+  `query_sql/3` and `Client.Local`'s stream returned a `DateTime`; code
+  that switched to streaming for a large result broke. Streamed rows now
+  get the same coercion; verified identical to `query_sql/3` on
+  InfluxDB 3.
+- **`Client.Local` refused `GROUP BY` and `ORDER BY` references DataFusion
+  accepts.** `GROUP BY bucket` (a select alias — the usual form after
+  `DATE_BIN(...) AS bucket`), `GROUP BY 1, 2`, `ORDER BY 2 DESC` were all
+  "No field named" schema errors, and `GROUP BY DATE_BIN(...), host` —
+  one row per bucket per host — was refused although the guide said it
+  was supported. Positions and aliases are now resolved to the select
+  items they name, `DATE_BIN` combines with grouping columns, and a
+  position outside the select list is the engine's planning error; 14 of
+  14 comparison queries match InfluxDB 3.
 - **`Client.Local` skipped every Flux stage it did not understand.** The
   double matched a few regexes anywhere in the query and ignored the rest,
   so `|> mean()`, `last()`, `limit()`, `count()`, `aggregateWindow()`,

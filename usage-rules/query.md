@@ -7,7 +7,7 @@
 
 ## Query Types
 - `query_sql/2,3` — v3 SQL queries, returns `{:ok, rows}` or `{:error, reason}`
-- `query_sql_stream/2,3` — returns a lazy `Stream` for large result sets; failures raise `InfluxElixir.StreamError` when the stream is enumerated
+- `query_sql_stream/2,3` — returns a lazy `Stream` for large result sets; each row is the same map `query_sql/3` returns (timestamps are `DateTime`s); failures raise `InfluxElixir.StreamError` when the stream is enumerated
 - `execute_sql/2,3` — non-SELECT SQL (DELETE, INSERT INTO ... SELECT)
 - `query_influxql/2,3` — legacy InfluxQL queries. InfluxQL rows are not SQL rows: each carries `"iox::measurement"` and `"time"`, rows come in time order, aggregates are named `mean`, `count`, `sum`, ... (`COUNT(*)` gives `count_<field>`) with `time` at the epoch unless a lone selector returns its point, `LIMIT` applies per `GROUP BY` series, and an unknown column or measurement is `{:ok, []}` — on the server and `Client.Local` alike. `Client.Local` refuses `GROUP BY time(...)`, regular expressions and `fill()` by name
 - `query_flux/2,3` — v2 Flux queries; rows are long format (`_field` / `_value` per field) with `_start`, `_stop` and a `table` per series (measurement, tags, field order). `range()` is required on the server and `Client.Local` alike. `Client.Local` applies `range`, `filter` (`and`/`or`/`not`, every comparison), `first`/`last`/`min`/`max`, `mean`/`sum`/`count`, `limit` and `yield`, and refuses any other stage (`aggregateWindow`, `pivot`, `group`, `sort`, ...) with a 400 naming it — it never skips one
@@ -22,6 +22,7 @@
 - `COUNT(DISTINCT col)`, `MIN(time)` / `MAX(time)` (a `DateTime`) and `WHERE col IS [NOT] NULL` work on both clients; `AVG(time)` and arithmetic on `time` do not
 - `WHERE` supports `AND` / `OR` / `NOT` / parentheses (AND binds tighter), `<>`, `[NOT] BETWEEN`, `[NOT] LIKE` / `ILIKE`; a string tag against a bare number compares lexically on both clients (`rack > 3` does not match `"10"`) — quote the literal or compare numbers to numeric fields
 - `CAST(col AS INTEGER | DOUBLE | VARCHAR)` and `col::TYPE` work in `WHERE`, projections, aggregates and `ORDER BY` on both clients — cast a numeric tag before comparing it numerically; a cast that cannot be performed makes InfluxDB 3 Core drop the connection, which both clients report as `{:error, {:connection_error, _}}`
+- `GROUP BY` and `ORDER BY` items may be select aliases or 1-based positions (`GROUP BY bucket, host`, `ORDER BY 2 DESC`), and `GROUP BY DATE_BIN(...), host` gives a row per bucket per host, on the server and `Client.Local` alike
 - `ORDER BY` accepts several terms, each with its own direction, and expressions
 - `Client.Local` also runs projected arithmetic with an alias (`(bid + ask) / 2 AS mid`), non-recursive `WITH` CTEs read in order, `alias.column` qualifiers, `median()`, `CROSS JOIN` (broadcast a one-row CTE; a column on both sides is refused as ambiguous) and arithmetic on either side of a `WHERE` comparison; other joins, set operations, subqueries, `HAVING` and window functions are rejected by name — cover those against a real server
 - `LIMIT n OFFSET m` pages through ordered rows on both clients (either order; `OFFSET` beyond the end is an empty result)
