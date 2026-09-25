@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`Client.Local` reads and writes are two to four times faster.** Every
+  read merged duplicate points (same measurement, tags and time), about
+  three quarters of a query's cost at 100k points, although most
+  measurements never hold a duplicate. A write now records each series
+  and time with an atomic `insert_new`; a second write of the same key
+  marks the measurement, and reads merge only marked measurements. The
+  line-protocol parser skips its escape-aware scans and unescaping when a
+  token has no quote or backslash, and slices bytes instead of graphemes.
+  Measured: a 50k-point write 1,962 → 697 ms, 200 small writes 40 → 16 ms,
+  `COUNT` over 50k points 88 → 19 ms. Results are unchanged.
+
 ### Fixed
+- **`Client.Local` misparsed escaped backslashes.** A string field value
+  ending in an escaped backslash (`s="ends\\",v=1i`) swallowed the next
+  field and failed the line; InfluxDB 3 stores `ends\`. A measurement, tag
+  key, tag value or field key ending in a backslash (`m\\,t=a`) was stored
+  under a garbled name or refused with the wrong message; InfluxDB 3
+  refuses it with "Measurements, tag keys and values, and field keys may
+  not end with a backslash". Both verified. Under the `:v2` profile a
+  measurement keeps `\\,` as InfluxDB 2 does (verified), and tag and field
+  names ending in a backslash are refused as it refuses them.
 - **No release since 0.1.21 had a CHANGELOG heading (#22).** The publish
   job bumped the version and published without touching `CHANGELOG.md`,
   so 0.1.22 through 0.1.31 were all released with their entries under

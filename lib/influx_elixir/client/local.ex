@@ -63,6 +63,10 @@ defmodule InfluxElixir.Client.Local do
     * `{:column, database, measurement, column}` => the column's kind
       (`iox::column_type::tag` or `iox::column_type::field::<type>`), fixed
       by the first write that names the column
+    * `{:series_time, database, measurement, tags, timestamp}` — one per
+      point written; a second write of the same key adds
+    * `{:duplicates, database, measurement}` — reads merge that measurement's
+      duplicate points (same tags and time) only when this marker exists
 
   ## Write Rules
 
@@ -85,7 +89,9 @@ defmodule InfluxElixir.Client.Local do
       on an existing one the engine words it as a column-type conflict with
       `iox::column_type::timestamp`); a key cannot be both a tag and a field on
       one line; an integer must fit in 64 bits (`7u` is unsigned); a newline
-      inside a quoted string value is part of the value; an empty payload is
+      inside a quoted string value is part of the value; a measurement, tag
+      key, tag value or field key ending in a backslash is refused ("... may
+      not end with a backslash"); an empty payload is
       "incoming write was empty".
     * Points with the same measurement, tag set and timestamp are one point,
       on both versions (verified): their fields merge and the later write
@@ -1149,6 +1155,8 @@ defmodule InfluxElixir.Client.Local do
         # schema go with it, so a re-created database starts empty.
         :ets.match_delete(table, {{:point, name, :_, :_}, :_})
         :ets.match_delete(table, {{:column, name, :_, :_}, :_})
+        :ets.match_delete(table, {{:series_time, name, :_, :_, :_}})
+        :ets.match_delete(table, {{:duplicates, name, :_}})
         :ets.delete(table, {:database, name})
         :ok
       else
@@ -1361,6 +1369,15 @@ defmodule InfluxElixir.Client.Local do
     # Real InfluxDB assigns a server timestamp when none is provided.
     point = assign_default_timestamp(point)
     seq = :erlang.unique_integer([:monotonic, :positive])
+    series_time = {:series_time, database, point.measurement, point.tags, point.timestamp}
+
+    # A second point at the same series and time marks the measurement, so
+    # reads merge only where a duplicate can exist (see `merge_duplicates/1`).
+    # `insert_new` is atomic: of two concurrent writers one sees the other.
+    unless :ets.insert_new(table, {series_time}) do
+      :ets.insert(table, {{:duplicates, database, point.measurement}})
+    end
+
     :ets.insert(table, {{:point, database, point.measurement, seq}, point})
   end
 
@@ -1382,6 +1399,9 @@ defmodule InfluxElixir.Client.Local do
   # later write wins per field, within a payload and across payloads.
   # Points are stored as written, one insert each (see `store_point/3`), and
   # merged here on read; the merged point keeps the first write's position.
+  # Merging is most of a query's cost at 100k points, so it runs only for a
+  # measurement a duplicate was written to (`{:duplicates, db, m}`); a
+  # stale marker only costs a merge that changes nothing.
   @spec merge_duplicates([point_map()]) :: [point_map()]
   defp merge_duplicates(points) do
     {merged, order} =
@@ -1404,7 +1424,11 @@ defmodule InfluxElixir.Client.Local do
   # Points come back in key (= insertion) order, duplicates merged.
   @spec fetch_points(:ets.table(), binary(), binary()) :: [point_map()]
   defp fetch_points(table, database, measurement) do
-    table |> raw_points(database, measurement) |> merge_duplicates()
+    points = raw_points(table, database, measurement)
+
+    if :ets.member(table, {:duplicates, database, measurement}),
+      do: merge_duplicates(points),
+      else: points
   end
 
   # Every stored object for a measurement, as written.
@@ -1427,7 +1451,11 @@ defmodule InfluxElixir.Client.Local do
   defp all_points_in_db(table, database) do
     table
     |> :ets.select([{{{:point, database, :_, :_}, :"$1"}, [], [:"$1"]}])
-    |> merge_duplicates()
+    |> then(fn points ->
+      if :ets.match(table, {{:duplicates, database, :_}}, 1) == :"$end_of_table",
+        do: points,
+        else: merge_duplicates(points)
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -1476,6 +1504,7 @@ defmodule InfluxElixir.Client.Local do
       |> MapSet.new(&{&1.tags, &1.timestamp})
 
     for {key, point} <- stored, MapSet.member?(doomed, {point.tags, point.timestamp}) do
+      :ets.delete(table, {:series_time, database, measurement, point.tags, point.timestamp})
       :ets.delete(table, key)
     end
 

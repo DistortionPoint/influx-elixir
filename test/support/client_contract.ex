@@ -1889,6 +1889,30 @@ defmodule InfluxElixir.ClientContract do
 
           assert row["s"] == "a\nb"
         end
+
+        test "a name ending in a backslash is refused; an escaped backslash in a string is kept",
+             ctx do
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).write(ctx.conn, ~S"contract_bs,k\\=a v=1i 1",
+                     database: ctx.database
+                   )
+
+          assert body =~ "may not end with a backslash"
+
+          m = "contract_bsok_#{System.unique_integer([:positive])}"
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, ~s(#{m} s="x\\\\",v=1i 1700000000000000000),
+              database: ctx.database
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:ok, [%{"s" => "x\\", "v" => 1}]} =
+                   unquote(client).query_sql(ctx.conn, "SELECT s, v FROM #{m}",
+                     database: ctx.database
+                   )
+        end
       end
     end
   end

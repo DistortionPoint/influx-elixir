@@ -47,6 +47,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-24 | [`local-flux-pipeline`](2026-09-24_local-flux-pipeline.md) | Local runs every Flux stage or refuses it (24/24 verified against InfluxDB 2.7); filter grammar, `_start`/`_stop`, series table order |
 | 2026-09-24 | [`sql-references-and-stream-types`](2026-09-24_sql-references-and-stream-types.md) | HTTP stream rows coerced like `query_sql`; Local resolves `GROUP BY`/`ORDER BY` aliases and positions and groups `DATE_BIN` with columns |
 | 2026-09-24 | [`changelog-release-headings`](2026-09-24_changelog-release-headings.md) | #22: headings for 0.1.22–0.1.31 backfilled from the tags; the publish job writes each release's heading; a test guards it |
+| 2026-09-24 | [`local-write-read-performance`](2026-09-24_local-write-read-performance.md) | Local merges duplicates only where one was written; parser fast paths (writes 2.8×, `COUNT` 4.6× faster); escaped and trailing backslashes as the engines read them |
 
 ## Verifying against a real engine
 

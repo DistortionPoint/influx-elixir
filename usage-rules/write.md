@@ -26,3 +26,4 @@
 - `time` is a reserved column ("'time' is a reserved column" on a new table, a column-type conflict with `iox::column_type::timestamp` on an existing one), a key cannot be both a tag and a field, integers must fit in 64 bits (`u` for unsigned), an empty payload is a 400
 - Under `api_version: :v2` (and the `:v2` Local profile) a field type conflict is HTTP 422 with `dropped=N` and the other lines stored, while a parse error is HTTP 400 and nothing is stored; `time` as a field is dropped silently there
 - A point with the same measurement, tag set and timestamp as an earlier one is the same point: fields merge and the later write wins per field, on the server and on `Client.Local` alike — rewriting a point is an update, not a second row
+- A measurement, tag key, tag value or field key may not end in a backslash on InfluxDB 3 (the line is refused; `Client.Local` refuses it the same way); a backslash at the end of a string field value is fine when escaped (`s="x\\"`)

@@ -5198,6 +5198,55 @@ defmodule InfluxElixir.Client.LocalTest do
     end
   end
 
+  describe "write/3 — escapes take the careful splitter" do
+    # Plain text is split with :binary.split/3; a backslash or a quote
+    # sends the token through the escape-aware scan. Both must agree.
+    setup do
+      {:ok, conn} = Local.start(databases: ["esc"])
+      on_exit(fn -> Local.stop(conn) end)
+      {:ok, conn: conn}
+    end
+
+    test "an escaped equals sign in a tag key and an escaped backslash in a string",
+         %{conn: conn} do
+      lp = ~S"""
+      e,a\=b=x s="ends\\",v=1i 1700000000000000000
+      e,a\=b=y s="line1
+      line2",v=2i 1700000000000000001
+      """
+
+      assert {:ok, :written} = Local.write(conn, String.trim(lp), database: "esc")
+
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM e ORDER BY time", database: "esc")
+
+      assert Enum.map(rows, &{&1["a=b"], &1["s"], &1["v"]}) == [
+               {"x", ~S"ends\\" |> String.replace("\\\\", "\\"), 1},
+               {"y", "line1\nline2", 2}
+             ]
+    end
+
+    test "a name ending in a backslash is refused on v3; v2 keeps `\\\\,` in a measurement",
+         %{conn: conn} do
+      message = "Measurements, tag keys and values, and field keys may not end with a backslash"
+
+      for lp <- [~S"bs\\,t=a v=1i 1", ~S"bt,k\\=a v=2i 1", ~S"bv,t=a\\ v=1i 1", ~S"bf k\\=1i 1"] do
+        assert {:error, %{status: 400, body: body}} = Local.write(conn, lp, database: "esc")
+        assert [{1, ^message}] = partial_errors(body), lp
+      end
+
+      {:ok, v2} = Local.start(profile: :v2)
+      on_exit(fn -> Local.stop(v2) end)
+      :ok = Local.create_bucket(v2, "b")
+
+      assert {:ok, :written} = Local.write(v2, ~S"bs\\,t=a v=1i 1", database: "b")
+
+      assert {:ok, [%{"_measurement" => ~S"bs\,t=a"}]} =
+               Local.query_flux(v2, ~s|from(bucket: "b") \|> range(start: 0)|)
+
+      assert {:error, %{status: 400}} = Local.write(v2, ~S"bt,k\\=a v=2i 1", database: "b")
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Duplicate points: same measurement, tags and timestamp are one point.
   # Verified against InfluxDB 3 and 2.7
