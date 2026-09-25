@@ -63,7 +63,7 @@ defmodule InfluxElixirTest do
 
   describe "execute_sql/3" do
     test "delegates to configured client", %{conn: conn} do
-      assert {:error, :delete_not_supported} =
+      assert {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}} =
                InfluxElixir.execute_sql(conn, "DELETE FROM cpu", database: "test_db")
     end
   end
@@ -247,7 +247,7 @@ defmodule InfluxElixirTest do
       assert {:ok, :written} = InfluxElixir.write(conn, "cpu value=1i")
       assert {:ok, [%{"value" => 1}]} = InfluxElixir.query_sql(conn, "SELECT * FROM cpu")
       assert {:ok, [%{"value" => 1}]} = InfluxElixir.query_influxql(conn, "SELECT * FROM cpu")
-      assert {:ok, %{"rows_affected" => 0}} = InfluxElixir.execute_sql(conn, "ALTER TABLE cpu")
+      assert {:ok, [%{"value" => 1}]} = InfluxElixir.execute_sql(conn, "SELECT * FROM cpu")
 
       assert [%{"value" => 1}] =
                conn |> InfluxElixir.query_sql_stream("SELECT * FROM cpu") |> Enum.to_list()

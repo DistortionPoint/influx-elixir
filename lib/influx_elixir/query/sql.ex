@@ -76,7 +76,8 @@ defmodule InfluxElixir.Query.SQL do
   end
 
   @doc """
-  Executes a non-SELECT SQL statement (DELETE, INSERT INTO ... SELECT).
+  Sends a SQL statement as it is; see `InfluxElixir.execute_sql/3` for what
+  InfluxDB 3 accepts (Core refuses DML and DDL).
 
   ## Options
 
@@ -87,7 +88,7 @@ defmodule InfluxElixir.Query.SQL do
           InfluxElixir.Client.connection(),
           binary(),
           keyword()
-        ) :: {:ok, map()} | {:error, term()}
+        ) :: {:ok, map() | [map()]} | {:error, term()}
   def execute(connection, sql, opts \\ []) do
     InfluxElixir.Client.impl().execute_sql(connection, sql, opts)
   end

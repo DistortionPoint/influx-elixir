@@ -478,6 +478,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
         {:ok, stats} = BatchWriter.stats(pid)
         stats.total_errors == 1
       end)
+
+      assert {:ok, %{total_errors: 1, total_writes: 0}} = BatchWriter.stats(pid)
     end
 
     test "the buffer deferred during a chain is flushed when the chain ends", %{http_conn: conn} do
@@ -499,6 +501,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
         {:ok, stats} = BatchWriter.stats(pid)
         stats.total_errors == 2
       end)
+
+      assert {:ok, %{total_errors: 2, total_writes: 0}} = BatchWriter.stats(pid)
     end
 
     test "write_sync is answered with its own chain's final result", %{http_conn: conn} do

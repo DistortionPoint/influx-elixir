@@ -286,7 +286,7 @@ defmodule InfluxElixir.Client.HTTP do
 
   @impl true
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
-          {:ok, map()} | {:error, term()}
+          {:ok, map() | [map()]} | {:error, term()}
   def execute_sql(connection, sql, opts \\ []) do
     with {:ok, database} <- resolve_database(opts, connection) do
       body = Jason.encode!(%{"db" => database, "q" => sql})
@@ -294,9 +294,14 @@ defmodule InfluxElixir.Client.HTTP do
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
 
+      # A SELECT answers rows, typed like `query_sql/3` rows (they were raw
+      # JSON with string timestamps); a summary map passes through.
       with {:ok, %Finch.Response{body: resp_body}} <-
-             request(:post, url, headers, body, connection, opts, [200]) do
-        Jason.decode(resp_body)
+             request(:post, url, headers, body, connection, opts, [200]),
+           {:ok, decoded} <- Jason.decode(resp_body) do
+        if is_list(decoded),
+          do: {:ok, Enum.map(decoded, &ResponseParser.coerce_types/1)},
+          else: {:ok, decoded}
       end
     end
   end

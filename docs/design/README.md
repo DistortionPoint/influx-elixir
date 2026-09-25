@@ -49,6 +49,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-24 | [`changelog-release-headings`](2026-09-24_changelog-release-headings.md) | #22: headings for 0.1.22–0.1.31 backfilled from the tags; the publish job writes each release's heading; a test guards it |
 | 2026-09-24 | [`local-write-read-performance`](2026-09-24_local-write-read-performance.md) | Local merges duplicates only where one was written; parser fast paths (writes 2.8×, `COUNT` 4.6× faster); escaped and trailing backslashes as the engines read them |
 | 2026-09-25 | [`local-sql-nulls-and-operators`](2026-09-25_local-sql-nulls-and-operators.md) | Local: three-valued WHERE, DataFusion null ordering and `NULLS FIRST/LAST`, DISTINCT null row, LIKE escapes, `WHERE b`, `%`, unary minus |
+| 2026-09-25 | [`execute-sql-and-weak-contracts`](2026-09-25_execute-sql-and-weak-contracts.md) | Local `execute_sql` answers DML/DDL as the engine refuses them (it returned `rows_affected: 0`); HTTP `execute_sql` rows typed; contract tests assert exact errors |
 
 ## Verifying against a real engine
 

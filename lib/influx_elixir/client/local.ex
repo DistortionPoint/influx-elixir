@@ -803,20 +803,28 @@ defmodule InfluxElixir.Client.Local do
           InfluxElixir.Client.query_result()
   def query_sql(%{table: table} = conn, sql, opts \\ []) do
     with :ok <- require_capability(conn, :query_sql) do
-      params = Keyword.get(opts, :params, %{})
-      database = resolve_database(opts, conn)
-      resolved_sql = SQLParser.resolve_params(sql, params)
+      # The engine answers query_sql and execute_sql from the same endpoint:
+      # a statement that is not a query gets execute_sql's answer.
+      if statement_kind(String.trim(sql)) == :query,
+        do: run_query(table, conn, sql, opts),
+        else: execute_sql(conn, sql, opts)
+    end
+  end
 
-      with nil <- SQLParser.unbound_placeholder(resolved_sql),
-           {:ok, query} <- SQLParser.parse_select(resolved_sql) do
-        case SQLExecutor.run(query, &point_source(table, database, &1)) do
-          {:error, _reason} = err -> err
-          rows -> {:ok, rows}
-        end
-      else
+  @spec run_query(:ets.table(), map(), binary(), keyword()) :: InfluxElixir.Client.query_result()
+  defp run_query(table, conn, sql, opts) do
+    database = resolve_database(opts, conn)
+    resolved_sql = SQLParser.resolve_params(sql, Keyword.get(opts, :params, %{}))
+
+    with nil <- SQLParser.unbound_placeholder(resolved_sql),
+         {:ok, query} <- SQLParser.parse_select(resolved_sql) do
+      case SQLExecutor.run(query, &point_source(table, database, &1)) do
         {:error, _reason} = err -> err
-        name when is_binary(name) -> {:error, unbound_placeholder_error(name)}
+        rows -> {:ok, rows}
       end
+    else
+      {:error, _reason} = err -> err
+      name when is_binary(name) -> {:error, unbound_placeholder_error(name)}
     end
   end
 
@@ -866,48 +874,90 @@ defmodule InfluxElixir.Client.Local do
   defp stream_error_opts(reason), do: [kind: :transport, reason: reason]
 
   @doc """
-  Executes a SQL statement and returns a summary map.
+  @doc \"""
+  Executes a SQL statement as InfluxDB 3 does (verified against Core).
 
-  Supports `DELETE FROM <measurement>` and
-  `DELETE FROM <measurement> WHERE ...` — matching points are removed
-  from ETS and the count is returned in `%{"rows_affected" => N}`.
-
-  On `:v3_core` profile, DELETE is not supported (matches real InfluxDB v3
-  Core behavior) and returns `{:error, :delete_not_supported}`.
-
-  On `:v3_enterprise` profile, DELETE is supported.
-
-  Unknown statements return `%{"rows_affected" => 0}`.
+    * `SELECT` / `WITH ... SELECT` run as `query_sql/3` and return
+      `{:ok, rows}`.
+    * `DELETE FROM m [WHERE ...]` on `:v3_enterprise` removes the matching
+      points and returns `{:ok, %{"rows_affected" => n}}`. (Not verified:
+      no Enterprise server was available.)
+    * Everything else is refused with the engine's answer: `DELETE`,
+      `INSERT` and `UPDATE` are 400 `Error during planning: DML not
+      supported: Delete | Insert Into | Update`; `CREATE TABLE | VIEW |
+      DATABASE` and `DROP TABLE | VIEW` are 400 `Error during planning: DDL
+      not supported: CreateMemoryTable | CreateView | CreateCatalog |
+      DropTable | DropView`; any other statement (`ALTER`, `TRUNCATE`, ...)
+      is 405 `This feature is not implemented: Unsupported SQL statement:
+      <sql>`.
   """
   @impl true
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
-          {:ok, map()} | {:error, term()}
+          {:ok, map() | [map()]} | {:error, term()}
   def execute_sql(%{table: table, profile: profile} = conn, sql, opts \\ []) do
     with :ok <- require_capability(conn, :execute_sql) do
-      database = resolve_database(opts, conn)
       trimmed = String.trim(sql)
 
-      case Regex.run(~r/^(?i)DELETE\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)$/s, trimmed) do
-        [_full, measurement_raw, rest] ->
-          execute_delete(table, database, profile, measurement_raw, rest)
+      case statement_kind(trimmed) do
+        :query ->
+          query_sql(conn, sql, opts)
 
-        _no_match ->
-          {:ok, %{"rows_affected" => 0}}
+        :delete when profile == :v3_enterprise ->
+          case Regex.run(~r/^(?i)DELETE\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)$/s, trimmed) do
+            [_full, measurement_raw, rest] ->
+              execute_delete(table, resolve_database(opts, conn), measurement_raw, rest)
+
+            nil ->
+              {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}}
+          end
+
+        :delete ->
+          {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}}
+
+        {:planning, message} ->
+          {:error, %{status: 400, body: "Error during planning: " <> message}}
+
+        :unsupported ->
+          {:error,
+           %{
+             status: 405,
+             body: "This feature is not implemented: Unsupported SQL statement: " <> trimmed
+           }}
       end
     end
   end
 
-  @spec execute_delete(
-          :ets.table(),
-          binary(),
-          profile(),
-          binary(),
-          binary()
-        ) :: {:ok, map()} | {:error, term()}
-  defp execute_delete(_table, _database, :v3_core, _measurement_raw, _rest),
-    do: {:error, :delete_not_supported}
+  # Regexes nested in a list cannot be module attributes on OTP 28, so the
+  # table is a function.
+  @spec statement_kinds() :: [{Regex.t(), atom() | {:planning, binary()}}]
+  defp statement_kinds do
+    [
+      # Statements the engine answers with rows. The ones the double does
+      # not model (EXPLAIN, SHOW TABLES, DESCRIBE) reach its parser and are
+      # refused by name there, not reported as unimplemented.
+      {~r/^(?i)(?:SELECT|WITH|EXPLAIN|SHOW|DESCRIBE)\b|^\(/, :query},
+      {~r/^(?i)DELETE\b/, :delete},
+      {~r/^(?i)INSERT\b/, {:planning, "DML not supported: Insert Into"}},
+      {~r/^(?i)UPDATE\b/, {:planning, "DML not supported: Update"}},
+      {~r/^(?i)CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b/,
+       {:planning, "DDL not supported: CreateView"}},
+      {~r/^(?i)CREATE\s+(?:DATABASE|SCHEMA)\b/, {:planning, "DDL not supported: CreateCatalog"}},
+      {~r/^(?i)CREATE\s+TABLE\b/, {:planning, "DDL not supported: CreateMemoryTable"}},
+      {~r/^(?i)DROP\s+VIEW\b/, {:planning, "DDL not supported: DropView"}},
+      {~r/^(?i)DROP\s+TABLE\b/, {:planning, "DDL not supported: DropTable"}}
+    ]
+  end
 
-  defp execute_delete(table, database, _profile, measurement_raw, rest) do
+  @spec statement_kind(binary()) :: :query | :delete | {:planning, binary()} | :unsupported
+  defp statement_kind(sql) do
+    Enum.find_value(statement_kinds(), :unsupported, fn {pattern, kind} ->
+      if Regex.match?(pattern, sql), do: kind
+    end)
+  end
+
+  @spec execute_delete(:ets.table(), binary(), binary(), binary()) ::
+          {:ok, map()} | {:error, term()}
+  defp execute_delete(table, database, measurement_raw, rest) do
     measurement = LineProtocolParser.unescape_measurement(measurement_raw)
 
     with {:ok, where} <- SQLParser.parse_where(rest) do

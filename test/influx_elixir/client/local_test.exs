@@ -573,8 +573,9 @@ defmodule InfluxElixir.Client.LocalTest do
       refute Map.has_key?(row, "_measurement")
     end
 
-    test "unsupported SQL returns error", %{conn: conn, db: db} do
-      assert {:error, _reason} =
+    test "a statement that is not a query gets execute_sql's answer", %{conn: conn, db: db} do
+      assert {:error,
+              %{status: 400, body: "Error during planning: DML not supported: Insert Into"}} =
                Local.query_sql(conn, "INSERT INTO cpu VALUES (1)", database: db)
     end
   end
@@ -821,13 +822,44 @@ defmodule InfluxElixir.Client.LocalTest do
   # ---------------------------------------------------------------------------
 
   describe "execute_sql/3" do
-    test "returns error for DELETE on v3_core", %{conn: conn} do
-      assert {:error, :delete_not_supported} =
-               Local.execute_sql(conn, "DELETE FROM cpu")
+    # Every answer below was taken from influxdb:3-core.
+    test "DML is the engine's planning error on v3_core", %{conn: conn} do
+      for {sql, kind} <- [
+            {"DELETE FROM cpu", "Delete"},
+            {"delete from cpu where v = 1", "Delete"},
+            {"INSERT INTO cpu (time, v) VALUES ('2023-11-14T22:13:20Z', 5)", "Insert Into"},
+            {"UPDATE cpu SET v = 2", "Update"}
+          ] do
+        assert {:error, %{status: 400, body: body}} = Local.execute_sql(conn, sql)
+        assert body == "Error during planning: DML not supported: " <> kind, sql
+      end
     end
 
-    test "returns zero rows affected for an unknown statement", %{conn: conn} do
-      assert {:ok, %{"rows_affected" => 0}} = Local.execute_sql(conn, "ALTER TABLE foo")
+    test "DDL is the engine's planning error; anything else is its 405", %{conn: conn} do
+      for {sql, kind} <- [
+            {"CREATE TABLE foo (id INT)", "CreateMemoryTable"},
+            {"CREATE VIEW vv AS SELECT * FROM cpu", "CreateView"},
+            {"CREATE DATABASE x", "CreateCatalog"},
+            {"DROP TABLE cpu", "DropTable"},
+            {"DROP VIEW vv", "DropView"}
+          ] do
+        assert {:error, %{status: 400, body: body}} = Local.execute_sql(conn, sql)
+        assert body == "Error during planning: DDL not supported: " <> kind, sql
+      end
+
+      for sql <- ["ALTER TABLE cpu ADD COLUMN y INT", "TRUNCATE cpu"] do
+        assert {:error, %{status: 405, body: body}} = Local.execute_sql(conn, sql)
+        assert body == "This feature is not implemented: Unsupported SQL statement: " <> sql
+      end
+    end
+
+    test "a SELECT or WITH runs as a query", %{conn: conn} do
+      {:ok, :written} = Local.write(conn, "sel v=1i 1700000000000000000")
+
+      assert {:ok, [%{"v" => 1}]} = Local.execute_sql(conn, "SELECT v FROM sel")
+
+      assert {:ok, [%{"v" => 1}]} =
+               Local.execute_sql(conn, "WITH w AS (SELECT v FROM sel) SELECT v FROM w")
     end
   end
 
@@ -898,15 +930,12 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "del_db"}
     end
 
-    test "DELETE FROM returns error on v3_core profile",
-         %{conn: conn, db: db} do
-      assert {:error, :delete_not_supported} =
+    test "DELETE FROM is refused on v3_core and removes nothing", %{conn: conn, db: db} do
+      assert {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}} =
                Local.execute_sql(conn, "DELETE FROM cpu", database: db)
-    end
 
-    test "unknown statement returns 0 rows_affected", %{conn: conn, db: db} do
-      assert {:ok, %{"rows_affected" => 0}} =
-               Local.execute_sql(conn, "CREATE TABLE foo (id INT)", database: db)
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+      assert length(rows) == 3
     end
   end
 

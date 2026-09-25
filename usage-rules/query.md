@@ -8,7 +8,7 @@
 ## Query Types
 - `query_sql/2,3` — v3 SQL queries, returns `{:ok, rows}` or `{:error, reason}`
 - `query_sql_stream/2,3` — returns a lazy `Stream` for large result sets; each row is the same map `query_sql/3` returns (timestamps are `DateTime`s); failures raise `InfluxElixir.StreamError` when the stream is enumerated
-- `execute_sql/2,3` — non-SELECT SQL (DELETE, INSERT INTO ... SELECT)
+- `execute_sql/2,3` — sends a statement as it is; InfluxDB 3 Core refuses `DELETE`, `INSERT`, `UPDATE` (400 `DML not supported`), `CREATE` / `DROP` (400 `DDL not supported`) and everything else but `SELECT` (405), on the server and `Client.Local` alike — delete data with `delete_database/2`
 - `query_influxql/2,3` — legacy InfluxQL queries. InfluxQL rows are not SQL rows: each carries `"iox::measurement"` and `"time"`, rows come in time order, aggregates are named `mean`, `count`, `sum`, ... (`COUNT(*)` gives `count_<field>`) with `time` at the epoch unless a lone selector returns its point, `LIMIT` applies per `GROUP BY` series, and an unknown column or measurement is `{:ok, []}` — on the server and `Client.Local` alike. `Client.Local` refuses `GROUP BY time(...)`, regular expressions and `fill()` by name
 - `query_flux/2,3` — v2 Flux queries; rows are long format (`_field` / `_value` per field) with `_start`, `_stop` and a `table` per series (measurement, tags, field order). `range()` is required on the server and `Client.Local` alike. `Client.Local` applies `range`, `filter` (`and`/`or`/`not`, every comparison), `first`/`last`/`min`/`max`, `mean`/`sum`/`count`, `limit` and `yield`, and refuses any other stage (`aggregateWindow`, `pivot`, `group`, `sort`, ...) with a 400 naming it — it never skips one
 

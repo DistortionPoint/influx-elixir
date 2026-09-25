@@ -20,6 +20,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COUNT` over 50k points 88 → 19 ms. Results are unchanged.
 
 ### Fixed
+- **`Client.Local.execute_sql/3` accepted statements InfluxDB 3 refuses.**
+  Every statement but `DELETE` returned `{:ok, %{"rows_affected" => 0}}`,
+  and `DELETE` on `:v3_core` returned a bare `:delete_not_supported`.
+  Verified against Core: `DELETE`, `INSERT`, `UPDATE` are 400 `Error
+  during planning: DML not supported: Delete | Insert Into | Update`;
+  `CREATE TABLE | VIEW | DATABASE` and `DROP TABLE | VIEW` are 400 `... DDL
+  not supported: CreateMemoryTable | CreateView | CreateCatalog |
+  DropTable | DropView`; anything else (`ALTER`, `TRUNCATE`) is 405 `This
+  feature is not implemented: Unsupported SQL statement: <sql>`; a
+  `SELECT` returns rows. The double now answers each of these as the
+  engine does (its `:v3_enterprise` `DELETE` is unchanged), and
+  `query_sql/3` gives a non-query the same answer, since the engine serves
+  both from one endpoint. The contract test that should have caught this
+  asserted `{:error, _}` and `is_map(result)`; it and the other contract
+  tests accepting any error now assert the engine's status and body.
+- **`Client.HTTP.execute_sql/3` returned `SELECT` rows as raw JSON** with
+  string timestamps; they are now typed like `query_sql/3` rows. The
+  facade, `Query.SQL.execute/3` and the usage rules advertised
+  `execute_sql` for "DELETE, INSERT INTO ... SELECT", which Core refuses;
+  they now say what it accepts. The `execute_sql` callback returns
+  `{:ok, map() | [map()]}`.
 - **`Client.Local` got NULL wrong in `WHERE`, `ORDER BY` and `DISTINCT`.**
   Verified against InfluxDB 3: `WHERE NOT (rack = '1')`, `rack NOT IN (...)`
   and `v NOT BETWEEN ...` returned rows where the column was null (the

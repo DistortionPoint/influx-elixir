@@ -17,11 +17,13 @@ defmodule InfluxElixir.Query.SQLTest do
                SQL.query(conn, "SELECT * FROM cpu", database: "test_db")
     end
 
-    test "passes params through to client", %{conn: conn} do
-      assert {:ok, _rows} =
+    test "params reach the client and bind the placeholder", %{conn: conn} do
+      {:ok, :written} = Local.write(conn, "cpu,host=web02 value=2i", database: "test_db")
+
+      assert {:ok, [%{"host" => "web02", "value" => 2}]} =
                SQL.query(conn, "SELECT * FROM cpu WHERE host = $host",
                  database: "test_db",
-                 params: %{host: "web01"}
+                 params: %{host: "web02"}
                )
     end
 
@@ -53,19 +55,22 @@ defmodule InfluxElixir.Query.SQLTest do
 
       assert {:ok, [%{"value" => 7}]} = SQL.query(conn, "SELECT * FROM cpu")
       assert [%{"value" => 7}] = conn |> SQL.query_stream("SELECT * FROM cpu") |> Enum.to_list()
-      assert {:ok, %{"rows_affected" => 0}} = SQL.execute(conn, "ALTER TABLE cpu")
+      assert {:ok, [%{"value" => 7}]} = SQL.execute(conn, "SELECT * FROM cpu")
     end
   end
 
   describe "execute/3" do
-    test "returns {:error, _} for DELETE on v3_core", %{conn: conn} do
-      assert {:error, :delete_not_supported} =
+    test "DELETE on v3_core is the engine's planning error", %{conn: conn} do
+      assert {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}} =
                SQL.execute(conn, "DELETE FROM cpu", database: "test_db")
     end
 
-    test "returns {:ok, map} for non-SELECT statement", %{conn: conn} do
-      assert {:ok, %{"rows_affected" => 0}} =
-               SQL.execute(conn, "ALTER TABLE foo", database: "test_db")
+    test "a statement the engine does not implement is its 405", %{conn: conn} do
+      assert {:error, %{status: 405, body: body}} =
+               SQL.execute(conn, "ALTER TABLE foo ADD COLUMN y INT", database: "test_db")
+
+      assert body ==
+               "This feature is not implemented: Unsupported SQL statement: ALTER TABLE foo ADD COLUMN y INT"
     end
   end
 end

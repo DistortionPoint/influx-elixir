@@ -209,10 +209,10 @@ defmodule InfluxElixir.ClientContract do
         end
       else
         quote do
-          test "returns {:error, _} for an unknown database", ctx do
+          test "a write to a bucket that does not exist is a 404", ctx do
             lp = "cpu value=1.0"
 
-            assert {:error, _reason} =
+            assert {:error, %{status: 404}} =
                      unquote(client).write(
                        ctx.conn,
                        lp,
@@ -238,8 +238,8 @@ defmodule InfluxElixir.ClientContract do
 
         unquote(ghost_db_test)
 
-        test "returns {:error, _} for malformed line protocol", ctx do
-          assert {:error, _reason} =
+        test "malformed line protocol is a 400", ctx do
+          assert {:error, %{status: 400}} =
                    unquote(client).write(
                      ctx.conn,
                      "this is not line protocol!!",
@@ -424,7 +424,12 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert {:error, _reason} = result
+          assert {:error,
+                  %{
+                    status: 400,
+                    body:
+                      "Error during planning: table 'public.iox.empty_measurement_contract' not found"
+                  }} = result
         end
 
         test "LIMIT restricts the number of returned rows", ctx do
@@ -665,21 +670,36 @@ defmodule InfluxElixir.ClientContract do
   defp execute_tests_core(client) do
     quote do
       describe "execute_sql/3 — contract" do
-        test "DELETE FROM is not supported on v3 Core", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_del value=1i",
-            database: ctx.database
-          )
+        test "DML and DDL are refused with the engine's answer; SELECT returns rows", ctx do
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, "contract_del value=1i 1700000000000000000",
+              database: ctx.database
+            )
 
           InfluxElixir.ClientContract.settle(ctx)
+          exec = &unquote(client).execute_sql(ctx.conn, &1, database: ctx.database)
 
-          assert {:error, _reason} =
-                   unquote(client).execute_sql(
-                     ctx.conn,
-                     "DELETE FROM contract_del",
-                     database: ctx.database
-                   )
+          assert {:error,
+                  %{status: 400, body: "Error during planning: DML not supported: Delete"}} =
+                   exec.("DELETE FROM contract_del")
+
+          assert {:error,
+                  %{
+                    status: 400,
+                    body: "Error during planning: DDL not supported: CreateMemoryTable"
+                  }} =
+                   exec.("CREATE TABLE contract_x (id INT)")
+
+          assert {:error, %{status: 405, body: "This feature is not implemented: " <> _rest}} =
+                   exec.("ALTER TABLE contract_del ADD COLUMN y INT")
+
+          {:ok, rows} =
+            unquote(client).query_sql(ctx.conn, "SELECT * FROM contract_del",
+              database: ctx.database
+            )
+
+          assert {:ok, ^rows} = exec.("SELECT * FROM contract_del")
+          assert [%{"value" => 1, "time" => %DateTime{}}] = rows
         end
       end
     end
@@ -697,14 +717,12 @@ defmodule InfluxElixir.ClientContract do
 
           InfluxElixir.ClientContract.settle(ctx)
 
-          assert {:ok, result} =
+          assert {:ok, %{"rows_affected" => 1}} =
                    unquote(client).execute_sql(
                      ctx.conn,
                      "DELETE FROM contract_del",
                      database: ctx.database
                    )
-
-          assert is_map(result)
         end
       end
     end

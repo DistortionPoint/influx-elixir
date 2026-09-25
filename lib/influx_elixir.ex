@@ -189,13 +189,22 @@ defmodule InfluxElixir do
   end
 
   @doc """
-  Executes a non-SELECT SQL statement (DELETE, INSERT INTO ... SELECT).
+  Sends a SQL statement to `/api/v3/query_sql` as it is.
+
+  InfluxDB 3 Core refuses every statement that changes data (verified):
+  `DELETE`, `INSERT` and `UPDATE` are `{:error, %{status: 400, body:
+  "Error during planning: DML not supported: ..."}}`, `CREATE` and `DROP`
+  are `... DDL not supported: ...`, anything else is a 405. A `SELECT`
+  returns `{:ok, rows}` typed like `query_sql/3` rows. Remove data with
+  `delete_database/2` instead. `Client.Local` answers the same way; under
+  its `:v3_enterprise` profile it also runs `DELETE FROM m [WHERE ...]`
+  and returns `{:ok, %{"rows_affected" => n}}`.
   """
   @spec execute_sql(
           InfluxElixir.Client.connection(),
           binary(),
           keyword()
-        ) :: {:ok, map()} | {:error, term()}
+        ) :: {:ok, map() | [map()]} | {:error, term()}
   def execute_sql(connection, sql, opts \\ []) do
     connection = resolve_connection(connection)
     query_span(connection, opts, fn -> client().execute_sql(connection, sql, opts) end)

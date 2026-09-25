@@ -66,7 +66,7 @@ defmodule InfluxElixir.Client do
   @callback query_sql_stream(connection, binary(), keyword()) ::
               Enumerable.t()
   @callback execute_sql(connection, binary(), keyword()) ::
-              {:ok, map()} | {:error, term()}
+              {:ok, map() | [map()]} | {:error, term()}
 
   # Query — v3 InfluxQL
   @callback query_influxql(connection, binary(), keyword()) :: query_result()
