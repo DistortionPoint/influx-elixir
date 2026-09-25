@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`Client.Local`'s ETS storage is its own module,
+  `InfluxElixir.Client.Local.Store`.** The key layout, the atomic
+  insert rules, the duplicate-merge fast path and the deletion bookkeeping
+  were spread through `local.ex` as raw `:ets` patterns (40 call sites);
+  they now live in one 300-line module with a small API, and `local.ex`
+  (1,583 → 1,430 lines) holds no `:ets` call. Behaviour is unchanged.
+
+### Fixed
+- **`Client.Local` read three clocks.** Untimed points and Flux `now()`
+  used `System.system_time/1`, SQL `now()` used `System.os_time/1`; the
+  two differ by microseconds, so a point a test stamped with one clock
+  could fall after `now()` read from the other and drop out of
+  `range(start: -1h)`. The double now has one clock (`Store.now_ns/0`,
+  the later of the two), and Flux's exclusive `stop` defaults to a
+  nanosecond after it, so a point written a moment ago is always in range,
+  as on a real server.
+
 ## [0.1.32] - 2026-09-25
 
 ### Changed

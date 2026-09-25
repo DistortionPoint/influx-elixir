@@ -9,8 +9,9 @@ defmodule InfluxElixir.Client.Local do
   Parses real line protocol on write, stores points as maps, and responds
   with realistic InfluxDB response formats on query. Parsing is split out:
   `InfluxElixir.Client.Local.LineProtocolParser` handles writes and
-  `InfluxElixir.Client.Local.SQLParser` handles the SQL subset; this module
-  owns storage, profiles and the InfluxQL and Flux paths; SQL execution is
+  `InfluxElixir.Client.Local.SQLParser` handles the SQL subset;
+  `InfluxElixir.Client.Local.Store` owns the ETS table; this module
+  owns profiles, the write rules and the InfluxQL and Flux paths; SQL execution is
   `InfluxElixir.Client.Local.SQLExecutor`.
 
   ## Profiles
@@ -48,25 +49,13 @@ defmodule InfluxElixir.Client.Local do
         Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
       end
 
-  ## ETS Key Layout
+  ## Storage
 
-  One `:ordered_set` per instance. Every mutation is a single insert or
+  Each instance is one ETS table owned by `InfluxElixir.Client.Local.Store`,
+  which alone knows the key layout. Every mutation is a single insert or
   delete of its own key, so concurrent writers — `async: true` tests sharing
   one database, `BatchWriter` flushes racing direct writes — never
-  read-modify-write a shared value and no write is ever lost:
-
-    * `{:database, name}` => `true`
-    * `{:bucket, name}` => `%{retention: seconds}`
-    * `{:token, id}` => `map()` — the token map
-    * `{:point, database, measurement, seq}` => `point_map()` — `seq` is a
-      monotonic integer, so points scan in insertion order
-    * `{:column, database, measurement, column}` => the column's kind
-      (`iox::column_type::tag` or `iox::column_type::field::<type>`), fixed
-      by the first write that names the column
-    * `{:series_time, database, measurement, tags, timestamp}` — one per
-      point written; a second write of the same key adds
-    * `{:duplicates, database, measurement}` — reads merge that measurement's
-      duplicate points (same tags and time) only when this marker exists
+  read-modify-write a shared value and no write is ever lost.
 
   ## Write Rules
 
@@ -291,14 +280,21 @@ defmodule InfluxElixir.Client.Local do
 
   @behaviour InfluxElixir.Client
 
-  alias InfluxElixir.Client.Local.{Flux, InfluxQL, LineProtocolParser, SQLExecutor, SQLParser}
+  alias InfluxElixir.Client.Local.{
+    Flux,
+    InfluxQL,
+    LineProtocolParser,
+    SQLExecutor,
+    SQLParser,
+    Store
+  }
 
   @type point_map :: LineProtocolParser.point()
 
   @type profile :: :v3_core | :v3_enterprise | :v2
 
   @type conn :: %{
-          table: :ets.table(),
+          table: Store.t(),
           databases: MapSet.t(binary()),
           database: binary() | nil,
           profile: profile()
@@ -405,13 +401,6 @@ defmodule InfluxElixir.Client.Local do
               "Must be one of: :v3_core, :v3_enterprise, :v2"
     end
 
-    # :public access is intentional — allows async: true tests where
-    # the test process and the LocalClient caller are different processes.
-    # Every mutation is a single :ets.insert/2 or :ets.delete/2 on its own
-    # key (see "ETS Key Layout"), so no GenServer is needed to make
-    # concurrent writers safe. :ordered_set keeps points in insertion order.
-    table = :ets.new(:influx_local, [:ordered_set, :public])
-
     # "default" is always pre-created so writes without an explicit
     # database: opt succeed. The connection-level :database (if given)
     # is also pre-created so it can be used as a query target.
@@ -422,7 +411,10 @@ defmodule InfluxElixir.Client.Local do
       |> Enum.concat()
       |> MapSet.new()
 
-    Enum.each(databases, &:ets.insert(table, {{:database, &1}, true}))
+    # A public ETS store (see `InfluxElixir.Client.Local.Store`): every
+    # mutation is one insert or delete of its own key, so no process is
+    # needed to make concurrent writers safe.
+    table = Store.new(databases)
 
     conn = %{
       table: table,
@@ -485,16 +477,7 @@ defmodule InfluxElixir.Client.Local do
   Safe to call multiple times; a no-op if the table is already deleted.
   """
   @spec stop(conn()) :: :ok
-  def stop(%{table: table}) do
-    # The table dies with its owner process. An `on_exit` callback runs after
-    # the test process has exited, so checking `:ets.info/1` first still
-    # races the owner's cleanup; `:ets.delete/1` raising ArgumentError means
-    # the table is already gone, which is the outcome we want.
-    :ets.delete(table)
-    :ok
-  rescue
-    ArgumentError -> :ok
-  end
+  def stop(%{table: table}), do: Store.drop(table)
 
   # ---------------------------------------------------------------------------
   # Write
@@ -608,7 +591,7 @@ defmodule InfluxElixir.Client.Local do
   #
   # Both bodies are the engine's JSON so consumer code that reads them can
   # be exercised.
-  @spec store_lines(:ets.table(), binary(), [LineProtocolParser.line_result()], profile()) ::
+  @spec store_lines(Store.t(), binary(), [LineProtocolParser.line_result()], profile()) ::
           InfluxElixir.Client.write_result()
   defp store_lines(table, database, lines, :v2) do
     case Enum.find(lines, &match?({:error, _line_error}, &1)) do
@@ -628,7 +611,7 @@ defmodule InfluxElixir.Client.Local do
           Enum.reduce(lines, [], fn {:ok, point, _number, _line}, conflicts ->
             case check_schema(table, database, point, :v2) do
               :ok ->
-                store_point(table, database, strip_uint_markers(point))
+                Store.store_point(table, database, strip_uint_markers(point))
                 conflicts
 
               {:error, conflict} ->
@@ -664,7 +647,7 @@ defmodule InfluxElixir.Client.Local do
         {:ok, point, number, line}, errors ->
           case check_schema(table, database, point, :v3) do
             :ok ->
-              store_point(table, database, strip_uint_markers(point))
+              Store.store_point(table, database, strip_uint_markers(point))
               errors
 
             {:error, message} ->
@@ -692,7 +675,7 @@ defmodule InfluxElixir.Client.Local do
   # InfluxDB 3 reserves `time` for the timestamp column. The wording
   # depends on whether the table exists (verified): a new table refuses
   # the line outright, an existing one reports a column-type conflict.
-  @spec check_schema(:ets.table(), binary(), point_map(), LineProtocolParser.dialect()) ::
+  @spec check_schema(Store.t(), binary(), point_map(), LineProtocolParser.dialect()) ::
           :ok | {:error, binary() | {binary(), binary(), binary(), binary()}}
   defp check_schema(table, database, point, :v3) do
     case reserved_time(table, database, point) do
@@ -704,7 +687,7 @@ defmodule InfluxElixir.Client.Local do
   defp check_schema(table, database, point, :v2),
     do: check_column_types(table, database, point, :v2)
 
-  @spec reserved_time(:ets.table(), binary(), point_map()) :: :ok | {:error, binary()}
+  @spec reserved_time(Store.t(), binary(), point_map()) :: :ok | {:error, binary()}
   defp reserved_time(table, database, %{tags: tags, fields: fields} = point) do
     cond do
       Map.has_key?(tags, "time") ->
@@ -719,16 +702,14 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec reserved_time_error(:ets.table(), binary(), binary(), binary()) :: {:error, binary()}
+  @spec reserved_time_error(Store.t(), binary(), binary(), binary()) :: {:error, binary()}
   defp reserved_time_error(table, database, measurement, got) do
-    case :ets.match(table, {{:column, database, measurement, :_}, :_}, 1) do
-      :"$end_of_table" ->
-        {:error, "'time' is a reserved column"}
-
-      _existing_columns ->
-        {:error,
-         "invalid column type for column 'time', expected iox::column_type::timestamp, got " <>
-           got}
+    if Store.table?(table, database, measurement) do
+      {:error,
+       "invalid column type for column 'time', expected iox::column_type::timestamp, got " <>
+         got}
+    else
+      {:error, "'time' is a reserved column"}
     end
   end
 
@@ -737,7 +718,7 @@ defmodule InfluxElixir.Client.Local do
   # writer never loses a column. InfluxDB 3 types tags and fields in one
   # namespace and reports a conflict with its column-type wording; InfluxDB
   # 2 types fields only and reports `{field, measurement, existing, got}`.
-  @spec check_column_types(:ets.table(), binary(), point_map(), LineProtocolParser.dialect()) ::
+  @spec check_column_types(Store.t(), binary(), point_map(), LineProtocolParser.dialect()) ::
           :ok | {:error, binary() | {binary(), binary(), binary(), binary()}}
   defp check_column_types(table, database, point, dialect) do
     tags = if dialect == :v3, do: Enum.map(point.tags, fn {k, _v} -> {k, :tag, nil} end), else: []
@@ -745,16 +726,10 @@ defmodule InfluxElixir.Client.Local do
 
     Enum.find_value(columns, :ok, fn {column, kind, value} ->
       type = LineProtocolParser.column_type(kind, value)
-      key = {:column, database, point.measurement, column}
 
-      if :ets.insert_new(table, {key, type}) do
-        nil
-      else
-        [{^key, existing}] = :ets.lookup(table, key)
-
-        if existing == type,
-          do: nil,
-          else: {:error, conflict(dialect, column, point, existing, type)}
+      case Store.register_column(table, database, point.measurement, column, type) do
+        :ok -> nil
+        {:conflict, existing} -> {:error, conflict(dialect, column, point, existing, type)}
       end
     end)
   end
@@ -811,7 +786,7 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec run_query(:ets.table(), map(), binary(), keyword()) :: InfluxElixir.Client.query_result()
+  @spec run_query(Store.t(), map(), binary(), keyword()) :: InfluxElixir.Client.query_result()
   defp run_query(table, conn, sql, opts) do
     database = resolve_database(opts, conn)
     resolved_sql = SQLParser.resolve_params(sql, Keyword.get(opts, :params, %{}))
@@ -955,13 +930,15 @@ defmodule InfluxElixir.Client.Local do
     end)
   end
 
-  @spec execute_delete(:ets.table(), binary(), binary(), binary()) ::
+  @spec execute_delete(Store.t(), binary(), binary(), binary()) ::
           {:ok, map()} | {:error, term()}
   defp execute_delete(table, database, measurement_raw, rest) do
     measurement = LineProtocolParser.unescape_measurement(measurement_raw)
 
     with {:ok, where} <- SQLParser.parse_where(rest) do
-      count = delete_points(table, database, measurement, where)
+      count =
+        Store.delete_points(table, database, measurement, &SQLExecutor.matches_all?(&1, where))
+
       {:ok, %{"rows_affected" => count}}
     end
   end
@@ -1001,14 +978,14 @@ defmodule InfluxElixir.Client.Local do
   @show_measurements ~r/^(?i)SHOW\s+MEASUREMENTS\s*;?$/
   @show_keys ~r/^(?i)SHOW\s+(TAG|FIELD)\s+KEYS(?:\s+FROM\s+("(?:[^"\\]|\\.)+"|\S+?))?\s*;?$/
 
-  @spec do_query_influxql(:ets.table(), map(), binary(), keyword()) ::
+  @spec do_query_influxql(Store.t(), map(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   defp do_query_influxql(table, conn, influxql, opts) do
     database = resolve_database(opts, conn)
 
     cond do
       String.match?(influxql, @show_databases) ->
-        {:ok, Enum.map(get_databases(table), &%{"iox::database" => &1, "deleted" => false})}
+        {:ok, Enum.map(Store.databases(table), &%{"iox::database" => &1, "deleted" => false})}
 
       String.match?(influxql, @show_measurements) ->
         {:ok, show_measurements(table, database)}
@@ -1021,17 +998,16 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec show_measurements(:ets.table(), binary()) :: [map()]
+  @spec show_measurements(Store.t(), binary()) :: [map()]
   defp show_measurements(table, database) do
     table
-    |> :ets.select([{{{:point, database, :"$1", :_}, :_}, [], [:"$1"]}])
-    |> Enum.uniq()
+    |> Store.measurements(database)
     |> Enum.map(&%{"iox::measurement" => "measurements", "name" => &1})
   end
 
   # Tag and field keys come from the column schema, in (measurement, key)
-  # order — the `{:column, ...}` keys of the ordered set.
-  @spec show_keys(:ets.table(), binary(), [binary()]) :: [map()]
+  # order.
+  @spec show_keys(Store.t(), binary(), [binary()]) :: [map()]
   defp show_keys(table, database, [_full, kind | from]) do
     only =
       case from do
@@ -1039,7 +1015,7 @@ defmodule InfluxElixir.Client.Local do
         [] -> nil
       end
 
-    for [m, column, type] <- :ets.match(table, {{:column, database, :"$1", :"$2"}, :"$3"}),
+    for {m, column, type} <- Store.columns(table, database),
         only in [nil, m],
         row = key_row(String.upcase(kind), m, column, type),
         row != nil do
@@ -1064,7 +1040,7 @@ defmodule InfluxElixir.Client.Local do
   # share: comparisons, AND/OR/NOT, time literals, now()); InfluxQL then
   # shapes the rows. A measurement or column the engine does not know is an
   # empty InfluxQL result, not an error (verified).
-  @spec influxql_select(:ets.table(), map(), binary(), keyword()) ::
+  @spec influxql_select(Store.t(), map(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   defp influxql_select(table, conn, influxql, opts) do
     with {:ok, query} <- influxql_parse(influxql) do
@@ -1075,7 +1051,7 @@ defmodule InfluxElixir.Client.Local do
 
       case query_sql(conn, sql, Keyword.delete(opts, :params)) do
         {:ok, rows} ->
-          tags = measurement_tags(table, resolve_database(opts, conn), query.measurement)
+          tags = Store.tag_columns(table, resolve_database(opts, conn), query.measurement)
           {:ok, InfluxQL.run(query, rows, tags)}
 
         {:error, %{body: "Error during planning: table " <> _rest}} ->
@@ -1098,13 +1074,6 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec measurement_tags(:ets.table(), binary(), binary()) :: MapSet.t(binary())
-  defp measurement_tags(table, database, measurement) do
-    table
-    |> :ets.match({{:column, database, measurement, :"$1"}, "iox::column_type::tag"})
-    |> MapSet.new(fn [column] -> column end)
-  end
-
   @doc """
   Executes a Flux query as InfluxDB 2 does; see `InfluxElixir.Client.Local.Flux`
   for the stages supported. Every stage is applied or the query is refused
@@ -1124,7 +1093,7 @@ defmodule InfluxElixir.Client.Local do
     with :ok <- require_capability(conn, :query_flux),
          {:ok, query} <- flux_parse(flux),
          :ok <- flux_bucket_exists(table, query.bucket) do
-      case Flux.run(query, all_points_in_db(table, query.bucket)) do
+      case Flux.run(query, Store.points_in_db(table, query.bucket)) do
         {:ok, rows} -> {:ok, rows}
         {:error, message} -> {:error, flux_error(400, "invalid", message)}
       end
@@ -1133,17 +1102,19 @@ defmodule InfluxElixir.Client.Local do
 
   @spec flux_parse(binary()) :: {:ok, Flux.query()} | {:error, map()}
   defp flux_parse(flux) do
-    # The clock `store_point/3` stamps untimed points with, so a point
-    # written a moment ago is inside `range(start: -1h)`.
-    case Flux.parse(flux, System.system_time(:nanosecond)) do
+    # The clock untimed points are stamped with, plus a nanosecond: `stop`
+    # is exclusive and the clock can read the same value for a write and
+    # the query right after it, which on a real server never happen at
+    # the same instant.
+    case Flux.parse(flux, Store.now_ns() + 1) do
       {:ok, query} -> {:ok, query}
       {:error, message} -> {:error, flux_error(400, "invalid", message)}
     end
   end
 
-  @spec flux_bucket_exists(:ets.table(), binary()) :: :ok | {:error, map()}
+  @spec flux_bucket_exists(Store.t(), binary()) :: :ok | {:error, map()}
   defp flux_bucket_exists(table, bucket) do
-    if :ets.member(table, {:bucket, bucket}) or :ets.member(table, {:database, bucket}),
+    if Store.bucket?(table, bucket) or Store.database?(table, bucket),
       do: :ok,
       else:
         {:error,
@@ -1175,7 +1146,7 @@ defmodule InfluxElixir.Client.Local do
         ) :: :ok | {:error, term()}
   def create_database(%{table: table} = conn, name, _opts \\ []) do
     with :ok <- require_capability(conn, :create_database) do
-      :ets.insert(table, {{:database, name}, true})
+      Store.put_database(table, name)
       :ok
     end
   end
@@ -1191,7 +1162,7 @@ defmodule InfluxElixir.Client.Local do
     with :ok <- require_capability(conn, :list_databases) do
       dbs =
         table
-        |> get_databases()
+        |> Store.databases()
         |> Enum.map(&%{"name" => &1})
 
       {:ok, dbs}
@@ -1210,17 +1181,11 @@ defmodule InfluxElixir.Client.Local do
           :ok | {:error, term()}
   def delete_database(%{table: table} = conn, name) do
     with :ok <- require_capability(conn, :delete_database) do
-      if :ets.member(table, {:database, name}) do
-        # Dropping a database drops its tables: the points and the column
-        # schema go with it, so a re-created database starts empty.
-        :ets.match_delete(table, {{:point, name, :_, :_}, :_})
-        :ets.match_delete(table, {{:column, name, :_, :_}, :_})
-        :ets.match_delete(table, {{:series_time, name, :_, :_, :_}})
-        :ets.match_delete(table, {{:duplicates, name, :_}})
-        :ets.delete(table, {:database, name})
-        :ok
-      else
-        {:error, %{status: 404, body: "the requested resource was not found: #{name}"}}
+      # Dropping a database drops its tables: points and schema go with it,
+      # so a re-created database starts empty.
+      case Store.drop_database(table, name) do
+        :ok -> :ok
+        :error -> {:error, %{status: 404, body: "the requested resource was not found: #{name}"}}
       end
     end
   end
@@ -1258,7 +1223,7 @@ defmodule InfluxElixir.Client.Local do
            }}
 
         seconds ->
-          :ets.insert(table, {{:bucket, name}, %{retention: seconds}})
+          Store.put_bucket(table, name, %{retention: seconds})
           :ok
       end
     end
@@ -1276,8 +1241,7 @@ defmodule InfluxElixir.Client.Local do
     with :ok <- require_capability(conn, :list_buckets) do
       bkts =
         table
-        |> :ets.select([{{{:bucket, :"$1"}, :"$2"}, [], [{{:"$1", :"$2"}}]}])
-        |> Enum.sort()
+        |> Store.buckets()
         |> Enum.map(fn {name, %{retention: seconds}} ->
           %{
             "id" => bucket_id(name),
@@ -1302,11 +1266,9 @@ defmodule InfluxElixir.Client.Local do
           :ok | {:error, term()}
   def delete_bucket(%{table: table} = conn, name) do
     with :ok <- require_capability(conn, :delete_bucket) do
-      if :ets.member(table, {:bucket, name}) do
-        :ets.delete(table, {:bucket, name})
-        :ok
-      else
-        {:error, %{status: 404, body: "bucket not found: #{name}"}}
+      case Store.delete_bucket(table, name) do
+        :ok -> :ok
+        :error -> {:error, %{status: 404, body: "bucket not found: #{name}"}}
       end
     end
   end
@@ -1337,7 +1299,7 @@ defmodule InfluxElixir.Client.Local do
         "description" => description
       }
 
-      :ets.insert(table, {{:token, id}, token})
+      Store.put_token(table, id, token)
       {:ok, token}
     end
   end
@@ -1351,7 +1313,7 @@ defmodule InfluxElixir.Client.Local do
           :ok | {:error, term()}
   def delete_token(%{table: table} = conn, token_id) do
     with :ok <- require_capability(conn, :delete_token) do
-      :ets.delete(table, {:token, token_id})
+      Store.delete_token(table, token_id)
       :ok
     end
   end
@@ -1374,23 +1336,13 @@ defmodule InfluxElixir.Client.Local do
   end
 
   # ---------------------------------------------------------------------------
-  # Private — ETS helpers
+  # Private — storage policy
   # ---------------------------------------------------------------------------
 
-  @spec get_databases(:ets.table()) :: MapSet.t(binary())
-  # Every registry below is one ETS object per entry, so registering and
-  # removing are single atomic operations; there is no shared set to
-  # read-modify-write.
-  defp get_databases(table) do
-    table
-    |> :ets.select([{{{:database, :"$1"}, :_}, [], [:"$1"]}])
-    |> MapSet.new()
-  end
-
   # v3 Core/Enterprise auto-create databases on write; v2 requires pre-existing
-  @spec ensure_database(:ets.table(), binary(), profile()) :: :ok | {:error, term()}
+  @spec ensure_database(Store.t(), binary(), profile()) :: :ok | {:error, term()}
   defp ensure_database(table, database, profile) when profile in [:v3_core, :v3_enterprise] do
-    :ets.insert(table, {{:database, database}, true})
+    Store.put_database(table, database)
     :ok
   end
 
@@ -1399,10 +1351,10 @@ defmodule InfluxElixir.Client.Local do
   # so a v2 connection can be prepared either way.
   defp ensure_database(table, bucket, :v2) do
     cond do
-      :ets.member(table, {:bucket, bucket}) ->
+      Store.bucket?(table, bucket) ->
         :ok
 
-      :ets.member(table, {:database, bucket}) ->
+      Store.database?(table, bucket) ->
         :ok
 
       true ->
@@ -1419,103 +1371,14 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  # One ETS object per point, keyed by a monotonic sequence number. Storing
-  # a measurement's points as one list meant every write read the list,
-  # prepended and wrote it back: concurrent writers overwrote each other
-  # (#15: 159 of 480 writes survived) and each insert copied the whole
-  # list, making a bulk write quadratic. A plain insert is atomic and O(log n).
-  @spec store_point(:ets.table(), binary(), point_map()) :: true
-  defp store_point(table, database, point) do
-    # Real InfluxDB assigns a server timestamp when none is provided.
-    point = assign_default_timestamp(point)
-    seq = :erlang.unique_integer([:monotonic, :positive])
-    series_time = {:series_time, database, point.measurement, point.tags, point.timestamp}
-
-    # A second point at the same series and time marks the measurement, so
-    # reads merge only where a duplicate can exist (see `merge_duplicates/1`).
-    # `insert_new` is atomic: of two concurrent writers one sees the other.
-    unless :ets.insert_new(table, {series_time}) do
-      :ets.insert(table, {{:duplicates, database, point.measurement}})
-    end
-
-    :ets.insert(table, {{:point, database, point.measurement, seq}, point})
-  end
-
-  @spec assign_default_timestamp(point_map()) :: point_map()
-  defp assign_default_timestamp(%{timestamp: nil} = point) do
-    %{point | timestamp: System.system_time(:nanosecond)}
-  end
-
-  defp assign_default_timestamp(point), do: point
-
-  @spec measurement_exists?(:ets.table(), binary(), binary()) :: boolean()
-  defp measurement_exists?(table, database, measurement) do
-    spec = [{{{:point, database, measurement, :_}, :_}, [], [true]}]
-    :ets.select(table, spec, 1) != :"$end_of_table"
-  end
-
-  # InfluxDB — both versions, verified — treats a measurement's points with
-  # the same tag set and timestamp as one point: their fields merge and the
-  # later write wins per field, within a payload and across payloads.
-  # Points are stored as written, one insert each (see `store_point/3`), and
-  # merged here on read; the merged point keeps the first write's position.
-  # Merging is most of a query's cost at 100k points, so it runs only for a
-  # measurement a duplicate was written to (`{:duplicates, db, m}`); a
-  # stale marker only costs a merge that changes nothing.
-  @spec merge_duplicates([point_map()]) :: [point_map()]
-  defp merge_duplicates(points) do
-    {merged, order} =
-      Enum.reduce(points, {%{}, []}, fn point, {merged, order} ->
-        key = {point.measurement, point.tags, point.timestamp}
-
-        case merged do
-          %{^key => earlier} ->
-            later = %{earlier | fields: Map.merge(earlier.fields, point.fields)}
-            {Map.put(merged, key, later), order}
-
-          _first ->
-            {Map.put(merged, key, point), [key | order]}
-        end
-      end)
-
-    order |> Enum.reverse() |> Enum.map(&Map.fetch!(merged, &1))
-  end
-
-  # Points come back in key (= insertion) order, duplicates merged.
-  @spec fetch_points(:ets.table(), binary(), binary()) :: [point_map()]
-  defp fetch_points(table, database, measurement) do
-    points = raw_points(table, database, measurement)
-
-    if :ets.member(table, {:duplicates, database, measurement}),
-      do: merge_duplicates(points),
-      else: points
-  end
-
-  # Every stored object for a measurement, as written.
-  @spec raw_points(:ets.table(), binary(), binary()) :: [point_map()]
-  defp raw_points(table, database, measurement) do
-    :ets.select(table, [{{{:point, database, measurement, :_}, :"$1"}, [], [:"$1"]}])
-  end
-
   # The SQL executor's view of the store: a measurement's points, or
   # `:error` for one that was never written (the engine's "table not
   # found").
-  @spec point_source(:ets.table(), binary(), binary()) :: {:ok, [point_map()]} | :error
+  @spec point_source(Store.t(), binary(), binary()) :: {:ok, [point_map()]} | :error
   defp point_source(table, database, measurement) do
-    if measurement_exists?(table, database, measurement),
-      do: {:ok, fetch_points(table, database, measurement)},
+    if Store.measurement?(table, database, measurement),
+      do: {:ok, Store.points(table, database, measurement)},
       else: :error
-  end
-
-  @spec all_points_in_db(:ets.table(), binary()) :: [point_map()]
-  defp all_points_in_db(table, database) do
-    table
-    |> :ets.select([{{{:point, database, :_, :_}, :"$1"}, [], [:"$1"]}])
-    |> then(fn points ->
-      if :ets.match(table, {{:duplicates, database, :_}}, 1) == :"$end_of_table",
-        do: points,
-        else: merge_duplicates(points)
-    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -1531,8 +1394,6 @@ defmodule InfluxElixir.Client.Local do
 
   defp maybe_decompress(plain), do: {:ok, plain}
 
-  # Flux responses include _measurement (v2 compatibility format)
-
   # ---------------------------------------------------------------------------
   # Private — utilities
   # ---------------------------------------------------------------------------
@@ -1545,30 +1406,6 @@ defmodule InfluxElixir.Client.Local do
       status: 400,
       body: "Error during planning: No value found for placeholder with name #{name}"
     }
-  end
-
-  @spec delete_points(:ets.table(), binary(), binary(), [SQLParser.where_node()]) ::
-          non_neg_integer()
-  # The WHERE is evaluated over merged points, as the engine sees them; every
-  # stored object behind a matching point is then deleted by its own key, so
-  # a concurrent write to the same measurement is never lost to a rewrite of
-  # the whole list. The count is of points as the engine counts them.
-  defp delete_points(table, database, measurement, where) do
-    stored = :ets.select(table, [{{{:point, database, measurement, :_}, :_}, [], [:"$_"]}])
-
-    doomed =
-      stored
-      |> Enum.map(fn {_key, point} -> point end)
-      |> merge_duplicates()
-      |> Enum.filter(&SQLExecutor.matches_all?(&1, where))
-      |> MapSet.new(&{&1.tags, &1.timestamp})
-
-    for {key, point} <- stored, MapSet.member?(doomed, {point.tags, point.timestamp}) do
-      :ets.delete(table, {:series_time, database, measurement, point.tags, point.timestamp})
-      :ets.delete(table, key)
-    end
-
-    MapSet.size(doomed)
   end
 
   @spec generate_id() :: binary()

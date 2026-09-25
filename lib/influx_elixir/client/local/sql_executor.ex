@@ -14,7 +14,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   Pure over the points it is given: no ETS, no connection state.
   """
 
-  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLParser}
+  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLParser, Store}
 
   @typedoc "A stored point, as `InfluxElixir.Client.Local` keeps it."
   @type point :: LineProtocolParser.point()
@@ -921,7 +921,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # does.
   @spec to_nanoseconds(SQLParser.time_value()) :: integer()
   defp to_nanoseconds(value) when is_integer(value), do: value
-  defp to_nanoseconds({:now, offset_ns}), do: System.os_time(:nanosecond) + offset_ns
+  defp to_nanoseconds({:now, offset_ns}), do: Store.now_ns() + offset_ns
 
   # DataFusion: "There isn't a common type to coerce Float64 and Utf8 in
   # LIKE expression".
