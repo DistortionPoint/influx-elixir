@@ -85,6 +85,7 @@ defmodule InfluxElixir.ClientContract do
     influxql_tests = if v3_sql, do: influxql_tests(client), else: nil
     influxql_select_tests = if v3_sql, do: influxql_select_tests(client), else: nil
     reference_tests = if v3_sql, do: reference_tests(client), else: nil
+    null_semantics_tests = if v3_sql, do: null_semantics_tests(client), else: nil
     db_admin_tests = if v3_sql, do: db_admin_tests(client), else: nil
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
@@ -126,6 +127,7 @@ defmodule InfluxElixir.ClientContract do
         influxql_tests,
         influxql_select_tests,
         reference_tests,
+        null_semantics_tests,
         db_admin_tests,
         bucket_tests,
         v2_write_rule_tests,
@@ -2465,6 +2467,102 @@ defmodule InfluxElixir.ClientContract do
 
           assert streamed == rows
           assert Enum.all?(streamed, &match?(%DateTime{}, &1["time"]))
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # NULL semantics and operators (v3_core, v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  defp null_semantics_tests(client) do
+    quote do
+      describe "query_sql/3 — nulls and operators contract" do
+        setup ctx do
+          m = "contract_nl_#{System.unique_integer([:positive])}"
+
+          lp = """
+          #{m},host=a,rack=1 v=1.5,n=2i,s="al%pha",b=true 1700000000000000000
+          #{m},host=b n=-4i,b=false 1700000060000000000
+          #{m},host=c,rack=2 v=-3.25,n=7i 1700000120000000000
+          """
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, String.trim(lp), database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+          {:ok, m: m}
+        end
+
+        test "null ordering, three-valued NOT and the DISTINCT null row", ctx do
+          q = fn sql ->
+            {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+            rows
+          end
+
+          assert Enum.map(q.("SELECT rack FROM #{ctx.m} ORDER BY rack"), & &1["rack"]) == [
+                   "1",
+                   "2",
+                   nil
+                 ]
+
+          assert Enum.map(q.("SELECT rack FROM #{ctx.m} ORDER BY rack DESC"), & &1["rack"]) == [
+                   nil,
+                   "2",
+                   "1"
+                 ]
+
+          assert Enum.map(q.("SELECT rack FROM #{ctx.m} ORDER BY rack NULLS FIRST"), & &1["rack"]) ==
+                   [nil, "1", "2"]
+
+          assert Enum.map(
+                   q.("SELECT host FROM #{ctx.m} WHERE NOT (rack = '1') ORDER BY time"),
+                   & &1["host"]
+                 ) == ["c"]
+
+          assert q.("SELECT DISTINCT rack FROM #{ctx.m} ORDER BY rack") == [
+                   %{"rack" => "1"},
+                   %{"rack" => "2"},
+                   %{}
+                 ]
+        end
+
+        test "LIKE escapes, a boolean predicate, % and unary minus", ctx do
+          q = fn sql ->
+            {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+            rows
+          end
+
+          assert [%{"host" => "a"}] = q.(~s(SELECT host FROM #{ctx.m} WHERE s LIKE 'al\\%%'))
+
+          assert Enum.map(q.("SELECT host FROM #{ctx.m} WHERE NOT b ORDER BY time"), & &1["host"]) ==
+                   ["b"]
+
+          assert Enum.map(q.("SELECT n % 3 AS r FROM #{ctx.m} ORDER BY time"), & &1["r"]) == [
+                   2,
+                   -1,
+                   1
+                 ]
+
+          assert Enum.map(q.("SELECT -v AS x FROM #{ctx.m} ORDER BY time"), & &1["x"]) == [
+                   -1.5,
+                   nil,
+                   3.25
+                 ]
+
+          assert {:error,
+                  %{
+                    status: 400,
+                    body:
+                      "Error during planning: Cannot create filter with non-boolean predicate" <>
+                        _rest
+                  }} =
+                   unquote(client).query_sql(ctx.conn, "SELECT host FROM #{ctx.m} WHERE n",
+                     database: ctx.database
+                   )
         end
       end
     end

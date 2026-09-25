@@ -368,16 +368,28 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec keys_before?(term(), term(), [{(term() -> term()), :asc | :desc}]) :: boolean()
   defp keys_before?(_a, _b, []), do: true
 
+  # Nulls sort last ascending and first descending unless the query says
+  # NULLS FIRST / LAST — DataFusion's rule (verified). Term order put a nil
+  # before every string and between `false` and `true`.
   defp keys_before?(a, b, [{key_fn, direction} | rest]) do
+    {dir, nulls} = null_placement(direction)
     x = key_fn.(a)
     y = key_fn.(b)
 
     cond do
+      is_nil(x) and is_nil(y) -> keys_before?(a, b, rest)
+      is_nil(x) -> nulls == :nulls_first
+      is_nil(y) -> nulls == :nulls_last
       value_order(x, y) and value_order(y, x) -> keys_before?(a, b, rest)
-      direction == :asc -> value_order(x, y)
+      dir == :asc -> value_order(x, y)
       true -> value_order(y, x)
     end
   end
+
+  @spec null_placement(SQLParser.direction()) :: {:asc | :desc, :nulls_first | :nulls_last}
+  defp null_placement(:asc), do: {:asc, :nulls_last}
+  defp null_placement(:desc), do: {:desc, :nulls_first}
+  defp null_placement({dir, nulls}), do: {dir, nulls}
 
   # The same shape and wording the real engine returns for a missing table
   # (HTTP 400, planning error), so consumer code matching `%{status: 400}`
@@ -408,15 +420,15 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp put_column(row, key, value), do: Map.put(row, key, value)
 
   # SELECT DISTINCT a[, b ...]: one row per distinct combination, sorted
-  # unless ORDER BY (one of the selected columns) says otherwise. A row
-  # whose columns are all null is dropped, as the real engine does.
+  # unless ORDER BY (one of the selected columns) says otherwise. A
+  # combination whose columns are all null is a row too (`%{}`), as the
+  # engine returns it (verified).
   @spec execute_distinct_query([point()], SQLParser.parsed_query()) :: [map()]
   defp execute_distinct_query(points, query) do
     columns = query.distinct_columns
 
     points
     |> Enum.map(fn point -> Enum.map(columns, &point_value(point, &1)) end)
-    |> Enum.reject(&Enum.all?(&1, fn value -> is_nil(value) end))
     |> Enum.uniq()
     |> Enum.sort()
     |> Enum.map(fn values ->
@@ -535,6 +547,13 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp eval_expr({:lit, value}, _point), do: value
   defp eval_expr({:cast, inner, type}, point), do: cast(eval_expr(inner, point), type)
 
+  defp eval_expr({:neg, inner}, point) do
+    case eval_expr(inner, point) do
+      value when is_number(value) -> -value
+      _null -> nil
+    end
+  end
+
   defp eval_expr({:op, op, left, right}, point) do
     with l when is_number(l) <- eval_expr(left, point),
          r when is_number(r) <- eval_expr(right, point) do
@@ -590,6 +609,12 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp arithmetic(:/, _l, +0.0), do: nil
   defp arithmetic(:/, l, r) when is_integer(l) and is_integer(r), do: div(l, r)
   defp arithmetic(:/, l, r), do: l / r
+  # `%` takes the dividend's sign (-4 % 3 = -1) and works on floats
+  # (-3.25 % 2 = -1.25), as DataFusion's does (verified).
+  defp arithmetic(:rem, _l, 0), do: nil
+  defp arithmetic(:rem, _l, +0.0), do: nil
+  defp arithmetic(:rem, l, r) when is_integer(l) and is_integer(r), do: rem(l, r)
+  defp arithmetic(:rem, l, r), do: :math.fmod(l / 1, r / 1)
 
   @spec compute_aggregate(SQLParser.aggregate(), [number() | DateTime.t()]) ::
           number() | DateTime.t() | nil
@@ -736,14 +761,54 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec matches_all?(point(), [SQLParser.where_node()]) :: boolean()
   @doc "Whether a point satisfies a parsed `WHERE` conjunction (also used by `DELETE`)."
   @spec matches_all?(point(), [SQLParser.where_node()]) :: boolean()
-  def matches_all?(point, conjunction), do: Enum.all?(conjunction, &node_matches?(point, &1))
+  def matches_all?(point, conjunction), do: eval_all(point, conjunction) == true
 
-  @spec node_matches?(point(), SQLParser.where_node()) :: boolean()
-  defp node_matches?(point, {:or, branches}), do: Enum.any?(branches, &matches_all?(point, &1))
-  defp node_matches?(point, {:not, conjunction}), do: not matches_all?(point, conjunction)
-  defp node_matches?(point, clause), do: matches_condition?(point, clause)
+  # SQL's three-valued logic: a comparison with a null operand is unknown
+  # (nil), AND is false if any part is false, OR is true if any part is
+  # true, NOT of unknown is unknown, and a row is kept only when true.
+  # Two-valued evaluation kept rows where `NOT (rack = '1')` had no rack.
+  @spec eval_all(point(), [SQLParser.where_node()]) :: boolean() | nil
+  defp eval_all(point, conjunction) do
+    Enum.reduce_while(conjunction, true, fn node, acc ->
+      case eval_node(point, node) do
+        false -> {:halt, false}
+        nil -> {:cont, nil}
+        true -> {:cont, acc}
+      end
+    end)
+  end
 
-  @spec matches_condition?(point(), SQLParser.where_clause()) :: boolean()
+  @spec eval_node(point(), SQLParser.where_node()) :: boolean() | nil
+  defp eval_node(point, {:or, branches}) do
+    Enum.reduce_while(branches, false, fn branch, acc ->
+      case eval_all(point, branch) do
+        true -> {:halt, true}
+        nil -> {:cont, nil}
+        false -> {:cont, acc}
+      end
+    end)
+  end
+
+  defp eval_node(point, {:not, conjunction}) do
+    case eval_all(point, conjunction) do
+      nil -> nil
+      value -> not value
+    end
+  end
+
+  defp eval_node(point, clause), do: matches_condition?(point, clause)
+
+  @spec matches_condition?(point(), SQLParser.where_clause()) :: boolean() | nil
+  defp matches_condition?(point, {:truthy, column, _nil}) do
+    case point_value(point, column) do
+      value when is_boolean(value) or is_nil(value) ->
+        value
+
+      other ->
+        throw({:query_error, %{status: 400, body: non_boolean_predicate(point, column, other)}})
+    end
+  end
+
   defp matches_condition?(point, {:between, "time", {low, high}}) do
     ts = point.timestamp
     not is_nil(ts) and ts >= to_nanoseconds(low) and ts <= to_nanoseconds(high)
@@ -753,16 +818,22 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     do: not matches_condition?(point, {:between, "time", range})
 
   defp matches_condition?(point, {:between, left, {low, high}}) do
-    actual = left_value(point, left)
-    compare(actual, :gte, low) and compare(actual, :lte, high)
+    case left_value(point, left) do
+      nil -> nil
+      actual -> compare(actual, :gte, low) and compare(actual, :lte, high)
+    end
   end
 
-  defp matches_condition?(point, {:not_between, key, range}),
-    do: not matches_condition?(point, {:between, key, range})
+  defp matches_condition?(point, {:not_between, key, range}) do
+    case matches_condition?(point, {:between, key, range}) do
+      nil -> nil
+      value -> not value
+    end
+  end
 
   defp matches_condition?(point, {:like, left, regex}) do
     case left_value(point, left) do
-      nil -> false
+      nil -> nil
       text when is_binary(text) -> Regex.match?(regex, text)
       _number -> throw({:query_error, %{status: 400, body: like_type_error(left)}})
     end
@@ -770,7 +841,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   defp matches_condition?(point, {:not_like, left, regex}) do
     case left_value(point, left) do
-      nil -> false
+      nil -> nil
       text when is_binary(text) -> not Regex.match?(regex, text)
       _number -> throw({:query_error, %{status: 400, body: like_type_error(left)}})
     end
@@ -785,13 +856,17 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   end
 
   defp matches_condition?(point, {:in, key, values}) do
-    actual = point_value(point, key)
-    Enum.any?(values, &compare(actual, :eq, right_value(point, &1)))
+    case point_value(point, key) do
+      nil -> nil
+      actual -> Enum.any?(values, &compare(actual, :eq, right_value(point, &1)))
+    end
   end
 
   defp matches_condition?(point, {:not_in, key, values}) do
-    actual = point_value(point, key)
-    not Enum.any?(values, &compare(actual, :eq, right_value(point, &1)))
+    case matches_condition?(point, {:in, key, values}) do
+      nil -> nil
+      value -> not value
+    end
   end
 
   defp matches_condition?(point, {:is_null, key, _nil}), do: is_nil(point_value(point, key))
@@ -804,7 +879,25 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   end
 
   defp matches_condition?(point, {op, left, right}) do
-    compare(left_value(point, left), op, right_value(point, right))
+    case {left_value(point, left), right_value(point, right)} do
+      {nil, _right} -> nil
+      {_left, nil} -> nil
+      {l, r} -> compare(l, op, r)
+    end
+  end
+
+  # DataFusion refuses a non-boolean column as a filter at planning.
+  @spec non_boolean_predicate(point(), binary(), term()) :: binary()
+  defp non_boolean_predicate(point, column, value) do
+    type =
+      cond do
+        is_integer(value) -> "Int64"
+        is_float(value) -> "Float64"
+        true -> "Utf8"
+      end
+
+    "Error during planning: Cannot create filter with non-boolean predicate " <>
+      "'#{point.measurement}.#{column}' returning #{type}"
   end
 
   # The left operand is a column name or an arithmetic expression; the right

@@ -20,6 +20,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COUNT` over 50k points 88 → 19 ms. Results are unchanged.
 
 ### Fixed
+- **`Client.Local` got NULL wrong in `WHERE`, `ORDER BY` and `DISTINCT`.**
+  Verified against InfluxDB 3: `WHERE NOT (rack = '1')`, `rack NOT IN (...)`
+  and `v NOT BETWEEN ...` returned rows where the column was null (the
+  double's logic was two-valued); `ORDER BY` put a null first for strings,
+  last for numbers and between `false` and `true` (term order) where the
+  engine puts nulls last ascending and first descending, so a `GROUP BY`
+  of a tag with missing values was mis-ordered too; `SELECT DISTINCT`
+  dropped the all-null combination the engine returns as `%{}`. The
+  evaluator now uses three-valued logic, sorting honours DataFusion's null
+  placement and `NULLS FIRST` / `NULLS LAST`, and `DISTINCT` keeps the null
+  row.
+- **`LIKE 'al\%%'` matched nothing in `Client.Local`.** The backslash
+  escape was read as a literal backslash; it now makes the next character
+  literal, as on the engine.
+- **`Client.Local` refused valid SQL:** a boolean column as a predicate
+  (`WHERE b`, `NOT b`), the `%` operator and unary minus (`-n`). All three
+  now work as on the engine (`%` takes the dividend's sign and works on
+  floats); a non-boolean bare column is the engine's planning error.
+  `HAVING` is still refused by name.
 - **`Client.Local` misparsed escaped backslashes.** A string field value
   ending in an escaped backslash (`s="ends\\",v=1i`) swallowed the next
   field and failed the line; InfluxDB 3 stores `ends\`. A measurement, tag

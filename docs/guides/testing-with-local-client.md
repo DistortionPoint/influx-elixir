@@ -381,6 +381,18 @@ exactly as InfluxDB 3's JSON responses omit null columns. Assert with
 `refute Map.has_key?(row, "avg_usage")`, not `row["avg_usage"] == nil`
 (the latter passes for both shapes and proves nothing).
 
+## NULLs
+
+The double follows DataFusion's NULL rules, verified against InfluxDB 3:
+
+- `ORDER BY col` puts nulls last, `ORDER BY col DESC` puts them first, and
+  `NULLS FIRST` / `NULLS LAST` override either.
+- A comparison with a null is unknown, and `NOT` of unknown is unknown, so
+  `WHERE NOT (rack = '1')` does not return rows that have no `rack`; neither
+  do `rack NOT IN (...)` or `v NOT BETWEEN ...`.
+- `SELECT DISTINCT rack` includes the all-null combination as `%{}`, and a
+  `GROUP BY rack` has a group for rows without a `rack`.
+
 ## GROUP BY Tag/Field Columns
 
 `GROUP BY` on bare tag/field columns is supported alongside `DATE_BIN`

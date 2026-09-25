@@ -5674,4 +5674,140 @@ defmodule InfluxElixir.Client.LocalTest do
                  "Valid columns: 1 to 2"
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # NULL semantics, LIKE escapes, bare booleans, % and unary minus.
+  # Expectations taken from influxdb:3-core
+  # (docs/design/2026-09-25_local-sql-nulls-and-operators.md).
+  # ---------------------------------------------------------------------------
+
+  describe "query_sql/3 — nulls and operators as DataFusion has them" do
+    setup do
+      {:ok, conn} = Local.start(databases: ["nl"])
+      on_exit(fn -> Local.stop(conn) end)
+
+      lp = """
+      t,host=a,rack=1 v=1.5,n=2i,s="alpha",b=true 1700000000000000000
+      t,host=a,rack=2 v=-3.25,n=7i,s="Beta",b=false 1700000060000000000
+      t,host=b,rack=1 v=10.0,n=-4i,s="gamma" 1700000120000000000
+      t,host=b n=0i,b=true 1700000180000000000
+      t,host=c,rack=3 v=0.5,s="al%pha" 1700000240000000000
+      """
+
+      {:ok, :written} = Local.write(conn, String.trim(lp), database: "nl")
+      {:ok, conn: conn}
+    end
+
+    defp nq(conn, sql) do
+      {:ok, rows} = Local.query_sql(conn, sql, database: "nl")
+      rows
+    end
+
+    test "nulls sort last ascending, first descending, and where NULLS says", %{conn: conn} do
+      racks = fn sql -> conn |> nq(sql) |> Enum.map(& &1["rack"]) end
+
+      assert racks.("SELECT rack FROM t ORDER BY rack, time") == ["1", "1", "2", "3", nil]
+      assert racks.("SELECT rack FROM t ORDER BY rack DESC, time") == [nil, "3", "2", "1", "1"]
+
+      assert racks.("SELECT rack FROM t ORDER BY rack NULLS FIRST, time") == [
+               nil,
+               "1",
+               "1",
+               "2",
+               "3"
+             ]
+
+      assert racks.("SELECT rack FROM t ORDER BY rack DESC NULLS LAST, time") == [
+               "3",
+               "2",
+               "1",
+               "1",
+               nil
+             ]
+
+      assert Enum.map(
+               nq(conn, "SELECT rack, COUNT(*) AS c FROM t GROUP BY rack ORDER BY rack"),
+               & &1["rack"]
+             ) ==
+               ["1", "2", "3", nil]
+    end
+
+    test "DISTINCT keeps the all-null combination as an empty row", %{conn: conn} do
+      assert nq(conn, "SELECT DISTINCT b FROM t ORDER BY b") == [
+               %{"b" => false},
+               %{"b" => true},
+               %{}
+             ]
+    end
+
+    test "NOT, NOT IN and NOT BETWEEN over a null are unknown, so the row is dropped",
+         %{conn: conn} do
+      hosts = fn sql -> conn |> nq(sql) |> Enum.map(& &1["host"]) end
+
+      assert hosts.("SELECT host FROM t WHERE NOT (rack = '1') ORDER BY time") == ["a", "c"]
+      assert hosts.("SELECT host FROM t WHERE NOT (v > 0) ORDER BY time") == ["a"]
+      assert hosts.("SELECT host FROM t WHERE rack NOT IN ('1') ORDER BY time") == ["a", "c"]
+      assert hosts.("SELECT host FROM t WHERE v NOT BETWEEN 0 AND 2 ORDER BY time") == ["a", "b"]
+
+      assert hosts.("SELECT host FROM t WHERE v > 0 OR rack = '3' ORDER BY time") == [
+               "a",
+               "b",
+               "c"
+             ]
+    end
+
+    test "a backslash makes % and _ literal in LIKE and ILIKE", %{conn: conn} do
+      assert [%{"s" => "al%pha"}] = nq(conn, ~S"SELECT s FROM t WHERE s LIKE 'al\%%'")
+      assert [%{"s" => "al%pha"}] = nq(conn, ~S"SELECT s FROM t WHERE s ILIKE 'AL\%%'")
+      assert [] = nq(conn, ~S"SELECT s FROM t WHERE s LIKE 'al\_ha'")
+    end
+
+    test "a boolean column is a predicate; a non-boolean one is the planning error",
+         %{conn: conn} do
+      assert Enum.map(nq(conn, "SELECT host FROM t WHERE b ORDER BY time"), & &1["host"]) == [
+               "a",
+               "b"
+             ]
+
+      assert Enum.map(nq(conn, "SELECT host FROM t WHERE NOT b ORDER BY time"), & &1["host"]) == [
+               "a"
+             ]
+
+      assert [%{"host" => "a"}] = nq(conn, "SELECT host FROM t WHERE b AND n > 0")
+
+      assert {:error, %{status: 400, body: body}} =
+               Local.query_sql(conn, "SELECT host FROM t WHERE n", database: "nl")
+
+      assert body ==
+               "Error during planning: Cannot create filter with non-boolean predicate 't.n' returning Int64"
+    end
+
+    test "% keeps the dividend's sign and works on floats; unary minus negates", %{conn: conn} do
+      assert Enum.map(nq(conn, "SELECT n % 3 AS m FROM t ORDER BY time"), & &1["m"]) == [
+               2,
+               1,
+               -1,
+               0,
+               nil
+             ]
+
+      assert Enum.map(nq(conn, "SELECT v % 2 AS m FROM t ORDER BY time"), & &1["m"]) == [
+               1.5,
+               -1.25,
+               0.0,
+               nil,
+               0.5
+             ]
+
+      assert Enum.map(nq(conn, "SELECT -n AS x FROM t ORDER BY time"), & &1["x"]) == [
+               -2,
+               -7,
+               4,
+               0,
+               nil
+             ]
+
+      assert [%{"host" => "b"}] = nq(conn, "SELECT host FROM t WHERE -n > 0")
+    end
+  end
 end

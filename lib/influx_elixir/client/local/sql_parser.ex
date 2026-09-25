@@ -28,7 +28,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @type expr ::
           {:field, binary()}
           | {:lit, number() | binary()}
-          | {:op, :+ | :- | :* | :/, expr(), expr()}
+          | {:op, :+ | :- | :* | :/ | :rem, expr(), expr()}
+          | {:neg, expr()}
           | {:cast, expr(), cast_type()}
 
   @typedoc "`CAST(expr AS INTEGER | DOUBLE | VARCHAR)` targets (and their synonyms)."
@@ -78,8 +79,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   """
   @type time_value :: integer() | {:now, integer()}
 
+  @typedoc "`:asc` / `:desc` (nulls last / first), or a direction with explicit NULLS placement."
+  @type direction :: :asc | :desc | {:asc | :desc, :nulls_first | :nulls_last}
+
   @typedoc "`ORDER BY` terms in order; a target is `time`, a column, an output alias or an expression."
-  @type order_by :: [{binary() | {:expr, expr()}, :asc | :desc}]
+  @type order_by :: [{binary() | {:expr, expr()}, direction()}]
 
   @typedoc """
   A projected column: `{source, output}` where `source` is a column name or
@@ -893,11 +897,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   #
   # Grammar (recursive descent, standard precedence):
   #   expr   := term   (('+' | '-') term)*
-  #   term   := factor (('*' | '/') factor)*
-  #   factor := number | identifier | '(' expr ')'
+  #   term   := factor (('*' | '/' | '%') factor)*
+  #   factor := '-' factor | number | identifier | '(' expr ')'
   # ---------------------------------------------------------------------------
 
-  @expr_token ~r/\s*(?:(\d+\.\d+|\d+)|(\w+)|([()+\-*\/]))/
+  @expr_token ~r/\s*(?:(\d+\.\d+|\d+)|(\w+)|([()+\-*\/%]))/
 
   # `col::INTEGER` is DataFusion's shorthand for `CAST(col AS INTEGER)`.
   @shorthand_cast ~r/(\w+)::(\w+)/
@@ -947,7 +951,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   defp parse_sum_tail(left, [{:tok, op} | rest]) when op in ["+", "-"] do
     with {:ok, right, rest} <- parse_product(rest) do
-      parse_sum_tail({:op, String.to_existing_atom(op), left, right}, rest)
+      parse_sum_tail({:op, operator(op), left, right}, rest)
     end
   end
 
@@ -960,15 +964,27 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  defp parse_product_tail(left, [{:tok, op} | rest]) when op in ["*", "/"] do
+  defp parse_product_tail(left, [{:tok, op} | rest]) when op in ["*", "/", "%"] do
     with {:ok, right, rest} <- parse_factor(rest) do
-      parse_product_tail({:op, String.to_existing_atom(op), left, right}, rest)
+      parse_product_tail({:op, operator(op), left, right}, rest)
     end
   end
 
   defp parse_product_tail(left, rest), do: {:ok, left, rest}
 
+  @spec operator(binary()) :: :+ | :- | :* | :/ | :rem
+  defp operator("+"), do: :+
+  defp operator("-"), do: :-
+  defp operator("*"), do: :*
+  defp operator("/"), do: :/
+  defp operator("%"), do: :rem
+
   @spec parse_factor([term()]) :: {:ok, expr(), [term()]} | {:error, term()}
+  # Unary minus (`-n`, `-(a + b)`), as DataFusion reads it (verified).
+  defp parse_factor([{:tok, "-"} | rest]) do
+    with {:ok, inner, rest} <- parse_factor(rest), do: {:ok, {:neg, inner}, rest}
+  end
+
   defp parse_factor([{:lit, _value} = lit | rest]), do: {:ok, lit, rest}
 
   # CAST(expr AS type): the tokens are `CAST`, `(`, the expression, `AS`,
@@ -1402,6 +1418,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
                 {like_op(negated != ""), operand,
                  like_regex(pattern, String.upcase(kind) == "ILIKE")}}
 
+      # A bare column is a boolean predicate (`WHERE b`, `NOT b`).
+      Regex.match?(~r/^[A-Za-z_]\w*$/, trimmed) and
+          String.upcase(trimmed) not in ~w(TRUE FALSE NULL) ->
+        {:ok, {:truthy, trimmed, nil}}
+
       true ->
         parse_binary_where_clause(trimmed)
     end
@@ -1425,21 +1446,22 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp like_op(true), do: :not_like
   defp like_op(false), do: :like
 
-  # SQL LIKE: `%` is any run, `_` any single character; everything else is
-  # literal. LIKE is case-sensitive on the engine, ILIKE is not.
+  # SQL LIKE: `%` is any run, `_` any single character, `\` makes the next
+  # character literal (`'al\%%'` matches "al%pha", verified); everything
+  # else is literal. LIKE is case-sensitive on the engine, ILIKE is not.
   @spec like_regex(binary(), boolean()) :: Regex.t()
   defp like_regex(pattern, case_insensitive) do
-    source =
-      pattern
-      |> String.graphemes()
-      |> Enum.map_join(fn
-        "%" -> ".*"
-        "_" -> "."
-        char -> Regex.escape(char)
-      end)
+    source = pattern |> String.graphemes() |> like_source([])
 
     Regex.compile!("\\A" <> source <> "\\z", if(case_insensitive, do: "is", else: "s"))
   end
+
+  @spec like_source([binary()], [binary()]) :: binary()
+  defp like_source([], acc), do: acc |> Enum.reverse() |> Enum.join()
+  defp like_source(["\\", char | rest], acc), do: like_source(rest, [Regex.escape(char) | acc])
+  defp like_source(["%" | rest], acc), do: like_source(rest, [".*" | acc])
+  defp like_source(["_" | rest], acc), do: like_source(rest, ["." | acc])
+  defp like_source([char | rest], acc), do: like_source(rest, [Regex.escape(char) | acc])
 
   @spec parse_binary_where_clause(binary()) ::
           {:ok, where_clause()} | {:error, map()}
@@ -1710,10 +1732,21 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   @spec parse_order_term(binary()) :: {binary() | {:expr, expr()}, :asc | :desc}
+  # `[ASC|DESC] [NULLS FIRST|LAST]`. Without NULLS, DataFusion puts nulls
+  # last ascending and first descending (verified); the direction then
+  # stays a bare atom and the executor applies that default.
   defp parse_order_term(term) do
-    case Regex.run(~r/^(.+?)(?:\s+(ASC|DESC))?$/is, term) do
-      [_full, target] -> {order_target(String.trim(target)), :asc}
-      [_full, target, direction] -> {order_target(String.trim(target)), direction_atom(direction)}
+    case Regex.run(~r/^(.+?)(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?$/is, term) do
+      [_full, target] ->
+        {order_target(String.trim(target)), :asc}
+
+      [_full, target, direction] ->
+        {order_target(String.trim(target)), direction_atom(direction)}
+
+      [_full, target, direction, nulls] ->
+        dir = if direction == "", do: :asc, else: direction_atom(direction)
+        nulls = if String.upcase(nulls) == "FIRST", do: :nulls_first, else: :nulls_last
+        {order_target(String.trim(target)), {dir, nulls}}
     end
   end
 

@@ -120,7 +120,8 @@ defmodule InfluxElixir.Client.Local do
       the same as the HTTP and Flight transports return; compare them with
       `DateTime.compare/2` or a six-digit sigil (`~U[... .000000Z]`).
       A projected column may be an arithmetic expression with an alias
-      (`(bid + ask) / 2 AS mid`); a null operand makes the column null
+      (`(bid + ask) / 2 AS mid`; `+ - * / %` and unary minus, `%` taking the
+      dividend's sign); a null operand makes the column null
       (omitted). `ORDER BY` may name a projected alias.
     * `WITH name AS (<select>)[, name AS (<select>)] <select>` — non-recursive
       CTEs. Each body is a query in this subset, run in order over the store
@@ -155,7 +156,13 @@ defmodule InfluxElixir.Client.Local do
       error ("No field named prod", HTTP 500), which is what a typo or a
       forgotten pair of quotes produces in production. With no rows the
       schema is unknown and nothing is checked. `col = NULL` (a `nil`
-      param) is never true.
+      param) is never true. Logic is SQL's three-valued logic: a comparison
+      with a null operand is unknown, `NOT` keeps it unknown, and only a true
+      predicate keeps the row, so `NOT (rack = '1')` does not return rows
+      without a `rack`. A boolean column is itself a predicate (`WHERE b`,
+      `NOT b`); any other bare column is the engine's planning error
+      ("Cannot create filter with non-boolean predicate 't.n' returning
+      Int64").
     * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)` — each
       item a literal, a column or an expression, as in SQL (a bare word is
       a column reference, never a string)
@@ -165,7 +172,8 @@ defmodule InfluxElixir.Client.Local do
     * `WHERE col IS NULL` and `WHERE col IS NOT NULL`
     * `WHERE col [NOT] BETWEEN low AND high` (inclusive; `time` too)
     * `WHERE col [NOT] LIKE 'pattern'` and `ILIKE` (`%` any run, `_` one
-      character; `LIKE` is case-sensitive, `ILIKE` is not). `LIKE` over a
+      character, a backslash makes the next character literal — `'al\\%%'`; `LIKE` is
+      case-sensitive, `ILIKE` is not). `LIKE` over a
       numeric column is the engine's planning error, reproduced.
     * `WHERE time <op> <comparand>` — exactly what InfluxDB 3 accepts against
       a Timestamp: a quoted ISO-8601 datetime (`'2026-03-31T12:00:00Z'`,
@@ -176,11 +184,13 @@ defmodule InfluxElixir.Client.Local do
       ("Cannot infer common argument type for comparison operation
       Timestamp(ns) > Int64"), rather than silently matching nothing.
     * `SELECT DISTINCT col[, col ...] FROM measurement` (sorted combinations;
-      `ORDER BY` must name a selected column, as in DataFusion)
+      `ORDER BY` must name a selected column, as in DataFusion). An all-null
+      combination is a row too (`%{}`).
     * `ORDER BY a [ASC|DESC][, b [ASC|DESC] ...]` — each term `time`, a
       column, an output alias, or (on raw and projected rows) an expression
       such as `CAST(level AS INTEGER) DESC`; every term applies, each with
-      its own direction
+      its own direction. Nulls sort last ascending and first descending,
+      unless a term says `NULLS FIRST` / `NULLS LAST`.
     * `CAST(expr AS INTEGER | INT | BIGINT | DOUBLE | FLOAT | VARCHAR | STRING)`
       and DataFusion's `col::TYPE` shorthand, wherever an expression is
       allowed: `WHERE` (`CAST(level AS INTEGER) <= 20` compares a numeric tag

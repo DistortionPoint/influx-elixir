@@ -48,6 +48,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-24 | [`sql-references-and-stream-types`](2026-09-24_sql-references-and-stream-types.md) | HTTP stream rows coerced like `query_sql`; Local resolves `GROUP BY`/`ORDER BY` aliases and positions and groups `DATE_BIN` with columns |
 | 2026-09-24 | [`changelog-release-headings`](2026-09-24_changelog-release-headings.md) | #22: headings for 0.1.22–0.1.31 backfilled from the tags; the publish job writes each release's heading; a test guards it |
 | 2026-09-24 | [`local-write-read-performance`](2026-09-24_local-write-read-performance.md) | Local merges duplicates only where one was written; parser fast paths (writes 2.8×, `COUNT` 4.6× faster); escaped and trailing backslashes as the engines read them |
+| 2026-09-25 | [`local-sql-nulls-and-operators`](2026-09-25_local-sql-nulls-and-operators.md) | Local: three-valued WHERE, DataFusion null ordering and `NULLS FIRST/LAST`, DISTINCT null row, LIKE escapes, `WHERE b`, `%`, unary minus |
 
 ## Verifying against a real engine
 
