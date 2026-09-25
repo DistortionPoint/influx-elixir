@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-09-25
+
 ### Changed
 - **`Client.Local` reads and writes are two to four times faster.** Every
   read merged duplicate points (same measurement, tags and time), about
