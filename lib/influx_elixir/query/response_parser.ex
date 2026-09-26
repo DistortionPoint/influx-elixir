@@ -16,9 +16,11 @@ defmodule InfluxElixir.Query.ResponseParser do
     * JSON / JSONL numbers and booleans keep the types Jason decodes
     * CSV cells are typed from the Flux `#datatype` annotation row when the
       query requested one (`double`, `long`, `unsignedLong`, `boolean`,
-      `dateTime:RFC3339[Nano]`); without it every cell stays a string. A
-      newline inside a value is restored: InfluxDB 2's CSV writer sends it
-      as `\\r\\n`
+      `dateTime:RFC3339[Nano]`); without it (InfluxDB 3's `format: :csv`)
+      every cell stays a string. An empty cell is left out of the row, as a
+      null column is in JSON: CSV writes a null and an empty string alike.
+      A newline inside a value is restored: InfluxDB 2's CSV writer sends
+      it as `\\r\\n`
   """
 
   alias NimbleCSV.RFC4180, as: CSV
@@ -191,7 +193,7 @@ defmodule InfluxElixir.Query.ResponseParser do
   defp csv_row(columns, values) do
     columns
     |> Enum.zip(values)
-    |> Enum.reject(fn {{name, _type}, _value} -> name == "" end)
+    |> Enum.reject(fn {{name, _type}, value} -> name == "" or value == "" end)
     |> Map.new(fn {{name, type}, value} -> {name, cast(type, name, restore_newlines(value))} end)
   end
 
@@ -208,7 +210,6 @@ defmodule InfluxElixir.Query.ResponseParser do
   end
 
   @spec cast(binary() | nil, binary(), binary()) :: term()
-  defp cast(_type, _key, ""), do: nil
   defp cast("double", _key, value), do: parse_number(Float.parse(value), value)
   defp cast("long", _key, value), do: parse_number(Integer.parse(value), value)
   defp cast("unsignedLong", _key, value), do: parse_number(Integer.parse(value), value)

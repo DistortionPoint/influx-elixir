@@ -259,6 +259,10 @@ defmodule InfluxElixir.Client.Local do
   exactly as InfluxDB 3's JSON and JSONL responses do (`COUNT` is `0`, never
   null).
 
+  `format:` is answered as `Client.HTTP` answers it — `:csv` rows carry
+  the engine's CSV strings, `:parquet` is refused by name, an unknown
+  format is the engine's 400: see `InfluxElixir.Client.Local.Format`.
+
   Anything outside this subset is rejected with
   `{:error, %{status: 400, body: "Client.Local: ..."}}`. The `Client.Local:`
   prefix marks the rejection as a limitation of the test double rather than
@@ -295,6 +299,7 @@ defmodule InfluxElixir.Client.Local do
 
   alias InfluxElixir.Client.Local.{
     Flux,
+    Format,
     InfluxQL,
     LineProtocolParser,
     SQLExecutor,
@@ -906,7 +911,7 @@ defmodule InfluxElixir.Client.Local do
       # The engine answers query_sql and execute_sql from the same endpoint:
       # a statement that is not a query gets execute_sql's answer.
       if statement_kind(String.trim(sql)) == :query,
-        do: run_query(table, conn, sql, opts),
+        do: Format.answer(query_format(opts), fn -> run_query(table, conn, sql, opts) end),
         else: execute_sql(conn, sql, opts)
     end
   end
@@ -951,7 +956,7 @@ defmodule InfluxElixir.Client.Local do
   def query_sql_stream(conn, sql, opts \\ []) do
     case require_capability(conn, :query_sql_stream) do
       :ok ->
-        case query_sql(conn, sql, opts) do
+        case query_sql(conn, sql, Keyword.delete(opts, :format)) do
           {:ok, rows} -> Stream.map(rows, & &1)
           {:error, reason} -> InfluxElixir.StreamError.stream(stream_error_opts(reason))
         end
@@ -1095,9 +1100,15 @@ defmodule InfluxElixir.Client.Local do
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(%{table: table} = conn, influxql, opts \\ []) do
     with :ok <- require_capability(conn, :query_influxql) do
-      do_query_influxql(table, conn, String.trim(influxql), opts)
+      Format.answer(query_format(opts), fn ->
+        do_query_influxql(table, conn, String.trim(influxql), opts)
+      end)
     end
   end
+
+  # `format:` as `Client.HTTP` sends it; see `Client.Local.Format`.
+  @spec query_format(keyword()) :: term()
+  defp query_format(opts), do: Keyword.get(opts, :format, :json)
 
   @show_databases ~r/^(?i)SHOW\s+DATABASES\s*;?$/
   @show_measurements ~r/^(?i)SHOW\s+MEASUREMENTS\s*;?$/

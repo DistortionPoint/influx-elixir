@@ -28,6 +28,9 @@
 - `LIMIT n OFFSET m` pages through ordered rows on both clients (either order; `OFFSET` beyond the end is an empty result)
 - A bare word is a column reference on both clients; a column no row has, named in any clause, is the engine's schema error (HTTP 500), not an empty or unsorted result — quote string literals
 - Default response format is JSON; `:jsonl`, `:csv` and `:parquet` (raw binary) are also supported
+- `format: :csv` rows carry every value as the engine's CSV string (`"1.5"`, `"1e16"`, `"true"`; timestamps stay `DateTime`), an empty cell absent like a null; a nested value (`array_agg`, a bare `selector_*`) cannot be CSV and fails with `{:connection_error, %Mint.TransportError{reason: :closed}}` — both clients alike
+- `Client.Local` refuses `format: :parquet` by name (400 `Client.Local: ...`); an unknown format is the engine's 400 on both clients, and `:pretty` / `:json_lines` are `{:error, {:unsupported_format, f}}`
+- `query_sql_stream/3` always streams JSONL: `format:` is ignored
 
 ## Arrow Flight
 - Use `transport: :flight` on `InfluxElixir.query_sql/3` for high-throughput queries (HTTP client only)

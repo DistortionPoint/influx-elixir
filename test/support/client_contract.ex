@@ -88,6 +88,7 @@ defmodule InfluxElixir.ClientContract do
     null_semantics_tests = if v3_sql, do: null_semantics_tests(client), else: nil
     atomic_write_tests = if v3_sql, do: atomic_write_tests(client), else: nil
     db_admin_tests = if v3_sql, do: db_admin_tests(client), else: nil
+    format_tests = if v3_sql, do: format_tests(client), else: nil
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
     v2_write_rule_tests = if v2_ops, do: v2_write_rule_tests(client), else: nil
@@ -131,6 +132,7 @@ defmodule InfluxElixir.ClientContract do
         null_semantics_tests,
         atomic_write_tests,
         db_admin_tests,
+        format_tests,
         bucket_tests,
         v2_write_rule_tests,
         v2_precision_tests,
@@ -2655,6 +2657,109 @@ defmodule InfluxElixir.ClientContract do
                      accept_partial: false,
                      no_sync: true
                    )
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Query formats (v3_core, v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  defp format_tests(client) do
+    quote do
+      describe "query formats contract" do
+        setup ctx do
+          m = "contract_fmt_#{System.unique_integer([:positive])}"
+
+          {:ok, :written} =
+            unquote(client).write(
+              ctx.conn,
+              "#{m},host=a v=1.5,big=9007199254740993i,tiny=1.5e-7,huge=1e16,b=true,s=\"\" 1\n" <>
+                "#{m},host=b v=1e15 2",
+              database: ctx.database,
+              precision: :second
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+          {:ok, m: m}
+        end
+
+        test "format: :csv answers every value as the engine's CSV string", ctx do
+          assert {:ok, [first, second]} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT * FROM #{ctx.m} ORDER BY time",
+                     database: ctx.database,
+                     format: :csv
+                   )
+
+          assert first == %{
+                   "time" => ~U[1970-01-01 00:00:01.000000Z],
+                   "host" => "a",
+                   "v" => "1.5",
+                   "big" => "9007199254740993",
+                   "tiny" => "1.5e-7",
+                   "huge" => "1e16",
+                   "b" => "true"
+                 }
+
+          assert second == %{
+                   "time" => ~U[1970-01-01 00:00:02.000000Z],
+                   "host" => "b",
+                   "v" => "1000000000000000.0"
+                 }
+        end
+
+        test "query_influxql format: :csv answers strings too", ctx do
+          assert {:ok, [%{"iox::measurement" => m, "v" => "1.5", "b" => "true"}, second]} =
+                   unquote(client).query_influxql(ctx.conn, "SELECT v, b FROM #{ctx.m}",
+                     database: ctx.database,
+                     format: :csv
+                   )
+
+          assert m == ctx.m
+          refute Map.has_key?(second, "b")
+        end
+
+        test "a nested value cannot be written as CSV: the connection closes", ctx do
+          assert {:error, {:connection_error, %Mint.TransportError{reason: :closed}}} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT selector_last(v, time) AS s FROM #{ctx.m}",
+                     database: ctx.database,
+                     format: :csv
+                   )
+        end
+
+        test "an unknown format is the engine's 400", ctx do
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).query_sql(ctx.conn, "SELECT * FROM #{ctx.m}",
+                     database: ctx.database,
+                     format: :xml
+                   )
+
+          assert body =~ "unknown variant `xml`"
+        end
+
+        test "a format the client cannot parse is unsupported", ctx do
+          assert {:error, {:unsupported_format, :pretty}} =
+                   unquote(client).query_sql(ctx.conn, "SELECT * FROM #{ctx.m}",
+                     database: ctx.database,
+                     format: :pretty
+                   )
+        end
+
+        test "query_sql_stream answers typed rows whatever format: says", ctx do
+          rows =
+            ctx.conn
+            |> unquote(client).query_sql_stream("SELECT v FROM #{ctx.m} ORDER BY time",
+              database: ctx.database,
+              format: :csv
+            )
+            |> Enum.to_list()
+
+          assert rows == [%{"v" => 1.5}, %{"v" => 1.0e15}]
         end
       end
     end

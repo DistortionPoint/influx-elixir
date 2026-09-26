@@ -188,7 +188,7 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
       InfluxElixir.ClientContract.settle(ctx)
 
       for sql <- [
-            "SELECT selector_last(v, time) AS sl, array_agg(host) AS hosts FROM #{m}",
+            "SELECT selector_last(v, time) AS sl, array_agg(host ORDER BY host) AS hosts FROM #{m}",
             "SELECT time - LAG(time) OVER (ORDER BY time) AS gap FROM #{m} ORDER BY time",
             "SELECT concat(host, '-', s) AS hs, CAST(time AS DATE) AS d, CAST(v AS DECIMAL(10,2)) AS dec FROM #{m} ORDER BY time"
           ] do

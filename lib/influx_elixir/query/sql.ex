@@ -20,8 +20,12 @@ defmodule InfluxElixir.Query.SQL do
 
     * `:json` — default, returns parsed list of maps
     * `:jsonl` — newline-delimited JSON
-    * `:csv` — comma-separated values
-    * `:parquet` — Apache Parquet binary
+    * `:csv` — rows whose values are the engine's CSV strings (`"1.5"`,
+      `"1e16"`, `"true"`); timestamps are still `DateTime`s and an empty
+      cell is absent, as a null column is in JSON. A nested value
+      (`array_agg`, a `selector_*` struct) cannot be written as CSV: the
+      server closes the connection, `{:error, {:connection_error, _}}`
+    * `:parquet` — Apache Parquet binary (`Client.Local` refuses it by name)
 
   ## Transport
 

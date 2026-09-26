@@ -21,11 +21,11 @@ defmodule InfluxElixir.Client.LocalTest do
     Enum.map(rows, & &1["level"])
   end
 
-  # {line_number, error_message} pairs from a partial-write response body.
   defp v2_flux(measurement) do
     ~s'from(bucket: "metrics") |> range(start: 0) |> filter(fn: (r) => r._measurement == "#{measurement}")'
   end
 
+  # {line_number, error_message} pairs from a partial-write response body.
   defp partial_errors(body) do
     %{"error" => "partial write of line protocol occurred", "data" => data} = Jason.decode!(body)
     Enum.map(data, &{&1["line_number"], &1["error_message"]})
@@ -740,12 +740,18 @@ defmodule InfluxElixir.Client.LocalTest do
   # query_sql_stream/3
   # ---------------------------------------------------------------------------
 
-  describe "query_sql_stream/3" do
-    test "returns an enumerable", %{conn: conn} do
-      stream = Local.query_sql_stream(conn, "SELECT * FROM cpu")
-      assert Enumerable.impl_for(stream)
-    end
+  describe "query formats" do
+    test "format: :parquet is refused by name, over SQL and InfluxQL", %{conn: conn} do
+      Local.write(conn, "m v=1i", database: "test_db")
 
+      for query <- [&Local.query_sql/3, &Local.query_influxql/3] do
+        assert {:error, %{status: 400, body: "Client.Local: format: :parquet" <> _rest}} =
+                 query.(conn, "SELECT v FROM m", database: "test_db", format: :parquet)
+      end
+    end
+  end
+
+  describe "query_sql_stream/3" do
     test "stream yields same rows as query_sql", %{conn: conn} do
       :ok = Local.create_database(conn, "sdb")
       Local.write(conn, "m value=1i\nm value=2i", database: "sdb")

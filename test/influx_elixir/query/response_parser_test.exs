@@ -118,14 +118,43 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       assert {:ok, [%{"ratio" => "abc", "count" => "1.5"}]} = ResponseParser.parse(body, :csv)
     end
 
-    test "types long, unsignedLong and boolean columns and maps empty cells to nil" do
+    test "types long, unsignedLong and boolean columns" do
       body =
-        "#datatype,string,long,unsignedLong,boolean,double\n" <>
-          ",result,count,ucount,flag,ratio\n" <>
-          ",_result,3,7,true,\n"
+        "#datatype,string,long,unsignedLong,boolean\n" <>
+          ",result,count,ucount,flag\n" <>
+          ",_result,3,7,true\n"
 
-      assert {:ok, [%{"count" => 3, "ucount" => 7, "flag" => true, "ratio" => nil}]} =
+      assert {:ok, [%{"count" => 3, "ucount" => 7, "flag" => true}]} =
                ResponseParser.parse(body, :csv)
+    end
+
+    test "an empty Flux cell is absent from the row, as a null column is in JSON" do
+      # A v2 pivot leaves a field the row lacks empty; an empty string
+      # field is an empty cell too (verified).
+      body =
+        "#datatype,string,long,string,double,double\r\n" <>
+          ",result,table,s,x,y\r\n" <>
+          ",_result,0,,1,\r\n"
+
+      assert {:ok, [row]} = ResponseParser.parse(body, :csv)
+      assert row == %{"result" => "_result", "table" => 0, "x" => 1.0}
+    end
+
+    test "InfluxDB 3's CSV has no annotations: values are strings, empty cells absent" do
+      # `format: "csv"` from InfluxDB 3 Core, verbatim.
+      body =
+        "iox::measurement,time,v,b\nm,2023-11-14T22:13:20,1.5,true\nm,2023-11-14T22:14:20,0.0,\n"
+
+      assert {:ok, [first, second]} = ResponseParser.parse(body, :csv)
+
+      assert first == %{
+               "iox::measurement" => "m",
+               "time" => ~U[2023-11-14 22:13:20.000000Z],
+               "v" => "1.5",
+               "b" => "true"
+             }
+
+      refute Map.has_key?(second, "b")
     end
   end
 

@@ -861,6 +861,10 @@ nothing is stored; `time` as a field is dropped silently, as a tag it is a
   `ORDER BY`) with optional `GROUP BY DATE_BIN` or `GROUP BY <columns>`.
   Anything else is rejected with a `Client.Local:` prefixed 400 — see
   `InfluxElixir.Client.Local.SQLParser` and `check_sql/1` above.
+- **`format: :parquet`**: refused with a `Client.Local:` 400 — the double
+  holds no Parquet writer. `format: :csv` is modelled: values come back as
+  the engine's CSV strings (`"1.5"`, `"1e16"`, `"true"`), empty cells
+  absent, and a nested value fails as the server's aborted response does.
 - **Division by zero**: null in the double. InfluxDB returns IEEE infinity
   for a float divided by zero (serialised as JSON `null`, but counted by
   `COUNT`) and fails the query for an integer divided by zero.

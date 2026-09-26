@@ -27,6 +27,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1,583 → 1,430 lines) holds no `:ets` call. Behaviour is unchanged.
 
 ### Fixed
+- **`Client.Local` ignored `format:`.** Over HTTP, `format: :csv` returns
+  every value as a string (`"1.5"`, `"true"`), but the double returned
+  typed values. A test of CSV handling could pass against the double and
+  fail in production. The double also returned rows for `:parquet`
+  instead of a binary, and rows for an unknown format where the engine
+  answers 400. The new `Client.Local.Format` answers as `Client.HTTP`
+  does, verified against InfluxDB 3 Core:
+  - Floats render as the engine's CSV does: `1e15` is
+    `"1000000000000000.0"`, `1e16` is `"1e16"`, `1.5e-5` is
+    `"0.000015"` and `1e-6` is `"1e-6"`. Integers and booleans render
+    as the engine's strings too.
+  - A nested value gives the same connection error as the server's
+    aborted body.
+  - `:parquet` is refused by name.
+  - `:xml` is the engine's 400.
+  - `:pretty` and `:json_lines` are `{:unsupported_format, f}`.
+
+  The same applies to `query_influxql/3`. `query_sql_stream/3` ignores
+  `format:` on both clients.
+- **An empty CSV cell was a `nil` key.** A null column is absent from a
+  JSON row, but `ResponseParser` put an empty CSV cell into the row as
+  `nil`. An empty cell is either a null or an empty string; CSV cannot
+  tell them apart (verified on InfluxDB 3's CSV and on a v2 Flux
+  `pivot`). Empty cells are now left out, so `refute Map.has_key?/2`
+  holds for every format.
 - **Flux (HTTP) returned a newline inside a string as `\r\n`.** InfluxDB
   2's CSV writer (Go's `csv.Writer` in CRLF mode) rewrites every `\n` in a
   quoted value as `\r\n` and drops a bare `\r` (verified), so a stored
