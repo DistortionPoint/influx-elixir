@@ -16,7 +16,9 @@ defmodule InfluxElixir.Query.ResponseParser do
     * JSON / JSONL numbers and booleans keep the types Jason decodes
     * CSV cells are typed from the Flux `#datatype` annotation row when the
       query requested one (`double`, `long`, `unsignedLong`, `boolean`,
-      `dateTime:RFC3339[Nano]`); without it every cell stays a string
+      `dateTime:RFC3339[Nano]`); without it every cell stays a string. A
+      newline inside a value is restored: InfluxDB 2's CSV writer sends it
+      as `\\r\\n`
   """
 
   alias NimbleCSV.RFC4180, as: CSV
@@ -190,7 +192,19 @@ defmodule InfluxElixir.Query.ResponseParser do
     columns
     |> Enum.zip(values)
     |> Enum.reject(fn {{name, _type}, _value} -> name == "" end)
-    |> Map.new(fn {{name, type}, value} -> {name, cast(type, name, value)} end)
+    |> Map.new(fn {{name, type}, value} -> {name, cast(type, name, restore_newlines(value))} end)
+  end
+
+  # InfluxDB 2 writes its CSV with Go's csv.Writer in CRLF mode, which
+  # turns every "\n" inside a quoted value into "\r\n" (and drops a bare
+  # "\r"; verified). Undoing it gives back the stored string — `s="l1\nl2"`
+  # reads as "l1\nl2", as Client.Local returns it — for any value that had
+  # no "\r" of its own; those the server has already altered.
+  @spec restore_newlines(binary()) :: binary()
+  defp restore_newlines(value) do
+    if :binary.match(value, "\r\n") == :nomatch,
+      do: value,
+      else: String.replace(value, "\r\n", "\n")
   end
 
   @spec cast(binary() | nil, binary(), binary()) :: term()

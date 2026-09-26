@@ -93,6 +93,14 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       refute Map.has_key?(value_row, "")
     end
 
+    test "a newline inside a quoted value comes back as the \\n it was stored as" do
+      # InfluxDB 2's CSV writer turns "\n" in a value into "\r\n" (verified:
+      # the stored `s="l1\nl2"` arrives as "l1\r\nl2" on the wire).
+      body = "#datatype,string,long,string\r\n,result,table,s\r\n,_result,0,\"l1\r\nl2\"\r\n\r\n"
+
+      assert {:ok, [%{"s" => "l1\nl2", "table" => 0}]} = ResponseParser.parse(body, :csv)
+    end
+
     test "other annotations without #datatype leave cells as strings" do
       body = "#group,false,false\n,result,value\n,_result,42.5\n"
 

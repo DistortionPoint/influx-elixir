@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1,583 → 1,430 lines) holds no `:ets` call. Behaviour is unchanged.
 
 ### Fixed
+- **Flux (HTTP) returned a newline inside a string as `\r\n`.** InfluxDB
+  2's CSV writer (Go's `csv.Writer` in CRLF mode) rewrites every `\n` in a
+  quoted value as `\r\n` and drops a bare `\r` (verified), so a stored
+  `s="l1\nl2"` read back as `"l1\r\nl2"` over `Client.HTTP` while
+  `Client.Local` returned `"l1\nl2"`. `ResponseParser` undoes the rewrite;
+  both clients now return the value as stored (unless it contained a `\r`
+  of its own, which the server has already dropped).
 - **`transport: :flight` silently dropped every column of a type the
   reader did not know.** Verified on InfluxDB 3: `selector_*` without a
   subscript (a Struct), `array_agg` (a List), `time - LAG(time)` (a

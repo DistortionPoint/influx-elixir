@@ -2424,6 +2424,25 @@ defmodule InfluxElixir.ClientContract do
           assert Jason.decode!(body)["message"] ==
                    "unsupported input type for mean aggregate: string"
         end
+
+        test "a string field with a newline reads back as stored", ctx do
+          m = "contract_v2nl_#{System.unique_integer([:positive])}"
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, ~s|#{m} s="l1\nl2" 1700000000000000000|,
+              database: ctx.database
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          {:ok, [row]} =
+            unquote(client).query_flux(
+              ctx.conn,
+              ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 1800000000) \|> filter(fn: (r) => r._measurement == "#{m}")|
+            )
+
+          assert row["_value"] == "l1\nl2"
+        end
       end
     end
   end
