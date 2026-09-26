@@ -665,7 +665,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           :first | :last | :min | :max,
           binary(),
           binary(),
-          :value | :time,
+          :value | :time | :struct,
           [point()]
         ) :: term() | nil
   defp compute_selector(kind, field, ordering, access, points) do
@@ -681,9 +681,21 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
       end
 
     case {picked, access} do
-      {nil, _access} -> nil
-      {point, :value} -> Map.get(point.fields, field)
-      {point, :time} -> nanoseconds_to_datetime(point.timestamp)
+      {nil, _access} ->
+        nil
+
+      {point, :value} ->
+        Map.get(point.fields, field)
+
+      {point, :time} ->
+        nanoseconds_to_datetime(point.timestamp)
+
+      # The engine's struct (verified): `%{"time" => ..., "value" => ...}`.
+      {point, :struct} ->
+        %{
+          "time" => nanoseconds_to_datetime(point.timestamp),
+          "value" => Map.get(point.fields, field)
+        }
     end
   end
 

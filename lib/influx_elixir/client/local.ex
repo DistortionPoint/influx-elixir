@@ -229,7 +229,8 @@ defmodule InfluxElixir.Client.Local do
       work (a `DateTime` result); every other aggregate over `time`, and
       any arithmetic on it, is rejected as DataFusion rejects it.
     * Selector functions: `selector_first|last|min|max(field, time)['value']`
-      and `['time']`
+      and `['time']`; without a subscript, the engine's struct
+      `%{"time" => %DateTime{}, "value" => v}`
     * Ordered aggregates: `first_value(field ORDER BY col [ASC|DESC])` and
       `last_value(field ORDER BY col [ASC|DESC])` — the InfluxDB v3 SQL
       (DataFusion) spelling. The `ORDER BY` is required: without it the real

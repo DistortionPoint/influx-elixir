@@ -176,6 +176,35 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
       assert Enum.sort(Map.keys(sparse)) == ["c", "host", "time", "v"]
     end
 
+    test "structs, lists, durations and Utf8View strings are the same over Flight", ctx do
+      m = "flight_types_#{System.unique_integer([:positive])}"
+
+      lp = """
+      #{m},host=a v=1.5,s="x" 1700000000000000000
+      #{m},host=b v=2.5 1700000060000000000
+      """
+
+      {:ok, :written} = HTTP.write(ctx.conn, String.trim(lp), database: ctx.database)
+      InfluxElixir.ClientContract.settle(ctx)
+
+      for sql <- [
+            "SELECT selector_last(v, time) AS sl, array_agg(host) AS hosts FROM #{m}",
+            "SELECT time - LAG(time) OVER (ORDER BY time) AS gap FROM #{m} ORDER BY time",
+            "SELECT concat(host, '-', s) AS hs, CAST(time AS DATE) AS d, CAST(v AS DECIMAL(10,2)) AS dec FROM #{m} ORDER BY time"
+          ] do
+        assert {:ok, http_rows} = HTTP.query_sql(ctx.conn, sql, database: ctx.database)
+
+        assert {:ok, ^http_rows} =
+                 HTTP.query_sql(ctx.conn, sql,
+                   database: ctx.database,
+                   transport: :flight,
+                   flight_port: ctx.conn[:port],
+                   tls: false
+                 ),
+               sql
+      end
+    end
+
     test "rejects params over Flight instead of dropping them", ctx do
       assert {:error, :params_unsupported_over_flight} =
                HTTP.query_sql(ctx.conn, "SELECT 1",

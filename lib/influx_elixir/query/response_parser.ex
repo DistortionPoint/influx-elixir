@@ -103,6 +103,15 @@ defmodule InfluxElixir.Query.ResponseParser do
   end
 
   defp coerce_value(_key, value) when is_binary(value), do: coerce_naive(value)
+
+  # Structs (`selector_last(v, time)` is `%{"time" => ..., "value" => ...}`)
+  # and lists (`array_agg(time)`) are coerced inside too, so a timestamp is
+  # a DateTime at any depth — as it is when the Flight transport decodes
+  # the same values.
+  defp coerce_value(_key, value) when is_map(value) and not is_struct(value),
+    do: coerce_types(value)
+
+  defp coerce_value(key, value) when is_list(value), do: Enum.map(value, &coerce_value(key, &1))
   defp coerce_value(_key, value), do: value
 
   # Only a string shaped `dddd-dd-ddT...` is worth the regex; every other

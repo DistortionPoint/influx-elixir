@@ -2584,6 +2584,16 @@ defmodule InfluxElixir.ClientContract do
                      database: ctx.database
                    )
         end
+
+        test "a selector without a subscript is the time/value struct", ctx do
+          q = fn sql ->
+            {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
+            rows
+          end
+
+          assert [%{"sl" => %{"time" => %DateTime{}, "value" => -3.25}}] =
+                   q.("SELECT selector_last(v, time) AS sl FROM #{ctx.m}")
+        end
       end
     end
   end

@@ -45,8 +45,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           | {:count_star, binary()}
           | {:count_distinct, binary(), binary()}
           | {:ordered_aggregate, :first | :last, binary(), binary(), binary()}
-          | {:selector, :first | :last | :min | :max, binary(), binary(), :value | :time,
-             binary()}
+          | {:selector, :first | :last | :min | :max, binary(), binary(),
+             :value | :time | :struct, binary()}
           | {:grouping_column, binary(), binary()}
           | {:constant, term(), binary()}
 
@@ -135,8 +135,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     "median" => :median
   }
 
-  # selector_first|last|min|max(field, time)['value'|'time'] AS alias
-  @selector_pattern ~r/(?i)^\s*SELECTOR_(FIRST|LAST|MIN|MAX)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*\[\s*'(value|time)'\s*\]\s+AS\s+(\w+)\s*$/
+  # selector_first|last|min|max(field, time)[['value'|'time']] AS alias
+  @selector_pattern ~r/(?i)^\s*SELECTOR_(FIRST|LAST|MIN|MAX)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*(?:\[\s*'(value|time)'\s*\])?\s+AS\s+(\w+)\s*$/
 
   # InfluxQL selector functions that InfluxDB v3 SQL does not provide. They are
   # routed into the aggregate parser only so the rejection can name the fix.
@@ -873,7 +873,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp references_time?({:cast, inner, _type}), do: references_time?(inner)
   defp references_time?(_leaf), do: false
 
-  # Parse: selector_first|last|min|max(field, time)['value' | 'time'] AS alias.
+  # Parse: selector_first|last|min|max(field, time)[['value' | 'time']] AS alias.
   # selector_first/last pick the row with the smallest/largest second
   # argument; selector_min/max pick the row with the smallest/largest field.
   @spec parse_selector_column(binary()) :: {:ok, select_column()} | {:error, term()}
@@ -881,13 +881,15 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     case Regex.run(@selector_pattern, col) do
       [_full, kind, field, ordering, access, alias_name] ->
         selector = String.to_existing_atom(String.downcase(kind))
-        {:ok, {:selector, selector, field, ordering, String.to_existing_atom(access), alias_name}}
+        # Without a subscript the engine returns the whole struct.
+        access = if access == "", do: :struct, else: String.to_existing_atom(access)
+        {:ok, {:selector, selector, field, ordering, access, alias_name}}
 
       _no_match ->
         {:error,
          local_error(
            "selector functions are supported as " <>
-             "selector_first|last|min|max(field, time)['value' | 'time'] AS alias: #{col}"
+             "selector_first|last|min|max(field, time)[['value' | 'time']] AS alias: #{col}"
          )}
     end
   end

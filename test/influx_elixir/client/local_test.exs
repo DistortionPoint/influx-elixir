@@ -3656,9 +3656,16 @@ defmodule InfluxElixir.Client.LocalTest do
       refute Map.has_key?(row, "v")
     end
 
-    test "a selector without the ['value'|'time'] accessor is rejected", %{conn: conn, db: db} do
-      assert {:error, %{status: 400, body: "Client.Local: selector functions" <> _reason}} =
+    test "a selector without an accessor is the engine's time/value struct", %{conn: conn, db: db} do
+      assert {:ok, [%{"v" => %{"time" => %DateTime{} = time, "value" => 5.0}}]} =
                Local.query_sql(conn, ~s|SELECT selector_last(value, time) AS v FROM "m"|,
+                 database: db
+               )
+
+      assert {:ok, [%{"t" => ^time, "x" => 5.0}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|SELECT selector_last(value, time)['time'] AS t, selector_last(value, time)['value'] AS x FROM "m"|,
                  database: db
                )
     end

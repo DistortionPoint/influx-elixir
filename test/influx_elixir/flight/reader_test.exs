@@ -1264,17 +1264,14 @@ defmodule InfluxElixir.Flight.ReaderTest do
   # ---------------------------------------------------------------------------
 
   describe "decode_flight_data/1 — unknown type columns" do
-    test "unknown type_type produces nil values" do
-      # type_type 99 is not recognized — should produce type_id 0
+    test "a type the reader does not decode is refused by name, not dropped" do
+      # Dropping it silently made a column vanish from Flight rows while
+      # the same query over HTTP had it.
       schema = schema_fd([{"mystery", 99, []}])
-      # Provide some dummy data; unknown type decodes to nils
-      dummy_data = :binary.copy(<<0>>, 16)
-      specs = [{0, 0}, {0, 16}]
-      batch = batch_fd(dummy_data, specs, 2)
+      batch = batch_fd(:binary.copy(<<0>>, 16), [{0, 0}, {0, 16}], 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) == 2
-      assert Enum.all?(rows, fn r -> r["mystery"] == nil end)
+      assert {:error, {:unsupported_arrow_type, "type 99", "mystery"}} =
+               Reader.decode_flight_data([schema, batch])
     end
   end
 

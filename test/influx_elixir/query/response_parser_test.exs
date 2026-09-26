@@ -182,6 +182,20 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       assert ResponseParser.coerce_types(row) == row
     end
 
+    test "timestamps inside structs and lists are coerced too" do
+      row = %{
+        "sl" => %{"time" => "2023-11-14T22:15:20", "value" => 10.0},
+        "ts" => ["2023-11-14T22:13:20", "2023-11-14T22:14:20.5"],
+        "at" => ~U[2023-11-14 22:13:20.000000Z]
+      }
+
+      assert %{
+               "sl" => %{"time" => ~U[2023-11-14 22:15:20.000000Z], "value" => 10.0},
+               "ts" => [~U[2023-11-14 22:13:20.000000Z], ~U[2023-11-14 22:14:20.500000Z]],
+               "at" => ~U[2023-11-14 22:13:20.000000Z]
+             } = ResponseParser.coerce_types(row)
+    end
+
     test "decodes InfluxDB 3's zone-less timestamp under any column name" do
       # Captured from InfluxDB 3 Core for
       #   DATE_BIN(...) AS bucket, selector_min(value, time)['time'] AS low_at

@@ -19,7 +19,9 @@ defmodule InfluxElixir.Write.BatchWriter do
       (default: `3`). 4xx responses are never retried.
     * `:base_retry_delay_ms` - base for exponential retry backoff. Delay
       for attempt N is roughly `base * 2^N`. Default: `100`.
-    * `:no_sync` - when `true`, `write_sync/3` behaves like `write/3` (default: `false`)
+    * `:no_sync` - when `true`, `write_sync/3` behaves like `write/3` (default: `false`).
+      Not InfluxDB 3's `no_sync` write parameter: pass that, like
+      `accept_partial: false`, in `:write_opts`.
     * `:write_opts` - keyword list forwarded to `InfluxElixir.Write.Writer.write/3`
       on every flush. Useful for setting `:database`, `:timeout`, `:precision`
       per BatchWriter without baking them into the connection. Default: `[]`.

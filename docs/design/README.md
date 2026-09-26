@@ -52,6 +52,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-25 | [`execute-sql-and-weak-contracts`](2026-09-25_execute-sql-and-weak-contracts.md) | Local `execute_sql` answers DML/DDL as the engine refuses them (it returned `rows_affected: 0`); HTTP `execute_sql` rows typed; contract tests assert exact errors |
 | 2026-09-25 | [`local-store-module`](2026-09-25_local-store-module.md) | ETS layout moved into `Client.Local.Store` (40 raw `:ets` call sites); one clock for untimed points and SQL/Flux `now()` |
 | 2026-09-25 | [`atomic-writes-and-no-sync`](2026-09-25_atomic-writes-and-no-sync.md) | `write/3` takes `accept_partial:` / `no_sync:` (v3); Local models all-or-nothing writes; schema errors render the line as the engine does; repeated spaces accepted |
+| 2026-09-26 | [`flight-arrow-types`](2026-09-26_flight-arrow-types.md) | Flight decodes structs, lists, durations, Utf8View, dates, decimals, binary as HTTP returns them (they were silently dropped); nested timestamps coerced on HTTP; Local's bare selector struct |
 
 ## Verifying against a real engine
 

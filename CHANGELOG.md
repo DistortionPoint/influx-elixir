@@ -27,6 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1,583 → 1,430 lines) holds no `:ets` call. Behaviour is unchanged.
 
 ### Fixed
+- **`transport: :flight` silently dropped every column of a type the
+  reader did not know.** Verified on InfluxDB 3: `selector_*` without a
+  subscript (a Struct), `array_agg` (a List), `time - LAG(time)` (a
+  Duration), `concat`/`upper` results (Utf8View), `CAST(... AS DATE)`,
+  `DECIMAL` and `BYTEA`, and literal lists and structs all came back as
+  empty rows over Flight while HTTP returned them. The reader now walks
+  Arrow's field nodes, buffers and variadic buffer counts depth-first and
+  decodes each of these to exactly what HTTP returns; types it still does
+  not decode (Interval, Time, Map, Union, ...) are an error naming the
+  type and column instead of a vanished column. Tested against 13
+  recorded engine responses in `test/fixtures/flight` and live.
+- **Timestamps inside structs and lists were strings over HTTP.**
+  `ResponseParser` now coerces nested values, so
+  `selector_last(v, time)` is `%{"time" => %DateTime{}, "value" => v}` on
+  HTTP, Flight and `Client.Local`, which now also accepts a selector
+  without `['value' | 'time']` and returns that struct, as the engine does.
 - **`Client.Local` refused a line with repeated spaces between its
   sections** (`m    v=1i   1`) as "No fields were provided"; InfluxDB 3
   accepts it (verified), and so does the double now.

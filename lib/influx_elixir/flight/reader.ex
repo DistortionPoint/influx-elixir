@@ -20,15 +20,27 @@ defmodule InfluxElixir.Flight.Reader do
 
   ## Supported Column Types
 
-  | Arrow Type | Elixir type    |
-  |------------|----------------|
-  | Int8-64    | `integer()`    |
-  | UInt8-64   | `integer()`    |
-  | Float32/64 | `float()`      |
-  | Bool       | `boolean()`    |
-  | Utf8       | `binary()`     |
-  | Timestamp  | `DateTime.t()` (converted with the column's unit; nanoseconds
-    are truncated to microseconds, as on the HTTP transport) |
+  Every type decodes to the value the HTTP transport returns for it, so a
+  row is the same map on both (verified against InfluxDB 3, and recorded in
+  `test/fixtures/flight`):
+
+  | Arrow Type | Elixir value |
+  |------------|--------------|
+  | Int8-64, UInt8-64 | `integer()` |
+  | Float16/32/64 | `float()` |
+  | Bool | `boolean()` |
+  | Utf8, LargeUtf8, Utf8View (string functions return it) | `binary()` |
+  | Binary, LargeBinary, BinaryView | lowercase hex, as HTTP renders it |
+  | Timestamp | `DateTime.t()` (microsecond precision, as on HTTP) |
+  | Date32/64 | `"YYYY-MM-DD"` |
+  | Duration | `"PT60S"`, `"PT0.5S"`, `"-PT0.000000001S"`, `"P0D"` |
+  | Decimal128/256 | a number (integer at scale 0, else float) |
+  | Struct (`selector_*` without a subscript) | a map of its members |
+  | List, LargeList, FixedSizeList (`array_agg`) | a list |
+  | Null | `nil` |
+
+  Nested types are read with the batch's field nodes and, for view types,
+  its variadic buffer counts, in Arrow's depth-first layout.
 
   Null bitmaps are supported. A null cell is left out of the row map, the
   same as a null column in InfluxDB 3's JSON, so a row is identical over
@@ -36,8 +48,11 @@ defmodule InfluxElixir.Flight.Reader do
 
   ## Limitations
 
-  - Dictionary-encoded columns are not yet decoded.
-  - Nested / list / struct types are not supported.
+  Interval, Time, Map, Union, FixedSizeBinary, run-end encoded and
+  list-view columns, dictionary-encoded fields and compressed IPC bodies
+  are refused with `{:error, {:unsupported_arrow_type, type, column}}`
+  rather than dropped. (InfluxDB 3 sends tag columns hydrated, so their
+  `Dictionary(Int32, Utf8)` type does not reach the reader.)
   """
 
   import Bitwise
@@ -54,6 +69,32 @@ defmodule InfluxElixir.Flight.Reader do
   @fb_type_utf8 5
   @fb_type_bool 6
   @fb_type_timestamp 10
+
+  @fb_type_null 1
+  @fb_type_binary 4
+  @fb_type_decimal 7
+  @fb_type_date 8
+  @fb_type_list 12
+  @fb_type_struct 13
+  @fb_type_fixed_size_list 16
+  @fb_type_duration 18
+  @fb_type_large_binary 19
+  @fb_type_large_utf8 20
+  @fb_type_large_list 21
+  @fb_type_binary_view 23
+  @fb_type_utf8_view 24
+
+  # Names for the types refused by name.
+  @fb_type_names %{
+    9 => "Time",
+    11 => "Interval",
+    14 => "Union",
+    15 => "FixedSizeBinary",
+    17 => "Map",
+    22 => "RunEndEncoded",
+    25 => "ListView",
+    26 => "LargeListView"
+  }
 
   # Arrow FlatBuffer MessageHeader union discriminator values
   @msg_header_schema 1
@@ -93,11 +134,32 @@ defmodule InfluxElixir.Flight.Reader do
   # Arrow TimeUnit enum (Timestamp table slot 0)
   @time_units %{0 => :second, 1 => :millisecond, 2 => :microsecond, 3 => :nanosecond}
 
+  @typedoc "How a column decodes (see \"Supported Column Types\")."
+  @type kind ::
+          :primitive
+          | :null
+          | :binary
+          | :large_binary
+          | :large_utf8
+          | :binary_view
+          | :utf8_view
+          | :float16
+          | :struct
+          | :list
+          | :large_list
+          | {:fixed_size_list, integer()}
+          | {:duration, System.time_unit()}
+          | {:date, :day | :millisecond}
+          | {:decimal, integer(), integer()}
+          | {:unsupported, binary()}
+
   @typedoc "Parsed column schema entry (`unit` is set for Timestamp columns)"
   @type column_schema :: %{
           name: binary(),
           type_id: non_neg_integer(),
-          unit: System.time_unit() | nil
+          unit: System.time_unit() | nil,
+          kind: kind(),
+          children: [column_schema()]
         }
 
   @doc """
@@ -236,7 +298,91 @@ defmodule InfluxElixir.Flight.Reader do
       end
 
     type_id = resolve_type_id(fb, type_type, type_table_pos)
-    %{name: name, type_id: type_id, unit: timestamp_unit(fb, type_type, type_table_pos)}
+
+    # Field slot 4: dictionary encoding; slot 5: children (nested types).
+    dictionary? = FB.field_pos(fb, field_pos, vt_pos, vt_size, 4) != nil
+
+    children =
+      case FB.field_pos(fb, field_pos, vt_pos, vt_size, 5) do
+        nil ->
+          []
+
+        pos ->
+          {start, count} = FB.read_vector_header(fb, pos)
+
+          for i <- 0..(count - 1)//1,
+              do: parse_field_table(fb, FB.read_vector_table(fb, start, i))
+      end
+
+    kind =
+      if dictionary?,
+        do: {:unsupported, "Dictionary"},
+        else: field_kind(fb, type_type, type_table_pos, type_id)
+
+    %{
+      name: name,
+      type_id: type_id,
+      unit: timestamp_unit(fb, type_type, type_table_pos),
+      kind: kind,
+      children: children
+    }
+  end
+
+  # How a column decodes. The flat types the reader has always handled are
+  # `:primitive` (decoded by `type_id`); the rest are what InfluxDB 3
+  # returns for functions, casts and aggregates (verified), and anything
+  # else is refused by name rather than dropped.
+  @spec field_kind(binary(), non_neg_integer(), non_neg_integer() | nil, non_neg_integer()) ::
+          term()
+  defp field_kind(_fb, _type_type, _pos, type_id) when type_id != 0, do: :primitive
+  defp field_kind(_fb, @fb_type_null, _pos, _type_id), do: :null
+  defp field_kind(_fb, @fb_type_binary, _pos, _type_id), do: :binary
+  defp field_kind(_fb, @fb_type_large_binary, _pos, _type_id), do: :large_binary
+  defp field_kind(_fb, @fb_type_large_utf8, _pos, _type_id), do: :large_utf8
+  defp field_kind(_fb, @fb_type_binary_view, _pos, _type_id), do: :binary_view
+  defp field_kind(_fb, @fb_type_utf8_view, _pos, _type_id), do: :utf8_view
+  defp field_kind(_fb, @fb_type_struct, _pos, _type_id), do: :struct
+  defp field_kind(_fb, @fb_type_list, _pos, _type_id), do: :list
+  defp field_kind(_fb, @fb_type_large_list, _pos, _type_id), do: :large_list
+
+  defp field_kind(fb, @fb_type_fixed_size_list, pos, _type_id),
+    do: {:fixed_size_list, type_slot(fb, pos, 0, :int32, 0)}
+
+  defp field_kind(fb, @fb_type_duration, pos, _type_id),
+    do: {:duration, Map.get(@time_units, type_slot(fb, pos, 0, :int16, 1), :millisecond)}
+
+  defp field_kind(fb, @fb_type_date, pos, _type_id),
+    do: {:date, if(type_slot(fb, pos, 0, :int16, 1) == 0, do: :day, else: :millisecond)}
+
+  defp field_kind(fb, @fb_type_decimal, pos, _type_id),
+    do: {:decimal, type_slot(fb, pos, 1, :int32, 0), div(type_slot(fb, pos, 2, :int32, 128), 8)}
+
+  defp field_kind(fb, @fb_type_floating_point, pos, _type_id) do
+    if type_slot(fb, pos, 0, :int16, 2) == 0, do: :float16, else: {:unsupported, "FloatingPoint"}
+  end
+
+  defp field_kind(_fb, type_type, _pos, _type_id),
+    do: {:unsupported, Map.get(@fb_type_names, type_type, "type #{type_type}")}
+
+  # A scalar slot of a type table, or its default when absent.
+  @spec type_slot(
+          binary(),
+          non_neg_integer() | nil,
+          non_neg_integer(),
+          :int16 | :int32,
+          integer()
+        ) ::
+          integer()
+  defp type_slot(_fb, nil, _slot, _kind, default), do: default
+
+  defp type_slot(fb, type_pos, slot, kind, default) do
+    {vt_pos, vt_size} = FB.read_vtable(fb, type_pos)
+
+    case FB.field_pos(fb, type_pos, vt_pos, vt_size, slot) do
+      nil -> default
+      pos when kind == :int16 -> FB.read_int16(fb, pos)
+      pos -> FB.read_int32(fb, pos)
+    end
   end
 
   # Timestamp slot 0: unit (int16 TimeUnit enum). Absent means SECOND per
@@ -340,27 +486,38 @@ defmodule InfluxElixir.Flight.Reader do
          %FlightData{data_header: header, data_body: body},
          columns
        ) do
-    with {:ok, row_count, buffer_specs} <-
+    with {:ok, row_count, buffer_specs, meta} <-
            parse_record_batch_header(header),
+         :ok <- check_uncompressed(meta),
          {:ok, col_vectors} <-
-           decode_columns(columns, buffer_specs, body, row_count) do
+           decode_columns(columns, buffer_specs, body, row_count, meta) do
       {:ok, zip_columns(columns, col_vectors, row_count)}
     end
   rescue
     e -> {:error, {:decode_error, Exception.message(e)}}
+  catch
+    {:unsupported_arrow_type, type, column} -> {:error, {:unsupported_arrow_type, type, column}}
   end
 
+  @spec check_uncompressed(map()) :: :ok | {:error, term()}
+  defp check_uncompressed(%{compressed: true}),
+    do: {:error, {:unsupported_arrow_type, "compressed IPC body", nil}}
+
+  defp check_uncompressed(_meta), do: :ok
+
+  @empty_meta %{nodes: [], variadic: [], compressed: false}
+
   @spec parse_record_batch_header(binary() | nil) ::
-          {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}]}
+          {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}], map()}
           | {:error, term()}
-  defp parse_record_batch_header(nil), do: {:ok, 0, []}
-  defp parse_record_batch_header(<<>>), do: {:ok, 0, []}
+  defp parse_record_batch_header(nil), do: {:ok, 0, [], @empty_meta}
+  defp parse_record_batch_header(<<>>), do: {:ok, 0, [], @empty_meta}
 
   defp parse_record_batch_header(header) do
     fb = strip_continuation(header)
 
     if byte_size(fb) < 8 do
-      {:ok, 0, []}
+      {:ok, 0, [], @empty_meta}
     else
       parse_message_record_batch(fb)
     end
@@ -369,7 +526,7 @@ defmodule InfluxElixir.Flight.Reader do
   end
 
   @spec parse_message_record_batch(binary()) ::
-          {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}]}
+          {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}], map()}
           | {:error, term()}
   defp parse_message_record_batch(fb) do
     msg_pos = FB.root_table_pos(fb)
@@ -385,19 +542,19 @@ defmodule InfluxElixir.Flight.Reader do
     if header_type == @msg_header_record_batch do
       case FB.field_pos(fb, msg_pos, vt_pos, vt_size, 2) do
         nil ->
-          {:ok, 0, []}
+          {:ok, 0, [], @empty_meta}
 
         header_offset_pos ->
           rb_pos = FB.read_offset(fb, header_offset_pos)
           parse_record_batch_table(fb, rb_pos)
       end
     else
-      {:ok, 0, []}
+      {:ok, 0, [], @empty_meta}
     end
   end
 
   @spec parse_record_batch_table(binary(), non_neg_integer()) ::
-          {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}]}
+          {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}], map()}
   defp parse_record_batch_table(fb, rb_pos) do
     {vt_pos, vt_size} = FB.read_vtable(fb, rb_pos)
 
@@ -426,7 +583,33 @@ defmodule InfluxElixir.Flight.Reader do
           end
       end
 
-    {:ok, row_count, buffer_specs}
+    # RecordBatch slot 1: nodes (FieldNode structs: length, null_count —
+    # 16 bytes each), one per field depth-first; slot 3: compression;
+    # slot 4: variadicBufferCounts (int64s, one per view column).
+    nodes = read_int64_pairs(fb, FB.field_pos(fb, rb_pos, vt_pos, vt_size, 1))
+    compressed = FB.field_pos(fb, rb_pos, vt_pos, vt_size, 3) != nil
+
+    variadic =
+      case FB.field_pos(fb, rb_pos, vt_pos, vt_size, 4) do
+        nil ->
+          []
+
+        pos ->
+          {start, count} = FB.read_vector_header(fb, pos)
+          for i <- 0..(count - 1)//1, do: FB.read_int64(fb, start + i * 8)
+      end
+
+    {:ok, row_count, buffer_specs, %{nodes: nodes, variadic: variadic, compressed: compressed}}
+  end
+
+  @spec read_int64_pairs(binary(), non_neg_integer() | nil) :: [{integer(), integer()}]
+  defp read_int64_pairs(_fb, nil), do: []
+
+  defp read_int64_pairs(fb, offset_pos) do
+    {start, count} = FB.read_vector_header(fb, offset_pos)
+
+    for i <- 0..(count - 1)//1,
+        do: {FB.read_int64(fb, start + i * 16), FB.read_int64(fb, start + i * 16 + 8)}
   end
 
   # ---------------------------------------------------------------------------
@@ -449,26 +632,233 @@ defmodule InfluxElixir.Flight.Reader do
           [column_schema()],
           [{non_neg_integer(), non_neg_integer()}],
           binary() | nil,
-          non_neg_integer()
+          non_neg_integer(),
+          map()
         ) :: {:ok, [[term()]]} | {:error, term()}
-  defp decode_columns(columns, buffer_specs, body, row_count) do
-    body = body || <<>>
-
-    {col_vectors, _remaining} =
-      Enum.map_reduce(columns, buffer_specs, fn col, specs ->
-        {allocated, rest} = allocate_buffers(col.type_id, specs)
-
-        vector =
-          col.type_id
-          |> decode_column(allocated, body, row_count)
-          |> to_datetimes(col)
-
-        {vector, rest}
-      end)
-
+  defp decode_columns(columns, buffer_specs, body, row_count, meta) do
+    cursor = %{specs: buffer_specs, nodes: meta.nodes, variadic: meta.variadic, rows: row_count}
+    {col_vectors, _cursor} = Enum.map_reduce(columns, cursor, &decode_field(&1, &2, body || <<>>))
     {:ok, col_vectors}
   rescue
     e -> {:error, {:column_decode_error, Exception.message(e)}}
+  end
+
+  # One field, depth-first as Arrow lays it out: its FieldNode (length,
+  # nulls), then its buffers, then its children's. A batch without nodes
+  # (a flat, hand-built message) gives every column the batch's length.
+  @spec decode_field(column_schema(), map(), binary()) :: {[term()], map()}
+  defp decode_field(col, cursor, body) do
+    {len, cursor} = pop_node(cursor)
+    decode_kind(col.kind, col, len, cursor, body)
+  end
+
+  @spec pop_node(map()) :: {non_neg_integer(), map()}
+  defp pop_node(%{nodes: [{len, _nulls} | rest]} = cursor), do: {len, %{cursor | nodes: rest}}
+  defp pop_node(%{nodes: []} = cursor), do: {cursor.rows, cursor}
+
+  @spec pop_specs(map(), non_neg_integer()) :: {list(), map()}
+  defp pop_specs(cursor, n) do
+    {taken, rest} = Enum.split(cursor.specs, n)
+    {taken, %{cursor | specs: rest}}
+  end
+
+  @spec decode_kind(term(), column_schema(), non_neg_integer(), map(), binary()) ::
+          {[term()], map()}
+  defp decode_kind(:primitive, col, len, cursor, body) do
+    {allocated, cursor} = pop_specs(cursor, if(col.type_id == @type_utf8, do: 3, else: 2))
+    {col.type_id |> decode_column(allocated, body, len) |> to_datetimes(col), cursor}
+  end
+
+  defp decode_kind(:null, _col, len, cursor, _body), do: {List.duplicate(nil, len), cursor}
+
+  defp decode_kind(kind, _col, len, cursor, body)
+       when kind in [:binary, :large_binary, :large_utf8] do
+    {specs, cursor} = pop_specs(cursor, 3)
+    [validity, offsets, data] = pad_specs(specs, 3)
+    width = if kind == :binary, do: 4, else: 8
+
+    values =
+      body
+      |> slice(offsets)
+      |> offsets_list(width)
+      |> var_width_values(slice(body, data))
+      |> fit(len)
+      |> Enum.map(&render_bytes(kind, &1))
+
+    {apply_nulls(values, slice_validity(body, validity), len), cursor}
+  end
+
+  defp decode_kind(kind, _col, len, cursor, body) when kind in [:utf8_view, :binary_view] do
+    {specs, cursor} = pop_specs(cursor, 2)
+    [validity, views] = pad_specs(specs, 2)
+    [count | rest] = if cursor.variadic == [], do: [0], else: cursor.variadic
+    {data_specs, cursor} = pop_specs(%{cursor | variadic: rest}, count)
+    buffers = Enum.map(data_specs, &slice(body, &1))
+
+    values =
+      for <<view::binary-16 <- slice(body, views)>> do
+        view
+        |> decode_view(buffers)
+        |> then(&if(kind == :binary_view, do: Base.encode16(&1, case: :lower), else: &1))
+      end
+
+    {apply_nulls(fit(values, len), slice_validity(body, validity), len), cursor}
+  end
+
+  defp decode_kind(kind, _col, len, cursor, body)
+       when kind == :float16 or elem(kind, 0) in [:duration, :date, :decimal] do
+    {specs, cursor} = pop_specs(cursor, 2)
+    [validity, data] = pad_specs(specs, 2)
+    values = kind |> decode_fixed_kind(slice(body, data)) |> fit(len)
+    {apply_nulls(values, slice_validity(body, validity), len), cursor}
+  end
+
+  defp decode_kind(:struct, col, len, cursor, body) do
+    {specs, cursor} = pop_specs(cursor, 1)
+    [validity] = pad_specs(specs, 1)
+    {vectors, cursor} = Enum.map_reduce(col.children, cursor, &decode_field(&1, &2, body))
+
+    # Null members are left out, as they are left out of a row.
+    rows =
+      zip_columns(col.children, vectors, len)
+      |> fit(len)
+
+    {apply_nulls(rows, slice_validity(body, validity), len), cursor}
+  end
+
+  defp decode_kind(kind, col, len, cursor, body) when kind in [:list, :large_list] do
+    {specs, cursor} = pop_specs(cursor, 2)
+    [validity, offsets] = pad_specs(specs, 2)
+    {items, cursor} = decode_field(hd(col.children), cursor, body)
+    items = List.to_tuple(items)
+
+    lists =
+      body
+      |> slice(offsets)
+      |> offsets_list(if kind == :list, do: 4, else: 8)
+      |> pairs()
+      |> Enum.map(fn {from, to} -> for i <- from..(to - 1)//1, do: cell(items, i) end)
+      |> fit(len)
+
+    {apply_nulls(lists, slice_validity(body, validity), len), cursor}
+  end
+
+  defp decode_kind({:fixed_size_list, size}, col, len, cursor, body) do
+    {specs, cursor} = pop_specs(cursor, 1)
+    [validity] = pad_specs(specs, 1)
+    {items, cursor} = decode_field(hd(col.children), cursor, body)
+    lists = items |> Enum.chunk_every(max(size, 1)) |> fit(len)
+    {apply_nulls(lists, slice_validity(body, validity), len), cursor}
+  end
+
+  defp decode_kind({:unsupported, type}, col, _len, _cursor, _body),
+    do: throw({:unsupported_arrow_type, type, col.name})
+
+  # ---------------------------------------------------------------------------
+  # Private: the decoders for the non-primitive kinds
+  # ---------------------------------------------------------------------------
+
+  @spec pad_specs(list(), non_neg_integer()) :: list()
+  defp pad_specs(specs, n), do: specs ++ List.duplicate(nil, n - length(specs))
+
+  @spec slice(binary(), {non_neg_integer(), non_neg_integer()} | nil) :: binary()
+  defp slice(_body, nil), do: <<>>
+  defp slice(body, {offset, len}), do: safe_slice(body, offset, len)
+
+  @spec slice_validity(binary(), {non_neg_integer(), non_neg_integer()} | nil) :: binary() | nil
+  defp slice_validity(_body, nil), do: nil
+  defp slice_validity(_body, {_offset, 0}), do: nil
+  defp slice_validity(body, spec), do: slice(body, spec)
+
+  @spec offsets_list(binary(), 4 | 8) :: [integer()]
+  defp offsets_list(bin, 4), do: for(<<v::little-signed-32 <- bin>>, do: v)
+  defp offsets_list(bin, 8), do: for(<<v::little-signed-64 <- bin>>, do: v)
+
+  @spec pairs([integer()]) :: [{integer(), integer()}]
+  defp pairs([]), do: []
+  defp pairs(offsets), do: Enum.zip(offsets, tl(offsets))
+
+  @spec var_width_values([integer()], binary()) :: [binary() | nil]
+  defp var_width_values(offsets, data) do
+    for {from, to} <- pairs(offsets) do
+      if from >= 0 and to >= from and to <= byte_size(data),
+        do: binary_part(data, from, to - from),
+        else: nil
+    end
+  end
+
+  # HTTP renders binary as lowercase hex (`CAST(host AS BYTEA)` is "61").
+  @spec render_bytes(atom(), binary() | nil) :: binary() | nil
+  defp render_bytes(_kind, nil), do: nil
+  defp render_bytes(:large_utf8, value), do: value
+  defp render_bytes(_binary, value), do: Base.encode16(value, case: :lower)
+
+  # A view is 16 bytes: the length, then the bytes inline (12 or fewer) or
+  # a 4-byte prefix, the data buffer's index and the offset in it.
+  @spec decode_view(binary(), [binary()]) :: binary() | nil
+  defp decode_view(<<len::little-32, inline::binary-12>>, _buffers) when len <= 12,
+    do: binary_part(inline, 0, len)
+
+  defp decode_view(
+         <<len::little-32, _prefix::binary-4, index::little-32, offset::little-32>>,
+         buffers
+       ) do
+    buffer = Enum.at(buffers, index, <<>>)
+    if offset + len <= byte_size(buffer), do: binary_part(buffer, offset, len), else: nil
+  end
+
+  @spec decode_fixed_kind(term(), binary()) :: [term()]
+  defp decode_fixed_kind(:float16, data), do: for(<<v::little-float-16 <- data>>, do: v)
+
+  defp decode_fixed_kind({:duration, unit}, data) do
+    for <<v::little-signed-64 <- data>>,
+      do: render_duration(System.convert_time_unit(v, unit, :nanosecond))
+  end
+
+  defp decode_fixed_kind({:date, :day}, data),
+    do: for(<<d::little-signed-32 <- data>>, do: Date.to_iso8601(Date.add(~D[1970-01-01], d)))
+
+  defp decode_fixed_kind({:date, :millisecond}, data) do
+    for <<ms::little-signed-64 <- data>>,
+      do: Date.to_iso8601(Date.add(~D[1970-01-01], Integer.floor_div(ms, 86_400_000)))
+  end
+
+  defp decode_fixed_kind({:decimal, scale, bytes}, data) do
+    bits = bytes * 8
+    for <<v::little-signed-size(bits) <- data>>, do: scale_decimal(v, scale)
+  end
+
+  # HTTP's JSON has the decimal as a number: an integer at scale 0, else a
+  # float (`CAST(v AS DECIMAL(10,2))` of 1.5 is 1.5).
+  @spec scale_decimal(integer(), integer()) :: number()
+  defp scale_decimal(v, 0), do: v
+  defp scale_decimal(v, scale), do: v / Integer.pow(10, scale)
+
+  # InfluxDB 3's HTTP rendering of a Duration (verified): `P0D` for zero,
+  # else `[-]PT<seconds>[.<fraction>]S` with the fraction's trailing zeros
+  # dropped — `PT60S`, `PT0.5S`, `-PT0.000000001S`, `PT7199.75S`.
+  @doc false
+  @spec render_duration(integer()) :: binary()
+  def render_duration(0), do: "P0D"
+  def render_duration(ns) when ns < 0, do: "-" <> render_duration(-ns)
+
+  def render_duration(ns) do
+    seconds = div(ns, 1_000_000_000)
+
+    fraction =
+      case rem(ns, 1_000_000_000) do
+        0 ->
+          ""
+
+        frac ->
+          "." <>
+            (frac
+             |> Integer.to_string()
+             |> String.pad_leading(9, "0")
+             |> String.trim_trailing("0"))
+      end
+
+    "PT#{seconds}#{fraction}S"
   end
 
   # Timestamps come off the wire as integers in the column's unit. They are
@@ -488,15 +878,6 @@ defmodule InfluxElixir.Flight.Reader do
   end
 
   defp to_datetimes(values, _column), do: values
-
-  @spec allocate_buffers(non_neg_integer(), list()) :: {list(), list()}
-  defp allocate_buffers(@type_utf8, specs) do
-    {Enum.take(specs, 3), Enum.drop(specs, 3)}
-  end
-
-  defp allocate_buffers(_type_id, specs) do
-    {Enum.take(specs, 2), Enum.drop(specs, 2)}
-  end
 
   @spec decode_column(non_neg_integer(), list(), binary(), non_neg_integer()) ::
           [term()]
