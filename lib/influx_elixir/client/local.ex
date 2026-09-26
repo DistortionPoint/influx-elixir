@@ -88,6 +88,18 @@ defmodule InfluxElixir.Client.Local do
       back as `v=2, w=1`, and the last of two such lines in one payload
       wins. A different tag value is a different point. `DELETE` removes
       the merged point.
+    * `accept_partial: false` makes a write all-or-nothing: the first bad
+      line in line order — a parse error or a schema conflict, also against
+      an earlier line of the same payload — rejects it, nothing is stored
+      (not even schema), and the body is `{"error": "line protocol parsing
+      error", "data": {...}}` with that one line. `no_sync:` is accepted
+      and changes nothing (the double has no write-ahead log; on the
+      engine a `no_sync` write may not be visible to a query right away).
+      Either one that is not a boolean is the engine's 400.
+    * A schema error's `original_line` is the line as the engine renders
+      it, not as it was sent: single spaces, floats shortest and without an
+      exponent (`2.0` → `2`), strings unquoted. Runs of spaces between a
+      line's sections are one separator.
     * Under the `:v2` profile the rules are InfluxDB 2's, verified against
       2.7: a field type conflict is HTTP 422 (`{"code":"unprocessable
       entity","message":"... field type conflict: input field \"v\" on
@@ -504,12 +516,22 @@ defmodule InfluxElixir.Client.Local do
     with :ok <- require_capability(conn, :write),
          {:ok, text} <- maybe_decompress(payload),
          {:ok, precision} <- normalize_precision(Keyword.get(opts, :precision), profile),
+         {:ok, accept_partial} <- write_flag(opts, :accept_partial, true, profile),
+         {:ok, _no_sync} <- write_flag(opts, :no_sync, false, profile),
          :ok <- ensure_database(table, database, profile) do
       case LineProtocolParser.parse_lines(text, precision, dialect(profile)) do
-        {:ok, lines} -> store_lines(table, database, lines, profile)
+        {:ok, lines} when profile != :v2 and not accept_partial ->
+          store_lines_atomically(table, database, lines)
+
+        {:ok, lines} ->
+          store_lines(table, database, lines, profile)
+
         # InfluxDB 2 answers 204 to an empty payload; InfluxDB 3 refuses it.
-        {:error, _empty} when profile == :v2 -> {:ok, :written}
-        {:error, _reason} = error -> error
+        {:error, _empty} when profile == :v2 ->
+          {:ok, :written}
+
+        {:error, _reason} = error ->
+          error
       end
     end
   end
@@ -651,7 +673,7 @@ defmodule InfluxElixir.Client.Local do
               errors
 
             {:error, message} ->
-              [LineProtocolParser.line_error(message, number, line) | errors]
+              [LineProtocolParser.schema_error(message, number, line) | errors]
           end
       end)
 
@@ -672,13 +694,102 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
+  # `accept_partial: false` and `no_sync:` are InfluxDB 3 write parameters
+  # (`HTTP.write/3` sends them as `&accept_partial=false`, `&no_sync=true`);
+  # the engine refuses anything but `true` / `false` (verified). `no_sync`
+  # changes durability only, which the double does not have, so it is
+  # accepted and changes nothing. InfluxDB 2's endpoint has neither.
+  @spec write_flag(keyword(), atom(), boolean(), profile()) :: {:ok, boolean()} | {:error, map()}
+  defp write_flag(_opts, _key, default, :v2), do: {:ok, default}
+
+  defp write_flag(opts, key, default, _v3) do
+    case Keyword.get(opts, key, default) do
+      value when is_boolean(value) ->
+        {:ok, value}
+
+      _other ->
+        {:error, %{status: 400, body: "serde error: provided string was not `true` or `false`"}}
+    end
+  end
+
+  # `accept_partial: false` (verified against InfluxDB 3): the first bad
+  # line in line order — a parse error or a schema conflict, including one
+  # against an earlier line of the same payload — rejects the whole payload
+  # and nothing is stored, not even the schema; the body is
+  # `{"error": "line protocol parsing error", "data": {one line error}}`.
+  # Every line is checked against the stored schema plus the payload's
+  # pending columns before anything is written.
+  @spec store_lines_atomically(Store.t(), binary(), [LineProtocolParser.line_result()]) ::
+          InfluxElixir.Client.write_result()
+  defp store_lines_atomically(table, database, lines) do
+    case first_line_error(table, database, lines) do
+      nil ->
+        store_lines(table, database, lines, :v3_core)
+
+      line_error ->
+        {:error,
+         %{
+           status: 400,
+           body:
+             Jason.encode!(%{
+               "error" => "line protocol parsing error",
+               "data" => Map.delete(line_error, :line)
+             })
+         }}
+    end
+  end
+
+  @spec first_line_error(Store.t(), binary(), [LineProtocolParser.line_result()]) ::
+          LineProtocolParser.line_error() | nil
+  defp first_line_error(table, database, lines) do
+    Enum.reduce_while(lines, {:ok, %{}}, fn
+      {:error, line_error}, _pending ->
+        {:halt, {:error, line_error}}
+
+      {:ok, point, number, line}, {:ok, pending} ->
+        case dry_check(table, database, point, pending) do
+          {:ok, pending} ->
+            {:cont, {:ok, pending}}
+
+          {:error, message} ->
+            {:halt, {:error, LineProtocolParser.schema_error(message, number, line)}}
+        end
+    end)
+    |> case do
+      {:error, line_error} -> line_error
+      {:ok, _pending} -> nil
+    end
+  end
+
+  # The v3 schema checks without registering anything; `pending` holds the
+  # kinds the payload's earlier lines would register.
+  @spec dry_check(Store.t(), binary(), point_map(), map()) :: {:ok, map()} | {:error, binary()}
+  defp dry_check(table, database, point, pending) do
+    m = point.measurement
+
+    exists? =
+      Store.table?(table, database, m) or Enum.any?(Map.keys(pending), &match?({^m, _column}, &1))
+
+    with :ok <- reserved_time(point, exists?) do
+      point
+      |> point_columns(:v3)
+      |> Enum.reduce_while({:ok, pending}, fn {column, type}, {:ok, pending} ->
+        existing = Map.get(pending, {m, column}) || Store.column_kind(table, database, m, column)
+
+        if existing in [nil, type],
+          do: {:cont, {:ok, Map.put(pending, {m, column}, type)}},
+          else: {:halt, {:error, conflict(:v3, column, point, existing, type)}}
+      end)
+    end
+  end
+
   # InfluxDB 3 reserves `time` for the timestamp column. The wording
   # depends on whether the table exists (verified): a new table refuses
   # the line outright, an existing one reports a column-type conflict.
   @spec check_schema(Store.t(), binary(), point_map(), LineProtocolParser.dialect()) ::
           :ok | {:error, binary() | {binary(), binary(), binary(), binary()}}
   defp check_schema(table, database, point, :v3) do
-    case reserved_time(table, database, point) do
+    case reserved_time(point, Store.table?(table, database, point.measurement)) do
       :ok -> check_column_types(table, database, point, :v3)
       {:error, _message} = error -> error
     end
@@ -687,24 +798,26 @@ defmodule InfluxElixir.Client.Local do
   defp check_schema(table, database, point, :v2),
     do: check_column_types(table, database, point, :v2)
 
-  @spec reserved_time(Store.t(), binary(), point_map()) :: :ok | {:error, binary()}
-  defp reserved_time(table, database, %{tags: tags, fields: fields} = point) do
+  @spec reserved_time(point_map(), boolean()) :: :ok | {:error, binary()}
+  defp reserved_time(%{tags: tags, fields: fields}, table_exists?) do
     cond do
       Map.has_key?(tags, "time") ->
-        reserved_time_error(table, database, point.measurement, "iox::column_type::tag")
+        reserved_time_error(table_exists?, "iox::column_type::tag")
 
       Map.has_key?(fields, "time") ->
-        got = LineProtocolParser.column_type(:field, Map.fetch!(fields, "time"))
-        reserved_time_error(table, database, point.measurement, got)
+        reserved_time_error(
+          table_exists?,
+          LineProtocolParser.column_type(:field, Map.fetch!(fields, "time"))
+        )
 
       true ->
         :ok
     end
   end
 
-  @spec reserved_time_error(Store.t(), binary(), binary(), binary()) :: {:error, binary()}
-  defp reserved_time_error(table, database, measurement, got) do
-    if Store.table?(table, database, measurement) do
+  @spec reserved_time_error(boolean(), binary()) :: {:error, binary()}
+  defp reserved_time_error(table_exists?, got) do
+    if table_exists? do
       {:error,
        "invalid column type for column 'time', expected iox::column_type::timestamp, got " <>
          got}
@@ -721,17 +834,28 @@ defmodule InfluxElixir.Client.Local do
   @spec check_column_types(Store.t(), binary(), point_map(), LineProtocolParser.dialect()) ::
           :ok | {:error, binary() | {binary(), binary(), binary(), binary()}}
   defp check_column_types(table, database, point, dialect) do
-    tags = if dialect == :v3, do: Enum.map(point.tags, fn {k, _v} -> {k, :tag, nil} end), else: []
-    columns = tags ++ Enum.map(point.fields, fn {k, v} -> {k, :field, v} end)
-
-    Enum.find_value(columns, :ok, fn {column, kind, value} ->
-      type = LineProtocolParser.column_type(kind, value)
-
+    point
+    |> point_columns(dialect)
+    |> Enum.find_value(:ok, fn {column, type} ->
       case Store.register_column(table, database, point.measurement, column, type) do
         :ok -> nil
         {:conflict, existing} -> {:error, conflict(dialect, column, point, existing, type)}
       end
     end)
+  end
+
+  # The columns a point types, as `{column, kind}`: InfluxDB 3 types tags
+  # and fields in one namespace, InfluxDB 2 types fields only.
+  @spec point_columns(point_map(), LineProtocolParser.dialect()) :: [{binary(), binary()}]
+  defp point_columns(point, dialect) do
+    tags =
+      if dialect == :v3,
+        do:
+          Enum.map(point.tags, fn {k, _v} -> {k, LineProtocolParser.column_type(:tag, nil)} end),
+        else: []
+
+    tags ++
+      Enum.map(point.fields, fn {k, v} -> {k, LineProtocolParser.column_type(:field, v)} end)
   end
 
   @spec conflict(LineProtocolParser.dialect(), binary(), point_map(), binary(), binary()) ::

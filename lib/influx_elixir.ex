@@ -103,6 +103,22 @@ defmodule InfluxElixir do
 
   Goes through `InfluxElixir.Write.Writer`, so payloads over 1 KB are
   gzipped and a `[:influx_elixir, :write, ...]` telemetry span is emitted.
+
+  ## Options
+
+    * `:database` — overrides the connection-level default database.
+    * `:precision` — the unit of the timestamps (default nanoseconds); see
+      `InfluxElixir.Client.Local` for the spellings each server accepts.
+    * `:accept_partial` — InfluxDB 3 only. `false` makes the write
+      all-or-nothing: the first bad line (a parse error or a schema
+      conflict, in line order) rejects the payload, nothing is stored, and
+      the error is `{:error, %{status: 400, body: json}}` with
+      `"line protocol parsing error"` and that one line under `"data"`.
+      Default `true`: good lines are stored and the bad ones reported as a
+      partial write.
+    * `:no_sync` — InfluxDB 3 only. `true` acknowledges the write before
+      it is persisted to the write-ahead log: faster, and a query right
+      after it may not see the points yet (verified).
   """
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()

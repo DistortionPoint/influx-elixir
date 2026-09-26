@@ -119,8 +119,10 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   # Format: measurement[,tag=val...] field=val[,...] [timestamp]
   @spec parse_line(binary(), pos_integer(), precision(), dialect()) :: line_result()
   defp parse_line(line, number, precision, dialect) do
+    # Runs of spaces between sections are one separator on the engine
+    # (verified), so empty sections are dropped.
     result =
-      case split_line_parts(line) do
+      case line |> split_line_parts() |> Enum.reject(&(&1 == "")) do
         [key_part, fields_part | rest] ->
           ts_raw = List.first(rest)
 
@@ -153,6 +155,88 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
       original_line: String.slice(line, 0, 20),
       line: line
     }
+  end
+
+  @doc """
+  Builds the `t:line_error/0` for a schema error. InfluxDB 3 does not echo
+  the raw line for those but the line as it parsed it (verified): single
+  spaces, floats printed shortest and without an exponent (`2.0` → `2`,
+  `1e3` → `1000`), strings unquoted, then cut to 20 characters. Parse
+  errors keep the raw line (`line_error/3`).
+  """
+  @spec schema_error(binary(), pos_integer(), binary()) :: line_error()
+  def schema_error(message, number, line) do
+    %{line_error(message, number, line) | original_line: String.slice(render_line(line), 0, 20)}
+  end
+
+  # The engine's rendering of a line that parsed: the key part and
+  # timestamp as written, each field value as its parsed value prints.
+  @spec render_line(binary()) :: binary()
+  defp render_line(line) do
+    case line |> String.trim() |> split_line_parts() |> Enum.reject(&(&1 == "")) do
+      [key_part, fields_part | rest] ->
+        fields =
+          fields_part
+          |> split_unescaped_comma()
+          |> Enum.map_join(",", fn pair ->
+            {key, raw} = split_first_unescaped_equals(pair)
+            key <> "=" <> render_value(raw)
+          end)
+
+        Enum.join([key_part, fields | rest], " ")
+
+      _unparsed ->
+        line
+    end
+  end
+
+  @spec render_value(binary()) :: binary()
+  defp render_value(raw) do
+    case parse_field_value(raw) do
+      {:ok, {:uint, n}} -> "#{n}u"
+      {:ok, n} when is_integer(n) -> "#{n}i"
+      {:ok, f} when is_float(f) -> render_float(f)
+      {:ok, value} -> to_string(value)
+      {:error, _reason} -> raw
+    end
+  end
+
+  # Rust's `f64` Display: the shortest digits that round-trip, never in
+  # exponent form, no trailing `.0`.
+  @spec render_float(float()) :: binary()
+  defp render_float(f) when f == 0.0, do: if(<<f::float>> == <<-0.0::float>>, do: "-0", else: "0")
+  defp render_float(f) when f < 0, do: "-" <> render_float(-f)
+
+  defp render_float(f) do
+    {mantissa, exponent} =
+      case :erlang.float_to_binary(f, [:short]) |> String.split("e") do
+        [mantissa, exp] -> {mantissa, String.to_integer(exp)}
+        [mantissa] -> {mantissa, 0}
+      end
+
+    [whole, frac] = String.split(mantissa, ".")
+    digits = whole <> frac
+    point = byte_size(whole) + exponent
+
+    cond do
+      point <= 0 ->
+        "0." <> String.duplicate("0", -point) <> digits
+
+      point >= byte_size(digits) ->
+        digits <> String.duplicate("0", point - byte_size(digits))
+
+      true ->
+        binary_part(digits, 0, point) <>
+          "." <> binary_part(digits, point, byte_size(digits) - point)
+    end
+    |> trim_fraction()
+  end
+
+  @spec trim_fraction(binary()) :: binary()
+  defp trim_fraction(text) do
+    if String.contains?(text, "."),
+      do: text |> String.trim_trailing("0") |> String.trim_trailing("."),
+      else: text |> String.trim_leading("0") |> then(&if(&1 == "", do: "0", else: &1))
   end
 
   # A key is one column, so a key used as both a tag and a field cannot be

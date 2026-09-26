@@ -86,6 +86,7 @@ defmodule InfluxElixir.ClientContract do
     influxql_select_tests = if v3_sql, do: influxql_select_tests(client), else: nil
     reference_tests = if v3_sql, do: reference_tests(client), else: nil
     null_semantics_tests = if v3_sql, do: null_semantics_tests(client), else: nil
+    atomic_write_tests = if v3_sql, do: atomic_write_tests(client), else: nil
     db_admin_tests = if v3_sql, do: db_admin_tests(client), else: nil
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
@@ -128,6 +129,7 @@ defmodule InfluxElixir.ClientContract do
         influxql_select_tests,
         reference_tests,
         null_semantics_tests,
+        atomic_write_tests,
         db_admin_tests,
         bucket_tests,
         v2_write_rule_tests,
@@ -2580,6 +2582,49 @@ defmodule InfluxElixir.ClientContract do
                   }} =
                    unquote(client).query_sql(ctx.conn, "SELECT host FROM #{ctx.m} WHERE n",
                      database: ctx.database
+                   )
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # accept_partial / no_sync write parameters (v3_core, v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  defp atomic_write_tests(client) do
+    quote do
+      describe "write/3 — accept_partial and no_sync contract" do
+        test "accept_partial: false rejects the payload at its first bad line", ctx do
+          m = "contract_atomic_#{System.unique_integer([:positive])}"
+
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).write(ctx.conn, "#{m} v=1i 1\n#{m} v=2.0 2",
+                     database: ctx.database,
+                     accept_partial: false
+                   )
+
+          assert %{"error" => "line protocol parsing error", "data" => %{"line_number" => 2}} =
+                   Jason.decode!(body)
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:error, %{status: 400}} =
+                   unquote(client).query_sql(ctx.conn, "SELECT * FROM #{m}",
+                     database: ctx.database
+                   )
+        end
+
+        test "no_sync: true and a clean atomic payload are accepted", ctx do
+          m = "contract_nosync_#{System.unique_integer([:positive])}"
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, "#{m} v=1i 1\n#{m} v=2i 2",
+                     database: ctx.database,
+                     accept_partial: false,
+                     no_sync: true
                    )
         end
       end

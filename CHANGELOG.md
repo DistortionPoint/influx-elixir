@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Writes can be all-or-nothing, and acknowledged before persistence.**
+  InfluxDB 3's `accept_partial=false` and `no_sync=true` write parameters
+  had no way through the client; `write/3` now takes `accept_partial:`
+  and `no_sync:` (v3 only) and `Client.HTTP` sends them. `Client.Local`
+  models both as verified: with `accept_partial: false` the first bad line
+  in line order rejects the payload with the engine's single-line
+  `"line protocol parsing error"` body and stores nothing, not even
+  schema; `no_sync` is accepted; a flag that is not a boolean is the
+  engine's 400.
+
 ### Changed
 - **`Client.Local`'s ETS storage is its own module,
   `InfluxElixir.Client.Local.Store`.** The key layout, the atomic
@@ -16,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1,583 → 1,430 lines) holds no `:ets` call. Behaviour is unchanged.
 
 ### Fixed
+- **`Client.Local` refused a line with repeated spaces between its
+  sections** (`m    v=1i   1`) as "No fields were provided"; InfluxDB 3
+  accepts it (verified), and so does the double now.
+- **A schema error's `original_line` was the raw line.** InfluxDB 3
+  reports the line as it parsed it — single spaces, `v=2.0` as `v=2`,
+  `1e3` as `1000`, strings unquoted (verified); the double renders it the
+  same way. Parse errors still show the raw line, as on the engine.
 - **`Client.Local` read three clocks.** Untimed points and Flux `now()`
   used `System.system_time/1`, SQL `now()` used `System.os_time/1`; the
   two differ by microseconds, so a point a test stamped with one clock

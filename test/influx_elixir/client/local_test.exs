@@ -5839,4 +5839,101 @@ defmodule InfluxElixir.Client.LocalTest do
       assert [%{"host" => "b"}] = nq(conn, "SELECT host FROM t WHERE -n > 0")
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # accept_partial: false and no_sync; the engine's rendering of a line in a
+  # schema error. Expectations taken from influxdb:3-core
+  # (docs/design/2026-09-25_atomic-writes-and-no-sync.md).
+  # ---------------------------------------------------------------------------
+
+  describe "write/3 — accept_partial: false, no_sync" do
+    setup do
+      {:ok, conn} = Local.start(databases: ["aw"])
+      on_exit(fn -> Local.stop(conn) end)
+      {:ok, conn: conn}
+    end
+
+    defp atomic_error(body) do
+      %{"error" => "line protocol parsing error", "data" => data} = Jason.decode!(body)
+      {data["line_number"], data["error_message"], data["original_line"]}
+    end
+
+    test "the first bad line in line order rejects the whole payload", %{conn: conn} do
+      assert {:error, %{status: 400, body: body}} =
+               Local.write(conn, "m1 v=1i 1\nm1 v=\nm1 x=\nm1 v=3i 3",
+                 database: "aw",
+                 accept_partial: false
+               )
+
+      assert atomic_error(body) == {2, "No fields were provided", "m1 v="}
+
+      assert {:error,
+              %{status: 400, body: "Error during planning: table 'public.iox.m1' not found"}} =
+               Local.query_sql(conn, "SELECT * FROM m1", database: "aw")
+    end
+
+    test "a conflict with an earlier line of the payload rejects it and registers no schema",
+         %{conn: conn} do
+      assert {:error, %{status: 400, body: body}} =
+               Local.write(conn, "m2 v=1i 1\nm2 v=2.0 2", database: "aw", accept_partial: false)
+
+      assert atomic_error(body) ==
+               {2,
+                "invalid column type for column 'v', expected iox::column_type::field::integer, got iox::column_type::field::float",
+                "m2 v=2 2"}
+
+      # Nothing was registered: a float is now the first kind of `v`.
+      assert {:ok, :written} = Local.write(conn, "m2 v=3.5 3", database: "aw")
+      assert {:ok, [%{"v" => 3.5}]} = Local.query_sql(conn, "SELECT v FROM m2", database: "aw")
+    end
+
+    test "a clean payload is stored whole; no_sync is accepted", %{conn: conn} do
+      assert {:ok, :written} =
+               Local.write(conn, "m3 v=1i 1\nm3 v=2i 2",
+                 database: "aw",
+                 accept_partial: false,
+                 no_sync: true
+               )
+
+      assert {:ok, [%{"v" => 1}, %{"v" => 2}]} =
+               Local.query_sql(conn, "SELECT v FROM m3 ORDER BY time", database: "aw")
+    end
+
+    test "time as a tag on a new table is the reserved-column error", %{conn: conn} do
+      assert {:error, %{body: body}} =
+               Local.write(conn, "m4,time=x v=1i 1", database: "aw", accept_partial: false)
+
+      assert {1, "'time' is a reserved column", _line} = atomic_error(body)
+    end
+
+    test "a flag that is not a boolean is the engine's 400", %{conn: conn} do
+      for key <- [:accept_partial, :no_sync] do
+        assert {:error,
+                %{status: 400, body: "serde error: provided string was not `true` or `false`"}} =
+                 Local.write(conn, "m5 v=1i 1", [{:database, "aw"}, {key, "yes"}])
+      end
+    end
+
+    test "the :v2 profile has neither parameter and ignores them" do
+      {:ok, v2} = Local.start(profile: :v2)
+      on_exit(fn -> Local.stop(v2) end)
+      :ok = Local.create_bucket(v2, "b")
+
+      assert {:ok, :written} = Local.write(v2, "m v=1i 1", database: "b", accept_partial: "yes")
+    end
+
+    test "a schema error shows the line as the engine renders it", %{conn: conn} do
+      {:ok, :written} = Local.write(conn, "r v=1i,a=1i 1", database: "aw")
+
+      for {lp, rendered} <- [
+            {"r    v=2.50,a=3i   2", "r v=2.5,a=3i 2"},
+            {"r,t=x v=1e3 4", "r,t=x v=1000 4"},
+            {~s(r v="s" 6), "r v=s 6"},
+            {"r v=1.5e-7 8", "r v=0.00000015 8"}
+          ] do
+        assert {:error, %{body: body}} = Local.write(conn, lp, database: "aw")
+        assert [%{"original_line" => ^rendered}] = Jason.decode!(body)["data"], lp
+      end
+    end
+  end
 end

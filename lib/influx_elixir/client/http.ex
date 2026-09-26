@@ -14,7 +14,8 @@ defmodule InfluxElixir.Client.HTTP do
 
   ## InfluxDB v3 API Endpoints (`api_version: :v3`, the default)
 
-    * Write: `POST /api/v3/write_lp?db=DATABASE&precision=PRECISION`
+    * Write: `POST /api/v3/write_lp?db=DATABASE&precision=PRECISION`, plus
+      `&accept_partial=false` / `&no_sync=true` when those opts are given
     * SQL Query: `POST /api/v3/query_sql` (JSON body)
     * InfluxQL: `POST /api/v3/query_influxql` (JSON body)
     * Databases: `GET/POST/DELETE /api/v3/configure/database`
@@ -120,7 +121,7 @@ defmodule InfluxElixir.Client.HTTP do
   def write(connection, line_protocol, opts \\ []) do
     with {:ok, database} <- resolve_database(opts, connection) do
       precision = Keyword.get(opts, :precision, "nanosecond")
-      url = write_url(connection, database, precision)
+      url = write_url(connection, database, precision) <> write_flags(connection, opts)
 
       headers =
         if Keyword.get(opts, :gzip, false) do
@@ -153,6 +154,20 @@ defmodule InfluxElixir.Client.HTTP do
       :v3 ->
         base_url(connection) <>
           "/api/v3/write_lp?db=#{URI.encode(database)}&precision=#{precision}"
+    end
+  end
+
+  # InfluxDB 3's `accept_partial` (false: all-or-nothing) and `no_sync`
+  # (acknowledge before the WAL is persisted) write parameters. Sent only
+  # when given, and only on v3 — InfluxDB 2's endpoint has neither.
+  @spec write_flags(keyword(), keyword()) :: binary()
+  defp write_flags(connection, opts) do
+    if api_version(connection) == :v3 do
+      for key <- [:accept_partial, :no_sync], Keyword.has_key?(opts, key), into: "" do
+        "&#{key}=#{Keyword.fetch!(opts, key)}"
+      end
+    else
+      ""
     end
   end
 

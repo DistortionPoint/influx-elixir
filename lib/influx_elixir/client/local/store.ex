@@ -293,6 +293,15 @@ defmodule InfluxElixir.Client.Local.Store do
     end
   end
 
+  @doc "A column's registered kind, or `nil` — a read that registers nothing."
+  @spec column_kind(t(), binary(), binary(), binary()) :: binary() | nil
+  def column_kind(table, database, measurement, column) do
+    case :ets.lookup(table, {:column, database, measurement, column}) do
+      [{_key, kind}] -> kind
+      [] -> nil
+    end
+  end
+
   @doc "Whether the measurement has any column registered (the table exists)."
   @spec table?(t(), binary(), binary()) :: boolean()
   def table?(table, database, measurement),
