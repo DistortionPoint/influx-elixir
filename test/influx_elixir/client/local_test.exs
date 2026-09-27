@@ -1854,6 +1854,25 @@ defmodule InfluxElixir.Client.LocalTest do
   # query_sql/3 — SELECT DISTINCT
   # ---------------------------------------------------------------------------
 
+  # The engine's DISTINCT ON semantics are in the contract; this is the
+  # double's own limit.
+  describe "query_sql/3 — SELECT DISTINCT ON" do
+    test "an expression in ON is refused by name, not answered wrongly", %{conn: conn} do
+      Local.write(conn, "m v=1i 1", database: "test_db")
+
+      sql =
+        "SELECT DISTINCT ON (date_bin(INTERVAL '2 seconds', time)) v FROM m " <>
+          "ORDER BY date_bin(INTERVAL '2 seconds', time)"
+
+      assert {:error,
+              %{status: 400, body: "Client.Local: DISTINCT ON takes column names only" <> _rest}} =
+               Local.query_sql(conn, sql, database: "test_db")
+
+      assert {:error, %{status: 400, body: "Client.Local: DISTINCT ON" <> _rest}} =
+               Local.check_sql(sql)
+    end
+  end
+
   describe "query_sql/3 — SELECT DISTINCT" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "dist_db")

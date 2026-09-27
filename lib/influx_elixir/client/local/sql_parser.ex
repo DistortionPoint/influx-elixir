@@ -105,6 +105,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           group_by_columns: [binary()] | nil,
           select_columns: [select_column()] | nil,
           distinct_columns: [binary()] | nil,
+          distinct_on: [binary()] | nil,
           projection_columns: [projection()] | nil,
           ctes: [{binary(), parsed_query()}],
           cross_join: {binary(), [binary()]} | nil
@@ -231,12 +232,109 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     {sql, cross_join} = sql |> String.trim() |> split_cross_join()
     normalised = strip_table_qualifiers(sql, cross_join)
 
+    {normalised, on} = split_distinct_on(normalised)
+
     with :ok <- check_clauses(normalised),
+         :ok <- check_distinct_on_grouping(on, normalised),
          {:ok, split} <- split_select(normalised),
          {:ok, split, normalised} <- resolve_references(split, normalised),
-         {:ok, query} <- dispatch_select(split, normalised) do
+         {:ok, query} <- dispatch_select(split, normalised),
+         {:ok, query} <- apply_distinct_on(query, on) do
       {:ok, %{query | cross_join: cross_join}}
     end
+  end
+
+  # `SELECT DISTINCT ON (a[, b]) ...` is an ordinary select whose rows are
+  # then cut to the first per distinct (a, b) after ORDER BY, before LIMIT
+  # and OFFSET (verified against InfluxDB 3). The ON list is taken out of
+  # the text so the rest parses as that ordinary select.
+  @distinct_on ~r/^(\s*SELECT\s+)DISTINCT\s+ON\s*\((.*)$/is
+
+  @spec split_distinct_on(binary()) :: {binary(), binary() | nil}
+  defp split_distinct_on(sql) do
+    with [_full, select, after_open] <- Regex.run(@distinct_on, sql),
+         {:ok, on, rest} <- take_balanced(after_open) do
+      {select <> String.trim_leading(rest), on}
+    else
+      _no_distinct_on -> {sql, nil}
+    end
+  end
+
+  # DISTINCT ON with an aggregate in the select list, or a GROUP BY, is the
+  # engine's 405, answered before the select list is read (verified). A
+  # DATE_BIN in ORDER BY is neither.
+  @spec check_distinct_on_grouping(binary() | nil, binary()) :: :ok | {:error, map()}
+  defp check_distinct_on_grouping(nil, _sql), do: :ok
+
+  defp check_distinct_on_grouping(_on, sql) do
+    select_list =
+      case Regex.named_captures(@select_pattern, sql) do
+        %{"columns" => columns} -> String.upcase(columns)
+        nil -> ""
+      end
+
+    aggregate? = Enum.any?(@aggregate_functions, &String.contains?(select_list, &1 <> "("))
+
+    if aggregate? or Regex.match?(~r/\bGROUP\s+BY\b/i, sql) do
+      {:error,
+       %{
+         status: 405,
+         body:
+           "This feature is not implemented: DISTINCT ON expressions with GROUP BY, " <>
+             "aggregation or window functions are not supported "
+       }}
+    else
+      :ok
+    end
+  end
+
+  # The engine's other rules for DISTINCT ON, each verified: at least one
+  # expression, and an ORDER BY, if any, must start with the ON expressions
+  # in their order (400). The double takes plain columns only and refuses
+  # an expression by name.
+  @spec apply_distinct_on(parsed_query(), binary() | nil) ::
+          {:ok, parsed_query()} | {:error, map()}
+  defp apply_distinct_on(query, nil), do: {:ok, query}
+
+  defp apply_distinct_on(query, on) do
+    columns = on |> split_top_level_commas() |> Enum.map(&String.trim/1)
+
+    cond do
+      columns == [""] ->
+        {:error, %{status: 400, body: "Error during planning: No `ON` expressions provided"}}
+
+      not Enum.all?(columns, &Regex.match?(~r/^(?:\w+|"[^"]+")$/, &1)) ->
+        {:error, local_error("DISTINCT ON takes column names only: (#{on})")}
+
+      true ->
+        columns = Enum.map(columns, &String.trim(&1, "\""))
+        check_distinct_on_order(%{query | distinct_on: columns}, columns)
+    end
+  end
+
+  @spec check_distinct_on_order(parsed_query(), [binary()]) ::
+          {:ok, parsed_query()} | {:error, map()}
+  defp check_distinct_on_order(%{order_by: []} = query, _columns), do: {:ok, query}
+
+  # Under DISTINCT ON the engine resolves ORDER BY against the table: a
+  # select alias there is its schema error, which it reports before this
+  # rule, so an aliased term is left to the executor's column check.
+  defp check_distinct_on_order(%{order_by: order_by} = query, columns) do
+    leading = order_by |> Enum.take(length(columns)) |> Enum.map(&elem(&1, 0))
+
+    aliases =
+      for {source, output} <- query.projection_columns || [], source != output, do: output
+
+    if leading == columns or Enum.any?(leading, &(&1 in aliases)),
+      do: {:ok, query},
+      else:
+        {:error,
+         %{
+           status: 400,
+           body:
+             "Error during planning: SELECT DISTINCT ON expressions must match initial " <>
+               "ORDER BY expressions"
+         }}
   end
 
   # `GROUP BY 1`, `ORDER BY 2 DESC` and `GROUP BY bucket` (a select alias)
@@ -586,6 +684,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         group_by_columns: nil,
         select_columns: nil,
         distinct_columns: nil,
+        distinct_on: nil,
         projection_columns: nil,
         ctes: [],
         cross_join: nil

@@ -187,6 +187,14 @@ defmodule InfluxElixir.Client.Local do
     * `SELECT DISTINCT col[, col ...] FROM measurement` (sorted combinations;
       `ORDER BY` must name a selected column, as in DataFusion). An all-null
       combination is a row too (`%{}`).
+    * `SELECT DISTINCT ON (col[, col ...]) ...` over plain or projected
+      columns (or `*`): the first row per distinct key after `ORDER BY`,
+      then `LIMIT` / `OFFSET` — `ORDER BY k, time DESC` is the latest row
+      per `k`. As on the engine, an `ORDER BY` must start with the `ON`
+      columns (400), resolves against the table rather than select aliases
+      (500), and aggregates or `GROUP BY` are refused (405). Without
+      `ORDER BY` the engine's choice and order are unspecified. An
+      expression in `ON` (`DATE_BIN(...)`) is refused by name.
     * `ORDER BY a [ASC|DESC][, b [ASC|DESC] ...]` — each term `time`, a
       column, an output alias, or (on raw and projected rows) an expression
       such as `CAST(level AS INTEGER) DESC`; every term applies, each with
@@ -918,16 +926,12 @@ defmodule InfluxElixir.Client.Local do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Executes a SQL-like query against stored ETS points and returns rows.
+  Executes a SQL query against the stored points and returns rows shaped as
+  InfluxDB 3 returns them.
 
-  Supports:
-
-    * `SELECT * FROM measurement`
-    * `SELECT DISTINCT column FROM measurement`
-    * `WHERE key = 'value'` / `WHERE key > N` / `WHERE key < N`
-    * `ORDER BY time ASC|DESC`
-    * `LIMIT N`
-    * `$param` placeholder substitution via `params: %{"$name" => value}`
+  The SQL subset, and what the double refuses by name, is described under
+  "SQL" in the moduledoc; `check_sql/1` answers without running. `$name`
+  placeholders take `params: %{"name" => value}` (or a keyword list).
   """
   @impl true
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::

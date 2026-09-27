@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`Client.Local` runs `SELECT DISTINCT ON (...)` (#23).** The double
+  refused every `DISTINCT ON` query. InfluxDB 3 (DataFusion) supports it,
+  and it is the idiomatic "latest row per key" query
+  (`... ORDER BY k, time DESC`). A consumer that rescued the refusal got
+  "no rows" from its tests instead of exercising the read path. The
+  double now keeps the first row per distinct key after `ORDER BY`,
+  before `LIMIT` and `OFFSET`, over plain or projected columns or `*`. It
+  follows the engine's rules, verified against InfluxDB 3 Core:
+  - `ORDER BY` must start with the `ON` columns, in order (400);
+  - `ORDER BY` resolves against the table, not select aliases (500);
+  - aggregates and `GROUP BY` are refused (405);
+  - an empty `ON ()` is a 400;
+  - a missing key column is the null key.
+
+  An expression in `ON`, such as `DATE_BIN(...)`, is refused by name.
 - **Writes can be all-or-nothing, and acknowledged before persistence.**
   InfluxDB 3's `accept_partial=false` and `no_sync=true` write parameters
   had no way through the client; `write/3` now takes `accept_partial:`

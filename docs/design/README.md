@@ -57,6 +57,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-26 | [`query-formats`](2026-09-26_query-formats.md) | Local answers `format:` as HTTP does: engine CSV strings (float rendering rule), nested-value connection error, Parquet refused, unknown format 400; empty CSV cells absent |
 | 2026-09-26 | [`batch-writer-shutdown`](2026-09-26_batch-writer-shutdown.md) | BatchWriter traps exits so a supervisor shutdown flushes; points encoded in the caller; one entry per retry chain |
 | 2026-09-27 | [`local-database-rules`](2026-09-27_local-database-rules.md) | Local drops the implicit "default" database (HTTP's `:no_database_specified`), defaults to the first of `:databases`, applies Core's name rules, 5-database limit, missing-database 404 and `_internal` |
+| 2026-09-27 | [`local-distinct-on`](2026-09-27_local-distinct-on.md) | #23: Local runs `SELECT DISTINCT ON (cols)` with the engine's semantics and refusals |
 
 ## Verifying against a real engine
 

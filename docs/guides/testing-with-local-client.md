@@ -332,6 +332,27 @@ with DataFusion's own message):
   )
 ```
 
+`SELECT DISTINCT ON (a[, b])` keeps the first row per distinct key after
+`ORDER BY` — the idiomatic "latest row per key":
+
+```elixir
+{:ok, latest} =
+  Local.query_sql(
+    conn,
+    "SELECT DISTINCT ON (symbol) symbol, price, time FROM prices ORDER BY symbol, time DESC",
+    database: "test_db"
+  )
+```
+
+It follows the engine's rules (verified against InfluxDB 3): `ORDER BY`
+must begin with the `ON` columns, in order (400 otherwise); `ORDER BY`
+names table columns, not select aliases (500); `LIMIT` and `OFFSET` apply
+to the de-duplicated rows; a row missing a key column belongs to the null
+key; aggregates and `GROUP BY` are the engine's 405. Without `ORDER BY`
+the engine picks an arbitrary row per key in an arbitrary order, so don't
+assert on it. The double takes plain columns in `ON` and refuses an
+expression such as `DATE_BIN(...)` by name.
+
 Selector functions return the value, or the timestamp, of the row a
 selector picks — `selector_first` / `selector_last` by time,
 `selector_min` / `selector_max` by the field. Either accessor works:
@@ -873,7 +894,8 @@ nothing is stored; `time` as a field is dropped silently, as a tag it is a
 - **No WAL flush delay**: Writes are immediately queryable (set `query_delay: 0`)
 - **In-memory only**: Data is lost when `stop/1` is called
 - **Simplified SQL parser**: Supports `SELECT *`, multi-column projection (with
-  optional `AS alias`), `SELECT DISTINCT col[, col ...]`, `WHERE` with binary
+  optional `AS alias`), `SELECT DISTINCT col[, col ...]`,
+  `SELECT DISTINCT ON (col[, col ...])`, `WHERE` with binary
   ops + `IN` / `NOT IN` (quoted literals are strings, bare literals are typed),
   `ORDER BY <column>`, `LIMIT`, `$param` substitution, `DATE_BIN` + aggregate
   functions (`AVG`, `SUM`, `COUNT`, `COUNT(*)`, `MIN`, `MAX`,

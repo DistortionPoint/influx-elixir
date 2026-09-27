@@ -90,6 +90,7 @@ defmodule InfluxElixir.ClientContract do
     db_admin_tests = if v3_sql, do: db_admin_tests(client), else: nil
     format_tests = if v3_sql, do: format_tests(client), else: nil
     database_rule_tests = if v3_sql, do: database_rule_tests(client), else: nil
+    distinct_on_tests = if v3_sql, do: distinct_on_tests(client), else: nil
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
     v2_write_rule_tests = if v2_ops, do: v2_write_rule_tests(client), else: nil
@@ -135,6 +136,7 @@ defmodule InfluxElixir.ClientContract do
         db_admin_tests,
         format_tests,
         database_rule_tests,
+        distinct_on_tests,
         bucket_tests,
         v2_write_rule_tests,
         v2_precision_tests,
@@ -2817,6 +2819,152 @@ defmodule InfluxElixir.ClientContract do
 
           assert {:error, %{status: 500, body: "cannot delete internal db"}} =
                    unquote(client).delete_database(ctx.conn, "_internal")
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SELECT DISTINCT ON (v3_core, v3_enterprise) — #23
+  # ---------------------------------------------------------------------------
+
+  defp distinct_on_tests(client) do
+    quote do
+      describe "SELECT DISTINCT ON contract" do
+        setup ctx do
+          m = "contract_don_#{System.unique_integer([:positive])}"
+
+          {:ok, :written} =
+            unquote(client).write(
+              ctx.conn,
+              Enum.join(
+                [
+                  "#{m},k=a v=1i,w=10i 1",
+                  "#{m},k=a v=2i 2",
+                  "#{m},k=b v=3i,w=30i 3",
+                  "#{m},k=b v=4i 4",
+                  "#{m},k=c v=5i 5",
+                  "#{m},k=a,j=x v=6i 6"
+                ],
+                "\n"
+              ),
+              database: ctx.database,
+              precision: :second
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+          {:ok, m: m}
+        end
+
+        defp don(client, ctx, sql),
+          do:
+            client.query_sql(ctx.conn, String.replace(sql, "__M__", ctx.m),
+              database: ctx.database
+            )
+
+        test "keeps the first row per key after ORDER BY: the latest per key", ctx do
+          assert {:ok,
+                  [
+                    %{"k" => "a", "v" => 6, "time" => ~U[1970-01-01 00:00:06.000000Z]},
+                    %{"k" => "b", "v" => 4},
+                    %{"k" => "c", "v" => 5}
+                  ]} =
+                   don(
+                     unquote(client),
+                     ctx,
+                     "SELECT DISTINCT ON (k) k, v, time FROM __M__ ORDER BY k, time DESC"
+                   )
+
+          # A null column of the kept row is absent, as on any row.
+          assert {:ok, [%{"k" => "a"} = a, _b, _c]} =
+                   don(
+                     unquote(client),
+                     ctx,
+                     "SELECT DISTINCT ON (k) k, w FROM __M__ ORDER BY k, time DESC"
+                   )
+
+          refute Map.has_key?(a, "w")
+        end
+
+        test "composes with WHERE, LIMIT and OFFSET, which apply after it", ctx do
+          assert {:ok, [%{"k" => "a", "v" => 6}, %{"k" => "b", "v" => 4}]} =
+                   don(
+                     unquote(client),
+                     ctx,
+                     "SELECT DISTINCT ON (k) k, v FROM __M__ WHERE v > 1 ORDER BY k, time DESC LIMIT 2"
+                   )
+
+          assert {:ok, [%{"k" => "b", "v" => 4}]} =
+                   don(
+                     unquote(client),
+                     ctx,
+                     "SELECT DISTINCT ON (k) k, v FROM __M__ ORDER BY k, v DESC LIMIT 1 OFFSET 1"
+                   )
+        end
+
+        test "several keys, a key that is not selected, a null key, SELECT *", ctx do
+          assert {:ok, [%{"k" => "a", "j" => "x", "v" => 6}, %{"k" => "a", "v" => 2}, _b, _c]} =
+                   don(
+                     unquote(client),
+                     ctx,
+                     "SELECT DISTINCT ON (k, j) k, j, v FROM __M__ ORDER BY k, j, time DESC"
+                   )
+
+          assert {:ok, [%{"v" => 6}, %{"v" => 4}, %{"v" => 5}]} =
+                   don(
+                     unquote(client),
+                     ctx,
+                     "SELECT DISTINCT ON (k) v FROM __M__ ORDER BY k, time DESC"
+                   )
+
+          assert {:ok, [%{"v" => 5} = null_key, %{"j" => "x", "v" => 6}]} =
+                   don(
+                     unquote(client),
+                     ctx,
+                     "SELECT DISTINCT ON (j) j, v FROM __M__ ORDER BY j NULLS FIRST, time DESC"
+                   )
+
+          refute Map.has_key?(null_key, "j")
+
+          assert {:ok, [%{"k" => "c", "v" => 5}, %{"k" => "b"}, %{"k" => "a"}]} =
+                   don(
+                     unquote(client),
+                     ctx,
+                     "SELECT DISTINCT ON (k) * FROM __M__ ORDER BY k DESC, time DESC"
+                   )
+        end
+
+        test "the engine's refusals", ctx do
+          mismatch =
+            "Error during planning: SELECT DISTINCT ON expressions must match initial " <>
+              "ORDER BY expressions"
+
+          for sql <- [
+                "SELECT DISTINCT ON (k) k, v FROM __M__ ORDER BY time DESC",
+                "SELECT DISTINCT ON (k, j) k, j, v FROM __M__ ORDER BY j, k"
+              ] do
+            assert {:error, %{status: 400, body: ^mismatch}} = don(unquote(client), ctx, sql)
+          end
+
+          assert {:error,
+                  %{status: 405, body: "This feature is not implemented: DISTINCT ON" <> _rest}} =
+                   don(
+                     unquote(client),
+                     ctx,
+                     "SELECT DISTINCT ON (k) k, max(v) FROM __M__ GROUP BY k ORDER BY k"
+                   )
+
+          assert {:error,
+                  %{status: 400, body: "Error during planning: No `ON` expressions provided"}} =
+                   don(unquote(client), ctx, "SELECT DISTINCT ON () k FROM __M__")
+
+          # ORDER BY is resolved against the table, not the select list.
+          assert {:error, %{status: 500, body: "Schema error: No field named kk." <> _rest}} =
+                   don(
+                     unquote(client),
+                     ctx,
+                     "SELECT DISTINCT ON (k) k AS kk, v FROM __M__ ORDER BY kk, time DESC"
+                   )
         end
       end
     end

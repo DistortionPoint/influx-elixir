@@ -70,6 +70,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
         true ->
           filtered
           |> apply_order_by(query.order_by)
+          |> distinct_on(query.distinct_on, & &1)
           |> apply_limit(query.limit, query.offset)
           |> Enum.map(&point_to_row/1)
       end
@@ -238,7 +239,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # alias instead, which is not a source column.
   @spec referenced_columns(SQLParser.parsed_query()) :: [binary()]
   defp referenced_columns(query) do
-    aliases = output_aliases(query)
+    aliases = if query.distinct_on, do: [], else: output_aliases(query)
 
     order_by_refs =
       Enum.flat_map(query.order_by, fn
@@ -251,6 +252,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
       where_refs(query.where) ++
       (query.group_by_columns || []) ++
       (query.distinct_columns || []) ++
+      (query.distinct_on || []) ++
       order_by_refs
   end
 
@@ -322,9 +324,34 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     points
     |> Enum.map(fn point -> {point, project_point(point, projection)} end)
     |> order_projected(query.order_by, projection)
+    |> distinct_on(query.distinct_on, fn {point, _row} -> point end)
     |> apply_limit(query.limit, query.offset)
     |> Enum.map(fn {_point, row} -> row end)
   end
+
+  # DISTINCT ON: the first row per distinct key, in the order ORDER BY left
+  # them; rows missing a key column share the null key. The key is read
+  # from the source point, so an ON column need not be selected.
+  @spec distinct_on([item], [binary()] | nil, (item -> point())) :: [item] when item: term()
+  defp distinct_on(items, nil, _point_of), do: items
+
+  defp distinct_on(items, columns, point_of) do
+    {kept, _seen} =
+      Enum.reduce(items, {[], MapSet.new()}, fn item, {kept, seen} ->
+        point = point_of.(item)
+        key = Enum.map(columns, &distinct_key(point, &1))
+
+        if MapSet.member?(seen, key),
+          do: {kept, seen},
+          else: {[item | kept], MapSet.put(seen, key)}
+      end)
+
+    Enum.reverse(kept)
+  end
+
+  @spec distinct_key(point(), binary()) :: term()
+  defp distinct_key(point, "time"), do: point.timestamp
+  defp distinct_key(point, column), do: point_value(point, column)
 
   @spec order_projected([{point(), map()}], SQLParser.order_by(), [SQLParser.projection()]) ::
           [{point(), map()}]

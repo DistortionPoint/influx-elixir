@@ -37,4 +37,5 @@
 - Arrow Flight uses gRPC on its own port: set `flight_port:` on the connection (or per call); InfluxDB 3 Core serves it on 8181 with `tls: false`
 - `params:` are not supported over Flight — the call returns `{:error, :params_unsupported_over_flight}`
 - NULL follows SQL on the server and `Client.Local` alike: `ORDER BY` puts nulls last ascending and first descending (`NULLS FIRST` / `NULLS LAST` override); `NOT (col = 'x')`, `NOT IN` and `NOT BETWEEN` drop rows where `col` is null; `SELECT DISTINCT` returns the all-null combination as `%{}`
+- `SELECT DISTINCT ON (k) ... ORDER BY k, time DESC` gives the latest row per `k` on the server and `Client.Local` alike; `ORDER BY` must start with the `ON` columns, and `LIMIT` / `OFFSET` apply after de-duplication — without `ORDER BY` the row kept is arbitrary on the server
 - In `LIKE` / `ILIKE`, `\` makes the next character literal (`s LIKE 'al\%%'`); a boolean column can stand alone as a predicate (`WHERE b`, `NOT b`)
