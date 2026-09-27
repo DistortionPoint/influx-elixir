@@ -7,7 +7,7 @@ defmodule InfluxElixir.Admin.Buckets do
 
   ## Examples
 
-      {:ok, conn} = InfluxElixir.Client.Local.start()
+      {:ok, conn} = InfluxElixir.Client.Local.start(profile: :v2)
 
       :ok = InfluxElixir.Admin.Buckets.create(conn, "my_bucket")
       {:ok, buckets} = InfluxElixir.Admin.Buckets.list(conn)

@@ -43,8 +43,9 @@ defmodule InfluxElixir.Client do
     * `:database` — connection-level default database name. When the
       caller does not pass `database:` in opts, this value is used.
     * `:databases` — list of database names. `Client.Local` pre-creates
-      each; `Client.HTTP` defaults `:database` to the first item when
-      `:database` is not set.
+      each; both default `:database` to the first item when `:database` is
+      not set. With neither key an operation that needs a database is
+      `{:error, :no_database_specified}` on both.
     * `:profile` — `Client.Local` only; ignored by `Client.HTTP`.
 
   Implementations must not silently ignore the singular `:database` key.

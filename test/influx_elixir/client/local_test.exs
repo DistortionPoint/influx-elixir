@@ -66,10 +66,10 @@ defmodule InfluxElixir.Client.LocalTest do
       assert :ets.info(conn.table) == :undefined
     end
 
-    test "pre-creates databases from options" do
-      {:ok, conn} = Local.start(databases: ["db1", "db2"])
-      assert MapSet.member?(conn.databases, "db1")
-      assert MapSet.member?(conn.databases, "db2")
+    test "pre-creates databases from options, listed with the engine's _internal" do
+      {:ok, conn} = Local.start(databases: ["db2", "db1"])
+      assert {:ok, dbs} = Local.list_databases(conn)
+      assert Enum.map(dbs, & &1["name"]) == ["_internal", "db1", "db2"]
       Local.stop(conn)
     end
 
@@ -98,26 +98,40 @@ defmodule InfluxElixir.Client.LocalTest do
       Local.stop(conn_b)
     end
 
-    test "stores :database singular as connection-level default" do
+    test ":database is the connection-level default and is pre-created" do
       {:ok, conn} = Local.start(database: "metrics")
-      assert conn.database == "metrics"
-      assert MapSet.member?(conn.databases, "metrics")
+      assert {:ok, :written} = Local.write(conn, "m v=1i")
+      assert {:ok, [%{"v" => 1}]} = Local.query_sql(conn, "SELECT v FROM m", database: "metrics")
+      assert {:ok, [_internal, %{"name" => "metrics"}]} = Local.list_databases(conn)
       Local.stop(conn)
     end
 
-    test ":database is nil when not specified" do
-      {:ok, conn} = Local.start(databases: ["x"])
-      assert conn.database == nil
+    test "without :database the first of :databases is the default, as over HTTP" do
+      # Client.HTTP.init_connection/1 does the same; Local used to write to
+      # a "default" database instead, so the same config diverged.
+      {:ok, conn} = Local.start(databases: ["x", "y"])
+      assert {:ok, :written} = Local.write(conn, "m v=1i")
+      assert {:ok, [%{"v" => 1}]} = Local.query_sql(conn, "SELECT v FROM m", database: "x")
       Local.stop(conn)
     end
 
     test "pre-creates both :database and :databases when both are given" do
       {:ok, conn} = Local.start(database: "primary", databases: ["a", "b"])
-      assert conn.database == "primary"
-      assert MapSet.member?(conn.databases, "primary")
-      assert MapSet.member?(conn.databases, "a")
-      assert MapSet.member?(conn.databases, "b")
+      assert {:ok, dbs} = Local.list_databases(conn)
+      assert Enum.map(dbs, & &1["name"]) == ["_internal", "a", "b", "primary"]
+      assert {:ok, :written} = Local.write(conn, "m v=1i")
+      assert {:ok, [_row]} = Local.query_sql(conn, "SELECT v FROM m", database: "primary")
       Local.stop(conn)
+    end
+
+    test "refuses a database the engine would refuse, with the engine's message" do
+      assert_raise ArgumentError, ~r/a\.b: .*invalid character in database or rp name/, fn ->
+        Local.start(databases: ["a.b"])
+      end
+
+      assert_raise ArgumentError, ~r/exceed limit of 5 databases/, fn ->
+        Local.start(databases: Enum.map(1..6, &"db#{&1}"))
+      end
     end
   end
 
@@ -144,10 +158,9 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu")
       assert row["value"] == 1.0
 
-      # Other databases don't see the write — still report no table
-      assert {:error,
-              %{status: 400, body: "Error during planning: table 'public.iox.cpu' not found"}} =
-               Local.query_sql(conn, "SELECT * FROM cpu", database: "default")
+      # The write created no other database.
+      assert {:ok, [%{"name" => "_internal"}, %{"name" => "primary"}]} =
+               Local.list_databases(conn)
 
       Local.stop(conn)
     end
@@ -168,19 +181,34 @@ defmodule InfluxElixir.Client.LocalTest do
       Local.stop(conn)
     end
 
-    test "falls back to \"default\" when neither opts nor conn specifies database" do
+    test "with no database anywhere, each operation answers as Client.HTTP does" do
+      # Local used to fall back to a "default" database the server does not
+      # have: code that forgot `database:` passed against the double and
+      # failed against InfluxDB.
       {:ok, conn} = Local.init_connection([])
-      assert {:ok, :written} = Local.write(conn, "cpu value=1.0")
-      {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu")
-      assert row["value"] == 1.0
-      Local.stop(conn)
+      on_exit(fn -> Local.stop(conn) end)
+
+      assert {:error, :no_database_specified} = Local.write(conn, "cpu value=1.0")
+      assert {:error, :no_database_specified} = Local.query_sql(conn, "SELECT 1")
+      assert {:error, :no_database_specified} = Local.execute_sql(conn, "SELECT 1")
+
+      assert_raise InfluxElixir.StreamError, fn ->
+        conn |> Local.query_sql_stream("SELECT 1") |> Enum.to_list()
+      end
+
+      # HTTP sends the InfluxQL without `db`; this is the engine's answer.
+      assert {:error, %{status: 400, body: "must specify a 'db' parameter" <> _rest}} =
+               Local.query_influxql(conn, "SHOW MEASUREMENTS")
+
+      assert {:ok, [%{"iox::database" => "_internal"}]} =
+               Local.query_influxql(conn, "SHOW DATABASES")
     end
 
     test "init_connection ignores unknown keys without auto-pre-creating them" do
       # A typo like :default_database must not silently become a database.
       {:ok, conn} = Local.init_connection(default_database: "typo_db")
-      assert conn.database == nil
-      refute MapSet.member?(conn.databases, "typo_db")
+      assert {:ok, [%{"name" => "_internal"}]} = Local.list_databases(conn)
+      assert {:error, :no_database_specified} = Local.write(conn, "m v=1i")
       Local.stop(conn)
     end
   end
@@ -1670,16 +1698,26 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["value"] == 2
     end
 
-    test "same measurement in two databases returns different data", %{conn: conn} do
-      {:ok, rows_a} = Local.query_sql(conn, "SELECT * FROM m", database: "db_a")
-      {:ok, rows_b} = Local.query_sql(conn, "SELECT * FROM m", database: "db_b")
-      assert hd(rows_a)["value"] != hd(rows_b)["value"]
+    test "a query against a database that does not exist is the engine's 404", %{conn: conn} do
+      body = ~s({"error":"query error: database not found: nope"})
+
+      # Any SQL statement, before it is parsed; InfluxQL after parsing.
+      for sql <- ["SELECT * FROM m", "SELECT 1", "DELETE FROM m", "SELEC 1"] do
+        assert {:error, %{status: 404, body: ^body}} =
+                 Local.query_sql(conn, sql, database: "nope")
+      end
+
+      assert {:error, %{status: 404, body: ^body}} =
+               Local.query_influxql(conn, "SELECT value FROM m", database: "nope")
+
+      assert {:error, %{status: 404, body: ^body}} =
+               Local.query_influxql(conn, "SHOW MEASUREMENTS", database: "nope")
     end
 
-    test "query without explicit database uses 'default'", %{conn: conn} do
-      Local.write(conn, "m value=99i", database: "default")
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m")
-      assert row["value"] == 99
+    test "query without explicit database uses the connection's default", %{conn: conn} do
+      # setup starts with databases: ["test_db"], the default as over HTTP.
+      Local.write(conn, "m value=99i", database: "test_db")
+      assert {:ok, [%{"value" => 99}]} = Local.query_sql(conn, "SELECT * FROM m")
     end
   end
 
@@ -3147,7 +3185,10 @@ defmodule InfluxElixir.Client.LocalTest do
       assert rows |> Enum.map(& &1["symbol"]) |> Enum.uniq() |> length() == writers * per_writer
     end
 
-    test "parallel create_database calls all register", %{conn: conn} do
+    test "parallel create_database calls all register" do
+      # Enterprise: Core allows only 5 databases.
+      {:ok, conn} = Local.start(profile: :v3_enterprise)
+      on_exit(fn -> Local.stop(conn) end)
       names = for i <- 1..16, do: "par_db_#{i}"
 
       names

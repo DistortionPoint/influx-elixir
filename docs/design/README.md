@@ -56,6 +56,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-26 | [`flux-csv-newlines`](2026-09-26_flux-csv-newlines.md) | InfluxDB 2's CSV turns `\n` in a value into `\r\n`; ResponseParser restores it so HTTP and Local agree |
 | 2026-09-26 | [`query-formats`](2026-09-26_query-formats.md) | Local answers `format:` as HTTP does: engine CSV strings (float rendering rule), nested-value connection error, Parquet refused, unknown format 400; empty CSV cells absent |
 | 2026-09-26 | [`batch-writer-shutdown`](2026-09-26_batch-writer-shutdown.md) | BatchWriter traps exits so a supervisor shutdown flushes; points encoded in the caller; one entry per retry chain |
+| 2026-09-27 | [`local-database-rules`](2026-09-27_local-database-rules.md) | Local drops the implicit "default" database (HTTP's `:no_database_specified`), defaults to the first of `:databases`, applies Core's name rules, 5-database limit, missing-database 404 and `_internal` |
 
 ## Verifying against a real engine
 

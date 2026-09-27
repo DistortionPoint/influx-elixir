@@ -19,6 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine's 400.
 
 ### Changed
+- **Breaking (tests): `Client.Local` has no implicit `"default"`
+  database.** With neither `:database` nor `:databases` configured, the
+  double wrote to and queried a `"default"` database, and listed it. The
+  server has no such database. `Client.HTTP` returns
+  `{:error, :no_database_specified}` for the same call, so code that
+  forgot `database:` passed its tests and failed in production. The
+  double now answers exactly as HTTP does:
+  - `write/3`, `query_sql/3` and `execute_sql/3` return
+    `{:error, :no_database_specified}`.
+  - `query_sql_stream/3` raises `StreamError` of kind `:no_database`.
+  - `query_influxql/3` returns the engine's 400 (`must specify a 'db'
+    parameter...`); `SHOW DATABASES` still works.
+
+  Without `:database`, the first of `:databases` is now the default, as
+  it already was in `Client.HTTP`. The Local connection map no longer
+  carries `:databases`, a snapshot taken at start that went stale on
+  every create and delete. Use `list_databases/1`.
 - **`Client.Local`'s ETS storage is its own module,
   `InfluxElixir.Client.Local.Store`.** The key layout, the atomic
   insert rules, the duplicate-merge fast path and the deletion bookkeeping
@@ -27,6 +44,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1,583 → 1,430 lines) holds no `:ets` call. Behaviour is unchanged.
 
 ### Fixed
+- **`Client.Local` ignored InfluxDB 3's database rules.** Each of the
+  following was verified against Core:
+  - **Names.** A name must start with an ASCII letter or digit and
+    contain only letters, digits, `_`, `-` and at most one `/` (the
+    `<db>/<rp>` form). The double accepted any name. It now returns the
+    engine's 400, with the engine's message, in the engine's order. This
+    applies to `create_database/3`, to a write that creates a database,
+    and to `start/1`, which raises.
+  - **Database limit.** Core holds at most 5 databases; the `:v3_core`
+    profile now returns the engine's 422 for a sixth.
+  - **Missing database.** A query against a database that does not
+    exist is the engine's 404,
+    `{"error":"query error: database not found: <name>"}`. That covers
+    SQL of any kind, even unparseable, and InfluxQL after parsing. The
+    double used to answer a table error, or rows for `SELECT 1`.
+  - **`_internal`.** `list_databases/1` and `SHOW DATABASES` include
+    the engine's own `_internal`, and dropping it is the engine's 500.
+- **InfluxQL with `format: :csv` in `Client.Local` aggregated strings.**
+  The inner SQL query inherited `format:`, so InfluxQL saw CSV strings
+  before rendering them again. The format now applies once, to the
+  InfluxQL result.
+- **Stale module examples.** Three module examples no longer worked:
+  `Write.Writer` wrote with no database, `Admin.Tokens` used the
+  `:v3_core` profile (tokens are Enterprise-only), and `Admin.Buckets`
+  used `:v3_core` (buckets are v2). All three now run as written.
 - **A stopping `BatchWriter` lost its buffer.** Its `terminate/2` flushed
   the buffer, but the writer did not trap exits. When a supervisor stopped
   it (application shutdown, `remove_connection/1`), the exit signal killed

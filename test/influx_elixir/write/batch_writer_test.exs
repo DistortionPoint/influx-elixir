@@ -31,7 +31,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   describe "start_link/1" do
     test "the :database option is the write target for every flush", %{conn: conn} do
       # Regression: :database was stored but never forwarded, so flushes
-      # landed in the connection default ("default") instead.
+      # landed in the connection's default database instead.
       pid = start_writer(conn, database: "target_db")
 
       :ok = BatchWriter.write_sync(pid, "cpu value=7.0")
@@ -39,8 +39,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert {:ok, [%{"value" => 7.0}]} =
                Local.query_sql(conn, "SELECT * FROM cpu", database: "target_db")
 
-      assert {:error, %{status: 400}} =
-               Local.query_sql(conn, "SELECT * FROM cpu", database: "default")
+      assert {:ok, [%{"name" => "_internal"}, %{"name" => "target_db"}]} =
+               Local.list_databases(conn)
     end
 
     test "starts with empty buffer and zeroed stats", %{conn: conn} do
@@ -52,105 +52,76 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
-  describe "write/2" do
-    test "accepts a line protocol binary and returns :ok", %{conn: conn} do
-      pid = start_writer(conn)
-      assert :ok = BatchWriter.write(pid, "cpu value=1.0")
+  # The rows of `measurement` in the writer's database, in time order.
+  defp stored(conn, measurement) do
+    case Local.query_sql(conn, "SELECT * FROM #{measurement} ORDER BY time", database: "test_db") do
+      {:ok, rows} -> rows
+      {:error, _no_table_yet} -> []
+    end
+  end
+
+  describe "write/3" do
+    test "buffers lines and Points until a flush stores them", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000)
+      :ok = BatchWriter.write(pid, "cpu value=1.0 1")
+      :ok = BatchWriter.write(pid, Point.new("cpu", %{"value" => 0.64}, timestamp: 2))
+
+      assert stored(conn, "cpu") == []
+      :ok = BatchWriter.flush(pid)
+      assert [%{"value" => 1.0}, %{"value" => 0.64}] = stored(conn, "cpu")
     end
 
-    test "accepts a Point struct and returns :ok", %{conn: conn} do
-      pid = start_writer(conn)
-      point = Point.new("cpu", %{"value" => 0.64})
-      assert :ok = BatchWriter.write(pid, point)
-    end
-
-    test "flushes when buffer reaches batch_size via explicit flush",
-         %{conn: conn} do
+    test "flushes on its own when the buffer reaches batch_size", %{conn: conn} do
       pid = start_writer(conn, batch_size: 3, flush_interval_ms: 60_000)
 
-      Enum.each(1..3, fn i ->
-        :ok = BatchWriter.write(pid, "cpu value=#{i}.0")
-      end)
+      :ok = BatchWriter.write(pid, "cpu value=1.0 1")
+      :ok = BatchWriter.write(pid, "cpu value=2.0 2")
+      assert stored(conn, "cpu") == []
 
-      # Explicitly flush to ensure all buffered data is written
-      :ok = BatchWriter.flush(pid)
-
-      {:ok, stats} = BatchWriter.stats(pid)
-      assert stats.total_writes >= 1
-      assert stats.total_bytes > 0
+      :ok = BatchWriter.write(pid, "cpu value=3.0 3")
+      assert length(stored(conn, "cpu")) == 3
+      assert {:ok, %{total_writes: 1}} = BatchWriter.stats(pid)
     end
   end
 
-  describe "write_sync/2" do
-    test "returns :ok after flush completes", %{conn: conn} do
-      pid = start_writer(conn)
-      assert :ok = BatchWriter.write_sync(pid, "cpu value=1.0")
-    end
-
-    test "increments total_writes after successful sync write",
+  describe "write_sync/3" do
+    test "returns once its line, and everything buffered before it, is stored",
          %{conn: conn} do
-      pid = start_writer(conn)
-      :ok = BatchWriter.write_sync(pid, "cpu value=1.0")
+      pid = start_writer(conn, flush_interval_ms: 60_000)
+      :ok = BatchWriter.write(pid, "cpu value=1.0 1")
 
-      {:ok, stats} = BatchWriter.stats(pid)
-      assert stats.total_writes == 1
-    end
-
-    test "with no_sync: true behaves like async write", %{conn: conn} do
-      pid = start_writer(conn, no_sync: true)
-      assert :ok = BatchWriter.write_sync(pid, "cpu value=1.0")
-    end
-
-    test "accepts a Point struct", %{conn: conn} do
-      pid = start_writer(conn)
-      point = Point.new("mem", %{"free" => 512})
-      assert :ok = BatchWriter.write_sync(pid, point)
+      assert :ok = BatchWriter.write_sync(pid, Point.new("cpu", %{"value" => 2.0}, timestamp: 2))
+      assert [%{"value" => 1.0}, %{"value" => 2.0}] = stored(conn, "cpu")
+      assert {:ok, %{total_writes: 1}} = BatchWriter.stats(pid)
     end
   end
 
-  describe "flush/1" do
-    test "returns :ok immediately on empty buffer", %{conn: conn} do
+  describe "flush/2" do
+    test "an empty buffer writes nothing", %{conn: conn} do
       pid = start_writer(conn)
       assert :ok = BatchWriter.flush(pid)
+      assert {:ok, %{total_writes: 0, total_bytes: 0}} = BatchWriter.stats(pid)
     end
 
-    test "flushes buffered writes and increments total_writes",
-         %{conn: conn} do
+    test "writes the buffer as one request and empties it", %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 60_000)
-      :ok = BatchWriter.write(pid, "cpu value=1.0")
-      :ok = BatchWriter.write(pid, "cpu value=2.0")
+      :ok = BatchWriter.write(pid, "cpu value=1.0 1")
+      :ok = BatchWriter.write(pid, "cpu value=2.0 2")
+      :ok = BatchWriter.flush(pid)
       :ok = BatchWriter.flush(pid)
 
-      {:ok, stats} = BatchWriter.stats(pid)
-      assert stats.total_writes == 1
-      assert stats.total_bytes > 0
+      assert length(stored(conn, "cpu")) == 2
+      payload = "cpu value=1.0 1\ncpu value=2.0 2"
+      assert {:ok, %{total_writes: 1, total_bytes: bytes}} = BatchWriter.stats(pid)
+      assert bytes == byte_size(payload)
     end
 
-    test "clears the buffer after flush", %{conn: conn} do
+    test "the timeout arities write and flush as the defaults do", %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 60_000)
-      Enum.each(1..3, fn i -> BatchWriter.write(pid, "cpu v=#{i}.0") end)
-      :ok = BatchWriter.flush(pid)
-
-      # A second flush on empty buffer should also succeed
-      assert :ok = BatchWriter.flush(pid)
-    end
-
-    test "flush/2 accepts an explicit timeout", %{conn: conn} do
-      pid = start_writer(conn, flush_interval_ms: 60_000)
-      :ok = BatchWriter.write(pid, "cpu value=1.0")
-
-      # Generous timeout — verifies the new arity accepts and forwards it.
-      assert :ok = BatchWriter.flush(pid, 10_000)
-    end
-
-    test "write/3 accepts an explicit timeout", %{conn: conn} do
-      pid = start_writer(conn, flush_interval_ms: 60_000)
-      assert :ok = BatchWriter.write(pid, "cpu value=1.0", 10_000)
-    end
-
-    test "write_sync/3 accepts an explicit timeout", %{conn: conn} do
-      pid = start_writer(conn, flush_interval_ms: 60_000)
-      assert :ok = BatchWriter.write_sync(pid, "cpu value=1.0", 10_000)
+      :ok = BatchWriter.write(pid, "cpu value=1.0 1", 10_000)
+      :ok = BatchWriter.flush(pid, 10_000)
+      :ok = BatchWriter.write_sync(pid, "cpu value=2.0 2", 10_000)
+      assert length(stored(conn, "cpu")) == 2
     end
 
     test "GenServer.call timeout fires when the wait bound is exceeded",
@@ -181,9 +152,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
 
     test "forwards :write_opts to Writer.write/3 on flush" do
-      # Use a conn with two databases. Without :write_opts, Local would
-      # fall back to the conn-level default ("default"). With
-      # write_opts: [database: "metrics"], the flush must land there.
+      # write_opts' :database wins over the writer's :database.
       {:ok, conn} = Local.start(databases: ["metrics"])
       on_exit(fn -> Local.stop(conn) end)
 
@@ -201,15 +170,13 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       :ok = BatchWriter.write_sync(pid, "cpu value=1.0")
 
-      # Data should be in "metrics", not "default"
       assert {:ok, [row]} =
                Local.query_sql(conn, "SELECT * FROM cpu", database: "metrics")
 
       assert row["value"] == 1.0
 
-      assert {:error,
-              %{status: 400, body: "Error during planning: table 'public.iox.cpu' not found"}} =
-               Local.query_sql(conn, "SELECT * FROM cpu", database: "default")
+      assert {:ok, [%{"name" => "_internal"}, %{"name" => "metrics"}]} =
+               Local.list_databases(conn)
     end
   end
 
@@ -234,26 +201,16 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   end
 
   describe "stats/1" do
-    test "total_bytes accumulates correctly", %{conn: conn} do
-      pid = start_writer(conn, flush_interval_ms: 60_000)
-      payload = "cpu value=1.0"
-      :ok = BatchWriter.write(pid, payload)
-      :ok = BatchWriter.flush(pid)
-
-      {:ok, stats} = BatchWriter.stats(pid)
-      assert stats.total_bytes == byte_size(payload)
-    end
-
-    test "total_writes increments on each flush", %{conn: conn} do
+    test "total_writes and total_bytes accumulate across flushes", %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 60_000)
 
       :ok = BatchWriter.write(pid, "cpu v=1.0")
       :ok = BatchWriter.flush(pid)
-      :ok = BatchWriter.write(pid, "cpu v=2.0")
+      :ok = BatchWriter.write(pid, "cpu v=22.0")
       :ok = BatchWriter.flush(pid)
 
-      {:ok, stats} = BatchWriter.stats(pid)
-      assert stats.total_writes == 2
+      assert {:ok, %{total_writes: 2, total_bytes: 19, total_errors: 0}} =
+               BatchWriter.stats(pid)
     end
   end
 
@@ -342,12 +299,12 @@ defmodule InfluxElixir.Write.BatchWriterTest do
           flush_interval_ms: 60_000
         )
 
-      :ok = BatchWriter.write_sync(pid, "cpu value=1.0")
-      :ok = BatchWriter.write_sync(pid, "cpu value=2.0")
+      :ok = BatchWriter.write_sync(pid, "cpu value=1.0 1")
+      assert stored(conn, "cpu") == []
+      :ok = BatchWriter.write_sync(pid, "cpu value=2.0 2")
 
-      # batch_size=2, no_sync=true → maybe_flush_on_batch triggers do_flush
-      {:ok, stats} = BatchWriter.stats(pid)
-      assert stats.total_writes >= 1
+      assert {:ok, %{total_writes: 1}} = BatchWriter.stats(pid)
+      assert length(stored(conn, "cpu")) == 2
     end
 
     test "write_sync with no_sync under batch_size does not flush",
@@ -623,9 +580,9 @@ defmodule InfluxElixir.Write.BatchWriterTest do
           max_retries: 0
         )
 
-      # write_sync should return the error (not hang)
-      result = BatchWriter.write_sync(pid, "!!!")
-      assert {:error, _reason} = result
+      # The caller gets the engine's 400, and the batch is counted as an error.
+      assert {:error, %{status: 400}} = BatchWriter.write_sync(pid, "!!!")
+      assert {:ok, %{total_errors: 1, total_writes: 0}} = BatchWriter.stats(pid)
     end
   end
 end

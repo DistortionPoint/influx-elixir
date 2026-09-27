@@ -4,6 +4,8 @@
 - Set `config :influx_elixir, :client, InfluxElixir.Client.Local` in `config/test.exs`
 - LocalClient is NOT a mock — it stores data in ETS and responds like real InfluxDB
 - Each test process gets isolated ETS tables for `async: true` safety
+- There is no implicit "default" database: name one with `database:` (or `databases:`, whose first entry is the default, as over HTTP) — without one, writes and queries are `{:error, :no_database_specified}` on both clients
+- Database names follow InfluxDB 3's rules (ASCII letters, digits, `_`, `-`, one `/`; starting with a letter or digit) and the `:v3_core` profile holds at most 5 databases, as Core does; a query against a missing database is the engine's 404, and `list_databases/1` includes `_internal`
 
 ## Test Helpers
 - Use `InfluxElixir.TestHelper.setup_influx/1` in test setup blocks

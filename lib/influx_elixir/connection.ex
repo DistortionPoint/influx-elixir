@@ -13,7 +13,7 @@ defmodule InfluxElixir.Connection do
   depends on the configured client implementation:
 
   - `Client.HTTP` — keyword list (host, token, etc.)
-  - `Client.Local` — map with ETS table reference (`%{table: _, databases: _, profile: _}`)
+  - `Client.Local` — map with ETS table reference (`%{table: _, database: _, profile: _}`)
 
   ## Usage
 

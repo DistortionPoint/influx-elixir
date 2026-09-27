@@ -7,7 +7,7 @@ defmodule InfluxElixir.Admin.Tokens do
 
   ## Examples
 
-      {:ok, conn} = InfluxElixir.Client.Local.start()
+      {:ok, conn} = InfluxElixir.Client.Local.start(profile: :v3_enterprise)
 
       {:ok, token} = InfluxElixir.Admin.Tokens.create(conn, "my token")
       :ok = InfluxElixir.Admin.Tokens.delete(conn, token["id"])

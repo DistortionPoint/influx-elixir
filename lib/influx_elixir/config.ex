@@ -13,9 +13,9 @@ defmodule InfluxElixir.Config do
     * `:token` - Authentication token. Required.
     * `:org` - Organization name (default: `""`)
     * `:database` - Default database name (default: `nil`)
-    * `:databases` - List of database names (informational; LocalClient
-      pre-creates them, HTTP defaults `:database` to the first item if
-      `:database` is not set). Default: `[]`
+    * `:databases` - List of database names (LocalClient pre-creates them;
+      both clients default `:database` to the first item if `:database` is
+      not set). Default: `[]`
     * `:port` - Port number (default: `8086`)
     * `:scheme` - `:http` or `:https` (default: `:https`)
     * `:pool_size` - Finch connection pool size (default: `10`)
@@ -70,7 +70,7 @@ defmodule InfluxElixir.Config do
       default: [],
       doc:
         "List of database names. LocalClient pre-creates each; " <>
-          "HTTP defaults :database to the first item if :database is unset."
+          "both clients default :database to the first item if :database is unset."
     ],
     port: [
       type: :pos_integer,

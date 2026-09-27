@@ -89,6 +89,7 @@ defmodule InfluxElixir.ClientContract do
     atomic_write_tests = if v3_sql, do: atomic_write_tests(client), else: nil
     db_admin_tests = if v3_sql, do: db_admin_tests(client), else: nil
     format_tests = if v3_sql, do: format_tests(client), else: nil
+    database_rule_tests = if v3_sql, do: database_rule_tests(client), else: nil
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
     v2_write_rule_tests = if v2_ops, do: v2_write_rule_tests(client), else: nil
@@ -133,6 +134,7 @@ defmodule InfluxElixir.ClientContract do
         atomic_write_tests,
         db_admin_tests,
         format_tests,
+        database_rule_tests,
         bucket_tests,
         v2_write_rule_tests,
         v2_precision_tests,
@@ -2760,6 +2762,61 @@ defmodule InfluxElixir.ClientContract do
             |> Enum.to_list()
 
           assert rows == [%{"v" => 1.5}, %{"v" => 1.0e15}]
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Database names and existence (v3_core, v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  defp database_rule_tests(client) do
+    quote do
+      describe "database rules contract" do
+        test "a query against a missing database is a 404, SQL and InfluxQL", ctx do
+          db = "contract_missing_#{System.unique_integer([:positive])}"
+          body = ~s({"error":"query error: database not found: #{db}"})
+
+          assert {:error, %{status: 404, body: ^body}} =
+                   unquote(client).query_sql(ctx.conn, "SELECT 1", database: db)
+
+          assert {:error, %{status: 404, body: ^body}} =
+                   unquote(client).query_influxql(ctx.conn, "SHOW MEASUREMENTS", database: db)
+        end
+
+        test "a name the engine refuses is its 400, in its order", ctx do
+          for {name, message} <- [
+                {"", "db name cannot be empty"},
+                {"_x", "db name did not start with a number or letter"},
+                {"a.b/c/d",
+                 "invalid character in database or rp name: must be ASCII, containing " <>
+                   "only letters, numbers, underscores, or hyphens"},
+                {"a/",
+                 "db name with invalid retention policy, if providing a retention policy " <>
+                   "name, must be of form '<db_name>/<rp_name>'"}
+              ] do
+            body = Jason.encode!(%{"error" => message})
+
+            assert {:error, %{status: 400, body: ^body}} =
+                     unquote(client).create_database(ctx.conn, name, []),
+                   inspect(name)
+
+            assert {:error, %{status: 400, body: ^body}} =
+                     unquote(client).write(ctx.conn, "m v=1i", database: name),
+                   inspect(name)
+          end
+        end
+
+        test "the engine's _internal is listed and cannot be dropped", ctx do
+          {:ok, dbs} = unquote(client).list_databases(ctx.conn)
+          assert "_internal" in Enum.map(dbs, & &1["name"])
+
+          assert {:ok, rows} = unquote(client).query_influxql(ctx.conn, "SHOW DATABASES")
+          assert %{"iox::database" => "_internal", "deleted" => false} in rows
+
+          assert {:error, %{status: 500, body: "cannot delete internal db"}} =
+                   unquote(client).delete_database(ctx.conn, "_internal")
         end
       end
     end

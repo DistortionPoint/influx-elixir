@@ -143,10 +143,31 @@ in opts, this value is used:
 ```
 
 `:databases` (list) is also accepted by both implementations:
-`Client.Local` pre-creates each entry; `Client.HTTP` uses the first
-entry as the default when `:database` is not set. This makes a config
-like `database: "primary", databases: ["primary", "backup"]` a true
-drop-in across implementations.
+`Client.Local` pre-creates each entry, and both use the first entry as
+the default when `:database` is not set, so any combination of the two
+keys resolves to the same database on either client.
+
+With neither key there is no default database — as on the server,
+which has none. An operation that needs one returns
+`{:error, :no_database_specified}` (InfluxQL answers the engine's 400,
+`SHOW DATABASES` still works). Earlier versions of the double wrote to
+an implicit `"default"` database instead, so code that forgot
+`database:` passed its tests and failed in production.
+
+The double also applies the server's database rules (verified against
+InfluxDB 3 Core):
+
+- A name must start with an ASCII letter or digit and contain only
+  letters, digits, `_`, `-` and at most one `/` (InfluxDB 1's
+  `<db>/<rp>` form); anything else is the engine's 400, from
+  `create_database/3`, from a write that would create the database and
+  from `start/1` (which raises).
+- The `:v3_core` profile holds at most 5 databases, as Core does: a
+  sixth is the engine's 422.
+- A query against a database that does not exist is the engine's 404
+  `{"error":"query error: database not found: <name>"}`.
+- `list_databases/1` and `SHOW DATABASES` include the engine's own
+  `_internal`, which cannot be dropped (500).
 
 ## Profile Enforcement
 

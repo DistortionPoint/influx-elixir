@@ -298,6 +298,7 @@ defmodule InfluxElixir.Client.Local do
   @behaviour InfluxElixir.Client
 
   alias InfluxElixir.Client.Local.{
+    DatabaseRules,
     Flux,
     Format,
     InfluxQL,
@@ -313,7 +314,6 @@ defmodule InfluxElixir.Client.Local do
 
   @type conn :: %{
           table: Store.t(),
-          databases: MapSet.t(binary()),
           database: binary() | nil,
           profile: profile()
         }
@@ -387,7 +387,14 @@ defmodule InfluxElixir.Client.Local do
 
     * `:database` - connection-level default database name. Used when the
       caller does not pass `database:` in opts. Pre-created automatically.
-    * `:databases` - list of database names to pre-create (default: `[]`)
+    * `:databases` - list of database names to pre-create (default: `[]`).
+      Without `:database`, the first is the default, as in `Client.HTTP`.
+      With neither there is no default: an operation that needs a database
+      is `{:error, :no_database_specified}`, as over HTTP.
+
+  On the v3 profiles each name must be one InfluxDB 3 accepts, and
+  `:v3_core` holds at most 5; `start/1` raises `ArgumentError` with the
+  engine's message otherwise (see `InfluxElixir.Client.Local.DatabaseRules`).
     * `:profile` - InfluxDB version profile to emulate. Determines which
       operations are available. Operations outside the profile return
       `{:error, :unsupported_operation}`. Valid values:
@@ -419,29 +426,20 @@ defmodule InfluxElixir.Client.Local do
               "Must be one of: :v3_core, :v3_enterprise, :v2"
     end
 
-    # "default" is always pre-created so writes without an explicit
-    # database: opt succeed. The connection-level :database (if given)
-    # is also pre-created so it can be used as a query target.
-    database = Keyword.get(opts, :database)
+    # As `Client.HTTP.init_connection/1`: without `:database` the first of
+    # `:databases` is the default. With neither there is none, and an
+    # operation that needs one is `{:error, :no_database_specified}` — no
+    # "default" database the server does not have.
+    listed = Keyword.get(opts, :databases, [])
+    database = Keyword.get(opts, :database) || List.first(listed)
+    databases = Enum.uniq(listed ++ List.wrap(database))
 
-    databases =
-      [Keyword.get(opts, :databases, []), List.wrap(database), ["default"]]
-      |> Enum.concat()
-      |> MapSet.new()
+    if profile != :v2, do: DatabaseRules.check_start!(databases, profile)
 
     # A public ETS store (see `InfluxElixir.Client.Local.Store`): every
     # mutation is one insert or delete of its own key, so no process is
     # needed to make concurrent writers safe.
-    table = Store.new(databases)
-
-    conn = %{
-      table: table,
-      databases: databases,
-      database: database,
-      profile: profile
-    }
-
-    {:ok, conn}
+    {:ok, %{table: Store.new(databases), database: database, profile: profile}}
   end
 
   @doc """
@@ -482,11 +480,40 @@ defmodule InfluxElixir.Client.Local do
     if supports?(conn, operation), do: :ok, else: {:error, :unsupported_operation}
   end
 
-  # Mirrors HTTP's resolve_database/2: prefer opts[:database], then the
-  # connection-level default, then "default" (which is always pre-created).
-  @spec resolve_database(keyword(), conn()) :: binary()
+  # Mirrors HTTP's resolve_database/2: opts[:database], then the
+  # connection-level default; neither is the HTTP client's error.
+  @spec resolve_database(keyword(), conn()) ::
+          {:ok, binary()} | {:error, :no_database_specified}
   defp resolve_database(opts, conn) do
-    Keyword.get(opts, :database) || Map.get(conn, :database) || "default"
+    case Keyword.get(opts, :database) || Map.get(conn, :database) do
+      nil -> {:error, :no_database_specified}
+      database -> {:ok, database}
+    end
+  end
+
+  # A query names a database the engine has (verified: SQL of any kind and
+  # InfluxQL other than SHOW DATABASES answer 404 otherwise). `_internal`
+  # exists on the engine, but its system tables are not modelled.
+  @spec database_exists(Store.t(), binary()) :: :ok | {:error, map()}
+  defp database_exists(table, database) do
+    cond do
+      Store.database?(table, database) ->
+        :ok
+
+      database == DatabaseRules.internal() ->
+        {:error,
+         %{
+           status: 400,
+           body: "Client.Local: the _internal database's system tables are not modelled"
+         }}
+
+      true ->
+        {:error,
+         %{
+           status: 404,
+           body: Jason.encode!(%{"error" => "query error: database not found: #{database}"})
+         }}
+    end
   end
 
   @doc """
@@ -517,9 +544,8 @@ defmodule InfluxElixir.Client.Local do
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(%{table: table, profile: profile} = conn, payload, opts \\ []) do
-    database = resolve_database(opts, conn)
-
     with :ok <- require_capability(conn, :write),
+         {:ok, database} <- resolve_database(opts, conn),
          {:ok, text} <- maybe_decompress(payload),
          {:ok, precision} <- normalize_precision(Keyword.get(opts, :precision), profile),
          {:ok, accept_partial} <- write_flag(opts, :accept_partial, true, profile),
@@ -907,18 +933,26 @@ defmodule InfluxElixir.Client.Local do
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_sql(%{table: table} = conn, sql, opts \\ []) do
-    with :ok <- require_capability(conn, :query_sql) do
+    with :ok <- require_capability(conn, :query_sql),
+         {:ok, database} <- resolve_database(opts, conn) do
       # The engine answers query_sql and execute_sql from the same endpoint:
       # a statement that is not a query gets execute_sql's answer.
       if statement_kind(String.trim(sql)) == :query,
-        do: Format.answer(query_format(opts), fn -> run_query(table, conn, sql, opts) end),
+        do:
+          Format.answer(query_format(opts), fn -> query_database(table, database, sql, opts) end),
         else: execute_sql(conn, sql, opts)
     end
   end
 
-  @spec run_query(Store.t(), map(), binary(), keyword()) :: InfluxElixir.Client.query_result()
-  defp run_query(table, conn, sql, opts) do
-    database = resolve_database(opts, conn)
+  @spec query_database(Store.t(), binary(), binary(), keyword()) ::
+          InfluxElixir.Client.query_result()
+  defp query_database(table, database, sql, opts) do
+    with :ok <- database_exists(table, database), do: run_query(table, database, sql, opts)
+  end
+
+  @spec run_query(Store.t(), binary(), binary(), keyword()) ::
+          InfluxElixir.Client.query_result()
+  defp run_query(table, database, sql, opts) do
     resolved_sql = SQLParser.resolve_params(sql, Keyword.get(opts, :params, %{}))
 
     with nil <- SQLParser.unbound_placeholder(resolved_sql),
@@ -1000,7 +1034,9 @@ defmodule InfluxElixir.Client.Local do
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map() | [map()]} | {:error, term()}
   def execute_sql(%{table: table, profile: profile} = conn, sql, opts \\ []) do
-    with :ok <- require_capability(conn, :execute_sql) do
+    with :ok <- require_capability(conn, :execute_sql),
+         {:ok, database} <- resolve_database(opts, conn),
+         :ok <- database_exists(table, database) do
       trimmed = String.trim(sql)
 
       case statement_kind(trimmed) do
@@ -1010,7 +1046,7 @@ defmodule InfluxElixir.Client.Local do
         :delete when profile == :v3_enterprise ->
           case Regex.run(~r/^(?i)DELETE\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)$/s, trimmed) do
             [_full, measurement_raw, rest] ->
-              execute_delete(table, resolve_database(opts, conn), measurement_raw, rest)
+              execute_delete(table, database, measurement_raw, rest)
 
             nil ->
               {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}}
@@ -1117,21 +1153,54 @@ defmodule InfluxElixir.Client.Local do
   @spec do_query_influxql(Store.t(), map(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   defp do_query_influxql(table, conn, influxql, opts) do
-    database = resolve_database(opts, conn)
-
-    cond do
-      String.match?(influxql, @show_databases) ->
-        {:ok, Enum.map(Store.databases(table), &%{"iox::database" => &1, "deleted" => false})}
-
-      String.match?(influxql, @show_measurements) ->
-        {:ok, show_measurements(table, database)}
-
-      match = Regex.run(@show_keys, influxql) ->
-        {:ok, show_keys(table, database, match)}
-
-      true ->
-        influxql_select(table, conn, influxql, opts)
+    if String.match?(influxql, @show_databases) do
+      {:ok, Enum.map(database_names(table), &%{"iox::database" => &1, "deleted" => false})}
+    else
+      # The engine parses the statement before it looks for the database.
+      with {:ok, statement} <- influxql_statement(influxql),
+           {:ok, database} <- influxql_database(opts, conn),
+           :ok <- database_exists(table, database) do
+        case statement do
+          :show_measurements -> {:ok, show_measurements(table, database)}
+          {:show_keys, match} -> {:ok, show_keys(table, database, match)}
+          {:select, query} -> influxql_select(table, conn, database, query, opts)
+        end
+      end
     end
+  end
+
+  @spec influxql_statement(binary()) ::
+          {:ok, :show_measurements | {:show_keys, [binary()]} | {:select, map()}}
+          | {:error, term()}
+  defp influxql_statement(influxql) do
+    cond do
+      String.match?(influxql, @show_measurements) -> {:ok, :show_measurements}
+      match = Regex.run(@show_keys, influxql) -> {:ok, {:show_keys, match}}
+      true -> with {:ok, query} <- influxql_parse(influxql), do: {:ok, {:select, query}}
+    end
+  end
+
+  # HTTP sends an InfluxQL query without `db` when there is none, and the
+  # engine answers this 400 (verified).
+  @spec influxql_database(keyword(), conn()) :: {:ok, binary()} | {:error, map()}
+  defp influxql_database(opts, conn) do
+    case resolve_database(opts, conn) do
+      {:ok, _database} = ok ->
+        ok
+
+      {:error, :no_database_specified} ->
+        {:error,
+         %{
+           status: 400,
+           body: "must specify a 'db' parameter, or provide the database in the InfluxQL query"
+         }}
+    end
+  end
+
+  # The engine lists its own `_internal` database with the others (sorted).
+  @spec database_names(Store.t()) :: [binary()]
+  defp database_names(table) do
+    table |> Store.databases() |> MapSet.put(DatabaseRules.internal()) |> Enum.sort()
   end
 
   @spec show_measurements(Store.t(), binary()) :: [map()]
@@ -1176,29 +1245,32 @@ defmodule InfluxElixir.Client.Local do
   # share: comparisons, AND/OR/NOT, time literals, now()); InfluxQL then
   # shapes the rows. A measurement or column the engine does not know is an
   # empty InfluxQL result, not an error (verified).
-  @spec influxql_select(Store.t(), map(), binary(), keyword()) ::
+  #
+  # The inner query gets typed rows: the caller's `format:` applies once, to
+  # the InfluxQL result (it used to render the rows as CSV strings before
+  # InfluxQL aggregated them).
+  @spec influxql_select(Store.t(), map(), binary(), InfluxQL.query(), keyword()) ::
           InfluxElixir.Client.query_result()
-  defp influxql_select(table, conn, influxql, opts) do
-    with {:ok, query} <- influxql_parse(influxql) do
-      where = if query.where, do: " WHERE " <> query.where, else: ""
-      # ORDER BY time sorts on the stored nanoseconds; rows carry microsecond
-      # DateTimes, so sorting those alone would tie sub-microsecond points.
-      sql = ~s|SELECT * FROM "#{query.measurement}"| <> where <> " ORDER BY time"
+  defp influxql_select(table, conn, database, query, opts) do
+    where = if query.where, do: " WHERE " <> query.where, else: ""
+    # ORDER BY time sorts on the stored nanoseconds; rows carry microsecond
+    # DateTimes, so sorting those alone would tie sub-microsecond points.
+    sql = ~s|SELECT * FROM "#{query.measurement}"| <> where <> " ORDER BY time"
+    inner_opts = opts |> Keyword.drop([:params, :format]) |> Keyword.put(:database, database)
 
-      case query_sql(conn, sql, Keyword.delete(opts, :params)) do
-        {:ok, rows} ->
-          tags = Store.tag_columns(table, resolve_database(opts, conn), query.measurement)
-          {:ok, InfluxQL.run(query, rows, tags)}
+    case query_sql(conn, sql, inner_opts) do
+      {:ok, rows} ->
+        tags = Store.tag_columns(table, database, query.measurement)
+        {:ok, InfluxQL.run(query, rows, tags)}
 
-        {:error, %{body: "Error during planning: table " <> _rest}} ->
-          {:ok, []}
+      {:error, %{body: "Error during planning: table " <> _rest}} ->
+        {:ok, []}
 
-        {:error, %{body: "Schema error: No field named" <> _rest}} ->
-          {:ok, []}
+      {:error, %{body: "Schema error: No field named" <> _rest}} ->
+        {:ok, []}
 
-        error ->
-          error
-      end
+      error ->
+        error
     end
   end
 
@@ -1272,7 +1344,10 @@ defmodule InfluxElixir.Client.Local do
   @doc """
   Creates a named database in this local instance.
 
-  Always succeeds — creating an already-existing database is idempotent.
+  Creating an existing database is `:ok` (the engine's 409, which
+  `Client.HTTP` treats as success). A name the engine refuses is its 400,
+  and a sixth database on the `:v3_core` profile its 422 — see
+  `InfluxElixir.Client.Local.DatabaseRules`.
   """
   @impl true
   @spec create_database(
@@ -1281,27 +1356,23 @@ defmodule InfluxElixir.Client.Local do
           keyword()
         ) :: :ok | {:error, term()}
   def create_database(%{table: table} = conn, name, _opts \\ []) do
-    with :ok <- require_capability(conn, :create_database) do
+    with :ok <- require_capability(conn, :create_database),
+         :ok <- DatabaseRules.check_new(name, Store.databases(table), conn.profile) do
       Store.put_database(table, name)
       :ok
     end
   end
 
   @doc """
-  Returns all databases created in this local instance as a list of maps
-  with a single `:name` key.
+  Returns the databases as maps with a single `"name"` key, sorted, with
+  the engine's own `_internal` among them as InfluxDB 3 lists it.
   """
   @impl true
   @spec list_databases(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
   def list_databases(%{table: table} = conn) do
     with :ok <- require_capability(conn, :list_databases) do
-      dbs =
-        table
-        |> Store.databases()
-        |> Enum.map(&%{"name" => &1})
-
-      {:ok, dbs}
+      {:ok, Enum.map(database_names(table), &%{"name" => &1})}
     end
   end
 
@@ -1316,7 +1387,8 @@ defmodule InfluxElixir.Client.Local do
   @spec delete_database(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_database(%{table: table} = conn, name) do
-    with :ok <- require_capability(conn, :delete_database) do
+    with :ok <- require_capability(conn, :delete_database),
+         :ok <- deletable(name) do
       # Dropping a database drops its tables: points and schema go with it,
       # so a re-created database starts empty.
       case Store.drop_database(table, name) do
@@ -1325,6 +1397,11 @@ defmodule InfluxElixir.Client.Local do
       end
     end
   end
+
+  # The engine's answer for its own database (verified).
+  @spec deletable(binary()) :: :ok | {:error, map()}
+  defp deletable("_internal"), do: {:error, %{status: 500, body: "cannot delete internal db"}}
+  defp deletable(_name), do: :ok
 
   # ---------------------------------------------------------------------------
   # Bucket admin (v2 compat)
@@ -1478,8 +1555,10 @@ defmodule InfluxElixir.Client.Local do
   # v3 Core/Enterprise auto-create databases on write; v2 requires pre-existing
   @spec ensure_database(Store.t(), binary(), profile()) :: :ok | {:error, term()}
   defp ensure_database(table, database, profile) when profile in [:v3_core, :v3_enterprise] do
-    Store.put_database(table, database)
-    :ok
+    with :ok <- DatabaseRules.check_new(database, Store.databases(table), profile) do
+      Store.put_database(table, database)
+      :ok
+    end
   end
 
   # v2 writes target buckets, so anything registered via `create_bucket/3` is a

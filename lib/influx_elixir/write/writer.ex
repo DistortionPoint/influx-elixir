@@ -34,7 +34,7 @@ defmodule InfluxElixir.Write.Writer do
 
   ## Examples
 
-      iex> {:ok, conn} = InfluxElixir.Client.Local.start()
+      iex> {:ok, conn} = InfluxElixir.Client.Local.start(database: "mydb")
       iex> InfluxElixir.Write.Writer.write(conn, "cpu value=1.0")
       {:ok, :written}
   """
