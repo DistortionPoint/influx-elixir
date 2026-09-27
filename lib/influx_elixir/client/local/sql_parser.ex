@@ -11,7 +11,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   Pure functions only: no ETS, no connection state.
   """
 
-  alias InfluxElixir.Client.Local.LineProtocolParser
+  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLIdentifiers}
 
   # The one place a SELECT is cut into its parts. A measurement name is
   # quoted, or bare with escaped spaces ("my\ measurement") — everything up
@@ -151,9 +151,19 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @doc """
   Parses a statement — an optional `WITH` list of non-recursive CTEs followed
   by one `SELECT` — into a `t:parsed_query/0`.
+
+  Identifiers follow DataFusion's rules (see
+  `InfluxElixir.Client.Local.SQLIdentifiers`) unless `identifiers: :exact`
+  is given — for SQL the double writes itself, from InfluxQL, whose
+  identifiers are case-sensitive.
   """
-  @spec parse_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
-  def parse_select(sql) do
+  @spec parse_select(binary(), keyword()) :: {:ok, parsed_query()} | {:error, term()}
+  def parse_select(sql, opts \\ []) do
+    sql =
+      if Keyword.get(opts, :identifiers, :fold) == :exact,
+        do: sql,
+        else: SQLIdentifiers.normalize(sql)
+
     with {:ok, cte_sources, main_sql} <- split_ctes(String.trim(sql)),
          {:ok, ctes} <- parse_ctes(cte_sources),
          {:ok, main} <- parse_single_select(main_sql) do
@@ -1278,17 +1288,18 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       Regex.match?(~r/^(?:-?\d+(?:\.\d+)?|'[^']*')$/, trimmed) ->
         {:error, local_error("unsupported column (a constant needs AS alias): #{col}")}
 
-      match = Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/i, trimmed) ->
+      # A quoted alias keeps a name that needs its quotes (`AS "The Host"`).
+      match = Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+|"[^"]+"))?$/i, trimmed) ->
         case match do
           [_full, name] -> {:ok, {name, name}}
-          [_full, name, alias_name] -> {:ok, {name, alias_name}}
+          [_full, name, alias_name] -> {:ok, {name, String.trim(alias_name, "\"")}}
         end
 
-      match = Regex.run(~r/^(.+?)\s+AS\s+(\w+)$/is, trimmed) ->
+      match = Regex.run(~r/^(.+?)\s+AS\s+(\w+|"[^"]+")$/is, trimmed) ->
         [_full, expr_str, alias_name] = match
 
         case parse_expr(expr_str) do
-          {:ok, expr} -> {:ok, {expr, alias_name}}
+          {:ok, expr} -> {:ok, {expr, String.trim(alias_name, "\"")}}
           {:error, _reason} -> {:error, local_error("unsupported column: #{col}")}
         end
 

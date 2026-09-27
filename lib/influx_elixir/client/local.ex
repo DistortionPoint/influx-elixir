@@ -112,7 +112,14 @@ defmodule InfluxElixir.Client.Local do
 
   ## SQL Query Support
 
-  `query_sql/3` understands a subset of SQL:
+  `query_sql/3` understands a subset of SQL.
+
+  Identifiers follow DataFusion: an unquoted name is folded to lower case
+  (`SELECT Host FROM Cpu` reads column `host` of table `cpu`, and `v AS V`
+  answers `"v"`), a double-quoted one is exact (`"Host"`), and `"..."` is
+  never a string — `WHERE k = "a"` compares with column `a`. See
+  `InfluxElixir.Client.Local.SQLIdentifiers`. (InfluxQL identifiers are
+  case-sensitive and are not folded.) The subset:
 
     * `SELECT * FROM measurement`
     * `SELECT col1, col2 [, ...] FROM measurement` with optional `AS alias`
@@ -956,11 +963,11 @@ defmodule InfluxElixir.Client.Local do
 
   @spec run_query(Store.t(), binary(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
-  defp run_query(table, database, sql, opts) do
+  defp run_query(table, database, sql, opts, identifiers \\ :fold) do
     resolved_sql = SQLParser.resolve_params(sql, Keyword.get(opts, :params, %{}))
 
     with nil <- SQLParser.unbound_placeholder(resolved_sql),
-         {:ok, query} <- SQLParser.parse_select(resolved_sql) do
+         {:ok, query} <- SQLParser.parse_select(resolved_sql, identifiers: identifiers) do
       case SQLExecutor.run(query, &point_source(table, database, &1)) do
         {:error, _reason} = err -> err
         rows -> {:ok, rows}
@@ -1167,7 +1174,7 @@ defmodule InfluxElixir.Client.Local do
         case statement do
           :show_measurements -> {:ok, show_measurements(table, database)}
           {:show_keys, match} -> {:ok, show_keys(table, database, match)}
-          {:select, query} -> influxql_select(table, conn, database, query, opts)
+          {:select, query} -> influxql_select(table, database, query, opts)
         end
       end
     end
@@ -1253,16 +1260,16 @@ defmodule InfluxElixir.Client.Local do
   # The inner query gets typed rows: the caller's `format:` applies once, to
   # the InfluxQL result (it used to render the rows as CSV strings before
   # InfluxQL aggregated them).
-  @spec influxql_select(Store.t(), map(), binary(), InfluxQL.query(), keyword()) ::
+  @spec influxql_select(Store.t(), binary(), InfluxQL.query(), keyword()) ::
           InfluxElixir.Client.query_result()
-  defp influxql_select(table, conn, database, query, opts) do
+  defp influxql_select(table, database, query, opts) do
     where = if query.where, do: " WHERE " <> query.where, else: ""
     # ORDER BY time sorts on the stored nanoseconds; rows carry microsecond
     # DateTimes, so sorting those alone would tie sub-microsecond points.
     sql = ~s|SELECT * FROM "#{query.measurement}"| <> where <> " ORDER BY time"
-    inner_opts = opts |> Keyword.drop([:params, :format]) |> Keyword.put(:database, database)
-
-    case query_sql(conn, sql, inner_opts) do
+    # InfluxQL identifiers are case-sensitive: the SQL written from them is
+    # read as it is, not folded as a user's SQL would be.
+    case run_query(table, database, sql, Keyword.drop(opts, [:params, :format]), :exact) do
       {:ok, rows} ->
         tags = Store.tag_columns(table, database, query.measurement)
         {:ok, InfluxQL.run(query, rows, tags)}

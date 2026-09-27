@@ -1567,18 +1567,17 @@ defmodule InfluxElixir.Client.LocalTest do
                Local.query_sql(conn, sql, database: db)
     end
 
-    test "double-quoted WHERE value parsed as string",
-         %{conn: conn, db: db} do
+    test "a double-quoted WHERE operand is a column, not a string", %{conn: conn, db: db} do
+      # SQL quotes identifiers with "..." and strings with '...'. The double
+      # used to read "hello" as a string, so a query the engine refuses
+      # (verified: No field named hello) passed against it.
       Local.write(conn, ~s(m,tag=hello val=1i), database: db)
 
-      {:ok, rows} =
-        Local.query_sql(
-          conn,
-          ~s(SELECT * FROM m WHERE tag = "hello"),
-          database: db
-        )
+      assert {:error, %{status: 500, body: "Schema error: No field named hello." <> _rest}} =
+               Local.query_sql(conn, ~s(SELECT * FROM m WHERE tag = "hello"), database: db)
 
-      assert length(rows) == 1
+      assert {:ok, [_row]} =
+               Local.query_sql(conn, ~s(SELECT * FROM m WHERE tag = 'hello'), database: db)
     end
 
     test "boolean false param in WHERE", %{conn: conn, db: db} do

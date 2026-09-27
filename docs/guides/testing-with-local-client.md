@@ -523,6 +523,24 @@ against a string literal by casting the column to text — so
 `Client.Local` reproduces that so the mistake fails in tests rather than
 in production.
 
+## Identifiers and Case
+
+SQL identifiers follow DataFusion's rules on the double as on the server
+(verified against InfluxDB 3):
+
+- An unquoted identifier is folded to lower case — columns, tables,
+  aliases and CTE names. `SELECT Host FROM cpu` is the schema error
+  `No field named host` when the tag is `Host`; `FROM Cpu` reads table
+  `cpu`; `AVG(v) AS AvgV` answers the key `"avgv"`.
+- A double-quoted identifier is exact: `SELECT "Host" FROM "Cpu"`,
+  `AS "Mixed Case"`.
+- `"..."` is always an identifier. `WHERE k = "a"` compares `k` with a
+  column named `a`; string literals take single quotes.
+
+Earlier versions of the double compared names case-sensitively and read
+`"..."` as a string, so queries the server refuses passed against it.
+InfluxQL identifiers are case-sensitive and are not folded.
+
 ## WHERE Literal Typing
 
 Quoted literals are always strings, exactly as in InfluxDB v3. A

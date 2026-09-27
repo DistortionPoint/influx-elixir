@@ -34,6 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine's 400.
 
 ### Changed
+- **Breaking (tests): `Client.Local` follows SQL's identifier rules.**
+  DataFusion folds every unquoted identifier to lower case: columns,
+  tables, aliases and CTE names. Only a double-quoted identifier is
+  exact, and `"..."` is never a string. The double compared names
+  case-sensitively and read `"..."` as a string literal, so it disagreed
+  with the server both ways:
+  - `SELECT Host` on a tag `Host` passed against the double, but the
+    server answers `No field named host`.
+  - `SELECT K` failed against the double, but the server reads `k`.
+  - `v AS V` answered `"V"` instead of `"v"`.
+  - `WHERE k = "a"` matched the string `a` instead of comparing with a
+    column.
+  - `SELECT "Host"` and `AS "Mixed Case"` were refused.
+
+  The new `Client.Local.SQLIdentifiers` applies the rules before parsing,
+  verified against InfluxDB 3 Core. InfluxQL identifiers stay
+  case-sensitive, as on the server. `Client.Local:` error messages now
+  echo the query with its identifiers folded.
 - **Breaking (tests): `Client.Local` has no implicit `"default"`
   database.** With neither `:database` nor `:databases` configured, the
   double wrote to and queried a `"default"` database, and listed it. The

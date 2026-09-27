@@ -91,6 +91,7 @@ defmodule InfluxElixir.ClientContract do
     format_tests = if v3_sql, do: format_tests(client), else: nil
     database_rule_tests = if v3_sql, do: database_rule_tests(client), else: nil
     distinct_on_tests = if v3_sql, do: distinct_on_tests(client), else: nil
+    identifier_tests = if v3_sql, do: identifier_tests(client), else: nil
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
     v2_write_rule_tests = if v2_ops, do: v2_write_rule_tests(client), else: nil
@@ -137,6 +138,7 @@ defmodule InfluxElixir.ClientContract do
         format_tests,
         database_rule_tests,
         distinct_on_tests,
+        identifier_tests,
         bucket_tests,
         v2_write_rule_tests,
         v2_precision_tests,
@@ -2965,6 +2967,80 @@ defmodule InfluxElixir.ClientContract do
                      ctx,
                      "SELECT DISTINCT ON (k) k AS kk, v FROM __M__ ORDER BY kk, time DESC"
                    )
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # SQL identifiers: case folding and quoting (v3_core, v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  defp identifier_tests(client) do
+    quote do
+      describe "SQL identifier contract" do
+        setup ctx do
+          m = "Contract_Ident_#{System.unique_integer([:positive])}"
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, "#{m},Host=h1,k=a Val=1i,v=2i 1",
+              database: ctx.database,
+              precision: :second
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+          {:ok, m: m}
+        end
+
+        defp ident(client, ctx, sql),
+          do:
+            client.query_sql(ctx.conn, String.replace(sql, "__M__", ~s("#{ctx.m}")),
+              database: ctx.database
+            )
+
+        test "an unquoted identifier is folded to lower case, a quoted one is exact", ctx do
+          assert {:ok, [%{"k" => "a", "Host" => "h1", "Val" => 1}]} =
+                   ident(unquote(client), ctx, ~s|SELECT K, "Host", "Val" FROM __M__|)
+
+          for sql <- ["SELECT Host FROM __M__", ~s|SELECT * FROM __M__ WHERE Host = 'h1'|] do
+            assert {:error, %{status: 500, body: "Schema error: No field named host." <> _rest}} =
+                     ident(unquote(client), ctx, sql)
+          end
+
+          assert {:ok, [%{"Host" => "h1"}]} =
+                   ident(
+                     unquote(client),
+                     ctx,
+                     ~s|SELECT * FROM __M__ WHERE "Host" = 'h1' ORDER BY "Val"|
+                   )
+        end
+
+        test "aliases fold too unless quoted", ctx do
+          assert {:ok, [%{"v" => 2, "V2" => 2, "Mixed Case" => 1, "avg_v" => 2.0}]} =
+                   ident(
+                     unquote(client),
+                     ctx,
+                     ~s|SELECT v AS V, v AS "V2", "Val" AS "Mixed Case", v * 1.0 AS Avg_V FROM __M__|
+                   )
+        end
+
+        test "an unquoted mixed-case table name is folded, so it is another table", ctx do
+          lower = String.downcase(ctx.m)
+
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).query_sql(ctx.conn, "SELECT * FROM #{ctx.m}",
+                     database: ctx.database
+                   )
+
+          assert body == "Error during planning: table 'public.iox.#{lower}' not found"
+        end
+
+        test "a double-quoted operand is a column, not a string", ctx do
+          assert {:error, %{status: 500, body: "Schema error: No field named hello." <> _rest}} =
+                   ident(unquote(client), ctx, ~s|SELECT * FROM __M__ WHERE k = "hello"|)
+
+          assert {:ok, [_row]} =
+                   ident(unquote(client), ctx, ~s|SELECT * FROM __M__ WHERE k = "k"|)
         end
       end
     end
