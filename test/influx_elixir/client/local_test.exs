@@ -991,10 +991,30 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, conn: conn, db: "del_db"}
     end
 
-    test "DELETE FROM removes all points for a measurement",
-         %{conn: conn, db: db} do
+    test "DELETE FROM removes every point and leaves an empty table", %{conn: conn, db: db} do
       assert {:ok, %{"rows_affected" => 3}} =
                Local.execute_sql(conn, "DELETE FROM cpu", database: db)
+
+      # The table stays in the catalog: no rows, not "table not found".
+      assert {:ok, []} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+    end
+
+    test "DELETE follows SQL's identifier rules, as SELECT does", %{conn: conn, db: db} do
+      {:ok, :written} =
+        Local.write(conn, "Cpu,Host=a v=1i 1\nCpu,Host=b v=2i 2", database: db)
+
+      # Unquoted names fold: `Cpu` and `HOST` are table cpu and its host tag.
+      assert {:ok, %{"rows_affected" => 2}} =
+               Local.execute_sql(conn, ~s|DELETE FROM Cpu WHERE HOST = 'web01'|, database: db)
+
+      assert {:ok, [%{"host" => "web02"}]} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+
+      assert {:ok, %{"rows_affected" => 1}} =
+               Local.execute_sql(conn, ~s|DELETE FROM "Cpu" WHERE "Host" = 'a'|, database: db)
+
+      assert {:ok, [%{"Host" => "b"}]} =
+               Local.query_sql(conn, ~s|SELECT * FROM "Cpu"|, database: db)
     end
 
     test "DELETE FROM with WHERE removes matching points only",

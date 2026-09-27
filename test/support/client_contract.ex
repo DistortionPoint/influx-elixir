@@ -176,12 +176,6 @@ defmodule InfluxElixir.ClientContract do
   defp health_tests(client) do
     quote do
       describe "health/1" do
-        test "returns {:ok, map} with string status key", ctx do
-          {:ok, result} = unquote(client).health(ctx.conn)
-          assert is_map(result)
-          assert Map.has_key?(result, "status")
-        end
-
         test "reports a passing status", ctx do
           {:ok, %{"status" => status}} = unquote(client).health(ctx.conn)
           assert status in ["pass", "ok"]
@@ -346,15 +340,6 @@ defmodule InfluxElixir.ClientContract do
           {:ok, dbs} = unquote(client).list_databases(ctx.conn)
           names = Enum.map(dbs, & &1["name"])
           assert "contract_extra_db" in names
-        end
-
-        test "each entry is a map with a string name key", ctx do
-          {:ok, dbs} = unquote(client).list_databases(ctx.conn)
-
-          Enum.each(dbs, fn db ->
-            assert is_map(db)
-            assert is_binary(db["name"])
-          end)
         end
       end
 
@@ -830,7 +815,6 @@ defmodule InfluxElixir.ClientContract do
             )
 
           {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
-          assert is_list(buckets)
           names = Enum.map(buckets, & &1["name"])
           assert "contract_list_bkt" in names
         end
@@ -3609,8 +3593,7 @@ defmodule InfluxElixir.ClientContract do
           assert body =~ "not found"
         end
 
-        test "malformed line protocol returns {:error, _} with status info",
-             ctx do
+        test "malformed line protocol is the engine's 400, line by line", ctx do
           result =
             unquote(client).write(
               ctx.conn,
@@ -3618,9 +3601,19 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          # Both clients reject with an HTTP-shaped 400 and a non-empty body.
+          # The engine's body (verified), `original_line` cut to 20 bytes.
           assert {:error, %{status: 400, body: body}} = result
-          assert is_binary(body) and body != ""
+
+          assert Jason.decode!(body) == %{
+                   "error" => "partial write of line protocol occurred",
+                   "data" => [
+                     %{
+                       "error_message" => "No fields were provided",
+                       "line_number" => 1,
+                       "original_line" => "this is not line pro"
+                     }
+                   ]
+                 }
         end
 
         test "delete_database for non-existent DB returns {:error, _}",
@@ -3654,9 +3647,8 @@ defmodule InfluxElixir.ClientContract do
               []
             )
 
-          assert is_map(token)
-          assert is_binary(token["id"])
-          assert token["description"] == "contract token"
+          assert %{"id" => id, "description" => "contract token"} = token
+          assert is_binary(id) and id != ""
         end
 
         test "delete_token returns :ok", ctx do

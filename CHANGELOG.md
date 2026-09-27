@@ -77,6 +77,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1,583 → 1,430 lines) holds no `:ets` call. Behaviour is unchanged.
 
 ### Fixed
+- **Enterprise `DELETE` in `Client.Local` ignored SQL's identifier
+  rules.** It is now read like a `SELECT`: unquoted names fold to lower
+  case, and quoted ones are exact. Before, `DELETE FROM "Cpu"` looked for
+  a measurement literally named `"Cpu"`, quotes included, and its
+  `WHERE` compared names case-sensitively.
+- **A `Client.Local` table ended with its last point.** A table exists
+  once its columns are in the catalog, as on the engine, so a `SELECT`
+  after an Enterprise `DELETE` of every row answers `[]`. Before, it was
+  a "table not found" error.
+- **Tests that proved little were tightened.** Contract tests now check
+  the engine's full error body for malformed line protocol and a
+  created token's fields, where they used to check only for a
+  non-empty body and a map. Two tests that duplicated stronger ones
+  were removed. The runtime `add_connection/2` test now writes and
+  queries through the name, and checks the name is gone after
+  `remove_connection/1`.
 - **`Client.Local` ignored InfluxDB 3's database rules.** Each of the
   following was verified against Core:
   - **Names.** A name must start with an ASCII letter or digit and

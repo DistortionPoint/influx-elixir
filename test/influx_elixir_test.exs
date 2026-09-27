@@ -268,18 +268,21 @@ defmodule InfluxElixirTest do
       assert :ok = InfluxElixir.remove_connection(name)
     end
 
-    test "dynamically adds and removes a connection" do
+    test "a connection added at runtime is usable by name until it is removed" do
       # The supervisor registry is VM-global: a unique name keeps this test
       # isolated from every other async module.
       name = :"dynamic_test_#{System.unique_integer([:positive])}"
 
-      assert {:ok, pid} = InfluxElixir.add_connection(name, [])
-
-      assert is_pid(pid)
-      assert Process.alive?(pid)
+      assert {:ok, pid} = InfluxElixir.add_connection(name, database: "dyn")
+      assert {:ok, :written} = InfluxElixir.write(name, "cpu v=1i")
+      assert {:ok, [%{"v" => 1}]} = InfluxElixir.query_sql(name, "SELECT v FROM cpu")
 
       assert :ok = InfluxElixir.remove_connection(name)
       refute Process.alive?(pid)
+
+      assert_raise ArgumentError, ~r/no InfluxElixir connection named/, fn ->
+        InfluxElixir.write(name, "cpu v=2i")
+      end
     end
   end
 

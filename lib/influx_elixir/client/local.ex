@@ -319,6 +319,7 @@ defmodule InfluxElixir.Client.Local do
     InfluxQL,
     LineProtocolParser,
     SQLExecutor,
+    SQLIdentifiers,
     SQLParser,
     Store
   }
@@ -1030,8 +1031,10 @@ defmodule InfluxElixir.Client.Local do
     * `SELECT` / `WITH ... SELECT` run as `query_sql/3` and return
       `{:ok, rows}`.
     * `DELETE FROM m [WHERE ...]` on `:v3_enterprise` removes the matching
-      points and returns `{:ok, %{"rows_affected" => n}}`. (Not verified:
-      no Enterprise server was available.)
+      points and returns `{:ok, %{"rows_affected" => n}}`. Identifiers
+      follow SQL's rules, as in a `SELECT` (`DELETE FROM "Cpu"`), and a
+      table whose every point was deleted stays, answering no rows.
+      (Not verified: no Enterprise server was available.)
     * Everything else is refused with the engine's answer: `DELETE`,
       `INSERT` and `UPDATE` are 400 `Error during planning: DML not
       supported: Delete | Insert Into | Update`; `CREATE TABLE | VIEW |
@@ -1054,8 +1057,13 @@ defmodule InfluxElixir.Client.Local do
         :query ->
           query_sql(conn, sql, opts)
 
+        # The statement follows SQL's identifier rules, as a SELECT does:
+        # `DELETE FROM "Cpu" WHERE "Host" = 'a'`.
         :delete when profile == :v3_enterprise ->
-          case Regex.run(~r/^(?i)DELETE\s+FROM\s+((?:[^\s\\]|\\.)+)(.*)$/s, trimmed) do
+          case Regex.run(
+                 ~r/^(?i)DELETE\s+FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+)(.*)$/s,
+                 SQLIdentifiers.normalize(trimmed)
+               ) do
             [_full, measurement_raw, rest] ->
               execute_delete(table, database, measurement_raw, rest)
 
@@ -1110,7 +1118,11 @@ defmodule InfluxElixir.Client.Local do
   @spec execute_delete(Store.t(), binary(), binary(), binary()) ::
           {:ok, map()} | {:error, term()}
   defp execute_delete(table, database, measurement_raw, rest) do
-    measurement = LineProtocolParser.unescape_measurement(measurement_raw)
+    measurement =
+      case measurement_raw do
+        "\"" <> _quoted -> String.trim(measurement_raw, "\"")
+        bare -> LineProtocolParser.unescape_measurement(bare)
+      end
 
     with {:ok, where} <- SQLParser.parse_where(rest) do
       count =
@@ -1597,12 +1609,14 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  # The SQL executor's view of the store: a measurement's points, or
-  # `:error` for one that was never written (the engine's "table not
-  # found").
+  # The SQL executor's view of the store: a table's points, or `:error` for
+  # one the catalog does not have (the engine's "table not found"). A table
+  # exists once a write registered its columns, not while it holds points:
+  # an Enterprise DELETE of every row leaves an empty table, which answers
+  # no rows as a DataFusion table does.
   @spec point_source(Store.t(), binary(), binary()) :: {:ok, [point_map()]} | :error
   defp point_source(table, database, measurement) do
-    if Store.measurement?(table, database, measurement),
+    if Store.table?(table, database, measurement),
       do: {:ok, Store.points(table, database, measurement)},
       else: :error
   end

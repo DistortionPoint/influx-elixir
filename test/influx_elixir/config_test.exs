@@ -156,8 +156,9 @@ defmodule InfluxElixir.ConfigTest do
   describe "validate!/1" do
     test "returns keyword list for valid opts" do
       opts = Config.validate!(host: "localhost", token: "my-token")
-      assert is_list(opts)
       assert opts[:host] == "localhost"
+      # Defaults are filled in, as validate/1 does.
+      assert opts[:scheme] == :https and opts[:port] == 8086
     end
 
     test "raises NimbleOptions.ValidationError for missing :host" do

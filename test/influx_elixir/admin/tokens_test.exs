@@ -24,7 +24,10 @@ defmodule InfluxElixir.Admin.TokensTest do
     end
 
     test "defaults opts to empty list", %{conn: conn} do
-      assert {:ok, _token} = Tokens.create(conn, "default token")
+      assert {:ok, %{"description" => "default token", "id" => id}} =
+               Tokens.create(conn, "default token")
+
+      assert :ok = Tokens.delete(conn, id)
     end
   end
 

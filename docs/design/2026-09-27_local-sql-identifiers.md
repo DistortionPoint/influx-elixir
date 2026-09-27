@@ -77,3 +77,34 @@ saw it, with identifiers folded.
 | `lib/influx_elixir/client/local.ex` | InfluxQL path `:exact`; moduledoc |
 | `test/influx_elixir/client/local/sql_identifiers_test.exs`, `test/support/client_contract.ex`, `test/influx_elixir/client/local_test.exs` | Tests |
 | `docs/guides/testing-with-local-client.md`, `usage-rules/query.md`, `CHANGELOG.md` | Updated |
+
+## Follow-up (same day): DELETE, and when a table exists
+
+The next sweep found two paths the change above did not reach.
+
+- **Enterprise `DELETE`.** `execute_sql/3` matched `DELETE FROM <name>`
+  on the raw text and parsed its `WHERE` separately:
+  - `DELETE FROM "Cpu"` took the measurement to be `"Cpu"`, quotes
+    included;
+  - `DELETE FROM Cpu` did not fold the name to `cpu`;
+  - the `WHERE` compared names case-sensitively.
+
+  The statement is now normalised with `SQLIdentifiers.normalize/1`
+  before it is matched, and a quoted measurement is unwrapped. (There
+  was no Enterprise server to test against; the rules are DataFusion's,
+  as for `SELECT`.)
+- **Table existence.** The SQL executor's `point_source` answered "table
+  not found" for a measurement with no points, so an Enterprise `DELETE`
+  of every row turned the table into an error. The engine's catalog
+  keeps a table once it exists, and DataFusion answers a table with no
+  rows with `[]`. `point_source` now asks the schema (`Store.table?/3`).
+  On Core, whether a rejected write leaves its table behind was checked
+  against the engine: a rejected line's columns stay (`t5,a=b` registers
+  `a`), and Local already matched that.
+
+  One Core oddity was not copied: a table whose only line was rejected
+  for a `time` tag exists with no columns, and the engine answers 500
+  `table should have a time column`. Local answers "table not found".
+
+Both are covered by `execute_sql/3 — DELETE` tests. The new tests fail
+against the previous `local.ex` and pass with the change.
