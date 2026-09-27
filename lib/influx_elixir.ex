@@ -413,6 +413,9 @@ defmodule InfluxElixir do
 
   @doc """
   Removes a named connection dynamically at runtime.
+
+  The connection's batch writer, if any, writes what it still holds
+  before it stops (see "Shutdown" in `InfluxElixir.Write.BatchWriter`).
   """
   @spec remove_connection(atom()) :: :ok | {:error, term()}
   def remove_connection(name) do

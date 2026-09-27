@@ -27,6 +27,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1,583 → 1,430 lines) holds no `:ets` call. Behaviour is unchanged.
 
 ### Fixed
+- **A stopping `BatchWriter` lost its buffer.** Its `terminate/2` flushed
+  the buffer, but the writer did not trap exits. When a supervisor stopped
+  it (application shutdown, `remove_connection/1`), the exit signal killed
+  it before `terminate/2` could run, so every buffered line was lost. The
+  tests used `GenServer.stop/1`, which runs `terminate/2` regardless, so
+  they never caught it. The writer now traps exits. On shutdown it
+  writes any batch still being retried, then the buffer, once each and in
+  the order they were written. It answers any `write_sync/3` caller
+  waiting on those writes. The new `:shutdown` option sets how long the
+  supervisor waits (default `5_000`).
+- **An invalid `Point` crashed the `BatchWriter`.** The point was encoded
+  inside the writer with `encode!`, so a point with no fields killed the
+  process along with every other caller's buffered lines. `write/3` and
+  `write_sync/3` now encode in the caller and return `{:error, reason}`,
+  as `LineProtocol.encode/1` does.
+- **Backpressure lifted while a retry chain was still in flight.** An
+  explicit `flush/2` or `write_sync/3` during a retry chain starts a
+  second chain, but the writer tracked only one. The first chain to end
+  cleared the marker, so writes flushed into new chains instead of being
+  held to the `10 × batch_size` bound. Each chain now keeps its own batch
+  and `write_sync/3` caller until it ends.
 - **`Client.Local` ignored `format:`.** Over HTTP, `format: :csv` returns
   every value as a string (`"1.5"`, `"true"`), but the double returned
   typed values. A test of CSV handling could pass against the double and

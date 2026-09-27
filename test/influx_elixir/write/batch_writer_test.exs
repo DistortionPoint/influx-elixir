@@ -29,12 +29,6 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   end
 
   describe "start_link/1" do
-    test "starts the GenServer and returns a pid", %{conn: conn} do
-      pid = start_writer(conn)
-      assert is_pid(pid)
-      assert Process.alive?(pid)
-    end
-
     test "the :database option is the write target for every flush", %{conn: conn} do
       # Regression: :database was stored but never forwarded, so flushes
       # landed in the connection default ("default") instead.
@@ -300,26 +294,41 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
-  describe "terminate/2" do
-    test "flushes buffered data on shutdown", %{conn: conn} do
+  describe "shutdown" do
+    # A supervisor stops a child with an exit signal, which kills a process
+    # that does not trap exits before terminate/2 can run: the buffer was
+    # lost on every application shutdown and remove_connection/1.
+    # (GenServer.stop runs terminate/2 either way, so it never showed.)
+    test "a supervisor stopping the writer flushes the buffer", %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 60_000)
       :ok = BatchWriter.write(pid, "cpu value=42.0")
 
-      # Stop the GenServer — terminate/2 should flush
-      GenServer.stop(pid)
+      :ok = stop_supervised!(BatchWriter)
 
-      # Verify the data was written to the writer's configured database
       assert {:ok, [%{"value" => 42.0}]} =
                Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
     end
+
+    test ":shutdown sets how long the supervisor waits for the final flush" do
+      assert %{shutdown: 5_000} = BatchWriter.child_spec([])
+      assert %{shutdown: 30_000} = BatchWriter.child_spec(shutdown: 30_000)
+    end
   end
 
-  describe "GenServer lifecycle" do
-    test "can be stopped cleanly", %{conn: conn} do
-      pid = start_writer(conn)
-      assert Process.alive?(pid)
-      GenServer.stop(pid)
-      refute Process.alive?(pid)
+  describe "invalid points" do
+    test "are the caller's error and leave the writer and its buffer intact", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000)
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
+
+      # Encoding used to run inside the writer: encode! raised there and
+      # the crash lost every caller's buffered lines.
+      assert {:error, :empty_fields} = BatchWriter.write(pid, Point.new("cpu", %{}))
+      assert {:error, :empty_fields} = BatchWriter.write_sync(pid, Point.new("cpu", %{}))
+
+      :ok = BatchWriter.flush(pid)
+
+      assert {:ok, [%{"value" => 1.0}]} =
+               Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
     end
   end
 
@@ -535,6 +544,58 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       assert {:ok, %{total_errors: 1, total_writes: 0}} = BatchWriter.stats(pid)
       assert Process.alive?(pid)
+    end
+
+    test "backpressure holds while any chain is in flight, not just the first",
+         %{http_conn: conn} do
+      pid =
+        start_writer(conn,
+          client: InfluxElixir.Client.HTTP,
+          batch_size: 1,
+          flush_interval_ms: 60_000,
+          max_retries: 1,
+          base_retry_delay_ms: 250
+        )
+
+      # Chain 1 starts now and ends ~500ms later; chain 2 (an explicit
+      # flush) starts ~250ms later and so outlives it.
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
+      Process.sleep(250)
+      :ok = BatchWriter.write(pid, "cpu value=2.0")
+      :ok = BatchWriter.flush(pid)
+
+      wait_until(fn -> match?({:ok, %{total_errors: 1}}, BatchWriter.stats(pid)) end)
+
+      # Chain 2 is still retrying. The end of chain 1 used to clear the
+      # single in-flight marker, so these flushed into new chains instead
+      # of being held to the backpressure bound.
+      for i <- 1..10, do: assert(:ok = BatchWriter.write(pid, "cpu value=#{i}.5"))
+      assert {:error, :buffer_full} = BatchWriter.write(pid, "cpu value=11.5")
+      assert {:ok, %{total_errors: 1}} = BatchWriter.stats(pid)
+    end
+
+    test "a write_sync caller waiting on a chain is answered at shutdown", %{http_conn: conn} do
+      pid =
+        start_writer(conn,
+          client: InfluxElixir.Client.HTTP,
+          flush_interval_ms: 60_000,
+          max_retries: 3,
+          base_retry_delay_ms: 60_000
+        )
+
+      caller = Task.async(fn -> BatchWriter.write_sync(pid, "cpu value=1.0") end)
+
+      # The caller is blocked on its reply and the writer has nothing
+      # queued: the first attempt has failed, the chain waits to retry.
+      wait_until(fn ->
+        Process.info(caller.pid, :status) == {:status, :waiting} and
+          Process.info(pid, :message_queue_len) == {:message_queue_len, 0}
+      end)
+
+      :ok = stop_supervised!(BatchWriter)
+
+      # terminate/2 writes the chain's batch once more and answers with that.
+      assert {:error, {:connection_error, _reason}} = Task.await(caller)
     end
 
     test "with max_retries: 0 a transport error is recorded on the first flush",

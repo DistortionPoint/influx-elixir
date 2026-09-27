@@ -27,17 +27,30 @@ defmodule InfluxElixir.Write.BatchWriter do
       per BatchWriter without baking them into the connection. Default: `[]`.
     * `:client` - client module to write with instead of the configured one
       (`InfluxElixir.Client.impl/0`).
+    * `:shutdown` - how long, in milliseconds, a supervisor waits for the
+      final flush when it stops the writer (default: `5_000`, OTP's
+      default for workers); see "Shutdown"
 
   ## Backpressure
 
-  While a batch is being retried, the automatic flushes (batch size reached,
-  timer fired) wait for that retry chain to finish instead of starting
-  another chain against a server that is already failing; writes keep
+  While any batch is being retried, the automatic flushes (batch size
+  reached, timer fired) wait for every retry chain to finish instead of
+  starting another against a server that is already failing; writes keep
   buffering meanwhile. Once the buffer holds `10 * batch_size` entries,
   `write/3` and `write_sync/3` return `{:error, :buffer_full}` until the
-  chain ends. An explicit `flush/2`, and `write_sync/3` without `:no_sync`,
-  always flush immediately. When the chain ends the deferred buffer is
-  flushed if it has reached `batch_size`; otherwise the timer takes it.
+  last chain ends. An explicit `flush/2`, and `write_sync/3` without
+  `:no_sync`, always flush immediately — and may start a chain of their
+  own. When the last chain ends the deferred buffer is flushed if it has
+  reached `batch_size`; otherwise the timer takes it.
+
+  ## Shutdown
+
+  The writer traps exits, so a supervisor stopping it — application
+  shutdown, `InfluxElixir.remove_connection/1` — runs `terminate/2`, which
+  writes every batch still being retried and then the buffer, once each
+  and in the order they were written, and answers any `write_sync/3`
+  caller waiting on them. A write that fails there is logged and dropped.
+  The supervisor kills the writer if that takes longer than `:shutdown`.
 
   ## Retry Policy
 
@@ -91,8 +104,7 @@ defmodule InfluxElixir.Write.BatchWriter do
     no_sync: false,
     write_opts: [],
     stats: %{total_writes: 0, total_errors: 0, total_bytes: 0},
-    retry_payload: nil,
-    retry_attempt: 0
+    chains: %{}
   ]
 
   @type t :: %__MODULE__{
@@ -109,9 +121,8 @@ defmodule InfluxElixir.Write.BatchWriter do
           write_opts: keyword(),
           stats: stats(),
           timer_ref: reference() | nil,
-          pending_sync: {pid(), term()} | nil,
-          retry_payload: binary() | nil,
-          retry_attempt: non_neg_integer()
+          pending_sync: GenServer.from() | nil,
+          chains: %{integer() => {binary(), GenServer.from() | nil}}
         }
 
   # ---------------------------------------------------------------------------
@@ -140,6 +151,19 @@ defmodule InfluxElixir.Write.BatchWriter do
   end
 
   @doc """
+  The child spec a supervisor starts the writer with; `:shutdown` in
+  `opts` sets how long it waits for the final flush.
+  """
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
+  def child_spec(opts) do
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, [opts]},
+      shutdown: Keyword.get(opts, :shutdown, 5_000)
+    }
+  end
+
+  @doc """
   Buffers a point (or line protocol binary) for writing.
 
   Returns immediately after buffering unless the buffer reaches `batch_size`,
@@ -163,9 +187,11 @@ defmodule InfluxElixir.Write.BatchWriter do
           GenServer.server(),
           InfluxElixir.Write.Point.t() | binary(),
           timeout()
-        ) :: :ok | {:error, :buffer_full}
+        ) :: :ok | {:error, :buffer_full | term()}
   def write(server, payload, timeout \\ @default_write_timeout) do
-    GenServer.call(server, {:write, payload}, timeout)
+    with {:ok, line} <- encode_payload(payload) do
+      GenServer.call(server, {:write, line}, timeout)
+    end
   end
 
   @doc """
@@ -197,7 +223,9 @@ defmodule InfluxElixir.Write.BatchWriter do
           timeout()
         ) :: :ok | {:error, term()}
   def write_sync(server, payload, timeout \\ @default_write_sync_timeout) do
-    GenServer.call(server, {:write_sync, payload}, timeout)
+    with {:ok, line} <- encode_payload(payload) do
+      GenServer.call(server, {:write_sync, line}, timeout)
+    end
   end
 
   @doc """
@@ -249,6 +277,10 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   @impl GenServer
   def init(opts) do
+    # Without this a supervisor's shutdown kills the writer outright and
+    # terminate/2 never flushes the buffer.
+    Process.flag(:trap_exit, true)
+
     state = %__MODULE__{
       connection: Keyword.get(opts, :connection),
       database: Keyword.get(opts, :database),
@@ -285,19 +317,18 @@ defmodule InfluxElixir.Write.BatchWriter do
   end
 
   @impl GenServer
-  def handle_call({:write, payload}, _from, %__MODULE__{} = state) do
+  def handle_call({:write, line}, _from, %__MODULE__{} = state) do
     max_buffer = state.batch_size * @backpressure_multiplier
 
     if state.buffer_size >= max_buffer do
       {:reply, {:error, :buffer_full}, state}
     else
-      line = encode_payload(payload)
       {:reply, :ok, state |> append_to_buffer(line) |> maybe_flush_on_batch()}
     end
   end
 
   @impl GenServer
-  def handle_call({:write_sync, payload}, from, %__MODULE__{} = state) do
+  def handle_call({:write_sync, line}, from, %__MODULE__{} = state) do
     max_buffer = state.batch_size * @backpressure_multiplier
 
     cond do
@@ -305,14 +336,10 @@ defmodule InfluxElixir.Write.BatchWriter do
         {:reply, {:error, :buffer_full}, state}
 
       state.no_sync ->
-        line = encode_payload(payload)
-        new_state = append_to_buffer(state, line)
-        {:reply, :ok, maybe_flush_on_batch(new_state)}
+        {:reply, :ok, state |> append_to_buffer(line) |> maybe_flush_on_batch()}
 
       true ->
-        line = encode_payload(payload)
-        new_state = append_to_buffer(%{state | pending_sync: from}, line)
-        {:noreply, do_flush(new_state)}
+        {:noreply, do_flush(append_to_buffer(%{state | pending_sync: from}, line))}
     end
   end
 
@@ -327,9 +354,9 @@ defmodule InfluxElixir.Write.BatchWriter do
     {:reply, {:ok, state.stats}, state}
   end
 
-  # The timer flush waits for an in-flight retry chain (see "Backpressure").
+  # The timer flush waits for in-flight retry chains (see "Backpressure").
   @impl GenServer
-  def handle_info(:flush, %__MODULE__{retry_payload: nil} = state) do
+  def handle_info(:flush, %__MODULE__{chains: chains} = state) when map_size(chains) == 0 do
     new_state =
       state
       |> do_flush()
@@ -342,18 +369,21 @@ defmodule InfluxElixir.Write.BatchWriter do
     {:noreply, schedule_flush(state), :hibernate}
   end
 
-  # `from` is the write_sync caller waiting on this chain (or nil); it
-  # travels with the chain so a later chain cannot answer it by mistake.
-  @impl GenServer
-  def handle_info({:retry, payload, attempt, from}, %__MODULE__{} = state) do
+  # Each chain keeps its payload and its write_sync caller (or nil) in
+  # `chains`, so a later chain cannot answer that caller by mistake and
+  # terminate/2 can still write the payload.
+  def handle_info({:retry, chain, attempt}, %__MODULE__{chains: chains} = state)
+      when is_map_key(chains, chain) do
+    {payload, _from} = Map.fetch!(chains, chain)
+
     case Writer.write(state.connection, payload, state.write_opts) do
       {:ok, :written} ->
-        finish_flush(state, payload, :ok, from)
+        finish_chain(state, chain, :ok)
 
       {:error, %{status: status}} = error when status in 400..499 ->
         Logger.warning("[BatchWriter] 4xx error (#{status}) — discarding batch")
 
-        finish_flush(state, payload, error, from)
+        finish_chain(state, chain, error)
 
       {:error, reason} when attempt < state.max_retries ->
         Logger.warning(
@@ -361,33 +391,69 @@ defmodule InfluxElixir.Write.BatchWriter do
             inspect(reason)
         )
 
-        schedule_retry(state, payload, attempt + 1, from)
-
-        {:noreply, %{state | retry_payload: payload, retry_attempt: attempt + 1}}
+        schedule_retry(state, chain, attempt + 1)
+        {:noreply, state}
 
       {:error, reason} ->
         Logger.error("[BatchWriter] Flush failed after retries: #{inspect(reason)}")
 
-        finish_flush(state, payload, {:error, reason}, from)
+        finish_chain(state, chain, {:error, reason})
     end
   end
 
+  # Trapping exits delivers the exit of a linked process that is not the
+  # parent (the parent's ends the writer through terminate/2); nothing
+  # else is linked, and a stray message must not crash the writer and lose
+  # its buffer.
+  def handle_info(message, %__MODULE__{} = state) do
+    Logger.debug("[BatchWriter] ignoring unexpected message: #{inspect(message)}")
+    {:noreply, state}
+  end
+
+  # One attempt each, oldest first: the batches being retried, then the
+  # buffer. Retries cannot outlive the writer.
   @impl GenServer
   def terminate(_reason, %__MODULE__{} = state) do
-    do_flush(state)
+    state.chains
+    |> Enum.sort()
+    |> Enum.each(fn {_chain, {payload, from}} -> final_write(state, payload, from) end)
+
+    if state.buffer_size > 0 do
+      lines = state.buffer |> Enum.reverse() |> Enum.join("\n")
+      final_write(state, lines, state.pending_sync)
+    end
+
     :ok
+  end
+
+  @spec final_write(t(), binary(), GenServer.from() | nil) :: :ok
+  defp final_write(state, payload, from) do
+    result =
+      case Writer.write(state.connection, payload, state.write_opts) do
+        {:ok, :written} ->
+          :ok
+
+        {:error, reason} = error ->
+          Logger.error("[BatchWriter] Final flush failed: #{inspect(reason)}")
+          error
+      end
+
+    reply_sync(%{state | pending_sync: from}, result)
   end
 
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  @spec encode_payload(InfluxElixir.Write.Point.t() | binary()) :: binary()
-  defp encode_payload(payload) when is_binary(payload), do: payload
+  # Runs in the caller: a point no server accepts is that caller's
+  # `{:error, reason}` (as from `LineProtocol.encode/1`), not a crash of
+  # the writer that loses every other caller's buffered lines.
+  @spec encode_payload(InfluxElixir.Write.Point.t() | binary()) ::
+          {:ok, binary()} | {:error, term()}
+  defp encode_payload(payload) when is_binary(payload), do: {:ok, payload}
 
-  defp encode_payload(%InfluxElixir.Write.Point{} = point) do
-    InfluxElixir.Write.LineProtocol.encode!(point)
-  end
+  defp encode_payload(%InfluxElixir.Write.Point{} = point),
+    do: InfluxElixir.Write.LineProtocol.encode(point)
 
   @spec append_to_buffer(t(), binary()) :: t()
   defp append_to_buffer(%__MODULE__{} = state, line) do
@@ -398,9 +464,9 @@ defmodule InfluxElixir.Write.BatchWriter do
   # buffer keeps filling up to the backpressure bound instead.
   @spec maybe_flush_on_batch(t()) :: t()
   defp maybe_flush_on_batch(
-         %__MODULE__{buffer_size: size, batch_size: batch, retry_payload: nil} = state
+         %__MODULE__{buffer_size: size, batch_size: batch, chains: chains} = state
        )
-       when size >= batch do
+       when size >= batch and map_size(chains) == 0 do
     do_flush(state)
   end
 
@@ -432,15 +498,16 @@ defmodule InfluxElixir.Write.BatchWriter do
       {:error, reason} when state.max_retries > 0 ->
         Logger.warning("[BatchWriter] Write error (attempt 1): #{inspect(reason)}")
 
-        schedule_retry(state, lines, 1, state.pending_sync)
+        # Monotonic, so terminate/2 can write chains in the order they began.
+        chain = System.unique_integer([:monotonic])
+        schedule_retry(state, chain, 1)
 
         %{
           state
           | buffer: [],
             buffer_size: 0,
             pending_sync: nil,
-            retry_payload: lines,
-            retry_attempt: 1
+            chains: Map.put(state.chains, chain, {lines, state.pending_sync})
         }
 
       {:error, reason} ->
@@ -461,24 +528,20 @@ defmodule InfluxElixir.Write.BatchWriter do
       | buffer: [],
         buffer_size: 0,
         stats: stats,
-        pending_sync: nil,
-        retry_payload: nil,
-        retry_attempt: 0
+        pending_sync: nil
     }
   end
 
-  # Ends a retry chain: answers the chain's write_sync caller, then flushes
-  # whatever accumulated while the chain was in flight if it has reached
-  # batch_size (the timer takes anything smaller).
-  @spec finish_flush(t(), binary(), :ok | {:error, term()}, GenServer.from() | nil) ::
-          {:noreply, t()}
-  defp finish_flush(%__MODULE__{} = state, payload, result, from) do
-    bytes = byte_size(payload)
-    stats = update_stats(state.stats, result, bytes)
+  # Ends a retry chain: answers the chain's write_sync caller, then — once
+  # no chain is left — flushes whatever accumulated meanwhile if it has
+  # reached batch_size (the timer takes anything smaller).
+  @spec finish_chain(t(), integer(), :ok | {:error, term()}) :: {:noreply, t()}
+  defp finish_chain(%__MODULE__{} = state, chain, result) do
+    {{payload, from}, chains} = Map.pop!(state.chains, chain)
     reply_sync(%{state | pending_sync: from}, result)
 
     new_state =
-      %{state | stats: stats, retry_payload: nil, retry_attempt: 0}
+      %{state | stats: update_stats(state.stats, result, byte_size(payload)), chains: chains}
       |> maybe_flush_on_batch()
 
     {:noreply, new_state}
@@ -504,10 +567,10 @@ defmodule InfluxElixir.Write.BatchWriter do
     :ok
   end
 
-  @spec schedule_retry(t(), binary(), non_neg_integer(), GenServer.from() | nil) :: :ok
-  defp schedule_retry(%__MODULE__{} = state, payload, attempt, from) do
+  @spec schedule_retry(t(), integer(), pos_integer()) :: :ok
+  defp schedule_retry(%__MODULE__{} = state, chain, attempt) do
     delay = backoff_delay(attempt, state.jitter_ms, state.base_retry_delay_ms)
-    Process.send_after(self(), {:retry, payload, attempt, from}, delay)
+    Process.send_after(self(), {:retry, chain, attempt}, delay)
     :ok
   end
 

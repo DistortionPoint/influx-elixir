@@ -5,6 +5,8 @@
 - Configure `batch_size` (default 5,000) and `flush_interval_ms` (default 1,000) per connection; `database:` on the writer is the flush target
 - 4xx responses are discarded and counted as errors; 5xx and transport errors are retried with exponential backoff up to `max_retries` (default 3)
 - Use `InfluxElixir.flush/1` to force an immediate flush
+- Stopping the writer (application shutdown, `InfluxElixir.remove_connection/1`) writes the buffer and any batch still being retried, once each, within the writer's `shutdown:` (default 5,000 ms); a failure there is logged and the data dropped
+- `BatchWriter.write/3` and `write_sync/3` encode a `Point` in the caller: an invalid point returns `{:error, reason}` (as from `LineProtocol.encode/1`) and the writer keeps everything else it holds
 - Use `InfluxElixir.stats/1` to retrieve batch writer statistics (`total_writes`, `total_errors`, `total_bytes`)
 
 ## Line Protocol
