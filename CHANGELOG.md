@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.33] - 2026-09-28
+
 ### Added
 - **`Client.Local` runs `SELECT DISTINCT ON (...)` (#23).** The double
   refused every `DISTINCT ON` query. InfluxDB 3 (DataFusion) supports it,
