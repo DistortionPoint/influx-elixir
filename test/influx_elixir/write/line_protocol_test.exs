@@ -47,6 +47,32 @@ defmodule InfluxElixir.Write.LineProtocolTest do
       assert String.ends_with?(lp, "#{DateTime.to_unix(dt, :nanosecond)}")
     end
 
+    test "a DateTime is written in the write's precision, truncated toward the past" do
+      point = Point.new("cpu", %{"v" => 1}, timestamp: ~U[2026-09-28 12:00:00.123456Z])
+
+      for {precision, ts} <- [
+            {:second, "1790596800"},
+            {"s", "1790596800"},
+            {:millisecond, "1790596800123"},
+            {"ms", "1790596800123"},
+            {:microsecond, "1790596800123456"},
+            {"u", "1790596800123456"},
+            {:nanosecond, "1790596800123456000"},
+            {:auto, "1790596800123456000"}
+          ] do
+        assert {:ok, "cpu v=1i " <> ^ts} = LineProtocol.encode(point, precision: precision)
+      end
+
+      # Before 1970, truncating toward zero would move the time forward.
+      early = Point.new("cpu", %{"v" => 1}, timestamp: ~U[1969-12-31 23:59:59.500Z])
+      assert {:ok, "cpu v=1i -1"} = LineProtocol.encode(early, precision: :second)
+    end
+
+    test "an integer timestamp is already in the caller's unit, whatever the precision" do
+      point = Point.new("cpu", %{"v" => 1}, timestamp: 1_790_596_800)
+      assert {:ok, "cpu v=1i 1790596800"} = LineProtocol.encode(point, precision: :second)
+    end
+
     test "omits timestamp when nil" do
       point = Point.new("cpu", %{"value" => 1.0})
       assert {:ok, lp} = LineProtocol.encode(point)

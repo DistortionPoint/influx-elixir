@@ -93,6 +93,7 @@ defmodule InfluxElixir.ClientContract do
     distinct_on_tests = if v3_sql, do: distinct_on_tests(client), else: nil
     identifier_tests = if v3_sql, do: identifier_tests(client), else: nil
     tab_tests = if v3_sql, do: tab_tests(client), else: nil
+    timestamp_range_tests = timestamp_range_tests(client, if(v2_ops, do: :v2, else: :v3))
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
     v2_write_rule_tests = if v2_ops, do: v2_write_rule_tests(client), else: nil
@@ -141,6 +142,7 @@ defmodule InfluxElixir.ClientContract do
         distinct_on_tests,
         identifier_tests,
         tab_tests,
+        timestamp_range_tests,
         bucket_tests,
         v2_write_rule_tests,
         v2_precision_tests,
@@ -3081,6 +3083,52 @@ defmodule InfluxElixir.ClientContract do
                    unquote(client).query_sql(ctx.conn, ~s|SELECT h, s FROM "#{m}"|,
                      database: ctx.database
                    )
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Timestamp range (every profile)
+  # ---------------------------------------------------------------------------
+
+  # A timestamp must fit in a signed 64-bit count of nanoseconds once scaled
+  # by the precision; each version refuses the rest in its own words.
+  defp timestamp_range_tests(client, version) do
+    quote do
+      describe "write/3 — timestamp range contract" do
+        test "the largest timestamp per precision is stored; one more is refused", ctx do
+          m = "contract_ts_#{System.unique_integer([:positive])}"
+          v2? = unquote(version) == :v2
+
+          for {ok, over, precision, unit} <- [
+                {9_223_372_036, 9_223_372_037, :second, "Second"},
+                {9_223_372_036_854, 9_223_372_036_855, :millisecond, "Millisecond"},
+                {9_223_372_036_854_775, 9_223_372_036_854_776, :microsecond, "Microsecond"}
+              ] do
+            assert {:ok, :written} =
+                     unquote(client).write(ctx.conn, "#{m} v=1i #{ok}",
+                       database: ctx.database,
+                       precision: precision
+                     )
+
+            assert {:error, %{status: 400, body: body}} =
+                     unquote(client).write(ctx.conn, "#{m} v=1i #{over}",
+                       database: ctx.database,
+                       precision: precision
+                     )
+
+            if v2? do
+              assert %{"message" => message} = Jason.decode!(body)
+
+              assert message ==
+                       "unable to parse '#{m} v=1i #{over}': time outside range " <>
+                         "-9223372036854775806 - 9223372036854775806"
+            else
+              assert %{"data" => [%{"error_message" => message}]} = Jason.decode!(body)
+              assert message == "timestamp, #{over}, out of range for precision: #{unit}"
+            end
+          end
         end
       end
     end

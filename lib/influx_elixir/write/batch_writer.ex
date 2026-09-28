@@ -25,6 +25,8 @@ defmodule InfluxElixir.Write.BatchWriter do
     * `:write_opts` - keyword list forwarded to `InfluxElixir.Write.Writer.write/3`
       on every flush. Useful for setting `:database`, `:timeout`, `:precision`
       per BatchWriter without baking them into the connection. Default: `[]`.
+      A `Point`'s `DateTime` timestamp is encoded in its `:precision`; an
+      integer timestamp must already be in that unit.
     * `:client` - client module to write with instead of the configured one
       (`InfluxElixir.Client.impl/0`).
     * `:shutdown` - how long, in milliseconds, a supervisor waits for the
@@ -189,9 +191,7 @@ defmodule InfluxElixir.Write.BatchWriter do
           timeout()
         ) :: :ok | {:error, :buffer_full | term()}
   def write(server, payload, timeout \\ @default_write_timeout) do
-    with {:ok, line} <- encode_payload(payload) do
-      GenServer.call(server, {:write, line}, timeout)
-    end
+    GenServer.call(server, {:write, payload}, timeout)
   end
 
   @doc """
@@ -223,9 +223,7 @@ defmodule InfluxElixir.Write.BatchWriter do
           timeout()
         ) :: :ok | {:error, term()}
   def write_sync(server, payload, timeout \\ @default_write_sync_timeout) do
-    with {:ok, line} <- encode_payload(payload) do
-      GenServer.call(server, {:write_sync, line}, timeout)
-    end
+    GenServer.call(server, {:write_sync, payload}, timeout)
   end
 
   @doc """
@@ -317,29 +315,30 @@ defmodule InfluxElixir.Write.BatchWriter do
   end
 
   @impl GenServer
-  def handle_call({:write, line}, _from, %__MODULE__{} = state) do
+  def handle_call({:write, payload}, _from, %__MODULE__{} = state) do
     max_buffer = state.batch_size * @backpressure_multiplier
 
-    if state.buffer_size >= max_buffer do
-      {:reply, {:error, :buffer_full}, state}
-    else
+    with false <- state.buffer_size >= max_buffer,
+         {:ok, line} <- encode_payload(payload, state.write_opts) do
       {:reply, :ok, state |> append_to_buffer(line) |> maybe_flush_on_batch()}
+    else
+      true -> {:reply, {:error, :buffer_full}, state}
+      {:error, _reason} = error -> {:reply, error, state}
     end
   end
 
   @impl GenServer
-  def handle_call({:write_sync, line}, from, %__MODULE__{} = state) do
+  def handle_call({:write_sync, payload}, from, %__MODULE__{} = state) do
     max_buffer = state.batch_size * @backpressure_multiplier
 
-    cond do
-      state.buffer_size >= max_buffer ->
-        {:reply, {:error, :buffer_full}, state}
-
-      state.no_sync ->
-        {:reply, :ok, state |> append_to_buffer(line) |> maybe_flush_on_batch()}
-
-      true ->
-        {:noreply, do_flush(append_to_buffer(%{state | pending_sync: from}, line))}
+    with false <- state.buffer_size >= max_buffer,
+         {:ok, line} <- encode_payload(payload, state.write_opts) do
+      if state.no_sync,
+        do: {:reply, :ok, state |> append_to_buffer(line) |> maybe_flush_on_batch()},
+        else: {:noreply, do_flush(append_to_buffer(%{state | pending_sync: from}, line))}
+    else
+      true -> {:reply, {:error, :buffer_full}, state}
+      {:error, _reason} = error -> {:reply, error, state}
     end
   end
 
@@ -445,15 +444,16 @@ defmodule InfluxElixir.Write.BatchWriter do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  # Runs in the caller: a point no server accepts is that caller's
-  # `{:error, reason}` (as from `LineProtocol.encode/1`), not a crash of
-  # the writer that loses every other caller's buffered lines.
-  @spec encode_payload(InfluxElixir.Write.Point.t() | binary()) ::
+  # A point no server accepts is the caller's `{:error, reason}` (as from
+  # `LineProtocol.encode/2`), never a crash that loses every other caller's
+  # buffered lines. It is encoded here, where the flushes' `:precision` is
+  # known: a `DateTime` timestamp is written in that unit.
+  @spec encode_payload(InfluxElixir.Write.Point.t() | binary(), keyword()) ::
           {:ok, binary()} | {:error, term()}
-  defp encode_payload(payload) when is_binary(payload), do: {:ok, payload}
+  defp encode_payload(payload, _write_opts) when is_binary(payload), do: {:ok, payload}
 
-  defp encode_payload(%InfluxElixir.Write.Point{} = point),
-    do: InfluxElixir.Write.LineProtocol.encode(point)
+  defp encode_payload(%InfluxElixir.Write.Point{} = point, write_opts),
+    do: InfluxElixir.Write.LineProtocol.encode(point, Keyword.take(write_opts, [:precision]))
 
   @spec append_to_buffer(t(), binary()) :: t()
   defp append_to_buffer(%__MODULE__{} = state, line) do

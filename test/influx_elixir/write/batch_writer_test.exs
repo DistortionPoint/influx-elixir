@@ -272,6 +272,20 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
+  describe "precision" do
+    test "a Point's DateTime is written in the flushes' :precision", %{conn: conn} do
+      # It was always nanoseconds: with `precision: :second` the server
+      # refused it as out of range (verified), and the double stored a time
+      # its queries could not render.
+      pid = start_writer(conn, flush_interval_ms: 60_000, write_opts: [precision: :millisecond])
+      dt = ~U[2026-09-28 12:00:00.123456Z]
+
+      :ok = BatchWriter.write_sync(pid, Point.new("cpu", %{"v" => 1}, timestamp: dt))
+
+      assert [%{"time" => ~U[2026-09-28 12:00:00.123000Z]}] = stored(conn, "cpu")
+    end
+  end
+
   describe "invalid points" do
     test "are the caller's error and leave the writer and its buffer intact", %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 60_000)

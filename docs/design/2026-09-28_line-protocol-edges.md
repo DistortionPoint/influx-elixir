@@ -82,3 +82,48 @@ stands:
 | `lib/influx_elixir/client/local/line_protocol_parser.ex` | `tab_error/2` scanner; leading whitespace |
 | `test/influx_elixir/write/line_protocol_test.exs`, `test/support/client_contract.ex` | Tests |
 | `usage-rules/write.md`, `docs/guides/testing-with-local-client.md`, `CHANGELOG.md` | Updated |
+
+## Follow-up (same day): timestamps, precision and range
+
+**Encoder precision.** `encode/1` wrote a `DateTime` timestamp in
+nanoseconds whatever the write's precision. A `BatchWriter` with
+`write_opts: [precision: :second]` sent `1790596800123456000` as seconds,
+and InfluxDB 3 refused every point with `timestamp, …, out of range for
+precision: Second`; the same happened at `:millisecond` and
+`:microsecond`.
+
+`encode/2` now takes `precision:` in the spellings `write/3` accepts. It
+divides the `DateTime`'s nanoseconds by the unit with `floor_div`, so a
+time before 1970 does not move forward. `:auto`, an unknown spelling, or
+no option means nanoseconds. An integer timestamp is written as given,
+because it is already in the caller's unit.
+
+`BatchWriter` encodes a `Point` in the writer process again, where its
+`write_opts` precision is known. It uses the non-raising `encode/2`, so
+an invalid point is still the caller's `{:error, reason}`, never a crash.
+
+**Range.** Probing the boundary of each precision on both engines:
+
+- InfluxDB 3 accepts any timestamp whose value in nanoseconds fits in
+  int64, at every precision; the next one is `timestamp, N, out of range
+  for precision: Second|Millisecond|Microsecond`. A literal past int64 is
+  `Unable to parse timestamp value`.
+- InfluxDB 2 accepts `-9223372036854775806 .. 9223372036854775806`
+  nanoseconds, so the two int64 ends are refused. Its message is
+  `time outside range -9223372036854775806 - 9223372036854775806`, and a
+  literal past int64 is `strconv.ParseInt: parsing "…": value out of
+  range`.
+
+`Client.Local` stored the scaled value, and a later query raised
+converting it to a `DateTime`. It now applies each version's range and
+wording. Twenty-eight boundary writes gave identical answers from
+`Client.HTTP` against Core and 2.7 and from `Client.Local`. A
+`BatchWriter` writing a `DateTime` point at each precision stored the
+same, truncated, time on both clients.
+
+**Tests.** `write/3 — timestamp range contract` runs on every profile,
+with each version's message. There are encoder tests for each precision
+and spelling, for truncation before 1970, and for integer timestamps,
+plus a `BatchWriter` precision test. The new unit tests fail against the
+previous code. `writer_test.exs` built timestamps past int64 by string
+concatenation (`"17000000000000000#{i}"`) and now adds instead.

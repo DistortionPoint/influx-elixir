@@ -141,7 +141,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
           with {:ok, {measurement, tags}} <- parse_key_part(key_part, dialect),
                {:ok, fields} <- parse_fields_part(fields_part),
                {:ok, fields} <- check_columns(tags, fields, dialect),
-               {:ok, timestamp} <- parse_timestamp(ts_raw, precision) do
+               {:ok, timestamp} <- parse_timestamp(ts_raw, precision, dialect) do
             {:ok, %{measurement: measurement, tags: tags, fields: fields, timestamp: timestamp}}
           end
 
@@ -682,17 +682,52 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   end
 
   # Parses a raw timestamp string, normalising to nanoseconds.
-  @spec parse_timestamp(binary() | nil, precision()) ::
+  @spec parse_timestamp(binary() | nil, precision(), dialect()) ::
           {:ok, integer() | nil} | {:error, binary()}
-  defp parse_timestamp(nil, _prec), do: {:ok, nil}
-  defp parse_timestamp("", _prec), do: {:ok, nil}
+  defp parse_timestamp(nil, _prec, _dialect), do: {:ok, nil}
+  defp parse_timestamp("", _prec, _dialect), do: {:ok, nil}
 
-  defp parse_timestamp(ts_str, precision) do
-    case Integer.parse(ts_str) do
-      {ts, ""} -> {:ok, to_nanoseconds(ts, precision)}
-      _err -> {:error, "Unable to parse timestamp value `#{ts_str}`"}
+  # The stored time is nanoseconds in a signed 64-bit integer. A timestamp
+  # that does not fit once scaled to nanoseconds is refused, in each
+  # version's words (verified): InfluxDB 3 takes the whole int64 range,
+  # InfluxDB 2 all but its two ends.
+  defp parse_timestamp(ts_str, precision, dialect) do
+    with {ts, ""} <- Integer.parse(ts_str),
+         true <- ts in @int64_min..@int64_max do
+      ns = to_nanoseconds(ts, precision)
+
+      if in_range?(ns, dialect),
+        do: {:ok, ns},
+        else: {:error, out_of_range(ts, precision, dialect)}
+    else
+      {_ts, _rest} -> {:error, "Unable to parse timestamp value `#{ts_str}`"}
+      :error -> {:error, "Unable to parse timestamp value `#{ts_str}`"}
+      false -> {:error, int64_overflow(ts_str, dialect)}
     end
   end
+
+  @spec in_range?(integer(), dialect()) :: boolean()
+  defp in_range?(ns, :v3), do: ns in @int64_min..@int64_max
+  defp in_range?(ns, :v2), do: ns in (@int64_min + 2)..(@int64_max - 1)
+
+  @spec out_of_range(integer(), precision(), dialect()) :: binary()
+  defp out_of_range(ts, precision, :v3),
+    do: "timestamp, #{ts}, out of range for precision: #{precision_name(precision)}"
+
+  defp out_of_range(_ts, _precision, :v2),
+    do: "time outside range #{@int64_min + 2} - #{@int64_max - 1}"
+
+  @spec int64_overflow(binary(), dialect()) :: binary()
+  defp int64_overflow(ts_str, :v3), do: "Unable to parse timestamp value `#{ts_str}`"
+
+  defp int64_overflow(ts_str, :v2),
+    do: ~s|strconv.ParseInt: parsing "#{ts_str}": value out of range|
+
+  @spec precision_name(precision()) :: binary()
+  defp precision_name(:second), do: "Second"
+  defp precision_name(:millisecond), do: "Millisecond"
+  defp precision_name(:microsecond), do: "Microsecond"
+  defp precision_name(_nanosecond_or_auto), do: "Nanosecond"
 
   # `:auto` is InfluxDB 3's guess from the magnitude, verified against the
   # engine: |ts| below 5e9 is seconds, below 5e12 milliseconds, below 5e15

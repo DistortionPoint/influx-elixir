@@ -21,7 +21,13 @@ defmodule InfluxElixir.Write.WriterTest do
     test "a payload over 1 KB is gzipped and still stored in full", %{conn: conn} do
       # 100 distinct points; the client receives the compressed payload
       # (Local decompresses on the gzip magic bytes) and stores every one.
-      lp = Enum.map_join(1..100, "\n", &"cpu,host=h#{&1} value=#{&1}i 17000000000000000#{&1}")
+      lp =
+        Enum.map_join(
+          1..100,
+          "\n",
+          &"cpu,host=h#{&1} value=#{&1}i #{1_700_000_000_000_000_000 + &1}"
+        )
+
       assert byte_size(lp) > 1024
 
       assert {:ok, :written} = Writer.write(conn, lp, database: "w")

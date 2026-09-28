@@ -77,6 +77,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1,583 → 1,430 lines) holds no `:ets` call. Behaviour is unchanged.
 
 ### Fixed
+- **A `Point`'s `DateTime` timestamp only worked at nanosecond
+  precision.** The encoder always wrote nanoseconds, so a `BatchWriter`
+  with `write_opts: [precision: :second]` (or `:millisecond`,
+  `:microsecond`) had every point refused by InfluxDB 3 with
+  `timestamp, 1790596800123456000, out of range for precision: Second`.
+  `LineProtocol.encode/2` now takes `precision:` and writes a `DateTime`
+  in that unit, truncated toward the past. `BatchWriter` encodes with its
+  own `write_opts` precision. An integer timestamp is still taken as
+  given, since it is already in the caller's unit.
+- **`Client.Local` accepted timestamps no server stores, and then crashed
+  on the query.** A timestamp is refused once scaled past a signed 64-bit
+  count of nanoseconds, in each version's words (verified on Core and
+  2.7):
+  - InfluxDB 3 answers `timestamp, N, out of range for precision: Unit`,
+    and `Unable to parse timestamp value` for anything past 64 bits.
+  - InfluxDB 2 answers `time outside range -9223372036854775806 -
+    9223372036854775806`, a range that excludes both int64 ends, and a
+    `strconv.ParseInt` error past 64 bits.
+
+  The double used to store the scaled value, and a later `SELECT` raised
+  converting it to a `DateTime`. A test fixture that built timestamps
+  past int64 by string concatenation relied on this and was fixed.
 - **`LineProtocol.encode/1` produced lines no server accepts, or one both
   drop silently.** Each case was verified on InfluxDB 3 Core and 2.7:
   - **An integer outside 64 bits.** Both reject the line.

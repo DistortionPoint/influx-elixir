@@ -69,6 +69,17 @@ defmodule InfluxElixir.Write.LineProtocol do
   Returns `{:ok, binary}` on success or `{:error, reason}` on failure; see
   "Validation" in the moduledoc for the reasons.
 
+  ## Options
+
+    * `:precision` - the unit of the write the line is for (`:second`,
+      `:millisecond`, `:microsecond`, `:nanosecond`, or the short spellings
+      `write/3` takes: `:s`, `"ms"`, `"us"`, `"u"`, `"n"`, ...). A
+      `DateTime` timestamp is written in that unit, truncated; without it
+      (or for `:auto`) in nanoseconds. A `DateTime` written in nanoseconds
+      to a write with `precision: :second` is out of range on the server
+      (verified), so pass the write's precision here. An integer timestamp
+      is written as given: it is already in the caller's unit.
+
   ## Examples
 
       iex> point = InfluxElixir.Write.Point.new("cpu", %{"value" => 0.64})
@@ -88,13 +99,17 @@ defmodule InfluxElixir.Write.LineProtocol do
       iex> InfluxElixir.Write.LineProtocol.encode(point)
       {:error, {:invalid_tag_value, "host", ""}}
   """
-  @spec encode(Point.t() | [Point.t()]) :: encode_result()
-  def encode(%Point{} = point), do: encode_point(point)
+  @spec encode(Point.t() | [Point.t()], keyword()) :: encode_result()
+  def encode(point_or_points, opts \\ [])
 
-  def encode(points) when is_list(points) do
+  def encode(%Point{} = point, opts), do: encode_point(point, timestamp_divisor(opts))
+
+  def encode(points, opts) when is_list(points) do
+    divisor = timestamp_divisor(opts)
+
     points
     |> Enum.reduce_while({:ok, []}, fn point, {:ok, acc} ->
-      case encode_point(point) do
+      case encode_point(point, divisor) do
         {:ok, line} -> {:cont, {:ok, [line | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
@@ -116,9 +131,9 @@ defmodule InfluxElixir.Write.LineProtocol do
       iex> InfluxElixir.Write.LineProtocol.encode!(point)
       "cpu value=0.64"
   """
-  @spec encode!(Point.t() | [Point.t()]) :: binary()
-  def encode!(point_or_points) do
-    case encode(point_or_points) do
+  @spec encode!(Point.t() | [Point.t()], keyword()) :: binary()
+  def encode!(point_or_points, opts \\ []) do
+    case encode(point_or_points, opts) do
       {:ok, line} -> line
       {:error, reason} -> raise ArgumentError, "LineProtocol encode failed: #{inspect(reason)}"
     end
@@ -128,13 +143,29 @@ defmodule InfluxElixir.Write.LineProtocol do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  @spec encode_point(Point.t()) :: encode_result()
-  defp encode_point(%Point{measurement: measurement, tags: tags, fields: fields, timestamp: ts}) do
+  # Nanoseconds per unit of the write's precision; a `DateTime` is divided
+  # by it. An unknown spelling is left to the server to refuse, with the
+  # timestamp in nanoseconds.
+  @spec timestamp_divisor(keyword()) :: pos_integer()
+  defp timestamp_divisor(opts) do
+    case opts |> Keyword.get(:precision) |> to_string() do
+      unit when unit in ~w(second s) -> 1_000_000_000
+      unit when unit in ~w(millisecond ms) -> 1_000_000
+      unit when unit in ~w(microsecond us u) -> 1_000
+      _nanosecond_auto_or_unknown -> 1
+    end
+  end
+
+  @spec encode_point(Point.t(), pos_integer()) :: encode_result()
+  defp encode_point(
+         %Point{measurement: measurement, tags: tags, fields: fields, timestamp: ts},
+         divisor
+       ) do
     with :ok <- validate_fields(fields),
          {:ok, measurement_str} <- encode_measurement(measurement),
          {:ok, tags_str} <- encode_tags(tags),
          {:ok, fields_str} <- encode_fields(fields),
-         {:ok, timestamp_str} <- encode_timestamp(ts) do
+         {:ok, timestamp_str} <- encode_timestamp(ts, divisor) do
       line =
         case {tags_str, timestamp_str} do
           {"", ""} -> "#{measurement_str} #{fields_str}"
@@ -240,23 +271,18 @@ defmodule InfluxElixir.Write.LineProtocol do
   defp field_value?(value) when is_integer(value), do: value in @int64_min..@int64_max
   defp field_value?(value), do: is_float(value) or is_binary(value) or is_boolean(value)
 
-  @spec encode_timestamp(DateTime.t() | integer() | nil) ::
+  @spec encode_timestamp(DateTime.t() | integer() | nil, pos_integer()) ::
           {:ok, binary()} | {:error, term()}
-  defp encode_timestamp(nil), do: {:ok, ""}
+  defp encode_timestamp(nil, _divisor), do: {:ok, ""}
 
-  defp encode_timestamp(%DateTime{} = dt) do
-    nanos =
-      dt
-      |> DateTime.to_unix(:nanosecond)
+  # Truncated toward the past, so a timestamp never moves forward.
+  defp encode_timestamp(%DateTime{} = dt, divisor),
+    do:
+      {:ok,
+       dt |> DateTime.to_unix(:nanosecond) |> Integer.floor_div(divisor) |> Integer.to_string()}
 
-    {:ok, Integer.to_string(nanos)}
-  end
-
-  defp encode_timestamp(ts) when is_integer(ts) do
-    {:ok, Integer.to_string(ts)}
-  end
-
-  defp encode_timestamp(ts), do: {:error, {:invalid_timestamp, ts}}
+  defp encode_timestamp(ts, _divisor) when is_integer(ts), do: {:ok, Integer.to_string(ts)}
+  defp encode_timestamp(ts, _divisor), do: {:error, {:invalid_timestamp, ts}}
 
   # Tag key escaping: spaces, commas, equals, backslashes
   @spec escape_tag_key(String.t()) :: binary()
