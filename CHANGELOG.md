@@ -77,6 +77,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1,583 → 1,430 lines) holds no `:ets` call. Behaviour is unchanged.
 
 ### Fixed
+- **`query_sql_stream/3` could starve its connection pool.** A stream
+  runs its request in a producer process that holds a pool connection.
+  There were two ways to lose it:
+  - If the consuming process was killed mid-stream (`:kill`, a brutal
+    task shutdown), the producer waited forever for an acknowledgement,
+    holding the connection. On a small pool, every later request was a
+    `:pool_timeout`.
+  - If the consumer stopped early (`Enum.take/2`), cleanup killed the
+    producer. Finch's pool drops the connection of an owner that dies
+    without serving the requests already waiting for it, so a request
+    queued at that moment timed out.
+
+  Both were reproduced on InfluxDB 3 Core with a one-connection pool. The
+  producer now monitors its consumer, and it ends the request with
+  `Finch.stream_while/5`'s `{:halt, _}` instead of dying, which checks
+  the connection back in. Early-stop cleanup asks the producer to cancel,
+  and kills it only if it has not stopped within a second (a server gone
+  silent). Two integration tests fail against the previous client.
+- **`Flight.Client.query/3` closes its gRPC channel when decoding
+  raises.** The channel was closed on every return path but not on a
+  raise; the call now uses `try/after`.
 - **Enterprise `DELETE` in `Client.Local` ignored SQL's identifier
   rules.** It is now read like a `SELECT`: unquoted names fold to lower
   case, and quoted ones are exact. Before, `DELETE FROM "Cpu"` looked for

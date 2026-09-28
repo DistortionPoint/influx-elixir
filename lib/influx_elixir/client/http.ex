@@ -836,47 +836,52 @@ defmodule InfluxElixir.Client.HTTP do
           :ok
   defp run_producer(parent, ref, finch_name, url, headers, body, finch_opts) do
     request = Finch.build(:post, url, headers, body)
+    # The consumer may die without running `stream_cleanup/1` (killed, or
+    # its task shut down brutally); the producer then waited for an ack
+    # that never came and kept its pool connection checked out for good.
+    consumer = Process.monitor(parent)
 
+    # The request is ended with `{:halt, _}`, never by killing this process:
+    # Finch then checks the connection back in, and a request already
+    # queued for the pool is served. A pool whose checked-out owner dies
+    # drops that connection without serving its queue (verified), so the
+    # waiting request timed out.
     outcome =
-      Finch.stream(
+      Finch.stream_while(
         request,
         finch_name,
-        :ok,
+        :streaming,
         fn
-          {:status, status}, acc ->
-            emit_and_wait(parent, ref, {:status, status})
-            acc
-
-          {:headers, _headers}, acc ->
-            acc
-
-          {:data, data}, acc ->
-            emit_and_wait(parent, ref, {:data, data})
-            acc
-
-          {:trailers, _trailers}, acc ->
-            acc
+          {:status, status}, acc -> emit_and_wait(parent, consumer, ref, {:status, status}, acc)
+          {:data, data}, acc -> emit_and_wait(parent, consumer, ref, {:data, data}, acc)
+          {_headers_or_trailers, _value}, acc -> {:cont, acc}
         end,
         finch_opts
       )
 
+    # A consumer that cancelled, or died, is sent nothing more.
     case outcome do
-      {:ok, _acc} -> send(parent, {ref, :done})
-      {:error, reason, _acc} -> send(parent, {ref, {:transport_error, reason}})
+      {:ok, :streaming} -> send(parent, {ref, :done})
+      {:ok, :cancelled} -> :ok
+      {:error, reason, :streaming} -> send(parent, {ref, {:transport_error, reason}})
+      {:error, _reason, :cancelled} -> :ok
     end
 
     :ok
   end
 
-  # Send a chunk to the consumer and block until it acks. If the consumer has
-  # abandoned the stream it is killed by `stream_cleanup/1`, which unblocks this
-  # receive by terminating the process.
-  @spec emit_and_wait(pid(), reference(), term()) :: :ok
-  defp emit_and_wait(parent, ref, msg) do
+  # Send a chunk to the consumer and block until it acks. A consumer that
+  # stops early cancels (`stream_cleanup/1`), and one that dies is seen by
+  # its monitor; either way the request halts.
+  @spec emit_and_wait(pid(), reference(), reference(), term(), :streaming) ::
+          {:cont, :streaming} | {:halt, :cancelled}
+  defp emit_and_wait(parent, consumer, ref, msg, acc) do
     send(parent, {ref, msg})
 
     receive do
-      {:ack, ^ref} -> :ok
+      {:ack, ^ref} -> {:cont, acc}
+      {:cancel, ^ref} -> {:halt, :cancelled}
+      {:DOWN, ^consumer, :process, ^parent, _reason} -> {:halt, :cancelled}
     end
   end
 
@@ -969,17 +974,42 @@ defmodule InfluxElixir.Client.HTTP do
     :ok
   end
 
-  # Tear down the producer and drain any of its messages from the consumer's
-  # mailbox. The stream runs in the caller's process, so leftover chunk or
-  # :DOWN messages would otherwise pollute that mailbox.
+  # Stop the producer and drain its messages from the consumer's mailbox:
+  # the stream runs in the caller's process, so a leftover chunk or :DOWN
+  # would otherwise pollute that mailbox. A producer still running is asked
+  # to cancel, so its request halts and the connection goes back to the
+  # pool (see `run_producer/7`); it notices at its next chunk. One that does
+  # not stop within the grace period (a server gone silent) is killed.
+  # Waiting for its :DOWN first means every message it sent is already in
+  # the mailbox when it is flushed.
+  @cancel_grace_ms 1_000
+
   @spec stream_cleanup(stream_state() | term()) :: :ok
   defp stream_cleanup(%{producer: producer, ref: ref, monitor: monitor}) do
-    Process.exit(producer, :kill)
+    if Process.alive?(producer) do
+      send(producer, {:cancel, ref})
+      await_down(producer, monitor)
+    end
+
     Process.demonitor(monitor, [:flush])
     flush_ref(ref)
   end
 
   defp stream_cleanup(_state), do: :ok
+
+  @spec await_down(pid(), reference()) :: :ok
+  defp await_down(producer, monitor) do
+    receive do
+      {:DOWN, ^monitor, :process, ^producer, _reason} -> :ok
+    after
+      @cancel_grace_ms ->
+        Process.exit(producer, :kill)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^producer, _reason} -> :ok
+        end
+    end
+  end
 
   @spec flush_ref(reference()) :: :ok
   defp flush_ref(ref) do

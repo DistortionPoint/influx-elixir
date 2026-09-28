@@ -49,6 +49,86 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
     end
   end
 
+  # A streaming query holds its pool connection in a producer process. The
+  # producer used to be killed when the consumer stopped early, and to wait
+  # forever when the consumer itself was killed. A pool drops the connection
+  # of a checkout owner that dies, without serving the requests already
+  # queued for it (verified), so a request waiting on the pool timed out.
+  # The producer now halts its request, which checks the connection back in.
+  describe "query_sql_stream/3 releases its pool connection" do
+    setup ctx do
+      finch = :"stream_release_finch_#{System.unique_integer([:positive])}"
+      start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
+      conn = Keyword.put(ctx.conn, :finch_name, finch)
+      m = "stream_release_#{System.unique_integer([:positive])}"
+
+      # Enough rows that the response arrives in many chunks.
+      lp = Enum.map_join(1..20_000, "\n", &"#{m},k=k#{rem(&1, 50)} v=#{&1}i #{&1}")
+      {:ok, :written} = HTTP.write(conn, lp, database: ctx.database)
+      InfluxElixir.ClientContract.settle(ctx)
+
+      count = fn ->
+        HTTP.query_sql(conn, "SELECT count(*) AS n FROM #{m}",
+          database: ctx.database,
+          pool_timeout: 5_000
+        )
+      end
+
+      {:ok, conn: conn, m: m, count: count}
+    end
+
+    test "when the consumer stops early, a request waiting on the pool is served", ctx do
+      test_pid = self()
+
+      rows =
+        ctx.conn
+        |> HTTP.query_sql_stream("SELECT * FROM #{ctx.m}", database: ctx.database)
+        |> Stream.with_index()
+        |> Stream.each(fn
+          {_row, 0} -> send(test_pid, {:waiter, queue_waiter(ctx.count)})
+          _later -> :ok
+        end)
+        |> Enum.take(3)
+
+      assert length(rows) == 3
+
+      # The stream ran in this process: nothing of it is left in the mailbox.
+      refute_received {_ref, {:data, _chunk}}
+      refute_received {_ref, :done}
+
+      assert_received {:waiter, waiter}
+      assert {:ok, [%{"n" => 20_000}]} = Task.await(waiter, 10_000)
+    end
+
+    test "when the consumer is killed, a request waiting on the pool is served", ctx do
+      test_pid = self()
+
+      consumer =
+        spawn(fn ->
+          ctx.conn
+          |> HTTP.query_sql_stream("SELECT * FROM #{ctx.m}", database: ctx.database)
+          |> Enum.each(fn _row ->
+            send(test_pid, :streaming)
+            Process.sleep(:infinity)
+          end)
+        end)
+
+      assert_receive :streaming, 10_000
+      waiter = queue_waiter(ctx.count)
+      Process.exit(consumer, :kill)
+
+      assert {:ok, [%{"n" => 20_000}]} = Task.await(waiter, 10_000)
+    end
+  end
+
+  # A request for the pool's only connection, queued behind the stream:
+  # returns once the waiting process is blocked on its checkout.
+  defp queue_waiter(count) do
+    waiter = Task.async(count)
+    wait_until(fn -> Process.info(waiter.pid, :status) == {:status, :waiting} end)
+    waiter
+  end
+
   # Proves :pool_timeout reaches Finch (#14). A pool of size 1 is held by a
   # streaming request that sleeps inside its chunk callback; a second request
   # must then wait on checkout, and its :pool_timeout decides its fate
@@ -307,6 +387,7 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
     end
   end
 
+  # Polls `fun` with a hard deadline instead of a fixed sleep.
   defp wait_until(fun, deadline_ms \\ 10_000) do
     deadline = System.monotonic_time(:millisecond) + deadline_ms
     do_wait_until(fun, deadline)
@@ -321,7 +402,8 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
         flunk("condition not met within deadline")
 
       true ->
-        Process.sleep(20) && do_wait_until(fun, deadline)
+        Process.sleep(20)
+        do_wait_until(fun, deadline)
     end
   end
 end

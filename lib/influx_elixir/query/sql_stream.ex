@@ -28,6 +28,11 @@ defmodule InfluxElixir.Query.SQLStream do
   status, transport failure) are raised as an `InfluxElixir.StreamError` when
   the stream is enumerated rather than surfacing as an empty result.
 
+  A stream holds one pool connection while it is enumerated. Stopping early
+  (`Enum.take/2`, a `break` out of `Enum.reduce_while/3`) or the enumerating
+  process dying, even by `:kill`, ends the request and returns the
+  connection to the pool, where a request already waiting for it is served.
+
   ## Options
 
     * `:params` - parameter map for `$param` substitution
