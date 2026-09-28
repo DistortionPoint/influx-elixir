@@ -900,6 +900,36 @@ engine's message for where it stands (InfluxDB 3 only; a leading tab is
 whitespace), a line starting with `#` is a comment, a timestamp that does not
 fit in 64 bits of nanoseconds once scaled by the precision is rejected in each
 version's words, and an empty payload is rejected.
+### Pinning production's column types
+
+Every `Local.start/1` begins with an empty schema, so in a test the *first*
+write to a measurement decides each column's type. Production's columns were
+typed long ago by other writers. A writer that sends the wrong type is
+therefore refused in production (`invalid column type ...`), but in its own
+test it simply defines the column, and the test passes.
+
+To catch that drift, write one point with production's types before the code
+under test runs. Stamp it at a time your queries never reach, for example the
+epoch:
+
+```elixir
+setup %{conn: conn} do
+  # duration_ms is a float in production.
+  {:ok, :written} =
+    Local.write(conn, "job_runs,job=seed duration_ms=0.0 0", database: "test_db")
+
+  :ok
+end
+
+test "records whole-millisecond durations as the column's type", %{conn: conn} do
+  # Refused, as on the server, if the writer sends duration_ms=1153i.
+  assert :ok = MyApp.JobLog.record(conn, "import", 1153)
+end
+```
+
+The seed row is stored like any other. A query that is not bounded by time,
+such as a plain `COUNT(*)`, sees it.
+
 Points with the same measurement, tag set and timestamp are one point on both
 versions (verified): their fields merge and the later write wins per field,
 so a fixture that rewrites `v=2i` at an existing instant reads back one row.

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The testing guide explains how to pin production's column types
+  (#24).** Each `Client.Local` store starts with an empty schema, so a
+  test's first write to a measurement decides its column types. A writer
+  that sends the wrong type therefore defines the column in its own test
+  but is refused in production. The guide now says so, with a `setup`
+  recipe that seeds one point with production's types. The double already
+  refuses a conflicting type as InfluxDB 3 does, re-verified on every
+  profile and on v0.1.33.
+
 ## [0.1.34] - 2026-09-28
 
 ### Fixed
