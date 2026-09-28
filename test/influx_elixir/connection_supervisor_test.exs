@@ -106,6 +106,23 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
     end
   end
 
+  describe "batch_writer: validation" do
+    test "a misconfigured writer fails the connection's start, naming the option" do
+      name = unique_name()
+
+      assert {:error, reason} =
+               InfluxElixir.add_connection(name, batch_writer: [batch_size: 0])
+
+      assert inspect(reason) =~ "invalid value for :batch_size option"
+      assert {:error, :not_found} = Connection.get(name)
+
+      # Nothing was left behind, so the corrected config starts.
+      assert {:ok, _pid} = InfluxElixir.add_connection(name, batch_writer: [batch_size: 10])
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+      assert {:ok, _conn} = Connection.get(name)
+    end
+  end
+
   describe "remove_connection — registry cleanup" do
     test "deregisters connection from persistent_term on removal" do
       name = unique_name()

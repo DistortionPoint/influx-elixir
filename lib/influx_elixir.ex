@@ -397,6 +397,11 @@ defmodule InfluxElixir do
 
   @doc """
   Adds a new named connection dynamically at runtime.
+
+  If the connection does not start — a `batch_writer:` option that
+  `InfluxElixir.Write.BatchWriter` refuses, say — the error is returned
+  and nothing is left behind: the name does not resolve and the client's
+  connection state is released.
   """
   @spec add_connection(atom(), keyword()) :: Supervisor.on_start_child()
   def add_connection(name, opts) do
@@ -408,7 +413,36 @@ defmodule InfluxElixir do
         id: {InfluxElixir.ConnectionSupervisor, name}
       )
 
-    Supervisor.start_child(InfluxElixir.Supervisor, child_spec)
+    # A name already running keeps its registration; any other failure
+    # releases what `ConnectionSupervisor.init/1` set up.
+    case Supervisor.start_child(InfluxElixir.Supervisor, child_spec) do
+      {:error, {:already_started, _pid}} = error ->
+        error
+
+      {:error, :already_present} = error ->
+        error
+
+      {:error, _reason} = error ->
+        release_connection(name)
+        error
+
+      started ->
+        started
+    end
+  end
+
+  # `ConnectionSupervisor.init/1` registers the connection and initialises
+  # the client before its children start; a child that then fails used to
+  # leave the name resolving to a connection that was not running (and,
+  # for `Client.Local`, its store allocated).
+  @spec release_connection(atom()) :: :ok
+  defp release_connection(name) do
+    case InfluxElixir.Connection.get(name) do
+      {:ok, conn} -> client().shutdown_connection(conn)
+      {:error, :not_found} -> :ok
+    end
+
+    InfluxElixir.Connection.delete(name)
   end
 
   @doc """

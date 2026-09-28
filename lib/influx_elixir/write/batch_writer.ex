@@ -1,4 +1,76 @@
 defmodule InfluxElixir.Write.BatchWriter do
+  @default_shutdown 5_000
+
+  # The options, validated by `start_link/1`; the moduledoc lists them from
+  # here, so the two cannot drift.
+  @options_schema NimbleOptions.new!(
+                    connection: [
+                      type: :any,
+                      required: true,
+                      doc: "connection term passed to `InfluxElixir.Write.Writer`"
+                    ],
+                    database: [
+                      type: :string,
+                      doc: "database every flush writes to. A `:database` in `:write_opts` wins."
+                    ],
+                    batch_size: [
+                      type: :pos_integer,
+                      default: 5_000,
+                      doc: "maximum points per flush"
+                    ],
+                    flush_interval_ms: [
+                      type: :pos_integer,
+                      default: 1_000,
+                      doc: "timer interval in milliseconds"
+                    ],
+                    jitter_ms: [
+                      type: :non_neg_integer,
+                      default: 0,
+                      doc: "random jitter added to the flush timer and retry backoff"
+                    ],
+                    max_retries: [
+                      type: :non_neg_integer,
+                      default: 3,
+                      doc: "retry attempts for 5xx and transport errors. 4xx is never retried."
+                    ],
+                    base_retry_delay_ms: [
+                      type: :non_neg_integer,
+                      default: 100,
+                      doc: "base of the exponential backoff: attempt N waits about `base * 2^N`"
+                    ],
+                    no_sync: [
+                      type: :boolean,
+                      default: false,
+                      doc:
+                        "when `true`, `write_sync/3` behaves like `write/3`. Not InfluxDB 3's " <>
+                          "`no_sync` write parameter: pass that, like `accept_partial: false`, " <>
+                          "in `:write_opts`."
+                    ],
+                    write_opts: [
+                      type: :keyword_list,
+                      default: [],
+                      doc:
+                        "options for `InfluxElixir.Write.Writer.write/3` on every flush " <>
+                          "(`:database`, `:timeout`, `:precision`, ...). A `Point`'s " <>
+                          "`DateTime` timestamp is encoded in its `:precision`; an integer " <>
+                          "timestamp must already be in that unit."
+                    ],
+                    client: [
+                      type: :atom,
+                      doc:
+                        "client module to write with instead of the configured one " <>
+                          "(`InfluxElixir.Client.impl/0`)"
+                    ],
+                    name: [type: :any, doc: "a `GenServer` name to register the writer under"],
+                    shutdown: [
+                      type: {:or, [:non_neg_integer, {:in, [:infinity, :brutal_kill]}]},
+                      default: @default_shutdown,
+                      doc:
+                        "how long a supervisor waits for the final flush when it stops the " <>
+                          "writer (OTP's default for workers); see \"Shutdown\""
+                    ]
+                  )
+
   @moduledoc """
   GenServer-based batch writer with configurable flush intervals,
   batch sizes, retry with exponential backoff, and backpressure.
@@ -9,29 +81,12 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   ## Options
 
-    * `:connection` - connection term passed to `InfluxElixir.Write.Writer`
-    * `:database` - database every flush writes to (binary). A `:database`
-      inside `:write_opts` takes precedence.
-    * `:batch_size` - maximum points per flush (default: `5000`)
-    * `:flush_interval_ms` - timer interval in milliseconds (default: `1000`)
-    * `:jitter_ms` - random jitter added to flush timer (default: `0`)
-    * `:max_retries` - max retry attempts for 5xx and transport errors
-      (default: `3`). 4xx responses are never retried.
-    * `:base_retry_delay_ms` - base for exponential retry backoff. Delay
-      for attempt N is roughly `base * 2^N`. Default: `100`.
-    * `:no_sync` - when `true`, `write_sync/3` behaves like `write/3` (default: `false`).
-      Not InfluxDB 3's `no_sync` write parameter: pass that, like
-      `accept_partial: false`, in `:write_opts`.
-    * `:write_opts` - keyword list forwarded to `InfluxElixir.Write.Writer.write/3`
-      on every flush. Useful for setting `:database`, `:timeout`, `:precision`
-      per BatchWriter without baking them into the connection. Default: `[]`.
-      A `Point`'s `DateTime` timestamp is encoded in its `:precision`; an
-      integer timestamp must already be in that unit.
-    * `:client` - client module to write with instead of the configured one
-      (`InfluxElixir.Client.impl/0`).
-    * `:shutdown` - how long, in milliseconds, a supervisor waits for the
-      final flush when it stops the writer (default: `5_000`, OTP's
-      default for workers); see "Shutdown"
+  Validated by `start_link/1`, which returns
+  `{:error, %NimbleOptions.ValidationError{}}` for an unknown key or a
+  value of the wrong type — a `batch_size: 0` used to refuse every write
+  as `:buffer_full`, and a misspelt key was silently ignored.
+
+  #{NimbleOptions.docs(@options_schema)}
 
   ## Backpressure
 
@@ -73,12 +128,7 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   alias InfluxElixir.Write.Writer
 
-  @default_batch_size 5_000
-  @default_flush_interval_ms 1_000
-  @default_jitter_ms 0
-  @default_max_retries 3
   @backpressure_multiplier 10
-  @default_base_retry_delay_ms 100
 
   # GenServer.call wait-bound defaults. Generous enough to cover one HTTP
   # write at the default `Client.HTTP.@default_timeout` (30s). `write_sync`
@@ -96,15 +146,16 @@ defmodule InfluxElixir.Write.BatchWriter do
     :database,
     :timer_ref,
     :pending_sync,
+    # Set from the validated options by init/1.
+    :batch_size,
+    :flush_interval_ms,
+    :jitter_ms,
+    :max_retries,
+    :base_retry_delay_ms,
+    :no_sync,
+    :write_opts,
     buffer: [],
     buffer_size: 0,
-    batch_size: @default_batch_size,
-    flush_interval_ms: @default_flush_interval_ms,
-    jitter_ms: @default_jitter_ms,
-    max_retries: @default_max_retries,
-    base_retry_delay_ms: @default_base_retry_delay_ms,
-    no_sync: false,
-    write_opts: [],
     stats: %{total_writes: 0, total_errors: 0, total_bytes: 0},
     chains: %{}
   ]
@@ -147,9 +198,12 @@ defmodule InfluxElixir.Write.BatchWriter do
       iex> is_pid(pid)
       true
   """
-  @spec start_link(keyword()) :: GenServer.on_start()
+  @spec start_link(keyword()) ::
+          GenServer.on_start() | {:error, NimbleOptions.ValidationError.t()}
   def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name))
+    with {:ok, opts} <- NimbleOptions.validate(opts, @options_schema) do
+      GenServer.start_link(__MODULE__, opts, name: opts[:name])
+    end
   end
 
   @doc """
@@ -161,7 +215,7 @@ defmodule InfluxElixir.Write.BatchWriter do
     %{
       id: __MODULE__,
       start: {__MODULE__, :start_link, [opts]},
-      shutdown: Keyword.get(opts, :shutdown, 5_000)
+      shutdown: Keyword.get(opts, :shutdown, @default_shutdown)
     }
   end
 
@@ -279,15 +333,16 @@ defmodule InfluxElixir.Write.BatchWriter do
     # terminate/2 never flushes the buffer.
     Process.flag(:trap_exit, true)
 
+    # `opts` were validated, defaults filled in, by `start_link/1`.
     state = %__MODULE__{
-      connection: Keyword.get(opts, :connection),
-      database: Keyword.get(opts, :database),
-      batch_size: Keyword.get(opts, :batch_size, @default_batch_size),
-      flush_interval_ms: Keyword.get(opts, :flush_interval_ms, @default_flush_interval_ms),
-      jitter_ms: Keyword.get(opts, :jitter_ms, @default_jitter_ms),
-      max_retries: Keyword.get(opts, :max_retries, @default_max_retries),
-      base_retry_delay_ms: Keyword.get(opts, :base_retry_delay_ms, @default_base_retry_delay_ms),
-      no_sync: Keyword.get(opts, :no_sync, false),
+      connection: opts[:connection],
+      database: opts[:database],
+      batch_size: opts[:batch_size],
+      flush_interval_ms: opts[:flush_interval_ms],
+      jitter_ms: opts[:jitter_ms],
+      max_retries: opts[:max_retries],
+      base_retry_delay_ms: opts[:base_retry_delay_ms],
+      no_sync: opts[:no_sync],
       write_opts: resolve_write_opts(opts)
     }
 

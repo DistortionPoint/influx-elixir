@@ -272,6 +272,29 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
+  describe "start_link/1 option validation" do
+    # Each of these used to start: `batch_size: 0` then refused every write
+    # as :buffer_full, a misspelt key was ignored for its default, and a
+    # string batch size crashed the writer on its first write.
+    test "a misconfiguration is refused before the writer starts", %{conn: conn} do
+      for {bad, key} <- [
+            {[batch_size: 0], :batch_size},
+            {[batch_size: "10"], :batch_size},
+            {[flush_interval_ms: 0], :flush_interval_ms},
+            {[max_retries: -1], :max_retries},
+            {[shutdown: :later], :shutdown},
+            {[flush_interval: 50], [:flush_interval]}
+          ] do
+        assert {:error, %NimbleOptions.ValidationError{key: ^key}} =
+                 BatchWriter.start_link([connection: conn, database: "test_db"] ++ bad),
+               inspect(bad)
+      end
+
+      assert {:error, %NimbleOptions.ValidationError{key: :connection}} =
+               BatchWriter.start_link(database: "test_db")
+    end
+  end
+
   describe "precision" do
     test "a Point's DateTime is written in the flushes' :precision", %{conn: conn} do
       # It was always nanoseconds: with `precision: :second` the server

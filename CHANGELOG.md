@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`BatchWriter` options were not validated.** Each of these was
+  reproduced:
+  - `batch_size: 0` started a writer that refused every write as
+    `{:error, :buffer_full}`.
+  - A misspelt key such as `flush_interval:` was silently ignored and its
+    default used.
+  - `batch_size: "10"` started, then crashed the writer on its first
+    write.
+
+  `start_link/1` now validates with NimbleOptions and returns
+  `{:error, %NimbleOptions.ValidationError{}}` naming the option. Through
+  a connection's `batch_writer:` config, that fails
+  `add_connection/2` (or application start). The moduledoc's option list
+  is generated from the same schema, so it cannot drift from what is
+  accepted.
+- **A connection that failed to start stayed registered.**
+  `ConnectionSupervisor` registers the connection and initialises the
+  client before starting its children. When a child failed,
+  `add_connection/2` returned the error but the name still resolved to a
+  connection that was not running, and `Client.Local`'s store stayed
+  allocated. Both are now released, so a corrected retry under the same
+  name starts. A name that is already running keeps its registration.
+
 ## [0.1.33] - 2026-09-28
 
 ### Added

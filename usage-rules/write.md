@@ -3,6 +3,7 @@
 ## Batch Writer
 - Batch writers are managed by the library's supervision tree — add `batch_writer: [...]` to the connection config, do not start `InfluxElixir.Write.BatchWriter` directly
 - Configure `batch_size` (default 5,000) and `flush_interval_ms` (default 1,000) per connection; `database:` on the writer is the flush target
+- `batch_writer:` options are validated when the writer starts (positive `batch_size` and `flush_interval_ms`, known keys only): a bad one fails `add_connection/2` (or application start) with a `NimbleOptions.ValidationError` naming the option, and leaves nothing registered
 - 4xx responses are discarded and counted as errors; 5xx and transport errors are retried with exponential backoff up to `max_retries` (default 3)
 - Use `InfluxElixir.flush/1` to force an immediate flush
 - Stopping the writer (application shutdown, `InfluxElixir.remove_connection/1`) writes the buffer and any batch still being retried, once each, within the writer's `shutdown:` (default 5,000 ms); a failure there is logged and the data dropped
