@@ -92,6 +92,7 @@ defmodule InfluxElixir.ClientContract do
     database_rule_tests = if v3_sql, do: database_rule_tests(client), else: nil
     distinct_on_tests = if v3_sql, do: distinct_on_tests(client), else: nil
     identifier_tests = if v3_sql, do: identifier_tests(client), else: nil
+    tab_tests = if v3_sql, do: tab_tests(client), else: nil
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
     v2_write_rule_tests = if v2_ops, do: v2_write_rule_tests(client), else: nil
@@ -139,6 +140,7 @@ defmodule InfluxElixir.ClientContract do
         database_rule_tests,
         distinct_on_tests,
         identifier_tests,
+        tab_tests,
         bucket_tests,
         v2_write_rule_tests,
         v2_precision_tests,
@@ -3025,6 +3027,60 @@ defmodule InfluxElixir.ClientContract do
 
           assert {:ok, [_row]} =
                    ident(unquote(client), ctx, ~s|SELECT * FROM __M__ WHERE k = "k"|)
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Tabs in line protocol (v3_core, v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  defp tab_tests(client) do
+    quote do
+      describe "write/3 — tabs in line protocol contract" do
+        test "a tab outside a quoted string refuses the line, with the engine's message", ctx do
+          m = "contract_tab_#{System.unique_integer([:positive])}"
+          space = "Expected at least one space character, got "
+          trailing = "Could not parse entire line. Found trailing content: "
+
+          for {lp, message} <- [
+                {"#{m},h=a\tb v=1i 1", space <> "`\tb v=1i 1`"},
+                {"#{m}\tx v=1i 1", space <> "`\tx v=1i 1`"},
+                {"#{m},h\tk=a v=1i 1",
+                 "Tag set malformed: could not find equals sign in `h\tk=a v=1i...`"},
+                {"#{m},h=\ta v=1i 1", "Expected tag value, got `\ta v=1i 1`"},
+                {"#{m} v\tx=1i 1", "No fields were provided"},
+                {"#{m} v=1i,w\tx=2i 1", trailing <> "`w\tx=2i 1`"},
+                {"#{m} v=1i,w=2i,x\ty=3i 1", trailing <> "`,x\ty=3i 1`"},
+                {"#{m} v=1i\t1", trailing <> "`\t1`"}
+              ] do
+            assert {:error, %{status: 400, body: body}} =
+                     unquote(client).write(ctx.conn, lp, database: ctx.database),
+                   inspect(lp)
+
+            assert %{"data" => [%{"error_message" => ^message}]} = Jason.decode!(body),
+                   inspect(lp)
+          end
+        end
+
+        test "a leading tab is whitespace; an escaped tab and one in a string are kept", ctx do
+          m = "contract_tab_ok_#{System.unique_integer([:positive])}"
+
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "\t#{m},h=a\\\tb s=\"x\ty\" 1",
+                     database: ctx.database,
+                     precision: :second
+                   )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:ok, [%{"h" => "a\\\tb", "s" => "x\ty"}]} =
+                   unquote(client).query_sql(ctx.conn, ~s|SELECT h, s FROM "#{m}"|,
+                     database: ctx.database
+                   )
         end
       end
     end

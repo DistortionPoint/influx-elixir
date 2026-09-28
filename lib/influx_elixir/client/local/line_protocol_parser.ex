@@ -119,10 +119,22 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   # Format: measurement[,tag=val...] field=val[,...] [timestamp]
   @spec parse_line(binary(), pos_integer(), precision(), dialect()) :: line_result()
   defp parse_line(line, number, precision, dialect) do
+    case tab_error(line, dialect) do
+      nil -> parse_line_parts(line, number, precision, dialect)
+      message -> {:error, line_error(message, number, line)}
+    end
+  end
+
+  @spec parse_line_parts(binary(), pos_integer(), precision(), dialect()) :: line_result()
+  defp parse_line_parts(line, number, precision, dialect) do
     # Runs of spaces between sections are one separator on the engine
-    # (verified), so empty sections are dropped.
+    # (verified), so empty sections are dropped; so is leading whitespace,
+    # a tab included.
     result =
-      case line |> split_line_parts() |> Enum.reject(&(&1 == "")) do
+      case line
+           |> leading_whitespace_trimmed(dialect)
+           |> split_line_parts()
+           |> Enum.reject(&(&1 == "")) do
         [key_part, fields_part | rest] ->
           ts_raw = List.first(rest)
 
@@ -142,6 +154,132 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
       {:error, message} -> {:error, line_error(message, number, line)}
     end
   end
+
+  @spec leading_whitespace_trimmed(binary(), dialect()) :: binary()
+  defp leading_whitespace_trimmed(line, :v3), do: String.replace(line, ~r/^[ \t]+/, "")
+  defp leading_whitespace_trimmed(line, :v2), do: line
+
+  # ---------------------------------------------------------------------------
+  # Tabs (InfluxDB 3)
+  #
+  # InfluxDB 3's parser ends a token at an unescaped tab as it does at a
+  # space, but only a space separates sections, so a tab outside a quoted
+  # string is refused with a message that depends on where it stands
+  # (verified; InfluxDB 2 stores the tab instead). A leading tab is
+  # whitespace, and `\<tab>` is part of the name. The scan answers only for
+  # a tab: a line with no tab, or one malformed before its first tab, is
+  # left to the parser.
+  # ---------------------------------------------------------------------------
+
+  @spec tab_error(binary(), dialect()) :: binary() | nil
+  defp tab_error(_line, :v2), do: nil
+
+  defp tab_error(line, :v3) do
+    if plain?(line, "\t"),
+      do: nil,
+      else: line |> leading_whitespace_trimmed(:v3) |> scan_tabs(:measurement, %{})
+  end
+
+  @spec scan_tabs(binary(), atom(), map()) :: binary() | nil
+  defp scan_tabs(<<>>, _state, _ctx), do: nil
+  defp scan_tabs(<<?\\, _c, rest::binary>>, state, ctx), do: scan_tabs(rest, advance(state), ctx)
+
+  defp scan_tabs(<<?\t, _rest::binary>> = at, state, ctx), do: tab_message(state, at, ctx)
+
+  defp scan_tabs(<<?", rest::binary>>, :value_start, ctx), do: skip_string(rest, ctx)
+
+  defp scan_tabs(<<c, rest::binary>> = at, state, ctx),
+    do: transition(region(state), state, c, rest, at, ctx)
+
+  # The region a state belongs to: a `*_start` state is its token's region.
+  @spec region(atom()) :: atom()
+  defp region(state) when state in [:tag_key_start, :tag_key], do: :tag_key
+  defp region(state) when state in [:tag_value_start, :tag_value], do: :tag_value
+  defp region(state) when state in [:key_start, :key], do: :key
+  defp region(state) when state in [:value_start, :value], do: :value
+  defp region(state), do: state
+
+  # One character in one region: a separator moves to the next token, a
+  # separator where the parser expects none leaves the line to it (`nil`).
+  @spec transition(atom(), atom(), byte(), binary(), binary(), map()) :: binary() | nil
+  defp transition(:measurement, _state, ?,, rest, _at, ctx),
+    do: scan_tabs(rest, :tag_key_start, Map.put(ctx, :tag_set, rest))
+
+  defp transition(:measurement, _state, ?\s, rest, _at, ctx),
+    do: scan_tabs(rest, :key_start, Map.put(ctx, :field, :first))
+
+  defp transition(:tag_key, _state, ?=, rest, _at, ctx),
+    do: scan_tabs(rest, :tag_value_start, ctx)
+
+  defp transition(:tag_key, _state, c, _rest, _at, _ctx) when c in [?,, ?\s], do: nil
+
+  defp transition(:tag_value, _state, ?,, rest, _at, ctx),
+    do: scan_tabs(rest, :tag_key_start, ctx)
+
+  defp transition(:tag_value, _state, ?\s, rest, _at, ctx),
+    do: scan_tabs(String.trim_leading(rest, " "), :key_start, Map.put(ctx, :field, :first))
+
+  defp transition(:key, _state, ?=, rest, _at, ctx), do: scan_tabs(rest, :value_start, ctx)
+  defp transition(:key, _state, c, _rest, _at, _ctx) when c in [?,, ?\s], do: nil
+
+  defp transition(:value, _state, ?,, rest, at, ctx),
+    do: scan_tabs(rest, :key_start, %{ctx | field: {:later, next_field(ctx.field), at}})
+
+  defp transition(:value, _state, ?\s, rest, _at, ctx), do: scan_tabs(rest, :timestamp, ctx)
+  defp transition(_region, state, _c, rest, _at, ctx), do: scan_tabs(rest, advance(state), ctx)
+
+  # A character read in a `*_start` state means the token has begun.
+  @spec advance(atom()) :: atom()
+  defp advance(:tag_key_start), do: :tag_key
+  defp advance(:tag_value_start), do: :tag_value
+  defp advance(:key_start), do: :key
+  defp advance(:value_start), do: :value
+  defp advance(state), do: state
+
+  # A quoted string value, tabs and all, up to its closing quote.
+  @spec skip_string(binary(), map()) :: binary() | nil
+  defp skip_string(<<>>, _ctx), do: nil
+  defp skip_string(<<?\\, _c, rest::binary>>, ctx), do: skip_string(rest, ctx)
+  defp skip_string(<<?", rest::binary>>, ctx), do: scan_tabs(rest, :value, ctx)
+  defp skip_string(<<_c, rest::binary>>, ctx), do: skip_string(rest, ctx)
+
+  @spec tab_message(atom(), binary(), map()) :: binary()
+  defp tab_message(state, at, _ctx) when state in [:measurement, :tag_value],
+    do: "Expected at least one space character, got `#{at}`"
+
+  defp tab_message(:tag_key_start, at, _ctx), do: "Expected tag key, got `#{at}`"
+  defp tab_message(:tag_value_start, at, _ctx), do: "Expected tag value, got `#{at}`"
+
+  defp tab_message(:tag_key, _at, %{tag_set: tag_set}) do
+    excerpt =
+      if String.length(tag_set) > 10, do: String.slice(tag_set, 0, 10) <> "...", else: tag_set
+
+    "Tag set malformed: could not find equals sign in `#{excerpt}`"
+  end
+
+  defp tab_message(state, _at, %{field: :first}) when state in [:key_start, :key, :value_start],
+    do: "No fields were provided"
+
+  # A later field with a tab in its key, or at the start of its value, ends
+  # the field list before it: after its comma when it is the second field,
+  # at its comma from the third on (verified).
+  defp tab_message(state, _at, %{field: {:later, 2, <<?,, field::binary>>}})
+       when state in [:key_start, :key, :value_start],
+       do: trailing(field)
+
+  defp tab_message(state, _at, %{field: {:later, _n, comma}})
+       when state in [:key_start, :key, :value_start],
+       do: trailing(comma)
+
+  defp tab_message(_value_or_timestamp, at, _ctx), do: trailing(at)
+
+  # The number of the field that starts after the next comma.
+  @spec next_field(:first | {:later, pos_integer(), binary()}) :: pos_integer()
+  defp next_field(:first), do: 2
+  defp next_field({:later, n, _comma}), do: n + 1
+
+  @spec trailing(binary()) :: binary()
+  defp trailing(content), do: "Could not parse entire line. Found trailing content: `#{content}`"
 
   @doc """
   Builds a `t:line_error/0` the way InfluxDB 3 reports one. The full line

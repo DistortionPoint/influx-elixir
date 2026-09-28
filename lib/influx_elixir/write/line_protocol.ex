@@ -37,17 +37,26 @@ defmodule InfluxElixir.Write.LineProtocol do
   |---|---|
   | No fields | `:empty_fields` |
   | Empty measurement | `:empty_measurement` |
-  | Measurement not a string, or containing a newline | `{:invalid_measurement, value}` |
+  | Measurement not a string, containing a newline, or starting with `#` | `{:invalid_measurement, value}` |
   | Tag key empty, not a string, or containing a newline | `{:invalid_tag_key, key}` |
   | Tag value empty, not a string, or containing a newline | `{:invalid_tag_value, key, value}` |
   | Tag key `time` (reserved on every version) | `{:reserved_tag_key, "time"}` |
   | Field key empty, not a string, or containing a newline | `{:invalid_field_key, key}` |
-  | Field value not an integer, float, string or boolean | `{:invalid_field_value, key, value}` |
+  | Field value not an integer, float, string or boolean, or an integer outside 64 bits | `{:invalid_field_value, key, value}` |
   | Timestamp not a `DateTime`, integer or `nil` | `{:invalid_timestamp, value}` |
 
+  A measurement, tag key, tag value or field key that ends in a backslash
+  is refused with the same error as the other problems with that name:
+  both versions reject the line even though the backslash is escaped. A
+  measurement starting with `#` is a comment line to both, which drop it
+  silently inside a batch, and escaping it (`\#`) stores the backslash. An
+  integer field must fit in a signed 64-bit integer; there is no unsigned
+  field type on a `Point`.
+
   A field named `time` is left to the server: InfluxDB 3 rejects it and
-  InfluxDB 2 drops it silently. A newline inside a *string field value* is
-  fine — it is quoted, and both versions store it.
+  InfluxDB 2 drops it silently. So is a tab in a name: InfluxDB 3 refuses
+  the line and InfluxDB 2 stores the tab. A newline inside a *string field
+  value* is fine — it is quoted, and both versions store it.
   """
 
   alias InfluxElixir.Write.Point
@@ -145,10 +154,11 @@ defmodule InfluxElixir.Write.LineProtocol do
   defp validate_fields(_fields), do: :ok
 
   # A name that can stand outside quotes: a non-empty string with no
-  # newline (there is no escape for one, so it would end the line).
+  # newline (there is no escape for one, so it would end the line) that
+  # does not end in a backslash (both versions refuse it, escaped or not).
   @spec name?(term()) :: boolean()
   defp name?(value) when is_binary(value) and value != "",
-    do: not String.contains?(value, "\n")
+    do: not String.contains?(value, "\n") and not String.ends_with?(value, "\\")
 
   defp name?(_value), do: false
 
@@ -156,7 +166,7 @@ defmodule InfluxElixir.Write.LineProtocol do
   defp encode_measurement(""), do: {:error, :empty_measurement}
 
   defp encode_measurement(name) do
-    if name?(name) do
+    if name?(name) and not String.starts_with?(name, "#") do
       escaped =
         name
         |> String.replace("\\", "\\\\")
@@ -223,9 +233,12 @@ defmodule InfluxElixir.Write.LineProtocol do
     end
   end
 
+  @int64_min -9_223_372_036_854_775_808
+  @int64_max 9_223_372_036_854_775_807
+
   @spec field_value?(term()) :: boolean()
-  defp field_value?(value),
-    do: is_integer(value) or is_float(value) or is_binary(value) or is_boolean(value)
+  defp field_value?(value) when is_integer(value), do: value in @int64_min..@int64_max
+  defp field_value?(value), do: is_float(value) or is_binary(value) or is_boolean(value)
 
   @spec encode_timestamp(DateTime.t() | integer() | nil) ::
           {:ok, binary()} | {:error, term()}

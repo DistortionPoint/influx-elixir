@@ -895,7 +895,10 @@ a key cannot be both a tag and a field on
 one line, an integer must fit in 64 bits (`7u` is unsigned), a newline inside
 a quoted string value is part of the value, a name ending in a backslash is
 rejected ("Measurements, tag keys and values, and field keys may not end with
-a backslash"), and an empty payload is rejected.
+a backslash"), a tab outside a quoted string value is rejected with the
+engine's message for where it stands (InfluxDB 3 only; a leading tab is
+whitespace), a line starting with `#` is a comment, and an empty payload is
+rejected.
 Points with the same measurement, tag set and timestamp are one point on both
 versions (verified): their fields merge and the later write wins per field,
 so a fixture that rewrites `v=2i` at an existing instant reads back one row.

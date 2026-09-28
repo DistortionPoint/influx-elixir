@@ -254,6 +254,43 @@ defmodule InfluxElixir.Write.LineProtocolTest do
       end
     end
 
+    test "an integer outside 64 bits; the int64 bounds themselves encode" do
+      for value <- [9_223_372_036_854_775_808, -9_223_372_036_854_775_809] do
+        assert {:error, {:invalid_field_value, "v", ^value}} =
+                 LineProtocol.encode(Point.new("cpu", %{"v" => value}))
+      end
+
+      assert {:ok, "cpu v=-9223372036854775808i"} =
+               LineProtocol.encode(Point.new("cpu", %{"v" => -9_223_372_036_854_775_808}))
+    end
+
+    test "a measurement starting with # is a comment line to the server" do
+      assert {:error, {:invalid_measurement, "#cpu"}} =
+               LineProtocol.encode(Point.new("#cpu", %{"v" => 1}))
+
+      # Anywhere else, and in a tag value, # is an ordinary character.
+      assert {:ok, "c#pu,h=#a v=1i"} =
+               LineProtocol.encode(Point.new("c#pu", %{"v" => 1}, tags: %{"h" => "#a"}))
+    end
+
+    test "a name ending in a backslash, which both versions refuse even escaped" do
+      assert {:error, {:invalid_measurement, "cpu\\"}} =
+               LineProtocol.encode(Point.new("cpu\\", %{"v" => 1}))
+
+      assert {:error, {:invalid_tag_key, "h\\"}} =
+               LineProtocol.encode(Point.new("cpu", %{"v" => 1}, tags: %{"h\\" => "a"}))
+
+      assert {:error, {:invalid_tag_value, "h", "a\\\\"}} =
+               LineProtocol.encode(Point.new("cpu", %{"v" => 1}, tags: %{"h" => "a\\\\"}))
+
+      assert {:error, {:invalid_field_key, "v\\"}} =
+               LineProtocol.encode(Point.new("cpu", %{"v\\" => 1}))
+
+      # Inside a name, or at the end of a string value, it is escaped and fine.
+      assert {:ok, ~S|cpu,h=a\\b s="x\\"|} =
+               LineProtocol.encode(Point.new("cpu", %{"s" => "x\\"}, tags: %{"h" => "a\\b"}))
+    end
+
     test "a newline inside a string field value is quoted and accepted" do
       assert {:ok, ~s|cpu s="a\nb"|} = LineProtocol.encode(Point.new("cpu", %{"s" => "a\nb"}))
     end

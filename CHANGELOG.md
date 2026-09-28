@@ -77,6 +77,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1,583 → 1,430 lines) holds no `:ets` call. Behaviour is unchanged.
 
 ### Fixed
+- **`LineProtocol.encode/1` produced lines no server accepts, or one both
+  drop silently.** Each case was verified on InfluxDB 3 Core and 2.7:
+  - **An integer outside 64 bits.** Both reject the line.
+  - **A name ending in a backslash.** Both reject it, even though the
+    encoder escaped the backslash.
+  - **A measurement starting with `#`.** It is a comment line to both, so
+    inside a batch it vanished while the other lines were stored.
+    Escaping it as `\#` stores the backslash.
+
+  These are now refused with the existing `{:invalid_field_value, ...}`,
+  `{:invalid_measurement, ...}`, `{:invalid_tag_key, ...}`,
+  `{:invalid_tag_value, ...}` and `{:invalid_field_key, ...}` errors.
+  `BatchWriter.write/3` returns the error to the caller.
+- **`Client.Local` accepted tabs in line protocol that InfluxDB 3
+  refuses.** InfluxDB 3 ends a name or value at an unescaped tab, but it
+  separates sections only with spaces. So a tab in a measurement, tag,
+  field key or after a value refuses the line, with a message that depends
+  on where the tab stands. The double now gives each of those answers, as
+  verified on InfluxDB 3 Core. A leading tab is whitespace, as on the
+  engine; the double had kept it as part of the measurement name. A tab
+  inside a quoted string is fine. InfluxDB 2 stores tabs, and so does the
+  `:v2` profile.
 - **`query_sql_stream/3` could starve its connection pool.** A stream
   runs its request in a producer process that holds a pool connection.
   There were two ways to lose it:
