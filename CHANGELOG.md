@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Contract tests assert exact results.** Fifteen contract tests
+  checked only `rows != []` before inspecting `hd(rows)`, or summed values
+  across buckets. One tag-escaping test accepted either of two answers.
+  They now assert the exact rows the engine returns, verified on
+  InfluxDB 3 Core and 2.7:
+  - the four 2-minute `AVG` buckets (10.0, 25.0, 45.0, 60.0);
+  - the single hourly `SUM`, `COUNT` and `MIN`/`MAX` row;
+  - `"us,east"` for an escaped comma in a tag;
+  - all five streamed values.
+
+  Their fixtures now check their own writes, so a failed write can't
+  surface later as a wrong answer. The telemetry error test pins the
+  query error it expects.
+
 ## [0.1.35] - 2026-09-29
 
 ### Fixed

@@ -217,7 +217,7 @@ defmodule InfluxElixirTest do
     end
 
     test "a client error is a :stop with result: :error, not an exception", %{conn: conn} do
-      assert {:error, _reason} =
+      assert {:error, %{status: 400, body: "Error during planning: table " <> _rest}} =
                InfluxElixir.query_sql(conn, "SELECT * FROM nope", database: "test_db")
 
       assert_receive {:telemetry, [:influx_elixir, :query, :stop], _measurements,

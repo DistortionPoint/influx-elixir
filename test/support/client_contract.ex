@@ -582,9 +582,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          assert is_integer(hd(rows)["count"])
-          assert hd(rows)["count"] == ts
+          assert [%{"count" => ^ts}] = rows
         end
 
         test "float field survives write/query cycle", ctx do
@@ -602,8 +600,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          assert_in_delta hd(rows)["ratio"], 3.14, 1.0e-10
+          assert [%{"ratio" => 3.14}] = rows
         end
 
         test "string field survives write/query cycle", ctx do
@@ -621,8 +618,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          assert hd(rows)["label"] == "hello world"
+          assert [%{"label" => "hello world"}] = rows
         end
 
         test "boolean field survives write/query cycle", ctx do
@@ -640,8 +636,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          assert hd(rows)["active"] == true
+          assert [%{"active" => true}] = rows
         end
       end
     end
@@ -656,11 +651,12 @@ defmodule InfluxElixir.ClientContract do
       describe "query_sql_stream/3 — contract" do
         test "returns enumerable rows", ctx do
           Enum.each(1..5, fn i ->
-            unquote(client).write(
-              ctx.conn,
-              "contract_stream value=#{i}i #{i * 1_000_000}",
-              database: ctx.database
-            )
+            {:ok, :written} =
+              unquote(client).write(
+                ctx.conn,
+                "contract_stream value=#{i}i #{i * 1_000_000}",
+                database: ctx.database
+              )
           end)
 
           InfluxElixir.ClientContract.settle(ctx)
@@ -672,8 +668,13 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          rows = Enum.to_list(stream)
-          assert rows != []
+          assert stream |> Enum.to_list() |> Enum.map(& &1["value"]) |> Enum.sort() == [
+                   1,
+                   2,
+                   3,
+                   4,
+                   5
+                 ]
         end
       end
     end
@@ -1019,11 +1020,12 @@ defmodule InfluxElixir.ClientContract do
             ts = base_ts + i * 60_000_000_000
             val = (i + 1) * 10
 
-            unquote(client).write(
-              ctx.conn,
-              "contract_agg value=#{val}i #{ts}",
-              database: ctx.database
-            )
+            {:ok, :written} =
+              unquote(client).write(
+                ctx.conn,
+                "contract_agg value=#{val}i #{ts}",
+                database: ctx.database
+              )
           end)
 
           InfluxElixir.ClientContract.settle(ctx)
@@ -1048,9 +1050,12 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          assert is_number(hd(rows)["avg_val"])
-          assert %DateTime{} = hd(rows)["time"]
+          assert rows == [
+                   %{"time" => ~U[2023-11-14 22:12:00.000000Z], "avg_val" => 10.0},
+                   %{"time" => ~U[2023-11-14 22:14:00.000000Z], "avg_val" => 25.0},
+                   %{"time" => ~U[2023-11-14 22:16:00.000000Z], "avg_val" => 45.0},
+                   %{"time" => ~U[2023-11-14 22:18:00.000000Z], "avg_val" => 60.0}
+                 ]
         end
 
         test "SUM aggregate returns total", ctx do
@@ -1069,10 +1074,8 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          # 10+20+30+40+50+60 = 210
-          totals = Enum.map(rows, & &1["total"])
-          assert Enum.sum(totals) == 210
+          # All six points fall in the 22:00 hour: 10+20+30+40+50+60.
+          assert [%{"total" => 210}] = rows
         end
 
         test "COUNT aggregate returns row count", ctx do
@@ -1091,9 +1094,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          counts = Enum.map(rows, & &1["cnt"])
-          assert Enum.sum(counts) == 6
+          assert [%{"cnt" => 6}] = rows
         end
 
         test "MIN and MAX aggregates", ctx do
@@ -1113,11 +1114,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          all_mins = Enum.map(rows, & &1["min_val"])
-          all_maxs = Enum.map(rows, & &1["max_val"])
-          assert Enum.min(all_mins) == 10
-          assert Enum.max(all_maxs) == 60
+          assert [%{"min_val" => 10, "max_val" => 60}] = rows
         end
       end
     end
@@ -1140,11 +1137,12 @@ defmodule InfluxElixir.ClientContract do
             ts = base_ts + i * 60_000_000_000
             val = (i + 1) * 10
 
-            unquote(client).write(
-              ctx.conn,
-              "contract_agg value=#{val}i #{ts}",
-              database: ctx.database
-            )
+            {:ok, :written} =
+              unquote(client).write(
+                ctx.conn,
+                "contract_agg value=#{val}i #{ts}",
+                database: ctx.database
+              )
           end)
 
           InfluxElixir.ClientContract.settle(ctx)
@@ -3508,11 +3506,12 @@ defmodule InfluxElixir.ClientContract do
           Enum.each([{10, 100}, {20, 200}, {30, 300}], fn {val, ts_offset} ->
             ts = base_ts + ts_offset * 1_000_000_000
 
-            unquote(client).write(
-              ctx.conn,
-              "contract_fl value=#{val}i #{ts}",
-              database: ctx.database
-            )
+            {:ok, :written} =
+              unquote(client).write(
+                ctx.conn,
+                "contract_fl value=#{val}i #{ts}",
+                database: ctx.database
+              )
           end)
 
           InfluxElixir.ClientContract.settle(ctx)
@@ -3536,8 +3535,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          assert hd(rows)["first_val"] == 10
+          assert [%{"first_val" => 10}] = rows
         end
 
         test "last_value(ORDER BY time) returns the latest value", ctx do
@@ -3556,8 +3554,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          assert hd(rows)["last_val"] == 30
+          assert [%{"last_val" => 30}] = rows
         end
 
         test "first_value(ORDER BY time DESC) returns the latest value", ctx do
@@ -3698,8 +3695,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          assert hd(rows)["value"] == 42
+          assert [%{"value" => 42}] = rows
         end
       end
     end
@@ -3727,8 +3723,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          assert hd(rows)["value"] == 1
+          assert [%{"value" => 1}] = rows
         end
 
         test "tag with special characters round-trips", ctx do
@@ -3747,10 +3742,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-
-          assert hd(rows)["region"] == "us\\,east" or
-                   hd(rows)["region"] == "us,east"
+          assert [%{"region" => "us,east"}] = rows
         end
 
         test "string field with escaped quotes round-trips", ctx do
@@ -3768,8 +3760,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert rows != []
-          assert hd(rows)["label"] == ~s(say "hi")
+          assert [%{"label" => ~s(say "hi")}] = rows
         end
       end
     end
