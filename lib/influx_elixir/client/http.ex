@@ -32,7 +32,13 @@ defmodule InfluxElixir.Client.HTTP do
     * Flux: `POST /api/v2/query` (JSON body, `#datatype`-annotated CSV back)
     * Buckets: `GET/POST/DELETE /api/v2/buckets`. `create_bucket/3` resolves
       the org ID from the connection's `:org` name (override with `org_id:`);
-      `delete_bucket/2` accepts a bucket name or a 16-hex bucket ID.
+      `delete_bucket/2` accepts a bucket name or a 16-hex bucket ID. A name
+      is looked up, and `list_buckets/1` lists, within the connection's
+      `:org` (every org the token can read when it is `""`); the listing
+      reads every page, not just the server's first 20 buckets.
+
+  Names are percent-encoded in the URL, so a bucket, org or database name
+  may hold `&`, `+`, `#`, `=` or spaces.
 
   ## Request Timeout
 
@@ -148,12 +154,12 @@ defmodule InfluxElixir.Client.HTTP do
         org = conn_val(connection, :org, "")
 
         base_url(connection) <>
-          "/api/v2/write?org=#{URI.encode(org)}&bucket=#{URI.encode(database)}" <>
-          "&precision=#{v2_precision(precision)}"
+          "/api/v2/write?org=#{query_value(org)}&bucket=#{query_value(database)}" <>
+          "&precision=#{query_value(v2_precision(precision))}"
 
       :v3 ->
         base_url(connection) <>
-          "/api/v3/write_lp?db=#{URI.encode(database)}&precision=#{precision}"
+          "/api/v3/write_lp?db=#{query_value(database)}&precision=#{query_value(precision)}"
     end
   end
 
@@ -164,7 +170,7 @@ defmodule InfluxElixir.Client.HTTP do
   defp write_flags(connection, opts) do
     if api_version(connection) == :v3 do
       for key <- [:accept_partial, :no_sync], Keyword.has_key?(opts, key), into: "" do
-        "&#{key}=#{Keyword.fetch!(opts, key)}"
+        "&#{key}=#{query_value(Keyword.fetch!(opts, key))}"
       end
     else
       ""
@@ -379,7 +385,7 @@ defmodule InfluxElixir.Client.HTTP do
         "dialect" => %{"annotations" => ["datatype"], "header" => true, "delimiter" => ","}
       })
 
-    url = base_url(connection) <> "/api/v2/query?org=#{URI.encode(org)}"
+    url = base_url(connection) <> "/api/v2/query?org=#{query_value(org)}"
     headers = json_headers(connection)
 
     with {:ok, %Finch.Response{body: resp_body}} <-
@@ -439,7 +445,7 @@ defmodule InfluxElixir.Client.HTTP do
   def delete_database(connection, name) do
     url =
       base_url(connection) <>
-        "/api/v3/configure/database?db=#{URI.encode(name)}"
+        "/api/v3/configure/database?db=#{query_value(name)}"
 
     headers = auth_headers(connection)
 
@@ -500,7 +506,7 @@ defmodule InfluxElixir.Client.HTTP do
 
   @spec lookup_org_id(keyword(), binary()) :: {:ok, binary()} | {:error, term()}
   defp lookup_org_id(connection, org) do
-    url = base_url(connection) <> "/api/v2/orgs?org=#{URI.encode(org)}"
+    url = base_url(connection) <> "/api/v2/orgs?org=#{query_value(org)}"
 
     with {:ok, %Finch.Response{body: body}} <-
            request(:get, url, auth_headers(connection), nil, connection, [], [200]),
@@ -515,17 +521,40 @@ defmodule InfluxElixir.Client.HTTP do
   @impl true
   @spec list_buckets(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
-  def list_buckets(connection) do
-    url = base_url(connection) <> "/api/v2/buckets"
-    headers = auth_headers(connection)
+  def list_buckets(connection), do: list_bucket_pages(connection, 0, [])
+
+  # InfluxDB 2 answers at most 100 buckets a page (20 by default); only the
+  # first page used to be returned, so an org with more than 20 buckets
+  # silently lost the rest (verified). Pages are read until one is short.
+  @bucket_page 100
+
+  @spec list_bucket_pages(keyword(), non_neg_integer(), [[map()]]) ::
+          {:ok, [map()]} | {:error, term()}
+  defp list_bucket_pages(connection, offset, pages) do
+    url =
+      base_url(connection) <>
+        "/api/v2/buckets?limit=#{@bucket_page}&offset=#{offset}" <> org_param(connection)
 
     with {:ok, %Finch.Response{body: resp_body}} <-
-           request(:get, url, headers, nil, connection, [], [200]),
-         {:ok, decoded} <- Jason.decode(resp_body) do
-      case decoded do
-        %{"buckets" => buckets} -> {:ok, buckets}
-        other -> {:ok, List.wrap(other)}
-      end
+           request(:get, url, auth_headers(connection), nil, connection, [], [200]),
+         {:ok, %{"buckets" => page}} <- Jason.decode(resp_body) do
+      if length(page) == @bucket_page,
+        do: list_bucket_pages(connection, offset + @bucket_page, [page | pages]),
+        else: {:ok, [page | pages] |> Enum.reverse() |> Enum.concat()}
+    else
+      {:ok, other} -> {:error, {:unexpected_response, other}}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  # Buckets are named per org: without the connection's org a name (or a
+  # listing) spans every org the token can read, and `delete_bucket/2`
+  # deleted another org's bucket of the same name (verified).
+  @spec org_param(keyword()) :: binary()
+  defp org_param(connection) do
+    case conn_val(connection, :org, "") do
+      "" -> ""
+      org -> "&org=" <> query_value(org)
     end
   end
 
@@ -534,7 +563,7 @@ defmodule InfluxElixir.Client.HTTP do
           :ok | {:error, term()}
   def delete_bucket(connection, bucket) do
     with {:ok, bucket_id} <- resolve_bucket_id(connection, bucket) do
-      url = base_url(connection) <> "/api/v2/buckets/#{URI.encode(bucket_id)}"
+      url = base_url(connection) <> "/api/v2/buckets/#{path_segment(bucket_id)}"
       headers = auth_headers(connection)
 
       with {:ok, _response} <-
@@ -561,16 +590,31 @@ defmodule InfluxElixir.Client.HTTP do
 
   @spec lookup_bucket_id(keyword(), binary()) :: {:ok, binary()} | {:error, term()}
   defp lookup_bucket_id(connection, name) do
-    url = base_url(connection) <> "/api/v2/buckets?name=#{URI.encode(name)}"
+    url =
+      base_url(connection) <> "/api/v2/buckets?name=#{query_value(name)}" <> org_param(connection)
 
+    # Scoped to an org, the server answers a missing name with a 404 of its
+    # own rather than an empty list; both are this client's "not found". A
+    # 404 for the org itself is passed on as the server's answer.
     with {:ok, %Finch.Response{body: body}} <-
            request(:get, url, auth_headers(connection), nil, connection, [], [200]),
          {:ok, %{"buckets" => [%{"id" => id} | _rest]}} <- Jason.decode(body) do
       {:ok, id}
     else
-      {:ok, _no_buckets} -> lookup_bucket_id_error(name)
-      {:error, _reason} = error -> error
+      {:ok, _no_buckets} ->
+        lookup_bucket_id_error(name)
+
+      {:error, %{status: 404, body: body}} = error ->
+        if bucket_not_found?(body), do: lookup_bucket_id_error(name), else: error
+
+      {:error, _reason} = error ->
+        error
     end
+  end
+
+  @spec bucket_not_found?(binary()) :: boolean()
+  defp bucket_not_found?(body) do
+    match?({:ok, %{"message" => "bucket " <> _rest}}, Jason.decode(body))
   end
 
   # ---------------------------------------------------------------------------
@@ -607,7 +651,7 @@ defmodule InfluxElixir.Client.HTTP do
   def delete_token(connection, token_id) do
     url =
       base_url(connection) <>
-        "/api/v3/configure/token/#{URI.encode(token_id)}"
+        "/api/v3/configure/token/#{path_segment(token_id)}"
 
     headers = auth_headers(connection)
 
@@ -647,6 +691,17 @@ defmodule InfluxElixir.Client.HTTP do
   # status is one of `ok_statuses`, `{:error, %{status, body}}` for any other
   # status, and `{:error, {:connection_error, reason}}` for a transport
   # failure. Every public function used to repeat this three-clause case.
+  # A value in a query string. `URI.encode/1` left `&`, `+`, `=` and `#`
+  # alone, so a v2 bucket named `a&b` was written to bucket `a` (another
+  # bucket's data, if one of that name existed), `c+d` to `c d`, and `e#f`
+  # to `e` (verified against InfluxDB 2.7).
+  @spec query_value(term()) :: binary()
+  defp query_value(value), do: value |> to_string() |> URI.encode_www_form()
+
+  # A path segment: everything but the unreserved characters is encoded.
+  @spec path_segment(term()) :: binary()
+  defp path_segment(value), do: value |> to_string() |> URI.encode(&URI.char_unreserved?/1)
+
   @spec request(
           :get | :post | :delete,
           binary(),

@@ -46,6 +46,9 @@ defmodule InfluxElixir.Admin.Buckets do
 
     * `connection` - a client connection term
 
+  Every bucket of the connection's `:org`, across all of the server's
+  pages.
+
   ## Returns
 
     * `{:ok, [map()]}` on success

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`delete_bucket/2` could delete another org's bucket.** The lookup
+  from a bucket name to its ID did not name the connection's org. When
+  two orgs had a bucket of the same name, it took the first match: on
+  InfluxDB 2.7 a `dev-influx` connection deleted the other org's bucket
+  and left its own. The lookup and `list_buckets/1` are now scoped to
+  the connection's `:org`. A 404 for the org itself is passed through as
+  the server's answer, not reported as "bucket not found".
+- **`list_buckets/1` returned at most 20 buckets.** InfluxDB 2 pages the
+  list, and only the first page was read, so an org with more buckets
+  silently lost the rest. Every page is now read, 100 at a time.
+- **Names with `&`, `+`, `#` or `=` went to the wrong place.** Query
+  values were built with `URI.encode/1`, which leaves those characters
+  alone. A write to bucket `a&b` went to bucket `a` (into its data, if
+  such a bucket existed), `c+d` went to `c d`, and `e#f` went to `e`.
+  Query values are now form-encoded and path segments strictly encoded,
+  for org, bucket and database names, precision, and bucket and token
+  IDs. A v3 `db/rp` name such as `name/autogen` writes, queries and drops
+  as before.
+
 ### Changed
 - **The testing guide explains how to pin production's column types
   (#24).** Each `Client.Local` store starts with an empty schema, so a

@@ -801,6 +801,47 @@ defmodule InfluxElixir.ClientContract do
   defp bucket_tests(client) do
     quote do
       describe "bucket admin — contract" do
+        # A v2 bucket name may hold characters that mean something in a
+        # query string. `a&b` used to be written to bucket `a`, `c+d` to
+        # `c d` and `e#f` to `e` (verified against InfluxDB 2.7).
+        test "a bucket name with &, +, # and = is written to and deleted by name", ctx do
+          name = "contract a&b+c#d=e #{System.unique_integer([:positive])}"
+          assert :ok = unquote(client).create_bucket(ctx.conn, name, [])
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, "enc v=1i 1",
+                     database: name,
+                     precision: :second
+                   )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:ok, [%{"_value" => 1}]} =
+                   unquote(client).query_flux(
+                     ctx.conn,
+                     ~s|from(bucket: "#{name}") \|> range(start: 0)|
+                   )
+
+          assert :ok = unquote(client).delete_bucket(ctx.conn, name)
+          {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
+          refute name in Enum.map(buckets, & &1["name"])
+        end
+
+        # InfluxDB 2 pages the list; only its first 20 buckets used to be
+        # returned (verified).
+        test "list_buckets returns every bucket, past the server's page size", ctx do
+          prefix = "contract_page_#{System.unique_integer([:positive])}_"
+          names = for i <- 1..101, do: prefix <> Integer.to_string(i)
+
+          Enum.each(names, &(:ok = unquote(client).create_bucket(ctx.conn, &1, [])))
+
+          {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
+          listed = for %{"name" => name} <- buckets, String.starts_with?(name, prefix), do: name
+          assert Enum.sort(listed) == Enum.sort(names)
+
+          Enum.each(names, &(:ok = unquote(client).delete_bucket(ctx.conn, &1)))
+        end
+
         test "create_bucket returns :ok", ctx do
           assert :ok ==
                    unquote(client).create_bucket(
@@ -2798,6 +2839,23 @@ defmodule InfluxElixir.ClientContract do
                      unquote(client).write(ctx.conn, "m v=1i", database: name),
                    inspect(name)
           end
+        end
+
+        test "a database/retention-policy name is written, queried and dropped", ctx do
+          name = "contract_rp#{System.unique_integer([:positive])}/autogen"
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, "enc v=1i 1",
+                     database: name,
+                     precision: :second
+                   )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:ok, [%{"v" => 1}]} =
+                   unquote(client).query_sql(ctx.conn, "SELECT v FROM enc", database: name)
+
+          assert :ok = unquote(client).delete_database(ctx.conn, name)
         end
 
         test "the engine's _internal is listed and cannot be dropped", ctx do
