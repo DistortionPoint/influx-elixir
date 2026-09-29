@@ -1370,7 +1370,9 @@ defmodule InfluxElixir.Client.Local do
   Creating an existing database is `:ok` (the engine's 409, which
   `Client.HTTP` treats as success). A name the engine refuses is its 400,
   and a sixth database on the `:v3_core` profile its 422 — see
-  `InfluxElixir.Client.Local.DatabaseRules`.
+  `InfluxElixir.Client.Local.DatabaseRules`. `retention:` must be a
+  duration the engine reads (`"30d"`, `"1h 30m"`, `"1.5h"`, `"0"`), or it
+  is the engine's 400; the double keeps no retention, so nothing expires.
   """
   @impl true
   @spec create_database(
@@ -1378,13 +1380,52 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           keyword()
         ) :: :ok | {:error, term()}
-  def create_database(%{table: table} = conn, name, _opts \\ []) do
+  def create_database(%{table: table} = conn, name, opts \\ []) do
     with :ok <- require_capability(conn, :create_database),
+         :ok <- check_retention(Keyword.get(opts, :retention)),
          :ok <- DatabaseRules.check_new(name, Store.databases(table), conn.profile) do
       Store.put_database(table, name)
       :ok
     end
   end
+
+  # `retention:` is sent as the engine's `retention_period`, a duration
+  # string it reads before anything else in the request (verified against
+  # InfluxDB 3 Core): one or more `<number><unit>` parts, optionally
+  # spaced, a fraction allowed (`1.5h`), units case-sensitive (`M` months,
+  # `m` minutes), or a bare `0`. Anything else is its 400, without the
+  # `at line 1 column N` its JSON parser appends. The double stores no
+  # retention: nothing expires.
+  @duration_units ~w(nanos nsec ns usec us µs millis msec ms seconds second secs sec s
+                     minutes minute mins min m hours hour hrs hr h days day d weeks week w
+                     months month M years year y)
+  @duration ~r/^\s*(?:0|(?:\d+(?:\.\d+)?\s*(?:#{Enum.join(@duration_units, "|")})\s*)+)\s*$/u
+
+  @spec check_retention(term()) :: :ok | {:error, map()}
+  defp check_retention(nil), do: :ok
+
+  defp check_retention(retention) when is_boolean(retention),
+    do: retention_error("invalid type: boolean `#{retention}`")
+
+  defp check_retention(retention) when is_binary(retention) or is_atom(retention) do
+    text = to_string(retention)
+
+    if Regex.match?(@duration, text),
+      do: :ok,
+      else: retention_error(~s|invalid value: string "#{text}"|)
+  end
+
+  defp check_retention(retention) when is_integer(retention),
+    do: retention_error("invalid type: integer `#{retention}`")
+
+  defp check_retention(retention) when is_float(retention),
+    do: retention_error("invalid type: floating point `#{retention}`")
+
+  defp check_retention(retention), do: retention_error("invalid type: `#{inspect(retention)}`")
+
+  @spec retention_error(binary()) :: {:error, map()}
+  defp retention_error(what),
+    do: {:error, %{status: 400, body: "serde json error: #{what}, expected a duration"}}
 
   @doc """
   Returns the databases as maps with a single `"name"` key, sorted, with
@@ -1559,17 +1600,34 @@ defmodule InfluxElixir.Client.Local do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Returns a passing health status map with string keys, matching the
-  JSON-decoded shape returned by the HTTP client.
+  Returns a passing health status in the shape `Client.HTTP` returns for
+  the profile's server (verified): InfluxDB 3's `/health` answers a plain
+  `OK`, which the HTTP client reports as `%{"status" => "pass"}`; InfluxDB
+  2 answers JSON with `name`, `message`, `status`, `checks`, `version` and
+  `commit` (here `"local"`).
   """
   @impl true
   @spec health(InfluxElixir.Client.connection()) ::
           {:ok, map()} | {:error, term()}
   def health(conn) do
     with :ok <- require_capability(conn, :health) do
-      {:ok, %{"status" => "pass", "version" => "local"}}
+      {:ok, health_body(conn.profile)}
     end
   end
+
+  @spec health_body(profile()) :: map()
+  defp health_body(:v2) do
+    %{
+      "name" => "influxdb",
+      "message" => "ready for queries and writes",
+      "status" => "pass",
+      "checks" => [],
+      "version" => "local",
+      "commit" => "local"
+    }
+  end
+
+  defp health_body(_v3), do: %{"status" => "pass"}
 
   # ---------------------------------------------------------------------------
   # Private — storage policy

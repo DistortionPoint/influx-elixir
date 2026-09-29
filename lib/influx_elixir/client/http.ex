@@ -687,10 +687,6 @@ defmodule InfluxElixir.Client.HTTP do
   # Private: HTTP helpers
   # ---------------------------------------------------------------------------
 
-  # Runs a request and normalises the outcome: `{:ok, response}` when the
-  # status is one of `ok_statuses`, `{:error, %{status, body}}` for any other
-  # status, and `{:error, {:connection_error, reason}}` for a transport
-  # failure. Every public function used to repeat this three-clause case.
   # A value in a query string. `URI.encode/1` left `&`, `+`, `=` and `#`
   # alone, so a v2 bucket named `a&b` was written to bucket `a` (another
   # bucket's data, if one of that name existed), `c+d` to `c d`, and `e#f`
@@ -702,6 +698,10 @@ defmodule InfluxElixir.Client.HTTP do
   @spec path_segment(term()) :: binary()
   defp path_segment(value), do: value |> to_string() |> URI.encode(&URI.char_unreserved?/1)
 
+  # Runs a request and normalises the outcome: `{:ok, response}` when the
+  # status is one of `ok_statuses`, `{:error, %{status, body}}` for any other
+  # status, and `{:error, {:connection_error, reason}}` for a transport
+  # failure. Every public function used to repeat this three-clause case.
   @spec request(
           :get | :post | :delete,
           binary(),

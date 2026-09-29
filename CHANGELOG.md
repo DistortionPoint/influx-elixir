@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` accepted any `retention:` for a v3 database.**
+  InfluxDB 3 takes a duration string and refuses anything else with 400
+  `serde json error: ... expected a duration`. That includes
+  `retention: 3600`, seconds as a v2 bucket takes them, so such a call
+  passed in tests and failed in production. The double now applies the
+  engine's grammar, verified on 53 values against Core: one or more
+  `<number><unit>` parts, a fraction allowed, case-sensitive units, or a
+  bare `"0"`. It still stores no retention, so nothing expires.
+- **`health/1` on `Client.Local` answered `"version" => "local"` on
+  every profile.** InfluxDB 3's `/health` is a plain `OK`, which
+  `Client.HTTP` reports as `%{"status" => "pass"}`. The double now
+  answers that shape on the v3 profiles, and InfluxDB 2's JSON shape on
+  `:v2`. The contract asserts each exactly instead of
+  `status in ["pass", "ok"]`.
 - **`delete_bucket/2` could delete another org's bucket.** The lookup
   from a bucket name to its ID did not name the connection's org. When
   two orgs had a bucket of the same name, it took the first match: on

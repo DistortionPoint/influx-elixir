@@ -49,7 +49,7 @@ defmodule InfluxElixir.ClientContract do
     v2_ops = profile == :v2
     enterprise_ops = profile == :v3_enterprise
 
-    health_tests = health_tests(client)
+    health_tests = health_tests(client, if(v2_ops, do: :v2, else: :v3))
     write_tests = write_tests(client, profile)
 
     sql_tests = if v3_sql, do: sql_tests(client), else: nil
@@ -177,12 +177,29 @@ defmodule InfluxElixir.ClientContract do
   # Health (all profiles)
   # ---------------------------------------------------------------------------
 
-  defp health_tests(client) do
+  defp health_tests(client, version) do
     quote do
       describe "health/1" do
-        test "reports a passing status", ctx do
-          {:ok, %{"status" => status}} = unquote(client).health(ctx.conn)
-          assert status in ["pass", "ok"]
+        test "reports a passing status in the server's shape", ctx do
+          {:ok, health} = unquote(client).health(ctx.conn)
+
+          case unquote(version) do
+            # InfluxDB 3's /health is a plain "OK".
+            :v3 ->
+              assert health == %{"status" => "pass"}
+
+            :v2 ->
+              assert %{
+                       "name" => "influxdb",
+                       "message" => "ready for queries and writes",
+                       "status" => "pass",
+                       "checks" => [],
+                       "version" => version,
+                       "commit" => commit
+                     } = health
+
+              assert is_binary(version) and is_binary(commit)
+          end
         end
       end
     end
@@ -2856,6 +2873,31 @@ defmodule InfluxElixir.ClientContract do
                    unquote(client).query_sql(ctx.conn, "SELECT v FROM enc", database: name)
 
           assert :ok = unquote(client).delete_database(ctx.conn, name)
+        end
+
+        # retention: is a duration string; the double used to accept any
+        # value, so `retention: 3600` (a v2 bucket's seconds) passed in tests
+        # and was the engine's 400 in production.
+        test "retention: takes the engine's duration strings and refuses the rest", ctx do
+          for retention <- ["30d", "1h 30m", "1.5h", "2 weeks", "1M", "0"] do
+            name = "contract_ret_#{System.unique_integer([:positive])}"
+            assert :ok = unquote(client).create_database(ctx.conn, name, retention: retention)
+            assert :ok = unquote(client).delete_database(ctx.conn, name)
+          end
+
+          for {retention, what} <- [
+                {3600, "invalid type: integer `3600`"},
+                {"1H", ~s|invalid value: string "1H"|},
+                {"1", ~s|invalid value: string "1"|},
+                {"-1h", ~s|invalid value: string "-1h"|}
+              ] do
+            name = "contract_ret_#{System.unique_integer([:positive])}"
+            expected = "serde json error: #{what}, expected a duration"
+
+            assert {:error, %{status: 400, body: ^expected <> _position}} =
+                     unquote(client).create_database(ctx.conn, name, retention: retention),
+                   inspect(retention)
+          end
         end
 
         test "the engine's _internal is listed and cannot be dropped", ctx do

@@ -23,9 +23,11 @@ defmodule InfluxElixir.Admin.Databases do
     * `connection` - a client connection term
     * `name` - the database name to create
     * `opts` - optional keyword list:
-      * `:retention` - retention period as a duration string, e.g. `"30d"` or
-        `"1h"` (InfluxDB 3 rejects an integer with a 400; verified). Omit for
-        no expiry.
+      * `:retention` - retention period as a duration string, e.g. `"30d"`,
+        `"1h 30m"` or `"1.5h"` (units are case-sensitive: `M` months, `m`
+        minutes); omit it for data that never expires. Anything else — an
+        integer number of seconds, as a v2 bucket takes — is InfluxDB 3's
+        400 `expected a duration`, from `Client.Local` too
 
   ## Returns
 
