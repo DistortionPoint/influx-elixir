@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.35] - 2026-09-29
+
 ### Fixed
 - **`Client.Local` accepted any `retention:` for a v3 database.**
   InfluxDB 3 takes a duration string and refuses anything else with 400
