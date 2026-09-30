@@ -71,7 +71,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
       |> split_lines()
       |> Enum.with_index(1)
       |> Enum.reject(fn {line, _n} ->
-        String.trim(line) == "" or String.starts_with?(line, "#")
+        blank?(line) or String.starts_with?(line, "#")
       end)
       |> Enum.map(fn {line, n} -> parse_line(line, n, precision, dialect) end)
 
@@ -80,6 +80,14 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
       results -> {:ok, results}
     end
   end
+
+  # A line of only spaces and tabs: nothing else is blank to InfluxDB 3 (a
+  # line of `\r`, `\v`, `\f` or a no-break space is its "Expected at least
+  # one space character", verified). It stops at the first other byte.
+  @spec blank?(binary()) :: boolean()
+  defp blank?(<<c, rest::binary>>) when c in [?\s, ?\t], do: blank?(rest)
+  defp blank?(<<>>), do: true
+  defp blank?(_line), do: false
 
   # Splits the payload at newlines that are not inside a quoted string
   # field value.
@@ -119,7 +127,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   # Format: measurement[,tag=val...] field=val[,...] [timestamp]
   @spec parse_line(binary(), pos_integer(), precision(), dialect()) :: line_result()
   defp parse_line(line, number, precision, dialect) do
-    case tab_error(line, dialect) do
+    case terminator_error(line, dialect) do
       nil -> parse_line_parts(line, number, precision, dialect)
       message -> {:error, line_error(message, number, line)}
     end
@@ -139,7 +147,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
           ts_raw = List.first(rest)
 
           with {:ok, {measurement, tags}} <- parse_key_part(key_part, dialect),
-               {:ok, fields} <- parse_fields_part(fields_part),
+               {:ok, fields} <- parse_fields_part(v2_quote_cr(fields_part, dialect)),
                {:ok, fields} <- check_columns(tags, fields, dialect),
                {:ok, timestamp} <- parse_timestamp(ts_raw, precision, dialect) do
             {:ok, %{measurement: measurement, tags: tags, fields: fields, timestamp: timestamp}}
@@ -155,9 +163,26 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
     end
   end
 
+  # InfluxDB 2 accepts a string field that a `\r` follows (a CRLF ending,
+  # or `s="x"\r 5`) and stores it from after the opening quote up to the
+  # `\r`, closing quote included: `"x"\r` is `x"`, `""\r` is `"` (verified).
+  # A number followed by `\r` is refused. Rewriting the `"\r` as an escaped
+  # quote and a closing one gives that value to the string parser.
+  @spec v2_quote_cr(binary(), dialect()) :: binary()
+  defp v2_quote_cr(fields_part, :v2), do: String.replace_suffix(fields_part, "\"\r", "\\\"\"")
+  defp v2_quote_cr(fields_part, :v3), do: fields_part
+
   @spec leading_whitespace_trimmed(binary(), dialect()) :: binary()
-  defp leading_whitespace_trimmed(line, :v3), do: String.replace(line, ~r/^[ \t]+/, "")
+  defp leading_whitespace_trimmed(line, :v3), do: trim_leading_blanks(line)
   defp leading_whitespace_trimmed(line, :v2), do: line
+
+  # Leading spaces and tabs, by byte: a regex here ran on every line of
+  # every write.
+  @spec trim_leading_blanks(binary()) :: binary()
+  defp trim_leading_blanks(<<c, rest::binary>>) when c in [?\s, ?\t],
+    do: trim_leading_blanks(rest)
+
+  defp trim_leading_blanks(line), do: line
 
   # ---------------------------------------------------------------------------
   # Tabs (InfluxDB 3)
@@ -171,24 +196,36 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   # left to the parser.
   # ---------------------------------------------------------------------------
 
-  @spec tab_error(binary(), dialect()) :: binary() | nil
-  defp tab_error(_line, :v2), do: nil
+  @spec terminator_error(binary(), dialect()) :: binary() | nil
+  defp terminator_error(_line, :v2), do: nil
 
-  defp tab_error(line, :v3) do
-    if plain?(line, "\t"),
+  defp terminator_error(line, :v3) do
+    if plain?(line, ["\t", "\r"]),
       do: nil,
-      else: line |> leading_whitespace_trimmed(:v3) |> scan_tabs(:measurement, %{})
+      else: line |> leading_whitespace_trimmed(:v3) |> scan_terminators(:measurement, %{})
   end
 
-  @spec scan_tabs(binary(), atom(), map()) :: binary() | nil
-  defp scan_tabs(<<>>, _state, _ctx), do: nil
-  defp scan_tabs(<<?\\, _c, rest::binary>>, state, ctx), do: scan_tabs(rest, advance(state), ctx)
+  @spec scan_terminators(binary(), atom(), map()) :: binary() | nil
+  defp scan_terminators(<<>>, _state, _ctx), do: nil
 
-  defp scan_tabs(<<?\t, _rest::binary>> = at, state, ctx), do: tab_message(state, at, ctx)
+  defp scan_terminators(<<?\\, _c, rest::binary>>, state, ctx),
+    do: scan_terminators(rest, advance(state), ctx)
 
-  defp scan_tabs(<<?", rest::binary>>, :value_start, ctx), do: skip_string(rest, ctx)
+  defp scan_terminators(<<?\t, _rest::binary>> = at, state, ctx),
+    do: terminator_message(state, at, ctx)
 
-  defp scan_tabs(<<c, rest::binary>> = at, state, ctx),
+  # A carriage return ends only a field value or a timestamp (a CRLF line
+  # ending among them); in a name or a tag it is an ordinary character
+  # (both verified).
+  defp scan_terminators(<<?\r, rest::binary>> = at, state, ctx) do
+    if region(state) in [:value, :timestamp],
+      do: terminator_message(state, at, ctx),
+      else: scan_terminators(rest, advance(state), ctx)
+  end
+
+  defp scan_terminators(<<?", rest::binary>>, :value_start, ctx), do: skip_string(rest, ctx)
+
+  defp scan_terminators(<<c, rest::binary>> = at, state, ctx),
     do: transition(region(state), state, c, rest, at, ctx)
 
   # The region a state belongs to: a `*_start` state is its token's region.
@@ -203,30 +240,35 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   # separator where the parser expects none leaves the line to it (`nil`).
   @spec transition(atom(), atom(), byte(), binary(), binary(), map()) :: binary() | nil
   defp transition(:measurement, _state, ?,, rest, _at, ctx),
-    do: scan_tabs(rest, :tag_key_start, Map.put(ctx, :tag_set, rest))
+    do: scan_terminators(rest, :tag_key_start, Map.put(ctx, :tag_set, rest))
 
   defp transition(:measurement, _state, ?\s, rest, _at, ctx),
-    do: scan_tabs(rest, :key_start, Map.put(ctx, :field, :first))
+    do: scan_terminators(rest, :key_start, Map.put(ctx, :field, :first))
 
   defp transition(:tag_key, _state, ?=, rest, _at, ctx),
-    do: scan_tabs(rest, :tag_value_start, ctx)
+    do: scan_terminators(rest, :tag_value_start, ctx)
 
   defp transition(:tag_key, _state, c, _rest, _at, _ctx) when c in [?,, ?\s], do: nil
 
   defp transition(:tag_value, _state, ?,, rest, _at, ctx),
-    do: scan_tabs(rest, :tag_key_start, ctx)
+    do: scan_terminators(rest, :tag_key_start, ctx)
 
   defp transition(:tag_value, _state, ?\s, rest, _at, ctx),
-    do: scan_tabs(String.trim_leading(rest, " "), :key_start, Map.put(ctx, :field, :first))
+    do: scan_terminators(String.trim_leading(rest, " "), :key_start, Map.put(ctx, :field, :first))
 
-  defp transition(:key, _state, ?=, rest, _at, ctx), do: scan_tabs(rest, :value_start, ctx)
+  defp transition(:key, _state, ?=, rest, _at, ctx),
+    do: scan_terminators(rest, :value_start, Map.put(ctx, :value_from, rest))
+
   defp transition(:key, _state, c, _rest, _at, _ctx) when c in [?,, ?\s], do: nil
 
   defp transition(:value, _state, ?,, rest, at, ctx),
-    do: scan_tabs(rest, :key_start, %{ctx | field: {:later, next_field(ctx.field), at}})
+    do: scan_terminators(rest, :key_start, %{ctx | field: {:later, next_field(ctx.field), at}})
 
-  defp transition(:value, _state, ?\s, rest, _at, ctx), do: scan_tabs(rest, :timestamp, ctx)
-  defp transition(_region, state, _c, rest, _at, ctx), do: scan_tabs(rest, advance(state), ctx)
+  defp transition(:value, _state, ?\s, rest, _at, ctx),
+    do: scan_terminators(rest, :timestamp, ctx)
+
+  defp transition(_region, state, _c, rest, _at, ctx),
+    do: scan_terminators(rest, advance(state), ctx)
 
   # A character read in a `*_start` state means the token has begun.
   @spec advance(atom()) :: atom()
@@ -240,38 +282,50 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   @spec skip_string(binary(), map()) :: binary() | nil
   defp skip_string(<<>>, _ctx), do: nil
   defp skip_string(<<?\\, _c, rest::binary>>, ctx), do: skip_string(rest, ctx)
-  defp skip_string(<<?", rest::binary>>, ctx), do: scan_tabs(rest, :value, ctx)
+  defp skip_string(<<?", rest::binary>>, ctx), do: scan_terminators(rest, :value, ctx)
   defp skip_string(<<_c, rest::binary>>, ctx), do: skip_string(rest, ctx)
 
-  @spec tab_message(atom(), binary(), map()) :: binary()
-  defp tab_message(state, at, _ctx) when state in [:measurement, :tag_value],
+  @spec terminator_message(atom(), binary(), map()) :: binary()
+  defp terminator_message(state, at, _ctx) when state in [:measurement, :tag_value],
     do: "Expected at least one space character, got `#{at}`"
 
-  defp tab_message(:tag_key_start, at, _ctx), do: "Expected tag key, got `#{at}`"
-  defp tab_message(:tag_value_start, at, _ctx), do: "Expected tag value, got `#{at}`"
+  defp terminator_message(:tag_key_start, at, _ctx), do: "Expected tag key, got `#{at}`"
+  defp terminator_message(:tag_value_start, at, _ctx), do: "Expected tag value, got `#{at}`"
 
-  defp tab_message(:tag_key, _at, %{tag_set: tag_set}) do
+  defp terminator_message(:tag_key, _at, %{tag_set: tag_set}) do
     excerpt =
       if String.length(tag_set) > 10, do: String.slice(tag_set, 0, 10) <> "...", else: tag_set
 
     "Tag set malformed: could not find equals sign in `#{excerpt}`"
   end
 
-  defp tab_message(state, _at, %{field: :first}) when state in [:key_start, :key, :value_start],
-    do: "No fields were provided"
+  defp terminator_message(state, _at, %{field: :first})
+       when state in [:key_start, :key, :value_start],
+       do: "No fields were provided"
 
   # A later field with a tab in its key, or at the start of its value, ends
   # the field list before it: after its comma when it is the second field,
   # at its comma from the third on (verified).
-  defp tab_message(state, _at, %{field: {:later, 2, <<?,, field::binary>>}})
+  defp terminator_message(state, _at, %{field: {:later, 2, <<?,, field::binary>>}})
        when state in [:key_start, :key, :value_start],
        do: trailing(field)
 
-  defp tab_message(state, _at, %{field: {:later, _n, comma}})
+  defp terminator_message(state, _at, %{field: {:later, _n, comma}})
        when state in [:key_start, :key, :value_start],
        do: trailing(comma)
 
-  defp tab_message(_value_or_timestamp, at, _ctx), do: trailing(at)
+  # A terminator after a value that does not parse fails that field, as an
+  # empty value does (verified).
+  defp terminator_message(:value, at, %{value_from: from} = ctx) do
+    value = binary_part(from, 0, byte_size(from) - byte_size(at))
+
+    case parse_field_value(value) do
+      {:ok, _typed} -> trailing(at)
+      {:error, _reason} -> terminator_message(:value_start, at, ctx)
+    end
+  end
+
+  defp terminator_message(_timestamp, at, _ctx), do: trailing(at)
 
   # The number of the field that starts after the next comma.
   @spec next_field(:first | {:later, pos_integer(), binary()}) :: pos_integer()
@@ -290,7 +344,9 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
     %{
       error_message: message,
       line_number: number,
-      original_line: String.slice(line, 0, 20),
+      # InfluxDB 3 echoes the line without the `\r` of a CRLF ending; one
+      # inside the line stays (verified).
+      original_line: line |> String.replace_suffix("\r", "") |> String.slice(0, 20),
       line: line
     }
   end

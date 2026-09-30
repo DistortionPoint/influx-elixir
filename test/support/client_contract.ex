@@ -2091,6 +2091,34 @@ defmodule InfluxElixir.ClientContract do
           assert Enum.map(rows, & &1["_value"]) == [1, 3]
         end
 
+        # InfluxDB 2 stores a string field that a \r follows, from after the
+        # opening quote up to the \r, closing quote included; a number
+        # followed by \r is refused (verified).
+        test "a string field before a CRLF ending is stored, closing quote and all", ctx do
+          m = "contract_v2cr_#{System.unique_integer([:positive])}"
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, "#{m} s=\"x\"\r\n#{m} s=\"y\"\r 5\n",
+                     database: ctx.database,
+                     precision: :nanosecond
+                   )
+
+          assert {:error, %{status: 400}} =
+                   unquote(client).write(ctx.conn, "#{m} n=1i\r\n",
+                     database: ctx.database,
+                     precision: :nanosecond
+                   )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          flux =
+            ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) | <>
+              ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
+
+          {:ok, rows} = unquote(client).query_flux(ctx.conn, flux)
+          assert rows |> Enum.map(& &1["_value"]) |> Enum.sort() == ["x\"", "y\""]
+        end
+
         test "a parse error rejects the whole payload with 400 and nothing is stored", ctx do
           m = "contract_v2pe_#{System.unique_integer([:positive])}"
           lp = "#{m} v=1i 1700000000000000000\n#{m} v=\n#{m} v=3i 1700000000000000002"
@@ -3162,6 +3190,54 @@ defmodule InfluxElixir.ClientContract do
             assert %{"data" => [%{"error_message" => ^message}]} = Jason.decode!(body),
                    inspect(lp)
           end
+        end
+
+        test "a CRLF ending, a stray carriage return, a line of other whitespace", ctx do
+          m = "contract_cr_#{System.unique_integer([:positive])}"
+          trailing = "Could not parse entire line. Found trailing content: "
+          no_space = "Expected at least one space character, got end of input"
+
+          for {lp, number, message, original} <- [
+                # CRLF: the \r ends the value; the echoed line drops it.
+                {"#{m} v=1i 1\r\n", 1, trailing <> "`\r`", "#{m} v=1i 1"},
+                {"#{m} s=\"x\"\r\n", 1, trailing <> "`\r`", "#{m} s=\"x\""},
+                # One inside the line stays in the echo.
+                {"#{m} v=1i\r 1", 1, trailing <> "`\r 1`", "#{m} v=1i\r 1"},
+                # An invalid value before it fails the field.
+                {"#{m} v=abc\r\n", 1, "No fields were provided", "#{m} v=abc"},
+                # Only spaces and tabs make a blank line.
+                {"#{m} v=1i 1\n\v\n", 2, no_space, "\v"},
+                {"#{m} v=1i 1\n \n", 2, no_space, " "}
+              ] do
+            assert {:error, %{status: 400, body: body}} =
+                     unquote(client).write(ctx.conn, lp,
+                       database: ctx.database,
+                       precision: :second
+                     ),
+                   inspect(lp)
+
+            assert %{"data" => [%{"line_number" => ^number, "error_message" => ^message} = e]} =
+                     Jason.decode!(body),
+                   inspect(lp)
+
+            assert e["original_line"] == String.slice(original, 0, 20), inspect(lp)
+          end
+
+          # In a tag value a \r is an ordinary character.
+          tagged = m <> "_tag"
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, "#{tagged},t=a\rb v=1i 1",
+                     database: ctx.database,
+                     precision: :second
+                   )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:ok, [%{"t" => "a\rb"}]} =
+                   unquote(client).query_sql(ctx.conn, ~s|SELECT t FROM "#{tagged}"|,
+                     database: ctx.database
+                   )
         end
 
         test "a leading tab is whitespace; an escaped tab and one in a string are kept", ctx do

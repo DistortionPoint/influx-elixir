@@ -900,7 +900,11 @@ a quoted string value is part of the value, a name ending in a backslash is
 rejected ("Measurements, tag keys and values, and field keys may not end with
 a backslash"), a tab outside a quoted string value is rejected with the
 engine's message for where it stands (InfluxDB 3 only; a leading tab is
-whitespace), a line starting with `#` is a comment, a timestamp that does not
+whitespace), a CRLF line ending is refused on InfluxDB 3 (the `\r` is
+trailing content after the last value) and accepted by InfluxDB 2 only after
+a string field (which then keeps its closing quote), a line of anything but
+spaces and tabs is not blank, a line starting with `#` is a comment, a
+timestamp that does not
 fit in 64 bits of nanoseconds once scaled by the precision is rejected in each
 version's words, and an empty payload is rejected.
 ### Pinning production's column types

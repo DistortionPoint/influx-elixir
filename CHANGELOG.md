@@ -7,7 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local` accepted line-protocol whitespace that InfluxDB
+  refuses, and refused some it accepts.** Each case was verified against
+  InfluxDB 3 Core and 2.7:
+  - A line holding only a no-break space, `\v`, `\f` or `\r` was skipped
+    as blank. Both servers refuse it; only spaces and tabs make a line
+    blank.
+  - CRLF line endings. InfluxDB 3 answers
+    ``Could not parse entire line. Found trailing content: `\r` ``, and
+    echoes the line without its `\r`.
+    The double now gives that exact answer; it used to answer `Unable to
+    parse timestamp value`.
+  - InfluxDB 2 refuses a `\r` after a number, but stores a string field
+    that a `\r` follows, closing quote included (`s="x"\r` is `x"`). The
+    `:v2` profile used to refuse it.
+  - A tab or `\r` after an invalid field value fails that field
+    (`No fields were provided`, or trailing content for a later field),
+    as on InfluxDB 3.
+
 ### Changed
+- **`Client.Local` writes are about 40% faster.** A 100k-line write went
+  from about 2.25 s to about 1.3 s. Three changes:
+  - Leading whitespace and blank lines are now checked byte by byte,
+    where a regex and a full-line trim ran on every line.
+  - Each column's type is confirmed once per write, instead of costing
+    two ETS calls per column per point.
+  - The table-exists lookup that only a `time` column needs no longer
+    runs for every point.
 - **`Client.Local` multi-key `ORDER BY` is 25–35% faster.** Each row's
   sort-key values are now read once, not on every comparison. At 100k
   points, `ORDER BY host, time DESC` went from 375 to about 270 ms and

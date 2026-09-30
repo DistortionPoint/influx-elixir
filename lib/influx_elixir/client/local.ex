@@ -677,15 +677,15 @@ defmodule InfluxElixir.Client.Local do
          }}
 
       nil ->
-        conflicts =
-          Enum.reduce(lines, [], fn {:ok, point, _number, _line}, conflicts ->
-            case check_schema(table, database, point, :v2) do
-              :ok ->
+        {conflicts, _known} =
+          Enum.reduce(lines, {[], %{}}, fn {:ok, point, _number, _line}, {conflicts, known} ->
+            case check_schema(table, database, point, :v2, known) do
+              {:ok, known} ->
                 Store.store_point(table, database, strip_uint_markers(point))
-                conflicts
+                {conflicts, known}
 
               {:error, conflict} ->
-                [conflict | conflicts]
+                {[conflict | conflicts], known}
             end
           end)
 
@@ -709,19 +709,19 @@ defmodule InfluxElixir.Client.Local do
   end
 
   defp store_lines(table, database, lines, _v3) do
-    errors =
-      Enum.reduce(lines, [], fn
-        {:error, line_error}, errors ->
-          [line_error | errors]
+    {errors, _known} =
+      Enum.reduce(lines, {[], %{}}, fn
+        {:error, line_error}, {errors, known} ->
+          {[line_error | errors], known}
 
-        {:ok, point, number, line}, errors ->
-          case check_schema(table, database, point, :v3) do
-            :ok ->
+        {:ok, point, number, line}, {errors, known} ->
+          case check_schema(table, database, point, :v3, known) do
+            {:ok, known} ->
               Store.store_point(table, database, strip_uint_markers(point))
-              errors
+              {errors, known}
 
             {:error, message} ->
-              [LineProtocolParser.schema_error(message, number, line) | errors]
+              {[LineProtocolParser.schema_error(message, number, line) | errors], known}
           end
       end)
 
@@ -815,8 +815,9 @@ defmodule InfluxElixir.Client.Local do
   defp dry_check(table, database, point, pending) do
     m = point.measurement
 
-    exists? =
+    exists? = fn ->
       Store.table?(table, database, m) or Enum.any?(Map.keys(pending), &match?({^m, _column}, &1))
+    end
 
     with :ok <- reserved_time(point, exists?) do
       point
@@ -834,27 +835,34 @@ defmodule InfluxElixir.Client.Local do
   # InfluxDB 3 reserves `time` for the timestamp column. The wording
   # depends on whether the table exists (verified): a new table refuses
   # the line outright, an existing one reports a column-type conflict.
-  @spec check_schema(Store.t(), binary(), point_map(), LineProtocolParser.dialect()) ::
-          :ok | {:error, binary() | {binary(), binary(), binary(), binary()}}
-  defp check_schema(table, database, point, :v3) do
-    case reserved_time(point, Store.table?(table, database, point.measurement)) do
-      :ok -> check_column_types(table, database, point, :v3)
+  #
+  # `known` holds the kinds this write has already confirmed or registered,
+  # `{measurement, column} => kind`: a kind never changes once set, so the
+  # store is asked only about a column the write has not met yet (two ETS
+  # calls per column per point, before).
+  @spec check_schema(Store.t(), binary(), point_map(), LineProtocolParser.dialect(), map()) ::
+          {:ok, map()} | {:error, binary() | {binary(), binary(), binary(), binary()}}
+  defp check_schema(table, database, point, :v3, known) do
+    case reserved_time(point, fn -> Store.table?(table, database, point.measurement) end) do
+      :ok -> check_column_types(table, database, point, :v3, known)
       {:error, _message} = error -> error
     end
   end
 
-  defp check_schema(table, database, point, :v2),
-    do: check_column_types(table, database, point, :v2)
+  defp check_schema(table, database, point, :v2, known),
+    do: check_column_types(table, database, point, :v2, known)
 
-  @spec reserved_time(point_map(), boolean()) :: :ok | {:error, binary()}
+  # `table_exists?` is asked only for a point that names `time`; every
+  # point used to pay an ETS match for it.
+  @spec reserved_time(point_map(), (-> boolean())) :: :ok | {:error, binary()}
   defp reserved_time(%{tags: tags, fields: fields}, table_exists?) do
     cond do
       Map.has_key?(tags, "time") ->
-        reserved_time_error(table_exists?, "iox::column_type::tag")
+        reserved_time_error(table_exists?.(), "iox::column_type::tag")
 
       Map.has_key?(fields, "time") ->
         reserved_time_error(
-          table_exists?,
+          table_exists?.(),
           LineProtocolParser.column_type(:field, Map.fetch!(fields, "time"))
         )
 
@@ -879,15 +887,34 @@ defmodule InfluxElixir.Client.Local do
   # writer never loses a column. InfluxDB 3 types tags and fields in one
   # namespace and reports a conflict with its column-type wording; InfluxDB
   # 2 types fields only and reports `{field, measurement, existing, got}`.
-  @spec check_column_types(Store.t(), binary(), point_map(), LineProtocolParser.dialect()) ::
-          :ok | {:error, binary() | {binary(), binary(), binary(), binary()}}
-  defp check_column_types(table, database, point, dialect) do
+  @spec check_column_types(
+          Store.t(),
+          binary(),
+          point_map(),
+          LineProtocolParser.dialect(),
+          map()
+        ) :: {:ok, map()} | {:error, binary() | {binary(), binary(), binary(), binary()}}
+  defp check_column_types(table, database, point, dialect, known) do
+    m = point.measurement
+
     point
     |> point_columns(dialect)
-    |> Enum.find_value(:ok, fn {column, type} ->
-      case Store.register_column(table, database, point.measurement, column, type) do
-        :ok -> nil
-        {:conflict, existing} -> {:error, conflict(dialect, column, point, existing, type)}
+    |> Enum.reduce_while({:ok, known}, fn {column, type}, {:ok, known} ->
+      case Map.fetch(known, {m, column}) do
+        {:ok, ^type} ->
+          {:cont, {:ok, known}}
+
+        {:ok, existing} ->
+          {:halt, {:error, conflict(dialect, column, point, existing, type)}}
+
+        :error ->
+          case Store.register_column(table, database, m, column, type) do
+            :ok ->
+              {:cont, {:ok, Map.put(known, {m, column}, type)}}
+
+            {:conflict, existing} ->
+              {:halt, {:error, conflict(dialect, column, point, existing, type)}}
+          end
       end
     end)
   end
