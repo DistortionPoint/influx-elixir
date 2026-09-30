@@ -4648,6 +4648,44 @@ defmodule InfluxElixir.Client.LocalTest do
   # recorded from InfluxDB 3 Core (docs/design/2026-09-16_local-cast-order-by.md).
   # ---------------------------------------------------------------------------
 
+  # The engine's order for rows that tie on every key is arbitrary; the
+  # double keeps the order the points were written, so a test's expected
+  # rows are deterministic. Keys are read once per row, not per comparison.
+  describe "query_sql/3 — multi-key ORDER BY" do
+    test "each key in turn, nulls per direction, full ties in write order",
+         %{conn: conn} do
+      Local.write(
+        conn,
+        Enum.join(
+          [
+            "sk,rack=b,host=h1 n=1i 1",
+            "sk,rack=a,host=h2 n=2i 2",
+            "sk,host=h3 n=3i 3",
+            "sk,rack=a,host=h2 n=4i 4",
+            "sk,rack=b,host=h9 n=5i 5",
+            "sk,rack=a,host=h1 n=6i 6"
+          ],
+          "\n"
+        ),
+        database: "test_db",
+        precision: :nanosecond
+      )
+
+      order = fn sql ->
+        {:ok, rows} = Local.query_sql(conn, sql, database: "test_db")
+        Enum.map(rows, & &1["n"])
+      end
+
+      # rack ascending (nulls last), then host descending; n=2 and n=4 tie
+      # on both keys and keep their write order.
+      assert order.("SELECT n FROM sk ORDER BY rack, host DESC") == [2, 4, 6, 5, 1, 3]
+
+      # rack descending puts nulls first; NULLS LAST overrides it.
+      assert order.("SELECT n FROM sk ORDER BY rack DESC, host") == [3, 1, 5, 6, 2, 4]
+      assert order.("SELECT n FROM sk ORDER BY rack DESC NULLS LAST, host") == [1, 5, 6, 2, 4, 3]
+    end
+  end
+
   describe "bug regression — CAST, ::TYPE and multi-term ORDER BY (#20)" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "cast_db")

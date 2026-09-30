@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`Client.Local` multi-key `ORDER BY` is 25–35% faster.** Each row's
+  sort-key values are now read once, not on every comparison. At 100k
+  points, `ORDER BY host, time DESC` went from 375 to about 270 ms and
+  `SELECT DISTINCT ON (host) ... ORDER BY host, time DESC` from 572 to
+  about 395 ms (medians of 7 runs). A single-key sort such as `ORDER BY
+  time` still sorts in place, which is faster when the key is a field
+  read. Ordering is unchanged, including full ties in write order, which
+  a new test pins; the testing guide notes that the server's order for
+  ties is arbitrary.
+
 ### Fixed
 - **`Query.*` and `Admin.*` behaved differently from the facade.**
   `Query.SQL`, `Query.SQLStream`, `Query.InfluxQL`, `Query.Flux` and the

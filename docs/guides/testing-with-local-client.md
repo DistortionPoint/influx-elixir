@@ -429,6 +429,9 @@ The double follows DataFusion's NULL rules, verified against InfluxDB 3:
 
 - `ORDER BY col` puts nulls last, `ORDER BY col DESC` puts them first, and
   `NULLS FIRST` / `NULLS LAST` override either.
+- Rows that tie on every `ORDER BY` key come back in the order they were
+  written. The engine's order for such ties is arbitrary, so don't assert
+  it against a real server; add a key that breaks the tie, such as `time`.
 - A comparison with a null is unknown, and `NOT` of unknown is unknown, so
   `WHERE NOT (rack = '1')` does not return rows that have no `rack`; neither
   do `rack NOT IN (...)` or `v NOT BETWEEN ...`.

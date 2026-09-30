@@ -387,29 +387,54 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   # Stable multi-key sort with a direction per key; `DateTime`s compare
   # chronologically and nil (an omitted column) sorts first.
-  @spec sort_by_keys([term()], [{(term() -> term()), :asc | :desc}]) :: [term()]
-  defp sort_by_keys(items, keys) do
-    Enum.sort(items, fn a, b -> keys_before?(a, b, keys) end)
+  #
+  # Each item's key values are read once, not on every comparison: with two
+  # keys over 100k rows that was millions of key-function calls (a
+  # `DISTINCT ON (k) ... ORDER BY k, time DESC` took 630 ms).
+  @spec sort_by_keys([term()], [{(term() -> term()), SQLParser.direction()}]) :: [term()]
+  # One key, the common case (`ORDER BY time`): its key functions are cheap
+  # field reads, and building a decorated list costs more than it saves.
+  defp sort_by_keys(items, [{key_fn, direction}]) do
+    placement = null_placement(direction)
+    Enum.sort(items, fn a, b -> value_before?(key_fn.(a), key_fn.(b), placement) != :after end)
   end
 
-  @spec keys_before?(term(), term(), [{(term() -> term()), :asc | :desc}]) :: boolean()
-  defp keys_before?(_a, _b, []), do: true
+  defp sort_by_keys(items, keys) do
+    placements = Enum.map(keys, fn {_key_fn, direction} -> null_placement(direction) end)
 
-  # Nulls sort last ascending and first descending unless the query says
-  # NULLS FIRST / LAST — DataFusion's rule (verified). Term order put a nil
-  # before every string and between `false` and `true`.
-  defp keys_before?(a, b, [{key_fn, direction} | rest]) do
-    {dir, nulls} = null_placement(direction)
-    x = key_fn.(a)
-    y = key_fn.(b)
+    items
+    |> Enum.map(fn item ->
+      {Enum.map(keys, fn {key_fn, _direction} -> key_fn.(item) end), item}
+    end)
+    |> Enum.sort(fn {a, _item_a}, {b, _item_b} -> values_before?(a, b, placements) end)
+    |> Enum.map(fn {_values, item} -> item end)
+  end
 
+  @spec values_before?([term()], [term()], [{:asc | :desc, :nulls_first | :nulls_last}]) ::
+          boolean()
+  defp values_before?([], [], []), do: true
+
+  defp values_before?([x | xs], [y | ys], [placement | rest]) do
+    case value_before?(x, y, placement) do
+      :tie -> values_before?(xs, ys, rest)
+      order -> order == :before
+    end
+  end
+
+  # One key's order: `:before`, `:after` or `:tie`. Nulls sort last
+  # ascending and first descending unless the query says NULLS FIRST /
+  # LAST — DataFusion's rule (verified). Term order put a nil before every
+  # string and between `false` and `true`.
+  @spec value_before?(term(), term(), {:asc | :desc, :nulls_first | :nulls_last}) ::
+          :before | :after | :tie
+  defp value_before?(x, y, {dir, nulls}) do
     cond do
-      is_nil(x) and is_nil(y) -> keys_before?(a, b, rest)
-      is_nil(x) -> nulls == :nulls_first
-      is_nil(y) -> nulls == :nulls_last
-      value_order(x, y) and value_order(y, x) -> keys_before?(a, b, rest)
-      dir == :asc -> value_order(x, y)
-      true -> value_order(y, x)
+      is_nil(x) and is_nil(y) -> :tie
+      is_nil(x) -> if nulls == :nulls_first, do: :before, else: :after
+      is_nil(y) -> if nulls == :nulls_last, do: :before, else: :after
+      value_order(x, y) and value_order(y, x) -> :tie
+      value_order(x, y) == (dir == :asc) -> :before
+      true -> :after
     end
   end
 
