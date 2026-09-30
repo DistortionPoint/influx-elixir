@@ -1,4 +1,6 @@
 defmodule InfluxElixir.ConnectionSupervisor do
+  @release_timeout_ms 15_000
+
   @moduledoc """
   Per-connection supervisor using `:rest_for_one` strategy.
 
@@ -16,6 +18,14 @@ defmodule InfluxElixir.ConnectionSupervisor do
 
   Children stop in reverse start order, so on shutdown the BatchWriter
   writes its buffer while the Finch pool is still up.
+
+  If this supervisor is killed outright, its children outlive it for a
+  moment (they stop when they see it exit, the writer after writing its
+  buffer) and still hold their registered names. A restart waits for
+  those names to be released, up to `#{@release_timeout_ms}` ms each,
+  before starting new children: starting at once failed with
+  `:already_started`, and the repeated failures took the top-level
+  supervisor, and every other connection, down with it.
   """
 
   use Supervisor
@@ -80,6 +90,14 @@ defmodule InfluxElixir.ConnectionSupervisor do
 
     batch_opts = Keyword.get(config, :batch_writer)
 
+    # Finch registers its own supervisor as `<name>.Supervisor`, the top of
+    # its tree and so the last of its names to go; the pool's registry
+    # (`<name>`) can be released before it.
+    Enum.each(
+      [:"#{finch_name}.Supervisor", finch_name, batch_writer_name(name)],
+      &await_release/1
+    )
+
     # The writer gets the *initialised* connection, not the raw config: for
     # Client.Local that is the ETS-backed map, and the raw keyword list would
     # not match `Local.write/3`.
@@ -97,6 +115,27 @@ defmodule InfluxElixir.ConnectionSupervisor do
       end
 
     Supervisor.init(children, strategy: :rest_for_one)
+  end
+
+  # A child left over from a killed predecessor still holds its name until
+  # it has stopped; wait for that rather than fail to start.
+  @spec await_release(atom()) :: :ok
+  defp await_release(registered_name) do
+    case Process.whereis(registered_name) do
+      nil ->
+        :ok
+
+      pid ->
+        ref = Process.monitor(pid)
+
+        receive do
+          {:DOWN, ^ref, :process, ^pid, _reason} -> :ok
+        after
+          @release_timeout_ms ->
+            Process.demonitor(ref, [:flush])
+            :ok
+        end
+    end
   end
 
   @spec validate_config(module(), keyword()) :: keyword()

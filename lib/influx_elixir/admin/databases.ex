@@ -3,8 +3,8 @@ defmodule InfluxElixir.Admin.Databases do
   v3 database CRUD operations via `/api/v3/configure/database`.
 
   Each function is the `InfluxElixir` facade function of the same operation:
-  it takes a connection or a connection name, and queries emit the same
-  telemetry span.
+  it takes a connection or a connection name. Admin operations emit no
+  telemetry span; only writes and queries do (see `InfluxElixir.Telemetry`).
 
   In production this performs HTTP requests; in tests the `LocalClient`
   is used for fast, isolated operation.

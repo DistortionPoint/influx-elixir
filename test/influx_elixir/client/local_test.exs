@@ -372,26 +372,6 @@ defmodule InfluxElixir.Client.LocalTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Write — gzip decompression
-  # ---------------------------------------------------------------------------
-
-  describe "write/3 — gzip" do
-    test "decompresses gzipped line protocol", %{conn: conn} do
-      :ok = Local.create_database(conn, "gz_db")
-      lp = "cpu value=1.0"
-      compressed = :zlib.gzip(lp)
-      assert {:ok, :written} = Local.write(conn, compressed, database: "gz_db")
-      assert {:ok, [_row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: "gz_db")
-    end
-
-    test "invalid gzip returns 400 error", %{conn: conn} do
-      # gzip magic bytes but garbage body
-      bad = <<0x1F, 0x8B, 0x00, 0xFF, 0xFF>>
-      assert {:error, %{status: 400}} = Local.write(conn, bad, database: "test_db")
-    end
-  end
-
-  # ---------------------------------------------------------------------------
   # Write — timestamp precision
   # ---------------------------------------------------------------------------
 
@@ -1688,11 +1668,6 @@ defmodule InfluxElixir.Client.LocalTest do
       Local.write(conn, lp, database: db)
       assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert length(rows) == 2
-    end
-
-    test "gzip: true option is accepted without error", %{conn: conn, db: db} do
-      assert {:ok, :written} =
-               Local.write(conn, "m value=1i", database: db, gzip: true)
     end
   end
 

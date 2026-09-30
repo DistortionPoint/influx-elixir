@@ -310,7 +310,10 @@ defmodule InfluxElixir.Client.HTTP do
           {:ok, map() | [map()]} | {:error, term()}
   def execute_sql(connection, sql, opts \\ []) do
     with {:ok, database} <- resolve_database(opts, connection) do
-      body = Jason.encode!(%{"db" => database, "q" => sql})
+      # `params` were dropped here, so a `$name` placeholder was the engine's
+      # "No value found for placeholder" 400 (verified) while Client.Local,
+      # which runs execute_sql/3 through query_sql/3, bound it.
+      body = Jason.encode!(%{"db" => database, "q" => sql, "params" => query_params(opts)})
 
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
@@ -319,7 +322,7 @@ defmodule InfluxElixir.Client.HTTP do
       # JSON with string timestamps); a summary map passes through.
       with {:ok, %Finch.Response{body: resp_body}} <-
              request(:post, url, headers, body, connection, opts, [200]),
-           {:ok, decoded} <- Jason.decode(resp_body) do
+           {:ok, decoded} <- decode_json(resp_body) do
         if is_list(decoded),
           do: {:ok, Enum.map(decoded, &ResponseParser.coerce_types/1)},
           else: {:ok, decoded}
@@ -390,7 +393,7 @@ defmodule InfluxElixir.Client.HTTP do
 
     with {:ok, %Finch.Response{body: resp_body}} <-
            request(:post, url, headers, body, connection, opts, [200]) do
-      ResponseParser.parse(resp_body, :csv)
+      ResponseParser.parse(resp_body, :flux_csv)
     end
   end
 
@@ -434,8 +437,11 @@ defmodule InfluxElixir.Client.HTTP do
 
     with {:ok, %Finch.Response{body: resp_body}} <-
            request(:get, url, headers, nil, connection, [], [200]),
-         {:ok, rows} <- Jason.decode(resp_body) do
+         {:ok, rows} when is_list(rows) <- decode_json(resp_body) do
       {:ok, Enum.map(rows, fn row -> %{"name" => row["iox::database"]} end)}
+    else
+      {:ok, other} -> {:error, {:unexpected_response, other}}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -510,7 +516,7 @@ defmodule InfluxElixir.Client.HTTP do
 
     with {:ok, %Finch.Response{body: body}} <-
            request(:get, url, auth_headers(connection), nil, connection, [], [200]),
-         {:ok, %{"orgs" => [%{"id" => id} | _rest]}} <- Jason.decode(body) do
+         {:ok, %{"orgs" => [%{"id" => id} | _rest]}} <- decode_json(body) do
       {:ok, id}
     else
       {:ok, _no_orgs} -> {:error, {:org_not_found, org}}
@@ -537,7 +543,7 @@ defmodule InfluxElixir.Client.HTTP do
 
     with {:ok, %Finch.Response{body: resp_body}} <-
            request(:get, url, auth_headers(connection), nil, connection, [], [200]),
-         {:ok, %{"buckets" => page}} <- Jason.decode(resp_body) do
+         {:ok, %{"buckets" => page}} <- decode_json(resp_body) do
       if length(page) == @bucket_page,
         do: list_bucket_pages(connection, offset + @bucket_page, [page | pages]),
         else: {:ok, [page | pages] |> Enum.reverse() |> Enum.concat()}
@@ -598,7 +604,7 @@ defmodule InfluxElixir.Client.HTTP do
     # 404 for the org itself is passed on as the server's answer.
     with {:ok, %Finch.Response{body: body}} <-
            request(:get, url, auth_headers(connection), nil, connection, [], [200]),
-         {:ok, %{"buckets" => [%{"id" => id} | _rest]}} <- Jason.decode(body) do
+         {:ok, %{"buckets" => [%{"id" => id} | _rest]}} <- decode_json(body) do
       {:ok, id}
     else
       {:ok, _no_buckets} ->
@@ -641,7 +647,7 @@ defmodule InfluxElixir.Client.HTTP do
 
     with {:ok, %Finch.Response{body: resp_body}} <-
            request(:post, url, headers, body, connection, opts, [200, 201]) do
-      Jason.decode(resp_body)
+      decode_json(resp_body)
     end
   end
 
@@ -824,10 +830,22 @@ defmodule InfluxElixir.Client.HTTP do
     Keyword.get(connection, key, default)
   end
 
+  # A body that is not JSON (a proxy's HTML page, say) is the same error
+  # ResponseParser gives, not a bare Jason.DecodeError.
+  @spec decode_json(binary()) :: {:ok, term()} | {:error, {:json_parse_error, term()}}
+  defp decode_json(body) do
+    case Jason.decode(body) do
+      {:ok, decoded} -> {:ok, decoded}
+      {:error, reason} -> {:error, {:json_parse_error, reason}}
+    end
+  end
+
   @spec resolve_database(keyword(), keyword()) ::
           {:ok, binary()} | {:error, :no_database_specified}
+  # `database: nil` is no database given, as in Client.Local and the
+  # facade's telemetry: it used to shadow the connection's default.
   defp resolve_database(opts, connection) do
-    case Keyword.get(opts, :database, conn_val(connection, :database)) do
+    case Keyword.get(opts, :database) || conn_val(connection, :database) do
       nil -> {:error, :no_database_specified}
       db -> {:ok, db}
     end

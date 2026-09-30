@@ -77,7 +77,10 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   Points or pre-encoded line protocol strings are buffered in memory and
   flushed either when the buffer reaches `batch_size` or when the
-  `flush_interval_ms` timer fires — whichever comes first.
+  `flush_interval_ms` timer fires — whichever comes first. Every flush,
+  however triggered (size, timer, `flush/2`, `write_sync/3`), restarts the
+  interval, so a write is never left buffered longer than one interval
+  after the last flush.
 
   ## Options
 
@@ -533,8 +536,14 @@ defmodule InfluxElixir.Write.BatchWriter do
     %{state | pending_sync: nil}
   end
 
+  # Any flush that writes restarts the interval, so the timer is running
+  # exactly once afterwards (schedule_flush/1 cancels a pending one first).
   defp do_flush(%__MODULE__{} = state) do
-    state = cancel_timer(state)
+    state |> write_buffer() |> schedule_flush()
+  end
+
+  @spec write_buffer(t()) :: t()
+  defp write_buffer(%__MODULE__{} = state) do
     lines = state.buffer |> Enum.reverse() |> Enum.join("\n")
 
     case Writer.write(state.connection, lines, state.write_opts) do
@@ -640,6 +649,7 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   @spec schedule_flush(t()) :: t()
   defp schedule_flush(%__MODULE__{} = state) do
+    state = cancel_timer(state)
     jitter = if state.jitter_ms > 0, do: :rand.uniform(state.jitter_ms), else: 0
     delay = state.flush_interval_ms + jitter
     ref = Process.send_after(self(), :flush, delay)

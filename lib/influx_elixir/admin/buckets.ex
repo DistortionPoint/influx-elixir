@@ -3,8 +3,8 @@ defmodule InfluxElixir.Admin.Buckets do
   v2 bucket CRUD operations for backwards compatibility.
 
   Each function is the `InfluxElixir` facade function of the same operation:
-  it takes a connection or a connection name, and queries emit the same
-  telemetry span.
+  it takes a connection or a connection name. Admin operations emit no
+  telemetry span; only writes and queries do (see `InfluxElixir.Telemetry`).
 
   Use this module when working with InfluxDB v2 bucket APIs.
 

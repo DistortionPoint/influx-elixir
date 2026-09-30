@@ -20,7 +20,8 @@ defmodule InfluxElixir.Write.WriterTest do
 
     test "a payload over 1 KB is gzipped and still stored in full", %{conn: conn} do
       # 100 distinct points; the client receives the compressed payload
-      # (Local decompresses on the gzip magic bytes) and stores every one.
+      # with gzip: true (Local, like the servers, decompresses only then)
+      # and stores every one.
       lp =
         Enum.map_join(
           1..100,
@@ -34,6 +35,23 @@ defmodule InfluxElixir.Write.WriterTest do
 
       assert {:ok, [%{"n" => 100}]} =
                Local.query_sql(conn, "SELECT COUNT(value) AS n FROM cpu", database: "w")
+    end
+
+    # gzip: true reached the client with the payload uncompressed, and the
+    # server refused it: "error decoding gzip stream" (verified).
+    test "gzip: true compresses a payload of any size; false leaves a large one plain",
+         %{conn: conn} do
+      assert {:ok, :written} = Writer.write(conn, "small v=1i 1", database: "w", gzip: true)
+
+      large = Enum.map_join(1..100, "\n", &"large v=#{&1}i #{&1}")
+      assert byte_size(large) > 1024
+      assert {:ok, :written} = Writer.write(conn, large, database: "w", gzip: false)
+
+      assert {:ok, [%{"n" => 1}]} =
+               Local.query_sql(conn, "SELECT COUNT(v) AS n FROM small", database: "w")
+
+      assert {:ok, [%{"n" => 100}]} =
+               Local.query_sql(conn, "SELECT COUNT(v) AS n FROM large", database: "w")
     end
 
     test "opts such as :precision reach the client", %{conn: conn} do

@@ -292,10 +292,13 @@ defmodule InfluxElixir.Client.Local do
   (when the optional `:decimal` dependency is loaded — `Decimal` values
   are emitted as bare numeric literals via `Decimal.to_string(:normal)`).
 
-  ## Gzip Decompression
+  ## Write Bodies
 
-  If a write payload begins with gzip magic bytes (0x1F 0x8B) it is
-  automatically decompressed before line protocol parsing.
+  `gzip: true` (the HTTP client's `Content-Encoding: gzip`, which
+  `InfluxElixir.write/3` sets whenever it compresses) decompresses the
+  payload, and on InfluxDB 3 a payload that is not UTF-8 is refused; see
+  `InfluxElixir.Client.Local.Body` for the engines' errors. A gzip payload
+  without `gzip: true` is line protocol to the engine, and so here.
 
   ## Timestamp Precision
 
@@ -313,6 +316,7 @@ defmodule InfluxElixir.Client.Local do
   @behaviour InfluxElixir.Client
 
   alias InfluxElixir.Client.Local.{
+    Body,
     DatabaseRules,
     Flux,
     Format,
@@ -370,9 +374,6 @@ defmodule InfluxElixir.Client.Local do
       :delete_bucket
     ]
   }
-
-  # Gzip magic bytes
-  @gzip_magic <<0x1F, 0x8B>>
 
   # ---------------------------------------------------------------------------
   # Connection lifecycle (behaviour callbacks)
@@ -551,8 +552,8 @@ defmodule InfluxElixir.Client.Local do
   exist an `{:error, %{status: 404, body: ...}}` is returned. If line protocol
   cannot be parsed an `{:error, %{status: 400, body: ...}}` is returned.
 
-  Payloads beginning with gzip magic bytes are automatically decompressed.
-  Pass `precision:` to say what unit numeric timestamps are in (default
+  `gzip: true` says the payload is gzip-compressed (see "Write Bodies" in
+  the moduledoc). Pass `precision:` to say what unit numeric timestamps are in (default
   nanoseconds); see "Timestamp Precision" in the moduledoc for the
   spellings each profile accepts and `auto`.
   """
@@ -562,10 +563,12 @@ defmodule InfluxElixir.Client.Local do
   def write(%{table: table, profile: profile} = conn, payload, opts \\ []) do
     with :ok <- require_capability(conn, :write),
          {:ok, database} <- resolve_database(opts, conn),
-         {:ok, text} <- maybe_decompress(payload),
+         # The engine's order (verified): the request's parameters, then
+         # the body, then the database.
          {:ok, precision} <- normalize_precision(Keyword.get(opts, :precision), profile),
          {:ok, accept_partial} <- write_flag(opts, :accept_partial, true, profile),
          {:ok, _no_sync} <- write_flag(opts, :no_sync, false, profile),
+         {:ok, text} <- Body.read(payload, Keyword.get(opts, :gzip, false) == true, profile),
          :ok <- ensure_database(table, database, profile) do
       case text
            |> LineProtocolParser.parse_lines(precision, dialect(profile))
@@ -1576,7 +1579,7 @@ defmodule InfluxElixir.Client.Local do
         ) :: :ok | {:error, term()}
   def create_database(%{table: table} = conn, name, opts \\ []) do
     with :ok <- require_capability(conn, :create_database),
-         :ok <- check_retention(Keyword.get(opts, :retention)),
+         :ok <- check_retention(Keyword.get(opts, :retention), name),
          :ok <- DatabaseRules.check_new(name, Store.databases(table), conn.profile) do
       Store.put_database(table, name)
       :ok
@@ -1587,39 +1590,48 @@ defmodule InfluxElixir.Client.Local do
   # string it reads before anything else in the request (verified against
   # InfluxDB 3 Core): one or more `<number><unit>` parts, optionally
   # spaced, a fraction allowed (`1.5h`), units case-sensitive (`M` months,
-  # `m` minutes), or a bare `0`. Anything else is its 400, without the
-  # `at line 1 column N` its JSON parser appends. The double stores no
-  # retention: nothing expires.
+  # `m` minutes), or a bare `0`. Anything else is its 400, ending in the
+  # `at line 1 column N` its JSON parser appends: the byte just before the
+  # closing brace of the body `Client.HTTP` sends (verified). The double
+  # stores no retention: nothing expires.
   @duration_units ~w(nanos nsec ns usec us µs millis msec ms seconds second secs sec s
                      minutes minute mins min m hours hour hrs hr h days day d weeks week w
                      months month M years year y)
   @duration ~r/^\s*(?:0|(?:\d+(?:\.\d+)?\s*(?:#{Enum.join(@duration_units, "|")})\s*)+)\s*$/u
 
-  @spec check_retention(term()) :: :ok | {:error, map()}
-  defp check_retention(nil), do: :ok
+  @spec check_retention(term(), binary()) :: :ok | {:error, map()}
+  defp check_retention(nil, _name), do: :ok
 
-  defp check_retention(retention) when is_boolean(retention),
-    do: retention_error("invalid type: boolean `#{retention}`")
+  defp check_retention(retention, name) when is_boolean(retention),
+    do: retention_error("invalid type: boolean `#{retention}`", retention, name)
 
-  defp check_retention(retention) when is_binary(retention) or is_atom(retention) do
+  defp check_retention(retention, name) when is_binary(retention) or is_atom(retention) do
     text = to_string(retention)
 
     if Regex.match?(@duration, text),
       do: :ok,
-      else: retention_error(~s|invalid value: string "#{text}"|)
+      else: retention_error(~s|invalid value: string "#{text}"|, retention, name)
   end
 
-  defp check_retention(retention) when is_integer(retention),
-    do: retention_error("invalid type: integer `#{retention}`")
+  defp check_retention(retention, name) when is_integer(retention),
+    do: retention_error("invalid type: integer `#{retention}`", retention, name)
 
-  defp check_retention(retention) when is_float(retention),
-    do: retention_error("invalid type: floating point `#{retention}`")
+  defp check_retention(retention, name) when is_float(retention),
+    do: retention_error("invalid type: floating point `#{retention}`", retention, name)
 
-  defp check_retention(retention), do: retention_error("invalid type: `#{inspect(retention)}`")
+  defp check_retention(retention, name),
+    do: retention_error("invalid type: `#{inspect(retention)}`", retention, name)
 
-  @spec retention_error(binary()) :: {:error, map()}
-  defp retention_error(what),
-    do: {:error, %{status: 400, body: "serde json error: #{what}, expected a duration"}}
+  @spec retention_error(binary(), term(), binary()) :: {:error, map()}
+  defp retention_error(what, retention, name) do
+    position =
+      case Jason.encode(%{"db" => name, "retention_period" => retention}) do
+        {:ok, body} -> " at line 1 column #{byte_size(body) - 1}"
+        {:error, _unencodable} -> ""
+      end
+
+    {:error, %{status: 400, body: "serde json error: #{what}, expected a duration" <> position}}
+  end
 
   @doc """
   Returns the databases as maps with a single `"name"` key, sorted, with
@@ -1872,19 +1884,6 @@ defmodule InfluxElixir.Client.Local do
       do: {:ok, Store.points(table, database, measurement)},
       else: :error
   end
-
-  # ---------------------------------------------------------------------------
-  # Private — gzip decompression
-  # ---------------------------------------------------------------------------
-
-  @spec maybe_decompress(binary()) :: {:ok, binary()} | {:error, map()}
-  defp maybe_decompress(<<@gzip_magic, _rest::binary>> = compressed) do
-    {:ok, :zlib.gunzip(compressed)}
-  rescue
-    _err -> {:error, %{status: 400, body: "invalid gzip payload"}}
-  end
-
-  defp maybe_decompress(plain), do: {:ok, plain}
 
   # ---------------------------------------------------------------------------
   # Private — utilities

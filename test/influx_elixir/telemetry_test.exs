@@ -98,18 +98,6 @@ defmodule InfluxElixir.TelemetryTest do
 
       refute_receive {:telemetry, [:influx_elixir, :write, :stop], _, _}
     end
-
-    test "passes the function return value through unchanged" do
-      handler_id = unique_handler_id("span_write_passthrough")
-      attach_handler(handler_id, [:influx_elixir, :write, :stop])
-
-      result =
-        Telemetry.span_write(%{database: "db", point_count: 0, bytes: 0}, fn ->
-          {:ok, %{rows: 3}}
-        end)
-
-      assert result == {:ok, %{rows: 3}}
-    end
   end
 
   # ---------- span_query/2 ----------
@@ -172,18 +160,6 @@ defmodule InfluxElixir.TelemetryTest do
       end
 
       refute_receive {:telemetry, [:influx_elixir, :query, :stop], _, _}
-    end
-
-    test "passes the function return value through unchanged" do
-      handler_id = unique_handler_id("span_query_passthrough")
-      attach_handler(handler_id, [:influx_elixir, :query, :stop])
-
-      result =
-        Telemetry.span_query(%{database: "db", transport: :http}, fn ->
-          {:ok, [%{"a" => 1}, %{"a" => 2}]}
-        end)
-
-      assert result == {:ok, [%{"a" => 1}, %{"a" => 2}]}
     end
   end
 

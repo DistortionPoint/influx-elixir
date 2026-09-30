@@ -119,6 +119,8 @@ defmodule InfluxElixir do
     * `:no_sync` — InfluxDB 3 only. `true` acknowledges the write before
       it is persisted to the write-ahead log: faster, and a query right
       after it may not see the points yet (verified).
+    * `:gzip` — `true` compresses every payload, `false` none; by default
+      only payloads over 1 KB (see `InfluxElixir.Write.Writer.write/3`).
   """
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()

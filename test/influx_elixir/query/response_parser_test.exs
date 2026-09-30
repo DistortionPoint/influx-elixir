@@ -61,7 +61,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
     end
   end
 
-  describe "parse/2 with :csv format" do
+  describe "parse/2 with :csv format (InfluxDB 3)" do
     test "parses plain CSV with a header row, cells stay strings" do
       body = "name,value\ncpu,0.64\nmem,0.85"
 
@@ -73,71 +73,18 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       assert {:ok, []} = ResponseParser.parse("", :csv)
     end
 
-    test "parses Flux annotated CSV: CRLF, multiple tables, quoted cells, typed columns" do
-      # Captured verbatim from InfluxDB 2.7 with dialect annotations: ["datatype"].
-      body =
-        "#datatype,string,long,dateTime:RFC3339,string,string,string,string\r\n" <>
-          ",result,table,_time,_value,_field,_measurement,host\r\n" <>
-          ",_result,0,2023-11-14T22:13:20Z,\"x, y\",label,probe_flux,a\r\n" <>
-          "\r\n" <>
-          "#datatype,string,long,dateTime:RFC3339,double,string,string,string\r\n" <>
-          ",result,table,_time,_value,_field,_measurement,host\r\n" <>
-          ",_result,1,2023-11-14T22:13:20Z,42.5,value,probe_flux,a\r\n" <>
-          "\r\n"
+    test "a one-column row that is null or empty is a row, not a table separator" do
+      # `SELECT host FROM t` from InfluxDB 3 Core, verbatim: the engine
+      # writes the null `host` as `""`. The row was dropped and "b" read as
+      # a header, so the answer was one row instead of four.
+      body = "host\na\n\"\"\nb\nc\n"
 
-      assert {:ok, [label_row, value_row]} = ResponseParser.parse(body, :csv)
-
-      assert %{"table" => 0, "_value" => "x, y", "_field" => "label", "host" => "a"} = label_row
-      assert %{"table" => 1, "_value" => 42.5, "_field" => "value"} = value_row
-      assert value_row["_time"] == ~U[2023-11-14 22:13:20.000000Z]
-      refute Map.has_key?(value_row, "")
-    end
-
-    test "a newline inside a quoted value comes back as the \\n it was stored as" do
-      # InfluxDB 2's CSV writer turns "\n" in a value into "\r\n" (verified:
-      # the stored `s="l1\nl2"` arrives as "l1\r\nl2" on the wire).
-      body = "#datatype,string,long,string\r\n,result,table,s\r\n,_result,0,\"l1\r\nl2\"\r\n\r\n"
-
-      assert {:ok, [%{"s" => "l1\nl2", "table" => 0}]} = ResponseParser.parse(body, :csv)
-    end
-
-    test "other annotations without #datatype leave cells as strings" do
-      body = "#group,false,false\n,result,value\n,_result,42.5\n"
-
-      assert {:ok, [%{"result" => "_result", "value" => "42.5"}]} =
+      assert {:ok, [%{"host" => "a"}, %{}, %{"host" => "b"}, %{"host" => "c"}]} =
                ResponseParser.parse(body, :csv)
     end
 
-    test "a table with only annotation rows yields no rows" do
-      body = "#datatype,string,double\n\n,result,value\n,_result,1.5\n"
-      assert {:ok, [%{"value" => "1.5"}]} = ResponseParser.parse(body, :csv)
-    end
-
-    test "a typed cell that does not parse falls back to the raw string" do
-      body = "#datatype,string,double,long\n,result,ratio,count\n,_result,abc,1.5\n"
-      assert {:ok, [%{"ratio" => "abc", "count" => "1.5"}]} = ResponseParser.parse(body, :csv)
-    end
-
-    test "types long, unsignedLong and boolean columns" do
-      body =
-        "#datatype,string,long,unsignedLong,boolean\n" <>
-          ",result,count,ucount,flag\n" <>
-          ",_result,3,7,true\n"
-
-      assert {:ok, [%{"count" => 3, "ucount" => 7, "flag" => true}]} =
-               ResponseParser.parse(body, :csv)
-    end
-
-    test "an empty Flux cell is absent from the row, as a null column is in JSON" do
-      # A v2 pivot leaves a field the row lacks empty; an empty string
-      # field is an empty cell too (verified).
-      body =
-        "#datatype,string,long,string,double,double\r\n" <>
-          ",result,table,s,x,y\r\n" <>
-          ",_result,0,,1,\r\n"
-
-      assert {:ok, [row]} = ResponseParser.parse(body, :csv)
-      assert row == %{"result" => "_result", "table" => 0, "x" => 1.0}
+    test "a column named like an annotation is a column" do
+      assert {:ok, [%{"#tag" => "x"}]} = ResponseParser.parse("#tag\nx\n", :csv)
     end
 
     test "InfluxDB 3's CSV has no annotations: values are strings, empty cells absent" do
@@ -155,6 +102,81 @@ defmodule InfluxElixir.Query.ResponseParserTest do
              }
 
       refute Map.has_key?(second, "b")
+    end
+  end
+
+  describe "parse/2 with :flux_csv format (InfluxDB 2)" do
+    test "returns empty list for empty body" do
+      assert {:ok, []} = ResponseParser.parse("", :flux_csv)
+    end
+
+    test "parses Flux annotated CSV: CRLF, multiple tables, quoted cells, typed columns" do
+      # Captured verbatim from InfluxDB 2.7 with dialect annotations: ["datatype"].
+      body =
+        "#datatype,string,long,dateTime:RFC3339,string,string,string,string\r\n" <>
+          ",result,table,_time,_value,_field,_measurement,host\r\n" <>
+          ",_result,0,2023-11-14T22:13:20Z,\"x, y\",label,probe_flux,a\r\n" <>
+          "\r\n" <>
+          "#datatype,string,long,dateTime:RFC3339,double,string,string,string\r\n" <>
+          ",result,table,_time,_value,_field,_measurement,host\r\n" <>
+          ",_result,1,2023-11-14T22:13:20Z,42.5,value,probe_flux,a\r\n" <>
+          "\r\n"
+
+      assert {:ok, [label_row, value_row]} = ResponseParser.parse(body, :flux_csv)
+
+      assert %{"table" => 0, "_value" => "x, y", "_field" => "label", "host" => "a"} = label_row
+      assert %{"table" => 1, "_value" => 42.5, "_field" => "value"} = value_row
+      assert value_row["_time"] == ~U[2023-11-14 22:13:20.000000Z]
+      refute Map.has_key?(value_row, "")
+    end
+
+    test "a newline inside a quoted value comes back as the \\n it was stored as" do
+      # InfluxDB 2's CSV writer turns "\n" in a value into "\r\n" (verified:
+      # the stored `s="l1\nl2"` arrives as "l1\r\nl2" on the wire).
+      body = "#datatype,string,long,string\r\n,result,table,s\r\n,_result,0,\"l1\r\nl2\"\r\n\r\n"
+
+      assert {:ok, [%{"s" => "l1\nl2", "table" => 0}]} = ResponseParser.parse(body, :flux_csv)
+    end
+
+    test "other annotations without #datatype leave cells as strings" do
+      body = "#group,false,false\n,result,value\n,_result,42.5\n"
+
+      assert {:ok, [%{"result" => "_result", "value" => "42.5"}]} =
+               ResponseParser.parse(body, :flux_csv)
+    end
+
+    test "a table with only annotation rows yields no rows" do
+      body = "#datatype,string,double\n\n,result,value\n,_result,1.5\n"
+      assert {:ok, [%{"value" => "1.5"}]} = ResponseParser.parse(body, :flux_csv)
+    end
+
+    test "a typed cell that does not parse falls back to the raw string" do
+      body = "#datatype,string,double,long\n,result,ratio,count\n,_result,abc,1.5\n"
+
+      assert {:ok, [%{"ratio" => "abc", "count" => "1.5"}]} =
+               ResponseParser.parse(body, :flux_csv)
+    end
+
+    test "types long, unsignedLong and boolean columns" do
+      body =
+        "#datatype,string,long,unsignedLong,boolean\n" <>
+          ",result,count,ucount,flag\n" <>
+          ",_result,3,7,true\n"
+
+      assert {:ok, [%{"count" => 3, "ucount" => 7, "flag" => true}]} =
+               ResponseParser.parse(body, :flux_csv)
+    end
+
+    test "an empty Flux cell is absent from the row, as a null column is in JSON" do
+      # A v2 pivot leaves a field the row lacks empty; an empty string
+      # field is an empty cell too (verified).
+      body =
+        "#datatype,string,long,string,double,double\r\n" <>
+          ",result,table,s,x,y\r\n" <>
+          ",_result,0,,1,\r\n"
+
+      assert {:ok, [row]} = ResponseParser.parse(body, :flux_csv)
+      assert row == %{"result" => "_result", "table" => 0, "x" => 1.0}
     end
   end
 

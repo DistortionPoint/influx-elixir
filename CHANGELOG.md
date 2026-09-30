@@ -42,6 +42,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   merged and the last write winning. The double stamped each line
   separately and kept them as separate rows. Tests that wrote several
   untimed points of one series and counted rows now write timestamps.
+- **`BatchWriter` stopped flushing on its timer after any other flush.**
+  A flush at `batch_size`, an explicit `flush/2`, or a `write_sync/3`
+  cancelled the interval timer, and nothing restarted it. Points written
+  afterwards sat in the buffer until the next full batch or shutdown.
+  Every flush now restarts the interval.
+- **Killing one connection's supervisor took every connection down.**
+  The restart found the killed supervisor's Finch pool and writer still
+  registered, failed with `:already_started`, and the repeated failures
+  stopped `InfluxElixir.Supervisor`. The restart now waits for those
+  names to be released.
+- **`query_sql(..., format: :csv)` lost rows of a one-column result.**
+  InfluxDB 3 writes a null or empty one-column row as `""`. The parser
+  took that for a table separator, dropped the row and read the next one
+  as a header. InfluxDB 3's CSV is now parsed as the single table it is.
+  `ResponseParser.parse/2` takes `:flux_csv` for InfluxDB 2's annotated
+  CSV, which `query_flux` uses.
+- **`gzip: true` on a write sent an uncompressed body under a gzip
+  header.** The server refused it with `error decoding gzip stream`.
+  `Writer` now compresses whenever `gzip: true` is given, and never when
+  `gzip: false` is.
+- **`execute_sql` over HTTP dropped `params:`.** A `$name` placeholder
+  was the server's 400 `No value found for placeholder`.
+  `Client.Local` bound it, so tests passed.
+- **`database: nil` over HTTP overrode the connection's default
+  database** and failed with `:no_database_specified`. `Client.Local` and
+  the telemetry metadata already treated it as no database given.
+- **HTTP admin calls returned a bare `Jason.DecodeError`** for a body
+  that is not JSON. They now return `{:json_parse_error, reason}`, as
+  queries do. `list_databases` returns `{:unexpected_response, body}` for
+  JSON that is not a list, instead of raising.
+- **`Client.Local` read a write body by its bytes, not by `gzip:`.**
+  InfluxDB decompresses exactly when it is told to. Verified against
+  InfluxDB 3 Core and 2.7:
+  - A gzip body without `gzip: true` was stored by the double and refused
+    by the server.
+  - A plain body with `gzip: true` was stored by the double and refused
+    by the server.
+  - InfluxDB 3 refuses a body that is not UTF-8. The double stored it.
+
+  The double now does all three as the engines do, with the engines' own
+  error bodies. InfluxDB 3's database retention error now carries the
+  server's `at line 1 column N` suffix.
+- The `Admin.*` moduledocs claimed a telemetry span that admin calls do
+  not emit. `Config` called `:token` required, but it is optional.
+
+### Changed
+- **Line protocol encoding is about 6x faster.** 10,000 tagged points
+  now take 30 ms instead of 191 ms. The encoder no longer runs four
+  string replacements on every name: it scans each name once and escapes
+  only when needed, and it builds lines as iodata. The output is
+  unchanged.
 
 ## [0.1.36] - 2026-09-30
 

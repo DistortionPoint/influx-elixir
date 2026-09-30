@@ -1,7 +1,7 @@
 defmodule InfluxElixir.Query.ResponseParser do
   @moduledoc """
-  Parses InfluxDB query responses in JSON, JSONL, and Flux annotated CSV
-  formats, and passes Parquet bodies through untouched.
+  Parses InfluxDB query responses in JSON, JSONL, InfluxDB 3 CSV and Flux
+  annotated CSV formats, and passes Parquet bodies through untouched.
 
   ## Type Coercion
 
@@ -14,11 +14,13 @@ defmodule InfluxElixir.Query.ResponseParser do
       it. A *string field* holding exactly that zone-less shape is decoded
       too — store zoned RFC3339 strings if the distinction matters.
     * JSON / JSONL numbers and booleans keep the types Jason decodes
-    * CSV cells are typed from the Flux `#datatype` annotation row when the
+    * Flux CSV cells are typed from the `#datatype` annotation row when the
       query requested one (`double`, `long`, `unsignedLong`, `boolean`,
-      `dateTime:RFC3339[Nano]`); without it (InfluxDB 3's `format: :csv`)
-      every cell stays a string. An empty cell is left out of the row, as a
-      null column is in JSON: CSV writes a null and an empty string alike.
+      `dateTime:RFC3339[Nano]`); InfluxDB 3's `format: :csv` has no
+      annotations, so every cell stays a string. An empty cell is left out
+      of the row, as a null column is in JSON: CSV writes a null and an
+      empty string alike (InfluxDB 3 writes a one-column row's as `""`,
+      an empty line to the parser, and that row is `%{}`).
       A newline inside a value is restored: InfluxDB 2's CSV writer sends
       it as `\\r\\n`
   """
@@ -33,7 +35,10 @@ defmodule InfluxElixir.Query.ResponseParser do
   ## Parameters
 
     * `body` - response body binary
-    * `format` - one of `:json`, `:jsonl`, `:csv`, `:parquet`
+    * `format` - one of `:json`, `:jsonl`, `:csv` (InfluxDB 3: one header
+      row, then one line per row), `:flux_csv` (InfluxDB 2's annotated CSV:
+      tables separated by an empty line, each with its own header),
+      `:parquet`
 
   ## Returns
 
@@ -68,6 +73,8 @@ defmodule InfluxElixir.Query.ResponseParser do
   end
 
   def parse(body, :csv), do: {:ok, parse_csv(body)}
+
+  def parse(body, :flux_csv), do: {:ok, parse_flux_csv(body)}
 
   def parse(body, :parquet), do: {:ok, body}
 
@@ -144,12 +151,31 @@ defmodule InfluxElixir.Query.ResponseParser do
   def microsecond_precision(%DateTime{microsecond: {us, _precision}} = dt),
     do: %{dt | microsecond: {us, 6}}
 
+  # InfluxDB 3's CSV is one table: a header row, then one line per row.
+  # Every line after the header is a row, even one that reads as empty:
+  # the engine writes a one-column row whose value is null or "" as `""`
+  # (verified), which NimbleCSV reads as `[""]` — it used to be taken for
+  # a table separator, dropping that row and reading the next as a header.
+  @spec parse_csv(binary()) :: [map()]
+  defp parse_csv(body) do
+    case CSV.parse_string(body, skip_headers: false) do
+      [header | rows] ->
+        columns = Enum.map(header, &{&1, nil})
+        Enum.map(rows, &csv_row(columns, &1))
+
+      [] ->
+        []
+    end
+  end
+
   # Flux annotated CSV: tables are separated by an empty line; each table
   # starts with optional `#`-prefixed annotation rows, then a header row.
   # The first column is the annotation column (empty header) and is dropped.
+  # A Flux row always has that column and `result` and `table`, so a line
+  # that reads as `[""]` is only ever a separator here.
   # Lines end in CRLF and cells may be quoted — NimbleCSV handles both.
-  @spec parse_csv(binary()) :: [map()]
-  defp parse_csv(body) do
+  @spec parse_flux_csv(binary()) :: [map()]
+  defp parse_flux_csv(body) do
     body
     |> CSV.parse_string(skip_headers: false)
     |> Enum.chunk_by(&blank_row?/1)

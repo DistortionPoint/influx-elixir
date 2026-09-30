@@ -15,9 +15,10 @@ defmodule InfluxElixir.Write.Writer do
   @doc """
   Writes line protocol binary to InfluxDB via the configured client.
 
-  Automatically gzips payloads larger than #{@gzip_threshold} bytes by
-  prepending `{:gzip, true}` to opts so that the HTTP client can set
-  the appropriate `Content-Encoding: gzip` header.
+  Gzips payloads larger than #{@gzip_threshold} bytes, and passes
+  `gzip: true` to the client exactly when it has compressed the payload,
+  so the HTTP client's `Content-Encoding: gzip` header always matches the
+  body.
 
   ## Parameters
 
@@ -26,6 +27,11 @@ defmodule InfluxElixir.Write.Writer do
     * `opts` - keyword options forwarded to the client, plus:
       * `:client` - client module to use instead of the configured one
         (`InfluxElixir.Client.impl/0`). Not forwarded to the client.
+      * `:gzip` - `true` compresses the payload whatever its size, `false`
+        never does; by default only payloads over #{@gzip_threshold} bytes
+        are. An explicit `true` used to reach the client with the payload
+        uncompressed, and the server refused the header
+        (`error decoding gzip stream`, verified).
 
   ## Returns
 
@@ -42,7 +48,8 @@ defmodule InfluxElixir.Write.Writer do
           InfluxElixir.Client.write_result()
   def write(connection, line_protocol, opts \\ []) do
     {client, opts} = Keyword.pop(opts, :client, InfluxElixir.Client.impl())
-    {payload, write_opts} = maybe_gzip(line_protocol, opts)
+    {gzip, opts} = Keyword.pop(opts, :gzip)
+    {payload, write_opts} = maybe_gzip(line_protocol, gzip, opts)
 
     metadata = %{
       database: Keyword.get(opts, :database) || connection_database(connection),
@@ -59,13 +66,12 @@ defmodule InfluxElixir.Write.Writer do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  @spec maybe_gzip(binary(), keyword()) :: {binary(), keyword()}
-  defp maybe_gzip(payload, opts) when byte_size(payload) > @gzip_threshold do
-    compressed = :zlib.gzip(payload)
-    {compressed, Keyword.put(opts, :gzip, true)}
-  end
+  @spec maybe_gzip(binary(), boolean() | nil, keyword()) :: {binary(), keyword()}
+  defp maybe_gzip(payload, gzip, opts)
+       when gzip == true or (gzip == nil and byte_size(payload) > @gzip_threshold),
+       do: {:zlib.gzip(payload), Keyword.put(opts, :gzip, true)}
 
-  defp maybe_gzip(payload, opts), do: {payload, opts}
+  defp maybe_gzip(payload, _gzip, opts), do: {payload, opts}
 
   # The connection is a keyword list (HTTP) or a map (Local); Access reads
   # the connection-level default database from either.

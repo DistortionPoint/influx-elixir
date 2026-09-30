@@ -3,8 +3,8 @@ defmodule InfluxElixir.Admin.Tokens do
   v3 token management via `/api/v3/configure/token`.
 
   Each function is the `InfluxElixir` facade function of the same operation:
-  it takes a connection or a connection name, and queries emit the same
-  telemetry span.
+  it takes a connection or a connection name. Admin operations emit no
+  telemetry span; only writes and queries do (see `InfluxElixir.Telemetry`).
 
   Use this module to create and delete API tokens in InfluxDB v3.
 

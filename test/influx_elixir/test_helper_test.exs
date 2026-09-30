@@ -16,9 +16,15 @@ defmodule InfluxElixir.TestHelperTest do
       assert {:ok, [%{"value" => 1.0}]} = InfluxElixir.query_sql(conn, "SELECT * FROM cpu")
     end
 
-    test "each test gets its own isolated instance", %{conn: conn} do
-      # Nothing written by the previous test is visible here.
-      assert {:error, %{status: 400}} = InfluxElixir.query_sql(conn, "SELECT * FROM cpu")
+    test "each setup gets its own isolated instance", %{conn: conn} do
+      {:ok, :written} = InfluxElixir.write(conn, "cpu value=1.0")
+
+      {:ok, conn: other} = setup_influx(databases: ["helper_db"], database: "helper_db")
+
+      assert {:error, %{status: 400, body: "Error during planning: table " <> _rest}} =
+               InfluxElixir.query_sql(other, "SELECT * FROM cpu")
+
+      assert {:ok, [%{"value" => 1.0}]} = InfluxElixir.query_sql(conn, "SELECT * FROM cpu")
     end
 
     test "passes :profile through" do

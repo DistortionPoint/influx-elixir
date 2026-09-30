@@ -102,7 +102,11 @@ defmodule InfluxElixir.Write.LineProtocol do
   @spec encode(Point.t() | [Point.t()], keyword()) :: encode_result()
   def encode(point_or_points, opts \\ [])
 
-  def encode(%Point{} = point, opts), do: encode_point(point, timestamp_divisor(opts))
+  def encode(%Point{} = point, opts) do
+    with {:ok, line} <- encode_point(point, timestamp_divisor(opts)) do
+      {:ok, IO.iodata_to_binary(line)}
+    end
+  end
 
   def encode(points, opts) when is_list(points) do
     divisor = timestamp_divisor(opts)
@@ -115,8 +119,11 @@ defmodule InfluxElixir.Write.LineProtocol do
       end
     end)
     |> case do
-      {:ok, lines} -> {:ok, lines |> Enum.reverse() |> Enum.join("\n")}
-      {:error, reason} -> {:error, reason}
+      {:ok, lines} ->
+        {:ok, lines |> Enum.reverse() |> Enum.intersperse(?\n) |> IO.iodata_to_binary()}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -156,7 +163,7 @@ defmodule InfluxElixir.Write.LineProtocol do
     end
   end
 
-  @spec encode_point(Point.t(), pos_integer()) :: encode_result()
+  @spec encode_point(Point.t(), pos_integer()) :: {:ok, iodata()} | {:error, term()}
   defp encode_point(
          %Point{measurement: measurement, tags: tags, fields: fields, timestamp: ts},
          divisor
@@ -166,15 +173,8 @@ defmodule InfluxElixir.Write.LineProtocol do
          {:ok, tags_str} <- encode_tags(tags),
          {:ok, fields_str} <- encode_fields(fields),
          {:ok, timestamp_str} <- encode_timestamp(ts, divisor) do
-      line =
-        case {tags_str, timestamp_str} do
-          {"", ""} -> "#{measurement_str} #{fields_str}"
-          {"", ts_str} -> "#{measurement_str} #{fields_str} #{ts_str}"
-          {t, ""} -> "#{measurement_str},#{t} #{fields_str}"
-          {t, ts_str} -> "#{measurement_str},#{t} #{fields_str} #{ts_str}"
-        end
-
-      {:ok, line}
+      # iodata: the caller makes one binary of the line (or the batch).
+      {:ok, [measurement_str, tags_str, ?\s, fields_str | timestamp_str]}
     end
   end
 
@@ -198,20 +198,15 @@ defmodule InfluxElixir.Write.LineProtocol do
 
   defp encode_measurement(name) do
     if name?(name) and not String.starts_with?(name, "#") do
-      escaped =
-        name
-        |> String.replace("\\", "\\\\")
-        |> String.replace(",", "\\,")
-        |> String.replace(" ", "\\ ")
-
-      {:ok, escaped}
+      {:ok, escape(name, :measurement)}
     else
       {:error, {:invalid_measurement, name}}
     end
   end
 
-  @spec encode_tags(%{String.t() => String.t()}) :: {:ok, binary()} | {:error, term()}
-  defp encode_tags(tags) when map_size(tags) == 0, do: {:ok, ""}
+  # `,k=v` for each tag, sorted by key, or `[]` without tags.
+  @spec encode_tags(%{String.t() => String.t()}) :: {:ok, iodata()} | {:error, term()}
+  defp encode_tags(tags) when map_size(tags) == 0, do: {:ok, []}
 
   defp encode_tags(tags) do
     tags
@@ -223,24 +218,24 @@ defmodule InfluxElixir.Write.LineProtocol do
       end
     end)
     |> case do
-      {:ok, pairs} -> {:ok, pairs |> Enum.reverse() |> Enum.join(",")}
+      {:ok, pairs} -> {:ok, Enum.reverse(pairs)}
       {:error, _reason} = error -> error
     end
   end
 
-  @spec encode_tag(term(), term()) :: {:ok, binary()} | {:error, term()}
+  @spec encode_tag(term(), term()) :: {:ok, iodata()} | {:error, term()}
   defp encode_tag("time", _value), do: {:error, {:reserved_tag_key, "time"}}
 
   defp encode_tag(key, value) do
     cond do
       not name?(key) -> {:error, {:invalid_tag_key, key}}
       not name?(value) -> {:error, {:invalid_tag_value, key, value}}
-      true -> {:ok, "#{escape_tag_key(key)}=#{escape_tag_value(value)}"}
+      true -> {:ok, [?,, escape(key, :name), ?=, escape(value, :name)]}
     end
   end
 
   @spec encode_fields(%{String.t() => Point.field_value()}) ::
-          {:ok, binary()} | {:error, term()}
+          {:ok, iodata()} | {:error, term()}
   defp encode_fields(fields) do
     fields
     |> Enum.reduce_while({:ok, []}, fn {k, v}, {:ok, acc} ->
@@ -250,17 +245,17 @@ defmodule InfluxElixir.Write.LineProtocol do
       end
     end)
     |> case do
-      {:ok, pairs} -> {:ok, pairs |> Enum.reverse() |> Enum.join(",")}
+      {:ok, pairs} -> {:ok, pairs |> Enum.reverse() |> Enum.intersperse(?,)}
       {:error, _reason} = error -> error
     end
   end
 
-  @spec encode_field(term(), term()) :: {:ok, binary()} | {:error, term()}
+  @spec encode_field(term(), term()) :: {:ok, iodata()} | {:error, term()}
   defp encode_field(key, value) do
     cond do
       not name?(key) -> {:error, {:invalid_field_key, key}}
       not field_value?(value) -> {:error, {:invalid_field_value, key, value}}
-      true -> {:ok, "#{escape_field_key(key)}=#{encode_field_value(value)}"}
+      true -> {:ok, [escape(key, :name), ?=, encode_field_value(value)]}
     end
   end
 
@@ -271,41 +266,59 @@ defmodule InfluxElixir.Write.LineProtocol do
   defp field_value?(value) when is_integer(value), do: value in @int64_min..@int64_max
   defp field_value?(value), do: is_float(value) or is_binary(value) or is_boolean(value)
 
+  # ` <timestamp>`, or `[]` without one.
   @spec encode_timestamp(DateTime.t() | integer() | nil, pos_integer()) ::
-          {:ok, binary()} | {:error, term()}
-  defp encode_timestamp(nil, _divisor), do: {:ok, ""}
+          {:ok, iodata()} | {:error, term()}
+  defp encode_timestamp(nil, _divisor), do: {:ok, []}
 
   # Truncated toward the past, so a timestamp never moves forward.
   defp encode_timestamp(%DateTime{} = dt, divisor),
     do:
       {:ok,
-       dt |> DateTime.to_unix(:nanosecond) |> Integer.floor_div(divisor) |> Integer.to_string()}
+       [
+         ?\s,
+         dt
+         |> DateTime.to_unix(:nanosecond)
+         |> Integer.floor_div(divisor)
+         |> Integer.to_string()
+       ]}
 
-  defp encode_timestamp(ts, _divisor) when is_integer(ts), do: {:ok, Integer.to_string(ts)}
+  defp encode_timestamp(ts, _divisor) when is_integer(ts),
+    do: {:ok, [?\s, Integer.to_string(ts)]}
+
   defp encode_timestamp(ts, _divisor), do: {:error, {:invalid_timestamp, ts}}
 
-  # Tag key escaping: spaces, commas, equals, backslashes
-  @spec escape_tag_key(String.t()) :: binary()
-  defp escape_tag_key(str) do
-    str
-    |> String.replace("\\", "\\\\")
-    |> String.replace(",", "\\,")
-    |> String.replace("=", "\\=")
-    |> String.replace(" ", "\\ ")
+  # The bytes each kind of text backslash-escapes: tag keys, tag values and
+  # field keys (`:name`), measurements, and string field values. All ASCII,
+  # so no byte of a multi-byte UTF-8 character can match.
+  @escapes [name: ~c"\\,= ", measurement: ~c"\\, ", string: ~c"\\\""]
+
+  @typep escape_kind :: :name | :measurement | :string
+
+  # Most text needs no escape: one byte scan returns it as it is.
+  @spec escape(binary(), escape_kind()) :: binary()
+  defp escape(str, kind) do
+    if clean?(str, kind),
+      do: str,
+      else: for(<<byte <- str>>, into: "", do: escape_byte(byte, kind))
   end
 
-  # Tag value escaping: same as tag key
-  @spec escape_tag_value(String.t()) :: binary()
-  defp escape_tag_value(str), do: escape_tag_key(str)
+  @spec clean?(binary(), escape_kind()) :: boolean()
+  @spec escape_byte(byte(), escape_kind()) :: binary()
+  for {kind, bytes} <- @escapes do
+    defp clean?(<<byte, _rest::binary>>, unquote(kind)) when byte in unquote(bytes), do: false
+    defp escape_byte(byte, unquote(kind)) when byte in unquote(bytes), do: <<?\\, byte>>
+  end
 
-  # Field key escaping: same as tag key
-  @spec escape_field_key(String.t()) :: binary()
-  defp escape_field_key(str), do: escape_tag_key(str)
+  defp clean?(<<_byte, rest::binary>>, kind), do: clean?(rest, kind)
+  defp clean?(<<>>, _kind), do: true
+
+  defp escape_byte(byte, _kind), do: <<byte>>
 
   # Field value encoding by type
-  @spec encode_field_value(Point.field_value()) :: binary()
+  @spec encode_field_value(Point.field_value()) :: iodata()
   defp encode_field_value(value) when is_integer(value) do
-    "#{value}i"
+    [Integer.to_string(value), ?i]
   end
 
   # `:short` is the shortest representation that round-trips exactly and
@@ -316,12 +329,7 @@ defmodule InfluxElixir.Write.LineProtocol do
   end
 
   defp encode_field_value(value) when is_binary(value) do
-    escaped =
-      value
-      |> String.replace("\\", "\\\\")
-      |> String.replace("\"", "\\\"")
-
-    "\"#{escaped}\""
+    [?", escape(value, :string), ?"]
   end
 
   defp encode_field_value(true), do: "true"

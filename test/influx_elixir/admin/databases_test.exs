@@ -19,10 +19,25 @@ defmodule InfluxElixir.Admin.DatabasesTest do
       assert "new_db" in Enum.map(dbs, & &1["name"])
     end
 
-    test "accepts a retention duration string", %{conn: conn} do
+    test "a valid retention duration is accepted and the database is created", %{conn: conn} do
+      # Local validates the duration but keeps no retention, so none is observable.
       assert :ok = Databases.create(conn, "kept", retention: "30d")
       assert {:ok, dbs} = Databases.list(conn)
       assert %{"name" => "kept"} in dbs
+    end
+
+    test "an unreadable retention duration is the engine's 400 and creates nothing", %{conn: conn} do
+      assert {:error,
+              %{
+                status: 400,
+                body:
+                  ~s|serde json error: invalid value: string "soon", expected a duration | <>
+                    "at line 1 column 39"
+              }} =
+               Databases.create(conn, "never", retention: "soon")
+
+      assert {:ok, dbs} = Databases.list(conn)
+      refute %{"name" => "never"} in dbs
     end
   end
 

@@ -11,11 +11,6 @@ defmodule InfluxElixir.Query.SQLStreamTest do
   end
 
   describe "stream/3" do
-    test "returns an enumerable", %{conn: conn} do
-      stream = SQLStream.stream(conn, "SELECT * FROM cpu")
-      assert Enumerable.impl_for(stream)
-    end
-
     test "can be consumed with Enum.to_list", %{conn: conn} do
       Local.write(conn, "cpu value=1i 1\ncpu value=2i 2", database: "test_db")
 

@@ -158,6 +158,16 @@ defmodule InfluxElixir.Write.LineProtocolTest do
       assert {:ok, lp} = LineProtocol.encode(point)
       assert lp =~ ~s(path="C:\\\\Users")
     end
+
+    test "each kind of text escapes only its own bytes, beside multi-byte characters" do
+      point =
+        Point.new("m=é, ü", %{"f é=, k" => ~s(v é,= "q" \\ x)}, tags: %{"t é=, k" => "v ü=, x"})
+
+      assert {:ok, lp} = LineProtocol.encode(point)
+
+      assert lp ==
+               ~S(m=é\,\ ü,t\ é\=\,\ k=v\ ü\=\,\ x f\ é\=\,\ k="v é,= \"q\" \\ x")
+    end
   end
 
   describe "encode/1 — field types" do

@@ -124,31 +124,18 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert length(stored(conn, "cpu")) == 2
     end
 
-    test "GenServer.call timeout fires when the wait bound is exceeded",
-         %{conn: conn} do
-      # Spawn a writer with a queue of writes that the call-side cannot
-      # process before a 1ms timeout — verifies the bound is honoured
-      # rather than being capped by a hardcoded value.
+    test "the timeout arities bound the wait for the reply", %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 60_000)
-      :ok = BatchWriter.write(pid, "cpu value=1.0")
 
-      # GenServer.call with timeout: 0 will exit with :timeout if the
-      # handler doesn't reply within 0ms. We trap exits and verify.
-      Process.flag(:trap_exit, true)
-      caller = self()
+      # A suspended writer cannot reply, so each call must give up after
+      # exactly the timeout it was handed.
+      :ok = :sys.suspend(pid)
 
-      spawn_link(fn ->
-        result =
-          try do
-            BatchWriter.flush(pid, 0)
-          catch
-            :exit, reason -> {:exit, reason}
-          end
+      assert {:timeout, _reason} = catch_exit(BatchWriter.write(pid, "cpu value=1.0 1", 20))
+      assert {:timeout, _reason} = catch_exit(BatchWriter.flush(pid, 20))
+      assert {:timeout, _reason} = catch_exit(BatchWriter.write_sync(pid, "cpu value=2.0 2", 20))
 
-        send(caller, {:done, result})
-      end)
-
-      assert_receive {:done, {:exit, {:timeout, _}}}, 1_000
+      :ok = :sys.resume(pid)
     end
 
     test "forwards :write_opts to Writer.write/3 on flush" do
@@ -237,17 +224,65 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   end
 
   describe "timer-based flush" do
-    test "automatically flushes after flush_interval_ms", %{conn: conn} do
-      pid = start_writer(conn, flush_interval_ms: 10)
-      :ok = BatchWriter.write(pid, "cpu value=1.0")
+    for jitter_ms <- [0, 20] do
+      test "automatically flushes after flush_interval_ms with jitter_ms: #{jitter_ms}",
+           %{conn: conn} do
+        pid = start_writer(conn, flush_interval_ms: 10, jitter_ms: unquote(jitter_ms))
+        :ok = BatchWriter.write(pid, "cpu value=1.0")
 
-      wait_until(fn ->
-        {:ok, stats} = BatchWriter.stats(pid)
-        stats.total_writes >= 1
-      end)
+        wait_until(fn -> match?({:ok, %{total_writes: 1}}, BatchWriter.stats(pid)) end)
 
-      assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
-      assert row["value"] == 1.0
+        assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
+        assert row["value"] == 1.0
+      end
+    end
+
+    # Regression: do_flush/1 cancelled the timer and only the timer's own
+    # handler re-armed it, so after a size-triggered flush the interval flush
+    # never fired again and the next write stayed buffered.
+    test "the timer keeps flushing after a size-triggered flush", %{conn: conn} do
+      pid = start_writer(conn, batch_size: 2, flush_interval_ms: 50)
+
+      :ok = BatchWriter.write(pid, "cpu value=1.0 1")
+      :ok = BatchWriter.write(pid, "cpu value=2.0 2")
+      assert {:ok, %{total_writes: 1}} = BatchWriter.stats(pid)
+
+      :ok = BatchWriter.write(pid, "cpu value=3.0 3")
+      wait_until(fn -> match?({:ok, %{total_writes: 2}}, BatchWriter.stats(pid)) end)
+
+      bytes = byte_size("cpu value=1.0 1\ncpu value=2.0 2") + byte_size("cpu value=3.0 3")
+
+      assert {:ok, %{total_writes: 2, total_errors: 0, total_bytes: ^bytes}} =
+               BatchWriter.stats(pid)
+
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT value FROM cpu", database: "test_db")
+      assert rows |> Enum.map(& &1["value"]) |> Enum.sort() == [1.0, 2.0, 3.0]
+    end
+
+    test "the timer keeps flushing after an explicit flush/2", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 50)
+
+      :ok = BatchWriter.write(pid, "cpu value=1.0 1")
+      :ok = BatchWriter.flush(pid)
+      assert {:ok, %{total_writes: 1}} = BatchWriter.stats(pid)
+
+      :ok = BatchWriter.write(pid, "cpu value=2.0 2")
+      wait_until(fn -> match?({:ok, %{total_writes: 2}}, BatchWriter.stats(pid)) end)
+
+      bytes = byte_size("cpu value=1.0 1") + byte_size("cpu value=2.0 2")
+
+      assert {:ok, %{total_writes: 2, total_errors: 0, total_bytes: ^bytes}} =
+               BatchWriter.stats(pid)
+    end
+
+    test "the timer keeps flushing after a write_sync/3", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 50)
+
+      :ok = BatchWriter.write_sync(pid, "cpu value=1.0 1")
+      :ok = BatchWriter.write(pid, "cpu value=2.0 2")
+      wait_until(fn -> match?({:ok, %{total_writes: 2}}, BatchWriter.stats(pid)) end)
+
+      assert {:ok, %{total_writes: 2, total_errors: 0}} = BatchWriter.stats(pid)
     end
   end
 
@@ -367,21 +402,6 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
-  describe "jitter" do
-    test "the timer still flushes when jitter is configured", %{conn: conn} do
-      pid = start_writer(conn, flush_interval_ms: 10, jitter_ms: 20)
-      :ok = BatchWriter.write(pid, "cpu value=3.0")
-
-      wait_until(fn ->
-        {:ok, stats} = BatchWriter.stats(pid)
-        stats.total_writes >= 1
-      end)
-
-      assert {:ok, [%{"value" => 3.0}]} =
-               Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
-    end
-  end
-
   describe "4xx responses" do
     test "invalid line protocol is discarded on the first flush even with retries left",
          %{conn: conn} do
@@ -423,7 +443,9 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       {:ok, http_conn: conn}
     end
 
-    test "a transport error starts a retry chain: nothing is counted yet and writes keep buffering",
+    # That later writes are held while the chain is in flight is the
+    # backpressure tests' subject, below.
+    test "a transport error is retried, and counted once, when its chain gives up",
          %{http_conn: conn} do
       pid =
         start_writer(conn,
@@ -431,17 +453,16 @@ defmodule InfluxElixir.Write.BatchWriterTest do
           batch_size: 1,
           flush_interval_ms: 60_000,
           max_retries: 2,
-          base_retry_delay_ms: 60_000
+          base_retry_delay_ms: 20
         )
 
-      # batch_size 1: the write flushes at once, fails, and is now retrying.
+      # batch_size 1: the write flushes at once and fails; the retries
+      # (20 ms, then 40 ms) fail too, and only then is the error counted.
       :ok = BatchWriter.write(pid, "cpu value=1.0")
       assert {:ok, %{total_errors: 0, total_writes: 0}} = BatchWriter.stats(pid)
 
-      # Further writes are accepted and held (not flushed into a second
-      # chain) while the first chain is in flight.
-      :ok = BatchWriter.write(pid, "cpu value=2.0")
-      assert {:ok, %{total_errors: 0, total_writes: 0}} = BatchWriter.stats(pid)
+      wait_until(fn -> match?({:ok, %{total_errors: 1}}, BatchWriter.stats(pid)) end)
+      assert {:ok, %{total_errors: 1, total_writes: 0, total_bytes: 0}} = BatchWriter.stats(pid)
     end
 
     test "backpressure: the buffer is bounded at 10 x batch_size while a chain is in flight",
@@ -542,23 +563,24 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
     test "backpressure holds while any chain is in flight, not just the first",
          %{http_conn: conn} do
+      # With max_retries: 1 a chain lasts 2 * base_retry_delay_ms. Chain 1
+      # ends 3s after it starts; chain 2 starts 1.2s later, so it is still
+      # retrying for 1.2s after chain 1 ends. Every margin is over a second.
       pid =
         start_writer(conn,
           client: InfluxElixir.Client.HTTP,
           batch_size: 1,
           flush_interval_ms: 60_000,
           max_retries: 1,
-          base_retry_delay_ms: 250
+          base_retry_delay_ms: 1_500
         )
 
-      # Chain 1 starts now and ends ~500ms later; chain 2 (an explicit
-      # flush) starts ~250ms later and so outlives it.
       :ok = BatchWriter.write(pid, "cpu value=1.0")
-      Process.sleep(250)
+      Process.sleep(1_200)
       :ok = BatchWriter.write(pid, "cpu value=2.0")
       :ok = BatchWriter.flush(pid)
 
-      wait_until(fn -> match?({:ok, %{total_errors: 1}}, BatchWriter.stats(pid)) end)
+      wait_until(fn -> match?({:ok, %{total_errors: 1}}, BatchWriter.stats(pid)) end, 10_000)
 
       # Chain 2 is still retrying. The end of chain 1 used to clear the
       # single in-flight marker, so these flushed into new chains instead

@@ -15,7 +15,11 @@ defmodule InfluxElixir.ConfigTest do
     end
 
     test "returns {:error, validation_error} when :host is missing" do
-      assert {:error, %NimbleOptions.ValidationError{}} =
+      assert {:error,
+              %NimbleOptions.ValidationError{
+                key: :host,
+                message: "required :host option not found" <> _rest
+              }} =
                Config.validate(token: "my-token")
     end
 
@@ -25,7 +29,11 @@ defmodule InfluxElixir.ConfigTest do
     end
 
     test "returns {:error, validation_error} when both required fields are missing" do
-      assert {:error, %NimbleOptions.ValidationError{}} = Config.validate([])
+      assert {:error,
+              %NimbleOptions.ValidationError{
+                key: :host,
+                message: "required :host option not found" <> _rest
+              }} = Config.validate([])
     end
   end
 
@@ -67,7 +75,12 @@ defmodule InfluxElixir.ConfigTest do
 
   describe "validate/1 — type validation" do
     test "rejects :scheme value that is not :http or :https" do
-      assert {:error, %NimbleOptions.ValidationError{}} =
+      assert {:error,
+              %NimbleOptions.ValidationError{
+                key: :scheme,
+                message:
+                  "invalid value for :scheme option: expected one of [:http, :https], got: :ftp"
+              }} =
                Config.validate(host: "h", token: "t", scheme: :ftp)
     end
 
@@ -84,7 +97,11 @@ defmodule InfluxElixir.ConfigTest do
       assert opts[:batch_writer] == [batch_size: 10]
 
       # The typo that used to be silently ignored.
-      assert {:error, %NimbleOptions.ValidationError{}} =
+      assert {:error,
+              %NimbleOptions.ValidationError{
+                key: [:default_database],
+                message: "unknown options [:default_database]" <> _rest
+              }} =
                Config.validate(host: "h", token: "t", default_database: "prices")
     end
 
@@ -92,27 +109,48 @@ defmodule InfluxElixir.ConfigTest do
       assert {:ok, opts} = Config.validate(host: "h", token: "t", api_version: :v2)
       assert opts[:api_version] == :v2
 
-      assert {:error, %NimbleOptions.ValidationError{}} =
+      assert {:error,
+              %NimbleOptions.ValidationError{
+                key: :api_version,
+                message:
+                  "invalid value for :api_version option: expected one of [:v2, :v3], got: :v1"
+              }} =
                Config.validate(host: "h", token: "t", api_version: :v1)
     end
 
     test "rejects :port that is not a positive integer" do
-      assert {:error, %NimbleOptions.ValidationError{}} =
+      assert {:error,
+              %NimbleOptions.ValidationError{
+                key: :port,
+                message: "invalid value for :port option: expected positive integer, got: -1"
+              }} =
                Config.validate(host: "h", token: "t", port: -1)
     end
 
     test "rejects :pool_size that is not a positive integer" do
-      assert {:error, %NimbleOptions.ValidationError{}} =
+      assert {:error,
+              %NimbleOptions.ValidationError{
+                key: :pool_size,
+                message: "invalid value for :pool_size option: expected positive integer, got: 0"
+              }} =
                Config.validate(host: "h", token: "t", pool_size: 0)
     end
 
     test "rejects :host that is not a string" do
-      assert {:error, %NimbleOptions.ValidationError{}} =
+      assert {:error,
+              %NimbleOptions.ValidationError{
+                key: :host,
+                message: "invalid value for :host option: expected string, got: 123"
+              }} =
                Config.validate(host: 123, token: "t")
     end
 
     test "rejects :token that is not a string" do
-      assert {:error, %NimbleOptions.ValidationError{}} =
+      assert {:error,
+              %NimbleOptions.ValidationError{
+                key: :token,
+                message: "invalid value for :token option: expected string, got: :not_a_string"
+              }} =
                Config.validate(host: "h", token: :not_a_string)
     end
 
@@ -162,7 +200,7 @@ defmodule InfluxElixir.ConfigTest do
     end
 
     test "raises NimbleOptions.ValidationError for missing :host" do
-      assert_raise NimbleOptions.ValidationError, fn ->
+      assert_raise NimbleOptions.ValidationError, ~r/required :host option not found/, fn ->
         Config.validate!(token: "my-token")
       end
     end
@@ -173,13 +211,13 @@ defmodule InfluxElixir.ConfigTest do
     end
 
     test "raises NimbleOptions.ValidationError for invalid :scheme" do
-      assert_raise NimbleOptions.ValidationError, fn ->
+      assert_raise NimbleOptions.ValidationError, ~r/invalid value for :scheme option/, fn ->
         Config.validate!(host: "h", token: "t", scheme: :ws)
       end
     end
 
     test "raises NimbleOptions.ValidationError for zero :pool_size" do
-      assert_raise NimbleOptions.ValidationError, fn ->
+      assert_raise NimbleOptions.ValidationError, ~r/invalid value for :pool_size option/, fn ->
         Config.validate!(host: "h", token: "t", pool_size: 0)
       end
     end

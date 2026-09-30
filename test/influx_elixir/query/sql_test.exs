@@ -75,15 +75,10 @@ defmodule InfluxElixir.Query.SQLTest do
   end
 
   describe "query_stream/3" do
-    test "returns an enumerable with opts", %{conn: conn} do
-      stream = SQL.query_stream(conn, "SELECT * FROM cpu", database: "test_db")
-      assert Enumerable.impl_for(stream)
-    end
-
     test "streams actual rows", %{conn: conn} do
       stream = SQL.query_stream(conn, "SELECT * FROM cpu", database: "test_db")
       rows = Enum.to_list(stream)
-      assert length(rows) == 1
+      assert [%{"host" => "web01", "value" => 1}] = rows
     end
   end
 

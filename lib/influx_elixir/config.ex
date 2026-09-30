@@ -10,7 +10,8 @@ defmodule InfluxElixir.Config do
 
     * `:host` - InfluxDB host (e.g., `"localhost"` or `"us-east-1.influxdb.io"`)
       Required.
-    * `:token` - Authentication token. Required.
+    * `:token` - Authentication token (default: `""`; omit it for an
+      unauthenticated instance, and no `Authorization` header is sent)
     * `:org` - Organization name (default: `""`)
     * `:database` - Default database name (default: `nil`)
     * `:databases` - List of database names (LocalClient pre-creates them;

@@ -52,15 +52,6 @@ defmodule InfluxElixirTest do
     end
   end
 
-  describe "query_sql_stream/3" do
-    test "returns an enumerable", %{conn: conn} do
-      stream =
-        InfluxElixir.query_sql_stream(conn, "SELECT * FROM cpu", database: "test_db")
-
-      assert Enumerable.impl_for(stream)
-    end
-  end
-
   describe "execute_sql/3" do
     test "delegates to configured client", %{conn: conn} do
       assert {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}} =
@@ -227,15 +218,22 @@ defmodule InfluxElixirTest do
     end
   end
 
-  describe "flush/1" do
-    test "returns {:error, :no_batch_writer} when no writer configured" do
-      assert {:error, :no_batch_writer} = InfluxElixir.flush(:default)
-    end
-  end
+  describe "flush/1 and stats/1" do
+    test "a running connection configured without a batch writer has none to flush" do
+      name = :"no_writer_#{System.unique_integer([:positive])}"
+      {:ok, _pid} = InfluxElixir.add_connection(name, database: "no_writer_db")
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
-  describe "stats/1" do
-    test "returns {:error, :no_batch_writer} when no writer configured" do
-      assert {:error, :no_batch_writer} = InfluxElixir.stats(:default)
+      assert {:ok, :written} = InfluxElixir.write(name, "cpu v=1i")
+      assert {:error, :no_batch_writer} = InfluxElixir.flush(name)
+      assert {:error, :no_batch_writer} = InfluxElixir.stats(name)
+    end
+
+    test "an unregistered connection name has no batch writer" do
+      name = :"never_registered_#{System.unique_integer([:positive])}"
+
+      assert {:error, :no_batch_writer} = InfluxElixir.flush(name)
+      assert {:error, :no_batch_writer} = InfluxElixir.stats(name)
     end
   end
 

@@ -2,7 +2,8 @@
 
 ## Parameterized Queries
 - Always use `$param` placeholders — never interpolate user input into queries
-- Pass params as a map: `InfluxElixir.query_sql(conn, "SELECT * FROM m WHERE tag = $tag", params: %{tag: "value"})`
+- Pass params as a map: `InfluxElixir.query_sql(conn, "SELECT * FROM m WHERE tag = $tag", params: %{tag: "value"})`; `execute_sql` binds them too
+- `database: nil` is no database given: the connection's default is used, on both clients
 - A string param is a string on the server: `'08338636'` keeps its leading zero, and comparing a string against a numeric field is a text comparison — bind numbers as numbers
 
 ## Query Types
@@ -28,7 +29,7 @@
 - `LIMIT n OFFSET m` pages through ordered rows on both clients (either order; `OFFSET` beyond the end is an empty result)
 - A bare word is a column reference on both clients; a column no row has, named in any clause, is the engine's schema error (HTTP 500), not an empty or unsorted result — quote string literals
 - Default response format is JSON; `:jsonl`, `:csv` and `:parquet` (raw binary) are also supported
-- `format: :csv` rows carry every value as the engine's CSV string (`"1.5"`, `"1e16"`, `"true"`; timestamps stay `DateTime`), an empty cell absent like a null; a nested value (`array_agg`, a bare `selector_*`) cannot be CSV and fails with `{:connection_error, %Mint.TransportError{reason: :closed}}` — both clients alike
+- `format: :csv` rows carry every value as the engine's CSV string (`"1.5"`, `"1e16"`, `"true"`; timestamps stay `DateTime`), an empty cell absent like a null (a one-column row that is null or empty is `%{}`); a nested value (`array_agg`, a bare `selector_*`) cannot be CSV and fails with `{:connection_error, %Mint.TransportError{reason: :closed}}` — both clients alike
 - `Client.Local` refuses `format: :parquet` by name (400 `Client.Local: ...`); an unknown format is the engine's 400 on both clients, and `:pretty` / `:json_lines` are `{:error, {:unsupported_format, f}}`
 - `query_sql_stream/3` always streams JSONL: `format:` is ignored
 

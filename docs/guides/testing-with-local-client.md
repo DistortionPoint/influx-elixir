@@ -886,6 +886,15 @@ in this guide about what the real engine returns was recorded that way.
 
 ## Write Rules
 
+A write's body is read as the server reads it. `gzip: true` says the body
+is gzip-compressed (it is the HTTP client's `Content-Encoding: gzip`,
+which `InfluxElixir.write/3` sets whenever it compresses): the double
+decompresses then and only then, and a body that does not decompress is
+the engine's `error decoding gzip stream: ...` (InfluxDB 2: its 500). On
+the v3 profiles a body that is not UTF-8 is the engine's 400
+`body content is not valid utf8: ...`; the v2 profile stores the bytes as
+they are. See `InfluxElixir.Client.Local.Body`.
+
 A write is applied line by line, as on InfluxDB 3. A line with a syntax error,
 or a column whose kind conflicts with the measurement's schema, is dropped and
 reported while the other lines are stored; the call then returns the engine's

@@ -98,6 +98,7 @@ defmodule InfluxElixir.ClientContract do
 
     bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
     v2_write_rule_tests = if v2_ops, do: v2_write_rule_tests(client), else: nil
+    v2_body_tests = if v2_ops, do: v2_body_tests(client), else: nil
     v2_precision_tests = if v2_ops, do: v2_precision_tests(client), else: nil
     v2_duplicate_tests = if v2_ops, do: v2_duplicate_tests(client), else: nil
     v2_flux_pipeline_tests = if v2_ops, do: v2_flux_pipeline_tests(client), else: nil
@@ -147,6 +148,7 @@ defmodule InfluxElixir.ClientContract do
         timestamp_range_tests,
         bucket_tests,
         v2_write_rule_tests,
+        v2_body_tests,
         v2_precision_tests,
         v2_duplicate_tests,
         v2_flux_pipeline_tests,
@@ -174,6 +176,16 @@ defmodule InfluxElixir.ClientContract do
   end
 
   def settle(_ctx), do: :ok
+
+  @doc """
+  The connection with `database` as its default, for either client's
+  connection shape (a keyword list over HTTP, a map for `Client.Local`).
+  """
+  @spec with_database(keyword() | map(), binary()) :: keyword() | map()
+  def with_database(conn, database) when is_list(conn),
+    do: Keyword.put(conn, :database, database)
+
+  def with_database(conn, database) when is_map(conn), do: Map.put(conn, :database, database)
 
   # ---------------------------------------------------------------------------
   # Health (all profiles)
@@ -719,6 +731,41 @@ defmodule InfluxElixir.ClientContract do
 
           assert {:ok, ^rows} = exec.("SELECT * FROM contract_del")
           assert [%{"value" => 1, "time" => %DateTime{}}] = rows
+        end
+
+        # Client.HTTP dropped `params`, so the placeholder was the engine's
+        # 400 "No value found for placeholder with name $host" (verified).
+        test "binds params as query_sql/3 does", ctx do
+          m = "contract_exparams_#{System.unique_integer([:positive])}"
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, "#{m},host=a v=1i 1\n#{m},host=b v=2i 2",
+              database: ctx.database
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:ok, [%{"v" => 2}]} =
+                   unquote(client).execute_sql(ctx.conn, "SELECT v FROM #{m} WHERE host = $host",
+                     database: ctx.database,
+                     params: %{host: "b"}
+                   )
+        end
+
+        # Client.HTTP read `database: nil` as the database; Client.Local
+        # and the facade's telemetry as no database given.
+        test "database: nil is no database given: the connection's default is used", ctx do
+          conn = InfluxElixir.ClientContract.with_database(ctx.conn, ctx.database)
+          m = "contract_nildb_#{System.unique_integer([:positive])}"
+
+          assert {:ok, :written} = unquote(client).write(conn, "#{m} v=1i 1", database: nil)
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:ok, [%{"v" => 1}]} =
+                   unquote(client).query_sql(conn, "SELECT v FROM #{m}", database: nil)
+
+          assert {:ok, [%{"v" => 1}]} =
+                   unquote(client).execute_sql(conn, "SELECT v FROM #{m}", database: nil)
         end
       end
     end
@@ -2879,6 +2926,21 @@ defmodule InfluxElixir.ClientContract do
                  }
         end
 
+        test "format: :csv keeps a one-column row whose value is null or empty", ctx do
+          # The engine writes such a row as `""`; the parser took it for a
+          # table separator, dropped it and read the next row as a header.
+          # `b` is null on the second row; `s` is "" on the first, null on the second.
+          for {column, expected} <- [{"b", [%{"b" => "true"}, %{}]}, {"s", [%{}, %{}]}] do
+            assert {:ok, ^expected} =
+                     unquote(client).query_sql(
+                       ctx.conn,
+                       "SELECT #{column} FROM #{ctx.m} ORDER BY time",
+                       database: ctx.database,
+                       format: :csv
+                     )
+          end
+        end
+
         test "query_influxql format: :csv answers strings too", ctx do
           assert {:ok, [%{"iox::measurement" => m, "v" => "1.5", "b" => "true"}, second]} =
                    unquote(client).query_influxql(ctx.conn, "SELECT v, b FROM #{ctx.m}",
@@ -3001,16 +3063,19 @@ defmodule InfluxElixir.ClientContract do
             assert :ok = unquote(client).delete_database(ctx.conn, name)
           end
 
-          for {retention, what} <- [
-                {3600, "invalid type: integer `3600`"},
-                {"1H", ~s|invalid value: string "1H"|},
-                {"1", ~s|invalid value: string "1"|},
-                {"-1h", ~s|invalid value: string "-1h"|}
+          # The position is the byte before the closing brace of the body
+          # {"db":<name>,"retention_period":<retention>}; the name is 24
+          # bytes, quotes included, so the body before the value is 50.
+          for {retention, what, column} <- [
+                {3600, "invalid type: integer `3600`", 54},
+                {"1H", ~s|invalid value: string "1H"|, 54},
+                {"1", ~s|invalid value: string "1"|, 53},
+                {"-1h", ~s|invalid value: string "-1h"|, 55}
               ] do
-            name = "contract_ret_#{System.unique_integer([:positive])}"
-            expected = "serde json error: #{what}, expected a duration"
+            name = "contract_ret_#{100_000_000 + System.unique_integer([:positive])}"
+            expected = "serde json error: #{what}, expected a duration at line 1 column #{column}"
 
-            assert {:error, %{status: 400, body: ^expected <> _position}} =
+            assert {:error, %{status: 400, body: ^expected}} =
                      unquote(client).create_database(ctx.conn, name, retention: retention),
                    inspect(retention)
           end
@@ -3901,6 +3966,140 @@ defmodule InfluxElixir.ClientContract do
             )
 
           assert [%{"value" => 42}] = rows
+        end
+
+        # `gzip: true` is the Content-Encoding header: it, not the bytes,
+        # decides. Each body below is the engine's own reason (verified).
+        test "a body gzip: true cannot decompress is the engine's 400, and nothing is stored",
+             ctx do
+          db = "contract_gzbad_#{System.unique_integer([:positive])}"
+          good = :zlib.gzip("contract_gzbad v=1i 1")
+          size = byte_size(good)
+          <<body::binary-size(size - 8), _crc::binary-size(4), isize::binary-size(4)>> = good
+
+          cases = [
+            {"x", "unexpected end of file"},
+            {"contract_gzbad v=1i 1", "invalid gzip header"},
+            {binary_part(good, 0, size - 4), "unexpected end of file"},
+            {<<0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 3>> <> "garbagegarbage",
+             "corrupt deflate stream"},
+            {body <> <<0, 0, 0, 0>> <> isize,
+             "corrupt gzip stream does not have a matching checksum"}
+          ]
+
+          for {payload, reason} <- cases do
+            assert {:error, %{status: 400, body: "error decoding gzip stream: " <> ^reason}} =
+                     unquote(client).write(ctx.conn, payload, database: db, gzip: true)
+          end
+
+          # The body is read before the database is created.
+          assert {:ok, databases} = unquote(client).list_databases(ctx.conn)
+          refute Enum.any?(databases, &(&1["name"] == db))
+        end
+
+        test "the request's parameters are read before its body", ctx do
+          assert {:error, %{status: 400, body: "serde error: unknown variant `zz`" <> _rest}} =
+                   unquote(client).write(ctx.conn, "x",
+                     database: ctx.database,
+                     gzip: true,
+                     precision: "zz"
+                   )
+        end
+
+        test "concatenated gzip members are one body", ctx do
+          m = "contract_gzcat_#{System.unique_integer([:positive])}"
+          payload = :zlib.gzip("#{m} v=1i 1\n") <> :zlib.gzip("#{m} v=2i 2")
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, payload, database: ctx.database, gzip: true)
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:ok, [%{"v" => 1}, %{"v" => 2}]} =
+                   unquote(client).query_sql(ctx.conn, "SELECT v FROM #{m} ORDER BY time",
+                     database: ctx.database
+                   )
+        end
+
+        test "gzip bytes without gzip: true are not UTF-8 to the engine", ctx do
+          # 0x1F is ASCII; 0x8B cannot start a character.
+          assert {:error,
+                  %{
+                    status: 400,
+                    body:
+                      "body content is not valid utf8: invalid utf-8 sequence of 1 bytes " <>
+                        "from index 1"
+                  }} =
+                   unquote(client).write(ctx.conn, :zlib.gzip("m v=1i 1"), database: ctx.database)
+        end
+
+        test "a body that is not UTF-8 names the first bad byte as the engine does", ctx do
+          cases = [
+            {"u v=1i \xFF", "invalid utf-8 sequence of 1 bytes from index 7"},
+            {"u v=1i 1\xE2\x82", "incomplete utf-8 byte sequence from index 8"},
+            {"u v=\xF0\x9F\x98x", "invalid utf-8 sequence of 3 bytes from index 4"},
+            {"u v=\xE0\x80\x80", "invalid utf-8 sequence of 1 bytes from index 4"},
+            {"u v=\xED\xA0\x80", "invalid utf-8 sequence of 1 bytes from index 4"}
+          ]
+
+          for {payload, reason} <- cases do
+            assert {:error, %{status: 400, body: "body content is not valid utf8: " <> ^reason}} =
+                     unquote(client).write(ctx.conn, payload, database: ctx.database)
+          end
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Gzip and non-UTF-8 write bodies (v2)
+  # ---------------------------------------------------------------------------
+
+  defp v2_body_tests(client) do
+    quote do
+      describe "write/3 — v2 body contract" do
+        test "a gzip body is read with gzip: true; a plain one then is the engine's 500", ctx do
+          m = "contract_v2gz_#{System.unique_integer([:positive])}"
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, :zlib.gzip("#{m} v=1i 1"),
+                     database: ctx.database,
+                     gzip: true
+                   )
+
+          assert {:error, %{status: 500, body: body}} =
+                   unquote(client).write(ctx.conn, "#{m} v=2i 2",
+                     database: ctx.database,
+                     gzip: true
+                   )
+
+          assert Jason.decode!(body) == %{
+                   "code" => "internal error",
+                   "message" => "An internal error has occurred - check server logs"
+                 }
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:ok, [%{"_value" => 1}]} =
+                   unquote(client).query_flux(
+                     ctx.conn,
+                     ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) \|> filter(fn: (r) => r._measurement == "#{m}")|
+                   )
+        end
+
+        test "a body that is not UTF-8 is stored byte for byte", ctx do
+          m = "contract_v2u8_#{System.unique_integer([:positive])}"
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, "#{m},t=a\xFFb v=1i 1", database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:ok, [%{"t" => "a\xFFb", "_value" => 1}]} =
+                   unquote(client).query_flux(
+                     ctx.conn,
+                     ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) \|> filter(fn: (r) => r._measurement == "#{m}")|
+                   )
         end
       end
     end
