@@ -2,7 +2,10 @@ defmodule InfluxElixir.Admin.Health do
   @moduledoc """
   Health and ping checks for InfluxDB instances.
 
-  Delegates to the configured `InfluxElixir.Client` implementation.
+  Each function is the `InfluxElixir` facade function of the same operation:
+  it takes a connection or a connection name, and queries emit the same
+  telemetry span.
+
   Use this module to verify connectivity and service health.
 
   ## Examples
@@ -27,6 +30,6 @@ defmodule InfluxElixir.Admin.Health do
   """
   @spec check(InfluxElixir.Client.connection()) :: {:ok, map()} | {:error, term()}
   def check(connection) do
-    InfluxElixir.Client.impl().health(connection)
+    InfluxElixir.health(connection)
   end
 end

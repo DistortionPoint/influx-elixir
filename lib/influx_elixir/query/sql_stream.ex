@@ -2,6 +2,9 @@ defmodule InfluxElixir.Query.SQLStream do
   @moduledoc """
   Streaming JSONL query results as a lazy Elixir Stream.
 
+  `stream/3` is `InfluxElixir.query_sql_stream/3`: it takes a connection or
+  a connection name. Like it, a stream emits no telemetry span.
+
   Uses Finch's streaming response support to parse JSONL
   line-by-line as chunks arrive from the HTTP response body.
   Provides constant-memory processing regardless of result size.
@@ -44,7 +47,7 @@ defmodule InfluxElixir.Query.SQLStream do
           keyword()
         ) :: Enumerable.t()
   def stream(connection, sql, opts \\ []) do
-    InfluxElixir.Client.impl().query_sql_stream(
+    InfluxElixir.query_sql_stream(
       connection,
       sql,
       opts

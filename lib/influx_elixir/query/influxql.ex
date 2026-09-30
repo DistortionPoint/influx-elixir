@@ -2,6 +2,10 @@ defmodule InfluxElixir.Query.InfluxQL do
   @moduledoc """
   v3 InfluxQL query executor for legacy query compatibility.
 
+  Each function is the `InfluxElixir` facade function of the same operation:
+  it takes a connection or a connection name, and queries emit the same
+  telemetry span.
+
   InfluxQL is supported in InfluxDB v3 for backwards compatibility
   with v1/v2 query patterns.
 
@@ -25,7 +29,7 @@ defmodule InfluxElixir.Query.InfluxQL do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query(connection, influxql, opts \\ []) do
-    InfluxElixir.Client.impl().query_influxql(
+    InfluxElixir.query_influxql(
       connection,
       influxql,
       opts

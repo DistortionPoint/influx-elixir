@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Query.*` and `Admin.*` behaved differently from the facade.**
+  `Query.SQL`, `Query.SQLStream`, `Query.InfluxQL`, `Query.Flux` and the
+  `Admin.*` modules called the client directly. So:
+  - a connection name raised `FunctionClauseError` (for example
+    `Query.SQL.query(:my_conn, sql)` or `Admin.Databases.list(:my_conn)`),
+    where `InfluxElixir.query_sql(:my_conn, sql)` worked;
+  - queries made through them emitted no telemetry span.
+
+  They now call the facade functions, so the two entry points behave
+  identically.
+
 ### Changed
 - **Contract tests assert exact results.** Fifteen contract tests
   checked only `rows != []` before inspecting `hd(rows)`, or summed values

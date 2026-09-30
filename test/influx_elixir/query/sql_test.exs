@@ -11,6 +11,46 @@ defmodule InfluxElixir.Query.SQLTest do
     {:ok, conn: conn}
   end
 
+  # These modules used to call the client directly: a connection name was a
+  # FunctionClauseError and no telemetry span was emitted. They now behave
+  # exactly as the facade functions they document.
+  describe "the same entry point as the facade" do
+    test "a connection name resolves, and each call is a telemetry span" do
+      name = :"sql_module_#{System.unique_integer([:positive])}"
+      {:ok, _pid} = InfluxElixir.add_connection(name, database: "named_db")
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+      {:ok, :written} = InfluxElixir.write(name, "cpu v=1i")
+
+      handler = "sql-module-#{name}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler,
+        [:influx_elixir, :query, :stop],
+        &__MODULE__.forward_event/4,
+        %{test_pid: test_pid}
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert {:ok, [%{"v" => 1}]} = SQL.query(name, "SELECT v FROM cpu")
+      assert_receive {:query_stop, %{database: "named_db", result: :ok, row_count: 1}}
+
+      assert [%{"v" => 1}] = name |> SQL.query_stream("SELECT v FROM cpu") |> Enum.to_list()
+      assert {:ok, [%{"v" => 1}]} = SQL.execute(name, "SELECT v FROM cpu")
+      assert {:ok, [_one, _two]} = InfluxElixir.Admin.Databases.list(name)
+      assert {:ok, %{"status" => "pass"}} = InfluxElixir.Admin.Health.check(name)
+    end
+  end
+
+  @doc false
+  @spec forward_event([atom()], map(), map(), %{test_pid: pid()}) :: :ok
+  def forward_event(_event, _measurements, metadata, %{test_pid: test_pid}) do
+    # Handlers are global: forward only this test process's spans.
+    if self() == test_pid, do: send(test_pid, {:query_stop, metadata})
+    :ok
+  end
+
   describe "query/3" do
     test "returns the stored rows", %{conn: conn} do
       assert {:ok, [%{"host" => "web01", "value" => 1}]} =

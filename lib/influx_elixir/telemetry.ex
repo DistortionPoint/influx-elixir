@@ -4,8 +4,10 @@ defmodule InfluxElixir.Telemetry do
 
   `InfluxElixir.Write.Writer.write/3` (and therefore `InfluxElixir.write/3`
   and every `BatchWriter` flush) emits the write span; `InfluxElixir.query_sql/3`,
-  `execute_sql/3`, `query_influxql/3` and `query_flux/3` emit the query span.
-  Streaming queries are not spanned.
+  `execute_sql/3`, `query_influxql/3` and `query_flux/3` emit the query span,
+  as do `InfluxElixir.Query.SQL`, `InfluxElixir.Query.InfluxQL` and
+  `InfluxElixir.Query.Flux`, which call them. Streaming queries are not
+  spanned.
 
   ## Events
 

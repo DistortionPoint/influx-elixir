@@ -2,7 +2,10 @@ defmodule InfluxElixir.Admin.Databases do
   @moduledoc """
   v3 database CRUD operations via `/api/v3/configure/database`.
 
-  Delegates to the configured `InfluxElixir.Client` implementation.
+  Each function is the `InfluxElixir` facade function of the same operation:
+  it takes a connection or a connection name, and queries emit the same
+  telemetry span.
+
   In production this performs HTTP requests; in tests the `LocalClient`
   is used for fast, isolated operation.
 
@@ -37,7 +40,7 @@ defmodule InfluxElixir.Admin.Databases do
   @spec create(InfluxElixir.Client.connection(), binary(), keyword()) ::
           :ok | {:error, term()}
   def create(connection, name, opts \\ []) do
-    InfluxElixir.Client.impl().create_database(connection, name, opts)
+    InfluxElixir.create_database(connection, name, opts)
   end
 
   @doc """
@@ -54,7 +57,7 @@ defmodule InfluxElixir.Admin.Databases do
   """
   @spec list(InfluxElixir.Client.connection()) :: {:ok, [map()]} | {:error, term()}
   def list(connection) do
-    InfluxElixir.Client.impl().list_databases(connection)
+    InfluxElixir.list_databases(connection)
   end
 
   @doc """
@@ -72,6 +75,6 @@ defmodule InfluxElixir.Admin.Databases do
   """
   @spec delete(InfluxElixir.Client.connection(), binary()) :: :ok | {:error, term()}
   def delete(connection, name) do
-    InfluxElixir.Client.impl().delete_database(connection, name)
+    InfluxElixir.delete_database(connection, name)
   end
 end

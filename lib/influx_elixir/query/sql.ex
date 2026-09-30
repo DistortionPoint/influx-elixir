@@ -2,6 +2,10 @@ defmodule InfluxElixir.Query.SQL do
   @moduledoc """
   v3 SQL query builder and executor.
 
+  Each function is the `InfluxElixir` facade function of the same operation:
+  it takes a connection or a connection name, and queries emit the same
+  telemetry span.
+
   Supports parameterized queries with `$param` placeholders
   and multiple response formats (JSON, JSONL, CSV, Parquet).
 
@@ -54,7 +58,7 @@ defmodule InfluxElixir.Query.SQL do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query(connection, sql, opts \\ []) do
-    InfluxElixir.Client.impl().query_sql(connection, sql, opts)
+    InfluxElixir.query_sql(connection, sql, opts)
   end
 
   @doc """
@@ -72,7 +76,7 @@ defmodule InfluxElixir.Query.SQL do
           keyword()
         ) :: Enumerable.t()
   def query_stream(connection, sql, opts \\ []) do
-    InfluxElixir.Client.impl().query_sql_stream(
+    InfluxElixir.query_sql_stream(
       connection,
       sql,
       opts
@@ -94,6 +98,6 @@ defmodule InfluxElixir.Query.SQL do
           keyword()
         ) :: {:ok, map() | [map()]} | {:error, term()}
   def execute(connection, sql, opts \\ []) do
-    InfluxElixir.Client.impl().execute_sql(connection, sql, opts)
+    InfluxElixir.execute_sql(connection, sql, opts)
   end
 end

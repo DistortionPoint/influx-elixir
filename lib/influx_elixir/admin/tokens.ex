@@ -2,7 +2,10 @@ defmodule InfluxElixir.Admin.Tokens do
   @moduledoc """
   v3 token management via `/api/v3/configure/token`.
 
-  Delegates to the configured `InfluxElixir.Client` implementation.
+  Each function is the `InfluxElixir` facade function of the same operation:
+  it takes a connection or a connection name, and queries emit the same
+  telemetry span.
+
   Use this module to create and delete API tokens in InfluxDB v3.
 
   ## Examples
@@ -30,7 +33,7 @@ defmodule InfluxElixir.Admin.Tokens do
   @spec create(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def create(connection, description, opts \\ []) do
-    InfluxElixir.Client.impl().create_token(connection, description, opts)
+    InfluxElixir.create_token(connection, description, opts)
   end
 
   @doc """
@@ -48,6 +51,6 @@ defmodule InfluxElixir.Admin.Tokens do
   """
   @spec delete(InfluxElixir.Client.connection(), binary()) :: :ok | {:error, term()}
   def delete(connection, token_id) do
-    InfluxElixir.Client.impl().delete_token(connection, token_id)
+    InfluxElixir.delete_token(connection, token_id)
   end
 end

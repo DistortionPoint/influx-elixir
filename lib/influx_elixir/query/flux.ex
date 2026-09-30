@@ -2,6 +2,10 @@ defmodule InfluxElixir.Query.Flux do
   @moduledoc """
   v2 Flux query executor for backwards compatibility.
 
+  Each function is the `InfluxElixir` facade function of the same operation:
+  it takes a connection or a connection name, and queries emit the same
+  telemetry span.
+
   Flux is the query language for InfluxDB v2. This module provides
   compatibility for v2-to-v3 migration workflows.
 
@@ -25,6 +29,6 @@ defmodule InfluxElixir.Query.Flux do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query(connection, flux, opts \\ []) do
-    InfluxElixir.Client.impl().query_flux(connection, flux, opts)
+    InfluxElixir.query_flux(connection, flux, opts)
   end
 end

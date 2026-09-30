@@ -2,7 +2,10 @@ defmodule InfluxElixir.Admin.Buckets do
   @moduledoc """
   v2 bucket CRUD operations for backwards compatibility.
 
-  Delegates to the configured `InfluxElixir.Client` implementation.
+  Each function is the `InfluxElixir` facade function of the same operation:
+  it takes a connection or a connection name, and queries emit the same
+  telemetry span.
+
   Use this module when working with InfluxDB v2 bucket APIs.
 
   ## Examples
@@ -36,7 +39,7 @@ defmodule InfluxElixir.Admin.Buckets do
   @spec create(InfluxElixir.Client.connection(), binary(), keyword()) ::
           :ok | {:error, term()}
   def create(connection, name, opts \\ []) do
-    InfluxElixir.Client.impl().create_bucket(connection, name, opts)
+    InfluxElixir.create_bucket(connection, name, opts)
   end
 
   @doc """
@@ -56,7 +59,7 @@ defmodule InfluxElixir.Admin.Buckets do
   """
   @spec list(InfluxElixir.Client.connection()) :: {:ok, [map()]} | {:error, term()}
   def list(connection) do
-    InfluxElixir.Client.impl().list_buckets(connection)
+    InfluxElixir.list_buckets(connection)
   end
 
   @doc """
@@ -74,6 +77,6 @@ defmodule InfluxElixir.Admin.Buckets do
   """
   @spec delete(InfluxElixir.Client.connection(), binary()) :: :ok | {:error, term()}
   def delete(connection, name) do
-    InfluxElixir.Client.impl().delete_bucket(connection, name)
+    InfluxElixir.delete_bucket(connection, name)
   end
 end
