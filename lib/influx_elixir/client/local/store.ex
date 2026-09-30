@@ -152,7 +152,9 @@ defmodule InfluxElixir.Client.Local.Store do
 
   @doc """
   Stores a point as written, one insert of its own key. A point without a
-  timestamp gets the server's time, as on the engine.
+  timestamp gets the server's time here as a fallback; `Client.Local.write/3`
+  stamps a write's untimed lines itself, all with one time, as the engines
+  do.
 
   Storing a measurement's points as one list meant every write read the
   list, prepended and wrote it back: concurrent writers overwrote each

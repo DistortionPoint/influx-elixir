@@ -567,7 +567,9 @@ defmodule InfluxElixir.Client.Local do
          {:ok, accept_partial} <- write_flag(opts, :accept_partial, true, profile),
          {:ok, _no_sync} <- write_flag(opts, :no_sync, false, profile),
          :ok <- ensure_database(table, database, profile) do
-      case LineProtocolParser.parse_lines(text, precision, dialect(profile)) do
+      case text
+           |> LineProtocolParser.parse_lines(precision, dialect(profile))
+           |> stamp_untimed() do
         {:ok, lines} when profile != :v2 and not accept_partial ->
           store_lines_atomically(table, database, lines)
 
@@ -583,6 +585,27 @@ defmodule InfluxElixir.Client.Local do
       end
     end
   end
+
+  # Both engines give every line of one write that has no timestamp the
+  # same one, the request's time (verified): untimed lines of one series in
+  # one payload are one point, their fields merged and the last write
+  # winning. Stamping each line separately kept them as separate rows.
+  @spec stamp_untimed({:ok, [LineProtocolParser.line_result()]} | {:error, term()}) ::
+          {:ok, [LineProtocolParser.line_result()]} | {:error, term()}
+  defp stamp_untimed({:ok, lines}) do
+    now = Store.now_ns()
+
+    {:ok,
+     Enum.map(lines, fn
+       {:ok, %{timestamp: nil} = point, number, line} ->
+         {:ok, %{point | timestamp: now}, number, line}
+
+       other ->
+         other
+     end)}
+  end
+
+  defp stamp_untimed(error), do: error
 
   # What `HTTP.write/3` plus the engine accept for `:precision`, verified:
   # InfluxDB 3 takes the spellings below verbatim (case-sensitive) and
@@ -1173,10 +1196,15 @@ defmodule InfluxElixir.Client.Local do
     * `SHOW TAG KEYS [FROM m]` — `%{"iox::measurement" => m, "tagKey" => k}`
     * `SHOW FIELD KEYS [FROM m]` — `%{"iox::measurement" => m, "fieldKey" => k,
       "fieldType" => "integer" | "unsigned" | "float" | "string" | "boolean"}`
+    * `SHOW TAG VALUES [FROM m] WITH KEY ... [WHERE ...]` —
+      `%{"iox::measurement" => m, "key" => k, "value" => v}` by measurement,
+      key and value, a row without `"value"` when a point lacks the key,
+      over the last 24 hours unless the `WHERE` bounds `time`
     * `SELECT ...` — InfluxQL, not SQL: see `InfluxElixir.Client.Local.InfluxQL`
       for the row shape (`iox::measurement` and `time` on every row, time
       order, `mean`/`count`/... aggregates, an unknown column or measurement
-      is `{:ok, []}`) and for what is refused by name
+      is `{:ok, []}`), for InfluxQL's `WHERE` (a missing tag is `''`,
+      regexes, durations) and for what is refused by name
   """
   @impl true
   @spec query_influxql(
@@ -1213,21 +1241,108 @@ defmodule InfluxElixir.Client.Local do
         case statement do
           :show_measurements -> {:ok, show_measurements(table, database)}
           {:show_keys, match} -> {:ok, show_keys(table, database, match)}
-          {:select, query} -> influxql_select(table, database, query, opts)
+          {:show_tag_values, spec} -> show_tag_values(table, database, spec)
+          {:select, query} -> influxql_select(table, database, query)
         end
       end
     end
   end
 
   @spec influxql_statement(binary()) ::
-          {:ok, :show_measurements | {:show_keys, [binary()]} | {:select, map()}}
+          {:ok,
+           :show_measurements
+           | {:show_keys, [binary()]}
+           | {:show_tag_values, map()}
+           | {:select, map()}}
           | {:error, term()}
   defp influxql_statement(influxql) do
     cond do
-      String.match?(influxql, @show_measurements) -> {:ok, :show_measurements}
-      match = Regex.run(@show_keys, influxql) -> {:ok, {:show_keys, match}}
-      true -> with {:ok, query} <- influxql_parse(influxql), do: {:ok, {:select, query}}
+      String.match?(influxql, @show_measurements) ->
+        {:ok, :show_measurements}
+
+      match = Regex.run(@show_keys, influxql) ->
+        {:ok, {:show_keys, match}}
+
+      show = InfluxQL.parse_show_tag_values(influxql) ->
+        case show do
+          {:ok, spec} ->
+            {:ok, {:show_tag_values, spec}}
+
+          {:error, message} ->
+            {:error, %{status: 400, body: "Client.Local: #{message}: #{influxql}"}}
+        end
+
+      true ->
+        with {:ok, query} <- influxql_parse(influxql), do: {:ok, {:select, query}}
     end
+  end
+
+  # `SHOW TAG VALUES`, as InfluxDB 3 answers it (verified): a row per
+  # distinct value of each listed key, by measurement, key and value, plus
+  # a row without `value` when a point in range lacks the key; a
+  # measurement without the key has no rows. Without a WHERE on `time`,
+  # only the last 24 hours count.
+  @show_tag_values_window "time >= now() - INTERVAL '86400 seconds'"
+
+  @spec show_tag_values(Store.t(), binary(), map()) :: {:ok, [map()]} | {:error, map()}
+  defp show_tag_values(table, database, spec) do
+    measurements =
+      if spec.measurement, do: [spec.measurement], else: Store.measurements(table, database)
+
+    measurements
+    |> Enum.sort()
+    |> Enum.reduce_while({:ok, []}, fn m, {:ok, acc} ->
+      case tag_value_rows(table, database, m, spec) do
+        {:ok, rows} -> {:cont, {:ok, [rows | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, groups} -> {:ok, groups |> Enum.reverse() |> Enum.concat()}
+      error -> error
+    end
+  end
+
+  @spec tag_value_rows(Store.t(), binary(), binary(), map()) :: {:ok, [map()]} | {:error, map()}
+  defp tag_value_rows(table, database, measurement, spec) do
+    tags = Store.tag_columns(table, database, measurement)
+    keys = tags |> Enum.filter(&InfluxQL.key_listed?(&1, spec.keys)) |> Enum.sort()
+
+    with [_first | _rest] <- keys,
+         {:ok, where} <- tag_values_where(spec.where, tags) do
+      sql = ~s|SELECT * FROM "#{measurement}" WHERE | <> where
+
+      case run_influxql_sql(table, database, sql, tags) do
+        {:ok, rows} -> {:ok, Enum.flat_map(keys, &key_value_rows(measurement, &1, rows))}
+        {:error, _no_table_or_column} -> {:ok, []}
+      end
+    else
+      [] -> {:ok, []}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  # The statement's WHERE, parenthesised so an `OR` in it binds before the
+  # default window, which applies unless the WHERE bounds `time` itself.
+  @spec tag_values_where(binary() | nil, MapSet.t(binary())) ::
+          {:ok, binary()} | {:error, map()}
+  defp tag_values_where(nil, _tags), do: {:ok, @show_tag_values_window}
+
+  defp tag_values_where(where, tags) do
+    with {:ok, " WHERE " <> sql} <- influxql_where(where, tags) do
+      if InfluxQL.mentions_time?(where),
+        do: {:ok, sql},
+        else: {:ok, "(#{sql}) AND " <> @show_tag_values_window}
+    end
+  end
+
+  @spec key_value_rows(binary(), binary(), [map()]) :: [map()]
+  defp key_value_rows(measurement, key, rows) do
+    values = for %{^key => value} <- rows, do: value
+    base = %{"iox::measurement" => measurement, "key" => key}
+    missing = if Enum.any?(rows, &(not Map.has_key?(&1, key))), do: [base], else: []
+
+    (values |> Enum.uniq() |> Enum.sort() |> Enum.map(&Map.put(base, "value", &1))) ++ missing
   end
 
   # HTTP sends an InfluxQL query without `db` when there is none, and the
@@ -1299,18 +1414,69 @@ defmodule InfluxElixir.Client.Local do
   # The inner query gets typed rows: the caller's `format:` applies once, to
   # the InfluxQL result (it used to render the rows as CSV strings before
   # InfluxQL aggregated them).
-  @spec influxql_select(Store.t(), binary(), InfluxQL.query(), keyword()) ::
+  @spec influxql_select(Store.t(), binary(), InfluxQL.query()) ::
           InfluxElixir.Client.query_result()
-  defp influxql_select(table, database, query, opts) do
-    where = if query.where, do: " WHERE " <> query.where, else: ""
-    # ORDER BY time sorts on the stored nanoseconds; rows carry microsecond
-    # DateTimes, so sorting those alone would tie sub-microsecond points.
-    sql = ~s|SELECT * FROM "#{query.measurement}"| <> where <> " ORDER BY time"
-    # InfluxQL identifiers are case-sensitive: the SQL written from them is
-    # read as it is, not folded as a user's SQL would be.
-    case run_query(table, database, sql, Keyword.drop(opts, [:params, :format]), :exact) do
+  defp influxql_select(table, database, query) do
+    tags = Store.tag_columns(table, database, query.measurement)
+
+    with {:ok, where} <- influxql_where(query.where, tags) do
+      # ORDER BY time sorts on the stored nanoseconds; rows carry microsecond
+      # DateTimes, so sorting those alone would tie sub-microsecond points.
+      sql = ~s|SELECT * FROM "#{query.measurement}"| <> where <> " ORDER BY time"
+
+      table
+      |> run_influxql_sql(database, sql, tags)
+      |> influxql_result(query, tags)
+    end
+  end
+
+  @spec influxql_where(binary() | nil, MapSet.t(binary())) :: {:ok, binary()} | {:error, map()}
+  defp influxql_where(nil, _tags), do: {:ok, ""}
+
+  defp influxql_where(where, tags) do
+    case InfluxQL.where_sql(where, tags) do
+      {:ok, sql} -> {:ok, " WHERE " <> sql}
+      {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+    end
+  end
+
+  # InfluxQL reads a tag a point lacks as the empty string (verified), so
+  # the WHERE runs over points with every missing tag filled with "". A
+  # stored tag value is never empty (line protocol forbids it), so the
+  # filled ones are dropped from the rows again afterwards. InfluxQL
+  # identifiers are case-sensitive: the SQL written from them is read as
+  # it is, not folded as a user's SQL would be.
+  @spec run_influxql_sql(Store.t(), binary(), binary(), MapSet.t(binary())) ::
+          {:ok, [map()]} | {:error, term()}
+  defp run_influxql_sql(table, database, sql, tags) do
+    blank_tags = Map.new(tags, &{&1, ""})
+
+    fetch = fn measurement ->
+      with {:ok, points} <- point_source(table, database, measurement) do
+        {:ok, Enum.map(points, &%{&1 | tags: Map.merge(blank_tags, &1.tags)})}
+      end
+    end
+
+    with {:ok, query} <- SQLParser.parse_select(sql, identifiers: :exact),
+         rows when is_list(rows) <- SQLExecutor.run(query, fetch) do
+      {:ok, Enum.map(rows, &drop_blank_tags(&1, tags))}
+    else
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec drop_blank_tags(map(), MapSet.t(binary())) :: map()
+  defp drop_blank_tags(row, tags) do
+    Enum.reduce(tags, row, fn tag, row ->
+      if Map.get(row, tag) == "", do: Map.delete(row, tag), else: row
+    end)
+  end
+
+  @spec influxql_result({:ok, [map()]} | {:error, term()}, InfluxQL.query(), MapSet.t(binary())) ::
+          InfluxElixir.Client.query_result()
+  defp influxql_result(result, query, tags) do
+    case result do
       {:ok, rows} ->
-        tags = Store.tag_columns(table, database, query.measurement)
         {:ok, InfluxQL.run(query, rows, tags)}
 
       {:error, %{body: "Error during planning: table " <> _rest}} ->
@@ -1328,6 +1494,7 @@ defmodule InfluxElixir.Client.Local do
   defp influxql_parse(influxql) do
     case InfluxQL.parse(influxql) do
       {:ok, query} -> {:ok, query}
+      {:error, {:engine, body}} -> {:error, %{status: 400, body: body}}
       {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}: #{influxql}"}}
     end
   end

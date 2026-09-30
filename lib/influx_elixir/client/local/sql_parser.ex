@@ -65,6 +65,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           | :not_between
           | :like
           | :not_like
+          | :regex
+          | :not_regex
   @type where_clause :: {where_op(), binary(), term()}
 
   @typedoc """
@@ -1492,6 +1494,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @is_null_pattern ~r/^(\w+)\s+IS\s+NULL$/i
   @between_pattern ~r/^(.+?)\s+(NOT\s+)?BETWEEN\s+(.+?)\s+AND\s+(.+)$/is
   @like_pattern ~r/^(.+?)\s+(NOT\s+)?(I?LIKE)\s+'(.*)'$/is
+  @regex_pattern ~r/^(.+?)\s*(!?~\*?)\s*'(.*)'$/s
 
   @spec parse_single_where_clause(binary()) ::
           {:ok, where_clause()} | {:error, map()}
@@ -1530,6 +1533,14 @@ defmodule InfluxElixir.Client.Local.SQLParser do
                 {like_op(negated != ""), operand,
                  like_regex(pattern, String.upcase(kind) == "ILIKE")}}
 
+      match = Regex.run(@regex_pattern, trimmed) ->
+        [_full, left, op, pattern] = match
+
+        with {:ok, operand} <- parse_operand(String.trim(left)),
+             {:ok, regex} <- compile_sql_regex(String.replace(pattern, "''", "'"), op) do
+          {:ok, {regex_op(op), operand, {regex, op}}}
+        end
+
       # A bare column is a boolean predicate (`WHERE b`, `NOT b`).
       Regex.match?(~r/^[A-Za-z_]\w*$/, trimmed) and
           String.upcase(trimmed) not in ~w(TRUE FALSE NULL) ->
@@ -1551,6 +1562,32 @@ defmodule InfluxElixir.Client.Local.SQLParser do
            do: {:ok, {op, "time", {lo, hi}}}
     else
       {:ok, {op, operand, {parse_where_value(low), parse_where_value(high)}}}
+    end
+  end
+
+  # `~` / `~*` match and `!~` / `!~*` do not match a regular expression,
+  # anywhere in the value (unanchored); `*` ignores case. As on the engine
+  # (verified): a null is unknown and an invalid pattern fails the query.
+  # The engine's regexes are Rust's; the double compiles with Erlang's PCRE,
+  # which also accepts backreferences and lookaround the engine refuses.
+  @spec regex_op(binary()) :: :regex | :not_regex
+  defp regex_op("!" <> _rest), do: :not_regex
+  defp regex_op(_match), do: :regex
+
+  @spec compile_sql_regex(binary(), binary()) :: {:ok, Regex.t()} | {:error, map()}
+  defp compile_sql_regex(pattern, op) do
+    case Regex.compile(pattern, if(String.ends_with?(op, "*"), do: "iu", else: "u")) do
+      {:ok, regex} ->
+        {:ok, regex}
+
+      {:error, {reason, _position}} ->
+        {:error,
+         %{
+           status: 500,
+           body:
+             "Optimizer rule 'simplify_expressions' failed\ncaused by\nInvalid regex\n" <>
+               "caused by\nExternal error: regex parse error: #{reason}"
+         }}
     end
   end
 

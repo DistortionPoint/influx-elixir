@@ -903,6 +903,22 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end
   end
 
+  defp matches_condition?(point, {:regex, left, {regex, op}}) do
+    case left_value(point, left) do
+      nil -> nil
+      text when is_binary(text) -> Regex.match?(regex, text)
+      other -> throw({:query_error, %{status: 400, body: regex_type_error(other, op)}})
+    end
+  end
+
+  defp matches_condition?(point, {:not_regex, left, {regex, op}}) do
+    case left_value(point, left) do
+      nil -> nil
+      text when is_binary(text) -> not Regex.match?(regex, text)
+      other -> throw({:query_error, %{status: 400, body: regex_type_error(other, op)}})
+    end
+  end
+
   defp matches_condition?(point, {:not_like, left, regex}) do
     case left_value(point, left) do
       nil -> nil
@@ -986,6 +1002,20 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec to_nanoseconds(SQLParser.time_value()) :: integer()
   defp to_nanoseconds(value) when is_integer(value), do: value
   defp to_nanoseconds({:now, offset_ns}), do: Store.now_ns() + offset_ns
+
+  # A regular expression against a non-string column (verified).
+  @spec regex_type_error(term(), binary()) :: binary()
+  defp regex_type_error(value, op) do
+    type =
+      cond do
+        is_boolean(value) -> "Boolean"
+        is_integer(value) -> "Int64"
+        true -> "Float64"
+      end
+
+    "type_coercion\ncaused by\nError during planning: Cannot infer common argument type " <>
+      "for regex operation #{type} #{op} Utf8"
+  end
 
   # DataFusion: "There isn't a common type to coerce Float64 and Utf8 in
   # LIKE expression".

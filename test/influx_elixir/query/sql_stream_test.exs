@@ -17,7 +17,7 @@ defmodule InfluxElixir.Query.SQLStreamTest do
     end
 
     test "can be consumed with Enum.to_list", %{conn: conn} do
-      Local.write(conn, "cpu value=1i\ncpu value=2i", database: "test_db")
+      Local.write(conn, "cpu value=1i 1\ncpu value=2i 2", database: "test_db")
 
       result =
         conn

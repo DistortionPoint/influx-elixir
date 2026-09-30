@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`Client.Local` answers more of InfluxQL, as InfluxDB 3 does.** These
+  constructs were refused by name and are now answered, verified against
+  Core:
+  - regular expressions (`tag =~ /re/`, `!~`);
+  - relative time (`time > now() - 30m`);
+  - double-quoted identifiers;
+  - `SHOW TAG VALUES [FROM m] WITH KEY = | != | =~ | !~ | IN (...)
+    [WHERE ...]`, with the engine's row per missing key and its default
+    24-hour window.
+
+  Arithmetic in the select list, several measurements in `FROM`,
+  sub-second durations, and `LIMIT`/`OFFSET` on `SHOW TAG VALUES` are
+  still refused by name.
+- **`Client.Local` SQL has the regular-expression operators** `~`, `!~`,
+  `~*` and `!~*`, with DataFusion's semantics (verified): unanchored, a
+  null is unknown, a non-string column is the engine's planning error,
+  and an invalid pattern is its 500.
+
+### Fixed
+- **`Client.Local` answered some InfluxQL `WHERE` clauses wrongly.** It
+  ran InfluxQL's `WHERE` with SQL's null rules, but InfluxQL reads a tag
+  a point lacks as the empty string. Verified against Core:
+  - `host != 'h1'` dropped points without `host`; the engine keeps them.
+  - `host = ''` found nothing; the engine finds those points.
+  - `host > 'h0'` compared strings; ordering a tag is always false in
+    InfluxQL.
+  - `NOT`, which InfluxQL does not have, was answered; the engine
+    refuses it as a parse error.
+- **Untimed lines of one write became separate points in `Client.Local`.**
+  Both engines give every line of a write that has no timestamp the same
+  time, the request's, so lines of one series are one point, with fields
+  merged and the last write winning. The double stamped each line
+  separately and kept them as separate rows. Tests that wrote several
+  untimed points of one series and counted rows now write timestamps.
+
 ## [0.1.36] - 2026-09-30
 
 ### Fixed

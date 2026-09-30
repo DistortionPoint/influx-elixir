@@ -666,7 +666,9 @@ forgotten pair of quotes.
 
 Predicates are `=`, `!=` / `<>`, `<`, `<=`, `>`, `>=`, `IN (...)`,
 `NOT IN (...)`, `IS [NOT] NULL`, `[NOT] BETWEEN low AND high` and
-`[NOT] LIKE` / `ILIKE`, combined with `AND`, `OR`, `NOT` and parentheses.
+`[NOT] LIKE` / `ILIKE`, the regular-expression operators `~`, `!~`, `~*`
+and `!~*` (unanchored; `*` ignores case), combined with `AND`, `OR`, `NOT`
+and parentheses.
 `AND` binds tighter than `OR`, as in SQL:
 
 ```elixir
@@ -800,8 +802,29 @@ selector (`MAX`, `MIN`, `FIRST`, `LAST`) returns its point's time and the
 columns beside it. `LIMIT` and `OFFSET` apply per `GROUP BY` series. An
 unknown column or measurement is `{:ok, []}`. `SHOW DATABASES`,
 `SHOW MEASUREMENTS`, `SHOW TAG KEYS [FROM m]` and `SHOW FIELD KEYS [FROM m]`
-are answered from the schema. `GROUP BY time(...)`, regular expressions,
-`fill()`, `INTO` and subqueries are refused by name.
+are answered from the schema.
+
+InfluxQL's `WHERE` is not SQL's, and the double follows the engine
+(verified):
+
+- A tag a point lacks is the empty string: `host != 'h1'` keeps points
+  without `host`, and `host = ''` finds them. A missing field stays null.
+- `host =~ /h1/` and `host !~ /h1/` match anywhere in the value
+  (`/^h1$/` to anchor, `(?i)` to ignore case). A regex on a field, or `<`,
+  `>`, `<=` or `>=` on a tag, is false.
+- `time > now() - 30m` works with `s`, `m`, `h`, `d` and `w` durations.
+- `"host"` and `"usage"` are exact identifiers; InfluxQL folds no case.
+- InfluxQL has no `NOT`: it is the engine's parse error.
+
+`SHOW TAG VALUES [FROM m] WITH KEY = k` (also `!= k`, `=~ /re/`, `!~ /re/`,
+`IN (a, b)`, and an optional `WHERE`) lists each value once, by
+measurement, key and value, plus a row without `"value"` when a point
+lacks the key. Only the last 24 hours count unless the `WHERE` bounds
+`time`, as on the engine.
+
+`GROUP BY time(...)`, `fill()`, `INTO`, subqueries, arithmetic in the
+select list, several measurements in `FROM`, sub-second durations, and
+`LIMIT` / `OFFSET` on `SHOW TAG VALUES` are refused by name.
 
 ## Running Against a Real InfluxDB
 

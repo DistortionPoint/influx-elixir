@@ -339,7 +339,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "multi-line write stores multiple points", %{conn: conn, db: db} do
-      lp = "m value=1.0\nm value=2.0\nm value=3.0"
+      lp = "m value=1.0 1\nm value=2.0 2\nm value=3.0 3"
       Local.write(conn, lp, database: db)
       assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert length(rows) == 3
@@ -957,7 +957,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       Local.write(
         conn,
-        "cpu,host=web01 value=10i\ncpu,host=web02 value=20i\ncpu,host=web01 value=30i",
+        "cpu,host=web01 value=10i 1\ncpu,host=web02 value=20i 2\ncpu,host=web01 value=30i 3",
         database: "del_db"
       )
 
@@ -983,7 +983,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       Local.write(
         conn,
-        "cpu,host=web01 value=10i\ncpu,host=web02 value=20i\ncpu,host=web01 value=30i",
+        "cpu,host=web01 value=10i 1\ncpu,host=web02 value=20i 2\ncpu,host=web01 value=30i 3",
         database: "del_db"
       )
 
@@ -1684,7 +1684,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "comments and blank lines are ignored", %{conn: conn, db: db} do
-      lp = "# This is a comment\n\nm value=1i\n\n# Another comment\nm value=2i\n"
+      lp = "# This is a comment\n\nm value=1i 1\n\n# Another comment\nm value=2i 2\n"
       Local.write(conn, lp, database: db)
       assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM m", database: db)
       assert length(rows) == 2
@@ -3114,10 +3114,10 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, []} = Local.query_sql(conn, sql, database: db)
     end
 
-    test "aggregate on measurement without explicit timestamps uses server time",
+    test "untimed lines of one write share the server's time, so one series is one point",
          %{conn: conn, db: db} do
-      # Points without timestamps get server-assigned time (like real InfluxDB).
-      # Both points land in the same 1-hour bucket since they're written together.
+      # Both engines stamp every untimed line of a write with the request's
+      # time (verified): the two lines are one point, the later value wins.
       Local.write(conn, "no_ts val=10i\nno_ts val=20i", database: db)
 
       sql = """
@@ -3129,7 +3129,7 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["total"] == 30
+      assert row["total"] == 20
       # Bucket time should be the server-assigned hour, not the epoch
       assert %DateTime{} = row["time"]
       refute row["time"] == ~U[1970-01-01 00:00:00.000000Z]
@@ -3242,11 +3242,13 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, ent} = Local.start(databases: [db], profile: :v3_enterprise)
       on_exit(fn -> Local.stop(ent) end)
 
-      Local.write(ent, Enum.map_join(1..50, "\n", &"m,k=old v=#{&1}i"), database: db)
+      # Explicit timestamps: the untimed lines of one write share a time
+      # and would be one point, as on the engines.
+      Local.write(ent, Enum.map_join(1..50, "\n", &"m,k=old v=#{&1}i #{&1}"), database: db)
 
       writer =
         Task.async(fn ->
-          for i <- 1..50, do: Local.write(ent, "m,k=new v=#{i}i", database: db)
+          for i <- 1..50, do: Local.write(ent, "m,k=new v=#{i}i #{100 + i}", database: db)
         end)
 
       {:ok, %{"rows_affected" => 50}} =
@@ -5598,7 +5600,8 @@ defmodule InfluxElixir.Client.LocalTest do
     test "constructs the double does not model are refused by name", %{conn: conn} do
       for {statement, name} <- [
             {"SELECT MEAN(v) FROM o WHERE time > 0 GROUP BY time(1m)", "GROUP BY time(...)"},
-            {"SELECT v FROM o WHERE h =~ /x/", "regular expressions"},
+            {"SELECT v FROM o WHERE time > now() - 500ms", "sub-second duration"},
+            {"SHOW TAG VALUES WITH KEY = h LIMIT 1", "SHOW TAG VALUES with LIMIT/OFFSET"},
             {"SELECT MEDIAN(v) FROM o", "function"},
             {"SELECT SUM(*) FROM o", "sum(*)"},
             {"SELECT MEAN(v), h FROM o", "columns beside aggregates"}
@@ -5606,6 +5609,11 @@ defmodule InfluxElixir.Client.LocalTest do
         assert {:error, %{status: 400, body: body}} = iq(conn, statement)
         assert body =~ name, statement
       end
+
+      # NOT is no InfluxQL keyword: the engine's parse error, not a refusal.
+      assert {:error,
+              %{status: 400, body: "error in InfluxQL statement: parsing error:" <> _rest}} =
+               iq(conn, "SELECT v FROM o WHERE NOT h = 'x'")
     end
   end
 

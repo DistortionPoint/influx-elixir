@@ -92,6 +92,7 @@ defmodule InfluxElixir.ClientContract do
     database_rule_tests = if v3_sql, do: database_rule_tests(client), else: nil
     distinct_on_tests = if v3_sql, do: distinct_on_tests(client), else: nil
     identifier_tests = if v3_sql, do: identifier_tests(client), else: nil
+    influxql_where_tests = if v3_sql, do: influxql_where_tests(client), else: nil
     tab_tests = if v3_sql, do: tab_tests(client), else: nil
     timestamp_range_tests = timestamp_range_tests(client, if(v2_ops, do: :v2, else: :v3))
 
@@ -141,6 +142,7 @@ defmodule InfluxElixir.ClientContract do
         database_rule_tests,
         distinct_on_tests,
         identifier_tests,
+        influxql_where_tests,
         tab_tests,
         timestamp_range_tests,
         bucket_tests,
@@ -2297,6 +2299,94 @@ defmodule InfluxElixir.ClientContract do
   # InfluxQL SELECT shapes and sub-microsecond time (v3_core, v3_enterprise)
   # ---------------------------------------------------------------------------
 
+  # InfluxQL's WHERE and SHOW TAG VALUES, verified against InfluxDB 3: a
+  # missing tag is the empty string, regexes match tags only, ordering a
+  # tag is false, durations work with now(), NOT does not exist.
+  defp influxql_where_tests(client) do
+    quote do
+      describe "query_influxql/3 — WHERE and SHOW TAG VALUES contract" do
+        setup ctx do
+          m = "contract_iqw_#{System.unique_integer([:positive])}"
+          now = System.os_time(:second)
+
+          lp =
+            Enum.join(
+              [
+                "#{m},host=h1 v=1i #{now - 7200}",
+                "#{m},host=h2 v=2i #{now - 1800}",
+                "#{m},host=h12 v=3i #{now - 600}",
+                "#{m} v=4i #{now - 300}",
+                "#{m},host=H1 v=5i #{now - 60}",
+                "#{m},host=old v=6i #{now - 90_000}"
+              ],
+              "\n"
+            )
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, lp, database: ctx.database, precision: :second)
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          vs = fn where ->
+            {:ok, rows} =
+              unquote(client).query_influxql(ctx.conn, "SELECT v FROM #{m} WHERE #{where}",
+                database: ctx.database
+              )
+
+            Enum.map(rows, & &1["v"])
+          end
+
+          {:ok, m: m, vs: vs}
+        end
+
+        test "a missing tag is the empty string; regexes are unanchored", %{vs: vs} do
+          assert vs.("host =~ /h1/") == [1, 3]
+          assert vs.("host =~ /^h1$/") == [1]
+          assert vs.("host =~ /(?i)h1/") == [1, 3, 5]
+          assert vs.("host !~ /h1/") == [6, 2, 4, 5]
+          assert vs.("host != 'h1'") == [6, 2, 3, 4, 5]
+          assert vs.("host = ''") == [4]
+        end
+
+        test "ordering a tag, or a regex on a field, is false", %{vs: vs} do
+          assert vs.("host > 'h0'") == []
+          assert vs.("host >= 'h1' OR v = 4") == [4]
+          assert vs.("v =~ /1/") == []
+        end
+
+        test "durations with now(), and quoted identifiers", ctx do
+          assert ctx.vs.("time > now() - 40m") == [2, 3, 4, 5]
+          assert ctx.vs.("time > now() - 1h AND time < now() - 5m") == [2, 3, 4]
+          assert ctx.vs.("\"host\" = 'h2'") == [2]
+        end
+
+        test "NOT is the engine's parse error", ctx do
+          assert {:error,
+                  %{status: 400, body: "error in InfluxQL statement: parsing error:" <> _rest}} =
+                   unquote(client).query_influxql(
+                     ctx.conn,
+                     "SELECT v FROM #{ctx.m} WHERE NOT host = 'h1'",
+                     database: ctx.database
+                   )
+        end
+
+        test "SHOW TAG VALUES: sorted values, a row for the missing key, the last 24 hours",
+             ctx do
+          assert {:ok, rows} =
+                   unquote(client).query_influxql(
+                     ctx.conn,
+                     "SHOW TAG VALUES FROM #{ctx.m} WITH KEY = host",
+                     database: ctx.database
+                   )
+
+          base = %{"iox::measurement" => ctx.m, "key" => "host"}
+          values = for v <- ["H1", "h1", "h12", "h2"], do: Map.put(base, "value", v)
+          assert rows == values ++ [base]
+        end
+      end
+    end
+  end
+
   defp influxql_select_tests(client) do
     quote do
       describe "query_influxql/3 — SELECT shape contract" do
@@ -3271,6 +3361,45 @@ defmodule InfluxElixir.ClientContract do
   defp timestamp_range_tests(client, version) do
     quote do
       describe "write/3 — timestamp range contract" do
+        # Both engines stamp every untimed line of one write with the same
+        # time (verified): lines of one series are one point, fields merged,
+        # the last write winning.
+        test "untimed lines of one write are one point per series", ctx do
+          m = "contract_untimed_#{System.unique_integer([:positive])}"
+
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "#{m},k=a v=1i\n#{m},k=a v=2i,w=9i\n#{m},k=b v=3i",
+                     database: ctx.database
+                   )
+
+          InfluxElixir.ClientContract.settle(ctx)
+
+          rows =
+            if unquote(version) == :v2 do
+              flux =
+                ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) | <>
+                  ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
+
+              {:ok, rows} = unquote(client).query_flux(ctx.conn, flux)
+              rows |> Enum.map(&{&1["k"], &1["_field"], &1["_value"]}) |> Enum.sort()
+            else
+              {:ok, rows} =
+                unquote(client).query_sql(ctx.conn, ~s|SELECT k, v, w FROM "#{m}" ORDER BY k|,
+                  database: ctx.database
+                )
+
+              rows
+            end
+
+          if unquote(version) == :v2 do
+            assert rows == [{"a", "v", 2}, {"a", "w", 9}, {"b", "v", 3}]
+          else
+            assert rows == [%{"k" => "a", "v" => 2, "w" => 9}, %{"k" => "b", "v" => 3}]
+          end
+        end
+
         test "the largest timestamp per precision is stored; one more is refused", ctx do
           m = "contract_ts_#{System.unique_integer([:positive])}"
           v2? = unquote(version) == :v2
