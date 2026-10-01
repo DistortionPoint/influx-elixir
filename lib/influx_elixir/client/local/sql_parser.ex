@@ -11,7 +11,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   Pure functions only: no ETS, no connection state.
   """
 
-  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLIdentifiers}
+  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLFunctions, SQLIdentifiers}
 
   # The one place a SELECT is cut into its parts. A measurement name is
   # quoted, or bare with escaped spaces ("my\ measurement") — everything up
@@ -31,6 +31,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           | {:op, :+ | :- | :* | :/ | :rem, expr(), expr()}
           | {:neg, expr()}
           | {:cast, expr(), cast_type()}
+          | {:call, InfluxElixir.Client.Local.SQLFunctions.name(), [expr()]}
 
   @typedoc "`CAST(expr AS INTEGER | DOUBLE | VARCHAR)` targets (and their synonyms)."
   @type cast_type :: :integer | :float | :string
@@ -1012,9 +1013,14 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   #   expr   := term   (('+' | '-') term)*
   #   term   := factor (('*' | '/' | '%') factor)*
   #   factor := '-' factor | number | identifier | '(' expr ')'
+  #           | function '(' [expr (',' expr)*] ')'
+  #
+  # `function` is one of `InfluxElixir.Client.Local.SQLFunctions`; any
+  # number of arguments parses, and the executor answers a wrong count or
+  # type as the engine's planner does.
   # ---------------------------------------------------------------------------
 
-  @expr_token ~r/\s*(?:(\d+\.\d+|\d+)|(\w+)|([()+\-*\/%]))/
+  @expr_token ~r/\s*(?:(\d+\.\d+|\d+)|(\w+)|([()+\-*\/%,]))/
 
   # `col::INTEGER` is DataFusion's shorthand for `CAST(col AS INTEGER)`.
   @shorthand_cast ~r/(\w+)::(\w+)/
@@ -1113,6 +1119,13 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
+  defp parse_factor([{:field, name} = field, {:tok, "("} | args] = tokens) do
+    case SQLFunctions.lookup(name) do
+      nil -> {:ok, field, tl(tokens)}
+      function -> parse_call(function, args)
+    end
+  end
+
   defp parse_factor([{:field, _name} = field | rest]), do: {:ok, field, rest}
 
   defp parse_factor([{:tok, "("} | rest]) do
@@ -1124,6 +1137,26 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   defp parse_factor(_tokens), do: {:error, :unexpected_token}
+
+  @spec parse_call(SQLFunctions.name(), [term()]) :: {:ok, expr(), [term()]} | {:error, term()}
+  defp parse_call(function, [{:tok, ")"} | rest]), do: {:ok, {:call, function, []}, rest}
+  defp parse_call(function, tokens), do: parse_call_args(function, tokens, [])
+
+  defp parse_call_args(function, tokens, args) do
+    case parse_sum(tokens) do
+      {:ok, arg, [{:tok, ","} | rest]} ->
+        parse_call_args(function, rest, [arg | args])
+
+      {:ok, arg, [{:tok, ")"} | rest]} ->
+        {:ok, {:call, function, Enum.reverse([arg | args])}, rest}
+
+      {:ok, _arg, _rest} ->
+        {:error, :unbalanced_parenthesis}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
 
   # The SQL type names DataFusion accepts for the three casts the double
   # performs; anything else (BOOLEAN, TIMESTAMP, ...) is outside the subset.
@@ -1488,10 +1521,13 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # IN / NOT IN must be matched before binary operators because they don't
   # contain any of {=, <, >, !} characters that the binary-op scanner looks
   # for. Order: NOT IN before IN (NOT IN substring contains IN).
-  @not_in_pattern ~r/^(\w+)\s+NOT\s+IN\s*\((.*)\)\s*$/is
-  @in_pattern ~r/^(\w+)\s+IN\s*\((.*)\)\s*$/is
-  @is_not_null_pattern ~r/^(\w+)\s+IS\s+NOT\s+NULL$/i
-  @is_null_pattern ~r/^(\w+)\s+IS\s+NULL$/i
+  # The left side of these is a column or an expression (`abs(x) IS NULL`,
+  # `price * 2 IN (...)`); a match whose left side is neither (the words
+  # inside a string literal, say) is not one of them.
+  @not_in_pattern ~r/^(.+?)\s+NOT\s+IN\s*\((.*)\)\s*$/is
+  @in_pattern ~r/^(.+?)\s+IN\s*\((.*)\)\s*$/is
+  @is_not_null_pattern ~r/^(.+?)\s+IS\s+NOT\s+NULL$/is
+  @is_null_pattern ~r/^(.+?)\s+IS\s+NULL$/is
   @between_pattern ~r/^(.+?)\s+(NOT\s+)?BETWEEN\s+(.+?)\s+AND\s+(.+)$/is
   @like_pattern ~r/^(.+?)\s+(NOT\s+)?(I?LIKE)\s+'(.*)'$/is
   @regex_pattern ~r/^(.+?)\s*(!?~\*?)\s*'(.*)'$/s
@@ -1502,20 +1538,20 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     trimmed = String.trim(clause)
 
     cond do
-      match = Regex.run(@is_not_null_pattern, trimmed) ->
-        [_full, key] = match
+      match = operand_match(@is_not_null_pattern, trimmed) ->
+        [key] = match
         {:ok, {:is_not_null, key, nil}}
 
-      match = Regex.run(@is_null_pattern, trimmed) ->
-        [_full, key] = match
+      match = operand_match(@is_null_pattern, trimmed) ->
+        [key] = match
         {:ok, {:is_null, key, nil}}
 
-      match = Regex.run(@not_in_pattern, trimmed) ->
-        [_full, key, list_str] = match
+      match = operand_match(@not_in_pattern, trimmed) ->
+        [key, list_str] = match
         with {:ok, values} <- parse_in_values(key, list_str), do: {:ok, {:not_in, key, values}}
 
-      match = Regex.run(@in_pattern, trimmed) ->
-        [_full, key, list_str] = match
+      match = operand_match(@in_pattern, trimmed) ->
+        [key, list_str] = match
         with {:ok, values} <- parse_in_values(key, list_str), do: {:ok, {:in, key, values}}
 
       match = Regex.run(@between_pattern, trimmed) ->
@@ -1548,6 +1584,18 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
       true ->
         parse_binary_where_clause(trimmed)
+    end
+  end
+
+  # The pattern's captures with the first parsed as an operand, or nil when
+  # the pattern does not match or its left side is not an operand.
+  @spec operand_match(Regex.t(), binary()) :: [term()] | nil
+  defp operand_match(pattern, text) do
+    with [_full, left | rest] <- Regex.run(pattern, text),
+         {:ok, operand} <- parse_operand(String.trim(left)) do
+      [operand | rest]
+    else
+      _no_match -> nil
     end
   end
 
@@ -1641,12 +1689,42 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       {op, "time", right} ->
         with {:ok, value} <- parse_time_comparand(right), do: {:ok, {op, "time", value}}
 
+      # A literal on the left (`1 < abs(x)`, `'2024-01-01' <= time`) is the
+      # same comparison turned around. It was read as a column named `1`:
+      # the engine's schema error, for a query the engine answers.
+      {op, key, "time"} ->
+        with true <- literal?(key),
+             {:ok, value} <- parse_time_comparand(key) do
+          {:ok, {mirror(op), "time", value}}
+        else
+          false -> {:error, local_error("unsupported WHERE clause: #{trimmed}")}
+          {:error, _reason} = error -> error
+        end
+
       {op, key, right} ->
-        with {:ok, left} <- parse_operand(key),
-             {:ok, value} <- parse_comparand(right),
-             do: {:ok, {op, left, value}}
+        if literal?(key),
+          do: comparison(mirror(op), right, key),
+          else: comparison(op, key, right)
     end
   end
+
+  @spec comparison(where_op(), binary(), binary()) :: {:ok, where_clause()} | {:error, map()}
+  defp comparison(op, operand, comparand) do
+    with {:ok, left} <- parse_operand(operand),
+         {:ok, value} <- parse_comparand(comparand),
+         do: {:ok, {op, left, value}}
+  end
+
+  @spec literal?(binary()) :: boolean()
+  defp literal?(text),
+    do: quoted?(text) or text in ["true", "false"] or is_number(coerce_value(text))
+
+  @spec mirror(where_op()) :: where_op()
+  defp mirror(:gt), do: :lt
+  defp mirror(:lt), do: :gt
+  defp mirror(:gte), do: :lte
+  defp mirror(:lte), do: :gte
+  defp mirror(op), do: op
 
   # The left side is a column, or an arithmetic expression over columns
   # (`2 * price > volume`).

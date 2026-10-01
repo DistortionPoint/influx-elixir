@@ -12,6 +12,8 @@ defmodule InfluxElixir.Client.ContractLocalV3CoreTest do
     client: InfluxElixir.Client.Local,
     profile: :v3_core
 
+  use InfluxElixir.TokenContract, client: InfluxElixir.Client.Local, profile: :v3_core
+
   alias InfluxElixir.Client.Local
 
   setup do

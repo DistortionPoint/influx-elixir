@@ -13,8 +13,8 @@ doesn't support.
 
 | Profile | Operations |
 |---|---|
-| `:v3_core` | write, SQL queries, InfluxQL, database CRUD |
-| `:v3_enterprise` | everything in v3_core + token management |
+| `:v3_core` | write, SQL queries, InfluxQL, database CRUD, admin tokens |
+| `:v3_enterprise` | everything in v3_core + resource tokens (`create_token/3` with `:permissions`) |
 | `:v2` | write, Flux queries, bucket CRUD |
 
 ## Setup
@@ -668,7 +668,14 @@ Predicates are `=`, `!=` / `<>`, `<`, `<=`, `>`, `>=`, `IN (...)`,
 `NOT IN (...)`, `IS [NOT] NULL`, `[NOT] BETWEEN low AND high` and
 `[NOT] LIKE` / `ILIKE`, the regular-expression operators `~`, `!~`, `~*`
 and `!~*` (unanchored; `*` ignores case), combined with `AND`, `OR`, `NOT`
-and parentheses.
+and parentheses. Either side of a predicate may be an expression: arithmetic,
+`CAST`, and the scalar functions `abs`, `round(x[, n])`, `floor` and `ceil`
+(`abs(amount) >= $threshold`, `1 < abs(f)`, `round(price, 2) IN (...)`).
+Those functions work in the select list, `ORDER BY` and aggregates too, as on
+the engine (verified): `abs` keeps its argument's type, the others return
+floats, `round` rounds half away from zero, and a null argument gives null. A
+wrong argument type or count is the engine's planning error, even when no row
+matches, worded as the engine words it for the clause the call is in.
 `AND` binds tighter than `OR`, as in SQL:
 
 ```elixir

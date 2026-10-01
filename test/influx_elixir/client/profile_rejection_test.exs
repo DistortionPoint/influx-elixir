@@ -46,18 +46,6 @@ defmodule InfluxElixir.Client.ProfileRejectionTest do
       assert {:error, :unsupported_operation} =
                Local.delete_bucket(conn, "bkt")
     end
-
-    test "create_token returns {:error, :unsupported_operation}",
-         %{conn: conn} do
-      assert {:error, :unsupported_operation} =
-               Local.create_token(conn, "tok")
-    end
-
-    test "delete_token returns {:error, :unsupported_operation}",
-         %{conn: conn} do
-      assert {:error, :unsupported_operation} =
-               Local.delete_token(conn, "id")
-    end
   end
 
   # ---------------------------------------------------------------------------

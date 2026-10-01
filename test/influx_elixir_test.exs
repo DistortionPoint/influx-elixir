@@ -130,23 +130,15 @@ defmodule InfluxElixirTest do
     end
   end
 
-  describe "create_token/3" do
-    test "delegates to configured client" do
-      {:ok, ent_conn} = Local.start(profile: :v3_enterprise)
-      on_exit(fn -> Local.stop(ent_conn) end)
+  describe "create_token/3 and delete_token/2" do
+    test "create a named token and delete it by name", %{conn: conn} do
+      assert {:ok, %{"id" => 1, "name" => "facade", "expiry" => nil}} =
+               InfluxElixir.create_token(conn, "facade")
 
-      assert {:ok, %{"token" => secret, "description" => "test token"}} =
-               InfluxElixir.create_token(ent_conn, "test token")
+      assert :ok = InfluxElixir.delete_token(conn, "facade")
 
-      assert byte_size(secret) > 0
-    end
-  end
-
-  describe "delete_token/2" do
-    test "delegates to configured client" do
-      {:ok, ent_conn} = Local.start(profile: :v3_enterprise)
-      on_exit(fn -> Local.stop(ent_conn) end)
-      assert :ok = InfluxElixir.delete_token(ent_conn, "token_id")
+      assert {:error, %{status: 404, body: "the requested resource was not found: facade"}} =
+               InfluxElixir.delete_token(conn, "facade")
     end
   end
 

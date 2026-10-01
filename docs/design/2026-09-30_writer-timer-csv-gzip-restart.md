@@ -146,6 +146,9 @@ pattern, the pattern was compiled on every call, about 1.2 µs a name.
 
 ## Open: token management does not match either server
 
+> **Resolved** in
+> [`2026-10-01_scalar-functions-and-named-tokens`](2026-10-01_scalar-functions-and-named-tokens.md).
+
 The same probes showed that `create_token/3` and `delete_token/2` call
 `POST /api/v3/configure/token` and `DELETE /api/v3/configure/token/{id}`.
 Neither exists on InfluxDB 3 Core 3.10.1: both answer 404 with auth

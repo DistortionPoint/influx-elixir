@@ -315,6 +315,8 @@ defmodule InfluxElixir.Client.Local do
 
   @behaviour InfluxElixir.Client
 
+  alias InfluxElixir.Admin.TokenRequest
+
   alias InfluxElixir.Client.Local.{
     Body,
     DatabaseRules,
@@ -350,7 +352,9 @@ defmodule InfluxElixir.Client.Local do
       :query_influxql,
       :create_database,
       :list_databases,
-      :delete_database
+      :delete_database,
+      :create_token,
+      :delete_token
     ],
     v3_enterprise: [
       :health,
@@ -415,8 +419,9 @@ defmodule InfluxElixir.Client.Local do
     * `:profile` - InfluxDB version profile to emulate. Determines which
       operations are available. Operations outside the profile return
       `{:error, :unsupported_operation}`. Valid values:
-      - `:v3_core` (default) — write, SQL, InfluxQL, database CRUD
-      - `:v3_enterprise` — everything in v3_core plus token management
+      - `:v3_core` (default) — write, SQL, InfluxQL, database CRUD, admin tokens
+      - `:v3_enterprise` — everything in v3_core plus resource tokens
+        (`create_token/3` with `:permissions`)
       - `:v2` — write, Flux, bucket CRUD
 
   ## Examples
@@ -1761,9 +1766,11 @@ defmodule InfluxElixir.Client.Local do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Creates a synthetic API token and stores it in ETS.
-
-  Returns `{:ok, %{id: id, token: token_string, description: desc}}`.
+  Creates a named token as InfluxDB 3 does (verified against Core): an
+  admin token, or with `:permissions` a resource token, on `:v3_enterprise`
+  only (Core's 404 `Not found`). See `InfluxElixir.Admin.Tokens.create/3`
+  for the options and the answers. Ids count up from 1 (the operator token
+  `_admin` is 0) and are never reused; the secret is random.
   """
   @impl true
   @spec create_token(
@@ -1771,33 +1778,86 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           keyword()
         ) :: {:ok, map()} | {:error, term()}
-  def create_token(%{table: table} = conn, description, _opts \\ []) do
-    with :ok <- require_capability(conn, :create_token) do
-      id = generate_id()
-      token_string = "local-token-#{id}"
+  def create_token(%{table: table, profile: profile} = conn, name, opts \\ []) do
+    with :ok <- require_capability(conn, :create_token),
+         {:ok, {kind, _path, body}} <- TokenRequest.build(name, opts),
+         :ok <- token_endpoint(kind, profile),
+         {:ok, expiry_secs} <- check_expiry(Keyword.get(opts, :expiry_secs), body) do
+      case Store.claim_token(table, name) do
+        {:ok, id} ->
+          token = new_token(id, name, expiry_secs)
+          Store.put_token(table, name, token)
+          {:ok, token}
 
-      token = %{
-        "id" => id,
-        "token" => token_string,
-        "description" => description
-      }
-
-      Store.put_token(table, id, token)
-      {:ok, token}
+        :exists ->
+          {:error, %{status: 409, body: "token name already exists, #{name}"}}
+      end
     end
   end
 
+  @spec token_endpoint(TokenRequest.kind(), profile()) :: :ok | {:error, map()}
+  defp token_endpoint(:resource, profile) when profile != :v3_enterprise,
+    do: {:error, %{status: 404, body: "Not found"}}
+
+  defp token_endpoint(_kind, _profile), do: :ok
+
+  # `expiry_secs` is a u64 to the engine; anything else is its JSON error,
+  # at the end of the value — the last key of the body (verified).
+  @spec check_expiry(term(), binary()) :: {:ok, non_neg_integer() | nil} | {:error, map()}
+  defp check_expiry(nil, _body), do: {:ok, nil}
+  defp check_expiry(secs, _body) when is_integer(secs) and secs >= 0, do: {:ok, secs}
+
+  defp check_expiry(secs, body) do
+    what =
+      cond do
+        is_integer(secs) -> "invalid value: integer `#{secs}`"
+        is_float(secs) -> "invalid type: floating point `#{secs}`"
+        is_boolean(secs) -> "invalid type: boolean `#{secs}`"
+        is_binary(secs) -> ~s|invalid type: string "#{secs}"|
+        true -> "invalid type: `#{inspect(secs)}`"
+      end
+
+    {:error,
+     %{
+       status: 400,
+       body: "serde json error: #{what}, expected u64 at line 1 column #{byte_size(body) - 1}"
+     }}
+  end
+
+  @spec new_token(pos_integer(), binary(), non_neg_integer() | nil) :: map()
+  defp new_token(id, name, expiry_secs) do
+    created = DateTime.utc_now() |> DateTime.truncate(:millisecond)
+    secret = "apiv3_" <> Base.url_encode64(:crypto.strong_rand_bytes(64), padding: false)
+
+    %{
+      "id" => id,
+      "name" => name,
+      "token" => secret,
+      "hash" => :sha512 |> :crypto.hash(secret) |> Base.encode16(case: :lower),
+      "created_at" => DateTime.to_iso8601(created),
+      "expiry" => expiry_secs && DateTime.to_iso8601(DateTime.add(created, expiry_secs))
+    }
+  end
+
   @doc """
-  Deletes a token by its `id` field. Returns `:ok` even if the token was
-  not found, matching real InfluxDB delete semantics.
+  Deletes the token named `name` as InfluxDB 3 does: `:ok`, the engine's
+  404 for a name no token has, its 405 for the operator token `_admin`.
   """
   @impl true
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_token(%{table: table} = conn, token_id) do
+  def delete_token(%{table: table} = conn, name) do
     with :ok <- require_capability(conn, :delete_token) do
-      Store.delete_token(table, token_id)
-      :ok
+      cond do
+        name == "_admin" ->
+          {:error, %{status: 405, body: "cannot delete operator token"}}
+
+        Store.delete_token(table, name) == :ok ->
+          :ok
+
+        true ->
+          {:error, %{status: 404, body: "the requested resource was not found: #{name}"}}
+      end
     end
   end
 
@@ -1897,11 +1957,6 @@ defmodule InfluxElixir.Client.Local do
       status: 400,
       body: "Error during planning: No value found for placeholder with name #{name}"
     }
-  end
-
-  @spec generate_id() :: binary()
-  defp generate_id do
-    :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
   end
 
   @spec bucket_id(binary()) :: binary()

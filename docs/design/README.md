@@ -59,6 +59,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-09-27 | [`local-database-rules`](2026-09-27_local-database-rules.md) | Local drops the implicit "default" database (HTTP's `:no_database_specified`), defaults to the first of `:databases`, applies Core's name rules, 5-database limit, missing-database 404 and `_internal` |
 | 2026-09-27 | [`local-distinct-on`](2026-09-27_local-distinct-on.md) | #23: Local runs `SELECT DISTINCT ON (cols)` with the engine's semantics and refusals |
 | 2026-09-30 | [`local-influxql-where-and-tag-values`](2026-09-30_local-influxql-where-and-tag-values.md) | InfluxQL WHERE with InfluxQL semantics (missing tag = `''`, regex, durations, tag ordering false, no NOT); `SHOW TAG VALUES`; SQL `~` operators; untimed lines of one write share a time |
+| 2026-10-01 | [`scalar-functions-and-named-tokens`](2026-10-01_scalar-functions-and-named-tokens.md) | Issue #25: `abs`/`round`/`floor`/`ceil` wherever an expression stands, with the planner's errors; expression operands for `IS NULL`/`IN`, a literal on the left; token API rebuilt on the endpoints the servers serve |
 | 2026-09-30 | [`writer-timer-csv-gzip-restart`](2026-09-30_writer-timer-csv-gzip-restart.md) | BatchWriter timer re-armed; one-column v3 CSV rows kept; `gzip:` owned by `Writer`, Local reads bodies as the engines do; killed connection restarts alone; HTTP `execute_sql` params and `database: nil`; encoder 6x; token API mismatch recorded |
 | 2026-09-30 | [`local-write-speed-and-line-endings`](2026-09-30_local-write-speed-and-line-endings.md) | Local writes ~40% faster (byte trims, per-write column-kind cache, lazy `time` check); CRLF, `\r` and whitespace-only lines as both engines answer them |
 | 2026-09-29 | [`query-admin-modules-delegate`](2026-09-29_query-admin-modules-delegate.md) | `Query.*` and `Admin.*` call the facade: connection names resolve and queries emit telemetry, as through `InfluxElixir` |
@@ -90,5 +91,12 @@ docker run -d --rm --name influx2_verify -p 8086:8086 \
   -e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=dev-influx-token-123456789 influxdb:2.7
 mix test test/integration/contract_v2_test.exs --include v2 --include integration
 
-docker stop influx3_verify influx2_verify
+# InfluxDB 3 Core on 8183 *with* auth, for the token endpoints (the test
+# creates the operator token, once per fresh server; or set
+# INFLUX_V3_AUTH_TOKEN)
+docker run -d --rm --name influx3_auth -p 8183:8181 influxdb:3-core \
+  influxdb3 serve --node-id node0 --object-store memory
+mix test test/integration/tokens_v3_core_auth_test.exs --include v3_core_auth --include integration
+
+docker stop influx3_verify influx2_verify influx3_auth
 ```

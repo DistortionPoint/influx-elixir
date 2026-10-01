@@ -19,6 +19,11 @@ defmodule InfluxElixir.IntegrationHelper do
 
       INFLUX_V3_ENT_HOST  (default: "localhost")
       INFLUX_V3_ENT_PORT  (default: "8182")
+
+      INFLUX_V3_AUTH_HOST  (default: "localhost")
+      INFLUX_V3_AUTH_PORT  (default: "8183")
+      INFLUX_V3_AUTH_TOKEN (default: created on a fresh server; see
+                            `v3_core_auth_conn/1`)
   """
 
   @doc """
@@ -90,6 +95,43 @@ defmodule InfluxElixir.IntegrationHelper do
     case Finch.start_link(name: :integration_finch, pools: %{default: [size: 5]}) do
       {:ok, pid} -> pid
       {:error, {:already_started, pid}} -> pid
+    end
+  end
+
+  @doc """
+  Returns `{:ok, conn}` for InfluxDB 3 Core started *with* authentication
+  on port 8183 (token endpoints are disabled without it), its operator
+  token from `INFLUX_V3_AUTH_TOKEN` or, on a fresh server, created with
+  `POST /api/v3/configure/token/admin` (which works once per server).
+  `{:error, reason}` when neither gives a token.
+  """
+  @spec v3_core_auth_conn() :: {:ok, keyword()} | {:error, term()}
+  def v3_core_auth_conn do
+    base = [
+      host: env("INFLUX_V3_AUTH_HOST", "localhost"),
+      port: env_int("INFLUX_V3_AUTH_PORT", 8183),
+      scheme: :http,
+      name: :integration_v3_core_auth,
+      finch_name: :integration_finch
+    ]
+
+    with {:ok, token} <- operator_token(base), do: {:ok, Keyword.put(base, :token, token)}
+  end
+
+  @spec operator_token(keyword()) :: {:ok, binary()} | {:error, term()}
+  defp operator_token(conn) do
+    case System.get_env("INFLUX_V3_AUTH_TOKEN") do
+      token when is_binary(token) and token != "" ->
+        {:ok, token}
+
+      _unset ->
+        url = "http://#{conn[:host]}:#{conn[:port]}/api/v3/configure/token/admin"
+
+        case Finch.request(Finch.build(:post, url), :integration_finch) do
+          {:ok, %Finch.Response{status: 201, body: body}} -> {:ok, Jason.decode!(body)["token"]}
+          {:ok, %Finch.Response{status: status, body: body}} -> {:error, {status, body}}
+          {:error, reason} -> {:error, reason}
+        end
     end
   end
 

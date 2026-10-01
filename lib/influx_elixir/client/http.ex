@@ -19,7 +19,9 @@ defmodule InfluxElixir.Client.HTTP do
     * SQL Query: `POST /api/v3/query_sql` (JSON body)
     * InfluxQL: `POST /api/v3/query_influxql` (JSON body)
     * Databases: `GET/POST/DELETE /api/v3/configure/database`
-    * Tokens: `POST/DELETE /api/v3/configure/token`
+    * Tokens: `POST /api/v3/configure/token/named_admin` (admin),
+      `POST /api/v3/enterprise/configure/token` (with permissions, Enterprise),
+      `DELETE /api/v3/configure/token?token_name=NAME`
     * Health: `GET /health`
 
   ## InfluxDB v2 (`api_version: :v2`)
@@ -75,6 +77,7 @@ defmodule InfluxElixir.Client.HTTP do
 
   @behaviour InfluxElixir.Client
 
+  alias InfluxElixir.Admin.TokenRequest
   alias InfluxElixir.Query.ResponseParser
 
   # Default `Finch.request/3` receive timeout, mirroring
@@ -633,20 +636,21 @@ defmodule InfluxElixir.Client.HTTP do
           binary(),
           keyword()
         ) :: {:ok, map()} | {:error, term()}
-  def create_token(connection, description, opts \\ []) do
-    permissions = Keyword.get(opts, :permissions, [])
-
-    body =
-      Jason.encode!(%{
-        "description" => description,
-        "permissions" => permissions
-      })
-
-    url = base_url(connection) <> "/api/v3/configure/token"
-    headers = json_headers(connection)
-
-    with {:ok, %Finch.Response{body: resp_body}} <-
-           request(:post, url, headers, body, connection, opts, [200, 201]) do
+  # The token endpoints used to be `POST /api/v3/configure/token` and
+  # `DELETE /api/v3/configure/token/{id}`, which neither InfluxDB 3 Core nor
+  # Enterprise serves (verified); see `InfluxElixir.Admin.TokenRequest`.
+  def create_token(connection, name, opts \\ []) do
+    with {:ok, {_kind, path, body}} <- TokenRequest.build(name, opts),
+         {:ok, %Finch.Response{body: resp_body}} <-
+           request(
+             :post,
+             base_url(connection) <> path,
+             json_headers(connection),
+             body,
+             connection,
+             opts,
+             [200, 201]
+           ) do
       decode_json(resp_body)
     end
   end
@@ -654,11 +658,8 @@ defmodule InfluxElixir.Client.HTTP do
   @impl true
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_token(connection, token_id) do
-    url =
-      base_url(connection) <>
-        "/api/v3/configure/token/#{path_segment(token_id)}"
-
+  def delete_token(connection, name) do
+    url = base_url(connection) <> "/api/v3/configure/token?token_name=#{query_value(name)}"
     headers = auth_headers(connection)
 
     with {:ok, _response} <-

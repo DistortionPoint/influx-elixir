@@ -11,7 +11,7 @@ defmodule InfluxElixir.Client.Local.Store do
 
     * `{:database, name}` => `true`
     * `{:bucket, name}` => `%{retention: seconds}`
-    * `{:token, id}` => the token map
+    * `{:token, name}` => the token map, and `:token_id` => the last id given
     * `{:point, database, measurement, seq}` => the point — `seq` is a
       monotonic integer, so points scan in insertion order
     * `{:series_time, database, measurement, tags, timestamp}` — one per
@@ -124,13 +124,32 @@ defmodule InfluxElixir.Client.Local.Store do
     end
   end
 
-  @doc "Stores a token under its id."
-  @spec put_token(t(), binary(), map()) :: true
-  def put_token(table, id, token), do: :ets.insert(table, {{:token, id}, token})
+  @doc """
+  Claims a token name and gives it the next id, atomically: `{:ok, id}`, or
+  `:exists` when the name is taken (which spends no id, as on the engine).
+  The operator token `_admin` (id 0) always exists.
+  """
+  @spec claim_token(t(), binary()) :: {:ok, pos_integer()} | :exists
+  def claim_token(_table, "_admin"), do: :exists
 
-  @doc "Removes a token (a missing one is fine)."
-  @spec delete_token(t(), binary()) :: true
-  def delete_token(table, id), do: :ets.delete(table, {:token, id})
+  def claim_token(table, name) do
+    if :ets.insert_new(table, {{:token, name}, :claimed}),
+      do: {:ok, :ets.update_counter(table, :token_id, 1, {:token_id, 0})},
+      else: :exists
+  end
+
+  @doc "Stores a claimed token's map under its name."
+  @spec put_token(t(), binary(), map()) :: true
+  def put_token(table, name, token), do: :ets.insert(table, {{:token, name}, token})
+
+  @doc "Removes the token named `name`: `:ok`, or `:error` when there is none."
+  @spec delete_token(t(), binary()) :: :ok | :error
+  def delete_token(table, name) do
+    case :ets.take(table, {:token, name}) do
+      [_token] -> :ok
+      [] -> :error
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Clock

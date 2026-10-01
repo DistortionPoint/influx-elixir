@@ -47,7 +47,6 @@ defmodule InfluxElixir.ClientContract do
     # Determine which feature groups this profile supports
     v3_sql = profile in [:v3_core, :v3_enterprise]
     v2_ops = profile == :v2
-    enterprise_ops = profile == :v3_enterprise
 
     health_tests = health_tests(client, if(v2_ops, do: :v2, else: :v3))
     write_tests = write_tests(client, profile)
@@ -60,6 +59,8 @@ defmodule InfluxElixir.ClientContract do
     time_filter_tests = if v3_sql, do: time_filter_tests(client), else: nil
     cte_tests = if v3_sql, do: cte_tests(client), else: nil
     where_tests = if v3_sql, do: where_tests(client), else: nil
+    scalar_function_tests = if v3_sql, do: scalar_function_tests(client), else: nil
+    scalar_function_error_tests = if v3_sql, do: scalar_function_error_tests(client), else: nil
     median_join_tests = if v3_sql, do: median_join_tests(client), else: nil
     cast_tests = if v3_sql, do: cast_tests(client), else: nil
     schema_rule_tests = if v3_sql, do: schema_rule_tests(client), else: nil
@@ -104,8 +105,6 @@ defmodule InfluxElixir.ClientContract do
     v2_flux_pipeline_tests = if v2_ops, do: v2_flux_pipeline_tests(client), else: nil
     flux_tests = if v2_ops, do: flux_tests(client), else: nil
 
-    token_tests = if enterprise_ops, do: token_tests(client), else: nil
-
     blocks =
       [
         health_tests,
@@ -118,6 +117,8 @@ defmodule InfluxElixir.ClientContract do
         time_filter_tests,
         cte_tests,
         where_tests,
+        scalar_function_tests,
+        scalar_function_error_tests,
         median_join_tests,
         cast_tests,
         schema_rule_tests,
@@ -152,8 +153,7 @@ defmodule InfluxElixir.ClientContract do
         v2_precision_tests,
         v2_duplicate_tests,
         v2_flux_pipeline_tests,
-        flux_tests,
-        token_tests
+        flux_tests
       ]
       |> Enum.reject(&is_nil/1)
 
@@ -3938,6 +3938,209 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
+  # Scalar math functions: abs, round, floor, ceil (v3_core, v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  defp scalar_function_tests(client) do
+    quote do
+      describe "scalar functions — contract" do
+        unquote(scalar_function_setup(client))
+
+        # Issue #25: a transaction's magnitude against a threshold. The
+        # double refused the clause by name (and before that read it as a
+        # column named `abs(amount)`, returning no rows).
+        test "abs() in WHERE compares a magnitude against a parameter", ctx do
+          assert {:ok,
+                  [%{"amount" => -80_000_000_000, "time" => ~U[1970-01-01 00:00:01.000000Z]}]} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT amount, time FROM #{ctx.m} WHERE firm = $firm " <>
+                       "AND time >= $start AND time <= $end AND abs(amount) >= $threshold",
+                     database: ctx.database,
+                     params: %{
+                       firm: "f1",
+                       start: "1970-01-01T00:00:00Z",
+                       end: "1970-01-01T00:00:05Z",
+                       threshold: 5_000_000_000
+                     }
+                   )
+        end
+
+        test "abs, round, floor and ceil answer as the engine does, null in, null out", ctx do
+          assert {:ok, rows} =
+                   ctx.sql.(
+                     "SELECT abs(amount) AS a, abs(f) AS af, round(f) AS r, round(f, 1) AS r1, " <>
+                       "round(1234.5678, -2) AS rn, floor(f) AS fl, ceil(f) AS c, " <>
+                       "ROUND(amount) AS ra FROM #{ctx.m} ORDER BY time"
+                   )
+
+          assert rows == [
+                   %{
+                     "a" => 80_000_000_000,
+                     "af" => 2.5,
+                     "r" => -3.0,
+                     "r1" => -2.5,
+                     "rn" => 1200.0,
+                     "fl" => -3.0,
+                     "c" => -2.0,
+                     "ra" => -80_000_000_000.0
+                   },
+                   %{
+                     "a" => 100_000_000,
+                     "af" => 2.5,
+                     "r" => 3.0,
+                     "r1" => 2.5,
+                     "rn" => 1200.0,
+                     "fl" => 2.0,
+                     "c" => 3.0,
+                     "ra" => 100_000_000.0
+                   },
+                   %{
+                     "af" => 0.4,
+                     "r" => 0.0,
+                     "r1" => 0.4,
+                     "rn" => 1200.0,
+                     "fl" => 0.0,
+                     "c" => 1.0
+                   },
+                   %{"a" => 90_000_000_000, "rn" => 1200.0, "ra" => -90_000_000_000.0}
+                 ]
+        end
+
+        test "a call stands wherever an expression does", ctx do
+          times = fn sql ->
+            {:ok, rows} = ctx.sql.("SELECT time FROM #{ctx.m} WHERE #{sql} ORDER BY time")
+            Enum.map(rows, &DateTime.to_unix(&1["time"]))
+          end
+
+          assert times.("abs(f) > 1") == [1, 2]
+          assert times.("1 < abs(f)") == [1, 2]
+          assert times.("abs(f) BETWEEN 1 AND 3") == [1, 2]
+          assert times.("abs(f) IN (2.5)") == [1, 2]
+          assert times.("abs(f) NOT IN (2.5)") == [3]
+          assert times.("abs(f) IS NULL") == [4]
+          assert times.("abs(f * 2) = 5") == [1, 2]
+          assert times.("round(f) = 0 OR ceil(f) = 3") == [2, 3]
+          assert times.("'1970-01-01T00:00:02Z' < time") == [3, 4]
+
+          assert {:ok, [%{"a" => 2.5}, %{"a" => 2.5}, %{"a" => 0.4}]} =
+                   ctx.sql.(
+                     "SELECT abs(f) AS a FROM #{ctx.m} WHERE f IS NOT NULL " <>
+                       "ORDER BY abs(f) DESC, time"
+                   )
+
+          assert {:ok, [%{"s" => 170_100_000_000}]} =
+                   ctx.sql.("SELECT sum(abs(amount)) AS s FROM #{ctx.m}")
+        end
+      end
+    end
+  end
+
+  defp scalar_function_error_tests(client) do
+    quote do
+      describe "scalar function errors — contract" do
+        unquote(scalar_function_setup(client))
+
+        # The engine types a call's arguments when it plans the query: a
+        # wrong one fails it though no row reaches the call (`f = 99`), with
+        # the message shaped by where the call stands.
+        test "a wrong argument is the engine's planning error, worded per clause", ctx do
+          suggestion =
+            " No function matches the given name and argument types 'abs(Utf8)'. You might " <>
+              "need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"
+
+          head =
+            "Error during planning: Function 'abs' expects NativeType::Numeric but received " <>
+              "NativeType::String"
+
+          assert {:error, %{status: 400, body: body}} =
+                   ctx.sql.("SELECT f FROM #{ctx.m} WHERE abs(s) > 1 AND f = 99")
+
+          assert body == "type_coercion\ncaused by\n" <> head <> suggestion
+
+          assert {:error, %{status: 400, body: body}} =
+                   ctx.sql.("SELECT abs(s) AS a FROM #{ctx.m} WHERE f = 99")
+
+          assert body == head <> suggestion
+
+          assert {:error, %{status: 400, body: body}} =
+                   ctx.sql.("SELECT f FROM #{ctx.m} ORDER BY abs(s)")
+
+          assert body == "type_coercion\ncaused by\n" <> head
+
+          assert {:error, %{status: 400, body: body}} =
+                   ctx.sql.("SELECT f FROM #{ctx.m} WHERE abs(firm) > 1")
+
+          assert body =~ "'abs(Dictionary(Int32, Utf8))'"
+
+          assert {:error, %{status: 400, body: body}} =
+                   ctx.sql.("SELECT f FROM #{ctx.m} WHERE floor(b) > 1")
+
+          assert body ==
+                   "type_coercion\ncaused by\nError during planning: Failed to coerce arguments " <>
+                     "to satisfy a call to 'floor' function: coercion from Boolean to the " <>
+                     "signature Uniform(1, [Float64, Float32]) failed No function matches the " <>
+                     "given name and argument types 'floor(Boolean)'. You might need to add " <>
+                     "explicit type casts.\n\tCandidate functions:\n\tfloor(Float64/Float32)"
+
+          assert {:error, %{status: 400, body: body}} =
+                   ctx.sql.("SELECT f FROM #{ctx.m} ORDER BY abs(time)")
+
+          assert body ==
+                   "type_coercion\ncaused by\nError during planning: Function 'abs' expects " <>
+                     "NativeType::Numeric but received NativeType::Timestamp(Nanosecond, None)"
+        end
+
+        test "a wrong argument count is the engine's error", ctx do
+          assert {:error, %{status: 400, body: body}} =
+                   ctx.sql.("SELECT f FROM #{ctx.m} WHERE abs(f, 1) > 1")
+
+          assert body =~
+                   "Error during planning: Function 'abs' expects 1 arguments but received 2 " <>
+                     "No function matches the given name and argument types 'abs(Float64, Int64)'"
+
+          assert {:error,
+                  %{status: 400, body: "Error during planning: 'round' does not support" <> _rest}} =
+                   ctx.sql.("SELECT round() AS r FROM #{ctx.m}")
+
+          assert {:error, %{status: 400, body: body}} =
+                   ctx.sql.("SELECT round(f, 1.5) AS r FROM #{ctx.m}")
+
+          assert body =~ "coercion from Float64, Float64 to the signature OneOf("
+
+          assert {:error,
+                  %{
+                    status: 405,
+                    body: "This feature is not implemented: CEIL with scale is not supported"
+                  }} =
+                   ctx.sql.("SELECT f FROM #{ctx.m} WHERE ceil(f, 1) > 1")
+        end
+      end
+    end
+  end
+
+  defp scalar_function_setup(client) do
+    quote do
+      setup ctx do
+        m = "contract_fn_#{System.unique_integer([:positive])}"
+
+        {:ok, :written} =
+          unquote(client).write(
+            ctx.conn,
+            "#{m},firm=f1 amount=-80000000000i,f=-2.5,s=\"x\" 1000000000\n" <>
+              "#{m},firm=f1 amount=100000000i,f=2.5 2000000000\n" <>
+              "#{m},firm=f1 f=0.4 3000000000\n" <>
+              "#{m},firm=f2 amount=-90000000000i,b=true 4000000000",
+            database: ctx.database
+          )
+
+        InfluxElixir.ClientContract.settle(ctx)
+        {:ok, m: m, sql: &unquote(client).query_sql(ctx.conn, &1, database: ctx.database)}
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Gzip write handling (v3_core, v3_enterprise)
   # ---------------------------------------------------------------------------
 
@@ -4226,36 +4429,6 @@ defmodule InfluxElixir.ClientContract do
           # 404 from both clients, body naming the database.
           assert {:error, %{status: 404, body: body}} = result
           assert body =~ "contract_db_that_never_existed_xyz"
-        end
-      end
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Token admin (v3_enterprise)
-  # ---------------------------------------------------------------------------
-
-  defp token_tests(client) do
-    quote do
-      describe "token admin — contract" do
-        test "create_token returns {:ok, map} with string keys", ctx do
-          {:ok, token} =
-            unquote(client).create_token(
-              ctx.conn,
-              "contract token",
-              []
-            )
-
-          assert %{"id" => id, "description" => "contract token"} = token
-          assert is_binary(id) and id != ""
-        end
-
-        test "delete_token returns :ok", ctx do
-          {:ok, token} =
-            unquote(client).create_token(ctx.conn, "disposable", [])
-
-          assert :ok ==
-                   unquote(client).delete_token(ctx.conn, token["id"])
         end
       end
     end

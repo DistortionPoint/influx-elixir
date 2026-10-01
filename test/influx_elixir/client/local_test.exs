@@ -44,7 +44,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert Local.supports?(core, :query_sql)
       refute Local.supports?(core, :query_flux)
-      refute Local.supports?(core, :create_token)
+      assert Local.supports?(core, :create_token)
 
       assert Local.supports?(enterprise, :create_token)
       refute Local.supports?(enterprise, :create_bucket)

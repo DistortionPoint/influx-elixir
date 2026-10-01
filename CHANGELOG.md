@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`Client.Local` evaluates `abs`, `round`, `floor` and `ceil` in SQL**
+  (issue #25), wherever an expression stands: `WHERE`, the select list,
+  `ORDER BY`, and an aggregate's argument. `WHERE abs(amount) >=
+  $threshold` was refused by name, and before 0.1.37 it was read as a
+  column named `abs(amount)`, which returned no rows. The double matches
+  InfluxDB 3, verified against Core:
+  - `round` rounds half away from zero and takes an optional scale.
+  - `round`, `floor` and `ceil` return floats; `abs` keeps the argument's
+    type.
+  - A null argument gives null.
+  - A wrong argument type or count is the planner's error, even when no
+    row reaches the call. Its wording depends on the clause the call is
+    in.
+  - `floor` or `ceil` with a scale is the engine's 405.
+- A `WHERE` operand may be an expression in `IS [NOT] NULL` and
+  `[NOT] IN (...)` too.
+
+### Changed
+- **Breaking: tokens are created and deleted by name, on the endpoints
+  InfluxDB 3 serves.** `create_token(conn, description, opts)` and
+  `delete_token(conn, id)` called `/api/v3/configure/token` and
+  `/api/v3/configure/token/{id}`, which neither Core nor Enterprise
+  serves. They never worked against a server.
+  - `create_token(conn, name, opts)` makes an admin token, on Core and
+    Enterprise.
+  - With `permissions: ["db:db1:read,write", ...]` (the CLI's
+    `--permission` form) it makes an Enterprise resource token.
+  - `expiry_secs:` sets an expiry.
+  - The result carries `id`, `name`, `token`, `hash`, `created_at` and
+    `expiry`.
+  - `delete_token(conn, name)` deletes by name.
+  - `Client.Local` answers as the server does, on `:v3_core` too:
+    - a taken name is a 409;
+    - an unknown name is a 404;
+    - deleting `_admin` is a 405;
+    - a bad `expiry_secs` is the 400 with its column.
+
+  The admin token path is verified against Core. The resource token's
+  request is the one the Enterprise CLI sends; its response is not
+  verified, because Enterprise needs a license.
+
+### Fixed
+- **`Client.Local` read a literal on the left of a comparison as a column
+  name.** `WHERE 1 < f` was the engine's "No field named 1" schema error,
+  for a query the engine answers. The comparison is now turned around.
+
 ## [0.1.37] - 2026-10-01
 
 ### Added

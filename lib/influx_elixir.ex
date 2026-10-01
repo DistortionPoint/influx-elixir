@@ -324,24 +324,24 @@ defmodule InfluxElixir do
   # ---------- Admin — v3 tokens ----------
 
   @doc """
-  Creates an API token in InfluxDB v3.
+  Creates a named InfluxDB 3 token; see `InfluxElixir.Admin.Tokens.create/3`.
   """
   @spec create_token(
           InfluxElixir.Client.connection(),
           binary(),
           keyword()
         ) :: {:ok, map()} | {:error, term()}
-  def create_token(connection, description, opts \\ []) do
-    client().create_token(resolve_connection(connection), description, opts)
+  def create_token(connection, name, opts \\ []) do
+    client().create_token(resolve_connection(connection), name, opts)
   end
 
   @doc """
-  Deletes an API token in InfluxDB v3.
+  Deletes an InfluxDB 3 token by name; see `InfluxElixir.Admin.Tokens.delete/2`.
   """
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_token(connection, token_id) do
-    client().delete_token(resolve_connection(connection), token_id)
+  def delete_token(connection, name) do
+    client().delete_token(resolve_connection(connection), name)
   end
 
   # ---------- Health ----------

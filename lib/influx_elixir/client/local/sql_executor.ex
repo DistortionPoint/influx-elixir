@@ -14,7 +14,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   Pure over the points it is given: no ETS, no connection state.
   """
 
-  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLParser, Store}
+  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLFunctions, SQLParser, Store}
 
   @typedoc "A stored point, as `InfluxElixir.Client.Local` keeps it."
   @type point :: LineProtocolParser.point()
@@ -55,6 +55,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     with {:ok, points} <- source_points(fetch, m, cte_sources),
          {:ok, joined} <- cross_join(fetch, points, query.cross_join, cte_sources),
          :ok <- check_query_columns(joined, query),
+         :ok <- check_function_calls(joined, query),
          :ok <- check_grouping_columns(query),
          {:ok, filtered} <- apply_where(joined, query.where) do
       cond do
@@ -203,6 +204,67 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end
   end
 
+  # The engine checks a function's arguments when it plans the query, so a
+  # wrong type fails it even when no row would reach the call. Its planner
+  # reads WHERE, then the select list, then ORDER BY.
+  @spec check_function_calls([point()], SQLParser.parsed_query()) :: :ok | {:error, map()}
+  defp check_function_calls(points, query) do
+    contexts =
+      [where: query.where] ++
+        [select: Enum.map(query.projection_columns || [], &elem(&1, 0))] ++
+        [select: Enum.map(query.select_columns || [], &aggregate_expr/1)] ++
+        [order_by: Enum.map(query.order_by, &elem(&1, 0))]
+
+    calls = for {context, terms} <- contexts, call <- calls_in(terms), do: {context, call}
+
+    case calls do
+      [] -> :ok
+      calls -> check_calls(calls, column_types(points))
+    end
+  end
+
+  @spec aggregate_expr(SQLParser.select_column()) :: term()
+  defp aggregate_expr({:aggregate, _agg, expr, _alias}), do: expr
+  defp aggregate_expr(_other), do: nil
+
+  # Every call in a term, the innermost first: the planner types a call's
+  # arguments before the call.
+  @spec calls_in(term()) :: [term()]
+  defp calls_in({:call, _function, args} = call), do: calls_in(args) ++ [call]
+  defp calls_in(terms) when is_list(terms), do: Enum.flat_map(terms, &calls_in/1)
+  defp calls_in(term) when is_tuple(term), do: term |> Tuple.to_list() |> calls_in()
+  defp calls_in(_other), do: []
+
+  @spec check_calls([{SQLFunctions.context(), term()}], %{binary() => binary()}) ::
+          :ok | {:error, map()}
+  defp check_calls(calls, columns) do
+    Enum.reduce_while(calls, :ok, fn {context, {:call, function, args}}, :ok ->
+      types = Enum.map(args, &SQLFunctions.type_of(&1, columns))
+
+      case SQLFunctions.check(function, types, context) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  # Each column's Arrow type as the engine has it: a tag is dictionary
+  # encoded, a field typed by its values, `time` a timestamp.
+  @spec column_types([point()]) :: %{binary() => binary()}
+  defp column_types(points) do
+    Enum.reduce(points, %{"time" => "Timestamp(ns)"}, fn point, acc ->
+      acc
+      |> Map.merge(Map.new(point.tags, fn {tag, _value} -> {tag, "Dictionary(Int32, Utf8)"} end))
+      |> Map.merge(Map.new(point.fields, fn {field, value} -> {field, field_type(value)} end))
+    end)
+  end
+
+  @spec field_type(term()) :: binary()
+  defp field_type(value) when is_boolean(value), do: "Boolean"
+  defp field_type(value) when is_integer(value), do: "Int64"
+  defp field_type(value) when is_float(value), do: "Float64"
+  defp field_type(_string), do: "Utf8"
+
   # A projected plain column in an aggregate query must be grouped: the
   # engine fails planning otherwise ("must appear in the GROUP BY clause or
   # must be part of an aggregate function"). Before, the double sampled the
@@ -297,6 +359,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp expr_fields({:field, name}), do: [name]
   defp expr_fields({:op, _op, left, right}), do: expr_fields(left) ++ expr_fields(right)
   defp expr_fields({:cast, inner, _type}), do: expr_fields(inner)
+  defp expr_fields({:call, _function, args}), do: expr_fields(args)
   defp expr_fields(items) when is_list(items), do: Enum.flat_map(items, &expr_fields/1)
   defp expr_fields(_other), do: []
 
@@ -598,6 +661,9 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp eval_expr({:field, name}, point), do: point_value(point, name)
   defp eval_expr({:lit, value}, _point), do: value
   defp eval_expr({:cast, inner, type}, point), do: cast(eval_expr(inner, point), type)
+
+  defp eval_expr({:call, function, args}, point),
+    do: SQLFunctions.call(function, Enum.map(args, &eval_expr(&1, point)))
 
   defp eval_expr({:neg, inner}, point) do
     case eval_expr(inner, point) do
@@ -936,7 +1002,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   end
 
   defp matches_condition?(point, {:in, key, values}) do
-    case point_value(point, key) do
+    case left_value(point, key) do
       nil -> nil
       actual -> Enum.any?(values, &compare(actual, :eq, right_value(point, &1)))
     end
@@ -949,10 +1015,10 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end
   end
 
-  defp matches_condition?(point, {:is_null, key, _nil}), do: is_nil(point_value(point, key))
+  defp matches_condition?(point, {:is_null, key, _nil}), do: is_nil(left_value(point, key))
 
   defp matches_condition?(point, {:is_not_null, key, _nil}),
-    do: not is_nil(point_value(point, key))
+    do: not is_nil(left_value(point, key))
 
   defp matches_condition?(point, {op, "time", value}) do
     compare(point.timestamp, op, to_nanoseconds(value))

@@ -91,7 +91,8 @@ defmodule InfluxElixir.Client do
   @callback delete_bucket(connection, binary()) ::
               :ok | {:error, term()}
 
-  # Admin — v3 tokens
+  # Admin — v3 tokens, by name: `create_token(conn, name, opts)` with
+  # `:permissions` and `:expiry_secs`; `delete_token(conn, name)`.
   @callback create_token(connection, binary(), keyword()) ::
               {:ok, map()} | {:error, term()}
   @callback delete_token(connection, binary()) ::
