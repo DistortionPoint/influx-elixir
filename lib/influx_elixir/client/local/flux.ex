@@ -13,9 +13,13 @@ defmodule InfluxElixir.Client.Local.Flux do
 
     * `from(bucket: "b")` — first; the bucket must exist (404 otherwise)
     * `range(start: s[, stop: s])` — required, as on the engine; `s` is
-      Unix seconds, an RFC3339 time, a negative duration (`-1h`, `-30m`,
+      Unix seconds, an RFC3339 time, a duration from now (`-1h`, `-30m`,
       `-7d`, `-10s`, `-2w`) or `now()`; `stop` defaults to now. Every row
-      carries `_start` and `_stop`.
+      carries `_start` and `_stop`. A range that is empty (`start` not
+      before `stop`) is the engine's 400 "cannot query an empty range".
+      Times are 64-bit nanoseconds as on the engine, so a time that does
+      not fit wraps: `stop: 99999999999999` (seconds) is 1976-05-08 in
+      `_stop`.
     * `filter(fn: (r) => ...)` — `r.key` or `r["key"]` compared with
       `== != < <= > >=` against a string, number or boolean, combined with
       `and`, `or`, `not` and parentheses. A key the row lacks never matches.
@@ -64,6 +68,37 @@ defmodule InfluxElixir.Client.Local.Flux do
       {:ok, %{bucket: bucket, stages: stages}}
     end
   end
+
+  @doc """
+  The measurements a query reads: the ones its `filter` stages pin with
+  `r._measurement == "m"` (joined by `or`, narrowed by `and`), or `:all`.
+  A table never mixes measurements, so a point of any other one can only
+  be filtered out; `Client.Local` reads just these from the store.
+  """
+  @spec measurements(query()) :: :all | [term()]
+  def measurements(%{stages: stages}) do
+    for({:filter, predicate} <- stages, do: pinned(predicate))
+    |> Enum.reduce(:all, &intersect/2)
+  end
+
+  @spec pinned(predicate()) :: :all | [term()]
+  defp pinned({:cmp, "_measurement", "==", literal}), do: [literal]
+  defp pinned({:and, a, b}), do: intersect(pinned(a), pinned(b))
+
+  defp pinned({:or, a, b}) do
+    case {pinned(a), pinned(b)} do
+      {:all, _b} -> :all
+      {_a, :all} -> :all
+      {a, b} -> Enum.uniq(a ++ b)
+    end
+  end
+
+  defp pinned(_predicate), do: :all
+
+  @spec intersect(:all | [term()], :all | [term()]) :: :all | [term()]
+  defp intersect(:all, other), do: other
+  defp intersect(other, :all), do: other
+  defp intersect(a, b), do: Enum.filter(a, &(&1 in b))
 
   @doc """
   Runs a parsed query over the bucket's points (`%{measurement, tags,
@@ -303,8 +338,9 @@ defmodule InfluxElixir.Client.Local.Flux do
   defp parse_stage({"range", args}, now_ns) do
     params = named_args(args)
 
-    with {:ok, start} <- fetch_time(params, "start", now_ns),
-         {:ok, stop} <- optional_time(params, "stop", now_ns) do
+    with {:ok, {start, start_order}} <- fetch_time(params, "start", now_ns),
+         {:ok, {stop, stop_order}} <- optional_time(params, "stop", now_ns),
+         :ok <- non_empty(start_order, stop_order) do
       {:ok, {:range, start, stop}}
     end
   end
@@ -383,7 +419,20 @@ defmodule InfluxElixir.Client.Local.Flux do
     end)
   end
 
-  @spec fetch_time(map(), binary(), integer()) :: {:ok, integer()} | {:error, binary()}
+  # The plan is refused when the range has no time in it. The engine
+  # compares seconds given as integers as Go times, which count seconds
+  # since the year 1 in 64 bits, before they become nanoseconds: a wrapped
+  # stop is not "empty" (`range(start: 0, stop: 18446744073)` reads
+  # nothing without an error), only one that overflows that count is. Every
+  # other form is compared as the nanoseconds it wraps to.
+  @spec non_empty(integer(), integer()) :: :ok | {:error, binary()}
+  defp non_empty(start, stop) when start < stop, do: :ok
+
+  defp non_empty(_start, _stop),
+    do: {:error, "error in building plan while starting program: cannot query an empty range"}
+
+  @spec fetch_time(map(), binary(), integer()) ::
+          {:ok, {integer(), integer()}} | {:error, binary()}
   defp fetch_time(params, key, now_ns) do
     case Map.fetch(params, key) do
       {:ok, text} -> parse_time(text, now_ns)
@@ -391,9 +440,12 @@ defmodule InfluxElixir.Client.Local.Flux do
     end
   end
 
-  @spec optional_time(map(), binary(), integer()) :: {:ok, integer()} | {:error, binary()}
+  @spec optional_time(map(), binary(), integer()) ::
+          {:ok, {integer(), integer()}} | {:error, binary()}
   defp optional_time(params, key, now_ns) do
-    if Map.has_key?(params, key), do: fetch_time(params, key, now_ns), else: {:ok, now_ns}
+    if Map.has_key?(params, key),
+      do: fetch_time(params, key, now_ns),
+      else: {:ok, {now_ns, now_ns}}
   end
 
   @duration_units %{
@@ -404,24 +456,49 @@ defmodule InfluxElixir.Client.Local.Flux do
     "w" => 604_800_000_000_000
   }
 
-  @spec parse_time(binary(), integer()) :: {:ok, integer()} | {:error, binary()}
-  defp parse_time("now()", now_ns), do: {:ok, now_ns}
+  # Seconds from the year 1 to the epoch, the offset of Go's time count.
+  @year_one 62_135_596_800
+
+  # `{nanoseconds, ordering key}`: the time as the engine holds it (a
+  # signed 64-bit count, so one that does not fit wraps) and the value an
+  # empty range is judged on, see `non_empty/2`.
+  @spec parse_time(binary(), integer()) ::
+          {:ok, {integer(), integer()}} | {:error, binary()}
+  defp parse_time("now()", now_ns), do: {:ok, {now_ns, now_ns}}
 
   defp parse_time(text, now_ns) do
     cond do
-      match = Regex.run(~r/^-(\d+)(s|m|h|d|w)$/, text) ->
-        [_full, amount, unit] = match
-        {:ok, now_ns - String.to_integer(amount) * @duration_units[unit]}
+      match = Regex.run(~r/^(-?)(\d+)(s|m|h|d|w)$/, text) ->
+        [_full, sign, amount, unit] = match
+        offset = String.to_integer(amount) * @duration_units[unit]
+        wrapped = wrap64(now_ns + if(sign == "-", do: -offset, else: offset))
+        {:ok, {wrapped, wrapped}}
 
       Regex.match?(~r/^-?\d+$/, text) ->
-        {:ok, String.to_integer(text) * 1_000_000_000}
+        seconds = String.to_integer(text)
+
+        {:ok,
+         {wrap64(seconds * 1_000_000_000),
+          (wrap64(seconds + @year_one) - @year_one) * 1_000_000_000}}
 
       true ->
         case DateTime.from_iso8601(text) do
-          {:ok, dt, _offset} -> {:ok, DateTime.to_unix(dt, :nanosecond)}
-          {:error, _reason} -> {:error, "Client.Local: unsupported range() time: #{text}"}
+          {:ok, dt, _offset} ->
+            wrapped = wrap64(DateTime.to_unix(dt, :nanosecond))
+            {:ok, {wrapped, wrapped}}
+
+          {:error, _reason} ->
+            {:error, "Client.Local: unsupported range() time: #{text}"}
         end
     end
+  end
+
+  # Two's-complement 64-bit wrap, which is what multiplying seconds by 1e9
+  # does on the engine.
+  @spec wrap64(integer()) :: integer()
+  defp wrap64(value) do
+    wrapped = Bitwise.band(value, 0xFFFFFFFFFFFFFFFF)
+    if wrapped >= 0x8000000000000000, do: wrapped - 0x10000000000000000, else: wrapped
   end
 
   @spec fetch_int(map(), binary()) :: {:ok, non_neg_integer()} | {:error, binary()}

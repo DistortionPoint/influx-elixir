@@ -7,6 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The library failed to compile in a project without `decimal`.** It
+  is an optional dependency, but the SQL parser matched `%Decimal{}`,
+  which needs the struct at compile time
+  (`Decimal.__struct__/1 is undefined`). It now matches
+  `%{__struct__: Decimal}`, and a test keeps optional structs out of
+  `lib/`.
+- **A `Decimal` query parameter was compared as text over HTTP.** Jason
+  encodes a Decimal as a JSON string, so `amount >= $p` with
+  `Decimal.new("1000.00")` kept 500.0 (`"500.0" >= "1000.00"`), while
+  `Client.Local` compared numbers. `Client.HTTP` now sends Decimal
+  parameters as JSON numbers, and both clients compare numbers.
+- **`Client.Local` gave wrong answers to SQL that InfluxDB 3 answers
+  differently.** Each case was verified against Core 3.10.
+  - **Quoting and parameters.**
+    - `''` inside a literal (`'O''Brien'`) and in `LIKE` patterns was
+      not read as a quote.
+    - A string parameter containing a quote was injected into the
+      query text (`"zzz' OR v > 0 OR name = 'q"` returned every row).
+    - Literals containing a comma, an operator or a keyword
+      (`IN ('Smith, John')`, `s = 'a>b'`, `'note limit 5'`) were refused
+      or cut short.
+    - `LIKE`/`ILIKE` matched bytes, not characters.
+  - **Nulls and three-valued logic.**
+    - `NOT IN (1, NULL)` and `BETWEEN … AND NULL` returned rows.
+    - `first_value` dropped a `false` value.
+    - Ordered aggregates sorted a null ordering value first.
+  - **Grouping and ordering.**
+    - `GROUP BY time` returned one row.
+    - `DATE_BIN` put negative timestamps in the bucket after.
+    - A `DATE_BIN` in the select list that did not match the `GROUP BY`
+      was answered with the wrong buckets.
+  - **Comparisons.**
+    - A float compared with a string literal was rendered as `5.0e3`
+      instead of `5000.0`, which gave wrong rows.
+    - `WHERE 1 = 1` and `WHERE true` were a schema error or refused.
+  - **Plan-time type errors.**
+    - Aggregates over strings, booleans, tags or `time` crashed or
+      answered (`median(s)` was `"y"`).
+    - Arithmetic over a string answered nulls.
+    - Each is now the engine's planning error, with the same wording,
+      even when no row matches.
+  - **Errors in the engine's words** (the double now uses them):
+    - bare-integer `time` comparisons;
+    - `AVG(time)` and the other `time` aggregates;
+    - `DISTINCT … ORDER BY`;
+    - negative or non-numeric `LIMIT`/`OFFSET`;
+    - `FIRST()`/`LAST()`;
+    - `LIKE` over a number;
+    - CROSS JOIN ambiguity;
+    - ungrouped projections;
+    - unknown `format:` values (with the column position);
+    - boolean casts;
+    - a CTE column named `time`;
+    - integer division by zero, which closes the connection.
+  - **Crashes, now answered or refused by name:**
+    - `DATE_BIN` with a zero interval;
+    - `round` with a huge scale;
+    - a CTE `time` column holding strings.
+  - **Refused by name.** A float divided by zero is infinity on the
+    engine, which compares as a number (`WHERE v / 0.0 > 1` keeps every
+    row). Elixir cannot hold it, so the double refuses by name instead
+    of returning no rows.
+  - **Transport error shape.** A `CAST` that cannot be performed now
+    returns `%Mint.TransportError{reason: :closed}`, as over HTTP, not
+    a bare `:closed`.
+- **`Client.Local` line protocol, InfluxQL and Flux now match the
+  engines**, verified against Core and 2.7.
+  - **Line protocol.**
+    - Text after the timestamp (`m v=1 100 200`) is refused, as are
+      `v=.5` and `v=5.`, with the engine's messages.
+    - InfluxDB 2's parse errors are now its own words (`invalid field
+      format`, `missing field value`, `invalid number`, …), and every
+      bad line is reported.
+  - **InfluxQL.**
+    - A literal containing `into` or `fill(` is no longer refused.
+    - `time > 0s` and bare-integer nanosecond times are answered.
+    - An aggregate's `time` is the `WHERE` lower bound.
+    - `LIMIT` and `OFFSET` count per field.
+  - **Flux.**
+    - A `range` far in the future wraps as the engine's does instead of
+      crashing.
+    - `start >= stop` is the engine's 400.
+  - **Buckets.** `list_buckets` maps carry `type`, `orgID` and shard
+    group durations.
+- **`Client.Local` concurrency.** A token deleted while it was being
+  created could reappear, and concurrent first writes could exceed
+  `:v3_core`'s 5-database limit. Both now happen under a lock.
+
+### Changed
+- **`Client.Local` InfluxQL `SELECT` is about twice as fast** at 100k
+  points. Redundant passes and sorts are gone, `SHOW MEASUREMENTS` reads
+  the column index, and a Flux filter on `_measurement` reads only those
+  measurements.
+- **Tests.** About 55 `local_test.exs` tests that duplicated the contract
+  suite or could not fail are gone. Others now assert exact results:
+  - error bodies taken from the real servers;
+  - `ORDER BY` checked on data written out of order;
+  - `DISTINCT` checked with real duplicates.
+
+  New contract modules for the SQL parser, the SQL executor, and
+  InfluxQL/Flux/line protocol run against Local and the real engines.
+
 ## [0.1.38] - 2026-10-01
 
 ### Added

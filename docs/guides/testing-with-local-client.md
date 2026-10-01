@@ -1006,8 +1006,9 @@ nothing is stored; `time` as a field is dropped silently, as a tag it is a
   holds no Parquet writer. `format: :csv` is modelled: values come back as
   the engine's CSV strings (`"1.5"`, `"1e16"`, `"true"`), empty cells
   absent, and a nested value fails as the server's aborted response does.
-- **Division by zero**: null in the double. InfluxDB returns IEEE infinity
-  for a float divided by zero (serialised as JSON `null`, but counted by
-  `COUNT`) and fails the query for an integer divided by zero.
+- **Division by zero**: an integer divided by zero closes the connection,
+  as on the engine. A float divided by zero is IEEE infinity or NaN there
+  (shown as JSON `null`, but compared as a number: `WHERE v / 0.0 > 1` keeps
+  every row); Elixir has no such float, so the double refuses it by name.
 - **No authentication**: All operations succeed regardless of token
 - **ETS-based**: Each `start/1` creates an isolated ETS table

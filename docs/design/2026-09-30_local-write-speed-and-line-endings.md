@@ -63,10 +63,13 @@ refused.
 - In the v2 dialect, a trailing `"\r` becomes an escaped quote plus a
   closing quote, so the string parser yields the value InfluxDB 2
   stores.
-- v2 error *texts* are still not modelled: the double keeps its wording
-  inside InfluxDB 2's `unable to parse '<line>': …` frame, as documented.
-  Only the accepted-or-refused behaviour and the stored values are
-  matched.
+- v2 error *texts* were not modelled at the time: the double kept its own
+  wording inside InfluxDB 2's `unable to parse '<line>': …` frame. **They
+  are now** (2026-10-01): `parse_line_parts/4` runs a port of the Go
+  scanners for the `:v2` dialect and a separate grammar for InfluxDB 3,
+  and the `v2_quote_cr/2` rewrite is gone, because the port reads a string
+  field up to a `\r` by itself. Probes of about 330 malformed lines against
+  both engines give the same message on the double.
 
 ## Verification
 

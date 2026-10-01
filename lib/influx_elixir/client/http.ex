@@ -1,4 +1,6 @@
 defmodule InfluxElixir.Client.HTTP do
+  @compile {:no_warn_undefined, Decimal}
+
   @moduledoc """
   Production InfluxDB client implementation using Finch.
 
@@ -243,8 +245,23 @@ defmodule InfluxElixir.Client.HTTP do
   # of a keyword list, so a keyword list used to raise here while
   # `Client.Local` accepted it — a query could pass tests and crash in
   # production. Both shapes are accepted by both clients.
+  #
+  # A `Decimal` param goes as a JSON number. Jason encodes a Decimal as a
+  # string, which the engine compares as text: `amount >= $p` with
+  # `Decimal.new("1000.00")` kept 500.0 ("500.0" >= "1000.00", verified)
+  # while Client.Local compared numbers.
   @spec query_params(keyword()) :: map()
-  defp query_params(opts), do: opts |> Keyword.get(:params, %{}) |> Map.new()
+  defp query_params(opts) do
+    opts
+    |> Keyword.get(:params, %{})
+    |> Map.new(fn {key, value} -> {key, param_value(value)} end)
+  end
+
+  @spec param_value(term()) :: term()
+  defp param_value(%{__struct__: Decimal} = value),
+    do: Jason.Fragment.new(Decimal.to_string(value, :normal))
+
+  defp param_value(value), do: value
 
   @spec http_query_sql(keyword(), binary(), keyword()) :: InfluxElixir.Client.query_result()
   defp http_query_sql(connection, sql, opts) do

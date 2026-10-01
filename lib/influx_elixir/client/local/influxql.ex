@@ -8,20 +8,27 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   `"iox::measurement"` and `"time"`; rows come back in time order; a row with
   no selected field value is dropped; an unknown column or measurement is an
   empty result, not an error; aggregates are named after the function
-  (`mean`, `count`, ...) and put `time` at the epoch, except a lone selector
+  (`mean`, `count`, ...) and put `time` at the lower bound the `WHERE`
+  gives `time` (the epoch when it gives none), except a lone selector
   (`MAX`, `MIN`, `FIRST`, `LAST`), which returns its point's time and tags;
   `LIMIT` and `OFFSET` apply per `GROUP BY` series.
 
   This module is pure. `parse/1` turns the statement into a query map;
-  `run/3` shapes rows the caller has already filtered with the statement's
-  `WHERE` clause (Client.Local runs it through its SQL engine).
+  `run/4` shapes rows the caller has already filtered with the statement's
+  `WHERE` clause (Client.Local runs it through its SQL engine) and put in
+  time order.
 
-  `WHERE` follows InfluxQL, not SQL (`where_sql/2`): a missing tag is the
+  `WHERE` follows InfluxQL, not SQL (`where_plan/2`): a missing tag is the
   empty string (`host != 'a'` keeps points without `host`, `host = ''`
   finds them), `=~ /re/` and `!~ /re/` are unanchored matches on tags and
   false on fields, `<`/`>` on a tag is false, durations (`now() - 30m`)
   are intervals, double-quoted identifiers are exact, and `NOT` is the
-  engine's parse error. `SHOW TAG VALUES [FROM m] WITH KEY = | != | =~ |
+  engine's parse error. Compared with `time`, a bare integer or a duration
+  is an offset from the epoch in nanoseconds (`time >= 2`, `time > 0s`,
+  `time > 1s - 999999999ns`), `!=` and `<>` are the engine's planning
+  error, and a float is refused. The engine pulls `time` comparisons out
+  of the whole `WHERE` as if they were joined by `AND`, so one inside an
+  `OR` is refused by name. `SHOW TAG VALUES [FROM m] WITH KEY = | != | =~ |
   !~ | IN (...)` [WHERE ...] lists values as the engine does, over the
   last 24 hours unless the `WHERE` bounds `time` (`parse_show_tag_values/1`).
 
@@ -30,9 +37,13 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   subqueries, `GROUP BY *`, functions other than
   `MEAN SUM COUNT MIN MAX FIRST LAST`, `F(*)` other than `COUNT(*)`, plain
   columns beside anything but a single selector, arithmetic in the select
-  list, several measurements in `FROM`, sub-second durations, and `LIMIT` /
-  `OFFSET` on `SHOW TAG VALUES`.
+  list, several measurements in `FROM`, sub-second durations in `now() -
+  ...`, and `LIMIT` / `OFFSET` on `SHOW TAG VALUES`. A keyword inside a
+  quoted string, quoted identifier or regular expression is not one:
+  `WHERE k = 'into'` is answered.
   """
+
+  alias InfluxElixir.Client.Local.SQLParser
 
   @epoch DateTime.from_unix!(0, :microsecond)
 
@@ -84,10 +95,13 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   """
   @spec parse(binary()) :: {:ok, query()} | {:error, binary() | {:engine, binary()}}
   def parse(statement) do
-    with :ok <- check_supported(statement),
+    masked = mask_literals(statement)
+
+    with :ok <- check_supported(masked),
          %{"items" => items, "from" => from, "rest" => rest} <-
-           Regex.named_captures(@select, statement) || {:error, "invalid statement"},
-         %{} = clauses <- Regex.named_captures(@rest, rest) || {:error, "invalid clauses"},
+           slices(@select, masked, statement) || {:error, "invalid statement"},
+         %{"rest" => masked_rest} = slices(@select, masked, masked),
+         %{} = clauses <- slices(@rest, masked_rest, rest) || {:error, "invalid clauses"},
          :ok <- check_where(statement, blank_to_nil(clauses["where"])),
          {:ok, items} <- parse_items(items),
          :ok <- check_mix(items) do
@@ -106,47 +120,161 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
 
   @doc """
   Shapes `rows` — the measurement's points already filtered by the
-  statement's `WHERE`, as SQL row maps with `"time"` — into the engine's
-  answer. `tags` names the measurement's tag columns; everything else but
-  `time` is a field.
+  statement's `WHERE`, as SQL row maps with `"time"`, **in time order** —
+  into the engine's answer. `tags` names the measurement's tag columns;
+  everything else but `time` is a field.
+
+  Options:
+
+    * `:lower` - the lower bound (nanoseconds) the `WHERE` gives `time`;
+      an aggregate row is stamped with it, and with the epoch without one
+      (verified: `WHERE time >= 2` answers `mean` at 2 ns, `WHERE time < 3`
+      at the epoch; with `GROUP BY` every series carries it)
+    * `:fields` - the measurement's field names, when `LIMIT` or `OFFSET`
+      need them (they are read from the rows otherwise)
   """
-  @spec run(query(), [map()], MapSet.t(binary())) :: [map()]
-  def run(query, rows, tags) do
-    rows
-    |> Enum.group_by(&Map.take(&1, query.group_by))
-    |> Enum.sort_by(fn {key, _rows} -> Enum.map(query.group_by, &Map.get(key, &1)) end)
+  @spec run(query(), [map()], MapSet.t(binary()), keyword()) :: [map()]
+  def run(query, rows, tags, opts \\ []) do
+    context = %{
+      query: query,
+      tags: tags,
+      time: lower_time(Keyword.get(opts, :lower)),
+      fields: Keyword.get(opts, :fields),
+      sources: Map.new(for({:column, column, name} <- query.items, do: {name, column}))
+    }
+
+    query
+    |> series_groups(rows)
     |> Enum.flat_map(fn {key, group} ->
       group
-      |> Enum.sort_by(& &1["time"], DateTime)
-      |> series(query, tags, key)
-      |> Enum.drop(query.offset)
-      |> take(query.limit)
+      |> series(context, key)
+      |> window(context)
     end)
   end
+
+  # `LIMIT` and `OFFSET` of one series. A row of an aggregate is one row;
+  # for plain columns the engine counts per selected field, not per row
+  # (verified): `SELECT v, x FROM m LIMIT 1` is the first row with a `v` and
+  # the first with an `x`, which may be two rows, each with its own field
+  # only. A row that keeps no field is dropped.
+  @spec window([map()], map()) :: [map()]
+  defp window(rows, %{query: %{limit: nil, offset: 0}}), do: rows
+
+  defp window(rows, %{query: query} = context) do
+    if Enum.any?(query.items, &match?({:aggregate, _fn, _arg, _alias}, &1)),
+      do: rows |> Enum.drop(query.offset) |> take(query.limit),
+      else: window_per_field(rows, context)
+  end
+
+  defp window_per_field(rows, %{query: query} = context) do
+    fields = window_fields(rows, context)
+
+    # row index => the fields of it inside their windows
+    kept =
+      Enum.reduce(fields, %{}, fn field, kept ->
+        field
+        |> window_indices(rows, query)
+        |> Enum.reduce(kept, fn index, kept -> Map.update(kept, index, [field], &[field | &1]) end)
+      end)
+
+    last = kept |> Map.keys() |> Enum.max(fn -> -1 end)
+
+    for {row, index} <- rows |> Enum.take(last + 1) |> Enum.with_index(),
+        {:ok, keep} <- [Map.fetch(kept, index)] do
+      Map.drop(row, fields -- keep)
+    end
+  end
+
+  # The fields a window counts, as the rows name them: the selected
+  # columns that are fields, `*` being the measurement's (or, when the
+  # caller did not say, those the rows hold).
+  @spec window_fields([map()], map()) :: [binary()]
+  defp window_fields(rows, %{query: query} = context) do
+    query.items
+    |> Enum.flat_map(fn
+      :star -> star_fields(rows, context)
+      {:column, column, name} -> if MapSet.member?(context.tags, column), do: [], else: [name]
+    end)
+    |> Enum.uniq()
+  end
+
+  defp star_fields(rows, %{fields: nil} = context) do
+    rows
+    |> Enum.flat_map(fn row ->
+      for {name, _value} <- row,
+          name not in ["iox::measurement", "time"],
+          field?(name, context),
+          do: name
+    end)
+    |> Enum.uniq()
+  end
+
+  defp star_fields(_rows, %{fields: fields}), do: fields
+
+  # The indices of the rows that hold `field` inside its window, stopping
+  # at the end of it.
+  @spec window_indices(binary(), [map()], query()) :: [non_neg_integer()]
+  defp window_indices(field, rows, query) do
+    wanted = if query.limit, do: query.offset + query.limit, else: :all
+    rows |> field_indices(field, 0, wanted, []) |> Enum.drop(query.offset)
+  end
+
+  defp field_indices(_rows, _field, _index, 0, acc), do: Enum.reverse(acc)
+  defp field_indices([], _field, _index, _wanted, acc), do: Enum.reverse(acc)
+
+  defp field_indices([row | rows], field, index, wanted, acc) do
+    if Map.has_key?(row, field),
+      do: field_indices(rows, field, index + 1, decrement(wanted), [index | acc]),
+      else: field_indices(rows, field, index + 1, wanted, acc)
+  end
+
+  defp decrement(:all), do: :all
+  defp decrement(n), do: n - 1
+
+  # The rows of each `GROUP BY` series, in order of the tag values; the
+  # rows keep the time order they came in (the grouping is stable). Without
+  # a `GROUP BY` there is one series and no pass to group it.
+  @spec series_groups(query(), [map()]) :: [{map(), [map()]}]
+  defp series_groups(%{group_by: []}, []), do: []
+  defp series_groups(%{group_by: []}, rows), do: [{%{}, rows}]
+
+  defp series_groups(%{group_by: group_by}, rows) do
+    rows
+    |> Enum.group_by(&Map.take(&1, group_by))
+    |> Enum.sort_by(fn {key, _rows} -> Enum.map(group_by, &Map.get(key, &1)) end)
+  end
+
+  @spec lower_time(integer() | nil) :: DateTime.t()
+  defp lower_time(nil), do: @epoch
+  defp lower_time(ns), do: DateTime.from_unix!(Integer.floor_div(ns, 1_000), :microsecond)
 
   # ---------------------------------------------------------------------------
   # One series (one GROUP BY key)
   # ---------------------------------------------------------------------------
 
-  @spec series([map()], query(), MapSet.t(binary()), map()) :: [map()]
-  defp series(rows, query, tags, key) do
+  @spec series([map()], map(), map()) :: [map()]
+  defp series(rows, %{query: query} = context, key) do
     base = Map.put(key, "iox::measurement", query.measurement)
 
     if Enum.any?(query.items, &match?({:aggregate, _fn, _arg, _alias}, &1)),
-      do: aggregate(rows, query.items, tags, base),
-      else: project(rows, query, tags, base)
+      do: aggregate(rows, query.items, context.tags, base, context.time),
+      else: project(rows, context, base)
   end
 
-  @spec project([map()], query(), MapSet.t(binary()), map()) :: [map()]
-  defp project(rows, query, tags, base) do
+  @spec project([map()], map(), map()) :: [map()]
+  defp project(rows, %{query: query} = context, base) do
     rows = if query.descending, do: Enum.reverse(rows), else: rows
+    star? = query.items == [:star]
 
     for row <- rows,
-        projected = Enum.reduce(query.items, %{}, &put_item(&1, row, &2)),
-        Enum.any?(Map.keys(projected), &field?(&1, projected, tags, query.items)) do
+        projected = if(star?, do: Map.delete(row, "time"), else: projection(query.items, row)),
+        Enum.any?(projected, fn {name, _value} -> field?(name, context) end) do
       base |> Map.put("time", row["time"]) |> Map.merge(projected)
     end
   end
+
+  @spec projection([item()], map()) :: map()
+  defp projection(items, row), do: Enum.reduce(items, %{}, &put_item(&1, row, &2))
 
   @spec put_item(item(), map(), map()) :: map()
   defp put_item(:star, row, acc), do: Map.merge(acc, Map.delete(row, "time"))
@@ -159,23 +287,15 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   end
 
   # A projected key counts as a field value unless it is a tag (under its
-  # own name or an alias).
-  @spec field?(binary(), map(), MapSet.t(binary()), [item()]) :: boolean()
-  defp field?(name, _projected, tags, items) do
-    source =
-      Enum.find_value(items, name, fn
-        {:column, column, ^name} -> column
-        _other -> nil
-      end)
+  # own name or an alias; `sources` maps an alias to its column).
+  @spec field?(binary(), map()) :: boolean()
+  defp field?(name, %{sources: sources, tags: tags}),
+    do: not MapSet.member?(tags, Map.get(sources, name, name))
 
-    not MapSet.member?(tags, source)
-  end
-
-  @spec aggregate([map()], [item()], MapSet.t(binary()), map()) :: [map()]
-  defp aggregate(rows, items, tags, base) do
+  @spec aggregate([map()], [item()], MapSet.t(binary()), map(), DateTime.t()) :: [map()]
+  defp aggregate(rows, items, tags, base, time) do
     aggregates = for {:aggregate, _fn, _arg, _alias} = item <- items, do: item
-    fields = rows |> Enum.flat_map(&Map.keys/1) |> Enum.uniq() |> Enum.sort()
-    fields = Enum.reject(fields, &(&1 == "time" or MapSet.member?(tags, &1)))
+    fields = if count_star?(aggregates), do: field_names(rows, tags), else: []
 
     {values, _names} =
       Enum.flat_map_reduce(aggregates, %{}, fn item, names ->
@@ -206,8 +326,23 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
         [base |> Map.put("time", point["time"]) |> Map.merge(columns) |> Map.merge(values)]
 
       true ->
-        [base |> Map.put("time", @epoch) |> Map.merge(values)]
+        [base |> Map.put("time", time) |> Map.merge(values)]
     end
+  end
+
+  @spec count_star?([item()]) :: boolean()
+  defp count_star?(aggregates),
+    do: Enum.any?(aggregates, &match?({:aggregate, "count", :star, _alias}, &1))
+
+  # The field names the rows hold, sorted: only `COUNT(*)` needs them.
+  @spec field_names([map()], MapSet.t(binary())) :: [binary()]
+  defp field_names(rows, tags) do
+    rows
+    |> Enum.reduce(MapSet.new(), fn row, names ->
+      row |> Map.keys() |> MapSet.new() |> MapSet.union(names)
+    end)
+    |> Enum.reject(&(&1 == "time" or MapSet.member?(tags, &1)))
+    |> Enum.sort()
   end
 
   @spec lone_selector?([item()]) :: boolean()
@@ -289,17 +424,64 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   # ---------------------------------------------------------------------------
 
   @spec check_supported(binary()) :: :ok | {:error, binary()}
-  defp check_supported(statement) do
-    case Enum.find(unsupported(), fn {pattern, _name} -> Regex.match?(pattern, statement) end) do
+  defp check_supported(masked) do
+    case Enum.find(unsupported(), fn {pattern, _name} -> Regex.match?(pattern, masked) end) do
       nil -> :ok
       {_pattern, name} -> {:error, "unsupported InfluxQL (#{name})"}
     end
   end
 
+  # The named captures of `regex` run over `masked`, read from `text` (the
+  # same length): a keyword inside a literal cannot end a clause early.
+  @spec slices(Regex.t(), binary(), binary()) :: %{binary() => binary()} | nil
+  defp slices(regex, masked, text) do
+    with %{} = indexes <- Regex.named_captures(regex, masked, return: :index) do
+      Map.new(indexes, fn {name, {from, length}} ->
+        {name, if(from < 0, do: "", else: binary_part(text, from, length))}
+      end)
+    end
+  end
+
+  # The statement with the inside of every quoted string, quoted identifier
+  # and `=~ /regex/` blanked to underscores, byte for byte (spaces would let
+  # the clause regexes backtrack for ages), so that what is
+  # looked for in it (`fill(`, `INTO`, `GROUP BY`) is a keyword and not a
+  # piece of a value.
+  @spec mask_literals(binary()) :: binary()
+  defp mask_literals(statement), do: mask(statement, [], "")
+
+  defp mask(<<>>, acc, _last), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp mask(<<quote, rest::binary>>, acc, _last) when quote in [?', ?"],
+    do: mask_literal(rest, quote, acc, [quote], 0)
+
+  defp mask(<<?/, rest::binary>>, acc, last) when last in ["=~", "!~"],
+    do: mask_literal(rest, ?/, acc, [?/], 0)
+
+  defp mask(<<c, rest::binary>>, acc, last),
+    do: mask(rest, [c | acc], if(c in [?\s, ?\t, ?\n, ?\r], do: last, else: next_last(last, c)))
+
+  @spec next_last(binary(), byte()) :: binary()
+  defp next_last(last, c),
+    do: binary_part(last <> <<c>>, max(byte_size(last) + 1 - 2, 0), min(byte_size(last) + 1, 2))
+
+  # Blanks the literal's body; the closing delimiter stays.
+  defp mask_literal(<<>>, _delimiter, acc, opening, blanks),
+    do: mask(<<>>, [String.duplicate("_", blanks), opening | acc], "")
+
+  defp mask_literal(<<?\\, _c, rest::binary>>, delimiter, acc, opening, blanks),
+    do: mask_literal(rest, delimiter, acc, opening, blanks + 2)
+
+  defp mask_literal(<<delimiter, rest::binary>>, delimiter, acc, opening, blanks),
+    do: mask(rest, [delimiter, String.duplicate("_", blanks), opening | acc], "")
+
+  defp mask_literal(<<_c, rest::binary>>, delimiter, acc, opening, blanks),
+    do: mask_literal(rest, delimiter, acc, opening, blanks + 1)
+
   # ---------------------------------------------------------------------------
   # WHERE
   #
-  # The caller runs the WHERE through its SQL engine; `where_sql/2` rewrites
+  # The caller runs the WHERE through its SQL engine; `where_plan/2` rewrites
   # it into that SQL with InfluxQL's semantics (verified against InfluxDB 3):
   #
   #   * a tag the point lacks is the empty string, so `host != 'a'` and
@@ -308,9 +490,17 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   #   * `tag =~ /re/` and `tag !~ /re/` are unanchored regular-expression
   #     (non-)matches; either on a field is false
   #   * `<`, `<=`, `>` and `>=` on a tag are false
-  #   * a duration (`30m`, `1h`, `2d`, `1w`) is an interval; `now()` works
+  #   * a duration (`30m`, `1h`, `2d`, `1w`) is an interval next to `now()`;
+  #     `now()` works
   #   * a double-quoted identifier is exact; InfluxQL folds no case
   #   * `NOT` does not exist: the engine's parse error
+  #   * next to `time`, a duration or an integer is nanoseconds since the
+  #     epoch (`time >= 2`, `time > 0s`, `time = 2ns`), constants add and
+  #     subtract (`time > 1s - 999999999ns`); `!=` and `<>` are a planning
+  #     error; a float is refused
+  #   * the engine takes every `time` comparison out of the whole condition
+  #     and joins them with the rest by `AND`, `OR` or not, so one inside an
+  #     `OR` is refused rather than answered differently
   # ---------------------------------------------------------------------------
 
   @duration_ns %{
@@ -325,16 +515,52 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
     "w" => 604_800_000_000_000
   }
 
+  @typedoc """
+  A bound on `time`: nanoseconds since the epoch, or an offset from the
+  query's `now()`.
+  """
+  @type bound :: integer() | {:now, integer()}
+
+  @typedoc "A `WHERE` as the caller's SQL, with the lower bounds its `time` comparisons give."
+  @type where_plan :: %{sql: binary(), lowers: [bound()], idents: MapSet.t(binary())}
+
   @doc """
   Rewrites an InfluxQL `WHERE` into the caller's SQL, given the
   measurement's tag columns. `{:error, message}` for what the double
-  refuses by name.
+  refuses by name; `{:error, {:engine, body}}` for what the engine itself
+  answers with a 400.
   """
-  @spec where_sql(binary(), MapSet.t(binary())) :: {:ok, binary()} | {:error, binary()}
+  @spec where_sql(binary(), MapSet.t(binary())) ::
+          {:ok, binary()} | {:error, binary() | {:engine, binary()}}
   def where_sql(where, tags) do
-    with {:ok, tokens} <- tokenize(where, []) do
-      tokens |> rewrite(tags, []) |> Enum.join(" ") |> then(&{:ok, &1})
+    with {:ok, %{sql: sql}} <- where_plan(where, tags), do: {:ok, sql}
+  end
+
+  @doc """
+  Like `where_sql/2`, with the column names the `WHERE` mentions and the
+  lower bounds it puts on `time`:
+  `time >= x` and `time = x` give `x`, `time > x` gives `x + 1`, upper
+  bounds give none. An aggregate over a lower bound is stamped with the
+  greatest of them (`run/4`).
+  """
+  @spec where_plan(binary(), MapSet.t(binary())) ::
+          {:ok, where_plan()} | {:error, binary() | {:engine, binary()}}
+  def where_plan(where, tags) do
+    case tokenize(where, []) do
+      {:ok, tokens} ->
+        {tree, _rest} = parse_or(tokens)
+        {sql, lowers} = plan(tree, tags)
+        idents = for {:ident, name} <- tokens, into: MapSet.new(), do: name
+        {:ok, %{sql: sql, lowers: lowers, idents: idents}}
+
+      {:not, _after} ->
+        {:error, "unsupported InfluxQL WHERE: NOT"}
+
+      {:error, _message} = error ->
+        error
     end
+  catch
+    {:refused, message} -> {:error, message}
   end
 
   # `NOT` is no InfluxQL keyword: the engine fails to parse the statement
@@ -393,15 +619,11 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
            text
          ) do
       [full, n, unit] ->
-        with {:ok, token} <-
-               duration(String.to_integer(n) * Map.fetch!(@duration_ns, unit), full),
-             do:
-               tokenize(binary_part(text, byte_size(full), byte_size(text) - byte_size(full)), [
-                 token | acc
-               ])
+        duration = {:duration, String.to_integer(n) * Map.fetch!(@duration_ns, unit), full}
+        tokenize(rest_after(text, full), [duration | acc])
 
       [full, "", "", number] ->
-        tokenize(rest_after(text, full), [{:raw, number} | acc])
+        tokenize(rest_after(text, full), [{:number, number} | acc])
 
       [full, "", "", "", _now] ->
         tokenize(rest_after(text, full), [{:raw, "now()"} | acc])
@@ -425,19 +647,283 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
     if String.upcase(word) in ~w(AND OR TRUE FALSE), do: {:raw, word}, else: {:ident, word}
   end
 
-  # A duration is written in whole seconds, the unit the SQL engine's
-  # INTERVAL takes; a finer one is refused by name.
-  @spec duration(integer(), binary()) :: {:ok, tuple()} | {:error, binary()}
-  defp duration(ns, _text) when rem(ns, 1_000_000_000) == 0,
-    do: {:ok, {:raw, "INTERVAL '#{div(ns, 1_000_000_000)} seconds'"}}
-
-  defp duration(_ns, text), do: {:error, "unsupported InfluxQL (sub-second duration #{text})"}
-
   @spec take_until(binary(), char(), iodata()) :: {binary(), binary()}
   defp take_until(<<?\\, c, rest::binary>>, q, acc), do: take_until(rest, q, [<<?\\, c>> | acc])
   defp take_until(<<q, rest::binary>>, q, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), rest}
   defp take_until(<<c::utf8, rest::binary>>, q, acc), do: take_until(rest, q, [<<c::utf8>> | acc])
   defp take_until(<<>>, _q, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), <<>>}
+
+  # The condition as a tree: `OR` of `AND`s of comparisons and
+  # parenthesised conditions, as InfluxQL binds them.
+  #
+  #     {:or, [node]} | {:and, [node]} | {:group, node} | {:cmp, [token]}
+  @spec parse_or(list()) :: {tuple(), list()}
+  defp parse_or(tokens) do
+    {first, rest} = parse_and(tokens)
+    collect(rest, "OR", [first], &parse_and/1, :or)
+  end
+
+  @spec parse_and(list()) :: {tuple(), list()}
+  defp parse_and(tokens) do
+    {first, rest} = parse_atom(tokens)
+    collect(rest, "AND", [first], &parse_atom/1, :and)
+  end
+
+  defp collect([{:raw, word} | rest], keyword, acc, parse, kind) do
+    if String.upcase(word) == keyword do
+      {node, rest} = parse.(rest)
+      collect(rest, keyword, [node | acc], parse, kind)
+    else
+      done([{:raw, word} | rest], acc, kind)
+    end
+  end
+
+  defp collect(rest, _keyword, acc, _parse, kind), do: done(rest, acc, kind)
+
+  defp done(rest, [single], _kind), do: {single, rest}
+  defp done(rest, acc, kind), do: {{kind, Enum.reverse(acc)}, rest}
+
+  # A parenthesis opens a condition when it closes before an `AND`, an `OR`
+  # or the end and holds a comparison or connective; `(a + b) > 1` is an
+  # expression and stays a comparison.
+  defp parse_atom([{:raw, "("} | after_paren] = tokens) do
+    with {inside, [next | _more] = rest} <- split_group(after_paren, 1, []),
+         true <- boundary?(next) and condition?(inside) do
+      {node, []} = parse_or(inside)
+      {{:group, node}, rest}
+    else
+      {inside, []} -> if condition?(inside), do: group_to_end(inside), else: comparison(tokens)
+      _expression -> comparison(tokens)
+    end
+  end
+
+  defp parse_atom(tokens), do: comparison(tokens)
+
+  defp group_to_end(inside) do
+    {node, []} = parse_or(inside)
+    {{:group, node}, []}
+  end
+
+  # Tokens up to the closing parenthesis of the group just opened.
+  defp split_group([], _depth, _acc), do: :unbalanced
+
+  defp split_group([{:raw, ")"} | rest], 1, acc), do: {Enum.reverse(acc), rest}
+
+  defp split_group([{:raw, ")"} = token | rest], depth, acc),
+    do: split_group(rest, depth - 1, [token | acc])
+
+  defp split_group([{:raw, "("} = token | rest], depth, acc),
+    do: split_group(rest, depth + 1, [token | acc])
+
+  defp split_group([token | rest], depth, acc), do: split_group(rest, depth, [token | acc])
+
+  defp boundary?({:raw, word}), do: String.upcase(word) in ["AND", "OR", ")"]
+  defp boundary?(_token), do: false
+
+  defp condition?(tokens) do
+    Enum.any?(tokens, fn
+      {:op, _op} -> true
+      {:raw, word} -> String.upcase(word) in ["AND", "OR"]
+      _token -> false
+    end)
+  end
+
+  # Tokens up to the next `AND` or `OR` outside parentheses.
+  defp comparison(tokens), do: comparison(tokens, 0, [])
+
+  defp comparison([], _depth, acc), do: {{:cmp, Enum.reverse(acc)}, []}
+
+  defp comparison([{:raw, word} = token | rest], 0, acc) do
+    if String.upcase(word) in ["AND", "OR"],
+      do: {{:cmp, Enum.reverse(acc)}, [token | rest]},
+      else: comparison(rest, depth_after(word, 0), [token | acc])
+  end
+
+  defp comparison([{:raw, word} = token | rest], depth, acc),
+    do: comparison(rest, depth_after(word, depth), [token | acc])
+
+  defp comparison([token | rest], depth, acc), do: comparison(rest, depth, [token | acc])
+
+  defp depth_after("(", depth), do: depth + 1
+  defp depth_after(")", depth), do: max(depth - 1, 0)
+  defp depth_after(_word, depth), do: depth
+
+  # The tree as SQL, with the lower bounds its `time` comparisons give.
+  @spec plan(tuple(), MapSet.t(binary())) :: {binary(), [bound()]}
+  defp plan({:cmp, tokens}, tags) do
+    if Enum.any?(tokens, &match?({:ident, "time"}, &1)),
+      do: time_plan(tokens, tags),
+      else: {tokens |> rewrite(tags, []) |> Enum.join(" "), []}
+  end
+
+  defp plan({:group, node}, tags) do
+    {sql, lowers} = plan(node, tags)
+    {"(" <> sql <> ")", lowers}
+  end
+
+  defp plan({:and, nodes}, tags), do: join_plans(nodes, " AND ", tags)
+
+  defp plan({:or, nodes}, tags) do
+    if Enum.any?(nodes, &mentions_time_node?/1),
+      do: throw({:refused, "unsupported InfluxQL (a time comparison inside OR)"})
+
+    join_plans(nodes, " OR ", tags)
+  end
+
+  defp join_plans(nodes, separator, tags) do
+    {sqls, lowers} = nodes |> Enum.map(&plan(&1, tags)) |> Enum.unzip()
+    {Enum.join(sqls, separator), Enum.concat(lowers)}
+  end
+
+  defp mentions_time_node?({:cmp, tokens}), do: Enum.any?(tokens, &match?({:ident, "time"}, &1))
+  defp mentions_time_node?({:group, node}), do: mentions_time_node?(node)
+  defp mentions_time_node?({_kind, nodes}), do: Enum.any?(nodes, &mentions_time_node?/1)
+
+  # A comparison with `time` on one side and a time on the other.
+  @flipped %{"=" => "=", "<" => ">", "<=" => ">=", ">" => "<", ">=" => "<="}
+
+  defp time_plan(tokens, tags) do
+    case time_sides(tokens) do
+      {op, comparand} -> time_comparison(op, comparand)
+      :other -> {tokens |> rewrite(tags, []) |> Enum.join(" "), []}
+    end
+  end
+
+  defp time_sides([{:ident, "time"}, {:op, op} | comparand]) when comparand != [] do
+    if Enum.any?(comparand, &match?({:ident, _name}, &1)),
+      do: :other,
+      else: {op, comparand}
+  end
+
+  defp time_sides(tokens) when length(tokens) > 2 do
+    case Enum.split(tokens, -2) do
+      {comparand, [{:op, op}, {:ident, "time"}]} ->
+        if op in ["=~", "!~"] or Enum.any?(comparand, &match?({:ident, _name}, &1)),
+          do: :other,
+          else: {Map.get(@flipped, op, op), comparand}
+
+      _other ->
+        :other
+    end
+  end
+
+  defp time_sides(_tokens), do: :other
+
+  defp time_comparison(op, _comparand) when op in ["!=", "<>"] do
+    throw(
+      {:refused,
+       {:engine,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\n" <>
+          "Error during planning: invalid time comparison operator: !="}}
+    )
+  end
+
+  defp time_comparison(op, _comparand) when op not in ["=", "<", "<=", ">", ">="],
+    do: throw({:refused, "unsupported InfluxQL (time #{op} ...)"})
+
+  defp time_comparison(op, comparand) do
+    case time_value(comparand) do
+      {:ns, ns} ->
+        {"time #{op} '#{iso_ns(ns)}'", lower(op, ns)}
+
+      {:str, content} ->
+        {"time #{op} '#{content}'", lower(op, string_ns(content))}
+
+      {:now, offset, sql} ->
+        {"time #{op} #{sql}", lower(op, {:now, offset})}
+    end
+  end
+
+  # `time >= x` and `time = x` start at x, `time > x` just after it.
+  @spec lower(binary(), integer() | {:now, integer()} | nil) :: [bound()]
+  defp lower(_op, nil), do: []
+  defp lower(op, bound) when op in ["=", ">="], do: [bound]
+  defp lower(">", {:now, offset}), do: [{:now, offset + 1}]
+  defp lower(">", ns), do: [ns + 1]
+  defp lower(_op, _bound), do: []
+
+  # What a time is compared with: a quoted time, `now()` and durations, or
+  # a constant of integers and durations in nanoseconds.
+  defp time_value([{:str, content}]), do: {:str, content}
+
+  defp time_value([{:raw, "now()"} | terms]) do
+    {offset, sql} = now_terms(terms, 0, ["now()"])
+    {:now, offset, Enum.join(sql, " ")}
+  end
+
+  defp time_value(tokens), do: {:ns, constant(tokens)}
+
+  defp now_terms([], offset, sql), do: {offset, Enum.reverse(sql)}
+
+  defp now_terms([{:raw, sign}, {:duration, ns, text} | rest], offset, sql)
+       when sign in ["+", "-"] do
+    signed = if sign == "-", do: -ns, else: ns
+    now_terms(rest, offset + signed, [duration_sql(ns, text), sign | sql])
+  end
+
+  defp now_terms(_terms, _offset, _sql),
+    do: throw({:refused, "unsupported InfluxQL (a time compared with now() and something else)"})
+
+  # A duration next to `now()` is an interval in whole seconds, the unit
+  # the SQL engine's INTERVAL takes; a finer one is refused by name.
+  defp duration_sql(ns, _text) when rem(ns, 1_000_000_000) == 0,
+    do: "INTERVAL '#{div(ns, 1_000_000_000)} seconds'"
+
+  defp duration_sql(_ns, text),
+    do: throw({:refused, "unsupported InfluxQL (sub-second duration #{text})"})
+
+  # `[-] term [(+|-) term]...` of integers and durations.
+  defp constant([{:raw, "-"} | rest]), do: constant_sum(rest, 0, -1)
+  defp constant([{:raw, "+"} | rest]), do: constant_sum(rest, 0, 1)
+  defp constant(tokens), do: constant_sum(tokens, 0, 1)
+
+  defp constant_sum([term | rest], total, sign) do
+    total = total + sign * term_ns(term)
+
+    case rest do
+      [] -> total
+      [{:raw, "+"} | more] -> constant_sum(more, total, 1)
+      [{:raw, "-"} | more] -> constant_sum(more, total, -1)
+      _other -> throw({:refused, "unsupported InfluxQL (a time compared with an expression)"})
+    end
+  end
+
+  defp constant_sum([], _total, _sign),
+    do: throw({:refused, "unsupported InfluxQL (a time compared with an expression)"})
+
+  defp term_ns({:duration, ns, _text}), do: ns
+
+  defp term_ns({:number, text}) do
+    case Integer.parse(text) do
+      {n, ""} -> n
+      _float -> throw({:refused, "unsupported InfluxQL (non-integer time #{text})"})
+    end
+  end
+
+  defp term_ns(_token),
+    do: throw({:refused, "unsupported InfluxQL (a time compared with an expression)"})
+
+  # nanoseconds since the epoch as the nine-digit ISO-8601 time the SQL
+  # engine reads exactly; the 64-bit range is the engine's.
+  @spec iso_ns(integer()) :: binary()
+  defp iso_ns(ns) when ns >= -9_223_372_036_854_775_808 and ns <= 9_223_372_036_854_775_807 do
+    seconds = Integer.floor_div(ns, 1_000_000_000)
+    nanos = Integer.mod(ns, 1_000_000_000)
+    stamp = seconds |> DateTime.from_unix!() |> DateTime.to_iso8601() |> String.trim_trailing("Z")
+    "#{stamp}.#{String.pad_leading(Integer.to_string(nanos), 9, "0")}Z"
+  end
+
+  defp iso_ns(_ns),
+    do: throw({:refused, "unsupported InfluxQL (a time outside 64-bit nanoseconds)"})
+
+  # A quoted time, as the SQL engine reads it.
+  @spec string_ns(binary()) :: integer() | nil
+  defp string_ns(content) do
+    case SQLParser.parse_where(" WHERE time >= '#{content}'") do
+      {:ok, [{:gte, "time", ns}]} when is_integer(ns) -> ns
+      _unreadable -> nil
+    end
+  end
 
   @spec rewrite(list(), MapSet.t(binary()), [binary()]) :: [binary()]
   defp rewrite([], _tags, acc), do: Enum.reverse(acc)
@@ -467,6 +953,8 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   defp token_sql({:regex, pattern}), do: "'" <> String.replace(pattern, "'", "''") <> "'"
   defp token_sql({:op, op}), do: op
   defp token_sql({:raw, text}), do: text
+  defp token_sql({:number, text}), do: text
+  defp token_sql({:duration, ns, text}), do: duration_sql(ns, text)
 
   @spec ident_sql(binary()) :: binary()
   defp ident_sql(name) do

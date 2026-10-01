@@ -12,6 +12,10 @@ defmodule InfluxElixir.Client.ContractLocalV2Test do
     client: InfluxElixir.Client.Local,
     profile: :v2
 
+  use InfluxElixir.Contract.InfluxQLFluxLP,
+    client: InfluxElixir.Client.Local,
+    profile: :v2
+
   alias InfluxElixir.Client.Local
 
   setup do

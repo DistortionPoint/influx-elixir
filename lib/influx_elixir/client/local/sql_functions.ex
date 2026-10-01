@@ -45,20 +45,69 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
     if Enum.any?(args, &is_nil/1), do: nil, else: compute(name, args)
   end
 
-  @spec compute(name(), [number()]) :: number()
+  @spec compute(name(), [number()]) :: number() | nil
   defp compute(:abs, [x]), do: Kernel.abs(x)
   defp compute(:round, [x]), do: Kernel.round(x) * 1.0
   defp compute(:round, [x, 0]), do: Kernel.round(x) * 1.0
 
   # DataFusion scales, rounds half away from zero (as `Kernel.round/1`
-  # does) and scales back.
+  # does) and scales back, in IEEE doubles: `x * 10^scale` that overflows is
+  # infinity, a `10^scale` of 0 (`scale <= -309`) or of infinity (`scale >=
+  # 309`) leaves NaN or infinity, and JSON renders both as null (verified:
+  # `round(v, 400)` and `round(v, -400)` are `{"r":null}`). Erlang raises on
+  # those. A null that is not a missing value cannot be a result row here
+  # (the engine omits missing values, and a row map without the key is how
+  # this double says so), so the query is refused by name.
   defp compute(:round, [x, scale]) do
-    factor = :math.pow(10, scale)
-    Kernel.round(x * factor) / factor
+    case power_of_ten(scale) do
+      factor when is_float(factor) -> Kernel.round(x * factor) / factor
+      nil -> out_of_range(scale)
+    end
+  rescue
+    ArithmeticError -> out_of_range(scale)
   end
 
   defp compute(:floor, [x]), do: Float.floor(x * 1.0)
   defp compute(:ceil, [x]), do: Float.ceil(x * 1.0)
+
+  @spec out_of_range(integer()) :: no_return()
+  defp out_of_range(scale) do
+    throw(
+      {:query_error,
+       %{
+         status: 400,
+         body:
+           "Client.Local: round(x, #{scale}) leaves the range of a double: InfluxDB answers " <>
+             "null (a NaN or infinity as JSON), which a result row here cannot hold"
+       }}
+    )
+  end
+
+  # `10.0.powi(n)` as the engine's runtime computes it (square and multiply,
+  # then the reciprocal for a negative `n`), so the last bits match: a
+  # power computed another way differs in the final digit for large `n`.
+  # `nil` is infinity, which a float cannot hold here.
+  @spec power_of_ten(integer()) :: float() | nil
+  defp power_of_ten(scale) do
+    case square_and_multiply(10.0, abs(scale), 1.0) do
+      nil when scale < 0 -> 0.0
+      nil -> nil
+      power when scale < 0 -> 1.0 / power
+      power -> power
+    end
+  end
+
+  @spec square_and_multiply(float(), non_neg_integer(), float()) :: float() | nil
+  defp square_and_multiply(_base, 0, acc), do: acc
+
+  defp square_and_multiply(base, exponent, acc) do
+    acc = if Bitwise.band(exponent, 1) == 1, do: acc * base, else: acc
+    exponent = Bitwise.bsr(exponent, 1)
+
+    if exponent == 0, do: acc, else: square_and_multiply(base * base, exponent, acc)
+  rescue
+    ArithmeticError -> nil
+  end
 
   @doc """
   The engine's planning error for a call, given its arguments' Arrow types

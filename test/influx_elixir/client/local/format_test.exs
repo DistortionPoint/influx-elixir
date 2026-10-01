@@ -38,7 +38,7 @@ defmodule InfluxElixir.Client.Local.FormatTest do
     end
   end
 
-  describe "answer/2" do
+  describe "answer/3" do
     @row %{
       "time" => ~U[2023-11-14 22:13:20.000000Z],
       "host" => "a",
@@ -49,12 +49,12 @@ defmodule InfluxElixir.Client.Local.FormatTest do
     }
 
     test ":json and :jsonl answer the rows unchanged" do
-      assert Format.answer(:json, fn -> {:ok, [@row]} end) == {:ok, [@row]}
-      assert Format.answer(:jsonl, fn -> {:ok, [@row]} end) == {:ok, [@row]}
+      assert Format.answer(:json, fn -> {:ok, [@row]} end, "db") == {:ok, [@row]}
+      assert Format.answer(:jsonl, fn -> {:ok, [@row]} end, "db") == {:ok, [@row]}
     end
 
     test ":csv renders values as strings, keeps timestamps and drops empty cells" do
-      assert {:ok, [row]} = Format.answer(:csv, fn -> {:ok, [@row]} end)
+      assert {:ok, [row]} = Format.answer(:csv, fn -> {:ok, [@row]} end, "db")
 
       assert row == %{
                "time" => ~U[2023-11-14 22:13:20.000000Z],
@@ -68,33 +68,41 @@ defmodule InfluxElixir.Client.Local.FormatTest do
     test ":csv fails like the engine's aborted body on a nested value" do
       for nested <- [[1.5, 0.0], %{"time" => ~U[2023-11-14 22:13:20.000000Z], "value" => 1.5}] do
         assert {:error, {:connection_error, %Mint.TransportError{reason: :closed}}} =
-                 Format.answer(:csv, fn -> {:ok, [%{"a" => nested}]} end)
+                 Format.answer(:csv, fn -> {:ok, [%{"a" => nested}]} end, "db")
       end
     end
 
     test ":parquet is refused by name before the query runs" do
       assert {:error, %{status: 400, body: "Client.Local: format: :parquet" <> _rest}} =
-               Format.answer(:parquet, fn -> flunk("the query ran") end)
+               Format.answer(:parquet, fn -> flunk("the query ran") end, "db")
     end
 
     test "a format the engine does not know is its 400 before the query runs" do
-      assert {:error, %{status: 400, body: body}} =
-               Format.answer(:xml, fn -> flunk("the query ran") end)
-
-      assert body =~ "unknown variant `xml`, expected one of `parquet`, `csv`, `pretty`"
+      # The column is where the format string ends in the body Client.HTTP
+      # sends, `db` left out when no database is named (verified on Core).
+      for {database, column} <- [{"db", 25}, {nil, 15}] do
+        assert Format.answer(:xml, fn -> flunk("the query ran") end, database) ==
+                 {:error,
+                  %{
+                    status: 400,
+                    body:
+                      "serde json error: unknown variant `xml`, expected one of `parquet`, " <>
+                        "`csv`, `pretty`, `json`, `json_lines`, `jsonl` at line 1 column #{column}"
+                  }}
+      end
     end
 
     test "a format the engine answers but the client cannot parse is unsupported" do
       for format <- [:pretty, :json_lines, "json", "csv"] do
-        assert Format.answer(format, fn -> {:ok, [@row]} end) ==
+        assert Format.answer(format, fn -> {:ok, [@row]} end, "db") ==
                  {:error, {:unsupported_format, format}}
       end
     end
 
     test "a query error is answered before the format" do
       error = {:error, %{status: 400, body: "table not found"}}
-      assert Format.answer(:csv, fn -> error end) == error
-      assert Format.answer(:pretty, fn -> error end) == error
+      assert Format.answer(:csv, fn -> error end, "db") == error
+      assert Format.answer(:pretty, fn -> error end, "db") == error
     end
   end
 end

@@ -14,6 +14,16 @@ defmodule InfluxElixir.Client.ContractLocalV3CoreTest do
 
   use InfluxElixir.TokenContract, client: InfluxElixir.Client.Local, profile: :v3_core
 
+  use InfluxElixir.Contract.SQLParser, client: InfluxElixir.Client.Local, profile: :v3_core
+
+  use InfluxElixir.Contract.SQLExecutor,
+    client: InfluxElixir.Client.Local,
+    profile: :v3_core
+
+  use InfluxElixir.Contract.InfluxQLFluxLP,
+    client: InfluxElixir.Client.Local,
+    profile: :v3_core
+
   alias InfluxElixir.Client.Local
 
   setup do

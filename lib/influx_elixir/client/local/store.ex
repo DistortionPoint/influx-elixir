@@ -12,6 +12,8 @@ defmodule InfluxElixir.Client.Local.Store do
     * `{:database, name}` => `true`
     * `{:bucket, name}` => `%{retention: seconds}`
     * `{:token, name}` => the token map, and `:token_id` => the last id given
+      (a token is created by one insert of its full map, under a lock that
+      also gives the id, so a delete can never be overwritten)
     * `{:point, database, measurement, seq}` => the point — `seq` is a
       monotonic integer, so points scan in insertion order
     * `{:series_time, database, measurement, tags, timestamp}` — one per
@@ -66,6 +68,35 @@ defmodule InfluxElixir.Client.Local.Store do
   @spec put_database(t(), binary()) :: true
   def put_database(table, name), do: :ets.insert(table, {{:database, name}, true})
 
+  @doc """
+  Registers a database after `check` approves it, atomically: `check` is
+  called with the registered databases while no other process creates one,
+  so a limit such as Core's five cannot be passed by concurrent first
+  writes (each would have seen four). A database that exists is `:ok`
+  without taking the lock. `check` returns `:ok` or `{:error, reason}`.
+  """
+  @spec create_database(t(), binary(), (Enumerable.t(binary()) -> :ok | {:error, term()})) ::
+          :ok | {:error, term()}
+  def create_database(table, name, check) do
+    if database?(table, name) do
+      :ok
+    else
+      with_lock(table, :databases, fn ->
+        with :ok <- check.(databases(table)) do
+          put_database(table, name)
+          :ok
+        end
+      end)
+    end
+  end
+
+  # A lock on one store's resource, released when the function returns or
+  # its process dies. `:global` is node-wide, which is the scope of a store.
+  @spec with_lock(t(), atom(), (-> result)) :: result when result: term()
+  defp with_lock(table, resource, fun) do
+    :global.trans({{:influx_local, table, resource}, self()}, fun, [node()], :infinity)
+  end
+
   @doc "Whether a database is registered."
   @spec database?(t(), binary()) :: boolean()
   def database?(table, name), do: :ets.member(table, {:database, name})
@@ -105,6 +136,15 @@ defmodule InfluxElixir.Client.Local.Store do
   @spec bucket?(t(), binary()) :: boolean()
   def bucket?(table, name), do: :ets.member(table, {:bucket, name})
 
+  @doc "A bucket's metadata, or `nil` when it is not registered."
+  @spec bucket(t(), binary()) :: map() | nil
+  def bucket(table, name) do
+    case :ets.lookup(table, {:bucket, name}) do
+      [{_key, meta}] -> meta
+      [] -> nil
+    end
+  end
+
   @doc "The buckets as `{name, meta}`, sorted by name."
   @spec buckets(t()) :: [{binary(), map()}]
   def buckets(table) do
@@ -125,22 +165,40 @@ defmodule InfluxElixir.Client.Local.Store do
   end
 
   @doc """
-  Claims a token name and gives it the next id, atomically: `{:ok, id}`, or
-  `:exists` when the name is taken (which spends no id, as on the engine).
-  The operator token `_admin` (id 0) always exists.
-  """
-  @spec claim_token(t(), binary()) :: {:ok, pos_integer()} | :exists
-  def claim_token(_table, "_admin"), do: :exists
+  Creates the token named `name`: `build` is called with the next id and
+  returns the token map, which is stored by one `insert_new`. `{:ok, token}`,
+  or `:exists` when the name is taken, which spends no id (as on the
+  engine). The operator token `_admin` (id 0) always exists.
 
-  def claim_token(table, name) do
-    if :ets.insert_new(table, {{:token, name}, :claimed}),
-      do: {:ok, :ets.update_counter(table, :token_id, 1, {:token_id, 0})},
-      else: :exists
+  The id is chosen, and the name checked, under a lock so that no id is
+  spent on a duplicate; the token goes in whole, never as a placeholder to
+  be filled in later, so a `delete_token/2` can never be overwritten and
+  bring the token back.
+  """
+  @spec create_token(t(), binary(), (pos_integer() -> map())) :: {:ok, map()} | :exists
+  def create_token(_table, "_admin", _build), do: :exists
+
+  def create_token(table, name, build) do
+    with_lock(table, :tokens, fn ->
+      id = last_token_id(table) + 1
+      token = build.(id)
+
+      if :ets.insert_new(table, {{:token, name}, token}) do
+        :ets.insert(table, {:token_id, id})
+        {:ok, token}
+      else
+        :exists
+      end
+    end)
   end
 
-  @doc "Stores a claimed token's map under its name."
-  @spec put_token(t(), binary(), map()) :: true
-  def put_token(table, name, token), do: :ets.insert(table, {{:token, name}, token})
+  @spec last_token_id(t()) :: non_neg_integer()
+  defp last_token_id(table) do
+    case :ets.lookup(table, :token_id) do
+      [{:token_id, id}] -> id
+      [] -> 0
+    end
+  end
 
   @doc "Removes the token named `name`: `:ok`, or `:error` when there is none."
   @spec delete_token(t(), binary()) :: :ok | :error
@@ -209,12 +267,18 @@ defmodule InfluxElixir.Client.Local.Store do
     :ets.select(table, spec, 1) != :"$end_of_table"
   end
 
-  @doc "The database's measurements that hold points, first-written first."
+  @doc """
+  The database's measurements, sorted by name: the ones with a table,
+  which a write creates by registering its columns. They are read from the
+  column keys, which are few; looking for them among the points meant
+  selecting every point. The order is the keys', alphabetical, which is
+  how InfluxDB lists them.
+  """
   @spec measurements(t(), binary()) :: [binary()]
   def measurements(table, database) do
     table
-    |> :ets.select([{{{:point, database, :"$1", :_}, :_}, [], [:"$1"]}])
-    |> Enum.uniq()
+    |> :ets.select([{{{:column, database, :"$1", :_}, :_}, [], [:"$1"]}])
+    |> Enum.dedup()
   end
 
   @doc """
@@ -231,9 +295,15 @@ defmodule InfluxElixir.Client.Local.Store do
       else: points
   end
 
-  @doc "Every point in a database, duplicates merged."
-  @spec points_in_db(t(), binary()) :: [point()]
-  def points_in_db(table, database) do
+  @doc """
+  The points of a database, duplicates merged: every measurement's with
+  `:all`, or only the listed measurements' (a query that names them need
+  not read the rest).
+  """
+  @spec points_in_db(t(), binary(), :all | [binary()]) :: [point()]
+  def points_in_db(table, database, only \\ :all)
+
+  def points_in_db(table, database, :all) do
     points = :ets.select(table, [{{{:point, database, :_, :_}, :"$1"}, [], [:"$1"]}])
 
     if :ets.match(table, {{:duplicates, database, :_}}, 1) == :"$end_of_table",
@@ -241,11 +311,27 @@ defmodule InfluxElixir.Client.Local.Store do
       else: merge_duplicates(points)
   end
 
+  def points_in_db(table, database, measurements) do
+    measurements
+    |> Enum.uniq()
+    |> Enum.sort()
+    |> Enum.flat_map(&points(table, database, &1))
+  end
+
   @doc """
   Deletes the points of a measurement that `match?` accepts, judged on the
   merged points as the engine sees them; every stored object behind a
   matching point is deleted by its own key, so a concurrent write is never
   lost. Returns the number of (merged) points deleted.
+
+  The `series_time` key of a doomed point is deleted with it, which a
+  writer racing the delete may have just claimed. That is harmless
+  (assessed, not a bug): a writer that finds the key taken has already put
+  the measurement's `duplicates` marker, which is never removed, so reads
+  merge it with any point left at that series and time; one that finds the
+  key gone writes a point that nothing deleted here refers to. Either way
+  the point the writer stored is kept, as a write after the delete would
+  be, and no point is merged with one that was deleted.
   """
   @spec delete_points(t(), binary(), binary(), (point() -> boolean())) :: non_neg_integer()
   def delete_points(table, database, measurement, match?) do

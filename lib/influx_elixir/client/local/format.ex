@@ -14,7 +14,11 @@ defmodule InfluxElixir.Client.Local.Format do
     * `:parquet` — refused by name: the double holds no Parquet writer
     * `:pretty` / `:json_lines` and their string forms — the engine accepts
       them but the client cannot parse them: `{:unsupported_format, format}`
-    * anything else — the engine's 400 for an unknown variant
+    * anything else — the engine's 400 for an unknown variant, ending in the
+      ` at line 1 column N` of its JSON parser: N is the byte, in the request
+      body `Client.HTTP` sends (`{"db":"<database>","format":"<format>",...}`,
+      keys in that order), where the format's string ends. It depends on the
+      database name, which `answer/3` takes.
 
   The engine reads `format` with the request, before it plans the query:
   an unknown format is its 400 whatever the query, as is the refusal of
@@ -26,18 +30,22 @@ defmodule InfluxElixir.Client.Local.Format do
   @doc """
   Runs the query (`run` returns `{:ok, rows}` or an error) and answers in
   `format`, or with the error `Client.HTTP` returns for that format.
+
+  `database` is the one the request names, or `nil` when it names none
+  (`Client.HTTP` then leaves `db` out of the body); the position in an
+  unknown format's error counts the body's bytes.
   """
-  @spec answer(term(), (-> {:ok, [map()]} | {:error, term()})) ::
+  @spec answer(term(), (-> {:ok, [map()]} | {:error, term()}), binary() | nil) ::
           {:ok, [map()]} | {:error, term()}
-  def answer(format, run) do
-    with :ok <- accept(format),
+  def answer(format, run, database) do
+    with :ok <- accept(format, database),
          {:ok, rows} <- run.() do
       render(rows, format)
     end
   end
 
-  @spec accept(term()) :: :ok | {:error, map()}
-  defp accept(:parquet) do
+  @spec accept(term(), binary() | nil) :: :ok | {:error, map()}
+  defp accept(:parquet, _database) do
     {:error,
      %{
        status: 400,
@@ -47,10 +55,10 @@ defmodule InfluxElixir.Client.Local.Format do
      }}
   end
 
-  defp accept(format) do
+  defp accept(format, database) do
     if to_string(format) in @engine_formats,
       do: :ok,
-      else: {:error, %{status: 400, body: unknown_variant(format)}}
+      else: {:error, %{status: 400, body: unknown_variant(format, database)}}
   end
 
   @spec render([map()], term()) :: {:ok, [map()]} | {:error, term()}
@@ -65,10 +73,16 @@ defmodule InfluxElixir.Client.Local.Format do
     end
   end
 
-  @spec unknown_variant(term()) :: binary()
-  defp unknown_variant(format) do
+  # The parser stops where the format's string ends; the body `Client.HTTP`
+  # builds is that string's prefix, closed, minus its closing brace.
+  @spec unknown_variant(term(), binary() | nil) :: binary()
+  defp unknown_variant(format, database) do
     expected = Enum.map_join(@engine_formats, ", ", &"`#{&1}`")
-    "serde json error: unknown variant `#{format}`, expected one of #{expected}"
+    body = if database, do: %{"db" => database}, else: %{}
+    request = Jason.encode!(Map.put(body, "format", to_string(format)))
+
+    "serde json error: unknown variant `#{format}`, expected one of #{expected} " <>
+      "at line 1 column #{byte_size(request) - 1}"
   end
 
   @spec csv([map()]) :: {:ok, [map()]} | {:error, term()}
@@ -108,6 +122,30 @@ defmodule InfluxElixir.Client.Local.Format do
   def render_float(value) do
     sign = if negative?(value), do: "-", else: ""
     sign <> render_abs(digits(abs(value)))
+  end
+
+  @doc """
+  A float as the planner prints a `Float64` literal: positional notation, the
+  shortest digits that read back, no `.0` for a whole number (`1`, `0.1`,
+  `100000000000000000000`, `0.0000001`).
+  """
+  @spec render_decimal(float()) :: binary()
+  def render_decimal(value) do
+    sign = if negative?(value), do: "-", else: ""
+    sign <> decimal_abs(digits(abs(value)))
+  end
+
+  @spec decimal_abs({binary(), integer()}) :: binary()
+  defp decimal_abs({"", _point}), do: "0"
+
+  defp decimal_abs({digits, point}) do
+    size = byte_size(digits)
+
+    cond do
+      point <= 0 -> "0." <> String.duplicate("0", -point) <> digits
+      point >= size -> digits <> String.duplicate("0", point - size)
+      true -> binary_part(digits, 0, point) <> "." <> binary_part(digits, point, size - point)
+    end
   end
 
   @spec negative?(float()) :: boolean()

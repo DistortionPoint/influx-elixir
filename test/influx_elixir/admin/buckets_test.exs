@@ -16,8 +16,13 @@ defmodule InfluxElixir.Admin.BucketsTest do
 
       assert {:ok, [bucket]} = Buckets.list(conn)
       assert bucket["name"] == "my_bucket"
-      assert bucket["retentionRules"] == [%{"type" => "expire", "everySeconds" => 0}]
+      # With no expiry a bucket's shard groups are a week long (verified).
+      assert bucket["retentionRules"] == [
+               %{"type" => "expire", "everySeconds" => 0, "shardGroupDurationSeconds" => 604_800}
+             ]
+
       assert is_binary(bucket["id"])
+      assert bucket["type"] == "user"
     end
 
     test ":retention is kept in seconds and listed as the bucket's rule", %{conn: conn} do

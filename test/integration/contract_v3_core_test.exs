@@ -18,6 +18,10 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
     client: InfluxElixir.Client.HTTP,
     profile: :v3_core
 
+  use InfluxElixir.Contract.SQLParser, client: InfluxElixir.Client.HTTP, profile: :v3_core
+  use InfluxElixir.Contract.SQLExecutor, client: InfluxElixir.Client.HTTP, profile: :v3_core
+  use InfluxElixir.Contract.InfluxQLFluxLP, client: InfluxElixir.Client.HTTP, profile: :v3_core
+
   alias InfluxElixir.Client.HTTP
   alias InfluxElixir.IntegrationHelper, as: H
 

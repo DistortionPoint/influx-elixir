@@ -100,15 +100,34 @@ defmodule InfluxElixir.Client.Local do
       it, not as it was sent: single spaces, floats shortest and without an
       exponent (`2.0` → `2`), strings unquoted. Runs of spaces between a
       line's sections are one separator.
+    * InfluxDB 3 reads a line the way its parser does, and says so in its
+      words: `series SP+ fields [SP+ timestamp] SP*`, where whatever is left
+      over is "Could not parse entire line. Found trailing content: `...`"
+      and a first field that does not parse is "No fields were provided".
+      `v=5.` leaves `.`, `v=1e` leaves `e`, `v=.5` and `v=+5` are no
+      fields at all, `v=1 100 200` leaves `200`; a tag set that cannot be
+      read is "Tag set malformed", "Expected tag key" or "Expected tag
+      value", and a field named twice is refused. See
+      `InfluxElixir.Client.Local.LineProtocolParser` for the grammar.
     * Under the `:v2` profile the rules are InfluxDB 2's, verified against
-      2.7: a field type conflict is HTTP 422 (`{"code":"unprocessable
-      entity","message":"... field type conflict: input field \"v\" on
-      measurement \"m\" is type float, already exists as type integer
-      dropped=N"}`) with the other lines stored; a line that fails to parse
-      rejects the whole payload with HTTP 400 (`{"code":"invalid","message":
-      "unable to parse '<line>': ..."}`) and nothing is stored; `time` as a
-      field is dropped silently and as a tag is a 400; a tag and a field may
-      share a name; an empty payload is accepted.
+      2.7, which parses with Go's `ParsePoints` and words its errors after
+      the scanner that failed: a field type conflict is HTTP 422
+      (`{"code":"unprocessable entity","message":"... field type conflict:
+      input field \"v\" on measurement \"m\" is type float, already exists as
+      type integer dropped=N"}`) with the other lines stored; a point whose
+      only field is `time` is dropped, "invalid field name" (the other
+      fields of a point that has some are stored, `time` is not); a payload
+      is written a shard group at a time (a week of time, or a day or an
+      hour for a bucket with a short retention), and the message is the
+      last group's first drop, counting every point it dropped. A line that
+      fails to parse rejects the whole payload with HTTP 400
+      (`{"code":"invalid","message":"unable to parse '<line>': <reason>"}`,
+      one such sentence per failed line, joined by newlines, the reason one
+      of `invalid field format`, `missing field value`, `invalid number`,
+      `invalid float`, `invalid boolean`, `bad timestamp`, `point is
+      invalid`, `missing fields`, `missing tag value`, ... the way the
+      scanners say them) and nothing is stored; `time` as a tag is a 400; a
+      tag and a field may share a name; an empty payload is accepted.
 
   ## SQL Query Support
 
@@ -216,8 +235,8 @@ defmodule InfluxElixir.Client.Local do
       null. A cast that cannot be performed (`'abc'` to `INTEGER`, `time` to
       `INTEGER`) makes InfluxDB 3 Core drop the connection mid-response,
       which `Client.HTTP` reports as `{:error, {:connection_error,
-      %Mint.TransportError{reason: :closed}}}`; the double reports
-      `{:error, {:connection_error, :closed}}`. `BOOLEAN` and `TIMESTAMP`
+      %Mint.TransportError{reason: :closed}}}`, and so does the double.
+      `BOOLEAN` and `TIMESTAMP`
       targets are outside the subset.
     * `LIMIT n` and `OFFSET m`, in either order — `OFFSET` skips rows before
       `LIMIT` takes them, on plain, projected, grouped and `DISTINCT` rows
@@ -236,9 +255,11 @@ defmodule InfluxElixir.Client.Local do
       expression over fields
       and numeric literals (`SUM(value * value)`, `AVG(bid + ask)`); two
       integer operands divide as integers (`3 / 2 = 1`), as in DataFusion.
-      Division by zero is null in the double, where InfluxDB returns IEEE
-      infinity for floats (serialised as JSON `null` but counted by
-      `COUNT`) and fails the query for integers. A sample
+      An integer divided by zero closes the connection mid-response, as on
+      the engine (`{:error, {:connection_error, %Mint.TransportError{reason:
+      :closed}}}`). A float divided by zero is IEEE infinity or NaN on the
+      engine, which compares as a number but has no Elixir form, so the
+      double refuses it by name. A sample
       statistic over one value is null. `COUNT(DISTINCT col)` counts
       distinct non-null values. `MIN(time)`, `MAX(time)` and `COUNT(time)`
       work (a `DateTime` result); every other aggregate over `time`, and
@@ -335,9 +356,10 @@ defmodule InfluxElixir.Client.Local do
   @type profile :: :v3_core | :v3_enterprise | :v2
 
   @type conn :: %{
-          table: Store.t(),
-          database: binary() | nil,
-          profile: profile()
+          required(:table) => Store.t(),
+          required(:database) => binary() | nil,
+          required(:profile) => profile(),
+          optional(:org) => binary()
         }
 
   # Operations supported by each profile.
@@ -389,7 +411,8 @@ defmodule InfluxElixir.Client.Local do
     start(
       database: Keyword.get(config, :database),
       databases: Keyword.get(config, :databases, []),
-      profile: Keyword.get(config, :profile, :v3_core)
+      profile: Keyword.get(config, :profile, :v3_core),
+      org: Keyword.get(config, :org)
     )
   end
 
@@ -412,6 +435,9 @@ defmodule InfluxElixir.Client.Local do
       Without `:database`, the first is the default, as in `Client.HTTP`.
       With neither there is no default: an operation that needs a database
       is `{:error, :no_database_specified}`, as over HTTP.
+    * `:org` - the organisation the buckets belong to (`:v2`; default
+      `"local"`). A bucket's `"orgID"` is derived from it, so it is stable
+      for a connection and differs between organisations.
 
   On the v3 profiles each name must be one InfluxDB 3 accepts, and
   `:v3_core` holds at most 5; `start/1` raises `ArgumentError` with the
@@ -461,7 +487,8 @@ defmodule InfluxElixir.Client.Local do
     # A public ETS store (see `InfluxElixir.Client.Local.Store`): every
     # mutation is one insert or delete of its own key, so no process is
     # needed to make concurrent writers safe.
-    {:ok, %{table: Store.new(databases), database: database, profile: profile}}
+    org = Keyword.get(opts, :org) || "local"
+    {:ok, %{table: Store.new(databases), database: database, profile: profile, org: org}}
   end
 
   @doc """
@@ -695,47 +722,19 @@ defmodule InfluxElixir.Client.Local do
   @spec store_lines(Store.t(), binary(), [LineProtocolParser.line_result()], profile()) ::
           InfluxElixir.Client.write_result()
   defp store_lines(table, database, lines, :v2) do
-    case Enum.find(lines, &match?({:error, _line_error}, &1)) do
-      {:error, %{error_message: message, line: line}} ->
-        {:error,
-         %{
-           status: 400,
-           body:
-             Jason.encode!(%{
-               "code" => "invalid",
-               "message" => "unable to parse '#{line}': #{message}"
-             })
-         }}
+    case for({:error, line_error} <- lines, do: line_error) do
+      [] ->
+        store_v2_points(table, database, lines)
 
-      nil ->
-        {conflicts, _known} =
-          Enum.reduce(lines, {[], %{}}, fn {:ok, point, _number, _line}, {conflicts, known} ->
-            case check_schema(table, database, point, :v2, known) do
-              {:ok, known} ->
-                Store.store_point(table, database, strip_uint_markers(point))
-                {conflicts, known}
-
-              {:error, conflict} ->
-                {[conflict | conflicts], known}
-            end
+      errors ->
+        # Every line that fails is reported, joined by newlines.
+        message =
+          Enum.map_join(errors, "\n", fn %{error_message: reason, line: line} ->
+            "unable to parse '#{line}': #{reason}"
           end)
 
-        case Enum.reverse(conflicts) do
-          [] ->
-            {:ok, :written}
-
-          [{field, measurement, existing, got} | _rest] = dropped ->
-            message =
-              "failure writing points to database: partial write: field type conflict: " <>
-                ~s|input field "#{field}" on measurement "#{measurement}" is type #{got}, | <>
-                "already exists as type #{existing} dropped=#{length(dropped)}"
-
-            {:error,
-             %{
-               status: 422,
-               body: Jason.encode!(%{"code" => "unprocessable entity", "message" => message})
-             }}
-        end
+        {:error,
+         %{status: 400, body: Jason.encode!(%{"code" => "invalid", "message" => message})}}
     end
   end
 
@@ -770,6 +769,93 @@ defmodule InfluxElixir.Client.Local do
                "data" => errors |> Enum.reverse() |> Enum.map(&Map.delete(&1, :line))
              })
          }}
+    end
+  end
+
+  # InfluxDB 2 writes a payload's points in groups, one per shard group
+  # (verified): a point it drops is counted, and the message it answers
+  # with is the first drop of the last group (in order of first appearance)
+  # that dropped any. A point is dropped for a field type that conflicts
+  # with the stored one and for having no field but `time`.
+  @spec store_v2_points(Store.t(), binary(), [LineProtocolParser.line_result()]) ::
+          InfluxElixir.Client.write_result()
+  defp store_v2_points(table, database, lines) do
+    shard_ns = shard_group_seconds(bucket_retention(table, database)) * 1_000_000_000
+
+    {failures, groups, _known} =
+      Enum.reduce(lines, {[], [], %{}}, fn {:ok, point, _number, _line},
+                                           {failures, groups, known} ->
+        group = Integer.floor_div(point.timestamp, shard_ns)
+        groups = if group in groups, do: groups, else: groups ++ [group]
+
+        case store_v2_point(table, database, point, known) do
+          {:ok, known} -> {failures, groups, known}
+          {:dropped, reason, known} -> {[{group, reason} | failures], groups, known}
+        end
+      end)
+
+    v2_write_result(Enum.reverse(failures), groups)
+  end
+
+  @spec store_v2_point(Store.t(), binary(), point_map(), map()) ::
+          {:ok, map()} | {:dropped, term(), map()}
+  defp store_v2_point(_table, _database, %{fields: fields} = point, known)
+       when map_size(fields) == 0,
+       do: {:dropped, {:invalid_name, point.measurement}, known}
+
+  defp store_v2_point(table, database, point, known) do
+    case check_schema(table, database, point, :v2, known) do
+      {:ok, known} ->
+        Store.store_point(table, database, strip_uint_markers(point))
+        {:ok, known}
+
+      {:error, conflict} ->
+        {:dropped, conflict, known}
+    end
+  end
+
+  @spec v2_write_result([{integer(), term()}], [integer()]) ::
+          InfluxElixir.Client.write_result()
+  defp v2_write_result([], _groups), do: {:ok, :written}
+
+  defp v2_write_result(failures, groups) do
+    failed = MapSet.new(failures, &elem(&1, 0))
+    last = groups |> Enum.filter(&MapSet.member?(failed, &1)) |> List.last()
+    [first | _rest] = reasons = for {^last, reason} <- failures, do: reason
+
+    message =
+      "failure writing points to database: partial write: " <>
+        v2_drop_reason(first) <> " dropped=#{length(reasons)}"
+
+    {:error,
+     %{
+       status: 422,
+       body: Jason.encode!(%{"code" => "unprocessable entity", "message" => message})
+     }}
+  end
+
+  @spec v2_drop_reason(term()) :: binary()
+  defp v2_drop_reason({:invalid_name, measurement}) do
+    ~s|invalid field name: input field "time" on measurement "#{measurement}" is invalid|
+  end
+
+  defp v2_drop_reason({field, measurement, existing, got}) do
+    ~s|field type conflict: input field "#{field}" on measurement "#{measurement}" is | <>
+      "type #{got}, already exists as type #{existing}"
+  end
+
+  # How long a bucket's shard groups are: a week when its retention is
+  # none or at least 180 days, a day from two days, an hour below.
+  @spec shard_group_seconds(non_neg_integer()) :: pos_integer()
+  defp shard_group_seconds(retention) when retention == 0 or retention >= 15_552_000, do: 604_800
+  defp shard_group_seconds(retention) when retention >= 172_800, do: 86_400
+  defp shard_group_seconds(_retention), do: 3_600
+
+  @spec bucket_retention(Store.t(), binary()) :: non_neg_integer()
+  defp bucket_retention(table, bucket) do
+    case Store.bucket(table, bucket) do
+      %{retention: seconds} -> seconds
+      _unregistered -> 0
     end
   end
 
@@ -1009,7 +1095,11 @@ defmodule InfluxElixir.Client.Local do
       # a statement that is not a query gets execute_sql's answer.
       if statement_kind(String.trim(sql)) == :query,
         do:
-          Format.answer(query_format(opts), fn -> query_database(table, database, sql, opts) end),
+          Format.answer(
+            query_format(opts),
+            fn -> query_database(table, database, sql, opts) end,
+            database
+          ),
         else: execute_sql(conn, sql, opts)
     end
   end
@@ -1083,7 +1173,6 @@ defmodule InfluxElixir.Client.Local do
   defp stream_error_opts(reason), do: [kind: :transport, reason: reason]
 
   @doc """
-  @doc \"""
   Executes a SQL statement as InfluxDB 3 does (verified against Core).
 
     * `SELECT` / `WITH ... SELECT` run as `query_sql/3` and return
@@ -1210,9 +1299,11 @@ defmodule InfluxElixir.Client.Local do
       over the last 24 hours unless the `WHERE` bounds `time`
     * `SELECT ...` — InfluxQL, not SQL: see `InfluxElixir.Client.Local.InfluxQL`
       for the row shape (`iox::measurement` and `time` on every row, time
-      order, `mean`/`count`/... aggregates, an unknown column or measurement
-      is `{:ok, []}`), for InfluxQL's `WHERE` (a missing tag is `''`,
-      regexes, durations) and for what is refused by name
+      order, `mean`/`count`/... aggregates stamped with the `WHERE`'s lower
+      bound on `time`, an unknown column or measurement is `{:ok, []}`,
+      `LIMIT` and `OFFSET` per selected field), for InfluxQL's `WHERE` (a
+      missing tag is `''`, regexes, durations, integers and durations as
+      nanoseconds next to `time`) and for what is refused by name
   """
   @impl true
   @spec query_influxql(
@@ -1222,9 +1313,11 @@ defmodule InfluxElixir.Client.Local do
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(%{table: table} = conn, influxql, opts \\ []) do
     with :ok <- require_capability(conn, :query_influxql) do
-      Format.answer(query_format(opts), fn ->
-        do_query_influxql(table, conn, String.trim(influxql), opts)
-      end)
+      Format.answer(
+        query_format(opts),
+        fn -> do_query_influxql(table, conn, String.trim(influxql), opts) end,
+        Keyword.get(opts, :database) || Map.get(conn, :database)
+      )
     end
   end
 
@@ -1337,7 +1430,7 @@ defmodule InfluxElixir.Client.Local do
   defp tag_values_where(nil, _tags), do: {:ok, @show_tag_values_window}
 
   defp tag_values_where(where, tags) do
-    with {:ok, " WHERE " <> sql} <- influxql_where(where, tags) do
+    with {:ok, %{where: " WHERE " <> sql}} <- influxql_where(where, tags) do
       if InfluxQL.mentions_time?(where),
         do: {:ok, sql},
         else: {:ok, "(#{sql}) AND " <> @show_tag_values_window}
@@ -1427,47 +1520,83 @@ defmodule InfluxElixir.Client.Local do
   defp influxql_select(table, database, query) do
     tags = Store.tag_columns(table, database, query.measurement)
 
-    with {:ok, where} <- influxql_where(query.where, tags) do
+    with {:ok, plan} <- influxql_where(query.where, tags) do
       # ORDER BY time sorts on the stored nanoseconds; rows carry microsecond
       # DateTimes, so sorting those alone would tie sub-microsecond points.
-      sql = ~s|SELECT * FROM "#{query.measurement}"| <> where <> " ORDER BY time"
+      # InfluxQL shapes the rows in that order and sorts nothing again.
+      sql = ~s|SELECT * FROM "#{query.measurement}"| <> plan.where <> " ORDER BY time"
 
       table
-      |> run_influxql_sql(database, sql, tags)
-      |> influxql_result(query, tags)
+      |> run_influxql_sql(database, sql, plan.tags)
+      |> influxql_result(query, tags,
+        lower: lower_bound(plan.lowers),
+        fields: window_fields(table, database, query)
+      )
     end
   end
 
-  @spec influxql_where(binary() | nil, MapSet.t(binary())) :: {:ok, binary()} | {:error, map()}
-  defp influxql_where(nil, _tags), do: {:ok, ""}
+  # The field names a LIMIT or OFFSET counts per field, from the schema;
+  # a query without either does not read them.
+  @spec window_fields(Store.t(), binary(), InfluxQL.query()) :: [binary()] | nil
+  defp window_fields(_table, _database, %{limit: nil, offset: 0}), do: nil
+
+  defp window_fields(table, database, query) do
+    for {measurement, column, "iox::column_type::field::" <> _type} <-
+          Store.columns(table, database),
+        measurement == query.measurement,
+        do: column
+  end
+
+  # The WHERE as SQL (with its leading ` WHERE `, or nothing), the lower
+  # bounds it puts on `time`, and the tag columns it names: only those
+  # need the missing-tag fill.
+  @spec influxql_where(binary() | nil, MapSet.t(binary())) ::
+          {:ok, %{where: binary(), lowers: [InfluxQL.bound()], tags: MapSet.t(binary())}}
+          | {:error, map()}
+  defp influxql_where(nil, _tags), do: {:ok, %{where: "", lowers: [], tags: MapSet.new()}}
 
   defp influxql_where(where, tags) do
-    case InfluxQL.where_sql(where, tags) do
-      {:ok, sql} -> {:ok, " WHERE " <> sql}
-      {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+    case InfluxQL.where_plan(where, tags) do
+      {:ok, plan} ->
+        {:ok,
+         %{
+           where: " WHERE " <> plan.sql,
+           lowers: plan.lowers,
+           tags: MapSet.intersection(tags, plan.idents)
+         }}
+
+      {:error, {:engine, body}} ->
+        {:error, %{status: 400, body: body}}
+
+      {:error, message} ->
+        {:error, %{status: 400, body: "Client.Local: #{message}"}}
     end
   end
 
   # InfluxQL reads a tag a point lacks as the empty string (verified), so
-  # the WHERE runs over points with every missing tag filled with "". A
-  # stored tag value is never empty (line protocol forbids it), so the
-  # filled ones are dropped from the rows again afterwards. InfluxQL
-  # identifiers are case-sensitive: the SQL written from them is read as
-  # it is, not folded as a user's SQL would be.
+  # the WHERE runs over points with every missing tag it names filled with
+  # "". A stored tag value is never empty (line protocol forbids it), so the
+  # filled ones are dropped from the rows again afterwards. A tag the WHERE
+  # does not name is not filled, and a query without a WHERE makes no extra
+  # pass. InfluxQL identifiers are case-sensitive: the SQL written from
+  # them is read as it is, not folded as a user's SQL would be.
   @spec run_influxql_sql(Store.t(), binary(), binary(), MapSet.t(binary())) ::
           {:ok, [map()]} | {:error, term()}
-  defp run_influxql_sql(table, database, sql, tags) do
-    blank_tags = Map.new(tags, &{&1, ""})
+  defp run_influxql_sql(table, database, sql, fill_tags) do
+    blank_tags = Map.new(fill_tags, &{&1, ""})
 
     fetch = fn measurement ->
       with {:ok, points} <- point_source(table, database, measurement) do
-        {:ok, Enum.map(points, &%{&1 | tags: Map.merge(blank_tags, &1.tags)})}
+        if blank_tags == %{},
+          do: {:ok, points},
+          else: {:ok, Enum.map(points, &%{&1 | tags: Map.merge(blank_tags, &1.tags)})}
       end
     end
 
     with {:ok, query} <- SQLParser.parse_select(sql, identifiers: :exact),
          rows when is_list(rows) <- SQLExecutor.run(query, fetch) do
-      {:ok, Enum.map(rows, &drop_blank_tags(&1, tags))}
+      {:ok,
+       if(blank_tags == %{}, do: rows, else: Enum.map(rows, &drop_blank_tags(&1, fill_tags)))}
     else
       {:error, _reason} = error -> error
     end
@@ -1480,12 +1609,16 @@ defmodule InfluxElixir.Client.Local do
     end)
   end
 
-  @spec influxql_result({:ok, [map()]} | {:error, term()}, InfluxQL.query(), MapSet.t(binary())) ::
-          InfluxElixir.Client.query_result()
-  defp influxql_result(result, query, tags) do
+  @spec influxql_result(
+          {:ok, [map()]} | {:error, term()},
+          InfluxQL.query(),
+          MapSet.t(binary()),
+          keyword()
+        ) :: InfluxElixir.Client.query_result()
+  defp influxql_result(result, query, tags, opts) do
     case result do
       {:ok, rows} ->
-        {:ok, InfluxQL.run(query, rows, tags)}
+        {:ok, InfluxQL.run(query, rows, tags, opts)}
 
       {:error, %{body: "Error during planning: table " <> _rest}} ->
         {:ok, []}
@@ -1496,6 +1629,18 @@ defmodule InfluxElixir.Client.Local do
       error ->
         error
     end
+  end
+
+  # The greatest of the lower bounds a WHERE puts on `time`, `now()` taken
+  # now, or `nil` for none.
+  @spec lower_bound([InfluxQL.bound()]) :: integer() | nil
+  defp lower_bound(lowers) do
+    lowers
+    |> Enum.map(fn
+      {:now, offset} -> Store.now_ns() + offset
+      ns -> ns
+    end)
+    |> Enum.max(fn -> nil end)
   end
 
   @spec influxql_parse(binary()) :: {:ok, InfluxQL.query()} | {:error, map()}
@@ -1517,7 +1662,10 @@ defmodule InfluxElixir.Client.Local do
         "_stop" => %DateTime{}, "_time" => %DateTime{}, "_measurement" => "cpu",
         "_field" => "value", "_value" => 1.0, "host" => "web01"}
 
-  A bucket that does not exist is the engine's 404.
+  A bucket that does not exist is the engine's 404, a `range` with no time
+  in it its 400, and times that do not fit 64-bit nanoseconds wrap as they
+  do there. A query that filters on `r._measurement` reads only the
+  measurements it names.
   """
   @impl true
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
@@ -1526,7 +1674,7 @@ defmodule InfluxElixir.Client.Local do
     with :ok <- require_capability(conn, :query_flux),
          {:ok, query} <- flux_parse(flux),
          :ok <- flux_bucket_exists(table, query.bucket) do
-      case Flux.run(query, Store.points_in_db(table, query.bucket)) do
+      case Flux.run(query, Store.points_in_db(table, query.bucket, Flux.measurements(query))) do
         {:ok, rows} -> {:ok, rows}
         {:error, message} -> {:error, flux_error(400, "invalid", message)}
       end
@@ -1585,8 +1733,8 @@ defmodule InfluxElixir.Client.Local do
   def create_database(%{table: table} = conn, name, opts \\ []) do
     with :ok <- require_capability(conn, :create_database),
          :ok <- check_retention(Keyword.get(opts, :retention), name),
-         :ok <- DatabaseRules.check_new(name, Store.databases(table), conn.profile) do
-      Store.put_database(table, name)
+         :ok <-
+           Store.create_database(table, name, &DatabaseRules.check_new(name, &1, conn.profile)) do
       :ok
     end
   end
@@ -1711,31 +1859,38 @@ defmodule InfluxElixir.Client.Local do
            }}
 
         seconds ->
-          Store.put_bucket(table, name, %{retention: seconds})
+          created_at =
+            case Store.bucket(table, name) do
+              %{created_at: at} -> at
+              _new -> nanosecond_timestamp()
+            end
+
+          Store.put_bucket(table, name, %{retention: seconds, created_at: created_at})
           :ok
       end
     end
   end
 
   @doc """
-  Returns all buckets in this local instance as maps with `"id"`, `"name"`
-  and `"retentionRules"` (`[%{"type" => "expire", "everySeconds" => n}]`,
-  the shape InfluxDB 2 lists; verified).
+  Returns all buckets in this local instance as InfluxDB 2 lists them
+  (verified against 2.7): `"id"`, `"orgID"` (stable for the connection's
+  org), `"type"` (`"user"`; the engine's own `_tasks` and `_monitoring`
+  buckets are not modelled), `"name"`, `"retentionRules"` (`[%{"type" =>
+  "expire", "everySeconds" => n, "shardGroupDurationSeconds" => n}]`),
+  `"createdAt"`, `"updatedAt"`, `"links"` and `"labels"`.
   """
   @impl true
   @spec list_buckets(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
   def list_buckets(%{table: table} = conn) do
     with :ok <- require_capability(conn, :list_buckets) do
+      org_id = hex_id(Map.get(conn, :org, "local"))
+
       bkts =
         table
         |> Store.buckets()
-        |> Enum.map(fn {name, %{retention: seconds}} ->
-          %{
-            "id" => bucket_id(name),
-            "name" => name,
-            "retentionRules" => [%{"type" => "expire", "everySeconds" => seconds}]
-          }
+        |> Enum.map(fn {name, %{retention: seconds} = meta} ->
+          bucket_map(name, seconds, org_id, Map.get(meta, :created_at, nanosecond_timestamp()))
         end)
 
       {:ok, bkts}
@@ -1783,10 +1938,8 @@ defmodule InfluxElixir.Client.Local do
          {:ok, {kind, _path, body}} <- TokenRequest.build(name, opts),
          :ok <- token_endpoint(kind, profile),
          {:ok, expiry_secs} <- check_expiry(Keyword.get(opts, :expiry_secs), body) do
-      case Store.claim_token(table, name) do
-        {:ok, id} ->
-          token = new_token(id, name, expiry_secs)
-          Store.put_token(table, name, token)
+      case Store.create_token(table, name, &new_token(&1, name, expiry_secs)) do
+        {:ok, token} ->
           {:ok, token}
 
         :exists ->
@@ -1902,10 +2055,7 @@ defmodule InfluxElixir.Client.Local do
   # v3 Core/Enterprise auto-create databases on write; v2 requires pre-existing
   @spec ensure_database(Store.t(), binary(), profile()) :: :ok | {:error, term()}
   defp ensure_database(table, database, profile) when profile in [:v3_core, :v3_enterprise] do
-    with :ok <- DatabaseRules.check_new(database, Store.databases(table), profile) do
-      Store.put_database(table, database)
-      :ok
-    end
+    Store.create_database(table, database, &DatabaseRules.check_new(database, &1, profile))
   end
 
   # v2 writes target buckets, so anything registered via `create_bucket/3` is a
@@ -1959,8 +2109,52 @@ defmodule InfluxElixir.Client.Local do
     }
   end
 
-  @spec bucket_id(binary()) :: binary()
-  defp bucket_id(name) do
+  @spec bucket_map(binary(), non_neg_integer(), binary(), binary()) :: map()
+  defp bucket_map(name, retention, org_id, created_at) do
+    id = hex_id(name)
+    base = "/api/v2/buckets/#{id}"
+
+    %{
+      "id" => id,
+      "orgID" => org_id,
+      "type" => "user",
+      "name" => name,
+      "retentionRules" => [
+        %{
+          "type" => "expire",
+          "everySeconds" => retention,
+          "shardGroupDurationSeconds" => shard_group_seconds(retention)
+        }
+      ],
+      "createdAt" => created_at,
+      "updatedAt" => created_at,
+      "links" => %{
+        "labels" => base <> "/labels",
+        "members" => base <> "/members",
+        "org" => "/api/v2/orgs/#{org_id}",
+        "owners" => base <> "/owners",
+        "self" => base,
+        "write" => "/api/v2/write?org=#{org_id}&bucket=#{id}"
+      },
+      "labels" => []
+    }
+  end
+
+  # InfluxDB 2's ids are 16 hex digits; these are derived from the name, so
+  # they stay the same across calls and connections.
+  @spec hex_id(binary()) :: binary()
+  defp hex_id(name) do
     :crypto.hash(:sha256, name) |> binary_part(0, 8) |> Base.encode16(case: :lower)
+  end
+
+  # The engine's timestamps: RFC 3339 with nine fractional digits.
+  @spec nanosecond_timestamp() :: binary()
+  defp nanosecond_timestamp do
+    ns = System.os_time(:nanosecond)
+    seconds = Integer.floor_div(ns, 1_000_000_000)
+    stamp = seconds |> DateTime.from_unix!() |> DateTime.to_iso8601() |> String.trim_trailing("Z")
+
+    stamp <>
+      "." <> String.pad_leading(Integer.to_string(Integer.mod(ns, 1_000_000_000)), 9, "0") <> "Z"
   end
 end
