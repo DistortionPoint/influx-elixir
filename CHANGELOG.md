@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.37] - 2026-10-01
+
 ### Added
 - **`Client.Local` answers more of InfluxQL, as InfluxDB 3 does.** These
   constructs were refused by name and are now answered, verified against
