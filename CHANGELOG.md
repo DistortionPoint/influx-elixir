@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.39] - 2026-10-01
+
 ### Fixed
 - **The library failed to compile in a project without `decimal`.** It
   is an optional dependency, but the SQL parser matched `%Decimal{}`,
