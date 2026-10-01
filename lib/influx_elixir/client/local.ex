@@ -100,6 +100,16 @@ defmodule InfluxElixir.Client.Local do
       it, not as it was sent: single spaces, floats shortest and without an
       exponent (`2.0` → `2`), strings unquoted. Runs of spaces between a
       line's sections are one separator.
+    * `line_number` counts the lines that are not blank and not comments,
+      and `original_line` of a syntax error is the physical line of the
+      payload with that number, so a comment before a bad line shifts the
+      echo, as it does on the engine. A quote opens a string only after a
+      field's `=`; one in a measurement, tag or field key is a plain byte,
+      and a measurement in quotes keeps them in its name.
+    * Two lines InfluxDB 3 Core accepts are refused by name, because what it
+      then stores cannot be held: a tag key given twice (every query of the
+      table then fails with a 500) and a float too large for 64 bits such as
+      `1e999` (stored as infinity).
     * InfluxDB 3 reads a line the way its parser does, and says so in its
       words: `series SP+ fields [SP+ timestamp] SP*`, where whatever is left
       over is "Could not parse entire line. Found trailing content: `...`"
@@ -119,7 +129,7 @@ defmodule InfluxElixir.Client.Local do
       fields of a point that has some are stored, `time` is not); a payload
       is written a shard group at a time (a week of time, or a day or an
       hour for a bucket with a short retention), and the message is the
-      last group's first drop, counting every point it dropped. A line that
+      earliest failing group's first drop, counting that group's drops. A line that
       fails to parse rejects the whole payload with HTTP 400
       (`{"code":"invalid","message":"unable to parse '<line>': <reason>"}`,
       one such sentence per failed line, joined by newlines, the reason one
@@ -127,7 +137,10 @@ defmodule InfluxElixir.Client.Local do
       `invalid float`, `invalid boolean`, `bad timestamp`, `point is
       invalid`, `missing fields`, `missing tag value`, ... the way the
       scanners say them) and nothing is stored; `time` as a tag is a 400; a
-      tag and a field may share a name; an empty payload is accepted.
+      tag and a field may share a name; an empty payload is accepted. A
+      measurement with a backslash before `=` or `"`, or two or more before
+      a `,` or a space, is accepted and never returned by a query, on the
+      engine and in the double.
 
   ## SQL Query Support
 
@@ -242,7 +255,9 @@ defmodule InfluxElixir.Client.Local do
       `LIMIT` takes them, on plain, projected, grouped and `DISTINCT` rows
       alike; `LIMIT 0` returns no rows; a negative or non-numeric
       limit is rejected, as the engine rejects it
-    * `$param` placeholders via `params: %{"$name" => value}` in opts. A
+    * `$param` placeholders via `params: %{name: value}` (or `%{"name" => value}`)
+      in opts; the key is the name without `$`, as the engine reads it (a
+      `"$name"` key binds nothing on either client). A
       `DateTime`, `NaiveDateTime` or `Date` param renders as the ISO-8601
       string Jason sends over HTTP, so `time >= $start` works the same on
       both clients; an integer param against `time` is rejected on both.
@@ -337,6 +352,7 @@ defmodule InfluxElixir.Client.Local do
   @behaviour InfluxElixir.Client
 
   alias InfluxElixir.Admin.TokenRequest
+  alias InfluxElixir.Client.QueryParams
 
   alias InfluxElixir.Client.Local.{
     Body,
@@ -347,6 +363,7 @@ defmodule InfluxElixir.Client.Local do
     LineProtocolParser,
     SQLExecutor,
     SQLIdentifiers,
+    SQLLexer,
     SQLParser,
     Store
   }
@@ -624,7 +641,7 @@ defmodule InfluxElixir.Client.Local do
   # Both engines give every line of one write that has no timestamp the
   # same one, the request's time (verified): untimed lines of one series in
   # one payload are one point, their fields merged and the last write
-  # winning. Stamping each line separately kept them as separate rows.
+  # winning.
   @spec stamp_untimed({:ok, [LineProtocolParser.line_result()]} | {:error, term()}) ::
           {:ok, [LineProtocolParser.line_result()]} | {:error, term()}
   defp stamp_untimed({:ok, lines}) do
@@ -774,37 +791,46 @@ defmodule InfluxElixir.Client.Local do
 
   # InfluxDB 2 writes a payload's points in groups, one per shard group
   # (verified): a point it drops is counted, and the message it answers
-  # with is the first drop of the last group (in order of first appearance)
-  # that dropped any. A point is dropped for a field type that conflicts
-  # with the stored one and for having no field but `time`.
+  # with is the first drop of the earliest group that dropped any, counting
+  # only that group's drops, whatever order the payload gave the groups in.
+  # A point is dropped for a field type that conflicts with the stored one
+  # and for having no field but `time`.
   @spec store_v2_points(Store.t(), binary(), [LineProtocolParser.line_result()]) ::
           InfluxElixir.Client.write_result()
   defp store_v2_points(table, database, lines) do
     shard_ns = shard_group_seconds(bucket_retention(table, database)) * 1_000_000_000
 
-    {failures, groups, _known} =
-      Enum.reduce(lines, {[], [], %{}}, fn {:ok, point, _number, _line},
-                                           {failures, groups, known} ->
-        group = Integer.floor_div(point.timestamp, shard_ns)
-        groups = if group in groups, do: groups, else: groups ++ [group]
+    {failures, _known} =
+      Enum.reduce(lines, {[], %{}}, fn
+        {:ok, %{unreadable: true}, _number, _line}, state ->
+          state
 
-        case store_v2_point(table, database, point, known) do
-          {:ok, known} -> {failures, groups, known}
-          {:dropped, reason, known} -> {[{group, reason} | failures], groups, known}
-        end
+        {:ok, point, _number, _line}, {failures, known} ->
+          group = Integer.floor_div(point.timestamp, shard_ns)
+
+          case store_v2_point(table, database, point, v2_scope(point, group), known) do
+            {:ok, known} -> {failures, known}
+            {:dropped, reason, known} -> {[{group, reason} | failures], known}
+          end
       end)
 
-    v2_write_result(Enum.reverse(failures), groups)
+    v2_write_result(Enum.reverse(failures))
   end
 
-  @spec store_v2_point(Store.t(), binary(), point_map(), map()) ::
+  # InfluxDB 2 types a field per shard group (verified): the same field may
+  # be an integer in one week and a float in another. The schema of a group
+  # is kept under the measurement and the group, joined by a NUL.
+  @spec v2_scope(point_map(), integer()) :: binary()
+  defp v2_scope(point, group), do: point.measurement <> <<0>> <> Integer.to_string(group)
+
+  @spec store_v2_point(Store.t(), binary(), point_map(), binary(), map()) ::
           {:ok, map()} | {:dropped, term(), map()}
-  defp store_v2_point(_table, _database, %{fields: fields} = point, known)
+  defp store_v2_point(_table, _database, %{fields: fields} = point, _scope, known)
        when map_size(fields) == 0,
        do: {:dropped, {:invalid_name, point.measurement}, known}
 
-  defp store_v2_point(table, database, point, known) do
-    case check_schema(table, database, point, :v2, known) do
+  defp store_v2_point(table, database, point, scope, known) do
+    case check_schema(table, database, point, {:v2, scope}, known) do
       {:ok, known} ->
         Store.store_point(table, database, strip_uint_markers(point))
         {:ok, known}
@@ -814,14 +840,12 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec v2_write_result([{integer(), term()}], [integer()]) ::
-          InfluxElixir.Client.write_result()
-  defp v2_write_result([], _groups), do: {:ok, :written}
+  @spec v2_write_result([{integer(), term()}]) :: InfluxElixir.Client.write_result()
+  defp v2_write_result([]), do: {:ok, :written}
 
-  defp v2_write_result(failures, groups) do
-    failed = MapSet.new(failures, &elem(&1, 0))
-    last = groups |> Enum.filter(&MapSet.member?(failed, &1)) |> List.last()
-    [first | _rest] = reasons = for {^last, reason} <- failures, do: reason
+  defp v2_write_result(failures) do
+    {earliest, _reason} = Enum.min_by(failures, &elem(&1, 0))
+    [first | _rest] = reasons = for {^earliest, reason} <- failures, do: reason
 
     message =
       "failure writing points to database: partial write: " <>
@@ -955,22 +979,20 @@ defmodule InfluxElixir.Client.Local do
   #
   # `known` holds the kinds this write has already confirmed or registered,
   # `{measurement, column} => kind`: a kind never changes once set, so the
-  # store is asked only about a column the write has not met yet (two ETS
-  # calls per column per point, before).
-  @spec check_schema(Store.t(), binary(), point_map(), LineProtocolParser.dialect(), map()) ::
+  # store is asked only about a column the write has not met yet.
+  @spec check_schema(Store.t(), binary(), point_map(), :v3 | {:v2, binary()}, map()) ::
           {:ok, map()} | {:error, binary() | {binary(), binary(), binary(), binary()}}
   defp check_schema(table, database, point, :v3, known) do
     case reserved_time(point, fn -> Store.table?(table, database, point.measurement) end) do
-      :ok -> check_column_types(table, database, point, :v3, known)
+      :ok -> check_column_types(table, database, point, :v3, point.measurement, known)
       {:error, _message} = error -> error
     end
   end
 
-  defp check_schema(table, database, point, :v2, known),
-    do: check_column_types(table, database, point, :v2, known)
+  defp check_schema(table, database, point, {:v2, scope}, known),
+    do: check_column_types(table, database, point, :v2, scope, known)
 
-  # `table_exists?` is asked only for a point that names `time`; every
-  # point used to pay an ETS match for it.
+  # `table_exists?` is asked only for a point that names `time`.
   @spec reserved_time(point_map(), (-> boolean())) :: :ok | {:error, binary()}
   defp reserved_time(%{tags: tags, fields: fields}, table_exists?) do
     cond do
@@ -1009,11 +1031,10 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           point_map(),
           LineProtocolParser.dialect(),
+          binary(),
           map()
         ) :: {:ok, map()} | {:error, binary() | {binary(), binary(), binary(), binary()}}
-  defp check_column_types(table, database, point, dialect, known) do
-    m = point.measurement
-
+  defp check_column_types(table, database, point, dialect, m, known) do
     point
     |> point_columns(dialect)
     |> Enum.reduce_while({:ok, known}, fn {column, type}, {:ok, known} ->
@@ -1060,8 +1081,8 @@ defmodule InfluxElixir.Client.Local do
      LineProtocolParser.v2_field_type(type)}
   end
 
-  # An unsigned integer is stored as the integer; the marker only served
-  # the schema check.
+  # An unsigned integer is stored as the integer; the marker exists for the
+  # schema check alone.
   @spec strip_uint_markers(point_map()) :: point_map()
   defp strip_uint_markers(point) do
     fields =
@@ -1088,42 +1109,61 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
-  def query_sql(%{table: table} = conn, sql, opts \\ []) do
+  def query_sql(conn, sql, opts \\ []) do
     with :ok <- require_capability(conn, :query_sql),
-         {:ok, database} <- resolve_database(opts, conn) do
-      # The engine answers query_sql and execute_sql from the same endpoint:
-      # a statement that is not a query gets execute_sql's answer.
-      if statement_kind(String.trim(sql)) == :query,
-        do:
-          Format.answer(
-            query_format(opts),
-            fn -> query_database(table, database, sql, opts) end,
-            database
-          ),
-        else: execute_sql(conn, sql, opts)
+         {:ok, database} <- resolve_database(opts, conn),
+         {:ok, params} <- QueryParams.normalize(Keyword.get(opts, :params, %{})) do
+      answer_sql(conn, database, sql, params, opts)
     end
   end
 
-  @spec query_database(Store.t(), binary(), binary(), keyword()) ::
+  # The engine answers query_sql and execute_sql from the same endpoint:
+  # a statement that is not a query gets execute_sql's answer. A text its
+  # tokenizer cannot read is answered after the request's format and
+  # parameters, as its parser reads the text last.
+  @spec answer_sql(conn(), binary(), binary(), QueryParams.t(), keyword()) ::
           InfluxElixir.Client.query_result()
-  defp query_database(table, database, sql, opts) do
-    with :ok <- database_exists(table, database), do: run_query(table, database, sql, opts)
+  defp answer_sql(%{table: table} = conn, database, sql, params, opts) do
+    case SQLLexer.scrub(sql) do
+      {:ok, statement} ->
+        if statement_kind(statement) == :query,
+          do:
+            Format.answer(
+              query_format(opts),
+              fn -> query_database(table, database, statement, params) end,
+              database,
+              params
+            ),
+          else: execute_sql(conn, sql, opts)
+
+      {:error, _reason} = error ->
+        Format.answer(
+          query_format(opts),
+          fn -> with :ok <- database_exists(table, database), do: error end,
+          database,
+          params
+        )
+    end
   end
 
-  @spec run_query(Store.t(), binary(), binary(), keyword()) ::
+  @spec query_database(Store.t(), binary(), binary(), QueryParams.t()) ::
           InfluxElixir.Client.query_result()
-  defp run_query(table, database, sql, opts, identifiers \\ :fold) do
-    resolved_sql = SQLParser.resolve_params(sql, Keyword.get(opts, :params, %{}))
+  defp query_database(table, database, sql, params) do
+    with :ok <- database_exists(table, database), do: run_query(table, database, sql, params)
+  end
 
-    with nil <- SQLParser.unbound_placeholder(resolved_sql),
-         {:ok, query} <- SQLParser.parse_select(resolved_sql, identifiers: identifiers) do
-      case SQLExecutor.run(query, &point_source(table, database, &1)) do
+  @spec run_query(Store.t(), binary(), binary(), QueryParams.t()) ::
+          InfluxElixir.Client.query_result()
+  defp run_query(table, database, sql, params) do
+    with {:ok, query} <- SQLParser.parse_select(sql) do
+      case SQLExecutor.run(
+             query,
+             &point_source(table, database, &1),
+             QueryParams.engine_values(params)
+           ) do
         {:error, _reason} = err -> err
         rows -> {:ok, rows}
       end
-    else
-      {:error, _reason} = err -> err
-      name when is_binary(name) -> {:error, unbound_placeholder_error(name)}
     end
   end
 
@@ -1197,9 +1237,9 @@ defmodule InfluxElixir.Client.Local do
   def execute_sql(%{table: table, profile: profile} = conn, sql, opts \\ []) do
     with :ok <- require_capability(conn, :execute_sql),
          {:ok, database} <- resolve_database(opts, conn),
-         :ok <- database_exists(table, database) do
-      trimmed = String.trim(sql)
-
+         {:ok, _params} <- QueryParams.normalize(Keyword.get(opts, :params, %{})),
+         :ok <- database_exists(table, database),
+         {:ok, trimmed} <- SQLLexer.scrub(sql) do
       case statement_kind(trimmed) do
         :query ->
           query_sql(conn, sql, opts)
@@ -1513,8 +1553,7 @@ defmodule InfluxElixir.Client.Local do
   # empty InfluxQL result, not an error (verified).
   #
   # The inner query gets typed rows: the caller's `format:` applies once, to
-  # the InfluxQL result (it used to render the rows as CSV strings before
-  # InfluxQL aggregated them).
+  # the InfluxQL result.
   @spec influxql_select(Store.t(), binary(), InfluxQL.query()) ::
           InfluxElixir.Client.query_result()
   defp influxql_select(table, database, query) do
@@ -1674,11 +1713,60 @@ defmodule InfluxElixir.Client.Local do
     with :ok <- require_capability(conn, :query_flux),
          {:ok, query} <- flux_parse(flux),
          :ok <- flux_bucket_exists(table, query.bucket) do
-      case Flux.run(query, Store.points_in_db(table, query.bucket, Flux.measurements(query))) do
+      points = Store.points_in_db(table, query.bucket, Flux.measurements(query))
+
+      case Flux.run(query, flux_typed(table, query, points)) do
         {:ok, rows} -> {:ok, rows}
         {:error, message} -> {:error, flux_error(400, "invalid", message)}
       end
     end
+  end
+
+  # A field written with different types in different shard groups reads as
+  # the type of the earliest group the range touches; the points of the other
+  # types are not returned (verified). A bucket's shard groups are as long as
+  # its retention makes them.
+  @spec flux_typed(Store.t(), Flux.query(), [point_map()]) :: [point_map()]
+  defp flux_typed(table, %{bucket: bucket} = query, points) do
+    {start_ns, stop_ns} = Flux.range(query)
+    shard_ns = shard_group_seconds(bucket_retention(table, bucket)) * 1_000_000_000
+
+    touched =
+      for point <- points,
+          group = Integer.floor_div(point.timestamp, shard_ns),
+          group * shard_ns < stop_ns and (group + 1) * shard_ns > start_ns,
+          do: {point, group}
+
+    kinds =
+      Map.new(
+        for(
+          {point, group} <- touched,
+          field <- Map.keys(point.fields),
+          do: {point, group, field}
+        ),
+        fn {point, group, field} ->
+          {{point.measurement, group, field},
+           Store.column_kind(table, bucket, v2_scope(point, group), field)}
+        end
+      )
+
+    earliest =
+      Enum.reduce(kinds, %{}, fn {{m, group, field}, kind}, acc ->
+        Map.update(acc, {m, field}, {group, kind}, &min(&1, {group, kind}))
+      end)
+
+    for {point, group} <- touched,
+        fields = flux_typed_fields(point, group, kinds, earliest),
+        map_size(fields) > 0,
+        do: %{point | fields: fields}
+  end
+
+  @spec flux_typed_fields(point_map(), integer(), map(), map()) :: map()
+  defp flux_typed_fields(point, group, kinds, earliest) do
+    Map.filter(point.fields, fn {field, _value} ->
+      {_earliest_group, kind} = Map.fetch!(earliest, {point.measurement, field})
+      Map.fetch!(kinds, {point.measurement, group, field}) == kind
+    end)
   end
 
   @spec flux_parse(binary()) :: {:ok, Flux.query()} | {:error, map()}
@@ -2098,16 +2186,6 @@ defmodule InfluxElixir.Client.Local do
   # ---------------------------------------------------------------------------
   # Private — utilities
   # ---------------------------------------------------------------------------
-
-  # The engine's exact wording; a placeholder with no binding is a planning
-  # error there, never an empty result.
-  @spec unbound_placeholder_error(binary()) :: %{status: 400, body: binary()}
-  defp unbound_placeholder_error(name) do
-    %{
-      status: 400,
-      body: "Error during planning: No value found for placeholder with name #{name}"
-    }
-  end
 
   @spec bucket_map(binary(), non_neg_integer(), binary(), binary()) :: map()
   defp bucket_map(name, retention, org_id, created_at) do

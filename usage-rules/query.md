@@ -4,6 +4,7 @@
 - Always use `$param` placeholders — never interpolate user input into queries
 - Pass params as a map: `InfluxElixir.query_sql(conn, "SELECT * FROM m WHERE tag = $tag", params: %{tag: "value"})`; `execute_sql` binds them too
 - `database: nil` is no database given: the connection's default is used, on both clients
+- A param's key is its name without `$` (`%{host: "a"}` or `%{"host" => "a"}` for `$host`); a `"$host"` key binds nothing, on the server and `Client.Local` alike
 - A `Decimal` param is a number on both clients (`Client.HTTP` sends it as a JSON number; Jason alone would send a string, which the engine compares as text)
 - A string param is a string on the server: `'08338636'` keeps its leading zero, and comparing a string against a numeric field is a text comparison — bind numbers as numbers
 

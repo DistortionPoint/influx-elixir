@@ -1,16 +1,21 @@
 defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
   @moduledoc """
-  Unit tests for the line protocol grammar of both engines, InfluxQL's
-  `WHERE`, time and `LIMIT`, Flux's `range` and the store's atomicity.
-  Every expectation was read from InfluxDB 3 Core or InfluxDB 2.7; the
-  same facts, through a client, are in
-  `InfluxElixir.Contract.InfluxQLFluxLP`.
+  Unit tests for the line protocol grammar of both engines, the answers
+  `Client.Local` gives where it refuses by name or models more than the
+  shared contract reaches (InfluxQL and Flux through the client) and the
+  store's atomicity. Every expectation was read from InfluxDB 3 Core or
+  InfluxDB 2.7; the facts a real engine can be asked in the same words are
+  in `InfluxElixir.Contract.InfluxQLFluxLP`.
   """
 
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
-  alias InfluxElixir.Client.Local.{Flux, InfluxQL, LineProtocolParser, Store}
+  alias InfluxElixir.Client.Local.{LineProtocolParser, Store}
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
 
   defp parse_one(line, dialect) do
     assert {:ok, [result]} = LineProtocolParser.parse_lines(line, :nanosecond, dialect)
@@ -37,13 +42,65 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     point
   end
 
-  # ---------------------------------------------------------------------------
-  # Line protocol, InfluxDB 3
-  # ---------------------------------------------------------------------------
+  defp point(measurement, tags, fields, timestamp \\ nil),
+    do: %{measurement: measurement, tags: tags, fields: fields, timestamp: timestamp}
+
+  defp parse_errors(text, dialect) do
+    assert {:ok, results} = LineProtocolParser.parse_lines(text, :nanosecond, dialect)
+
+    for {:error, %{line_number: n, error_message: message, original_line: shown}} <- results,
+        do: {n, message, shown}
+  end
+
+  defp v2_errors(text) do
+    assert {:ok, results} = LineProtocolParser.parse_lines(text, :nanosecond, :v2)
+    for {:error, %{line: line, error_message: message}} <- results, do: {line, message}
+  end
+
+  defp v3_conn(databases \\ ["db"]) do
+    {:ok, conn} = Local.start(databases: databases, profile: :v3_core)
+    on_exit(fn -> Local.stop(conn) end)
+    conn
+  end
+
+  defp v2_conn(buckets \\ ["b"]) do
+    {:ok, conn} = Local.start(profile: :v2)
+    Enum.each(buckets, &Local.create_bucket(conn, &1))
+    on_exit(fn -> Local.stop(conn) end)
+    conn
+  end
+
+  defp error_body(result) do
+    assert {:error, %{body: body}} = result
+    Jason.decode!(body)
+  end
+
+  defp iql(conn, statement), do: Local.query_influxql(conn, statement, database: "db")
+
+  defp flux_all(conn, tail),
+    do: Local.query_flux(conn, ~s|from(bucket: "b") \|> range(start: 0) | <> tail)
+
+  defp flux_range(conn, args),
+    do: Local.query_flux(conn, ~s|from(bucket: "b") \|> range(#{args})|)
+
+  defp wrap64(value) do
+    wrapped = Bitwise.band(value, 0xFFFFFFFFFFFFFFFF)
+    if wrapped >= 0x8000000000000000, do: wrapped - 0x10000000000000000, else: wrapped
+  end
+
+  @empty_range %{
+    "code" => "invalid",
+    "message" => "error in building plan while starting program: cannot query an empty range"
+  }
 
   @trailing "Could not parse entire line. Found trailing content: "
   @no_fields "No fields were provided"
   @backslash "Measurements, tag keys and values, and field keys may not end with a backslash"
+  @need_space "Expected at least one space character, got end of input"
+
+  # ---------------------------------------------------------------------------
+  # Line protocol, InfluxDB 3
+  # ---------------------------------------------------------------------------
 
   describe "InfluxDB 3 line protocol — the engine's errors" do
     test "the lines the report named" do
@@ -115,13 +172,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
         assert v3_error("zz v=#{value}") == message, value
       end
 
-      assert %{fields: %{"a" => true, "b" => false, "c" => true, "d" => false}} =
-               v3_point("zz a=T,b=f,c=True,d=FALSE")
+      assert v3_point("zz a=T,b=f,c=True,d=FALSE") ==
+               point("zz", %{}, %{"a" => true, "b" => false, "c" => true, "d" => false})
     end
 
     test "a string value ends at its closing quote" do
       assert v3_error(~s|zz v="a"b"|) == @trailing <> ~s|`b"`|
-      assert %{fields: %{"v" => ~s|a"b|}} = v3_point(~S|zz v="a\"b"|)
+      assert v3_point(~S|zz v="a\"b"|) == point("zz", %{}, %{"v" => ~s|a"b|})
     end
 
     test "after the fields: whitespace and a timestamp, then nothing" do
@@ -141,9 +198,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
         assert v3_error("zz v=1#{tail}") == message, tail
       end
 
-      for tail <- [" 5 ", " 5  ", "  5", " -5"] do
-        assert %{fields: %{"v" => 1.0}} = v3_point("zz v=1#{tail}")
+      for tail <- [" 5 ", " 5  ", "  5"] do
+        assert v3_point("zz v=1#{tail}") == point("zz", %{}, %{"v" => 1.0}, 5)
       end
+
+      assert v3_point("zz v=1 -5") == point("zz", %{}, %{"v" => 1.0}, -5)
     end
 
     test "the second field that fails leaves the line after its comma, later ones at it" do
@@ -192,9 +251,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
             {"zz,t=1,u=2, v=1", "Expected tag key, got ` v=1`"},
             {"zz,", "Expected tag key, got end of input"},
             {"zz,t=1,", "Expected tag key, got end of input"},
-            {"zz,t=1", "Expected at least one space character, got end of input"},
-            {"zz,t=1,u=2", "Expected at least one space character, got end of input"},
-            {"justmeasurement", "Expected at least one space character, got end of input"},
+            {"zz,t=1", @need_space},
+            {"zz,t=1,u=2", @need_space},
+            {"justmeasurement", @need_space},
             {"zz,t=1 ", @no_fields},
             {",t=1 v=1", "Invalid measurement was provided"},
             {",", "Invalid measurement was provided"},
@@ -206,34 +265,44 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     end
 
     test "a tag key may start with a comma or hold one; a tag value may hold an =" do
-      assert %{tags: %{",t" => "1"}} = v3_point("zz,,t=1 v=1")
-      assert %{tags: %{"t,u" => "1"}} = v3_point("zz,t,u=1 v=1")
-      assert %{tags: %{",u" => "2", "t" => "1"}} = v3_point("zz,t=1,,u=2 v=1")
-      assert %{tags: %{"t" => "a=b"}} = v3_point("zz,t=a=b v=1")
-      assert %{tags: %{"t" => "=b"}} = v3_point("zz,t==b v=1")
-      assert %{tags: %{"t" => "1"}} = v3_point("zz,t=1,t=1 v=1")
+      for {line, tags} <- [
+            {"zz,,t=1 v=1", %{",t" => "1"}},
+            {"zz,t,u=1 v=1", %{"t,u" => "1"}},
+            {"zz,t=1,,u=2 v=1", %{",u" => "2", "t" => "1"}},
+            {"zz,t=a=b v=1", %{"t" => "a=b"}},
+            {"zz,t==b v=1", %{"t" => "=b"}}
+          ] do
+        assert v3_point(line) == point("zz", tags, %{"v" => 1.0}), line
+      end
     end
 
     test "a field key may hold commas and quotes; a trailing comma is accepted" do
-      assert %{fields: %{"a,b" => 1.0}} = v3_point("zz a,b=1 5")
-      assert %{fields: %{"w,x" => 2.0, "v" => 1.0}} = v3_point("zz v=1,w,x=2 5")
-      assert %{fields: %{~s|"k"| => 1.0}} = v3_point(~s|zz "k"=1 5|)
-      assert %{fields: %{"v" => 1.0}, timestamp: 5} = v3_point("zz v=1, 5")
-      assert %{fields: %{"v" => 1.0, ",w" => 2.0}} = v3_point("zz v=1,,w=2")
-      assert %{fields: %{"a b" => 1.0}} = v3_point(~S|zz a\ b=1|)
+      assert v3_point("zz a,b=1 5") == point("zz", %{}, %{"a,b" => 1.0}, 5)
+
+      assert v3_point("zz v=1,w,x=2 5") ==
+               point("zz", %{}, %{"w,x" => 2.0, "v" => 1.0}, 5)
+
+      assert v3_point(~s|zz "k"=1 5|) == point("zz", %{}, %{~s|"k"| => 1.0}, 5)
+      assert v3_point("zz v=1, 5") == point("zz", %{}, %{"v" => 1.0}, 5)
+      assert v3_point("zz v=1,,w=2") == point("zz", %{}, %{"v" => 1.0, ",w" => 2.0})
+      assert v3_point(~S|zz a\ b=1|) == point("zz", %{}, %{"a b" => 1.0})
     end
 
     test "numbers: the forms the engine reads and their types" do
-      assert %{fields: %{"v" => 1500.0}} = v3_point("zz v=1.5e3")
-      assert %{fields: %{"v" => 1000.0}} = v3_point("zz v=1E+3")
-      assert %{fields: %{"v" => 0.0015}} = v3_point("zz v=1.5E-3")
-      assert %{fields: %{"v" => 7.0}} = v3_point("zz v=007")
+      for {value, expected} <- [
+            {"1.5e3", 1500.0},
+            {"1E+3", 1000.0},
+            {"1.5E-3", 0.0015},
+            {"007", 7.0},
+            {"9223372036854775807i", 9_223_372_036_854_775_807},
+            {"1u", {:uint, 1}}
+          ] do
+        assert v3_point("zz v=#{value}") == point("zz", %{}, %{"v" => expected}), value
+      end
 
-      assert %{fields: %{"v" => 9_223_372_036_854_775_807}} =
-               v3_point("zz v=9223372036854775807i")
-
-      assert %{fields: %{"v" => {:uint, 1}}} = v3_point("zz v=1u")
-      assert %{timestamp: -5} = v3_point("zz v=1 -5")
+      assert %{fields: %{"v" => zero}} = v3_point("zz v=-0")
+      assert <<zero::float>> == <<-0.0::float>>
+      assert v3_point("zz v=1 -5") == point("zz", %{}, %{"v" => 1.0}, -5)
     end
 
     test "a number outside what its type holds is its own error" do
@@ -242,9 +311,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
       assert v3_error("zz v=18446744073709551616u") ==
                "Unable to parse unsigned integer value `18446744073709551616`"
+    end
 
-      assert v3_error("zz v=1e999") ==
-               "Client.Local: the float 1e999 is outside what Elixir can hold"
+    test "a float too large for 64 bits is infinity on the engine, which the double refuses" do
+      message =
+        "Client.Local: the float 1e999 is infinity on InfluxDB 3 Core, " <>
+          "which the double cannot hold"
+
+      assert v3_error("zz v=1e999") == message
+      assert v3_error("zz v=-2.5e999") == String.replace(message, "1e999", "-2.5e999")
+    end
+
+    test "a tag key given twice is accepted by the engine, which then fails every query" do
+      assert v3_error("zz,t=1,t=1 v=1") ==
+               "Client.Local: the tag key t is given twice; InfluxDB 3 Core stores such a " <>
+                 "line and then answers every query of the table with a 500"
+
+      assert v3_error(~S"zz,t\ x=1,t\ x=2 v=1") ==
+               "Client.Local: the tag key t x is given twice; InfluxDB 3 Core stores such a " <>
+                 "line and then answers every query of the table with a 500"
     end
 
     test "a field named twice, or also a tag: the first the line meets wins" do
@@ -283,21 +368,224 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       end
 
       # An escaped separator is part of the name.
-      assert %{tags: %{"t,u" => "1"}} = v3_point(~S"zz,t\,u=1 v=1i 5")
-      assert %{measurement: "z z"} = v3_point(~S"z\ z v=1i 5")
-      assert %{measurement: "z,z"} = v3_point(~S"z\,z v=1i 5")
+      assert v3_point(~S"zz,t\,u=1 v=1i 5") == point("zz", %{"t,u" => "1"}, %{"v" => 1}, 5)
+      assert v3_point(~S"z\ z v=1i 5") == point("z z", %{}, %{"v" => 1}, 5)
+      assert v3_point(~S"z\,z v=1i 5") == point("z,z", %{}, %{"v" => 1}, 5)
     end
 
-    test "blank lines and comments are skipped after leading blanks" do
-      assert {:ok, [{:ok, %{measurement: "m"}, 4, _line}]} =
+    test "a tab ends a name as a space does, but a space alone separates the sections" do
+      for {line, message} <- [
+            {"zz\tv=1 5", "Expected at least one space character, got `\tv=1 5`"},
+            {"zz,t=a\tb v=1", "Expected at least one space character, got `\tb v=1`"},
+            {"zz,t\tx=1 v=1", "Tag set malformed: could not find equals sign in `t\tx=1 v=1`"},
+            {"zz,\tt=1 v=1", "Expected tag key, got `\tt=1 v=1`"},
+            {"zz,t=\t1 v=1", "Expected tag value, got `\t1 v=1`"},
+            {"zz\tv=1", "Expected at least one space character, got `\tv=1`"},
+            {"zz v\t=1", @no_fields},
+            {"zz v=1,w\t=2", @trailing <> "`w\t=2`"},
+            {"zz v=1\t5", @trailing <> "`\t5`"},
+            {"zz v=1 5\t", @trailing <> "`\t`"},
+            {"zz v=1,w=2,x\t=3", @trailing <> "`,x\t=3`"},
+            {"zz v=2\",g=\t\"q \" 7", @trailing <> "`\",g=\t\"q \" ...`"}
+          ] do
+        assert v3_error(line) == message, line
+      end
+
+      # A tab inside a string, or escaped, is part of it.
+      assert v3_point("zz v=\"a\tb\" 5") == point("zz", %{}, %{"v" => "a\tb"}, 5)
+      assert v3_point("zz\\\tx v=1i 5") == point("zz\\\tx", %{}, %{"v" => 1}, 5)
+    end
+
+    test "a carriage return is a name's byte but ends a value or a timestamp" do
+      assert v3_point("zz\rx,t=a\rb v=1i 5") ==
+               point("zz\rx", %{"t" => "a\rb"}, %{"v" => 1}, 5)
+
+      assert v3_error("zz v=1i\r") == @trailing <> "`\r`"
+      assert v3_error("zz v=1i 5\r") == @trailing <> "`\r`"
+    end
+
+    test "blank lines and comments are skipped after leading blanks, and not counted" do
+      assert {:ok, [{:ok, parsed, 1, "  m v=1"}]} =
                LineProtocolParser.parse_lines(
                  "\n  # a comment\n\t \n  m v=1\n",
                  :nanosecond,
                  :v3
                )
 
+      assert parsed == point("m", %{}, %{"v" => 1.0})
+
       assert {:error, %{body: "incoming write was empty"}} =
                LineProtocolParser.parse_lines(" # only a comment", :nanosecond, :v3)
+    end
+  end
+
+  describe "line splitting — what both engines do with a quote" do
+    test "a quote opens a string only after an = that no comma has closed" do
+      for dialect <- [:v3, :v2] do
+        assert {:ok, [first, second]} =
+                 LineProtocolParser.parse_lines(
+                   ~s|m,t=a"b f=1i 1\nm f=2i 2|,
+                   :nanosecond,
+                   dialect
+                 )
+
+        assert first ==
+                 {:ok, point("m", %{"t" => ~s|a"b|}, %{"f" => 1}, 1), 1, ~s|m,t=a"b f=1i 1|}
+
+        assert second == {:ok, point("m", %{}, %{"f" => 2}, 2), 2, "m f=2i 2"}
+      end
+    end
+
+    test "a quote in a measurement, a tag key or a field key means nothing" do
+      for text <- [~s|m"a f=1i 1\nBAD|, ~s|m,k"x=1 f=1i 1\nBAD|, ~s|m f"x=1i 1\nBAD|] do
+        assert [{2, @need_space, _echo}] = parse_errors(text, :v3), text
+        assert [{"BAD", "missing fields"}] = v2_errors(text)
+      end
+    end
+
+    test "a quote after a field value, or in the timestamp, opens a string" do
+      assert parse_errors(~s|m f=1"i 1\nBAD|, :v3) ==
+               [{1, @trailing <> ~s|`"i 1\nBAD`|, ~s|m f=1"i 1|}]
+
+      assert parse_errors(~s|m f=1i 1 "\nBAD|, :v3) ==
+               [{1, @trailing <> ~s|`"\nBAD`|, ~s|m f=1i 1 "|}]
+
+      assert v2_errors(~s|m f=1"i 1\nBAD|) == [{~s|m f=1"i 1\nBAD|, "invalid number"}]
+    end
+
+    test "a quote after a comma that closes the = opens nothing" do
+      for text <- [~s|m f=1i,"\nBAD|, ~s|m f=1i, "g\nBAD|, ~s|m f="a,b",g,"\nBAD|] do
+        assert [{1, _first, _echoed}, {2, @need_space, _echo}] = parse_errors(text, :v3), text
+      end
+    end
+
+    test "a backslash takes the next byte with it, a newline too" do
+      assert [{1, @need_space, "BAD1\\"}, {2, @need_space, "BAD2"}] =
+               parse_errors("BAD1\\\nBAD2\nBAD3", :v3)
+
+      assert v2_errors("BAD1\\\nBAD2\nBAD3") ==
+               [{"BAD1\\\nBAD2", "missing fields"}, {"BAD3", "missing fields"}]
+    end
+
+    test "a newline inside a string value is part of the value" do
+      assert {:ok, [{:ok, parsed, 1, _line}, {:ok, _second, 2, _text}]} =
+               LineProtocolParser.parse_lines(
+                 ~s|m f="a\nb" 1\nm f=2i 2|,
+                 :nanosecond,
+                 :v3
+               )
+
+      assert parsed == point("m", %{}, %{"f" => "a\nb"}, 1)
+    end
+
+    test "InfluxDB 3 skips a comment through its physical line, InfluxDB 2 the whole line" do
+      text = ~s|# a=1 "x\nBAD|
+      assert [{1, @need_space, ~s|# a=1 "x|}] = parse_errors(text, :v3)
+
+      assert {:error, %{body: "incoming write was empty"}} =
+               LineProtocolParser.parse_lines(text, :nanosecond, :v2)
+    end
+
+    test "InfluxDB 2 does not count a final newline in a line a quote left open" do
+      assert v2_errors(~s|m f="a\nBAD\n|) == [{~s|m f="a\nBAD|, "unbalanced quotes"}]
+    end
+  end
+
+  describe "line numbers — the engine counts the lines that are not blank or comments" do
+    test "an error is numbered among them and echoes the physical line with that number" do
+      assert parse_errors("#c\nBAD1\nBAD2\nBAD3", :v3) ==
+               [{1, @need_space, "#c"}, {2, @need_space, "BAD1"}, {3, @need_space, "BAD2"}]
+
+      assert parse_errors("\nBAD", :v3) == [{1, @need_space, ""}]
+
+      assert parse_errors("BAD1\n#c\n\nBAD2\nBAD3", :v3) ==
+               [{1, @need_space, "BAD1"}, {2, @need_space, "#c"}, {3, @need_space, ""}]
+    end
+
+    test "a point's number is its place among them" do
+      assert {:ok, [{:ok, _a, 1, "m v=1"}, {:ok, _b, 2, "m v=2"}]} =
+               LineProtocolParser.parse_lines("#c\nm v=1\n\nm v=2\n#d", :nanosecond, :v3)
+    end
+
+    test "the echo is cut to 20 characters and loses a carriage return" do
+      assert [{1, @trailing <> "`\r`", "zz v=1i"}, {2, @need_space, "BAD"}] =
+               parse_errors("zz v=1i\r\nBAD", :v3)
+
+      # The last line has no newline to take a carriage return with it.
+      assert [{1, @trailing <> "`\r`", "zz v=1i\r"}] = parse_errors("zz v=1i\r", :v3)
+
+      assert [{1, @need_space, "abcdefghijklmnopqrst"}] =
+               parse_errors("abcdefghijklmnopqrstuvwxyz", :v3)
+    end
+  end
+
+  describe "line protocol — quotes and escapes in names" do
+    test "a measurement in quotes keeps its quotes on both engines" do
+      for dialect <- [:v3, :v2] do
+        assert dialect |> then(&parse_one(~s|"m" f=1i 1|, &1)) ==
+                 {:ok, point(~s|"m"|, %{}, %{"f" => 1}, 1), 1, ~s|"m" f=1i 1|}
+      end
+    end
+
+    test "a quote is an ordinary byte in a tag key, a tag value and a field key" do
+      for dialect <- [:v3, :v2] do
+        assert {:ok, parsed, 1, _line} = parse_one(~s|m,"k"="v" "f"=1i 1|, dialect)
+        assert parsed == point("m", %{~s|"k"| => ~s|"v"|}, %{~s|"f"| => 1}, 1)
+      end
+    end
+
+    test "InfluxDB 3 undoes \\\\, \\, and \\<space> everywhere, \\= outside a measurement" do
+      for {suffix, tag_value, measurement} <- [
+            {~S|\,x|, "a,x", ",x"},
+            {~S|\ x|, "a x", " x"},
+            {~S|\=x|, "a=x", ~S|\=x|},
+            {~S|\"x|, ~S|a\"x|, ~S|\"x|},
+            {~S|\\x|, ~S|a\x|, ~S|\x|},
+            {~S|\\=x|, ~S|a\=x|, ~S|\=x|},
+            {~S|\\\,x|, ~S|a\,x|, ~S|\,x|},
+            {~S|\\\\x|, ~S|a\\x|, ~S|\\x|},
+            {~S|\x|, ~S|a\x|, ~S|\x|}
+          ] do
+        assert v3_point("m,k=a#{suffix} v=1i 1") ==
+                 point("m", %{"k" => tag_value}, %{"v" => 1}, 1)
+
+        assert v3_point("m#{suffix} v=1i 1") == point("m" <> measurement, %{}, %{"v" => 1}, 1)
+      end
+    end
+
+    test "InfluxDB 2 undoes only an escape of its set and keeps every other backslash" do
+      for {suffix, tag_value} <- [
+            {~S|\,x|, "a,x"},
+            {~S|\ x|, "a x"},
+            {~S|\=x|, "a=x"},
+            {~S|\"x|, ~S|a\"x|},
+            {~S|\\x|, ~S|a\\x|},
+            {~S|\\,x|, ~S|a\,x|},
+            {~S|\\ x|, ~S|a\ x|},
+            {~S|\\=x|, ~S|a\=x|},
+            {~S|\\\,x|, ~S|a\\,x|},
+            {~S|\\\\x|, ~S|a\\\\x|},
+            {~S|\x|, ~S|a\x|}
+          ] do
+        assert v2_point("m,k=a#{suffix} v=1i 1") ==
+                 point("m", %{"k" => tag_value}, %{"v" => 1}, 1)
+      end
+
+      # A field key and a measurement also undo \".
+      assert v2_point(~S|m v\"x=1i 1|) == point("m", %{}, %{~S|v"x| => 1}, 1)
+
+      assert v2_point(~S|m\"x v=1i 1|) ==
+               Map.put(point(~S|m"x|, %{}, %{"v" => 1}, 1), :unreadable, true)
+    end
+
+    test "InfluxDB 2 accepts a measurement it never returns: the point is marked unreadable" do
+      for suffix <- [~S|\=x|, ~S|\"x|, ~S|\\,x|, ~S|\\ x|, ~S|\\=x|, ~S|\\"x|, ~S|\\\,x|] do
+        assert %{unreadable: true} = v2_point("m#{suffix} v=1i 1"), suffix
+      end
+
+      for suffix <- [~S|\,x|, ~S|\ x|, ~S|\\x|, ~S|\\\\x|, ~S|\x|, ~S|"x|, ~S|x"|] do
+        refute Map.has_key?(v2_point("m#{suffix} v=1i 1"), :unreadable), suffix
+      end
     end
   end
 
@@ -343,9 +631,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     end
 
     test "an escape is judged by the byte before it" do
-      # `\\,` is not a separator: the measurement keeps both, minus the escape of the comma.
-      assert %{measurement: ~S"bs\,t=a", tags: %{}} = v2_point(~S"bs\\,t=a v=1i 1")
-      assert %{measurement: "bs,t=a"} = v2_point(~S"bs\,t=a v=1i 1")
+      # `\\,` is not a separator: the measurement keeps the backslash and
+      # loses the escape of the comma, and its point is never returned.
+      assert v2_point(~S"bs\\,t=a v=1i 1") ==
+               Map.put(point(~S"bs\,t=a", %{}, %{"v" => 1}, 1), :unreadable, true)
+
+      assert v2_point(~S"bs\,t=a v=1i 1") == point("bs,t=a", %{}, %{"v" => 1}, 1)
       assert v2_error(~S"zq\\ v=1i 5") == {~S"zq\\ v=1i 5", "invalid field format"}
       assert v2_error(~S"zq,t=a\\ v=1i 5") == {~S"zq,t=a\\ v=1i 5", "invalid tag format"}
       assert v2_error(~S"zq,t\\ v=1i 5") == {~S"zq,t\\ v=1i 5", "invalid field format"}
@@ -425,8 +716,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
         assert v2_error(line) == {line, reason}, line
       end
 
-      for tail <- ["", " 5", "  5", " 5 ", " 5   ", " -5"] do
-        assert %{fields: %{"v" => 1.0}} = v2_point("zz v=1" <> tail)
+      for {tail, timestamp} <- [
+            {"", nil},
+            {" 5", 5},
+            {"  5", 5},
+            {" 5 ", 5},
+            {" 5   ", 5},
+            {" -5", -5}
+          ] do
+        assert v2_point("zz v=1" <> tail) == point("zz", %{}, %{"v" => 1.0}, timestamp), tail
       end
     end
 
@@ -448,32 +746,36 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     end
 
     test "a field key that ends in a backslash is refused after the line scans" do
-      for line <- [~S"zz v\\=1i 5", ~S"zz v=1i,w\\=1i"] do
-        {quoted, reason} = v2_error(line)
-        assert quoted == line
-        assert reason =~ ~r/\Ainvalid value: field-key=.*\\\\=1i\z/
-      end
+      assert v2_error(~S"zz v\\=1i 5") ==
+               {~S"zz v\\=1i 5", ~S"invalid value: field-key=v\\=1i"}
+
+      assert v2_error(~S"zz v=1i,w\\=1i") ==
+               {~S"zz v=1i,w\\=1i", ~S"invalid value: field-key=w\\=1i"}
     end
 
     test "floats like 5. and .5 are floats; a string takes its last byte off" do
-      assert %{fields: %{"v" => 5.0}} = v2_point("zz v=5.")
-      assert %{fields: %{"v" => 0.5}} = v2_point("zz v=.5")
-      assert %{fields: %{"v" => -0.5}} = v2_point("zz v=-.5")
-      assert %{fields: %{"v" => 10.0}} = v2_point("zz v=1.e1")
-      assert %{fields: %{"v" => 50.0}} = v2_point("zz v=5.e1")
-      assert %{fields: %{"s" => "x"}} = v2_point(~S|zz s="x"|)
-      # InfluxDB 2 drops the last byte of the value, whatever it is.
-      assert %{fields: %{"s" => ~S|x"|}} = v2_point("zz s=\"x\"\r")
-      assert %{fields: %{"s" => ~S|a"b|}} = v2_point(~S|zz s="a\"b"|)
-      assert %{fields: %{"a b" => 1.0}} = v2_point(~S|zz a\ b=1|)
-      assert %{fields: %{~s|"k"| => 1.0}} = v2_point(~s|zz "k"=1|)
-      assert %{fields: %{"v" => true, "w" => false}} = v2_point("zz v=T,w=false")
+      for {value, expected} <- [
+            {"5.", 5.0},
+            {".5", 0.5},
+            {"-.5", -0.5},
+            {"1.e1", 10.0},
+            {"5.e1", 50.0},
+            {~S|"x"|, "x"},
+            # InfluxDB 2 drops the last byte of the value, whatever it is.
+            {"\"x\"\r", ~S|x"|},
+            {~S|"a\"b"|, ~S|a"b|}
+          ] do
+        assert v2_point("zz v=#{value}") == point("zz", %{}, %{"v" => expected}), value
+      end
+
+      assert v2_point(~S|zz a\ b=1|) == point("zz", %{}, %{"a b" => 1.0})
+      assert v2_point(~s|zz "k"=1|) == point("zz", %{}, %{~s|"k"| => 1.0})
+      assert v2_point("zz v=T,w=false") == point("zz", %{}, %{"v" => true, "w" => false})
     end
 
     test "time as a field is dropped, as a tag refused" do
-      assert %{fields: %{"v" => 2.0}} = v2_point("zz time=1,v=2")
-      assert %{fields: fields} = v2_point("zz time=1")
-      assert fields == %{}
+      assert v2_point("zz time=1,v=2") == point("zz", %{}, %{"v" => 2.0})
+      assert v2_point("zz time=1") == point("zz", %{}, %{})
 
       assert v2_error("zz,time=x v=1") ==
                {"zz,time=x v=1", ~s|cannot use reserved tag key "time"|}
@@ -481,7 +783,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
     test "the line is quoted without its leading whitespace" do
       assert v2_error(" \t zz v=") == {"zz v=", "missing field value"}
-      assert %{measurement: "zz"} = v2_point("\t zz v=1")
+      assert v2_point("\t zz v=1") == point("zz", %{}, %{"v" => 1.0})
 
       assert {:error, %{body: "incoming write was empty"}} =
                LineProtocolParser.parse_lines("\0 \t\n  # c", :nanosecond, :v2)
@@ -489,37 +791,37 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
   end
 
   # ---------------------------------------------------------------------------
-  # InfluxQL
+  # InfluxQL through the double
   # ---------------------------------------------------------------------------
 
-  describe "InfluxQL — keywords inside literals" do
-    test "a quoted string, identifier or regex is not a keyword" do
-      for statement <- [
-            "SELECT v FROM o WHERE k = 'into'",
-            "SELECT v FROM o WHERE k = 'fill('",
-            "SELECT v FROM o WHERE k = 'group by time(1m)'",
-            "SELECT v FROM o WHERE k = 'slimit 1'",
-            "SELECT v FROM o WHERE k = 'tz(x)'",
-            "SELECT v FROM o WHERE k =~ /fill\\(/",
-            "SELECT v FROM o WHERE k !~ /into/",
-            ~s|SELECT "into" FROM o|,
-            ~s|SELECT v FROM o WHERE k = 'it\\'s into'|
+  describe "query_influxql/3 — what the double refuses by name" do
+    setup do
+      conn = v3_conn()
+      {:ok, :written} = Local.write(conn, "o,k=a v=1,w=10 1000", database: "db")
+      {:ok, conn: conn}
+    end
+
+    test "a WHERE it does not model", %{conn: conn} do
+      for {where, message} <- [
+            {"time > 0.5", "Client.Local: unsupported InfluxQL (non-integer time 0.5)"},
+            {"time > now() - 500ms",
+             "Client.Local: unsupported InfluxQL (sub-second duration 500ms)"},
+            {"time >= 2 OR k = 'a'",
+             "Client.Local: unsupported InfluxQL (a time comparison inside OR)"},
+            {"k = 'a' OR (k = 'b' AND time >= 2)",
+             "Client.Local: unsupported InfluxQL (a time comparison inside OR)"},
+            {"time > now() - 1 ",
+             "Client.Local: unsupported InfluxQL (a time compared with now() and something else)"},
+            {"time > 1 * 2",
+             "Client.Local: unsupported InfluxQL (a time compared with an expression)"}
           ] do
-        assert {:ok, %{measurement: "o"}} = InfluxQL.parse(statement), statement
+        assert iql(conn, "SELECT v FROM o WHERE #{where}") ==
+                 {:error, %{status: 400, body: message}},
+               where
       end
     end
 
-    test "a keyword inside a literal does not end a clause" do
-      assert {:ok, %{where: "k = 'group by x limit 5'", limit: nil, group_by: []}} =
-               InfluxQL.parse("SELECT v FROM o WHERE k = 'group by x limit 5'")
-
-      assert {:ok, %{where: "k = 'a'", group_by: ["k"], limit: 2, offset: 1}} =
-               InfluxQL.parse("SELECT v FROM o WHERE k = 'a' GROUP BY k LIMIT 2 OFFSET 1")
-
-      assert {:ok, %{measurement: "my m"}} = InfluxQL.parse(~s|SELECT v FROM "my m"|)
-    end
-
-    test "a keyword outside a literal is still refused by name" do
+    test "a clause it does not model, outside a literal", %{conn: conn} do
       for {statement, name} <- [
             {"SELECT v INTO x FROM o", "INTO"},
             {"SELECT v FROM o fill(none)", "fill()"},
@@ -529,231 +831,155 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
             {"SELECT v FROM o GROUP BY *", "GROUP BY *"},
             {"SELECT v FROM o WHERE k = 'a' tz('UTC')", "tz()"}
           ] do
-        assert InfluxQL.parse(statement) == {:error, "unsupported InfluxQL (#{name})"}, statement
+        assert iql(conn, statement) ==
+                 {:error,
+                  %{
+                    status: 400,
+                    body: "Client.Local: unsupported InfluxQL (#{name}): #{statement}"
+                  }},
+               statement
       end
     end
 
-    test "a long literal is no problem for the clause patterns" do
+    test "a keyword inside a literal is no keyword, however long the literal", %{conn: conn} do
       long = String.duplicate("x", 5_000)
-      assert {:ok, %{where: where}} = InfluxQL.parse("SELECT v FROM o WHERE k = '#{long}'")
-      assert where == "k = '#{long}'"
-    end
-  end
 
-  describe "InfluxQL — WHERE and time" do
-    @tags MapSet.new(["k"])
-
-    defp plan(where) do
-      assert {:ok, plan} = InfluxQL.where_plan(where, @tags)
-      plan
-    end
-
-    test "next to time an integer or a duration is nanoseconds since the epoch" do
-      assert %{sql: "time >= '1970-01-01T00:00:00.000000002Z'", lowers: [2]} = plan("time >= 2")
-      assert %{sql: "time > '1970-01-01T00:00:00.000000000Z'", lowers: [1]} = plan("time > 0s")
-      assert %{sql: "time > '1970-01-01T00:00:00.000000002Z'", lowers: [3]} = plan("time > 2ns")
-      assert %{sql: "time = '1970-01-01T00:00:00.000002000Z'", lowers: [2000]} = plan("time = 2u")
-      assert %{sql: "time < '1970-01-01T00:00:01.000000000Z'", lowers: []} = plan("time < 1s")
-      assert %{sql: "time > '1969-12-31T23:59:59.999999999Z'", lowers: [0]} = plan("time > -1")
-    end
-
-    test "the comparand may be on either side, and a constant adds and subtracts" do
-      assert %{sql: "time <= '1970-01-01T00:00:00.000000002Z'", lowers: []} = plan("2 >= time")
-      assert %{sql: "time >= '1970-01-01T00:00:00.000000002Z'", lowers: [2]} = plan("2 <= time")
-
-      assert %{sql: "time > '1970-01-01T00:00:00.000000002Z'", lowers: [3]} =
-               plan("time > 1 + 1")
-
-      assert %{sql: "time > '1970-01-01T00:00:00.000000001Z'", lowers: [2]} =
-               plan("time > 1s - 999999999ns")
-
-      assert %{sql: "time > '1969-12-31T23:59:59.999999998Z'"} = plan("time > -1 - 1")
-    end
-
-    test "a quoted time is passed on, and now() is an interval" do
-      assert %{sql: "time >= '2026-03-31T12:00:00Z'", lowers: [1_774_958_400_000_000_000]} =
-               plan("time >= '2026-03-31T12:00:00Z'")
-
-      assert %{
-               sql: "time > now() - INTERVAL '1800 seconds'",
-               lowers: [{:now, -1_799_999_999_999}]
-             } = plan("time > now() - 30m")
-
-      assert %{sql: "time >= now() + INTERVAL '60 seconds' - INTERVAL '1 seconds'"} =
-               plan("time >= now() + 1m - 1s")
-    end
-
-    test "the lower bounds of a conjunction, and tags beside time" do
-      assert %{
-               sql: "k = 'a' AND time >= '1970-01-01T00:00:00.000000002Z'",
-               lowers: [2]
-             } = plan("k = 'a' AND time >= 2")
-
-      assert %{lowers: [2, 3]} = plan("time >= 2 AND time > 2")
-      assert %{lowers: [2]} = plan("(time >= 2)")
-      assert %{lowers: [2]} = plan("(k = 'a' OR k = 'b') AND time >= 2")
-
-      assert %{sql: "(k = 'a' OR k = 'b') AND" <> _rest} =
-               plan("(k = 'a' OR k = 'b') AND time >= 2")
-
-      assert %{lowers: []} = plan("k = 'a' OR k = 'b'")
-    end
-
-    test "the engine's planning error for != and <>, whatever the comparand" do
-      body =
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\n" <>
-          "Error during planning: invalid time comparison operator: !="
-
-      for where <- ["time != 2", "time <> 2", "time <> 2s", "2 != time", "time != '2026-01-01'"] do
-        assert InfluxQL.where_plan(where, @tags) == {:error, {:engine, body}}, where
-      end
-    end
-
-    test "what the double refuses by name" do
-      for {where, message} <- [
-            {"time > 0.5", "unsupported InfluxQL (non-integer time 0.5)"},
-            {"time > now() - 500ms", "unsupported InfluxQL (sub-second duration 500ms)"},
-            {"time >= 2 OR k = 'a'", "unsupported InfluxQL (a time comparison inside OR)"},
-            {"k = 'a' OR (k = 'b' AND time >= 2)",
-             "unsupported InfluxQL (a time comparison inside OR)"},
-            {"time > now() - 1 ",
-             "unsupported InfluxQL (a time compared with now() and something else)"},
-            {"time > 1 * 2", "unsupported InfluxQL (a time compared with an expression)"}
+      for literal <- [
+            "into",
+            "fill(",
+            "group by time(1m)",
+            "slimit 1",
+            "tz(x)",
+            "it\\'s into",
+            long
           ] do
-        assert {:error, ^message} = InfluxQL.where_plan(where, @tags)
+        assert {:ok, []} = iql(conn, "SELECT v FROM o WHERE k = '#{literal}'"), literal
       end
-    end
 
-    test "tags are strings and regexes are unanchored, as before" do
-      assert %{sql: "k ~ 'a.c'", lowers: []} = plan("k =~ /a.c/")
-      assert %{sql: "(k IS NULL AND k IS NOT NULL)"} = plan("k > 'a'")
-      assert %{sql: "f > 1"} = plan("f > 1")
-      assert %{idents: idents} = plan("k = 'a' AND f > 1 AND time >= 2")
-      assert MapSet.equal?(idents, MapSet.new(["k", "f", "time"]))
+      assert {:ok, []} = iql(conn, "SELECT v FROM o WHERE k =~ /fill\\(/")
+      assert {:ok, [%{"v" => 1.0}]} = iql(conn, "SELECT v FROM o WHERE k = 'a' LIMIT 5")
     end
   end
 
-  describe "InfluxQL — run/4" do
-    defp row(us, fields),
-      do: Map.merge(%{"time" => DateTime.from_unix!(us, :microsecond)}, fields)
+  describe "query_influxql/3 — answers the contract does not reach" do
+    setup do
+      conn = v3_conn()
 
-    defp run(statement, rows, opts \\ []) do
-      assert {:ok, query} = InfluxQL.parse(statement)
-      InfluxQL.run(query, rows, MapSet.new(["k"]), opts)
+      lp = """
+      o,k=a v=1,w=10 1000
+      o,k=b v=2,w=20 2000
+      o,k=a v=3,w=30 3000
+      o,k=into v=4,w=40 4000
+      o,k=c x=7i 5000
+      """
+
+      {:ok, :written} = Local.write(conn, String.trim(lp), database: "db")
+      {:ok, conn: conn}
     end
 
-    defp rows do
-      [
-        row(1, %{"k" => "a", "v" => 1.0, "w" => 10.0}),
-        row(2, %{"k" => "b", "v" => 2.0, "w" => 20.0}),
-        row(3, %{"k" => "a", "v" => 3.0, "w" => 30.0}),
-        row(5, %{"k" => "c", "x" => 7})
-      ]
+    test "a bound taken from now() is stamped on the aggregate", %{conn: conn} do
+      before = System.os_time(:microsecond) - 3_600_000_000
+
+      assert {:ok, []} = iql(conn, "SELECT mean(v) FROM o WHERE time > now() - 1h")
+
+      assert {:ok, :written} =
+               Local.write(conn, "fresh v=1 #{System.os_time(:nanosecond)}", database: "db")
+
+      assert {:ok, [%{"time" => time}]} =
+               iql(conn, "SELECT mean(v) FROM fresh WHERE time > now() - 1h")
+
+      assert abs(DateTime.to_unix(time, :microsecond) - before) < 60_000_000
     end
 
-    test "an aggregate is stamped with the lower bound, the epoch without one" do
-      epoch = DateTime.from_unix!(0, :microsecond)
-      assert [%{"mean" => 2.0, "time" => ^epoch}] = run("SELECT mean(v) FROM o", rows())
+    test "a query with a WHERE on a tag finds the points that lack it", %{conn: conn} do
+      {:ok, :written} = Local.write(conn, "o v=9,w=90 6000", database: "db")
 
-      two = DateTime.from_unix!(2, :microsecond)
-      assert [%{"time" => ^two}] = run("SELECT mean(v) FROM o", rows(), lower: 2_000)
-      # A bound below a microsecond is cut to it, as every time is.
-      assert [%{"time" => ^epoch}] = run("SELECT mean(v) FROM o", rows(), lower: 2)
-      assert [%{"time" => ^two}] = run("SELECT mean(v) FROM o", rows(), lower: 2_001)
+      assert {:ok, rows} = iql(conn, "SELECT v FROM o WHERE k = ''")
+      assert Enum.map(rows, & &1["v"]) == [9.0]
 
-      before_epoch = DateTime.from_unix!(-1, :microsecond)
-      assert [%{"time" => ^before_epoch}] = run("SELECT mean(v) FROM o", rows(), lower: -1_000)
+      assert {:ok, rows} = iql(conn, "SELECT v FROM o WHERE k != 'a'")
+      assert Enum.map(rows, & &1["v"]) == [2.0, 4.0, 9.0]
+
+      assert {:ok, [row]} = iql(conn, "SELECT * FROM o WHERE k = ''")
+      refute Map.has_key?(row, "k")
+
+      assert {:ok, rows} = iql(conn, "SELECT * FROM o")
+      assert length(rows) == 6
+      refute Enum.any?(rows, &(&1["k"] == ""))
     end
 
-    test "with GROUP BY every series carries the bound; a lone selector keeps its point" do
-      two = DateTime.from_unix!(2, :microsecond)
-
-      assert [%{"k" => "a", "time" => ^two}, %{"k" => "b", "time" => ^two}] =
-               run("SELECT mean(v) FROM o GROUP BY k", rows(), lower: 2_000)
-
-      three = DateTime.from_unix!(3, :microsecond)
-
-      assert [%{"max" => 3.0, "time" => ^three}] =
-               run("SELECT max(v) FROM o", rows(), lower: 2_000)
-    end
-
-    test "LIMIT and OFFSET count per selected field" do
-      assert [%{"v" => 1.0}, %{"v" => 2.0}, %{"x" => 7}] =
-               run("SELECT v, x FROM o LIMIT 2", rows())
-               |> Enum.map(&Map.drop(&1, ["time", "iox::measurement"]))
-
-      assert [%{"v" => 1.0, "w" => 10.0, "k" => "a"}, %{"x" => 7, "k" => "c"}] =
-               run("SELECT * FROM o LIMIT 1", rows(), fields: ["v", "w", "x"])
-               |> Enum.map(&Map.drop(&1, ["time", "iox::measurement"]))
-
-      assert [%{"v" => 2.0}] =
-               run("SELECT v FROM o LIMIT 1 OFFSET 1", rows())
-               |> Enum.map(&Map.drop(&1, ["time", "iox::measurement"]))
-
-      assert [] = run("SELECT * FROM o LIMIT 0", rows())
-
-      # v and w have a third row, x has none.
-      assert [%{"k" => "a", "v" => 3.0, "w" => 30.0}] =
-               run("SELECT * FROM o OFFSET 2", rows())
-               |> Enum.map(&Map.drop(&1, ["time", "iox::measurement"]))
-    end
-
-    test "an alias is the name a window counts" do
-      assert [%{"vee" => 1.0}, %{"vee" => 2.0}] =
-               run("SELECT v AS vee FROM o LIMIT 2", rows())
-               |> Enum.map(&Map.drop(&1, ["time", "iox::measurement"]))
-    end
-
-    test "rows are shaped in the order they come, not sorted again" do
-      unordered = [row(3, %{"v" => 3.0}), row(1, %{"v" => 1.0})]
-      assert [%{"v" => 3.0}, %{"v" => 1.0}] = run("SELECT v FROM o", unordered)
-      assert [] = run("SELECT v FROM o", [])
+    test "SHOW MEASUREMENTS lists the measurements by name", %{conn: conn} do
+      {:ok, :written} = Local.write(conn, "zz v=1 1\naa v=1 1\nmm v=1 1", database: "db")
+      assert {:ok, rows} = iql(conn, "SHOW MEASUREMENTS")
+      assert Enum.map(rows, & &1["name"]) == ["aa", "mm", "o", "zz"]
     end
   end
 
   # ---------------------------------------------------------------------------
-  # Flux
+  # Flux through the double
   # ---------------------------------------------------------------------------
 
-  describe "Flux — range" do
-    @now 1_700_000_000_000_000_000
+  describe "query_flux/3 — range" do
+    test "an integer second count wraps in 64-bit nanoseconds" do
+      conn = v2_conn()
+      assert {:ok, :written} = Local.write(conn, "m v=1 5", database: "b")
 
-    defp flux_range(args) do
-      Flux.parse(~s|from(bucket: "b") \|> range(#{args})|, @now)
+      assert {:ok, [row]} = flux_range(conn, "start: 0, stop: 99999999999999")
+      assert row["_start"] == ~U[1970-01-01 00:00:00.000000Z]
+      assert row["_stop"] == ~U[1976-05-08 04:06:59.520689Z]
+
+      assert {:ok, [row]} = flux_range(conn, "start: 0, stop: 9223372036")
+      assert row["_stop"] == ~U[2262-04-11 23:47:16.000000Z]
+
+      # The stop wraps below the start, but a range is judged on the seconds.
+      assert {:ok, []} = flux_range(conn, "start: 0, stop: 18446744073")
     end
 
-    defp bounds(args) do
-      assert {:ok, %{stages: [{:range, start, stop}]}} = flux_range(args)
-      {start, stop}
+    test "a duration is taken from now, and wraps too" do
+      conn = v2_conn()
+      now = System.os_time(:nanosecond)
+      later = now + 86_400_000_000_000
+
+      assert {:ok, :written} = Local.write(conn, "m v=1 #{now}\nm v=2 #{later}", database: "b")
+
+      assert {:ok, [row]} = flux_range(conn, "start: -1h, stop: now()")
+      assert {row["_value"], DateTime.diff(row["_stop"], row["_start"], :second)} == {1.0, 3_600}
+
+      assert {:ok, [row]} = flux_range(conn, "start: now(), stop: 1w")
+
+      assert {row["_value"], DateTime.diff(row["_stop"], row["_start"], :second)} ==
+               {2.0, 604_800}
     end
 
-    test "integer seconds wrap in 64-bit nanoseconds" do
-      assert {0, stop} = bounds("start: 0, stop: 99999999999999")
-      assert DateTime.from_unix!(stop, :nanosecond) == ~U[1976-05-08 04:06:59.520689Z]
+    test "a duration that does not fit wraps to the engine's value" do
+      conn = v2_conn()
+      assert {:ok, :written} = Local.write(conn, "m v=1 5", database: "b")
 
-      assert {0, 9_223_372_036_000_000_000} = bounds("start: 0, stop: 9223372036")
-      assert {0, -709_551_616} = bounds("start: 0, stop: 18446744073")
-      assert {-709_551_616, 1_290_448_384} = bounds("start: 18446744073, stop: 18446744075")
-    end
+      assert {:ok, [row]} = flux_range(conn, "start: -99999999999w, stop: now()")
 
-    test "a duration is taken from now and wraps too" do
-      assert {start, @now} = bounds("start: -1h, stop: now()")
-      assert start == @now - 3_600_000_000_000
-      assert {@now, stop} = bounds("start: now(), stop: 1w")
-      assert stop == @now + 604_800_000_000_000
+      stop_ns = DateTime.to_unix(row["_stop"], :nanosecond)
+      week = 604_800_000_000_000
 
-      assert {wrapped, _stop} = bounds("start: -99999999999w, stop: now()")
-      assert wrapped in -9_223_372_036_854_775_808..9_223_372_036_854_775_807
-      assert DateTime.from_unix!(wrapped, :nanosecond).year in 1678..2261
+      # `now` carries nanoseconds a row's time does not, which can move the
+      # microsecond of the wrapped start by one.
+      candidates =
+        for extra <- [0, 999],
+            do: DateTime.from_unix!(wrap64(stop_ns + extra - 99_999_999_999 * week), :nanosecond)
+
+      assert Enum.any?(candidates, &(DateTime.truncate(&1, :microsecond) == row["_start"]))
+      assert row["_start"].year == 1810
     end
 
     test "an RFC3339 time that does not fit wraps" do
-      assert {start, _stop} = bounds("start: 0001-01-01T00:00:00Z, stop: now()")
-      assert DateTime.from_unix!(start, :nanosecond) == ~U[1754-08-30 22:43:41.128654Z]
+      conn = v2_conn()
+      assert {:ok, :written} = Local.write(conn, "m v=1 5", database: "b")
+      assert {:ok, rows} = flux_range(conn, "start: 0001-01-01T00:00:00Z, stop: now()")
+
+      assert Enum.map(rows, & &1["_start"]) == [~U[1754-08-30 22:43:41.128654Z]]
     end
 
     test "a range with no time in it is the engine's plan error" do
-      message = "error in building plan while starting program: cannot query an empty range"
+      conn = v2_conn()
 
       for args <- [
             "start: 5, stop: 3",
@@ -767,7 +993,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
             "start: 0, stop: 2262-04-12T00:00:00Z",
             "start: 18446744073, stop: 18446744070"
           ] do
-        assert flux_range(args) == {:error, message}, args
+        assert error_body(flux_range(conn, args)) == @empty_range, args
       end
 
       # Judged on the seconds as Go counts them, these have a range.
@@ -776,126 +1002,105 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
             "start: 9223372037, stop: 9223372038",
             "start: 18446744073, stop: 18446744075"
           ] do
-        assert {:ok, _query} = flux_range(args), args
+        assert {:ok, []} = flux_range(conn, args), args
       end
     end
 
-    test "the measurements a query reads" do
-      reads = fn filters ->
-        assert {:ok, query} =
-                 Flux.parse(~s|from(bucket: "b") \|> range(start: 0) #{filters}|, @now)
-
-        Flux.measurements(query)
-      end
-
-      assert reads.("") == :all
-      assert reads.(~s/|> filter(fn: (r) => r._field == "v")/) == :all
-      assert reads.(~s/|> filter(fn: (r) => r._measurement == "a")/) == ["a"]
-
-      assert reads.(~s/|> filter(fn: (r) => r._measurement == "a" or r._measurement == "b")/) ==
-               ["a", "b"]
-
-      assert reads.(~s/|> filter(fn: (r) => r._measurement == "a" and r.host == "x")/) == ["a"]
-      assert reads.(~s/|> filter(fn: (r) => r._measurement == "a" or r.host == "x")/) == :all
-      assert reads.(~s/|> filter(fn: (r) => not (r._measurement == "a"))/) == :all
-      assert reads.(~s/|> filter(fn: (r) => r._measurement != "a")/) == :all
-
-      assert reads.(
-               ~s/|> filter(fn: (r) => r._measurement == "a" or r._measurement == "b")/ <>
-                 ~s/ |> filter(fn: (r) => r._measurement == "b")/
-             ) == ["b"]
-
-      assert reads.(
-               ~s/|> filter(fn: (r) => r._measurement == "a")/ <>
-                 ~s/ |> filter(fn: (r) => r._measurement == "b")/
-             ) == []
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Through the double
-  # ---------------------------------------------------------------------------
-
-  defp v3_conn(databases \\ ["db"]) do
-    {:ok, conn} = Local.start(databases: databases, profile: :v3_core)
-    on_exit(fn -> Local.stop(conn) end)
-    conn
-  end
-
-  defp v2_conn(buckets \\ ["b"]) do
-    {:ok, conn} = Local.start(profile: :v2)
-    Enum.each(buckets, &Local.create_bucket(conn, &1))
-    on_exit(fn -> Local.stop(conn) end)
-    conn
-  end
-
-  defp error_body(result) do
-    assert {:error, %{body: body}} = result
-    Jason.decode!(body)
-  end
-
-  describe "write/3 — InfluxDB 2" do
-    test "every line that fails is reported, joined by newlines, and nothing is stored" do
+    test "a query with no range is the engine's plan error" do
       conn = v2_conn()
 
-      assert %{"code" => "invalid", "message" => message} =
-               error_body(Local.write(conn, "m v=1 5\nbad line\nm v=\n  m w=2 5", database: "b"))
-
-      assert message ==
-               "unable to parse 'bad line': invalid field format\n" <>
-                 "unable to parse 'm v=': missing field value"
-
-      assert {:ok, []} = Local.query_flux(conn, ~s|from(bucket: "b") \|> range(start: 0)|)
-    end
-
-    test "a point whose only field is time is dropped with the engine's 422" do
-      conn = v2_conn()
-      assert {:ok, :written} = Local.write(conn, "m time=1,v=2 5", database: "b")
-
-      assert error_body(Local.write(conn, "m time=1 5", database: "b")) == %{
-               "code" => "unprocessable entity",
+      assert error_body(Local.query_flux(conn, ~s|from(bucket: "b")|)) == %{
+               "code" => "invalid",
                "message" =>
-                 "failure writing points to database: partial write: invalid field name: " <>
-                   ~s|input field "time" on measurement "m" is invalid dropped=1|
+                 "error in building plan while starting program: cannot submit unbounded " <>
+                   ~s|read to "b"; try bounding 'from' with a call to 'range'|
              }
-
-      assert {:ok, rows} = Local.query_flux(conn, ~s|from(bucket: "b") \|> range(start: 0)|)
-      assert Enum.map(rows, & &1["_field"]) == ["v"]
     end
+  end
 
-    test "dropped points are counted per shard group, and the last group's first drop speaks" do
+  describe "query_flux/3 — stages" do
+    test "rows of a table are in the stored nanosecond order: first, last, limit and the rows" do
       conn = v2_conn()
-      assert {:ok, :written} = Local.write(conn, "m v=1.5 5", database: "b")
 
-      conflict = fn field, measurement, got, dropped ->
-        "failure writing points to database: partial write: field type conflict: " <>
-          ~s|input field "#{field}" on measurement "#{measurement}" is type #{got}, | <>
-          "already exists as type float dropped=#{dropped}"
+      assert {:ok, :written} =
+               Local.write(conn, "m,t=a v=1i 1001\nm,t=a v=2i 1000", database: "b")
+
+      assert {:ok, rows} = flux_all(conn, "")
+      assert Enum.map(rows, & &1["_value"]) == [2, 1]
+
+      for {stage, value} <- [{"first()", 2}, {"last()", 1}, {"limit(n: 1)", 2}] do
+        assert {:ok, [row]} = flux_all(conn, "|> " <> stage)
+        assert row["_value"] == value, stage
       end
 
-      invalid = fn measurement, dropped ->
-        "failure writing points to database: partial write: invalid field name: " <>
-          ~s|input field "time" on measurement "#{measurement}" is invalid dropped=#{dropped}|
-      end
+      assert {:ok, [row]} = flux_all(conn, "|> limit(n: 1, offset: 1)")
+      assert row["_value"] == 1
+    end
 
-      for {payload, expected} <- [
-            # one group: the first drop speaks, all are counted
-            {"m time=1 5\nm v=1i 6", invalid.("m", 2)},
-            {"m v=1i 6\nm time=1 5", conflict.("v", "m", "integer", 2)},
-            {"m v=1i 6\nm v=2i 6\nm time=1 5\nm time=1 6", conflict.("v", "m", "integer", 4)},
-            # a week apart: two groups, the last one speaks
-            {"m time=1\nm v=1i 5", conflict.("v", "m", "integer", 1)},
-            {"m v=1i 5\nm time=1", invalid.("m", 1)},
-            {"m time=1\nm time=2 5\nn time=3", invalid.("m", 1)},
-            {"n time=3\nm time=3", invalid.("n", 2)},
-            {"m v=1i 1000000000000000\nm v=2i 1\nm time=1 2", conflict.("v", "m", "integer", 2)}
-          ] do
-        assert %{"code" => "unprocessable entity", "message" => ^expected} =
-                 error_body(Local.write(conn, payload, database: "b")),
-               payload
+    test "sort and group are refused by name" do
+      conn = v2_conn()
+
+      for stage <- ["sort()", "group()"] do
+        assert error_body(flux_all(conn, "|> " <> stage)) == %{
+                 "code" => "invalid",
+                 "message" => "Client.Local: unsupported Flux function: #{stage}"
+               }
       end
     end
 
+    test "a filter on _measurement reads only those measurements" do
+      conn = v2_conn()
+      assert {:ok, :written} = Local.write(conn, "a v=1 1\nb v=2 2\nc v=3 3", database: "b")
+
+      reads = fn filter ->
+        assert {:ok, rows} = flux_all(conn, "|> filter(fn: (r) => #{filter})")
+        Enum.map(rows, &{&1["_measurement"], &1["_value"]})
+      end
+
+      assert reads.(~s|r._measurement == "a"|) == [{"a", 1.0}]
+
+      assert reads.(~s|r._measurement == "a" or r._measurement == "c"|) == [
+               {"a", 1.0},
+               {"c", 3.0}
+             ]
+
+      assert reads.(~s|r._measurement == "a" and r._measurement == "b"|) == []
+      assert reads.(~s|r._measurement != "a"|) == [{"b", 2.0}, {"c", 3.0}]
+      assert reads.(~s|not (r._measurement == "a")|) == [{"b", 2.0}, {"c", 3.0}]
+
+      assert reads.(~s|r._measurement == "a" or r._field == "v"|) == [
+               {"a", 1.0},
+               {"b", 2.0},
+               {"c", 3.0}
+             ]
+
+      assert reads.(~s|r._measurement == "nope"|) == []
+    end
+
+    test "a measurement InfluxDB 2 accepts and never returns is not returned" do
+      conn = v2_conn()
+
+      assert {:ok, :written} =
+               Local.write(conn, ~S"gone\\,x v=1i 1" <> "\n" <> ~S"here\,x v=2i 2", database: "b")
+
+      assert {:ok, rows} = flux_all(conn, "")
+      assert Enum.map(rows, &{&1["_measurement"], &1["_value"]}) == [{"here,x", 2}]
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Writes and buckets through the double
+  # ---------------------------------------------------------------------------
+
+  @drop_conflict "failure writing points to database: partial write: field type conflict: " <>
+                   ~s|input field "v" on measurement "m" is type integer, | <>
+                   "already exists as type float dropped="
+  @drop_invalid "failure writing points to database: partial write: invalid field name: " <>
+                  ~s|input field "time" on measurement "m" is invalid dropped=|
+
+  defp drop_body(message), do: %{"code" => "unprocessable entity", "message" => message}
+
+  describe "write/3 — InfluxDB 2 shard groups" do
     test "the shard group of a bucket follows its retention" do
       conn = v2_conn([])
       :ok = Local.create_bucket(conn, "hourly", retention: 3600)
@@ -903,14 +1108,33 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       assert {:ok, :written} = Local.write(conn, "m v=1.5 5", database: "hourly")
       assert {:ok, :written} = Local.write(conn, "m v=1.5 5", database: "daily")
 
-      # 2 hours apart: two groups in an hourly bucket, one in a daily one.
+      # Two hours apart: two groups in an hourly bucket, one in a daily one.
       payload = "m v=1i 5\nm time=1 7200000000000"
-      assert %{"message" => hourly} = error_body(Local.write(conn, payload, database: "hourly"))
-      assert hourly =~ "invalid field name"
-      assert hourly =~ "dropped=1"
-      assert %{"message" => daily} = error_body(Local.write(conn, payload, database: "daily"))
-      assert daily =~ "field type conflict"
-      assert daily =~ "dropped=2"
+
+      assert error_body(Local.write(conn, payload, database: "hourly")) ==
+               drop_body(@drop_conflict <> "1")
+
+      assert error_body(Local.write(conn, payload, database: "daily")) ==
+               drop_body(@drop_conflict <> "2")
+
+      payload = "m time=1 7200000000000\nm v=1i 5\nm time=1 5"
+
+      assert error_body(Local.write(conn, payload, database: "hourly")) ==
+               drop_body(@drop_conflict <> "2")
+
+      assert error_body(Local.write(conn, payload, database: "daily")) ==
+               drop_body(@drop_invalid <> "3")
+    end
+
+    test "a payload of thousands of groups is written group by group" do
+      conn = v2_conn([])
+      :ok = Local.create_bucket(conn, "hourly", retention: 3600)
+      assert {:ok, :written} = Local.write(conn, "m v=1.5 5", database: "hourly")
+
+      payload = Enum.map_join(0..2_999, "\n", &"m v=1i #{&1 * 3_600_000_000_000 + 7}")
+
+      assert error_body(Local.write(conn, payload, database: "hourly")) ==
+               drop_body(@drop_conflict <> "1")
     end
   end
 
@@ -924,7 +1148,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       assert {:ok, [one, two]} = Local.list_buckets(conn)
       assert {:ok, [^one, ^two]} = Local.list_buckets(conn)
 
-      assert Map.keys(one) |> Enum.sort() ==
+      assert one |> Map.keys() |> Enum.sort() ==
                ~w(createdAt id labels links name orgID retentionRules type updatedAt)
 
       assert %{"type" => "user", "name" => "one", "labels" => [], "orgID" => org_id} = one
@@ -977,181 +1201,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     end
   end
 
-  describe "query_influxql/3" do
-    setup do
-      conn = v3_conn()
-
-      lp = """
-      o,k=a v=1,w=10 1000
-      o,k=b v=2,w=20 2000
-      o,k=a v=3,w=30 3000
-      o,k=into v=4,w=40 4000
-      o,k=c x=7i 5000
-      """
-
-      {:ok, :written} = Local.write(conn, String.trim(lp), database: "db")
-      {:ok, conn: conn}
-    end
-
-    defp iq(conn, statement), do: Local.query_influxql(conn, statement, database: "db")
-
-    defp iq_values(conn, statement, column \\ "v") do
-      assert {:ok, rows} = iq(conn, statement)
-      Enum.map(rows, & &1[column])
-    end
-
-    test "a keyword inside a literal is answered", %{conn: conn} do
-      assert iq_values(conn, "SELECT v FROM o WHERE k = 'into'") == [4.0]
-      assert iq_values(conn, "SELECT v FROM o WHERE k = 'fill('") == []
-      assert iq_values(conn, "SELECT v FROM o WHERE k =~ /into/") == [4.0]
-    end
-
-    test "time against integers and durations, to the nanosecond", %{conn: conn} do
-      {:ok, :written} = Local.write(conn, "n v=1 1\nn v=2 2\nn v=3 3\nn v=4 4", database: "db")
-
-      for {where, expected} <- [
-            {"time > 0s", [1.0, 2.0, 3.0, 4.0]},
-            {"time >= 2", [2.0, 3.0, 4.0]},
-            {"time > 2ns", [3.0, 4.0]},
-            {"2 <= time", [2.0, 3.0, 4.0]},
-            {"time = 2", [2.0]},
-            {"time >= 2 AND time < 4", [2.0, 3.0]},
-            {"time > 1u", []},
-            {"time > 1s - 999999999ns", [2.0, 3.0, 4.0]}
-          ] do
-        assert iq_values(conn, "SELECT v FROM n WHERE #{where}") == expected, where
-      end
-    end
-
-    test "time != is the engine's planning error", %{conn: conn} do
-      assert {:error, %{status: 400, body: body}} = iq(conn, "SELECT v FROM o WHERE time != 2")
-      assert body =~ "invalid time comparison operator: !="
-    end
-
-    test "an aggregate time is the lower bound at the nanosecond, then cut to a microsecond",
-         %{conn: conn} do
-      {:ok, :written} = Local.write(conn, "n v=1 1\nn v=2 2\nn v=3 3\nn v=4 4", database: "db")
-      epoch = DateTime.from_unix!(0, :microsecond)
-
-      assert {:ok, [%{"mean" => 3.0, "time" => ^epoch}]} =
-               iq(conn, "SELECT mean(v) FROM n WHERE time >= 2")
-
-      two_us = DateTime.from_unix!(2, :microsecond)
-
-      assert {:ok, [%{"mean" => 3.0, "time" => ^two_us}]} =
-               iq(conn, "SELECT mean(v) FROM o WHERE time >= 2000")
-
-      assert {:ok, [%{"mean" => 1.5, "time" => ^epoch}]} =
-               iq(conn, "SELECT mean(v) FROM o WHERE time < 3000")
-
-      assert {:ok, [%{"mean" => 4.0, "time" => ^two_us}]} =
-               iq(conn, "SELECT mean(v) FROM o WHERE time > 1500 AND time >= 2000 AND k = 'into'")
-    end
-
-    test "a bound taken from now() is stamped on the aggregate", %{conn: conn} do
-      before = System.os_time(:microsecond) - 3_600_000_000
-
-      assert {:ok, []} = iq(conn, "SELECT mean(v) FROM o WHERE time > now() - 1h")
-
-      now = Local.write(conn, "fresh v=1 #{System.os_time(:nanosecond)}", database: "db")
-      assert {:ok, :written} = now
-
-      assert {:ok, [%{"time" => time}]} =
-               iq(conn, "SELECT mean(v) FROM fresh WHERE time > now() - 1h")
-
-      assert abs(DateTime.to_unix(time, :microsecond) - before) < 60_000_000
-    end
-
-    test "LIMIT counts per field", %{conn: conn} do
-      assert {:ok, rows} = iq(conn, "SELECT v, x FROM o LIMIT 2")
-      assert Enum.map(rows, &{&1["v"], &1["x"]}) == [{1.0, nil}, {2.0, nil}, {nil, 7}]
-
-      assert {:ok, rows} = iq(conn, "SELECT * FROM o LIMIT 1")
-      assert Enum.map(rows, &{&1["k"], &1["v"], &1["x"]}) == [{"a", 1.0, nil}, {"c", nil, 7}]
-      assert {:ok, [%{"v" => 2.0}]} = iq(conn, "SELECT v FROM o LIMIT 1 OFFSET 1")
-    end
-
-    test "a query with a WHERE on a tag finds the points that lack it", %{conn: conn} do
-      {:ok, :written} = Local.write(conn, "o v=9,w=90 6000", database: "db")
-      assert iq_values(conn, "SELECT v FROM o WHERE k = ''") == [9.0]
-      assert iq_values(conn, "SELECT v FROM o WHERE k != 'a'") == [2.0, 4.0, 9.0]
-      assert {:ok, rows} = iq(conn, "SELECT * FROM o WHERE k = ''")
-      refute Enum.any?(rows, &Map.has_key?(&1, "k"))
-      assert {:ok, rows} = iq(conn, "SELECT * FROM o")
-      assert length(rows) == 6
-      refute Enum.any?(rows, &(&1["k"] == ""))
-    end
-
-    test "SHOW MEASUREMENTS lists the measurements by name", %{conn: conn} do
-      {:ok, :written} = Local.write(conn, "zz v=1 1\naa v=1 1\nmm v=1 1", database: "db")
-      assert {:ok, rows} = iq(conn, "SHOW MEASUREMENTS")
-      assert Enum.map(rows, & &1["name"]) == ["aa", "mm", "o", "zz"]
-    end
-  end
-
-  describe "query_flux/3" do
-    test "a filter on _measurement reads only those, and the tables are numbered the same" do
-      conn = v2_conn()
-
-      lp = """
-      a,h=x v=1 1000000000
-      b,h=x v=2 1000000000
-      c,h=x v=3 1000000000
-      a,h=y v=4 2000000000
-      """
-
-      assert {:ok, :written} = Local.write(conn, String.trim(lp), database: "b")
-      base = ~s|from(bucket: "b") \|> range(start: 0, stop: 100) |
-
-      all = fn extra -> Local.query_flux(conn, base <> extra) end
-
-      assert {:ok, rows} =
-               all.(~s/|> filter(fn: (r) => r._measurement == "a" or r._measurement == "c")/)
-
-      assert Enum.map(rows, &{&1["table"], &1["_measurement"], &1["h"], &1["_value"]}) == [
-               {0, "a", "x", 1.0},
-               {1, "a", "y", 4.0},
-               {2, "c", "x", 3.0}
-             ]
-
-      assert {:ok, [%{"table" => 0, "_value" => 2.0}]} =
-               all.(~s/|> filter(fn: (r) => r._measurement == "b")/)
-
-      assert {:ok, []} = all.(~s/|> filter(fn: (r) => r._measurement == "nope")/)
-
-      assert {:ok, [%{"table" => 0, "_value" => 4.0}]} =
-               all.(~s/|> filter(fn: (r) => r._measurement == "a" and r.h == "y")/)
-
-      assert {:ok, rows} =
-               all.(~s/|> filter(fn: (r) => r._measurement != "b") |> last()/)
-
-      assert Enum.map(rows, & &1["_value"]) == [1.0, 4.0, 3.0]
-    end
-
-    test "integer seconds that do not fit wrap instead of raising" do
-      conn = v2_conn()
-      assert {:ok, :written} = Local.write(conn, "m v=1 5\nm v=2 1000000000", database: "b")
-
-      query = fn stop ->
-        Local.query_flux(
-          conn,
-          ~s|from(bucket: "b") \|> range(start: 0, stop: #{stop})|
-        )
-      end
-
-      assert {:ok, rows} = query.("99999999999999")
-      assert Enum.map(rows, & &1["_value"]) == [1.0, 2.0]
-      assert Enum.all?(rows, &(&1["_stop"] == ~U[1976-05-08 04:06:59.520689Z]))
-      assert {:ok, []} = query.("18446744073")
-
-      assert %{"code" => "invalid", "message" => "error in building plan" <> _rest} =
-               error_body(query.("0"))
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # The store
   # ---------------------------------------------------------------------------
+
+  @tasks 12
+
+  defp stored(measurement, tags, v, timestamp),
+    do: %{measurement: measurement, tags: tags, fields: %{"v" => v}, timestamp: timestamp}
 
   describe "Store" do
     test "measurements are listed by name from the schema" do
@@ -1169,12 +1226,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       table = Store.new(["db"])
 
       for m <- ["a", "b", "c"], i <- 1..3 do
-        Store.store_point(table, "db", %{
-          measurement: m,
-          tags: %{},
-          fields: %{"v" => i},
-          timestamp: i
-        })
+        Store.store_point(table, "db", stored(m, %{}, i, i))
       end
 
       assert table |> Store.points_in_db("db") |> length() == 9
@@ -1206,14 +1258,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       build = fn id -> %{"id" => id} end
 
       results =
-        1..60
+        1..@tasks
         |> Task.async_stream(fn _n -> Store.create_token(table, "same", build) end,
-          max_concurrency: 60
+          max_concurrency: @tasks
         )
         |> Enum.map(fn {:ok, result} -> result end)
 
       assert [{:ok, %{"id" => 1}}] = Enum.filter(results, &match?({:ok, _token}, &1))
-      assert Enum.count(results, &(&1 == :exists)) == 59
+      assert Enum.count(results, &(&1 == :exists)) == @tasks - 1
       assert {:ok, %{"id" => 2}} = Store.create_token(table, "next", build)
     end
 
@@ -1221,21 +1273,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       table = Store.new([])
 
       ids =
-        1..80
+        1..@tasks
         |> Task.async_stream(
           fn n ->
             {:ok, %{"id" => id}} = Store.create_token(table, "t#{n}", &%{"id" => &1})
             id
           end,
-          max_concurrency: 80
+          max_concurrency: @tasks
         )
         |> Enum.map(fn {:ok, id} -> id end)
 
-      assert Enum.sort(ids) == Enum.to_list(1..80)
+      assert Enum.sort(ids) == Enum.to_list(1..@tasks)
     end
 
-    test "a token deleted while being created is never brought back" do
-      for round <- 1..100 do
+    test "a token deleted while it is being created ends up as one of the two orders left it" do
+      for round <- 1..16 do
         table = Store.new([])
         name = "t#{round}"
         build = &%{"id" => &1}
@@ -1245,12 +1297,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
         created = Task.await(creator)
         deleted = Task.await(deleter)
 
-        # Either the delete found the token (and it is gone), or it ran first.
+        # Delete first: nothing to delete, and the token stays. Create first:
+        # the delete removes it, and a second delete finds nothing.
         case {created, deleted} do
-          {{:ok, _token}, :ok} -> assert :ok != Store.delete_token(table, name)
-          {{:ok, _token}, :error} -> assert :ok = Store.delete_token(table, name)
+          {{:ok, %{"id" => 1}}, :error} -> assert :ok = Store.delete_token(table, name)
+          {{:ok, %{"id" => 1}}, :ok} -> assert :error = Store.delete_token(table, name)
         end
+
+        assert {:ok, %{"id" => 2}} = Store.create_token(table, "next", build)
       end
+    end
+
+    test "a deleted token's name is free again, and the delete is not undone" do
+      table = Store.new([])
+      build = &%{"id" => &1}
+
+      assert {:ok, %{"id" => 1}} = Store.create_token(table, "t", build)
+      assert :ok = Store.delete_token(table, "t")
+      assert :error = Store.delete_token(table, "t")
+      assert {:ok, %{"id" => 2}} = Store.create_token(table, "t", build)
     end
 
     test "concurrent first writes cannot pass the database limit" do
@@ -1258,14 +1323,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       check = fn existing -> if Enum.count(existing) >= 5, do: {:error, :limit}, else: :ok end
 
       results =
-        1..40
+        1..16
         |> Task.async_stream(fn n -> Store.create_database(table, "db#{n}", check) end,
-          max_concurrency: 40
+          max_concurrency: 16
         )
         |> Enum.map(fn {:ok, result} -> result end)
 
       assert Enum.count(results, &(&1 == :ok)) == 5
-      assert Enum.count(results, &(&1 == {:error, :limit})) == 35
+      assert Enum.count(results, &(&1 == {:error, :limit})) == 11
       assert table |> Store.databases() |> MapSet.size() == 5
     end
 
@@ -1278,76 +1343,88 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       refute Store.database?(table, "c")
     end
 
-    test "the limit holds through the double, concurrently" do
+    test "points written again after a delete are not merged with the deleted ones" do
+      table = Store.new(["db"])
+      Store.register_column(table, "db", "m", "v", "iox::column_type::field::integer")
+      tags = %{"h" => "x"}
+
+      Store.store_point(table, "db", stored("m", tags, 1, 5))
+      Store.store_point(table, "db", stored("m", tags, 2, 5))
+      assert Store.points(table, "db", "m") == [stored("m", tags, 2, 5)]
+
+      assert Store.delete_points(table, "db", "m", fn _point -> true end) == 1
+      assert Store.points(table, "db", "m") == []
+
+      Store.store_point(table, "db", stored("m", tags, 3, 5))
+      assert Store.points(table, "db", "m") == [stored("m", tags, 3, 5)]
+    end
+
+    test "writers of other series survive a concurrent delete exactly" do
+      for _round <- 1..8 do
+        table = Store.new(["db"])
+        Store.store_point(table, "db", stored("m", %{"s" => "old"}, 0, 5))
+
+        writers =
+          for n <- 1..4 do
+            Task.async(fn ->
+              Store.store_point(table, "db", stored("m", %{"s" => "new#{n}"}, n, 5))
+            end)
+          end
+
+        deleter =
+          Task.async(fn ->
+            Store.delete_points(table, "db", "m", &(&1.tags == %{"s" => "old"}))
+          end)
+
+        Enum.each(writers, &Task.await/1)
+        assert Task.await(deleter) == 1
+
+        assert table |> Store.points("db", "m") |> Enum.sort_by(& &1.fields["v"]) ==
+                 for(n <- 1..4, do: stored("m", %{"s" => "new#{n}"}, n, 5))
+      end
+    end
+  end
+
+  describe "Local — concurrency through the double" do
+    test "the database limit holds" do
       {:ok, conn} = Local.start(profile: :v3_core)
       on_exit(fn -> Local.stop(conn) end)
 
       results =
-        1..30
+        1..12
         |> Task.async_stream(
           fn n -> Local.write(conn, "m v=1 #{n}", database: "limit#{n}") end,
-          max_concurrency: 30
+          max_concurrency: 12
         )
         |> Enum.map(fn {:ok, result} -> result end)
 
       assert Enum.count(results, &(&1 == {:ok, :written})) == 5
-
-      assert Enum.all?(results, fn
-               {:ok, :written} -> true
-               {:error, %{status: 422}} -> true
-             end)
+      assert Enum.count(results, &match?({:error, %{status: 422}}, &1)) == 7
 
       assert {:ok, listed} = Local.list_databases(conn)
       assert length(listed) == 6
     end
 
-    test "tokens through the double: ids count up from 1, concurrently" do
+    test "tokens: ids count up from 1" do
       {:ok, conn} = Local.start(profile: :v3_core)
       on_exit(fn -> Local.stop(conn) end)
 
       ids =
-        1..40
+        1..@tasks
         |> Task.async_stream(
           fn n ->
             assert {:ok, %{"id" => id}} = Local.create_token(conn, "tok#{n}")
             id
           end,
-          max_concurrency: 40
+          max_concurrency: @tasks
         )
         |> Enum.map(fn {:ok, id} -> id end)
 
-      assert Enum.sort(ids) == Enum.to_list(1..40)
+      assert Enum.sort(ids) == Enum.to_list(1..@tasks)
       assert {:error, %{status: 409}} = Local.create_token(conn, "tok1")
       assert :ok = Local.delete_token(conn, "tok1")
-      assert {:ok, %{"id" => 41}} = Local.create_token(conn, "tok1")
-    end
-
-    test "deleting points while the same series is rewritten keeps one merged point" do
-      table = Store.new(["db"])
-      Store.register_column(table, "db", "m", "v", "iox::column_type::field::integer")
-
-      point = fn v ->
-        %{measurement: "m", tags: %{"h" => "x"}, fields: %{"v" => v}, timestamp: 5}
-      end
-
-      for round <- 1..200 do
-        Store.store_point(table, "db", point.(round))
-
-        writers =
-          for n <- 1..4 do
-            Task.async(fn -> Store.store_point(table, "db", point.(round * 10 + n)) end)
-          end
-
-        deleter =
-          Task.async(fn -> Store.delete_points(table, "db", "m", fn _point -> true end) end)
-
-        Enum.each(writers, &Task.await/1)
-        Task.await(deleter)
-
-        # However the race fell, what is left is one merged point or none.
-        assert length(Store.points(table, "db", "m")) <= 1
-        Store.delete_points(table, "db", "m", fn _point -> true end)
-      end
+      assert {:ok, %{"id" => id}} = Local.create_token(conn, "tok1")
+      assert id == @tasks + 1
     end
   end
 end

@@ -649,12 +649,12 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "string param substitution", %{conn: conn, db: db} do
       sql = "SELECT * FROM cpu WHERE host = $host"
-      assert param_rows(conn, db, sql, %{"$host" => "web01"}) == [{"web01", 10}]
+      assert param_rows(conn, db, sql, %{"host" => "web01"}) == [{"web01", 10}]
     end
 
     test "integer param substitution", %{conn: conn, db: db} do
       sql = "SELECT * FROM cpu WHERE usage > $min"
-      assert param_rows(conn, db, sql, %{"$min" => 15}) == [{"web02", 20}]
+      assert param_rows(conn, db, sql, %{"min" => 15}) == [{"web02", 20}]
     end
 
     test "atom key params without $ prefix", %{conn: conn, db: db} do
@@ -1050,24 +1050,6 @@ defmodule InfluxElixir.Client.LocalTest do
       assert column_values(conn, db, sql, "symbol") == ["AAPL", "GOOG"]
     end
 
-    test "a bare integer comparand is rejected, as DataFusion rejects it", %{conn: conn, db: db} do
-      # InfluxDB 3: "Cannot infer common argument type for comparison
-      # operation Timestamp(ns) >= Int64". Matching nothing here would let a
-      # query pass tests and 400 in production.
-      assert {:error,
-              %{
-                status: 400,
-                body:
-                  "type_coercion\ncaused by\nError during planning: Cannot infer common " <>
-                    "argument type for comparison operation Timestamp(ns) >= Int64"
-              }} =
-               Local.query_sql(
-                 conn,
-                 "SELECT * FROM prices WHERE time >= 1773748800000000000",
-                 database: db
-               )
-    end
-
     test "SELECT * with ISO 8601 time params", %{conn: conn, db: db} do
       {:ok, rows} =
         Local.query_sql(
@@ -1075,8 +1057,8 @@ defmodule InfluxElixir.Client.LocalTest do
           "SELECT * FROM prices WHERE time >= $start AND time < $end ORDER BY time",
           database: db,
           params: %{
-            "$start" => "2026-03-17T12:00:00Z",
-            "$end" => "2026-03-17T12:02:00Z"
+            "start" => "2026-03-17T12:00:00Z",
+            "end" => "2026-03-17T12:02:00Z"
           }
         )
 
@@ -1098,8 +1080,8 @@ defmodule InfluxElixir.Client.LocalTest do
         Local.query_sql(conn, sql,
           database: db,
           params: %{
-            "$start" => "2026-03-17T12:00:00Z",
-            "$end" => "2026-03-17T12:02:00Z"
+            "start" => "2026-03-17T12:00:00Z",
+            "end" => "2026-03-17T12:02:00Z"
           }
         )
 
@@ -1116,8 +1098,8 @@ defmodule InfluxElixir.Client.LocalTest do
           "SELECT * FROM prices WHERE time >= $start AND time < $end AND symbol = 'AAPL'",
           database: db,
           params: %{
-            "$start" => "2026-03-17T12:00:00Z",
-            "$end" => "2026-03-17T12:05:00Z"
+            "start" => "2026-03-17T12:00:00Z",
+            "end" => "2026-03-17T12:05:00Z"
           }
         )
 
@@ -1132,8 +1114,8 @@ defmodule InfluxElixir.Client.LocalTest do
           "SELECT * FROM prices WHERE time >= $start AND time < $end",
           database: db,
           params: %{
-            "$start" => "2026-03-18T00:00:00Z",
-            "$end" => "2026-03-18T01:00:00Z"
+            "start" => "2026-03-18T00:00:00Z",
+            "end" => "2026-03-18T01:00:00Z"
           }
         )
 
@@ -1232,7 +1214,7 @@ defmodule InfluxElixir.Client.LocalTest do
           conn,
           "SELECT * FROM holdings WHERE ticker IN ($t0, $t1) ORDER BY time",
           database: db,
-          params: %{"$t0" => "AAPL", "$t1" => "MSFT"}
+          params: %{"t0" => "AAPL", "t1" => "MSFT"}
         )
 
       assert Enum.map(rows, & &1["ticker"]) == ["AAPL", "MSFT"]
@@ -1329,43 +1311,6 @@ defmodule InfluxElixir.Client.LocalTest do
   end
 
   # ---------------------------------------------------------------------------
-  # query_sql/3 — Decimal SQL params (issue #7)
-  # ---------------------------------------------------------------------------
-
-  describe "query_sql/3 — Decimal params" do
-    setup %{conn: conn} do
-      :ok = Local.create_database(conn, "dec_db")
-
-      lines =
-        Enum.join(
-          [
-            "cash_flows,account_id=abc amount=500.0 1000",
-            "cash_flows,account_id=abc amount=5000.0 2000",
-            "cash_flows,account_id=abc amount=12000.0 3000"
-          ],
-          "\n"
-        )
-
-      {:ok, :written} = Local.write(conn, lines, database: "dec_db", precision: :nanosecond)
-      {:ok, db: "dec_db"}
-    end
-
-    test "Decimal param serialises as numeric literal (issue #7 reproduction)",
-         %{conn: conn, db: db} do
-      sql = """
-      SELECT amount FROM cash_flows
-      WHERE account_id = $a AND amount >= $min
-      ORDER BY time
-      """
-
-      params = %{"$a" => "abc", "$min" => Decimal.new("1000.00")}
-
-      assert {:ok, rows} = Local.query_sql(conn, sql, database: db, params: params)
-      assert rows == [%{"amount" => 5000.0}, %{"amount" => 12_000.0}]
-    end
-  end
-
-  # ---------------------------------------------------------------------------
   # query_sql/3 — coverage for error/edge branches
   # ---------------------------------------------------------------------------
 
@@ -1382,26 +1327,6 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, [%{}]} = Local.query_sql(conn, "SELECT DISTINCT FROM prices", database: db)
     end
 
-    test "WHERE time with an integer param is rejected, as over HTTP", %{conn: conn, db: db} do
-      # The engine plans `Timestamp(ns) >= UInt64` as an error for a JSON
-      # integer param; the double must not accept what production refuses.
-      {:ok, :written} = Local.write(conn, "m val=1i 5000", database: db)
-
-      assert {:error,
-              %{
-                status: 400,
-                body:
-                  "type_coercion\ncaused by\nError during planning: Cannot infer common " <>
-                    "argument type for comparison operation Timestamp(ns) >= UInt64"
-              }} =
-               Local.query_sql(
-                 conn,
-                 "SELECT * FROM m WHERE time >= $t",
-                 database: db,
-                 params: %{"$t" => 5000}
-               )
-    end
-
     test "WHERE time with a DateTime param renders as the ISO string Jason sends",
          %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "m val=1i 5000\nm val=2i 6000", database: db)
@@ -1411,7 +1336,7 @@ defmodule InfluxElixir.Client.LocalTest do
           conn,
           "SELECT * FROM m WHERE time >= $t",
           database: db,
-          params: %{"$t" => ~U[1970-01-01 00:00:00.000006Z]}
+          params: %{"t" => ~U[1970-01-01 00:00:00.000006Z]}
         )
 
       assert rows == [%{"val" => 2, "time" => ~U[1970-01-01 00:00:00.000006Z]}]
@@ -1455,7 +1380,7 @@ defmodule InfluxElixir.Client.LocalTest do
           conn,
           "SELECT * FROM m WHERE val > $v",
           database: db,
-          params: %{"$v" => 3.0}
+          params: %{"v" => 3.0}
         )
 
       assert [%{"val" => 3.14}] = rows
@@ -2234,18 +2159,6 @@ defmodule InfluxElixir.Client.LocalTest do
               }} = Local.query_sql(conn, sql, database: db)
     end
 
-    test "InfluxQL FIRST()/LAST() fail planning as invalid functions", %{conn: conn, db: db} do
-      # InfluxDB v3 SQL has no FIRST/LAST (#13).
-      for {sql, body} <- [
-            {"SELECT FIRST(price, time) AS open FROM \"trades\"",
-             "Error during planning: Invalid function 'first'.\nDid you mean 'cbrt'?"},
-            {"SELECT last(price) AS close FROM \"trades\"",
-             "Error during planning: Invalid function 'last'.\nDid you mean 'least'?"}
-          ] do
-        assert {:error, %{status: 400, body: ^body}} = Local.query_sql(conn, sql, database: db)
-      end
-    end
-
     test "a malformed first_value call is rejected", %{conn: conn, db: db} do
       sql = "SELECT first_value(price ORDER BY time, symbol) AS open FROM \"trades\""
 
@@ -2566,7 +2479,7 @@ defmodule InfluxElixir.Client.LocalTest do
                    conn,
                    "SELECT * FROM devices WHERE active = $flag",
                    database: db,
-                   params: %{"$flag" => flag}
+                   params: %{"flag" => flag}
                  )
       end
     end
@@ -2579,7 +2492,7 @@ defmodule InfluxElixir.Client.LocalTest do
                  conn,
                  "SELECT * FROM devices WHERE id = $val",
                  database: db,
-                 params: %{"$val" => nil}
+                 params: %{"val" => nil}
                )
 
       assert rows == []
@@ -2658,28 +2571,6 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       assert {:ok, []} = Local.query_sql(conn, sql, database: db)
-    end
-
-    test "untimed lines of one write share the server's time, so one series is one point",
-         %{conn: conn, db: db} do
-      # Both engines stamp every untimed line of a write with the request's
-      # time (verified): the two lines are one point, the later value wins.
-      {:ok, :written} = Local.write(conn, "no_ts val=10i\nno_ts val=20i", database: db)
-
-      sql = """
-      SELECT
-        DATE_BIN(INTERVAL '1 hour', time) AS time,
-        SUM(val) AS total
-      FROM no_ts
-      GROUP BY DATE_BIN(INTERVAL '1 hour', time)
-      """
-
-      assert {:ok, [%{"total" => 20, "time" => time}]} = Local.query_sql(conn, sql, database: db)
-
-      # The bucket is the server-assigned hour, not the epoch: it starts on the
-      # hour, within the last hour.
-      assert %DateTime{minute: 0, second: 0, microsecond: {0, 6}} = time
-      assert DateTime.diff(DateTime.utc_now(), time, :second) in 0..3600
     end
   end
 
@@ -3345,65 +3236,6 @@ defmodule InfluxElixir.Client.LocalTest do
                  database: db
                )
     end
-
-    test "aggregates over time other than MIN, MAX and COUNT fail planning as on the engine",
-         %{conn: conn, db: db} do
-      for {expression, body} <- [
-            {"AVG(time) AS s",
-             "Error during planning: Execution error: Function 'avg' user-defined coercion " <>
-               "failed with \"Error during planning: Avg does not support inputs of type " <>
-               "Timestamp(ns).\" No function matches the given name and argument types " <>
-               "'avg(Timestamp(ns))'. You might need to add explicit type casts.\n" <>
-               "\tCandidate functions:\n\tavg(UserDefined)"},
-            {"SUM(time) AS s",
-             "Error during planning: Execution error: Function 'sum' user-defined coercion " <>
-               "failed with \"Execution error: Sum not supported for Timestamp(ns)\" No " <>
-               "function matches the given name and argument types 'sum(Timestamp(ns))'. You " <>
-               "might need to add explicit type casts.\n\tCandidate functions:\n\tsum(UserDefined)"},
-            {"STDDEV(time) AS s",
-             "Error during planning: Function 'stddev' expects NativeType::Numeric but " <>
-               "received NativeType::Timestamp(Nanosecond, None) No function matches the " <>
-               "given name and argument types 'stddev(Timestamp(ns))'. You might need to add " <>
-               "explicit type casts.\n\tCandidate functions:\n\tstddev(Numeric(1))"}
-          ] do
-        assert {:error, %{status: 400, body: ^body}} =
-                 Local.query_sql(conn, ~s|SELECT #{expression} FROM "q"|, database: db)
-      end
-
-      # Arithmetic on `time` inside an aggregate (verified on Core).
-      assert {:error,
-              %{
-                status: 400,
-                body:
-                  "Error during planning: Cannot coerce arithmetic expression " <>
-                    "Timestamp(ns) - Int64 to valid types"
-              }} = Local.query_sql(conn, ~s|SELECT MAX(time - 1) AS s FROM "q"|, database: db)
-    end
-
-    test "SELECT DISTINCT honours ORDER BY on a selected column", %{conn: conn, db: db} do
-      assert {:ok, [%{"provider" => "c"}, %{"provider" => "b"}, %{"provider" => "a"}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT DISTINCT provider FROM "q" ORDER BY provider DESC|,
-                 database: db
-               )
-    end
-
-    test "SELECT DISTINCT rejects ORDER BY a column outside the select list",
-         %{conn: conn, db: db} do
-      assert {:error,
-              %{
-                status: 400,
-                body:
-                  "Error during planning: For SELECT DISTINCT, ORDER BY expressions " <>
-                    "q.price must appear in select list"
-              }} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT DISTINCT provider FROM "q" ORDER BY price|,
-                 database: db
-               )
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -3642,17 +3474,6 @@ defmodule InfluxElixir.Client.LocalTest do
                ["a", "e"]
     end
 
-    test "LIKE over a numeric column is the engine's planning error", %{conn: conn, db: db} do
-      assert {:error,
-              %{
-                status: 400,
-                body:
-                  "type_coercion\ncaused by\nError during planning: There isn't a common " <>
-                    "type to coerce Float64 and Utf8 in LIKE expression"
-              }} =
-               Local.query_sql(conn, ~s|SELECT host FROM "m" WHERE v LIKE '1%'|, database: db)
-    end
-
     test "a string column against a numeric literal compares the literal's text, lexically",
          %{conn: conn, db: db} do
       # rack is a tag: "1", "2", "4", "10". DataFusion keeps the column Utf8
@@ -3670,22 +3491,6 @@ defmodule InfluxElixir.Client.LocalTest do
       assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host = 'x AND y' OR host = 'a'|) == [
                "a"
              ]
-    end
-
-    test "LIMIT 0 returns no rows; a negative or non-numeric LIMIT is rejected",
-         %{conn: conn, db: db} do
-      assert {:ok, []} = Local.query_sql(conn, ~s|SELECT host FROM "m" LIMIT 0|, database: db)
-
-      assert {:error,
-              %{
-                status: 400,
-                body:
-                  "Optimizer rule 'eliminate_limit' failed\ncaused by\nError during " <>
-                    "planning: LIMIT must be >= 0, '-1' was provided"
-              }} = Local.query_sql(conn, ~s|SELECT host FROM "m" LIMIT -1|, database: db)
-
-      assert {:error, %{status: 500, body: "Schema error: No field named abc."}} =
-               Local.query_sql(conn, ~s|SELECT host FROM "m" LIMIT abc|, database: db)
     end
 
     test "malformed boolean expressions are rejected, not truncated", %{conn: conn, db: db} do
@@ -4628,122 +4433,6 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, conn: conn}
     end
 
-    test "a field type conflict is a 422 partial write naming the first conflict and the dropped count",
-         %{conn: conn} do
-      {:ok, :written} = Local.write(conn, "d1 v=1i 1700000000000000000", database: "metrics")
-
-      lp =
-        "d1 v=2.0 1700000000000000001\nd1 v=3.0 1700000000000000002\nd1 v=4i 1700000000000000003"
-
-      assert {:error, %{status: 422, body: body}} = Local.write(conn, lp, database: "metrics")
-
-      assert Jason.decode!(body) == %{
-               "code" => "unprocessable entity",
-               "message" =>
-                 "failure writing points to database: partial write: field type conflict: " <>
-                   ~s|input field "v" on measurement "d1" is type float, already exists as type | <>
-                   "integer dropped=2"
-             }
-
-      # The good lines were stored (Flux returns one row per field value).
-      assert {:ok, rows} =
-               Local.query_flux(conn, v2_flux("d1"))
-
-      assert Enum.map(rows, & &1["_value"]) == [1, 4]
-
-      for {first, second, measurement, field, existing, got} <- [
-            {~s|s s="x"|, "s s=1.0", "s", "s", "string", "float"},
-            {"b b=true", "b b=1i", "b", "b", "boolean", "integer"},
-            {"u v=1i", "u v=2u", "u", "v", "integer", "unsigned"}
-          ] do
-        {:ok, :written} = Local.write(conn, first, database: "metrics")
-
-        assert {:error, %{status: 422, body: body}} =
-                 Local.write(conn, second, database: "metrics")
-
-        assert Jason.decode!(body)["message"] ==
-                 "failure writing points to database: partial write: field type conflict: " <>
-                   ~s|input field "#{field}" on measurement "#{measurement}" is type #{got}, | <>
-                   "already exists as type #{existing} dropped=1"
-      end
-    end
-
-    test "a line that fails to parse rejects the whole payload with 400 and stores nothing",
-         %{conn: conn} do
-      lp = "p2 v=1i 1700000000000000000\np2 v=\np2 v=3i 1700000000000000002"
-      assert {:error, %{status: 400, body: body}} = Local.write(conn, lp, database: "metrics")
-
-      assert %{
-               "code" => "invalid",
-               "message" => "unable to parse 'p2 v=': missing field value"
-             } =
-               Jason.decode!(body)
-
-      assert {:ok, []} =
-               Local.query_flux(conn, v2_flux("p2"))
-
-      assert {:error, %{status: 400, body: body}} =
-               Local.write(conn, "p3 v=9223372036854775808i 1700000000000000000",
-                 database: "metrics"
-               )
-
-      assert Jason.decode!(body) == %{
-               "code" => "invalid",
-               "message" =>
-                 "unable to parse 'p3 v=9223372036854775808i 1700000000000000000': " <>
-                   "unable to parse integer 9223372036854775808: strconv.ParseInt: " <>
-                   "parsing \"9223372036854775808\": value out of range"
-             }
-
-      # Every failed line is reported, joined by a newline.
-      two_bad = "p4 v=1i 1\np4 v=\np4 v=2i 2\np4 w=9223372036854775808i 3"
-
-      assert {:error, %{status: 400, body: body}} =
-               Local.write(conn, two_bad, database: "metrics")
-
-      assert Jason.decode!(body) == %{
-               "code" => "invalid",
-               "message" =>
-                 "unable to parse 'p4 v=': missing field value\n" <>
-                   "unable to parse 'p4 w=9223372036854775808i 3': unable to parse integer " <>
-                   "9223372036854775808: strconv.ParseInt: parsing \"9223372036854775808\": " <>
-                   "value out of range"
-             }
-    end
-
-    test "time as a tag is refused; time as a field is dropped silently; a tag and a field may share a name; an empty payload is accepted",
-         %{conn: conn} do
-      assert {:error, %{status: 400, body: body}} =
-               Local.write(conn, "t1,time=x v=1i 1700000000000000000", database: "metrics")
-
-      assert Jason.decode!(body) == %{
-               "code" => "invalid",
-               "message" =>
-                 "unable to parse 't1,time=x v=1i 1700000000000000000': " <>
-                   ~s|cannot use reserved tag key "time"|
-             }
-
-      {:ok, :written} =
-        Local.write(conn, "t2 time=5i,v=1i 1700000000000000000", database: "metrics")
-
-      assert {:ok, [%{"_field" => "v", "_value" => 1}]} =
-               Local.query_flux(conn, v2_flux("t2"))
-
-      {:ok, :written} =
-        Local.write(conn, "t3,host=a host=1i 1700000000000000000", database: "metrics")
-
-      {:ok, :written} =
-        Local.write(conn, "t3,host=b v=2i 1700000000000000001", database: "metrics")
-
-      assert {:ok, rows} = Local.query_flux(conn, v2_flux("t3"))
-
-      assert rows |> Enum.map(&{&1["host"], &1["_field"], &1["_value"]}) |> Enum.sort() ==
-               [{"a", "host", 1}, {"b", "v", 2}]
-
-      assert {:ok, :written} = Local.write(conn, "", database: "metrics")
-      assert {:ok, :written} = Local.write(conn, "# only a comment\n", database: "metrics")
-    end
-
     test "precision takes ns, us, ms, s and the long names; auto and the rest are the v2 400",
          %{conn: conn} do
       for precision <- [:ms, "ms", :millisecond, "millisecond"] do
@@ -4794,33 +4483,6 @@ defmodule InfluxElixir.Client.LocalTest do
                {"x", "ends\\", 1},
                {"y", "line1\nline2", 2}
              ]
-    end
-
-    test "a name ending in a backslash is refused on v3; v2 keeps `\\\\,` in a measurement",
-         %{conn: conn} do
-      message = "Measurements, tag keys and values, and field keys may not end with a backslash"
-
-      for lp <- [~S"bs\\,t=a v=1i 1", ~S"bt,k\\=a v=2i 1", ~S"bv,t=a\\ v=1i 1", ~S"bf k\\=1i 1"] do
-        assert {:error, %{status: 400, body: body}} = Local.write(conn, lp, database: "esc")
-        assert [{1, ^message}] = partial_errors(body), lp
-      end
-
-      {:ok, v2} = Local.start(profile: :v2)
-      on_exit(fn -> Local.stop(v2) end)
-      :ok = Local.create_bucket(v2, "b")
-
-      assert {:ok, :written} = Local.write(v2, ~S"bs\\,t=a v=1i 1", database: "b")
-
-      assert {:ok, [%{"_measurement" => ~S"bs\,t=a"}]} =
-               Local.query_flux(v2, ~s|from(bucket: "b") \|> range(start: 0)|)
-
-      assert {:error, %{status: 400, body: body}} =
-               Local.write(v2, ~S"bt,k\\=a v=2i 1", database: "b")
-
-      assert Jason.decode!(body) == %{
-               "code" => "invalid",
-               "message" => ~S"unable to parse 'bt,k\\=a v=2i 1': missing tag value"
-             }
     end
   end
 

@@ -233,10 +233,8 @@ defmodule InfluxElixir.Client.Local.Store do
   stamps a write's untimed lines itself, all with one time, as the engines
   do.
 
-  Storing a measurement's points as one list meant every write read the
-  list, prepended and wrote it back: concurrent writers overwrote each
-  other (#15: 159 of 480 writes survived) and each insert copied the whole
-  list. A plain insert is atomic and O(log n).
+  Each point is its own object, so concurrent writers never read-modify-write
+  a shared value and no write is lost; an insert is atomic and O(log n).
   """
   @spec store_point(t(), binary(), point()) :: true
   def store_point(table, database, point) do
@@ -270,9 +268,8 @@ defmodule InfluxElixir.Client.Local.Store do
   @doc """
   The database's measurements, sorted by name: the ones with a table,
   which a write creates by registering its columns. They are read from the
-  column keys, which are few; looking for them among the points meant
-  selecting every point. The order is the keys', alphabetical, which is
-  how InfluxDB lists them.
+  column keys, which are few, not from the points, which are many. The
+  order is the keys', alphabetical, which is how InfluxDB lists them.
   """
   @spec measurements(t(), binary()) :: [binary()]
   def measurements(table, database) do

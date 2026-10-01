@@ -25,9 +25,22 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
     blocks =
       case profile do
-        :v3_core -> [helpers(client), v3_line_protocol_tests(client), v3_influxql_tests(client)]
-        :v2 -> [helpers(client), v2_line_protocol_tests(client), v2_flux_tests(client)]
-        _other -> []
+        :v3_core ->
+          [helpers(client), v3_line_protocol_tests(client), v3_influxql_tests(client)]
+
+        :v2 ->
+          [
+            helpers(client),
+            v2_line_protocol_helpers(client),
+            v2_line_protocol_tests(client),
+            v2_flux_helpers(client),
+            v2_flux_range_tests(client),
+            v2_flux_data_tests(client),
+            v2_bucket_tests(client)
+          ]
+
+        _other ->
+          []
       end
 
     quote do
@@ -47,26 +60,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         InfluxElixir.ClientContract.settle(ctx)
       end
 
-      # A real server outlives the test, so its bucket is deleted after it;
-      # the double may be gone by then.
-      defp ifl_delete_after(ctx, name) do
-        on_exit(fn ->
-          try do
-            unquote(client).delete_bucket(ctx.conn, name)
-          rescue
-            ArgumentError -> :ok
-          end
-        end)
-      end
-
-      # The engine's 400 for InfluxDB 3: one entry per bad line.
-      defp ifl_partial_errors(body) do
-        assert %{"error" => "partial write of line protocol occurred", "data" => data} =
-                 Jason.decode!(body)
-
-        for %{"error_message" => message, "line_number" => number} <- data,
-            do: {number, message}
-      end
+      defp ifl_us(microseconds), do: DateTime.from_unix!(microseconds, :microsecond)
     end
   end
 
@@ -76,28 +70,38 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
   defp v3_line_protocol_tests(client) do
     quote do
-      describe "line protocol grammar — InfluxDB 3 contract" do
-        # `~m` is the measurement. After the first field that parses, what
-        # does not is trailing content: from the comma when it is the
-        # third field or later, after it for the second.
-        @ifl_v3_errors [
-          {"~m v=1 100 200", "Could not parse entire line. Found trailing content: `200`"},
-          {"~m v=.5 1", "No fields were provided"},
-          {"~m v=5. 2", "Could not parse entire line. Found trailing content: `. 2`"},
-          {"~m v=1e 5", "Could not parse entire line. Found trailing content: `e 5`"},
-          {"~m v=tRUE 5", "Could not parse entire line. Found trailing content: `RUE 5`"},
-          {"~m v=+5 5", "No fields were provided"},
-          {"~m v=1 5 6", "Could not parse entire line. Found trailing content: `6`"},
-          {"~m v=1 abcdefghijklmnop",
-           "Could not parse entire line. Found trailing content: ` abcdefghi...`"},
-          {"~m v=1,w= 5", "Could not parse entire line. Found trailing content: `w= 5`"},
-          {"~m v=1,w=2,x=3,y= 5", "Could not parse entire line. Found trailing content: `,y= 5`"},
-          {"~m v=1,v=2 5", "invalid line protocol - multiple instances of 'v' field found"},
-          {"~m,t v=1 5", "Tag set malformed: could not find equals sign in `t v=1 5`"},
-          {"~m,t= v=1 5", "Expected tag value, got ` v=1 5`"},
-          {"~m,=a v=1 5", "Expected tag key, got `=a v=1 5`"}
-        ]
+      # `~m` is the measurement. After the first field that parses, what
+      # does not is trailing content: from the comma when it is the
+      # third field or later, after it for the second.
+      @ifl_v3_errors [
+        {"~m v=1 100 200", "Could not parse entire line. Found trailing content: `200`"},
+        {"~m v=.5 1", "No fields were provided"},
+        {"~m v=5. 2", "Could not parse entire line. Found trailing content: `. 2`"},
+        {"~m v=1e 5", "Could not parse entire line. Found trailing content: `e 5`"},
+        {"~m v=tRUE 5", "Could not parse entire line. Found trailing content: `RUE 5`"},
+        {"~m v=+5 5", "No fields were provided"},
+        {"~m v=1 5 6", "Could not parse entire line. Found trailing content: `6`"},
+        {"~m v=1 abcdefghijklmnop",
+         "Could not parse entire line. Found trailing content: ` abcdefghi...`"},
+        {"~m v=1,w= 5", "Could not parse entire line. Found trailing content: `w= 5`"},
+        {"~m v=1,w=2,x=3,y= 5", "Could not parse entire line. Found trailing content: `,y= 5`"},
+        {"~m v=1,v=2 5", "invalid line protocol - multiple instances of 'v' field found"},
+        {"~m,t v=1 5", "Tag set malformed: could not find equals sign in `t v=1 5`"},
+        {"~m,t= v=1 5", "Expected tag value, got ` v=1 5`"},
+        {"~m,=a v=1 5", "Expected tag key, got `=a v=1 5`"},
+        {"~m\tv=1 5", "Expected at least one space character, got `\tv=1 5`"},
+        {"~m v=1\t5", "Could not parse entire line. Found trailing content: `\t5`"}
+      ]
 
+      defp ifl_partial_errors(body) do
+        assert %{"error" => "partial write of line protocol occurred", "data" => data} =
+                 Jason.decode!(body)
+
+        for %{"error_message" => message, "line_number" => number} <- data,
+            do: {number, message}
+      end
+
+      describe "line protocol grammar — InfluxDB 3 contract" do
         test "a line that does not parse is the engine's 400, in the engine's words", ctx do
           for {template, message} <- @ifl_v3_errors do
             line = String.replace(template, "~m", ifl_name("ifl_lp"))
@@ -150,6 +154,48 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
           assert Enum.map(rows, & &1["v"]) == [1.0, 3.0]
         end
+
+        test "a quote in a tag value does not join the next line to it", ctx do
+          m = ifl_name("ifl_quote")
+
+          ifl_write(ctx, [~s|#{m},t=a"b f=1i 1000|, "#{m} f=2i 2000"])
+
+          assert {:ok, rows} =
+                   unquote(client).query_influxql(ctx.conn, "SELECT f, t FROM #{m}",
+                     database: ctx.database
+                   )
+
+          assert Enum.map(rows, &{&1["time"], &1["f"], &1["t"]}) == [
+                   {ifl_us(1), 1, ~s|a"b|},
+                   {ifl_us(2), 2, nil}
+                 ]
+        end
+
+        test "a quote after a field value opens a string that swallows the newline", ctx do
+          m = ifl_name("ifl_swallow")
+
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).write(ctx.conn, ~s|#{m} f=1"i 1\nBAD|, database: ctx.database)
+
+          assert [{1, "Could not parse entire line. Found trailing content: `\"i 1\nBAD`"}] =
+                   ifl_partial_errors(body)
+        end
+
+        test "an error is numbered among the lines that count and echoes the physical line",
+             ctx do
+          m = ifl_name("ifl_number")
+
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).write(ctx.conn, "#c\n\n#{m} v=1 5 6", database: ctx.database)
+
+          assert %{"data" => [entry]} = Jason.decode!(body)
+
+          assert entry == %{
+                   "error_message" => "Could not parse entire line. Found trailing content: `6`",
+                   "line_number" => 1,
+                   "original_line" => "#c"
+                 }
+        end
       end
     end
   end
@@ -160,6 +206,18 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
   defp v3_influxql_tests(client) do
     quote do
+      defp ifl_iq(ctx, statement) do
+        unquote(client).query_influxql(ctx.conn, statement, database: ctx.database)
+      end
+
+      defp ifl_iq_values(ctx, statement, column \\ "v") do
+        assert {:ok, rows} = ifl_iq(ctx, statement)
+        Enum.map(rows, & &1[column])
+      end
+
+      @ifl_time_not_equal "rewriting statement\ncaused by\nsplit condition\ncaused by\n" <>
+                            "Error during planning: invalid time comparison operator: !="
+
       describe "InfluxQL WHERE, time and LIMIT — contract" do
         # Times are whole microseconds, which a query result carries.
         setup ctx do
@@ -175,17 +233,6 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
           {:ok, m: m}
         end
-
-        defp ifl_iq(ctx, statement) do
-          unquote(client).query_influxql(ctx.conn, statement, database: ctx.database)
-        end
-
-        defp ifl_iq_values(ctx, statement, column \\ "v") do
-          assert {:ok, rows} = ifl_iq(ctx, statement)
-          Enum.map(rows, & &1[column])
-        end
-
-        defp ifl_us(microseconds), do: DateTime.from_unix!(microseconds, :microsecond)
 
         test "a keyword inside a quoted string is a string, not a keyword", ctx do
           assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE k = 'into'") == [4.0]
@@ -216,14 +263,18 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           end
         end
 
-        test "time != and time <> are a planning error", ctx do
-          body =
-            "rewriting statement\ncaused by\nsplit condition\ncaused by\n" <>
-              "Error during planning: invalid time comparison operator: !="
-
-          for operator <- ["!=", "<>"] do
-            assert {:error, %{status: 400, body: ^body}} =
-                     ifl_iq(ctx, "SELECT v FROM #{ctx.m} WHERE time #{operator} 2000")
+        test "time != and time <> are a planning error, whatever the comparand", ctx do
+          for where <- [
+                "time != 2000",
+                "time <> 2000",
+                "time <> 2s",
+                "2000 != time",
+                "time != '2026-01-01'",
+                "time != now()"
+              ] do
+            assert {:error, %{status: 400, body: @ifl_time_not_equal}} =
+                     ifl_iq(ctx, "SELECT v FROM #{ctx.m} WHERE #{where}"),
+                   where
           end
         end
 
@@ -282,42 +333,77 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   # InfluxDB 2 line protocol
   # ---------------------------------------------------------------------------
 
+  defp v2_line_protocol_helpers(_client) do
+    quote do
+      # The Go parser's words; `~m` is the measurement.
+      @ifl_v2_errors [
+        {"this is not line protocol!!", "invalid field format"},
+        {"~m v=", "missing field value"},
+        {"~m v=.e3", "invalid float"},
+        {"~m v=1e999", "invalid float"},
+        {"~m v=tRUE", "invalid boolean"},
+        {"~m v=+5", "invalid boolean"},
+        {"~m v=1ii", "invalid number"},
+        {"~m v=1 abc", "bad timestamp"},
+        {"~m v=1 -", ~S|strconv.ParseInt: parsing "-": invalid syntax|},
+        {"~m v=1 5 6", "point is invalid"},
+        {"~m,t=1,t=2 v=1", "duplicate tags"},
+        {"~m", "missing fields"},
+        {"~m,t v=1", "missing tag value"},
+        {"~m,=1 v=1", "missing tag key"},
+        {"~m,t=a=b v=1", "invalid tag format"},
+        {",t=1 v=1", "missing measurement"},
+        {"~m =1", "missing field key"},
+        {"~m v=1,w", "invalid field format"},
+        {"~m v=1,,w=2", "invalid field format"},
+        {~S|~m v="abc|, "unbalanced quotes"},
+        {"~m v=9223372036854775808i",
+         "unable to parse integer 9223372036854775808: " <>
+           ~S|strconv.ParseInt: parsing "9223372036854775808": value out of range|},
+        {"~m v=18446744073709551616u",
+         "unable to parse unsigned 18446744073709551616: " <>
+           ~S|strconv.ParseUint: parsing "18446744073709551616": value out of range|}
+      ]
+
+      # The drops of one payload against a measurement that holds `v` as a
+      # float: `~m` and `~n` are two measurements. An untimed point lands in
+      # today's shard group and a timed one in its own week; the message is
+      # the first drop of the earliest group that dropped any, and `dropped`
+      # counts that group's drops.
+      @ifl_v2_drops [
+        {"~m time=1 5\n~m v=1i 6", :invalid, "~m", 2},
+        {"~m v=1i 6\n~m time=1 5", :conflict, "~m", 2},
+        {"~m v=1i 6\n~m v=2i 6\n~m time=1 5\n~m time=1 6", :conflict, "~m", 4},
+        {"~m time=1\n~m v=1i 5", :conflict, "~m", 1},
+        {"~m v=1i 5\n~m time=1", :conflict, "~m", 1},
+        {"~m time=1\n~m time=2 5\n~n time=3", :invalid, "~m", 1},
+        {"~n time=3\n~m time=3", :invalid, "~n", 2},
+        {"~m v=1i 1000000000000000\n~m v=2i 1\n~m time=1 2", :conflict, "~m", 2},
+        {"~m time=1 5\n~m v=1i 1000000000000000", :invalid, "~m", 1},
+        {"~m v=1i 1000000000000000\n~m time=1 5", :invalid, "~m", 1},
+        {"~m time=1 1000000000000000\n~m v=1i 5", :conflict, "~m", 1},
+        {"~m v=1i 5\n~m time=1 1000000000000000\n~m time=1 3000000000000000", :conflict, "~m", 1}
+      ]
+
+      defp ifl_v2_invalid(message),
+        do: %{"code" => "invalid", "message" => message}
+
+      defp ifl_v2_drop_message(:invalid, measurement, dropped) do
+        "failure writing points to database: partial write: invalid field name: " <>
+          ~s|input field "time" on measurement "#{measurement}" is invalid dropped=#{dropped}|
+      end
+
+      defp ifl_v2_drop_message(:conflict, measurement, dropped) do
+        "failure writing points to database: partial write: field type conflict: " <>
+          ~s|input field "v" on measurement "#{measurement}" is type integer, | <>
+          "already exists as type float dropped=#{dropped}"
+      end
+    end
+  end
+
   defp v2_line_protocol_tests(client) do
     quote do
       describe "line protocol grammar — InfluxDB 2 contract" do
-        # The Go parser's words; `~m` is the measurement.
-        @ifl_v2_errors [
-          {"this is not line protocol!!", "invalid field format"},
-          {"~m v=", "missing field value"},
-          {"~m v=.e3", "invalid float"},
-          {"~m v=1e999", "invalid float"},
-          {"~m v=tRUE", "invalid boolean"},
-          {"~m v=+5", "invalid boolean"},
-          {"~m v=1ii", "invalid number"},
-          {"~m v=1 abc", "bad timestamp"},
-          {"~m v=1 -", ~S|strconv.ParseInt: parsing "-": invalid syntax|},
-          {"~m v=1 5 6", "point is invalid"},
-          {"~m,t=1,t=2 v=1", "duplicate tags"},
-          {"~m", "missing fields"},
-          {"~m,t v=1", "missing tag value"},
-          {"~m,=1 v=1", "missing tag key"},
-          {"~m,t=a=b v=1", "invalid tag format"},
-          {",t=1 v=1", "missing measurement"},
-          {"~m =1", "missing field key"},
-          {"~m v=1,w", "invalid field format"},
-          {"~m v=1,,w=2", "invalid field format"},
-          {~S|~m v="abc|, "unbalanced quotes"},
-          {"~m v=9223372036854775808i",
-           "unable to parse integer 9223372036854775808: " <>
-             ~S|strconv.ParseInt: parsing "9223372036854775808": value out of range|},
-          {"~m v=18446744073709551616u",
-           "unable to parse unsigned 18446744073709551616: " <>
-             ~S|strconv.ParseUint: parsing "18446744073709551616": value out of range|}
-        ]
-
-        defp ifl_v2_invalid(message),
-          do: %{"code" => "invalid", "message" => message}
-
         test "a line that does not parse is a 400 in the Go parser's words", ctx do
           for {template, reason} <- @ifl_v2_errors do
             line = String.replace(template, "~m", ifl_name("ifl_lp"))
@@ -368,6 +454,17 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                    )
         end
 
+        test "a line left open by a quote is quoted without the payload's final newline",
+             ctx do
+          m = ifl_name("ifl_open")
+
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).write(ctx.conn, ~s|#{m} f="a\nBAD\n|, database: ctx.database)
+
+          assert Jason.decode!(body) ==
+                   ifl_v2_invalid(~s|unable to parse '#{m} f="a\nBAD': unbalanced quotes|)
+        end
+
         test "a field named time is dropped; a point with nothing else is not written", ctx do
           m = ifl_name("ifl_time")
 
@@ -379,10 +476,29 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
           assert Jason.decode!(body) == %{
                    "code" => "unprocessable entity",
-                   "message" =>
-                     "failure writing points to database: partial write: invalid field name: " <>
-                       ~s|input field "time" on measurement "#{m}" is invalid dropped=1|
+                   "message" => ifl_v2_drop_message(:invalid, m, 1)
                  }
+        end
+
+        test "dropped points are counted per shard group, the earliest group's first drop speaks",
+             ctx do
+          m = ifl_name("ifl_drop")
+          n = ifl_name("ifl_dropn")
+          ifl_write(ctx, ["#{m} v=1.5 5"])
+
+          for {template, kind, name, dropped} <- @ifl_v2_drops do
+            payload = template |> String.replace("~m", m) |> String.replace("~n", n)
+            speaker = String.replace(name, "~m", m) |> String.replace("~n", n)
+
+            assert {:error, %{status: 422, body: body}} =
+                     unquote(client).write(ctx.conn, payload, database: ctx.database)
+
+            assert Jason.decode!(body) == %{
+                     "code" => "unprocessable entity",
+                     "message" => ifl_v2_drop_message(kind, speaker, dropped)
+                   },
+                   template
+          end
         end
       end
     end
@@ -392,9 +508,29 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   # Flux and buckets
   # ---------------------------------------------------------------------------
 
-  defp v2_flux_tests(client) do
+  defp v2_flux_helpers(client) do
     quote do
-      describe "Flux range and bucket listing — InfluxDB 2 contract" do
+      # A real server outlives the test, so its bucket is deleted after it;
+      # the double may be gone by then.
+      defp ifl_delete_after(ctx, name) do
+        on_exit(fn ->
+          try do
+            unquote(client).delete_bucket(ctx.conn, name)
+          rescue
+            ArgumentError -> :ok
+          end
+        end)
+      end
+
+      defp ifl_range(ctx, stop), do: String.replace(ctx.head, "STOP", stop)
+
+      defp ifl_flux(ctx, query), do: unquote(client).query_flux(ctx.conn, query)
+    end
+  end
+
+  defp v2_flux_range_tests(_client) do
+    quote do
+      describe "Flux range — InfluxDB 2 contract" do
         setup ctx do
           m = ifl_name("ifl_fx")
           ifl_write(ctx, ["#{m} v=1 5", "#{m} v=2 1000000000"])
@@ -406,29 +542,24 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           {:ok, m: m, head: head}
         end
 
-        defp ifl_range(ctx, stop), do: String.replace(ctx.head, "STOP", stop)
-
         test "integer seconds become int64 nanoseconds, and wrap when they do not fit", ctx do
-          assert {:ok, rows} =
-                   unquote(client).query_flux(ctx.conn, ifl_range(ctx, "99999999999999"))
+          assert {:ok, rows} = ifl_flux(ctx, ifl_range(ctx, "99999999999999"))
 
           assert Enum.map(rows, & &1["_value"]) == [1.0, 2.0]
           assert Enum.all?(rows, &(&1["_stop"] == ~U[1976-05-08 04:06:59.520689Z]))
 
-          assert {:ok, rows} =
-                   unquote(client).query_flux(ctx.conn, ifl_range(ctx, "9223372036"))
+          assert {:ok, rows} = ifl_flux(ctx, ifl_range(ctx, "9223372036"))
 
           assert Enum.all?(rows, &(&1["_stop"] == ~U[2262-04-11 23:47:16.000000Z]))
 
           # The stop wraps below the start, but a range is judged on the
           # seconds: nothing is read, and there is no error.
-          assert {:ok, []} = unquote(client).query_flux(ctx.conn, ifl_range(ctx, "18446744073"))
+          assert {:ok, []} = ifl_flux(ctx, ifl_range(ctx, "18446744073"))
         end
 
         test "a range with no time in it is the engine's 400", ctx do
           for stop <- ["0", "-1", "9223372036854775807", "1970-01-01T00:00:00Z"] do
-            assert {:error, %{status: 400, body: body}} =
-                     unquote(client).query_flux(ctx.conn, ifl_range(ctx, stop))
+            assert {:error, %{status: 400, body: body}} = ifl_flux(ctx, ifl_range(ctx, stop))
 
             assert Jason.decode!(body) == %{
                      "code" => "invalid",
@@ -439,7 +570,138 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                    stop
           end
         end
+      end
+    end
+  end
 
+  defp v2_flux_data_tests(client) do
+    quote do
+      describe "Flux data and bucket listing — InfluxDB 2 contract" do
+        test "first and last choose by the stored nanoseconds, not the microsecond shown",
+             ctx do
+          m = ifl_name("ifl_ns")
+          ifl_write(ctx, ["#{m},t=a v=1i 1001", "#{m},t=a v=2i 1000"])
+
+          base =
+            ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) | <>
+              ~s|\|> filter(fn: (r) => r._measurement == "#{m}") |
+
+          for {stage, value} <- [{"first()", 2}, {"last()", 1}, {"limit(n: 1)", 2}] do
+            assert {:ok, [row]} = ifl_flux(ctx, base <> "|> " <> stage)
+            assert row["_value"] == value, stage
+          end
+        end
+
+        test "a filter on _measurement reads only those, and the tables are numbered the same",
+             ctx do
+          [a, b, c] = for p <- ["ifl_fa", "ifl_fb", "ifl_fc"], do: ifl_name(p)
+
+          ifl_write(ctx, [
+            "#{a},h=x v=1 1000000000",
+            "#{b},h=x v=2 1000000000",
+            "#{c},h=x v=3 1000000000",
+            "#{a},h=y v=4 2000000000"
+          ])
+
+          base = ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) |
+          either = ~s/|> filter(fn: (r) => r._measurement == "#{a}" or r._measurement == "#{c}")/
+
+          assert {:ok, rows} = ifl_flux(ctx, base <> either)
+
+          assert Enum.map(rows, &{&1["table"], &1["_measurement"], &1["h"], &1["_value"]}) ==
+                   [{0, a, "x", 1.0}, {1, a, "y", 4.0}, {2, c, "x", 3.0}]
+
+          assert {:ok, [%{"table" => 0, "_value" => 2.0}]} =
+                   ifl_flux(ctx, base <> ~s/|> filter(fn: (r) => r._measurement == "#{b}")/)
+
+          assert {:ok, []} =
+                   ifl_flux(ctx, base <> ~s/|> filter(fn: (r) => r._measurement == "nope")/)
+
+          assert {:ok, [%{"table" => 0, "_value" => 4.0}]} =
+                   ifl_flux(
+                     ctx,
+                     base <>
+                       ~s/|> filter(fn: (r) => r._measurement == "#{a}" and r.h == "y")/
+                   )
+        end
+
+        test "a field may be another type in another shard group; a read sees the earliest's",
+             ctx do
+          m = ifl_name("ifl_type")
+
+          # The first point is in the week of the epoch, the others a week later.
+          ifl_write(ctx, [
+            "#{m} v=1.5 5",
+            "#{m} v=1i 1000000000000000",
+            "#{m} v=2i 1000000000000001"
+          ])
+
+          assert {:error, %{status: 422, body: body}} =
+                   unquote(client).write(ctx.conn, "#{m} v=3i 6", database: ctx.database)
+
+          assert Jason.decode!(body) == %{
+                   "code" => "unprocessable entity",
+                   "message" => ifl_v2_drop_message(:conflict, m, 1)
+                 }
+
+          read = fn start ->
+            assert {:ok, rows} =
+                     ifl_flux(
+                       ctx,
+                       ~s|from(bucket: "#{ctx.database}") \|> range(start: #{start}, stop: 2000000) | <>
+                         ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
+                     )
+
+            Enum.map(rows, & &1["_value"])
+          end
+
+          assert read.(0) == [1.5]
+          assert read.(1_000_000) == [1, 2]
+        end
+
+        test "a quote in a tag value does not join the next line to it", ctx do
+          m = ifl_name("ifl_fq")
+          ifl_write(ctx, [~s|#{m},t=a"b f=1i 1000000000|, "#{m} f=2i 2000000000"])
+
+          assert {:ok, rows} =
+                   ifl_flux(
+                     ctx,
+                     ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) | <>
+                       ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
+                   )
+
+          assert rows |> Enum.map(&{&1["t"], &1["_value"]}) |> Enum.sort() ==
+                   [{nil, 2}, {~s|a"b|, 1}]
+        end
+
+        test "a measurement with a single escaped comma is readable under its unescaped name",
+             ctx do
+          m = ifl_name("ifl_esc")
+          ifl_write(ctx, ["#{m}\\,t=a v=1i 1000000000"])
+
+          assert {:ok, [%{"_measurement" => name, "_value" => 1}]} =
+                   ifl_flux(
+                     ctx,
+                     ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) | <>
+                       ~s|\|> filter(fn: (r) => r._measurement == "#{m},t=a")|
+                   )
+
+          assert name == "#{m},t=a"
+        end
+
+        test "a measurement whose escapes the index and the data read differently is accepted",
+             ctx do
+          for suffix <- [~S|\\,x|, ~S|\\ x|, ~S|\=x|, ~S|\"x|, ~S|\\=x|] do
+            ifl_write(ctx, ["#{ifl_name("ifl_gone")}#{suffix} v=1i 1000000000"])
+          end
+        end
+      end
+    end
+  end
+
+  defp v2_bucket_tests(client) do
+    quote do
+      describe "Bucket listing — InfluxDB 2 contract" do
         test "a listed bucket carries the engine's fields", ctx do
           name = ifl_name("ifl_bkt")
           :ok = unquote(client).create_bucket(ctx.conn, name, [])

@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local` read SQL text its tokenizer would refuse, and ignored
+  what the engine ignores.** Verified against Core 3.10.
+  - An unterminated `'...'`, `"..."`, `/* ... */` or `$$...$$` is the
+    engine's `SQL error: TokenizerError(...)` 400 naming the line and
+    column, not an answer.
+  - `-- ...` and `/* ... */` (which nest) are comments: a quote inside one
+    no longer re-pairs the quotes and drops a `WHERE`.
+  - A trailing `;` is accepted, empty statements are nothing, and two
+    statements are the engine's 405.
+  - `$$...$$` and `$tag$...$tag$` are string literals; `$a$b` is the
+    tokenizer's error, as on the engine.
+  - A literal that starts with a combining mark was compared as nothing.
+  - Identifiers in any script (`"fé"`, `é AS é2`, `count("é")`) are
+    columns; only ASCII letters fold to lower case.
+- **Parameters are bound, not substituted into the text.** A placeholder
+  is a value wherever a value may stand (comparands, `IN` and `BETWEEN`
+  items, `LIKE` and regex patterns, expression operands, `LIMIT`,
+  `OFFSET`), typed as the engine types the request's JSON: a non-negative
+  integer is a `UInt64` (`"time" > $a` with `0` is the engine's type
+  error, and an error body no longer carries a private-use character).
+  A key spelled `"$a"` no longer binds `$a`, as on the engine.
+- **`Client.Local` answers a boolean compared with another type as the
+  engine does** (`v = $p` with `true` against an integer column,
+  `v IN (1, true)`, `v BETWEEN 1 AND true`), and reports the planner's
+  first error in the engine's order: the select list's calls, operators
+  and aggregates, then `WHERE`, then `ORDER BY`, a negation last.
+- **A parameter that is a JSON object or array** is the engine's 400 from
+  `Client.Local`, with the column where its parser stops; a `Decimal` that
+  is NaN or an infinity (which has no JSON number) and a value with no JSON
+  form are `{:error, {:invalid_param, name, reason}}` from both clients
+  instead of invalid JSON or a raise.
+- **`Client.Local` line protocol now splits lines the way both engines
+  do.** Verified against Core and 2.7.
+  - A `"` in a measurement, tag key or tag value is an ordinary byte. It
+    used to join the line to the next, losing that line or rejecting the
+    write; it now opens a string only as a field value. Lines are split
+    with the engines' own `scanLine` rules.
+  - A quoted measurement keeps its quotes (`"m"` is the table `"m"`).
+  - Each engine's escape rules apply to measurements, tag keys and
+    values, and field keys. InfluxDB 2 never collapses `\\`.
+  - On InfluxDB 3, an error's `line_number` counts only the lines that
+    are not blank or comments, as on the engine.
+  - On InfluxDB 2:
+    - field types are per shard group;
+    - a partial write is reported by its earliest failing group;
+    - a measurement the engine accepts but never returns is accepted
+      and never returned.
+  - Refused by name rather than answered differently:
+    - an infinite float (`1e999`), which InfluxDB 3 stores as infinity;
+    - a repeated tag key, which InfluxDB 3 accepts and then fails every
+      query on.
+- **Flux in `Client.Local` orders rows by nanosecond.** `first()` and
+  `last()` were swapped for points less than a microsecond apart.
+  `sort()` and `group()` are refused by name.
+- **InfluxDB 2 writes in `Client.Local` were quadratic in shard groups.**
+  40k points in 40k hourly groups took 8.6 s; they now take about 0.2 s.
+
+### Changed
+- **For tests: a parameter key written as `"$name"` no longer binds.**
+  InfluxDB 3 reads a parameter's key without the `$`, and a `"$name"`
+  key binds nothing there, so a query that passed against `Client.Local`
+  failed in production. Write `params: %{name: value}` or
+  `%{"name" => value}`.
+- **`Client.Local` parses line protocol 3 to 4 times faster.** For
+  100k-line payloads:
+  - bare lines: 332 → about 130 ms;
+  - three tags and four fields: 1752 → about 540 ms.
+
+  A large payload is parsed in a short-lived process sized for its
+  result, so the caller's heap is left alone.
+- **Tests.**
+  - Fidelity tests that repeated the contract suite are gone, so each
+    fact is pinned once and runs against Local and the real engines.
+  - Tests on internal functions are driven through the public API
+    instead.
+  - The optional-dependency check walks each file's syntax tree.
+  - `test/support` compiles without warnings.
+
 ## [0.1.39] - 2026-10-01
 
 ### Fixed

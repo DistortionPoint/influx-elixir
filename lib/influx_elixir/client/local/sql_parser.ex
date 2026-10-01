@@ -1,6 +1,4 @@
 defmodule InfluxElixir.Client.Local.SQLParser do
-  @compile {:no_warn_undefined, Decimal}
-
   @moduledoc """
   SQL parser for `InfluxElixir.Client.Local`.
 
@@ -10,26 +8,42 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   cannot execute faithfully — is refused with a `Client.Local:`-prefixed 400
   so a query cannot pass tests here and fail in production.
 
+  A `$name` placeholder is read as a value wherever a value may stand and is
+  kept as a node; `bind/2` replaces the nodes with the values the engine
+  would read for them, so a parameter is data and never SQL text. The text
+  is read through `InfluxElixir.Client.Local.SQLLexer` first (comments,
+  statements, unterminated literals).
+
   Pure functions only: no ETS, no connection state.
   """
 
-  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLFunctions, SQLIdentifiers}
+  alias InfluxElixir.Client.Local.{
+    LineProtocolParser,
+    SQLError,
+    SQLFunctions,
+    SQLIdentifiers,
+    SQLLexer
+  }
 
   # The one place a SELECT is cut into its parts. A measurement name is
   # quoted, or bare with escaped spaces ("my\ measurement") — everything up
   # to the first unescaped space. `rest` is whatever follows the table.
-  @select_pattern ~r/(?i)^\s*SELECT\s+(?<distinct>DISTINCT\s+)?(?<columns>.+?)\s+FROM\s+(?:"(?<quoted>[^"]+)"|(?<bare>(?:[^\s\\]|\\.)+))\s*(?<rest>.*)$/s
+  @select_pattern ~r/(?i)^\s*SELECT\s+(?<distinct>DISTINCT\s+)?(?<columns>.+?)\s+FROM\s+(?:"(?<quoted>[^"]+)"|(?<bare>(?:[^\s\\]|\\.)+))\s*(?<rest>.*)$/su
 
   @typedoc false
   @typep split :: %{distinct: boolean(), columns: binary(), table: binary(), rest: binary()}
 
   @typedoc """
-  An arithmetic expression inside an aggregate: a field reference, a numeric
-  literal, or a binary operation over two expressions.
+  An arithmetic expression: a field reference, a literal, a `$name`
+  placeholder (`{:param, name}`, replaced by `bind/2`) or a bound
+  non-negative integer parameter (`{:uint, n}`, the engine's `UInt64`), or an
+  operation over expressions.
   """
   @type expr ::
           {:field, binary()}
-          | {:lit, number() | binary()}
+          | {:lit, number() | binary() | boolean()}
+          | {:uint, non_neg_integer()}
+          | {:param, binary()}
           | {:op, :+ | :- | :* | :/ | :rem, expr(), expr()}
           | {:neg, expr()}
           | {:cast, expr(), cast_type()}
@@ -160,16 +174,16 @@ defmodule InfluxElixir.Client.Local.SQLParser do
                          )
 
   # A call to an aggregate, or to an InfluxQL-only selector.
-  @aggregate_call ~r/(?i)(?:#{@aggregate_alternation})\s*\(/
-  @influxql_call ~r/(?i)\b(?:#{Enum.join(Map.keys(@influxql_only_functions), "|")})\s*\(/
+  @aggregate_call ~r/(?i)(?:#{@aggregate_alternation})\s*\(/u
+  @influxql_call ~r/(?i)\b(?:#{Enum.join(Map.keys(@influxql_only_functions), "|")})\s*\(/u
 
   # selector_first|last|min|max(field, time)[['value'|'time']] AS alias
-  @selector_pattern ~r/(?i)^\s*SELECTOR_(FIRST|LAST|MIN|MAX)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*(?:\[\s*'(value|time)'\s*\])?\s+AS\s+(\w+)\s*$/
+  @selector_pattern ~r/(?i)^\s*SELECTOR_(FIRST|LAST|MIN|MAX)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)\s*(?:\[\s*'(value|time)'\s*\])?\s+AS\s+(\w+)\s*$/u
 
   # first_value(field ORDER BY col [ASC|DESC]) AS alias  (and last_value).
   # The ORDER BY group is optional in the grammar so a missing one can be
   # reported specifically instead of as a generic parse failure.
-  @ordered_agg_pattern ~r/(?i)^\s*(FIRST_VALUE|LAST_VALUE)\s*\(\s*(\w+)\s*(?:ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?\s*)?\)\s+AS\s+(\w+)\s*$/
+  @ordered_agg_pattern ~r/(?i)^\s*(FIRST_VALUE|LAST_VALUE)\s*\(\s*(\w+)\s*(?:ORDER\s+BY\s+(\w+)(?:\s+(ASC|DESC))?\s*)?\)\s+AS\s+(\w+)\s*$/u
 
   @doc """
   Parses a statement — an optional `WITH` list of non-recursive CTEs followed
@@ -182,16 +196,19 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   """
   @spec parse_select(binary(), keyword()) :: {:ok, parsed_query()} | {:error, term()}
   def parse_select(sql, opts \\ []) do
-    sql =
-      if Keyword.get(opts, :identifiers, :fold) == :exact,
-        do: sql,
-        else: SQLIdentifiers.normalize(sql)
-
-    with {:ok, cte_sources, main_sql} <- split_ctes(String.trim(sql)),
+    with {:ok, text} <- SQLLexer.scrub(sql),
+         {:ok, cte_sources, main_sql} <- split_ctes(String.trim(fold_identifiers(text, opts))),
          {:ok, ctes} <- parse_ctes(cte_sources),
          {:ok, main} <- parse_single_select(main_sql) do
       {:ok, %{main | ctes: ctes}}
     end
+  end
+
+  @spec fold_identifiers(binary(), keyword()) :: binary()
+  defp fold_identifiers(sql, opts) do
+    if Keyword.get(opts, :identifiers, :fold) == :exact,
+      do: sql,
+      else: SQLIdentifiers.normalize(sql)
   end
 
   # ---------------------------------------------------------------------------
@@ -204,7 +221,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @spec split_ctes(binary()) :: {:ok, [{binary(), binary()}], binary()} | {:error, term()}
   defp split_ctes(sql) do
-    case Regex.run(~r/^WITH\s+(.*)$/is, sql) do
+    case Regex.run(~r/^WITH\s+(.*)$/isu, sql) do
       [_full, rest] -> take_ctes(rest, [], sql)
       nil -> {:ok, [], sql}
     end
@@ -213,16 +230,16 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec take_ctes(binary(), [{binary(), binary()}], binary()) ::
           {:ok, [{binary(), binary()}], binary()} | {:error, term()}
   defp take_ctes(str, acc, sql) do
-    with [_full, name, after_open] <- Regex.run(~r/^\s*(\w+)\s+AS\s*\((.*)$/is, str),
+    with [_full, name, after_open] <- Regex.run(~r/^\s*(\w+)\s+AS\s*\((.*)$/isu, str),
          {:ok, body, after_close} <- take_balanced(after_open) do
       cte = {name, String.trim(body)}
 
-      case Regex.run(~r/^\s*,(.*)$/s, after_close) do
+      case Regex.run(~r/^\s*,(.*)$/su, after_close) do
         [_full, more] -> take_ctes(more, [cte | acc], sql)
         nil -> {:ok, Enum.reverse([cte | acc]), String.trim(after_close)}
       end
     else
-      _no_match -> {:error, local_error("unsupported WITH clause: #{sql}")}
+      _no_match -> {:error, SQLError.refusal("unsupported WITH clause: #{sql}")}
     end
   end
 
@@ -272,7 +289,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp mask_quoted(<<q, q, rest::binary>>, q, width), do: mask_quoted(rest, q, width + 2)
   defp mask_quoted(<<q, rest::binary>>, q, width), do: {width, <<q>>, rest}
   defp mask_quoted(<<_byte, rest::binary>>, q, width), do: mask_quoted(rest, q, width + 1)
-  defp mask_quoted(<<>>, _q, width), do: {width, "", ""}
+  # The text reaching here has been through `SQLLexer.scrub/1`, which refuses
+  # an unterminated literal with the engine's tokenizer error; one found here
+  # is a caller that skipped it.
+  defp mask_quoted(<<>>, q, _width),
+    do: raise(ArgumentError, "unterminated #{<<q>>} literal: SQLLexer.scrub/1 must run first")
 
   # `Regex.run/2` over the masked text, with the captures cut from `text`
   # (an unmatched optional group is `""`).
@@ -329,7 +350,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # then cut to the first per distinct (a, b) after ORDER BY, before LIMIT
   # and OFFSET (verified against InfluxDB 3). The ON list is taken out of
   # the text so the rest parses as that ordinary select.
-  @distinct_on ~r/^(\s*SELECT\s+)DISTINCT\s+ON\s*\((.*)$/is
+  @distinct_on ~r/^(\s*SELECT\s+)DISTINCT\s+ON\s*\((.*)$/isu
 
   @spec split_distinct_on(binary()) :: {binary(), binary() | nil}
   defp split_distinct_on(sql) do
@@ -356,7 +377,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         {:error, _reason} -> ""
       end
 
-    if Regex.match?(@aggregate_call, select_list) or Regex.match?(~r/\bGROUP\s+BY\b/i, masked) do
+    if Regex.match?(@aggregate_call, select_list) or Regex.match?(~r/\bGROUP\s+BY\b/iu, masked) do
       {:error,
        %{
          status: 405,
@@ -384,8 +405,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       columns == [""] ->
         {:error, %{status: 400, body: "Error during planning: No `ON` expressions provided"}}
 
-      not Enum.all?(columns, &Regex.match?(~r/^(?:\w+|"[^"]+")$/, &1)) ->
-        {:error, local_error("DISTINCT ON takes column names only: (#{on})")}
+      not Enum.all?(columns, &Regex.match?(~r/^(?:\w+|"[^"]+")$/u, &1)) ->
+        {:error, SQLError.refusal("DISTINCT ON takes column names only: (#{on})")}
 
       true ->
         columns = Enum.map(columns, &String.trim(&1, "\""))
@@ -427,10 +448,10 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # What starts a LIMIT or OFFSET clause (rather than a column of that name):
   # a number, or NULL. A name after them is the engine's schema error, a
   # negative or fractional number its own, all answered by `check_limit/2`.
-  @limit_start "(?:LIMIT|OFFSET)\\s+(?:-?\\.?\\d|NULL\\b)"
+  @limit_start "(?:LIMIT|OFFSET)\\s+(?:-?\\.?[0-9]|NULL\\b|\\$)"
 
-  @group_clause ~r/(?i)(\bGROUP\s+BY\s+)(.+?)(?=\s+ORDER\b|\s+#{@limit_start}|\s*$)/s
-  @order_clause ~r/(?i)(\bORDER\s+BY\s+)(.+?)(?=\s+#{@limit_start}|\s*$)/s
+  @group_clause ~r/(?i)(\bGROUP\s+BY\s+)(.+?)(?=\s+ORDER\b|\s+#{@limit_start}|\s*$)/su
+  @order_clause ~r/(?i)(\bORDER\s+BY\s+)(.+?)(?=\s+#{@limit_start}|\s*$)/su
 
   @spec resolve_references(split(), binary()) ::
           {:ok, split(), binary()} | {:error, map()}
@@ -451,7 +472,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # {expression, output name} of one select item.
   @spec select_item(binary()) :: {binary(), binary()}
   defp select_item(item) do
-    case run_masked(~r/^(.+?)\s+AS\s+"?(\w+)"?$/is, item) do
+    case run_masked(~r/^(.+?)\s+AS\s+"?(\w+)"?$/isu, item) do
       [_full, expr, alias_name] -> {String.trim(expr), alias_name}
       nil -> {item, item}
     end
@@ -511,7 +532,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec order_term(binary(), [{binary(), binary()}]) :: {:ok, binary()} | {:error, map()}
   defp order_term(term, items) do
     {target, direction} =
-      case run_masked(~r/^(.+?)\s+(ASC|DESC)$/is, term) do
+      case run_masked(~r/^(.+?)\s+(ASC|DESC)$/isu, term) do
         [_full, target, direction] -> {target, " " <> direction}
         nil -> {term, ""}
       end
@@ -587,7 +608,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # Keywords that can follow a table name are clauses (or constructs), never an alias.
   @not_an_alias ~w(WHERE GROUP ORDER LIMIT JOIN CROSS INNER LEFT RIGHT FULL OUTER NATURAL UNION EXCEPT INTERSECT HAVING OFFSET ON USING)
 
-  @cross_join_pattern ~r/(?i)(\bFROM\s+(?:"[^"]+"|(?:[^\s\\]|\\.)+)(?:\s+(?:AS\s+)?(?!CROSS\b)\w+)?)\s+CROSS\s+JOIN\s+("[^"]+"|(?:[^\s\\]|\\.)+)(?:\s+(?:AS\s+)?(?!(?:#{Enum.join(@not_an_alias, "|")})\b)(\w+))?/
+  @cross_join_pattern ~r/(?i)(\bFROM\s+(?:"[^"]+"|(?:[^\s\\]|\\.)+)(?:\s+(?:AS\s+)?(?!CROSS\b)\w+)?)\s+CROSS\s+JOIN\s+("[^"]+"|(?:[^\s\\]|\\.)+)(?:\s+(?:AS\s+)?(?!(?:#{Enum.join(@not_an_alias, "|")})\b)(\w+))?/u
 
   @spec split_cross_join(binary()) :: {binary(), {binary(), [binary()]} | nil}
   defp split_cross_join(sql) do
@@ -610,7 +631,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # called `offset` or `over` (both fine on the engine) is not mistaken for
   # one; string literals are blanked first so `note = 'select from join'`
   # is not either.
-  @unsupported_construct ~r/(?i)\b(JOIN|UNION|EXCEPT|INTERSECT|HAVING)\b|\b(OVER)\s*\(/
+  @unsupported_construct ~r/(?i)\b(JOIN|UNION|EXCEPT|INTERSECT|HAVING)\b|\b(OVER)\s*\(/u
   @clause_keywords ~w(WHERE GROUP ORDER LIMIT OFFSET)
 
   @spec check_clauses(binary()) :: :ok | {:error, term()}
@@ -621,7 +642,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          :ok <- check_single_select(scannable, sql),
          {:ok, %{rest: rest}} <- split_select(scannable),
          :ok <- check_limit(rest, sql) do
-      [next] = Regex.run(~r/^\w*/, rest)
+      [next] = Regex.run(~r/^\w*/u, rest)
       if next == "" or String.upcase(next) in @clause_keywords, do: :ok, else: unsupported(sql)
     end
   end
@@ -634,7 +655,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
       [_full | groups] ->
         construct = groups |> Enum.reject(&(&1 == "")) |> List.first() |> String.upcase()
-        {:error, local_error("unsupported SQL construct #{construct}: #{sql}")}
+        {:error, SQLError.refusal("unsupported SQL construct #{construct}: #{sql}")}
     end
   end
 
@@ -643,25 +664,37 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # otherwise be read as a string literal.
   @spec check_single_select(binary(), binary()) :: :ok | {:error, term()}
   defp check_single_select(scannable, sql) do
-    if length(Regex.scan(~r/(?i)\bSELECT\b/, scannable)) > 1,
-      do: {:error, local_error("unsupported SQL construct SUBQUERY: #{sql}")},
+    if length(Regex.scan(~r/(?i)\bSELECT\b/u, scannable)) > 1,
+      do: {:error, SQLError.refusal("unsupported SQL construct SUBQUERY: #{sql}")},
       else: :ok
   end
 
   # `LIMIT n` and `OFFSET m`, in either order, end the statement. A clause
   # is the keyword followed by a value, so a column called `offset` (an
   # operator or keyword follows it) stays a column. The engine's answers
-  # (verified): a name is its schema error (500), a fractional number the
-  # type_coercion error naming the clause, a negative number the optimizer's
-  # error, 0 and NULL are fine. Planning comes before optimizing, and LIMIT
-  # before OFFSET; a negative OFFSET is reported by `push_down_limit` when a
-  # LIMIT is present and by `eliminate_limit` when it is not.
+  # (verified): a name is its schema error (500), a number with a fraction,
+  # a string or a boolean the type_coercion error naming the clause and the
+  # type, a negative number the optimizer's error, 0 and NULL are fine.
+  # Planning comes before optimizing, and LIMIT before OFFSET; a negative
+  # OFFSET is reported by `push_down_limit` when a LIMIT is present and by
+  # `eliminate_limit` when it is not. A `$name` is checked the same way once
+  # `bind/2` knows its value.
   @limit_keywords ~w(ASC DESC NULLS LIMIT OFFSET AND OR NOT IS IN LIKE ILIKE BETWEEN AS)
+
+  @typep limit_token ::
+           {:count, non_neg_integer()}
+           | {:negative, binary()}
+           | {:name, binary()}
+           | {:type, binary()}
+           | {:param, binary()}
+           | :null
+           | :other
+           | :not_a_clause
 
   @spec check_limit(binary(), binary()) :: :ok | {:error, term()}
   defp check_limit(rest, sql) do
     found =
-      ~r/(?i)(?<![\w.])(LIMIT|OFFSET)\s+(\S+)/
+      ~r/(?i)(?<![\w.])(LIMIT|OFFSET)\s+(\S+)/u
       |> Regex.scan(rest, return: :index)
       |> Enum.map(fn [{start, _len}, keyword, token] ->
         {start, {cut(rest, keyword) |> String.upcase(), limit_token(cut(rest, token))}}
@@ -676,24 +709,18 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  @spec limit_token(binary()) ::
-          {:count, non_neg_integer()}
-          | {:negative, binary()}
-          | {:name, binary()}
-          | :fractional
-          | :null
-          | :other
-          | :not_a_clause
+  @spec limit_token(binary()) :: limit_token()
   defp limit_token(token) do
     upper = String.upcase(token)
 
     cond do
-      Regex.match?(~r/^\d+$/, token) -> {:count, String.to_integer(token)}
-      Regex.match?(~r/^-\d+$/, token) -> {:negative, token}
-      Regex.match?(~r/^(?:\d+\.\d*|\.\d+)$/, token) -> :fractional
+      Regex.match?(~r/^[0-9]+$/u, token) -> {:count, String.to_integer(token)}
+      Regex.match?(~r/^-[0-9]+$/u, token) -> {:negative, token}
+      Regex.match?(~r/^(?:[0-9]+\.[0-9]*|\.[0-9]+)$/u, token) -> {:type, "Float64"}
       upper == "NULL" -> :null
-      upper in @limit_keywords or Regex.match?(~r/^[=<>!,)~]/, token) -> :not_a_clause
-      Regex.match?(~r/^[A-Za-z_]\w*$/, token) -> {:name, token}
+      upper in @limit_keywords or Regex.match?(~r/^[=<>!,)~]/u, token) -> :not_a_clause
+      match = Regex.run(~r/^\$(\w+)$/u, token) -> {:param, List.last(match)}
+      Regex.match?(~r/^[\p{L}_]\w*$/u, token) -> {:name, token}
       true -> :other
     end
   end
@@ -704,22 +731,28 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   defp trailing_garbage?([{start, _clause} | _more], rest) do
     tail = binary_part(rest, start, byte_size(rest) - start)
-    not Regex.match?(~r/(?i)^(?:(?:LIMIT|OFFSET)\s+\S+\s*)+$/, tail)
+    not Regex.match?(~r/(?i)^(?:(?:LIMIT|OFFSET)\s+\S+\s*)+$/u, tail)
   end
 
-  @spec limit_refusal([{binary(), term()}], boolean(), binary()) :: :ok | {:error, term()}
+  @spec limit_refusal([{binary(), limit_token()}], boolean(), binary()) ::
+          :ok | {:error, term()}
   defp limit_refusal(clauses, garbage?, sql) do
     cond do
       Enum.any?(clauses, &match?({"LIMIT", :other}, &1)) ->
-        {:error, local_error("unsupported LIMIT (a non-negative integer is required): #{sql}")}
+        {:error,
+         SQLError.refusal("unsupported LIMIT (a non-negative integer is required): #{sql}")}
 
       Enum.any?(clauses, &match?({"OFFSET", :other}, &1)) ->
         {:error,
-         local_error("unsupported LIMIT / OFFSET (non-negative integers are required): #{sql}")}
+         SQLError.refusal(
+           "unsupported LIMIT / OFFSET (non-negative integers are required): #{sql}"
+         )}
 
       garbage? or too_many_clauses?(clauses) ->
         {:error,
-         local_error("unsupported LIMIT / OFFSET (non-negative integers are required): #{sql}")}
+         SQLError.refusal(
+           "unsupported LIMIT / OFFSET (non-negative integers are required): #{sql}"
+         )}
 
       true ->
         :ok
@@ -727,28 +760,23 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   # One LIMIT and one OFFSET at most.
-  @spec too_many_clauses?([{binary(), term()}]) :: boolean()
+  @spec too_many_clauses?([{binary(), limit_token()}]) :: boolean()
   defp too_many_clauses?(clauses),
     do:
       Enum.count(clauses, &(elem(&1, 0) == "LIMIT")) > 1 or
         Enum.count(clauses, &(elem(&1, 0) == "OFFSET")) > 1
 
-  @spec limit_planning([{binary(), term()}]) :: :ok | {:error, map()}
+  @spec limit_planning([{binary(), limit_token()}]) :: :ok | {:error, map()}
   defp limit_planning(clauses) do
     case Enum.find(clauses, &match?({_keyword, {:name, _name}}, &1)) do
       {_keyword, {:name, name}} ->
         {:error, %{status: 500, body: "Schema error: No field named #{name}."}}
 
       nil ->
-        case Enum.find(clauses, &match?({_keyword, :fractional}, &1)) do
-          {keyword, :fractional} ->
+        case Enum.find(clauses, &match?({_keyword, {:type, _type}}, &1)) do
+          {keyword, {:type, type}} ->
             {:error,
-             %{
-               status: 400,
-               body:
-                 "type_coercion\ncaused by\nError during planning: Expected #{keyword} to be " <>
-                   "an integer or null, but got Float64"
-             }}
+             SQLError.coercion("Expected #{keyword} to be an integer or null, but got #{type}")}
 
           nil ->
             :ok
@@ -756,7 +784,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  @spec limit_optimizer([{binary(), term()}]) :: :ok | {:error, map()}
+  @spec limit_optimizer([{binary(), limit_token()}]) :: :ok | {:error, map()}
   defp limit_optimizer(clauses) do
     limit = Enum.find(clauses, &match?({"LIMIT", _clause}, &1))
     offset = Enum.find(clauses, &match?({"OFFSET", _clause}, &1))
@@ -787,14 +815,14 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   @spec unsupported(binary()) :: {:error, term()}
-  defp unsupported(sql), do: {:error, local_error("unsupported SQL: #{sql}")}
+  defp unsupported(sql), do: {:error, SQLError.refusal("unsupported SQL: #{sql}")}
 
   # `SELECT w.bid FROM q AS w WHERE w.provider = 'a'` — one table per query,
   # so a qualifier (the table name or its alias) adds nothing: drop the
   # alias from FROM and the `qualifier.` prefixes outside string literals.
   # A keyword after the table is a clause (or an unsupported construct that
   # `check_clauses/1` will name), never an alias.
-  @from_alias_pattern ~r/(?i)(FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+))(?:\s+(?:AS\s+)?(?!(?:#{Enum.join(@not_an_alias, "|")})\b)(\w+))?/
+  @from_alias_pattern ~r/(?i)(FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+))(?:\s+(?:AS\s+)?(?!(?:#{Enum.join(@not_an_alias, "|")})\b)(\w+))?/u
 
   @spec strip_table_qualifiers(binary(), {binary(), [binary()]} | nil) :: binary()
   defp strip_table_qualifiers(sql, cross_join) do
@@ -830,7 +858,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec drop_qualifiers(binary(), [binary()]) :: binary()
   defp drop_qualifiers(sql, qualifiers) do
     names = qualifiers |> Enum.map(&Regex.escape/1) |> Enum.join("|")
-    pattern = ~r/'(?:[^']|'')*'|"[^"]*"|(?<![\w."])(?:#{names})\.(?=\w)/
+    pattern = ~r/'(?:[^']|'')*'|"[^"]*"|(?<![\w."])(?:#{names})\.(?=\w)/u
 
     Regex.replace(pattern, sql, fn
       "'" <> _rest = literal -> literal
@@ -845,7 +873,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp aggregate_query?(sql) do
     masked = mask(sql)
 
-    Regex.match?(~r/(?i)DATE_BIN|\bGROUP\s+BY\b/, masked) or
+    Regex.match?(~r/(?i)DATE_BIN|\bGROUP\s+BY\b/u, masked) or
       Regex.match?(@aggregate_call, masked) or Regex.match?(@influxql_call, masked)
   end
 
@@ -855,7 +883,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     with {:ok, columns} <- parse_select_list(split.columns),
          {:ok, interval_ns} <- resolve_aggregate_interval(sql),
          :ok <- check_select_date_bins(split.columns, interval_ns),
-         {:ok, where} <- parse_where(rest),
+         {:ok, where} <- where_nodes(rest),
          :ok <- reject_expr_order(parse_order_by(rest)) do
       {:ok,
        new_query(measurement, where, rest,
@@ -906,7 +934,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   @spec date_bin_item?(binary()) :: boolean()
-  defp date_bin_item?(item), do: Regex.match?(~r/^DATE_BIN\s*\(/i, item)
+  defp date_bin_item?(item), do: Regex.match?(~r/^DATE_BIN\s*\(/iu, item)
 
   # The bare-column GROUP BY items, or nil when there are none.
   @spec parse_group_by_columns(binary()) :: [binary()] | nil
@@ -948,7 +976,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     |> Enum.reduce_while(:ok, fn interval, :ok ->
       case parse_interval(interval) do
         {:ok, ns} when ns == group_interval -> {:cont, :ok}
-        {:ok, _ns} -> {:halt, {:error, local_error(@date_bin_mismatch <> columns)}}
+        {:ok, _ns} -> {:halt, {:error, SQLError.refusal(@date_bin_mismatch <> columns)}}
         {:error, _reason} = error -> {:halt, error}
       end
     end)
@@ -956,7 +984,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @spec date_bin_interval(binary()) :: [binary()]
   defp date_bin_interval(column) do
-    case run_masked(~r/(?i)DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'/, column) do
+    case run_masked(~r/(?i)DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'/u, column) do
       [_full, interval] -> [interval]
       nil -> []
     end
@@ -1011,7 +1039,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # A constant in the select list (`0.0 AS volume`, `'x' AS label`) needs an
   # alias: DataFusion names an unaliased one after its own rendering
   # (`Int64(1)`), which the double will not guess.
-  @constant_column ~r/^\s*(-?\d+(?:\.\d+)?|'(?:[^']|'')*')\s+AS\s+(\w+)\s*$/i
+  @constant_column ~r/^\s*(-?[0-9]+(?:\.[0-9]+)?|'(?:[^']|'')*'|\$\w+)\s+AS\s+(\w+)\s*$/iu
 
   @spec parse_single_column(binary()) ::
           {:ok, select_column()} | {:error, term()}
@@ -1019,30 +1047,30 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     masked = mask(col)
 
     cond do
-      String.match?(masked, ~r/(?i)DATE_BIN\s*\(/) ->
+      String.match?(masked, ~r/(?i)DATE_BIN\s*\(/u) ->
         parse_date_bin_column(col)
 
-      String.match?(masked, ~r/(?i)\b(FIRST_VALUE|LAST_VALUE)\s*\(/) ->
+      String.match?(masked, ~r/(?i)\b(FIRST_VALUE|LAST_VALUE)\s*\(/u) ->
         parse_ordered_agg_column(col)
 
-      String.match?(masked, ~r/(?i)\bSELECTOR_(FIRST|LAST|MIN|MAX)\s*\(/) ->
+      String.match?(masked, ~r/(?i)\bSELECTOR_(FIRST|LAST|MIN|MAX)\s*\(/u) ->
         parse_selector_column(col)
 
       match = Regex.run(@influxql_call, masked) ->
         {:error, invalid_function(hd(match))}
 
-      String.match?(masked, ~r/(?i)\b(?:#{@plain_alternation})\s*\(/) ->
+      String.match?(masked, ~r/(?i)\b(?:#{@plain_alternation})\s*\(/u) ->
         parse_agg_column(col)
 
       match = Regex.run(@constant_column, col) ->
         [_full, literal, alias_name] = match
         {:ok, {:constant, parse_where_value(literal), alias_name}}
 
-      String.match?(col, ~r/^\s*\w+(\s+AS\s+\w+)?\s*$/i) ->
+      String.match?(col, ~r/^\s*\w+(\s+AS\s+\w+)?\s*$/iu) ->
         parse_grouping_column(col)
 
       true ->
-        {:error, local_error("unsupported column expression: #{col}")}
+        {:error, SQLError.refusal("unsupported column expression: #{col}")}
     end
   end
 
@@ -1051,7 +1079,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # double names one, always the same.
   @spec invalid_function(binary()) :: map()
   defp invalid_function(call) do
-    name = call |> String.replace(~r/\s*\($/, "") |> String.downcase()
+    name = call |> String.replace(~r/\s*\($/u, "") |> String.downcase()
 
     %{
       status: 400,
@@ -1080,14 +1108,14 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
       [_full, func, _field, "", _direction, _alias] ->
         {:error,
-         local_error(
+         SQLError.refusal(
            "#{func}() needs ORDER BY inside the call: InfluxDB v3 returns an " <>
              "arbitrary row from the group without one, which this test double " <>
              "cannot reproduce. Write #{func}(field ORDER BY time): #{col}"
          )}
 
       _no_match ->
-        {:error, local_error("invalid aggregate: #{col}")}
+        {:error, SQLError.refusal("invalid aggregate: #{col}")}
     end
   end
 
@@ -1105,10 +1133,10 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_grouping_column(binary()) ::
           {:ok, select_column()} | {:error, term()}
   defp parse_grouping_column(col) do
-    case Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/i, String.trim(col)) do
+    case Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+))?$/iu, String.trim(col)) do
       [_full, name] -> {:ok, {:grouping_column, name, name}}
       [_full, name, alias_name] -> {:ok, {:grouping_column, name, alias_name}}
-      _no_match -> {:error, local_error("invalid column: #{col}")}
+      _no_match -> {:error, SQLError.refusal("invalid column: #{col}")}
     end
   end
 
@@ -1117,14 +1145,14 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           {:ok, select_column()} | {:error, term()}
   defp parse_date_bin_column(col) do
     pattern =
-      ~r/(?i)DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)\s+AS\s+(\w+)/
+      ~r/(?i)DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)\s+AS\s+(\w+)/u
 
     case Regex.run(pattern, col) do
       [_full, _interval, alias_name] ->
         {:ok, {:time_bucket, alias_name}}
 
       _no_match ->
-        {:error, local_error("invalid DATE_BIN: #{col}")}
+        {:error, SQLError.refusal("invalid DATE_BIN: #{col}")}
     end
   end
 
@@ -1136,10 +1164,10 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           {:ok, select_column()} | {:error, term()}
   defp parse_agg_column(col) do
     count_star =
-      ~r/(?i)^\s*COUNT\s*\(\s*\*\s*\)\s+AS\s+(\w+)\s*$/
+      ~r/(?i)^\s*COUNT\s*\(\s*\*\s*\)\s+AS\s+(\w+)\s*$/u
 
     count_distinct =
-      ~r/(?i)^\s*COUNT\s*\(\s*DISTINCT\s+(\w+)\s*\)\s+AS\s+(\w+)\s*$/
+      ~r/(?i)^\s*COUNT\s*\(\s*DISTINCT\s+(\w+)\s*\)\s+AS\s+(\w+)\s*$/u
 
     cond do
       error = time_aggregate_error(col) ->
@@ -1164,7 +1192,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_agg_column_arg(binary()) ::
           {:ok, select_column()} | {:error, term()}
   defp parse_agg_column_arg(col) do
-    one_arg = ~r/(?i)^\s*(#{@plain_alternation})\s*\((.+)\)\s+AS\s+(\w+)\s*$/s
+    one_arg = ~r/(?i)^\s*(#{@plain_alternation})\s*\((.+)\)\s+AS\s+(\w+)\s*$/su
 
     with [_full, func, expr_str, alias_name] <- Regex.run(one_arg, col),
          {:ok, expr} <- parse_expr(expr_str),
@@ -1173,7 +1201,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       {:ok, {:aggregate, agg, expr, alias_name}}
     else
       {:error, %{status: 400}} = error -> error
-      _no_match -> {:error, local_error("invalid aggregate: #{col}")}
+      _no_match -> {:error, SQLError.refusal("invalid aggregate: #{col}")}
     end
   end
 
@@ -1190,7 +1218,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp check_time_argument(_agg, expr, col) do
     if expr == {:field, "time"} do
       {:error,
-       local_error(
+       SQLError.refusal(
          "InfluxDB rejects this aggregate over `time` (Timestamp): only " <>
            "MIN(time), MAX(time) and COUNT(time) are valid: #{col}"
        )}
@@ -1206,7 +1234,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec time_aggregate_error(binary()) :: map() | nil
   defp time_aggregate_error(col) do
     with [_full, func] <-
-           Regex.run(~r/(?i)^\s*(#{@plain_alternation})\s*\(\s*time\s*\)/, col),
+           Regex.run(~r/(?i)^\s*(#{@plain_alternation})\s*\(\s*time\s*\)/u, col),
          agg when agg not in [:min, :max, :count] <-
            Map.fetch!(@plain_aggregates, String.downcase(func)) do
       name = Atom.to_string(agg)
@@ -1261,7 +1289,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
       _no_match ->
         {:error,
-         local_error(
+         SQLError.refusal(
            "selector functions are supported as " <>
              "selector_first|last|min|max(field, time)[['value' | 'time']] AS alias: #{col}"
          )}
@@ -1282,10 +1310,10 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # type as the engine's planner does.
   # ---------------------------------------------------------------------------
 
-  @expr_token ~r/\s*(?:(\d+\.\d+|\d+)|(\w+)|([()+\-*\/%,]))/
+  @expr_token ~r/\s*(?:([0-9]+\.[0-9]+|[0-9]+)|\$(\w+)|(\w+)|([()+\-*\/%,]))/u
 
   # `col::INTEGER` is DataFusion's shorthand for `CAST(col AS INTEGER)`.
-  @shorthand_cast ~r/(\w+)::(\w+)/
+  @shorthand_cast ~r/(\w+)::(\w+)/u
 
   @doc false
   @spec parse_expr(binary()) :: {:ok, expr()} | {:error, term()}
@@ -1309,19 +1337,24 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     consumed =
       matches |> Enum.map(fn [full | _groups] -> byte_size(String.trim(full)) end) |> Enum.sum()
 
-    if consumed == byte_size(String.replace(str, ~r/\s/, "")) do
+    if consumed == byte_size(String.replace(str, ~r/\s/u, "")) do
       {:ok, Enum.map(matches, &expr_token/1)}
     else
       {:error, :unexpected_character}
     end
   end
 
+  # A match's groups are a number, a `$name`, an identifier or an operator;
+  # the groups after the last one that matched are not in the list.
   @spec expr_token([binary()]) :: term()
-  defp expr_token([_full, num, "", ""]), do: {:lit, coerce_value(num)}
-  defp expr_token([_full, "", ident, ""]), do: {:field, ident}
-  defp expr_token([_full, "", "", op]), do: {:tok, op}
-  defp expr_token([_full, "", ident]), do: {:field, ident}
-  defp expr_token([_full, num]), do: {:lit, coerce_value(num)}
+  defp expr_token([_full | groups]) do
+    case groups ++ List.duplicate("", 4 - length(groups)) do
+      [num, "", "", ""] when num != "" -> {:lit, coerce_value(num)}
+      ["", name, "", ""] when name != "" -> {:param, name}
+      ["", "", ident, ""] when ident != "" -> {:field, ident}
+      ["", "", "", op] -> {:tok, op}
+    end
+  end
 
   @spec parse_sum([term()]) :: {:ok, expr(), [term()]} | {:error, term()}
   defp parse_sum(tokens) do
@@ -1367,6 +1400,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   defp parse_factor([{:lit, _value} = lit | rest]), do: {:ok, lit, rest}
+  defp parse_factor([{:param, _name} = param | rest]), do: {:ok, param, rest}
 
   # CAST(expr AS type): the tokens are `CAST`, `(`, the expression, `AS`,
   # the type name and `)`.
@@ -1437,18 +1471,18 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           {:ok, pos_integer()} | {:error, term()}
   defp parse_group_by_interval(item) do
     pattern =
-      ~r/(?i)^DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)$/
+      ~r/(?i)^DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)$/u
 
     case Regex.run(pattern, item) do
       [_full, interval_str] -> parse_interval(interval_str)
-      _no_match -> {:error, local_error("missing GROUP BY DATE_BIN")}
+      _no_match -> {:error, SQLError.refusal("missing GROUP BY DATE_BIN")}
     end
   end
 
   # Convert "N unit" → nanoseconds
   @spec parse_interval(binary()) :: {:ok, pos_integer()} | {:error, term()}
   defp parse_interval(interval_str) do
-    case Regex.run(~r/^\s*(\d+)\s+(\w+)\s*$/, interval_str) do
+    case Regex.run(~r/^\s*([0-9]+)\s+(\w+)\s*$/u, interval_str) do
       [_full, n_str, unit] ->
         {n, ""} = Integer.parse(n_str)
         multiplier = interval_unit_to_ns(String.downcase(unit))
@@ -1456,11 +1490,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         if multiplier do
           {:ok, n * multiplier}
         else
-          {:error, local_error("unknown interval unit: #{unit}")}
+          {:error, SQLError.refusal("unknown interval unit: #{unit}")}
         end
 
       _no_match ->
-        {:error, local_error("invalid interval: #{interval_str}")}
+        {:error, SQLError.refusal("invalid interval: #{interval_str}")}
     end
   end
 
@@ -1489,11 +1523,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       columns == "" ->
         build_distinct_query([], table, rest)
 
-      Regex.match?(~r/^\w+(\s*,\s*\w+)*$/, columns) ->
+      Regex.match?(~r/^\w+(\s*,\s*\w+)*$/u, columns) ->
         build_distinct_query(split_columns(columns), table, rest)
 
       true ->
-        {:error, local_error("unsupported DISTINCT query: #{sql}")}
+        {:error, SQLError.refusal("unsupported DISTINCT query: #{sql}")}
     end
   end
 
@@ -1534,6 +1568,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec expr_columns(expr()) :: [binary()]
   defp expr_columns({:field, name}), do: [name]
   defp expr_columns({:lit, _value}), do: []
+  defp expr_columns({:uint, _value}), do: []
+  defp expr_columns({:param, _name}), do: []
   defp expr_columns({:neg, inner}), do: expr_columns(inner)
   defp expr_columns({:cast, inner, _type}), do: expr_columns(inner)
   defp expr_columns({:op, _op, left, right}), do: expr_columns(left) ++ expr_columns(right)
@@ -1543,14 +1579,16 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec reject_expr_order(order_by()) :: :ok | {:error, term()}
   defp reject_expr_order(order_by) do
     if Enum.any?(order_by, &match?({{:expr, _expr}, _direction}, &1)),
-      do: {:error, local_error("ORDER BY an expression is not supported in an aggregate query")},
+      do:
+        {:error,
+         SQLError.refusal("ORDER BY an expression is not supported in an aggregate query")},
       else: :ok
   end
 
   @spec build_distinct_query([binary()], binary(), binary()) ::
           {:ok, parsed_query()} | {:error, map()}
   defp build_distinct_query(columns, measurement, rest) do
-    with {:ok, where} <- parse_where(rest),
+    with {:ok, where} <- where_nodes(rest),
          {:ok, order_by} <- parse_distinct_order_by(columns, measurement, rest) do
       {:ok, new_query(measurement, where, rest, order_by: order_by, distinct_columns: columns)}
     end
@@ -1559,7 +1597,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec build_star_query(binary(), binary()) ::
           {:ok, parsed_query()} | {:error, map()}
   defp build_star_query(measurement, rest) do
-    with {:ok, where} <- parse_where(rest) do
+    with {:ok, where} <- where_nodes(rest) do
       {:ok, new_query(measurement, where, rest, [])}
     end
   end
@@ -1568,7 +1606,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           {:ok, parsed_query()} | {:error, term()}
   defp build_columns_query(columns_str, measurement, rest) do
     with {:ok, projection} <- parse_projection_columns(columns_str),
-         {:ok, where} <- parse_where(rest) do
+         {:ok, where} <- where_nodes(rest) do
       {:ok, new_query(measurement, where, rest, projection_columns: projection)}
     end
   end
@@ -1600,37 +1638,53 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     cond do
       match = Regex.run(@constant_column, trimmed) ->
         [_full, literal, alias_name] = match
-        {:ok, {{:lit, parse_where_value(literal)}, alias_name}}
+        {:ok, {literal_expr(literal), alias_name}}
 
-      Regex.match?(~r/^(?:-?\d+(?:\.\d+)?|'[^']*')$/, trimmed) ->
-        {:error, local_error("unsupported column (a constant needs AS alias): #{col}")}
+      Regex.match?(~r/^(?:-?[0-9]+(?:\.[0-9]+)?|'[^']*'|\$\w+)$/u, trimmed) ->
+        {:error, SQLError.refusal("unsupported column (a constant needs AS alias): #{col}")}
 
       # A quoted alias keeps a name that needs its quotes (`AS "The Host"`).
-      match = Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+|"[^"]+"))?$/i, trimmed) ->
+      match = Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+|"[^"]+"))?$/iu, trimmed) ->
         case match do
           [_full, name] -> {:ok, {name, name}}
           [_full, name, alias_name] -> {:ok, {name, String.trim(alias_name, "\"")}}
         end
 
-      match = Regex.run(~r/^(.+?)\s+AS\s+(\w+|"[^"]+")$/is, trimmed) ->
+      match = Regex.run(~r/^(.+?)\s+AS\s+(\w+|"[^"]+")$/isu, trimmed) ->
         [_full, expr_str, alias_name] = match
 
         case parse_expr(expr_str) do
           {:ok, expr} -> {:ok, {expr, String.trim(alias_name, "\"")}}
-          {:error, _reason} -> {:error, local_error("unsupported column: #{col}")}
+          {:error, _reason} -> {:error, SQLError.refusal("unsupported column: #{col}")}
         end
 
       true ->
-        {:error, local_error("unsupported column (an expression needs AS alias): #{col}")}
+        {:error, SQLError.refusal("unsupported column (an expression needs AS alias): #{col}")}
     end
   end
 
-  @doc "Parses the `WHERE ...` clause (if any) out of the text after `FROM <table>`."
+  @doc """
+  Parses the `WHERE ...` clause (if any) out of the text after `FROM <table>`,
+  for a statement that binds no parameters (`DELETE`, InfluxQL). A `$name`
+  in it is the engine's unbound-placeholder error.
+  """
   @spec parse_where(binary()) ::
           {:ok, [where_node()]} | {:error, map()}
   def parse_where(rest) do
+    if String.trim(rest) == "" do
+      {:ok, []}
+    else
+      with {:ok, text} <- SQLLexer.scrub(rest),
+           {:ok, nodes} <- where_nodes(text) do
+        bind_where(nodes, %{})
+      end
+    end
+  end
+
+  @spec where_nodes(binary()) :: {:ok, [where_node()]} | {:error, map()}
+  defp where_nodes(rest) do
     case run_masked(
-           ~r/(?i)WHERE\s+(.+?)(?:\s+GROUP\b|\s+ORDER\b|\s+#{@limit_start}|$)/s,
+           ~r/(?i)WHERE\s+(.+?)(?:\s+GROUP\b|\s+ORDER\b|\s+#{@limit_start}|$)/su,
            rest
          ) do
       [_full_match, clauses_str] -> parse_where_clauses(clauses_str)
@@ -1656,7 +1710,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          {:ok, conj, []} <- where_or(tokens) do
       {:ok, conj}
     else
-      {:ok, _conj, _leftover} -> {:error, local_error("unsupported WHERE clause: #{str}")}
+      {:ok, _conj, _leftover} -> {:error, SQLError.refusal("unsupported WHERE clause: #{str}")}
       {:error, _reason} = error -> error
     end
   end
@@ -1679,7 +1733,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp scan_where(<<q, rest::binary>>, state) when q in [?', ?"] do
     case take_literal(rest, q, []) do
       {:ok, literal, after_quote} -> scan_where(after_quote, append(state, <<q>> <> literal))
-      :error -> {:error, local_error("unterminated string literal in WHERE: #{rest}")}
+      :error -> {:error, SQLError.refusal("unterminated string literal in WHERE: #{rest}")}
     end
   end
 
@@ -1699,7 +1753,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     do: scan_where(rest, %{append(state, ")") | depth: state.depth - 1})
 
   defp scan_where(str, %{depth: 0} = state) do
-    case {word_boundary?(state.buf), Regex.run(~r/^(AND|OR|NOT)(?=\s|\(|$)/i, str)} do
+    case {word_boundary?(state.buf), Regex.run(~r/^(AND|OR|NOT)(?=\s|\(|$)/iu, str)} do
       {true, [keyword, _word]} ->
         rest = binary_part(str, byte_size(keyword), byte_size(str) - byte_size(keyword))
         scan_keyword(String.upcase(keyword), rest, state)
@@ -1746,7 +1800,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec append(map(), binary()) :: map()
   defp append(state, text) do
     buf = state.buf <> text
-    between = state.between or Regex.match?(~r/\bBETWEEN\s*$/i, buf)
+    between = state.between or Regex.match?(~r/\bBETWEEN\s*$/iu, buf)
     %{state | buf: buf, between: between}
   end
 
@@ -1796,7 +1850,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp where_factor([:lparen | rest]) do
     case where_or(rest) do
       {:ok, conj, [:rparen | rest]} -> {:ok, conj, rest}
-      {:ok, _conj, _rest} -> {:error, local_error("unbalanced parenthesis in WHERE")}
+      {:ok, _conj, _rest} -> {:error, SQLError.refusal("unbalanced parenthesis in WHERE")}
       {:error, _reason} = error -> error
     end
   end
@@ -1812,7 +1866,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  defp where_factor(_tokens), do: {:error, local_error("unsupported WHERE clause")}
+  defp where_factor(_tokens), do: {:error, SQLError.refusal("unsupported WHERE clause")}
 
   # ---------------------------------------------------------------------------
   # Predicates
@@ -1824,91 +1878,146 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # The left side of these is a column or an expression (`abs(x) IS NULL`,
   # `price * 2 IN (...)`); a match whose left side is neither (the words
   # inside a string literal, say) is not one of them.
-  @not_in_pattern ~r/^(.+?)\s+NOT\s+IN\s*\((.*)\)\s*$/is
-  @in_pattern ~r/^(.+?)\s+IN\s*\((.*)\)\s*$/is
-  @is_not_null_pattern ~r/^(.+?)\s+IS\s+NOT\s+NULL$/is
-  @is_null_pattern ~r/^(.+?)\s+IS\s+NULL$/is
-  @between_pattern ~r/^(.+?)\s+(NOT\s+)?BETWEEN\s+(.+?)\s+AND\s+(.+)$/is
-  @like_pattern ~r/^(.+?)\s+(NOT\s+)?(I?LIKE)\s+'(.*)'$/is
-  @regex_pattern ~r/^(.+?)\s*(!?~\*?)\s*'(.*)'$/s
+  @not_in_pattern ~r/^(.+?)\s+NOT\s+IN\s*\((.*)\)\s*$/isu
+  @in_pattern ~r/^(.+?)\s+IN\s*\((.*)\)\s*$/isu
+  @is_not_null_pattern ~r/^(.+?)\s+IS\s+NOT\s+NULL$/isu
+  @is_null_pattern ~r/^(.+?)\s+IS\s+NULL$/isu
+  @between_pattern ~r/^(.+?)\s+(NOT\s+)?BETWEEN\s+(.+?)\s+AND\s+(.+)$/isu
+  @like_pattern ~r/^(.+?)\s+(NOT\s+)?(I?LIKE)\s+'(.*)'$/isu
+  @like_param_pattern ~r/^(.+?)\s+(NOT\s+)?(I?LIKE)\s+\$(\w+)$/isu
+  @regex_pattern ~r/^(.+?)\s*(!?~\*?)\s*'(.*)'$/su
+  @regex_param_pattern ~r/^(.+?)\s*(!?~\*?)\s*\$(\w+)$/su
 
   @spec parse_single_where_clause(binary()) ::
           {:ok, where_clause() | :always | :never} | {:error, map()}
   defp parse_single_where_clause(clause) do
     trimmed = String.trim(clause)
 
+    with :nomatch <- null_predicate(trimmed),
+         :nomatch <- list_predicate(trimmed),
+         :nomatch <- between_predicate(trimmed),
+         :nomatch <- pattern_predicate(trimmed),
+         :nomatch <- constant_predicate(trimmed),
+         :nomatch <- column_predicate(trimmed) do
+      parse_binary_where_clause(trimmed)
+    end
+  end
+
+  @spec null_predicate(binary()) :: {:ok, where_clause()} | :nomatch
+  defp null_predicate(text) do
     cond do
-      match = operand_match(@is_not_null_pattern, trimmed) ->
+      match = operand_match(@is_not_null_pattern, text) ->
         [key] = match
         {:ok, {:is_not_null, key, nil}}
 
-      match = operand_match(@is_null_pattern, trimmed) ->
+      match = operand_match(@is_null_pattern, text) ->
         [key] = match
         {:ok, {:is_null, key, nil}}
 
-      match = operand_match(@not_in_pattern, trimmed) ->
-        [key, list_str] = match
-        with {:ok, values} <- parse_in_values(key, list_str), do: {:ok, {:not_in, key, values}}
+      true ->
+        :nomatch
+    end
+  end
 
-      match = operand_match(@in_pattern, trimmed) ->
-        [key, list_str] = match
-        with {:ok, values} <- parse_in_values(key, list_str), do: {:ok, {:in, key, values}}
+  @spec list_predicate(binary()) :: {:ok, where_clause()} | {:error, map()} | :nomatch
+  defp list_predicate(text) do
+    cond do
+      match = operand_match(@not_in_pattern, text) -> in_clause(:not_in, match)
+      match = operand_match(@in_pattern, text) -> in_clause(:in, match)
+      true -> :nomatch
+    end
+  end
 
-      match = run_masked(@between_pattern, trimmed) ->
-        [_full, left, negated, low, high] = match
+  @spec in_clause(:in | :not_in, [term()]) :: {:ok, where_clause()} | {:error, map()}
+  defp in_clause(op, [key, list_str]) do
+    with {:ok, values} <- parse_in_values(key, list_str), do: {:ok, {op, key, values}}
+  end
 
+  @spec between_predicate(binary()) :: {:ok, where_clause()} | {:error, map()} | :nomatch
+  defp between_predicate(text) do
+    case run_masked(@between_pattern, text) do
+      [_full, left, negated, low, high] ->
         with {:ok, operand} <- parse_operand(String.trim(left)),
              do: parse_between(operand, negated != "", String.trim(low), String.trim(high))
 
-      match = run_masked(@like_pattern, trimmed) ->
-        [_full, left, negated, kind, pattern] = match
-
-        with {:ok, operand} <- parse_operand(String.trim(left)),
-             do:
-               {:ok,
-                {like_op(negated != ""), operand,
-                 like_regex(unescape_literal(pattern), String.upcase(kind) == "ILIKE")}}
-
-      match = run_masked(@regex_pattern, trimmed) ->
-        [_full, left, op, pattern] = match
-
-        with {:ok, operand} <- parse_operand(String.trim(left)),
-             {:ok, regex} <- compile_sql_regex(unescape_literal(pattern), op) do
-          {:ok, {regex_op(op), operand, {regex, op}}}
-        end
-
-      constant = constant_predicate(trimmed) ->
-        constant
-
-      # A bare column is a boolean predicate (`WHERE b`, `NOT b`).
-      Regex.match?(~r/^[A-Za-z_]\w*$/, trimmed) and
-          String.upcase(trimmed) not in ~w(TRUE FALSE NULL) ->
-        {:ok, {:truthy, trimmed, nil}}
-
-      true ->
-        parse_binary_where_clause(trimmed)
+      nil ->
+        :nomatch
     end
+  end
+
+  # LIKE, ILIKE and the regex operators, against a literal pattern or a
+  # `$name` whose pattern `bind/2` compiles.
+  @spec pattern_predicate(binary()) :: {:ok, where_clause()} | {:error, map()} | :nomatch
+  defp pattern_predicate(text) do
+    cond do
+      match = run_masked(@like_pattern, text) -> like_clause(match)
+      match = run_masked(@like_param_pattern, text) -> like_param_clause(match)
+      match = run_masked(@regex_pattern, text) -> regex_clause(match)
+      match = run_masked(@regex_param_pattern, text) -> regex_param_clause(match)
+      true -> :nomatch
+    end
+  end
+
+  @spec like_clause([binary()]) :: {:ok, where_clause()} | {:error, map()}
+  defp like_clause([_full, left, negated, kind, pattern]) do
+    with {:ok, operand} <- parse_operand(String.trim(left)) do
+      regex = like_regex(unescape_literal(pattern), String.upcase(kind) == "ILIKE")
+      {:ok, {like_op(negated != ""), operand, regex}}
+    end
+  end
+
+  @spec like_param_clause([binary()]) :: {:ok, where_clause()} | {:error, map()}
+  defp like_param_clause([_full, left, negated, kind, name]) do
+    with {:ok, operand} <- parse_operand(String.trim(left)) do
+      {:ok,
+       {like_op(negated != ""), operand, {:like_param, name, String.upcase(kind) == "ILIKE"}}}
+    end
+  end
+
+  @spec regex_clause([binary()]) :: {:ok, where_clause()} | {:error, map()}
+  defp regex_clause([_full, left, op, pattern]) do
+    with {:ok, operand} <- parse_operand(String.trim(left)),
+         {:ok, regex} <- compile_sql_regex(unescape_literal(pattern), op) do
+      {:ok, {regex_op(op), operand, {regex, op}}}
+    end
+  end
+
+  @spec regex_param_clause([binary()]) :: {:ok, where_clause()} | {:error, map()}
+  defp regex_param_clause([_full, left, op, name]) do
+    with {:ok, operand} <- parse_operand(String.trim(left)) do
+      {:ok, {regex_op(op), operand, {:regex_param, name, op}}}
+    end
+  end
+
+  # A bare column is a boolean predicate (`WHERE b`, `NOT b`).
+  @spec column_predicate(binary()) :: {:ok, where_clause()} | :nomatch
+  defp column_predicate(text) do
+    if Regex.match?(~r/^[\p{L}_]\w*$/u, text) and String.upcase(text) not in ~w(TRUE FALSE NULL),
+      do: {:ok, {:truthy, text, nil}},
+      else: :nomatch
   end
 
   # `WHERE true` and `WHERE false` are conditions that hold for every row or
   # none. Any other lone literal is not a boolean, which the engine's
   # planner refuses (verified), naming the literal in its own rendering.
-  @spec constant_predicate(binary()) :: {:ok, :always | :never} | {:error, map()} | nil
+  @spec constant_predicate(binary()) :: {:ok, :always | :never} | {:error, map()} | :nomatch
   defp constant_predicate(text) do
     cond do
       String.upcase(text) == "TRUE" -> {:ok, :always}
       String.upcase(text) == "FALSE" -> {:ok, :never}
-      Regex.match?(~r/^-?\d+$/, text) -> non_boolean_filter("Int64(#{text})", "Int64")
+      Regex.match?(~r/^-?[0-9]+$/u, text) -> non_boolean_filter("Int64(#{text})", "Int64")
       match?({_float, ""}, parse_float(text)) -> float_filter(text)
       quoted?(text) -> non_boolean_filter(~s|Utf8("#{literal_body(text)}")|, "Utf8")
-      true -> nil
+      true -> :nomatch
     end
   end
 
+  @float_literal ~r/^-?(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+(?:\.[0-9]*)?[eE][+-]?[0-9]+)$/u
+
   @spec parse_float(binary()) :: {float(), binary()} | :error
   defp parse_float(text) do
-    if Regex.match?(~r/^-?(?:\d+\.\d*|\.\d+|\d+(?:\.\d*)?[eE][+-]?\d+)$/, text),
-      do: text |> String.replace(~r/^(-?)\./, "\\g{1}0.") |> Float.parse(),
+    if Regex.match?(@float_literal, text),
+      do: text |> String.replace(~r/^(-?)\./u, "\\g{1}0.") |> Float.parse(),
       else: :error
   end
 
@@ -1927,12 +2036,9 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec non_boolean_filter(binary(), binary()) :: {:error, map()}
   defp non_boolean_filter(expression, type) do
     {:error,
-     %{
-       status: 400,
-       body:
-         "Error during planning: Cannot create filter with non-boolean predicate " <>
-           "'#{expression}' returning #{type}"
-     }}
+     SQLError.planning(
+       "Cannot create filter with non-boolean predicate '#{expression}' returning #{type}"
+     )}
   end
 
   # The pattern's captures, cut from the unmasked text, with the first parsed
@@ -1950,19 +2056,57 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @spec parse_between(operand(), boolean(), binary(), binary()) ::
           {:ok, where_clause()} | {:error, map()}
+  defp parse_between("time", negated, low, high) do
+    op = if negated, do: :not_between, else: :between
+    low = time_bound(parse_time_comparand(low))
+    high = time_bound(parse_time_comparand(high))
+
+    if param_bound?(low) or param_bound?(high),
+      do: {:ok, {op, "time", {low, high}}},
+      else: finish_time_between(op, low, high)
+  end
+
   defp parse_between(operand, negated, low, high) do
     op = if negated, do: :not_between, else: :between
+    {:ok, {op, operand, {between_bound(low), between_bound(high)}}}
+  end
 
-    if operand == "time" do
-      case {parse_time_comparand(low), parse_time_comparand(high)} do
-        {{:ok, lo}, {:ok, hi}} -> {:ok, {op, "time", {lo, hi}}}
-        {{:error, {:number, type}}, _high} -> {:error, between_type_error(type)}
-        {_low, {:error, {:number, type}}} -> {:error, between_type_error(type)}
-        {{:error, error}, _high} -> {:error, error}
-        {_low, {:error, error}} -> {:error, error}
-      end
-    else
-      {:ok, {op, operand, {between_bound(low), between_bound(high)}}}
+  # What a `time` comparand is once read: nanoseconds or a `now()` offset,
+  # a `$name` still to bind, a bare number of the given type (an error once
+  # the clause is known) or the refusal of an unreadable one.
+  @typep time_bound ::
+           integer()
+           | {:now, integer()}
+           | {:param, binary()}
+           | {:param, binary(), :left}
+           | {:number, binary()}
+           | {:invalid, map()}
+
+  @typep time_comparand ::
+           {:ok, integer() | {:now, integer()} | {:param, binary()}}
+           | {:error, map() | {:number, binary()}}
+
+  @spec time_bound(time_comparand()) :: time_bound()
+  defp time_bound({:ok, value}), do: value
+  defp time_bound({:error, {:number, type}}), do: {:number, type}
+  defp time_bound({:error, error}), do: {:invalid, error}
+
+  @spec param_bound?(term()) :: boolean()
+  defp param_bound?({:param, _name}), do: true
+  defp param_bound?({:param, _name, :left}), do: true
+  defp param_bound?(_bound), do: false
+
+  # A bare number fails the BETWEEN, naming the first bound that has one; an
+  # unreadable bound comes after.
+  @spec finish_time_between(:between | :not_between, time_bound(), time_bound()) ::
+          {:ok, where_clause()} | {:error, map()}
+  defp finish_time_between(op, low, high) do
+    case {low, high} do
+      {{:number, type}, _high} -> {:error, SQLError.between_coercion("Timestamp(ns)", type)}
+      {_low, {:number, type}} -> {:error, SQLError.between_coercion("Timestamp(ns)", type)}
+      {{:invalid, error}, _high} -> {:error, error}
+      {_low, {:invalid, error}} -> {:error, error}
+      {low, high} -> {:ok, {op, "time", {low, high}}}
     end
   end
 
@@ -2035,9 +2179,9 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp parse_binary_where_clause(trimmed) do
     # The first operator outside a string literal, the two-character ones
     # before their one-character prefixes.
-    case Regex.run(~r/>=|<=|!=|<>|>|<|=/, mask(trimmed), return: :index) do
+    case Regex.run(~r/>=|<=|!=|<>|>|<|=/u, mask(trimmed), return: :index) do
       nil ->
-        {:error, local_error("unsupported WHERE clause: #{trimmed}")}
+        {:error, SQLError.refusal("unsupported WHERE clause: #{trimmed}")}
 
       [{start, length}] ->
         text = binary_part(trimmed, start, length)
@@ -2065,17 +2209,17 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   # A literal on the left (`1 < abs(x)`, `'2024-01-01' <= time`) is the
-  # same comparison turned around. It was read as a column named `1`:
-  # the engine's schema error, for a query the engine answers.
+  # same comparison turned around, and a `$name` there is kept as standing
+  # on the left, for the engine's wording of a type error.
   defp comparison_clause(text, left, "time", trimmed) do
     op = Map.fetch!(@comparison_operators, text)
 
-    with true <- literal?(left),
+    with true <- literal?(left) or param?(left),
          {:ok, value} <- parse_time_comparand(left) do
-      {:ok, {mirror(op), "time", value}}
+      {:ok, {mirror(op), "time", on_the_left(value)}}
     else
       {:error, {:number, type}} -> {:error, comparison_type_error(type, text, "Timestamp(ns)")}
-      false -> {:error, local_error("unsupported WHERE clause: #{trimmed}")}
+      false -> {:error, SQLError.refusal("unsupported WHERE clause: #{trimmed}")}
       {:error, _reason} = error -> error
     end
   end
@@ -2085,8 +2229,40 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
     cond do
       literal?(left) and literal?(right) -> constant_comparison(op, left, right, trimmed)
-      literal?(left) -> comparison(mirror(op), right, left)
+      param?(left) and (param?(right) or literal?(right)) -> unsupported_where(trimmed)
+      literal?(left) and param?(right) -> unsupported_where(trimmed)
+      literal?(left) or param?(left) -> turned_around(mirror(op), right, left, trimmed)
       true -> comparison(op, left, right)
+    end
+  end
+
+  @spec on_the_left(term()) :: term()
+  defp on_the_left({:param, name}), do: {:param, name, :left}
+  defp on_the_left(value), do: value
+
+  @spec unsupported_where(binary()) :: {:error, map()}
+  defp unsupported_where(text),
+    do: {:error, SQLError.refusal("unsupported WHERE clause: #{text}")}
+
+  # The column is the comparison's left side. The engine words a type error
+  # in the order the sides are written, which a boolean turned around would
+  # lose, so it is refused by name.
+  @spec turned_around(where_op(), binary(), binary(), binary()) ::
+          {:ok, where_clause()} | {:error, map()}
+  defp turned_around(_op, _operand, value, trimmed) when value in ["true", "false"] do
+    {:error,
+     SQLError.refusal(
+       "a boolean on the left of a comparison is outside the double's subset; " <>
+         "write the column first: #{trimmed}"
+     )}
+  end
+
+  defp turned_around(op, operand, value, _trimmed) do
+    with {:ok, left} <- parse_operand(operand) do
+      case param_name(value) do
+        nil -> with {:ok, comparand} <- parse_comparand(value), do: {:ok, {op, left, comparand}}
+        name -> {:ok, {op, left, {:param, name, :left}}}
+      end
     end
   end
 
@@ -2096,12 +2272,12 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec constant_comparison(where_op(), binary(), binary(), binary()) ::
           {:ok, :always | :never} | {:error, map()}
   defp constant_comparison(op, left, right, trimmed) do
-    {l, r} = {parse_where_value(strip_unsigned(left)), parse_where_value(strip_unsigned(right))}
+    {l, r} = {parse_where_value(left), parse_where_value(right)}
 
     if (is_number(l) and is_number(r)) or (is_binary(l) and is_binary(r)) or
          (is_boolean(l) and is_boolean(r)),
        do: {:ok, if(compare_constants(op, l, r), do: :always, else: :never)},
-       else: {:error, local_error("unsupported WHERE clause: #{trimmed}")}
+       else: unsupported_where(trimmed)
   end
 
   @spec compare_constants(where_op(), term(), term()) :: boolean()
@@ -2120,9 +2296,19 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   @spec literal?(binary()) :: boolean()
-  defp literal?(text) do
-    text = strip_unsigned(text)
-    quoted?(text) or text in ["true", "false"] or is_number(coerce_value(text))
+  defp literal?(text),
+    do: quoted?(text) or text in ["true", "false"] or is_number(coerce_value(text))
+
+  # `$name` is a placeholder; a name is word characters in any script.
+  @spec param?(binary()) :: boolean()
+  defp param?(text), do: param_name(text) != nil
+
+  @spec param_name(binary()) :: binary() | nil
+  defp param_name(text) do
+    case Regex.run(~r/\A\$(\w+)\z/u, text) do
+      [_full, name] -> name
+      nil -> nil
+    end
   end
 
   @spec mirror(where_op()) :: where_op()
@@ -2137,7 +2323,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_operand(binary()) :: {:ok, operand()} | {:error, map()}
   defp parse_operand(text) do
     cond do
-      Regex.match?(~r/^\w+$/, text) ->
+      Regex.match?(~r/^\w+$/u, text) ->
         {:ok, text}
 
       match?({:ok, _expr}, parse_expr(text)) ->
@@ -2145,12 +2331,13 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         {:ok, {:expr, expr}}
 
       true ->
-        {:error, local_error("unsupported WHERE clause: #{text}")}
+        unsupported_where(text)
     end
   end
 
-  # The right side is a literal, or an expression over columns and literals.
-  # A bare word is a column reference, as in SQL — never a string.
+  # The right side is a literal, a `$name`, or an expression over columns
+  # and literals. A bare word is a column reference, as in SQL — never a
+  # string.
   @spec parse_comparand(binary()) :: {:ok, term()} | {:error, map()}
   defp parse_comparand(text) do
     cond do
@@ -2163,12 +2350,15 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       is_number(coerce_value(text)) ->
         {:ok, coerce_value(text)}
 
+      param?(text) ->
+        {:ok, {:param, param_name(text)}}
+
       match?({:ok, _expr}, parse_expr(text)) ->
         {:ok, expr} = parse_expr(text)
         {:ok, {:expr, expr}}
 
       true ->
-        {:error, local_error("unsupported WHERE clause: #{text}")}
+        unsupported_where(text)
     end
   end
 
@@ -2201,71 +2391,67 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  # A bare number among the items fails the whole list, which the engine
-  # words with every item's type, a string being `Utf8`.
-  @spec parse_time_set([binary()]) :: {:ok, [term()]} | {:error, map()}
+  @spec parse_time_set([binary()]) :: {:ok, [time_bound()]} | {:error, map()}
   defp parse_time_set(items) do
-    parsed = Enum.map(items, &parse_time_comparand/1)
+    bounds = Enum.map(items, &time_bound(parse_time_comparand(&1)))
+    if Enum.any?(bounds, &param_bound?/1), do: {:ok, bounds}, else: finish_time_set(bounds)
+  end
 
-    if Enum.any?(parsed, &match?({:error, {:number, _type}}, &1)) do
-      types =
-        Enum.map(parsed, fn
-          {:error, {:number, type}} -> type
-          _other -> "Utf8"
-        end)
+  # A bare number among the items fails the whole list, which the engine
+  # words with every item's type, a string being `Utf8`; an unreadable item
+  # comes after.
+  @spec finish_time_set([time_bound()]) :: {:ok, [time_bound()]} | {:error, map()}
+  defp finish_time_set(bounds) do
+    cond do
+      Enum.any?(bounds, &match?({:number, _type}, &1)) ->
+        types =
+          Enum.map(bounds, fn
+            {:number, type} -> type
+            _other -> "Utf8"
+          end)
 
-      {:error,
-       coercion_error(
-         "Can not find compatible types to compare Timestamp(ns) with [#{Enum.join(types, ", ")}]"
-       )}
-    else
-      parsed
-      |> Enum.find(&match?({:error, _reason}, &1))
-      |> case do
-        nil -> {:ok, Enum.map(parsed, fn {:ok, value} -> value end)}
-        {:error, _reason} = error -> error
-      end
+        {:error,
+         SQLError.coercion(
+           "Can not find compatible types to compare Timestamp(ns) with [#{Enum.join(types, ", ")}]"
+         )}
+
+      invalid = Enum.find(bounds, &match?({:invalid, _error}, &1)) ->
+        {:invalid, error} = invalid
+        {:error, error}
+
+      true ->
+        {:ok, bounds}
     end
   end
 
   # What the engine accepts as a `time` comparand: a quoted ISO-8601
   # datetime (zoned or not, optional fraction), a quoted date (midnight
-  # UTC), or `now()` offset by `+`/`-` `INTERVAL 'N unit'` terms. DataFusion
-  # fails planning for a bare number (`{:error, {:number, type}}` here, for
-  # the caller to word as its clause does) and fails execution for any
-  # other string ("Error parsing timestamp"), so those are refused here
-  # instead of silently matching no rows.
-  @now_pattern ~r/^now\(\)((?:\s*[+-]\s*INTERVAL\s*'[^']*')*)$/i
-  @interval_term ~r/([+-])\s*INTERVAL\s*'([^']*)'/i
+  # UTC), `now()` offset by `+`/`-` `INTERVAL 'N unit'` terms, or a `$name`
+  # holding such a string. DataFusion fails planning for a bare number
+  # (`{:error, {:number, type}}` here, for the caller to word as its clause
+  # does) and fails execution for any other string ("Error parsing
+  # timestamp"), so those are refused here instead of silently matching no
+  # rows.
+  @now_pattern ~r/^now\(\)((?:\s*[+-]\s*INTERVAL\s*'[^']*')*)$/iu
+  @interval_term ~r/([+-])\s*INTERVAL\s*'([^']*)'/iu
 
   @spec parse_time_comparand(binary()) ::
-          {:ok, time_value()} | {:error, map() | {:number, binary()}}
+          time_comparand()
   defp parse_time_comparand(str) do
     cond do
       quoted?(str) -> parse_time_literal(literal_body(str), str)
       match = Regex.run(@now_pattern, str) -> parse_now_offset(match)
+      param?(str) -> {:ok, {:param, param_name(str)}}
       type = number_type(str) -> {:error, {:number, type}}
       true -> {:error, invalid_time_error(str)}
     end
   end
 
-  # A parameter's integer is `UInt64` to the engine when it is not negative
-  # (it arrives as JSON), a literal's `Int64`. `resolve_params/2` marks the
-  # former where it stands beside `time`, and this is the one place that
-  # reads the mark.
-  @unsigned "\u{E000}"
-
-  @spec strip_unsigned(binary()) :: binary()
-  defp strip_unsigned(@unsigned <> text), do: text
-  defp strip_unsigned(text), do: text
-
   @spec number_type(binary()) :: binary() | nil
-  defp number_type(str) do
-    text = strip_unsigned(str)
-
+  defp number_type(text) do
     cond do
-      Regex.match?(~r/^-?\d+$/, text) -> if str == text, do: "Int64", else: "UInt64"
-      Regex.match?(~r/^-?(?:\d+\.\d*|\.\d+|\d+(?:\.\d*)?[eE][+-]?\d+)$/, text) -> "Float64"
+      Regex.match?(~r/^-?[0-9]+$/u, text) -> "Int64"
+      Regex.match?(@float_literal, text) -> "Float64"
       true -> nil
     end
   end
@@ -2274,39 +2460,24 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp comparison_type_error(left, operator, right) do
     operator = if operator == "<>", do: "!=", else: operator
 
-    coercion_error(
+    SQLError.coercion(
       "Cannot infer common argument type for comparison operation #{left} #{operator} #{right}"
     )
   end
 
-  @spec between_type_error(binary()) :: map()
-  defp between_type_error(type) do
-    %{
-      status: 500,
-      body:
-        "type_coercion\ncaused by\nInternal error: Failed to coerce types Timestamp(ns) and " <>
-          "#{type} in BETWEEN expression.\nThis issue was likely caused by a bug in " <>
-          "DataFusion's code. Please help us to resolve this by filing a bug report in our " <>
-          "issue tracker: https://github.com/apache/datafusion/issues"
-    }
-  end
-
-  @spec coercion_error(binary()) :: map()
-  defp coercion_error(message),
-    do: %{status: 400, body: "type_coercion\ncaused by\nError during planning: " <> message}
-
   # One literal, not two joined by an operator: `'a'`, `"a"`, and not `'a' = 'b'`.
   @spec quoted?(binary()) :: boolean()
-  defp quoted?(str), do: Regex.match?(~r/\A(?:'x*'|"x*")\z/, mask(str))
+  defp quoted?(str), do: Regex.match?(~r/\A(?:'x*'|"x*")\z/u, mask(str))
 
-  # The text between a literal's quotes, with a doubled quote one quote.
+  # The text between a literal's quotes, with a doubled quote one quote. The
+  # quotes are one byte each, so the cut is by bytes, as every offset here is.
   @spec literal_body(binary()) :: binary()
-  defp literal_body(str), do: str |> String.slice(1..-2//1) |> unescape_literal()
+  defp literal_body(str), do: str |> binary_part(1, byte_size(str) - 2) |> unescape_literal()
 
-  @spec parse_time_literal(binary(), binary()) :: {:ok, integer()} | {:error, map()}
   # Elixir's calendar types stop at microseconds, so fraction digits seven
   # to nine are split off and added back as nanoseconds: the engine compares
   # '...:20.0000002Z' exactly (verified), and so must the double.
+  @spec parse_time_literal(binary(), binary()) :: {:ok, integer()} | {:error, map()}
   defp parse_time_literal(literal, original) do
     {literal, extra_ns} = split_sub_microseconds(literal)
 
@@ -2319,7 +2490,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  @sub_microsecond ~r/^(?<head>.*T\d{2}:\d{2}:\d{2}\.\d{6})(?<sub>\d{1,3})\d*(?<zone>Z|[+-]\d{2}:?\d{2})?$/
+  @sub_microsecond ~r/^(?<head>.*T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6})(?<sub>[0-9]{1,3})[0-9]*(?<zone>Z|[+-][0-9]{2}:?[0-9]{2})?$/u
 
   @spec split_sub_microseconds(binary()) :: {binary(), non_neg_integer()}
   defp split_sub_microseconds(literal) do
@@ -2375,12 +2546,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end)
   end
 
-  @spec invalid_time_error(binary()) :: %{status: 400, body: binary()}
+  @spec invalid_time_error(binary()) :: SQLError.t()
   defp invalid_time_error(str) do
-    local_error(
+    SQLError.refusal(
       "InfluxDB rejects this `time` comparand (a Timestamp compares only with an " <>
-        "ISO-8601 string or now() +/- INTERVAL 'N unit', never a bare integer): " <>
-        strip_unsigned(str)
+        "ISO-8601 string or now() +/- INTERVAL 'N unit', never a bare integer): " <> str
     )
   end
 
@@ -2391,17 +2561,20 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_where_value(binary()) :: term()
   defp parse_where_value(str) do
     cond do
-      quoted?(str) ->
-        literal_body(str)
+      quoted?(str) -> literal_body(str)
+      str == "true" -> true
+      str == "false" -> false
+      name = param_name(str) -> {:param, name}
+      true -> coerce_value(str)
+    end
+  end
 
-      str == "true" ->
-        true
-
-      str == "false" ->
-        false
-
-      true ->
-        coerce_value(str)
+  # A constant in a select list as an expression: a literal, or a `$name`.
+  @spec literal_expr(binary()) :: expr()
+  defp literal_expr(text) do
+    case parse_where_value(text) do
+      {:param, _name} = param -> param
+      value -> {:lit, value}
     end
   end
 
@@ -2428,7 +2601,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # target the expression parser cannot read is left as a column name so
   # the schema check names it.
   defp parse_order_by(rest) do
-    case run_masked(~r/(?i)ORDER\s+BY\s+(.+?)\s*(?:\b#{@limit_start}.*)?$/s, rest) do
+    case run_masked(~r/(?i)ORDER\s+BY\s+(.+?)\s*(?:\b#{@limit_start}.*)?$/su, rest) do
       [_full_match, list] ->
         list
         |> split_top_level_commas()
@@ -2446,7 +2619,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # last ascending and first descending (verified); the direction then
   # stays a bare atom and the executor applies that default.
   defp parse_order_term(term) do
-    case run_masked(~r/^(.+?)(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?$/is, term) do
+    case run_masked(~r/^(.+?)(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?$/isu, term) do
       [_full, target] ->
         {order_target(String.trim(target)), :asc}
 
@@ -2462,7 +2635,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @spec order_target(binary()) :: binary() | {:expr, expr()}
   defp order_target(target) do
-    if Regex.match?(~r/^\w+$/, target) do
+    if Regex.match?(~r/^\w+$/u, target) do
       target
     else
       case parse_expr(target) do
@@ -2477,124 +2650,378 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     if String.upcase(direction) == "DESC", do: :desc, else: :asc
   end
 
-  @spec parse_limit(binary()) :: non_neg_integer() | nil
-  defp parse_limit(rest), do: clause_count(~r/(?i)(?<![\w.])LIMIT\s+(\d+)/s, rest)
+  @spec parse_limit(binary()) :: non_neg_integer() | {:param, binary()} | nil
+  defp parse_limit(rest), do: clause_count(~r/(?i)(?<![\w.])LIMIT\s+(?:([0-9]+)|\$(\w+))/su, rest)
 
-  @spec parse_offset(binary()) :: non_neg_integer() | nil
-  defp parse_offset(rest), do: clause_count(~r/(?i)(?<![\w.])OFFSET\s+(\d+)/s, rest)
+  @spec parse_offset(binary()) :: non_neg_integer() | {:param, binary()} | nil
+  defp parse_offset(rest),
+    do: clause_count(~r/(?i)(?<![\w.])OFFSET\s+(?:([0-9]+)|\$(\w+))/su, rest)
 
-  @spec clause_count(Regex.t(), binary()) :: non_neg_integer() | nil
+  @spec clause_count(Regex.t(), binary()) :: non_neg_integer() | {:param, binary()} | nil
   defp clause_count(pattern, rest) do
     case Regex.run(pattern, mask(rest)) do
       [_full_match, n_str] -> String.to_integer(n_str)
+      [_full_match, "", name] -> {:param, name}
       _no_match -> nil
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # Parameters
+  #
+  # A `$name` is read as a value wherever a value may stand: a comparand, an
+  # item of an IN list, a bound of BETWEEN, a LIKE or regex pattern, an
+  # operand of an expression, a select-list constant, LIMIT or OFFSET. The
+  # parser keeps it as a node and `bind/2` replaces the node with the value
+  # the engine would read for it from the request's JSON: a non-negative
+  # integer is a `UInt64` (`{:uint, n}`), any other integer an `Int64`, a
+  # float a `Float64`, a string a `Utf8`; text is never substituted, so a
+  # value is data whatever it contains.
+  # ---------------------------------------------------------------------------
+
+  @comparison_ops [:eq, :ne, :gt, :lt, :gte, :lte]
+
   @doc """
-  The first `$name` placeholder left in `sql` after substitution, or `nil`.
-  String literals are ignored: a substituted value that happens to contain
-  `$` is text.
+  Binds a parsed query's `$name` placeholders to `params`, whose values are
+  what the engine reads from the request (see
+  `InfluxElixir.Client.QueryParams.engine_values/1`).
+
+  A placeholder with no value is the engine's planning error; a value the
+  placeholder's place cannot take is the engine's error for it: a `time`
+  compared with a number is a type error naming the number's type (`UInt64`
+  for a non-negative integer), `LIMIT` takes an integer or null. A query
+  without placeholders is returned as it is. Only the query's own clauses
+  are bound, not its CTEs.
   """
-  @spec unbound_placeholder(binary()) :: binary() | nil
-  def unbound_placeholder(sql) do
-    case Regex.run(~r/\$\w+/, mask(sql)) do
-      [name] -> name
-      nil -> nil
+  @spec bind(parsed_query(), %{binary() => term()}) ::
+          {:ok, parsed_query()} | {:error, map()}
+  def bind(query, params) do
+    parts = [
+      query.projection_columns,
+      query.select_columns,
+      query.where,
+      query.order_by,
+      query.limit,
+      query.offset
+    ]
+
+    case placeholders(parts) do
+      [] ->
+        {:ok, query}
+
+      names ->
+        with :ok <- all_bound(names, params),
+             {:ok, where} <- bind_where_nodes(query.where, params),
+             {:ok, limit, offset} <- bind_limits(query.limit, query.offset, params) do
+          {:ok,
+           %{
+             query
+             | where: where,
+               projection_columns: bind_projection(query.projection_columns, params),
+               select_columns: bind_select_columns(query.select_columns, params),
+               order_by: bind_order_by(query.order_by, params),
+               limit: limit,
+               offset: offset
+           }}
+        end
     end
   end
 
-  @doc """
-  Substitutes `$name` placeholders with SQL literals built from `params`.
+  @spec bind_where([where_node()], %{binary() => term()}) ::
+          {:ok, [where_node()]} | {:error, map()}
+  defp bind_where(nodes, params) do
+    with :ok <- all_bound(placeholders(nodes), params), do: bind_where_nodes(nodes, params)
+  end
 
-  A value is only ever data: a string becomes one quoted literal, its own
-  quotes doubled, so `"x' OR 1 = 1 OR name = 'y"` is a (never matching)
-  string and not a condition. Placeholders inside the query's own string
-  literals are left as they are.
-  """
-  @spec resolve_params(binary(), map()) :: binary()
-  def resolve_params(sql, params) when map_size(params) == 0, do: sql
+  # Every `$name` in a term, in order.
+  @spec placeholders(term()) :: [binary()]
+  defp placeholders(terms) when is_list(terms), do: Enum.flat_map(terms, &placeholders/1)
+  defp placeholders({:param, name}) when is_binary(name), do: [name]
+  defp placeholders({:param, name, :left}) when is_binary(name), do: [name]
+  defp placeholders({:like_param, name, _case_insensitive}), do: [name]
+  defp placeholders({:regex_param, name, _op}), do: [name]
+  defp placeholders(%{__struct__: _module}), do: []
+  defp placeholders(term) when is_tuple(term), do: term |> Tuple.to_list() |> placeholders()
+  defp placeholders(_other), do: []
 
-  # One pass over the SQL, whole placeholders only: a sequential
-  # String.replace/3 per param rewrote `$a` inside `$ab` and could
-  # re-substitute inside an already-substituted value.
-  def resolve_params(sql, params) do
-    lookup = Map.new(params, fn {key, value} -> {normalize_param_key(key), value} end)
+  @spec all_bound([binary()], %{binary() => term()}) :: :ok | {:error, map()}
+  defp all_bound(names, params) do
+    Enum.find_value(names, :ok, fn name ->
+      case Map.fetch(params, name) do
+        {:ok, value} when is_map(value) or is_list(value) ->
+          {:error, SQLError.refusal("the parameter $#{name} is a JSON object or array")}
 
-    ~r/'(?:[^']|'')*'|"[^"]*"|\$\w+/
-    |> Regex.scan(sql, return: :index)
-    |> Enum.reduce({0, []}, fn [{start, length}], {from, acc} ->
-      kept = binary_part(sql, from, start - from)
-      token = binary_part(sql, start, length)
-      {start + length, [substitute(token, lookup, sql, start, length), kept | acc]}
-    end)
-    |> then(fn {from, acc} ->
-      [binary_part(sql, from, byte_size(sql) - from) | acc]
-      |> Enum.reverse()
-      |> IO.iodata_to_binary()
+        {:ok, _scalar} ->
+          nil
+
+        :error ->
+          {:error, SQLError.planning("No value found for placeholder with name $#{name}")}
+      end
     end)
   end
 
-  @spec substitute(binary(), map(), binary(), non_neg_integer(), non_neg_integer()) :: binary()
-  defp substitute("$" <> _name = placeholder, lookup, sql, start, length) do
-    case Map.fetch(lookup, placeholder) do
-      {:ok, value} -> param_literal(value, sql, start, length)
-      :error -> placeholder
+  @spec map_ok([term()], (term() -> {:ok, term()} | {:error, map()})) ::
+          {:ok, [term()]} | {:error, map()}
+  defp map_ok(items, fun) do
+    items
+    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+      case fun.(item) do
+        {:ok, value} -> {:cont, {:ok, [value | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      {:error, _reason} = error -> error
     end
   end
 
-  defp substitute(quoted, _lookup, _sql, _start, _length), do: quoted
+  @spec bind_where_nodes([where_node()], %{binary() => term()}) ::
+          {:ok, [where_node()]} | {:error, map()}
+  defp bind_where_nodes(nodes, params), do: map_ok(nodes, &bind_node(&1, params))
 
-  @spec normalize_param_key(atom() | binary()) :: binary()
-  defp normalize_param_key(key) when is_atom(key), do: "$#{key}"
-  defp normalize_param_key("$" <> _rest = key), do: key
-  defp normalize_param_key(key) when is_binary(key), do: "$#{key}"
-
-  # A non-negative integer standing in a comparison with `time` is marked
-  # `UInt64` (see `number_type/1`); everywhere else it is a plain literal.
-  @spec param_literal(term(), binary(), non_neg_integer(), non_neg_integer()) :: binary()
-  defp param_literal(value, sql, start, length) when is_integer(value) and value >= 0 do
-    before = binary_part(sql, 0, start)
-    after_text = binary_part(sql, start + length, byte_size(sql) - start - length)
-    literal = Integer.to_string(value)
-    if beside_time?(before, after_text), do: @unsigned <> literal, else: literal
+  @spec bind_node(where_node(), %{binary() => term()}) :: {:ok, where_node()} | {:error, map()}
+  defp bind_node({:or, branches}, params) do
+    with {:ok, bound} <- map_ok(branches, &bind_where_nodes(&1, params)),
+         do: {:ok, {:or, bound}}
   end
 
-  defp param_literal(value, _sql, _start, _length), do: to_sql_literal(value)
-
-  @spec beside_time?(binary(), binary()) :: boolean()
-  defp beside_time?(before, after_text) do
-    Regex.match?(~r/(?i)\btime\s*(?:<=|>=|<>|!=|=|<|>)\s*\z/, before) or
-      Regex.match?(~r/(?i)\btime\s+(?:NOT\s+)?IN\s*\((?:[^()]*,)?\s*\z/, before) or
-      Regex.match?(~r/(?i)\btime\s+(?:NOT\s+)?BETWEEN\s+(?:\S+\s+AND\s+)?\z/, before) or
-      Regex.match?(~r/(?i)\A\s*(?:<=|>=|<>|!=|=|<|>)\s*time\b/, after_text)
+  defp bind_node({:not, nodes}, params) do
+    with {:ok, bound} <- bind_where_nodes(nodes, params), do: {:ok, {:not, bound}}
   end
 
-  # Calendar params render as the ISO-8601 strings Jason sends over HTTP, so
-  # `time >= $start` with a DateTime behaves the same on both clients.
-  @spec to_sql_literal(term()) :: binary()
-  # `decimal` is an optional dependency: matching `%Decimal{}` would need
-  # the struct at compile time, and the library failed to compile in a
-  # project without it (verified). A Decimal is bound as the JSON number
-  # Client.HTTP sends.
-  defp to_sql_literal(%{__struct__: Decimal} = value), do: Decimal.to_string(value, :normal)
-  defp to_sql_literal(%DateTime{} = value), do: quote_text(DateTime.to_iso8601(value))
-  defp to_sql_literal(%NaiveDateTime{} = value), do: quote_text(NaiveDateTime.to_iso8601(value))
-  defp to_sql_literal(%Date{} = value), do: quote_text(Date.to_iso8601(value))
-  defp to_sql_literal(value) when is_binary(value), do: quote_text(value)
-  defp to_sql_literal(value) when is_integer(value), do: Integer.to_string(value)
-  defp to_sql_literal(value) when is_float(value), do: Float.to_string(value)
-  defp to_sql_literal(true), do: "true"
-  defp to_sql_literal(false), do: "false"
-  # Jason sends nil as JSON null; `col = NULL` is never true on the engine.
-  defp to_sql_literal(nil), do: "NULL"
-  defp to_sql_literal(value), do: value |> inspect() |> quote_text()
+  defp bind_node({op, "time", {low, high}}, params) when op in [:between, :not_between],
+    do: finish_time_between(op, resolve_time(low, params), resolve_time(high, params))
+
+  defp bind_node({op, "time", items}, params) when op in [:in, :not_in] do
+    with {:ok, bounds} <- finish_time_set(Enum.map(items, &resolve_time(&1, params))),
+         do: {:ok, {op, "time", bounds}}
+  end
+
+  defp bind_node({op, "time", value}, params) when op in @comparison_ops,
+    do: bind_time_comparison(op, value, params)
+
+  defp bind_node({op, left, {:like_param, name, case_insensitive}}, params)
+       when op in [:like, :not_like] do
+    with {:ok, pattern} <- pattern_param(Map.fetch!(params, name), "LIKE") do
+      {:ok, {op, bind_operand(left, params), like_regex(pattern, case_insensitive)}}
+    end
+  end
+
+  defp bind_node({op, left, {:regex_param, name, symbol}}, params)
+       when op in [:regex, :not_regex] do
+    with {:ok, pattern} <- pattern_param(Map.fetch!(params, name), "regex"),
+         {:ok, regex} <- compile_sql_regex(pattern, symbol) do
+      {:ok, {op, bind_operand(left, params), {regex, symbol}}}
+    end
+  end
+
+  defp bind_node({op, left, right}, params) when op in @comparison_ops do
+    with {:ok, value} <- bind_comparand(right, params),
+         do: {:ok, {op, bind_operand(left, params), value}}
+  end
+
+  defp bind_node({op, left, values}, params) when op in [:in, :not_in] do
+    with {:ok, bound} <- map_ok(values, &bind_comparand(&1, params)),
+         do: {:ok, {op, bind_operand(left, params), bound}}
+  end
+
+  defp bind_node({op, left, {low, high}}, params) when op in [:between, :not_between] do
+    with {:ok, low} <- bind_comparand(low, params),
+         {:ok, high} <- bind_comparand(high, params),
+         do: {:ok, {op, bind_operand(left, params), {low, high}}}
+  end
+
+  defp bind_node({op, left, right}, params), do: {:ok, {op, bind_operand(left, params), right}}
+
+  @spec bind_operand(operand(), %{binary() => term()}) :: operand()
+  defp bind_operand({:expr, expr}, params), do: {:expr, bind_expr(expr, params)}
+  defp bind_operand(column, _params), do: column
+
+  # A value on the right of a comparison, or in a list or a BETWEEN. A
+  # boolean turned around (`$p = col`) is refused: the engine words a type
+  # error in the order the sides are written.
+  @spec bind_comparand(term(), %{binary() => term()}) :: {:ok, term()} | {:error, map()}
+  defp bind_comparand({:param, name}, params), do: {:ok, comparand(Map.fetch!(params, name))}
+
+  defp bind_comparand({:param, name, :left}, params) do
+    case Map.fetch!(params, name) do
+      value when is_boolean(value) ->
+        {:error,
+         SQLError.refusal(
+           "a boolean parameter on the left of a comparison is outside the double's " <>
+             "subset; write the column first: $#{name}"
+         )}
+
+      value ->
+        {:ok, comparand(value)}
+    end
+  end
+
+  defp bind_comparand({:expr, expr}, params), do: {:ok, {:expr, bind_expr(expr, params)}}
+  defp bind_comparand(value, _params), do: {:ok, value}
+
+  @spec comparand(term()) :: term()
+  defp comparand(value) when is_integer(value) and value >= 0, do: {:uint, value}
+  defp comparand(value), do: value
+
+  @spec bind_expr(expr(), %{binary() => term()}) :: expr()
+  defp bind_expr({:param, name}, params), do: param_expr(Map.fetch!(params, name))
+
+  defp bind_expr({:op, op, left, right}, params),
+    do: {:op, op, bind_expr(left, params), bind_expr(right, params)}
+
+  defp bind_expr({:neg, inner}, params), do: {:neg, bind_expr(inner, params)}
+  defp bind_expr({:cast, inner, type}, params), do: {:cast, bind_expr(inner, params), type}
+
+  defp bind_expr({:call, function, args}, params),
+    do: {:call, function, Enum.map(args, &bind_expr(&1, params))}
+
+  defp bind_expr(expr, _params), do: expr
+
+  @spec param_expr(term()) :: expr()
+  defp param_expr(value) when is_integer(value) and value >= 0, do: {:uint, value}
+  defp param_expr(value), do: {:lit, value}
+
+  @spec bind_projection([projection()] | nil, %{binary() => term()}) :: [projection()] | nil
+  defp bind_projection(nil, _params), do: nil
+
+  defp bind_projection(projection, params) do
+    Enum.map(projection, fn
+      {source, output} when is_binary(source) -> {source, output}
+      {expr, output} -> {bind_expr(expr, params), output}
+    end)
+  end
+
+  @spec bind_select_columns([select_column()] | nil, %{binary() => term()}) ::
+          [select_column()] | nil
+  defp bind_select_columns(nil, _params), do: nil
+
+  defp bind_select_columns(columns, params) do
+    Enum.map(columns, fn
+      {:aggregate, agg, expr, output} -> {:aggregate, agg, bind_expr(expr, params), output}
+      {:constant, {:param, name}, output} -> {:constant, Map.fetch!(params, name), output}
+      column -> column
+    end)
+  end
+
+  @spec bind_order_by(order_by(), %{binary() => term()}) :: order_by()
+  defp bind_order_by(order_by, params) do
+    Enum.map(order_by, fn
+      {{:expr, expr}, direction} -> {{:expr, bind_expr(expr, params)}, direction}
+      term -> term
+    end)
+  end
+
+  # A pattern is a string; the engine words the error for another type with
+  # the column's type too, which is not known here.
+  @spec pattern_param(term(), binary()) :: {:ok, binary()} | {:error, map()}
+  defp pattern_param(value, _kind) when is_binary(value), do: {:ok, value}
+
+  defp pattern_param(_value, kind),
+    do: {:error, SQLError.refusal("a #{kind} pattern parameter must be a string")}
+
+  # `time` against a parameter: a string is an instant, a number or a
+  # boolean is the engine's type error.
+  @spec bind_time_comparison(where_op(), term(), %{binary() => term()}) ::
+          {:ok, where_clause()} | {:error, map()}
+  defp bind_time_comparison(op, {:param, name}, params) do
+    case time_param(Map.fetch!(params, name)) do
+      {:number, type} ->
+        {:error, comparison_type_error("Timestamp(ns)", comparison_symbol(op), type)}
+
+      {:invalid, error} ->
+        {:error, error}
+
+      ns ->
+        {:ok, {op, "time", ns}}
+    end
+  end
+
+  defp bind_time_comparison(op, {:param, name, :left}, params) do
+    case time_param(Map.fetch!(params, name)) do
+      {:number, type} ->
+        {:error, comparison_type_error(type, comparison_symbol(mirror(op)), "Timestamp(ns)")}
+
+      {:invalid, error} ->
+        {:error, error}
+
+      ns ->
+        {:ok, {op, "time", ns}}
+    end
+  end
+
+  defp bind_time_comparison(op, value, _params), do: {:ok, {op, "time", value}}
+
+  @spec resolve_time(time_bound(), %{binary() => term()}) :: time_bound()
+  defp resolve_time({:param, name}, params), do: time_param(Map.fetch!(params, name))
+  defp resolve_time({:param, name, :left}, params), do: time_param(Map.fetch!(params, name))
+  defp resolve_time(bound, _params), do: bound
+
+  @spec time_param(term()) :: integer() | {:number, binary()} | {:invalid, map()}
+  defp time_param(value) when is_binary(value) do
+    case parse_time_literal(value, quote_text(value)) do
+      {:ok, ns} -> ns
+      {:error, error} -> {:invalid, error}
+    end
+  end
+
+  defp time_param(value) when is_integer(value) and value >= 0, do: {:number, "UInt64"}
+  defp time_param(value) when is_integer(value), do: {:number, "Int64"}
+  defp time_param(value) when is_float(value), do: {:number, "Float64"}
+  defp time_param(value) when is_boolean(value), do: {:number, "Boolean"}
+  defp time_param(nil), do: {:invalid, invalid_time_error("NULL")}
+
+  @doc false
+  @spec comparison_symbol(where_op()) :: binary()
+  def comparison_symbol(:eq), do: "="
+  def comparison_symbol(:ne), do: "!="
+  def comparison_symbol(:gt), do: ">"
+  def comparison_symbol(:lt), do: "<"
+  def comparison_symbol(:gte), do: ">="
+  def comparison_symbol(:lte), do: "<="
+
+  # LIMIT and OFFSET with their `$name`s bound, checked as literals are: the
+  # planner's type error, then the optimizer's negative-number error.
+  @spec bind_limits(
+          non_neg_integer() | {:param, binary()} | nil,
+          non_neg_integer() | {:param, binary()} | nil,
+          %{binary() => term()}
+        ) :: {:ok, non_neg_integer() | nil, non_neg_integer() | nil} | {:error, map()}
+  defp bind_limits(limit, offset, params) do
+    clauses =
+      for {keyword, value} <- [{"LIMIT", limit}, {"OFFSET", offset}], value != nil do
+        {keyword, limit_value_token(value, params)}
+      end
+
+    with :ok <- limit_planning(clauses), :ok <- limit_optimizer(clauses) do
+      {:ok, limit_count(clauses, "LIMIT"), limit_count(clauses, "OFFSET")}
+    end
+  end
+
+  @spec limit_value_token(non_neg_integer() | {:param, binary()}, %{binary() => term()}) ::
+          limit_token()
+  defp limit_value_token(count, _params) when is_integer(count), do: {:count, count}
+
+  defp limit_value_token({:param, name}, params) do
+    case Map.fetch!(params, name) do
+      value when is_integer(value) and value >= 0 -> {:count, value}
+      value when is_integer(value) -> {:negative, Integer.to_string(value)}
+      value when is_float(value) -> {:type, "Float64"}
+      value when is_binary(value) -> {:type, "Utf8"}
+      value when is_boolean(value) -> {:type, "Boolean"}
+      nil -> :null
+    end
+  end
+
+  @spec limit_count([{binary(), limit_token()}], binary()) :: non_neg_integer() | nil
+  defp limit_count(clauses, keyword) do
+    case List.keyfind(clauses, keyword, 0) do
+      {^keyword, {:count, count}} -> count
+      _no_count -> nil
+    end
+  end
 
   @spec quote_text(binary()) :: binary()
   defp quote_text(text), do: "'" <> String.replace(text, "'", "''") <> "'"
-
-  # Every parser rejection carries this prefix so a consumer reading
-  # "unsupported ..." knows the test double, not InfluxDB, refused the query.
-  @spec local_error(binary()) :: %{status: 400, body: binary()}
-  defp local_error(message), do: %{status: 400, body: "Client.Local: " <> message}
 end

@@ -142,4 +142,84 @@ defmodule InfluxElixir.Client.HTTPTest do
       refute is_nil(error.reason)
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # sql_request_body/4 — the JSON a query_sql request carries
+  # ---------------------------------------------------------------------------
+
+  describe "sql_request_body/4" do
+    test "sends a Decimal as a JSON number, not a string" do
+      # A string would be compared as text by the engine.
+      assert HTTP.sql_request_body(
+               "db",
+               "select 1",
+               [
+                 params: %{
+                   p: Decimal.new("1000.00"),
+                   q: Decimal.new("-1"),
+                   r: Decimal.new("1.2E+4")
+                 }
+               ],
+               :json
+             ) ==
+               {:ok,
+                ~s|{"db":"db","format":"json","params":{"p":1000.00,"q":-1,"r":12000},"q":"select 1"}|}
+    end
+
+    test "takes a keyword list as it takes a map, and names every key as a string" do
+      assert HTTP.sql_request_body("db", "select 1", [params: [b: 2, a: "x"]], :jsonl) ==
+               {:ok, ~s|{"db":"db","format":"jsonl","params":{"a":"x","b":2},"q":"select 1"}|}
+
+      assert HTTP.sql_request_body("db", "select 1", [params: %{"$a" => 1}], :json) ==
+               {:ok, ~s|{"db":"db","format":"json","params":{"$a":1},"q":"select 1"}|}
+    end
+
+    test "sends the scalars as JSON, dates as ISO-8601 strings and atoms as names" do
+      params = %{
+        a: nil,
+        b: true,
+        c: 1.5,
+        d: ~D[2024-01-02],
+        e: ~U[2024-01-02 03:04:05.000000Z],
+        f: :name
+      }
+
+      assert HTTP.sql_request_body("db", "select 1", [params: params], :json) ==
+               {:ok,
+                ~s|{"db":"db","format":"json","params":{"a":null,"b":true,"c":1.5,| <>
+                  ~s|"d":"2024-01-02","e":"2024-01-02T03:04:05.000000Z","f":"name"},| <>
+                  ~s|"q":"select 1"}|}
+    end
+
+    test "leaves params an empty object and format out when there is none" do
+      assert HTTP.sql_request_body("db", "select 1", [], nil) ==
+               {:ok, ~s|{"db":"db","params":{},"q":"select 1"}|}
+    end
+
+    test "refuses a Decimal that has no JSON number and a value with no JSON form" do
+      for value <- ["NaN", "Infinity", "-Infinity"] do
+        assert HTTP.sql_request_body("db", "select 1", [params: %{p: Decimal.new(value)}], :json) ==
+                 {:error, {:invalid_param, "p", :non_finite_decimal}},
+               value
+      end
+
+      assert HTTP.sql_request_body("db", "select 1", [params: %{p: {1, 2}}], :json) ==
+               {:error, {:invalid_param, "p", :unsupported_type}}
+    end
+
+    test "a query with such a parameter is not sent" do
+      conn = [host: "localhost", port: 1, scheme: "http", token: "t", database: "db"]
+      params = [params: %{p: Decimal.new("NaN")}]
+
+      assert HTTP.query_sql(conn, "select 1", params) ==
+               {:error, {:invalid_param, "p", :non_finite_decimal}}
+
+      assert HTTP.execute_sql(conn, "select 1", params) ==
+               {:error, {:invalid_param, "p", :non_finite_decimal}}
+
+      assert_raise InfluxElixir.StreamError, fn ->
+        conn |> HTTP.query_sql_stream("select 1", params) |> Enum.to_list()
+      end
+    end
+  end
 end

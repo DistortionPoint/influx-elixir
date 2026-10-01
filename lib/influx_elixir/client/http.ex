@@ -1,6 +1,4 @@
 defmodule InfluxElixir.Client.HTTP do
-  @compile {:no_warn_undefined, Decimal}
-
   @moduledoc """
   Production InfluxDB client implementation using Finch.
 
@@ -80,6 +78,7 @@ defmodule InfluxElixir.Client.HTTP do
   @behaviour InfluxElixir.Client
 
   alias InfluxElixir.Admin.TokenRequest
+  alias InfluxElixir.Client.QueryParams
   alias InfluxElixir.Query.ResponseParser
 
   # Default `Finch.request/3` receive timeout, mirroring
@@ -232,51 +231,43 @@ defmodule InfluxElixir.Client.HTTP do
     end
   end
 
-  @spec reject_flight_params(keyword()) :: :ok | {:error, :params_unsupported_over_flight}
+  @spec reject_flight_params(keyword()) ::
+          :ok | {:error, :params_unsupported_over_flight | QueryParams.error()}
   defp reject_flight_params(opts) do
-    if map_size(query_params(opts)) == 0 do
-      :ok
-    else
-      {:error, :params_unsupported_over_flight}
+    case query_params(opts) do
+      {:ok, params} when map_size(params) == 0 -> :ok
+      {:ok, _params} -> {:error, :params_unsupported_over_flight}
+      {:error, _reason} = error -> error
     end
   end
 
-  # `params:` may be a map or a keyword list. Jason cannot encode the tuples
-  # of a keyword list, so a keyword list used to raise here while
-  # `Client.Local` accepted it — a query could pass tests and crash in
-  # production. Both shapes are accepted by both clients.
-  #
-  # A `Decimal` param goes as a JSON number. Jason encodes a Decimal as a
-  # string, which the engine compares as text: `amount >= $p` with
-  # `Decimal.new("1000.00")` kept 500.0 ("500.0" >= "1000.00", verified)
-  # while Client.Local compared numbers.
-  @spec query_params(keyword()) :: map()
-  defp query_params(opts) do
-    opts
-    |> Keyword.get(:params, %{})
-    |> Map.new(fn {key, value} -> {key, param_value(value)} end)
+  # `params:` may be a map or a keyword list; both clients accept both, and
+  # read them through `InfluxElixir.Client.QueryParams`, which refuses a
+  # value that has no JSON form and sends a `Decimal` as a JSON number (a
+  # JSON string would be compared as text).
+  @spec query_params(keyword()) :: {:ok, QueryParams.t()} | {:error, QueryParams.error()}
+  defp query_params(opts), do: QueryParams.normalize(Keyword.get(opts, :params, %{}))
+
+  @doc false
+  # The JSON body of a `POST /api/v3/query_sql`: `db`, `q`, `params` and, when
+  # `format` is not `nil`, `format`. Exposed so the encoding of the
+  # parameters can be pinned without a server.
+  @spec sql_request_body(binary(), binary(), keyword(), term()) ::
+          {:ok, binary()} | {:error, QueryParams.error()}
+  def sql_request_body(database, sql, opts, format) do
+    with {:ok, params} <- query_params(opts) do
+      body = %{"db" => database, "q" => sql, "params" => params}
+      body = if format == nil, do: body, else: Map.put(body, "format", to_string(format))
+      {:ok, Jason.encode!(body)}
+    end
   end
-
-  @spec param_value(term()) :: term()
-  defp param_value(%{__struct__: Decimal} = value),
-    do: Jason.Fragment.new(Decimal.to_string(value, :normal))
-
-  defp param_value(value), do: value
 
   @spec http_query_sql(keyword(), binary(), keyword()) :: InfluxElixir.Client.query_result()
   defp http_query_sql(connection, sql, opts) do
-    with {:ok, database} <- resolve_database(opts, connection) do
-      params = query_params(opts)
-      format = Keyword.get(opts, :format, :json)
+    format = Keyword.get(opts, :format, :json)
 
-      body =
-        Jason.encode!(%{
-          "db" => database,
-          "q" => sql,
-          "params" => params,
-          "format" => to_string(format)
-        })
-
+    with {:ok, database} <- resolve_database(opts, connection),
+         {:ok, body} <- sql_request_body(database, sql, opts, format) do
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
 
@@ -294,34 +285,24 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: Enumerable.t()
   def query_sql_stream(connection, sql, opts \\ []) do
-    case resolve_database(opts, connection) do
-      {:ok, database} ->
-        params = query_params(opts)
+    with {:ok, database} <- resolve_database(opts, connection),
+         {:ok, body} <- sql_request_body(database, sql, opts, "jsonl") do
+      url = base_url(connection) <> "/api/v3/query_sql"
+      headers = json_headers(connection)
+      finch_name = resolve_finch(connection)
+      finch_opts = finch_opts(opts, connection)
 
-        body =
-          Jason.encode!(%{
-            "db" => database,
-            "q" => sql,
-            "params" => params,
-            "format" => "jsonl"
-          })
-
-        url = base_url(connection) <> "/api/v3/query_sql"
-        headers = json_headers(connection)
-        finch_name = resolve_finch(connection)
-        finch_opts = finch_opts(opts, connection)
-
-        Stream.resource(
-          fn -> start_stream(finch_name, url, headers, body, finch_opts) end,
-          &stream_next/1,
-          &stream_cleanup/1
-        )
-
-      {:error, :no_database_specified} ->
-        # The return type is Enumerable.t(), so we cannot return an error
-        # tuple. Surface the failure by raising when the stream is enumerated
-        # rather than yielding an empty list that looks like "zero rows".
-        raise_stream(kind: :no_database)
+      Stream.resource(
+        fn -> start_stream(finch_name, url, headers, body, finch_opts) end,
+        &stream_next/1,
+        &stream_cleanup/1
+      )
+    else
+      # The return type is Enumerable.t(), so we cannot return an error
+      # tuple. Surface the failure by raising when the stream is enumerated
+      # rather than yielding an empty list that looks like "zero rows".
+      {:error, :no_database_specified} -> raise_stream(kind: :no_database)
+      {:error, reason} -> raise_stream(kind: :transport, reason: reason)
     end
   end
 
@@ -329,17 +310,13 @@ defmodule InfluxElixir.Client.HTTP do
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map() | [map()]} | {:error, term()}
   def execute_sql(connection, sql, opts \\ []) do
-    with {:ok, database} <- resolve_database(opts, connection) do
-      # `params` were dropped here, so a `$name` placeholder was the engine's
-      # "No value found for placeholder" 400 (verified) while Client.Local,
-      # which runs execute_sql/3 through query_sql/3, bound it.
-      body = Jason.encode!(%{"db" => database, "q" => sql, "params" => query_params(opts)})
-
+    with {:ok, database} <- resolve_database(opts, connection),
+         {:ok, body} <- sql_request_body(database, sql, opts, nil) do
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
 
-      # A SELECT answers rows, typed like `query_sql/3` rows (they were raw
-      # JSON with string timestamps); a summary map passes through.
+      # A SELECT answers rows, typed like `query_sql/3` rows; a summary map
+      # passes through.
       with {:ok, %Finch.Response{body: resp_body}} <-
              request(:post, url, headers, body, connection, opts, [200]),
            {:ok, decoded} <- decode_json(resp_body) do
@@ -549,9 +526,8 @@ defmodule InfluxElixir.Client.HTTP do
           {:ok, [map()]} | {:error, term()}
   def list_buckets(connection), do: list_bucket_pages(connection, 0, [])
 
-  # InfluxDB 2 answers at most 100 buckets a page (20 by default); only the
-  # first page used to be returned, so an org with more than 20 buckets
-  # silently lost the rest (verified). Pages are read until one is short.
+  # InfluxDB 2 answers at most 100 buckets a page (20 by default), so the pages are
+  # read until one is short (verified).
   @bucket_page 100
 
   @spec list_bucket_pages(keyword(), non_neg_integer(), [[map()]]) ::
@@ -653,9 +629,8 @@ defmodule InfluxElixir.Client.HTTP do
           binary(),
           keyword()
         ) :: {:ok, map()} | {:error, term()}
-  # The token endpoints used to be `POST /api/v3/configure/token` and
-  # `DELETE /api/v3/configure/token/{id}`, which neither InfluxDB 3 Core nor
-  # Enterprise serves (verified); see `InfluxElixir.Admin.TokenRequest`.
+  # The token endpoints are the ones InfluxDB 3 Core and Enterprise serve
+  # (verified); `InfluxElixir.Admin.TokenRequest` builds the request.
   def create_token(connection, name, opts \\ []) do
     with {:ok, {_kind, path, body}} <- TokenRequest.build(name, opts),
          {:ok, %Finch.Response{body: resp_body}} <-
@@ -711,10 +686,9 @@ defmodule InfluxElixir.Client.HTTP do
   # Private: HTTP helpers
   # ---------------------------------------------------------------------------
 
-  # A value in a query string. `URI.encode/1` left `&`, `+`, `=` and `#`
-  # alone, so a v2 bucket named `a&b` was written to bucket `a` (another
-  # bucket's data, if one of that name existed), `c+d` to `c d`, and `e#f`
-  # to `e` (verified against InfluxDB 2.7).
+  # A value in a query string. `URI.encode_www_form/1` encodes `&`, `+`, `=` and `#`,
+  # which `URI.encode/1` leaves alone: a v2 bucket named `a&b` would be written to
+  # bucket `a` (verified against InfluxDB 2.7).
   @spec query_value(term()) :: binary()
   defp query_value(value), do: value |> to_string() |> URI.encode_www_form()
 
@@ -725,7 +699,7 @@ defmodule InfluxElixir.Client.HTTP do
   # Runs a request and normalises the outcome: `{:ok, response}` when the
   # status is one of `ok_statuses`, `{:error, %{status, body}}` for any other
   # status, and `{:error, {:connection_error, reason}}` for a transport
-  # failure. Every public function used to repeat this three-clause case.
+  # failure. Every public function shares this three-clause case.
   @spec request(
           :get | :post | :delete,
           binary(),
@@ -861,7 +835,7 @@ defmodule InfluxElixir.Client.HTTP do
   @spec resolve_database(keyword(), keyword()) ::
           {:ok, binary()} | {:error, :no_database_specified}
   # `database: nil` is no database given, as in Client.Local and the
-  # facade's telemetry: it used to shadow the connection's default.
+  # facade's telemetry; the connection's default applies.
   defp resolve_database(opts, connection) do
     case Keyword.get(opts, :database) || conn_val(connection, :database) do
       nil -> {:error, :no_database_specified}
@@ -1050,7 +1024,7 @@ defmodule InfluxElixir.Client.HTTP do
   end
 
   # The same coercion `query_sql/3` applies (timestamps become DateTimes),
-  # so a row is the same map streamed or not; it used to be the raw JSON.
+  # so a row is the same map streamed or not.
   @spec decode_line(binary()) :: map()
   defp decode_line(line) do
     case Jason.decode(line) do

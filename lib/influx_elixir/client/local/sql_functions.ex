@@ -20,14 +20,15 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   with a second argument are the engine's 405.
   """
 
-  alias InfluxElixir.Client.Local.SQLParser
+  alias InfluxElixir.Client.Local.{SQLError, SQLParser}
 
   @type name :: :abs | :round | :floor | :ceil
   @type context :: :where | :select | :order_by
 
   @names %{"abs" => :abs, "round" => :round, "floor" => :floor, "ceil" => :ceil}
 
-  @numeric ~w(Int64 UInt64 Float64)
+  @doc "Whether an Arrow type name is one of the engine's numeric types."
+  defguard is_numeric_type(type) when type in ["Int64", "UInt64", "Float64"]
 
   @round_signature "OneOf([Exact([Float64, Int64]), Exact([Float32, Int64]), " <>
                      "Exact([Float64]), Exact([Float32])])"
@@ -74,12 +75,10 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   defp out_of_range(scale) do
     throw(
       {:query_error,
-       %{
-         status: 400,
-         body:
-           "Client.Local: round(x, #{scale}) leaves the range of a double: InfluxDB answers " <>
-             "null (a NaN or infinity as JSON), which a result row here cannot hold"
-       }}
+       SQLError.refusal(
+         "round(x, #{scale}) leaves the range of a double: InfluxDB answers null (a NaN or " <>
+           "infinity as JSON), which a result row here cannot hold"
+       )}
     )
   end
 
@@ -123,7 +122,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
     do: planning(name, [], "'#{name}' does not support zero arguments", context)
 
   defp refusal(:abs, [type], context) do
-    if type in @numeric,
+    if is_numeric_type(type),
       do: :ok,
       else:
         planning(
@@ -143,9 +142,9 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
         context
       )
 
-  defp refusal(:round, [type], _context) when type in @numeric, do: :ok
+  defp refusal(:round, [type], _context) when is_numeric_type(type), do: :ok
 
-  defp refusal(:round, [type, scale], _context) when type in @numeric and scale == "Int64",
+  defp refusal(:round, [type, scale], _context) when is_numeric_type(type) and scale == "Int64",
     do: :ok
 
   defp refusal(:round, types, context) do
@@ -159,7 +158,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   end
 
   defp refusal(name, [type], context) when name in [:floor, :ceil] do
-    if type in @numeric,
+    if is_numeric_type(type),
       do: :ok,
       else:
         planning(
@@ -188,14 +187,14 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
         "'#{name}(#{Enum.join(types, ", ")})'. You might need to add explicit type casts.\n" <>
         "\tCandidate functions:\n" <> candidates(name)
 
-    body =
+    error =
       case context do
-        :where -> "type_coercion\ncaused by\nError during planning: " <> head <> tail
-        :order_by -> "type_coercion\ncaused by\nError during planning: " <> head
-        :select -> "Error during planning: " <> head <> tail
+        :where -> SQLError.coercion(head <> tail)
+        :order_by -> SQLError.coercion(head)
+        :select -> SQLError.planning(head <> tail)
       end
 
-    {:error, %{status: 400, body: body}}
+    {:error, error}
   end
 
   @spec candidates(name()) :: binary()
@@ -206,12 +205,12 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
 
   defp candidates(name), do: "\t#{name}(Float64/Float32)"
 
-  # DataFusion's NativeType for an Arrow type, as its message names it.
+  @doc "DataFusion's NativeType for an Arrow type, as its messages name it."
   @spec native(binary()) :: binary()
-  defp native("Utf8"), do: "String"
-  defp native("Dictionary(Int32, Utf8)"), do: "String"
-  defp native("Timestamp(ns)"), do: "Timestamp(Nanosecond, None)"
-  defp native(type), do: type
+  def native("Utf8"), do: "String"
+  def native("Dictionary(Int32, Utf8)"), do: "String"
+  def native("Timestamp(ns)"), do: "Timestamp(Nanosecond, None)"
+  def native(type), do: type
 
   @doc """
   The Arrow type an expression has, given the columns' types, or `nil`
@@ -222,6 +221,8 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   def type_of({:lit, value}, _columns) when is_integer(value), do: "Int64"
   def type_of({:lit, value}, _columns) when is_float(value), do: "Float64"
   def type_of({:lit, value}, _columns) when is_binary(value), do: "Utf8"
+  def type_of({:lit, value}, _columns) when is_boolean(value), do: "Boolean"
+  def type_of({:uint, _value}, _columns), do: "UInt64"
   def type_of({:neg, inner}, columns), do: type_of(inner, columns)
   def type_of({:cast, _inner, :integer}, _columns), do: "Int64"
   def type_of({:cast, _inner, :float}, _columns), do: "Float64"
@@ -231,10 +232,17 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
 
   def type_of({:op, _op, left, right}, columns) do
     case {type_of(left, columns), type_of(right, columns)} do
-      {"Float64", type} when type in @numeric -> "Float64"
-      {type, "Float64"} when type in @numeric -> "Float64"
-      {left_type, right_type} when left_type in @numeric and right_type in @numeric -> "Int64"
-      _not_arithmetic -> nil
+      {"Float64", type} when is_numeric_type(type) ->
+        "Float64"
+
+      {type, "Float64"} when is_numeric_type(type) ->
+        "Float64"
+
+      {left_type, right_type} when is_numeric_type(left_type) and is_numeric_type(right_type) ->
+        "Int64"
+
+      _not_arithmetic ->
+        nil
     end
   end
 

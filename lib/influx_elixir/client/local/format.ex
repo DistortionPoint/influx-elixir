@@ -18,12 +18,17 @@ defmodule InfluxElixir.Client.Local.Format do
       ` at line 1 column N` of its JSON parser: N is the byte, in the request
       body `Client.HTTP` sends (`{"db":"<database>","format":"<format>",...}`,
       keys in that order), where the format's string ends. It depends on the
-      database name, which `answer/3` takes.
+      database name, which `answer/4` takes.
 
-  The engine reads `format` with the request, before it plans the query:
-  an unknown format is its 400 whatever the query, as is the refusal of
-  `:parquet` here; the others are answered from the query's result.
+  The engine reads the request's fields in that order, `db`, `format`,
+  `params`, `q`, before it plans the query: an unknown format is its 400
+  whatever the query, as is the refusal of `:parquet` here, and after it a
+  parameter that is a JSON object or array (`answer/4`, which names the byte
+  where the engine's parser stops). The other formats are answered from the
+  query's result.
   """
+
+  alias InfluxElixir.Client.QueryParams
 
   @engine_formats ~w(parquet csv pretty json json_lines jsonl)
 
@@ -33,12 +38,18 @@ defmodule InfluxElixir.Client.Local.Format do
 
   `database` is the one the request names, or `nil` when it names none
   (`Client.HTTP` then leaves `db` out of the body); the position in an
-  unknown format's error counts the body's bytes.
+  unknown format's error counts the body's bytes. `params` are the query's
+  parameters as `InfluxElixir.Client.QueryParams.normalize/1` returns them.
   """
-  @spec answer(term(), (-> {:ok, [map()]} | {:error, term()}), binary() | nil) ::
-          {:ok, [map()]} | {:error, term()}
-  def answer(format, run, database) do
+  @spec answer(
+          term(),
+          (-> {:ok, [map()]} | {:error, term()}),
+          binary() | nil,
+          QueryParams.t()
+        ) :: {:ok, [map()]} | {:error, term()}
+  def answer(format, run, database, params \\ %{}) do
     with :ok <- accept(format, database),
+         :ok <- accept_params(params, format, database),
          {:ok, rows} <- run.() do
       render(rows, format)
     end
@@ -60,6 +71,62 @@ defmodule InfluxElixir.Client.Local.Format do
       do: :ok,
       else: {:error, %{status: 400, body: unknown_variant(format, database)}}
   end
+
+  # The engine reads a parameter as null, boolean, number or string; its
+  # parser stops at the first object or array, at the end of that value, or
+  # one byte on when the value is the last parameter (the closing brace is
+  # read with it).
+  @spec accept_params(QueryParams.t(), term(), binary() | nil) :: :ok | {:error, map()}
+  defp accept_params(params, format, database) do
+    entries = Map.to_list(params)
+
+    case Enum.find_index(entries, fn {name, value} -> container(name, value) != nil end) do
+      nil ->
+        :ok
+
+      index ->
+        {name, value} = Enum.at(entries, index)
+        kept = Enum.take(entries, index + 1)
+        read = byte_size(request_head(format, database)) + byte_size(encode_entries(kept))
+        at = if index == length(entries) - 1, do: read + 1, else: read
+        {:error, %{status: 400, body: unsupported_param(container(name, value), at)}}
+    end
+  end
+
+  @spec container(binary(), term()) :: :object | :array | nil
+  defp container(name, value) do
+    case QueryParams.engine_values(%{name => value}) do
+      %{^name => object} when is_map(object) -> :object
+      %{^name => array} when is_list(array) -> :array
+      _scalar -> nil
+    end
+  end
+
+  @spec unsupported_param(:object | :array, pos_integer()) :: binary()
+  defp unsupported_param(:object, at) do
+    "serde json error: JSON objects are not supported as query parameters. " <>
+      "Expected null, boolean, number, or string at line 1 column #{at}"
+  end
+
+  defp unsupported_param(:array, at) do
+    "serde json error: JSON arrays are not supported as query parameters. " <>
+      "Expected null, boolean, number, or string. at line 1 column #{at}"
+  end
+
+  # `{"db":"<database>","format":"<format>","params":{` as `Client.HTTP`
+  # writes the start of the request body.
+  @spec request_head(term(), binary() | nil) :: binary()
+  defp request_head(format, database) do
+    db = if database, do: ~s|"db":#{Jason.encode!(database)},|, else: ""
+    "{" <> db <> ~s|"format":#{Jason.encode!(to_string(format))},"params":{|
+  end
+
+  @spec encode_entries([{binary(), term()}]) :: binary()
+  defp encode_entries(entries),
+    do:
+      Enum.map_join(entries, ",", fn {name, value} ->
+        Jason.encode!(name) <> ":" <> Jason.encode!(value)
+      end)
 
   @spec render([map()], term()) :: {:ok, [map()]} | {:error, term()}
   defp render(rows, format) when format in [:json, :jsonl], do: {:ok, rows}
@@ -119,37 +186,22 @@ defmodule InfluxElixir.Client.Local.Format do
   `5e-324`). Erlang's `:short` renders `1.0e15` and `1.0e-5` instead.
   """
   @spec render_float(float()) :: binary()
-  def render_float(value) do
-    sign = if negative?(value), do: "-", else: ""
-    sign <> render_abs(digits(abs(value)))
-  end
+  def render_float(value), do: signed(value, &render_abs/1)
 
   @doc """
-  A float as the planner prints a `Float64` literal: positional notation, the
-  shortest digits that read back, no `.0` for a whole number (`1`, `0.1`,
-  `100000000000000000000`, `0.0000001`).
+  A float as the planner prints a `Float64` literal, and as the engine writes
+  a field in line protocol: positional notation, the shortest digits that
+  read back, no `.0` for a whole number (`1`, `0.1`, `100000000000000000000`,
+  `0.0000001`; negative zero is `-0`).
   """
   @spec render_decimal(float()) :: binary()
-  def render_decimal(value) do
-    sign = if negative?(value), do: "-", else: ""
-    sign <> decimal_abs(digits(abs(value)))
+  def render_decimal(value), do: signed(value, &decimal_abs/1)
+
+  @spec signed(float(), ({binary(), integer()} -> binary())) :: binary()
+  defp signed(value, render) do
+    sign = if match?(<<1::1, _rest::63>>, <<value::float>>), do: "-", else: ""
+    sign <> render.(digits(abs(value)))
   end
-
-  @spec decimal_abs({binary(), integer()}) :: binary()
-  defp decimal_abs({"", _point}), do: "0"
-
-  defp decimal_abs({digits, point}) do
-    size = byte_size(digits)
-
-    cond do
-      point <= 0 -> "0." <> String.duplicate("0", -point) <> digits
-      point >= size -> digits <> String.duplicate("0", point - size)
-      true -> binary_part(digits, 0, point) <> "." <> binary_part(digits, point, size - point)
-    end
-  end
-
-  @spec negative?(float()) :: boolean()
-  defp negative?(value), do: match?(<<1::1, _rest::63>>, <<value::float>>)
 
   # The value as {digits, point}: 0.<digits> × 10^point, digits without
   # leading or trailing zeros ("" for zero).
@@ -168,21 +220,32 @@ defmodule InfluxElixir.Client.Local.Format do
     {String.trim_trailing(significant, "0"), point}
   end
 
+  @spec decimal_abs({binary(), integer()}) :: binary()
+  defp decimal_abs({"", _point}), do: "0"
+  defp decimal_abs({digits, point}), do: positional(digits, point)
+
   @spec render_abs({binary(), integer()}) :: binary()
   defp render_abs({"", _point}), do: "0.0"
 
   defp render_abs({digits, point}) when point in -4..16 do
-    size = byte_size(digits)
-
-    cond do
-      point <= 0 -> "0." <> String.duplicate("0", -point) <> digits
-      point >= size -> digits <> String.duplicate("0", point - size) <> ".0"
-      true -> binary_part(digits, 0, point) <> "." <> binary_part(digits, point, size - point)
-    end
+    text = positional(digits, point)
+    if String.contains?(text, "."), do: text, else: text <> ".0"
   end
 
   defp render_abs({<<first, rest::binary>>, point}) do
     mantissa = if rest == "", do: <<first>>, else: <<first, ?.>> <> rest
     "#{mantissa}e#{point - 1}"
+  end
+
+  # `0.<digits> × 10^point` without an exponent or a trailing `.0`.
+  @spec positional(binary(), integer()) :: binary()
+  defp positional(digits, point) do
+    size = byte_size(digits)
+
+    cond do
+      point <= 0 -> "0." <> String.duplicate("0", -point) <> digits
+      point >= size -> digits <> String.duplicate("0", point - size)
+      true -> binary_part(digits, 0, point) <> "." <> binary_part(digits, point, size - point)
+    end
   end
 end

@@ -38,6 +38,80 @@ defmodule InfluxElixir.Client.Local.FormatTest do
     end
   end
 
+  # What the engine's CSV and a Float64 literal write differ only in the
+  # exponent form and the `.0`; the line protocol writes the literal's form.
+  describe "render_decimal/1" do
+    test "writes a float as the planner and the line protocol write it" do
+      for {value, text} <- [
+            {1.0, "1"},
+            {2.5, "2.5"},
+            {0.1, "0.1"},
+            {1.0e20, "100000000000000000000"},
+            {1.0e-7, "0.0000001"},
+            {100_000.0, "100000"},
+            {-1.5, "-1.5"},
+            {123_456_789.5, "123456789.5"},
+            {5.0e-324, "0." <> String.duplicate("0", 323) <> "5"},
+            {0.0, "0"},
+            {-0.0, "-0"}
+          ] do
+        assert Format.render_decimal(value) == text, "#{inspect(value)}"
+      end
+    end
+  end
+
+  describe "answer/4 — the request's parameters" do
+    test "an object or an array is the engine's 400 at the byte its parser stops" do
+      object =
+        "serde json error: JSON objects are not supported as query parameters. " <>
+          "Expected null, boolean, number, or string at line 1 column "
+
+      array =
+        "serde json error: JSON arrays are not supported as query parameters. " <>
+          "Expected null, boolean, number, or string. at line 1 column "
+
+      # Each column was read back from Core for the body Client.HTTP sends.
+      for {database, params, body} <- [
+            {"rv_lib", %{"p" => %{"a" => 1}}, object <> "53"},
+            {"rv_lib", %{"p" => [1, 2]}, array <> "51"},
+            {"rv_lib", %{"p" => []}, array <> "48"},
+            {"rv_lib", %{"p" => %{"a" => %{"b" => [1]}}}, object <> "61"},
+            {"rv_lib", %{"p" => [1, %{"a" => 2}]}, array <> "57"},
+            {"rv_lib", %{"a" => 1, "p" => %{}}, object <> "54"},
+            {"rv_lib", %{"p" => [1, 2], "z" => 1}, array <> "50"}
+          ] do
+        assert Format.answer(:json, fn -> flunk("the query ran") end, database, params) ==
+                 {:error, %{status: 400, body: body}},
+               inspect(params)
+      end
+    end
+
+    test "the format is read before the parameters, the parameters before the query" do
+      params = %{"p" => [1]}
+
+      assert {:error, %{status: 400, body: "serde json error: unknown variant `xml`" <> _rest}} =
+               Format.answer(:xml, fn -> flunk("the query ran") end, "db", params)
+
+      assert {:error, %{status: 400, body: "serde json error: JSON arrays" <> _rest}} =
+               Format.answer(:json, fn -> flunk("the query ran") end, "db", params)
+    end
+
+    test "scalar parameters, and a Decimal that is a JSON number, reach the query" do
+      params = %{
+        "a" => nil,
+        "b" => true,
+        "c" => 1,
+        "d" => 1.5,
+        "e" => "x",
+        "f" => Jason.Fragment.new("1000.00"),
+        "g" => ~D[2024-01-02]
+      }
+
+      assert Format.answer(:json, fn -> {:ok, [%{"n" => 1}]} end, "db", params) ==
+               {:ok, [%{"n" => 1}]}
+    end
+  end
+
   describe "answer/3" do
     @row %{
       "time" => ~U[2023-11-14 22:13:20.000000Z],
@@ -80,14 +154,15 @@ defmodule InfluxElixir.Client.Local.FormatTest do
     test "a format the engine does not know is its 400 before the query runs" do
       # The column is where the format string ends in the body Client.HTTP
       # sends, `db` left out when no database is named (verified on Core).
-      for {database, column} <- [{"db", 25}, {nil, 15}] do
-        assert Format.answer(:xml, fn -> flunk("the query ran") end, database) ==
+      for {format, database, column} <- [{:xml, "db", 25}, {:xml, nil, 15}, {:yaml, "a", 25}] do
+        assert Format.answer(format, fn -> flunk("the query ran") end, database) ==
                  {:error,
                   %{
                     status: 400,
                     body:
-                      "serde json error: unknown variant `xml`, expected one of `parquet`, " <>
-                        "`csv`, `pretty`, `json`, `json_lines`, `jsonl` at line 1 column #{column}"
+                      "serde json error: unknown variant `#{format}`, expected one of " <>
+                        "`parquet`, `csv`, `pretty`, `json`, `json_lines`, `jsonl` " <>
+                        "at line 1 column #{column}"
                   }}
       end
     end

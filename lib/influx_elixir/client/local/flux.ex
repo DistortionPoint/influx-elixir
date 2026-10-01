@@ -5,9 +5,7 @@ defmodule InfluxElixir.Client.Local.Flux do
   `docs/design/2026-09-24_local-flux-pipeline.md`).
 
   A query is a pipeline, `from(bucket: "b") |> range(...) |> ...`, and every
-  stage is applied — or the query is refused. Before this module the double
-  matched a few regexes anywhere in the text and ignored the rest, so
-  `|> mean()` returned the raw rows.
+  stage is applied — or the query is refused by name.
 
   Supported stages:
 
@@ -30,7 +28,10 @@ defmodule InfluxElixir.Client.Local.Flux do
     * `yield(name: "x")` — names the result
 
   Tables are the series — measurement, tag set, field — numbered from `0`
-  in that order, rows in time order, as the engine numbers them.
+  in that order, rows in time order, as the engine numbers them. Time order
+  is the stored nanoseconds, finer than the microsecond a row's `_time`
+  carries, so `first()` and `last()` choose between points a microsecond
+  holds as the engine does.
   """
 
   alias InfluxElixir.Query.ResponseParser
@@ -68,6 +69,10 @@ defmodule InfluxElixir.Client.Local.Flux do
       {:ok, %{bucket: bucket, stages: stages}}
     end
   end
+
+  @doc "The `{start, stop}` nanoseconds of a query's `range` stage."
+  @spec range(query()) :: {integer(), integer()}
+  def range(%{stages: stages}), do: stages |> split_range() |> elem(0)
 
   @doc """
   The measurements a query reads: the ones its `filter` stages pin with
@@ -112,10 +117,10 @@ defmodule InfluxElixir.Client.Local.Flux do
     tables =
       points
       |> Enum.filter(&(&1.timestamp >= start_ns and &1.timestamp < stop_ns))
-      |> Enum.flat_map(&rows(&1, start_ns, stop_ns))
-      |> Enum.group_by(&series_key/1)
+      |> Enum.flat_map(&timed_rows(&1, start_ns, stop_ns))
+      |> Enum.group_by(fn {_ns, row} -> series_key(row) end)
       |> Enum.sort_by(fn {key, _rows} -> key end)
-      |> Enum.map(fn {_key, rows} -> Enum.sort_by(rows, & &1["_time"], DateTime) end)
+      |> Enum.map(fn {_key, timed} -> table_rows(timed) end)
 
     {tables, result} = Enum.reduce(rest, {tables, "_result"}, &apply_stage/2)
 
@@ -142,6 +147,19 @@ defmodule InfluxElixir.Client.Local.Flux do
   defp split_range([stage | rest]) do
     {range, others} = split_range(rest)
     {range, [stage | others]}
+  end
+
+  # A table's rows in time order: by the stored nanoseconds, which a row's
+  # microsecond `_time` cannot tell apart. The sort is stable, so points at
+  # one instant keep their order.
+  @spec table_rows([{integer(), map()}]) :: [map()]
+  defp table_rows(timed) do
+    timed |> Enum.sort_by(fn {ns, _row} -> ns end) |> Enum.map(fn {_ns, row} -> row end)
+  end
+
+  @spec timed_rows(map(), integer(), integer()) :: [{integer(), map()}]
+  defp timed_rows(point, start_ns, stop_ns) do
+    for row <- rows(point, start_ns, stop_ns), do: {point.timestamp, row}
   end
 
   @spec rows(map(), integer(), integer()) :: [map()]

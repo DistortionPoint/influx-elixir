@@ -6,7 +6,9 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
 
     * an unquoted identifier is folded to lower case — column, table, alias
       and CTE names alike: `SELECT Host FROM Cpu` reads column `host` of
-      table `cpu`, and `AVG(v) AS Avg_V` answers `avg_v`
+      table `cpu`, and `AVG(v) AS Avg_V` answers `avg_v`. Only the ASCII
+      letters fold: `Fé` is `fé`, and `FÉ` is `fÉ`, a column that does not
+      exist. A name may hold letters and digits of any script
     * a double-quoted identifier keeps its case: `"Host"` is column `Host`
     * string literals (`'Abc'`) and `$name` placeholders are left as they are
 
@@ -49,12 +51,14 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
     scan(rest, [number | acc])
   end
 
-  defp scan(<<c, _rest::binary>> = sql, acc) when c in ?a..?z or c in ?A..?Z or c == ?_ do
-    {word, rest} = take_word(sql, [])
-    scan(rest, [String.downcase(IO.iodata_to_binary(word)) | acc])
+  defp scan(<<c::utf8, rest::binary>> = sql, acc) do
+    if word_start?(c) do
+      {word, rest} = take_word(sql, [])
+      scan(rest, [String.downcase(IO.iodata_to_binary(word), :ascii) | acc])
+    else
+      scan(rest, [<<c::utf8>> | acc])
+    end
   end
-
-  defp scan(<<c::utf8, rest::binary>>, acc), do: scan(rest, [<<c::utf8>> | acc])
 
   # The body of a '...' or "..." token; a doubled quote inside it is kept
   # doubled, as the parser reads it. An unterminated token takes the rest.
@@ -67,16 +71,28 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
 
   defp take_quoted(<<>>, _q, acc), do: {Enum.reverse(acc), <<>>}
 
+  # An identifier starts with a letter or `_` and goes on with letters,
+  # digits and `_`, in any script.
   @spec take_word(binary(), iodata()) :: {iodata(), binary()}
-  defp take_word(<<c, rest::binary>>, acc)
-       when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_,
-       do: take_word(rest, [c | acc])
+  defp take_word(<<c::utf8, rest::binary>> = input, acc) do
+    if word_char?(c), do: take_word(rest, [<<c::utf8>> | acc]), else: {Enum.reverse(acc), input}
+  end
 
-  defp take_word(rest, acc), do: {Enum.reverse(acc), rest}
+  defp take_word(<<>>, acc), do: {Enum.reverse(acc), <<>>}
+
+  @spec word_start?(char()) :: boolean()
+  defp word_start?(c) when c in ?a..?z or c in ?A..?Z or c == ?_, do: true
+  defp word_start?(c) when c < 128, do: false
+  defp word_start?(c), do: Regex.match?(~r/\A\p{L}\z/u, <<c::utf8>>)
+
+  @spec word_char?(char()) :: boolean()
+  defp word_char?(c) when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_, do: true
+  defp word_char?(c) when c < 128, do: false
+  defp word_char?(c), do: Regex.match?(~r/\A[\p{L}\p{N}]\z/u, <<c::utf8>>)
 
   @spec quoted_identifier(binary()) :: iodata()
   defp quoted_identifier(name) do
-    if Regex.match?(~r/^[A-Za-z_][A-Za-z0-9_]*$/, name) and
+    if Regex.match?(~r/\A[\p{L}_][\p{L}\p{N}_]*\z/u, name) and
          String.downcase(name) not in @keywords,
        do: name,
        else: [?", name, ?"]

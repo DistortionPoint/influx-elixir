@@ -508,14 +508,36 @@ measurement, tag, field order. Any other stage, such as `aggregateWindow`,
 engine's 404. Against a real server, set `api_version: :v2` on the
 connection so writes go to `/api/v2/write`.
 
+## Params
+
+`params:` is a map or a keyword list; a `$name` placeholder takes the key
+`name` (`%{min: 1000}` binds `$min`; a key spelled `"$min"` binds nothing, as
+on InfluxDB). Both clients read the parameters through
+`InfluxElixir.Client.QueryParams`, and `Client.Local` binds what the engine
+reads from the request's JSON:
+
+  * a value is data, never SQL text: a string holding a quote, `--` or `$x`
+    is compared as that string
+  * a non-negative integer is a `UInt64`, so `time = $t` with `0` is the
+    engine's type error (`Timestamp(ns) = UInt64`); bind an ISO-8601 string
+    or a `DateTime` for a `time`
+  * `LIMIT $n` and `OFFSET $n` take an integer or `nil`; a boolean compared
+    with a number or a string is the engine's type error
+  * an object or an array is the engine's 400 (`JSON objects are not
+    supported as query parameters ... at line 1 column N`), and a `Decimal`
+    that is NaN or an infinity, or a value with no JSON form (a tuple, a
+    pid), is `{:error, {:invalid_param, name, reason}}` from both clients
+  * a placeholder with no value is the planner's 400, `No value found for
+    placeholder with name $name`
+
 ## Decimal Params
 
-`Decimal` values pass through `params:` as bare numeric literals — no
-quoting, so `WHERE amount >= $min` performs a numeric comparison even
-when `$min` is a `%Decimal{}`:
+`Decimal` values are sent as JSON numbers — no quoting, so
+`WHERE amount >= $min` performs a numeric comparison even when `$min` is a
+`%Decimal{}`:
 
 ```elixir
-params = %{"$min" => Decimal.new("1000.00")}
+params = %{min: Decimal.new("1000.00")}
 {:ok, rows} = Local.query_sql(conn, sql, database: "test_db", params: params)
 ```
 

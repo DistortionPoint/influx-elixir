@@ -14,7 +14,16 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   Pure over the points it is given: no ETS, no connection state.
   """
 
-  alias InfluxElixir.Client.Local.{Format, LineProtocolParser, SQLFunctions, SQLParser, Store}
+  alias InfluxElixir.Client.Local.{
+    Format,
+    LineProtocolParser,
+    SQLError,
+    SQLFunctions,
+    SQLParser,
+    Store
+  }
+
+  import SQLFunctions, only: [is_numeric_type: 1]
 
   @typedoc "A stored point, as `InfluxElixir.Client.Local` keeps it."
   @type point :: LineProtocolParser.point()
@@ -35,13 +44,16 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # of the same name, as in SQL).
   @doc """
   Runs a parsed query. `fetch` returns a measurement's points, or `:error`
-  when the measurement does not exist; CTEs shadow it by name.
+  when the measurement does not exist; CTEs shadow it by name. `params` are
+  the engine's values for the query's `$name` placeholders (see
+  `InfluxElixir.Client.QueryParams.engine_values/1`).
   """
-  @spec run(SQLParser.parsed_query(), fetch()) :: [map()] | {:error, term()}
-  def run(query, fetch) do
+  @spec run(SQLParser.parsed_query(), fetch(), %{binary() => term()}) ::
+          [map()] | {:error, term()}
+  def run(query, fetch, params \\ %{}) do
     query.ctes
     |> Enum.reduce_while({:ok, %{}}, fn {name, cte_query}, {:ok, sources} ->
-      case select(cte_query, fetch, sources) do
+      case select(cte_query, fetch, sources, params) do
         {:error, _reason} = error ->
           {:halt, error}
 
@@ -51,28 +63,39 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
       end
     end)
     |> case do
-      {:ok, sources} -> execute_select(query, fetch, sources)
+      {:ok, sources} -> execute_select(query, fetch, sources, params)
       {:error, _reason} = error -> error
     end
   end
 
-  @spec execute_select(SQLParser.parsed_query(), fetch(), %{binary() => [point()]}) ::
-          [map()] | {:error, term()}
-  defp execute_select(query, fetch, cte_sources) do
-    case select(query, fetch, cte_sources) do
+  @spec execute_select(
+          SQLParser.parsed_query(),
+          fetch(),
+          %{binary() => [point()]},
+          %{binary() => term()}
+        ) :: [map()] | {:error, term()}
+  defp execute_select(query, fetch, cte_sources, params) do
+    case select(query, fetch, cte_sources, params) do
       {:ok, rows, _source} -> rows
       {:error, _reason} = error -> error
     end
   end
 
   # The rows, with the points they were read from (after any join, before
-  # WHERE): a CTE has the schema of its source, not of the rows it kept.
-  @spec select(SQLParser.parsed_query(), fetch(), %{binary() => [point()]}) ::
-          {:ok, [map()], [point()]} | {:error, term()}
-  defp select(%{measurement: m} = query, fetch, cte_sources) do
+  # WHERE): a CTE has the schema of its source, not of the rows it kept. The
+  # engine finds a missing table or column first, then the placeholders
+  # without a value, then the type errors.
+  @spec select(
+          SQLParser.parsed_query(),
+          fetch(),
+          %{binary() => [point()]},
+          %{binary() => term()}
+        ) :: {:ok, [map()], [point()]} | {:error, term()}
+  defp select(%{measurement: m} = query, fetch, cte_sources, params) do
     with {:ok, points} <- source_points(fetch, m, cte_sources),
          {:ok, joined} <- cross_join(fetch, points, query, cte_sources),
          :ok <- check_query_columns(joined, query),
+         {:ok, query} <- SQLParser.bind(query, params),
          :ok <- check_plan(joined, query),
          :ok <- check_grouping_columns(query),
          {:ok, filtered} <- apply_where(joined, query.where) do
@@ -119,9 +142,9 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   end
 
   # `FROM w CROSS JOIN ref`: every left point paired with every right point,
-  # the right side's columns merged in as fields. Qualifiers were dropped
-  # at parse time, so a column present on both sides cannot be told apart
-  # any more. The engine refuses an unqualified reference to such a column
+  # the right side's columns merged in as fields. Qualifiers are dropped
+  # at parse time, so a column present on both sides cannot be told apart. The
+  # engine refuses an unqualified reference to such a column
   # (the first one its planner meets: WHERE, then the select list, then the
   # rest) and the double does too; a query that names none of them is fine
   # on the engine. `SELECT *` would return each shared column twice, which
@@ -174,7 +197,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
       star?(query) ->
         {:error,
-         local_refusal(
+         SQLError.refusal(
            "SELECT * over a CROSS JOIN whose sides share #{Enum.join(Enum.sort(shared), ", ")} " <>
              "returns each twice, which a row map cannot hold; name the columns"
          )}
@@ -189,9 +212,6 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     do:
       is_nil(query.distinct_columns) and is_nil(query.select_columns) and
         is_nil(query.projection_columns)
-
-  @spec local_refusal(binary()) :: %{status: 400, body: binary()}
-  defp local_refusal(reason), do: %{status: 400, body: "Client.Local: " <> reason}
 
   @spec point_columns([point()]) :: MapSet.t(binary())
   defp point_columns(points) do
@@ -253,23 +273,41 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   # The engine checks an expression's types when it plans the query, so a
   # wrong one fails it even when no row would reach it: a function's
-  # arguments, an arithmetic operator's operands, a negation, an aggregate's
-  # argument, the operand of a LIKE or a regex. Its planner reads WHERE,
-  # then the select list, then ORDER BY, and within a term the innermost
-  # part first.
+  # arguments, an arithmetic operator's operands, a comparison's operands, a
+  # negation, an aggregate's argument, the operand of a LIKE or a regex. The
+  # first problem it meets is the one it reports (verified, each pair of
+  # kinds in each pair of clauses), which `rank/2` orders:
+  #
+  #   0. the select list's calls, operators and aggregates, which fail the
+  #      plan before it is analysed, and so carry no `type_coercion` prefix
+  #   1. WHERE's calls, operators, comparisons and regexes, as written
+  #   2. WHERE's LIKEs
+  #   3. ORDER BY's calls and operators
+  #   4. a negation, wherever it stands
+  #
+  # and within a term the innermost part comes first.
   @spec check_plan([point()], SQLParser.parsed_query()) :: :ok | {:error, map()}
   defp check_plan(points, query) do
-    contexts = [
-      where: plan_items(query.where),
-      select: select_items(query),
-      order_by: plan_items(Enum.map(query.order_by, &elem(&1, 0)))
-    ]
+    checks =
+      Enum.sort_by(
+        Enum.map(select_items(query), &{:select, &1}) ++
+          Enum.map(plan_items(query.where), &{:where, &1}) ++
+          Enum.map(plan_items(Enum.map(query.order_by, &elem(&1, 0))), &{:order_by, &1}),
+        fn {context, item} -> rank(context, item) end
+      )
 
-    case for({context, items} <- contexts, item <- items, do: {context, item}) do
+    case checks do
       [] -> :ok
-      checks -> check_items(checks, column_types(points, plan_columns(checks)))
+      _checks -> check_items(checks, column_types(points, plan_columns(checks)))
     end
   end
+
+  @spec rank(SQLFunctions.context(), term()) :: 0..4
+  defp rank(_context, {:neg, _inner}), do: 4
+  defp rank(:select, _item), do: 0
+  defp rank(:where, {:pattern, kind, _operand, _rest}) when kind in [:like, :not_like], do: 2
+  defp rank(:where, _item), do: 1
+  defp rank(:order_by, _item), do: 3
 
   @spec select_items(SQLParser.parsed_query()) :: [term()]
   defp select_items(query) do
@@ -284,6 +322,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     projected ++ aggregated
   end
 
+  @comparisons [:eq, :ne, :gt, :lt, :gte, :lte]
+
   # Every part of a term the planner types, the innermost first.
   @spec plan_items(term()) :: [term()]
   defp plan_items({:call, _function, args} = call), do: plan_items(args) ++ [call]
@@ -291,17 +331,26 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp plan_items({:neg, inner} = neg), do: plan_items(inner) ++ [neg]
 
   defp plan_items({kind, left, rest}) when kind in [:like, :not_like, :regex, :not_regex] do
-    operand = pattern_operand(left)
+    operand = operand_expr(left)
     plan_items(operand) ++ [{:pattern, kind, operand, rest}]
   end
+
+  defp plan_items({op, left, right}) when op in @comparisons and left != "time",
+    do: plan_items(left) ++ plan_items(right) ++ [{:compare, op, operand_expr(left), right}]
+
+  defp plan_items({op, left, values}) when op in [:in, :not_in] and left != "time",
+    do: plan_items(left) ++ plan_items(values) ++ [{:in_list, operand_expr(left), values}]
+
+  defp plan_items({op, left, {low, high}}) when op in [:between, :not_between] and left != "time",
+    do: plan_items(left) ++ plan_items([low, high]) ++ [{:range, operand_expr(left), low, high}]
 
   defp plan_items(terms) when is_list(terms), do: Enum.flat_map(terms, &plan_items/1)
   defp plan_items(term) when is_tuple(term), do: term |> Tuple.to_list() |> plan_items()
   defp plan_items(_other), do: []
 
-  @spec pattern_operand(SQLParser.operand()) :: SQLParser.expr()
-  defp pattern_operand({:expr, expr}), do: expr
-  defp pattern_operand(column), do: {:field, column}
+  @spec operand_expr(SQLParser.operand()) :: SQLParser.expr()
+  defp operand_expr({:expr, expr}), do: expr
+  defp operand_expr(column), do: {:field, column}
 
   @spec plan_columns([{SQLFunctions.context(), term()}]) :: [binary()]
   defp plan_columns(checks),
@@ -318,8 +367,6 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end)
   end
 
-  @numeric ~w(Int64 UInt64 Float64)
-
   @spec check_item(term(), SQLFunctions.context(), %{binary() => binary()}) ::
           :ok | {:error, map()}
   defp check_item({:call, function, args}, context, columns),
@@ -329,7 +376,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     case {SQLFunctions.type_of(left, columns), SQLFunctions.type_of(right, columns)} do
       {left_type, right_type}
       when is_binary(left_type) and is_binary(right_type) and
-             not (left_type in @numeric and right_type in @numeric) ->
+             not (is_numeric_type(left_type) and is_numeric_type(right_type)) ->
         planning_error(
           "Cannot coerce arithmetic expression #{left_type} #{operator(op)} #{right_type} " <>
             "to valid types",
@@ -344,7 +391,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # The engine words a negation the same wherever it stands.
   defp check_item({:neg, inner}, _context, columns) do
     case SQLFunctions.type_of(inner, columns) do
-      type when type in [nil, "Timestamp(ns)" | @numeric] ->
+      type when type in [nil, "Timestamp(ns)"] or is_numeric_type(type) ->
         :ok
 
       _not_numeric ->
@@ -361,13 +408,78 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   defp check_item({:pattern, kind, expr, rest}, context, columns) do
     case SQLFunctions.type_of(expr, columns) do
-      type when type in ["Boolean" | @numeric] ->
+      type when type == "Boolean" or is_numeric_type(type) ->
         planning_error(pattern_error(kind, type, rest), context)
 
       _text_or_unknown ->
         :ok
     end
   end
+
+  # A boolean is comparable only with a boolean: against another type the
+  # comparison, the IN list and the BETWEEN have no common type.
+  defp check_item({:compare, op, left, right}, _context, columns) do
+    case {SQLFunctions.type_of(left, columns), value_type(right)} do
+      {column, value} when is_binary(column) and is_binary(value) ->
+        if boolean_mismatch?(column, value),
+          do:
+            {:error,
+             SQLError.coercion(
+               "Cannot infer common argument type for comparison operation " <>
+                 "#{column} #{SQLParser.comparison_symbol(op)} #{value}"
+             )},
+          else: :ok
+
+      _unknown ->
+        :ok
+    end
+  end
+
+  defp check_item({:in_list, left, values}, _context, columns) do
+    types = Enum.map(values, &value_type/1)
+
+    with column when is_binary(column) <- SQLFunctions.type_of(left, columns),
+         true <- Enum.all?(types, &(&1 != :unknown)),
+         true <- Enum.any?(types, &(&1 != nil and boolean_mismatch?(column, &1))) do
+      names = Enum.map_join(types, ", ", &(&1 || "Null"))
+
+      {:error,
+       SQLError.coercion("Can not find compatible types to compare #{column} with [#{names}]")}
+    else
+      _compatible_or_unknown -> :ok
+    end
+  end
+
+  defp check_item({:range, left, low, high}, _context, columns) do
+    with column when is_binary(column) <- SQLFunctions.type_of(left, columns),
+         bound when is_binary(bound) <-
+           Enum.find([value_type(low), value_type(high)], &boolean_mismatch_with?(column, &1)) do
+      {:error, SQLError.between_coercion(column, bound)}
+    else
+      _compatible_or_unknown -> :ok
+    end
+  end
+
+  # The type a literal has to the engine: a bound non-negative integer
+  # parameter is a `UInt64`, a bare one an `Int64`. `nil` is the null, and
+  # an expression's type is not known here.
+  @spec value_type(term()) :: binary() | nil | :unknown
+  defp value_type(nil), do: nil
+  defp value_type(value) when is_boolean(value), do: "Boolean"
+  defp value_type({:uint, _value}), do: "UInt64"
+  defp value_type(value) when is_integer(value), do: "Int64"
+  defp value_type(value) when is_float(value), do: "Float64"
+  defp value_type(value) when is_binary(value), do: "Utf8"
+  defp value_type(_expression), do: :unknown
+
+  @spec boolean_mismatch?(binary(), binary()) :: boolean()
+  defp boolean_mismatch?(left, right), do: left == "Boolean" != (right == "Boolean")
+
+  @spec boolean_mismatch_with?(binary(), binary() | nil | :unknown) :: boolean()
+  defp boolean_mismatch_with?(column, type) when is_binary(type),
+    do: boolean_mismatch?(column, type)
+
+  defp boolean_mismatch_with?(_column, _null_or_unknown), do: false
 
   @spec operator(atom()) :: binary()
   defp operator(:rem), do: "%"
@@ -376,13 +488,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # In WHERE and ORDER BY the planner's message is wrapped by the type
   # coercion pass; in the select list it is not.
   @spec planning_error(binary(), SQLFunctions.context()) :: {:error, map()}
-  defp planning_error(message, :select),
-    do: {:error, %{status: 400, body: "Error during planning: " <> message}}
-
-  defp planning_error(message, _where_or_order_by),
-    do:
-      {:error,
-       %{status: 400, body: "type_coercion\ncaused by\nError during planning: " <> message}}
+  defp planning_error(message, :select), do: {:error, SQLError.planning(message)}
+  defp planning_error(message, _where_or_order_by), do: {:error, SQLError.coercion(message)}
 
   @spec pattern_error(atom(), binary(), term()) :: binary()
   defp pattern_error(kind, type, _rest) when kind in [:like, :not_like],
@@ -395,7 +502,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # words each family differently (verified against Core).
   @spec aggregate_refusal(SQLParser.aggregate(), binary()) :: :ok | {:error, map()}
   defp aggregate_refusal(agg, _type) when agg in [:count, :min, :max], do: :ok
-  defp aggregate_refusal(_agg, type) when type in @numeric, do: :ok
+  defp aggregate_refusal(_agg, type) when is_numeric_type(type), do: :ok
 
   defp aggregate_refusal(agg, type) do
     name = Atom.to_string(agg)
@@ -420,8 +527,10 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
       ~s|"Error during planning: Avg does not support inputs of type #{unwrapped(type)}."|
   end
 
-  defp aggregate_head(agg, type),
-    do: "Function '#{agg}' expects NativeType::Numeric but received NativeType::#{native(type)}"
+  defp aggregate_head(agg, type) do
+    "Function '#{agg}' expects NativeType::Numeric but received " <>
+      "NativeType::#{SQLFunctions.native(type)}"
+  end
 
   @spec aggregate_candidate(SQLParser.aggregate()) :: binary()
   defp aggregate_candidate(agg) when agg in [:sum, :avg], do: "#{agg}(UserDefined)"
@@ -432,18 +541,12 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp unwrapped("Dictionary(Int32, Utf8)"), do: "Utf8"
   defp unwrapped(type), do: type
 
-  @spec native(binary()) :: binary()
-  defp native("Utf8"), do: "String"
-  defp native("Dictionary(Int32, Utf8)"), do: "String"
-  defp native("Timestamp(ns)"), do: "Timestamp(Nanosecond, None)"
-  defp native(type), do: type
-
   # The Arrow type of the columns the checks name, as the engine has them: a
   # tag is dictionary encoded, a field typed by its values, `time` a
   # timestamp. A type is read from the first point that has the column, and
-  # the scan stops once every column is known: typing every column of every
-  # point was O(points x columns). A column no point has stays unknown, and
-  # an unknown type is never refused.
+  # the scan stops once every column is known, so it costs no more than the
+  # points that name them. A column no point has stays unknown, and an
+  # unknown type is never refused.
   @spec column_types([point()], [binary()]) :: %{binary() => binary()}
   defp column_types(points, wanted) do
     pending = wanted |> MapSet.new() |> MapSet.delete("time")
@@ -525,7 +628,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
         }
 
       :unrenderable ->
-        local_refusal(
+        SQLError.refusal(
           "column \"#{column}\" must appear in the GROUP BY clause or be part of an " <>
             "aggregate function; the double cannot print this query's terms as the " <>
             "engine's error does"
@@ -685,6 +788,9 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp expr_fields({:neg, inner}), do: expr_fields(inner)
   defp expr_fields({:aggregate, _agg, expr}), do: expr_fields(expr)
   defp expr_fields({:pattern, _kind, expr, _rest}), do: expr_fields(expr)
+  defp expr_fields({:compare, _op, left, _right}), do: expr_fields(left)
+  defp expr_fields({:in_list, left, _values}), do: expr_fields(left)
+  defp expr_fields({:range, left, _low, _high}), do: expr_fields(left)
   defp expr_fields(_other), do: []
 
   # The columns a query's rows are made of, whether or not any row has a
@@ -792,9 +898,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # Stable multi-key sort with a direction per key; `DateTime`s compare
   # chronologically and nil (an omitted column) sorts first.
   #
-  # Each item's key values are read once, not on every comparison: with two
-  # keys over 100k rows that was millions of key-function calls (a
-  # `DISTINCT ON (k) ... ORDER BY k, time DESC` took 630 ms).
+  # Each item's key values are read once, not on every comparison, so the cost
+  # of a sort is its keys over the items and not over the comparisons.
   @spec sort_by_keys([term()], [{(term() -> term()), SQLParser.direction()}]) :: [term()]
   # One key, the common case (`ORDER BY time`): its key functions are cheap
   # field reads, and building a decorated list costs more than it saves.
@@ -827,8 +932,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   # One key's order: `:before`, `:after` or `:tie`. Nulls sort last
   # ascending and first descending unless the query says NULLS FIRST /
-  # LAST — DataFusion's rule (verified). Term order put a nil before every
-  # string and between `false` and `true`.
+  # LAST — DataFusion's rule (verified); it is not term order, which puts a nil
+  # before every string and between `false` and `true`.
   @spec value_before?(term(), term(), {:asc | :desc, :nulls_first | :nulls_last}) ::
           :before | :after | :tie
   defp value_before?(x, y, {dir, nulls}) do
@@ -1028,6 +1133,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           number() | binary() | boolean() | DateTime.t() | nil
   defp eval_expr({:field, name}, point), do: column_value(point, name)
   defp eval_expr({:lit, value}, _point), do: value
+  defp eval_expr({:uint, value}, _point), do: value
   defp eval_expr({:cast, inner, type}, point), do: cast(eval_expr(inner, point), type)
 
   defp eval_expr({:call, function, args}, point),
@@ -1230,9 +1336,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     agg |> pick_by_order(points, ordering) |> column_value(field)
   end
 
-  # A single pass for the extreme element; sorting the whole bucket to take
-  # its head was O(n log n) per aggregate column. Ties resolve to the first
-  # point in scan (insertion) order, as the stable sort did.
+  # A single pass for the extreme element, not a sort of the whole bucket.
+  # Ties resolve to the first point in scan (insertion) order.
   @spec pick_by_order(:first | :last, [point(), ...], binary()) :: point()
   defp pick_by_order(:first, points, ordering) do
     Enum.min_by(points, &sort_value(&1, ordering), fn a, b ->
@@ -1292,7 +1397,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # SQL's three-valued logic: a comparison with a null operand is unknown
   # (nil), AND is false if any part is false, OR is true if any part is
   # true, NOT of unknown is unknown, and a row is kept only when true.
-  # Two-valued evaluation kept rows where `NOT (rack = '1')` had no rack.
+  # So `NOT (rack = '1')` does not keep a row that has no rack.
   @spec eval_all(point(), [SQLParser.where_node()]) :: boolean() | nil
   defp eval_all(point, conjunction) do
     Enum.reduce_while(conjunction, true, fn node, acc ->
@@ -1449,6 +1554,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   @spec right_value(point(), term()) :: term()
   defp right_value(point, {:expr, expr}), do: eval_expr(expr, point)
+  defp right_value(_point, {:uint, value}), do: value
   defp right_value(_point, literal), do: literal
 
   @spec in_list(term(), [term()]) :: boolean() | nil
@@ -1462,6 +1568,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   @spec compare3(term(), atom(), term()) :: boolean() | nil
   defp compare3(_actual, _op, nil), do: nil
+  defp compare3(actual, op, {:uint, value}), do: compare(actual, op, value)
   defp compare3(actual, op, value), do: compare(actual, op, value)
 
   @spec both(boolean() | nil, boolean() | nil) :: boolean() | nil
