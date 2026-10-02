@@ -303,18 +303,43 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
     end
   end
 
+  @doc "The expressions directly inside an expression, in the order written."
+  @spec children(t()) :: [t()]
+  def children({:neg, inner}), do: [inner]
+  def children({:cast, inner, _type}), do: [inner]
+  def children({:op, _op, left, right}), do: [left, right]
+  def children({:call, _name, args}), do: args
+  def children(_leaf), do: []
+
+  @doc """
+  The expression with `fun` applied to each expression directly inside it
+  (a leaf is returned as it is).
+  """
+  @spec map_children(t(), (t() -> t())) :: t()
+  def map_children({:neg, inner}, fun), do: {:neg, fun.(inner)}
+  def map_children({:cast, inner, type}, fun), do: {:cast, fun.(inner), type}
+  def map_children({:op, op, left, right}, fun), do: {:op, op, fun.(left), fun.(right)}
+  def map_children({:call, name, args}, fun), do: {:call, name, Enum.map(args, fun)}
+  def map_children(leaf, _fun), do: leaf
+
+  @doc "Whether `predicate` holds for the expression or for any expression inside it."
+  @spec any?(t(), (t() -> boolean())) :: boolean()
+  def any?(expr, predicate),
+    do: predicate.(expr) or Enum.any?(children(expr), &any?(&1, predicate))
+
+  @doc """
+  The first value `fun` finds, other than `nil`: in the expressions inside
+  `expr`, the innermost first, and last in `expr` itself.
+  """
+  @spec find_value(t(), (t() -> term())) :: term()
+  def find_value(expr, fun),
+    do: Enum.find_value(children(expr), &find_value(&1, fun)) || fun.(expr)
+
   @doc "The columns an expression reads, in order."
   @spec columns(t()) :: [column_ref()]
   def columns({:field, ref}), do: [ref]
   def columns({:uint_col, name}), do: [name]
-  def columns({:lit, _value}), do: []
-  def columns({:uint, _value}), do: []
-  def columns({:param, _name}), do: []
-  def columns({:unreadable, _text}), do: []
-  def columns({:neg, inner}), do: columns(inner)
-  def columns({:cast, inner, _type}), do: columns(inner)
-  def columns({:op, _op, left, right}), do: columns(left) ++ columns(right)
-  def columns({:call, _name, args}), do: Enum.flat_map(args, &columns/1)
+  def columns(expr), do: Enum.flat_map(children(expr), &columns/1)
 
   @doc """
   A column reference as the engine prints it in a message: a name bare when

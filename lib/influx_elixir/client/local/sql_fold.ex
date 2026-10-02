@@ -37,46 +37,30 @@ defmodule InfluxElixir.Client.Local.SQLFold do
   end
 
   @doc """
+  Whether a constant sub-expression of `expr` cannot be computed (`1 / 0`):
+  it fails for every row alike.
+  """
+  @spec failing_constant?(SQLExpr.t()) :: boolean()
+  def failing_constant?(expr),
+    do: SQLExpr.any?(expr, &(foldable?(&1) and constant(&1) == :error))
+
+  @doc """
   The smallest integer, as text, whose negation a constant sub-expression
   of `expr` performs (`-(-9223372036854775807 - 1)`), or `nil`. A constant
   that fails some other way is not one.
   """
   @spec negation_overflow(SQLExpr.t()) :: binary() | nil
-  def negation_overflow({:neg, inner} = neg) do
-    negation_overflow(inner) || own_overflow(neg)
-  end
-
-  def negation_overflow({:op, _op, left, right}),
-    do: negation_overflow(left) || negation_overflow(right)
-
-  def negation_overflow({:call, _function, args}),
-    do: Enum.find_value(args, &negation_overflow/1)
-
-  def negation_overflow({:cast, inner, _type}), do: negation_overflow(inner)
-  def negation_overflow(_other), do: nil
+  def negation_overflow(expr), do: SQLExpr.find_value(expr, &own_overflow/1)
 
   @doc """
   Whether a constant sub-expression of `expr` divides the smallest integer of
   a type by -1 (`(-9223372036854775807 - 1) / -1`), which overflows.
   """
   @spec division_overflow?(SQLExpr.t()) :: boolean()
-  def division_overflow?({:op, :/, left, right} = division) do
-    division_overflow?(left) or division_overflow?(right) or own_division(division)
-  end
+  def division_overflow?(expr), do: SQLExpr.any?(expr, &own_division?/1)
 
-  def division_overflow?({:op, _op, left, right}),
-    do: division_overflow?(left) or division_overflow?(right)
-
-  def division_overflow?({:neg, inner}), do: division_overflow?(inner)
-  def division_overflow?({:cast, inner, _type}), do: division_overflow?(inner)
-  def division_overflow?({:call, _function, args}), do: Enum.any?(args, &division_overflow?/1)
-  def division_overflow?(_other), do: false
-
-  @spec own_division(SQLExpr.t()) :: boolean()
-  defp own_division({:op, :/, left, right}), do: own_division?(left, right)
-
-  @spec own_division?(SQLExpr.t(), SQLExpr.t()) :: boolean()
-  defp own_division?(left, right) do
+  @spec own_division?(SQLExpr.t()) :: boolean()
+  defp own_division?({:op, :/, left, right}) do
     with {:ok, dividend} <- constant(left),
          {:ok, divisor} <- constant(right) do
       overflowing_division?(dividend, divisor)
@@ -84,6 +68,8 @@ defmodule InfluxElixir.Client.Local.SQLFold do
       _not_constant -> false
     end
   end
+
+  defp own_division?(_other), do: false
 
   # An integer type's minimum over -1, in the wider of the two types.
   @spec overflowing_division?(term(), term()) :: boolean()
@@ -104,6 +90,8 @@ defmodule InfluxElixir.Client.Local.SQLFold do
     end
   end
 
+  defp own_overflow(_other), do: nil
+
   @spec minimum_text(integer(), 8 | 16 | 32 | 64) :: binary() | nil
   defp minimum_text(value, bits) do
     if value == SQLNumber.minimum(if(bits == 64, do: :int64, else: bits)),
@@ -115,17 +103,10 @@ defmodule InfluxElixir.Client.Local.SQLFold do
   # ---------------------------------------------------------------------------
 
   @spec cast_failure(SQLExpr.t()) :: {:error, SQLError.t()} | nil
-  defp cast_failure({:cast, inner, type}) do
-    cast_failure(inner) || fold_cast(inner, type)
-  end
+  defp cast_failure(expr), do: SQLExpr.find_value(expr, &fold_cast/1)
 
-  defp cast_failure({:op, _op, left, right}), do: cast_failure(left) || cast_failure(right)
-  defp cast_failure({:neg, inner}), do: cast_failure(inner)
-  defp cast_failure({:call, _function, args}), do: Enum.find_value(args, &cast_failure/1)
-  defp cast_failure(_leaf), do: nil
-
-  @spec fold_cast(SQLExpr.t(), SQLExpr.cast_type()) :: {:error, SQLError.t()} | nil
-  defp fold_cast(inner, type) do
+  @spec fold_cast(SQLExpr.t()) :: {:error, SQLError.t()} | nil
+  defp fold_cast({:cast, inner, type}) do
     with {:ok, value} <- constant(inner),
          {:error, message} <- SQLCast.fold(value, type) do
       {:error, SQLError.simplify("Arrow error: Cast error: " <> message)}
@@ -134,24 +115,25 @@ defmodule InfluxElixir.Client.Local.SQLFold do
     end
   end
 
-  # The value of an expression that reads no column, or `:error` when it
-  # cannot be known before a row is read (a failure at run time, a refusal).
+  defp fold_cast(_other), do: nil
+
+  @doc """
+  The value of an expression that reads no column, or `:error` when it
+  cannot be known before a row is read (a failure at run time, a refusal).
+  """
   @spec constant(SQLExpr.t()) :: {:ok, term()} | :error
-  defp constant(expr) do
+  def constant(expr) do
     if foldable?(expr), do: {:ok, SQLEval.eval(expr, @no_point)}, else: :error
   catch
     {:query_error, _error} -> :error
   end
 
   @spec foldable?(SQLExpr.t()) :: boolean()
-  defp foldable?({:field, _ref}), do: false
-  defp foldable?({:uint_col, _name}), do: false
-  defp foldable?({:param, _name}), do: false
-  defp foldable?({:cast, inner, _type}), do: foldable?(inner)
-  defp foldable?({:neg, inner}), do: foldable?(inner)
-  defp foldable?({:op, _op, left, right}), do: foldable?(left) and foldable?(right)
-  defp foldable?({:call, _function, args}), do: Enum.all?(args, &foldable?/1)
-  defp foldable?(_literal), do: true
+  defp foldable?(expr), do: not SQLExpr.any?(expr, &reads_row?/1)
+
+  @spec reads_row?(SQLExpr.t()) :: boolean()
+  defp reads_row?({kind, _name}) when kind in [:field, :uint_col, :param], do: true
+  defp reads_row?(_other), do: false
 
   # ---------------------------------------------------------------------------
   # The query's expressions

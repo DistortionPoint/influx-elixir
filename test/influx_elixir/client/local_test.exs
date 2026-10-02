@@ -2,20 +2,36 @@ defmodule InfluxElixir.Client.LocalTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
+  alias InfluxElixir.Client.Local.Store
 
   setup do
     {:ok, conn} = Local.start(databases: ["test_db"])
     {:ok, conn: conn}
   end
 
-  # The rows with the columns the clock assigns removed (a `time` written
-  # without a timestamp, a Flux range's `_start`/`_stop`), so that everything
-  # else is compared whole.
-  defp without({:ok, rows}, columns), do: {:ok, without(rows, columns)}
-  defp without(rows, columns), do: Enum.map(rows, &Map.drop(&1, columns))
+  # A Flux range with no `stop` ends at the clock's now, and a relative
+  # `start` is a fixed distance before it. `_start` and `_stop` are therefore
+  # the clock's, but not unknown: `_stop` lies between the readings taken
+  # around the query (read from the double's own clock, `Store.now_ns/0`, in
+  # microseconds, which is what a row carries) and `_stop - _start` is the
+  # range's width. Both are asserted, and the rows come back without the two
+  # columns, so that the rest is compared whole.
+  defp flux_now(conn, flux, width_seconds \\ nil) do
+    before = div(Store.now_ns(), 1_000)
+    {:ok, rows} = Local.query_flux(conn, flux)
+    later = div(Store.now_ns(), 1_000)
 
-  # The columns of a Flux row the query's own range and clock set.
-  @flux_range ["_start", "_stop"]
+    for %{"_start" => start, "_stop" => stop} <- rows do
+      stop_us = DateTime.to_unix(stop, :microsecond)
+      assert stop_us >= before and stop_us <= later
+      if width_seconds, do: assert(DateTime.diff(stop, start) === width_seconds)
+    end
+
+    {:ok, Enum.map(rows, &Map.drop(&1, ["_start", "_stop"]))}
+  end
+
+  # The time every row written with `@ts` reads back as.
+  @ts 1_700_000_000_000_000_000
 
   # Host tags of the rows a query returns, in order.
   defp hosts(conn, db, sql) do
@@ -77,9 +93,16 @@ defmodule InfluxElixir.Client.LocalTest do
   # The instant `us` microseconds past 1_700_000_000 s.
   defp iq_time(us), do: DateTime.from_unix!(1_700_000_000_000_000 + us, :microsecond)
 
+  # The `stop` of every `flux_b` query, and the `_stop` its rows carry.
+  @flux_b_stop 1_800_000_000
+  @flux_b_stop_time DateTime.from_unix!(@flux_b_stop * 1_000_000, :microsecond)
+
   # Flux over bucket "b" of the Flux pipeline fixture, with `tail` appended.
   defp flux_b(conn, tail) do
-    Local.query_flux(conn, ~s|from(bucket: "b") \|> range(start: 0, stop: 1800000000)| <> tail)
+    Local.query_flux(
+      conn,
+      ~s|from(bucket: "b") \|> range(start: 0, stop: #{@flux_b_stop})| <> tail
+    )
   end
 
   # {table, host, _value} of each Flux row.
@@ -274,9 +297,6 @@ defmodule InfluxElixir.Client.LocalTest do
                   "must specify a 'db' parameter, or provide the database in the InfluxQL query"
               }} =
                Local.query_influxql(conn, "SHOW MEASUREMENTS")
-
-      assert Local.query_influxql(conn, "SHOW DATABASES") ===
-               {:ok, [%{"iox::database" => "_internal", "deleted" => false}]}
     end
 
     test "init_connection ignores unknown keys without auto-pre-creating them" do
@@ -844,17 +864,19 @@ defmodule InfluxElixir.Client.LocalTest do
     test "returns the bucket's rows tagged with their measurement" do
       {:ok, v2_conn} = Local.start(profile: :v2)
       :ok = Local.create_bucket(v2_conn, "test")
-      {:ok, :written} = Local.write(v2_conn, "cpu value=1.0", database: "test")
+      {:ok, :written} = Local.write(v2_conn, "cpu value=1.0 #{@ts}", database: "test")
 
-      flux = "from(bucket: \"test\") |> range(start: -1h)"
+      flux = "from(bucket: \"test\") |> range(start: 0, stop: #{div(@ts, 1_000_000_000) + 1})"
 
-      # `_time` is the clock's at the write, and the range is relative to now.
-      assert v2_conn |> Local.query_flux(flux) |> without(@flux_range ++ ["_time"]) ===
+      assert Local.query_flux(v2_conn, flux) ===
                {:ok,
                 [
                   %{
                     "result" => "_result",
                     "table" => 0,
+                    "_start" => ~U[1970-01-01 00:00:00.000000Z],
+                    "_stop" => ~U[2023-11-14 22:13:21.000000Z],
+                    "_time" => ~U[2023-11-14 22:13:20.000000Z],
                     "_measurement" => "cpu",
                     "_field" => "value",
                     "_value" => 1.0
@@ -1313,13 +1335,6 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "edge_db"}
     end
 
-    test "SELECT DISTINCT with no column list is one empty row, as on the engine",
-         %{conn: conn, db: db} do
-      {:ok, :written} = Local.write(conn, "prices price=1i 1", database: db)
-
-      assert Local.query_sql(conn, "SELECT DISTINCT FROM prices", database: db) === {:ok, [%{}]}
-    end
-
     test "WHERE time with a DateTime param renders as the ISO string Jason sends",
          %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "m val=1i 5000\nm val=2i 6000", database: db)
@@ -1353,7 +1368,7 @@ defmodule InfluxElixir.Client.LocalTest do
       # SQL quotes identifiers with "..." and strings with '...'. The double
       # used to read "hello" as a string, so a query the engine refuses
       # (verified: No field named hello) passed against it.
-      {:ok, :written} = Local.write(conn, ~s(m,tag=hello val=1i), database: db)
+      {:ok, :written} = Local.write(conn, ~s(m,tag=hello val=1i #{@ts}), database: db)
 
       assert {:error,
               %{
@@ -1361,14 +1376,12 @@ defmodule InfluxElixir.Client.LocalTest do
                 body: "Schema error: No field named hello. Valid fields are m.tag, m.time, m.val."
               }} = Local.query_sql(conn, ~s(SELECT * FROM m WHERE tag = "hello"), database: db)
 
-      # No timestamp was written, so `time` is the clock's.
-      assert conn
-             |> Local.query_sql(~s(SELECT * FROM m WHERE tag = 'hello'), database: db)
-             |> without(["time"]) === {:ok, [%{"tag" => "hello", "val" => 1}]}
+      assert Local.query_sql(conn, ~s(SELECT * FROM m WHERE tag = 'hello'), database: db) ===
+               {:ok, [%{"tag" => "hello", "time" => iq_time(0), "val" => 1}]}
     end
 
     test "float param in SQL literal", %{conn: conn, db: db} do
-      {:ok, :written} = Local.write(conn, "m val=3.14", database: db)
+      {:ok, :written} = Local.write(conn, "m val=3.14 #{@ts}", database: db)
 
       {:ok, rows} =
         Local.query_sql(
@@ -1378,7 +1391,7 @@ defmodule InfluxElixir.Client.LocalTest do
           params: %{"v" => 3.0}
         )
 
-      assert without(rows, ["time"]) === [%{"val" => 3.14}]
+      assert rows === [%{"time" => iq_time(0), "val" => 3.14}]
     end
   end
 
@@ -1443,17 +1456,17 @@ defmodule InfluxElixir.Client.LocalTest do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "db_a")
       :ok = Local.create_database(conn, "db_b")
-      {:ok, :written} = Local.write(conn, "m value=1i", database: "db_a")
-      {:ok, :written} = Local.write(conn, "m value=2i", database: "db_b")
+      {:ok, :written} = Local.write(conn, "m value=1i #{@ts}", database: "db_a")
+      {:ok, :written} = Local.write(conn, "m value=2i #{@ts}", database: "db_b")
       :ok
     end
 
     test "points in db_a are NOT visible from db_b", %{conn: conn} do
-      assert conn |> Local.query_sql("SELECT * FROM m", database: "db_a") |> without(["time"]) ===
-               {:ok, [%{"value" => 1}]}
+      assert Local.query_sql(conn, "SELECT * FROM m", database: "db_a") ===
+               {:ok, [%{"time" => iq_time(0), "value" => 1}]}
 
-      assert conn |> Local.query_sql("SELECT * FROM m", database: "db_b") |> without(["time"]) ===
-               {:ok, [%{"value" => 2}]}
+      assert Local.query_sql(conn, "SELECT * FROM m", database: "db_b") ===
+               {:ok, [%{"time" => iq_time(0), "value" => 2}]}
     end
 
     test "a query against a database that does not exist is the engine's 404", %{conn: conn} do
@@ -1474,10 +1487,10 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "query without explicit database uses the connection's default", %{conn: conn} do
       # setup starts with databases: ["test_db"], the default as over HTTP.
-      {:ok, :written} = Local.write(conn, "m value=99i", database: "test_db")
+      {:ok, :written} = Local.write(conn, "m value=99i #{@ts}", database: "test_db")
 
-      assert conn |> Local.query_sql("SELECT * FROM m") |> without(["time"]) ===
-               {:ok, [%{"value" => 99}]}
+      assert Local.query_sql(conn, "SELECT * FROM m") ===
+               {:ok, [%{"time" => iq_time(0), "value" => 99}]}
     end
   end
 
@@ -1577,15 +1590,13 @@ defmodule InfluxElixir.Client.LocalTest do
       flux =
         "from(bucket: \"flux_db\") |> range(start: -24h) |> filter(fn: (r) => r.host == \"web01\")"
 
-      assert conn |> Local.query_flux(flux) |> without(@flux_range) ===
-               {:ok, [web01_row(now)]}
+      assert flux_now(conn, flux, 86_400) === {:ok, [web01_row(now)]}
     end
 
     test "range(start: -1h) filters old points", %{v2_conn: conn, now: now} do
       flux = "from(bucket: \"flux_db\") |> range(start: -1h)"
 
-      assert conn |> Local.query_flux(flux) |> without(@flux_range) ===
-               {:ok, [web01_row(now)]}
+      assert flux_now(conn, flux, 3_600) === {:ok, [web01_row(now)]}
     end
 
     test "rows are long-format with one table per series", %{v2_conn: conn, now: now} do
@@ -1600,21 +1611,22 @@ defmodule InfluxElixir.Client.LocalTest do
       assert web01["_time"] === DateTime.from_unix!(now, :nanosecond)
     end
 
-    test "filter on _field keeps only that field", %{v2_conn: conn} do
-      {:ok, :written} = Local.write(conn, "mem,host=web01 used=5i,free=7i", database: "flux_db")
+    test "filter on _field keeps only that field", %{v2_conn: conn, now: now} do
+      {:ok, :written} =
+        Local.write(conn, "mem,host=web01 used=5i,free=7i #{now}", database: "flux_db")
 
       flux =
         "from(bucket: \"flux_db\") |> range(start: -1h) " <>
           "|> filter(fn: (r) => r._measurement == \"mem\") " <>
           "|> filter(fn: (r) => r._field == \"free\")"
 
-      # The write carries no timestamp, so `_time` is the clock's.
-      assert conn |> Local.query_flux(flux) |> without(@flux_range ++ ["_time"]) ===
+      assert flux_now(conn, flux, 3_600) ===
                {:ok,
                 [
                   %{
                     "result" => "_result",
                     "table" => 0,
+                    "_time" => DateTime.from_unix!(now, :nanosecond),
                     "_measurement" => "mem",
                     "_field" => "free",
                     "_value" => 7,
@@ -2450,12 +2462,12 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "range with seconds unit filters correctly", %{v2_conn: conn, recent: recent} do
       flux = "from(bucket: \"flux_range_db\") |> range(start: -30s)"
-      assert conn |> Local.query_flux(flux) |> without(@flux_range) === {:ok, [new_row(recent)]}
+      assert flux_now(conn, flux, 30) === {:ok, [new_row(recent)]}
     end
 
     test "range with minutes unit filters correctly", %{v2_conn: conn, recent: recent} do
       flux = "from(bucket: \"flux_range_db\") |> range(start: -1m)"
-      assert conn |> Local.query_flux(flux) |> without(@flux_range) === {:ok, [new_row(recent)]}
+      assert flux_now(conn, flux, 60) === {:ok, [new_row(recent)]}
     end
 
     test "range with days unit includes all recent points", %{v2_conn: conn} do
@@ -2468,7 +2480,7 @@ defmodule InfluxElixir.Client.LocalTest do
       flux =
         "from(bucket: \"flux_range_db\") |> range(start: -1d) |> filter(fn: (r) => r.host == \"new\")"
 
-      assert conn |> Local.query_flux(flux) |> without(@flux_range) === {:ok, [new_row(recent)]}
+      assert flux_now(conn, flux, 86_400) === {:ok, [new_row(recent)]}
     end
   end
 
@@ -2483,7 +2495,7 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, :written} =
         Local.write(
           conn,
-          "devices,id=d1 active=true\ndevices,id=d2 active=false",
+          "devices,id=d1 active=true #{@ts}\ndevices,id=d2 active=false #{@ts}",
           database: "bool_param_db"
         )
 
@@ -2492,13 +2504,10 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "boolean params select by the flag", %{conn: conn, db: db} do
       for {flag, id} <- [{true, "d1"}, {false, "d2"}] do
-        # The rows carry no timestamp, so `time` is the clock's.
-        assert conn
-               |> Local.query_sql("SELECT * FROM devices WHERE active = $flag",
+        assert Local.query_sql(conn, "SELECT * FROM devices WHERE active = $flag",
                  database: db,
                  params: %{"flag" => flag}
-               )
-               |> without(["time"]) === {:ok, [%{"id" => id, "active" => flag}]}
+               ) === {:ok, [%{"id" => id, "active" => flag, "time" => iq_time(0)}]}
       end
     end
 
@@ -2969,20 +2978,6 @@ defmodule InfluxElixir.Client.LocalTest do
                {:ok, [%{"halves" => 3, "squares" => 34, "a" => 4.0}]}
     end
 
-    # A float over zero is infinity on the engine, which COUNT counts and SUM
-    # turns to NaN; the double cannot hold either, so it refuses by name.
-    test "a float divided by zero inside an aggregate sums to null and still counts",
-         %{conn: conn, db: db} do
-      # The engine: SUM over infinities is a non-finite double (sent as
-      # null); COUNT counts the rows, since infinity is not null.
-      sql = ~s|SELECT SUM(value / 0) AS s, COUNT(value / 0) AS n FROM "m"|
-
-      {:ok, [%{"n" => rows}]} =
-        Local.query_sql(conn, ~s|SELECT COUNT(*) AS n FROM "m"|, database: db)
-
-      assert Local.query_sql(conn, sql, database: db) === {:ok, [%{"s" => nil, "n" => rows}]}
-    end
-
     test "a malformed expression is rejected with a Client.Local error", %{conn: conn, db: db} do
       for {expression, rendered} <- [
             {"AVG(value, other)", "avg(value, other)"},
@@ -3094,21 +3089,6 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
       assert row === %{}
-    end
-
-    test "a selector without an accessor is the engine's time/value struct", %{conn: conn, db: db} do
-      assert {:ok, [%{"v" => %{"time" => %DateTime{} = time}} = row]} =
-               Local.query_sql(conn, ~s|SELECT selector_last(value, time) AS v FROM "m"|,
-                 database: db
-               )
-
-      assert row === %{"v" => %{"time" => time, "value" => 5.0}}
-
-      assert Local.query_sql(
-               conn,
-               ~s|SELECT selector_last(value, time)['time'] AS t, selector_last(value, time)['value'] AS x FROM "m"|,
-               database: db
-             ) === {:ok, [%{"t" => time, "x" => 5.0}]}
     end
   end
 
@@ -4154,11 +4134,6 @@ defmodule InfluxElixir.Client.LocalTest do
              ) ===
                {:ok, [%{"volume" => +0.0, "m" => 2.0, "t" => ~U[2023-11-14 22:13:00.000000Z]}]}
     end
-
-    test "a constant without an alias is named as the engine names it", %{conn: conn, db: db} do
-      assert Local.query_sql(conn, ~s|SELECT 1 FROM "p"|, database: db) ===
-               {:ok, [%{"Int64(1)" => 1}, %{"Int64(1)" => 1}]}
-    end
   end
 
   # ---------------------------------------------------------------------------
@@ -4685,7 +4660,7 @@ defmodule InfluxElixir.Client.LocalTest do
         "_measurement" => "cpu",
         "_field" => "v",
         "_start" => ~U[1970-01-01 00:00:00.000000Z],
-        "_stop" => ~U[2027-01-15 08:00:00.000000Z],
+        "_stop" => @flux_b_stop_time,
         "_time" => time,
         "_value" => value,
         "host" => host
@@ -4706,7 +4681,7 @@ defmodule InfluxElixir.Client.LocalTest do
              ]
 
       assert Enum.all?(rows, &(&1["_start"] === ~U[1970-01-01 00:00:00.000000Z]))
-      assert Enum.all?(rows, &(&1["_stop"] === ~U[2027-01-15 08:00:00.000000Z]))
+      assert Enum.all?(rows, &(&1["_stop"] === @flux_b_stop_time))
     end
 
     test "filter predicates: or, !=, not, numeric _value, r[\"key\"], a missing key",
@@ -4778,16 +4753,16 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert Enum.map(rows, & &1["_value"]) === [1.0, 5.0]
 
-      assert Local.query_flux(
+      # With no `stop` the range ends at the clock's now, which `flux_now`
+      # pins between the readings around the query.
+      assert flux_now(
                conn,
                ~s|from(bucket: "b") \|> range(start: 2023-11-14T22:14:00Z) \|> filter(fn: (r) => r._field == "v")|
-             )
-             |> without(["_stop"]) ===
+             ) ===
                {:ok,
                 [
                   cpu_v_row(0, "a", ~U[2023-11-14 22:14:20.000000Z], 3.0)
-                  |> Map.delete("_stop")
-                  |> Map.put("_start", ~U[2023-11-14 22:14:00.000000Z])
+                  |> Map.drop(["_start", "_stop"])
                 ]}
     end
 

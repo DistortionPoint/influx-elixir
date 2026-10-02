@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **0.1.40 shipped a stray script, `lib/influx_elixir/client/local/tmp_edit.exs`,
+  in the package.** It is removed. It was never compiled or loaded.
+- **`Client.Local` queries were 30-100% slower in 0.1.40 than in 0.1.39**
+  at 100k points (`SELECT *`, numeric `WHERE`, every InfluxQL query). Each
+  query scanned every point for column names an `ORDER BY` position might
+  need, converted every result cell, and made a second pass for column
+  types; InfluxQL lost its `SELECT *` fast path. They are back within 10%
+  of 0.1.39.
+- **`Client.Local` SQL runs what the engine's optimizer leaves.**
+  - What the simplifier removes is never evaluated: `x AND false`,
+    `x OR true`, absorption (`A AND (A OR B)`), `x = x` and `x IS NULL` of a
+    constant, and comparisons with a `NULL` literal.
+  - A `CAST` of an integer column to an integer type takes part in the
+    empty-range check (`CAST(j AS INT) > 5 AND j < 3` is the engine's
+    interval error), as does `col = lit AND 1/0 = 1`.
+  - A decimal compared with a float past `1e20` is the optimizer's
+    `Decimal128` error; an integer literal past `UInt64` compares as a
+    double.
+  - `AND`/`OR` whose right operand would fail for a row the left one leaves
+    out is refused by name: the engine evaluates it over a batch of rows.
+- **Smaller `Client.Local` SQL fixes:** `ORDER BY a + 1` reads the output
+  name `a`; `trunc(x, n)` wraps `n` to Int32 and `round(x, n)` past Int32
+  closes the connection, as on the engine; `FOO bar` is the parser's
+  `Expected: an SQL statement`; `COMMIT`, `SET`, `PREPARE` and `EXECUTE`
+  are `Statement not supported`; `SELECT *, i` is refused by name.
+- **InfluxQL in `Client.Local` follows the engine's planner.**
+  - An unsigned field makes arithmetic unsigned, so it wraps (`-u < 0` is
+    never true, `j > u` casts `j`); `SUM` wraps at its type's range, and a
+    float `SUM` past the double range is `null` instead of raising.
+  - `not` is a name; a column aliased `time` becomes `time_1`;
+    `SELECT time FROM t` is empty; `TIME` is the time in any case.
+  - `time = 'a'`, `GROUP BY time`, `WHERE time` and constant select items
+    get the engine's planner errors.
+  - Parentheses in `WHERE`, unclosed literals, `=~` without a regular
+    expression and reserved words after `+`/`-` get the engine's positioned
+    parse errors, after a `;` and in `SHOW TAG VALUES` too.
+  - Two tags compared (`k = x`) are false for every row.
+
+### Changed
+- **`Client.Local`'s InfluxQL and line-protocol modules are split.**
+  `influxql.ex` and `line_protocol_parser.ex` are entry points over modules
+  by seam (parser, checks, `WHERE` planning, typed comparisons, rows,
+  errors; scanner, grammars, numbers, times, escapes, errors).
+- **Test support.** One `InfluxElixir.TestServer` (a black-hole and a
+  test-answered listener) and shared helpers for polling, telemetry and
+  token shapes replace copies in several test files; tests that wrote
+  untimed points now write timestamps and compare whole rows.
+- **Test suite layout.** Each contract runs as per-part async modules
+  (`test/influx_elixir/client/contract_local/<profile>/`,
+  `test/integration/contract_<profile>/`): `mix test` takes 8-10 s instead
+  of 27-41 s. The integration one-liners start Core with
+  `--wal-flush-interval 10ms`, since a write is answered when the WAL
+  flushes: the Core suite takes 18 s instead of 8½ minutes.
+
 ## [0.1.40] - 2026-10-02
 
 ### Fixed

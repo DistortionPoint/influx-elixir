@@ -29,10 +29,16 @@ defmodule InfluxElixir.Client.Local.SQLRow do
     end
   end
 
-  def column_value(point, column) do
-    case point.tags do
-      %{^column => value} -> value
-      _no_tag -> Map.get(point.fields, column)
+  def column_value(%{tags: tags, fields: fields}, column) do
+    case tags do
+      %{^column => value} ->
+        value
+
+      _no_tag ->
+        case fields do
+          %{^column => value} -> value
+          _no_field -> nil
+        end
     end
   end
 

@@ -13,6 +13,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   """
 
   alias InfluxElixir.Client.Local.{
+    SQLDecimal,
     SQLError,
     SQLExpr,
     SQLFunctions,
@@ -312,6 +313,13 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   @spec check_comparison(atom(), SQLParser.expr(), term(), %{binary() => binary()}) ::
           :ok | {:error, map()}
   defp check_comparison(op, left, right, columns) do
+    with :ok <- boolean_comparison(op, left, right, columns),
+         do: SQLDecimal.check(left, [right], columns)
+  end
+
+  @spec boolean_comparison(atom(), SQLParser.expr(), term(), %{binary() => binary()}) ::
+          :ok | {:error, map()}
+  defp boolean_comparison(op, left, right, columns) do
     case {SQLFunctions.type_of(left, columns), value_type(right)} do
       {column, value} when is_binary(column) and is_binary(value) ->
         if boolean_mismatch?(column, value),
@@ -331,6 +339,13 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   @spec check_in_list(SQLParser.expr(), [term()], %{binary() => binary()}) ::
           :ok | {:error, map()}
   defp check_in_list(left, values, columns) do
+    with :ok <- boolean_list(left, values, columns),
+         do: SQLDecimal.check(left, values, columns)
+  end
+
+  @spec boolean_list(SQLParser.expr(), [term()], %{binary() => binary()}) ::
+          :ok | {:error, map()}
+  defp boolean_list(left, values, columns) do
     types = Enum.map(values, &value_type/1)
 
     with column when is_binary(column) <- SQLFunctions.type_of(left, columns),
@@ -348,6 +363,13 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   @spec check_range(SQLParser.expr(), term(), term(), %{binary() => binary()}) ::
           :ok | {:error, map()}
   defp check_range(left, low, high, columns) do
+    with :ok <- boolean_range(left, low, high, columns),
+         do: SQLDecimal.check(left, [low, high], columns)
+  end
+
+  @spec boolean_range(SQLParser.expr(), term(), term(), %{binary() => binary()}) ::
+          :ok | {:error, map()}
+  defp boolean_range(left, low, high, columns) do
     with column when is_binary(column) <- SQLFunctions.type_of(left, columns),
          bound when is_binary(bound) <-
            Enum.find([value_type(low), value_type(high)], &boolean_mismatch_with?(column, &1)) do

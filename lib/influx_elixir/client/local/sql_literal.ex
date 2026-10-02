@@ -18,6 +18,8 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
 
   alias InfluxElixir.Client.Local.SQLMask
 
+  import InfluxElixir.Client.Local.SQLLimits, only: [is_int64: 1, is_uint64: 1]
+
   @typedoc "A literal or placeholder as the parser keeps it."
   @type value :: number() | binary() | boolean() | {:param, binary()}
 
@@ -97,18 +99,33 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
     end
   end
 
-  @doc "Types a bare literal: integer, then float, else leaves it as a string."
+  @doc """
+  Types a bare literal as the engine does: an integer that fits `Int64` or
+  `UInt64`, else a float (an integer past both is the double nearest it, so
+  a `UInt64` column compares with `18446744073709551616` as a double), else
+  leaves it as a string.
+  """
   @spec coerce(binary()) :: number() | binary()
   def coerce(text) do
     case Integer.parse(text) do
       {n, ""} ->
-        n
+        double_past_integers(n, text)
 
       _no_int ->
         case Float.parse(text) do
           {f, ""} -> f
           _no_parse -> text
         end
+    end
+  end
+
+  @spec double_past_integers(integer(), binary()) :: number()
+  defp double_past_integers(n, _text) when is_int64(n) or is_uint64(n), do: n
+
+  defp double_past_integers(n, text) do
+    case float_value(text) do
+      :nonfinite -> n
+      value -> value
     end
   end
 

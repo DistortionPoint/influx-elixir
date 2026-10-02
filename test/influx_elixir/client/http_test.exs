@@ -2,7 +2,7 @@ defmodule InfluxElixir.Client.HTTPTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.HTTP
-  alias InfluxElixir.StreamError
+  alias InfluxElixir.{StreamError, TestServer}
 
   # ---------------------------------------------------------------------------
   # init_connection — :database resolution parity with Client.Local
@@ -14,14 +14,14 @@ defmodule InfluxElixir.Client.HTTPTest do
   describe "init_connection/1 — :database resolution" do
     test "passes :database through unchanged" do
       {:ok, conn} = HTTP.init_connection(host: "h", token: "t", database: "primary")
-      assert Keyword.get(conn, :database) == "primary"
+      assert Keyword.get(conn, :database) === "primary"
     end
 
     test "defaults :database to first of :databases when singular missing" do
       {:ok, conn} =
         HTTP.init_connection(host: "h", token: "t", databases: ["a", "b"])
 
-      assert Keyword.get(conn, :database) == "a"
+      assert Keyword.get(conn, :database) === "a"
     end
 
     test "preserves :database when both keys are given" do
@@ -33,12 +33,12 @@ defmodule InfluxElixir.Client.HTTPTest do
           databases: ["a", "b"]
         )
 
-      assert Keyword.get(conn, :database) == "primary"
+      assert Keyword.get(conn, :database) === "primary"
     end
 
     test "leaves :database absent when neither key is given" do
       {:ok, conn} = HTTP.init_connection(host: "h", token: "t")
-      assert Keyword.get(conn, :database) == nil
+      assert Keyword.get(conn, :database) === nil
     end
   end
 
@@ -53,55 +53,19 @@ defmodule InfluxElixir.Client.HTTPTest do
 
   @timed_out {:error, {:connection_error, %Mint.TransportError{reason: :timeout}}}
 
-  # The port of a listener that accepts connections and says nothing. The
-  # acceptor is a supervised task that owns the listener and every socket it
-  # takes, so all of them close when the test ends. With `:notify` the test
-  # process is told (`:held`) each time a connection has been taken.
-  defp black_hole(notify \\ :silent) do
-    owner = self()
-    ref = make_ref()
-    tell = if notify == :notify, do: owner, else: nil
-
-    start_supervised!(
-      Supervisor.child_spec(
-        {Task,
-         fn ->
-           {:ok, listener} =
-             :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, backlog: 128])
-
-           {:ok, port} = :inet.port(listener)
-           send(owner, {ref, port})
-           accept_and_hold(listener, tell, [])
-         end},
-        id: ref
-      )
-    )
-
-    receive do
-      {^ref, port} -> port
-    after
-      5_000 -> flunk("the black hole did not start listening")
-    end
-  end
-
-  defp accept_and_hold(listener, tell, sockets) do
-    case :gen_tcp.accept(listener) do
-      {:ok, socket} ->
-        if tell, do: send(tell, :held)
-        accept_and_hold(listener, tell, [socket | sockets])
-
-      {:error, _closed} ->
-        :ok
-    end
-  end
-
   # A pool of one connection, so a second request has to wait for the first.
   defp connection(port, extra) do
     finch = :"http_test_finch_#{System.unique_integer([:positive])}"
     start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}}, id: finch)
 
-    [host: "127.0.0.1", port: port, scheme: :http, token: "t", database: "db", finch_name: finch] ++
-      extra
+    [
+      host: "127.0.0.1",
+      port: port,
+      scheme: :http,
+      token: "t",
+      database: "db",
+      finch_name: finch
+    ] ++ extra
   end
 
   # The request's answer, or `:hung` when it is still waiting after `wait` ms.
@@ -136,54 +100,57 @@ defmodule InfluxElixir.Client.HTTPTest do
 
   describe "the receive timeout" do
     test "the option wins over the connection's" do
-      conn = connection(black_hole(), timeout: 60_000)
+      conn = connection(TestServer.black_hole(), timeout: 60_000)
 
-      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1", timeout: 150) end) ==
+      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1", timeout: 40) end) ===
                @timed_out
     end
 
     test "the connection's applies when the option is absent" do
-      conn = connection(black_hole(), timeout: 150)
-      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1") end) == @timed_out
+      conn = connection(TestServer.black_hole(), timeout: 40)
+      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1") end) === @timed_out
     end
 
     test "a nil option falls through to the connection's" do
-      conn = connection(black_hole(), timeout: 150)
+      conn = connection(TestServer.black_hole(), timeout: 40)
 
-      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1", timeout: nil) end) ==
+      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1", timeout: nil) end) ===
                @timed_out
     end
 
     test "every query function reads it" do
-      conn = connection(black_hole(), timeout: 150)
+      conn = connection(TestServer.black_hole(), timeout: 40)
 
-      for call <- [
-            fn -> HTTP.query_sql(conn, "SELECT 1") end,
-            fn -> HTTP.execute_sql(conn, "SELECT 1") end,
-            fn -> HTTP.query_influxql(conn, "SELECT 1") end
-          ] do
-        assert {:error, {:connection_error, %Mint.TransportError{reason: :timeout}}} =
-                 answer_within(20_000, call)
-      end
+      # Concurrent, so the three timeouts run their course in one wait.
+      answers =
+        [
+          fn -> HTTP.query_sql(conn, "SELECT 1") end,
+          fn -> HTTP.execute_sql(conn, "SELECT 1") end,
+          fn -> HTTP.query_influxql(conn, "SELECT 1") end
+        ]
+        |> Enum.map(&Task.async(fn -> answer_within(20_000, &1) end))
+        |> Enum.map(&Task.await(&1, 30_000))
+
+      assert answers === [@timed_out, @timed_out, @timed_out]
     end
   end
 
   describe "the pool checkout timeout" do
     test "the option wins over the connection's" do
-      conn = connection(black_hole(:notify), pool_timeout: 60_000)
+      conn = connection(TestServer.black_hole(notify: self()), pool_timeout: 60_000)
       holder = hold_the_connection(conn)
 
-      assert answer_within(3_000, fn -> HTTP.query_sql(conn, "SELECT 1", pool_timeout: 100) end) ==
-               {:error, {:connection_error, :pool_timeout}}
+      query = fn -> HTTP.query_sql(conn, "SELECT 1", pool_timeout: 40) end
+      assert answer_within(3_000, query) === {:error, {:connection_error, :pool_timeout}}
 
       Task.shutdown(holder, :brutal_kill)
     end
 
     test "the connection's applies when the option is absent, and is independent of :timeout" do
-      conn = connection(black_hole(:notify), pool_timeout: 100, timeout: 180_000)
+      conn = connection(TestServer.black_hole(notify: self()), pool_timeout: 40, timeout: 180_000)
       holder = hold_the_connection(conn)
 
-      assert answer_within(3_000, fn -> HTTP.query_sql(conn, "SELECT 1") end) ==
+      assert answer_within(3_000, fn -> HTTP.query_sql(conn, "SELECT 1") end) ===
                {:error, {:connection_error, :pool_timeout}}
 
       Task.shutdown(holder, :brutal_kill)
@@ -195,9 +162,9 @@ defmodule InfluxElixir.Client.HTTPTest do
   # one reads the defaults from the resolvers (public only for this test).
   describe "the timeout defaults" do
     test "are 30 seconds to receive and 5 to check out when nothing names one" do
-      assert HTTP.resolve_timeout([], host: "h") == 30_000
-      assert HTTP.resolve_pool_timeout([], []) == 5_000
-      assert HTTP.resolve_pool_timeout([timeout: 180_000], timeout: 180_000) == 5_000
+      assert HTTP.resolve_timeout([], host: "h") === 30_000
+      assert HTTP.resolve_pool_timeout([], []) === 5_000
+      assert HTTP.resolve_pool_timeout([timeout: 180_000], timeout: 180_000) === 5_000
     end
   end
 
@@ -260,8 +227,8 @@ defmodule InfluxElixir.Client.HTTPTest do
           ] do
         opts = [params: params]
 
-        assert HTTP.query_sql(conn, "select 1", opts) == {:error, error}
-        assert HTTP.execute_sql(conn, "select 1", opts) == {:error, error}
+        assert HTTP.query_sql(conn, "select 1", opts) === {:error, error}
+        assert HTTP.execute_sql(conn, "select 1", opts) === {:error, error}
 
         stream_error =
           assert_raise StreamError, fn ->
@@ -277,8 +244,8 @@ defmodule InfluxElixir.Client.HTTPTest do
       conn = connection(1, [])
 
       for params <- [nil, [], [p: 1], %{}, %{p: Decimal.new("1000.00")}] do
-        assert HTTP.query_sql(conn, "select 1", params: params) == @closed, inspect(params)
-        assert HTTP.execute_sql(conn, "select 1", params: params) == @closed, inspect(params)
+        assert HTTP.query_sql(conn, "select 1", params: params) === @closed, inspect(params)
+        assert HTTP.execute_sql(conn, "select 1", params: params) === @closed, inspect(params)
       end
     end
   end

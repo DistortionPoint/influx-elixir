@@ -54,6 +54,10 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
 
   @integer_types ["Int64", "Int32", "Int16", "Int8"]
 
+  @int32_min -2_147_483_648
+  @int32_max 2_147_483_647
+  @two_32 4_294_967_296
+
   @round_signature "OneOf([Exact([Float64, Int64]), Exact([Float32, Int64]), " <>
                      "Exact([Float64]), Exact([Float32])])"
   @trunc_signature "OneOf([Exact([Float32, Int64]), Exact([Float64, Int64]), " <>
@@ -91,16 +95,27 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   defp compute(:round, [x]), do: x |> SQLNumber.to_float() |> round_away()
   defp compute(:round, [x, {:int, _bits, scale}]), do: compute(:round, [x, scale])
   defp compute(:round, [x, 0]), do: x |> SQLNumber.to_float() |> round_away()
+
+  # A scale past `Int32` closes the connection (verified, in both directions).
+  defp compute(:round, [_x, scale]) when scale > @int32_max or scale < @int32_min,
+    do: throw({:query_error, SQLError.closed()})
+
   defp compute(:round, [x, scale]), do: scaled(SQLNumber.to_float(x), scale)
 
   # With a scale `trunc` rounds, exactly as `round` does (verified over a
-  # range of values and scales); without one it truncates toward zero, and a
-  # zero it leaves keeps the sign of a fraction (`trunc(-0.4)` is `-0.0`) but
-  # not of a zero (`trunc(-0.0)` is `0.0`).
+  # range of values and scales), after the engine reads the scale as an
+  # `Int32`, wrapping what does not fit (`trunc(3.25, 4294967296)` is `3.0`,
+  # `trunc(3.25, 9223372036854775807)` is `0.0`); without one it truncates
+  # toward zero, and a zero it leaves keeps the sign of a fraction
+  # (`trunc(-0.4)` is `-0.0`) but not of a zero (`trunc(-0.0)` is `0.0`).
   defp compute(:trunc, [x]), do: x |> SQLNumber.to_float() |> truncate()
-  defp compute(:trunc, [x, scale]), do: compute(:round, [x, scale])
+  defp compute(:trunc, [x, {:int, _bits, scale}]), do: compute(:trunc, [x, scale])
+  defp compute(:trunc, [x, scale]), do: compute(:round, [x, wrap_int32(scale)])
   defp compute(:floor, [x]), do: x |> SQLNumber.to_float() |> floor_float()
   defp compute(:ceil, [x]), do: x |> SQLNumber.to_float() |> ceil_float()
+
+  @spec wrap_int32(integer()) :: integer()
+  defp wrap_int32(scale), do: Integer.mod(scale - @int32_min, @two_32) + @int32_min
 
   @spec absolute_float(float() | SQLNumber.special()) :: float() | SQLNumber.special()
   defp absolute_float(x) when x in [:inf, :neg_inf], do: :inf

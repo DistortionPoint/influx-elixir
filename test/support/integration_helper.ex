@@ -105,8 +105,8 @@ defmodule InfluxElixir.IntegrationHelper do
   `POST /api/v3/configure/token/admin` (which works once per server).
   `{:error, reason}` when neither gives a token.
   """
-  @spec v3_core_auth_conn() :: {:ok, keyword()} | {:error, term()}
-  def v3_core_auth_conn do
+  @spec v3_core_auth_conn(keyword()) :: {:ok, keyword()} | {:error, term()}
+  def v3_core_auth_conn(overrides \\ []) do
     base = [
       host: env("INFLUX_V3_AUTH_HOST", "localhost"),
       port: env_int("INFLUX_V3_AUTH_PORT", 8183),
@@ -114,6 +114,8 @@ defmodule InfluxElixir.IntegrationHelper do
       name: :integration_v3_core_auth,
       finch_name: :integration_finch
     ]
+
+    base = Keyword.merge(base, overrides)
 
     with {:ok, token} <- operator_token(base), do: {:ok, Keyword.put(base, :token, token)}
   end
@@ -127,7 +129,7 @@ defmodule InfluxElixir.IntegrationHelper do
       _unset ->
         url = "http://#{conn[:host]}:#{conn[:port]}/api/v3/configure/token/admin"
 
-        case Finch.request(Finch.build(:post, url), :integration_finch) do
+        case Finch.request(Finch.build(:post, url), conn[:finch_name]) do
           {:ok, %Finch.Response{status: 201, body: body}} -> {:ok, Jason.decode!(body)["token"]}
           {:ok, %Finch.Response{status: status, body: body}} -> {:error, {status, body}}
           {:error, reason} -> {:error, reason}
@@ -148,8 +150,9 @@ defmodule InfluxElixir.IntegrationHelper do
     url = "#{scheme}://#{host}:#{port}/health"
 
     request = Finch.build(:get, url)
+    finch_name = Keyword.get(conn, :finch_name, :integration_finch)
 
-    case Finch.request(request, :integration_finch, receive_timeout: 2_000) do
+    case Finch.request(request, finch_name, receive_timeout: 2_000) do
       {:ok, %Finch.Response{}} -> true
       _other -> false
     end

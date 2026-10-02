@@ -12,6 +12,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
   alias InfluxElixir.Client.Local
   alias InfluxElixir.Client.Local.{LineProtocolParser, Store}
+  alias InfluxElixir.TestSupport.Await
+  alias InfluxElixir.TestSupport.Tokens, as: TokenShape
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -75,10 +77,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
   end
 
   # Returns once the clock reads later than it did, so that a second stamp
-  # taken after this call cannot equal one taken before it.
+  # taken after this call cannot equal one taken before it. Fails the test,
+  # rather than spinning on, if the clock never moves.
   defp let_the_clock_move do
     started = System.os_time(:nanosecond)
-    Enum.find(Stream.repeatedly(fn -> System.os_time(:nanosecond) end), &(&1 > started))
+    Await.until(fn -> System.os_time(:nanosecond) > started end)
   end
 
   defp iql(conn, statement), do: Local.query_influxql(conn, statement, database: "db")
@@ -526,12 +529,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     end
   end
 
-  # A payload is parsed a chunk of lines at a time; these write enough lines
-  # for bad ones to fall on either side of every chunk boundary, and read the
-  # numbers the error body gives.
+  # A payload is parsed in chunks of 10,000 lines, so a payload has to exceed
+  # 10,000 lines for a chunk boundary to be crossed. These write just enough
+  # lines for bad ones to fall on either side of the first boundary (and, in
+  # the one test that numbers errors, the second) and read the numbers the
+  # error body gives.
   describe "write/3 — a payload of many lines" do
-    @many 25_000
-    @around_boundaries [9_999, 10_000, 10_001, 19_999, 20_000, 20_001, 25_000]
+    @one_boundary 10_001
+    @two_boundaries 20_001
+    @first_boundary [9_999, 10_000, 10_001]
+    @both_boundaries [9_999, 10_000, 10_001, 19_999, 20_000, 20_001]
 
     defp many_lines(count, bad) do
       Enum.map_join(1..count, "\n", fn i ->
@@ -541,22 +548,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
     test "every point of a payload is stored, whichever chunk it is in" do
       conn = v3_conn()
-      assert {:ok, :written} = Local.write(conn, many_lines(@many, []), database: "db")
+      assert {:ok, :written} = Local.write(conn, many_lines(@one_boundary, []), database: "db")
 
       assert {:ok, rows} = iql(conn, "SELECT v FROM m")
-      assert Enum.map(rows, & &1["v"]) === Enum.to_list(1..@many)
+      assert Enum.map(rows, & &1["v"]) === Enum.to_list(1..@one_boundary)
     end
 
     test "InfluxDB 3 numbers and echoes an error in any chunk, and writes the other lines" do
       conn = v3_conn()
 
       assert {:error, %{status: 400, body: body}} =
-               Local.write(conn, many_lines(@many, @around_boundaries), database: "db")
+               Local.write(conn, many_lines(@two_boundaries, @both_boundaries), database: "db")
 
       assert %{"data" => data} = Jason.decode!(body)
 
       assert for(%{"line_number" => n, "original_line" => shown} <- data, do: {n, shown}) ===
-               for(i <- @around_boundaries, do: {i, "BAD#{i}"})
+               for(i <- @both_boundaries, do: {i, "BAD#{i}"})
 
       assert iql(conn, "SELECT count(v) FROM m") ===
                {:ok,
@@ -564,7 +571,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
                   %{
                     "iox::measurement" => "m",
                     "time" => ~U[1970-01-01 00:00:00.000000Z],
-                    "count" => @many - length(@around_boundaries)
+                    "count" => @two_boundaries - length(@both_boundaries)
                   }
                 ]}
     end
@@ -573,11 +580,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       conn = v2_conn()
 
       assert {:error, %{status: 400, body: body}} =
-               Local.write(conn, many_lines(@many, @around_boundaries), database: "b")
+               Local.write(conn, many_lines(@one_boundary, @first_boundary), database: "b")
 
       assert Jason.decode!(body)["message"] ===
                Enum.map_join(
-                 @around_boundaries,
+                 @first_boundary,
                  "\n",
                  &"unable to parse 'BAD#{&1}': missing fields"
                )
@@ -587,10 +594,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       conn = v3_conn()
 
       # Every third line is a comment, so physical line i is line i - div(i, 3).
-      bad = [14_999, 15_001, 29_999]
+      bad = [14_999, 15_001]
 
       payload =
-        Enum.map_join(1..30_000, "\n", fn i ->
+        Enum.map_join(1..15_002, "\n", fn i ->
           cond do
             rem(i, 3) == 0 -> "# c#{i}"
             i in bad -> "BAD#{i}"
@@ -603,12 +610,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
       # The engine echoes the physical line that has the error's number.
       assert for(%{"line_number" => n, "original_line" => shown} <- data, do: {n, shown}) ===
-               [{10_000, "m v=1i 10000"}, {10_001, "m v=1i 10001"}, {20_000, "m v=1i 20000"}]
+               [{10_000, "m v=1i 10000"}, {10_001, "m v=1i 10001"}]
     end
 
     test "a payload of only comments is empty" do
       conn = v3_conn()
-      text = Enum.map_join(1..@many, "\n", &"# c#{&1}")
+      text = Enum.map_join(1..@one_boundary, "\n", &"# c#{&1}")
 
       assert {:error, %{status: 400, body: "incoming write was empty"}} =
                Local.write(conn, text, database: "db")
@@ -1446,15 +1453,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       assert Store.points(table, "b", "m") ===
                [%{measurement: "m", tags: %{}, fields: %{"v" => 2}, timestamp: 5}]
 
-      assert [_first | _rest] = :ets.match_object(table, {{:series_time, "b", :_, :_, :_}})
-      assert [_first | _rest] = :ets.match_object(table, {{:duplicates, "b", :_}})
-
       assert :ok = Store.delete_bucket(table, "b")
 
       assert Store.points(table, "b", "m") === []
       assert Store.column_kind(table, "b", "m", "v") === nil
-      assert [] = :ets.match_object(table, {{:series_time, "b", :_, :_, :_}})
-      assert [] = :ets.match_object(table, {{:duplicates, "b", :_}})
+
+      # A bucket made again under the name reads nothing back, and takes the
+      # same series and time as a first write: one point, with only its own
+      # fields, not merged with anything the deleted bucket held.
+      Store.put_bucket(table, "b", %{retention: 0})
+      assert Store.points(table, "b", "m") === []
+
+      Store.store_points(table, "b", [%{stored("m", %{}, 3, 5) | fields: %{"w" => 3}}])
+
+      assert Store.points(table, "b", "m") ===
+               [%{measurement: "m", tags: %{}, fields: %{"w" => 3}, timestamp: 5}]
     end
   end
 
@@ -1690,18 +1703,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       assert merged.fields === %{"a" => 1, "b" => 2, "c" => 2}
     end
 
-    test "a payload with no repeat and no earlier write marks no duplicates" do
+    test "a payload with no repeat stores every point, and a later repeat adds none" do
       table = Store.new(["db"])
       Store.store_points(table, "db", for(t <- 1..5, do: stored("m", %{}, t, t)))
 
-      assert [] = :ets.match_object(table, {{:duplicates, "db", :_}})
-      assert table |> Store.points("db", "m") |> length() === 5
+      assert table |> Store.points("db", "m") |> Enum.map(& &1.timestamp) === [1, 2, 3, 4, 5]
 
-      # The marker is what a repeat sets, so the empty answer above means
-      # something.
       Store.store_points(table, "db", [stored("m", %{}, 9, 3)])
-      assert [{{:duplicates, "db", "m"}}] = :ets.match_object(table, {{:duplicates, "db", :_}})
-      assert table |> Store.points("db", "m") |> length() === 5
+
+      assert table |> Store.points("db", "m") |> Enum.map(&{&1.timestamp, &1.fields}) ===
+               [
+                 {1, %{"v" => 1}},
+                 {2, %{"v" => 2}},
+                 {3, %{"v" => 9}},
+                 {4, %{"v" => 4}},
+                 {5, %{"v" => 5}}
+               ]
     end
 
     test "a point without a timestamp is stamped, and stored" do
@@ -1789,14 +1806,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
     test "a taken token name is a 409, and a deleted one comes back with the next id" do
       conn = v3_conn([])
-      # The secret, its hash and the creation time are generated.
-      generated = ["token", "hash", "created_at"]
-      assert {:ok, first} = Local.create_token(conn, "tok1")
-      assert Map.drop(first, generated) === %{"id" => 1, "name" => "tok1", "expiry" => nil}
+      # The secret, its hash and the creation time are generated: `public/1`
+      # checks their shape and drops them.
+      assert conn |> Local.create_token("tok1") |> TokenShape.public() ===
+               {:ok, %{"id" => 1, "name" => "tok1", "expiry" => nil}}
+
       assert {:error, %{status: 409}} = Local.create_token(conn, "tok1")
       assert :ok = Local.delete_token(conn, "tok1")
-      assert {:ok, again} = Local.create_token(conn, "tok1")
-      assert Map.drop(again, generated) === %{"id" => 2, "name" => "tok1", "expiry" => nil}
+
+      assert conn |> Local.create_token("tok1") |> TokenShape.public() ===
+               {:ok, %{"id" => 2, "name" => "tok1", "expiry" => nil}}
     end
 
     test "writers of one series at once leave one point per time" do

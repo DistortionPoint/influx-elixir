@@ -82,10 +82,10 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     end
   end
 
-  @doc "Whether a relation's columns cannot be known: a table with no rows."
+  # Whether a relation's columns cannot be known: a table with no rows.
   @spec unknown_schema?(relation()) :: boolean()
-  def unknown_schema?(%{columns: nil, points: []}), do: true
-  def unknown_schema?(_relation), do: false
+  defp unknown_schema?(%{columns: nil, points: []}), do: true
+  defp unknown_schema?(_relation), do: false
 
   @spec quick_columns(relation()) :: MapSet.t(binary())
   defp quick_columns(%{columns: columns}) when is_list(columns), do: MapSet.new(columns)
@@ -248,7 +248,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     order_by_refs =
       Enum.flat_map(query.order_by, fn
         {{:expr, expr}, _direction} ->
-          expr_fields(expr)
+          Enum.reject(expr_fields(expr), &(&1 in aliases))
 
         {column, _direction} ->
           if column in aliases or ordinal?(query, column), do: [], else: [column]
@@ -286,23 +286,34 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @spec resolve_ordinals(SQLParser.parsed_query(), [relation()]) ::
           {:ok, SQLParser.parsed_query()} | {:error, map()}
   def resolve_ordinals(query, relations) do
-    columns = output_columns(query, relations)
+    if star?(query) and Enum.any?(query.order_by, &positional?/1),
+      do: resolve_positions(query, output_columns(query, relations)),
+      else: {:ok, query}
+  end
 
-    if is_nil(columns) or not star?(query) do
-      {:ok, query}
-    else
-      query.order_by
-      |> Enum.reduce_while({:ok, []}, fn {target, direction}, {:ok, acc} ->
-        case resolve_ordinal(target, columns) do
-          {:ok, column} -> {:cont, {:ok, [{column, direction} | acc]}}
-          {:error, _reason} = error -> {:halt, error}
-        end
-      end)
-      |> then(fn
-        {:ok, terms} -> {:ok, %{query | order_by: Enum.reverse(terms)}}
-        {:error, _reason} = error -> error
-      end)
-    end
+  @spec positional?({term(), term()}) :: boolean()
+  defp positional?({target, _direction}) when is_binary(target),
+    do: SQLClauses.order_position(target, 0) != :not_positional
+
+  defp positional?({{:expr, {:lit, _value}}, _direction}), do: true
+  defp positional?(_term), do: false
+
+  @spec resolve_positions(SQLParser.parsed_query(), [binary()] | nil) ::
+          {:ok, SQLParser.parsed_query()} | {:error, map()}
+  defp resolve_positions(query, nil), do: {:ok, query}
+
+  defp resolve_positions(query, columns) do
+    query.order_by
+    |> Enum.reduce_while({:ok, []}, fn {target, direction}, {:ok, acc} ->
+      case resolve_ordinal(target, columns) do
+        {:ok, column} -> {:cont, {:ok, [{column, direction} | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> then(fn
+      {:ok, terms} -> {:ok, %{query | order_by: Enum.reverse(terms)}}
+      {:error, _reason} = error -> error
+    end)
   end
 
   @spec resolve_ordinal(term(), [binary()]) :: {:ok, term()} | {:error, map()}
@@ -387,18 +398,14 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   def expr_fields({:expr, expr}), do: expr_fields(expr)
   def expr_fields({:field, name}), do: [name]
   def expr_fields({:uint_col, name}), do: [name]
-  def expr_fields({:op, _op, left, right}), do: expr_fields(left) ++ expr_fields(right)
-  def expr_fields({:cast, inner, _type}), do: expr_fields(inner)
-  def expr_fields({:call, _function, args}), do: expr_fields(args)
   def expr_fields(items) when is_list(items), do: Enum.flat_map(items, &expr_fields/1)
-  def expr_fields({:neg, inner}), do: expr_fields(inner)
   def expr_fields({:aggregate, _agg, expr}), do: expr_fields(expr)
   def expr_fields({:cut, call}), do: expr_fields(call)
   def expr_fields({:pattern, _kind, expr, _rest}), do: expr_fields(expr)
   def expr_fields({:compare, _op, left, _right}), do: expr_fields(left)
   def expr_fields({:in_list, left, _values}), do: expr_fields(left)
   def expr_fields({:range, left, _low, _high}), do: expr_fields(left)
-  def expr_fields(_other), do: []
+  def expr_fields(expr), do: Enum.flat_map(SQLExpr.children(expr), &expr_fields/1)
 
   @doc """
   The columns a query's rows are made of, whether or not any row has a value

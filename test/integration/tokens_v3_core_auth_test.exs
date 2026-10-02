@@ -11,7 +11,7 @@ defmodule InfluxElixir.Integration.TokensV3CoreAuthTest do
   """
 
   # async: false — token ids are compared with each other (`next == id + 1`), so no other
-  # module may create a token on this server meanwhile; the Finch pool is global too.
+  # module may create a token on this server meanwhile.
   use ExUnit.Case, async: false
 
   @moduletag :v3_core_auth
@@ -22,9 +22,10 @@ defmodule InfluxElixir.Integration.TokensV3CoreAuthTest do
   alias InfluxElixir.IntegrationHelper, as: H
 
   setup_all do
-    H.start_finch()
+    finch = Module.concat(__MODULE__, Finch)
+    start_supervised!({Finch, name: finch, pools: %{default: [size: 5]}})
 
-    case H.v3_core_auth_conn() do
+    case H.v3_core_auth_conn(finch_name: finch) do
       {:ok, conn} -> {:ok, conn: conn, shared: true}
       {:error, reason} -> {:ok, unavailable: reason}
     end

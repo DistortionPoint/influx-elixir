@@ -406,6 +406,19 @@ Anything outside the supported subset is rejected with
 `{:error, %{status: 400, body: "Client.Local: ..."}}`. The `Client.Local:`
 prefix tells you the double, not InfluxDB, refused the query.
 
+Two things are worth knowing when a test must also hold against the engine:
+
+- Without `ORDER BY` the double returns rows in time order. The engine's
+  order is not defined: it sorts what it reads by the tags (in the order
+  they were first written) and then by time, but which block of rows comes
+  first depends on how the data was written and held (separate writes, a
+  tag filter), so ask for the order you assert on.
+- The engine runs `a AND b` and `a OR b` over a batch of rows, and a `b`
+  that fails for a row `a` leaves out (`j <> 0 AND 100 / j > 1`) fails the
+  query or not by how it batches them. The double refuses such a query by
+  name rather than guess (a filter in a CTE does not help: the engine merges
+  it with the outer one). Keep such a query to an integration test.
+
 `GROUP BY DATE_BIN` is optional. When omitted, aggregate queries return a
 single scalar row over all matching points:
 
@@ -766,11 +779,17 @@ LIMIT $row_limit
   )
 ```
 
-Targets are `INTEGER` (`INT`, `BIGINT`), `DOUBLE` (`FLOAT`) and `VARCHAR`
-(`STRING`, `TEXT`). Text converts only when the whole string is a number, a
-float truncates to an integer, and a number renders to text. A cast that
-cannot be performed — `'abc'` to `INTEGER`, `time` to `INTEGER` — makes
-InfluxDB 3 Core drop the connection mid-response rather than send an error;
+Targets are `BIGINT` (`INT8`, 64-bit), `INTEGER` (`INT`, `INT4`, 32-bit),
+`SMALLINT` (`INT2`, 16-bit), `TINYINT` (8-bit), `DOUBLE` and `VARCHAR`
+(`STRING`, `TEXT`); `FLOAT`/`REAL` (32-bit on the engine), unsigned and
+`DECIMAL` targets are refused by name. Text converts only when the whole
+string is a number, a float truncates to an integer, and a number renders
+to text. A cast of a constant that cannot be performed (`CAST(300 AS
+TINYINT)`, a `$param` that does not fit) is the engine's HTTP 500
+"Optimizer rule 'simplify_expressions' failed". A cast of a column value
+that cannot be performed — `'abc'` to `INTEGER`, `time` to `INTEGER` —
+makes InfluxDB 3 Core drop the connection mid-response rather than send an
+error;
 `Client.HTTP` reports `{:error, {:connection_error, %Mint.TransportError{
 reason: :closed}}}` and the double reports `{:error, {:connection_error,
 :closed}}`, so a test that handles the production failure handles the
@@ -918,17 +937,20 @@ Exclude the tag by default in `test/test_helper.exs`
 (`ExUnit.start(exclude: [:integration])`) and include it when a server is up:
 
 ```bash
-# InfluxDB 3 Core on 8181, no auth, data in memory
+# InfluxDB 3 Core on 8181, no auth, data in memory. A write is answered
+# when the write-ahead log flushes (every second by default), so a short
+# interval keeps a write-heavy suite fast.
 docker run -d --rm --name influx3 -p 8181:8181 influxdb:3-core \
-  influxdb3 serve --node-id node0 --object-store memory --without-auth
+  influxdb3 serve --node-id node0 --object-store memory --without-auth \
+  --wal-flush-interval 10ms
 
 mix test --include integration
 docker stop influx3
 ```
 
 This library's own contract suite is that second tier:
-`test/integration/contract_v3_core_test.exs` runs the same assertions as
-`test/influx_elixir/client/contract_local_v3_core_test.exs` against the
+`test/integration/contract_v3_core/` runs the same assertions as
+`test/influx_elixir/client/contract_local/v3_core/` against the
 server, and reads `INFLUX_V3_CORE_HOST` / `INFLUX_V3_CORE_PORT` (defaults
 `localhost` / `8181`); the v2 suite reads `INFLUX_V2_HOST`, `INFLUX_V2_PORT`,
 `INFLUX_V2_TOKEN`, `INFLUX_V2_ORG` and `INFLUX_V2_BUCKET`. Every statement

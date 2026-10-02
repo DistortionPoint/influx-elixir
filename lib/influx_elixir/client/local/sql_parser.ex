@@ -103,6 +103,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @type parsed_query :: %{
           measurement: binary(),
           where: [where_node()],
+          where_tree: SQLWhere.tree() | nil,
           order_by: order_by(),
           limit: non_neg_integer() | nil,
           offset: non_neg_integer() | nil,
@@ -323,10 +324,24 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp resolve_references(%{columns: "*"} = split, sql, _qualifier), do: {:ok, split, sql}
 
   defp resolve_references(%{rest: rest} = split, sql, qualifier) do
-    with {:ok, rewritten} <-
+    with :ok <- reject_mixed_star(split.columns),
+         {:ok, rewritten} <-
            SQLClauses.resolve_references(split.columns, rest, &item_name(&1, qualifier)) do
       {:ok, %{split | rest: rewritten}, String.replace_suffix(sql, rest, rewritten)}
     end
+  end
+
+  # A `*` beside other items stands for every column in its place, so the
+  # positions of the items after it are not the ones written; the double
+  # does not read it, whatever the clauses name.
+  @spec reject_mixed_star(binary()) :: :ok | {:error, map()}
+  defp reject_mixed_star(columns) do
+    items = columns |> SQLMask.split_commas() |> Enum.map(&String.trim/1)
+
+    if match?([_, _ | _], items) and
+         Enum.any?(items, &(&1 == "*" or String.ends_with?(&1, ".*"))),
+       do: {:error, SQLError.refusal("unsupported column: *")},
+       else: :ok
   end
 
   # The name the engine gives a select item with no alias, for `ORDER BY 2`
@@ -593,6 +608,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       %{
         measurement: measurement,
         where: where,
+        where_tree: SQLWhere.tree(rest),
         order_by: SQLClauses.order_by(rest),
         limit: SQLLimit.limit(rest),
         offset: SQLLimit.offset(rest),

@@ -18,6 +18,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     * `InfluxElixir.Client.Local.SQLGrouping` — a column that is not grouped
     * `InfluxElixir.Client.Local.SQLFold` — a constant the optimizer cannot
       fold (a `CAST` that cannot be performed)
+    * `InfluxElixir.Client.Local.SQLSimplify` — what the optimizer removes of
+      the `WHERE` before a row is read
     * `InfluxElixir.Client.Local.SQLRange` — a `WHERE` that leaves no value
       (or a constant that overflows in its analysis)
     * `InfluxElixir.Client.Local.SQLCondition` — the filter itself
@@ -47,6 +49,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     SQLRange,
     SQLRow,
     SQLSchema,
+    SQLSimplify,
     SQLSort,
     SQLTime,
     SQLTyping
@@ -103,7 +106,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp run_query(query, fetch, params, kinds) do
     query.ctes
     |> Enum.reduce_while({:ok, %{}}, fn {name, cte_query}, {:ok, sources} ->
-      with {:ok, rows, relations} <- select(cte_query, fetch, sources, params, kinds),
+      with {:ok, rows, relations} <- select(cte_query, fetch, sources, params, kinds, false),
            :ok <- SQLTyping.check_cte_outputs(cte_query) do
         cte = cte_source(name, rows, relations, cte_query, sources, kinds)
         {:cont, {:ok, Map.put(sources, name, cte)}}
@@ -130,19 +133,39 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           kinds_mode()
         ) :: [map()] | {:error, term()}
   defp execute_select(query, fetch, sources, params, kinds) do
-    case select(query, fetch, sources, params, kinds) do
-      {:ok, rows, _relations} -> Enum.map(rows, &response_row/1)
+    case select(query, fetch, sources, params, kinds, true) do
+      {:ok, rows, _relations} -> response_rows(rows, query)
       {:error, _reason} = error -> error
     end
   end
+
+  # The rows of a `SELECT *` are the points' own, and `point_to_row/2` has
+  # written their `UInt64`s as the response carries them.
+  @spec response_rows([map()], SQLParser.parsed_query()) :: [map()]
+  defp response_rows(rows, query),
+    do: if(SQLSchema.star?(query), do: rows, else: Enum.map(rows, &response_row/1))
 
   # The row as the response carries it: a `UInt64` and a decimal as the
   # number the engine writes, an infinity or a NaN as the `null` that is
   # there.
   @spec response_row(map()) :: map()
   defp response_row(row) do
-    Map.new(row, fn {key, value} -> {key, response_value(value)} end)
+    if row |> Map.values() |> convertible?(),
+      do: Map.new(row, fn {key, value} -> {key, response_value(value)} end),
+      else: row
   end
+
+  # Whether a value the response writes differently is among them: a tuple
+  # (a `UInt64`, a decimal, a narrow integer), an infinity or a NaN, or a map.
+  @spec convertible?([term()]) :: boolean()
+  defp convertible?([]), do: false
+
+  defp convertible?([value | _rest])
+       when is_tuple(value) or value === :inf or value === :neg_inf or value === :nan or
+              (is_map(value) and not is_struct(value)),
+       do: true
+
+  defp convertible?([_value | rest]), do: convertible?(rest)
 
   @spec response_value(term()) :: term()
   defp response_value(value) when is_map(value) and not is_struct(value),
@@ -162,9 +185,10 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           fetch(),
           %{binary() => source()},
           %{binary() => term()},
-          kinds_mode()
+          kinds_mode(),
+          boolean()
         ) :: {:ok, [map()], [SQLSchema.relation()]} | {:error, term()}
-  defp select(%{measurement: m} = query, fetch, sources, params, kinds) do
+  defp select(%{measurement: m} = query, fetch, sources, params, kinds, final?) do
     unsigned? = unsigned_columns(query, sources, kinds)
     fetch_source = &fetch_source(fetch, &1, sources)
 
@@ -181,9 +205,10 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
          :ok <- SQLTime.first_invalid(typed.where),
          :ok <- limit_error(typed),
          :ok <- SQLFold.check(typed),
-         :ok <- SQLRange.check_time(typed, source.pushdown),
-         :ok <- check_value_range(typed, joined, sources, kinds, unsigned?) do
-      {:ok, rows(joined, typed), relations}
+         simplified = SQLSimplify.apply(typed),
+         :ok <- SQLRange.check_time(simplified, source.pushdown),
+         :ok <- check_value_range(simplified, joined, sources, kinds, unsigned?) do
+      {:ok, rows(joined, simplified, final?), relations}
     else
       :error -> {:error, table_not_found(m)}
       {:error, _reason} = error -> error
@@ -197,9 +222,11 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   # A `LIMIT 0` plans no scan (verified: `WHERE v > 1 / 0 LIMIT 0` is `[]`,
   # where without it the connection closes), so no row is evaluated.
-  @spec rows([point()], SQLParser.parsed_query()) :: [map()]
-  defp rows(_joined, %{limit: 0}), do: []
-  defp rows(joined, query), do: query_rows(filter(joined, query.where), ordered(query))
+  @spec rows([point()], SQLParser.parsed_query(), boolean()) :: [map()]
+  defp rows(_joined, %{limit: 0}, _final?), do: []
+
+  defp rows(joined, query, final?),
+    do: query_rows(filter(joined, query.where), ordered(query), final?)
 
   @spec plan_error(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
   defp plan_error(%{plan_error: nil}), do: :ok
@@ -217,11 +244,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     do: fn _column -> false end
 
   defp unsigned_columns(query, sources, kinds) do
-    tables =
-      [query.measurement | List.wrap(query.cross_join && elem(query.cross_join, 0))]
-      |> Enum.reject(&is_map_key(sources, &1))
-
-    fn column -> Enum.find_value(tables, &kinds.(&1, column)) == @uinteger_kind end
+    kind = column_kind(query, sources, kinds)
+    fn column -> kind.(column) == @uinteger_kind end
   end
 
   # A `WHERE` whose top-level comparisons leave a numeric column no value
@@ -235,9 +259,34 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
         ) :: :ok | {:error, SQLError.t()}
   defp check_value_range(_query, _points, _sources, :unchecked, _unsigned?), do: :ok
 
-  defp check_value_range(query, points, sources, _kinds, unsigned?) do
+  defp check_value_range(query, points, sources, kinds, unsigned?) do
     integer_type = fn column -> if unsigned?.(column), do: :uint64, else: :int64 end
-    SQLRange.check_values(query, points, integer_type, is_map_key(sources, query.measurement))
+
+    SQLRange.check_values(
+      query,
+      points,
+      column_kind(query, sources, kinds),
+      integer_type,
+      is_map_key(sources, query.measurement)
+    )
+  end
+
+  # A column's registered kind in the tables the query reads (not in a CTE,
+  # whose columns the store does not know).
+  @spec column_kind(SQLParser.parsed_query(), %{binary() => source()}, kinds_mode()) ::
+          (binary() -> binary() | nil)
+  defp column_kind(_query, _sources, kinds) when kinds in [nil, :unchecked],
+    do: fn _column -> nil end
+
+  defp column_kind(query, sources, kinds) do
+    tables = read_tables(query, sources)
+    fn column -> Enum.find_value(tables, &kinds.(&1, column)) end
+  end
+
+  @spec read_tables(SQLParser.parsed_query(), %{binary() => source()}) :: [binary()]
+  defp read_tables(query, sources) do
+    [query.measurement | List.wrap(query.cross_join && elem(query.cross_join, 0))]
+    |> Enum.reject(&is_map_key(sources, &1))
   end
 
   # The engine drops an `ORDER BY` term that is a constant (`ORDER BY 1 / 0`
@@ -245,7 +294,12 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec ordered(SQLParser.parsed_query()) :: SQLParser.parsed_query()
   defp ordered(query) do
     order_by =
-      Enum.reject(query.order_by, fn
+      query.order_by
+      |> Enum.map(fn
+        {{:expr, expr}, direction} -> {{:expr, output_items(expr, query)}, direction}
+        column -> column
+      end)
+      |> Enum.reject(fn
         {{:expr, expr}, _direction} -> SQLExpr.columns(expr) == []
         _column -> false
       end)
@@ -253,14 +307,26 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     %{query | order_by: order_by}
   end
 
+  # A name in an `ORDER BY` expression that is a select item's output name is
+  # that item, not a column of the table of the same name (verified:
+  # `SELECT i AS j ... ORDER BY j + 1` sorts by `i + 1`).
+  @spec output_items(SQLExpr.t(), SQLParser.parsed_query()) :: SQLExpr.t()
+  defp output_items({:field, name} = field, %{projection_columns: projection})
+       when is_binary(name) and is_list(projection) do
+    case List.keyfind(projection, name, 1) do
+      {source, ^name} when is_binary(source) -> {:field, source}
+      {expr, ^name} -> expr
+      nil -> field
+    end
+  end
+
+  defp output_items(expr, query), do: SQLExpr.map_children(expr, &output_items(&1, query))
+
   @spec filter([point()], [SQLParser.where_node()]) :: [point()]
-  defp filter(points, []), do: points
+  defp filter(points, conjunction), do: SQLCondition.filter(points, conjunction)
 
-  defp filter(points, conjunction),
-    do: Enum.filter(points, &SQLCondition.matches_all?(&1, conjunction))
-
-  @spec query_rows([point()], SQLParser.parsed_query()) :: [map()]
-  defp query_rows(points, query) do
+  @spec query_rows([point()], SQLParser.parsed_query(), boolean()) :: [map()]
+  defp query_rows(points, query, final?) do
     cond do
       query.distinct_columns ->
         execute_distinct_query(points, query)
@@ -276,7 +342,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
         |> apply_order_by(query.order_by)
         |> distinct_on(query.distinct_on, & &1)
         |> apply_limit(query.limit, query.offset)
-        |> Enum.map(&point_to_row/1)
+        |> Enum.map(&point_to_row(&1, final?))
     end
   end
 
@@ -569,15 +635,20 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     |> then(fn skipped -> if limit, do: Enum.take(skipped, limit), else: skipped end)
   end
 
-  @spec point_to_row(point()) :: map()
+  @spec point_to_row(point(), boolean()) :: map()
   # `time` is a DateTime (microsecond precision), as on the HTTP and Flight
   # transports, so consumer code sees one type whichever client is configured.
-  defp point_to_row(point) do
+  defp point_to_row(point, final?) do
     row =
       for {key, value} <- Map.merge(point.fields, point.tags),
           value != nil,
           into: %{},
-          do: {key, value}
+          do:
+            {key,
+             case value do
+               {:u, number} when final? -> number
+               _other -> value
+             end}
 
     put_column(row, "time", SQLRow.column_value(point, "time"))
   end

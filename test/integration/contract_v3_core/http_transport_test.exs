@@ -1,59 +1,17 @@
-defmodule InfluxElixir.Integration.ContractV3CoreTest do
+defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
   @moduledoc """
-  Contract tests against real InfluxDB v3 Core on port 8181.
+  What only the HTTP client has, against InfluxDB v3 Core on port 8181: pool
+  handling of streaming queries, `:pool_timeout`, Arrow Flight and the
+  `BatchWriter` retry chain. Local is in-memory, so none of it is part of the
+  shared contract.
 
   Run with: `mix test --include v3_core`
-
-  These are the SAME assertions that run against LocalClient in
-  `ContractLocalV3CoreTest`. If both pass, LocalClient is proven
-  faithful to real InfluxDB v3 Core.
   """
 
-  # async: false — shares the one real server and the globally named :integration_finch
-  # pool with the other integration modules, and its writes are timed against its clock.
-  use ExUnit.Case, async: false
-
-  @moduletag :v3_core
-  @moduletag :integration
-
-  use InfluxElixir.ClientContract,
-    client: InfluxElixir.Client.HTTP,
-    profile: :v3_core
-
-  use InfluxElixir.Contract.SQLParser, client: InfluxElixir.Client.HTTP, profile: :v3_core
-  use InfluxElixir.Contract.SQLExecutor, client: InfluxElixir.Client.HTTP, profile: :v3_core
-  use InfluxElixir.Contract.InfluxQLFluxLP, client: InfluxElixir.Client.HTTP, profile: :v3_core
+  use InfluxElixir.ContractServer, profile: :v3_core
 
   alias InfluxElixir.Client.HTTP
   alias InfluxElixir.IntegrationHelper, as: H
-
-  setup_all do
-    H.start_finch()
-    conn = H.v3_core_conn()
-
-    if H.reachable?(conn) do
-      {:ok, base_conn: conn}
-    else
-      {:ok, skip: true, base_conn: conn}
-    end
-  end
-
-  setup %{base_conn: base_conn} = ctx do
-    if ctx[:skip] do
-      flunk("InfluxDB v3 Core not reachable on port 8181")
-    end
-
-    db = H.unique_name("contract_v3core")
-
-    case HTTP.create_database(base_conn, db) do
-      :ok ->
-        on_exit(fn -> HTTP.delete_database(base_conn, db) end)
-        {:ok, conn: base_conn, database: db, query_delay: 500, time_slack: 60}
-
-      {:error, reason} ->
-        flunk("Failed to create test database: #{inspect(reason)}")
-    end
-  end
 
   # A streaming query holds its pool connection in a producer process. The
   # producer used to be killed when the consumer stopped early, and to wait

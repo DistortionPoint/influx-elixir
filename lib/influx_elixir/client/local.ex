@@ -169,6 +169,13 @@ defmodule InfluxElixir.Client.Local do
   case-sensitive and are not folded.) The subset:
 
     * `SELECT * FROM measurement`
+    * Rows come back in time order when no `ORDER BY` says otherwise. The
+      engine's own order then is not defined: it sorts what it reads by the
+      tags in the order they were first written and then by time, but the
+      blocks it holds that data in decide which comes first, and the same
+      rows written in separate requests, or filtered by a tag, come back in
+      another order (verified). Order is something to ask for with `ORDER BY`
+      in a test that is to hold against the engine.
     * `SELECT col1, col2 [, ...] FROM measurement` with optional `AS alias`
       (projects fields and tags; `time` is selectable). `time` and
       `DATE_BIN` buckets are `DateTime` values with microsecond precision,
@@ -240,6 +247,16 @@ defmodule InfluxElixir.Client.Local do
       `NOT b`); any other bare column is the engine's planning error
       ("Cannot create filter with non-boolean predicate 't.n' returning
       Int64").
+    * What the engine's simplifier removes before a row is read is not run
+      (`InfluxElixir.Client.Local.SQLSimplify`): `x AND false`, `x OR true`,
+      the absorption `A AND (A OR B)`, a comparison with a NULL literal, and
+      `x = x` or `x IS NULL` of a constant. An `AND` or an `OR` whose right
+      operand fails for a row the left one leaves out (`j <> 0 AND 100 / j >
+      1`) is refused by name: the engine runs it over a batch of rows, and
+      whether it meets that row depends on how it batches them. An integer
+      literal past `UInt64` is a double, as on the engine, and a decimal
+      expression compared with a float past `1e20` is its cast error (see
+      `InfluxElixir.Client.Local.SQLDecimal`).
     * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)` — each
       item a literal, a column or an expression, as in SQL (a bare word is
       a column reference, never a string)
@@ -455,6 +472,7 @@ defmodule InfluxElixir.Client.Local do
     SQLIdentifiers,
     SQLLexer,
     SQLParser,
+    SQLStatement,
     Store
   }
 
@@ -830,22 +848,34 @@ defmodule InfluxElixir.Client.Local do
           InfluxElixir.Client.write_result()
   defp store_lines(table, database, lines, :v2) do
     case for({:error, line_error} <- lines, do: line_error) do
-      [] ->
-        store_v2_points(table, database, lines)
-
-      errors ->
-        # Every line that fails is reported, joined by newlines.
-        message =
-          Enum.map_join(errors, "\n", fn %{error_message: reason, line: line} ->
-            "unable to parse '#{line}': #{reason}"
-          end)
-
-        {:error,
-         %{status: 400, body: Jason.encode!(%{"code" => "invalid", "message" => message})}}
+      [] -> store_v2_points(table, database, lines)
+      errors -> {:error, v2_parse_error(errors)}
     end
   end
 
   defp store_lines(table, database, lines, _v3) do
+    {errors, accepted} = check_v3_lines(table, database, lines)
+    Store.store_points(table, database, accepted)
+    if errors == [], do: {:ok, :written}, else: {:error, partial_write_error(errors)}
+  end
+
+  # Every line that fails to parse is reported, joined by newlines.
+  @spec v2_parse_error([map()]) :: map()
+  defp v2_parse_error(errors) do
+    message =
+      Enum.map_join(errors, "\n", fn %{error_message: reason, line: line} ->
+        "unable to parse '#{line}': #{reason}"
+      end)
+
+    %{status: 400, body: Jason.encode!(%{"code" => "invalid", "message" => message})}
+  end
+
+  # The lines InfluxDB 3 accepts, in order, and the errors of those it
+  # rejects (newest first): a line is checked against the schema as the lines
+  # before it have left it.
+  @spec check_v3_lines(Store.t(), binary(), [LineProtocolParser.line_result()]) ::
+          {[map()], [point_map()]}
+  defp check_v3_lines(table, database, lines) do
     {errors, accepted, _known} =
       Enum.reduce(lines, {[], [], %{}}, fn
         {:error, line_error}, {errors, accepted, known} ->
@@ -861,23 +891,19 @@ defmodule InfluxElixir.Client.Local do
           end
       end)
 
-    Store.store_points(table, database, Enum.reverse(accepted))
+    {errors, Enum.reverse(accepted)}
+  end
 
-    case errors do
-      [] ->
-        {:ok, :written}
-
-      errors ->
-        {:error,
-         %{
-           status: 400,
-           body:
-             Jason.encode!(%{
-               "error" => "partial write of line protocol occurred",
-               "data" => errors |> Enum.reverse() |> Enum.map(&Map.delete(&1, :line))
-             })
-         }}
-    end
+  @spec partial_write_error([map()]) :: map()
+  defp partial_write_error(errors) do
+    %{
+      status: 400,
+      body:
+        Jason.encode!(%{
+          "error" => "partial write of line protocol occurred",
+          "data" => errors |> Enum.reverse() |> Enum.map(&Map.delete(&1, :line))
+        })
+    }
   end
 
   # InfluxDB 2 maps a payload's points onto shards first and drops the ones
@@ -1466,10 +1492,11 @@ defmodule InfluxElixir.Client.Local do
 
         :unsupported ->
           {:error,
-           %{
-             status: 405,
-             body: "This feature is not implemented: Unsupported SQL statement: " <> trimmed
-           }}
+           SQLStatement.parser_error(sql) ||
+             %{
+               status: 405,
+               body: "This feature is not implemented: Unsupported SQL statement: " <> trimmed
+             }}
       end
     end
   end
@@ -1491,7 +1518,17 @@ defmodule InfluxElixir.Client.Local do
       {~r/^(?i)CREATE\s+(?:DATABASE|SCHEMA)\b/, {:planning, "DDL not supported: CreateCatalog"}},
       {~r/^(?i)CREATE\s+TABLE\b/, {:planning, "DDL not supported: CreateMemoryTable"}},
       {~r/^(?i)DROP\s+VIEW\b/, {:planning, "DDL not supported: DropView"}},
-      {~r/^(?i)DROP\s+TABLE\b/, {:planning, "DDL not supported: DropTable"}}
+      {~r/^(?i)DROP\s+TABLE\b/, {:planning, "DDL not supported: DropTable"}},
+      {~r/^(?i)(?:COMMIT|ROLLBACK)\s*;?\s*$/,
+       {:planning, "Statement not supported: TransactionEnd"}},
+      {~r/^(?i)START\s+TRANSACTION\s*;?\s*$/,
+       {:planning, "Statement not supported: TransactionStart"}},
+      {~r/^(?i)SET\s+[\w.]+\s*(?:=|TO\b)\s*\S/,
+       {:planning, "Statement not supported: SetVariable"}},
+      {~r/^(?i)PREPARE\s+\w+\s+AS\s+\S/, {:planning, "Statement not supported: Prepare"}},
+      {~r/^(?i)DEALLOCATE\s+\w+\s*;?\s*$/, {:planning, "Statement not supported: Deallocate"}},
+      {~r/^(?i)EXEC(?:UTE)?\s+\w+\s*(?:\([^)]*\))?\s*;?\s*$/,
+       {:planning, "Statement not supported: Execute"}}
     ]
   end
 
@@ -1612,6 +1649,9 @@ defmodule InfluxElixir.Client.Local do
           {:ok, spec} ->
             {:ok, {:show_tag_values, spec}}
 
+          {:error, {:engine, body}} ->
+            {:error, %{status: 400, body: body}}
+
           {:error, message} ->
             {:error, %{status: 400, body: "Client.Local: #{message}: #{influxql}"}}
         end
@@ -1673,10 +1713,14 @@ defmodule InfluxElixir.Client.Local do
   defp tag_values_where(nil, _tags), do: {:ok, @show_tag_values_window}
 
   defp tag_values_where(where, tags) do
-    with {:ok, %{where: " WHERE " <> sql}} <- influxql_where(where, tags, %{}) do
-      if InfluxQL.mentions_time?(where),
-        do: {:ok, sql},
-        else: {:ok, "(#{sql}) AND " <> @show_tag_values_window}
+    case influxql_where(where, tags, %{}) do
+      {:ok, %{where: " WHERE " <> sql}} ->
+        if InfluxQL.mentions_time?(where),
+          do: {:ok, sql},
+          else: {:ok, "(#{sql}) AND " <> @show_tag_values_window}
+
+      {:error, %{body: body} = error} ->
+        {:error, %{error | body: InfluxQL.unframe_split(body)}}
     end
   end
 
@@ -1764,6 +1808,7 @@ defmodule InfluxElixir.Client.Local do
     types = field_types(table, database, query.measurement)
 
     with {:ok, plan} <- influxql_where(query.where, tags, types),
+         :ok <- influxql_items(query),
          :ok <- influxql_window(table, database, query),
          :ok <- influxql_deferred(plan) do
       # ORDER BY time sorts on the stored nanoseconds; rows carry microsecond
@@ -1773,10 +1818,33 @@ defmodule InfluxElixir.Client.Local do
 
       table
       |> run_influxql_sql(database, sql, plan.tags)
+      |> influxql_checked(plan.checks)
       |> influxql_result(query, tags,
         lower: lower_bound(plan.lowers),
-        fields: window_fields(table, database, query)
+        fields: window_fields(table, database, query),
+        types: types
       )
+    end
+  end
+
+  # What the SQL engine does not read as the engine does is checked over the
+  # rows it kept.
+  @spec influxql_checked({:ok, [map()]} | {:error, term()}, [term()]) ::
+          {:ok, [map()]} | {:error, term()}
+  defp influxql_checked(result, []), do: result
+
+  defp influxql_checked({:ok, rows}, checks),
+    do: {:ok, Enum.filter(rows, &InfluxQL.keep?(checks, &1))}
+
+  defp influxql_checked(error, _checks), do: error
+
+  # The engine's planning error for a select item that is a constant, raised
+  # after the `WHERE` is planned and before `LIMIT` is.
+  @spec influxql_items(InfluxQL.query()) :: :ok | {:error, map()}
+  defp influxql_items(query) do
+    case InfluxQL.check_items(query.items) do
+      :ok -> :ok
+      {:error, {:engine, body}} -> {:error, %{status: 400, body: body}}
     end
   end
 
@@ -1833,12 +1901,13 @@ defmodule InfluxElixir.Client.Local do
            %{
              where: binary(),
              lowers: [InfluxQL.bound()],
+             checks: [term()],
              tags: MapSet.t(binary()),
              deferred: binary() | nil
            }}
           | {:error, map()}
   defp influxql_where(nil, _tags, _types),
-    do: {:ok, %{where: "", lowers: [], tags: MapSet.new(), deferred: nil}}
+    do: {:ok, %{where: "", lowers: [], checks: [], tags: MapSet.new(), deferred: nil}}
 
   defp influxql_where(where, tags, types) do
     case InfluxQL.where_plan(where, tags, types) do
@@ -1847,12 +1916,16 @@ defmodule InfluxElixir.Client.Local do
          %{
            where: " WHERE " <> plan.sql,
            lowers: plan.lowers,
+           checks: plan.checks,
            tags: MapSet.intersection(tags, plan.idents),
            deferred: plan.deferred
          }}
 
       {:error, {:engine, body}} ->
         {:error, %{status: 400, body: body}}
+
+      {:error, {:engine, status, body}} ->
+        {:error, %{status: status, body: body}}
 
       {:error, message} ->
         {:error, %{status: 400, body: "Client.Local: #{message}"}}

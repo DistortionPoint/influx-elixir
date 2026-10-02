@@ -47,6 +47,17 @@ defmodule InfluxElixir.Client.Local.SQLError do
   end
 
   @doc """
+  The engine's SQL parser error: `SQL error: ParserError("<message>")`, the
+  message printed as Rust's Debug does (a double quote or a backslash
+  escaped).
+  """
+  @spec parser(binary()) :: t()
+  def parser(message) do
+    debug = message |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")
+    %{status: 400, body: ~s|SQL error: ParserError("#{debug}")|}
+  end
+
+  @doc """
   An error the optimizer's `simplify_expressions` pass raises while it folds
   a constant (an unparseable timestamp string, an invalid regular
   expression): `Optimizer rule 'simplify_expressions' failed\\ncaused by\\n<message>`,
@@ -121,6 +132,17 @@ defmodule InfluxElixir.Client.Local.SQLError do
   defp interval_type(:int64), do: "Int64"
   defp interval_type(:uint64), do: "UInt64"
   defp interval_type(:float64), do: "Float64"
+
+  @doc """
+  The Arrow kernel's error for an unsigned column cast to a signed type of
+  `target` and compared with a negative number, status 500.
+  """
+  @spec cast_to_null(binary()) :: t()
+  def cast_to_null(target),
+    do: %{
+      status: 500,
+      body: "Arrow error: Cast error: Casting from #{target} to Null not supported"
+    }
 
   @doc """
   The engine's internal error for a BETWEEN whose operand and bound have no

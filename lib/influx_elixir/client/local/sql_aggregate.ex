@@ -86,24 +86,24 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp column_result({:selector, kind, field, ordering, access, _alias}, points, _bucket_ts),
     do: selector(kind, field, ordering, access, points)
 
-  @doc "An aggregate over the non-null values of one group."
+  # An aggregate over the non-null values of one group.
   @spec compute(SQLParser.aggregate(), [term()]) :: term()
-  def compute(:count, values), do: length(values)
-  def compute(_agg, []), do: nil
-  def compute(:avg, values), do: average(values)
-  def compute(:sum, [first | _rest] = values), do: Enum.reduce(values, zero(first), &add(&2, &1))
+  defp compute(:count, values), do: length(values)
+  defp compute(_agg, []), do: nil
+  defp compute(:avg, values), do: average(values)
+  defp compute(:sum, [first | _rest] = values), do: Enum.reduce(values, zero(first), &add(&2, &1))
   # MIN/MAX also run over `time`, so the comparison is the sort's.
-  def compute(:min, values), do: Enum.min(values, &SQLSort.value_order/2)
-  def compute(:max, values), do: Enum.max(values, fn a, b -> SQLSort.value_order(b, a) end)
-  def compute(:median, values), do: median(values)
+  defp compute(:min, values), do: Enum.min(values, &SQLSort.value_order/2)
+  defp compute(:max, values), do: Enum.max(values, fn a, b -> SQLSort.value_order(b, a) end)
+  defp compute(:median, values), do: median(values)
   # Sample forms need at least two values, exactly as the real engine
   # (STDDEV of one row is null); population forms are defined for one.
-  def compute(:var, [_one]), do: nil
-  def compute(:stddev, [_one]), do: nil
-  def compute(:var, values), do: variance(values, length(values) - 1)
-  def compute(:stddev, values), do: :var |> compute(values) |> square_root()
-  def compute(:var_pop, values), do: variance(values, length(values))
-  def compute(:stddev_pop, values), do: :var_pop |> compute(values) |> square_root()
+  defp compute(:var, [_one]), do: nil
+  defp compute(:stddev, [_one]), do: nil
+  defp compute(:var, values), do: variance(values, length(values) - 1)
+  defp compute(:stddev, values), do: :var |> compute(values) |> square_root()
+  defp compute(:var_pop, values), do: variance(values, length(values))
+  defp compute(:stddev_pop, values), do: :var_pop |> compute(values) |> square_root()
 
   # The sum starts from the type's zero, so the sum of `-0.0` is `0.0`
   # (verified).
@@ -118,6 +118,12 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp divide(value, divisor), do: SQLNumber.arithmetic(:/, value, divisor)
 
   @spec add(SQLNumber.t(), SQLNumber.t()) :: SQLNumber.t()
+  defp add(left, right) when is_float(left) and is_float(right) do
+    left + right
+  rescue
+    ArithmeticError -> SQLNumber.arithmetic(:+, left, right)
+  end
+
   defp add(left, right), do: SQLNumber.arithmetic(:+, left, right)
 
   # The mean of integers is their exact sum over their count; of floats, the

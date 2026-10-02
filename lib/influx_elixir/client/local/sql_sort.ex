@@ -65,15 +65,22 @@ defmodule InfluxElixir.Client.Local.SQLSort do
     end
   end
 
-  @doc "Where a direction puts nulls when the query does not say."
+  # Where a direction puts nulls when the query does not say.
   @spec null_placement(SQLClauses.direction()) :: placement()
-  def null_placement(:asc), do: {:asc, :nulls_last}
-  def null_placement(:desc), do: {:desc, :nulls_first}
-  def null_placement({dir, nulls}), do: {dir, nulls}
+  defp null_placement(:asc), do: {:asc, :nulls_last}
+  defp null_placement(:desc), do: {:desc, :nulls_first}
+  defp null_placement({dir, nulls}), do: {dir, nulls}
 
   @doc "Whether `a` sorts at or before `b`, ascending."
   @spec value_order(term(), term()) :: boolean()
   def value_order(%DateTime{} = a, %DateTime{} = b), do: DateTime.compare(a, b) != :gt
+
+  # Integers of one type, and floats that are not zero (the engine orders -0.0
+  # before 0.0), order as Erlang orders them.
+  def value_order(a, b) when is_integer(a) and is_integer(b), do: a <= b
+
+  def value_order(a, b) when is_float(a) and is_float(b) and a != 0.0 and b != 0.0,
+    do: a <= b
 
   def value_order(a, b) do
     if SQLNumber.numeric?(a) and SQLNumber.numeric?(b),

@@ -153,26 +153,51 @@ defmodule InfluxElixir.Client.Local.SQLRange do
   @spec check_values(
           SQLParser.parsed_query(),
           [SQLRow.point()],
+          (binary() -> binary() | nil),
           (binary() -> :int64 | :uint64),
           boolean()
         ) :: :ok | {:error, SQLError.t()}
-  def check_values(%{limit: 0}, _points, _integer_type, _cte?), do: :ok
-  def check_values(%{where: []}, _points, _integer_type, _cte?), do: :ok
+  def check_values(%{limit: 0}, _points, _kind, _integer_type, _cte?), do: :ok
+  def check_values(%{where: []}, _points, _kind, _integer_type, _cte?), do: :ok
 
-  def check_values(query, points, integer_type, cte?) do
+  def check_values(query, points, kind, integer_type, cte?) do
     columns = for column <- SQLSchema.where_refs(query.where), is_binary(column), do: column
-    types = column_types(points, Enum.uniq(columns), integer_type)
+    types = column_types(points, Enum.uniq(columns), kind, integer_type)
     SQLBounds.check(query.where, &Map.get(types, &1), cte: cte?)
   end
 
-  # What the interval analysis reads each column as: a float by its values,
-  # an integer by the kind the store registered, anything else (a tag, a
-  # text or boolean field) as `:other`. One pass over the points reads them
-  # all: a column with a tag anywhere is `:other`, else its type is that of
-  # its first value.
-  @spec column_types([SQLRow.point()], [binary()], (binary() -> :int64 | :uint64)) ::
+  # What the interval analysis reads each column as: what the store
+  # registered for it, or, for a column it has no kind for (one a CTE
+  # makes), what its values show: a column with a tag anywhere is `:other`,
+  # else its type is that of its first value. The points are read only for
+  # such columns.
+  @spec column_types(
+          [SQLRow.point()],
+          [binary()],
+          (binary() -> binary() | nil),
+          (binary() -> :int64 | :uint64)
+        ) :: %{binary() => SQLBounds.column_type()}
+  defp column_types(points, columns, kind, integer_type) do
+    {known, unknown} =
+      columns
+      |> Enum.map(&{&1, kind.(&1)})
+      |> Enum.split_with(fn {_column, kind} -> kind != nil end)
+
+    registered = Map.new(known, fn {column, kind} -> {column, kind_type(kind)} end)
+    Map.merge(observed_types(points, Enum.map(unknown, &elem(&1, 0)), integer_type), registered)
+  end
+
+  @spec kind_type(binary()) :: SQLBounds.column_type()
+  defp kind_type("iox::column_type::field::float"), do: :float64
+  defp kind_type("iox::column_type::field::integer"), do: :int64
+  defp kind_type("iox::column_type::field::uinteger"), do: :uint64
+  defp kind_type(_tag_or_text_or_boolean), do: :other
+
+  @spec observed_types([SQLRow.point()], [binary()], (binary() -> :int64 | :uint64)) ::
           %{binary() => SQLBounds.column_type()}
-  defp column_types(points, columns, integer_type) do
+  defp observed_types(_points, [], _integer_type), do: %{}
+
+  defp observed_types(points, columns, integer_type) do
     Enum.reduce(points, %{}, fn point, types ->
       Enum.reduce(columns, types, &observe(&2, point, &1, integer_type))
     end)

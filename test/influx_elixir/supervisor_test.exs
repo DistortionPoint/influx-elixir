@@ -2,24 +2,21 @@ defmodule InfluxElixir.SupervisorTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.ConnectionSupervisor
+  alias InfluxElixir.TestSupport.Await
 
   defp unique_name(prefix) do
     :"#{prefix}_#{System.unique_integer([:positive])}"
   end
 
-  # The restart is asynchronous: wait (bounded) for the name to resolve to a new pid.
-  defp await_restart(name, old_pid, attempts \\ 100) do
-    case Process.whereis(name) do
-      pid when is_pid(pid) and pid != old_pid ->
-        pid
-
-      _other when attempts > 0 ->
-        Process.sleep(10)
-        await_restart(name, old_pid, attempts - 1)
-
-      _other ->
-        flunk("#{inspect(name)} was not restarted")
-    end
+  # The old process is known dead once its :DOWN arrives; the restart is
+  # asynchronous, so wait (with a deadline) for the name to resolve to a new pid.
+  defp await_restart(name, old_pid) do
+    Await.until(fn ->
+      case Process.whereis(name) do
+        pid when is_pid(pid) and pid != old_pid -> pid
+        _other -> nil
+      end
+    end)
   end
 
   describe "crash isolation" do
@@ -63,7 +60,7 @@ defmodule InfluxElixir.SupervisorTest do
                {:ok, %{total_writes: 0, total_errors: 0, total_bytes: 0}}
 
       # The sibling connection keeps the very same processes and still serves.
-      assert pids.(name_b) == before_b
+      assert pids.(name_b) === before_b
       assert {:ok, :written} = InfluxElixir.write(name_b, "cpu v=1i")
       assert InfluxElixir.query_sql(name_b, "SELECT v FROM cpu") === {:ok, [%{"v" => 1}]}
 
@@ -91,22 +88,24 @@ defmodule InfluxElixir.SupervisorTest do
       finch_b = Process.whereis(ConnectionSupervisor.finch_name(name_b))
       writer_b = Process.whereis(ConnectionSupervisor.batch_writer_name(name_b))
 
+      sup_ref = Process.monitor(sup_a)
       Process.exit(sup_a, :kill)
+      assert_receive {:DOWN, ^sup_ref, :process, ^sup_a, :killed}
 
       new_sup_a = await_restart(ConnectionSupervisor.via(name_a), sup_a)
       # The name is registered before init/1 returns; a call waits for it.
       assert [_finch, _writer] = Supervisor.which_children(new_sup_a)
       refute_received {:DOWN, ^top, :process, _pid, _reason}
-      assert new_sup_a != sup_a
+      assert new_sup_a !== sup_a
       assert {:ok, :written} = InfluxElixir.write(name_a, "cpu v=2i")
       assert InfluxElixir.query_sql(name_a, "SELECT v FROM cpu") === {:ok, [%{"v" => 2}]}
 
       assert InfluxElixir.stats(name_a) ===
                {:ok, %{total_writes: 0, total_errors: 0, total_bytes: 0}}
 
-      assert Process.whereis(ConnectionSupervisor.via(name_b)) == sup_b
-      assert Process.whereis(ConnectionSupervisor.finch_name(name_b)) == finch_b
-      assert Process.whereis(ConnectionSupervisor.batch_writer_name(name_b)) == writer_b
+      assert Process.whereis(ConnectionSupervisor.via(name_b)) === sup_b
+      assert Process.whereis(ConnectionSupervisor.finch_name(name_b)) === finch_b
+      assert Process.whereis(ConnectionSupervisor.batch_writer_name(name_b)) === writer_b
       assert {:ok, :written} = InfluxElixir.write(name_b, "cpu v=3i")
     end
 
@@ -117,7 +116,7 @@ defmodule InfluxElixir.SupervisorTest do
       connection_ids =
         for %{id: {ConnectionSupervisor, name}} <- children, do: name
 
-      assert connection_ids == [:alpha, :beta]
+      assert connection_ids === [:alpha, :beta]
     end
   end
 end

@@ -61,6 +61,17 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   """
   @type operand :: binary() | {:expr, SQLExpr.t()}
 
+  @typedoc """
+  A `WHERE` as written, in binary nodes: `AND` and `OR` of two, a `NOT`, a
+  predicate, or a constant `true` or `false`.
+  """
+  @type tree ::
+          {:and, tree(), tree()}
+          | {:or, tree(), tree()}
+          | {:not, tree()}
+          | {:leaf, clause()}
+          | {:const, boolean()}
+
   @limit_start SQLLimit.start_source()
 
   @doc """
@@ -68,23 +79,45 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   """
   @spec nodes(binary()) :: {:ok, [node_t()]} | {:error, SQLError.t()}
   def nodes(rest) do
+    with {:ok, conj, _tree} <- parse(rest), do: {:ok, conj}
+  end
+
+  @doc """
+  The `WHERE ...` clause as written: the same predicates in binary `AND` and
+  `OR` nodes, left to right, parentheses kept as the grouping they make, which
+  the conjunction list of `nodes/1` does not keep. `nil` when there is no
+  `WHERE` or it does not parse.
+  """
+  @spec tree(binary()) :: tree() | nil
+  def tree(rest) do
+    case parse(rest) do
+      {:ok, _conj, tree} -> tree
+      {:error, _reason} -> nil
+    end
+  end
+
+  @spec parse(binary()) :: {:ok, [node_t()], tree() | nil} | {:error, map()}
+  defp parse(rest) do
     case SQLMask.run(
            ~r/(?i)WHERE\s+(.+?)(?:\s+GROUP\b|\s+ORDER\b|\s+#{@limit_start}|$)/su,
            rest
          ) do
       [_full_match, clauses_str] -> parse_clauses(clauses_str)
-      _no_match -> {:ok, []}
+      _no_match -> {:ok, [], nil}
     end
   end
 
-  @spec parse_clauses(binary()) :: {:ok, [node_t()]} | {:error, map()}
+  @spec parse_clauses(binary()) :: {:ok, [node_t()], tree()} | {:error, map()}
   defp parse_clauses(str) do
     with {:ok, tokens} <- tokenize_where(str),
-         {:ok, conj, []} <- where_or(tokens) do
-      {:ok, conj}
+         {:ok, conj, tree, []} <- where_or(tokens) do
+      {:ok, conj, tree}
     else
-      {:ok, _conj, _leftover} -> {:error, SQLError.refusal("unsupported WHERE clause: #{str}")}
-      {:error, _reason} = error -> error
+      {:ok, _conj, _tree, _leftover} ->
+        {:error, SQLError.refusal("unsupported WHERE clause: #{str}")}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -188,42 +221,49 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
     end
   end
 
-  @spec where_or([where_token()]) :: {:ok, [node_t()], [where_token()]} | {:error, map()}
+  @typep parsed :: {:ok, [node_t()], tree(), [where_token()]} | {:error, map()}
+
+  @spec where_or([where_token()]) :: parsed()
   defp where_or(tokens) do
-    with {:ok, first, rest} <- where_and(tokens) do
-      where_collect_or(rest, [first])
+    with {:ok, first, tree, rest} <- where_and(tokens) do
+      where_collect_or(rest, [first], tree)
     end
   end
 
-  defp where_collect_or([:or | rest], branches) do
-    with {:ok, branch, rest} <- where_and(rest), do: where_collect_or(rest, [branch | branches])
+  defp where_collect_or([:or | rest], branches, tree) do
+    with {:ok, branch, branch_tree, rest} <- where_and(rest),
+         do: where_collect_or(rest, [branch | branches], {:or, tree, branch_tree})
   end
 
-  defp where_collect_or(rest, [single]), do: {:ok, single, rest}
-  defp where_collect_or(rest, branches), do: {:ok, [{:or, Enum.reverse(branches)}], rest}
+  defp where_collect_or(rest, [single], tree), do: {:ok, single, tree, rest}
 
-  @spec where_and([where_token()]) :: {:ok, [node_t()], [where_token()]} | {:error, map()}
+  defp where_collect_or(rest, branches, tree),
+    do: {:ok, [{:or, Enum.reverse(branches)}], tree, rest}
+
+  @spec where_and([where_token()]) :: parsed()
   defp where_and(tokens) do
-    with {:ok, first, rest} <- where_factor(tokens) do
-      where_collect_and(rest, first)
+    with {:ok, first, tree, rest} <- where_factor(tokens) do
+      where_collect_and(rest, first, tree)
     end
   end
 
-  defp where_collect_and([:and | rest], conj) do
-    with {:ok, next, rest} <- where_factor(rest), do: where_collect_and(rest, conj ++ next)
+  defp where_collect_and([:and | rest], conj, tree) do
+    with {:ok, next, next_tree, rest} <- where_factor(rest),
+         do: where_collect_and(rest, conj ++ next, {:and, tree, next_tree})
   end
 
-  defp where_collect_and(rest, conj), do: {:ok, conj, rest}
+  defp where_collect_and(rest, conj, tree), do: {:ok, conj, tree, rest}
 
-  @spec where_factor([where_token()]) :: {:ok, [node_t()], [where_token()]} | {:error, map()}
+  @spec where_factor([where_token()]) :: parsed()
   defp where_factor([:not | rest]) do
-    with {:ok, conj, rest} <- where_factor(rest), do: {:ok, [{:not, conj}], rest}
+    with {:ok, conj, tree, rest} <- where_factor(rest),
+         do: {:ok, [{:not, conj}], {:not, tree}, rest}
   end
 
   defp where_factor([:lparen | rest]) do
     case where_or(rest) do
-      {:ok, conj, [:rparen | rest]} -> {:ok, conj, rest}
-      {:ok, _conj, _rest} -> {:error, SQLError.refusal("unbalanced parenthesis in WHERE")}
+      {:ok, conj, tree, [:rparen | rest]} -> {:ok, conj, tree, rest}
+      {:ok, _conj, _tree, _rest} -> {:error, SQLError.refusal("unbalanced parenthesis in WHERE")}
       {:error, _reason} = error -> error
     end
   end
@@ -232,9 +272,9 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   # row meets (an OR of nothing).
   defp where_factor([{:pred, text} | rest]) do
     case parse_single_where_clause(text) do
-      {:ok, :always} -> {:ok, [], rest}
-      {:ok, :never} -> {:ok, [{:or, []}], rest}
-      {:ok, clause} -> {:ok, [clause], rest}
+      {:ok, :always} -> {:ok, [], {:const, true}, rest}
+      {:ok, :never} -> {:ok, [{:or, []}], {:const, false}, rest}
+      {:ok, clause} -> {:ok, [clause], {:leaf, clause}, rest}
       {:error, _reason} = error -> error
     end
   end
@@ -385,11 +425,13 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   # `WHERE true` and `WHERE false` are conditions that hold for every row or
   # none. Any other lone literal is not a boolean, which the engine's
   # planner refuses (verified), naming the literal in its own rendering.
-  @spec constant_predicate(binary()) :: {:ok, :always | :never} | {:error, map()} | :nomatch
+  @spec constant_predicate(binary()) ::
+          {:ok, :always | :never | clause()} | {:error, map()} | :nomatch
   defp constant_predicate(text) do
     cond do
       String.upcase(text) == "TRUE" -> {:ok, :always}
       String.upcase(text) == "FALSE" -> {:ok, :never}
+      String.upcase(text) == "NULL" -> {:ok, {:eq, "time", nil}}
       Regex.match?(~r/^-?[0-9]+$/u, text) -> non_boolean_filter("Int64(#{text})", "Int64")
       match?({_float, ""}, SQLLiteral.parse_float(text)) -> float_filter(text)
       SQLLiteral.string?(text) -> non_boolean_filter(~s|Utf8("#{SQLLiteral.body(text)}")|, "Utf8")
@@ -530,9 +572,19 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
 
   @spec comparison_clause(binary(), binary(), binary(), binary()) ::
           {:ok, clause() | :always | :never} | {:error, map()}
-  defp comparison_clause(text, "time", right, _trimmed) do
+  defp comparison_clause(text, left, right, trimmed) do
     op = Map.fetch!(@comparison_operators, text)
 
+    case {left, right} do
+      {"time", _right} -> time_comparison(op, text, right)
+      {_left, "time"} -> mirrored_time_comparison(op, text, left, trimmed)
+      _no_time -> value_comparison(op, left, right, trimmed)
+    end
+  end
+
+  @spec time_comparison(op(), binary(), binary()) ::
+          {:ok, clause() | :always | :never} | {:error, map()}
+  defp time_comparison(op, text, right) do
     case SQLTime.comparand(right) do
       {:ok, value} ->
         {:ok, {op, "time", value}}
@@ -548,9 +600,9 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   # A literal on the left (`1 < abs(x)`, `'2024-01-01' <= time`) is the
   # same comparison turned around, and a `$name` there is kept as standing
   # on the left, for the engine's wording of a type error.
-  defp comparison_clause(text, left, "time", trimmed) do
-    op = Map.fetch!(@comparison_operators, text)
-
+  @spec mirrored_time_comparison(op(), binary(), binary(), binary()) ::
+          {:ok, clause() | :always | :never} | {:error, map()}
+  defp mirrored_time_comparison(op, text, left, trimmed) do
     with true <- SQLLiteral.literal?(left) or SQLLiteral.param?(left) or null?(left),
          {:ok, value} <- SQLTime.comparand(left) do
       {:ok, {mirror(op), "time", on_the_left(value)}}
@@ -559,16 +611,16 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
         {:ok, deferred_clause(SQLTime.comparison_type_error(type, text, "Timestamp(ns)"))}
 
       false ->
-        {:error, SQLError.refusal("unsupported WHERE clause: #{trimmed}")}
+        unsupported_where(trimmed)
 
       {:error, _reason} = error ->
         error
     end
   end
 
-  defp comparison_clause(text, left, right, trimmed) do
-    op = Map.fetch!(@comparison_operators, text)
-
+  @spec value_comparison(op(), binary(), binary(), binary()) ::
+          {:ok, clause() | :always | :never} | {:error, map()}
+  defp value_comparison(op, left, right, trimmed) do
     cond do
       null?(left) ->
         null_comparison(mirror(op), right, trimmed)

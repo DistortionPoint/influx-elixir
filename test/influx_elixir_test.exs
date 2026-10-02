@@ -2,20 +2,21 @@ defmodule InfluxElixirTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
+  alias InfluxElixir.TestSupport.{Telemetry, Tokens}
+
+  # The write's own time, so every row is compared whole, `time` included.
+  @ts 1_700_000_000_000_000_000
+  @time ~U[2023-11-14 22:13:20.000000Z]
 
   setup do
     {:ok, conn} = Local.start(databases: ["test_db"])
-    Local.write(conn, "cpu value=1i", database: "test_db")
+    Local.write(conn, "cpu value=1i #{@ts}", database: "test_db")
     {:ok, conn: conn}
   end
 
-  # A result with the columns the clock assigns taken out, so that the rest
-  # is compared whole.
-  defp without({:ok, rows}, columns), do: {:ok, Enum.map(rows, &Map.drop(&1, columns))}
-
   describe "client/0" do
     test "returns the configured client implementation" do
-      assert InfluxElixir.client() == InfluxElixir.Client.Local
+      assert InfluxElixir.client() === InfluxElixir.Client.Local
     end
   end
 
@@ -50,10 +51,8 @@ defmodule InfluxElixirTest do
 
   describe "query_sql/3" do
     test "delegates to configured client", %{conn: conn} do
-      assert conn
-             |> InfluxElixir.query_sql("SELECT * FROM cpu", database: "test_db")
-             |> without(["time"]) ===
-               {:ok, [%{"value" => 1}]}
+      assert InfluxElixir.query_sql(conn, "SELECT * FROM cpu", database: "test_db") ===
+               {:ok, [%{"time" => @time, "value" => 1}]}
     end
   end
 
@@ -66,10 +65,8 @@ defmodule InfluxElixirTest do
 
   describe "query_influxql/3" do
     test "delegates to configured client", %{conn: conn} do
-      assert conn
-             |> InfluxElixir.query_influxql("SELECT * FROM cpu", database: "test_db")
-             |> without(["time"]) ===
-               {:ok, [%{"iox::measurement" => "cpu", "value" => 1}]}
+      assert InfluxElixir.query_influxql(conn, "SELECT * FROM cpu", database: "test_db") ===
+               {:ok, [%{"iox::measurement" => "cpu", "time" => @time, "value" => 1}]}
     end
   end
 
@@ -78,17 +75,20 @@ defmodule InfluxElixirTest do
       {:ok, v2_conn} = Local.start(profile: :v2)
 
       :ok = InfluxElixir.create_bucket(v2_conn, "test")
-      {:ok, :written} = InfluxElixir.write(v2_conn, "cpu value=1.0", database: "test")
+      {:ok, :written} = InfluxElixir.write(v2_conn, "cpu value=1.0 #{@ts}", database: "test")
 
-      # _start, _stop and _time come from the clock; the rest is exact.
-      assert v2_conn
-             |> InfluxElixir.query_flux("from(bucket: \"test\") |> range(start: -1h)")
-             |> without(["_start", "_stop", "_time"]) ===
+      assert InfluxElixir.query_flux(
+               v2_conn,
+               "from(bucket: \"test\") |> range(start: 0, stop: #{div(@ts, 1_000_000_000) + 1})"
+             ) ===
                {:ok,
                 [
                   %{
                     "result" => "_result",
                     "table" => 0,
+                    "_start" => ~U[1970-01-01 00:00:00.000000Z],
+                    "_stop" => ~U[2023-11-14 22:13:21.000000Z],
+                    "_time" => @time,
                     "_measurement" => "cpu",
                     "_field" => "value",
                     "_value" => 1.0
@@ -144,14 +144,10 @@ defmodule InfluxElixirTest do
 
   describe "create_token/3 and delete_token/2" do
     test "create a named token and delete it by name", %{conn: conn} do
-      # The secret, its hash and the creation time are generated.
-      assert {:ok, token} = InfluxElixir.create_token(conn, "facade")
-
-      assert Map.drop(token, ["token", "hash", "created_at"]) ===
-               %{"id" => 1, "name" => "facade", "expiry" => nil}
-
-      assert %{"token" => "apiv3_" <> _secret, "hash" => hash, "created_at" => created_at} = token
-      assert is_binary(hash) and is_binary(created_at)
+      # The secret, its hash and the creation time are generated: `public/1`
+      # checks their shape (secret, 128 hex digits, RFC 3339) and drops them.
+      assert conn |> InfluxElixir.create_token("facade") |> Tokens.public() ===
+               {:ok, %{"id" => 1, "name" => "facade", "expiry" => nil}}
 
       assert :ok = InfluxElixir.delete_token(conn, "facade")
 
@@ -168,28 +164,7 @@ defmodule InfluxElixirTest do
 
   describe "telemetry" do
     setup do
-      handler_id = "influx-elixir-facade-#{inspect(self())}"
-
-      # Handlers are global; forward only events emitted by this test
-      # process so concurrent modules cannot leak spans in.
-      :telemetry.attach_many(
-        handler_id,
-        [[:influx_elixir, :write, :stop], [:influx_elixir, :query, :stop]],
-        &__MODULE__.forward_event/4,
-        %{test_pid: self()}
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
-      :ok
-    end
-
-    @doc false
-    @spec forward_event([atom()], map(), map(), %{test_pid: pid()}) :: :ok
-    def forward_event(event, measurements, metadata, %{test_pid: test_pid}) do
-      if self() == test_pid do
-        send(test_pid, {:telemetry, event, measurements, metadata})
-      end
-
+      Telemetry.attach([[:influx_elixir, :write, :stop], [:influx_elixir, :query, :stop]])
       :ok
     end
 
@@ -200,7 +175,7 @@ defmodule InfluxElixirTest do
       assert_receive {:telemetry, [:influx_elixir, :write, :stop], %{duration: duration},
                       %{database: "test_db", bytes: bytes, point_count: 2, result: :ok}}
 
-      assert bytes == byte_size(lp)
+      assert bytes === byte_size(lp)
       assert duration >= 0
     end
 
@@ -251,21 +226,19 @@ defmodule InfluxElixirTest do
     test "write and query functions fall back to it when opts omit :database" do
       {:ok, conn} = Local.start(database: "dflt_db")
 
-      assert {:ok, :written} = InfluxElixir.write(conn, "cpu value=1i")
+      assert {:ok, :written} = InfluxElixir.write(conn, "cpu value=1i #{@ts}")
 
-      # The write carries no timestamp, so `time` is the clock's.
-      assert conn |> InfluxElixir.query_sql("SELECT * FROM cpu") |> without(["time"]) ===
-               {:ok, [%{"value" => 1}]}
+      row = %{"time" => @time, "value" => 1}
 
-      assert conn |> InfluxElixir.query_influxql("SELECT * FROM cpu") |> without(["time"]) ===
-               {:ok, [%{"iox::measurement" => "cpu", "value" => 1}]}
+      assert InfluxElixir.query_sql(conn, "SELECT * FROM cpu") === {:ok, [row]}
 
-      assert conn |> InfluxElixir.execute_sql("SELECT * FROM cpu") |> without(["time"]) ===
-               {:ok, [%{"value" => 1}]}
+      assert InfluxElixir.query_influxql(conn, "SELECT * FROM cpu") ===
+               {:ok, [Map.put(row, "iox::measurement", "cpu")]}
 
-      assert conn
-             |> InfluxElixir.query_sql_stream("SELECT * FROM cpu")
-             |> Enum.map(&Map.delete(&1, "time")) === [%{"value" => 1}]
+      assert InfluxElixir.execute_sql(conn, "SELECT * FROM cpu") === {:ok, [row]}
+
+      assert conn |> InfluxElixir.query_sql_stream("SELECT * FROM cpu") |> Enum.to_list() ===
+               [row]
     end
   end
 

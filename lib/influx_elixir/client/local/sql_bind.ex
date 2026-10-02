@@ -222,16 +222,7 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   @spec bind_expr(SQLExpr.t(), %{binary() => term()}) :: SQLExpr.t()
   defp bind_expr({:param, name}, params), do: param_expr(Map.fetch!(params, name))
 
-  defp bind_expr({:op, op, left, right}, params),
-    do: {:op, op, bind_expr(left, params), bind_expr(right, params)}
-
-  defp bind_expr({:neg, inner}, params), do: {:neg, bind_expr(inner, params)}
-  defp bind_expr({:cast, inner, type}, params), do: {:cast, bind_expr(inner, params), type}
-
-  defp bind_expr({:call, function, args}, params),
-    do: {:call, function, Enum.map(args, &bind_expr(&1, params))}
-
-  defp bind_expr(expr, _params), do: expr
+  defp bind_expr(expr, params), do: SQLExpr.map_children(expr, &bind_expr(&1, params))
 
   @spec param_expr(term()) :: SQLExpr.t()
   defp param_expr(value) when is_integer(value) and value >= 0, do: {:uint, value}

@@ -2,94 +2,76 @@ defmodule InfluxElixir.TelemetryTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Telemetry
+  alias InfluxElixir.TestSupport.Telemetry, as: Forward
 
-  # ---------- Helpers ----------
+  # A span's function that takes at least this long, so a duration has a
+  # guaranteed floor to be checked against (the monotonic clock never reads
+  # less than the sleep waited).
+  @floor System.convert_time_unit(1, :millisecond, :native)
 
-  defp unique_handler_id(suffix) do
-    "influx-elixir-test-#{inspect(self())}-#{suffix}"
-  end
-
-  # Telemetry handlers are global, so events from other async test modules
-  # (the facade emits spans too) would leak in. The handler runs in the
-  # emitting process, so forwarding only when that is the test process
-  # keeps each test isolated. A module capture avoids telemetry's
-  # "local function" info log on every attach.
-  defp attach_handler(handler_id, event) do
-    :telemetry.attach(handler_id, event, &__MODULE__.forward_event/4, %{test_pid: self()})
-    on_exit(fn -> :telemetry.detach(handler_id) end)
-  end
-
-  @doc false
-  @spec forward_event([atom()], map(), map(), %{test_pid: pid()}) :: :ok
-  def forward_event(event, measurements, metadata, %{test_pid: test_pid}) do
-    if self() == test_pid do
-      send(test_pid, {:telemetry, event, measurements, metadata})
+  defp slowly(result) do
+    fn ->
+      Process.sleep(1)
+      result
     end
-
-    :ok
   end
 
-  # `system_time` must be wall-clock time (native units), i.e. within a few
-  # seconds of now — monotonic time is an arbitrary offset and would fail this.
-  defp assert_wall_clock(value) do
-    tolerance = System.convert_time_unit(5, :second, :native)
-    assert abs(value - System.system_time()) < tolerance
+  # Runs `emit` and returns the readings of a clock taken before and after it,
+  # so that a time the event carries can be bracketed exactly.
+  defp bracketed(clock, emit) do
+    before = clock.()
+    emit.()
+    {before, clock.()}
   end
-
-  # ---------- span_write/2 ----------
 
   describe "span_write/2" do
     test "emits :start event before the function executes" do
-      handler_id = unique_handler_id("span_write_start")
-      attach_handler(handler_id, [:influx_elixir, :write, :start])
-
+      Forward.attach([[:influx_elixir, :write, :start]])
       metadata = %{database: "testdb", point_count: 1, bytes: 42}
 
-      Telemetry.span_write(metadata, fn -> :ok end)
+      {before, later} =
+        bracketed(&System.system_time/0, fn ->
+          Telemetry.span_write(metadata, fn -> :ok end)
+        end)
 
       assert_receive {:telemetry, [:influx_elixir, :write, :start], measurements, recv_meta}
-      assert is_integer(measurements.system_time)
-      assert recv_meta.database == "testdb"
-      assert recv_meta.point_count == 1
-      assert recv_meta.bytes == 42
+      assert measurements.system_time >= before and measurements.system_time <= later
+      assert recv_meta.database === "testdb"
+      assert recv_meta.point_count === 1
+      assert recv_meta.bytes === 42
     end
 
     test "emits :stop event after the function returns" do
-      handler_id = unique_handler_id("span_write_stop")
-      attach_handler(handler_id, [:influx_elixir, :write, :stop])
-
+      Forward.attach([[:influx_elixir, :write, :stop]])
       metadata = %{database: "testdb", point_count: 2, bytes: 100}
 
-      result = Telemetry.span_write(metadata, fn -> {:ok, :written} end)
+      assert Telemetry.span_write(metadata, slowly({:ok, :written})) === {:ok, :written}
 
-      assert result == {:ok, :written}
       assert_receive {:telemetry, [:influx_elixir, :write, :stop], measurements, recv_meta}
-      assert is_integer(measurements.duration)
-      assert measurements.duration >= 0
-      assert recv_meta.database == "testdb"
+      assert measurements.duration >= @floor
+      assert recv_meta.database === "testdb"
     end
 
     test "emits :exception event when the function raises" do
-      handler_id = unique_handler_id("span_write_exception")
-      attach_handler(handler_id, [:influx_elixir, :write, :exception])
-
+      Forward.attach([[:influx_elixir, :write, :exception]])
       metadata = %{database: "testdb", point_count: 1, bytes: 10}
 
       assert_raise RuntimeError, "boom", fn ->
-        Telemetry.span_write(metadata, fn -> raise "boom" end)
+        Telemetry.span_write(metadata, fn ->
+          Process.sleep(1)
+          raise "boom"
+        end)
       end
 
       assert_receive {:telemetry, [:influx_elixir, :write, :exception], measurements, recv_meta}
 
-      assert is_integer(measurements.duration)
-      assert recv_meta.database == "testdb"
-      assert recv_meta.kind == :error
+      assert measurements.duration >= @floor
+      assert recv_meta.database === "testdb"
+      assert recv_meta.kind === :error
     end
 
     test "does not emit :stop event when the function raises" do
-      stop_handler_id = unique_handler_id("span_write_no_stop")
-      attach_handler(stop_handler_id, [:influx_elixir, :write, :stop])
-
+      Forward.attach([[:influx_elixir, :write, :stop]])
       metadata = %{database: "testdb", point_count: 1, bytes: 10}
 
       assert_raise RuntimeError, fn ->
@@ -101,59 +83,54 @@ defmodule InfluxElixir.TelemetryTest do
     end
   end
 
-  # ---------- span_query/2 ----------
-
   describe "span_query/2" do
     test "emits :start event before the function executes" do
-      handler_id = unique_handler_id("span_query_start")
-      attach_handler(handler_id, [:influx_elixir, :query, :start])
-
+      Forward.attach([[:influx_elixir, :query, :start]])
       metadata = %{database: "testdb", transport: :http}
 
-      Telemetry.span_query(metadata, fn -> {:ok, []} end)
+      {before, later} =
+        bracketed(&System.system_time/0, fn ->
+          Telemetry.span_query(metadata, fn -> {:ok, []} end)
+        end)
 
       assert_receive {:telemetry, [:influx_elixir, :query, :start], measurements, recv_meta}
-      assert is_integer(measurements.system_time)
-      assert recv_meta.database == "testdb"
-      assert recv_meta.transport == :http
+      assert measurements.system_time >= before and measurements.system_time <= later
+      assert recv_meta.database === "testdb"
+      assert recv_meta.transport === :http
     end
 
     test "emits :stop event after the function returns" do
-      handler_id = unique_handler_id("span_query_stop")
-      attach_handler(handler_id, [:influx_elixir, :query, :stop])
-
+      Forward.attach([[:influx_elixir, :query, :stop]])
       metadata = %{database: "testdb", transport: :flight}
 
-      result = Telemetry.span_query(metadata, fn -> {:ok, [%{"col" => 1}]} end)
+      assert Telemetry.span_query(metadata, slowly({:ok, [%{"col" => 1}]})) ===
+               {:ok, [%{"col" => 1}]}
 
-      assert result == {:ok, [%{"col" => 1}]}
       assert_receive {:telemetry, [:influx_elixir, :query, :stop], measurements, recv_meta}
-      assert is_integer(measurements.duration)
-      assert measurements.duration >= 0
-      assert recv_meta.transport == :flight
+      assert measurements.duration >= @floor
+      assert recv_meta.transport === :flight
     end
 
     test "emits :exception event when the function raises" do
-      handler_id = unique_handler_id("span_query_exception")
-      attach_handler(handler_id, [:influx_elixir, :query, :exception])
-
+      Forward.attach([[:influx_elixir, :query, :exception]])
       metadata = %{database: "testdb", transport: :http}
 
       assert_raise ArgumentError, "bad query", fn ->
-        Telemetry.span_query(metadata, fn -> raise ArgumentError, "bad query" end)
+        Telemetry.span_query(metadata, fn ->
+          Process.sleep(1)
+          raise ArgumentError, "bad query"
+        end)
       end
 
       assert_receive {:telemetry, [:influx_elixir, :query, :exception], measurements, recv_meta}
 
-      assert is_integer(measurements.duration)
-      assert recv_meta.database == "testdb"
-      assert recv_meta.kind == :error
+      assert measurements.duration >= @floor
+      assert recv_meta.database === "testdb"
+      assert recv_meta.kind === :error
     end
 
     test "does not emit :stop event when the function raises" do
-      stop_handler_id = unique_handler_id("span_query_no_stop")
-      attach_handler(stop_handler_id, [:influx_elixir, :query, :stop])
-
+      Forward.attach([[:influx_elixir, :query, :stop]])
       metadata = %{database: "testdb", transport: :http}
 
       assert_raise RuntimeError, fn ->
@@ -165,90 +142,94 @@ defmodule InfluxElixir.TelemetryTest do
     end
   end
 
-  # ---------- Manual write events ----------
+  # `system_time` is wall-clock time and `monotonic_time` the monotonic
+  # clock's, in native units: each lies between the readings taken around
+  # the emit, which an arbitrary offset or the wrong clock would fail.
+  defp assert_start_times(emit) do
+    before = {System.system_time(), System.monotonic_time()}
+    emit.()
+    {before, {System.system_time(), System.monotonic_time()}}
+  end
 
   describe "write_start/1" do
     test "emits the event with system_time measurement" do
-      handler_id = unique_handler_id("write_start")
-      attach_handler(handler_id, [:influx_elixir, :write, :start])
-
+      Forward.attach([[:influx_elixir, :write, :start]])
       meta = %{database: "mydb", point_count: 5, bytes: 200}
-      Telemetry.write_start(meta)
+
+      {{from_system, from_mono}, {to_system, to_mono}} =
+        assert_start_times(fn -> Telemetry.write_start(meta) end)
 
       assert_receive {:telemetry, [:influx_elixir, :write, :start], measurements, recv_meta}
-      assert_wall_clock(measurements.system_time)
-      assert is_integer(measurements.monotonic_time)
-      assert recv_meta == meta
+      assert measurements.system_time >= from_system and measurements.system_time <= to_system
+      assert measurements.monotonic_time >= from_mono and measurements.monotonic_time <= to_mono
+      assert recv_meta === meta
     end
   end
 
   describe "write_stop/2" do
     test "emits the event with duration measurement" do
-      handler_id = unique_handler_id("write_stop")
-      attach_handler(handler_id, [:influx_elixir, :write, :stop])
-
+      Forward.attach([[:influx_elixir, :write, :stop]])
       meta = %{database: "mydb", point_count: 5, bytes: 200}
-      Telemetry.write_stop(12_345, meta)
+
+      {before, later} =
+        bracketed(&System.monotonic_time/0, fn -> Telemetry.write_stop(12_345, meta) end)
 
       assert_receive {:telemetry, [:influx_elixir, :write, :stop], measurements, recv_meta}
-      assert measurements.duration == 12_345
-      assert is_integer(measurements.monotonic_time)
-      assert recv_meta == meta
+      assert measurements.duration === 12_345
+      assert measurements.monotonic_time >= before and measurements.monotonic_time <= later
+      assert recv_meta === meta
     end
   end
 
   describe "write_exception/2" do
     test "emits the event with duration measurement" do
-      handler_id = unique_handler_id("write_exception")
-      attach_handler(handler_id, [:influx_elixir, :write, :exception])
-
+      Forward.attach([[:influx_elixir, :write, :exception]])
       meta = %{database: "mydb", kind: :error, reason: :timeout, stacktrace: []}
-      Telemetry.write_exception(99_999, meta)
+
+      {before, later} =
+        bracketed(&System.monotonic_time/0, fn -> Telemetry.write_exception(99_999, meta) end)
 
       assert_receive {:telemetry, [:influx_elixir, :write, :exception], measurements, recv_meta}
 
-      assert measurements.duration == 99_999
-      assert is_integer(measurements.monotonic_time)
-      assert recv_meta == meta
+      assert measurements.duration === 99_999
+      assert measurements.monotonic_time >= before and measurements.monotonic_time <= later
+      assert recv_meta === meta
     end
   end
 
-  # ---------- Manual query events ----------
-
   describe "query_start/1" do
     test "emits the event with system_time measurement" do
-      handler_id = unique_handler_id("query_start")
-      attach_handler(handler_id, [:influx_elixir, :query, :start])
-
+      Forward.attach([[:influx_elixir, :query, :start]])
       meta = %{database: "mydb", transport: :http}
-      Telemetry.query_start(meta)
+
+      {{from_system, from_mono}, {to_system, to_mono}} =
+        assert_start_times(fn -> Telemetry.query_start(meta) end)
 
       assert_receive {:telemetry, [:influx_elixir, :query, :start], measurements, recv_meta}
-      assert_wall_clock(measurements.system_time)
-      assert is_integer(measurements.monotonic_time)
-      assert recv_meta == meta
+      assert measurements.system_time >= from_system and measurements.system_time <= to_system
+      assert measurements.monotonic_time >= from_mono and measurements.monotonic_time <= to_mono
+      assert recv_meta === meta
     end
   end
 
   describe "query_stop/2" do
     test "emits the event with duration measurement" do
-      handler_id = unique_handler_id("query_stop")
-      attach_handler(handler_id, [:influx_elixir, :query, :stop])
-
+      Forward.attach([[:influx_elixir, :query, :stop]])
       meta = %{database: "mydb", transport: :flight, row_count: 100}
-      Telemetry.query_stop(55_000, meta)
+
+      {before, later} =
+        bracketed(&System.monotonic_time/0, fn -> Telemetry.query_stop(55_000, meta) end)
 
       assert_receive {:telemetry, [:influx_elixir, :query, :stop], measurements, recv_meta}
-      assert measurements.duration == 55_000
-      assert is_integer(measurements.monotonic_time)
-      assert recv_meta == meta
+      assert measurements.duration === 55_000
+      assert measurements.monotonic_time >= before and measurements.monotonic_time <= later
+      assert recv_meta === meta
     end
   end
 
   describe "query_exception/2" do
     test "emits the event with duration measurement" do
-      handler_id = unique_handler_id("query_exception")
-      attach_handler(handler_id, [:influx_elixir, :query, :exception])
+      Forward.attach([[:influx_elixir, :query, :exception]])
 
       meta = %{
         database: "mydb",
@@ -258,13 +239,14 @@ defmodule InfluxElixir.TelemetryTest do
         stacktrace: []
       }
 
-      Telemetry.query_exception(77_777, meta)
+      {before, later} =
+        bracketed(&System.monotonic_time/0, fn -> Telemetry.query_exception(77_777, meta) end)
 
       assert_receive {:telemetry, [:influx_elixir, :query, :exception], measurements, recv_meta}
 
-      assert measurements.duration == 77_777
-      assert is_integer(measurements.monotonic_time)
-      assert recv_meta == meta
+      assert measurements.duration === 77_777
+      assert measurements.monotonic_time >= before and measurements.monotonic_time <= later
+      assert recv_meta === meta
     end
   end
 end

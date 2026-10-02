@@ -65,7 +65,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
     test "finch pool name is derivable from registered connection" do
       name = unique_name()
 
-      {:ok, _pid} =
+      {:ok, sup} =
         InfluxElixir.add_connection(name, host: "h", token: "t")
 
       on_exit(fn ->
@@ -73,7 +73,10 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       end)
 
       finch_name = ConnectionSupervisor.finch_name(name)
-      assert Process.whereis(finch_name) != nil
+      finch = Process.whereis(finch_name)
+      assert is_pid(finch) and Process.alive?(finch)
+      assert [{^finch_name, child, _type, _mods}] = Supervisor.which_children(sup)
+      assert is_pid(child) and Process.alive?(child)
     end
 
     test "no per-connection Finch pool is started when :finch_name names an existing one" do
@@ -86,7 +89,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
 
       on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
-      assert Process.whereis(ConnectionSupervisor.finch_name(name)) == nil
+      assert Process.whereis(ConnectionSupervisor.finch_name(name)) === nil
       assert InfluxElixir.health(name) === {:ok, %{"status" => "pass"}}
     end
   end

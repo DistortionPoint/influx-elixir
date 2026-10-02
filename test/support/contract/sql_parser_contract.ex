@@ -15,16 +15,35 @@ defmodule InfluxElixir.Contract.SQLParser do
 
   Where the double refuses by name (a `Client.Local:` 400) what the engine
   plans another way, the test says which of the two is acceptable.
+
+  ## Parts
+
+  A module that generates the whole contract is slow to compile, so `part: part`
+  generates one slice of it, for a module of its own that compiles and runs in
+  parallel with its siblings. Without `:part` everything is generated.
+
+    * `:literals_time` — literals, constants and every use of `time`
+    * `:functions_text` — LIMIT, functions, DATE_BIN, text and identifiers
+    * `:names_select` — unaliased and grouped names, field lists, CTEs
+    * `:parameters` — bound parameters
   """
+
+  @parts [:literals_time, :functions_text, :names_select, :parameters]
 
   @doc false
   defmacro __using__(opts) do
     client = Keyword.fetch!(opts, :client)
     profile = Keyword.fetch!(opts, :profile)
+    part = Keyword.get(opts, :part, :all)
+
+    unless part == :all or part in @parts do
+      raise ArgumentError,
+            "unknown :part #{inspect(part)}, expected :all or one of #{inspect(@parts)}"
+    end
 
     # SQL is the v3 profiles' query language; v2 has none of it.
     if profile in [:v3_core, :v3_enterprise] do
-      sql_parser_tests(client)
+      sql_parser_tests(client, part)
     end
   end
 
@@ -49,78 +68,91 @@ defmodule InfluxElixir.Contract.SQLParser do
       else: ~s("#{String.replace(name, "\"", "\"\"")}")
   end
 
-  defp sql_parser_tests(client) do
+  # The helpers are public functions: a part that does not call one of them must
+  # not warn about it.
+  defp sql_parser_tests(client, part) do
+    helpers = [helpers(client), error_helpers()]
+    tests = for {test_part, block} <- test_blocks(), part == :all or part == test_part, do: block
+
     quote location: :keep do
-      unquote(helpers(client))
-      unquote(error_helpers())
-      unquote(literal_tests())
-      unquote(constant_tests())
-      unquote(time_number_tests())
-      unquote(time_string_tests())
-      unquote(time_error_tests())
-      unquote(time_aggregate_tests())
-      unquote(limit_tests())
-      unquote(function_tests())
-      unquote(trunc_tests())
-      unquote(parenthesised_name_tests())
-      unquote(time_limit_tests())
-      unquote(cte_edge_tests())
-      unquote(order_position_tests())
-      unquote(date_bin_tests())
-      unquote(text_tests())
-      unquote(escape_tests())
-      unquote(identifier_tests())
-      unquote(unaliased_tests())
-      unquote(grouped_name_tests())
-      unquote(time_range_tests())
-      unquote(literal_type_tests())
-      unquote(quoted_select_tests())
-      unquote(valid_fields_tests())
-      unquote(valid_fields_context_tests())
-      unquote(time_zone_tests())
-      unquote(leap_second_tests())
-      unquote(small_fidelity_tests())
-      unquote(parameter_tests())
-      unquote(parameter_kind_tests())
-      unquote(parameter_type_tests())
-      unquote(request_param_tests())
+      (unquote_splicing(helpers))
+      (unquote_splicing(tests))
     end
+  end
+
+  # Every block of tests with the part it belongs to, in order.
+  @spec test_blocks() :: [{atom(), Macro.t()}]
+  defp test_blocks do
+    [
+      {:literals_time, literal_tests()},
+      {:literals_time, constant_tests()},
+      {:literals_time, time_number_tests()},
+      {:literals_time, time_string_tests()},
+      {:literals_time, time_error_tests()},
+      {:literals_time, time_aggregate_tests()},
+      {:functions_text, limit_tests()},
+      {:functions_text, function_tests()},
+      {:functions_text, trunc_tests()},
+      {:functions_text, parenthesised_name_tests()},
+      {:literals_time, time_limit_tests()},
+      {:names_select, cte_edge_tests()},
+      {:names_select, order_position_tests()},
+      {:functions_text, date_bin_tests()},
+      {:functions_text, text_tests()},
+      {:functions_text, escape_tests()},
+      {:functions_text, identifier_tests()},
+      {:names_select, unaliased_tests()},
+      {:names_select, grouped_name_tests()},
+      {:literals_time, time_range_tests()},
+      {:names_select, literal_type_tests()},
+      {:names_select, quoted_select_tests()},
+      {:names_select, valid_fields_tests()},
+      {:names_select, valid_fields_context_tests()},
+      {:literals_time, time_zone_tests()},
+      {:literals_time, leap_second_tests()},
+      {:functions_text, small_fidelity_tests()},
+      {:parameters, parameter_tests()},
+      {:parameters, parameter_kind_tests()},
+      {:parameters, parameter_type_tests()},
+      {:parameters, request_param_tests()}
+    ]
   end
 
   defp helpers(client) do
     quote location: :keep do
       # Nanoseconds for second `n` after 2023-11-14T22:13:20Z.
-      defp sp_ns(n), do: (1_700_000_000 + n) * 1_000_000_000
+      def sp_ns(n), do: (1_700_000_000 + n) * 1_000_000_000
 
-      defp sp_measurement(prefix),
+      def sp_measurement(prefix),
         do: "#{prefix}_#{100_000_000 + System.unique_integer([:positive])}"
 
-      defp sp_write(ctx, lines) do
+      def sp_write(ctx, lines) do
         assert {:ok, :written} =
                  unquote(client).write(ctx.conn, Enum.join(lines, "\n"), database: ctx.database)
 
         InfluxElixir.ClientContract.settle(ctx)
       end
 
-      defp sp_query(ctx, sql, params \\ nil) do
+      def sp_query(ctx, sql, params \\ nil) do
         opts = [database: ctx.database]
         opts = if params, do: Keyword.put(opts, :params, params), else: opts
         unquote(client).query_sql(ctx.conn, sql, opts)
       end
 
-      defp sp_raw(ctx, sql, opts),
+      def sp_raw(ctx, sql, opts),
         do: unquote(client).query_sql(ctx.conn, sql, [database: ctx.database] ++ opts)
 
-      defp sp_execute(ctx, sql, params),
+      def sp_execute(ctx, sql, params),
         do: unquote(client).execute_sql(ctx.conn, sql, database: ctx.database, params: params)
 
-      defp sp_local?, do: unquote(client) === InfluxElixir.Client.Local
+      def sp_local?, do: unquote(client) === InfluxElixir.Client.Local
 
       @sp_closed {:error, {:connection_error, %Mint.TransportError{reason: :closed}}}
+      @sp_nosuch "Schema error: No field named nosuch."
 
       # The byte of the request body `Client.HTTP` sends at which the text of the
       # parameters up to `problem` ends, and whether `problem` is the last one.
-      defp sp_params_read(ctx, sql, params, problem, format) do
+      def sp_params_read(ctx, sql, params, problem, format) do
         {:ok, normalized} = InfluxElixir.Client.QueryParams.normalize(params)
 
         body =
@@ -138,27 +170,27 @@ defmodule InfluxElixir.Contract.SQLParser do
   # The words in which the engine refuses what it cannot plan.
   defp error_helpers do
     quote location: :keep do
-      defp sp_coercion(message),
+      def sp_coercion(message),
         do: "type_coercion\ncaused by\nError during planning: " <> message
 
       # Rust's Debug format escapes `"` and `\` inside the message.
-      defp sp_tokenizer(message, line, column) do
+      def sp_tokenizer(message, line, column) do
         debug = message |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")
         ~s|SQL error: TokenizerError("#{debug} at Line: #{line}, Column: #{column}")|
       end
 
       # What the optimizer's `simplify_expressions` pass says when it folds
       # a constant that Arrow cannot read.
-      defp sp_optimizer(message),
+      def sp_optimizer(message),
         do: "Optimizer rule 'simplify_expressions' failed\ncaused by\nArrow error: " <> message
 
-      defp sp_timestamp_error(text, reason),
+      def sp_timestamp_error(text, reason),
         do: sp_optimizer("Parser error: Error parsing timestamp from '#{text}': #{reason}")
 
-      defp sp_negative_zero?(value), do: is_float(value) and <<value::float>> === <<-0.0::float>>
+      def sp_negative_zero?(value), do: is_float(value) and <<value::float>> === <<-0.0::float>>
 
       # Two ints, a string and a boolean beside the floats trunc takes.
-      defp sp_trunc_fixture(ctx) do
+      def sp_trunc_fixture(ctx) do
         m = sp_measurement("sp_trunc")
 
         sp_write(ctx, [
@@ -168,20 +200,20 @@ defmodule InfluxElixir.Contract.SQLParser do
         m
       end
 
-      defp sp_fields(table, columns), do: InfluxElixir.Contract.SQLParser.fields(table, columns)
+      def sp_fields(table, columns), do: InfluxElixir.Contract.SQLParser.fields(table, columns)
 
-      defp sp_no_field(printed, fields),
+      def sp_no_field(printed, fields),
         do: InfluxElixir.Contract.SQLParser.no_field(printed, fields)
 
       # What the engine says of a `WHERE` that leaves no instant of time.
-      defp sp_boundaries,
+      def sp_boundaries,
         do:
           "External error: unexpected: provided filters on time column did not produce " <>
             "a valid set of boundaries"
 
       # The rows of the fixture most tests read: three points two minutes apart
       # in a tag, an integer, a float, a string and a boolean field.
-      defp sp_fixture(ctx) do
+      def sp_fixture(ctx) do
         m = sp_measurement("sp_fix")
 
         sp_write(ctx, [
@@ -388,6 +420,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                    {:error, %{status: 400, body: expected}}
         end
 
+        @tag engine_bug: "DataFusion internal error"
         test "IN lists the types; BETWEEN is the engine's internal error", ctx do
           m = sp_measurement("sp_timein")
           sp_write(ctx, ["#{m} v=1 #{sp_ns(0)}"])
@@ -455,7 +488,11 @@ defmodule InfluxElixir.Contract.SQLParser do
                  }) ===
                    {:ok, [%{"v" => 1}, %{"v" => 2}]}
 
-          assert sp_query(ctx, select <> "time IN ($a, $b) ORDER BY time", %{a: at.(1), b: at.(3)}) ===
+          assert sp_query(
+                   ctx,
+                   select <> "time IN ($a, $b) ORDER BY time",
+                   %{a: at.(1), b: at.(3)}
+                 ) ===
                    {:ok, [%{"v" => 1}, %{"v" => 3}]}
 
           assert sp_query(ctx, select <> "$a < time", %{a: at.(2)}) === {:ok, [%{"v" => 3}]}
@@ -905,7 +942,8 @@ defmodule InfluxElixir.Contract.SQLParser do
                      ctx,
                      "SELECT round(-0.3) AS a, round(-0.0) AS b, round(-0.04, 1) AS c, " <>
                        "round(-0.3, 0) AS d, round(-1500.0, -4) AS e, round(-0.3 * v) AS f, " <>
-                       "ceil(-0.5) AS g, floor(-0.0) AS h, round(0.3) AS i, round(-v, -3) AS j " <>
+                       "ceil(-0.5) AS g, floor(-0.0) AS h, round(0.3) AS i, round(-v, -3) AS " <>
+                       "j " <>
                        "FROM #{m}"
                    )
 
@@ -1495,7 +1533,11 @@ defmodule InfluxElixir.Contract.SQLParser do
                    p: 18_446_744_073_709_551_616
                  }) === {:ok, [%{"v" => 1}, %{"v" => 2}]}
 
-          assert sp_query(ctx, "select v from #{m} where v between $a and $b", %{a: nil, b: 2}) ===
+          assert sp_query(
+                   ctx,
+                   "select v from #{m} where v between $a and $b",
+                   %{a: nil, b: 2}
+                 ) ===
                    {:ok, []}
 
           assert sp_query(ctx, "select v from #{m} where v between $a and $b order by time", %{
@@ -1685,12 +1727,8 @@ defmodule InfluxElixir.Contract.SQLParser do
                    "max(#{m}.v)" => 3,
                    "median(#{m}.v)" => 2
                  }},
-                {"stddev(v), STDDEV_SAMP(v), stddev_pop(v)",
-                 %{
-                   "stddev(#{m}.v)" => 1.0,
-                   "stddev_samp(#{m}.v)" => 1.0,
-                   "stddev_pop(#{m}.v)" => 0.816496580927726
-                 }},
+                {"stddev(v), STDDEV_SAMP(v)",
+                 %{"stddev(#{m}.v)" => 1.0, "stddev_samp(#{m}.v)" => 1.0}},
                 {"var(v), var_samp(v), var_pop(v)",
                  %{
                    "var(#{m}.v)" => 1.0,
@@ -1725,6 +1763,18 @@ defmodule InfluxElixir.Contract.SQLParser do
               ] do
             assert sp_query(ctx, "SELECT #{select} FROM #{m}") === {:ok, [row]}, select
           end
+        end
+
+        # The population deviation depends on the order the engine accumulates in, so its
+        # digits are compared within a tolerance rather than exactly.
+        test "stddev_pop is named as the engine names it and is the root of var_pop", ctx do
+          m = sp_fixture(ctx)
+
+          assert {:ok, [row]} = sp_query(ctx, "SELECT stddev_pop(v) FROM #{m}")
+          assert Map.keys(row) === ["stddev_pop(#{m}.v)"]
+          value = row["stddev_pop(#{m}.v)"]
+          assert is_float(value)
+          assert abs(value - 0.816496580927726) < 1.0e-12
         end
 
         test "a column, a constant or an expression is named as the engine names it", ctx do
@@ -1784,7 +1834,8 @@ defmodule InfluxElixir.Contract.SQLParser do
           m = sp_fixture(ctx)
 
           bucket = fn interval ->
-            "date_bin(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: #{elem(interval, 0)}, " <>
+            "date_bin(IntervalMonthDayNano(\"IntervalMonthDayNano " <>
+              "{ months: 0, days: #{elem(interval, 0)}, " <>
               "nanoseconds: #{elem(interval, 1)} }\"),#{m}.time)"
           end
 
@@ -1802,7 +1853,8 @@ defmodule InfluxElixir.Contract.SQLParser do
               ] do
             assert sp_query(
                      ctx,
-                     "SELECT date_bin(INTERVAL '#{interval}', time), count(*) FROM #{m} GROUP BY 1"
+                     "SELECT date_bin(INTERVAL '#{interval}', time), count(*) FROM #{m} GROUP " <>
+                       "BY 1"
                    ) === {:ok, [%{key => start, "count(*)" => 3}]},
                    interval
           end
@@ -1817,13 +1869,19 @@ defmodule InfluxElixir.Contract.SQLParser do
                    order
           end
 
-          assert sp_query(ctx, "SELECT h, sum(v) AS s FROM #{m} GROUP BY h ORDER BY sum(v) DESC") ===
+          assert sp_query(
+                   ctx,
+                   "SELECT h, sum(v) AS s FROM #{m} GROUP BY h ORDER BY sum(v) DESC"
+                 ) ===
                    {:ok, [%{"h" => "a", "s" => 4}, %{"h" => "b", "s" => 2}]}
 
           assert sp_query(ctx, "SELECT v * 2 FROM #{m} ORDER BY 1 DESC LIMIT 1") ===
                    {:ok, [%{"#{m}.v * Int64(2)" => 6}]}
 
-          assert sp_query(ctx, ~s|SELECT v * 2 FROM #{m} ORDER BY "#{m}.v * Int64(2)" LIMIT 1|) ===
+          assert sp_query(
+                   ctx,
+                   ~s|SELECT v * 2 FROM #{m} ORDER BY "#{m}.v * Int64(2)" LIMIT 1|
+                 ) ===
                    {:ok, [%{"#{m}.v * Int64(2)" => 2}]}
         end
 
@@ -1900,7 +1958,8 @@ defmodule InfluxElixir.Contract.SQLParser do
                 "time = #{t2} AND time < #{t1}",
                 "time = #{t2} AND time < #{t2}",
                 "time IN (#{t1}) AND time > #{t3}",
-                "time > '2023-11-14T22:13:20.000000000' AND time < '2023-11-14T22:13:20.000000001'",
+                "time > '2023-11-14T22:13:20.000000000' AND time < " <>
+                  "'2023-11-14T22:13:20.000000001'",
                 "time > now() AND time < now()",
                 "time > now() + INTERVAL '1 hour' AND time < now()",
                 "time > now() - INTERVAL '1 hour' AND time < now() - INTERVAL '2 hours'",
@@ -1925,8 +1984,10 @@ defmodule InfluxElixir.Contract.SQLParser do
                 "SELECT count(*) AS n FROM #{m} WHERE time > #{t1} AND time < #{t1}",
                 "SELECT DISTINCT v FROM #{m} WHERE time > #{t1} AND time < #{t1}",
                 "SELECT 1 AS a FROM #{m} WHERE time > #{t1} AND time < #{t1}",
-                "WITH w AS (SELECT * FROM #{m}) SELECT v FROM w WHERE time > #{t1} AND time < #{t1}",
-                "WITH w AS (SELECT * FROM #{m} WHERE time > #{t1} AND time < #{t1}) SELECT v FROM w",
+                "WITH w AS (SELECT * FROM #{m}) SELECT v FROM w WHERE time > #{t1} AND time < " <>
+                  "#{t1}",
+                "WITH w AS (SELECT * FROM #{m} WHERE time > #{t1} AND time < #{t1}) SELECT v " <>
+                  "FROM w",
                 "SELECT v FROM #{m} WHERE time > #{t1} AND time < #{t1} AND v / 0 > 1"
               ] do
             assert sp_query(ctx, sql) === boundaries, sql
@@ -1976,13 +2037,13 @@ defmodule InfluxElixir.Contract.SQLParser do
           m = sp_fixture(ctx)
           range = "time > '2023-11-14T22:13:20' AND time < '2023-11-14T22:13:20'"
 
-          assert {:error, %{status: 500, body: "Schema error: No field named nosuch." <> _fields}} =
+          assert {:error, %{status: 500, body: @sp_nosuch <> _fields}} =
                    sp_query(ctx, "SELECT nosuch FROM #{m} WHERE #{range}")
 
-          assert {:error, %{status: 500, body: "Schema error: No field named nosuch." <> _fields}} =
+          assert {:error, %{status: 500, body: @sp_nosuch <> _fields}} =
                    sp_query(ctx, "SELECT v FROM #{m} WHERE #{range} AND nosuch = 1")
 
-          assert {:error, %{status: 500, body: "Schema error: No field named nosuch." <> _fields}} =
+          assert {:error, %{status: 500, body: @sp_nosuch <> _fields}} =
                    sp_query(ctx, "SELECT v FROM #{m} WHERE #{range} ORDER BY nosuch")
 
           assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{range} AND time > 'abc'") ===
@@ -2013,7 +2074,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                    tail
           end
 
-          assert {:error, %{status: 500, body: "Schema error: No field named nosuch." <> _fields}} =
+          assert {:error, %{status: 500, body: @sp_nosuch <> _fields}} =
                    sp_query(ctx, "SELECT v FROM #{m} WHERE nosuch = 1 LIMIT -1")
         end
       end
@@ -2074,6 +2135,7 @@ defmodule InfluxElixir.Contract.SQLParser do
           end
         end
 
+        @tag engine_bug: "closed connection"
         test "an Int64 by a UInt64 divides as a decimal of four places", ctx do
           m = sp_fixture(ctx)
           order = " FROM #{m} ORDER BY time"
@@ -2108,7 +2170,8 @@ defmodule InfluxElixir.Contract.SQLParser do
              %{
                status: 400,
                body:
-                 "Error during planning: Negation only supports numeric, interval and timestamp types"
+                 "Error during planning: Negation only supports numeric, interval and " <>
+                   "timestamp types"
              }}
 
           for literal <- ["-(9223372036854775808)", "-(18446744073709551615)"] do
@@ -2123,6 +2186,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                    {:ok, [%{"a" => 5, "b" => 5}]}
         end
 
+        @tag engine_bug: "closed connection"
         test "the magnitude or the negation of the Int64 minimum overflows", ctx do
           m = sp_measurement("sp_min")
 
@@ -2220,7 +2284,8 @@ defmodule InfluxElixir.Contract.SQLParser do
 
           hint = fn printed ->
             " Column names are case sensitive. You can use double quotes to refer to the " <>
-              "\"#{printed}\" column or set the datafusion.sql_parser.enable_ident_normalization " <>
+              "\"#{printed}\" column or set the " <>
+              "datafusion.sql_parser.enable_ident_normalization " <>
               "configuration."
           end
 
@@ -2348,8 +2413,8 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"SELECT h, count(*) AS c FROM #{m} GROUP BY h ORDER BY nosuch",
                  sp_fields(m, ["h"]) ++ ["c"]},
                 {"SELECT count(*) FROM #{m} ORDER BY nosuch", [~s|"count(*)"|]},
-                {"SELECT date_bin(INTERVAL '1 minute', time) AS b, count(*) AS c FROM #{m} GROUP BY 1 ORDER BY nosuch",
-                 ["b", "c"]}
+                {"SELECT date_bin(INTERVAL '1 minute', time) AS b, count(*) AS c FROM #{m} " <>
+                   "GROUP BY 1 ORDER BY nosuch", ["b", "c"]}
               ] do
             assert sp_query(ctx, sql) ===
                      {:error, %{status: 500, body: sp_no_field("nosuch", projection ++ fields)}},
@@ -2436,7 +2501,8 @@ defmodule InfluxElixir.Contract.SQLParser do
           m = sp_measurement("sp_sorted_columns")
 
           sp_write(ctx, [
-            ~s|#{m},Host=A,host=b,t1=x a\\ b=1i,Zed=2i,alpha=3i,_u=4i,é=5i,ZZ=1i,zz=2i #{sp_ns(0)}|
+            ~s|#{m},Host=A,host=b,t1=x a\\ b=1i,Zed=2i,alpha=3i,_u=4i,é=5i,| <>
+              ~s|ZZ=1i,zz=2i #{sp_ns(0)}|
           ])
 
           fields =
@@ -2576,7 +2642,10 @@ defmodule InfluxElixir.Contract.SQLParser do
                 "Etc/GMT+00",
                 "Zulu "
               ] do
-            assert sp_query(ctx, "SELECT v FROM #{m} WHERE time = '2023-11-14T22:13:20 #{zone}'") ===
+            assert sp_query(
+                     ctx,
+                     "SELECT v FROM #{m} WHERE time = '2023-11-14T22:13:20 #{zone}'"
+                   ) ===
                      {:error,
                       %{
                         status: 500,
@@ -2781,7 +2850,8 @@ defmodule InfluxElixir.Contract.SQLParser do
           assert sp_query(
                    ctx,
                    "SELECT trunc(k, 2) AS a, trunc(k, -2) AS b, trunc(k, 0) AS c, " <>
-                     "trunc(g, 1) AS d, trunc(h, 1) AS e, trunc(i, 1) AS f, trunc(i, -1) AS g, " <>
+                     "trunc(g, 1) AS d, trunc(h, 1) AS e, trunc(i, 1) AS f, trunc(i, -1) AS " <>
+                     "g, " <>
                      "trunc(j, -1) AS h FROM #{m}"
                  ) ===
                    {:ok,
@@ -2806,7 +2876,8 @@ defmodule InfluxElixir.Contract.SQLParser do
           m = sp_trunc_fixture(ctx)
 
           signature =
-            "OneOf([Exact([Float32, Int64]), Exact([Float64, Int64]), Exact([Float64]), Exact([Float32])])"
+            "OneOf([Exact([Float32, Int64]), Exact([Float64, Int64]), Exact([Float64]), " <>
+              "Exact([Float32])])"
 
           candidates =
             "\tCandidate functions:\n\ttrunc(Float32, Int64)\n\ttrunc(Float64, Int64)\n" <>
@@ -3017,7 +3088,8 @@ defmodule InfluxElixir.Contract.SQLParser do
         end
 
         @tag local_divergence:
-               "a CTE column named time that is not a timestamp is compared as a number; Local refuses by name"
+               "a CTE column named time that is not a timestamp is compared as a number; " <>
+                 "Local refuses by name"
         test "a CTE column named time that is not a timestamp is an ordinary column", ctx do
           m = sp_measurement("sp_cte_num")
           sp_write(ctx, ["#{m} v=1i,w=10i 1000000000", "#{m} v=2i,w=20i 2000000000"])
@@ -3061,7 +3133,8 @@ defmodule InfluxElixir.Contract.SQLParser do
                     %{
                       status: 400,
                       body:
-                        "Error during planning: Order by column out of bounds, specified: 5, max: 4"
+                        "Error during planning: Order by column out of bounds, specified: 5, " <>
+                          "max: 4"
                     }}
         end
 
@@ -3070,7 +3143,10 @@ defmodule InfluxElixir.Contract.SQLParser do
           sp_write(ctx, ["#{m} f=1.5 1000000000", "#{m} f=2.5 2000000000"])
           name = "#{m}.f + Int64(1)"
 
-          assert sp_query(ctx, "WITH c AS (SELECT f + 1 FROM #{m}) SELECT * FROM c ORDER BY 1") ===
+          assert sp_query(
+                   ctx,
+                   "WITH c AS (SELECT f + 1 FROM #{m}) SELECT * FROM c ORDER BY 1"
+                 ) ===
                    {:ok, [%{name => 2.5}, %{name => 3.5}]}
 
           assert sp_query(
@@ -3078,12 +3154,16 @@ defmodule InfluxElixir.Contract.SQLParser do
                    "WITH c AS (SELECT f + 1 FROM #{m}) SELECT * FROM c ORDER BY 1 DESC"
                  ) === {:ok, [%{name => 3.5}, %{name => 2.5}]}
 
-          assert sp_query(ctx, "WITH c AS (SELECT f + 1 FROM #{m}) SELECT * FROM c ORDER BY 2") ===
+          assert sp_query(
+                   ctx,
+                   "WITH c AS (SELECT f + 1 FROM #{m}) SELECT * FROM c ORDER BY 2"
+                 ) ===
                    {:error,
                     %{
                       status: 400,
                       body:
-                        "Error during planning: Order by column out of bounds, specified: 2, max: 1"
+                        "Error during planning: Order by column out of bounds, specified: 2, " <>
+                          "max: 1"
                     }}
         end
       end
@@ -3262,7 +3342,7 @@ defmodule InfluxElixir.Contract.SQLParser do
           end
         end
 
-        test "nil and [] are no parameters; a key or a params value that makes no sense is refused",
+        test "nil and [] are no parameters; a key or a value that makes no sense is refused",
              ctx do
           m = sp_measurement("sp_param_shape")
           sp_write(ctx, ["#{m} v=1i #{sp_ns(0)}"])

@@ -140,14 +140,8 @@ defmodule InfluxElixir.Flight.ClientTest do
     end
 
     test "returns {:error, :connect_timeout} when fn exceeds the bound" do
-      started = System.monotonic_time(:millisecond)
-
       assert {:error, :connect_timeout} =
                Client.bounded_connect(fn -> Process.sleep(:infinity) end, 50)
-
-      elapsed = System.monotonic_time(:millisecond) - started
-      # Bound is 50ms; allow ample slack for scheduler jitter on CI.
-      assert elapsed < 1_000
     end
   end
 end

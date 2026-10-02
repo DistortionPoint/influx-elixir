@@ -63,9 +63,12 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-10-01 | [`local-fidelity-sweep-and-optional-decimal`](2026-10-01_local-fidelity-sweep-and-optional-decimal.md) | Library compiled only with `decimal`; Decimal params compared as text over HTTP; ~40 Local SQL/InfluxQL/Flux/line-protocol answers made the engines'; store races; tests deduplicated and made exact |
 | 2026-10-01 | [`scalar-functions-and-named-tokens`](2026-10-01_scalar-functions-and-named-tokens.md) | Issue #25: `abs`/`round`/`floor`/`ceil` wherever an expression stands, with the planner's errors; expression operands for `IS NULL`/`IN`, a literal on the left; token API rebuilt on the endpoints the servers serve |
 | 2026-10-02 | [`local-sql-split-and-second-review`](2026-10-02_local-sql-split-and-second-review.md) | SQL parser split into focused modules; huge params, Int64 wrap, E-strings, quoted names, Arrow time errors, NULL time, `round(-0.0)`; InfluxQL number grammar and series order; contract no longer assumes row order or which v2 shard group reports a drop |
+| 2026-10-02 | [`influxql-planner-and-module-split`](2026-10-02_influxql-planner-and-module-split.md) | Local InfluxQL as the planner reads it (unsigned arithmetic, `not`, names and the time column, quoted times, constants, parentheses, reserved words after operators); `influxql.ex` and `line_protocol_parser.ex` split by seam |
 | 2026-10-02 | [`fourth-review`](2026-10-02_fourth-review.md) | Local: float overflow answers null, UInt64 columns typed, `INTEGER` casts are Int32, failing constants fold to the optimizer's 500, executor split; InfluxQL reserved words and second statements; re-entrant lock raises; whole-result `===` assertions, clock-free backpressure test |
 | 2026-10-02 | [`third-review`](2026-10-02_third-review.md) | Local: unaliased aggregates named as DataFusion names them, empty time and numeric ranges fail as on Core, qualified field lists, number literals, UTC aliases; InfluxQL parse errors and `GROUP BY` order; store locks without `:global`; strict `===` in contract tests |
 | 2026-10-02 | [`local-write-concurrency-retention-and-mixed-types`](2026-10-02_local-write-concurrency-retention-and-mixed-types.md) | Local: batched store writes (50 concurrent writers in 0.4 s, was a timeout), bounded chunked parse, v2 retention 422, mixed field types cut at the first differing group, `delete_bucket` clears data |
+| 2026-10-02 | [`fifth-review`](2026-10-02_fifth-review.md) | Review of e71cf7b: query performance restored, scratch script removed from lib, contract modules split per part (suite 27-41 s → 8-10 s), shared test helpers, whole-row assertions, clock-free batch-writer retry tests |
+| 2026-10-02 | [`local-sql-simplifier-and-intervals`](2026-10-02_local-sql-simplifier-and-intervals.md) | Local SQL: the simplifier's rules, casts and divisions in the interval analysis, decimal-versus-float casts, integer literals past `UInt64`, `AND`/`OR` batches refused, `ORDER BY` aliases, `round`/`trunc` scales, parser errors for garbage statements; 100k-point regression fixed |
 | 2026-09-30 | [`writer-timer-csv-gzip-restart`](2026-09-30_writer-timer-csv-gzip-restart.md) | BatchWriter timer re-armed; one-column v3 CSV rows kept; `gzip:` owned by `Writer`, Local reads bodies as the engines do; killed connection restarts alone; HTTP `execute_sql` params and `database: nil`; encoder 6x; token API mismatch recorded |
 | 2026-09-30 | [`local-write-speed-and-line-endings`](2026-09-30_local-write-speed-and-line-endings.md) | Local writes ~40% faster (byte trims, per-write column-kind cache, lazy `time` check); CRLF, `\r` and whitespace-only lines as both engines answer them |
 | 2026-09-29 | [`query-admin-modules-delegate`](2026-09-29_query-admin-modules-delegate.md) | `Query.*` and `Admin.*` call the facade: connection names resolve and queries emit telemetry, as through `InfluxElixir` |
@@ -84,10 +87,13 @@ they are written down. No compose file is kept in the repo; these one-liners
 match the defaults in `test/support/integration_helper.ex`:
 
 ```bash
-# InfluxDB 3 Core on 8181 (HTTP and Flight, no auth)
+# InfluxDB 3 Core on 8181 (HTTP and Flight, no auth). A write is answered
+# once the WAL flushes, every second by default; 10ms takes the suite from
+# minutes to seconds and changes no answer.
 docker run -d --rm --name influx3_verify -p 8181:8181 influxdb:3-core \
-  influxdb3 serve --node-id node0 --object-store memory --without-auth
-mix test test/integration/contract_v3_core_test.exs --include v3_core --include integration
+  influxdb3 serve --node-id node0 --object-store memory --without-auth \
+  --wal-flush-interval 10ms
+mix test test/integration/contract_v3_core --include v3_core --include integration
 
 # InfluxDB 2.7 on 8086 (org dev-influx, bucket metrics)
 docker run -d --rm --name influx2_verify -p 8086:8086 \
@@ -95,13 +101,13 @@ docker run -d --rm --name influx2_verify -p 8086:8086 \
   -e DOCKER_INFLUXDB_INIT_PASSWORD=devpassword123 -e DOCKER_INFLUXDB_INIT_ORG=dev-influx \
   -e DOCKER_INFLUXDB_INIT_BUCKET=metrics \
   -e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=dev-influx-token-123456789 influxdb:2.7
-mix test test/integration/contract_v2_test.exs --include v2 --include integration
+mix test test/integration/contract_v2 --include v2 --include integration
 
 # InfluxDB 3 Core on 8183 *with* auth, for the token endpoints (the test
 # creates the operator token, once per fresh server; or set
 # INFLUX_V3_AUTH_TOKEN)
 docker run -d --rm --name influx3_auth -p 8183:8181 influxdb:3-core \
-  influxdb3 serve --node-id node0 --object-store memory
+  influxdb3 serve --node-id node0 --object-store memory --wal-flush-interval 10ms
 mix test test/integration/tokens_v3_core_auth_test.exs --include v3_core_auth --include integration
 
 docker stop influx3_verify influx2_verify influx3_auth

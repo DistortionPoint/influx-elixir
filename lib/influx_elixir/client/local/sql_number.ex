@@ -118,14 +118,6 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   def result_type("Int64", right) when right in @narrow_types, do: "Int64"
   def result_type(_left, _right), do: "Decimal128(?)"
 
-  @doc "The Arrow type name of a number."
-  @spec type_name(t()) :: binary()
-  def type_name(value) when is_integer(value), do: "Int64"
-  def type_name({:u, _value}), do: "UInt64"
-  def type_name({:int, bits, _value}), do: "Int#{bits}"
-  def type_name({:dec, _coefficient, _scale}), do: "Decimal128(?)"
-  def type_name(_float), do: "Float64"
-
   @spec narrow_bits(binary()) :: 8 | 16 | 32
   defp narrow_bits("Int8"), do: 8
   defp narrow_bits("Int16"), do: 16

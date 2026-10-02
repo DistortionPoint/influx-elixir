@@ -19,7 +19,10 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   alias InfluxElixir.Client.Local.{
     Format,
     SQLCast,
+    SQLError,
     SQLEval,
+    SQLExpr,
+    SQLFold,
     SQLNumber,
     SQLParser,
     SQLPlan,
@@ -33,6 +36,151 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   @doc "Whether a point satisfies a parsed `WHERE` conjunction (also used by `DELETE`)."
   @spec matches_all?(point(), [SQLParser.where_node()]) :: boolean()
   def matches_all?(point, conjunction), do: eval_all(point, conjunction) == true
+
+  @doc """
+  The points that satisfy a parsed `WHERE` conjunction.
+
+  The engine runs the right operand of an `AND` or an `OR` over a batch of
+  rows: over all of them, or only over the ones the left operand selects,
+  depending on how many that is, which the engine's batching decides. An
+  operand that fails for a row the left one leaves out (`j <> 0 AND 100 / j >
+  1`) therefore fails the query or not by something the double does not
+  model, and such a query is refused when a row it would skip fails. Every
+  other query is answered row by row.
+  """
+  @spec filter([point()], [SQLParser.where_node()]) :: [point()]
+  def filter(points, []), do: points
+
+  def filter(points, conjunction) do
+    if guarded?(conjunction),
+      do: Enum.filter(points, &(strict_all(&1, conjunction) == true)),
+      else: Enum.filter(points, &matches_all?(&1, conjunction))
+  end
+
+  # Whether an operand that can fail stands where the engine may skip it: not
+  # first in a conjunction or an `OR`.
+  @spec guarded?([SQLParser.where_node()]) :: boolean()
+  defp guarded?(conjunction),
+    do: skippable?(conjunction) or Enum.any?(conjunction, &guarded_node?/1)
+
+  @spec guarded_node?(SQLParser.where_node()) :: boolean()
+  defp guarded_node?({:or, branches}),
+    do: skippable?(branches) or Enum.any?(branches, &guarded?/1)
+
+  defp guarded_node?({:not, conjunction}), do: guarded?(conjunction)
+  defp guarded_node?(_clause), do: false
+
+  @spec skippable?([term()]) :: boolean()
+  defp skippable?([_first | rest]), do: Enum.any?(rest, &fallible?/1)
+  defp skippable?([]), do: false
+
+  @spec fallible?(term()) :: boolean()
+  defp fallible?(nodes) when is_list(nodes), do: Enum.any?(nodes, &fallible?/1)
+  defp fallible?({:expr, expr}), do: SQLExpr.any?(expr, &can_fail?/1)
+  defp fallible?(tuple) when is_tuple(tuple), do: tuple |> Tuple.to_list() |> fallible?()
+  defp fallible?(_other), do: false
+
+  @spec can_fail?(SQLExpr.t()) :: boolean()
+  defp can_fail?({:op, op, _left, _right}), do: op in [:/, :rem]
+  defp can_fail?({:call, _function, _args}), do: true
+  defp can_fail?({:neg, _inner}), do: true
+  defp can_fail?(_other), do: false
+
+  # `eval_all/2` and `eval_node/2` that run the parts after the one that
+  # decides as well, and refuse when one fails.
+  @spec strict_all(point(), [SQLParser.where_node()]) :: boolean() | nil
+  defp strict_all(point, conjunction), do: strict(point, conjunction, true, false)
+
+  @spec strict_node(point(), SQLParser.where_node()) :: boolean() | nil
+  defp strict_node(point, {:or, branches}), do: strict(point, branches, false, true)
+
+  defp strict_node(point, {:not, conjunction}) do
+    case strict_all(point, conjunction) do
+      nil -> nil
+      value -> not value
+    end
+  end
+
+  defp strict_node(point, clause), do: matches_condition?(point, clause)
+
+  # An `AND` starts true and is decided by a false part, an `OR` starts false
+  # and is decided by a true one; a branch of an `OR` is a conjunction.
+  @spec strict(point(), [term()], boolean(), boolean()) :: boolean() | nil
+  defp strict(point, parts, start, decisive) do
+    {result, _decided} =
+      Enum.reduce(parts, {start, false}, fn part, {acc, decided?} ->
+        if decided? do
+          skipped(point, part, decisive)
+          {acc, true}
+        else
+          case strict_part(point, part, decisive) do
+            ^decisive -> {decisive, true}
+            nil -> {nil, false}
+            _undecided -> {acc, false}
+          end
+        end
+      end)
+
+    result
+  end
+
+  @spec strict_part(point(), term(), boolean()) :: boolean() | nil
+  defp strict_part(point, part, true) when is_list(part), do: strict_all(point, part)
+  defp strict_part(point, part, _decisive), do: strict_node(point, part)
+
+  # A part the evaluation skips for this row. A predicate that fails for no
+  # reason a row gives (a constant that cannot be computed) fails exactly when
+  # some row reaches it, as the row-by-row evaluation finds. Any other
+  # failure, one a row gives or one in a part that holds an `AND` or an `OR`
+  # of its own, is met or not by how the engine batches the rows, and so is
+  # a conjunct that reads no column, which the engine may run whether or
+  # not a row reaches it.
+  @spec skipped(point(), term(), boolean()) :: :ok
+  defp skipped(point, part, decisive) do
+    if is_list(part), do: strict_all(point, part), else: strict_node(point, part)
+    :ok
+  catch
+    {:query_error, _error} ->
+      if predicate?(unwrap(part)) and constant_failure?(part) and
+           (decisive or not column_free?(unwrap(part))),
+         do: :ok,
+         else: throw({:query_error, batch_refusal()})
+  end
+
+  @spec batch_refusal() :: SQLError.t()
+  defp batch_refusal do
+    SQLError.refusal(
+      "a WHERE whose AND or OR runs an operand that fails over a row the other operand " <>
+        "leaves out: the engine runs it over a batch of rows, and whether the row is " <>
+        "met depends on how it batches them"
+    )
+  end
+
+  @spec constant_failure?(term()) :: boolean()
+  defp constant_failure?(part),
+    do: part |> part_exprs() |> Enum.any?(&SQLFold.failing_constant?/1)
+
+  # A branch of an `OR` that is one predicate is that predicate.
+  @spec unwrap(term()) :: term()
+  defp unwrap([single]), do: single
+  defp unwrap(part), do: part
+
+  @spec predicate?(term()) :: boolean()
+  defp predicate?({op, _left, _right}), do: op not in [:or, :not]
+  defp predicate?(_part), do: false
+
+  # A predicate that names no column (`1 / 0 > 1`).
+  @spec column_free?(term()) :: boolean()
+  defp column_free?({_op, left, _right} = clause) when not is_binary(left),
+    do: clause |> part_exprs() |> Enum.all?(&(SQLExpr.columns(&1) == []))
+
+  defp column_free?(_part), do: false
+
+  @spec part_exprs(term()) :: [SQLExpr.t()]
+  defp part_exprs({:expr, expr}), do: [expr]
+  defp part_exprs(list) when is_list(list), do: Enum.flat_map(list, &part_exprs/1)
+  defp part_exprs(tuple) when is_tuple(tuple), do: tuple |> Tuple.to_list() |> part_exprs()
+  defp part_exprs(_other), do: []
 
   # SQL's three-valued logic: a comparison with a null operand is unknown
   # (nil), AND is false if any part is false, OR is true if any part is
@@ -86,7 +234,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   # (`v BETWEEN NULL AND 5` keeps no row; `v NOT BETWEEN NULL AND 5` keeps
   # the rows above 5).
   defp matches_condition?(point, {:between, left, {low, high}}) do
-    case left_value(point, left, literals([low, high])) do
+    case left_value(point, left, [low, high]) do
       nil -> nil
       actual -> both(compare3(point, actual, :gte, low), compare3(point, actual, :lte, high))
     end
@@ -98,7 +246,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   # A null in the list (or a null parameter) makes a miss unknown, not
   # false: `v NOT IN (1, NULL)` keeps nothing.
   defp matches_condition?(point, {:in, key, values}) do
-    case left_value(point, key, literals(values)) do
+    case left_value(point, key, values) do
       nil -> nil
       actual -> in_list(actual, Enum.map(values, &right_value(point, &1)))
     end
@@ -112,13 +260,30 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   defp matches_condition?(point, {:is_not_null, key, _nil}),
     do: not is_nil(left_value(point, key))
 
-  defp matches_condition?(point, {op, left, right}) do
-    case {left_value(point, left, literals([right])), right_value(point, right)} do
-      {nil, _right} -> nil
-      {_left, nil} -> nil
-      {l, r} -> compare(l, op, r)
-    end
+  defp matches_condition?(point, {op, {:expr, expr}, right}) do
+    compare_values(
+      SQLEval.eval_compared(expr, point, literals([right])),
+      op,
+      right_value(point, right),
+      right
+    )
   end
+
+  defp matches_condition?(point, {op, column, right}),
+    do: compare_values(SQLRow.column_value(point, column), op, right_value(point, right), right)
+
+  # A comparison is unknown for a null operand; the float of one that is not a
+  # literal is checked against a decimal as it is read.
+  @spec compare_values(term(), atom(), term(), term()) :: boolean() | nil
+  defp compare_values(nil, _op, _right, _operand), do: nil
+  defp compare_values(_left, _op, nil, _operand), do: nil
+
+  defp compare_values(left, op, right, {:expr, _expr}) do
+    wide_decimal_float(left, right)
+    compare(left, op, right)
+  end
+
+  defp compare_values(left, op, right, _literal), do: compare(left, op, right)
 
   @spec negate(boolean() | nil) :: boolean() | nil
   defp negate(nil), do: nil
@@ -199,14 +364,16 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   end
 
   # The left operand is a column name or an arithmetic expression; the right
-  # one is a literal unless the parser tagged it as an expression.
-  @spec left_value(point(), SQLParser.operand(), [integer()]) :: term()
-  defp left_value(point, operand, literals \\ [])
+  # one is a literal unless the parser tagged it as an expression. `compared`
+  # is what the operand is compared with: an expression reads a cast of
+  # itself against integers (see `SQLEval.eval_compared/3`).
+  @spec left_value(point(), SQLParser.operand(), [term()]) :: term()
+  defp left_value(point, operand, compared \\ [])
 
-  defp left_value(point, {:expr, expr}, literals),
-    do: SQLEval.eval_compared(expr, point, literals)
+  defp left_value(point, {:expr, expr}, compared),
+    do: SQLEval.eval_compared(expr, point, literals(compared))
 
-  defp left_value(point, key, _literals), do: SQLRow.column_value(point, key)
+  defp left_value(point, key, _compared), do: SQLRow.column_value(point, key)
 
   # The integers an operand is compared with, when all of what it is compared
   # with are integers (the engine then reads a cast of the operand against
@@ -286,6 +453,14 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   defp compare(nil, _op, _value), do: false
   defp compare(_actual, _op, nil), do: false
 
+  defp compare(actual, op, value) when is_integer(actual) and is_integer(value),
+    do: term_compare(actual, op, value)
+
+  # Zero is left to `SQLNumber`, which orders -0.0 before 0.0.
+  defp compare(actual, op, value)
+       when is_float(actual) and is_float(value) and actual != 0.0 and value != 0.0,
+       do: term_compare(actual, op, value)
+
   defp compare(actual, op, value) do
     cond do
       is_binary(value) and not is_binary(actual) -> compare(text(actual), op, value)
@@ -309,6 +484,29 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
       :lte -> order != :gt
     end
   end
+
+  # The engine casts the float to the decimal's type, which holds a value to
+  # about 1e20 at the most, and fails the query for a row with a larger
+  # one; how large depends on the decimal's precision.
+  @spec wide_decimal_float(term(), term()) :: :ok
+  defp wide_decimal_float({:dec, _coefficient, _scale}, float), do: wide_float(float)
+  defp wide_decimal_float(float, {:dec, _coefficient, _scale}), do: wide_float(float)
+  defp wide_decimal_float(_actual, _value), do: :ok
+
+  @spec wide_float(term()) :: :ok
+  defp wide_float(value)
+       when value in [:inf, :neg_inf] or (is_float(value) and abs(value) > 1.0e20) do
+    throw(
+      {:query_error,
+       SQLError.refusal(
+         "a decimal expression compared with a float past 1e20 in a column: the engine fails " <>
+           "its cast of the float to the decimal's type, past a size that depends on the " <>
+           "decimal's precision, which is not modelled"
+       )}
+    )
+  end
+
+  defp wide_float(_value), do: :ok
 
   @spec term_compare(term(), atom(), term()) :: boolean()
   defp term_compare(actual, :eq, value), do: actual == value

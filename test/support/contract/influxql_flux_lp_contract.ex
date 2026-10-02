@@ -16,66 +16,104 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   The `setup` callback must return `conn`, `database` and `query_delay`, as
   for the shared contract. A real server is shared between runs, so every
   measurement name is unique and every line is given a timestamp.
+
+  ## Parts
+
+  A module that generates the whole contract is slow to compile, so `part: part`
+  generates one slice of the `:v3_core` tests, for a module of its own that
+  compiles and runs in parallel with its siblings: `:line_protocol`,
+  `:influxql_basics`, `:influxql_typed` or `:influxql_time`. Without `:part`
+  everything is generated, as it always is for `:v2`.
   """
+
+  @parts [:line_protocol, :influxql_basics, :influxql_typed, :influxql_time]
 
   @doc false
   defmacro __using__(opts) do
     client = Keyword.fetch!(opts, :client)
     profile = Keyword.fetch!(opts, :profile)
+    part = Keyword.get(opts, :part, :all)
+
+    unless part == :all or part in @parts do
+      raise ArgumentError,
+            "unknown :part #{inspect(part)}, expected :all or one of #{inspect(@parts)}"
+    end
 
     blocks =
-      case profile do
-        :v3_core ->
-          [
-            helpers(client),
-            v3_line_protocol_tests(client),
-            v3_line_protocol_name_tests(client),
-            v3_influxql_tests(client),
-            v3_influxql_group_tests(client),
-            v3_influxql_parse_tests(client),
-            v3_influxql_reserved_helpers(client),
-            v3_influxql_reserved_where_tests(client),
-            v3_influxql_reserved_select_tests(client),
-            v3_influxql_clause_tests(client),
-            v3_influxql_typed_tests(client),
-            v3_influxql_typed_edge_tests(client)
-          ]
-
-        :v2 ->
-          [
-            helpers(client),
-            v2_line_protocol_helpers(client),
-            v2_line_protocol_tests(client),
-            v2_retention_tests(client),
-            v2_flux_helpers(client),
-            v2_flux_range_tests(client),
-            v2_flux_data_tests(client),
-            v2_flux_name_tests(client),
-            v2_flux_type_tests(client),
-            v2_bucket_tests(client)
-          ]
-
-        _other ->
-          []
-      end
+      for {block_part, block} <- profile_blocks(client, profile),
+          part == :all or block_part in [:always, part],
+          do: block
 
     quote location: :keep do
       (unquote_splicing(blocks))
     end
   end
 
+  # The blocks of a profile, in order, each with the part it belongs to. `:always`
+  # blocks hold helpers and are generated in every part: they are public functions,
+  # so a part that does not call one of them does not warn about it.
+  @spec profile_blocks(Macro.t(), atom()) :: [{atom(), Macro.t()}]
+  defp profile_blocks(client, :v3_core) do
+    [
+      {:always, helpers(client)},
+      {:always, v3_influxql_helpers(client)},
+      {:always, v3_influxql_reserved_helpers(client)},
+      {:always, v3_influxql_planner_helpers(client)},
+      {:line_protocol, v3_line_protocol_tests(client)},
+      {:line_protocol, v3_line_protocol_name_tests(client)},
+      {:influxql_basics, v3_influxql_tests(client)},
+      {:influxql_basics, v3_influxql_group_tests(client)},
+      {:influxql_basics, v3_influxql_parse_tests(client)},
+      {:influxql_basics, v3_influxql_reserved_where_tests(client)},
+      {:influxql_basics, v3_influxql_reserved_select_tests(client)},
+      {:influxql_basics, v3_influxql_clause_tests(client)},
+      {:influxql_typed, v3_influxql_typed_tests(client)},
+      {:influxql_typed, v3_influxql_typed_edge_tests(client)},
+      {:influxql_typed, v3_influxql_unsigned_tests(client)},
+      {:influxql_typed, v3_influxql_names_tests(client)},
+      {:influxql_typed, v3_influxql_not_tests(client)},
+      {:influxql_time, v3_influxql_quoted_time_tests(client)},
+      {:influxql_time, v3_influxql_bare_time_tests(client)},
+      {:influxql_time, v3_influxql_group_time_tests(client)},
+      {:influxql_time, v3_influxql_constant_tests(client)},
+      {:influxql_time, v3_influxql_operator_tests(client)},
+      {:influxql_time, v3_influxql_paren_tests(client)},
+      {:influxql_time, v3_influxql_show_tests(client)},
+      {:influxql_time, v3_influxql_tag_tests(client)},
+      {:influxql_time, v3_influxql_literal_syntax_tests(client)}
+    ]
+  end
+
+  # The InfluxDB 2 tests are few and form one part: `:all`, the default.
+  defp profile_blocks(client, :v2) do
+    [
+      {:v2, helpers(client)},
+      {:v2, v2_line_protocol_helpers(client)},
+      {:v2, v2_line_protocol_tests(client)},
+      {:v2, v2_retention_tests(client)},
+      {:v2, v2_flux_helpers(client)},
+      {:v2, v2_flux_range_tests(client)},
+      {:v2, v2_flux_data_tests(client)},
+      {:v2, v2_flux_name_tests(client)},
+      {:v2, v2_flux_type_tests(client)},
+      {:v2, v2_bucket_tests(client)}
+    ]
+  end
+
+  defp profile_blocks(_client, _other), do: []
+
   defp helpers(client) do
     quote location: :keep do
-      defp ifl_name(prefix), do: InfluxElixir.IntegrationHelper.unique_name(prefix)
+      def ifl_name(prefix), do: InfluxElixir.IntegrationHelper.unique_name(prefix)
 
-      defp ifl_write(ctx, lines) do
+      def ifl_write(ctx, lines) do
         assert {:ok, :written} =
                  unquote(client).write(ctx.conn, Enum.join(lines, "\n"), database: ctx.database)
 
         InfluxElixir.ClientContract.settle(ctx)
       end
 
-      defp ifl_us(microseconds), do: DateTime.from_unix!(microseconds, :microsecond)
+      def ifl_us(microseconds), do: DateTime.from_unix!(microseconds, :microsecond)
     end
   end
 
@@ -108,7 +146,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         {"~m v=1\t5", "Could not parse entire line. Found trailing content: `\t5`"}
       ]
 
-      defp ifl_partial_errors(body) do
+      def ifl_partial_errors(body) do
         assert %{"error" => "partial write of line protocol occurred", "data" => data} =
                  Jason.decode!(body)
 
@@ -285,17 +323,21 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   # InfluxQL
   # ---------------------------------------------------------------------------
 
-  defp v3_influxql_tests(client) do
+  defp v3_influxql_helpers(client) do
     quote location: :keep do
-      defp ifl_iq(ctx, statement) do
+      def ifl_iq(ctx, statement) do
         unquote(client).query_influxql(ctx.conn, statement, database: ctx.database)
       end
 
-      defp ifl_iq_values(ctx, statement, column \\ "v") do
+      def ifl_iq_values(ctx, statement, column \\ "v") do
         assert {:ok, rows} = ifl_iq(ctx, statement)
         Enum.map(rows, & &1[column])
       end
+    end
+  end
 
+  defp v3_influxql_tests(_client) do
+    quote location: :keep do
       @ifl_time_not_equal "rewriting statement\ncaused by\nsplit condition\ncaused by\n" <>
                             "Error during planning: invalid time comparison operator: !="
 
@@ -590,7 +632,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
   defp v3_influxql_reserved_helpers(_client) do
     quote location: :keep do
-      defp ifl_rw_setup(ctx) do
+      def ifl_rw_setup(ctx) do
         m = ifl_name("ifl_rw")
 
         ifl_write(ctx, [
@@ -606,14 +648,14 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       @ifl_words ~w(tag key name values measurement field series all default limit in inf
                       group from select as by on to user write)
 
-      defp ifl_nom(statement, pos) do
+      def ifl_nom(statement, pos) do
         leftover = binary_part(statement, pos, byte_size(statement) - pos)
 
         @ifl_parse <>
           "invalid InfluxQL statement at pos #{pos}. Parsing Error: Nom(#{inspect(leftover)}, Tag)"
       end
 
-      defp ifl_failure(statement, word_at) do
+      def ifl_failure(statement, word_at) do
         leftover = binary_part(statement, word_at, byte_size(statement) - word_at)
 
         @ifl_parse <>
@@ -621,13 +663,13 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       end
 
       # the position just after the first `text` at or after `from`
-      defp ifl_after(statement, text, from \\ 0) do
+      def ifl_after(statement, text, from \\ 0) do
         rest = binary_part(statement, from, byte_size(statement) - from)
         {at, size} = :binary.match(rest, text)
         from + at + size
       end
 
-      defp ifl_err(ctx, statement, body) do
+      def ifl_err(ctx, statement, body) do
         assert {:error, %{status: 400, body: ^body}} = ifl_iq(ctx, statement), statement
       end
     end
@@ -1165,6 +1207,1009 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   end
 
   # ---------------------------------------------------------------------------
+  # InfluxQL as the planner reads it: arithmetic, names, times, constants
+  # ---------------------------------------------------------------------------
+
+  defp v3_influxql_planner_helpers(_client) do
+    quote location: :keep do
+      @ifl_split "rewriting statement\ncaused by\nsplit condition\ncaused by\n"
+      @ifl_gather "rewriting statement\ncaused by\ngather information about select statement\n" <>
+                    "caused by\nError during planning: "
+
+      def ifl_ids(ctx, statement), do: ifl_iq_values(ctx, statement, "i")
+
+      # the rows of an answer without the measurement every row carries
+      def ifl_rows(ctx, statement) do
+        assert {:ok, rows} = ifl_iq(ctx, statement), statement
+        Enum.map(rows, &Map.delete(&1, "iox::measurement"))
+      end
+
+      def ifl_after_downcased(statement, text, from),
+        do: ifl_after(String.downcase(statement), text, from)
+
+      def ifl_plan_err(ctx, statement, status, body) do
+        assert {:error, %{status: ^status, body: ^body}} = ifl_iq(ctx, statement), statement
+      end
+    end
+  end
+
+  defp v3_influxql_unsigned_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL unsigned arithmetic — contract" do
+        setup ctx do
+          m = ifl_name("ifl_un")
+
+          ifl_write(ctx, [
+            "#{m} i=1i,j=5i,u=3u 1000",
+            "#{m} i=2i,j=-5i,u=18446744073709551615u 2000",
+            "#{m} i=3i,u=0u 3000",
+            "#{m} i=4i,j=-9223372036854775808i,u=9223372036854775808u 4000",
+            "#{m},t=x i=5i,j=-1i,u=18446744073709551614u 5000"
+          ])
+
+          {:ok, m: m}
+        end
+
+        # An unsigned field makes the arithmetic around it unsigned: both
+        # sides are cast, a negative one as 2^64 + n - 1, and `+ - *` wrap.
+        # `-x` is `x * -1`, not a negation.
+        test "an unsigned field in arithmetic wraps; a negative constant next to it is 2^64 + n - 1",
+             %{m: m} = ctx do
+          for {where, expected} <- [
+                {"u * -1 < 0", []},
+                {"-u < 0", []},
+                {"u * -1 > 0", [1, 2, 5]},
+                {"u * -1 = 2", [2]},
+                {"u * -1 = 0", [3, 4]},
+                {"-(u) > 0", [1, 2, 5]},
+                {"u * 2 > 4", [1, 2, 5]},
+                {"u + 1 = 0", [2]},
+                {"u + 1 > 1", [1, 4, 5]},
+                {"u - 1 > 0", [1, 2, 3, 4, 5]},
+                {"0 - u < 1", [3]},
+                {"u - -1 = 4", []},
+                {"u + -1 = 1", [1]},
+                {"u * u = 9", [1]},
+                {"(u + 1) * 2 = 8", [1]},
+                {"u / 2 > 1", [2, 4, 5]},
+                {"u / 0 > 1", []},
+                {"u + 1.5 > 4", [1, 2, 4, 5]}
+              ] do
+            assert ifl_ids(ctx, "SELECT i FROM #{m} WHERE #{where}") === expected, where
+          end
+        end
+
+        test "an integer field and an unsigned field compare as unsigned", %{m: m} = ctx do
+          for {where, expected} <- [
+                {"j > u", [1]},
+                {"j < u", [2]},
+                {"j = u", [5]},
+                {"j >= u", [1, 5]},
+                {"u > j", [2]},
+                {"u = j", [5]},
+                {"u + j > 0", [1, 2, 5]},
+                {"j * 9223372036854775807 > 0", [1]}
+              ] do
+            assert ifl_ids(ctx, "SELECT i FROM #{m} WHERE #{where}") === expected, where
+          end
+
+          assert ifl_ids(ctx, "SELECT i FROM #{m} WHERE j > u AND i > 0") === [1]
+          assert ifl_ids(ctx, "SELECT i FROM #{m} WHERE (u * -1 = 2) AND t = 'x'") === []
+        end
+
+        test "SUM wraps at the range of its field's type", %{m: m} = ctx do
+          assert {:ok, [%{"sum" => 9_223_372_036_854_775_808, "time" => time}]} =
+                   ifl_iq(ctx, "SELECT sum(u) FROM #{m}")
+
+          assert time === ifl_us(0)
+        end
+
+        test "SUM, MEAN and overflow", ctx do
+          m = ifl_name("ifl_un")
+
+          ifl_write(ctx, [
+            "#{m} i=9223372036854775807i,u=18446744073709551615u,f=1.5 1000",
+            "#{m} i=9223372036854775807i,u=18446744073709551615u,f=2.5 2000",
+            "#{m} i=5i,u=2u,f=1e308 3000",
+            "#{m} f=1e308 4000"
+          ])
+
+          assert ifl_rows(ctx, "SELECT sum(i), sum(u), sum(f), mean(f) FROM #{m}") === [
+                   %{"time" => ifl_us(0), "sum" => 3, "sum_1" => 0, "sum_2" => nil, "mean" => nil}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT mean(i), mean(u) FROM #{m}") === [
+                   %{
+                     "time" => ifl_us(0),
+                     "mean" => 6_148_914_691_236_517_000.0,
+                     "mean_1" => 12_297_829_382_473_034_000.0
+                   }
+                 ]
+
+          assert ifl_rows(ctx, "SELECT sum(i), sum(u), sum(f) FROM #{m} WHERE time < 3000") === [
+                   %{
+                     "time" => ifl_us(0),
+                     "sum" => -2,
+                     "sum_1" => 18_446_744_073_709_551_614,
+                     "sum_2" => 4.0
+                   }
+                 ]
+
+          assert ifl_rows(ctx, "SELECT sum(f), mean(f) FROM #{m} WHERE time <= 3000") === [
+                   %{
+                     "time" => ifl_us(0),
+                     "sum" => 1.0e308,
+                     "mean" => String.to_float("3.333333333333333e307")
+                   }
+                 ]
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_names_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL names and the time column — contract" do
+        setup ctx do
+          m = ifl_name("ifl_nm")
+          ifl_write(ctx, ["#{m},k=a i=1i,j=5i 1000", "#{m},k=b i=2i,j=-5i 2000"])
+          {:ok, m: m}
+        end
+
+        test "a name taken twice is numbered, skipping the names taken", %{m: m} = ctx do
+          [one, two] = [ifl_us(1), ifl_us(2)]
+
+          assert ifl_rows(ctx, "SELECT i, i, i FROM #{m}") === [
+                   %{"time" => one, "i" => 1, "i_1" => 1, "i_2" => 1},
+                   %{"time" => two, "i" => 2, "i_1" => 2, "i_2" => 2}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT i AS j, j FROM #{m}") === [
+                   %{"time" => one, "j" => 1, "j_1" => 5},
+                   %{"time" => two, "j" => 2, "j_1" => -5}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT i AS k, k FROM #{m}") === [
+                   %{"time" => one, "k" => 1, "k_1" => "a"},
+                   %{"time" => two, "k" => 2, "k_1" => "b"}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT i AS i_1, i, i FROM #{m} LIMIT 1") === [
+                   %{"time" => one, "i_1" => 1, "i" => 1, "i_2" => 1}
+                 ]
+        end
+
+        test "an item named time is time_1 beside the time column that leads the answer",
+             %{m: m} = ctx do
+          [one, two] = [ifl_us(1), ifl_us(2)]
+
+          assert ifl_rows(ctx, "SELECT i AS time FROM #{m}") === [
+                   %{"time" => one, "time_1" => 1},
+                   %{"time" => two, "time_1" => 2}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT mean(i) AS time FROM #{m}") === [
+                   %{"time" => ifl_us(0), "time_1" => 1.5}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT count(i) AS time FROM #{m}") === [
+                   %{"time" => ifl_us(0), "time_1" => 2}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT max(i) AS time FROM #{m}") === [
+                   %{"time" => two, "time_1" => 2}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT i AS TIME FROM #{m} LIMIT 1") === [
+                   %{"time" => one, "TIME" => 1}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT count(*) AS time FROM #{m}") === [
+                   %{"time" => ifl_us(0), "time_i" => 2, "time_j" => 2}
+                 ]
+        end
+
+        test "a selected time column is the leading one, and its alias names it", %{m: m} = ctx do
+          [one, two] = [ifl_us(1), ifl_us(2)]
+
+          for select <- ["time, i", "i, time", "TIME, i", "time AS time, i", "\"time\", i"] do
+            assert ifl_rows(ctx, "SELECT #{select} FROM #{m}") === [
+                     %{"time" => one, "i" => 1},
+                     %{"time" => two, "i" => 2}
+                   ],
+                   select
+          end
+
+          for select <- ["time AS x, i", "i, time AS x"] do
+            assert ifl_rows(ctx, "SELECT #{select} FROM #{m}") === [
+                     %{"x" => one, "i" => 1},
+                     %{"x" => two, "i" => 2}
+                   ],
+                   select
+          end
+
+          assert ifl_rows(ctx, "SELECT i AS time, time FROM #{m}") === [
+                   %{"time_1" => one, "time" => 1},
+                   %{"time_1" => two, "time" => 2}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT time, i AS time FROM #{m}") === [
+                   %{"time" => one, "time_1" => 1},
+                   %{"time" => two, "time_1" => 2}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT time, i, time FROM #{m}") === [
+                   %{"time" => one, "i" => 1, "time_1" => one},
+                   %{"time" => two, "i" => 2, "time_1" => two}
+                 ]
+        end
+
+        test "time is no field: a list of nothing else is an empty answer", %{m: m} = ctx do
+          for select <- ["time", "time, time", "\"time\"", "TIME AS x"] do
+            assert ifl_rows(ctx, "SELECT #{select} FROM #{m}") === [], select
+          end
+
+          assert ifl_ids(ctx, "SELECT i FROM #{m} WHERE TIME > 1000") === [2]
+          assert ifl_ids(ctx, "SELECT i FROM #{m} WHERE \"time\" > 1000") === [2]
+          assert ifl_ids(ctx, "SELECT i FROM #{m} WHERE Time >= 2000") === [2]
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_not_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL NOT is a name — contract" do
+        setup ctx do
+          field = ifl_name("ifl_nf")
+          tag = ifl_name("ifl_nt")
+          ifl_write(ctx, ["#{field} not=7i,i=1i 1000", "#{field} not=8i,i=2i 2000"])
+          ifl_write(ctx, ["#{tag},not=a i=1i 1000", "#{tag},not=b i=2i 2000"])
+          {:ok, field: field, tag: tag}
+        end
+
+        test "it is read as any other name", %{field: field, tag: tag} = ctx do
+          for {where, expected} <- [
+                {"not = 7", [1]},
+                {"not > 7", [2]},
+                {"7 = not", [1]},
+                {"\"not\" = 7", [1]},
+                {"NOT = 7", []},
+                {"NOT", []}
+              ] do
+            assert ifl_ids(ctx, "SELECT i FROM #{field} WHERE #{where}") === expected, where
+          end
+
+          assert ifl_ids(ctx, "SELECT i FROM #{tag} WHERE not = 'a'") === [1]
+          assert ifl_ids(ctx, "SELECT i FROM #{tag} WHERE i > 0 AND not = 'b'") === [2]
+          assert ifl_ids(ctx, "SELECT i FROM #{tag} WHERE NOT") === []
+
+          assert ifl_rows(ctx, "SELECT not FROM #{field}") === [
+                   %{"time" => ifl_us(1), "not" => 7},
+                   %{"time" => ifl_us(2), "not" => 8}
+                 ]
+
+          assert ifl_rows(ctx, "SELECT i FROM #{tag} GROUP BY not") === [
+                   %{"time" => ifl_us(1), "not" => "a", "i" => 1},
+                   %{"time" => ifl_us(2), "not" => "b", "i" => 2}
+                 ]
+        end
+
+        test "alone it is a bare field, as any other", %{field: field, tag: tag} = ctx do
+          for {measurement, type} <- [{field, "Int64"}, {tag, "Dictionary(Int32, Utf8)"}],
+              where <- ["not", "(not)"] do
+            ifl_plan_err(
+              ctx,
+              "SELECT i FROM #{measurement} WHERE #{where}",
+              400,
+              "type_coercion\ncaused by\nError during planning: Cannot infer common " <>
+                "argument type for logical boolean operation Boolean AND #{type}"
+            )
+          end
+        end
+
+        test "another operand right after it is left over", %{field: field} = ctx do
+          for {where, left} <- [{"not k", "k"}, {"not 1", "1"}, {"not not", "not"}] do
+            statement = "SELECT i FROM #{field} WHERE #{where}"
+            ifl_err(ctx, statement, ifl_nom(statement, byte_size(statement) - byte_size(left)))
+          end
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_quoted_time_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL quoted times — contract" do
+        setup ctx do
+          m = ifl_name("ifl_qt")
+          ifl_write(ctx, ["#{m} i=1i 1000", "#{m} i=2i 2000"])
+          {:ok, m: m, sel: "SELECT i FROM #{m}"}
+        end
+
+        test "a time the planner cannot read is not a valid timestamp", %{sel: sel} = ctx do
+          for content <- [
+                "a",
+                "abc",
+                "",
+                " ",
+                "now",
+                "now()",
+                "1970",
+                "1970-01",
+                "1970-01-01T00:00:00",
+                "1970-01-01T00:00:00.000002",
+                "1970-01-01T00:00",
+                "1970-01-01 00:00",
+                "1970-01-01T25:00:00Z",
+                "1970-01-01T24:00:00Z",
+                "1970-01-01T00:60:00Z",
+                "2020-13-45",
+                "2020-02-30",
+                "1970-02-29",
+                "1970-00-01",
+                "1970-01-00",
+                "1000000000",
+                "10000-01-01",
+                "1970-01-01T00:00:00Z "
+              ] do
+            body =
+              @ifl_split <>
+                "Error during planning: invalid expression \"'#{content}'\": " <>
+                "'#{content}' is not a valid timestamp"
+
+            for where <- [
+                  "time = '#{content}'",
+                  "time > '#{content}'",
+                  "'#{content}' < time",
+                  "\"time\" = '#{content}'",
+                  "time = '#{content}' AND i > 1",
+                  "i > 1 AND time = '#{content}'",
+                  "time = '#{content}' OR i > 1"
+                ] do
+              ifl_plan_err(ctx, "#{sel} WHERE #{where}", 400, body)
+            end
+          end
+        end
+
+        test "a time in a form it reads that does not fit 64-bit nanoseconds is out of range",
+             %{sel: sel} = ctx do
+          for {content, shown} <- [
+                {"2262-04-12", "2262-04-12 00:00:00 +00:00"},
+                {"1677-09-20", "1677-09-20 00:00:00 +00:00"},
+                {"0000-01-01", "0000-01-01 00:00:00 +00:00"},
+                {"9999-12-31", "9999-12-31 00:00:00 +00:00"},
+                {"2262-04-11T23:47:16.854775808Z", "2262-04-11 23:47:16.854775808 +00:00"},
+                {"1677-09-21T00:12:43.145224191Z", "1677-09-21 00:12:43.145224191 +00:00"}
+              ] do
+            ifl_plan_err(
+              ctx,
+              "#{sel} WHERE time >= '#{content}'",
+              400,
+              @ifl_split <> "Error during planning: timestamp out of range: " <> shown
+            )
+          end
+        end
+
+        test "the forms it reads are answered", %{sel: sel} = ctx do
+          for {content, expected} <- [
+                {"1970-01-01", [1, 2]},
+                {"1970-01-01T00:00:00Z", [1, 2]},
+                {"1970-01-01t00:00:00z", [1, 2]},
+                {"1970-01-01 00:00:00", [1, 2]},
+                {"1970-01-01 00:00:00Z", [1, 2]},
+                {"1970-01-01T00:00:00+00:00", [1, 2]},
+                {"1970-01-01T00:00:00.000002Z", [2]},
+                {"1970-01-01 00:00:00.000002", [2]},
+                {"1970-01-01T00:00:00.123456789012Z", []},
+                {"1970-01-01T00:00:60Z", []},
+                {"1972-02-29", []},
+                {"2262-04-11T23:47:16.854775807Z", []},
+                {"1677-09-21T00:12:44Z", [1, 2]},
+                {"2262-04-12T00:00:00+01:00", []}
+              ] do
+            assert ifl_ids(ctx, "#{sel} WHERE time >= '#{content}'") === expected, content
+          end
+        end
+
+        test "the time is read before the select list is planned", %{m: m} = ctx do
+          ifl_plan_err(
+            ctx,
+            "SELECT mean(true) FROM #{m} WHERE time >= 'a'",
+            400,
+            @ifl_split <>
+              "Error during planning: invalid expression \"'a'\": 'a' is not a valid timestamp"
+          )
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_bare_time_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL time as a condition — contract" do
+        setup ctx do
+          m = ifl_name("ifl_bt")
+          ifl_write(ctx, ["#{m} i=1i 1000", "#{m} i=2i 2000"])
+          {:ok, sel: "SELECT i FROM #{m}"}
+        end
+
+        test "alone it breaks the planner's stack", %{sel: sel} = ctx do
+          for where <- ["time", "\"time\"", "TIME"] do
+            ifl_plan_err(
+              ctx,
+              "#{sel} WHERE #{where}",
+              500,
+              @ifl_split <>
+                "External error: InfluxQL internal error: expected an element on stack"
+            )
+          end
+
+          for where <- [
+                "time AND i > 1",
+                "i > 1 AND time",
+                "time OR i > 1",
+                "i > 1 OR time",
+                "time AND time",
+                "time > 0 AND time",
+                "time AND time > 0",
+                "(time AND i > 1)",
+                "i > 1 AND (time OR i < 3)",
+                "time < 1s AND (i > 1 OR time)",
+                "time > now() - 1d AND (time)",
+                "i > 1 AND time AND i < 4"
+              ] do
+            ifl_plan_err(
+              ctx,
+              "#{sel} WHERE #{where}",
+              500,
+              @ifl_split <> "External error: InfluxQL internal error: invalid expr stack"
+            )
+          end
+        end
+
+        test "in parentheses it is a timestamp where a boolean is wanted", %{sel: sel} = ctx do
+          for where <- ["(time)", "((time))"] do
+            ifl_plan_err(
+              ctx,
+              "#{sel} WHERE #{where}",
+              400,
+              "type_coercion\ncaused by\nError during planning: Cannot infer common " <>
+                "argument type for logical boolean operation Boolean AND Timestamp(ns)"
+            )
+          end
+
+          for {where, types} <- [
+                {"(time) AND i > 1", "Timestamp(ns) AND Boolean"},
+                {"i > 1 AND (time)", "Boolean AND Timestamp(ns)"},
+                {"(time) OR (i > 1)", "Timestamp(ns) OR Boolean"}
+              ] do
+            ifl_plan_err(
+              ctx,
+              "#{sel} WHERE #{where}",
+              400,
+              "Error during planning: Cannot infer common argument type for logical " <>
+                "boolean operation " <> types
+            )
+          end
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_group_time_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL GROUP BY time — contract" do
+        setup ctx do
+          m = ifl_name("ifl_gt")
+          ifl_write(ctx, ["#{m},k=a i=1i 1000", "#{m},k=b i=2i 2000"])
+          {:ok, m: m}
+        end
+
+        test "time without a call is an invalid TIME call, at the end of the word",
+             %{m: m} = ctx do
+          for tail <- [
+                "GROUP BY time",
+                "GROUP BY TIME",
+                "GROUP BY  time",
+                "GROUP BY time, k",
+                "GROUP BY time ,k",
+                "GROUP BY k, time",
+                "GROUP BY k,time,t",
+                "GROUP BY time ORDER BY time DESC",
+                "GROUP BY time LIMIT 1",
+                "WHERE i > 1 GROUP BY time"
+              ] do
+            statement = "SELECT i FROM #{m} #{tail}"
+            at = ifl_after_downcased(statement, "time", ifl_after(statement, "GROUP BY"))
+
+            ifl_err(
+              ctx,
+              statement,
+              @ifl_parse <> "invalid TIME call, expected 1 or 2 arguments at pos #{at}"
+            )
+          end
+
+          statement = "SELECT mean(i) FROM #{m} GROUP BY time"
+
+          ifl_err(
+            ctx,
+            statement,
+            @ifl_parse <>
+              "invalid TIME call, expected 1 or 2 arguments at pos #{byte_size(statement)}"
+          )
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_constant_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL constants in the select list — contract" do
+        setup ctx do
+          m = ifl_name("ifl_cl")
+          ifl_write(ctx, ["#{m} i=1i,j=5i 1000", "#{m} i=2i,j=-5i 2000"])
+          {:ok, m: m}
+        end
+
+        test "a constant item has no variable in it", %{m: m} = ctx do
+          for select <- [
+                "true",
+                "false",
+                "TRUE",
+                "1",
+                "1.5",
+                ".5",
+                "'a'",
+                "''",
+                "'a b'",
+                "-1",
+                "+1",
+                "-1.5",
+                "5s",
+                "1, 2",
+                "i, 1",
+                "i, 'a'",
+                "i, true",
+                "mean(i), true",
+                "true, i",
+                "true AS x",
+                "i, 1 AS x",
+                "i AS x, true",
+                "*, true",
+                "true, *",
+                "true, mean(true)"
+              ] do
+            for statement <- [
+                  "SELECT #{select} FROM #{m}",
+                  "SELECT #{select} FROM nothere_#{m}",
+                  "SELECT #{select} FROM #{m} WHERE i > 100",
+                  "SELECT #{select} FROM #{m} GROUP BY k LIMIT 1",
+                  "SELECT #{select} FROM #{m} LIMIT 9223372036854775808"
+                ] do
+              ifl_plan_err(
+                ctx,
+                statement,
+                400,
+                @ifl_gather <> "field must contain at least one variable"
+              )
+            end
+          end
+
+          assert ifl_rows(ctx, "SELECT \"true\" FROM #{m}") === []
+        end
+
+        test "a function of a constant expects a field, and names the constant", %{m: m} = ctx do
+          for {call, name, debug} <- [
+                {"mean(true)", "mean", "Boolean(true)"},
+                {"mean(FALSE)", "mean", "Boolean(false)"},
+                {"mean(1)", "mean", "Integer(1)"},
+                {"mean(-1)", "mean", "Integer(-1)"},
+                {"mean(1.5)", "mean", "Float(1.5)"},
+                {"mean('a')", "mean", "String(\"a\")"},
+                {"mean('a b')", "mean", "String(\"a b\")"},
+                {"mean('')", "mean", "String(\"\")"},
+                {"mean('a\"b')", "mean", "String(\"a\\\"b\")"},
+                {"mean(5s)", "mean", "Duration(Duration(5000000000))"},
+                {"sum(true)", "sum", "Boolean(true)"},
+                {"count(true)", "count", "Boolean(true)"},
+                {"count(1.5)", "count", "Float(1.5)"},
+                {"max(1)", "max", "Integer(1)"},
+                {"min(TRUE)", "min", "Boolean(true)"},
+                {"first(true)", "first", "Boolean(true)"},
+                {"last('x')", "last", "String(\"x\")"},
+                {"mean(1) AS x", "mean", "Integer(1)"},
+                {"mean(1), i", "mean", "Integer(1)"},
+                {"i, mean(true)", "mean", "Boolean(true)"},
+                {"mean(true), true", "mean", "Boolean(true)"}
+              ] do
+            for statement <- [
+                  "SELECT #{call} FROM #{m}",
+                  "SELECT #{call} FROM nothere_#{m}"
+                ] do
+              ifl_plan_err(
+                ctx,
+                statement,
+                400,
+                @ifl_gather <> "expected field argument in #{name}(), got Literal(#{debug})"
+              )
+            end
+          end
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_operator_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL a reserved word after an operator — contract" do
+        setup ctx do
+          m = ifl_name("ifl_ro")
+          ifl_write(ctx, ["#{m} i=1i,j=5i 1000"])
+          {:ok, m: m}
+        end
+
+        # after `+` or `-` the engine fails from the operand on, at position 0
+        test "after a binary + or - the parser fails from the operand", %{m: m} = ctx do
+          for {select, marker} <- [
+                {"i + as FROM #{m}", "as FROM"},
+                {"i - as FROM #{m}", "as FROM"},
+                {"i + AS FROM #{m}", "AS FROM"},
+                {"i +as FROM #{m}", "as FROM"},
+                {"i + from FROM #{m}", "from FROM"},
+                {"i + where FROM #{m}", "where FROM"},
+                {"i + select FROM #{m}", "select FROM"},
+                {"i + group FROM #{m}", "group FROM"},
+                {"i + FROM #{m}", "FROM #{m}"},
+                {"i, j + as FROM #{m}", "as FROM"},
+                {"i + (as) FROM #{m}", "(as) FROM"},
+                {"i + sum(as) FROM #{m}", "as) FROM"},
+                {"sum(i) + as FROM #{m}", "as FROM"},
+                {"i + -as FROM #{m}", "-as FROM"},
+                {"i + 1 + as FROM #{m}", "as FROM"},
+                {"i + as", "as"},
+                {"i + from", "from"}
+              ] do
+            statement = "SELECT " <> select
+            {at, _size} = :binary.match(statement, marker)
+            ifl_err(ctx, statement, ifl_failure(statement, at))
+          end
+        end
+
+        test "after another operator the statement is left unparsed", %{m: m} = ctx do
+          for operator <- ["*", "/", "%", "&"], word <- ["as", "from"] do
+            statement = "SELECT i #{operator} #{word} FROM #{m}"
+            ifl_err(ctx, statement, ifl_nom(statement, 0))
+          end
+        end
+
+        test "a sign before a reserved word first in the list is an expected field",
+             %{m: m} = ctx do
+          for word <- ["as", "from"] do
+            ifl_err(
+              ctx,
+              "SELECT -#{word} FROM #{m}",
+              @ifl_parse <> "invalid SELECT statement, expected field at pos 7"
+            )
+          end
+        end
+
+        test "in a statement after a ; the position is the statement's", %{m: m} = ctx do
+          first = "SELECT i FROM #{m}; "
+          second = "SELECT i + as FROM #{m}"
+          statement = first <> second
+          {at, _size} = :binary.match(statement, "as FROM")
+          leftover = binary_part(statement, at, byte_size(statement) - at)
+
+          ifl_err(
+            ctx,
+            statement,
+            @ifl_parse <>
+              "invalid InfluxQL statement at pos #{byte_size(first)}. " <>
+              "Parsing Failure: Nom(#{inspect(leftover)}, Char)"
+          )
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_paren_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL parentheses of a WHERE — contract" do
+        setup ctx do
+          m = ifl_name("ifl_pa")
+          ifl_write(ctx, ["#{m},k=a i=1i 1000", "#{m},k=b i=2i 2000"])
+          {:ok, m: m, prefix: "SELECT i FROM #{m} "}
+        end
+
+        test "a parenthesis left open, or with nothing in it, leaves the WHERE unparsed",
+             %{prefix: prefix} = ctx do
+          for where <- [
+                "(",
+                "()",
+                "(  )",
+                "(i",
+                "(i > 1",
+                "((i > 1)",
+                "((((i > 1",
+                "(i + 1 > 1",
+                "((i > 1) AND i < 3",
+                "(i > 1 LIMIT 1",
+                "(i > 1 GROUP BY k"
+              ] do
+            statement = prefix <> "WHERE " <> where
+            ifl_err(ctx, statement, ifl_nom(statement, byte_size(prefix)))
+          end
+        end
+
+        test "a parenthesis that closes nothing is left over from itself",
+             %{prefix: prefix} = ctx do
+          for {where, at} <- [
+                {"i > 1)", 5},
+                {"(i > 1))", 7},
+                {"i > 1 AND i < 3)", 15},
+                {"i + 1) > 1", 5},
+                {"i > 1 ) AND i < 3", 6},
+                {"(i > 1)) AND (", 7},
+                {"(i > 1) ) (", 8},
+                {"(i > 1) (", 8},
+                {"i)", 1}
+              ] do
+            statement = prefix <> "WHERE " <> where
+            ifl_err(ctx, statement, ifl_nom(statement, byte_size(prefix) + 6 + at))
+          end
+        end
+
+        test "after an operator or a connective the operand is missing",
+             %{prefix: prefix} = ctx do
+          for {where, at} <- [
+                {"i > (", 3},
+                {"i > (i", 3},
+                {"i > (1 + 2", 3},
+                {"i > 1 AND (", 9},
+                {"i > 1 AND (i > 1", 9},
+                {"(i > 1) AND (i > 1", 11},
+                {"(i > 1 OR (i < 3", 9}
+              ] do
+            expected =
+              @ifl_parse <>
+                "invalid conditional expression at pos #{byte_size(prefix) + 6 + at}"
+
+            ifl_err(ctx, prefix <> "WHERE " <> where, expected)
+          end
+        end
+
+        test "after a binary + the parser fails from the parenthesis", %{prefix: prefix} = ctx do
+          statement = prefix <> "WHERE i + (1 > 1"
+          {at, _size} = :binary.match(statement, "(1 > 1")
+          ifl_err(ctx, statement, ifl_failure(statement, at))
+        end
+
+        test "in a statement after a ; the position is the statement's", %{m: m} = ctx do
+          first = "SELECT i FROM #{m}; "
+          statement = first <> "SELECT i FROM #{m} WHERE ("
+          {at, _size} = :binary.match(statement, "WHERE (")
+          ifl_err(ctx, statement, ifl_nom(statement, at))
+        end
+
+        test "a GROUP BY dimension cannot start with a parenthesis", %{prefix: prefix} = ctx do
+          for tail <- ["GROUP BY (", "WHERE i > 1 GROUP BY ("] do
+            statement = prefix <> tail
+            {at, _size} = :binary.match(statement, "(")
+
+            ifl_err(
+              ctx,
+              statement,
+              @ifl_parse <>
+                "invalid GROUP BY clause, expected wildcard, TIME, identifier or regular " <>
+                "expression at pos #{at}"
+            )
+          end
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_show_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL SHOW TAG VALUES — contract" do
+        setup ctx do
+          m = ifl_name("ifl_sh")
+
+          ifl_write(ctx, [
+            "#{m},k=a,x=p i=1i 1000",
+            "#{m},k=b i=2i 2000",
+            "#{m},k=c,x=q i=3i 3000"
+          ])
+
+          {:ok, m: m}
+        end
+
+        # a row without `value` stands for the points that lack the key
+        test "lists the values of the keys it names, over the last day unless time is bounded",
+             %{m: m} = ctx do
+          assert ifl_rows(ctx, "SHOW TAG VALUES FROM #{m} WITH KEY = k") === []
+
+          bounded = fn spec, where ->
+            ifl_rows(ctx, "SHOW TAG VALUES FROM #{m} WITH KEY #{spec} WHERE #{where}")
+          end
+
+          values = fn key, values -> Enum.map(values, &%{"key" => key, "value" => &1}) end
+          k = values.("k", ["a", "b", "c"])
+          x = values.("x", ["p", "q"]) ++ [%{"key" => "x"}]
+
+          for {spec, expected} <- [
+                {"= k", k},
+                {"= x", x},
+                {"!= k", x},
+                {"IN (k, x)", k ++ x},
+                {"=~ /./", k ++ x},
+                {"!~ /k/", x},
+                {"= nothere", []}
+              ] do
+            assert bounded.(spec, "time >= 0") === expected, spec
+          end
+
+          assert bounded.("= k", "time >= 0 AND i > 1") === values.("k", ["b", "c"])
+          assert bounded.("= k", "time >= 0 AND x = 'p'") === values.("k", ["a"])
+        end
+
+        test "reads its WHERE as a SELECT does", %{m: m} = ctx do
+          prefix = "SHOW TAG VALUES FROM #{m} WITH KEY = k WHERE "
+
+          for where <- ["(", "()"] do
+            statement = prefix <> where
+            ifl_err(ctx, statement, ifl_nom(statement, byte_size(prefix) - 6))
+          end
+
+          statement = prefix <> "i >"
+
+          ifl_err(
+            ctx,
+            statement,
+            @ifl_parse <> "invalid conditional expression at pos #{byte_size(statement)}"
+          )
+
+          ifl_plan_err(
+            ctx,
+            prefix <> "time",
+            500,
+            "External error: InfluxQL internal error: expected an element on stack"
+          )
+
+          ifl_plan_err(
+            ctx,
+            prefix <> "time = 'a'",
+            400,
+            "Error during planning: invalid expression \"'a'\": 'a' is not a valid timestamp"
+          )
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_tag_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL two tags compared — contract" do
+        setup ctx do
+          m = ifl_name("ifl_tt")
+
+          ifl_write(ctx, [
+            "#{m},k=a,x=a i=1i,s=\"a\",t=\"a\" 1000",
+            "#{m},k=a,x=b i=2i,s=\"a\",t=\"b\" 2000"
+          ])
+
+          {:ok, m: m}
+        end
+
+        # the engine compares two tags as it compares nothing else: never equal,
+        # never different
+        test "is false for every row, whichever the operator", %{m: m} = ctx do
+          for where <- [
+                "k = x",
+                "x = k",
+                "k != x",
+                "k <> x",
+                "k = k",
+                "x = x",
+                "(k = x)",
+                "k = x AND i > 0",
+                "k = x OR k != x"
+              ] do
+            assert ifl_ids(ctx, "SELECT i FROM #{m} WHERE #{where}") === [], where
+          end
+
+          assert ifl_ids(ctx, "SELECT i FROM #{m} WHERE k = x OR i > 1") === [2]
+        end
+
+        test "a tag and a string field compare as strings", %{m: m} = ctx do
+          for {where, expected} <- [
+                {"k = s", [1, 2]},
+                {"k != s", []},
+                {"s = t", [1]},
+                {"s != t", [2]},
+                {"s = s", [1, 2]}
+              ] do
+            assert ifl_ids(ctx, "SELECT i FROM #{m} WHERE #{where}") === expected, where
+          end
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_literal_syntax_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL literals that are not closed, and =~ without a regex — contract" do
+        setup ctx do
+          m = ifl_name("ifl_ls")
+          ifl_write(ctx, ["#{m},k=a,x=a i=1i 1000", "#{m},k=a,x=b i=2i 2000"])
+          {:ok, m: m}
+        end
+
+        test "a string or quoted identifier never closed is an error at the end of the text",
+             %{m: m} = ctx do
+          for statement <- [
+                "SELECT i FROM #{m} WHERE k = 'a",
+                "SELECT i FROM #{m} WHERE \"k = 1",
+                "SELECT i FROM #{m} WHERE k = 'a' AND x = 'b",
+                "SELECT i FROM #{m} WHERE k = 'a LIMIT 1",
+                "SELECT i FROM #{m} WHERE k = 'a\\'",
+                "SELECT \"i FROM #{m}",
+                "SELECT i FROM \"#{m}",
+                "SELECT i FROM #{m} GROUP BY \"k"
+              ] do
+            ifl_err(
+              ctx,
+              statement,
+              @ifl_parse <> "unterminated string literal at pos #{byte_size(statement)}"
+            )
+          end
+        end
+
+        test "a regular expression never closed is an error at the end of the text",
+             %{m: m} = ctx do
+          for where <- ["k =~ /a", "k =~ /a/ AND x =~ /b", "k =~ /a LIMIT 1", "k !~ /a"] do
+            statement = "SELECT i FROM #{m} WHERE #{where}"
+
+            ifl_err(
+              ctx,
+              statement,
+              @ifl_parse <> "unterminated regex literal at pos #{byte_size(statement)}"
+            )
+          end
+        end
+
+        test "=~ and !~ want a regular expression, at the end of the operator", %{m: m} = ctx do
+          for {where, operator} <- [
+                {"k =~ k", "=~"},
+                {"k =~ 'a'", "=~"},
+                {"k =~ 1", "=~"},
+                {"k =~ \"a\"", "=~"},
+                {"k =~ -1", "=~"},
+                {"k =~ (a)", "=~"},
+                {"k =~ AND i > 1", "=~"},
+                {"k !~ k", "!~"},
+                {"k !~ 'a'", "!~"},
+                {"i > 1 AND k =~ 'a'", "=~"}
+              ] do
+            statement = "SELECT i FROM #{m} WHERE #{where}"
+
+            ifl_err(
+              ctx,
+              statement,
+              @ifl_parse <>
+                "invalid conditional, expected regular expression at pos " <>
+                "#{ifl_after(statement, operator)}"
+            )
+          end
+
+          assert ifl_ids(ctx, "SELECT i FROM #{m} WHERE k =~ /a/  AND x =~  /b/") === [2]
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # InfluxDB 2 line protocol
   # ---------------------------------------------------------------------------
 
@@ -1240,14 +2285,14 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
          [{:conflict, "~m", 1}, {:invalid, "~m", 1}]}
       ]
 
-      defp ifl_v2_invalid(message),
+      def ifl_v2_invalid(message),
         do: %{"code" => "invalid", "message" => message}
 
       # A bucket that keeps two hours; the engine's id and clock are masked.
-      defp ifl_with_retention_bucket(ctx, fun),
+      def ifl_with_retention_bucket(ctx, fun),
         do: ifl_with_bucket(ctx, "ifl_rb", [retention: 7200], fun)
 
-      defp ifl_masked(body) do
+      def ifl_masked(body) do
         update_in(Jason.decode!(body)["message"], fn message ->
           message
           |> String.replace(~r/Lower Bound at \d{4}-[-\d:.TZ]+/, "Lower Bound at BOUND")
@@ -1255,7 +2300,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end)
       end
 
-      defp ifl_retention_message(count, oldest, oldest_time, newest, newest_time) do
+      def ifl_retention_message(count, oldest, oldest_time, newest, newest_time) do
         drop = fn which, key, time ->
           "#{which} point #{key} at #{time} dropped because it violates a " <>
             "Retention Policy Lower Bound at BOUND"
@@ -1267,12 +2312,12 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           "for database: ID for retention policy: autogen"
       end
 
-      defp ifl_v2_drop_message(:invalid, measurement, dropped) do
+      def ifl_v2_drop_message(:invalid, measurement, dropped) do
         "failure writing points to database: partial write: invalid field name: " <>
           ~s|input field "time" on measurement "#{measurement}" is invalid dropped=#{dropped}|
       end
 
-      defp ifl_v2_drop_message(:conflict, measurement, dropped) do
+      def ifl_v2_drop_message(:conflict, measurement, dropped) do
         "failure writing points to database: partial write: field type conflict: " <>
           ~s|input field "v" on measurement "#{measurement}" is type integer, | <>
           "already exists as type float dropped=#{dropped}"
@@ -1400,19 +2445,19 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       # Runs `fun` with a bucket the test creates. A real server outlives the
       # test, so the bucket is deleted when `fun` returns or raises, in the
       # test's own process (the double's store dies with it).
-      defp ifl_with_bucket(ctx, prefix, opts, fun) do
+      def ifl_with_bucket(ctx, prefix, opts, fun) do
         InfluxElixir.ClientContract.with_scratch(unquote(client), ctx, :bucket, prefix, fn name ->
           :ok = unquote(client).create_bucket(ctx.conn, name, opts)
           fun.(name)
         end)
       end
 
-      defp ifl_range(ctx, stop), do: String.replace(ctx.head, "STOP", stop)
+      def ifl_range(ctx, stop), do: String.replace(ctx.head, "STOP", stop)
 
-      defp ifl_flux(ctx, query), do: unquote(client).query_flux(ctx.conn, query)
+      def ifl_flux(ctx, query), do: unquote(client).query_flux(ctx.conn, query)
 
       # Everything of one measurement from the epoch to `stop` seconds.
-      defp ifl_measurement_query(ctx, measurement, stop) do
+      def ifl_measurement_query(ctx, measurement, stop) do
         ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: #{stop}) | <>
           ~s|\|> filter(fn: (r) => r._measurement == "#{measurement}")|
       end
@@ -1469,11 +2514,11 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       # A time in the nth week from 2023-01-04, in nanoseconds: every week is
       # a shard group of a bucket that keeps everything.
-      defp ifl_week(n), do: (1_672_790_400 + n * 604_800) * 1_000_000_000
+      def ifl_week(n), do: (1_672_790_400 + n * 604_800) * 1_000_000_000
 
       # What a read of the measurement over all of 2023 returns, as
       # `{field, tag t, value}` sorted.
-      defp ifl_weeks(ctx, m) do
+      def ifl_weeks(ctx, m) do
         assert {:ok, rows} =
                  ifl_flux(
                    ctx,
@@ -1484,10 +2529,10 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         rows |> Enum.map(&{&1["_field"], &1["t"], &1["_value"]}) |> Enum.sort()
       end
 
-      defp ifl_filter_base(ctx),
+      def ifl_filter_base(ctx),
         do: ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) |
 
-      defp ifl_filter_fixture(ctx) do
+      def ifl_filter_fixture(ctx) do
         [a, b, c] = for p <- ["ifl_fa", "ifl_fb", "ifl_fc"], do: ifl_name(p)
 
         ifl_write(ctx, [

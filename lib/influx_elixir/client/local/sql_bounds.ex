@@ -31,6 +31,10 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   list) the constant is read per row, and the connection is closed
   (`SQLNumber.negate/2`).
 
+  The comparisons of an expression (a `CAST` of an integer column, an
+  integer division by zero, arithmetic on a column) are read by
+  `InfluxElixir.Client.Local.SQLBoundsExpr`.
+
   The body names the first conjunct, in the order written (`BETWEEN` is
   `>= low` then `<= high`): a lower bound or `>=` reads `lhs:Null,
   rhs:<type>`, an upper bound `lhs:<type>, rhs:Null`, an `=` is the
@@ -46,7 +50,14 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
 
   import Bitwise
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLFold, SQLLimits, SQLPredicates}
+  alias InfluxElixir.Client.Local.{
+    SQLBoundsExpr,
+    SQLError,
+    SQLExpr,
+    SQLFold,
+    SQLLimits,
+    SQLPredicates
+  }
 
   require SQLLimits
 
@@ -65,12 +76,18 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
 
   @mixed "an integer column bounded by an integer and a float literal"
 
+  @propagated "an arithmetic comparison of a column that, with the other comparisons of it, " <>
+                "leaves it no value"
+
   @typep leaf ::
            {:disabler, [binary() | :any]}
            | {:unknown, binary()}
            | {:bound, binary(), column_type(), atom(), number()}
            | {:cast, binary(), column_type(), atom(), float()}
            | {:overflow, binary()}
+           | {:cast_null, atom(), binary()}
+           | {:divzero, [binary()]}
+           | {:linear, binary(), column_type(), SQLBoundsExpr.interval(), boolean()}
            | :division
 
   @doc """
@@ -95,10 +112,64 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
       :division in leaves ->
         division(leaves)
 
+      cast_null = Enum.find(leaves, &match?({:cast_null, _op, _target}, &1)) ->
+        cast_null(leaves, cast_null, cte?)
+
+      Enum.any?(leaves, &match?({:divzero, _columns}, &1)) ->
+        divzero(leaves, cte?)
+
       true ->
         leaves |> analyse() |> answer(cte?)
     end
   end
+
+  # An unsigned column's cast against a negative number is the Arrow kernel's
+  # error when the analysis reads the whole filter; beside another conjunct
+  # the engine's answer is not pinned down.
+  @spec cast_null([leaf()], {:cast_null, atom(), binary()}, boolean()) ::
+          :ok | {:error, SQLError.t()}
+  defp cast_null(leaves, {:cast_null, _op, target}, cte?) do
+    if match?([_only], leaves) and not cte?,
+      do: {:error, SQLError.cast_to_null(target)},
+      else:
+        {:error,
+         SQLError.refusal(
+           "a negative number compared with a CAST of an unsigned column beside another " <>
+             "comparison, or over a CTE: the engine's answer is not pinned down"
+         )}
+  end
+
+  # `=` of an expression that divides an integer by zero fails the analysis
+  # when the other conjuncts bound every column it reads; the body is the
+  # first bound's.
+  @spec divzero([leaf()], boolean()) :: :ok | {:error, SQLError.t()}
+  defp divzero(leaves, cte?) do
+    bounds = for {:bound, _column, _type, _op, _value} = leaf <- leaves, do: leaf
+    bounded = for {:bound, column, _type, _op, _value} <- bounds, into: MapSet.new(), do: column
+
+    read =
+      Enum.flat_map(leaves, fn
+        {:divzero, columns} -> columns
+        _other -> []
+      end)
+
+    unknown = Enum.find(leaves, &match?({:unknown, _what}, &1))
+
+    cond do
+      bounds == [] or not Enum.all?(read, &(&1 in bounded)) -> :ok
+      unknown != nil -> {:error, refusal_for(elem(unknown, 1))}
+      cte? -> {:error, refusal_for("a filter over a CTE")}
+      true -> answer({:fail, hd(bounds)}, false)
+    end
+  end
+
+  @spec refusal_for(binary()) :: SQLError.t()
+  defp refusal_for(what),
+    do:
+      SQLError.refusal(
+        "a WHERE with an expression that divides by zero beside #{what}: the engine's answer " <>
+          "is not pinned down"
+      )
 
   # A constant that divides a minimum by -1 makes the analysis' intervals
   # disagree in type when another comparison meets it, an internal error whose
@@ -243,8 +314,16 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   end
 
   @spec clause(atom(), term(), term(), type_of()) :: [leaf()]
-  defp clause(_op, {:expr, _expr}, _rhs, _type_of),
-    do: [{:unknown, "an arithmetic expression compared"}]
+  defp clause(op, {:expr, expr}, rhs, type_of) do
+    case SQLBoundsExpr.classify(op, expr, rhs, type_of) do
+      {:column, column} -> clause(op, column, rhs, type_of)
+      {:cast_null, op, _target} = leaf when op in [:eq, :lt, :lte, :in] -> [leaf]
+      {:cast_null, _op, _target} -> [{:unknown, "a negative number against a CAST"}]
+      {:divzero, _columns} = leaf -> [leaf]
+      {:linear, _column, _type, _interval, _additive} = leaf -> [leaf]
+      :unknown -> [{:unknown, "an arithmetic expression compared"}]
+    end
+  end
 
   defp clause(:is_not_null, "time", _rhs, _type_of), do: []
   defp clause(_op, "time", _rhs, _type_of), do: [{:disabler, ["time"]}]
@@ -349,10 +428,14 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
       Enum.any?(Map.values(by_column), &equal_conflict?/1) ->
         :ok
 
+      linear_empty?(leaves) ->
+        {:refuse, @propagated}
+
       bounds == [] ->
         :ok
 
-      Enum.any?(Map.values(by_column) ++ Map.values(cast_columns), &empty?/1) ->
+      Enum.any?(Map.values(cast_columns), &empty?/1) or
+          Enum.any?(by_column, fn {column, group} -> column_empty?(leaves, column, group) end) ->
         failure(leaves, groups, bounds, by_column, casts)
 
       mixed_empty?(by_column, casts) ->
@@ -375,6 +458,9 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
       unknown = Enum.find(leaves, &match?({:unknown, _what}, &1)) ->
         {:refuse, elem(unknown, 1)}
 
+      Enum.any?(leaves, &match?({:linear, _column, _type, _interval, false}, &1)) ->
+        {:refuse, @propagated}
+
       Enum.any?(groups, &redundant?/1) ->
         {:refuse, "two bounds on one column, one implying the other"}
 
@@ -382,6 +468,53 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
         {:fail, hd(bounds)}
     end
   end
+
+  # A column is left no value by its bounds, or by them with the comparisons
+  # of it that only add a constant (the engine reads those as bounds that
+  # come after the others).
+  @spec column_empty?([leaf()], binary(), [leaf()]) :: boolean()
+  defp column_empty?(leaves, column, group) do
+    empty?(group) or
+      (match?([_ | _], additive_intervals(leaves, column)) and
+         SQLBoundsExpr.empty?(
+           elem(hd(group), 2),
+           bound_intervals(leaves, column) ++ additive_intervals(leaves, column)
+         ))
+  end
+
+  @spec additive_intervals([leaf()], binary()) :: [SQLBoundsExpr.interval()]
+  defp additive_intervals(leaves, column),
+    do: for({:linear, ^column, _type, interval, true} <- leaves, do: interval)
+
+  # Some column is left no value by the intervals that arithmetic comparisons
+  # of it leave, with its bounds.
+  @spec linear_empty?([leaf()]) :: boolean()
+  defp linear_empty?(leaves) do
+    linear =
+      for {:linear, column, type, interval, _additive} <- leaves, do: {column, type, interval}
+
+    linear
+    |> Enum.group_by(&elem(&1, 0))
+    |> Enum.any?(fn {column, group} ->
+      {_column, type, _interval} = hd(group)
+      intervals = Enum.map(group, &elem(&1, 2)) ++ bound_intervals(leaves, column)
+
+      Enum.any?(leaves, &match?({:linear, ^column, _type, _interval, false}, &1)) and
+        SQLBoundsExpr.empty?(type, intervals)
+    end)
+  end
+
+  @spec bound_intervals([leaf()], binary()) :: [SQLBoundsExpr.interval()]
+  defp bound_intervals(leaves, column) do
+    for {:bound, ^column, _type, op, x} <- leaves, do: bound_interval(op, x * 1.0)
+  end
+
+  @spec bound_interval(atom(), float()) :: SQLBoundsExpr.interval()
+  defp bound_interval(:gt, x), do: {x, true, :inf, false}
+  defp bound_interval(:gte, x), do: {x, false, :inf, false}
+  defp bound_interval(:lt, x), do: {:neg_inf, false, x, true}
+  defp bound_interval(:lte, x), do: {:neg_inf, false, x, false}
+  defp bound_interval(:eq, x), do: {x, false, x, false}
 
   # A float literal against an integer column is a bound of the column cast
   # to a double.

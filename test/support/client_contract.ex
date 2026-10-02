@@ -44,43 +44,53 @@ defmodule InfluxElixir.ClientContract do
   Test blocks are only compiled for profiles that support them.
   The profile is known at compile time, so unsupported test blocks
   are simply not generated — zero runtime overhead.
+
+  ## Parts
+
+  The contract is large, and a module that generates all of it is slow to
+  compile. `part: part` generates one slice of it, so that each slice can be its
+  own ExUnit module compiled and run in parallel with the others. Without
+  `:part` (or with `part: :all`) everything is generated; the parts of a profile
+  together generate exactly that.
+
+    * `:write_admin` — health, write, line protocol, precision, gzip, databases
+    * `:sql_query` — SQL queries, aggregates, CTEs, filters, joins, casts
+    * `:sql_semantics` — OFFSET, DISTINCT, parameters, literals, NULLs, references
+    * `:influxql_scalar` — InfluxQL, scalar functions, query formats
+    * `:v2` — buckets, v2 write rules and Flux (`:v2` profile only)
   """
+
+  @parts [:write_admin, :sql_query, :sql_semantics, :influxql_scalar, :v2]
 
   @doc false
   defmacro __using__(opts) do
     client = Keyword.fetch!(opts, :client)
     profile = Keyword.fetch!(opts, :profile)
+    part = Keyword.get(opts, :part, :all)
 
-    # Determine which feature groups this profile supports
+    unless part == :all or part in @parts do
+      raise ArgumentError,
+            "unknown :part #{inspect(part)}, expected :all or one of #{inspect(@parts)}"
+    end
+
+    blocks =
+      for {block_part, block} <- profile_blocks(client, profile),
+          block != nil,
+          part == :all or part == block_part,
+          do: block
+
+    quote location: :keep do
+      (unquote_splicing(blocks))
+    end
+  end
+
+  # The blocks a profile runs, in order, each with the part it belongs to. A block
+  # a profile does not support is `nil`: it is not generated, so it costs nothing.
+  @spec profile_blocks(Macro.t(), atom()) :: [{atom(), Macro.t() | nil}]
+  defp profile_blocks(client, profile) do
     v3_sql = profile in [:v3_core, :v3_enterprise]
     v2_ops = profile == :v2
-
-    health_tests = health_tests(client, if(v2_ops, do: :v2, else: :v3))
-    write_tests = write_tests(client, profile)
-
-    sql_tests = if v3_sql, do: sql_tests(client), else: nil
-    roundtrip_tests = if v3_sql, do: roundtrip_tests(client), else: nil
-    stream_tests = if v3_sql, do: stream_tests(client), else: nil
-    aggregate_tests = if v3_sql, do: aggregate_tests(client), else: nil
-    stats_tests = if v3_sql, do: stats_tests(client), else: nil
-    time_filter_tests = if v3_sql, do: time_filter_tests(client), else: nil
-    cte_tests = if v3_sql, do: cte_tests(client), else: nil
-    where_tests = if v3_sql, do: where_tests(client), else: nil
-    scalar_function_tests = if v3_sql, do: scalar_function_tests(client), else: nil
-    scalar_function_error_tests = if v3_sql, do: scalar_function_error_tests(client), else: nil
-    median_join_tests = if v3_sql, do: median_join_tests(client), else: nil
-    cast_tests = if v3_sql, do: cast_tests(client), else: nil
-    schema_rule_tests = if v3_sql, do: schema_rule_tests(client), else: nil
-    write_rule_tests = if v3_sql, do: write_rule_tests(client), else: nil
-    duplicate_tests = if v3_sql, do: duplicate_tests(client), else: nil
-    offset_tests = if v3_sql, do: offset_tests(client), else: nil
-    ordered_agg_tests = if v3_sql, do: ordered_agg_tests(client), else: nil
-    distinct_tests = if v3_sql, do: distinct_tests(client), else: nil
-    param_tests = if v3_sql, do: param_tests(client), else: nil
-    literal_tests = if v3_sql, do: literal_tests(client), else: nil
-    precision_tests = if v3_sql, do: precision_tests(client), else: nil
-    gzip_tests = if v3_sql, do: gzip_tests(client), else: nil
-    escaping_tests = if v3_sql, do: escaping_tests(client), else: nil
+    version = if v2_ops, do: :v2, else: :v3
 
     execute_tests =
       cond do
@@ -89,82 +99,57 @@ defmodule InfluxElixir.ClientContract do
         true -> nil
       end
 
-    influxql_tests = if v3_sql, do: influxql_tests(client), else: nil
-    influxql_select_tests = if v3_sql, do: influxql_select_tests(client), else: nil
-    reference_tests = if v3_sql, do: reference_tests(client), else: nil
-    null_semantics_tests = if v3_sql, do: null_semantics_tests(client), else: nil
-    atomic_write_tests = if v3_sql, do: atomic_write_tests(client), else: nil
-    db_admin_tests = if v3_sql, do: db_admin_tests(client), else: nil
-    format_tests = if v3_sql, do: format_tests(client), else: nil
-    database_rule_tests = if v3_sql, do: database_rule_tests(client), else: nil
-    distinct_on_tests = if v3_sql, do: distinct_on_tests(client), else: nil
-    identifier_tests = if v3_sql, do: identifier_tests(client), else: nil
-    influxql_where_tests = if v3_sql, do: influxql_where_tests(client), else: nil
-    tab_tests = if v3_sql, do: tab_tests(client), else: nil
-    timestamp_range_tests = timestamp_range_tests(client, if(v2_ops, do: :v2, else: :v3))
+    v3 = fn part, builder -> {part, if(v3_sql, do: builder.(client), else: nil)} end
+    v2 = fn builder -> {:v2, if(v2_ops, do: builder.(client), else: nil)} end
 
-    bucket_tests = if v2_ops, do: bucket_tests(client), else: nil
-    v2_write_rule_tests = if v2_ops, do: v2_write_rule_tests(client), else: nil
-    v2_body_tests = if v2_ops, do: v2_body_tests(client), else: nil
-    v2_precision_tests = if v2_ops, do: v2_precision_tests(client), else: nil
-    v2_duplicate_tests = if v2_ops, do: v2_duplicate_tests(client), else: nil
-    v2_flux_pipeline_tests = if v2_ops, do: v2_flux_pipeline_tests(client), else: nil
-    flux_tests = if v2_ops, do: flux_tests(client), else: nil
-
-    blocks =
-      [
-        health_tests,
-        write_tests,
-        sql_tests,
-        roundtrip_tests,
-        stream_tests,
-        aggregate_tests,
-        stats_tests,
-        time_filter_tests,
-        cte_tests,
-        where_tests,
-        scalar_function_tests,
-        scalar_function_error_tests,
-        median_join_tests,
-        cast_tests,
-        schema_rule_tests,
-        write_rule_tests,
-        duplicate_tests,
-        offset_tests,
-        ordered_agg_tests,
-        distinct_tests,
-        param_tests,
-        literal_tests,
-        precision_tests,
-        gzip_tests,
-        escaping_tests,
-        execute_tests,
-        influxql_tests,
-        influxql_select_tests,
-        reference_tests,
-        null_semantics_tests,
-        atomic_write_tests,
-        db_admin_tests,
-        format_tests,
-        database_rule_tests,
-        distinct_on_tests,
-        identifier_tests,
-        influxql_where_tests,
-        tab_tests,
-        timestamp_range_tests,
-        bucket_tests,
-        v2_write_rule_tests,
-        v2_body_tests,
-        v2_precision_tests,
-        v2_duplicate_tests,
-        v2_flux_pipeline_tests,
-        flux_tests
-      ]
-      |> Enum.reject(&is_nil/1)
-
-    quote location: :keep do
-      (unquote_splicing(blocks))
-    end
+    [
+      {:write_admin, health_tests(client, version)},
+      {:write_admin, write_tests(client, profile)},
+      v3.(:sql_query, &sql_tests/1),
+      v3.(:sql_query, &roundtrip_tests/1),
+      v3.(:sql_query, &stream_tests/1),
+      v3.(:sql_query, &aggregate_tests/1),
+      v3.(:sql_query, &stats_tests/1),
+      v3.(:sql_query, &time_filter_tests/1),
+      v3.(:sql_query, &cte_tests/1),
+      v3.(:sql_query, &where_tests/1),
+      v3.(:influxql_scalar, &scalar_function_tests/1),
+      v3.(:influxql_scalar, &scalar_function_error_tests/1),
+      v3.(:sql_query, &median_join_tests/1),
+      v3.(:sql_query, &cast_tests/1),
+      v3.(:write_admin, &schema_rule_tests/1),
+      v3.(:write_admin, &write_rule_tests/1),
+      v3.(:write_admin, &duplicate_tests/1),
+      v3.(:sql_semantics, &offset_tests/1),
+      v3.(:sql_semantics, &ordered_agg_tests/1),
+      v3.(:sql_semantics, &distinct_tests/1),
+      v3.(:sql_semantics, &param_tests/1),
+      v3.(:sql_semantics, &literal_tests/1),
+      v3.(:write_admin, &precision_tests/1),
+      v3.(:write_admin, &gzip_tests/1),
+      v3.(:write_admin, &escaping_tests/1),
+      {:sql_semantics, execute_tests},
+      v3.(:influxql_scalar, &influxql_tests/1),
+      v3.(:influxql_scalar, &influxql_select_tests/1),
+      v3.(:sql_semantics, &reference_tests/1),
+      v3.(:sql_semantics, &null_semantics_tests/1),
+      v3.(:write_admin, &atomic_write_tests/1),
+      v3.(:write_admin, &db_admin_tests/1),
+      v3.(:influxql_scalar, &format_tests/1),
+      v3.(:write_admin, &database_rule_tests/1),
+      v3.(:sql_semantics, &distinct_on_tests/1),
+      v3.(:write_admin, &identifier_tests/1),
+      v3.(:influxql_scalar, &influxql_where_tests/1),
+      v3.(:write_admin, &tab_tests/1),
+      {:write_admin, timestamp_range_tests(client, version)},
+      v2.(&bucket_tests/1),
+      v2.(&v2_write_rule_tests/1),
+      v2.(&v2_body_tests/1),
+      v2.(&v2_precision_tests/1),
+      v2.(&v2_duplicate_tests/1),
+      v2.(&v2_flux_pipeline_tests/1),
+      v2.(&flux_tests/1)
+    ]
   end
 
   @doc """
@@ -913,6 +898,62 @@ defmodule InfluxElixir.ClientContract do
 
           assert {:ok, ^rows} = exec.("SELECT * FROM contract_del")
           assert [%{"value" => 1, "time" => %DateTime{}}] = rows
+        end
+
+        test "a text that starts no statement is the parser's error, at its position", ctx do
+          query = &unquote(client).query_sql(ctx.conn, &1, database: ctx.database)
+          exec = &unquote(client).execute_sql(ctx.conn, &1, database: ctx.database)
+          found = &"SQL error: ParserError(\"Expected: an SQL statement, found: #{&1}\")"
+
+          for {text, token, position} <- [
+                {"FOO bar", "FOO", "Line: 1, Column: 1"},
+                {"SELEC 1", "SELEC", "Line: 1, Column: 1"},
+                {"1", "1", "Line: 1, Column: 1"},
+                {"42 + 1", "42", "Line: 1, Column: 1"},
+                {"1.5", "1.5", "Line: 1, Column: 1"},
+                {"123abc", "123", "Line: 1, Column: 1"},
+                {"foo.bar", "foo", "Line: 1, Column: 1"},
+                {"FOO;", "FOO", "Line: 1, Column: 1"},
+                {"'abc'", "'abc'", "Line: 1, Column: 1"},
+                {"* from t", "*", "Line: 1, Column: 1"},
+                {", select", ",", "Line: 1, Column: 1"},
+                {"@@", "@@", "Line: 1, Column: 1"},
+                {"ünï", "ünï", "Line: 1, Column: 1"},
+                {"  FOO bar", "FOO", "Line: 1, Column: 3"},
+                {"\n  FOO bar", "FOO", "Line: 2, Column: 3"},
+                {"LOCK TABLE t", "LOCK", "Line: 1, Column: 1"},
+                {"RESET x", "RESET", "Line: 1, Column: 1"},
+                {"LISTEN x", "LISTEN", "Line: 1, Column: 1"}
+              ] do
+            expected = {:error, %{status: 400, body: found.("#{token} at #{position}")}}
+            assert query.(text) === expected, text
+            assert exec.(text) === expected, text
+          end
+        end
+
+        test "a statement the engine reads and does not run is its planning error", ctx do
+          exec = &unquote(client).execute_sql(ctx.conn, &1, database: ctx.database)
+
+          for {text, kind} <- [
+                {"COMMIT", "TransactionEnd"},
+                {"ROLLBACK", "TransactionEnd"},
+                {"START TRANSACTION", "TransactionStart"},
+                {"SET x = 1", "SetVariable"},
+                {"SET x TO 1", "SetVariable"},
+                {"SET datafusion.execution.batch_size = 1", "SetVariable"},
+                {"PREPARE x AS select 1", "Prepare"},
+                {"DEALLOCATE x", "Deallocate"},
+                {"EXEC x", "Execute"},
+                {"EXECUTE x(1)", "Execute"}
+              ] do
+            assert exec.(text) ===
+                     {:error,
+                      %{
+                        status: 400,
+                        body: "Error during planning: Statement not supported: " <> kind
+                      }},
+                   text
+          end
         end
 
         # Client.HTTP dropped `params`, so the placeholder was the engine's
@@ -3572,12 +3613,22 @@ defmodule InfluxElixir.ClientContract do
         end
 
         test "a selector without a subscript is the time/value struct", ctx do
-          assert [%{"sl" => %{"time" => %DateTime{}, "value" => -3.25}}] =
+          assert [%{"sl" => %{"time" => %DateTime{} = struct_time, "value" => -3.25}}] =
                    InfluxElixir.ClientContract.rows(
                      unquote(client),
                      ctx,
                      "SELECT selector_last(v, time) AS sl FROM #{ctx.m}"
                    )
+
+          # The struct's time is the time the subscript form returns for the same query.
+          assert [%{"t" => subscript_time}] =
+                   InfluxElixir.ClientContract.rows(
+                     unquote(client),
+                     ctx,
+                     "SELECT selector_last(v, time)['time'] AS t FROM #{ctx.m}"
+                   )
+
+          assert struct_time === subscript_time
         end
       end
     end

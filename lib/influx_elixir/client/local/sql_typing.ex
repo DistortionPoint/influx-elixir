@@ -93,19 +93,10 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
   defp expr({:field, name} = field, unsigned?) when is_binary(name),
     do: if(unsigned?.(name), do: {:uint_col, name}, else: field)
 
-  defp expr({:op, op, left, right}, unsigned?),
-    do: {:op, op, expr(left, unsigned?), expr(right, unsigned?)}
-
   # Two negations in a row cancel before the planner types them (verified:
   # `-(-u)` is `u`, `-(-(-u))` is the engine's negation error).
   defp expr({:neg, {:neg, inner}}, unsigned?), do: expr(inner, unsigned?)
-  defp expr({:neg, inner}, unsigned?), do: {:neg, expr(inner, unsigned?)}
-  defp expr({:cast, inner, type}, unsigned?), do: {:cast, expr(inner, unsigned?), type}
-
-  defp expr({:call, function, args}, unsigned?),
-    do: {:call, function, Enum.map(args, &expr(&1, unsigned?))}
-
-  defp expr(other, _unsigned?), do: other
+  defp expr(other, unsigned?), do: SQLExpr.map_children(other, &expr(&1, unsigned?))
 
   @doc """
   Refuses a CTE whose select list casts to a narrow integer (`CAST(x AS INT)`
@@ -129,12 +120,11 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
   end
 
   @spec narrow_cast?(SQLExpr.t()) :: boolean()
-  defp narrow_cast?({:cast, _inner, type}) when type in [:int8, :int16, :int32], do: true
-  defp narrow_cast?({:cast, inner, _type}), do: narrow_cast?(inner)
-  defp narrow_cast?({:neg, inner}), do: narrow_cast?(inner)
-  defp narrow_cast?({:op, _op, left, right}), do: narrow_cast?(left) or narrow_cast?(right)
-  defp narrow_cast?({:call, _function, args}), do: Enum.any?(args, &narrow_cast?/1)
-  defp narrow_cast?(_leaf), do: false
+  defp narrow_cast?(expr), do: SQLExpr.any?(expr, &narrow_cast_node?/1)
+
+  @spec narrow_cast_node?(SQLExpr.t()) :: boolean()
+  defp narrow_cast_node?({:cast, _inner, type}), do: type in [:int8, :int16, :int32]
+  defp narrow_cast_node?(_other), do: false
 
   @doc """
   The output columns of a (CTE) query that are an unsigned column passed
