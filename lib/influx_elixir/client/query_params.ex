@@ -99,6 +99,22 @@ defmodule InfluxElixir.Client.QueryParams do
   end
 
   @doc """
+  The JSON body `Client.HTTP` posts to `/api/v3/query_sql`: `db` (left out
+  when `database` is `nil`), `format` (left out when it is `nil`, as for a
+  statement run with `execute_sql`), `params` and `q`, written in that order
+  (Jason writes a small map's keys sorted). The engine's JSON parser reports
+  an error by its byte position in this body, so `Client.Local` and the
+  contract tests that pin the position read it from here.
+  """
+  @spec request_body(binary() | nil, binary(), t(), term()) :: binary()
+  def request_body(database, sql, params, format) do
+    body = %{"q" => sql, "params" => params}
+    body = if database == nil, do: body, else: Map.put(body, "db", database)
+    body = if format == nil, do: body, else: Map.put(body, "format", to_string(format))
+    Jason.encode!(body)
+  end
+
+  @doc """
   What the engine reads from the parameters: the request body's JSON read
   as its parser reads it. A number is read as `serde_json` reads it: an
   integer in the `Int64`/`UInt64` range stays one, any other is a float. The

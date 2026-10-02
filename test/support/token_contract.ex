@@ -18,9 +18,9 @@ defmodule InfluxElixir.TokenContract do
     client = Keyword.fetch!(opts, :client)
     profile = Keyword.fetch!(opts, :profile)
 
-    quote do
+    quote location: :keep do
       defp token_name(prefix),
-        do: "#{prefix}_#{100_000_000 + System.unique_integer([:positive])}"
+        do: InfluxElixir.IntegrationHelper.unique_name(prefix)
 
       # A real server outlives the test: its tokens are deleted after it.
       defp delete_after(%{shared: true} = ctx, names) do
@@ -45,13 +45,13 @@ defmodule InfluxElixir.TokenContract do
                    "expiry" => expiry
                  } = token
 
-          assert map_size(token) == 6
+          assert map_size(token) === 6
           assert is_integer(id) and id > 0
-          assert byte_size(secret) == 86
+          assert byte_size(secret) === 86
           assert hash =~ ~r/\A[0-9a-f]{128}\z/
           assert {:ok, created, 0} = DateTime.from_iso8601(created_at)
           assert {:ok, expires, 0} = DateTime.from_iso8601(expiry)
-          assert DateTime.diff(expires, created, :millisecond) == 3_600_000
+          assert DateTime.diff(expires, created, :millisecond) === 3_600_000
           assert created_at =~ ~r/\.\d{3}Z\z/
         end
 
@@ -65,7 +65,7 @@ defmodule InfluxElixir.TokenContract do
           assert :ok = unquote(client).delete_token(ctx.conn, first)
 
           assert {:ok, %{"id" => next}} = unquote(client).create_token(ctx.conn, second)
-          assert next == id + 1
+          assert next === id + 1
         end
 
         test "a taken name is the engine's 409 and spends no id", ctx do
@@ -81,7 +81,7 @@ defmodule InfluxElixir.TokenContract do
                    unquote(client).create_token(ctx.conn, "_admin")
 
           assert {:ok, %{"id" => next}} = unquote(client).create_token(ctx.conn, other)
-          assert next == id + 1
+          assert next === id + 1
         end
 
         # The column is the end of the value, the body's last: the byte

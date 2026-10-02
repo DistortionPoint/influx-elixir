@@ -28,6 +28,27 @@ defmodule InfluxElixir.Contract.SQLParser do
     end
   end
 
+  @doc false
+  # The fields the engine lists in `Schema error: No field named ...`, each
+  # `table.column` with a name that is not a lower case word quoted, a quote
+  # doubled.
+  @spec fields(binary(), [binary()]) :: [binary()]
+  def fields(table, columns), do: Enum.map(columns, &(render(table) <> "." <> render(&1)))
+
+  @doc false
+  # The engine's message for a column it cannot find, exactly. `printed` is the
+  # name as the engine prints it; `fields` the fields it lists, in its order:
+  # for ORDER BY and GROUP BY the select list's own fields come first.
+  @spec no_field(binary(), [binary()]) :: binary()
+  def no_field(printed, fields),
+    do: "Schema error: No field named #{printed}. Valid fields are #{Enum.join(fields, ", ")}."
+
+  defp render(name) do
+    if Regex.match?(~r/\A[a-z_][a-z0-9_]*\z/, name),
+      do: name,
+      else: ~s("#{String.replace(name, "\"", "\"\"")}")
+  end
+
   defp sql_parser_tests(client) do
     quote location: :keep do
       unquote(helpers(client))
@@ -44,6 +65,16 @@ defmodule InfluxElixir.Contract.SQLParser do
       unquote(text_tests())
       unquote(escape_tests())
       unquote(identifier_tests())
+      unquote(unaliased_tests())
+      unquote(grouped_name_tests())
+      unquote(time_range_tests())
+      unquote(literal_type_tests())
+      unquote(quoted_select_tests())
+      unquote(valid_fields_tests())
+      unquote(valid_fields_context_tests())
+      unquote(time_zone_tests())
+      unquote(leap_second_tests())
+      unquote(small_fidelity_tests())
       unquote(parameter_tests())
       unquote(parameter_kind_tests())
       unquote(parameter_type_tests())
@@ -78,7 +109,24 @@ defmodule InfluxElixir.Contract.SQLParser do
       defp sp_execute(ctx, sql, params),
         do: unquote(client).execute_sql(ctx.conn, sql, database: ctx.database, params: params)
 
-      defp sp_local?, do: unquote(client) == InfluxElixir.Client.Local
+      defp sp_local?, do: unquote(client) === InfluxElixir.Client.Local
+
+      @sp_closed {:error, {:connection_error, %Mint.TransportError{reason: :closed}}}
+
+      # The byte of the request body `Client.HTTP` sends at which the text of the
+      # parameters up to `problem` ends, and whether `problem` is the last one.
+      defp sp_params_read(ctx, sql, params, problem, format) do
+        {:ok, normalized} = InfluxElixir.Client.QueryParams.normalize(params)
+
+        body =
+          InfluxElixir.Client.QueryParams.request_body(ctx.database, sql, normalized, format)
+
+        keys = normalized |> Map.keys() |> Enum.sort()
+        kept = Enum.take_while(keys, &(&1 <= problem))
+        text = normalized |> Map.take(kept) |> Jason.encode!()
+        {at, length} = :binary.match(body, binary_part(text, 1, byte_size(text) - 2))
+        {at + length, problem === List.last(keys)}
+      end
     end
   end
 
@@ -102,10 +150,32 @@ defmodule InfluxElixir.Contract.SQLParser do
       defp sp_timestamp_error(text, reason),
         do: sp_optimizer("Parser error: Error parsing timestamp from '#{text}': #{reason}")
 
-      defp sp_negative_zero?(value), do: is_float(value) and <<value::float>> == <<-0.0::float>>
+      defp sp_negative_zero?(value), do: is_float(value) and <<value::float>> === <<-0.0::float>>
 
-      defp sp_unknown_field(body, name, table),
-        do: InfluxElixir.ClientContract.unknown_field(body, name, table)
+      defp sp_fields(table, columns), do: InfluxElixir.Contract.SQLParser.fields(table, columns)
+
+      defp sp_no_field(printed, fields),
+        do: InfluxElixir.Contract.SQLParser.no_field(printed, fields)
+
+      # What the engine says of a `WHERE` that leaves no instant of time.
+      defp sp_boundaries,
+        do:
+          "External error: unexpected: provided filters on time column did not produce " <>
+            "a valid set of boundaries"
+
+      # The rows of the fixture most tests read: three points two minutes apart
+      # in a tag, an integer, a float, a string and a boolean field.
+      defp sp_fixture(ctx) do
+        m = sp_measurement("sp_fix")
+
+        sp_write(ctx, [
+          ~s|#{m},h=a v=1i,f=1.5,s="x",b=true #{sp_ns(0)}|,
+          ~s|#{m},h=b v=2i,f=2.5,s="y",b=false #{sp_ns(60)}|,
+          ~s|#{m},h=a v=3i,f=3.5,s="z",b=true #{sp_ns(120)}|
+        ])
+
+        m
+      end
     end
   end
 
@@ -123,15 +193,15 @@ defmodule InfluxElixir.Contract.SQLParser do
 
           obrien = {:ok, [%{"name" => "O'Brien"}]}
 
-          assert obrien == sp_query(ctx, "SELECT name FROM #{m} WHERE name = 'O''Brien'")
-          assert obrien == sp_query(ctx, "SELECT name FROM #{m} WHERE name LIKE 'O''B%'")
+          assert obrien === sp_query(ctx, "SELECT name FROM #{m} WHERE name = 'O''Brien'")
+          assert obrien === sp_query(ctx, "SELECT name FROM #{m} WHERE name LIKE 'O''B%'")
 
-          assert obrien ==
+          assert obrien ===
                    sp_query(ctx, "SELECT name FROM #{m} WHERE name = $n", %{n: "O'Brien"})
 
           hostile = "zzz' OR v > 0 OR name = 'q"
 
-          assert {:ok, []} ==
+          assert {:ok, []} ===
                    sp_query(ctx, "SELECT name FROM #{m} WHERE name = $n", %{n: hostile})
         end
 
@@ -186,12 +256,12 @@ defmodule InfluxElixir.Contract.SQLParser do
           all = {:ok, [%{"v" => 1.0}, %{"v" => 2.0}]}
 
           for where <- ["1 = 1", "true", "'a' = 'a'", "1 < 2.5", "NOT false"] do
-            assert all == sp_query(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY time"),
+            assert all === sp_query(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY time"),
                    where
           end
 
           for where <- ["false", "1 = 2", "NOT true", "'a' > 'b'"] do
-            assert {:ok, []} == sp_query(ctx, "SELECT v FROM #{m} WHERE #{where}"), where
+            assert {:ok, []} === sp_query(ctx, "SELECT v FROM #{m} WHERE #{where}"), where
           end
         end
 
@@ -210,7 +280,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"12345678.9", "Float64(12345678.9)", "Float64"},
                 {"'a'", ~s|Utf8("a")|, "Utf8"}
               ] do
-            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where}") ==
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where}") ===
                      {:error,
                       %{
                         status: 400,
@@ -221,7 +291,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                    where
           end
 
-          assert sp_query(ctx, "SELECT v FROM #{m} WHERE true AND v > 0") ==
+          assert sp_query(ctx, "SELECT v FROM #{m} WHERE true AND v > 0") ===
                    {:ok, [%{"v" => 1.0}]}
         end
       end
@@ -248,12 +318,12 @@ defmodule InfluxElixir.Contract.SQLParser do
             expected =
               sp_coercion("Cannot infer common argument type for comparison operation " <> pair)
 
-            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where}") ==
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where}") ===
                      {:error, %{status: 400, body: expected}},
                    where
           end
 
-          assert sp_query(ctx, "SELECT v FROM #{m} WHERE time > '2023-11-14T22:13:19Z'") ==
+          assert sp_query(ctx, "SELECT v FROM #{m} WHERE time > '2023-11-14T22:13:19Z'") ===
                    {:ok, [%{"v" => 1.0}]}
         end
 
@@ -278,13 +348,13 @@ defmodule InfluxElixir.Contract.SQLParser do
             expected =
               sp_coercion("Cannot infer common argument type for comparison operation " <> pair)
 
-            assert sp_query(ctx, sql, %{t: value}) ==
+            assert sp_query(ctx, sql, %{t: value}) ===
                      {:error, %{status: 400, body: expected}},
                    sql
           end
         end
 
-        @tag :local_divergence
+        @tag local_divergence: "Local refuses a comparison in the select list by name"
         test "a comparison in the select list is the same error, or refused by name", ctx do
           m = sp_measurement("sp_timeselect")
           sp_write(ctx, ["#{m} v=1 #{sp_ns(0)}"])
@@ -298,7 +368,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                     "Timestamp(ns) > UInt64"
                 )
 
-          assert sp_query(ctx, "select time > $t as x from #{m}", %{t: 0}) ==
+          assert sp_query(ctx, "select time > $t as x from #{m}", %{t: 0}) ===
                    {:error, %{status: 400, body: expected}}
         end
 
@@ -341,7 +411,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {where <> "time BETWEEN '2023-11-14' AND $b", %{b: 5}, between.("UInt64")},
                 {where <> "time BETWEEN $a AND 5", %{a: "2023-11-14"}, between.("Int64")}
               ] do
-            assert sp_query(ctx, sql, params) == {:error, error}, sql
+            assert sp_query(ctx, sql, params) === {:error, error}, sql
           end
         end
       end
@@ -360,19 +430,19 @@ defmodule InfluxElixir.Contract.SQLParser do
           assert sp_query(ctx, select <> "time >= $a AND time < $b ORDER BY time", %{
                    a: at.(1),
                    b: at.(3)
-                 }) ==
+                 }) ===
                    {:ok, [%{"v" => 1}, %{"v" => 2}]}
 
           assert sp_query(ctx, select <> "time BETWEEN $a AND $b ORDER BY time", %{
                    a: at.(1),
                    b: at.(2)
-                 }) ==
+                 }) ===
                    {:ok, [%{"v" => 1}, %{"v" => 2}]}
 
-          assert sp_query(ctx, select <> "time IN ($a, $b) ORDER BY time", %{a: at.(1), b: at.(3)}) ==
+          assert sp_query(ctx, select <> "time IN ($a, $b) ORDER BY time", %{a: at.(1), b: at.(3)}) ===
                    {:ok, [%{"v" => 1}, %{"v" => 3}]}
 
-          assert sp_query(ctx, select <> "$a < time", %{a: at.(2)}) == {:ok, [%{"v" => 3}]}
+          assert sp_query(ctx, select <> "$a < time", %{a: at.(2)}) === {:ok, [%{"v" => 3}]}
         end
 
         test "a null is unknown: no row, and NOT of it no row either", ctx do
@@ -395,13 +465,13 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"time BETWEEN NULL AND NULL", nil},
                 {"time NOT BETWEEN #{old} AND $a", %{a: nil}}
               ] do
-            assert sp_query(ctx, select <> where, params) == {:ok, []}, where
+            assert sp_query(ctx, select <> where, params) === {:ok, []}, where
           end
 
           # Unknown AND false is false, so the NOT of it keeps every row.
           assert sp_query(ctx, select <> "time NOT BETWEEN $a AND #{old} ORDER BY time", %{
                    a: nil
-                 }) == all
+                 }) === all
         end
 
         test "an offset, a space, a lower case separator and UTC are timestamps", ctx do
@@ -421,10 +491,10 @@ defmodule InfluxElixir.Contract.SQLParser do
                 "2023-11-14T22:13:20.0000000009999Z",
                 "2023-11-14T22:13:20.000000000999999999999Z"
               ] do
-            assert sp_query(ctx, select <> "'#{text}'") == {:ok, [%{"v" => 0}]}, text
+            assert sp_query(ctx, select <> "'#{text}'") === {:ok, [%{"v" => 0}]}, text
           end
 
-          assert sp_query(ctx, "SELECT v FROM #{m} WHERE time > '2023-11-14T22:13:20.5Z'") ==
+          assert sp_query(ctx, "SELECT v FROM #{m} WHERE time > '2023-11-14T22:13:20.5Z'") ===
                    {:ok, [%{"v" => 1}]}
         end
       end
@@ -461,7 +531,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"2024-01-01T0:00:00", "error parsing time"},
                 {"2024-01-01T00:60:00", "error parsing time"}
               ] do
-            assert sp_query(ctx, select <> "time > '#{text}'") ==
+            assert sp_query(ctx, select <> "time > '#{text}'") ===
                      {:error, %{status: 500, body: sp_timestamp_error(text, reason)}},
                    text
           end
@@ -474,7 +544,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"2024-01-01T00:00:00 Z", "Z"},
                 {"2024-01-01T00:00:00 +01:00 ", "+01:00 "}
               ] do
-            assert sp_query(ctx, select <> "time > '#{text}'") ==
+            assert sp_query(ctx, select <> "time > '#{text}'") ===
                      {:error,
                       %{
                         status: 500,
@@ -512,15 +582,15 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"1000-01-01T00:00:00.100Z", "1000-01-01 00:00:00.100"},
                 {"1000-01-01T00:00:00.100123Z", "1000-01-01 00:00:00.100123"}
               ] do
-            assert sp_query(ctx, select <> "time > '#{text}'") ==
+            assert sp_query(ctx, select <> "time > '#{text}'") ===
                      {:error, %{status: 500, body: overflow.(shown)}},
                    text
           end
 
-          assert sp_query(ctx, select <> "time > '2262-04-11T23:47:16.854775807Z'") ==
+          assert sp_query(ctx, select <> "time > '2262-04-11T23:47:16.854775807Z'") ===
                    {:ok, []}
 
-          assert sp_query(ctx, select <> "time > '1677-09-22'") == {:ok, [%{"v" => 1.0}]}
+          assert sp_query(ctx, select <> "time > '1677-09-22'") === {:ok, [%{"v" => 1.0}]}
         end
 
         test "the same string is the same error in BETWEEN, IN, a parameter and on the left",
@@ -552,7 +622,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"NOT time > 'qq'", nil, "qq"},
                 {"host = 'a' AND (time > 'qq')", nil, "qq"}
               ] do
-            assert sp_query(ctx, select <> where, params) == bad.(text), where
+            assert sp_query(ctx, select <> where, params) === bad.(text), where
           end
         end
 
@@ -566,10 +636,10 @@ defmodule InfluxElixir.Contract.SQLParser do
               "Cannot infer common argument type for comparison operation Timestamp(ns) = Int64"
             )
 
-          assert sp_query(ctx, select <> "time = 5 AND time > 'qq'") ==
+          assert sp_query(ctx, select <> "time = 5 AND time > 'qq'") ===
                    {:error, %{status: 400, body: coercion}}
 
-          assert sp_query(ctx, select <> "time > 'qq' AND time = 5") ==
+          assert sp_query(ctx, select <> "time > 'qq' AND time = 5") ===
                    {:error, %{status: 400, body: coercion}}
 
           assert {:error, %{status: 500, body: "Schema error: No field named zz." <> _fields}} =
@@ -589,7 +659,7 @@ defmodule InfluxElixir.Contract.SQLParser do
           assert {:error, %{status: 400, body: avg}} =
                    sp_query(ctx, "SELECT AVG(time) AS a FROM #{m}")
 
-          assert avg ==
+          assert avg ===
                    "Error during planning: Execution error: Function 'avg' user-defined " <>
                      "coercion failed with \"Error during planning: Avg does not support " <>
                      "inputs of type Timestamp(ns).\" No function matches the given name and " <>
@@ -599,7 +669,7 @@ defmodule InfluxElixir.Contract.SQLParser do
           assert {:error, %{status: 400, body: sum}} =
                    sp_query(ctx, "SELECT SUM(time) AS a FROM #{m}")
 
-          assert sum ==
+          assert sum ===
                    "Error during planning: Execution error: Function 'sum' user-defined " <>
                      "coercion failed with \"Execution error: Sum not supported for " <>
                      "Timestamp(ns)\" No function matches the given name and argument types " <>
@@ -620,7 +690,7 @@ defmodule InfluxElixir.Contract.SQLParser do
           assert sp_query(
                    ctx,
                    "SELECT MIN(time) AS lo, MAX(time) AS hi, COUNT(time) AS n FROM #{m}"
-                 ) ==
+                 ) ===
                    {:ok,
                     [
                       %{
@@ -666,8 +736,8 @@ defmodule InfluxElixir.Contract.SQLParser do
           m = sp_measurement("sp_distinct")
           sp_write(ctx, ["#{m} price=1.5 #{sp_ns(0)}", "#{m} price=2.5 #{sp_ns(1)}"])
 
-          assert {:ok, [%{}]} = sp_query(ctx, "SELECT DISTINCT FROM #{m}")
-          assert {:ok, []} = sp_query(ctx, "SELECT DISTINCT FROM #{m} WHERE price > 100")
+          assert sp_query(ctx, "SELECT DISTINCT FROM #{m}") === {:ok, [%{}]}
+          assert sp_query(ctx, "SELECT DISTINCT FROM #{m} WHERE price > 100") === {:ok, []}
         end
 
         test "DISTINCT cannot ORDER BY a column it does not select", ctx do
@@ -691,10 +761,10 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"SELECT DISTINCT v FROM #{m} ORDER BY price + 1", "#{m}.price"},
                 {"SELECT DISTINCT FROM #{m} ORDER BY price", "#{m}.price"}
               ] do
-            assert sp_query(ctx, sql) == error.(names), sql
+            assert sp_query(ctx, sql) === error.(names), sql
           end
 
-          assert sp_query(ctx, "SELECT DISTINCT v FROM #{m} ORDER BY v DESC") ==
+          assert sp_query(ctx, "SELECT DISTINCT v FROM #{m} ORDER BY v DESC") ===
                    {:ok, [%{"v" => 1.0}]}
         end
 
@@ -723,7 +793,7 @@ defmodule InfluxElixir.Contract.SQLParser do
           sp_write(ctx, ["#{m} v=1 #{sp_ns(0)}", "#{m} v=2 #{sp_ns(1)}"])
 
           for tail <- ["LIMIT abc", "LIMIT 1 OFFSET abc"] do
-            assert sp_query(ctx, "SELECT v FROM #{m} #{tail}") ==
+            assert sp_query(ctx, "SELECT v FROM #{m} #{tail}") ===
                      {:error, %{status: 500, body: "Schema error: No field named abc."}},
                    tail
           end
@@ -738,10 +808,10 @@ defmodule InfluxElixir.Contract.SQLParser do
           assert {:error, %{status: 400, body: ^expected}} =
                    sp_query(ctx, "SELECT v FROM #{m} LIMIT 1 OFFSET 1.5")
 
-          assert sp_query(ctx, "SELECT v FROM #{m} ORDER BY time LIMIT NULL") ==
+          assert sp_query(ctx, "SELECT v FROM #{m} ORDER BY time LIMIT NULL") ===
                    {:ok, [%{"v" => 1.0}, %{"v" => 2.0}]}
 
-          assert sp_query(ctx, "SELECT v FROM #{m} ORDER BY time LIMIT NULL OFFSET NULL") ==
+          assert sp_query(ctx, "SELECT v FROM #{m} ORDER BY time LIMIT NULL OFFSET NULL") ===
                    {:ok, [%{"v" => 1.0}, %{"v" => 2.0}]}
         end
 
@@ -754,7 +824,7 @@ defmodule InfluxElixir.Contract.SQLParser do
             "#{m} offset=9i,v=3i #{sp_ns(2)}"
           ])
 
-          assert sp_query(ctx, "SELECT v FROM #{m} WHERE offset > 3 ORDER BY time LIMIT 2") ==
+          assert sp_query(ctx, "SELECT v FROM #{m} WHERE offset > 3 ORDER BY time LIMIT 2") ===
                    {:ok, [%{"v" => 1}, %{"v" => 3}]}
         end
       end
@@ -764,7 +834,8 @@ defmodule InfluxElixir.Contract.SQLParser do
   defp function_tests do
     quote location: :keep do
       describe "SQL parsing — contract: functions" do
-        @tag :local_divergence
+        @tag local_divergence:
+               "the engine suggests a different function from run to run; Local always names one"
         test "FIRST and LAST are not SQL functions", ctx do
           m = sp_measurement("sp_first")
           sp_write(ctx, ["#{m} v=1 #{sp_ns(0)}"])
@@ -779,7 +850,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                      sp_query(ctx, "SELECT #{name}(#{args}) AS a FROM #{m}")
 
             if sp_local?() do
-              assert body == prefix <> suggestion <> "'?", args
+              assert body === prefix <> suggestion <> "'?", args
             else
               assert String.starts_with?(body, prefix), body
               assert String.replace_prefix(body, prefix, "") =~ ~r/\A[a-z_0-9]+'\?\z/, body
@@ -787,7 +858,7 @@ defmodule InfluxElixir.Contract.SQLParser do
           end
         end
 
-        @tag :local_divergence
+        @tag local_divergence: "the engine answers a null that is there; Local refuses by name"
         test "round to a scale outside a double is null on the engine", ctx do
           m = sp_measurement("sp_round")
           sp_write(ctx, ["#{m} v=1 #{sp_ns(0)}"])
@@ -804,7 +875,7 @@ defmodule InfluxElixir.Contract.SQLParser do
 
             if sp_local?() do
               # A row cannot say "null, not missing", so the double refuses by name.
-              assert result ==
+              assert result ===
                        {:error,
                         %{
                           status: 400,
@@ -814,7 +885,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                               "result row here cannot hold"
                         }}
             else
-              assert result == {:ok, [%{"r" => nil}]}
+              assert result === {:ok, [%{"r" => nil}]}
             end
           end
 
@@ -839,10 +910,10 @@ defmodule InfluxElixir.Contract.SQLParser do
             assert sp_negative_zero?(row[key]), key
           end
 
-          assert row["i"] == 0.0
+          assert row["i"] === 0.0
           refute sp_negative_zero?(row["i"])
 
-          assert sp_query(ctx, "SELECT round(-0.5) AS a, round(-0.49, 1) AS b FROM #{m}") ==
+          assert sp_query(ctx, "SELECT round(-0.5) AS a, round(-0.49, 1) AS b FROM #{m}") ===
                    {:ok, [%{"a" => -1.0, "b" => -0.5}]}
         end
 
@@ -854,7 +925,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                    ctx,
                    "SELECT round(2.345, 2) AS a, round(-2.5) AS b, round(v, 300) AS c, " <>
                      "round(v, -308) AS d FROM #{m}"
-                 ) == {:ok, [%{"a" => 2.35, "b" => -3.0, "c" => 1.0, "d" => 0.0}]}
+                 ) === {:ok, [%{"a" => 2.35, "b" => -3.0, "c" => 1.0, "d" => 0.0}]}
         end
       end
     end
@@ -871,7 +942,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                    ctx,
                    "SELECT DATE_BIN(INTERVAL '60 seconds', time) AS t, MAX(v) AS m " <>
                      "FROM #{m} GROUP BY DATE_BIN(INTERVAL '1 minute', time)"
-                 ) == {:ok, [%{"t" => ~U[2023-11-14 22:13:00.000000Z], "m" => 3.0}]}
+                 ) === {:ok, [%{"t" => ~U[2023-11-14 22:13:00.000000Z], "m" => 3.0}]}
         end
 
         test "a position or an alias in GROUP BY is the select item", ctx do
@@ -883,12 +954,13 @@ defmodule InfluxElixir.Contract.SQLParser do
                      ctx,
                      "SELECT DATE_BIN(INTERVAL '1 minute', time) AS t, MAX(v) AS m " <>
                        "FROM #{m} GROUP BY #{group}"
-                   ) == {:ok, [%{"t" => ~U[2023-11-14 22:13:00.000000Z], "m" => 3.0}]},
+                   ) === {:ok, [%{"t" => ~U[2023-11-14 22:13:00.000000Z], "m" => 3.0}]},
                    group
           end
         end
 
-        @tag :local_divergence
+        @tag local_divergence:
+               "the engine words its planning error; Local refuses the query by name"
         test "a select-list bucket needs the GROUP BY's", ctx do
           m = sp_measurement("sp_datebin_group")
           sp_write(ctx, ["#{m} v=1 #{sp_ns(0)}"])
@@ -918,7 +990,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                    "nanoseconds: 2000000000 }\"),#{m}.time), max(#{m}.v)"}
               ] do
             body = if sp_local?(), do: local, else: engine.(terms)
-            assert sp_query(ctx, sql) == {:error, %{status: 400, body: body}}
+            assert sp_query(ctx, sql) === {:error, %{status: 400, body: body}}
           end
         end
       end
@@ -945,10 +1017,10 @@ defmodule InfluxElixir.Contract.SQLParser do
                 "select v from #{m} where host = /* 'a' */ 'b'",
                 "select v from #{m} where host = 'b' /* ; */ ;"
               ] do
-            assert sp_query(ctx, sql) == {:ok, [%{"v" => 2.0}]}, sql
+            assert sp_query(ctx, sql) === {:ok, [%{"v" => 2.0}]}, sql
           end
 
-          assert sp_query(ctx, "select v from #{m} where s = 'a -- b /* c'") ==
+          assert sp_query(ctx, "select v from #{m} where s = 'a -- b /* c'") ===
                    {:ok, [%{"v" => 3.0}]}
         end
 
@@ -965,7 +1037,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"select v from #{m} where host='b';-- done", [%{"v" => 2.0}]},
                 {"select ';' as x from #{m} limit 1", [%{"x" => ";"}]}
               ] do
-            assert sp_query(ctx, sql) == {:ok, rows}, sql
+            assert sp_query(ctx, sql) === {:ok, rows}, sql
           end
         end
 
@@ -976,7 +1048,7 @@ defmodule InfluxElixir.Contract.SQLParser do
           none = "Error during planning: No SQL statements were provided in the query string"
 
           for sql <- ["", "  ", ";", ";;", "-- only a comment", "/* c */"] do
-            assert sp_query(ctx, sql) == {:error, %{status: 400, body: none}}, sql
+            assert sp_query(ctx, sql) === {:error, %{status: 400, body: none}}, sql
           end
 
           two =
@@ -984,7 +1056,7 @@ defmodule InfluxElixir.Contract.SQLParser do
               "The context currently only supports a single SQL statement"
 
           for sql <- ["select 1; select 2", "select 1;select v from #{m};"] do
-            assert sp_query(ctx, sql) == {:error, %{status: 405, body: two}}, sql
+            assert sp_query(ctx, sql) === {:error, %{status: 405, body: two}}, sql
           end
         end
 
@@ -1003,12 +1075,12 @@ defmodule InfluxElixir.Contract.SQLParser do
               ] do
             column = String.length(head) + offset + 1
 
-            assert sp_query(ctx, head <> tail) ==
+            assert sp_query(ctx, head <> tail) ===
                      {:error, %{status: 400, body: sp_tokenizer(message, 1, column)}},
                    tail
           end
 
-          assert sp_query(ctx, "select *\nfrom #{m}\nwhere host = 'a") ==
+          assert sp_query(ctx, "select *\nfrom #{m}\nwhere host = 'a") ===
                    {:error,
                     %{
                       status: 400,
@@ -1029,7 +1101,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {head <> "$a$b", "Unterminated dollar-quoted, expected $"},
                 {head <> "$a$b$", "Unterminated dollar-quoted, expected $"}
               ] do
-            assert sp_query(ctx, sql) ==
+            assert sp_query(ctx, sql) ===
                      {:error,
                       %{status: 400, body: sp_tokenizer(message, 1, String.length(sql) + 1)}},
                    sql
@@ -1047,7 +1119,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"host = $x$ $$ it's $$ $x$ or host = 'b'", 2.0}
               ] do
             sql = "select v from #{m} where #{where}"
-            assert sp_query(ctx, sql) == {:ok, [%{"v" => v}]}, sql
+            assert sp_query(ctx, sql) === {:ok, [%{"v" => v}]}, sql
           end
         end
 
@@ -1056,10 +1128,10 @@ defmodule InfluxElixir.Contract.SQLParser do
           mark = <<0x0301::utf8>>
           sp_write(ctx, ["#{m},k=#{mark}x v=1 #{sp_ns(0)}", "#{m},k=x v=2 #{sp_ns(1)}"])
 
-          assert sp_query(ctx, "select v from #{m} where k = '#{mark}x'") ==
+          assert sp_query(ctx, "select v from #{m} where k = '#{mark}x'") ===
                    {:ok, [%{"v" => 1.0}]}
 
-          assert sp_query(ctx, "select v from #{m} where k in ('#{mark}x', 'zz')") ==
+          assert sp_query(ctx, "select v from #{m} where k in ('#{mark}x', 'zz')") ===
                    {:ok, [%{"v" => 1.0}]}
         end
       end
@@ -1082,7 +1154,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"host = E'b\\\\' OR host = E'\\u0062'", 2.0}
               ] do
             sql = "select v from #{m} where #{where}"
-            assert sp_query(ctx, sql) == {:ok, [%{"v" => v}]}, sql
+            assert sp_query(ctx, sql) === {:ok, [%{"v" => v}]}, sql
           end
 
           # `\b \f \n \r \t`, `\x` with one or two hex digits (none is an x),
@@ -1107,10 +1179,10 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {~S[''], "'"}
               ] do
             sql = "select E'#{text}' as x from #{m} limit 1"
-            assert sp_query(ctx, sql) == {:ok, [%{"x" => value}]}, sql
+            assert sp_query(ctx, sql) === {:ok, [%{"x" => value}]}, sql
           end
 
-          assert sp_query(ctx, "select E'a' as x, e'b' as y, 'E''z' as z from #{m} limit 1") ==
+          assert sp_query(ctx, "select E'a' as x, e'b' as y, 'E''z' as z from #{m} limit 1") ===
                    {:ok, [%{"x" => "a", "y" => "b", "z" => "E'z"}]}
         end
 
@@ -1141,7 +1213,7 @@ defmodule InfluxElixir.Contract.SQLParser do
               ] do
             sql = head <> "E'#{text}' as x from #{m}"
 
-            assert sp_query(ctx, sql) ==
+            assert sp_query(ctx, sql) ===
                      {:error,
                       %{
                         status: 400,
@@ -1157,7 +1229,7 @@ defmodule InfluxElixir.Contract.SQLParser do
 
           sql = "select 1 as a,\n  E'abc as x from #{m}"
 
-          assert sp_query(ctx, sql) ==
+          assert sp_query(ctx, sql) ===
                    {:error,
                     %{
                       status: 400,
@@ -1187,10 +1259,10 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {~s|select "fé" from #{m} where é = 1 order by é|, %{"fé" => "x"}},
                 {"select fé from #{m} where fé = 'x'", %{"fé" => "x"}}
               ] do
-            assert sp_query(ctx, sql) == {:ok, [row]}, sql
+            assert sp_query(ctx, sql) === {:ok, [row]}, sql
           end
 
-          assert sp_query(ctx, ~s|select * from #{m} where "é" > 0|) ==
+          assert sp_query(ctx, ~s|select * from #{m} where "é" > 0|) ===
                    {:ok, [%{"fé" => "x", "é" => 1, "time" => ~U[2023-11-14 22:13:20.000000Z]}]}
         end
 
@@ -1200,8 +1272,12 @@ defmodule InfluxElixir.Contract.SQLParser do
 
           # `FÉ` is `fÉ`, a column that does not exist, and a name with a
           # letter outside ASCII is quoted when the engine prints it.
-          assert {:error, %{status: 500, body: body}} = sp_query(ctx, "select FÉ from #{m}")
-          assert sp_unknown_field(body, ~s|"fÉ"|, m) == ["fé", "time", "v"]
+          assert sp_query(ctx, "select FÉ from #{m}") ===
+                   {:error,
+                    %{
+                      status: 500,
+                      body: sp_no_field(~s|"fÉ"|, sp_fields(m, ["fé", "time", "v"]))
+                    }}
         end
 
         test "a name that needs its quotes is printed quoted, a quote doubled", ctx do
@@ -1229,38 +1305,49 @@ defmodule InfluxElixir.Contract.SQLParser do
                   "select v from #{m} where host = #{name}",
                   "select v from #{m} where host in (#{name}, 'a')"
                 ] do
-              assert {:error, %{status: 500, body: body}} = sp_query(ctx, sql)
-              assert sp_unknown_field(body, shown, m) == ["host", "time", "v"], sql
+              assert sp_query(ctx, sql) ===
+                       {:error,
+                        %{
+                          status: 500,
+                          body: sp_no_field(shown, sp_fields(m, ["host", "time", "v"]))
+                        }},
+                     sql
             end
           end
 
           # Wherever else a column may stand.
+          table = sp_fields(m, ["host", "time", "v"])
+
+          # ORDER BY lists the select list's fields before the table's.
           for name <- [~s|"Host"|, ~s|"a b"|, ~s|"ho""st"|],
-              sql <- [
-                "select v from #{m} where #{name}",
-                "select v from #{m} where not #{name}",
-                "select v from #{m} where #{name} is null",
-                "select v from #{m} where #{name} like 'a'",
-                "select v from #{m} where #{name} between 'a' and 'z'",
-                "select v from #{m} where host between #{name} and 'z'",
-                "select v from #{m} where host not between 'a' and #{name}",
-                "select v from #{m} order by #{name}",
-                "select v from #{m} order by host, #{name} desc"
+              {sql, listed} <- [
+                {"select v from #{m} where #{name}", table},
+                {"select v from #{m} where not #{name}", table},
+                {"select v from #{m} where #{name} is null", table},
+                {"select v from #{m} where #{name} like 'a'", table},
+                {"select v from #{m} where #{name} between 'a' and 'z'", table},
+                {"select v from #{m} where host between #{name} and 'z'", table},
+                {"select v from #{m} where host not between 'a' and #{name}", table},
+                {"select v from #{m} order by #{name}", sp_fields(m, ["v"]) ++ table},
+                {"select v from #{m} order by host, #{name} desc", sp_fields(m, ["v"]) ++ table}
               ] do
-            assert {:error, %{status: 500, body: body}} = sp_query(ctx, sql)
-            assert sp_unknown_field(body, name, m) == ["host", "time", "v"], sql
+            assert sp_query(ctx, sql) ===
+                     {:error, %{status: 500, body: sp_no_field(name, listed)}},
+                   sql
           end
 
           # The same column by a quoted name, and a double quote is never a string.
-          assert sp_query(ctx, ~s|select v from #{m} where "host" = 'a'|) == {:ok, [%{"v" => 1}]}
+          assert sp_query(ctx, ~s|select v from #{m} where "host" = 'a'|) === {:ok, [%{"v" => 1}]}
 
-          assert sp_query(ctx, ~s|select v from #{m} where host = "host"|) ==
+          assert sp_query(ctx, ~s|select v from #{m} where host = "host"|) ===
                    {:ok, [%{"v" => 1}]}
 
-          assert {:error, %{status: 500, body: body}} =
-                   sp_query(ctx, ~s|select v from #{m} where host = "$h"|, %{h: "a"})
-
-          assert sp_unknown_field(body, ~s|"$h"|, m) == ["host", "time", "v"]
+          assert sp_query(ctx, ~s|select v from #{m} where host = "$h"|, %{h: "a"}) ===
+                   {:error,
+                    %{
+                      status: 500,
+                      body: sp_no_field(~s|"$h"|, sp_fields(m, ["host", "time", "v"]))
+                    }}
         end
       end
     end
@@ -1292,7 +1379,7 @@ defmodule InfluxElixir.Contract.SQLParser do
           )
 
           for {value, i} <- Enum.with_index(values, 1) do
-            assert sp_query(ctx, "select v from #{m} where s = $p", %{p: value}) ==
+            assert sp_query(ctx, "select v from #{m} where s = $p", %{p: value}) ===
                      {:ok, [%{"v" => i}]},
                    value
           end
@@ -1302,7 +1389,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                    ctx,
                    "select v from #{m} where s = '$x' or v = $p order by time",
                    %{p: 0}
-                 ) == {:ok, [%{"v" => 0}, %{"v" => 3}]}
+                 ) === {:ok, [%{"v" => 0}, %{"v" => 3}]}
         end
 
         test "a string of 200 KB is bound as it is", ctx do
@@ -1310,7 +1397,7 @@ defmodule InfluxElixir.Contract.SQLParser do
           big = String.duplicate("a", 200_000)
           sp_write(ctx, [~s|#{m} v=1i,s="#{big}" #{sp_ns(0)}|, ~s|#{m} v=2i,s="b" #{sp_ns(1)}|])
 
-          assert sp_query(ctx, "select v from #{m} where s = $p", %{p: big}) ==
+          assert sp_query(ctx, "select v from #{m} where s = $p", %{p: big}) ===
                    {:ok, [%{"v" => 1}]}
         end
 
@@ -1320,20 +1407,20 @@ defmodule InfluxElixir.Contract.SQLParser do
           sp_write(ctx, ["#{m} v=1i #{sp_ns(0)}", "#{m} v=2i #{sp_ns(1)}"])
           rows = {:ok, [%{"v" => 2}]}
 
-          assert sp_query(ctx, "select v from #{m} where v = $é", %{"é" => 2}) == rows
-          assert sp_query(ctx, "select v from #{m} where v = $1", %{"1" => 2}) == rows
+          assert sp_query(ctx, "select v from #{m} where v = $é", %{"é" => 2}) === rows
+          assert sp_query(ctx, "select v from #{m} where v = $1", %{"1" => 2}) === rows
 
           assert sp_query(ctx, "select v from #{m} where v = $a or v = $b order by time", %{
                    a: 1,
                    b: 2
-                 }) == {:ok, [%{"v" => 1}, %{"v" => 2}]}
+                 }) === {:ok, [%{"v" => 1}, %{"v" => 2}]}
 
-          assert sp_query(ctx, "select v from #{m} where v = $ab", %{a: 1, ab: 2}) == rows
+          assert sp_query(ctx, "select v from #{m} where v = $ab", %{a: 1, ab: 2}) === rows
 
           # `$a$b` opens a dollar-quoted string, so the tokenizer refuses it.
           sql = "select v from #{m} where v = $a$b"
 
-          assert sp_query(ctx, sql, %{a: 1, b: 2}) ==
+          assert sp_query(ctx, sql, %{a: 1, b: 2}) ===
                    {:error,
                     %{
                       status: 400,
@@ -1358,15 +1445,15 @@ defmodule InfluxElixir.Contract.SQLParser do
              }}
           end
 
-          assert sp_query(ctx, "select v from #{m} where v = $zz") == unbound.("zz")
-          assert sp_query(ctx, "select v from #{m} where v = $zz", %{a: 1}) == unbound.("zz")
-          assert sp_query(ctx, "select v from #{m} where v = $a", %{"$a" => 1}) == unbound.("a")
-          assert sp_query(ctx, "select v from #{m} where v = $1", %{a: 1}) == unbound.("1")
+          assert sp_query(ctx, "select v from #{m} where v = $zz") === unbound.("zz")
+          assert sp_query(ctx, "select v from #{m} where v = $zz", %{a: 1}) === unbound.("zz")
+          assert sp_query(ctx, "select v from #{m} where v = $a", %{"$a" => 1}) === unbound.("a")
+          assert sp_query(ctx, "select v from #{m} where v = $1", %{a: 1}) === unbound.("1")
 
           # The missing table is found first.
           missing = "#{m}_missing"
 
-          assert sp_query(ctx, "select v from #{missing} where v = $zz") ==
+          assert sp_query(ctx, "select v from #{missing} where v = $zz") ===
                    {:error,
                     %{
                       status: 400,
@@ -1388,30 +1475,30 @@ defmodule InfluxElixir.Contract.SQLParser do
             "#{m},host=b v=2i,f=2.5 #{sp_ns(1)}"
           ])
 
-          assert sp_query(ctx, "select v from #{m} where host = $host", host: "b") ==
+          assert sp_query(ctx, "select v from #{m} where host = $host", host: "b") ===
                    {:ok, [%{"v" => 2}]}
 
-          assert sp_query(ctx, "select v from #{m} where v = $p", %{p: nil}) == {:ok, []}
+          assert sp_query(ctx, "select v from #{m} where v = $p", %{p: nil}) === {:ok, []}
 
           assert sp_query(ctx, "select v from #{m} where v in ($a, $b) order by time", %{
                    a: nil,
                    b: 1
-                 }) == {:ok, [%{"v" => 1}]}
+                 }) === {:ok, [%{"v" => 1}]}
 
-          assert sp_query(ctx, "select v from #{m} where f < $p order by time", %{p: 1.0e20}) ==
+          assert sp_query(ctx, "select v from #{m} where f < $p order by time", %{p: 1.0e20}) ===
                    {:ok, [%{"v" => 1}, %{"v" => 2}]}
 
           assert sp_query(ctx, "select v from #{m} where v < $p order by time", %{
                    p: 18_446_744_073_709_551_616
-                 }) == {:ok, [%{"v" => 1}, %{"v" => 2}]}
+                 }) === {:ok, [%{"v" => 1}, %{"v" => 2}]}
 
-          assert sp_query(ctx, "select v from #{m} where v between $a and $b", %{a: nil, b: 2}) ==
+          assert sp_query(ctx, "select v from #{m} where v between $a and $b", %{a: nil, b: 2}) ===
                    {:ok, []}
 
           assert sp_query(ctx, "select v from #{m} where v between $a and $b order by time", %{
                    a: 1,
                    b: 2
-                 }) == {:ok, [%{"v" => 1}, %{"v" => 2}]}
+                 }) === {:ok, [%{"v" => 1}, %{"v" => 2}]}
         end
 
         test "LIMIT and OFFSET take a parameter as they take a literal", ctx do
@@ -1419,10 +1506,10 @@ defmodule InfluxElixir.Contract.SQLParser do
           sp_write(ctx, for(i <- 1..3, do: "#{m} v=#{i}i #{sp_ns(i)}"))
           order = "select v from #{m} order by time"
 
-          assert sp_query(ctx, order <> " limit $n offset $o", %{n: 2, o: 1}) ==
+          assert sp_query(ctx, order <> " limit $n offset $o", %{n: 2, o: 1}) ===
                    {:ok, [%{"v" => 2}, %{"v" => 3}]}
 
-          assert sp_query(ctx, order <> " limit $n", %{n: nil}) ==
+          assert sp_query(ctx, order <> " limit $n", %{n: nil}) ===
                    {:ok, [%{"v" => 1}, %{"v" => 2}, %{"v" => 3}]}
 
           optimizer = fn rule, message ->
@@ -1445,13 +1532,14 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {" limit $n offset $o", %{n: -1, o: -1},
                  optimizer.("eliminate_limit", "LIMIT must be >= 0, '-1' was provided")}
               ] do
-            assert sp_query(ctx, order <> tail, params) ==
+            assert sp_query(ctx, order <> tail, params) ===
                      {:error, %{status: 400, body: body}},
                    tail
           end
         end
 
-        @tag :local_divergence
+        @tag local_divergence:
+               "the engine words the error with the column's type; Local refuses by name"
         test "a LIKE pattern is a string parameter", ctx do
           m = sp_measurement("sp_param_like")
 
@@ -1460,16 +1548,16 @@ defmodule InfluxElixir.Contract.SQLParser do
             ~s|#{m} v=2i,s="Banana" #{sp_ns(1)}|
           ])
 
-          assert sp_query(ctx, "select v from #{m} where s like $p", %{p: "a%"}) ==
+          assert sp_query(ctx, "select v from #{m} where s like $p", %{p: "a%"}) ===
                    {:ok, [%{"v" => 1}]}
 
-          assert sp_query(ctx, "select v from #{m} where s ilike $p", %{p: "b%"}) ==
+          assert sp_query(ctx, "select v from #{m} where s ilike $p", %{p: "b%"}) ===
                    {:ok, [%{"v" => 2}]}
 
-          assert sp_query(ctx, "select v from #{m} where s not like $p", %{p: "a%"}) ==
+          assert sp_query(ctx, "select v from #{m} where s not like $p", %{p: "a%"}) ===
                    {:ok, [%{"v" => 2}]}
 
-          assert sp_query(ctx, "select v from #{m} where s ~ $p", %{p: "^B"}) ==
+          assert sp_query(ctx, "select v from #{m} where s ~ $p", %{p: "^B"}) ===
                    {:ok, [%{"v" => 2}]}
 
           result = sp_query(ctx, "select v from #{m} where s like $p", %{p: 5})
@@ -1483,7 +1571,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                   "There isn't a common type to coerce Utf8 and UInt64 in LIKE expression"
                 )
 
-          assert result == {:error, %{status: 400, body: expected}}
+          assert result === {:error, %{status: 400, body: expected}}
         end
       end
     end
@@ -1506,9 +1594,9 @@ defmodule InfluxElixir.Contract.SQLParser do
 
           # As text "500" would sort after "1000.00", so a Decimal sent as a
           # string would match no row.
-          assert sp_query(ctx, select <> "n < $p", %{p: Decimal.new("1000.00")}) == first
-          assert sp_query(ctx, select <> "n < $p", %{p: Decimal.new("1.2E+3")}) == first
-          assert sp_query(ctx, select <> "n < $p", %{p: "1000.00"}) == {:ok, []}
+          assert sp_query(ctx, select <> "n < $p", %{p: Decimal.new("1000.00")}) === first
+          assert sp_query(ctx, select <> "n < $p", %{p: Decimal.new("1.2E+3")}) === first
+          assert sp_query(ctx, select <> "n < $p", %{p: "1000.00"}) === {:ok, []}
 
           for {where, value} <- [
                 {"time = $p", ~U[2023-11-14 22:13:20.000000Z]},
@@ -1517,12 +1605,12 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"s = $p", :name},
                 {"s = $p", "name"}
               ] do
-            assert sp_query(ctx, select <> "(" <> where <> ") AND n < 1000", %{p: value}) ==
+            assert sp_query(ctx, select <> "(" <> where <> ") AND n < 1000", %{p: value}) ===
                      first,
                    where <> " " <> inspect(value)
           end
 
-          assert sp_query(ctx, select <> "time >= $p ORDER BY time", %{p: ~D[2023-11-14]}) ==
+          assert sp_query(ctx, select <> "time >= $p ORDER BY time", %{p: ~D[2023-11-14]}) ===
                    {:ok, [%{"n" => 500}, %{"n" => 2000}]}
         end
 
@@ -1535,23 +1623,23 @@ defmodule InfluxElixir.Contract.SQLParser do
                    ctx,
                    "select $a as x, v + $b as y, f - $c as z from #{m} order by time limit 1",
                    %{a: "s", b: 2, c: -2}
-                 ) == {:ok, [%{"x" => "s", "y" => 3, "z" => 3.5}]}
+                 ) === {:ok, [%{"x" => "s", "y" => 3, "z" => 3.5}]}
 
-          assert sp_query(ctx, "select $p as x, count(*) as n from #{m}", %{p: 7}) ==
+          assert sp_query(ctx, "select $p as x, count(*) as n from #{m}", %{p: 7}) ===
                    {:ok, [%{"x" => 7, "n" => 3}]}
 
           assert sp_query(ctx, "select $q as x, v - $p as y from #{m} order by time limit 1", %{
                    q: 1.5,
                    p: 7
-                 }) == {:ok, [%{"x" => 1.5, "y" => -6}]}
+                 }) === {:ok, [%{"x" => 1.5, "y" => -6}]}
 
-          assert sp_query(ctx, "select sum(v * $b) as t from #{m}", %{b: 2}) ==
+          assert sp_query(ctx, "select sum(v * $b) as t from #{m}", %{b: 2}) ===
                    {:ok, [%{"t" => 12}]}
 
           assert sp_query(ctx, "select v from #{m} where v * $b > $c order by time", %{
                    b: 2,
                    c: 3
-                 }) == {:ok, [%{"v" => 2}, %{"v" => 3}]}
+                 }) === {:ok, [%{"v" => 2}, %{"v" => 3}]}
         end
 
         test "a parameter is bound inside a CTE", ctx do
@@ -1560,15 +1648,1072 @@ defmodule InfluxElixir.Contract.SQLParser do
 
           assert sp_query(ctx, "with c as (select v from #{m} where v > $b) select v from c", %{
                    b: 2
-                 }) == {:ok, [%{"v" => 3}]}
+                 }) === {:ok, [%{"v" => 3}]}
 
           assert sp_query(
                    ctx,
                    "with c as (select v, $a as s from #{m}) select v, s from c order by v",
                    %{a: "s"}
-                 ) ==
+                 ) ===
                    {:ok,
                     [%{"v" => 1, "s" => "s"}, %{"v" => 2, "s" => "s"}, %{"v" => 3, "s" => "s"}]}
+        end
+      end
+    end
+  end
+
+  defp unaliased_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: select items without an alias" do
+        test "an aggregate is named as the engine names it", ctx do
+          m = sp_fixture(ctx)
+          first = ~U[2023-11-14 22:13:20.000000Z]
+
+          for {select, row} <- [
+                {"count(*)", %{"count(*)" => 3}},
+                {"COUNT(1)", %{"count(Int64(1))" => 3}},
+                {"Count(V)", %{"count(#{m}.v)" => 3}},
+                {"count(DISTINCT h)", %{"count(DISTINCT #{m}.h)" => 2}},
+                {"sum(v), avg(v), min(v), max(v), median(v)",
+                 %{
+                   "sum(#{m}.v)" => 6,
+                   "avg(#{m}.v)" => 2.0,
+                   "min(#{m}.v)" => 1,
+                   "max(#{m}.v)" => 3,
+                   "median(#{m}.v)" => 2
+                 }},
+                {"stddev(v), STDDEV_SAMP(v), stddev_pop(v)",
+                 %{
+                   "stddev(#{m}.v)" => 1.0,
+                   "stddev_samp(#{m}.v)" => 1.0,
+                   "stddev_pop(#{m}.v)" => 0.816496580927726
+                 }},
+                {"var(v), var_samp(v), var_pop(v)",
+                 %{
+                   "var(#{m}.v)" => 1.0,
+                   "var_samp(#{m}.v)" => 1.0,
+                   "var_pop(#{m}.v)" => 0.6666666666666666
+                 }},
+                {"max(time), count(time)",
+                 %{"max(#{m}.time)" => ~U[2023-11-14 22:15:20.000000Z], "count(#{m}.time)" => 3}},
+                {"sum(v * 2)", %{"sum(#{m}.v * Int64(2))" => 12}},
+                {"sum((v + 1) * 2)", %{"sum(#{m}.v + Int64(1) * Int64(2))" => 18}},
+                {"avg(-v)", %{"avg((- #{m}.v))" => -2.0}},
+                {"sum(abs(v))", %{"sum(abs(#{m}.v))" => 6}},
+                {"sum(round(f, 1))", %{"sum(round(#{m}.f,Int64(1)))" => 7.5}},
+                {"sum(1.5 * v)", %{"sum(Float64(1.5) * #{m}.v)" => 9.0}},
+                {"sum(v / 2), sum(v % 2)",
+                 %{"sum(#{m}.v / Int64(2))" => 2, "sum(#{m}.v % Int64(2))" => 2}},
+                # A cast is not part of the name.
+                {"sum(CAST(v AS DOUBLE))", %{"sum(#{m}.v)" => 6.0}},
+                {"sum(v::DOUBLE)", %{"sum(#{m}.v)" => 6.0}},
+                {"first_value(v ORDER BY time)",
+                 %{"first_value(#{m}.v) ORDER BY [#{m}.time ASC NULLS LAST]" => 1}},
+                {"first_value(v ORDER BY time DESC)",
+                 %{"first_value(#{m}.v) ORDER BY [#{m}.time DESC NULLS FIRST]" => 3}},
+                {"last_value(v ORDER BY time ASC)",
+                 %{"last_value(#{m}.v) ORDER BY [#{m}.time ASC NULLS LAST]" => 3}},
+                {"selector_first(v, time)",
+                 %{"selector_first(#{m}.v,#{m}.time)" => %{"value" => 1, "time" => first}}},
+                {"selector_last(v, time)['value']",
+                 %{"selector_last(#{m}.v,#{m}.time)[value]" => 3}},
+                {"selector_min(v, time)['time']",
+                 %{"selector_min(#{m}.v,#{m}.time)[time]" => first}}
+              ] do
+            assert sp_query(ctx, "SELECT #{select} FROM #{m}") === {:ok, [row]}, select
+          end
+        end
+
+        test "a column, a constant or an expression is named as the engine names it", ctx do
+          m = sp_fixture(ctx)
+
+          for {select, row} <- [
+                {"v", %{"v" => 1}},
+                {"#{m}.v", %{"v" => 1}},
+                {"1", %{"Int64(1)" => 1}},
+                {"-1", %{"Int64(-1)" => -1}},
+                {"1.5", %{"Float64(1.5)" => 1.5}},
+                {"1.0", %{"Float64(1)" => 1.0}},
+                {"1e20", %{"Float64(100000000000000000000)" => 1.0e20}},
+                {"1e-7", %{"Float64(0.0000001)" => 1.0e-7}},
+                {".5", %{"Float64(0.5)" => 0.5}},
+                {"'x'", %{~s|Utf8("x")| => "x"}},
+                {"'it''s'", %{~s|Utf8("it's")| => "it's"}},
+                {"true", %{"Boolean(true)" => true}},
+                {"NULL", %{}},
+                {"-v", %{"(- #{m}.v)" => -1}},
+                {"abs(v)", %{"abs(#{m}.v)" => 1}},
+                {"ABS(-v)", %{"abs((- #{m}.v))" => 1}},
+                {"round(f, 1)", %{"round(#{m}.f,Int64(1))" => 1.5}},
+                {"round(f)", %{"round(#{m}.f)" => 2.0}},
+                {"floor(f), ceil(f)", %{"floor(#{m}.f)" => 1.0, "ceil(#{m}.f)" => 2.0}},
+                {"(v + 1) * 2", %{"#{m}.v + Int64(1) * Int64(2)" => 4}},
+                {"v / 2", %{"#{m}.v / Int64(2)" => 0}},
+                {"v % 2", %{"#{m}.v % Int64(2)" => 1}},
+                {"v * -2", %{"#{m}.v * Int64(-2)" => -2}},
+                {"2 * -v", %{"Int64(2) * (- #{m}.v)" => -2}},
+                {"v - -1", %{"#{m}.v - Int64(-1)" => 2}},
+                {"- -v", %{"(- (- #{m}.v))" => 1}},
+                {"v + f", %{"#{m}.v + #{m}.f" => 2.5}},
+                {"#{m}.v + 1", %{"#{m}.v + Int64(1)" => 2}},
+                {"abs(v) + 1", %{"abs(#{m}.v) + Int64(1)" => 2}},
+                {"round(v * 1.5, 2)", %{"round(#{m}.v * Float64(1.5),Int64(2))" => 1.5}},
+                {"CAST(v AS DOUBLE)", %{"#{m}.v" => 1.0}},
+                {"v::DOUBLE", %{"#{m}.v" => 1.0}},
+                {"CAST(f AS INTEGER)", %{"#{m}.f" => 1}},
+                {"CAST(v AS VARCHAR)", %{"#{m}.v" => "1"}},
+                {"CAST(v AS DOUBLE) * 2", %{"#{m}.v * Int64(2)" => 2.0}},
+                {"h, v * 2", %{"h" => "a", "#{m}.v * Int64(2)" => 2}}
+              ] do
+            sql = "SELECT #{select} FROM #{m} ORDER BY time LIMIT 1"
+            assert sp_query(ctx, sql) === {:ok, [row]}, select
+          end
+        end
+      end
+    end
+  end
+
+  defp grouped_name_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: select items without an alias, grouped and aliased" do
+        test "a grouped query names its items, and ORDER BY finds them by name or position",
+             ctx do
+          m = sp_fixture(ctx)
+
+          bucket = fn interval ->
+            "date_bin(IntervalMonthDayNano(\"IntervalMonthDayNano { months: 0, days: #{elem(interval, 0)}, " <>
+              "nanoseconds: #{elem(interval, 1)} }\"),#{m}.time)"
+          end
+
+          assert sp_query(ctx, "SELECT h, count(*) FROM #{m} GROUP BY h ORDER BY h") ===
+                   {:ok, [%{"h" => "a", "count(*)" => 2}, %{"h" => "b", "count(*)" => 1}]}
+
+          hour = bucket.({0, 3_600_000_000_000})
+          two_days = bucket.({2, 0})
+          thirty_six_hours = bucket.({0, 129_600_000_000_000})
+
+          for {interval, key, start} <- [
+                {"1 hour", hour, ~U[2023-11-14 22:00:00.000000Z]},
+                {"2 days", two_days, ~U[2023-11-13 00:00:00.000000Z]},
+                {"36 hours", thirty_six_hours, ~U[2023-11-14 12:00:00.000000Z]}
+              ] do
+            assert sp_query(
+                     ctx,
+                     "SELECT date_bin(INTERVAL '#{interval}', time), count(*) FROM #{m} GROUP BY 1"
+                   ) === {:ok, [%{key => start, "count(*)" => 3}]},
+                   interval
+          end
+
+          by_sum = {:ok, [%{"h" => "b", "sum(#{m}.v)" => 2}, %{"h" => "a", "sum(#{m}.v)" => 4}]}
+
+          for order <- ["2", "sum(v)", ~s|"sum(#{m}.v)"|, "SUM( v )"] do
+            assert sp_query(
+                     ctx,
+                     "SELECT h, sum(v) FROM #{m} GROUP BY h ORDER BY #{order}"
+                   ) === by_sum,
+                   order
+          end
+
+          assert sp_query(ctx, "SELECT h, sum(v) AS s FROM #{m} GROUP BY h ORDER BY sum(v) DESC") ===
+                   {:ok, [%{"h" => "a", "s" => 4}, %{"h" => "b", "s" => 2}]}
+
+          assert sp_query(ctx, "SELECT v * 2 FROM #{m} ORDER BY 1 DESC LIMIT 1") ===
+                   {:ok, [%{"#{m}.v * Int64(2)" => 6}]}
+
+          assert sp_query(ctx, ~s|SELECT v * 2 FROM #{m} ORDER BY "#{m}.v * Int64(2)" LIMIT 1|) ===
+                   {:ok, [%{"#{m}.v * Int64(2)" => 2}]}
+        end
+
+        test "a table alias is the qualifier in the name", ctx do
+          m = sp_fixture(ctx)
+
+          for from <- ["#{m} AS t", "#{m} t"] do
+            assert sp_query(ctx, "SELECT t.v * 2, t.v FROM #{from} ORDER BY time LIMIT 1") ===
+                     {:ok, [%{"t.v * Int64(2)" => 2, "v" => 1}]}
+
+            assert sp_query(ctx, "SELECT sum(v) FROM #{from}") === {:ok, [%{"sum(t.v)" => 6}]}
+          end
+        end
+
+        test "a parameter is named by its placeholder", ctx do
+          m = sp_fixture(ctx)
+
+          assert sp_query(
+                   ctx,
+                   "SELECT $p, $p + 1 AS q, v + $p FROM #{m} ORDER BY time LIMIT 1",
+                   %{p: 5}
+                 ) === {:ok, [%{"$p" => 5, "q" => 6, "#{m}.v + $p" => 6}]}
+        end
+
+        @tag local_divergence:
+               "the engine words its planning error; Local refuses the list by name"
+        test "two items with the same name are refused", ctx do
+          m = sp_fixture(ctx)
+
+          for {select, shown} <- [
+                {"v, v", ["#{m}.v", "#{m}.v"]},
+                {"v * 2, v * 2", ["#{m}.v * Int64(2)", "#{m}.v * Int64(2)"]},
+                {"1, 1", ["Int64(1)", "Int64(1)"]},
+                {"sum(v), sum(v)", ["sum(#{m}.v)", "sum(#{m}.v)"]},
+                {"v AS a, h AS a", ["#{m}.v AS a", "#{m}.h AS a"]}
+              ] do
+            [first, second] = shown
+
+            expected =
+              ~s|Error during planning: Projections require unique expression names but the | <>
+                ~s|expression "#{first}" at position 0 and "#{second}" at position 1 have | <>
+                ~s|the same name. Consider aliasing ("AS") one of them.|
+
+            assert {:error, %{status: 400, body: body}} =
+                     sp_query(ctx, "SELECT #{select} FROM #{m}")
+
+            if sp_local?(),
+              do: assert(String.starts_with?(body, "Client.Local: "), body),
+              else: assert(body === expected, select)
+          end
+        end
+      end
+    end
+  end
+
+  defp time_range_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: a WHERE that leaves no instant of time" do
+        test "the conjuncts on time that are empty together are the planner's error", ctx do
+          m = sp_fixture(ctx)
+          t1 = "'2023-11-14T22:13:20'"
+          t2 = "'2023-11-14T22:14:20'"
+          t3 = "'2023-11-14T22:15:20'"
+          boundaries = {:error, %{status: 500, body: sp_boundaries()}}
+
+          for where <- [
+                "time > #{t1} AND time < #{t1}",
+                "time >= #{t1} AND time < #{t1}",
+                "time > #{t1} AND time <= #{t1}",
+                "time >= #{t3} AND time <= #{t1}",
+                "time BETWEEN #{t3} AND #{t1}",
+                "time BETWEEN #{t1} AND #{t2} AND time > #{t2}",
+                "time > '2023-11-15' AND time = '2023-11-14'",
+                "time = #{t2} AND time < #{t1}",
+                "time = #{t2} AND time < #{t2}",
+                "time IN (#{t1}) AND time > #{t3}",
+                "time > '2023-11-14T22:13:20.000000000' AND time < '2023-11-14T22:13:20.000000001'",
+                "time > now() AND time < now()",
+                "time > now() + INTERVAL '1 hour' AND time < now()",
+                "time > now() - INTERVAL '1 hour' AND time < now() - INTERVAL '2 hours'",
+                "(time > #{t1} AND time < #{t1}) AND v = 1",
+                "v = 1 AND time > #{t1} AND time < #{t1}",
+                "time > #{t1} AND (time < #{t1} AND v > 0)",
+                "(time > #{t1} OR v = 1) AND time < #{t1} AND time > #{t3}",
+                "NOT (time <= #{t1} OR time >= #{t1})",
+                "NOT (time <= #{t1}) AND NOT (time >= #{t1})",
+                "time > #{t1} AND NOT (time >= #{t1})",
+                "NOT (NOT (time > #{t1} AND time < #{t1}))",
+                "NOT (time = #{t2}) AND time > #{t2} AND time < #{t2}",
+                "time > #{t1} AND time < #{t1} AND time IS NOT NULL",
+                "time > NULL AND time > #{t3} AND time < #{t1}",
+                "time > #{t1} AND time < #{t1} AND true",
+                "time IN (#{t1}, #{t2}) AND time > #{t2} AND time < #{t2}"
+              ] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where}") === boundaries, where
+          end
+
+          for sql <- [
+                "SELECT count(*) AS n FROM #{m} WHERE time > #{t1} AND time < #{t1}",
+                "SELECT DISTINCT v FROM #{m} WHERE time > #{t1} AND time < #{t1}",
+                "SELECT 1 AS a FROM #{m} WHERE time > #{t1} AND time < #{t1}",
+                "WITH w AS (SELECT * FROM #{m}) SELECT v FROM w WHERE time > #{t1} AND time < #{t1}",
+                "WITH w AS (SELECT * FROM #{m} WHERE time > #{t1} AND time < #{t1}) SELECT v FROM w",
+                "SELECT v FROM #{m} WHERE time > #{t1} AND time < #{t1} AND v / 0 > 1"
+              ] do
+            assert sp_query(ctx, sql) === boundaries, sql
+          end
+        end
+
+        test "what the optimizer settles first, or what hides the conjuncts, is no error", ctx do
+          m = sp_fixture(ctx)
+          t1 = "'2023-11-14T22:13:20'"
+          t2 = "'2023-11-14T22:14:20'"
+          t3 = "'2023-11-14T22:15:20'"
+          all = {:ok, [%{"v" => 1}, %{"v" => 2}, %{"v" => 3}]}
+
+          for {where, rows} <- [
+                {"time >= #{t1} AND time <= #{t1}", {:ok, [%{"v" => 1}]}},
+                {"time > #{t1} AND time < '2023-11-14T22:13:20.000000002'", {:ok, []}},
+                {"time > #{t1} AND time < #{t1} OR v = 1", {:ok, [%{"v" => 1}]}},
+                {"NOT (time > #{t1} AND time < #{t1})", all},
+                {"time NOT BETWEEN #{t3} AND #{t1}", all},
+                {"time = #{t1} AND time = #{t2}", {:ok, []}},
+                {"time = #{t1} AND time != #{t1}", {:ok, []}},
+                {"time = #{t1} AND time = #{t2} AND time > #{t3}", {:ok, []}},
+                {"time IS NULL AND time > #{t3} AND time < #{t1}", {:ok, []}},
+                {"time IN (#{t1}, #{t2}) AND time > #{t3}", {:ok, []}},
+                {"time > #{t1} AND time < #{t1} AND false", {:ok, []}},
+                {"time > #{t1} AND time < #{t1} AND 1 = 2", {:ok, []}},
+                {"NOT (time < #{t2} OR time > #{t2})", {:ok, [%{"v" => 2}]}}
+              ] do
+            sql = "SELECT v FROM #{m} WHERE #{where} ORDER BY time"
+            assert sp_query(ctx, sql) === rows, where
+          end
+
+          assert sp_query(
+                   ctx,
+                   "SELECT v FROM #{m} WHERE time > #{t1} AND time < #{t1} LIMIT 0"
+                 ) === {:ok, []}
+
+          # A filter on a CTE that aggregates does not reach the table.
+          assert sp_query(
+                   ctx,
+                   "WITH w AS (SELECT max(time) AS time FROM #{m}) " <>
+                     "SELECT * FROM w WHERE time > #{t2} AND time < #{t2}"
+                 ) === {:ok, []}
+        end
+
+        test "the planner's other errors come first", ctx do
+          m = sp_fixture(ctx)
+          range = "time > '2023-11-14T22:13:20' AND time < '2023-11-14T22:13:20'"
+
+          assert {:error, %{status: 500, body: "Schema error: No field named nosuch." <> _fields}} =
+                   sp_query(ctx, "SELECT nosuch FROM #{m} WHERE #{range}")
+
+          assert {:error, %{status: 500, body: "Schema error: No field named nosuch." <> _fields}} =
+                   sp_query(ctx, "SELECT v FROM #{m} WHERE #{range} AND nosuch = 1")
+
+          assert {:error, %{status: 500, body: "Schema error: No field named nosuch." <> _fields}} =
+                   sp_query(ctx, "SELECT v FROM #{m} WHERE #{range} ORDER BY nosuch")
+
+          assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{range} AND time > 'abc'") ===
+                   {:error,
+                    %{
+                      status: 500,
+                      body:
+                        sp_timestamp_error("abc", "timestamp must contain at least 10 characters")
+                    }}
+
+          assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{range} LIMIT -1") ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body:
+                        "Optimizer rule 'eliminate_limit' failed\ncaused by\n" <>
+                          "Error during planning: LIMIT must be >= 0, '-1' was provided"
+                    }}
+        end
+
+        test "an unreadable time string comes before a negative LIMIT or OFFSET", ctx do
+          m = sp_fixture(ctx)
+          unreadable = sp_timestamp_error("abc", "timestamp must contain at least 10 characters")
+
+          for tail <- ["LIMIT -1", "OFFSET -1", "LIMIT 1 OFFSET -1"] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE time > 'abc' #{tail}") ===
+                     {:error, %{status: 500, body: unreadable}},
+                   tail
+          end
+
+          assert {:error, %{status: 500, body: "Schema error: No field named nosuch." <> _fields}} =
+                   sp_query(ctx, "SELECT v FROM #{m} WHERE nosuch = 1 LIMIT -1")
+        end
+      end
+    end
+  end
+
+  defp literal_type_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: the type of a number" do
+        test "an integer is Int64, then UInt64, then a double", ctx do
+          m = sp_fixture(ctx)
+
+          for {literal, value} <- [
+                {"9223372036854775807", 9_223_372_036_854_775_807},
+                {"9223372036854775808", 9_223_372_036_854_775_808},
+                {"18446744073709551615", 18_446_744_073_709_551_615},
+                {"18446744073709551616", 1.844_674_407_370_955_2e19},
+                {"99999999999999999999999999", 1.0e26},
+                {"18446744073709551616.0", 1.844_674_407_370_955_2e19},
+                {"123456789012345678901234567890.5", 1.234_567_890_123_456_8e29},
+                {"-9223372036854775808", -9_223_372_036_854_775_808},
+                {"-9223372036854775809", -9.223_372_036_854_776e18},
+                {"-18446744073709551615", -1.844_674_407_370_955_2e19},
+                {"-18446744073709551616", -1.844_674_407_370_955_2e19},
+                {"1e308", 1.0e308},
+                {"1.7976931348623157e308", 1.797_693_134_862_315_7e308},
+                {"1e-400", 0.0},
+                {"abs(9223372036854775808)", 9_223_372_036_854_775_808},
+                {"abs(-9223372036854775807)", 9_223_372_036_854_775_807},
+                {"abs(18446744073709551615)", 18_446_744_073_709_551_615},
+                {"9223372036854775808 + 1", 9_223_372_036_854_775_809},
+                {"9223372036854775807 + 1", -9_223_372_036_854_775_808},
+                {"18446744073709551615 + 1", 18_446_744_073_709_551_616},
+                {"18446744073709551616 + 1", 1.844_674_407_370_955_2e19},
+                {"9223372036854775808 - 1", 9_223_372_036_854_775_807},
+                {"9223372036854775808 * 2", 18_446_744_073_709_551_616},
+                {"9223372036854775808 % 10", 8},
+                {"9223372036854775808 + 1.5", 9.223_372_036_854_776e18},
+                {"9223372036854775808 + (-1)", 9_223_372_036_854_775_807},
+                {"-9223372036854775807 - 1", -9_223_372_036_854_775_808},
+                {"-(9223372036854775807)", -9_223_372_036_854_775_807},
+                {"0.1 + 0.2", 0.30000000000000004},
+                {"CAST(9223372036854775808 AS DOUBLE)", 9.223_372_036_854_776e18}
+              ] do
+            assert sp_query(ctx, "SELECT #{literal} AS a FROM #{m} LIMIT 1") ===
+                     {:ok, [%{"a" => value}]},
+                   literal
+          end
+        end
+
+        test "a number past the double range is a null that is there", ctx do
+          m = sp_fixture(ctx)
+
+          for literal <- ["1e400", "-1e400", "1e309"] do
+            assert sp_query(ctx, "SELECT #{literal} AS a FROM #{m} LIMIT 1") ===
+                     {:ok, [%{"a" => nil}]},
+                   literal
+          end
+        end
+
+        @tag local_divergence:
+               "the engine closes the connection mid-response; Local returns the transport error"
+        test "an Int64 by a UInt64 divides as a decimal of four places", ctx do
+          m = sp_fixture(ctx)
+          order = " FROM #{m} ORDER BY time"
+
+          assert sp_query(ctx, "SELECT v / $p AS a" <> order, %{p: 3}) ===
+                   {:ok, [%{"a" => 0.3333}, %{"a" => 0.6666}, %{"a" => 1.0}]}
+
+          assert sp_query(ctx, "SELECT $p / v AS a" <> order, %{p: 10}) ===
+                   {:ok, [%{"a" => 10.0}, %{"a" => 5.0}, %{"a" => 3.3333}]}
+
+          assert sp_query(ctx, "SELECT -v / $p AS a" <> order <> " LIMIT 1", %{p: 7}) ===
+                   {:ok, [%{"a" => -0.1428}]}
+
+          assert sp_query(ctx, "SELECT 9223372036854775808 / 3 AS a" <> order <> " LIMIT 1") ===
+                   {:ok, [%{"a" => 3.074_457_345_618_258_6e18}]}
+
+          # Two UInt64s, and an Int64 by an Int64 parameter, divide as integers.
+          assert sp_query(ctx, "SELECT $p / $q AS a, v / $n AS b" <> order <> " LIMIT 1", %{
+                   p: 7,
+                   q: 2,
+                   n: -2
+                 }) === {:ok, [%{"a" => 3, "b" => 0}]}
+
+          assert sp_query(ctx, "SELECT v / $z AS a" <> order, %{z: 0}) === @sp_closed
+        end
+
+        test "a UInt64 cannot be negated", ctx do
+          m = sp_fixture(ctx)
+
+          negation =
+            {:error,
+             %{
+               status: 400,
+               body:
+                 "Error during planning: Negation only supports numeric, interval and timestamp types"
+             }}
+
+          for literal <- ["-(9223372036854775808)", "-(18446744073709551615)"] do
+            assert sp_query(ctx, "SELECT #{literal} AS a FROM #{m}") === negation, literal
+          end
+
+          for p <- [5, 0] do
+            assert sp_query(ctx, "SELECT -$p AS a FROM #{m}", %{p: p}) === negation, "#{p}"
+          end
+
+          assert sp_query(ctx, "SELECT -$p AS a, abs($p) AS b FROM #{m} LIMIT 1", %{p: -5}) ===
+                   {:ok, [%{"a" => 5, "b" => 5}]}
+        end
+
+        @tag local_divergence:
+               "the engine closes the connection mid-response; Local returns the transport error"
+        test "the magnitude or the negation of the Int64 minimum overflows", ctx do
+          m = sp_measurement("sp_min")
+
+          sp_write(ctx, [
+            "#{m} y=-9223372036854775808i,w=5i #{sp_ns(0)}",
+            "#{m} y=-9223372036854775807i,w=0i #{sp_ns(1)}"
+          ])
+
+          # Folded as a constant, or read from a column, `abs` overflows; a
+          # negation overflows only when it is folded.
+          for sql <- [
+                "SELECT -(-9223372036854775807 - 1) AS a FROM #{m}",
+                "SELECT abs(-9223372036854775807 - 1) AS a FROM #{m}",
+                "SELECT abs(-9223372036854775808) AS a FROM #{m}",
+                "SELECT abs(y) AS a FROM #{m}",
+                "SELECT abs(y) AS a FROM #{m} WHERE w = 5",
+                "SELECT sum(abs(y)) AS a FROM #{m}"
+              ] do
+            assert sp_query(ctx, sql) === @sp_closed, sql
+          end
+
+          assert sp_query(ctx, "SELECT -y AS a FROM #{m} ORDER BY time") ===
+                   {:ok,
+                    [%{"a" => -9_223_372_036_854_775_808}, %{"a" => 9_223_372_036_854_775_807}]}
+
+          assert sp_query(ctx, "SELECT abs(y) AS a FROM #{m} WHERE y > -9223372036854775808") ===
+                   {:ok, [%{"a" => 9_223_372_036_854_775_807}]}
+        end
+      end
+    end
+  end
+
+  defp quoted_select_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: quoted names in the select list" do
+        test "a quoted name is a column, wherever it stands in the select list", ctx do
+          m = sp_fixture(ctx)
+          fields = sp_fields(m, ["b", "f", "h", "s", "time", "v"])
+
+          for {sql, shown} <- [
+                {~s|SELECT "a b" FROM #{m}|, ~s|"a b"|},
+                {~s|SELECT "ho""st" FROM #{m}|, ~s|"ho""st"|},
+                {~s|SELECT "" FROM #{m}|, ""},
+                {~s|SELECT count("a b") AS n FROM #{m}|, ~s|"a b"|},
+                {~s|SELECT sum("a b" * 2) AS n FROM #{m}|, ~s|"a b"|},
+                {~s|SELECT "a b" * 2 AS n FROM #{m}|, ~s|"a b"|},
+                {~s|SELECT "a b" AS n FROM #{m}|, ~s|"a b"|},
+                {~s|SELECT v, "V" FROM #{m}|, ~s|"V"|}
+              ] do
+            assert sp_query(ctx, sql) ===
+                     {:error, %{status: 500, body: sp_no_field(shown, fields)}},
+                   sql
+          end
+
+          assert sp_query(ctx, ~s|SELECT "v", "h" FROM #{m} ORDER BY time LIMIT 1|) ===
+                   {:ok, [%{"v" => 1, "h" => "a"}]}
+
+          assert sp_query(
+                   ctx,
+                   ~s|SELECT count("v") AS n, "h" FROM #{m} GROUP BY "h" ORDER BY "h"|
+                 ) ===
+                   {:ok, [%{"n" => 2, "h" => "a"}, %{"n" => 1, "h" => "b"}]}
+        end
+
+        test "a column with a name that needs its quotes is read and named", ctx do
+          m = sp_measurement("sp_quoted_columns")
+          sp_write(ctx, [~s|#{m},Host=A a\\ b=1i,Zed=2i,alpha=3i #{sp_ns(0)}|])
+
+          assert sp_query(ctx, ~s|SELECT "Host", "a b", "Zed" FROM #{m}|) ===
+                   {:ok, [%{"Host" => "A", "a b" => 1, "Zed" => 2}]}
+
+          assert sp_query(ctx, ~s|SELECT "a b" * 2, "Zed" + 1 FROM #{m}|) ===
+                   {:ok, [%{"#{m}.a b * Int64(2)" => 2, "#{m}.Zed + Int64(1)" => 3}]}
+
+          assert sp_query(ctx, ~s|SELECT sum("a b"), sum("Zed" * 2) FROM #{m}|) ===
+                   {:ok, [%{"sum(#{m}.a b)" => 1, "sum(#{m}.Zed * Int64(2))" => 4}]}
+
+          assert sp_query(ctx, ~s|SELECT "a b" AS x FROM #{m} ORDER BY nosuch|) ===
+                   {:error,
+                    %{
+                      status: 500,
+                      body:
+                        sp_no_field(
+                          "nosuch",
+                          ["x" | sp_fields(m, ["Host", "Zed", "a b", "alpha", "time"])]
+                        )
+                    }}
+        end
+
+        test "a relation the query does not have is named as written, with the engine's hint",
+             ctx do
+          m = sp_fixture(ctx)
+          fields = sp_fields(m, ["b", "f", "h", "s", "time", "v"])
+          upper = String.upcase(m)
+
+          hint = fn printed ->
+            " Column names are case sensitive. You can use double quotes to refer to the " <>
+              "\"#{printed}\" column or set the datafusion.sql_parser.enable_ident_normalization " <>
+              "configuration."
+          end
+
+          upper_v = ~s|"#{upper}".v|
+
+          for sql <- [
+                ~s|SELECT "#{upper}".v FROM #{m}|,
+                ~s|SELECT v FROM #{m} WHERE "#{upper}".v = 1|,
+                ~s|SELECT count("#{upper}".v) AS c FROM #{m}|
+              ] do
+            assert {:error, %{status: 500, body: body}} = sp_query(ctx, sql)
+
+            assert body ===
+                     "Schema error: No field named #{upper_v}." <>
+                       hint.(upper_v) <> " Valid fields are " <> Enum.join(fields, ", ") <> ".",
+                   sql
+          end
+
+          # Without a name that differs only in case there is no hint.
+          assert sp_query(ctx, ~s|SELECT "Foo".v FROM #{m}|) ===
+                   {:error, %{status: 500, body: sp_no_field(~s|"Foo".v|, fields)}}
+
+          assert sp_query(ctx, "SELECT foo.v FROM #{m}") ===
+                   {:error, %{status: 500, body: sp_no_field("foo.v", fields)}}
+
+          assert sp_query(ctx, ~s|SELECT "#{m}".v FROM #{m} ORDER BY time LIMIT 1|) ===
+                   {:ok, [%{"v" => 1}]}
+
+          assert sp_query(ctx, "SELECT v FROM #{m} AS t WHERE #{m}.v = 1") ===
+                   {:error,
+                    %{
+                      status: 500,
+                      body:
+                        sp_no_field("#{m}.v", sp_fields("t", ["b", "f", "h", "s", "time", "v"]))
+                    }}
+        end
+      end
+    end
+  end
+
+  defp valid_fields_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: the fields an unknown column lists" do
+        test "WHERE and the select list list the table's fields, qualified and sorted", ctx do
+          m = sp_fixture(ctx)
+          fields = sp_fields(m, ["b", "f", "h", "s", "time", "v"])
+
+          for sql <- [
+                "SELECT nosuch FROM #{m}",
+                "SELECT v, nosuch FROM #{m}",
+                "SELECT nosuch, v FROM #{m}",
+                "SELECT * FROM #{m} WHERE nosuch = 1",
+                "SELECT h, v FROM #{m} WHERE nosuch = 1 ORDER BY other",
+                "SELECT count(*) AS c FROM #{m} WHERE nosuch = 1",
+                "SELECT count(nosuch) AS c FROM #{m}",
+                "SELECT sum(v * nosuch) AS c FROM #{m}",
+                "SELECT DISTINCT nosuch FROM #{m}",
+                "SELECT DISTINCT h FROM #{m} WHERE nosuch = 1",
+                "SELECT nosuch, count(*) AS n FROM #{m} GROUP BY nosuch",
+                "SELECT n1 FROM #{m} WHERE nosuch = 1 AND other = 2",
+                "SELECT v FROM #{m} WHERE v IN (1, nosuch)",
+                "SELECT v FROM #{m} WHERE nosuch BETWEEN other AND 1",
+                "SELECT nosuch FROM #{m} LIMIT other",
+                "SELECT first_value(nosuch ORDER BY time) AS f FROM #{m}",
+                "SELECT selector_first(v, nosuch)['value'] AS f FROM #{m}"
+              ] do
+            assert sp_query(ctx, sql) ===
+                     {:error, %{status: 500, body: sp_no_field("nosuch", fields)}},
+                   sql
+          end
+        end
+
+        test "the clauses are resolved in the order WHERE, select list, ORDER BY, GROUP BY",
+             ctx do
+          m = sp_fixture(ctx)
+          fields = sp_fields(m, ["b", "f", "h", "s", "time", "v"])
+          projection = sp_fields(m, ["h"]) ++ ["c"]
+
+          for {sql, name, listed} <- [
+                {"SELECT n1 FROM #{m} WHERE n2 = 1", "n2", fields},
+                {"SELECT n1 FROM #{m} WHERE n2 = 1 ORDER BY n3", "n2", fields},
+                {"SELECT n1, n2 FROM #{m}", "n1", fields},
+                {"SELECT n2, n1 FROM #{m}", "n2", fields},
+                {"SELECT n1, count(n4) AS c FROM #{m} GROUP BY n2 ORDER BY n3", "n1", fields},
+                {"SELECT count(n4) AS c FROM #{m} GROUP BY n2 ORDER BY n3", "n4", fields},
+                {"SELECT h, count(*) AS c FROM #{m} GROUP BY n2 ORDER BY n3", "n3",
+                 projection ++ fields},
+                {"SELECT h, count(*) AS c FROM #{m} GROUP BY n2", "n2", projection ++ fields},
+                {"SELECT DISTINCT n1 FROM #{m} ORDER BY n3", "n1", fields},
+                {"SELECT DISTINCT ON (n2) n1 FROM #{m} ORDER BY n3", "n1", fields}
+              ] do
+            assert sp_query(ctx, sql) ===
+                     {:error, %{status: 500, body: sp_no_field(name, listed)}},
+                   sql
+          end
+        end
+
+        test "ORDER BY and GROUP BY list the select list's fields first, repeats included",
+             ctx do
+          m = sp_fixture(ctx)
+          fields = sp_fields(m, ["b", "f", "h", "s", "time", "v"])
+
+          for {select, projection} <- [
+                {"h, v", sp_fields(m, ["h", "v"])},
+                {"v AS a, h", ["a" | sp_fields(m, ["h"])]},
+                {"v * 2 AS a", ["a"]},
+                {"v, v AS w", sp_fields(m, ["v"]) ++ ["w"]},
+                {"time, v", sp_fields(m, ["time", "v"])},
+                {"v * 2", [~s|"#{m}.v * Int64(2)"|]},
+                {"*", fields},
+                {"DISTINCT h", sp_fields(m, ["h"])},
+                {"DISTINCT ON (h) h, v", sp_fields(m, ["h", "v"])},
+                {"DISTINCT ON (h) v", sp_fields(m, ["v"])},
+                {"DISTINCT ON (h) *", fields}
+              ] do
+            sql = "SELECT #{select} FROM #{m} ORDER BY nosuch"
+
+            assert sp_query(ctx, sql) ===
+                     {:error, %{status: 500, body: sp_no_field("nosuch", projection ++ fields)}},
+                   sql
+          end
+
+          for {sql, projection} <- [
+                {"SELECT h, v FROM #{m} GROUP BY nosuch", sp_fields(m, ["h", "v"])},
+                {"SELECT h, count(*) AS c FROM #{m} GROUP BY h ORDER BY nosuch",
+                 sp_fields(m, ["h"]) ++ ["c"]},
+                {"SELECT count(*) FROM #{m} ORDER BY nosuch", [~s|"count(*)"|]},
+                {"SELECT date_bin(INTERVAL '1 minute', time) AS b, count(*) AS c FROM #{m} GROUP BY 1 ORDER BY nosuch",
+                 ["b", "c"]}
+              ] do
+            assert sp_query(ctx, sql) ===
+                     {:error, %{status: 500, body: sp_no_field("nosuch", projection ++ fields)}},
+                   sql
+          end
+        end
+
+        test "a select name in a DISTINCT ON's ORDER BY lists the table alone", ctx do
+          m = sp_fixture(ctx)
+          fields = sp_fields(m, ["b", "f", "h", "s", "time", "v"])
+
+          for {name, select} <- [{"hh", "h AS hh, v"}, {"w", "h, v * 2 AS w"}] do
+            sql = "SELECT DISTINCT ON (h) #{select} FROM #{m} ORDER BY #{name}, time DESC"
+
+            assert sp_query(ctx, sql) ===
+                     {:error, %{status: 500, body: sp_no_field(name, fields)}},
+                   sql
+          end
+        end
+      end
+    end
+  end
+
+  defp valid_fields_context_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: the fields an unknown column lists, by relation" do
+        test "a CTE lists its columns in the order it selects them", ctx do
+          m = sp_fixture(ctx)
+
+          for {sql, listed} <- [
+                {"WITH w AS (SELECT v, h FROM #{m}) SELECT v FROM w WHERE nosuch = 1",
+                 sp_fields("w", ["v", "h"])},
+                {"WITH w AS (SELECT v, h FROM #{m}) SELECT v FROM w ORDER BY nosuch",
+                 sp_fields("w", ["v"]) ++ sp_fields("w", ["v", "h"])},
+                {"WITH w AS (SELECT v AS a FROM #{m}) SELECT nosuch FROM w",
+                 sp_fields("w", ["a"])},
+                {"WITH w AS (SELECT h FROM #{m} WHERE v > 100) SELECT nosuch FROM w",
+                 sp_fields("w", ["h"])},
+                {"WITH w AS (SELECT * FROM #{m}) SELECT nosuch FROM w",
+                 sp_fields("w", ["b", "f", "h", "s", "time", "v"])}
+              ] do
+            assert sp_query(ctx, sql) ===
+                     {:error, %{status: 500, body: sp_no_field("nosuch", listed)}},
+                   sql
+          end
+
+          # A CTE without time has no time to ask for.
+          assert sp_query(ctx, "WITH w AS (SELECT v FROM #{m}) SELECT time FROM w") ===
+                   {:error, %{status: 500, body: sp_no_field("time", sp_fields("w", ["v"]))}}
+        end
+
+        test "an alias is the qualifier, and a column written with its relation keeps it", ctx do
+          m = sp_fixture(ctx)
+          fields = ["b", "f", "h", "s", "time", "v"]
+
+          for {from, qualifier} <- [{"#{m} AS t", "t"}, {"#{m} t", "t"}, {"#{m} AS T", "t"}] do
+            assert sp_query(ctx, "SELECT nosuch FROM #{from}") ===
+                     {:error,
+                      %{status: 500, body: sp_no_field("nosuch", sp_fields(qualifier, fields))}},
+                   from
+
+            assert sp_query(ctx, "SELECT v FROM #{from} ORDER BY nosuch") ===
+                     {:error,
+                      %{
+                        status: 500,
+                        body:
+                          sp_no_field(
+                            "nosuch",
+                            sp_fields(qualifier, ["v"]) ++ sp_fields(qualifier, fields)
+                          )
+                      }},
+                   from
+          end
+
+          assert sp_query(ctx, "SELECT v FROM #{m} t WHERE t.nosuch = 1") ===
+                   {:error, %{status: 500, body: sp_no_field("t.nosuch", sp_fields("t", fields))}}
+
+          assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{m}.nosuch = 1") ===
+                   {:error,
+                    %{status: 500, body: sp_no_field("#{m}.nosuch", sp_fields(m, fields))}}
+        end
+
+        test "names that need quotes are quoted and sorted by their bytes", ctx do
+          m = sp_measurement("sp_sorted_columns")
+
+          sp_write(ctx, [
+            ~s|#{m},Host=A,host=b,t1=x a\\ b=1i,Zed=2i,alpha=3i,_u=4i,é=5i,ZZ=1i,zz=2i #{sp_ns(0)}|
+          ])
+
+          fields =
+            sp_fields(m, [
+              "Host",
+              "ZZ",
+              "Zed",
+              "_u",
+              "a b",
+              "alpha",
+              "host",
+              "t1",
+              "time",
+              "zz",
+              "é"
+            ])
+
+          assert sp_query(ctx, "SELECT nosuch FROM #{m}") ===
+                   {:error, %{status: 500, body: sp_no_field("nosuch", fields)}}
+
+          assert sp_query(ctx, "SELECT Zed FROM #{m}") ===
+                   {:error, %{status: 500, body: sp_no_field("zed", fields)}}
+
+          assert sp_query(ctx, ~s|SELECT "Zed" FROM #{m}|) === {:ok, [%{"Zed" => 2}]}
+        end
+
+        test "the fields of both sides of a CROSS JOIN are listed, each qualified", ctx do
+          left = sp_measurement("sp_left")
+          right = sp_measurement("sp_right")
+          sp_write(ctx, ["#{left},h=a v=1i #{sp_ns(0)}", "#{right} w=2i #{sp_ns(0)}"])
+
+          assert sp_query(ctx, "SELECT h FROM #{left} CROSS JOIN #{right} WHERE nosuch = 1") ===
+                   {:error,
+                    %{
+                      status: 500,
+                      body:
+                        sp_no_field(
+                          "nosuch",
+                          sp_fields(left, ["h", "time", "v"]) ++ sp_fields(right, ["time", "w"])
+                        )
+                    }}
+        end
+
+        test "a missing table is named as written", ctx do
+          for {sql, name} <- [
+                {~s|SELECT * FROM "r""vt"|, ~s|r"vt|},
+                {~s|SELECT * FROM "XQA"|, "XQA"},
+                {"SELECT * FROM Xq", "xq"},
+                {~s|SELECT * FROM "a b"|, "a b"}
+              ] do
+            assert sp_query(ctx, sql) ===
+                     {:error,
+                      %{
+                        status: 400,
+                        body: "Error during planning: table 'public.iox.#{name}' not found"
+                      }},
+                   sql
+          end
+        end
+      end
+    end
+  end
+
+  defp time_zone_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: the zone of a time string" do
+        test "the names of UTC, the fixed offsets and Etc/GMT are zones", ctx do
+          m = sp_measurement("sp_zone")
+          summer = "#{m} v=9i 1689372780000000000"
+          sp_write(ctx, [summer | for(i <- 0..1, do: "#{m} v=#{i}i #{sp_ns(i)}")])
+          select = "SELECT v FROM #{m} WHERE time = "
+
+          # 22:13:20 UTC; `Etc/GMT+1` is an hour behind UTC, `Etc/GMT-1` ahead.
+          for text <- [
+                "2023-11-14T22:13:20 UTC",
+                "2023-11-14T22:13:20 GMT",
+                "2023-11-14T22:13:20 Zulu",
+                "2023-11-14T22:13:20 UCT",
+                "2023-11-14T22:13:20 Universal",
+                "2023-11-14T22:13:20 Greenwich",
+                "2023-11-14T22:13:20 GMT0",
+                "2023-11-14T22:13:20 GMT+0",
+                "2023-11-14T22:13:20 GMT-0",
+                "2023-11-14T22:13:20Zulu",
+                "2023-11-14T22:13:20  Zulu",
+                "2023-11-14T22:13:20 Etc/UTC",
+                "2023-11-14T22:13:20 Etc/GMT",
+                "2023-11-14T22:13:20 Etc/UCT",
+                "2023-11-14T22:13:20 Etc/Zulu",
+                "2023-11-14T22:13:20 Etc/Universal",
+                "2023-11-14T22:13:20 Etc/Greenwich",
+                "2023-11-14T22:13:20 Etc/GMT0",
+                "2023-11-14T22:13:20 Etc/GMT+0",
+                "2023-11-14T22:13:20 Etc/GMT-0",
+                "2023-11-14T21:13:20 Etc/GMT+1",
+                "2023-11-14T23:13:20 Etc/GMT-1",
+                "2023-11-14T10:13:20 Etc/GMT+12",
+                "2023-11-15T12:13:20 Etc/GMT-14",
+                "2023-11-14T17:13:20 EST",
+                "2023-11-14T15:13:20 MST",
+                "2023-11-14T12:13:20 HST"
+              ] do
+            assert sp_query(ctx, select <> "'#{text}'") === {:ok, [%{"v" => 0}]}, text
+          end
+
+          # The offset does not change with the date.
+          for text <- [
+                "2023-07-14T17:13:00 EST",
+                "2023-07-14T15:13:00 MST",
+                "2023-07-14T12:13:00 HST"
+              ] do
+            assert sp_query(ctx, select <> "'#{text}'") === {:ok, [%{"v" => 9}]}, text
+          end
+        end
+
+        test "a name that is not a zone, or is spelled wrongly, is the engine's error", ctx do
+          m = sp_measurement("sp_zone_bad")
+          sp_write(ctx, ["#{m} v=0i #{sp_ns(0)}"])
+
+          for zone <- [
+                "zulu",
+                "utc",
+                "gmt",
+                "est",
+                "Z",
+                "xyz",
+                "Factory",
+                "GMT+1",
+                "GMT-1",
+                "UTC+0",
+                "UTC0",
+                "Etc/GMT+13",
+                "Etc/GMT+14",
+                "Etc/GMT-15",
+                "Etc/GMT+01",
+                "Etc/GMT-01",
+                "Etc/GMT+00",
+                "Zulu "
+              ] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE time = '2023-11-14T22:13:20 #{zone}'") ===
+                     {:error,
+                      %{
+                        status: 500,
+                        body:
+                          sp_optimizer(
+                            "Parser error: Invalid timezone \"#{zone}\": failed to parse timezone"
+                          )
+                      }},
+                   zone
+          end
+        end
+
+        @tag local_divergence:
+               "Local holds no time zone database and refuses a zone whose offset changes by name"
+        test "a zone of the time zone database is read by the engine", ctx do
+          m = sp_measurement("sp_zone_db")
+          sp_write(ctx, ["#{m} v=0i #{sp_ns(0)}"])
+
+          for zone <- ["Europe/Paris", "America/New_York", "CET", "Japan", "PST8PDT", "EST5EDT"] do
+            result =
+              sp_query(ctx, "SELECT v FROM #{m} WHERE time > '2023-11-14T00:00:00 #{zone}'")
+
+            if sp_local?() do
+              assert {:error, %{status: 400, body: "Client.Local: " <> _reason}} = result, zone
+            else
+              assert {:ok, _rows} = result, zone
+            end
+          end
+        end
+      end
+    end
+  end
+
+  defp leap_second_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: a leap second in a time string" do
+        test "a leap second is the start of the next minute", ctx do
+          m = sp_measurement("sp_leap")
+
+          sp_write(ctx, [
+            "#{m} v=1i 1699999979000000000",
+            "#{m} v=2i 1699999980000000000",
+            "#{m} v=3i 1699999980500000000",
+            "#{m} v=4i 1700006400000000000",
+            "#{m} v=6i 1700000040000000000"
+          ])
+
+          select = "SELECT v FROM #{m} WHERE time = "
+
+          for {text, rows} <- [
+                {"2023-11-14T22:12:60Z", [2]},
+                {"2023-11-14T22:12:60.5Z", [3]},
+                {"2023-11-14 22:12:60", [2]},
+                {"2023-11-14T23:12:60+01:00", [2]},
+                {"2023-11-14T22:12:60 Zulu", [2]},
+                {"2023-11-14T22:13:60Z", [6]},
+                {"2023-11-14T23:59:60Z", [4]},
+                {"2023-11-14T22:12:60.000000001Z", []},
+                {"2023-11-14T22:12:59.999999999Z", []}
+              ] do
+            assert sp_query(ctx, select <> "'#{text}' ORDER BY time") ===
+                     {:ok, Enum.map(rows, &%{"v" => &1})},
+                   text
+          end
+
+          assert sp_query(
+                   ctx,
+                   "SELECT v FROM #{m} WHERE time >= '2023-11-14T22:12:60Z' AND " <>
+                     "time < '2023-11-14T22:13:01Z' ORDER BY time"
+                 ) === {:ok, [%{"v" => 2}, %{"v" => 3}]}
+
+          # Past :60 it is not a time; past the range the overflow shows the :60.
+          assert sp_query(ctx, select <> "'2023-11-14T22:12:61Z'") ===
+                   {:error,
+                    %{
+                      status: 500,
+                      body: sp_timestamp_error("2023-11-14T22:12:61Z", "error parsing time")
+                    }}
+
+          assert sp_query(ctx, select <> "'2262-04-11T23:47:60Z'") ===
+                   {:error,
+                    %{
+                      status: 500,
+                      body:
+                        sp_optimizer(
+                          "Cast error: Overflow converting 2262-04-11 23:47:60 to Nanosecond. " <>
+                            "The dates that can be represented as nanoseconds have to be " <>
+                            "between 1677-09-21T00:12:44.0 and 2262-04-11T23:47:16.854775804"
+                        )
+                    }}
+        end
+      end
+    end
+  end
+
+  defp small_fidelity_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: smaller answers" do
+        test "NULL compared with anything is unknown", ctx do
+          m = sp_fixture(ctx)
+
+          for where <- [
+                "NULL = time",
+                "NULL < time",
+                "NULL <> time",
+                "NULL >= time",
+                "time = NULL",
+                "NULL = v",
+                "NULL = h",
+                "NULL = NULL",
+                "NULL = 1",
+                "NOT (NULL = time)"
+              ] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where}") === {:ok, []}, where
+          end
+        end
+
+        @tag local_divergence: "Local refuses a function it does not model by name"
+        test "a function the double does not model is refused by name, or answered", ctx do
+          m = sp_fixture(ctx)
+
+          result = sp_query(ctx, "SELECT trunc(f) FROM #{m} ORDER BY time LIMIT 1")
+
+          if sp_local?(),
+            do: assert({:error, %{status: 400, body: "Client.Local: " <> _reason}} = result),
+            else: assert(result === {:ok, [%{"trunc(#{m}.f)" => 1.0}]})
+        end
+
+        @tag local_divergence: "Local refuses a binary value by name"
+        test "a hexadecimal string is a binary value, which the double does not model", ctx do
+          m = sp_fixture(ctx)
+          result = sp_query(ctx, "SELECT v FROM #{m} WHERE h = X'61' ORDER BY time")
+
+          if sp_local?(),
+            do: assert({:error, %{status: 400, body: "Client.Local: " <> _reason}} = result),
+            else: assert(result === {:ok, [%{"v" => 1}, %{"v" => 3}]})
         end
       end
     end
@@ -1581,7 +2726,6 @@ defmodule InfluxElixir.Contract.SQLParser do
           m = sp_measurement("sp_param_json")
           sp_write(ctx, ["#{m} v=1i #{sp_ns(0)}"])
           sql = "select v from #{m} where v = $p"
-          head = ~s|{"db":#{Jason.encode!(ctx.database)},"format":"json","params":{|
 
           object =
             "serde json error: JSON objects are not supported as query parameters. " <>
@@ -1591,30 +2735,30 @@ defmodule InfluxElixir.Contract.SQLParser do
             "serde json error: JSON arrays are not supported as query parameters. " <>
               "Expected null, boolean, number, or string. at line 1 column "
 
-          # The last parameter is read with the brace that closes the object.
-          for {params, text, read} <- [
-                {%{p: %{a: 1}}, object, ~s|"p":{"a":1}|},
-                {%{p: %{}}, object, ~s|"p":{}|},
-                {%{a: 1, p: %{}}, object, ~s|"a":1,"p":{}|},
-                {%{p: [1, 2]}, array, ~s|"p":[1,2]|},
-                {%{p: []}, array, ~s|"p":[]|},
-                {%{p: %{a: %{b: [1]}}}, object, ~s|"p":{"a":{"b":[1]}}|},
-                {%{p: [1, %{a: 2}]}, array, ~s|"p":[1,{"a":2}]|}
+          # The parser stops at the end of the value; the last parameter is
+          # read with the brace that closes the object.
+          for {params, text} <- [
+                {%{p: %{a: 1}}, object},
+                {%{p: %{}}, object},
+                {%{a: 1, p: %{}}, object},
+                {%{p: [1, 2]}, array},
+                {%{p: []}, array},
+                {%{p: %{a: %{b: [1]}}}, object},
+                {%{p: [1, %{a: 2}]}, array}
               ] do
-            column = byte_size(head <> read) + 1
+            {read, true} = sp_params_read(ctx, sql, params, "p", "json")
 
-            assert sp_query(ctx, sql, params) ==
-                     {:error, %{status: 400, body: text <> Integer.to_string(column)}},
+            assert sp_query(ctx, sql, params) ===
+                     {:error, %{status: 400, body: text <> Integer.to_string(read + 1)}},
                    inspect(params)
           end
 
           # Another parameter follows, so its comma is not read.
-          assert sp_query(ctx, sql, %{a: 1, p: [1, 2], z: 1}) ==
-                   {:error,
-                    %{
-                      status: 400,
-                      body: array <> Integer.to_string(byte_size(head <> ~s|"a":1,"p":[1,2]|))
-                    }}
+          params = %{a: 1, p: [1, 2], z: 1}
+          {read, false} = sp_params_read(ctx, sql, params, "p", "json")
+
+          assert sp_query(ctx, sql, params) ===
+                   {:error, %{status: 400, body: array <> Integer.to_string(read)}}
         end
 
         test "a number the engine's JSON parser cannot read stops it where the number ends",
@@ -1622,48 +2766,36 @@ defmodule InfluxElixir.Contract.SQLParser do
           m = sp_measurement("sp_param_range")
           sp_write(ctx, ["#{m} v=1i #{sp_ns(0)}"])
           sql = "select v from #{m} where v = $p"
-          head = ~s|{"db":#{Jason.encode!(ctx.database)},"format":"json","params":{|
           big = Integer.pow(10, 400)
 
           out_of_range = fn read ->
-            column = byte_size(head <> read)
-
             {:error,
              %{
                status: 400,
-               body: "serde json error: number out of range at line 1 column #{column}"
+               body: "serde json error: number out of range at line 1 column #{read}"
              }}
           end
 
           # Past the float range, however it is written; the column is the byte
           # where the number ends, last parameter or not.
-          for {params, read} <- [
-                {%{p: big}, ~s|"p":#{big}|},
-                {%{p: -big}, ~s|"p":-#{big}|},
-                {%{p: Decimal.new("1e400")}, ~s|"p":#{big}|},
-                {%{p: Decimal.new("-1e400")}, ~s|"p":-#{big}|},
-                {%{p: Integer.pow(2, 1024)}, ~s|"p":#{Integer.pow(2, 1024)}|},
-                {%{p: 2 * Integer.pow(10, 308)}, ~s|"p":#{2 * Integer.pow(10, 308)}|},
-                {%{a: 1, p: big, z: "x"}, ~s|"a":1,"p":#{big}|},
-                {%{a: 1.5, p: big, z: big}, ~s|"a":1.5,"p":#{big}|}
+          for params <- [
+                %{p: big},
+                %{p: -big},
+                %{p: Decimal.new("1e400")},
+                %{p: Decimal.new("-1e400")},
+                %{p: Integer.pow(2, 1024)},
+                %{p: 2 * Integer.pow(10, 308)},
+                %{a: 1, p: big, z: "x"},
+                %{a: 1.5, p: big, z: big}
               ] do
-            assert sp_query(ctx, sql, params) == out_of_range.(read), inspect(params)
+            {read, _last} = sp_params_read(ctx, sql, params, "p", "json")
+            assert sp_query(ctx, sql, params) === out_of_range.(read), inspect(params)
           end
 
           # A statement run with `execute_sql` carries no `format` in its body.
-          assert sp_execute(ctx, sql, %{a: 1, p: big}) ==
-                   {:error,
-                    %{
-                      status: 400,
-                      body:
-                        "serde json error: number out of range at line 1 column " <>
-                          Integer.to_string(
-                            byte_size(
-                              ~s|{"db":#{Jason.encode!(ctx.database)},"params":{| <>
-                                ~s|"a":1,"p":#{big}|
-                            )
-                          )
-                    }}
+          params = %{a: 1, p: big}
+          {read, _last} = sp_params_read(ctx, sql, params, "p", nil)
+          assert sp_execute(ctx, sql, params) === out_of_range.(read)
 
           # serde_json multiplies the digits it keeps by a power of ten, so
           # the largest double is in and the one above it is out.
@@ -1674,45 +2806,46 @@ defmodule InfluxElixir.Contract.SQLParser do
                 Decimal.new("1.5e-400"),
                 18_446_744_073_709_551_616
               ] do
-            assert sp_query(ctx, sql, %{p: value}) == {:ok, []}, inspect(value)
+            assert sp_query(ctx, sql, %{p: value}) === {:ok, []}, inspect(value)
           end
         end
 
-        test "no parameters can be nil, and a name or a params value must make sense", ctx do
+        test "nil and [] are no parameters; a key or a params value that makes no sense is refused",
+             ctx do
           m = sp_measurement("sp_param_shape")
           sp_write(ctx, ["#{m} v=1i #{sp_ns(0)}"])
           sql = "select v from #{m}"
 
-          assert sp_raw(ctx, sql, params: nil) ==
+          assert sp_raw(ctx, sql, params: nil) ===
                    {:ok, [%{"v" => 1}]}
 
-          assert sp_raw(ctx, sql, params: []) ==
+          assert sp_raw(ctx, sql, params: []) ===
                    {:ok, [%{"v" => 1}]}
 
-          assert sp_query(ctx, sql, %{{1, 2} => 1}) ==
+          assert sp_query(ctx, sql, %{{1, 2} => 1}) ===
                    {:error, {:invalid_param, "{1, 2}", :unsupported_key}}
 
-          assert sp_query(ctx, sql, [{{:a, :b}, 1}]) ==
+          assert sp_query(ctx, sql, [{{:a, :b}, 1}]) ===
                    {:error, {:invalid_param, "{:a, :b}", :unsupported_key}}
 
-          assert sp_query(ctx, sql, [1]) == {:error, {:invalid_param, "1", :unsupported_key}}
-          assert sp_query(ctx, sql, 5) == {:error, {:invalid_param, "5", :unsupported_params}}
+          assert sp_query(ctx, sql, [1]) === {:error, {:invalid_param, "1", :unsupported_key}}
+          assert sp_query(ctx, sql, 5) === {:error, {:invalid_param, "5", :unsupported_params}}
 
-          assert sp_query(ctx, sql, "p") ==
+          assert sp_query(ctx, sql, "p") ===
                    {:error, {:invalid_param, ~s|"p"|, :unsupported_params}}
         end
 
         test "a Decimal without a number, and a value with no JSON form, are refused", ctx do
           for value <- ["NaN", "Infinity", "-Infinity"] do
-            assert sp_query(ctx, "select 1", %{p: Decimal.new(value)}) ==
+            assert sp_query(ctx, "select 1", %{p: Decimal.new(value)}) ===
                      {:error, {:invalid_param, "p", :non_finite_decimal}},
                    value
           end
 
-          assert sp_query(ctx, "select 1", %{p: {:a, :tuple}}) ==
+          assert sp_query(ctx, "select 1", %{p: {:a, :tuple}}) ===
                    {:error, {:invalid_param, "p", :unsupported_type}}
 
-          assert sp_query(ctx, "select 1", p: self()) ==
+          assert sp_query(ctx, "select 1", p: self()) ===
                    {:error, {:invalid_param, "p", :unsupported_type}}
         end
       end

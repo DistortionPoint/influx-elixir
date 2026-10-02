@@ -26,7 +26,14 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     blocks =
       case profile do
         :v3_core ->
-          [helpers(client), v3_line_protocol_tests(client), v3_influxql_tests(client)]
+          [
+            helpers(client),
+            v3_line_protocol_tests(client),
+            v3_line_protocol_name_tests(client),
+            v3_influxql_tests(client),
+            v3_influxql_group_tests(client),
+            v3_influxql_parse_tests(client)
+          ]
 
         :v2 ->
           [
@@ -37,6 +44,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
             v2_flux_helpers(client),
             v2_flux_range_tests(client),
             v2_flux_data_tests(client),
+            v2_flux_name_tests(client),
             v2_flux_type_tests(client),
             v2_bucket_tests(client)
           ]
@@ -45,15 +53,14 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           []
       end
 
-    quote do
+    quote location: :keep do
       (unquote_splicing(blocks))
     end
   end
 
   defp helpers(client) do
     quote location: :keep do
-      defp ifl_name(prefix),
-        do: "#{prefix}_#{100_000_000 + System.unique_integer([:positive])}"
+      defp ifl_name(prefix), do: InfluxElixir.IntegrationHelper.unique_name(prefix)
 
       defp ifl_write(ctx, lines) do
         assert {:ok, :written} =
@@ -134,8 +141,8 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                        database: ctx.database
                      )
 
-            assert row["time"] == ifl_us(1), template
-            assert Map.drop(row, ["time", "iox::measurement"]) == columns, template
+            assert row["time"] === ifl_us(1), template
+            assert Map.drop(row, ["time", "iox::measurement"]) === columns, template
           end
         end
 
@@ -159,7 +166,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                      database: ctx.database
                    )
 
-          assert Enum.map(rows, & &1["v"]) == [1.0, 3.0]
+          assert Enum.map(rows, & &1["v"]) === [1.0, 3.0]
         end
 
         test "a quote in a tag value does not join the next line to it", ctx do
@@ -172,7 +179,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                      database: ctx.database
                    )
 
-          assert Enum.map(rows, &{&1["time"], &1["f"], &1["t"]}) == [
+          assert Enum.map(rows, &{&1["time"], &1["f"], &1["t"]}) === [
                    {ifl_us(1), 1, ~s|a"b|},
                    {ifl_us(2), 2, nil}
                  ]
@@ -197,11 +204,72 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
           assert %{"data" => [entry]} = Jason.decode!(body)
 
-          assert entry == %{
+          assert entry === %{
                    "error_message" => "Could not parse entire line. Found trailing content: `6`",
                    "line_number" => 1,
                    "original_line" => "#c"
                  }
+        end
+      end
+    end
+  end
+
+  defp v3_line_protocol_name_tests(client) do
+    quote location: :keep do
+      # A name that ends in a backslash, wherever it ends; `~m` is the measurement.
+      @ifl_v3_backslash [
+        ~S"~m\\ v=1i 5",
+        ~S"~m\\",
+        ~S"~m,t\\ v=1i 5",
+        ~S"~m,t\\",
+        ~S"~m,t=a\\",
+        ~S"~m,t=a\\ ",
+        ~S"~m,t=a\\ v=1i 5",
+        ~S"~m,t\\=1 v=1i",
+        ~S"~m,t=\\ v=1i",
+        ~S"~m v\\ =1i 5",
+        ~S"~m v\\",
+        ~S"~m v=1i,w\\ x=1i",
+        ~S"~m v=1i,w\\=1i",
+        ~S"~m v\\=1i 5"
+      ]
+
+      describe "line protocol names — InfluxDB 3 contract" do
+        test "a name that ends in a backslash is refused wherever it ends", ctx do
+          message =
+            "Measurements, tag keys and values, and field keys may not end with a backslash"
+
+          for template <- @ifl_v3_backslash do
+            line = String.replace(template, "~m", ifl_name("ifl_bs"))
+
+            assert {:error, %{status: 400, body: body}} =
+                     unquote(client).write(ctx.conn, line, database: ctx.database)
+
+            assert [{1, ^message}] = ifl_partial_errors(body), line
+          end
+        end
+
+        test "an escaped separator is part of the name", ctx do
+          for {template, name, columns} <- [
+                {~S"~m,t\,u=1 v=1i 1000", "~m", %{"t,u" => "1", "v" => 1}},
+                {~S"~m\ z v=1i 1000", "~m z", %{"v" => 1}},
+                {~S"~m\,z v=1i 1000", "~m,z", %{"v" => 1}}
+              ] do
+            m = ifl_name("ifl_sep")
+            ifl_write(ctx, [String.replace(template, "~m", m)])
+
+            measurement = String.replace(name, "~m", m)
+
+            assert {:ok, [row]} =
+                     unquote(client).query_influxql(
+                       ctx.conn,
+                       ~s|SELECT * FROM "#{measurement}"|,
+                       database: ctx.database
+                     )
+
+            assert row["iox::measurement"] === measurement
+            assert Map.drop(row, ["time", "iox::measurement"]) === columns, template
+          end
         end
       end
     end
@@ -242,11 +310,11 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         test "a keyword inside a quoted string is a string, not a keyword", ctx do
-          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE k = 'into'") == [4.0]
-          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE k = 'fill('") == []
-          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE k = 'group by x'") == []
-          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE k =~ /into/") == [4.0]
-          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE k =~ /fill\\(/") == []
+          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE k = 'into'") === [4.0]
+          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE k = 'fill('") === []
+          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE k = 'group by x'") === []
+          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE k =~ /into/") === [4.0]
+          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE k =~ /fill\\(/") === []
         end
 
         test "next to time, an integer or a duration is nanoseconds since the epoch", ctx do
@@ -265,7 +333,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                 {"time > 1s - 999999000ns", [2.0, 3.0, 4.0]},
                 {"k != 'a' AND time >= 2000", [2.0, 4.0]}
               ] do
-            assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE #{where}") == expected,
+            assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} WHERE #{where}") === expected,
                    where
           end
         end
@@ -307,7 +375,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           assert {:ok, rows} =
                    ifl_iq(ctx, "SELECT mean(v) FROM #{ctx.m} WHERE time >= 2000 GROUP BY k")
 
-          assert Enum.map(rows, &{&1["k"], &1["mean"], &1["time"]}) == [
+          assert Enum.map(rows, &{&1["k"], &1["mean"], &1["time"]}) === [
                    {"a", 3.0, two},
                    {"b", 2.0, two},
                    {"into", 4.0, two}
@@ -317,7 +385,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         test "LIMIT and OFFSET count per selected field, not per row", ctx do
           assert {:ok, rows} = ifl_iq(ctx, "SELECT v, x FROM #{ctx.m} LIMIT 2")
 
-          assert Enum.map(rows, &{&1["time"], &1["v"], &1["x"]}) == [
+          assert Enum.map(rows, &{&1["time"], &1["v"], &1["x"]}) === [
                    {ifl_us(1), 1.0, nil},
                    {ifl_us(2), 2.0, nil},
                    {ifl_us(5), nil, 7}
@@ -325,12 +393,186 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
           assert {:ok, rows} = ifl_iq(ctx, "SELECT * FROM #{ctx.m} LIMIT 1")
 
-          assert Enum.map(rows, &{&1["time"], &1["k"], &1["v"], &1["w"], &1["x"]}) == [
+          assert Enum.map(rows, &{&1["time"], &1["k"], &1["v"], &1["w"], &1["x"]}) === [
                    {ifl_us(1), "a", 1.0, 10.0, nil},
                    {ifl_us(5), "c", nil, nil, 7}
                  ]
 
-          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} LIMIT 1 OFFSET 1") == [2.0]
+          assert ifl_iq_values(ctx, "SELECT v FROM #{ctx.m} LIMIT 1 OFFSET 1") === [2.0]
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_group_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL GROUP BY order — contract" do
+        test "series are ordered by tag key whatever GROUP BY's order, a missing tag last",
+             ctx do
+          m = ifl_name("ifl_grp")
+
+          ifl_write(ctx, [
+            "#{m},h=a,r=2 v=1 1000",
+            "#{m},h=b,r=1 v=2 2000",
+            "#{m},h=a,r=1 v=3 3000",
+            "#{m},h=c v=4 4000",
+            "#{m},r=0 v=5 5000"
+          ])
+
+          expected = [
+            {"a", "1", 3.0},
+            {"a", "2", 1.0},
+            {"b", "1", 2.0},
+            {"c", nil, 4.0},
+            {nil, "0", 5.0}
+          ]
+
+          for select <- ["mean(v)", "v"], by <- ["h, r", "r, h"] do
+            assert {:ok, rows} = ifl_iq(ctx, "SELECT #{select} FROM #{m} GROUP BY #{by}")
+
+            assert Enum.map(rows, &{&1["h"], &1["r"], &1["mean"] || &1["v"]}) === expected,
+                   "SELECT #{select} GROUP BY #{by}"
+          end
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_parse_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL parse errors — contract" do
+        setup ctx do
+          m = ifl_name("ifl_pe")
+          ifl_write(ctx, ["#{m},k=a v=1 1000", "#{m},k=--1 v=2 2000"])
+          {:ok, m: m, prefix: "SELECT v FROM #{m} WHERE "}
+        end
+
+        @ifl_parse "error in InfluxQL statement: parsing error: "
+
+        test "an operand that is missing or cannot start is an invalid conditional expression",
+             %{prefix: prefix} = ctx do
+          # `--` starts a comment, so `v > --1` has no operand. The position
+          # is the end of the operator that wants one.
+          for {where, at} <- [
+                {"v > --1", 3},
+                {"v >--1", 3},
+                {"v>--1", 2},
+                {"v > .", 3},
+                {"v > -.", 3},
+                {"v >.", 3},
+                {"v >", 3},
+                {"v > ) ", 3},
+                {"v > AND k = 1", 3},
+                {"v > 1 AND", 9},
+                {"v > 1 AND v > --1", 13},
+                {"v > 1 AND v > .", 13}
+              ] do
+            expected =
+              @ifl_parse <> "invalid conditional expression at pos #{byte_size(prefix) + at}"
+
+            assert {:error, %{status: 400, body: ^expected}} = ifl_iq(ctx, prefix <> where),
+                   where
+          end
+
+          expected = @ifl_parse <> "invalid conditional, expected regular expression at pos "
+
+          assert {:error, %{status: 400, body: body}} = ifl_iq(ctx, prefix <> "v =~ ")
+          assert body === expected <> "#{byte_size(prefix) + 4}"
+        end
+
+        test "a comment ends at its line; a quoted -- is text", %{prefix: prefix} = ctx do
+          for {where, expected} <- [
+                {"v > 1 -- trailing", [2.0]},
+                {"v > 1 -- c\n AND v < 5", [2.0]},
+                {"v > 0 --c LIMIT 1", [1.0, 2.0]},
+                {"v > 1;", [2.0]},
+                {"v > 1; ; -- c", [2.0]},
+                {"k = '--1' OR v > 5", [2.0]}
+              ] do
+            assert {:ok, rows} = ifl_iq(ctx, prefix <> where), where
+            assert Enum.map(rows, & &1["v"]) === expected, where
+          end
+        end
+
+        test "an integer beyond 64 bits is an overflow at the end of its digits",
+             %{prefix: prefix} = ctx do
+          for {literal, text} <- [
+                {"99999999999999999999999", "unable to parse integer due to overflow"},
+                {"18446744073709551616", "unable to parse integer due to overflow"},
+                {"-99999999999999999999999", "unable to parse integer due to overflow"},
+                {"1 + 99999999999999999999999", "unable to parse integer due to overflow"},
+                {"99999999999999999999999s", "unable to parse integer due to overflow"},
+                {"-9223372036854775809", "constant overflows signed integer"}
+              ] do
+            where = "v > " <> literal
+            # a duration's unit is not part of the number it overflows
+            unit = if String.ends_with?(where, "s"), do: 1, else: 0
+            pos = byte_size(prefix) + byte_size(where) - unit
+            expected = @ifl_parse <> text <> " at pos #{pos}"
+
+            assert {:error, %{status: 400, body: ^expected}} = ifl_iq(ctx, prefix <> where),
+                   where
+          end
+
+          assert {:error, %{status: 400, body: body}} =
+                   ifl_iq(ctx, prefix <> "v > 9223372036854775808s")
+
+          pos = byte_size(prefix) + byte_size("v > 9223372036854775808")
+
+          assert body ===
+                   @ifl_parse <>
+                     "invalid InfluxQL statement at pos #{pos}. Parsing Error: Nom(\"s\", Tag)"
+        end
+
+        test "the largest 64-bit integers and a float of any size are numbers",
+             %{prefix: prefix} = ctx do
+          for {literal, expected} <- [
+                {"18446744073709551615", []},
+                {"-9223372036854775808", [1.0, 2.0]},
+                {"99999999999999999999999.5", []},
+                {"-99999999999999999999999.5", [1.0, 2.0]}
+              ] do
+            assert {:ok, rows} = ifl_iq(ctx, prefix <> "v > " <> literal), literal
+            assert Enum.map(rows, & &1["v"]) === expected, literal
+          end
+        end
+
+        test "after a ;, another statement is the engine's error and nothing else is read",
+             %{prefix: prefix, m: m} = ctx do
+          # The position is where the second statement starts, and the rest
+          # of the text is shown from there.
+          for {tail, next} <- [
+                {"v > 1; SELECT 2", "SELECT 2"},
+                {"v = 'a'; DROP", "DROP"},
+                {"v > 1 ; SELECT 2", "SELECT 2"},
+                {"v > 1;SELECT 2", "SELECT 2"},
+                {"v > 1;   SELECT 2", "SELECT 2"},
+                {"v > 1;; DROP", "DROP"},
+                {"v > 1; ; DROP", "DROP"},
+                {"v > 1 GROUP BY k; SELECT 2", "SELECT 2"},
+                {"v > 1 LIMIT 1; DROP", "DROP"},
+                {"v > 1; x", "x"}
+              ] do
+            statement = prefix <> tail
+            pos = byte_size(statement) - byte_size(next)
+
+            expected =
+              @ifl_parse <>
+                "invalid InfluxQL statement at pos #{pos}. Parsing Error: Nom(#{inspect(next)}, Tag)"
+
+            assert {:error, %{status: 400, body: ^expected}} = ifl_iq(ctx, statement), tail
+          end
+
+          one = "must provide only one InfluxQl statement per query"
+
+          for tail <- ["v > 1; SELECT v FROM #{m}", "v > 1; SHOW DATABASES"] do
+            assert {:error, %{status: 400, body: ^one}} = ifl_iq(ctx, prefix <> tail), tail
+          end
+
+          # The second statement is read, and its own error is positioned in the text.
+          statement = prefix <> "v > 1; SELECT v FROM #{m} WHERE v >"
+          expected = @ifl_parse <> "invalid conditional expression at pos #{byte_size(statement)}"
+          assert {:error, %{status: 400, body: ^expected}} = ifl_iq(ctx, statement)
         end
       end
     end
@@ -340,7 +582,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   # InfluxDB 2 line protocol
   # ---------------------------------------------------------------------------
 
-  defp v2_line_protocol_helpers(client) do
+  defp v2_line_protocol_helpers(_client) do
     quote location: :keep do
       # The Go parser's words; `~m` is the measurement.
       @ifl_v2_errors [
@@ -369,7 +611,22 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
            ~S|strconv.ParseInt: parsing "9223372036854775808": value out of range|},
         {"~m v=18446744073709551616u",
          "unable to parse unsigned 18446744073709551616: " <>
-           ~S|strconv.ParseUint: parsing "18446744073709551616": value out of range|}
+           ~S|strconv.ParseUint: parsing "18446744073709551616": value out of range|},
+        # a name that ends in a backslash is judged where the line scans on
+        {~S"~m\\ v=1i 5", "invalid field format"},
+        {~S"~m\\", "missing fields"},
+        {~S"~m,t\\ v=1i 5", "invalid field format"},
+        {~S"~m,t\\", "missing tag value"},
+        {~S"~m,t=a\\", "missing fields"},
+        {~S"~m,t=a\\ ", "missing fields"},
+        {~S"~m,t=a\\ v=1i 5", "invalid tag format"},
+        {~S"~m,t\\=1 v=1i", "missing tag value"},
+        {~S"~m,t=\\ v=1i", "invalid tag format"},
+        {~S"~m v\\ =1i 5", "invalid field format"},
+        {~S"~m v\\", "invalid field format"},
+        {~S"~m v=1i,w\\ x=1i", "invalid field format"},
+        {~S"~m v=1i,w\\=1i", ~S"invalid value: field-key=w\\=1i"},
+        {~S"~m v\\=1i 5", ~S"invalid value: field-key=v\\=1i"}
       ]
 
       # The drops of one payload against a measurement that holds `v` as a
@@ -378,10 +635,9 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       # the first drop of the earliest group that dropped any, and `dropped`
       # counts that group's drops.
       # Each payload with every drop the engine may report. When more than one
-      # shard group fails, the engine reports one of them and which one varies
-      # between identical writes (verified: 10 of 12 the earliest group's, 2 of
-      # 12 another's); the double always reports the earliest group's, listed
-      # first.
+      # shard group fails, the engine reports one of them, and identical
+      # writes were answered with different groups' (verified); the double
+      # always reports the earliest group's, listed first.
       @ifl_v2_drops [
         {"~m time=1 5\n~m v=1i 6", [{:invalid, "~m", 2}]},
         {"~m v=1i 6\n~m time=1 5", [{:conflict, "~m", 2}]},
@@ -402,12 +658,8 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         do: %{"code" => "invalid", "message" => message}
 
       # A bucket that keeps two hours; the engine's id and clock are masked.
-      defp ifl_retention_bucket(ctx) do
-        name = ifl_name("ifl_rb")
-        :ok = unquote(client).create_bucket(ctx.conn, name, retention: 7200)
-        ifl_delete_after(ctx, name)
-        name
-      end
+      defp ifl_with_retention_bucket(ctx, fun),
+        do: ifl_with_bucket(ctx, "ifl_rb", [retention: 7200], fun)
 
       defp ifl_masked(body) do
         update_in(Jason.decode!(body)["message"], fn message ->
@@ -452,7 +704,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
             assert {:error, %{status: 400, body: body}} =
                      unquote(client).write(ctx.conn, line, database: ctx.database)
 
-            assert Jason.decode!(body) == ifl_v2_invalid("unable to parse '#{line}': #{reason}"),
+            assert Jason.decode!(body) === ifl_v2_invalid("unable to parse '#{line}': #{reason}"),
                    line
           end
         end
@@ -463,7 +715,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           assert {:error, %{status: 400, body: body}} =
                    unquote(client).write(ctx.conn, "#{m} n=1i\r\n", database: ctx.database)
 
-          assert Jason.decode!(body) ==
+          assert Jason.decode!(body) ===
                    ifl_v2_invalid("unable to parse '#{m} n=1i\r': invalid number")
         end
 
@@ -477,7 +729,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                      database: ctx.database
                    )
 
-          assert Jason.decode!(body) ==
+          assert Jason.decode!(body) ===
                    ifl_v2_invalid(
                      "unable to parse 'bad line': invalid field format\n" <>
                        "unable to parse '#{m} v=': missing field value"
@@ -490,7 +742,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           ifl_write(ctx, ["", "  # a comment", "   ", "\t#{m} v=1 5", ""])
 
           assert {:ok, [row]} = ifl_flux(ctx, ifl_measurement_query(ctx, m, 100))
-          assert {row["_measurement"], row["_field"], row["_value"]} == {m, "v", 1.0}
+          assert {row["_measurement"], row["_field"], row["_value"]} === {m, "v", 1.0}
         end
 
         test "a line left open by a quote is quoted without the payload's final newline",
@@ -500,7 +752,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           assert {:error, %{status: 400, body: body}} =
                    unquote(client).write(ctx.conn, ~s|#{m} f="a\nBAD\n|, database: ctx.database)
 
-          assert Jason.decode!(body) ==
+          assert Jason.decode!(body) ===
                    ifl_v2_invalid(~s|unable to parse '#{m} f="a\nBAD': unbalanced quotes|)
         end
 
@@ -513,12 +765,14 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           assert {:error, %{status: 422, body: body}} =
                    unquote(client).write(ctx.conn, "#{m} time=1 5", database: ctx.database)
 
-          assert Jason.decode!(body) == %{
+          assert Jason.decode!(body) === %{
                    "code" => "unprocessable entity",
                    "message" => ifl_v2_drop_message(:invalid, m, 1)
                  }
         end
 
+        @tag local_divergence:
+               "the engine reports any failing shard group; Local always the earliest"
         test "dropped points are counted per shard group, the earliest group's first drop speaks",
              ctx do
           m = ifl_name("ifl_drop")
@@ -542,8 +796,8 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                      unquote(client).write(ctx.conn, payload, database: ctx.database)
 
             # The double's answer is the first; the engine's is any of them.
-            if unquote(client) == InfluxElixir.Client.Local,
-              do: assert(Jason.decode!(body) == hd(messages), template),
+            if unquote(client) === InfluxElixir.Client.Local,
+              do: assert(Jason.decode!(body) === hd(messages), template),
               else: assert(Jason.decode!(body) in messages, template)
           end
         end
@@ -557,15 +811,13 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
   defp v2_flux_helpers(client) do
     quote location: :keep do
-      # A real server outlives the test, so its bucket is deleted after it;
-      # the double may be gone by then.
-      defp ifl_delete_after(ctx, name) do
-        on_exit(fn ->
-          try do
-            unquote(client).delete_bucket(ctx.conn, name)
-          rescue
-            ArgumentError -> :ok
-          end
+      # Runs `fun` with a bucket the test creates. A real server outlives the
+      # test, so the bucket is deleted when `fun` returns or raises, in the
+      # test's own process (the double's store dies with it).
+      defp ifl_with_bucket(ctx, prefix, opts, fun) do
+        InfluxElixir.ClientContract.with_scratch(unquote(client), ctx, :bucket, prefix, fn name ->
+          :ok = unquote(client).create_bucket(ctx.conn, name, opts)
+          fun.(name)
         end)
       end
 
@@ -598,12 +850,12 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         test "integer seconds become int64 nanoseconds, and wrap when they do not fit", ctx do
           assert {:ok, rows} = ifl_flux(ctx, ifl_range(ctx, "99999999999999"))
 
-          assert Enum.map(rows, & &1["_value"]) == [1.0, 2.0]
-          assert Enum.all?(rows, &(&1["_stop"] == ~U[1976-05-08 04:06:59.520689Z]))
+          assert Enum.map(rows, & &1["_value"]) === [1.0, 2.0]
+          assert Enum.all?(rows, &(&1["_stop"] === ~U[1976-05-08 04:06:59.520689Z]))
 
           assert {:ok, rows} = ifl_flux(ctx, ifl_range(ctx, "9223372036"))
 
-          assert Enum.all?(rows, &(&1["_stop"] == ~U[2262-04-11 23:47:16.000000Z]))
+          assert Enum.all?(rows, &(&1["_stop"] === ~U[2262-04-11 23:47:16.000000Z]))
 
           # The stop wraps below the start, but a range is judged on the
           # seconds: nothing is read, and there is no error.
@@ -614,7 +866,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           for stop <- ["0", "-1", "9223372036854775807", "1970-01-01T00:00:00Z"] do
             assert {:error, %{status: 400, body: body}} = ifl_flux(ctx, ifl_range(ctx, stop))
 
-            assert Jason.decode!(body) == %{
+            assert Jason.decode!(body) === %{
                      "code" => "invalid",
                      "message" =>
                        "error in building plan while starting program: " <>
@@ -674,7 +926,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
           for {stage, value} <- [{"first()", 2}, {"last()", 1}, {"limit(n: 1)", 2}] do
             assert {:ok, [row]} = ifl_flux(ctx, base <> "|> " <> stage)
-            assert row["_value"] == value, stage
+            assert row["_value"] === value, stage
           end
         end
 
@@ -685,7 +937,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
           assert {:ok, rows} = ifl_flux(ctx, ifl_filter_base(ctx) <> either)
 
-          assert Enum.map(rows, &{&1["table"], &1["_measurement"], &1["h"], &1["_value"]}) ==
+          assert Enum.map(rows, &{&1["table"], &1["_measurement"], &1["h"], &1["_value"]}) ===
                    [{0, a, "x", 1.0}, {1, a, "y", 4.0}, {2, c, "x", 3.0}]
         end
 
@@ -720,7 +972,13 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                        ~s/|> filter(fn: (r) => r._measurement == "#{a}" and r.h == "y")/
                    )
         end
+      end
+    end
+  end
 
+  defp v2_flux_name_tests(_client) do
+    quote location: :keep do
+      describe "Flux names and quotes — InfluxDB 2 contract" do
         test "a quote in a tag value does not join the next line to it", ctx do
           m = ifl_name("ifl_fq")
           ifl_write(ctx, [~s|#{m},t=a"b f=1i 1000000000|, "#{m} f=2i 2000000000"])
@@ -732,7 +990,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                        ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
                    )
 
-          assert rows |> Enum.map(&{&1["t"], &1["_value"]}) |> Enum.sort() ==
+          assert rows |> Enum.map(&{&1["t"], &1["_value"]}) |> Enum.sort() ===
                    [{nil, 2}, {~s|a"b|, 1}]
         end
 
@@ -748,7 +1006,25 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                        ~s|\|> filter(fn: (r) => r._measurement == "#{m},t=a")|
                    )
 
-          assert name == "#{m},t=a"
+          assert name === "#{m},t=a"
+        end
+
+        test "an escaped separator is part of a name, and Flux returns the unescaped one", ctx do
+          for {template, name, columns} <- [
+                {~S"~m,t\,u=1 v=1i 1000000000", "~m", %{"t,u" => "1"}},
+                {~S"~m\ z v=1i 1000000000", "~m z", %{}},
+                {~S"~m\,z v=1i 1000000000", "~m,z", %{}}
+              ] do
+            m = ifl_name("ifl_sep")
+            ifl_write(ctx, [String.replace(template, "~m", m)])
+
+            measurement = String.replace(name, "~m", m)
+            assert {:ok, [row]} = ifl_flux(ctx, ifl_measurement_query(ctx, measurement, 100))
+
+            assert row["_measurement"] === measurement
+            assert row["_value"] === 1
+            assert Map.take(row, Map.keys(columns)) === columns, template
+          end
         end
 
         test "a measurement whose escapes the index and the data read differently is not read",
@@ -769,7 +1045,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                        ~s|\|> filter(fn: (r) => r._field == "#{field}")|
                    )
 
-          assert Enum.map(rows, &{&1["_measurement"], &1["_value"]}) == [{sentinel, 2}]
+          assert Enum.map(rows, &{&1["_measurement"], &1["_value"]}) === [{sentinel, 2}]
         end
       end
     end
@@ -780,100 +1056,105 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       describe "line protocol retention — InfluxDB 2 contract" do
         test "a point older than the bucket's retention is dropped, the others are written",
              ctx do
-          bucket = ifl_retention_bucket(ctx)
-          m = ifl_name("ifl_old")
-          fresh = System.os_time(:nanosecond) - 60_000_000_000
+          ifl_with_retention_bucket(ctx, fn bucket ->
+            m = ifl_name("ifl_old")
+            fresh = System.os_time(:nanosecond) - 60_000_000_000
 
-          payload =
-            "#{m},t=b,u=c v=1i 1672790400000000001\n" <>
-              "#{m},t=a v=2i 1672790400123456789\n#{m} v=3i #{fresh}"
+            payload =
+              "#{m},t=b,u=c v=1i 1672790400000000001\n" <>
+                "#{m},t=a v=2i 1672790400123456789\n#{m} v=3i #{fresh}"
 
-          assert {:error, %{status: 422, body: body}} =
-                   unquote(client).write(ctx.conn, payload, database: bucket)
+            assert {:error, %{status: 422, body: body}} =
+                     unquote(client).write(ctx.conn, payload, database: bucket)
 
-          assert ifl_masked(body) == %{
-                   "code" => "unprocessable entity",
-                   "message" =>
-                     ifl_retention_message(
-                       2,
-                       "#{m},t=b,u=c",
-                       "2023-01-04T00:00:00.000000001Z",
-                       "#{m},t=a",
-                       "2023-01-04T00:00:00.123456789Z"
+            assert ifl_masked(body) ===
+                     %{
+                       "code" => "unprocessable entity",
+                       "message" =>
+                         ifl_retention_message(
+                           2,
+                           "#{m},t=b,u=c",
+                           "2023-01-04T00:00:00.000000001Z",
+                           "#{m},t=a",
+                           "2023-01-04T00:00:00.123456789Z"
+                         )
+                     }
+
+            assert {:ok, rows} =
+                     ifl_flux(
+                       ctx,
+                       ~s|from(bucket: "#{bucket}") \|> range(start: -1h) | <>
+                         ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
                      )
-                 }
 
-          assert {:ok, rows} =
-                   ifl_flux(
-                     ctx,
-                     ~s|from(bucket: "#{bucket}") \|> range(start: -1h) | <>
-                       ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
-                   )
-
-          assert Enum.map(rows, & &1["_value"]) == [3]
+            assert Enum.map(rows, & &1["_value"]) === [3]
+          end)
         end
 
         test "a series key in a retention drop is sorted by tag and escaped", ctx do
-          bucket = ifl_retention_bucket(ctx)
-          m = ifl_name("ifl_oldkey")
+          ifl_with_retention_bucket(ctx, fn bucket ->
+            m = ifl_name("ifl_oldkey")
 
-          payload = ~s|#{m}\\ x\\,y,b\\ k\\=1=v\\,2\\ 3,a=z v=1i 1672790400000000000|
+            payload = ~s|#{m}\\ x\\,y,b\\ k\\=1=v\\,2\\ 3,a=z v=1i 1672790400000000000|
 
-          assert {:error, %{status: 422, body: body}} =
-                   unquote(client).write(ctx.conn, payload, database: bucket)
+            assert {:error, %{status: 422, body: body}} =
+                     unquote(client).write(ctx.conn, payload, database: bucket)
 
-          key = ~s|#{m}\\ x\\,y,a=z,b\\ k\\=1=v\\,2\\ 3|
+            key = ~s|#{m}\\ x\\,y,a=z,b\\ k\\=1=v\\,2\\ 3|
 
-          assert ifl_masked(body)["message"] ==
-                   ifl_retention_message(
-                     1,
-                     key,
-                     "2023-01-04T00:00:00Z",
-                     key,
-                     "2023-01-04T00:00:00Z"
-                   )
+            assert ifl_masked(body)["message"] ===
+                     ifl_retention_message(
+                       1,
+                       key,
+                       "2023-01-04T00:00:00Z",
+                       key,
+                       "2023-01-04T00:00:00Z"
+                     )
+          end)
         end
 
         test "a point older than the retention registers no field and is dropped whatever it is",
              ctx do
-          bucket = ifl_retention_bucket(ctx)
-          m = ifl_name("ifl_oldtype")
-          now = System.os_time(:nanosecond)
+          ifl_with_retention_bucket(ctx, fn bucket ->
+            m = ifl_name("ifl_oldtype")
+            now = System.os_time(:nanosecond)
 
-          for payload <- [
-                "#{m} v=2.5 1672790400000000000\n#{m} v=1i #{now}",
-                "#{m} time=1 1672790400000000000\n#{m} v=1i #{now + 1}"
-              ] do
-            assert {:error, %{status: 422, body: body}} =
-                     unquote(client).write(ctx.conn, payload, database: bucket)
+            for payload <- [
+                  "#{m} v=2.5 1672790400000000000\n#{m} v=1i #{now}",
+                  "#{m} time=1 1672790400000000000\n#{m} v=1i #{now + 1}"
+                ] do
+              assert {:error, %{status: 422, body: body}} =
+                       unquote(client).write(ctx.conn, payload, database: bucket)
 
-            assert Jason.decode!(body)["message"] =~
-                     "partial write: dropped 1 points outside retention policy of duration 2h0m0s"
-          end
+              assert Jason.decode!(body)["message"] =~
+                       "partial write: dropped 1 points outside retention policy of duration 2h0m0s"
+            end
 
-          assert {:ok, :written} =
-                   unquote(client).write(ctx.conn, "#{m} v=3i #{now + 2}", database: bucket)
+            assert {:ok, :written} =
+                     unquote(client).write(ctx.conn, "#{m} v=3i #{now + 2}", database: bucket)
+          end)
         end
 
         test "a type conflict in a group is reported instead of the retention drops", ctx do
-          bucket = ifl_retention_bucket(ctx)
-          m = ifl_name("ifl_oldconf")
-          now = System.os_time(:nanosecond)
+          ifl_with_retention_bucket(ctx, fn bucket ->
+            m = ifl_name("ifl_oldconf")
+            now = System.os_time(:nanosecond)
 
-          assert {:ok, :written} =
-                   unquote(client).write(ctx.conn, "#{m} v=1i #{now}", database: bucket)
+            assert {:ok, :written} =
+                     unquote(client).write(ctx.conn, "#{m} v=1i #{now}", database: bucket)
 
-          assert {:error, %{status: 422, body: body}} =
-                   unquote(client).write(
-                     ctx.conn,
-                     "#{m} v=1i 1672790400000000000\n#{m} v=2.5 #{now + 1}",
-                     database: bucket
-                   )
+            assert {:error, %{status: 422, body: body}} =
+                     unquote(client).write(
+                       ctx.conn,
+                       "#{m} v=1i 1672790400000000000\n#{m} v=2.5 #{now + 1}",
+                       database: bucket
+                     )
 
-          assert Jason.decode!(body)["message"] ==
-                   "failure writing points to database: partial write: field type conflict: " <>
-                     ~s|input field "v" on measurement "#{m}" is type float, | <>
-                     "already exists as type integer dropped=1"
+            assert Jason.decode!(body)["message"] ===
+                     "failure writing points to database: partial write: field type conflict: " <>
+                       ~s|input field "v" on measurement "#{m}" is type float, | <>
+                       "already exists as type integer dropped=1"
+          end)
         end
       end
     end
@@ -896,7 +1177,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           assert {:error, %{status: 422, body: body}} =
                    unquote(client).write(ctx.conn, "#{m} v=3i 6", database: ctx.database)
 
-          assert Jason.decode!(body) == %{
+          assert Jason.decode!(body) === %{
                    "code" => "unprocessable entity",
                    "message" => ifl_v2_drop_message(:conflict, m, 1)
                  }
@@ -912,8 +1193,8 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
             Enum.map(rows, & &1["_value"])
           end
 
-          assert read.(0) == [1.5]
-          assert read.(1_000_000) == [1, 2]
+          assert read.(0) === [1.5]
+          assert read.(1_000_000) === [1, 2]
         end
 
         test "after the first group of another type, no later group of the field is read", ctx do
@@ -926,7 +1207,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
             "#{m} f=4i #{ifl_week(3)}"
           ])
 
-          assert ifl_weeks(ctx, m) == [{"f", nil, 1}, {"f", nil, 2}]
+          assert ifl_weeks(ctx, m) === [{"f", nil, 1}, {"f", nil, 2}]
         end
 
         test "a group that differs from the first hides the rest, even of the first's type",
@@ -940,7 +1221,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
             "#{m} f=4i #{ifl_week(3)}"
           ])
 
-          assert ifl_weeks(ctx, m) == [{"f", nil, 1}]
+          assert ifl_weeks(ctx, m) === [{"f", nil, 1}]
         end
 
         test "the cut is per measurement and field, across the tag sets", ctx do
@@ -953,7 +1234,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
             "#{m},t=b f=3i #{ifl_week(2)}"
           ])
 
-          assert ifl_weeks(ctx, m) == [{"f", "a", 1}, {"f", "b", 1}]
+          assert ifl_weeks(ctx, m) === [{"f", "a", 1}, {"f", "b", 1}]
         end
 
         test "a field that conflicts in a group does not cut the other fields", ctx do
@@ -965,7 +1246,12 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
             "#{m} f=3i,g=3i #{ifl_week(2)}"
           ])
 
-          assert ifl_weeks(ctx, m) == [{"f", nil, 1}, {"g", nil, 1}, {"g", nil, 2}, {"g", nil, 3}]
+          assert ifl_weeks(ctx, m) === [
+                   {"f", nil, 1},
+                   {"g", nil, 1},
+                   {"g", nil, 2},
+                   {"g", nil, 3}
+                 ]
         end
       end
     end
@@ -975,74 +1261,68 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "Bucket listing — InfluxDB 2 contract" do
         test "a listed bucket carries the engine's fields", ctx do
-          name = ifl_name("ifl_bkt")
-          :ok = unquote(client).create_bucket(ctx.conn, name, [])
-          ifl_delete_after(ctx, name)
+          ifl_with_bucket(ctx, "ifl_bkt", [], fn name ->
+            assert {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
 
-          assert {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
+            assert %{"id" => id, "orgID" => org_id} =
+                     bucket = Enum.find(buckets, &(&1["name"] === name))
 
-          assert %{"id" => id, "orgID" => org_id} =
-                   bucket = Enum.find(buckets, &(&1["name"] == name))
+            assert bucket |> Map.keys() |> Enum.sort() ===
+                     ~w(createdAt id labels links name orgID retentionRules type updatedAt)
 
-          assert bucket |> Map.keys() |> Enum.sort() ==
-                   ~w(createdAt id labels links name orgID retentionRules type updatedAt)
+            assert id =~ ~r/\A[0-9a-f]{16}\z/
+            assert org_id =~ ~r/\A[0-9a-f]{16}\z/
+            assert bucket["type"] === "user"
+            assert bucket["labels"] === []
 
-          assert id =~ ~r/\A[0-9a-f]{16}\z/
-          assert org_id =~ ~r/\A[0-9a-f]{16}\z/
-          assert bucket["type"] == "user"
-          assert bucket["labels"] == []
+            for stamp <- [bucket["createdAt"], bucket["updatedAt"]],
+                do: assert(stamp =~ ~r/\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z\z/)
 
-          for stamp <- [bucket["createdAt"], bucket["updatedAt"]],
-              do: assert(stamp =~ ~r/\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+Z\z/)
+            assert bucket["retentionRules"] === [
+                     %{
+                       "type" => "expire",
+                       "everySeconds" => 0,
+                       "shardGroupDurationSeconds" => 604_800
+                     }
+                   ]
 
-          assert bucket["retentionRules"] == [
-                   %{
-                     "type" => "expire",
-                     "everySeconds" => 0,
-                     "shardGroupDurationSeconds" => 604_800
+            assert bucket["links"] === %{
+                     "labels" => "/api/v2/buckets/#{id}/labels",
+                     "members" => "/api/v2/buckets/#{id}/members",
+                     "org" => "/api/v2/orgs/#{org_id}",
+                     "owners" => "/api/v2/buckets/#{id}/owners",
+                     "self" => "/api/v2/buckets/#{id}",
+                     "write" => "/api/v2/write?org=#{org_id}&bucket=#{id}"
                    }
-                 ]
 
-          assert bucket["links"] == %{
-                   "labels" => "/api/v2/buckets/#{id}/labels",
-                   "members" => "/api/v2/buckets/#{id}/members",
-                   "org" => "/api/v2/orgs/#{org_id}",
-                   "owners" => "/api/v2/buckets/#{id}/owners",
-                   "self" => "/api/v2/buckets/#{id}",
-                   "write" => "/api/v2/write?org=#{org_id}&bucket=#{id}"
-                 }
-
-          assert Enum.all?(buckets, &(&1["orgID"] == org_id or &1["type"] == "system"))
+            assert Enum.all?(buckets, &(&1["orgID"] === org_id or &1["type"] === "system"))
+          end)
         end
 
         test "a bucket deleted and created again starts empty and takes any field type", ctx do
-          name = ifl_name("ifl_again")
-          :ok = unquote(client).create_bucket(ctx.conn, name, [])
-          ifl_delete_after(ctx, name)
+          ifl_with_bucket(ctx, "ifl_again", [], fn name ->
+            assert {:ok, :written} = unquote(client).write(ctx.conn, "m v=1i 5", database: name)
+            assert :ok = unquote(client).delete_bucket(ctx.conn, name)
+            assert :ok = unquote(client).create_bucket(ctx.conn, name, [])
+            assert {:ok, :written} = unquote(client).write(ctx.conn, "m v=1.5 6", database: name)
 
-          assert {:ok, :written} = unquote(client).write(ctx.conn, "m v=1i 5", database: name)
-          assert :ok = unquote(client).delete_bucket(ctx.conn, name)
-          assert :ok = unquote(client).create_bucket(ctx.conn, name, [])
-          assert {:ok, :written} = unquote(client).write(ctx.conn, "m v=1.5 6", database: name)
+            assert {:ok, rows} =
+                     ifl_flux(ctx, ~s|from(bucket: "#{name}") \|> range(start: 0, stop: 100)|)
 
-          assert {:ok, rows} =
-                   ifl_flux(ctx, ~s|from(bucket: "#{name}") \|> range(start: 0, stop: 100)|)
-
-          assert Enum.map(rows, & &1["_value"]) == [1.5]
+            assert Enum.map(rows, & &1["_value"]) === [1.5]
+          end)
         end
 
         test "the shard group of a bucket follows its retention", ctx do
-          name = ifl_name("ifl_ret")
-          :ok = unquote(client).create_bucket(ctx.conn, name, retention: 7200)
-          ifl_delete_after(ctx, name)
+          ifl_with_bucket(ctx, "ifl_ret", [retention: 7200], fn name ->
+            assert {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
 
-          assert {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
-
-          assert %{
-                   "retentionRules" => [
-                     %{"everySeconds" => 7200, "shardGroupDurationSeconds" => 3600}
-                   ]
-                 } = Enum.find(buckets, &(&1["name"] == name))
+            assert %{
+                     "retentionRules" => [
+                       %{"everySeconds" => 7200, "shardGroupDurationSeconds" => 3600}
+                     ]
+                   } = Enum.find(buckets, &(&1["name"] === name))
+          end)
         end
       end
     end

@@ -56,7 +56,8 @@ defmodule InfluxElixir.Client.Local.SQLBind do
       names ->
         with :ok <- all_bound(names, params),
              {:ok, where} <- bind_where_nodes(query.where, params),
-             {:ok, limit, offset} <- SQLLimit.bind(query.limit, query.offset, params) do
+             {:ok, limit, offset, limit_error} <-
+               SQLLimit.bind(query.limit, query.offset, params) do
           {:ok,
            %{
              query
@@ -65,7 +66,8 @@ defmodule InfluxElixir.Client.Local.SQLBind do
                select_columns: bind_select_columns(query.select_columns, params),
                order_by: bind_order_by(query.order_by, params),
                limit: limit,
-               offset: offset
+               offset: offset,
+               limit_error: limit_error || query.limit_error
            }}
         end
     end

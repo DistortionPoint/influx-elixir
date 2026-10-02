@@ -9,6 +9,8 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
   faithful to real InfluxDB v3 Core.
   """
 
+  # async: false — shares the one real server and the globally named :integration_finch
+  # pool with the other integration modules, and its writes are timed against its clock.
   use ExUnit.Case, async: false
 
   @moduletag :v3_core
@@ -64,7 +66,7 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
       finch = :"stream_release_finch_#{System.unique_integer([:positive])}"
       start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
       conn = Keyword.put(ctx.conn, :finch_name, finch)
-      m = "stream_release_#{System.unique_integer([:positive])}"
+      m = H.unique_name("stream_release")
 
       # Enough rows that the response arrives in many chunks.
       lp = Enum.map_join(1..20_000, "\n", &"#{m},k=k#{rem(&1, 50)} v=#{&1}i #{&1}")
@@ -133,8 +135,43 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
     waiter
   end
 
+  # A request that holds a size-1 pool's only connection until told to let go:
+  # its first callback (the response has started, so the connection is checked
+  # out) sends `{:holding, pid}` to the caller and blocks until `:release`.
+  defp hold_the_only_connection(conn, finch, database) do
+    test_pid = self()
+
+    holder =
+      Task.async(fn ->
+        request =
+          Finch.build(
+            :post,
+            "http://#{conn[:host]}:#{conn[:port]}/api/v3/query_sql",
+            [{"content-type", "application/json"}],
+            Jason.encode!(%{"db" => database, "q" => "SELECT 1", "format" => "json"})
+          )
+
+        Finch.stream(request, finch, :fresh, fn _chunk, acc ->
+          if acc == :fresh do
+            send(test_pid, {:holding, self()})
+
+            receive do
+              :release -> :released
+            end
+          else
+            acc
+          end
+        end)
+      end)
+
+    assert_receive {:holding, _pid}, 10_000
+    holder
+  end
+
+  defp release(holder), do: send(holder.pid, :release)
+
   # Proves :pool_timeout reaches Finch (#14). A pool of size 1 is held by a
-  # streaming request that sleeps inside its chunk callback; a second request
+  # streaming request that blocks inside its chunk callback; a second request
   # must then wait on checkout, and its :pool_timeout decides its fate
   # regardless of how generous :timeout is.
   describe "query_sql/3 with :pool_timeout" do
@@ -142,31 +179,12 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
       finch = :"pool_timeout_finch_#{System.unique_integer([:positive])}"
       start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
       conn = Keyword.put(ctx.conn, :finch_name, finch)
+      holder = hold_the_only_connection(conn, finch, ctx.database)
 
-      holder =
-        Task.async(fn ->
-          request =
-            Finch.build(
-              :post,
-              "http://#{conn[:host]}:#{conn[:port]}/api/v3/query_sql",
-              [{"content-type", "application/json"}],
-              Jason.encode!(%{"db" => ctx.database, "q" => "SELECT 1", "format" => "json"})
-            )
-
-          Finch.stream(request, finch, nil, fn _chunk, acc ->
-            Process.sleep(1_500)
-            acc
-          end)
-        end)
-
-      # Give the holder time to check the only connection out.
-      Process.sleep(200)
       {:ok, conn: conn, holder: holder}
     end
 
     test "a short :pool_timeout fails at checkout even with a long :timeout", ctx do
-      started = System.monotonic_time(:millisecond)
-
       # Finch raises on checkout timeout; the client maps it to a tuple.
       assert {:error, {:connection_error, :pool_timeout}} =
                HTTP.query_sql(ctx.conn, "SELECT 1",
@@ -174,8 +192,6 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
                  timeout: 180_000,
                  pool_timeout: 100
                )
-
-      assert System.monotonic_time(:millisecond) - started < 1_000
 
       # The streaming path reports the same failure as a StreamError.
       error =
@@ -188,17 +204,23 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
       assert error.kind == :transport
       assert error.reason == :pool_timeout
 
-      Task.await(ctx.holder, 10_000)
+      release(ctx.holder)
+      assert {:ok, _result} = Task.await(ctx.holder, 10_000)
     end
 
     test "a generous :pool_timeout waits for the connection and succeeds", ctx do
-      assert {:ok, [%{"one" => 1}]} =
-               HTTP.query_sql(ctx.conn, "SELECT 1 AS one",
-                 database: ctx.database,
-                 pool_timeout: 10_000
-               )
+      waiter =
+        queue_waiter(fn ->
+          HTTP.query_sql(ctx.conn, "SELECT 1 AS one",
+            database: ctx.database,
+            pool_timeout: 10_000
+          )
+        end)
 
-      Task.await(ctx.holder, 10_000)
+      release(ctx.holder)
+
+      assert {:ok, [%{"one" => 1}]} = Task.await(waiter, 10_000)
+      assert {:ok, _result} = Task.await(ctx.holder, 10_000)
     end
   end
 
@@ -261,7 +283,7 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
     end
 
     test "structs, lists, durations and Utf8View strings are the same over Flight", ctx do
-      m = "flight_types_#{System.unique_integer([:positive])}"
+      m = H.unique_name("flight_types")
 
       lp = """
       #{m},host=a v=1.5,s="x" 1700000000000000000
@@ -300,57 +322,44 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
   end
 
   # A retry chain end to end: a pool of size 1 is held by a streaming request,
-  # so the writer's first flush fails at checkout (a transport error, retried);
-  # by the time the backoff fires the holder has released the connection and
-  # the retry reaches the server. No fake server is involved.
+  # so the writer's first flush fails at checkout (a transport error, retried).
+  # `write/2` answers once that first attempt has failed, and only then does the
+  # test release the holder, so the retry reaches the server. No fake server is
+  # involved and nothing depends on timing.
   describe "BatchWriter retry against the server" do
     setup ctx do
       finch = :"bw_int_finch_#{System.unique_integer([:positive])}"
       start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
       conn = Keyword.put(ctx.conn, :finch_name, finch)
+      holder = hold_the_only_connection(conn, finch, ctx.database)
 
-      holder =
-        Task.async(fn ->
-          request =
-            Finch.build(
-              :post,
-              "http://#{conn[:host]}:#{conn[:port]}/api/v3/query_sql",
-              [{"content-type", "application/json"}],
-              Jason.encode!(%{"db" => ctx.database, "q" => "SELECT 1", "format" => "json"})
-            )
-
-          Finch.stream(request, finch, nil, fn _chunk, acc ->
-            Process.sleep(1_000)
-            acc
-          end)
-        end)
-
-      Process.sleep(200)
-      {:ok, conn: conn, holder: holder}
-    end
-
-    test "a transport error is retried and the retry succeeds", ctx do
-      pid =
+      writer =
         start_supervised!(
           {InfluxElixir.Write.BatchWriter,
-           connection: ctx.conn,
+           connection: conn,
            client: HTTP,
            database: ctx.database,
            batch_size: 1,
            flush_interval_ms: 60_000,
            max_retries: 3,
-           base_retry_delay_ms: 1_000,
+           base_retry_delay_ms: 500,
            write_opts: [pool_timeout: 100]}
         )
 
-      # batch_size 1 flushes at once; checkout times out; chain starts.
-      :ok = InfluxElixir.Write.BatchWriter.write(pid, "bw_retry value=1.0")
+      {:ok, conn: conn, holder: holder, writer: writer}
+    end
+
+    test "a transport error is retried and the retry succeeds", ctx do
+      # batch_size 1 flushes at once; the checkout times out; the chain starts.
+      :ok = InfluxElixir.Write.BatchWriter.write(ctx.writer, "bw_retry value=1.0")
 
       assert {:ok, %{total_writes: 0, total_errors: 0}} =
-               InfluxElixir.Write.BatchWriter.stats(pid)
+               InfluxElixir.Write.BatchWriter.stats(ctx.writer)
+
+      release(ctx.holder)
 
       wait_until(fn ->
-        {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(pid)
+        {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(ctx.writer)
         stats.total_writes == 1
       end)
 
@@ -359,35 +368,25 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
       assert {:ok, [%{"value" => 1.0}]} =
                HTTP.query_sql(ctx.conn, "SELECT value FROM bw_retry", database: ctx.database)
 
-      Task.await(ctx.holder, 10_000)
+      assert {:ok, _result} = Task.await(ctx.holder, 10_000)
     end
 
     test "a 4xx answered on retry discards the batch instead of retrying again", ctx do
-      pid =
-        start_supervised!(
-          {InfluxElixir.Write.BatchWriter,
-           connection: ctx.conn,
-           client: HTTP,
-           database: ctx.database,
-           batch_size: 1,
-           flush_interval_ms: 60_000,
-           max_retries: 3,
-           base_retry_delay_ms: 1_000,
-           write_opts: [pool_timeout: 100]}
-        )
-
-      :ok = InfluxElixir.Write.BatchWriter.write(pid, "not line protocol!!!")
+      :ok = InfluxElixir.Write.BatchWriter.write(ctx.writer, "not line protocol!!!")
+      release(ctx.holder)
 
       wait_until(fn ->
-        {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(pid)
+        {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(ctx.writer)
         stats.total_errors == 1
       end)
 
       # The chain is over: a valid batch goes straight through.
-      assert :ok = InfluxElixir.Write.BatchWriter.write_sync(pid, "bw_retry value=2.0")
+      assert :ok = InfluxElixir.Write.BatchWriter.write_sync(ctx.writer, "bw_retry value=2.0")
 
       assert {:ok, %{total_errors: 1, total_writes: 1}} =
-               InfluxElixir.Write.BatchWriter.stats(pid)
+               InfluxElixir.Write.BatchWriter.stats(ctx.writer)
+
+      assert {:ok, _result} = Task.await(ctx.holder, 10_000)
     end
   end
 

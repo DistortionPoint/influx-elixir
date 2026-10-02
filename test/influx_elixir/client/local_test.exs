@@ -5,7 +5,6 @@ defmodule InfluxElixir.Client.LocalTest do
 
   setup do
     {:ok, conn} = Local.start(databases: ["test_db"])
-    on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn}
   end
 
@@ -95,7 +94,6 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, core} = Local.start(profile: :v3_core)
       {:ok, enterprise} = Local.start(profile: :v3_enterprise)
       {:ok, v2} = Local.start(profile: :v2)
-      on_exit(fn -> Enum.each([core, enterprise, v2], &Local.stop/1) end)
 
       assert Local.supports?(core, :query_sql)
       refute Local.supports?(core, :query_flux)
@@ -127,7 +125,7 @@ defmodule InfluxElixir.Client.LocalTest do
     test "pre-creates databases from options, listed with the engine's _internal" do
       {:ok, conn} = Local.start(databases: ["db2", "db1"])
       assert {:ok, dbs} = Local.list_databases(conn)
-      assert Enum.map(dbs, & &1["name"]) == ["_internal", "db1", "db2"]
+      assert Enum.map(dbs, & &1["name"]) === ["_internal", "db1", "db2"]
       Local.stop(conn)
     end
 
@@ -176,7 +174,7 @@ defmodule InfluxElixir.Client.LocalTest do
     test "pre-creates both :database and :databases when both are given" do
       {:ok, conn} = Local.start(database: "primary", databases: ["a", "b"])
       assert {:ok, dbs} = Local.list_databases(conn)
-      assert Enum.map(dbs, & &1["name"]) == ["_internal", "a", "b", "primary"]
+      assert Enum.map(dbs, & &1["name"]) === ["_internal", "a", "b", "primary"]
       assert {:ok, :written} = Local.write(conn, "m v=1i")
       assert {:ok, [_row]} = Local.query_sql(conn, "SELECT v FROM m", database: "primary")
       Local.stop(conn)
@@ -205,7 +203,7 @@ defmodule InfluxElixir.Client.LocalTest do
   describe "init_connection/1 — :database resolution parity" do
     test "init_connection passes :database through to conn-level default" do
       {:ok, conn} = Local.init_connection(database: "metrics")
-      assert conn.database == "metrics"
+      assert conn.database === "metrics"
       Local.stop(conn)
     end
 
@@ -214,7 +212,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, :written} = Local.write(conn, "cpu value=1.0")
 
       {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu")
-      assert row["value"] == 1.0
+      assert row["value"] === 1.0
 
       # The write created no other database.
       assert {:ok, [%{"name" => "_internal"}, %{"name" => "primary"}]} =
@@ -244,7 +242,6 @@ defmodule InfluxElixir.Client.LocalTest do
       # have: code that forgot `database:` passed against the double and
       # failed against InfluxDB.
       {:ok, conn} = Local.init_connection([])
-      on_exit(fn -> Local.stop(conn) end)
 
       assert {:error, :no_database_specified} = Local.write(conn, "cpu value=1.0")
       assert {:error, :no_database_specified} = Local.query_sql(conn, "SELECT 1")
@@ -255,7 +252,7 @@ defmodule InfluxElixir.Client.LocalTest do
           conn |> Local.query_sql_stream("SELECT 1") |> Enum.to_list()
         end
 
-      assert error.kind == :no_database
+      assert error.kind === :no_database
 
       # HTTP sends the InfluxQL without `db`; this is the engine's answer.
       assert {:error,
@@ -288,13 +285,11 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, ent_conn} =
         Local.start(databases: ["ent_db"], profile: :v3_enterprise)
 
-      on_exit(fn -> Local.stop(ent_conn) end)
-
       assert {:ok, :written} =
                Local.write(ent_conn, "cpu value=1.0", database: "auto_db")
 
       assert {:ok, dbs} = Local.list_databases(ent_conn)
-      assert Enum.map(dbs, & &1["name"]) == ["_internal", "auto_db", "ent_db"]
+      assert Enum.map(dbs, & &1["name"]) === ["_internal", "auto_db", "ent_db"]
     end
   end
 
@@ -311,36 +306,36 @@ defmodule InfluxElixir.Client.LocalTest do
     test "boolean false field", %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "m active=false", database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["active"] == false
+      assert row["active"] === false
     end
 
     test "multiple tags are preserved", %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "m,host=s1,region=us-east value=1i", database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["host"] == "s1"
-      assert row["region"] == "us-east"
+      assert row["host"] === "s1"
+      assert row["region"] === "us-east"
     end
 
     test "multiple fields are preserved", %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "m a=1i,b=2.0,c=\"hi\"", database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["a"] == 1
-      assert row["b"] == 2.0
-      assert row["c"] == "hi"
+      assert row["a"] === 1
+      assert row["b"] === 2.0
+      assert row["c"] === "hi"
     end
 
     test "timestamp is returned as a microsecond-precision DateTime", %{conn: conn, db: db} do
       ts = 1_630_424_257_123_456_789
       {:ok, :written} = Local.write(conn, "m value=1.0 #{ts}", database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["time"] == ~U[2021-08-31 15:37:37.123456Z]
+      assert row["time"] === ~U[2021-08-31 15:37:37.123456Z]
     end
 
     test "multi-line write stores multiple points", %{conn: conn, db: db} do
       lp = "m value=1.0 1\nm value=2.0 2\nm value=3.0 3"
       {:ok, :written} = Local.write(conn, lp, database: db)
       assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM m ORDER BY time", database: db)
-      assert Enum.map(rows, & &1["value"]) == [1.0, 2.0, 3.0]
+      assert Enum.map(rows, & &1["value"]) === [1.0, 2.0, 3.0]
     end
   end
 
@@ -440,7 +435,7 @@ defmodule InfluxElixir.Client.LocalTest do
     test "returns all rows for bare SELECT *", %{conn: conn, db: db} do
       assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time", database: db)
 
-      assert Enum.map(rows, &{&1["host"], &1["region"], &1["usage"], &1["idle"]}) == [
+      assert Enum.map(rows, &{&1["host"], &1["region"], &1["usage"], &1["idle"]}) === [
                {"web01", "us-east", 10, 90},
                {"web02", "us-west", 20, 80},
                {"web01", "us-east", 30, 70}
@@ -455,7 +450,7 @@ defmodule InfluxElixir.Client.LocalTest do
                  database: db
                )
 
-      assert Enum.map(rows, &{&1["host"], &1["usage"]}) == [{"web01", 10}, {"web01", 30}]
+      assert Enum.map(rows, &{&1["host"], &1["usage"]}) === [{"web01", 10}, {"web01", 30}]
     end
 
     test "WHERE field comparisons filter rows", %{conn: conn, db: db} do
@@ -470,10 +465,10 @@ defmodule InfluxElixir.Client.LocalTest do
         Enum.map(rows, & &1["usage"])
       end
 
-      assert usages.(">", 15) == [20, 30]
-      assert usages.("<", 15) == [10]
-      assert usages.(">=", 20) == [20, 30]
-      assert usages.("<=", 20) == [10, 20]
+      assert usages.(">", 15) === [20, 30]
+      assert usages.("<", 15) === [10]
+      assert usages.(">=", 20) === [20, 30]
+      assert usages.("<=", 20) === [10, 20]
     end
 
     test "ORDER BY time ASC sorts points written out of order", %{conn: conn, db: db} do
@@ -483,7 +478,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, rows} =
                Local.query_sql(conn, "SELECT * FROM ooo ORDER BY time ASC", database: db)
 
-      assert Enum.map(rows, &{&1["time"], &1["v"]}) == [
+      assert Enum.map(rows, &{&1["time"], &1["v"]}) === [
                {~U[1970-01-01 00:00:00.000001Z], 1},
                {~U[1970-01-01 00:00:00.000002Z], 2},
                {~U[1970-01-01 00:00:00.000003Z], 3}
@@ -494,7 +489,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, rows} =
                Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time DESC", database: db)
 
-      assert Enum.map(rows, &{&1["time"], &1["usage"]}) == [
+      assert Enum.map(rows, &{&1["time"], &1["usage"]}) === [
                {~U[1970-01-01 00:00:00.000003Z], 30},
                {~U[1970-01-01 00:00:00.000002Z], 20},
                {~U[1970-01-01 00:00:00.000001Z], 10}
@@ -505,14 +500,14 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, rows} =
                Local.query_sql(conn, "SELECT usage FROM cpu ORDER BY time LIMIT 2", database: db)
 
-      assert rows == [%{"usage" => 10}, %{"usage" => 20}]
+      assert rows === [%{"usage" => 10}, %{"usage" => 20}]
     end
 
     test "combined WHERE + ORDER BY + LIMIT", %{conn: conn, db: db} do
       sql = "SELECT * FROM cpu WHERE region = 'us-east' ORDER BY time DESC LIMIT 1"
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["region"] == "us-east"
-      assert row["time"] == ~U[1970-01-01 00:00:00.000003Z]
+      assert row["region"] === "us-east"
+      assert row["time"] === ~U[1970-01-01 00:00:00.000003Z]
     end
 
     test "each row has fields, tags, and time but no _measurement key",
@@ -520,7 +515,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, [row | _rest]} =
                Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time", database: db)
 
-      assert row == %{
+      assert row === %{
                "time" => ~U[1970-01-01 00:00:00.000001Z],
                "host" => "web01",
                "region" => "us-east",
@@ -564,7 +559,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{
                  "net_value" => 100.0,
                  "total_balance" => 120.0,
@@ -595,7 +590,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
 
-      assert row == %{
+      assert row === %{
                "net_value" => 110.0,
                "total_balance" => 130.0,
                "time" => ~U[1970-01-01 00:00:00.000002Z]
@@ -609,7 +604,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, [%{"nv" => 50.0, "tb" => 55.0} = row]} =
                Local.query_sql(conn, sql, database: db)
 
-      assert Map.keys(row) == ["nv", "tb"]
+      assert Map.keys(row) === ["nv", "tb"]
     end
 
     test "selecting a tag column returns the tag value",
@@ -619,7 +614,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, [%{"account_id" => "xyz", "net_value" => 50.0} = row]} =
                Local.query_sql(conn, sql, database: db)
 
-      assert Map.keys(row) == ["account_id", "net_value"]
+      assert Map.keys(row) === ["account_id", "net_value"]
     end
   end
 
@@ -643,27 +638,27 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "string param substitution", %{conn: conn, db: db} do
       sql = "SELECT * FROM cpu WHERE host = $host"
-      assert param_rows(conn, db, sql, %{"host" => "web01"}) == [{"web01", 10}]
+      assert param_rows(conn, db, sql, %{"host" => "web01"}) === [{"web01", 10}]
     end
 
     test "integer param substitution", %{conn: conn, db: db} do
       sql = "SELECT * FROM cpu WHERE usage > $min"
-      assert param_rows(conn, db, sql, %{"min" => 15}) == [{"web02", 20}]
+      assert param_rows(conn, db, sql, %{"min" => 15}) === [{"web02", 20}]
     end
 
     test "atom key params without $ prefix", %{conn: conn, db: db} do
       sql = "SELECT * FROM cpu WHERE host = $host"
-      assert param_rows(conn, db, sql, %{host: "web01"}) == [{"web01", 10}]
+      assert param_rows(conn, db, sql, %{host: "web01"}) === [{"web01", 10}]
     end
 
     test "string key params without $ prefix", %{conn: conn, db: db} do
       sql = "SELECT * FROM cpu WHERE host = $host"
-      assert param_rows(conn, db, sql, %{"host" => "web01"}) == [{"web01", 10}]
+      assert param_rows(conn, db, sql, %{"host" => "web01"}) === [{"web01", 10}]
     end
 
     test "atom key params with multiple conditions", %{conn: conn, db: db} do
       sql = "SELECT * FROM cpu WHERE host = $host AND usage > $min"
-      assert param_rows(conn, db, sql, %{host: "web02", min: 15}) == [{"web02", 20}]
+      assert param_rows(conn, db, sql, %{host: "web02", min: 15}) === [{"web02", 20}]
     end
 
     test "a placeholder that prefixes another is substituted whole",
@@ -671,7 +666,7 @@ defmodule InfluxElixir.Client.LocalTest do
       # Sequential replacement rewrote `$h` inside `$hmin`, producing
       # `'web02'min` and a parse failure.
       sql = "SELECT * FROM cpu WHERE host = $h AND usage > $hmin"
-      assert param_rows(conn, db, sql, %{h: "web02", hmin: 15}) == [{"web02", 20}]
+      assert param_rows(conn, db, sql, %{h: "web02", hmin: 15}) === [{"web02", 20}]
     end
 
     test "an unbound placeholder is the engine's planning error", %{conn: conn, db: db} do
@@ -696,7 +691,7 @@ defmodule InfluxElixir.Client.LocalTest do
       sql = "SELECT * FROM sub WHERE host = $host AND usage > $min"
       params = %{host: "$min", min: 15}
 
-      assert param_rows(conn, db, sql, params) == [{"$min", 20}]
+      assert param_rows(conn, db, sql, params) === [{"$min", 20}]
     end
   end
 
@@ -736,8 +731,8 @@ defmodule InfluxElixir.Client.LocalTest do
         %{"time" => ~U[1970-01-01 00:00:00.000002Z], "value" => 2}
       ]
 
-      assert direct == expected
-      assert stream_rows == expected
+      assert direct === expected
+      assert stream_rows === expected
     end
 
     # Parity with Client.HTTP (issue #11): a query error must raise
@@ -755,10 +750,10 @@ defmodule InfluxElixir.Client.LocalTest do
       assert %InfluxElixir.StreamError{
                kind: :http_status,
                status: 500,
-               body: "Schema error: No field named nosuch. Valid fields are time, v.",
+               body: "Schema error: No field named nosuch. Valid fields are cpu.time, cpu.v.",
                message:
                  "streaming query failed with HTTP status 500: " <>
-                   "Schema error: No field named nosuch. Valid fields are time, v."
+                   "Schema error: No field named nosuch. Valid fields are cpu.time, cpu.v."
              } = error
     end
 
@@ -774,13 +769,12 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert_raise InfluxElixir.StreamError,
                    "streaming query failed with HTTP status 500: " <>
-                     "Schema error: No field named nosuch. Valid fields are time, v.",
+                     "Schema error: No field named nosuch. Valid fields are cpu.time, cpu.v.",
                    fn -> Enum.to_list(stream) end
     end
 
     test "raises StreamError with :unsupported when the profile lacks streaming" do
       {:ok, v2_conn} = Local.start(profile: :v2, databases: ["v2_db"])
-      on_exit(fn -> Local.stop(v2_conn) end)
 
       stream = Local.query_sql_stream(v2_conn, "SELECT * FROM cpu")
 
@@ -803,7 +797,7 @@ defmodule InfluxElixir.Client.LocalTest do
             {"UPDATE cpu SET v = 2", "Update"}
           ] do
         assert {:error, %{status: 400, body: body}} = Local.execute_sql(conn, sql)
-        assert body == "Error during planning: DML not supported: " <> kind, sql
+        assert body === "Error during planning: DML not supported: " <> kind, sql
       end
     end
 
@@ -816,12 +810,12 @@ defmodule InfluxElixir.Client.LocalTest do
             {"DROP VIEW vv", "DropView"}
           ] do
         assert {:error, %{status: 400, body: body}} = Local.execute_sql(conn, sql)
-        assert body == "Error during planning: DDL not supported: " <> kind, sql
+        assert body === "Error during planning: DDL not supported: " <> kind, sql
       end
 
       for sql <- ["ALTER TABLE cpu ADD COLUMN y INT", "TRUNCATE cpu"] do
         assert {:error, %{status: 405, body: body}} = Local.execute_sql(conn, sql)
-        assert body == "This feature is not implemented: Unsupported SQL statement: " <> sql
+        assert body === "This feature is not implemented: Unsupported SQL statement: " <> sql
       end
     end
 
@@ -842,7 +836,6 @@ defmodule InfluxElixir.Client.LocalTest do
   describe "query_flux/3" do
     test "returns the bucket's rows tagged with their measurement" do
       {:ok, v2_conn} = Local.start(profile: :v2)
-      on_exit(fn -> Local.stop(v2_conn) end)
       :ok = Local.create_bucket(v2_conn, "test")
       {:ok, :written} = Local.write(v2_conn, "cpu value=1.0", database: "test")
 
@@ -862,7 +855,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:error, %{status: 404, body: body}} =
                Local.delete_database(conn, "not_here")
 
-      assert body == "the requested resource was not found: not_here"
+      assert body === "the requested resource was not found: not_here"
     end
   end
 
@@ -896,7 +889,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time", database: db)
 
-      assert Enum.map(rows, &{&1["host"], &1["value"]}) == [
+      assert Enum.map(rows, &{&1["host"], &1["value"]}) === [
                {"web01", 10},
                {"web02", 20},
                {"web01", 30}
@@ -919,7 +912,6 @@ defmodule InfluxElixir.Client.LocalTest do
           database: "del_db"
         )
 
-      on_exit(fn -> Local.stop(conn) end)
       {:ok, conn: conn, db: "del_db"}
     end
 
@@ -1002,11 +994,11 @@ defmodule InfluxElixir.Client.LocalTest do
       sql = "SELECT * FROM m WHERE active = true AND count > 15"
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["host"] == "gamma"
+      assert row["host"] === "gamma"
     end
 
     test "case insensitive SELECT", %{conn: conn, db: db} do
-      assert hosts(conn, db, "select * from m where host = 'alpha'") == ["alpha"]
+      assert hosts(conn, db, "select * from m where host = 'alpha'") === ["alpha"]
     end
   end
 
@@ -1041,7 +1033,7 @@ defmodule InfluxElixir.Client.LocalTest do
         "SELECT * FROM prices WHERE time >= '2026-03-17T12:00:00Z' " <>
           "AND time < '2026-03-17T12:02:00Z' ORDER BY time"
 
-      assert column_values(conn, db, sql, "symbol") == ["AAPL", "GOOG"]
+      assert column_values(conn, db, sql, "symbol") === ["AAPL", "GOOG"]
     end
 
     test "SELECT * with ISO 8601 time params", %{conn: conn, db: db} do
@@ -1056,7 +1048,7 @@ defmodule InfluxElixir.Client.LocalTest do
           }
         )
 
-      assert Enum.map(rows, & &1["symbol"]) == ["AAPL", "GOOG"]
+      assert Enum.map(rows, & &1["symbol"]) === ["AAPL", "GOOG"]
     end
 
     test "aggregate query with time WHERE", %{conn: conn, db: db} do
@@ -1079,7 +1071,7 @@ defmodule InfluxElixir.Client.LocalTest do
           }
         )
 
-      assert rows == [
+      assert rows === [
                %{"time" => ~U[2026-03-17 12:00:00.000000Z], "avg_price" => 150.0},
                %{"time" => ~U[2026-03-17 12:01:00.000000Z], "avg_price" => 2800.0}
              ]
@@ -1113,7 +1105,7 @@ defmodule InfluxElixir.Client.LocalTest do
           }
         )
 
-      assert rows == []
+      assert rows === []
     end
 
     # Regression coverage for issue #4: bare ISO dates ("YYYY-MM-DD") must
@@ -1126,7 +1118,7 @@ defmodule InfluxElixir.Client.LocalTest do
       # accepts all three; WHERE time <= '2026-03-17' accepts none
       # (since midnight 03-17 is before all three timestamps).
       sql = "SELECT * FROM prices WHERE time <= '2026-03-18' ORDER BY time"
-      assert column_values(conn, db, sql, "symbol") == ["AAPL", "GOOG", "MSFT"]
+      assert column_values(conn, db, sql, "symbol") === ["AAPL", "GOOG", "MSFT"]
 
       assert {:ok, []} =
                Local.query_sql(conn, "SELECT * FROM prices WHERE time <= '2026-03-17'",
@@ -1139,7 +1131,7 @@ defmodule InfluxElixir.Client.LocalTest do
       sql =
         "SELECT * FROM prices WHERE time >= '2026-03-17' AND time <= '2026-03-18' ORDER BY time"
 
-      assert column_values(conn, db, sql, "symbol") == ["AAPL", "GOOG", "MSFT"]
+      assert column_values(conn, db, sql, "symbol") === ["AAPL", "GOOG", "MSFT"]
     end
   end
 
@@ -1166,23 +1158,23 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "IN with multiple tag values filters correctly", %{conn: conn, db: db} do
-      assert holding_tickers(conn, db, "ticker IN ('AAPL', 'MSFT')") == ["AAPL", "MSFT"]
+      assert holding_tickers(conn, db, "ticker IN ('AAPL', 'MSFT')") === ["AAPL", "MSFT"]
     end
 
     test "IN with a single value matches one row", %{conn: conn, db: db} do
-      assert holding_tickers(conn, db, "ticker IN ('GOOG')") == ["GOOG"]
+      assert holding_tickers(conn, db, "ticker IN ('GOOG')") === ["GOOG"]
     end
 
     test "empty IN () matches no rows", %{conn: conn, db: db} do
-      assert holding_tickers(conn, db, "ticker IN ()") == []
+      assert holding_tickers(conn, db, "ticker IN ()") === []
     end
 
     test "IN works on field columns", %{conn: conn, db: db} do
-      assert holding_tickers(conn, db, "shares IN (10, 20)") == ["AAPL", "MSFT"]
+      assert holding_tickers(conn, db, "shares IN (10, 20)") === ["AAPL", "MSFT"]
     end
 
     test "NOT IN excludes listed values", %{conn: conn, db: db} do
-      assert holding_tickers(conn, db, "ticker NOT IN ('AAPL', 'GOOG')") == ["MSFT"]
+      assert holding_tickers(conn, db, "ticker NOT IN ('AAPL', 'GOOG')") === ["MSFT"]
     end
 
     test "IN combines with binary operators via AND", %{conn: conn, db: db} do
@@ -1199,7 +1191,7 @@ defmodule InfluxElixir.Client.LocalTest do
           params: %{"t0" => "AAPL", "t1" => "MSFT"}
         )
 
-      assert Enum.map(rows, & &1["ticker"]) == ["AAPL", "MSFT"]
+      assert Enum.map(rows, & &1["ticker"]) === ["AAPL", "MSFT"]
     end
   end
 
@@ -1273,7 +1265,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows |> Enum.sort_by(& &1["sym"]) == [
+      assert rows |> Enum.sort_by(& &1["sym"]) === [
                %{"sym" => "AAPL", "n" => 3},
                %{"sym" => "GOOG", "n" => 1}
              ]
@@ -1321,7 +1313,7 @@ defmodule InfluxElixir.Client.LocalTest do
           params: %{"t" => ~U[1970-01-01 00:00:00.000006Z]}
         )
 
-      assert rows == [%{"val" => 2, "time" => ~U[1970-01-01 00:00:00.000006Z]}]
+      assert rows === [%{"val" => 2, "time" => ~U[1970-01-01 00:00:00.000006Z]}]
     end
 
     test "WHERE time with non-matching filter returns empty",
@@ -1335,7 +1327,7 @@ defmodule InfluxElixir.Client.LocalTest do
           database: db
         )
 
-      assert rows == []
+      assert rows === []
     end
 
     test "a double-quoted WHERE operand is a column, not a string", %{conn: conn, db: db} do
@@ -1347,7 +1339,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:error,
               %{
                 status: 500,
-                body: "Schema error: No field named hello. Valid fields are tag, time, val."
+                body: "Schema error: No field named hello. Valid fields are m.tag, m.time, m.val."
               }} = Local.query_sql(conn, ~s(SELECT * FROM m WHERE tag = "hello"), database: db)
 
       assert {:ok, [%{"tag" => "hello", "val" => 1}]} =
@@ -1382,7 +1374,7 @@ defmodule InfluxElixir.Client.LocalTest do
     test "tag value with escaped equals sign", %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "m,k=v\\=1 f=1i", database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: db)
-      assert row["k"] == "v=1"
+      assert row["k"] === "v=1"
     end
 
     test "measurement name with escaped comma", %{conn: conn, db: db} do
@@ -1481,7 +1473,7 @@ defmodule InfluxElixir.Client.LocalTest do
     test "SHOW DATABASES returns all databases with iox::database key", %{conn: conn} do
       assert {:ok, dbs} = Local.query_influxql(conn, "SHOW DATABASES")
 
-      assert Enum.map(dbs, & &1["iox::database"]) == ["_internal", "iql_db", "test_db"]
+      assert Enum.map(dbs, & &1["iox::database"]) === ["_internal", "iql_db", "test_db"]
     end
 
     test "SHOW MEASUREMENTS returns measurement names with iox::measurement key",
@@ -1489,7 +1481,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, measurements} =
                Local.query_influxql(conn, "SHOW MEASUREMENTS", database: db)
 
-      assert measurements == [
+      assert measurements === [
                %{"iox::measurement" => "measurements", "name" => "cpu"},
                %{"iox::measurement" => "measurements", "name" => "mem"}
              ]
@@ -1500,7 +1492,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, tag_keys} =
                Local.query_influxql(conn, "SHOW TAG KEYS FROM cpu", database: db)
 
-      assert tag_keys == [
+      assert tag_keys === [
                %{"iox::measurement" => "cpu", "tagKey" => "host"},
                %{"iox::measurement" => "cpu", "tagKey" => "region"}
              ]
@@ -1510,7 +1502,7 @@ defmodule InfluxElixir.Client.LocalTest do
          %{conn: conn, db: db} do
       assert {:ok, [row]} = Local.query_influxql(conn, "SELECT * FROM cpu", database: db)
 
-      assert row == %{
+      assert row === %{
                "iox::measurement" => "cpu",
                "time" => ~U[1970-01-01 00:00:00.000001Z],
                "host" => "web01",
@@ -1539,7 +1531,6 @@ defmodule InfluxElixir.Client.LocalTest do
           database: "flux_db"
         )
 
-      on_exit(fn -> Local.stop(v2_conn) end)
       {:ok, v2_conn: v2_conn, db: "flux_db", now: now, old: old}
     end
 
@@ -1563,11 +1554,11 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, rows} = Local.query_flux(conn, flux)
 
       # Two series (host=web01, host=web02) → tables 0 and 1, ordered.
-      assert Enum.map(rows, & &1["table"]) == [0, 1]
-      assert Enum.all?(rows, &(&1["_measurement"] == "cpu" and &1["result"] == "_result"))
+      assert Enum.map(rows, & &1["table"]) === [0, 1]
+      assert Enum.all?(rows, &(&1["_measurement"] === "cpu" and &1["result"] === "_result"))
 
       web01 = Enum.find(rows, &(&1["host"] == "web01"))
-      assert web01["_time"] == DateTime.from_unix!(now, :nanosecond)
+      assert web01["_time"] === DateTime.from_unix!(now, :nanosecond)
     end
 
     test "filter on _field keeps only that field", %{v2_conn: conn} do
@@ -1585,7 +1576,7 @@ defmodule InfluxElixir.Client.LocalTest do
       flux = "from(bucket: \"no_such_bucket\") |> range(start: -1h)"
       assert {:error, %{status: 404, body: body}} = Local.query_flux(conn, flux)
 
-      assert Jason.decode!(body) == %{
+      assert Jason.decode!(body) === %{
                "code" => "not found",
                "message" =>
                  ~s|failed to initialize execute state: could not find bucket "no_such_bucket"|
@@ -1644,26 +1635,26 @@ defmodule InfluxElixir.Client.LocalTest do
          %{conn: conn, db: db} do
       for table <- [~s("prices"), "prices"] do
         sql = "SELECT DISTINCT symbol FROM #{table} ORDER BY symbol"
-        assert column_values(conn, db, sql, "symbol") == ["AAPL", "GOOG", "MSFT"]
+        assert column_values(conn, db, sql, "symbol") === ["AAPL", "GOOG", "MSFT"]
       end
     end
 
     test "returns unique values for a field column", %{conn: conn, db: db} do
       sql = ~s(SELECT DISTINCT price FROM "prices" ORDER BY price)
 
-      assert column_values(conn, db, sql, "price") == [150.0, 151.0, 300.0, 2800.0, 2810.0]
+      assert column_values(conn, db, sql, "price") === [150.0, 151.0, 300.0, 2800.0, 2810.0]
     end
 
     test "applies WHERE filter", %{conn: conn, db: db} do
       sql = ~s(SELECT DISTINCT symbol FROM "prices" WHERE price > 200 ORDER BY symbol)
 
-      assert column_values(conn, db, sql, "symbol") == ["GOOG", "MSFT"]
+      assert column_values(conn, db, sql, "symbol") === ["GOOG", "MSFT"]
     end
 
     test "applies LIMIT", %{conn: conn, db: db} do
       sql = ~s(SELECT DISTINCT symbol FROM "prices" ORDER BY symbol LIMIT 2)
 
-      assert column_values(conn, db, sql, "symbol") == ["AAPL", "GOOG"]
+      assert column_values(conn, db, sql, "symbol") === ["AAPL", "GOOG"]
     end
   end
 
@@ -1708,7 +1699,7 @@ defmodule InfluxElixir.Client.LocalTest do
       # 0.5h,1.5h → bucket 0; 2.5h,3.5h → bucket 2h; 4.5h,5.5h → bucket 4h
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{"time" => ~U[1970-01-01 00:00:00.000000Z], "avg_usage" => 15.0},
                %{"time" => ~U[1970-01-01 02:00:00.000000Z], "avg_usage" => 35.0},
                %{"time" => ~U[1970-01-01 04:00:00.000000Z], "avg_usage" => 55.0}
@@ -1728,7 +1719,7 @@ defmodule InfluxElixir.Client.LocalTest do
       # 0.5h,1.5h,2.5h → bucket 0; 3.5h,4.5h,5.5h → bucket 3h
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{"time" => ~U[1970-01-01 00:00:00.000000Z], "total" => 60},
                %{"time" => ~U[1970-01-01 03:00:00.000000Z], "total" => 150}
              ]
@@ -1746,7 +1737,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{"time" => ~U[1970-01-01 00:00:00.000000Z], "cnt" => 3},
                %{"time" => ~U[1970-01-01 03:00:00.000000Z], "cnt" => 3}
              ]
@@ -1767,7 +1758,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
 
-      assert row == %{
+      assert row === %{
                "time" => ~U[1970-01-01 00:00:00.000000Z],
                "avg_val" => 35.0,
                "sum_val" => 210,
@@ -1789,7 +1780,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       # web01 has points at 0.5h, 1.5h, 2.5h → all in bucket 0
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row == %{"time" => ~U[1970-01-01 00:00:00.000000Z], "avg_usage" => 20.0}
+      assert row === %{"time" => ~U[1970-01-01 00:00:00.000000Z], "avg_usage" => 20.0}
     end
 
     test "ORDER BY time DESC", %{conn: conn, db: db} do
@@ -1804,7 +1795,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{"time" => ~U[1970-01-01 03:00:00.000000Z], "cnt" => 3},
                %{"time" => ~U[1970-01-01 00:00:00.000000Z], "cnt" => 3}
              ]
@@ -1824,7 +1815,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{"time" => ~U[1970-01-01 00:00:00.000000Z], "avg_usage" => 10.0},
                %{"time" => ~U[1970-01-01 01:00:00.000000Z], "avg_usage" => 20.0}
              ]
@@ -1861,7 +1852,7 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["avg_usage"] == 35.0
+      assert row["avg_usage"] === 35.0
     end
 
     test "non-existent measurement returns error",
@@ -1895,8 +1886,8 @@ defmodule InfluxElixir.Client.LocalTest do
 
       # All 6 points at 0.5h-5.5h → all in day bucket 0
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["time"] == ~U[1970-01-01 00:00:00.000000Z]
-      assert row["total"] == 210
+      assert row["time"] === ~U[1970-01-01 00:00:00.000000Z]
+      assert row["total"] === 210
     end
 
     test "aggregate without ORDER BY returns results", %{conn: conn, db: db} do
@@ -1909,7 +1900,7 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["total"] == 210
+      assert row["total"] === 210
     end
 
     test "scalar aggregate without GROUP BY DATE_BIN returns one row",
@@ -2022,7 +2013,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{"time" => hour_start(0), "open" => 100.0},
                %{"time" => hour_start(1), "open" => 110.0}
              ]
@@ -2041,7 +2032,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{"time" => hour_start(0), "close" => 102.0},
                %{"time" => hour_start(1), "close" => 112.0}
              ]
@@ -2064,7 +2055,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                # Hour 0: prices 100, 105, 102 — volumes 10, 20, 15
                %{
                  "time" => hour_start(0),
@@ -2099,7 +2090,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{"time" => hour_start(0), "latest" => 102.0},
                %{"time" => hour_start(1), "latest" => 112.0}
              ]
@@ -2118,7 +2109,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{"time" => hour_start(0), "earliest" => 100.0},
                %{"time" => hour_start(1), "earliest" => 110.0}
              ]
@@ -2179,7 +2170,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, [%{"time" => time, "open" => 105.0, "close" => 112.0}]} =
                Local.query_sql(conn, sql, database: db)
 
-      assert time == hour_start(0)
+      assert time === hour_start(0)
     end
   end
 
@@ -2210,7 +2201,7 @@ defmodule InfluxElixir.Client.LocalTest do
       # cpu,host=web\\01 has a literal backslash in the host tag value
       {:ok, :written} = Local.write(conn, "cpu,host=web\\\\01 value=1i", database: db)
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
-      assert row["host"] == "web\\01"
+      assert row["host"] === "web\\01"
     end
 
     test "a field value or timestamp that does not parse is a 400 naming the line and reason",
@@ -2265,7 +2256,7 @@ defmodule InfluxElixir.Client.LocalTest do
         """
 
         assert {:error, %{status: 400, body: body}} = Local.query_sql(conn, sql, database: db)
-        assert body == "Client.Local: " <> message, sql
+        assert body === "Client.Local: " <> message, sql
       end
     end
   end
@@ -2291,19 +2282,19 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "WHERE with float comparison filters correctly", %{conn: conn, db: db} do
       sql = "SELECT * FROM sensors WHERE temp > 1.5 ORDER BY time"
-      assert column_values(conn, db, sql, "device") == ["alpha", "beta"]
+      assert column_values(conn, db, sql, "device") === ["alpha", "beta"]
     end
 
     test "WHERE with float boundary excludes low values", %{conn: conn, db: db} do
       sql = "SELECT * FROM sensors WHERE temp > 50.0 ORDER BY time"
-      assert column_values(conn, db, sql, "device") == ["alpha"]
+      assert column_values(conn, db, sql, "device") === ["alpha"]
     end
 
     test "WHERE with unparseable string value is treated as string literal",
          %{conn: conn, db: db} do
       # A value like 'alpha' matches tag values as a string
       sql = "SELECT * FROM sensors WHERE device = 'alpha'"
-      assert column_values(conn, db, sql, "device") == ["alpha"]
+      assert column_values(conn, db, sql, "device") === ["alpha"]
     end
 
     test "WHERE clause that matches nothing returns empty list",
@@ -2381,7 +2372,6 @@ defmodule InfluxElixir.Client.LocalTest do
           database: "flux_range_db"
         )
 
-      on_exit(fn -> Local.stop(v2_conn) end)
       {:ok, v2_conn: v2_conn}
     end
 
@@ -2398,7 +2388,7 @@ defmodule InfluxElixir.Client.LocalTest do
     test "range with days unit includes all recent points", %{v2_conn: conn} do
       flux = "from(bucket: \"flux_range_db\") |> range(start: -1d)"
       assert {:ok, rows} = Local.query_flux(conn, flux)
-      assert Enum.map(rows, &{&1["host"], &1["_value"]}) == [{"new", 1}, {"old", 2}]
+      assert Enum.map(rows, &{&1["host"], &1["_value"]}) === [{"new", 1}, {"old", 2}]
     end
 
     test "flux filter predicate on tag field", %{v2_conn: conn} do
@@ -2450,7 +2440,7 @@ defmodule InfluxElixir.Client.LocalTest do
                  params: %{"val" => nil}
                )
 
-      assert rows == []
+      assert rows === []
     end
   end
 
@@ -2461,7 +2451,6 @@ defmodule InfluxElixir.Client.LocalTest do
   describe "execute_sql/3 — DELETE non-existent measurement" do
     setup do
       {:ok, conn} = Local.start(databases: ["del_ne_db"], profile: :v3_enterprise)
-      on_exit(fn -> Local.stop(conn) end)
       {:ok, conn: conn, db: "del_ne_db"}
     end
 
@@ -2561,7 +2550,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
       # priority=1 (type=b) is the minimum → first value is 200
-      assert row["first_val"] == 200
+      assert row["first_val"] === 200
     end
 
     test "last_value(value ORDER BY priority) returns value at highest priority",
@@ -2576,7 +2565,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
       # priority=3 (type=a) is the maximum → last value is 100
-      assert row["last_val"] == 100
+      assert row["last_val"] === 100
     end
   end
 
@@ -2614,13 +2603,12 @@ defmodule InfluxElixir.Client.LocalTest do
       expected = for w <- 1..writers, i <- 1..per_writer, do: "W#{w}X#{i}"
       symbols = column_values(conn, db, "SELECT symbol FROM prices", "symbol")
 
-      assert Enum.sort(symbols) == Enum.sort(expected)
+      assert Enum.sort(symbols) === Enum.sort(expected)
     end
 
     test "parallel create_database calls all register" do
       # Enterprise: Core allows only 5 databases.
       {:ok, conn} = Local.start(profile: :v3_enterprise)
-      on_exit(fn -> Local.stop(conn) end)
       names = for i <- 1..16, do: "par_db_#{i}"
 
       names
@@ -2628,12 +2616,11 @@ defmodule InfluxElixir.Client.LocalTest do
       |> Enum.each(&Task.await/1)
 
       assert {:ok, dbs} = Local.list_databases(conn)
-      assert dbs |> Enum.map(& &1["name"]) |> Enum.sort() == Enum.sort(["_internal" | names])
+      assert dbs |> Enum.map(& &1["name"]) |> Enum.sort() === Enum.sort(["_internal" | names])
     end
 
     test "a DELETE running beside writes only removes what it matched", %{db: db} do
       {:ok, ent} = Local.start(databases: [db], profile: :v3_enterprise)
-      on_exit(fn -> Local.stop(ent) end)
 
       # Explicit timestamps: the untimed lines of one write share a time
       # and would be one point, as on the engines.
@@ -2651,14 +2638,13 @@ defmodule InfluxElixir.Client.LocalTest do
       Task.await(writer)
 
       assert {:ok, rows} = Local.query_sql(ent, "SELECT k, v FROM m ORDER BY v", database: db)
-      assert Enum.map(rows, &{&1["k"], &1["v"]}) == for(i <- 1..50, do: {"new", i})
+      assert Enum.map(rows, &{&1["k"], &1["v"]}) === for(i <- 1..50, do: {"new", i})
     end
   end
 
   describe "bug regression — write preserves provided timestamps" do
-    # Bug: ignores-write-timestamp. Writes of N points at fixed spacing
-    # returned timestamps microseconds apart because store_point/3 substituted
-    # System.os_time/1 over the parsed timestamp.
+    # Points written at a fixed spacing keep their timestamps; the store
+    # must never put the server's clock in place of a parsed timestamp.
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "ts_keep_db")
       {:ok, db: "ts_keep_db"}
@@ -2683,7 +2669,7 @@ defmodule InfluxElixir.Client.LocalTest do
                  database: db
                )
 
-      assert Enum.map(rows, &{&1["time"], &1["close"]}) == [
+      assert Enum.map(rows, &{&1["time"], &1["close"]}) === [
                {~U[2023-11-14 22:13:20.000000Z], 100.0},
                {~U[2023-11-14 22:28:20.000000Z], 101.0},
                {~U[2023-11-14 22:43:20.000000Z], 102.0},
@@ -2708,7 +2694,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, rows} =
                Local.query_sql(conn, "SELECT * FROM obs ORDER BY time ASC", database: db)
 
-      assert Enum.map(rows, & &1["val"]) == [0, 1, 2, 3]
+      assert Enum.map(rows, & &1["val"]) === [0, 1, 2, 3]
     end
   end
 
@@ -2785,8 +2771,8 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       assert {:ok, [day1, day2]} = Local.query_sql(conn, sql, database: db)
-      assert day1 == %{"day" => ~U[1970-01-01 00:00:00.000000Z], "n" => 3}
-      assert day2 == %{"day" => ~U[1970-01-02 00:00:00.000000Z], "n" => 2}
+      assert day1 === %{"day" => ~U[1970-01-01 00:00:00.000000Z], "n" => 3}
+      assert day2 === %{"day" => ~U[1970-01-02 00:00:00.000000Z], "n" => 2}
     end
 
     test "COUNT(*) ignores field nullity (counts rows missing the field)",
@@ -2850,12 +2836,12 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["sd"] == 10.0
-      assert row["sd_samp"] == 10.0
-      assert row["sd_pop"] == 8.16496580927726
-      assert row["v"] == 100.0
-      assert row["v_samp"] == 100.0
-      assert row["v_pop"] == 66.66666666666667
+      assert row["sd"] === 10.0
+      assert row["sd_samp"] === 10.0
+      assert row["sd_pop"] === 8.16496580927726
+      assert row["v"] === 100.0
+      assert row["v_samp"] === 100.0
+      assert row["v_pop"] === 66.66666666666667
     end
 
     test "sample statistics over one row are null and the column is omitted",
@@ -2867,7 +2853,7 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       assert {:ok, [%{"v_pop" => +0.0} = row]} = Local.query_sql(conn, sql, database: db)
-      assert Map.keys(row) == ["v_pop"]
+      assert Map.keys(row) === ["v_pop"]
     end
 
     test "an empty group keeps only COUNT (0); every other aggregate is omitted",
@@ -2879,7 +2865,7 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       assert {:ok, [%{"n" => 0} = row]} = Local.query_sql(conn, sql, database: db)
-      assert Map.keys(row) == ["n"]
+      assert Map.keys(row) === ["n"]
     end
 
     test "VARIANCE is not a DataFusion function and is rejected", %{conn: conn, db: db} do
@@ -2900,10 +2886,10 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["sum_sq"] == 1400.0
-      assert row["half_avg"] == 10.0
-      assert row["max_less_one"] == 29.0
-      assert row["min_shifted"] == 40.0
+      assert row["sum_sq"] === 1400.0
+      assert row["half_avg"] === 10.0
+      assert row["max_less_one"] === 29.0
+      assert row["min_shifted"] === 40.0
     end
 
     test "integer operands divide as integers, like DataFusion", %{conn: conn, db: db} do
@@ -2941,7 +2927,7 @@ defmodule InfluxElixir.Client.LocalTest do
         sql = ~s|SELECT #{expression} AS a FROM "m"|
 
         assert {:error, %{status: 400, body: body}} = Local.query_sql(conn, sql, database: db)
-        assert body == "Client.Local: invalid aggregate: #{rendered} as a", sql
+        assert body === "Client.Local: invalid aggregate: #{rendered} as a", sql
       end
     end
 
@@ -2955,7 +2941,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{"provider" => "a", "total" => 60.0},
                %{"provider" => "b", "total" => 5.0}
              ]
@@ -2999,14 +2985,14 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row["first_v"] == 10.0
-      assert row["first_t"] == ~U[1970-01-01 00:00:00.000000Z]
-      assert row["last_v"] == 5.0
-      assert row["last_t"] == ~U[1970-01-01 00:01:10.000000Z]
-      assert row["min_v"] == 5.0
-      assert row["min_t"] == ~U[1970-01-01 00:01:10.000000Z]
-      assert row["max_v"] == 30.0
-      assert row["max_t"] == ~U[1970-01-01 00:00:20.000000Z]
+      assert row["first_v"] === 10.0
+      assert row["first_t"] === ~U[1970-01-01 00:00:00.000000Z]
+      assert row["last_v"] === 5.0
+      assert row["last_t"] === ~U[1970-01-01 00:01:10.000000Z]
+      assert row["min_v"] === 5.0
+      assert row["min_t"] === ~U[1970-01-01 00:01:10.000000Z]
+      assert row["max_v"] === 30.0
+      assert row["max_t"] === ~U[1970-01-01 00:00:20.000000Z]
     end
 
     test "selectors combine with DATE_BIN and ORDER BY the bin alias DESC",
@@ -3026,22 +3012,22 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, [late, early]} = Local.query_sql(conn, sql, database: db)
 
-      assert late["bucket"] == ~U[1970-01-01 00:01:00.000000Z]
-      assert late["open"] == 5.0 and late["close"] == 5.0 and late["n"] == 1
+      assert late["bucket"] === ~U[1970-01-01 00:01:00.000000Z]
+      assert late["open"] === 5.0 and late["close"] === 5.0 and late["n"] === 1
 
-      assert early["bucket"] == ~U[1970-01-01 00:00:00.000000Z]
-      assert early["open"] == 10.0
-      assert early["high"] == 30.0
-      assert early["low"] == 10.0
-      assert early["close"] == 20.0
-      assert early["n"] == 3
+      assert early["bucket"] === ~U[1970-01-01 00:00:00.000000Z]
+      assert early["open"] === 10.0
+      assert early["high"] === 30.0
+      assert early["low"] === 10.0
+      assert early["close"] === 20.0
+      assert early["n"] === 3
     end
 
     test "an empty selector group omits the column", %{conn: conn, db: db} do
       sql = ~s|SELECT selector_last(value, time)['value'] AS v FROM "m" WHERE symbol = 'nope'|
 
       assert {:ok, [row]} = Local.query_sql(conn, sql, database: db)
-      assert row == %{}
+      assert row === %{}
     end
 
     test "a selector without an accessor is the engine's time/value struct", %{conn: conn, db: db} do
@@ -3083,9 +3069,9 @@ defmodule InfluxElixir.Client.LocalTest do
                Local.query_sql(conn, ~s|SELECT * FROM "m" WHERE provider = 'b'|, database: db)
 
       [with_value, with_other] = Enum.sort_by(rows, & &1["time"], DateTime)
-      assert with_value["value"] == 3.0
+      assert with_value["value"] === 3.0
       refute Map.has_key?(with_value, "other")
-      assert with_other["other"] == 4.0
+      assert with_other["other"] === 4.0
       refute Map.has_key?(with_other, "value")
     end
 
@@ -3098,7 +3084,7 @@ defmodule InfluxElixir.Client.LocalTest do
                  database: db
                )
 
-      assert rows == [%{"provider" => "a"}, %{"provider" => "a"}]
+      assert rows === [%{"provider" => "a"}, %{"provider" => "a"}]
     end
   end
 
@@ -3121,7 +3107,6 @@ defmodule InfluxElixir.Client.LocalTest do
               } = err} = Local.check_sql(sql)
 
       {:ok, conn} = Local.start(databases: ["chk"])
-      on_exit(fn -> Local.stop(conn) end)
       assert {:error, ^err} = Local.query_sql(conn, sql, database: "chk")
     end
   end
@@ -3163,7 +3148,7 @@ defmodule InfluxElixir.Client.LocalTest do
         ~s|SELECT price FROM "q" WHERE time >= now() - INTERVAL '1 hour' - INTERVAL '30 minutes' | <>
           ~s|AND time < NOW() + INTERVAL '1 day' ORDER BY price|
 
-      assert column_values(conn, db, sql, "price") == [1.0, 2.0, 3.0]
+      assert column_values(conn, db, sql, "price") === [1.0, 2.0, 3.0]
     end
 
     # The engine answers "Error during planning: Invalid function 'foo'." with
@@ -3235,7 +3220,7 @@ defmodule InfluxElixir.Client.LocalTest do
                  database: db
                )
 
-      assert rows == [
+      assert rows === [
                %{"mid" => 2.0, "time" => ~U[1970-01-01 00:00:01.000000Z]},
                %{"mid" => 3.0, "time" => ~U[1970-01-01 00:01:01.000000Z]},
                %{"time" => ~U[1970-01-01 00:02:01.000000Z]},
@@ -3243,13 +3228,15 @@ defmodule InfluxElixir.Client.LocalTest do
              ]
     end
 
-    test "an expression without AS alias is rejected with the reason", %{conn: conn, db: db} do
-      assert {:error,
-              %{
-                status: 400,
-                body: "Client.Local: unsupported column (an expression needs AS alias): bid * 2"
-              }} =
-               Local.query_sql(conn, ~s|SELECT bid * 2 FROM "q"|, database: db)
+    test "an expression without AS alias is named as the engine names it", %{conn: conn, db: db} do
+      assert {:ok, rows} = Local.query_sql(conn, ~s|SELECT bid * 2 FROM "q"|, database: db)
+
+      assert Enum.sort_by(rows, & &1["q.bid * Int64(2)"]) === [
+               %{"q.bid * Int64(2)" => 2.0},
+               %{"q.bid * Int64(2)" => 4.0},
+               %{"q.bid * Int64(2)" => 10.0},
+               %{"q.bid * Int64(2)" => 20.0}
+             ]
     end
 
     test "a CTE feeds GROUP BY DATE_BIN qualified by the CTE alias", %{conn: conn, db: db} do
@@ -3261,7 +3248,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
 
-      assert rows == [
+      assert rows === [
                %{"time" => ~U[1970-01-01 00:00:00.000000Z], "hi" => 1.0},
                %{"time" => ~U[1970-01-01 00:01:00.000000Z], "hi" => 2.0},
                %{"time" => ~U[1970-01-01 00:02:00.000000Z], "hi" => 10.0}
@@ -3270,7 +3257,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "a CTE shadows nothing it does not name", %{conn: conn, db: db} do
       sql = ~s|WITH w AS (SELECT bid FROM "q") SELECT * FROM "q"|
-      assert column_values(conn, db, sql, "bid") |> Enum.sort() == [1.0, 2.0, 5.0, 10.0]
+      assert column_values(conn, db, sql, "bid") |> Enum.sort() === [1.0, 2.0, 5.0, 10.0]
 
       assert {:ok, [%{"n" => 4}]} =
                Local.query_sql(
@@ -3325,7 +3312,7 @@ defmodule InfluxElixir.Client.LocalTest do
              "select provider, count(*) as n from q group by provider having n > 1"}
           ] do
         assert {:error, %{status: 400, body: body}} = Local.query_sql(conn, sql, database: db)
-        assert body == "Client.Local: unsupported SQL construct #{construct}: #{rendered}", sql
+        assert body === "Client.Local: unsupported SQL construct #{construct}: #{rendered}", sql
       end
     end
   end
@@ -3448,11 +3435,11 @@ defmodule InfluxElixir.Client.LocalTest do
       assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host > 1 ORDER BY host|) ==
                ~w(a b c d e)
 
-      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host = 2|) == []
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host = 2|) === []
     end
 
     test "keywords inside string literals are text", %{conn: conn, db: db} do
-      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host = 'x AND y' OR host = 'a'|) == [
+      assert hosts(conn, db, ~s|SELECT host FROM "m" WHERE host = 'x AND y' OR host = 'a'|) === [
                "a"
              ]
     end
@@ -3585,7 +3572,7 @@ defmodule InfluxElixir.Client.LocalTest do
                  database: db
                )
 
-      assert Enum.map(rows, &{&1["price"], &1["n"]}) == [
+      assert Enum.map(rows, &{&1["price"], &1["n"]}) === [
                {4.0, 1},
                {4.0, 2},
                {100.0, 1},
@@ -3637,7 +3624,7 @@ defmodule InfluxElixir.Client.LocalTest do
                 status: 500,
                 body:
                   "Schema error: No field named prod. " <>
-                    "Valid fields are price, provider, symbol, time, volume."
+                    "Valid fields are p.price, p.provider, p.symbol, p.time, p.volume."
               }} =
                Local.query_sql(conn, ~s|SELECT price FROM "p" WHERE symbol = prod|, database: db)
     end
@@ -3663,28 +3650,32 @@ defmodule InfluxElixir.Client.LocalTest do
       # Every one of these is a 500 "Schema error: No field named nosuch" on
       # InfluxDB 3 Core; before, the double answered with rows, no rows, or
       # unsorted rows, depending on the clause.
-      for sql <- [
-            ~s|SELECT nosuch FROM "p"|,
-            ~s|SELECT host, nosuch AS n FROM "p"|,
-            ~s|SELECT * FROM "p" WHERE nosuch = 1|,
-            ~s|SELECT * FROM "p" WHERE nosuch IS NULL|,
-            ~s|SELECT * FROM "p" WHERE nosuch IN ('a')|,
-            ~s|SELECT * FROM "p" WHERE v > 0 OR nosuch LIKE 'a%'|,
-            ~s|SELECT * FROM "p" ORDER BY nosuch|,
-            ~s|SELECT host FROM "p" GROUP BY nosuch|,
-            ~s|SELECT MAX(nosuch) AS m FROM "p"|,
-            ~s|SELECT MAX(v + nosuch) AS m FROM "p"|,
-            ~s|SELECT nosuch, COUNT(*) AS n FROM "p" GROUP BY nosuch|,
-            ~s|SELECT DISTINCT nosuch FROM "p"|,
-            ~s|SELECT selector_first(nosuch, time)['value'] AS f FROM "p"|,
-            ~s|SELECT selector_first(v, nosuch)['value'] AS f FROM "p"|,
-            ~s|SELECT first_value(nosuch ORDER BY time) AS f FROM "p"|,
-            ~s|SELECT COUNT(DISTINCT nosuch) AS n FROM "p"|
+      table = "p.host, p.time, p.v"
+
+      # ORDER BY and GROUP BY list the select list's fields before the
+      # table's (`*` is every field).
+      for {sql, fields} <- [
+            {~s|SELECT nosuch FROM "p"|, table},
+            {~s|SELECT host, nosuch AS n FROM "p"|, table},
+            {~s|SELECT * FROM "p" WHERE nosuch = 1|, table},
+            {~s|SELECT * FROM "p" WHERE nosuch IS NULL|, table},
+            {~s|SELECT * FROM "p" WHERE nosuch IN ('a')|, table},
+            {~s|SELECT * FROM "p" WHERE v > 0 OR nosuch LIKE 'a%'|, table},
+            {~s|SELECT * FROM "p" ORDER BY nosuch|, "#{table}, #{table}"},
+            {~s|SELECT host FROM "p" GROUP BY nosuch|, "p.host, #{table}"},
+            {~s|SELECT MAX(nosuch) AS m FROM "p"|, table},
+            {~s|SELECT MAX(v + nosuch) AS m FROM "p"|, table},
+            {~s|SELECT nosuch, COUNT(*) AS n FROM "p" GROUP BY nosuch|, table},
+            {~s|SELECT DISTINCT nosuch FROM "p"|, table},
+            {~s|SELECT selector_first(nosuch, time)['value'] AS f FROM "p"|, table},
+            {~s|SELECT selector_first(v, nosuch)['value'] AS f FROM "p"|, table},
+            {~s|SELECT first_value(nosuch ORDER BY time) AS f FROM "p"|, table},
+            {~s|SELECT COUNT(DISTINCT nosuch) AS n FROM "p"|, table}
           ] do
         assert {:error,
                 %{
                   status: 500,
-                  body: "Schema error: No field named nosuch. Valid fields are host, time, v."
+                  body: "Schema error: No field named nosuch. Valid fields are " <> ^fields <> "."
                 }} = Local.query_sql(conn, sql, database: db),
                sql
       end
@@ -3693,7 +3684,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:error,
               %{
                 status: 500,
-                body: "Schema error: No field named nosuch. Valid fields are host, time."
+                body: "Schema error: No field named nosuch. Valid fields are w.host."
               }} =
                Local.query_sql(
                  conn,
@@ -3714,8 +3705,12 @@ defmodule InfluxElixir.Client.LocalTest do
                Local.query_sql(conn, ~s|SELECT COUNT(*) AS n FROM "p" ORDER BY n|, database: db)
     end
 
-    test "with no rows the schema is unknown and nothing is checked", %{conn: conn, db: db} do
-      assert {:ok, []} =
+    test "a CTE has its columns whether or not it has rows", %{conn: conn, db: db} do
+      assert {:error,
+              %{
+                status: 500,
+                body: "Schema error: No field named nosuch. Valid fields are w.host."
+              }} =
                Local.query_sql(
                  conn,
                  ~s|WITH w AS (SELECT host FROM "p" WHERE v > 100) SELECT nosuch FROM w|,
@@ -3838,11 +3833,11 @@ defmodule InfluxElixir.Client.LocalTest do
 
       # rack ascending (nulls last), then host descending; n=2 and n=4 tie
       # on both keys and keep their write order.
-      assert order.("SELECT n FROM sk ORDER BY rack, host DESC") == [2, 4, 6, 5, 1, 3]
+      assert order.("SELECT n FROM sk ORDER BY rack, host DESC") === [2, 4, 6, 5, 1, 3]
 
       # rack descending puts nulls first; NULLS LAST overrides it.
-      assert order.("SELECT n FROM sk ORDER BY rack DESC, host") == [3, 1, 5, 6, 2, 4]
-      assert order.("SELECT n FROM sk ORDER BY rack DESC NULLS LAST, host") == [1, 5, 6, 2, 4, 3]
+      assert order.("SELECT n FROM sk ORDER BY rack DESC, host") === [3, 1, 5, 6, 2, 4]
+      assert order.("SELECT n FROM sk ORDER BY rack DESC NULLS LAST, host") === [1, 5, 6, 2, 4, 3]
     end
   end
 
@@ -3911,7 +3906,7 @@ defmodule InfluxElixir.Client.LocalTest do
             ~s|SELECT level FROM "orderbooks" WHERE CAST(level AS INTEGER) * 2 <= 40 AND symbol = 'X' ORDER BY time|,
             ~s|SELECT level FROM "orderbooks" WHERE CAST(level AS INTEGER) BETWEEN 5 AND 20 AND symbol = 'X' ORDER BY time|
           ] do
-        assert levels(conn, db, sql) == ["5", "20"], sql
+        assert levels(conn, db, sql) === ["5", "20"], sql
       end
 
       assert levels(conn, db, ~s|SELECT level FROM "orderbooks" WHERE CAST(qty AS VARCHAR) = '2'|) ==
@@ -3921,7 +3916,7 @@ defmodule InfluxElixir.Client.LocalTest do
                conn,
                db,
                ~s|SELECT level FROM "orderbooks" WHERE CAST(qty AS VARCHAR) LIKE '2%'|
-             ) == ["20"]
+             ) === ["20"]
     end
 
     test "CAST in a projection, an aggregate and arithmetic", %{conn: conn, db: db} do
@@ -4026,7 +4021,7 @@ defmodule InfluxElixir.Client.LocalTest do
                  database: db
                )
 
-      assert Enum.map(rows, &{&1["symbol"], &1["level"]}) == [
+      assert Enum.map(rows, &{&1["symbol"], &1["level"]}) === [
                {"X", "100"},
                {"Y", "20"},
                {"X", "20"},
@@ -4080,22 +4075,22 @@ defmodule InfluxElixir.Client.LocalTest do
               %{
                 status: 500,
                 body:
-                  "Schema error: No field named a. Valid fields are host, other, rack, time, v."
+                  "Schema error: No field named a. Valid fields are p.host, p.other, p.rack, p.time, p.v."
               }} =
                Local.query_sql(conn, ~s|SELECT host FROM "p" WHERE host IN (a, b)|, database: db)
 
-      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE v IN (1, other) ORDER BY host|) == [
+      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE v IN (1, other) ORDER BY host|) === [
                "a"
              ]
 
-      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE v IN (other * 2)|) == []
+      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE v IN (other * 2)|) === []
 
-      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE rack IN (2, 4) ORDER BY host|) == [
+      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE rack IN (2, 4) ORDER BY host|) === [
                "a",
                "b"
              ]
 
-      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE host NOT IN ('a') ORDER BY host|) == [
+      assert hosts(conn, db, ~s|SELECT host FROM "p" WHERE host NOT IN ('a') ORDER BY host|) === [
                "b"
              ]
     end
@@ -4127,12 +4122,8 @@ defmodule InfluxElixir.Client.LocalTest do
                )
     end
 
-    test "a constant without an alias is refused with the reason", %{conn: conn, db: db} do
-      assert {:error,
-              %{
-                status: 400,
-                body: "Client.Local: unsupported column (a constant needs AS alias): 1"
-              }} =
+    test "a constant without an alias is named as the engine names it", %{conn: conn, db: db} do
+      assert {:ok, [%{"Int64(1)" => 1}, %{"Int64(1)" => 1}]} =
                Local.query_sql(conn, ~s|SELECT 1 FROM "p"|, database: db)
     end
   end
@@ -4189,7 +4180,7 @@ defmodule InfluxElixir.Client.LocalTest do
       lp = "p v=1i 1700000000000000000\np v=2.0 1700000000000000001\np v=3i 1700000000000000002"
       assert {:error, %{status: 400, body: body}} = Local.write(conn, lp, database: db)
 
-      assert partial_errors(body) == [{2, conflict}]
+      assert partial_errors(body) === [{2, conflict}]
 
       assert {:ok, [%{"v" => 1}, %{"v" => 3}]} =
                Local.query_sql(conn, ~s|SELECT v FROM "p" ORDER BY time|, database: db)
@@ -4200,7 +4191,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:error, %{status: 400, body: body}} = Local.write(conn, lp, database: db)
 
-      assert partial_errors(body) == [{2, "No fields were provided"}, {3, conflict}]
+      assert partial_errors(body) === [{2, "No fields were provided"}, {3, conflict}]
 
       assert {:ok, [%{"v" => 1}, %{"v" => 3}]} =
                Local.query_sql(conn, ~s|SELECT v FROM "q" ORDER BY time|, database: db)
@@ -4313,12 +4304,12 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "OFFSET 0 skips nothing and an OFFSET without ORDER BY follows write order",
          %{conn: conn, db: db} do
-      assert hosts(conn, db, ~s|SELECT host FROM "p" ORDER BY time LIMIT 2 OFFSET 0|) == [
+      assert hosts(conn, db, ~s|SELECT host FROM "p" ORDER BY time LIMIT 2 OFFSET 0|) === [
                "a",
                "b"
              ]
 
-      assert hosts(conn, db, ~s|SELECT host FROM "p" LIMIT 2 OFFSET 1|) == ["b", "c"]
+      assert hosts(conn, db, ~s|SELECT host FROM "p" LIMIT 2 OFFSET 1|) === ["b", "c"]
     end
 
     test "OFFSET applies to grouped, DISTINCT and projected rows too", %{conn: conn, db: db} do
@@ -4357,7 +4348,7 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
-      assert Enum.map(rows, & &1["host"]) == ["d", "c", "b", "a"]
+      assert Enum.map(rows, & &1["host"]) === ["d", "c", "b", "a"]
     end
 
     test "a negative or non-numeric OFFSET is the engine's error", %{conn: conn, db: db} do
@@ -4384,7 +4375,6 @@ defmodule InfluxElixir.Client.LocalTest do
     setup do
       {:ok, conn} = Local.start(profile: :v2)
       :ok = Local.create_bucket(conn, "metrics")
-      on_exit(fn -> Local.stop(conn) end)
       {:ok, conn: conn}
     end
 
@@ -4399,13 +4389,13 @@ defmodule InfluxElixir.Client.LocalTest do
       end
 
       assert {:ok, rows} = Local.query_flux(conn, v2_flux("pr"))
-      assert Enum.map(rows, & &1["_time"]) |> Enum.uniq() == [~U[2023-11-14 22:13:20.000000Z]]
+      assert Enum.map(rows, & &1["_time"]) |> Enum.uniq() === [~U[2023-11-14 22:13:20.000000Z]]
 
       for precision <- [:auto, :bogus, "NS"] do
         assert {:error, %{status: 400, body: body}} =
                  Local.write(conn, "pr value=1i 1", database: "metrics", precision: precision)
 
-        assert Jason.decode!(body) == %{
+        assert Jason.decode!(body) === %{
                  "code" => "invalid",
                  "message" => "invalid precision; valid precision units are ns, us, ms, and s"
                }
@@ -4418,7 +4408,6 @@ defmodule InfluxElixir.Client.LocalTest do
     # sends the token through the escape-aware scan. Both must agree.
     setup do
       {:ok, conn} = Local.start(databases: ["esc"])
-      on_exit(fn -> Local.stop(conn) end)
       {:ok, conn: conn}
     end
 
@@ -4434,7 +4423,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, "SELECT * FROM e ORDER BY time", database: "esc")
 
-      assert Enum.map(rows, &{&1["a=b"], &1["s"], &1["v"]}) == [
+      assert Enum.map(rows, &{&1["a=b"], &1["s"], &1["v"]}) === [
                {"x", "ends\\", 1},
                {"y", "line1\nline2", 2}
              ]
@@ -4450,7 +4439,6 @@ defmodule InfluxElixir.Client.LocalTest do
   describe "write/3 — a point rewritten at the same tags and time" do
     setup do
       {:ok, conn} = Local.start(databases: ["dup"], profile: :v3_enterprise)
-      on_exit(fn -> Local.stop(conn) end)
       {:ok, conn: conn, db: "dup"}
     end
 
@@ -4482,7 +4470,7 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, :written} = Local.write(conn, "d,h=x v=3i 1700000000000000001", database: db)
 
       assert {:ok, rows} = Local.query_sql(conn, "SELECT h, v FROM d ORDER BY v", database: db)
-      assert rows == [%{"h" => "x", "v" => 1}, %{"h" => "y", "v" => 2}, %{"h" => "x", "v" => 3}]
+      assert rows === [%{"h" => "x", "v" => 1}, %{"h" => "y", "v" => 2}, %{"h" => "x", "v" => 3}]
     end
 
     test "within one payload the last line wins; aggregates see one point", %{conn: conn, db: db} do
@@ -4517,7 +4505,6 @@ defmodule InfluxElixir.Client.LocalTest do
   describe "query_influxql/3 — the engine's InfluxQL answers" do
     setup do
       {:ok, conn} = Local.start(databases: ["iq"])
-      on_exit(fn -> Local.stop(conn) end)
 
       lp = """
       o,h=x v=3i 1700000000000003000
@@ -4535,7 +4522,7 @@ defmodule InfluxElixir.Client.LocalTest do
          %{conn: conn} do
       assert {:ok, rows} = iq_query(conn, "SELECT v FROM o")
 
-      assert rows == [
+      assert rows === [
                %{"iox::measurement" => "o", "time" => iq_time(1), "v" => 1},
                %{"iox::measurement" => "o", "time" => iq_time(2), "v" => 2},
                %{"iox::measurement" => "o", "time" => iq_time(3), "v" => 3}
@@ -4543,7 +4530,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, [%{"vee" => 1} | _rest]} = iq_query(conn, "SELECT v AS vee FROM o")
       assert {:ok, [%{"w" => 9, "time" => time}]} = iq_query(conn, "SELECT w FROM o")
-      assert time == iq_time(4)
+      assert time === iq_time(4)
       assert {:ok, []} = iq_query(conn, "SELECT h FROM o")
     end
 
@@ -4581,16 +4568,16 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, [%{"first" => 1, "time" => first}]} =
                iq_query(conn, "SELECT FIRST(v) FROM o")
 
-      assert first == iq_time(1)
+      assert first === iq_time(1)
     end
 
     test "GROUP BY orders series by tag; ORDER BY time DESC and MEAN apply per series",
          %{conn: conn} do
       assert {:ok, rows} = iq_query(conn, "SELECT v FROM o GROUP BY h ORDER BY time DESC")
-      assert Enum.map(rows, &{&1["h"], &1["v"]}) == [{"x", 3}, {"x", 2}, {"y", 1}]
+      assert Enum.map(rows, &{&1["h"], &1["v"]}) === [{"x", 3}, {"x", 2}, {"y", 1}]
 
       assert {:ok, rows} = iq_query(conn, "SELECT MEAN(v) FROM o GROUP BY h")
-      assert Enum.map(rows, &{&1["h"], &1["mean"]}) == [{"x", 2.5}, {"y", 1.0}]
+      assert Enum.map(rows, &{&1["h"], &1["mean"]}) === [{"x", 2.5}, {"y", 1.0}]
     end
 
     test "SHOW FIELD KEYS, SHOW TAG KEYS and SHOW DATABASES", %{conn: conn} do
@@ -4599,7 +4586,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, keys} = iq_query(conn, "SHOW FIELD KEYS")
 
-      assert Enum.map(keys, &{&1["iox::measurement"], &1["fieldKey"]}) == [
+      assert Enum.map(keys, &{&1["iox::measurement"], &1["fieldKey"]}) === [
                {"o", "v"},
                {"o", "w"},
                {"u", "x"}
@@ -4648,7 +4635,6 @@ defmodule InfluxElixir.Client.LocalTest do
   describe "query_sql/3 — time below a microsecond" do
     setup do
       {:ok, conn} = Local.start(databases: ["ns"])
-      on_exit(fn -> Local.stop(conn) end)
       lp = "o v=3i 1700000000000000300\no v=1i 1700000000000000100\no v=2i 1700000000000000200"
       {:ok, :written} = Local.write(conn, lp, database: "ns")
       {:ok, conn: conn}
@@ -4661,7 +4647,7 @@ defmodule InfluxElixir.Client.LocalTest do
             {"SELECT time AS t, v FROM o ORDER BY t", [1, 2, 3]}
           ] do
         assert {:ok, rows} = Local.query_sql(conn, sql, database: "ns")
-        assert Enum.map(rows, & &1["v"]) == expected, sql
+        assert Enum.map(rows, & &1["v"]) === expected, sql
       end
     end
   end
@@ -4674,7 +4660,6 @@ defmodule InfluxElixir.Client.LocalTest do
   describe "query_flux/3 — every stage is applied or refused" do
     setup do
       {:ok, conn} = Local.start(profile: :v2)
-      on_exit(fn -> Local.stop(conn) end)
       :ok = Local.create_bucket(conn, "b")
 
       lp = """
@@ -4691,7 +4676,7 @@ defmodule InfluxElixir.Client.LocalTest do
          %{conn: conn} do
       assert {:ok, rows} = flux_b(conn, "")
 
-      assert Enum.map(rows, &{&1["table"], &1["host"], &1["_field"]}) == [
+      assert Enum.map(rows, &{&1["table"], &1["host"], &1["_field"]}) === [
                {0, "a", "n"},
                {0, "a", "n"},
                {1, "a", "v"},
@@ -4700,8 +4685,8 @@ defmodule InfluxElixir.Client.LocalTest do
                {3, "b", "v"}
              ]
 
-      assert Enum.all?(rows, &(&1["_start"] == ~U[1970-01-01 00:00:00.000000Z]))
-      assert Enum.all?(rows, &(&1["_stop"] == ~U[2027-01-15 08:00:00.000000Z]))
+      assert Enum.all?(rows, &(&1["_start"] === ~U[1970-01-01 00:00:00.000000Z]))
+      assert Enum.all?(rows, &(&1["_stop"] === ~U[2027-01-15 08:00:00.000000Z]))
     end
 
     test "filter predicates: or, !=, not, numeric _value, r[\"key\"], a missing key",
@@ -4709,17 +4694,17 @@ defmodule InfluxElixir.Client.LocalTest do
       v = ~s| \|> filter(fn: (r) => r._field == "v"|
 
       assert {:ok, rows} = flux_b(conn, v <> ~s| and (r.host == "a" or r.host == "b"))|)
-      assert flux_values(rows) == [{0, "a", 1.0}, {0, "a", 3.0}, {1, "b", 5.0}]
+      assert flux_values(rows) === [{0, "a", 1.0}, {0, "a", 3.0}, {1, "b", 5.0}]
 
       assert {:ok, [%{"host" => "b", "_value" => 5.0}]} =
                flux_b(conn, v <> ~s| and r.host != "a")|)
 
       assert {:ok, rows} = flux_b(conn, ~s| \|> filter(fn: (r) => r._value > 2.0)|)
-      assert flux_values(rows) == [{0, "a", 3.0}, {1, "b", 3}, {2, "b", 5.0}]
+      assert flux_values(rows) === [{0, "a", 3.0}, {1, "b", 3}, {2, "b", 5.0}]
       assert {:ok, rows} = flux_b(conn, ~s| \|> filter(fn: (r) => not (r.host == "a"))|)
-      assert Enum.map(rows, & &1["host"]) == ["b", "b"]
+      assert Enum.map(rows, & &1["host"]) === ["b", "b"]
       assert {:ok, rows} = flux_b(conn, ~s| \|> filter(fn: (r) => r["host"] == "b")|)
-      assert Enum.map(rows, &{&1["host"], &1["_field"]}) == [{"b", "n"}, {"b", "v"}]
+      assert Enum.map(rows, &{&1["host"], &1["_field"]}) === [{"b", "n"}, {"b", "v"}]
       assert {:ok, []} = flux_b(conn, ~s| \|> filter(fn: (r) => r.nosuch == "x")|)
     end
 
@@ -4727,23 +4712,23 @@ defmodule InfluxElixir.Client.LocalTest do
          %{conn: conn} do
       v = ~s| \|> filter(fn: (r) => r._field == "v")|
       assert {:ok, rows} = flux_b(conn, v <> " |> last()")
-      assert flux_values(rows) == [{0, "a", 3.0}, {1, "b", 5.0}]
+      assert flux_values(rows) === [{0, "a", 3.0}, {1, "b", 5.0}]
 
-      assert Enum.map(rows, & &1["_time"]) == [
+      assert Enum.map(rows, & &1["_time"]) === [
                ~U[2023-11-14 22:14:20.000000Z],
                ~U[2023-11-14 22:13:20.000000Z]
              ]
 
       assert {:ok, rows} = flux_b(conn, v <> " |> max()")
-      assert flux_values(rows) == [{0, "a", 3.0}, {1, "b", 5.0}]
+      assert flux_values(rows) === [{0, "a", 3.0}, {1, "b", 5.0}]
 
       assert {:ok, rows} = flux_b(conn, v <> " |> mean()")
-      assert flux_values(rows) == [{0, "a", 2.0}, {1, "b", 5.0}]
+      assert flux_values(rows) === [{0, "a", 2.0}, {1, "b", 5.0}]
       refute Enum.any?(rows, &Map.has_key?(&1, "_time"))
       assert {:ok, rows} = flux_b(conn, ~s| \|> filter(fn: (r) => r._field == "n") \|> sum()|)
-      assert flux_values(rows) == [{0, "a", 3}, {1, "b", 3}]
+      assert flux_values(rows) === [{0, "a", 3}, {1, "b", 3}]
       assert {:ok, rows} = flux_b(conn, v <> " |> count()")
-      assert flux_values(rows) == [{0, "a", 2}, {1, "b", 1}]
+      assert flux_values(rows) === [{0, "a", 2}, {1, "b", 1}]
 
       assert {:ok, [%{"host" => "a", "_value" => 3.0}]} =
                flux_b(conn, v <> " |> limit(n: 1, offset: 1)")
@@ -4752,7 +4737,12 @@ defmodule InfluxElixir.Client.LocalTest do
                flux_b(conn, v <> " |> mean() |> filter(fn: (r) => r._value > 2.0)")
 
       assert {:ok, rows} = flux_b(conn, v <> ~s| \|> yield(name: "x")|)
-      assert Enum.map(rows, &{&1["result"], &1["_value"]}) == [{"x", 1.0}, {"x", 3.0}, {"x", 5.0}]
+
+      assert Enum.map(rows, &{&1["result"], &1["_value"]}) === [
+               {"x", 1.0},
+               {"x", 3.0},
+               {"x", 5.0}
+             ]
     end
 
     test "range(stop:) and an RFC3339 start bound the rows", %{conn: conn} do
@@ -4762,7 +4752,7 @@ defmodule InfluxElixir.Client.LocalTest do
                  ~s|from(bucket: "b") \|> range(start: 0, stop: 1700000030) \|> filter(fn: (r) => r._field == "v")|
                )
 
-      assert Enum.map(rows, & &1["_value"]) == [1.0, 5.0]
+      assert Enum.map(rows, & &1["_value"]) === [1.0, 5.0]
 
       assert {:ok, [%{"_value" => 3.0}]} =
                Local.query_flux(
@@ -4783,7 +4773,7 @@ defmodule InfluxElixir.Client.LocalTest do
              "Client.Local: unsupported filter predicate: r.host =~ /a/"}
           ] do
         assert {:error, %{status: 400, body: body}} = flux_b(conn, tail)
-        assert Jason.decode!(body) == %{"code" => "invalid", "message" => message}, tail
+        assert Jason.decode!(body) === %{"code" => "invalid", "message" => message}, tail
       end
     end
   end
@@ -4797,7 +4787,6 @@ defmodule InfluxElixir.Client.LocalTest do
   describe "query_sql/3 — GROUP BY and ORDER BY references" do
     setup do
       {:ok, conn} = Local.start(databases: ["g"])
-      on_exit(fn -> Local.stop(conn) end)
 
       lp = """
       m,h=a v=1.5,n=2i 1700000000000000000
@@ -4836,7 +4825,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "ORDER BY a position sorts by that select item", %{conn: conn} do
       assert {:ok, rows} = g_query(conn, "SELECT h, v FROM m ORDER BY 2 DESC")
-      assert Enum.map(rows, & &1["v"]) == [3.5, 2.5, 1.5]
+      assert Enum.map(rows, & &1["v"]) === [3.5, 2.5, 1.5]
 
       assert {:ok, [%{"h" => "a", "c" => 2}, %{"h" => "b", "c" => 1}]} =
                g_query(conn, "SELECT h, COUNT(v) AS c FROM m GROUP BY h ORDER BY 2 DESC")
@@ -4860,7 +4849,6 @@ defmodule InfluxElixir.Client.LocalTest do
   describe "query_sql/3 — nulls and operators as DataFusion has them" do
     setup do
       {:ok, conn} = Local.start(databases: ["nl"])
-      on_exit(fn -> Local.stop(conn) end)
 
       lp = """
       t,host=a,rack=1 v=1.5,n=2i,s="alpha",b=true 1700000000000000000
@@ -4877,10 +4865,10 @@ defmodule InfluxElixir.Client.LocalTest do
     test "nulls sort last ascending, first descending, and where NULLS says", %{conn: conn} do
       racks = fn sql -> conn |> nl_rows(sql) |> Enum.map(& &1["rack"]) end
 
-      assert racks.("SELECT rack FROM t ORDER BY rack, time") == ["1", "1", "2", "3", nil]
-      assert racks.("SELECT rack FROM t ORDER BY rack DESC, time") == [nil, "3", "2", "1", "1"]
+      assert racks.("SELECT rack FROM t ORDER BY rack, time") === ["1", "1", "2", "3", nil]
+      assert racks.("SELECT rack FROM t ORDER BY rack DESC, time") === [nil, "3", "2", "1", "1"]
 
-      assert racks.("SELECT rack FROM t ORDER BY rack NULLS FIRST, time") == [
+      assert racks.("SELECT rack FROM t ORDER BY rack NULLS FIRST, time") === [
                nil,
                "1",
                "1",
@@ -4888,7 +4876,7 @@ defmodule InfluxElixir.Client.LocalTest do
                "3"
              ]
 
-      assert racks.("SELECT rack FROM t ORDER BY rack DESC NULLS LAST, time") == [
+      assert racks.("SELECT rack FROM t ORDER BY rack DESC NULLS LAST, time") === [
                "3",
                "2",
                "1",
@@ -4907,12 +4895,12 @@ defmodule InfluxElixir.Client.LocalTest do
          %{conn: conn} do
       hosts = fn sql -> conn |> nl_rows(sql) |> Enum.map(& &1["host"]) end
 
-      assert hosts.("SELECT host FROM t WHERE NOT (rack = '1') ORDER BY time") == ["a", "c"]
-      assert hosts.("SELECT host FROM t WHERE NOT (v > 0) ORDER BY time") == ["a"]
-      assert hosts.("SELECT host FROM t WHERE rack NOT IN ('1') ORDER BY time") == ["a", "c"]
-      assert hosts.("SELECT host FROM t WHERE v NOT BETWEEN 0 AND 2 ORDER BY time") == ["a", "b"]
+      assert hosts.("SELECT host FROM t WHERE NOT (rack = '1') ORDER BY time") === ["a", "c"]
+      assert hosts.("SELECT host FROM t WHERE NOT (v > 0) ORDER BY time") === ["a"]
+      assert hosts.("SELECT host FROM t WHERE rack NOT IN ('1') ORDER BY time") === ["a", "c"]
+      assert hosts.("SELECT host FROM t WHERE v NOT BETWEEN 0 AND 2 ORDER BY time") === ["a", "b"]
 
-      assert hosts.("SELECT host FROM t WHERE v > 0 OR rack = '3' ORDER BY time") == [
+      assert hosts.("SELECT host FROM t WHERE v > 0 OR rack = '3' ORDER BY time") === [
                "a",
                "b",
                "c"
@@ -4948,7 +4936,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "% keeps the dividend's sign and works on floats; unary minus negates", %{conn: conn} do
-      assert Enum.map(nl_rows(conn, "SELECT n % 3 AS m FROM t ORDER BY time"), & &1["m"]) == [
+      assert Enum.map(nl_rows(conn, "SELECT n % 3 AS m FROM t ORDER BY time"), & &1["m"]) === [
                2,
                1,
                -1,
@@ -4956,7 +4944,7 @@ defmodule InfluxElixir.Client.LocalTest do
                nil
              ]
 
-      assert Enum.map(nl_rows(conn, "SELECT v % 2 AS m FROM t ORDER BY time"), & &1["m"]) == [
+      assert Enum.map(nl_rows(conn, "SELECT v % 2 AS m FROM t ORDER BY time"), & &1["m"]) === [
                1.5,
                -1.25,
                0.0,
@@ -4964,7 +4952,7 @@ defmodule InfluxElixir.Client.LocalTest do
                0.5
              ]
 
-      assert Enum.map(nl_rows(conn, "SELECT -n AS x FROM t ORDER BY time"), & &1["x"]) == [
+      assert Enum.map(nl_rows(conn, "SELECT -n AS x FROM t ORDER BY time"), & &1["x"]) === [
                -2,
                -7,
                4,
@@ -4985,7 +4973,6 @@ defmodule InfluxElixir.Client.LocalTest do
   describe "write/3 — accept_partial: false, no_sync" do
     setup do
       {:ok, conn} = Local.start(databases: ["aw"])
-      on_exit(fn -> Local.stop(conn) end)
       {:ok, conn: conn}
     end
 
@@ -4996,7 +4983,7 @@ defmodule InfluxElixir.Client.LocalTest do
                  accept_partial: false
                )
 
-      assert atomic_error(body) == {2, "No fields were provided", "m1 v="}
+      assert atomic_error(body) === {2, "No fields were provided", "m1 v="}
 
       assert {:error,
               %{status: 400, body: "Error during planning: table 'public.iox.m1' not found"}} =
@@ -5034,7 +5021,7 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:error, %{body: body}} =
                Local.write(conn, "m4,time=x v=1i 1", database: "aw", accept_partial: false)
 
-      assert atomic_error(body) == {1, "'time' is a reserved column", "m4,time=x v=1i 1"}
+      assert atomic_error(body) === {1, "'time' is a reserved column", "m4,time=x v=1i 1"}
     end
 
     test "a flag that is not a boolean is the engine's 400", %{conn: conn} do
@@ -5047,7 +5034,6 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "the :v2 profile has neither parameter and ignores them" do
       {:ok, v2} = Local.start(profile: :v2)
-      on_exit(fn -> Local.stop(v2) end)
       :ok = Local.create_bucket(v2, "b")
 
       assert {:ok, :written} = Local.write(v2, "m v=1i 1", database: "b", accept_partial: "yes")

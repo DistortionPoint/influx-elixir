@@ -6,7 +6,6 @@ defmodule InfluxElixirTest do
   setup do
     {:ok, conn} = Local.start(databases: ["test_db"])
     Local.write(conn, "cpu value=1i", database: "test_db")
-    on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn}
   end
 
@@ -69,7 +68,6 @@ defmodule InfluxElixirTest do
   describe "query_flux/3" do
     test "delegates to configured client" do
       {:ok, v2_conn} = Local.start(profile: :v2)
-      on_exit(fn -> Local.stop(v2_conn) end)
 
       :ok = InfluxElixir.create_bucket(v2_conn, "test")
       {:ok, :written} = InfluxElixir.write(v2_conn, "cpu value=1.0", database: "test")
@@ -104,7 +102,6 @@ defmodule InfluxElixirTest do
   describe "create_bucket/3" do
     test "delegates to configured client" do
       {:ok, v2_conn} = Local.start(profile: :v2)
-      on_exit(fn -> Local.stop(v2_conn) end)
       assert :ok = InfluxElixir.create_bucket(v2_conn, "new_bucket")
     end
   end
@@ -112,7 +109,6 @@ defmodule InfluxElixirTest do
   describe "list_buckets/1" do
     test "delegates to configured client" do
       {:ok, v2_conn} = Local.start(profile: :v2)
-      on_exit(fn -> Local.stop(v2_conn) end)
       :ok = InfluxElixir.create_bucket(v2_conn, "listed_bucket")
 
       assert {:ok, buckets} = InfluxElixir.list_buckets(v2_conn)
@@ -123,7 +119,6 @@ defmodule InfluxElixirTest do
   describe "delete_bucket/2" do
     test "delegates to configured client" do
       {:ok, v2_conn} = Local.start(profile: :v2)
-      on_exit(fn -> Local.stop(v2_conn) end)
       :ok = InfluxElixir.create_bucket(v2_conn, "test_bucket")
       assert :ok = InfluxElixir.delete_bucket(v2_conn, "test_bucket")
       assert {:error, %{status: 404}} = InfluxElixir.delete_bucket(v2_conn, "test_bucket")
@@ -232,7 +227,6 @@ defmodule InfluxElixirTest do
   describe "connection-level default database" do
     test "write and query functions fall back to it when opts omit :database" do
       {:ok, conn} = Local.start(database: "dflt_db")
-      on_exit(fn -> Local.stop(conn) end)
 
       assert {:ok, :written} = InfluxElixir.write(conn, "cpu value=1i")
       assert {:ok, [%{"value" => 1}]} = InfluxElixir.query_sql(conn, "SELECT * FROM cpu")
@@ -305,7 +299,6 @@ defmodule InfluxElixirTest do
 
       # Register a LocalClient connection under the name
       {:ok, local_conn} = Local.start(databases: ["facade_db"])
-      on_exit(fn -> Local.stop(local_conn) end)
 
       InfluxElixir.Connection.put(name, local_conn)
       on_exit(fn -> InfluxElixir.Connection.delete(name) end)
@@ -317,7 +310,6 @@ defmodule InfluxElixirTest do
       name = :"facade_rw_#{System.unique_integer([:positive])}"
 
       {:ok, local_conn} = Local.start(databases: ["facade_rw_db"])
-      on_exit(fn -> Local.stop(local_conn) end)
 
       InfluxElixir.Connection.put(name, local_conn)
       on_exit(fn -> InfluxElixir.Connection.delete(name) end)

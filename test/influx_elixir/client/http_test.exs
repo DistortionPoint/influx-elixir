@@ -53,21 +53,42 @@ defmodule InfluxElixir.Client.HTTPTest do
 
   @timed_out {:error, {:connection_error, %Mint.TransportError{reason: :timeout}}}
 
-  # The port of a listener that accepts connections and says nothing; the
-  # test process is told (`:held`) each time it has taken one.
-  defp black_hole do
+  # The port of a listener that accepts connections and says nothing. The
+  # acceptor is a supervised task that owns the listener and every socket it
+  # takes, so all of them close when the test ends. With `:notify` the test
+  # process is told (`:held`) each time a connection has been taken.
+  defp black_hole(notify \\ :silent) do
     owner = self()
-    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, backlog: 128])
-    {:ok, port} = :inet.port(listener)
-    spawn(fn -> accept_and_hold(listener, owner, []) end)
-    port
+    ref = make_ref()
+    tell = if notify == :notify, do: owner, else: nil
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {Task,
+         fn ->
+           {:ok, listener} =
+             :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, backlog: 128])
+
+           {:ok, port} = :inet.port(listener)
+           send(owner, {ref, port})
+           accept_and_hold(listener, tell, [])
+         end},
+        id: ref
+      )
+    )
+
+    receive do
+      {^ref, port} -> port
+    after
+      5_000 -> flunk("the black hole did not start listening")
+    end
   end
 
-  defp accept_and_hold(listener, owner, sockets) do
+  defp accept_and_hold(listener, tell, sockets) do
     case :gen_tcp.accept(listener) do
       {:ok, socket} ->
-        send(owner, :held)
-        accept_and_hold(listener, owner, [socket | sockets])
+        if tell, do: send(tell, :held)
+        accept_and_hold(listener, tell, [socket | sockets])
 
       {:error, _closed} ->
         :ok
@@ -98,10 +119,19 @@ defmodule InfluxElixir.Client.HTTPTest do
 
   # The first request holds the pool's only connection while the black hole
   # keeps it waiting for an answer.
+  # It names its own :pool_timeout: the connection's may be short, and under
+  # load the holder would then fail at checkout and never connect.
   defp hold_the_connection(conn) do
-    task = Task.async(fn -> HTTP.query_sql(conn, "SELECT 1", timeout: 5_000) end)
-    assert_receive :held, 2_000
-    task
+    task =
+      Task.async(fn ->
+        HTTP.query_sql(conn, "SELECT 1", timeout: 5_000, pool_timeout: 5_000)
+      end)
+
+    receive do
+      :held -> task
+    after
+      10_000 -> flunk("the holder never connected: #{inspect(Task.yield(task, 0))}")
+    end
   end
 
   describe "the receive timeout" do
@@ -136,16 +166,11 @@ defmodule InfluxElixir.Client.HTTPTest do
                  answer_within(20_000, call)
       end
     end
-
-    test "falls back to 30 seconds when neither names one" do
-      # A wait that long is not worth a test: the default is read directly.
-      assert HTTP.resolve_timeout([], host: "h") == 30_000
-    end
   end
 
   describe "the pool checkout timeout" do
     test "the option wins over the connection's" do
-      conn = connection(black_hole(), pool_timeout: 60_000)
+      conn = connection(black_hole(:notify), pool_timeout: 60_000)
       holder = hold_the_connection(conn)
 
       assert answer_within(3_000, fn -> HTTP.query_sql(conn, "SELECT 1", pool_timeout: 100) end) ==
@@ -155,7 +180,7 @@ defmodule InfluxElixir.Client.HTTPTest do
     end
 
     test "the connection's applies when the option is absent, and is independent of :timeout" do
-      conn = connection(black_hole(), pool_timeout: 100, timeout: 180_000)
+      conn = connection(black_hole(:notify), pool_timeout: 100, timeout: 180_000)
       holder = hold_the_connection(conn)
 
       assert answer_within(3_000, fn -> HTTP.query_sql(conn, "SELECT 1") end) ==
@@ -163,8 +188,14 @@ defmodule InfluxElixir.Client.HTTPTest do
 
       Task.shutdown(holder, :brutal_kill)
     end
+  end
 
-    test "falls back to Finch's 5 seconds when neither names one" do
+  # The defaults (30 s receive, 5 s checkout) are only visible as a wait that
+  # long, which is not worth a test; the precedence above is behavioural. This
+  # one reads the defaults from the resolvers (public only for this test).
+  describe "the timeout defaults" do
+    test "are 30 seconds to receive and 5 to check out when nothing names one" do
+      assert HTTP.resolve_timeout([], host: "h") == 30_000
       assert HTTP.resolve_pool_timeout([], []) == 5_000
       assert HTTP.resolve_pool_timeout([timeout: 180_000], timeout: 180_000) == 5_000
     end
@@ -242,7 +273,7 @@ defmodule InfluxElixir.Client.HTTPTest do
       end
     end
 
-    test "does not include nil, an empty list or a keyword list" do
+    test "nil, an empty list, a keyword list, an empty map and a finite Decimal are all sent" do
       conn = connection(1, [])
 
       for params <- [nil, [], [p: 1], %{}, %{p: Decimal.new("1000.00")}] do

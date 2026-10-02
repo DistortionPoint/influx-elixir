@@ -3,9 +3,14 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   What a `time` comparand is, as InfluxDB 3 reads it (verified against Core):
 
     * a quoted string is read as Arrow reads a timestamp: `YYYY-MM-DD`, then
-      optionally `T`, `t` or a space, `HH:MM:SS`, a fraction (digits past the
-      ninth are dropped) and a zone — `Z`, `z`, a fixed offset (`+01:00`,
-      `+0100`, `+01`, after any blanks) or `UTC` / `GMT`. A string it cannot
+      optionally `T`, `t` or a space, `HH:MM:SS` (`:60` is the next minute), a
+      fraction (digits past the ninth are dropped) and a zone — `Z`, `z`, a
+      fixed offset (`+01:00`, `+0100`, `+01`, after any blanks) or a name of
+      the time zone database, which is case sensitive: the ones that are UTC
+      (`UTC`, `GMT`, `Zulu`, `UCT`, `Universal`, `Greenwich`, `GMT0`, `GMT+0`,
+      `GMT-0` and the same under `Etc/`), `Etc/GMT+1` to `Etc/GMT+12` (the
+      sign is inverted: UTC minus that many hours) and `Etc/GMT-1` to
+      `Etc/GMT-14`, and the fixed offsets `EST`, `MST` and `HST`. A string it cannot
       read is the optimizer's 500 naming why (`timestamp must contain at
       least 10 characters`, `error parsing date`, `invalid timestamp
       separator`, `error parsing time`, `Invalid timezone "..."`), and an
@@ -20,8 +25,9 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   The optimizer folds a constant after the planner has typed the whole
   query, so an unreadable string is kept in the parsed query as
   `{:invalid_time, error}` and raised by `first_invalid/1` once the type
-  checks have passed. What the double cannot model — a leap second, a named
-  time zone — is the same marker carrying a `Client.Local:` refusal.
+  checks have passed. What the double cannot model — a time zone whose offset
+  changes with the date — is the same marker carrying a `Client.Local:`
+  refusal.
   """
 
   alias InfluxElixir.Client.Local.{SQLError, SQLLiteral}
@@ -50,11 +56,18 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   @int64_max 9_223_372_036_854_775_807
   @first_second -9_223_372_036
 
-  # Zone names of the tz database that carry no `/`; the double holds no tz
-  # database and refuses these by name.
-  @zone_names ~w(UCT Universal Zulu Greenwich EST MST HST EST5EDT CST6CDT MST7MDT PST8PDT
-                 CET MET EET WET Cuba Egypt Eire Hongkong Iceland Iran Israel Jamaica Japan
-                 Kwajalein Libya Navajo NZ PRC Poland Portugal ROC ROK Singapore Turkey)
+  # The names of the time zone database that are UTC all year (verified).
+  @utc_zones ~w(UTC GMT Zulu UCT Universal Greenwich GMT0 GMT+0 GMT-0 Etc/UTC Etc/GMT Etc/UCT
+                Etc/Zulu Etc/Universal Etc/Greenwich Etc/GMT0 Etc/GMT+0 Etc/GMT-0)
+
+  # Names whose offset never changes (verified: the offset holds in July).
+  @fixed_zones %{"EST" => -5 * 3600, "MST" => -7 * 3600, "HST" => -10 * 3600}
+
+  # Zone names of the tz database with no fixed offset; the double holds no
+  # tz database and refuses these, and any name with a `/`, by name.
+  @zone_names ~w(EST5EDT CST6CDT MST7MDT PST8PDT CET MET EET WET Cuba Egypt Eire Hongkong
+                 Iceland Iran Israel Jamaica Japan Kwajalein Libya Navajo NZ PRC Poland
+                 Portugal ROC ROK Singapore Turkey)
 
   @doc """
   Reads the text of a `time` comparand. `{:error, {:number, type}}` is a bare
@@ -248,14 +261,12 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   # A timestamp string, as Arrow reads it
   # ---------------------------------------------------------------------------
 
-  @doc """
-  A quoted timestamp's text as nanoseconds since the epoch, or the
-  optimizer's error for it.
-  """
+  # A quoted timestamp's text as nanoseconds since the epoch, or the
+  # optimizer's error for it.
   @spec literal(binary()) :: {:ok, integer()} | {:error, SQLError.t()}
-  def literal(text) do
-    with {:ok, instant} <- timestamp(text),
-         :ok <- in_range(instant) do
+  defp literal(text) do
+    with {:ok, instant, leap} <- timestamp(text),
+         :ok <- in_range(instant, leap) do
       {:ok, instant}
     else
       {:error, detail} -> {:error, SQLError.simplify(detail)}
@@ -265,14 +276,15 @@ defmodule InfluxElixir.Client.Local.SQLTime do
 
   # Arrow counts bytes, so a short string of wide characters is long enough.
   @spec timestamp(binary()) ::
-          {:ok, integer()} | {:error, binary()} | {:refusal, binary()}
+          {:ok, integer(), boolean()} | {:error, binary()} | {:refusal, binary()}
   defp timestamp(text) when byte_size(text) < 10,
     do: failed(text, "timestamp must contain at least 10 characters")
 
   defp timestamp(text) do
     with {:ok, date, rest} <- date(text),
          {:ok, clock, offset} <- time_and_zone(rest) do
-      {:ok, instant(date, clock, offset)}
+      {_seconds, _nanos, leap} = clock
+      {:ok, instant(date, clock, offset), leap}
     else
       {:error, reason} when is_binary(reason) ->
         failed(text, reason)
@@ -303,24 +315,24 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   defp date(_text), do: {:error, "error parsing date"}
 
   @spec time_and_zone(binary()) ::
-          {:ok, {integer(), non_neg_integer()}, integer()}
+          {:ok, {integer(), non_neg_integer(), boolean()}, integer()}
           | {:error, binary()}
           | {:zone, binary()}
           | {:refusal, binary()}
-  defp time_and_zone(""), do: {:ok, {0, 0}, 0}
+  defp time_and_zone(""), do: {:ok, {0, 0, false}, 0}
 
   defp time_and_zone(<<separator, rest::binary>>) when separator in [?T, ?t, ?\s] do
-    with {:ok, seconds, tail} <- clock(rest),
+    with {:ok, seconds, leap, tail} <- clock(rest),
          {:ok, nanos, tail} <- fraction(tail),
          {:ok, offset} <- zone(tail) do
-      {:ok, {seconds, nanos}, offset}
+      {:ok, {seconds, nanos, leap}, offset}
     end
   end
 
   defp time_and_zone(_text), do: {:error, "invalid timestamp separator"}
 
   @spec clock(binary()) ::
-          {:ok, non_neg_integer(), binary()} | {:error, binary()} | {:refusal, binary()}
+          {:ok, non_neg_integer(), boolean(), binary()} | {:error, binary()}
   defp clock(<<h::binary-size(2), ?:, m::binary-size(2), ?:, s::binary-size(2), tail::binary>>) do
     if digits?(h <> m <> s), do: clock_value(h, m, s, tail), else: {:error, "error parsing time"}
   end
@@ -330,16 +342,9 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   defp clock_value(h, m, s, tail) do
     {hour, minute, second} = {String.to_integer(h), String.to_integer(m), String.to_integer(s)}
 
-    cond do
-      hour > 23 or minute > 59 or second > 60 ->
-        {:error, "error parsing time"}
-
-      second == 60 ->
-        {:refusal, "Client.Local does not model a leap second (:60)"}
-
-      true ->
-        {:ok, hour * 3600 + minute * 60 + second, tail}
-    end
+    if hour > 23 or minute > 59 or second > 60,
+      do: {:error, "error parsing time"},
+      else: {:ok, hour * 3600 + minute * 60 + second, second == 60, tail}
   end
 
   # Digits past the ninth are read and dropped.
@@ -396,20 +401,41 @@ defmodule InfluxElixir.Client.Local.SQLTime do
 
   defp offset(_sign, _h, _m), do: :error
 
-  @spec named_zone(binary()) :: {:ok, 0} | {:zone, binary()} | {:refusal, binary()}
-  defp named_zone(zone) when zone in ["UTC", "GMT"], do: {:ok, 0}
+  @spec named_zone(binary()) :: {:ok, integer()} | {:zone, binary()} | {:refusal, binary()}
+  defp named_zone(zone) when zone in @utc_zones, do: {:ok, 0}
 
   defp named_zone(zone) do
-    if String.contains?(zone, "/") or zone in @zone_names,
-      do: {:refusal, "Client.Local holds no time zone database: #{zone}"},
-      else: {:zone, zone}
+    cond do
+      Map.has_key?(@fixed_zones, zone) -> {:ok, Map.fetch!(@fixed_zones, zone)}
+      match = Regex.run(~r/\AEtc\/GMT([+-])([0-9]+)\z/, zone) -> etc_zone(zone, match)
+      String.contains?(zone, "/") or zone in @zone_names -> unmodelled_zone(zone)
+      true -> {:zone, zone}
+    end
   end
+
+  # `Etc/GMT+N` is N hours *behind* UTC, `Etc/GMT-N` ahead; the database has
+  # +1 to +12 and -1 to -14, written without a leading zero (verified).
+  @spec etc_zone(binary(), [binary()]) :: {:ok, integer()} | {:zone, binary()}
+  defp etc_zone(zone, [_full, sign, digits]) do
+    hours = String.to_integer(digits)
+    plain? = not String.starts_with?(digits, "0")
+
+    cond do
+      plain? and sign == "+" and hours in 1..12 -> {:ok, -hours * 3600}
+      plain? and sign == "-" and hours in 1..14 -> {:ok, hours * 3600}
+      true -> {:zone, zone}
+    end
+  end
+
+  @spec unmodelled_zone(binary()) :: {:refusal, binary()}
+  defp unmodelled_zone(zone),
+    do: {:refusal, "the double holds no time zone database, so it cannot read the zone #{zone}"}
 
   @spec digits?(binary()) :: boolean()
   defp digits?(text), do: Regex.match?(~r/\A[0-9]+\z/, text)
 
-  @spec instant(Date.t(), {integer(), non_neg_integer()}, integer()) :: integer()
-  defp instant(date, {seconds, nanos}, offset) do
+  @spec instant(Date.t(), {integer(), non_neg_integer(), boolean()}, integer()) :: integer()
+  defp instant(date, {seconds, nanos, _leap}, offset) do
     midnight = date |> DateTime.new!(~T[00:00:00], "Etc/UTC") |> DateTime.to_unix()
     (midnight + seconds - offset) * 1_000_000_000 + nanos
   end
@@ -417,27 +443,30 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   # Arrow reads the seconds and the nanoseconds apart, and the seconds
   # before 1677-09-21T00:12:44 overflow the nanosecond count even when the
   # sum would fit.
-  @spec in_range(integer()) :: :ok | {:error, binary()}
-  defp in_range(ns) do
+  @spec in_range(integer(), boolean()) :: :ok | {:error, binary()}
+  defp in_range(ns, leap) do
     if Integer.floor_div(ns, 1_000_000_000) >= @first_second and ns <= @int64_max,
       do: :ok,
       else:
         {:error,
-         "Arrow error: Cast error: Overflow converting #{display(ns)} to Nanosecond. The " <>
+         "Arrow error: Cast error: Overflow converting #{display(ns, leap)} to Nanosecond. The " <>
            "dates that can be represented as nanoseconds have to be between " <>
            "1677-09-21T00:12:44.0 and 2262-04-11T23:47:16.854775804"}
   end
 
-  # chrono's rendering of a naive datetime.
-  @spec display(integer()) :: binary()
-  defp display(ns) do
-    nanos = Integer.mod(ns, 1_000_000_000)
-    datetime = ns |> Integer.floor_div(1_000_000_000) |> DateTime.from_unix!()
+  # chrono's rendering of a naive datetime; a leap second (`:60`) is the
+  # second after `:59`, which chrono writes as `:60`.
+  @spec display(integer(), boolean()) :: binary()
+  defp display(ns, leap) do
+    shown = if leap, do: ns - 1_000_000_000, else: ns
+    nanos = Integer.mod(shown, 1_000_000_000)
+    datetime = shown |> Integer.floor_div(1_000_000_000) |> DateTime.from_unix!()
     year = datetime.year
+    second = if leap, do: datetime.second + 1, else: datetime.second
 
     sign = if year < 0, do: "-", else: ""
     date = "#{sign}#{pad(abs(year), 4)}-#{pad(datetime.month, 2)}-#{pad(datetime.day, 2)}"
-    time = "#{pad(datetime.hour, 2)}:#{pad(datetime.minute, 2)}:#{pad(datetime.second, 2)}"
+    time = "#{pad(datetime.hour, 2)}:#{pad(datetime.minute, 2)}:#{pad(second, 2)}"
     date <> " " <> time <> fraction_text(nanos)
   end
 

@@ -95,16 +95,18 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   """
   @spec parse(binary()) :: {:ok, query()} | {:error, binary() | {:engine, binary()}}
   def parse(statement) do
-    masked = mask_literals(statement)
+    {clean, masked} = blank_comments(statement, mask_literals(statement))
+    {head, masked_head, tail} = split_statement(clean, masked)
 
-    with :ok <- check_supported(masked),
+    with :ok <- check_supported(masked_head),
          %{"items" => items, "from" => from, "rest" => rest} <-
-           slices(@select, masked, statement) || {:error, "invalid statement"},
-         %{"rest" => masked_rest} = slices(@select, masked, masked),
+           slices(@select, masked_head, head) || {:error, "invalid statement"},
+         %{"rest" => masked_rest} = slices(@select, masked_head, masked_head),
          %{} = clauses <- slices(@rest, masked_rest, rest) || {:error, "invalid clauses"},
-         :ok <- check_where(statement, rest, masked_rest, blank_to_nil(clauses["where"])),
+         :ok <- check_where(clean, head, rest, masked_rest, blank_to_nil(clauses["where"])),
          {:ok, items} <- parse_items(items),
-         :ok <- check_mix(items) do
+         :ok <- check_mix(items),
+         :ok <- check_single(statement, tail) do
       {:ok,
        %{
          items: items,
@@ -116,6 +118,84 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
          offset: to_int(clauses["offset"]) || 0
        }}
     end
+  end
+
+  # A `--` outside a literal comments out the rest of its line. The comment
+  # becomes spaces, byte for byte, in the statement and its mask, so every
+  # offset stays the engine's.
+  @spec blank_comments(binary(), binary()) :: {binary(), binary()}
+  defp blank_comments(statement, masked) do
+    comments = ~r/--[^\n]*/ |> Regex.scan(masked, return: :index) |> List.flatten()
+    {Enum.reduce(comments, statement, &blank/2), Enum.reduce(comments, masked, &blank/2)}
+  end
+
+  @spec blank({non_neg_integer(), non_neg_integer()}, binary()) :: binary()
+  defp blank({from, length}, text) do
+    <<before::binary-size(from), _comment::binary-size(length), rest::binary>> = text
+    before <> String.duplicate(" ", length) <> rest
+  end
+
+  # The statement up to its first `;` outside a literal, with its mask, and
+  # the offset just after the `;` (`nil` without one).
+  @spec split_statement(binary(), binary()) ::
+          {binary(), binary(), non_neg_integer() | nil}
+  defp split_statement(clean, masked) do
+    case :binary.match(masked, ";") do
+      {at, 1} ->
+        {binary_part(clean, 0, at), binary_part(masked, 0, at), at + 1}
+
+      :nomatch ->
+        {clean, masked, nil}
+    end
+  end
+
+  # What follows a statement's `;` is another statement or nothing. The
+  # engine takes one statement per query (verified): a second that reads is
+  # "only one InfluxQl statement per query", and what does not read is its
+  # own parse error at the position it starts, the rest of the text shown.
+  # Repeated `;` and whitespace between are skipped.
+  @spec check_single(binary(), non_neg_integer() | nil) :: :ok | {:error, term()}
+  defp check_single(_statement, nil), do: :ok
+
+  defp check_single(statement, after_semicolon) do
+    rest = binary_part(statement, after_semicolon, byte_size(statement) - after_semicolon)
+    {clean_rest, _masked} = blank_comments(rest, mask_literals(rest))
+    [skipped] = Regex.run(~r/^[\s;]*/, clean_rest)
+    start = after_semicolon + byte_size(skipped)
+
+    case binary_part(statement, start, byte_size(statement) - start) do
+      "" -> :ok
+      next -> next_statement_error(statement, next, start)
+    end
+  end
+
+  @only_one "must provide only one InfluxQl statement per query"
+  @other_statements ~r/^SHOW\s+(?:DATABASES|MEASUREMENTS|TAG\s+(?:KEYS|VALUES)|FIELD\s+KEYS)\b/i
+
+  @spec next_statement_error(binary(), binary(), non_neg_integer()) :: {:error, term()}
+  defp next_statement_error(statement, next, start) do
+    case parse(next) do
+      {:ok, _query} ->
+        {:error, {:engine, @only_one}}
+
+      {:error, {:engine, body}} ->
+        {:error, {:engine, shift_position(body, start)}}
+
+      {:error, "unsupported" <> _rest} = refusal ->
+        refusal
+
+      {:error, _message} ->
+        if Regex.match?(@other_statements, next),
+          do: {:error, {:engine, @only_one}},
+          else: {:error, {:engine, syntax_error_body(:nom, start, statement)}}
+    end
+  end
+
+  @spec shift_position(binary(), non_neg_integer()) :: binary()
+  defp shift_position(body, by) do
+    Regex.replace(~r/at pos (\d+)/, body, fn _match, pos ->
+      "at pos #{String.to_integer(pos) + by}"
+    end)
   end
 
   @doc """
@@ -231,7 +311,8 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   defp decrement(:all), do: :all
   defp decrement(n), do: n - 1
 
-  # The rows of each `GROUP BY` series, in order of the tag values; the
+  # The rows of each `GROUP BY` series, in order of the tag values by tag
+  # key (verified: `GROUP BY r, h` orders as `GROUP BY h, r`); the
   # rows keep the time order they came in (the grouping is stable). Without
   # a `GROUP BY` there is one series and no pass to group it.
   @spec series_groups(query(), [map()]) :: [{map(), [map()]}]
@@ -239,9 +320,11 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   defp series_groups(%{group_by: []}, rows), do: [{%{}, rows}]
 
   defp series_groups(%{group_by: group_by}, rows) do
+    keys = Enum.sort(group_by)
+
     rows
-    |> Enum.group_by(&Map.take(&1, group_by))
-    |> Enum.sort_by(fn {key, _rows} -> Enum.map(group_by, &series_sort_key(key, &1)) end)
+    |> Enum.group_by(&Map.take(&1, keys))
+    |> Enum.sort_by(fn {key, _rows} -> Enum.map(keys, &series_sort_key(key, &1)) end)
   end
 
   # The series that lacks the tag comes after every tag value, as the engine lists it.
@@ -513,22 +596,13 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
 
   @doc """
   Rewrites an InfluxQL `WHERE` into the caller's SQL, given the
-  measurement's tag columns. `{:error, message}` for what the double
-  refuses by name; `{:error, {:engine, body}}` for what the engine itself
-  answers with a 400.
-  """
-  @spec where_sql(binary(), MapSet.t(binary())) ::
-          {:ok, binary()} | {:error, binary() | {:engine, binary()}}
-  def where_sql(where, tags) do
-    with {:ok, %{sql: sql}} <- where_plan(where, tags), do: {:ok, sql}
-  end
-
-  @doc """
-  Like `where_sql/2`, with the column names the `WHERE` mentions and the
-  lower bounds it puts on `time`:
+  measurement's tag columns, with the column names the `WHERE` mentions and
+  the lower bounds it puts on `time`:
   `time >= x` and `time = x` give `x`, `time > x` gives `x + 1`, upper
   bounds give none. An aggregate over a lower bound is stamped with the
-  greatest of them (`run/4`).
+  greatest of them (`run/4`). `{:error, message}` for what the double
+  refuses by name; `{:error, {:engine, body}}` for what the engine itself
+  answers with a 400.
   """
   @spec where_plan(binary(), MapSet.t(binary())) ::
           {:ok, where_plan()} | {:error, binary() | {:engine, binary()}}
@@ -540,7 +614,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
         idents = for {:ident, name} <- tokens, into: MapSet.new(), do: name
         {:ok, %{sql: sql, lowers: lowers, idents: idents}}
 
-      {:parse_error, rest} ->
+      {:syntax_error, _kind, rest} ->
         {:error, "unsupported InfluxQL WHERE: #{rest}"}
 
       {:error, _message} = error ->
@@ -551,35 +625,65 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   end
 
   # What the engine's parser cannot read in the `WHERE` fails the statement
-  # where it stands (verified), naming the position and the rest of the
-  # statement, `;` and later clauses included. `NOT` is no InfluxQL keyword
-  # (the position is the operand after it); a number is `\d*\.\d+` or `\d+`
-  # only, so an exponent, a trailing dot, a hex or an underscore leaves the
-  # rest of the literal behind (the position is where that begins).
-  @spec check_where(binary(), binary(), binary(), binary() | nil) ::
+  # where it stands (verified), naming the position (from the
+  # start of the statement) and, for a statement it cannot continue, the
+  # rest of the statement, `;` and later clauses included:
+  #
+  #   * `NOT` is no InfluxQL keyword (the position is the operand after it);
+  #     a number is `\d*\.\d+` or `\d+` only, so an exponent, a trailing dot,
+  #     a hex or an underscore leaves the rest of the literal behind (the
+  #     position is where that begins)
+  #   * a comparison or `AND` / `OR` with no operand after it, or one that
+  #     cannot start an operand (a lone dot, `)`, a connective), is an
+  #     invalid conditional expression at the end of the operator
+  #   * an integer beyond the unsigned 64-bit range, or a negative one
+  #     beyond the signed range, is an overflow at the end of its digits; a
+  #     duration whose count only fits the unsigned range leaves its unit
+  #     behind
+  @spec check_where(binary(), binary(), binary(), binary(), binary() | nil) ::
           :ok | {:error, {:engine, binary()}}
-  defp check_where(_statement, _rest, _masked_rest, nil), do: :ok
+  defp check_where(_whole, _head, _rest, _masked_rest, nil), do: :ok
 
-  defp check_where(statement, rest, masked_rest, where) do
+  defp check_where(whole, head, rest, masked_rest, where) do
     case tokenize(where, []) do
-      {:parse_error, after_error} ->
+      {:syntax_error, kind, after_error} ->
         [{from, length}] = Regex.run(~r/\bWHERE\s+/i, masked_rest, return: :index)
-        where_at = byte_size(statement) - byte_size(rest) + from + length
+        where_at = byte_size(head) - byte_size(rest) + from + length
         pos = where_at + byte_size(where) - byte_size(after_error)
-        leftover = binary_part(statement, pos, byte_size(statement) - pos)
-
-        {:error,
-         {:engine,
-          "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos " <>
-            "#{pos}. Parsing Error: Nom(#{inspect(leftover)}, Tag)"}}
+        {:error, {:engine, syntax_error_body(kind, pos, whole)}}
 
       _tokens_or_refusal ->
         :ok
     end
   end
 
+  @engine_error_prefix "error in InfluxQL statement: parsing error: "
+
+  @spec syntax_error_body(atom(), non_neg_integer(), binary()) :: binary()
+  defp syntax_error_body(:nom, pos, whole) do
+    leftover = binary_part(whole, pos, byte_size(whole) - pos)
+
+    @engine_error_prefix <>
+      "invalid InfluxQL statement at pos #{pos}. Parsing Error: Nom(#{inspect(leftover)}, Tag)"
+  end
+
+  defp syntax_error_body(:operand, pos, _whole),
+    do: @engine_error_prefix <> "invalid conditional expression at pos #{pos}"
+
+  defp syntax_error_body(:regex, pos, _whole),
+    do: @engine_error_prefix <> "invalid conditional, expected regular expression at pos #{pos}"
+
+  defp syntax_error_body(:overflow, pos, _whole),
+    do: @engine_error_prefix <> "unable to parse integer due to overflow at pos #{pos}"
+
+  defp syntax_error_body(:signed_overflow, pos, _whole),
+    do: @engine_error_prefix <> "constant overflows signed integer at pos #{pos}"
+
+  @max_unsigned 18_446_744_073_709_551_615
+  @max_signed 9_223_372_036_854_775_807
+
   @spec tokenize(binary(), list()) ::
-          {:ok, list()} | {:parse_error, binary()} | {:error, binary()}
+          {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
   defp tokenize(<<>>, acc), do: {:ok, Enum.reverse(acc)}
   defp tokenize(<<c, rest::binary>>, acc) when c in [?\s, ?\t, ?\n, ?\r], do: tokenize(rest, acc)
 
@@ -601,10 +705,10 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
 
   defp tokenize(<<op::binary-size(2), rest::binary>>, acc)
        when op in ["=~", "!~", "!=", "<>", "<=", ">="],
-       do: tokenize(rest, [{:op, op} | acc])
+       do: operand(rest, {:op, op}, acc)
 
   defp tokenize(<<c, rest::binary>>, acc) when c in [?=, ?<, ?>],
-    do: tokenize(rest, [{:op, <<c>>} | acc])
+    do: operand(rest, {:op, <<c>>}, acc)
 
   defp tokenize(<<c, rest::binary>>, acc) when c in [?(, ?), ?+, ?-, ?*, ?/, ?,],
     do: tokenize(rest, [{:raw, <<c>>} | acc])
@@ -615,39 +719,119 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
            text
          ) do
       [full, n, unit] ->
-        duration = {:duration, String.to_integer(n) * Map.fetch!(@duration_ns, unit), full}
-        tokenize(rest_after(text, full), [duration | acc])
+        count = String.to_integer(n)
+
+        cond do
+          count > @max_unsigned -> {:syntax_error, :overflow, rest_after(text, n)}
+          count > @max_signed -> {:syntax_error, :nom, rest_after(text, n)}
+          true -> duration_token(count, unit, full, text, acc)
+        end
 
       [full, "", "", number] ->
-        case rest_after(text, full) do
-          <<c, _more::binary>> = rest
-          when c in ?0..?9 or c in ?a..?z or c in ?A..?Z or c in [?_, ?.] ->
-            {:parse_error, rest}
-
-          rest ->
-            tokenize(rest, [{:number, number} | acc])
-        end
+        number_token(number, rest_after(text, full), acc)
 
       [full, "", "", "", _now] ->
         tokenize(rest_after(text, full), [{:raw, "now()"} | acc])
 
       [full, "", "", "", "", word] ->
-        if String.upcase(word) == "NOT",
-          do: {:parse_error, String.trim_leading(rest_after(text, full))},
-          else: tokenize(rest_after(text, full), [word_token(word) | acc])
+        word_token(String.upcase(word), word, rest_after(text, full), acc)
 
       nil ->
         {:error, "unsupported InfluxQL WHERE: #{text}"}
     end
   end
 
+  @spec duration_token(non_neg_integer(), binary(), binary(), binary(), list()) ::
+          {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
+  defp duration_token(count, unit, full, text, acc) do
+    duration = {:duration, count * Map.fetch!(@duration_ns, unit), full}
+    tokenize(rest_after(text, full), [duration | acc])
+  end
+
+  # A number that a letter, digit, underscore or dot follows is cut short
+  # there, which the engine cannot continue from.
+  @spec number_token(binary(), binary(), list()) ::
+          {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
+  defp number_token(number, rest, acc) do
+    case rest do
+      <<c, _more::binary>> when c in ?0..?9 or c in ?a..?z or c in ?A..?Z or c in [?_, ?.] ->
+        {:syntax_error, :nom, rest}
+
+      _ended ->
+        case integer_overflow(number, acc) do
+          nil -> tokenize(rest, [{:number, number} | acc])
+          kind -> {:syntax_error, kind, rest}
+        end
+    end
+  end
+
+  # An integer literal fits the unsigned 64-bit range, a negated one the
+  # signed range; a number with a fraction has no range.
+  @spec integer_overflow(binary(), list()) :: :overflow | :signed_overflow | nil
+  defp integer_overflow(number, acc) do
+    case Integer.parse(number) do
+      {n, ""} when n > @max_unsigned -> :overflow
+      {n, ""} when n > @max_signed + 1 -> if negated?(acc), do: :signed_overflow
+      _fits_or_fraction -> nil
+    end
+  end
+
+  # A minus is a sign, not a subtraction, at the start, after a comparison,
+  # an opening parenthesis, a connective or another operator.
+  @spec negated?(list()) :: boolean()
+  defp negated?([{:raw, "-"} | before]) do
+    case before do
+      [] -> true
+      [{:op, _op} | _more] -> true
+      [{:raw, word} | _more] -> String.upcase(word) in ["(", "AND", "OR", "+", "-", "*", "/"]
+      _operand -> false
+    end
+  end
+
+  defp negated?(_acc), do: false
+
+  # `NOT` is no keyword; `AND` or `OR` with nothing after it has no operand.
+  @spec word_token(binary(), binary(), binary(), list()) ::
+          {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
+  defp word_token("NOT", _word, rest, _acc),
+    do: {:syntax_error, :nom, String.trim_leading(rest)}
+
+  defp word_token(upcased, word, rest, acc) when upcased in ["AND", "OR"] do
+    if String.trim(rest) == "",
+      do: {:syntax_error, :operand, rest},
+      else: tokenize(rest, [{:raw, word} | acc])
+  end
+
+  defp word_token(upcased, word, rest, acc),
+    do: tokenize(rest, [plain_word(upcased, word) | acc])
+
+  # A comparison operator needs an operand after it; the engine reports the
+  # end of the operator.
+  @spec operand(binary(), {:op, binary()}, list()) ::
+          {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
+  defp operand(rest, {:op, op} = token, acc) do
+    trimmed = String.trim_leading(rest)
+
+    cond do
+      trimmed == "" and op in ["=~", "!~"] -> {:syntax_error, :regex, rest}
+      trimmed == "" -> {:syntax_error, :operand, rest}
+      cannot_start_operand?(trimmed) -> {:syntax_error, :operand, rest}
+      true -> tokenize(rest, [token | acc])
+    end
+  end
+
+  # A closing parenthesis, a connective or a dot with no digit after it.
+  @spec cannot_start_operand?(binary()) :: boolean()
+  defp cannot_start_operand?(text),
+    do: Regex.match?(~r/^(?:\)|[-+]?\.(?!\d)|(?:AND|OR)\b)/i, text)
+
   @spec rest_after(binary(), binary()) :: binary()
   defp rest_after(text, prefix),
     do: binary_part(text, byte_size(prefix), byte_size(text) - byte_size(prefix))
 
-  @spec word_token(binary()) :: tuple()
-  defp word_token(word) do
-    if String.upcase(word) in ~w(AND OR TRUE FALSE), do: {:raw, word}, else: {:ident, word}
+  @spec plain_word(binary(), binary()) :: tuple()
+  defp plain_word(upcased, word) do
+    if upcased in ~w(TRUE FALSE), do: {:raw, word}, else: {:ident, word}
   end
 
   @spec take_until(binary(), char(), iodata()) :: {binary(), binary()}

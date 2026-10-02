@@ -6,7 +6,6 @@ defmodule InfluxElixir.Admin.BucketsTest do
 
   setup do
     {:ok, conn} = Local.start(profile: :v2)
-    on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn}
   end
 

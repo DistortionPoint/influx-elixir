@@ -258,9 +258,7 @@ defmodule InfluxElixir.Client.HTTP do
           {:ok, binary()} | {:error, QueryParams.error()}
   defp sql_request_body(database, sql, opts, format) do
     with {:ok, params} <- query_params(opts) do
-      body = %{"db" => database, "q" => sql, "params" => params}
-      body = if format == nil, do: body, else: Map.put(body, "format", to_string(format))
-      {:ok, Jason.encode!(body)}
+      {:ok, QueryParams.request_body(database, sql, params, format)}
     end
   end
 

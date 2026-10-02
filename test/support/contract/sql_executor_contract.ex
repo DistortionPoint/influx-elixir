@@ -28,6 +28,10 @@ defmodule InfluxElixir.Contract.SQLExecutor do
       unquote(division_tests(client))
       unquote(wording_tests())
       unquote(join_tests(profile))
+      unquote(bounds_helpers())
+      unquote(bounds_error_tests())
+      unquote(bounds_answer_tests())
+      unquote(bounds_order_tests(client))
     end
   end
 
@@ -84,12 +88,12 @@ defmodule InfluxElixir.Contract.SQLExecutor do
         test "a null in an IN list makes a miss unknown", ctx do
           m = sxc_mixed(ctx)
 
-          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v NOT IN (1, NULL)") == []
-          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v NOT IN (NULL)") == []
-          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v IN (NULL)") == []
-          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v IN (1, NULL)") == [%{"v" => 1}]
-          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE s IN ('a', NULL)") == [%{"v" => 2}]
-          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE s NOT IN ('zz', NULL)") == []
+          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v NOT IN (1, NULL)") === []
+          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v NOT IN (NULL)") === []
+          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v IN (NULL)") === []
+          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v IN (1, NULL)") === [%{"v" => 1}]
+          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE s IN ('a', NULL)") === [%{"v" => 2}]
+          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE s NOT IN ('zz', NULL)") === []
 
           assert {:ok, []} =
                    sxc_query(ctx, "SELECT v FROM #{m} WHERE v NOT IN (1, $x)",
@@ -101,27 +105,27 @@ defmodule InfluxElixir.Contract.SQLExecutor do
           m = sxc_mixed(ctx)
           tail = " You might need to add explicit type casts.\n\tCandidate functions:\n\t"
 
-          assert sxc_error(ctx, "SELECT sum(s) AS x FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT sum(s) AS x FROM #{m}") ===
                    {400,
                     "Error during planning: Execution error: Function 'sum' user-defined " <>
                       "coercion failed with \"Execution error: Sum not supported for Utf8\" " <>
                       "No function matches the given name and argument types 'sum(Utf8)'." <>
                       tail <> "sum(UserDefined)"}
 
-          assert sxc_error(ctx, "SELECT avg(b) AS x FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT avg(b) AS x FROM #{m}") ===
                    {400,
                     "Error during planning: Execution error: Function 'avg' user-defined " <>
                       "coercion failed with \"Error during planning: Avg does not support " <>
                       "inputs of type Boolean.\" No function matches the given name and " <>
                       "argument types 'avg(Boolean)'." <> tail <> "avg(UserDefined)"}
 
-          assert sxc_error(ctx, "SELECT median(s) AS x FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT median(s) AS x FROM #{m}") ===
                    {400,
                     "Error during planning: Function 'median' expects NativeType::Numeric " <>
                       "but received NativeType::String No function matches the given name " <>
                       "and argument types 'median(Utf8)'." <> tail <> "median(Numeric(1))"}
 
-          assert sxc_error(ctx, "SELECT stddev(k) AS x FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT stddev(k) AS x FROM #{m}") ===
                    {400,
                     "Error during planning: Function 'stddev' expects NativeType::Numeric " <>
                       "but received NativeType::String No function matches the given name " <>
@@ -133,7 +137,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                 {"var_pop", "var_pop", "b", "Boolean", "Boolean"},
                 {"stddev_pop", "stddev_pop", "s", "String", "Utf8"}
               ] do
-            assert sxc_error(ctx, "SELECT #{call}(#{column}) AS x FROM #{m}") ==
+            assert sxc_error(ctx, "SELECT #{call}(#{column}) AS x FROM #{m}") ===
                      {400,
                       "Error during planning: Function '#{name}' expects NativeType::Numeric " <>
                         "but received NativeType::#{native} No function matches the given " <>
@@ -142,7 +146,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                    call
           end
 
-          assert sxc_error(ctx, "SELECT sum(k) AS x FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT sum(k) AS x FROM #{m}") ===
                    {400,
                     "Error during planning: Execution error: Function 'sum' user-defined " <>
                       "coercion failed with \"Execution error: Sum not supported for Utf8\" " <>
@@ -157,19 +161,25 @@ defmodule InfluxElixir.Contract.SQLExecutor do
         test "min, max and count take any type", ctx do
           m = sxc_mixed(ctx)
 
-          assert sxc_rows(ctx, "SELECT min(b) AS lo, max(b) AS hi, count(b) AS n FROM #{m}") ==
+          assert sxc_rows(ctx, "SELECT min(b) AS lo, max(b) AS hi, count(b) AS n FROM #{m}") ===
                    [%{"lo" => false, "hi" => true, "n" => 3}]
 
-          assert sxc_rows(ctx, "SELECT min(s) AS lo, max(s) AS hi, count(s) AS n FROM #{m}") ==
+          assert sxc_rows(ctx, "SELECT min(s) AS lo, max(s) AS hi, count(s) AS n FROM #{m}") ===
                    [%{"lo" => "a", "hi" => "b", "n" => 2}]
 
-          assert sxc_rows(ctx, "SELECT min(k) AS lo, max(k) AS hi FROM #{m}") ==
+          assert sxc_rows(ctx, "SELECT min(k) AS lo, max(k) AS hi FROM #{m}") ===
                    [%{"lo" => "a", "hi" => "c"}]
+        end
 
-          assert sxc_rows(ctx, "SELECT sum(v) AS s, avg(f) AS a, median(v) AS m FROM #{m}") ==
+        test "sum, avg and median take numbers and answer in the number's type", ctx do
+          m = sxc_mixed(ctx)
+
+          assert sxc_rows(ctx, "SELECT sum(v) AS s, avg(f) AS a, median(v) AS m FROM #{m}") ===
                    [%{"s" => 6, "a" => 168.0, "m" => 2}]
         end
 
+        @tag local_divergence:
+               "the engine closes the connection mid-response; Local returns the transport error"
         test "DATE_BIN: an interval of zero closes the connection, a time before 1970 floors",
              ctx do
           m = sxc_mixed(ctx)
@@ -180,19 +190,19 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                    ctx,
                    "SELECT DATE_BIN(INTERVAL '0 seconds', time) AS t, count(*) AS n " <>
                      "FROM #{m} GROUP BY 1"
-                 ) == @sxc_closed
+                 ) === @sxc_closed
 
           assert sxc_rows(
                    ctx,
                    "SELECT DATE_BIN(INTERVAL '10 seconds', time) AS t, count(*) AS n " <>
                      "FROM #{neg} GROUP BY 1"
-                 ) == [%{"t" => ~U[1969-12-31 23:59:50.000000Z], "n" => 2}]
+                 ) === [%{"t" => ~U[1969-12-31 23:59:50.000000Z], "n" => 2}]
 
           assert sxc_rows(
                    ctx,
                    "SELECT DATE_BIN(INTERVAL '0 seconds', time) AS t, count(*) AS n " <>
                      "FROM #{m} WHERE v > 100 GROUP BY 1"
-                 ) == []
+                 ) === []
         end
       end
     end
@@ -206,7 +216,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
 
           assert ctx
                  |> sxc_rows("SELECT time, count(*) AS n FROM #{m} GROUP BY time")
-                 |> Enum.sort_by(& &1["time"], DateTime) == [
+                 |> Enum.sort_by(& &1["time"], DateTime) === [
                    %{"time" => ~U[1970-01-01 00:00:01.000000Z], "n" => 1},
                    %{"time" => ~U[1970-01-01 00:00:02.000000Z], "n" => 1},
                    %{"time" => ~U[1970-01-01 00:00:03.000000Z], "n" => 1}
@@ -218,7 +228,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
 
           assert ctx
                  |> sxc_rows("SELECT b, count(*) AS n FROM #{m} GROUP BY b")
-                 |> Enum.sort_by(& &1["b"]) == [
+                 |> Enum.sort_by(& &1["b"]) === [
                    %{"b" => false, "n" => 1},
                    %{"b" => true, "n" => 2}
                  ]
@@ -231,63 +241,63 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                    ctx,
                    "SELECT first_value(b ORDER BY time) AS a, last_value(b ORDER BY time) AS z " <>
                      "FROM #{m}"
-                 ) == [%{"a" => false, "z" => true}]
+                 ) === [%{"a" => false, "z" => true}]
 
           assert sxc_rows(
                    ctx,
                    "SELECT first_value(v ORDER BY s) AS a, first_value(v ORDER BY s DESC) AS b, " <>
                      "last_value(v ORDER BY s) AS c, last_value(v ORDER BY s DESC) AS d " <>
                      "FROM #{m}"
-                 ) == [%{"a" => 2, "b" => 3, "c" => 3, "d" => 2}]
+                 ) === [%{"a" => 2, "b" => 3, "c" => 3, "d" => 2}]
         end
 
         test "arithmetic over text is a planning error naming the types", ctx do
           m = sxc_mixed(ctx)
 
-          assert sxc_error(ctx, "SELECT s + 1 AS x FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT s + 1 AS x FROM #{m}") ===
                    {400,
                     "Error during planning: Cannot coerce arithmetic expression " <>
                       "Utf8 + Int64 to valid types"}
 
-          assert sxc_error(ctx, "SELECT k + 1 AS x FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT k + 1 AS x FROM #{m}") ===
                    {400,
                     "Error during planning: Cannot coerce arithmetic expression " <>
                       "Dictionary(Int32, Utf8) + Int64 to valid types"}
 
-          assert sxc_error(ctx, "SELECT v FROM #{m} WHERE s + 1 > 3") ==
+          assert sxc_error(ctx, "SELECT v FROM #{m} WHERE s + 1 > 3") ===
                    {400,
                     "type_coercion\ncaused by\nError during planning: Cannot coerce " <>
                       "arithmetic expression Utf8 + Int64 to valid types"}
 
-          assert sxc_error(ctx, "SELECT sum(s + 1) AS x FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT sum(s + 1) AS x FROM #{m}") ===
                    {400,
                     "Error during planning: Cannot coerce arithmetic expression " <>
                       "Utf8 + Int64 to valid types"}
 
-          assert sxc_error(ctx, "SELECT 1 + s AS x FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT 1 + s AS x FROM #{m}") ===
                    {400,
                     "Error during planning: Cannot coerce arithmetic expression " <>
                       "Int64 + Utf8 to valid types"}
 
-          assert sxc_error(ctx, "SELECT b * 2 AS x FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT b * 2 AS x FROM #{m}") ===
                    {400,
                     "Error during planning: Cannot coerce arithmetic expression " <>
                       "Boolean * Int64 to valid types"}
 
           # No row is needed to fail, and ORDER BY carries the wrapper like WHERE.
-          assert sxc_error(ctx, "SELECT k + 1 AS x FROM #{m} WHERE v > 100") ==
+          assert sxc_error(ctx, "SELECT k + 1 AS x FROM #{m} WHERE v > 100") ===
                    {400,
                     "Error during planning: Cannot coerce arithmetic expression " <>
                       "Dictionary(Int32, Utf8) + Int64 to valid types"}
 
-          assert sxc_error(ctx, "SELECT v FROM #{m} ORDER BY s + 1") ==
+          assert sxc_error(ctx, "SELECT v FROM #{m} ORDER BY s + 1") ===
                    {400,
                     "type_coercion\ncaused by\nError during planning: Cannot coerce " <>
                       "arithmetic expression Utf8 + Int64 to valid types"}
 
           assert ctx
                  |> sxc_rows("SELECT v + f AS x FROM #{m} ORDER BY time")
-                 |> Enum.map(& &1["x"]) == [2.5, 4.5, 503.0]
+                 |> Enum.map(& &1["x"]) === [2.5, 4.5, 503.0]
         end
 
         test "a boolean casts to text and to numbers", ctx do
@@ -297,7 +307,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                    ctx,
                    "SELECT CAST(b AS VARCHAR) AS t, CAST(b AS INTEGER) AS i, " <>
                      "CAST(b AS DOUBLE) AS d FROM #{m} ORDER BY time"
-                 ) == [
+                 ) === [
                    %{"t" => "false", "i" => 0, "d" => 0.0},
                    %{"t" => "true", "i" => 1, "d" => 1.0},
                    %{"t" => "true", "i" => 1, "d" => 1.0}
@@ -310,39 +320,37 @@ defmodule InfluxElixir.Contract.SQLExecutor do
 
           assert ctx
                  |> sxc_rows("WITH c AS (SELECT s AS time FROM #{m}) SELECT * FROM c")
-                 |> Enum.sort_by(&Map.get(&1, "time", "~")) ==
+                 |> Enum.sort_by(&Map.get(&1, "time", "~")) ===
                    [%{"time" => "a"}, %{"time" => "b"}, %{}]
 
           assert sxc_rows(
                    ctx,
                    "WITH c AS (SELECT s AS time FROM #{m}) SELECT time FROM c ORDER BY time"
-                 ) == [%{"time" => "a"}, %{"time" => "b"}, %{}]
+                 ) === [%{"time" => "a"}, %{"time" => "b"}, %{}]
 
           assert sxc_rows(
                    ctx,
                    "WITH c AS (SELECT time, v FROM #{m}) SELECT max(time) AS t FROM c"
-                 ) == [%{"t" => ~U[1970-01-01 00:00:03.000000Z]}]
+                 ) === [%{"t" => ~U[1970-01-01 00:00:03.000000Z]}]
 
-          assert sxc_rows(ctx, "WITH c AS (SELECT * FROM #{m} WHERE k = 'c') SELECT s FROM c") ==
+          assert sxc_rows(ctx, "WITH c AS (SELECT * FROM #{m} WHERE k = 'c') SELECT s FROM c") ===
                    [%{}]
 
-          # The engine lists the CTE's columns, qualified; the double its own.
-          assert {500, "Schema error: No field named zz. Valid fields are " <> _fields} =
-                   sxc_error(
-                     ctx,
-                     "WITH c AS (SELECT k, s FROM #{m} WHERE k = 'c') SELECT zz FROM c"
-                   )
+          assert sxc_error(
+                   ctx,
+                   "WITH c AS (SELECT k, s FROM #{m} WHERE k = 'c') SELECT zz FROM c"
+                 ) === {500, "Schema error: No field named zz. Valid fields are c.k, c.s."}
 
           assert sxc_rows(
                    ctx,
                    "WITH c AS (SELECT k, s FROM #{m} WHERE k = 'c') SELECT s FROM c"
-                 ) == [%{}]
+                 ) === [%{}]
 
           assert sxc_rows(
                    ctx,
                    "WITH c AS (SELECT k, s FROM #{m} WHERE k = 'c') " <>
                      "SELECT count(s) AS n, count(*) AS m FROM c"
-                 ) == [%{"n" => 0, "m" => 1}]
+                 ) === [%{"n" => 0, "m" => 1}]
         end
       end
     end
@@ -367,7 +375,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
             "SELECT y + #{@int64_max} AS a, y - #{@int64_max} AS b, y * #{@int64_max} AS c, " <>
               "-y AS d, y * 2 AS e, y - 1 AS f, y * -1 AS g FROM #{m} ORDER BY time"
 
-          assert sxc_rows(ctx, select) == [
+          assert sxc_rows(ctx, select) === [
                    %{
                      "a" => @int64_min,
                      "b" => -@int64_max + 1,
@@ -405,20 +413,22 @@ defmodule InfluxElixir.Contract.SQLExecutor do
           assert sxc_rows(
                    ctx,
                    "SELECT #{@int64_max} * 2 AS a, -#{@int64_max} - 2 AS b FROM #{m} LIMIT 1"
-                 ) == [%{"a" => -2, "b" => @int64_max}]
+                 ) === [%{"a" => -2, "b" => @int64_max}]
 
-          assert sxc_rows(ctx, "SELECT y FROM #{m} WHERE y + #{@int64_max} < 0 ORDER BY time") ==
+          assert sxc_rows(ctx, "SELECT y FROM #{m} WHERE y + #{@int64_max} < 0 ORDER BY time") ===
                    [%{"y" => 1}]
         end
 
+        @tag local_divergence:
+               "the engine closes the connection mid-response; Local returns the transport error"
         test "the minimum divided by -1 closes the connection; its remainder is 0", ctx do
           m = sxc_name("sxc_wrap_div")
           sxc_write(ctx, ["#{m} y=#{@int64_min}i 1000000000"])
 
-          assert sxc_query(ctx, "SELECT y / -1 AS a FROM #{m}") == @sxc_closed
-          assert sxc_rows(ctx, "SELECT y % -1 AS a FROM #{m}") == [%{"a" => 0}]
+          assert sxc_query(ctx, "SELECT y / -1 AS a FROM #{m}") === @sxc_closed
+          assert sxc_rows(ctx, "SELECT y % -1 AS a FROM #{m}") === [%{"a" => 0}]
 
-          assert sxc_rows(ctx, "SELECT y / 1 AS a, y / 2 AS b FROM #{m}") ==
+          assert sxc_rows(ctx, "SELECT y / 1 AS a, y / 2 AS b FROM #{m}") ===
                    [%{"a" => @int64_min, "b" => -4_611_686_018_427_387_904}]
         end
       end
@@ -428,24 +438,27 @@ defmodule InfluxElixir.Contract.SQLExecutor do
   defp division_tests(client) do
     quote location: :keep do
       describe "SQL executor — contract: division by zero" do
+        @tag local_divergence:
+               "the engine closes the connection mid-response; Local returns the transport error"
         test "dividing an integer by the integer zero closes the connection", ctx do
           m = sxc_mixed(ctx)
 
-          assert sxc_query(ctx, "SELECT v / 0 AS x FROM #{m}") == @sxc_closed
-          assert sxc_query(ctx, "SELECT v % 0 AS x FROM #{m}") == @sxc_closed
-          assert sxc_query(ctx, "SELECT sum(v / 0) AS x FROM #{m}") == @sxc_closed
-          assert sxc_query(ctx, "SELECT v FROM #{m} WHERE v / 0 > 1") == @sxc_closed
+          assert sxc_query(ctx, "SELECT v / 0 AS x FROM #{m}") === @sxc_closed
+          assert sxc_query(ctx, "SELECT v % 0 AS x FROM #{m}") === @sxc_closed
+          assert sxc_query(ctx, "SELECT sum(v / 0) AS x FROM #{m}") === @sxc_closed
+          assert sxc_query(ctx, "SELECT v FROM #{m} WHERE v / 0 > 1") === @sxc_closed
           assert {:ok, []} = sxc_query(ctx, "SELECT v / 0 AS x FROM #{m} WHERE v > 100")
         end
 
         # The engine's infinity and NaN show as null in a response but
         # compare as numbers; the double, which cannot hold them, refuses.
-        @tag :local_divergence
+        @tag local_divergence:
+               "the engine's infinity and NaN compare as numbers; Local, which cannot hold them, refuses by name"
         test "a float divided by zero is infinity on the engine; the double refuses it", ctx do
           m = sxc_name("sxc_fz")
           sxc_write(ctx, ["#{m} v=1i 1000000000", "#{m} v=2i 2000000000"])
 
-          if unquote(client) == InfluxElixir.Client.Local do
+          if unquote(client) === InfluxElixir.Client.Local do
             refusal =
               {:error,
                %{
@@ -462,14 +475,14 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                   "SELECT 1.5 % 0 AS y FROM #{m}",
                   "SELECT v FROM #{m} WHERE v / 0.0 > 1"
                 ] do
-              assert sxc_query(ctx, sql) == refusal, sql
+              assert sxc_query(ctx, sql) === refusal, sql
             end
           else
             # Present as JSON null, unlike a null column, which is absent.
-            assert sxc_rows(ctx, "SELECT v / 0.0 AS x, 1.5 / 0 AS y FROM #{m}") ==
+            assert sxc_rows(ctx, "SELECT v / 0.0 AS x, 1.5 / 0 AS y FROM #{m}") ===
                      [%{"x" => nil, "y" => nil}, %{"x" => nil, "y" => nil}]
 
-            assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v / 0.0 > 1 ORDER BY v") ==
+            assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v / 0.0 > 1 ORDER BY v") ===
                      [%{"v" => 1}, %{"v" => 2}]
           end
         end
@@ -497,6 +510,8 @@ defmodule InfluxElixir.Contract.SQLExecutor do
 
           for {where, expected} <- [
                 {"amount = '5000.0'", ["a"]},
+                {"amount = '500.0'", ["b"]},
+                {"amount = '500'", []},
                 {"amount >= '1000.00'", ["a", "b", "c", "d", "g", "i"]},
                 {"amount > '2e3'", ["a", "b"]},
                 {"amount = '1e16'", ["d"]},
@@ -509,12 +524,12 @@ defmodule InfluxElixir.Contract.SQLExecutor do
               ] do
             assert ctx
                    |> sxc_rows("SELECT k FROM #{m} WHERE #{where} ORDER BY time")
-                   |> Enum.map(& &1["k"]) == expected,
+                   |> Enum.map(& &1["k"]) === expected,
                    where
           end
 
           assert sxc_rows(ctx, "SELECT CAST(amount AS VARCHAR) AS x FROM #{m} ORDER BY time")
-                 |> Enum.map(& &1["x"]) == [
+                 |> Enum.map(& &1["x"]) === [
                    "5000.0",
                    "500.0",
                    "12000.0",
@@ -531,16 +546,16 @@ defmodule InfluxElixir.Contract.SQLExecutor do
           m = sxc_mixed(ctx)
           prefix = "type_coercion\ncaused by\nError during planning: There isn't a common type to"
 
-          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE f LIKE '1%'") ==
+          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE f LIKE '1%'") ===
                    {400, prefix <> " coerce Float64 and Utf8 in LIKE expression"}
 
-          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE v LIKE '1%'") ==
+          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE v LIKE '1%'") ===
                    {400, prefix <> " coerce Int64 and Utf8 in LIKE expression"}
 
-          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE f LIKE '1%' AND k = 'zz'") ==
+          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE f LIKE '1%' AND k = 'zz'") ===
                    {400, prefix <> " coerce Float64 and Utf8 in LIKE expression"}
 
-          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE b NOT LIKE 't%'") ==
+          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE b NOT LIKE 't%'") ===
                    {400, prefix <> " coerce Boolean and Utf8 in LIKE expression"}
         end
       end
@@ -559,18 +574,18 @@ defmodule InfluxElixir.Contract.SQLExecutor do
             "#{right},symbol=AAA price=1.0 1000000000"
           ])
 
-          assert sxc_error(ctx, "SELECT price, symbol FROM #{left} CROSS JOIN #{right}") ==
+          assert sxc_error(ctx, "SELECT price, symbol FROM #{left} CROSS JOIN #{right}") ===
                    {500, "Schema error: Ambiguous reference to unqualified field price"}
 
           assert sxc_error(
                    ctx,
                    "SELECT qty, time FROM #{left} CROSS JOIN #{right} WHERE price > 1"
-                 ) == {500, "Schema error: Ambiguous reference to unqualified field price"}
+                 ) === {500, "Schema error: Ambiguous reference to unqualified field price"}
 
           assert sxc_error(
                    ctx,
                    "SELECT qty FROM #{left} CROSS JOIN #{right} WHERE symbol = 'a'"
-                 ) == {500, "Schema error: Ambiguous reference to unqualified field symbol"}
+                 ) === {500, "Schema error: Ambiguous reference to unqualified field symbol"}
         end
 
         test "columns that are not shared join", ctx do
@@ -586,7 +601,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
           assert sxc_rows(
                    ctx,
                    "SELECT qty, only2 FROM #{left} CROSS JOIN #{right} ORDER BY qty"
-                 ) == [%{"qty" => 3, "only2" => 5}, %{"qty" => 4, "only2" => 5}]
+                 ) === [%{"qty" => 3, "only2" => 5}, %{"qty" => 4, "only2" => 5}]
         end
 
         test "an ungrouped column names itself and what satisfies the requirement", ctx do
@@ -600,24 +615,24 @@ defmodule InfluxElixir.Contract.SQLExecutor do
               "only \"#{satisfying}\" appears in the SELECT clause satisfies this requirement"
           end
 
-          assert sxc_error(ctx, "SELECT symbol, price, count(*) AS n FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT symbol, price, count(*) AS n FROM #{m}") ===
                    {400, ungrouped.("symbol", "count(Int64(1))")}
 
           assert sxc_error(
                    ctx,
                    "SELECT symbol, price, qty, count(*) AS n FROM #{m} GROUP BY symbol"
-                 ) == {400, ungrouped.("price", "#{m}.symbol, count(Int64(1))")}
+                 ) === {400, ungrouped.("price", "#{m}.symbol, count(Int64(1))")}
 
           assert sxc_error(
                    ctx,
                    "SELECT exch, price, count(*) AS n FROM #{m} GROUP BY symbol, exch"
-                 ) == {400, ungrouped.("price", "#{m}.symbol, #{m}.exch, count(Int64(1))")}
+                 ) === {400, ungrouped.("price", "#{m}.symbol, #{m}.exch, count(Int64(1))")}
 
           assert sxc_error(
                    ctx,
                    "SELECT exch, count(*) AS a, sum(price) AS b, avg(qty) AS c, " <>
                      "min(price) AS d FROM #{m} GROUP BY symbol"
-                 ) ==
+                 ) ===
                    {400,
                     ungrouped.(
                       "exch",
@@ -630,7 +645,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                    ctx,
                    "SELECT exch, sum(price * 2.5) AS a, count(DISTINCT qty) AS b, " <>
                      "sum(abs(price) - 1) AS c FROM #{m} GROUP BY symbol"
-                 ) ==
+                 ) ===
                    {400,
                     ungrouped.(
                       "exch",
@@ -643,7 +658,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                    ctx,
                    "SELECT price, DATE_BIN(INTERVAL '10 seconds', time) AS t, count(*) AS n " <>
                      "FROM #{m} GROUP BY 2"
-                 ) ==
+                 ) ===
                    {400,
                     ungrouped.(
                       "price",
@@ -652,15 +667,22 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                     )}
         end
 
-        if unquote(profile) == :v3_core do
+        if unquote(profile) === :v3_core do
           test "an unknown format ends with its position in the request body", ctx do
             assert {:error, %{status: 400, body: body}} =
                      sxc_query(ctx, "SELECT 1", format: :xml)
 
-            assert body ==
+            # The parser stops where the format's string ends in the body
+            # `Client.HTTP` sends.
+            request =
+              InfluxElixir.Client.QueryParams.request_body(ctx.database, "SELECT 1", %{}, :xml)
+
+            {at, length} = :binary.match(request, ~s("format":"xml"))
+
+            assert body ===
                      "serde json error: unknown variant `xml`, expected one of `parquet`, " <>
                        "`csv`, `pretty`, `json`, `json_lines`, `jsonl` at line 1 column " <>
-                       Integer.to_string(20 + byte_size(ctx.database) + byte_size("xml"))
+                       Integer.to_string(at + length)
           end
         end
       end
@@ -682,7 +704,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                 {"v BETWEEN NULL AND NULL", []},
                 {"v NOT BETWEEN NULL AND NULL", []}
               ] do
-            assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY time") ==
+            assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY time") ===
                      Enum.map(values, &%{"v" => &1}),
                    where
           end
@@ -724,7 +746,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                 {"SELECT v FROM #{m} WHERE abs(s) > 1 ORDER BY s + 1", sxc_coercion(abs)},
                 {"SELECT v FROM #{m} WHERE s + 1 > 1 ORDER BY abs(s)", sxc_coercion(op)}
               ] do
-            assert sxc_error(ctx, sql) == {400, error}, sql
+            assert sxc_error(ctx, sql) === {400, error}, sql
           end
         end
 
@@ -755,7 +777,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                 {"v LIKE 'a' AND v = true", cmp},
                 {"-s > 1 AND v LIKE 'a'", like}
               ] do
-            assert sxc_error(ctx, "SELECT v FROM #{m} WHERE #{where}") ==
+            assert sxc_error(ctx, "SELECT v FROM #{m} WHERE #{where}") ===
                      {400, "type_coercion\ncaused by\nError during planning: " <> message},
                    where
           end
@@ -776,10 +798,10 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                 {"SELECT v FROM #{m} WHERE -s > 1 ORDER BY s + 1",
                  "Cannot coerce arithmetic expression Utf8 + Int64 to valid types"}
               ] do
-            assert sxc_error(ctx, sql) == {400, prefix <> message}, sql
+            assert sxc_error(ctx, sql) === {400, prefix <> message}, sql
           end
 
-          assert sxc_error(ctx, "SELECT -s AS a FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT -s AS a FROM #{m}") ===
                    {400,
                     "Error during planning: Negation only supports numeric, interval and " <>
                       "timestamp types"}
@@ -794,14 +816,14 @@ defmodule InfluxElixir.Contract.SQLExecutor do
             ~s|#{m} v=3i,s="x" 3000000000|
           ])
 
-          assert sxc_error(ctx, "SELECT abs(s) AS x FROM #{m}") ==
+          assert sxc_error(ctx, "SELECT abs(s) AS x FROM #{m}") ===
                    {400,
                     "Error during planning: Function 'abs' expects NativeType::Numeric but " <>
                       "received NativeType::String No function matches the given name and " <>
                       "argument types 'abs(Utf8)'. You might need to add explicit type " <>
                       "casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}
 
-          assert sxc_rows(ctx, "SELECT abs(v) AS x FROM #{m} ORDER BY time LIMIT 1") ==
+          assert sxc_rows(ctx, "SELECT abs(v) AS x FROM #{m} ORDER BY time LIMIT 1") ===
                    [%{"x" => 1}]
         end
       end
@@ -842,7 +864,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                 {"v BETWEEN 1 AND true", 500, between},
                 {"v NOT BETWEEN false AND 1", 500, between}
               ] do
-            assert sxc_error(ctx, "SELECT v FROM #{m} WHERE #{where}") == {status, body}, where
+            assert sxc_error(ctx, "SELECT v FROM #{m} WHERE #{where}") === {status, body}, where
           end
         end
 
@@ -856,7 +878,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                 {"b BETWEEN true AND false", []},
                 {"v IN (1, NULL)", [1]}
               ] do
-            assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY time") ==
+            assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY time") ===
                      Enum.map(values, &%{"v" => &1}),
                    where
           end
@@ -874,7 +896,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                 {"b = $p", %{p: -1}, cmp <> "Boolean = Int64"},
                 {"b = $p", %{p: "true"}, cmp <> "Boolean = Utf8"}
               ] do
-            assert sxc_query(ctx, "SELECT v FROM #{m} WHERE #{where}", params: params) ==
+            assert sxc_query(ctx, "SELECT v FROM #{m} WHERE #{where}", params: params) ===
                      {:error,
                       %{
                         status: 400,
@@ -885,19 +907,20 @@ defmodule InfluxElixir.Contract.SQLExecutor do
 
           assert sxc_query(ctx, "SELECT v FROM #{m} WHERE b = $p ORDER BY time",
                    params: %{p: true}
-                 ) ==
+                 ) ===
                    {:ok, [%{"v" => 2}, %{"v" => 3}]}
 
-          assert sxc_query(ctx, "SELECT v FROM #{m} WHERE b = $p", params: %{p: nil}) == {:ok, []}
+          assert sxc_query(ctx, "SELECT v FROM #{m} WHERE b = $p", params: %{p: nil}) ===
+                   {:ok, []}
         end
 
-        @tag :local_divergence
+        @tag local_divergence: "Local refuses a boolean written first by name"
         test "a boolean written first is the engine's or refused by name", ctx do
           m = sxc_mixed(ctx)
           sql = "SELECT v FROM #{m} WHERE true = b ORDER BY time"
 
           expected =
-            if unquote(client) == InfluxElixir.Client.Local,
+            if unquote(client) === InfluxElixir.Client.Local,
               do:
                 {:error,
                  %{
@@ -908,7 +931,355 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                  }},
               else: {:ok, [%{"v" => 2}, %{"v" => 3}]}
 
-          assert sxc_query(ctx, sql) == expected
+          assert sxc_query(ctx, sql) === expected
+        end
+      end
+    end
+  end
+
+  defp bounds_helpers do
+    quote location: :keep do
+      # Two integer rows, then one row with a float, a string and a boolean.
+      defp sxc_bounds(ctx) do
+        m = sxc_name("sxc_bnd")
+
+        sxc_write(ctx, [
+          "#{m} v=1i 1000000000",
+          "#{m} v=2i 2000000000",
+          ~s|#{m} f=1.5,s="a",b=true 3000000000|
+        ])
+
+        m
+      end
+
+      defp sxc_interval(sides, kind \\ "comparable") do
+        "Internal error: Only intervals with the same data type are #{kind}, #{sides}.\n" <>
+          "This issue was likely caused by a bug in DataFusion's code. Please help us to " <>
+          "resolve this by filing a bug report in our issue tracker: " <>
+          "https://github.com/apache/datafusion/issues"
+      end
+    end
+  end
+
+  defp bounds_error_tests do
+    quote location: :keep do
+      describe "SQL executor — contract: the interval error of an empty numeric range" do
+        test "an empty interval on an integer column is the engine's internal error", ctx do
+          m = sxc_bounds(ctx)
+          failure = {500, sxc_interval("lhs:Null, rhs:Int64")}
+
+          for where <- [
+                "v > 1 AND v < 1",
+                "v >= 2 AND v <= 1",
+                "v > 1 AND v <= 1",
+                "v >= 1 AND v < 1",
+                "v > 1 AND v < 2",
+                "v > 5 AND v < 1",
+                "v BETWEEN 2 AND 1",
+                "v > 1 AND 1 > v",
+                "5 < v AND 1 > v",
+                "NOT (v <= 1) AND v < 1",
+                "(v > 1 AND v < 1)",
+                "v > 9223372036854775807 AND v < 5",
+                "v > -1 AND v < -5"
+              ] do
+            assert sxc_error(ctx, "SELECT * FROM #{m} WHERE #{where}") === failure, where
+          end
+
+          for sql <- [
+                "SELECT count(*) AS n FROM #{m} WHERE v > 1 AND v < 1",
+                "SELECT v FROM #{m} WHERE v > 1 AND v < 1 ORDER BY v LIMIT 1 OFFSET 1",
+                "SELECT DISTINCT v FROM #{m} WHERE v > 1 AND v < 1",
+                "SELECT v + 1 AS w FROM #{m} WHERE v > 1 AND v < 1"
+              ] do
+            assert sxc_error(ctx, sql) === failure, sql
+          end
+        end
+
+        # An unsigned field: the error names UInt64, `u < 0` is empty by
+        # itself, and a negative literal keeps the engine from failing.
+        test "an empty interval on an unsigned column names UInt64", ctx do
+          m = sxc_name("sxc_uint")
+          sxc_write(ctx, ["#{m} u=5u 1000000000"])
+
+          assert sxc_error(ctx, "SELECT u FROM #{m} WHERE u > 5 AND u < 1") ===
+                   {500, sxc_interval("lhs:Null, rhs:UInt64")}
+
+          assert sxc_error(ctx, "SELECT u FROM #{m} WHERE u < 0") ===
+                   {500, sxc_interval("lhs:UInt64, rhs:Null")}
+
+          assert sxc_rows(ctx, "SELECT u FROM #{m} WHERE u > -1 AND u < 1") === []
+        end
+
+        test "the first comparison written sets which side of the error is null", ctx do
+          m = sxc_bounds(ctx)
+          lower = {500, sxc_interval("lhs:Null, rhs:Int64")}
+          upper = {500, sxc_interval("lhs:Int64, rhs:Null")}
+          equal = {500, sxc_interval("lhs:Null, rhs:Int64", "intersectable")}
+
+          for {where, failure} <- [
+                {"v > 5 AND v < 1", lower},
+                {"v >= 5 AND v <= 1", lower},
+                {"v < 1 AND v > 5", upper},
+                {"v <= 1 AND v >= 5", upper},
+                {"1 > v AND v > 5", upper},
+                {"v > 5 AND 1 > v", lower},
+                {"v = 5 AND v < 1", equal},
+                {"v IN (5) AND v < 1", equal},
+                {"v = 1 AND v > 1", equal},
+                {"v < 1 AND v = 5", upper},
+                {"v > 7 AND v = 5", lower},
+                {"v < 1 AND v > 5 AND v = 4", upper},
+                {"v = 4 AND v < 1 AND v > 5", equal}
+              ] do
+            assert sxc_error(ctx, "SELECT * FROM #{m} WHERE #{where}") === failure, where
+          end
+        end
+
+        test "the first comparison written sets the type, whatever column is empty", ctx do
+          m = sxc_bounds(ctx)
+          float = fn sides, kind -> {500, sxc_interval(sides, kind)} end
+
+          for {where, failure} <- [
+                {"f > 2.0 AND f < 1.0", float.("lhs:Null, rhs:Float64", "comparable")},
+                {"f > 2 AND f < 1", float.("lhs:Null, rhs:Float64", "comparable")},
+                {"f < 1 AND f > 2", float.("lhs:Float64, rhs:Null", "comparable")},
+                {"f = 5 AND f < 1", float.("lhs:Null, rhs:Float64", "intersectable")},
+                {"f BETWEEN 2 AND 1", float.("lhs:Null, rhs:Float64", "comparable")},
+                {"f > 1.5 AND f < 1.5", float.("lhs:Null, rhs:Float64", "comparable")},
+                {"f > 1.5 AND f <= 1.5", float.("lhs:Null, rhs:Float64", "comparable")},
+                {"f > 1.0 AND f < 1.0000000000000002",
+                 float.("lhs:Null, rhs:Float64", "comparable")},
+                {"v > 1 AND v < 1 AND f = 1", {500, sxc_interval("lhs:Null, rhs:Int64")}},
+                {"f = 1 AND v > 1 AND v < 1", float.("lhs:Null, rhs:Float64", "intersectable")},
+                {"f > 0 AND v > 5 AND v < 1", float.("lhs:Null, rhs:Float64", "comparable")},
+                {"v < 1 AND f < 9 AND v > 5", {500, sxc_interval("lhs:Int64, rhs:Null")}},
+                {"f < 1 AND f > 5 AND v < 1 AND v > 5",
+                 float.("lhs:Float64, rhs:Null", "comparable")}
+              ] do
+            assert sxc_error(ctx, "SELECT * FROM #{m} WHERE #{where}") === failure, where
+          end
+        end
+
+        test "an integer column compared with float literals is cast and sits out", ctx do
+          m = sxc_bounds(ctx)
+          failure = {500, sxc_interval("lhs:Null, rhs:Float64")}
+
+          for where <- [
+                "v > 1.5 AND f > 2 AND f < 1",
+                "v >= 1.0 AND f > 2 AND f < 1",
+                "v BETWEEN 1.5 AND 3 AND f > 2 AND f < 1"
+              ] do
+            assert sxc_error(ctx, "SELECT * FROM #{m} WHERE #{where}") === failure, where
+          end
+
+          for where <- ["v > 1.5 AND v < 1.7", "v > 2.0 AND v < 1.0", "v = 1.5 AND f = 2"] do
+            assert sxc_rows(ctx, "SELECT * FROM #{m} WHERE #{where}") === [], where
+          end
+
+          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE v > 2.0 AND v < 1.0 AND f = 1") ===
+                   {500, sxc_interval("lhs:Null, rhs:Float64", "intersectable")}
+
+          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE v > 2.0 AND v < 1.0 AND v < 5") ===
+                   {500, sxc_interval("lhs:Int64, rhs:Null")}
+        end
+      end
+    end
+  end
+
+  defp bounds_answer_tests do
+    quote location: :keep do
+      describe "SQL executor — contract: what a numeric range still answers" do
+        test "a range that holds a value, or an end of the type's range, answers", ctx do
+          m = sxc_bounds(ctx)
+          one = [%{"v" => 1}]
+
+          for {where, rows} <- [
+                {"v >= 1 AND v <= 1", one},
+                {"v > 0 AND v < 2", one},
+                {"v = 1 AND v < 5", one},
+                {"v > 1 AND v < 3", [%{"v" => 2}]},
+                {"v > 9223372036854775807", []},
+                {"v < -9223372036854775808", []},
+                {"v > 1.5", [%{"v" => 2}]},
+                {"f > 1.5 AND f < 1.6", []},
+                {"f >= 1.0 AND f <= 1.0", []}
+              ] do
+            assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY time") === rows,
+                   where
+          end
+
+          assert sxc_rows(ctx, "SELECT f FROM #{m} WHERE f >= 1.5 AND f <= 1.5") ===
+                   [%{"f" => 1.5}]
+        end
+
+        test "two different equalities, or a condition the analysis cannot take, answer", ctx do
+          m = sxc_bounds(ctx)
+
+          for where <- [
+                "v = 1 AND v = 2",
+                "v = 4 AND v = 7 AND v < 3",
+                "v > 1 AND v < 1 AND v != 5",
+                "v > 1 AND v < 1 AND v NOT IN (3)",
+                "v > 1 AND v < 1 AND v IN (1, 2)",
+                "v > 1 AND v < 1 AND v NOT BETWEEN 0 AND 9",
+                "v > 1 AND v < 1 AND v IS NULL",
+                "v > 1 AND v < 1 AND v IS NOT NULL",
+                "v > 1 AND v < 1 AND f IS NOT NULL",
+                "v > 1 AND v < 1 AND s = 'a'",
+                "v > 1 AND v < 1 AND s > 'a'",
+                "v > 1 AND v < 1 AND b",
+                "v > 1 AND v < 1 AND NOT b",
+                "v > 1 AND v < 1 AND time > '2000-01-01T00:00:00Z'",
+                "v > 1 AND v < 1 AND time = '1970-01-01T00:00:01Z'",
+                "v > 1 AND v < 1 AND (v > 1 OR v < 1)",
+                "v > 1 AND v < 1 AND NOT (v = 3 AND v = 4)",
+                "v > 1 AND v < 1 AND v > NULL",
+                "v > NULL AND v < 1",
+                "v > '5' AND v < 1",
+                "v NOT BETWEEN 1 AND 3 AND v > 5",
+                "s > 'b' AND s < 'a'",
+                "v + 1 > 2 AND v + 1 < 2",
+                "cast(v AS DOUBLE) > 1 AND cast(v AS DOUBLE) < 1",
+                "v > 1 AND v < 1 AND false"
+              ] do
+            assert sxc_rows(ctx, "SELECT * FROM #{m} WHERE #{where}") === [], where
+          end
+
+          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v > 1 AND v < 1 OR v = 2") ===
+                   [%{"v" => 2}]
+
+          assert sxc_rows(ctx, "SELECT v FROM #{m} WHERE v > 1 AND v < 1 LIMIT 0") === []
+        end
+
+        test "a parameter bounds as a literal does", ctx do
+          m = sxc_bounds(ctx)
+          failure = {:error, %{status: 500, body: sxc_interval("lhs:Null, rhs:Int64")}}
+
+          for params <- [%{a: 5, b: 1}, %{a: 5, b: -1}, %{a: -1, b: -5}] do
+            assert sxc_query(ctx, "SELECT * FROM #{m} WHERE v > $a AND v < $b", params: params) ===
+                     failure,
+                   inspect(params)
+          end
+
+          assert sxc_query(ctx, "SELECT * FROM #{m} WHERE v > $a AND v < $a", params: %{a: 1}) ===
+                   failure
+
+          assert sxc_query(ctx, "SELECT * FROM #{m} WHERE v > $a AND v < $b",
+                   params: %{a: nil, b: 1}
+                 ) === {:ok, []}
+        end
+      end
+    end
+  end
+
+  defp bounds_order_tests(client) do
+    quote location: :keep do
+      describe "SQL executor — contract: the interval error among the others" do
+        test "the planner's errors come before the interval's", ctx do
+          m = sxc_bounds(ctx)
+          schema = "Schema error: No field named nope. Valid fields are "
+
+          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE nope > 1 AND nope < 1") ===
+                   {500, schema <> "#{m}.b, #{m}.f, #{m}.s, #{m}.time, #{m}.v."}
+
+          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE v > 1 AND v < 1 AND nope = 1") ===
+                   {500, schema <> "#{m}.b, #{m}.f, #{m}.s, #{m}.time, #{m}.v."}
+
+          assert sxc_error(
+                   ctx,
+                   "SELECT * FROM #{m} WHERE time > '2100-01-01T00:00:00Z' AND " <>
+                     "time < '2000-01-01T00:00:00Z' AND v > 1 AND v < 1"
+                 ) ===
+                   {500,
+                    "External error: unexpected: provided filters on time column did not " <>
+                      "produce a valid set of boundaries"}
+
+          assert sxc_error(ctx, "SELECT * FROM #{m} WHERE v > 1 AND v < 1 LIMIT -1") ===
+                   {400,
+                    "Optimizer rule 'eliminate_limit' failed\ncaused by\nError during " <>
+                      "planning: LIMIT must be >= 0, '-1' was provided"}
+        end
+
+        test "InfluxQL answers an empty range with no rows", ctx do
+          m = sxc_bounds(ctx)
+
+          assert unquote(client).query_influxql(
+                   ctx.conn,
+                   "SELECT v FROM #{m} WHERE v > 1 AND v < 1",
+                   database: ctx.database
+                 ) === {:ok, []}
+        end
+
+        test "a CROSS JOIN's filter fails on either side's column", ctx do
+          left = sxc_name("sxc_bl")
+          right = sxc_name("sxc_br")
+          sxc_write(ctx, ["#{left} qty=3i 1000000000", "#{right} only2=5i 1000000000"])
+          failure = {500, sxc_interval("lhs:Null, rhs:Int64")}
+
+          for where <- ["qty > 5 AND qty < 1", "only2 > 5 AND only2 < 1"] do
+            assert sxc_error(
+                     ctx,
+                     "SELECT qty, only2 FROM #{left} CROSS JOIN #{right} WHERE #{where}"
+                   ) === failure,
+                   where
+          end
+        end
+
+        @tag local_divergence: "Local refuses what it cannot pin down by name"
+        test "a shape the double cannot pin down is the engine's or refused by name", ctx do
+          m = sxc_bounds(ctx)
+          local? = unquote(client) === InfluxElixir.Client.Local
+
+          refusal = fn what ->
+            {:error,
+             %{
+               status: 400,
+               body:
+                 "Client.Local: a WHERE that may leave a numeric column no value, with " <>
+                   what <> ": the engine's answer is not pinned down"
+             }}
+          end
+
+          cte =
+            {:error,
+             %{
+               status: 400,
+               body:
+                 "Client.Local: a WHERE over a CTE that leaves a numeric column no value: " <>
+                   "the engine's answer depends on where it pushes the filter"
+             }}
+
+          engine = fn sides, kind ->
+            {:error, %{status: 500, body: sxc_interval(sides, kind)}}
+          end
+
+          for {sql, refused, answer} <- [
+                {"WITH c AS (SELECT * FROM #{m}) SELECT * FROM c WHERE v > 1 AND v < 1", cte,
+                 engine.("lhs:Null, rhs:Int64", "comparable")},
+                {"SELECT * FROM #{m} WHERE v > 1 AND v < 1 AND v > 0",
+                 refusal.("two bounds on one column, one implying the other"),
+                 engine.("lhs:Null, rhs:Int64", "comparable")},
+                {"SELECT * FROM #{m} WHERE v < 3 AND v < 9 AND v = 4",
+                 refusal.("two bounds on one column, one implying the other"),
+                 engine.("lhs:Null, rhs:Int64", "intersectable")},
+                {"SELECT * FROM #{m} WHERE v > 1 AND v < 1.5",
+                 refusal.("an integer column bounded by an integer and a float literal"),
+                 {:error,
+                  %{
+                    status: 500,
+                    body: "FilterPushdown\ncaused by\n" <> sxc_interval("lhs:Null, rhs:Int64")
+                  }}},
+                {"SELECT * FROM #{m} WHERE v > 1 AND v < 1 AND v + 1 > 0",
+                 refusal.("an arithmetic expression compared"),
+                 engine.("lhs:Null, rhs:Int64", "comparable")},
+                {"SELECT * FROM #{m} WHERE v = 2 AND v IN (1, 2) AND v < 1",
+                 refusal.("a predicate an equality of the same column may decide"), {:ok, []}}
+              ] do
+            if local?,
+              do: assert(sxc_query(ctx, sql) === refused, sql),
+              else: assert(sxc_query(ctx, sql) === answer, sql)
+          end
         end
       end
     end

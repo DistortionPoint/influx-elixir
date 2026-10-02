@@ -11,6 +11,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
     * `$$...$$` and `$tag$...$tag$` are dollar-quoted strings, and `E'...'`
       or `e'...'` a string with backslash escapes, rewritten as ordinary
       `'...'` literals; `$name` is a placeholder and is kept
+    * `X'...'` is a binary value, which the double refuses by name
     * `;` ends a statement; empty statements are nothing, so a trailing `;`
       is fine
 
@@ -103,6 +104,9 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
         <<?', body::binary>> when word in ["E", "e"] ->
           escape_string(body, input, state, chunk)
 
+        <<?', body::binary>> when word in ["X", "x"] ->
+          hex_string(body, after_word, state, [word | chunk])
+
         _no_escape_string ->
           scan(after_word, state, [word | chunk])
       end
@@ -135,6 +139,26 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
 
       :error ->
         {:error, located(state.whole, start, "Unterminated encoded string literal")}
+    end
+  end
+
+  # `X'61'` is a binary value to the engine, which compares it byte for byte
+  # with a text column and refuses it against a number. The double does not
+  # model a binary value and refuses the text by name; an unterminated
+  # literal is the tokenizer's error as for any string.
+  @spec hex_string(binary(), binary(), state(), iodata()) ::
+          {:ok, [binary()]} | {:error, SQLError.t()}
+  defp hex_string(body, after_word, state, chunk) do
+    case take_quoted(body, ?', [?']) do
+      {:ok, _literal, _rest} ->
+        {:error,
+         SQLError.refusal(
+           "a hexadecimal string literal (X'...') is a binary value on the engine, which " <>
+             "this double does not model"
+         )}
+
+      :error ->
+        scan(after_word, state, chunk)
     end
   end
 

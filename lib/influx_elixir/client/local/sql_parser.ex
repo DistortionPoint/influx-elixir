@@ -113,7 +113,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           distinct_on: [binary()] | nil,
           projection_columns: [projection()] | nil,
           ctes: [{binary(), parsed_query()}],
-          cross_join: {binary(), [binary()]} | nil
+          cross_join: {binary(), [binary()]} | nil,
+          qualifier: binary(),
+          qualified: %{binary() => binary()},
+          plan_error: SQLError.t() | nil,
+          limit_error: SQLError.t() | nil
         }
 
   @typedoc """
@@ -199,17 +203,21 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_single_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
   defp parse_single_select(sql) do
     {sql, cross_join} = sql |> String.trim() |> split_cross_join()
-    normalised = strip_table_qualifiers(sql, cross_join)
+    {normalised, qualifier, qualified} = strip_table_qualifiers(sql, cross_join)
 
     {normalised, on} = split_distinct_on(normalised)
+
+    # A column of a joined table is qualified by the side that holds it,
+    # which a text cannot tell: no name is written for it.
+    naming = if cross_join, do: nil, else: qualifier
 
     with :ok <- check_clauses(normalised),
          :ok <- check_distinct_on_grouping(on, normalised),
          {:ok, split} <- split_select(normalised),
-         {:ok, split, normalised} <- resolve_references(split, normalised),
-         {:ok, query} <- dispatch_select(split, normalised),
+         {:ok, split, normalised} <- resolve_references(split, normalised, naming),
+         {:ok, query} <- dispatch_select(split, normalised, naming),
          {:ok, query} <- apply_distinct_on(query, on) do
-      {:ok, %{query | cross_join: cross_join}}
+      {:ok, %{query | cross_join: cross_join, qualifier: qualifier, qualified: qualified}}
     end
   end
 
@@ -259,8 +267,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   # The engine's other rules for DISTINCT ON, each verified: at least one
   # expression, and an ORDER BY, if any, must start with the ON expressions
-  # in their order (400). The double takes plain columns only and refuses
-  # an expression by name.
+  # in their order (400, raised once the executor has found the columns). The
+  # double takes plain columns only and refuses an expression by name.
   @spec apply_distinct_on(parsed_query(), binary() | nil) ::
           {:ok, parsed_query()} | {:error, map()}
   defp apply_distinct_on(query, nil), do: {:ok, query}
@@ -281,8 +289,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  @spec check_distinct_on_order(parsed_query(), [binary()]) ::
-          {:ok, parsed_query()} | {:error, map()}
+  @spec check_distinct_on_order(parsed_query(), [binary()]) :: {:ok, parsed_query()}
   defp check_distinct_on_order(%{order_by: []} = query, _columns), do: {:ok, query}
 
   # Under DISTINCT ON the engine resolves ORDER BY against the table: a
@@ -297,24 +304,44 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     if leading == columns or Enum.any?(leading, &(&1 in aliases)),
       do: {:ok, query},
       else:
-        {:error,
+        {:ok,
          %{
-           status: 400,
-           body:
-             "Error during planning: SELECT DISTINCT ON expressions must match initial " <>
-               "ORDER BY expressions"
+           query
+           | plan_error:
+               query.plan_error ||
+                 SQLError.planning(
+                   "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+                 )
          }}
   end
 
   # `GROUP BY 1`, `ORDER BY 2 DESC` and `GROUP BY bucket` (a select alias)
   # name select items; the clauses are rewritten to them before anything
   # else reads the text.
-  @spec resolve_references(split(), binary()) :: {:ok, split(), binary()} | {:error, map()}
-  defp resolve_references(%{columns: "*"} = split, sql), do: {:ok, split, sql}
+  @spec resolve_references(split(), binary(), binary() | nil) ::
+          {:ok, split(), binary()} | {:error, map()}
+  defp resolve_references(%{columns: "*"} = split, sql, _qualifier), do: {:ok, split, sql}
 
-  defp resolve_references(%{rest: rest} = split, sql) do
-    with {:ok, rewritten} <- SQLClauses.resolve_references(split.columns, rest) do
+  defp resolve_references(%{rest: rest} = split, sql, qualifier) do
+    with {:ok, rewritten} <-
+           SQLClauses.resolve_references(split.columns, rest, &item_name(&1, qualifier)) do
       {:ok, %{split | rest: rewritten}, String.replace_suffix(sql, rest, rewritten)}
+    end
+  end
+
+  # The name the engine gives a select item with no alias, for `ORDER BY 2`
+  # to name it; `nil` when the double cannot write it.
+  @spec item_name(binary(), binary() | nil) :: binary() | nil
+  defp item_name(item, qualifier) do
+    parsed =
+      if SQLSelect.aggregate_query?(item),
+        do: SQLSelect.parse_list(item, qualifier),
+        else: parse_projection_column(item, qualifier)
+
+    case parsed do
+      {:ok, [column]} -> elem(column, tuple_size(column) - 1)
+      {:ok, {_source, output}} -> output
+      {:error, _reason} -> nil
     end
   end
 
@@ -326,10 +353,12 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
       indexes ->
         part = fn name -> SQLMask.cut(sql, Map.fetch!(indexes, name)) end
-        table = part.("quoted")
 
         table =
-          if table != "", do: table, else: LineProtocolParser.unescape_measurement(part.("bare"))
+          case part.("quoted") do
+            "" -> LineProtocolParser.unescape_measurement(part.("bare"))
+            quoted -> String.replace(quoted, ~s(""), ~s("))
+          end
 
         {:ok, select_parts(part.("distinct") != "", String.trim(part.("columns")), table, part)}
     end
@@ -344,14 +373,16 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       else: %{distinct: distinct, columns: columns, table: table, rest: part.("rest")}
   end
 
-  @spec dispatch_select(split(), binary()) :: {:ok, parsed_query()} | {:error, term()}
-  defp dispatch_select(%{distinct: true} = split, sql), do: parse_distinct_select(split, sql)
+  @spec dispatch_select(split(), binary(), binary() | nil) ::
+          {:ok, parsed_query()} | {:error, term()}
+  defp dispatch_select(%{distinct: true} = split, sql, qualifier),
+    do: parse_distinct_select(split, sql, qualifier)
 
-  defp dispatch_select(split, sql) do
+  defp dispatch_select(split, sql, qualifier) do
     cond do
-      SQLSelect.aggregate_query?(sql) -> parse_aggregate_select(split, sql)
+      SQLSelect.aggregate_query?(sql) -> parse_aggregate_select(split, sql, qualifier)
       split.columns == "*" -> build_star_query(split.table, split.rest)
-      true -> build_columns_query(split.columns, split.table, split.rest)
+      true -> build_columns_query(split.columns, split.table, split.rest, qualifier)
     end
   end
 
@@ -359,7 +390,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # (the rest of the parser sees one table) and recorded with its alias so
   # its qualifiers can be dropped like the left side's.
   # Keywords that can follow a table name are clauses (or constructs), never an alias.
-  @not_an_alias ~w(WHERE GROUP ORDER LIMIT JOIN CROSS INNER LEFT RIGHT FULL OUTER NATURAL UNION EXCEPT INTERSECT HAVING OFFSET ON USING)
+  @not_an_alias ~w(AS WHERE GROUP ORDER LIMIT JOIN CROSS INNER LEFT RIGHT FULL OUTER NATURAL UNION EXCEPT INTERSECT HAVING OFFSET ON USING)
 
   @cross_join_pattern ~r/(?i)(\bFROM\s+(?:"[^"]+"|(?:[^\s\\]|\\.)+)(?:\s+(?:AS\s+)?(?!CROSS\b)\w+)?)\s+CROSS\s+JOIN\s+("[^"]+"|(?:[^\s\\]|\\.)+)(?:\s+(?:AS\s+)?(?!(?:#{Enum.join(@not_an_alias, "|")})\b)(\w+))?/u
 
@@ -367,7 +398,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp split_cross_join(sql) do
     case Regex.run(@cross_join_pattern, SQLMask.mask(sql), return: :index) do
       [{start, length}, left, table | alias_name] ->
-        name = sql |> SQLMask.cut(table) |> String.trim("\"")
+        name = sql |> SQLMask.cut(table) |> table_name()
         names = [name | Enum.map(alias_name, &SQLMask.cut(sql, &1))]
         tail = binary_part(sql, start + length, byte_size(sql) - start - length)
         {binary_part(sql, 0, start) <> SQLMask.cut(sql, left) <> tail, {name, names}}
@@ -432,16 +463,19 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # `check_clauses/1` will name), never an alias.
   @from_alias_pattern ~r/(?i)(FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+))(?:\s+(?:AS\s+)?(?!(?:#{Enum.join(@not_an_alias, "|")})\b)(\w+))?/u
 
-  @spec strip_table_qualifiers(binary(), {binary(), [binary()]} | nil) :: binary()
+  @spec strip_table_qualifiers(binary(), {binary(), [binary()]} | nil) ::
+          {binary(), binary(), %{binary() => binary()}}
   defp strip_table_qualifiers(sql, cross_join) do
+    # The joined table is known by its alias when it has one, by its name
+    # otherwise.
     joined_names =
       case cross_join do
-        {_table, names} -> names
+        {_table, names} -> [List.last(names)]
         nil -> []
       end
 
     case Regex.run(@from_alias_pattern, SQLMask.mask(sql), return: :index) do
-      [{start, length}, from_clause, table, alias_name] ->
+      [{start, length}, from_clause, _table, alias_name] ->
         # The alias (with its `AS`) is whatever follows the table in the match.
         {from_start, from_length} = from_clause
         after_match = start + length
@@ -450,35 +484,94 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           binary_part(sql, 0, from_start + from_length) <>
             binary_part(sql, after_match, byte_size(sql) - after_match)
 
-        drop_qualifiers(without_alias, [
-          sql |> SQLMask.cut(table) |> String.trim("\""),
-          SQLMask.cut(sql, alias_name) | joined_names
-        ])
+        # Once the table has an alias the engine knows it by that name alone
+        # (`xqa.v` is an unknown relation after `FROM xqa AS t`).
+        alias_text = SQLMask.cut(sql, alias_name)
+        {text, qualified} = drop_qualifiers(without_alias, [alias_text | joined_names])
+        {text, alias_text, qualified}
 
       [_full, _from_clause, table] ->
-        drop_qualifiers(sql, [sql |> SQLMask.cut(table) |> String.trim("\"") | joined_names])
+        table_text = table_name(SQLMask.cut(sql, table))
+        {text, qualified} = drop_qualifiers(sql, [table_text | joined_names])
+        {text, table_text, qualified}
 
       nil ->
-        sql
+        {sql, "", %{}}
     end
   end
 
-  @spec drop_qualifiers(binary(), [binary()]) :: binary()
-  defp drop_qualifiers(sql, qualifiers) do
-    names = qualifiers |> Enum.map(&Regex.escape/1) |> Enum.join("|")
-    pattern = ~r/'(?:[^']|'')*'|"[^"]*"|(?<![\w."])(?:#{names})\.(?=\w)/u
+  # A table as the engine names it: a quoted one without its quotes, a
+  # doubled quote one quote.
+  @spec table_name(binary()) :: binary()
+  defp table_name("\"" <> _rest = quoted), do: SQLLiteral.identifier_name(quoted)
+  defp table_name(bare), do: LineProtocolParser.unescape_measurement(bare)
 
-    Regex.replace(pattern, sql, fn
-      "'" <> _rest = literal -> literal
-      "\"" <> _rest = identifier -> identifier
-      _qualifier -> ""
-    end)
+  # A qualifier is the table's name or its alias, bare or quoted; a quoted
+  # one is dropped only when it is exactly the name (the engine reads
+  # `"XQA".v` as another relation).
+  #
+  # Returns the text without them, and the qualifier each column was written
+  # with: the engine names a column it cannot find as it was written
+  # (`t.nosuch`).
+  @spec drop_qualifiers(binary(), [binary()]) :: {binary(), %{binary() => binary()}}
+  defp drop_qualifiers(sql, qualifiers) do
+    qualifiers = Enum.reject(qualifiers, &(&1 == ""))
+    names = qualifiers |> Enum.map_join("|", &Regex.escape/1)
+
+    quoted =
+      Enum.map_join(qualifiers, "|", &Regex.escape(~s("#{String.replace(&1, ~s("), ~s(""))}")))
+
+    pattern =
+      ~r/'(?:[^']|'')*'|(?:#{quoted})\.(?=[\w"])|"[^"]*"|(?<![\w."])(?:#{names})\.(?=\w)/u
+
+    qualified =
+      pattern
+      |> Regex.scan(sql, return: :index)
+      |> Enum.flat_map(fn [{start, length} | _groups] ->
+        token = binary_part(sql, start, length)
+        after_token = binary_part(sql, start + length, byte_size(sql) - start - length)
+
+        if qualifier_token?(token), do: written_with(token, after_token), else: []
+      end)
+      |> Map.new()
+
+    stripped =
+      Regex.replace(pattern, sql, fn token ->
+        if qualifier_token?(token), do: "", else: token
+      end)
+
+    {stripped, qualified}
   end
 
-  @spec parse_aggregate_select(split(), binary()) ::
+  # A match that is a qualifier: not a string literal, and a quoted token
+  # only when the dot after it is part of it.
+  @spec qualifier_token?(binary()) :: boolean()
+  defp qualifier_token?("'" <> _rest), do: false
+  defp qualifier_token?("\"" <> _rest = token), do: String.ends_with?(token, "\".")
+  defp qualifier_token?(_bare), do: true
+
+  # `[{column, qualifier}]` for the column that follows a qualifier.
+  @spec written_with(binary(), binary()) :: [{binary(), binary()}]
+  defp written_with(token, rest) do
+    qualifier = token |> String.trim_trailing(".") |> bare_identifier()
+
+    case Regex.run(~r/\A(?:("(?:[^"]|"")*")|(\w+))/u, rest) do
+      [_full, column] -> [{bare_identifier(column), qualifier}]
+      [_full, "", column] -> [{column, qualifier}]
+      nil -> []
+    end
+  end
+
+  @spec bare_identifier(binary()) :: binary()
+  defp bare_identifier(text) do
+    if SQLLiteral.identifier?(text), do: SQLLiteral.identifier_name(text), else: text
+  end
+
+  @spec parse_aggregate_select(split(), binary(), binary() | nil) ::
           {:ok, parsed_query()} | {:error, term()}
-  defp parse_aggregate_select(%{table: measurement, rest: rest} = split, sql) do
-    with {:ok, columns} <- SQLSelect.parse_list(split.columns),
+  defp parse_aggregate_select(%{table: measurement, rest: rest} = split, sql, qualifier) do
+    with {:ok, columns} <- SQLSelect.parse_list(split.columns, qualifier),
+         :ok <- check_unique(Enum.map(columns, &elem(&1, tuple_size(&1) - 1))),
          {:ok, interval_ns} <- SQLClauses.interval(sql),
          :ok <- SQLClauses.check_date_bins(split.columns, interval_ns),
          {:ok, where} <- SQLWhere.nodes(rest),
@@ -510,7 +603,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         distinct_on: nil,
         projection_columns: nil,
         ctes: [],
-        cross_join: nil
+        cross_join: nil,
+        qualifier: measurement,
+        qualified: %{},
+        plan_error: SQLLimit.planning_error(rest),
+        limit_error: SQLLimit.deferred(rest)
       },
       Map.new(overrides)
     )
@@ -518,16 +615,16 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   # SELECT DISTINCT col[, col ...] FROM measurement ...
   # SELECT DISTINCT a[, b ...]: plain column names only.
-  @spec parse_distinct_select(split(), binary()) ::
+  @spec parse_distinct_select(split(), binary(), binary() | nil) ::
           {:ok, parsed_query()} | {:error, term()}
-  defp parse_distinct_select(%{columns: columns, table: table, rest: rest}, sql) do
+  defp parse_distinct_select(%{columns: columns, table: table, rest: rest}, sql, qualifier) do
     cond do
       # A DISTINCT over no columns: one empty row if any row qualifies.
       columns == "" ->
-        build_distinct_query([], table, rest)
+        build_distinct_query([], table, rest, qualifier)
 
       Regex.match?(~r/^\w+(\s*,\s*\w+)*$/u, columns) ->
-        build_distinct_query(split_columns(columns), table, rest)
+        build_distinct_query(split_columns(columns), table, rest, qualifier)
 
       true ->
         {:error, SQLError.refusal("unsupported DISTINCT query: #{sql}")}
@@ -542,26 +639,26 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # listed run together, with no separator (`pp.pricepp.name`), and an
   # expression is listed as the columns it reads.
   @spec parse_distinct_order_by([binary()], binary(), binary()) ::
-          {:ok, order_by()} | {:error, term()}
+          {order_by(), SQLError.t() | nil}
   defp parse_distinct_order_by(columns, table, rest) do
     order_by = SQLClauses.order_by(rest)
 
     case Enum.flat_map(order_by, &unselected_columns(&1, columns)) do
       [] ->
-        {:ok, order_by}
+        {order_by, nil}
 
       missing ->
-        {:error,
-         %{
-           status: 400,
-           body:
-             "Error during planning: For SELECT DISTINCT, ORDER BY expressions " <>
-               Enum.map_join(missing, &"#{table}.#{&1}") <> " must appear in select list"
-         }}
+        {order_by,
+         SQLError.planning(
+           "For SELECT DISTINCT, ORDER BY expressions " <>
+             Enum.map_join(missing, &"#{table}.#{SQLExpr.ref_text(&1)}") <>
+             " must appear in select list"
+         )}
     end
   end
 
-  @spec unselected_columns({binary() | {:expr, expr()}, direction()}, [binary()]) :: [binary()]
+  @spec unselected_columns({binary() | {:expr, expr()}, direction()}, [binary()]) ::
+          [SQLExpr.column_ref()]
   defp unselected_columns({target, _direction}, columns) when is_binary(target),
     do: if(target in columns, do: [], else: [target])
 
@@ -578,12 +675,21 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       else: :ok
   end
 
-  @spec build_distinct_query([binary()], binary(), binary()) ::
+  # An ORDER BY outside the selected columns is the planner's error, raised
+  # once the executor has found the columns (a name that is no column is the
+  # schema error first).
+  @spec build_distinct_query([binary()], binary(), binary(), binary() | nil) ::
           {:ok, parsed_query()} | {:error, map()}
-  defp build_distinct_query(columns, measurement, rest) do
-    with {:ok, where} <- SQLWhere.nodes(rest),
-         {:ok, order_by} <- parse_distinct_order_by(columns, measurement, rest) do
-      {:ok, new_query(measurement, where, rest, order_by: order_by, distinct_columns: columns)}
+  defp build_distinct_query(columns, measurement, rest, qualifier) do
+    with {:ok, where} <- SQLWhere.nodes(rest) do
+      {order_by, error} = parse_distinct_order_by(columns, qualifier || measurement, rest)
+
+      {:ok,
+       new_query(measurement, where, rest,
+         order_by: order_by,
+         distinct_columns: columns,
+         plan_error: error || SQLLimit.planning_error(rest)
+       )}
     end
   end
 
@@ -595,23 +701,43 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  @spec build_columns_query(binary(), binary(), binary()) ::
+  @spec build_columns_query(binary(), binary(), binary(), binary() | nil) ::
           {:ok, parsed_query()} | {:error, term()}
-  defp build_columns_query(columns_str, measurement, rest) do
-    with {:ok, projection} <- parse_projection_columns(columns_str),
+  defp build_columns_query(columns_str, measurement, rest, qualifier) do
+    with {:ok, projection} <- parse_projection_columns(columns_str, qualifier),
+         :ok <- check_unique(Enum.map(projection, fn {_source, output} -> output end)),
          {:ok, where} <- SQLWhere.nodes(rest) do
       {:ok, new_query(measurement, where, rest, projection_columns: projection)}
     end
   end
 
-  @spec parse_projection_columns(binary()) ::
+  # The engine refuses a select list that names two columns alike
+  # ("Projections require unique expression names"), in words that print its
+  # planner's rendering of each expression, which the double does not
+  # reproduce: it refuses the list by name.
+  @spec check_unique([binary()]) :: :ok | {:error, map()}
+  defp check_unique(outputs) do
+    case outputs -- Enum.uniq(outputs) do
+      [] ->
+        :ok
+
+      [name | _more] ->
+        {:error,
+         SQLError.refusal(
+           "two select items are both named #{inspect(name)}, which the engine refuses " <>
+             "(\"Projections require unique expression names\"); alias one of them"
+         )}
+    end
+  end
+
+  @spec parse_projection_columns(binary(), binary() | nil) ::
           {:ok, [projection()]} | {:error, term()}
-  defp parse_projection_columns(columns_str) do
+  defp parse_projection_columns(columns_str, qualifier) do
     columns =
       columns_str
       |> SQLMask.split_commas()
       |> Enum.map(&String.trim/1)
-      |> Enum.map(&parse_projection_column/1)
+      |> Enum.map(&parse_projection_column(&1, qualifier))
 
     if Enum.any?(columns, &match?({:error, _}, &1)) do
       Enum.find(columns, &match?({:error, _}, &1))
@@ -620,48 +746,50 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  # A constant in a select list as an expression: a literal, or a `$name`.
-  @spec literal_expr(binary()) :: expr()
-  defp literal_expr(text) do
-    case SQLLiteral.value(text) do
-      {:param, _name} = param -> param
-      value -> {:lit, value}
+  # Parse a select item: a column (`name`, or a quoted `"a b"`), a constant,
+  # or an arithmetic expression, with or without `AS alias`, returning
+  # `{source, output}`. An item with no alias is named as the engine names it
+  # (`rvt.v * Int64(2)`, `Int64(1)`; see `InfluxElixir.Client.Local.SQLSelect`).
+  @spec parse_projection_column(binary(), binary() | nil) ::
+          {:ok, projection()} | {:error, term()}
+  defp parse_projection_column(col, qualifier) do
+    trimmed = String.trim(col)
+    {body, alias_name} = SQLSelect.split_alias(trimmed)
+
+    cond do
+      constant = SQLSelect.constant(body) ->
+        {expr, default} = constant
+
+        with {:ok, output} <-
+               SQLSelect.output_name(trimmed, alias_name, fn ->
+                 default || throw(:unrenderable)
+               end) do
+          {:ok, {expr, output}}
+        end
+
+      Regex.match?(~r/^(?:\w+|"(?:[^"]|"")*")$/u, body) ->
+        source = SQLSelect.name(body)
+        {:ok, {source, alias_name || source}}
+
+      true ->
+        expression_projection(trimmed, body, alias_name, qualifier)
     end
   end
 
-  # Parse `name`, `name AS alias` or `<arithmetic> AS alias`, returning
-  # `{source, output}`. An expression needs an alias: DataFusion names an
-  # unaliased one after its own rendering (`q.bid * Int64(2)`), which the
-  # double will not guess.
-  @spec parse_projection_column(binary()) :: {:ok, projection()} | {:error, term()}
-  defp parse_projection_column(col) do
-    trimmed = String.trim(col)
-
-    cond do
-      match = SQLSelect.constant_column(trimmed) ->
-        [_full, literal, alias_name] = match
-        {:ok, {literal_expr(literal), alias_name}}
-
-      Regex.match?(~r/^(?:-?[0-9]+(?:\.[0-9]+)?|'[^']*'|\$\w+)$/u, trimmed) ->
-        {:error, SQLError.refusal("unsupported column (a constant needs AS alias): #{col}")}
-
-      # A quoted alias keeps a name that needs its quotes (`AS "The Host"`).
-      match = Regex.run(~r/^(\w+)(?:\s+AS\s+(\w+|"[^"]+"))?$/iu, trimmed) ->
-        case match do
-          [_full, name] -> {:ok, {name, name}}
-          [_full, name, alias_name] -> {:ok, {name, String.trim(alias_name, "\"")}}
+  @spec expression_projection(binary(), binary(), binary() | nil, binary() | nil) ::
+          {:ok, projection()} | {:error, term()}
+  defp expression_projection(col, body, alias_name, qualifier) do
+    case SQLExpr.parse(body) do
+      {:ok, expr} ->
+        with {:ok, output} <-
+               SQLSelect.output_name(col, alias_name, fn ->
+                 SQLExpr.render(expr, qualifier, :drop)
+               end) do
+          {:ok, {expr, output}}
         end
 
-      match = Regex.run(~r/^(.+?)\s+AS\s+(\w+|"[^"]+")$/isu, trimmed) ->
-        [_full, expr_str, alias_name] = match
-
-        case SQLExpr.parse(expr_str) do
-          {:ok, expr} -> {:ok, {expr, String.trim(alias_name, "\"")}}
-          {:error, _reason} -> {:error, SQLError.refusal("unsupported column: #{col}")}
-        end
-
-      true ->
-        {:error, SQLError.refusal("unsupported column (an expression needs AS alias): #{col}")}
+      {:error, _reason} ->
+        {:error, SQLError.refusal("unsupported column: #{col}")}
     end
   end
 

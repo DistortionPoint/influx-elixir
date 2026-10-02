@@ -10,6 +10,8 @@ defmodule InfluxElixir.Integration.TokensV3CoreAuthTest do
   `influxdb3 serve` without `--without-auth`, or set `INFLUX_V3_AUTH_TOKEN`.
   """
 
+  # async: false — token ids are compared with each other (`next == id + 1`), so no other
+  # module may create a token on this server meanwhile; the Finch pool is global too.
   use ExUnit.Case, async: false
 
   @moduletag :v3_core_auth

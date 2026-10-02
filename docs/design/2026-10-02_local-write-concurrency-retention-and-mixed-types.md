@@ -48,9 +48,10 @@ found with a map (a map the same size as the key list means none) and mark
 their measurement. The key is `{:series_time, db, measurement, timestamp,
 tags}`: the timestamp comes before the tag map because ordered-set
 comparison of maps was half the cost of the claim. The table is created
-with `write_concurrency: true`. `:global.trans` stays for tokens and the
-database limit: a spin lock in the table would leak when its holder is
-killed. `store_point/3` is `store_points/3` of one point.
+with `write_concurrency: true`. (Tokens and the database limit later moved
+from `:global.trans` to a lock key in the table that a waiter clears when
+its holder has died, and `store_point/3` was removed; see
+[`2026-10-02_third-review`](2026-10-02_third-review.md).)
 
 **Parser.** The lines are parsed 10k at a time. A full chunk runs in a
 process of its own with `min_heap_size` of 1M words and sends its result
@@ -121,7 +122,9 @@ and pins the earliest from the double.
   15,954 (60 s timeout before the change, in the report) → 356-561 ms;
   100k lines 640 → 700-750 ms.
 - Parse, 100k lines in a fresh process, best of 8: typical 322 → 270-300
-  ms, bare 152 → 125-156 ms. Memory, 200k lines: +1,071 MB → +287 MB;
+  ms, bare 152 → 125-156 ms. Memory, 200k lines: +1,071 MB → about 170 MB
+  retained and 380-470 MB at peak (re-measured by the third review; the
+  +287 MB first reported did not reproduce);
   eight at once: +8,755 MB → +1,579-2,283 MB (the results alone are about
   250 MB each).
 - Flux, 100k points: `flux_typed` 250 → 41 ms, `Flux.run` 490 → 295 ms.

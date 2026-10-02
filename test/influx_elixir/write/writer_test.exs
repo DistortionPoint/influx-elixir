@@ -6,7 +6,6 @@ defmodule InfluxElixir.Write.WriterTest do
 
   setup do
     {:ok, conn} = Local.start(databases: ["w"])
-    on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn}
   end
 

@@ -1,26 +1,28 @@
 defmodule InfluxElixir.Client.QueryParamsTest do
+  @moduledoc """
+  One unit test per function of `InfluxElixir.Client.QueryParams`. What a
+  query does with the parameters, and the engine's words for a parameter it
+  refuses, are pinned against both clients in
+  `InfluxElixir.Contract.SQLParser`.
+  """
+
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.QueryParams
 
   describe "normalize/1" do
-    test "takes a map, a keyword list, nil and an empty list, naming every key as a string" do
-      assert QueryParams.normalize(%{"b" => "x", 3 => nil, a: 1}) ==
+    test "names every key as a string, turns a Decimal into a JSON number, refuses the rest" do
+      assert QueryParams.normalize(%{"b" => "x", 3 => nil, a: 1}) ===
                {:ok, %{"a" => 1, "b" => "x", "3" => nil}}
 
-      assert QueryParams.normalize(b: 2, a: true) == {:ok, %{"a" => true, "b" => 2}}
-      assert QueryParams.normalize(nil) == {:ok, %{}}
-      assert QueryParams.normalize([]) == {:ok, %{}}
-      assert QueryParams.normalize(%{}) == {:ok, %{}}
-    end
+      assert QueryParams.normalize(b: 2, a: true) === {:ok, %{"a" => true, "b" => 2}}
 
-    test "turns a Decimal into a JSON number" do
+      for none <- [nil, [], %{}], do: assert(QueryParams.normalize(none) === {:ok, %{}})
+
       assert {:ok, %{"p" => fragment}} = QueryParams.normalize(p: Decimal.new("1.2E+4"))
-      assert fragment |> Jason.encode!() == "12000"
-    end
+      assert Jason.encode!(fragment) === "12000"
 
-    test "refuses what the engine could not be sent, naming it" do
-      for {params, error} <- [
+      for {params, {name, reason}} <- [
             {%{p: Decimal.new("NaN")}, {"p", :non_finite_decimal}},
             {%{p: Decimal.new("Infinity")}, {"p", :non_finite_decimal}},
             {%{p: {1, 2}}, {"p", :unsupported_type}},
@@ -32,9 +34,21 @@ defmodule InfluxElixir.Client.QueryParamsTest do
             {"p", {~s|"p"|, :unsupported_params}},
             {%URI{}, {inspect(%URI{}), :unsupported_params}}
           ] do
-        {name, reason} = error
-        assert QueryParams.normalize(params) == {:error, {:invalid_param, name, reason}}
+        assert QueryParams.normalize(params) === {:error, {:invalid_param, name, reason}}
       end
+    end
+  end
+
+  describe "request_body/4" do
+    test "writes db, format, params and q in that order, leaving out a db or format that is nil" do
+      assert QueryParams.request_body("db", "SELECT 1", %{"p" => 1}, :json) ===
+               ~s|{"db":"db","format":"json","params":{"p":1},"q":"SELECT 1"}|
+
+      assert QueryParams.request_body("db", "SELECT 1", %{}, nil) ===
+               ~s|{"db":"db","params":{},"q":"SELECT 1"}|
+
+      assert QueryParams.request_body(nil, "", %{}, "csv") ===
+               ~s|{"format":"csv","params":{},"q":""}|
     end
   end
 
@@ -69,35 +83,12 @@ defmodule InfluxElixir.Client.QueryParamsTest do
   defp number(text) when is_binary(text), do: String.to_float(text)
   defp number(value), do: value
 
-  describe "engine_values/1 and problem/1 — a number as the engine's JSON parser reads it" do
+  describe "engine_values/1" do
     test "reads a number as serde_json does, an ulp off a correct rounding where it is" do
       for {text, value} <- @engine_reads do
-        params = %{"p" => Jason.Fragment.new(text)}
-
-        assert QueryParams.problem(params["p"]) == nil, text
-        assert QueryParams.engine_values(params) == %{"p" => number(value)}, text
-      end
-    end
-
-    test "refuses a number past the float range, though the largest double is in" do
-      for text <- [
-            "1e400",
-            "-1e400",
-            "1.7976931348623158e308",
-            "1797693134862315907729305190789024733617976978942306572734300811577326758055009631327084773224075360211201138798713933576587897688144166224928474306394741243777678934248654852763022196012460941194530829520850057688381506823424628814739131105408272371633505106845862982399472459384797163048353563296242241372160",
-            String.duplicate("9", 400)
-          ] do
-        assert QueryParams.problem(Jason.Fragment.new(text)) == :out_of_range, text
-      end
-    end
-
-    test "an object or an array is a problem, any other value is not" do
-      assert QueryParams.problem(%{a: 1}) == :object
-      assert QueryParams.problem([]) == :array
-      assert QueryParams.problem([1, %{a: 2}]) == :array
-
-      for value <- [nil, true, 1, 1.5, "x", ~D[2024-01-02], :name] do
-        assert QueryParams.problem(value) == nil, inspect(value)
+        assert QueryParams.engine_values(%{"p" => Jason.Fragment.new(text)}) ===
+                 %{"p" => number(value)},
+               text
       end
     end
 
@@ -109,7 +100,7 @@ defmodule InfluxElixir.Client.QueryParamsTest do
                "d" => ~D[2024-01-02],
                "e" => :name,
                "f" => ~U[2024-01-02 03:04:05.000000Z]
-             }) == %{
+             }) === %{
                "a" => nil,
                "b" => true,
                "c" => "x",
@@ -117,6 +108,31 @@ defmodule InfluxElixir.Client.QueryParamsTest do
                "e" => "name",
                "f" => "2024-01-02T03:04:05.000000Z"
              }
+    end
+  end
+
+  describe "problem/1" do
+    test "is what the engine's JSON parser refuses in a value: an object, an array, a number" do
+      assert QueryParams.problem(%{a: 1}) === :object
+      assert QueryParams.problem([]) === :array
+      assert QueryParams.problem([1, %{a: 2}]) === :array
+
+      for text <- [
+            "1e400",
+            "-1e400",
+            "1.7976931348623158e308",
+            String.duplicate("9", 400)
+          ] do
+        assert QueryParams.problem(Jason.Fragment.new(text)) === :out_of_range, text
+      end
+
+      for value <- [nil, true, 1, 1.5, "x", ~D[2024-01-02], :name] do
+        assert QueryParams.problem(value) === nil, inspect(value)
+      end
+
+      for {text, _value} <- @engine_reads do
+        assert QueryParams.problem(Jason.Fragment.new(text)) === nil, text
+      end
     end
   end
 end

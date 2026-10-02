@@ -28,6 +28,7 @@ defmodule InfluxElixir.Client.Local.Format do
   query's result.
   """
 
+  alias InfluxElixir.Client.Local.SQLError
   alias InfluxElixir.Client.QueryParams
 
   @engine_formats ~w(parquet csv pretty json json_lines jsonl)
@@ -91,8 +92,7 @@ defmodule InfluxElixir.Client.Local.Format do
 
       index ->
         {_name, value} = Enum.at(entries, index)
-        kept = Enum.take(entries, index + 1)
-        read = byte_size(request_head(format, database)) + byte_size(encode_entries(kept))
+        read = bytes_through(database, format, entries |> Enum.take(index + 1) |> Map.new())
         last? = index == length(entries) - 1
         {:error, %{status: 400, body: params_error(QueryParams.problem(value), read, last?)}}
     end
@@ -116,22 +116,16 @@ defmodule InfluxElixir.Client.Local.Format do
       "Expected null, boolean, number, or string. at line 1 column #{at}"
   end
 
-  # `{"db":"<database>","format":"<format>","params":{` as `Client.HTTP`
-  # writes the start of the request body; a request with no format (an
-  # `execute_sql`) has no `format` key.
-  @spec request_head(term(), binary() | nil) :: binary()
-  defp request_head(format, database) do
-    db = if database, do: ~s|"db":#{Jason.encode!(database)},|, else: ""
-    format = if format, do: ~s|"format":#{Jason.encode!(to_string(format))},|, else: ""
-    "{" <> db <> format <> ~s|"params":{|
+  # The number of bytes of the request body `Client.HTTP` sends, from its
+  # start through the last of the `kept` parameters: the body of an empty
+  # `params` object, up to the object's first byte, and what the entries add.
+  @spec bytes_through(binary() | nil, term(), QueryParams.t()) :: pos_integer()
+  defp bytes_through(database, format, kept) do
+    empty = QueryParams.request_body(database, "", %{}, format)
+    full = QueryParams.request_body(database, "", kept, format)
+    {at, length} = :binary.match(empty, ~s("params":{))
+    at + length + byte_size(full) - byte_size(empty)
   end
-
-  @spec encode_entries([{binary(), term()}]) :: binary()
-  defp encode_entries(entries),
-    do:
-      Enum.map_join(entries, ",", fn {name, value} ->
-        Jason.encode!(name) <> ":" <> Jason.encode!(value)
-      end)
 
   @spec render([map()], term()) :: {:ok, [map()]} | {:error, term()}
   defp render(rows, format) when format in [:json, :jsonl], do: {:ok, rows}
@@ -145,22 +139,22 @@ defmodule InfluxElixir.Client.Local.Format do
     end
   end
 
-  # The parser stops where the format's string ends; the body `Client.HTTP`
-  # builds is that string's prefix, closed, minus its closing brace.
+  # The parser stops where the format's string ends, which is where the body
+  # `Client.HTTP` sends goes on to its `params`.
   @spec unknown_variant(term(), binary() | nil) :: binary()
   defp unknown_variant(format, database) do
     expected = Enum.map_join(@engine_formats, ", ", &"`#{&1}`")
-    body = if database, do: %{"db" => database}, else: %{}
-    request = Jason.encode!(Map.put(body, "format", to_string(format)))
+    body = QueryParams.request_body(database, "", %{}, format)
+    {column, _length} = :binary.match(body, ~s(,"params":))
 
     "serde json error: unknown variant `#{format}`, expected one of #{expected} " <>
-      "at line 1 column #{byte_size(request) - 1}"
+      "at line 1 column #{column}"
   end
 
   @spec csv([map()]) :: {:ok, [map()]} | {:error, term()}
   defp csv(rows) do
     if Enum.any?(rows, &nested?/1),
-      do: {:error, {:connection_error, %Mint.TransportError{reason: :closed}}},
+      do: {:error, SQLError.closed()},
       else: {:ok, Enum.map(rows, &csv_row/1)}
   end
 

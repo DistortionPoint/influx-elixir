@@ -174,10 +174,20 @@ defmodule InfluxElixir.Client.Local do
       `DATE_BIN` buckets are `DateTime` values with microsecond precision,
       the same as the HTTP and Flight transports return; compare them with
       `DateTime.compare/2` or a six-digit sigil (`~U[... .000000Z]`).
-      A projected column may be an arithmetic expression with an alias
+      A projected column may be an arithmetic expression
       (`(bid + ask) / 2 AS mid`; `+ - * / %` and unary minus, `%` taking the
       dividend's sign); a null operand makes the column null
       (omitted). `ORDER BY` may name a projected alias.
+    * A select item with no alias is named as the engine names it: a column
+      by its name, anything else by the engine's rendering over the table
+      (or its alias) as the qualifier: `sum(m.v * Int64(2))`, `count(*)`,
+      `count(DISTINCT m.h)`, `m.v + Int64(1) * Int64(2)`, `Int64(1)`,
+      `Utf8("x")`, `$p`, `first_value(m.v) ORDER BY [m.time ASC NULLS
+      LAST]`, `selector_first(m.v,m.time)[value]`, `date_bin(...)`; a `CAST`
+      is not part of a name. A name that depends on which side of a `CROSS
+      JOIN` holds a column, and two items with the same name (which the
+      engine refuses), are refused by name. `ORDER BY` finds such an item by
+      its position, its name in quotes, or the aggregate it repeats.
     * `WITH name AS (<select>)[, name AS (<select>)] <select>` — non-recursive
       CTEs. Each body is a query in this subset, run in order over the store
       or an earlier CTE; the final `SELECT` may read from any of them
@@ -191,8 +201,11 @@ defmodule InfluxElixir.Client.Local do
       joins, set operations, `HAVING` and window functions are
       rejected by name rather than silently ignored.
     * Table qualifiers and aliases: `FROM q AS w` / `FROM q w`, and
-      `w.time`, `q.bid` in any clause — one table per query, so the prefix
-      is dropped.
+      `w.time` in any clause (or `q.time` with no alias: the engine knows an
+      aliased table by the alias alone). One table per query, so the prefix
+      is dropped; an unknown column is named as it was written (`w.nosuch`),
+      and a quoted qualifier that differs in case (`"Q".bid`) is another
+      relation, with the engine's hint about case.
     * `WHERE` with `=`, `!=` / `<>`, `<`, `<=`, `>`, `>=`, combined with
       `AND`, `OR`, `NOT` and parentheses (`AND` binds tighter than `OR`, as
       in SQL). A quoted literal is always a **string**, exactly as in
@@ -209,8 +222,15 @@ defmodule InfluxElixir.Client.Local do
       A column that no row has — named anywhere: `SELECT`, an aggregate,
       `WHERE`, `GROUP BY`, `ORDER BY`, `DISTINCT` — is the engine's schema
       error ("No field named prod", HTTP 500), which is what a typo or a
-      forgotten pair of quotes produces in production. With no rows the
-      schema is unknown and nothing is checked. `col = NULL` (a `nil`
+      forgotten pair of quotes produces in production. The first one the
+      engine meets is the one it names (`WHERE`, the select list, `ORDER BY`,
+      `GROUP BY`, `DISTINCT ON`), and the fields it lists are the table's,
+      each qualified and sorted by its bytes (`m.host, m."Zed", m.time`),
+      preceded for `ORDER BY` and `GROUP BY` by the select list's own
+      fields; a CTE lists its columns in the order it selects them. A
+      double-quoted name in the select list is a column too (`"a b"`,
+      `count("a b")`). With no rows a table's schema is unknown and nothing
+      is checked; a CTE's columns are known. `col = NULL` (a `nil`
       param) is never true. Logic is SQL's three-valued logic: a comparison
       with a null operand is unknown, `NOT` keeps it unknown, and only a true
       predicate keeps the row, so `NOT (rack = '1')` does not return rows
@@ -221,9 +241,16 @@ defmodule InfluxElixir.Client.Local do
     * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)` — each
       item a literal, a column or an expression, as in SQL (a bare word is
       a column reference, never a string)
-    * A constant with an alias in any select list (`0.0 AS volume`,
-      `'x' AS label`); an unaliased constant is refused because DataFusion
-      names it after its own rendering
+    * A constant in any select list (`0.0 AS volume`, `'x' AS label`, `NULL`);
+      a number is typed as the engine types it: an integer is `Int64`, one
+      above `Int64`'s range `UInt64`, one above that a double (`-` directly
+      before a number is part of it, but `-(9223372036854775808)` negates a
+      `UInt64`, which the engine refuses, as it does `-$p` for a
+      non-negative integer parameter); a number past the double range is a
+      JSON `null` that is there (`%{"a" => nil}`). An `Int64` divided by a
+      `UInt64` is a decimal truncated to four places. The magnitude of the
+      `Int64` minimum, and its negation when it is folded as a constant,
+      close the connection mid-response.
     * `WHERE col IS NULL` and `WHERE col IS NOT NULL`
     * `WHERE col [NOT] BETWEEN low AND high` (inclusive; `time` too)
     * `WHERE col [NOT] LIKE 'pattern'` and `ILIKE` (`%` any run, `_` one
@@ -233,8 +260,13 @@ defmodule InfluxElixir.Client.Local do
     * `WHERE time <op> <comparand>` — exactly what InfluxDB 3 accepts against
       a Timestamp: a quoted datetime or date as Arrow reads it
       (`'2026-03-31T12:00:00Z'`; a space or `t` for the `T`, a fraction of
-      any length, a zone as `Z`, `+01:00`, `+0100`, `+01`, `UTC` or `GMT`;
-      `'2026-03-31'` is midnight UTC), `now()` offset by `+`/`-`
+      any length, a zone as `Z`, `+01:00`, `+0100`, `+01`, or a name of the
+      time zone database that the double can read: `UTC`, `GMT`, `Zulu`,
+      `UCT`, `Universal`, `Greenwich`, `GMT0`, `GMT+0`, `GMT-0` and the same
+      under `Etc/`, `Etc/GMT+1` to `Etc/GMT+12` (the sign is inverted) and
+      `Etc/GMT-1` to `Etc/GMT-14`, `EST`, `MST` and `HST`; a second of `:60`
+      is the start of the next minute; `'2026-03-31'` is midnight UTC),
+      `now()` offset by `+`/`-`
       `INTERVAL 'N unit'` terms (`now() - INTERVAL '5 minutes'`), `NULL` or a
       `$param`. A bare integer (`time > 1700000000`) is rejected as
       DataFusion rejects it ("Cannot infer common argument type for
@@ -244,8 +276,16 @@ defmodule InfluxElixir.Client.Local do
       timestamp from 'abc': timestamp must contain at least 10
       characters"), raised after the planner's own errors, and an instant
       outside the nanosecond range is its overflow error. A null compares as
-      unknown. A leap second (`:60`) and a time zone name other than `UTC`
-      and `GMT` are refused by name.
+      unknown, and so is `NULL = time`. A zone name of the database whose
+      offset changes with the date (`Europe/Paris`) is refused by name.
+      A `WHERE` whose top-level conjuncts on `time` leave no instant
+      (`time > X AND time < X`, `BETWEEN` with reversed bounds, adjacent
+      exclusive bounds, `now()` against itself) is the planner's 500
+      "provided filters on time column did not produce a valid set of
+      boundaries", in the engine's order: after the schema and type errors
+      and the optimizer's (an unreadable time string, a negative `LIMIT`),
+      and not for an `OR`, `LIMIT 0`, `time IS NULL`, a constant false, or two
+      different instants that `time` equals.
     * `SELECT DISTINCT col[, col ...] FROM measurement` (sorted combinations;
       `ORDER BY` must name a selected column, as in DataFusion). An all-null
       combination is a row too (`%{}`).
@@ -1299,7 +1339,8 @@ defmodule InfluxElixir.Client.Local do
       case SQLExecutor.run(
              query,
              &point_source(table, database, &1),
-             QueryParams.engine_values(params)
+             QueryParams.engine_values(params),
+             &Store.column_kind(table, database, &1, &2)
            ) do
         {:error, _reason} = err -> err
         rows -> {:ok, rows}
@@ -1774,7 +1815,7 @@ defmodule InfluxElixir.Client.Local do
     end
 
     with {:ok, query} <- SQLParser.parse_select(sql, identifiers: :exact),
-         rows when is_list(rows) <- SQLExecutor.run(query, fetch) do
+         rows when is_list(rows) <- SQLExecutor.run_influxql(query, fetch) do
       {:ok,
        if(blank_tags == %{}, do: rows, else: Enum.map(rows, &drop_blank_tags(&1, fill_tags)))}
     else

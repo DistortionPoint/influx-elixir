@@ -25,6 +25,9 @@ defmodule InfluxElixir.Client.Local.Store do
     * `{:column, database, measurement, column}` => the column's kind
       (`iox::column_type::tag` or `iox::column_type::field::<type>`), fixed
       by the first write that names the column
+    * `{:lock, resource}` => the process holding that resource's lock, for
+      as long as it runs the one operation that needs it (database limit,
+      token ids)
 
   The store is policy-free: what a write may contain, which errors the
   engine returns and how a query reads rows live in `Client.Local` and the
@@ -65,9 +68,9 @@ defmodule InfluxElixir.Client.Local.Store do
   # Databases, buckets, tokens
   # ---------------------------------------------------------------------------
 
-  @doc "Registers a database (idempotent)."
+  # Registers a database (idempotent).
   @spec put_database(t(), binary()) :: true
-  def put_database(table, name), do: :ets.insert(table, {{:database, name}, true})
+  defp put_database(table, name), do: :ets.insert(table, {{:database, name}, true})
 
   @doc """
   Registers a database after `check` approves it, atomically: `check` is
@@ -91,11 +94,39 @@ defmodule InfluxElixir.Client.Local.Store do
     end
   end
 
-  # A lock on one store's resource, released when the function returns or
-  # its process dies. `:global` is node-wide, which is the scope of a store.
+  # A lock on one store's resource: a key naming its holder, taken by one
+  # `insert_new`, so it is atomic, belongs to this store alone and a waiter
+  # retries at once instead of backing off for as long as a node-wide lock
+  # would make it. The holder deletes its key when the function returns or
+  # raises; a key left by a holder that died is deleted, as that exact
+  # object, by the next waiter that finds the holder dead.
   @spec with_lock(t(), atom(), (-> result)) :: result when result: term()
   defp with_lock(table, resource, fun) do
-    :global.trans({{:influx_local, table, resource}, self()}, fun, [node()], :infinity)
+    key = {:lock, resource}
+    acquire(table, key)
+
+    try do
+      fun.()
+    after
+      :ets.delete_object(table, {key, self()})
+    end
+  end
+
+  @spec acquire(t(), {:lock, atom()}) :: :ok
+  defp acquire(table, key) do
+    if :ets.insert_new(table, {key, self()}) do
+      :ok
+    else
+      with [{^key, holder} = held] <- :ets.lookup(table, key),
+           false <- Process.alive?(holder) do
+        :ets.delete_object(table, held)
+      end
+
+      receive do
+      after
+        1 -> acquire(table, key)
+      end
+    end
   end
 
   @doc "Whether a database is registered."
@@ -237,12 +268,6 @@ defmodule InfluxElixir.Client.Local.Store do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Stores a point as written; see `store_points/3`.
-  """
-  @spec store_point(t(), binary(), point()) :: true
-  def store_point(table, database, point), do: store_points(table, database, [point])
-
-  @doc """
   Stores a payload's points as written, each its own object, in one batched
   insert. A point without a timestamp gets the server's time here as a
   fallback; `Client.Local.write/3` stamps a write's untimed lines itself,
@@ -314,13 +339,6 @@ defmodule InfluxElixir.Client.Local.Store do
 
   defp assign_default_timestamp(point), do: point
 
-  @doc "Whether any point was written to the measurement."
-  @spec measurement?(t(), binary(), binary()) :: boolean()
-  def measurement?(table, database, measurement) do
-    spec = [{{{:point, database, measurement, :_}, :_}, [], [true]}]
-    :ets.select(table, spec, 1) != :"$end_of_table"
-  end
-
   @doc """
   The database's measurements, sorted by name: the ones with a table,
   which a write creates by registering its columns. They are read from the
@@ -378,13 +396,13 @@ defmodule InfluxElixir.Client.Local.Store do
   lost. Returns the number of (merged) points deleted.
 
   The `series_time` key of a doomed point is deleted with it, which a
-  writer racing the delete may have just claimed. That is harmless
-  (assessed, not a bug): a writer that finds the key taken has already put
-  the measurement's `duplicates` marker, which is never removed, so reads
-  merge it with any point left at that series and time; one that finds the
-  key gone writes a point that nothing deleted here refers to. Either way
-  the point the writer stored is kept, as a write after the delete would
-  be, and no point is merged with one that was deleted.
+  writer racing the delete may have just claimed. The invariant that makes
+  this safe: a writer that finds the key taken has already put the
+  measurement's `duplicates` marker, which is never removed, so reads merge
+  it with any point left at that series and time; one that finds the key
+  gone writes a point that nothing deleted here refers to. Either way the
+  point the writer stored is kept, as a write after the delete would be, and
+  no point is merged with one that was deleted.
   """
   @spec delete_points(t(), binary(), binary(), (point() -> boolean())) :: non_neg_integer()
   def delete_points(table, database, measurement, match?) do

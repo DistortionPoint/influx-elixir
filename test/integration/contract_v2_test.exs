@@ -9,6 +9,8 @@ defmodule InfluxElixir.Integration.ContractV2Test do
   faithful to real InfluxDB v2.
   """
 
+  # async: false — shares the one real server and the globally named :integration_finch
+  # pool with the other integration modules, and its writes are timed against its clock.
   use ExUnit.Case, async: false
 
   @moduletag :v2
@@ -48,14 +50,17 @@ defmodule InfluxElixir.Integration.ContractV2Test do
   # outside the shared contract.
   describe "bucket names are scoped to the connection's org" do
     test "delete_bucket leaves another org's bucket of the same name", ctx do
-      suffix = System.unique_integer([:positive])
-      name = "shared_#{suffix}"
-      other_org = api(ctx.conn, :post, "/api/v2/orgs", %{"name" => "other_org_#{suffix}"})
+      org_name = H.unique_name("other_org")
+      name = H.unique_name("shared")
+      other_org = api(ctx.conn, :post, "/api/v2/orgs", %{"name" => org_name})
 
       other =
         api(ctx.conn, :post, "/api/v2/buckets", %{"name" => name, "orgID" => other_org["id"]})
 
-      on_exit(fn -> api(ctx.conn, :delete, "/api/v2/orgs/#{other_org["id"]}", nil) end)
+      on_exit(fn ->
+        HTTP.delete_bucket(ctx.conn, name)
+        api(ctx.conn, :delete, "/api/v2/orgs/#{other_org["id"]}", nil)
+      end)
 
       :ok = HTTP.create_bucket(ctx.conn, name, [])
 

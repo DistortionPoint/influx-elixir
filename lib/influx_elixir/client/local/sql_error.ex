@@ -60,6 +60,72 @@ defmodule InfluxElixir.Client.Local.SQLError do
     }
 
   @doc """
+  What `Client.HTTP` returns when the engine fails a query after it has sent
+  `200`: it closes the connection mid-response. An integer divided by zero,
+  an overflowing `abs`, a cast that cannot be performed and a bin of zero
+  width fail this way.
+  """
+  @spec closed() :: {:connection_error, Mint.TransportError.t()}
+  def closed, do: {:connection_error, %Mint.TransportError{reason: :closed}}
+
+  @doc """
+  The refusal of a computation over a number past the range of a double: the
+  engine holds it as infinity, which an Elixir float cannot be.
+  """
+  @spec nonfinite() :: t()
+  def nonfinite do
+    refusal(
+      "a number past the range of a double is infinity on the engine, which this double " <>
+        "cannot compute with"
+    )
+  end
+
+  @doc """
+  The physical planner's error for a `WHERE` whose conjuncts on `time` leave
+  no instant (`time > X AND time < X`), status 500.
+  """
+  @spec empty_range() :: t()
+  def empty_range do
+    %{
+      status: 500,
+      body:
+        "External error: unexpected: provided filters on time column did not produce a " <>
+          "valid set of boundaries"
+    }
+  end
+
+  @doc """
+  The engine's internal error for a `WHERE` that leaves a numeric column an
+  empty interval (status 500), as raised for the first conjunct of the
+  filter: a lower bound reads `lhs:Null, rhs:<type>`, an upper bound
+  `lhs:<type>, rhs:Null`, and an `=` is the `intersectable` variant with a
+  null on the left.
+  """
+  @spec interval(atom(), :int64 | :uint64 | :float64) :: t()
+  def interval(op, type) do
+    {verb, sides} =
+      case op do
+        :eq -> {"intersectable", "lhs:Null, rhs:#{interval_type(type)}"}
+        op when op in [:gt, :gte] -> {"comparable", "lhs:Null, rhs:#{interval_type(type)}"}
+        _upper -> {"comparable", "lhs:#{interval_type(type)}, rhs:Null"}
+      end
+
+    %{
+      status: 500,
+      body:
+        "Internal error: Only intervals with the same data type are #{verb}, #{sides}.\n" <>
+          "This issue was likely caused by a bug in DataFusion's code. Please help us to " <>
+          "resolve this by filing a bug report in our issue tracker: " <>
+          "https://github.com/apache/datafusion/issues"
+    }
+  end
+
+  @spec interval_type(:int64 | :uint64 | :float64) :: binary()
+  defp interval_type(:int64), do: "Int64"
+  defp interval_type(:uint64), do: "UInt64"
+  defp interval_type(:float64), do: "Float64"
+
+  @doc """
   The engine's internal error for a BETWEEN whose operand and bound have no
   common type (a type coercion error, status 500).
   """

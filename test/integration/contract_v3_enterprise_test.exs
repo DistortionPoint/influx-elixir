@@ -8,13 +8,22 @@ defmodule InfluxElixir.Integration.ContractV3EnterpriseTest do
   `ContractLocalV3EnterpriseTest`. If both pass, LocalClient is proven
   faithful to real InfluxDB v3 Enterprise.
 
-  The SQL parser and executor contracts run here too.
+  **Enterprise is unverified**: no licensed InfluxDB 3 Enterprise server is
+  available, so this module has never run against one. Its expectations are
+  those proven on Core plus what the documentation says of Enterprise (for
+  example `DELETE FROM`); treat a failure here as either a finding or a wrong
+  expectation. The token contract is not run here for the same reason.
+
+  What runs: the shared client contract and the SQL parser and executor
+  contracts.
   `InfluxElixir.Contract.InfluxQLFluxLP` does not: it generates tests for
   `:v3_core` and `:v2` only, so for `:v3_enterprise` it would run nothing.
   The `time_slack` of the context is how far, in seconds, the server's clock
   may be from this one.
   """
 
+  # async: false — shares the one real server and the globally named :integration_finch
+  # pool with the other integration modules, and its writes are timed against its clock.
   use ExUnit.Case, async: false
 
   @moduletag :v3_enterprise

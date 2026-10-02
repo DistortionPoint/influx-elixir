@@ -301,7 +301,10 @@ end
 Supported aggregate functions: `AVG`, `SUM`, `COUNT`, `COUNT(*)`, `MIN`,
 `MAX`, `STDDEV` / `STDDEV_SAMP` (sample), `STDDEV_POP`, `VAR` / `VAR_SAMP`
 (sample) and `VAR_POP`. The argument may be an arithmetic expression over
-fields and numeric literals, evaluated per row before aggregation:
+fields and numeric literals, evaluated per row before aggregation. Without
+`AS alias` a column is named as the engine names it (verified): `count(*)`,
+`avg(trades.price)`, `sum(trades.price * Int64(2))`, `Int64(1)` for a bare
+constant.
 
 ```elixir
 sql = """
@@ -682,7 +685,14 @@ A bare word is a column reference, as in SQL. A column that no row has —
 named anywhere, in `SELECT`, an aggregate, `WHERE`, `GROUP BY`, `ORDER BY` or
 `DISTINCT` — is the engine's schema error (`No field named prod`, HTTP 500)
 rather than an empty or unsorted result; the usual cause is a typo or a
-forgotten pair of quotes.
+forgotten pair of quotes. The error lists the known columns as the engine
+does: qualified by the table (`trades.price`), and for `ORDER BY` and
+`GROUP BY` with the select list's own fields first.
+
+A `time` range that is empty in the top-level `AND` (`time > X AND time < X`,
+`BETWEEN` with reversed bounds) is the engine's HTTP 500 "provided filters
+on time column did not produce a valid set of boundaries", not an empty
+result.
 
 ## WHERE Clauses
 

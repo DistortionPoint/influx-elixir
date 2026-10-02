@@ -30,7 +30,6 @@ defmodule InfluxElixir.Client.ContractLocalV3CoreTest do
     {:ok, conn} =
       Local.start(databases: ["contract_db"], profile: :v3_core)
 
-    on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn, database: "contract_db", query_delay: 0}
   end
 end

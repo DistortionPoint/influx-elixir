@@ -14,7 +14,15 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   host`: one row per bucket per host).
   """
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLLimit, SQLLiteral, SQLMask, SQLTime}
+  alias InfluxElixir.Client.Local.{
+    SQLError,
+    SQLExpr,
+    SQLLimit,
+    SQLLiteral,
+    SQLMask,
+    SQLSelect,
+    SQLTime
+  }
 
   @typedoc "`:asc` / `:desc` (nulls last / first), or a direction with explicit NULLS placement."
   @type direction :: :asc | :desc | {:asc | :desc, :nulls_first | :nulls_last}
@@ -29,14 +37,17 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
 
   @doc """
   Rewrites the positions and select aliases of the clauses in `rest`, the
-  text after the table, to the items they name. `columns` is the select list.
+  text after the table, to the items they name. `columns` is the select list;
+  `namer` gives the output name of an item without an alias, or `nil`
+  when the double cannot write it (the item then stands for itself).
   """
-  @spec resolve_references(binary(), binary()) :: {:ok, binary()} | {:error, SQLError.t()}
-  def resolve_references(columns, rest) do
+  @spec resolve_references(binary(), binary(), (binary() -> binary() | nil)) ::
+          {:ok, binary()} | {:error, SQLError.t()}
+  def resolve_references(columns, rest, namer) do
     items =
       columns
       |> SQLMask.split_commas()
-      |> Enum.map(&(&1 |> String.trim() |> select_item()))
+      |> Enum.map(&(&1 |> String.trim() |> select_item(namer)))
 
     with {:ok, rest} <- rewrite_clause(rest, @group_clause, &group_term(&1, items)) do
       rewrite_clause(rest, @order_clause, &order_term(&1, items))
@@ -44,12 +55,21 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   end
 
   # {expression, output name} of one select item.
-  @spec select_item(binary()) :: {binary(), binary()}
-  defp select_item(item) do
-    case SQLMask.run(~r/^(.+?)\s+AS\s+"?(\w+)"?$/isu, item) do
-      [_full, expr, alias_name] -> {String.trim(expr), alias_name}
-      nil -> {item, item}
+  @spec select_item(binary(), (binary() -> binary() | nil)) :: {binary(), binary()}
+  defp select_item(item, namer) do
+    case SQLSelect.split_alias(item) do
+      {expr, alias_name} when is_binary(alias_name) -> {expr, alias_name}
+      {_item, nil} -> {item, namer.(item) || item}
     end
+  end
+
+  # An output name as a term of a clause: bare when it is one word, else
+  # quoted.
+  @spec identifier_text(binary()) :: binary()
+  defp identifier_text(name) do
+    if Regex.match?(~r/\A[\p{L}_][\p{L}\p{N}_]*\z/u, name),
+      do: name,
+      else: ~s|"#{String.replace(name, ~s("), ~s(""))}"|
   end
 
   @spec rewrite_clause(binary(), Regex.t(), (binary() -> {:ok, binary()} | {:error, map()})) ::
@@ -112,11 +132,25 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
       end
 
     case positional(target, items) do
-      {:ok, {_expr, name}} -> {:ok, name <> direction}
-      :not_positional -> {:ok, term}
+      {:ok, {_expr, name}} -> {:ok, identifier_text(name) <> direction}
+      :not_positional -> {:ok, aggregate_term(target, items, direction) || term}
       error -> error
     end
   end
+
+  # An aggregate in ORDER BY that the select list also holds is that item
+  # (`ORDER BY sum(v)` after `sum(v) AS total` sorts by `total`).
+  @spec aggregate_term(binary(), [{binary(), binary()}], binary()) :: binary() | nil
+  defp aggregate_term(target, items, direction) do
+    if SQLSelect.aggregate_call?(target) do
+      Enum.find_value(items, fn {expr, name} ->
+        if squeeze(expr) == squeeze(target), do: identifier_text(name) <> direction
+      end)
+    end
+  end
+
+  @spec squeeze(binary()) :: binary()
+  defp squeeze(text), do: String.replace(text, ~r/\s+/u, "")
 
   @spec positional(binary(), [{binary(), binary()}]) ::
           {:ok, {binary(), binary()}} | :not_positional | {:error, map()}
@@ -157,17 +191,23 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   @spec date_bin_item?(binary()) :: boolean()
   defp date_bin_item?(item), do: Regex.match?(~r/^DATE_BIN\s*\(/iu, item)
 
-  # The bare-column GROUP BY items, or nil when there are none.
+  @doc """
+  The bare-column `GROUP BY` items of a statement (a quoted name as the name
+  it holds), or `nil` when there are none.
+  """
   @spec group_columns(binary()) :: [binary()] | nil
   def group_columns(sql) do
     case sql |> group_by_items() |> Enum.reject(&date_bin_item?/1) do
       [] -> nil
-      columns -> columns
+      columns -> Enum.map(columns, &SQLSelect.name/1)
     end
   end
 
-  # GROUP BY DATE_BIN is optional. Without it the executor groups by columns
-  # or produces a single scalar row; a malformed interval still surfaces.
+  @doc """
+  The `GROUP BY DATE_BIN` bucket of a statement in nanoseconds, or `nil`.
+  The `DATE_BIN` is optional: without it the executor groups by columns or
+  produces a single scalar row; a malformed interval still surfaces.
+  """
   @spec interval(binary()) ::
           {:ok, non_neg_integer() | nil} | {:error, term()}
   def interval(sql) do
@@ -189,6 +229,11 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
                        "SELECT must be in GROUP BY or an aggregate function\", or answers a " <>
                        "plain projection, which this double does not model): "
 
+  @doc """
+  Checks the `DATE_BIN`s of a select list against the `GROUP BY` bucket
+  (`group_interval`, in nanoseconds): each must be that bucket, or the double
+  refuses the query by name.
+  """
   @spec check_date_bins(binary(), non_neg_integer() | nil) :: :ok | {:error, map()}
   def check_date_bins(columns, group_interval) do
     columns
@@ -224,13 +269,14 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
     end
   end
 
-  # ORDER BY <column> [ASC|DESC]. The column is `time` or an output alias
-  # (e.g. the DATE_BIN alias); direction defaults to ASC as in SQL.
+  @doc """
+  The `ORDER BY a [ASC|DESC][, b [ASC|DESC] ...]` terms of the text after
+  the table. A target may be a column, `time`, an output alias (the
+  `DATE_BIN` alias, say) or an expression (`CAST(level AS INTEGER) DESC`); a
+  target the expression parser cannot read is left as a column name so the
+  schema check names it. The direction defaults to ascending, as in SQL.
+  """
   @spec order_by(binary()) :: order_by()
-  # `ORDER BY a [ASC|DESC][, b [ASC|DESC] ...]`; a target may be a column,
-  # an output alias or an expression (`CAST(level AS INTEGER) DESC`). A
-  # target the expression parser cannot read is left as a column name so
-  # the schema check names it.
   def order_by(rest) do
     case SQLMask.run(~r/(?i)ORDER\s+BY\s+(.+?)\s*(?:\b#{@limit_start}.*)?$/su, rest) do
       [_full_match, list] ->

@@ -17,7 +17,6 @@ defmodule InfluxElixir.Client.ProfileRejectionTest do
   describe "v3_core rejects unsupported operations" do
     setup do
       {:ok, conn} = Local.start(profile: :v3_core)
-      on_exit(fn -> Local.stop(conn) end)
       {:ok, conn: conn}
     end
 
@@ -55,7 +54,6 @@ defmodule InfluxElixir.Client.ProfileRejectionTest do
   describe "v3_enterprise rejects unsupported operations" do
     setup do
       {:ok, conn} = Local.start(profile: :v3_enterprise)
-      on_exit(fn -> Local.stop(conn) end)
       {:ok, conn: conn}
     end
 
@@ -93,7 +91,6 @@ defmodule InfluxElixir.Client.ProfileRejectionTest do
   describe "v2 rejects unsupported operations" do
     setup do
       {:ok, conn} = Local.start(profile: :v2)
-      on_exit(fn -> Local.stop(conn) end)
       {:ok, conn: conn}
     end
 

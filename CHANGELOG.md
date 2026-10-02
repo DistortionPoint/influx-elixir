@@ -8,6 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` refused aggregates and expressions without `AS`.**
+  `SELECT count(*) FROM t` now answers `[%{"count(*)" => n}]`, and every
+  unaliased item is named as the engine names it (`avg(t.v)`,
+  `sum(t.v * Int64(2))`, `Int64(1)`).
+- **Empty ranges in `Client.Local` SQL returned `[]` where the engine
+  fails.** A `time` range the top-level `AND` leaves empty is the engine's
+  500 "provided filters on time column did not produce a valid set of
+  boundaries"; an empty range on a numeric field is the engine's
+  DataFusion internal error, in its four wordings. InfluxQL still answers
+  `[]`, as the engine does.
+- **More `Client.Local` SQL answers now match InfluxDB 3 Core:**
+  - "Valid fields are" lists columns qualified by the table, with the
+    select list first for `ORDER BY` and `GROUP BY`;
+  - quoted names in the select list are columns;
+  - integer literals past UInt64 are Float64, `1e400` is null, and
+    `-(9223372036854775808)` is the engine's negation error;
+  - `abs` of the Int64 minimum closes the connection, as on the engine;
+  - an Int64 divided by a UInt64 parameter is a four-place decimal;
+  - UTC aliases (`Zulu`, `UCT`, `Etc/GMT±N`), `EST`/`MST`/`HST` and the
+    `:60` leap second are read in timestamps;
+  - `NULL = time` matches nothing, and `"r""vt"` prints as `r"vt`.
+- **InfluxQL in `Client.Local`:** `GROUP BY r, h` orders series by tag
+  key, as the engine does; a doubled sign, an integer overflow, a lone
+  `.` and a second statement after `;` give the engine's parse errors at
+  its positions.
+- **`Client.Local` locks backed off for seconds under contention.**
+  Token creation and the database limit used `:global.trans`; 16
+  concurrent creates took 4.4 s. They now use a lock key in the store
+  that a waiter clears when its holder has died.
+
 - **`Client.Local` slowed to a crawl under concurrent writes.** Eight
   writers of 2,500 lines to one series took 4.5 s, 32 took 20 s, and 50
   timed out at 60 s. A payload's points now go into the store as one
@@ -125,6 +155,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   40k points in 40k hourly groups took 8.6 s; they now take about 0.2 s.
 
 ### Changed
+- **`Client.Local` store API trimmed.** `Store.measurement?/3`,
+  `Store.store_point/3` and `InfluxQL.where_sql/2` are removed and
+  `Store.put_database/2` is private; `SQLExecutor.run/2` is
+  `run_influxql/2`.
+- **Tests compare rows strictly.** `%{"v" => 1} == %{"v" => 1.0}` is true
+  in Elixir, so contract assertions now use `===`; unique names carry the
+  wall clock so runs on a persistent server never collide; real-server
+  cleanup runs in `after`; concurrency tests start their tasks on a
+  barrier.
 - **`Client.Local`'s SQL parser is split into focused modules:**
   `SQLParser` (entry), `SQLLexer`, `SQLMask`, `SQLLiteral`, `SQLTime`,
   `SQLExpr`, `SQLSelect`, `SQLWhere`, `SQLClauses`, `SQLLimit` and

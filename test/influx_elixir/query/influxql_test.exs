@@ -7,7 +7,6 @@ defmodule InfluxElixir.Query.InfluxQLTest do
   setup do
     {:ok, conn} = Local.start(databases: ["test_db"])
     Local.write(conn, "cpu,host=web01 value=1i", database: "test_db")
-    on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn}
   end
 

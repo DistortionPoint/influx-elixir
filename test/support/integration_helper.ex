@@ -158,16 +158,18 @@ defmodule InfluxElixir.IntegrationHelper do
   end
 
   @doc """
-  Generates a unique name for test databases/measurements to avoid collisions.
+  Generates a name unique across runs: the wall-clock millisecond is part of it
+  because `System.unique_integer/1` restarts in every BEAM, so a later run
+  against the same server would otherwise reuse a name and join stale data.
 
   ## Examples
 
       iex> name = InfluxElixir.IntegrationHelper.unique_name("test_db")
-      "test_db_..." # with unique integer suffix
+      "test_db_1700000000000_42"
   """
   @spec unique_name(binary()) :: binary()
   def unique_name(prefix) do
-    "#{prefix}_#{System.unique_integer([:positive])}"
+    "#{prefix}_#{System.system_time(:millisecond)}_#{System.unique_integer([:positive])}"
   end
 
   @spec env(binary(), binary()) :: binary()

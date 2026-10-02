@@ -10,7 +10,6 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
   setup do
     {:ok, conn} = Local.start()
-    on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn}
   end
 
@@ -141,7 +140,6 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     test "forwards :write_opts to Writer.write/3 on flush" do
       # write_opts' :database wins over the writer's :database.
       {:ok, conn} = Local.start(databases: ["metrics"])
-      on_exit(fn -> Local.stop(conn) end)
 
       pid =
         start_supervised!(

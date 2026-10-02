@@ -127,16 +127,13 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
 
   # The results of every line that counts, in order. A payload's results
   # are as large as the payload, and a process heap that grows by a fraction
-  # at a time copies everything built so far at each step: parsed in the
-  # caller, 100k lines took 2-3 times as long (measured: 0.8 s against 0.3 s
-  # for lines with tags and two fields). So the lines are parsed 10k at a
-  # time, each full chunk in a short-lived process whose heap starts at
-  # 1M words and whose result is sent back once. A parsed line is 37 to 94
-  # words (measured, bare lines to lines with four tags and three fields),
-  # so 100 words a line holds a chunk without a collection. The caller's own
-  # heap and flags are never touched, only one chunk runs beside it, and a
-  # chunk ends on its own, so it cannot outlive a dead caller by more than
-  # its own parse.
+  # at a time copies everything built so far at each step, so parsing a large
+  # payload in the caller is dominated by that copying. Instead the lines are
+  # parsed a chunk at a time, each full chunk in a short-lived process whose
+  # heap starts large enough to hold the chunk's results without a
+  # collection, and whose result is sent back once. The caller's own heap and
+  # flags are never touched, only one chunk runs beside it, and a chunk ends
+  # on its own, so it cannot outlive a dead caller by more than its own parse.
   @chunk_lines 10_000
   @chunk_heap_words 1_000_000
 

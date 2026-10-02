@@ -108,6 +108,24 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
     end
   end
 
+  @doc """
+  The value of a number token (`1.5`, `.5`, `1.`, `1e5`, or digits only), read
+  as a Rust `f64` is: correctly rounded, `0.0` on underflow, and `:nonfinite`
+  past the largest double, which the engine holds as infinity.
+  """
+  @spec float_value(binary()) :: float() | :nonfinite
+  def float_value(text) do
+    normal =
+      text
+      |> String.replace(~r/^(-?)\./u, "\\g{1}0.")
+      |> String.replace(~r/\.(?=[eE]|$)/u, ".0")
+
+    case Float.parse(normal) do
+      {value, ""} -> value
+      _overflow -> :nonfinite
+    end
+  end
+
   @float_literal ~r/^-?(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+(?:\.[0-9]*)?[eE][+-]?[0-9]+)$/u
 
   @doc "Whether the text is a float literal (`1.5`, `.5`, `1e5`); an integer is not."

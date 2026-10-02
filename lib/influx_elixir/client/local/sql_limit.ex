@@ -39,11 +39,41 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
   def start_source, do: @start
 
   @doc """
-  Checks the LIMIT and OFFSET clauses of the text after the table, in the
-  order the engine does; `sql` is the statement, for a refusal.
+  Checks that the LIMIT and OFFSET clauses of the text after the table are
+  ones the double reads; `sql` is the statement, for a refusal. What the
+  engine's planner finds wrong with them is `planning_error/1`, what its
+  optimizer finds is `deferred/1`: both come after the errors of the clauses
+  before them.
   """
   @spec check(binary(), binary()) :: :ok | {:error, SQLError.t()}
   def check(rest, sql) do
+    {found, clauses} = scan(rest)
+    refusal(clauses, trailing_garbage?(found, rest), sql)
+  end
+
+  @doc """
+  The planner's error for a LIMIT or OFFSET of the text after the table that
+  is a name or a fraction, or `nil`.
+  """
+  @spec planning_error(binary()) :: SQLError.t() | nil
+  def planning_error(rest) do
+    {_found, clauses} = scan(rest)
+    error(planning(clauses))
+  end
+
+  @doc """
+  The optimizer's error for a negative LIMIT or OFFSET of the text after the
+  table, or `nil`. The optimizer finds it after `simplify_expressions` has
+  folded the `WHERE`, so a `time` string it cannot read is reported first.
+  """
+  @spec deferred(binary()) :: SQLError.t() | nil
+  def deferred(rest) do
+    {_found, clauses} = scan(rest)
+    error(optimizer(clauses))
+  end
+
+  @spec scan(binary()) :: {[{non_neg_integer(), {binary(), token()}}], [{binary(), token()}]}
+  defp scan(rest) do
     found =
       ~r/(?i)(?<![\w.])(LIMIT|OFFSET)\s+(\S+)/u
       |> Regex.scan(rest, return: :index)
@@ -53,13 +83,12 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
       end)
       |> Enum.reject(&match?({_start, {_keyword, :not_a_clause}}, &1))
 
-    clauses = Enum.map(found, &elem(&1, 1))
-
-    with :ok <- refusal(clauses, trailing_garbage?(found, rest), sql),
-         :ok <- planning(clauses) do
-      optimizer(clauses)
-    end
+    {found, Enum.map(found, &elem(&1, 1))}
   end
+
+  @spec error(:ok | {:error, SQLError.t()}) :: SQLError.t() | nil
+  defp error(:ok), do: nil
+  defp error({:error, error}), do: error
 
   @spec token(binary()) :: token()
   defp token(token) do
@@ -183,18 +212,22 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
 
   @doc """
   LIMIT and OFFSET with their `$name`s bound, checked as literals are: the
-  planner's type error, then the optimizer's negative-number error.
+  planner's type error, and the optimizer's negative-number error, which is
+  returned for the executor to raise in its place (the last element, `nil`
+  when there is none).
   """
   @spec bind(clause(), clause(), %{binary() => term()}) ::
-          {:ok, non_neg_integer() | nil, non_neg_integer() | nil} | {:error, SQLError.t()}
+          {:ok, non_neg_integer() | nil, non_neg_integer() | nil, SQLError.t() | nil}
+          | {:error, SQLError.t()}
   def bind(limit, offset, params) do
     clauses =
       for {keyword, value} <- [{"LIMIT", limit}, {"OFFSET", offset}], value != nil do
         {keyword, value_token(value, params)}
       end
 
-    with :ok <- planning(clauses), :ok <- optimizer(clauses) do
-      {:ok, bound_count(clauses, "LIMIT"), bound_count(clauses, "OFFSET")}
+    with :ok <- planning(clauses) do
+      {:ok, bound_count(clauses, "LIMIT"), bound_count(clauses, "OFFSET"),
+       error(optimizer(clauses))}
     end
   end
 

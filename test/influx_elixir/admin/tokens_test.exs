@@ -9,7 +9,6 @@ defmodule InfluxElixir.Admin.TokensTest do
 
   setup do
     {:ok, conn} = Local.start(profile: :v3_enterprise)
-    on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn}
   end
 

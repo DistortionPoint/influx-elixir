@@ -6,7 +6,6 @@ defmodule InfluxElixir.Admin.HealthTest do
 
   setup do
     {:ok, conn} = Local.start()
-    on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn}
   end
 

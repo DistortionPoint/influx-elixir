@@ -545,7 +545,7 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   defp comparison_clause(text, left, "time", trimmed) do
     op = Map.fetch!(@comparison_operators, text)
 
-    with true <- SQLLiteral.literal?(left) or SQLLiteral.param?(left),
+    with true <- SQLLiteral.literal?(left) or SQLLiteral.param?(left) or null?(left),
          {:ok, value} <- SQLTime.comparand(left) do
       {:ok, {mirror(op), "time", on_the_left(value)}}
     else
@@ -564,6 +564,9 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
     op = Map.fetch!(@comparison_operators, text)
 
     cond do
+      null?(left) ->
+        null_comparison(mirror(op), right, trimmed)
+
       SQLLiteral.literal?(left) and SQLLiteral.literal?(right) ->
         constant_comparison(op, left, right, trimmed)
 
@@ -578,6 +581,21 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
 
       true ->
         comparison(op, left, right)
+    end
+  end
+
+  @spec null?(binary()) :: boolean()
+  defp null?(text), do: String.upcase(text) == "NULL"
+
+  # `NULL = x` is unknown for every row, whatever `x` is. Against a constant
+  # that is `time` compared with NULL; against a column the comparison
+  # turned around.
+  @spec null_comparison(op(), binary(), binary()) :: {:ok, clause()} | {:error, map()}
+  defp null_comparison(op, right, trimmed) do
+    cond do
+      SQLLiteral.literal?(right) or null?(right) -> {:ok, {:eq, "time", nil}}
+      SQLLiteral.param?(right) -> unsupported_where(trimmed)
+      true -> comparison(op, right, "NULL")
     end
   end
 

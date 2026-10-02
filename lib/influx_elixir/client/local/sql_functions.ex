@@ -42,12 +42,21 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   Evaluates a call the planner has accepted (`check/3`), its arguments
   already evaluated: numbers, or `nil`, which makes the result `nil`.
   """
-  @spec call(name(), [number() | nil]) :: number() | nil
+  @spec call(name(), [number() | nil | :nonfinite]) :: number() | nil
   def call(name, args) do
-    if Enum.any?(args, &is_nil/1), do: nil, else: compute(name, args)
+    cond do
+      :nonfinite in args -> throw({:query_error, SQLError.nonfinite()})
+      Enum.any?(args, &is_nil/1) -> nil
+      true -> compute(name, args)
+    end
   end
 
+  @int64_min -9_223_372_036_854_775_808
+
   @spec compute(name(), [number()]) :: number() | nil
+  # The magnitude of the `Int64` minimum overflows, whether the engine folds
+  # a constant or reads a column (verified): it closes the connection.
+  defp compute(:abs, [@int64_min]), do: throw({:query_error, SQLError.closed()})
   defp compute(:abs, [x]), do: Kernel.abs(x)
   defp compute(:round, [x]), do: round_away(x)
   defp compute(:round, [x, 0]), do: round_away(x)
@@ -234,9 +243,10 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   when it cannot be known.
   """
   @spec type_of(SQLParser.expr(), %{binary() => binary()}) :: binary() | nil
-  def type_of({:field, name}, columns), do: Map.get(columns, name)
+  def type_of({:field, ref}, columns), do: Map.get(columns, ref)
   def type_of({:lit, value}, _columns) when is_integer(value), do: "Int64"
   def type_of({:lit, value}, _columns) when is_float(value), do: "Float64"
+  def type_of({:lit, :nonfinite}, _columns), do: "Float64"
   def type_of({:lit, value}, _columns) when is_binary(value), do: "Utf8"
   def type_of({:lit, value}, _columns) when is_boolean(value), do: "Boolean"
   def type_of({:uint, _value}, _columns), do: "UInt64"

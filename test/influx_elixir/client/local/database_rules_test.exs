@@ -65,7 +65,6 @@ defmodule InfluxElixir.Client.Local.DatabaseRulesTest do
   describe "the rules through Client.Local" do
     setup do
       {:ok, conn} = Local.start(databases: ~w(a b c d))
-      on_exit(fn -> Local.stop(conn) end)
       {:ok, conn: conn}
     end
 

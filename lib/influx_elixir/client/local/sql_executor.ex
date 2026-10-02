@@ -17,7 +17,9 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   alias InfluxElixir.Client.Local.{
     Format,
     LineProtocolParser,
+    SQLBounds,
     SQLError,
+    SQLExpr,
     SQLFunctions,
     SQLLiteral,
     SQLParser,
@@ -34,13 +36,18 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @typedoc "Fetches a measurement's points, or `:error` when there is no such measurement."
   @type fetch :: (binary() -> {:ok, [point()]} | :error)
 
+  @typedoc """
+  Looks up a stored column's kind from its measurement and name: the
+  `iox::column_type::field::<type>` the store registered, or `nil`.
+  """
+  @type kinds :: (binary(), binary() -> binary() | nil)
+
+  @int64_min -9_223_372_036_854_775_808
+  @int64_max 9_223_372_036_854_775_807
+  @two_64 18_446_744_073_709_551_616
+
   # The order an ascending sort (and `first_value`/`last_value`) puts nulls in.
   @ascending {:asc, :nulls_last}
-
-  @doc false
-  @spec nanoseconds_to_datetime(integer() | nil) :: DateTime.t() | nil
-  def nanoseconds_to_datetime(nil), do: nil
-  def nanoseconds_to_datetime(ns), do: DateTime.from_unix!(ns, :nanosecond)
 
   # CTEs run first, in order, each over the store or an earlier CTE; their
   # rows become the points the next query reads (a CTE shadows a measurement
@@ -49,62 +56,100 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   Runs a parsed query. `fetch` returns a measurement's points, or `:error`
   when the measurement does not exist; CTEs shadow it by name. `params` are
   the engine's values for the query's `$name` placeholders (see
-  `InfluxElixir.Client.QueryParams.engine_values/1`).
+  `InfluxElixir.Client.QueryParams.engine_values/1`). `kinds` tells an
+  `Int64` column from a `UInt64` one, which the stored integers do not; a
+  query that runs without it reads every integer column as `Int64`.
+
+  This is the engine's SQL: a `WHERE` that leaves a numeric column no value
+  fails as it does there (see `InfluxElixir.Client.Local.SQLBounds`).
   """
-  @spec run(SQLParser.parsed_query(), fetch(), %{binary() => term()}) ::
+  @spec run(SQLParser.parsed_query(), fetch(), %{binary() => term()}, kinds() | nil) ::
           [map()] | {:error, term()}
-  def run(query, fetch, params \\ %{}) do
+  def run(query, fetch, params, kinds \\ nil), do: run_query(query, fetch, params, kinds)
+
+  @doc """
+  Runs the SQL that an InfluxQL query is written as. The engine's InfluxQL
+  planner does not fail on a `WHERE` that leaves a numeric column no value
+  (verified: it answers `[]`), so that failure is not raised here.
+  """
+  @spec run_influxql(SQLParser.parsed_query(), fetch()) :: [map()] | {:error, term()}
+  def run_influxql(query, fetch), do: run_query(query, fetch, %{}, :unchecked)
+
+  @spec run_query(
+          SQLParser.parsed_query(),
+          fetch(),
+          %{binary() => term()},
+          kinds() | nil | :unchecked
+        ) :: [map()] | {:error, term()}
+  defp run_query(query, fetch, params, kinds) do
     query.ctes
     |> Enum.reduce_while({:ok, %{}}, fn {name, cte_query}, {:ok, sources} ->
-      case select(cte_query, fetch, sources, params) do
+      case select(cte_query, fetch, sources, params, kinds) do
         {:error, _reason} = error ->
           {:halt, error}
 
-        {:ok, rows, source} ->
-          columns = output_columns(cte_query, source)
-          {:cont, {:ok, Map.put(sources, name, rows_to_points(name, rows, columns))}}
+        {:ok, rows, relations} ->
+          columns = output_columns(cte_query, relations)
+          cte = cte_source(name, rows, columns, cte_query, sources)
+          {:cont, {:ok, Map.put(sources, name, cte)}}
       end
     end)
     |> case do
-      {:ok, sources} -> execute_select(query, fetch, sources, params)
+      {:ok, sources} -> execute_select(query, fetch, sources, params, kinds)
       {:error, _reason} = error -> error
     end
   end
+
+  # What a query reads from: its points; its columns in order when it is a
+  # CTE (a table's are its points', sorted); and whether a filter above it
+  # reaches the table underneath (it does not cross an aggregate or a LIMIT).
+  @typep source :: %{points: [point()], columns: [binary()] | nil, pushdown: boolean()}
+
+  # One relation of a `FROM`, as the schema check and the engine's "Valid
+  # fields" list see it: the name its columns are qualified with.
+  @typep relation :: %{qualifier: binary(), points: [point()], columns: [binary()] | nil}
 
   @spec execute_select(
           SQLParser.parsed_query(),
           fetch(),
-          %{binary() => [point()]},
-          %{binary() => term()}
+          %{binary() => source()},
+          %{binary() => term()},
+          kinds() | nil | :unchecked
         ) :: [map()] | {:error, term()}
-  defp execute_select(query, fetch, cte_sources, params) do
-    case select(query, fetch, cte_sources, params) do
-      {:ok, rows, _source} -> rows
+  defp execute_select(query, fetch, sources, params, kinds) do
+    case select(query, fetch, sources, params, kinds) do
+      {:ok, rows, _relations} -> rows
       {:error, _reason} = error -> error
     end
   end
 
-  # The rows, with the points they were read from (after any join, before
+  # The rows, with the relations they were read from (after any join, before
   # WHERE): a CTE has the schema of its source, not of the rows it kept. The
   # engine finds a missing table or column first, then the placeholders
-  # without a value, then the type errors, and last what its optimizer finds
-  # folding a constant (a `time` string it cannot read).
+  # without a value, then the type errors, then what its optimizer finds
+  # folding a constant (a `time` string it cannot read, a negative LIMIT),
+  # and last, planning the scan, a `WHERE` that leaves no instant of `time`.
   @spec select(
           SQLParser.parsed_query(),
           fetch(),
-          %{binary() => [point()]},
-          %{binary() => term()}
-        ) :: {:ok, [map()], [point()]} | {:error, term()}
-  defp select(%{measurement: m} = query, fetch, cte_sources, params) do
-    with {:ok, points} <- source_points(fetch, m, cte_sources),
-         {:ok, joined} <- cross_join(fetch, points, query, cte_sources),
-         :ok <- check_query_columns(joined, query),
+          %{binary() => source()},
+          %{binary() => term()},
+          kinds() | nil | :unchecked
+        ) :: {:ok, [map()], [relation()]} | {:error, term()}
+  defp select(%{measurement: m} = query, fetch, sources, params, kinds) do
+    with {:ok, source} <- source(fetch, m, sources),
+         {:ok, joined, relations} <- cross_join(fetch, source, query, sources),
+         :ok <- check_query_columns(relations, query),
+         :ok <- plan_error(query),
          {:ok, query} <- SQLParser.bind(query, params),
          :ok <- check_plan(joined, query),
          :ok <- check_grouping_columns(query),
          :ok <- SQLTime.first_invalid(query.where),
+         :ok <- limit_error(query),
+         :ok <- check_time_range(query, source.pushdown),
+         :ok <- check_value_range(query, joined, sources, kinds),
          {:ok, filtered} <- apply_where(joined, query.where) do
-      {:ok, query_rows(filtered, query), joined}
+      {:ok, query_rows(filtered, query), relations}
     else
       :error -> {:error, table_not_found(m)}
       {:error, _reason} = error -> error
@@ -115,6 +160,204 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     # engine's error here.
     {:query_error, error} -> {:error, error}
   end
+
+  @spec plan_error(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
+  defp plan_error(%{plan_error: nil}), do: :ok
+  defp plan_error(%{plan_error: error}), do: {:error, error}
+
+  @spec limit_error(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
+  defp limit_error(%{limit_error: nil}), do: :ok
+  defp limit_error(%{limit_error: error}), do: {:error, error}
+
+  # The scan's time range is the intersection of the comparisons of `time`
+  # among the top-level conjuncts of the `WHERE`. When they leave no instant
+  # (`time > X AND time < X`, `BETWEEN` with its bounds reversed, adjacent
+  # exclusive bounds: an open range holds nothing between two consecutive
+  # nanoseconds) the planner fails the query (verified). What the optimizer
+  # settles first is not an error: two different instants that `time` equals,
+  # an instant it both equals and differs from, `time IS NULL`, a constant
+  # false. An `OR` hides its branches, a `NOT` is pushed in, a bound that is
+  # NULL says nothing, and `now()` is one instant for the whole statement.
+  # A `LIMIT 0` plans no scan, and a filter on a CTE that aggregates or
+  # limits does not reach the table.
+  @spec check_time_range(SQLParser.parsed_query(), boolean()) :: :ok | {:error, SQLError.t()}
+  defp check_time_range(%{limit: 0}, _pushdown), do: :ok
+  defp check_time_range(_query, false), do: :ok
+
+  defp check_time_range(query, true) do
+    cond do
+      not empty_time_range?(query.where) ->
+        :ok
+
+      query.cross_join ->
+        {:error,
+         SQLError.refusal(
+           "a CROSS JOIN whose WHERE leaves no instant of time: the engine's answer depends " <>
+             "on where it pushes the filter"
+         )}
+
+      true ->
+        {:error, SQLError.empty_range()}
+    end
+  end
+
+  # A `WHERE` whose top-level comparisons leave a numeric column no value
+  # fails in the engine's interval analysis (see `SQLBounds`). A `LIMIT 0`
+  # plans no scan.
+  @spec check_value_range(
+          SQLParser.parsed_query(),
+          [point()],
+          %{binary() => source()},
+          kinds() | nil | :unchecked
+        ) ::
+          :ok | {:error, SQLError.t()}
+  defp check_value_range(_query, _points, _sources, :unchecked), do: :ok
+  defp check_value_range(%{limit: 0}, _points, _sources, _kinds), do: :ok
+  defp check_value_range(%{where: []}, _points, _sources, _kinds), do: :ok
+
+  defp check_value_range(query, points, sources, kinds) do
+    tables = [query.measurement | List.wrap(query.cross_join && elem(query.cross_join, 0))]
+    type_of = &bound_type(&1, points, tables, kinds)
+    SQLBounds.check(query.where, type_of, cte: is_map_key(sources, query.measurement))
+  end
+
+  # What the interval analysis reads a column as: a float by its values, an
+  # integer by the kind the store registered, anything else (a tag, a text
+  # or boolean field) as `:other`.
+  @spec bound_type(binary(), [point()], [binary()], kinds() | nil) ::
+          SQLBounds.column_type() | nil
+  defp bound_type(column, points, tables, kinds) do
+    if Enum.any?(points, &is_map_key(&1.tags, column)) do
+      :other
+    else
+      case Enum.find_value(points, &present(&1.fields, column)) do
+        nil -> nil
+        {value} when is_float(value) -> :float64
+        {value} when is_integer(value) -> integer_type(column, tables, kinds)
+        {_text_or_boolean} -> :other
+      end
+    end
+  end
+
+  # `{value}` for a value the point has (a `false` included), else `nil`.
+  @spec present(map(), binary()) :: {term()} | nil
+  defp present(fields, column) do
+    case fields do
+      %{^column => nil} -> nil
+      %{^column => value} -> {value}
+      _missing -> nil
+    end
+  end
+
+  @spec integer_type(binary(), [binary()], kinds() | nil) :: :int64 | :uint64
+  defp integer_type(_column, _tables, nil), do: :int64
+
+  defp integer_type(column, tables, kinds) do
+    case Enum.find_value(tables, &kinds.(&1, column)) do
+      "iox::column_type::field::uinteger" -> :uint64
+      _integer -> :int64
+    end
+  end
+
+  @negations %{
+    gt: :lte,
+    gte: :lt,
+    lt: :gte,
+    lte: :gt,
+    eq: :ne,
+    ne: :eq,
+    between: :not_between,
+    not_between: :between,
+    in: :not_in,
+    not_in: :in,
+    is_null: :is_not_null,
+    is_not_null: :is_null
+  }
+
+  @spec empty_time_range?([SQLParser.where_node()]) :: boolean()
+  defp empty_time_range?(where) do
+    leaves = positive_leaves(where)
+    now = Store.now_ns()
+    constraints = Enum.flat_map(leaves, &time_constraints(&1, now))
+    equal = for {:eq, instant} <- constraints, do: instant
+    different = for {:ne, instant} <- constraints, do: instant
+
+    cond do
+      :never in leaves -> false
+      Enum.any?(leaves, &match?({:is_null, "time", _nil}, &1)) -> false
+      length(Enum.uniq(equal)) > 1 -> false
+      Enum.any?(equal, &(&1 in different)) -> false
+      true -> bounds_empty?(constraints, equal)
+    end
+  end
+
+  # The inclusive instants the bounds allow, `time = x` being both.
+  @spec bounds_empty?([{atom(), integer()}], [integer()]) :: boolean()
+  defp bounds_empty?(constraints, equal) do
+    lows = equal ++ for {:lo, instant} <- constraints, do: instant
+    highs = equal ++ for {:hi, instant} <- constraints, do: instant
+
+    lows != [] and highs != [] and Enum.max(lows) > Enum.min(highs)
+  end
+
+  # The conjuncts of a conjunction, a `NOT` pushed in as the optimizer does:
+  # a predicate, `:never` for a constant false, `:opaque` for what hides the
+  # conjuncts (an `OR`, a `NOT` of several).
+  @spec positive_leaves([SQLParser.where_node()]) :: [term()]
+  defp positive_leaves(nodes), do: Enum.flat_map(nodes, &positive/1)
+
+  defp positive({:or, []}), do: [:never]
+  defp positive({:or, _branches}), do: [:opaque]
+  defp positive({:not, nodes}), do: negated_all(nodes)
+  defp positive(clause), do: [clause]
+
+  # NOT (a AND b ...)
+  @spec negated_all([SQLParser.where_node()]) :: [term()]
+  defp negated_all([]), do: [:never]
+  defp negated_all([node]), do: negated(node)
+  defp negated_all(_nodes), do: [:opaque]
+
+  # NOT node
+  @spec negated(SQLParser.where_node()) :: [term()]
+  defp negated({:or, []}), do: []
+  defp negated({:or, branches}), do: Enum.flat_map(branches, &negated_all/1)
+  defp negated({:not, nodes}), do: positive_leaves(nodes)
+
+  defp negated({op, "time", value}) when is_map_key(@negations, op),
+    do: [{Map.fetch!(@negations, op), "time", value}]
+
+  defp negated(_clause), do: [:opaque]
+
+  @spec time_constraints(term(), integer()) :: [{atom(), integer()}]
+  defp time_constraints({op, "time", value}, now) when op in [:gt, :gte, :lt, :lte, :eq, :ne] do
+    case instant(value, now) do
+      nil -> []
+      ns -> [bound(op, ns)]
+    end
+  end
+
+  defp time_constraints({:between, "time", {low, high}}, now),
+    do: time_constraints({:gte, "time", low}, now) ++ time_constraints({:lte, "time", high}, now)
+
+  defp time_constraints({:in, "time", [value]}, now),
+    do: time_constraints({:eq, "time", value}, now)
+
+  defp time_constraints({:not_in, "time", [value]}, now),
+    do: time_constraints({:ne, "time", value}, now)
+
+  defp time_constraints(_leaf, _now), do: []
+
+  @spec bound(atom(), integer()) :: {atom(), integer()}
+  defp bound(:gt, ns), do: {:lo, ns + 1}
+  defp bound(:gte, ns), do: {:lo, ns}
+  defp bound(:lt, ns), do: {:hi, ns - 1}
+  defp bound(:lte, ns), do: {:hi, ns}
+  defp bound(op, ns), do: {op, ns}
+
+  @spec instant(term(), integer()) :: integer() | nil
+  defp instant(ns, _now) when is_integer(ns), do: ns
+  defp instant({:now, offset}, now), do: now + offset
+  defp instant(_null_or_unread, _now), do: nil
 
   @spec query_rows([point()], SQLParser.parsed_query()) :: [map()]
   defp query_rows(points, query) do
@@ -137,14 +380,43 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end
   end
 
-  @spec source_points(fetch(), binary(), %{binary() => [point()]}) ::
-          {:ok, [point()]} | :error
-  defp source_points(fetch, measurement, cte_sources) do
-    case Map.fetch(cte_sources, measurement) do
-      {:ok, points} -> {:ok, points}
-      :error -> fetch.(measurement)
+  @spec nanoseconds_to_datetime(integer() | nil) :: DateTime.t() | nil
+  defp nanoseconds_to_datetime(nil), do: nil
+  defp nanoseconds_to_datetime(ns), do: DateTime.from_unix!(ns, :nanosecond)
+
+  @spec source(fetch(), binary(), %{binary() => source()}) :: {:ok, source()} | :error
+  defp source(fetch, measurement, sources) do
+    case Map.fetch(sources, measurement) do
+      {:ok, cte} ->
+        {:ok, cte}
+
+      :error ->
+        with {:ok, points} <- fetch.(measurement),
+             do: {:ok, %{points: points, columns: nil, pushdown: true}}
     end
   end
+
+  @spec cte_source(binary(), [map()], [binary()] | nil, SQLParser.parsed_query(), map()) ::
+          source()
+  defp cte_source(name, rows, columns, query, sources) do
+    below =
+      case Map.fetch(sources, query.measurement) do
+        {:ok, %{pushdown: pushdown}} -> pushdown
+        :error -> true
+      end
+
+    %{
+      points: rows_to_points(name, rows, columns || []),
+      columns: columns,
+      pushdown:
+        below and is_nil(query.select_columns) and is_nil(query.limit) and
+          is_nil(query.offset)
+    }
+  end
+
+  @spec relation(binary(), source()) :: relation()
+  defp relation(qualifier, source),
+    do: %{qualifier: qualifier, points: source.points, columns: source.columns}
 
   # `FROM w CROSS JOIN ref`: every left point paired with every right point,
   # the right side's columns merged in as fields. Qualifiers are dropped
@@ -155,29 +427,32 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # on the engine. `SELECT *` would return each shared column twice, which
   # a row map cannot hold, so that is refused by name. Both sides carry
   # `time`. Rows are the left side's measurement and timestamp.
-  @spec cross_join(fetch(), [point()], SQLParser.parsed_query(), %{binary() => [point()]}) ::
-          {:ok, [point()]} | {:error, term()}
-  defp cross_join(_fetch, points, %{cross_join: nil}, _cte_sources), do: {:ok, points}
+  @spec cross_join(fetch(), source(), SQLParser.parsed_query(), %{binary() => source()}) ::
+          {:ok, [point()], [relation()]} | {:error, term()}
+  defp cross_join(_fetch, source, %{cross_join: nil} = query, _sources),
+    do: {:ok, source.points, [relation(query.qualifier, source)]}
 
-  defp cross_join(fetch, points, %{cross_join: {right_name, _aliases}} = query, cte_sources) do
-    with {:ok, right_points} <- fetch_source(fetch, right_name, cte_sources),
-         :ok <- check_join_collisions(points, right_points, query) do
-      {:ok,
-       for left <- points, right <- right_points do
-         %{
-           left
-           | tags: Map.merge(left.tags, right.tags),
-             fields: Map.merge(left.fields, right.fields)
-         }
-       end}
+  defp cross_join(fetch, source, %{cross_join: {right_name, names}} = query, sources) do
+    with {:ok, right} <- fetch_source(fetch, right_name, sources),
+         :ok <- check_join_collisions(source.points, right.points, query) do
+      joined =
+        for left <- source.points, right_point <- right.points do
+          %{
+            left
+            | tags: Map.merge(left.tags, right_point.tags),
+              fields: Map.merge(left.fields, right_point.fields)
+          }
+        end
+
+      {:ok, joined, [relation(query.qualifier, source), relation(List.last(names), right)]}
     end
   end
 
-  @spec fetch_source(fetch(), binary(), %{binary() => [point()]}) ::
-          {:ok, [point()]} | {:error, term()}
-  defp fetch_source(fetch, name, cte_sources) do
-    case source_points(fetch, name, cte_sources) do
-      {:ok, points} -> {:ok, points}
+  @spec fetch_source(fetch(), binary(), %{binary() => source()}) ::
+          {:ok, source()} | {:error, term()}
+  defp fetch_source(fetch, name, sources) do
+    case source(fetch, name, sources) do
+      {:ok, source} -> {:ok, source}
       :error -> {:error, table_not_found(name)}
     end
   end
@@ -187,7 +462,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp check_join_collisions(left, right, query) do
     right_columns = right |> point_columns() |> maybe_add_time(right)
     shared = MapSet.intersection(left |> point_columns() |> maybe_add_time(left), right_columns)
-    references = where_refs(query.where) ++ referenced_columns(query)
+    references = Enum.map(clause_refs(query), &elem(&1, 1))
 
     cond do
       MapSet.size(shared) == 0 ->
@@ -242,38 +517,184 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # ("No field named prod"), not an empty or unsorted result. The usual
   # cause is a typo or a forgotten pair of quotes around a string literal.
   # With no rows the schema is unknown, so nothing is checked.
-  @spec check_query_columns([point()], SQLParser.parsed_query()) :: :ok | {:error, term()}
-  defp check_query_columns([], _query), do: :ok
+  @spec check_query_columns([relation()], SQLParser.parsed_query()) :: :ok | {:error, term()}
+  defp check_query_columns(relations, query) do
+    refs = clause_refs(query)
 
-  defp check_query_columns([first | _rest] = points, query) do
-    # Almost every query names only columns the first row has, so that row
-    # answers first; the full scan (every row's columns) runs only when a
-    # name is missing there, which is also when the error message needs it.
-    first_row_columns = first |> point_columns_of() |> MapSet.put("time")
+    if refs == [] or Enum.any?(relations, &unknown_schema?/1) do
+      :ok
+    else
+      # Almost every query names only columns the first row has, so that row
+      # answers first; the full scan (every row's columns) runs only when a
+      # name is missing there, which is also when the error message needs it.
+      quick =
+        relations
+        |> Enum.map(&quick_columns/1)
+        |> Enum.reduce(MapSet.new(), &MapSet.union/2)
 
-    case Enum.reject(referenced_columns(query), &MapSet.member?(first_row_columns, &1)) do
-      [] -> :ok
-      candidates -> check_against_all_rows(points, candidates)
+      if Enum.all?(refs, fn {_clause, ref} -> known?(ref, quick) end),
+        do: :ok,
+        else: check_against_all_rows(relations, query, refs)
     end
   end
 
-  @spec check_against_all_rows([point()], [binary()]) :: :ok | {:error, term()}
-  defp check_against_all_rows(points, candidates) do
-    known = points |> point_columns() |> MapSet.put("time")
+  @spec unknown_schema?(relation()) :: boolean()
+  defp unknown_schema?(%{columns: nil, points: []}), do: true
+  defp unknown_schema?(_relation), do: false
 
-    case Enum.reject(candidates, &MapSet.member?(known, &1)) do
-      [] ->
-        :ok
+  @spec quick_columns(relation()) :: MapSet.t(binary())
+  defp quick_columns(%{columns: columns}) when is_list(columns), do: MapSet.new(columns)
 
-      [missing | _rest] ->
-        {:error,
-         %{
-           status: 500,
-           body:
-             "Schema error: No field named #{SQLLiteral.render_identifier(missing)}. Valid fields are " <>
-               Enum.join(Enum.sort(known), ", ") <> "."
-         }}
+  defp quick_columns(%{points: [first | _rest]}),
+    do: first |> point_columns_of() |> MapSet.put("time")
+
+  # A reference to a relation the query does not have is never a column.
+  @spec known?(SQLExpr.column_ref(), MapSet.t(binary())) :: boolean()
+  defp known?(ref, columns) when is_binary(ref), do: MapSet.member?(columns, ref)
+  defp known?(_qualified, _columns), do: false
+
+  @spec check_against_all_rows([relation()], SQLParser.parsed_query(), [{clause(), term()}]) ::
+          :ok | {:error, term()}
+  defp check_against_all_rows(relations, query, refs) do
+    listed = Enum.map(relations, &{&1.qualifier, full_columns(&1)})
+    known = listed |> Enum.flat_map(&elem(&1, 1)) |> MapSet.new()
+
+    case Enum.find(refs, fn {_clause, ref} -> not known?(ref, known) end) do
+      nil -> :ok
+      {clause, ref} -> {:error, no_field(ref, clause, query, listed)}
     end
+  end
+
+  # A CTE's columns are as it declared them; a table's are every column any
+  # of its rows has, sorted as the engine's schema is (byte order).
+  @spec full_columns(relation()) :: [binary()]
+  defp full_columns(%{columns: columns}) when is_list(columns), do: columns
+
+  defp full_columns(%{points: points}),
+    do: points |> point_columns() |> MapSet.put("time") |> Enum.sort()
+
+  # The clauses a reference stands in, in the order the engine plans them:
+  # WHERE, the select list, ORDER BY, GROUP BY, DISTINCT ON. The select list
+  # and WHERE see the table's fields; the later clauses see the select
+  # list's output as well.
+  @typep clause :: :where | :select | :order | :group | :on
+
+  @spec no_field(SQLExpr.column_ref(), clause(), SQLParser.parsed_query(), [
+          {binary(), [binary()]}
+        ]) :: map()
+  defp no_field(ref, clause, query, listed) do
+    fields = Enum.flat_map(listed, fn {qualifier, columns} -> qualify(qualifier, columns) end)
+
+    # Under DISTINCT ON an ORDER BY term is resolved against the table, so
+    # an output name there lists the table's fields alone (verified).
+    output_name? = query.distinct_on != nil and ref in output_names(query)
+
+    valid =
+      if clause in [:order, :group, :on] and not output_name?,
+        do: projection_fields(query, listed) ++ fields,
+        else: fields
+
+    printed = printed(ref, query.qualified)
+
+    body =
+      Enum.join(
+        ["Schema error: No field named #{printed}." | case_hint(ref, printed, listed)] ++
+          ["Valid fields are #{Enum.join(valid, ", ")}."],
+        " "
+      )
+
+    %{status: 500, body: body}
+  end
+
+  # The name as the query wrote it: a column written with its relation
+  # (`t.nosuch`) is named with it.
+  @spec printed(SQLExpr.column_ref(), %{binary() => binary()}) :: binary()
+  defp printed(ref, qualified) when is_binary(ref) do
+    case Map.fetch(qualified, ref) do
+      {:ok, relation} ->
+        SQLLiteral.render_identifier(relation) <> "." <> SQLLiteral.render_identifier(ref)
+
+      :error ->
+        SQLExpr.ref_text(ref)
+    end
+  end
+
+  defp printed(ref, _qualified), do: SQLExpr.ref_text(ref)
+
+  # A qualified name that would resolve if its case were folded gets the
+  # engine's pointer to quoting (verified).
+  @spec case_hint(SQLExpr.column_ref(), binary(), [{binary(), [binary()]}]) :: [binary()]
+  defp case_hint({:qualified, qualifier, column}, printed, listed) do
+    {relation, name} = {unquoted(qualifier), unquoted(column)}
+
+    folded? =
+      Enum.any?(listed, fn {qualifier, columns} ->
+        String.downcase(qualifier) == String.downcase(relation) and
+          Enum.any?(columns, &(String.downcase(&1) == String.downcase(name)))
+      end)
+
+    if folded?,
+      do: [
+        "Column names are case sensitive. You can use double quotes to refer to the " <>
+          "\"#{printed}\" column or set the datafusion.sql_parser.enable_ident_normalization " <>
+          "configuration."
+      ],
+      else: []
+  end
+
+  defp case_hint(_name, _printed, _listed), do: []
+
+  @spec unquoted(binary()) :: binary()
+  defp unquoted(text) do
+    if SQLLiteral.identifier?(text), do: SQLLiteral.identifier_name(text), else: text
+  end
+
+  @spec qualify(binary(), [binary()]) :: [binary()]
+  defp qualify(qualifier, columns),
+    do: Enum.map(columns, &field_text(qualifier, &1))
+
+  @spec field_text(binary(), binary()) :: binary()
+  defp field_text(qualifier, column),
+    do: SQLLiteral.render_identifier(qualifier) <> "." <> SQLLiteral.render_identifier(column)
+
+  # The select list's output fields as the engine lists them: a column
+  # qualified by its relation, anything else (an alias, an expression, an
+  # aggregate) by its name alone; `*` is every field.
+  @spec projection_fields(SQLParser.parsed_query(), [{binary(), [binary()]}]) :: [binary()]
+  defp projection_fields(query, listed) do
+    cond do
+      query.distinct_columns ->
+        Enum.map(query.distinct_columns, &holder_field(&1, listed))
+
+      query.select_columns ->
+        Enum.map(query.select_columns, &select_field(&1, listed))
+
+      query.projection_columns ->
+        Enum.map(query.projection_columns, &projected_field(&1, listed))
+
+      true ->
+        Enum.flat_map(listed, fn {qualifier, columns} -> qualify(qualifier, columns) end)
+    end
+  end
+
+  @spec select_field(SQLParser.select_column(), [{binary(), [binary()]}]) :: binary()
+  defp select_field({:grouping_column, source, source}, listed), do: holder_field(source, listed)
+
+  defp select_field(column, _listed),
+    do: SQLLiteral.render_identifier(elem(column, tuple_size(column) - 1))
+
+  @spec projected_field(SQLParser.projection(), [{binary(), [binary()]}]) :: binary()
+  defp projected_field({source, source}, listed) when is_binary(source),
+    do: holder_field(source, listed)
+
+  defp projected_field({_source, output}, _listed), do: SQLLiteral.render_identifier(output)
+
+  @spec holder_field(binary(), [{binary(), [binary()]}]) :: binary()
+  defp holder_field(column, listed) do
+    {qualifier, _columns} =
+      Enum.find(listed, hd(listed), fn {_qualifier, columns} -> column in columns end)
+
+    field_text(qualifier, column)
   end
 
   # The engine checks an expression's types when it plans the query, so a
@@ -411,7 +832,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
       when is_binary(left_type) and is_binary(right_type) and
              not (is_numeric_type(left_type) and is_numeric_type(right_type)) ->
         planning_error(
-          "Cannot coerce arithmetic expression #{left_type} #{operator(op)} #{right_type} " <>
+          "Cannot coerce arithmetic expression #{left_type} #{SQLExpr.symbol(op)} #{right_type} " <>
             "to valid types",
           context
         )
@@ -424,10 +845,10 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec check_negation(SQLParser.expr(), %{binary() => binary()}) :: :ok | {:error, map()}
   defp check_negation(inner, columns) do
     case SQLFunctions.type_of(inner, columns) do
-      type when type in [nil, "Timestamp(ns)"] or is_numeric_type(type) ->
+      type when type in [nil, "Timestamp(ns)", "Int64", "Float64"] ->
         :ok
 
-      _not_numeric ->
+      _not_signed ->
         planning_error("Negation only supports numeric, interval and timestamp types", :select)
     end
   end
@@ -528,10 +949,6 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     do: boolean_mismatch?(column, type)
 
   defp boolean_mismatch_with?(_column, _null_or_unknown), do: false
-
-  @spec operator(atom()) :: binary()
-  defp operator(:rem), do: "%"
-  defp operator(op), do: Atom.to_string(op)
 
   # In WHERE and ORDER BY the planner's message is wrapped by the type
   # coercion pass; in the select list it is not.
@@ -669,7 +1086,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           status: 400,
           body:
             "Error during planning: Column in SELECT must be in GROUP BY or an aggregate " <>
-              "function: While expanding wildcard, column \"#{query.measurement}.#{column}\" " <>
+              "function: While expanding wildcard, column \"#{query.qualifier}.#{column}\" " <>
               "must appear in the GROUP BY clause or must be part of an aggregate function, " <>
               "currently only \"#{Enum.join(terms, ", ")}\" appears in the SELECT clause " <>
               "satisfies this requirement"
@@ -687,7 +1104,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @day_ns 86_400_000_000_000
 
   @spec satisfying_terms(SQLParser.parsed_query()) :: {:ok, [binary()]} | :unrenderable
-  defp satisfying_terms(%{cross_join: nil, measurement: table} = query) do
+  defp satisfying_terms(%{cross_join: nil, qualifier: table} = query) do
     columns = Enum.map(query.group_by_columns || [], &"#{table}.#{&1}")
 
     with {:ok, groups} <- group_terms(query.group_by_interval, columns, table),
@@ -731,7 +1148,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     do: "count(DISTINCT #{table}.#{column})"
 
   defp aggregate_term({:aggregate, agg, expr, _alias}, table) do
-    "#{agg}(#{render_expr(expr, table)})"
+    "#{agg}(#{SQLExpr.render(expr, table, :refuse)})"
   catch
     :unrenderable -> :unrenderable
   end
@@ -747,33 +1164,12 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   defp aggregate_term(_group_or_constant, _table), do: nil
 
-  # An expression as the planner prints it: columns qualified, literals with
-  # their type, operators infix and unparenthesised.
-  @spec render_expr(SQLParser.expr(), binary()) :: binary()
-  defp render_expr({:field, name}, table), do: "#{table}.#{name}"
-  defp render_expr({:lit, value}, _table) when is_integer(value), do: "Int64(#{value})"
-
-  defp render_expr({:lit, value}, _table) when is_float(value),
-    do: "Float64(#{Format.render_decimal(value)})"
-
-  defp render_expr({:lit, value}, _table) when is_binary(value), do: ~s|Utf8("#{value}")|
-
-  defp render_expr({:op, op, left, right}, table),
-    do: "#{render_expr(left, table)} #{operator(op)} #{render_expr(right, table)}"
-
-  defp render_expr({:neg, inner}, table), do: "(- #{render_expr(inner, table)})"
-
-  defp render_expr({:call, function, args}, table),
-    do: "#{function}(#{Enum.map_join(args, ",", &render_expr(&1, table))})"
-
-  # A CAST is simplified away or kept depending on the types.
-  defp render_expr({:cast, _inner, _type}, _table), do: throw(:unrenderable)
-
-  # Every source column the query refers to. ORDER BY may name an output
+  # Every source column the query refers to, with the clause it stands in,
+  # in the order the engine resolves the clauses. ORDER BY may name an output
   # alias instead, which is not a source column.
-  @spec referenced_columns(SQLParser.parsed_query()) :: [binary()]
-  defp referenced_columns(query) do
-    aliases = if query.distinct_on, do: [], else: output_aliases(query)
+  @spec clause_refs(SQLParser.parsed_query()) :: [{clause(), SQLExpr.column_ref()}]
+  defp clause_refs(query) do
+    aliases = if query.distinct_on, do: [], else: output_names(query)
 
     order_by_refs =
       Enum.flat_map(query.order_by, fn
@@ -781,27 +1177,33 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
         {column, _direction} -> if column in aliases, do: [], else: [column]
       end)
 
-    Enum.flat_map(query.projection_columns || [], &projection_refs/1) ++
-      Enum.flat_map(query.select_columns || [], &select_column_refs/1) ++
-      where_refs(query.where) ++
-      (query.group_by_columns || []) ++
-      (query.distinct_columns || []) ++
-      (query.distinct_on || []) ++
-      order_by_refs
+    select_refs =
+      Enum.flat_map(query.projection_columns || [], &projection_refs/1) ++
+        Enum.flat_map(query.select_columns || [], &select_column_refs/1) ++
+        (query.distinct_columns || [])
+
+    tagged(:where, where_refs(query.where)) ++
+      tagged(:select, select_refs) ++
+      tagged(:order, order_by_refs) ++
+      tagged(:group, query.group_by_columns || []) ++
+      tagged(:on, query.distinct_on || [])
   end
 
-  @spec output_aliases(SQLParser.parsed_query()) :: [binary()]
-  defp output_aliases(query) do
+  @spec tagged(clause(), [SQLExpr.column_ref()]) :: [{clause(), SQLExpr.column_ref()}]
+  defp tagged(clause, refs), do: Enum.map(refs, &{clause, &1})
+
+  @spec output_names(SQLParser.parsed_query()) :: [binary()]
+  defp output_names(query) do
     Enum.map(query.projection_columns || [], fn {_source, output} -> output end) ++
       Enum.map(query.select_columns || [], &elem(&1, tuple_size(&1) - 1)) ++
       (query.distinct_columns || [])
   end
 
-  @spec projection_refs(SQLParser.projection()) :: [binary()]
+  @spec projection_refs(SQLParser.projection()) :: [SQLExpr.column_ref()]
   defp projection_refs({source, _output}) when is_binary(source), do: [source]
   defp projection_refs({expr, _output}), do: expr_fields(expr)
 
-  @spec select_column_refs(SQLParser.select_column()) :: [binary()]
+  @spec select_column_refs(SQLParser.select_column()) :: [SQLExpr.column_ref()]
   defp select_column_refs({:time_bucket, _alias}), do: ["time"]
   defp select_column_refs({:aggregate, _agg, expr, _alias}), do: expr_fields(expr)
   defp select_column_refs({:count_star, _alias}), do: []
@@ -816,7 +1218,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp select_column_refs({:grouping_column, source, _alias}), do: [source]
   defp select_column_refs({:constant, _value, _alias}), do: []
 
-  @spec where_refs([SQLParser.where_node()]) :: [binary()]
+  @spec where_refs([SQLParser.where_node()]) :: [SQLExpr.column_ref()]
   defp where_refs(nodes) do
     Enum.flat_map(nodes, fn
       {:or, branches} ->
@@ -836,11 +1238,11 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end)
   end
 
-  @spec operand_fields(SQLParser.operand()) :: [binary()]
+  @spec operand_fields(SQLParser.operand()) :: [SQLExpr.column_ref()]
   defp operand_fields(column) when is_binary(column), do: [column]
   defp operand_fields(operand), do: expr_fields(operand)
 
-  @spec expr_fields(term()) :: [binary()]
+  @spec expr_fields(term()) :: [SQLExpr.column_ref()]
   defp expr_fields({:expr, expr}), do: expr_fields(expr)
   defp expr_fields({:field, name}), do: [name]
   defp expr_fields({:op, _op, left, right}), do: expr_fields(left) ++ expr_fields(right)
@@ -858,16 +1260,23 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # The columns a query's rows are made of, whether or not any row has a
   # value for them: a column that is null in every row is still in the
   # schema the next query reads.
-  @spec output_columns(SQLParser.parsed_query(), [point()]) :: [binary()]
-  defp output_columns(%{distinct_columns: columns}, _source) when is_list(columns), do: columns
+  @spec output_columns(SQLParser.parsed_query(), [relation()]) :: [binary()] | nil
+  defp output_columns(%{distinct_columns: columns}, _relations) when is_list(columns),
+    do: columns
 
-  defp output_columns(%{select_columns: columns}, _source) when is_list(columns),
+  defp output_columns(%{select_columns: columns}, _relations) when is_list(columns),
     do: Enum.map(columns, &elem(&1, tuple_size(&1) - 1))
 
-  defp output_columns(%{projection_columns: columns}, _source) when is_list(columns),
+  defp output_columns(%{projection_columns: columns}, _relations) when is_list(columns),
     do: Enum.map(columns, fn {_source, output} -> output end)
 
-  defp output_columns(_select_star, source), do: source |> point_columns() |> MapSet.to_list()
+  # `*` is every column of the relations in turn, or unknown when one of
+  # them is a table with no rows.
+  defp output_columns(_select_star, relations) do
+    if Enum.any?(relations, &unknown_schema?/1),
+      do: nil,
+      else: Enum.flat_map(relations, &full_columns/1)
+  end
 
   # A CTE's output rows, read back as points: every column but a timestamp
   # `time` is a field (tag/field is a storage distinction the next query
@@ -1040,6 +1449,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # the JSON and JSONL formats), so a nil never becomes a key here.
   @spec put_column(map(), binary(), term()) :: map()
   defp put_column(row, _key, nil), do: row
+  # A number past the range of a double is a JSON `null` that is there.
+  defp put_column(row, key, :nonfinite), do: Map.put(row, key, nil)
   defp put_column(row, key, value), do: Map.put(row, key, value)
 
   # SELECT DISTINCT a[, b ...]: one row per distinct combination, sorted
@@ -1192,7 +1603,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # `time` is the point's timestamp; the parser only lets it reach MIN, MAX
   # and COUNT, the aggregates DataFusion accepts over a Timestamp.
   @spec eval_expr(SQLParser.expr(), point()) ::
-          number() | binary() | boolean() | DateTime.t() | nil
+          number() | binary() | boolean() | DateTime.t() | :nonfinite | nil
   defp eval_expr({:field, name}, point), do: column_value(point, name)
   defp eval_expr({:lit, value}, _point), do: value
   defp eval_expr({:uint, value}, _point), do: value
@@ -1203,20 +1614,82 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   defp eval_expr({:neg, inner}, point) do
     case eval_expr(inner, point) do
-      value when is_integer(value) -> if int64?(value), do: wrap(-value), else: -value
+      :nonfinite -> :nonfinite
+      value when is_integer(value) -> negate(value, inner)
       value when is_float(value) -> -value
       _null -> nil
     end
   end
 
   defp eval_expr({:op, op, left, right}, point) do
-    with l when is_number(l) <- eval_expr(left, point),
-         r when is_number(r) <- eval_expr(right, point) do
-      arithmetic(op, l, r)
-    else
+    case {eval_expr(left, point), eval_expr(right, point)} do
+      {:nonfinite, _right} -> throw({:query_error, SQLError.nonfinite()})
+      {_left, :nonfinite} -> throw({:query_error, SQLError.nonfinite()})
+      {l, r} when is_number(l) and is_number(r) -> operate(op, {left, l}, {right, r})
       _non_number -> nil
     end
   end
+
+  # `/` of an `Int64` by a `UInt64` (a non-negative integer parameter, a
+  # literal above the `Int64` range) or the other way round is a decimal
+  # division on the engine, truncated to four places (`1 / $p` for 3 is
+  # `0.3333`, verified); two `UInt64`s divide as integers. A `UInt64` hidden
+  # in a larger expression has a type the double does not follow.
+  @spec operate(atom(), {SQLParser.expr(), number()}, {SQLParser.expr(), number()}) ::
+          number() | nil
+  defp operate(:/, {left, l}, {right, r}) when is_integer(l) and is_integer(r) do
+    case {uint_kind(left), uint_kind(right)} do
+      {kind, kind} -> arithmetic(:/, l, r)
+      {:nested, _right} -> throw({:query_error, nested_uint()})
+      {_left, :nested} -> throw({:query_error, nested_uint()})
+      _int_by_uint -> decimal_division(l, r)
+    end
+  end
+
+  defp operate(op, {_left, l}, {_right, r}), do: arithmetic(op, l, r)
+
+  @spec uint_kind(SQLParser.expr()) :: :uint | :nested | :int
+  defp uint_kind({:uint, _value}), do: :uint
+  defp uint_kind(expr), do: if(contains_uint?(expr), do: :nested, else: :int)
+
+  @spec contains_uint?(SQLParser.expr()) :: boolean()
+  defp contains_uint?({:uint, _value}), do: true
+  defp contains_uint?({:neg, inner}), do: contains_uint?(inner)
+  defp contains_uint?({:cast, inner, _type}), do: contains_uint?(inner)
+  defp contains_uint?({:op, _op, left, right}), do: contains_uint?(left) or contains_uint?(right)
+  defp contains_uint?({:call, _function, args}), do: Enum.any?(args, &contains_uint?/1)
+  defp contains_uint?(_leaf), do: false
+
+  @spec nested_uint() :: SQLError.t()
+  defp nested_uint do
+    SQLError.refusal(
+      "a division by or of an expression computed from a UInt64 (a non-negative integer " <>
+        "parameter, a literal above Int64's range): its type on the engine is not modelled"
+    )
+  end
+
+  # The quotient truncated to four places, read back as a float as the JSON
+  # number the engine writes is.
+  @spec decimal_division(integer(), integer()) :: float()
+  defp decimal_division(_dividend, 0), do: connection_closed()
+
+  defp decimal_division(dividend, divisor) do
+    scaled = div(abs(dividend) * 10_000, abs(divisor))
+    sign = if dividend < 0 != divisor < 0, do: "-", else: ""
+    fraction = scaled |> rem(10_000) |> Integer.to_string() |> String.pad_leading(4, "0")
+    {value, ""} = Float.parse("#{sign}#{div(scaled, 10_000)}.#{fraction}")
+    value
+  end
+
+  # Negating the `Int64` minimum overflows. The engine's optimizer folds a
+  # constant and fails the query, closing the connection; over a column the
+  # kernel wraps and the minimum is its own negation (both verified).
+  @spec negate(integer(), SQLParser.expr()) :: integer()
+  defp negate(@int64_min, inner) do
+    if SQLExpr.columns(inner) == [], do: connection_closed(), else: @int64_min
+  end
+
+  defp negate(value, _inner), do: if(int64?(value), do: wrap(-value), else: -value)
 
   # CAST as DataFusion performs it: text to a number only when the whole
   # string is one ("2.5" is not an integer), a float to an integer by
@@ -1228,6 +1701,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # transport error, so the double reports the same shape.
   @spec cast(term(), SQLParser.cast_type()) :: term()
   defp cast(nil, _type), do: nil
+  defp cast(:nonfinite, _type), do: throw({:query_error, SQLError.nonfinite()})
   defp cast(value, :integer) when is_integer(value), do: value
   defp cast(value, :integer) when is_float(value), do: trunc(value)
   defp cast(value, :integer) when is_boolean(value), do: if(value, do: 1, else: 0)
@@ -1259,12 +1733,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # Format gives a nested value in CSV), so code matching on it holds
   # against both clients.
   @spec connection_closed() :: no_return()
-  defp connection_closed,
-    do: throw({:query_error, {:connection_error, %Mint.TransportError{reason: :closed}}})
-
-  @int64_min -9_223_372_036_854_775_808
-  @int64_max 9_223_372_036_854_775_807
-  @two_64 18_446_744_073_709_551_616
+  defp connection_closed, do: throw({:query_error, SQLError.closed()})
 
   # `Int64` arithmetic wraps in two's complement, as the engine's does
   # (verified: `y + 9223372036854775807` for 1 is the minimum, `-y` for the
@@ -1655,13 +2124,19 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # The left operand is a column name or an arithmetic expression; the right
   # one is a literal unless the parser tagged it as an expression.
   @spec left_value(point(), SQLParser.operand()) :: term()
-  defp left_value(point, {:expr, expr}), do: eval_expr(expr, point)
+  defp left_value(point, {:expr, expr}), do: point |> then(&eval_expr(expr, &1)) |> finite()
   defp left_value(point, key), do: column_value(point, key)
 
   @spec right_value(point(), term()) :: term()
-  defp right_value(point, {:expr, expr}), do: eval_expr(expr, point)
+  defp right_value(point, {:expr, expr}), do: point |> then(&eval_expr(expr, &1)) |> finite()
   defp right_value(_point, {:uint, value}), do: value
   defp right_value(_point, literal), do: literal
+
+  # A comparison with a number past the range of a double would need
+  # infinity, which an Elixir float cannot be.
+  @spec finite(term()) :: term()
+  defp finite(:nonfinite), do: throw({:query_error, SQLError.nonfinite()})
+  defp finite(value), do: value
 
   @spec in_list(term(), [term()]) :: boolean() | nil
   defp in_list(actual, candidates) do

@@ -7,7 +7,6 @@ defmodule InfluxElixir.Query.SQLTest do
   setup do
     {:ok, conn} = Local.start(databases: ["test_db"])
     Local.write(conn, "cpu,host=web01 value=1i", database: "test_db")
-    on_exit(fn -> Local.stop(conn) end)
     {:ok, conn: conn}
   end
 
@@ -85,7 +84,6 @@ defmodule InfluxElixir.Query.SQLTest do
   describe "connection-level default database" do
     test "query/2, query_stream/2 and execute/2 use it" do
       {:ok, conn} = Local.start(database: "dflt_db")
-      on_exit(fn -> Local.stop(conn) end)
       {:ok, :written} = Local.write(conn, "cpu value=7i")
 
       assert {:ok, [%{"value" => 7}]} = SQL.query(conn, "SELECT * FROM cpu")
