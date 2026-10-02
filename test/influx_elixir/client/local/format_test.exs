@@ -2,6 +2,16 @@ defmodule InfluxElixir.Client.Local.FormatTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local.Format
+  alias InfluxElixir.Client.QueryParams
+
+  @row %{
+    "time" => ~U[2023-11-14 22:13:20.000000Z],
+    "host" => "a",
+    "v" => 1.5,
+    "n" => -3,
+    "b" => true,
+    "e" => ""
+  }
 
   # Every pair was read back from InfluxDB 3 Core's `format: "csv"`.
   @engine_csv [
@@ -61,31 +71,6 @@ defmodule InfluxElixir.Client.Local.FormatTest do
   end
 
   describe "answer/4 — the request's parameters" do
-    test "an object or an array is the engine's 400 at the byte its parser stops" do
-      object =
-        "serde json error: JSON objects are not supported as query parameters. " <>
-          "Expected null, boolean, number, or string at line 1 column "
-
-      array =
-        "serde json error: JSON arrays are not supported as query parameters. " <>
-          "Expected null, boolean, number, or string. at line 1 column "
-
-      # Each column was read back from Core for the body Client.HTTP sends.
-      for {database, params, body} <- [
-            {"rv_lib", %{"p" => %{"a" => 1}}, object <> "53"},
-            {"rv_lib", %{"p" => [1, 2]}, array <> "51"},
-            {"rv_lib", %{"p" => []}, array <> "48"},
-            {"rv_lib", %{"p" => %{"a" => %{"b" => [1]}}}, object <> "61"},
-            {"rv_lib", %{"p" => [1, %{"a" => 2}]}, array <> "57"},
-            {"rv_lib", %{"a" => 1, "p" => %{}}, object <> "54"},
-            {"rv_lib", %{"p" => [1, 2], "z" => 1}, array <> "50"}
-          ] do
-        assert Format.answer(:json, fn -> flunk("the query ran") end, database, params) ==
-                 {:error, %{status: 400, body: body}},
-               inspect(params)
-      end
-    end
-
     test "the format is read before the parameters, the parameters before the query" do
       params = %{"p" => [1]}
 
@@ -96,7 +81,7 @@ defmodule InfluxElixir.Client.Local.FormatTest do
                Format.answer(:json, fn -> flunk("the query ran") end, "db", params)
     end
 
-    test "scalar parameters, and a Decimal that is a JSON number, reach the query" do
+    test "scalar parameters, and a Decimal that is a JSON number, are accepted and the query runs" do
       params = %{
         "a" => nil,
         "b" => true,
@@ -104,24 +89,69 @@ defmodule InfluxElixir.Client.Local.FormatTest do
         "d" => 1.5,
         "e" => "x",
         "f" => Jason.Fragment.new("1000.00"),
-        "g" => ~D[2024-01-02]
+        "g" => ~D[2024-01-02],
+        "h" => 18_446_744_073_709_551_616,
+        "i" => Integer.pow(10, 308),
+        "j" => 1.797_693_134_862_315_7e308
       }
 
-      assert Format.answer(:json, fn -> {:ok, [%{"n" => 1}]} end, "db", params) ==
-               {:ok, [%{"n" => 1}]}
+      test_pid = self()
+
+      assert Format.answer(
+               :json,
+               fn ->
+                 send(test_pid, :ran)
+                 {:ok, [%{"n" => 1}]}
+               end,
+               "db",
+               params
+             ) == {:ok, [%{"n" => 1}]}
+
+      assert_received :ran
+    end
+  end
+
+  # Each column was read back from Core for the body `Client.HTTP` sends:
+  # the byte where the number ends, `db` and `format` left out when the
+  # request has none.
+  describe "check_params/3 — a number the engine's JSON parser cannot read" do
+    @out_of_range "serde json error: number out of range at line 1 column "
+
+    test "stops the parser where the number ends, last parameter or not" do
+      big = Integer.pow(10, 400)
+
+      for {database, format, params, column} <- [
+            {"rv_lib", :json, %{"p" => big}, 41 + 4 + 401},
+            {"rv_lib", :json, %{"p" => Decimal.new("1e400")}, 41 + 4 + 401},
+            {"rv_lib", :json, %{"p" => -big}, 41 + 4 + 402},
+            {"rv_lib", :json, %{"a" => 1, "p" => -big, "z" => 2}, 41 + 6 + 4 + 402},
+            {"rv_lib", nil, %{"p" => big}, 25 + 4 + 401},
+            {"é", :json, %{"p" => big}, 37 + 4 + 401},
+            {nil, :json, %{"p" => big}, 27 + 4 + 401}
+          ] do
+        assert {:ok, params} = QueryParams.normalize(params)
+
+        assert Format.check_params(params, format, database) ==
+                 {:error, %{status: 400, body: @out_of_range <> Integer.to_string(column)}},
+               inspect({database, format, params})
+      end
+    end
+
+    test "reads the largest double and a number that underflows" do
+      for value <- [
+            1.797_693_134_862_315_7e308,
+            Integer.pow(10, 308),
+            -Integer.pow(10, 308),
+            5.0e-324
+          ] do
+        assert Format.check_params(%{"p" => value}, :json, "db") == :ok, inspect(value)
+      end
+
+      assert Format.check_params(%{"p" => Jason.Fragment.new("1e-400")}, :json, "db") == :ok
     end
   end
 
   describe "answer/3" do
-    @row %{
-      "time" => ~U[2023-11-14 22:13:20.000000Z],
-      "host" => "a",
-      "v" => 1.5,
-      "n" => -3,
-      "b" => true,
-      "e" => ""
-    }
-
     test ":json and :jsonl answer the rows unchanged" do
       assert Format.answer(:json, fn -> {:ok, [@row]} end, "db") == {:ok, [@row]}
       assert Format.answer(:jsonl, fn -> {:ok, [@row]} end, "db") == {:ok, [@row]}
@@ -152,9 +182,10 @@ defmodule InfluxElixir.Client.Local.FormatTest do
     end
 
     test "a format the engine does not know is its 400 before the query runs" do
-      # The column is where the format string ends in the body Client.HTTP
-      # sends, `db` left out when no database is named (verified on Core).
-      for {format, database, column} <- [{:xml, "db", 25}, {:xml, nil, 15}, {:yaml, "a", 25}] do
+      # With a named database the contract pins the column; no database leaves
+      # `db` out of the body Client.HTTP sends, and the column is where the
+      # format string ends in what is left (verified on Core).
+      for {format, database, column} <- [{:xml, nil, 15}, {:yaml, nil, 16}] do
         assert Format.answer(format, fn -> flunk("the query ran") end, database) ==
                  {:error,
                   %{
@@ -168,7 +199,7 @@ defmodule InfluxElixir.Client.Local.FormatTest do
     end
 
     test "a format the engine answers but the client cannot parse is unsupported" do
-      for format <- [:pretty, :json_lines, "json", "csv"] do
+      for format <- [:pretty, "json", "csv"] do
         assert Format.answer(format, fn -> {:ok, [@row]} end, "db") ==
                  {:error, {:unsupported_format, format}}
       end

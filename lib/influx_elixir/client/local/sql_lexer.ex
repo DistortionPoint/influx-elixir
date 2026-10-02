@@ -8,8 +8,9 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
       comments and leave no trace: a quote inside one opens nothing
     * `'...'` is a string and `"..."` a quoted identifier; inside either, a
       doubled quote is one quote and nothing else has a meaning
-    * `$$...$$` and `$tag$...$tag$` are dollar-quoted strings, rewritten as
-      ordinary `'...'` literals; `$name` is a placeholder and is kept
+    * `$$...$$` and `$tag$...$tag$` are dollar-quoted strings, and `E'...'`
+      or `e'...'` a string with backslash escapes, rewritten as ordinary
+      `'...'` literals; `$name` is a placeholder and is kept
     * `;` ends a statement; empty statements are nothing, so a trailing `;`
       is fine
 
@@ -21,7 +22,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   one with several is the engine's 405.
   """
 
-  alias InfluxElixir.Client.Local.SQLError
+  alias InfluxElixir.Client.Local.{SQLError, SQLLiteral}
 
   @typep state :: %{whole: binary(), statements: [binary()]}
 
@@ -87,12 +88,137 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   defp scan(<<?$, rest::binary>>, state, chunk) do
     case dollar(rest) do
       {:literal, literal, after_literal} -> scan(after_literal, state, [literal | chunk])
-      :placeholder -> scan(rest, state, [?$ | chunk])
+      :placeholder -> placeholder(rest, state, chunk)
       {:unterminated, message} -> {:error, at_end(state.whole, message)}
     end
   end
 
-  defp scan(<<c::utf8, rest::binary>>, state, chunk), do: scan(rest, state, [<<c::utf8>> | chunk])
+  # A word is read whole, so an `E` that ends one (`name'...'`) opens no
+  # escape string; `E'` or `e'` at the start of a token does.
+  defp scan(<<c::utf8, rest::binary>> = input, state, chunk) do
+    if word_char?(c) do
+      {word, after_word} = take_tag(input, [])
+
+      case after_word do
+        <<?', body::binary>> when word in ["E", "e"] ->
+          escape_string(body, input, state, chunk)
+
+        _no_escape_string ->
+          scan(after_word, state, [word | chunk])
+      end
+    else
+      scan(rest, state, [<<c::utf8>> | chunk])
+    end
+  end
+
+  # `$name`: the name is read whole, so a name ending in `e` opens no escape
+  # string.
+  @spec placeholder(binary(), state(), iodata()) :: {:ok, [binary()]} | {:error, SQLError.t()}
+  defp placeholder(rest, state, chunk) do
+    {name, after_name} = take_tag(rest, [])
+    scan(after_name, state, [name, ?$ | chunk])
+  end
+
+  # `E'...'`: a backslash escape is read as the engine's tokenizer reads it
+  # (verified): `\b \f \n \r \t`, `\u` and `\U` with exactly 4 or 8 hex
+  # digits, `\x` with 1 or 2 hex digits (none leaves a literal `x`), an octal
+  # `\N`, `\NN` or `\NNN`; the code of `\x` and of an octal escape must be
+  # 1 to 127, of `\u` and `\U` a non-zero scalar value, or the string is
+  # unterminated. Any other escaped character stands for itself, and a
+  # doubled quote is a quote. The literal is rewritten as a plain `'...'`.
+  @spec escape_string(binary(), binary(), state(), iodata()) ::
+          {:ok, [binary()]} | {:error, SQLError.t()}
+  defp escape_string(body, start, state, chunk) do
+    case take_escaped(body, []) do
+      {:ok, text, after_literal} ->
+        scan(after_literal, state, [SQLLiteral.quote_text(text) | chunk])
+
+      :error ->
+        {:error, located(state.whole, start, "Unterminated encoded string literal")}
+    end
+  end
+
+  @spec take_escaped(binary(), [binary()]) :: {:ok, binary(), binary()} | :error
+  defp take_escaped(<<?', ?', rest::binary>>, acc), do: take_escaped(rest, ["'" | acc])
+
+  defp take_escaped(<<?', rest::binary>>, acc),
+    do: {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary(), rest}
+
+  defp take_escaped(<<?\\, rest::binary>>, acc) do
+    with {:ok, char, after_escape} <- escape(rest), do: take_escaped(after_escape, [char | acc])
+  end
+
+  defp take_escaped(<<c::utf8, rest::binary>>, acc), do: take_escaped(rest, [<<c::utf8>> | acc])
+  defp take_escaped(<<>>, _acc), do: :error
+
+  @spec escape(binary()) :: {:ok, binary(), binary()} | :error
+  defp escape(<<?b, rest::binary>>), do: {:ok, <<8>>, rest}
+  defp escape(<<?f, rest::binary>>), do: {:ok, <<12>>, rest}
+  defp escape(<<?n, rest::binary>>), do: {:ok, "\n", rest}
+  defp escape(<<?r, rest::binary>>), do: {:ok, "\r", rest}
+  defp escape(<<?t, rest::binary>>), do: {:ok, "\t", rest}
+  defp escape(<<?u, rest::binary>>), do: fixed_hex(rest, 4)
+  defp escape(<<?U, rest::binary>>), do: fixed_hex(rest, 8)
+
+  defp escape(<<?x, rest::binary>>) do
+    case take_digits(rest, 2, &hex?/1, []) do
+      {[], _rest} -> {:ok, "x", rest}
+      {digits, after_digits} -> ascii_code(digits, 16, after_digits)
+    end
+  end
+
+  defp escape(<<c, _rest::binary>> = input) when c in ?0..?7 do
+    {digits, after_digits} = take_digits(input, 3, &octal?/1, [])
+    ascii_code(digits, 8, after_digits)
+  end
+
+  defp escape(<<c::utf8, rest::binary>>), do: {:ok, <<c::utf8>>, rest}
+  defp escape(<<>>), do: :error
+
+  @spec fixed_hex(binary(), pos_integer()) :: {:ok, binary(), binary()} | :error
+  defp fixed_hex(input, count) do
+    case take_digits(input, count, &hex?/1, []) do
+      {digits, rest} when length(digits) == count -> scalar(digits, rest)
+      _short -> :error
+    end
+  end
+
+  @spec scalar([char()], binary()) :: {:ok, binary(), binary()} | :error
+  defp scalar(digits, rest) do
+    code = digits |> List.to_string() |> String.to_integer(16)
+
+    if code in 1..0xD7FF or code in 0xE000..0x10FFFF,
+      do: {:ok, <<code::utf8>>, rest},
+      else: :error
+  end
+
+  @spec ascii_code([char()], 8 | 16, binary()) :: {:ok, binary(), binary()} | :error
+  defp ascii_code(digits, base, rest) do
+    case digits |> List.to_string() |> String.to_integer(base) do
+      code when code in 1..127 -> {:ok, <<code>>, rest}
+      _outside -> :error
+    end
+  end
+
+  @spec take_digits(binary(), non_neg_integer(), (byte() -> boolean()), [char()]) ::
+          {[char()], binary()}
+  defp take_digits(<<c, rest::binary>>, count, digit?, acc) when count > 0 do
+    if digit?.(c),
+      do: take_digits(rest, count - 1, digit?, [c | acc]),
+      else: {Enum.reverse(acc), <<c, rest::binary>>}
+  end
+
+  defp take_digits(rest, _count, _digit?, acc), do: {Enum.reverse(acc), rest}
+
+  @spec hex?(byte()) :: boolean()
+  defp hex?(c), do: c in ?0..?9 or c in ?a..?f or c in ?A..?F
+
+  @spec octal?(byte()) :: boolean()
+  defp octal?(c), do: c in ?0..?7
+
+  @spec word_char?(char()) :: boolean()
+  defp word_char?(c) when c < 128, do: c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_
+  defp word_char?(c), do: Regex.match?(~r/\A[\p{L}\p{N}]\z/u, <<c::utf8>>)
 
   @spec text(iodata()) :: binary()
   defp text(chunk), do: chunk |> Enum.reverse() |> IO.iodata_to_binary()
@@ -129,7 +255,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
           {:literal, binary(), binary()} | :placeholder | {:unterminated, binary()}
   defp dollar(<<?$, rest::binary>>) do
     case :binary.split(rest, "$$") do
-      [body, after_body] -> {:literal, quote_text(body), after_body}
+      [body, after_body] -> {:literal, SQLLiteral.quote_text(body), after_body}
       [_unterminated] -> {:unterminated, "Unterminated dollar-quoted string"}
     end
   end
@@ -140,7 +266,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
     case after_tag do
       <<?$, body_and_rest::binary>> ->
         case :binary.split(body_and_rest, "$" <> tag <> "$") do
-          [body, after_body] -> {:literal, quote_text(body), after_body}
+          [body, after_body] -> {:literal, SQLLiteral.quote_text(body), after_body}
           [_unterminated] -> {:unterminated, "Unterminated dollar-quoted, expected $"}
         end
 
@@ -151,17 +277,12 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
 
   @spec take_tag(binary(), [binary()]) :: {binary(), binary()}
   defp take_tag(<<c::utf8, rest::binary>> = input, acc) do
-    char = <<c::utf8>>
-
-    if char == "_" or Regex.match?(~r/\A[\p{L}\p{N}]\z/u, char),
-      do: take_tag(rest, [char | acc]),
+    if word_char?(c),
+      do: take_tag(rest, [<<c::utf8>> | acc]),
       else: {acc |> Enum.reverse() |> IO.iodata_to_binary(), input}
   end
 
   defp take_tag(<<>>, acc), do: {acc |> Enum.reverse() |> IO.iodata_to_binary(), <<>>}
-
-  @spec quote_text(binary()) :: binary()
-  defp quote_text(body), do: "'" <> String.replace(body, "'", "''") <> "'"
 
   @spec unterminated(char(), binary(), binary()) :: SQLError.t()
   defp unterminated(?', whole, input),

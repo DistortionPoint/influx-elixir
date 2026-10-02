@@ -93,9 +93,50 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     "message" => "error in building plan while starting program: cannot query an empty range"
   }
 
+  @tasks 4
+  @minute_ns 60_000_000_000
+  @hour_ns 3_600_000_000_000
+
+  @drop_conflict "failure writing points to database: partial write: field type conflict: " <>
+                   ~s|input field "v" on measurement "m" is type integer, | <>
+                   "already exists as type float dropped="
+  @drop_invalid "failure writing points to database: partial write: invalid field name: " <>
+                  ~s|input field "time" on measurement "m" is invalid dropped=|
+
+  defp drop_body(message), do: %{"code" => "unprocessable entity", "message" => message}
+
+  defp stored(measurement, tags, v, timestamp),
+    do: %{measurement: measurement, tags: tags, fields: %{"v" => v}, timestamp: timestamp}
+
+  # The message with the clock's reading and the bucket's id masked, and the
+  # bounds it printed.
+  defp masked_retention(conn, bucket, body) do
+    assert %{"code" => "unprocessable entity", "message" => message} = body
+    assert {:ok, buckets} = Local.list_buckets(conn)
+    assert %{"id" => id} = Enum.find(buckets, &(&1["name"] == bucket))
+
+    bounds =
+      ~r/Lower Bound at (\d{4}-[-\d:.TZ]+)/
+      |> Regex.scan(message, capture: :all_but_first)
+      |> List.flatten()
+
+    masked =
+      message
+      |> String.replace(~r/Lower Bound at \d{4}-[-\d:.TZ]+/, "Lower Bound at BOUND")
+      |> String.replace("database: #{id} ", "database: ID ")
+
+    {masked, bounds}
+  end
+
+  defp numbered(lines, dialect) do
+    assert {:ok, results} =
+             LineProtocolParser.parse_lines(Enum.join(lines, "\n"), :nanosecond, dialect)
+
+    results
+  end
+
   @trailing "Could not parse entire line. Found trailing content: "
   @no_fields "No fields were provided"
-  @backslash "Measurements, tag keys and values, and field keys may not end with a backslash"
   @need_space "Expected at least one space character, got end of input"
 
   # ---------------------------------------------------------------------------
@@ -103,13 +144,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
   # ---------------------------------------------------------------------------
 
   describe "InfluxDB 3 line protocol — the engine's errors" do
-    test "the lines the report named" do
-      assert v3_error("lp v=1 100 200") == @trailing <> "`200`"
-      assert v3_error("lp v=.5 1") == @no_fields
-      assert v3_error("lp v=5. 2") == @trailing <> "`. 2`"
-    end
-
-    test "the engine quotes ten characters of what is left, and dots for the rest" do
+    test "most errors quote ten characters of what is left, and dots for the rest" do
       for {line, message} <- [
             {"zz v=1 abcdefghi", @trailing <> "` abcdefghi`"},
             {"zz v=1 abcdefghij", @trailing <> "` abcdefghi...`"},
@@ -125,8 +160,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
           ] do
         assert v3_error(line) == message, line
       end
+    end
 
-      # "Expected at least one space character" quotes all of it.
+    test "\"Expected at least one space character\" quotes all of what is left" do
       assert v3_error("zz\tabcdefghijklmnop v=1") ==
                "Expected at least one space character, got `\tabcdefghijklmnop v=1`"
     end
@@ -333,9 +369,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     end
 
     test "a field named twice, or also a tag: the first the line meets wins" do
-      assert v3_error("zz v=1,v=2 5") ==
-               "invalid line protocol - multiple instances of 'v' field found"
-
       assert v3_error("zz,t=1 a=1,a=2,t=3") ==
                "invalid line protocol - multiple instances of 'a' field found"
 
@@ -345,32 +378,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
       # A parse error comes before either.
       assert v3_error("zz v=1,v=2 abc") == @trailing <> "` abc`"
-    end
-
-    test "a name that ends in a backslash is refused wherever it ends" do
-      for line <- [
-            ~S"zz\\ v=1i 5",
-            ~S"zz\\",
-            ~S"zz,t\\ v=1i 5",
-            ~S"zz,t\\",
-            ~S"zz,t=a\\",
-            ~S"zz,t=a\\ ",
-            ~S"zz,t=a\\ v=1i 5",
-            ~S"zz,t\\=1 v=1i",
-            ~S"zz,t=\\ v=1i",
-            ~S"zz v\\ =1i 5",
-            ~S"zz v\\",
-            ~S"zz v=1i,w\\ x=1i",
-            ~S"zz v=1i,w\\=1i",
-            ~S"zz v\\=1i 5"
-          ] do
-        assert v3_error(line) == @backslash, line
-      end
-
-      # An escaped separator is part of the name.
-      assert v3_point(~S"zz,t\,u=1 v=1i 5") == point("zz", %{"t,u" => "1"}, %{"v" => 1}, 5)
-      assert v3_point(~S"z\ z v=1i 5") == point("z z", %{}, %{"v" => 1}, 5)
-      assert v3_point(~S"z\,z v=1i 5") == point("z,z", %{}, %{"v" => 1}, 5)
     end
 
     test "a tab ends a name as a space does, but a space alone separates the sections" do
@@ -443,13 +450,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       end
     end
 
-    test "a quote after a field value, or in the timestamp, opens a string" do
+    test "InfluxDB 3: a quote after a field value opens a string that takes the next line" do
       assert parse_errors(~s|m f=1"i 1\nBAD|, :v3) ==
                [{1, @trailing <> ~s|`"i 1\nBAD`|, ~s|m f=1"i 1|}]
+    end
 
+    test "InfluxDB 3: a quote in the timestamp opens a string that takes the next line" do
       assert parse_errors(~s|m f=1i 1 "\nBAD|, :v3) ==
                [{1, @trailing <> ~s|`"\nBAD`|, ~s|m f=1i 1 "|}]
+    end
 
+    test "InfluxDB 2: a quote after a field value is part of the number's line" do
       assert v2_errors(~s|m f=1"i 1\nBAD|) == [{~s|m f=1"i 1\nBAD|, "invalid number"}]
     end
 
@@ -478,16 +489,61 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       assert parsed == point("m", %{}, %{"f" => "a\nb"}, 1)
     end
 
-    test "InfluxDB 3 skips a comment through its physical line, InfluxDB 2 the whole line" do
-      text = ~s|# a=1 "x\nBAD|
-      assert [{1, @need_space, ~s|# a=1 "x|}] = parse_errors(text, :v3)
+    test "InfluxDB 3 skips a comment through its physical line" do
+      assert [{1, @need_space, ~s|# a=1 "x|}] = parse_errors(~s|# a=1 "x\nBAD|, :v3)
+    end
 
+    test "InfluxDB 2 skips a comment through the whole line a quote leaves open" do
       assert {:error, %{body: "incoming write was empty"}} =
-               LineProtocolParser.parse_lines(text, :nanosecond, :v2)
+               LineProtocolParser.parse_lines(~s|# a=1 "x\nBAD|, :nanosecond, :v2)
     end
 
     test "InfluxDB 2 does not count a final newline in a line a quote left open" do
       assert v2_errors(~s|m f="a\nBAD\n|) == [{~s|m f="a\nBAD|, "unbalanced quotes"}]
+    end
+  end
+
+  describe "parse_lines — a payload of many lines" do
+    test "points keep their order and their numbers across the chunks" do
+      results = numbered(for(i <- 1..25_000, do: "m v=#{i}i #{i}"), :v3)
+
+      assert for({:ok, point, number, _line} <- results, do: {number, point.timestamp}) ==
+               for(i <- 1..25_000, do: {i, i})
+    end
+
+    test "InfluxDB 3 echoes the physical line of an error in any chunk" do
+      lines =
+        for i <- 1..25_000,
+            do: if(i in [10_000, 10_001, 20_001], do: "BAD#{i}", else: "m v=1i #{i}")
+
+      assert for(
+               {:error, %{line_number: n, original_line: shown}} <- numbered(lines, :v3),
+               do: {n, shown}
+             ) ==
+               [{10_000, "BAD10000"}, {10_001, "BAD10001"}, {20_001, "BAD20001"}]
+    end
+
+    test "InfluxDB 2 quotes the line of an error in any chunk, in order" do
+      lines =
+        for i <- 1..25_000,
+            do: if(i in [10_000, 10_001, 20_001], do: "BAD#{i}", else: "m v=1i #{i}")
+
+      assert for({:error, %{line: line}} <- numbered(lines, :v2), do: line) ==
+               ["BAD10000", "BAD10001", "BAD20001"]
+    end
+
+    test "comments and blank lines are not numbered, wherever the chunks fall" do
+      lines = for i <- 1..30_000, do: if(rem(i, 3) == 0, do: "# c#{i}", else: "m v=1i #{i}")
+      results = numbered(lines, :v3)
+
+      assert for({:ok, _point, number, _line} <- results, do: number) == Enum.to_list(1..20_000)
+    end
+
+    test "a payload of only comments is empty" do
+      text = Enum.map_join(1..25_000, "\n", &"# c#{&1}")
+
+      assert {:error, %{body: "incoming write was empty"}} =
+               LineProtocolParser.parse_lines(text, :nanosecond, :v3)
     end
   end
 
@@ -594,17 +650,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
   # ---------------------------------------------------------------------------
 
   describe "InfluxDB 2 line protocol — the Go parser's errors" do
-    test "the lines the report named" do
-      assert v2_error("this is not line protocol!!") ==
-               {"this is not line protocol!!", "invalid field format"}
-
-      assert v2_error("m v=") == {"m v=", "missing field value"}
-      assert v2_error("m n=1i\r") == {"m n=1i\r", "invalid number"}
-
-      assert {:ok, [{:error, %{error_message: "invalid number", line: "m n=1i\r"}}]} =
-               LineProtocolParser.parse_lines("m n=1i\r\n", :nanosecond, :v2)
-    end
-
     test "the key block" do
       for {line, reason} <- [
             {"zz", "missing fields"},
@@ -888,17 +933,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       assert {:ok, [%{"time" => time}]} =
                iql(conn, "SELECT mean(v) FROM fresh WHERE time > now() - 1h")
 
-      assert abs(DateTime.to_unix(time, :microsecond) - before) < 60_000_000
+      assert abs(DateTime.to_unix(time, :microsecond) - before) < 5_000_000
     end
 
-    test "a query with a WHERE on a tag finds the points that lack it", %{conn: conn} do
+    test "a tag equal to '' finds the points that lack the tag", %{conn: conn} do
       {:ok, :written} = Local.write(conn, "o v=9,w=90 6000", database: "db")
 
       assert {:ok, rows} = iql(conn, "SELECT v FROM o WHERE k = ''")
       assert Enum.map(rows, & &1["v"]) == [9.0]
+    end
+
+    test "a tag not equal to a value finds the points that lack the tag", %{conn: conn} do
+      {:ok, :written} = Local.write(conn, "o v=9,w=90 6000", database: "db")
 
       assert {:ok, rows} = iql(conn, "SELECT v FROM o WHERE k != 'a'")
       assert Enum.map(rows, & &1["v"]) == [2.0, 4.0, 9.0]
+    end
+
+    test "a row without the tag has no key for it, not an empty string", %{conn: conn} do
+      {:ok, :written} = Local.write(conn, "o v=9,w=90 6000", database: "db")
 
       assert {:ok, [row]} = iql(conn, "SELECT * FROM o WHERE k = ''")
       refute Map.has_key?(row, "k")
@@ -920,7 +973,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
   # ---------------------------------------------------------------------------
 
   describe "query_flux/3 — range" do
-    test "an integer second count wraps in 64-bit nanoseconds" do
+    test "an integer second count that does not fit wraps in 64-bit nanoseconds" do
       conn = v2_conn()
       assert {:ok, :written} = Local.write(conn, "m v=1 5", database: "b")
 
@@ -935,7 +988,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       assert {:ok, []} = flux_range(conn, "start: 0, stop: 18446744073")
     end
 
-    test "a duration is taken from now, and wraps too" do
+    test "a negative duration reaches back from now, a positive one forward" do
       conn = v2_conn()
       now = System.os_time(:nanosecond)
       later = now + 86_400_000_000_000
@@ -1004,17 +1057,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
           ] do
         assert {:ok, []} = flux_range(conn, args), args
       end
-    end
-
-    test "a query with no range is the engine's plan error" do
-      conn = v2_conn()
-
-      assert error_body(Local.query_flux(conn, ~s|from(bucket: "b")|)) == %{
-               "code" => "invalid",
-               "message" =>
-                 "error in building plan while starting program: cannot submit unbounded " <>
-                   ~s|read to "b"; try bounding 'from' with a call to 'range'|
-             }
     end
   end
 
@@ -1092,54 +1134,265 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
   # Writes and buckets through the double
   # ---------------------------------------------------------------------------
 
-  @drop_conflict "failure writing points to database: partial write: field type conflict: " <>
-                   ~s|input field "v" on measurement "m" is type integer, | <>
-                   "already exists as type float dropped="
-  @drop_invalid "failure writing points to database: partial write: invalid field name: " <>
-                  ~s|input field "time" on measurement "m" is invalid dropped=|
-
-  defp drop_body(message), do: %{"code" => "unprocessable entity", "message" => message}
-
   describe "write/3 — InfluxDB 2 shard groups" do
-    test "the shard group of a bucket follows its retention" do
+    # A bucket that keeps three hours has hour-long groups, one that keeps
+    # three days day-long ones. Each gets `v` as a float in the group of
+    # `first`; `second` is two hours on, in the same group only for the
+    # daily bucket.
+    setup do
       conn = v2_conn([])
-      :ok = Local.create_bucket(conn, "hourly", retention: 3600)
+      :ok = Local.create_bucket(conn, "hourly", retention: 10_800)
       :ok = Local.create_bucket(conn, "daily", retention: 259_200)
-      assert {:ok, :written} = Local.write(conn, "m v=1.5 5", database: "hourly")
-      assert {:ok, :written} = Local.write(conn, "m v=1.5 5", database: "daily")
 
-      # Two hours apart: two groups in an hourly bucket, one in a daily one.
-      payload = "m v=1i 5\nm time=1 7200000000000"
+      now = Store.now_ns()
+      hour = Integer.floor_div(now, @hour_ns) * @hour_ns
+      day = Integer.floor_div(now, 24 * @hour_ns) * 24 * @hour_ns
+
+      times = %{
+        "hourly" => {hour - 2 * @hour_ns + 5 * @minute_ns, hour + 5 * @minute_ns},
+        "daily" => {day + @hour_ns, day + 3 * @hour_ns}
+      }
+
+      for {bucket, {first, _second}} <- times do
+        assert {:ok, :written} = Local.write(conn, "m v=1.5 #{first}", database: bucket)
+      end
+
+      {:ok, conn: conn, times: times}
+    end
+
+    test "a bucket of hour-long groups reports the first group's drop, counting its own",
+         %{conn: conn, times: %{"hourly" => {first, second}}} do
+      payload = "m v=1i #{first}\nm time=1 #{second}"
 
       assert error_body(Local.write(conn, payload, database: "hourly")) ==
                drop_body(@drop_conflict <> "1")
+    end
+
+    test "a bucket of day-long groups counts both drops of the one group",
+         %{conn: conn, times: %{"daily" => {first, second}}} do
+      payload = "m v=1i #{first}\nm time=1 #{second}"
 
       assert error_body(Local.write(conn, payload, database: "daily")) ==
                drop_body(@drop_conflict <> "2")
+    end
 
-      payload = "m time=1 7200000000000\nm v=1i 5\nm time=1 5"
+    test "the earliest hour-long group speaks whatever order the payload gives them in",
+         %{conn: conn, times: %{"hourly" => {first, second}}} do
+      payload = "m time=1 #{second}\nm v=1i #{first}\nm time=1 #{first}"
 
       assert error_body(Local.write(conn, payload, database: "hourly")) ==
                drop_body(@drop_conflict <> "2")
+    end
+
+    test "in one day-long group the first drop in the payload speaks, counting all three",
+         %{conn: conn, times: %{"daily" => {first, second}}} do
+      payload = "m time=1 #{second}\nm v=1i #{first}\nm time=1 #{first}"
 
       assert error_body(Local.write(conn, payload, database: "daily")) ==
                drop_body(@drop_invalid <> "3")
     end
 
     test "a payload of thousands of groups is written group by group" do
-      conn = v2_conn([])
-      :ok = Local.create_bucket(conn, "hourly", retention: 3600)
-      assert {:ok, :written} = Local.write(conn, "m v=1.5 5", database: "hourly")
+      conn = v2_conn(["weekly"])
+      assert {:ok, :written} = Local.write(conn, "m v=1.5 5", database: "weekly")
 
-      payload = Enum.map_join(0..2_999, "\n", &"m v=1i #{&1 * 3_600_000_000_000 + 7}")
+      payload = Enum.map_join(0..2_999, "\n", &"m v=1i #{&1 * 604_800_000_000_000 + 7}")
 
-      assert error_body(Local.write(conn, payload, database: "hourly")) ==
+      assert error_body(Local.write(conn, payload, database: "weekly")) ==
                drop_body(@drop_conflict <> "1")
     end
   end
 
+  describe "write/3 — InfluxDB 2 retention" do
+    setup do
+      conn = v2_conn([])
+      :ok = Local.create_bucket(conn, "short", retention: 7200)
+      :ok = Local.create_bucket(conn, "forever")
+      {:ok, conn: conn, now: Store.now_ns()}
+    end
+
+    test "a bucket that keeps everything accepts a point of any age", %{conn: conn} do
+      assert {:ok, :written} = Local.write(conn, "m v=1i 5", database: "forever")
+    end
+
+    test "a point older than the retention is the engine's 422, naming it", ctx do
+      %{conn: conn} = ctx
+      body = error_body(Local.write(conn, "m v=1i 1672790400000000000", database: "short"))
+
+      assert {masked, _bounds} = masked_retention(conn, "short", body)
+
+      assert masked ==
+               "failure writing points to database: partial write: dropped 1 points outside " <>
+                 "retention policy of duration 2h0m0s - oldest point m at 2023-01-04T00:00:00Z " <>
+                 "dropped because it violates a Retention Policy Lower Bound at BOUND, " <>
+                 "newest point m at 2023-01-04T00:00:00Z dropped because it violates a " <>
+                 "Retention Policy Lower Bound at BOUND dropped=1 for database: ID " <>
+                 "for retention policy: autogen"
+    end
+
+    test "the lower bound is the retention before now", %{conn: conn, now: now} do
+      body = error_body(Local.write(conn, "m v=1i 5", database: "short"))
+      assert {_masked, [bound, same]} = masked_retention(conn, "short", body)
+      assert bound == same
+
+      assert {:ok, bound, 0} = DateTime.from_iso8601(bound)
+      expected = DateTime.from_unix!(now - 7200 * 1_000_000_000, :nanosecond)
+      assert abs(DateTime.diff(bound, expected, :microsecond)) < 5_000_000
+    end
+
+    test "the oldest and the newest dropped point are named by series key and time",
+         %{conn: conn} do
+      payload =
+        "m1,t=a v=1i 1672790400123456789\n" <>
+          "m2,u=c,t=b v=1i 1672790400000000001\n" <>
+          "m3 v=1i 1672790400123456000"
+
+      body = error_body(Local.write(conn, payload, database: "short"))
+      assert {masked, _bounds} = masked_retention(conn, "short", body)
+
+      assert masked =~ "dropped 3 points"
+      assert masked =~ "oldest point m2,t=b,u=c at 2023-01-04T00:00:00.000000001Z dropped"
+      assert masked =~ "newest point m1,t=a at 2023-01-04T00:00:00.123456789Z dropped"
+      assert masked =~ "dropped=3 for database"
+    end
+
+    test "on a tie the first point of the payload is both the oldest and the newest",
+         %{conn: conn} do
+      body =
+        error_body(
+          Local.write(conn, "m1 v=1i 1672790400000000000\nm2 v=1i 1672790400000000000",
+            database: "short"
+          )
+        )
+
+      assert {masked, _bounds} = masked_retention(conn, "short", body)
+      assert masked =~ "oldest point m1 at 2023-01-04T00:00:00Z dropped"
+      assert masked =~ "newest point m1 at 2023-01-04T00:00:00Z dropped"
+    end
+
+    test "a series key is escaped as line protocol escapes it", %{conn: conn} do
+      payload = ~S"m\ x\,y,b\ k\=1=v\,2\ 3,a=z v=1i 1672790400000000000"
+      body = error_body(Local.write(conn, payload, database: "short"))
+      assert {masked, _bounds} = masked_retention(conn, "short", body)
+
+      key = ~S"m\ x\,y,a=z,b\ k\=1=v\,2\ 3"
+      assert masked =~ "oldest point #{key} at 2023-01-04T00:00:00Z dropped"
+    end
+
+    test "the duration is Go's, in hours", %{conn: conn} do
+      :ok = Local.create_bucket(conn, "odd", retention: 90_061)
+      body = error_body(Local.write(conn, "m v=1i 5", database: "odd"))
+      assert {masked, _bounds} = masked_retention(conn, "odd", body)
+      assert masked =~ "outside retention policy of duration 25h1m1s - "
+    end
+
+    test "the other points of the payload are written", %{conn: conn, now: now} do
+      assert {:error, %{status: 422}} =
+               Local.write(conn, "m v=1i 5\nm v=2i #{now - 60_000_000_000}", database: "short")
+
+      assert {:ok, rows} =
+               Local.query_flux(conn, ~s|from(bucket: "short") \|> range(start: -3h, stop: 1h)|)
+
+      assert Enum.map(rows, & &1["_value"]) == [2]
+    end
+
+    test "a point older than the retention registers no field type", %{conn: conn, now: now} do
+      assert {:error, %{status: 422}} = Local.write(conn, "m v=2.5 5", database: "short")
+      assert {:ok, :written} = Local.write(conn, "m v=1i #{now}", database: "short")
+    end
+
+    test "a point older than the retention is dropped before its fields are judged",
+         %{conn: conn} do
+      body = error_body(Local.write(conn, "m time=1 5", database: "short"))
+      assert {masked, _bounds} = masked_retention(conn, "short", body)
+      assert masked =~ "partial write: dropped 1 points outside retention policy"
+    end
+
+    test "a group's drop is reported instead of the retention drops", %{conn: conn, now: now} do
+      assert {:ok, :written} = Local.write(conn, "m v=1i #{now}", database: "short")
+
+      payload = "m v=1i 5\nm v=2.5 #{now + 1}"
+
+      assert error_body(Local.write(conn, payload, database: "short")) ==
+               drop_body(
+                 "failure writing points to database: partial write: field type conflict: " <>
+                   ~s|input field "v" on measurement "m" is type float, | <>
+                   "already exists as type integer dropped=1"
+               )
+    end
+  end
+
+  describe "delete_bucket/2 — the bucket's data goes with it" do
+    test "a bucket created again has none of the old points" do
+      conn = v2_conn(["b"])
+      assert {:ok, :written} = Local.write(conn, "m v=1i 5", database: "b")
+      assert :ok = Local.delete_bucket(conn, "b")
+      assert :ok = Local.create_bucket(conn, "b")
+
+      assert {:ok, []} = flux_all(conn, "")
+    end
+
+    test "a bucket created again takes another type of a field" do
+      conn = v2_conn(["b"])
+      assert {:ok, :written} = Local.write(conn, "m v=1i 5", database: "b")
+      assert :ok = Local.delete_bucket(conn, "b")
+      assert :ok = Local.create_bucket(conn, "b")
+
+      assert {:ok, :written} = Local.write(conn, "m v=1.5 5", database: "b")
+      assert {:ok, [%{"_value" => 1.5}]} = flux_all(conn, "")
+    end
+
+    test "another bucket keeps its points and its field types" do
+      conn = v2_conn(["b", "other"])
+      assert {:ok, :written} = Local.write(conn, "m v=1i 5", database: "other")
+      assert :ok = Local.delete_bucket(conn, "b")
+
+      assert {:error, %{status: 422}} = Local.write(conn, "m v=1.5 5", database: "other")
+
+      assert {:ok, [%{"_value" => 1}]} =
+               Local.query_flux(conn, ~s|from(bucket: "other") \|> range(start: 0)|)
+    end
+
+    test "the store holds nothing of the bucket" do
+      table = Store.new([])
+      Store.put_bucket(table, "b", %{retention: 0})
+      Store.register_column(table, "b", "m", "v", "iox::column_type::field::integer")
+      Store.store_point(table, "b", stored("m", %{}, 1, 5))
+      Store.store_point(table, "b", stored("m", %{}, 2, 5))
+
+      assert :ok = Store.delete_bucket(table, "b")
+
+      assert Store.points(table, "b", "m") == []
+      assert Store.column_kind(table, "b", "m", "v") == nil
+      assert [] = :ets.match_object(table, {{:series_time, "b", :_, :_, :_}})
+      assert [] = :ets.match_object(table, {{:duplicates, "b", :_}})
+    end
+  end
+
+  describe "query_flux/3 — a field of another type in a later shard group" do
+    test "a bucket of hour-long groups reads up to the first group of another type" do
+      conn = v2_conn([])
+      :ok = Local.create_bucket(conn, "hourly", retention: 10_800)
+      hour = Integer.floor_div(Store.now_ns(), @hour_ns) * @hour_ns
+
+      assert {:ok, :written} =
+               Local.write(
+                 conn,
+                 "m v=1i #{hour - 2 * @hour_ns + 5 * @minute_ns}\n" <>
+                   "m v=2.5 #{hour - @hour_ns + 5 * @minute_ns}\n" <>
+                   "m v=3i #{hour + 5 * @minute_ns}",
+                 database: "hourly"
+               )
+
+      assert {:ok, rows} =
+               Local.query_flux(conn, ~s|from(bucket: "hourly") \|> range(start: -3h, stop: 1h)|)
+
+      assert Enum.map(rows, & &1["_value"]) == [1]
+    end
+  end
+
   describe "list_buckets/1" do
-    test "a bucket carries the engine's fields and a stable orgID" do
+    test "a bucket's orgID is its org's and its id is stable across calls and connections" do
       {:ok, conn} = Local.start(profile: :v2, org: "acme")
       on_exit(fn -> Local.stop(conn) end)
       :ok = Local.create_bucket(conn, "one")
@@ -1148,47 +1401,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       assert {:ok, [one, two]} = Local.list_buckets(conn)
       assert {:ok, [^one, ^two]} = Local.list_buckets(conn)
 
-      assert one |> Map.keys() |> Enum.sort() ==
-               ~w(createdAt id labels links name orgID retentionRules type updatedAt)
-
-      assert %{"type" => "user", "name" => "one", "labels" => [], "orgID" => org_id} = one
-      assert org_id =~ ~r/\A[0-9a-f]{16}\z/
-      assert two["orgID"] == org_id
-      assert one["id"] =~ ~r/\A[0-9a-f]{16}\z/
+      assert two["orgID"] == one["orgID"]
       assert one["id"] != two["id"]
-      assert one["createdAt"] =~ ~r/\A\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}Z\z/
-
-      assert one["retentionRules"] == [
-               %{"type" => "expire", "everySeconds" => 0, "shardGroupDurationSeconds" => 604_800}
-             ]
-
-      assert two["retentionRules"] == [
-               %{
-                 "type" => "expire",
-                 "everySeconds" => 86_400,
-                 "shardGroupDurationSeconds" => 3_600
-               }
-             ]
-
-      assert one["links"] == %{
-               "labels" => "/api/v2/buckets/#{one["id"]}/labels",
-               "members" => "/api/v2/buckets/#{one["id"]}/members",
-               "org" => "/api/v2/orgs/#{org_id}",
-               "owners" => "/api/v2/buckets/#{one["id"]}/owners",
-               "self" => "/api/v2/buckets/#{one["id"]}",
-               "write" => "/api/v2/write?org=#{org_id}&bucket=#{one["id"]}"
-             }
 
       # Another connection to the same org lists the same ids; another org does not.
       {:ok, same} = Local.start(profile: :v2, org: "acme")
       {:ok, other} = Local.start(profile: :v2, org: "other")
-      on_exit(fn -> Local.stop(same) && Local.stop(other) end)
+      on_exit(fn -> Local.stop(same) end)
+      on_exit(fn -> Local.stop(other) end)
       :ok = Local.create_bucket(same, "one")
       :ok = Local.create_bucket(other, "one")
-      assert {:ok, [%{"orgID" => ^org_id, "id" => id}]} = Local.list_buckets(same)
-      assert id == one["id"]
+
+      assert {:ok, [%{"orgID" => same_org, "id" => id}]} = Local.list_buckets(same)
+      assert {same_org, id} == {one["orgID"], one["id"]}
       assert {:ok, [%{"orgID" => other_org}]} = Local.list_buckets(other)
-      assert other_org != org_id
+      assert other_org != one["orgID"]
     end
 
     test "creating a bucket again keeps its creation time" do
@@ -1204,11 +1431,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
   # ---------------------------------------------------------------------------
   # The store
   # ---------------------------------------------------------------------------
-
-  @tasks 12
-
-  defp stored(measurement, tags, v, timestamp),
-    do: %{measurement: measurement, tags: tags, fields: %{"v" => v}, timestamp: timestamp}
 
   describe "Store" do
     test "measurements are listed by name from the schema" do
@@ -1318,19 +1540,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       assert {:ok, %{"id" => 2}} = Store.create_token(table, "t", build)
     end
 
-    test "concurrent first writes cannot pass the database limit" do
+    test "concurrent creates of databases cannot pass the limit" do
       table = Store.new([])
       check = fn existing -> if Enum.count(existing) >= 5, do: {:error, :limit}, else: :ok end
 
       results =
-        1..16
+        1..8
         |> Task.async_stream(fn n -> Store.create_database(table, "db#{n}", check) end,
-          max_concurrency: 16
+          max_concurrency: 8
         )
         |> Enum.map(fn {:ok, result} -> result end)
 
       assert Enum.count(results, &(&1 == :ok)) == 5
-      assert Enum.count(results, &(&1 == {:error, :limit})) == 11
+      assert Enum.count(results, &(&1 == {:error, :limit})) == 3
       assert table |> Store.databases() |> MapSet.size() == 5
     end
 
@@ -1341,6 +1563,63 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       assert :ok = Store.create_database(table, "a", full)
       assert {:error, :limit} = Store.create_database(table, "c", full)
       refute Store.database?(table, "c")
+    end
+
+    test "points of one payload at one series and time are one point, the last write winning" do
+      table = Store.new(["db"])
+      tags = %{"h" => "x"}
+
+      Store.store_points(table, "db", [
+        stored("m", tags, 1, 5),
+        stored("m", %{"h" => "y"}, 7, 5),
+        stored("m", tags, 2, 5)
+      ])
+
+      assert Store.points(table, "db", "m") == [
+               stored("m", tags, 2, 5),
+               stored("m", %{"h" => "y"}, 7, 5)
+             ]
+    end
+
+    test "fields of points at one series and time merge across payloads" do
+      table = Store.new(["db"])
+      tags = %{"h" => "x"}
+      first = %{stored("m", tags, 1, 5) | fields: %{"a" => 1, "b" => 1}}
+      second = %{stored("m", tags, 1, 5) | fields: %{"b" => 2, "c" => 2}}
+
+      Store.store_points(table, "db", [first, stored("m", tags, 9, 6)])
+      Store.store_points(table, "db", [second, stored("m", tags, 8, 7)])
+
+      assert [merged, _six, _seven] = Store.points(table, "db", "m")
+      assert merged.fields == %{"a" => 1, "b" => 2, "c" => 2}
+    end
+
+    test "a payload with no repeat and no earlier write marks no duplicates" do
+      table = Store.new(["db"])
+      Store.store_points(table, "db", for(t <- 1..5, do: stored("m", %{}, t, t)))
+
+      assert [] = :ets.match_object(table, {{:duplicates, "db", :_}})
+      assert table |> Store.points("db", "m") |> length() == 5
+    end
+
+    test "a point without a timestamp is stamped, and stored" do
+      table = Store.new(["db"])
+      before = Store.now_ns()
+      assert Store.store_point(table, "db", stored("m", %{}, 1, nil))
+
+      assert [%{timestamp: stamp}] = Store.points(table, "db", "m")
+      assert stamp >= before
+    end
+
+    test "writers of the same payload at once leave one point per series and time" do
+      table = Store.new(["db"])
+      points = for t <- 1..300, do: stored("m", %{"h" => "x"}, t, t)
+
+      @tasks
+      |> then(&Task.async_stream(1..&1, fn _n -> Store.store_points(table, "db", points) end))
+      |> Stream.run()
+
+      assert Store.points(table, "db", "m") == points
     end
 
     test "points written again after a delete are not merged with the deleted ones" do
@@ -1386,28 +1665,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
   end
 
   describe "Local — concurrency through the double" do
-    test "the database limit holds" do
+    test "first writes to new databases stop at Core's five" do
       {:ok, conn} = Local.start(profile: :v3_core)
       on_exit(fn -> Local.stop(conn) end)
 
       results =
-        1..12
+        1..8
         |> Task.async_stream(
           fn n -> Local.write(conn, "m v=1 #{n}", database: "limit#{n}") end,
-          max_concurrency: 12
+          max_concurrency: 8
         )
         |> Enum.map(fn {:ok, result} -> result end)
 
       assert Enum.count(results, &(&1 == {:ok, :written})) == 5
-      assert Enum.count(results, &match?({:error, %{status: 422}}, &1)) == 7
+      assert Enum.count(results, &match?({:error, %{status: 422}}, &1)) == 3
 
       assert {:ok, listed} = Local.list_databases(conn)
       assert length(listed) == 6
     end
 
-    test "tokens: ids count up from 1" do
-      {:ok, conn} = Local.start(profile: :v3_core)
-      on_exit(fn -> Local.stop(conn) end)
+    test "tokens created at once get the ids 1 up, each its own" do
+      conn = v3_conn([])
 
       ids =
         1..@tasks
@@ -1421,10 +1699,29 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
         |> Enum.map(fn {:ok, id} -> id end)
 
       assert Enum.sort(ids) == Enum.to_list(1..@tasks)
+    end
+
+    test "a taken token name is a 409, and a deleted one comes back with the next id" do
+      conn = v3_conn([])
+      assert {:ok, %{"id" => 1}} = Local.create_token(conn, "tok1")
       assert {:error, %{status: 409}} = Local.create_token(conn, "tok1")
       assert :ok = Local.delete_token(conn, "tok1")
-      assert {:ok, %{"id" => id}} = Local.create_token(conn, "tok1")
-      assert id == @tasks + 1
+      assert {:ok, %{"id" => 2}} = Local.create_token(conn, "tok1")
+    end
+
+    test "writers of one series at once leave one point per time" do
+      conn = v3_conn()
+      payload = Enum.map_join(1..500, "\n", &"m,h=a v=#{&1} #{&1}")
+
+      1..@tasks
+      |> Task.async_stream(fn _n -> Local.write(conn, payload, database: "db") end,
+        max_concurrency: @tasks,
+        timeout: 30_000
+      )
+      |> Enum.each(fn {:ok, result} -> assert result == {:ok, :written} end)
+
+      assert {:ok, rows} = iql(conn, "SELECT v FROM m")
+      assert Enum.map(rows, & &1["v"]) == Enum.map(1..500, &(&1 * 1.0))
     end
   end
 end

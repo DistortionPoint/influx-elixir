@@ -26,6 +26,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
       `parse_v2/2`.
   """
 
+  alias InfluxElixir.Client.Local.Format
+
   @typedoc """
   A parsed point: fields and tags as string-keyed maps, timestamp in ns.
   `:unreadable` marks a point InfluxDB 2 accepts and then never returns
@@ -102,9 +104,9 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
     context = %{precision: precision, dialect: dialect}
     lines = text |> final_newline_off(dialect) |> split_lines()
 
-    case presized(length(lines), fn -> parse_all(lines, text, context) end) do
+    case parse_all(lines, text, context) do
       [] -> {:error, %{status: 400, body: "incoming write was empty"}}
-      results -> {:ok, Enum.reverse(results)}
+      results -> {:ok, results}
     end
   end
 
@@ -123,37 +125,52 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
 
   defp final_newline_off(text, :v3), do: text
 
-  # The results of every line that counts, last first.
+  # The results of every line that counts, in order. A payload's results
+  # are as large as the payload, and a process heap that grows by a fraction
+  # at a time copies everything built so far at each step: parsed in the
+  # caller, 100k lines took 2-3 times as long (measured: 0.8 s against 0.3 s
+  # for lines with tags and two fields). So the lines are parsed 10k at a
+  # time, each full chunk in a short-lived process whose heap starts at
+  # 1M words and whose result is sent back once. A parsed line is 37 to 94
+  # words (measured, bare lines to lines with four tags and three fields),
+  # so 100 words a line holds a chunk without a collection. The caller's own
+  # heap and flags are never touched, only one chunk runs beside it, and a
+  # chunk ends on its own, so it cannot outlive a dead caller by more than
+  # its own parse.
+  @chunk_lines 10_000
+  @chunk_heap_words 1_000_000
+
   @spec parse_all([binary()], binary(), map()) :: [line_result()]
-  defp parse_all(lines, text, %{dialect: dialect} = context) do
-    {results, _count, _physical} =
-      Enum.reduce(lines, {[], 0, nil}, fn line, {acc, count, physical} ->
-        case content(line, dialect) do
-          :skip -> {acc, count, physical}
-          content -> parse_numbered(content, count + 1, text, context, {acc, physical})
-        end
+  defp parse_all(lines, text, context) do
+    {chunks, _count, _physical} =
+      lines
+      |> Enum.chunk_every(@chunk_lines)
+      |> Enum.reduce({[], 0, nil}, fn chunk, {chunks, count, physical} ->
+        {results, count, physical} = parse_chunk(chunk, count, physical, text, context)
+        {[results | chunks], count, physical}
       end)
 
-    results
+    chunks |> Enum.reverse() |> Enum.concat()
   end
 
-  # The parsed points of a big payload are about as large as the payload,
-  # and a process heap that grows by a fraction at a time copies everything
-  # built so far at each step: that is most of the time of parsing 100k
-  # lines. A payload of many lines is parsed in a short-lived process whose
-  # heap is sized for the result up front, and the result sent back once;
-  # the caller's own heap and GC settings are never touched. The cap keeps
-  # a huge payload from asking for more than a heap normally grows to. An
-  # exception in the parse is raised again in the caller, as if the parse
-  # had run there.
-  @presize_from 2_000
-  @words_per_line 160
-  @presize_cap 32_000_000
+  # The results of one chunk, in order, with the numbering and the split
+  # physical lines carried on. A full chunk is parsed in a process of its
+  # own, which ends with the chunk and so cannot outlive its caller by more
+  # than that; a failure in it is raised again in the caller.
+  @spec parse_chunk([binary()], non_neg_integer(), tuple() | nil, binary(), map()) ::
+          {[line_result()], non_neg_integer(), tuple() | nil}
+  defp parse_chunk(chunk, count, physical, text, context) do
+    work = fn -> parse_lines_from(chunk, count, physical, text, context) end
 
-  @spec presized(non_neg_integer(), (-> result)) :: result when result: term()
-  defp presized(lines, fun) when lines < @presize_from, do: fun.()
+    if length(chunk) < @chunk_lines do
+      work.()
+    else
+      in_chunk_process(work)
+    end
+  end
 
-  defp presized(lines, fun) do
+  @spec in_chunk_process((-> result)) :: result when result: term()
+  defp in_chunk_process(work) do
     parent = self()
     ref = make_ref()
 
@@ -162,14 +179,14 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
         fn ->
           outcome =
             try do
-              {:ok, fun.()}
+              {:ok, work.()}
             catch
               kind, reason -> {:raised, kind, reason, __STACKTRACE__}
             end
 
           send(parent, {ref, outcome})
         end,
-        [:monitor, {:min_heap_size, min(lines * @words_per_line, @presize_cap)}]
+        [:monitor, {:min_heap_size, @chunk_heap_words}]
       )
 
     receive do
@@ -184,6 +201,20 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
       {:DOWN, ^monitor, :process, ^pid, reason} ->
         exit(reason)
     end
+  end
+
+  @spec parse_lines_from([binary()], non_neg_integer(), tuple() | nil, binary(), map()) ::
+          {[line_result()], non_neg_integer(), tuple() | nil}
+  defp parse_lines_from(chunk, count, physical, text, %{dialect: dialect} = context) do
+    {results, count, physical} =
+      Enum.reduce(chunk, {[], count, physical}, fn line, {acc, count, physical} ->
+        case content(line, dialect) do
+          :skip -> {acc, count, physical}
+          content -> parse_numbered(content, count + 1, text, context, {acc, physical})
+        end
+      end)
+
+    {Enum.reverse(results), count, physical}
   end
 
   # One line, numbered `number` among the lines that count. The physical
@@ -1497,46 +1528,9 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   @spec render_value(term()) :: binary()
   defp render_value({:uint, n}), do: "#{n}u"
   defp render_value(n) when is_integer(n), do: "#{n}i"
-  defp render_value(f) when is_float(f), do: render_float(f)
+  # Rust's `f64` Display, which the planner's literals share.
+  defp render_value(f) when is_float(f), do: Format.render_decimal(f)
   defp render_value(value), do: to_string(value)
-
-  # Rust's `f64` Display: the shortest digits that round-trip, never in
-  # exponent form, no trailing `.0`.
-  @spec render_float(float()) :: binary()
-  defp render_float(f) when f == 0.0, do: if(<<f::float>> == <<-0.0::float>>, do: "-0", else: "0")
-  defp render_float(f) when f < 0, do: "-" <> render_float(-f)
-
-  defp render_float(f) do
-    {mantissa, exponent} =
-      case :erlang.float_to_binary(f, [:short]) |> String.split("e") do
-        [mantissa, exp] -> {mantissa, String.to_integer(exp)}
-        [mantissa] -> {mantissa, 0}
-      end
-
-    [whole, frac] = String.split(mantissa, ".")
-    digits = whole <> frac
-    point = byte_size(whole) + exponent
-
-    cond do
-      point <= 0 ->
-        "0." <> String.duplicate("0", -point) <> digits
-
-      point >= byte_size(digits) ->
-        digits <> String.duplicate("0", point - byte_size(digits))
-
-      true ->
-        binary_part(digits, 0, point) <>
-          "." <> binary_part(digits, point, byte_size(digits) - point)
-    end
-    |> trim_fraction()
-  end
-
-  @spec trim_fraction(binary()) :: binary()
-  defp trim_fraction(text) do
-    if String.contains?(text, "."),
-      do: text |> String.trim_trailing("0") |> String.trim_trailing("."),
-      else: text |> String.trim_leading("0") |> then(&if(&1 == "", do: "0", else: &1))
-  end
 
   # A key is one column, so a key used as both a tag and a field cannot be
   # typed — on InfluxDB 3 — and a field named twice is refused. They are

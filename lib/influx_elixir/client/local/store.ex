@@ -4,10 +4,11 @@ defmodule InfluxElixir.Client.Local.Store do
   knows the key layout.
 
   One `:ordered_set` per instance, `:public` so `async: true` tests can
-  write from any process. Every mutation is a single insert or delete of
-  its own key, so concurrent writers — tests sharing a database,
-  `BatchWriter` flushes racing direct writes — never read-modify-write a
-  shared value and no write is lost:
+  write from any process, with `write_concurrency` so writers do not queue
+  on one lock. Every mutation is an insert or delete of its own keys (a
+  payload's points go in as one batched insert), so concurrent writers —
+  tests sharing a database, `BatchWriter` flushes racing direct writes —
+  never read-modify-write a shared value and no write is lost:
 
     * `{:database, name}` => `true`
     * `{:bucket, name}` => `%{retention: seconds}`
@@ -16,7 +17,7 @@ defmodule InfluxElixir.Client.Local.Store do
       also gives the id, so a delete can never be overwritten)
     * `{:point, database, measurement, seq}` => the point — `seq` is a
       monotonic integer, so points scan in insertion order
-    * `{:series_time, database, measurement, tags, timestamp}` — one per
+    * `{:series_time, database, measurement, timestamp, tags}` — one per
       point written; a second write of the same key adds
     * `{:duplicates, database, measurement}` — reads merge that
       measurement's duplicate points (same tags and time) only when this
@@ -43,7 +44,7 @@ defmodule InfluxElixir.Client.Local.Store do
   @doc "Creates a store with `databases` registered."
   @spec new(Enumerable.t()) :: t()
   def new(databases) do
-    table = :ets.new(:influx_local, [:ordered_set, :public])
+    table = :ets.new(:influx_local, [:ordered_set, :public, write_concurrency: true])
     Enum.each(databases, &put_database(table, &1))
     table
   end
@@ -117,15 +118,22 @@ defmodule InfluxElixir.Client.Local.Store do
   @spec drop_database(t(), binary()) :: :ok | :error
   def drop_database(table, name) do
     if database?(table, name) do
-      :ets.match_delete(table, {{:point, name, :_, :_}, :_})
-      :ets.match_delete(table, {{:column, name, :_, :_}, :_})
-      :ets.match_delete(table, {{:series_time, name, :_, :_, :_}})
-      :ets.match_delete(table, {{:duplicates, name, :_}})
+      delete_data(table, name)
       :ets.delete(table, {:database, name})
       :ok
     else
       :error
     end
+  end
+
+  # Everything written to a database or bucket: points, schema, the series
+  # index and the duplicate markers.
+  @spec delete_data(t(), binary()) :: true
+  defp delete_data(table, name) do
+    :ets.match_delete(table, {{:point, name, :_, :_}, :_})
+    :ets.match_delete(table, {{:column, name, :_, :_}, :_})
+    :ets.match_delete(table, {{:series_time, name, :_, :_, :_}})
+    :ets.match_delete(table, {{:duplicates, name, :_}})
   end
 
   @doc "Registers a bucket with its metadata (replacing any earlier one)."
@@ -158,6 +166,7 @@ defmodule InfluxElixir.Client.Local.Store do
   def delete_bucket(table, name) do
     if bucket?(table, name) do
       :ets.delete(table, {:bucket, name})
+      delete_data(table, name)
       :ok
     else
       :error
@@ -228,28 +237,75 @@ defmodule InfluxElixir.Client.Local.Store do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Stores a point as written, one insert of its own key. A point without a
-  timestamp gets the server's time here as a fallback; `Client.Local.write/3`
-  stamps a write's untimed lines itself, all with one time, as the engines
-  do.
-
-  Each point is its own object, so concurrent writers never read-modify-write
-  a shared value and no write is lost; an insert is atomic and O(log n).
+  Stores a point as written; see `store_points/3`.
   """
   @spec store_point(t(), binary(), point()) :: true
-  def store_point(table, database, point) do
-    point = assign_default_timestamp(point)
-    seq = :erlang.unique_integer([:monotonic, :positive])
-    series_time = {:series_time, database, point.measurement, point.tags, point.timestamp}
+  def store_point(table, database, point), do: store_points(table, database, [point])
 
-    # A second point at the same series and time marks the measurement, so
-    # reads merge only where a duplicate can exist. `insert_new` is atomic:
-    # of two concurrent writers one sees the other.
-    unless :ets.insert_new(table, {series_time}) do
-      :ets.insert(table, {{:duplicates, database, point.measurement}})
+  @doc """
+  Stores a payload's points as written, each its own object, in one batched
+  insert. A point without a timestamp gets the server's time here as a
+  fallback; `Client.Local.write/3` stamps a write's untimed lines itself,
+  all with one time, as the engines do.
+
+  Concurrent writers never read-modify-write a shared value, so no write is
+  lost. A series and time already written, by this payload or another
+  writer, marks the measurement `duplicates` so reads merge it. The payload's
+  own repeats are found with a map and the keys it adds are claimed by one
+  `insert_new`, which is all-or-nothing: only when another writer holds one
+  of them are the keys claimed singly to find which.
+  """
+  @spec store_points(t(), binary(), [point()]) :: true
+  def store_points(table, database, points) do
+    stamped = Enum.map(points, &assign_default_timestamp/1)
+
+    keys =
+      for point <- stamped,
+          do: {:series_time, database, point.measurement, point.timestamp, point.tags}
+
+    unique = :maps.from_keys(keys, true)
+
+    {claimed, repeated} =
+      if map_size(unique) == length(keys),
+        do: {keys, []},
+        else: {Map.keys(unique), repeated_measurements(keys)}
+
+    taken = claim_series(table, claimed)
+
+    markers = for m <- Enum.uniq(repeated ++ taken), do: {{:duplicates, database, m}}
+    :ets.insert(table, markers)
+
+    :ets.insert(
+      table,
+      for point <- stamped do
+        seq = :erlang.unique_integer([:monotonic, :positive])
+        {{:point, database, point.measurement, seq}, point}
+      end
+    )
+  end
+
+  # The measurements of the series keys that occur more than once.
+  @spec repeated_measurements([tuple()]) :: [binary()]
+  defp repeated_measurements(keys) do
+    {_seen, repeated} =
+      Enum.reduce(keys, {%{}, []}, fn key, {seen, repeated} ->
+        if is_map_key(seen, key),
+          do: {seen, [elem(key, 2) | repeated]},
+          else: {Map.put(seen, key, true), repeated}
+      end)
+
+    repeated
+  end
+
+  # Claims series keys; returns the measurements of the keys another writer
+  # already held.
+  @spec claim_series(t(), [tuple()]) :: [binary()]
+  defp claim_series(table, keys) do
+    if :ets.insert_new(table, for(key <- keys, do: {key})) do
+      []
+    else
+      for key <- keys, not :ets.insert_new(table, {key}), do: elem(key, 2)
     end
-
-    :ets.insert(table, {{:point, database, point.measurement, seq}, point})
   end
 
   @spec assign_default_timestamp(point()) :: point()
@@ -342,7 +398,7 @@ defmodule InfluxElixir.Client.Local.Store do
       |> MapSet.new(&{&1.tags, &1.timestamp})
 
     for {key, point} <- stored, MapSet.member?(doomed, {point.tags, point.timestamp}) do
-      :ets.delete(table, {:series_time, database, measurement, point.tags, point.timestamp})
+      :ets.delete(table, {:series_time, database, measurement, point.timestamp, point.tags})
       :ets.delete(table, key)
     end
 

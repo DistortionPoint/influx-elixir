@@ -49,7 +49,7 @@ defmodule InfluxElixir.Client.Local.Format do
         ) :: {:ok, [map()]} | {:error, term()}
   def answer(format, run, database, params \\ %{}) do
     with :ok <- accept(format, database),
-         :ok <- accept_params(params, format, database),
+         :ok <- check_params(params, format, database),
          {:ok, rows} <- run.() do
       render(rows, format)
     end
@@ -72,35 +72,38 @@ defmodule InfluxElixir.Client.Local.Format do
       else: {:error, %{status: 400, body: unknown_variant(format, database)}}
   end
 
-  # The engine reads a parameter as null, boolean, number or string; its
-  # parser stops at the first object or array, at the end of that value, or
-  # one byte on when the value is the last parameter (the closing brace is
-  # read with it).
-  @spec accept_params(QueryParams.t(), term(), binary() | nil) :: :ok | {:error, map()}
-  defp accept_params(params, format, database) do
+  @doc """
+  The engine's 400 for the request's parameters, or `:ok`. The engine reads
+  a parameter as null, boolean, number or string, and its parser stops at the
+  first object or array, at the end of that value, or one byte on when the
+  value is the last parameter (the closing brace is read with it); at the end
+  of a number it cannot read (`number out of range`). The position counts the
+  bytes of the body `Client.HTTP` sends, which `database` and `format` (`nil`
+  when the request carries none) shape.
+  """
+  @spec check_params(QueryParams.t(), term(), binary() | nil) :: :ok | {:error, map()}
+  def check_params(params, format, database) do
     entries = Map.to_list(params)
 
-    case Enum.find_index(entries, fn {name, value} -> container(name, value) != nil end) do
+    case Enum.find_index(entries, fn {_name, value} -> QueryParams.problem(value) != nil end) do
       nil ->
         :ok
 
       index ->
-        {name, value} = Enum.at(entries, index)
+        {_name, value} = Enum.at(entries, index)
         kept = Enum.take(entries, index + 1)
         read = byte_size(request_head(format, database)) + byte_size(encode_entries(kept))
-        at = if index == length(entries) - 1, do: read + 1, else: read
-        {:error, %{status: 400, body: unsupported_param(container(name, value), at)}}
+        last? = index == length(entries) - 1
+        {:error, %{status: 400, body: params_error(QueryParams.problem(value), read, last?)}}
     end
   end
 
-  @spec container(binary(), term()) :: :object | :array | nil
-  defp container(name, value) do
-    case QueryParams.engine_values(%{name => value}) do
-      %{^name => object} when is_map(object) -> :object
-      %{^name => array} when is_list(array) -> :array
-      _scalar -> nil
-    end
-  end
+  @spec params_error(QueryParams.problem(), pos_integer(), boolean()) :: binary()
+  defp params_error(:out_of_range, at, _last?),
+    do: "serde json error: number out of range at line 1 column #{at}"
+
+  defp params_error(container, at, last?),
+    do: unsupported_param(container, if(last?, do: at + 1, else: at))
 
   @spec unsupported_param(:object | :array, pos_integer()) :: binary()
   defp unsupported_param(:object, at) do
@@ -114,11 +117,13 @@ defmodule InfluxElixir.Client.Local.Format do
   end
 
   # `{"db":"<database>","format":"<format>","params":{` as `Client.HTTP`
-  # writes the start of the request body.
+  # writes the start of the request body; a request with no format (an
+  # `execute_sql`) has no `format` key.
   @spec request_head(term(), binary() | nil) :: binary()
   defp request_head(format, database) do
     db = if database, do: ~s|"db":#{Jason.encode!(database)},|, else: ""
-    "{" <> db <> ~s|"format":#{Jason.encode!(to_string(format))},"params":{|
+    format = if format, do: ~s|"format":#{Jason.encode!(to_string(format))},|, else: ""
+    "{" <> db <> format <> ~s|"params":{|
   end
 
   @spec encode_entries([{binary(), term()}]) :: binary()

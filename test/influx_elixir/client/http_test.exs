@@ -2,6 +2,7 @@ defmodule InfluxElixir.Client.HTTPTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.HTTP
+  alias InfluxElixir.StreamError
 
   # ---------------------------------------------------------------------------
   # init_connection — :database resolution parity with Client.Local
@@ -42,47 +43,130 @@ defmodule InfluxElixir.Client.HTTPTest do
   end
 
   # ---------------------------------------------------------------------------
-  # resolve_timeout/2 precedence (issue #8)
+  # Timeouts (issues #8 and #14)
   #
-  # The HTTP transport previously dropped :timeout on the floor (Finch's 15s
-  # default applied unconditionally). Now opts > connection > 30s default.
+  # The HTTP transport once dropped :timeout on the floor. opts > connection >
+  # default, for the receive timeout and for the pool checkout alike. A server
+  # that accepts a connection and never answers makes the precedence show: the
+  # request returns when the timeout that won runs out, or not at all.
   # ---------------------------------------------------------------------------
 
-  describe "resolve_pool_timeout/2" do
-    test "uses opts :pool_timeout when both opts and conn have it" do
-      assert HTTP.resolve_pool_timeout([pool_timeout: 250], pool_timeout: 9_000) == 250
-    end
+  @timed_out {:error, {:connection_error, %Mint.TransportError{reason: :timeout}}}
 
-    test "falls back to connection :pool_timeout when opts has none" do
-      assert HTTP.resolve_pool_timeout([], pool_timeout: 9_000) == 9_000
-    end
+  # The port of a listener that accepts connections and says nothing; the
+  # test process is told (`:held`) each time it has taken one.
+  defp black_hole do
+    owner = self()
+    {:ok, listener} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true, backlog: 128])
+    {:ok, port} = :inet.port(listener)
+    spawn(fn -> accept_and_hold(listener, owner, []) end)
+    port
+  end
 
-    test "falls back to Finch's 5s default when neither has it" do
-      assert HTTP.resolve_pool_timeout([], []) == 5_000
-    end
+  defp accept_and_hold(listener, owner, sockets) do
+    case :gen_tcp.accept(listener) do
+      {:ok, socket} ->
+        send(owner, :held)
+        accept_and_hold(listener, owner, [socket | sockets])
 
-    test "is independent of :timeout" do
-      assert HTTP.resolve_pool_timeout([timeout: 180_000], timeout: 180_000) == 5_000
+      {:error, _closed} ->
+        :ok
     end
   end
 
-  describe "resolve_timeout/2" do
-    test "uses opts :timeout when both opts and conn have it" do
-      assert HTTP.resolve_timeout([timeout: 5_000], timeout: 60_000) == 5_000
+  # A pool of one connection, so a second request has to wait for the first.
+  defp connection(port, extra) do
+    finch = :"http_test_finch_#{System.unique_integer([:positive])}"
+    start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}}, id: finch)
+
+    [host: "127.0.0.1", port: port, scheme: :http, token: "t", database: "db", finch_name: finch] ++
+      extra
+  end
+
+  # The request's answer, or `:hung` when it is still waiting after `wait` ms.
+  # Each wait is well below the timeout a wrong precedence would apply (30 s
+  # or more for the receive timeout; Finch's 5 s for the pool checkout), and
+  # far above the one under test, so a loaded machine cannot flip the result.
+  defp answer_within(wait, fun) do
+    task = Task.async(fun)
+
+    case Task.yield(task, wait) || Task.shutdown(task, :brutal_kill) do
+      {:ok, answer} -> answer
+      _no_answer -> :hung
+    end
+  end
+
+  # The first request holds the pool's only connection while the black hole
+  # keeps it waiting for an answer.
+  defp hold_the_connection(conn) do
+    task = Task.async(fn -> HTTP.query_sql(conn, "SELECT 1", timeout: 5_000) end)
+    assert_receive :held, 2_000
+    task
+  end
+
+  describe "the receive timeout" do
+    test "the option wins over the connection's" do
+      conn = connection(black_hole(), timeout: 60_000)
+
+      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1", timeout: 150) end) ==
+               @timed_out
     end
 
-    test "falls back to connection :timeout when opts has none" do
-      assert HTTP.resolve_timeout([], timeout: 60_000) == 60_000
+    test "the connection's applies when the option is absent" do
+      conn = connection(black_hole(), timeout: 150)
+      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1") end) == @timed_out
     end
 
-    test "falls back to 30s default when neither has it" do
+    test "a nil option falls through to the connection's" do
+      conn = connection(black_hole(), timeout: 150)
+
+      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1", timeout: nil) end) ==
+               @timed_out
+    end
+
+    test "every query function reads it" do
+      conn = connection(black_hole(), timeout: 150)
+
+      for call <- [
+            fn -> HTTP.query_sql(conn, "SELECT 1") end,
+            fn -> HTTP.execute_sql(conn, "SELECT 1") end,
+            fn -> HTTP.query_influxql(conn, "SELECT 1") end
+          ] do
+        assert {:error, {:connection_error, %Mint.TransportError{reason: :timeout}}} =
+                 answer_within(20_000, call)
+      end
+    end
+
+    test "falls back to 30 seconds when neither names one" do
+      # A wait that long is not worth a test: the default is read directly.
       assert HTTP.resolve_timeout([], host: "h") == 30_000
     end
+  end
 
-    test "ignores nil :timeout in opts" do
-      # Keyword.get(opts, :timeout) returns nil when absent OR when explicitly
-      # set to nil; both should fall through to conn / default.
-      assert HTTP.resolve_timeout([timeout: nil], timeout: 7_000) == 7_000
+  describe "the pool checkout timeout" do
+    test "the option wins over the connection's" do
+      conn = connection(black_hole(), pool_timeout: 60_000)
+      holder = hold_the_connection(conn)
+
+      assert answer_within(3_000, fn -> HTTP.query_sql(conn, "SELECT 1", pool_timeout: 100) end) ==
+               {:error, {:connection_error, :pool_timeout}}
+
+      Task.shutdown(holder, :brutal_kill)
+    end
+
+    test "the connection's applies when the option is absent, and is independent of :timeout" do
+      conn = connection(black_hole(), pool_timeout: 100, timeout: 180_000)
+      holder = hold_the_connection(conn)
+
+      assert answer_within(3_000, fn -> HTTP.query_sql(conn, "SELECT 1") end) ==
+               {:error, {:connection_error, :pool_timeout}}
+
+      Task.shutdown(holder, :brutal_kill)
+    end
+
+    test "falls back to Finch's 5 seconds when neither names one" do
+      assert HTTP.resolve_pool_timeout([], []) == 5_000
+      assert HTTP.resolve_pool_timeout([timeout: 180_000], timeout: 180_000) == 5_000
     end
   end
 
@@ -98,127 +182,72 @@ defmodule InfluxElixir.Client.HTTPTest do
   describe "query_sql_stream/3 — error surfacing" do
     test "raises :no_database when no database can be resolved" do
       conn = [host: "h", token: "t", finch_name: :unused_finch]
-
       stream = HTTP.query_sql_stream(conn, "SELECT 1")
 
-      assert_raise InfluxElixir.StreamError, fn -> Enum.to_list(stream) end
-
-      error =
-        try do
-          Enum.to_list(stream)
-          nil
-        rescue
-          e in InfluxElixir.StreamError -> e
-        end
-
-      assert error.kind == :no_database
+      for _enumeration <- 1..2 do
+        error = assert_raise StreamError, fn -> Enum.to_list(stream) end
+        assert %StreamError{kind: :no_database, status: nil, body: nil, reason: nil} = error
+      end
     end
 
     test "raises :transport on a connection failure rather than yielding []" do
-      finch = :"stream_transport_finch_#{System.unique_integer([:positive])}"
-      start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
-
-      # Port 1 is not listening — Finch will fail to connect.
-      conn = [
-        host: "127.0.0.1",
-        port: 1,
-        scheme: :http,
-        token: "t",
-        database: "test_db",
-        finch_name: finch
-      ]
-
+      conn = connection(1, [])
       stream = HTTP.query_sql_stream(conn, "SELECT 1")
 
-      error =
-        try do
-          Enum.to_list(stream)
-          nil
-        rescue
-          e in InfluxElixir.StreamError -> e
-        end
+      # Port 1 is not listening — Finch will fail to connect.
+      error = assert_raise StreamError, fn -> Enum.to_list(stream) end
 
-      assert error.kind == :transport
-      refute is_nil(error.reason)
+      assert %StreamError{
+               kind: :transport,
+               status: nil,
+               body: nil,
+               reason: %Mint.TransportError{reason: :econnrefused}
+             } = error
     end
   end
 
   # ---------------------------------------------------------------------------
-  # sql_request_body/4 — the JSON a query_sql request carries
+  # What a query carries — parameters the engine cannot be sent
+  #
+  # The body of a request is pinned against the engine in the SQL contract
+  # (`InfluxElixir.Contract.SQLParser`); here is what is refused before any
+  # request is made, and that `params: nil` is not one of them.
   # ---------------------------------------------------------------------------
 
-  describe "sql_request_body/4" do
-    test "sends a Decimal as a JSON number, not a string" do
-      # A string would be compared as text by the engine.
-      assert HTTP.sql_request_body(
-               "db",
-               "select 1",
-               [
-                 params: %{
-                   p: Decimal.new("1000.00"),
-                   q: Decimal.new("-1"),
-                   r: Decimal.new("1.2E+4")
-                 }
-               ],
-               :json
-             ) ==
-               {:ok,
-                ~s|{"db":"db","format":"json","params":{"p":1000.00,"q":-1,"r":12000},"q":"select 1"}|}
-    end
+  describe "a parameter that cannot be sent" do
+    @closed {:error, {:connection_error, %Mint.TransportError{reason: :econnrefused}}}
 
-    test "takes a keyword list as it takes a map, and names every key as a string" do
-      assert HTTP.sql_request_body("db", "select 1", [params: [b: 2, a: "x"]], :jsonl) ==
-               {:ok, ~s|{"db":"db","format":"jsonl","params":{"a":"x","b":2},"q":"select 1"}|}
-
-      assert HTTP.sql_request_body("db", "select 1", [params: %{"$a" => 1}], :json) ==
-               {:ok, ~s|{"db":"db","format":"json","params":{"$a":1},"q":"select 1"}|}
-    end
-
-    test "sends the scalars as JSON, dates as ISO-8601 strings and atoms as names" do
-      params = %{
-        a: nil,
-        b: true,
-        c: 1.5,
-        d: ~D[2024-01-02],
-        e: ~U[2024-01-02 03:04:05.000000Z],
-        f: :name
-      }
-
-      assert HTTP.sql_request_body("db", "select 1", [params: params], :json) ==
-               {:ok,
-                ~s|{"db":"db","format":"json","params":{"a":null,"b":true,"c":1.5,| <>
-                  ~s|"d":"2024-01-02","e":"2024-01-02T03:04:05.000000Z","f":"name"},| <>
-                  ~s|"q":"select 1"}|}
-    end
-
-    test "leaves params an empty object and format out when there is none" do
-      assert HTTP.sql_request_body("db", "select 1", [], nil) ==
-               {:ok, ~s|{"db":"db","params":{},"q":"select 1"}|}
-    end
-
-    test "refuses a Decimal that has no JSON number and a value with no JSON form" do
-      for value <- ["NaN", "Infinity", "-Infinity"] do
-        assert HTTP.sql_request_body("db", "select 1", [params: %{p: Decimal.new(value)}], :json) ==
-                 {:error, {:invalid_param, "p", :non_finite_decimal}},
-               value
-      end
-
-      assert HTTP.sql_request_body("db", "select 1", [params: %{p: {1, 2}}], :json) ==
-               {:error, {:invalid_param, "p", :unsupported_type}}
-    end
-
-    test "a query with such a parameter is not sent" do
+    test "is refused by every query function before anything is sent" do
       conn = [host: "localhost", port: 1, scheme: "http", token: "t", database: "db"]
-      params = [params: %{p: Decimal.new("NaN")}]
 
-      assert HTTP.query_sql(conn, "select 1", params) ==
-               {:error, {:invalid_param, "p", :non_finite_decimal}}
+      for {params, error} <- [
+            {%{p: Decimal.new("NaN")}, {:invalid_param, "p", :non_finite_decimal}},
+            {%{p: Decimal.new("-Infinity")}, {:invalid_param, "p", :non_finite_decimal}},
+            {%{p: {1, 2}}, {:invalid_param, "p", :unsupported_type}},
+            {%{{1, 2} => 1}, {:invalid_param, "{1, 2}", :unsupported_key}},
+            {5, {:invalid_param, "5", :unsupported_params}}
+          ] do
+        opts = [params: params]
 
-      assert HTTP.execute_sql(conn, "select 1", params) ==
-               {:error, {:invalid_param, "p", :non_finite_decimal}}
+        assert HTTP.query_sql(conn, "select 1", opts) == {:error, error}
+        assert HTTP.execute_sql(conn, "select 1", opts) == {:error, error}
 
-      assert_raise InfluxElixir.StreamError, fn ->
-        conn |> HTTP.query_sql_stream("select 1", params) |> Enum.to_list()
+        stream_error =
+          assert_raise StreamError, fn ->
+            conn |> HTTP.query_sql_stream("select 1", opts) |> Enum.to_list()
+          end
+
+        assert %StreamError{kind: :transport, status: nil, body: nil, reason: ^error} =
+                 stream_error
+      end
+    end
+
+    test "does not include nil, an empty list or a keyword list" do
+      conn = connection(1, [])
+
+      for params <- [nil, [], [p: 1], %{}, %{p: Decimal.new("1000.00")}] do
+        assert HTTP.query_sql(conn, "select 1", params: params) == @closed, inspect(params)
+        assert HTTP.execute_sql(conn, "select 1", params: params) == @closed, inspect(params)
       end
     end
   end

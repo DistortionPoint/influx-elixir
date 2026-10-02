@@ -104,14 +104,18 @@ finding below was confirmed against InfluxDB 3 Core 3.10.1 or InfluxDB
   Each engine's escape rules are applied in one pass. The lenient second
   parser is gone.
 - **InfluxDB 2 shard groups.** Local keeps a per-shard-group schema and
-  reports the earliest failing group. The group list is a MapSet.
+  reports the earliest failing group. The group list is a MapSet. (The
+  engine's choice among several failing groups turned out to vary between
+  identical writes; see
+  [`2026-10-02_local-write-concurrency-retention-and-mixed-types`](2026-10-02_local-write-concurrency-retention-and-mixed-types.md).)
 - **Fidelity found by fuzzing.** v3 error line numbering and the
   schema-error echo now match the engine. v2 measurements that the engine
   accepts but never returns are modelled.
 - **Parse speed.**
-  - A payload of 2,000 lines or more is parsed in a short-lived process
-    spawned with a heap sized for the result. An exception is raised
-    again in the caller.
+  - A payload of 2,000 lines or more was parsed in a short-lived process
+    spawned with a heap sized for the result. That process is replaced by
+    chunks of 10k lines, each in a process that ends with it
+    ([`2026-10-02_local-write-concurrency-retention-and-mixed-types`](2026-10-02_local-write-concurrency-retention-and-mixed-types.md)).
   - The first version set `min_heap_size` on the caller and forced a GC
     there. That was replaced, because a library must not change the GC
     settings of the process that calls it.
@@ -121,7 +125,7 @@ finding below was confirmed against InfluxDB 3 Core 3.10.1 or InfluxDB
   - Each fact is pinned once, in a contract module that runs on Local and
     on the engines.
   - Fidelity files keep only whole-shape unit tests of public functions.
-  - Stress tests use 12 to 16 tasks.
+  - Stress tests use 4 to 8 tasks.
   - The optional-dependency check walks the AST.
   - The gate list now includes `MIX_ENV=test mix compile --force
     --warnings-as-errors`.

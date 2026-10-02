@@ -113,12 +113,13 @@ defmodule InfluxElixir.Client.Local.Flux do
   def run(%{stages: stages}, points) do
     {range, rest} = split_range(stages)
     {start_ns, stop_ns} = range
+    bounds = {datetime(start_ns), datetime(stop_ns)}
 
     tables =
       points
       |> Enum.filter(&(&1.timestamp >= start_ns and &1.timestamp < stop_ns))
-      |> Enum.flat_map(&timed_rows(&1, start_ns, stop_ns))
-      |> Enum.group_by(fn {_ns, row} -> series_key(row) end)
+      |> Enum.flat_map(&timed_rows(&1, bounds))
+      |> Enum.group_by(fn {key, _timed} -> key end, fn {_key, timed} -> timed end)
       |> Enum.sort_by(fn {key, _rows} -> key end)
       |> Enum.map(fn {_key, timed} -> table_rows(timed) end)
 
@@ -157,35 +158,31 @@ defmodule InfluxElixir.Client.Local.Flux do
     timed |> Enum.sort_by(fn {ns, _row} -> ns end) |> Enum.map(fn {_ns, row} -> row end)
   end
 
-  @spec timed_rows(map(), integer(), integer()) :: [{integer(), map()}]
-  defp timed_rows(point, start_ns, stop_ns) do
-    for row <- rows(point, start_ns, stop_ns), do: {point.timestamp, row}
-  end
+  # The tag names a row's own columns would shadow; a series is told apart
+  # by the tags that are left.
+  @reserved_columns ["_measurement", "_field", "_value", "_time", "_start", "_stop"]
 
-  @spec rows(map(), integer(), integer()) :: [map()]
-  defp rows(point, start_ns, stop_ns) do
+  # A point's rows, one per field, each with its series key — the engine's
+  # series order: measurement, then the tag set, then field — and the
+  # stored nanoseconds it is ordered by. The point's own parts are built
+  # once, not once per field.
+  @spec timed_rows(map(), {DateTime.t(), DateTime.t()}) ::
+          [{{binary(), [{binary(), binary()}], binary()}, {integer(), map()}}]
+  defp timed_rows(point, {start, stop}) do
+    series = point.tags |> Map.drop(@reserved_columns) |> Enum.sort()
+
     base =
       Map.merge(point.tags, %{
         "_measurement" => point.measurement,
-        "_start" => datetime(start_ns),
-        "_stop" => datetime(stop_ns),
+        "_start" => start,
+        "_stop" => stop,
         "_time" => datetime(point.timestamp)
       })
 
     for {field, value} <- point.fields do
-      Map.merge(base, %{"_field" => field, "_value" => value})
+      row = base |> Map.put("_field", field) |> Map.put("_value", value)
+      {{point.measurement, series, field}, {point.timestamp, row}}
     end
-  end
-
-  # The engine's series order: measurement, then the tag set, then field.
-  @spec series_key(map()) :: {binary(), [{binary(), binary()}], binary()}
-  defp series_key(row) do
-    tags =
-      row
-      |> Map.drop(["_measurement", "_field", "_value", "_time", "_start", "_stop"])
-      |> Enum.sort()
-
-    {row["_measurement"], tags, row["_field"]}
   end
 
   @spec apply_stage(stage(), {[[map()]], binary()}) :: {[[map()]], binary()}

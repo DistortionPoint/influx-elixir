@@ -39,7 +39,7 @@ defmodule InfluxElixir.Integration.ContractV2Test do
       flunk("InfluxDB v2 not reachable on port 8086")
     end
 
-    {:ok, conn: base_conn, database: base_conn[:database], query_delay: 500}
+    {:ok, conn: base_conn, database: base_conn[:database], query_delay: 500, time_slack: 60}
   end
 
   # Bucket names are per org. The name lookup behind `delete_bucket/2`

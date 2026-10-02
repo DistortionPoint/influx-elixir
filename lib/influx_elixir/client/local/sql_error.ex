@@ -47,6 +47,19 @@ defmodule InfluxElixir.Client.Local.SQLError do
   end
 
   @doc """
+  An error the optimizer's `simplify_expressions` pass raises while it folds
+  a constant (an unparseable timestamp string, an invalid regular
+  expression): `Optimizer rule 'simplify_expressions' failed\\ncaused by\\n<message>`,
+  status 500. It comes after the planner's own errors.
+  """
+  @spec simplify(binary()) :: t()
+  def simplify(message),
+    do: %{
+      status: 500,
+      body: "Optimizer rule 'simplify_expressions' failed\ncaused by\n" <> message
+    }
+
+  @doc """
   The engine's internal error for a BETWEEN whose operand and bound have no
   common type (a type coercion error, status 500).
   """

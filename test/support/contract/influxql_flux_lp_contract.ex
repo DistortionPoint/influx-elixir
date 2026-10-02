@@ -33,9 +33,11 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
             helpers(client),
             v2_line_protocol_helpers(client),
             v2_line_protocol_tests(client),
+            v2_retention_tests(client),
             v2_flux_helpers(client),
             v2_flux_range_tests(client),
             v2_flux_data_tests(client),
+            v2_flux_type_tests(client),
             v2_bucket_tests(client)
           ]
 
@@ -49,7 +51,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   end
 
   defp helpers(client) do
-    quote do
+    quote location: :keep do
       defp ifl_name(prefix),
         do: "#{prefix}_#{100_000_000 + System.unique_integer([:positive])}"
 
@@ -69,7 +71,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   # ---------------------------------------------------------------------------
 
   defp v3_line_protocol_tests(client) do
-    quote do
+    quote location: :keep do
       # `~m` is the measurement. After the first field that parses, what
       # does not is trailing content: from the comma when it is the
       # third field or later, after it for the second.
@@ -113,22 +115,27 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           end
         end
 
-        test "what the engine's grammar lets through is written", ctx do
-          for template <- [
+        test "what the engine's grammar lets through is stored as the columns it names", ctx do
+          for {template, columns} <- [
                 # a trailing comma, a comma in a field key, a tag key that
                 # starts with one or holds one, an `=` inside a tag value
-                "~m v=1, 5",
-                "~m a,b=1 5",
-                "~m,,t=1 v=1 5",
-                "~m,t,u=1 v=1 5",
-                "~m,t=a=b v=1 5",
-                "~m v=1.5e3 5"
+                {"~m v=1, 1000", %{"v" => 1.0}},
+                {"~m a,b=1 1000", %{"a,b" => 1.0}},
+                {"~m,,t=1 v=1 1000", %{",t" => "1", "v" => 1.0}},
+                {"~m,t,u=1 v=1 1000", %{"t,u" => "1", "v" => 1.0}},
+                {"~m,t=a=b v=1 1000", %{"t" => "a=b", "v" => 1.0}},
+                {"~m v=1.5e3 1000", %{"v" => 1500.0}}
               ] do
-            line = String.replace(template, "~m", ifl_name("ifl_ok"))
+            m = ifl_name("ifl_ok")
+            ifl_write(ctx, [String.replace(template, "~m", m)])
 
-            assert {:ok, :written} =
-                     unquote(client).write(ctx.conn, line, database: ctx.database),
-                   line
+            assert {:ok, [row]} =
+                     unquote(client).query_influxql(ctx.conn, "SELECT * FROM #{m}",
+                       database: ctx.database
+                     )
+
+            assert row["time"] == ifl_us(1), template
+            assert Map.drop(row, ["time", "iox::measurement"]) == columns, template
           end
         end
 
@@ -205,7 +212,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   # ---------------------------------------------------------------------------
 
   defp v3_influxql_tests(client) do
-    quote do
+    quote location: :keep do
       defp ifl_iq(ctx, statement) do
         unquote(client).query_influxql(ctx.conn, statement, database: ctx.database)
       end
@@ -333,8 +340,8 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   # InfluxDB 2 line protocol
   # ---------------------------------------------------------------------------
 
-  defp v2_line_protocol_helpers(_client) do
-    quote do
+  defp v2_line_protocol_helpers(client) do
+    quote location: :keep do
       # The Go parser's words; `~m` is the measurement.
       @ifl_v2_errors [
         {"this is not line protocol!!", "invalid field format"},
@@ -370,23 +377,57 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       # today's shard group and a timed one in its own week; the message is
       # the first drop of the earliest group that dropped any, and `dropped`
       # counts that group's drops.
+      # Each payload with every drop the engine may report. When more than one
+      # shard group fails, the engine reports one of them and which one varies
+      # between identical writes (verified: 10 of 12 the earliest group's, 2 of
+      # 12 another's); the double always reports the earliest group's, listed
+      # first.
       @ifl_v2_drops [
-        {"~m time=1 5\n~m v=1i 6", :invalid, "~m", 2},
-        {"~m v=1i 6\n~m time=1 5", :conflict, "~m", 2},
-        {"~m v=1i 6\n~m v=2i 6\n~m time=1 5\n~m time=1 6", :conflict, "~m", 4},
-        {"~m time=1\n~m v=1i 5", :conflict, "~m", 1},
-        {"~m v=1i 5\n~m time=1", :conflict, "~m", 1},
-        {"~m time=1\n~m time=2 5\n~n time=3", :invalid, "~m", 1},
-        {"~n time=3\n~m time=3", :invalid, "~n", 2},
-        {"~m v=1i 1000000000000000\n~m v=2i 1\n~m time=1 2", :conflict, "~m", 2},
-        {"~m time=1 5\n~m v=1i 1000000000000000", :invalid, "~m", 1},
-        {"~m v=1i 1000000000000000\n~m time=1 5", :invalid, "~m", 1},
-        {"~m time=1 1000000000000000\n~m v=1i 5", :conflict, "~m", 1},
-        {"~m v=1i 5\n~m time=1 1000000000000000\n~m time=1 3000000000000000", :conflict, "~m", 1}
+        {"~m time=1 5\n~m v=1i 6", [{:invalid, "~m", 2}]},
+        {"~m v=1i 6\n~m time=1 5", [{:conflict, "~m", 2}]},
+        {"~m v=1i 6\n~m v=2i 6\n~m time=1 5\n~m time=1 6", [{:conflict, "~m", 4}]},
+        {"~m time=1\n~m v=1i 5", [{:conflict, "~m", 1}, {:invalid, "~m", 1}]},
+        {"~m v=1i 5\n~m time=1", [{:conflict, "~m", 1}, {:invalid, "~m", 1}]},
+        {"~m time=1\n~m time=2 5\n~n time=3", [{:invalid, "~m", 1}, {:invalid, "~m", 2}]},
+        {"~n time=3\n~m time=3", [{:invalid, "~n", 2}]},
+        {"~m v=1i 1000000000000000\n~m v=2i 1\n~m time=1 2", [{:conflict, "~m", 2}]},
+        {"~m time=1 5\n~m v=1i 1000000000000000", [{:invalid, "~m", 1}]},
+        {"~m v=1i 1000000000000000\n~m time=1 5", [{:invalid, "~m", 1}]},
+        {"~m time=1 1000000000000000\n~m v=1i 5", [{:conflict, "~m", 1}, {:invalid, "~m", 1}]},
+        {"~m v=1i 5\n~m time=1 1000000000000000\n~m time=1 3000000000000000",
+         [{:conflict, "~m", 1}, {:invalid, "~m", 1}]}
       ]
 
       defp ifl_v2_invalid(message),
         do: %{"code" => "invalid", "message" => message}
+
+      # A bucket that keeps two hours; the engine's id and clock are masked.
+      defp ifl_retention_bucket(ctx) do
+        name = ifl_name("ifl_rb")
+        :ok = unquote(client).create_bucket(ctx.conn, name, retention: 7200)
+        ifl_delete_after(ctx, name)
+        name
+      end
+
+      defp ifl_masked(body) do
+        update_in(Jason.decode!(body)["message"], fn message ->
+          message
+          |> String.replace(~r/Lower Bound at \d{4}-[-\d:.TZ]+/, "Lower Bound at BOUND")
+          |> String.replace(~r/for database: [0-9a-f]{16} /, "for database: ID ")
+        end)
+      end
+
+      defp ifl_retention_message(count, oldest, oldest_time, newest, newest_time) do
+        drop = fn which, key, time ->
+          "#{which} point #{key} at #{time} dropped because it violates a " <>
+            "Retention Policy Lower Bound at BOUND"
+        end
+
+        "failure writing points to database: partial write: dropped #{count} points outside " <>
+          "retention policy of duration 2h0m0s - #{drop.("oldest", oldest, oldest_time)}, " <>
+          "#{drop.("newest", newest, newest_time)} dropped=#{count} " <>
+          "for database: ID for retention policy: autogen"
+      end
 
       defp ifl_v2_drop_message(:invalid, measurement, dropped) do
         "failure writing points to database: partial write: invalid field name: " <>
@@ -402,7 +443,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   end
 
   defp v2_line_protocol_tests(client) do
-    quote do
+    quote location: :keep do
       describe "line protocol grammar — InfluxDB 2 contract" do
         test "a line that does not parse is a 400 in the Go parser's words", ctx do
           for {template, reason} <- @ifl_v2_errors do
@@ -443,15 +484,13 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                    )
         end
 
-        test "leading whitespace, comments and blank lines are skipped", ctx do
+        test "leading whitespace, comments and blank lines are skipped, the point is stored",
+             ctx do
           m = ifl_name("ifl_ws")
+          ifl_write(ctx, ["", "  # a comment", "   ", "\t#{m} v=1 5", ""])
 
-          assert {:ok, :written} =
-                   unquote(client).write(
-                     ctx.conn,
-                     "\n  # a comment\n   \n\t#{m} v=1 5\n",
-                     database: ctx.database
-                   )
+          assert {:ok, [row]} = ifl_flux(ctx, ifl_measurement_query(ctx, m, 100))
+          assert {row["_measurement"], row["_field"], row["_value"]} == {m, "v", 1.0}
         end
 
         test "a line left open by a quote is quoted without the payload's final newline",
@@ -486,18 +525,26 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           n = ifl_name("ifl_dropn")
           ifl_write(ctx, ["#{m} v=1.5 5"])
 
-          for {template, kind, name, dropped} <- @ifl_v2_drops do
+          for {template, drops} <- @ifl_v2_drops do
             payload = template |> String.replace("~m", m) |> String.replace("~n", n)
-            speaker = String.replace(name, "~m", m) |> String.replace("~n", n)
+
+            messages =
+              for {kind, name, dropped} <- drops do
+                speaker = name |> String.replace("~m", m) |> String.replace("~n", n)
+
+                %{
+                  "code" => "unprocessable entity",
+                  "message" => ifl_v2_drop_message(kind, speaker, dropped)
+                }
+              end
 
             assert {:error, %{status: 422, body: body}} =
                      unquote(client).write(ctx.conn, payload, database: ctx.database)
 
-            assert Jason.decode!(body) == %{
-                     "code" => "unprocessable entity",
-                     "message" => ifl_v2_drop_message(kind, speaker, dropped)
-                   },
-                   template
+            # The double's answer is the first; the engine's is any of them.
+            if unquote(client) == InfluxElixir.Client.Local,
+              do: assert(Jason.decode!(body) == hd(messages), template),
+              else: assert(Jason.decode!(body) in messages, template)
           end
         end
       end
@@ -509,7 +556,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   # ---------------------------------------------------------------------------
 
   defp v2_flux_helpers(client) do
-    quote do
+    quote location: :keep do
       # A real server outlives the test, so its bucket is deleted after it;
       # the double may be gone by then.
       defp ifl_delete_after(ctx, name) do
@@ -525,11 +572,17 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       defp ifl_range(ctx, stop), do: String.replace(ctx.head, "STOP", stop)
 
       defp ifl_flux(ctx, query), do: unquote(client).query_flux(ctx.conn, query)
+
+      # Everything of one measurement from the epoch to `stop` seconds.
+      defp ifl_measurement_query(ctx, measurement, stop) do
+        ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: #{stop}) | <>
+          ~s|\|> filter(fn: (r) => r._measurement == "#{measurement}")|
+      end
     end
   end
 
   defp v2_flux_range_tests(_client) do
-    quote do
+    quote location: :keep do
       describe "Flux range — InfluxDB 2 contract" do
         setup ctx do
           m = ifl_name("ifl_fx")
@@ -574,8 +627,41 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     end
   end
 
-  defp v2_flux_data_tests(client) do
-    quote do
+  defp v2_flux_data_tests(_client) do
+    quote location: :keep do
+      # A time in the nth week from 2023-01-04, in nanoseconds: every week is
+      # a shard group of a bucket that keeps everything.
+      defp ifl_week(n), do: (1_672_790_400 + n * 604_800) * 1_000_000_000
+
+      # What a read of the measurement over all of 2023 returns, as
+      # `{field, tag t, value}` sorted.
+      defp ifl_weeks(ctx, m) do
+        assert {:ok, rows} =
+                 ifl_flux(
+                   ctx,
+                   ~s|from(bucket: "#{ctx.database}") \|> range(start: 1672531200, stop: 1704067200) | <>
+                     ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
+                 )
+
+        rows |> Enum.map(&{&1["_field"], &1["t"], &1["_value"]}) |> Enum.sort()
+      end
+
+      defp ifl_filter_base(ctx),
+        do: ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) |
+
+      defp ifl_filter_fixture(ctx) do
+        [a, b, c] = for p <- ["ifl_fa", "ifl_fb", "ifl_fc"], do: ifl_name(p)
+
+        ifl_write(ctx, [
+          "#{a},h=x v=1 1000000000",
+          "#{b},h=x v=2 1000000000",
+          "#{c},h=x v=3 1000000000",
+          "#{a},h=y v=4 2000000000"
+        ])
+
+        %{a: a, b: b, c: c}
+      end
+
       describe "Flux data and bucket listing — InfluxDB 2 contract" do
         test "first and last choose by the stored nanoseconds, not the microsecond shown",
              ctx do
@@ -592,40 +678,211 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           end
         end
 
-        test "a filter on _measurement reads only those, and the tables are numbered the same",
+        test "a filter on two measurements reads only those, numbering the tables across them",
              ctx do
-          [a, b, c] = for p <- ["ifl_fa", "ifl_fb", "ifl_fc"], do: ifl_name(p)
-
-          ifl_write(ctx, [
-            "#{a},h=x v=1 1000000000",
-            "#{b},h=x v=2 1000000000",
-            "#{c},h=x v=3 1000000000",
-            "#{a},h=y v=4 2000000000"
-          ])
-
-          base = ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) |
+          %{a: a, c: c} = ifl_filter_fixture(ctx)
           either = ~s/|> filter(fn: (r) => r._measurement == "#{a}" or r._measurement == "#{c}")/
 
-          assert {:ok, rows} = ifl_flux(ctx, base <> either)
+          assert {:ok, rows} = ifl_flux(ctx, ifl_filter_base(ctx) <> either)
 
           assert Enum.map(rows, &{&1["table"], &1["_measurement"], &1["h"], &1["_value"]}) ==
                    [{0, a, "x", 1.0}, {1, a, "y", 4.0}, {2, c, "x", 3.0}]
+        end
+
+        test "a filter on one measurement numbers its first table 0", ctx do
+          %{b: b} = ifl_filter_fixture(ctx)
 
           assert {:ok, [%{"table" => 0, "_value" => 2.0}]} =
-                   ifl_flux(ctx, base <> ~s/|> filter(fn: (r) => r._measurement == "#{b}")/)
+                   ifl_flux(
+                     ctx,
+                     ifl_filter_base(ctx) <> ~s/|> filter(fn: (r) => r._measurement == "#{b}")/
+                   )
+        end
+
+        test "a filter on a measurement that does not exist reads nothing", ctx do
+          ifl_filter_fixture(ctx)
 
           assert {:ok, []} =
-                   ifl_flux(ctx, base <> ~s/|> filter(fn: (r) => r._measurement == "nope")/)
+                   ifl_flux(
+                     ctx,
+                     ifl_filter_base(ctx) <>
+                       ~s/|> filter(fn: (r) => r._measurement == "nope")/
+                   )
+        end
+
+        test "a filter on a measurement and a tag reads that series only", ctx do
+          %{a: a} = ifl_filter_fixture(ctx)
 
           assert {:ok, [%{"table" => 0, "_value" => 4.0}]} =
                    ifl_flux(
                      ctx,
-                     base <>
+                     ifl_filter_base(ctx) <>
                        ~s/|> filter(fn: (r) => r._measurement == "#{a}" and r.h == "y")/
                    )
         end
 
-        test "a field may be another type in another shard group; a read sees the earliest's",
+        test "a quote in a tag value does not join the next line to it", ctx do
+          m = ifl_name("ifl_fq")
+          ifl_write(ctx, [~s|#{m},t=a"b f=1i 1000000000|, "#{m} f=2i 2000000000"])
+
+          assert {:ok, rows} =
+                   ifl_flux(
+                     ctx,
+                     ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) | <>
+                       ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
+                   )
+
+          assert rows |> Enum.map(&{&1["t"], &1["_value"]}) |> Enum.sort() ==
+                   [{nil, 2}, {~s|a"b|, 1}]
+        end
+
+        test "a measurement with a single escaped comma is readable under its unescaped name",
+             ctx do
+          m = ifl_name("ifl_esc")
+          ifl_write(ctx, ["#{m}\\,t=a v=1i 1000000000"])
+
+          assert {:ok, [%{"_measurement" => name, "_value" => 1}]} =
+                   ifl_flux(
+                     ctx,
+                     ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) | <>
+                       ~s|\|> filter(fn: (r) => r._measurement == "#{m},t=a")|
+                   )
+
+          assert name == "#{m},t=a"
+        end
+
+        test "a measurement whose escapes the index and the data read differently is not read",
+             ctx do
+          field = ifl_name("ifl_gone_f")
+          sentinel = ifl_name("ifl_here")
+
+          gone =
+            for suffix <- [~S|\\,x|, ~S|\\ x|, ~S|\=x|, ~S|\"x|, ~S|\\=x|],
+                do: "#{ifl_name("ifl_gone")}#{suffix} #{field}=1i 1000000000"
+
+          ifl_write(ctx, gone ++ ["#{sentinel} #{field}=2i 1000000000"])
+
+          assert {:ok, rows} =
+                   ifl_flux(
+                     ctx,
+                     ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) | <>
+                       ~s|\|> filter(fn: (r) => r._field == "#{field}")|
+                   )
+
+          assert Enum.map(rows, &{&1["_measurement"], &1["_value"]}) == [{sentinel, 2}]
+        end
+      end
+    end
+  end
+
+  defp v2_retention_tests(client) do
+    quote location: :keep do
+      describe "line protocol retention — InfluxDB 2 contract" do
+        test "a point older than the bucket's retention is dropped, the others are written",
+             ctx do
+          bucket = ifl_retention_bucket(ctx)
+          m = ifl_name("ifl_old")
+          fresh = System.os_time(:nanosecond) - 60_000_000_000
+
+          payload =
+            "#{m},t=b,u=c v=1i 1672790400000000001\n" <>
+              "#{m},t=a v=2i 1672790400123456789\n#{m} v=3i #{fresh}"
+
+          assert {:error, %{status: 422, body: body}} =
+                   unquote(client).write(ctx.conn, payload, database: bucket)
+
+          assert ifl_masked(body) == %{
+                   "code" => "unprocessable entity",
+                   "message" =>
+                     ifl_retention_message(
+                       2,
+                       "#{m},t=b,u=c",
+                       "2023-01-04T00:00:00.000000001Z",
+                       "#{m},t=a",
+                       "2023-01-04T00:00:00.123456789Z"
+                     )
+                 }
+
+          assert {:ok, rows} =
+                   ifl_flux(
+                     ctx,
+                     ~s|from(bucket: "#{bucket}") \|> range(start: -1h) | <>
+                       ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
+                   )
+
+          assert Enum.map(rows, & &1["_value"]) == [3]
+        end
+
+        test "a series key in a retention drop is sorted by tag and escaped", ctx do
+          bucket = ifl_retention_bucket(ctx)
+          m = ifl_name("ifl_oldkey")
+
+          payload = ~s|#{m}\\ x\\,y,b\\ k\\=1=v\\,2\\ 3,a=z v=1i 1672790400000000000|
+
+          assert {:error, %{status: 422, body: body}} =
+                   unquote(client).write(ctx.conn, payload, database: bucket)
+
+          key = ~s|#{m}\\ x\\,y,a=z,b\\ k\\=1=v\\,2\\ 3|
+
+          assert ifl_masked(body)["message"] ==
+                   ifl_retention_message(
+                     1,
+                     key,
+                     "2023-01-04T00:00:00Z",
+                     key,
+                     "2023-01-04T00:00:00Z"
+                   )
+        end
+
+        test "a point older than the retention registers no field and is dropped whatever it is",
+             ctx do
+          bucket = ifl_retention_bucket(ctx)
+          m = ifl_name("ifl_oldtype")
+          now = System.os_time(:nanosecond)
+
+          for payload <- [
+                "#{m} v=2.5 1672790400000000000\n#{m} v=1i #{now}",
+                "#{m} time=1 1672790400000000000\n#{m} v=1i #{now + 1}"
+              ] do
+            assert {:error, %{status: 422, body: body}} =
+                     unquote(client).write(ctx.conn, payload, database: bucket)
+
+            assert Jason.decode!(body)["message"] =~
+                     "partial write: dropped 1 points outside retention policy of duration 2h0m0s"
+          end
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, "#{m} v=3i #{now + 2}", database: bucket)
+        end
+
+        test "a type conflict in a group is reported instead of the retention drops", ctx do
+          bucket = ifl_retention_bucket(ctx)
+          m = ifl_name("ifl_oldconf")
+          now = System.os_time(:nanosecond)
+
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, "#{m} v=1i #{now}", database: bucket)
+
+          assert {:error, %{status: 422, body: body}} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "#{m} v=1i 1672790400000000000\n#{m} v=2.5 #{now + 1}",
+                     database: bucket
+                   )
+
+          assert Jason.decode!(body)["message"] ==
+                   "failure writing points to database: partial write: field type conflict: " <>
+                     ~s|input field "v" on measurement "#{m}" is type float, | <>
+                     "already exists as type integer dropped=1"
+        end
+      end
+    end
+  end
+
+  defp v2_flux_type_tests(client) do
+    quote location: :keep do
+      describe "Flux field types per shard group — InfluxDB 2 contract" do
+        test "a field of another type in a later shard group is not read after the first one",
              ctx do
           m = ifl_name("ifl_type")
 
@@ -659,48 +916,63 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           assert read.(1_000_000) == [1, 2]
         end
 
-        test "a quote in a tag value does not join the next line to it", ctx do
-          m = ifl_name("ifl_fq")
-          ifl_write(ctx, [~s|#{m},t=a"b f=1i 1000000000|, "#{m} f=2i 2000000000"])
+        test "after the first group of another type, no later group of the field is read", ctx do
+          m = ifl_name("ifl_cut")
 
-          assert {:ok, rows} =
-                   ifl_flux(
-                     ctx,
-                     ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) | <>
-                       ~s|\|> filter(fn: (r) => r._measurement == "#{m}")|
-                   )
+          ifl_write(ctx, [
+            "#{m} f=1i #{ifl_week(0)}",
+            "#{m} f=2i #{ifl_week(1)}",
+            "#{m} f=3.5 #{ifl_week(2)}",
+            "#{m} f=4i #{ifl_week(3)}"
+          ])
 
-          assert rows |> Enum.map(&{&1["t"], &1["_value"]}) |> Enum.sort() ==
-                   [{nil, 2}, {~s|a"b|, 1}]
+          assert ifl_weeks(ctx, m) == [{"f", nil, 1}, {"f", nil, 2}]
         end
 
-        test "a measurement with a single escaped comma is readable under its unescaped name",
+        test "a group that differs from the first hides the rest, even of the first's type",
              ctx do
-          m = ifl_name("ifl_esc")
-          ifl_write(ctx, ["#{m}\\,t=a v=1i 1000000000"])
+          m = ifl_name("ifl_cutfloat")
 
-          assert {:ok, [%{"_measurement" => name, "_value" => 1}]} =
-                   ifl_flux(
-                     ctx,
-                     ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) | <>
-                       ~s|\|> filter(fn: (r) => r._measurement == "#{m},t=a")|
-                   )
+          ifl_write(ctx, [
+            "#{m} f=1i #{ifl_week(0)}",
+            "#{m} f=2.5 #{ifl_week(1)}",
+            "#{m} f=3.5 #{ifl_week(2)}",
+            "#{m} f=4i #{ifl_week(3)}"
+          ])
 
-          assert name == "#{m},t=a"
+          assert ifl_weeks(ctx, m) == [{"f", nil, 1}]
         end
 
-        test "a measurement whose escapes the index and the data read differently is accepted",
-             ctx do
-          for suffix <- [~S|\\,x|, ~S|\\ x|, ~S|\=x|, ~S|\"x|, ~S|\\=x|] do
-            ifl_write(ctx, ["#{ifl_name("ifl_gone")}#{suffix} v=1i 1000000000"])
-          end
+        test "the cut is per measurement and field, across the tag sets", ctx do
+          m = ifl_name("ifl_cuttags")
+
+          ifl_write(ctx, [
+            "#{m},t=a f=1i #{ifl_week(0)}",
+            "#{m},t=b f=1i #{ifl_week(0)}",
+            "#{m},t=a f=2.5 #{ifl_week(1)}",
+            "#{m},t=b f=3i #{ifl_week(2)}"
+          ])
+
+          assert ifl_weeks(ctx, m) == [{"f", "a", 1}, {"f", "b", 1}]
+        end
+
+        test "a field that conflicts in a group does not cut the other fields", ctx do
+          m = ifl_name("ifl_cutfield")
+
+          ifl_write(ctx, [
+            "#{m} f=1i,g=1i #{ifl_week(0)}",
+            "#{m} f=2.5,g=2i #{ifl_week(1)}",
+            "#{m} f=3i,g=3i #{ifl_week(2)}"
+          ])
+
+          assert ifl_weeks(ctx, m) == [{"f", nil, 1}, {"g", nil, 1}, {"g", nil, 2}, {"g", nil, 3}]
         end
       end
     end
   end
 
   defp v2_bucket_tests(client) do
-    quote do
+    quote location: :keep do
       describe "Bucket listing — InfluxDB 2 contract" do
         test "a listed bucket carries the engine's fields", ctx do
           name = ifl_name("ifl_bkt")
@@ -741,6 +1013,22 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                  }
 
           assert Enum.all?(buckets, &(&1["orgID"] == org_id or &1["type"] == "system"))
+        end
+
+        test "a bucket deleted and created again starts empty and takes any field type", ctx do
+          name = ifl_name("ifl_again")
+          :ok = unquote(client).create_bucket(ctx.conn, name, [])
+          ifl_delete_after(ctx, name)
+
+          assert {:ok, :written} = unquote(client).write(ctx.conn, "m v=1i 5", database: name)
+          assert :ok = unquote(client).delete_bucket(ctx.conn, name)
+          assert :ok = unquote(client).create_bucket(ctx.conn, name, [])
+          assert {:ok, :written} = unquote(client).write(ctx.conn, "m v=1.5 6", database: name)
+
+          assert {:ok, rows} =
+                   ifl_flux(ctx, ~s|from(bucket: "#{name}") \|> range(start: 0, stop: 100)|)
+
+          assert Enum.map(rows, & &1["_value"]) == [1.5]
         end
 
         test "the shard group of a bucket follows its retention", ctx do

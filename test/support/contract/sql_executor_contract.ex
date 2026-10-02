@@ -17,13 +17,14 @@ defmodule InfluxElixir.Contract.SQLExecutor do
     client = Keyword.fetch!(opts, :client)
     profile = Keyword.fetch!(opts, :profile)
 
-    quote do
+    quote location: :keep do
       unquote(helpers(client))
       unquote(planning_tests())
       unquote(null_between_tests())
       unquote(plan_order_tests())
       unquote(boolean_tests(client))
       unquote(result_tests())
+      unquote(integer_tests())
       unquote(division_tests(client))
       unquote(wording_tests())
       unquote(join_tests(profile))
@@ -31,7 +32,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
   end
 
   defp helpers(client) do
-    quote do
+    quote location: :keep do
       @sxc_closed {:error, {:connection_error, %Mint.TransportError{reason: :closed}}}
 
       defp sxc_name(prefix), do: "#{prefix}_#{100_000_000 + System.unique_integer([:positive])}"
@@ -78,7 +79,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
   end
 
   defp planning_tests do
-    quote do
+    quote location: :keep do
       describe "SQL executor — contract: nulls and planning" do
         test "a null in an IN list makes a miss unknown", ctx do
           m = sxc_mixed(ctx)
@@ -198,7 +199,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
   end
 
   defp result_tests do
-    quote do
+    quote location: :keep do
       describe "SQL executor — contract: results" do
         test "GROUP BY time is a row per distinct time", ctx do
           m = sxc_mixed(ctx)
@@ -347,8 +348,85 @@ defmodule InfluxElixir.Contract.SQLExecutor do
     end
   end
 
+  defp integer_tests do
+    quote location: :keep do
+      describe "SQL executor — contract: Int64 arithmetic" do
+        @int64_max 9_223_372_036_854_775_807
+        @int64_min -9_223_372_036_854_775_808
+
+        test "+, -, * and negation wrap in two's complement", ctx do
+          m = sxc_name("sxc_wrap")
+
+          sxc_write(ctx, [
+            "#{m} y=1i 1000000000",
+            "#{m} y=2i 2000000000",
+            "#{m} y=#{@int64_min}i 3000000000"
+          ])
+
+          select =
+            "SELECT y + #{@int64_max} AS a, y - #{@int64_max} AS b, y * #{@int64_max} AS c, " <>
+              "-y AS d, y * 2 AS e, y - 1 AS f, y * -1 AS g FROM #{m} ORDER BY time"
+
+          assert sxc_rows(ctx, select) == [
+                   %{
+                     "a" => @int64_min,
+                     "b" => -@int64_max + 1,
+                     "c" => @int64_max,
+                     "d" => -1,
+                     "e" => 2,
+                     "f" => 0,
+                     "g" => -1
+                   },
+                   %{
+                     "a" => @int64_min + 1,
+                     "b" => -@int64_max + 2,
+                     "c" => -2,
+                     "d" => -2,
+                     "e" => 4,
+                     "f" => 1,
+                     "g" => -2
+                   },
+                   %{
+                     "a" => -1,
+                     "b" => 1,
+                     "c" => @int64_min,
+                     "d" => @int64_min,
+                     "e" => 0,
+                     "f" => @int64_max,
+                     "g" => @int64_min
+                   }
+                 ]
+        end
+
+        test "a constant and a WHERE wrap as a column does", ctx do
+          m = sxc_name("sxc_wrap_where")
+          sxc_write(ctx, ["#{m} y=1i 1000000000", "#{m} y=-5i 2000000000"])
+
+          assert sxc_rows(
+                   ctx,
+                   "SELECT #{@int64_max} * 2 AS a, -#{@int64_max} - 2 AS b FROM #{m} LIMIT 1"
+                 ) == [%{"a" => -2, "b" => @int64_max}]
+
+          assert sxc_rows(ctx, "SELECT y FROM #{m} WHERE y + #{@int64_max} < 0 ORDER BY time") ==
+                   [%{"y" => 1}]
+        end
+
+        test "the minimum divided by -1 closes the connection; its remainder is 0", ctx do
+          m = sxc_name("sxc_wrap_div")
+          sxc_write(ctx, ["#{m} y=#{@int64_min}i 1000000000"])
+
+          assert sxc_query(ctx, "SELECT y / -1 AS a FROM #{m}") == @sxc_closed
+          assert sxc_rows(ctx, "SELECT y % -1 AS a FROM #{m}") == [%{"a" => 0}]
+
+          assert sxc_rows(ctx, "SELECT y / 1 AS a, y / 2 AS b FROM #{m}") ==
+                   [%{"a" => @int64_min, "b" => -4_611_686_018_427_387_904}]
+        end
+      end
+    end
+  end
+
   defp division_tests(client) do
-    quote do
+    quote location: :keep do
       describe "SQL executor — contract: division by zero" do
         test "dividing an integer by the integer zero closes the connection", ctx do
           m = sxc_mixed(ctx)
@@ -362,6 +440,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
 
         # The engine's infinity and NaN show as null in a response but
         # compare as numbers; the double, which cannot hold them, refuses.
+        @tag :local_divergence
         test "a float divided by zero is infinity on the engine; the double refuses it", ctx do
           m = sxc_name("sxc_fz")
           sxc_write(ctx, ["#{m} v=1i 1000000000", "#{m} v=2i 2000000000"])
@@ -399,7 +478,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
   end
 
   defp wording_tests do
-    quote do
+    quote location: :keep do
       describe "SQL executor — contract: the planner's wording" do
         test "a float compared with a string is compared as the text the engine writes", ctx do
           m = sxc_name("sxc_fl")
@@ -469,7 +548,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
   end
 
   defp join_tests(profile) do
-    quote do
+    quote location: :keep do
       describe "SQL executor — contract: joins, groups and formats" do
         test "an unqualified column on both sides of a CROSS JOIN is ambiguous", ctx do
           left = sxc_name("sxc_px")
@@ -589,7 +668,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
   end
 
   defp null_between_tests do
-    quote do
+    quote location: :keep do
       describe "SQL executor — contract: NULL bounds" do
         test "a null bound makes BETWEEN unknown, with three-valued AND", ctx do
           m = sxc_name("sxc_between")
@@ -613,7 +692,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
   end
 
   defp plan_order_tests do
-    quote do
+    quote location: :keep do
       describe "SQL executor — contract: which planning error comes first" do
         test "the select list's calls, operators and aggregates, then WHERE, then ORDER BY",
              ctx do
@@ -730,7 +809,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
   end
 
   defp boolean_tests(client) do
-    quote do
+    quote location: :keep do
       describe "SQL executor — contract: a boolean is comparable with a boolean" do
         test "a comparison, an IN list and a BETWEEN name the types", ctx do
           m = sxc_mixed(ctx)
@@ -812,6 +891,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
           assert sxc_query(ctx, "SELECT v FROM #{m} WHERE b = $p", params: %{p: nil}) == {:ok, []}
         end
 
+        @tag :local_divergence
         test "a boolean written first is the engine's or refused by name", ctx do
           m = sxc_mixed(ctx)
           sql = "SELECT v FROM #{m} WHERE true = b ORDER BY time"

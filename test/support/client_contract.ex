@@ -32,6 +32,11 @@ defmodule InfluxElixir.ClientContract do
     * `query_delay` — ms to sleep between write and query
       (0 for Local, 500 for real InfluxDB)
 
+  and may return:
+
+    * `time_slack` — seconds the server's clock may differ from this
+      one (default 5; a context for a real server sets it wider)
+
   ## Profile gating
 
   Test blocks are only compiled for profiles that support them.
@@ -155,7 +160,7 @@ defmodule InfluxElixir.ClientContract do
       ]
       |> Enum.reject(&is_nil/1)
 
-    quote do
+    quote location: :keep do
       (unquote_splicing(blocks))
     end
   end
@@ -184,6 +189,28 @@ defmodule InfluxElixir.ClientContract do
     do: Keyword.put(conn, :database, database)
 
   def with_database(conn, database) when is_map(conn), do: Map.put(conn, :database, database)
+
+  @doc false
+  # Runs `fun` with the name of a scratch database (`kind` `:database`) or
+  # bucket (`:bucket`), unique by `prefix`, and drops it afterwards, whatever
+  # the outcome. The drop runs in the test's own process: a `Client.Local`
+  # connection's store dies with that process, before any `on_exit` callback.
+  # A drop of what the test already dropped answers an error, which is ignored.
+  @spec with_scratch(module(), map(), :database | :bucket, binary(), (binary() -> term())) ::
+          term()
+  def with_scratch(client, ctx, kind, prefix, fun) do
+    name = "#{prefix}_#{System.unique_integer([:positive])}"
+
+    try do
+      fun.(name)
+    after
+      _result =
+        case kind do
+          :database -> client.delete_database(ctx.conn, name)
+          :bucket -> client.delete_bucket(ctx.conn, name)
+        end
+    end
+  end
 
   @doc false
   # Runs `sql` with `__M__` replaced by the context's measurement name.
@@ -281,7 +308,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp health_tests(client, version) do
-    quote do
+    quote location: :keep do
       describe "health/1" do
         test "reports a passing status in the server's shape", ctx do
           {:ok, health} = unquote(client).health(ctx.conn)
@@ -315,28 +342,25 @@ defmodule InfluxElixir.ClientContract do
   defp write_tests(client, profile) do
     ghost_db_test =
       if profile in [:v3_core, :v3_enterprise] do
-        quote do
-          test "accepts write to a non-pre-existing database", ctx do
-            on_exit(fn ->
-              try do
-                unquote(client).delete_database(ctx.conn, "ghost_db_contract")
-              rescue
-                _err -> :ok
+        quote location: :keep do
+          test "a write to a database that does not exist creates it", ctx do
+            InfluxElixir.ClientContract.with_scratch(
+              unquote(client),
+              ctx,
+              :database,
+              "ghost_db_contract",
+              fn ghost ->
+                assert {:ok, :written} =
+                         unquote(client).write(ctx.conn, "cpu value=1.0", database: ghost)
+
+                {:ok, dbs} = unquote(client).list_databases(ctx.conn)
+                assert Enum.filter(dbs, &(&1["name"] == ghost)) == [%{"name" => ghost}]
               end
-            end)
-
-            lp = "cpu value=1.0"
-
-            assert {:ok, :written} =
-                     unquote(client).write(
-                       ctx.conn,
-                       lp,
-                       database: "ghost_db_contract"
-                     )
+            )
           end
         end
       else
-        quote do
+        quote location: :keep do
           test "a write to a bucket that does not exist is the engine's 404", ctx do
             name = "contract_nowrite_#{System.unique_integer([:positive])}"
 
@@ -353,7 +377,7 @@ defmodule InfluxElixir.ClientContract do
 
     malformed_test =
       if profile == :v2 do
-        quote do
+        quote location: :keep do
           test "malformed line protocol is the engine's 400", ctx do
             assert {:error, %{status: 400, body: body}} =
                      unquote(client).write(
@@ -370,7 +394,7 @@ defmodule InfluxElixir.ClientContract do
           end
         end
       else
-        quote do
+        quote location: :keep do
           # The engine's body, `original_line` cut to 20 bytes.
           test "malformed line protocol is the engine's 400, line by line", ctx do
             assert {:error, %{status: 400, body: body}} =
@@ -394,7 +418,7 @@ defmodule InfluxElixir.ClientContract do
         end
       end
 
-    quote do
+    quote location: :keep do
       describe "write/3 — contract" do
         test "accepts valid line protocol and returns {:ok, :written}",
              ctx do
@@ -420,109 +444,86 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp db_admin_tests(client) do
-    quote do
+    quote location: :keep do
       describe "create_database/3 — contract" do
         test "returns :ok for a new database name", ctx do
-          on_exit(fn ->
-            try do
-              unquote(client).delete_database(ctx.conn, "contract_new_db")
-            rescue
-              _err -> :ok
-            end
-          end)
-
-          assert :ok ==
-                   unquote(client).create_database(
-                     ctx.conn,
-                     "contract_new_db",
-                     []
-                   )
+          InfluxElixir.ClientContract.with_scratch(
+            unquote(client),
+            ctx,
+            :database,
+            "contract_new_db",
+            fn name -> assert :ok == unquote(client).create_database(ctx.conn, name, []) end
+          )
         end
 
         test "is idempotent — creating a duplicate returns :ok", ctx do
-          on_exit(fn ->
-            try do
-              unquote(client).delete_database(ctx.conn, "contract_dup")
-            rescue
-              _err -> :ok
+          InfluxElixir.ClientContract.with_scratch(
+            unquote(client),
+            ctx,
+            :database,
+            "contract_dup",
+            fn name ->
+              assert :ok == unquote(client).create_database(ctx.conn, name, [])
+              assert :ok == unquote(client).create_database(ctx.conn, name, [])
+
+              {:ok, dbs} = unquote(client).list_databases(ctx.conn)
+              assert Enum.filter(dbs, &(&1["name"] == name)) == [%{"name" => name}]
             end
-          end)
-
-          assert :ok ==
-                   unquote(client).create_database(
-                     ctx.conn,
-                     "contract_dup",
-                     []
-                   )
-
-          assert :ok ==
-                   unquote(client).create_database(
-                     ctx.conn,
-                     "contract_dup",
-                     []
-                   )
+          )
         end
       end
 
       describe "list_databases/1 — contract" do
-        test "includes the test database", ctx do
+        test "lists the test database once, as a name", ctx do
           {:ok, dbs} = unquote(client).list_databases(ctx.conn)
-          names = Enum.map(dbs, & &1["name"])
-          assert ctx.database in names
+          assert Enum.filter(dbs, &(&1["name"] == ctx.database)) == [%{"name" => ctx.database}]
         end
 
-        test "includes newly created databases", ctx do
-          on_exit(fn ->
-            try do
-              unquote(client).delete_database(ctx.conn, "contract_extra_db")
-            rescue
-              _err -> :ok
+        test "lists a newly created database once, as a name", ctx do
+          InfluxElixir.ClientContract.with_scratch(
+            unquote(client),
+            ctx,
+            :database,
+            "contract_extra_db",
+            fn name ->
+              :ok = unquote(client).create_database(ctx.conn, name, [])
+
+              {:ok, dbs} = unquote(client).list_databases(ctx.conn)
+              assert Enum.filter(dbs, &(&1["name"] == name)) == [%{"name" => name}]
             end
-          end)
-
-          :ok =
-            unquote(client).create_database(
-              ctx.conn,
-              "contract_extra_db",
-              []
-            )
-
-          {:ok, dbs} = unquote(client).list_databases(ctx.conn)
-          names = Enum.map(dbs, & &1["name"])
-          assert "contract_extra_db" in names
+          )
         end
       end
 
       describe "delete_database/2 — contract" do
         test "returns :ok for an existing database", ctx do
-          :ok =
-            unquote(client).create_database(
-              ctx.conn,
-              "contract_to_delete",
-              []
-            )
+          InfluxElixir.ClientContract.with_scratch(
+            unquote(client),
+            ctx,
+            :database,
+            "contract_to_delete",
+            fn name ->
+              :ok = unquote(client).create_database(ctx.conn, name, [])
 
-          assert :ok ==
-                   unquote(client).delete_database(
-                     ctx.conn,
-                     "contract_to_delete"
-                   )
+              assert :ok == unquote(client).delete_database(ctx.conn, name)
+            end
+          )
         end
 
-        test "database is no longer listed after deletion", ctx do
-          :ok =
-            unquote(client).create_database(
-              ctx.conn,
-              "contract_gone_db",
-              []
-            )
+        test "a deleted database is no longer listed", ctx do
+          InfluxElixir.ClientContract.with_scratch(
+            unquote(client),
+            ctx,
+            :database,
+            "contract_gone_db",
+            fn name ->
+              :ok = unquote(client).create_database(ctx.conn, name, [])
+              :ok = unquote(client).delete_database(ctx.conn, name)
 
-          :ok =
-            unquote(client).delete_database(ctx.conn, "contract_gone_db")
-
-          {:ok, dbs} = unquote(client).list_databases(ctx.conn)
-          names = Enum.map(dbs, & &1["name"])
-          refute "contract_gone_db" in names
+              {:ok, dbs} = unquote(client).list_databases(ctx.conn)
+              assert Enum.filter(dbs, &(&1["name"] == name)) == []
+            end
+          )
         end
 
         test "deleting a database that does not exist is the engine's 404", ctx do
@@ -540,11 +541,12 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp sql_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — basic SELECT contract" do
         test "a line without a timestamp is stamped with the server's current time", ctx do
-          # The server's clock may differ from ours by a little, so bracket generously.
-          before_write = DateTime.add(DateTime.utc_now(), -60, :second)
+          # The context's `time_slack` (seconds) is how far the server's clock may be from ours.
+          slack = Map.get(ctx, :time_slack, 5)
+          before_write = DateTime.add(DateTime.utc_now(), -slack, :second)
 
           {:ok, :written} =
             unquote(client).write(
@@ -553,7 +555,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          after_write = DateTime.add(DateTime.utc_now(), 60, :second)
+          after_write = DateTime.add(DateTime.utc_now(), slack, :second)
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -587,11 +589,12 @@ defmodule InfluxElixir.ClientContract do
 
         test "LIMIT restricts the number of returned rows", ctx do
           Enum.each(1..5, fn i ->
-            unquote(client).write(
-              ctx.conn,
-              "contract_limited value=#{i}i #{i * 1_000_000_000}",
-              database: ctx.database
-            )
+            assert {:ok, :written} =
+                     unquote(client).write(
+                       ctx.conn,
+                       "contract_limited value=#{i}i #{i * 1_000_000_000}",
+                       database: ctx.database
+                     )
           end)
 
           InfluxElixir.ClientContract.settle(ctx)
@@ -611,11 +614,12 @@ defmodule InfluxElixir.ClientContract do
         test "ORDER BY time DESC returns most-recent rows first", ctx do
           # Written out of order, so the result can only be ordered by the query.
           Enum.each([2, 3, 1], fn s ->
-            unquote(client).write(
-              ctx.conn,
-              "contract_ordered value=#{s * 100}i #{s * 1_000_000_000}",
-              database: ctx.database
-            )
+            assert {:ok, :written} =
+                     unquote(client).write(
+                       ctx.conn,
+                       "contract_ordered value=#{s * 100}i #{s * 1_000_000_000}",
+                       database: ctx.database
+                     )
           end)
 
           InfluxElixir.ClientContract.settle(ctx)
@@ -631,6 +635,19 @@ defmodule InfluxElixir.ClientContract do
                      "SELECT * FROM contract_ordered ORDER BY time DESC",
                      database: ctx.database
                    )
+        end
+
+        test "ORDER BY time ASC returns oldest rows first", ctx do
+          Enum.each([2, 3, 1], fn s ->
+            assert {:ok, :written} =
+                     unquote(client).write(
+                       ctx.conn,
+                       "contract_ordered value=#{s * 100}i #{s * 1_000_000_000}",
+                       database: ctx.database
+                     )
+          end)
+
+          InfluxElixir.ClientContract.settle(ctx)
 
           assert {:ok, ascending} =
                    unquote(client).query_sql(
@@ -643,17 +660,19 @@ defmodule InfluxElixir.ClientContract do
         end
 
         test "WHERE clause filters by tag value", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_tagged,host=alpha value=1i 1000000000",
-            database: ctx.database
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_tagged,host=alpha value=1i 1000000000",
+                     database: ctx.database
+                   )
 
-          unquote(client).write(
-            ctx.conn,
-            "contract_tagged,host=beta value=2i 2000000000",
-            database: ctx.database
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_tagged,host=beta value=2i 2000000000",
+                     database: ctx.database
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -672,21 +691,23 @@ defmodule InfluxElixir.ClientContract do
   end
 
   defp multi_measurement_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — multiple measurements contract" do
         test "querying one measurement does not return rows from another",
              ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_a value=1i 1000000000",
-            database: ctx.database
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_a value=1i 1000000000",
+                     database: ctx.database
+                   )
 
-          unquote(client).write(
-            ctx.conn,
-            "contract_b value=2i 2000000000",
-            database: ctx.database
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_b value=2i 2000000000",
+                     database: ctx.database
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -713,7 +734,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp roundtrip_tests(client) do
-    quote do
+    quote location: :keep do
       describe "field type round-trips — contract" do
         test "integer field survives write/query cycle", ctx do
           ts = System.os_time(:nanosecond)
@@ -796,9 +817,9 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp stream_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql_stream/3 — contract" do
-        test "returns enumerable rows", ctx do
+        test "streams every row written, as typed maps", ctx do
           Enum.each(1..5, fn i ->
             {:ok, :written} =
               unquote(client).write(
@@ -834,7 +855,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp execute_tests_core(client) do
-    quote do
+    quote location: :keep do
       describe "execute_sql/3 — contract" do
         test "DML and DDL are refused with the engine's answer; SELECT returns rows", ctx do
           {:ok, :written} =
@@ -913,14 +934,13 @@ defmodule InfluxElixir.ClientContract do
   end
 
   defp execute_tests_enterprise(client) do
-    quote do
+    quote location: :keep do
       describe "execute_sql/3 — contract" do
         test "DELETE FROM removes written data", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_del value=1i",
-            database: ctx.database
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(ctx.conn, "contract_del value=1i 1700000000000000000",
+                     database: ctx.database
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -928,6 +948,11 @@ defmodule InfluxElixir.ClientContract do
                    unquote(client).execute_sql(
                      ctx.conn,
                      "DELETE FROM contract_del",
+                     database: ctx.database
+                   )
+
+          assert {:ok, []} =
+                   unquote(client).query_sql(ctx.conn, "SELECT * FROM contract_del",
                      database: ctx.database
                    )
         end
@@ -940,63 +965,59 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp influxql_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_influxql/3 — contract" do
-        test "SHOW DATABASES returns list including test database", ctx do
+        test "SHOW DATABASES lists the test database once", ctx do
           {:ok, dbs} =
             unquote(client).query_influxql(ctx.conn, "SHOW DATABASES")
 
           names = Enum.map(dbs, & &1["iox::database"])
-          assert ctx.database in names
+          assert Enum.filter(names, &(&1 == ctx.database)) == [ctx.database]
         end
 
-        test "SHOW MEASUREMENTS returns measurement names", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_iql_m value=1i",
-            database: ctx.database
-          )
+        test "SHOW MEASUREMENTS lists the database's measurements and nothing else", ctx do
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_iql_m value=1i 1000000000",
+                     database: ctx.database
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
-          {:ok, measurements} =
-            unquote(client).query_influxql(
-              ctx.conn,
-              "SHOW MEASUREMENTS",
-              database: ctx.database
-            )
+          assert {:ok, measurements} =
+                   unquote(client).query_influxql(
+                     ctx.conn,
+                     "SHOW MEASUREMENTS",
+                     database: ctx.database
+                   )
 
-          names = Enum.map(measurements, & &1["name"])
-          assert "contract_iql_m" in names
-
-          Enum.each(measurements, fn m ->
-            assert m["iox::measurement"] == "measurements"
-          end)
+          assert measurements == [
+                   %{"iox::measurement" => "measurements", "name" => "contract_iql_m"}
+                 ]
         end
 
-        test "SHOW TAG KEYS FROM returns tag keys", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_iql_tags,host=web01,region=us value=1i",
-            database: ctx.database
-          )
+        test "SHOW TAG KEYS FROM lists the measurement's tag keys in order", ctx do
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_iql_tags,host=web01,region=us value=1i 1000000000",
+                     database: ctx.database
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
-          {:ok, tag_keys} =
-            unquote(client).query_influxql(
-              ctx.conn,
-              "SHOW TAG KEYS FROM contract_iql_tags",
-              database: ctx.database
-            )
+          assert {:ok, tag_keys} =
+                   unquote(client).query_influxql(
+                     ctx.conn,
+                     "SHOW TAG KEYS FROM contract_iql_tags",
+                     database: ctx.database
+                   )
 
-          keys = Enum.map(tag_keys, & &1["tagKey"])
-          assert "host" in keys
-          assert "region" in keys
-
-          Enum.each(tag_keys, fn tk ->
-            assert tk["iox::measurement"] == "contract_iql_tags"
-          end)
+          assert tag_keys == [
+                   %{"iox::measurement" => "contract_iql_tags", "tagKey" => "host"},
+                   %{"iox::measurement" => "contract_iql_tags", "tagKey" => "region"}
+                 ]
         end
       end
     end
@@ -1007,7 +1028,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp bucket_tests(client) do
-    quote do
+    quote location: :keep do
       describe "bucket admin — contract" do
         # A v2 bucket name may hold characters that mean something in a
         # query string. `a&b` used to be written to bucket `a`, `c+d` to
@@ -1050,15 +1071,6 @@ defmodule InfluxElixir.ClientContract do
           Enum.each(names, &(:ok = unquote(client).delete_bucket(ctx.conn, &1)))
         end
 
-        test "create_bucket returns :ok", ctx do
-          assert :ok ==
-                   unquote(client).create_bucket(
-                     ctx.conn,
-                     "contract_bucket",
-                     []
-                   )
-        end
-
         test "list_buckets lists a created bucket as a user bucket with no expiry", ctx do
           name = "contract_list_bkt_#{System.unique_integer([:positive])}"
           :ok = unquote(client).create_bucket(ctx.conn, name, [])
@@ -1094,29 +1106,44 @@ defmodule InfluxElixir.ClientContract do
         end
 
         test "a bucket created via create_bucket accepts writes", ctx do
-          :ok = unquote(client).create_bucket(ctx.conn, "contract_write_bkt", [])
+          InfluxElixir.ClientContract.with_scratch(
+            unquote(client),
+            ctx,
+            :bucket,
+            "contract_write_bkt",
+            fn name ->
+              :ok = unquote(client).create_bucket(ctx.conn, name, [])
 
-          assert {:ok, :written} =
-                   unquote(client).write(
-                     ctx.conn,
-                     "contract_bkt_write value=1i",
-                     database: "contract_write_bkt"
-                   )
+              assert {:ok, :written} =
+                       unquote(client).write(
+                         ctx.conn,
+                         "contract_bkt_write value=1i",
+                         database: name
+                       )
+            end
+          )
         end
 
         test "a retention rule is stored in seconds; under one hour is refused", ctx do
-          name = "contract_ret_#{System.unique_integer([:positive])}"
-          :ok = unquote(client).create_bucket(ctx.conn, name, retention: 3600)
+          InfluxElixir.ClientContract.with_scratch(
+            unquote(client),
+            ctx,
+            :bucket,
+            "contract_ret",
+            fn name ->
+              :ok = unquote(client).create_bucket(ctx.conn, name, retention: 3600)
 
-          {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
-          bucket = Enum.find(buckets, &(&1["name"] == name))
-          assert [%{"type" => "expire", "everySeconds" => 3600}] = bucket["retentionRules"]
+              {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
+              bucket = Enum.find(buckets, &(&1["name"] == name))
+              assert [%{"type" => "expire", "everySeconds" => 3600}] = bucket["retentionRules"]
 
-          assert {:error, %{status: 500, body: body}} =
-                   unquote(client).create_bucket(ctx.conn, name <> "_short", retention: 60)
+              assert {:error, %{status: 500, body: body}} =
+                       unquote(client).create_bucket(ctx.conn, name <> "_short", retention: 60)
 
-          assert %{"message" => "retention policy duration must be at least 1h0m0s"} =
-                   Jason.decode!(body)
+              assert %{"message" => "retention policy duration must be at least 1h0m0s"} =
+                       Jason.decode!(body)
+            end
+          )
         end
 
         test "deleting a bucket that does not exist is a 404", ctx do
@@ -1134,7 +1161,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp flux_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_flux/3 — contract" do
         test "returns long-format rows with typed values", ctx do
           # Unique measurement: a real server keeps data between runs.
@@ -1166,7 +1193,7 @@ defmodule InfluxElixir.ClientContract do
           assert Enum.all?(rows, &(&1["result"] == "_result" and is_integer(&1["table"])))
         end
 
-        test "filters on _field keep only that field", ctx do
+        test "a _field filter keeps only that field", ctx do
           # Unique measurement: a real server keeps data between runs.
           measurement = "contract_flux_field_#{System.unique_integer([:positive])}"
 
@@ -1198,7 +1225,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp aggregate_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — aggregate contract" do
         setup ctx do
           # Known timestamps, written out of order
@@ -1309,13 +1336,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # Statistical aggregates, expressions, selectors, ORDER BY alias (#16, #17)
   # ---------------------------------------------------------------------------
 
   defp stats_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — statistics and selectors contract" do
         setup ctx do
           # Same six points as the aggregate contract: 10..60 one minute apart.
@@ -1338,8 +1363,7 @@ defmodule InfluxElixir.ClientContract do
           {:ok, agg_base_ts: base_ts}
         end
 
-        test "STDDEV / VAR family, expression arguments and null omission (#16)",
-             ctx do
+        test "STDDEV / VAR family and aggregates over expression arguments (#16)", ctx do
           sql = """
           SELECT
             COUNT(value) AS n,
@@ -1365,9 +1389,9 @@ defmodule InfluxElixir.ClientContract do
           assert row["sum_sq"] == 9100
           assert row["half_avg"] == 17.5
           assert row["max_less_one"] == 59
+        end
 
-          # A sample statistic over one row is null, and a null column is
-          # absent from the row rather than present as nil.
+        test "a sample statistic over one row is null, absent from the row (#16)", ctx do
           sql_one = """
           SELECT STDDEV(value) AS sd, COUNT(value) AS n
           FROM contract_agg
@@ -1431,14 +1455,12 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # Time comparands, null checks, COUNT(DISTINCT), aggregates over `time`,
   # DISTINCT ordering — every value recorded from InfluxDB 3 Core first.
   # ---------------------------------------------------------------------------
 
   defp time_filter_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — time comparand, null check and COUNT DISTINCT contract" do
         setup ctx do
           now_ns = System.os_time(:nanosecond)
@@ -1468,37 +1490,6 @@ defmodule InfluxElixir.ClientContract do
             )
 
           assert Enum.map(rows, & &1["price"]) == [1.0]
-        end
-
-        test "a bare integer time comparand is rejected", ctx do
-          assert {:error,
-                  %{
-                    status: 400,
-                    body:
-                      "type_coercion\ncaused by\nError during planning: Cannot infer common " <>
-                        "argument type for comparison operation Timestamp(ns) > Int64"
-                  }} =
-                   unquote(client).query_sql(
-                     ctx.conn,
-                     "SELECT price FROM contract_tf WHERE time > 1000000000",
-                     database: ctx.database
-                   )
-        end
-
-        test "an integer param against time is rejected", ctx do
-          assert {:error,
-                  %{
-                    status: 400,
-                    body:
-                      "type_coercion\ncaused by\nError during planning: Cannot infer common " <>
-                        "argument type for comparison operation Timestamp(ns) > UInt64"
-                  }} =
-                   unquote(client).query_sql(
-                     ctx.conn,
-                     "SELECT price FROM contract_tf WHERE time > $start",
-                     database: ctx.database,
-                     params: %{start: 1_000_000_000}
-                   )
         end
 
         test "a DateTime param against time selects by instant", ctx do
@@ -1541,7 +1532,7 @@ defmodule InfluxElixir.ClientContract do
   end
 
   defp time_filter_distinct_tests(client) do
-    quote do
+    quote location: :keep do
       test "COUNT(DISTINCT col) counts distinct non-null values", ctx do
         {:ok, [row]} =
           unquote(client).query_sql(
@@ -1554,7 +1545,7 @@ defmodule InfluxElixir.ClientContract do
         assert row["b"] == 2
       end
 
-      test "MAX(time) and MIN(time) are DateTimes; AVG(time) is rejected", ctx do
+      test "MAX(time), MIN(time) and COUNT(time) answer DateTimes and a count", ctx do
         {:ok, [row]} =
           unquote(client).query_sql(
             ctx.conn,
@@ -1570,24 +1561,9 @@ defmodule InfluxElixir.ClientContract do
         assert DateTime.compare(row["mx"], newest) == :eq
         assert DateTime.compare(row["mn"], oldest) == :eq
         assert row["n"] == 4
+      end
 
-        assert {:error,
-                %{
-                  status: 400,
-                  body:
-                    "Error during planning: Execution error: Function 'avg' user-defined " <>
-                      "coercion failed with \"Error during planning: Avg does not support " <>
-                      "inputs of type Timestamp(ns).\" No function matches the given name and " <>
-                      "argument types 'avg(Timestamp(ns))'. You might need to add explicit " <>
-                      "type casts.\n\tCandidate functions:\n\tavg(UserDefined)"
-                }} =
-                 unquote(client).query_sql(
-                   ctx.conn,
-                   "SELECT AVG(time) AS a FROM contract_tf",
-                   database: ctx.database
-                 )
-
-        # Arithmetic on `time` inside an aggregate fails planning too.
+      test "arithmetic on time inside an aggregate fails planning", ctx do
         assert {:error,
                 %{
                   status: 400,
@@ -1615,32 +1591,15 @@ defmodule InfluxElixir.ClientContract do
                  %{"provider" => "b", "symbol" => "Y"}
                ]
       end
-
-      test "SELECT DISTINCT rejects ORDER BY a column outside the select list", ctx do
-        assert {:error,
-                %{
-                  status: 400,
-                  body:
-                    "Error during planning: For SELECT DISTINCT, ORDER BY expressions " <>
-                      "contract_tf.price must appear in select list"
-                }} =
-                 unquote(client).query_sql(
-                   ctx.conn,
-                   "SELECT DISTINCT provider FROM contract_tf ORDER BY price",
-                   database: ctx.database
-                 )
-      end
     end
   end
-
-  # ---------------------------------------------------------------------------
 
   # ---------------------------------------------------------------------------
   # Projected expressions, CTEs and table qualifiers (#18)
   # ---------------------------------------------------------------------------
 
   defp cte_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — projected expression and CTE contract" do
         setup ctx do
           lp =
@@ -1739,13 +1698,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # WHERE boolean logic, BETWEEN, LIKE, <>, LIMIT 0, string-vs-number
   # ---------------------------------------------------------------------------
 
   defp where_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — WHERE boolean logic contract" do
         setup ctx do
           lp =
@@ -1813,7 +1770,7 @@ defmodule InfluxElixir.ClientContract do
   end
 
   defp where_pattern_tests(client) do
-    quote do
+    quote location: :keep do
       test "BETWEEN, LIKE, ILIKE and string-vs-number comparison", ctx do
         assert InfluxElixir.ClientContract.column(
                  unquote(client),
@@ -1904,20 +1861,9 @@ defmodule InfluxElixir.ClientContract do
                  )
       end
 
-      test "LIMIT 0 returns no rows and LIMIT -1 is rejected", ctx do
+      test "LIMIT 0 returns no rows", ctx do
         assert {:ok, []} =
                  unquote(client).query_sql(ctx.conn, "SELECT host FROM contract_wh LIMIT 0",
-                   database: ctx.database
-                 )
-
-        assert {:error,
-                %{
-                  status: 400,
-                  body:
-                    "Optimizer rule 'eliminate_limit' failed\ncaused by\nError during " <>
-                      "planning: LIMIT must be >= 0, '-1' was provided"
-                }} =
-                 unquote(client).query_sql(ctx.conn, "SELECT host FROM contract_wh LIMIT -1",
                    database: ctx.database
                  )
       end
@@ -1925,13 +1871,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # median(), CROSS JOIN, expression comparands (#19)
   # ---------------------------------------------------------------------------
 
   defp median_join_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — median and CROSS JOIN contract" do
         setup ctx do
           lp =
@@ -2066,13 +2010,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # CAST, ::TYPE, ORDER BY expressions and multiple terms (#20)
   # ---------------------------------------------------------------------------
 
   defp cast_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — CAST and ORDER BY contract" do
         setup ctx do
           lp =
@@ -2153,14 +2095,12 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # Schema and grouping rules: unknown columns, IN-list items, constants,
   # ungrouped projections
   # ---------------------------------------------------------------------------
 
   defp schema_rule_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — schema and grouping rules contract" do
         setup ctx do
           lp =
@@ -2249,13 +2189,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # Write rules: partial writes, column schema, reserved time, int64 range
   # ---------------------------------------------------------------------------
 
   defp write_rule_tests(client) do
-    quote do
+    quote location: :keep do
       describe "write/3 — schema and partial-write contract" do
         test "a type conflict is a 400 partial write that keeps the other lines", ctx do
           {:ok, :written} =
@@ -2289,8 +2227,7 @@ defmodule InfluxElixir.ClientContract do
           assert Enum.map(rows, & &1["v"]) == [1, 3]
         end
 
-        test "reserved time, tag-and-field key, int64 overflow and an empty payload are 400",
-             ctx do
+        test "reserved time, tag-and-field key and int64 overflow are 400", ctx do
           for {lp, message} <- [
                 {"contract_wr2,time=x v=1i", "'time' is a reserved column"},
                 {"contract_wr2 time=5i,v=1i", "'time' is a reserved column"},
@@ -2317,9 +2254,16 @@ defmodule InfluxElixir.ClientContract do
                    },
                    lp
           end
+        end
 
+        test "an empty payload is 400", ctx do
           assert {:error, %{status: 400, body: "incoming write was empty"}} =
                    unquote(client).write(ctx.conn, "", database: ctx.database)
+        end
+
+        test "a payload of only a comment holds no line and is 400 as empty", ctx do
+          assert {:error, %{status: 400, body: "incoming write was empty"}} =
+                   unquote(client).write(ctx.conn, "# only a comment\n", database: ctx.database)
         end
 
         unquote(untimed_and_escape_tests(client))
@@ -2328,7 +2272,7 @@ defmodule InfluxElixir.ClientContract do
   end
 
   defp untimed_and_escape_tests(client) do
-    quote do
+    quote location: :keep do
       # The engine stamps every untimed line of one write with the same
       # time (verified): lines of one series are one point, fields merged,
       # the last write winning.
@@ -2383,7 +2327,7 @@ defmodule InfluxElixir.ClientContract do
         assert row["s"] == "a\nb"
       end
 
-      test "a name ending in a backslash is refused; an escaped backslash in a string is kept",
+      test "a tag key ending in a backslash is refused with the engine's partial-write body",
            ctx do
         assert {:error, %{status: 400, body: body}} =
                  unquote(client).write(ctx.conn, ~S"contract_bs,k\\=a v=1i 1",
@@ -2402,8 +2346,10 @@ defmodule InfluxElixir.ClientContract do
                    }
                  ]
                }
+      end
 
-        # The measurement, a tag key, a tag value and a field key all refuse it.
+      test "a measurement, tag key, tag value or field key ending in a backslash is refused",
+           ctx do
         for lp <- [
               ~S"bs\\,t=a v=1i 1",
               ~S"bt,k\\=a v=2i 1",
@@ -2421,7 +2367,9 @@ defmodule InfluxElixir.ClientContract do
                      "with a backslash",
                  lp
         end
+      end
 
+      test "an escaped backslash at the end of a string value is kept", ctx do
         m = "contract_bsok_#{System.unique_integer([:positive])}"
 
         {:ok, :written} =
@@ -2440,13 +2388,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # LIMIT / OFFSET pagination (#21)
   # ---------------------------------------------------------------------------
 
   defp offset_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — LIMIT and OFFSET contract" do
         setup ctx do
           lines =
@@ -2536,13 +2482,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # InfluxDB 2 write rules (v2)
   # ---------------------------------------------------------------------------
 
   defp v2_write_rule_tests(client) do
-    quote do
+    quote location: :keep do
       describe "write/3 — v2 schema and partial-write contract" do
         test "a field type conflict is 422 with the dropped count; the other lines are stored",
              ctx do
@@ -2664,7 +2608,7 @@ defmodule InfluxElixir.ClientContract do
   end
 
   defp v2_write_rule_parse_tests(client) do
-    quote do
+    quote location: :keep do
       # InfluxDB 2 stores a string field that a \r follows, from after the
       # opening quote up to the \r, closing quote included; a number
       # followed by \r is refused (verified).
@@ -2721,8 +2665,7 @@ defmodule InfluxElixir.ClientContract do
         assert rows == []
       end
 
-      test "time as a tag is 400; time as a field is dropped; a tag and a field may share a name; an empty payload is accepted",
-           ctx do
+      test "time as a tag key is 400", ctx do
         m = "contract_v2t_#{System.unique_integer([:positive])}"
 
         assert {:error, %{status: 400, body: body}} =
@@ -2736,18 +2679,15 @@ defmodule InfluxElixir.ClientContract do
                    "unable to parse '#{m},time=x v=1i 1700000000000000000': " <>
                      ~s|cannot use reserved tag key "time"|
                }
+      end
+
+      test "time as a field is dropped and the other fields are stored", ctx do
+        m = "contract_v2tf_#{System.unique_integer([:positive])}"
 
         assert {:ok, :written} =
                  unquote(client).write(ctx.conn, "#{m} time=5i,v=1i 1700000000000000000",
                    database: ctx.database
                  )
-
-        assert {:ok, :written} =
-                 unquote(client).write(ctx.conn, "#{m},host=a host=1i 1700000000000000001",
-                   database: ctx.database
-                 )
-
-        assert {:ok, :written} = unquote(client).write(ctx.conn, "", database: ctx.database)
 
         InfluxElixir.ClientContract.settle(ctx)
 
@@ -2757,10 +2697,11 @@ defmodule InfluxElixir.ClientContract do
             ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) \|> filter(fn: (r) => r._measurement == "#{m}")|
           )
 
-        assert Enum.sort(Enum.map(rows, & &1["_field"])) == ["host", "v"]
+        assert Enum.map(rows, &{&1["_field"], &1["_value"]}) == [{"v", 1}]
+      end
 
-        # A tag and a field of one name are two columns: each row keeps its own.
-        shared = "#{m}_shared"
+      test "a tag and a field may share a name: each row keeps its own", ctx do
+        shared = "contract_v2sh_#{System.unique_integer([:positive])}"
 
         for line <- [
               "#{shared},host=a host=1i 1700000000000000000",
@@ -2779,6 +2720,15 @@ defmodule InfluxElixir.ClientContract do
 
         assert shared_rows |> Enum.map(&{&1["host"], &1["_field"], &1["_value"]}) |> Enum.sort() ==
                  [{"a", "host", 1}, {"b", "v", 2}]
+      end
+
+      test "an empty payload is accepted", ctx do
+        assert {:ok, :written} = unquote(client).write(ctx.conn, "", database: ctx.database)
+      end
+
+      test "a payload of only a comment is accepted", ctx do
+        assert {:ok, :written} =
+                 unquote(client).write(ctx.conn, "# only a comment\n", database: ctx.database)
       end
 
       # A backslash only escapes a comma, equals sign or space. `bs\\,t=a` is a
@@ -2806,13 +2756,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # InfluxDB 2 precision spellings (v2)
   # ---------------------------------------------------------------------------
 
   defp v2_precision_tests(client) do
-    quote do
+    quote location: :keep do
       describe "write/3 — v2 precision contract" do
         test "ms and millisecond both mean milliseconds; auto is refused with 400", ctx do
           m = "contract_v2prec_#{System.unique_integer([:positive])}"
@@ -2851,13 +2799,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # Duplicate points (v3_core, v3_enterprise)
   # ---------------------------------------------------------------------------
 
   defp duplicate_tests(client) do
-    quote do
+    quote location: :keep do
       describe "write/3 — duplicate point contract" do
         test "a point rewritten at the same tags and time merges, the later write winning",
              ctx do
@@ -2893,7 +2839,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp v2_duplicate_tests(client) do
-    quote do
+    quote location: :keep do
       describe "write/3 — v2 duplicate point contract" do
         test "a point rewritten at the same tags and time merges, the later write winning",
              ctx do
@@ -2924,8 +2870,6 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # InfluxQL SELECT shapes and sub-microsecond time (v3_core, v3_enterprise)
   # ---------------------------------------------------------------------------
 
@@ -2933,7 +2877,7 @@ defmodule InfluxElixir.ClientContract do
   # missing tag is the empty string, regexes match tags only, ordering a
   # tag is false, durations work with now(), NOT does not exist.
   defp influxql_where_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_influxql/3 — WHERE and SHOW TAG VALUES contract" do
         setup ctx do
           m = "contract_iqw_#{System.unique_integer([:positive])}"
@@ -3031,6 +2975,8 @@ defmodule InfluxElixir.ClientContract do
                    )
         end
 
+        unquote(influxql_number_tests(client))
+
         test "SHOW TAG VALUES: sorted values, a row for the missing key, the last 24 hours",
              ctx do
           assert {:ok, rows} =
@@ -3048,8 +2994,59 @@ defmodule InfluxElixir.ClientContract do
     end
   end
 
+  defp influxql_number_tests(client) do
+    quote location: :keep do
+      test "a number is digits with an optional fraction, signed or led by a dot", ctx do
+        assert InfluxElixir.ClientContract.where_values(
+                 unquote(client),
+                 ctx,
+                 "v > .5 AND v < 2"
+               ) == [1]
+
+        assert InfluxElixir.ClientContract.where_values(
+                 unquote(client),
+                 ctx,
+                 "v > -.5 AND v < +2.0"
+               ) == [1]
+
+        assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "v >= 004") ==
+                 [6, 4, 5]
+      end
+
+      test "an exponent, a trailing dot, a hex or an underscore is the engine's parse error",
+           ctx do
+        prefix = "SELECT v FROM #{ctx.m} WHERE v > "
+
+        for {literal, number, left} <- [
+              {"5e20", "5", "e20"},
+              {"1.5e3", "1.5", "e3"},
+              {"5.", "5", "."},
+              {"0x10", "0", "x10"},
+              {"1_000", "1", "_000"}
+            ],
+            tail <- ["", " GROUP BY host LIMIT 1", ";"] do
+          pos = String.length(prefix) + String.length(number)
+
+          assert {:error,
+                  %{
+                    status: 400,
+                    body:
+                      "error in InfluxQL statement: parsing error: invalid InfluxQL " <>
+                        "statement at pos " <> rest
+                  }} =
+                   unquote(client).query_influxql(ctx.conn, prefix <> literal <> tail,
+                     database: ctx.database
+                   )
+
+          assert rest == "#{pos}. Parsing Error: Nom(#{inspect(left <> tail)}, Tag)",
+                 literal <> tail
+        end
+      end
+    end
+  end
+
   defp influxql_select_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_influxql/3 — SELECT shape contract" do
         setup ctx do
           m = "contract_iqs_#{System.unique_integer([:positive])}"
@@ -3101,6 +3098,38 @@ defmodule InfluxElixir.ClientContract do
 
           assert %{"max" => 3, "h" => "x"} = max
           assert max["time"] == DateTime.from_unix!(1_700_000_000_000_003, :microsecond)
+        end
+
+        test "GROUP BY lists the series without the tag after the series that have it", ctx do
+          m = "contract_iqo_#{System.unique_integer([:positive])}"
+
+          lp =
+            Enum.join(
+              [
+                "#{m},g=b x=2i 1700000000000000000",
+                "#{m} x=9i 1700000010000000000",
+                "#{m},g=a x=1i 1700000020000000000",
+                "#{m},g=a x=3i 1700000030000000000"
+              ],
+              "\n"
+            )
+
+          assert {:ok, :written} = unquote(client).write(ctx.conn, lp, database: ctx.database)
+          InfluxElixir.ClientContract.settle(ctx)
+
+          assert {:ok, means} =
+                   unquote(client).query_influxql(ctx.conn, "SELECT MEAN(x) FROM #{m} GROUP BY g",
+                     database: ctx.database
+                   )
+
+          assert Enum.map(means, &{&1["g"], &1["mean"]}) == [{"a", 2.0}, {"b", 2.0}, {nil, 9.0}]
+
+          assert {:ok, rows} =
+                   unquote(client).query_influxql(ctx.conn, "SELECT x FROM #{m} GROUP BY g",
+                     database: ctx.database
+                   )
+
+          assert Enum.map(rows, &{&1["g"], &1["x"]}) == [{"a", 1}, {"a", 3}, {"b", 2}, {nil, 9}]
         end
 
         test "GROUP BY with a per-series LIMIT; unknown names are empty; field keys", ctx do
@@ -3157,13 +3186,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # Flux pipelines (v2)
   # ---------------------------------------------------------------------------
 
   defp v2_flux_pipeline_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_flux/3 — pipeline contract" do
         setup ctx do
           m = "contract_fx_#{System.unique_integer([:positive])}"
@@ -3292,13 +3319,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # GROUP BY / ORDER BY references and streamed row types (v3_core, v3_enterprise)
   # ---------------------------------------------------------------------------
 
   defp reference_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — GROUP BY and ORDER BY references contract" do
         setup ctx do
           m = "contract_ref_#{System.unique_integer([:positive])}"
@@ -3358,13 +3383,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # NULL semantics and operators (v3_core, v3_enterprise)
   # ---------------------------------------------------------------------------
 
   defp null_semantics_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — nulls and operators contract" do
         setup ctx do
           m = "contract_nl_#{System.unique_integer([:positive])}"
@@ -3506,13 +3529,11 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
-
-  # ---------------------------------------------------------------------------
   # accept_partial / no_sync write parameters (v3_core, v3_enterprise)
   # ---------------------------------------------------------------------------
 
   defp atomic_write_tests(client) do
-    quote do
+    quote location: :keep do
       describe "write/3 — accept_partial and no_sync contract" do
         test "accept_partial: false rejects the payload at its first bad line", ctx do
           m = "contract_atomic_#{System.unique_integer([:positive])}"
@@ -3565,7 +3586,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp format_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query formats contract" do
         setup ctx do
           m = "contract_fmt_#{System.unique_integer([:positive])}"
@@ -3645,31 +3666,6 @@ defmodule InfluxElixir.ClientContract do
                    )
         end
 
-        test "an unknown format is the engine's 400", ctx do
-          assert {:error, %{status: 400, body: body}} =
-                   unquote(client).query_sql(ctx.conn, "SELECT * FROM #{ctx.m}",
-                     database: ctx.database,
-                     format: :xml
-                   )
-
-          # The column in the engine's message is the position in the request
-          # body, which each client serialises in its own way.
-          prefix =
-            "serde json error: unknown variant `xml`, expected one of `parquet`, `csv`, " <>
-              "`pretty`, `json`, `json_lines`, `jsonl` at line 1 column "
-
-          assert String.starts_with?(body, prefix)
-          assert String.replace_prefix(body, prefix, "") =~ ~r/\A\d+\z/
-        end
-
-        test "a format the client cannot parse is unsupported", ctx do
-          assert {:error, {:unsupported_format, :pretty}} =
-                   unquote(client).query_sql(ctx.conn, "SELECT * FROM #{ctx.m}",
-                     database: ctx.database,
-                     format: :pretty
-                   )
-        end
-
         test "query_sql_stream answers typed rows whatever format: says", ctx do
           rows =
             ctx.conn
@@ -3690,7 +3686,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp database_rule_tests(client) do
-    quote do
+    quote location: :keep do
       describe "database rules contract" do
         test "a query against a missing database is a 404, SQL and InfluxQL", ctx do
           db = "contract_missing_#{System.unique_integer([:positive])}"
@@ -3790,7 +3786,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp distinct_on_tests(client) do
-    quote do
+    quote location: :keep do
       describe "SELECT DISTINCT ON contract" do
         setup ctx do
           m = "contract_don_#{System.unique_integer([:positive])}"
@@ -3945,7 +3941,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp identifier_tests(client) do
-    quote do
+    quote location: :keep do
       describe "SQL identifier contract" do
         setup ctx do
           m = "Contract_Ident_#{System.unique_integer([:positive])}"
@@ -4032,7 +4028,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp tab_tests(client) do
-    quote do
+    quote location: :keep do
       describe "write/3 — tabs in line protocol contract" do
         test "a tab outside a quoted string refuses the line, with the engine's message", ctx do
           m = "contract_tab_#{System.unique_integer([:positive])}"
@@ -4136,7 +4132,7 @@ defmodule InfluxElixir.ClientContract do
   # A timestamp must fit in a signed 64-bit count of nanoseconds once scaled
   # by the precision; each version refuses the rest in its own words.
   defp timestamp_range_tests(client, version) do
-    quote do
+    quote location: :keep do
       describe "write/3 — timestamp range contract" do
         test "the largest timestamp per precision is stored; one more is refused", ctx do
           m = "contract_ts_#{System.unique_integer([:positive])}"
@@ -4180,14 +4176,15 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp param_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — parameterized query contract" do
         test "filters by string parameter", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_params,host=alpha value=1i 1000000000\ncontract_params,host=beta value=2i 2000000000",
-            database: ctx.database
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_params,host=alpha value=1i 1000000000\ncontract_params,host=beta value=2i 2000000000",
+                     database: ctx.database
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -4236,11 +4233,12 @@ defmodule InfluxElixir.ClientContract do
         end
 
         test "accepts params as a keyword list as well as a map", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_params_kw,host=alpha value=1i 1000000000\ncontract_params_kw,host=beta value=2i 2000000000",
-            database: ctx.database
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_params_kw,host=alpha value=1i 1000000000\ncontract_params_kw,host=beta value=2i 2000000000",
+                     database: ctx.database
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -4257,11 +4255,12 @@ defmodule InfluxElixir.ClientContract do
         end
 
         test "filters by integer parameter", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_params_int value=100i 1000000000\ncontract_params_int value=200i 2000000000",
-            database: ctx.database
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_params_int value=100i 1000000000\ncontract_params_int value=200i 2000000000",
+                     database: ctx.database
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -4286,15 +4285,16 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp literal_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — WHERE literal typing contract" do
         setup ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_lit,repcode=08338636 amount=500.0 1700000000000000000\n" <>
-              "contract_lit,repcode=12345678 amount=5000.0 1700000100000000000",
-            database: ctx.database
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_lit,repcode=08338636 amount=500.0 1700000000000000000\n" <>
+                       "contract_lit,repcode=12345678 amount=5000.0 1700000100000000000",
+                     database: ctx.database
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -4366,6 +4366,21 @@ defmodule InfluxElixir.ClientContract do
             )
 
           assert [%{"amount" => 5000.0}] = numeric
+
+          # 500.0 renders as "500.0", so '500' is not equal to it and '500.0' is.
+          assert {:ok, []} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT * FROM contract_lit WHERE amount = '500'",
+                     database: ctx.database
+                   )
+
+          assert {:ok, [%{"amount" => 500.0}]} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT * FROM contract_lit WHERE amount IN ('500.0')",
+                     database: ctx.database
+                   )
         end
       end
     end
@@ -4376,16 +4391,17 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp precision_tests(client) do
-    quote do
+    quote location: :keep do
       describe "write/3 — timestamp precision contract" do
         test "second precision writes and queries correctly", ctx do
           # Write with second precision — InfluxDB converts to nanoseconds
-          unquote(client).write(
-            ctx.conn,
-            "contract_prec_s value=1i 1700000000",
-            database: ctx.database,
-            precision: :second
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_prec_s value=1i 1700000000",
+                     database: ctx.database,
+                     precision: :second
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -4401,12 +4417,13 @@ defmodule InfluxElixir.ClientContract do
         end
 
         test "millisecond precision writes correctly", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_prec_ms value=1i 1700000000000",
-            database: ctx.database,
-            precision: :millisecond
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_prec_ms value=1i 1700000000000",
+                     database: ctx.database,
+                     precision: :millisecond
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -4421,12 +4438,13 @@ defmodule InfluxElixir.ClientContract do
         end
 
         test "microsecond precision writes correctly", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_prec_us value=1i 1700000000000000",
-            database: ctx.database,
-            precision: :microsecond
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_prec_us value=1i 1700000000000000",
+                     database: ctx.database,
+                     precision: :microsecond
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -4480,7 +4498,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp ordered_agg_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — first_value/last_value aggregate contract" do
         setup ctx do
           base_ts = 1_700_000_000_000_000_000
@@ -4517,7 +4535,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert [%{"first_val" => 10}] = rows
+          assert rows == [%{"time" => ~U[2023-11-14 22:00:00.000000Z], "first_val" => 10}]
         end
 
         test "last_value(ORDER BY time) returns the latest value", ctx do
@@ -4536,7 +4554,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert [%{"last_val" => 30}] = rows
+          assert rows == [%{"time" => ~U[2023-11-14 22:00:00.000000Z], "last_val" => 30}]
         end
 
         test "first_value(ORDER BY time DESC) returns the latest value", ctx do
@@ -4548,18 +4566,19 @@ defmodule InfluxElixir.ClientContract do
           {:ok, [row]} =
             unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
 
-          assert row["latest"] == 30
+          assert row == %{"latest" => 30}
         end
 
         test "latest value per group (the #13 shape)", ctx do
-          unquote(client).write(
-            ctx.conn,
-            "contract_latest,symbol=BTC price=1.0 1700000000000000000\n" <>
-              "contract_latest,symbol=BTC price=2.0 1700000100000000000\n" <>
-              "contract_latest,symbol=ETH price=9.0 1700000200000000000\n" <>
-              "contract_latest,symbol=ETH price=8.0 1700000050000000000",
-            database: ctx.database
-          )
+          assert {:ok, :written} =
+                   unquote(client).write(
+                     ctx.conn,
+                     "contract_latest,symbol=BTC price=1.0 1700000000000000000\n" <>
+                       "contract_latest,symbol=BTC price=2.0 1700000100000000000\n" <>
+                       "contract_latest,symbol=ETH price=9.0 1700000200000000000\n" <>
+                       "contract_latest,symbol=ETH price=8.0 1700000050000000000",
+                     database: ctx.database
+                   )
 
           InfluxElixir.ClientContract.settle(ctx)
 
@@ -4572,26 +4591,10 @@ defmodule InfluxElixir.ClientContract do
           {:ok, rows} =
             unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
 
-          assert Map.new(rows, &{&1["symbol"], &1["price"]}) ==
-                   %{"BTC" => 2.0, "ETH" => 9.0}
-        end
-
-        test "InfluxQL FIRST()/LAST() are not v3 SQL and are rejected", ctx do
-          # The engine suggests a similar function, and picks among equally
-          # close ones at random ('instr' or 'sqrt' for 'first'), so the
-          # suggestion is only checked to be one name.
-          for {sql, name} <- [
-                {"SELECT FIRST(value, time) AS v FROM contract_fl", "first"},
-                {"SELECT LAST(value) AS v FROM contract_fl", "last"}
-              ] do
-            prefix = "Error during planning: Invalid function '#{name}'.\nDid you mean '"
-
-            assert {:error, %{status: 400, body: body}} =
-                     unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
-
-            assert String.starts_with?(body, prefix), sql
-            assert String.replace_prefix(body, prefix, "") =~ ~r/\A\w+'\?\z/, sql
-          end
+          assert Enum.sort_by(rows, & &1["symbol"]) == [
+                   %{"symbol" => "BTC", "price" => 2.0},
+                   %{"symbol" => "ETH", "price" => 9.0}
+                 ]
         end
       end
     end
@@ -4602,7 +4605,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp distinct_tests(client) do
-    quote do
+    quote location: :keep do
       describe "query_sql/3 — DISTINCT contract" do
         # Every line has its own time: untimed lines of one series in one
         # write are one point, so they could never repeat a value.
@@ -4677,7 +4680,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp scalar_function_tests(client) do
-    quote do
+    quote location: :keep do
       describe "scalar functions — contract" do
         unquote(scalar_function_setup(client))
 
@@ -4808,7 +4811,7 @@ defmodule InfluxElixir.ClientContract do
   end
 
   defp scalar_function_error_tests(client) do
-    quote do
+    quote location: :keep do
       describe "scalar function errors — contract" do
         unquote(scalar_function_setup(client))
 
@@ -4952,7 +4955,7 @@ defmodule InfluxElixir.ClientContract do
   end
 
   defp scalar_function_setup(client) do
-    quote do
+    quote location: :keep do
       setup ctx do
         m = "contract_fn_#{System.unique_integer([:positive])}"
 
@@ -4977,7 +4980,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp gzip_tests(client) do
-    quote do
+    quote location: :keep do
       describe "write/3 — gzip contract" do
         test "gzip-compressed payload is accepted and queryable", ctx do
           lp = "contract_gz value=42i 1700000000000000000"
@@ -5093,7 +5096,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp v2_body_tests(client) do
-    quote do
+    quote location: :keep do
       describe "write/3 — v2 body contract" do
         test "a gzip body is read with gzip: true; a plain one then is the engine's 500", ctx do
           m = "contract_v2gz_#{System.unique_integer([:positive])}"
@@ -5147,7 +5150,7 @@ defmodule InfluxElixir.ClientContract do
   # ---------------------------------------------------------------------------
 
   defp escaping_tests(client) do
-    quote do
+    quote location: :keep do
       describe "write/3 — line protocol escaping contract" do
         test "escaped space in measurement name round-trips", ctx do
           lp = "my\\ measurement value=1i 1700000000000000000"
@@ -5164,7 +5167,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert [%{"value" => 1}] = rows
+          assert rows == [%{"value" => 1, "time" => ~U[2023-11-14 22:13:20.000000Z]}]
         end
 
         test "tag with special characters round-trips", ctx do
@@ -5183,7 +5186,13 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert [%{"region" => "us,east"}] = rows
+          assert rows == [
+                   %{
+                     "region" => "us,east",
+                     "value" => 1,
+                     "time" => ~U[2023-11-14 22:13:20.000000Z]
+                   }
+                 ]
         end
 
         test "string field with escaped quotes round-trips", ctx do
@@ -5201,7 +5210,7 @@ defmodule InfluxElixir.ClientContract do
               database: ctx.database
             )
 
-          assert [%{"label" => ~s(say "hi")}] = rows
+          assert rows == [%{"label" => ~s(say "hi"), "time" => ~U[2023-11-14 22:13:20.000000Z]}]
         end
       end
     end

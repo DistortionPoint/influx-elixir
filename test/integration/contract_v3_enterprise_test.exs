@@ -7,6 +7,12 @@ defmodule InfluxElixir.Integration.ContractV3EnterpriseTest do
   These are the SAME assertions that run against LocalClient in
   `ContractLocalV3EnterpriseTest`. If both pass, LocalClient is proven
   faithful to real InfluxDB v3 Enterprise.
+
+  The SQL parser and executor contracts run here too.
+  `InfluxElixir.Contract.InfluxQLFluxLP` does not: it generates tests for
+  `:v3_core` and `:v2` only, so for `:v3_enterprise` it would run nothing.
+  The `time_slack` of the context is how far, in seconds, the server's clock
+  may be from this one.
   """
 
   use ExUnit.Case, async: false
@@ -15,6 +21,14 @@ defmodule InfluxElixir.Integration.ContractV3EnterpriseTest do
   @moduletag :integration
 
   use InfluxElixir.ClientContract,
+    client: InfluxElixir.Client.HTTP,
+    profile: :v3_enterprise
+
+  use InfluxElixir.Contract.SQLParser,
+    client: InfluxElixir.Client.HTTP,
+    profile: :v3_enterprise
+
+  use InfluxElixir.Contract.SQLExecutor,
     client: InfluxElixir.Client.HTTP,
     profile: :v3_enterprise
 
@@ -42,7 +56,7 @@ defmodule InfluxElixir.Integration.ContractV3EnterpriseTest do
     case HTTP.create_database(base_conn, db) do
       :ok ->
         on_exit(fn -> HTTP.delete_database(base_conn, db) end)
-        {:ok, conn: base_conn, database: db, query_delay: 500}
+        {:ok, conn: base_conn, database: db, query_delay: 500, time_slack: 60}
 
       {:error, reason} ->
         flunk("Failed to create test database: #{inspect(reason)}")

@@ -43,7 +43,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   `WHERE k = 'into'` is answered.
   """
 
-  alias InfluxElixir.Client.Local.SQLParser
+  alias InfluxElixir.Client.Local.{SQLMask, SQLParser}
 
   @epoch DateTime.from_unix!(0, :microsecond)
 
@@ -102,7 +102,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
            slices(@select, masked, statement) || {:error, "invalid statement"},
          %{"rest" => masked_rest} = slices(@select, masked, masked),
          %{} = clauses <- slices(@rest, masked_rest, rest) || {:error, "invalid clauses"},
-         :ok <- check_where(statement, blank_to_nil(clauses["where"])),
+         :ok <- check_where(statement, rest, masked_rest, blank_to_nil(clauses["where"])),
          {:ok, items} <- parse_items(items),
          :ok <- check_mix(items) do
       {:ok,
@@ -241,7 +241,14 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   defp series_groups(%{group_by: group_by}, rows) do
     rows
     |> Enum.group_by(&Map.take(&1, group_by))
-    |> Enum.sort_by(fn {key, _rows} -> Enum.map(group_by, &Map.get(key, &1)) end)
+    |> Enum.sort_by(fn {key, _rows} -> Enum.map(group_by, &series_sort_key(key, &1)) end)
+  end
+
+  # The series that lacks the tag comes after every tag value, as the engine lists it.
+  @spec series_sort_key(map(), binary()) :: {boolean(), term()}
+  defp series_sort_key(key, tag) do
+    value = Map.get(key, tag)
+    {is_nil(value), value}
   end
 
   @spec lower_time(integer() | nil) :: DateTime.t()
@@ -448,35 +455,15 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   # looked for in it (`fill(`, `INTO`, `GROUP BY`) is a keyword and not a
   # piece of a value.
   @spec mask_literals(binary()) :: binary()
-  defp mask_literals(statement), do: mask(statement, [], "")
-
-  defp mask(<<>>, acc, _last), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
-
-  defp mask(<<quote, rest::binary>>, acc, _last) when quote in [?', ?"],
-    do: mask_literal(rest, quote, acc, [quote], 0)
-
-  defp mask(<<?/, rest::binary>>, acc, last) when last in ["=~", "!~"],
-    do: mask_literal(rest, ?/, acc, [?/], 0)
-
-  defp mask(<<c, rest::binary>>, acc, last),
-    do: mask(rest, [c | acc], if(c in [?\s, ?\t, ?\n, ?\r], do: last, else: next_last(last, c)))
-
-  @spec next_last(binary(), byte()) :: binary()
-  defp next_last(last, c),
-    do: binary_part(last <> <<c>>, max(byte_size(last) + 1 - 2, 0), min(byte_size(last) + 1, 2))
-
-  # Blanks the literal's body; the closing delimiter stays.
-  defp mask_literal(<<>>, _delimiter, acc, opening, blanks),
-    do: mask(<<>>, [String.duplicate("_", blanks), opening | acc], "")
-
-  defp mask_literal(<<?\\, _c, rest::binary>>, delimiter, acc, opening, blanks),
-    do: mask_literal(rest, delimiter, acc, opening, blanks + 2)
-
-  defp mask_literal(<<delimiter, rest::binary>>, delimiter, acc, opening, blanks),
-    do: mask(rest, [delimiter, String.duplicate("_", blanks), opening | acc], "")
-
-  defp mask_literal(<<_c, rest::binary>>, delimiter, acc, opening, blanks),
-    do: mask_literal(rest, delimiter, acc, opening, blanks + 1)
+  defp mask_literals(statement) do
+    SQLMask.mask(statement,
+      blank: ?_,
+      doubled: false,
+      backslash: true,
+      regex: true,
+      lenient: true
+    )
+  end
 
   # ---------------------------------------------------------------------------
   # WHERE
@@ -553,8 +540,8 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
         idents = for {:ident, name} <- tokens, into: MapSet.new(), do: name
         {:ok, %{sql: sql, lowers: lowers, idents: idents}}
 
-      {:not, _after} ->
-        {:error, "unsupported InfluxQL WHERE: NOT"}
+      {:parse_error, rest} ->
+        {:error, "unsupported InfluxQL WHERE: #{rest}"}
 
       {:error, _message} = error ->
         error
@@ -563,27 +550,36 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
     {:refused, message} -> {:error, message}
   end
 
-  # `NOT` is no InfluxQL keyword: the engine fails to parse the statement
-  # where it stands (verified), naming the position after it and the rest.
-  @spec check_where(binary(), binary() | nil) :: :ok | {:error, {:engine, binary()}}
-  defp check_where(_statement, nil), do: :ok
+  # What the engine's parser cannot read in the `WHERE` fails the statement
+  # where it stands (verified), naming the position and the rest of the
+  # statement, `;` and later clauses included. `NOT` is no InfluxQL keyword
+  # (the position is the operand after it); a number is `\d*\.\d+` or `\d+`
+  # only, so an exponent, a trailing dot, a hex or an underscore leaves the
+  # rest of the literal behind (the position is where that begins).
+  @spec check_where(binary(), binary(), binary(), binary() | nil) ::
+          :ok | {:error, {:engine, binary()}}
+  defp check_where(_statement, _rest, _masked_rest, nil), do: :ok
 
-  defp check_where(statement, where) do
+  defp check_where(statement, rest, masked_rest, where) do
     case tokenize(where, []) do
-      {:not, after_not} ->
-        pos = byte_size(statement) - byte_size(after_not)
+      {:parse_error, after_error} ->
+        [{from, length}] = Regex.run(~r/\bWHERE\s+/i, masked_rest, return: :index)
+        where_at = byte_size(statement) - byte_size(rest) + from + length
+        pos = where_at + byte_size(where) - byte_size(after_error)
+        leftover = binary_part(statement, pos, byte_size(statement) - pos)
 
         {:error,
          {:engine,
           "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos " <>
-            "#{pos}. Parsing Error: Nom(#{inspect(after_not)}, Tag)"}}
+            "#{pos}. Parsing Error: Nom(#{inspect(leftover)}, Tag)"}}
 
       _tokens_or_refusal ->
         :ok
     end
   end
 
-  @spec tokenize(binary(), list()) :: {:ok, list()} | {:not, binary()} | {:error, binary()}
+  @spec tokenize(binary(), list()) ::
+          {:ok, list()} | {:parse_error, binary()} | {:error, binary()}
   defp tokenize(<<>>, acc), do: {:ok, Enum.reverse(acc)}
   defp tokenize(<<c, rest::binary>>, acc) when c in [?\s, ?\t, ?\n, ?\r], do: tokenize(rest, acc)
 
@@ -615,7 +611,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
 
   defp tokenize(text, acc) do
     case Regex.run(
-           ~r/^(?:(\d+)(ns|ms|u|µ|s|m|h|d|w)\b|(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|(now\s*\(\s*\))|([A-Za-z_]\w*))/u,
+           ~r/^(?:(\d+)(ns|ms|u|µ|s|m|h|d|w)\b|(\d*\.\d+|\d+)|(now\s*\(\s*\))|([A-Za-z_]\w*))/u,
            text
          ) do
       [full, n, unit] ->
@@ -623,14 +619,21 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
         tokenize(rest_after(text, full), [duration | acc])
 
       [full, "", "", number] ->
-        tokenize(rest_after(text, full), [{:number, number} | acc])
+        case rest_after(text, full) do
+          <<c, _more::binary>> = rest
+          when c in ?0..?9 or c in ?a..?z or c in ?A..?Z or c in [?_, ?.] ->
+            {:parse_error, rest}
+
+          rest ->
+            tokenize(rest, [{:number, number} | acc])
+        end
 
       [full, "", "", "", _now] ->
         tokenize(rest_after(text, full), [{:raw, "now()"} | acc])
 
       [full, "", "", "", "", word] ->
         if String.upcase(word) == "NOT",
-          do: {:not, String.trim_leading(rest_after(text, full))},
+          do: {:parse_error, String.trim_leading(rest_after(text, full))},
           else: tokenize(rest_after(text, full), [word_token(word) | acc])
 
       nil ->
@@ -753,7 +756,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   defp plan({:cmp, tokens}, tags) do
     if Enum.any?(tokens, &match?({:ident, "time"}, &1)),
       do: time_plan(tokens, tags),
-      else: {tokens |> rewrite(tags, []) |> Enum.join(" "), []}
+      else: {tokens |> drop_unary_plus([]) |> rewrite(tags, []) |> Enum.join(" "), []}
   end
 
   defp plan({:group, node}, tags) do
@@ -896,7 +899,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   defp term_ns({:number, text}) do
     case Integer.parse(text) do
       {n, ""} -> n
-      _float -> throw({:refused, "unsupported InfluxQL (non-integer time #{text})"})
+      _float_or_error -> throw({:refused, "unsupported InfluxQL (non-integer time #{text})"})
     end
   end
 
@@ -947,12 +950,29 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
 
   defp rewrite([token | rest], tags, acc), do: rewrite(rest, tags, [token_sql(token) | acc])
 
+  # InfluxQL reads `+5` as 5; the SQL the double hands on does not read a
+  # unary plus. A `+` is unary at the start, after a comparison operator,
+  # after an opening parenthesis and after another sign or operator.
+  @spec drop_unary_plus(list(), list()) :: list()
+  defp drop_unary_plus([], acc), do: Enum.reverse(acc)
+  defp drop_unary_plus([{:raw, "+"} | rest], []), do: drop_unary_plus(rest, [])
+
+  defp drop_unary_plus([{:raw, "+"} | rest], [{:op, _op} | _more] = acc),
+    do: drop_unary_plus(rest, acc)
+
+  defp drop_unary_plus([{:raw, "+"} | rest], [{:raw, prev} | _more] = acc)
+       when prev in ["(", "+", "-", "*", "/"],
+       do: drop_unary_plus(rest, acc)
+
+  defp drop_unary_plus([token | rest], acc), do: drop_unary_plus(rest, [token | acc])
+
   @spec token_sql(tuple()) :: binary()
   defp token_sql({:ident, name}), do: ident_sql(name)
   defp token_sql({:str, content}), do: "'" <> content <> "'"
   defp token_sql({:regex, pattern}), do: "'" <> String.replace(pattern, "'", "''") <> "'"
   defp token_sql({:op, op}), do: op
   defp token_sql({:raw, text}), do: text
+  defp token_sql({:number, "." <> _fraction = text}), do: "0" <> text
   defp token_sql({:number, text}), do: text
   defp token_sql({:duration, ns, text}), do: duration_sql(ns, text)
 

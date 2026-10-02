@@ -19,7 +19,10 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     LineProtocolParser,
     SQLError,
     SQLFunctions,
+    SQLLiteral,
     SQLParser,
+    SQLTime,
+    SQLWhere,
     Store
   }
 
@@ -84,7 +87,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # The rows, with the points they were read from (after any join, before
   # WHERE): a CTE has the schema of its source, not of the rows it kept. The
   # engine finds a missing table or column first, then the placeholders
-  # without a value, then the type errors.
+  # without a value, then the type errors, and last what its optimizer finds
+  # folding a constant (a `time` string it cannot read).
   @spec select(
           SQLParser.parsed_query(),
           fetch(),
@@ -98,6 +102,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
          {:ok, query} <- SQLParser.bind(query, params),
          :ok <- check_plan(joined, query),
          :ok <- check_grouping_columns(query),
+         :ok <- SQLTime.first_invalid(query.where),
          {:ok, filtered} <- apply_where(joined, query.where) do
       {:ok, query_rows(filtered, query), joined}
     else
@@ -265,7 +270,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
          %{
            status: 500,
            body:
-             "Schema error: No field named #{missing}. Valid fields are " <>
+             "Schema error: No field named #{SQLLiteral.render_identifier(missing)}. Valid fields are " <>
                Enum.join(Enum.sort(known), ", ") <> "."
          }}
     end
@@ -372,7 +377,35 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp check_item({:call, function, args}, context, columns),
     do: SQLFunctions.check(function, Enum.map(args, &SQLFunctions.type_of(&1, columns)), context)
 
-  defp check_item({:op, op, left, right}, context, columns) do
+  defp check_item({:op, op, left, right}, context, columns),
+    do: check_arithmetic(op, left, right, context, columns)
+
+  # The engine words a negation the same wherever it stands.
+  defp check_item({:neg, inner}, _context, columns), do: check_negation(inner, columns)
+
+  defp check_item({:aggregate, agg, expr}, _context, columns),
+    do: check_aggregate(agg, expr, columns)
+
+  defp check_item({:pattern, kind, expr, rest}, context, columns),
+    do: check_pattern(kind, expr, rest, context, columns)
+
+  defp check_item({:compare, op, left, right}, _context, columns),
+    do: check_comparison(op, left, right, columns)
+
+  defp check_item({:in_list, left, values}, _context, columns),
+    do: check_in_list(left, values, columns)
+
+  defp check_item({:range, left, low, high}, _context, columns),
+    do: check_range(left, low, high, columns)
+
+  @spec check_arithmetic(
+          atom(),
+          SQLParser.expr(),
+          SQLParser.expr(),
+          SQLFunctions.context(),
+          %{binary() => binary()}
+        ) :: :ok | {:error, map()}
+  defp check_arithmetic(op, left, right, context, columns) do
     case {SQLFunctions.type_of(left, columns), SQLFunctions.type_of(right, columns)} do
       {left_type, right_type}
       when is_binary(left_type) and is_binary(right_type) and
@@ -388,8 +421,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end
   end
 
-  # The engine words a negation the same wherever it stands.
-  defp check_item({:neg, inner}, _context, columns) do
+  @spec check_negation(SQLParser.expr(), %{binary() => binary()}) :: :ok | {:error, map()}
+  defp check_negation(inner, columns) do
     case SQLFunctions.type_of(inner, columns) do
       type when type in [nil, "Timestamp(ns)"] or is_numeric_type(type) ->
         :ok
@@ -399,14 +432,23 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end
   end
 
-  defp check_item({:aggregate, agg, expr}, _context, columns) do
+  @spec check_aggregate(SQLParser.aggregate(), SQLParser.expr(), %{binary() => binary()}) ::
+          :ok | {:error, map()}
+  defp check_aggregate(agg, expr, columns) do
     case SQLFunctions.type_of(expr, columns) do
       nil -> :ok
       type -> aggregate_refusal(agg, type)
     end
   end
 
-  defp check_item({:pattern, kind, expr, rest}, context, columns) do
+  @spec check_pattern(
+          atom(),
+          SQLParser.expr(),
+          term(),
+          SQLFunctions.context(),
+          %{binary() => binary()}
+        ) :: :ok | {:error, map()}
+  defp check_pattern(kind, expr, rest, context, columns) do
     case SQLFunctions.type_of(expr, columns) do
       type when type == "Boolean" or is_numeric_type(type) ->
         planning_error(pattern_error(kind, type, rest), context)
@@ -418,7 +460,9 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   # A boolean is comparable only with a boolean: against another type the
   # comparison, the IN list and the BETWEEN have no common type.
-  defp check_item({:compare, op, left, right}, _context, columns) do
+  @spec check_comparison(atom(), SQLParser.expr(), term(), %{binary() => binary()}) ::
+          :ok | {:error, map()}
+  defp check_comparison(op, left, right, columns) do
     case {SQLFunctions.type_of(left, columns), value_type(right)} do
       {column, value} when is_binary(column) and is_binary(value) ->
         if boolean_mismatch?(column, value),
@@ -426,7 +470,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
             {:error,
              SQLError.coercion(
                "Cannot infer common argument type for comparison operation " <>
-                 "#{column} #{SQLParser.comparison_symbol(op)} #{value}"
+                 "#{column} #{SQLWhere.symbol(op)} #{value}"
              )},
           else: :ok
 
@@ -435,7 +479,9 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end
   end
 
-  defp check_item({:in_list, left, values}, _context, columns) do
+  @spec check_in_list(SQLParser.expr(), [term()], %{binary() => binary()}) ::
+          :ok | {:error, map()}
+  defp check_in_list(left, values, columns) do
     types = Enum.map(values, &value_type/1)
 
     with column when is_binary(column) <- SQLFunctions.type_of(left, columns),
@@ -450,7 +496,9 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end
   end
 
-  defp check_item({:range, left, low, high}, _context, columns) do
+  @spec check_range(SQLParser.expr(), term(), term(), %{binary() => binary()}) ::
+          :ok | {:error, map()}
+  defp check_range(left, low, high, columns) do
     with column when is_binary(column) <- SQLFunctions.type_of(left, columns),
          bound when is_binary(bound) <-
            Enum.find([value_type(low), value_type(high)], &boolean_mismatch_with?(column, &1)) do
@@ -771,12 +819,26 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec where_refs([SQLParser.where_node()]) :: [binary()]
   defp where_refs(nodes) do
     Enum.flat_map(nodes, fn
-      {:or, branches} -> Enum.flat_map(branches, &where_refs/1)
-      {:not, conjunction} -> where_refs(conjunction)
-      {_op, left, right} when is_binary(left) -> [left | expr_fields(right)]
-      {_op, left, right} -> expr_fields(left) ++ expr_fields(right)
+      {:or, branches} ->
+        Enum.flat_map(branches, &where_refs/1)
+
+      {:not, conjunction} ->
+        where_refs(conjunction)
+
+      {op, left, {low, high}} when op in [:between, :not_between] ->
+        operand_fields(left) ++ expr_fields([low, high])
+
+      {_op, left, right} when is_binary(left) ->
+        [left | expr_fields(right)]
+
+      {_op, left, right} ->
+        expr_fields(left) ++ expr_fields(right)
     end)
   end
+
+  @spec operand_fields(SQLParser.operand()) :: [binary()]
+  defp operand_fields(column) when is_binary(column), do: [column]
+  defp operand_fields(operand), do: expr_fields(operand)
 
   @spec expr_fields(term()) :: [binary()]
   defp expr_fields({:expr, expr}), do: expr_fields(expr)
@@ -1141,7 +1203,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   defp eval_expr({:neg, inner}, point) do
     case eval_expr(inner, point) do
-      value when is_number(value) -> -value
+      value when is_integer(value) -> if int64?(value), do: wrap(-value), else: -value
+      value when is_float(value) -> -value
       _null -> nil
     end
   end
@@ -1199,16 +1262,47 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp connection_closed,
     do: throw({:query_error, {:connection_error, %Mint.TransportError{reason: :closed}}})
 
+  @int64_min -9_223_372_036_854_775_808
+  @int64_max 9_223_372_036_854_775_807
+  @two_64 18_446_744_073_709_551_616
+
+  # `Int64` arithmetic wraps in two's complement, as the engine's does
+  # (verified: `y + 9223372036854775807` for 1 is the minimum, `-y` for the
+  # minimum is itself, `y * 9223372036854775807` for 2 is -2). A value
+  # outside the range — a `UInt64` parameter — is not wrapped.
+  @spec wrap(integer()) :: integer()
+  defp wrap(value) when value >= @int64_min and value <= @int64_max, do: value
+  defp wrap(value), do: Integer.mod(value - @int64_min, @two_64) + @int64_min
+
+  @spec int64?(integer()) :: boolean()
+  defp int64?(value), do: value >= @int64_min and value <= @int64_max
+
+  @spec integer_arithmetic(:+ | :- | :*, integer(), integer()) :: integer()
+  defp integer_arithmetic(op, l, r) do
+    result =
+      case op do
+        :+ -> l + r
+        :- -> l - r
+        :* -> l * r
+      end
+
+    if int64?(l) and int64?(r), do: wrap(result), else: result
+  end
+
   @spec arithmetic(:+ | :- | :* | :/ | :rem, number(), number()) :: number() | nil
+  defp arithmetic(op, l, r) when op in [:+, :-, :*] and is_integer(l) and is_integer(r),
+    do: integer_arithmetic(op, l, r)
+
   defp arithmetic(:+, l, r), do: l + r
   defp arithmetic(:-, l, r), do: l - r
   defp arithmetic(:*, l, r), do: l * r
   # DataFusion divides two integers as integers (3 / 2 = 1), so the double
-  # must not promote to float. Dividing an integer by the integer zero makes
-  # the engine close the connection mid-response (verified), as an
-  # impossible CAST does. A float divided by zero is refused by name (see
-  # `float_by_zero/0`).
+  # must not promote to float. Dividing an integer by the integer zero, or
+  # the minimum by -1, makes the engine close the connection mid-response
+  # (verified), as an impossible CAST does. A float divided by zero is
+  # refused by name (see `float_by_zero/0`).
   defp arithmetic(:/, l, 0) when is_integer(l), do: connection_closed()
+  defp arithmetic(:/, @int64_min, -1), do: connection_closed()
   defp arithmetic(:/, _l, zero) when zero in [0, +0.0, -0.0], do: float_by_zero()
   defp arithmetic(:/, l, r) when is_integer(l) and is_integer(r), do: div(l, r)
   defp arithmetic(:/, l, r), do: l / r
@@ -1429,24 +1523,17 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   defp eval_node(point, clause), do: matches_condition?(point, clause)
 
+  @time_ops [:eq, :ne, :gt, :lt, :gte, :lte, :between, :not_between, :in, :not_in]
+  @pattern_ops [:like, :not_like, :regex, :not_regex]
+
   @spec matches_condition?(point(), SQLParser.where_clause()) :: boolean() | nil
-  defp matches_condition?(point, {:truthy, column, _nil}) do
-    case column_value(point, column) do
-      value when is_boolean(value) or is_nil(value) ->
-        value
+  defp matches_condition?(point, {:truthy, column, _nil}), do: truthy(point, column)
 
-      other ->
-        throw({:query_error, %{status: 400, body: non_boolean_predicate(point, column, other)}})
-    end
-  end
+  defp matches_condition?(point, {op, "time", value}) when op in @time_ops,
+    do: time_condition(point.timestamp, op, value)
 
-  defp matches_condition?(point, {:between, "time", {low, high}}) do
-    ts = point.timestamp
-    not is_nil(ts) and ts >= to_nanoseconds(low) and ts <= to_nanoseconds(high)
-  end
-
-  defp matches_condition?(point, {:not_between, "time", range}),
-    do: not matches_condition?(point, {:between, "time", range})
+  defp matches_condition?(point, {op, left, rest}) when op in @pattern_ops,
+    do: pattern_condition(left_value(point, left), op, rest)
 
   # SQL's three-valued logic: a null bound makes its comparison unknown,
   # and `AND` of an unknown is false only if the other side is false
@@ -1455,56 +1542,12 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp matches_condition?(point, {:between, left, {low, high}}) do
     case left_value(point, left) do
       nil -> nil
-      actual -> both(compare3(actual, :gte, low), compare3(actual, :lte, high))
+      actual -> both(compare3(point, actual, :gte, low), compare3(point, actual, :lte, high))
     end
   end
 
-  defp matches_condition?(point, {:not_between, key, range}) do
-    case matches_condition?(point, {:between, key, range}) do
-      nil -> nil
-      value -> not value
-    end
-  end
-
-  defp matches_condition?(point, {:like, left, regex}) do
-    case left_value(point, left) do
-      nil -> nil
-      text when is_binary(text) -> Regex.match?(regex, text)
-      other -> throw({:query_error, %{status: 400, body: like_type_error(other)}})
-    end
-  end
-
-  defp matches_condition?(point, {:regex, left, {regex, op}}) do
-    case left_value(point, left) do
-      nil -> nil
-      text when is_binary(text) -> Regex.match?(regex, text)
-      other -> throw({:query_error, %{status: 400, body: regex_type_error(other, op)}})
-    end
-  end
-
-  defp matches_condition?(point, {:not_regex, left, {regex, op}}) do
-    case left_value(point, left) do
-      nil -> nil
-      text when is_binary(text) -> not Regex.match?(regex, text)
-      other -> throw({:query_error, %{status: 400, body: regex_type_error(other, op)}})
-    end
-  end
-
-  defp matches_condition?(point, {:not_like, left, regex}) do
-    case left_value(point, left) do
-      nil -> nil
-      text when is_binary(text) -> not Regex.match?(regex, text)
-      other -> throw({:query_error, %{status: 400, body: like_type_error(other)}})
-    end
-  end
-
-  defp matches_condition?(point, {:in, "time", values}) do
-    point_in_time_set?(point, values)
-  end
-
-  defp matches_condition?(point, {:not_in, "time", values}) do
-    not point_in_time_set?(point, values)
-  end
+  defp matches_condition?(point, {:not_between, key, range}),
+    do: negate(matches_condition?(point, {:between, key, range}))
 
   # A null in the list (or a null parameter) makes a miss unknown, not
   # false: `v NOT IN (1, NULL)` keeps nothing.
@@ -1515,21 +1558,13 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end
   end
 
-  defp matches_condition?(point, {:not_in, key, values}) do
-    case matches_condition?(point, {:in, key, values}) do
-      nil -> nil
-      value -> not value
-    end
-  end
+  defp matches_condition?(point, {:not_in, key, values}),
+    do: negate(matches_condition?(point, {:in, key, values}))
 
   defp matches_condition?(point, {:is_null, key, _nil}), do: is_nil(left_value(point, key))
 
   defp matches_condition?(point, {:is_not_null, key, _nil}),
     do: not is_nil(left_value(point, key))
-
-  defp matches_condition?(point, {op, "time", value}) do
-    compare(point.timestamp, op, to_nanoseconds(value))
-  end
 
   defp matches_condition?(point, {op, left, right}) do
     case {left_value(point, left), right_value(point, right)} do
@@ -1538,6 +1573,77 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
       {l, r} -> compare(l, op, r)
     end
   end
+
+  @spec negate(boolean() | nil) :: boolean() | nil
+  defp negate(nil), do: nil
+  defp negate(value), do: not value
+
+  @spec truthy(point(), binary()) :: boolean() | nil
+  defp truthy(point, column) do
+    case column_value(point, column) do
+      value when is_boolean(value) or is_nil(value) ->
+        value
+
+      other ->
+        throw({:query_error, %{status: 400, body: non_boolean_predicate(point, column, other)}})
+    end
+  end
+
+  # A `time` comparison, range or set. A null bound, or a point with no
+  # time, makes it unknown, as for any other column.
+  @spec time_condition(integer() | nil, atom(), term()) :: boolean() | nil
+  defp time_condition(ts, :between, {low, high}),
+    do: both(time_compare(ts, :gte, low), time_compare(ts, :lte, high))
+
+  defp time_condition(ts, :not_between, range), do: negate(time_condition(ts, :between, range))
+  defp time_condition(ts, :in, values), do: time_in(ts, values)
+  defp time_condition(ts, :not_in, values), do: negate(time_in(ts, values))
+  defp time_condition(ts, op, value), do: time_compare(ts, op, value)
+
+  @spec time_compare(integer() | nil, atom(), SQLParser.time_value()) :: boolean() | nil
+  defp time_compare(ts, op, bound) do
+    case {ts, to_nanoseconds(bound)} do
+      {nil, _bound} -> nil
+      {_ts, nil} -> nil
+      {ts, ns} -> compare(ts, op, ns)
+    end
+  end
+
+  @spec time_in(integer() | nil, [SQLParser.time_value()]) :: boolean() | nil
+  defp time_in(nil, _values), do: nil
+
+  defp time_in(ts, values) do
+    bounds = Enum.map(values, &to_nanoseconds/1)
+
+    cond do
+      Enum.any?(bounds, &(&1 == ts)) -> true
+      Enum.any?(bounds, &is_nil/1) -> nil
+      true -> false
+    end
+  end
+
+  # LIKE, ILIKE and the regular-expression operators over a text value; a
+  # number or a boolean has no text to match.
+  @spec pattern_condition(term(), atom(), term()) :: boolean() | nil
+  defp pattern_condition(nil, _op, _rest), do: nil
+
+  defp pattern_condition(text, op, rest) when is_binary(text),
+    do: pattern_match(op, rest, text)
+
+  defp pattern_condition(other, op, rest),
+    do: throw({:query_error, %{status: 400, body: pattern_type_error(op, rest, other)}})
+
+  @spec pattern_match(atom(), term(), binary()) :: boolean()
+  defp pattern_match(:like, regex, text), do: Regex.match?(regex, text)
+  defp pattern_match(:not_like, regex, text), do: not Regex.match?(regex, text)
+  defp pattern_match(:regex, {regex, _op}, text), do: Regex.match?(regex, text)
+  defp pattern_match(:not_regex, {regex, _op}, text), do: not Regex.match?(regex, text)
+
+  @spec pattern_type_error(atom(), term(), term()) :: binary()
+  defp pattern_type_error(op, _regex, value) when op in [:like, :not_like],
+    do: like_type_error(value)
+
+  defp pattern_type_error(_op, {_regex, symbol}, value), do: regex_type_error(value, symbol)
 
   # DataFusion refuses a non-boolean column as a filter at planning.
   @spec non_boolean_predicate(point(), binary(), term()) :: binary()
@@ -1566,10 +1672,13 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     end
   end
 
-  @spec compare3(term(), atom(), term()) :: boolean() | nil
-  defp compare3(_actual, _op, nil), do: nil
-  defp compare3(actual, op, {:uint, value}), do: compare(actual, op, value)
-  defp compare3(actual, op, value), do: compare(actual, op, value)
+  @spec compare3(point(), term(), atom(), term()) :: boolean() | nil
+  defp compare3(point, actual, op, bound) do
+    case right_value(point, bound) do
+      nil -> nil
+      value -> compare(actual, op, value)
+    end
+  end
 
   @spec both(boolean() | nil, boolean() | nil) :: boolean() | nil
   defp both(false, _other), do: false
@@ -1578,16 +1687,11 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp both(_other, nil), do: nil
   defp both(true, true), do: true
 
-  @spec point_in_time_set?(point(), [term()]) :: boolean()
-  defp point_in_time_set?(point, values) do
-    ts = point.timestamp
-    Enum.any?(values, fn v -> ts == to_nanoseconds(v) end)
-  end
-
   # The parser has already turned every `time` comparand into nanoseconds or
   # a `now()` offset; `now()` is resolved here, at execution, as the engine
   # does.
-  @spec to_nanoseconds(SQLParser.time_value()) :: integer()
+  @spec to_nanoseconds(SQLParser.time_value()) :: integer() | nil
+  defp to_nanoseconds(nil), do: nil
   defp to_nanoseconds(value) when is_integer(value), do: value
   defp to_nanoseconds({:now, offset_ns}), do: Store.now_ns() + offset_ns
 

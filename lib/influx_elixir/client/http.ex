@@ -248,13 +248,15 @@ defmodule InfluxElixir.Client.HTTP do
   @spec query_params(keyword()) :: {:ok, QueryParams.t()} | {:error, QueryParams.error()}
   defp query_params(opts), do: QueryParams.normalize(Keyword.get(opts, :params, %{}))
 
-  @doc false
   # The JSON body of a `POST /api/v3/query_sql`: `db`, `q`, `params` and, when
-  # `format` is not `nil`, `format`. Exposed so the encoding of the
-  # parameters can be pinned without a server.
+  # `format` is not `nil`, `format`. Jason writes the keys in that order
+  # (`db`, `format`, `params`, `q`), which `Client.Local` relies on to place
+  # the byte where the engine's JSON parser stops
+  # (`InfluxElixir.Client.Local.Format.check_params/3`); the SQL contract pins
+  # both against the engine.
   @spec sql_request_body(binary(), binary(), keyword(), term()) ::
           {:ok, binary()} | {:error, QueryParams.error()}
-  def sql_request_body(database, sql, opts, format) do
+  defp sql_request_body(database, sql, opts, format) do
     with {:ok, params} <- query_params(opts) do
       body = %{"db" => database, "q" => sql, "params" => params}
       body = if format == nil, do: body, else: Map.put(body, "format", to_string(format))
@@ -764,8 +766,8 @@ defmodule InfluxElixir.Client.HTTP do
   @doc false
   # Resolves the receive timeout in milliseconds. Precedence:
   #   opts[:timeout] → connection[:timeout] → @default_timeout
-  # Exposed (with @doc false) so the precedence logic is unit-testable
-  # without spinning up a network fixture.
+  # Exposed (with @doc false) for the default alone: the precedence is pinned
+  # through the query functions, but a 30 second default is not waited for.
   @spec resolve_timeout(keyword(), keyword()) :: non_neg_integer()
   def resolve_timeout(opts, connection) do
     Keyword.get(opts, :timeout) ||

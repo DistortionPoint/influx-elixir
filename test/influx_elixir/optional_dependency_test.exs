@@ -1,11 +1,34 @@
+defmodule InfluxElixir.OptionalDependencyTest.Deps do
+  @moduledoc false
+
+  # The main module of each dependency marked `optional: true` in mix.exs.
+  # `{:app, "~> 1.0"}`, `{:app, "~> 1.0", opts}` and `{:app, opts}` are all
+  # dependency specs.
+  @spec modules(%{atom() => module()}) :: [module()]
+  def modules(main_modules) do
+    for dep <- Mix.Project.config()[:deps],
+        {app, opts} = spec(dep),
+        Keyword.get(opts, :optional, false) do
+      Map.get_lazy(main_modules, app, fn ->
+        Module.concat([app |> Atom.to_string() |> Macro.camelize()])
+      end)
+    end
+  end
+
+  defp spec({app, _requirement, opts}) when is_list(opts), do: {app, opts}
+  defp spec({app, opts}) when is_list(opts), do: {app, opts}
+  defp spec({app, _requirement}), do: {app, []}
+end
+
 defmodule InfluxElixir.OptionalDependencyTest do
   use ExUnit.Case, async: true
 
   # An optional dependency (`optional: true` in mix.exs) may be absent from a
   # consumer's project. Writing `%Decimal{}` expands the struct at compile
-  # time, so the library failed to compile there (verified with a scratch
-  # consumer). Code must match `%{__struct__: Decimal}` and call the module
-  # only behind that match.
+  # time, and `import`, `require` and `use` of the module need it at compile
+  # time too, so the library failed to compile there (verified with a scratch
+  # consumer for the struct). Code must match `%{__struct__: Decimal}` and call
+  # the module only behind that match.
   #
   # The main module of an optional dependency is its app name camelized
   # (`:decimal` is `Decimal`); a dependency whose module is named otherwise
@@ -14,33 +37,22 @@ defmodule InfluxElixir.OptionalDependencyTest do
 
   @lib_files Path.wildcard(Path.expand("../../lib/**/*.ex", __DIR__))
 
-  defp optional_modules do
-    for app <- optional_deps(), do: main_module(app)
+  # A library with no optional dependency has nothing to check.
+  @optional_modules InfluxElixir.OptionalDependencyTest.Deps.modules(@main_modules)
+
+  @compile_time_forms [:import, :require, :use]
+
+  setup_all do
+    # Every library file is parsed once, for every optional module.
+    {:ok, asts: Map.new(@lib_files, &{&1, &1 |> File.read!() |> parse()})}
   end
 
-  defp optional_deps do
-    for dep <- Mix.Project.config()[:deps],
-        {app, _requirement, opts} <- [normalise(dep)],
-        Keyword.get(opts, :optional, false),
-        do: app
-  end
+  defp parse(source), do: Code.string_to_quoted!(source, columns: true)
 
-  # `{:app, "~> 1.0"}`, `{:app, "~> 1.0", opts}` and `{:app, opts}` are all
-  # dependency specs.
-  defp normalise({app, requirement, opts}) when is_list(opts), do: {app, requirement, opts}
-  defp normalise({app, opts}) when is_list(opts), do: {app, nil, opts}
-  defp normalise({app, requirement}), do: {app, requirement, []}
-
-  defp main_module(app) do
-    Map.get_lazy(@main_modules, app, fn ->
-      Module.concat([app |> Atom.to_string() |> Macro.camelize()])
-    end)
-  end
-
-  # The struct expansions of `module` in `source`, as line numbers: `%Module{}`
-  # directly or through an `alias Module, as: Other`.
-  defp struct_expansions(source, module) do
-    ast = Code.string_to_quoted!(source, columns: true)
+  # What needs `module` at compile time in `ast`, as `{line, form}`: a struct
+  # `%Module{}` directly or through an `alias Module, as: Other`, and an
+  # `import`, `require` or `use` of it.
+  defp compile_time_needs(ast, module) do
     target = module |> Module.split() |> Enum.map(&String.to_atom/1)
 
     {_ast, {_names, found}} =
@@ -56,11 +68,15 @@ defmodule InfluxElixir.OptionalDependencyTest do
           {node, {names, found}}
 
         {:%, meta, [{:__aliases__, _name_meta, segments}, _fields]} = node, {names, found} ->
-          if MapSet.member?(names, normalise_segments(segments)) do
-            {node, {names, [meta[:line] | found]}}
-          else
-            {node, {names, found}}
-          end
+          if MapSet.member?(names, normalise_segments(segments)),
+            do: {node, {names, [{meta[:line], :struct} | found]}},
+            else: {node, {names, found}}
+
+        {form, meta, [{:__aliases__, _name_meta, segments} | _opts]} = node, {names, found}
+        when form in @compile_time_forms ->
+          if MapSet.member?(names, normalise_segments(segments)),
+            do: {node, {names, [{meta[:line], form} | found]}},
+            else: {node, {names, found}}
 
         node, acc ->
           {node, acc}
@@ -73,30 +89,35 @@ defmodule InfluxElixir.OptionalDependencyTest do
   defp normalise_segments(segments), do: segments
 
   describe "the library's optional dependencies" do
-    test "the library has source files and optional dependencies to check" do
-      refute @lib_files == []
-      refute optional_modules() == []
+    if @optional_modules == [] do
+      @describetag skip: "the library declares no optional dependency"
     end
 
     test "each optional dependency resolves to its main module" do
-      for module <- optional_modules() do
+      for module <- @optional_modules do
         assert Code.ensure_loaded?(module),
                "#{inspect(module)} is not a module; see @main_modules"
       end
     end
 
-    test "no library file expands a struct of an optional dependency" do
+    test "no library file needs an optional dependency at compile time", %{asts: asts} do
       offenders =
-        for module <- optional_modules(),
-            path <- @lib_files,
-            line <- path |> File.read!() |> struct_expansions(module),
-            do: "#{Path.relative_to_cwd(path)}:#{line} expands %#{inspect(module)}{}"
+        for module <- @optional_modules,
+            {path, ast} <- asts,
+            {line, form} <- compile_time_needs(ast, module),
+            do: "#{Path.relative_to_cwd(path)}:#{line} #{form}s #{inspect(module)}"
 
       assert offenders == []
     end
   end
 
-  describe "the struct detector" do
+  describe "the library's source" do
+    test "has files to check", %{asts: asts} do
+      assert map_size(asts) > 0
+    end
+  end
+
+  describe "the compile-time detector" do
     test "finds a struct written directly or through an alias, and ignores a match on the map" do
       source = """
       defmodule Sample do
@@ -111,7 +132,51 @@ defmodule InfluxElixir.OptionalDependencyTest do
       end
       """
 
-      assert struct_expansions(source, Decimal) == [4, 5]
+      assert source |> parse() |> compile_time_needs(Decimal) ==
+               [{4, :struct}, {5, :struct}]
+    end
+
+    test "finds an import, a require and a use, with options or an alias" do
+      source = """
+      defmodule Sample do
+        import Decimal
+        import Decimal, only: [new: 1]
+        require Decimal
+        require Decimal, as: D
+        use Decimal
+        use Decimal, option: true
+        alias Decimal, as: Dec
+        import Dec
+      end
+      """
+
+      assert source |> parse() |> compile_time_needs(Decimal) ==
+               [
+                 {2, :import},
+                 {3, :import},
+                 {4, :require},
+                 {5, :require},
+                 {6, :use},
+                 {7, :use},
+                 {9, :import}
+               ]
+    end
+
+    test "ignores a plain alias, another module and a call on the module" do
+      source = """
+      defmodule Sample do
+        alias Decimal
+        alias Decimal, as: D
+        import Enum
+        require Logger
+        use GenServer
+
+        def a(%{__struct__: Decimal} = value), do: Decimal.to_string(value)
+        def b(value), do: D.to_string(value)
+      end
+      """
+
+      assert source |> parse() |> compile_time_needs(Decimal) == []
     end
   end
 end

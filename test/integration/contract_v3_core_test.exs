@@ -46,7 +46,7 @@ defmodule InfluxElixir.Integration.ContractV3CoreTest do
     case HTTP.create_database(base_conn, db) do
       :ok ->
         on_exit(fn -> HTTP.delete_database(base_conn, db) end)
-        {:ok, conn: base_conn, database: db, query_delay: 500}
+        {:ok, conn: base_conn, database: db, query_delay: 500, time_slack: 60}
 
       {:error, reason} ->
         flunk("Failed to create test database: #{inspect(reason)}")

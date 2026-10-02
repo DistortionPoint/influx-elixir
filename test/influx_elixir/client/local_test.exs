@@ -3,12 +3,6 @@ defmodule InfluxElixir.Client.LocalTest do
 
   alias InfluxElixir.Client.Local
 
-  # Client.Local's refusal of a `time` comparand the engine rejects; the
-  # comparand as written follows it.
-  @time_comparand_rejected "Client.Local: InfluxDB rejects this `time` comparand " <>
-                             "(a Timestamp compares only with an ISO-8601 string or now() " <>
-                             "+/- INTERVAL 'N unit', never a bare integer): "
-
   setup do
     {:ok, conn} = Local.start(databases: ["test_db"])
     on_exit(fn -> Local.stop(conn) end)
@@ -1146,18 +1140,6 @@ defmodule InfluxElixir.Client.LocalTest do
         "SELECT * FROM prices WHERE time >= '2026-03-17' AND time <= '2026-03-18' ORDER BY time"
 
       assert column_values(conn, db, sql, "symbol") == ["AAPL", "GOOG", "MSFT"]
-    end
-
-    test "an unparseable date string is rejected, as the engine rejects it",
-         %{conn: conn, db: db} do
-      # InfluxDB 3 fails the query ("Error parsing timestamp from 'totally
-      # garbage'"); returning [] would hide the mistake.
-      assert {:error, %{status: 400, body: @time_comparand_rejected <> "'totally garbage'"}} =
-               Local.query_sql(
-                 conn,
-                 "SELECT * FROM prices WHERE time > 'totally garbage'",
-                 database: db
-               )
     end
   end
 
@@ -2372,20 +2354,6 @@ defmodule InfluxElixir.Client.LocalTest do
       assert [%{"repcode" => "12345678", "amount" => 5000.0}] = sql_rows(conn, db, sql)
     end
 
-    test "a string literal against a float field compares as text", %{conn: conn, db: db} do
-      # Real engine: '500.0' >= '1000.00' lexically, so BOTH rows come back.
-      # The double reproduces the footgun so tests fail the way prod does.
-      sql = "SELECT amount FROM acct WHERE amount >= '1000.00' ORDER BY time"
-      assert sql_rows(conn, db, sql) == [%{"amount" => 500.0}, %{"amount" => 5000.0}]
-
-      # Real engine: 500.0 renders as "500.0", so '500' is not equal ...
-      assert [] = sql_rows(conn, db, "SELECT * FROM acct WHERE amount = '500'")
-
-      # ... but '500.0' is.
-      assert [%{"amount" => 500.0}] =
-               sql_rows(conn, db, "SELECT * FROM acct WHERE amount IN ('500.0')")
-    end
-
     test "a bare numeric literal against a float field compares numerically",
          %{conn: conn, db: db} do
       sql = "SELECT * FROM acct WHERE amount >= 1000.0"
@@ -2431,19 +2399,6 @@ defmodule InfluxElixir.Client.LocalTest do
       flux = "from(bucket: \"flux_range_db\") |> range(start: -1d)"
       assert {:ok, rows} = Local.query_flux(conn, flux)
       assert Enum.map(rows, &{&1["host"], &1["_value"]}) == [{"new", 1}, {"old", 2}]
-    end
-
-    test "a query without range() is refused as unbounded, as the engine refuses it",
-         %{v2_conn: conn} do
-      assert {:error, %{status: 400, body: body}} =
-               Local.query_flux(conn, "from(bucket: \"flux_range_db\")")
-
-      assert Jason.decode!(body) == %{
-               "code" => "invalid",
-               "message" =>
-                 "error in building plan while starting program: cannot submit unbounded " <>
-                   ~s|read to "flux_range_db"; try bounding 'from' with a call to 'range'|
-             }
     end
 
     test "flux filter predicate on tag field", %{v2_conn: conn} do
@@ -3211,9 +3166,18 @@ defmodule InfluxElixir.Client.LocalTest do
       assert column_values(conn, db, sql, "price") == [1.0, 2.0, 3.0]
     end
 
-    test "an unknown function as a time comparand is rejected", %{conn: conn, db: db} do
-      assert {:error, %{status: 400, body: @time_comparand_rejected <> "foo()"}} =
-               Local.query_sql(conn, ~s|SELECT price FROM "q" WHERE time >= foo()|, database: db)
+    # The engine answers "Error during planning: Invalid function 'foo'." with
+    # a "Did you mean" suggestion that varies from run to run (verified); the
+    # double refuses by name with the same status.
+    test "an unknown function as a time comparand is refused by name", %{conn: conn, db: db} do
+      assert Local.query_sql(conn, ~s|SELECT price FROM "q" WHERE time >= foo()|, database: db) ==
+               {:error,
+                %{
+                  status: 400,
+                  body:
+                    "Client.Local: a `time` comparand must be a quoted ISO-8601 string, now() " <>
+                      "+/- INTERVAL 'N unit', NULL or a $parameter: foo()"
+                }}
     end
 
     test "COUNT(DISTINCT col) is 0 over no rows and counts per group", %{conn: conn, db: db} do
@@ -4185,18 +4149,9 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, db: "wr_db"}
     end
 
-    test "a field's type is fixed by the first write; a later conflict is rejected with the engine's message",
+    test "a column's type is fixed by the first write across tags, strings, floats and booleans",
          %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "c v=1i 1700000000000000000", database: db)
-
-      assert {:error, %{status: 400, body: body}} =
-               Local.write(conn, "c v=2.0 1700000000000000001", database: db)
-
-      assert partial_errors(body) == [
-               {1,
-                "invalid column type for column 'v', expected iox::column_type::field::integer, " <>
-                  "got iox::column_type::field::float"}
-             ]
 
       # tag then field, field then tag, string then float, boolean then integer
       for {first, second, column, expected, got} <- [

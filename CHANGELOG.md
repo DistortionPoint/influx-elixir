@@ -8,6 +8,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` slowed to a crawl under concurrent writes.** Eight
+  writers of 2,500 lines to one series took 4.5 s, 32 took 20 s, and 50
+  timed out at 60 s. A payload's points now go into the store as one
+  batched insert, its series keys are claimed by one all-or-nothing
+  `insert_new`, and the table has `write_concurrency`. The same writers
+  now take 0.05 s, 0.2 s and 0.4 s. Duplicate merging and last-write-wins
+  are unchanged.
+- **Parsing a large payload no longer spawns an unbounded process.** The
+  parse for 2,000 lines or more sized a process for the whole payload, which
+  added about 1 GB for 200k lines (8.7 GB for eight at once), and it kept
+  running after its caller died. Lines are now parsed 10k at a time, each
+  chunk in a process that ends with the chunk: 287 MB for 200k lines, and
+  the speed is unchanged.
+- **InfluxDB 2 reads of a field with mixed types stopped at the wrong
+  group in `Client.Local`.** The engine reads the earliest group's type up
+  to the first later group of another type and drops that group and every
+  group after it, per measurement and field, across all tag sets. Local
+  also returned later groups of the first type. Verified on 2.7.
+- **`delete_bucket/2` on `Client.Local` left the bucket's points and
+  per-group schema behind.** A bucket created again returned the old
+  points, and a write of a new field type was refused with a 422.
+- **`Client.Local` accepted a point older than a v2 bucket's retention.**
+  2.7 drops it before any shard sees it and answers 422 `partial write:
+  dropped N points outside retention policy of duration 2h0m0s - oldest
+  point <series key> at <time> dropped because it violates a Retention
+  Policy Lower Bound at <now - retention>, newest point ... dropped=N for
+  database: <bucket id> for retention policy: autogen`. A failing shard
+  group's message replaces it; the other points are written. A v3
+  database's `retention:` is still not applied.
+- **`Client.Local` SQL matches InfluxDB 3 in more corners.** Verified
+  against Core.
+  - A huge integer or Decimal param (beyond a double) is the engine's 400
+    `number out of range`, not a crash. `params: nil` is accepted, and an
+    unusable key or shape is `{:error, {:invalid_param, ...}}`.
+  - Int64 arithmetic wraps as the engine's does (`MAX + 1` is `MIN`), and
+    `MIN / -1` closes the connection.
+  - `E'…'` strings take the engine's backslash escapes.
+  - A double-quoted name is always a column. A name that needs its quotes
+    is printed as the engine prints it in "No field named".
+  - A `time` string Arrow cannot read is the optimizer's 500
+    (`Error parsing timestamp from '…': …`), not a 400 about integers.
+  - `time = NULL` and a nil `time` param match no rows.
+  - `round` keeps the sign of a zero result (`round(-0.3)` is `-0.0`).
+- **`Client.Local` InfluxQL.**
+  - A series without the `GROUP BY` tag comes last, as on the engine.
+  - A number with an exponent, a trailing dot or a hex prefix is the
+    engine's parse error.
+  - The parse error's position is right when a clause follows `WHERE`.
+- **Contract tests no longer assume what the engines leave open.**
+  - Row order without `ORDER BY` is not assumed.
+  - When several InfluxDB 2 shard groups fail in one write, the engine
+    reports one of them, and which one varies between identical writes.
+    The contract accepts any of them, and the double reports the
+    earliest.
+- **HTTP timeout tests could flake under load.** Each wait is now well
+  under the timeout a wrong precedence would apply, and well over the one
+  under test.
 - **`Client.Local` read SQL text its tokenizer would refuse, and ignored
   what the engine ignores.** Verified against Core 3.10.
   - An unterminated `'...'`, `"..."`, `/* ... */` or `$$...$$` is the
@@ -52,7 +109,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     are not blank or comments, as on the engine.
   - On InfluxDB 2:
     - field types are per shard group;
-    - a partial write is reported by its earliest failing group;
+    - a partial write is reported by one failing group: the engine's
+      choice among several varies between identical writes (usually the
+      earliest), and the double always reports the earliest;
     - a measurement the engine accepts but never returns is accepted
       and never returned.
   - Refused by name rather than answered differently:
@@ -66,6 +125,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   40k points in 40k hourly groups took 8.6 s; they now take about 0.2 s.
 
 ### Changed
+- **`Client.Local`'s SQL parser is split into focused modules:**
+  `SQLParser` (entry), `SQLLexer`, `SQLMask`, `SQLLiteral`, `SQLTime`,
+  `SQLExpr`, `SQLSelect`, `SQLWhere`, `SQLClauses`, `SQLLimit` and
+  `SQLBind`. `sql_parser.ex` drops from 3,027 lines to 694. InfluxQL and
+  the line protocol share its quote masking and float rendering.
+- **Contract coverage.**
+  - Every contract quote keeps its source location, so a failure points
+    at the contract line.
+  - Tests where Local deliberately differs are tagged
+    `:local_divergence`.
+  - The SQL contracts also run on the `:v3_enterprise` profile.
+  - Test databases and buckets on real servers have unique names and are
+    cleaned up.
 - **For tests: a parameter key written as `"$name"` no longer binds.**
   InfluxDB 3 reads a parameter's key without the `$`, and a `"$name"`
   key binds nothing there, so a query that passed against `Client.Local`
@@ -76,8 +148,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - bare lines: 332 → about 130 ms;
   - three tags and four fields: 1752 → about 540 ms.
 
-  A large payload is parsed in a short-lived process sized for its
-  result, so the caller's heap is left alone.
+  A large payload is parsed 10k lines at a time, each chunk in a
+  short-lived process, so the caller's heap is left alone.
 - **Tests.**
   - Fidelity tests that repeated the contract suite are gone, so each
     fact is pinned once and runs against Local and the real engines.

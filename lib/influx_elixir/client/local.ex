@@ -128,8 +128,18 @@ defmodule InfluxElixir.Client.Local do
       only field is `time` is dropped, "invalid field name" (the other
       fields of a point that has some are stored, `time` is not); a payload
       is written a shard group at a time (a week of time, or a day or an
-      hour for a bucket with a short retention), and the message is the
-      earliest failing group's first drop, counting that group's drops. A line that
+      hour for a bucket with a short retention), and the message is one
+      failing group's first drop, counting that group's drops. When several
+      groups fail, which one the engine reports varies between identical
+      writes (verified; usually the earliest); the double always reports the
+      earliest. A
+      point older than the bucket's retention (`now - retention`) is dropped
+      before any group sees it, and a write that has such points and no
+      failing group is HTTP 422 `... partial write: dropped N points outside
+      retention policy of duration 2h0m0s - oldest point <series key> at
+      <time> dropped because it violates a Retention Policy Lower Bound at
+      <bound>, newest point ... dropped=N for database: <bucket id> for
+      retention policy: autogen`; a failing group's message replaces it. A line that
       fails to parse rejects the whole payload with HTTP 400
       (`{"code":"invalid","message":"unable to parse '<line>': <reason>"}`,
       one such sentence per failed line, joined by newlines, the reason one
@@ -149,8 +159,13 @@ defmodule InfluxElixir.Client.Local do
   Identifiers follow DataFusion: an unquoted name is folded to lower case
   (`SELECT Host FROM Cpu` reads column `host` of table `cpu`, and `v AS V`
   answers `"v"`), a double-quoted one is exact (`"Host"`), and `"..."` is
-  never a string — `WHERE k = "a"` compares with column `a`. See
-  `InfluxElixir.Client.Local.SQLIdentifiers`. (InfluxQL identifiers are
+  never a string — `WHERE k = "a"` compares with column `a`, and a name that
+  needs its quotes (`"a b"`, `"ho""st"`) is a column too, printed quoted in
+  the engine's "No field named" error. `'...'` is a string, a doubled quote
+  one quote; `E'...'` or `e'...'` a string with backslash escapes
+  (`E'it\\'s'`, `E'a\\nb'`, `E'\\x41'`), read as the engine's tokenizer reads
+  them. See `InfluxElixir.Client.Local.SQLIdentifiers` and
+  `InfluxElixir.Client.Local.SQLLexer`. (InfluxQL identifiers are
   case-sensitive and are not folded.) The subset:
 
     * `SELECT * FROM measurement`
@@ -216,13 +231,21 @@ defmodule InfluxElixir.Client.Local do
       case-sensitive, `ILIKE` is not). `LIKE` over a
       numeric column is the engine's planning error, reproduced.
     * `WHERE time <op> <comparand>` — exactly what InfluxDB 3 accepts against
-      a Timestamp: a quoted ISO-8601 datetime (`'2026-03-31T12:00:00Z'`,
-      zone-less or fractional forms too), a quoted date (`'2026-03-31'`,
-      midnight UTC), or `now()` offset by `+`/`-` `INTERVAL 'N unit'` terms
-      (`now() - INTERVAL '5 minutes'`). A bare integer (`time > 1700000000`)
-      and an integer-as-string are **rejected**, as DataFusion rejects them
-      ("Cannot infer common argument type for comparison operation
-      Timestamp(ns) > Int64"), rather than silently matching nothing.
+      a Timestamp: a quoted datetime or date as Arrow reads it
+      (`'2026-03-31T12:00:00Z'`; a space or `t` for the `T`, a fraction of
+      any length, a zone as `Z`, `+01:00`, `+0100`, `+01`, `UTC` or `GMT`;
+      `'2026-03-31'` is midnight UTC), `now()` offset by `+`/`-`
+      `INTERVAL 'N unit'` terms (`now() - INTERVAL '5 minutes'`), `NULL` or a
+      `$param`. A bare integer (`time > 1700000000`) is rejected as
+      DataFusion rejects it ("Cannot infer common argument type for
+      comparison operation Timestamp(ns) > Int64"), rather than silently
+      matching nothing. A string Arrow cannot read — an integer-as-string
+      too — is the optimizer's 500 in Arrow's words ("Error parsing
+      timestamp from 'abc': timestamp must contain at least 10
+      characters"), raised after the planner's own errors, and an instant
+      outside the nanosecond range is its overflow error. A null compares as
+      unknown. A leap second (`:60`) and a time zone name other than `UTC`
+      and `GMT` are refused by name.
     * `SELECT DISTINCT col[, col ...] FROM measurement` (sorted combinations;
       `ORDER BY` must name a selected column, as in DataFusion). An all-null
       combination is a row too (`%{}`).
@@ -270,8 +293,12 @@ defmodule InfluxElixir.Client.Local do
       expression over fields
       and numeric literals (`SUM(value * value)`, `AVG(bid + ask)`); two
       integer operands divide as integers (`3 / 2 = 1`), as in DataFusion.
-      An integer divided by zero closes the connection mid-response, as on
-      the engine (`{:error, {:connection_error, %Mint.TransportError{reason:
+      `Int64` `+`, `-`, `*` and unary minus wrap in two's complement, as the
+      engine's do (`9223372036854775807 + 1` is the minimum, `-` of the
+      minimum is itself).
+      `round` keeps the sign of a zero it leaves (`round(-0.3)` is `-0.0`).
+      An integer divided by zero, or the minimum by -1, closes the
+      connection mid-response, as on the engine (`{:error, {:connection_error, %Mint.TransportError{reason:
       :closed}}}`). A float divided by zero is IEEE infinity or NaN on the
       engine, which compares as a number but has no Elixir form, so the
       double refuses it by name. A sample
@@ -323,10 +350,15 @@ defmodule InfluxElixir.Client.Local do
 
   ## SQL Param Types
 
-  `params:` values are serialised to SQL literals before query execution.
-  Supported types: `binary`, `integer`, `float`, `boolean`, and `Decimal`
-  (when the optional `:decimal` dependency is loaded — `Decimal` values
-  are emitted as bare numeric literals via `Decimal.to_string(:normal)`).
+  `params:` is a map or a keyword list (or `nil`), sent as the JSON object of
+  the request body: a value is data and is never spliced into the SQL text.
+  A parameter is a `nil`, boolean, number, string, atom (its name), `Date`,
+  `Time`, `NaiveDateTime`, `DateTime` (ISO-8601 strings) or a `Decimal` (a
+  JSON number, when the optional `:decimal` dependency is loaded). A
+  number is read as the engine's JSON parser reads it — an integer outside
+  `Int64`/`UInt64` is a float, and one past the float range is the engine's
+  `number out of range` 400 — and an object or an array is its 400 too;
+  see `InfluxElixir.Client.QueryParams` and `InfluxElixir.Client.Local.Format`.
 
   ## Write Bodies
 
@@ -756,21 +788,22 @@ defmodule InfluxElixir.Client.Local do
   end
 
   defp store_lines(table, database, lines, _v3) do
-    {errors, _known} =
-      Enum.reduce(lines, {[], %{}}, fn
-        {:error, line_error}, {errors, known} ->
-          {[line_error | errors], known}
+    {errors, accepted, _known} =
+      Enum.reduce(lines, {[], [], %{}}, fn
+        {:error, line_error}, {errors, accepted, known} ->
+          {[line_error | errors], accepted, known}
 
-        {:ok, point, number, line}, {errors, known} ->
+        {:ok, point, number, line}, {errors, accepted, known} ->
           case check_schema(table, database, point, :v3, known) do
             {:ok, known} ->
-              Store.store_point(table, database, strip_uint_markers(point))
-              {errors, known}
+              {errors, [strip_uint_markers(point) | accepted], known}
 
             {:error, message} ->
-              {[LineProtocolParser.schema_error(message, number, line) | errors], known}
+              {[LineProtocolParser.schema_error(message, number, line) | errors], accepted, known}
           end
       end)
+
+    Store.store_points(table, database, Enum.reverse(accepted))
 
     case errors do
       [] ->
@@ -789,32 +822,61 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  # InfluxDB 2 writes a payload's points in groups, one per shard group
-  # (verified): a point it drops is counted, and the message it answers
-  # with is the first drop of the earliest group that dropped any, counting
-  # only that group's drops, whatever order the payload gave the groups in.
-  # A point is dropped for a field type that conflicts with the stored one
-  # and for having no field but `time`.
+  # InfluxDB 2 maps a payload's points onto shards first and drops the ones
+  # older than the bucket's retention (verified): `now - retention` is the
+  # lower bound, and a point before it never reaches a shard — it registers
+  # no field and is dropped whatever else is wrong with it.
+  #
+  # The rest are written in groups, one per shard group (verified): a point
+  # it drops is counted, and the message it answers with is the first drop
+  # of one group that dropped any, counting only that group's drops. The
+  # engine's choice among several failing groups varies between identical
+  # writes (verified; usually the earliest); the double takes the earliest,
+  # whatever order the payload gave the groups in. A point is dropped
+  # for a field type that conflicts with the stored one and for having no
+  # field but `time`. The retention drops are reported only when no group
+  # dropped anything (verified): the group's message replaces them.
   @spec store_v2_points(Store.t(), binary(), [LineProtocolParser.line_result()]) ::
           InfluxElixir.Client.write_result()
   defp store_v2_points(table, database, lines) do
-    shard_ns = shard_group_seconds(bucket_retention(table, database)) * 1_000_000_000
+    retention = bucket_retention(table, database)
+    shard_ns = shard_group_seconds(retention) * 1_000_000_000
+    lower_bound = Store.now_ns() - retention * 1_000_000_000
 
-    {failures, _known} =
-      Enum.reduce(lines, {[], %{}}, fn
+    {failures, expired, accepted, _known} =
+      Enum.reduce(lines, {[], [], [], %{}}, fn
         {:ok, %{unreadable: true}, _number, _line}, state ->
           state
 
-        {:ok, point, _number, _line}, {failures, known} ->
+        {:ok, %{timestamp: timestamp} = point, _number, _line},
+        {failures, expired, accepted, known}
+        when retention > 0 and timestamp < lower_bound ->
+          {failures, [point | expired], accepted, known}
+
+        {:ok, point, _number, _line}, {failures, expired, accepted, known} ->
           group = Integer.floor_div(point.timestamp, shard_ns)
 
           case store_v2_point(table, database, point, v2_scope(point, group), known) do
-            {:ok, known} -> {failures, known}
-            {:dropped, reason, known} -> {[{group, reason} | failures], known}
+            {:ok, known} ->
+              {failures, expired, [strip_uint_markers(point) | accepted], known}
+
+            {:dropped, reason, known} ->
+              {[{group, reason} | failures], expired, accepted, known}
           end
       end)
 
-    v2_write_result(Enum.reverse(failures))
+    Store.store_points(table, database, Enum.reverse(accepted))
+
+    case {failures, expired} do
+      {[], []} ->
+        {:ok, :written}
+
+      {[], expired} ->
+        v2_retention_result(expired, database, retention, lower_bound)
+
+      {failures, _expired} ->
+        v2_write_result(Enum.reverse(failures))
+    end
   end
 
   # InfluxDB 2 types a field per shard group (verified): the same field may
@@ -832,7 +894,6 @@ defmodule InfluxElixir.Client.Local do
   defp store_v2_point(table, database, point, scope, known) do
     case check_schema(table, database, point, {:v2, scope}, known) do
       {:ok, known} ->
-        Store.store_point(table, database, strip_uint_markers(point))
         {:ok, known}
 
       {:error, conflict} ->
@@ -840,9 +901,88 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec v2_write_result([{integer(), term()}]) :: InfluxElixir.Client.write_result()
-  defp v2_write_result([]), do: {:ok, :written}
+  # The 422 for points older than the retention: the count, the oldest and
+  # the newest of them (the first one met on a tie) by series key and time,
+  # and the lower bound, all as the engine words them (verified).
+  @spec v2_retention_result([point_map()], binary(), pos_integer(), integer()) ::
+          InfluxElixir.Client.write_result()
+  defp v2_retention_result(expired, database, retention, lower_bound) do
+    expired = Enum.reverse(expired)
 
+    oldest =
+      Enum.reduce(expired, fn point, kept ->
+        if point.timestamp < kept.timestamp, do: point, else: kept
+      end)
+
+    newest =
+      Enum.reduce(expired, fn point, kept ->
+        if point.timestamp > kept.timestamp, do: point, else: kept
+      end)
+
+    bound = rfc3339_nano(lower_bound)
+
+    drop = fn which, point ->
+      "#{which} point #{series_key(point)} at #{rfc3339_nano(point.timestamp)} dropped because " <>
+        "it violates a Retention Policy Lower Bound at #{bound}"
+    end
+
+    message =
+      "failure writing points to database: partial write: dropped #{length(expired)} points " <>
+        "outside retention policy of duration #{go_duration(retention)} - " <>
+        "#{drop.("oldest", oldest)}, #{drop.("newest", newest)} dropped=#{length(expired)} " <>
+        "for database: #{hex_id(database)} for retention policy: autogen"
+
+    {:error,
+     %{
+       status: 422,
+       body: Jason.encode!(%{"code" => "unprocessable entity", "message" => message})
+     }}
+  end
+
+  # Go's `time.Duration` string for a whole number of seconds of an hour or
+  # more: `2h0m0s`.
+  @spec go_duration(pos_integer()) :: binary()
+  defp go_duration(seconds) do
+    "#{div(seconds, 3600)}h#{div(rem(seconds, 3600), 60)}m#{rem(seconds, 60)}s"
+  end
+
+  # Go's RFC 3339 with nanoseconds: the fraction only as far as it is not
+  # zero.
+  @spec rfc3339_nano(integer()) :: binary()
+  defp rfc3339_nano(ns) do
+    stamp =
+      ns
+      |> Integer.floor_div(1_000_000_000)
+      |> DateTime.from_unix!()
+      |> DateTime.to_iso8601()
+      |> String.trim_trailing("Z")
+
+    case Integer.mod(ns, 1_000_000_000) do
+      0 ->
+        stamp <> "Z"
+
+      fraction ->
+        digits = fraction |> Integer.to_string() |> String.pad_leading(9, "0")
+        stamp <> "." <> String.trim_trailing(digits, "0") <> "Z"
+    end
+  end
+
+  # A point's series key as the engine prints it: the measurement and the
+  # tags sorted by key, with the line protocol's escapes.
+  @spec series_key(point_map()) :: binary()
+  defp series_key(point) do
+    tags =
+      point.tags
+      |> Enum.sort()
+      |> Enum.map_join(fn {key, value} -> "," <> escape_key(key) <> "=" <> escape_key(value) end)
+
+    String.replace(point.measurement, [",", " "], &("\\" <> &1)) <> tags
+  end
+
+  @spec escape_key(binary()) :: binary()
+  defp escape_key(text), do: String.replace(text, [",", "=", " "], &("\\" <> &1))
+
+  @spec v2_write_result([{integer(), term()}]) :: InfluxElixir.Client.write_result()
   defp v2_write_result(failures) do
     {earliest, _reason} = Enum.min_by(failures, &elem(&1, 0))
     [first | _rest] = reasons = for {^earliest, reason} <- failures, do: reason
@@ -1237,7 +1377,8 @@ defmodule InfluxElixir.Client.Local do
   def execute_sql(%{table: table, profile: profile} = conn, sql, opts \\ []) do
     with :ok <- require_capability(conn, :execute_sql),
          {:ok, database} <- resolve_database(opts, conn),
-         {:ok, _params} <- QueryParams.normalize(Keyword.get(opts, :params, %{})),
+         {:ok, params} <- QueryParams.normalize(Keyword.get(opts, :params, %{})),
+         :ok <- Format.check_params(params, nil, database),
          :ok <- database_exists(table, database),
          {:ok, trimmed} <- SQLLexer.scrub(sql) do
       case statement_kind(trimmed) do
@@ -1722,9 +1863,11 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  # A field written with different types in different shard groups reads as
-  # the type of the earliest group the range touches; the points of the other
-  # types are not returned (verified). A bucket's shard groups are as long as
+  # A field written with different types in different shard groups reads
+  # as the type of the earliest group the range touches, up to the first
+  # later group of another type: that group and every group after it are
+  # not returned, whatever their type (verified). The cut is per measurement
+  # and field, across all tag sets. A bucket's shard groups are as long as
   # its retention makes them.
   @spec flux_typed(Store.t(), Flux.query(), [point_map()]) :: [point_map()]
   defp flux_typed(table, %{bucket: bucket} = query, points) do
@@ -1737,35 +1880,63 @@ defmodule InfluxElixir.Client.Local do
           group * shard_ns < stop_ns and (group + 1) * shard_ns > start_ns,
           do: {point, group}
 
-    kinds =
-      Map.new(
-        for(
-          {point, group} <- touched,
-          field <- Map.keys(point.fields),
-          do: {point, group, field}
-        ),
-        fn {point, group, field} ->
-          {{point.measurement, group, field},
-           Store.column_kind(table, bucket, v2_scope(point, group), field)}
-        end
-      )
+    case flux_cutoffs(table, bucket, touched) do
+      cutoffs when map_size(cutoffs) == 0 ->
+        Enum.map(touched, &elem(&1, 0))
 
-    earliest =
-      Enum.reduce(kinds, %{}, fn {{m, group, field}, kind}, acc ->
-        Map.update(acc, {m, field}, {group, kind}, &min(&1, {group, kind}))
-      end)
-
-    for {point, group} <- touched,
-        fields = flux_typed_fields(point, group, kinds, earliest),
-        map_size(fields) > 0,
-        do: %{point | fields: fields}
+      cutoffs ->
+        for {point, group} <- touched,
+            fields = flux_typed_fields(point, group, cutoffs),
+            map_size(fields) > 0,
+            do: %{point | fields: fields}
+    end
   end
 
-  @spec flux_typed_fields(point_map(), integer(), map(), map()) :: map()
-  defp flux_typed_fields(point, group, kinds, earliest) do
+  # `{measurement, field} => group`: the first group that is not read. The
+  # store is asked for the kind of a field once per measurement, group and
+  # field, not once per point.
+  @spec flux_cutoffs(Store.t(), binary(), [{point_map(), integer()}]) :: %{
+          {binary(), binary()} => integer()
+        }
+  defp flux_cutoffs(table, bucket, touched) do
+    kinds =
+      Enum.reduce(touched, %{}, fn {point, group}, kinds ->
+        Enum.reduce(point.fields, kinds, fn {field, _value}, kinds ->
+          key = {point.measurement, field, group}
+
+          if is_map_key(kinds, key) do
+            kinds
+          else
+            kind = Store.column_kind(table, bucket, v2_scope(point, group), field)
+            Map.put(kinds, key, kind)
+          end
+        end)
+      end)
+
+    kinds
+    |> Enum.group_by(&series_of_kind/1, &group_and_kind/1)
+    |> Enum.reduce(%{}, fn {series, group_kinds}, cutoffs ->
+      [{_group, first} | later] = Enum.sort(group_kinds)
+
+      case Enum.find(later, fn {_group, kind} -> kind != first end) do
+        {group, _kind} -> Map.put(cutoffs, series, group)
+        nil -> cutoffs
+      end
+    end)
+  end
+
+  @spec series_of_kind({{binary(), binary(), integer()}, term()}) :: {binary(), binary()}
+  defp series_of_kind({{measurement, field, _group}, _kind}), do: {measurement, field}
+  @spec group_and_kind({{binary(), binary(), integer()}, term()}) :: {integer(), term()}
+  defp group_and_kind({{_measurement, _field, group}, kind}), do: {group, kind}
+
+  @spec flux_typed_fields(point_map(), integer(), map()) :: map()
+  defp flux_typed_fields(point, group, cutoffs) do
     Map.filter(point.fields, fn {field, _value} ->
-      {_earliest_group, kind} = Map.fetch!(earliest, {point.measurement, field})
-      Map.fetch!(kinds, {point.measurement, group, field}) == kind
+      case Map.fetch(cutoffs, {point.measurement, field}) do
+        {:ok, cutoff} -> group < cutoff
+        :error -> true
+      end
     end)
   end
 
@@ -1810,7 +1981,8 @@ defmodule InfluxElixir.Client.Local do
   and a sixth database on the `:v3_core` profile its 422 — see
   `InfluxElixir.Client.Local.DatabaseRules`. `retention:` must be a
   duration the engine reads (`"30d"`, `"1h 30m"`, `"1.5h"`, `"0"`), or it
-  is the engine's 400; the double keeps no retention, so nothing expires.
+  is the engine's 400; the double keeps no retention for a database, so nothing
+  expires. (A v2 bucket's `retention:` is applied: see `create_bucket/3`.)
   """
   @impl true
   @spec create_database(
@@ -1834,7 +2006,7 @@ defmodule InfluxElixir.Client.Local do
   # `m` minutes), or a bare `0`. Anything else is its 400, ending in the
   # `at line 1 column N` its JSON parser appends: the byte just before the
   # closing brace of the body `Client.HTTP` sends (verified). The double
-  # stores no retention: nothing expires.
+  # stores no retention for a database: nothing expires.
   @duration_units ~w(nanos nsec ns usec us µs millis msec ms seconds second secs sec s
                      minutes minute mins min m hours hour hrs hr h days day d weeks week w
                      months month M years year y)
@@ -1924,7 +2096,9 @@ defmodule InfluxElixir.Client.Local do
   `retention:` is the expiry in seconds (default `0`, none). InfluxDB 2
   refuses a period between 1 and 3599 seconds with a 500 `retention policy
   duration must be at least 1h0m0s` (verified), and so does this.
-  Creating an already-existing bucket is idempotent.
+  A write of a point older than the retention is refused as the engine
+  refuses it (see "Write" in the moduledoc), and the period sets how long the
+  bucket's shard groups are. Creating an already-existing bucket is idempotent.
   """
   @impl true
   @spec create_bucket(
@@ -1990,7 +2164,9 @@ defmodule InfluxElixir.Client.Local do
 
   Returns `{:error, %{status: 404, body: "bucket not found: name"}}` for a
   bucket that does not exist — InfluxDB 2 answers 404 (verified), which
-  `InfluxElixir.Client.HTTP` reports with this body.
+  `InfluxElixir.Client.HTTP` reports with this body. The bucket's points and
+  per-group schema go with it, so a bucket created again under the name
+  starts empty and takes any field type.
   """
   @impl true
   @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
