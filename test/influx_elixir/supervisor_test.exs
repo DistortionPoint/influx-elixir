@@ -58,13 +58,17 @@ defmodule InfluxElixir.SupervisorTest do
       # Only the crashed child is replaced; its own supervisor and pool stay.
       new_writer_a = await_restart(ConnectionSupervisor.batch_writer_name(name_a), writer_a)
       assert [^sup_a, ^finch_a, ^new_writer_a] = pids.(name_a)
-      assert {:ok, %{}} = InfluxElixir.stats(name_a)
+
+      assert InfluxElixir.stats(name_a) ===
+               {:ok, %{total_writes: 0, total_errors: 0, total_bytes: 0}}
 
       # The sibling connection keeps the very same processes and still serves.
       assert pids.(name_b) == before_b
       assert {:ok, :written} = InfluxElixir.write(name_b, "cpu v=1i")
-      assert {:ok, [%{"v" => 1}]} = InfluxElixir.query_sql(name_b, "SELECT v FROM cpu")
-      assert {:ok, %{}} = InfluxElixir.stats(name_b)
+      assert InfluxElixir.query_sql(name_b, "SELECT v FROM cpu") === {:ok, [%{"v" => 1}]}
+
+      assert InfluxElixir.stats(name_b) ===
+               {:ok, %{total_writes: 0, total_errors: 0, total_bytes: 0}}
     end
 
     # A killed connection supervisor leaves its children stopping, still
@@ -95,8 +99,10 @@ defmodule InfluxElixir.SupervisorTest do
       refute_received {:DOWN, ^top, :process, _pid, _reason}
       assert new_sup_a != sup_a
       assert {:ok, :written} = InfluxElixir.write(name_a, "cpu v=2i")
-      assert {:ok, [%{"v" => 2}]} = InfluxElixir.query_sql(name_a, "SELECT v FROM cpu")
-      assert {:ok, %{total_writes: 0}} = InfluxElixir.stats(name_a)
+      assert InfluxElixir.query_sql(name_a, "SELECT v FROM cpu") === {:ok, [%{"v" => 2}]}
+
+      assert InfluxElixir.stats(name_a) ===
+               {:ok, %{total_writes: 0, total_errors: 0, total_bytes: 0}}
 
       assert Process.whereis(ConnectionSupervisor.via(name_b)) == sup_b
       assert Process.whereis(ConnectionSupervisor.finch_name(name_b)) == finch_b

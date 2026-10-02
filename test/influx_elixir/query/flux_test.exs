@@ -9,6 +9,10 @@ defmodule InfluxElixir.Query.FluxTest do
     {:ok, conn: conn}
   end
 
+  # The rows with the columns the clock assigns removed, so that the rest is
+  # compared whole.
+  defp without({:ok, rows}, columns), do: {:ok, Enum.map(rows, &Map.drop(&1, columns))}
+
   describe "query/3" do
     test "returns the rows in the bucket's range", %{conn: conn} do
       :ok = Local.create_bucket(conn, "test")
@@ -17,8 +21,18 @@ defmodule InfluxElixir.Query.FluxTest do
       flux_query =
         "from(bucket: \"test\") |> range(start: -1h)"
 
-      assert {:ok, [%{"_measurement" => "cpu", "_field" => "value", "_value" => 1.0}]} =
-               Flux.query(conn, flux_query)
+      # `_start`, `_stop` and `_time` are the clock's.
+      assert conn |> Flux.query(flux_query) |> without(["_start", "_stop", "_time"]) ===
+               {:ok,
+                [
+                  %{
+                    "result" => "_result",
+                    "table" => 0,
+                    "_measurement" => "cpu",
+                    "_field" => "value",
+                    "_value" => 1.0
+                  }
+                ]}
     end
   end
 end

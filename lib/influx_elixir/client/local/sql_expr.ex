@@ -14,14 +14,16 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   is a `{:uint, n}`, anything else is a `Float64`; a `-` written directly
   before a number is part of it (`-9223372036854775808` is an `Int64`, while
   `-(9223372036854775808)` negates a `UInt64`, which the engine refuses). A
-  float too large for a double is `{:lit, :nonfinite}`, which the engine
+  float too large for a double is `{:lit, :inf}` or `{:lit, :neg_inf}`, which the engine
   answers as a JSON `null` and compares as infinity.
 
   `render/3` writes an expression as the engine names a column: the name
   that stands for a select item without an alias.
   """
 
-  alias InfluxElixir.Client.Local.{Format, SQLFunctions, SQLLiteral}
+  alias InfluxElixir.Client.Local.{Format, SQLFunctions, SQLLimits, SQLLiteral}
+
+  require SQLLimits
 
   @typedoc """
   A column an expression reads: its name, or a reference to a relation the
@@ -34,27 +36,34 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   An arithmetic expression: a column, a literal, a `$name`
   placeholder (`{:param, name}`, replaced by `InfluxElixir.Client.Local.SQLBind`)
   or a bound non-negative integer parameter (`{:uint, n}`, the engine's
-  `UInt64`), or an operation over expressions.
+  `UInt64`), or an operation over expressions. The parser reads a column as
+  `{:field, name}`; `InfluxElixir.Client.Local.SQLTyping` reads one the store
+  holds as `UInt64` as `{:uint_col, name}`.
   """
   @type t ::
           {:field, column_ref()}
-          | {:lit, number() | binary() | boolean() | nil | :nonfinite}
+          | {:lit, number() | binary() | boolean() | nil | :inf | :neg_inf}
+          | {:uint_col, binary()}
           | {:uint, non_neg_integer()}
           | {:param, binary()}
           | {:op, :+ | :- | :* | :/ | :rem, t(), t()}
           | {:neg, t()}
           | {:cast, t(), cast_type()}
           | {:call, SQLFunctions.name(), [t()]}
+          | {:unreadable, binary()}
 
-  @typedoc "`CAST(expr AS INTEGER | DOUBLE | VARCHAR)` targets (and their synonyms)."
-  @type cast_type :: :integer | :float | :string
+  @typedoc """
+  `CAST(expr AS type)` targets (and their synonyms): the integer types by
+  width (`INTEGER` is 32 bits), `DOUBLE`, and text.
+  """
+  @type cast_type :: :int8 | :int16 | :int32 | :int64 | :float | :string
 
   @typedoc "How `render/3` treats a `CAST`: written as the engine names it (gone), or refused."
   @type casts :: :drop | :refuse
 
-  @int64_min -9_223_372_036_854_775_808
-  @int64_max 9_223_372_036_854_775_807
-  @uint64_max 18_446_744_073_709_551_615
+  @int64_min SQLLimits.int64_min()
+  @int64_max SQLLimits.int64_max()
+  @uint64_max SQLLimits.uint64_max()
 
   @number "(?:[0-9]+\\.[0-9]*|\\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?"
   @quoted ~S{"(?:[^"]|"")*"}
@@ -251,7 +260,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   @spec float_literal(binary(), boolean()) :: t()
   defp float_literal(text, negative) do
     case SQLLiteral.float_value(text) do
-      :nonfinite -> {:lit, :nonfinite}
+      :nonfinite -> {:lit, if(negative, do: :neg_inf, else: :inf)}
       value -> {:lit, if(negative, do: -value, else: value)}
     end
   end
@@ -276,13 +285,19 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
     end
   end
 
-  # The SQL type names DataFusion accepts for the three casts the double
-  # performs; anything else (BOOLEAN, TIMESTAMP, ...) is outside the subset.
+  # The SQL type names DataFusion accepts for the casts the double performs
+  # (verified: `INT` is `Int32`, `SMALLINT` `Int16`, `TINYINT` `Int8`,
+  # `BIGINT` `Int64`, `DOUBLE` `Float64`); anything else is outside the
+  # subset, `FLOAT` and `REAL` (`Float32`) and the unsigned and decimal types
+  # among it.
   @spec cast_type(binary()) :: {:ok, cast_type()} | {:error, term()}
   defp cast_type(type) do
     case String.upcase(type) do
-      t when t in ~w(INTEGER INT BIGINT SMALLINT TINYINT) -> {:ok, :integer}
-      t when t in ~w(DOUBLE FLOAT REAL) -> {:ok, :float}
+      t when t in ~w(INTEGER INT INT4) -> {:ok, :int32}
+      t when t in ~w(SMALLINT INT2) -> {:ok, :int16}
+      "TINYINT" -> {:ok, :int8}
+      t when t in ~w(BIGINT INT8) -> {:ok, :int64}
+      t when t in ~w(DOUBLE FLOAT8) -> {:ok, :float}
       t when t in ~w(VARCHAR STRING TEXT CHAR) -> {:ok, :string}
       _other -> {:error, {:unsupported_cast_type, type}}
     end
@@ -291,9 +306,11 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   @doc "The columns an expression reads, in order."
   @spec columns(t()) :: [column_ref()]
   def columns({:field, ref}), do: [ref]
+  def columns({:uint_col, name}), do: [name]
   def columns({:lit, _value}), do: []
   def columns({:uint, _value}), do: []
   def columns({:param, _name}), do: []
+  def columns({:unreadable, _text}), do: []
   def columns({:neg, inner}), do: columns(inner)
   def columns({:cast, inner, _type}), do: columns(inner)
   def columns({:op, _op, left, right}), do: columns(left) ++ columns(right)
@@ -328,10 +345,11 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
 
   Throws `:unrenderable` for what the double does not print: a column when
   `qualifier` is `nil` (the side of a join that holds it is not known), a
-  refused cast, a number too large for a double.
+  refused cast.
   """
   @spec render(t(), binary() | nil, casts()) :: binary()
   def render({:field, ref}, qualifier, _casts), do: qualified(ref, qualifier)
+  def render({:uint_col, name}, qualifier, _casts), do: qualified(name, qualifier)
   def render({:lit, value}, _qualifier, _casts) when is_integer(value), do: "Int64(#{value})"
 
   def render({:lit, value}, _qualifier, _casts) when is_float(value),
@@ -340,7 +358,8 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   def render({:lit, value}, _qualifier, _casts) when is_binary(value), do: ~s|Utf8("#{value}")|
   def render({:lit, value}, _qualifier, _casts) when is_boolean(value), do: "Boolean(#{value})"
   def render({:lit, nil}, _qualifier, _casts), do: "NULL"
-  def render({:lit, :nonfinite}, _qualifier, _casts), do: throw(:unrenderable)
+  def render({:lit, :inf}, _qualifier, _casts), do: "Float64(inf)"
+  def render({:lit, :neg_inf}, _qualifier, _casts), do: "Float64(-inf)"
   def render({:uint, value}, _qualifier, _casts), do: "UInt64(#{value})"
   def render({:param, name}, _qualifier, _casts), do: "$" <> name
 

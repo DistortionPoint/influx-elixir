@@ -32,7 +32,13 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
             v3_line_protocol_name_tests(client),
             v3_influxql_tests(client),
             v3_influxql_group_tests(client),
-            v3_influxql_parse_tests(client)
+            v3_influxql_parse_tests(client),
+            v3_influxql_reserved_helpers(client),
+            v3_influxql_reserved_where_tests(client),
+            v3_influxql_reserved_select_tests(client),
+            v3_influxql_clause_tests(client),
+            v3_influxql_typed_tests(client),
+            v3_influxql_typed_edge_tests(client)
           ]
 
         :v2 ->
@@ -573,6 +579,586 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           statement = prefix <> "v > 1; SELECT v FROM #{m} WHERE v >"
           expected = @ifl_parse <> "invalid conditional expression at pos #{byte_size(statement)}"
           assert {:error, %{status: 400, body: ^expected}} = ifl_iq(ctx, statement)
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # InfluxDB 3 InfluxQL: reserved words, clauses, typed comparisons
+  # ---------------------------------------------------------------------------
+
+  defp v3_influxql_reserved_helpers(_client) do
+    quote location: :keep do
+      defp ifl_rw_setup(ctx) do
+        m = ifl_name("ifl_rw")
+
+        ifl_write(ctx, [
+          ~s|#{m},tag=a,host=h1 v=1i,f=1.5,b=true,u=5u,s="x" 1000|,
+          "#{m},tag=b v=-4i,f=2.5,b=false,u=0u 2000",
+          "#{m},host=h2 v=7i,f=3.5,b=true,u=9u 3000"
+        ])
+
+        {:ok, m: m, sel: "SELECT v FROM #{m}"}
+      end
+
+      @ifl_parse "error in InfluxQL statement: parsing error: "
+      @ifl_words ~w(tag key name values measurement field series all default limit in inf
+                      group from select as by on to user write)
+
+      defp ifl_nom(statement, pos) do
+        leftover = binary_part(statement, pos, byte_size(statement) - pos)
+
+        @ifl_parse <>
+          "invalid InfluxQL statement at pos #{pos}. Parsing Error: Nom(#{inspect(leftover)}, Tag)"
+      end
+
+      defp ifl_failure(statement, word_at) do
+        leftover = binary_part(statement, word_at, byte_size(statement) - word_at)
+
+        @ifl_parse <>
+          "invalid InfluxQL statement at pos 0. Parsing Failure: Nom(#{inspect(leftover)}, Char)"
+      end
+
+      # the position just after the first `text` at or after `from`
+      defp ifl_after(statement, text, from \\ 0) do
+        rest = binary_part(statement, from, byte_size(statement) - from)
+        {at, size} = :binary.match(rest, text)
+        from + at + size
+      end
+
+      defp ifl_err(ctx, statement, body) do
+        assert {:error, %{status: 400, body: ^body}} = ifl_iq(ctx, statement), statement
+      end
+    end
+  end
+
+  defp v3_influxql_reserved_where_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL reserved words in WHERE — contract" do
+        setup ctx do
+          ifl_rw_setup(ctx)
+        end
+
+        test "a reserved word as a bare name leaves the WHERE unparsed, in any case",
+             %{sel: sel} = ctx do
+          where_at = byte_size(sel) + 1
+
+          for word <- @ifl_words, word <- [word, String.upcase(word)] do
+            statement = "#{sel} WHERE #{word} = 'a'"
+            ifl_err(ctx, statement, ifl_nom(statement, where_at))
+          end
+
+          for word <- ["fill", "now", "not", "null", "nan"] do
+            assert {:ok, []} = ifl_iq(ctx, "#{sel} WHERE #{word} = 1"), word
+          end
+
+          assert ifl_iq_values(ctx, "#{sel} WHERE \"tag\" = 'a'") === [1]
+        end
+
+        test "a reserved word where an operand belongs is the missing operand",
+             %{sel: sel} = ctx do
+          operand = @ifl_parse <> "invalid conditional expression at pos "
+
+          for {where, end_of} <- [
+                {"v = 1 AND tag = 2", "AND"},
+                {"v = 1 OR tag = 2", "OR"},
+                {"v = tag", "v ="},
+                {"1 = tag", "1 ="},
+                {"v = -tag", "v ="},
+                {"v = +tag", "v ="},
+                {"v = ( tag )", "v ="},
+                {"(v = 1) AND tag = 1", "AND"},
+                {"(v = 1 AND tag = 2)", "AND"},
+                {"v = 1 AND (tag = 'a')", "AND"},
+                {"v = 1 AND where = 2", "AND"},
+                {"v = 1 OR and = 2", "OR"}
+              ] do
+            statement = "#{sel} WHERE #{where}"
+            ifl_err(ctx, statement, operand <> "#{ifl_after(statement, end_of, byte_size(sel))}")
+          end
+        end
+
+        test "after an operand, a reserved word is what cannot be read", %{sel: sel} = ctx do
+          for {where, word} <- [{"v tag = 1", "tag"}, {"v = 1 tag", "tag"}, {"v in (1)", "in"}] do
+            statement = "#{sel} WHERE #{where}"
+            {at, _size} = :binary.match(statement, word)
+            ifl_err(ctx, statement, ifl_nom(statement, at))
+          end
+
+          # after `*` or `/` it is the operator
+          for op <- ["*", "/"] do
+            statement = "#{sel} WHERE v = 1 #{op} tag"
+            {at, _size} = :binary.match(statement, op)
+            ifl_err(ctx, statement, ifl_nom(statement, at))
+          end
+
+          # after a binary `+` or `-` the engine fails from the word, at position 0
+          for where <- ["v + tag = 1", "v = 1 + tag", "v = 1 - tag", "v = (1 + tag)"] do
+            statement = "#{sel} WHERE #{where}; SELECT 2"
+            {at, _size} = :binary.match(statement, "tag")
+            ifl_err(ctx, statement, ifl_failure(statement, at))
+          end
+        end
+
+        test "a WHERE with nothing in it, or a reserved word first, is unparsed",
+             %{sel: sel} = ctx do
+          where_at = byte_size(sel) + 1
+
+          for tail <- [
+                "WHERE",
+                "WHERE where",
+                "WHERE tag",
+                "WHERE tag(v) = 1",
+                "WHERE (tag = 'a')",
+                "WHERE tag + v = 1",
+                "WHERE tag = 1 GROUP BY host",
+                "WHERE tag = 'a'; SELECT 2"
+              ] do
+            statement = "#{sel} #{tail}"
+            ifl_err(ctx, statement, ifl_nom(statement, where_at))
+          end
+
+          # the text counts as sent, blanks included
+          statement = "  #{sel} WHERE tag = 1  "
+          ifl_err(ctx, statement, ifl_nom(statement, byte_size(sel) + 3))
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_reserved_select_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL reserved words in the select list and GROUP BY — contract" do
+        setup ctx do
+          ifl_rw_setup(ctx)
+        end
+
+        test "the select list, FROM and aliases name reserved words", %{m: m} = ctx do
+          field = @ifl_parse <> "invalid SELECT statement, expected field at pos "
+
+          for {statement, pos} <- [
+                {"SELECT tag FROM #{m}", 7},
+                {"SELECT  key FROM #{m}", 8},
+                {"SELECT NAME FROM #{m}", 7},
+                {"SELECT FROM #{m}", 7},
+                {"SELECT", 6}
+              ] do
+            ifl_err(ctx, statement, field <> "#{pos}")
+          end
+
+          # a later item that is reserved leaves the whole statement unparsed
+          for statement <- ["SELECT v, tag FROM #{m}", "SELECT v,  key FROM #{m}", "SELECT v"] do
+            ifl_err(ctx, statement, ifl_nom(statement, 0))
+          end
+
+          ifl_err(ctx, "SELECT sum(tag) FROM #{m}", ifl_failure("SELECT sum(tag) FROM #{m}", 11))
+
+          ifl_err(
+            ctx,
+            "SELECT v, mean(tag) FROM #{m}",
+            ifl_failure("SELECT v, mean(tag) FROM #{m}", 15)
+          )
+
+          alias_error = @ifl_parse <> "invalid field alias, expected identifier at pos "
+
+          for {statement, pos} <- [
+                {"SELECT v AS tag FROM #{m}", 11},
+                {"SELECT v AS  key FROM #{m}", 11},
+                {"SELECT mean(v) AS tag FROM #{m}", 17},
+                {"SELECT v, v AS tag FROM #{m}", 14}
+              ] do
+            ifl_err(ctx, statement, alias_error <> "#{pos}")
+          end
+
+          from_error =
+            @ifl_parse <>
+              "invalid FROM clause, expected identifier, regular expression or subquery at pos "
+
+          for {statement, pos} <- [
+                {"SELECT v FROM", 13},
+                {"SELECT v FROM tag", 14},
+                {"SELECT v FROM 1", 14},
+                {"SELECT v FROM ,x", 14},
+                {"SELECT v FROM  WHERE", 15}
+              ] do
+            ifl_err(ctx, statement, from_error <> "#{pos}")
+          end
+
+          distinct = @ifl_parse <> "invalid DISTINCT expression, expected identifier at pos "
+          ifl_err(ctx, "SELECT DISTINCT FROM #{m}", distinct <> "16")
+          ifl_err(ctx, "SELECT v, DISTINCT FROM #{m}", distinct <> "19")
+
+          assert ifl_iq_values(ctx, "SELECT v AS \"tag\" FROM #{m}", "tag") === [1, -4, 7]
+        end
+
+        test "GROUP BY names a reserved word", %{sel: sel} = ctx do
+          group =
+            @ifl_parse <>
+              "invalid GROUP BY clause, expected wildcard, TIME, identifier or regular " <>
+              "expression at pos "
+
+          for {tail, pos} <- [
+                {"GROUP BY tag", 9},
+                {"GROUP BY  key", 10},
+                {"GROUP BY TAG, host", 9},
+                {"WHERE v = 1 GROUP BY tag", 21}
+              ] do
+            ifl_err(ctx, "#{sel} #{tail}", group <> "#{byte_size(sel) + 1 + pos}")
+          end
+
+          for tail <- ["GROUP BY host, tag", "GROUP BY host,tag", "GROUP BY host,  key; SELECT"] do
+            statement = "#{sel} #{tail}"
+            {comma, _size} = :binary.match(statement, ",")
+            ifl_err(ctx, statement, ifl_nom(statement, comma))
+          end
+
+          statement = "#{sel} WHERE tag = 1 GROUP BY tag"
+          ifl_err(ctx, statement, ifl_nom(statement, byte_size(sel) + 1))
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_clause_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL clauses and statements after a ; — contract" do
+        setup ctx do
+          ifl_rw_setup(ctx)
+        end
+
+        test "a clause the WHERE runs into is read for its own error", %{sel: sel} = ctx do
+          order_time = @ifl_parse <> "invalid ORDER BY, expected TIME column at pos "
+          order = @ifl_parse <> "invalid ORDER BY, expected ASC, DESC or TIME at pos "
+
+          for {tail, prefix, marker} <- [
+                {"WHERE v = 1 ORDER BY tag", order, "ORDER BY"},
+                {"WHERE v = 1 ORDER BY tag LIMIT 1", order, "ORDER BY"},
+                {"GROUP BY host ORDER BY tag", order, "ORDER BY"},
+                {"WHERE v = 1 ORDER BY 1", order, "ORDER BY"},
+                {"WHERE v = 1 ORDER BY v", order_time, "ORDER BY "},
+                {"GROUP BY host ORDER BY v", order_time, "ORDER BY "}
+              ] do
+            statement = "#{sel} #{tail}"
+            ifl_err(ctx, statement, prefix <> "#{ifl_after(statement, marker)}")
+          end
+
+          limit = @ifl_parse <> "invalid LIMIT clause, expected unsigned integer at pos "
+          offset = @ifl_parse <> "invalid OFFSET clause, expected unsigned integer at pos "
+
+          for {tail, prefix, argument} <- [
+                {"WHERE v = 1 LIMIT x", limit, "x"},
+                {"WHERE v = 1 LIMIT -1", limit, "-1"},
+                {"WHERE v = 1 OFFSET x", offset, "x"}
+              ] do
+            statement = "#{sel} #{tail}"
+            ifl_err(ctx, statement, prefix <> "#{byte_size(statement) - byte_size(argument)}")
+          end
+
+          statement = "#{sel} WHERE v = 1 GROUP x"
+
+          ifl_err(
+            ctx,
+            statement,
+            @ifl_parse <>
+              "invalid GROUP BY clause, expected BY at pos #{byte_size(statement) - 1}"
+          )
+
+          assert ifl_iq_values(ctx, "#{sel} ORDER BY DESC") === [7, -4, 1]
+          assert ifl_iq_values(ctx, "#{sel} WHERE v > 0 ORDER BY ASC") === [1, 7]
+          assert ifl_iq_values(ctx, "#{sel} ORDER BY TIME DESC") === [7, -4, 1]
+        end
+
+        test "after a ;, the next statement is parsed on its own, positioned in the text",
+             %{m: m} = ctx do
+          first = "SELECT v FROM #{m}"
+
+          for {next, kind} <- [
+                {"SELECT", {:field, 6}},
+                {"SELECT v FROM", {:from, 13}},
+                {"SELECT tag FROM #{m}", {:field, 7}},
+                {"SELECT v AS tag FROM #{m}", {:alias, 11}},
+                {"SELECT v FROM tag", {:from, 14}},
+                {"SELECT v FROM #{m} WHERE", {:nom, "WHERE"}},
+                {"SELECT v FROM #{m} WHERE tag = 1", {:nom, "WHERE tag = 1"}},
+                {"SELECT 2", {:nom, "SELECT 2"}},
+                {"x", {:nom, "x"}},
+                {"DROP", {:nom, "DROP"}}
+              ],
+              glue <- ["; ", ";", " ;  "] do
+            statement = first <> glue <> next
+            start = byte_size(first <> glue)
+            ifl_err(ctx, statement, ifl_second(kind, start, statement))
+          end
+
+          assert {:error,
+                  %{status: 400, body: "must provide only one InfluxQl statement per query"}} =
+                   ifl_iq(ctx, first <> "; " <> first <> " LIMIT 9223372036854775808")
+        end
+
+        defp ifl_second({:field, offset}, start, _statement),
+          do: @ifl_parse <> "invalid SELECT statement, expected field at pos #{start + offset}"
+
+        defp ifl_second({:from, offset}, start, _statement) do
+          @ifl_parse <>
+            "invalid FROM clause, expected identifier, regular expression or subquery at pos " <>
+            "#{start + offset}"
+        end
+
+        defp ifl_second({:alias, offset}, start, _statement),
+          do: @ifl_parse <> "invalid field alias, expected identifier at pos #{start + offset}"
+
+        defp ifl_second({:nom, text}, start, statement) do
+          {at, _size} =
+            :binary.match(binary_part(statement, start, byte_size(statement) - start), text)
+
+          ifl_nom(statement, start + at)
+        end
+
+        test "LIMIT and OFFSET past the signed range are a planning error",
+             %{sel: sel, m: m} = ctx do
+          assert ifl_iq_values(ctx, "#{sel} LIMIT 9223372036854775807") === [1, -4, 7]
+          assert ifl_iq_values(ctx, "#{sel} OFFSET 9223372036854775807") === []
+          assert ifl_iq_values(ctx, "#{sel} LIMIT 0") === []
+
+          for {tail, which} <- [
+                {"LIMIT 9223372036854775808", "limit"},
+                {"LIMIT 18446744073709551615", "limit"},
+                {"OFFSET 9223372036854775808", "offset"},
+                {"OFFSET 18446744073709551615", "offset"},
+                {"LIMIT 9223372036854775808 OFFSET 9223372036854775808", "limit"},
+                {"LIMIT 1 OFFSET 9223372036854775808", "offset"},
+                {"WHERE nope = 1 LIMIT 9223372036854775808", "limit"},
+                {"GROUP BY host LIMIT 9223372036854775808", "limit"}
+              ] do
+            assert {:error, %{status: 400, body: body}} = ifl_iq(ctx, "#{sel} #{tail}"), tail
+            assert body === "Error during planning: #{which} out of range", tail
+          end
+
+          assert {:error, %{status: 400, body: "Error during planning: limit out of range"}} =
+                   ifl_iq(ctx, "SELECT mean(v) FROM #{m} LIMIT 9223372036854775808")
+
+          # an unsigned past 64 bits is a parse error at the end of its digits
+          for {tail, digits} <- [
+                {"LIMIT 18446744073709551616", "18446744073709551616"},
+                {"OFFSET 18446744073709551616", "18446744073709551616"},
+                {"LIMIT 99999999999999999999999", "99999999999999999999999"},
+                {"LIMIT 99999999999999999999 OFFSET 9223372036854775808", "99999999999999999999"},
+                {"LIMIT 1 OFFSET 99999999999999999999", "99999999999999999999"}
+              ] do
+            statement = "#{sel} #{tail}"
+
+            expected =
+              @ifl_parse <>
+                "unable to parse unsigned integer at pos #{ifl_after(statement, digits)}"
+
+            ifl_err(ctx, statement, expected)
+          end
+
+          # a measurement that does not exist is no planning error
+          assert {:ok, []} = ifl_iq(ctx, "SELECT v FROM #{m}_none LIMIT 9223372036854775808")
+
+          # a bare field's type is checked after LIMIT; a comparison's before it
+          assert {:error, %{status: 400, body: "Error during planning: limit out of range"}} =
+                   ifl_iq(ctx, "#{sel} WHERE v LIMIT 9223372036854775808")
+
+          assert {:error, %{status: 400, body: body}} =
+                   ifl_iq(ctx, "#{sel} WHERE b = 9223372036854775808 LIMIT 9223372036854775808")
+
+          assert body ===
+                   "Error during planning: Cannot infer common argument type for comparison " <>
+                     "operation Boolean = UInt64"
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_typed_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL typed comparisons — contract" do
+        setup ctx do
+          ifl_rw_setup(ctx)
+        end
+
+        test "a field is compared with a literal by the two types", %{sel: sel} = ctx do
+          # a literal of another kind is false for every row, whatever the operator
+          for where <- [
+                "b = 1",
+                "b != 1",
+                "b > 1",
+                "b = -1",
+                "b = 1.5",
+                "b = 'x'",
+                "v = true",
+                "v != true",
+                "v > true",
+                "v = 'x'",
+                "v != 'x'",
+                "f = true",
+                "f = 'x'",
+                "s = 1",
+                "s != 1",
+                "s = true",
+                "1 = b",
+                "true = v",
+                "b > false",
+                "b < true",
+                "b >= true",
+                "b <= false",
+                "s > 'x'",
+                "s >= 'x'",
+                "s < 'x'"
+              ] do
+            assert ifl_iq_values(ctx, "#{sel} WHERE #{where}") === [], where
+          end
+
+          assert ifl_iq_values(ctx, "#{sel} WHERE b = true") === [1, 7]
+          assert ifl_iq_values(ctx, "#{sel} WHERE b = FALSE") === [-4]
+          assert ifl_iq_values(ctx, "#{sel} WHERE b") === [1, 7]
+          assert ifl_iq_values(ctx, "#{sel} WHERE s = 'x'") === [1]
+
+          # a negative integer against an unsigned field wraps to 2^64 + n
+          for {where, expected} <- [
+                {"u > -1", []},
+                {"u >= -1", []},
+                {"u = -1", []},
+                {"u < -1", [1, -4, 7]},
+                {"u <= -1", [1, -4, 7]},
+                {"u != -1", [1, -4, 7]},
+                {"u > -2", []},
+                {"-1 < u", []},
+                {"-4 > u", [1, -4, 7]},
+                {"u > (-1)", []},
+                {"u > 1 - 2", []},
+                {"u > -1.5", [1, -4, 7]},
+                {"u < -1.5", []},
+                {"u = -0", [-4]},
+                {"u > 0", [1, 7]},
+                {"u > 1.5", [1, 7]}
+              ] do
+            assert ifl_iq_values(ctx, "#{sel} WHERE #{where}") === expected, where
+          end
+
+          # an integer past the signed range is unsigned: an integer field wraps
+          for {where, expected} <- [
+                {"v > 9223372036854775807", []},
+                {"v > 9223372036854775808", [-4]},
+                {"v >= 9223372036854775808", [-4]},
+                {"v < 9223372036854775808", [1, 7]},
+                {"v <= 9223372036854775808", [1, 7]},
+                {"v = 9223372036854775808", []},
+                {"v != 9223372036854775808", [1, -4, 7]},
+                {"9223372036854775808 < v", [-4]},
+                {"9223372036854775808 > v", [1, 7]},
+                {"v > 18446744073709551615", []},
+                {"v < 18446744073709551615", [1, -4, 7]},
+                {"v = 18446744073709551611", [-4]},
+                {"v > 18446744073709551610", [-4]},
+                {"v > 18446744073709551611", []},
+                {"f > 9223372036854775808", []},
+                {"f < 9223372036854775808", [1, -4, 7]},
+                {"u > 9223372036854775808", []},
+                {"u < 9223372036854775808", [1, -4, 7]}
+              ] do
+            assert ifl_iq_values(ctx, "#{sel} WHERE #{where}") === expected, where
+          end
+
+          # a boolean against an unsigned is the planning error, in the written order
+          cannot =
+            "Error during planning: Cannot infer common argument type for comparison operation "
+
+          for {where, types} <- [
+                {"b = 9223372036854775808", "Boolean = UInt64"},
+                {"b > 9223372036854775808", "Boolean > UInt64"},
+                {"b <> 9223372036854775808", "Boolean != UInt64"},
+                {"b <= 18446744073709551615", "Boolean <= UInt64"},
+                {"9223372036854775808 = b", "UInt64 = Boolean"},
+                {"u = true", "UInt64 = Boolean"},
+                {"u != false", "UInt64 != Boolean"},
+                {"true < u", "Boolean < UInt64"}
+              ] do
+            assert {:error, %{status: 400, body: body}} = ifl_iq(ctx, "#{sel} WHERE #{where}"),
+                   where
+
+            assert body === cannot <> types, where
+          end
+        end
+      end
+    end
+  end
+
+  defp v3_influxql_typed_edge_tests(_client) do
+    quote location: :keep do
+      describe "InfluxQL typed comparisons at the edges — contract" do
+        setup ctx do
+          ifl_rw_setup(ctx)
+        end
+
+        test "the wrap of a negative integer is 2^64 + n - 1, and the lowest integer is null",
+             ctx do
+          m = ifl_name("ifl_rw_edge")
+
+          ifl_write(ctx, [
+            "#{m} v=-1i,u=18446744073709551615u 1000",
+            "#{m} v=-9223372036854775808i,u=18446744073709551614u 2000",
+            "#{m} v=-9223372036854775807i,u=18446744073709551613u 3000",
+            "#{m} v=0i,u=9223372036854775808u 4000"
+          ])
+
+          low = -9_223_372_036_854_775_808
+
+          # an integer field against an unsigned literal
+          for {where, expected} <- [
+                {"v = 9223372036854775808", [low + 1]},
+                {"v = 18446744073709551614", [-1]},
+                {"v = 18446744073709551615", []},
+                {"v > 18446744073709551613", [-1]},
+                {"v > 18446744073709551614", []},
+                {"v >= 18446744073709551614", [-1]},
+                {"v < 9223372036854775808", [0]},
+                {"v <= 9223372036854775808", [low + 1, 0]},
+                {"v != 9223372036854775808", [-1, 0]},
+                {"v <= 18446744073709551615", [-1, low + 1, 0]}
+              ] do
+            assert ifl_iq_values(ctx, "SELECT v FROM #{m} WHERE #{where}") === expected, where
+          end
+
+          # an unsigned field against a negative literal
+          for {where, expected} <- [
+                {"u = -1", [low]},
+                {"u = -2", [low + 1]},
+                {"u = -3", []},
+                {"u > -1", [-1]},
+                {"u > -2", [-1, low]},
+                {"u < -2", [0]},
+                {"u = -9223372036854775807", [0]},
+                {"u > -9223372036854775807", [-1, low, low + 1]}
+              ] do
+            assert ifl_iq_values(ctx, "SELECT v FROM #{m} WHERE #{where}") === expected, where
+          end
+        end
+
+        test "a bare field as the whole condition is a planning error naming its type",
+             %{sel: sel} = ctx do
+          for {field, type} <- [
+                {"v", "Int64"},
+                {"f", "Float64"},
+                {"u", "UInt64"},
+                {"s", "Utf8"},
+                {"host", "Dictionary(Int32, Utf8)"},
+                {"(f)", "Float64"}
+              ] do
+            assert {:error, %{status: 400, body: body}} = ifl_iq(ctx, "#{sel} WHERE #{field}"),
+                   field
+
+            assert body ===
+                     "type_coercion\ncaused by\nError during planning: Cannot infer common " <>
+                       "argument type for logical boolean operation Boolean AND #{type}",
+                   field
+          end
+
+          assert ifl_iq_values(ctx, "#{sel} WHERE nothere") === []
+          assert ifl_iq_values(ctx, "#{sel} WHERE true") === [1, -4, 7]
         end
       end
     end

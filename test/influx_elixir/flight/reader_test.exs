@@ -790,9 +790,9 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
       assert length(rows) == 3
-      assert Enum.at(rows, 0)["value"] == 10
-      assert Enum.at(rows, 1)["value"] == 20
-      assert Enum.at(rows, 2)["value"] == 30
+      assert Enum.at(rows, 0)["value"] === 10
+      assert Enum.at(rows, 1)["value"] === 20
+      assert Enum.at(rows, 2)["value"] === 30
     end
 
     test "decodes negative Int64 values" do
@@ -801,9 +801,9 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 3)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["delta"] == -1
-      assert Enum.at(rows, 1)["delta"] == -100
-      assert Enum.at(rows, 2)["delta"] == 0
+      assert Enum.at(rows, 0)["delta"] === -1
+      assert Enum.at(rows, 1)["delta"] === -100
+      assert Enum.at(rows, 2)["delta"] === 0
     end
 
     test "decodes a single-row Int64 batch" do
@@ -812,7 +812,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 1)
 
       assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["n"] == 42
+      assert row["n"] === 42
     end
   end
 
@@ -855,9 +855,9 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
       assert length(rows) == 3
-      assert Enum.at(rows, 0)["flag"] == true
-      assert Enum.at(rows, 1)["flag"] == false
-      assert Enum.at(rows, 2)["flag"] == true
+      assert Enum.at(rows, 0)["flag"] === true
+      assert Enum.at(rows, 1)["flag"] === false
+      assert Enum.at(rows, 2)["flag"] === true
     end
 
     test "decodes all-false bool column" do
@@ -866,7 +866,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.all?(rows, fn r -> r["active"] == false end)
+      assert Enum.all?(rows, fn r -> r["active"] === false end)
     end
   end
 
@@ -882,8 +882,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
       assert length(rows) == 2
-      assert Enum.at(rows, 0)["host"] == "server01"
-      assert Enum.at(rows, 1)["host"] == "server02"
+      assert Enum.at(rows, 0)["host"] === "server01"
+      assert Enum.at(rows, 1)["host"] === "server02"
     end
 
     test "decodes empty strings alongside non-empty strings" do
@@ -892,8 +892,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["tag"] == ""
-      assert Enum.at(rows, 1)["tag"] == "val"
+      assert Enum.at(rows, 0)["tag"] === ""
+      assert Enum.at(rows, 1)["tag"] === "val"
     end
   end
 
@@ -910,8 +910,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, [row1, row2]} = Reader.decode_flight_data([schema, batch])
-      assert row1["time"] == ~U[2021-08-31 15:37:37.123456Z]
-      assert row2["time"] == ~U[2021-08-31 15:37:38.000000Z]
+      assert row1["time"] === ~U[2021-08-31 15:37:37.123456Z]
+      assert row2["time"] === ~U[2021-08-31 15:37:38.000000Z]
     end
 
     test "honours the column's TimeUnit (milliseconds)" do
@@ -954,8 +954,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
       assert length(rows) == 2
-      assert Enum.at(rows, 0)["count"] == 1
-      assert Enum.at(rows, 1)["count"] == 2
+      assert Enum.at(rows, 0)["count"] === 1
+      assert Enum.at(rows, 1)["count"] === 2
       assert_in_delta Enum.at(rows, 0)["value"], 0.1, 1.0e-9
       assert_in_delta Enum.at(rows, 1)["value"], 0.2, 1.0e-9
     end
@@ -990,7 +990,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch1, batch2])
       assert length(rows) == 4
-      assert Enum.map(rows, fn r -> r["v"] end) == [1, 2, 3, 4]
+      assert Enum.map(rows, fn r -> r["v"] end) === [1, 2, 3, 4]
     end
 
     test "accumulates five single-row batches" do
@@ -1004,7 +1004,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema | batches])
       assert length(rows) == 5
-      assert Enum.map(rows, fn r -> r["n"] end) == [1, 2, 3, 4, 5]
+      assert Enum.map(rows, fn r -> r["n"] end) === [1, 2, 3, 4, 5]
     end
   end
 
@@ -1017,21 +1017,21 @@ defmodule InfluxElixir.Flight.ReaderTest do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
       batch = %FlightData{data_header: nil, data_body: <<>>}
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert rows == []
+      assert rows === []
     end
 
     test "handles batch with empty data_header" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
       batch = %FlightData{data_header: <<>>, data_body: <<>>}
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert rows == []
+      assert rows === []
     end
 
     test "handles batch with nil data_body" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
       batch = %FlightData{data_header: batch_msg(0, [{0, 0}, {0, 0}]), data_body: nil}
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert rows == []
+      assert rows === []
     end
   end
 
@@ -1046,7 +1046,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 3)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["count"]) == [100, -200, 0]
+      assert Enum.map(rows, & &1["count"]) === [100, -200, 0]
     end
   end
 
@@ -1057,7 +1057,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 3)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["small"]) == [1, -1, 32_767]
+      assert Enum.map(rows, & &1["small"]) === [1, -1, 32_767]
     end
   end
 
@@ -1068,7 +1068,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 3)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["tiny"]) == [1, -1, 127]
+      assert Enum.map(rows, & &1["tiny"]) === [1, -1, 127]
     end
   end
 
@@ -1079,8 +1079,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["big"] == 0
-      assert Enum.at(rows, 1)["big"] == 18_446_744_073_709_551_615
+      assert Enum.at(rows, 0)["big"] === 0
+      assert Enum.at(rows, 1)["big"] === 18_446_744_073_709_551_615
     end
   end
 
@@ -1091,7 +1091,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["u"]) == [0, 4_294_967_295]
+      assert Enum.map(rows, & &1["u"]) === [0, 4_294_967_295]
     end
   end
 
@@ -1102,7 +1102,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["u16"]) == [0, 65_535]
+      assert Enum.map(rows, & &1["u16"]) === [0, 65_535]
     end
   end
 
@@ -1113,7 +1113,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["byte"]) == [0, 255]
+      assert Enum.map(rows, & &1["byte"]) === [0, 255]
     end
   end
 
@@ -1147,9 +1147,9 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 3)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] == 10
+      assert Enum.at(rows, 0)["v"] === 10
       refute Map.has_key?(Enum.at(rows, 1), "v")
-      assert Enum.at(rows, 2)["v"] == 30
+      assert Enum.at(rows, 2)["v"] === 30
     end
 
     test "marks null Float64 values based on validity bitmap" do
@@ -1171,7 +1171,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert rows == [%{}, %{}]
+      assert rows === [%{}, %{}]
     end
   end
 
@@ -1195,7 +1195,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 1)
 
       assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["n"] == 547_808
+      assert row["n"] === 547_808
     end
 
     test "marks null Int64 value with 64-byte alignment padding" do
@@ -1208,9 +1208,9 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 3)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] == 10
+      assert Enum.at(rows, 0)["v"] === 10
       refute Map.has_key?(Enum.at(rows, 1), "v")
-      assert Enum.at(rows, 2)["v"] == 30
+      assert Enum.at(rows, 2)["v"] === 30
     end
 
     test "decodes Float64 values with 64-byte alignment padding" do
@@ -1237,8 +1237,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] == 42
-      assert Enum.at(rows, 1)["v"] == 7
+      assert Enum.at(rows, 0)["v"] === 42
+      assert Enum.at(rows, 1)["v"] === 7
     end
   end
 
@@ -1478,7 +1478,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       fb = build_schema_fb_with_blob(field_blob)
       header = schema_msg_from_fb(fb)
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.name == ""
+      assert col.name === ""
     end
   end
 
@@ -1491,7 +1491,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       fb = build_schema_fb_with_blob(field_blob)
       header = schema_msg_from_fb(fb)
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 0
+      assert col.type_id === 0
     end
   end
 
@@ -1502,7 +1502,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       header = schema_msg_from_fb(fb)
       {:ok, [col]} = Reader.parse_schema(header)
       # nil bitWidth defaults to 32, is_signed=true → type_id 4
-      assert col.type_id == 4
+      assert col.type_id === 4
     end
   end
 
@@ -1513,7 +1513,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       header = schema_msg_from_fb(fb)
       {:ok, [col]} = Reader.parse_schema(header)
       # nil is_signed defaults to true; bitWidth=64, signed → type_id 6
-      assert col.type_id == 6
+      assert col.type_id === 6
     end
   end
 
@@ -1524,7 +1524,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       header = schema_msg_from_fb(fb)
       {:ok, [col]} = Reader.parse_schema(header)
       # nil precision defaults to 2 (DOUBLE) → type_id 12
-      assert col.type_id == 12
+      assert col.type_id === 12
     end
   end
 
@@ -1757,7 +1757,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       fd = %FlightData{data_header: msg_header, data_body: <<>>}
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert rows == []
+      assert rows === []
     end
 
     test "nil header_type (absent vtable slot) defaults to 0 and returns no rows" do
@@ -1768,7 +1768,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       fd = %FlightData{data_header: msg_header, data_body: <<>>}
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert rows == []
+      assert rows === []
     end
 
     test "header_type=3 but absent header uoffset slot returns no rows" do
@@ -1778,7 +1778,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       fd = %FlightData{data_header: msg_header, data_body: <<>>}
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert rows == []
+      assert rows === []
     end
   end
 
@@ -1792,7 +1792,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
       # row_count defaults to 0 → no rows assembled
-      assert rows == []
+      assert rows === []
     end
   end
 
@@ -1806,7 +1806,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       # With no buffer specs, decode_column gets [] and returns nils
       assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
       assert length(rows) == 1
-      assert hd(rows)["v"] == nil
+      assert hd(rows)["v"] === nil
     end
   end
 
@@ -1818,7 +1818,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       fd = %FlightData{data_header: short_header, data_body: <<>>}
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert rows == []
+      assert rows === []
     end
   end
 
@@ -1848,7 +1848,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 1)
 
       assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["v"] == nil
+      assert row["v"] === nil
     end
   end
 
@@ -1879,8 +1879,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
       assert length(rows) == 2
-      assert Enum.at(rows, 0)["s"] == nil
-      assert Enum.at(rows, 1)["s"] == nil
+      assert Enum.at(rows, 0)["s"] === nil
+      assert Enum.at(rows, 1)["s"] === nil
     end
   end
 
@@ -1895,7 +1895,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
       assert length(rows) == 2
-      assert Enum.all?(rows, fn r -> r["v"] == nil end)
+      assert Enum.all?(rows, fn r -> r["v"] === nil end)
     end
   end
 
@@ -1913,7 +1913,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 0)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert rows == []
+      assert rows === []
     end
   end
 
@@ -1936,7 +1936,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 1)
 
       assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["v"] == nil
+      assert row["v"] === nil
     end
   end
 
@@ -1950,7 +1950,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 1)
 
       assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["f"] == nil
+      assert row["f"] === nil
     end
   end
 
@@ -1966,8 +1966,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(data, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] == 7
-      assert Enum.at(rows, 1)["v"] == 8
+      assert Enum.at(rows, 0)["v"] === 7
+      assert Enum.at(rows, 1)["v"] === 8
     end
   end
 
@@ -1991,7 +1991,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] == nil
+      assert Enum.at(rows, 0)["v"] === nil
       refute Map.has_key?(Enum.at(rows, 1), "v")
     end
   end
@@ -2005,9 +2005,9 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 3)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] == nil
-      assert Enum.at(rows, 1)["v"] == 20
-      assert Enum.at(rows, 2)["v"] == nil
+      assert Enum.at(rows, 0)["v"] === nil
+      assert Enum.at(rows, 1)["v"] === 20
+      assert Enum.at(rows, 2)["v"] === nil
     end
   end
 
@@ -2021,7 +2021,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
       # safe_slice returns <<>> because offset >= byte_size(body)
-      assert row["v"] == nil
+      assert row["v"] === nil
     end
   end
 
@@ -2038,7 +2038,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 1)
 
       assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["v"] == nil
+      assert row["v"] === nil
     end
   end
 

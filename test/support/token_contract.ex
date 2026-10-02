@@ -108,7 +108,11 @@ defmodule InfluxElixir.TokenContract do
 
         test "delete is by name: an unknown one is the engine's 404, _admin its 405", ctx do
           name = token_name("contract_del")
-          assert {:ok, _token} = unquote(client).create_token(ctx.conn, name)
+          assert {:ok, token} = unquote(client).create_token(ctx.conn, name)
+
+          assert %{"id" => id, "name" => ^name, "token" => "apiv3_" <> _secret} = token
+          assert map_size(token) === 6
+          assert is_integer(id) and id > 0
           assert :ok = unquote(client).delete_token(ctx.conn, name)
 
           assert {:error, %{status: 404, body: "the requested resource was not found: " <> ^name}} =

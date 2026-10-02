@@ -6,14 +6,25 @@ defmodule InfluxElixir.Query.InfluxQLTest do
 
   setup do
     {:ok, conn} = Local.start(databases: ["test_db"])
-    Local.write(conn, "cpu,host=web01 value=1i", database: "test_db")
+
+    {:ok, :written} =
+      Local.write(conn, "cpu,host=web01 value=1i 1700000000000000000", database: "test_db")
+
     {:ok, conn: conn}
   end
 
   describe "query/3" do
     test "returns {:ok, rows} from client", %{conn: conn} do
-      assert {:ok, [%{"host" => "web01", "value" => 1}]} =
-               InfluxQL.query(conn, "SELECT * FROM cpu", database: "test_db")
+      assert InfluxQL.query(conn, "SELECT * FROM cpu", database: "test_db") ===
+               {:ok,
+                [
+                  %{
+                    "iox::measurement" => "cpu",
+                    "time" => ~U[2023-11-14 22:13:20.000000Z],
+                    "host" => "web01",
+                    "value" => 1
+                  }
+                ]}
     end
 
     test "SHOW DATABASES works without database option", %{conn: conn} do

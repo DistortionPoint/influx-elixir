@@ -197,7 +197,9 @@ defmodule InfluxElixir.Client.Local do
       (the usual use is broadcasting a one-row CTE such as a median across
       the rows it screens). A column present on both sides is refused as
       ambiguous, because qualifiers are dropped and the two could not be
-      told apart; the engine refuses the unqualified reference too. Other
+      told apart; the engine refuses the unqualified reference too. A shared
+      column written with a qualifier (`a.v`) is refused by name, since the
+      engine resolves it to a side. Other
       joins, set operations, `HAVING` and window functions are
       rejected by name rather than silently ignored.
     * Table qualifiers and aliases: `FROM q AS w` / `FROM q w`, and
@@ -247,10 +249,16 @@ defmodule InfluxElixir.Client.Local do
       before a number is part of it, but `-(9223372036854775808)` negates a
       `UInt64`, which the engine refuses, as it does `-$p` for a
       non-negative integer parameter); a number past the double range is a
-      JSON `null` that is there (`%{"a" => nil}`). An `Int64` divided by a
-      `UInt64` is a decimal truncated to four places. The magnitude of the
-      `Int64` minimum, and its negation when it is folded as a constant,
-      close the connection mid-response.
+      JSON `null` that is there (`%{"a" => nil}`), named `Float64(inf)` when
+      it has no alias. A column the store holds as `UInt64` (`5u`) has that
+      type in an expression, as a literal or a parameter does: it divides by
+      an `Int64` as a decimal truncated to four places (`u / 2` is `2.5`),
+      by a `UInt64` as an integer, adds to an `Int64` as a decimal, wraps at
+      2^64 with another `UInt64`, and cannot be negated (the engine's
+      planning error); a decimal past 38 digits, and the mean of decimals, are
+      refused by name. The magnitude of the `Int64` minimum, and its
+      negation when it is folded as a constant, close the connection
+      mid-response.
     * `WHERE col IS NULL` and `WHERE col IS NOT NULL`
     * `WHERE col [NOT] BETWEEN low AND high` (inclusive; `time` too)
     * `WHERE col [NOT] LIKE 'pattern'` and `ILIKE` (`%` any run, `_` one
@@ -302,7 +310,8 @@ defmodule InfluxElixir.Client.Local do
       such as `CAST(level AS INTEGER) DESC`; every term applies, each with
       its own direction. Nulls sort last ascending and first descending,
       unless a term says `NULLS FIRST` / `NULLS LAST`.
-    * `CAST(expr AS INTEGER | INT | BIGINT | DOUBLE | FLOAT | VARCHAR | STRING)`
+    * `CAST(expr AS BIGINT | INT8 | INTEGER | INT | INT4 | SMALLINT | INT2 |
+      TINYINT | DOUBLE | VARCHAR | STRING)`
       and DataFusion's `col::TYPE` shorthand, wherever an expression is
       allowed: `WHERE` (`CAST(level AS INTEGER) <= 20` compares a numeric tag
       numerically), `BETWEEN`, `LIKE`, projections, aggregates, arithmetic
@@ -312,8 +321,12 @@ defmodule InfluxElixir.Client.Local do
       `INTEGER`) makes InfluxDB 3 Core drop the connection mid-response,
       which `Client.HTTP` reports as `{:error, {:connection_error,
       %Mint.TransportError{reason: :closed}}}`, and so does the double.
-      `BOOLEAN` and `TIMESTAMP`
-      targets are outside the subset.
+      As on the engine, `INTEGER`/`INT` is Int32, `SMALLINT` Int16 and
+      `TINYINT` Int8: arithmetic of two such values wraps at the wider
+      width, and a constant that does not fit is the optimizer's HTTP 500
+      "Can't cast value". `BIGINT` is Int64. `FLOAT`/`REAL` (Float32),
+      unsigned and `DECIMAL`, `BOOLEAN` and `TIMESTAMP` targets are refused
+      by name.
     * `LIMIT n` and `OFFSET m`, in either order — `OFFSET` skips rows before
       `LIMIT` takes them, on plain, projected, grouped and `DISTINCT` rows
       alike; `LIMIT 0` returns no rows; a negative or non-numeric
@@ -336,12 +349,17 @@ defmodule InfluxElixir.Client.Local do
       `Int64` `+`, `-`, `*` and unary minus wrap in two's complement, as the
       engine's do (`9223372036854775807 + 1` is the minimum, `-` of the
       minimum is itself).
-      `round` keeps the sign of a zero it leaves (`round(-0.3)` is `-0.0`).
-      An integer divided by zero, or the minimum by -1, closes the
-      connection mid-response, as on the engine (`{:error, {:connection_error, %Mint.TransportError{reason:
-      :closed}}}`). A float divided by zero is IEEE infinity or NaN on the
-      engine, which compares as a number but has no Elixir form, so the
-      double refuses it by name. A sample
+      `round` keeps the sign of a zero it leaves (`round(-0.3)` is `-0.0`);
+      `trunc(x)` cuts toward zero and `trunc(x, n)` rounds to `n` places, as
+      the engine's does. An integer divided by zero, or the minimum by -1,
+      closes the connection mid-response, as on the engine (`{:error,
+      {:connection_error, %Mint.TransportError{reason: :closed}}}`). A float
+      that overflows, or is divided by zero, is IEEE infinity or NaN: `null`
+      in a response, and an infinity compares as a number greater than every
+      finite one (`SUM` and `AVG` of floats that overflow are `null`). A
+      comparison or ordering of a NaN is refused by name, since the engine
+      orders a NaN by a sign the CPU that computed it chooses. `SUM` of
+      `Int64`s wraps. A sample
       statistic over one value is null. `COUNT(DISTINCT col)` counts
       distinct non-null values. `MIN(time)`, `MAX(time)` and `COUNT(time)`
       work (a `DateTime` result); every other aggregate over `time`, and
@@ -1537,7 +1555,7 @@ defmodule InfluxElixir.Client.Local do
     with :ok <- require_capability(conn, :query_influxql) do
       Format.answer(
         query_format(opts),
-        fn -> do_query_influxql(table, conn, String.trim(influxql), opts) end,
+        fn -> do_query_influxql(table, conn, influxql, opts) end,
         Keyword.get(opts, :database) || Map.get(conn, :database)
       )
     end
@@ -1553,12 +1571,15 @@ defmodule InfluxElixir.Client.Local do
 
   @spec do_query_influxql(Store.t(), map(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
-  defp do_query_influxql(table, conn, influxql, opts) do
+  defp do_query_influxql(table, conn, raw, opts) do
+    # The engine's positions count the text as sent, blanks included.
+    influxql = String.trim(raw)
+
     if String.match?(influxql, @show_databases) do
       {:ok, Enum.map(database_names(table), &%{"iox::database" => &1, "deleted" => false})}
     else
       # The engine parses the statement before it looks for the database.
-      with {:ok, statement} <- influxql_statement(influxql),
+      with {:ok, statement} <- influxql_statement(influxql, raw),
            {:ok, database} <- influxql_database(opts, conn),
            :ok <- database_exists(table, database) do
         case statement do
@@ -1571,14 +1592,14 @@ defmodule InfluxElixir.Client.Local do
     end
   end
 
-  @spec influxql_statement(binary()) ::
+  @spec influxql_statement(binary(), binary()) ::
           {:ok,
            :show_measurements
            | {:show_keys, [binary()]}
            | {:show_tag_values, map()}
            | {:select, map()}}
           | {:error, term()}
-  defp influxql_statement(influxql) do
+  defp influxql_statement(influxql, raw) do
     cond do
       String.match?(influxql, @show_measurements) ->
         {:ok, :show_measurements}
@@ -1596,7 +1617,7 @@ defmodule InfluxElixir.Client.Local do
         end
 
       true ->
-        with {:ok, query} <- influxql_parse(influxql), do: {:ok, {:select, query}}
+        with {:ok, query} <- influxql_parse(raw, influxql), do: {:ok, {:select, query}}
     end
   end
 
@@ -1652,7 +1673,7 @@ defmodule InfluxElixir.Client.Local do
   defp tag_values_where(nil, _tags), do: {:ok, @show_tag_values_window}
 
   defp tag_values_where(where, tags) do
-    with {:ok, %{where: " WHERE " <> sql}} <- influxql_where(where, tags) do
+    with {:ok, %{where: " WHERE " <> sql}} <- influxql_where(where, tags, %{}) do
       if InfluxQL.mentions_time?(where),
         do: {:ok, sql},
         else: {:ok, "(#{sql}) AND " <> @show_tag_values_window}
@@ -1740,8 +1761,11 @@ defmodule InfluxElixir.Client.Local do
           InfluxElixir.Client.query_result()
   defp influxql_select(table, database, query) do
     tags = Store.tag_columns(table, database, query.measurement)
+    types = field_types(table, database, query.measurement)
 
-    with {:ok, plan} <- influxql_where(query.where, tags) do
+    with {:ok, plan} <- influxql_where(query.where, tags, types),
+         :ok <- influxql_window(table, database, query),
+         :ok <- influxql_deferred(plan) do
       # ORDER BY time sorts on the stored nanoseconds; rows carry microsecond
       # DateTimes, so sorting those alone would tie sub-microsecond points.
       # InfluxQL shapes the rows in that order and sorts nothing again.
@@ -1755,6 +1779,39 @@ defmodule InfluxElixir.Client.Local do
       )
     end
   end
+
+  # The type of each field of a measurement, as the WHERE reads it.
+  @spec field_types(Store.t(), binary(), binary()) :: %{binary() => atom()}
+  defp field_types(table, database, measurement) do
+    for {^measurement, column, "iox::column_type::field::" <> type} <-
+          Store.columns(table, database),
+        into: %{},
+        do: {column, field_type(type)}
+  end
+
+  @spec field_type(binary()) :: :integer | :unsigned | :float | :string | :boolean
+  defp field_type("integer"), do: :integer
+  defp field_type("uinteger"), do: :unsigned
+  defp field_type("float"), do: :float
+  defp field_type("string"), do: :string
+  defp field_type("boolean"), do: :boolean
+
+  # A LIMIT or OFFSET beyond the signed 64-bit range is a planning error,
+  # raised only for a measurement that exists (verified).
+  @spec influxql_window(Store.t(), binary(), InfluxQL.query()) :: :ok | {:error, map()}
+  defp influxql_window(table, database, query) do
+    with true <- query.measurement in Store.measurements(table, database),
+         {:error, {:engine, body}} <- InfluxQL.check_window(query) do
+      {:error, %{status: 400, body: body}}
+    else
+      _in_range_or_absent -> :ok
+    end
+  end
+
+  # An error the engine raises after it has planned the LIMIT.
+  @spec influxql_deferred(map()) :: :ok | {:error, map()}
+  defp influxql_deferred(%{deferred: nil}), do: :ok
+  defp influxql_deferred(%{deferred: body}), do: {:error, %{status: 400, body: body}}
 
   # The field names a LIMIT or OFFSET counts per field, from the schema;
   # a query without either does not read them.
@@ -1771,19 +1828,27 @@ defmodule InfluxElixir.Client.Local do
   # The WHERE as SQL (with its leading ` WHERE `, or nothing), the lower
   # bounds it puts on `time`, and the tag columns it names: only those
   # need the missing-tag fill.
-  @spec influxql_where(binary() | nil, MapSet.t(binary())) ::
-          {:ok, %{where: binary(), lowers: [InfluxQL.bound()], tags: MapSet.t(binary())}}
+  @spec influxql_where(binary() | nil, MapSet.t(binary()), %{binary() => atom()}) ::
+          {:ok,
+           %{
+             where: binary(),
+             lowers: [InfluxQL.bound()],
+             tags: MapSet.t(binary()),
+             deferred: binary() | nil
+           }}
           | {:error, map()}
-  defp influxql_where(nil, _tags), do: {:ok, %{where: "", lowers: [], tags: MapSet.new()}}
+  defp influxql_where(nil, _tags, _types),
+    do: {:ok, %{where: "", lowers: [], tags: MapSet.new(), deferred: nil}}
 
-  defp influxql_where(where, tags) do
-    case InfluxQL.where_plan(where, tags) do
+  defp influxql_where(where, tags, types) do
+    case InfluxQL.where_plan(where, tags, types) do
       {:ok, plan} ->
         {:ok,
          %{
            where: " WHERE " <> plan.sql,
            lowers: plan.lowers,
-           tags: MapSet.intersection(tags, plan.idents)
+           tags: MapSet.intersection(tags, plan.idents),
+           deferred: plan.deferred
          }}
 
       {:error, {:engine, body}} ->
@@ -1864,9 +1929,9 @@ defmodule InfluxElixir.Client.Local do
     |> Enum.max(fn -> nil end)
   end
 
-  @spec influxql_parse(binary()) :: {:ok, InfluxQL.query()} | {:error, map()}
-  defp influxql_parse(influxql) do
-    case InfluxQL.parse(influxql) do
+  @spec influxql_parse(binary(), binary()) :: {:ok, InfluxQL.query()} | {:error, map()}
+  defp influxql_parse(raw, influxql) do
+    case InfluxQL.parse(raw) do
       {:ok, query} -> {:ok, query}
       {:error, {:engine, body}} -> {:error, %{status: 400, body: body}}
       {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}: #{influxql}"}}

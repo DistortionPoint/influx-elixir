@@ -11,10 +11,10 @@ defmodule InfluxElixir.Write.WriterTest do
 
   describe "write/3" do
     test "writes line protocol through the configured client", %{conn: conn} do
-      assert {:ok, :written} = Writer.write(conn, "cpu value=1.0", database: "w")
+      assert {:ok, :written} = Writer.write(conn, "cpu value=1.0 1", database: "w")
 
-      assert {:ok, [%{"value" => 1.0}]} =
-               Local.query_sql(conn, "SELECT * FROM cpu", database: "w")
+      assert Local.query_sql(conn, "SELECT * FROM cpu", database: "w") ===
+               {:ok, [%{"time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 1.0}]}
     end
 
     test "a payload over 1 KB is gzipped and still stored in full", %{conn: conn} do
@@ -32,8 +32,8 @@ defmodule InfluxElixir.Write.WriterTest do
 
       assert {:ok, :written} = Writer.write(conn, lp, database: "w")
 
-      assert {:ok, [%{"n" => 100}]} =
-               Local.query_sql(conn, "SELECT COUNT(value) AS n FROM cpu", database: "w")
+      assert Local.query_sql(conn, "SELECT COUNT(value) AS n FROM cpu", database: "w") ===
+               {:ok, [%{"n" => 100}]}
     end
 
     # gzip: true reached the client with the payload uncompressed, and the
@@ -46,19 +46,19 @@ defmodule InfluxElixir.Write.WriterTest do
       assert byte_size(large) > 1024
       assert {:ok, :written} = Writer.write(conn, large, database: "w", gzip: false)
 
-      assert {:ok, [%{"n" => 1}]} =
-               Local.query_sql(conn, "SELECT COUNT(v) AS n FROM small", database: "w")
+      assert Local.query_sql(conn, "SELECT COUNT(v) AS n FROM small", database: "w") ===
+               {:ok, [%{"n" => 1}]}
 
-      assert {:ok, [%{"n" => 100}]} =
-               Local.query_sql(conn, "SELECT COUNT(v) AS n FROM large", database: "w")
+      assert Local.query_sql(conn, "SELECT COUNT(v) AS n FROM large", database: "w") ===
+               {:ok, [%{"n" => 100}]}
     end
 
     test "opts such as :precision reach the client", %{conn: conn} do
       assert {:ok, :written} =
                Writer.write(conn, "cpu value=1i 1700000000000", database: "w", precision: :ms)
 
-      assert {:ok, [%{"time" => ~U[2023-11-14 22:13:20.000000Z]}]} =
-               Local.query_sql(conn, "SELECT time FROM cpu", database: "w")
+      assert Local.query_sql(conn, "SELECT time FROM cpu", database: "w") ===
+               {:ok, [%{"time" => ~U[2023-11-14 22:13:20.000000Z]}]}
     end
 
     test "the :client opt selects the client and is not forwarded to it" do

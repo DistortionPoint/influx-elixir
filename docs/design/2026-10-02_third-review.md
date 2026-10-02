@@ -113,7 +113,10 @@ every millisecond).
 `trunc()`, `X'..'` literals, `SELECT` without `FROM`, duplicate output
 names, `CAST(x AS INT)` as Int32, and a CTE that renames `time` are refused
 by name or left as they were. InfluxQL `LIMIT`/`OFFSET` overflow and a
-dangling arithmetic operator still differ in wording.
+dangling arithmetic operator still differ in wording. (`trunc`, the Int32
+cast and InfluxQL `LIMIT`/`OFFSET` overflow were modelled by the next
+review,
+[`2026-10-02_fourth-review`](2026-10-02_fourth-review.md).)
 
 ## Verification
 

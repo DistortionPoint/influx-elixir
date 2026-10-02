@@ -32,13 +32,26 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   !~ | IN (...)` [WHERE ...] lists values as the engine does, over the
   last 24 hours unless the `WHERE` bounds `time` (`parse_show_tag_values/1`).
 
+  A reserved word (`reserved?/1`) is no bare identifier: the engine's parse
+  errors for it, and for a select list, `FROM`, `WHERE`, `GROUP BY`,
+  `ORDER BY`, `LIMIT` or a statement after a `;` that stops short, are
+  positioned in the text as sent and read with the statement's own offset. A
+  field is compared with a literal by the types of the two (`b = 1` is false
+  for every row, `u > -1` wraps the `-1`, an integer past the signed range
+  compares as unsigned), `LIMIT` and `OFFSET` beyond the signed 64-bit range
+  are the planning error and beyond the unsigned a parse error.
+
   Refused by name, rather than answered wrongly: `GROUP BY time(...)` (the
   engine fills every empty bucket), `fill()`, `INTO`, `SLIMIT`/`SOFFSET`,
   subqueries, `GROUP BY *`, functions other than
   `MEAN SUM COUNT MIN MAX FIRST LAST`, `F(*)` other than `COUNT(*)`, plain
   columns beside anything but a single selector, arithmetic in the select
   list, several measurements in `FROM`, sub-second durations in `now() -
-  ...`, and `LIMIT` / `OFFSET` on `SHOW TAG VALUES`. A keyword inside a
+  ...`, `LIMIT` / `OFFSET` on `SHOW TAG VALUES`, an unsigned field
+  compared with a string, a string field or a tag compared with an integer
+  past the signed range, a field compared with a constant the double cannot
+  fold, a bare non-boolean field inside `AND` / `OR`, `DISTINCT`, and a
+  statement after a `;` that the double does not read. A keyword inside a
   quoted string, quoted identifier or regular expression is not one:
   `WHERE k = 'into'` is answered.
   """
@@ -46,6 +59,9 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   alias InfluxElixir.Client.Local.{SQLMask, SQLParser}
 
   @epoch DateTime.from_unix!(0, :microsecond)
+
+  @max_unsigned 18_446_744_073_709_551_615
+  @max_signed 9_223_372_036_854_775_807
 
   @aggregates ~w(mean sum count min max first last)
   @selectors ~w(min max first last)
@@ -84,7 +100,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
 
   @select ~r/^\s*SELECT\s+(?<items>.+?)\s+FROM\s+(?<from>"(?:[^"\\]|\\.)+"|[A-Za-z_][\w\-]*)(?<rest>.*)$/is
 
-  @rest ~r/^\s*(?:WHERE\s+(?<where>.+?))?\s*(?:GROUP\s+BY\s+(?<group>.+?))?\s*(?:ORDER\s+BY\s+time(?:\s+(?<dir>ASC|DESC))?)?\s*(?:LIMIT\s+(?<limit>\d+))?\s*(?:OFFSET\s+(?<offset>\d+))?\s*;?\s*$/is
+  @rest ~r/^\s*(?:WHERE\s+(?<where>.+?))?\s*(?:GROUP\s+BY\s+(?<group>.+?))?\s*(?:ORDER\s+BY\s+(?:time\s+(?=ASC|DESC)|(?=ASC\b|DESC\b)|time\b)(?<dir>ASC|DESC)?)?\s*(?:LIMIT\s+(?<limit>\d+))?\s*(?:OFFSET\s+(?<offset>\d+))?\s*;?\s*$/is
 
   @function ~r/^(?<fn>[A-Za-z_]\w*)\s*\(\s*(?<arg>\*|"[^"]+"|[\w.]+)\s*\)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is
   @column ~r/^(?<col>"[^"]+"|[\w.]+)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is
@@ -99,11 +115,18 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
     {head, masked_head, tail} = split_statement(clean, masked)
 
     with :ok <- check_supported(masked_head),
+         :ok <- check_select(clean, masked_head),
          %{"items" => items, "from" => from, "rest" => rest} <-
            slices(@select, masked_head, head) || {:error, "invalid statement"},
          %{"rest" => masked_rest} = slices(@select, masked_head, masked_head),
+         at = byte_size(head) - byte_size(rest),
+         :ok <- check_empty_where(clean, at, masked_rest),
          %{} = clauses <- slices(@rest, masked_rest, rest) || {:error, "invalid clauses"},
-         :ok <- check_where(clean, head, rest, masked_rest, blank_to_nil(clauses["where"])),
+         {where, swallowed} = cut_where(masked_rest, clauses["where"]),
+         :ok <- check_where(clean, at, masked_rest, where),
+         :ok <- check_group(clean, at, masked_rest),
+         :ok <- check_swallowed(clean, at, masked_rest, swallowed),
+         :ok <- check_unsigned(clean, at, masked_rest),
          {:ok, items} <- parse_items(items),
          :ok <- check_mix(items),
          :ok <- check_single(statement, tail) do
@@ -111,7 +134,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
        %{
          items: items,
          measurement: unquote_ident(from),
-         where: blank_to_nil(clauses["where"]),
+         where: where,
          group_by: parse_group(clauses["group"]),
          descending: String.upcase(clauses["dir"]) == "DESC",
          limit: to_int(clauses["limit"]),
@@ -172,6 +195,11 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   @only_one "must provide only one InfluxQl statement per query"
   @other_statements ~r/^SHOW\s+(?:DATABASES|MEASUREMENTS|TAG\s+(?:KEYS|VALUES)|FIELD\s+KEYS)\b/i
 
+  # Statements the engine reads in ways the double does not follow; any
+  # other text is not a statement at all, and the engine fails it where it
+  # starts (verified).
+  @known_statements ~r/^(?:(?:SELECT|SHOW|EXPLAIN|CREATE|DELETE)(?![\w])|DROP(?![\w])\s*\S)/i
+
   @spec next_statement_error(binary(), binary(), non_neg_integer()) :: {:error, term()}
   defp next_statement_error(statement, next, start) do
     case parse(next) do
@@ -184,10 +212,17 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
       {:error, "unsupported" <> _rest} = refusal ->
         refusal
 
-      {:error, _message} ->
-        if Regex.match?(@other_statements, next),
-          do: {:error, {:engine, @only_one}},
-          else: {:error, {:engine, syntax_error_body(:nom, start, statement)}}
+      {:error, message} ->
+        cond do
+          Regex.match?(@other_statements, next) ->
+            {:error, {:engine, @only_one}}
+
+          Regex.match?(@known_statements, next) ->
+            {:error, "#{message} (in a statement after `;`)"}
+
+          true ->
+            {:error, {:engine, syntax_error_body(:nom, start, statement)}}
+        end
     end
   end
 
@@ -592,7 +627,12 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   @type bound :: integer() | {:now, integer()}
 
   @typedoc "A `WHERE` as the caller's SQL, with the lower bounds its `time` comparisons give."
-  @type where_plan :: %{sql: binary(), lowers: [bound()], idents: MapSet.t(binary())}
+  @type where_plan :: %{
+          sql: binary(),
+          lowers: [bound()],
+          idents: MapSet.t(binary()),
+          deferred: binary() | nil
+        }
 
   @doc """
   Rewrites an InfluxQL `WHERE` into the caller's SQL, given the
@@ -600,19 +640,25 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   the lower bounds it puts on `time`:
   `time >= x` and `time = x` give `x`, `time > x` gives `x + 1`, upper
   bounds give none. An aggregate over a lower bound is stamped with the
-  greatest of them (`run/4`). `{:error, message}` for what the double
+  greatest of them (`run/4`). `types` maps each field to its type: a
+  comparison of a field with a literal follows the engine's rules for the
+  two types (see the section on typed comparisons). `deferred` is the engine's
+  error for a bare field as the whole condition, which it raises after it has
+  checked `LIMIT` and `OFFSET`. `{:error, message}` for what the double
   refuses by name; `{:error, {:engine, body}}` for what the engine itself
   answers with a 400.
   """
-  @spec where_plan(binary(), MapSet.t(binary())) ::
+  @spec where_plan(binary(), MapSet.t(binary()), %{binary() => field_type()}) ::
           {:ok, where_plan()} | {:error, binary() | {:engine, binary()}}
-  def where_plan(where, tags) do
+  def where_plan(where, tags, types \\ %{}) do
     case tokenize(where, []) do
       {:ok, tokens} ->
         {tree, _rest} = parse_or(tokens)
-        {sql, lowers} = plan(tree, tags)
+        ctx = {tags, types}
+        deferred = bare_condition(tree, ctx)
+        {sql, lowers} = if deferred, do: {"true", []}, else: plan(tree, ctx)
         idents = for {:ident, name} <- tokens, into: MapSet.new(), do: name
-        {:ok, %{sql: sql, lowers: lowers, idents: idents}}
+        {:ok, %{sql: sql, lowers: lowers, idents: idents, deferred: deferred}}
 
       {:syntax_error, _kind, rest} ->
         {:error, "unsupported InfluxQL WHERE: #{rest}"}
@@ -640,19 +686,447 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   #     beyond the signed range, is an overflow at the end of its digits; a
   #     duration whose count only fits the unsigned range leaves its unit
   #     behind
-  @spec check_where(binary(), binary(), binary(), binary(), binary() | nil) ::
-          :ok | {:error, {:engine, binary()}}
-  defp check_where(_whole, _head, _rest, _masked_rest, nil), do: :ok
+  #
+  # A reserved word (`reserved?/1`) where an operand is expected is an error
+  # whose shape depends on what stands before it (verified): at the start of
+  # the condition the whole `WHERE` is left unparsed (the error is at the
+  # `WHERE`); after a comparison or a connective it is the missing operand
+  # (at the end of the operator, sign and parenthesis skipped); after `*` or
+  # `/` the operator is what cannot be read; after a binary `+` or `-` the
+  # engine fails from the word on, at position 0; after an operand it is the
+  # word itself. A `WHERE` with nothing after it is unparsed like the first.
+  # A clause keyword inside what the clause regex took for the `WHERE` means
+  # the clause after it is malformed: the condition ends there, and that
+  # clause is what the engine reads next.
+  @clause_keyword ~r/\b(?:GROUP|ORDER|LIMIT|OFFSET)\b/i
 
-  defp check_where(whole, head, rest, masked_rest, where) do
+  @spec cut_where(binary(), binary()) :: {binary() | nil, {non_neg_integer()} | nil}
+  defp cut_where(masked_rest, raw_where) do
+    indexes = Regex.named_captures(@rest, masked_rest, return: :index)
+
+    case swallowed(masked_rest, indexes["where"]) do
+      {at, from} -> {blank_to_nil(binary_part(raw_where, 0, at)), {from}}
+      nil -> {blank_to_nil(raw_where), swallowed_in_group(masked_rest, indexes["group"])}
+    end
+  end
+
+  defp swallowed_in_group(masked_rest, index) do
+    case swallowed(masked_rest, index) do
+      {_at, from} -> {from}
+      nil -> nil
+    end
+  end
+
+  # Where a clause keyword stands inside a clause's text (not at its start):
+  # `{offset in the text, offset in the rest}`.
+  defp swallowed(_masked_rest, {from, _length}) when from < 0, do: nil
+  defp swallowed(_masked_rest, nil), do: nil
+
+  defp swallowed(masked_rest, {from, length}) do
+    case Regex.run(@clause_keyword, binary_part(masked_rest, from, length), return: :index) do
+      [{at, _size}] when at > 0 ->
+        if completes_operand?(masked_rest, from, at), do: {at, from + at}
+
+      _none_or_start ->
+        nil
+    end
+  end
+
+  # A clause keyword ends the condition only after a complete operand; after
+  # an operator or a connective it is a reserved word where one is wanted.
+  @spec completes_operand?(binary(), non_neg_integer(), non_neg_integer()) :: boolean()
+  defp completes_operand?(masked_rest, from, at),
+    do: not (binary_part(masked_rest, from, at) =~ ~r/(?:[-+*\/=<>(,~!]|\b(?:AND|OR))\s*$/i)
+
+  @spec check_swallowed(binary(), non_neg_integer(), binary(), {non_neg_integer()} | nil) ::
+          :ok | {:error, term()}
+  defp check_swallowed(_whole, _at, _masked_rest, nil), do: :ok
+
+  defp check_swallowed(whole, at, masked_rest, {from}) do
+    text = binary_part(masked_rest, from, byte_size(masked_rest) - from)
+    start = at + from
+
+    cond do
+      text =~ ~r/^ORDER\s+BY/i -> check_order(text, start, whole)
+      text =~ ~r/^(?:LIMIT|OFFSET)(?![\w])/i -> check_count(text, start, whole)
+      text =~ ~r/^GROUP(?![\w])/i -> check_group_keyword(text, start, whole)
+      text =~ ~r/^ORDER(?![\w])/i -> {:error, {:engine, syntax_error_body(:nom, start, whole)}}
+      true -> {:error, "invalid clauses"}
+    end
+  end
+
+  # `ORDER BY` takes `time`, `ASC` or `DESC`: another name is "expected TIME
+  # column", where it starts; a reserved word or a number "expected ASC, DESC
+  # or TIME", at the end of `BY`.
+  @spec check_order(binary(), non_neg_integer(), binary()) :: {:error, term()}
+  defp check_order(text, start, whole) do
+    [{_at, size}, {_blank, blank}] = Regex.run(~r/^ORDER\s+BY(\s*)/i, text, return: :index)
+    after_by = binary_part(text, size, byte_size(text) - size)
+
+    cond do
+      after_by =~ ~r/^(?:time|asc|desc)(?![\w])/i ->
+        {:error, "invalid clauses"}
+
+      reserved_start(after_by) == nil and after_by =~ ~r/^[A-Za-z_]/ ->
+        {:error, {:engine, syntax_error_body(:order_time, start + size, whole)}}
+
+      true ->
+        {:error, {:engine, syntax_error_body(:order, start + size - blank, whole)}}
+    end
+  end
+
+  # `LIMIT` and `OFFSET` take an unsigned integer: anything else after it is "expected
+  # unsigned integer", where it starts; nothing leaves the clause unparsed.
+  @spec check_count(binary(), non_neg_integer(), binary()) :: {:error, term()}
+  defp check_count(text, start, whole) do
+    [_all, {word, _word_size}, {at, _blank}, {_rest_at, rest_size}] =
+      Regex.run(~r/^(LIMIT|OFFSET)\s*()(.*)$/is, text, return: :index)
+
+    kind = if text |> binary_part(word, 1) |> String.upcase() == "L", do: :limit, else: :offset
+
+    cond do
+      rest_size == 0 -> {:error, {:engine, syntax_error_body(:nom, start, whole)}}
+      binary_part(text, at, 1) =~ ~r/\d/ -> {:error, "invalid clauses"}
+      true -> {:error, {:engine, syntax_error_body(kind, start + at, whole)}}
+    end
+  end
+
+  # `GROUP` must be followed by `BY`; `GROUP BY` and nothing is unparsed.
+  @spec check_group_keyword(binary(), non_neg_integer(), binary()) :: {:error, term()}
+  defp check_group_keyword(text, start, whole) do
+    cond do
+      text =~ ~r/^GROUP\s+BY\s*$/i ->
+        {:error, {:engine, syntax_error_body(:nom, start, whole)}}
+
+      text =~ ~r/^GROUP\s+BY(?![\w])/i ->
+        {:error, "invalid clauses"}
+
+      true ->
+        [{_at, size}] = Regex.run(~r/^GROUP\s*/i, text, return: :index)
+        {:error, {:engine, syntax_error_body(:group_by, start + size, whole)}}
+    end
+  end
+
+  @spec check_empty_where(binary(), non_neg_integer(), binary()) ::
+          :ok | {:error, {:engine, binary()}}
+  defp check_empty_where(whole, at, masked_rest) do
+    case Regex.run(~r/^(\s*)WHERE\s*$/i, masked_rest, return: :index) do
+      [_all, {_from, blank}] -> {:error, {:engine, syntax_error_body(:nom, at + blank, whole)}}
+      nil -> :ok
+    end
+  end
+
+  @spec check_where(binary(), non_neg_integer(), binary(), binary() | nil) ::
+          :ok | {:error, {:engine, binary()}}
+  defp check_where(_whole, _at, _masked_rest, nil), do: :ok
+
+  defp check_where(whole, at, masked_rest, where) do
     case tokenize(where, []) do
       {:syntax_error, kind, after_error} ->
         [{from, length}] = Regex.run(~r/\bWHERE\s+/i, masked_rest, return: :index)
-        where_at = byte_size(head) - byte_size(rest) + from + length
-        pos = where_at + byte_size(where) - byte_size(after_error)
-        {:error, {:engine, syntax_error_body(kind, pos, whole)}}
+        pos = at + from + length + byte_size(where) - byte_size(after_error)
+        {:error, {:engine, where_error_body(kind, pos, at + from, whole)}}
 
       _tokens_or_refusal ->
+        :ok
+    end
+  end
+
+  @spec where_error_body(atom(), non_neg_integer(), non_neg_integer(), binary()) :: binary()
+  defp where_error_body(:where_unparsed, _pos, where_at, whole),
+    do: syntax_error_body(:nom, where_at, whole)
+
+  defp where_error_body(:reserved_operand, pos, _where_at, whole),
+    do: syntax_error_body(:operand, before_operand(whole, pos), whole)
+
+  defp where_error_body(:reserved_operator, pos, _where_at, whole),
+    do: syntax_error_body(:nom, before_operand(whole, pos) - 1, whole)
+
+  defp where_error_body(:reserved_failure, pos, _where_at, whole),
+    do: syntax_error_body(:failure, pos, whole)
+
+  defp where_error_body(kind, pos, _where_at, whole), do: syntax_error_body(kind, pos, whole)
+
+  # The end of the operator before the operand that starts at `pos`:
+  # whitespace, opening parentheses and unary signs between them are skipped.
+  @spec before_operand(binary(), non_neg_integer()) :: non_neg_integer()
+  defp before_operand(whole, pos) do
+    skipped = whole |> binary_part(0, pos) |> String.reverse()
+    [spaces] = Regex.run(~r/^[\s(+\-]*/, skipped)
+    pos - byte_size(spaces)
+  end
+
+  # ---------------------------------------------------------------------------
+  # Reserved words
+  #
+  # InfluxQL takes a reserved word as an identifier only quoted. The list is
+  # the engine's (probed one word at a time: each is refused as a bare
+  # identifier in the select list, `WHERE` and `GROUP BY`); `fill`, `nan`,
+  # `not`, `now`, `null`, `time`, `true` and `false` are not reserved.
+  # ---------------------------------------------------------------------------
+
+  @reserved ~w(
+    all alter analyze and any as asc begin by cardinality continuous create database
+    databases default delete desc destinations diagnostics distinct drop duration end every
+    exact explain field for from grant grants group groups in inf insert into key keys kill
+    limit measurement measurements name offset on or order password policies policy
+    privileges queries query read replication resample retention revoke select series set
+    shard shards show slimit soffset stats subscription subscriptions tag to user users
+    values where with write
+  )
+
+  @doc "Whether a bare word is one InfluxQL reserves (any case)."
+  @spec reserved?(binary()) :: boolean()
+  def reserved?(word), do: String.downcase(word) in @reserved
+
+  # The reserved word a text starts with, as `{word, length}`, unless a `::`
+  # follows (a cast, which the engine reads) or, with `plain: true`, a `(`
+  # (a call).
+  @spec reserved_start(binary(), keyword()) :: {binary(), non_neg_integer()} | nil
+  defp reserved_start(text, opts \\ []) do
+    with [_all, word] <- Regex.run(~r/^([A-Za-z_]\w*)(?![\w:])/, text),
+         true <- reserved?(word),
+         false <- Keyword.get(opts, :plain, false) and called?(text, word) do
+      {word, byte_size(word)}
+    else
+      _other -> nil
+    end
+  end
+
+  @spec called?(binary(), binary()) :: boolean()
+  defp called?(text, word),
+    do:
+      text
+      |> binary_part(byte_size(word), byte_size(text) - byte_size(word))
+      |> then(&(&1 =~ ~r/^\s*\(/))
+
+  # The select list and `FROM`, as the engine's parser reads them (verified):
+  #
+  #   * a select list that is empty or starts with a reserved word is
+  #     "expected field" where the list starts
+  #   * a later item that starts with a reserved word leaves the whole
+  #     statement unparsed (position 0); a reserved word first in a function's
+  #     argument fails from there, at position 0
+  #   * an alias after `AS` that is reserved is "invalid field alias", at the
+  #     end of `AS`; a lone `DISTINCT` is "invalid DISTINCT expression", at
+  #     `FROM`
+  #   * `FROM` followed by nothing, by a reserved word or by a character that
+  #     starts no identifier is "invalid FROM clause", where the name starts
+  @spec check_select(binary(), binary()) :: :ok | {:error, term()}
+  defp check_select(whole, masked) do
+    with [{0, items_at}] <- Regex.run(~r/^\s*SELECT(?![\w])\s*/i, masked, return: :index),
+         rest = binary_part(masked, items_at, byte_size(masked) - items_at),
+         false <- rest == "" or reserved_item?(rest),
+         [{from_at, from_length}] <- from_keyword(masked, items_at) || :no_from do
+      items = binary_part(masked, items_at, from_at - items_at)
+      from_end = from_at + from_length
+
+      with :ok <- check_items(whole, items, items_at, from_at + 1),
+           do: check_from(masked, from_end)
+    else
+      true ->
+        {:error, {:engine, syntax_error_body(:field, items_at_of(masked), whole)}}
+
+      :no_from ->
+        {:error, {:engine, syntax_error_body(:nom, 0, whole)}}
+
+      _no_select_or_from ->
+        :ok
+    end
+  end
+
+  # `DISTINCT` is read by the select list, not refused as a reserved word.
+  @spec reserved_item?(binary()) :: boolean()
+  defp reserved_item?(text) do
+    case reserved_start(text) do
+      {word, _size} -> String.downcase(word) != "distinct"
+      nil -> false
+    end
+  end
+
+  @spec items_at_of(binary()) :: non_neg_integer()
+  defp items_at_of(masked) do
+    [{0, at}] = Regex.run(~r/^\s*SELECT(?![\w])\s*/i, masked, return: :index)
+    at
+  end
+
+  @spec from_keyword(binary(), non_neg_integer()) ::
+          [{non_neg_integer(), non_neg_integer()}] | nil
+  defp from_keyword(masked, items_at) do
+    case Regex.run(~r/\sFROM(?![\w])\s*/i, masked, return: :index, offset: items_at) do
+      [{at, length}] -> [{at, length}]
+      nil -> nil
+    end
+  end
+
+  @spec check_from(binary(), non_neg_integer()) :: :ok | {:error, term()}
+  defp check_from(masked, from_end) do
+    rest = binary_part(masked, from_end, byte_size(masked) - from_end)
+
+    if rest == "" or reserved_start(rest) != nil or not (rest =~ ~r/^[A-Za-z_"\/(]/),
+      do: {:error, {:engine, syntax_error_body(:from, from_end, masked)}},
+      else: :ok
+  end
+
+  # The comma-separated pieces of a text, each with its offset in the statement.
+  @spec comma_pieces(binary(), non_neg_integer()) :: [{binary(), non_neg_integer()}]
+  defp comma_pieces(text, base) do
+    text
+    |> String.split(",")
+    |> Enum.map_reduce(base, &{{&1, &2}, &2 + byte_size(&1) + 1})
+    |> elem(0)
+  end
+
+  @spec check_items(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
+          :ok | {:error, term()}
+  defp check_items(whole, items, items_at, from_keyword_at) do
+    pieces = comma_pieces(items, items_at)
+    last = length(pieces) - 1
+
+    pieces
+    |> Enum.with_index()
+    |> Enum.find_value(:ok, fn {{piece, at}, index} ->
+      case check_item(whole, piece, at, index, index == last, from_keyword_at) do
+        :ok -> nil
+        error -> error
+      end
+    end)
+  end
+
+  @spec check_item(
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          boolean(),
+          non_neg_integer()
+        ) ::
+          :ok | {:error, term()}
+  defp check_item(whole, piece, at, index, last?, from_keyword_at) do
+    text = String.trim_leading(piece)
+    start = at + byte_size(piece) - byte_size(text)
+    text = String.trim_trailing(text)
+
+    cond do
+      String.downcase(text) == "distinct" and last? ->
+        {:error, {:engine, syntax_error_body(:distinct, from_keyword_at, whole)}}
+
+      String.downcase(text) == "distinct" ->
+        {:error, "unsupported InfluxQL (DISTINCT)"}
+
+      index > 0 and (text == "" or reserved_start(text, plain: true) != nil) ->
+        {:error, {:engine, syntax_error_body(:nom, 0, whole)}}
+
+      pos = reserved_argument(text, start) ->
+        {:error, {:engine, syntax_error_body(:failure, pos, whole)}}
+
+      pos = reserved_alias(text, start) ->
+        {:error, {:engine, syntax_error_body(:alias, pos, whole)}}
+
+      true ->
+        :ok
+    end
+  end
+
+  # Where a reserved word is the first thing in a call's parentheses.
+  @spec reserved_argument(binary(), non_neg_integer()) :: non_neg_integer() | nil
+  defp reserved_argument(text, start) do
+    with [_all, {from, _length}] <-
+           Regex.run(~r/^[A-Za-z_]\w*\s*\(\s*([A-Za-z_]\w*)/, text, return: :index),
+         <<_skip::binary-size(from), word_and_rest::binary>> = text,
+         {_word, _size} <- reserved_start(word_and_rest) do
+      start + from
+    else
+      _not_reserved -> nil
+    end
+  end
+
+  # The end of `AS` when the alias after it is reserved.
+  @spec reserved_alias(binary(), non_neg_integer()) :: non_neg_integer() | nil
+  defp reserved_alias(text, start) do
+    case Regex.run(~r/\s(AS)(?![\w])\s*([A-Za-z_]\w*)/i, text, return: :index) do
+      [_all, {as_at, as_length}, {alias_at, _length}] ->
+        <<_skip::binary-size(alias_at), alias_and_rest::binary>> = text
+        if reserved_start(alias_and_rest), do: start + as_at + as_length
+
+      nil ->
+        last_as(text, start)
+    end
+  end
+
+  # An `AS` last in the list: the word after it was cut off as `FROM`.
+  @spec last_as(binary(), non_neg_integer()) :: non_neg_integer() | nil
+  defp last_as(text, start) do
+    case Regex.run(~r/\s(AS)(?![\w])\s*$/i, text, return: :index) do
+      [_all, {as_at, as_length}] -> start + as_at + as_length
+      nil -> nil
+    end
+  end
+
+  # `GROUP BY`: a first dimension that is a reserved word is "invalid GROUP BY
+  # clause" where it starts; a later one leaves the list from the comma before
+  # it unparsed.
+  @spec check_group(binary(), non_neg_integer(), binary()) :: :ok | {:error, term()}
+  defp check_group(whole, at, masked_rest) do
+    case Regex.named_captures(@rest, masked_rest, return: :index) do
+      %{"group" => {from, length}} when from >= 0 ->
+        masked_rest
+        |> binary_part(from, length)
+        |> comma_pieces(at + from)
+        |> Enum.with_index()
+        |> Enum.find_value(:ok, &group_dimension(&1, whole))
+
+      _no_group ->
+        :ok
+    end
+  end
+
+  @spec group_dimension({{binary(), non_neg_integer()}, non_neg_integer()}, binary()) ::
+          {:error, term()} | nil
+  defp group_dimension({{piece, at}, index}, whole) do
+    text = String.trim_leading(piece)
+    start = at + byte_size(piece) - byte_size(text)
+
+    cond do
+      reserved_start(text) == nil -> nil
+      index == 0 -> {:error, {:engine, syntax_error_body(:group, start, whole)}}
+      true -> {:error, {:engine, syntax_error_body(:nom, at - 1, whole)}}
+    end
+  end
+
+  # `LIMIT` and `OFFSET` are unsigned 64-bit integers; a longer number is a
+  # parse error at the end of its digits. One that fits but not the signed
+  # range is a planning error (`check_window/1`).
+  @spec check_unsigned(binary(), non_neg_integer(), binary()) :: :ok | {:error, term()}
+  defp check_unsigned(whole, at, masked_rest) do
+    indexes = Regex.named_captures(@rest, masked_rest, return: :index)
+
+    Enum.find_value(["limit", "offset"], :ok, fn clause ->
+      with {from, length} when from >= 0 <- indexes[clause],
+           digits = binary_part(masked_rest, from, length),
+           true <- String.to_integer(digits) > @max_unsigned do
+        {:error, {:engine, syntax_error_body(:unsigned, at + from + length, whole)}}
+      else
+        _fits -> nil
+      end
+    end)
+  end
+
+  @doc """
+  The engine's planning error for a `LIMIT` or `OFFSET` beyond the signed
+  64-bit range (`LIMIT` first), or `:ok`. It is raised only for a measurement
+  that exists.
+  """
+  @spec check_window(query()) :: :ok | {:error, {:engine, binary()}}
+  def check_window(%{limit: limit, offset: offset}) do
+    cond do
+      is_integer(limit) and limit > @max_signed ->
+        {:error, {:engine, "Error during planning: limit out of range"}}
+
+      offset > @max_signed ->
+        {:error, {:engine, "Error during planning: offset out of range"}}
+
+      true ->
         :ok
     end
   end
@@ -679,8 +1153,50 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   defp syntax_error_body(:signed_overflow, pos, _whole),
     do: @engine_error_prefix <> "constant overflows signed integer at pos #{pos}"
 
-  @max_unsigned 18_446_744_073_709_551_615
-  @max_signed 9_223_372_036_854_775_807
+  defp syntax_error_body(:field, pos, _whole),
+    do: @engine_error_prefix <> "invalid SELECT statement, expected field at pos #{pos}"
+
+  defp syntax_error_body(:from, pos, _whole) do
+    @engine_error_prefix <>
+      "invalid FROM clause, expected identifier, regular expression or subquery at pos #{pos}"
+  end
+
+  defp syntax_error_body(:alias, pos, _whole),
+    do: @engine_error_prefix <> "invalid field alias, expected identifier at pos #{pos}"
+
+  defp syntax_error_body(:group, pos, _whole) do
+    @engine_error_prefix <>
+      "invalid GROUP BY clause, expected wildcard, TIME, identifier or regular expression " <>
+      "at pos #{pos}"
+  end
+
+  defp syntax_error_body(:order, pos, _whole),
+    do: @engine_error_prefix <> "invalid ORDER BY, expected ASC, DESC or TIME at pos #{pos}"
+
+  defp syntax_error_body(:order_time, pos, _whole),
+    do: @engine_error_prefix <> "invalid ORDER BY, expected TIME column at pos #{pos}"
+
+  defp syntax_error_body(:limit, pos, _whole),
+    do: @engine_error_prefix <> "invalid LIMIT clause, expected unsigned integer at pos #{pos}"
+
+  defp syntax_error_body(:offset, pos, _whole),
+    do: @engine_error_prefix <> "invalid OFFSET clause, expected unsigned integer at pos #{pos}"
+
+  defp syntax_error_body(:group_by, pos, _whole),
+    do: @engine_error_prefix <> "invalid GROUP BY clause, expected BY at pos #{pos}"
+
+  defp syntax_error_body(:distinct, pos, _whole),
+    do: @engine_error_prefix <> "invalid DISTINCT expression, expected identifier at pos #{pos}"
+
+  defp syntax_error_body(:unsigned, pos, _whole),
+    do: @engine_error_prefix <> "unable to parse unsigned integer at pos #{pos}"
+
+  defp syntax_error_body(:failure, pos, whole) do
+    leftover = binary_part(whole, pos, byte_size(whole) - pos)
+
+    @engine_error_prefix <>
+      "invalid InfluxQL statement at pos 0. Parsing Failure: Nom(#{inspect(leftover)}, Char)"
+  end
 
   @spec tokenize(binary(), list()) ::
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
@@ -793,17 +1309,53 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   # `NOT` is no keyword; `AND` or `OR` with nothing after it has no operand.
   @spec word_token(binary(), binary(), binary(), list()) ::
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
-  defp word_token("NOT", _word, rest, _acc),
-    do: {:syntax_error, :nom, String.trim_leading(rest)}
-
-  defp word_token(upcased, word, rest, acc) when upcased in ["AND", "OR"] do
-    if String.trim(rest) == "",
-      do: {:syntax_error, :operand, rest},
-      else: tokenize(rest, [{:raw, word} | acc])
+  defp word_token("NOT", word, rest, acc) do
+    if rest =~ ~r/^\s*[=!<>]/,
+      do: tokenize(rest, [{:ident, word} | acc]),
+      else: {:syntax_error, :nom, String.trim_leading(rest)}
   end
 
-  defp word_token(upcased, word, rest, acc),
-    do: tokenize(rest, [plain_word(upcased, word) | acc])
+  defp word_token(upcased, word, rest, acc) when upcased in ["AND", "OR"] do
+    cond do
+      reserved_kind(acc) != :nom -> {:syntax_error, reserved_kind(acc), word <> rest}
+      String.trim(rest) == "" -> {:syntax_error, :operand, rest}
+      true -> tokenize(rest, [{:raw, word} | acc])
+    end
+  end
+
+  defp word_token(upcased, word, rest, acc) do
+    if reserved?(word) and not String.starts_with?(rest, ":"),
+      do: {:syntax_error, reserved_kind(acc), word <> rest},
+      else: tokenize(rest, [plain_word(upcased, word) | acc])
+  end
+
+  # What stands before a word where an operand is expected decides the
+  # error (see `check_where/4`).
+  @spec reserved_kind(list()) :: atom()
+  defp reserved_kind([]), do: :where_unparsed
+  defp reserved_kind([{:raw, "("} | before]), do: reserved_kind(before)
+  defp reserved_kind([{:op, _op} | _before]), do: :reserved_operand
+
+  defp reserved_kind([{:raw, sign} | before]) when sign in ["+", "-"] do
+    if unary_sign?(before), do: reserved_kind(before), else: :reserved_failure
+  end
+
+  defp reserved_kind([{:raw, op} | _before]) when op in ["*", "/"], do: :reserved_operator
+
+  defp reserved_kind([{:raw, word} | _before]) do
+    if String.upcase(word) in ["AND", "OR"], do: :reserved_operand, else: :nom
+  end
+
+  defp reserved_kind(_operand), do: :nom
+
+  @spec unary_sign?(list()) :: boolean()
+  defp unary_sign?([]), do: true
+  defp unary_sign?([{:op, _op} | _before]), do: true
+
+  defp unary_sign?([{:raw, word} | _before]),
+    do: String.upcase(word) in ["(", "AND", "OR", "+", "-", "*", "/"]
+
+  defp unary_sign?(_operand), do: false
 
   # A comparison operator needs an operand after it; the engine reports the
   # end of the operator.
@@ -936,35 +1488,358 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   defp depth_after(_word, depth), do: depth
 
   # The tree as SQL, with the lower bounds its `time` comparisons give.
-  @spec plan(tuple(), MapSet.t(binary())) :: {binary(), [bound()]}
-  defp plan({:cmp, tokens}, tags) do
+  @spec plan(tuple(), {MapSet.t(binary()), map()}) :: {binary(), [bound()]}
+  defp plan({:cmp, tokens}, {tags, _types} = ctx) do
     if Enum.any?(tokens, &match?({:ident, "time"}, &1)),
       do: time_plan(tokens, tags),
-      else: {tokens |> drop_unary_plus([]) |> rewrite(tags, []) |> Enum.join(" "), []}
+      else: {plain_or_typed(tokens, ctx), []}
   end
 
-  defp plan({:group, node}, tags) do
-    {sql, lowers} = plan(node, tags)
+  defp plan({:group, node}, ctx) do
+    {sql, lowers} = plan(node, ctx)
     {"(" <> sql <> ")", lowers}
   end
 
-  defp plan({:and, nodes}, tags), do: join_plans(nodes, " AND ", tags)
+  defp plan({:and, nodes}, ctx), do: join_plans(nodes, " AND ", ctx)
 
-  defp plan({:or, nodes}, tags) do
+  defp plan({:or, nodes}, ctx) do
     if Enum.any?(nodes, &mentions_time_node?/1),
       do: throw({:refused, "unsupported InfluxQL (a time comparison inside OR)"})
 
-    join_plans(nodes, " OR ", tags)
+    join_plans(nodes, " OR ", ctx)
   end
 
-  defp join_plans(nodes, separator, tags) do
-    {sqls, lowers} = nodes |> Enum.map(&plan(&1, tags)) |> Enum.unzip()
+  defp join_plans(nodes, separator, ctx) do
+    {sqls, lowers} = nodes |> Enum.map(&plan(&1, ctx)) |> Enum.unzip()
     {Enum.join(sqls, separator), Enum.concat(lowers)}
   end
 
   defp mentions_time_node?({:cmp, tokens}), do: Enum.any?(tokens, &match?({:ident, "time"}, &1))
   defp mentions_time_node?({:group, node}), do: mentions_time_node?(node)
   defp mentions_time_node?({_kind, nodes}), do: Enum.any?(nodes, &mentions_time_node?/1)
+
+  # ---------------------------------------------------------------------------
+  # Typed comparisons
+  #
+  # The engine compares a field with a literal by the field's type
+  # (verified, for every operator):
+  #
+  #   * a literal of another kind than the field (a boolean or string
+  #     against a number, a number against a boolean or string) is false for
+  #     every row, not an error
+  #   * an integer beyond the signed range (up to the unsigned) is an
+  #     unsigned literal: an integer field is compared as unsigned (a
+  #     negative value as 2^64 + value - 1, the lowest integer as null), an
+  #     unsigned or float field
+  #     as it is, a boolean field is the planning error "Cannot infer common
+  #     argument type"
+  #   * a negative integer against an unsigned field is 2^64 + n - 1
+  #     (`u > -1` is false for all but the largest)
+  #   * an unsigned field against a boolean is the same planning error;
+  #     against a string, a string field against a big integer and a tag
+  #     against a big integer, the engine compares as text: refused by name
+  #   * a bare field as the whole condition is a planning error (after the
+  #     LIMIT is checked) naming the field's type; inside `AND` / `OR` it is
+  #     refused
+  # ---------------------------------------------------------------------------
+
+  @typedoc "The type of a field, as the engine plans it."
+  @type field_type :: :integer | :unsigned | :float | :string | :boolean
+
+  @arrow_types %{
+    integer: "Int64",
+    unsigned: "UInt64",
+    float: "Float64",
+    string: "Utf8",
+    boolean: "Boolean",
+    tag: "Dictionary(Int32, Utf8)"
+  }
+
+  @comparison_ops ["=", "!=", "<>", "<", "<=", ">", ">="]
+  @flipped_ops %{
+    "=" => "=",
+    "!=" => "!=",
+    "<>" => "<>",
+    "<" => ">",
+    "<=" => ">=",
+    ">" => "<",
+    ">=" => "<="
+  }
+
+  # The SQL of a comparison tokens, typed when it is a field against a literal.
+  @spec plain_or_typed(list(), {MapSet.t(binary()), map()}) :: binary()
+  defp plain_or_typed(tokens, {tags, types}) do
+    case typed_comparison(tokens, tags, types) do
+      nil -> tokens |> drop_unary_plus([]) |> rewrite(tags, []) |> Enum.join(" ")
+      sql -> sql
+    end
+  end
+
+  @spec typed_comparison(list(), MapSet.t(binary()), map()) :: binary() | nil
+  defp typed_comparison(tokens, tags, types) do
+    with {name, op, literal, flipped?} <- comparison_parts(tokens),
+         type when type != nil <- field_kind(name, tags, types),
+         literal when literal != nil <- literal_kind(literal) do
+      op = if flipped?, do: Map.fetch!(@flipped_ops, op), else: op
+      typed_sql(type, literal, ident_sql(name), op, flipped?)
+    else
+      _untyped -> nil
+    end
+  end
+
+  @spec field_kind(binary(), MapSet.t(binary()), map()) :: atom() | nil
+  defp field_kind(name, tags, types) do
+    if MapSet.member?(tags, name), do: :tag, else: Map.get(types, name)
+  end
+
+  # `name op literal` and `literal op name`, the literal a number (signed),
+  # a boolean or a string.
+  @spec comparison_parts(list()) :: {binary(), binary(), list(), boolean()} | nil
+  defp comparison_parts([{:ident, name}, {:op, op} | literal]) when op in @comparison_ops,
+    do: {name, op, literal, false}
+
+  defp comparison_parts(tokens) when length(tokens) in [3, 4] do
+    case Enum.split(tokens, -2) do
+      {literal, [{:op, op}, {:ident, name}]} when op in @comparison_ops ->
+        {name, op, literal, true}
+
+      _other ->
+        nil
+    end
+  end
+
+  defp comparison_parts(_tokens), do: nil
+
+  @spec literal_kind(list()) ::
+          {:integer, integer()} | :float | :boolean | :string | :expression | nil
+  defp literal_kind([{:raw, sign}, {:number, _text} = number]) when sign in ["-", "+"],
+    do: signed_kind(sign, number)
+
+  defp literal_kind([{:number, _text} = number]), do: signed_kind("+", number)
+  defp literal_kind([{:str, _content}]), do: :string
+
+  defp literal_kind([{:raw, word}]) do
+    if String.upcase(word) in ["TRUE", "FALSE"], do: :boolean
+  end
+
+  defp literal_kind(tokens) do
+    if Enum.all?(tokens, &constant_token?/1), do: constant_kind(tokens)
+  end
+
+  defp constant_token?({:number, _text}), do: true
+  defp constant_token?({:raw, text}), do: text in ["+", "-", "*", "/", "(", ")"]
+  defp constant_token?(_token), do: false
+
+  # A constant of numbers, `+ - *` and parentheses is folded before it is
+  # compared, as the engine does; anything else numeric (`/`, an
+  # overflow) is `:expression`, which the caller refuses.
+  @spec constant_kind(list()) :: {:integer, integer()} | :float | :expression
+  defp constant_kind(tokens) do
+    case fold_sum(tokens) do
+      {value, []} when is_float(value) ->
+        :float
+
+      {value, []} when is_integer(value) and value >= -@max_signed - 1 and value <= @max_signed ->
+        {:integer, value}
+
+      _unfoldable ->
+        :expression
+    end
+  end
+
+  defp fold_sum(tokens) do
+    with {value, rest} <- fold_product(tokens),
+         do: fold_more(rest, value, ["+", "-"], &fold_product/1)
+  end
+
+  defp fold_product(tokens) do
+    with {value, rest} <- fold_factor(tokens), do: fold_more(rest, value, ["*"], &fold_factor/1)
+  end
+
+  defp fold_more([{:raw, op} | rest] = tokens, left, ops, next) do
+    if op in ops do
+      case next.(rest) do
+        {right, after_right} -> fold_more(after_right, apply_op(op, left, right), ops, next)
+        :error -> :error
+      end
+    else
+      {left, tokens}
+    end
+  end
+
+  defp fold_more(tokens, left, _ops, _next), do: {left, tokens}
+
+  defp apply_op("+", left, right), do: left + right
+  defp apply_op("-", left, right), do: left - right
+  defp apply_op("*", left, right), do: left * right
+
+  defp fold_factor([{:raw, "-"} | rest]) do
+    with {value, after_value} <- fold_factor(rest), do: {-value, after_value}
+  end
+
+  defp fold_factor([{:raw, "+"} | rest]), do: fold_factor(rest)
+
+  defp fold_factor([{:raw, "("} | rest]) do
+    case fold_sum(rest) do
+      {value, [{:raw, ")"} | after_group]} -> {value, after_group}
+      _unbalanced -> :error
+    end
+  end
+
+  defp fold_factor([{:number, text} | rest]) do
+    case Integer.parse(text) do
+      {n, ""} -> {n, rest}
+      _fraction -> {text |> number_text() |> String.to_float(), rest}
+    end
+  end
+
+  defp fold_factor(_tokens), do: :error
+
+  defp number_text("." <> _fraction = text), do: "0" <> text
+  defp number_text(text), do: text
+
+  defp signed_kind(sign, {:number, text}) do
+    case Integer.parse(text) do
+      {n, ""} -> {:integer, if(sign == "-", do: -n, else: n)}
+      _fraction -> :float
+    end
+  end
+
+  # The SQL for a field of `type` against `literal`, or `nil` to leave the
+  # comparison as written.
+  @spec typed_sql(atom(), term(), binary(), binary(), boolean()) :: binary() | nil
+  defp typed_sql(type, literal, column, op, flipped?) do
+    case decide(type, literal, op) do
+      :plain -> nil
+      :never -> "(#{column} IS NULL AND #{column} IS NOT NULL)"
+      {:unsigned, n} -> "#{column} #{op} #{n}"
+      :wrap -> wrapped_sql(column, op, literal)
+      :mismatch -> mismatch(type, literal, op, flipped?)
+      :refuse -> throw({:refused, "unsupported InfluxQL (#{refusal(type, literal)})"})
+    end
+  end
+
+  # Booleans and strings have equality only: an ordering is false for all.
+  @spec decide(atom(), term(), binary()) ::
+          :plain | :never | :wrap | :mismatch | :refuse | {:unsigned, non_neg_integer()}
+  defp decide(type, kind, op) when type in [:boolean, :string] and op in ["<", "<=", ">", ">="] do
+    if decide(type, kind, "=") == :plain, do: :never, else: decide(type, kind, "=")
+  end
+
+  defp decide(:float, :expression, _op), do: :plain
+  defp decide(_type, :expression, _op), do: :refuse
+  defp decide(:integer, {:integer, n}, _op) when n > @max_signed, do: :wrap
+  defp decide(:integer, kind, _op) when kind == :float or is_tuple(kind), do: :plain
+  defp decide(:float, kind, _op) when kind == :float or is_tuple(kind), do: :plain
+
+  defp decide(:unsigned, {:integer, n}, _op) when n == -9_223_372_036_854_775_808,
+    do: :refuse
+
+  defp decide(:unsigned, {:integer, n}, _op) when n < 0,
+    do: {:unsigned, n + 18_446_744_073_709_551_615}
+
+  defp decide(:unsigned, kind, _op) when kind == :float or is_tuple(kind), do: :plain
+  defp decide(:unsigned, :boolean, _op), do: :mismatch
+  defp decide(:unsigned, :string, _op), do: :refuse
+  defp decide(:boolean, :boolean, _op), do: :plain
+  defp decide(:boolean, {:integer, n}, _op) when n > @max_signed, do: :mismatch
+  defp decide(:string, :string, _op), do: :plain
+  defp decide(:string, {:integer, n}, _op) when n > @max_signed, do: :refuse
+  defp decide(:tag, {:integer, n}, _op) when n > @max_signed, do: :refuse
+  defp decide(:tag, :string, _op), do: :plain
+  defp decide(_type, _literal, _op), do: :never
+
+  # An integer field against an unsigned literal `n` (verified): a
+  # non-negative value is itself, a negative one `2^64 + value - 1`, and the
+  # lowest 64-bit integer is null. With `m = n - 2^64 + 1` (negative) a
+  # negative value therefore compares as `value` against `m`, a non-negative
+  # one is below `n`.
+  @spec wrapped_sql(binary(), binary(), {:integer, integer()}) :: binary()
+  defp wrapped_sql(column, op, {:integer, n}) do
+    m = n - 18_446_744_073_709_551_615
+
+    negative =
+      "(#{column} < 0 AND #{column} > -9223372036854775808 AND #{column} #{op} #{m})"
+
+    if op in ["=", ">", ">="], do: negative, else: "(#{column} >= 0 OR #{negative})"
+  end
+
+  @spec mismatch(atom(), term(), binary(), boolean()) :: no_return()
+  defp mismatch(type, literal, op, flipped?) do
+    field = Map.fetch!(@arrow_types, type)
+    other = if literal == :boolean, do: "Boolean", else: "UInt64"
+    {left, right} = if flipped?, do: {other, field}, else: {field, other}
+    op = if flipped?, do: Map.fetch!(@flipped_ops, op), else: op
+    op = if op == "<>", do: "!=", else: op
+
+    throw(
+      {:refused,
+       {:engine,
+        "Error during planning: Cannot infer common argument type for comparison " <>
+          "operation #{left} #{op} #{right}"}}
+    )
+  end
+
+  @spec refusal(atom(), term()) :: binary()
+  defp refusal(_type, :expression), do: "a field compared with a constant expression"
+  defp refusal(:unsigned, :string), do: "an unsigned field compared with a string"
+
+  defp refusal(:unsigned, _literal),
+    do: "an unsigned field compared with the lowest 64-bit integer"
+
+  defp refusal(_type, _literal), do: "a string compared with an integer beyond 64 bits signed"
+
+  # A bare field (or tag) as the whole condition: the engine's planning
+  # error, raised after the LIMIT. Inside `AND` / `OR` it is refused.
+  @spec bare_condition(tuple(), {MapSet.t(binary()), map()}) :: binary() | nil
+  defp bare_condition({:group, node}, ctx), do: bare_condition(node, ctx)
+
+  defp bare_condition({:cmp, tokens}, {tags, types}) do
+    case tokens |> strip_parens() |> bare_field(tags, types) do
+      nil -> nil
+      :boolean -> nil
+      type -> bare_error(type)
+    end
+  end
+
+  defp bare_condition({kind, nodes}, ctx) when kind in [:and, :or] do
+    if Enum.any?(nodes, &bare_member?(&1, ctx)),
+      do: throw({:refused, "unsupported InfluxQL (a bare non-boolean field inside AND/OR)"})
+
+    nil
+  end
+
+  defp bare_condition(_node, _ctx), do: nil
+
+  @spec bare_field(list(), MapSet.t(binary()), map()) :: atom() | nil
+  defp bare_field([{:ident, name}], tags, types), do: field_kind(name, tags, types)
+  defp bare_field(_tokens, _tags, _types), do: nil
+
+  @spec strip_parens(list()) :: list()
+  defp strip_parens([{:raw, "("} | rest] = tokens) do
+    case Enum.split(rest, -1) do
+      {inside, [{:raw, ")"}]} -> strip_parens(inside)
+      _other -> tokens
+    end
+  end
+
+  defp strip_parens(tokens), do: tokens
+
+  defp bare_member?({:group, node}, ctx), do: bare_member?(node, ctx)
+
+  defp bare_member?({:cmp, tokens}, {tags, types}),
+    do: bare_field(strip_parens(tokens), tags, types) not in [nil, :boolean]
+
+  defp bare_member?({kind, nodes}, ctx) when kind in [:and, :or],
+    do: Enum.any?(nodes, &bare_member?(&1, ctx))
+
+  defp bare_member?(_node, _ctx), do: false
+
+  @spec bare_error(atom()) :: binary()
+  defp bare_error(type) do
+    "type_coercion\ncaused by\nError during planning: Cannot infer common argument type " <>
+      "for logical boolean operation Boolean AND #{Map.fetch!(@arrow_types, type)}"
+  end
 
   # A comparison with `time` on one side and a time on the other.
   @flipped %{"=" => "=", "<" => ">", "<=" => ">=", ">" => "<", ">=" => "<="}
@@ -1160,9 +2035,15 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   defp token_sql({:number, text}), do: text
   defp token_sql({:duration, ns, text}), do: duration_sql(ns, text)
 
+  # Words the SQL the double hands on reads as keywords, though InfluxQL
+  # takes them as names.
+  @sql_words ~w(not is like ilike between case when then else exists)
+
   @spec ident_sql(binary()) :: binary()
   defp ident_sql(name) do
-    if Regex.match?(~r/^[A-Za-z_]\w*$/, name), do: name, else: ~s("#{name}")
+    if Regex.match?(~r/^[A-Za-z_]\w*$/, name) and String.downcase(name) not in @sql_words,
+      do: name,
+      else: ~s("#{name}")
   end
 
   # False for every row, in the SQL the caller's engine reads.

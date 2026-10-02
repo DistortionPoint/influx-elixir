@@ -18,6 +18,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
     SQLError,
     SQLExpr,
     SQLLimit,
+    SQLLimits,
     SQLLiteral,
     SQLMask,
     SQLSelect,
@@ -29,6 +30,8 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
 
   @typedoc "`ORDER BY` terms in order; a target is `time`, a column, an output alias or an expression."
   @type order_by :: [{binary() | {:expr, SQLExpr.t()}, direction()}]
+
+  require SQLLimits
 
   @limit_start SQLLimit.start_source()
 
@@ -131,12 +134,57 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
         nil -> {term, ""}
       end
 
-    case positional(target, items) do
-      {:ok, {_expr, name}} -> {:ok, identifier_text(name) <> direction}
-      :not_positional -> {:ok, aggregate_term(target, items, direction) || term}
-      error -> error
+    case order_position(target, length(items)) do
+      {:ok, position} ->
+        {_expr, name} = Enum.at(items, position - 1)
+        {:ok, identifier_text(name) <> direction}
+
+      :not_positional ->
+        {:ok, aggregate_term(target, items, direction) || term}
+
+      {:error, _reason} = error ->
+        error
     end
   end
+
+  @float_term ~r/\A(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+(?:\.[0-9]*)?[eE][+-]?[0-9]+)\z/
+
+  @doc """
+  How an `ORDER BY` term reads as a position among `count` select items
+  (verified against InfluxDB 3 Core): a whole number from 1 to `count` is
+  that position; 0, a position past `count` and one past `UInt64` are the
+  engine's planning errors, and so is a number with a fraction or an
+  exponent. Anything else is not a position.
+  """
+  @spec order_position(binary(), non_neg_integer()) ::
+          {:ok, pos_integer()} | :not_positional | {:error, SQLError.t()}
+  def order_position(term, count) do
+    cond do
+      Regex.match?(~r/\A[0-9]+\z/, term) ->
+        checked_position(String.to_integer(term), count)
+
+      Regex.match?(@float_term, term) ->
+        {:error, SQLError.planning("invalid digit found in string")}
+
+      true ->
+        :not_positional
+    end
+  end
+
+  @spec checked_position(non_neg_integer(), non_neg_integer()) ::
+          {:ok, pos_integer()} | {:error, SQLError.t()}
+  defp checked_position(0, _count),
+    do: {:error, SQLError.planning("Order by index starts at 1 for column indexes")}
+
+  defp checked_position(position, _count) when position > SQLLimits.uint64_max(),
+    do: {:error, SQLError.planning("number too large to fit in target type")}
+
+  defp checked_position(position, count) when position > count do
+    {:error,
+     SQLError.planning("Order by column out of bounds, specified: #{position}, max: #{count}")}
+  end
+
+  defp checked_position(position, _count), do: {:ok, position}
 
   # An aggregate in ORDER BY that the select list also holds is that item
   # (`ORDER BY sum(v)` after `sum(v) AS total` sorts by `total`).
@@ -273,8 +321,9 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   The `ORDER BY a [ASC|DESC][, b [ASC|DESC] ...]` terms of the text after
   the table. A target may be a column, `time`, an output alias (the
   `DATE_BIN` alias, say) or an expression (`CAST(level AS INTEGER) DESC`); a
-  target the expression parser cannot read is left as a column name so the
-  schema check names it. The direction defaults to ascending, as in SQL.
+  target the expression parser cannot read is `{:expr, {:unreadable, text}}`,
+  which `unreadable_order/1` refuses by name. The direction defaults to
+  ascending, as in SQL.
   """
   @spec order_by(binary()) :: order_by()
   def order_by(rest) do
@@ -319,11 +368,28 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
     end
   end
 
-  @spec order_expression(binary()) :: binary() | {:expr, SQLExpr.t()}
+  @spec order_expression(binary()) :: {:expr, SQLExpr.t()}
   defp order_expression(target) do
     case SQLExpr.parse(target) do
       {:ok, expr} -> {:expr, expr}
-      {:error, _reason} -> target
+      {:error, _reason} -> {:expr, {:unreadable, target}}
+    end
+  end
+
+  @doc """
+  The refusal of an `ORDER BY` term the double cannot read (a function it
+  does not have, a type it does not model: `CAST(x AS FLOAT)`), or `:ok`. The
+  engine answers it with rows or an error of its own; naming it a column, as
+  a schema error would, answers neither.
+  """
+  @spec unreadable_order(order_by()) :: :ok | {:error, SQLError.t()}
+  def unreadable_order(order_by) do
+    case Enum.find(order_by, &match?({{:expr, {:unreadable, _text}}, _direction}, &1)) do
+      {{:expr, {:unreadable, text}}, _direction} ->
+        {:error, SQLError.refusal("unsupported ORDER BY: #{text}")}
+
+      nil ->
+        :ok
     end
   end
 

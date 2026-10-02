@@ -96,7 +96,8 @@ defmodule InfluxElixir.TelemetryTest do
         Telemetry.span_write(metadata, fn -> raise "oops" end)
       end
 
-      refute_receive {:telemetry, [:influx_elixir, :write, :stop], _, _}
+      # Handlers run in the caller, so the event would already be in the mailbox.
+      refute_received {:telemetry, [:influx_elixir, :write, :stop], _, _}
     end
   end
 
@@ -159,7 +160,8 @@ defmodule InfluxElixir.TelemetryTest do
         Telemetry.span_query(metadata, fn -> raise "fail" end)
       end
 
-      refute_receive {:telemetry, [:influx_elixir, :query, :stop], _, _}
+      # Handlers run in the caller, so the event would already be in the mailbox.
+      refute_received {:telemetry, [:influx_elixir, :query, :stop], _, _}
     end
   end
 

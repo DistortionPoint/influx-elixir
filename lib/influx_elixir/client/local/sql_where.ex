@@ -22,6 +22,7 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
     SQLLimit,
     SQLLiteral,
     SQLMask,
+    SQLNumber,
     SQLTime
   }
 
@@ -43,6 +44,7 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
           | :not_like
           | :regex
           | :not_regex
+          | :time_type_error
 
   @typedoc "A predicate: operator, left operand, right side."
   @type clause :: {op(), binary() | {:expr, SQLExpr.t()}, term()}
@@ -301,7 +303,11 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
 
   @spec in_clause(:in | :not_in, [term()]) :: {:ok, clause()} | {:error, map()}
   defp in_clause(op, [key, list_str]) do
-    with {:ok, values} <- parse_in_values(key, list_str), do: {:ok, {op, key, values}}
+    case parse_in_values(key, list_str) do
+      {:ok, values} -> {:ok, {op, key, values}}
+      {:type_error, error} -> {:ok, {:time_type_error, "time", error}}
+      {:error, _reason} = error -> error
+    end
   end
 
   @spec between_predicate(binary()) :: {:ok, clause()} | {:error, map()} | :nomatch
@@ -427,7 +433,7 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
 
     if SQLTime.param_bound?(low) or SQLTime.param_bound?(high),
       do: {:ok, {op, "time", {low, high}}},
-      else: SQLTime.between(op, low, high)
+      else: op |> SQLTime.between(low, high) |> deferred()
   end
 
   # Each bound is a comparand: a literal, NULL (the comparison is unknown),
@@ -532,7 +538,7 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
         {:ok, {op, "time", value}}
 
       {:error, {:number, type}} ->
-        {:error, SQLTime.comparison_type_error("Timestamp(ns)", text, type)}
+        {:ok, deferred_clause(SQLTime.comparison_type_error("Timestamp(ns)", text, type))}
 
       {:error, _reason} = error ->
         error
@@ -550,7 +556,7 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
       {:ok, {mirror(op), "time", on_the_left(value)}}
     else
       {:error, {:number, type}} ->
-        {:error, SQLTime.comparison_type_error(type, text, "Timestamp(ns)")}
+        {:ok, deferred_clause(SQLTime.comparison_type_error(type, text, "Timestamp(ns)"))}
 
       false ->
         {:error, SQLError.refusal("unsupported WHERE clause: #{trimmed}")}
@@ -635,21 +641,53 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   @spec constant_comparison(op(), binary(), binary(), binary()) ::
           {:ok, :always | :never} | {:error, map()}
   defp constant_comparison(op, left, right, trimmed) do
-    {l, r} = {SQLLiteral.value(left), SQLLiteral.value(right)}
+    {l, r} = {constant_value(left), constant_value(right)}
 
-    if (is_number(l) and is_number(r)) or (is_binary(l) and is_binary(r)) or
+    if (SQLNumber.numeric?(l) and SQLNumber.numeric?(r)) or (is_binary(l) and is_binary(r)) or
          (is_boolean(l) and is_boolean(r)),
        do: {:ok, if(compare_constants(op, l, r), do: :always, else: :never)},
        else: unsupported_where(trimmed)
   end
 
+  # A literal's value; a number past the range of a double is an infinity.
+  @spec constant_value(binary()) :: term()
+  defp constant_value(text) do
+    case SQLLiteral.value(text) do
+      value when is_binary(value) ->
+        cond do
+          SQLLiteral.string?(text) -> value
+          SQLLiteral.float?(text) and String.starts_with?(text, "-") -> :neg_inf
+          SQLLiteral.float?(text) -> :inf
+          true -> value
+        end
+
+      value ->
+        value
+    end
+  end
+
   @spec compare_constants(op(), term(), term()) :: boolean()
-  defp compare_constants(:eq, l, r), do: l == r
-  defp compare_constants(:ne, l, r), do: l != r
-  defp compare_constants(:gt, l, r), do: l > r
-  defp compare_constants(:lt, l, r), do: l < r
-  defp compare_constants(:gte, l, r), do: l >= r
-  defp compare_constants(:lte, l, r), do: l <= r
+  defp compare_constants(op, l, r) do
+    if SQLNumber.numeric?(l) and SQLNumber.numeric?(r),
+      do: ordered(op, SQLNumber.compare(l, r)),
+      else: compare_values(op, l, r)
+  end
+
+  @spec ordered(op(), :lt | :eq | :gt) :: boolean()
+  defp ordered(:eq, order), do: order == :eq
+  defp ordered(:ne, order), do: order != :eq
+  defp ordered(:gt, order), do: order == :gt
+  defp ordered(:lt, order), do: order == :lt
+  defp ordered(:gte, order), do: order != :lt
+  defp ordered(:lte, order), do: order != :gt
+
+  @spec compare_values(op(), term(), term()) :: boolean()
+  defp compare_values(:eq, l, r), do: l == r
+  defp compare_values(:ne, l, r), do: l != r
+  defp compare_values(:gt, l, r), do: l > r
+  defp compare_values(:lt, l, r), do: l < r
+  defp compare_values(:gte, l, r), do: l >= r
+  defp compare_values(:lte, l, r), do: l <= r
 
   @spec comparison(op(), binary(), binary()) :: {:ok, clause()} | {:error, map()}
   defp comparison(op, operand, comparand) do
@@ -725,7 +763,8 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
     end
   end
 
-  @spec parse_in_values(binary(), binary()) :: {:ok, [term()]} | {:error, map()}
+  @spec parse_in_values(binary(), binary()) ::
+          {:ok, [term()]} | {:error, map()} | {:type_error, map()}
   defp parse_in_values(key, str) do
     items =
       str
@@ -754,12 +793,31 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
     end
   end
 
-  @spec parse_time_set([binary()]) :: {:ok, [SQLTime.bound()]} | {:error, map()}
+  @spec parse_time_set([binary()]) :: {:ok, [SQLTime.bound()]} | {:type_error, map()}
   defp parse_time_set(items) do
     bounds = Enum.map(items, &(&1 |> SQLTime.comparand() |> SQLTime.bound()))
 
-    if Enum.any?(bounds, &SQLTime.param_bound?/1),
-      do: {:ok, bounds},
-      else: SQLTime.in_list(bounds)
+    if Enum.any?(bounds, &SQLTime.param_bound?/1) do
+      {:ok, bounds}
+    else
+      case SQLTime.in_list(bounds) do
+        {:error, error} -> {:type_error, error}
+        ok -> ok
+      end
+    end
   end
+
+  # The planner finds a `time` compared with a number when it types the
+  # query, after it has found the columns, so the clause is kept to be
+  # raised then (see `InfluxElixir.Client.Local.SQLPlan`).
+  @doc """
+  A type error found in a `time` clause, kept as a clause for the planner to
+  raise when it types the query.
+  """
+  @spec deferred_clause(SQLError.t()) :: clause()
+  def deferred_clause(error), do: {:time_type_error, "time", error}
+
+  @spec deferred({:ok, clause()} | {:error, SQLError.t()}) :: {:ok, clause()}
+  defp deferred({:error, error}), do: {:ok, deferred_clause(error)}
+  defp deferred({:ok, _clause} = ok), do: ok
 end

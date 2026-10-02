@@ -694,6 +694,15 @@ A `time` range that is empty in the top-level `AND` (`time > X AND time < X`,
 on time column did not produce a valid set of boundaries", not an empty
 result.
 
+The same holds for a numeric field: when the top-level `AND` bounds a bare
+`Int64`, `UInt64` or `Float64` column to no value (`v > 1 AND v < 1`,
+`v BETWEEN 2 AND 1`, `u < 0` on an unsigned field), the engine fails with
+DataFusion's HTTP 500 "Only intervals with the same data type are
+comparable", and so does `Client.Local`. Any `OR`, a string or tag column,
+or an arithmetic expression keeps the query answering. Shapes whose error
+text the engine does not choose consistently are refused by name. InfluxQL
+answers `[]` for these, as the engine does.
+
 ## WHERE Clauses
 
 Predicates are `=`, `!=` / `<>`, `<`, `<=`, `>`, `>=`, `IN (...)`,
@@ -735,7 +744,9 @@ rejected.
 A tag is always a string, so `level <= 20` compares text (`"100"` sorts
 before `"20"`). Cast it, as you would on the server, wherever an expression
 is allowed — `WHERE`, `BETWEEN`, `LIKE`, projections, aggregates and
-`ORDER BY`; `col::INTEGER` is the same as `CAST(col AS INTEGER)`:
+`ORDER BY`; `col::INTEGER` is the same as `CAST(col AS INTEGER)`. Note
+that, as on the engine, `INTEGER` is a 32-bit integer: use `BIGINT` for
+values past 2,147,483,647, or arithmetic that may leave that range:
 
 ```elixir
 sql = """

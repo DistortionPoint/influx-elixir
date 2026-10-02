@@ -390,7 +390,7 @@ defmodule InfluxElixir.Write.LineProtocolTest do
     test "float precision round-trips exactly" do
       value = 123_456_789.123456789
       assert {:ok, "cpu v=" <> encoded} = LineProtocol.encode(Point.new("cpu", %{"v" => value}))
-      assert String.to_float(encoded) == value
+      assert String.to_float(encoded) === value
     end
   end
 

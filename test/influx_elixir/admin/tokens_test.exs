@@ -12,9 +12,22 @@ defmodule InfluxElixir.Admin.TokensTest do
     {:ok, conn: conn}
   end
 
+  # The secret, its hash and the creation time are generated, so they are
+  # checked for being there and taken out; the rest is compared whole.
+  defp public(
+         {:ok,
+          %{"token" => "apiv3_" <> _secret, "hash" => hash, "created_at" => created_at} = token}
+       )
+       when is_binary(hash) and is_binary(created_at),
+       do: {:ok, Map.drop(token, ["token", "hash", "created_at"])}
+
+  defp public(other), do: other
+
   describe "create/3 and delete/2" do
     test "create a token by name, then delete it by that name", %{conn: conn} do
-      assert {:ok, %{"id" => 1, "name" => "ci", "expiry" => nil}} = Tokens.create(conn, "ci")
+      assert conn |> Tokens.create("ci") |> public() ===
+               {:ok, %{"id" => 1, "name" => "ci", "expiry" => nil}}
+
       assert :ok = Tokens.delete(conn, "ci")
 
       assert {:error, %{status: 404, body: "the requested resource was not found: ci"}} =
@@ -22,8 +35,8 @@ defmodule InfluxElixir.Admin.TokensTest do
     end
 
     test "permissions make a resource token on Enterprise", %{conn: conn} do
-      assert {:ok, %{"name" => "reader"}} =
-               Tokens.create(conn, "reader", permissions: ["db:metrics:read"])
+      assert conn |> Tokens.create("reader", permissions: ["db:metrics:read"]) |> public() ===
+               {:ok, %{"id" => 1, "name" => "reader", "expiry" => nil}}
     end
 
     test "a permission in another form is refused before any request", %{conn: conn} do
@@ -33,7 +46,8 @@ defmodule InfluxElixir.Admin.TokensTest do
       end
 
       # Nothing was created, so the name is still free.
-      assert {:ok, %{"name" => "bad"}} = Tokens.create(conn, "bad")
+      assert conn |> Tokens.create("bad") |> public() ===
+               {:ok, %{"id" => 1, "name" => "bad", "expiry" => nil}}
     end
 
     test "a connection name resolves through the facade" do
@@ -41,7 +55,9 @@ defmodule InfluxElixir.Admin.TokensTest do
       {:ok, _pid} = InfluxElixir.add_connection(name, profile: :v3_core)
       on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
-      assert {:ok, %{"name" => "named"}} = Tokens.create(name, "named")
+      assert name |> Tokens.create("named") |> public() ===
+               {:ok, %{"id" => 1, "name" => "named", "expiry" => nil}}
+
       assert :ok = Tokens.delete(name, "named")
     end
   end

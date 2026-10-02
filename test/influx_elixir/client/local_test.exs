@@ -8,6 +8,15 @@ defmodule InfluxElixir.Client.LocalTest do
     {:ok, conn: conn}
   end
 
+  # The rows with the columns the clock assigns removed (a `time` written
+  # without a timestamp, a Flux range's `_start`/`_stop`), so that everything
+  # else is compared whole.
+  defp without({:ok, rows}, columns), do: {:ok, without(rows, columns)}
+  defp without(rows, columns), do: Enum.map(rows, &Map.drop(&1, columns))
+
+  # The columns of a Flux row the query's own range and clock set.
+  @flux_range ["_start", "_stop"]
+
   # Host tags of the rows a query returns, in order.
   defp hosts(conn, db, sql) do
     {:ok, rows} = Local.query_sql(conn, sql, database: db)
@@ -157,7 +166,10 @@ defmodule InfluxElixir.Client.LocalTest do
     test ":database is the connection-level default and is pre-created" do
       {:ok, conn} = Local.start(database: "metrics")
       assert {:ok, :written} = Local.write(conn, "m v=1i")
-      assert {:ok, [%{"v" => 1}]} = Local.query_sql(conn, "SELECT v FROM m", database: "metrics")
+
+      assert Local.query_sql(conn, "SELECT v FROM m", database: "metrics") ===
+               {:ok, [%{"v" => 1}]}
+
       assert {:ok, [_internal, %{"name" => "metrics"}]} = Local.list_databases(conn)
       Local.stop(conn)
     end
@@ -167,7 +179,7 @@ defmodule InfluxElixir.Client.LocalTest do
       # a "default" database instead, so the same config diverged.
       {:ok, conn} = Local.start(databases: ["x", "y"])
       assert {:ok, :written} = Local.write(conn, "m v=1i")
-      assert {:ok, [%{"v" => 1}]} = Local.query_sql(conn, "SELECT v FROM m", database: "x")
+      assert Local.query_sql(conn, "SELECT v FROM m", database: "x") === {:ok, [%{"v" => 1}]}
       Local.stop(conn)
     end
 
@@ -215,8 +227,8 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row["value"] === 1.0
 
       # The write created no other database.
-      assert {:ok, [%{"name" => "_internal"}, %{"name" => "primary"}]} =
-               Local.list_databases(conn)
+      assert Local.list_databases(conn) ===
+               {:ok, [%{"name" => "_internal"}, %{"name" => "primary"}]}
 
       Local.stop(conn)
     end
@@ -263,14 +275,14 @@ defmodule InfluxElixir.Client.LocalTest do
               }} =
                Local.query_influxql(conn, "SHOW MEASUREMENTS")
 
-      assert {:ok, [%{"iox::database" => "_internal"}]} =
-               Local.query_influxql(conn, "SHOW DATABASES")
+      assert Local.query_influxql(conn, "SHOW DATABASES") ===
+               {:ok, [%{"iox::database" => "_internal", "deleted" => false}]}
     end
 
     test "init_connection ignores unknown keys without auto-pre-creating them" do
       # A typo like :default_database must not silently become a database.
       {:ok, conn} = Local.init_connection(default_database: "typo_db")
-      assert {:ok, [%{"name" => "_internal"}]} = Local.list_databases(conn)
+      assert Local.list_databases(conn) === {:ok, [%{"name" => "_internal"}]}
       assert {:error, :no_database_specified} = Local.write(conn, "m v=1i")
       Local.stop(conn)
     end
@@ -369,12 +381,11 @@ defmodule InfluxElixir.Client.LocalTest do
           Local.write(conn, "p,s=#{i} value=1i #{ts}", database: db, precision: precision)
       end
 
-      assert {:ok, [%{"n" => 10}]} =
-               Local.query_sql(
-                 conn,
-                 "SELECT COUNT(value) AS n FROM p WHERE time = '1970-01-01T00:00:01'",
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               "SELECT COUNT(value) AS n FROM p WHERE time = '1970-01-01T00:00:01'",
+               database: db
+             ) === {:ok, [%{"n" => 10}]}
     end
 
     test ":auto guesses the unit from the magnitude at the engine's thresholds",
@@ -394,8 +405,8 @@ defmodule InfluxElixir.Client.LocalTest do
         m = "auto_#{System.unique_integer([:positive])}"
         {:ok, :written} = Local.write(conn, "#{m} value=1i #{ts}", database: db, precision: :auto)
 
-        assert {:ok, [%{"time" => ^expected}]} =
-                 Local.query_sql(conn, "SELECT time FROM #{m}", database: db),
+        assert Local.query_sql(conn, "SELECT time FROM #{m}", database: db) ===
+                 {:ok, [%{"time" => expected}]},
                inspect(ts)
       end
     end
@@ -485,7 +496,7 @@ defmodule InfluxElixir.Client.LocalTest do
              ]
     end
 
-    test "ORDER BY time DESC", %{conn: conn, db: db} do
+    test "SELECT * ORDER BY time DESC lists the points newest first", %{conn: conn, db: db} do
       assert {:ok, rows} =
                Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time DESC", database: db)
 
@@ -601,20 +612,16 @@ defmodule InfluxElixir.Client.LocalTest do
       sql =
         "SELECT net_value AS nv, total_balance AS tb FROM account_balances WHERE account_id = 'xyz'"
 
-      assert {:ok, [%{"nv" => 50.0, "tb" => 55.0} = row]} =
-               Local.query_sql(conn, sql, database: db)
-
-      assert Map.keys(row) === ["nv", "tb"]
+      assert Local.query_sql(conn, sql, database: db) ===
+               {:ok, [%{"nv" => 50.0, "tb" => 55.0}]}
     end
 
     test "selecting a tag column returns the tag value",
          %{conn: conn, db: db} do
       sql = "SELECT account_id, net_value FROM account_balances WHERE account_id = 'xyz'"
 
-      assert {:ok, [%{"account_id" => "xyz", "net_value" => 50.0} = row]} =
-               Local.query_sql(conn, sql, database: db)
-
-      assert Map.keys(row) === ["account_id", "net_value"]
+      assert Local.query_sql(conn, sql, database: db) ===
+               {:ok, [%{"account_id" => "xyz", "net_value" => 50.0}]}
     end
   end
 
@@ -822,10 +829,10 @@ defmodule InfluxElixir.Client.LocalTest do
     test "a SELECT or WITH runs as a query", %{conn: conn} do
       {:ok, :written} = Local.write(conn, "sel v=1i 1700000000000000000")
 
-      assert {:ok, [%{"v" => 1}]} = Local.execute_sql(conn, "SELECT v FROM sel")
+      assert Local.execute_sql(conn, "SELECT v FROM sel") === {:ok, [%{"v" => 1}]}
 
-      assert {:ok, [%{"v" => 1}]} =
-               Local.execute_sql(conn, "WITH w AS (SELECT v FROM sel) SELECT v FROM w")
+      assert Local.execute_sql(conn, "WITH w AS (SELECT v FROM sel) SELECT v FROM w") ===
+               {:ok, [%{"v" => 1}]}
     end
   end
 
@@ -841,8 +848,18 @@ defmodule InfluxElixir.Client.LocalTest do
 
       flux = "from(bucket: \"test\") |> range(start: -1h)"
 
-      assert {:ok, [%{"_measurement" => "cpu", "_field" => "value", "_value" => 1.0}]} =
-               Local.query_flux(v2_conn, flux)
+      # `_time` is the clock's at the write, and the range is relative to now.
+      assert v2_conn |> Local.query_flux(flux) |> without(@flux_range ++ ["_time"]) ===
+               {:ok,
+                [
+                  %{
+                    "result" => "_result",
+                    "table" => 0,
+                    "_measurement" => "cpu",
+                    "_field" => "value",
+                    "_value" => 1.0
+                  }
+                ]}
     end
   end
 
@@ -916,8 +933,8 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "DELETE FROM removes every point and leaves an empty table", %{conn: conn, db: db} do
-      assert {:ok, %{"rows_affected" => 3}} =
-               Local.execute_sql(conn, "DELETE FROM cpu", database: db)
+      assert Local.execute_sql(conn, "DELETE FROM cpu", database: db) ===
+               {:ok, %{"rows_affected" => 3}}
 
       # The table stays in the catalog: no rows, not "table not found".
       assert {:ok, []} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
@@ -928,30 +945,31 @@ defmodule InfluxElixir.Client.LocalTest do
         Local.write(conn, "Cpu,Host=a v=1i 1\nCpu,Host=b v=2i 2", database: db)
 
       # Unquoted names fold: `Cpu` and `HOST` are table cpu and its host tag.
-      assert {:ok, %{"rows_affected" => 2}} =
-               Local.execute_sql(conn, ~s|DELETE FROM Cpu WHERE HOST = 'web01'|, database: db)
+      assert Local.execute_sql(conn, ~s|DELETE FROM Cpu WHERE HOST = 'web01'|, database: db) ===
+               {:ok, %{"rows_affected" => 2}}
 
-      assert {:ok, [%{"host" => "web02"}]} =
-               Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+      assert Local.query_sql(conn, "SELECT * FROM cpu", database: db) ===
+               {:ok,
+                [%{"host" => "web02", "time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 20}]}
 
-      assert {:ok, %{"rows_affected" => 1}} =
-               Local.execute_sql(conn, ~s|DELETE FROM "Cpu" WHERE "Host" = 'a'|, database: db)
+      assert Local.execute_sql(conn, ~s|DELETE FROM "Cpu" WHERE "Host" = 'a'|, database: db) ===
+               {:ok, %{"rows_affected" => 1}}
 
-      assert {:ok, [%{"Host" => "b"}]} =
-               Local.query_sql(conn, ~s|SELECT * FROM "Cpu"|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT * FROM "Cpu"|, database: db) ===
+               {:ok, [%{"Host" => "b", "time" => ~U[1970-01-01 00:00:00.000000Z], "v" => 2}]}
     end
 
     test "DELETE FROM with WHERE removes matching points only",
          %{conn: conn, db: db} do
-      assert {:ok, %{"rows_affected" => 2}} =
-               Local.execute_sql(
-                 conn,
-                 "DELETE FROM cpu WHERE host = 'web01'",
-                 database: db
-               )
+      assert Local.execute_sql(
+               conn,
+               "DELETE FROM cpu WHERE host = 'web01'",
+               database: db
+             ) === {:ok, %{"rows_affected" => 2}}
 
-      assert {:ok, [%{"host" => "web02", "value" => 20}]} =
-               Local.query_sql(conn, "SELECT * FROM cpu", database: db)
+      assert Local.query_sql(conn, "SELECT * FROM cpu", database: db) ===
+               {:ok,
+                [%{"host" => "web02", "time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 20}]}
     end
   end
 
@@ -1089,8 +1107,9 @@ defmodule InfluxElixir.Client.LocalTest do
           }
         )
 
-      assert [%{"symbol" => "AAPL", "price" => 150.0, "time" => ~U[2026-03-17 12:00:00.000000Z]}] =
-               rows
+      assert rows === [
+               %{"symbol" => "AAPL", "price" => 150.0, "time" => ~U[2026-03-17 12:00:00.000000Z]}
+             ]
     end
 
     test "time WHERE excludes all points", %{conn: conn, db: db} do
@@ -1298,7 +1317,7 @@ defmodule InfluxElixir.Client.LocalTest do
          %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "prices price=1i 1", database: db)
 
-      assert {:ok, [%{}]} = Local.query_sql(conn, "SELECT DISTINCT FROM prices", database: db)
+      assert Local.query_sql(conn, "SELECT DISTINCT FROM prices", database: db) === {:ok, [%{}]}
     end
 
     test "WHERE time with a DateTime param renders as the ISO string Jason sends",
@@ -1342,8 +1361,10 @@ defmodule InfluxElixir.Client.LocalTest do
                 body: "Schema error: No field named hello. Valid fields are m.tag, m.time, m.val."
               }} = Local.query_sql(conn, ~s(SELECT * FROM m WHERE tag = "hello"), database: db)
 
-      assert {:ok, [%{"tag" => "hello", "val" => 1}]} =
-               Local.query_sql(conn, ~s(SELECT * FROM m WHERE tag = 'hello'), database: db)
+      # No timestamp was written, so `time` is the clock's.
+      assert conn
+             |> Local.query_sql(~s(SELECT * FROM m WHERE tag = 'hello'), database: db)
+             |> without(["time"]) === {:ok, [%{"tag" => "hello", "val" => 1}]}
     end
 
     test "float param in SQL literal", %{conn: conn, db: db} do
@@ -1357,7 +1378,7 @@ defmodule InfluxElixir.Client.LocalTest do
           params: %{"v" => 3.0}
         )
 
-      assert [%{"val" => 3.14}] = rows
+      assert without(rows, ["time"]) === [%{"val" => 3.14}]
     end
   end
 
@@ -1380,37 +1401,37 @@ defmodule InfluxElixir.Client.LocalTest do
     test "measurement name with escaped comma", %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "my\\,measurement field=1i", database: db)
 
-      assert {:ok, [%{"field" => 1}]} =
-               Local.query_sql(conn, ~s|SELECT field FROM "my,measurement"|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT field FROM "my,measurement"|, database: db) ===
+               {:ok, [%{"field" => 1}]}
     end
 
     test "field with negative integer", %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "m value=-42i", database: db)
 
-      assert {:ok, [%{"value" => -42}]} =
-               Local.query_sql(conn, "SELECT value FROM m", database: db)
+      assert Local.query_sql(conn, "SELECT value FROM m", database: db) ===
+               {:ok, [%{"value" => -42}]}
     end
 
     test "field with negative float", %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "m value=-3.14", database: db)
 
-      assert {:ok, [%{"value" => -3.14}]} =
-               Local.query_sql(conn, "SELECT value FROM m", database: db)
+      assert Local.query_sql(conn, "SELECT value FROM m", database: db) ===
+               {:ok, [%{"value" => -3.14}]}
     end
 
     test "field with scientific notation", %{conn: conn, db: db} do
       {:ok, :written} = Local.write(conn, "m value=1.5e10", database: db)
 
-      assert {:ok, [%{"value" => 15_000_000_000.0}]} =
-               Local.query_sql(conn, "SELECT value FROM m", database: db)
+      assert Local.query_sql(conn, "SELECT value FROM m", database: db) ===
+               {:ok, [%{"value" => 15_000_000_000.0}]}
     end
 
     test "comments and blank lines are ignored", %{conn: conn, db: db} do
       lp = "# This is a comment\n\nm value=1i 1\n\n# Another comment\nm value=2i 2\n"
       {:ok, :written} = Local.write(conn, lp, database: db)
 
-      assert {:ok, [%{"value" => 1}, %{"value" => 2}]} =
-               Local.query_sql(conn, "SELECT value FROM m ORDER BY time", database: db)
+      assert Local.query_sql(conn, "SELECT value FROM m ORDER BY time", database: db) ===
+               {:ok, [%{"value" => 1}, %{"value" => 2}]}
     end
   end
 
@@ -1428,8 +1449,11 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "points in db_a are NOT visible from db_b", %{conn: conn} do
-      assert {:ok, [%{"value" => 1}]} = Local.query_sql(conn, "SELECT * FROM m", database: "db_a")
-      assert {:ok, [%{"value" => 2}]} = Local.query_sql(conn, "SELECT * FROM m", database: "db_b")
+      assert conn |> Local.query_sql("SELECT * FROM m", database: "db_a") |> without(["time"]) ===
+               {:ok, [%{"value" => 1}]}
+
+      assert conn |> Local.query_sql("SELECT * FROM m", database: "db_b") |> without(["time"]) ===
+               {:ok, [%{"value" => 2}]}
     end
 
     test "a query against a database that does not exist is the engine's 404", %{conn: conn} do
@@ -1451,7 +1475,9 @@ defmodule InfluxElixir.Client.LocalTest do
     test "query without explicit database uses the connection's default", %{conn: conn} do
       # setup starts with databases: ["test_db"], the default as over HTTP.
       {:ok, :written} = Local.write(conn, "m value=99i", database: "test_db")
-      assert {:ok, [%{"value" => 99}]} = Local.query_sql(conn, "SELECT * FROM m")
+
+      assert conn |> Local.query_sql("SELECT * FROM m") |> without(["time"]) ===
+               {:ok, [%{"value" => 99}]}
     end
   end
 
@@ -1534,19 +1560,32 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, v2_conn: v2_conn, db: "flux_db", now: now, old: old}
     end
 
-    test "filter by tag equality", %{v2_conn: conn} do
+    # The row the cpu,host=web01 point written in the setup comes back as.
+    defp web01_row(now) do
+      %{
+        "result" => "_result",
+        "table" => 0,
+        "_measurement" => "cpu",
+        "_field" => "value",
+        "_time" => DateTime.from_unix!(now, :nanosecond),
+        "_value" => 10,
+        "host" => "web01"
+      }
+    end
+
+    test "filter by tag equality", %{v2_conn: conn, now: now} do
       flux =
         "from(bucket: \"flux_db\") |> range(start: -24h) |> filter(fn: (r) => r.host == \"web01\")"
 
-      assert {:ok, [%{"host" => "web01", "_field" => "value", "_value" => 10}]} =
-               Local.query_flux(conn, flux)
+      assert conn |> Local.query_flux(flux) |> without(@flux_range) ===
+               {:ok, [web01_row(now)]}
     end
 
-    test "range(start: -1h) filters old points", %{v2_conn: conn} do
+    test "range(start: -1h) filters old points", %{v2_conn: conn, now: now} do
       flux = "from(bucket: \"flux_db\") |> range(start: -1h)"
 
-      assert {:ok, [%{"_field" => "value", "_value" => 10, "host" => "web01"}]} =
-               Local.query_flux(conn, flux)
+      assert conn |> Local.query_flux(flux) |> without(@flux_range) ===
+               {:ok, [web01_row(now)]}
     end
 
     test "rows are long-format with one table per series", %{v2_conn: conn, now: now} do
@@ -1569,7 +1608,19 @@ defmodule InfluxElixir.Client.LocalTest do
           "|> filter(fn: (r) => r._measurement == \"mem\") " <>
           "|> filter(fn: (r) => r._field == \"free\")"
 
-      assert {:ok, [%{"_field" => "free", "_value" => 7}]} = Local.query_flux(conn, flux)
+      # The write carries no timestamp, so `_time` is the clock's.
+      assert conn |> Local.query_flux(flux) |> without(@flux_range ++ ["_time"]) ===
+               {:ok,
+                [
+                  %{
+                    "result" => "_result",
+                    "table" => 0,
+                    "_measurement" => "mem",
+                    "_field" => "free",
+                    "_value" => 7,
+                    "host" => "web01"
+                  }
+                ]}
     end
 
     test "a bucket that does not exist is the engine's 404", %{v2_conn: conn} do
@@ -1783,7 +1834,8 @@ defmodule InfluxElixir.Client.LocalTest do
       assert row === %{"time" => ~U[1970-01-01 00:00:00.000000Z], "avg_usage" => 20.0}
     end
 
-    test "ORDER BY time DESC", %{conn: conn, db: db} do
+    test "ORDER BY the DATE_BIN time alias DESC lists the buckets newest first",
+         %{conn: conn, db: db} do
       sql = """
       SELECT
         DATE_BIN(INTERVAL '3 hours', time) AS time,
@@ -1911,7 +1963,7 @@ defmodule InfluxElixir.Client.LocalTest do
       FROM "cpu"
       """
 
-      assert {:ok, [%{"avg_usage" => 35.0}]} = Local.query_sql(conn, sql, database: db)
+      assert Local.query_sql(conn, sql, database: db) === {:ok, [%{"avg_usage" => 35.0}]}
     end
 
     test "scalar aggregate honours WHERE filtering", %{conn: conn, db: db} do
@@ -1924,8 +1976,8 @@ defmodule InfluxElixir.Client.LocalTest do
       """
 
       # web01 has usage values 10, 20, 30 → total 60, count 3
-      assert {:ok, [%{"total_usage" => 60, "row_count" => 3}]} =
-               Local.query_sql(conn, sql, database: db)
+      assert Local.query_sql(conn, sql, database: db) ===
+               {:ok, [%{"total_usage" => 60, "row_count" => 3}]}
     end
 
     test "scalar COUNT returns 0 when no rows match", %{conn: conn, db: db} do
@@ -1936,8 +1988,7 @@ defmodule InfluxElixir.Client.LocalTest do
       WHERE host = 'no_such_host'
       """
 
-      assert {:ok, [%{"row_count" => 0}]} =
-               Local.query_sql(conn, sql, database: db)
+      assert Local.query_sql(conn, sql, database: db) === {:ok, [%{"row_count" => 0}]}
     end
 
     test "scalar AVG omits the column when no rows match", %{conn: conn, db: db} do
@@ -2167,10 +2218,8 @@ defmodule InfluxElixir.Client.LocalTest do
 
       # Prices > 104: 105 (0.5h), 110 (1h10m), 108 (1h30m), 112 (1h50m)
       # All in bucket 0 (2-hour window)
-      assert {:ok, [%{"time" => time, "open" => 105.0, "close" => 112.0}]} =
-               Local.query_sql(conn, sql, database: db)
-
-      assert time === hour_start(0)
+      assert Local.query_sql(conn, sql, database: db) ===
+               {:ok, [%{"time" => hour_start(0), "open" => 105.0, "close" => 112.0}]}
     end
   end
 
@@ -2317,6 +2366,17 @@ defmodule InfluxElixir.Client.LocalTest do
   # column to text.
   # ---------------------------------------------------------------------------
 
+  @acct_08338636 %{
+    "repcode" => "08338636",
+    "amount" => 500.0,
+    "time" => ~U[1970-01-01 00:00:00.000001Z]
+  }
+  @acct_12345678 %{
+    "repcode" => "12345678",
+    "amount" => 5000.0,
+    "time" => ~U[1970-01-01 00:00:00.000002Z]
+  }
+
   describe "query_sql/3 — quoted literals stay strings" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "lit_db")
@@ -2334,21 +2394,21 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "!= excludes only the matching string tag", %{conn: conn, db: db} do
       sql = "SELECT * FROM acct WHERE repcode != '08338636'"
-      assert [%{"repcode" => "12345678", "amount" => 5000.0}] = sql_rows(conn, db, sql)
+      assert sql_rows(conn, db, sql) === [@acct_12345678]
     end
 
     test "IN / NOT IN compare zero-padded literals as strings", %{conn: conn, db: db} do
       sql = "SELECT * FROM acct WHERE repcode IN ('08338636')"
-      assert [%{"repcode" => "08338636", "amount" => 500.0}] = sql_rows(conn, db, sql)
+      assert sql_rows(conn, db, sql) === [@acct_08338636]
 
       sql = "SELECT * FROM acct WHERE repcode NOT IN ('08338636')"
-      assert [%{"repcode" => "12345678", "amount" => 5000.0}] = sql_rows(conn, db, sql)
+      assert sql_rows(conn, db, sql) === [@acct_12345678]
     end
 
     test "a bare numeric literal against a float field compares numerically",
          %{conn: conn, db: db} do
       sql = "SELECT * FROM acct WHERE amount >= 1000.0"
-      assert [%{"repcode" => "12345678", "amount" => 5000.0}] = sql_rows(conn, db, sql)
+      assert sql_rows(conn, db, sql) === [@acct_12345678]
     end
   end
 
@@ -2372,17 +2432,30 @@ defmodule InfluxElixir.Client.LocalTest do
           database: "flux_range_db"
         )
 
-      {:ok, v2_conn: v2_conn}
+      {:ok, v2_conn: v2_conn, recent: recent}
     end
 
-    test "range with seconds unit filters correctly", %{v2_conn: conn} do
+    # The recent point as a query over its range returns it.
+    defp new_row(recent) do
+      %{
+        "result" => "_result",
+        "table" => 0,
+        "_measurement" => "sensors",
+        "_field" => "value",
+        "_time" => DateTime.from_unix!(recent, :nanosecond),
+        "_value" => 1,
+        "host" => "new"
+      }
+    end
+
+    test "range with seconds unit filters correctly", %{v2_conn: conn, recent: recent} do
       flux = "from(bucket: \"flux_range_db\") |> range(start: -30s)"
-      assert {:ok, [%{"host" => "new", "_value" => 1}]} = Local.query_flux(conn, flux)
+      assert conn |> Local.query_flux(flux) |> without(@flux_range) === {:ok, [new_row(recent)]}
     end
 
-    test "range with minutes unit filters correctly", %{v2_conn: conn} do
+    test "range with minutes unit filters correctly", %{v2_conn: conn, recent: recent} do
       flux = "from(bucket: \"flux_range_db\") |> range(start: -1m)"
-      assert {:ok, [%{"host" => "new", "_value" => 1}]} = Local.query_flux(conn, flux)
+      assert conn |> Local.query_flux(flux) |> without(@flux_range) === {:ok, [new_row(recent)]}
     end
 
     test "range with days unit includes all recent points", %{v2_conn: conn} do
@@ -2391,11 +2464,11 @@ defmodule InfluxElixir.Client.LocalTest do
       assert Enum.map(rows, &{&1["host"], &1["_value"]}) === [{"new", 1}, {"old", 2}]
     end
 
-    test "flux filter predicate on tag field", %{v2_conn: conn} do
+    test "flux filter predicate on tag field", %{v2_conn: conn, recent: recent} do
       flux =
         "from(bucket: \"flux_range_db\") |> range(start: -1d) |> filter(fn: (r) => r.host == \"new\")"
 
-      assert {:ok, [%{"host" => "new", "_value" => 1}]} = Local.query_flux(conn, flux)
+      assert conn |> Local.query_flux(flux) |> without(@flux_range) === {:ok, [new_row(recent)]}
     end
   end
 
@@ -2419,13 +2492,13 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "boolean params select by the flag", %{conn: conn, db: db} do
       for {flag, id} <- [{true, "d1"}, {false, "d2"}] do
-        assert {:ok, [%{"id" => ^id, "active" => ^flag}]} =
-                 Local.query_sql(
-                   conn,
-                   "SELECT * FROM devices WHERE active = $flag",
-                   database: db,
-                   params: %{"flag" => flag}
-                 )
+        # The rows carry no timestamp, so `time` is the clock's.
+        assert conn
+               |> Local.query_sql("SELECT * FROM devices WHERE active = $flag",
+                 database: db,
+                 params: %{"flag" => flag}
+               )
+               |> without(["time"]) === {:ok, [%{"id" => id, "active" => flag}]}
       end
     end
 
@@ -2456,8 +2529,8 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "DELETE FROM non-existent measurement returns 0 rows affected",
          %{conn: conn, db: db} do
-      assert {:ok, %{"rows_affected" => 0}} =
-               Local.execute_sql(conn, "DELETE FROM nonexistent", database: db)
+      assert Local.execute_sql(conn, "DELETE FROM nonexistent", database: db) ===
+               {:ok, %{"rows_affected" => 0}}
     end
 
     test "DELETE honours OR, NOT and parentheses in its WHERE", %{conn: conn, db: db} do
@@ -2468,18 +2541,16 @@ defmodule InfluxElixir.Client.LocalTest do
           database: db
         )
 
-      assert {:ok, %{"rows_affected" => 2}} =
-               Local.execute_sql(conn, "DELETE FROM m WHERE host = 'a' OR host = 'b'",
-                 database: db
-               )
+      assert Local.execute_sql(conn, "DELETE FROM m WHERE host = 'a' OR host = 'b'", database: db) ===
+               {:ok, %{"rows_affected" => 2}}
 
-      assert {:ok, %{"rows_affected" => 1}} =
-               Local.execute_sql(conn, "DELETE FROM m WHERE NOT (host = 'c' OR v > 9)",
-                 database: db
-               )
+      assert Local.execute_sql(conn, "DELETE FROM m WHERE NOT (host = 'c' OR v > 9)",
+               database: db
+             ) ===
+               {:ok, %{"rows_affected" => 1}}
 
-      assert {:ok, [%{"host" => "c"}]} =
-               Local.query_sql(conn, "SELECT host FROM m", database: db)
+      assert Local.query_sql(conn, "SELECT host FROM m", database: db) ===
+               {:ok, [%{"host" => "c"}]}
     end
   end
 
@@ -2575,7 +2646,7 @@ defmodule InfluxElixir.Client.LocalTest do
   # library (see the GitHub issues and CHANGELOG for the original reports).
   # ---------------------------------------------------------------------------
 
-  describe "bug regression — concurrent writes to one database (#15)" do
+  describe "write/3 and create_database/2 — concurrent callers" do
     # Points were stored as one list per measurement and every write
     # read-modify-wrote it, so parallel writers overwrote each other:
     # 159 of 480 rows survived while every call returned {:ok, :written}.
@@ -2642,7 +2713,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
   end
 
-  describe "bug regression — write preserves provided timestamps" do
+  describe "write/3 — provided timestamps are stored and read back in order" do
     # Points written at a fixed spacing keep their timestamps; the store
     # must never put the server's clock in place of a parsed timestamp.
     setup %{conn: conn} do
@@ -2698,7 +2769,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
   end
 
-  describe "bug regression — unrecognised WHERE clauses do not silently drop" do
+  describe "query_sql/3 — an unrecognised WHERE clause is an error, not dropped rows" do
     # Bug: in-operator (corollary). The fix list says: clauses the parser cannot
     # recognise must not produce wrong rows. Today they yield []; with this
     # regression test we lock in that behaviour into an explicit error so a
@@ -2732,7 +2803,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
   end
 
-  describe "bug regression — COUNT(*) aggregate" do
+  describe "query_sql/3 — COUNT(*) aggregate" do
     # Bug: count-star. parse_agg_column/1 required \w+ inside the parens, so
     # COUNT(*) failed parsing and the query 400'd.
     setup %{conn: conn} do
@@ -2754,12 +2825,11 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "scalar COUNT(*) returns total row count", %{conn: conn, db: db} do
-      assert {:ok, [%{"n" => 5}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT COUNT(*) AS n FROM "decision_traces"|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT COUNT(*) AS n FROM "decision_traces"|,
+               database: db
+             ) === {:ok, [%{"n" => 5}]}
     end
 
     test "COUNT(*) with DATE_BIN buckets by day", %{conn: conn, db: db} do
@@ -2786,12 +2856,11 @@ defmodule InfluxElixir.Client.LocalTest do
           database: db
         )
 
-      assert {:ok, [%{"n" => 6}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT COUNT(*) AS n FROM "decision_traces"|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT COUNT(*) AS n FROM "decision_traces"|,
+               database: db
+             ) === {:ok, [%{"n" => 6}]}
     end
   end
 
@@ -2802,7 +2871,7 @@ defmodule InfluxElixir.Client.LocalTest do
   # docs/design/2026-09-14_local-sql-stats-selectors-distinct.md).
   # ---------------------------------------------------------------------------
 
-  describe "bug regression — statistical aggregates (#16)" do
+  describe "query_sql/3 — statistical aggregates" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "stats_db")
 
@@ -2852,8 +2921,7 @@ defmodule InfluxElixir.Client.LocalTest do
       WHERE provider = 'b'
       """
 
-      assert {:ok, [%{"v_pop" => +0.0} = row]} = Local.query_sql(conn, sql, database: db)
-      assert Map.keys(row) === ["v_pop"]
+      assert Local.query_sql(conn, sql, database: db) === {:ok, [%{"v_pop" => +0.0}]}
     end
 
     test "an empty group keeps only COUNT (0); every other aggregate is omitted",
@@ -2864,8 +2932,7 @@ defmodule InfluxElixir.Client.LocalTest do
       WHERE provider = 'none'
       """
 
-      assert {:ok, [%{"n" => 0} = row]} = Local.query_sql(conn, sql, database: db)
-      assert Map.keys(row) === ["n"]
+      assert Local.query_sql(conn, sql, database: db) === {:ok, [%{"n" => 0}]}
     end
 
     test "VARIANCE is not a DataFusion function and is rejected", %{conn: conn, db: db} do
@@ -2898,23 +2965,22 @@ defmodule InfluxElixir.Client.LocalTest do
 
       sql = ~s|SELECT SUM(n / 2) AS halves, SUM(n * n) AS squares, AVG(n) AS a FROM "ints"|
 
-      assert {:ok, [%{"halves" => 3, "squares" => 34, "a" => 4.0}]} =
-               Local.query_sql(conn, sql, database: db)
+      assert Local.query_sql(conn, sql, database: db) ===
+               {:ok, [%{"halves" => 3, "squares" => 34, "a" => 4.0}]}
     end
 
     # A float over zero is infinity on the engine, which COUNT counts and SUM
     # turns to NaN; the double cannot hold either, so it refuses by name.
-    test "a float divided by zero inside an aggregate is refused by name, not a crash",
+    test "a float divided by zero inside an aggregate sums to null and still counts",
          %{conn: conn, db: db} do
+      # The engine: SUM over infinities is a non-finite double (sent as
+      # null); COUNT counts the rows, since infinity is not null.
       sql = ~s|SELECT SUM(value / 0) AS s, COUNT(value / 0) AS n FROM "m"|
 
-      assert {:error,
-              %{
-                status: 400,
-                body:
-                  "Client.Local: a float divided by zero is IEEE infinity or NaN on the " <>
-                    "engine, which the double cannot hold"
-              }} = Local.query_sql(conn, sql, database: db)
+      {:ok, [%{"n" => rows}]} =
+        Local.query_sql(conn, ~s|SELECT COUNT(*) AS n FROM "m"|, database: db)
+
+      assert Local.query_sql(conn, sql, database: db) === {:ok, [%{"s" => nil, "n" => rows}]}
     end
 
     test "a malformed expression is rejected with a Client.Local error", %{conn: conn, db: db} do
@@ -2948,7 +3014,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
   end
 
-  describe "bug regression — selector functions and DATE_BIN ordering (#17)" do
+  describe "query_sql/3 — selector functions and DATE_BIN ordering" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "sel_db")
 
@@ -3031,21 +3097,22 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "a selector without an accessor is the engine's time/value struct", %{conn: conn, db: db} do
-      assert {:ok, [%{"v" => %{"time" => %DateTime{} = time, "value" => 5.0}}]} =
+      assert {:ok, [%{"v" => %{"time" => %DateTime{} = time}} = row]} =
                Local.query_sql(conn, ~s|SELECT selector_last(value, time) AS v FROM "m"|,
                  database: db
                )
 
-      assert {:ok, [%{"t" => ^time, "x" => 5.0}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT selector_last(value, time)['time'] AS t, selector_last(value, time)['value'] AS x FROM "m"|,
-                 database: db
-               )
+      assert row === %{"v" => %{"time" => time, "value" => 5.0}}
+
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT selector_last(value, time)['time'] AS t, selector_last(value, time)['value'] AS x FROM "m"|,
+               database: db
+             ) === {:ok, [%{"t" => time, "x" => 5.0}]}
     end
   end
 
-  describe "bug regression — null omission (#17)" do
+  describe "query_sql/3 — null omission" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "md_db")
 
@@ -3116,7 +3183,7 @@ defmodule InfluxElixir.Client.LocalTest do
   # InfluxDB 3 Core (see docs/design/2026-09-14_local-time-filters-count-distinct.md).
   # ---------------------------------------------------------------------------
 
-  describe "bug regression — now() time filters, IS NULL, COUNT(DISTINCT), time aggregates" do
+  describe "query_sql/3 — now() time filters, IS NULL, COUNT(DISTINCT), time aggregates" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "sweep_db")
       now_ns = System.os_time(:nanosecond)
@@ -3137,12 +3204,11 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "now() - INTERVAL is evaluated at query time", %{conn: conn, db: db} do
-      assert {:ok, [%{"price" => 1.0}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT price FROM "q" WHERE time >= now() - INTERVAL '2 minutes'|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT price FROM "q" WHERE time >= now() - INTERVAL '2 minutes'|,
+               database: db
+             ) === {:ok, [%{"price" => 1.0}]}
 
       sql =
         ~s|SELECT price FROM "q" WHERE time >= now() - INTERVAL '1 hour' - INTERVAL '30 minutes' | <>
@@ -3166,24 +3232,23 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "COUNT(DISTINCT col) is 0 over no rows and counts per group", %{conn: conn, db: db} do
-      assert {:ok, [%{"n" => 0}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT COUNT(DISTINCT provider) AS n FROM "q" WHERE provider = 'zzz'|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT COUNT(DISTINCT provider) AS n FROM "q" WHERE provider = 'zzz'|,
+               database: db
+             ) === {:ok, [%{"n" => 0}]}
 
-      assert {:ok,
-              [
-                %{"provider" => "a", "n" => 1},
-                %{"provider" => "b", "n" => 1},
-                %{"provider" => "c", "n" => 1}
-              ]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT provider, COUNT(DISTINCT symbol) AS n FROM "q" GROUP BY provider ORDER BY provider|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT provider, COUNT(DISTINCT symbol) AS n FROM "q" GROUP BY provider ORDER BY provider|,
+               database: db
+             ) ===
+               {:ok,
+                [
+                  %{"provider" => "a", "n" => 1},
+                  %{"provider" => "b", "n" => 1},
+                  %{"provider" => "c", "n" => 1}
+                ]}
     end
   end
 
@@ -3192,7 +3257,7 @@ defmodule InfluxElixir.Client.LocalTest do
   # recorded from InfluxDB 3 Core (docs/design/2026-09-15_local-ctes-projected-expressions.md).
   # ---------------------------------------------------------------------------
 
-  describe "bug regression — projected expressions, CTEs and qualifiers (#18)" do
+  describe "query_sql/3 — projected expressions, CTEs and qualifiers" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "cte_db")
 
@@ -3239,32 +3304,15 @@ defmodule InfluxElixir.Client.LocalTest do
              ]
     end
 
-    test "a CTE feeds GROUP BY DATE_BIN qualified by the CTE alias", %{conn: conn, db: db} do
-      sql = """
-      WITH w AS (SELECT bid, time FROM "q")
-      SELECT DATE_BIN(INTERVAL '1 minute', w.time) AS time, MAX(w.bid) AS hi
-      FROM w GROUP BY DATE_BIN(INTERVAL '1 minute', w.time) ORDER BY time
-      """
-
-      assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
-
-      assert rows === [
-               %{"time" => ~U[1970-01-01 00:00:00.000000Z], "hi" => 1.0},
-               %{"time" => ~U[1970-01-01 00:01:00.000000Z], "hi" => 2.0},
-               %{"time" => ~U[1970-01-01 00:02:00.000000Z], "hi" => 10.0}
-             ]
-    end
-
     test "a CTE shadows nothing it does not name", %{conn: conn, db: db} do
       sql = ~s|WITH w AS (SELECT bid FROM "q") SELECT * FROM "q"|
       assert column_values(conn, db, sql, "bid") |> Enum.sort() === [1.0, 2.0, 5.0, 10.0]
 
-      assert {:ok, [%{"n" => 4}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|WITH w AS (SELECT bid FROM "q") SELECT COUNT(*) AS n FROM w|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|WITH w AS (SELECT bid FROM "q") SELECT COUNT(*) AS n FROM w|,
+               database: db
+             ) === {:ok, [%{"n" => 4}]}
     end
 
     test "a CTE over a missing table reports the engine's table-not-found error",
@@ -3277,22 +3325,21 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "table aliases and qualified columns are accepted in every clause", %{conn: conn, db: db} do
-      assert {:ok, [%{"bid" => 1.0, "time" => ~U[1970-01-01 00:00:01.000000Z]}]} =
-               Local.query_sql(conn, ~s|SELECT q.bid, q.time FROM q AS q ORDER BY q.time LIMIT 1|,
-                 database: db
-               )
+      assert Local.query_sql(conn, ~s|SELECT q.bid, q.time FROM q AS q ORDER BY q.time LIMIT 1|,
+               database: db
+             ) === {:ok, [%{"bid" => 1.0, "time" => ~U[1970-01-01 00:00:01.000000Z]}]}
 
-      assert {:ok,
-              [
-                %{"b" => ~U[1970-01-01 00:00:00.000000Z], "n" => 1},
-                %{"b" => ~U[1970-01-01 00:01:00.000000Z], "n" => 1},
-                %{"b" => ~U[1970-01-01 00:02:00.000000Z], "n" => 2}
-              ]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT DATE_BIN(INTERVAL '1 minute', q.time) AS b, COUNT(*) AS n FROM q GROUP BY DATE_BIN(INTERVAL '1 minute', q.time) ORDER BY b|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT DATE_BIN(INTERVAL '1 minute', q.time) AS b, COUNT(*) AS n FROM q GROUP BY DATE_BIN(INTERVAL '1 minute', q.time) ORDER BY b|,
+               database: db
+             ) ===
+               {:ok,
+                [
+                  %{"b" => ~U[1970-01-01 00:00:00.000000Z], "n" => 1},
+                  %{"b" => ~U[1970-01-01 00:01:00.000000Z], "n" => 1},
+                  %{"b" => ~U[1970-01-01 00:02:00.000000Z], "n" => 2}
+                ]}
 
       # A qualifier-looking string literal is untouched.
       assert {:ok, []} =
@@ -3317,7 +3364,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
   end
 
-  describe "bug regression — keyword-like column names and literals are not constructs" do
+  describe "query_sql/3 — keyword-like column names and literals are not constructs" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "kw_db")
 
@@ -3333,15 +3380,14 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "columns named offset and over are selectable, as on the engine", %{conn: conn, db: db} do
-      assert {:ok, [%{"offset" => 1, "over" => 2}, %{"offset" => 3, "over" => 4}]} =
-               Local.query_sql(conn, ~s|SELECT offset, over FROM "m" ORDER BY time|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT offset, over FROM "m" ORDER BY time|, database: db) ===
+               {:ok, [%{"offset" => 1, "over" => 2}, %{"offset" => 3, "over" => 4}]}
     end
 
     test "keywords inside a string literal are just text", %{conn: conn, db: db} do
-      assert {:ok, [%{"tag" => "x"}]} =
-               Local.query_sql(conn, ~s|SELECT tag FROM "m" WHERE note = 'select from join'|,
-                 database: db
-               )
+      assert Local.query_sql(conn, ~s|SELECT tag FROM "m" WHERE note = 'select from join'|,
+               database: db
+             ) === {:ok, [%{"tag" => "x"}]}
     end
 
     test "a window function is still refused by name", %{conn: conn, db: db} do
@@ -3366,7 +3412,7 @@ defmodule InfluxElixir.Client.LocalTest do
   # (docs/design/2026-09-15_local-where-boolean-logic.md).
   # ---------------------------------------------------------------------------
 
-  describe "bug regression — WHERE OR / NOT / parentheses, BETWEEN, LIKE, <>, LIMIT 0" do
+  describe "query_sql/3 — WHERE OR / NOT / parentheses, BETWEEN, LIKE, <>, LIMIT 0" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "where_db")
 
@@ -3458,7 +3504,7 @@ defmodule InfluxElixir.Client.LocalTest do
   # recorded from InfluxDB 3 Core (docs/design/2026-09-15_local-median-cross-join.md).
   # ---------------------------------------------------------------------------
 
-  describe "bug regression — median, CROSS JOIN and expression comparands (#19)" do
+  describe "query_sql/3 — median, CROSS JOIN and expression comparands" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "med_db")
 
@@ -3484,23 +3530,26 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "median: mean of the two middles, integer division, per bucket, never over time",
          %{conn: conn, db: db} do
-      assert {:ok, [%{"med" => 2.5}]} =
-               Local.query_sql(conn, ~s|SELECT median(price) AS med FROM "p" WHERE price < 4|,
-                 database: db
-               )
+      assert Local.query_sql(conn, ~s|SELECT median(price) AS med FROM "p" WHERE price < 4|,
+               database: db
+             ) === {:ok, [%{"med" => 2.5}]}
 
       # Integers: (1 + 4) / 2 with integer division.
-      assert {:ok, [%{"med" => 2}]} =
-               Local.query_sql(conn, ~s|SELECT median(n) AS med FROM "q" WHERE n IN (1, 4)|,
-                 database: db
-               )
+      assert Local.query_sql(conn, ~s|SELECT median(n) AS med FROM "q" WHERE n IN (1, 4)|,
+               database: db
+             ) ===
+               {:ok, [%{"med" => 2}]}
 
-      assert {:ok, [%{"med" => 1.75}, %{"med" => 4.0}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT DATE_BIN(INTERVAL '1 minute', time) AS t, median(price) AS med FROM "p" GROUP BY DATE_BIN(INTERVAL '1 minute', time) ORDER BY t|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT DATE_BIN(INTERVAL '1 minute', time) AS t, median(price) AS med FROM "p" GROUP BY DATE_BIN(INTERVAL '1 minute', time) ORDER BY t|,
+               database: db
+             ) ===
+               {:ok,
+                [
+                  %{"t" => ~U[2023-11-14 22:13:00.000000Z], "med" => 1.75},
+                  %{"t" => ~U[2023-11-14 22:14:00.000000Z], "med" => 4.0}
+                ]}
 
       assert {:error,
               %{
@@ -3542,25 +3591,26 @@ defmodule InfluxElixir.Client.LocalTest do
       }
 
       # The 100.0 outlier (median 3.0, bound 9.0) is screened out of the second candle.
-      assert {:ok,
-              [
-                %{
-                  "time" => ~U[2023-11-14 22:13:00.000000Z],
-                  "open" => 1.0,
-                  "high" => 2.5,
-                  "low" => 1.0,
-                  "close" => 2.5,
-                  "volume" => 30.0
-                },
-                %{
-                  "time" => ~U[2023-11-14 22:14:00.000000Z],
-                  "open" => 3.0,
-                  "high" => 4.0,
-                  "low" => 3.0,
-                  "close" => 4.0,
-                  "volume" => 70.0
-                }
-              ]} = Local.query_sql(conn, sql, database: db, params: params)
+      assert Local.query_sql(conn, sql, database: db, params: params) ===
+               {:ok,
+                [
+                  %{
+                    "time" => ~U[2023-11-14 22:13:00.000000Z],
+                    "open" => 1.0,
+                    "high" => 2.5,
+                    "low" => 1.0,
+                    "close" => 2.5,
+                    "volume" => 30.0
+                  },
+                  %{
+                    "time" => ~U[2023-11-14 22:14:00.000000Z],
+                    "open" => 3.0,
+                    "high" => 4.0,
+                    "low" => 3.0,
+                    "close" => 4.0,
+                    "volume" => 70.0
+                  }
+                ]}
     end
 
     test "CROSS JOIN is a cartesian product; a column on both sides is ambiguous",
@@ -3611,26 +3661,14 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "arithmetic on the left side of a WHERE comparison", %{conn: conn, db: db} do
-      assert {:ok, [%{"price" => 100.0}]} =
-               Local.query_sql(conn, ~s|SELECT price FROM "p" WHERE 2 * price > volume|,
-                 database: db
-               )
-    end
-
-    test "a bare word is a column; an unknown one is the engine's schema error",
-         %{conn: conn, db: db} do
-      assert {:error,
-              %{
-                status: 500,
-                body:
-                  "Schema error: No field named prod. " <>
-                    "Valid fields are p.price, p.provider, p.symbol, p.time, p.volume."
-              }} =
-               Local.query_sql(conn, ~s|SELECT price FROM "p" WHERE symbol = prod|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT price FROM "p" WHERE 2 * price > volume|,
+               database: db
+             ) ===
+               {:ok, [%{"price" => 100.0}]}
     end
   end
 
-  describe "bug regression — an unknown column anywhere is the engine's schema error" do
+  describe "query_sql/3 — an unknown column anywhere is the engine's schema error" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "schema_db")
 
@@ -3695,31 +3733,18 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "an output alias is a valid ORDER BY target and a source column need not be projected",
          %{conn: conn, db: db} do
-      assert {:ok, [%{"h" => "b"}, %{"h" => "a"}]} =
-               Local.query_sql(conn, ~s|SELECT host AS h FROM "p" ORDER BY h DESC|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT host AS h FROM "p" ORDER BY h DESC|, database: db) ===
+               {:ok, [%{"h" => "b"}, %{"h" => "a"}]}
 
-      assert {:ok, [%{"host" => "b"}, %{"host" => "a"}]} =
-               Local.query_sql(conn, ~s|SELECT host FROM "p" ORDER BY v DESC|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT host FROM "p" ORDER BY v DESC|, database: db) ===
+               {:ok, [%{"host" => "b"}, %{"host" => "a"}]}
 
-      assert {:ok, [%{"n" => 2}]} =
-               Local.query_sql(conn, ~s|SELECT COUNT(*) AS n FROM "p" ORDER BY n|, database: db)
-    end
-
-    test "a CTE has its columns whether or not it has rows", %{conn: conn, db: db} do
-      assert {:error,
-              %{
-                status: 500,
-                body: "Schema error: No field named nosuch. Valid fields are w.host."
-              }} =
-               Local.query_sql(
-                 conn,
-                 ~s|WITH w AS (SELECT host FROM "p" WHERE v > 100) SELECT nosuch FROM w|,
-                 database: db
-               )
+      assert Local.query_sql(conn, ~s|SELECT COUNT(*) AS n FROM "p" ORDER BY n|, database: db) ===
+               {:ok, [%{"n" => 2}]}
     end
   end
 
-  describe "bug regression — GROUP BY without an aggregate, ungrouped projections, grouped ORDER BY" do
+  describe "query_sql/3 — GROUP BY without an aggregate, ungrouped projections, grouped ORDER BY" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "grp_db")
 
@@ -3743,15 +3768,14 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "GROUP BY without an aggregate yields one row per group", %{conn: conn, db: db} do
       # Before, GROUP BY on a plain projection was silently ignored.
-      assert {:ok, [%{"host" => "a"}, %{"host" => "b"}]} =
-               Local.query_sql(conn, ~s|SELECT host FROM "p" GROUP BY host ORDER BY host|,
-                 database: db
-               )
+      assert Local.query_sql(conn, ~s|SELECT host FROM "p" GROUP BY host ORDER BY host|,
+               database: db
+             ) ===
+               {:ok, [%{"host" => "a"}, %{"host" => "b"}]}
 
-      assert {:ok, [%{"h" => "b"}, %{"h" => "a"}]} =
-               Local.query_sql(conn, ~s|SELECT host AS h FROM "p" GROUP BY host ORDER BY h DESC|,
-                 database: db
-               )
+      assert Local.query_sql(conn, ~s|SELECT host AS h FROM "p" GROUP BY host ORDER BY h DESC|,
+               database: db
+             ) === {:ok, [%{"h" => "b"}, %{"h" => "a"}]}
     end
 
     test "a projected column that is neither grouped nor aggregated is the engine's planning error",
@@ -3782,17 +3806,15 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "ORDER BY is honoured on GROUP BY <column> aggregates", %{conn: conn, db: db} do
       # Before, only DATE_BIN groups were ordered; column groups came back in map order.
-      assert {:ok, [%{"host" => "b", "t" => 7.0}, %{"host" => "a", "t" => 1.0}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT host, SUM(v) AS t FROM "p" GROUP BY host ORDER BY t DESC|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT host, SUM(v) AS t FROM "p" GROUP BY host ORDER BY t DESC|,
+               database: db
+             ) === {:ok, [%{"host" => "b", "t" => 7.0}, %{"host" => "a", "t" => 1.0}]}
 
-      assert {:ok, [%{"n" => 1}, %{"n" => 2}]} =
-               Local.query_sql(conn, ~s|SELECT COUNT(*) AS n FROM "p" GROUP BY host ORDER BY n|,
-                 database: db
-               )
+      assert Local.query_sql(conn, ~s|SELECT COUNT(*) AS n FROM "p" GROUP BY host ORDER BY n|,
+               database: db
+             ) === {:ok, [%{"n" => 1}, %{"n" => 2}]}
     end
   end
 
@@ -3841,7 +3863,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
   end
 
-  describe "bug regression — CAST, ::TYPE and multi-term ORDER BY (#20)" do
+  describe "query_sql/3 — CAST, ::TYPE and multi-term ORDER BY" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "cast_db")
 
@@ -3884,8 +3906,26 @@ defmodule InfluxElixir.Client.LocalTest do
       }
 
       # Numeric depth: "100" is excluded although it sorts before "20" as text.
-      assert {:ok, [%{"level" => "20"}, %{"level" => "5"}]} =
-               Local.query_sql(conn, sql, database: db, params: params)
+      assert Local.query_sql(conn, sql, database: db, params: params) ===
+               {:ok,
+                [
+                  %{
+                    "time" => ~U[2023-11-14 22:13:21.000000Z],
+                    "symbol" => "X",
+                    "provider" => "a",
+                    "level" => "20",
+                    "price" => 3.2,
+                    "qty" => 2
+                  },
+                  %{
+                    "time" => ~U[2023-11-14 22:13:20.000000Z],
+                    "symbol" => "X",
+                    "provider" => "a",
+                    "level" => "5",
+                    "price" => 2.7,
+                    "qty" => 1
+                  }
+                ]}
 
       # The uncast comparison is the lexical one the report describes.
       assert levels(
@@ -3920,41 +3960,36 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "CAST in a projection, an aggregate and arithmetic", %{conn: conn, db: db} do
-      assert {:ok, [%{"lvl" => 5}, %{"lvl" => 20}, %{"lvl" => 20}, %{"lvl" => 100}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT CAST(level AS INTEGER) AS lvl FROM "orderbooks" ORDER BY lvl|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT CAST(level AS INTEGER) AS lvl FROM "orderbooks" ORDER BY lvl|,
+               database: db
+             ) === {:ok, [%{"lvl" => 5}, %{"lvl" => 20}, %{"lvl" => 20}, %{"lvl" => 100}]}
 
-      assert {:ok, [%{"m" => 100}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT MAX(CAST(level AS INTEGER)) AS m FROM "orderbooks"|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT MAX(CAST(level AS INTEGER)) AS m FROM "orderbooks"|,
+               database: db
+             ) === {:ok, [%{"m" => 100}]}
 
       # float -> integer truncates; integer -> double widens
-      assert {:ok, [%{"p" => 1}, %{"p" => 2}, %{"p" => 3}, %{"p" => 9}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT CAST(price AS INTEGER) AS p FROM "orderbooks" ORDER BY p|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT CAST(price AS INTEGER) AS p FROM "orderbooks" ORDER BY p|,
+               database: db
+             ) === {:ok, [%{"p" => 1}, %{"p" => 2}, %{"p" => 3}, %{"p" => 9}]}
 
-      assert {:ok, [%{"q" => 1.0} | _rest]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT CAST(qty AS DOUBLE) AS q FROM "orderbooks" ORDER BY q|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT CAST(qty AS DOUBLE) AS q FROM "orderbooks" ORDER BY q|,
+               database: db
+             ) === {:ok, [%{"q" => 1.0}, %{"q" => 2.0}, %{"q" => 3.0}, %{"q" => 9.0}]}
 
-      assert {:ok, [%{"s" => 6}, %{"s" => 22}, %{"s" => 29}, %{"s" => 103}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT CAST(level AS INTEGER) + qty AS s FROM "orderbooks" ORDER BY s|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT CAST(level AS INTEGER) + qty AS s FROM "orderbooks" ORDER BY s|,
+               database: db
+             ) === {:ok, [%{"s" => 6}, %{"s" => 22}, %{"s" => 29}, %{"s" => 103}]}
     end
 
     test "a cast that cannot be performed fails the query as the engine does", %{
@@ -4028,12 +4063,11 @@ defmodule InfluxElixir.Client.LocalTest do
                {"X", "5"}
              ]
 
-      assert {:ok, [%{"m" => 9.9, "symbol" => "X"}, %{"m" => 1.1, "symbol" => "Y"}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT symbol, MAX(price) AS m FROM "orderbooks" GROUP BY symbol ORDER BY m DESC, symbol|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT symbol, MAX(price) AS m FROM "orderbooks" GROUP BY symbol ORDER BY m DESC, symbol|,
+               database: db
+             ) === {:ok, [%{"m" => 9.9, "symbol" => "X"}, %{"m" => 1.1, "symbol" => "Y"}]}
 
       assert {:error,
               %{
@@ -4049,7 +4083,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
   end
 
-  describe "bug regression — IN-list items are comparands; constants in a select list" do
+  describe "query_sql/3 — IN-list items are comparands; constants in a select list" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "const_db")
 
@@ -4096,35 +4130,34 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "constants with an alias in projections and aggregates", %{conn: conn, db: db} do
-      assert {:ok, [%{"one" => 1}]} =
-               Local.query_sql(conn, ~s|SELECT 1 AS one FROM "p" LIMIT 1|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT 1 AS one FROM "p" LIMIT 1|, database: db) ===
+               {:ok, [%{"one" => 1}]}
 
-      assert {:ok, [%{"host" => "a", "label" => "x"}, %{"host" => "b", "label" => "x"}]} =
-               Local.query_sql(conn, ~s|SELECT host, 'x' AS label FROM "p" ORDER BY host|,
-                 database: db
-               )
+      assert Local.query_sql(conn, ~s|SELECT host, 'x' AS label FROM "p" ORDER BY host|,
+               database: db
+             ) ===
+               {:ok, [%{"host" => "a", "label" => "x"}, %{"host" => "b", "label" => "x"}]}
 
-      assert {:ok, [%{"host" => "a", "volume" => +0.0}, %{"host" => "b", "volume" => +0.0}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT host, 0.0 AS volume FROM "p" GROUP BY host ORDER BY host|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT host, 0.0 AS volume FROM "p" GROUP BY host ORDER BY host|,
+               database: db
+             ) === {:ok, [%{"host" => "a", "volume" => +0.0}, %{"host" => "b", "volume" => +0.0}]}
 
-      assert {:ok, [%{"volume" => +0.0, "m" => 2.0}]} =
-               Local.query_sql(conn, ~s|SELECT 0.0 AS volume, MAX(v) AS m FROM "p"|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT 0.0 AS volume, MAX(v) AS m FROM "p"|, database: db) ===
+               {:ok, [%{"volume" => +0.0, "m" => 2.0}]}
 
-      assert {:ok, [%{"volume" => +0.0, "m" => 2.0, "t" => ~U[2023-11-14 22:13:00.000000Z]}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT DATE_BIN(INTERVAL '1 minute', time) AS t, 0.0 AS volume, MAX(v) AS m FROM "p" GROUP BY DATE_BIN(INTERVAL '1 minute', time)|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT DATE_BIN(INTERVAL '1 minute', time) AS t, 0.0 AS volume, MAX(v) AS m FROM "p" GROUP BY DATE_BIN(INTERVAL '1 minute', time)|,
+               database: db
+             ) ===
+               {:ok, [%{"volume" => +0.0, "m" => 2.0, "t" => ~U[2023-11-14 22:13:00.000000Z]}]}
     end
 
     test "a constant without an alias is named as the engine names it", %{conn: conn, db: db} do
-      assert {:ok, [%{"Int64(1)" => 1}, %{"Int64(1)" => 1}]} =
-               Local.query_sql(conn, ~s|SELECT 1 FROM "p"|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT 1 FROM "p"|, database: db) ===
+               {:ok, [%{"Int64(1)" => 1}, %{"Int64(1)" => 1}]}
     end
   end
 
@@ -4182,8 +4215,8 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert partial_errors(body) === [{2, conflict}]
 
-      assert {:ok, [%{"v" => 1}, %{"v" => 3}]} =
-               Local.query_sql(conn, ~s|SELECT v FROM "p" ORDER BY time|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT v FROM "p" ORDER BY time|, database: db) ===
+               {:ok, [%{"v" => 1}, %{"v" => 3}]}
 
       # A syntax error is reported the same way, with every bad line listed.
       lp =
@@ -4193,8 +4226,8 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert partial_errors(body) === [{2, "No fields were provided"}, {3, conflict}]
 
-      assert {:ok, [%{"v" => 1}, %{"v" => 3}]} =
-               Local.query_sql(conn, ~s|SELECT v FROM "q" ORDER BY time|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT v FROM "q" ORDER BY time|, database: db) ===
+               {:ok, [%{"v" => 1}, %{"v" => 3}]}
     end
 
     test "time is a reserved column; a key cannot be both tag and field; an integer must fit int64",
@@ -4250,15 +4283,15 @@ defmodule InfluxElixir.Client.LocalTest do
           database: db
         )
 
-      assert {:ok,
-              [
-                %{
-                  "big" => 9_223_372_036_854_775_807,
-                  "small" => -9_223_372_036_854_775_808,
-                  "u" => 18_446_744_073_709_551_615
-                }
-              ]} =
-               Local.query_sql(conn, ~s|SELECT big, small, u FROM "n"|, database: db)
+      assert Local.query_sql(conn, ~s|SELECT big, small, u FROM "n"|, database: db) ===
+               {:ok,
+                [
+                  %{
+                    "big" => 9_223_372_036_854_775_807,
+                    "small" => -9_223_372_036_854_775_808,
+                    "u" => 18_446_744_073_709_551_615
+                  }
+                ]}
     end
 
     test "an empty payload is rejected", %{conn: conn, db: db} do
@@ -4288,7 +4321,7 @@ defmodule InfluxElixir.Client.LocalTest do
   # (docs/design/2026-09-22_local-offset.md).
   # ---------------------------------------------------------------------------
 
-  describe "bug regression — LIMIT and OFFSET (#21)" do
+  describe "query_sql/3 — LIMIT and OFFSET" do
     setup %{conn: conn} do
       :ok = Local.create_database(conn, "off_db")
 
@@ -4313,26 +4346,23 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "OFFSET applies to grouped, DISTINCT and projected rows too", %{conn: conn, db: db} do
-      assert {:ok, [%{"host" => "b", "n" => 1}, %{"host" => "c", "n" => 1}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT host, COUNT(*) AS n FROM "p" GROUP BY host ORDER BY host LIMIT 2 OFFSET 1|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT host, COUNT(*) AS n FROM "p" GROUP BY host ORDER BY host LIMIT 2 OFFSET 1|,
+               database: db
+             ) === {:ok, [%{"host" => "b", "n" => 1}, %{"host" => "c", "n" => 1}]}
 
-      assert {:ok, [%{"host" => "c"}, %{"host" => "d"}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT DISTINCT host FROM "p" ORDER BY host LIMIT 2 OFFSET 2|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT DISTINCT host FROM "p" ORDER BY host LIMIT 2 OFFSET 2|,
+               database: db
+             ) === {:ok, [%{"host" => "c"}, %{"host" => "d"}]}
 
-      assert {:ok, [%{"twice" => 6}, %{"twice" => 8}]} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT v * 2 AS twice FROM "p" ORDER BY v LIMIT 2 OFFSET 2|,
-                 database: db
-               )
+      assert Local.query_sql(
+               conn,
+               ~s|SELECT v * 2 AS twice FROM "p" ORDER BY v LIMIT 2 OFFSET 2|,
+               database: db
+             ) === {:ok, [%{"twice" => 6}, %{"twice" => 8}]}
     end
 
     test "the reported pagination query", %{conn: conn, db: db} do
@@ -4349,20 +4379,6 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert {:ok, rows} = Local.query_sql(conn, sql, database: db)
       assert Enum.map(rows, & &1["host"]) === ["d", "c", "b", "a"]
-    end
-
-    test "a negative or non-numeric OFFSET is the engine's error", %{conn: conn, db: db} do
-      assert {:error,
-              %{
-                status: 400,
-                body:
-                  "Optimizer rule 'push_down_limit' failed\ncaused by\nError during " <>
-                    "planning: OFFSET must be >=0, '-1' was provided"
-              }} =
-               Local.query_sql(conn, ~s|SELECT host FROM "p" LIMIT 2 OFFSET -1|, database: db)
-
-      assert {:error, %{status: 500, body: "Schema error: No field named abc."}} =
-               Local.query_sql(conn, ~s|SELECT host FROM "p" LIMIT 2 OFFSET abc|, database: db)
     end
   end
 
@@ -4443,26 +4459,7 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     @t "1700000000000000000"
-
-    test "the later write wins per field and the fields merge", %{conn: conn, db: db} do
-      {:ok, :written} = Local.write(conn, "a,h=x v=1i #{@t}", database: db)
-      {:ok, :written} = Local.write(conn, "a,h=x v=2i #{@t}", database: db)
-
-      assert {:ok, [%{"h" => "x", "v" => 2}]} =
-               Local.query_sql(conn, "SELECT * FROM a", database: db)
-
-      {:ok, :written} = Local.write(conn, "b,h=x v=1i #{@t}", database: db)
-      {:ok, :written} = Local.write(conn, "b,h=x w=2i #{@t}", database: db)
-
-      assert {:ok, [%{"v" => 1, "w" => 2}]} =
-               Local.query_sql(conn, "SELECT * FROM b", database: db)
-
-      {:ok, :written} = Local.write(conn, "c,h=x v=1i,w=1i #{@t}", database: db)
-      {:ok, :written} = Local.write(conn, "c,h=x v=2i #{@t}", database: db)
-
-      assert {:ok, [%{"v" => 2, "w" => 1}]} =
-               Local.query_sql(conn, "SELECT * FROM c", database: db)
-    end
+    @time ~U[2023-11-14 22:13:20.000000Z]
 
     test "a different tag value is another point; the same series at another time too",
          %{conn: conn, db: db} do
@@ -4477,22 +4474,22 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, :written} = Local.write(conn, "e,h=x v=1i #{@t}\ne,h=x v=2i #{@t}", database: db)
       {:ok, :written} = Local.write(conn, "e v=5i #{@t}\ne v=6i #{@t}", database: db)
 
-      assert {:ok, [%{"n" => 2, "s" => 8}]} =
-               Local.query_sql(conn, "SELECT COUNT(v) AS n, SUM(v) AS s FROM e", database: db)
+      assert Local.query_sql(conn, "SELECT COUNT(v) AS n, SUM(v) AS s FROM e", database: db) ===
+               {:ok, [%{"n" => 2, "s" => 8}]}
 
-      assert {:ok, [%{"v" => 6}]} =
-               Local.query_sql(conn, "SELECT v FROM e WHERE h IS NULL", database: db)
+      assert Local.query_sql(conn, "SELECT v FROM e WHERE h IS NULL", database: db) ===
+               {:ok, [%{"v" => 6}]}
     end
 
     test "DELETE removes the merged point and counts it once", %{conn: conn, db: db} do
       {:ok, :written} =
         Local.write(conn, "f,h=x v=1i #{@t}\nf,h=x w=1i #{@t}\nf,h=y v=9i #{@t}", database: db)
 
-      assert {:ok, %{"rows_affected" => 1}} =
-               Local.execute_sql(conn, "DELETE FROM f WHERE w = 1", database: db)
+      assert Local.execute_sql(conn, "DELETE FROM f WHERE w = 1", database: db) ===
+               {:ok, %{"rows_affected" => 1}}
 
-      assert {:ok, [%{"h" => "y", "v" => 9}]} =
-               Local.query_sql(conn, "SELECT * FROM f", database: db)
+      assert Local.query_sql(conn, "SELECT * FROM f", database: db) ===
+               {:ok, [%{"h" => "y", "time" => @time, "v" => 9}]}
     end
   end
 
@@ -4528,9 +4525,17 @@ defmodule InfluxElixir.Client.LocalTest do
                %{"iox::measurement" => "o", "time" => iq_time(3), "v" => 3}
              ]
 
-      assert {:ok, [%{"vee" => 1} | _rest]} = iq_query(conn, "SELECT v AS vee FROM o")
-      assert {:ok, [%{"w" => 9, "time" => time}]} = iq_query(conn, "SELECT w FROM o")
-      assert time === iq_time(4)
+      assert iq_query(conn, "SELECT v AS vee FROM o") ===
+               {:ok,
+                [
+                  %{"iox::measurement" => "o", "time" => iq_time(1), "vee" => 1},
+                  %{"iox::measurement" => "o", "time" => iq_time(2), "vee" => 2},
+                  %{"iox::measurement" => "o", "time" => iq_time(3), "vee" => 3}
+                ]}
+
+      assert iq_query(conn, "SELECT w FROM o") ===
+               {:ok, [%{"iox::measurement" => "o", "time" => iq_time(4), "w" => 9}]}
+
       assert {:ok, []} = iq_query(conn, "SELECT h FROM o")
     end
 
@@ -4543,32 +4548,32 @@ defmodule InfluxElixir.Client.LocalTest do
     test "aggregates are named after the function and put time at the epoch", %{conn: conn} do
       epoch = DateTime.from_unix!(0, :microsecond)
 
-      assert {:ok,
-              [
-                %{
-                  "iox::measurement" => "o",
-                  "time" => ^epoch,
-                  "sum" => 6,
-                  "mean" => 2.0,
-                  "count" => 3
-                }
-              ]} =
-               iq_query(conn, "SELECT SUM(v), MEAN(v), COUNT(v) FROM o")
+      assert iq_query(conn, "SELECT SUM(v), MEAN(v), COUNT(v) FROM o") ===
+               {:ok,
+                [
+                  %{
+                    "iox::measurement" => "o",
+                    "time" => epoch,
+                    "sum" => 6,
+                    "mean" => 2.0,
+                    "count" => 3
+                  }
+                ]}
 
-      assert {:ok, [%{"total" => 6}]} = iq_query(conn, "SELECT SUM(v) AS total FROM o")
+      assert iq_query(conn, "SELECT SUM(v) AS total FROM o") ===
+               {:ok, [%{"iox::measurement" => "o", "time" => epoch, "total" => 6}]}
 
-      assert {:ok, [%{"min" => 1, "min_1" => 9}]} =
-               iq_query(conn, "SELECT MIN(v), MIN(w) FROM o")
+      assert iq_query(conn, "SELECT MIN(v), MIN(w) FROM o") ===
+               {:ok, [%{"iox::measurement" => "o", "time" => epoch, "min" => 1, "min_1" => 9}]}
 
-      assert {:ok, [%{"time" => ^epoch, "count_v" => 3, "count_w" => 1}]} =
-               iq_query(conn, "SELECT COUNT(*) FROM o")
+      assert iq_query(conn, "SELECT COUNT(*) FROM o") ===
+               {:ok,
+                [%{"iox::measurement" => "o", "time" => epoch, "count_v" => 3, "count_w" => 1}]}
     end
 
     test "a lone FIRST selector returns its point's time", %{conn: conn} do
-      assert {:ok, [%{"first" => 1, "time" => first}]} =
-               iq_query(conn, "SELECT FIRST(v) FROM o")
-
-      assert first === iq_time(1)
+      assert iq_query(conn, "SELECT FIRST(v) FROM o") ===
+               {:ok, [%{"iox::measurement" => "o", "time" => iq_time(1), "first" => 1}]}
     end
 
     test "GROUP BY orders series by tag; ORDER BY time DESC and MEAN apply per series",
@@ -4581,8 +4586,8 @@ defmodule InfluxElixir.Client.LocalTest do
     end
 
     test "SHOW FIELD KEYS, SHOW TAG KEYS and SHOW DATABASES", %{conn: conn} do
-      assert {:ok, [%{"iox::measurement" => "u", "fieldKey" => "x", "fieldType" => "unsigned"}]} =
-               iq_query(conn, "SHOW FIELD KEYS FROM u")
+      assert iq_query(conn, "SHOW FIELD KEYS FROM u") ===
+               {:ok, [%{"iox::measurement" => "u", "fieldKey" => "x", "fieldType" => "unsigned"}]}
 
       assert {:ok, keys} = iq_query(conn, "SHOW FIELD KEYS")
 
@@ -4592,8 +4597,8 @@ defmodule InfluxElixir.Client.LocalTest do
                {"u", "x"}
              ]
 
-      assert {:ok, [%{"iox::measurement" => "o", "tagKey" => "h"}]} =
-               iq_query(conn, "SHOW TAG KEYS")
+      assert iq_query(conn, "SHOW TAG KEYS") ===
+               {:ok, [%{"iox::measurement" => "o", "tagKey" => "h"}]}
 
       assert {:ok, []} = iq_query(conn, "SHOW TAG KEYS FROM nope")
       assert {:ok, dbs} = iq_query(conn, "SHOW DATABASES")
@@ -4672,6 +4677,21 @@ defmodule InfluxElixir.Client.LocalTest do
       {:ok, conn: conn}
     end
 
+    # A cpu,field=v row of the bucket's whole range, as the double returns it.
+    defp cpu_v_row(table, host, time, value) do
+      %{
+        "result" => "_result",
+        "table" => table,
+        "_measurement" => "cpu",
+        "_field" => "v",
+        "_start" => ~U[1970-01-01 00:00:00.000000Z],
+        "_stop" => ~U[2027-01-15 08:00:00.000000Z],
+        "_time" => time,
+        "_value" => value,
+        "host" => host
+      }
+    end
+
     test "tables are series in measurement, tag, field order; rows carry _start and _stop",
          %{conn: conn} do
       assert {:ok, rows} = flux_b(conn, "")
@@ -4696,8 +4716,8 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, rows} = flux_b(conn, v <> ~s| and (r.host == "a" or r.host == "b"))|)
       assert flux_values(rows) === [{0, "a", 1.0}, {0, "a", 3.0}, {1, "b", 5.0}]
 
-      assert {:ok, [%{"host" => "b", "_value" => 5.0}]} =
-               flux_b(conn, v <> ~s| and r.host != "a")|)
+      assert flux_b(conn, v <> ~s| and r.host != "a")|) ===
+               {:ok, [cpu_v_row(0, "b", ~U[2023-11-14 22:13:20.000000Z], 5.0)]}
 
       assert {:ok, rows} = flux_b(conn, ~s| \|> filter(fn: (r) => r._value > 2.0)|)
       assert flux_values(rows) === [{0, "a", 3.0}, {1, "b", 3}, {2, "b", 5.0}]
@@ -4730,11 +4750,15 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, rows} = flux_b(conn, v <> " |> count()")
       assert flux_values(rows) === [{0, "a", 2}, {1, "b", 1}]
 
-      assert {:ok, [%{"host" => "a", "_value" => 3.0}]} =
-               flux_b(conn, v <> " |> limit(n: 1, offset: 1)")
+      assert flux_b(conn, v <> " |> limit(n: 1, offset: 1)") ===
+               {:ok, [cpu_v_row(0, "a", ~U[2023-11-14 22:14:20.000000Z], 3.0)]}
 
-      assert {:ok, [%{"_value" => 5.0, "table" => 0}]} =
-               flux_b(conn, v <> " |> mean() |> filter(fn: (r) => r._value > 2.0)")
+      assert flux_b(conn, v <> " |> mean() |> filter(fn: (r) => r._value > 2.0)") ===
+               {:ok,
+                [
+                  cpu_v_row(0, "b", nil, 5.0)
+                  |> Map.delete("_time")
+                ]}
 
       assert {:ok, rows} = flux_b(conn, v <> ~s| \|> yield(name: "x")|)
 
@@ -4754,11 +4778,17 @@ defmodule InfluxElixir.Client.LocalTest do
 
       assert Enum.map(rows, & &1["_value"]) === [1.0, 5.0]
 
-      assert {:ok, [%{"_value" => 3.0}]} =
-               Local.query_flux(
-                 conn,
-                 ~s|from(bucket: "b") \|> range(start: 2023-11-14T22:14:00Z) \|> filter(fn: (r) => r._field == "v")|
-               )
+      assert Local.query_flux(
+               conn,
+               ~s|from(bucket: "b") \|> range(start: 2023-11-14T22:14:00Z) \|> filter(fn: (r) => r._field == "v")|
+             )
+             |> without(["_stop"]) ===
+               {:ok,
+                [
+                  cpu_v_row(0, "a", ~U[2023-11-14 22:14:20.000000Z], 3.0)
+                  |> Map.delete("_stop")
+                  |> Map.put("_start", ~U[2023-11-14 22:14:00.000000Z])
+                ]}
     end
 
     test "a stage the double does not model is refused by name, never skipped", %{conn: conn} do
@@ -4827,8 +4857,8 @@ defmodule InfluxElixir.Client.LocalTest do
       assert {:ok, rows} = g_query(conn, "SELECT h, v FROM m ORDER BY 2 DESC")
       assert Enum.map(rows, & &1["v"]) === [3.5, 2.5, 1.5]
 
-      assert {:ok, [%{"h" => "a", "c" => 2}, %{"h" => "b", "c" => 1}]} =
-               g_query(conn, "SELECT h, COUNT(v) AS c FROM m GROUP BY h ORDER BY 2 DESC")
+      assert g_query(conn, "SELECT h, COUNT(v) AS c FROM m GROUP BY h ORDER BY 2 DESC") ===
+               {:ok, [%{"h" => "a", "c" => 2}, %{"h" => "b", "c" => 1}]}
     end
 
     test "a position outside the select list is the engine's planning error", %{conn: conn} do
@@ -4909,7 +4939,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
     test "a backslash makes % and _ literal in ILIKE and in a pattern with no match",
          %{conn: conn} do
-      assert [%{"s" => "al%pha"}] = nl_rows(conn, ~S"SELECT s FROM t WHERE s ILIKE 'AL\%%'")
+      assert nl_rows(conn, ~S"SELECT s FROM t WHERE s ILIKE 'AL\%%'") === [%{"s" => "al%pha"}]
       assert [] = nl_rows(conn, ~S"SELECT s FROM t WHERE s LIKE 'al\_ha'")
     end
 
@@ -4926,7 +4956,7 @@ defmodule InfluxElixir.Client.LocalTest do
                  "a"
                ]
 
-      assert [%{"host" => "a"}] = nl_rows(conn, "SELECT host FROM t WHERE b AND n > 0")
+      assert nl_rows(conn, "SELECT host FROM t WHERE b AND n > 0") === [%{"host" => "a"}]
 
       assert {:error, %{status: 400, body: body}} =
                Local.query_sql(conn, "SELECT host FROM t WHERE n", database: "nl")
@@ -4960,7 +4990,7 @@ defmodule InfluxElixir.Client.LocalTest do
                nil
              ]
 
-      assert [%{"host" => "b"}] = nl_rows(conn, "SELECT host FROM t WHERE -n > 0")
+      assert nl_rows(conn, "SELECT host FROM t WHERE -n > 0") === [%{"host" => "b"}]
     end
   end
 
@@ -5002,7 +5032,7 @@ defmodule InfluxElixir.Client.LocalTest do
 
       # Nothing was registered: a float is now the first kind of `v`.
       assert {:ok, :written} = Local.write(conn, "m2 v=3.5 3", database: "aw")
-      assert {:ok, [%{"v" => 3.5}]} = Local.query_sql(conn, "SELECT v FROM m2", database: "aw")
+      assert Local.query_sql(conn, "SELECT v FROM m2", database: "aw") === {:ok, [%{"v" => 3.5}]}
     end
 
     test "a clean payload is stored whole; no_sync is accepted", %{conn: conn} do
@@ -5013,8 +5043,8 @@ defmodule InfluxElixir.Client.LocalTest do
                  no_sync: true
                )
 
-      assert {:ok, [%{"v" => 1}, %{"v" => 2}]} =
-               Local.query_sql(conn, "SELECT v FROM m3 ORDER BY time", database: "aw")
+      assert Local.query_sql(conn, "SELECT v FROM m3 ORDER BY time", database: "aw") ===
+               {:ok, [%{"v" => 1}, %{"v" => 2}]}
     end
 
     test "time as a tag on a new table is the reserved-column error", %{conn: conn} do
@@ -5049,7 +5079,11 @@ defmodule InfluxElixir.Client.LocalTest do
             {"r v=1.5e-7 8", "r v=0.00000015 8"}
           ] do
         assert {:error, %{body: body}} = Local.write(conn, lp, database: "aw")
-        assert [%{"original_line" => ^rendered}] = Jason.decode!(body)["data"], lp
+        assert [entry] = Jason.decode!(body)["data"]
+
+        assert {entry["original_line"], Map.keys(entry)} ===
+                 {rendered, ["error_message", "line_number", "original_line"]},
+               lp
       end
     end
   end

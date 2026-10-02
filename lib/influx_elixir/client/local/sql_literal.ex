@@ -74,9 +74,13 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
   @spec param?(binary()) :: boolean()
   def param?(text), do: param_name(text) != nil
 
-  @doc "Whether the text is a string, a boolean or a number."
+  @doc """
+  Whether the text is a string, a boolean or a number, one past the range of
+  a double (`1e400`) included.
+  """
   @spec literal?(binary()) :: boolean()
-  def literal?(text), do: string?(text) or text in ["true", "false"] or is_number(coerce(text))
+  def literal?(text),
+    do: string?(text) or text in ["true", "false"] or is_number(coerce(text)) or float?(text)
 
   @doc """
   A literal as a value: a quoted one is a string, only a bare one is typed,

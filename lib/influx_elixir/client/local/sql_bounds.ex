@@ -23,6 +23,14 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   compared with a float literal is cast by the engine and does not take
   part.
 
+  The same analysis evaluates the constants of the conjuncts it takes, and one
+  that overflows (the negation of the smallest integer of a type) fails the
+  query before any row is read: status 500, `Arrow error: Arithmetic overflow:
+  Overflow happened on: - -9223372036854775808`. It does so only when the
+  analysis takes every conjunct; with one it cannot take (or in a select
+  list) the constant is read per row, and the connection is closed
+  (`SQLNumber.negate/2`).
+
   The body names the first conjunct, in the order written (`BETWEEN` is
   `>= low` then `<= high`): a lower bound or `>=` reads `lhs:Null,
   rhs:<type>`, an upper bound `lhs:<type>, rhs:Null`, an `=` is the
@@ -38,7 +46,9 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
 
   import Bitwise
 
-  alias InfluxElixir.Client.Local.SQLError
+  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLFold, SQLLimits, SQLPredicates}
+
+  require SQLLimits
 
   @typedoc "What the engine's analysis reads a numeric column as; `:other` is any other column."
   @type column_type :: :int64 | :uint64 | :float64 | :other
@@ -46,29 +56,10 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   @typedoc "Looks up a column's type, or `nil` for a column that is not there."
   @type type_of :: (binary() -> column_type() | nil)
 
-  @int64_min -9_223_372_036_854_775_808
-  @int64_max 9_223_372_036_854_775_807
-  @uint64_max 18_446_744_073_709_551_615
-  @float_max 1.797_693_134_862_315_7e308
-
-  @negations %{
-    gt: :lte,
-    gte: :lt,
-    lt: :gte,
-    lte: :gt,
-    eq: :ne,
-    ne: :eq,
-    between: :not_between,
-    not_between: :between,
-    in: :not_in,
-    not_in: :in,
-    is_null: :is_not_null,
-    is_not_null: :is_null,
-    like: :not_like,
-    not_like: :like,
-    regex: :not_regex,
-    not_regex: :regex
-  }
+  @int64_min SQLLimits.int64_min()
+  @int64_max SQLLimits.int64_max()
+  @uint64_max SQLLimits.uint64_max()
+  @float_max SQLLimits.float_max()
 
   @bounds [:gt, :gte, :lt, :lte, :eq]
 
@@ -79,6 +70,8 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
            | {:unknown, binary()}
            | {:bound, binary(), column_type(), atom(), number()}
            | {:cast, binary(), column_type(), atom(), float()}
+           | {:overflow, binary()}
+           | :division
 
   @doc """
   Whether the engine fails the `WHERE`: `:ok`, or the engine's error, or the
@@ -88,11 +81,66 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   """
   @spec check([term()], type_of(), keyword()) :: :ok | {:error, SQLError.t()}
   def check(where, type_of, opts \\ []) do
-    leaves = where |> leaves(false, type_of) |> fold_disablers()
+    leaves = where |> SQLPredicates.flatten(false, leaf_spec(type_of)) |> fold_disablers()
 
-    if Enum.any?(leaves, &match?({:disabler, _columns}, &1)),
-      do: :ok,
-      else: leaves |> analyse() |> answer(Keyword.get(opts, :cte, false))
+    cte? = Keyword.get(opts, :cte, false)
+
+    cond do
+      Enum.any?(leaves, &match?({:disabler, _columns}, &1)) ->
+        :ok
+
+      overflow = Enum.find(leaves, &match?({:overflow, _text}, &1)) ->
+        overflow(leaves, overflow, cte?)
+
+      :division in leaves ->
+        division(leaves)
+
+      true ->
+        leaves |> analyse() |> answer(cte?)
+    end
+  end
+
+  # A constant that divides a minimum by -1 makes the analysis' intervals
+  # disagree in type when another comparison meets it, an internal error whose
+  # wording the double does not model; alone, it is read per row and closes
+  # the connection.
+  @spec division([leaf()]) :: :ok | {:error, SQLError.t()}
+  defp division(leaves) do
+    taken = Enum.reject(leaves, &match?({:unknown, _what}, &1))
+
+    if match?([_, _ | _], leaves) and taken != [],
+      do:
+        {:error,
+         SQLError.refusal(
+           "a WHERE with a constant that divides a minimum by -1 beside another comparison: " <>
+             "the engine fails it in its interval analysis with an internal error that is " <>
+             "not modelled"
+         )},
+      else: :ok
+  end
+
+  # The analysis meets a constant that overflows: it fails the query, unless
+  # a conjunct it cannot take is there, whose effect on it is not pinned down.
+  @spec overflow([leaf()], {:overflow, binary()}, boolean()) :: :ok | {:error, SQLError.t()}
+  defp overflow(leaves, {:overflow, text}, cte?) do
+    case Enum.find(leaves, &match?({:unknown, _what}, &1)) do
+      {:unknown, what} ->
+        {:error,
+         SQLError.refusal(
+           "a WHERE with a constant that overflows (a negated minimum) beside #{what}: the " <>
+             "engine's answer is not pinned down"
+         )}
+
+      nil when cte? ->
+        {:error,
+         SQLError.refusal(
+           "a WHERE over a CTE with a constant that overflows (a negated minimum): the " <>
+             "engine's answer depends on where it pushes the filter"
+         )}
+
+      nil ->
+        {:error, SQLError.overflow(text)}
+    end
   end
 
   # A predicate that stops the analysis stops it only if the optimizer
@@ -117,29 +165,82 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   # The conjuncts
   # ---------------------------------------------------------------------------
 
-  @spec leaves([term()], boolean(), type_of()) :: [leaf()]
-  defp leaves(nodes, false, type_of), do: Enum.flat_map(nodes, &leaf(&1, false, type_of))
-  defp leaves([], true, _type_of), do: [{:disabler, []}]
-  defp leaves([node], true, type_of), do: leaf(node, true, type_of)
-  defp leaves(nodes, true, _type_of), do: [{:disabler, columns_of(nodes)}]
-
-  @spec leaf(term(), boolean(), type_of()) :: [leaf()]
-  defp leaf({:or, []}, false, _type_of), do: [{:disabler, []}]
-  defp leaf({:or, []}, true, _type_of), do: []
-  defp leaf({:or, _branches} = node, false, _type_of), do: [{:disabler, columns_of(node)}]
-
-  defp leaf({:or, branches}, true, type_of),
-    do: Enum.flat_map(branches, &leaves(&1, true, type_of))
-
-  defp leaf({:not, nodes}, negated, type_of), do: leaves(nodes, not negated, type_of)
-  defp leaf({:truthy, column, _nil}, _negated, _type_of), do: [{:disabler, [column]}]
-
-  defp leaf({op, operand, rhs}, negated, type_of) do
-    op = if negated, do: Map.get(@negations, op, op), else: op
-    clause(op, operand, rhs, type_of)
+  # What `SQLPredicates.flatten/3` puts for each kind of conjunct: a constant
+  # false or a conjunct that hides its columns stops the analysis.
+  @spec leaf_spec(type_of()) :: SQLPredicates.leaves()
+  defp leaf_spec(type_of) do
+    %{
+      never: {:disabler, []},
+      opaque: &{:disabler, columns_of(&1)},
+      clause: &clause_leaves(&1, &2, type_of)
+    }
   end
 
-  defp leaf(_other, _negated, _type_of), do: [{:unknown, "an unrecognised predicate"}]
+  @spec clause_leaves(term(), boolean(), type_of()) :: [leaf()]
+  defp clause_leaves({:truthy, column, _nil}, _negated, _type_of), do: [{:disabler, [column]}]
+
+  defp clause_leaves({op, operand, rhs}, negated, type_of) do
+    op = if negated, do: SQLPredicates.negate_op(op), else: op
+
+    case overflowing(operand, rhs) do
+      nil -> clause(op, operand, rhs, type_of)
+      leaf -> overflow_leaves(op, operand, rhs, leaf, type_of)
+    end
+  end
+
+  defp clause_leaves(_other, _negated, _type_of), do: [{:unknown, "an unrecognised predicate"}]
+
+  # The leaf for the first constant overflow in a conjunct's operands: a
+  # negation, or a division.
+  @spec overflowing(term(), term()) :: {:overflow, binary()} | :division | nil
+  defp overflowing(operand, rhs) do
+    exprs = Enum.flat_map([operand, rhs], &operand_exprs/1)
+
+    case Enum.find_value(exprs, &SQLFold.negation_overflow/1) do
+      nil -> if Enum.any?(exprs, &SQLFold.division_overflow?/1), do: :division
+      text -> {:overflow, text}
+    end
+  end
+
+  @spec operand_exprs(term()) :: [SQLExpr.t()]
+  defp operand_exprs({:expr, expr}), do: [expr]
+  defp operand_exprs(list) when is_list(list), do: Enum.flat_map(list, &operand_exprs/1)
+  defp operand_exprs({low, high}), do: operand_exprs(low) ++ operand_exprs(high)
+  defp operand_exprs(_other), do: []
+
+  # What a conjunct with an overflowing constant is to the analysis: the
+  # comparisons it reads take it to the constant; the rest it cannot take.
+  @spec overflow_leaves(atom(), term(), term(), {:overflow, binary()} | :division, type_of()) ::
+          [leaf()]
+  defp overflow_leaves(op, operand, rhs, leaf, type_of) do
+    cond do
+      op in [:ne, :not_in, :not_between, :is_null, :is_not_null] -> [{:disabler, [:any]}]
+      op == :in and length(List.wrap(rhs)) > 1 -> [{:disabler, [:any]}]
+      op not in [:in, :between | @bounds] -> [{:unknown, "a predicate the analysis may not take"}]
+      is_binary(operand) -> overflow_column(operand, leaf, type_of)
+      true -> overflow_expression(operand, leaf, type_of)
+    end
+  end
+
+  @spec overflow_column(binary(), leaf(), type_of()) :: [leaf()]
+  defp overflow_column("time", _leaf, _type_of), do: [{:unknown, "a comparison of time"}]
+
+  defp overflow_column(column, leaf, type_of) do
+    case type_of.(column) do
+      nil -> [{:unknown, "a column the double does not know"}]
+      :other -> [{:disabler, [column]}]
+      _numeric -> [leaf]
+    end
+  end
+
+  @spec overflow_expression(term(), leaf(), type_of()) :: [leaf()]
+  defp overflow_expression({:expr, expr}, leaf, type_of) do
+    types = for column <- SQLExpr.columns(expr), is_binary(column), do: type_of.(column)
+
+    if Enum.all?(types, &(&1 in [:int64, :uint64, :float64])),
+      do: [leaf],
+      else: [{:unknown, "an expression over a column the double does not read as a number"}]
+  end
 
   @spec clause(atom(), term(), term(), type_of()) :: [leaf()]
   defp clause(_op, {:expr, _expr}, _rhs, _type_of),
@@ -216,10 +317,10 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   defp columns_of(_other), do: [:any]
 
   @spec integer_bound(atom(), binary(), column_type(), integer()) :: [leaf()]
-  defp integer_bound(op, column, :int64, n) when n in @int64_min..@int64_max,
+  defp integer_bound(op, column, :int64, n) when SQLLimits.is_int64(n),
     do: [{:bound, column, :int64, op, n}]
 
-  defp integer_bound(op, column, :uint64, n) when n in 0..@uint64_max,
+  defp integer_bound(op, column, :uint64, n) when SQLLimits.is_uint64(n),
     do: [{:bound, column, :uint64, op, n}]
 
   defp integer_bound(_op, _column, _type, _n),

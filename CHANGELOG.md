@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` crashed on float overflow.** `f * 1e308 * 1e308`, a
+  `sum` past the double range and the like raised `ArithmeticError`; they
+  now answer `null` as the engine does, and an infinity compares as a
+  number in `WHERE` and `ORDER BY`. A float divided by zero is no longer
+  refused. An Int64 `sum` past the range wraps, as on the engine.
+- **Unsigned (`UInt64`) fields in `Client.Local` SQL were treated as
+  Int64.** `u / 2` gave `2` where the engine gives the decimal `2.5000`;
+  `-u` answered where the engine refuses the negation; `u + n` wrapped at
+  the wrong width. Unsigned columns now follow the engine's decimal and
+  wrap rules.
+- **More `Client.Local` SQL answers now match the engine:** `trunc`;
+  `(v)` named `v`; an unaliased `1e400` named `Float64(inf)`; `ORDER BY`
+  positions on `SELECT *` and their range errors; schema errors before a
+  `time` type error; a `time` bound at the last nanosecond. A qualified
+  reference to a column both sides of a `CROSS JOIN` have is refused by
+  name instead of the engine's "ambiguous" error the engine does not give.
+- **InfluxQL in `Client.Local` accepted reserved words.**
+  `WHERE tag = 'a'`, `SELECT name`, `GROUP BY key` and the rest of the
+  engine's keywords are its positioned parse errors; a failing statement
+  after `;` gives that statement's own error; `LIMIT`/`OFFSET` past Int64
+  are the engine's range errors; a boolean field compared with a number,
+  and a negative number compared with an unsigned field, answer as the
+  engine does.
+- **A `Client.Local` lock taken again by its holder hung forever.** It now
+  raises.
+- **`CAST(x AS INTEGER)` in `Client.Local` was a 64-bit integer.** On the
+  engine `INTEGER`/`INT` is Int32, `SMALLINT` Int16 and `TINYINT` Int8, so
+  arithmetic on them wraps at that width and a constant that does not fit
+  is the optimizer's 500. Local now does the same, unwraps a cast compared
+  with an integer literal in `WHERE` as the engine's optimizer does, and
+  folds a failing constant cast or a negated minimum into the engine's
+  500 instead of closing the connection. `FLOAT`/`REAL` (Float32),
+  unsigned and `DECIMAL` casts are refused by name.
 - **`Client.Local` refused aggregates and expressions without `AS`.**
   `SELECT count(*) FROM t` now answers `[%{"count(*)" => n}]`, and every
   unaliased item is named as the engine names it (`avg(t.v)`,
@@ -16,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails.** A `time` range the top-level `AND` leaves empty is the engine's
   500 "provided filters on time column did not produce a valid set of
   boundaries"; an empty range on a numeric field is the engine's
-  DataFusion internal error, in its four wordings. InfluxQL still answers
+  DataFusion internal error, in its three wordings. InfluxQL still answers
   `[]`, as the engine does.
 - **More `Client.Local` SQL answers now match InfluxDB 3 Core:**
   - "Valid fields are" lists columns qualified by the table, with the
@@ -49,7 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parse for 2,000 lines or more sized a process for the whole payload, which
   added about 1 GB for 200k lines (8.7 GB for eight at once), and it kept
   running after its caller died. Lines are now parsed 10k at a time, each
-  chunk in a process that ends with the chunk: 287 MB for 200k lines, and
+  chunk in a process that ends with the chunk: about 170 MB retained and
+  380-470 MB at peak for 200k lines, and
   the speed is unchanged.
 - **InfluxDB 2 reads of a field with mixed types stopped at the wrong
   group in `Client.Local`.** The engine reads the earliest group's type up
@@ -155,6 +189,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   40k points in 40k hourly groups took 8.6 s; they now take about 0.2 s.
 
 ### Changed
+- **`Client.Local`'s SQL executor is split into focused modules**
+  (`SQLNumber`, `SQLCast`, `SQLEval`, `SQLAggregate`, `SQLCondition`,
+  `SQLSort`, `SQLRow`, `SQLTyping`, `SQLPlan`, `SQLSchema`, `SQLGrouping`,
+  `SQLJoin`, `SQLRange`, `SQLFold`, with shared `SQLLimits` and
+  `SQLPredicates`); `SQLExecutor` keeps the pipeline.
+- **Tests compare whole results.** About 150 partial map patterns, which
+  ignore extra keys, became exact comparisons; numeric `==` became `===`
+  outside the contract modules too; the batch writer's backpressure test
+  is driven by a listener the test controls instead of the clock.
 - **`Client.Local` store API trimmed.** `Store.measurement?/3`,
   `Store.store_point/3` and `InfluxQL.where_sql/2` are removed and
   `Store.put_database/2` is private; `SQLExecutor.run/2` is

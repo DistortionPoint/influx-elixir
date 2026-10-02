@@ -99,7 +99,9 @@ defmodule InfluxElixir.Client.Local.Store do
   # retries at once instead of backing off for as long as a node-wide lock
   # would make it. The holder deletes its key when the function returns or
   # raises; a key left by a holder that died is deleted, as that exact
-  # object, by the next waiter that finds the holder dead.
+  # object, by the next waiter that finds the holder dead. A waiter waits
+  # without bound while a live holder runs, and the lock is not re-entrant:
+  # a holder that asks for its own lock again raises instead of spinning.
   @spec with_lock(t(), atom(), (-> result)) :: result when result: term()
   defp with_lock(table, resource, fun) do
     key = {:lock, resource}
@@ -118,6 +120,7 @@ defmodule InfluxElixir.Client.Local.Store do
       :ok
     else
       with [{^key, holder} = held] <- :ets.lookup(table, key),
+           :ok <- not_self(holder, key),
            false <- Process.alive?(holder) do
         :ets.delete_object(table, held)
       end
@@ -128,6 +131,16 @@ defmodule InfluxElixir.Client.Local.Store do
       end
     end
   end
+
+  @spec not_self(pid(), {:lock, atom()}) :: :ok
+  defp not_self(holder, {:lock, resource}) when holder == self(),
+    do:
+      raise(
+        "Client.Local.Store: the #{resource} lock is already held by this process; " <>
+          "a critical section cannot start another that takes it"
+      )
+
+  defp not_self(_holder, _key), do: :ok
 
   @doc "Whether a database is registered."
   @spec database?(t(), binary()) :: boolean()

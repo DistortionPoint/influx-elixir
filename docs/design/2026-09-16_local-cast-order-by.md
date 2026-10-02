@@ -27,7 +27,7 @@ The rest of `CAST`'s surface, recorded from the engine before implementing:
 
 | Query | Engine |
 |---|---|
-| `CAST(level AS BIGINT | INT)`, `level::INTEGER` | as `INTEGER` |
+| `CAST(level AS BIGINT | INT)`, `level::INTEGER` | as `INTEGER` (later found to be Int32 for `INT`/`INTEGER`, Int64 only for `BIGINT`; see [`2026-10-02_fourth-review`](2026-10-02_fourth-review.md)) |
 | `CAST(level AS DOUBLE) <= 20.5` | numeric |
 | `CAST(qty AS VARCHAR) = '2'` | text |
 | `SELECT CAST(level AS INTEGER) AS lvl ... ORDER BY lvl` | 5, 20, 100 |

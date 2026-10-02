@@ -27,8 +27,20 @@ defmodule InfluxElixir.Admin.BucketsTest do
     test ":retention is kept in seconds and listed as the bucket's rule", %{conn: conn} do
       assert :ok = Buckets.create(conn, "hourly", retention: 3600)
 
-      assert {:ok, [%{"name" => "hourly", "retentionRules" => [%{"everySeconds" => 3600}]}]} =
-               Buckets.list(conn)
+      # The ids, links and timestamps are generated; the name and the rules are the subject.
+      assert {:ok, [bucket]} = Buckets.list(conn)
+
+      assert Map.take(bucket, ["name", "retentionRules"]) ===
+               %{
+                 "name" => "hourly",
+                 "retentionRules" => [
+                   %{
+                     "type" => "expire",
+                     "everySeconds" => 3600,
+                     "shardGroupDurationSeconds" => 3600
+                   }
+                 ]
+               }
     end
 
     test "a retention under one hour is refused the way InfluxDB 2 refuses it", %{conn: conn} do

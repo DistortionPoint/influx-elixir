@@ -138,12 +138,18 @@ defmodule InfluxElixir.Client.Local.SQLBind do
     with {:ok, bound} <- bind_where_nodes(nodes, params), do: {:ok, {:not, bound}}
   end
 
-  defp bind_node({op, "time", {low, high}}, params) when op in [:between, :not_between],
-    do: SQLTime.between(op, resolve_time(low, params), resolve_time(high, params))
+  defp bind_node({op, "time", {low, high}}, params) when op in [:between, :not_between] do
+    case SQLTime.between(op, resolve_time(low, params), resolve_time(high, params)) do
+      {:error, error} -> {:ok, SQLWhere.deferred_clause(error)}
+      ok -> ok
+    end
+  end
 
   defp bind_node({op, "time", items}, params) when op in [:in, :not_in] do
-    with {:ok, bounds} <- SQLTime.in_list(Enum.map(items, &resolve_time(&1, params))),
-         do: {:ok, {op, "time", bounds}}
+    case SQLTime.in_list(Enum.map(items, &resolve_time(&1, params))) do
+      {:ok, bounds} -> {:ok, {op, "time", bounds}}
+      {:error, error} -> {:ok, SQLWhere.deferred_clause(error)}
+    end
   end
 
   defp bind_node({op, "time", value}, params) when op in @comparison_ops,
@@ -277,7 +283,10 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   defp bind_time_comparison(op, {:param, name}, params) do
     case SQLTime.param(Map.fetch!(params, name)) do
       {:number, type} ->
-        {:error, SQLTime.comparison_type_error("Timestamp(ns)", SQLWhere.symbol(op), type)}
+        {:ok,
+         SQLWhere.deferred_clause(
+           SQLTime.comparison_type_error("Timestamp(ns)", SQLWhere.symbol(op), type)
+         )}
 
       bound ->
         {:ok, {op, "time", bound}}
@@ -287,11 +296,13 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   defp bind_time_comparison(op, {:param, name, :left}, params) do
     case SQLTime.param(Map.fetch!(params, name)) do
       {:number, type} ->
-        {:error,
-         SQLTime.comparison_type_error(
-           type,
-           SQLWhere.symbol(SQLWhere.mirror(op)),
-           "Timestamp(ns)"
+        {:ok,
+         SQLWhere.deferred_clause(
+           SQLTime.comparison_type_error(
+             type,
+             SQLWhere.symbol(SQLWhere.mirror(op)),
+             "Timestamp(ns)"
+           )
          )}
 
       bound ->

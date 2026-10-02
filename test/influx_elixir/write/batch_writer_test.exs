@@ -1,6 +1,8 @@
 defmodule InfluxElixir.Write.BatchWriterTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   # The writer logs every discarded batch and retry; the error-path tests
   # below trigger those deliberately, so keep the output out of the run.
   @moduletag capture_log: true
@@ -35,11 +37,12 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       :ok = BatchWriter.write_sync(pid, "cpu value=7.0")
 
-      assert {:ok, [%{"value" => 7.0}]} =
-               Local.query_sql(conn, "SELECT * FROM cpu", database: "target_db")
+      # No timestamp was written, so `time` is the clock's.
+      assert conn |> Local.query_sql("SELECT * FROM cpu", database: "target_db") |> no_clock() ===
+               {:ok, [%{"value" => 7.0}]}
 
-      assert {:ok, [%{"name" => "_internal"}, %{"name" => "target_db"}]} =
-               Local.list_databases(conn)
+      assert Local.list_databases(conn) ===
+               {:ok, [%{"name" => "_internal"}, %{"name" => "target_db"}]}
     end
 
     test "starts with empty buffer and zeroed stats", %{conn: conn} do
@@ -59,6 +62,13 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
+  # A row written at 1 or 2 ns, which reads back as the epoch.
+  defp epoch_row(value), do: %{"time" => ~U[1970-01-01 00:00:00.000000Z], "value" => value}
+
+  # A query result without the `time` the clock assigned to a write that
+  # carried none; the rest is compared whole.
+  defp no_clock({:ok, rows}), do: {:ok, Enum.map(rows, &Map.delete(&1, "time"))}
+
   describe "write/3" do
     test "buffers lines and Points until a flush stores them", %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 60_000)
@@ -67,7 +77,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       assert stored(conn, "cpu") == []
       :ok = BatchWriter.flush(pid)
-      assert [%{"value" => 1.0}, %{"value" => 0.64}] = stored(conn, "cpu")
+      assert stored(conn, "cpu") === [epoch_row(1.0), epoch_row(0.64)]
     end
 
     test "flushes on its own when the buffer reaches batch_size", %{conn: conn} do
@@ -90,7 +100,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       :ok = BatchWriter.write(pid, "cpu value=1.0 1")
 
       assert :ok = BatchWriter.write_sync(pid, Point.new("cpu", %{"value" => 2.0}, timestamp: 2))
-      assert [%{"value" => 1.0}, %{"value" => 2.0}] = stored(conn, "cpu")
+      assert stored(conn, "cpu") === [epoch_row(1.0), epoch_row(2.0)]
       assert {:ok, %{total_writes: 1}} = BatchWriter.stats(pid)
     end
   end
@@ -158,10 +168,10 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert {:ok, [row]} =
                Local.query_sql(conn, "SELECT * FROM cpu", database: "metrics")
 
-      assert row["value"] == 1.0
+      assert row["value"] === 1.0
 
-      assert {:ok, [%{"name" => "_internal"}, %{"name" => "metrics"}]} =
-               Local.list_databases(conn)
+      assert Local.list_databases(conn) ===
+               {:ok, [%{"name" => "_internal"}, %{"name" => "metrics"}]}
     end
   end
 
@@ -194,8 +204,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       :ok = BatchWriter.write(pid, "cpu v=22.0")
       :ok = BatchWriter.flush(pid)
 
-      assert {:ok, %{total_writes: 2, total_bytes: 19, total_errors: 0}} =
-               BatchWriter.stats(pid)
+      assert BatchWriter.stats(pid) ===
+               {:ok, %{total_writes: 2, total_bytes: 19, total_errors: 0}}
     end
   end
 
@@ -231,7 +241,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
         wait_until(fn -> match?({:ok, %{total_writes: 1}}, BatchWriter.stats(pid)) end)
 
         assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
-        assert row["value"] == 1.0
+        assert row["value"] === 1.0
       end
     end
 
@@ -254,7 +264,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
                BatchWriter.stats(pid)
 
       assert {:ok, rows} = Local.query_sql(conn, "SELECT value FROM cpu", database: "test_db")
-      assert rows |> Enum.map(& &1["value"]) |> Enum.sort() == [1.0, 2.0, 3.0]
+      assert rows |> Enum.map(& &1["value"]) |> Enum.sort() === [1.0, 2.0, 3.0]
     end
 
     test "the timer keeps flushing after an explicit flush/2", %{conn: conn} do
@@ -295,8 +305,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       :ok = stop_supervised!(BatchWriter)
 
-      assert {:ok, [%{"value" => 42.0}]} =
-               Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
+      assert conn |> Local.query_sql("SELECT * FROM cpu", database: "test_db") |> no_clock() ===
+               {:ok, [%{"value" => 42.0}]}
     end
 
     test ":shutdown sets how long the supervisor waits for the final flush" do
@@ -338,7 +348,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       :ok = BatchWriter.write_sync(pid, Point.new("cpu", %{"v" => 1}, timestamp: dt))
 
-      assert [%{"time" => ~U[2026-09-28 12:00:00.123000Z]}] = stored(conn, "cpu")
+      assert stored(conn, "cpu") === [%{"time" => ~U[2026-09-28 12:00:00.123000Z], "v" => 1}]
     end
   end
 
@@ -354,8 +364,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       :ok = BatchWriter.flush(pid)
 
-      assert {:ok, [%{"value" => 1.0}]} =
-               Local.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
+      assert conn |> Local.query_sql("SELECT * FROM cpu", database: "test_db") |> no_clock() ===
+               {:ok, [%{"value" => 1.0}]}
     end
   end
 
@@ -395,8 +405,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       :ok = BatchWriter.flush(pid)
       assert {:ok, %{total_writes: 1}} = BatchWriter.stats(pid)
 
-      assert {:ok, [%{"value" => 1.0}]} =
-               Local.query_sql(conn, "SELECT value FROM cpu", database: "test_db")
+      assert Local.query_sql(conn, "SELECT value FROM cpu", database: "test_db") ===
+               {:ok, [%{"value" => 1.0}]}
     end
   end
 
@@ -427,6 +437,134 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert stats.total_errors == 1
       assert stats.total_writes == 0
     end
+  end
+
+  # A listener the test controls, run under the test's supervisor. Each
+  # request is announced to the test as `{:request, handler, body}`; the
+  # connection is answered, and closed, when the test sends the handler
+  # `{:respond, status}`. Requests are served one at a time, which is how the
+  # single writer process issues them.
+  defp controlled_server do
+    owner = self()
+    ref = make_ref()
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {Task,
+         fn ->
+           {:ok, listener} =
+             :gen_tcp.listen(0, [
+               :binary,
+               packet: :http_bin,
+               active: false,
+               reuseaddr: true,
+               backlog: 128
+             ])
+
+           {:ok, port} = :inet.port(listener)
+           send(owner, {ref, port})
+           serve_requests(listener, owner)
+         end},
+        id: ref
+      )
+    )
+
+    receive do
+      {^ref, port} -> port
+    after
+      5_000 -> flunk("the controlled server did not start listening")
+    end
+  end
+
+  defp serve_requests(listener, owner) do
+    {:ok, socket} = :gen_tcp.accept(listener)
+    {:ok, {:http_request, _method, _path, _version}} = :gen_tcp.recv(socket, 0)
+
+    length =
+      socket |> request_headers(%{}) |> Map.get("content-length", "0") |> String.to_integer()
+
+    :ok = :inet.setopts(socket, packet: :raw)
+    {:ok, body} = if length == 0, do: {:ok, ""}, else: :gen_tcp.recv(socket, length)
+
+    send(owner, {:request, self(), body})
+
+    receive do
+      {:respond, status} ->
+        :ok =
+          :gen_tcp.send(
+            socket,
+            "HTTP/1.1 #{status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+          )
+
+        :ok = :gen_tcp.close(socket)
+    end
+
+    serve_requests(listener, owner)
+  end
+
+  defp request_headers(socket, acc) do
+    case :gen_tcp.recv(socket, 0) do
+      {:ok, {:http_header, _position, name, _reserved, value}} ->
+        request_headers(socket, Map.put(acc, name |> to_string() |> String.downcase(), value))
+
+      {:ok, :http_eoh} ->
+        acc
+    end
+  end
+
+  # Chain 1's retry gets a 400, which ends it; chain 2's requests get 503
+  # until then. Returns the first chain 2 request that arrives afterwards,
+  # unanswered, so the writer stays blocked on it. Whichever chain's timer
+  # fires first, the outcome is the same.
+  defp answer_until_chain_two_is_held(chain_one_ended?) do
+    receive do
+      {:request, handler, "cpu value=1.0"} ->
+        send(handler, {:respond, 400})
+        answer_until_chain_two_is_held(true)
+
+      {:request, handler, "cpu value=2.0"} when chain_one_ended? ->
+        handler
+
+      {:request, handler, "cpu value=2.0"} ->
+        send(handler, {:respond, 503})
+        answer_until_chain_two_is_held(false)
+    after
+      5_000 -> flunk("no request arrived from the writer")
+    end
+  end
+
+  # Waits for a task's reply, answering any request the writer makes meanwhile
+  # with a success.
+  defp await_serving(%Task{ref: ref} = task) do
+    receive do
+      {:request, handler, _body} ->
+        send(handler, {:respond, 204})
+        await_serving(task)
+
+      {^ref, reply} ->
+        Process.demonitor(ref, [:flush])
+        reply
+    after
+      5_000 -> flunk("the call was never answered")
+    end
+  end
+
+  defp settled_stats(pid) do
+    case await_serving(Task.async(fn -> BatchWriter.stats(pid) end)) do
+      {:ok, %{total_writes: 2}} = settled -> settled
+      {:ok, _unsettled} -> settled_stats(pid)
+    end
+  end
+
+  # How many calls of `kind` sit unread in the writer's mailbox.
+  defp queued_calls(pid, kind) do
+    {:messages, messages} = Process.info(pid, :messages)
+
+    Enum.count(messages, fn
+      {:"$gen_call", _from, {^kind, _payload}} -> true
+      {:"$gen_call", _from, ^kind} -> true
+      _other -> false
+    end)
   end
 
   # Transport errors come from a real HTTP client pointed at a closed port
@@ -482,6 +620,10 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       assert {:error, :buffer_full} = BatchWriter.write(pid, "cpu value=11.0")
       assert {:error, :buffer_full} = BatchWriter.write_sync(pid, "cpu value=11.0")
+
+      # The held buffer is flushed once more at shutdown, and that fails too.
+      assert capture_log(fn -> :ok = stop_supervised!(BatchWriter) end) =~
+               "Final flush failed"
     end
 
     test "retries exhaust max_retries and record one error", %{http_conn: conn} do
@@ -561,31 +703,60 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
     test "backpressure holds while any chain is in flight, not just the first",
          %{http_conn: conn} do
-      # With max_retries: 1 a chain lasts 2 * base_retry_delay_ms. Chain 1
-      # ends 3s after it starts; chain 2 starts 1.2s later, so it is still
-      # retrying for 1.2s after chain 1 ends. Every margin is over a second.
+      # The test is the server: it answers every request itself, so the order
+      # of events is its to decide and no clock is involved. Chain 1 ends on a
+      # 400 while chain 2 is mid-retry (its request held, the writer blocked
+      # on it); the writes queued meanwhile must then meet the bound.
+      conn = Keyword.put(conn, :port, controlled_server())
+
       pid =
         start_writer(conn,
           client: InfluxElixir.Client.HTTP,
           batch_size: 1,
           flush_interval_ms: 60_000,
-          max_retries: 1,
-          base_retry_delay_ms: 1_500
+          max_retries: 3,
+          base_retry_delay_ms: 1
         )
 
-      :ok = BatchWriter.write(pid, "cpu value=1.0")
-      Process.sleep(1_200)
-      :ok = BatchWriter.write(pid, "cpu value=2.0")
-      :ok = BatchWriter.flush(pid)
+      # Chain 1's first attempt: held while the writer is blocked on it, so
+      # the next two calls are queued behind it in a known order.
+      first = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
+      assert_receive {:request, held, "cpu value=1.0"}, 5_000
 
-      wait_until(fn -> match?({:ok, %{total_errors: 1}}, BatchWriter.stats(pid)) end, 10_000)
+      second = Task.async(fn -> BatchWriter.write(pid, "cpu value=2.0") end)
+      wait_until(fn -> queued_calls(pid, :write) == 1 end)
+      flush = Task.async(fn -> BatchWriter.flush(pid) end)
+      wait_until(fn -> queued_calls(pid, :flush) == 1 end)
 
-      # Chain 2 is still retrying. The end of chain 1 used to clear the
-      # single in-flight marker, so these flushed into new chains instead
-      # of being held to the backpressure bound.
-      for i <- 1..10, do: assert(:ok = BatchWriter.write(pid, "cpu value=#{i}.5"))
-      assert {:error, :buffer_full} = BatchWriter.write(pid, "cpu value=11.5")
-      assert {:ok, %{total_errors: 1}} = BatchWriter.stats(pid)
+      send(held, {:respond, 503})
+      assert :ok = Task.await(first)
+
+      # Chain 2's first attempt, started by the queued flush before any retry.
+      assert_receive {:request, chain_two, "cpu value=2.0"}, 5_000
+      send(chain_two, {:respond, 503})
+      assert :ok = Task.await(second)
+      assert :ok = Task.await(flush)
+
+      held_retry = answer_until_chain_two_is_held(false)
+
+      writes =
+        for i <- 1..11 do
+          Task.async(fn -> BatchWriter.write(pid, "cpu value=#{i}.5") end)
+        end
+
+      wait_until(fn -> queued_calls(pid, :write) == 11 end)
+
+      # Chain 2 stays in flight when its held attempt fails; everything the
+      # writer takes next sees that chain, and the end of chain 1 must not
+      # have forgotten it. The server accepts every request from here on.
+      send(held_retry, {:respond, 503})
+
+      replies = Enum.map(writes, &await_serving/1)
+      assert Enum.frequencies(replies) === %{:ok => 10, {:error, :buffer_full} => 1}
+
+      # Chain 2 then succeeds and the ten buffered lines go out in one write.
+      # Wait for that so the writer has nothing left to send when it stops.
+      assert {:ok, %{total_errors: 1, total_writes: 2}} = settled_stats(pid)
     end
 
     test "a write_sync caller waiting on a chain is answered at shutdown", %{http_conn: conn} do

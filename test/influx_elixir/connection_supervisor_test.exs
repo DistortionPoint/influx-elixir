@@ -7,6 +7,16 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
     :"conn_sup_test_#{System.unique_integer([:positive])}"
   end
 
+  # The registered connection is what the client built from the added
+  # options: under the double, its profile, default database and org around
+  # the store. Neither case adds a database, and `host` and `token` are the
+  # HTTP client's alone.
+  defp assert_local_config(config) do
+    assert %{table: table} = config
+    assert is_reference(table)
+    assert Map.delete(config, :table) === %{profile: :v3_core, database: nil, org: "local"}
+  end
+
   describe "init/1 — registry population" do
     test "registers initialized connection in persistent_term on start" do
       name = unique_name()
@@ -30,8 +40,8 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       # The registered term is an initialised connection the configured
       # client can use straight away.
       assert {:ok, registered} = Connection.get(name)
-      assert {:ok, %{"status" => "pass"}} = InfluxElixir.health(registered)
-      assert {:ok, %{"status" => "pass"}} = InfluxElixir.health(name)
+      assert InfluxElixir.health(registered) === {:ok, %{"status" => "pass"}}
+      assert InfluxElixir.health(name) === {:ok, %{"status" => "pass"}}
     end
 
     test "fetch!/1 works for a started connection" do
@@ -49,7 +59,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
 
       conn = Connection.fetch!(name)
       # Returns an initialised connection, usable by the configured client
-      assert {:ok, %{"status" => "pass"}} = InfluxElixir.health(conn)
+      assert InfluxElixir.health(conn) === {:ok, %{"status" => "pass"}}
     end
 
     test "finch pool name is derivable from registered connection" do
@@ -77,7 +87,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
       assert Process.whereis(ConnectionSupervisor.finch_name(name)) == nil
-      assert {:ok, %{"status" => "pass"}} = InfluxElixir.health(name)
+      assert InfluxElixir.health(name) === {:ok, %{"status" => "pass"}}
     end
   end
 
@@ -96,12 +106,14 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
       writer = ConnectionSupervisor.batch_writer_name(name)
-      :ok = InfluxElixir.Write.BatchWriter.write_sync(writer, "cpu value=1.0")
+      :ok = InfluxElixir.Write.BatchWriter.write_sync(writer, "cpu value=1.0 1")
 
-      assert {:ok, [%{"value" => 1.0}]} =
-               InfluxElixir.query_sql(name, "SELECT * FROM cpu", database: "bw_db")
+      assert InfluxElixir.query_sql(name, "SELECT * FROM cpu", database: "bw_db") ===
+               {:ok, [%{"time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 1.0}]}
 
-      assert {:ok, %{total_writes: 1, total_errors: 0}} = InfluxElixir.stats(name)
+      assert InfluxElixir.stats(name) ===
+               {:ok, %{total_writes: 1, total_errors: 0, total_bytes: 15}}
+
       assert :ok = InfluxElixir.flush(name)
     end
   end
@@ -119,7 +131,8 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       # Nothing was left behind, so the corrected config starts.
       assert {:ok, _pid} = InfluxElixir.add_connection(name, batch_writer: [batch_size: 10])
       on_exit(fn -> InfluxElixir.remove_connection(name) end)
-      assert {:ok, _conn} = Connection.get(name)
+      assert {:ok, config} = Connection.get(name)
+      assert_local_config(config)
     end
   end
 
@@ -131,7 +144,8 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
         InfluxElixir.add_connection(name, host: "h", token: "t")
 
       # Verify it's registered
-      assert {:ok, _config} = Connection.get(name)
+      assert {:ok, config} = Connection.get(name)
+      assert_local_config(config)
 
       # Remove the connection
       :ok = InfluxElixir.remove_connection(name)

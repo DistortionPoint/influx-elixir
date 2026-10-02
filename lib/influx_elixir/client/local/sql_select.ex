@@ -231,7 +231,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
       {:error,
        SQLError.refusal(
          "the name the engine gives this select item cannot be written here (a column of " <>
-           "a joined table, a number past the range of a double); add AS alias: " <> col
+           "a joined table); add AS alias: " <> col
        )}
   end
 

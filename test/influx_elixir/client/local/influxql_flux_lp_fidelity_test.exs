@@ -74,6 +74,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     Jason.decode!(body)
   end
 
+  # Returns once the clock reads later than it did, so that a second stamp
+  # taken after this call cannot equal one taken before it.
+  defp let_the_clock_move do
+    started = System.os_time(:nanosecond)
+    Enum.find(Stream.repeatedly(fn -> System.os_time(:nanosecond) end), &(&1 > started))
+  end
+
   defp iql(conn, statement), do: Local.query_influxql(conn, statement, database: "db")
 
   defp flux_all(conn, tail),
@@ -551,8 +558,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       assert for(%{"line_number" => n, "original_line" => shown} <- data, do: {n, shown}) ===
                for(i <- @around_boundaries, do: {i, "BAD#{i}"})
 
-      assert {:ok, [%{"count" => written}]} = iql(conn, "SELECT count(v) FROM m")
-      assert written === @many - length(@around_boundaries)
+      assert iql(conn, "SELECT count(v) FROM m") ===
+               {:ok,
+                [
+                  %{
+                    "iox::measurement" => "m",
+                    "time" => ~U[1970-01-01 00:00:00.000000Z],
+                    "count" => @many - length(@around_boundaries)
+                  }
+                ]}
     end
 
     test "InfluxDB 2 quotes the line of an error in any chunk, in order" do
@@ -956,7 +970,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       end
 
       assert {:ok, []} = iql(conn, "SELECT v FROM o WHERE k =~ /fill\\(/")
-      assert {:ok, [%{"v" => 1.0}]} = iql(conn, "SELECT v FROM o WHERE k = 'a' LIMIT 5")
+
+      assert iql(conn, "SELECT v FROM o WHERE k = 'a' LIMIT 5") ===
+               {:ok,
+                [
+                  %{
+                    "iox::measurement" => "o",
+                    "time" => ~U[1970-01-01 00:00:00.000001Z],
+                    "v" => 1.0
+                  }
+                ]}
     end
   end
 
@@ -989,7 +1012,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       answer = iql(conn, "SELECT mean(v) FROM fresh WHERE time > now() - 1h")
       last = Store.now_ns()
 
-      assert {:ok, [%{"time" => time}]} = answer
+      assert {:ok, [%{"time" => time} = row]} = answer
+      assert Map.delete(row, "time") === %{"iox::measurement" => "fresh", "mean" => 1.0}
       stamp = DateTime.to_unix(time, :microsecond)
       assert stamp >= Integer.floor_div(first - @hour_ns + 1, 1_000)
       assert stamp <= Integer.floor_div(last - @hour_ns + 1, 1_000)
@@ -1396,8 +1420,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
       assert {:error, %{status: 422}} = Local.write(conn, "m v=1.5 5", database: "other")
 
-      assert {:ok, [%{"_value" => 1}]} =
-               Local.query_flux(conn, ~s|from(bucket: "other") \|> range(start: 0)|)
+      # `_stop` is the clock's reading; the rest of the row is exact.
+      assert {:ok, [row]} = Local.query_flux(conn, ~s|from(bucket: "other") \|> range(start: 0)|)
+
+      assert Map.delete(row, "_stop") === %{
+               "result" => "_result",
+               "table" => 0,
+               "_measurement" => "m",
+               "_field" => "v",
+               "_start" => ~U[1970-01-01 00:00:00.000000Z],
+               "_time" => ~U[1970-01-01 00:00:00.000000Z],
+               "_value" => 1
+             }
     end
 
     test "the store holds nothing of the bucket" do
@@ -1409,7 +1443,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
       # The same series and time twice: one merged point, and the series
       # index and the duplicate marker hold something to be deleted.
-      assert [%{fields: %{"v" => 2}}] = Store.points(table, "b", "m")
+      assert Store.points(table, "b", "m") ===
+               [%{measurement: "m", tags: %{}, fields: %{"v" => 2}, timestamp: 5}]
+
       assert [_first | _rest] = :ets.match_object(table, {{:series_time, "b", :_, :_, :_}})
       assert [_first | _rest] = :ets.match_object(table, {{:duplicates, "b", :_}})
 
@@ -1462,17 +1498,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       :ok = Local.create_bucket(same, "one")
       :ok = Local.create_bucket(other, "one")
 
-      assert {:ok, [%{"orgID" => same_org, "id" => id}]} = Local.list_buckets(same)
-      assert {same_org, id} === {one["orgID"], one["id"]}
-      assert {:ok, [%{"orgID" => other_org}]} = Local.list_buckets(other)
-      assert other_org != one["orgID"]
+      # Created on another connection, so its time differs; its identity does not.
+      assert {:ok, [same_one]} = Local.list_buckets(same)
+      assert Map.take(same_one, ["orgID", "id"]) === Map.take(one, ["orgID", "id"])
+      assert {:ok, [other_one]} = Local.list_buckets(other)
+      refute other_one["orgID"] === one["orgID"]
     end
 
     test "creating a bucket again keeps its creation time" do
       conn = v2_conn([])
       :ok = Local.create_bucket(conn, "one")
       {:ok, [first]} = Local.list_buckets(conn)
-      Process.sleep(2)
+      let_the_clock_move()
       :ok = Local.create_bucket(conn, "one")
       assert {:ok, [^first]} = Local.list_buckets(conn)
     end
@@ -1515,14 +1552,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     test "a token is created whole; _admin and a taken name are :exists and spend no id" do
       table = Store.new([])
       build = fn id -> %{"id" => id, "name" => "t"} end
+      token = fn id -> {:ok, %{"id" => id, "name" => "t"}} end
 
-      assert {:ok, %{"id" => 1}} = Store.create_token(table, "a", build)
+      assert Store.create_token(table, "a", build) === token.(1)
       assert :exists = Store.create_token(table, "a", build)
       assert :exists = Store.create_token(table, "_admin", build)
-      assert {:ok, %{"id" => 2}} = Store.create_token(table, "b", build)
+      assert Store.create_token(table, "b", build) === token.(2)
       assert :ok = Store.delete_token(table, "a")
       assert :error = Store.delete_token(table, "a")
-      assert {:ok, %{"id" => 3}} = Store.create_token(table, "a", build)
+      assert Store.create_token(table, "a", build) === token.(3)
     end
 
     test "concurrent creates of one name make one token and spend one id" do
@@ -1531,9 +1569,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
       results = at_once(@tasks, fn _n -> Store.create_token(table, "same", build) end)
 
-      assert [{:ok, %{"id" => 1}}] = Enum.filter(results, &match?({:ok, _token}, &1))
+      assert Enum.filter(results, &match?({:ok, _token}, &1)) === [ok: %{"id" => 1}]
       assert Enum.count(results, &(&1 === :exists)) === @tasks - 1
-      assert {:ok, %{"id" => 2}} = Store.create_token(table, "next", build)
+      assert Store.create_token(table, "next", build) === {:ok, %{"id" => 2}}
     end
 
     test "concurrent creates of different names give each its own id, in a row" do
@@ -1567,7 +1605,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
           {{:ok, %{"id" => 1}}, :ok} -> assert :error = Store.delete_token(table, name)
         end
 
-        assert {:ok, %{"id" => 2}} = Store.create_token(table, "next", build)
+        assert Store.create_token(table, "next", build) === {:ok, %{"id" => 2}}
       end
     end
 
@@ -1575,10 +1613,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
       table = Store.new([])
       build = &%{"id" => &1}
 
-      assert {:ok, %{"id" => 1}} = Store.create_token(table, "t", build)
+      assert Store.create_token(table, "t", build) === {:ok, %{"id" => 1}}
       assert :ok = Store.delete_token(table, "t")
       assert :error = Store.delete_token(table, "t")
-      assert {:ok, %{"id" => 2}} = Store.create_token(table, "t", build)
+      assert Store.create_token(table, "t", build) === {:ok, %{"id" => 2}}
     end
 
     test "concurrent creates of databases cannot pass the limit" do
@@ -1751,10 +1789,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
     test "a taken token name is a 409, and a deleted one comes back with the next id" do
       conn = v3_conn([])
-      assert {:ok, %{"id" => 1}} = Local.create_token(conn, "tok1")
+      # The secret, its hash and the creation time are generated.
+      generated = ["token", "hash", "created_at"]
+      assert {:ok, first} = Local.create_token(conn, "tok1")
+      assert Map.drop(first, generated) === %{"id" => 1, "name" => "tok1", "expiry" => nil}
       assert {:error, %{status: 409}} = Local.create_token(conn, "tok1")
       assert :ok = Local.delete_token(conn, "tok1")
-      assert {:ok, %{"id" => 2}} = Local.create_token(conn, "tok1")
+      assert {:ok, again} = Local.create_token(conn, "tok1")
+      assert Map.drop(again, generated) === %{"id" => 2, "name" => "tok1", "expiry" => nil}
     end
 
     test "writers of one series at once leave one point per time" do
@@ -1766,6 +1808,57 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
 
       assert {:ok, rows} = iql(conn, "SELECT v FROM m")
       assert Enum.map(rows, & &1["v"]) === Enum.map(1..500, &(&1 * 1.0))
+    end
+  end
+
+  describe "Store — the lock is not re-entrant" do
+    test "a holder that takes its own lock again raises instead of spinning" do
+      table = Store.new([])
+
+      assert_raise RuntimeError, ~r/databases lock is already held by this process/, fn ->
+        Store.create_database(table, "outer", fn _databases ->
+          Store.create_database(table, "inner", fn _databases -> :ok end)
+        end)
+      end
+
+      assert_raise RuntimeError, ~r/tokens lock is already held by this process/, fn ->
+        Store.create_token(table, "outer", fn _id ->
+          Store.create_token(table, "inner", fn id -> %{"id" => id} end)
+        end)
+      end
+
+      # the raise released the locks: neither resource is stuck, nor half made
+      refute Store.database?(table, "outer")
+      assert :ok = Store.create_database(table, "later", fn _databases -> :ok end)
+      assert {:ok, %{"id" => 1}} = Store.create_token(table, "later", &%{"id" => &1})
+    end
+
+    test "another process waits for the holder instead of raising" do
+      table = Store.new([])
+      parent = self()
+
+      holder =
+        Task.async(fn ->
+          Store.create_database(table, "slow", fn _databases ->
+            send(parent, :holding)
+
+            receive do
+              :release -> :ok
+            end
+          end)
+        end)
+
+      assert_receive :holding
+
+      waiter =
+        Task.async(fn -> Store.create_database(table, "other", fn _databases -> :ok end) end)
+
+      refute Task.yield(waiter, 50)
+
+      send(holder.pid, :release)
+      assert Task.await(holder) === :ok
+      assert Task.await(waiter) === :ok
+      assert Store.databases(table) === MapSet.new(["slow", "other"])
     end
   end
 end

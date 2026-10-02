@@ -60,6 +60,15 @@ defmodule InfluxElixir.Client.Local.SQLError do
     }
 
   @doc """
+  The Arrow kernel's error for the negation of the smallest integer of a type
+  that the engine's interval analysis meets while it reads a `WHERE`'s
+  constants, status 500. `text` is the integer, as printed (`-9223372036854775808`).
+  """
+  @spec overflow(binary()) :: t()
+  def overflow(text),
+    do: %{status: 500, body: "Arrow error: Arithmetic overflow: Overflow happened on: - " <> text}
+
+  @doc """
   What `Client.HTTP` returns when the engine fails a query after it has sent
   `200`: it closes the connection mid-response. An integer divided by zero,
   an overflowing `abs`, a cast that cannot be performed and a bin of zero
@@ -67,18 +76,6 @@ defmodule InfluxElixir.Client.Local.SQLError do
   """
   @spec closed() :: {:connection_error, Mint.TransportError.t()}
   def closed, do: {:connection_error, %Mint.TransportError{reason: :closed}}
-
-  @doc """
-  The refusal of a computation over a number past the range of a double: the
-  engine holds it as infinity, which an Elixir float cannot be.
-  """
-  @spec nonfinite() :: t()
-  def nonfinite do
-    refusal(
-      "a number past the range of a double is infinity on the engine, which this double " <>
-        "cannot compute with"
-    )
-  end
 
   @doc """
   The physical planner's error for a `WHERE` whose conjuncts on `time` leave

@@ -7,15 +7,13 @@ defmodule InfluxElixir.Query.ResponseParserTest do
     test "parses JSON array response" do
       body = ~s([{"name":"cpu","value":0.64}])
 
-      assert {:ok, [%{"name" => "cpu", "value" => 0.64}]} =
-               ResponseParser.parse(body, :json)
+      assert ResponseParser.parse(body, :json) === {:ok, [%{"name" => "cpu", "value" => 0.64}]}
     end
 
     test "parses single JSON object as one-element list" do
       body = ~s({"name":"cpu","value":42})
 
-      assert {:ok, [%{"name" => "cpu", "value" => 42}]} =
-               ResponseParser.parse(body, :json)
+      assert ResponseParser.parse(body, :json) === {:ok, [%{"name" => "cpu", "value" => 42}]}
     end
 
     test "returns error on invalid JSON" do
@@ -43,14 +41,13 @@ defmodule InfluxElixir.Query.ResponseParserTest do
 
       assert {:ok, rows} = ResponseParser.parse(body, :jsonl)
       assert length(rows) == 3
-      assert Enum.map(rows, & &1["a"]) == [1, 2, 3]
+      assert Enum.map(rows, & &1["a"]) === [1, 2, 3]
     end
 
     test "handles trailing newline" do
       body = ~s({"a":1}\n)
 
-      assert {:ok, [%{"a" => 1}]} =
-               ResponseParser.parse(body, :jsonl)
+      assert ResponseParser.parse(body, :jsonl) === {:ok, [%{"a" => 1}]}
     end
 
     test "returns error on invalid JSONL line" do
@@ -65,8 +62,9 @@ defmodule InfluxElixir.Query.ResponseParserTest do
     test "parses plain CSV with a header row, cells stay strings" do
       body = "name,value\ncpu,0.64\nmem,0.85"
 
-      assert {:ok, [%{"name" => "cpu", "value" => "0.64"}, %{"name" => "mem", "value" => "0.85"}]} =
-               ResponseParser.parse(body, :csv)
+      assert ResponseParser.parse(body, :csv) ===
+               {:ok,
+                [%{"name" => "cpu", "value" => "0.64"}, %{"name" => "mem", "value" => "0.85"}]}
     end
 
     test "returns empty list for empty body" do
@@ -79,12 +77,12 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       # a header, so the answer was one row instead of four.
       body = "host\na\n\"\"\nb\nc\n"
 
-      assert {:ok, [%{"host" => "a"}, %{}, %{"host" => "b"}, %{"host" => "c"}]} =
-               ResponseParser.parse(body, :csv)
+      assert ResponseParser.parse(body, :csv) ===
+               {:ok, [%{"host" => "a"}, %{}, %{"host" => "b"}, %{"host" => "c"}]}
     end
 
     test "a column named like an annotation is a column" do
-      assert {:ok, [%{"#tag" => "x"}]} = ResponseParser.parse("#tag\nx\n", :csv)
+      assert ResponseParser.parse("#tag\nx\n", :csv) === {:ok, [%{"#tag" => "x"}]}
     end
 
     test "InfluxDB 3's CSV has no annotations: values are strings, empty cells absent" do
@@ -135,26 +133,29 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       # the stored `s="l1\nl2"` arrives as "l1\r\nl2" on the wire).
       body = "#datatype,string,long,string\r\n,result,table,s\r\n,_result,0,\"l1\r\nl2\"\r\n\r\n"
 
-      assert {:ok, [%{"s" => "l1\nl2", "table" => 0}]} = ResponseParser.parse(body, :flux_csv)
+      assert ResponseParser.parse(body, :flux_csv) ===
+               {:ok, [%{"result" => "_result", "s" => "l1\nl2", "table" => 0}]}
     end
 
     test "other annotations without #datatype leave cells as strings" do
       body = "#group,false,false\n,result,value\n,_result,42.5\n"
 
-      assert {:ok, [%{"result" => "_result", "value" => "42.5"}]} =
-               ResponseParser.parse(body, :flux_csv)
+      assert ResponseParser.parse(body, :flux_csv) ===
+               {:ok, [%{"result" => "_result", "value" => "42.5"}]}
     end
 
     test "a table with only annotation rows yields no rows" do
       body = "#datatype,string,double\n\n,result,value\n,_result,1.5\n"
-      assert {:ok, [%{"value" => "1.5"}]} = ResponseParser.parse(body, :flux_csv)
+
+      assert ResponseParser.parse(body, :flux_csv) ===
+               {:ok, [%{"result" => "_result", "value" => "1.5"}]}
     end
 
     test "a typed cell that does not parse falls back to the raw string" do
       body = "#datatype,string,double,long\n,result,ratio,count\n,_result,abc,1.5\n"
 
-      assert {:ok, [%{"ratio" => "abc", "count" => "1.5"}]} =
-               ResponseParser.parse(body, :flux_csv)
+      assert ResponseParser.parse(body, :flux_csv) ===
+               {:ok, [%{"result" => "_result", "ratio" => "abc", "count" => "1.5"}]}
     end
 
     test "types long, unsignedLong and boolean columns" do
@@ -163,8 +164,8 @@ defmodule InfluxElixir.Query.ResponseParserTest do
           ",result,count,ucount,flag\n" <>
           ",_result,3,7,true\n"
 
-      assert {:ok, [%{"count" => 3, "ucount" => 7, "flag" => true}]} =
-               ResponseParser.parse(body, :flux_csv)
+      assert ResponseParser.parse(body, :flux_csv) ===
+               {:ok, [%{"result" => "_result", "count" => 3, "ucount" => 7, "flag" => true}]}
     end
 
     test "an empty Flux cell is absent from the row, as a null column is in JSON" do
@@ -176,7 +177,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
           ",_result,0,,1,\r\n"
 
       assert {:ok, [row]} = ResponseParser.parse(body, :flux_csv)
-      assert row == %{"result" => "_result", "table" => 0, "x" => 1.0}
+      assert row === %{"result" => "_result", "table" => 0, "x" => 1.0}
     end
   end
 
@@ -200,7 +201,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
 
       assert {:ok, [row]} = ResponseParser.parse(body)
       assert row["measurement"] == "cpu"
-      assert row["value"] == 1.5
+      assert row["value"] === 1.5
     end
 
     test "invalid JSON body with default format returns json parse error" do
@@ -214,12 +215,12 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       row = %{"time" => "2026-03-12T10:00:00Z", "value" => 42}
       result = ResponseParser.coerce_types(row)
       assert %DateTime{} = result["time"]
-      assert result["value"] == 42
+      assert result["value"] === 42
     end
 
     test "leaves non-time fields unchanged" do
       row = %{"name" => "cpu", "value" => 0.64}
-      assert ResponseParser.coerce_types(row) == row
+      assert ResponseParser.coerce_types(row) === row
     end
 
     test "treats a zone-less time (InfluxDB 3's JSON rendering) as UTC" do
@@ -238,7 +239,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
 
     test "a date-shaped string that is not a timestamp stays a string" do
       row = %{"label" => "2023-11-14Tomorrow", "code" => "2023-11-14T22:13"}
-      assert ResponseParser.coerce_types(row) == row
+      assert ResponseParser.coerce_types(row) === row
     end
 
     test "timestamps inside structs and lists are coerced too" do
@@ -268,14 +269,14 @@ defmodule InfluxElixir.Query.ResponseParserTest do
                "bucket" => ~U[2023-11-14 22:12:00.000000Z],
                "low_at" => ~U[2023-11-14 22:13:20.500000Z],
                "label" => "bucket"
-             } == ResponseParser.coerce_types(row)
+             } === ResponseParser.coerce_types(row)
     end
 
     test "a zoned RFC3339 string outside the time keys stays a string" do
       # Only InfluxDB 3's zone-less rendering is evidence of a timestamp
       # column; a string field carrying an RFC3339 value is left alone.
       row = %{"created_at" => "2026-03-12T10:00:00Z", "note" => "2026-03-12"}
-      assert ResponseParser.coerce_types(row) == row
+      assert ResponseParser.coerce_types(row) === row
     end
 
     test "converts the Flux _time, _start and _stop columns too" do
@@ -290,7 +291,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
                "_time" => ~U[2026-03-12 10:00:00.000000Z],
                "_start" => ~U[2026-03-12 09:00:00.000000Z],
                "_stop" => ~U[2026-03-12 11:00:00.000000Z]
-             } == ResponseParser.coerce_types(row)
+             } === ResponseParser.coerce_types(row)
     end
   end
 end

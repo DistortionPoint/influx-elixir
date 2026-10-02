@@ -45,7 +45,7 @@ defmodule InfluxElixir.Write.PointTest do
 
     test "accepts integer field values" do
       point = Point.new("cpu", %{"count" => 42})
-      assert point.fields["count"] == 42
+      assert point.fields["count"] === 42
     end
 
     test "accepts boolean field values" do

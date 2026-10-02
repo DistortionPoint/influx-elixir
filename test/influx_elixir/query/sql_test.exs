@@ -10,6 +10,11 @@ defmodule InfluxElixir.Query.SQLTest do
     {:ok, conn: conn}
   end
 
+  # The rows with the columns the clock assigns removed, so that the rest is
+  # compared whole.
+  defp without({:ok, rows}, columns), do: {:ok, without(rows, columns)}
+  defp without(rows, columns), do: Enum.map(rows, &Map.drop(&1, columns))
+
   # These modules used to call the client directly: a connection name was a
   # FunctionClauseError and no telemetry span was emitted. They now behave
   # exactly as the facade functions they document.
@@ -32,13 +37,13 @@ defmodule InfluxElixir.Query.SQLTest do
 
       on_exit(fn -> :telemetry.detach(handler) end)
 
-      assert {:ok, [%{"v" => 1}]} = SQL.query(name, "SELECT v FROM cpu")
+      assert SQL.query(name, "SELECT v FROM cpu") === {:ok, [%{"v" => 1}]}
       assert_receive {:query_stop, %{database: "named_db", result: :ok, row_count: 1}}
 
-      assert [%{"v" => 1}] = name |> SQL.query_stream("SELECT v FROM cpu") |> Enum.to_list()
-      assert {:ok, [%{"v" => 1}]} = SQL.execute(name, "SELECT v FROM cpu")
+      assert name |> SQL.query_stream("SELECT v FROM cpu") |> Enum.to_list() === [%{"v" => 1}]
+      assert SQL.execute(name, "SELECT v FROM cpu") === {:ok, [%{"v" => 1}]}
       assert {:ok, [_one, _two]} = InfluxElixir.Admin.Databases.list(name)
-      assert {:ok, %{"status" => "pass"}} = InfluxElixir.Admin.Health.check(name)
+      assert InfluxElixir.Admin.Health.check(name) === {:ok, %{"status" => "pass"}}
     end
   end
 
@@ -52,18 +57,19 @@ defmodule InfluxElixir.Query.SQLTest do
 
   describe "query/3" do
     test "returns the stored rows", %{conn: conn} do
-      assert {:ok, [%{"host" => "web01", "value" => 1}]} =
-               SQL.query(conn, "SELECT * FROM cpu", database: "test_db")
+      assert conn |> SQL.query("SELECT * FROM cpu", database: "test_db") |> without(["time"]) ===
+               {:ok, [%{"host" => "web01", "value" => 1}]}
     end
 
     test "params reach the client and bind the placeholder", %{conn: conn} do
       {:ok, :written} = Local.write(conn, "cpu,host=web02 value=2i", database: "test_db")
 
-      assert {:ok, [%{"host" => "web02", "value" => 2}]} =
-               SQL.query(conn, "SELECT * FROM cpu WHERE host = $host",
-                 database: "test_db",
-                 params: %{host: "web02"}
-               )
+      assert conn
+             |> SQL.query("SELECT * FROM cpu WHERE host = $host",
+               database: "test_db",
+               params: %{host: "web02"}
+             )
+             |> without(["time"]) === {:ok, [%{"host" => "web02", "value" => 2}]}
     end
 
     test "returns error for non-existent measurement", %{conn: conn} do
@@ -77,7 +83,7 @@ defmodule InfluxElixir.Query.SQLTest do
     test "streams actual rows", %{conn: conn} do
       stream = SQL.query_stream(conn, "SELECT * FROM cpu", database: "test_db")
       rows = Enum.to_list(stream)
-      assert [%{"host" => "web01", "value" => 1}] = rows
+      assert without(rows, ["time"]) === [%{"host" => "web01", "value" => 1}]
     end
   end
 
@@ -86,9 +92,15 @@ defmodule InfluxElixir.Query.SQLTest do
       {:ok, conn} = Local.start(database: "dflt_db")
       {:ok, :written} = Local.write(conn, "cpu value=7i")
 
-      assert {:ok, [%{"value" => 7}]} = SQL.query(conn, "SELECT * FROM cpu")
-      assert [%{"value" => 7}] = conn |> SQL.query_stream("SELECT * FROM cpu") |> Enum.to_list()
-      assert {:ok, [%{"value" => 7}]} = SQL.execute(conn, "SELECT * FROM cpu")
+      assert conn |> SQL.query("SELECT * FROM cpu") |> without(["time"]) ===
+               {:ok, [%{"value" => 7}]}
+
+      assert conn |> SQL.query_stream("SELECT * FROM cpu") |> without(["time"]) === [
+               %{"value" => 7}
+             ]
+
+      assert conn |> SQL.execute("SELECT * FROM cpu") |> without(["time"]) ===
+               {:ok, [%{"value" => 7}]}
     end
   end
 

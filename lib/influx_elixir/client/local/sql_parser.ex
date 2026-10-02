@@ -56,7 +56,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @typedoc "An arithmetic expression; see `t:InfluxElixir.Client.Local.SQLExpr.t/0`."
   @type expr :: SQLExpr.t()
 
-  @typedoc "`CAST(expr AS INTEGER | DOUBLE | VARCHAR)` targets (and their synonyms)."
+  @typedoc "`CAST(expr AS type)` targets: an integer width, `DOUBLE` or text."
   @type cast_type :: SQLExpr.cast_type()
 
   @typedoc "Plain aggregates; `:stddev`/`:var` are the sample forms, as in InfluxDB."
@@ -665,10 +665,15 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp unselected_columns({{:expr, expr}, _direction}, columns),
     do: expr |> SQLExpr.columns() |> Enum.reject(&(&1 in columns))
 
+  @spec readable_expression?({binary() | {:expr, expr()}, direction()}) :: boolean()
+  defp readable_expression?({{:expr, {:unreadable, _text}}, _direction}), do: false
+  defp readable_expression?({{:expr, _expr}, _direction}), do: true
+  defp readable_expression?({_column, _direction}), do: false
+
   # Grouped rows have no source point to evaluate an expression against.
   @spec reject_expr_order(order_by()) :: :ok | {:error, term()}
   defp reject_expr_order(order_by) do
-    if Enum.any?(order_by, &match?({{:expr, _expr}, _direction}, &1)),
+    if Enum.any?(order_by, &readable_expression?/1),
       do:
         {:error,
          SQLError.refusal("ORDER BY an expression is not supported in an aggregate query")},
@@ -767,12 +772,29 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           {:ok, {expr, output}}
         end
 
-      Regex.match?(~r/^(?:\w+|"(?:[^"]|"")*")$/u, body) ->
-        source = SQLSelect.name(body)
+      source = plain_column(body) ->
         {:ok, {source, alias_name || source}}
 
       true ->
         expression_projection(trimmed, body, alias_name, qualifier)
+    end
+  end
+
+  # A column the select item names, however many pairs of parentheses wrap it
+  # (`(v)` is named `v`, as the engine names it); `nil` for anything else,
+  # a wrapped constant (`(1)`) included.
+  @wrapped_column ~r/\A((?:\(\s*)*)(\w+|"(?:[^"]|"")*")((?:\s*\))*)\z/u
+
+  @spec plain_column(binary()) :: binary() | nil
+  defp plain_column(body) do
+    with [_full, opens, name, closes] <- Regex.run(@wrapped_column, body),
+         true <-
+           String.length(opens |> String.replace(~r/\s/, "")) ==
+             String.length(String.replace(closes, ~r/\s/, "")),
+         nil <- SQLSelect.constant(name) do
+      SQLSelect.name(name)
+    else
+      _not_a_column -> nil
     end
   end
 
@@ -806,6 +828,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     else
       with {:ok, text} <- SQLLexer.scrub(rest),
            {:ok, nodes} <- SQLWhere.nodes(text),
+           :ok <- SQLTime.first_type_error(nodes),
            :ok <- SQLBind.reject_placeholders(nodes),
            :ok <- SQLTime.first_invalid(nodes) do
         {:ok, nodes}

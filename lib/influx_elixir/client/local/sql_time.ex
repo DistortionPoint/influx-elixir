@@ -30,7 +30,9 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   refusal.
   """
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLLiteral}
+  alias InfluxElixir.Client.Local.{SQLError, SQLLimits, SQLLiteral}
+
+  require SQLLimits
 
   @typedoc """
   A `time` comparand: nanoseconds since the epoch, `now()` plus an offset,
@@ -53,7 +55,7 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   @now_pattern ~r/^now\(\)((?:\s*[+-]\s*INTERVAL\s*'[^']*')*)$/iu
   @interval_term ~r/([+-])\s*INTERVAL\s*'([^']*)'/iu
 
-  @int64_max 9_223_372_036_854_775_807
+  @int64_max SQLLimits.int64_max()
   @first_second -9_223_372_036
 
   # The names of the time zone database that are UTC all year (verified).
@@ -195,6 +197,22 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   """
   @spec first_invalid([term()]) :: :ok | {:error, SQLError.t()}
   def first_invalid(nodes), do: nodes |> invalid_in() |> List.first() |> invalid_result()
+
+  @doc """
+  The first type error kept in a `WHERE` (a `time` compared with a number,
+  see `InfluxElixir.Client.Local.SQLWhere.deferred_clause/1`), in the order
+  written; `:ok` when there is none. A statement that is not planned
+  against a schema raises it as soon as it is parsed.
+  """
+  @spec first_type_error([term()]) :: :ok | {:error, SQLError.t()}
+  def first_type_error(nodes), do: nodes |> type_errors_in() |> List.first() |> invalid_result()
+
+  @spec type_errors_in(term()) :: [SQLError.t()]
+  defp type_errors_in(nodes) when is_list(nodes), do: Enum.flat_map(nodes, &type_errors_in/1)
+  defp type_errors_in({:or, branches}), do: Enum.flat_map(branches, &type_errors_in/1)
+  defp type_errors_in({:not, conjunction}), do: type_errors_in(conjunction)
+  defp type_errors_in({:time_type_error, "time", error}), do: [error]
+  defp type_errors_in(_other), do: []
 
   @spec invalid_result(SQLError.t() | nil) :: :ok | {:error, SQLError.t()}
   defp invalid_result(nil), do: :ok

@@ -61,6 +61,11 @@ defmodule InfluxElixir.Contract.SQLParser do
       unquote(time_aggregate_tests())
       unquote(limit_tests())
       unquote(function_tests())
+      unquote(trunc_tests())
+      unquote(parenthesised_name_tests())
+      unquote(time_limit_tests())
+      unquote(cte_edge_tests())
+      unquote(order_position_tests())
       unquote(date_bin_tests())
       unquote(text_tests())
       unquote(escape_tests())
@@ -151,6 +156,17 @@ defmodule InfluxElixir.Contract.SQLParser do
         do: sp_optimizer("Parser error: Error parsing timestamp from '#{text}': #{reason}")
 
       defp sp_negative_zero?(value), do: is_float(value) and <<value::float>> === <<-0.0::float>>
+
+      # Two ints, a string and a boolean beside the floats trunc takes.
+      defp sp_trunc_fixture(ctx) do
+        m = sp_measurement("sp_trunc")
+
+        sp_write(ctx, [
+          ~s|#{m} f=2.75,g=-2.75,h=-0.4,i=7i,j=-7i,k=1234.5678,z=-0.0,s="x",b=true #{sp_ns(0)}|
+        ])
+
+        m
+      end
 
       defp sp_fields(table, columns), do: InfluxElixir.Contract.SQLParser.fields(table, columns)
 
@@ -858,35 +874,22 @@ defmodule InfluxElixir.Contract.SQLParser do
           end
         end
 
-        @tag local_divergence: "the engine answers a null that is there; Local refuses by name"
         test "round to a scale outside a double is null on the engine", ctx do
           m = sp_measurement("sp_round")
           sp_write(ctx, ["#{m} v=1 #{sp_ns(0)}"])
 
           # 10^308 holds, but 2.5 * 10^308 does not.
-          for {call, scale} <- [
-                {"round(v, 309)", 309},
-                {"round(v, 400)", 400},
-                {"round(v, -309)", -309},
-                {"round(v, -400)", -400},
-                {"round(2.5, 308)", 308}
+          for call <- [
+                "round(v, 309)",
+                "round(v, 400)",
+                "round(v, -309)",
+                "round(v, -400)",
+                "round(2.5, 308)",
+                "trunc(v, 400)",
+                "trunc(v, -400)"
               ] do
-            result = sp_query(ctx, "SELECT #{call} AS r FROM #{m}")
-
-            if sp_local?() do
-              # A row cannot say "null, not missing", so the double refuses by name.
-              assert result ===
-                       {:error,
-                        %{
-                          status: 400,
-                          body:
-                            "Client.Local: round(x, #{scale}) leaves the range of a double: " <>
-                              "InfluxDB answers null (a NaN or infinity as JSON), which a " <>
-                              "result row here cannot hold"
-                        }}
-            else
-              assert result === {:ok, [%{"r" => nil}]}
-            end
+            assert sp_query(ctx, "SELECT #{call} AS r FROM #{m}") === {:ok, [%{"r" => nil}]},
+                   call
           end
 
           assert {:ok, [%{"r" => 1200.0}]} =
@@ -2071,8 +2074,6 @@ defmodule InfluxElixir.Contract.SQLParser do
           end
         end
 
-        @tag local_divergence:
-               "the engine closes the connection mid-response; Local returns the transport error"
         test "an Int64 by a UInt64 divides as a decimal of four places", ctx do
           m = sp_fixture(ctx)
           order = " FROM #{m} ORDER BY time"
@@ -2122,8 +2123,6 @@ defmodule InfluxElixir.Contract.SQLParser do
                    {:ok, [%{"a" => 5, "b" => 5}]}
         end
 
-        @tag local_divergence:
-               "the engine closes the connection mid-response; Local returns the transport error"
         test "the magnitude or the negation of the Int64 minimum overflows", ctx do
           m = sp_measurement("sp_min")
 
@@ -2594,16 +2593,34 @@ defmodule InfluxElixir.Contract.SQLParser do
                "Local holds no time zone database and refuses a zone whose offset changes by name"
         test "a zone of the time zone database is read by the engine", ctx do
           m = sp_measurement("sp_zone_db")
-          sp_write(ctx, ["#{m} v=0i #{sp_ns(0)}"])
 
-          for zone <- ["Europe/Paris", "America/New_York", "CET", "Japan", "PST8PDT", "EST5EDT"] do
+          # 04:00Z, 06:00Z and 22:13:20Z on the 14th: the instant midnight of
+          # the 14th is in each zone (all on standard time that day) falls
+          # before, between or after them.
+          sp_write(ctx, [
+            "#{m} v=10i 1699934400000000000",
+            "#{m} v=11i 1699941600000000000",
+            "#{m} v=0i #{sp_ns(0)}"
+          ])
+
+          for {zone, rows} <- [
+                {"Europe/Paris", [10, 11, 0]},
+                {"CET", [10, 11, 0]},
+                {"Japan", [10, 11, 0]},
+                {"America/New_York", [11, 0]},
+                {"EST5EDT", [11, 0]},
+                {"PST8PDT", [0]}
+              ] do
             result =
-              sp_query(ctx, "SELECT v FROM #{m} WHERE time > '2023-11-14T00:00:00 #{zone}'")
+              sp_query(
+                ctx,
+                "SELECT v FROM #{m} WHERE time > '2023-11-14T00:00:00 #{zone}' ORDER BY time"
+              )
 
             if sp_local?() do
               assert {:error, %{status: 400, body: "Client.Local: " <> _reason}} = result, zone
             else
-              assert {:ok, _rows} = result, zone
+              assert result === {:ok, Enum.map(rows, &%{"v" => &1})}, zone
             end
           end
         end
@@ -2699,11 +2716,11 @@ defmodule InfluxElixir.Contract.SQLParser do
         test "a function the double does not model is refused by name, or answered", ctx do
           m = sp_fixture(ctx)
 
-          result = sp_query(ctx, "SELECT trunc(f) FROM #{m} ORDER BY time LIMIT 1")
+          result = sp_query(ctx, "SELECT sqrt(f) FROM #{m} ORDER BY time LIMIT 1")
 
           if sp_local?(),
             do: assert({:error, %{status: 400, body: "Client.Local: " <> _reason}} = result),
-            else: assert(result === {:ok, [%{"trunc(#{m}.f)" => 1.0}]})
+            else: assert(result === {:ok, [%{"sqrt(#{m}.f)" => 1.224744871391589}]})
         end
 
         @tag local_divergence: "Local refuses a binary value by name"
@@ -2714,6 +2731,441 @@ defmodule InfluxElixir.Contract.SQLParser do
           if sp_local?(),
             do: assert({:error, %{status: 400, body: "Client.Local: " <> _reason}} = result),
             else: assert(result === {:ok, [%{"v" => 1}, %{"v" => 3}]})
+        end
+      end
+    end
+  end
+
+  defp trunc_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: trunc" do
+        test "trunc cuts toward zero and returns a float", ctx do
+          m = sp_trunc_fixture(ctx)
+
+          assert sp_query(
+                   ctx,
+                   "SELECT trunc(f) AS a, trunc(g) AS b, trunc(i) AS c, trunc(j) AS d, " <>
+                     "trunc(k) AS e FROM #{m}"
+                 ) === {:ok, [%{"a" => 2.0, "b" => -2.0, "c" => 7.0, "d" => -7.0, "e" => 1234.0}]}
+
+          assert sp_query(ctx, "SELECT trunc(f) FROM #{m}") === {:ok, [%{"trunc(#{m}.f)" => 2.0}]}
+
+          assert sp_query(ctx, "SELECT TRUNC(k,2) FROM #{m}") ===
+                   {:ok, [%{"trunc(#{m}.k,Int64(2))" => 1234.57}]}
+
+          assert sp_query(ctx, "SELECT i FROM #{m} WHERE trunc(f) = 2") === {:ok, [%{"i" => 7}]}
+          assert sp_query(ctx, "SELECT i FROM #{m} ORDER BY trunc(h)") === {:ok, [%{"i" => 7}]}
+        end
+
+        test "a zero that trunc leaves keeps the sign of a fraction, not of a zero", ctx do
+          m = sp_trunc_fixture(ctx)
+
+          assert {:ok, [row]} =
+                   sp_query(
+                     ctx,
+                     "SELECT trunc(h) AS a, trunc(-0.5) AS b, trunc(z) AS c, trunc(-z) AS d, " <>
+                       "trunc(0.0) AS e FROM #{m}"
+                   )
+
+          assert sp_negative_zero?(row["a"])
+          assert sp_negative_zero?(row["b"])
+
+          for key <- ~w(c d e) do
+            assert row[key] === 0.0, key
+          end
+        end
+
+        test "with a scale trunc rounds, as round does", ctx do
+          m = sp_trunc_fixture(ctx)
+
+          assert sp_query(
+                   ctx,
+                   "SELECT trunc(k, 2) AS a, trunc(k, -2) AS b, trunc(k, 0) AS c, " <>
+                     "trunc(g, 1) AS d, trunc(h, 1) AS e, trunc(i, 1) AS f, trunc(i, -1) AS g, " <>
+                     "trunc(j, -1) AS h FROM #{m}"
+                 ) ===
+                   {:ok,
+                    [
+                      %{
+                        "a" => 1234.57,
+                        "b" => 1200.0,
+                        "c" => 1235.0,
+                        "d" => -2.8,
+                        "e" => -0.4,
+                        "f" => 7.0,
+                        "g" => 10.0,
+                        "h" => -10.0
+                      }
+                    ]}
+
+          assert sp_query(ctx, "SELECT trunc(NULL) AS a, trunc(f, NULL) AS b FROM #{m}") ===
+                   {:ok, [%{}]}
+        end
+
+        test "trunc takes one number, and a scale that is an Int64", ctx do
+          m = sp_trunc_fixture(ctx)
+
+          signature =
+            "OneOf([Exact([Float32, Int64]), Exact([Float64, Int64]), Exact([Float64]), Exact([Float32])])"
+
+          candidates =
+            "\tCandidate functions:\n\ttrunc(Float32, Int64)\n\ttrunc(Float64, Int64)\n" <>
+              "\ttrunc(Float64)\n\ttrunc(Float32)"
+
+          tail = fn types ->
+            " No function matches the given name and argument types 'trunc(#{types})'. " <>
+              "You might need to add explicit type casts.\n" <> candidates
+          end
+
+          head = fn types ->
+            "Failed to coerce arguments to satisfy a call to 'trunc' function: coercion from " <>
+              "#{types} to the signature #{signature} failed"
+          end
+
+          for {call, types} <- [
+                {"trunc(f, 1, 2)", "Float64, Int64, Int64"},
+                {"trunc(s)", "Utf8"},
+                {"trunc(f, 1.5)", "Float64, Float64"},
+                {"trunc(b)", "Boolean"}
+              ] do
+            plain = types |> String.split(", ") |> Enum.join(", ")
+
+            assert sp_query(ctx, "SELECT #{call} AS a FROM #{m}") ===
+                     {:error,
+                      %{
+                        status: 400,
+                        body: "Error during planning: " <> head.(types) <> tail.(plain)
+                      }},
+                   call
+          end
+
+          assert sp_query(ctx, "SELECT trunc() AS a FROM #{m}") ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body:
+                        "Error during planning: 'trunc' does not support zero arguments" <>
+                          tail.("")
+                    }}
+
+          # In WHERE the message carries the type coercion prefix; in ORDER BY it
+          # is cut after its first sentence.
+          assert sp_query(ctx, "SELECT i FROM #{m} WHERE trunc(s) > 1") ===
+                   {:error, %{status: 400, body: sp_coercion(head.("Utf8") <> tail.("Utf8"))}}
+
+          assert sp_query(ctx, "SELECT i FROM #{m} ORDER BY trunc(s)") ===
+                   {:error, %{status: 400, body: sp_coercion(head.("Utf8"))}}
+        end
+      end
+    end
+  end
+
+  defp parenthesised_name_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: names of parenthesised and infinite items" do
+        test "a column in parentheses is named as the column", ctx do
+          m = sp_measurement("sp_paren")
+          sp_write(ctx, ["#{m} v=1i #{sp_ns(0)}"])
+
+          for select <- ["(v)", "((v))", "(#{m}.v)", "( v )", ~s|("v")|] do
+            assert sp_query(ctx, "SELECT #{select} FROM #{m}") === {:ok, [%{"v" => 1}]}, select
+          end
+
+          assert sp_query(ctx, "SELECT (v) AS w FROM #{m}") === {:ok, [%{"w" => 1}]}
+
+          # An expression is named by its text, a parenthesised constant by its type.
+          assert sp_query(ctx, "SELECT (v) + 1 FROM #{m}") ===
+                   {:ok, [%{"#{m}.v + Int64(1)" => 2}]}
+
+          assert sp_query(ctx, "SELECT (1) FROM #{m}") === {:ok, [%{"Int64(1)" => 1}]}
+        end
+
+        test "a number past the range of a double is named inf, and is a null that is there",
+             ctx do
+          m = sp_measurement("sp_inf_name")
+          sp_write(ctx, ["#{m} v=1i #{sp_ns(0)}"])
+
+          for {select, name} <- [
+                {"1e400", "Float64(inf)"},
+                {"-1e400", "Float64(-inf)"},
+                {"-(1e400)", "(- Float64(inf))"},
+                {"1e400 + 1", "Float64(inf) + Int64(1)"},
+                {"sum(1e400)", "sum(Float64(inf))"}
+              ] do
+            assert sp_query(ctx, "SELECT #{select} FROM #{m}") === {:ok, [%{name => nil}]},
+                   select
+          end
+
+          assert sp_query(ctx, "SELECT 1e400, -1e400 FROM #{m}") ===
+                   {:ok, [%{"Float64(inf)" => nil, "Float64(-inf)" => nil}]}
+        end
+      end
+    end
+  end
+
+  defp time_limit_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: time at the end of the nanosecond range" do
+        test "no instant is greater than the last one, which is not an empty range", ctx do
+          m = sp_measurement("sp_last")
+          last = "2262-04-11T23:47:16.854775807Z"
+          before_last = "2262-04-11T23:47:16.854775806Z"
+
+          sp_write(ctx, [
+            "#{m} v=1i 1000000000",
+            "#{m} v=2i 9223372036854775807",
+            "#{m} v=3i -9223372036854775808"
+          ])
+
+          for {where, rows} <- [
+                {"time > '#{last}' AND time < '#{last}'", []},
+                {"time > '#{last}'", []},
+                {"time > '#{last}' AND time <= '#{last}'", []},
+                {"time > '#{last}' AND time < '#{before_last}'", []},
+                {"NOT (time <= '#{last}')", []},
+                {"time >= '#{last}'", [2]},
+                {"time = '#{last}'", [2]},
+                {"time < '#{last}'", [3, 1]}
+              ] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY time") ===
+                     {:ok, Enum.map(rows, &%{"v" => &1})},
+                   where
+          end
+
+          # What is left of the last instant is an empty range, as anywhere.
+          empty =
+            {:error,
+             %{
+               status: 500,
+               body:
+                 "External error: unexpected: provided filters on time column did not " <>
+                   "produce a valid set of boundaries"
+             }}
+
+          for where <- [
+                "time >= '#{last}' AND time < '#{last}'",
+                "time > '#{before_last}' AND time < '#{last}'"
+              ] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where}") === empty, where
+          end
+        end
+
+        test "an instant before the first nanosecond is the optimizer's overflow", ctx do
+          m = sp_measurement("sp_first")
+          sp_write(ctx, ["#{m} v=1i 1000000000"])
+          first = "1677-09-21T00:12:43.145224192Z"
+
+          overflow =
+            {:error,
+             %{
+               status: 500,
+               body:
+                 "Optimizer rule 'simplify_expressions' failed\ncaused by\nArrow error: Cast " <>
+                   "error: Overflow converting 1677-09-21 00:12:43.145224192 to Nanosecond. " <>
+                   "The dates that can be represented as nanoseconds have to be between " <>
+                   "1677-09-21T00:12:44.0 and 2262-04-11T23:47:16.854775804"
+             }}
+
+          for where <- [
+                "time < '#{first}' AND time > '#{first}'",
+                "time < '#{first}'",
+                "time <= '#{first}'"
+              ] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where}") === overflow, where
+          end
+        end
+      end
+    end
+  end
+
+  defp cte_edge_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: CTE columns and positions" do
+        test "a column that is not there is found before a time compared with a number", ctx do
+          m = sp_measurement("sp_cte_time")
+          sp_write(ctx, ["#{m} v=1i,w=10i 1000000000", "#{m} v=2i,w=20i 2000000000"])
+
+          assert sp_query(
+                   ctx,
+                   "WITH c AS (SELECT v AS time FROM #{m}) SELECT v FROM c " <>
+                     "WHERE time > 5 AND time < 3"
+                 ) ===
+                   {:error,
+                    %{
+                      status: 500,
+                      body: "Schema error: No field named v. Valid fields are c.time."
+                    }}
+
+          assert sp_query(ctx, "SELECT nosuch FROM #{m} WHERE time > 5") ===
+                   {:error,
+                    %{
+                      status: 500,
+                      body: sp_no_field("nosuch", sp_fields(m, ["time", "v", "w"]))
+                    }}
+
+          # The column that is there is the type error.
+          assert sp_query(ctx, "SELECT v FROM #{m} WHERE time > 5") ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body:
+                        sp_coercion(
+                          "Cannot infer common argument type for comparison operation " <>
+                            "Timestamp(ns) > Int64"
+                        )
+                    }}
+        end
+
+        @tag local_divergence:
+               "a CTE column named time that is not a timestamp is compared as a number; Local refuses by name"
+        test "a CTE column named time that is not a timestamp is an ordinary column", ctx do
+          m = sp_measurement("sp_cte_num")
+          sp_write(ctx, ["#{m} v=1i,w=10i 1000000000", "#{m} v=2i,w=20i 2000000000"])
+
+          for {sql, rows} <- [
+                {"SELECT time FROM c WHERE time > 5", []},
+                {"SELECT time FROM c WHERE time = 1", [%{"time" => 1}]},
+                {"SELECT w FROM c WHERE time > 1", [%{"w" => 20}]}
+              ] do
+            result =
+              sp_query(ctx, "WITH c AS (SELECT v AS time, w FROM #{m}) " <> sql)
+
+            if sp_local?(),
+              do:
+                assert({:error, %{status: 400, body: "Client.Local: " <> _reason}} = result, sql),
+              else: assert(result === {:ok, rows}, sql)
+          end
+        end
+
+        test "ORDER BY a position of SELECT * names a column", ctx do
+          m = sp_measurement("sp_order_pos")
+          sp_write(ctx, ["#{m} v=1i,w=10i,f=1.5 1000000000", "#{m} v=2i,w=20i,f=2.5 2000000000"])
+          column = fn f, v, w, ns -> %{"f" => f, "v" => v, "w" => w, "time" => ns} end
+          first = column.(1.5, 1, 10, ~U[1970-01-01 00:00:01.000000Z])
+          second = column.(2.5, 2, 20, ~U[1970-01-01 00:00:02.000000Z])
+
+          # The columns are f, time, v, w.
+          assert sp_query(ctx, "SELECT * FROM #{m} ORDER BY 1 DESC") === {:ok, [second, first]}
+          assert sp_query(ctx, "SELECT * FROM #{m} ORDER BY 3 DESC, 1") === {:ok, [second, first]}
+          assert sp_query(ctx, "SELECT * FROM #{m} ORDER BY 2") === {:ok, [first, second]}
+
+          assert sp_query(ctx, "SELECT * FROM #{m} ORDER BY 0") ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body: "Error during planning: Order by index starts at 1 for column indexes"
+                    }}
+
+          assert sp_query(ctx, "SELECT * FROM #{m} ORDER BY 5") ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body:
+                        "Error during planning: Order by column out of bounds, specified: 5, max: 4"
+                    }}
+        end
+
+        test "ORDER BY a position of a CTE's SELECT * names a column of the CTE", ctx do
+          m = sp_measurement("sp_cte_pos")
+          sp_write(ctx, ["#{m} f=1.5 1000000000", "#{m} f=2.5 2000000000"])
+          name = "#{m}.f + Int64(1)"
+
+          assert sp_query(ctx, "WITH c AS (SELECT f + 1 FROM #{m}) SELECT * FROM c ORDER BY 1") ===
+                   {:ok, [%{name => 2.5}, %{name => 3.5}]}
+
+          assert sp_query(
+                   ctx,
+                   "WITH c AS (SELECT f + 1 FROM #{m}) SELECT * FROM c ORDER BY 1 DESC"
+                 ) === {:ok, [%{name => 3.5}, %{name => 2.5}]}
+
+          assert sp_query(ctx, "WITH c AS (SELECT f + 1 FROM #{m}) SELECT * FROM c ORDER BY 2") ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body:
+                        "Error during planning: Order by column out of bounds, specified: 2, max: 1"
+                    }}
+        end
+      end
+    end
+  end
+
+  defp order_position_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: ORDER BY positions and constants" do
+        test "a position outside the select list, or a number that is not one, fails", ctx do
+          m = sp_measurement("sp_order_range")
+          sp_write(ctx, ["#{m} v=1i,w=10i #{sp_ns(0)}", "#{m} v=2i,w=20i #{sp_ns(1)}"])
+
+          planning = fn message ->
+            {:error, %{status: 400, body: "Error during planning: " <> message}}
+          end
+
+          for {order, message} <- [
+                {"2", "Order by column out of bounds, specified: 2, max: 1"},
+                {"0", "Order by index starts at 1 for column indexes"},
+                {"1.5", "invalid digit found in string"},
+                {"1e400", "invalid digit found in string"},
+                {"0.0 DESC", "invalid digit found in string"},
+                {"18446744073709551615",
+                 "Order by column out of bounds, specified: 18446744073709551615, max: 1"},
+                {"18446744073709551616", "number too large to fit in target type"}
+              ] do
+            assert sp_query(ctx, "SELECT v FROM #{m} ORDER BY #{order}") === planning.(message),
+                   order
+
+            # The three columns of SELECT * are the positions.
+            star = String.replace(message, ~r/specified: 2, max: 1/, "specified: 4, max: 3")
+            star_order = if order == "2", do: "4", else: String.replace(order, "max: 1", "max: 3")
+
+            assert sp_query(ctx, "SELECT * FROM #{m} ORDER BY #{star_order}") ===
+                     planning.(String.replace(star, "max: 1", "max: 3")),
+                   order
+          end
+
+          assert sp_query(ctx, "SELECT v, count(*) AS n FROM #{m} GROUP BY v ORDER BY 3") ===
+                   planning.("Order by column out of bounds, specified: 3, max: 2")
+
+          # A position in GROUP BY has its own words.
+          assert sp_query(ctx, "SELECT v FROM #{m} GROUP BY 3") ===
+                   planning.(
+                     "Cannot find column with position 3 in SELECT clause. Valid columns: 1 to 1"
+                   )
+        end
+
+        test "an ORDER BY term that is a constant orders nothing and fails nothing", ctx do
+          m = sp_measurement("sp_order_const")
+          sp_write(ctx, ["#{m} v=1i,w=10i #{sp_ns(0)}", "#{m} v=2i,w=20i #{sp_ns(1)}"])
+          both = {:ok, [%{"v" => 1}, %{"v" => 2}]}
+
+          for order <- ["1 / 0", "-1", "abs(-9223372036854775808)", "5 % 0", "1 / 0, v"] do
+            assert sp_query(ctx, "SELECT v FROM #{m} ORDER BY #{order}") === both, order
+          end
+
+          assert sp_query(ctx, "SELECT v FROM #{m} ORDER BY 1 / 0, v DESC") ===
+                   {:ok, [%{"v" => 2}, %{"v" => 1}]}
+        end
+
+        test "a number past the range of a double compares as an infinity in WHERE", ctx do
+          m = sp_measurement("sp_where_inf")
+          sp_write(ctx, ["#{m} v=1i #{sp_ns(0)}", "#{m} v=2i #{sp_ns(1)}"])
+          both = {:ok, [%{"v" => 1}, %{"v" => 2}]}
+
+          for {where, rows} <- [
+                {"1e400 > 1", both},
+                {"1 < 1e400", both},
+                {"1e400 = 1e400", both},
+                {"-1e400 < 1e400", both},
+                {"1e400 > v", both},
+                {"-1e400 < v", both},
+                {"v < 1e400", both},
+                {"0.0 > -0.0", both},
+                {"0.0 = -0.0", {:ok, []}},
+                {"1e400 < 1", {:ok, []}}
+              ] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY v") === rows,
+                   where
+          end
         end
       end
     end
