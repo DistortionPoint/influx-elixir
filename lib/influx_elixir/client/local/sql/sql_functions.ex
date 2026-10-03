@@ -97,6 +97,8 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
               :length,
               :substr,
               :starts_with,
+              :left,
+              :right,
               :sqrt,
               :ln,
               :log,

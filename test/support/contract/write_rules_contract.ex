@@ -8,7 +8,7 @@ defmodule InfluxElixir.Contract.WriteRules do
 
       use InfluxElixir.Contract.WriteRules, client: InfluxElixir.Client.Local, profile: :v3_core
 
-  The `setup` callback must return `conn`, `database` and `query_delay`, as for
+  The `setup` callback must return `conn` and `database`, as for
   the shared contract. Each test has a database of its own, so the measurements
   are short fixed names: the engine cuts `original_line` to 20 bytes, and a
   long unique name would cut the rest of the line away.

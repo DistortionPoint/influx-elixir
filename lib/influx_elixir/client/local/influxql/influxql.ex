@@ -84,9 +84,13 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   # fields, the first `time()`, its errors at their positions), `fill()` over
   # the buckets that hold points, `/* */` comments, `SLIMIT` (405), `tz('UTC')`,
   # `percentile`, `mode`, `top`, `bottom`, `integral`, the math functions, the
-  # transforms of fields and of aggregates (`InfluxQLTransform`), `F(*)`,
-  # `*::field`, `/re/` columns and `FROM` lists (`InfluxQLWild`), booleans in
-  # `first`/`last`/`min`/`max`, and the `SHOW` statements (`InfluxQLShowParser`).
+  # transforms of fields and of aggregates (`InfluxQLTransform`: a float that
+  # overflows is a null in the row, an integer wraps), `F(*)` (`count`, `mode` and
+  # `elapsed` take every field), `*::field`, `/re/` columns and `FROM` lists
+  # (`InfluxQLWild`), the planning errors of a duration or window the engine
+  # refuses (`InfluxQLExpr`, `InfluxQLPlan`), booleans in `first`/`last`/`min`/`max`,
+  # and the `SHOW` statements (`InfluxQLShowParser`, `InfluxQLShowClauses`,
+  # `InfluxQLShowCondition`).
   #
   # Refused by name, rather than answered wrongly: `INTO`, subqueries, `tz()`
   # of a zone other than UTC, `mode()` of values equally often there, `GROUP BY`
@@ -145,7 +149,8 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
           fill: InfluxElixir.Client.Local.InfluxQLBuckets.fill(),
           descending: boolean(),
           limit: non_neg_integer() | nil,
-          offset: non_neg_integer()
+          offset: non_neg_integer(),
+          rewrite_error: binary() | nil
         }
 
   @typedoc """
@@ -239,6 +244,14 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   @spec plan_select(query(), %{binary() => field_type()}, MapSet.t(binary())) ::
           :ok | {:error, {:engine, binary()} | {:engine, pos_integer(), binary()} | binary()}
   defdelegate plan_select(query, types, tags), to: InfluxQLPlan, as: :check
+
+  @doc """
+  The engine's planning error that comes first, while it rewrites the
+  statement: a wildcard it cannot expand, then the offset of a `GROUP BY time()`
+  it cannot read. `:ok` when there is none.
+  """
+  @spec early_error(query()) :: :ok | {:error, {:engine, binary()}}
+  defdelegate early_error(query), to: InfluxQLPlan
 
   @doc """
   Whether a row (field name to value) satisfies a check of a `where_plan/3`:

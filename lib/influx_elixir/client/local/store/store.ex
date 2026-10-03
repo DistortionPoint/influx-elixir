@@ -21,6 +21,8 @@ defmodule InfluxElixir.Client.Local.Store do
   #     monotonic integer, so points scan in insertion order
   #   * `{:series_time, database, measurement, timestamp, tags}` — one per
   #     point written; a second write of the same key adds
+  #   * `{:chunk, database, measurement, index}` — a database with a retention
+  #     has one for each 10-minute chunk (see `Retention`) it was written to
   #   * `{:duplicates, database, measurement}` — reads merge that
   #     measurement's duplicate points (same tags and time) only when this
   #     marker exists
@@ -202,6 +204,7 @@ defmodule InfluxElixir.Client.Local.Store do
     :ets.match_delete(table, {{:column, name, :_, :_}, :_})
     :ets.match_delete(table, {{:series_time, name, :_, :_, :_}})
     :ets.match_delete(table, {{:duplicates, name, :_}})
+    :ets.match_delete(table, {{:chunk, name, :_, :_}})
   end
 
   @doc "Registers a bucket with its metadata (replacing any earlier one)."
@@ -336,6 +339,7 @@ defmodule InfluxElixir.Client.Local.Store do
 
     markers = for m <- Enum.uniq(repeated ++ taken), do: {{:duplicates, database, m}}
     :ets.insert(table, markers)
+    mark_chunks(table, database, stamped)
 
     :ets.insert(
       table,
@@ -346,9 +350,45 @@ defmodule InfluxElixir.Client.Local.Store do
     )
   end
 
-  @spec unexpired([point()], t(), binary()) :: [point()]
-  defp unexpired(points, table, database),
-    do: Retention.visible(points, retention(table, database), now_ns())
+  # The points of a measurement (`:_` for all of them) that a query sees.
+  # Without a retention they are all of them, and so they are when no chunk
+  # written to reaches back to the cut-off: the markers of the chunks are few,
+  # the points are not read to find out.
+  @spec visible_points(t(), binary(), binary() | :_) :: [point()]
+  defp visible_points(table, database, measurement) do
+    all = [{{{:point, database, measurement, :_}, :"$1"}, [], [:"$1"]}]
+
+    case retention(table, database) do
+      nil ->
+        :ets.select(table, all)
+
+      seconds ->
+        now = now_ns()
+        oldest = Retention.oldest_chunk(Retention.cutoff(seconds, now))
+        old = [{{{:chunk, database, measurement, :"$1"}}, [{:"=<", :"$1", oldest}], [true]}]
+
+        if :ets.select_count(table, old) == 0,
+          do: :ets.select(table, all),
+          else: table |> :ets.select(all) |> Retention.visible(seconds, now)
+    end
+  end
+
+  # A database with a retention keeps a marker for each chunk (see
+  # `Retention`) it holds points in, which only tells reads that no point can
+  # have expired. A marker outlives the points deleted from its chunk; a
+  # database without a retention keeps none.
+  @spec mark_chunks(t(), binary(), [point()]) :: true
+  defp mark_chunks(table, database, points) do
+    if retention(table, database) do
+      markers =
+        for {measurement, index} <- Retention.chunks(points),
+            do: {{:chunk, database, measurement, index}}
+
+      :ets.insert(table, markers)
+    else
+      true
+    end
+  end
 
   # The measurements of the series keys that occur more than once.
   @spec repeated_measurements([tuple()]) :: [binary()]
@@ -402,10 +442,7 @@ defmodule InfluxElixir.Client.Local.Store do
   """
   @spec points(t(), binary(), binary()) :: [point()]
   def points(table, database, measurement) do
-    points =
-      table
-      |> :ets.select([{{{:point, database, measurement, :_}, :"$1"}, [], [:"$1"]}])
-      |> unexpired(table, database)
+    points = visible_points(table, database, measurement)
 
     if :ets.member(table, {:duplicates, database, measurement}),
       do: merge_duplicates(points),
@@ -421,10 +458,7 @@ defmodule InfluxElixir.Client.Local.Store do
   def points_in_db(table, database, only \\ :all)
 
   def points_in_db(table, database, :all) do
-    points =
-      table
-      |> :ets.select([{{{:point, database, :_, :_}, :"$1"}, [], [:"$1"]}])
-      |> unexpired(table, database)
+    points = visible_points(table, database, :_)
 
     if :ets.match(table, {{:duplicates, database, :_}}, 1) == :"$end_of_table",
       do: points,

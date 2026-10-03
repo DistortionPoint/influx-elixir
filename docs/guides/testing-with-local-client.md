@@ -246,7 +246,7 @@ defmodule MyApp.ContractTest do
   setup do
     {:ok, conn} = Local.start(databases: ["contract_db"], profile: :v3_core)
     on_exit(fn -> Local.stop(conn) end)
-    {:ok, conn: conn, database: "contract_db", query_delay: 0}
+    {:ok, conn: conn, database: "contract_db"}
   end
 end
 ```
@@ -942,7 +942,7 @@ Queries the double cannot express (CTEs, joins, window functions, `median`,
 ## InfluxQL
 
 `query_influxql/3` answers in InfluxDB 3's InfluxQL shape, which is not the
-SQL shape (every row below was taken from `influxdb:3-core`):
+SQL shape (every row below was taken from `influxdb:3.10.1-core`):
 
 ```elixir
 Local.query_influxql(conn, "SELECT v FROM o", database: "db")
@@ -982,10 +982,13 @@ InfluxQL's `WHERE` is not SQL's, and the double follows the engine
 are answered from the schema, with `ON db`, `FROM` (names and `/re/`),
 `WITH MEASUREMENT`, `WITH KEY`, `WHERE`, `LIMIT` and `OFFSET`. Only the last
 24 hours count for a `WHERE` that does not bound `time`. The engine's parse
-errors are given at their positions. Refused by name: `LIMIT`/`OFFSET` on
-`SHOW TAG VALUES` over several keys, a `WHERE` with `OR` on a column the
-measurement lacks, a time comparison inside `OR`, and the engine's internal
-errors (a `WHERE` of a bare column, a `TAG KEYS` with `WHERE` and `LIMIT`).
+errors are given at their positions. A column the measurement lacks is null in
+a comparison, as in a `SELECT` (`nosuch = 'x' OR region = 'eu'` keeps the
+points of region `eu`), and a `WHERE` that is no boolean (`WHERE 1`, a string,
+a tag or a field) is the engine's `type_coercion` error. Refused by name:
+`LIMIT`/`OFFSET` on `SHOW TAG VALUES` over several keys, a time comparison
+inside `OR`, and the engine's internal error for a `TAG KEYS` with `WHERE` and
+`LIMIT`.
 
 ### SELECT
 
@@ -1008,7 +1011,17 @@ in a `GROUP BY time` (the transforms that compare with the bucket before scan
 one bucket before the range, as the engine does). `F(*)`, `F(/re/)`, `*::field`,
 `*::tag` and `/re/` in the select list, `FROM` with several names or `/re/`,
 `tz('UTC')`, `SLIMIT`/`SOFFSET` (the engine's 405) and arithmetic in the select
-list (`usage + 1`, `sum(n) / count(n)`, `n::float`) are answered.
+list (`usage + 1`, `sum(n) / count(n)`, `n::float`) are answered. `count`,
+`mode` and `elapsed` take every field (strings and booleans too) in `F(*)` and
+`F(/re/)`; `F(*::tag)` is the engine's "unable to use tag as wildcard" error,
+and a regular expression stands alone in the parentheses (`percentile(/re/, 99)`
+is the engine's parse error). A duration or window the planner refuses
+(`derivative(f, 0s)`, `moving_average(f, 1)`) is its planning error, with the
+duration worded as it words it (`-1s` is `-1000ms`). A float result that
+overflows is a null that is in the row (an integer wraps at 64 bits), and a
+`percentile()` of an integer field that has no value, beside another column or
+in a `GROUP BY time`, breaks the connection as the engine does
+(`{:error, {:connection_error, %Mint.TransportError{reason: :closed}}}`).
 
 Refused by name, because the double cannot answer them as the engine does:
 
@@ -1068,8 +1081,9 @@ defmodule MyApp.Integration.CandlesTest do
     db = "candles_#{System.unique_integer([:positive])}"
     :ok = HTTP.create_database(ctx.conn, db)
     on_exit(fn -> HTTP.delete_database(ctx.conn, db) end)
-    # Real servers ingest asynchronously: wait before querying a fresh write.
-    {:ok, database: db, query_delay: 500}
+    # Core and 2.7 answer a query with every write they acknowledged, so a
+    # test does not wait between a write and a read.
+    {:ok, database: db}
   end
 end
 ```
@@ -1081,7 +1095,7 @@ Exclude the tag by default in `test/test_helper.exs`
 # InfluxDB 3 Core on 8181, no auth, data in memory. A write is answered
 # when the write-ahead log flushes (every second by default), so a short
 # interval keeps a write-heavy suite fast.
-docker run -d --rm --name influx3 -p 8181:8181 influxdb:3-core \
+docker run -d --rm --name influx3 -p 8181:8181 influxdb:3.10.1-core \
   influxdb3 serve --node-id node0 --object-store memory --without-auth \
   --wal-flush-interval 10ms
 
@@ -1097,7 +1111,9 @@ server, and reads `INFLUX_V3_CORE_HOST` / `INFLUX_V3_CORE_PORT` (defaults
 `INFLUX_V2_TOKEN`, `INFLUX_V2_ORG` and `INFLUX_V2_BUCKET`. Every statement
 in this guide about what the real engine returns was recorded that way. This
 library's `mix test` does not compile `test/integration` unless a path under it
-is named or `INTEGRATION=1` is set, so the unit suite stays fast.
+is named, an integration tag is included (`mix test --include integration
+--include v3_core` needs no path) or `INTEGRATION=1` is set, so the unit suite
+stays fast.
 
 ## Write Rules
 
@@ -1197,7 +1213,7 @@ nothing is stored; `time` as a field is dropped silently, as a tag it is a
 
 ## Key Differences from Real InfluxDB
 
-- **No WAL flush delay**: Writes are immediately queryable (set `query_delay: 0`)
+- **No WAL flush delay**: Writes are immediately queryable
 - **In-memory only**: Data is lost when `stop/1` is called
 - **Simplified SQL parser**: Supports `SELECT *`, multi-column projection (with
   optional `AS alias`), `SELECT DISTINCT col[, col ...]`,

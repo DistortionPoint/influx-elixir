@@ -43,6 +43,11 @@ defmodule InfluxElixir.Client.Local.SQLCompare do
   defp like_source(["_" | rest], acc), do: like_source(rest, ["." | acc])
   defp like_source([char | rest], acc), do: like_source(rest, [Regex.escape(char) | acc])
 
+  @doc "A three-valued negation: unknown stays unknown."
+  @spec negate(boolean() | nil) :: boolean() | nil
+  def negate(nil), do: nil
+  def negate(value), do: not value
+
   @doc "Whether `actual op value` holds; a null on either side is not true."
   @spec compare(term(), atom(), term()) :: boolean()
   def compare(nil, _op, _value), do: false

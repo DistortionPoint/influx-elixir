@@ -36,14 +36,6 @@ defmodule InfluxElixir.Client.Local.SQLFold do
   end
 
   @doc """
-  Whether a constant sub-expression of `expr` cannot be computed (`1 / 0`):
-  it fails for every row alike.
-  """
-  @spec failing_constant?(SQLExpr.t()) :: boolean()
-  def failing_constant?(expr),
-    do: SQLExpr.any?(expr, &(foldable?(&1) and constant(&1) == :error))
-
-  @doc """
   The smallest integer, as text, whose negation a constant sub-expression
   of `expr` performs (`-(-9223372036854775807 - 1)`), or `nil`. A constant
   that fails some other way is not one.

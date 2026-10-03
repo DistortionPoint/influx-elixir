@@ -104,6 +104,38 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
   defp split_sign("-" <> unsigned), do: {"-", unsigned}
   defp split_sign(unsigned), do: {"", unsigned}
 
+  @display_units [
+    {"w", 604_800_000_000_000},
+    {"d", 86_400_000_000_000},
+    {"h", 3_600_000_000_000},
+    {"m", 60_000_000_000},
+    {"s", 1_000_000_000},
+    {"ms", 1_000_000},
+    {"u", 1_000},
+    {"ns", 1}
+  ]
+
+  @doc """
+  A duration in nanoseconds as the engine words it in an error: `0s` for none,
+  otherwise the units it holds from the weeks down (`1s500ms`), a unit only
+  where the duration is more than that unit (a lone minute is `60s`, a lone
+  nanosecond nothing at all), and a negative one after a `-`.
+  """
+  @spec display_duration(integer()) :: binary()
+  def display_duration(0), do: "0s"
+  def display_duration(ns) when ns < 0, do: "-" <> display_duration(-ns)
+
+  def display_duration(ns) do
+    {text, _rest} =
+      Enum.reduce(@display_units, {"", ns}, fn {unit, size}, {text, rest} ->
+        if ns > size and rest >= size,
+          do: {text <> "#{div(rest, size)}#{unit}", rem(rest, size)},
+          else: {text, rest}
+      end)
+
+    text
+  end
+
   @spec duration(binary()) :: {:ok, binary()}
   defp duration(text) do
     [count, unit] = Regex.run(~r/^(\d+)(ns|ms|u|µ|s|m|h|d|w)$/u, text, capture: :all_but_first)

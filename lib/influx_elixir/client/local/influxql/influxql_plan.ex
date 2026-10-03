@@ -34,8 +34,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
           :ok
           | {:error, {:engine, binary()} | {:engine, pos_integer(), binary()} | binary()}
   def check(%{items: items, group_time: group_time} = query, types, tags) do
-    with :ok <- call_errors(items),
-         :ok <- InfluxQLLiteral.constant_error(items),
+    with :ok <- early_error(query),
+         :ok <- item_errors(items),
          :ok <- distinct_alone(items),
          :ok <- multi_rules(items),
          :ok <- transforms(query),
@@ -225,15 +225,32 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     end
   end
 
-  @spec call_errors([InfluxQL.item()]) :: :ok | {:error, {:engine, binary()}}
-  defp call_errors(items) do
-    case Enum.find(
-           items,
-           &match?({kind, _message} when kind in [:planning_error, :expand_error], &1)
-         ) do
-      {:planning_error, message} -> planning(message)
+  @doc """
+  The errors the engine raises while it rewrites the statement, before it looks
+  at the `WHERE` (verified): one found while the projection is expanded, then
+  the offset of the `GROUP BY time()`.
+  """
+  @spec early_error(InfluxQL.query()) :: :ok | {:error, {:engine, binary()}}
+  def early_error(%{items: items} = query) do
+    case Enum.find(items, &match?({:expand_error, _message}, &1)) do
       {:expand_error, message} -> {:error, {:engine, InfluxQLError.expand_error(message)}}
-      nil -> :ok
+      nil -> offset_error(Map.get(query, :rewrite_error))
+    end
+  end
+
+  defp offset_error(nil), do: :ok
+  defp offset_error(body), do: {:error, {:engine, body}}
+
+  # The first item, in order, that is a constant or a call the engine refuses.
+  @spec item_errors([InfluxQL.item()]) :: :ok | {:error, {:engine, binary()}}
+  defp item_errors(items), do: Enum.find_value(items, :ok, &item_error/1)
+
+  defp item_error({:planning_error, message}), do: planning(message)
+
+  defp item_error(item) do
+    case InfluxQLLiteral.constant_error([item]) do
+      :ok -> nil
+      error -> error
     end
   end
 

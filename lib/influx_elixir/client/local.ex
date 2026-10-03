@@ -208,11 +208,14 @@ defmodule InfluxElixir.Client.Local do
     * Expressions, answered as the engine does (verified against InfluxDB 3
       Core, bodies of its errors included): `CASE`, `COALESCE`, `NULLIF`,
       `GREATEST`, `LEAST`; `lower`, `upper`, `length`, `substr`,
-      `starts_with`; `sqrt`, `ln`, `log`, `pow`; `IS [NOT] DISTINCT FROM`,
+      `starts_with`, `left`, `right`; `sqrt`, `ln`, `log`, `pow`; `IS [NOT] DISTINCT FROM`,
       `IS [NOT] TRUE|FALSE`; a `SELECT` with no `FROM` (`SELECT 1 + 1 two`);
       an alias with no `AS` (`SELECT n a`); an expression of aggregates
       (`sum(n) / count(n)`), a `GROUP BY` expression, and `HAVING` with a
-      comparison. These work in `WHERE` too.
+      comparison, which may name a select item's alias (a column of the table of that
+      name is read instead). These work in `WHERE` too. A word of the grammar after
+      `AS` is a name (`SELECT host AS having`), and so are `LEFT`, `RIGHT` and the other
+      join words in a select item.
     * `information_schema.tables`, `.columns` and `.schemata`, `SHOW TABLES`
       and `SHOW COLUMNS FROM t`, and the qualified names `iox.t` and
       `public.iox.t`. Another schema or catalog is the engine's "table not
@@ -227,9 +230,12 @@ defmodule InfluxElixir.Client.Local do
       `approx_percentile_cont` and `approx_median`, window functions, `JOIN`
       other than `CROSS JOIN`, `UNION` / `INTERSECT` / `EXCEPT`, subqueries,
       `FROM (VALUES ...)`, `ROLLUP` / `CUBE` / `GROUPING SETS`, table
-      functions, the `system.*` tables and the other `information_schema`
-      views, `SHOW` other than `TABLES` and `COLUMNS`, `concat`, `trim`,
-      `replace`, `bool_and`, `array_agg`, `FILTER (WHERE ...)`, a `HAVING`
+      functions, `SELECT ... INTO` (answered with the engine's refusal to
+      create the table), the `~~` family of `LIKE` operators, `current_time`
+      and its kin without parentheses, `TIMESTAMP '...'` and the other typed
+      literals, the difference of two timestamps, the `system.*` tables and
+      the other `information_schema` views, `SHOW` other than `TABLES` and
+      `COLUMNS`, `concat`, `trim`, `replace`, `bool_and`, `array_agg`, `FILTER (WHERE ...)`, a `HAVING`
       that is no comparison or has no `GROUP BY`, `COALESCE` of text with a
       number, and a comparison of `time` inside a select item. The last
       digit of `var_*` and `stddev*` can differ from the engine's, whose

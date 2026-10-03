@@ -3,7 +3,8 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
   The `:write_admin` part of `InfluxElixir.ClientContract`:
   Health, writes, write rules, line protocol, precision, gzip, escaping,
   databases and their names, timestamp range (all profiles for health and write; the
-  InfluxDB 3 profiles for the rest).
+  InfluxDB 3 profiles for the rest), and the line protocol grammar of both engines
+  (`InfluxElixir.ClientContract.LineProtocol`).
   """
 
   @doc false
@@ -30,7 +31,9 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
       end
 
     [health_tests(client, version), write_tests(client, profile)] ++
-      v3 ++ [timestamp_range_tests(client, version)]
+      v3 ++
+      InfluxElixir.ClientContract.LineProtocol.blocks(client, profile) ++
+      [timestamp_range_tests(client, version)]
   end
 
   defp health_tests(client, version) do

@@ -10,9 +10,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
   #     the function takes (a regular expression only names fields), each
   #     column named `F_field` (`alias_field` after `AS`): the numeric fields
   #     for `mean sum median spread stddev percentile abs round floor ceil sqrt
-  #     ln log pow` and the transforms, the numeric and boolean ones for `min` and
-  #     `max`, every field for `first` and `last`
-  #   * a measurement with none of them answers nothing
+  #     `ln log pow` and the transforms except `elapsed`, the numeric and boolean
+  #     ones for `min` and `max`, every field for `count`, `mode`, `elapsed`,
+  #     `first` and `last`
+  #   * `*::tag` is the planning error `unable to use tag as wildcard in F()`
+  #   * a measurement with none of them answers nothing; a function the double
+  #     does not know is refused by name, never answered with nothing
 
   alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLExpr, InfluxQLNames, InfluxQLRegex}
 
@@ -20,7 +23,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
   @numeric_functions ~w(mean sum median spread stddev percentile integral abs round floor ceil sqrt ln
                         log pow derivative non_negative_derivative difference
                         non_negative_difference cumulative_sum moving_average)
-  @aggregates ~w(mean sum median spread stddev min max first last)
+  @every_type ~w(first last count mode elapsed)
+  @aggregates ~w(mean sum median spread stddev min max first last count mode)
+  @known @every_type ++ ~w(min max) ++ @numeric_functions
 
   @doc """
   The query with its wildcards written out for a measurement with the given
@@ -31,18 +36,28 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
   @spec expand(InfluxQL.query(), %{binary() => atom()}, MapSet.t(binary())) ::
           {:ok, InfluxQL.query()} | :empty | {:error, binary()}
   def expand(%{items: items} = query, types, tags) do
-    if Enum.any?(items, &wild?/1) do
-      case Enum.flat_map(items, &expand_item(&1, types, tags)) do
-        [] ->
-          :empty
+    cond do
+      not Enum.any?(items, &wild?/1) ->
+        {:ok, query}
 
-        expanded ->
-          with {:ok, named} <- InfluxQLNames.resolve(expanded), do: {:ok, %{query | items: named}}
-      end
-    else
-      {:ok, query}
+      unknown = Enum.find(items, &unknown_call?/1) ->
+        {:wild_call, name, _extra, _target, _alias} = unknown
+        {:error, "unsupported InfluxQL (#{name}() of a wildcard)"}
+
+      true ->
+        case Enum.flat_map(items, &expand_item(&1, types, tags)) do
+          [] ->
+            :empty
+
+          expanded ->
+            with {:ok, named} <- InfluxQLNames.resolve(expanded),
+                 do: {:ok, %{query | items: named}}
+        end
     end
   end
+
+  defp unknown_call?({:wild_call, name, _extra, _target, _alias}), do: name not in @known
+  defp unknown_call?(_item), do: false
 
   defp wild?({:wild_column, _target}), do: true
   defp wild?({:wild_call, _name, _extra, _target, _alias}), do: true
@@ -76,44 +91,78 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
     types |> Enum.sort() |> Enum.filter(fn {field, _type} -> Regex.match?(regex, field) end)
   end
 
-  defp takes?(name, type) when name in ["first", "last"],
+  defp takes?(name, type) when name in @every_type,
     do: type in (@numeric ++ [:string, :boolean])
 
   defp takes?(name, type) when name in ["min", "max"], do: type in (@numeric ++ [:boolean])
   defp takes?(name, type) when name in @numeric_functions, do: type in @numeric
-  defp takes?(_name, _type), do: false
 
-  # `F(field)` as the item the engine reads it as.
-  defp call_item(name, _extra, field, column) when name in @aggregates,
-    do: {:aggregate, name, field, column}
-
-  defp call_item("integral", extra, field, column) do
-    unit =
-      case extra do
-        [{:dur, ns}] -> ns
-        _default -> 1_000_000_000
-      end
-
-    {:aggregate, "integral:" <> Integer.to_string(unit), field, column}
-  end
-
-  defp call_item("percentile", [{:lit, {_kind, percent}}], field, column),
-    do: {:aggregate, "percentile:" <> number_text(percent), field, column}
-
+  # `F(field)` as the item the engine reads it as; the engine counts the
+  # arguments first (the wildcard is one).
   defp call_item(name, extra, field, column) do
-    arguments = Enum.map_join([~s("#{field}") | Enum.map(extra, &argument_text/1)], ", ", & &1)
-
-    case InfluxQLExpr.parse("#{name}(#{arguments})") do
-      {:ok, ast} -> {:expr, ast, column}
-      _other -> nil
+    case arity_error(name, 1 + length(extra)) do
+      nil -> call_item_of(name, extra, field, column)
+      message -> {:planning_error, message}
     end
   end
 
-  defp argument_text({:lit, {_kind, number}}), do: number_text(number)
-  defp argument_text({:dur, ns}), do: "#{ns}ns"
+  @one_argument @aggregates ++
+                  ~w(difference non_negative_difference cumulative_sum abs round floor ceil sqrt ln)
+  @two_arguments ~w(percentile moving_average pow log)
+  @one_or_two ~w(derivative non_negative_derivative elapsed integral)
 
-  defp number_text(n) when is_integer(n), do: Integer.to_string(n)
-  defp number_text(x) when is_float(x), do: Float.to_string(x)
+  @spec arity_error(binary(), pos_integer()) :: binary() | nil
+  defp arity_error(name, count) when name in @one_argument and count != 1,
+    do: "invalid number of arguments for #{name}, expected 1, got #{count}"
+
+  defp arity_error(name, count) when name in @two_arguments and count != 2,
+    do: "invalid number of arguments for #{name}, expected 2, got #{count}"
+
+  defp arity_error(name, count) when name in @one_or_two and count > 2,
+    do:
+      "invalid number of arguments for #{name}, expected at least 1 but no more than 2, " <>
+        "got #{count}"
+
+  defp arity_error(_name, _count), do: nil
+
+  defp call_item_of(name, _extra, field, column) when name in @aggregates,
+    do: {:aggregate, name, field, column}
+
+  defp call_item_of("integral", extra, field, column) do
+    case InfluxQLExpr.integral_unit(extra) do
+      {:ok, unit} -> {:aggregate, "integral:" <> Integer.to_string(unit), field, column}
+      {:planning, message} -> {:planning_error, message}
+      :error -> refuse("integral")
+    end
+  end
+
+  defp call_item_of("percentile", [{:str, content}], _field, _column) do
+    {:planning_error,
+     "expected number for percentile(), got Literal(String(#{inspect(content)}))"}
+  end
+
+  defp call_item_of("percentile", [{:lit, {_kind, percent}}], field, column),
+    do: {:aggregate, "percentile:" <> InfluxQLExpr.number_text(percent), field, column}
+
+  defp call_item_of(name, extra, field, column) do
+    arguments =
+      Enum.map_join([~s("#{field}") | Enum.map(extra, &argument_text(name, &1))], ", ", & &1)
+
+    case InfluxQLExpr.parse("#{name}(#{arguments})") do
+      {:ok, ast} -> {:expr, ast, column}
+      {:planning, message} -> {:planning_error, message}
+      _other -> refuse(name)
+    end
+  end
+
+  defp argument_text(_name, {:lit, {_kind, number}}), do: InfluxQLExpr.number_text(number)
+  defp argument_text(_name, {:dur, ns}), do: "#{ns}ns"
+  defp argument_text(_name, {:neg, {:dur, ns}}), do: "-#{ns}ns"
+  defp argument_text(name, _other), do: refuse(name)
+
+  @spec refuse(binary()) :: no_return()
+  defp refuse(name),
+    do: throw({:refused, "unsupported InfluxQL (#{name}() of a wildcard with those arguments)"})
 
   defp sorted(names), do: names |> Enum.to_list() |> Enum.sort()
 end

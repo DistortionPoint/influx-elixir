@@ -22,7 +22,6 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     SQLExprType,
     SQLFunctions,
     SQLParser,
-    SQLPredicate,
     SQLSchema,
     SQLWhere
   }
@@ -49,7 +48,8 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   #   1. WHERE's calls, operators, comparisons and regexes, as written
   #   2. WHERE's LIKEs, IN lists and BETWEENs, and its parts under a CAST,
   #      IS [NOT] NULL, BETWEEN, LIKE, IN or NOT (`{:cut, item}`; see
-  #      `plan_items/2`), as written
+  #      `plan_items/2`), as written, then the booleans of its `AND`, `OR`, `NOT` and
+  #      `IS TRUE`, which the engine checks once the calls under them have planned
   #   3. ORDER BY's calls and operators
   #   4. a negation, wherever it stands
   #
@@ -95,6 +95,8 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp rank(:where, {:lazy_cut, _call}), do: 2
   defp rank(:where, {:null_cut, _call}), do: 2
   defp rank(:where, {:in_list, _operand, _values}), do: 2
+  defp rank(:where, {:logical, _tree}), do: 2
+  defp rank(:where, {:expr_check, {:is_bool, _inner, _value, _negated}}), do: 2
   defp rank(:where, {:range, _operand, _low, _high}), do: 2
   defp rank(:where, _item), do: 1
   defp rank(:order_by, _item), do: 3
@@ -269,23 +271,26 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp plan_items({:is_distinct, left, right, _negated} = node, state),
     do: plan_items([left, right], state) ++ [mark({:expr_check, node}, elem(state, 1))]
 
-  defp plan_items({:in, left, items, _negated} = node, state)
+  defp plan_items(term, state), do: plan_predicate_items(term, state)
+
+  @spec plan_predicate_items(term(), state()) :: [term()]
+  defp plan_predicate_items({:in, left, items, _negated} = node, state)
        when is_list(items) and not is_nil(left),
        do:
          lazy(left, state) ++
            slot_items(left, items, state) ++ [mark({:expr_check, node}, elem(state, 1))]
 
-  defp plan_items({:between, inner, low, high, _negated} = node, state),
+  defp plan_predicate_items({:between, inner, low, high, _negated} = node, state),
     do:
       lazy(inner, state) ++
         slot_items(inner, [low, high], state) ++ [mark({:expr_check, node}, elem(state, 1))]
 
-  defp plan_items({:like, inner, pattern, _negated, _ilike, _regex} = node, state),
+  defp plan_predicate_items({:like, inner, pattern, _negated, _ilike, _regex} = node, state),
     do:
       lazy(inner, state) ++
         slot_items(inner, pattern, state) ++ [mark({:expr_check, node}, elem(state, 1))]
 
-  defp plan_items({:case, operand, whens, otherwise} = node, state) do
+  defp plan_predicate_items({:case, operand, whens, otherwise} = node, state) do
     conditions = List.wrap(operand) ++ Enum.map(whens, &elem(&1, 0))
     [first | later] = Enum.map(whens, &elem(&1, 1))
 
@@ -295,60 +300,64 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
       [mark({:expr_check, node}, elem(state, 1))]
   end
 
-  defp plan_items({:call, _function, args} = call, {_function_above, cut}),
+  defp plan_predicate_items({:call, _function, args} = call, {_function_above, cut}),
     do: plan_items(args, {true, cut}) ++ [mark(call, cut)]
 
-  defp plan_items({:cast, inner, _type}, {function_above, cut}),
+  defp plan_predicate_items({:cast, inner, _type}, {function_above, cut}),
     do: plan_items(inner, {function_above, cut or not function_above})
 
-  defp plan_items({:op, _op, left, right} = op, state),
+  defp plan_predicate_items({:op, _op, left, right} = op, state),
     do: plan_items(left, state) ++ plan_items(right, state) ++ [mark(op, elem(state, 1))]
 
-  defp plan_items({:neg, inner} = neg, state), do: plan_items(inner, state) ++ [neg]
+  defp plan_predicate_items({:neg, inner} = neg, state), do: plan_items(inner, state) ++ [neg]
 
-  defp plan_items({:field, name}, _state) when is_binary(name),
+  defp plan_predicate_items({:field, name}, _state) when is_binary(name),
     do: if(SQLAggExpr.placeholder?(name), do: [{:agg_ref, name}], else: [])
 
-  defp plan_items({kind, left, rest}, {function_above, _cut})
+  defp plan_predicate_items(term, state), do: plan_condition_items(term, state)
+
+  @spec plan_condition_items(term(), state()) :: [term()]
+  defp plan_condition_items({kind, left, rest}, {function_above, _cut})
        when kind in [:like, :not_like, :regex, :not_regex] do
     operand = operand_expr(left)
     plan_items(operand, {function_above, true}) ++ [{:pattern, kind, operand, rest}]
   end
 
-  defp plan_items({op, left, right}, state) when op in @comparisons and left != "time",
+  defp plan_condition_items({op, left, right}, state) when op in @comparisons and left != "time",
     do:
       plan_items(left, state) ++
         plan_items(right, state) ++
         [mark({:compare, op, operand_expr(left), right}, elem(state, 1))]
 
-  defp plan_items({op, left, values}, {function_above, _cut})
+  defp plan_condition_items({op, left, values}, {function_above, _cut})
        when op in [:in, :not_in] and left != "time",
        do:
          plan_items(left, {function_above, true}) ++
            plan_items(values, {function_above, true}) ++ [{:in_list, operand_expr(left), values}]
 
-  defp plan_items({op, left, {low, high}}, {function_above, _cut})
+  defp plan_condition_items({op, left, {low, high}}, {function_above, _cut})
        when op in [:between, :not_between] and left != "time",
        do:
          plan_items(left, {function_above, true}) ++
            plan_items([low, high], {function_above, true}) ++
            [{:range, operand_expr(left), low, high}]
 
-  defp plan_items({op, left, _nil}, {function_above, _cut}) when op in [:is_null, :is_not_null],
-    do: left |> plan_items({function_above, true}) |> Enum.map(&null_mark/1)
+  defp plan_condition_items({op, left, _nil}, {function_above, _cut})
+       when op in [:is_null, :is_not_null],
+       do: left |> plan_items({function_above, true}) |> Enum.map(&null_mark/1)
 
-  defp plan_items({:not, nodes}, {function_above, _cut}),
+  defp plan_condition_items({:not, nodes}, {function_above, _cut}),
     do: plan_items(nodes, {function_above, true})
 
-  defp plan_items({:time_type_error, "time", error}, _state), do: [{:time_type, error}]
+  defp plan_condition_items({:time_type_error, "time", error}, _state), do: [{:time_type, error}]
 
-  defp plan_items(terms, state) when is_list(terms),
+  defp plan_condition_items(terms, state) when is_list(terms),
     do: Enum.flat_map(terms, &plan_items(&1, state))
 
-  defp plan_items(term, state) when is_tuple(term),
+  defp plan_condition_items(term, state) when is_tuple(term),
     do: term |> Tuple.to_list() |> plan_items(state)
 
-  defp plan_items(_other, _state), do: []
+  defp plan_condition_items(_other, _state), do: []
 
   # The parts the planner types only when it coerces the expression are cut like
   # what stands under an `IS [NOT] NULL`.
@@ -444,9 +453,17 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp check_item({:null_cut, call}, context, columns),
     do: check_item({:cut, call}, context, columns)
 
-  # The parts of an expression over aggregates are typed with the aggregates' results.
-  defp check_item({:aggs, aggs, item}, context, columns),
-    do: check_item(item, context, Map.merge(columns, SQLAggType.types(aggs, columns)))
+  # The parts of an expression over aggregates are typed with the aggregates'
+  # results. `MIN(NULL)` and `MAX(NULL)` have a type the engine prints from its
+  # own coercion rules (`Utf8 + Utf8` beside a text, verified against Core) that
+  # the double does not model, so an expression over one is refused by name.
+  defp check_item({:aggs, aggs, item}, context, columns) do
+    if Enum.any?(aggs, &null_extreme?/1) do
+      {:error, SQLError.refusal("an expression over MIN(NULL) or MAX(NULL)")}
+    else
+      check_item(item, context, Map.merge(columns, SQLAggType.types(aggs, columns)))
+    end
+  end
 
   defp check_item({:constant, call, ancestors}, context, _columns),
     do: SQLConstantCall.check(call, ancestors, context)
@@ -470,10 +487,18 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp check_item({:aggregate, agg, expr}, _context, columns),
     do: check_aggregate(agg, expr, columns)
 
+  defp check_item(item, context, columns), do: check_where_item(item, context, columns)
+
+  @spec null_extreme?({binary(), term()}) :: boolean()
+  defp null_extreme?({_name, {:aggregate, agg, {:lit, nil}, _alias}}), do: agg in [:min, :max]
+  defp null_extreme?(_agg), do: false
+
+  @spec check_where_item(term(), SQLFunctions.context(), %{binary() => binary()}) ::
+          :ok | {:error, map()}
   # A `time` compared with a number is a type error when `time` is the
   # timestamp; a CTE's column of that name that is not one is an ordinary
   # column, whose comparison the double does not model.
-  defp check_item({:time_type, error}, _context, columns) do
+  defp check_where_item({:time_type, error}, _context, columns) do
     case columns do
       %{"time" => "Timestamp(ns)"} ->
         {:error, error}
@@ -487,19 +512,19 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     end
   end
 
-  defp check_item({:pattern, kind, expr, rest}, context, columns),
+  defp check_where_item({:pattern, kind, expr, rest}, context, columns),
     do: check_pattern(kind, expr, rest, context, columns)
 
-  defp check_item({:compare, op, left, right}, _context, columns),
+  defp check_where_item({:compare, op, left, right}, _context, columns),
     do: check_comparison(op, left, right, columns)
 
-  defp check_item({:in_list, left, values}, _context, columns),
+  defp check_where_item({:in_list, left, values}, _context, columns),
     do: check_in_list(left, values, columns)
 
-  defp check_item({:range, left, low, high}, _context, columns),
+  defp check_where_item({:range, left, low, high}, _context, columns),
     do: check_range(left, low, high, columns)
 
-  defp check_item({:logical, tree}, _context, columns) do
+  defp check_where_item({:logical, tree}, _context, columns) do
     case logical_type(tree, columns) do
       {:error, _reason} = error -> error
       _type -> :ok
@@ -565,6 +590,21 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
         ) :: :ok | {:error, map()}
   defp check_arithmetic(op, left, right, context, columns) do
     case {SQLExprType.type_of(left, columns), SQLExprType.type_of(right, columns)} do
+      {"Timestamp(ns)", "Timestamp(ns)"} when op == :- ->
+        {:error,
+         SQLError.refusal(
+           "the difference of two timestamps: the engine answers a Duration(ns), which this " <>
+             "double does not model"
+         )}
+
+      {"Timestamp(ns)", "Timestamp(ns)"} ->
+        planning_error(
+          "Cannot get result type for temporal operation Timestamp(ns) #{SQLExpr.symbol(op)} " <>
+            "Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: " <>
+            "Timestamp(ns) #{SQLExpr.symbol(op)} Timestamp(ns)",
+          context
+        )
+
       {left_type, right_type}
       when is_binary(left_type) and is_binary(right_type) and
              not (is_numeric_type(left_type) and is_numeric_type(right_type)) ->
@@ -594,11 +634,20 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   @spec check_aggregate(SQLParser.aggregate(), SQLParser.expr(), %{binary() => binary()}) ::
           :ok | {:error, map()}
   defp check_aggregate(agg, expr, columns) do
-    case SQLFunctions.type_of(expr, columns) do
-      nil -> :ok
-      type -> aggregate_refusal(agg, type)
+    case SQLExprType.type_of(expr, columns) do
+      nil -> null_aggregate(agg, expr)
+      type when is_binary(type) -> aggregate_refusal(agg, type)
+      :mixed -> :ok
     end
   end
+
+  # `SUM(NULL)` and `AVG(NULL)` are planning errors (verified against Core); the
+  # other aggregates of a null are null.
+  @spec null_aggregate(SQLParser.aggregate(), SQLParser.expr()) :: :ok | {:error, map()}
+  defp null_aggregate(agg, {:lit, nil}) when agg in [:sum, :avg],
+    do: aggregate_refusal(agg, "Null")
+
+  defp null_aggregate(_agg, _expr), do: :ok
 
   @spec check_pattern(
           atom(),
@@ -636,7 +685,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
             {:error,
              SQLError.coercion(
                "Cannot infer common argument type for comparison operation " <>
-                 "#{column} #{SQLPredicate.symbol(op)} #{value}"
+                 "#{column} #{SQLExpr.symbol(op)} #{value}"
              )},
           else: :ok
 

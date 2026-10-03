@@ -32,6 +32,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     InfluxQLBuckets,
     InfluxQLError,
     InfluxQLText,
+    InfluxQLTime,
     SQLLimits
   }
 
@@ -42,9 +43,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
   @typedoc "A parsed `GROUP BY`; `fill` is `nil` when the statement has none."
   @type t :: %{
-          dimensions: [dimension()],
-          time: nil | {integer(), integer()},
-          fill: InfluxQLBuckets.fill() | nil
+          required(:dimensions) => [dimension()],
+          required(:time) => nil | {integer(), integer()},
+          required(:fill) => InfluxQLBuckets.fill() | nil,
+          optional(:rewrite_error) => binary() | nil
         }
 
   @types ~w(float integer unsigned string boolean field tag)
@@ -306,17 +308,45 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
         {:error, "unsupported InfluxQL (a duration beyond 64 bits)"}
 
       :none when pos < byte_size(ctx.text) ->
-        refuse_offset(ctx, interval_stop, pos)
+        refuse_offset(ctx, every, interval_stop, pos)
 
       _other ->
         {:error, {:engine, error(ctx, :time_close, interval_stop)}}
     end
   end
 
-  defp refuse_offset(ctx, interval_stop, pos) do
-    if binary_part(ctx.text, pos, byte_size(ctx.text) - pos) =~ ~r/^now\s*\(/i,
-      do: {:error, "unsupported InfluxQL (GROUP BY time() offset of now())"},
-      else: {:error, {:engine, error(ctx, :time_close, interval_stop)}}
+  defp refuse_offset(ctx, every, interval_stop, pos) do
+    rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
+
+    cond do
+      rest =~ ~r/^now\s*\(/i ->
+        {:error, "unsupported InfluxQL (GROUP BY time() offset of now())"}
+
+      match = Regex.run(~r/^'([^'\\]*)'/, rest) ->
+        timestamp_offset(ctx, every, pos, match)
+
+      true ->
+        {:error, {:engine, error(ctx, :time_close, interval_stop)}}
+    end
+  end
+
+  # A quoted offset is a timestamp the planner reads: one it cannot read is its
+  # error (after the whole statement has been read), one it can is not
+  # answered.
+  defp timestamp_offset(ctx, every, pos, [quoted, content]) do
+    stop = pos + byte_size(quoted)
+    close = skip(ctx.text, stop)
+
+    cond do
+      byte_at(ctx.text, close) != ?) ->
+        {:error, {:engine, error(ctx, :time_close, stop)}}
+
+      InfluxQLTime.classify(content) == :invalid ->
+        {:ok, {:time, {every, {:invalid, InfluxQLError.offset_error(quoted)}}}, close + 1}
+
+      true ->
+        {:error, "unsupported InfluxQL (GROUP BY time() with a timestamp offset)"}
+    end
   end
 
   # A duration with an optional sign, as nanoseconds, or `:integer` for a plain
@@ -449,11 +479,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     if rest == "" or rest =~ @after_clause do
       times = for {:time, time} <- dimensions, do: time
       others = for dimension <- dimensions, not match?({:time, _time}, dimension), do: dimension
-      {:ok, %{dimensions: others, time: List.first(times), fill: fill}, stop}
+      {time, rewrite_error} = first_time(times)
+
+      {:ok, %{dimensions: others, time: time, fill: fill, rewrite_error: rewrite_error}, stop}
     else
       {:error, {:engine, error(ctx, :nom, pos)}}
     end
   end
+
+  # Only the first `time()` counts; its offset may be the error the planner
+  # raises for it.
+  defp first_time([{every, {:invalid, body}} | _more]), do: {{every, 0}, body}
+  defp first_time([time | _more]), do: {time, nil}
+  defp first_time([]), do: {nil, nil}
 
   # ---------------------------------------------------------------------------
   # Text helpers

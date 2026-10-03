@@ -20,6 +20,12 @@ defmodule InfluxElixir.Client.Local.Retention do
   # `SHOW TAG KEYS`) stays. A retention of `0` hides every point before now.
   # All of SQL, InfluxQL and `SHOW TAG VALUES` read through this rule.
   #
+  # A store keeps a marker for each chunk a database with a retention was
+  # written to (`chunks/1`), so a read finds out from the few markers, not from
+  # the points, that none reaches back to the cut-off (`oldest_chunk/1`) and
+  # shows every point as it is; only when one does are the points sorted out
+  # (`visible/3`).
+  #
   # The engine's own persisted files follow the same rule, per file: a
   # chunk that the engine has split across files by writes on either side of
   # a snapshot is not modelled.
@@ -102,24 +108,85 @@ defmodule InfluxElixir.Client.Local.Retention do
   end
 
   @doc """
+  The oldest timestamp, in nanoseconds, a point may have and be visible by its
+  own age: a retention of `seconds` before `now_ns`.
+  """
+  @spec cutoff(non_neg_integer(), integer()) :: integer()
+  def cutoff(seconds, now_ns), do: now_ns - seconds * @second_ns
+
+  @doc """
+  The chunks `points` fall in, each once, as `{measurement, index}`. A store
+  keeps one marker per chunk it has written to, so that a table with no chunk
+  that reaches back to the cut-off (`oldest_chunk/1`) is known to hold no
+  expired point without reading its points.
+  """
+  @spec chunks([map()]) :: [{binary(), integer()}]
+  def chunks(points) do
+    points
+    |> Enum.reduce(%{}, fn point, seen ->
+      chunk = chunk(point)
+      if is_map_key(seen, chunk), do: seen, else: Map.put(seen, chunk, true)
+    end)
+    |> Map.keys()
+  end
+
+  @doc """
+  The index of the newest chunk that can hold a point older than `cutoff`: the
+  one `cutoff` falls in, since every one before it is expired whole.
+  """
+  @spec oldest_chunk(integer()) :: integer()
+  def oldest_chunk(cutoff), do: Integer.floor_div(cutoff, @chunk_ns)
+
+  @doc """
   The points a query sees: all of them without a retention, otherwise those
   in a chunk (one measurement, one 10-minute window) with a point at or after
   `now_ns - retention`.
+
+  A point at or after the cut-off is seen by its own age, and every chunk
+  before the one the cut-off falls in is expired whole, so only that one
+  chunk of each measurement can be kept alive by a newer point: the
+  measurements with a point in it from the cut-off on are found in one pass,
+  and a point is kept when it is not older than the cut-off or lies in that
+  chunk of such a measurement.
   """
   @spec visible([map()], t(), integer()) :: [map()]
   def visible(points, nil, _now_ns), do: points
 
   def visible(points, seconds, now_ns) do
-    cutoff = now_ns - seconds * @second_ns
+    cutoff = cutoff(seconds, now_ns)
 
-    newest =
-      Enum.reduce(points, %{}, fn point, acc ->
-        Map.update(acc, chunk(point), point.timestamp, &max(&1, point.timestamp))
-      end)
-
-    Enum.filter(points, &(Map.fetch!(newest, chunk(&1)) >= cutoff))
+    if all_current?(points, cutoff),
+      do: points,
+      else: kept(points, cutoff, oldest_chunk(cutoff) * @chunk_ns)
   end
 
   @spec chunk(map()) :: {binary(), integer()}
   defp chunk(point), do: {point.measurement, Integer.floor_div(point.timestamp, @chunk_ns)}
+
+  @spec all_current?([map()], integer()) :: boolean()
+  defp all_current?([], _cutoff), do: true
+
+  defp all_current?([%{timestamp: timestamp} | rest], cutoff) when timestamp >= cutoff,
+    do: all_current?(rest, cutoff)
+
+  defp all_current?(_expired, _cutoff), do: false
+
+  @spec kept([map()], integer(), integer()) :: [map()]
+  defp kept(points, cutoff, window_start) do
+    window_end = window_start + @chunk_ns
+
+    alive =
+      Enum.reduce(points, %{}, fn
+        %{timestamp: timestamp, measurement: measurement}, acc
+        when timestamp >= cutoff and timestamp < window_end ->
+          Map.put(acc, measurement, true)
+
+        _point, acc ->
+          acc
+      end)
+
+    Enum.filter(points, fn %{timestamp: timestamp, measurement: measurement} ->
+      timestamp >= cutoff or (timestamp >= window_start and is_map_key(alive, measurement))
+    end)
+  end
 end

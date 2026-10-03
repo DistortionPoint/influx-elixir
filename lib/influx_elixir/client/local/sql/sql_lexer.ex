@@ -22,7 +22,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   # whose end is missing. A text with no statement is the planner's 400, and
   # one with several is the engine's 405.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLLiteral}
+  alias InfluxElixir.Client.Local.{SQLError, SQLIdentifiers, SQLLiteral}
 
   @typep state :: %{whole: binary(), statements: [binary()]}
 
@@ -69,8 +69,8 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
     do: scan(rest, %{state | statements: [text(chunk) | state.statements]}, [])
 
   defp scan(<<q, rest::binary>> = input, state, chunk) when q in [?', ?", ?`] do
-    case take_quoted(rest, q, [q]) do
-      {:ok, literal, after_literal} -> scan(after_literal, state, [literal | chunk])
+    case SQLIdentifiers.take_quoted(rest, q) do
+      {:ok, body, after_literal} -> scan(after_literal, state, [[q, body, q] | chunk])
       :error -> {:error, unterminated(q, state.whole, input)}
     end
   end
@@ -96,7 +96,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   # A word is read whole, so an `E` that ends one (`name'...'`) opens no
   # escape string; `E'` or `e'` at the start of a token does.
   defp scan(<<c::utf8, rest::binary>> = input, state, chunk) do
-    if word_char?(c) do
+    if SQLIdentifiers.word_char?(c) do
       {word, after_word} = take_word(input)
 
       case after_word do
@@ -148,7 +148,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   @spec hex_string(binary(), binary(), state(), iodata()) ::
           {:ok, [binary()]} | {:error, SQLError.t()}
   defp hex_string(body, after_word, state, chunk) do
-    case take_quoted(body, ?', [?']) do
+    case SQLIdentifiers.take_quoted(body, ?') do
       {:ok, _literal, _rest} ->
         {:error,
          SQLError.refusal(
@@ -247,25 +247,8 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   @spec octal?(byte()) :: boolean()
   defp octal?(c), do: c in ?0..?7
 
-  @spec word_char?(char()) :: boolean()
-  defp word_char?(c) when c < 128, do: c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_
-  defp word_char?(c), do: Regex.match?(~r/\A[\p{L}\p{N}]\z/u, <<c::utf8>>)
-
   @spec text(iodata()) :: binary()
   defp text(chunk), do: chunk |> Enum.reverse() |> IO.iodata_to_binary()
-
-  # The text of a '...' or "..." through its closing quote, `acc` holding
-  # what was read, reversed; a doubled quote does not close it.
-  @spec take_quoted(binary(), char(), iodata()) :: {:ok, binary(), binary()} | :error
-  defp take_quoted(<<q, q, rest::binary>>, q, acc), do: take_quoted(rest, q, [q, q | acc])
-
-  defp take_quoted(<<q, rest::binary>>, q, acc),
-    do: {:ok, [q | acc] |> Enum.reverse() |> IO.iodata_to_binary(), rest}
-
-  defp take_quoted(<<c::utf8, rest::binary>>, q, acc),
-    do: take_quoted(rest, q, [<<c::utf8>> | acc])
-
-  defp take_quoted(<<>>, _q, _acc), do: :error
 
   # The newline that ends a `--` comment is not part of the comment.
   @spec skip_line(binary()) :: binary()
@@ -315,7 +298,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   end
 
   defp take_tail(<<c::utf8, rest::binary>> = input, acc) do
-    if word_char?(c) or c == ?$,
+    if SQLIdentifiers.word_char?(c) or c == ?$,
       do: take_tail(rest, [<<c::utf8>> | acc]),
       else: {acc |> Enum.reverse() |> IO.iodata_to_binary(), input}
   end
@@ -324,7 +307,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
 
   @spec take_tag(binary(), [binary()]) :: {binary(), binary()}
   defp take_tag(<<c::utf8, rest::binary>> = input, acc) do
-    if word_char?(c),
+    if SQLIdentifiers.word_char?(c),
       do: take_tag(rest, [<<c::utf8>> | acc]),
       else: {acc |> Enum.reverse() |> IO.iodata_to_binary(), input}
   end

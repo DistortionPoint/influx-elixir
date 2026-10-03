@@ -18,7 +18,7 @@ defmodule InfluxElixir.ClientContract do
 
         setup do
           {:ok, conn} = Local.start(databases: ["contract_db"], profile: :v3_core)
-          {:ok, conn: conn, database: "contract_db", query_delay: 0}
+          {:ok, conn: conn, database: "contract_db"}
         end
       end
 
@@ -31,8 +31,6 @@ defmodule InfluxElixir.ClientContract do
 
     * `conn` — client connection (keyword list or map)
     * `database` — test database name
-    * `query_delay` — ms to sleep between write and query
-      (0 for Local, 500 for real InfluxDB)
 
   and may return:
 

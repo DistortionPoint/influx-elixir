@@ -7,7 +7,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
 
       use InfluxElixir.Contract.SQLExecutor, client: InfluxElixir.Client.Local, profile: :v3_core
 
-  The `setup` callback must return `conn`, `database` and `query_delay`, as
+  The `setup` callback must return `conn` and `database`, as
   for the shared contract. A real server is shared between runs, so every
   measurement name is unique.
 

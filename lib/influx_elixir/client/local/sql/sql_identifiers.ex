@@ -11,16 +11,24 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
   #     exist. A name may hold letters and digits of any script
   #   * a double-quoted identifier keeps its case: `"Host"` is column `Host`
   #   * string literals (`'Abc'`) and `$name` placeholders are left as they are
+  #   * a number ends where the engine's tokenizer ends it, and a word right after it is a
+  #     word of its own: `1_000` is `1` and the alias `_000`, `0b1` is `0` and `b1`
   #
   # A quoted identifier that is a plain word is written back bare, so the
   # parser — which folds nothing — sees its exact name. One that needs its
   # quotes (a space, a dot, a keyword such as `"order"`) keeps them.
+  #
+  # It also owns what the passes that read a SQL text share: the characters of a word and
+  # the reader of a quoted token.
 
   # Words the parser reads as structure: a quoted column of that name keeps
   # its quotes rather than turn into the keyword.
   @keywords ~w(select distinct on from where and or not in is null between like ilike
                group by order asc desc nulls first last limit offset as with cross join
-               interval true false cast having union)
+               interval true false cast having union except intersect minus left right inner
+               full natural outer using window qualify fetch all)
+
+  @number ~r/\A(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/
 
   @doc "Folds unquoted identifiers to lower case and unwraps plain quoted ones."
   @spec normalize(binary()) :: binary()
@@ -30,13 +38,13 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
   defp scan(<<>>, acc), do: Enum.reverse(acc)
 
   defp scan(<<?', rest::binary>>, acc) do
-    {literal, rest} = take_quoted(rest, ?', [])
+    {literal, rest} = quoted_or_rest(rest, ?')
     scan(rest, [[?', literal, ?'] | acc])
   end
 
   defp scan(<<?", rest::binary>>, acc) do
-    {name, rest} = take_quoted(rest, ?", [])
-    scan(rest, [quoted_identifier(IO.iodata_to_binary(name)) | acc])
+    {name, rest} = quoted_or_rest(rest, ?")
+    scan(rest, [quoted_identifier(name) | acc])
   end
 
   defp scan(<<?$, rest::binary>>, acc) do
@@ -44,11 +52,15 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
     scan(rest, [[?$, name] | acc])
   end
 
-  # A number (`1e5`, `2.5`) is copied whole, so its exponent is not a word.
-  defp scan(<<c, _rest::binary>> = sql, acc) when c in ?0..?9 do
+  # `0x1F` is one token: a binary value to the engine.
+  defp scan(<<?0, x, _rest::binary>> = sql, acc) when x in [?x, ?X] do
     {number, rest} = take_word(sql, [])
     scan(rest, [number | acc])
   end
+
+  defp scan(<<c, _rest::binary>> = sql, acc) when c in ?0..?9, do: scan_number(sql, acc)
+
+  defp scan(<<?., d, _rest::binary>> = sql, acc) when d in ?0..?9, do: scan_number(sql, acc)
 
   defp scan(<<c::utf8, rest::binary>> = sql, acc) do
     if word_start?(c) do
@@ -59,16 +71,49 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
     end
   end
 
-  # The body of a '...' or "..." token; a doubled quote inside it is kept
-  # doubled, as the parser reads it. An unterminated token takes the rest.
-  @spec take_quoted(binary(), char(), iodata()) :: {iodata(), binary()}
-  defp take_quoted(<<q, q, rest::binary>>, q, acc), do: take_quoted(rest, q, [q, q | acc])
-  defp take_quoted(<<q, rest::binary>>, q, acc), do: {Enum.reverse(acc), rest}
+  # A number (`1e5`, `2.5`) is copied whole, so its exponent is not a word; the word after
+  # it is set apart by a space, which the passes after this one read as the tokenizer does.
+  @spec scan_number(binary(), iodata()) :: iodata()
+  defp scan_number(sql, acc) do
+    [number] = Regex.run(@number, sql)
+    rest = binary_part(sql, byte_size(number), byte_size(sql) - byte_size(number))
 
-  defp take_quoted(<<c::utf8, rest::binary>>, q, acc),
-    do: take_quoted(rest, q, [<<c::utf8>> | acc])
+    case rest do
+      <<c::utf8, _more::binary>> -> scan(rest, [separator(c), number | acc])
+      _end -> scan(rest, [number | acc])
+    end
+  end
 
-  defp take_quoted(<<>>, _q, acc), do: {Enum.reverse(acc), <<>>}
+  @spec separator(char()) :: binary()
+  defp separator(c), do: if(word_char?(c), do: " ", else: "")
+
+  @spec quoted_or_rest(binary(), char()) :: {binary(), binary()}
+  defp quoted_or_rest(text, mark) do
+    case take_quoted(text, mark) do
+      {:ok, body, rest} -> {body, rest}
+      :error -> {text, <<>>}
+    end
+  end
+
+  @doc """
+  The body of a quoted token whose opening `mark` was read, a doubled quote kept doubled,
+  and the text after the closing quote; `:error` when the token is not closed.
+  """
+  @spec take_quoted(binary(), char()) :: {:ok, binary(), binary()} | :error
+  def take_quoted(text, mark), do: take_quoted(text, mark, text, 0)
+
+  @spec take_quoted(binary(), char(), binary(), non_neg_integer()) ::
+          {:ok, binary(), binary()} | :error
+  defp take_quoted(<<mark, mark, rest::binary>>, mark, whole, at),
+    do: take_quoted(rest, mark, whole, at + 2)
+
+  defp take_quoted(<<mark, rest::binary>>, mark, whole, at),
+    do: {:ok, binary_part(whole, 0, at), rest}
+
+  defp take_quoted(<<c::utf8, rest::binary>>, mark, whole, at),
+    do: take_quoted(rest, mark, whole, at + byte_size(<<c::utf8>>))
+
+  defp take_quoted(_text, _mark, _whole, _at), do: :error
 
   # An identifier starts with a letter or `_` and goes on with letters,
   # digits and `_`, in any script.
@@ -79,15 +124,21 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
 
   defp take_word(<<>>, acc), do: {Enum.reverse(acc), <<>>}
 
+  @doc "Whether a character starts an identifier: a letter of any script, or `_`."
   @spec word_start?(char()) :: boolean()
-  defp word_start?(c) when c in ?a..?z or c in ?A..?Z or c == ?_, do: true
-  defp word_start?(c) when c < 128, do: false
-  defp word_start?(c), do: Regex.match?(~r/\A\p{L}\z/u, <<c::utf8>>)
+  def word_start?(c) when c in ?a..?z or c in ?A..?Z or c == ?_, do: true
+  def word_start?(c) when c < 128, do: false
+  def word_start?(c), do: Regex.match?(~r/\A\p{L}\z/u, <<c::utf8>>)
 
+  @doc "Whether a character goes on an identifier: a letter or digit of any script, or `_`."
   @spec word_char?(char()) :: boolean()
-  defp word_char?(c) when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_, do: true
-  defp word_char?(c) when c < 128, do: false
-  defp word_char?(c), do: Regex.match?(~r/\A[\p{L}\p{N}]\z/u, <<c::utf8>>)
+  def word_char?(c) when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_, do: true
+  def word_char?(c) when c < 128, do: false
+  def word_char?(c), do: Regex.match?(~r/\A[\p{L}\p{N}]\z/u, <<c::utf8>>)
+
+  @doc "Whether a byte is an ASCII letter, digit or `_`, for the passes that read bytes."
+  @spec word_byte?(byte()) :: boolean()
+  def word_byte?(byte), do: byte in ?a..?z or byte in ?A..?Z or byte in ?0..?9 or byte == ?_
 
   @spec quoted_identifier(binary()) :: iodata()
   defp quoted_identifier(name) do

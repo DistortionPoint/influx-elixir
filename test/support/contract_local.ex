@@ -25,7 +25,7 @@ defmodule InfluxElixir.ContractLocal do
         {:ok, conn} =
           InfluxElixir.Client.Local.start(databases: ["contract_db"], profile: unquote(profile))
 
-        {:ok, conn: conn, database: "contract_db", query_delay: 0}
+        {:ok, conn: conn, database: "contract_db"}
       end
     end
   end

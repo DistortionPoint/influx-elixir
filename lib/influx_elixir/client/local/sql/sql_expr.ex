@@ -745,21 +745,9 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   refused cast.
   """
   @spec render(t(), binary() | nil, casts()) :: binary()
-  def render({:field, ref}, qualifier, _casts), do: qualified(ref, qualifier)
-  def render({:uint_col, name}, qualifier, _casts), do: qualified(name, qualifier)
-  def render({:lit, value}, _qualifier, _casts) when is_integer(value), do: "Int64(#{value})"
-
-  def render({:lit, value}, _qualifier, _casts) when is_float(value),
-    do: "Float64(#{Format.render_decimal(value)})"
-
-  def render({:lit, value}, _qualifier, _casts) when is_binary(value), do: ~s|Utf8("#{value}")|
-  def render({:lit, value}, _qualifier, _casts) when is_boolean(value), do: "Boolean(#{value})"
-  def render({:lit, nil}, _qualifier, _casts), do: "NULL"
-  def render({:lit, :inf}, _qualifier, _casts), do: "Float64(inf)"
-  def render({:lit, :neg_inf}, _qualifier, _casts), do: "Float64(-inf)"
-  def render({:uint, value}, _qualifier, _casts), do: "UInt64(#{value})"
-  def render({:raw, text}, _qualifier, _casts), do: text
-  def render({:param, name}, _qualifier, _casts), do: "$" <> name
+  def render({kind, _value} = leaf, qualifier, casts)
+      when kind in [:field, :uint_col, :lit, :uint, :raw, :param],
+      do: render_leaf(leaf, qualifier, casts)
 
   def render({:op, op, left, right}, qualifier, :display) do
     shown = &operand(&1, op, qualifier)
@@ -790,51 +778,77 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   def render({:cast, _inner, _type}, _qualifier, casts) when casts in [:refuse, :display],
     do: throw(:unrenderable)
 
-  def render({:cmp, op, left, right}, qualifier, casts),
-    do: join([left, comparison_symbol(op), right], qualifier, casts)
+  def render(node, qualifier, casts), do: render_form(node, qualifier, casts)
 
-  def render({:and, left, right}, qualifier, casts),
+  @spec render_leaf(t(), binary() | nil, casts()) :: binary()
+  defp render_leaf({:field, ref}, qualifier, _casts), do: qualified(ref, qualifier)
+  defp render_leaf({:uint_col, name}, qualifier, _casts), do: qualified(name, qualifier)
+
+  defp render_leaf({:lit, value}, _qualifier, _casts) when is_integer(value),
+    do: "Int64(#{value})"
+
+  defp render_leaf({:lit, value}, _qualifier, _casts) when is_float(value),
+    do: "Float64(#{Format.render_decimal(value)})"
+
+  defp render_leaf({:lit, value}, _qualifier, _casts) when is_binary(value),
+    do: ~s|Utf8("#{value}")|
+
+  defp render_leaf({:lit, value}, _qualifier, _casts) when is_boolean(value),
+    do: "Boolean(#{value})"
+
+  defp render_leaf({:lit, nil}, _qualifier, _casts), do: "NULL"
+  defp render_leaf({:lit, :inf}, _qualifier, _casts), do: "Float64(inf)"
+  defp render_leaf({:lit, :neg_inf}, _qualifier, _casts), do: "Float64(-inf)"
+  defp render_leaf({:uint, value}, _qualifier, _casts), do: "UInt64(#{value})"
+  defp render_leaf({:raw, text}, _qualifier, _casts), do: text
+  defp render_leaf({:param, name}, _qualifier, _casts), do: "$" <> name
+
+  @spec render_form(t(), binary() | nil, casts()) :: binary()
+  defp render_form({:cmp, op, left, right}, qualifier, casts),
+    do: join([left, symbol(op), right], qualifier, casts)
+
+  defp render_form({:and, left, right}, qualifier, casts),
     do: join([left, "AND", right], qualifier, casts)
 
-  def render({:or, left, right}, qualifier, casts),
+  defp render_form({:or, left, right}, qualifier, casts),
     do: join([left, "OR", right], qualifier, casts)
 
-  def render({:concat, left, right}, qualifier, casts),
+  defp render_form({:concat, left, right}, qualifier, casts),
     do: join([left, "||", right], qualifier, casts)
 
-  def render({:not, inner}, qualifier, casts), do: join(["NOT", inner], qualifier, casts)
+  defp render_form({:not, inner}, qualifier, casts), do: join(["NOT", inner], qualifier, casts)
 
-  def render({:is_null, inner, negated}, qualifier, casts),
+  defp render_form({:is_null, inner, negated}, qualifier, casts),
     do: join([inner, if(negated, do: "IS NOT NULL", else: "IS NULL")], qualifier, casts)
 
-  def render({:is_bool, inner, value, negated}, qualifier, casts) do
+  defp render_form({:is_bool, inner, value, negated}, qualifier, casts) do
     word = if value, do: "TRUE", else: "FALSE"
     join([inner, if(negated, do: "IS NOT " <> word, else: "IS " <> word)], qualifier, casts)
   end
 
-  def render({:is_distinct, left, right, negated}, qualifier, casts) do
+  defp render_form({:is_distinct, left, right, negated}, qualifier, casts) do
     word = if negated, do: "IS NOT DISTINCT FROM", else: "IS DISTINCT FROM"
     join([left, word, right], qualifier, casts)
   end
 
-  def render({:in, inner, items, negated}, qualifier, casts) do
+  defp render_form({:in, inner, items, negated}, qualifier, casts) do
     word = if negated, do: "NOT IN", else: "IN"
 
     "#{render(inner, qualifier, casts)} #{word} " <>
       Enum.map_join(items, ", ", &render(&1, qualifier, casts))
   end
 
-  def render({:between, inner, low, high, negated}, qualifier, casts) do
+  defp render_form({:between, inner, low, high, negated}, qualifier, casts) do
     word = if negated, do: "NOT BETWEEN", else: "BETWEEN"
     join([inner, word, low, "AND", high], qualifier, casts)
   end
 
-  def render({:like, inner, pattern, negated, ilike, _regex}, qualifier, casts) do
+  defp render_form({:like, inner, pattern, negated, ilike, _regex}, qualifier, casts) do
     word = if(negated, do: "NOT ", else: "") <> if(ilike, do: "ILIKE", else: "LIKE")
     join([inner, word, pattern], qualifier, casts)
   end
 
-  def render({:case, operand, whens, otherwise}, qualifier, casts) do
+  defp render_form({:case, operand, whens, otherwise}, qualifier, casts) do
     head = if operand, do: ["CASE", operand], else: ["CASE"]
 
     branches =
@@ -867,21 +881,19 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
     end)
   end
 
-  @spec comparison_symbol(comparison()) :: binary()
-  defp comparison_symbol(:eq), do: "="
-  defp comparison_symbol(:ne), do: "!="
-  defp comparison_symbol(:gt), do: ">"
-  defp comparison_symbol(:lt), do: "<"
-  defp comparison_symbol(:gte), do: ">="
-  defp comparison_symbol(:lte), do: "<="
-
   @spec qualified(column_ref(), binary() | nil) :: binary()
   defp qualified(_ref, nil), do: throw(:unrenderable)
   defp qualified({:qualified, qualifier, column}, _qualifier), do: qualifier <> "." <> column
   defp qualified(name, qualifier), do: qualifier <> "." <> name
 
-  @doc "The SQL symbol of an arithmetic operator."
-  @spec symbol(:+ | :- | :* | :/ | :rem) :: binary()
+  @doc "The SQL symbol of an arithmetic or a comparison operator."
+  @spec symbol(:+ | :- | :* | :/ | :rem | comparison()) :: binary()
   def symbol(:rem), do: "%"
+  def symbol(:eq), do: "="
+  def symbol(:ne), do: "!="
+  def symbol(:gt), do: ">"
+  def symbol(:lt), do: "<"
+  def symbol(:gte), do: ">="
+  def symbol(:lte), do: "<="
   def symbol(op), do: Atom.to_string(op)
 end

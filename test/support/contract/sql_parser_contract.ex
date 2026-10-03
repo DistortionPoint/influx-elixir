@@ -8,7 +8,7 @@ defmodule InfluxElixir.Contract.SQLParser do
 
       use InfluxElixir.Contract.SQLParser, client: InfluxElixir.Client.Local, profile: :v3_core
 
-  The `setup` callback must return `conn`, `database` and `query_delay`, as
+  The `setup` callback must return `conn` and `database`, as
   for `InfluxElixir.ClientContract`. Every measurement has a unique name and
   every line a timestamp, so a server that outlives the test run does not
   mix one test's rows with another's.

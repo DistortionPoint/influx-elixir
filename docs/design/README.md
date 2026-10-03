@@ -67,6 +67,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-10-02 | [`fourth-review`](2026-10-02_fourth-review.md) | Local: float overflow answers null, UInt64 columns typed, `INTEGER` casts are Int32, failing constants fold to the optimizer's 500, executor split; InfluxQL reserved words and second statements; re-entrant lock raises; whole-result `===` assertions, clock-free backpressure test |
 | 2026-10-02 | [`third-review`](2026-10-02_third-review.md) | Local: unaliased aggregates named as DataFusion names them, empty time and numeric ranges fail as on Core, qualified field lists, number literals, UTC aliases; InfluxQL parse errors and `GROUP BY` order; store locks without `:global`; strict `===` in contract tests |
 | 2026-10-02 | [`local-write-concurrency-retention-and-mixed-types`](2026-10-02_local-write-concurrency-retention-and-mixed-types.md) | Local: batched store writes (50 concurrent writers in 0.4 s, was a timeout), bounded chunked parse, v2 retention 422, mixed field types cut at the first differing group, `delete_bucket` clears data |
+| 2026-10-03 | [`eighth-review`](2026-10-03_eighth-review.md) | Defects in 0.1.41: InfluxQL transform crashes and empty wildcard answers, SQL engine-shaped errors, retention read cost, `mix test` path handling, refusal ratchet, Core image pinned |
 | 2026-10-03 | [`seventh-review`](2026-10-03_seventh-review.md) | Review of 69cf692: InfluxQL GROUP BY wrong answers and fill(none) hang fixed, dashboard refusal rates cut (InfluxQL 37%→2.4%, SQL 57%→23%), retention modelled, each fact pinned once, mix test skips integration compiles |
 | 2026-10-03 | [`local-database-retention`](2026-10-03_local-database-retention.md) | Local applies a v3 database's `retention:` as Core does: writes accepted, reads hide 10-minute chunks older than `now - retention`, schema stays, `0` is a zero period, `SHOW RETENTION POLICIES` prints it (`1h0m0s`) |
 | 2026-10-02 | [`sixth-review`](2026-10-02_sixth-review.md) | Review of 2b7b801: false refusals removed (guarded division, unsigned OR), InfluxQL GROUP BY time and fill, package file list fixed, Local internals by area and hidden from docs, engine facts moved into contracts, contract-tag lint |
@@ -89,7 +90,14 @@ Claims about server behaviour are checked against a real InfluxDB before
 they are written down. No compose file is kept in the repo; these one-liners
 match the defaults in `test/support/integration_helper.ex`.
 
-A bare `mix test` runs the unit suite only: the 65 integration modules cost about
+The Core image is pinned (`influxdb:3.10.1-core`, `influxdb3 --version` prints
+`3.10.1`), not the floating `3-core` tag: about fifty cases pin the words of
+DataFusion's internal errors, which change between engine versions, and the
+double's contract is to reproduce those words exactly. Moving to a newer Core
+means running the contract against it, correcting the cases that changed, and
+only then changing the tag here and in the guide.
+
+A bare `mix test` runs the unit suite only: the 71 integration modules cost about
 23 s of CPU to compile and every one is excluded by tag, so `mix.exs` does not
 hand `test/integration` to the test task unless a path is named (as below) or
 `INTEGRATION=1` is set (`INTEGRATION=1 mix test --include integration --include
@@ -100,7 +108,7 @@ exactly the tests it always ran.
 # InfluxDB 3 Core on 8181 (HTTP and Flight, no auth). A write is answered
 # once the WAL flushes, every second by default; 10ms takes the suite from
 # minutes to seconds and changes no answer.
-docker run -d --rm --name influx3_verify -p 8181:8181 influxdb:3-core \
+docker run -d --rm --name influx3_verify -p 8181:8181 influxdb:3.10.1-core \
   influxdb3 serve --node-id node0 --object-store memory --without-auth \
   --wal-flush-interval 10ms
 mix test test/integration/contract_v3_core --include v3_core --include integration
@@ -116,7 +124,7 @@ mix test test/integration/contract_v2 --include v2 --include integration
 # InfluxDB 3 Core on 8183 *with* auth, for the token endpoints (the test
 # creates the operator token, once per fresh server; or set
 # INFLUX_V3_AUTH_TOKEN)
-docker run -d --rm --name influx3_auth -p 8183:8181 influxdb:3-core \
+docker run -d --rm --name influx3_auth -p 8183:8181 influxdb:3.10.1-core \
   influxdb3 serve --node-id node0 --object-store memory --wal-flush-interval 10ms
 mix test test/integration/tokens_v3_core_auth_test.exs --include v3_core_auth --include integration
 

@@ -44,8 +44,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
 
   @doc "A three-valued negation: unknown stays unknown."
   @spec negate(boolean() | nil) :: boolean() | nil
-  def negate(nil), do: nil
-  def negate(value), do: not value
+  defdelegate negate(value), to: SQLCompare
 
   # SQL's three-valued logic: a comparison with a null operand is unknown
   # (nil), AND is false if any part is false, OR is true if any part is
@@ -94,21 +93,8 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   @spec matches_condition?(point(), SQLParser.where_clause()) :: boolean() | nil
   defp matches_condition?(point, {:truthy, column, _nil}), do: truthy(point, column)
 
-  defp matches_condition?(point, {:truthy_expr, {:expr, expr}, _nil}) do
-    case SQLEval.eval(expr, point) do
-      value when is_boolean(value) or is_nil(value) ->
-        value
-
-      other ->
-        throw(
-          {:query_error,
-           SQLPredicate.non_boolean_error(
-             filter_text(expr, point),
-             viewed_type(expr, point) || SQLPlan.arrow_type(other)
-           )}
-        )
-    end
-  end
+  defp matches_condition?(point, {:truthy_expr, {:expr, expr}, _nil}),
+    do: truthy_expression(point, expr)
 
   defp matches_condition?(_point, {:non_boolean, _operand, {expression, type}}),
     do: throw({:query_error, SQLPredicate.non_boolean_error(expression, type)})
@@ -161,6 +147,24 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
 
   defp matches_condition?(point, {op, column, right}),
     do: compare_values(SQLRow.column_value(point, column), op, right_value(point, right), right)
+
+  # A `WHERE` that is an expression: a boolean, or the engine's error for any other value.
+  @spec truthy_expression(point(), SQLExpr.t()) :: boolean() | nil
+  defp truthy_expression(point, expr) do
+    case SQLEval.eval(expr, point) do
+      value when is_boolean(value) or is_nil(value) ->
+        value
+
+      other ->
+        throw(
+          {:query_error,
+           SQLPredicate.non_boolean_error(
+             filter_text(expr, point),
+             viewed_type(expr, point) || SQLPlan.arrow_type(other)
+           )}
+        )
+    end
+  end
 
   # A comparison is unknown for a null operand; the float of one that is not a
   # literal is checked against a decimal as it is read.

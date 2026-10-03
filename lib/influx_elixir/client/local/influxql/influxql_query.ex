@@ -14,6 +14,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     InfluxQLWild,
     LineProtocolParser,
     Scope,
+    SQLError,
     SQLExecutor,
     SQLParser,
     Store
@@ -131,7 +132,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp show_exists(table, database), do: Scope.database_exists(table, database)
 
   @spec show_rows(Store.t(), binary() | :all, map()) :: InfluxElixir.Client.query_result()
-  defp show_rows(table, database, %{kind: :retention}) do
+  defp show_rows(table, database, %{kind: :retention}), do: retention_rows(table, database)
+
+  defp show_rows(table, database, %{kind: :measurements} = spec),
+    do: measurement_rows(table, database, spec)
+
+  defp show_rows(table, database, %{kind: :tag_keys} = spec),
+    do: tag_key_list(table, database, spec)
+
+  defp show_rows(table, database, %{kind: :field_keys} = spec),
+    do: field_key_list(table, database, spec)
+
+  defp show_rows(table, database, %{kind: :tag_values} = spec),
+    do: tag_value_list(table, database, spec)
+
+  defp retention_rows(table, database) do
     databases = if database == :all, do: Scope.database_names(table), else: [database]
 
     {:ok,
@@ -140,7 +155,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
   # Measurements come sorted. A WHERE keeps those with a point in range that
   # satisfies it; LIMIT and OFFSET count the measurements.
-  defp show_rows(table, database, %{kind: :measurements} = spec) do
+  defp measurement_rows(table, database, spec) do
     names =
       InfluxQLShow.select_measurements(
         Store.measurements(table, database),
@@ -158,7 +173,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
   # The engine fails a WHERE with a LIMIT or OFFSET on a measurement that
   # exists with an internal error of the SQL engine (verified).
-  defp show_rows(table, database, %{kind: :tag_keys} = spec) do
+  defp tag_key_list(table, database, spec) do
     names = show_names(table, database, spec)
 
     if spec.where != nil and names != [] and (spec.limit != nil or spec.offset > 0) do
@@ -171,7 +186,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     end
   end
 
-  defp show_rows(table, database, %{kind: :field_keys} = spec) do
+  defp field_key_list(table, database, spec) do
     fields =
       table
       |> Store.columns(database)
@@ -194,7 +209,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
   # With a LIMIT or OFFSET and no measurement that has a key to list, the
   # engine fails with an internal error of the SQL engine (verified).
-  defp show_rows(table, database, %{kind: :tag_values} = spec) do
+  defp tag_value_list(table, database, spec) do
     names = show_names(table, database, spec)
 
     if (spec.limit != nil or spec.offset > 0) and
@@ -378,10 +393,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp show_plan(%{where: nil}, _tags, _types),
     do: {:ok, %{condition: @show_window, tags: MapSet.new(), checks: []}}
 
-  defp show_plan(%{where: where} = spec, tags, types) do
-    case influxql_where(where, tags, types, Store.now_ns()) do
+  defp show_plan(%{where: where}, tags, types) do
+    case influxql_where(where, tags, types, Store.now_ns(), 0) do
       {:ok, %{deferred: deferred}} when deferred != nil ->
-        show_refusal(spec, "a bare column as the WHERE of a SHOW statement")
+        {:error, %{status: 400, body: deferred}}
 
       {:ok, %{where: " WHERE " <> sql} = plan} ->
         condition =
@@ -469,25 +484,32 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     types = field_types(table, database, query.measurement)
     now = Store.now_ns()
 
-    case influxql_wild(query, types, tags) do
-      :empty ->
-        {:ok, []}
+    with :ok <- influxql_early(query),
+         {:ok, query} <- influxql_wild(query, types, tags) do
+      influxql_planned(table, database, query, types, tags, now)
+    else
+      :empty -> {:ok, []}
+      {:error, _reason} = error -> error
+    end
+  end
 
-      {:ok, query} ->
-        influxql_planned(table, database, query, types, tags, now)
-
-      {:error, _reason} = error ->
-        error
+  # What the engine raises while it rewrites the statement, before it reads
+  # the `WHERE`.
+  @spec influxql_early(InfluxQL.query()) :: :ok | {:error, map()}
+  defp influxql_early(query) do
+    case InfluxQL.early_error(query) do
+      :ok -> :ok
+      {:error, {:engine, body}} -> {:error, %{status: 400, body: body}}
     end
   end
 
   defp influxql_planned(table, database, query, types, tags, now) do
     with {:ok, extend} <- influxql_lookback(query),
-         {:ok, plan} <- influxql_where(query.where, tags, types, now, extend, true),
+         {:ok, plan} <- influxql_where(query.where, tags, types, now, extend),
          :ok <- influxql_items(query, types, tags),
          :ok <- influxql_window(table, database, query),
          :ok <- influxql_stride(table, database, query),
-         :ok <- influxql_deferred(plan) do
+         :ok <- influxql_deferred(table, database, query, plan) do
       if empty_range?(plan),
         do: {:ok, []},
         else: influxql_rows(table, database, query, plan, types, tags, now)
@@ -611,10 +633,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
   defp influxql_stride(_table, _database, _query), do: :ok
 
-  # An error the engine raises after it has planned the LIMIT.
-  @spec influxql_deferred(map()) :: :ok | {:error, map()}
-  defp influxql_deferred(%{deferred: nil}), do: :ok
-  defp influxql_deferred(%{deferred: body}), do: {:error, %{status: 400, body: body}}
+  # An error the engine raises after it has planned the LIMIT, of a
+  # measurement that exists.
+  @spec influxql_deferred(Store.t(), binary(), InfluxQL.query(), map()) :: :ok | {:error, map()}
+  defp influxql_deferred(_table, _database, _query, %{deferred: nil}), do: :ok
+
+  defp influxql_deferred(table, database, query, %{deferred: body}) do
+    if query.measurement in Store.measurements(table, database),
+      do: {:error, %{status: 400, body: body}},
+      else: :ok
+  end
 
   # The field names a LIMIT or OFFSET counts per field, from the schema;
   # a query without either does not read them.
@@ -631,7 +659,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # The WHERE as SQL (with its leading ` WHERE `, or nothing), the lower
   # bounds it puts on `time`, and the tag columns it names: only those
   # need the missing-tag fill.
-  @spec influxql_where(binary() | nil, MapSet.t(binary()), %{binary() => atom()}, integer()) ::
+  @spec influxql_where(
+          binary() | nil,
+          MapSet.t(binary()),
+          %{binary() => atom()},
+          integer(),
+          non_neg_integer()
+        ) ::
           {:ok,
            %{
              where: binary(),
@@ -642,15 +676,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
              deferred: binary() | nil
            }}
           | {:error, map()}
-  defp influxql_where(where, tags, types, now),
-    do: influxql_where(where, tags, types, now, 0, false)
-
-  defp influxql_where(nil, _tags, _types, _now, _extend, _known?) do
+  defp influxql_where(nil, _tags, _types, _now, _extend) do
     {:ok, %{where: "", lowers: [], uppers: [], checks: [], tags: MapSet.new(), deferred: nil}}
   end
 
-  defp influxql_where(where, tags, types, now, extend, known?) do
-    known = if known?, do: MapSet.union(tags, MapSet.new(Map.keys(types)))
+  defp influxql_where(where, tags, types, now, extend) do
+    known = MapSet.union(tags, MapSet.new(Map.keys(types)))
 
     case InfluxQL.where_plan(where, tags, types, now: now, extend_lower: extend, known: known) do
       {:ok, plan} ->
@@ -778,6 +809,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp run_select(query, rows, tags, opts) do
     {:ok, InfluxQL.run(query, rows, tags, opts)}
   catch
+    :closed_connection -> {:error, SQLError.closed()}
     {:refused, {:engine, status, body}} -> {:error, %{status: status, body: body}}
     {:refused, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
   end

@@ -507,14 +507,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
 
     time_name = InfluxQLNames.time_name(query.items)
 
+    sources = Enum.map(plan.transforms, & &1.source)
+
     results =
       Map.new(plan.transforms, fn transform ->
-        inputs =
-          for row <- rows, is_number(row[transform.source]) do
-            {time_ns(row), row[transform.source]}
-          end
-
-        {transform.key, inputs |> raw_results(transform) |> Map.new()}
+        {transform.key,
+         rows |> transform_inputs(transform, sources) |> raw_results(transform) |> Map.new()}
       end)
 
     for row <- rows,
@@ -524,6 +522,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
         visible != %{} do
       base |> Map.put(time_name, row["time"]) |> Map.merge(visible)
     end
+  end
+
+  # What a transform reads of the rows of a series: the numbers of its field,
+  # but for `elapsed()`, which counts the time between the rows that hold any
+  # field the select list reads, of whatever type (verified).
+  @spec transform_inputs([map()], map(), [binary()]) :: [{integer(), number() | nil}]
+  defp transform_inputs(rows, %{name: "elapsed"}, sources) do
+    for row <- rows, Enum.any?(sources, &(row[&1] != nil)), do: {time_ns(row), 0}
+  end
+
+  defp transform_inputs(rows, transform, _sources) do
+    for row <- rows, is_number(row[transform.source]), do: {time_ns(row), row[transform.source]}
   end
 
   defp raw_results(inputs, transform) do
@@ -658,6 +668,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     {:multi, kind, field, tags, limit, alias} =
       Enum.find(query.items, &match?({:multi, _k, _f, _t, _n, _a}, &1))
 
+    cond do
+      not MapSet.member?(context.tags, field) ->
+        multi_rows(rows, context, base, {kind, field, tags, limit, alias})
+
+      tags == [] ->
+        []
+
+      true ->
+        throw({:refused, "unsupported InfluxQL (#{kind}() of a tag beside other arguments)"})
+    end
+  end
+
+  defp multi_rows(rows, %{query: query} = context, base, {kind, field, tags, limit, alias}) do
     groups =
       case query.group_time do
         nil -> [rows]

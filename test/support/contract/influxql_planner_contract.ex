@@ -20,6 +20,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
     InfluxQLArithmeticCases,
     InfluxQLBucketCases,
     InfluxQLCallCases,
+    InfluxQLFixCases,
     InfluxQLShowCases,
     InfluxQLWhereCases
   }
@@ -35,7 +36,9 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
       unquote(buckets(client))
       unquote(calls(client))
       unquote(shows(client))
+      unquote(fixes(client))
       unquote(show_helpers(client))
+      unquote(fix_helpers(client))
       unquote(helpers(client))
     end
   end
@@ -302,8 +305,77 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
     end
   end
 
+  defp fixes(client) do
+    quote location: :keep do
+      describe "InfluxQL arguments, overflow, wildcards, errors and SHOW conditions — contract" do
+        setup ctx do
+          names = InfluxQLFixCases.names(InfluxElixir.IntegrationHelper.unique_name("ipx"))
+          write(ctx, unquote(client), InfluxQLFixCases.fixture(names))
+          write(ctx, unquote(client), InfluxQLFixCases.show_fixture(names))
+          {:ok, names: names}
+        end
+
+        test "durations and windows the planner refuses, and the order it refuses them in", ctx do
+          check_fix(ctx, InfluxQLFixCases.planning_arguments())
+        end
+
+        test "floats that overflow are null, integers wrap, areas and spreads follow", ctx do
+          check_fix(ctx, InfluxQLFixCases.overflow())
+        end
+
+        test "count, mode and elapsed over wildcards, regular expressions and *::tag", ctx do
+          check_fix(ctx, InfluxQLFixCases.wildcards())
+        end
+
+        test "conditions the parser refuses, bare constants and top() of a tag", ctx do
+          check_fix(ctx, InfluxQLFixCases.conditions())
+        end
+
+        test "a truncated GROUP, the offset of GROUP BY time() and count(distinct f)", ctx do
+          check_fix(ctx, InfluxQLFixCases.parse_errors())
+        end
+
+        @tag engine_bug: "closed connection"
+        test "the percentile of an integer field with no value breaks the connection", ctx do
+          check_fix(ctx, InfluxQLFixCases.closed_or_empty())
+        end
+
+        test "SHOW over a column the measurement lacks, and a condition that is no boolean",
+             ctx do
+          check_show_fix(ctx, InfluxQLFixCases.shows())
+        end
+      end
+    end
+  end
+
   defp show_helpers(client) do
     quote location: :keep do
+      defp check_show_fix(ctx, cases) do
+        InfluxElixir.TestSupport.Check.check_cases(cases, fn {template, expected} ->
+          statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
+
+          actual =
+            case InfluxElixir.Contract.InfluxQLPlanner.raw(unquote(client), ctx, statement) do
+              {:ok, rows} ->
+                rows
+
+              {:error, %{status: status, body: body}} ->
+                {:error, status,
+                 InfluxElixir.Contract.InfluxQLPlanner.template_positions(
+                   body,
+                   statement,
+                   ctx.names
+                 )}
+            end
+
+          expected = InfluxElixir.Contract.InfluxQLPlanner.fill_names(expected, ctx.names)
+
+          if actual === expected,
+            do: :ok,
+            else: {:mismatch, %{expected: expected, actual: actual}}
+        end)
+      end
+
       defp check_show(ctx, cases) do
         for {template, expected} <- cases do
           statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
@@ -317,6 +389,25 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           assert actual === InfluxElixir.Contract.InfluxQLPlanner.fill_names(expected, ctx.names),
                  statement
         end
+      end
+    end
+  end
+
+  defp fix_helpers(client) do
+    quote location: :keep do
+      defp check_fix(ctx, cases) do
+        InfluxElixir.TestSupport.Check.check_cases(cases, fn {template, expected} ->
+          statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
+
+          actual =
+            InfluxElixir.Contract.InfluxQLPlanner.fix_outcome(unquote(client), ctx, statement)
+
+          expected = InfluxElixir.Contract.InfluxQLPlanner.fill_names(expected, ctx.names)
+
+          if actual === expected,
+            do: :ok,
+            else: {:mismatch, %{expected: expected, actual: actual}}
+        end)
       end
     end
   end
@@ -399,17 +490,58 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
   """
   @spec outcome(module(), map(), binary()) ::
           [{binary(), map()}] | {:error, pos_integer(), binary()}
-  def outcome(client, ctx, statement) do
-    case raw(client, ctx, statement) do
-      {:ok, rows} ->
-        for row <- rows do
-          {Calendar.strftime(row["time"], "%Y-%m-%d %H:%M:%S"),
-           row |> Map.delete("time") |> Map.delete("iox::measurement")}
-        end
+  def outcome(client, ctx, statement), do: client |> raw(ctx, statement) |> answered()
 
-      {:error, %{status: status, body: body}} ->
-        {:error, status, body}
+  defp answered({:ok, rows}) do
+    for row <- rows do
+      {Calendar.strftime(row["time"], "%Y-%m-%d %H:%M:%S"),
+       row |> Map.delete("time") |> Map.delete("iox::measurement")}
     end
+  end
+
+  defp answered({:error, %{status: status, body: body}}), do: {:error, status, body}
+
+  @doc """
+  `outcome/3`, or `:closed` for the connection the engine breaks mid-response.
+  """
+  @spec fix_outcome(module(), map(), binary()) ::
+          [{binary(), map()}] | {:error, pos_integer(), binary()} | :closed
+  def fix_outcome(client, ctx, statement) do
+    case raw(client, ctx, statement) do
+      {:error, {:connection_error, %Mint.TransportError{reason: :closed}}} ->
+        :closed
+
+      answer ->
+        case answered(answer) do
+          {:error, status, body} ->
+            {:error, status, template_positions(body, statement, ctx.names)}
+
+          rows ->
+            rows
+        end
+    end
+  end
+
+  @doc """
+  The positions of a parse error body (`at pos N`) counted as if every measurement name
+  in the statement were its template placeholder (`~f1`, three characters): the
+  measurements of a run have names of their own length, the cases are written once.
+  """
+  @spec template_positions(binary(), binary(), %{binary() => binary()}) :: binary()
+  def template_positions(body, statement, names) do
+    Regex.replace(~r/ at pos (\d+)/, body, fn _all, digits ->
+      pos = String.to_integer(digits)
+      before = binary_part(statement, 0, min(pos, byte_size(statement)))
+
+      shift =
+        Enum.sum(
+          for {key, name} <- names do
+            length(:binary.matches(before, name)) * (byte_size(name) - byte_size("~" <> key))
+          end
+        )
+
+      " at pos #{pos - shift}"
+    end)
   end
 
   @doc false

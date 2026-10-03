@@ -30,6 +30,12 @@ defmodule InfluxElixir.TestHelperTest do
                {:ok, [%{"time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 1.0}]}
     end
 
+    test "without options starts a v3 Core instance with no database" do
+      {:ok, conn: bare} = setup_influx()
+
+      assert InfluxElixir.list_databases(bare) === {:ok, [%{"name" => "_internal"}]}
+    end
+
     test "passes :profile through" do
       {:ok, conn: v2} = setup_influx(profile: :v2)
       assert {:error, :unsupported_operation} = Local.query_sql(v2, "SELECT 1")

@@ -88,19 +88,6 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
     end
   end
 
-  @doc """
-  An expression text with its aggregates read: the expression over `__agN__`
-  columns and the aggregates by those names.
-  """
-  @spec read_expression(binary(), binary() | nil) ::
-          {:ok, SQLExpr.t(), [{binary(), SQLSelect.column()}]} | {:error, term()}
-  def read_expression(body, qualifier) do
-    with {:ok, text, aggs} <- replace_aggregates(body, qualifier),
-         {:ok, expr} <- read(text, body) do
-      {:ok, expr, aggs}
-    end
-  end
-
   @spec read(binary(), binary()) :: {:ok, SQLExpr.t()} | {:error, term()}
   defp read(text, item) do
     case SQLExpr.parse(text) do

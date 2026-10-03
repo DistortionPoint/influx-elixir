@@ -239,7 +239,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # there (see `check_select/2`).
   @spec reserved_operand(binary(), non_neg_integer(), binary()) :: binary() | nil
   defp reserved_operand(text, start, whole) do
-    [operator_hit(text, start, whole), argument_hit(text, start, whole)]
+    [
+      operator_hit(text, start, whole),
+      argument_hit(text, start, whole),
+      wildcard_hit(text, start, whole)
+    ]
     |> Enum.reject(&is_nil/1)
     |> Enum.min_by(&elem(&1, 0), fn -> nil end)
     |> then(fn hit -> hit && elem(hit, 1) end)
@@ -267,15 +271,48 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     |> Enum.find_value(fn [_all, {from, _length}] ->
       <<_skip::binary-size(from), word_and_rest::binary>> = text
 
-      if InfluxQLText.reserved_start(word_and_rest) != nil and
-           not distinct_call?(word_and_rest),
-         do: {start + from, InfluxQLError.syntax_error_body(:failure, start + from, whole)}
+      if InfluxQLText.reserved_start(word_and_rest) != nil,
+        do: reserved_argument(word_and_rest, start + from, whole)
     end)
   end
 
-  # `count(distinct(f))`: `DISTINCT` is a function there, not a reserved word.
-  @spec distinct_call?(binary()) :: boolean()
-  defp distinct_call?(text), do: Regex.match?(~r/^distinct\s*\(/i, text)
+  # `count(distinct(f))`: `DISTINCT` is a function there, not a reserved word;
+  # `count(distinct f)` reads the same. After the keyword only an identifier
+  # will do ("invalid DISTINCT expression" where the other token starts); any
+  # other reserved word is where the engine fails.
+  @spec reserved_argument(binary(), non_neg_integer(), binary()) ::
+          {non_neg_integer(), binary()} | nil
+  defp reserved_argument(word_and_rest, at, whole) do
+    case Regex.run(~r/^distinct(\s*)(\S?)/i, word_and_rest, return: :index) do
+      [_all, {_start, spaces}, {token_at, token_size}] ->
+        token = binary_part(word_and_rest, token_at, token_size)
+        distinct_hit(token, spaces, at, token_at, whole)
+
+      nil ->
+        {at, InfluxQLError.syntax_error_body(:failure, at, whole)}
+    end
+  end
+
+  defp distinct_hit(token, spaces, at, token_at, whole) do
+    cond do
+      token == "(" or (spaces > 0 and token =~ ~r/^[A-Za-z_"]$/) -> nil
+      token in [")", ""] -> {at, InfluxQLError.syntax_error_body(:failure, at, whole)}
+      true -> {at, InfluxQLError.syntax_error_body(:distinct, at + token_at, whole)}
+    end
+  end
+
+  # A regular expression stands alone in a call's parentheses: the engine fails
+  # from whatever follows it (`percentile(/re/, 90)` fails at the comma). A `*`
+  # may be followed by arguments, but not by a comma with none.
+  @spec wildcard_hit(binary(), non_neg_integer(), binary()) ::
+          {non_neg_integer(), binary()} | nil
+  defp wildcard_hit(text, start, whole) do
+    ~r{[A-Za-z_]\w*\s*\(\s*(?:/(?:[^/\\]|\\.)+/\s*(?=[^)\s])|\*\s*(?=,\s*\)))}
+    |> Regex.scan(text, return: :index)
+    |> Enum.find_value(fn [{from, length}] ->
+      {start + from, InfluxQLError.syntax_error_body(:failure, start + from + length, whole)}
+    end)
+  end
 
   # The end of `AS` when the alias after it is reserved.
   @spec reserved_alias(binary(), non_neg_integer()) :: non_neg_integer() | nil

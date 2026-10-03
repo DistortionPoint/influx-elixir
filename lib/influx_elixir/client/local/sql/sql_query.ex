@@ -115,6 +115,14 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
   @spec written_syntax(binary()) :: :ok | {:error, SQLError.t()}
   defp written_syntax(original), do: SQLSyntax.check_statements(original)
 
+  # `SELECT ... INTO name` plans the select and then fails to create the table.
+  @spec into_or_rows([map()], binary()) :: {:ok, [map()]} | {:error, SQLError.t()}
+  defp into_or_rows(rows, sql) do
+    if SQLRewrite.into?(sql),
+      do: {:error, SQLError.planning("DDL not supported: CreateMemoryTable")},
+      else: {:ok, rows}
+  end
+
   @spec run_query(Store.t(), binary(), binary(), QueryParams.t()) ::
           InfluxElixir.Client.query_result()
   defp run_query(table, database, sql, params) do
@@ -127,7 +135,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
              &Store.column_kind(table, database, &1, &2)
            ) do
         {:error, _reason} = err -> err
-        rows -> {:ok, rows}
+        rows -> into_or_rows(rows, sql)
       end
     end
   end
@@ -190,7 +198,8 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
          :ok <- Format.check_params(params, nil, database),
          :ok <- Scope.database_exists(table, database),
          {:ok, trimmed} <- scrubbed(sql),
-         :ok <- bare_statement(sql) do
+         :ok <- bare_statement(sql),
+         :ok <- delete_syntax(sql, trimmed) do
       case statement_kind(trimmed) do
         :query ->
           query_sql(conn, sql, opts)
@@ -210,7 +219,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
           end
 
         :delete ->
-          {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}}
+          {:error, delete_error(table, database, trimmed)}
 
         {:planning, message} ->
           {:error, %{status: 400, body: "Error during planning: " <> message}}
@@ -219,13 +228,27 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
           {:error, SQLError.refusal(message)}
 
         :unsupported ->
-          {:error,
-           SQLStatement.parser_error(sql) ||
-             %{
-               status: 405,
-               body: "This feature is not implemented: Unsupported SQL statement: " <> trimmed
-             }}
+          {:error, SQLStatement.parser_error(sql) || unsupported(trimmed)}
       end
+    end
+  end
+
+  # The engine prints the statement it does not run as its parser reads it, keywords in
+  # capitals and one space between tokens.
+  @spec unsupported(binary()) :: SQLError.t() | map()
+  defp unsupported(statement) do
+    case SQLStatement.display(statement) do
+      {:ok, text} ->
+        %{
+          status: 405,
+          body: "This feature is not implemented: Unsupported SQL statement: " <> text
+        }
+
+      :unknown ->
+        SQLError.refusal(
+          "the statement #{inspect(statement)} is not run: the engine's wording of it " <>
+            "(its keywords in capitals) is not modelled"
+        )
     end
   end
 
@@ -235,6 +258,13 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
       {:ok, _statement} = ok -> ok
       {:error, reason} -> {:error, parsed(sql, reason)}
     end
+  end
+
+  # A `DELETE` the parser does not read (`DELETE FROM` with no table) is its error, whatever
+  # the engine does with one that reads.
+  @spec delete_syntax(binary(), binary()) :: :ok | {:error, SQLError.t()}
+  defp delete_syntax(sql, trimmed) do
+    if statement_kind(trimmed) == :delete, do: SQLSyntax.check_statements(sql), else: :ok
   end
 
   @spec bare_statement(binary()) :: :ok | {:error, SQLError.t()}
@@ -285,14 +315,36 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     end)
   end
 
+  # The planner finds the table of a `DELETE` before it refuses the statement.
+  @spec delete_error(Store.t(), binary(), binary()) :: map()
+  defp delete_error(table, database, statement) do
+    case Regex.run(
+           ~r/^(?i)DELETE\s+FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+)(.*)$/s,
+           SQLIdentifiers.normalize(statement)
+         ) do
+      [_full, raw, _rest] ->
+        name = delete_target(raw)
+
+        if name in Store.measurements(table, database),
+          do: %{status: 400, body: "Error during planning: DML not supported: Delete"},
+          else: %{
+            status: 400,
+            body: "Error during planning: table 'public.iox.#{name}' not found"
+          }
+
+      nil ->
+        %{status: 400, body: "Error during planning: DML not supported: Delete"}
+    end
+  end
+
+  @spec delete_target(binary()) :: binary()
+  defp delete_target("\"" <> _quoted = raw), do: String.trim(raw, "\"")
+  defp delete_target(bare), do: LineProtocolParser.unescape_measurement(bare)
+
   @spec execute_delete(Store.t(), binary(), binary(), binary()) ::
           {:ok, map()} | {:error, term()}
   defp execute_delete(table, database, measurement_raw, rest) do
-    measurement =
-      case measurement_raw do
-        "\"" <> _quoted -> String.trim(measurement_raw, "\"")
-        bare -> LineProtocolParser.unescape_measurement(bare)
-      end
+    measurement = delete_target(measurement_raw)
 
     with {:ok, where} <- SQLParser.parse_where(rest) do
       count =

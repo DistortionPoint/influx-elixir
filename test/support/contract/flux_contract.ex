@@ -6,8 +6,8 @@ defmodule InfluxElixir.Contract.Flux do
 
       use InfluxElixir.Contract.Flux, client: InfluxElixir.Client.Local, profile: :v2
 
-  The `setup` callback must return `conn`, `database` (the bucket) and
-  `query_delay`, as for the shared contract. A real server keeps its data
+  The `setup` callback must return `conn` and `database` (the bucket),
+  as for the shared contract. A real server keeps its data
   between runs and the tests share one bucket, so every measurement name is
   unique and every query filters on it.
 

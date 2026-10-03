@@ -192,6 +192,48 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
     end
   end
 
+  # The words the engine prints in capitals when it names a statement it does not run
+  # (the keywords of the statements above, and the words that follow them).
+  @display_words @statement_words ++
+                   ~w(TABLE TRANSACTION COLUMN ADD INT ALL ON TO LOGS SAVEPOINT CURSOR FOR IS AS
+                      MATERIALIZED VIEW DATA)
+
+  @doc """
+  A statement the engine does not run as it names it in its error: the keywords in capitals
+  and one space between the words. A statement of words only is written so; one with
+  punctuation or a literal is written as it stands when its keywords already are in capitals,
+  else `:unknown`.
+  """
+  @spec display(binary()) :: {:ok, binary()} | :unknown
+  def display(statement) do
+    text = statement |> String.trim() |> String.replace_suffix(";", "") |> String.trim()
+
+    cond do
+      Regex.match?(~r/\A[A-Za-z_][\w$]*(?:\s+[A-Za-z_][\w$]*)*\z/, text) ->
+        {:ok, text |> String.split() |> Enum.map_join(" ", &display_word/1) |> release()}
+
+      Enum.all?(Regex.scan(~r/[A-Za-z_][\w$]*/, text), fn [word] ->
+        word == String.upcase(word) or String.upcase(word) not in @display_words
+      end) ->
+        {:ok, text}
+
+      true ->
+        :unknown
+    end
+  end
+
+  @spec display_word(binary()) :: binary()
+  defp display_word(word) do
+    upper = String.upcase(word)
+    if upper in @display_words, do: upper, else: word
+  end
+
+  # `RELEASE s` is named `RELEASE SAVEPOINT s`.
+  @spec release(binary()) :: binary()
+  defp release("RELEASE SAVEPOINT" <> _name = text), do: text
+  defp release("RELEASE " <> name), do: "RELEASE SAVEPOINT " <> name
+  defp release(text), do: text
+
   @doc """
   The engine's answer to a statement word with nothing after it but a `;`
   (`UPDATE`, `GRANT;`): the parser's error for the end of the text, or the

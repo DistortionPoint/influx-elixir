@@ -23,6 +23,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   require SQLLimits
 
   @selectors ~w(min max first last)
+  @root_of_float_max :math.sqrt(SQLLimits.float_max())
 
   @typedoc "What an aggregate comes to over some rows."
   @type result :: {:value, term(), map() | nil} | :none | :null
@@ -64,10 +65,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   @spec name_columns([InfluxQL.item()], [map()], [binary()], MapSet.t(binary()), map()) ::
           [{binary(), result(), spec()}]
   defp name_columns(aggregates, rows, fields, tags, types) do
+    beside? = length(aggregates) > 1
+
     {named, _names} =
       Enum.flat_map_reduce(aggregates, %{}, fn item, names ->
         item
+        |> beside(beside?)
         |> compute(rows, fields, tags, types)
+        |> tap(&check_null(item, &1, beside?, types))
         |> Enum.map_reduce(names, fn {name, result, spec}, names ->
           {unique, names} = unique_name(name, names)
           {{unique, result, spec}, names}
@@ -76,6 +81,42 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
 
     named
   end
+
+  # A `percentile()` that is not alone in the select list reads its rank as in a
+  # bucket of a `GROUP BY time`: the last value is the one of rank `n` (verified;
+  # alone, the engine answers nothing for it).
+  @spec beside(InfluxQL.item(), boolean()) :: InfluxQL.item()
+  defp beside({:aggregate, "percentile:" <> rest = fun, field, alias} = item, true) do
+    if String.ends_with?(rest, ":bucket"),
+      do: item,
+      else: {:aggregate, fun <> ":bucket", field, alias}
+  end
+
+  defp beside(item, _beside?), do: item
+
+  # A `percentile()` of an integer field that comes to null (a rank past its
+  # values) breaks the engine's connection when another column is beside it
+  # or the buckets of a `GROUP BY time` carry it (verified); alone over a
+  # series it answers nothing. A float one answers the row of the others.
+  @spec check_null(InfluxQL.item(), [{binary(), result(), spec()}], boolean(), map()) :: :ok
+  defp check_null(
+         {:aggregate, "percentile:" <> rest, field, _alias},
+         [{_name, :null, _spec}],
+         beside?,
+         types
+       ) do
+    null_percentile(Map.get(types, field), beside? or String.ends_with?(rest, ":bucket"))
+  end
+
+  defp check_null(_item, _results, _beside, _types), do: :ok
+
+  defp null_percentile(:integer, true), do: throw(:closed_connection)
+
+  defp null_percentile(:unsigned, true),
+    do:
+      throw({:refused, "unsupported InfluxQL (percentile() of an unsigned field with no value)"})
+
+  defp null_percentile(_type, _beside), do: :ok
 
   # An aggregate of a tag column answers nothing, alone: a query must select
   # a field to answer.
@@ -173,8 +214,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
 
   # The area under the points of a series by the trapezoid rule, in `unit`
   # (verified: the time is the range's, as for any aggregate; one point has an
-  # area of zero; each pair adds a rectangle and a triangle in the unit, which
-  # is what the engine's floats come to). Over the buckets of a `GROUP BY time`
+  # area of zero; each pair adds the mean of its two values, as floats, times
+  # the time between them in the unit, which is what the engine's floats come
+  # to; an area that overflows is null). Over the buckets of a `GROUP BY time`
   # the engine carries the line across the bucket edges and the gaps, which the
   # double does not.
   @spec integral([map()], binary(), binary(), map()) :: result()
@@ -203,8 +245,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
     |> Enum.chunk_every(2, 1, :discard)
     |> Enum.reduce(0.0, fn [{t0, y0}, {t1, y1}], total ->
       span = DateTime.diff(t1, t0, :microsecond) * 1000
-      total + (y0 * span / unit + (y1 - y0) * span / unit / 2)
+      total + (y0 * 1.0 + y1 * 1.0) / 2 * (span / unit)
     end)
+  rescue
+    ArithmeticError -> nil
   end
 
   # The value that is most often there; of several the engine's choice is in an
@@ -267,7 +311,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
     end
   end
 
-  @spec middle([number(), ...]) :: number()
+  @spec middle([number(), ...]) :: number() | nil
   defp middle(sorted) do
     count = length(sorted)
     upper = Enum.at(sorted, div(count, 2))
@@ -277,10 +321,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
       else: average(Enum.at(sorted, div(count, 2) - 1), upper)
   end
 
-  # Integers average as integers, truncated toward zero.
-  @spec average(number(), number()) :: number()
-  defp average(low, high) when is_integer(low) and is_integer(high), do: div(low + high, 2)
-  defp average(low, high), do: (low + high) / 2
+  # Integers average as integers, the sum wrapped at 64 bits and the quotient
+  # truncated toward zero; floats that overflow average to null.
+  @spec average(number(), number()) :: number() | nil
+  defp average(low, high) when is_integer(low) and is_integer(high),
+    do: div(SQLLimits.wrap_int64(low + high), 2)
+
+  defp average(low, high) do
+    (low + high) / 2
+  rescue
+    ArithmeticError -> nil
+  end
 
   @spec spread([map()], binary(), map()) :: result()
   defp spread(rows, field, types) do
@@ -316,17 +367,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   end
 
   # The sample standard deviation, by Welford's streaming update as the
-  # engine accumulates it; null for a single value.
+  # engine accumulates it; null for a single value, and for values whose
+  # squares overflow (verified: two equal values of 1.7e308 are null).
   @spec stddev([map()], binary()) :: result()
   defp stddev(rows, field) do
     case numbers(rows, field) do
       [] -> :none
       [_one] -> :null
-      values -> {:value, welford(values), nil}
+      values -> {:value, if(squares_fit?(values), do: welford(values)), nil}
     end
   end
 
-  @spec welford([number(), ...]) :: float()
+  defp squares_fit?(values), do: Enum.all?(values, &(abs(&1) <= @root_of_float_max))
+
+  @spec welford([number(), ...]) :: float() | nil
   defp welford(values) do
     {count, _mean, m2} =
       Enum.reduce(values, {0, 0.0, 0.0}, fn value, {count, mean, m2} ->
@@ -337,6 +391,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
       end)
 
     :math.sqrt(m2 / (count - 1))
+  rescue
+    ArithmeticError -> nil
   end
 
   # Rows arrive in time order, so the first extreme wins a tie, as on the

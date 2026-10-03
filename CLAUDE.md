@@ -37,8 +37,10 @@ iex -S mix              # Start interactive shell with library loaded
 
 ### Testing & Quality
 ```bash
-mix test                    # Run tests
+mix test                    # Run the unit tier (test/integration is not compiled)
 mix test --cover            # Run tests with coverage
+mix test test/integration/contract_v3_core --include integration --include v3_core
+                            # Integration tier against a real server (see docs/design/README.md)
 mix quality                 # Run all quality checks (format, credo, dialyzer, sobelow)
 mix credo --strict          # Code analysis
 mix dialyzer                # Type checking

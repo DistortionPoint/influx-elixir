@@ -9,7 +9,7 @@ defmodule InfluxElixir.Contract.SQLAggregates do
         client: InfluxElixir.Client.Local,
         profile: :v3_core
 
-  The `setup` callback must return `conn`, `database` and `query_delay`, as for
+  The `setup` callback must return `conn` and `database`, as for
   the shared contract. Each test has a database of its own, so the measurement
   names are fixed. Every timestamp is explicit and in nanoseconds, so that the
   `DATE_BIN` buckets are known.

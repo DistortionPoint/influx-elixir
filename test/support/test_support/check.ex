@@ -5,9 +5,15 @@ defmodule InfluxElixir.TestSupport.Check do
 
     * `check_cases/2` runs a check on every case and fails once, listing every
       case that did not hold, instead of stopping at the first.
+    * `check_ratchet/3` is `check_cases/2` for a table of cases that the double
+      may refuse by name instead of answering: the number it refused is pinned
+      with `===`, so that a regression to "refused" and an improvement both fail
+      until the pin is moved.
     * `assert_rows_close/3` compares rows exactly, except that two floats may
       differ by a relative `1.0e-12`: a mean or a sum of floats is correct to
       that precision whatever order the engine added the values in.
+    * `rows_close?/3` is the same comparison as a boolean, for a check that
+      reports a mismatch itself.
   """
 
   import ExUnit.Assertions, only: [flunk: 1]
@@ -24,6 +30,41 @@ defmodule InfluxElixir.TestSupport.Check do
     case for(item <- cases, {:mismatch, why} <- [check.(item)], do: {item, why}) do
       [] -> :ok
       failed -> flunk(describe_failures(failed))
+    end
+  end
+
+  @doc """
+  Runs `check` on each of `cases` like `check_cases/2`, where `check` may also
+  return `:refused` (the double refused the case by name), and fails unless
+  exactly `pinned` cases were refused.
+
+  The count is a ratchet. Above the pin, a case that used to be answered is now
+  refused: a regression, listed. Below it, a case that used to be refused is now
+  answered: the pin is lowered and the case moved out of its refusable table into
+  the table of answers. On a real engine nothing may be refused: the pin is `0`.
+  """
+  @spec check_ratchet(
+          Enumerable.t(),
+          (term() -> :ok | :refused | {:mismatch, term()}),
+          non_neg_integer()
+        ) :: :ok
+  def check_ratchet(cases, check, pinned) when is_function(check, 1) and pinned >= 0 do
+    results = for item <- cases, do: {item, check.(item)}
+    mismatches = for {item, {:mismatch, why}} <- results, do: {item, why}
+    refused = for {item, :refused} <- results, do: item
+
+    cond do
+      mismatches !== [] ->
+        flunk(describe_failures(mismatches))
+
+      length(refused) === pinned ->
+        :ok
+
+      true ->
+        flunk(
+          "#{length(refused)} case(s) refused, #{pinned} pinned (of #{length(results)}); " <>
+            "refused:\n" <> Enum.map_join(refused, "\n", &"  #{inspect(&1)}")
+        )
     end
   end
 
@@ -66,6 +107,15 @@ defmodule InfluxElixir.TestSupport.Check do
       found -> flunk(describe_diffs(found, actual, expected))
     end
   end
+
+  @doc """
+  True when `actual` equals `expected` as `assert_rows_close/3` reads it: floats
+  to a relative `tolerance`, everything else strictly, on any nesting of lists,
+  maps and tuples.
+  """
+  @spec rows_close?(term(), term(), float()) :: boolean()
+  def rows_close?(actual, expected, tolerance \\ @default_tolerance),
+    do: diffs(actual, expected, tolerance, []) === []
 
   @doc """
   True when `a` and `b` are equal floats to a relative `tolerance`.

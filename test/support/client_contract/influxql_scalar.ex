@@ -438,6 +438,57 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                  }
         end
 
+        test "format: :csv writes each float as the engine's CSV does", ctx do
+          # Every pair was read back from InfluxDB 3 Core's `format: "csv"`.
+          pairs = [
+            {0.5, "0.5"},
+            {2.0, "2.0"},
+            {100.0, "100.0"},
+            {12_345_678.9, "12345678.9"},
+            {0.001, "0.001"},
+            {0.0001, "0.0001"},
+            {0.00001, "0.00001"},
+            {1.5e-5, "0.000015"},
+            {9.5e-6, "9.5e-6"},
+            {1.0e-6, "1e-6"},
+            {1.5e-7, "1.5e-7"},
+            {5.0e-324, "5e-324"},
+            {1.0e15, "1000000000000000.0"},
+            {9.999e15, "9999000000000000.0"},
+            {1.0e16, "1e16"},
+            {1.0e20, "1e20"},
+            {123_456_789_012_345_678.0, "1.2345678901234568e17"},
+            {1.797_693_134_862_315_7e308, "1.7976931348623157e308"},
+            {-12.25, "-12.25"},
+            {-2.5e-6, "-2.5e-6"},
+            {-1.0e16, "-1e16"},
+            {0.0, "0.0"}
+          ]
+
+          lines =
+            pairs
+            |> Enum.with_index(1)
+            |> Enum.map_join("\n", fn {{value, _csv}, second} ->
+              "#{ctx.m}_csv_float f=#{Float.to_string(value)} #{second}"
+            end)
+
+          assert {:ok, :written} ===
+                   unquote(client).write(ctx.conn, lines,
+                     database: ctx.database,
+                     precision: :second
+                   )
+
+          assert {:ok, rows} =
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT f FROM #{ctx.m}_csv_float ORDER BY time",
+                     database: ctx.database,
+                     format: :csv
+                   )
+
+          assert Enum.map(rows, & &1["f"]) === Enum.map(pairs, &elem(&1, 1))
+        end
+
         test "format: :csv keeps a one-column row whose value is null or empty", ctx do
           # The engine writes such a row as `""`; the parser took it for a
           # table separator, dropped it and read the next row as a header.

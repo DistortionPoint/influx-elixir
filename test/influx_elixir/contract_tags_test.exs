@@ -41,8 +41,11 @@ defmodule InfluxElixir.ContractTagsTest do
     "contract/sql_executor_contract.ex" => 130,
     "contract/sql_expressions_contract.ex" => 33,
     "contract/sql_parser_contract.ex" => 108,
+    "contract/influxql_planner_contract.ex" => 29,
+    "contract/retention_contract.ex" => 14,
     "contract/sql_scalar_contract.ex" => 6,
-    "contract/write_rules_contract.ex" => 19
+    "contract/write_rules_contract.ex" => 19,
+    "token_contract.ex" => 9
   }
 
   @total_floor 600

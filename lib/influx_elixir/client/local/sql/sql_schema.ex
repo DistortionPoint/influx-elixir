@@ -126,6 +126,10 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     end
   end
 
+  @doc "Every column the relations have, a table's from its rows and a CTE's as it declared them."
+  @spec table_columns([relation()]) :: MapSet.t(binary())
+  def table_columns(relations), do: relations |> Enum.flat_map(&full_columns/1) |> MapSet.new()
+
   # A CTE's columns are as it declared them; a table's are every column any
   # of its rows has, sorted as the engine's schema is (byte order).
   @spec full_columns(relation()) :: [binary()]
@@ -452,7 +456,10 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   def expr_fields({:uint_col, name}), do: [name]
   def expr_fields(items) when is_list(items), do: Enum.flat_map(items, &expr_fields/1)
   def expr_fields({:aggregate, _agg, expr}), do: expr_fields(expr)
-  def expr_fields({:aggs, aggs, item}), do: SQLAggType.fields(aggs) ++ expr_fields(item)
+
+  def expr_fields({:aggs, aggs, item}),
+    do: Enum.flat_map(SQLAggType.arguments(aggs), &expr_fields/1) ++ expr_fields(item)
+
   def expr_fields({:agg_ref, _name}), do: []
   def expr_fields({:constant, _call, _ancestors}), do: []
   def expr_fields({:cut, call}), do: expr_fields(call)

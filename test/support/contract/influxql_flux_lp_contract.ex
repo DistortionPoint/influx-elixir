@@ -13,7 +13,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   `profile: :v3_core` adds the InfluxDB 3 tests (line protocol, InfluxQL),
   `profile: :v2` the InfluxDB 2 ones (line protocol, Flux, buckets).
 
-  The `setup` callback must return `conn`, `database` and `query_delay`, as
+  The `setup` callback must return `conn` and `database`, as
   for the shared contract. A real server is shared between runs, so every
   measurement name is unique and every line is given a timestamp.
 

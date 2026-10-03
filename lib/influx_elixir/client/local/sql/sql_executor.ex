@@ -208,7 +208,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
          typed = SQLTyping.retype(bound, unsigned?),
          :ok <- SQLPlan.check(joined, typed, unsigned?),
          typed = SQLCoerce.apply(typed, joined, unsigned?),
-         :ok <- SQLGrouping.check(typed),
+         :ok <- SQLGrouping.check(typed, relations),
          :ok <- SQLTime.first_invalid(typed.where),
          :ok <- limit_error(typed),
          :ok <- SQLFold.check(typed),

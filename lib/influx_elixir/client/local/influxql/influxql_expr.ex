@@ -35,7 +35,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   #     to an integer, an unsigned cast, an expression of constants alone, a
   #     math function of a string, a boolean or an unsigned field
 
-  alias InfluxElixir.Client.Local.{Durations, InfluxQLAggregate, InfluxQLError, SQLLimits}
+  alias InfluxElixir.Client.Local.{
+    Durations,
+    InfluxQLError,
+    InfluxQLLiteral,
+    InfluxQLText,
+    SQLLimits
+  }
 
   require SQLLimits
 
@@ -125,14 +131,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     cond do
       match = Regex.run(~r/^(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+(?![\w.])/u, text) ->
         [all] = match
-        tokenize(rest_after(text, all), [{:duration, duration_ns(all)} | acc])
+        duration(rest_after(text, all), duration_ns(all), acc)
 
       match = Regex.run(~r/^(?:\d+\.\d+|\.\d+|\d+)(?![\w.])/, text) ->
         tokenize(rest_after(text, hd(match)), [{:number, hd(match)} | acc])
 
       match = Regex.run(~r/^("(?:[^"\\]|\\.)+"|[A-Za-z_][\w.]*)(?:::(float|integer))?/, text) ->
         [all, name | cast] = match
-        tokenize(rest_after(text, all), [{:name, unquote_name(name), List.first(cast)} | acc])
+
+        tokenize(rest_after(text, all), [
+          {:name, InfluxQLText.unquote_ident(name), List.first(cast)} | acc
+        ])
 
       true ->
         :error
@@ -149,6 +158,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp regex_end(<<c, rest::binary>>, acc), do: regex_end(rest, [<<c>> | acc])
   defp regex_end(<<>>, _acc), do: :error
 
+  # A duration beyond 64 bits is the engine's parse error ("overflow"), at a
+  # position the double does not track: refused by name.
+  defp duration(_rest, ns, _acc) when ns > 9_223_372_036_854_775_807, do: :error
+  defp duration(rest, ns, acc), do: tokenize(rest, [{:duration, ns} | acc])
+
   defp duration_ns(text) do
     ~r/(\d+)(ns|ms|u|µ|s|m|h|d|w)/u
     |> Regex.scan(text)
@@ -159,11 +173,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp rest_after(text, prefix),
     do: binary_part(text, byte_size(prefix), byte_size(text) - byte_size(prefix))
-
-  defp unquote_name("\"" <> _rest = quoted),
-    do: quoted |> String.trim("\"") |> String.replace("\\\"", "\"")
-
-  defp unquote_name(name), do: name
 
   @spec sum(list()) :: {:ok, ast(), list()} | :error
   defp sum(tokens) do
@@ -273,6 +282,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       {[], _plain} ->
         classify_call(call)
 
+      {[{:star, "tag"}], _plain} ->
+        if name in @wild_names,
+          do: {:expand_error, "unable to use tag as wildcard in #{name}()"},
+          else: :error
+
+      {[{:regex, _source}], [_argument | _more]} ->
+        :error
+
       {[target], plain} ->
         if name in @wild_names, do: {:wild, name, plain, target}, else: :error
 
@@ -287,8 +304,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp classify({:bin, op, left, right}) do
     case {classify(left), classify(right)} do
       {{:ok, l}, {:ok, r}} -> {:ok, {:bin, op, l, r}}
+      {{:planning, _message} = planning, _right} -> planning
       {{:wild, _n, _a, _t}, _right} -> {:expand_error, @wild_in_arithmetic}
       {_left, {:wild, _n, _a, _t}} -> {:expand_error, @wild_in_arithmetic}
+      {_left, {:planning, _message} = planning} -> planning
       _other -> :error
     end
   end
@@ -296,10 +315,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp classify({kind, _payload} = _leaf) when kind in [:star, :regex, :dur], do: :error
   defp classify(leaf), do: {:ok, leaf}
 
-  # Inside another expression a call with `*` is no column of its own.
+  # Inside another expression a call with `*` is no column of its own; a
+  # planning error found in it is the error of the whole.
   defp classify_inner(ast) do
     case classify(ast) do
       {:ok, classified} -> {:ok, classified}
+      {:planning, _message} = planning -> planning
       _other -> :error
     end
   end
@@ -352,6 +373,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
          {:ok, ns} <- integral_unit(unit) do
       {:ok, {:agg, "integral:" <> Integer.to_string(ns), field}}
     else
+      {:planning, _message} = planning -> planning
       _unread -> :error
     end
   end
@@ -367,24 +389,49 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp classify_call(_call), do: :error
 
-  defp integral_unit([]), do: {:ok, 1_000_000_000}
-  defp integral_unit([{:dur, ns}]) when ns > 0, do: {:ok, ns}
-  defp integral_unit(_other), do: :error
+  @doc """
+  The unit of an `integral()` from its argument list (none: a second): `{:ok,
+  nanoseconds}`, the engine's planning error as `{:planning, message}` for a
+  duration that is not positive, or `:error` for what is no duration.
+  """
+  @spec integral_unit([term()]) :: {:ok, pos_integer()} | {:planning, binary()} | :error
+  def integral_unit([]), do: {:ok, 1_000_000_000}
+  def integral_unit([duration]), do: positive_duration(duration)
+  def integral_unit(_other), do: :error
+
+  # The engine's planning error for a duration argument that is not positive.
+  defp positive_duration({:dur, ns}) when ns > 0, do: {:ok, ns}
+  defp positive_duration({:neg, {:dur, ns}}), do: not_positive(-ns)
+  defp positive_duration({:dur, ns}), do: not_positive(ns)
+  defp positive_duration(_other), do: :error
+
+  defp not_positive(ns) do
+    {:planning,
+     "duration argument must be positive, got " <> InfluxQLLiteral.display_duration(ns)}
+  end
 
   defp function(name, arguments) do
     classified = Enum.map(arguments, &classify_inner/1)
 
-    if Enum.all?(classified, &match?({:ok, _}, &1)),
-      do: {:ok, {:fn, name, for({:ok, ast} <- classified, do: ast)}},
-      else: :error
+    cond do
+      Enum.all?(classified, &match?({:ok, _ast}, &1)) ->
+        {:ok, {:fn, name, for({:ok, ast} <- classified, do: ast)}}
+
+      planning = Enum.find(classified, &match?({:planning, _message}, &1)) ->
+        planning
+
+      true ->
+        :error
+    end
   end
 
   defp transform(name, [argument | options]) do
     with {:ok, inner} <- classify_inner(argument),
-         true <- inner_ok?(inner),
-         {:ok, parameter} <- transform_parameter(name, options) do
+         {:ok, parameter} <- transform_parameter(name, options),
+         true <- inner_ok?(inner) do
       {:ok, {:transform, name, inner, parameter}}
     else
+      {:planning, _message} = planning -> planning
       _unread -> :error
     end
   end
@@ -396,18 +443,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp inner_ok?({:agg, _fun, _field}), do: true
   defp inner_ok?(_other), do: false
 
-  defp transform_parameter("moving_average", [{:lit, {:int, n}}]), do: {:ok, n}
+  defp transform_parameter("moving_average", [{:lit, {:int, n}}]) when n > 1, do: {:ok, n}
+
+  defp transform_parameter("moving_average", [{:lit, {:int, n}}]),
+    do: {:planning, "moving_average window must be greater than 1, got #{n}"}
+
   defp transform_parameter("moving_average", _other), do: :error
   defp transform_parameter("cumulative_sum", []), do: {:ok, nil}
   defp transform_parameter(name, []) when name in @transforms, do: {:ok, nil}
   defp transform_parameter("cumulative_sum", _other), do: :error
   defp transform_parameter("difference", _other), do: :error
   defp transform_parameter("non_negative_difference", _other), do: :error
-  defp transform_parameter(_name, [{:dur, ns}]), do: {:ok, ns}
+  defp transform_parameter(_name, [duration]), do: positive_duration(duration)
   defp transform_parameter(_name, _other), do: :error
 
-  defp number_text(n) when is_integer(n), do: Integer.to_string(n)
-  defp number_text(x) when is_float(x), do: Float.to_string(x)
+  @doc "A number as it is written inside the name of an aggregate (`percentile:99.5`)."
+  @spec number_text(number()) :: binary()
+  def number_text(n) when is_integer(n), do: Integer.to_string(n)
+  def number_text(x) when is_float(x), do: Float.to_string(x)
 
   # ---------------------------------------------------------------------------
   # What an expression is made of
@@ -724,6 +777,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp value({:bin, op, left, right}, env, types),
     do: apply_op(op, value(left, env, types), value(right, env, types))
 
+  defp typed(_type, :nan), do: :nan
   defp typed(:integer, n) when is_integer(n), do: {:int, n}
   defp typed(:unsigned, n) when is_integer(n), do: {:uint, n}
   defp typed(:float, x) when is_number(x), do: {:float, x * 1.0}
@@ -850,8 +904,4 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp float_arith("%", x, y), do: :math.fmod(x, y)
   defp float_arith("/", x, y), do: x / y
   defp float_arith(op, x, y), do: arith(op, x, y)
-
-  @doc "The aggregates a function name may take in an expression."
-  @spec aggregate_function?(binary()) :: boolean()
-  def aggregate_function?(fun), do: fun in @aggregates and InfluxQLAggregate.function?(fun)
 end

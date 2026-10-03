@@ -250,4 +250,22 @@ defmodule InfluxElixir.Client.HTTPTest do
       end
     end
   end
+
+  # Every function that takes options also works without them: each default
+  # reaches the transport, which here refuses the connection.
+  describe "calls without options" do
+    test "write, queries and admin calls send their request with the defaults" do
+      conn = connection(ClosedPort.port(), org: "org")
+
+      for call <- [
+            fn -> HTTP.write(conn, "m v=1i 1") end,
+            fn -> HTTP.query_flux(conn, "from(bucket: \"b\")") end,
+            fn -> HTTP.create_database(conn, "db") end,
+            fn -> HTTP.create_bucket(conn, "b") end,
+            fn -> HTTP.create_token(conn, "t") end
+          ] do
+        assert call.() === @closed
+      end
+    end
+  end
 end

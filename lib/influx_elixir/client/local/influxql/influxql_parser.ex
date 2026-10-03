@@ -39,7 +39,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
   @function ~r/^(?<fn>[A-Za-z_]\w*)\s*\(\s*(?<arg>\*|"[^"]+"|'(?:[^'\\]|\\.)*'|[+-]?[\w.]+)\s*\)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is
   @literal ~r/^(?:'(?:[^'\\]|\\.)*'|[+-]?(?:\d+\.\d+|\.\d+|\d+)|\d+(?:ns|ms|u|µ|s|m|h|d|w)|true|false)(?:\s+AS\s+(?:"[^"]+"|\w+))?$/isu
-  @count_distinct ~r/^count\s*\(\s*distinct\s*\(\s*(?<arg>"[^"]+"|[A-Za-z_][\w.]*)\s*\)\s*\)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is
+  @count_distinct ~r/^count\s*\(\s*distinct(?:\s*\(\s*(?<arg>"[^"]+"|[A-Za-z_][\w.]*)\s*\)|\s+(?<bare>"[^"]+"|[A-Za-z_][\w.]*))\s*\)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is
   @column ~r/^(?<col>"[^"]+"|[\w.]+)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is
 
   @doc """
@@ -108,7 +108,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
          fill: group.fill || :null,
          descending: String.upcase(clauses["dir"]) == "DESC",
          limit: to_int(clauses["limit"]),
-         offset: to_int(clauses["offset"]) || 0
+         offset: to_int(clauses["offset"]) || 0,
+         rewrite_error: Map.get(group, :rewrite_error)
        }}
     end
   end
@@ -292,7 +293,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
       captures = Regex.named_captures(@count_distinct, text) ->
         {:ok,
-         {:aggregate, "count", {:distinct, InfluxQLText.unquote_ident(captures["arg"])},
+         {:aggregate, "count",
+          {:distinct, InfluxQLText.unquote_ident(captures["arg"] <> captures["bare"])},
           InfluxQLText.blank_to_nil(InfluxQLText.unquote_ident(captures["alias"]))}}
 
       captures = Regex.named_captures(@function, text) ->
@@ -427,7 +429,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # double does not read.
   @spec clause_error(binary(), non_neg_integer(), binary()) :: {:error, term()}
   defp clause_error(whole, at, masked_rest) do
-    ~r/\b(?:ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b/i
+    ~r/\b(?:GROUP|ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b/i
     |> Regex.scan(masked_rest, return: :index)
     |> Enum.find_value({:error, :unread_order}, fn [{from, _size}] ->
       case InfluxQLCheck.check_swallowed(whole, at, masked_rest, {from}) do

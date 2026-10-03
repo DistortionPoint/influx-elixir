@@ -18,8 +18,10 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   #   * `:regex` — a `/.../` that follows `=~` or `!~` is masked too, as an
   #     InfluxQL regular expression (default `false`)
   #   * `:lenient` — an unterminated literal is masked to the end of the text
-  #     instead of raising (default `false`; `InfluxElixir.Client.Local.SQLLexer`
+  #     instead of failing (default `false`; `InfluxElixir.Client.Local.SQLLexer`
   #     refuses such a text first, so SQL never reaches one)
+
+  alias InfluxElixir.Client.Local.SQLIdentifiers
 
   @typedoc "How `mask/2` reads quoted text."
   @type option ::
@@ -80,13 +82,6 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   @spec literal(binary(), byte(), config(), iodata(), non_neg_integer()) :: iodata()
   defp literal(<<>>, delimiter, %{lenient: true} = config, acc, blanks),
     do: scan(<<>>, config, [filler(config, blanks), delimiter | acc], "")
-
-  defp literal(<<>>, delimiter, _config, _acc, _blanks),
-    do:
-      raise(
-        ArgumentError,
-        "unterminated #{<<delimiter>>} literal: SQLLexer.scrub/1 must run first"
-      )
 
   defp literal(<<?\\, _byte, rest::binary>>, delimiter, %{backslash: true} = config, acc, blanks),
     do: literal(rest, delimiter, config, acc, blanks + 2)
@@ -156,15 +151,12 @@ defmodule InfluxElixir.Client.Local.SQLMask do
 
   @spec boundary?(iodata()) :: boolean()
   defp boundary?([]), do: true
-  defp boundary?([byte | _acc]) when is_integer(byte), do: not word_byte?(byte)
+  defp boundary?([byte | _acc]) when is_integer(byte), do: not SQLIdentifiers.word_byte?(byte)
   defp boundary?(_other), do: true
 
   @spec word_start?(binary()) :: boolean()
-  defp word_start?(<<byte, _rest::binary>>), do: word_byte?(byte)
+  defp word_start?(<<byte, _rest::binary>>), do: SQLIdentifiers.word_byte?(byte)
   defp word_start?(<<>>), do: false
-
-  @spec word_byte?(byte()) :: boolean()
-  defp word_byte?(byte), do: byte in ?a..?z or byte in ?A..?Z or byte in ?0..?9 or byte == ?_
 
   @doc "The text a `{start, length}` capture covers, or `\"\"` for a group that did not match."
   @spec cut(binary(), {integer(), non_neg_integer()}) :: binary()

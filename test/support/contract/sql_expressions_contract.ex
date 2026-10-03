@@ -8,7 +8,7 @@ defmodule InfluxElixir.Contract.SQLExpressions do
 
       use InfluxElixir.Contract.SQLExpressions, client: InfluxElixir.Client.Local, profile: :v3_core
 
-  The `setup` callback must return `conn`, `database` and `query_delay`, as
+  The `setup` callback must return `conn` and `database`, as
   for the shared contract. Every test writes its own table into the database
   the context gives it.
 

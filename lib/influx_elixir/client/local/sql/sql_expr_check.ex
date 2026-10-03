@@ -30,11 +30,44 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
   @doc "`:ok`, or the error for the operator at the top of `node` (its operands were checked)."
   @spec check(SQLExpr.t(), %{binary() => binary()}, context()) :: :ok | {:error, map()}
-  def check({:cmp, op, left, right}, columns, context) do
-    comparison(op, type(left, columns), type(right, columns), context)
-  end
+  def check({:cmp, op, left, right}, columns, context),
+    do: comparison(op, type(left, columns), type(right, columns), context)
 
-  def check({kind, left, right}, columns, context) when kind in [:and, :or] do
+  def check({kind, left, right}, columns, context) when kind in [:and, :or],
+    do: check_logical(kind, left, right, columns, context)
+
+  def check({:not, inner}, columns, _context), do: boolean_operand(type(inner, columns))
+
+  def check({:is_bool, inner, _value, _negated}, columns, _context),
+    do: boolean_operand(type(inner, columns))
+
+  def check({:is_distinct, left, right, negated}, columns, context),
+    do: check_distinct(left, right, negated, columns, context)
+
+  def check({:like, inner, pattern, _negated, ilike, _regex}, columns, _context),
+    do: check_like(inner, pattern, ilike, columns)
+
+  def check({:in, inner, items, _negated}, columns, _context),
+    do: check_in(inner, items, columns)
+
+  def check({:between, inner, low, high, _negated}, columns, _context),
+    do: check_between(inner, low, high, columns)
+
+  def check({:concat, left, right}, columns, context),
+    do: check_concat(left, right, columns, context)
+
+  def check({:case, operand, whens, otherwise}, columns, _context),
+    do: check_case(operand, whens, otherwise, columns)
+
+  def check({:call, :coalesce, args}, columns, context),
+    do: check_coalesce(args, columns, context)
+
+  def check({:call, :nullif, args}, columns, context), do: check_nullif(args, columns, context)
+  def check(_other, _columns, _context), do: :ok
+
+  @spec check_logical(:and | :or, SQLExpr.t(), SQLExpr.t(), %{binary() => binary()}, context()) ::
+          :ok | {:error, map()}
+  defp check_logical(kind, left, right, columns, context) do
     case {logical_type(left, columns), logical_type(right, columns)} do
       {l, r} when is_binary(l) and is_binary(r) and (l not in @logical or r not in @logical) ->
         planner(
@@ -47,12 +80,9 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     end
   end
 
-  def check({:not, inner}, columns, _context), do: boolean_operand(type(inner, columns))
-
-  def check({:is_bool, inner, _value, _negated}, columns, _context),
-    do: boolean_operand(type(inner, columns))
-
-  def check({:is_distinct, left, right, negated}, columns, context) do
+  @spec check_distinct(SQLExpr.t(), SQLExpr.t(), boolean(), %{binary() => binary()}, context()) ::
+          :ok | {:error, map()}
+  defp check_distinct(left, right, negated, columns, context) do
     operation = if negated, do: "IS NOT DISTINCT FROM", else: "IS DISTINCT FROM"
 
     case {type(left, columns), type(right, columns)} do
@@ -70,7 +100,9 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     end
   end
 
-  def check({:like, inner, pattern, _negated, ilike, _regex}, columns, _context) do
+  @spec check_like(SQLExpr.t(), SQLExpr.t(), boolean(), %{binary() => binary()}) ::
+          :ok | {:error, map()}
+  defp check_like(inner, pattern, ilike, columns) do
     word = if ilike, do: "ILIKE", else: "LIKE"
 
     case {type(inner, columns), type(pattern, columns)} do
@@ -85,7 +117,8 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     end
   end
 
-  def check({:in, inner, items, _negated}, columns, _context) do
+  @spec check_in(SQLExpr.t(), [SQLExpr.t()], %{binary() => binary()}) :: :ok | {:error, map()}
+  defp check_in(inner, items, columns) do
     types = Enum.map(items, &type(&1, columns))
     operand = type(inner, columns)
 
@@ -99,7 +132,9 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     end
   end
 
-  def check({:between, inner, low, high, _negated}, columns, _context) do
+  @spec check_between(SQLExpr.t(), SQLExpr.t(), SQLExpr.t(), %{binary() => binary()}) ::
+          :ok | {:error, map()}
+  defp check_between(inner, low, high, columns) do
     operand = type(inner, columns)
 
     bound =
@@ -110,7 +145,9 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     if bound, do: {:error, SQLError.between_coercion(operand, bound)}, else: :ok
   end
 
-  def check({:concat, left, right}, columns, context) do
+  @spec check_concat(SQLExpr.t(), SQLExpr.t(), %{binary() => binary()}, context()) ::
+          :ok | {:error, map()}
+  defp check_concat(left, right, columns, context) do
     case {type(left, columns), type(right, columns)} do
       {l, r} when is_binary(l) and is_binary(r) ->
         cond do
@@ -135,15 +172,6 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
         :ok
     end
   end
-
-  def check({:case, operand, whens, otherwise}, columns, _context),
-    do: check_case(operand, whens, otherwise, columns)
-
-  def check({:call, :coalesce, args}, columns, context),
-    do: check_coalesce(args, columns, context)
-
-  def check({:call, :nullif, args}, columns, context), do: check_nullif(args, columns, context)
-  def check(_other, _columns, _context), do: :ok
 
   @spec type(SQLExpr.t(), %{binary() => binary()}) :: SQLExprType.type()
   defp type(expr, columns), do: SQLExprType.type_of(expr, columns)
@@ -183,7 +211,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
       left == "Boolean" != (right == "Boolean") ->
         planner(
           "Cannot infer common argument type for comparison operation #{left} " <>
-            "#{symbol(op)} #{right}",
+            "#{SQLExpr.symbol(op)} #{right}",
           context
         )
 
@@ -200,7 +228,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
           {:error, map()}
   defp timestamp_comparison(op, left, right, context) do
     message =
-      "Cannot infer common argument type for comparison operation #{left} #{symbol(op)} #{right}"
+      "Cannot infer common argument type for comparison operation #{left} #{SQLExpr.symbol(op)} #{right}"
 
     cond do
       "UInt64" in [left, right] and "Timestamp(ns)" in [left, right] and left != right ->
@@ -217,14 +245,6 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
          )}
     end
   end
-
-  @spec symbol(SQLExpr.comparison()) :: binary()
-  defp symbol(:eq), do: "="
-  defp symbol(:ne), do: "!="
-  defp symbol(:gt), do: ">"
-  defp symbol(:lt), do: "<"
-  defp symbol(:gte), do: ">="
-  defp symbol(:lte), do: "<="
 
   @spec boolean_operand(SQLExprType.type()) :: :ok | {:error, map()}
   defp boolean_operand(type) when is_binary(type) and type != "Boolean",

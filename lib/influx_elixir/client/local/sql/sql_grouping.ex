@@ -6,16 +6,23 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
   # and then the aggregates in select order, each as the planner prints it.
   # The double refuses by name a query whose terms it cannot print.
 
-  alias InfluxElixir.Client.Local.{SQLAggExpr, SQLError, SQLExpr, SQLParser, SQLWhere}
+  alias InfluxElixir.Client.Local.{
+    SQLAggExpr,
+    SQLError,
+    SQLExpr,
+    SQLParser,
+    SQLSchema,
+    SQLWhere
+  }
 
   @doc """
   `:ok`, or the engine's planning error for a projected plain column of an
   aggregate query that is not in its `GROUP BY`.
   """
-  @spec check(SQLParser.parsed_query()) :: :ok | {:error, term()}
-  def check(%{select_columns: nil}), do: :ok
+  @spec check(SQLParser.parsed_query(), [SQLSchema.relation()]) :: :ok | {:error, term()}
+  def check(%{select_columns: nil}, _relations), do: :ok
 
-  def check(query) do
+  def check(query, relations) do
     items = query.group_by_columns || []
     grouped = for item <- items, is_binary(item), do: item
     expressions = for {:expr, expr} <- items, do: expr
@@ -33,30 +40,36 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
       end)
 
     case ungrouped do
-      nil -> check_having(query, grouped)
+      nil -> check_having(query, grouped, relations)
       {:column, column} -> {:error, ungrouped_error(query, column, "SELECT")}
       {:expression, column} -> {:error, ungrouped_refusal(column)}
     end
   end
 
-  # A column a `HAVING` reads that is neither grouped, an aggregate's nor the
-  # name of a grouped column in the select list (verified against Core: the
-  # alias of an aggregate or an expression is no column of a `HAVING`). The
-  # `NULL` of `HAVING NULL` reads as a comparison of `time` with null, which
-  # reads no column.
-  @spec check_having(SQLParser.parsed_query(), [binary()]) :: :ok | {:error, term()}
-  defp check_having(%{having: nil}, _grouped), do: :ok
+  # A column a `HAVING` reads that is neither grouped nor an aggregate's. A name the table
+  # has is that column; any other is the name of a select item (verified against Core: an
+  # alias of an aggregate or an expression is read as the item, and a column of the table
+  # wins over an alias of that name). The `NULL` of `HAVING NULL` reads as a comparison of
+  # `time` with null, which reads no column.
+  @spec check_having(SQLParser.parsed_query(), [binary()], [SQLSchema.relation()]) ::
+          :ok | {:error, term()}
+  defp check_having(%{having: nil}, _grouped, _relations), do: :ok
 
-  defp check_having(%{having: %{nodes: nodes}} = query, grouped) do
-    outputs = for {:grouping_column, _source, output} <- query.select_columns, do: output
+  defp check_having(%{having: %{nodes: nodes}} = query, grouped, relations) do
+    outputs = for column <- query.select_columns, do: elem(column, tuple_size(column) - 1)
 
     ungrouped =
       Enum.find(SQLWhere.conjunction_columns(nodes), fn name ->
-        not (SQLAggExpr.placeholder?(name) or name in grouped or name in outputs)
+        not (SQLAggExpr.placeholder?(name) or name in grouped or
+               named_item?(name, outputs, relations))
       end)
 
     if ungrouped, do: {:error, ungrouped_error(query, ungrouped, "HAVING")}, else: :ok
   end
+
+  @spec named_item?(binary(), [binary()], [SQLSchema.relation()]) :: boolean()
+  defp named_item?(name, outputs, relations),
+    do: name in outputs and not MapSet.member?(SQLSchema.table_columns(relations), name)
 
   # The first column an expression reads outside an aggregate that is not
   # grouped (an expression the `GROUP BY` also holds is grouped whole).

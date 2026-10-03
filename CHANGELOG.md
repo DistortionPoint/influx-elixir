@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local` raised `ArithmeticError` on InfluxQL transforms** (0.1.41).
+  `derivative(v, 0s)`, `elapsed(v, 0s)` and `moving_average(v, 0)` now give
+  the engine's 400 ("duration argument must be positive", "moving_average
+  window must be greater than 1"), and `moving_average(v, 1)` no longer
+  answers. A float overflow in `cumulative_sum`, `derivative`, `difference`,
+  `moving_average`, `integral`, `median` or `stddev` is a null, and integer
+  `difference`/`moving_average` wrap as the engine does.
+- **`Client.Local` InfluxQL returned no rows where the engine answers**
+  (0.1.41): `count(/re/)`, `count(*::field)`, `mode(*)`, `mode(/re/)`,
+  `elapsed(*)` and `elapsed` of a boolean field. An unknown function in a
+  wildcard is now refused by name instead of answering `[]`.
+- **`Client.Local` accepted InfluxQL the engine rejects** (0.1.41):
+  `host = /re/`, a regex with flags, `percentile(/re/, n)`, `top` of a tag,
+  a bare constant as a `SHOW … WHERE`; and refused a `SHOW TAG VALUES` `OR`
+  on a missing column that 0.1.40 answered.
+- **`Client.Local` SQL gave engine-shaped errors the engine does not give**
+  (0.1.41) for `left()`/`right()`, a `HAVING` on an alias, a keyword alias,
+  `1_000`/`1e`/`0b1`, `count(*`, `5 div 2`, `SELECT … INTO`, `USE`, and
+  `SELECT 1; DELETE FROM`; these now answer or give the engine's own error.
+  `selector_max(n, time) + 1`, `sum(NULL)`, `avg(NULL)` and an aggregate of
+  a mistyped `CASE` give the engine's planning error, and an expression over
+  `MIN(NULL)`/`MAX(NULL)` is refused by name.
+- **Queries against a database with a retention were up to 7× slower**
+  (0.1.41); they now cost about the same as any other database.
+- **`mix test` with an absolute or `./` path ran the whole suite**, and an
+  `--include` of an integration tag without a path ran none of the
+  integration tests.
+
+### Changed
+- The integration one-liners pin `influxdb:3.10.1-core`, the version the
+  exact engine bodies were verified against.
+- Contract case tables report every mismatch; tables that accept a refusal
+  by name pin how many refusals they hold, so a regression to "refused"
+  fails. Line-protocol errors are pinned once, in a contract run on both
+  engines.
+
 ## [0.1.41] - 2026-10-03
 
 ### Added

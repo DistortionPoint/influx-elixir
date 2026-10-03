@@ -305,7 +305,7 @@ defmodule InfluxElixir.Client.Local.SQLBind do
       {:number, type} ->
         {:ok,
          SQLPredicate.deferred_clause(
-           SQLTime.comparison_type_error("Timestamp(ns)", SQLPredicate.symbol(op), type)
+           SQLTime.comparison_type_error("Timestamp(ns)", SQLExpr.symbol(op), type)
          )}
 
       bound ->
@@ -320,7 +320,7 @@ defmodule InfluxElixir.Client.Local.SQLBind do
          SQLPredicate.deferred_clause(
            SQLTime.comparison_type_error(
              type,
-             SQLPredicate.symbol(SQLPredicate.mirror(op)),
+             SQLExpr.symbol(SQLPredicate.mirror(op)),
              "Timestamp(ns)"
            )
          )}

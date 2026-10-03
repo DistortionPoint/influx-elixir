@@ -32,6 +32,8 @@ defmodule InfluxElixir.Client.Local.SQLScalarRefusalsTest do
     test "is refused by name", %{conn: conn} do
       Check.each_case(
         [
+          {"SELECT min(NULL) + 'a' FROM m",
+           "Client.Local: an expression over MIN(NULL) or MAX(NULL)"},
           {"SELECT substr(s) FROM m",
            "Client.Local: substr with one argument: the engine's error quotes the argument's " <>
              "position in the query, which is not modelled"},

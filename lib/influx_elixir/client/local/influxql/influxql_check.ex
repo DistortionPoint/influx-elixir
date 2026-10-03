@@ -153,12 +153,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     end
   end
 
-  # `GROUP` must be followed by `BY`; `GROUP BY` and nothing is unparsed.
+  # `GROUP` must be followed by `BY`; `GROUP` or `GROUP BY` at the very end of
+  # the text is unparsed, with blanks after it the dimension is wanted there.
   @spec check_group_keyword(binary(), non_neg_integer(), binary()) :: {:error, term()}
   defp check_group_keyword(text, start, whole) do
     cond do
-      text =~ ~r/^GROUP\s+BY\s*$/i ->
+      text =~ ~r/^GROUP(?:\s+BY)?$/i ->
         {:error, {:engine, InfluxQLError.syntax_error_body(:nom, start, whole)}}
+
+      text =~ ~r/^GROUP\s+BY\s+$/i ->
+        {:error,
+         {:engine, InfluxQLError.syntax_error_body(:group, start + byte_size(text), whole)}}
 
       text =~ ~r/^GROUP\s+BY(?![\w])/i ->
         {:error, :unread_order}

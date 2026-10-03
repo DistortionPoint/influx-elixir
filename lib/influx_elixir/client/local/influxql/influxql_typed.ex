@@ -335,7 +335,28 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   @spec bare_field(list(), MapSet.t(binary()), map()) :: atom() | nil
   defp bare_field([{:ident, name}], tags, types), do: field_kind(name, tags, types)
+  defp bare_field([{:number, text}], _tags, _types), do: number_kind(text, 1)
+  defp bare_field([{:raw, "-"}, {:number, text}], _tags, _types), do: number_kind(text, -1)
+  defp bare_field([{:str, _content}], _tags, _types), do: :string
   defp bare_field(_tokens, _tags, _types), do: nil
+
+  # The type of a constant that stands alone as a condition.
+  @spec number_kind(binary(), 1 | -1) :: :float | :integer | :unsigned | nil
+  defp number_kind(text, sign) do
+    case Integer.parse(text) do
+      {n, ""} when sign * n >= -9_223_372_036_854_775_808 and n <= 9_223_372_036_854_775_807 ->
+        :integer
+
+      {n, ""} when sign == 1 and n <= 18_446_744_073_709_551_615 ->
+        :unsigned
+
+      {_n, ""} ->
+        nil
+
+      _fraction ->
+        :float
+    end
+  end
 
   @spec strip_parens(list()) :: list()
   defp strip_parens([{:raw, "("} | rest] = tokens) do

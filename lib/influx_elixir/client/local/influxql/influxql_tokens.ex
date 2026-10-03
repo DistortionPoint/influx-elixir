@@ -32,9 +32,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     tokenize(rest, [{:ident, String.replace(name, "\\\"", "\"")} | acc])
   end
 
+  def tokenize(<<?/, _rest::binary>> = text, []), do: {:syntax_error, :where_unparsed, text}
+
   def tokenize(<<?/, rest::binary>>, [{:op, op} | _tokens] = acc) when op in ["=~", "!~"] do
     {pattern, rest} = take_regex(rest, [])
-    tokenize(rest, [{:regex, pattern} | acc])
+
+    if word_start?(rest),
+      do: {:syntax_error, :nom, rest},
+      else: tokenize(rest, [{:regex, pattern} | acc])
   end
 
   def tokenize(<<op::binary-size(2), rest::binary>>, acc)
@@ -106,6 +111,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
       true -> duration_total(after_part, rest, total + count * Durations.ns(unit))
     end
   end
+
+  # A flag after a regular expression (`/re/i`) is left over: the engine has none.
+  @spec word_start?(binary()) :: boolean()
+  defp word_start?(<<c, _more::binary>>), do: c in ?0..?9 or c in ?a..?z or c in ?A..?Z or c == ?_
+  defp word_start?(_ended), do: false
 
   @spec leftover?(binary()) :: boolean()
   defp leftover?(<<c, _more::binary>>),
@@ -224,6 +234,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
         {:syntax_error, :operand, rest}
 
       cannot_start_operand?(trimmed) ->
+        {:syntax_error, :operand, rest}
+
+      op not in ["=~", "!~"] and String.starts_with?(trimmed, "/") ->
         {:syntax_error, :operand, rest}
 
       true ->

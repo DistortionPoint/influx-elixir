@@ -7,7 +7,7 @@ defmodule InfluxElixir.Client.Local.SQLNoFrom do
   # of a column is "No field named n.". The statement is read as one over
   # that row: the table is added to the text, where the first clause stands.
 
-  alias InfluxElixir.Client.Local.{SQLInformation, SQLMask}
+  alias InfluxElixir.Client.Local.{SQLIdentifiers, SQLInformation, SQLMask}
 
   @clauses ~w(WHERE GROUP HAVING ORDER LIMIT OFFSET UNION EXCEPT INTERSECT)
 
@@ -61,7 +61,7 @@ defmodule InfluxElixir.Client.Local.SQLNoFrom do
   defp scan(masked, at, depth, word, clause) do
     <<byte>> = binary_part(masked, at, 1)
 
-    if word_byte?(byte) do
+    if SQLIdentifiers.word_byte?(byte) do
       scan(masked, at + 1, depth, word || at, clause)
     else
       case word_end(masked, word, at, depth, clause) do
@@ -70,9 +70,6 @@ defmodule InfluxElixir.Client.Local.SQLNoFrom do
       end
     end
   end
-
-  @spec word_byte?(byte()) :: boolean()
-  defp word_byte?(byte), do: byte in ?a..?z or byte in ?A..?Z or byte in ?0..?9 or byte == ?_
 
   @spec word_end(binary(), integer() | nil, non_neg_integer(), non_neg_integer(), term()) ::
           {:done, :from} | {:continue, term()}

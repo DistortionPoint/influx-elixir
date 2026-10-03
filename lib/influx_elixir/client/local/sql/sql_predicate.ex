@@ -609,15 +609,6 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   def mirror(:lte), do: :gte
   def mirror(op), do: op
 
-  @doc "The SQL symbol of a comparison operator."
-  @spec symbol(op()) :: binary()
-  def symbol(:eq), do: "="
-  def symbol(:ne), do: "!="
-  def symbol(:gt), do: ">"
-  def symbol(:lt), do: "<"
-  def symbol(:gte), do: ">="
-  def symbol(:lte), do: "<="
-
   # The left side is a column — a quoted one holds any name — or an
   # arithmetic expression over columns (`2 * price > volume`), or a literal
   # (`1 IS NULL`, `'a' IN ('a')`), which holds the same for every row.

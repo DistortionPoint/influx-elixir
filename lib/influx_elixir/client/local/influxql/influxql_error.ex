@@ -104,6 +104,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
       "caused by\nError during planning: " <> message
   end
 
+  @doc """
+  The planning error the engine raises while it finds the offset of a `GROUP BY
+  time()` for a quoted offset that is no timestamp: `quoted` is the literal as
+  written, quotes included.
+  """
+  @spec offset_error(binary()) :: binary()
+  def offset_error(quoted) do
+    "rewriting statement\ncaused by\nfind interval offset\ncaused by\n" <>
+      "Error during planning: invalid expression #{inspect(quoted)}: " <>
+      "#{quoted} is not a valid timestamp"
+  end
+
   @doc "Moves the positions of a parse error body on by `by` bytes."
   @spec shift_position(binary(), non_neg_integer()) :: binary()
   def shift_position(body, by) do

@@ -79,7 +79,9 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     values =
       Map.new(aggs, fn {name, column} -> {name, column_result(column, points, bucket_ts)} end)
 
-    %{base | fields: base.fields |> Map.merge(outputs) |> Map.merge(values)}
+    # A name the table has is its column, not the item of that name.
+    items = Map.drop(outputs, Map.keys(base.tags) ++ Map.keys(base.fields))
+    %{base | fields: base.fields |> Map.merge(items) |> Map.merge(values)}
   end
 
   # A null result is no key.

@@ -12,19 +12,57 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   #     it: `LIMIT` and `OFFSET` decide the rows
   #   * `FROM (t)` is `FROM t`, in any depth of parentheses
   #   * `FROM a, b` is `FROM a CROSS JOIN b`
+  #   * `SELECT ... INTO name` is `SELECT ...`: the engine plans the select and then refuses
+  #     to create the table, which `into?/1` says
+  #   * a word of the grammar after `AS` (`AS having`) is a name: it is written quoted
+
+  alias InfluxElixir.Client.Local.SQLIdentifiers
 
   @typep token :: {:space | :word | :quoted | :backtick | :string | :symbol | :other, binary()}
 
-  @symbols ["<=>", "!~*", "<>", "!=", "<=", ">=", "||", "~*", "!~", "<<", ">>", "::", "->", "=="]
+  @symbols [
+    "<=>",
+    "!~~*",
+    "!~~",
+    "~~*",
+    "~~",
+    "//",
+    "!~*",
+    "<>",
+    "!=",
+    "<=",
+    ">=",
+    "||",
+    "~*",
+    "!~",
+    "<<",
+    ">>",
+    "::",
+    "->",
+    "=="
+  ]
   @from_ends ~w(WHERE GROUP HAVING ORDER LIMIT OFFSET FETCH UNION EXCEPT INTERSECT WINDOW QUALIFY)
   @not_names ~w(SELECT WITH VALUES LATERAL UNNEST TABLE)
+  @structural ~w(SELECT FROM WHERE GROUP HAVING ORDER LIMIT OFFSET FETCH UNION EXCEPT INTERSECT
+    MINUS WINDOW QUALIFY WITH JOIN INNER LEFT RIGHT FULL CROSS NATURAL OUTER ON USING DISTINCT
+    ALL)
+
+  @doc "Whether the statement (a plain `SELECT`, once `SQLSyntax` has read it) has an `INTO`."
+  @spec into?(binary()) :: boolean()
+  def into?(sql) do
+    Regex.match?(~r/\binto\b/i, sql) and
+      sql |> tokens([]) |> without_into() |> elem(1)
+  end
 
   @doc "The statement with the engine's other spellings written as the ones the double reads."
   @spec apply(binary()) :: binary()
   def apply(sql) do
     sql
     |> tokens([])
+    |> without_into()
+    |> elem(0)
     |> Enum.map(&spelled/1)
+    |> keyword_aliases()
     |> select_all()
     |> offset_rows()
     |> fetch()
@@ -45,8 +83,8 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   end
 
   defp tokens(<<q, rest::binary>> = text, acc) when q in [?', ?", ?`] do
-    case closing(rest, q) do
-      {:ok, after_quote} ->
+    case SQLIdentifiers.take_quoted(rest, q) do
+      {:ok, _body, after_quote} ->
         kind = Map.fetch!(%{?' => :string, ?" => :quoted, ?` => :backtick}, q)
         quoted = binary_part(text, 0, byte_size(text) - byte_size(after_quote))
         tokens(after_quote, [{kind, quoted} | acc])
@@ -58,7 +96,7 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
 
   defp tokens(<<c::utf8, _rest::binary>> = text, acc) do
     cond do
-      word_start?(c) ->
+      SQLIdentifiers.word_start?(c) ->
         [word] = Regex.run(~r/\A[\p{L}_][\p{L}\p{N}_$]*/u, text)
         tokens(tail(text, word), [{:word, word} | acc])
 
@@ -72,21 +110,9 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
     end
   end
 
-  # The text after the quote that closes a quoted token, a doubled quote one inside.
-  @spec closing(binary(), byte()) :: {:ok, binary()} | :error
-  defp closing(<<q, q, rest::binary>>, q), do: closing(rest, q)
-  defp closing(<<q, rest::binary>>, q), do: {:ok, rest}
-  defp closing(<<_c::utf8, rest::binary>>, q), do: closing(rest, q)
-  defp closing(<<>>, _q), do: :error
-
   @spec tail(binary(), binary()) :: binary()
   defp tail(text, taken),
     do: binary_part(text, byte_size(taken), byte_size(text) - byte_size(taken))
-
-  @spec word_start?(integer()) :: boolean()
-  defp word_start?(c) when c in ?a..?z or c in ?A..?Z or c == ?_, do: true
-  defp word_start?(c) when c < 128, do: false
-  defp word_start?(c), do: Regex.match?(~r/\A\p{L}\z/u, <<c::utf8>>)
 
   # ---------------------------------------------------------------------------
   # The spellings of a token
@@ -103,6 +129,115 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
     name = text |> binary_part(1, byte_size(text) - 2) |> String.replace("``", "`")
     ~s|"| <> String.replace(name, ~s|"|, ~s|""|) <> ~s|"|
   end
+
+  # ---------------------------------------------------------------------------
+  # INTO
+  # ---------------------------------------------------------------------------
+
+  # The tokens without the `INTO name` of the statement's select list, and whether it had one.
+  @spec without_into([token()]) :: {[token()], boolean()}
+  defp without_into(tokens) do
+    case Enum.split_while(tokens, &(not into_word?(&1))) do
+      {_all, []} ->
+        {tokens, false}
+
+      {before, [_into | after_into]} ->
+        if select_list?(before),
+          do: {before ++ drop_target(after_into), true},
+          else: {tokens, false}
+    end
+  end
+
+  @spec into_word?(token()) :: boolean()
+  defp into_word?({:word, word}), do: String.upcase(word) == "INTO"
+  defp into_word?(_token), do: false
+
+  # Whether the tokens are a select list still open: a `SELECT` as the first token, no `FROM`
+  # outside parentheses yet, and the last token not an `AS`.
+  @spec select_list?([token()]) :: boolean()
+  defp select_list?(tokens) do
+    case Enum.reject(tokens, &space?/1) do
+      [{:word, select} | _rest] = significant ->
+        String.upcase(select) == "SELECT" and open_list?(significant)
+
+      _other ->
+        false
+    end
+  end
+
+  @spec open_list?([token()]) :: boolean()
+  defp open_list?(significant) do
+    {depth, from?} =
+      Enum.reduce(significant, {0, false}, fn
+        {:symbol, "("}, {depth, from?} -> {depth + 1, from?}
+        {:symbol, ")"}, {depth, from?} -> {depth - 1, from?}
+        {:word, word}, {0, _from?} = state -> if from?(word), do: {0, true}, else: state
+        _other, state -> state
+      end)
+
+    depth == 0 and not from? and not as?(List.last(significant))
+  end
+
+  @spec from?(binary()) :: boolean()
+  defp from?(word), do: String.upcase(word) == "FROM"
+
+  @spec as?(token()) :: boolean()
+  defp as?({:word, word}), do: String.upcase(word) == "AS"
+  defp as?(_token), do: false
+
+  # The target's tokens: `[TEMP[ORARY]] [UNLOGGED] [TABLE] name[.name]*`.
+  @spec drop_target([token()]) :: [token()]
+  defp drop_target(tokens) do
+    tokens
+    |> drop_words(["TEMP", "TEMPORARY"])
+    |> drop_words(["UNLOGGED"])
+    |> drop_words(["TABLE"])
+    |> drop_name()
+  end
+
+  @spec drop_words([token()], [binary()]) :: [token()]
+  defp drop_words(tokens, words) do
+    case Enum.drop_while(tokens, &space?/1) do
+      [{:word, word} | rest] = found -> if String.upcase(word) in words, do: rest, else: found
+      other -> other
+    end
+  end
+
+  @spec drop_name([token()]) :: [token()]
+  defp drop_name(tokens) do
+    case Enum.drop_while(tokens, &space?/1) do
+      [{kind, _name}, {:symbol, "."} | rest] when kind in [:word, :quoted, :string] ->
+        drop_name(rest)
+
+      [{kind, _name} | rest] when kind in [:word, :quoted, :string] ->
+        [{:space, " "} | rest]
+
+      other ->
+        other
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # A keyword as an alias
+  # ---------------------------------------------------------------------------
+
+  # The engine takes any word after `AS` as the name (`SELECT host AS having`), which the
+  # clause readers would take for the clause: it is quoted.
+  @spec keyword_aliases([token()]) :: [token()]
+  defp keyword_aliases([{:word, as} = token | rest]) do
+    with "AS" <- String.upcase(as),
+         {blank, [{:word, name} | more]} <- Enum.split_while(rest, &space?/1),
+         upper = String.upcase(name),
+         true <- upper in @structural do
+      [token | blank] ++
+        [{:quoted, ~s|"| <> String.downcase(name) <> ~s|"|} | keyword_aliases(more)]
+    else
+      _plain -> [token | keyword_aliases(rest)]
+    end
+  end
+
+  defp keyword_aliases([token | rest]), do: [token | keyword_aliases(rest)]
+  defp keyword_aliases([]), do: []
 
   # ---------------------------------------------------------------------------
   # SELECT ALL

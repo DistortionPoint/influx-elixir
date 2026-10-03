@@ -26,6 +26,10 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     SQLScalar
   }
 
+  @boolean_nodes [:not, :is_null, :is_bool, :is_distinct]
+  @predicate_nodes [:in, :between, :like]
+  @value_nodes [:concat, :case, :neg]
+
   @typedoc "What an expression evaluates to."
   @type value :: SQLNumber.t() | binary() | boolean() | DateTime.t() | nil
 
@@ -36,40 +40,11 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   def eval({:lit, value}, _point), do: value
   def eval({:uint, value}, _point), do: {:u, value}
   def eval({:cast, inner, type}, point), do: SQLCast.cast(eval(inner, point), type)
+  def eval({:call, _name, _args} = call, point), do: eval_call(call, point)
 
-  def eval({:call, :coalesce, args}, point), do: first_value(args, point)
-
-  def eval({:call, name, args}, point) when name in [:greatest, :least],
-    do: SQLScalar.extreme(name, Enum.map(args, &eval(&1, point)))
-
-  def eval({:call, :nullif, [left, right]}, point) do
-    value = eval(left, point)
-    other = eval(right, point)
-
-    if is_nil(value) or is_nil(other) or not SQLCompare.compare(value, :eq, other),
-      do: value
-  end
-
-  # The optimizer folds a `log` whose base is its argument, of a column, to
-  # `1.0` for every row, a null one too (verified against InfluxDB 3 Core:
-  # `log(x, x)`, `log(n, n)`, `log(x + 1, x + 1)`), once it has put the two in
-  # one form: a product or a quotient by one dropped (`log(x, 1 * x)`) and the
-  # operands of a sum or a product in one order (`log(x + 1, 1 + x)`). It does not
-  # drop a sum of zero (`log(x, x + 0)` is not folded), and a constant is computed.
-  def eval({:call, :log, [base, argument]} = call, point) do
-    {base, argument} = {log_form(base), log_form(argument)}
-
-    cond do
-      constant?(base) -> call_function(call, point)
-      base == argument -> 1.0
-      without_cast(base) == without_cast(argument) -> throw({:query_error, log_cast_refusal()})
-      true -> call_function(call, point)
-    end
-  end
-
-  def eval({:call, _function, _args} = call, point), do: call_function(call, point)
-
-  def eval({:cmp, op, left, right}, point), do: compare(op, eval(left, point), eval(right, point))
+  # The nodes of a row's hot path are matched here; the rest by the kind they belong to.
+  def eval({:cmp, op, left, right}, point),
+    do: compare(op, eval(left, point), eval(right, point))
 
   def eval({:and, left, right}, point) do
     case eval(left, point) do
@@ -85,13 +60,64 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     end
   end
 
-  def eval({:not, inner}, point), do: negate(eval(inner, point))
-  def eval({:is_null, inner, negated}, point), do: is_nil(eval(inner, point)) != negated
+  def eval({:op, op, left, right}, point) do
+    left_value = eval(left, point)
+    right_value = eval(right, point)
 
-  def eval({:is_bool, inner, expected, negated}, point),
+    if SQLNumber.numeric?(left_value) and SQLNumber.numeric?(right_value),
+      do: SQLNumber.arithmetic(op, left_value, right_value)
+  end
+
+  def eval({:case, nil, whens, otherwise}, point) do
+    branch = Enum.find(whens, fn {condition, _result} -> eval(condition, point) == true end)
+    case_result(branch, otherwise, point)
+  end
+
+  def eval(node, point) when elem(node, 0) in @boolean_nodes, do: eval_boolean(node, point)
+  def eval(node, point) when elem(node, 0) in @predicate_nodes, do: eval_predicate(node, point)
+  def eval(node, point) when elem(node, 0) in @value_nodes, do: eval_value(node, point)
+
+  @spec eval_call(SQLExpr.t(), SQLRow.point()) :: value()
+  defp eval_call({:call, :coalesce, args}, point), do: first_value(args, point)
+
+  defp eval_call({:call, name, args}, point) when name in [:greatest, :least],
+    do: SQLScalar.extreme(name, Enum.map(args, &eval(&1, point)))
+
+  defp eval_call({:call, :nullif, [left, right]}, point) do
+    value = eval(left, point)
+    other = eval(right, point)
+
+    if is_nil(value) or is_nil(other) or not SQLCompare.compare(value, :eq, other),
+      do: value
+  end
+
+  # The optimizer folds a `log` whose base is its argument, of a column, to
+  # `1.0` for every row, a null one too (verified against InfluxDB 3 Core:
+  # `log(x, x)`, `log(n, n)`, `log(x + 1, x + 1)`), once it has put the two in
+  # one form: a product or a quotient by one dropped (`log(x, 1 * x)`) and the
+  # operands of a sum or a product in one order (`log(x + 1, 1 + x)`). It does not
+  # drop a sum of zero (`log(x, x + 0)` is not folded), and a constant is computed.
+  defp eval_call({:call, :log, [base, argument]} = call, point) do
+    {base, argument} = {log_form(base), log_form(argument)}
+
+    cond do
+      constant?(base) -> call_function(call, point)
+      base == argument -> 1.0
+      without_cast(base) == without_cast(argument) -> throw({:query_error, log_cast_refusal()})
+      true -> call_function(call, point)
+    end
+  end
+
+  defp eval_call({:call, _function, _args} = call, point), do: call_function(call, point)
+
+  @spec eval_boolean(SQLExpr.t(), SQLRow.point()) :: value()
+  defp eval_boolean({:not, inner}, point), do: SQLCompare.negate(eval(inner, point))
+  defp eval_boolean({:is_null, inner, negated}, point), do: is_nil(eval(inner, point)) != negated
+
+  defp eval_boolean({:is_bool, inner, expected, negated}, point),
     do: eval(inner, point) == expected != negated
 
-  def eval({:is_distinct, left, right, negated}, point) do
+  defp eval_boolean({:is_distinct, left, right, negated}, point) do
     distinct =
       case {eval(left, point), eval(right, point)} do
         {nil, nil} -> false
@@ -103,14 +129,15 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     distinct != negated
   end
 
-  def eval({:in, inner, items, negated}, point) do
+  @spec eval_predicate(SQLExpr.t(), SQLRow.point()) :: value()
+  defp eval_predicate({:in, inner, items, negated}, point) do
     case eval(inner, point) do
       nil -> nil
       value -> value |> member(Enum.map(items, &eval(&1, point))) |> negate_if(negated)
     end
   end
 
-  def eval({:between, inner, low, high, negated}, point) do
+  defp eval_predicate({:between, inner, low, high, negated}, point) do
     case eval(inner, point) do
       nil ->
         nil
@@ -122,7 +149,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     end
   end
 
-  def eval({:like, inner, pattern, negated, ilike, regex}, point) do
+  defp eval_predicate({:like, inner, pattern, negated, ilike, regex}, point) do
     with value when value != nil <- eval(inner, point),
          %Regex{} = regex <- regex || pattern_regex(eval(pattern, point), ilike) do
       value |> like(ilike) |> then(&Regex.match?(regex, &1)) |> negate_if(negated)
@@ -131,19 +158,15 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     end
   end
 
-  def eval({:concat, left, right}, point) do
+  @spec eval_value(SQLExpr.t(), SQLRow.point()) :: value()
+  defp eval_value({:concat, left, right}, point) do
     with value when value != nil <- eval(left, point),
          other when other != nil <- eval(right, point) do
       SQLCompare.text(value) <> SQLCompare.text(other)
     end
   end
 
-  def eval({:case, nil, whens, otherwise}, point) do
-    branch = Enum.find(whens, fn {condition, _result} -> eval(condition, point) == true end)
-    case_result(branch, otherwise, point)
-  end
-
-  def eval({:case, operand, whens, otherwise}, point) do
+  defp eval_value({:case, operand, whens, otherwise}, point) do
     case eval(operand, point) do
       nil ->
         case_result(nil, otherwise, point)
@@ -161,21 +184,13 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     end
   end
 
-  def eval({:neg, inner}, point) do
+  defp eval_value({:neg, inner}, point) do
     case eval(inner, point) do
       nil -> nil
       # The engine cannot negate a timestamp and closes the connection (verified).
       %DateTime{} -> throw({:query_error, SQLError.closed()})
       value -> if SQLNumber.numeric?(value), do: SQLNumber.negate(value, constant?(inner))
     end
-  end
-
-  def eval({:op, op, left, right}, point) do
-    left_value = eval(left, point)
-    right_value = eval(right, point)
-
-    if SQLNumber.numeric?(left_value) and SQLNumber.numeric?(right_value),
-      do: SQLNumber.arithmetic(op, left_value, right_value)
   end
 
   @spec call_function(SQLExpr.t(), SQLRow.point()) :: value()
@@ -221,12 +236,8 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   defp either(false, false), do: false
   defp either(_left, _right), do: nil
 
-  @spec negate(boolean() | nil) :: boolean() | nil
-  defp negate(nil), do: nil
-  defp negate(value), do: not value
-
   @spec negate_if(boolean() | nil, boolean()) :: boolean() | nil
-  defp negate_if(value, true), do: negate(value)
+  defp negate_if(value, true), do: SQLCompare.negate(value)
   defp negate_if(value, false), do: value
 
   # `v IN (...)`: true for a member, unknown when a null stands in the list

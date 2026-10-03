@@ -143,6 +143,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
       {:ok, conn: conn, holder: holder}
     end
 
+    @tag :capture_log
     test "a short :pool_timeout fails at checkout even with a long :timeout", ctx do
       # Finch raises on checkout timeout; the client maps it to a tuple.
       assert {:error, {:connection_error, :pool_timeout}} =

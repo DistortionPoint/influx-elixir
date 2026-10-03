@@ -8,7 +8,7 @@ defmodule InfluxElixir.Contract.Retention do
 
       use InfluxElixir.Contract.Retention, client: InfluxElixir.Client.Local, profile: :v3_core
 
-  The `setup` callback must return `conn`, `database` and `query_delay`, as for
+  The `setup` callback must return `conn` and `database`, as for
   the shared contract. A server holds only a few databases, so a test does not
   create one beside its own: it drops the database it was given and creates it
   again with the retention under test (the module's `on_exit` drops that one).
@@ -46,6 +46,9 @@ defmodule InfluxElixir.Contract.Retention do
     {"0h", "0s"}
   ]
 
+  # `retention:` texts the engine refuses.
+  @refused ["", "1", "h", "1H", "1mo", "-1h", "1.h", "1 hour ago", "0.5", "zz"]
+
   @doc false
   defmacro __using__(opts) do
     client = Keyword.fetch!(opts, :client)
@@ -57,6 +60,7 @@ defmodule InfluxElixir.Contract.Retention do
       schema_tests(client),
       chunk_tests(client),
       zero_tests(client),
+      refusal_tests(client),
       policy_tests(client)
     ]
 
@@ -123,6 +127,10 @@ defmodule InfluxElixir.Contract.Retention do
   @doc false
   @spec durations() :: [{binary(), binary()}]
   def durations, do: @durations
+
+  @doc false
+  @spec refused() :: [binary()]
+  def refused, do: @refused
 
   # ---------------------------------------------------------------------------
   # Tests
@@ -367,19 +375,65 @@ defmodule InfluxElixir.Contract.Retention do
     quote location: :keep do
       describe "retention — zero is a period, not none" do
         test "0, 0h and under a second hide every point before now", ctx do
-          for retention <- ["0", "0h", "100ms"] do
+          InfluxElixir.TestSupport.Check.check_cases(["0", "0h", "100ms"], fn retention ->
             Retention.fresh(unquote(client), ctx, retention)
 
             lines = "m v=1i #{Retention.ago(1)}\nm v=2i #{Retention.ago(-1)}"
 
-            assert {:ok, :written} ===
-                     unquote(client).write(ctx.conn, lines, database: ctx.database)
-
+            written = unquote(client).write(ctx.conn, lines, database: ctx.database)
             ClientContract.settle(ctx)
+            rows = Retention.rows(unquote(client), ctx, "SELECT v FROM m ORDER BY time")
 
-            assert {:ok, [%{"v" => 2}]} ===
-                     Retention.rows(unquote(client), ctx, "SELECT v FROM m ORDER BY time")
+            if {written, rows} === {{:ok, :written}, {:ok, [%{"v" => 2}]}},
+              do: :ok,
+              else: {:mismatch, %{written: written, rows: rows}}
+          end)
+        end
+      end
+    end
+  end
+
+  defp refusal_tests(client) do
+    quote location: :keep do
+      describe "retention — create_database" do
+        test "a retention the engine refuses is a 400 and creates nothing", ctx do
+          :ok = unquote(client).delete_database(ctx.conn, ctx.database)
+
+          InfluxElixir.TestSupport.Check.check_cases(Retention.refused(), fn text ->
+            case unquote(client).create_database(ctx.conn, ctx.database, retention: text) do
+              {:error, %{status: 400}} ->
+                :ok
+
+              other ->
+                _dropped = unquote(client).delete_database(ctx.conn, ctx.database)
+                {:mismatch, other}
+            end
+          end)
+
+          assert {:ok, names} = unquote(client).list_databases(ctx.conn)
+          assert Enum.filter(names, &(&1["name"] === ctx.database)) === []
+
+          # The module's `on_exit` drops the database it was given.
+          :ok = unquote(client).create_database(ctx.conn, ctx.database)
+        end
+
+        test "an expired point that is rewritten stays hidden and a live one is merged", ctx do
+          Retention.fresh(unquote(client), ctx, "1h")
+          now = Retention.now_ns()
+
+          for line <- [
+                "m v=1i #{Retention.ago(3)}",
+                "m,host=a v=2i #{now}",
+                "m,host=a w=3i #{now}"
+              ] do
+            assert {:ok, :written} ===
+                     unquote(client).write(ctx.conn, line, database: ctx.database)
           end
+
+          ClientContract.settle(ctx)
+
+          assert {:ok, [%{"v" => 2, "w" => 3}]} ===
+                   Retention.rows(unquote(client), ctx, "SELECT v, w FROM m")
         end
       end
     end

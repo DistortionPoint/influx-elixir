@@ -6,18 +6,14 @@ defmodule InfluxElixir.ClientContract.Helpers do
   """
 
   @doc """
-  Waits for a write to become visible to queries on the client under test.
-
-  `Client.Local` is synchronous, so its contexts set `query_delay: 0` and this
-  returns immediately. Real servers ingest asynchronously and their contexts
-  set a delay in milliseconds. Kept in one place so the wait strategy can be
-  changed without touching every test.
+  Where a test waits for a write to become visible to queries on the client
+  under test. It waits for nothing: `Client.Local` is synchronous, and InfluxDB 3
+  Core and 2.7 answer a query with every write they acknowledged before it. Kept
+  in one place so that a wait strategy, were one ever needed for a server that
+  ingests asynchronously (Enterprise is unverified), changes without touching
+  every test.
   """
   @spec settle(map()) :: :ok
-  def settle(%{query_delay: delay}) when is_integer(delay) and delay > 0 do
-    Process.sleep(delay)
-  end
-
   def settle(_ctx), do: :ok
 
   @doc """

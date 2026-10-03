@@ -14,6 +14,10 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
   #     smallest `Int64` given with a count, close the connection (without a
   #     count that start is just the whole text)
   #   * `starts_with(s, prefix)`
+  #   * `left(s, n)`, `right(s, n)` — the first or last `n` characters of the text (a number
+  #     or a boolean as it is cast to text); a negative `n` is all but the last (`left`) or
+  #     first (`right`) `|n|`, and the smallest `Int64` is the whole text for `left` and
+  #     nothing for `right`; `Utf8`
   #   * `sqrt(x)`, `ln(x)`, `log(x)` (base 10), `log(base, x)` — `Float64`; the
   #     domain's errors are the specials (`sqrt(-1)`, `ln(0)` are a `null` that
   #     is there). `log(b, x)` is `ln(x) / ln(b)`, as the engine computes it
@@ -36,6 +40,8 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
     "substr" => :substr,
     "substring" => :substr,
     "starts_with" => :starts_with,
+    "left" => :left,
+    "right" => :right,
     "sqrt" => :sqrt,
     "ln" => :ln,
     "log" => :log,
@@ -52,6 +58,8 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
           | :length
           | :substr
           | :starts_with
+          | :left
+          | :right
           | :sqrt
           | :ln
           | :log
@@ -70,7 +78,7 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
 
   @doc "The Arrow type of a call, given the types of its arguments (`nil` when not known)."
   @spec type_of(name(), [binary() | nil]) :: binary() | nil
-  def type_of(name, _types) when name in [:lower, :upper], do: "Utf8"
+  def type_of(name, _types) when name in [:lower, :upper, :left, :right], do: "Utf8"
   def type_of(:substr, _types), do: "Utf8View"
   def type_of(:length, _types), do: "Int32"
   def type_of(:starts_with, _types), do: "Boolean"
@@ -95,6 +103,8 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
   def compute(:substr, [text, from]), do: substring(text, from, nil)
   def compute(:substr, [text, from, count]), do: substring(text, from, count)
   def compute(:starts_with, [text, prefix]), do: String.starts_with?(text, prefix)
+  def compute(:left, [value, count]), do: value |> SQLCompare.text() |> leading(integer(count))
+  def compute(:right, [value, count]), do: value |> SQLCompare.text() |> trailing(integer(count))
   def compute(:sqrt, [x]), do: x |> SQLNumber.to_float() |> square_root()
   def compute(:ln, [x]), do: x |> SQLNumber.to_float() |> natural_log()
   def compute(:log, [x]), do: compute(:log, [10, x])
@@ -156,6 +166,22 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
 
   defp take(characters, :infinity, _first), do: characters
   defp take(characters, last, first), do: Enum.take(characters, last - first + 1)
+
+  # `left`: the first `count` characters, all but the last `|count|` for a negative one. The
+  # smallest `Int64` has no magnitude on the engine and takes the whole text.
+  @spec leading(binary(), integer()) :: binary()
+  defp leading(text, count) when count >= 0, do: String.slice(text, 0, count)
+  defp leading(text, SQLLimits.int64_min()), do: text
+
+  defp leading(text, count),
+    do: String.slice(text, 0, max(String.length(text) + count, 0))
+
+  # `right`: the last `count` characters, all but the first `|count|` for a negative one.
+  @spec trailing(binary(), integer()) :: binary()
+  defp trailing(text, count) when count >= 0,
+    do: String.slice(text, max(String.length(text) - count, 0), count)
+
+  defp trailing(text, count), do: String.slice(text, -count, String.length(text))
 
   @spec integer(term()) :: integer()
   defp integer({:int, _bits, value}), do: value

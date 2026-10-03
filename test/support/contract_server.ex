@@ -13,11 +13,11 @@ defmodule InfluxElixir.ContractServer do
     * for the v3 profiles a database created for every test and deleted after
       it, so that no two tests share data; for `:v2` the connection's bucket.
 
-  The context holds `conn`, `database`, `query_delay: 0` (InfluxDB 3 Core and
-  2.7 answer a query with every write they acknowledged before it; 200
-  write-then-read pairs on each found none missing; verified on Core and 2.7,
-  not on Enterprise) and `time_slack: 60`
-  (how far, in seconds, the server's clock may be from this one).
+  The context holds `conn`, `database` and `time_slack: 60` (how far, in seconds,
+  the server's clock may be from this one). No test waits between a write and a
+  read: InfluxDB 3 Core and 2.7 answer a query with every write they
+  acknowledged before it (200 write-then-read pairs on each found none missing;
+  verified on Core and 2.7, not on Enterprise).
 
   Option: `:profile` (required).
 
@@ -80,7 +80,7 @@ defmodule InfluxElixir.ContractServer do
 
   # `:v2` shares the connection's bucket; the v3 profiles create a database per test.
   defp database(:v2, base_conn) do
-    {:ok, conn: base_conn, database: base_conn[:database], query_delay: 0, time_slack: 60}
+    {:ok, conn: base_conn, database: base_conn[:database], time_slack: 60}
   end
 
   defp database(profile, base_conn) do
@@ -89,7 +89,7 @@ defmodule InfluxElixir.ContractServer do
     case HTTP.create_database(base_conn, db) do
       :ok ->
         ExUnit.Callbacks.on_exit(fn -> delete_database(base_conn, db) end)
-        {:ok, conn: base_conn, database: db, query_delay: 0, time_slack: 60}
+        {:ok, conn: base_conn, database: db, time_slack: 60}
 
       {:error, reason} ->
         ExUnit.Assertions.flunk("Failed to create test database: #{inspect(reason)}")

@@ -20,16 +20,11 @@ defmodule InfluxElixir.MixProject do
       test_coverage: [
         threshold: 90,
         ignore_modules: [
-          # Requires a live InfluxDB instance (integration-only)
-          InfluxElixir.Client.HTTP,
           # Auto-generated gRPC stub (no logic to test)
           InfluxElixir.Flight.Proto.FlightService.Stub,
-          # Requires a live gRPC server (integration-only)
-          InfluxElixir.Flight.Client,
           # Test support modules (not library code)
           InfluxElixir.InfluxCase,
           InfluxElixir.IntegrationHelper,
-          InfluxElixir.TestHelper,
           # The contracts and their helpers live in test/support
           ~r/^InfluxElixir\.(Contract|ClientContract|TestSupport|TestServer|TokenContract)/
         ]
@@ -95,31 +90,51 @@ defmodule InfluxElixir.MixProject do
     ]
   end
 
-  # The 65 integration modules cost about 23 s of CPU to compile and every one of
+  # The 71 integration modules cost about 23 s of CPU to compile and every one of
   # them is excluded by tag unless `--include integration` is given. A bare
   # `mix test` therefore runs only the test directories that are not
-  # `test/integration`. The integration suites are compiled when a path under
-  # `test/integration` is named, or when INTEGRATION=1 is set:
+  # `test/integration`. The integration suites are compiled when a path is
+  # named, an integration tag is included, or INTEGRATION=1 is set:
   #
   #     mix test test/integration/contract_v3_core --include integration --include v3_core
-  #     INTEGRATION=1 mix test --include integration --include v3_core
+  #     mix test --include integration --include v3_core
   @non_unit_test_entries ~w(integration support fixtures test_helper.exs)
 
   defp run_tests(args) do
     Mix.Task.run("test", test_args(args, System.get_env("INTEGRATION")))
   end
 
+  # The unit paths are prepended only when nothing else says which tests to
+  # run: no path (relative, `./` or absolute), no `--failed` or `--stale`
+  # (Mix's own manifests choose those), and no `--include`/`--only` of an
+  # integration tag (asking for a tier means compiling it).
+  @integration_tags ~w(integration v2 v3_core v3_core_auth v3_enterprise)
+  @manifest_flags ~w(--failed --stale)
+
   defp test_args(args, integration) do
-    if integration in [nil, "", "0"] and not Enum.any?(args, &test_path?/1) do
+    if integration in [nil, "", "0"] and not explicit_selection?(args) do
       unit_test_paths() ++ args
     else
       args
     end
   end
 
+  defp explicit_selection?(args) do
+    Enum.any?(args, &(&1 in @manifest_flags or test_path?(&1))) or
+      integration_tag_requested?(args)
+  end
+
+  defp integration_tag_requested?([flag, tag | rest]) when flag in ["--include", "--only"] do
+    hd(String.split(tag, ":")) in @integration_tags or integration_tag_requested?(rest)
+  end
+
+  defp integration_tag_requested?([_arg | rest]), do: integration_tag_requested?(rest)
+  defp integration_tag_requested?([]), do: false
+
   defp test_path?(arg) do
     [path | _line_filters] = String.split(arg, ":")
-    String.starts_with?(path, "test") and File.exists?(path)
+    relative = Path.relative_to_cwd(Path.expand(path))
+    String.starts_with?(relative, "test") and File.exists?(relative)
   end
 
   defp unit_test_paths do
@@ -178,7 +193,6 @@ defmodule InfluxElixir.MixProject do
         "Public API": [InfluxElixir, InfluxElixir.Config, InfluxElixir.StreamError],
         Clients: [
           InfluxElixir.Client,
-          InfluxElixir.Client.HTTP,
           InfluxElixir.Client.Local,
           InfluxElixir.Client.QueryParams
         ],
@@ -209,7 +223,6 @@ defmodule InfluxElixir.MixProject do
           InfluxElixir.TestHelper
         ],
         "Arrow Flight": [
-          InfluxElixir.Flight.Client,
           InfluxElixir.Flight.Reader,
           InfluxElixir.Flight.FlatBuffer
         ]

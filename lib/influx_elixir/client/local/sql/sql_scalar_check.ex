@@ -27,6 +27,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
     "log(Coercion(TypeSignatureClass::Float, implicit_coercion=ImplicitCoercion([Numeric], default_type=Float64), Coercion(TypeSignatureClass::Float, implicit_coercion=ImplicitCoercion([Numeric], default_type=Float64))"
   ]
   @numbers ["Int64", "Int32", "Int16", "Int8", "UInt64", "Float64"]
+  @integer_arguments ["Int64", "Int32", "Int16", "Int8"]
   @integers ["Int64", "Int32", "Int16", "Int8", "UInt64"]
   @text_types ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"]
   @shown_types ["Int64", "Float64", "Boolean", "Utf8", "Dictionary(Int32, Utf8)"]
@@ -72,6 +73,11 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
       {:planning, "'character_length' does not support zero arguments", "character_length",
        length_candidate()}
 
+  defp problem(name, []) when name in [:left, :right],
+    do:
+      {:planning, "'#{name}' does not support zero arguments", Atom.to_string(name),
+       slice_candidates(name)}
+
   defp problem(name, []) when name in [:sqrt, :ln],
     do:
       {:planning, "'#{name}' does not support zero arguments", Atom.to_string(name),
@@ -102,15 +108,35 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
 
   @spec arity_ok?(atom(), non_neg_integer()) :: boolean()
   defp arity_ok?(name, count) when name in [:lower, :upper, :length, :sqrt, :ln], do: count == 1
-  defp arity_ok?(name, count) when name in [:starts_with, :pow, :power], do: count == 2
+
+  defp arity_ok?(name, count) when name in [:starts_with, :pow, :power, :left, :right],
+    do: count == 2
+
   defp arity_ok?(:log, count), do: count in [1, 2]
   defp arity_ok?(_name, _count), do: true
 
-  @spec typed_problem(atom(), [binary()]) ::
-          :ok
-          | {:refuse, binary()}
-          | {:planning | :internal | :execution, binary(), binary(), binary()}
-  defp typed_problem(name, types) when name in [:lower, :upper] do
+  @typep problem ::
+           :ok
+           | {:refuse, binary()}
+           | {:planning | :internal | :execution, binary(), binary(), binary()}
+
+  @spec typed_problem(atom(), [binary()]) :: problem()
+  defp typed_problem(name, types) when name in [:lower, :upper, :starts_with, :left, :right],
+    do: text_problem(name, types)
+
+  defp typed_problem(:length, types), do: length_problem(types)
+
+  defp typed_problem(name, types) when name in [:sqrt, :ln, :pow, :power, :log],
+    do: math_problem(name, types)
+
+  defp typed_problem(name, types) when name in [:greatest, :least] do
+    if SQLCommonType.common(types, :coalesce) == :mixed,
+      do: {:refuse, "#{name} of arguments with no common type the double models"},
+      else: :ok
+  end
+
+  @spec text_problem(atom(), [binary()]) :: problem()
+  defp text_problem(name, types) when name in [:lower, :upper] do
     if length(types) != 1 do
       {:planning, "Function '#{name}' expects 1 arguments but received #{length(types)}",
        Atom.to_string(name), text_candidate(name)}
@@ -119,7 +145,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
     end
   end
 
-  defp typed_problem(:starts_with, types) do
+  defp text_problem(:starts_with, types) do
     if length(types) == 2,
       do: text_arguments(:starts_with, types),
       else:
@@ -127,22 +153,42 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
          "starts_with", text_candidate(:starts_with)}
   end
 
-  defp typed_problem(:length, ["Timestamp(ns)"]),
+  # `left` and `right` take anything cast to text and an integer of 64 bits or fewer.
+  defp text_problem(name, [first, count]) when name in [:left, :right] do
+    cond do
+      first == "Timestamp(ns)" ->
+        {:refuse,
+         "#{name} of a timestamp: the engine writes its nanoseconds as text, which the " <>
+           "double keeps only to the microsecond"}
+
+      count in @integer_arguments ->
+        :ok
+
+      true ->
+        slice_failure(name, [first, count])
+    end
+  end
+
+  defp text_problem(name, types) when name in [:left, :right], do: slice_failure(name, types)
+
+  @spec length_problem([binary()]) :: problem()
+  defp length_problem(["Timestamp(ns)"]),
     do:
       {:refuse,
        "length of a timestamp: the engine writes its nanoseconds as text, which the double " <>
          "keeps only to the microsecond"}
 
-  defp typed_problem(:length, types) when length(types) == 1, do: :ok
+  defp length_problem(types) when length(types) == 1, do: :ok
 
-  defp typed_problem(:length, types) do
+  defp length_problem(types) do
     {:planning,
      "Failed to coerce arguments to satisfy a call to 'character_length' function: coercion " <>
        "from #{Enum.join(types, ", ")} to the signature Uniform(1, [Utf8, LargeUtf8, Utf8View]) " <>
        "failed", "character_length", length_candidate()}
   end
 
-  defp typed_problem(name, types) when name in [:sqrt, :ln] do
+  @spec math_problem(atom(), [binary()]) :: problem()
+  defp math_problem(name, types) when name in [:sqrt, :ln] do
     if length(types) == 1 and hd(types) in @numbers do
       :ok
     else
@@ -153,7 +199,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
     end
   end
 
-  defp typed_problem(name, types) when name in [:pow, :power] do
+  defp math_problem(name, types) when name in [:pow, :power] do
     cond do
       "UInt64" in types or Enum.any?(types, &(&1 in ["Int32", "Int16", "Int8"])) ->
         {:refuse,
@@ -170,16 +216,10 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
     end
   end
 
-  defp typed_problem(:log, types) do
+  defp math_problem(:log, types) do
     if length(types) in [1, 2] and Enum.all?(types, &(&1 in ["Int64", "Float64"])),
       do: :ok,
       else: {:refuse, "log of those arguments: the engine's error for them is not modelled"}
-  end
-
-  defp typed_problem(name, types) when name in [:greatest, :least] do
-    if SQLCommonType.common(types, :coalesce) == :mixed,
-      do: {:refuse, "#{name} of arguments with no common type the double models"},
-      else: :ok
   end
 
   # An argument of a type that is not text, for a function of text.
@@ -193,7 +233,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
       type when type in @shown_types ->
         {:internal,
          "Expect TypeSignatureClass::Native(LogicalType(Native(String), String)) but received " <>
-           "NativeType::#{SQLCommonType.native(type)}, DataType: #{type}.", Atom.to_string(name),
+           "NativeType::#{SQLFunctions.native(type)}, DataType: #{type}.", Atom.to_string(name),
          text_candidate(name)}
 
       type ->
@@ -271,6 +311,19 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
      "Function 'substr' user-defined coercion failed with \"Error during planning: #{message}\"",
      "substr", @substr_candidate}
   end
+
+  @spec slice_failure(atom(), [binary()]) :: {:planning, binary(), binary(), binary()}
+  defp slice_failure(name, types) do
+    {:planning,
+     "Failed to coerce arguments to satisfy a call to '#{name}' function: coercion from " <>
+       "#{Enum.join(types, ", ")} to the signature OneOf([Exact([Utf8View, Int64]), " <>
+       "Exact([Utf8, Int64]), Exact([LargeUtf8, Int64])]) failed", Atom.to_string(name),
+     slice_candidates(name)}
+  end
+
+  @spec slice_candidates(atom()) :: binary()
+  defp slice_candidates(name),
+    do: Enum.map_join(["Utf8View", "Utf8", "LargeUtf8"], "\n\t", &"#{name}(#{&1}, Int64)")
 
   @spec text_candidate(atom()) :: binary()
   defp text_candidate(:starts_with), do: "starts_with(#{@text}, #{@text})"

@@ -17,7 +17,8 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
       time_filter_tests(client),
       cte_tests(client),
       where_tests(client),
-      cast_tests(client)
+      cast_tests(client),
+      cast_spelling_tests(client)
     ]
   end
 
@@ -981,20 +982,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
     quote location: :keep do
       describe "query_sql/3 — CAST and ORDER BY contract" do
         setup ctx do
-          lp =
-            Enum.join(
-              [
-                "contract_cast,symbol=X,level=5 price=2.7,qty=1i 1700000000000000000",
-                "contract_cast,symbol=X,level=20 price=3.2,qty=2i 1700000001000000000",
-                "contract_cast,symbol=X,level=100 price=9.9,qty=3i 1700000002000000000",
-                "contract_cast,symbol=Y,level=20 price=1.1,qty=9i 1700000003000000000",
-                "contract_cast_bad,level=abc price=1.0 1700000000000000000"
-              ],
-              "\n"
-            )
-
-          {:ok, :written} = unquote(client).write(ctx.conn, lp, database: ctx.database)
-          InfluxElixir.ClientContract.settle(ctx)
+          InfluxElixir.ClientContract.SqlQuery.write_cast_fixture(unquote(client), ctx)
           :ok
         end
 
@@ -1053,8 +1041,142 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                      "SELECT level FROM contract_cast_bad WHERE CAST(level AS INTEGER) <= 20",
                      database: ctx.database
                    )
+
+          assert {:error, {:connection_error, %Mint.TransportError{reason: :closed}}} ===
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT CAST(time AS INTEGER) AS t FROM contract_cast LIMIT 1",
+                     database: ctx.database
+                   )
         end
       end
     end
+  end
+
+  defp cast_spelling_tests(client) do
+    quote location: :keep do
+      describe "query_sql/3 — CAST spellings and ORDER BY terms contract" do
+        setup ctx do
+          InfluxElixir.ClientContract.SqlQuery.write_cast_fixture(unquote(client), ctx)
+          :ok
+        end
+
+        test "CAST spellings and targets, in WHERE, as parameters and uncast", ctx do
+          for sql <- [
+                "CAST(level AS INTEGER) <= 20",
+                "CAST(level AS BIGINT) <= 20",
+                "CAST(level AS INT) <= 20",
+                "level::INTEGER <= 20",
+                "CAST(level AS DOUBLE) <= 20.5",
+                "CAST(level AS INTEGER) * 2 <= 40",
+                "CAST(level AS INTEGER) BETWEEN 5 AND 20"
+              ] do
+            assert {sql,
+                    InfluxElixir.ClientContract.column(
+                      unquote(client),
+                      ctx,
+                      "level",
+                      "SELECT level FROM contract_cast WHERE #{sql} AND symbol = 'X' ORDER BY time"
+                    )} === {sql, ["5", "20"]}
+          end
+
+          for {where, expected} <- [
+                {"CAST(qty AS VARCHAR) = '2'", ["20"]},
+                {"CAST(qty AS VARCHAR) LIKE '2%'", ["20"]},
+                # The uncast comparison is the lexical one: "100" sorts before "20".
+                {"level <= '20'", ["20", "100", "20"]}
+              ] do
+            assert {where,
+                    InfluxElixir.ClientContract.column(
+                      unquote(client),
+                      ctx,
+                      "level",
+                      "SELECT level FROM contract_cast WHERE #{where} ORDER BY time"
+                    )} === {where, expected}
+          end
+
+          assert {:ok, [%{"level" => "20"}, %{"level" => "5"}]} ===
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT level FROM contract_cast WHERE time >= $start AND symbol = $symbol " <>
+                       "AND CAST(level AS INTEGER) <= $depth ORDER BY time DESC LIMIT $row_limit",
+                     database: ctx.database,
+                     params: %{
+                       start: ~U[2023-01-01 00:00:00Z],
+                       symbol: "X",
+                       depth: 20,
+                       row_limit: 10
+                     }
+                   )
+        end
+
+        test "CAST in a projection, an aggregate and arithmetic", ctx do
+          for {sql, expected} <- [
+                {"SELECT CAST(level AS INTEGER) AS r FROM contract_cast ORDER BY r",
+                 [5, 20, 20, 100]},
+                {"SELECT MAX(CAST(level AS INTEGER)) AS r FROM contract_cast", [100]},
+                # A float truncates to an integer; an integer widens to a double.
+                {"SELECT CAST(price AS INTEGER) AS r FROM contract_cast ORDER BY r",
+                 [1, 2, 3, 9]},
+                {"SELECT CAST(qty AS DOUBLE) AS r FROM contract_cast ORDER BY r",
+                 [1.0, 2.0, 3.0, 9.0]},
+                {"SELECT CAST(level AS INTEGER) + qty AS r FROM contract_cast ORDER BY r",
+                 [6, 22, 29, 103]},
+                # A whole-string float is a DOUBLE, not an INTEGER.
+                {"SELECT CAST(level AS DOUBLE) AS r FROM contract_cast_bad WHERE level = '2.5'",
+                 [2.5]}
+              ] do
+            assert {sql, InfluxElixir.ClientContract.column(unquote(client), ctx, "r", sql)} ===
+                     {sql, expected}
+          end
+        end
+
+        test "ORDER BY several terms, each with its own direction", ctx do
+          {:ok, rows} =
+            unquote(client).query_sql(
+              ctx.conn,
+              "SELECT symbol, level FROM contract_cast ORDER BY level, symbol DESC",
+              database: ctx.database
+            )
+
+          assert Enum.map(rows, &{&1["symbol"], &1["level"]}) === [
+                   {"X", "100"},
+                   {"Y", "20"},
+                   {"X", "20"},
+                   {"X", "5"}
+                 ]
+
+          assert {:ok, [%{"m" => 9.9, "symbol" => "X"}, %{"m" => 1.1, "symbol" => "Y"}]} ===
+                   unquote(client).query_sql(
+                     ctx.conn,
+                     "SELECT symbol, MAX(price) AS m FROM contract_cast " <>
+                       "GROUP BY symbol ORDER BY m DESC, symbol",
+                     database: ctx.database
+                   )
+        end
+      end
+    end
+  end
+
+  @doc false
+  # The tables the CAST tests read.
+  @spec write_cast_fixture(module(), map()) :: :ok
+  def write_cast_fixture(client, ctx) do
+    lp =
+      Enum.join(
+        [
+          "contract_cast,symbol=X,level=5 price=2.7,qty=1i 1700000000000000000",
+          "contract_cast,symbol=X,level=20 price=3.2,qty=2i 1700000001000000000",
+          "contract_cast,symbol=X,level=100 price=9.9,qty=3i 1700000002000000000",
+          "contract_cast,symbol=Y,level=20 price=1.1,qty=9i 1700000003000000000",
+          "contract_cast_bad,level=abc price=1.0 1700000000000000000",
+          "contract_cast_bad,level=2.5 price=1.0 1700000001000000000"
+        ],
+        "\n"
+      )
+
+    {:ok, :written} = client.write(ctx.conn, lp, database: ctx.database)
+    InfluxElixir.ClientContract.settle(ctx)
+    :ok
   end
 end

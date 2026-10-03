@@ -21,71 +21,54 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # without a verdict and leaves the text to the rest of the double, which
   # answers it or refuses it by name.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLLexer, SQLStatement}
+  alias InfluxElixir.Client.Local.{SQLError, SQLStatement, SQLTokenizer}
 
   @top {__MODULE__, :top}
   @refusal {__MODULE__, :refusal}
+  @planner {__MODULE__, :planner}
+  @into {__MODULE__, :into}
+  @depth {__MODULE__, :depth}
+  @set_operation {__MODULE__, :set_operation}
 
-  @typep token :: {atom(), binary(), binary(), pos_integer(), pos_integer()}
-  @typep tokens :: [token()]
+  @typep token :: SQLTokenizer.token()
+  @typep tokens :: SQLTokenizer.tokens()
 
-  # Words that are not taken as the alias of a select item or a table.
-  @alias_reserved ~w(FROM INTO WITH EXPLAIN ANALYZE SELECT WHERE GROUP SORT HAVING ORDER PIVOT
+  # Words that are not taken as the alias of a select item, nor begin one (`LEFT`, `RIGHT`,
+  # `ON` and `FORMAT` are names there; the join words only follow a table).
+  @column_reserved ~w(FROM INTO WITH EXPLAIN ANALYZE SELECT WHERE GROUP SORT HAVING ORDER TOP
+    LATERAL VIEW LIMIT OFFSET FETCH UNION EXCEPT INTERSECT MINUS CLUSTER DISTRIBUTE RETURNING
+    END)
+
+  # Words that are not taken as the alias of a table.
+  @table_reserved ~w(FROM WITH EXPLAIN ANALYZE SELECT WHERE GROUP SORT HAVING ORDER PIVOT
     UNPIVOT TOP LATERAL VIEW LIMIT OFFSET FETCH UNION EXCEPT INTERSECT MINUS ON JOIN INNER CROSS
-    FULL LEFT RIGHT NATURAL USING CLUSTER DISTRIBUTE GLOBAL ANTI SEMI RETURNING ASOF OUTER SET
+    FULL LEFT RIGHT NATURAL USING CLUSTER DISTRIBUTE ANTI SEMI RETURNING ASOF OUTER SET
     QUALIFY WINDOW END FOR PARTITION PREWHERE SETTINGS FORMAT START CONNECT)
+
+  # Words with a clause of their own after a query, whose errors this grammar does not read.
+  @own_syntax ~w(PIVOT UNPIVOT JOIN INNER CROSS FULL LEFT RIGHT NATURAL ANTI SEMI ASOF OUTER
+    QUALIFY WINDOW FOR PARTITION PREWHERE SETTINGS FORMAT START CONNECT)
 
   # Words with a syntax of their own that this grammar does not read, and
   # words read as a call whose arguments have one.
   @opaque_words ~w(EXISTS ARRAY STRUCT MAP CONVERT MATCH PRIOR LISTAGG)
   @special_calls ~w(TRY_CAST SAFE_CAST EXTRACT CEIL FLOOR POSITION SUBSTRING SUBSTR OVERLAY TRIM)
-  @typed_literals ~w(DATE TIME TIMESTAMP DATETIME)
+  @typed_literals ~w(DATE TIME TIMESTAMP TIMESTAMPTZ DATETIME)
+  @niladic ~w(CURRENT_TIME CURRENT_DATE CURRENT_TIMESTAMP)
   @after_call_bail ~w(FILTER OVER WITHIN IGNORE RESPECT)
+  @own_words ~w(SELECT ALL DISTINCT TRUE FALSE NULL AS INTERVAL TO IS NOT AND OR YEAR YEARS MONTH
+    MONTHS WEEK WEEKS DAY DAYS HOUR HOURS MINUTE MINUTES SECOND SECONDS MILLISECOND MILLISECONDS
+    MICROSECOND MICROSECONDS NANOSECOND NANOSECONDS)
   @interval_units ~w(YEAR YEARS MONTH MONTHS WEEK WEEKS DAY DAYS HOUR HOURS MINUTE MINUTES SECOND
     SECONDS MILLISECOND MILLISECONDS MICROSECOND MICROSECONDS NANOSECOND NANOSECONDS)
-  @operators ~w(= == <=> <> != < > <= >= + - * / % || ~ !~ ~* !~* & | ^ << >>)
+  @operators ~w(= == <=> <> != < > <= >= + - * / % || ~ !~ ~* !~* & | ^ << >> ~~ ~~* !~~ !~~* //)
   @predicate_words ~w(IS IN BETWEEN LIKE ILIKE)
   @negatable_words ~w(IN BETWEEN LIKE ILIKE)
   @join_words ~w(JOIN INNER LEFT RIGHT FULL CROSS NATURAL OUTER STRAIGHT_JOIN)
   @logical_words ~w(AND OR XOR)
   @bound_operators ~w(+ - * / % ||)
   @table_function {__MODULE__, :table_function}
-
-  @symbols [
-    "<=>",
-    "==",
-    "!~*",
-    "<>",
-    "!=",
-    "<=",
-    ">=",
-    "||",
-    "~*",
-    "!~",
-    "<<",
-    ">>",
-    "::",
-    "->",
-    "(",
-    ")",
-    ",",
-    ".",
-    "*",
-    "+",
-    "-",
-    "/",
-    "%",
-    "=",
-    "<",
-    ">",
-    "~",
-    "&",
-    "|",
-    "^",
-    "[",
-    "]",
-    ":"
-  ]
+  @flags [@table_function, @top, @refusal, @planner, @into, @depth, @set_operation]
 
   @doc """
   `:ok` when the text reads as a statement (or this grammar cannot say), else
@@ -93,14 +76,12 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   """
   @spec check(binary()) :: :ok | {:error, SQLError.t()}
   def check(sql) do
-    case tokenize(sql, 1, 1, []) do
-      {:ok, tokens} -> tokens |> statement() |> flagged()
+    case SQLTokenizer.tokenize(sql) do
+      {:ok, tokens} -> tokens |> read() |> flagged(tokens)
       :bail -> :ok
     end
   after
-    Process.delete(@table_function)
-    Process.delete(@top)
-    Process.delete(@refusal)
+    Enum.each(@flags, &Process.delete/1)
   end
 
   @doc """
@@ -111,126 +92,50 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   @spec check_statements(binary()) :: :ok | {:error, SQLError.t()}
   def check_statements(sql) do
     sql
-    |> split()
+    |> SQLTokenizer.split()
     |> Enum.reduce_while(:ok, fn {offset, piece}, :ok ->
-      positioned = blank(binary_part(sql, 0, offset)) <> piece
+      positioned = SQLTokenizer.blank(binary_part(sql, 0, offset)) <> piece
       statement = String.replace_suffix(positioned, ";", "")
 
-      case SQLStatement.parser_error(statement) do
+      case first_token_error(statement) do
         nil -> verdict(check(positioned))
         error -> {:halt, {:error, error}}
       end
     end)
   end
 
+  # The parser's error for a statement that starts with no statement, or is a statement word
+  # with nothing after it (`DELETE`, `USE`); the other answers of a bare word (`BEGIN`, `END`)
+  # are the planner's, which a text of several statements never reaches.
+  @spec first_token_error(binary()) :: SQLError.t() | nil
+  defp first_token_error(statement) do
+    SQLStatement.parser_error(statement) || parse_only(SQLStatement.bare_error(statement))
+  end
+
+  defp parse_only(%{body: "SQL error: ParserError" <> _rest} = error), do: error
+  defp parse_only(_other), do: nil
+
+  # `0x1F` is a binary value to the engine, which the double refuses by name once the text
+  # reads.
+  @spec read(tokens()) :: :ok | {:error, SQLError.t()}
+  defp read(tokens) do
+    if Enum.any?(tokens, &SQLTokenizer.hex?/1),
+      do:
+        refuse(
+          "a hexadecimal number (0x...) is a binary value on the engine, " <>
+            "which this double does not model"
+        )
+
+    statement(tokens)
+  end
+
   defp verdict(:ok), do: {:cont, :ok}
   defp verdict({:error, _error} = error), do: {:halt, error}
 
-  # The text with every character but a newline blank, so a statement keeps its line and
-  # column in the whole text.
-  @spec blank(binary()) :: binary()
-  defp blank(text), do: Regex.replace(~r/[^\n]/u, text, " ")
-
-  # The statements of a text, each with the byte at which it starts. A `;` inside a string,
-  # a quoted name, a comment or a dollar-quoted string ends nothing.
-  @spec split(binary()) :: [{non_neg_integer(), binary()}]
-  defp split(sql), do: split(sql, 0, 0, [])
-
-  defp split(sql, pos, start, acc) when pos >= byte_size(sql),
-    do: Enum.reverse([piece(sql, start, pos) | acc])
-
-  defp split(sql, pos, start, acc) do
-    rest = binary_part(sql, pos, byte_size(sql) - pos)
-
-    case rest do
-      <<?;, _after::binary>> ->
-        split(sql, pos + 1, pos + 1, [piece(sql, start, pos + 1) | acc])
-
-      <<q, quoted::binary>> when q in [?', ?", ?`] ->
-        split(sql, skip_quoted(sql, pos + 1, q, quoted), start, acc)
-
-      <<"--", _after::binary>> ->
-        split(sql, skip_line(sql, pos + 2), start, acc)
-
-      <<"/*", _after::binary>> ->
-        split(sql, skip_comment(sql, pos + 2, 1), start, acc)
-
-      <<?$, _after::binary>> ->
-        split(sql, skip_dollar(sql, pos, rest), start, acc)
-
-      <<e, ?', body::binary>> when e in [?E, ?e] ->
-        if word_before?(sql, pos),
-          do: split(sql, pos + 1, start, acc),
-          else: split(sql, skip_escaped(sql, pos + 2, body), start, acc)
-
-      _other ->
-        split(sql, pos + 1, start, acc)
-    end
-  end
-
-  defp piece(sql, start, stop), do: {start, binary_part(sql, start, stop - start)}
-
-  # The position after the quote that closes a quoted token, a doubled quote one inside.
-  defp skip_quoted(sql, pos, q, <<q, q, rest::binary>>), do: skip_quoted(sql, pos + 2, q, rest)
-  defp skip_quoted(_sql, pos, q, <<q, _rest::binary>>), do: pos + 1
-  defp skip_quoted(sql, pos, q, <<_byte, rest::binary>>), do: skip_quoted(sql, pos + 1, q, rest)
-  defp skip_quoted(sql, _pos, _q, <<>>), do: byte_size(sql)
-
-  defp skip_line(sql, pos) when pos >= byte_size(sql), do: byte_size(sql)
-
-  defp skip_line(sql, pos) do
-    case :binary.match(sql, "\n", scope: {pos, byte_size(sql) - pos}) do
-      {at, _length} -> at
-      :nomatch -> byte_size(sql)
-    end
-  end
-
-  defp skip_comment(sql, pos, _depth) when pos >= byte_size(sql), do: byte_size(sql)
-
-  defp skip_comment(sql, pos, depth) do
-    case binary_part(sql, pos, min(2, byte_size(sql) - pos)) do
-      "*/" -> if depth == 1, do: pos + 2, else: skip_comment(sql, pos + 2, depth - 1)
-      "/*" -> skip_comment(sql, pos + 2, depth + 1)
-      _other -> skip_comment(sql, pos + 1, depth)
-    end
-  end
-
-  # A dollar-quoted string, or the position after a placeholder's `$`.
-  defp skip_dollar(sql, pos, rest) do
-    case Regex.run(~r/\A\$([\p{L}\p{N}_]*)\$/u, rest) do
-      [open, _tag] ->
-        after_open = pos + byte_size(open)
-
-        case :binary.match(sql, open, scope: {after_open, byte_size(sql) - after_open}) do
-          {at, length} -> at + length
-          :nomatch -> byte_size(sql)
-        end
-
-      nil ->
-        pos + 1
-    end
-  end
-
-  defp word_before?(_sql, 0), do: false
-  defp word_before?(sql, pos), do: Regex.match?(~r/[\p{L}\p{N}_]/u, last_character(sql, pos))
-
-  defp last_character(sql, pos) do
-    sql |> binary_part(0, pos) |> String.last() |> Kernel.||("")
-  end
-
-  # The position after the closing quote of an escape string whose body starts at `pos`.
-  defp skip_escaped(sql, pos, body) do
-    case SQLLexer.escaped(body) do
-      {:ok, _text, rest} -> byte_size(sql) - byte_size(rest)
-      :error -> byte_size(sql)
-    end
-    |> max(pos)
-  end
-
   # What a text that reads is still answered with: the engine's `TOP` is no feature of its
   # planner (405), and a spelling the double cannot read is refused by name.
-  @spec flagged(:ok | {:error, SQLError.t()}) :: :ok | {:error, SQLError.t()}
-  defp flagged(:ok) do
+  @spec flagged(:ok | {:error, SQLError.t()}, tokens()) :: :ok | {:error, SQLError.t()}
+  defp flagged(:ok, tokens) do
     cond do
       Process.get(@top) ->
         {:error, %{status: 405, body: "This feature is not implemented: TOP"}}
@@ -241,245 +146,65 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
       Process.get(@table_function) ->
         {:error, SQLError.refusal("a table function in FROM: the engine has none")}
 
+      message = Process.get(@planner) ->
+        unsupported(message, tokens)
+
+      Process.get(@into) ->
+        into_verdict(tokens)
+
       true ->
         :ok
     end
   end
 
-  defp flagged(error), do: error
+  defp flagged(error, _tokens), do: error
+
+  # The planner's refusal of a construct the parser read. It comes after the planner has
+  # found the tables and columns of the text, so it is the engine's answer only where the
+  # text names none; elsewhere which error comes first depends on the clause.
+  @spec unsupported(binary(), tokens()) :: {:error, SQLError.t() | map()}
+  defp unsupported(message, tokens) do
+    if constant?(tokens),
+      do: {:error, %{status: 405, body: "This feature is not implemented: " <> message}},
+      else:
+        {:error,
+         SQLError.refusal(
+           "#{message} in a text that names columns or tables: which error the engine " <>
+             "gives first depends on the clause"
+         )}
+  end
+
+  # Whether the text names no table, column or function: its words are the statement's own
+  # (or follow `AS`, which names an item whatever the word is).
+  @spec constant?(tokens()) :: boolean()
+  defp constant?(tokens) do
+    tokens
+    |> Enum.zip([nil | tokens])
+    |> Enum.all?(fn
+      {{:word, _printed, _upper, _line, _col}, {:word, _p, "AS", _l, _c}} -> true
+      {{:word, _printed, upper, _line, _col}, _previous} -> upper in @own_words
+      {_token, _previous} -> true
+    end)
+  end
+
+  # `SELECT ... INTO name` is the engine's `CREATE TABLE AS`, which it refuses once the
+  # select has planned. The double plans the select without the clause (`SQLRewrite`) and
+  # answers the refusal, for a plain top-level `SELECT`; any other `INTO` is refused by name.
+  @spec into_verdict(tokens()) :: :ok | {:error, SQLError.t()}
+  defp into_verdict([{:word, _printed, "SELECT", _line, _col} | _rest]) do
+    if Process.get(@into) == :plain and not Process.get(@set_operation, false),
+      do: :ok,
+      else: {:error, SQLError.refusal("an INTO clause outside a plain SELECT")}
+  end
+
+  defp into_verdict(_tokens),
+    do: {:error, SQLError.refusal("an INTO clause outside a plain SELECT")}
 
   @spec refuse(binary()) :: :ok
   defp refuse(reason) do
     Process.put(@refusal, reason)
     :ok
   end
-
-  # ---------------------------------------------------------------------------
-  # Tokens: `{kind, printed, upper, line, column}`
-  # ---------------------------------------------------------------------------
-
-  @spec tokenize(binary(), pos_integer(), pos_integer(), tokens()) :: {:ok, tokens()} | :bail
-  defp tokenize(<<>>, line, col, acc),
-    do: {:ok, Enum.reverse([{:eof, "EOF", "EOF", line, col} | acc])}
-
-  defp tokenize(<<?;, _rest::binary>>, line, col, acc),
-    do: tokenize(<<>>, line, col + 1, [{:symbol, ";", ";", line, col} | acc])
-
-  defp tokenize(<<?\n, rest::binary>>, line, _col, acc), do: tokenize(rest, line + 1, 1, acc)
-
-  defp tokenize(<<c, rest::binary>>, line, col, acc) when c in [?\s, ?\t, ?\r],
-    do: tokenize(rest, line, col + 1, acc)
-
-  defp tokenize(<<"--", rest::binary>>, line, col, acc) do
-    case :binary.split(rest, "\n") do
-      [_comment] -> tokenize(<<>>, line, col, acc)
-      [_comment, after_line] -> tokenize(after_line, line + 1, 1, acc)
-    end
-  end
-
-  defp tokenize(<<"/*", rest::binary>>, line, col, acc),
-    do: block_comment(rest, 1, line, col + 2, acc)
-
-  defp tokenize(<<?', rest::binary>> = text, line, col, acc),
-    do: quoted(text, rest, ?', :string, line, col, acc)
-
-  defp tokenize(<<?", rest::binary>> = text, line, col, acc),
-    do: quoted(text, rest, ?", :quoted, line, col, acc)
-
-  defp tokenize(<<?`, rest::binary>> = text, line, col, acc),
-    do: quoted(text, rest, ?`, :quoted, line, col, acc)
-
-  defp tokenize(<<c::utf8, _rest::binary>> = text, line, col, acc) do
-    cond do
-      c in ?0..?9 or (c == ?. and digit_next?(text)) -> number(text, line, col, acc)
-      word_start?(c) -> word(text, line, col, acc)
-      c == ?$ -> placeholder(text, line, col, acc)
-      true -> symbol(text, line, col, acc)
-    end
-  end
-
-  defp tokenize(_invalid, _line, _col, _acc), do: :bail
-
-  @spec digit_next?(binary()) :: boolean()
-  defp digit_next?(<<?., d, _rest::binary>>), do: d in ?0..?9
-  defp digit_next?(_text), do: false
-
-  @spec block_comment(binary(), pos_integer(), pos_integer(), pos_integer(), tokens()) ::
-          {:ok, tokens()} | :bail
-  defp block_comment(<<"*/", rest::binary>>, 1, line, col, acc),
-    do: tokenize(rest, line, col + 2, acc)
-
-  defp block_comment(<<"*/", rest::binary>>, depth, line, col, acc),
-    do: block_comment(rest, depth - 1, line, col + 2, acc)
-
-  defp block_comment(<<"/*", rest::binary>>, depth, line, col, acc),
-    do: block_comment(rest, depth + 1, line, col + 2, acc)
-
-  defp block_comment(<<?\n, rest::binary>>, depth, line, _col, acc),
-    do: block_comment(rest, depth, line + 1, 1, acc)
-
-  defp block_comment(<<_c::utf8, rest::binary>>, depth, line, col, acc),
-    do: block_comment(rest, depth, line, col + 1, acc)
-
-  defp block_comment(_end_of_text, _depth, _line, _col, _acc), do: :bail
-
-  # A string or a quoted identifier, its doubled quotes one quote inside. It
-  # prints as the engine's tokenizer prints it: the text between the quotes,
-  # undoubled, in the quotes.
-  @spec quoted(binary(), binary(), byte(), atom(), pos_integer(), pos_integer(), tokens()) ::
-          {:ok, tokens()} | :bail
-  defp quoted(text, rest, mark, kind, line, col, acc) do
-    case take_quoted(rest, mark, []) do
-      {:ok, body, after_quote} ->
-        raw = binary_part(text, 0, byte_size(text) - byte_size(after_quote))
-        printed = <<mark>> <> body <> <<mark>>
-        {next_line, next_col} = advance(raw, line, col)
-        tokenize(after_quote, next_line, next_col, [{kind, printed, printed, line, col} | acc])
-
-      :error ->
-        :bail
-    end
-  end
-
-  @spec take_quoted(binary(), byte(), [binary()]) :: {:ok, binary(), binary()} | :error
-  defp take_quoted(<<mark, mark, rest::binary>>, mark, acc),
-    do: take_quoted(rest, mark, [<<mark>> | acc])
-
-  defp take_quoted(<<mark, rest::binary>>, mark, acc),
-    do: {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary(), rest}
-
-  defp take_quoted(<<c::utf8, rest::binary>>, mark, acc),
-    do: take_quoted(rest, mark, [<<c::utf8>> | acc])
-
-  defp take_quoted(_text, _mark, _acc), do: :error
-
-  # The line and column after `text`, which starts at `line`, `col`.
-  @spec advance(binary(), pos_integer(), pos_integer()) :: {pos_integer(), pos_integer()}
-  defp advance(text, line, col) do
-    case String.split(text, "\n") do
-      [single] -> {line, col + String.length(single)}
-      parts -> {line + length(parts) - 1, String.length(List.last(parts)) + 1}
-    end
-  end
-
-  # `0x1F` is a binary value to the engine, printed `X'1F'`, which the double refuses by
-  # name once the text reads.
-  @spec number(binary(), pos_integer(), pos_integer(), tokens()) :: {:ok, tokens()} | :bail
-  defp number(text, line, col, acc) do
-    case Regex.run(~r/\A0x([0-9a-fA-F]*)/, text) do
-      [raw, digits] ->
-        refuse(
-          "a hexadecimal number (0x...) is a binary value on the engine, which this double does not model"
-        )
-
-        raw_token(text, raw, :literal, "X'" <> digits <> "'", line, col, acc)
-
-      nil ->
-        [literal] = Regex.run(~r/\A(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/, text)
-        emit(text, literal, :number, line, col, acc)
-    end
-  end
-
-  # A token of the text as written, which may span lines, printed as the engine prints it.
-  @spec raw_token(binary(), binary(), atom(), binary(), pos_integer(), pos_integer(), tokens()) ::
-          {:ok, tokens()} | :bail
-  defp raw_token(text, raw, kind, printed, line, col, acc) do
-    {next_line, next_col} = advance(raw, line, col)
-    token = {kind, printed, printed, line, col}
-    tokenize(binary_tail(text, raw), next_line, next_col, [token | acc])
-  end
-
-  # A one-letter word directly before a quote prefixes a string: `E'..'` is read (it prints
-  # decoded, `E'a'b'` for `E'a''b'`), `N'..'` and the others are not.
-  @spec word(binary(), pos_integer(), pos_integer(), tokens()) :: {:ok, tokens()} | :bail
-  defp word(text, line, col, acc) do
-    [literal] = Regex.run(~r/\A[\p{L}_][\p{L}\p{N}_$]*/u, text)
-    after_word = binary_tail(text, literal)
-
-    if String.length(literal) == 1 and String.starts_with?(after_word, "'") do
-      if literal in ["E", "e"], do: escape_string(text, after_word, line, col, acc), else: :bail
-    else
-      emit(text, literal, :word, line, col, acc)
-    end
-  end
-
-  @spec escape_string(binary(), binary(), pos_integer(), pos_integer(), tokens()) ::
-          {:ok, tokens()} | :bail
-  defp escape_string(text, <<?', body::binary>>, line, col, acc) do
-    case SQLLexer.escaped(body) do
-      {:ok, decoded, rest} ->
-        raw = binary_part(text, 0, byte_size(text) - byte_size(rest))
-        raw_token(text, raw, :literal, "E'" <> decoded <> "'", line, col, acc)
-
-      :error ->
-        :bail
-    end
-  end
-
-  @spec binary_tail(binary(), binary()) :: binary()
-  defp binary_tail(text, literal),
-    do: binary_part(text, byte_size(literal), byte_size(text) - byte_size(literal))
-
-  @spec placeholder(binary(), pos_integer(), pos_integer(), tokens()) ::
-          {:ok, tokens()} | :bail
-  defp placeholder(text, line, col, acc) do
-    case dollar_string(text) do
-      {:ok, raw} ->
-        raw_token(text, raw, :literal, raw, line, col, acc)
-
-      :none ->
-        case Regex.run(~r/\A\$[\p{L}\p{N}_]*/u, text) do
-          [literal] -> emit(text, literal, :placeholder, line, col, acc)
-          nil -> :bail
-        end
-
-      :bail ->
-        :bail
-    end
-  end
-
-  # `$$..$$` and `$tag$..$tag$`, as written.
-  @spec dollar_string(binary()) :: {:ok, binary()} | :none | :bail
-  defp dollar_string(text) do
-    case Regex.run(~r/\A\$([\p{L}\p{N}_]*)\$/u, text) do
-      [open, _tag] ->
-        case :binary.split(binary_tail(text, open), open) do
-          [body, _after] -> {:ok, open <> body <> open}
-          [_unterminated] -> :bail
-        end
-
-      nil ->
-        :none
-    end
-  end
-
-  @spec symbol(binary(), pos_integer(), pos_integer(), tokens()) :: {:ok, tokens()} | :bail
-  defp symbol(text, line, col, acc) do
-    case Enum.find(@symbols, &String.starts_with?(text, &1)) do
-      nil -> :bail
-      "!=" -> emit(text, "!=", :symbol, line, col, acc, "<>")
-      symbol -> emit(text, symbol, :symbol, line, col, acc)
-    end
-  end
-
-  @spec emit(
-          binary(),
-          binary(),
-          atom(),
-          pos_integer(),
-          pos_integer(),
-          tokens(),
-          binary() | nil
-        ) :: {:ok, tokens()} | :bail
-  defp emit(text, literal, kind, line, col, acc, printed \\ nil) do
-    token = {kind, printed || literal, String.upcase(literal), line, col}
-    tokenize(binary_tail(text, literal), line, col + String.length(literal), [token | acc])
-  end
-
-  @spec word_start?(integer()) :: boolean()
-  defp word_start?(c) when c in ?a..?z or c in ?A..?Z or c == ?_, do: true
-  defp word_start?(c) when c < 128, do: false
-  defp word_start?(c), do: Regex.match?(~r/\A\p{L}\z/u, <<c::utf8>>)
 
   # ---------------------------------------------------------------------------
   # The statement
@@ -493,6 +218,13 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp statement([{:symbol, _printed, "(", _line, _col} | _rest] = tokens),
     do: read_query(tokens)
 
+  defp statement([{:word, _p, "DELETE", _l, _c}, {:word, _q, "FROM", _l2, _c2} | rest]) do
+    _target = object_name(rest)
+    :ok
+  catch
+    {:syntax, expected, token} -> {:error, parser_error(expected, token)}
+  end
+
   defp statement(_tokens), do: :ok
 
   @spec read_query(tokens()) :: :ok | {:error, SQLError.t()}
@@ -500,6 +232,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     case query(tokens) do
       [{:eof, _printed, _upper, _line, _col}] -> :ok
       [{:symbol, _printed, ";", _line, _col}, {:eof, _p, _u, _l, _c}] -> :ok
+      [{:word, _printed, upper, _line, _col} | _rest] when upper in @own_syntax -> :ok
       [token | _rest] -> {:error, parser_error("end of statement", token)}
     end
   catch
@@ -521,13 +254,20 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   @spec query(tokens()) :: tokens()
   defp query(tokens) do
-    tokens
-    |> with_clause()
-    |> select_term()
-    |> set_operations()
-    |> order_by()
-    |> limit_offset()
-    |> fetch_clause()
+    depth = Process.get(@depth, 0)
+    Process.put(@depth, depth + 1)
+
+    try do
+      tokens
+      |> with_clause()
+      |> select_term()
+      |> set_operations()
+      |> order_by()
+      |> limit_offset()
+      |> fetch_clause()
+    after
+      Process.put(@depth, depth)
+    end
   end
 
   defp with_clause([{:word, _p, "WITH", _l, _c} | rest]), do: common_tables(rest)
@@ -558,10 +298,18 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp select_term([{:symbol, _p, "(", _l, _c} | rest]), do: rest |> query() |> close_paren()
   defp select_term([{:word, _p, "SELECT", _l, _c} | rest]), do: select_core(rest)
+
+  defp select_term([{:word, _p, "FROM", _l, _c} | _rest]) do
+    refuse("a query that begins with FROM: the engine reads it, this double does not")
+    throw(:bail)
+  end
+
   defp select_term(tokens), do: fail("SELECT, VALUES, or a subquery in the query body", tokens)
 
   defp set_operations([{:word, _p, operator, _l, _c} | rest])
-       when operator in ["UNION", "EXCEPT", "INTERSECT"] do
+       when operator in ["UNION", "EXCEPT", "INTERSECT", "MINUS"] do
+    Process.put(@set_operation, true)
+
     case rest do
       [{:word, _q, quantifier, _l2, _c2} | more] when quantifier in ["ALL", "DISTINCT"] ->
         more |> select_term() |> set_operations()
@@ -582,6 +330,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     tokens
     |> select_head()
     |> projection()
+    |> into_clause()
     |> from_clause()
     |> condition_clause("WHERE")
     |> group_by()
@@ -637,6 +386,35 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp select_quantifier(tokens), do: tokens
 
+  # `INTO [TEMP] [UNLOGGED] [TABLE] name`, between the list and `FROM`.
+  defp into_clause([{:word, _p, "INTO", _l, _c} | rest]) do
+    Process.put(@into, if(Process.get(@depth) == 1, do: :plain, else: :nested))
+
+    rest
+    |> into_option(["TEMP", "TEMPORARY"])
+    |> into_option(["UNLOGGED"])
+    |> into_option(["TABLE"])
+    |> into_name(1)
+  end
+
+  defp into_clause(tokens), do: tokens
+
+  defp into_option([{:word, _p, word, _l, _c} | rest] = tokens, words),
+    do: if(word in words, do: rest, else: tokens)
+
+  defp into_option(tokens, _words), do: tokens
+
+  defp into_name([{kind, _p, _u, _l, _c}, {:symbol, _q, ".", _l2, _c2} | rest], parts)
+       when kind in [:word, :quoted, :string],
+       do: into_name(rest, parts + 1)
+
+  defp into_name([{kind, _p, _u, _l, _c} | rest], parts) when kind in [:word, :quoted, :string] do
+    if parts > 3, do: refuse("an INTO target of #{parts} parts: the engine words its error")
+    rest
+  end
+
+  defp into_name(tokens, _parts), do: fail("identifier", tokens)
+
   # `SELECT FROM t` selects no column.
   defp projection([{:word, _p, "FROM", _l, _c} | _rest] = tokens), do: tokens
   defp projection(tokens), do: tokens |> select_item() |> after_item()
@@ -647,7 +425,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     case rest do
       [{:eof, _q, _u, _l2, _c2} | _more] -> rest
       [{:symbol, _q, bracket, _l2, _c2} | _more] when bracket in [")", "]"] -> rest
-      [{:word, _q, upper, _l2, _c2} | _more] when upper in @alias_reserved -> rest
+      [{:word, _q, upper, _l2, _c2} | _more] when upper in @column_reserved -> rest
       _item -> projection(rest)
     end
   end
@@ -681,7 +459,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp item_alias([{kind, _p, _u, _l, _c} | rest]) when kind in [:quoted, :string], do: rest
 
   defp item_alias([{:word, _p, upper, _l, _c} | rest] = tokens),
-    do: if(upper in @alias_reserved, do: tokens, else: rest)
+    do: if(upper in @column_reserved, do: tokens, else: rest)
 
   defp item_alias(tokens), do: tokens
 
@@ -778,7 +556,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     do: alias_columns(rest)
 
   defp table_alias([{:word, _p, upper, _l, _c} | rest] = tokens),
-    do: if(upper in @alias_reserved, do: tokens, else: alias_columns(rest))
+    do: if(upper in @table_reserved, do: tokens, else: alias_columns(rest))
 
   defp table_alias(tokens), do: tokens
 
@@ -973,11 +751,45 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
        when upper in @special_calls,
        do: skip_to_close(rest)
 
-  defp word_operand(upper, [_word, {:string, _p, _u, _l, _c} | rest])
-       when upper in @typed_literals,
-       do: rest
+  defp word_operand(upper, [_word | more] = tokens) when upper in @typed_literals do
+    case typed_literal(more) do
+      nil -> identifier(tokens)
+      rest -> rest
+    end
+  end
+
+  # The engine reads these as the calls they are, with no parentheses; the double does not.
+  defp word_operand(upper, [_word, {:symbol, _p, "(", _l, _c} | _rest] = tokens)
+       when upper in @niladic,
+       do: identifier(tokens)
+
+  defp word_operand(upper, tokens) when upper in @niladic do
+    refuse("#{String.downcase(upper)} without parentheses: write #{String.downcase(upper)}()")
+    identifier(tokens)
+  end
 
   defp word_operand(_upper, tokens), do: identifier(tokens)
+
+  # The string after a type name in `TIMESTAMP '...'`, the type with its precision and
+  # `WITH [OUT] TIME ZONE` as the engine reads them; `nil` when the text is no typed literal.
+  defp typed_literal([{:string, _p, _u, _l, _c} | rest]), do: rest
+
+  defp typed_literal([
+         {:symbol, _p, "(", _l, _c},
+         {:number, _q, _u, _l2, _c2},
+         {:symbol, _r, ")", _l3, _c3} | more
+       ]),
+       do: typed_literal(more)
+
+  defp typed_literal([
+         {:word, _p, zone, _l, _c},
+         {:word, _q, "TIME", _l2, _c2},
+         {:word, _r, "ZONE", _l3, _c3} | more
+       ])
+       when zone in ["WITH", "WITHOUT"],
+       do: typed_literal(more)
+
+  defp typed_literal(_tokens), do: nil
 
   # A keyword with a syntax of its own that fails to parse is an identifier
   # (or a call of that name); when that fails too, the error is the
@@ -1032,15 +844,77 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp type_words(tokens), do: tokens
 
-  # `INTERVAL '1 minute'` and `INTERVAL '1' minute`.
+  # `INTERVAL '1 minute'` and `INTERVAL '1' minute`. The engine's planner reads no `TO`
+  # field and no precision (405); an interval of any other expression is not read here.
   defp interval([_interval, {kind, _p, _u, _l, _c} | rest]) when kind in [:string, :number] do
-    case rest do
-      [{:word, _q, unit, _l2, _c2} | more] when unit in @interval_units -> more
-      _no_unit -> rest
+    {unit_end, precision} = rest |> interval_unit() |> interval_precision()
+
+    case interval_to(unit_end) do
+      {:to, last_field, more} ->
+        unsupported_interval("last_field Some(#{last_field})", more)
+
+      :none ->
+        if precision,
+          do: unsupported_interval("leading_precision Some(#{precision})", unit_end),
+          else: unit_end
     end
   end
 
-  defp interval(_tokens), do: throw(:bail)
+  defp interval([_interval | rest]) do
+    _read = operand(rest)
+    refuse("an INTERVAL of an expression that is not a string or a number")
+    throw(:bail)
+  end
+
+  defp interval_unit([{:word, _q, unit, _l, _c} | more]) when unit in @interval_units, do: more
+  defp interval_unit(tokens), do: tokens
+
+  defp interval_precision([{:symbol, _p, "(", _l, _c}, {:number, _q, digits, _l2, _c2} | more]) do
+    case more do
+      [{:symbol, _r, ")", _l3, _c3} | after_precision] ->
+        if digits =~ ~r/\A\d+\z/,
+          do: {after_precision, String.to_integer(digits)},
+          else: no_precision()
+
+      _other ->
+        no_precision()
+    end
+  end
+
+  defp interval_precision(tokens), do: {tokens, nil}
+
+  defp no_precision do
+    refuse("an INTERVAL precision this grammar does not read")
+    throw(:bail)
+  end
+
+  defp interval_to([{:word, _p, "TO", _l, _c} | rest]) do
+    case rest do
+      [{:word, _q, field, _l2, _c2} | more] when field in @interval_units ->
+        {:to, String.capitalize(field), more}
+
+      [{:word, _q, _other, _l2, _c2} | _more] ->
+        refuse("an INTERVAL ... TO field this grammar does not read")
+        throw(:bail)
+
+      tokens ->
+        fail("date/time field", tokens)
+    end
+  end
+
+  defp interval_to(_tokens), do: :none
+
+  defp unsupported_interval(what, rest) do
+    defer("Unsupported Interval Expression with " <> what)
+    rest
+  end
+
+  # The planner's refusal the text will get once it reads; the first one stands.
+  @spec defer(binary()) :: :ok
+  defp defer(message) do
+    if is_nil(Process.get(@planner)), do: Process.put(@planner, message)
+    :ok
+  end
 
   # The tokens after the closing parenthesis of a call whose arguments are
   # not read here.
@@ -1081,9 +955,6 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp call_arguments([{:symbol, _p, ")", _l, _c} | rest]), do: rest
 
-  defp call_arguments([{:symbol, _p, "*", _l, _c}, {:symbol, _q, ")", _l2, _c2} | rest]),
-    do: rest
-
   defp call_arguments([{:word, _p, quantifier, _l, _c} | rest])
        when quantifier in ["DISTINCT", "ALL"],
        do: argument_list(rest)
@@ -1091,13 +962,17 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp call_arguments(tokens), do: argument_list(tokens)
 
   defp argument_list(tokens) do
-    case tokens |> expression() |> argument_order() do
+    case tokens |> argument() |> argument_order() do
       [{:symbol, _p, ",", _l, _c} | rest] -> argument_list(rest)
       [{:symbol, _p, ")", _l, _c} | rest] -> rest
       [{:word, _p, word, _l, _c} | _rest] when word in ["IGNORE", "RESPECT", "ON"] -> throw(:bail)
       other -> fail(")", other)
     end
   end
+
+  # An argument is an expression, or the `*` of `count(*)`.
+  defp argument([{:symbol, _p, "*", _l, _c} | rest]), do: rest
+  defp argument(tokens), do: expression(tokens)
 
   # `first_value(x ORDER BY t)`.
   defp argument_order([{:word, _p, "ORDER", _l, _c}, {:word, _q, "BY", _l2, _c2} | rest]),
@@ -1127,6 +1002,28 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
       ^tokens -> tokens
       after_step -> tight_infix(after_step)
     end
+  end
+
+  # `DIV` has a precedence on the engine's parser and no infix parser behind it.
+  defp infix_step([{:word, printed, "DIV", line, col} | _rest]) do
+    throw(
+      {:fail,
+       SQLError.parser(
+         "No infix parser for token Word(Word { value: \"#{printed}\", quote_style: None, " <>
+           "keyword: DIV }) at Line: #{line}, Column: #{col}"
+       )}
+    )
+  end
+
+  defp infix_step([{:symbol, _p, "//", _l, _c} | rest]) do
+    defer("Operator DIV is not yet supported")
+    operand_after_operator(rest)
+  end
+
+  defp infix_step([{:symbol, _p, like, _l, _c} | rest])
+       when like in ["~~", "~~*", "!~~", "!~~*"] do
+    refuse("the operators ~~, ~~*, !~~ and !~~*: write LIKE, ILIKE, NOT LIKE or NOT ILIKE")
+    operand_after_operator(rest)
   end
 
   defp infix_step([{:symbol, _p, "<=>", _l, _c} | rest]) do
