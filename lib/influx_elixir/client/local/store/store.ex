@@ -98,8 +98,9 @@ defmodule InfluxElixir.Client.Local.Store do
     else
       with_lock(table, :databases, fn ->
         with :ok <- check.(databases(table)) do
-          put_database(table, name)
+          # The retention first: a write that finds the database must find its retention too.
           put_retention(table, name, retention)
+          put_database(table, name)
           :ok
         end
       end)

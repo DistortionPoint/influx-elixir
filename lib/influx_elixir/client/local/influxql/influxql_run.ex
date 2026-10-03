@@ -300,7 +300,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   defp aggregate(rows, items, %{tags: tags, time: time, types: types}, base) do
     plan = expression_plan(items, types, tags)
     fields = if count_star?(plan.aggregates), do: field_names(rows, tags), else: []
-    named = InfluxQLAggregate.columns(plan.aggregates, rows, fields, tags, types)
+
+    field_columns? =
+      Enum.any?(items, fn
+        {:column, column, _name} ->
+          Map.has_key?(types, column) and not MapSet.member?(tags, column)
+
+        _item ->
+          false
+      end)
+
+    named = InfluxQLAggregate.columns(plan.aggregates, rows, fields, tags, types, field_columns?)
 
     values = for {name, {:value, value, _point}, _spec} <- named, into: %{}, do: {name, value}
 
@@ -448,12 +458,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     cond do
       not lookback? -> results
       query.descending -> Enum.drop(results, -1)
-      true -> tl(results)
+      true -> Enum.drop(results, 1)
     end
   end
 
-  # Whether the bucket scanned before the range holds a value.
+  # Whether the bucket scanned before the range holds a value; with no bucket there is none.
   defp phantom_value?({_start, values}), do: map_size(values) > 0
+  defp phantom_value?(nil), do: false
 
   @lookback ~w(derivative non_negative_derivative difference non_negative_difference
                moving_average)

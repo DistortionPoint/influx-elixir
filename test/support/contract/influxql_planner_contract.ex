@@ -153,7 +153,10 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
         end
 
         test "without a lower bound the buckets start at the first point and end now", ctx do
-          before = days_since_2024()
+          # The server's clock decides which day it is: the days of the bounds of the
+          # slack between this clock and the server's, taken round the query.
+          slack = Map.get(ctx, :time_slack, 5)
+          lowest = days_since_2024(-slack)
 
           assert {:ok, [first | rest]} =
                    InfluxElixir.Contract.InfluxQLPlanner.raw(
@@ -162,11 +165,11 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
                      "SELECT mean(usage) FROM #{ctx.names["m2"]} GROUP BY time(1d)"
                    )
 
-          later = days_since_2024()
+          highest = days_since_2024(slack)
           assert first["time"] === ~U[2024-01-01 00:00:00.000000Z]
           assert first["mean"] === 5.25
           assert Enum.all?(rest, &(map_size(Map.drop(&1, ["time", "iox::measurement"])) == 0))
-          assert (length(rest) + 1) in before..later
+          assert (length(rest) + 1) in lowest..highest
         end
 
         test "each series starts at its own first point, and LIMIT reads only what it keeps",
@@ -457,7 +460,14 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           )
       end
 
-      defp days_since_2024, do: Date.diff(Date.utc_today(), ~D[2024-01-01]) + 1
+      # The number of days from 2024-01-01 to the day it is `seconds` from now, both counted.
+      defp days_since_2024(seconds) do
+        DateTime.utc_now()
+        |> DateTime.add(seconds, :second)
+        |> DateTime.to_date()
+        |> Date.diff(~D[2024-01-01])
+        |> Kernel.+(1)
+      end
     end
   end
 
@@ -470,6 +480,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
   @doc false
   @spec fill_names(term(), %{binary() => binary()}) :: term()
   def fill_names(text, names) when is_binary(text), do: statement(text, names)
+  def fill_names(%DateTime{} = time, _names), do: time
   def fill_names(list, names) when is_list(list), do: Enum.map(list, &fill_names(&1, names))
   def fill_names(%{} = map, names), do: Map.new(map, fn {k, v} -> {k, fill_names(v, names)} end)
 
@@ -526,22 +537,52 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
   The positions of a parse error body (`at pos N`) counted as if every measurement name
   in the statement were its template placeholder (`~f1`, three characters): the
   measurements of a run have names of their own length, the cases are written once.
+
+  The map from a position to the template's is not injective for a position inside a
+  name, which is no position of the template: a wrong position there could be read as
+  a right one. Such a position is reported as `within ~key`, which no case expects, so
+  that it fails with the engine's own position in the message of the mismatch.
   """
   @spec template_positions(binary(), binary(), %{binary() => binary()}) :: binary()
   def template_positions(body, statement, names) do
+    spans = name_spans(statement, names)
+
     Regex.replace(~r/ at pos (\d+)/, body, fn _all, digits ->
       pos = String.to_integer(digits)
-      before = binary_part(statement, 0, min(pos, byte_size(statement)))
 
-      shift =
-        Enum.sum(
-          for {key, name} <- names do
-            length(:binary.matches(before, name)) * (byte_size(name) - byte_size("~" <> key))
-          end
-        )
+      case Enum.find(spans, fn {start, length, _placeholder} ->
+             pos > start and pos < start + length
+           end) do
+        {_start, _length, placeholder} ->
+          " at pos within #{placeholder} (#{pos})"
 
-      " at pos #{pos - shift}"
+        nil ->
+          shift =
+            for {start, length, placeholder} <- spans, start + length <= pos, reduce: 0 do
+              shift -> shift + length - byte_size(placeholder)
+            end
+
+          " at pos #{pos - shift}"
+      end
     end)
+  end
+
+  # Where each name stands in the statement, as `{start, length, placeholder}`, in
+  # order. A name that is the start of another (the prefix a family of names shares)
+  # is not read inside the longer one.
+  defp name_spans(statement, names) do
+    by_name = Map.new(names, fn {key, name} -> {name, "~" <> key} end)
+
+    pattern =
+      by_name
+      |> Map.keys()
+      |> Enum.sort_by(&{-byte_size(&1), &1})
+      |> Enum.map_join("|", &Regex.escape/1)
+      |> Regex.compile!()
+
+    for [{start, length}] <- Regex.scan(pattern, statement, return: :index) do
+      {start, length, Map.fetch!(by_name, binary_part(statement, start, length))}
+    end
   end
 
   @doc false

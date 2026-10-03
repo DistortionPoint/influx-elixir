@@ -21,38 +21,50 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   def tokenize(<<>>, acc), do: {:ok, Enum.reverse(acc)}
   def tokenize(<<c, rest::binary>>, acc) when c in [?\s, ?\t, ?\n, ?\r], do: tokenize(rest, acc)
 
-  def tokenize(<<?', rest::binary>>, acc) do
+  # A token that follows an operand with no operator between them is where the engine's
+  # parser stops: the condition ended before it.
+  def tokenize(text, [previous | _before] = acc) do
+    if leftover_token?(previous, text),
+      do: {:syntax_error, :nom, text},
+      else: lex(text, acc)
+  end
+
+  def tokenize(text, []), do: lex(text, [])
+
+  @spec lex(binary(), list()) ::
+          {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
+  defp lex(<<?', rest::binary>>, acc) do
     {content, rest} = take_until(rest, ?', [])
     # InfluxQL escapes a quote with a backslash, SQL by doubling it.
     tokenize(rest, [{:str, String.replace(content, "\\'", "''")} | acc])
   end
 
-  def tokenize(<<?", rest::binary>>, acc) do
+  defp lex(<<?", rest::binary>>, acc) do
     {name, rest} = take_until(rest, ?", [])
     tokenize(rest, [{:ident, String.replace(name, "\\\"", "\"")} | acc])
   end
 
-  def tokenize(<<?/, _rest::binary>> = text, []), do: {:syntax_error, :where_unparsed, text}
+  defp lex(<<?/, _rest::binary>> = text, []), do: {:syntax_error, :where_unparsed, text}
 
-  def tokenize(<<?/, rest::binary>>, [{:op, op} | _tokens] = acc) when op in ["=~", "!~"] do
+  defp lex(<<?/, rest::binary>>, [{:op, op} | _tokens] = acc) when op in ["=~", "!~"] do
     {pattern, rest} = take_regex(rest, [])
 
-    if word_start?(rest),
+    if word_next?(rest),
       do: {:syntax_error, :nom, rest},
       else: tokenize(rest, [{:regex, pattern} | acc])
   end
 
-  def tokenize(<<op::binary-size(2), rest::binary>>, acc)
-      when op in ["=~", "!~", "!=", "<>", "<=", ">="],
-      do: operand(rest, {:op, op}, acc)
+  defp lex(<<op::binary-size(2), rest::binary>>, acc)
+       when op in ["=~", "!~", "!=", "<>", "<=", ">="],
+       do: operand(rest, {:op, op}, acc)
 
-  def tokenize(<<c, rest::binary>>, acc) when c in [?=, ?<, ?>],
+  defp lex(<<c, rest::binary>>, acc) when c in [?=, ?<, ?>],
     do: operand(rest, {:op, <<c>>}, acc)
 
-  def tokenize(<<c, rest::binary>>, acc) when c in [?(, ?), ?+, ?-, ?*, ?/, ?,],
+  defp lex(<<c, rest::binary>>, acc) when c in [?(, ?), ?+, ?-, ?*, ?/, ?,],
     do: tokenize(rest, [{:raw, <<c>>} | acc])
 
-  def tokenize(text, acc) do
+  defp lex(text, acc) do
     case Regex.run(
            ~r/^(?:((?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+)|(\d*\.\d+|\d+)|(now\s*\(\s*\))|([A-Za-z_]\w*))/u,
            text
@@ -112,33 +124,51 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     end
   end
 
-  # A flag after a regular expression (`/re/i`) is left over: the engine has none.
-  @spec word_start?(binary()) :: boolean()
-  defp word_start?(<<c, _more::binary>>), do: c in ?0..?9 or c in ?a..?z or c in ?A..?Z or c == ?_
-  defp word_start?(_ended), do: false
+  # Whether a letter, digit or underscore comes next: a flag after a regular expression
+  # (`/re/i`) is left over, the engine has none.
+  @spec word_next?(binary()) :: boolean()
+  defp word_next?(<<c, _more::binary>>), do: c in ?0..?9 or c in ?a..?z or c in ?A..?Z or c == ?_
+  defp word_next?(_ended), do: false
 
   @spec leftover?(binary()) :: boolean()
-  defp leftover?(<<c, _more::binary>>),
-    do: c in ?0..?9 or c in ?a..?z or c in ?A..?Z or c in [?_, ?.]
-
-  defp leftover?(_ended), do: false
+  defp leftover?(rest), do: word_next?(rest) or String.starts_with?(rest, ".")
 
   # A number that a letter, digit, underscore or dot follows is cut short
   # there, which the engine cannot continue from.
   @spec number_token(binary(), binary(), list()) ::
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
   defp number_token(number, rest, acc) do
-    case rest do
-      <<c, _more::binary>> when c in ?0..?9 or c in ?a..?z or c in ?A..?Z or c in [?_, ?.] ->
-        {:syntax_error, :nom, rest}
-
-      _ended ->
-        case integer_overflow(number, acc) do
-          nil -> tokenize(rest, [{:number, number} | acc])
-          kind -> {:syntax_error, kind, rest}
-        end
+    if leftover?(rest) do
+      {:syntax_error, :nom, rest}
+    else
+      case integer_overflow(number, acc) do
+        nil -> tokenize(rest, [{:number, number} | acc])
+        kind -> {:syntax_error, kind, rest}
+      end
     end
   end
+
+  # Whether `text`, where the next token starts, cannot follow the token `previous`: an operand
+  # beside an operand, or after a regular expression (which ends its comparison) anything but
+  # a connective or a closing parenthesis. A comparison operator is left to the clause that
+  # reads it.
+  @spec leftover_token?(term(), binary()) :: boolean()
+  defp leftover_token?({:regex, _pattern}, text),
+    do: Regex.match?(~r/^(?:[\d.'"+\-*\/,(]|[A-Za-z_])/, text) and not connective?(text)
+
+  defp leftover_token?(previous, text),
+    do:
+      operand_end?(previous) and Regex.match?(~r/^(?:['"\d]|\.\d|[A-Za-z_])/, text) and
+        not connective?(text)
+
+  @spec operand_end?(term()) :: boolean()
+  defp operand_end?({kind, _value}) when kind in [:ident, :number, :str], do: true
+  defp operand_end?({:duration, _total, _text}), do: true
+  defp operand_end?({:raw, word}), do: String.upcase(word) in ["TRUE", "FALSE", "NOW()", ")"]
+  defp operand_end?(_token), do: false
+
+  @spec connective?(binary()) :: boolean()
+  defp connective?(text), do: Regex.match?(~r/^(?:AND|OR)(?![\w])/i, text)
 
   # An integer literal fits the unsigned 64-bit range, a negated one the
   # signed range; a number with a fraction has no range.
@@ -180,6 +210,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     cond do
       reserved_kind(acc) != :nom -> {:syntax_error, reserved_kind(acc), word <> rest}
       String.trim(rest) == "" -> {:syntax_error, :operand, rest}
+      String.starts_with?(String.trim_leading(rest), "/") -> {:syntax_error, :operand, rest}
       true -> tokenize(rest, [{:raw, word} | acc])
     end
   end

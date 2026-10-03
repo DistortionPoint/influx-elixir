@@ -1053,8 +1053,28 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
        when word in @negatable_words,
        do: predicate(rest, word)
 
+  # `SIMILAR TO` is an operator the double does not read; a `SIMILAR` with no `TO` after it is
+  # the engine's parse error, found at the word.
+  defp infix_step([{:word, _p, "SIMILAR", _l, _c}, {:word, _q, "TO", _l2, _c2} | _rest]),
+    do: throw(:bail)
+
+  defp infix_step([{:word, _p, "SIMILAR", _l, _c} | _rest] = tokens),
+    do: fail("IN or BETWEEN after NOT", tokens)
+
+  defp infix_step([
+         {:word, _p, "NOT", _l, _c},
+         {:word, _q, "SIMILAR", _l2, _c2},
+         {:word, _r, "TO", _l3, _c3} | _rest
+       ]),
+       do: throw(:bail)
+
+  defp infix_step([
+         {:word, _p, "NOT", _l, _c} | [{:word, _q, "SIMILAR", _l2, _c2} | _more] = tokens
+       ]),
+       do: fail("IN or BETWEEN after NOT", tokens)
+
   defp infix_step([{:word, _p, word, _l, _c} | _rest])
-       when word in ["SIMILAR", "COLLATE", "AT", "ISNULL", "NOTNULL", "ESCAPE", "NULL"],
+       when word in ["COLLATE", "AT", "ISNULL", "NOTNULL", "ESCAPE", "NULL"],
        do: throw(:bail)
 
   defp infix_step([{:word, _p, word, _l, _c}, {:symbol, _q, "(", _l2, _c2} | _rest])

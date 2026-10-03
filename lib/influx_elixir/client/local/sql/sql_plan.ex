@@ -21,6 +21,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     SQLExprCheck,
     SQLExprType,
     SQLFunctions,
+    SQLNativeType,
     SQLParser,
     SQLSchema,
     SQLWhere
@@ -32,6 +33,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   @type point :: InfluxElixir.Client.Local.SQLRow.point()
 
   @decimal "Decimal128(?)"
+  @tag "Dictionary(Int32, Utf8)"
 
   # What `AND` and `OR` accept: a boolean, or the null literal (typed `Null`).
   @logical ["Boolean", "Null"]
@@ -303,8 +305,10 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp plan_predicate_items({:call, _function, args} = call, {_function_above, cut}),
     do: plan_items(args, {true, cut}) ++ [mark(call, cut)]
 
-  defp plan_predicate_items({:cast, inner, _type}, {function_above, cut}),
-    do: plan_items(inner, {function_above, cut or not function_above})
+  defp plan_predicate_items({:cast, inner, _type} = node, {function_above, cut}),
+    do:
+      plan_items(inner, {function_above, cut or not function_above}) ++
+        [mark({:expr_check, node}, cut)]
 
   defp plan_predicate_items({:op, _op, left, right} = op, state),
     do: plan_items(left, state) ++ plan_items(right, state) ++ [mark(op, elem(state, 1))]
@@ -454,22 +458,25 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     do: check_item({:cut, call}, context, columns)
 
   # The parts of an expression over aggregates are typed with the aggregates'
-  # results. `MIN(NULL)` and `MAX(NULL)` have a type the engine prints from its
-  # own coercion rules (`Utf8 + Utf8` beside a text, verified against Core) that
-  # the double does not model, so an expression over one is refused by name.
+  # results. `MIN(NULL)` and `MAX(NULL)` are the null to the planner (verified against
+  # Core: `MIN(NULL) + 'a'` fails as `Utf8 + Utf8` does, `MIN(NULL) + 1` is null).
   defp check_item({:aggs, aggs, item}, context, columns) do
-    if Enum.any?(aggs, &null_extreme?/1) do
-      {:error, SQLError.refusal("an expression over MIN(NULL) or MAX(NULL)")}
-    else
-      check_item(item, context, Map.merge(columns, SQLAggType.types(aggs, columns)))
-    end
+    nulls = for {name, _column} = agg <- aggs, null_extreme?(agg), do: name
+
+    check_item(
+      nullify(item, nulls),
+      context,
+      Map.merge(columns, SQLAggType.types(aggs, columns))
+    )
   end
 
   defp check_item({:constant, call, ancestors}, context, _columns),
     do: SQLConstantCall.check(call, ancestors, context)
 
-  defp check_item({:call, function, args}, context, columns),
-    do: SQLFunctions.check(function, Enum.map(args, &SQLExprType.type_of(&1, columns)), context)
+  defp check_item({:call, function, args}, context, columns) do
+    types = Enum.map(args, &argument_type(function, &1, columns))
+    SQLFunctions.check(function, types, context)
+  end
 
   defp check_item({:op, op, left, right}, context, columns),
     do: check_arithmetic(op, left, right, context, columns)
@@ -488,6 +495,26 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     do: check_aggregate(agg, expr, columns)
 
   defp check_item(item, context, columns), do: check_where_item(item, context, columns)
+
+  # The `NULL` literal has the type `Null` to the functions whose signatures coerce it with the
+  # other arguments (`left(NULL, 1.5)` is a type error); to any other it is a type not known.
+  @spec argument_type(atom(), SQLExpr.t(), %{binary() => binary()}) :: binary() | nil
+  defp argument_type(function, {:lit, nil}, _columns)
+       when function in [:left, :right, :starts_with],
+       do: "Null"
+
+  defp argument_type(_function, arg, columns), do: SQLExprType.type_of(arg, columns)
+
+  # The plan item with the aggregates called `names` read as the null literal.
+  @spec nullify(term(), [binary()]) :: term()
+  defp nullify({:field, name}, names) when is_binary(name),
+    do: if(name in names, do: {:lit, nil}, else: {:field, name})
+
+  defp nullify(term, names) when is_tuple(term),
+    do: term |> Tuple.to_list() |> Enum.map(&nullify(&1, names)) |> List.to_tuple()
+
+  defp nullify(terms, names) when is_list(terms), do: Enum.map(terms, &nullify(&1, names))
+  defp nullify(other, _names), do: other
 
   @spec null_extreme?({binary(), term()}) :: boolean()
   defp null_extreme?({_name, {:aggregate, agg, {:lit, nil}, _alias}}), do: agg in [:min, :max]
@@ -589,7 +616,13 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
           %{binary() => binary()}
         ) :: :ok | {:error, map()}
   defp check_arithmetic(op, left, right, context, columns) do
-    case {SQLExprType.type_of(left, columns), SQLExprType.type_of(right, columns)} do
+    case {arithmetic_type(left, columns), arithmetic_type(right, columns)} do
+      {"Null", type} when is_binary(type) ->
+        null_operand(op, type, context)
+
+      {type, "Null"} when is_binary(type) ->
+        null_operand(op, type, context)
+
       {"Timestamp(ns)", "Timestamp(ns)"} when op == :- ->
         {:error,
          SQLError.refusal(
@@ -617,6 +650,46 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
       _typed_or_unknown ->
         :ok
     end
+  end
+
+  # The type of an operand of an arithmetic operator: the null literal is `Null` (which the
+  # engine coerces to the other operand's type), and an operation over it has the type of
+  # its other side.
+  @spec arithmetic_type(SQLParser.expr(), %{binary() => binary()}) :: binary() | nil | :mixed
+  defp arithmetic_type({:lit, nil}, _columns), do: "Null"
+
+  defp arithmetic_type({:op, _op, left, right} = expr, columns) do
+    case {arithmetic_type(left, columns), arithmetic_type(right, columns)} do
+      {"Null", "Null"} -> "Null"
+      {"Null", type} -> if is_numeric_type(type), do: type, else: nil
+      {type, "Null"} -> if is_numeric_type(type), do: type, else: nil
+      _typed -> SQLExprType.type_of(expr, columns)
+    end
+  end
+
+  defp arithmetic_type(expr, columns), do: SQLExprType.type_of(expr, columns)
+
+  # An operator with the null on one side: the engine types the null as the other side, so
+  # a number is fine and a text or a boolean is an operation on that type with itself.
+  @spec null_operand(atom(), binary(), SQLFunctions.context()) :: :ok | {:error, map()}
+  defp null_operand(_op, type, _context) when type == "Null" or is_numeric_type(type), do: :ok
+
+  defp null_operand(op, type, context) when type in ["Utf8", "Boolean", @tag] do
+    operation = "#{type} #{SQLExpr.symbol(op)} #{type}"
+
+    planning_error(
+      "Cannot get result type for arithmetic operation #{operation}: Invalid argument error: " <>
+        "Invalid arithmetic operation: #{operation}",
+      context
+    )
+  end
+
+  defp null_operand(_op, type, _context) do
+    {:error,
+     SQLError.refusal(
+       "an arithmetic operator with the null beside a #{type}: the engine's error for it is " <>
+         "not modelled"
+     )}
   end
 
   @spec check_negation(SQLParser.expr(), %{binary() => binary()}) :: :ok | {:error, map()}
@@ -758,7 +831,10 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp value_type(value, _columns), do: value_type(value)
 
   @spec boolean_mismatch?(binary(), binary()) :: boolean()
-  defp boolean_mismatch?(left, right), do: left == "Boolean" != (right == "Boolean")
+  defp boolean_mismatch?(left, right),
+    do:
+      left == "Boolean" != (right == "Boolean") or
+        SQLExprType.struct?(left) != SQLExprType.struct?(right)
 
   @spec boolean_mismatch_with?(binary(), binary() | nil | :unknown) :: boolean()
   defp boolean_mismatch_with?(column, type) when is_binary(type),
@@ -793,7 +869,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   # COUNT, MIN and MAX take any type; the others need a number. DataFusion
   # words each family differently (verified against Core).
   @spec aggregate_refusal(SQLParser.aggregate(), binary()) :: :ok | {:error, map()}
-  defp aggregate_refusal(agg, _type) when agg in [:count, :min, :max], do: :ok
+  defp aggregate_refusal(agg, _type) when agg in [:count, :count_distinct, :min, :max], do: :ok
   defp aggregate_refusal(_agg, type) when is_numeric_type(type), do: :ok
 
   defp aggregate_refusal(agg, type) do
@@ -821,7 +897,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   defp aggregate_head(agg, type) do
     "Function '#{agg}' expects NativeType::Numeric but received " <>
-      "NativeType::#{SQLFunctions.native(type)}"
+      "NativeType::#{SQLNativeType.native(type)}"
   end
 
   @spec aggregate_candidate(SQLParser.aggregate()) :: binary()

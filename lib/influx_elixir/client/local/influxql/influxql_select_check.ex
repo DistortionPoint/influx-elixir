@@ -41,7 +41,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   defp check_list(whole, masked, items_at) do
     rest = binary_part(masked, items_at, byte_size(masked) - items_at)
 
-    if rest == "" or reserved_item?(rest) or reserved_item?(skip_signs(rest)) do
+    if rest == "" or reserved_item?(rest) or reserved_item?(skip_signs(rest)) or
+         not field_start?(skip_signs(rest)) do
       {:error, {:engine, InfluxQLError.syntax_error_body(:field, items_at, whole)}}
     else
       check_from_keyword(whole, masked, items_at)
@@ -69,6 +70,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
 
   @spec skip_signs(binary()) :: binary()
   defp skip_signs(text), do: Regex.replace(~r/^(?:[+\-]\s*)+/, text, "")
+
+  # Whether a field can begin with the text: a name, a quoted name or string, a number, a
+  # duration, a wildcard, a regular expression, a parenthesis or a bind parameter. Any other
+  # character (`,`, `#`, `)`, a `.` with no digit after it) is where the engine expects a field.
+  @spec field_start?(binary()) :: boolean()
+  defp field_start?(text), do: Regex.match?(~r/^(?:[A-Za-z_"'*\/(\d]|\.\d|\$\w)/, text)
 
   # `DISTINCT` is read by the select list, not refused as a reserved word.
   @spec reserved_item?(binary()) :: boolean()
@@ -220,7 +227,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
       String.downcase(text) == "distinct" ->
         {:error, "unsupported InfluxQL (DISTINCT)"}
 
-      index > 0 and (text == "" or InfluxQLText.reserved_start(text, plain: true) != nil) ->
+      index > 0 and unreadable_start?(text) ->
         {:error, {:engine, InfluxQLError.syntax_error_body(:nom, 0, whole)}}
 
       body = reserved_operand(text, start, whole) ->
@@ -229,9 +236,49 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
       pos = reserved_alias(text, start) ->
         {:error, {:engine, InfluxQLError.syntax_error_body(:alias, pos, whole)}}
 
+      unreadable?(text) ->
+        {:error, {:engine, InfluxQLError.syntax_error_body(:nom, 0, whole)}}
+
       true ->
         :ok
     end
+  end
+
+  # Whether an item after the first cannot start a field.
+  @spec unreadable_start?(binary()) :: boolean()
+  defp unreadable_start?(text) do
+    not field_start?(skip_signs(text)) or InfluxQLText.reserved_start(text, plain: true) != nil
+  end
+
+  @spec unreadable?(binary()) :: boolean()
+  defp unreadable?(text), do: number_leftover?(text) or stray?(text)
+
+  # A `#`, or a `)` that closes nothing, is where the engine's parser stops reading the item
+  # and then the statement. A text with a regular expression is not read for them.
+  @spec stray?(binary()) :: boolean()
+  defp stray?(text) do
+    not Regex.match?(~r{(?:^|[(,])\s*/}, text) and
+      (String.contains?(text, "#") or excess_close?(String.to_charlist(text), 0))
+  end
+
+  @spec excess_close?(charlist(), non_neg_integer()) :: boolean()
+  defp excess_close?([], _depth), do: false
+  defp excess_close?([?) | _rest], 0), do: true
+  defp excess_close?([?) | rest], depth), do: excess_close?(rest, depth - 1)
+  defp excess_close?([?( | rest], depth), do: excess_close?(rest, depth + 1)
+  defp excess_close?([_char | rest], depth), do: excess_close?(rest, depth)
+
+  # A number is `\d*\.\d+` or `\d+`, or a duration of such counts and units: one that a
+  # letter, digit, underscore or dot follows (`1_0`, `1e3`, `0x10`, `5.`) leaves the rest of
+  # the text unread, and the engine fails the whole statement. A text with a regular
+  # expression is not read for numbers.
+  @spec number_leftover?(binary()) :: boolean()
+  defp number_leftover?(text) do
+    not Regex.match?(~r{(?:^|[(,])\s*/}, text) and
+      Regex.match?(
+        ~r/(?<![\w.])(?>(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+|\d*\.\d+|\d+)(?=[A-Za-z0-9_.])/u,
+        text
+      )
   end
 
   # The first place a reserved word stands where an operand is wanted: after

@@ -42,16 +42,22 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   text after the table, to the items they name. `columns` is the select list;
   `namer` gives the output name of an item without an alias, or `nil`
   when the double cannot write it (the item then stands for itself).
+  `qualified` holds the names the `GROUP BY` wrote with a relation, which no select item is
+  called.
   """
-  @spec resolve_references(binary(), binary(), (binary() -> binary() | nil)) ::
-          {:ok, binary()} | {:error, SQLError.t()}
-  def resolve_references(columns, rest, namer) do
+  @spec resolve_references(
+          binary(),
+          binary(),
+          (binary() -> binary() | nil),
+          MapSet.t(binary())
+        ) :: {:ok, binary()} | {:error, SQLError.t()}
+  def resolve_references(columns, rest, namer, qualified) do
     items =
       columns
       |> SQLMask.split_commas()
       |> Enum.map(&(&1 |> String.trim() |> select_item(namer)))
 
-    with {:ok, rest} <- rewrite_clause(rest, @group_clause, &group_term(&1, items)) do
+    with {:ok, rest} <- rewrite_clause(rest, @group_clause, &group_term(&1, items, qualified)) do
       rewrite_clause(rest, @order_clause, &order_term(&1, items))
     end
   end
@@ -108,14 +114,18 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
     end
   end
 
-  @spec group_term(binary(), [{binary(), binary()}]) :: {:ok, binary()} | {:error, map()}
-  defp group_term(term, items) do
+  # A name written with its relation (`t.alias`) is a column of it, not a select item.
+  @spec group_term(binary(), [{binary(), binary()}], MapSet.t(binary())) ::
+          {:ok, binary()} | {:error, map()}
+  defp group_term(term, items, qualified) do
     case positional(term, items) do
       {:ok, {expr, _name}} ->
         {:ok, expr}
 
       :not_positional ->
-        case Enum.find(items, fn {expr, name} -> name == term and expr != term end) do
+        case Enum.find(items, fn {expr, name} ->
+               name == term and expr != term and not MapSet.member?(qualified, term)
+             end) do
           {expr, _name} -> {:ok, expr}
           nil -> {:ok, term}
         end

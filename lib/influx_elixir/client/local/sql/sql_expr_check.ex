@@ -18,7 +18,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   # `COALESCE`, a comparison of `time`, a `CASE` condition that is not a
   # boolean) is refused by name. A type not known is never refused.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLExprType}
+  alias InfluxElixir.Client.Local.{SQLCast, SQLError, SQLExpr, SQLExprType}
 
   @type context :: :select | :where | :order_by
 
@@ -55,6 +55,9 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
   def check({:concat, left, right}, columns, context),
     do: check_concat(left, right, columns, context)
+
+  def check({:cast, inner, target}, columns, _context),
+    do: check_cast(type(inner, columns), target)
 
   def check({:case, operand, whens, otherwise}, columns, _context),
     do: check_case(operand, whens, otherwise, columns)
@@ -159,18 +162,40 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
              )}
 
           text?(l) or text?(r) ->
-            :ok
+            if SQLExprType.struct?(l) or SQLExprType.struct?(r),
+              do: concat_error(l, r, context),
+              else: :ok
 
           true ->
-            planner(
-              "Cannot infer common string type for string concat operation #{l} || #{r}",
-              context
-            )
+            concat_error(l, r, context)
         end
 
       _text_or_unknown ->
         :ok
     end
+  end
+
+  @spec concat_error(binary(), binary(), context()) :: {:error, map()}
+  defp concat_error(left, right, context) do
+    planner(
+      "Cannot infer common string type for string concat operation #{left} || #{right}",
+      context
+    )
+  end
+
+  # A struct (the result of a selector) cannot be cast to anything.
+  @spec check_cast(SQLExprType.type(), SQLExpr.cast_type()) :: :ok | {:error, map()}
+  defp check_cast(type, target) do
+    if SQLExprType.struct?(type),
+      do:
+        {:error,
+         %{
+           status: 405,
+           body:
+             "This feature is not implemented: Unsupported CAST from #{type} to " <>
+               SQLCast.arrow_type(target)
+         }},
+      else: :ok
   end
 
   @spec type(SQLExpr.t(), %{binary() => binary()}) :: SQLExprType.type()
@@ -190,6 +215,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   @spec incompatible?(binary(), binary()) :: boolean()
   defp incompatible?(left, right) do
     left == "Boolean" != (right == "Boolean") or
+      SQLExprType.struct?(left) != SQLExprType.struct?(right) or
       ("Timestamp(ns)" in [left, right] and
          Enum.any?([left, right], &(&1 in ["Int64", "UInt64", "Float64"])))
   end
@@ -208,7 +234,8 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
       "Timestamp(ns)" in [left, right] ->
         timestamp_comparison(op, left, right, context)
 
-      left == "Boolean" != (right == "Boolean") ->
+      left == "Boolean" != (right == "Boolean") or
+          SQLExprType.struct?(left) != SQLExprType.struct?(right) ->
         planner(
           "Cannot infer common argument type for comparison operation #{left} " <>
             "#{SQLExpr.symbol(op)} #{right}",

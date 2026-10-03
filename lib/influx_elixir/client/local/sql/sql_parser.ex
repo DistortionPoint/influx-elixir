@@ -128,6 +128,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           cross_join: {binary(), [binary()]} | nil,
           qualifier: binary(),
           qualified: %{binary() => binary()},
+          qualified_in: SQLQualifier.zones(),
           plan_error: SQLError.t() | nil,
           limit_error: SQLError.t() | nil,
           table_error: SQLError.t() | nil,
@@ -258,7 +259,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     {sql, cross_join} =
       sql |> String.trim() |> SQLNoFrom.add_table() |> SQLQualifier.split_cross_join()
 
-    {normalised, qualifier, qualified} = SQLQualifier.strip(sql, cross_join)
+    {normalised, qualifier, qualified, zones} = SQLQualifier.strip(sql, cross_join)
 
     {normalised, on} = SQLDistinctOn.split(normalised)
 
@@ -269,7 +270,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     with :ok <- check_clauses(normalised),
          :ok <- SQLDistinctOn.check_grouping(on, normalised, &select_list/1),
          {:ok, split} <- split_select(normalised),
-         {:ok, split, normalised} <- resolve_references(split, normalised, naming),
+         {:ok, split, normalised} <- resolve_references(split, normalised, naming, zones),
          {:ok, query} <- dispatch_select(split, normalised, naming),
          {:ok, query} <- SQLDistinctOn.apply(query, on) do
       {:ok,
@@ -278,6 +279,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          | cross_join: cross_join,
            qualifier: qualifier,
            qualified: qualified,
+           qualified_in: zones,
            table_error: split.table_error
        }}
     end
@@ -286,14 +288,20 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # `GROUP BY 1`, `ORDER BY 2 DESC` and `GROUP BY bucket` (a select alias)
   # name select items; the clauses are rewritten to them before anything
   # else reads the text.
-  @spec resolve_references(split(), binary(), binary() | nil) ::
+  @spec resolve_references(split(), binary(), binary() | nil, SQLQualifier.zones()) ::
           {:ok, split(), binary()} | {:error, map()}
-  defp resolve_references(%{columns: "*"} = split, sql, _qualifier), do: {:ok, split, sql}
+  defp resolve_references(%{columns: "*"} = split, sql, _qualifier, _zones),
+    do: {:ok, split, sql}
 
-  defp resolve_references(%{rest: rest} = split, sql, qualifier) do
+  defp resolve_references(%{rest: rest} = split, sql, qualifier, zones) do
     with :ok <- reject_mixed_star(split.columns),
          {:ok, rewritten} <-
-           SQLClauses.resolve_references(split.columns, rest, &item_name(&1, qualifier)) do
+           SQLClauses.resolve_references(
+             split.columns,
+             rest,
+             &item_name(&1, qualifier),
+             Map.get(zones, :group, MapSet.new())
+           ) do
       {:ok, %{split | rest: rewritten}, String.replace_suffix(sql, rest, rewritten)}
     end
   end
@@ -515,6 +523,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         cross_join: nil,
         qualifier: measurement,
         qualified: %{},
+        qualified_in: %{},
         plan_error: SQLClauses.empty_tuple_error(rest) || SQLLimit.planning_error(rest),
         limit_error: SQLLimit.deferred(rest),
         table_error: nil,

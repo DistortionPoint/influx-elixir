@@ -67,6 +67,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-10-02 | [`fourth-review`](2026-10-02_fourth-review.md) | Local: float overflow answers null, UInt64 columns typed, `INTEGER` casts are Int32, failing constants fold to the optimizer's 500, executor split; InfluxQL reserved words and second statements; re-entrant lock raises; whole-result `===` assertions, clock-free backpressure test |
 | 2026-10-02 | [`third-review`](2026-10-02_third-review.md) | Local: unaliased aggregates named as DataFusion names them, empty time and numeric ranges fail as on Core, qualified field lists, number literals, UTC aliases; InfluxQL parse errors and `GROUP BY` order; store locks without `:global`; strict `===` in contract tests |
 | 2026-10-02 | [`local-write-concurrency-retention-and-mixed-types`](2026-10-02_local-write-concurrency-retention-and-mixed-types.md) | Local: batched store writes (50 concurrent writers in 0.4 s, was a timeout), bounded chunked parse, v2 retention 422, mixed field types cut at the first differing group, `delete_bucket` clears data |
+| 2026-10-04 | [`ninth-review`](2026-10-04_ninth-review.md) | Cause of the Core `timestamp wraparound` panic (forced snapshot of a near-largest timestamp; `--wal-snapshot-size 100000`), regressions in the 0.1.41 fixes, `mix test` alias via OptionParser, refusal ratchet pins sets |
 | 2026-10-03 | [`eighth-review`](2026-10-03_eighth-review.md) | Defects in 0.1.41: InfluxQL transform crashes and empty wildcard answers, SQL engine-shaped errors, retention read cost, `mix test` path handling, refusal ratchet, Core image pinned |
 | 2026-10-03 | [`seventh-review`](2026-10-03_seventh-review.md) | Review of 69cf692: InfluxQL GROUP BY wrong answers and fill(none) hang fixed, dashboard refusal rates cut (InfluxQL 37%→2.4%, SQL 57%→23%), retention modelled, each fact pinned once, mix test skips integration compiles |
 | 2026-10-03 | [`local-database-retention`](2026-10-03_local-database-retention.md) | Local applies a v3 database's `retention:` as Core does: writes accepted, reads hide 10-minute chunks older than `now - retention`, schema stays, `0` is a zero period, `SHOW RETENTION POLICIES` prints it (`1h0m0s`) |
@@ -107,10 +108,14 @@ exactly the tests it always ran.
 ```bash
 # InfluxDB 3 Core on 8181 (HTTP and Flight, no auth). A write is answered
 # once the WAL flushes, every second by default; 10ms takes the suite from
-# minutes to seconds and changes no answer.
+# minutes to seconds and changes no answer. Core forces a snapshot after
+# three times --wal-snapshot-size WAL files, and a snapshot of a point near
+# the largest timestamp panics ("timestamp wraparound"; writes then hang
+# until restart), which the contracts write; a large snapshot size keeps a
+# test run far from that.
 docker run -d --rm --name influx3_verify -p 8181:8181 influxdb:3.10.1-core \
   influxdb3 serve --node-id node0 --object-store memory --without-auth \
-  --wal-flush-interval 10ms
+  --wal-flush-interval 10ms --wal-snapshot-size 100000
 mix test test/integration/contract_v3_core --include v3_core --include integration
 
 # InfluxDB 2.7 on 8086 (org dev-influx, bucket metrics)
@@ -125,7 +130,7 @@ mix test test/integration/contract_v2 --include v2 --include integration
 # creates the operator token, once per fresh server; or set
 # INFLUX_V3_AUTH_TOKEN)
 docker run -d --rm --name influx3_auth -p 8183:8181 influxdb:3.10.1-core \
-  influxdb3 serve --node-id node0 --object-store memory --wal-flush-interval 10ms
+  influxdb3 serve --node-id node0 --object-store memory --wal-flush-interval 10ms --wal-snapshot-size 100000
 mix test test/integration/tokens_v3_core_auth_test.exs --include v3_core_auth --include integration
 
 docker stop influx3_verify influx2_verify influx3_auth

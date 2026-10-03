@@ -5,6 +5,10 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   # below trigger those deliberately, so keep the output out of the run.
   @moduletag capture_log: true
 
+  # A ceiling on waits for answers that will come: generous, so a loaded
+  # machine cannot fail a correct test, and never what a test measures.
+  @await 30_000
+
   alias InfluxElixir.Client.Local
   alias InfluxElixir.TestServer
   alias InfluxElixir.TestSupport.Await
@@ -588,7 +592,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     reader = Task.async(fn -> BatchWriter.stats(pid) end)
     Await.until(fn -> queued_calls(pid, :stats) == 1 end)
     TestServer.respond(handler, status)
-    Task.await(reader)
+    Task.await(reader, @await)
   end
 
   # An owner for a server that answers every request itself with `status`
@@ -651,7 +655,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       writer = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
 
       assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 0, 0)
-      assert :ok = Task.await(writer)
+      assert :ok = Task.await(writer, @await)
       assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 0, 0)
       assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 1, 0)
 
@@ -670,7 +674,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       writer = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
 
       assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 0, 0)
-      assert :ok = Task.await(writer)
+      assert :ok = Task.await(writer, @await)
       assert answer_with_stats(pid, "cpu value=1.0", 204) === stats(1, 0, 13)
     end
 
@@ -719,8 +723,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       Await.until(fn -> queued_calls(pid, :write) == 1 end)
 
       TestServer.respond(held, 503)
-      assert :ok = Task.await(first)
-      assert :ok = Task.await(second)
+      assert :ok = Task.await(first, @await)
+      assert :ok = Task.await(second, @await)
 
       # Chain 1's one retry fails and ends it (error 1); the deferred line then
       # flushes into chain 2, which succeeds.
@@ -748,7 +752,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 0, 0)
       assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 1, 0)
 
-      assert {:error, %{status: 503}} = Task.await(caller)
+      assert {:error, %{status: 503}} = Task.await(caller, @await)
       refute_received {:request, _handler, _body}
       assert Process.alive?(pid)
     end
@@ -775,8 +779,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
         TestServer.respond(handler, if(body == "cpu value=1.0", do: 400, else: 204))
       end
 
-      assert {:error, %{status: 400}} = Task.await(one)
-      assert :ok = Task.await(two)
+      assert {:error, %{status: 400}} = Task.await(one, @await)
+      assert :ok = Task.await(two, @await)
       assert BatchWriter.stats(pid) === stats(1, 1, 13)
     end
 
@@ -804,13 +808,13 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       Await.until(fn -> queued_calls(pid, :flush) == 1 end)
 
       TestServer.respond(held, 503)
-      assert :ok = Task.await(first)
+      assert :ok = Task.await(first, @await)
 
       # Chain 2's first attempt, started by the queued flush before any retry.
       assert_receive {:request, chain_two, "cpu value=2.0"}, 5_000
       TestServer.respond(chain_two, 503)
-      assert :ok = Task.await(second)
-      assert :ok = Task.await(flush)
+      assert :ok = Task.await(second, @await)
+      assert :ok = Task.await(flush, @await)
 
       held_retry = answer_until_chain_two_is_held(false)
 
@@ -831,7 +835,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       # have forgotten it.
       TestServer.respond(held_retry, 503)
 
-      assert Enum.map(writes, &Task.await/1) ===
+      assert Enum.map(writes, &Task.await(&1, @await)) ===
                List.duplicate(:ok, 10) ++ [{:error, :buffer_full}]
 
       # The next request is chain 2's retry, not a flush of the ten lines; it
@@ -866,7 +870,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       # terminate/2 writes the chain's batch once more, answering its caller
       # with that result, and then the buffer.
-      assert {:error, %{status: 503}} = Task.await(caller)
+      assert {:error, %{status: 503}} = Task.await(caller, @await)
       assert seen_bodies() === ["cpu value=1.0", "cpu value=2.0"]
     end
 
@@ -878,7 +882,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert_receive {:request, handler, "cpu value=1.0"}, 5_000
       TestServer.respond(handler, 503)
 
-      assert {:error, %{status: 503}} = Task.await(caller)
+      assert {:error, %{status: 503}} = Task.await(caller, @await)
       assert BatchWriter.stats(pid) === stats(0, 1, 0)
       refute_received {:request, _handler, _body}
     end

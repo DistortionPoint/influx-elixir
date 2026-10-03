@@ -51,6 +51,10 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
 
   def type_of(expr, columns), do: SQLFunctions.type_of(expr, columns)
 
+  @doc "Whether an Arrow type is a struct (the result of a selector), which has no common type."
+  @spec struct?(type()) :: boolean()
+  def struct?(type), do: is_binary(type) and String.starts_with?(type, "Struct(")
+
   @doc "See `InfluxElixir.Client.Local.SQLCommonType.common/2`."
   @spec common([type()], :case | :coalesce) :: type()
   defdelegate common(types, mode), to: SQLCommonType

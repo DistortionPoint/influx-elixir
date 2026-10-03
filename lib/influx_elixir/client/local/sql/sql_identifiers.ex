@@ -12,7 +12,10 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
   #   * a double-quoted identifier keeps its case: `"Host"` is column `Host`
   #   * string literals (`'Abc'`) and `$name` placeholders are left as they are
   #   * a number ends where the engine's tokenizer ends it, and a word right after it is a
-  #     word of its own: `1_000` is `1` and the alias `_000`, `0b1` is `0` and `b1`
+  #     word of its own: `1_000` is `1` and the alias `_000`, `0b1` is `0` and `b1`. The
+  #     tokenizer's `L` after a number (`1L`, `1.5L`, `1e3L`) belongs to it and reads as a
+  #     plain number, so `1LL` is `1L` and the alias `L`; `0x` followed by hexadecimal digits
+  #     is a binary value, but `0X` is `0` and the alias `X`
   #
   # A quoted identifier that is a plain word is written back bare, so the
   # parser — which folds nothing — sees its exact name. One that needs its
@@ -28,7 +31,10 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
                interval true false cast having union except intersect minus left right inner
                full natural outer using window qualify fetch all)
 
-  @number ~r/\A(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/
+  # The one definition of a number token: a hexadecimal value (`0x` in lower case, digits
+  # optional) or decimal digits with an optional fraction and exponent (`1e` is `1` and the
+  # word `e`) and an optional `L`.
+  @number ~r/\A(?:0x[0-9a-fA-F]*|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?L?)/
 
   @doc "Folds unquoted identifiers to lower case and unwraps plain quoted ones."
   @spec normalize(binary()) :: binary()
@@ -52,12 +58,6 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
     scan(rest, [[?$, name] | acc])
   end
 
-  # `0x1F` is one token: a binary value to the engine.
-  defp scan(<<?0, x, _rest::binary>> = sql, acc) when x in [?x, ?X] do
-    {number, rest} = take_word(sql, [])
-    scan(rest, [number | acc])
-  end
-
   defp scan(<<c, _rest::binary>> = sql, acc) when c in ?0..?9, do: scan_number(sql, acc)
 
   defp scan(<<?., d, _rest::binary>> = sql, acc) when d in ?0..?9, do: scan_number(sql, acc)
@@ -73,19 +73,35 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
 
   # A number (`1e5`, `2.5`) is copied whole, so its exponent is not a word; the word after
   # it is set apart by a space, which the passes after this one read as the tokenizer does.
+  # The `L` of `1L` is dropped: it changes nothing the passes after this one read.
   @spec scan_number(binary(), iodata()) :: iodata()
   defp scan_number(sql, acc) do
-    [number] = Regex.run(@number, sql)
-    rest = binary_part(sql, byte_size(number), byte_size(sql) - byte_size(number))
+    {number, rest} = take_number(sql)
+
+    plain =
+      if String.starts_with?(number, "0x"), do: number, else: String.trim_trailing(number, "L")
 
     case rest do
-      <<c::utf8, _more::binary>> -> scan(rest, [separator(c), number | acc])
-      _end -> scan(rest, [number | acc])
+      <<c::utf8, _more::binary>> -> scan(rest, [separator(c, plain != number), plain | acc])
+      _end -> scan(rest, [plain | acc])
     end
   end
 
-  @spec separator(char()) :: binary()
-  defp separator(c), do: if(word_char?(c), do: " ", else: "")
+  @doc """
+  The number token at the start of a text that begins with a digit, or with a `.` and a
+  digit, and the text after it: the one definition of where a number ends (see the module
+  documentation), for every pass that reads a SQL text.
+  """
+  @spec take_number(binary()) :: {binary(), binary()}
+  def take_number(text) do
+    [number] = Regex.run(@number, text)
+    {number, binary_part(text, byte_size(number), byte_size(text) - byte_size(number))}
+  end
+
+  # What keeps the text after a number a token of its own: a space where a word follows, or
+  # where an `L` was dropped (`1L'a'` is `1` and the string, not `1'a'`).
+  @spec separator(char(), boolean()) :: binary()
+  defp separator(c, dropped?), do: if(dropped? or word_char?(c), do: " ", else: "")
 
   @spec quoted_or_rest(binary(), char()) :: {binary(), binary()}
   defp quoted_or_rest(text, mark) do
@@ -139,6 +155,11 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
   @doc "Whether a byte is an ASCII letter, digit or `_`, for the passes that read bytes."
   @spec word_byte?(byte()) :: boolean()
   def word_byte?(byte), do: byte in ?a..?z or byte in ?A..?Z or byte in ?0..?9 or byte == ?_
+
+  @doc "Whether the text goes on with a byte `word_byte?/1` accepts."
+  @spec word_next?(binary()) :: boolean()
+  def word_next?(<<byte, _rest::binary>>), do: word_byte?(byte)
+  def word_next?(<<>>), do: false
 
   @spec quoted_identifier(binary()) :: iodata()
   defp quoted_identifier(name) do

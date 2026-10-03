@@ -54,8 +54,10 @@ against the double.
 
 Core panicked with `timestamp wraparound` four times this week, each time
 under agent probing or concurrent, killed suite runs; afterwards its write
-path hangs until restart. Sequential suite runs have not triggered it. Not
-reported upstream from here.
+path hangs until restart. Not reported upstream from here. (A sequential
+suite run did trigger it later; the cause, a forced snapshot of a point near
+the largest timestamp, is in
+[`2026-10-04_ninth-review`](2026-10-04_ninth-review.md).)
 
 ## Known differences left
 

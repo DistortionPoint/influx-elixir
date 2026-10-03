@@ -94,10 +94,12 @@ defmodule InfluxElixir.MixProject do
   # them is excluded by tag unless `--include integration` is given. A bare
   # `mix test` therefore runs only the test directories that are not
   # `test/integration`. The integration suites are compiled when a path is
-  # named, an integration tag is included, or INTEGRATION=1 is set:
+  # named, an integration tag is selected, or INTEGRATION=1 is set. One
+  # server's suite is selected by its tag alone (`--include integration`
+  # would also select every other server's):
   #
+  #     mix test --only v3_core
   #     mix test test/integration/contract_v3_core --include integration --include v3_core
-  #     mix test --include integration --include v3_core
   @non_unit_test_entries ~w(integration support fixtures test_helper.exs)
 
   defp run_tests(args) do
@@ -105,11 +107,30 @@ defmodule InfluxElixir.MixProject do
   end
 
   # The unit paths are prepended only when nothing else says which tests to
-  # run: no path (relative, `./` or absolute), no `--failed` or `--stale`
-  # (Mix's own manifests choose those), and no `--include`/`--only` of an
-  # integration tag (asking for a tier means compiling it).
+  # run: no path, no `--failed` or `--stale` (Mix's own manifests choose
+  # those), and no `--include`/`--only` of an integration tag. The arguments
+  # are read as `mix test` reads them, so `--only=v2` and a value after a
+  # switch are not taken for paths.
   @integration_tags ~w(integration v2 v3_core v3_core_auth v3_enterprise)
-  @manifest_flags ~w(--failed --stale)
+  @test_switches [
+    include: :keep,
+    exclude: :keep,
+    only: :keep,
+    failed: :boolean,
+    stale: :boolean,
+    cover: :boolean,
+    trace: :boolean,
+    raise: :boolean,
+    color: :boolean,
+    warnings_as_errors: :boolean,
+    seed: :integer,
+    slowest: :integer,
+    max_cases: :integer,
+    max_failures: :integer,
+    timeout: :integer,
+    formatter: :keep,
+    partitions: :integer
+  ]
 
   defp test_args(args, integration) do
     if integration in [nil, "", "0"] and not explicit_selection?(args) do
@@ -120,21 +141,11 @@ defmodule InfluxElixir.MixProject do
   end
 
   defp explicit_selection?(args) do
-    Enum.any?(args, &(&1 in @manifest_flags or test_path?(&1))) or
-      integration_tag_requested?(args)
-  end
+    {opts, paths, _unknown} = OptionParser.parse(args, switches: @test_switches)
+    tags = Keyword.get_values(opts, :include) ++ Keyword.get_values(opts, :only)
 
-  defp integration_tag_requested?([flag, tag | rest]) when flag in ["--include", "--only"] do
-    hd(String.split(tag, ":")) in @integration_tags or integration_tag_requested?(rest)
-  end
-
-  defp integration_tag_requested?([_arg | rest]), do: integration_tag_requested?(rest)
-  defp integration_tag_requested?([]), do: false
-
-  defp test_path?(arg) do
-    [path | _line_filters] = String.split(arg, ":")
-    relative = Path.relative_to_cwd(Path.expand(path))
-    String.starts_with?(relative, "test") and File.exists?(relative)
+    paths != [] or opts[:failed] == true or opts[:stale] == true or
+      Enum.any?(tags, &(hd(String.split(&1, ":")) in @integration_tags))
   end
 
   defp unit_test_paths do

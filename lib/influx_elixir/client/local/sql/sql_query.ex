@@ -275,6 +275,9 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     end
   end
 
+  # A name: a word or a quoted one, dotted.
+  @object ~S{(?:[\w$]+|"(?:[^"]|"")*")(?:\.(?:[\w$]+|"(?:[^"]|"")*"))*}
+
   # Regexes nested in a list cannot be module attributes on OTP 28, so the
   # table is a function.
   @spec statement_kinds() :: [{Regex.t(), atom() | {:planning | :refusal, binary()}}]
@@ -283,14 +286,22 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
       # Statements the engine answers with rows. The ones the double does
       # not model (EXPLAIN, SHOW TABLES, DESCRIBE) reach its parser and are
       # refused by name there, not reported as unimplemented.
-      {~r/^(?i)(?:SELECT|WITH|EXPLAIN|SHOW|DESCRIBE)\b|^\(/, :query},
+      {~r/^(?i)(?:SELECT|WITH|EXPLAIN|SHOW|DESC|DESCRIBE)\b|^\(/, :query},
       {~r/^(?i)DELETE\b/, :delete},
       {~r/^(?i)VALUES\b/, {:refusal, "a VALUES statement: the double reads no VALUES rows"}},
       {~r/^(?i)INSERT\b/, {:planning, "DML not supported: Insert Into"}},
       {~r/^(?i)UPDATE\b/, {:planning, "DML not supported: Update"}},
       {~r/^(?i)CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b/,
        {:planning, "DDL not supported: CreateView"}},
-      {~r/^(?i)CREATE\s+(?:DATABASE|SCHEMA)\b/, {:planning, "DDL not supported: CreateCatalog"}},
+      {~r/^(?i)CREATE\s+DATABASE\s+(?:IF\s+NOT\s+EXISTS\s+)?#{@object}\s*;?\s*$/,
+       {:planning, "DDL not supported: CreateCatalog"}},
+      {~r/^(?i)CREATE\s+SCHEMA\s+(?:IF\s+NOT\s+EXISTS\s+)?#{@object}\s*;?\s*$/,
+       {:planning, "DDL not supported: CreateCatalogSchema"}},
+      {~r/^(?i)DROP\s+SCHEMA\s+(?:IF\s+EXISTS\s+)?#{@object}(?:\s+(?:CASCADE|RESTRICT))?\s*;?\s*$/,
+       {:planning, "DDL not supported: DropCatalogSchema"}},
+      {~r/^(?i)(?:CREATE|DROP)\s+(?:DATABASE|SCHEMA)\b/,
+       {:refusal,
+        "that CREATE or DROP of a database or a schema: the engine's error for it is not modelled"}},
       {~r/^(?i)CREATE\s+TABLE\b/, {:planning, "DDL not supported: CreateMemoryTable"}},
       {~r/^(?i)DROP\s+VIEW\b/, {:planning, "DDL not supported: DropView"}},
       {~r/^(?i)DROP\s+TABLE\b/, {:planning, "DDL not supported: DropTable"}},

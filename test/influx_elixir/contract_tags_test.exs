@@ -34,7 +34,8 @@ defmodule InfluxElixir.ContractTagsTest do
   # The fewest tests the scan must find in each contract (a little under the count
   # when they were set; raise them with the contract, never lower them to pass).
   @floors %{
-    "client_contract" => 150,
+    "client_contract" => 183,
+    "client_contract/line_protocol.ex" => 15,
     "contract/flux_contract.ex" => 27,
     "contract/influxql_flux_lp_contract.ex" => 88,
     "contract/sql_aggregates_contract.ex" => 26,
@@ -48,7 +49,7 @@ defmodule InfluxElixir.ContractTagsTest do
     "token_contract.ex" => 9
   }
 
-  @total_floor 600
+  @total_floor 727
 
   setup_all do
     files =

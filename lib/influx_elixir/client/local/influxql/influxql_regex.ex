@@ -20,13 +20,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
   #         ^^^
   #     error: look-around, including look-ahead and look-behind, is not supported
   #
-  # (`unrecognized flag` for `(?>`). A pattern the double's engine cannot compile
-  # is refused by name, not given another body.
+  # (`unrecognized flag` for `(?>`, and for any letter of a flag group the crate has none
+  # for: `(?n)`). A pattern the double's engine cannot compile, and a flag group whose error
+  # the double does not word, is refused by name, not given another body.
   #
   # Every function throws `{:refused, message}` or `{:refused, {:engine, 500, body}}`.
 
   @kept_letters ~c"dDwWsSpPx"
   @look_around "look-around, including look-ahead and look-behind, is not supported"
+  @flag_letters ["i", "m", "s", "U", "u", "x", "R"]
+  @not_flags ["P", "<", "#", "(", "|", "=", "!"]
 
   @doc "The pattern as the double's regex engine reads it, or a throw."
   @spec pattern(binary()) :: binary()
@@ -86,19 +89,65 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
   defp scan(["(", "?", "<", c | _rest], index, 0, regex) when c in ["=", "!"],
     do: group_error(regex, index, 4, @look_around)
 
-  defp scan(["(", "?", ">" | _rest], index, 0, regex),
-    do: group_error(regex, index + 2, 1, "unrecognized flag")
-
   defp scan(["(", "?", c | rest], index, 0, regex) when c in ["#", "(", "|"],
     do: scan_refuse(rest, index, c, regex)
 
   defp scan(["(", "?", "P", "=" | rest], index, 0, regex),
     do: scan_refuse(rest, index, "P=", regex)
 
+  defp scan(["(", "?", c | rest], index, 0, regex) when c not in @not_flags do
+    check_flags([c | rest], index + 2, [], "", regex)
+    scan(["?", c | rest], index + 1, 0, regex)
+  end
+
   defp scan([_other | rest], index, class, regex), do: scan(rest, index + 1, class, regex)
+
+  # The flags of `(?flags)` and `(?flags:`, up to the character that ends them: a letter the
+  # crate has no flag for is its error where it stands; the other faults of a flag group
+  # (a repeated flag or negation, a negation with no flag after it, an end of the pattern)
+  # are not worded by the double.
+  @spec check_flags([binary()], non_neg_integer(), [binary()], binary(), binary()) ::
+          :ok
+  defp check_flags([], _at, _seen, _last, _regex), do: unworded_flags()
+
+  defp check_flags([")" | _rest], at, [], _last, regex),
+    do: group_error(regex, at - 1, 1, "repetition operator missing expression")
+
+  defp check_flags([closer | _rest], at, _seen, last, regex) when closer in [")", ":"],
+    do:
+      if(last == "-",
+        do: group_error(regex, at - 1, 1, "dangling flag negation operator"),
+        else: :ok
+      )
+
+  defp check_flags(["-" | rest], at, seen, _last, regex) do
+    if "-" in seen,
+      do: unworded_flags(),
+      else: check_flags(rest, at + 1, ["-" | seen], "-", regex)
+  end
+
+  # `R` is the crate's flag for CRLF line ends, where the double's engine reads recursion.
+  defp check_flags(["R" | _rest], _at, _seen, _last, _regex), do: unworded_flags()
+
+  defp check_flags([c | rest], at, seen, _last, regex) when c in @flag_letters do
+    if c in seen,
+      do: unworded_flags(),
+      else: check_flags(rest, at + 1, [c | seen], c, regex)
+  end
+
+  defp check_flags([_other | _rest], at, _seen, _last, regex),
+    do: group_error(regex, at, 1, "unrecognized flag")
 
   defp scan_refuse(_rest, _index, group, _regex),
     do: throw({:refused, "unsupported InfluxQL (the regular expression group (?#{group})"})
+
+  @spec unworded_flags() :: no_return()
+  defp unworded_flags,
+    do:
+      throw(
+        {:refused,
+         "unsupported InfluxQL (a regular expression flag group the double does not word)"}
+      )
 
   @spec group_error(binary(), non_neg_integer(), pos_integer(), binary()) :: no_return()
   defp group_error(regex, column, width, message) do

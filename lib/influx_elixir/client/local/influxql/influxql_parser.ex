@@ -38,7 +38,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
           )
 
   @function ~r/^(?<fn>[A-Za-z_]\w*)\s*\(\s*(?<arg>\*|"[^"]+"|'(?:[^'\\]|\\.)*'|[+-]?[\w.]+)\s*\)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is
-  @literal ~r/^(?:'(?:[^'\\]|\\.)*'|[+-]?(?:\d+\.\d+|\.\d+|\d+)|\d+(?:ns|ms|u|µ|s|m|h|d|w)|true|false)(?:\s+AS\s+(?:"[^"]+"|\w+))?$/isu
+  @literal ~r/^(?:'(?:[^'\\]|\\.)*'|[+-]?(?:\d+\.\d+|\.\d+|\d+)|(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+|true|false)(?:\s+AS\s+(?:"[^"]+"|\w+))?$/isu
   @count_distinct ~r/^count\s*\(\s*distinct(?:\s*\(\s*(?<arg>"[^"]+"|[A-Za-z_][\w.]*)\s*\)|\s+(?<bare>"[^"]+"|[A-Za-z_][\w.]*))\s*\)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is
   @column ~r/^(?<col>"[^"]+"|[\w.]+)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is
 
@@ -311,12 +311,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # Arithmetic over fields and aggregates, with its alias.
   @spec expression_item(binary()) :: {:ok, InfluxQL.item()} | {:error, binary()}
   defp expression_item(text) do
-    %{"body" => body, "alias" => alias} =
-      Regex.named_captures(~r/^(?<body>.+?)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is, text)
+    case Regex.named_captures(~r/^(?<body>.+?)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is, text) do
+      %{"body" => body, "alias" => alias} -> expression(InfluxQLExpr.parse(body), alias, text)
+      nil -> {:error, "unsupported select item: #{text}"}
+    end
+  end
 
+  @spec expression(term(), binary(), binary()) :: {:ok, InfluxQL.item()} | {:error, binary()}
+  defp expression(parsed, alias, text) do
     alias = InfluxQLText.blank_to_nil(InfluxQLText.unquote_ident(alias))
 
-    case InfluxQLExpr.parse(body) do
+    case parsed do
       {:ok, {:agg, fun, field}} -> {:ok, {:aggregate, fun, field, alias}}
       {:ok, ast} -> {:ok, {:expr, ast, alias}}
       {:multi, kind, field, tags, limit} -> {:ok, {:multi, kind, field, tags, limit, alias}}

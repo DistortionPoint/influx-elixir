@@ -211,11 +211,11 @@ defmodule InfluxElixir.Contract.WriteRules do
   defp parse_error_tests(client) do
     quote location: :keep do
       describe "write/3 — lines the engine cannot parse" do
-        # The grammar errors (empty tag key or value, trailing content) are
-        # pinned for every shape in InfluxElixir.Contract.InfluxQLFluxLP.
+        # The grammar errors (what each engine refuses and the words it says so
+        # in) are pinned for every shape in InfluxElixir.ClientContract.LineProtocol.
         test "text where a value should be leaves the line with no field", ctx do
           InfluxElixir.TestSupport.Check.each_case(
-            ["cpu value=notanumber", "cpu value=abci", "m =1i"],
+            ["cpu value=notanumber", "cpu value=abci"],
             fn lp ->
               assert {:error, %{status: 400, body: body}} =
                        unquote(client).write(ctx.conn, lp, database: ctx.database),
@@ -237,21 +237,6 @@ defmodule InfluxElixir.Contract.WriteRules do
                      1,
                      InfluxElixir.Contract.WriteRules.conflict("host", "tag", "field::integer"),
                      "w,host=a host=1i"
-                   )
-        end
-
-        test "an integer beyond int64 is refused where it is parsed", ctx do
-          assert {:error, %{status: 400, body: body}} =
-                   unquote(client).write(ctx.conn, "w v=9223372036854775808i",
-                     database: ctx.database
-                   )
-
-          assert Jason.decode!(body) ===
-                   InfluxElixir.Contract.WriteRules.partial(
-                     1,
-                     "Unable to parse integer value `9223372036854775808`",
-                     # the engine cuts original_line to 20 bytes
-                     "w v=9223372036854775"
                    )
         end
       end

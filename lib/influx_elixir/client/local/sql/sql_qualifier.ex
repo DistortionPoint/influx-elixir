@@ -9,6 +9,9 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
 
   alias InfluxElixir.Client.Local.{LineProtocolParser, SQLLiteral, SQLMask, SQLTable}
 
+  @typedoc "The columns a query wrote with a relation, by the clause they stand in."
+  @type zones :: %{(:group | :having | :order) => MapSet.t(binary())}
+
   # `FROM w CROSS JOIN ref [AS r]`: the right side is taken out of the text
   # (the rest of the parser sees one table) and recorded with its alias so
   # its qualifiers can be dropped like the left side's.
@@ -44,10 +47,11 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
 
   @doc """
   The text without the qualifiers of its table (and of the joined one), the
-  name the table is known by, and the qualifier each column was written with.
+  name the table is known by, the qualifier each column was written with, and the
+  columns written with one in each of the clauses `GROUP BY`, `HAVING` and `ORDER BY`.
   """
   @spec strip(binary(), {binary(), [binary()]} | nil) ::
-          {binary(), binary(), %{binary() => binary()}}
+          {binary(), binary(), %{binary() => binary()}, zones()}
   def strip(sql, cross_join) do
     # The joined table is known by its alias when it has one, by its name
     # otherwise.
@@ -70,17 +74,17 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
         # Once the table has an alias the engine knows it by that name alone
         # (`xqa.v` is an unknown relation after `FROM xqa AS t`).
         alias_text = SQLMask.cut(sql, alias_name)
-        {text, qualified} = drop_qualifiers(without_alias, [alias_text | joined_names])
-        {text, alias_text, qualified}
+        {text, qualified, zones} = drop_qualifiers(without_alias, [alias_text | joined_names])
+        {text, alias_text, qualified, zones}
 
       [_full, _from_clause, table] ->
         table_text = table_name(SQLMask.cut(sql, table))
         also = table_qualifiers(SQLMask.cut(sql, table), table_text)
-        {text, qualified} = drop_qualifiers(sql, [table_text | also] ++ joined_names)
-        {text, table_text, qualified}
+        {text, qualified, zones} = drop_qualifiers(sql, [table_text | also] ++ joined_names)
+        {text, table_text, qualified, zones}
 
       nil ->
-        {sql, "", %{}}
+        {sql, "", %{}, %{}}
     end
   end
 
@@ -108,7 +112,8 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
   # Returns the text without them, and the qualifier each column was written
   # with: the engine names a column it cannot find as it was written
   # (`t.nosuch`).
-  @spec drop_qualifiers(binary(), [binary()]) :: {binary(), %{binary() => binary()}}
+  @spec drop_qualifiers(binary(), [binary()]) ::
+          {binary(), %{binary() => binary()}, zones()}
   defp drop_qualifiers(sql, qualifiers) do
     qualifiers = Enum.reject(qualifiers, &(&1 == ""))
     names = qualifiers |> Enum.map_join("|", &Regex.escape/1)
@@ -119,23 +124,84 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
     pattern =
       ~r/'(?:[^']|'')*'|(?:#{quoted})\.(?=[\w"])|"[^"]*"|(?<![\w."])(?:#{names})\.(?=\w)/u
 
-    qualified =
+    clauses = clause_starts(sql)
+
+    written =
       pattern
       |> Regex.scan(sql, return: :index)
       |> Enum.flat_map(fn [{start, length} | _groups] ->
         token = binary_part(sql, start, length)
         after_token = binary_part(sql, start + length, byte_size(sql) - start - length)
 
-        if qualifier_token?(token), do: written_with(token, after_token), else: []
+        if qualifier_token?(token),
+          do:
+            for(
+              {column, qualifier} <- written_with(token, after_token),
+              do: {column, qualifier, clause_at(clauses, start)}
+            ),
+          else: []
       end)
-      |> Map.new()
+
+    qualified = Map.new(written, fn {column, qualifier, _clause} -> {column, qualifier} end)
+
+    zones =
+      Enum.reduce(written, %{}, fn
+        {column, _qualifier, clause}, acc when clause in [:group, :having, :order] ->
+          Map.update(acc, clause, MapSet.new([column]), &MapSet.put(&1, column))
+
+        _other, acc ->
+          acc
+      end)
 
     stripped =
       Regex.replace(pattern, sql, fn token ->
         if qualifier_token?(token), do: "", else: token
       end)
 
-    {stripped, qualified}
+    {stripped, qualified, zones}
+  end
+
+  @clause_words ~r/\b(WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|OFFSET|SELECT|FROM)\b/i
+
+  # Where each clause of the query itself (not of a call or a subquery in parentheses) starts.
+  @spec clause_starts(binary()) :: [{non_neg_integer(), atom()}]
+  defp clause_starts(sql) do
+    masked = SQLMask.mask(sql)
+
+    for [{_at, _length}, {start, size}] <- Regex.scan(@clause_words, masked, return: :index),
+        depth(masked, start) == 0,
+        do: {start, clause(masked |> binary_part(start, size) |> String.upcase())}
+  end
+
+  @spec clause(binary()) :: atom()
+  defp clause("GROUP" <> _by), do: :group
+  defp clause("HAVING"), do: :having
+  defp clause("ORDER" <> _by), do: :order
+  defp clause(_other), do: :other
+
+  # The parentheses open at `at`.
+  @spec depth(binary(), non_neg_integer()) :: integer()
+  defp depth(masked, at) do
+    masked
+    |> binary_part(0, at)
+    |> :binary.bin_to_list()
+    |> Enum.reduce(0, fn
+      ?(, depth -> depth + 1
+      ?), depth -> depth - 1
+      _byte, depth -> depth
+    end)
+  end
+
+  # The clause a position is in: that of the last clause word before it.
+  @spec clause_at([{non_neg_integer(), atom()}], non_neg_integer()) :: atom()
+  defp clause_at(clauses, position) do
+    clauses
+    |> Enum.take_while(fn {start, _clause} -> start <= position end)
+    |> List.last()
+    |> case do
+      {_start, clause} -> clause
+      nil -> :other
+    end
   end
 
   # A match that is a qualifier: not a string literal, and a quoted token

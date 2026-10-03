@@ -1,10 +1,13 @@
 defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   @moduledoc """
-  Contract tests for the line protocol grammar of both engines, InfluxQL's
-  `WHERE` and time, Flux's `range` and InfluxDB 2's bucket listing, run
-  against `InfluxElixir.Client.Local` and against the real engines: the
-  answers the double must give exactly as they do (rows, error status and
-  body). Every expectation was read from InfluxDB 3 Core or InfluxDB 2.7.
+  Contract tests for what a line protocol write does after the grammar accepts it
+  (partial writes stored, names and escapes, InfluxDB 2's retention and dropped
+  points), InfluxQL's `WHERE` and time, Flux's `range` and InfluxDB 2's bucket
+  listing, run against `InfluxElixir.Client.Local` and against the real engines: the
+  answers the double must give exactly as they do (rows, error status and body).
+  The grammar itself (what is refused and in which words) is pinned by
+  `InfluxElixir.ClientContract.LineProtocol`. Every expectation was read from
+  InfluxDB 3 Core or InfluxDB 2.7.
 
       use InfluxElixir.Contract.InfluxQLFluxLP,
         client: InfluxElixir.Client.Local,
@@ -121,29 +124,6 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
   defp v3_line_protocol_tests(client) do
     quote location: :keep do
-      # `~m` is the measurement. After the first field that parses, what
-      # does not is trailing content: from the comma when it is the
-      # third field or later, after it for the second.
-      @ifl_v3_errors [
-        {"~m v=1 100 200", "Could not parse entire line. Found trailing content: `200`"},
-        {"~m v=.5 1", "No fields were provided"},
-        {"~m v=5. 2", "Could not parse entire line. Found trailing content: `. 2`"},
-        {"~m v=1e 5", "Could not parse entire line. Found trailing content: `e 5`"},
-        {"~m v=tRUE 5", "Could not parse entire line. Found trailing content: `RUE 5`"},
-        {"~m v=+5 5", "No fields were provided"},
-        {"~m v=1 5 6", "Could not parse entire line. Found trailing content: `6`"},
-        {"~m v=1 abcdefghijklmnop",
-         "Could not parse entire line. Found trailing content: ` abcdefghi...`"},
-        {"~m v=1,w= 5", "Could not parse entire line. Found trailing content: `w= 5`"},
-        {"~m v=1,w=2,x=3,y= 5", "Could not parse entire line. Found trailing content: `,y= 5`"},
-        {"~m v=1,v=2 5", "invalid line protocol - multiple instances of 'v' field found"},
-        {"~m,t v=1 5", "Tag set malformed: could not find equals sign in `t v=1 5`"},
-        {"~m,t= v=1 5", "Expected tag value, got ` v=1 5`"},
-        {"~m,=a v=1 5", "Expected tag key, got `=a v=1 5`"},
-        {"~m\tv=1 5", "Expected at least one space character, got `\tv=1 5`"},
-        {"~m v=1\t5", "Could not parse entire line. Found trailing content: `\t5`"}
-      ]
-
       def ifl_partial_errors(body) do
         assert %{"error" => "partial write of line protocol occurred", "data" => data} =
                  Jason.decode!(body)
@@ -153,42 +133,6 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       end
 
       describe "line protocol grammar — InfluxDB 3 contract" do
-        test "a line that does not parse is the engine's 400, in the engine's words", ctx do
-          for {template, message} <- @ifl_v3_errors do
-            line =
-              String.replace(template, "~m", InfluxElixir.IntegrationHelper.unique_name("ifl_lp"))
-
-            assert {:error, %{status: 400, body: body}} =
-                     unquote(client).write(ctx.conn, line, database: ctx.database)
-
-            assert [{1, ^message}] = ifl_partial_errors(body), line
-          end
-        end
-
-        test "what the engine's grammar lets through is stored as the columns it names", ctx do
-          for {template, columns} <- [
-                # a trailing comma, a comma in a field key, a tag key that
-                # starts with one or holds one, an `=` inside a tag value
-                {"~m v=1, 1000", %{"v" => 1.0}},
-                {"~m a,b=1 1000", %{"a,b" => 1.0}},
-                {"~m,,t=1 v=1 1000", %{",t" => "1", "v" => 1.0}},
-                {"~m,t,u=1 v=1 1000", %{"t,u" => "1", "v" => 1.0}},
-                {"~m,t=a=b v=1 1000", %{"t" => "a=b", "v" => 1.0}},
-                {"~m v=1.5e3 1000", %{"v" => 1500.0}}
-              ] do
-            m = InfluxElixir.IntegrationHelper.unique_name("ifl_ok")
-            ifl_write(ctx, [String.replace(template, "~m", m)])
-
-            assert {:ok, [row]} =
-                     unquote(client).query_influxql(ctx.conn, "SELECT * FROM #{m}",
-                       database: ctx.database
-                     )
-
-            assert row["time"] === ifl_us(1), template
-            assert Map.drop(row, ["time", "iox::measurement"]) === columns, template
-          end
-        end
-
         test "good lines around a bad one are written, the bad one is numbered", ctx do
           m = InfluxElixir.IntegrationHelper.unique_name("ifl_mix")
 
@@ -226,32 +170,6 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                    {ifl_us(1), 1, ~s|a"b|},
                    {ifl_us(2), 2, nil}
                  ]
-        end
-
-        test "a quote after a field value opens a string that swallows the newline", ctx do
-          m = InfluxElixir.IntegrationHelper.unique_name("ifl_swallow")
-
-          assert {:error, %{status: 400, body: body}} =
-                   unquote(client).write(ctx.conn, ~s|#{m} f=1"i 1\nBAD|, database: ctx.database)
-
-          assert [{1, "Could not parse entire line. Found trailing content: `\"i 1\nBAD`"}] =
-                   ifl_partial_errors(body)
-        end
-
-        test "an error is numbered among the lines that count and echoes the physical line",
-             ctx do
-          m = InfluxElixir.IntegrationHelper.unique_name("ifl_number")
-
-          assert {:error, %{status: 400, body: body}} =
-                   unquote(client).write(ctx.conn, "#c\n\n#{m} v=1 5 6", database: ctx.database)
-
-          assert %{"data" => [entry]} = Jason.decode!(body)
-
-          assert entry === %{
-                   "error_message" => "Could not parse entire line. Found trailing content: `6`",
-                   "line_number" => 1,
-                   "original_line" => "#c"
-                 }
         end
       end
     end
@@ -2215,52 +2133,6 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
   defp v2_line_protocol_helpers(_client) do
     quote location: :keep do
-      # The Go parser's words; `~m` is the measurement.
-      @ifl_v2_errors [
-        {"this is not line protocol!!", "invalid field format"},
-        {"~m v=", "missing field value"},
-        {"~m v=.e3", "invalid float"},
-        {"~m v=1e999", "invalid float"},
-        {"~m v=tRUE", "invalid boolean"},
-        {"~m v=+5", "invalid boolean"},
-        {"~m v=1ii", "invalid number"},
-        {"~m v=1 abc", "bad timestamp"},
-        {"~m v=1 -", ~S|strconv.ParseInt: parsing "-": invalid syntax|},
-        {"~m v=1 5 6", "point is invalid"},
-        {"~m,t=1,t=2 v=1", "duplicate tags"},
-        {"~m", "missing fields"},
-        {"~m,t v=1", "missing tag value"},
-        {"~m,=1 v=1", "missing tag key"},
-        {"~m,t=a=b v=1", "invalid tag format"},
-        {",t=1 v=1", "missing measurement"},
-        {"~m =1", "missing field key"},
-        {"~m v=1,w", "invalid field format"},
-        {"~m v=1,,w=2", "invalid field format"},
-        {~S|~m v="abc|, "unbalanced quotes"},
-        {"~m v=9223372036854775808i",
-         "unable to parse integer 9223372036854775808: " <>
-           ~S|strconv.ParseInt: parsing "9223372036854775808": value out of range|},
-        {"~m v=18446744073709551616u",
-         "unable to parse unsigned 18446744073709551616: " <>
-           ~S|strconv.ParseUint: parsing "18446744073709551616": value out of range|},
-        # a name that ends in a backslash is judged where the line scans on
-        {~S"~m\\ v=1i 5", "invalid field format"},
-        {~S"~m\\", "missing fields"},
-        {~S"~m,t\\ v=1i 5", "invalid field format"},
-        {~S"~m,t\\", "missing tag value"},
-        {~S"~m,t=a\\", "missing fields"},
-        {~S"~m,t=a\\ ", "missing fields"},
-        {~S"~m,t=a\\ v=1i 5", "invalid tag format"},
-        {~S"~m,t\\=1 v=1i", "missing tag value"},
-        {~S"~m,t=\\ v=1i", "invalid tag format"},
-        {~S"~m v\\ =1i 5", "invalid field format"},
-        {~S"~m v\\", "invalid field format"},
-        {~S"~m v=1i,w\\ x=1i", "invalid field format"},
-        {~S"~m v=1i,w\\=1i", ~S"invalid value: field-key=w\\=1i"},
-        {~S"~m v\\=1i 5", ~S"invalid value: field-key=v\\=1i"}
-      ]
-
-      # The drops of one payload against a measurement that holds `v` as a
       # float: `~m` and `~n` are two measurements. An untimed point lands in
       # today's shard group and a timed one in its own week; the message is
       # the first drop of the earliest group that dropped any, and `dropped`
@@ -2328,66 +2200,6 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   defp v2_line_protocol_tests(client) do
     quote location: :keep do
       describe "line protocol grammar — InfluxDB 2 contract" do
-        test "a line that does not parse is a 400 in the Go parser's words", ctx do
-          for {template, reason} <- @ifl_v2_errors do
-            line =
-              String.replace(template, "~m", InfluxElixir.IntegrationHelper.unique_name("ifl_lp"))
-
-            assert {:error, %{status: 400, body: body}} =
-                     unquote(client).write(ctx.conn, line, database: ctx.database)
-
-            assert Jason.decode!(body) === ifl_v2_invalid("unable to parse '#{line}': #{reason}"),
-                   line
-          end
-        end
-
-        test "a carriage return ends a number, and stays in the quoted line", ctx do
-          m = InfluxElixir.IntegrationHelper.unique_name("ifl_cr")
-
-          assert {:error, %{status: 400, body: body}} =
-                   unquote(client).write(ctx.conn, "#{m} n=1i\r\n", database: ctx.database)
-
-          assert Jason.decode!(body) ===
-                   ifl_v2_invalid("unable to parse '#{m} n=1i\r': invalid number")
-        end
-
-        test "every line that fails is reported, joined by newlines", ctx do
-          m = InfluxElixir.IntegrationHelper.unique_name("ifl_many")
-
-          assert {:error, %{status: 400, body: body}} =
-                   unquote(client).write(
-                     ctx.conn,
-                     "#{m} v=1 5\nbad line\n#{m} v=\n  #{m} w=2 5",
-                     database: ctx.database
-                   )
-
-          assert Jason.decode!(body) ===
-                   ifl_v2_invalid(
-                     "unable to parse 'bad line': invalid field format\n" <>
-                       "unable to parse '#{m} v=': missing field value"
-                   )
-        end
-
-        test "leading whitespace, comments and blank lines are skipped, the point is stored",
-             ctx do
-          m = InfluxElixir.IntegrationHelper.unique_name("ifl_ws")
-          ifl_write(ctx, ["", "  # a comment", "   ", "\t#{m} v=1 5", ""])
-
-          assert {:ok, [row]} = ifl_flux(ctx, ifl_measurement_query(ctx, m, 100))
-          assert {row["_measurement"], row["_field"], row["_value"]} === {m, "v", 1.0}
-        end
-
-        test "a line left open by a quote is quoted without the payload's final newline",
-             ctx do
-          m = InfluxElixir.IntegrationHelper.unique_name("ifl_open")
-
-          assert {:error, %{status: 400, body: body}} =
-                   unquote(client).write(ctx.conn, ~s|#{m} f="a\nBAD\n|, database: ctx.database)
-
-          assert Jason.decode!(body) ===
-                   ifl_v2_invalid(~s|unable to parse '#{m} f="a\nBAD': unbalanced quotes|)
-        end
-
         test "a field named time is dropped; a point with nothing else is not written", ctx do
           m = InfluxElixir.IntegrationHelper.unique_name("ifl_time")
 

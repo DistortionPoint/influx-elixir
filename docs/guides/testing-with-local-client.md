@@ -1094,10 +1094,12 @@ Exclude the tag by default in `test/test_helper.exs`
 ```bash
 # InfluxDB 3 Core on 8181, no auth, data in memory. A write is answered
 # when the write-ahead log flushes (every second by default), so a short
-# interval keeps a write-heavy suite fast.
+# interval keeps a write-heavy suite fast. A large snapshot size keeps the
+# server from snapshotting mid-run: Core 3.10.1 panics when it snapshots a
+# point near the largest timestamp, and its writes then hang.
 docker run -d --rm --name influx3 -p 8181:8181 influxdb:3.10.1-core \
   influxdb3 serve --node-id node0 --object-store memory --without-auth \
-  --wal-flush-interval 10ms
+  --wal-flush-interval 10ms --wal-snapshot-size 100000
 
 mix test --include integration
 docker stop influx3
@@ -1111,9 +1113,10 @@ server, and reads `INFLUX_V3_CORE_HOST` / `INFLUX_V3_CORE_PORT` (defaults
 `INFLUX_V2_TOKEN`, `INFLUX_V2_ORG` and `INFLUX_V2_BUCKET`. Every statement
 in this guide about what the real engine returns was recorded that way. This
 library's `mix test` does not compile `test/integration` unless a path under it
-is named, an integration tag is included (`mix test --include integration
---include v3_core` needs no path) or `INTEGRATION=1` is set, so the unit suite
-stays fast.
+is named, an integration tag is selected or `INTEGRATION=1` is set, so the
+unit suite stays fast. One server's suite is selected by its tag alone,
+`mix test --only v3_core` (or `--only v2`); `--include integration` selects
+every server's suites, so use it only together with a path.
 
 ## Write Rules
 

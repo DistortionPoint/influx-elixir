@@ -24,6 +24,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   @numeric ~w(mean sum median spread stddev)
 
+  # The type as the library words it: `{in a coercion, as a native type, in a signature}`.
+  @utf8 {"Utf8", "String", "Utf8"}
+  @timestamp {"Timestamp(ns)", "Timestamp(Nanosecond, None)", "Timestamp(ns)"}
+
   @doc """
   `:ok`, the engine's error as `{:error, {:engine, body}}` (or
   `{:error, {:engine, status, body}}`), or a refusal by name as
@@ -44,6 +48,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
          :ok <- no_mix(items),
          :ok <- group_selector_columns(items, group_time),
          :ok <- text_aggregate(items, types),
+         :ok <- time_aggregate(items, types, tags),
          :ok <- expressions(items, types, tags),
          :ok <- lone_selector_calls(items),
          :ok <- group_field_read(query, types, tags) do
@@ -127,7 +132,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   end
 
   defp text_aggregate_error({:aggregate, fun, _field, _alias}, :string) do
-    {:error, {:engine, "Error during planning: " <> text_signature(fun)}}
+    {:error, {:engine, "Error during planning: " <> text_signature(fun, @utf8)}}
   end
 
   defp text_aggregate_error({:aggregate, fun, _field, _alias}, :boolean),
@@ -138,31 +143,75 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   @candidates " No function matches the given name and argument types"
   @casts "You might need to add explicit type casts.\n\tCandidate functions:\n\t"
 
-  defp text_signature("mean") do
+  defp text_signature("mean", {type, _native, signature}) do
     "Execution error: Function 'avg' user-defined coercion failed with " <>
-      "\"Error during planning: Avg does not support inputs of type Utf8.\"" <>
-      @candidates <> " 'avg(Utf8)'. " <> @casts <> "avg(UserDefined)"
+      "\"Error during planning: Avg does not support inputs of type #{type}.\"" <>
+      @candidates <> " 'avg(#{signature})'. " <> @casts <> "avg(UserDefined)"
   end
 
-  defp text_signature("sum") do
+  defp text_signature("sum", {type, _native, signature}) do
     "Execution error: Function 'sum' user-defined coercion failed with " <>
-      "\"Execution error: Sum not supported for Utf8\"" <>
-      @candidates <> " 'sum(Utf8)'. " <> @casts <> "sum(UserDefined)"
+      "\"Execution error: Sum not supported for #{type}\"" <>
+      @candidates <> " 'sum(#{signature})'. " <> @casts <> "sum(UserDefined)"
   end
 
-  defp text_signature(fun) when fun in ["median", "stddev"] do
-    "Function '#{fun}' expects NativeType::Numeric but received NativeType::String" <>
-      @candidates <> " '#{fun}(Utf8)'. " <> @casts <> "#{fun}(Numeric(1))"
+  defp text_signature(fun, {_type, native, signature}) when fun in ["median", "stddev"] do
+    "Function '#{fun}' expects NativeType::Numeric but received NativeType::#{native}" <>
+      @candidates <> " '#{fun}(#{signature})'. " <> @casts <> "#{fun}(Numeric(1))"
   end
 
-  defp text_signature("spread") do
-    "Failed to coerce arguments to satisfy a call to 'spread' function: coercion from Utf8 to " <>
-      "the signature OneOf([Exact([Int64]), Exact([UInt64]), Exact([Float64])]) failed" <>
+  defp text_signature("spread", {type, _native, signature}) do
+    "Failed to coerce arguments to satisfy a call to 'spread' function: coercion from " <>
+      "#{type} to the signature OneOf([Exact([Int64]), Exact([UInt64]), Exact([Float64])]) " <>
+      "failed" <>
       @candidates <>
-      " 'spread(Utf8)'. " <>
+      " 'spread(#{signature})'. " <>
       @casts <>
       "spread(Int64)\n\tspread(UInt64)\n\tspread(Float64)"
   end
+
+  # An aggregate of the `time` column that needs numbers is a planning error when a field is
+  # aggregated beside it (verified; alone, or beside tags and other times, the engine answers
+  # nothing, and the first such aggregate of the list is the one it names). `percentile()` and
+  # `integral()` word it at length and are refused by name.
+  @spec time_aggregate([InfluxQL.item()], map(), MapSet.t(binary())) ::
+          :ok | {:error, {:engine, binary()} | binary()}
+  defp time_aggregate(items, types, tags) do
+    if Enum.any?(items, &field_aggregate?(&1, types, tags)) do
+      Enum.find_value(items, :ok, &time_error/1)
+    else
+      :ok
+    end
+  end
+
+  defp time_error({:aggregate, fun, "time", _alias}) when fun in @numeric,
+    do: {:error, {:engine, "Error during planning: " <> text_signature(fun, @timestamp)}}
+
+  defp time_error({:aggregate, "percentile:" <> _rest, "time", _alias}),
+    do: {:error, "unsupported InfluxQL (percentile() of time beside a field)"}
+
+  defp time_error({:aggregate, "integral:" <> _rest, "time", _alias}),
+    do: {:error, "unsupported InfluxQL (integral() of time beside a field)"}
+
+  defp time_error(_item), do: nil
+
+  defp field_aggregate?({:aggregate, _fun, :star, _alias}, _types, _tags), do: true
+
+  defp field_aggregate?({:aggregate, "count", {:distinct, field}, _alias}, types, tags),
+    do: field?(field, types, tags)
+
+  defp field_aggregate?({:aggregate, _fun, field, _alias}, types, tags) when is_binary(field),
+    do: field?(field, types, tags)
+
+  defp field_aggregate?({:expr, ast, _alias}, types, tags) do
+    Enum.any?(InfluxQLExpr.aggregates(ast), fn {_fun, arg} ->
+      is_binary(arg) and field?(arg, types, tags)
+    end)
+  end
+
+  defp field_aggregate?(_item, _types, _tags), do: false
+
+  defp field?(name, types, tags), do: Map.has_key?(types, name) and not MapSet.member?(tags, name)
 
   # A number given to `fill()` cannot become the value of a text column.
   @spec fill_number_on_text(InfluxQL.query(), map()) ::

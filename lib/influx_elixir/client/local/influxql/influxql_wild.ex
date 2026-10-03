@@ -22,7 +22,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
   @numeric ~w(integer unsigned float)a
   @numeric_functions ~w(mean sum median spread stddev percentile integral abs round floor ceil sqrt ln
                         log pow derivative non_negative_derivative difference
-                        non_negative_difference cumulative_sum moving_average)
+                        non_negative_difference cumulative_sum moving_average top bottom)
   @every_type ~w(first last count mode elapsed)
   @aggregates ~w(mean sum median spread stddev min max first last count mode)
   @known @every_type ++ ~w(min max) ++ @numeric_functions
@@ -110,6 +110,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
                   ~w(difference non_negative_difference cumulative_sum abs round floor ceil sqrt ln)
   @two_arguments ~w(percentile moving_average pow log)
   @one_or_two ~w(derivative non_negative_derivative elapsed integral)
+  @selectors ~w(top bottom)
 
   @spec arity_error(binary(), pos_integer()) :: binary() | nil
   defp arity_error(name, count) when name in @one_argument and count != 1,
@@ -117,6 +118,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
 
   defp arity_error(name, count) when name in @two_arguments and count != 2,
     do: "invalid number of arguments for #{name}, expected 2, got #{count}"
+
+  defp arity_error(name, count) when name in @selectors and count < 2,
+    do: "invalid number of arguments for #{name}, expected at least 2, got #{count}"
 
   defp arity_error(name, count) when name in @one_or_two and count > 2,
     do:

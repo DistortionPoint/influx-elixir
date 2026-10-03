@@ -8,7 +8,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowCondition do
   # VALUES`. Each takes the spec read so far and returns it with the condition
   # added, with where the clause ends, or the engine's parse error.
 
-  alias InfluxElixir.Client.Local.{InfluxQLCheck, InfluxQLTokens}
+  alias InfluxElixir.Client.Local.InfluxQLCheck
   alias InfluxElixir.Client.Local.InfluxQLShowText, as: Text
 
   @cond_end ~r/\b(?:LIMIT|OFFSET|SLIMIT|SOFFSET|GROUP|ORDER|FILL)\b|;/i
@@ -44,33 +44,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowCondition do
 
   defp condition(ctx, text, to, spec) do
     case InfluxQLCheck.check_where(ctx.raw, 0, ctx.masked, text) do
-      :ok -> read_condition(text, to, spec)
+      :ok -> {:ok, %{spec | where: text}, to}
       {:error, _engine} = error -> error
     end
   end
-
-  # Operands side by side are a condition the engine stops reading half way.
-  defp read_condition(text, to, spec) do
-    case InfluxQLTokens.tokenize(text, []) do
-      {:ok, tokens} ->
-        if adjacent_operands?(tokens),
-          do: {:error, "unsupported InfluxQL (a WHERE the double does not read to its end)"},
-          else: {:ok, %{spec | where: text}, to}
-
-      _unread ->
-        {:ok, %{spec | where: text}, to}
-    end
-  end
-
-  defp adjacent_operands?(tokens) do
-    tokens
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.any?(fn [left, right] -> operand?(left) and operand?(right) end)
-  end
-
-  defp operand?({kind, _value}) when kind in [:ident, :str, :number], do: true
-  defp operand?({:duration, _total, _text}), do: true
-  defp operand?(_token), do: false
 
   # ---- WITH MEASUREMENT ---------------------------------------------------------
 

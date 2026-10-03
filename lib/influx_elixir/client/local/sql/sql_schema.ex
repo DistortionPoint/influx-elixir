@@ -66,7 +66,10 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @doc "`:ok`, or the engine's schema error for the first column the query names that is not there."
   @spec check([relation()], SQLParser.parsed_query()) :: :ok | {:error, term()}
   def check(relations, query) do
-    with :ok <- no_table_star(relations, query), do: check_columns(relations, query)
+    with :ok <- no_table_star(relations, query),
+         :ok <- check_columns(relations, query),
+         :ok <- check_order_ambiguous(relations, query),
+         do: check_order_available(relations, query)
   end
 
   # `SELECT *` with no `FROM` has no table to expand.
@@ -142,34 +145,288 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
           {binary(), [binary()]}
         ]) :: map()
   defp no_field(ref, clause, query, listed) do
+    if clause != :group and column_as_relation?(ref, query, listed),
+      do:
+        SQLError.refusal(
+          "a column used as the relation of another (the engine reads it as a field of that " <>
+            "column and fails by the column's type and the clause)"
+        ),
+      else: unknown_field(ref, clause, query, listed)
+  end
+
+  # `n.y` where `n` is no relation of the query but a column of one: the engine does not look
+  # for a field `y` of a relation `n`, it reads `n` as a column to take a field of.
+  @spec column_as_relation?(SQLExpr.column_ref(), SQLParser.parsed_query(), [
+          {binary(), [binary()]}
+        ]) :: boolean()
+  defp column_as_relation?({:qualified, relation, _name}, _query, listed) do
+    name = unquoted(relation)
+
+    not Enum.any?(listed, fn {qualifier, _columns} -> qualifier == name end) and
+      Enum.any?(listed, fn {_qualifier, columns} -> name in columns end)
+  end
+
+  defp column_as_relation?(_ref, _query, _listed), do: false
+
+  @spec unknown_field(SQLExpr.column_ref(), clause(), SQLParser.parsed_query(), [
+          {binary(), [binary()]}
+        ]) :: map()
+  defp unknown_field(ref, clause, query, listed) do
     fields = Enum.flat_map(listed, fn {qualifier, columns} -> qualify(qualifier, columns) end)
 
     # Under DISTINCT ON an ORDER BY term is resolved against the table, so
     # an output name there lists the table's fields alone (verified).
     output_name? = query.distinct_on != nil and ref in output_names(query)
 
-    valid =
-      if clause in [:order, :group, :on, :having] and not output_name?,
-        do: projection_fields(query, listed) ++ fields,
-        else: fields
+    # A name written with its relation is looked up in the select list alone (verified).
+    written_with_relation? =
+      clause in [:order, :group] and written_with_relation?(ref, query, clause)
 
+    valid = valid_fields(clause, written_with_relation?, output_name?, fields, query, listed)
     printed = printed(ref, query.qualified)
 
-    known = if valid == [], do: [], else: ["Valid fields are #{Enum.join(valid, ", ")}."]
+    case suggestion(clause, ref, query, listed) do
+      {:refuse, why} ->
+        SQLError.refusal(why)
 
-    body =
-      Enum.join(
-        ["Schema error: No field named #{printed}." | case_hint(ref, printed, listed)] ++ known,
-        " "
-      )
+      {:suggest, field} ->
+        %{status: 500, body: "Schema error: No field named #{printed}. Did you mean '#{field}'?."}
 
-    %{status: 500, body: body}
+      nil ->
+        known = known_fields(ref, valid)
+
+        body =
+          Enum.join(
+            [
+              "Schema error: No field named #{printed}."
+              | case_hint(ref, printed, listed, query.qualified)
+            ] ++
+              known,
+            " "
+          )
+
+        %{status: 500, body: body}
+    end
+  end
+
+  # What the engine says of the fields it knows: the first listed field that is within half
+  # its length in edits of the name written, without its relation, as "Did you mean"
+  # (verified: `x.host` over `cpu` suggests `cpu.host`, `x.cpu` suggests `cpu.h`, while
+  # `x.n` over `cpu.n` and `x.hos` over `cpu.host` do not come within half), else all of them.
+  @spec known_fields(SQLExpr.column_ref(), [binary()]) :: [binary()]
+  defp known_fields(_ref, []), do: []
+
+  defp known_fields(ref, valid) do
+    name = bare_name(ref)
+
+    case Enum.find(valid, &close_to_field?(name, &1)) do
+      nil -> ["Valid fields are #{Enum.join(valid, ", ")}."]
+      field -> ["Did you mean '#{field}'?."]
+    end
+  end
+
+  @spec close_to_field?(binary(), binary()) :: boolean()
+  defp close_to_field?(name, field) do
+    longest = max(String.length(name), String.length(field))
+    edit_distance(name, field) * 2 <= longest
+  end
+
+  # The fields the engine lists: the table's, the select list's before them in a clause that
+  # reads it, or the select list's alone for a name written with its relation.
+  @spec valid_fields(clause(), boolean(), boolean(), [binary()], SQLParser.parsed_query(), [
+          {binary(), [binary()]}
+        ]) :: [binary()]
+  defp valid_fields(:group, true, _output_name?, fields, _query, _listed), do: fields
+
+  defp valid_fields(_clause, true, _output_name?, _fields, query, listed),
+    do: projection_fields(query, listed)
+
+  defp valid_fields(clause, false, false, fields, query, listed)
+       when clause in [:order, :group, :on, :having],
+       do: projection_fields(query, listed) ++ fields
+
+  defp valid_fields(_clause, false, _output_name?, fields, _query, _listed), do: fields
+
+  @spec written_with_relation?(SQLExpr.column_ref(), SQLParser.parsed_query(), clause()) ::
+          boolean()
+  defp written_with_relation?({:qualified, _relation, _name}, _query, _clause), do: true
+
+  defp written_with_relation?(ref, query, clause),
+    do: MapSet.member?(written_in(query, clause), ref)
+
+  # The select item an unknown `ORDER BY` name is taken for (verified): one with the same
+  # name is the engine's suggestion. A name that is merely close to an item is one the engine
+  # suggests by a measure the double does not hold, so it is refused.
+  @spec suggestion(clause(), SQLExpr.column_ref(), SQLParser.parsed_query(), [
+          {binary(), [binary()]}
+        ]) :: {:suggest, binary()} | {:refuse, binary()} | nil
+  defp suggestion(:group, ref, query, listed) do
+    if written_with_relation?(ref, query, :group) and
+         Enum.any?(listed, fn {_relation, columns} -> bare_name(ref) in columns end),
+       do:
+         {:refuse,
+          "a GROUP BY name with a relation that is not the column's: the engine may suggest " <>
+            "the column"},
+       else: nil
+  end
+
+  # Under DISTINCT ON the terms are resolved against the table alone.
+  defp suggestion(:order, _ref, %{distinct_on: on}, _listed) when on != nil, do: nil
+
+  defp suggestion(:order, ref, query, listed) do
+    name = bare_name(ref)
+
+    # Of a plain query the engine suggests a name that stands alone in its select list, not
+    # a column it prints with its relation (verified); of an aggregate query, any item.
+    outputs =
+      for {output, field} <- Enum.zip(output_names(query), projection_fields(query, listed)),
+          query.select_columns != nil or not relation_field?(field),
+          do: {output, field}
+
+    case Enum.filter(outputs, fn {output, _field} -> output == name end) do
+      [{_output, field}] ->
+        {:suggest, field}
+
+      [] ->
+        if Enum.any?(outputs, fn {output, _field} -> close?(output, name) end),
+          do:
+            {:refuse,
+             "an ORDER BY name close to a select item: the engine suggests the item by a " <>
+               "measure of closeness the double does not hold"},
+          else: nil
+
+      _several ->
+        {:refuse, "an ORDER BY name that several select items are called"}
+    end
+  end
+
+  defp suggestion(_clause, _ref, _query, _listed), do: nil
+
+  # Whether two names are within half their length of each other in edits.
+  @spec close?(binary(), binary()) :: boolean()
+  defp close?(left, right) do
+    longest = max(String.length(left), String.length(right))
+    longest > 0 and edit_distance(left, right) * 5 <= longest * 3
+  end
+
+  @spec edit_distance(binary(), binary()) :: non_neg_integer()
+  defp edit_distance(left, right) do
+    initial = Enum.to_list(0..String.length(right))
+
+    left
+    |> String.graphemes()
+    |> Enum.with_index(1)
+    |> Enum.reduce(initial, fn {a, row}, previous ->
+      right
+      |> String.graphemes()
+      |> Enum.zip(Enum.zip(previous, tl(previous)))
+      |> Enum.reduce([row], fn {b, {diagonal, above}}, [left_cell | _older] = acc ->
+        cost = if a == b, do: 0, else: 1
+        [min(min(above + 1, left_cell + 1), diagonal + cost) | acc]
+      end)
+      |> Enum.reverse()
+    end)
+    |> List.last()
+  end
+
+  @spec relation_field?(binary()) :: boolean()
+  defp relation_field?(field),
+    do: not String.starts_with?(field, "\"") and String.contains?(field, ".")
+
+  @spec bare_name(SQLExpr.column_ref()) :: binary()
+  defp bare_name({:qualified, _relation, name}), do: unquoted(name)
+  defp bare_name(name), do: name
+
+  # `ORDER BY t.x` beside a select item called `x` that is no column of `t` is ambiguous to
+  # the engine: the select list holds the unqualified field `x`.
+  @spec check_order_ambiguous([relation()], SQLParser.parsed_query()) :: :ok | {:error, map()}
+  defp check_order_ambiguous(relations, query) do
+    written = written_in(query, :order)
+
+    if MapSet.size(written) == 0 or Enum.any?(relations, &unknown_schema?/1) or
+         query.distinct_on != nil do
+      :ok
+    else
+      listed = Enum.map(relations, &{&1.qualifier, full_columns(&1)})
+      outputs = Enum.zip(output_names(query), projection_fields(query, listed))
+
+      ambiguous =
+        Enum.find(MapSet.to_list(written), fn name ->
+          Enum.any?(outputs, fn {output, field} ->
+            output == name and not relation_field?(field)
+          end)
+        end)
+
+      if ambiguous do
+        printed = written_name(ambiguous, query.qualified)
+
+        {:error,
+         %{
+           status: 500,
+           body:
+             "Schema error: Schema contains qualified field name #{printed} and unqualified " <>
+               "field name #{ambiguous} which would be ambiguous"
+         }}
+      else
+        :ok
+      end
+    end
+  end
+
+  # In an aggregate query a table column in `ORDER BY` is one of the `GROUP BY` terms or an
+  # output of the select list; any other is the engine's schema error, which lists the
+  # outputs alone and names the column with its relation.
+  @spec check_order_available([relation()], SQLParser.parsed_query()) :: :ok | {:error, map()}
+  defp check_order_available(_relations, %{select_columns: nil}), do: :ok
+  defp check_order_available(_relations, %{distinct_on: on}) when on != nil, do: :ok
+
+  defp check_order_available(relations, query) do
+    if Enum.any?(relations, &unknown_schema?/1) do
+      :ok
+    else
+      listed = Enum.map(relations, &{&1.qualifier, full_columns(&1)})
+      grouped = for item <- query.group_by_columns || [], is_binary(item), do: item
+      outputs = output_names(query)
+
+      unavailable =
+        query.order_by
+        |> Enum.flat_map(&order_refs(&1, query))
+        |> Enum.find(fn ref ->
+          is_binary(ref) and
+            not (alias_ref?(ref, outputs, query, :order) or ref in grouped or
+                   SQLAggExpr.placeholder?(ref))
+        end)
+
+      case unavailable do
+        nil -> :ok
+        ref -> {:error, unavailable_order(ref, query, listed)}
+      end
+    end
+  end
+
+  @spec order_refs({term(), term()}, SQLParser.parsed_query()) :: [SQLExpr.column_ref()]
+  defp order_refs({{:expr, expr}, _direction}, _query), do: expr_fields(expr)
+
+  defp order_refs({column, _direction}, query),
+    do: if(ordinal?(query, column), do: [], else: [column])
+
+  defp unavailable_order(ref, query, listed) do
+    known = ref |> known_fields(projection_fields(query, listed)) |> Enum.map(&(" " <> &1))
+
+    %{
+      status: 500,
+      body: "Schema error: No field named #{holder_field(ref, listed)}.#{Enum.join(known)}"
+    }
   end
 
   # The name as the query wrote it: a column written with its relation
   # (`t.nosuch`) is named with it.
   @spec printed(SQLExpr.column_ref(), %{binary() => binary()}) :: binary()
-  defp printed(ref, qualified) when is_binary(ref) do
+  defp printed(ref, qualified), do: written_name(ref, qualified)
+
+  @doc "The name of a column as the query wrote it: with its relation when it had one."
+  @spec written_name(SQLExpr.column_ref(), %{binary() => binary()}) :: binary()
+  def written_name(ref, qualified) when is_binary(ref) do
     case Map.fetch(qualified, ref) do
       {:ok, relation} ->
         SQLLiteral.render_qualifier(relation) <> "." <> SQLLiteral.render_identifier(ref)
@@ -179,12 +436,25 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     end
   end
 
-  defp printed(ref, _qualified), do: SQLExpr.ref_text(ref)
+  def written_name(ref, _qualified), do: SQLExpr.ref_text(ref)
 
   # A qualified name that would resolve if its case were folded gets the
   # engine's pointer to quoting (verified).
-  @spec case_hint(SQLExpr.column_ref(), binary(), [{binary(), [binary()]}]) :: [binary()]
-  defp case_hint({:qualified, qualifier, column}, printed, listed) do
+  @spec case_hint(SQLExpr.column_ref(), binary(), [{binary(), [binary()]}], %{
+          binary() => binary()
+        }) :: [binary()]
+  defp case_hint(ref, printed, listed, qualified) when is_binary(ref) do
+    flat = String.downcase(join_flat(Map.get(qualified, ref), ref))
+
+    folded? =
+      Enum.any?(listed, fn {qualifier, columns} ->
+        Enum.any?(columns, &(String.downcase(join_flat(qualifier, &1)) == flat))
+      end)
+
+    if folded?, do: [case_sensitive_hint(printed)], else: []
+  end
+
+  defp case_hint({:qualified, qualifier, column}, printed, listed, _qualified) do
     {relation, name} = {unquoted(qualifier), unquoted(column)}
 
     folded? =
@@ -193,16 +463,17 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
           Enum.any?(columns, &(String.downcase(&1) == String.downcase(name)))
       end)
 
-    if folded?,
-      do: [
-        "Column names are case sensitive. You can use double quotes to refer to the " <>
-          "\"#{printed}\" column or set the datafusion.sql_parser.enable_ident_normalization " <>
-          "configuration."
-      ],
-      else: []
+    if folded?, do: [case_sensitive_hint(printed)], else: []
   end
 
-  defp case_hint(_name, _printed, _listed), do: []
+  defp join_flat(nil, name), do: name
+  defp join_flat(qualifier, name), do: qualifier <> "." <> name
+
+  defp case_sensitive_hint(printed) do
+    "Column names are case sensitive. You can use double quotes to refer to the " <>
+      "\"#{printed}\" column or set the datafusion.sql_parser.enable_ident_normalization " <>
+      "configuration."
+  end
 
   @spec unquoted(binary()) :: binary()
   defp unquoted(text) do
@@ -265,14 +536,15 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @spec clause_refs(SQLParser.parsed_query()) :: [{clause(), SQLExpr.column_ref()}]
   def clause_refs(query) do
     aliases = if query.distinct_on, do: [], else: output_names(query)
+    alias? = &alias_ref?(&1, aliases, query, :order)
 
     order_by_refs =
       Enum.flat_map(query.order_by, fn
         {{:expr, expr}, _direction} ->
-          Enum.reject(expr_fields(expr), &(&1 in aliases))
+          Enum.reject(expr_fields(expr), alias?)
 
         {column, _direction} ->
-          if column in aliases or ordinal?(query, column), do: [], else: [column]
+          if alias?.(column) or ordinal?(query, column), do: [], else: [column]
       end)
 
     select_refs =
@@ -282,21 +554,37 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
     tagged(:where, where_refs(query.where)) ++
       tagged(:select, select_refs) ++
-      tagged(:having, having_refs(query.having, aliases)) ++
+      tagged(:having, having_refs(query.having, aliases, written_in(query, :having))) ++
       tagged(:order, order_by_refs) ++
       tagged(:group, group_refs(query.group_by_columns)) ++
       tagged(:on, query.distinct_on || [])
   end
 
-  # The columns a `HAVING` reads that are neither an aggregate's name nor a
-  # name of the select list, and those its aggregates read.
-  @spec having_refs(SQLAggExpr.having_t() | nil, [binary()]) :: [SQLExpr.column_ref()]
-  defp having_refs(nil, _aliases), do: []
+  # Whether a reference is the name of a select item: only a name written without a relation
+  # is (`ORDER BY t.alias` is a column of `t`).
+  @spec alias_ref?(SQLExpr.column_ref(), [binary()], SQLParser.parsed_query(), atom()) ::
+          boolean()
+  defp alias_ref?(ref, aliases, query, clause),
+    do: is_binary(ref) and ref in aliases and not MapSet.member?(written_in(query, clause), ref)
 
-  defp having_refs(%{nodes: nodes, aggs: aggs}, aliases) do
+  # The columns the query wrote with a relation in a clause (see `SQLQualifier.strip/2`).
+  @spec written_in(SQLParser.parsed_query(), :group | :having | :order) :: MapSet.t(binary())
+  defp written_in(query, clause), do: Map.get(query.qualified_in, clause, MapSet.new())
+
+  # The columns a `HAVING` reads that are neither an aggregate's name nor a
+  # name of the select list, and those its aggregates read. A name written with a relation
+  # is read by `InfluxElixir.Client.Local.SQLGrouping`, which the engine's `HAVING` check
+  # precedes the schema with.
+  @spec having_refs(SQLAggExpr.having_t() | nil, [binary()], MapSet.t(binary())) ::
+          [SQLExpr.column_ref()]
+  defp having_refs(nil, _aliases, _qualified), do: []
+
+  defp having_refs(%{nodes: nodes, aggs: aggs}, aliases, qualified) do
     plain =
       for ref <- where_refs(nodes),
-          not (is_binary(ref) and (SQLAggExpr.placeholder?(ref) or ref in aliases)),
+          not (is_binary(ref) and
+                 (SQLAggExpr.placeholder?(ref) or ref in aliases or MapSet.member?(qualified, ref))),
+          not match?({:qualified, _relation, _name}, ref),
           do: ref
 
     plain ++ Enum.flat_map(aggs, fn {_name, column} -> select_column_refs(column) end)

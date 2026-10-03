@@ -176,13 +176,43 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp tag_key_list(table, database, spec) do
     names = show_names(table, database, spec)
 
-    if spec.where != nil and names != [] and (spec.limit != nil or spec.offset > 0) do
-      show_refusal(
-        spec,
-        "SHOW TAG KEYS with WHERE and LIMIT or OFFSET (the engine fails it with an internal error)"
-      )
+    cond do
+      spec.where != nil and names != [] and (spec.limit != nil or spec.offset > 0) ->
+        show_refusal(
+          spec,
+          "SHOW TAG KEYS with WHERE and LIMIT or OFFSET (the engine fails it with an internal error)"
+        )
+
+      spec.where != nil and tagless?(table, database, names) ->
+        tagless_where(spec)
+
+      true ->
+        show_collect(names, &tag_key_rows(table, database, &1, spec))
+    end
+  end
+
+  # Whether a measurement of the list has no tag.
+  @spec tagless?(Store.t(), binary(), [binary()]) :: boolean()
+  defp tagless?(table, database, names),
+    do: Enum.any?(names, &Enum.empty?(Store.tag_columns(table, database, &1)))
+
+  # `SHOW TAG KEYS WHERE ...` fails to plan once a measurement it lists has no tag column
+  # (verified, whatever the condition): the engine builds an aggregate of nothing. A `now()`
+  # in the condition is its error first, which the double does not order.
+  @spec tagless_where(map()) :: {:error, map()}
+  defp tagless_where(spec) do
+    if Regex.match?(~r/\bnow\s*\(/i, spec.where) do
+      show_refusal(spec, "SHOW TAG KEYS WHERE now() over a measurement with no tag")
     else
-      show_collect(names, &tag_key_rows(table, database, &1, spec))
+      {:error,
+       %{
+         status: 400,
+         body:
+           "Error during planning: Aggregate requires at least one grouping or aggregate " <>
+             "expression. Aggregate without grouping expressions nor aggregate expressions is " <>
+             "logically equivalent to, but less efficient than, VALUES producing single row. " <>
+             "Please use VALUES instead."
+       }}
     end
   end
 
@@ -395,8 +425,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
   defp show_plan(%{where: where}, tags, types) do
     case influxql_where(where, tags, types, Store.now_ns(), 0) do
-      {:ok, %{deferred: deferred}} when deferred != nil ->
-        {:error, %{status: 400, body: deferred}}
+      {:ok, %{deferred: {status, body}}} ->
+        {:error, %{status: status, body: body}}
 
       {:ok, %{where: " WHERE " <> sql} = plan} ->
         condition =
@@ -638,9 +668,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   @spec influxql_deferred(Store.t(), binary(), InfluxQL.query(), map()) :: :ok | {:error, map()}
   defp influxql_deferred(_table, _database, _query, %{deferred: nil}), do: :ok
 
-  defp influxql_deferred(table, database, query, %{deferred: body}) do
+  defp influxql_deferred(table, database, query, %{deferred: {status, body}}) do
     if query.measurement in Store.measurements(table, database),
-      do: {:error, %{status: 400, body: body}},
+      do: {:error, %{status: status, body: body}},
       else: :ok
   end
 
@@ -673,7 +703,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
              uppers: [InfluxQL.bound()],
              checks: [term()],
              tags: MapSet.t(binary()),
-             deferred: binary() | nil
+             deferred: {pos_integer(), binary()} | nil
            }}
           | {:error, map()}
   defp influxql_where(nil, _tags, _types, _now, _extend) do
@@ -796,6 +826,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
       {:error, %{body: "Schema error: No field named" <> _rest}} ->
         {:ok, []}
+
+      # The planner raises its own coercion error, before the analyser that would wrap it.
+      {:error,
+       %{body: "type_coercion\ncaused by\nError during planning: Cannot coerce arith" <> rest} =
+           error} ->
+        {:error, %{error | body: "Error during planning: Cannot coerce arith" <> rest}}
 
       error ->
         error

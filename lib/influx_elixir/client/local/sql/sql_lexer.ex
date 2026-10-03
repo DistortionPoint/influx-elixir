@@ -93,6 +93,18 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
     end
   end
 
+  # A number is read whole (`SQLIdentifiers.take_number/1`), so a letter after it begins a
+  # word of its own: `1e'a'` is `1` and the escape string `e'a'`.
+  defp scan(<<c, _rest::binary>> = input, state, chunk) when c in ?0..?9 do
+    {number, after_number} = SQLIdentifiers.take_number(input)
+    scan(after_number, state, [number | chunk])
+  end
+
+  defp scan(<<?., d, _rest::binary>> = input, state, chunk) when d in ?0..?9 do
+    {number, after_number} = SQLIdentifiers.take_number(input)
+    scan(after_number, state, [number | chunk])
+  end
+
   # A word is read whole, so an `E` that ends one (`name'...'`) opens no
   # escape string; `E'` or `e'` at the start of a token does.
   defp scan(<<c::utf8, rest::binary>> = input, state, chunk) do
@@ -192,7 +204,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   defp escape(<<?U, rest::binary>>), do: fixed_hex(rest, 8)
 
   defp escape(<<?x, rest::binary>>) do
-    case take_digits(rest, 2, &hex?/1, []) do
+    case take_digits(rest, 2, &hex_digit?/1, []) do
       {[], _rest} -> {:ok, "x", rest}
       {digits, after_digits} -> ascii_code(digits, 16, after_digits)
     end
@@ -208,7 +220,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
 
   @spec fixed_hex(binary(), pos_integer()) :: {:ok, binary(), binary()} | :error
   defp fixed_hex(input, count) do
-    case take_digits(input, count, &hex?/1, []) do
+    case take_digits(input, count, &hex_digit?/1, []) do
       {digits, rest} when length(digits) == count -> scalar(digits, rest)
       _short -> :error
     end
@@ -241,8 +253,8 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
 
   defp take_digits(rest, _count, _digit?, acc), do: {Enum.reverse(acc), rest}
 
-  @spec hex?(byte()) :: boolean()
-  defp hex?(c), do: c in ?0..?9 or c in ?a..?f or c in ?A..?F
+  @spec hex_digit?(byte()) :: boolean()
+  defp hex_digit?(c), do: c in ?0..?9 or c in ?a..?f or c in ?A..?F
 
   @spec octal?(byte()) :: boolean()
   defp octal?(c), do: c in ?0..?7

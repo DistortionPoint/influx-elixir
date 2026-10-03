@@ -46,6 +46,9 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   @structural ~w(SELECT FROM WHERE GROUP HAVING ORDER LIMIT OFFSET FETCH UNION EXCEPT INTERSECT
     MINUS WINDOW QUALIFY WITH JOIN INNER LEFT RIGHT FULL CROSS NATURAL OUTER ON USING DISTINCT
     ALL)
+  # Words after which a word is an operand: it begins an item or an expression.
+  @operand_words ~w(SELECT DISTINCT ALL AS AND OR NOT XOR IS IN LIKE ILIKE BETWEEN CASE WHEN
+    THEN ELSE)
 
   @doc "Whether the statement (a plain `SELECT`, once `SQLSyntax` has read it) has an `INTO`."
   @spec into?(binary()) :: boolean()
@@ -100,15 +103,19 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
         [word] = Regex.run(~r/\A[\p{L}_][\p{L}\p{N}_$]*/u, text)
         tokens(tail(text, word), [{:word, word} | acc])
 
-      c in ?0..?9 ->
-        [number] = Regex.run(~r/\A\d[\p{L}\p{N}_.]*/u, text)
-        tokens(tail(text, number), [{:other, number} | acc])
+      c in ?0..?9 or (c == ?. and digit_next?(text)) ->
+        {number, rest} = SQLIdentifiers.take_number(text)
+        tokens(rest, [{:other, number} | acc])
 
       true ->
         symbol = Enum.find(@symbols, &String.starts_with?(text, &1)) || <<c::utf8>>
         tokens(tail(text, symbol), [{:symbol, symbol} | acc])
     end
   end
+
+  @spec digit_next?(binary()) :: boolean()
+  defp digit_next?(<<?., d, _rest::binary>>), do: d in ?0..?9
+  defp digit_next?(_text), do: false
 
   @spec tail(binary(), binary()) :: binary()
   defp tail(text, taken),
@@ -135,22 +142,58 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   # ---------------------------------------------------------------------------
 
   # The tokens without the `INTO name` of the statement's select list, and whether it had one.
+  # An `INTO` where an item begins is a column's name (`SELECT into`, `SELECT n + into`).
   @spec without_into([token()]) :: {[token()], boolean()}
   defp without_into(tokens) do
-    case Enum.split_while(tokens, &(not into_word?(&1))) do
-      {_all, []} ->
+    case split_into(tokens, [], nil) do
+      nil ->
         {tokens, false}
 
-      {before, [_into | after_into]} ->
+      {before, after_into} ->
         if select_list?(before),
           do: {before ++ drop_target(after_into), true},
           else: {tokens, false}
     end
   end
 
+  # The tokens before the first `INTO` that follows a complete item (or the comma of a trailing
+  # one) and those after it; `nil` when there is none.
+  @spec split_into([token()], [token()], token() | nil) :: {[token()], [token()]} | nil
+  defp split_into([], _before, _previous), do: nil
+
+  defp split_into([token | rest], before, previous) do
+    cond do
+      into_word?(token) and (item_end?(previous) or previous == {:symbol, ","}) ->
+        {Enum.reverse(before), rest}
+
+      space?(token) ->
+        split_into(rest, [token | before], previous)
+
+      true ->
+        split_into(rest, [token | before], following(token, previous))
+    end
+  end
+
   @spec into_word?(token()) :: boolean()
   defp into_word?({:word, word}), do: String.upcase(word) == "INTO"
   defp into_word?(_token), do: false
+
+  # What the next token is read after: a `*` is the wildcard of an item where no expression
+  # ends before it (that wildcard ends the item), and a multiplication otherwise.
+  @spec following(token(), token() | nil) :: token()
+  defp following({:symbol, "*"} = star, previous),
+    do: if(item_end?(previous), do: star, else: {:other, "*"})
+
+  defp following(token, _previous), do: token
+
+  # Whether the token before is the end of an expression, so that a word after it begins no
+  # item and no operand: not the start of the list (`SELECT`, `DISTINCT`, `ALL`), a comma, an
+  # opening bracket, an operator or a word that takes an operand.
+  @spec item_end?(token() | nil) :: boolean()
+  defp item_end?({kind, _text}) when kind in [:quoted, :string, :other], do: true
+  defp item_end?({:symbol, symbol}), do: symbol in [")", "]"]
+  defp item_end?({:word, word}), do: String.upcase(word) not in @operand_words
+  defp item_end?(_start), do: false
 
   # Whether the tokens are a select list still open: a `SELECT` as the first token, no `FROM`
   # outside parentheses yet, and the last token not an `AS`.
@@ -221,23 +264,37 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   # A keyword as an alias
   # ---------------------------------------------------------------------------
 
-  # The engine takes any word after `AS` as the name (`SELECT host AS having`), which the
-  # clause readers would take for the clause: it is quoted.
+  # The engine takes any word after an `AS` as the name (`SELECT host AS having`), which the
+  # clause readers would take for the clause: it is quoted. An `AS` where an item begins is a
+  # column's name, and the name after an `AS` is not another `AS` (`host AS as`).
   @spec keyword_aliases([token()]) :: [token()]
-  defp keyword_aliases([{:word, as} = token | rest]) do
+  defp keyword_aliases(tokens), do: keyword_aliases(tokens, nil)
+
+  @spec keyword_aliases([token()], token() | nil) :: [token()]
+  defp keyword_aliases([{:word, as} = token | rest], previous) do
     with "AS" <- String.upcase(as),
-         {blank, [{:word, name} | more]} <- Enum.split_while(rest, &space?/1),
-         upper = String.upcase(name),
-         true <- upper in @structural do
-      [token | blank] ++
-        [{:quoted, ~s|"| <> String.downcase(name) <> ~s|"|} | keyword_aliases(more)]
+         true <- item_end?(previous),
+         {blank, [{:word, name} | more]} <- Enum.split_while(rest, &space?/1) do
+      [token | blank] ++ [alias_name(name) | keyword_aliases(more, {:word, name})]
     else
-      _plain -> [token | keyword_aliases(rest)]
+      _plain -> [token | keyword_aliases(rest, token)]
     end
   end
 
-  defp keyword_aliases([token | rest]), do: [token | keyword_aliases(rest)]
-  defp keyword_aliases([]), do: []
+  defp keyword_aliases([{:space, _text} = token | rest], previous),
+    do: [token | keyword_aliases(rest, previous)]
+
+  defp keyword_aliases([token | rest], previous),
+    do: [token | keyword_aliases(rest, following(token, previous))]
+
+  defp keyword_aliases([], _previous), do: []
+
+  @spec alias_name(binary()) :: token()
+  defp alias_name(name) do
+    if String.upcase(name) in @structural,
+      do: {:quoted, ~s|"| <> String.downcase(name) <> ~s|"|},
+      else: {:word, name}
+  end
 
   # ---------------------------------------------------------------------------
   # SELECT ALL

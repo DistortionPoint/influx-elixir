@@ -47,24 +47,30 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
       for [{at, 1}] <- Regex.scan(@parens, masked, return: :index),
           do: {at, :binary.at(masked, at)}
 
-    walk(parens, [], 0, masked)
+    walk(parens, [], 0, masked, nil)
   end
 
-  defp walk([], [], _count, _masked), do: :balanced
-  defp walk([], [{offset, ordinal} | _outer], _count, _masked), do: {:open, offset, ordinal}
+  # `closed` is where the last `)` ended: a `(` right after it is left over from itself.
+  defp walk([], [], _count, _masked, _closed), do: :balanced
 
-  defp walk([{at, ?(} | rest], open, count, masked),
-    do: walk(rest, [{at, count} | open], count + 1, masked)
+  defp walk([], [{offset, ordinal} | _outer], _count, _masked, _closed),
+    do: {:open, offset, ordinal}
 
-  defp walk([{at, ?)} | _rest], [], _count, _masked), do: {:excess, at}
+  defp walk([{at, ?(} | rest], open, count, masked, closed) do
+    if closed != nil and String.trim(binary_part(masked, closed, at - closed)) == "",
+      do: {:excess, at},
+      else: walk(rest, [{at, count} | open], count + 1, masked, nil)
+  end
+
+  defp walk([{at, ?)} | _rest], [], _count, _masked, _closed), do: {:excess, at}
 
   # A pair with nothing in it is as unreadable as a `(` left open.
-  defp walk([{at, ?)} | rest], [{offset, ordinal} | outer], count, masked) do
+  defp walk([{at, ?)} | rest], [{offset, ordinal} | outer], count, masked, _closed) do
     inside = binary_part(masked, offset + 1, at - offset - 1)
 
     if String.trim(inside) == "",
       do: {:open, offset, ordinal},
-      else: walk(rest, outer, count, masked)
+      else: walk(rest, outer, count, masked, at + 1)
   end
 
   # The tokens before the `(` that has `ordinal` before it, latest first.

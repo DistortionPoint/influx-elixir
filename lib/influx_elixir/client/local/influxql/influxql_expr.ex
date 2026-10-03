@@ -64,7 +64,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @two_arguments ~w(log pow)
   @functions @one_argument ++ @two_arguments
   @wild_in_arithmetic "unsupported binary expression: contains a wildcard or regular expression"
-  @wild_names @aggregates ++ @transforms ++ @functions ++ ["percentile", "integral"]
+  @wild_names @aggregates ++
+                @transforms ++ @functions ++ ["percentile", "integral", "top", "bottom"]
 
   # ---------------------------------------------------------------------------
   # Reading
@@ -274,10 +275,40 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
           | {:planning, binary()}
           | {:expand_error, binary()}
           | :error
-  defp classify({:call, name, arguments}) when name in ["top", "bottom"],
-    do: multi(name, arguments)
+  defp classify({:call, name, arguments} = call) when name in ["top", "bottom"] do
+    if Enum.any?(arguments, &match?({kind, _} when kind in [:star, :regex], &1)),
+      do: classify_wild(call),
+      else: multi(name, arguments)
+  end
 
-  defp classify({:call, name, arguments} = call) do
+  defp classify({:call, _name, _arguments} = call), do: classify_wild(call)
+
+  defp classify({:neg, operand}),
+    do: with({:ok, o} <- classify_inner(operand), do: {:ok, {:neg, o}})
+
+  defp classify({:bin, op, left, right}) do
+    case {classify(left), classify(right)} do
+      {{:ok, l}, {:ok, r}} -> {:ok, {:bin, op, l, r}}
+      {{:planning, _message} = planning, _right} -> planning
+      {{:wild, _n, _a, _t}, _right} -> {:expand_error, @wild_in_arithmetic}
+      {_left, {:wild, _n, _a, _t}} -> {:expand_error, @wild_in_arithmetic}
+      {_left, {:planning, _message} = planning} -> planning
+      _other -> :error
+    end
+  end
+
+  defp classify({kind, _payload} = _leaf) when kind in [:star, :regex, :dur], do: :error
+  defp classify(leaf), do: {:ok, leaf}
+
+  # A call with `*` or a regular expression among its arguments stands for the calls of the
+  # fields it names.
+  @spec classify_wild(term()) ::
+          {:ok, ast()}
+          | {:wild, binary(), [ast()], term()}
+          | {:planning, binary()}
+          | {:expand_error, binary()}
+          | :error
+  defp classify_wild({:call, name, arguments} = call) do
     case Enum.split_with(arguments, &match?({kind, _} when kind in [:star, :regex], &1)) do
       {[], _plain} ->
         classify_call(call)
@@ -297,23 +328,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
         :error
     end
   end
-
-  defp classify({:neg, operand}),
-    do: with({:ok, o} <- classify_inner(operand), do: {:ok, {:neg, o}})
-
-  defp classify({:bin, op, left, right}) do
-    case {classify(left), classify(right)} do
-      {{:ok, l}, {:ok, r}} -> {:ok, {:bin, op, l, r}}
-      {{:planning, _message} = planning, _right} -> planning
-      {{:wild, _n, _a, _t}, _right} -> {:expand_error, @wild_in_arithmetic}
-      {_left, {:wild, _n, _a, _t}} -> {:expand_error, @wild_in_arithmetic}
-      {_left, {:planning, _message} = planning} -> planning
-      _other -> :error
-    end
-  end
-
-  defp classify({kind, _payload} = _leaf) when kind in [:star, :regex, :dur], do: :error
-  defp classify(leaf), do: {:ok, leaf}
 
   # Inside another expression a call with `*` is no column of its own; a
   # planning error found in it is the error of the whole.

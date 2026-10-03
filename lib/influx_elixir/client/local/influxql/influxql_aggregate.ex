@@ -50,15 +50,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   column. `fields` names the fields `COUNT(*)` counts, `tags` the tag columns
   and `types` the type of each field.
   """
-  @spec columns([InfluxQL.item()], [map()], [binary()], MapSet.t(binary()), map()) ::
+  @spec columns([InfluxQL.item()], [map()], [binary()], MapSet.t(binary()), map(), boolean()) ::
           [{binary(), result(), spec()}]
-  def columns(aggregates, rows, fields, tags, types) do
+  def columns(aggregates, rows, fields, tags, types, field_columns? \\ false) do
     tagged = Enum.filter(aggregates, &tag_argument?(&1, tags))
 
     cond do
-      tagged == [] -> name_columns(aggregates, rows, fields, tags, types)
-      length(tagged) == length(aggregates) -> name_columns(aggregates, [], fields, tags, types)
-      true -> throw({:refused, "unsupported InfluxQL (an aggregate of a tag beside others)"})
+      field_columns? and match?([{:aggregate, _fun, "time", _alias}], aggregates) and
+          selector?(elem(hd(aggregates), 1)) ->
+        name_columns(aggregates, rows, fields, tags, types)
+
+      Enum.all?(aggregates, &(tag_argument?(&1, tags) or time_argument?(&1))) ->
+        name_columns(aggregates, [], fields, tags, types)
+
+      tagged == [] ->
+        name_columns(aggregates, rows, fields, tags, types)
+
+      true ->
+        throw({:refused, "unsupported InfluxQL (an aggregate of a tag beside others)"})
     end
   end
 
@@ -128,6 +137,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
     do: MapSet.member?(tags, field)
 
   defp tag_argument?(_item, _tags), do: false
+
+  # An aggregate of the `time` column answers nothing alone, as an aggregate of a tag does
+  # (beside a field `count`, `first`, `last`, `min`, `max` and `mode` read the time of the
+  # points, the others are the engine's planning error, see `InfluxQLPlan`).
+  @spec time_argument?(InfluxQL.item()) :: boolean()
+  defp time_argument?({:aggregate, _fun, "time", _alias}), do: true
+  defp time_argument?({:aggregate, "count", {:distinct, "time"}, _alias}), do: true
+  defp time_argument?(_item), do: false
 
   # [{output_name, result, spec}]
   @spec compute(InfluxQL.item(), [map()], [binary()], MapSet.t(binary()), map()) ::
@@ -412,19 +429,29 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
 
   # `min` and `max` take numbers and strings (by bytes).
   @spec orderable?(term()) :: boolean()
-  defp orderable?(value), do: is_number(value) or is_binary(value) or is_boolean(value)
+  defp orderable?(value),
+    do: is_number(value) or is_binary(value) or is_boolean(value) or is_struct(value, DateTime)
+
+  # `>` on two times compares the structs, not the instants.
+  @spec after?(term(), term()) :: boolean()
+  defp after?(%DateTime{} = left, %DateTime{} = right), do: DateTime.compare(left, right) == :gt
+  defp after?(left, right), do: left > right
 
   @spec pick(binary(), [map(), ...], binary()) :: {:value, term(), map()}
   defp pick("first", [point | _rest], field), do: {:value, point[field], point}
   defp pick("last", points, field), do: pick("first", Enum.reverse(points), field)
 
   defp pick("max", points, field) do
-    point = Enum.reduce(points, fn p, best -> if p[field] > best[field], do: p, else: best end)
+    point =
+      Enum.reduce(points, fn p, best -> if after?(p[field], best[field]), do: p, else: best end)
+
     {:value, point[field], point}
   end
 
   defp pick("min", points, field) do
-    point = Enum.reduce(points, fn p, best -> if p[field] < best[field], do: p, else: best end)
+    point =
+      Enum.reduce(points, fn p, best -> if after?(best[field], p[field]), do: p, else: best end)
+
     {:value, point[field], point}
   end
 

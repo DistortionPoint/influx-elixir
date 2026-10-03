@@ -220,10 +220,18 @@ defmodule InfluxElixir.Client.Local.Admin do
       "name" => name,
       "token" => secret,
       "hash" => :sha512 |> :crypto.hash(secret) |> Base.encode16(case: :lower),
-      "created_at" => DateTime.to_iso8601(created),
-      "expiry" => expiry_secs && DateTime.to_iso8601(DateTime.add(created, expiry_secs))
+      "created_at" => token_time(created),
+      "expiry" => expiry_secs && token_time(DateTime.add(created, expiry_secs))
     }
   end
+
+  # The engine prints a token's times to the millisecond, and with no fraction
+  # at all when the milliseconds are zero (`…:53Z`, verified against Core).
+  @spec token_time(DateTime.t()) :: binary()
+  defp token_time(%DateTime{microsecond: {0, _precision}} = time),
+    do: time |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+
+  defp token_time(time), do: DateTime.to_iso8601(time)
 
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}

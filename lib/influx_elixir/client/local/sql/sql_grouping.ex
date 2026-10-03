@@ -10,6 +10,7 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
     SQLAggExpr,
     SQLError,
     SQLExpr,
+    SQLLiteral,
     SQLParser,
     SQLSchema,
     SQLWhere
@@ -40,36 +41,84 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
       end)
 
     case ungrouped do
-      nil -> check_having(query, grouped, relations)
-      {:column, column} -> {:error, ungrouped_error(query, column, "SELECT")}
-      {:expression, column} -> {:error, ungrouped_refusal(column)}
+      nil ->
+        check_having(query, grouped, relations)
+
+      {:column, column} ->
+        {:error, ungrouped_error(query, "#{query.qualifier}.#{column}", "SELECT")}
+
+      {:expression, column} ->
+        {:error, ungrouped_refusal(column)}
     end
   end
 
   # A column a `HAVING` reads that is neither grouped nor an aggregate's. A name the table
   # has is that column; any other is the name of a select item (verified against Core: an
   # alias of an aggregate or an expression is read as the item, and a column of the table
-  # wins over an alias of that name). The `NULL` of `HAVING NULL` reads as a comparison of
-  # `time` with null, which reads no column.
+  # wins over an alias of that name), but only a name written without a relation: `t.alias`
+  # is a column of `t`, which a `HAVING` that is not grouped refuses, named as written. The
+  # `NULL` of `HAVING NULL` reads as a comparison of `time` with null, which reads no column.
   @spec check_having(SQLParser.parsed_query(), [binary()], [SQLSchema.relation()]) ::
           :ok | {:error, term()}
   defp check_having(%{having: nil}, _grouped, _relations), do: :ok
 
   defp check_having(%{having: %{nodes: nodes}} = query, grouped, relations) do
     outputs = for column <- query.select_columns, do: elem(column, tuple_size(column) - 1)
+    columns = SQLSchema.table_columns(relations)
 
-    ungrouped =
-      Enum.find(SQLWhere.conjunction_columns(nodes), fn name ->
-        not (SQLAggExpr.placeholder?(name) or name in grouped or
-               named_item?(name, outputs, relations))
-      end)
+    qualified = for {:qualified, _relation, _name} = ref <- SQLSchema.where_refs(nodes), do: ref
 
-    if ungrouped, do: {:error, ungrouped_error(query, ungrouped, "HAVING")}, else: :ok
+    problem =
+      Enum.find_value(
+        SQLWhere.conjunction_columns(nodes) ++ qualified,
+        &having_problem(&1, query, grouped, outputs, columns)
+      )
+
+    case problem do
+      nil -> :ok
+      {:ungrouped, printed} -> {:error, ungrouped_error(query, printed, "HAVING")}
+      {:refuse, why} -> {:error, SQLError.refusal(why)}
+    end
   end
 
-  @spec named_item?(binary(), [binary()], [SQLSchema.relation()]) :: boolean()
-  defp named_item?(name, outputs, relations),
-    do: name in outputs and not MapSet.member?(SQLSchema.table_columns(relations), name)
+  @spec having_problem(
+          SQLExpr.column_ref(),
+          SQLParser.parsed_query(),
+          [binary()],
+          [binary()],
+          MapSet.t(binary())
+        ) :: nil | {:ungrouped, binary()} | {:refuse, binary()}
+  defp having_problem({:qualified, relation, _name} = ref, _query, _grouped, outputs, columns) do
+    taken = unquoted(relation)
+
+    if taken in outputs or MapSet.member?(columns, taken),
+      do:
+        {:refuse,
+         "a HAVING name #{SQLExpr.ref_text(ref)} whose relation is a column or a select item: " <>
+           "the engine reads it as a field of that column"},
+      else: {:ungrouped, SQLExpr.ref_text(ref)}
+  end
+
+  defp having_problem(name, query, grouped, outputs, columns) do
+    cond do
+      SQLAggExpr.placeholder?(name) or name in grouped ->
+        nil
+
+      MapSet.member?(Map.get(query.qualified_in, :having, MapSet.new()), name) ->
+        {:ungrouped, SQLSchema.written_name(name, query.qualified)}
+
+      name in outputs and not MapSet.member?(columns, name) ->
+        nil
+
+      true ->
+        {:ungrouped, "#{query.qualifier}.#{name}"}
+    end
+  end
+
+  @spec unquoted(binary()) :: binary()
+  defp unquoted(text) do
+    if SQLLiteral.identifier?(text), do: SQLLiteral.identifier_name(text), else: text
+  end
 
   # The first column an expression reads outside an aggregate that is not
   # grouped (an expression the `GROUP BY` also holds is grouped whole).
@@ -104,14 +153,14 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
   end
 
   @spec ungrouped_error(SQLParser.parsed_query(), binary(), binary()) :: map()
-  defp ungrouped_error(query, column, clause) do
+  defp ungrouped_error(query, printed, clause) do
     case satisfying_terms(query) do
       {:ok, terms} ->
         %{
           status: 400,
           body:
             "Error during planning: Column in #{clause} must be in GROUP BY or an aggregate " <>
-              "function: While expanding wildcard, column \"#{query.qualifier}.#{column}\" " <>
+              "function: While expanding wildcard, column \"#{printed}\" " <>
               "must appear in the GROUP BY clause or must be part of an aggregate function, " <>
               "currently only \"#{Enum.join(terms, ", ")}\" appears in the SELECT clause " <>
               "satisfies this requirement"
@@ -119,7 +168,7 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
 
       :unrenderable ->
         SQLError.refusal(
-          "column \"#{column}\" must appear in the GROUP BY clause or be part of an " <>
+          "column \"#{printed}\" must appear in the GROUP BY clause or be part of an " <>
             "aggregate function; the double cannot print this query's terms as the " <>
             "engine's error does"
         )

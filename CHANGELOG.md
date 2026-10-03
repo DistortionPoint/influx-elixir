@@ -32,17 +32,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MIN(NULL)`/`MAX(NULL)` is refused by name.
 - **Queries against a database with a retention were up to 7× slower**
   (0.1.41); they now cost about the same as any other database.
-- **`mix test` with an absolute or `./` path ran the whole suite**, and an
-  `--include` of an integration tag without a path ran none of the
-  integration tests.
+- **`Client.Local` InfluxQL dropped a `min(time)`/`max(time)` column**
+  beside another aggregate, and `WHERE - host` was a planner error where the
+  engine answers `[]` (a tag under arithmetic is null).
+- **`Client.Local` SQL read `INTO` and `AS` used as column names as clauses**,
+  resolved a qualified `HAVING`/`ORDER BY` name (`cpu.c`) as a select alias,
+  answered `left(NULL, 1.5)` where the engine errors, and raised on
+  `selector_max(...) || 'a'` and on some malformed InfluxQL select lists.
+  Numbers such as `1L` and `0XFF` are read as the engine reads them (one
+  definition of a number token now serves every SQL reader).
+- **`Client.Local` printed a token created on a whole second as `….000Z`**;
+  the engine prints `…Z` with no fraction (it is to the millisecond
+  otherwise).
+- **`mix test` chose the wrong tests** for an absolute or `./` path, a path
+  outside `test/`, `--only=v2`, and an `--include` of an integration tag
+  without a path. The arguments are now read as `mix test` reads them.
 
 ### Changed
 - The integration one-liners pin `influxdb:3.10.1-core`, the version the
-  exact engine bodies were verified against.
+  exact engine bodies were verified against, and start it with
+  `--wal-snapshot-size 100000`: Core 3.10.1 panics ("timestamp wraparound")
+  when it snapshots a point near the largest timestamp, which the contracts
+  write, and its writes then hang until restart. With a 10 ms WAL flush a
+  suite reached that snapshot within one run.
+- One server's integration suite is run with `mix test --only v3_core` (or
+  `v2`); `--include integration` selects every server's.
 - Contract case tables report every mismatch; tables that accept a refusal
-  by name pin how many refusals they hold, so a regression to "refused"
-  fails. Line-protocol errors are pinned once, in a contract run on both
-  engines.
+  by name pin exactly which cases are refused, so a regression to "refused"
+  fails naming the case. Line-protocol errors, including the 10,000-line
+  chunk payloads, are pinned once, in a contract run on both engines.
 
 ## [0.1.41] - 2026-10-03
 

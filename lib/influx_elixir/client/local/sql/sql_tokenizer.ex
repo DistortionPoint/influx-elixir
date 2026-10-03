@@ -275,15 +275,14 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   end
 
   # `0x1F` is a binary value to the engine, printed `X'1F'`, which the double refuses by
-  # name once the text reads.
+  # name once the text reads; any other number prints as written, with its `L`.
   @spec number(binary(), pos_integer(), pos_integer(), tokens()) :: {:ok, tokens()} | :bail
   defp number(text, line, col, acc) do
-    case Regex.run(~r/\A0x([0-9a-fA-F]*)/, text) do
-      [raw, digits] ->
+    case SQLIdentifiers.take_number(text) do
+      {"0x" <> digits = raw, _rest} ->
         raw_token(text, raw, :literal, "X'" <> digits <> "'", line, col, acc)
 
-      nil ->
-        [literal] = Regex.run(~r/\A(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/, text)
+      {literal, _rest} ->
         emit(text, literal, :number, line, col, acc)
     end
   end

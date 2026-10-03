@@ -177,11 +177,13 @@ defmodule InfluxElixir.Contract.SQLScalar do
         end)
       end
 
-      # The same for a table the double may refuse by name. `local_refusals` is
-      # pinned with `===`: above it a case regressed to "refused", below it one
-      # is answered now and moves to the table of answers. A real engine refuses none.
+      # The same for a table the double may refuse by name. `local_refusals` is the
+      # pinned set of `{kind, text}` it refuses (`InfluxElixir.Contract.SQLScalarRefusals`):
+      # a case refused and not in it regressed, a case in it that is answered now
+      # moves to the table of answers; each fails naming the case. A real engine
+      # refuses none.
       def ss_check_refusable(ctx, cases, local_refusals) do
-        pinned = if ss_local?(), do: local_refusals, else: 0
+        pinned = if ss_local?(), do: local_refusals, else: []
 
         InfluxElixir.TestSupport.Check.check_ratchet(
           cases,
@@ -195,7 +197,11 @@ defmodule InfluxElixir.Contract.SQLScalar do
               true -> {:mismatch, %{expected: expected, actual: actual}}
             end
           end,
-          pinned
+          pinned,
+          fn entry ->
+            {kind, text, _expected} = InfluxElixir.Contract.SQLScalar.decode(entry)
+            {kind, text}
+          end
         )
       end
     end
@@ -212,8 +218,7 @@ defmodule InfluxElixir.Contract.SQLScalar do
           ss_check_refusable(
             ctx,
             InfluxElixir.Contract.SQLScalarCases.expressions_values_refusable(),
-            # Local refuses 16 of these
-            16
+            InfluxElixir.Contract.SQLScalarRefusals.expressions_values()
           )
         end
 
@@ -225,8 +230,7 @@ defmodule InfluxElixir.Contract.SQLScalar do
           ss_check_refusable(
             ctx,
             InfluxElixir.Contract.SQLScalarCases.expressions_names_refusable(),
-            # Local refuses 1 of these
-            1
+            InfluxElixir.Contract.SQLScalarRefusals.expressions_names()
           )
         end
       end
@@ -245,8 +249,7 @@ defmodule InfluxElixir.Contract.SQLScalar do
           ss_check_refusable(
             ctx,
             InfluxElixir.Contract.SQLScalarCases.functions_values_refusable(),
-            # Local refuses 8 of these
-            8
+            InfluxElixir.Contract.SQLScalarRefusals.functions_values()
           )
         end
       end
@@ -260,8 +263,12 @@ defmodule InfluxElixir.Contract.SQLScalar do
         test "type errors, wrong arities and failures only a value shows", ctx do
           ss_fixture(ctx)
           ss_check(ctx, InfluxElixir.Contract.SQLScalarCases.errors())
-          # Local refuses 52 of these
-          ss_check_refusable(ctx, InfluxElixir.Contract.SQLScalarCases.errors_refusable(), 52)
+
+          ss_check_refusable(
+            ctx,
+            InfluxElixir.Contract.SQLScalarCases.errors_refusable(),
+            InfluxElixir.Contract.SQLScalarRefusals.errors()
+          )
         end
       end
     end
@@ -278,8 +285,7 @@ defmodule InfluxElixir.Contract.SQLScalar do
           ss_check_refusable(
             ctx,
             InfluxElixir.Contract.SQLCatalogCases.aggregates_refusable(),
-            # Local refuses 24 of these
-            24
+            InfluxElixir.Contract.SQLScalarRefusals.aggregates()
           )
         end
       end
@@ -293,16 +299,24 @@ defmodule InfluxElixir.Contract.SQLScalar do
         test "the statements the parser reads, and its errors for those it does not", ctx do
           ss_fixture(ctx)
           ss_check(ctx, InfluxElixir.Contract.SQLCatalogCases.syntax())
-          # Local refuses 54 of these
-          ss_check_refusable(ctx, InfluxElixir.Contract.SQLCatalogCases.syntax_refusable(), 54)
+
+          ss_check_refusable(
+            ctx,
+            InfluxElixir.Contract.SQLCatalogCases.syntax_refusable(),
+            InfluxElixir.Contract.SQLScalarRefusals.syntax()
+          )
         end
 
         @tag local_divergence: "Local refuses by name some of what the engine answers"
         test "SHOW TABLES, SHOW COLUMNS and the information_schema", ctx do
           ss_fixture(ctx)
           ss_check(ctx, InfluxElixir.Contract.SQLCatalogCases.catalog())
-          # Local refuses 10 of these
-          ss_check_refusable(ctx, InfluxElixir.Contract.SQLCatalogCases.catalog_refusable(), 10)
+
+          ss_check_refusable(
+            ctx,
+            InfluxElixir.Contract.SQLCatalogCases.catalog_refusable(),
+            InfluxElixir.Contract.SQLScalarRefusals.catalog()
+          )
         end
       end
     end

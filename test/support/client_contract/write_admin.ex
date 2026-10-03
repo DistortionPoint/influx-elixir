@@ -23,8 +23,7 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
           atomic_write_tests(client),
           db_admin_tests(client),
           database_rule_tests(client),
-          identifier_tests(client),
-          tab_tests(client)
+          identifier_tests(client)
         ]
       else
         []
@@ -100,49 +99,6 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
         end
       end
 
-    malformed_test =
-      if profile == :v2 do
-        quote location: :keep do
-          test "malformed line protocol is the engine's 400", ctx do
-            assert {:error, %{status: 400, body: body}} =
-                     unquote(client).write(
-                       ctx.conn,
-                       "this is not line protocol!!",
-                       database: ctx.database
-                     )
-
-            assert Jason.decode!(body) === %{
-                     "code" => "invalid",
-                     "message" =>
-                       "unable to parse 'this is not line protocol!!': invalid field format"
-                   }
-          end
-        end
-      else
-        quote location: :keep do
-          # The engine's body, `original_line` cut to 20 bytes.
-          test "malformed line protocol is the engine's 400, line by line", ctx do
-            assert {:error, %{status: 400, body: body}} =
-                     unquote(client).write(
-                       ctx.conn,
-                       "this is not line protocol!!",
-                       database: ctx.database
-                     )
-
-            assert Jason.decode!(body) === %{
-                     "error" => "partial write of line protocol occurred",
-                     "data" => [
-                       %{
-                         "error_message" => "No fields were provided",
-                         "line_number" => 1,
-                         "original_line" => "this is not line pro"
-                       }
-                     ]
-                   }
-          end
-        end
-      end
-
     quote location: :keep do
       describe "write/3 — contract" do
         test "accepts valid line protocol and returns {:ok, :written}",
@@ -158,8 +114,6 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
         end
 
         unquote(ghost_db_test)
-
-        unquote(malformed_test)
       end
     end
   end
@@ -651,110 +605,6 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
                      unquote(client),
                      ctx,
                      ~s|SELECT * FROM __M__ WHERE k = "k"|
-                   )
-        end
-      end
-    end
-  end
-
-  defp tab_tests(client) do
-    quote location: :keep do
-      describe "write/3 — tabs in line protocol contract" do
-        test "a tab outside a quoted string refuses the line, with the engine's message", ctx do
-          m = InfluxElixir.IntegrationHelper.unique_name("contract_tab")
-          space = "Expected at least one space character, got "
-          trailing = "Could not parse entire line. Found trailing content: "
-
-          InfluxElixir.TestSupport.Check.each_case(
-            [
-              {"#{m},h=a\tb v=1i 1", space <> "`\tb v=1i 1`"},
-              {"#{m}\tx v=1i 1", space <> "`\tx v=1i 1`"},
-              {"#{m},h\tk=a v=1i 1",
-               "Tag set malformed: could not find equals sign in `h\tk=a v=1i...`"},
-              {"#{m},h=\ta v=1i 1", "Expected tag value, got `\ta v=1i 1`"},
-              {"#{m} v\tx=1i 1", "No fields were provided"},
-              {"#{m} v=1i,w\tx=2i 1", trailing <> "`w\tx=2i 1`"},
-              {"#{m} v=1i,w=2i,x\ty=3i 1", trailing <> "`,x\ty=3i 1`"},
-              {"#{m} v=1i\t1", trailing <> "`\t1`"}
-            ],
-            fn {lp, message} ->
-              assert {:error, %{status: 400, body: body}} =
-                       unquote(client).write(ctx.conn, lp, database: ctx.database),
-                     inspect(lp)
-
-              assert %{"data" => [%{"error_message" => ^message}]} = Jason.decode!(body),
-                     inspect(lp)
-            end
-          )
-        end
-
-        test "a CRLF ending, a stray carriage return, a line of other whitespace", ctx do
-          m = InfluxElixir.IntegrationHelper.unique_name("contract_cr")
-          trailing = "Could not parse entire line. Found trailing content: "
-          no_space = "Expected at least one space character, got end of input"
-
-          InfluxElixir.TestSupport.Check.each_case(
-            [
-              # CRLF: the \r ends the value; the echoed line drops it.
-              {"#{m} v=1i 1\r\n", 1, trailing <> "`\r`", "#{m} v=1i 1"},
-              {"#{m} s=\"x\"\r\n", 1, trailing <> "`\r`", "#{m} s=\"x\""},
-              # One inside the line stays in the echo.
-              {"#{m} v=1i\r 1", 1, trailing <> "`\r 1`", "#{m} v=1i\r 1"},
-              # An invalid value before it fails the field.
-              {"#{m} v=abc\r\n", 1, "No fields were provided", "#{m} v=abc"},
-              # Only spaces and tabs make a blank line.
-              {"#{m} v=1i 1\n\v\n", 2, no_space, "\v"},
-              {"#{m} v=1i 1\n \n", 2, no_space, " "}
-            ],
-            fn {lp, number, message, original} ->
-              assert {:error, %{status: 400, body: body}} =
-                       unquote(client).write(ctx.conn, lp,
-                         database: ctx.database,
-                         precision: :second
-                       ),
-                     inspect(lp)
-
-              assert %{"data" => [%{"line_number" => ^number, "error_message" => ^message} = e]} =
-                       Jason.decode!(body),
-                     inspect(lp)
-
-              assert e["original_line"] === String.slice(original, 0, 20), inspect(lp)
-            end
-          )
-
-          # In a tag value a \r is an ordinary character.
-          tagged = m <> "_tag"
-
-          assert {:ok, :written} =
-                   unquote(client).write(ctx.conn, "#{tagged},t=a\rb v=1i 1",
-                     database: ctx.database,
-                     precision: :second
-                   )
-
-          InfluxElixir.ClientContract.settle(ctx)
-
-          assert {:ok, [%{"t" => "a\rb"}]} =
-                   unquote(client).query_sql(ctx.conn, ~s|SELECT t FROM "#{tagged}"|,
-                     database: ctx.database
-                   )
-        end
-
-        test "a leading tab is whitespace; an escaped tab and one in a string are kept", ctx do
-          m = InfluxElixir.IntegrationHelper.unique_name("contract_tab_ok")
-
-          assert {:ok, :written} =
-                   unquote(client).write(
-                     ctx.conn,
-                     "\t#{m},h=a\\\tb s=\"x\ty\" 1",
-                     database: ctx.database,
-                     precision: :second
-                   )
-
-          InfluxElixir.ClientContract.settle(ctx)
-
-          assert {:ok, [%{"h" => "a\\\tb", "s" => "x\ty"}]} =
-                   unquote(client).query_sql(ctx.conn, ~s|SELECT h, s FROM "#{m}"|,
-                     database: ctx.database
                    )
         end
       end

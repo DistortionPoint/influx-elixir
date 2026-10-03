@@ -36,6 +36,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
     SQLCast,
     SQLError,
     SQLLimits,
+    SQLNativeType,
     SQLNumber,
     SQLParser,
     SQLScalar,
@@ -259,7 +260,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
         planning(
           :abs,
           [type],
-          "Function 'abs' expects NativeType::Numeric but received NativeType::#{native(type)}",
+          "Function 'abs' expects NativeType::Numeric but received NativeType::#{SQLNativeType.native(type)}",
           context
         )
   end
@@ -344,14 +345,6 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
     do: "\ttrunc(Float32, Int64)\n\ttrunc(Float64, Int64)\n\ttrunc(Float64)\n\ttrunc(Float32)"
 
   defp candidates(name), do: "\t#{name}(Float64/Float32)"
-
-  @doc "DataFusion's NativeType for an Arrow type, as its messages name it."
-  @spec native(binary()) :: binary()
-  def native("Utf8"), do: "String"
-  def native("Dictionary(Int32, Utf8)"), do: "String"
-  def native("Utf8View"), do: "String"
-  def native("Timestamp(ns)"), do: "Timestamp(Nanosecond, None)"
-  def native(type), do: type
 
   @doc """
   The Arrow type an expression has, given the columns' types, or `nil`

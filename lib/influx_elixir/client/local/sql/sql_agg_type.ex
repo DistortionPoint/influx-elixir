@@ -48,7 +48,8 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   defp result({:count_star, _name}, _columns), do: "Int64"
   defp result({:count_distinct, _column, _name}, _columns), do: "Int64"
 
-  defp result({:aggregate, :count, _expr, _name}, _columns), do: "Int64"
+  defp result({:aggregate, agg, _expr, _name}, _columns) when agg in [:count, :count_distinct],
+    do: "Int64"
 
   # The null as an argument (verified against Core): the statistics are floats; `MIN` and
   # `MAX` of it are typed by the engine only after the plan (not modelled), `SUM` and `AVG`

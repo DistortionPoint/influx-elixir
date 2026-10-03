@@ -41,8 +41,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
           known: Keyword.get(opts, :known)
         }
 
-        deferred = InfluxQLTyped.bare_condition(tree, ctx)
-        {sql, bounds, checks} = if deferred, do: {"true", [], []}, else: plan(tree, ctx, times)
+        {deferred, {sql, bounds, checks}} =
+          case InfluxQLTyped.bare_condition(tree, ctx) do
+            nil -> {nil, plan(tree, ctx, times)}
+            :empty -> {nil, {"(1 = 0)", [], []}}
+            error -> {error, {"true", [], []}}
+          end
+
         idents = for {:ident, name} <- tokens, into: MapSet.new(), do: name
 
         {:ok,
@@ -240,10 +245,40 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   defp time_plan(tokens, tags, times) do
     case time_sides(tokens) do
-      {op, comparand} -> time_comparison(op, comparand, times)
-      :other -> {tokens |> InfluxQLSql.rewrite(tags, []) |> Enum.join(" "), []}
+      {op, comparand} ->
+        time_comparison(op, comparand, times)
+
+      :other ->
+        if {:raw, "now()"} not in tokens, do: negated_time(tokens, nil)
+        {tokens |> InfluxQLSql.rewrite(tags, []) |> Enum.join(" "), []}
     end
   end
+
+  # A minus sign before `time` is the planning error of `-1 * time` (verified), not the
+  # SQL engine's broken connection.
+  defp negated_time([{:raw, "-"} | rest], previous)
+       when previous in [nil, "(", "+", "-", "*", "/", :op] do
+    case rest do
+      [token | _more] ->
+        if InfluxQLTokens.time?(token),
+          do:
+            throw(
+              {:refused,
+               {:engine, 400,
+                "Error during planning: Cannot coerce arithmetic expression " <>
+                  "Int64 * Timestamp(ns) to valid types"}}
+            ),
+          else: negated_time(rest, "-")
+
+      [] ->
+        :ok
+    end
+  end
+
+  defp negated_time([{:op, _op} | rest], _previous), do: negated_time(rest, :op)
+  defp negated_time([{:raw, text} | rest], _previous), do: negated_time(rest, text)
+  defp negated_time([_token | rest], _previous), do: negated_time(rest, :operand)
+  defp negated_time([], _previous), do: :ok
 
   defp time_sides([first, {:op, op} | comparand] = tokens) when comparand != [] do
     cond do
@@ -285,9 +320,26 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   # `InfluxQLRun`); the bounds it gives are the statement's own.
   defp time_comparison(op, comparand, %{now: now, extend: extend}) do
     ns = time_ns(comparand, now)
-    scanned = if op in [">=", ">"], do: ns - extend, else: ns
-    {"time #{op} '#{iso_ns(scanned)}'", bounds(op, ns)}
+
+    if wraps?(op, ns) do
+      {"(1 = 1)", wrapped_bounds(op)}
+    else
+      scanned = if op in [">=", ">"], do: ns - extend, else: ns
+      {"time #{op} '#{iso_ns(scanned)}'", bounds(op, ns)}
+    end
   end
+
+  # The engine adds one to the bound of `time > x` and takes one from that of `time < x`, in
+  # 64 bits: past the largest time the bound wraps to the smallest (and the reverse), so
+  # `time > 9223372036854775807` and `time < -9223372036854775808` keep every point (verified).
+  @spec wraps?(binary(), integer()) :: boolean()
+  defp wraps?(">", ns), do: ns == SQLLimits.int64_max()
+  defp wraps?("<", ns), do: ns == SQLLimits.int64_min()
+  defp wraps?(_op, _ns), do: false
+
+  @spec wrapped_bounds(binary()) :: [{:lower | :upper, InfluxQL.bound()}]
+  defp wrapped_bounds(">"), do: [{:lower, SQLLimits.int64_min()}]
+  defp wrapped_bounds("<"), do: [{:upper, SQLLimits.int64_max()}]
 
   # What a time is compared with, in nanoseconds since the epoch: a lone
   # quoted time, read as the planner reads it, or an expression of quoted

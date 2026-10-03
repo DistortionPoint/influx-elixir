@@ -20,7 +20,12 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # the 405 or the planning error of a statement that needs nothing more
   # (`BEGIN`, `COMMIT`, `SHOW`).
 
-  alias InfluxElixir.Client.Local.SQLError
+  alias InfluxElixir.Client.Local.{SQLError, SQLIdentifiers, SQLTokenizer}
+
+  # The privileges `GRANT`, `REVOKE` and `DENY` take (every other word is where the parser
+  # expects a privilege keyword).
+  @privileges ~w(ALL SELECT INSERT UPDATE DELETE TRUNCATE REFERENCES TRIGGER CREATE USAGE CONNECT
+    EXECUTE TEMPORARY MODIFY MONITOR)
 
   # The words a statement of the engine's parser may start with (every one
   # of them was checked: none is `Expected: an SQL statement`).
@@ -112,8 +117,6 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # printed with its prefix in capitals and its quotes undoubled; a hexadecimal
   # number as `X'<digits>'`.
   @prefixed ~r/\A([Uu]&|[NEXBRnexbr])'((?:[^']|'')*)'/u
-  @hex ~r/\A0x([0-9a-fA-F]*)/
-  @number ~r/\A(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?/
   @single ~r/\A'((?:[^']|'')*)'/u
   @double ~r/\A"((?:[^"]|"")*)"/u
   @backtick ~r/\A`([^`]*)`/u
@@ -172,7 +175,7 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
         nil
 
       statement_word?(rest) ->
-        nil
+        phrase_error(sql)
 
       true ->
         case printed(rest) do
@@ -192,11 +195,72 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
     end
   end
 
+  # The parser's error for a statement of one of these words whose next token is not one it
+  # can go on with: a privilege (`GRANT x`), `AS` (`ATTACH x`), `USING` (`MERGE INTO t`).
+  @spec phrase_error(binary()) :: SQLError.t() | nil
+  defp phrase_error(sql) do
+    case SQLTokenizer.tokenize(sql) do
+      {:ok, [{:word, _printed, word, _line, _col} | rest]} -> phrase(word, rest)
+      _unread -> nil
+    end
+  end
+
+  @spec phrase(binary(), SQLTokenizer.tokens()) :: SQLError.t() | nil
+  defp phrase(word, [next | _rest]) when word in ["GRANT", "REVOKE", "DENY"] do
+    case next do
+      {:eof, _printed, _upper, _line, _col} -> nil
+      {:word, _printed, upper, _line, _col} when upper in @privileges -> nil
+      token -> expected("a privilege keyword", token)
+    end
+  end
+
+  defp phrase("ATTACH", [{:word, _p, "DATABASE", _l, _c}, name | rest]), do: attached(name, rest)
+  defp phrase("ATTACH", [name | rest]), do: attached(name, rest)
+
+  defp phrase("MERGE", [{:word, _p, "INTO", _l, _c}, name | rest]), do: merged(name, rest)
+  defp phrase("MERGE", [name | rest]), do: merged(name, rest)
+  defp phrase(_word, _rest), do: nil
+
+  # What follows the one-token name of `ATTACH [DATABASE] name`: `AS`, or the parser's error.
+  @spec attached(SQLTokenizer.token(), SQLTokenizer.tokens()) :: SQLError.t() | nil
+  defp attached({kind, _p, _u, _l, _c}, [after_name | _rest])
+       when kind in [:word, :string, :quoted, :number] do
+    case after_name do
+      {:word, _printed, "AS", _line, _col} -> nil
+      {:eof, _printed, _upper, _line, _col} = token -> expected("AS", token)
+      {:symbol, ";", _upper, _line, _col} = token -> expected("AS", token)
+      {:symbol, _printed, _upper, _line, _col} -> nil
+      token -> expected("AS", token)
+    end
+  end
+
+  defp attached(_name, _rest), do: nil
+
+  # What follows the one-token name of `MERGE [INTO] name`: nothing, where the parser wants
+  # `USING`.
+  @spec merged(SQLTokenizer.token(), SQLTokenizer.tokens()) :: SQLError.t() | nil
+  defp merged({kind, _p, _u, _l, _c}, [{:eof, _printed, _upper, _line, _col} = eof | _rest])
+       when kind in [:word, :quoted],
+       do: expected("USING", eof)
+
+  defp merged({kind, _p, _u, _l, _c}, [{:symbol, ";", _upper, _line, _col} = semi | _rest])
+       when kind in [:word, :quoted],
+       do: expected("USING", semi)
+
+  defp merged(_name, _rest), do: nil
+
+  @spec expected(binary(), SQLTokenizer.token()) :: SQLError.t()
+  defp expected(what, {:eof, _printed, _upper, _line, _col}),
+    do: SQLError.parser("Expected: #{what}, found: EOF")
+
+  defp expected(what, {_kind, printed, _upper, line, col}),
+    do: SQLError.parser("Expected: #{what}, found: #{printed} at Line: #{line}, Column: #{col}")
+
   # The words the engine prints in capitals when it names a statement it does not run
   # (the keywords of the statements above, and the words that follow them).
   @display_words @statement_words ++
                    ~w(TABLE TRANSACTION COLUMN ADD INT ALL ON TO LOGS SAVEPOINT CURSOR FOR IS AS
-                      MATERIALIZED VIEW DATA)
+                      MATERIALIZED VIEW DATA DATABASE SCHEMA)
 
   @doc """
   A statement the engine does not run as it names it in its error: the keywords in capitals
@@ -209,6 +273,9 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
     text = statement |> String.trim() |> String.replace_suffix(";", "") |> String.trim()
 
     cond do
+      Regex.match?(~r/\A(?:MERGE|GRANT|REVOKE|DENY)\b/i, text) ->
+        privilege_or_merge_display(text)
+
       Regex.match?(~r/\A[A-Za-z_][\w$]*(?:\s+[A-Za-z_][\w$]*)*\z/, text) ->
         {:ok, text |> String.split() |> Enum.map_join(" ", &display_word/1) |> release()}
 
@@ -216,6 +283,49 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
         word == String.upcase(word) or String.upcase(word) not in @display_words
       end) ->
         {:ok, text}
+
+      true ->
+        :unknown
+    end
+  end
+
+  # The `MERGE` and the privilege statements the double names: `MERGE [INTO] a USING b ON true
+  # WHEN MATCHED THEN DELETE` and `GRANT p [ON t] TO u` (`REVOKE ... FROM`, `DENY ... TO`)
+  # for one privilege. Their other forms print aliases, lists and clauses the double does not
+  # model.
+  @spec privilege_or_merge_display(binary()) :: {:ok, binary()} | :unknown
+  defp privilege_or_merge_display(text) do
+    name = "([A-Za-z_][\\w$]*)"
+    privilege = Enum.join(@privileges -- ["ALL"], "|")
+
+    merge =
+      Regex.compile!(
+        "\\AMERGE(\\s+INTO)?\\s+#{name}\\s+USING\\s+#{name}\\s+ON\\s+TRUE\\s+WHEN" <>
+          "\\s+MATCHED\\s+THEN\\s+DELETE\\z",
+        "i"
+      )
+
+    grant =
+      Regex.compile!(
+        "\\A(GRANT|REVOKE|DENY)\\s+(#{privilege})(?:\\s+ON\\s+#{name})?\\s+(TO|FROM)\\s+#{name}\\z",
+        "i"
+      )
+
+    cond do
+      match = Regex.run(merge, text) ->
+        [_all, into, target, source] = match
+        into = if into == "", do: "", else: " INTO"
+        {:ok, "MERGE#{into} #{target} USING #{source} ON true WHEN MATCHED THEN DELETE"}
+
+      match = Regex.run(grant, text) ->
+        [_all, verb, privilege, object, direction, user] = match
+        on = if object == "", do: "", else: " ON #{object}"
+
+        if String.upcase(verb) == "REVOKE" == (String.upcase(direction) == "FROM"),
+          do:
+            {:ok,
+             "#{String.upcase(verb)} #{String.upcase(privilege)}#{on} #{String.upcase(direction)} #{user}"},
+          else: :unknown
 
       true ->
         :unknown
@@ -331,7 +441,6 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
     Enum.find_value(
       [
         &prefixed/1,
-        &hex/1,
         &number/1,
         &quoted(&1, @single, "'"),
         &quoted(&1, @double, "\""),
@@ -361,16 +470,23 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
     end
   end
 
-  @spec hex(binary()) :: {:ok, binary()} | nil
-  defp hex(rest) do
-    case Regex.run(@hex, rest) do
-      [_all, digits] -> {:ok, "X'#{digits}'"}
-      nil -> nil
+  # A number as the tokenizer prints it (see `SQLIdentifiers.take_number/1`): as written, and
+  # a hexadecimal one as `X'<digits>'`.
+  @spec number(binary()) :: {:ok, binary()} | nil
+  defp number(<<c, _rest::binary>> = text) when c in ?0..?9 or c == ?. do
+    case Regex.match?(~r/\A\.\D|\A\.\z/, text) do
+      true ->
+        nil
+
+      false ->
+        case SQLIdentifiers.take_number(text) do
+          {"0x" <> digits, _rest} -> {:ok, "X'#{digits}'"}
+          {token, _rest} -> {:ok, token}
+        end
     end
   end
 
-  @spec number(binary()) :: {:ok, binary()} | nil
-  defp number(rest), do: simple(rest, @number)
+  defp number(_text), do: nil
 
   @spec quoted(binary(), Regex.t(), binary()) :: {:ok, binary()} | nil
   defp quoted(rest, pattern, quote_mark) do

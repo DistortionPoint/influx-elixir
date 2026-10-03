@@ -3,7 +3,7 @@ defmodule InfluxElixir.Client.HTTPTest do
 
   alias InfluxElixir.Client.HTTP
   alias InfluxElixir.{StreamError, TestServer}
-  alias InfluxElixir.TestSupport.ClosedPort
+  alias InfluxElixir.TestSupport.{Check, ClosedPort}
 
   # ---------------------------------------------------------------------------
   # init_connection — :database resolution parity with Client.Local
@@ -254,18 +254,23 @@ defmodule InfluxElixir.Client.HTTPTest do
   # Every function that takes options also works without them: each default
   # reaches the transport, which here refuses the connection.
   describe "calls without options" do
-    test "write, queries and admin calls send their request with the defaults" do
+    test "write, query_flux, create_database, create_bucket and create_token reach the transport" do
       conn = connection(ClosedPort.port(), org: "org")
 
-      for call <- [
-            fn -> HTTP.write(conn, "m v=1i 1") end,
-            fn -> HTTP.query_flux(conn, "from(bucket: \"b\")") end,
-            fn -> HTTP.create_database(conn, "db") end,
-            fn -> HTTP.create_bucket(conn, "b") end,
-            fn -> HTTP.create_token(conn, "t") end
-          ] do
-        assert call.() === @closed
-      end
+      calls = [
+        write: fn -> HTTP.write(conn, "m v=1i 1") end,
+        query_flux: fn -> HTTP.query_flux(conn, "from(bucket: \"b\")") end,
+        create_database: fn -> HTTP.create_database(conn, "db") end,
+        create_bucket: fn -> HTTP.create_bucket(conn, "b") end,
+        create_token: fn -> HTTP.create_token(conn, "t") end
+      ]
+
+      Check.check_cases(calls, fn {_name, call} ->
+        case call.() do
+          @closed -> :ok
+          other -> {:mismatch, other}
+        end
+      end)
     end
   end
 end

@@ -52,7 +52,9 @@ defmodule InfluxElixir.TokenContract do
           assert {:ok, created, 0} = DateTime.from_iso8601(created_at)
           assert {:ok, expires, 0} = DateTime.from_iso8601(expiry)
           assert DateTime.diff(expires, created, :millisecond) === 3_600_000
-          assert created_at =~ ~r/\.\d{3}Z\z/
+          # To the millisecond, with no fraction when it is zero.
+          assert created_at =~ ~r/:\d{2}(\.\d{3})?Z\z/
+          refute created_at =~ ~r/\.000Z\z/
         end
 
         test "ids count up and are never reused; no expiry is nil", ctx do

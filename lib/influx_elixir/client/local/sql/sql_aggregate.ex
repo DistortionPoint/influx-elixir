@@ -131,6 +131,7 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   # An aggregate over the non-null values of one group.
   @spec compute(SQLParser.aggregate(), [term()]) :: term()
   defp compute(:count, values), do: length(values)
+  defp compute(:count_distinct, values), do: values |> Enum.uniq() |> length()
   defp compute(_agg, []), do: nil
   defp compute(:avg, values), do: average(values)
   defp compute(:sum, [first | _rest] = values), do: Enum.reduce(values, zero(first), &add(&2, &1))

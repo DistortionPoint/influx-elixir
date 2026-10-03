@@ -15,9 +15,17 @@ defmodule InfluxElixir.ContractCaseTablesTest do
   there a case is also unique across tables: a text in two of them is run twice
   against the same rows. The InfluxQL tables (`{text, ...}`) each bring a fixture
   of their own, so there the same text in two tables is two different questions.
+
+  The line protocol tables (`InfluxElixir.ClientContract.LineProtocolCases`) are
+  identified by their line or payload without the name of its measurement: `zz v=1`
+  and `m v=1` are one case.
   """
 
   use ExUnit.Case, async: true
+
+  # The line protocol tables whose case begins with a line or a payload.
+  @line_tables [:v3_errors, :v3_stored, :v3_numbered, :v2_errors, :v2_payloads, :v2_stored]
+  @lines InfluxElixir.ClientContract.LineProtocolCases
 
   @tables for {:ok, modules} <- [:application.get_key(:influx_elixir, :modules)],
               module <- modules,
@@ -28,25 +36,33 @@ defmodule InfluxElixir.ContractCaseTablesTest do
   test "the scan finds the case tables of every cases module" do
     modules = @tables |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
 
-    assert length(modules) >= 8
-    assert length(@tables) >= 30
+    assert length(modules) >= 10
+    assert length(@tables) >= 53
   end
 
   test "no case is written twice in its table" do
     repeated =
       for {module, name} <- @tables,
-          {identity, count} <- apply(module, name, []) |> Enum.frequencies_by(&identity/1),
+          {identity, count} <-
+            apply(module, name, []) |> Enum.frequencies_by(&identity(module, name, &1)),
           count > 1,
           do: "#{inspect(module)}.#{name}/0 x#{count}: #{inspect(identity)}"
 
     assert repeated === []
   end
 
+  test "a line is the same case whatever the name of its measurement" do
+    assert @lines.measurement_free("zz,t=1 v=1 5") === @lines.measurement_free("~m,t=1 v=1 5")
+    assert @lines.measurement_free("m v=1\nzz v=2") === @lines.measurement_free("zz v=1\nzz v=2")
+    refute @lines.measurement_free("zz,t=1 v=1") === @lines.measurement_free("zz,t=2 v=1")
+    refute @lines.measurement_free("zz v=1") === @lines.measurement_free("zz v=1 5")
+  end
+
   test "no SQL case is written in two tables" do
     in_tables =
       for {module, name} <- @tables,
           case_ <- apply(module, name, []),
-          {kind, _text} = identity <- [identity(case_)],
+          {kind, _text} = identity <- [identity(module, name, case_)],
           is_atom(kind),
           uniq: true,
           do: {identity, {module, name}}
@@ -60,7 +76,13 @@ defmodule InfluxElixir.ContractCaseTablesTest do
   end
 
   # `{kind, text, ...}` where the first element is the kind of place (an atom),
-  # `{text, ...}` where it is the text, or the case itself.
+  # `{text, ...}` where it is the text, or the case itself. A line is identified by
+  # the line without the name of its measurement.
+  defp identity(@lines, name, {text, _expectation}) when name in @line_tables,
+    do: @lines.measurement_free(text)
+
+  defp identity(_module, _name, case_), do: identity(case_)
+
   defp identity({kind, text, _expectation}) when is_atom(kind), do: {kind, text}
   defp identity({kind, text, _tag, _answer}) when is_atom(kind), do: {kind, text}
   defp identity({kind, text, _tag, _status, _body}) when is_atom(kind), do: {kind, text}

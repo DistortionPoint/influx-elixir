@@ -3,7 +3,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   # A field compared with a literal by the types of the two, as the engine
   # compares them, and a bare field as the whole condition.
 
-  alias InfluxElixir.Client.Local.{InfluxQLArithmetic, InfluxQLSql, SQLLimits}
+  alias InfluxElixir.Client.Local.{
+    InfluxQLArithmetic,
+    InfluxQLSql,
+    InfluxQLTokens,
+    InfluxQLWhereArith,
+    SQLLimits
+  }
 
   require SQLLimits
 
@@ -41,7 +47,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     float: "Float64",
     string: "Utf8",
     boolean: "Boolean",
-    tag: "Dictionary(Int32, Utf8)"
+    tag: "Dictionary(Int32, Utf8)",
+    interval: "Interval(MonthDayNano)"
   }
 
   @comparison_ops ["=", "!=", "<>", "<", "<=", ">", ">="]
@@ -65,13 +72,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
           {binary(), [{binary(), InfluxQLArithmetic.check()}]}
   @doc false
   def plan_comparison(tokens, {tags, types}) do
-    with nil <- typed_comparison(tokens, tags, types),
-         :unsupported <- InfluxQLArithmetic.compile(tokens, types) do
-      {plain(tokens, tags, types), []}
+    # A tag under arithmetic is null, so false for every row (see `InfluxQLWhereArith`).
+    if InfluxQLWhereArith.null?(tokens, tags, types) do
+      {"(1 = 0)", []}
     else
-      :written -> {plain(tokens, tags, types), []}
-      sql when is_binary(sql) -> {sql, []}
-      {:ok, check} -> check_sql(check)
+      with nil <- typed_comparison(tokens, tags, types),
+           :unsupported <- InfluxQLArithmetic.compile(tokens, types) do
+        {plain(tokens, tags, types), []}
+      else
+        :written -> {plain(tokens, tags, types), []}
+        sql when is_binary(sql) -> {sql, []}
+        {:ok, check} -> check_sql(check)
+      end
     end
   end
 
@@ -310,28 +322,155 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   defp refusal(_type, _literal), do: "a string compared with an integer beyond 64 bits signed"
 
-  # A bare field (or tag) as the whole condition: the engine's planning
-  # error, raised after the LIMIT. Inside `AND` / `OR` it is refused.
-  @spec bare_condition(tuple(), {MapSet.t(binary()), map()}) :: binary() | nil
+  # The engine's status and error for a condition it plans and refuses, raised after the
+  # LIMIT: `now()` anywhere but in a comparison of `time` (it is not implemented there),
+  # and a bare field, constant or duration as the whole condition. Beside a comparison in an
+  # `AND` or an `OR` a bare operand keeps no point at all (`:empty`), unless it is an
+  # unsigned constant, or the operands are bare both: the engine's error then.
+  @spec bare_condition(tuple(), {MapSet.t(binary()), map()}) ::
+          {pos_integer(), binary()} | :empty | nil
   @doc false
-  def bare_condition({:group, node}, ctx), do: bare_condition(node, ctx)
+  def bare_condition(tree, ctx) do
+    if now_outside_time?(tree),
+      do: {405, "This feature is not implemented: now"},
+      else: bare_type(tree, ctx)
+  end
 
-  def bare_condition({:cmp, tokens}, {tags, types}) do
-    case tokens |> strip_parens() |> bare_field(tags, types) do
+  @spec bare_type(tuple(), {MapSet.t(binary()), map()}) ::
+          {pos_integer(), binary()} | :empty | nil
+  defp bare_type({:group, node}, ctx), do: bare_type(node, ctx)
+
+  defp bare_type({:cmp, tokens}, {tags, types}) do
+    case tokens |> strip_parens() |> standalone_field(tags, types) do
       nil -> nil
       :boolean -> nil
-      type -> bare_error(type)
+      type -> {400, bare_error(type)}
     end
   end
 
-  def bare_condition({kind, nodes}, ctx) when kind in [:and, :or] do
-    if Enum.any?(nodes, &bare_member?(&1, ctx)),
-      do: throw({:refused, "unsupported InfluxQL (a bare non-boolean field inside AND/OR)"})
+  defp bare_type({kind, nodes}, ctx) when kind in [:and, :or] do
+    members = Enum.map(nodes, &member_kind(&1, ctx))
 
-    nil
+    cond do
+      :nested in members ->
+        refuse_bare()
+
+      Enum.any?(nodes, &null_member?(&1, ctx)) and Enum.any?(members, &(&1 != :ok)) ->
+        refuse_bare()
+
+      Enum.all?(members, &(&1 == :ok)) ->
+        nil
+
+      true ->
+        logical_outcome(kind, members)
+    end
   end
 
-  def bare_condition(_node, _ctx), do: nil
+  defp bare_type(_node, _ctx), do: nil
+
+  @spec refuse_bare() :: no_return()
+  defp refuse_bare,
+    do: throw({:refused, "unsupported InfluxQL (a bare non-boolean field inside AND/OR)"})
+
+  # What a member of an `AND` or `OR` is: a comparison or a boolean (`:ok`), a bare operand
+  # with its type, or a connective that holds one (`:nested`).
+  @spec member_kind(tuple(), {MapSet.t(binary()), map()}) :: :ok | :nested | {:bare, atom()}
+  defp member_kind({:group, node}, ctx), do: member_kind(node, ctx)
+
+  defp member_kind({:cmp, tokens}, {tags, types}) do
+    case tokens |> strip_parens() |> standalone_field(tags, types) do
+      type when type in [nil, :boolean] -> :ok
+      type -> {:bare, type}
+    end
+  end
+
+  defp member_kind({kind, nodes}, ctx) when kind in [:and, :or],
+    do: if(Enum.any?(nodes, &bare_member?(&1, ctx)), do: :nested, else: :ok)
+
+  defp member_kind(_node, _ctx), do: :ok
+
+  # Two operands, both bare or one an unsigned constant, are the planner's error; a bare
+  # operand beside comparisons keeps no point.
+  @spec logical_outcome(:and | :or, [:ok | {:bare, atom()}]) :: {pos_integer(), binary()} | :empty
+  defp logical_outcome(kind, [left, right] = members) do
+    if Enum.all?(members, &match?({:bare, _type}, &1)) or {:bare, :unsigned} in members,
+      do: {400, logical_error(kind, operand_type(left), operand_type(right))},
+      else: :empty
+  end
+
+  defp logical_outcome(_kind, members) do
+    if Enum.all?(members, &match?({:bare, _type}, &1)) or {:bare, :unsigned} in members,
+      do: refuse_bare(),
+      else: :empty
+  end
+
+  @spec operand_type(:ok | {:bare, atom()}) :: binary()
+  defp operand_type(:ok), do: "Boolean"
+  defp operand_type({:bare, type}), do: Map.fetch!(@arrow_types, type)
+
+  @spec logical_error(:and | :or, binary(), binary()) :: binary()
+  defp logical_error(kind, left, right) do
+    word = if kind == :and, do: "AND", else: "OR"
+
+    "Error during planning: Cannot infer common argument type for logical boolean " <>
+      "operation #{left} #{word} #{right}"
+  end
+
+  # Whether a comparison names `now()` and not `time`.
+  @spec now_outside_time?(tuple()) :: boolean()
+  defp now_outside_time?({:group, node}), do: now_outside_time?(node)
+
+  defp now_outside_time?({:cmp, tokens}),
+    do: {:raw, "now()"} in tokens and not Enum.any?(tokens, &InfluxQLTokens.time?/1)
+
+  defp now_outside_time?({kind, nodes}) when kind in [:and, :or],
+    do: Enum.any?(nodes, &now_outside_time?/1)
+
+  defp now_outside_time?(_node), do: false
+
+  # What a condition that is one operand is: a field, a constant, a duration, or a number
+  # or numeric field with signs.
+  @spec standalone_field(list(), MapSet.t(binary()), map()) :: atom() | nil
+  defp standalone_field([{:duration, _total, _text}], _tags, _types), do: :interval
+
+  defp standalone_field([{:raw, sign} | rest], tags, types) when sign in ["-", "+"] do
+    case signed_operand(rest, tags, types) do
+      {:ok, type} ->
+        type
+
+      :none ->
+        bare_field([{:raw, sign} | rest], tags, types) ||
+          arithmetic_field([{:raw, sign} | rest], tags, types)
+    end
+  end
+
+  defp standalone_field(tokens, tags, types),
+    do: bare_field(tokens, tags, types) || arithmetic_field(tokens, tags, types)
+
+  # Arithmetic and signs over several operands: the type it comes to.
+  defp arithmetic_field(tokens, tags, types),
+    do: InfluxQLWhereArith.standalone(tokens, tags, types)
+
+  # The type of an operand after signs: a number, or a numeric field.
+  @spec signed_operand(list(), MapSet.t(binary()), map()) :: {:ok, atom()} | :none
+  defp signed_operand([{:raw, sign} | rest], tags, types) when sign in ["-", "+"],
+    do: signed_operand(rest, tags, types)
+
+  defp signed_operand([{:number, text}], _tags, _types) do
+    case number_kind(text, 1) do
+      nil -> :none
+      type -> {:ok, type}
+    end
+  end
+
+  defp signed_operand([{:ident, name}], tags, types) do
+    case field_kind(name, tags, types) do
+      type when type in [:integer, :float] -> {:ok, type}
+      _other -> :none
+    end
+  end
+
+  defp signed_operand(_tokens, _tags, _types), do: :none
 
   @spec bare_field(list(), MapSet.t(binary()), map()) :: atom() | nil
   defp bare_field([{:ident, name}], tags, types), do: field_kind(name, tags, types)
@@ -377,6 +516,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     do: Enum.any?(nodes, &bare_member?(&1, ctx))
 
   defp bare_member?(_node, _ctx), do: false
+
+  # A member that is a tag under arithmetic, null where the others are conditions; beside a
+  # bare operand the engine words the type of the null (verified: `Boolean OR Utf8`).
+  defp null_member?({:group, node}, ctx), do: null_member?(node, ctx)
+
+  defp null_member?({:cmp, tokens}, {tags, types}),
+    do: InfluxQLWhereArith.null?(tokens, tags, types)
+
+  defp null_member?(_node, _ctx), do: false
 
   @spec bare_error(atom()) :: binary()
   defp bare_error(type) do

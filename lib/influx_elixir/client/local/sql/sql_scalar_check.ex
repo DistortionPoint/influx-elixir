@@ -14,7 +14,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   # error the engine words as an internal or an execution error is then a 500
   # without the planner's prefix.
 
-  alias InfluxElixir.Client.Local.{SQLCommonType, SQLError, SQLFunctions}
+  alias InfluxElixir.Client.Local.{SQLCommonType, SQLError, SQLFunctions, SQLNativeType}
 
   @text "Coercion(TypeSignatureClass::Native(LogicalType(Native(String), String)))"
   @internal_tail "\nThis issue was likely caused by a bug in DataFusion's code. Please help us " <>
@@ -161,7 +161,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
          "#{name} of a timestamp: the engine writes its nanoseconds as text, which the " <>
            "double keeps only to the microsecond"}
 
-      count in @integer_arguments ->
+      count in @integer_arguments or count == "Null" ->
         :ok
 
       true ->
@@ -226,14 +226,14 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   @spec text_arguments(atom(), [binary()]) ::
           :ok | {:refuse, binary()} | {:internal, binary(), binary(), binary()}
   defp text_arguments(name, types) do
-    case Enum.find(types, &(&1 not in @text_types)) do
+    case Enum.find(types, &(&1 not in ["Null" | @text_types])) do
       nil ->
         :ok
 
       type when type in @shown_types ->
         {:internal,
          "Expect TypeSignatureClass::Native(LogicalType(Native(String), String)) but received " <>
-           "NativeType::#{SQLFunctions.native(type)}, DataType: #{type}.", Atom.to_string(name),
+           "NativeType::#{SQLNativeType.native(type)}, DataType: #{type}.", Atom.to_string(name),
          text_candidate(name)}
 
       type ->

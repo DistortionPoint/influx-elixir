@@ -20,7 +20,17 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
 
   @typedoc "Plain aggregates; `:stddev`/`:var` are the sample forms, as in InfluxDB."
   @type aggregate ::
-          :avg | :sum | :count | :min | :max | :median | :stddev | :stddev_pop | :var | :var_pop
+          :avg
+          | :sum
+          | :count
+          | :count_distinct
+          | :min
+          | :max
+          | :median
+          | :stddev
+          | :stddev_pop
+          | :var
+          | :var_pop
 
   @typedoc "One column of an aggregate or grouped select list."
   @type column ::
@@ -474,7 +484,29 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
 
       match = Regex.run(count_distinct, body) ->
         [_full, column] = match
-        column = name(column)
+        count_distinct_column(col, column, alias_name, qualifier)
+
+      true ->
+        parse_agg_column_arg(col, body, alias_name, qualifier)
+    end
+  end
+
+  # `COUNT(DISTINCT x)`: of a column, or of a constant (`1`, `NULL`, `true`), which is `1`
+  # over any rows and `0` over none (or for the null).
+  @spec count_distinct_column(binary(), binary(), binary() | nil, binary() | nil) ::
+          {:ok, column()} | {:error, term()}
+  defp count_distinct_column(col, word, alias_name, qualifier) do
+    case SQLExpr.parse(word) do
+      {:ok, constant} when elem(constant, 0) in [:lit, :uint] ->
+        with {:ok, output} <-
+               output_name(col, alias_name, fn ->
+                 "count(DISTINCT #{SQLExpr.render(constant, qualifier, :drop)})"
+               end) do
+          {:ok, {:aggregate, :count_distinct, constant, output}}
+        end
+
+      _column ->
+        column = name(word)
 
         with {:ok, output} <-
                output_name(col, alias_name, fn ->
@@ -482,9 +514,6 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
                end) do
           {:ok, {:count_distinct, column, output}}
         end
-
-      true ->
-        parse_agg_column_arg(col, body, alias_name, qualifier)
     end
   end
 

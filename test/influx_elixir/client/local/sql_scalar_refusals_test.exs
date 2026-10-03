@@ -32,8 +32,6 @@ defmodule InfluxElixir.Client.Local.SQLScalarRefusalsTest do
     test "is refused by name", %{conn: conn} do
       Check.each_case(
         [
-          {"SELECT min(NULL) + 'a' FROM m",
-           "Client.Local: an expression over MIN(NULL) or MAX(NULL)"},
           {"SELECT substr(s) FROM m",
            "Client.Local: substr with one argument: the engine's error quotes the argument's " <>
              "position in the query, which is not modelled"},
@@ -125,6 +123,42 @@ defmodule InfluxElixir.Client.Local.SQLScalarRefusalsTest do
           {"SHOW SCHEMAS", "Client.Local: unsupported SQL: show schemas"},
           {"SHOW COLUMNS", "Client.Local: unsupported SQL: show columns"},
           {"SHOW TABLES FROM iox", "Client.Local: unsupported SQL: show tables from iox"}
+        ],
+        fn {sql, body} ->
+          assert {:error, %{status: 400, body: ^body}} = Local.query_sql(conn, sql, [])
+        end
+      )
+    end
+  end
+
+  describe "a name or a statement the engine words by a measure the double does not hold" do
+    test "is refused by name", %{conn: conn} do
+      close =
+        "Client.Local: an ORDER BY name close to a select item: the engine suggests the item " <>
+          "by a measure of closeness the double does not hold"
+
+      Check.each_case(
+        [
+          {"SELECT host, count(*) AS c FROM m GROUP BY host HAVING c.c > 0",
+           "Client.Local: a HAVING name c.c whose relation is a column or a select item: the " <>
+             "engine reads it as a field of that column"},
+          {"SELECT host AS hh FROM m ORDER BY hhh", close},
+          {"SELECT host, count(*) AS c FROM m GROUP BY host ORDER BY cc", close},
+          {"SELECT host AS hh, count(*) AS c FROM m GROUP BY x.host",
+           "Client.Local: a GROUP BY name with a relation that is not the column's: the " <>
+             "engine may suggest the column"},
+          {"DESCRIBE information_schema.columns",
+           "Client.Local: DESCRIBE of information_schema.columns: only tables of the iox schema"},
+          {"CREATE SCHEMA",
+           "Client.Local: that CREATE or DROP of a database or a schema: the engine's error " <>
+             "for it is not modelled"},
+          {"GRANT SELECT",
+           "Client.Local: the statement \"GRANT SELECT\" is not run: the engine's wording of " <>
+             "it (its keywords in capitals) is not modelled"},
+          {"MERGE INTO m USING m c2 ON true WHEN MATCHED THEN DELETE",
+           "Client.Local: the statement \"MERGE INTO m USING m c2 ON true WHEN MATCHED THEN " <>
+             "DELETE\" is not run: the engine's wording of it (its keywords in capitals) is " <>
+             "not modelled"}
         ],
         fn {sql, body} ->
           assert {:error, %{status: 400, body: ^body}} = Local.query_sql(conn, sql, [])

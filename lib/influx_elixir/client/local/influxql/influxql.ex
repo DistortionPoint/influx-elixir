@@ -171,7 +171,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
           uppers: [bound()],
           checks: [{binary(), check()}],
           idents: MapSet.t(binary()),
-          deferred: binary() | nil
+          deferred: {pos_integer(), binary()} | nil
         }
 
   @typedoc "A comparison of numbers the SQL cannot make; see `where_plan/0`."
