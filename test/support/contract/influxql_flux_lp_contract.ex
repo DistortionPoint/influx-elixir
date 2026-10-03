@@ -104,8 +104,6 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
   defp helpers(client) do
     quote location: :keep do
-      def ifl_name(prefix), do: InfluxElixir.IntegrationHelper.unique_name(prefix)
-
       def ifl_write(ctx, lines) do
         assert {:ok, :written} =
                  unquote(client).write(ctx.conn, Enum.join(lines, "\n"), database: ctx.database)
@@ -157,7 +155,8 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       describe "line protocol grammar — InfluxDB 3 contract" do
         test "a line that does not parse is the engine's 400, in the engine's words", ctx do
           for {template, message} <- @ifl_v3_errors do
-            line = String.replace(template, "~m", ifl_name("ifl_lp"))
+            line =
+              String.replace(template, "~m", InfluxElixir.IntegrationHelper.unique_name("ifl_lp"))
 
             assert {:error, %{status: 400, body: body}} =
                      unquote(client).write(ctx.conn, line, database: ctx.database)
@@ -177,7 +176,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                 {"~m,t=a=b v=1 1000", %{"t" => "a=b", "v" => 1.0}},
                 {"~m v=1.5e3 1000", %{"v" => 1500.0}}
               ] do
-            m = ifl_name("ifl_ok")
+            m = InfluxElixir.IntegrationHelper.unique_name("ifl_ok")
             ifl_write(ctx, [String.replace(template, "~m", m)])
 
             assert {:ok, [row]} =
@@ -191,7 +190,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         test "good lines around a bad one are written, the bad one is numbered", ctx do
-          m = ifl_name("ifl_mix")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_mix")
 
           assert {:error, %{status: 400, body: body}} =
                    unquote(client).write(
@@ -214,7 +213,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         test "a quote in a tag value does not join the next line to it", ctx do
-          m = ifl_name("ifl_quote")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_quote")
 
           ifl_write(ctx, [~s|#{m},t=a"b f=1i 1000|, "#{m} f=2i 2000"])
 
@@ -230,7 +229,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         test "a quote after a field value opens a string that swallows the newline", ctx do
-          m = ifl_name("ifl_swallow")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_swallow")
 
           assert {:error, %{status: 400, body: body}} =
                    unquote(client).write(ctx.conn, ~s|#{m} f=1"i 1\nBAD|, database: ctx.database)
@@ -241,7 +240,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
         test "an error is numbered among the lines that count and echoes the physical line",
              ctx do
-          m = ifl_name("ifl_number")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_number")
 
           assert {:error, %{status: 400, body: body}} =
                    unquote(client).write(ctx.conn, "#c\n\n#{m} v=1 5 6", database: ctx.database)
@@ -284,7 +283,8 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
             "Measurements, tag keys and values, and field keys may not end with a backslash"
 
           for template <- @ifl_v3_backslash do
-            line = String.replace(template, "~m", ifl_name("ifl_bs"))
+            line =
+              String.replace(template, "~m", InfluxElixir.IntegrationHelper.unique_name("ifl_bs"))
 
             assert {:error, %{status: 400, body: body}} =
                      unquote(client).write(ctx.conn, line, database: ctx.database)
@@ -299,7 +299,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                 {~S"~m\ z v=1i 1000", "~m z", %{"v" => 1}},
                 {~S"~m\,z v=1i 1000", "~m,z", %{"v" => 1}}
               ] do
-            m = ifl_name("ifl_sep")
+            m = InfluxElixir.IntegrationHelper.unique_name("ifl_sep")
             ifl_write(ctx, [String.replace(template, "~m", m)])
 
             measurement = String.replace(name, "~m", m)
@@ -344,7 +344,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       describe "InfluxQL WHERE, time and LIMIT — contract" do
         # Times are whole microseconds, which a query result carries.
         setup ctx do
-          m = ifl_name("ifl_iq")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_iq")
 
           ifl_write(ctx, [
             "#{m},k=a v=1,w=10 1000",
@@ -457,7 +457,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       describe "InfluxQL GROUP BY order — contract" do
         test "series are ordered by tag key whatever GROUP BY's order, a missing tag last",
              ctx do
-          m = ifl_name("ifl_grp")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_grp")
 
           ifl_write(ctx, [
             "#{m},h=a,r=2 v=1 1000",
@@ -490,7 +490,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL parse errors — contract" do
         setup ctx do
-          m = ifl_name("ifl_pe")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_pe")
           ifl_write(ctx, ["#{m},k=a v=1 1000", "#{m},k=--1 v=2 2000"])
           {:ok, m: m, prefix: "SELECT v FROM #{m} WHERE "}
         end
@@ -633,7 +633,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
   defp v3_influxql_reserved_helpers(_client) do
     quote location: :keep do
       def ifl_rw_setup(ctx) do
-        m = ifl_name("ifl_rw")
+        m = InfluxElixir.IntegrationHelper.unique_name("ifl_rw")
 
         ifl_write(ctx, [
           ~s|#{m},tag=a,host=h1 v=1i,f=1.5,b=true,u=5u,s="x" 1000|,
@@ -1138,7 +1138,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
         test "the wrap of a negative integer is 2^64 + n - 1, and the lowest integer is null",
              ctx do
-          m = ifl_name("ifl_rw_edge")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_rw_edge")
 
           ifl_write(ctx, [
             "#{m} v=-1i,u=18446744073709551615u 1000",
@@ -1237,7 +1237,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL unsigned arithmetic — contract" do
         setup ctx do
-          m = ifl_name("ifl_un")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_un")
 
           ifl_write(ctx, [
             "#{m} i=1i,j=5i,u=3u 1000",
@@ -1305,7 +1305,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         test "SUM, MEAN and overflow", ctx do
-          m = ifl_name("ifl_un")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_un")
 
           ifl_write(ctx, [
             "#{m} i=9223372036854775807i,u=18446744073709551615u,f=1.5 1000",
@@ -1351,7 +1351,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL names and the time column — contract" do
         setup ctx do
-          m = ifl_name("ifl_nm")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_nm")
           ifl_write(ctx, ["#{m},k=a i=1i,j=5i 1000", "#{m},k=b i=2i,j=-5i 2000"])
           {:ok, m: m}
         end
@@ -1461,8 +1461,8 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL NOT is a name — contract" do
         setup ctx do
-          field = ifl_name("ifl_nf")
-          tag = ifl_name("ifl_nt")
+          field = InfluxElixir.IntegrationHelper.unique_name("ifl_nf")
+          tag = InfluxElixir.IntegrationHelper.unique_name("ifl_nt")
           ifl_write(ctx, ["#{field} not=7i,i=1i 1000", "#{field} not=8i,i=2i 2000"])
           ifl_write(ctx, ["#{tag},not=a i=1i 1000", "#{tag},not=b i=2i 2000"])
           {:ok, field: field, tag: tag}
@@ -1522,7 +1522,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL quoted times — contract" do
         setup ctx do
-          m = ifl_name("ifl_qt")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_qt")
           ifl_write(ctx, ["#{m} i=1i 1000", "#{m} i=2i 2000"])
           {:ok, m: m, sel: "SELECT i FROM #{m}"}
         end
@@ -1629,7 +1629,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL time as a condition — contract" do
         setup ctx do
-          m = ifl_name("ifl_bt")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_bt")
           ifl_write(ctx, ["#{m} i=1i 1000", "#{m} i=2i 2000"])
           {:ok, sel: "SELECT i FROM #{m}"}
         end
@@ -1701,7 +1701,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL GROUP BY time — contract" do
         setup ctx do
-          m = ifl_name("ifl_gt")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_gt")
           ifl_write(ctx, ["#{m},k=a i=1i 1000", "#{m},k=b i=2i 2000"])
           {:ok, m: m}
         end
@@ -1747,7 +1747,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL constants in the select list — contract" do
         setup ctx do
-          m = ifl_name("ifl_cl")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_cl")
           ifl_write(ctx, ["#{m} i=1i,j=5i 1000", "#{m} i=2i,j=-5i 2000"])
           {:ok, m: m}
         end
@@ -1844,7 +1844,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL a reserved word after an operator — contract" do
         setup ctx do
-          m = ifl_name("ifl_ro")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_ro")
           ifl_write(ctx, ["#{m} i=1i,j=5i 1000"])
           {:ok, m: m}
         end
@@ -1917,7 +1917,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL parentheses of a WHERE — contract" do
         setup ctx do
-          m = ifl_name("ifl_pa")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_pa")
           ifl_write(ctx, ["#{m},k=a i=1i 1000", "#{m},k=b i=2i 2000"])
           {:ok, m: m, prefix: "SELECT i FROM #{m} "}
         end
@@ -2014,7 +2014,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL SHOW TAG VALUES — contract" do
         setup ctx do
-          m = ifl_name("ifl_sh")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_sh")
 
           ifl_write(ctx, [
             "#{m},k=a,x=p i=1i 1000",
@@ -2092,7 +2092,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL two tags compared — contract" do
         setup ctx do
-          m = ifl_name("ifl_tt")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_tt")
 
           ifl_write(ctx, [
             "#{m},k=a,x=a i=1i,s=\"a\",t=\"a\" 1000",
@@ -2141,7 +2141,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "InfluxQL literals that are not closed, and =~ without a regex — contract" do
         setup ctx do
-          m = ifl_name("ifl_ls")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_ls")
           ifl_write(ctx, ["#{m},k=a,x=a i=1i 1000", "#{m},k=a,x=b i=2i 2000"])
           {:ok, m: m}
         end
@@ -2330,7 +2330,8 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       describe "line protocol grammar — InfluxDB 2 contract" do
         test "a line that does not parse is a 400 in the Go parser's words", ctx do
           for {template, reason} <- @ifl_v2_errors do
-            line = String.replace(template, "~m", ifl_name("ifl_lp"))
+            line =
+              String.replace(template, "~m", InfluxElixir.IntegrationHelper.unique_name("ifl_lp"))
 
             assert {:error, %{status: 400, body: body}} =
                      unquote(client).write(ctx.conn, line, database: ctx.database)
@@ -2341,7 +2342,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         test "a carriage return ends a number, and stays in the quoted line", ctx do
-          m = ifl_name("ifl_cr")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_cr")
 
           assert {:error, %{status: 400, body: body}} =
                    unquote(client).write(ctx.conn, "#{m} n=1i\r\n", database: ctx.database)
@@ -2351,7 +2352,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         test "every line that fails is reported, joined by newlines", ctx do
-          m = ifl_name("ifl_many")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_many")
 
           assert {:error, %{status: 400, body: body}} =
                    unquote(client).write(
@@ -2369,7 +2370,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
         test "leading whitespace, comments and blank lines are skipped, the point is stored",
              ctx do
-          m = ifl_name("ifl_ws")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_ws")
           ifl_write(ctx, ["", "  # a comment", "   ", "\t#{m} v=1 5", ""])
 
           assert {:ok, [row]} = ifl_flux(ctx, ifl_measurement_query(ctx, m, 100))
@@ -2378,7 +2379,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
         test "a line left open by a quote is quoted without the payload's final newline",
              ctx do
-          m = ifl_name("ifl_open")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_open")
 
           assert {:error, %{status: 400, body: body}} =
                    unquote(client).write(ctx.conn, ~s|#{m} f="a\nBAD\n|, database: ctx.database)
@@ -2388,7 +2389,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         test "a field named time is dropped; a point with nothing else is not written", ctx do
-          m = ifl_name("ifl_time")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_time")
 
           assert {:ok, :written} =
                    unquote(client).write(ctx.conn, "#{m} time=1,v=2 5", database: ctx.database)
@@ -2406,8 +2407,8 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                "the engine reports any failing shard group; Local always the earliest"
         test "dropped points are counted per shard group, the earliest group's first drop speaks",
              ctx do
-          m = ifl_name("ifl_drop")
-          n = ifl_name("ifl_dropn")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_drop")
+          n = InfluxElixir.IntegrationHelper.unique_name("ifl_dropn")
           ifl_write(ctx, ["#{m} v=1.5 5"])
 
           for {template, drops} <- @ifl_v2_drops do
@@ -2468,7 +2469,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "Flux range — InfluxDB 2 contract" do
         setup ctx do
-          m = ifl_name("ifl_fx")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_fx")
           ifl_write(ctx, ["#{m} v=1 5", "#{m} v=2 1000000000"])
 
           head =
@@ -2533,7 +2534,9 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         do: ~s|from(bucket: "#{ctx.database}") \|> range(start: 0, stop: 100) |
 
       def ifl_filter_fixture(ctx) do
-        [a, b, c] = for p <- ["ifl_fa", "ifl_fb", "ifl_fc"], do: ifl_name(p)
+        [a, b, c] =
+          for p <- ["ifl_fa", "ifl_fb", "ifl_fc"],
+              do: InfluxElixir.IntegrationHelper.unique_name(p)
 
         ifl_write(ctx, [
           "#{a},h=x v=1 1000000000",
@@ -2548,7 +2551,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       describe "Flux data and bucket listing — InfluxDB 2 contract" do
         test "first and last choose by the stored nanoseconds, not the microsecond shown",
              ctx do
-          m = ifl_name("ifl_ns")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_ns")
           ifl_write(ctx, ["#{m},t=a v=1i 1001", "#{m},t=a v=2i 1000"])
 
           base =
@@ -2611,7 +2614,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
     quote location: :keep do
       describe "Flux names and quotes — InfluxDB 2 contract" do
         test "a quote in a tag value does not join the next line to it", ctx do
-          m = ifl_name("ifl_fq")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_fq")
           ifl_write(ctx, [~s|#{m},t=a"b f=1i 1000000000|, "#{m} f=2i 2000000000"])
 
           assert {:ok, rows} =
@@ -2627,7 +2630,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
         test "a measurement with a single escaped comma is readable under its unescaped name",
              ctx do
-          m = ifl_name("ifl_esc")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_esc")
           ifl_write(ctx, ["#{m}\\,t=a v=1i 1000000000"])
 
           assert {:ok, [%{"_measurement" => name, "_value" => 1}]} =
@@ -2646,7 +2649,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                 {~S"~m\ z v=1i 1000000000", "~m z", %{}},
                 {~S"~m\,z v=1i 1000000000", "~m,z", %{}}
               ] do
-            m = ifl_name("ifl_sep")
+            m = InfluxElixir.IntegrationHelper.unique_name("ifl_sep")
             ifl_write(ctx, [String.replace(template, "~m", m)])
 
             measurement = String.replace(name, "~m", m)
@@ -2660,12 +2663,13 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
         test "a measurement whose escapes the index and the data read differently is not read",
              ctx do
-          field = ifl_name("ifl_gone_f")
-          sentinel = ifl_name("ifl_here")
+          field = InfluxElixir.IntegrationHelper.unique_name("ifl_gone_f")
+          sentinel = InfluxElixir.IntegrationHelper.unique_name("ifl_here")
 
           gone =
             for suffix <- [~S|\\,x|, ~S|\\ x|, ~S|\=x|, ~S|\"x|, ~S|\\=x|],
-                do: "#{ifl_name("ifl_gone")}#{suffix} #{field}=1i 1000000000"
+                do:
+                  "#{InfluxElixir.IntegrationHelper.unique_name("ifl_gone")}#{suffix} #{field}=1i 1000000000"
 
           ifl_write(ctx, gone ++ ["#{sentinel} #{field}=2i 1000000000"])
 
@@ -2688,7 +2692,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         test "a point older than the bucket's retention is dropped, the others are written",
              ctx do
           ifl_with_retention_bucket(ctx, fn bucket ->
-            m = ifl_name("ifl_old")
+            m = InfluxElixir.IntegrationHelper.unique_name("ifl_old")
             fresh = System.os_time(:nanosecond) - 60_000_000_000
 
             payload =
@@ -2724,7 +2728,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
         test "a series key in a retention drop is sorted by tag and escaped", ctx do
           ifl_with_retention_bucket(ctx, fn bucket ->
-            m = ifl_name("ifl_oldkey")
+            m = InfluxElixir.IntegrationHelper.unique_name("ifl_oldkey")
 
             payload = ~s|#{m}\\ x\\,y,b\\ k\\=1=v\\,2\\ 3,a=z v=1i 1672790400000000000|
 
@@ -2747,7 +2751,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         test "a point older than the retention registers no field and is dropped whatever it is",
              ctx do
           ifl_with_retention_bucket(ctx, fn bucket ->
-            m = ifl_name("ifl_oldtype")
+            m = InfluxElixir.IntegrationHelper.unique_name("ifl_oldtype")
             now = System.os_time(:nanosecond)
 
             for payload <- [
@@ -2768,7 +2772,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
         test "a type conflict in a group is reported instead of the retention drops", ctx do
           ifl_with_retention_bucket(ctx, fn bucket ->
-            m = ifl_name("ifl_oldconf")
+            m = InfluxElixir.IntegrationHelper.unique_name("ifl_oldconf")
             now = System.os_time(:nanosecond)
 
             assert {:ok, :written} =
@@ -2796,7 +2800,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
       describe "Flux field types per shard group — InfluxDB 2 contract" do
         test "a field of another type in a later shard group is not read after the first one",
              ctx do
-          m = ifl_name("ifl_type")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_type")
 
           # The first point is in the week of the epoch, the others a week later.
           ifl_write(ctx, [
@@ -2829,7 +2833,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         test "after the first group of another type, no later group of the field is read", ctx do
-          m = ifl_name("ifl_cut")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_cut")
 
           ifl_write(ctx, [
             "#{m} f=1i #{ifl_week(0)}",
@@ -2843,7 +2847,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
 
         test "a group that differs from the first hides the rest, even of the first's type",
              ctx do
-          m = ifl_name("ifl_cutfloat")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_cutfloat")
 
           ifl_write(ctx, [
             "#{m} f=1i #{ifl_week(0)}",
@@ -2856,7 +2860,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         test "the cut is per measurement and field, across the tag sets", ctx do
-          m = ifl_name("ifl_cuttags")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_cuttags")
 
           ifl_write(ctx, [
             "#{m},t=a f=1i #{ifl_week(0)}",
@@ -2869,7 +2873,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         test "a field that conflicts in a group does not cut the other fields", ctx do
-          m = ifl_name("ifl_cutfield")
+          m = InfluxElixir.IntegrationHelper.unique_name("ifl_cutfield")
 
           ifl_write(ctx, [
             "#{m} f=1i,g=1i #{ifl_week(0)}",

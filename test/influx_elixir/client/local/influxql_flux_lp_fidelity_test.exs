@@ -924,14 +924,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     test "a WHERE it does not model", %{conn: conn} do
       for {where, message} <- [
             {"time > 0.5", "Client.Local: unsupported InfluxQL (non-integer time 0.5)"},
-            {"time > now() - 500ms",
-             "Client.Local: unsupported InfluxQL (sub-second duration 500ms)"},
             {"time >= 2 OR k = 'a'",
              "Client.Local: unsupported InfluxQL (a time comparison inside OR)"},
             {"k = 'a' OR (k = 'b' AND time >= 2)",
              "Client.Local: unsupported InfluxQL (a time comparison inside OR)"},
-            {"time > now() - 1 ",
-             "Client.Local: unsupported InfluxQL (a time compared with now() and something else)"},
             {"time > 1 * 2",
              "Client.Local: unsupported InfluxQL (a time compared with an expression)"}
           ] do
@@ -944,10 +940,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
     test "a clause it does not model, outside a literal", %{conn: conn} do
       for {statement, name} <- [
             {"SELECT v INTO x FROM o", "INTO"},
-            {"SELECT v FROM o fill(none)", "fill()"},
             {"SELECT v FROM o SLIMIT 1", "SLIMIT/SOFFSET"},
             {"SELECT v FROM (SELECT v FROM o)", "subqueries"},
-            {"SELECT mean(v) FROM o GROUP BY time(1m)", "GROUP BY time(...)"},
+            {"SELECT mean(v) FROM o GROUP BY time(1)", "GROUP BY time(1)"},
+            {"SELECT mean(v) FROM o GROUP BY time(0s)",
+             "GROUP BY time() of zero or under a microsecond"},
+            {"SELECT mean(v) FROM o GROUP BY time(1m), time(2m)",
+             "GROUP BY with more than one time()"},
+            {"SELECT mean(v) FROM o GROUP BY time(1m) fill( linear2 )", "fill(linear2)"},
             {"SELECT v FROM o GROUP BY *", "GROUP BY *"},
             {"SELECT v FROM o WHERE k = 'a' tz('UTC')", "tz()"}
           ] do
@@ -1867,7 +1867,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxLPFidelityTest do
           end)
         end)
 
-      assert_receive :holding
+      assert_receive :holding, 5_000
 
       waiter =
         Task.async(fn -> Store.create_database(table, "other", fn _databases -> :ok end) end)

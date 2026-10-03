@@ -1,0 +1,659 @@
+defmodule InfluxElixir.Client.Local.Flux do
+  @moduledoc false
+  # The Flux subset `InfluxElixir.Client.Local` answers, with InfluxDB 2's
+  # semantics (verified against `influxdb:2.7`; see
+  # `docs/design/2026-09-24_local-flux-pipeline.md`).
+  #
+  # A query is a pipeline, `from(bucket: "b") |> range(...) |> ...`, and every
+  # stage is applied — or the query is refused by name.
+  #
+  # Supported stages:
+  #
+  #   * `from(bucket: "b")` — first; the bucket must exist (404 otherwise)
+  #   * `range(start: s[, stop: s])` — required, as on the engine; `s` is
+  #     Unix seconds, an RFC3339 time, a duration from now (`-1h`, `-30m`,
+  #     `-7d`, `-10s`, `-2w`) or `now()`; `stop` defaults to now. Every row
+  #     carries `_start` and `_stop`. A range that is empty (`start` not
+  #     before `stop`) is the engine's 400 "cannot query an empty range".
+  #     Times are 64-bit nanoseconds as on the engine, so a time that does
+  #     not fit wraps: `stop: 99999999999999` (seconds) is 1976-05-08 in
+  #     `_stop`.
+  #   * `filter(fn: (r) => ...)` — `r.key` or `r["key"]` compared with
+  #     `== != < <= > >=` against a string, number or boolean, combined with
+  #     `and`, `or`, `not` and parentheses. A key the row lacks never matches.
+  #   * `first() last() min() max()` — the selected row per table
+  #   * `mean() sum() count()` — one row per table, without `_time`
+  #     (`mean` is a float; `count` counts rows)
+  #   * `limit(n: N[, offset: M])` — per table
+  #   * `yield(name: "x")` — names the result
+  #
+  # Tables are the series — measurement, tag set, field — numbered from `0`
+  # in that order, rows in time order, as the engine numbers them. Time order
+  # is the stored nanoseconds, finer than the microsecond a row's `_time`
+  # carries, so `first()` and `last()` choose between points a microsecond
+  # holds as the engine does.
+
+  alias InfluxElixir.Client.Local.Durations
+  alias InfluxElixir.Query.ResponseParser
+
+  @typedoc "A comparison operand: a row key compared against a literal."
+  @type predicate ::
+          {:cmp, binary(), binary(), term()}
+          | {:and, predicate(), predicate()}
+          | {:or, predicate(), predicate()}
+          | {:not, predicate()}
+
+  @typedoc "One pipeline stage after `from`."
+  @type stage ::
+          {:range, integer(), integer()}
+          | {:filter, predicate()}
+          | {:selector, :first | :last | :min | :max}
+          | {:aggregate, :mean | :sum | :count}
+          | {:limit, non_neg_integer(), non_neg_integer()}
+          | {:yield, binary()}
+
+  @typedoc "A parsed query."
+  @type query :: %{bucket: binary(), stages: [stage()]}
+
+  @doc """
+  Parses a Flux query. `now_ns` is the instant `now()` and a relative
+  `range` resolve against. Returns `{:error, message}` for syntax the
+  double does not model.
+  """
+  @spec parse(binary(), integer()) :: {:ok, query()} | {:error, binary()}
+  def parse(flux, now_ns) do
+    with {:ok, calls} <- split_pipeline(flux),
+         {:ok, bucket, rest} <- parse_from(calls),
+         {:ok, stages} <- parse_stages(rest, now_ns),
+         :ok <- require_range(stages, bucket) do
+      {:ok, %{bucket: bucket, stages: stages}}
+    end
+  end
+
+  @doc "The `{start, stop}` nanoseconds of a query's `range` stage."
+  @spec range(query()) :: {integer(), integer()}
+  def range(%{stages: stages}), do: stages |> split_range() |> elem(0)
+
+  @doc """
+  The measurements a query reads: the ones its `filter` stages pin with
+  `r._measurement == "m"` (joined by `or`, narrowed by `and`), or `:all`.
+  A table never mixes measurements, so a point of any other one can only
+  be filtered out; `Client.Local` reads just these from the store.
+  """
+  @spec measurements(query()) :: :all | [term()]
+  def measurements(%{stages: stages}) do
+    for({:filter, predicate} <- stages, do: pinned(predicate))
+    |> Enum.reduce(:all, &intersect/2)
+  end
+
+  @spec pinned(predicate()) :: :all | [term()]
+  defp pinned({:cmp, "_measurement", "==", literal}), do: [literal]
+  defp pinned({:and, a, b}), do: intersect(pinned(a), pinned(b))
+
+  defp pinned({:or, a, b}) do
+    case {pinned(a), pinned(b)} do
+      {:all, _b} -> :all
+      {_a, :all} -> :all
+      {a, b} -> Enum.uniq(a ++ b)
+    end
+  end
+
+  defp pinned(_predicate), do: :all
+
+  @spec intersect(:all | [term()], :all | [term()]) :: :all | [term()]
+  defp intersect(:all, other), do: other
+  defp intersect(other, :all), do: other
+  defp intersect(a, b), do: Enum.filter(a, &(&1 in b))
+
+  @doc """
+  Runs a parsed query over the bucket's points (`%{measurement, tags,
+  fields, timestamp}` maps, duplicates already merged).
+  """
+  @spec run(query(), [map()]) :: {:ok, [map()]} | {:error, binary()}
+  def run(%{stages: stages}, points) do
+    {range, rest} = split_range(stages)
+    {start_ns, stop_ns} = range
+    bounds = {datetime(start_ns), datetime(stop_ns)}
+
+    tables =
+      points
+      |> Enum.filter(&(&1.timestamp >= start_ns and &1.timestamp < stop_ns))
+      |> Enum.flat_map(&timed_rows(&1, bounds))
+      |> Enum.group_by(fn {key, _timed} -> key end, fn {_key, timed} -> timed end)
+      |> Enum.sort_by(fn {key, _rows} -> key end)
+      |> Enum.map(fn {_key, timed} -> table_rows(timed) end)
+
+    {tables, result} = Enum.reduce(rest, {tables, "_result"}, &apply_stage/2)
+
+    rows =
+      tables
+      |> Enum.reject(&(&1 == []))
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {rows, index} ->
+        Enum.map(rows, &Map.merge(&1, %{"table" => index, "result" => result}))
+      end)
+
+    {:ok, rows}
+  catch
+    {:flux_error, message} -> {:error, message}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Execution
+  # ---------------------------------------------------------------------------
+
+  @spec split_range([stage()]) :: {{integer(), integer()}, [stage()]}
+  defp split_range([{:range, start_ns, stop_ns} | rest]), do: {{start_ns, stop_ns}, rest}
+
+  defp split_range([stage | rest]) do
+    {range, others} = split_range(rest)
+    {range, [stage | others]}
+  end
+
+  # A table's rows in time order: by the stored nanoseconds, which a row's
+  # microsecond `_time` cannot tell apart. The sort is stable, so points at
+  # one instant keep their order.
+  @spec table_rows([{integer(), map()}]) :: [map()]
+  defp table_rows(timed) do
+    timed |> Enum.sort_by(fn {ns, _row} -> ns end) |> Enum.map(fn {_ns, row} -> row end)
+  end
+
+  # The tag names a row's own columns would shadow; a series is told apart
+  # by the tags that are left.
+  @reserved_columns ["_measurement", "_field", "_value", "_time", "_start", "_stop"]
+
+  # A point's rows, one per field, each with its series key — the engine's
+  # series order: measurement, then the tag set, then field — and the
+  # stored nanoseconds it is ordered by. The point's own parts are built
+  # once, not once per field.
+  @spec timed_rows(map(), {DateTime.t(), DateTime.t()}) ::
+          [{{binary(), [{binary(), binary()}], binary()}, {integer(), map()}}]
+  defp timed_rows(point, {start, stop}) do
+    series = point.tags |> Map.drop(@reserved_columns) |> Enum.sort()
+
+    base =
+      Map.merge(point.tags, %{
+        "_measurement" => point.measurement,
+        "_start" => start,
+        "_stop" => stop,
+        "_time" => datetime(point.timestamp)
+      })
+
+    for {field, value} <- point.fields do
+      row = base |> Map.put("_field", field) |> Map.put("_value", value)
+      {{point.measurement, series, field}, {point.timestamp, row}}
+    end
+  end
+
+  @spec apply_stage(stage(), {[[map()]], binary()}) :: {[[map()]], binary()}
+  defp apply_stage({:yield, name}, {tables, _result}), do: {tables, name}
+
+  defp apply_stage(stage, {tables, result}),
+    do: {Enum.map(tables, &apply_to_table(stage, &1)), result}
+
+  @spec apply_to_table(stage(), [map()]) :: [map()]
+  defp apply_to_table({:filter, predicate}, rows),
+    do: Enum.filter(rows, &(matches?(predicate, &1) == true))
+
+  defp apply_to_table({:limit, n, offset}, rows), do: rows |> Enum.drop(offset) |> Enum.take(n)
+  defp apply_to_table({:selector, _kind}, []), do: []
+  defp apply_to_table({:selector, :first}, [row | _rest]), do: [row]
+  defp apply_to_table({:selector, :last}, rows), do: [List.last(rows)]
+
+  # The first row with the extreme value wins a tie.
+  defp apply_to_table({:selector, kind}, rows) do
+    better? = if kind == :max, do: &Kernel.>/2, else: &Kernel.</2
+
+    [
+      Enum.reduce(rows, fn row, best ->
+        if better?.(row["_value"], best["_value"]), do: row, else: best
+      end)
+    ]
+  end
+
+  defp apply_to_table({:aggregate, _kind}, []), do: []
+
+  defp apply_to_table({:aggregate, kind}, [first | _rest] = rows) do
+    values = Enum.map(rows, & &1["_value"])
+
+    if kind != :count and not Enum.all?(values, &is_number/1) do
+      throw({:flux_error, "unsupported input type for #{kind} aggregate: #{type_name(values)}"})
+    end
+
+    value =
+      case kind do
+        :count -> length(values)
+        :sum -> Enum.sum(values)
+        :mean -> Enum.sum(values) / length(values)
+      end
+
+    [first |> Map.delete("_time") |> Map.put("_value", value)]
+  end
+
+  # Flux logic is three-valued: a key the row does not have is null, a
+  # comparison with null is null, `not null` is null, and filter keeps a
+  # row only when the predicate is true.
+  @spec matches?(predicate(), map()) :: boolean() | nil
+  defp matches?({:and, a, b}, row) do
+    case {matches?(a, row), matches?(b, row)} do
+      {false, _b} -> false
+      {_a, false} -> false
+      {true, true} -> true
+      _null -> nil
+    end
+  end
+
+  defp matches?({:or, a, b}, row) do
+    case {matches?(a, row), matches?(b, row)} do
+      {true, _b} -> true
+      {_a, true} -> true
+      {false, false} -> false
+      _null -> nil
+    end
+  end
+
+  defp matches?({:not, a}, row) do
+    case matches?(a, row) do
+      nil -> nil
+      value -> not value
+    end
+  end
+
+  defp matches?({:cmp, key, op, literal}, row) do
+    case Map.fetch(row, key) do
+      {:ok, value} -> compare(op, value, literal)
+      :error -> nil
+    end
+  end
+
+  @spec compare(binary(), term(), term()) :: boolean()
+  defp compare(op, a, b) when is_number(a) and is_number(b), do: ordered(op, a, b)
+  defp compare(op, a, b) when is_binary(a) and is_binary(b), do: ordered(op, a, b)
+  defp compare("==", a, b), do: a === b
+  defp compare("!=", a, b), do: a !== b
+  defp compare(_op, _a, _b), do: false
+
+  @spec ordered(binary(), term(), term()) :: boolean()
+  defp ordered("==", a, b), do: a == b
+  defp ordered("!=", a, b), do: a != b
+  defp ordered("<", a, b), do: a < b
+  defp ordered("<=", a, b), do: a <= b
+  defp ordered(">", a, b), do: a > b
+  defp ordered(">=", a, b), do: a >= b
+
+  @spec type_name([term()]) :: binary()
+  defp type_name(values) do
+    case Enum.find(values, &(not is_number(&1))) do
+      value when is_binary(value) -> "string"
+      value when is_boolean(value) -> "boolean"
+      _other -> "unknown"
+    end
+  end
+
+  @spec datetime(integer()) :: DateTime.t()
+  defp datetime(ns) do
+    ns |> DateTime.from_unix!(:nanosecond) |> ResponseParser.microsecond_precision()
+  end
+
+  # ---------------------------------------------------------------------------
+  # Parsing — the pipeline
+  # ---------------------------------------------------------------------------
+
+  # Splits `a(...) |> b(...)` at top-level pipes into `{name, args}` calls.
+  @spec split_pipeline(binary()) :: {:ok, [{binary(), binary()}]} | {:error, binary()}
+  defp split_pipeline(flux) do
+    flux
+    |> split_top_level("|>")
+    |> Enum.reduce_while({:ok, []}, fn text, {:ok, acc} ->
+      case Regex.run(~r/^\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$/s, text) do
+        [_full, name, args] ->
+          {:cont, {:ok, [{name, args} | acc]}}
+
+        nil ->
+          {:halt, {:error, "Client.Local: unsupported Flux expression: #{String.trim(text)}"}}
+      end
+    end)
+    |> case do
+      {:ok, calls} -> {:ok, Enum.reverse(calls)}
+      error -> error
+    end
+  end
+
+  @spec parse_from([{binary(), binary()}]) ::
+          {:ok, binary(), [{binary(), binary()}]} | {:error, binary()}
+  defp parse_from([{"from", args} | rest]) do
+    case Regex.run(~r/^\s*bucket\s*:\s*"([^"]*)"\s*$/, args) do
+      [_full, bucket] -> {:ok, bucket, rest}
+      nil -> {:error, "Client.Local: unsupported from(): #{args}"}
+    end
+  end
+
+  defp parse_from(_calls),
+    do: {:error, "Client.Local: a Flux query must start with from(bucket: ...)"}
+
+  @spec parse_stages([{binary(), binary()}], integer()) :: {:ok, [stage()]} | {:error, binary()}
+  defp parse_stages(calls, now_ns) do
+    calls
+    |> Enum.reduce_while({:ok, []}, fn call, {:ok, acc} ->
+      case parse_stage(call, now_ns) do
+        {:ok, stage} -> {:cont, {:ok, [stage | acc]}}
+        {:error, _message} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, stages} -> {:ok, Enum.reverse(stages)}
+      error -> error
+    end
+  end
+
+  @selectors %{"first" => :first, "last" => :last, "min" => :min, "max" => :max}
+  @aggregates %{"mean" => :mean, "sum" => :sum, "count" => :count}
+
+  @spec parse_stage({binary(), binary()}, integer()) :: {:ok, stage()} | {:error, binary()}
+  defp parse_stage({"range", args}, now_ns) do
+    params = named_args(args)
+
+    with {:ok, {start, start_order}} <- fetch_time(params, "start", now_ns),
+         {:ok, {stop, stop_order}} <- optional_time(params, "stop", now_ns),
+         :ok <- non_empty(start_order, stop_order) do
+      {:ok, {:range, start, stop}}
+    end
+  end
+
+  defp parse_stage({"filter", args}, _now_ns) do
+    case Regex.run(~r/^\s*fn\s*:\s*\(\s*r\s*\)\s*=>\s*(.+?)\s*$/s, args) do
+      [_full, body] ->
+        with {:ok, predicate} <- parse_predicate(body), do: {:ok, {:filter, predicate}}
+
+      nil ->
+        {:error, "Client.Local: unsupported filter(): #{args}"}
+    end
+  end
+
+  defp parse_stage({"limit", args}, _now_ns) do
+    params = named_args(args)
+
+    with {:ok, n} <- fetch_int(params, "n"),
+         {:ok, offset} <- optional_int(params, "offset") do
+      {:ok, {:limit, n, offset}}
+    end
+  end
+
+  defp parse_stage({"yield", args}, _now_ns) do
+    case named_args(args) do
+      %{"name" => "\"" <> _rest = quoted} -> {:ok, {:yield, String.trim(quoted, "\"")}}
+      params when params == %{} -> {:ok, {:yield, "_result"}}
+      _other -> {:error, "Client.Local: unsupported yield(): #{args}"}
+    end
+  end
+
+  defp parse_stage({name, args}, _now_ns) do
+    cond do
+      String.trim(args) != "" and Map.has_key?(Map.merge(@selectors, @aggregates), name) ->
+        {:error, "Client.Local: unsupported Flux arguments: #{name}(#{args})"}
+
+      kind = @selectors[name] ->
+        {:ok, {:selector, kind}}
+
+      kind = @aggregates[name] ->
+        {:ok, {:aggregate, kind}}
+
+      true ->
+        {:error, "Client.Local: unsupported Flux function: #{name}()"}
+    end
+  end
+
+  @spec require_range([stage()], binary()) :: :ok | {:error, binary()}
+  defp require_range(stages, bucket) do
+    case Enum.count(stages, &match?({:range, _start, _stop}, &1)) do
+      1 ->
+        :ok
+
+      0 ->
+        {:error,
+         "error in building plan while starting program: cannot submit unbounded read to " <>
+           "\"#{bucket}\"; try bounding 'from' with a call to 'range'"}
+
+      _many ->
+        {:error, "Client.Local: unsupported Flux: more than one range()"}
+    end
+  end
+
+  # `key: value, key: value` at top level (values may hold commas in quotes
+  # or parentheses).
+  @spec named_args(binary()) :: %{binary() => binary()}
+  defp named_args(args) do
+    args
+    |> split_top_level(",")
+    |> Enum.reject(&(String.trim(&1) == ""))
+    |> Map.new(fn pair ->
+      case String.split(pair, ":", parts: 2) do
+        [key, value] -> {String.trim(key), String.trim(value)}
+        [bare] -> {String.trim(bare), ""}
+      end
+    end)
+  end
+
+  # The plan is refused when the range has no time in it. The engine
+  # compares seconds given as integers as Go times, which count seconds
+  # since the year 1 in 64 bits, before they become nanoseconds: a wrapped
+  # stop is not "empty" (`range(start: 0, stop: 18446744073)` reads
+  # nothing without an error), only one that overflows that count is. Every
+  # other form is compared as the nanoseconds it wraps to.
+  @spec non_empty(integer(), integer()) :: :ok | {:error, binary()}
+  defp non_empty(start, stop) when start < stop, do: :ok
+
+  defp non_empty(_start, _stop),
+    do: {:error, "error in building plan while starting program: cannot query an empty range"}
+
+  @spec fetch_time(map(), binary(), integer()) ::
+          {:ok, {integer(), integer()}} | {:error, binary()}
+  defp fetch_time(params, key, now_ns) do
+    case Map.fetch(params, key) do
+      {:ok, text} -> parse_time(text, now_ns)
+      :error -> {:error, "Client.Local: range() needs #{key}"}
+    end
+  end
+
+  @spec optional_time(map(), binary(), integer()) ::
+          {:ok, {integer(), integer()}} | {:error, binary()}
+  defp optional_time(params, key, now_ns) do
+    if Map.has_key?(params, key),
+      do: fetch_time(params, key, now_ns),
+      else: {:ok, {now_ns, now_ns}}
+  end
+
+  # Seconds from the year 1 to the epoch, the offset of Go's time count.
+  @year_one 62_135_596_800
+
+  # `{nanoseconds, ordering key}`: the time as the engine holds it (a
+  # signed 64-bit count, so one that does not fit wraps) and the value an
+  # empty range is judged on, see `non_empty/2`.
+  @spec parse_time(binary(), integer()) ::
+          {:ok, {integer(), integer()}} | {:error, binary()}
+  defp parse_time("now()", now_ns), do: {:ok, {now_ns, now_ns}}
+
+  defp parse_time(text, now_ns) do
+    cond do
+      match = Regex.run(~r/^(-?)(\d+)(s|m|h|d|w)$/, text) ->
+        [_full, sign, amount, unit] = match
+        offset = String.to_integer(amount) * Durations.ns(unit)
+        wrapped = wrap64(now_ns + if(sign == "-", do: -offset, else: offset))
+        {:ok, {wrapped, wrapped}}
+
+      Regex.match?(~r/^-?\d+$/, text) ->
+        seconds = String.to_integer(text)
+
+        {:ok,
+         {wrap64(seconds * 1_000_000_000),
+          (wrap64(seconds + @year_one) - @year_one) * 1_000_000_000}}
+
+      true ->
+        case DateTime.from_iso8601(text) do
+          {:ok, dt, _offset} ->
+            wrapped = wrap64(DateTime.to_unix(dt, :nanosecond))
+            {:ok, {wrapped, wrapped}}
+
+          {:error, _reason} ->
+            {:error, "Client.Local: unsupported range() time: #{text}"}
+        end
+    end
+  end
+
+  # Two's-complement 64-bit wrap, which is what multiplying seconds by 1e9
+  # does on the engine.
+  @spec wrap64(integer()) :: integer()
+  defp wrap64(value) do
+    wrapped = Bitwise.band(value, 0xFFFFFFFFFFFFFFFF)
+    if wrapped >= 0x8000000000000000, do: wrapped - 0x10000000000000000, else: wrapped
+  end
+
+  @spec fetch_int(map(), binary()) :: {:ok, non_neg_integer()} | {:error, binary()}
+  defp fetch_int(params, key) do
+    with {:ok, text} <- Map.fetch(params, key),
+         {n, ""} when n >= 0 <- Integer.parse(text) do
+      {:ok, n}
+    else
+      _missing -> {:error, "Client.Local: limit() needs a non-negative integer #{key}"}
+    end
+  end
+
+  @spec optional_int(map(), binary()) :: {:ok, non_neg_integer()} | {:error, binary()}
+  defp optional_int(params, key),
+    do: if(Map.has_key?(params, key), do: fetch_int(params, key), else: {:ok, 0})
+
+  # ---------------------------------------------------------------------------
+  # Parsing — filter predicates: or > and > not > comparison | ( ... )
+  # ---------------------------------------------------------------------------
+
+  @token ~r/^\s*(?:(?<str>"(?:[^"\\]|\\.)*")|(?<num>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|(?<key>r\.[A-Za-z_]\w*|r\s*\[\s*"(?:[^"\\]|\\.)*"\s*\])|(?<op>==|!=|<=|>=|<|>)|(?<paren>[()])|(?<word>[A-Za-z_]\w*))/
+
+  @spec parse_predicate(binary()) :: {:ok, predicate()} | {:error, binary()}
+  defp parse_predicate(text) do
+    with {:ok, tokens} <- tokenize(text, []),
+         {:ok, predicate, []} <- parse_or(tokens) do
+      {:ok, predicate}
+    else
+      _error -> {:error, "Client.Local: unsupported filter predicate: #{text}"}
+    end
+  end
+
+  @spec tokenize(binary(), list()) :: {:ok, list()} | :error
+  defp tokenize(text, acc) do
+    with false <- String.trim(text) == "",
+         [full] <- Regex.run(@token, text, capture: :first),
+         {:ok, token} <- token(Regex.named_captures(@token, text)) do
+      rest = binary_part(text, byte_size(full), byte_size(text) - byte_size(full))
+      tokenize(rest, [token | acc])
+    else
+      true -> {:ok, Enum.reverse(acc)}
+      _unknown -> :error
+    end
+  end
+
+  @spec token(map()) :: {:ok, tuple()} | :error
+  defp token(%{"str" => "\"" <> _rest = str}),
+    do: {:ok, {:lit, str |> String.slice(1..-2//1) |> String.replace(~s(\\"), ~s("))}}
+
+  defp token(%{"num" => num}) when num != "", do: {:ok, {:lit, number(num)}}
+  defp token(%{"key" => key}) when key != "", do: {:ok, {:key, key_name(key)}}
+  defp token(%{"op" => op}) when op != "", do: {:ok, {:op, op}}
+  defp token(%{"paren" => paren}) when paren != "", do: {:ok, {:paren, paren}}
+  defp token(%{"word" => word}) when word in ["true", "false"], do: {:ok, {:lit, word == "true"}}
+  defp token(%{"word" => "and"}), do: {:ok, {:and}}
+  defp token(%{"word" => "or"}), do: {:ok, {:or}}
+  defp token(%{"word" => "not"}), do: {:ok, {:not}}
+  defp token(_other), do: :error
+
+  @spec key_name(binary()) :: binary()
+  defp key_name("r." <> name), do: name
+
+  defp key_name(bracket) do
+    [_full, name] = Regex.run(~r/"((?:[^"\\]|\\.)*)"/, bracket)
+    String.replace(name, ~s(\\"), ~s("))
+  end
+
+  @spec number(binary()) :: number()
+  defp number(text) do
+    case Integer.parse(text) do
+      {n, ""} -> n
+      _float -> text |> Float.parse() |> elem(0)
+    end
+  end
+
+  @spec parse_or(list()) :: {:ok, predicate(), list()} | :error
+  defp parse_or(tokens) do
+    with {:ok, left, rest} <- parse_and(tokens), do: or_tail(left, rest)
+  end
+
+  defp or_tail(left, [{:or} | rest]) do
+    with {:ok, right, rest} <- parse_and(rest), do: or_tail({:or, left, right}, rest)
+  end
+
+  defp or_tail(left, rest), do: {:ok, left, rest}
+
+  @spec parse_and(list()) :: {:ok, predicate(), list()} | :error
+  defp parse_and(tokens) do
+    with {:ok, left, rest} <- parse_not(tokens), do: and_tail(left, rest)
+  end
+
+  defp and_tail(left, [{:and} | rest]) do
+    with {:ok, right, rest} <- parse_not(rest), do: and_tail({:and, left, right}, rest)
+  end
+
+  defp and_tail(left, rest), do: {:ok, left, rest}
+
+  @spec parse_not(list()) :: {:ok, predicate(), list()} | :error
+  defp parse_not([{:not} | rest]) do
+    with {:ok, inner, rest} <- parse_not(rest), do: {:ok, {:not, inner}, rest}
+  end
+
+  defp parse_not([{:paren, "("} | rest]) do
+    case parse_or(rest) do
+      {:ok, inner, [{:paren, ")"} | rest]} -> {:ok, inner, rest}
+      _error -> :error
+    end
+  end
+
+  defp parse_not([{:key, key}, {:op, op}, {:lit, literal} | rest]),
+    do: {:ok, {:cmp, key, op, literal}, rest}
+
+  defp parse_not(_tokens), do: :error
+
+  # ---------------------------------------------------------------------------
+  # Splitting outside strings and parentheses
+  # ---------------------------------------------------------------------------
+
+  @spec split_top_level(binary(), binary()) :: [binary()]
+  defp split_top_level(text, separator), do: do_split(text, separator, 0, false, "", [])
+
+  defp do_split("", _sep, _depth, _quoted, current, acc), do: Enum.reverse([current | acc])
+
+  defp do_split(<<"\\", c::utf8, rest::binary>>, sep, depth, true, current, acc),
+    do: do_split(rest, sep, depth, true, current <> "\\" <> <<c::utf8>>, acc)
+
+  defp do_split(<<"\"", rest::binary>>, sep, depth, quoted, current, acc),
+    do: do_split(rest, sep, depth, not quoted, current <> "\"", acc)
+
+  defp do_split(<<c::utf8, rest::binary>>, sep, depth, true, current, acc),
+    do: do_split(rest, sep, depth, true, current <> <<c::utf8>>, acc)
+
+  defp do_split(<<c, rest::binary>>, sep, depth, false, current, acc) when c in [?(, ?[],
+    do: do_split(rest, sep, depth + 1, false, current <> <<c>>, acc)
+
+  defp do_split(<<c, rest::binary>>, sep, depth, false, current, acc) when c in [?), ?]],
+    do: do_split(rest, sep, depth - 1, false, current <> <<c>>, acc)
+
+  defp do_split(text, sep, 0, false, current, acc) do
+    if String.starts_with?(text, sep) do
+      rest = binary_part(text, byte_size(sep), byte_size(text) - byte_size(sep))
+      do_split(rest, sep, 0, false, "", [current | acc])
+    else
+      <<c::utf8, rest::binary>> = text
+      do_split(rest, sep, 0, false, current <> <<c::utf8>>, acc)
+    end
+  end
+
+  defp do_split(<<c::utf8, rest::binary>>, sep, depth, false, current, acc),
+    do: do_split(rest, sep, depth, false, current <> <<c::utf8>>, acc)
+end

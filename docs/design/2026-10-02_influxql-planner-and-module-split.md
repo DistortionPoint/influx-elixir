@@ -77,9 +77,10 @@ Behaviour first, each as the engine does it or refused by name.
   Core, where the same comparison is decimal arithmetic) cannot express
   UInt64 casts and wrapping. `where_plan/3` returns, beside the SQL and the
   lower bounds, `checks`: comparisons of numbers with an unsigned field in
-  them, which the caller applies with `keep?/2` over the rows the SQL kept.
-  One inside an `OR` is refused by name (a check cannot be one branch of an
-  SQL `OR`); a comparison with a string, a tag or a regular expression stays
+  them, each a column of the point that the SQL reads (`{column, check}`; the
+  caller fills it with `holds?/2`), so `AND`, `OR` and parentheses combine it
+  with the rest. A plain unsigned field against a non-negative integer needs
+  no check. A comparison with a string, a tag or a regular expression stays
   on the old path. Rejected: an SQL rewrite with explicit moduli (no `UInt64`
   literal or cast exists in the SQL subset, and the exact decimal arithmetic
   does not wrap).
@@ -145,3 +146,111 @@ does (its planner errors come without the frame a `SELECT` gets).
   before and 679, 580, 619 ms after; `Local.write/3` 1516, 1703, 1222 ms
   before and 1434, 1350, 2072 ms after. The spread between rounds is larger
   than any difference between builds: no regression.
+
+---
+
+## Second pass: what the first one refused, and the layout of `Client.Local`
+
+Every claim below was read from InfluxDB 3 Core (`curl localhost:8181/api/v3/query_influxql`)
+and the double compared with it statement by statement over the same data
+(about 1,000 statements, no difference but the ones refused by name). The
+answers are pinned in `test/support/contract/influxql_planner_contract.ex`
+(with the cases in `influxql_*_cases.ex`), run against `Client.Local` and,
+as an integration test, against Core.
+
+**Unsigned `OR`** (`u > 5 OR i < 0` and the shapes in the contract). Fixed
+as described above; it was a false refusal of what Core answers.
+
+**Regular expressions on string fields.** `=~` and `!~` match the values of a
+string field as they match a tag (unanchored, case-sensitive, `(?i)` works);
+a null value matches neither. The engine reads a backslash before a letter
+other than `d D w W s S p P x` as that letter (`\b`, `\A`, `\z`, `\t`, `\Q`
+are `b`, `A`, `z`, `t`, `Q`; there is no word boundary), before a digit as a
+back reference it refuses, and only `\/` escapes in the literal (`/\\/` is
+unterminated). `!~ /.*/` on a string field is the optimizer's `= ''`. A
+pattern with `\u`, a back reference or one the double cannot compile is
+refused by name.
+
+**Times.** A quoted time with a zone: `Z`, `UTC` (any case), `+HH:MM`,
+`+HHMM`, with blanks before the zone, hours up to 23, minutes up to 59;
+leading blanks, a `+` year and unpadded parts are read when a zone is given.
+A date with a zone, a clock without seconds, `GMT`/`EST`, `+HH`, a trailing
+blank are `is not a valid timestamp`. A duration is one or more
+`<count><unit>` (`1h30m`); its total past the signed range is `overflow` at
+the end of the literal, anything left after it (`5sx`, `1h30`) is left over
+from there. `time` is compared with `term (+|-) term ...` of quoted times,
+durations, integers (nanoseconds), `now()` and parentheses: an instant plus
+or minus a length is an instant, an instant minus an instant a length;
+instants are folded without a range and only the result must fit 64-bit
+nanoseconds (`timestamp out of range: 2297-10-16 00:00:00.500 +00:00`, the
+fraction in groups of three digits). `now()` is read once, when the `WHERE`
+is planned, so `now() - 1`, sub-second durations and `now() + 1` are exact.
+`5s - 'ts'`, `1 + now()`, `*`, `/`, `%` and a bad quoted time inside an
+expression are the engine's errors; they are refused by name.
+
+**`count(distinct(host))`** on a tag is `[]` (any aggregate of a tag alone
+is); of a field it counts the distinct values.
+
+**`GROUP BY time(every[, offset])`.** Buckets start at `offset` plus multiples
+of `every` from the epoch (`time(7s)`, `time(1m, 30s)`; `time(1m, 90s)` is
+`time(1m, 30s)`). The range runs from the bucket of the `WHERE` lower bound
+(of the series' first point without one) to the bucket of the upper bound
+(`time < x` ends with the bucket of `x - 1ns`; `now()` without one), a series
+with no value in it is not answered, every bucket of it is. A bucket is
+*present* when an aggregate had a value to work on in it (a `count` of zero is
+no value). `fill` is applied to the aggregates before an expression is
+computed: `null` (a `count` of an empty bucket is zero), `none` drops empty
+buckets, `previous` carries the last value (a `count` too), `linear`
+interpolates `y0 + (y1 - y0) * ((i - p) / (q - p))` (truncated toward zero
+for integers; nothing before the first or after the last value), a number is
+cast to the column (`1.5` is `1` for an integer, `-1` wraps for an unsigned).
+A null column of a present bucket is filled like an empty bucket, a `count`
+there keeps its value. `ORDER BY time DESC`, `LIMIT` and `OFFSET` apply after
+the fill, per series. `fill()` without `GROUP BY time` changes nothing, but
+`fill(none)`/`fill(linear)` of plain columns is the engine's planning error.
+Refused by name: `fill(linear)` with a `count` or on text (Core breaks the
+connection), a second `time()`, `time(0s)`, a number on a string column that
+is not a plain integer or fraction, and more than a million rows in a series
+(a `LIMIT` stops the stream early, so an unbounded `time(1m)` since 2024 with
+`LIMIT 2` is answered).
+
+**Aggregates.** `median` (the middle; the mean of the middle two, an integer
+for integers, truncated toward zero), `spread` (`max - min`, but an integer
+maximum starts at zero: a lone `-9` has spread 9; several negative values and
+negative floats are refused), `stddev` (Welford, sample; null for one value
+and the row stays), `min`/`max` of strings (bytes). `mean`, `sum`, `median`,
+`spread`, `stddev` of a string field are the engine's planning errors, quoted
+exactly. An aggregate of a tag answers nothing alone (beside a field it is
+refused). A column beside a non-selector aggregate is `mixing aggregate and
+non-aggregate columns is not supported`, beside several selectors `mixing
+multiple selector functions ...`.
+
+**Arithmetic.** See `InfluxQLExpr`: names are the names in the expression
+joined by `_`; `/` of two signed integers is a float division and a division
+by zero is zero; unsigned arithmetic wraps and a negative literal beside it is
+`2^64 + n - 1`; a signed integer field beside an unsigned one, and a tag or
+string in arithmetic, are the engine's planning errors. A row of a plain
+select is kept when a field it names is in it; `LIMIT` counts the rows where
+the expression is not null.
+
+### Layout
+
+`Client.Local` (facade and SQL) over `Scope` (profile, database, store reads),
+`Writes`, `Admin`, `Buckets` (v2 buckets), `InfluxQLQuery`, `FluxQuery`.
+InfluxQL: `InfluxQLText` (reserved words, quoting, masks, clause regex) under
+`InfluxQLParser` / `InfluxQLCheck` / `InfluxQLSelectCheck` / `InfluxQLGroup`;
+`InfluxQLPlan` (select-list planning errors); `InfluxQLExpr`,
+`InfluxQLAggregate`, `InfluxQLBuckets`, `InfluxQLRun`. `Durations` and
+`SQLLimits` are the one definition of the duration units and the 64-bit
+limits. `LineProtocolColumn` moved into `LineProtocolNumber`, `InfluxQLReserved`
+into `InfluxQLText`; `InfluxQLParens` and `InfluxQLShow` stay (each is read by
+one caller and merging them would only lengthen `InfluxQLCheck`). Remaining
+runtime cycles of the library are outside these modules (`SQLCondition` and
+`SQLBatch`, `Connection`).
+
+### Not modelled
+
+Core's answer varies with the data or with how its optimizer folds the
+expression, or is an error the double words differently: `distinct(f)` (hash
+order), `median(*)`, `max(f), n` per bucket, the errors of `fill()` options
+written with a blank, `time()` calls other than durations, `ts + now()`.

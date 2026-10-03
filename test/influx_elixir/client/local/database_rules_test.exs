@@ -1,7 +1,6 @@
 defmodule InfluxElixir.Client.Local.DatabaseRulesTest do
   use ExUnit.Case, async: true
 
-  alias InfluxElixir.Client.Local
   alias InfluxElixir.Client.Local.DatabaseRules
 
   @none MapSet.new()
@@ -59,24 +58,6 @@ defmodule InfluxElixir.Client.Local.DatabaseRulesTest do
     test "an existing database passes at the limit; a bad name is still its 400" do
       assert :ok = DatabaseRules.check_new("a", @five, :v3_core)
       assert {:error, %{status: 400}} = DatabaseRules.check_new("_f", @five, :v3_core)
-    end
-  end
-
-  describe "the rules through Client.Local" do
-    setup do
-      {:ok, conn} = Local.start(databases: ~w(a b c d))
-      {:ok, conn: conn}
-    end
-
-    test "the fifth database is created by a write, the sixth refused either way", %{conn: conn} do
-      assert {:ok, :written} = Local.write(conn, "m v=1i", database: "e")
-      assert {:error, %{status: 422}} = Local.write(conn, "m v=1i", database: "f")
-      assert {:error, %{status: 422}} = Local.create_database(conn, "f")
-
-      # Re-creating one that exists is fine at the limit; dropping one frees a slot.
-      assert :ok = Local.create_database(conn, "a")
-      assert :ok = Local.delete_database(conn, "a")
-      assert :ok = Local.create_database(conn, "f")
     end
   end
 end

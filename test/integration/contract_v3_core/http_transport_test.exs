@@ -12,6 +12,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
 
   alias InfluxElixir.Client.HTTP
   alias InfluxElixir.IntegrationHelper, as: H
+  alias InfluxElixir.TestSupport.Await
 
   # A streaming query holds its pool connection in a producer process. The
   # producer used to be killed when the consumer stopped early, and to wait
@@ -89,7 +90,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
   # returns once the waiting process is blocked on its checkout.
   defp queue_waiter(count) do
     waiter = Task.async(count)
-    wait_until(fn -> Process.info(waiter.pid, :status) == {:status, :waiting} end)
+    Await.until(fn -> Process.info(waiter.pid, :status) == {:status, :waiting} end)
     waiter
   end
 
@@ -316,10 +317,13 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
 
       release(ctx.holder)
 
-      wait_until(fn ->
-        {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(ctx.writer)
-        stats.total_writes == 1
-      end)
+      Await.until(
+        fn ->
+          {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(ctx.writer)
+          stats.total_writes == 1
+        end,
+        10_000
+      )
 
       InfluxElixir.ClientContract.settle(ctx)
 
@@ -333,10 +337,13 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
       :ok = InfluxElixir.Write.BatchWriter.write(ctx.writer, "not line protocol!!!")
       release(ctx.holder)
 
-      wait_until(fn ->
-        {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(ctx.writer)
-        stats.total_errors == 1
-      end)
+      Await.until(
+        fn ->
+          {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(ctx.writer)
+          stats.total_errors == 1
+        end,
+        10_000
+      )
 
       # The chain is over: a valid batch goes straight through.
       assert :ok = InfluxElixir.Write.BatchWriter.write_sync(ctx.writer, "bw_retry value=2.0")
@@ -345,26 +352,6 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
                InfluxElixir.Write.BatchWriter.stats(ctx.writer)
 
       assert {:ok, _result} = Task.await(ctx.holder, 10_000)
-    end
-  end
-
-  # Polls `fun` with a hard deadline instead of a fixed sleep.
-  defp wait_until(fun, deadline_ms \\ 10_000) do
-    deadline = System.monotonic_time(:millisecond) + deadline_ms
-    do_wait_until(fun, deadline)
-  end
-
-  defp do_wait_until(fun, deadline) do
-    cond do
-      fun.() ->
-        :ok
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        flunk("condition not met within deadline")
-
-      true ->
-        Process.sleep(20)
-        do_wait_until(fun, deadline)
     end
   end
 end

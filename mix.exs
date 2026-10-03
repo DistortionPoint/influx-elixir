@@ -41,18 +41,7 @@ defmodule InfluxElixir.MixProject do
       docs: docs(),
 
       # UsageRules
-      usage_rules: usage_rules(),
-
-      # Include usage-rules files in hex package
-      files: [
-        "lib",
-        "mix.exs",
-        "README.md",
-        "LICENSE",
-        "CHANGELOG.md",
-        "usage-rules.md",
-        "usage-rules/**/*"
-      ]
+      usage_rules: usage_rules()
     ]
   end
 
@@ -120,7 +109,17 @@ defmodule InfluxElixir.MixProject do
     [
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url},
-      maintainers: ["bcatherall"]
+      maintainers: ["bcatherall"],
+      # Only what a consumer needs: no priv/plts (dialyzer PLTs), no .formatter.exs.
+      files: [
+        "lib",
+        "mix.exs",
+        "README.md",
+        "LICENSE",
+        "CHANGELOG.md",
+        "usage-rules.md",
+        "usage-rules/**/*"
+      ]
     ]
   end
 
@@ -135,6 +134,46 @@ defmodule InfluxElixir.MixProject do
       ],
       groups_for_extras: [
         Guides: ~r/docs\/guides\/.*/
+      ],
+      groups_for_modules: [
+        "Public API": [InfluxElixir, InfluxElixir.Config, InfluxElixir.StreamError],
+        Clients: [
+          InfluxElixir.Client,
+          InfluxElixir.Client.HTTP,
+          InfluxElixir.Client.Local,
+          InfluxElixir.Client.QueryParams
+        ],
+        Writing: [
+          InfluxElixir.Write.Point,
+          InfluxElixir.Write.LineProtocol,
+          InfluxElixir.Write.Writer,
+          InfluxElixir.Write.BatchWriter
+        ],
+        Querying: [
+          InfluxElixir.Query.SQL,
+          InfluxElixir.Query.SQLStream,
+          InfluxElixir.Query.InfluxQL,
+          InfluxElixir.Query.Flux,
+          InfluxElixir.Query.ResponseParser
+        ],
+        Administration: [
+          InfluxElixir.Admin.Databases,
+          InfluxElixir.Admin.Buckets,
+          InfluxElixir.Admin.Tokens,
+          InfluxElixir.Admin.Health
+        ],
+        "Connections and Testing": [
+          InfluxElixir.Connection,
+          InfluxElixir.ConnectionSupervisor,
+          InfluxElixir.Supervisor,
+          InfluxElixir.Telemetry,
+          InfluxElixir.TestHelper
+        ],
+        "Arrow Flight": [
+          InfluxElixir.Flight.Client,
+          InfluxElixir.Flight.Reader,
+          InfluxElixir.Flight.FlatBuffer
+        ]
       ],
       source_ref: "v#{@version}"
     ]

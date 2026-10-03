@@ -1,0 +1,322 @@
+defmodule InfluxElixir.Contract.InfluxQLPlanner do
+  @moduledoc """
+  Contract tests for what the InfluxQL planner does with a statement, run
+  against `InfluxElixir.Client.Local` and against a real InfluxDB 3 Core: the
+  answers (rows, error status and body) the double must give exactly. Every
+  expectation was read from InfluxDB 3 Core.
+
+      use InfluxElixir.Contract.InfluxQLPlanner,
+        client: InfluxElixir.Client.Local
+
+  It covers comparisons of unsigned fields inside `OR`, regular expressions
+  on string fields, the forms a `time` is compared with, `GROUP BY time` with
+  `fill()`, `median`, `spread`, `stddev`, `count(distinct())` and arithmetic
+  in the select list. A real server is shared between runs, so every
+  measurement name is unique and every line is given a timestamp.
+  """
+
+  alias InfluxElixir.Contract.{
+    InfluxQLAggregateCases,
+    InfluxQLArithmeticCases,
+    InfluxQLBucketCases,
+    InfluxQLWhereCases
+  }
+
+  @doc false
+  defmacro __using__(opts) do
+    client = Keyword.fetch!(opts, :client)
+
+    quote location: :keep do
+      import InfluxElixir.Contract.InfluxQLPlanner, only: [fixture: 2, run: 3, outcome: 3]
+
+      unquote(conditions(client))
+      unquote(buckets(client))
+      unquote(helpers(client))
+    end
+  end
+
+  defp conditions(client) do
+    quote location: :keep do
+      describe "InfluxQL conditions — contract" do
+        setup ctx do
+          names = %{
+            "or" => InfluxElixir.IntegrationHelper.unique_name("ipl_or"),
+            "re" => InfluxElixir.IntegrationHelper.unique_name("ipl_re"),
+            "t" => InfluxElixir.IntegrationHelper.unique_name("ipl_t")
+          }
+
+          write(ctx, unquote(client), fixture(:where, names))
+          {:ok, names: names}
+        end
+
+        test "an unsigned comparison combines with the rest of an OR", ctx do
+          check_ids(ctx, "or", "i", InfluxQLWhereCases.unsigned_or())
+        end
+
+        test "a regular expression is matched against a string field", ctx do
+          check_ids(ctx, "re", "n", InfluxQLWhereCases.string_regex())
+        end
+
+        test "a time is compared in the forms the planner reads", ctx do
+          check_ids(ctx, "t", "v", InfluxQLWhereCases.times())
+        end
+      end
+    end
+  end
+
+  defp buckets(client) do
+    quote location: :keep do
+      describe "InfluxQL GROUP BY time and the select list — contract" do
+        setup ctx do
+          names =
+            for key <- ~w(m1 m2 m3 m4), into: %{} do
+              {key, InfluxElixir.IntegrationHelper.unique_name("ipl_" <> key)}
+            end
+
+          write(ctx, unquote(client), fixture(:buckets, names))
+          {:ok, names: names}
+        end
+
+        test "windows, bounds, offsets, series and fills of floats and integers", ctx do
+          check_rows(ctx, InfluxQLBucketCases.buckets())
+        end
+
+        test "fills across buckets with no data", ctx do
+          check_rows(ctx, InfluxQLBucketCases.gaps())
+        end
+
+        test "fills of integer, unsigned and string columns", ctx do
+          check_rows(ctx, InfluxQLBucketCases.types())
+        end
+
+        test "fills of columns that are null in a bucket with other values", ctx do
+          check_rows(ctx, InfluxQLBucketCases.partial())
+        end
+
+        test "median, spread, stddev, count(distinct()) and mixed select lists", ctx do
+          check_rows(ctx, InfluxQLAggregateCases.aggregates())
+        end
+
+        test "arithmetic in the select list", ctx do
+          check_rows(ctx, InfluxQLArithmeticCases.arithmetic())
+        end
+
+        test "a fill option the parser cannot read is its error at the option", ctx do
+          for option <- ["foo", "", ~s("x"), "true"] do
+            statement = bucket_statement(ctx, "fill(#{option})")
+            at = String.length(String.replace(statement, ~r/fill\(.*$/, "fill("))
+
+            assert outcome(unquote(client), ctx, statement) ===
+                     {:error, 400,
+                      "error in InfluxQL statement: parsing error: invalid FILL option, " <>
+                        "expected NULL, NONE, PREVIOUS, LINEAR, or a number at pos #{at}"},
+                   statement
+          end
+        end
+
+        test "a fill that is more than an option leaves the statement from fill", ctx do
+          for clause <- ["GROUP BY time(1m) fill(1,2)", "GROUP BY time(1m) fill(1e3)"] do
+            statement = bucket_statement(ctx, clause)
+            [before, _rest] = String.split(statement, "fill(", parts: 2)
+            rest = String.slice(statement, String.length(before)..-1//1)
+
+            assert outcome(unquote(client), ctx, statement) ===
+                     {:error, 400,
+                      "error in InfluxQL statement: parsing error: invalid InfluxQL " <>
+                        "statement at pos #{String.length(before)}. Parsing Error: " <>
+                        "Nom(#{inspect(rest)}, Tag)"},
+                   statement
+          end
+        end
+
+        test "a fill after LIMIT, or a second fill, is left over", ctx do
+          for clause <- ["LIMIT 1 fill(0)", "fill(0) fill(1)"] do
+            statement = "SELECT mean(usage) FROM #{ctx.names["m1"]} #{clause}"
+            [before, _rest] = String.split(statement, "fill(0)", parts: 2)
+            at = String.length(before) + if(String.ends_with?(clause, "fill(1)"), do: 8, else: 0)
+            rest = String.slice(statement, at..-1//1)
+
+            assert outcome(unquote(client), ctx, statement) ===
+                     {:error, 400,
+                      "error in InfluxQL statement: parsing error: invalid InfluxQL " <>
+                        "statement at pos #{at}. Parsing Error: Nom(#{inspect(rest)}, Tag)"},
+                   statement
+          end
+        end
+
+        test "without a lower bound the buckets start at the first point and end now", ctx do
+          before = days_since_2024()
+
+          assert {:ok, [first | rest]} =
+                   InfluxElixir.Contract.InfluxQLPlanner.raw(
+                     unquote(client),
+                     ctx,
+                     "SELECT mean(usage) FROM #{ctx.names["m2"]} GROUP BY time(1d)"
+                   )
+
+          later = days_since_2024()
+          assert first["time"] === ~U[2024-01-01 00:00:00.000000Z]
+          assert first["mean"] === 5.25
+          assert Enum.all?(rest, &(map_size(Map.drop(&1, ["time", "iox::measurement"])) == 0))
+          assert (length(rest) + 1) in before..later
+        end
+
+        test "each series starts at its own first point, and LIMIT reads only what it keeps",
+             ctx do
+          statement =
+            "SELECT mean(usage) FROM #{ctx.names["m2"]} GROUP BY time(1m), host LIMIT 2"
+
+          assert outcome(unquote(client), ctx, statement) ===
+                   [
+                     {"2024-01-01 00:00:00", %{"host" => "a", "mean" => 1.0}},
+                     {"2024-01-01 00:01:00", %{"host" => "a"}},
+                     {"2024-01-01 00:07:00", %{"host" => "b", "mean" => 10.0}},
+                     {"2024-01-01 00:08:00", %{"host" => "b"}}
+                   ]
+        end
+      end
+    end
+  end
+
+  defp helpers(client) do
+    quote location: :keep do
+      defp write(ctx, client, lines) do
+        assert {:ok, :written} =
+                 client.write(ctx.conn, Enum.join(lines, "\n"), database: ctx.database)
+
+        InfluxElixir.ClientContract.settle(ctx)
+      end
+
+      defp check_ids(ctx, key, field, cases) do
+        for {statement, expected} <- cases do
+          template =
+            "SELECT #{field} FROM ~m WHERE " <>
+              String.replace(statement, ~r/^SELECT \w+ FROM ~m WHERE /, "")
+
+          real = String.replace(template, "~m", ctx.names[key])
+          result = run(unquote(client), ctx, real)
+
+          actual =
+            case result do
+              {:ok, rows} -> Enum.map(rows, & &1[field])
+              {:error, %{status: status, body: body}} -> {:error, status, body}
+            end
+
+          assert actual === expected, statement
+        end
+      end
+
+      defp check_rows(ctx, cases) do
+        for {template, expected} <- cases do
+          statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
+          assert outcome(unquote(client), ctx, statement) === expected, template
+        end
+      end
+
+      defp bucket_statement(ctx, clause) do
+        "SELECT mean(usage) FROM #{ctx.names["m1"]} " <>
+          "WHERE time >= '2024-01-01T00:00:00Z' AND time < '2024-01-01T00:05:00Z' " <>
+          if(String.starts_with?(clause, "GROUP"),
+            do: clause,
+            else: "GROUP BY time(1m) " <> clause
+          )
+      end
+
+      defp days_since_2024, do: Date.diff(Date.utc_today(), ~D[2024-01-01]) + 1
+    end
+  end
+
+  @doc false
+  @spec statement(binary(), %{binary() => binary()}) :: binary()
+  def statement(template, names) do
+    Enum.reduce(names, template, fn {key, name}, acc -> String.replace(acc, "~" <> key, name) end)
+  end
+
+  @doc false
+  @spec raw(module(), map(), binary()) :: InfluxElixir.Client.query_result()
+  def raw(client, ctx, statement),
+    do: client.query_influxql(ctx.conn, statement, database: ctx.database)
+
+  @doc false
+  @spec run(module(), map(), binary()) :: InfluxElixir.Client.query_result()
+  def run(client, ctx, statement), do: raw(client, ctx, statement)
+
+  @doc """
+  The answer of a statement as the cases write it: the rows as `{time,
+  columns}` with the time as `YYYY-MM-DD HH:MM:SS`, or `{:error, status,
+  body}`.
+  """
+  @spec outcome(module(), map(), binary()) ::
+          [{binary(), map()}] | {:error, pos_integer(), binary()}
+  def outcome(client, ctx, statement) do
+    case raw(client, ctx, statement) do
+      {:ok, rows} ->
+        for row <- rows do
+          {Calendar.strftime(row["time"], "%Y-%m-%d %H:%M:%S"),
+           row |> Map.delete("time") |> Map.delete("iox::measurement")}
+        end
+
+      {:error, %{status: status, body: body}} ->
+        {:error, status, body}
+    end
+  end
+
+  @doc false
+  @spec fixture(:where | :buckets, %{binary() => binary()}) :: [binary()]
+  def fixture(:where, names) do
+    [or_m, re_m, t_m] = [names["or"], names["re"], names["t"]]
+
+    [
+      "#{or_m},h=a i=1i,j=-5i,u=3u 1000000000",
+      "#{or_m},h=b i=2i,u=18446744073709551615u 2000000000",
+      "#{or_m},h=c i=3i,u=0u 3000000000",
+      "#{or_m},h=a i=-4i,u=9223372036854775808u 4000000000",
+      ~s(#{re_m},h=a msg="m0",n=1i 1000000000),
+      ~s(#{re_m},h=b msg="m1",n=2i 2000000000),
+      ~s(#{re_m},h=c msg="m3",n=3i 3000000000),
+      ~s(#{re_m},h=a msg="M3x",n=4i 4000000000),
+      ~s(#{re_m},h=b n=5i 5000000000),
+      ~s(#{re_m},h=c msg="a.b",n=6i 6000000000),
+      ~s(#{re_m},h=c msg="",n=7i 7000000000),
+      ~s(#{re_m},h=c msg="ab\\nc",n=8i 8000000000)
+    ] ++
+      for {iso, v} <-
+            Enum.with_index(
+              ~w(2023-12-31T23:00:00Z 2024-01-01T00:00:00Z 2024-01-01T00:00:05Z
+                 2024-01-01T01:30:00Z 2024-01-01T02:00:00Z 2024-01-08T00:00:00Z),
+              1
+            ) do
+        "#{t_m} v=#{v}i #{ns(iso)}"
+      end
+  end
+
+  def fixture(:buckets, names) do
+    [m1, m2, m3, m4] = [names["m1"], names["m2"], names["m3"], names["m4"]]
+
+    [
+      "#{m1},host=a usage=1.0,n=1i #{ns("2024-01-01T00:00:00Z")}",
+      "#{m1},host=a usage=2.0,n=2i #{ns("2024-01-01T00:00:10Z")}",
+      "#{m1},host=b usage=10.0,n=10i #{ns("2024-01-01T00:00:20Z")}",
+      "#{m1},host=a usage=4.0,n=4i #{ns("2024-01-01T00:01:05Z")}",
+      "#{m1},host=b usage=20.0,n=20i #{ns("2024-01-01T00:02:10Z")}",
+      "#{m1},host=a usage=8.0,n=8i #{ns("2024-01-01T00:03:30Z")}",
+      "#{m2},host=a usage=1.0,n=1i #{ns("2024-01-01T00:00:10Z")}",
+      "#{m2},host=a usage=4.0,n=4i #{ns("2024-01-01T00:03:10Z")}",
+      "#{m2},host=a usage=6.0,n=6i #{ns("2024-01-01T00:03:40Z")}",
+      "#{m2},host=b usage=10.0,n=10i #{ns("2024-01-01T00:07:30Z")}",
+      ~s(#{m3},host=a usage=1.0,n=1i,u=1u,s="x" #{ns("2024-01-01T00:00:10Z")}),
+      ~s(#{m3},host=a usage=2.0,n=2i,u=2u,s="y" #{ns("2024-01-01T00:03:10Z")}),
+      ~s(#{m3},host=a usage=9.0,n=-9i,u=9u,s="z" #{ns("2024-01-01T00:05:10Z")}),
+      "#{m4},host=a a=1.0,b=10.0 #{ns("2024-01-01T00:00:10Z")}",
+      "#{m4},host=a a=2.0 #{ns("2024-01-01T00:01:10Z")}",
+      "#{m4},host=a b=30.0 #{ns("2024-01-01T00:03:10Z")}",
+      "#{m4},host=a a=5.0,b=50.0 #{ns("2024-01-01T00:05:10Z")}"
+    ]
+  end
+
+  @spec ns(binary()) :: integer()
+  defp ns(iso) do
+    {:ok, time, 0} = DateTime.from_iso8601(iso)
+    DateTime.to_unix(time, :nanosecond)
+  end
+end

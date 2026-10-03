@@ -1,0 +1,157 @@
+defmodule InfluxElixir.Client.Local.InfluxQLSql do
+  @moduledoc false
+  # Writes the tokens of an InfluxQL comparison as the SQL the caller's engine
+  # reads: a missing tag, a double-quoted identifier, a regular expression, a
+  # duration next to `now()`.
+
+  # A duration next to `now()` is an interval in whole seconds, the unit
+  # the SQL engine's INTERVAL takes; a finer one is refused by name.
+  @doc false
+  @spec duration_sql(non_neg_integer(), binary()) :: binary()
+  def duration_sql(ns, _text) when rem(ns, 1_000_000_000) == 0,
+    do: "INTERVAL '#{div(ns, 1_000_000_000)} seconds'"
+
+  def duration_sql(_ns, text),
+    do: throw({:refused, "unsupported InfluxQL (sub-second duration #{text})"})
+
+  @doc """
+  The tokens of a comparison as SQL. A regular expression is matched against
+  a tag or a string field (`strings`) and is false for any other column.
+  """
+  @spec rewrite(list(), MapSet.t(binary()), [binary()]) :: [binary()]
+  # No string fields: the tags without the tags.
+  def rewrite(tokens, tags, acc), do: rewrite(tokens, tags, MapSet.difference(tags, tags), acc)
+
+  @doc false
+  @spec rewrite(list(), MapSet.t(binary()), MapSet.t(binary()), [binary()]) :: [binary()]
+  def rewrite([], _tags, _strings, acc), do: Enum.reverse(acc)
+
+  def rewrite([{:ident, name}, {:op, op}, {:regex, pattern} | rest], tags, strings, acc) do
+    regex = regex_pattern(pattern)
+
+    sql =
+      cond do
+        MapSet.member?(tags, name) -> regex_sql(name, op, regex)
+        MapSet.member?(strings, name) -> string_regex_sql(name, op, regex)
+        true -> always_false(name)
+      end
+
+    rewrite(rest, tags, strings, [sql | acc])
+  end
+
+  def rewrite([{:ident, name}, {:op, op}, value | rest], tags, strings, acc)
+      when op in ["<", "<=", ">", ">="] do
+    if MapSet.member?(tags, name),
+      do: rewrite(rest, tags, strings, [always_false(name) | acc]),
+      else: rewrite(rest, tags, strings, [token_sql(value), op, ident_sql(name) | acc])
+  end
+
+  # Two tags compared are false for every row, whichever the operator
+  # (verified: `k = x` on points where they hold the same value, `k != x`
+  # where they differ, `k = k`).
+  def rewrite([{:ident, name}, {:op, op}, {:ident, other} | rest], tags, strings, acc)
+      when op in ["=", "!=", "<>"] do
+    if MapSet.member?(tags, name) and MapSet.member?(tags, other),
+      do: rewrite(rest, tags, strings, [always_false(name) | acc]),
+      else: rewrite(rest, tags, strings, [token_sql({:ident, other}), op, ident_sql(name) | acc])
+  end
+
+  def rewrite([token | rest], tags, strings, acc),
+    do: rewrite(rest, tags, strings, [token_sql(token) | acc])
+
+  @spec regex_sql(binary(), binary(), binary()) :: binary()
+  defp regex_sql(name, op, regex),
+    do:
+      "#{ident_sql(name)} #{if op == "=~", do: "~", else: "!~"} '#{String.replace(regex, "'", "''")}'"
+
+  # The engine's optimizer folds `!~ /.*/` on a string field into `= ''`
+  # (verified: it keeps the points whose value is the empty string, and no
+  # other pattern, tag or field does).
+  @spec string_regex_sql(binary(), binary(), binary()) :: binary()
+  defp string_regex_sql(name, "!~", ".*"), do: "#{ident_sql(name)} = ''"
+  defp string_regex_sql(name, op, regex), do: regex_sql(name, op, regex)
+
+  # The engine reads a regular expression with the Rust `regex` crate, after
+  # its own handling of backslashes (verified one letter at a time): `\d \D \w
+  # \W \s \S` and the `\p \P \x` classes and escapes are kept, a backslash
+  # before any other letter is dropped (`\b` is the letter `b`, there is no
+  # word boundary, `\A` is `A`), before punctuation it escapes it. A digit
+  # after one is a back reference the engine refuses, and `\u` a Unicode
+  # escape the double's engine does not read; an expression the double's
+  # engine cannot compile is refused by name, not given another body.
+  @spec regex_pattern(binary()) :: binary()
+  defp regex_pattern(pattern) do
+    regex = unescape(pattern, [])
+
+    case Regex.compile(regex, "u") do
+      {:ok, _compiled} ->
+        regex
+
+      {:error, _reason} ->
+        throw({:refused, "unsupported InfluxQL (the regular expression /#{pattern}/)"})
+    end
+  end
+
+  @kept_letters ~c"dDwWsSpPx"
+
+  @spec unescape(binary(), iodata()) :: binary()
+  defp unescape(<<>>, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp unescape(<<?\\, c, _rest::binary>>, _acc) when c in ?0..?9 or c in [?u, ?U],
+    do: throw({:refused, "unsupported InfluxQL (the regular expression escape \\#{<<c>>})"})
+
+  defp unescape(<<?\\, c, rest::binary>>, acc) when c in @kept_letters,
+    do: unescape(rest, [<<?\\, c>> | acc])
+
+  defp unescape(<<?\\, c, rest::binary>>, acc) when c in ?a..?z or c in ?A..?Z,
+    do: unescape(rest, [<<c>> | acc])
+
+  defp unescape(<<?\\, c::utf8, rest::binary>>, acc), do: unescape(rest, [<<?\\, c::utf8>> | acc])
+  defp unescape(<<c::utf8, rest::binary>>, acc), do: unescape(rest, [<<c::utf8>> | acc])
+  defp unescape(<<c, rest::binary>>, acc), do: unescape(rest, [<<c>> | acc])
+
+  # InfluxQL reads `+5` as 5;
+  # the SQL the double hands on does not read a
+  # unary plus. A `+` is unary at the start, after a comparison operator,
+  # after an opening parenthesis and after another sign or operator.
+  @spec drop_unary_plus(list(), list()) :: list()
+  @doc false
+  def drop_unary_plus([], acc), do: Enum.reverse(acc)
+  def drop_unary_plus([{:raw, "+"} | rest], []), do: drop_unary_plus(rest, [])
+
+  def drop_unary_plus([{:raw, "+"} | rest], [{:op, _op} | _more] = acc),
+    do: drop_unary_plus(rest, acc)
+
+  def drop_unary_plus([{:raw, "+"} | rest], [{:raw, prev} | _more] = acc)
+      when prev in ["(", "+", "-", "*", "/"],
+      do: drop_unary_plus(rest, acc)
+
+  def drop_unary_plus([token | rest], acc), do: drop_unary_plus(rest, [token | acc])
+
+  @spec token_sql(tuple()) :: binary()
+  defp token_sql({:ident, name}), do: ident_sql(name)
+  defp token_sql({:str, content}), do: "'" <> content <> "'"
+  defp token_sql({:regex, pattern}), do: "'" <> String.replace(pattern, "'", "''") <> "'"
+  defp token_sql({:op, op}), do: op
+  defp token_sql({:raw, text}), do: text
+  defp token_sql({:number, "." <> _fraction = text}), do: "0" <> text
+  defp token_sql({:number, text}), do: text
+  defp token_sql({:duration, ns, text}), do: duration_sql(ns, text)
+
+  # Words the SQL the double hands on reads as keywords, though InfluxQL
+  # takes them as names.
+  @sql_words ~w(not is like ilike between case when then else exists)
+
+  @spec ident_sql(binary()) :: binary()
+  @doc false
+  def ident_sql(name) do
+    if Regex.match?(~r/^[A-Za-z_]\w*$/, name) and String.downcase(name) not in @sql_words,
+      do: name,
+      else: ~s("#{name}")
+  end
+
+  # False for every row, in the SQL the caller's engine reads.
+  @spec always_false(binary()) :: binary()
+  defp always_false(name),
+    do: "(#{ident_sql(name)} IS NULL AND #{ident_sql(name)} IS NOT NULL)"
+end

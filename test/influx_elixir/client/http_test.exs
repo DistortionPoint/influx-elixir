@@ -3,6 +3,7 @@ defmodule InfluxElixir.Client.HTTPTest do
 
   alias InfluxElixir.Client.HTTP
   alias InfluxElixir.{StreamError, TestServer}
+  alias InfluxElixir.TestSupport.ClosedPort
 
   # ---------------------------------------------------------------------------
   # init_connection — :database resolution parity with Client.Local
@@ -174,7 +175,7 @@ defmodule InfluxElixir.Client.HTTPTest do
   # The stream must never swallow errors as "zero rows". Each error class is
   # raised as an InfluxElixir.StreamError when the stream is enumerated. These
   # tests use a real Finch pool (no mocking) — the transport case points at a
-  # closed port so the failure is a genuine connection error.
+  # closed port (`ClosedPort`) so the failure is a genuine connection error.
   # ---------------------------------------------------------------------------
 
   describe "query_sql_stream/3 — error surfacing" do
@@ -189,10 +190,10 @@ defmodule InfluxElixir.Client.HTTPTest do
     end
 
     test "raises :transport on a connection failure rather than yielding []" do
-      conn = connection(1, [])
+      conn = connection(ClosedPort.port(), [])
       stream = HTTP.query_sql_stream(conn, "SELECT 1")
 
-      # Port 1 is not listening — Finch will fail to connect.
+      # The port was closed — Finch will fail to connect.
       error = assert_raise StreamError, fn -> Enum.to_list(stream) end
 
       assert %StreamError{
@@ -241,7 +242,7 @@ defmodule InfluxElixir.Client.HTTPTest do
     end
 
     test "nil, an empty list, a keyword list, an empty map and a finite Decimal are all sent" do
-      conn = connection(1, [])
+      conn = connection(ClosedPort.port(), [])
 
       for params <- [nil, [], [p: 1], %{}, %{p: Decimal.new("1000.00")}] do
         assert HTTP.query_sql(conn, "select 1", params: params) === @closed, inspect(params)

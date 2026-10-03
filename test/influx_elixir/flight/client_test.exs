@@ -3,6 +3,7 @@ defmodule InfluxElixir.Flight.ClientTest do
 
   alias InfluxElixir.Flight.Client
   alias InfluxElixir.Flight.Proto.Ticket
+  alias InfluxElixir.TestSupport.ClosedPort
 
   describe "build_ticket_payload/2" do
     test "produces valid JSON with required fields" do
@@ -88,16 +89,19 @@ defmodule InfluxElixir.Flight.ClientTest do
       end
     end
 
-    test "returns {:error, _} when unable to connect (no server)" do
+    @tag :capture_log
+    test "returns {:error, :no_addresses} when nothing listens on the port" do
       conn = %{
         host: "127.0.0.1",
         token: "tok",
         database: "db",
-        port: 19_999
+        port: ClosedPort.port()
       }
 
-      result = Client.query(conn, "SELECT 1", tls: false, timeout: 1_000)
-      assert {:error, _reason} = result
+      # The bound is not under test here; it only has to outlast a refused
+      # connection on a loaded machine.
+      assert Client.query(conn, "SELECT 1", tls: false, timeout: 30_000) ===
+               {:error, :no_addresses}
     end
   end
 

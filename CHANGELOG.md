@@ -7,7 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`Client.Local` InfluxQL `GROUP BY time(every[, offset])` with `fill()`.**
+  Every bucket of the range is answered (buckets start at multiples of
+  `every` from the epoch, shifted by `offset`; the range is the `WHERE`
+  bounds, from the first point of the series to `now()` without them);
+  `fill(null)`, `none`, `previous`, `linear` (an integer truncated toward
+  zero) and a number cast to the column's type. `median`, `spread`, `stddev`
+  and `count(distinct(f))` are answered, and arithmetic in the select list
+  (`usage + 1`, `-n`, `sum(n) / count(n)`, `n::float`, `n::integer`), with the
+  engine's column names, types and planning errors. `fill()` without a
+  `GROUP BY`, `min`/`max` of strings and the engine's errors for `mean`,
+  `sum`, `median`, `spread` and `stddev` of a string field are answered.
+- Time comparisons: quoted times with an offset (`'… +0000'`, `+01:00`,
+  `UTC`), compound durations (`1h30m`), and `+`/`-` of quoted times,
+  durations, integers and `now()` (`time > '…Z' - 1h30m`, `now() - 1`,
+  sub-second durations).
+
+### Changed
+- **`Client.Local`'s internals are organised by area.** `Client.Local` is the
+  facade; the work is in modules under `client/local/` grouped as `sql/`,
+  `influxql/`, `line_protocol/`, `flux/`, `store/`, `write/`, `admin/` and
+  `shared/`. They are hidden from the HexDocs sidebar (`@moduledoc false`);
+  the published modules are grouped by role. Duration units, 64-bit limits
+  and column type names each have one definition, and the InfluxQL modules
+  have no runtime cycles.
+- **Test support.** One `InfluxElixir.TestServer` (a black-hole and a
+  test-answered listener) and shared helpers for polling, telemetry and
+  token shapes replace copies in several test files; tests that wrote
+  untimed points now write timestamps and compare whole rows.
+- **Test suite layout.** Each contract runs as per-part async modules
+  (`test/influx_elixir/client/contract_local/<profile>/`,
+  `test/integration/contract_<profile>/`): `mix test` takes 8-10 s instead
+  of 27-41 s. The integration one-liners start Core with
+  `--wal-flush-interval 10ms`, since a write is answered when the WAL
+  flushes: the Core suite takes 18 s instead of 8½ minutes.
+
 ### Fixed
+- **The Hex package carried the wrong files.** `files:` sat outside
+  `package()` in `mix.exs`, so Hex used its default list: 0.1.40 and earlier
+  shipped `priv/plts/dialyzer.plt` and `.formatter.exs` and left out
+  `usage-rules.md` and `usage-rules/`. The package now holds `lib/`, the
+  README, LICENSE, CHANGELOG and the usage rules.
+- **`Client.Local` InfluxQL refused `OR` with an unsigned field** (`u > 5 OR
+  i < 0`, `h = 'c' OR u > 5`); the engine answers it. The comparisons that
+  need the engine's unsigned rules are now a column of the point that the SQL
+  reads, so `AND`, `OR` and parentheses combine them.
+- **`Client.Local` InfluxQL regular expressions on string fields matched
+  nothing.** `msg =~ /m/` and `msg !~ /m0/` now match string values; a
+  backslash before a letter other than `d w s D S W p P x` is dropped, as the
+  engine does (`\b` is `b`), and `\\/` no longer ends a regular expression.
 - **0.1.40 shipped a stray script, `lib/influx_elixir/client/local/tmp_edit.exs`,
   in the package.** It is removed. It was never compiled or loaded.
 - **`Client.Local` queries were 30-100% slower in 0.1.40 than in 0.1.39**
@@ -26,8 +75,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A decimal compared with a float past `1e20` is the optimizer's
     `Decimal128` error; an integer literal past `UInt64` compares as a
     double.
-  - `AND`/`OR` whose right operand would fail for a row the left one leaves
-    out is refused by name: the engine evaluates it over a batch of rows.
+  - `AND`/`OR` whose right operand fails for a row the left one leaves out:
+    the engine's outcome depends on how the table is stored (a fresh write
+    runs the operand over the whole batch unless the left side keeps under a
+    fifth of it; a persisted table runs the cheaper columns' conjuncts
+    first), so the double answers only what is the same in both (a tag
+    conjunct that leaves the failing rows out, in either order; a guard that
+    keeps no row; a row that reaches the failure) and refuses the rest by
+    name. A refusal of the double or a NaN in an operand a row does not
+    reach is no failure: `total > 0 AND used / total > 0.5` answers.
+  - Unsigned arithmetic, and an integer column's with a float constant, is
+    not in the interval analysis (`u + 1 > 5 AND u < 3` is `[]`);
+    `i / 0 = 1 AND i > 0` is the division's interval error and
+    `i / 0 = 1 AND i < 5` closes the connection.
+  - A literal on the left of `IS NULL`, `BETWEEN`, `IN`, `LIKE` is that
+    constant; `(n + 1) > 5` and `(n) IS NULL` parse; `(SELECT ...)` is the
+    query; statement parser errors print the engine's token (`X'1f'` for
+    `0x1f`, `B'1'`, `1e5`, `@@x`) and a bare `UPDATE` or `GRANT` is
+    `Expected: ..., found: EOF`.
 - **Smaller `Client.Local` SQL fixes:** `ORDER BY a + 1` reads the output
   name `a`; `trunc(x, n)` wraps `n` to Int32 and `round(x, n)` past Int32
   closes the connection, as on the engine; `FOO bar` is the parser's
@@ -45,22 +110,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     expression and reserved words after `+`/`-` get the engine's positioned
     parse errors, after a `;` and in `SHOW TAG VALUES` too.
   - Two tags compared (`k = x`) are false for every row.
-
-### Changed
-- **`Client.Local`'s InfluxQL and line-protocol modules are split.**
-  `influxql.ex` and `line_protocol_parser.ex` are entry points over modules
-  by seam (parser, checks, `WHERE` planning, typed comparisons, rows,
-  errors; scanner, grammars, numbers, times, escapes, errors).
-- **Test support.** One `InfluxElixir.TestServer` (a black-hole and a
-  test-answered listener) and shared helpers for polling, telemetry and
-  token shapes replace copies in several test files; tests that wrote
-  untimed points now write timestamps and compare whole rows.
-- **Test suite layout.** Each contract runs as per-part async modules
-  (`test/influx_elixir/client/contract_local/<profile>/`,
-  `test/integration/contract_<profile>/`): `mix test` takes 8-10 s instead
-  of 27-41 s. The integration one-liners start Core with
-  `--wal-flush-interval 10ms`, since a write is answered when the WAL
-  flushes: the Core suite takes 18 s instead of 8½ minutes.
 
 ## [0.1.40] - 2026-10-02
 
@@ -744,7 +793,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries `:databases`, a snapshot taken at start that went stale on
   every create and delete. Use `list_databases/1`.
 - **`Client.Local`'s ETS storage is its own module,
-  `InfluxElixir.Client.Local.Store`.** The key layout, the atomic
+  `Client.Local.Store`.** The key layout, the atomic
   insert rules, the duplicate-merge fast path and the deletion bookkeeping
   were spread through `local.ex` as raw `:ets` patterns (40 call sites);
   they now live in one 300-line module with a small API, and `local.ex`
@@ -1224,7 +1273,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **SQL execution split out of `Client.Local`.** The 900-line executor —
   CTEs, joins, the `WHERE` evaluator, aggregates, casts, ordering, schema
-  checks — is `InfluxElixir.Client.Local.SQLExecutor`, pure over the points
+  checks — is `Client.Local.SQLExecutor`, pure over the points
   it is handed through a fetch function; `Client.Local` keeps storage,
   profiles and the InfluxQL and Flux paths. Public behaviour is unchanged.
 - `Client.Local` checks a query's column references against the first
@@ -1379,8 +1428,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observable flush instead.
 - **`Client.Local` split into three modules.** The 2,470-line module now owns
   storage, capability checks and query execution (1,450 lines); the SQL parser
-  is `InfluxElixir.Client.Local.SQLParser` and the line-protocol parser is
-  `InfluxElixir.Client.Local.LineProtocolParser`, both pure. Public behaviour
+  is `Client.Local.SQLParser` and the line-protocol parser is
+  `Client.Local.LineProtocolParser`, both pure. Public behaviour
   is unchanged; the contract suites prove it.
 - `Client.Local.query_influxql/3` matches each `SHOW` pattern once.
 - Removed the unused internal `InfluxElixir.InfluxCase` case template from

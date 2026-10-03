@@ -65,7 +65,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
                {:ok, [%{"name" => "_internal"}, %{"name" => "target_db"}]}
     end
 
-    test "starts with empty buffer and zeroed stats", %{conn: conn} do
+    test "a new writer reports zeroed stats", %{conn: conn} do
       pid = start_writer(conn)
       assert BatchWriter.stats(pid) === stats(0, 0, 0)
     end
@@ -229,7 +229,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
   describe "timer-based flush" do
     for jitter_ms <- [0, 20] do
-      test "automatically flushes after flush_interval_ms with jitter_ms: #{jitter_ms}",
+      test "the timer flushes the buffer by itself (jitter_ms: #{jitter_ms})",
            %{conn: conn} do
         pid = start_writer(conn, flush_interval_ms: 10, jitter_ms: unquote(jitter_ms))
         :ok = BatchWriter.write(pid, line(1.0, 1))
@@ -247,15 +247,19 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     # handler re-armed it, so after a size-triggered flush the interval flush
     # never fired again and the next write stayed buffered.
     test "the timer keeps flushing after a size-triggered flush", %{conn: conn} do
-      pid = start_writer(conn, batch_size: 2, flush_interval_ms: 50)
+      # The interval is far longer than the test: the timer message is sent
+      # by hand, where the real one would fire, so no clock decides the order.
+      pid = start_writer(conn, batch_size: 2, flush_interval_ms: 600_000)
       first = line(1.0, 1) <> "\n" <> line(2.0, 2)
 
       :ok = BatchWriter.write(pid, line(1.0, 1))
       :ok = BatchWriter.write(pid, line(2.0, 2))
       assert BatchWriter.stats(pid) === stats(1, 0, byte_size(first))
+      assert is_integer(:erlang.read_timer(timer_ref(pid)))
 
       :ok = BatchWriter.write(pid, line(3.0, 3))
-      await_writes(pid, 2)
+      send(pid, :flush)
+      assert BatchWriter.stats(pid) === stats(2, 0, byte_size(first) + byte_size(line(3.0, 3)))
 
       assert BatchWriter.stats(pid) === stats(2, 0, byte_size(first) + byte_size(line(3.0, 3)))
       assert stored(conn, "cpu") === [row(1.0, 1), row(2.0, 2), row(3.0, 3)]
@@ -283,6 +287,191 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       await_writes(pid, 2)
 
       assert BatchWriter.stats(pid) === stats(2, 0, byte_size(line(1.0, 1) <> line(2.0, 2)))
+    end
+  end
+
+  # The writer's pending flush timer, from its state.
+  defp timer_ref(pid), do: :sys.get_state(pid).timer_ref
+
+  # Every flush restarts the interval (the moduledoc's promise): the pending
+  # timer is cancelled and a new one runs. Intervals here are far longer than
+  # the test, so no timer fires and no clock is read.
+  defp assert_restarts_timer(pid, trigger) do
+    before = timer_ref(pid)
+    assert is_integer(:erlang.read_timer(before))
+
+    trigger.()
+
+    pending = timer_ref(pid)
+    assert is_reference(pending)
+    assert pending != before
+    assert :erlang.read_timer(before) === false
+    assert is_integer(:erlang.read_timer(pending))
+  end
+
+  describe "the flush interval restarts on every flush" do
+    test "after a size-triggered flush", %{conn: conn} do
+      pid = start_writer(conn, batch_size: 2, flush_interval_ms: 600_000)
+      :ok = BatchWriter.write(pid, line(1.0, 1))
+
+      assert_restarts_timer(pid, fn -> :ok = BatchWriter.write(pid, line(2.0, 2)) end)
+      assert stored(conn, "cpu") === [row(1.0, 1), row(2.0, 2)]
+    end
+
+    test "after an explicit flush/2", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 600_000)
+      :ok = BatchWriter.write(pid, line(1.0, 1))
+
+      assert_restarts_timer(pid, fn -> :ok = BatchWriter.flush(pid) end)
+      assert stored(conn, "cpu") === [row(1.0, 1)]
+    end
+
+    test "after a write_sync/3", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 600_000)
+
+      assert_restarts_timer(pid, fn -> :ok = BatchWriter.write_sync(pid, line(1.0, 1)) end)
+      assert stored(conn, "cpu") === [row(1.0, 1)]
+    end
+
+    test "after the timer's own flush", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 600_000)
+      :ok = BatchWriter.write(pid, line(1.0, 1))
+
+      assert_restarts_timer(pid, fn ->
+        send(pid, :flush)
+        assert BatchWriter.stats(pid) === stats(1, 0, byte_size(line(1.0, 1)))
+      end)
+    end
+  end
+
+  # Every timer the writer sets goes through `:erlang.send_after`, whose delay
+  # is the one thing that tells jitter (or a backoff base) from its absence,
+  # and it is random or buried in a timer wheel. Call tracing the writer
+  # hands the test each call's arguments as a message, so the delays are
+  # read exactly and no clock is involved. The trace pattern is set once and
+  # only the writer under test is traced.
+  defp trace_timers(pid) do
+    :erlang.trace_pattern({:erlang, :send_after, :_}, true, [:global])
+    1 = :erlang.trace(pid, true, [:call])
+    :ok
+  end
+
+  defp next_flush_delay(pid) do
+    receive do
+      {:trace, ^pid, :call, {:erlang, :send_after, [delay, _dest, :flush | _opts]}} -> delay
+    after
+      5_000 -> flunk("the writer set no flush timer")
+    end
+  end
+
+  defp next_retry_delay(pid) do
+    receive do
+      {:trace, ^pid, :call,
+       {:erlang, :send_after, [delay, _dest, {:retry, _chain, _attempt} | _opts]}} ->
+        delay
+    after
+      5_000 -> flunk("the writer set no retry timer")
+    end
+  end
+
+  describe "jitter_ms on the flush timer" do
+    test "adds 1..jitter_ms to every interval", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 600_000, jitter_ms: 20)
+      :ok = trace_timers(pid)
+
+      delays =
+        for i <- 1..30 do
+          :ok = BatchWriter.write(pid, line(i, i))
+          :ok = BatchWriter.flush(pid)
+          next_flush_delay(pid)
+        end
+
+      assert Enum.all?(delays, &(&1 in 600_001..600_020))
+      # 30 draws from 20 values are all equal with probability 20^-29.
+      assert length(Enum.uniq(delays)) > 1
+    end
+
+    test "is nothing without jitter_ms", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 600_000, jitter_ms: 0)
+      :ok = trace_timers(pid)
+
+      :ok = BatchWriter.write(pid, line(1.0, 1))
+      :ok = BatchWriter.flush(pid)
+
+      assert next_flush_delay(pid) === 600_000
+    end
+  end
+
+  describe "retry timers" do
+    setup do
+      finch = :"bw_timer_finch_#{System.unique_integer([:positive])}"
+      start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
+      {:ok, finch: finch}
+    end
+
+    test "base_retry_delay_ms sets the first retry's delay to base * 2", %{finch: finch} do
+      pid =
+        start_http_writer(finch, TestServer.controlled(owner: answering_owner(503)),
+          batch_size: 1,
+          max_retries: 2,
+          base_retry_delay_ms: 7_000
+        )
+
+      :ok = trace_timers(pid)
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
+
+      assert next_retry_delay(pid) === 14_000
+      :ok = stop_supervised!(BatchWriter)
+    end
+
+    test "jitter_ms adds 1..jitter_ms to a retry's delay", %{finch: finch} do
+      pid =
+        start_http_writer(finch, TestServer.controlled(owner: answering_owner(503)),
+          batch_size: 100,
+          max_retries: 2,
+          base_retry_delay_ms: 7_000,
+          jitter_ms: 20
+        )
+
+      :ok = trace_timers(pid)
+
+      # Each flush starts a chain whose first attempt fails at once; its retry is
+      # 14_000 away.
+      delays =
+        for i <- 1..30 do
+          :ok = BatchWriter.write(pid, "cpu value=#{i}.0")
+          :ok = BatchWriter.flush(pid)
+          next_retry_delay(pid)
+        end
+
+      assert Enum.all?(delays, &(&1 in 14_001..14_020))
+      assert length(Enum.uniq(delays)) > 1
+      :ok = stop_supervised!(BatchWriter)
+    end
+  end
+
+  describe "unexpected messages" do
+    test "a stray message and a linked process's exit leave the writer and buffer intact",
+         %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 600_000)
+      :ok = BatchWriter.write(pid, line(1.0, 1))
+
+      send(pid, :stray)
+      send(pid, {:EXIT, self(), :boom})
+
+      # The writer traps exits, so a linked process ending is a message.
+      {linked, monitor} =
+        spawn_monitor(fn ->
+          Process.link(pid)
+          Process.exit(self(), :kill)
+        end)
+
+      assert_receive {:DOWN, ^monitor, :process, ^linked, :killed}, 5_000
+
+      assert BatchWriter.stats(pid) === stats(0, 0, 0)
+      assert Process.alive?(pid)
+      :ok = BatchWriter.flush(pid)
+      assert stored(conn, "cpu") === [row(1.0, 1)]
     end
   end
 

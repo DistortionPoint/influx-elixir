@@ -15,7 +15,8 @@ defmodule InfluxElixir.ContractServer do
 
   The context holds `conn`, `database`, `query_delay: 0` (InfluxDB 3 Core and
   2.7 answer a query with every write they acknowledged before it; 200
-  write-then-read pairs on each found none missing) and `time_slack: 60`
+  write-then-read pairs on each found none missing; verified on Core and 2.7,
+  not on Enterprise) and `time_slack: 60`
   (how far, in seconds, the server's clock may be from this one).
 
   Option: `:profile` (required).
@@ -87,11 +88,23 @@ defmodule InfluxElixir.ContractServer do
 
     case HTTP.create_database(base_conn, db) do
       :ok ->
-        ExUnit.Callbacks.on_exit(fn -> HTTP.delete_database(base_conn, db) end)
+        ExUnit.Callbacks.on_exit(fn -> delete_database(base_conn, db) end)
         {:ok, conn: base_conn, database: db, query_delay: 0, time_slack: 60}
 
       {:error, reason} ->
         ExUnit.Assertions.flunk("Failed to create test database: #{inspect(reason)}")
+    end
+  end
+
+  # A database that is not deleted leaks towards Core's limit of 5 databases and
+  # fails a later test far from the cause, so a failed delete fails this one.
+  defp delete_database(base_conn, db) do
+    case HTTP.delete_database(base_conn, db) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        ExUnit.Assertions.flunk("Failed to delete test database #{db}: #{inspect(reason)}")
     end
   end
 

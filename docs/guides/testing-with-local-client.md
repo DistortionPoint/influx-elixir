@@ -891,9 +891,15 @@ measurement, key and value, plus a row without `"value"` when a point
 lacks the key. Only the last 24 hours count unless the `WHERE` bounds
 `time`, as on the engine.
 
-`GROUP BY time(...)`, `fill()`, `INTO`, subqueries, arithmetic in the
-select list, several measurements in `FROM`, sub-second durations, and
-`LIMIT` / `OFFSET` on `SHOW TAG VALUES` are refused by name.
+`GROUP BY time(every[, offset])` with `fill(null | none | previous |
+linear | n)` answers every bucket of its range as the engine does (from the
+first point to `now()` without time bounds); `median`, `spread`, `stddev`,
+`count(distinct(f))` and arithmetic in the select list (`usage + 1`,
+`sum(n) / count(n)`, `n::float`) are answered; `now()` and durations
+fold with quoted times in a `time` comparison. `INTO`, subqueries, several
+measurements in `FROM`, `fill(linear)` with a `count`, the values of
+`distinct(f)` and `LIMIT` / `OFFSET` on `SHOW TAG VALUES` are refused by
+name.
 
 ## Running Against a Real InfluxDB
 
@@ -965,7 +971,7 @@ decompresses then and only then, and a body that does not decompress is
 the engine's `error decoding gzip stream: ...` (InfluxDB 2: its 500). On
 the v3 profiles a body that is not UTF-8 is the engine's 400
 `body content is not valid utf8: ...`; the v2 profile stores the bytes as
-they are. See `InfluxElixir.Client.Local.Body`.
+they are.
 
 A write is applied line by line, as on InfluxDB 3. A line with a syntax error,
 or a column whose kind conflicts with the measurement's schema, is dropped and
@@ -1066,7 +1072,7 @@ nothing is stored; `time` as a field is dropped silently, as a tag it is a
   `selector_first|last|min|max`, `first_value` / `last_value` with an inner
   `ORDER BY`) with optional `GROUP BY DATE_BIN` or `GROUP BY <columns>`.
   Anything else is rejected with a `Client.Local:` prefixed 400 — see
-  `InfluxElixir.Client.Local.SQLParser` and `check_sql/1` above.
+  `check_sql/1` above.
 - **`format: :parquet`**: refused with a `Client.Local:` 400 — the double
   holds no Parquet writer. `format: :csv` is modelled: values come back as
   the engine's CSV strings (`"1.5"`, `"1e16"`, `"true"`), empty cells

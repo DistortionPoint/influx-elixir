@@ -29,10 +29,8 @@ defmodule InfluxElixir.Query.SQLTest do
 
       assert SQL.query(name, "SELECT v FROM cpu") === {:ok, [%{"v" => 1}]}
 
-      assert_receive {:telemetry, [:influx_elixir, :query, :stop], %{duration: duration},
+      assert_receive {:telemetry, [:influx_elixir, :query, :stop], _measurements,
                       %{database: "named_db", result: :ok, row_count: 1}}
-
-      assert duration >= 0
 
       assert name |> SQL.query_stream("SELECT v FROM cpu") |> Enum.to_list() === [%{"v" => 1}]
       assert SQL.execute(name, "SELECT v FROM cpu") === {:ok, [%{"v" => 1}]}

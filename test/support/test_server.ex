@@ -92,22 +92,38 @@ defmodule InfluxElixir.TestServer do
     end
   end
 
+  # A client that closes before it has sent a whole request (a probe, a
+  # timed-out request) is dropped; the listener keeps serving the next one.
   @spec serve_requests(port(), pid()) :: no_return()
   defp serve_requests(listener, owner) do
     {:ok, socket} = :gen_tcp.accept(listener)
-    {:ok, {:http_request, _method, _path, _version}} = :gen_tcp.recv(socket, 0)
 
-    length =
-      socket |> request_headers(%{}) |> Map.get("content-length", "0") |> String.to_integer()
+    case read_request(socket) do
+      {:ok, body} -> respond(socket, owner, body)
+      {:error, _closed} -> :ok = :gen_tcp.close(socket)
+    end
 
-    :ok = :inet.setopts(socket, packet: :raw)
-    {:ok, body} = if length == 0, do: {:ok, ""}, else: :gen_tcp.recv(socket, length)
+    serve_requests(listener, owner)
+  end
 
+  @spec read_request(port()) :: {:ok, binary()} | {:error, term()}
+  defp read_request(socket) do
+    with {:ok, {:http_request, _method, _path, _version}} <- :gen_tcp.recv(socket, 0),
+         {:ok, headers} <- request_headers(socket, %{}) do
+      length = headers |> Map.get("content-length", "0") |> String.to_integer()
+      :ok = :inet.setopts(socket, packet: :raw)
+      if length == 0, do: {:ok, ""}, else: :gen_tcp.recv(socket, length)
+    end
+  end
+
+  @spec respond(port(), pid(), binary()) :: :ok
+  defp respond(socket, owner, body) do
     send(owner, {:request, self(), body})
 
     receive do
       {:respond, status} ->
-        :ok =
+        # The client may have gone while the test decided; nothing to answer then.
+        _sent =
           :gen_tcp.send(
             socket,
             "HTTP/1.1 #{status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
@@ -115,18 +131,20 @@ defmodule InfluxElixir.TestServer do
 
         :ok = :gen_tcp.close(socket)
     end
-
-    serve_requests(listener, owner)
   end
 
-  @spec request_headers(port(), %{String.t() => String.t()}) :: %{String.t() => String.t()}
+  @spec request_headers(port(), %{String.t() => String.t()}) ::
+          {:ok, %{String.t() => String.t()}} | {:error, term()}
   defp request_headers(socket, acc) do
     case :gen_tcp.recv(socket, 0) do
       {:ok, {:http_header, _position, name, _reserved, value}} ->
         request_headers(socket, Map.put(acc, name |> to_string() |> String.downcase(), value))
 
       {:ok, :http_eoh} ->
-        acc
+        {:ok, acc}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 end

@@ -20,6 +20,7 @@ defmodule InfluxElixir.SupervisorTest do
   end
 
   describe "crash isolation" do
+    @tag :capture_log
     test "a crash inside one connection's tree is contained to that connection" do
       name_a = unique_name(:isolation_a)
       name_b = unique_name(:isolation_b)
@@ -50,7 +51,7 @@ defmodule InfluxElixir.SupervisorTest do
 
       ref = Process.monitor(writer_a)
       Process.exit(writer_a, :kill)
-      assert_receive {:DOWN, ^ref, :process, ^writer_a, :killed}
+      assert_receive {:DOWN, ^ref, :process, ^writer_a, :killed}, 5_000
 
       # Only the crashed child is replaced; its own supervisor and pool stay.
       new_writer_a = await_restart(ConnectionSupervisor.batch_writer_name(name_a), writer_a)
@@ -71,6 +72,13 @@ defmodule InfluxElixir.SupervisorTest do
     # A killed connection supervisor leaves its children stopping, still
     # holding their names; the restart used to fail with :already_started
     # until the top-level supervisor gave up and took every connection down.
+    #
+    # This kills a ConnectionSupervisor of the global application supervisor,
+    # which counts against that supervisor's restart intensity (default 3
+    # restarts in 5 s). Keep this the only test that kills one: a second such
+    # test, running concurrently, could exceed the intensity and take down every
+    # connection of every other test.
+    @tag :capture_log
     test "a killed connection supervisor restarts alone, the others untouched" do
       name_a = unique_name(:killed_a)
       name_b = unique_name(:killed_b)
@@ -90,7 +98,7 @@ defmodule InfluxElixir.SupervisorTest do
 
       sup_ref = Process.monitor(sup_a)
       Process.exit(sup_a, :kill)
-      assert_receive {:DOWN, ^sup_ref, :process, ^sup_a, :killed}
+      assert_receive {:DOWN, ^sup_ref, :process, ^sup_a, :killed}, 5_000
 
       new_sup_a = await_restart(ConnectionSupervisor.via(name_a), sup_a)
       # The name is registered before init/1 returns; a call waits for it.

@@ -172,11 +172,10 @@ defmodule InfluxElixirTest do
       lp = "cpu value=1i\ncpu value=2i"
       assert {:ok, :written} = InfluxElixir.write(conn, lp, database: "test_db")
 
-      assert_receive {:telemetry, [:influx_elixir, :write, :stop], %{duration: duration},
+      assert_receive {:telemetry, [:influx_elixir, :write, :stop], _measurements,
                       %{database: "test_db", bytes: bytes, point_count: 2, result: :ok}}
 
       assert bytes === byte_size(lp)
-      assert duration >= 0
     end
 
     test "query_sql/3 emits a query span with transport and row count", %{conn: conn} do

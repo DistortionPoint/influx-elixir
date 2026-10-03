@@ -86,6 +86,7 @@ defmodule InfluxElixir.Contract.SQLParser do
     [
       {:literals_time, literal_tests()},
       {:literals_time, constant_tests()},
+      {:literals_time, operand_tests()},
       {:literals_time, time_number_tests()},
       {:literals_time, time_string_tests()},
       {:literals_time, time_error_tests()},
@@ -114,7 +115,8 @@ defmodule InfluxElixir.Contract.SQLParser do
       {:parameters, parameter_tests()},
       {:parameters, parameter_kind_tests()},
       {:parameters, parameter_type_tests()},
-      {:parameters, request_param_tests()}
+      {:parameters, request_param_tests()},
+      {:parameters, request_column_tests()}
     ]
   end
 
@@ -150,19 +152,22 @@ defmodule InfluxElixir.Contract.SQLParser do
       @sp_closed {:error, {:connection_error, %Mint.TransportError{reason: :closed}}}
       @sp_nosuch "Schema error: No field named nosuch."
 
-      # The byte of the request body `Client.HTTP` sends at which the text of the
-      # parameters up to `problem` ends, and whether `problem` is the last one.
-      def sp_params_read(ctx, sql, params, problem, format) do
+      # The byte of the request body at which the text of the parameters up to
+      # `problem` ends, and whether `problem` is the last one. The head of the
+      # body is written out here, not asked of the client's own body builder:
+      # the keys of the body are sorted, so `db`, `format` and `params` come
+      # before the query, and a statement run with `execute_sql` has no `format`.
+      def sp_params_read(ctx, params, problem, format) do
         {:ok, normalized} = InfluxElixir.Client.QueryParams.normalize(params)
 
-        body =
-          InfluxElixir.Client.QueryParams.request_body(ctx.database, sql, normalized, format)
+        head =
+          ~s({"db":"#{ctx.database}",) <>
+            if(format, do: ~s("format":"#{format}",), else: "") <> ~s("params":{)
 
         keys = normalized |> Map.keys() |> Enum.sort()
         kept = Enum.take_while(keys, &(&1 <= problem))
         text = normalized |> Map.take(kept) |> Jason.encode!()
-        {at, length} = :binary.match(body, binary_part(text, 1, byte_size(text) - 2))
-        {at + length, problem === List.last(keys)}
+        {byte_size(head) + byte_size(text) - 2, problem === List.last(keys)}
       end
     end
   end
@@ -288,6 +293,143 @@ defmodule InfluxElixir.Contract.SQLParser do
 
           assert {:ok, [%{"s" => "Éa"}]} =
                    sp_query(ctx, "SELECT s FROM #{m} WHERE s ILIKE 'éa'")
+        end
+      end
+    end
+  end
+
+  defp operand_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: a literal or a parenthesised operand" do
+        test "a literal on the left of a predicate is that constant for every row", ctx do
+          m = sp_fixture(ctx)
+          all = {:ok, [%{"v" => 1}, %{"v" => 2}, %{"v" => 3}]}
+
+          # Why this list: each predicate (`IS NULL`, `BETWEEN`, `IN`, `LIKE`, a match) with a
+          # number, a string, a boolean and NULL on its left, that holds for every row.
+          for where <- [
+                "1 IS NOT NULL",
+                "'a' IS NOT NULL",
+                "NULL IS NULL",
+                "1 BETWEEN 0 AND 5",
+                "1 NOT BETWEEN 5 AND 9",
+                "1.5 BETWEEN 1 AND 2",
+                "1 + 1 BETWEEN 1 AND 3",
+                "'a' BETWEEN 'a' AND 'z'",
+                "1 IN (1, 2)",
+                "1 NOT IN (2, 3)",
+                "'a' IN ('a', 'b')",
+                "'a' NOT IN ('b')",
+                "true IN (true)",
+                "'a' LIKE 'a%'",
+                "'abc' ILIKE 'A%'",
+                "'x' ~ 'x'",
+                "1 IS NULL OR v > 0",
+                "1 IS NOT NULL AND v > 0",
+                "v > 0 AND 1 IS NOT NULL"
+              ] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY v") === all, where
+          end
+
+          for where <- [
+                "1 IS NULL",
+                "'a' IS NULL",
+                "true IS NULL",
+                "-1 IS NULL",
+                "1 + 1 IS NULL",
+                "1 BETWEEN NULL AND 5",
+                "1 NOT BETWEEN 0 AND 5",
+                "NULL BETWEEN 1 AND 2",
+                "NULL IN (1, 2)",
+                "NULL NOT IN (1, 2)",
+                "true IN (false, NULL)",
+                "1 BETWEEN 'a' AND 'b'",
+                "'x' !~ 'x'",
+                "1 IS NULL AND v > 0"
+              ] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY v") === {:ok, []},
+                   where
+          end
+        end
+
+        test "a literal beside a column in a set or a range is compared with it", ctx do
+          m = sp_fixture(ctx)
+
+          for {where, rows} <- [{"1 IN (v, 2)", [1]}, {"1 BETWEEN v AND 5", [1]}] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY v") ===
+                     {:ok, Enum.map(rows, &%{"v" => &1})},
+                   where
+          end
+
+          assert sp_query(ctx, "SELECT v FROM #{m} WHERE 1 LIKE 'a'") ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body:
+                        sp_coercion(
+                          "There isn't a common type to coerce Int64 and Utf8 in LIKE expression"
+                        )
+                    }}
+        end
+
+        test "an operand in parentheses is the operand, not a group of conditions", ctx do
+          m = sp_fixture(ctx)
+
+          # Why this list: a parenthesised column or sum before each predicate (a comparison,
+          # `IS NULL`, `BETWEEN`, `IN`), in groups and beside `OR` and `AND`, and a
+          # parenthesised literal.
+          for {where, rows} <- [
+                {"(v + 1) > 2", [2, 3]},
+                {"(v) > 1", [2, 3]},
+                {"(v) IS NULL", []},
+                {"(v + 1) BETWEEN 2 AND 3", [1, 2]},
+                {"(v) IN (1, 2)", [1, 2]},
+                {"((v) > 1)", [2, 3]},
+                {"(v > 1) AND (v < 3)", [2]},
+                {"((v + 1) > 2) OR v = 1", [1, 2, 3]},
+                {"(1) IS NULL", []},
+                {"(1 + 1) IS NULL", []}
+              ] do
+            assert sp_query(ctx, "SELECT v FROM #{m} WHERE #{where} ORDER BY v") ===
+                     {:ok, Enum.map(rows, &%{"v" => &1})},
+                   where
+          end
+        end
+
+        test "a query in parentheses, or after empty statements, is the query", ctx do
+          m = sp_fixture(ctx)
+          select = "SELECT v FROM #{m} ORDER BY v"
+          all = {:ok, [%{"v" => 1}, %{"v" => 2}, %{"v" => 3}]}
+
+          for text <- [
+                "(#{select})",
+                "((#{select}))",
+                " ( #{select} ) ",
+                "(#{select});",
+                "; #{select}",
+                ";;#{select};;"
+              ] do
+            assert sp_query(ctx, text) === all, text
+          end
+        end
+
+        @tag local_divergence: "Local refuses what orders or cuts a parenthesised query by name"
+        test "a parenthesised query ordered or cut after its parentheses", ctx do
+          m = sp_fixture(ctx)
+          text = "(SELECT v FROM #{m}) ORDER BY v DESC LIMIT 2"
+
+          if sp_local?() do
+            assert sp_query(ctx, text) ===
+                     {:error,
+                      %{
+                        status: 400,
+                        body:
+                          "Client.Local: a parenthesized query followed by ORDER BY, LIMIT or " <>
+                            "OFFSET: " <> text
+                      }}
+          else
+            assert sp_query(ctx, text) === {:ok, [%{"v" => 3}, %{"v" => 2}]}
+          end
         end
       end
     end
@@ -3278,7 +3420,7 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {%{p: %{a: %{b: [1]}}}, object},
                 {%{p: [1, %{a: 2}]}, array}
               ] do
-            {read, true} = sp_params_read(ctx, sql, params, "p", "json")
+            {read, true} = sp_params_read(ctx, params, "p", "json")
 
             assert sp_query(ctx, sql, params) ===
                      {:error, %{status: 400, body: text <> Integer.to_string(read + 1)}},
@@ -3287,10 +3429,59 @@ defmodule InfluxElixir.Contract.SQLParser do
 
           # Another parameter follows, so its comma is not read.
           params = %{a: 1, p: [1, 2], z: 1}
-          {read, false} = sp_params_read(ctx, sql, params, "p", "json")
+          {read, false} = sp_params_read(ctx, params, "p", "json")
 
           assert sp_query(ctx, sql, params) ===
                    {:error, %{status: 400, body: array <> Integer.to_string(read)}}
+        end
+      end
+    end
+  end
+
+  defp request_column_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: where a request parameter's error is reported" do
+        # The positions are counted by hand from the bodies, read from Core: the
+        # database's name is the only part of the body before the parameters that
+        # varies, and the rest of the head is `{"db":"` + `","format":"json","params":{`
+        # (35 bytes with the name, 19 without the format).
+        test "the column an error is reported at, pinned for fixed bodies", ctx do
+          db = byte_size(ctx.database)
+          sql = "select 1 where 1 = $p"
+
+          # {"db":"<db>","format":"json","params":{"p":{"a":1}},"q":...}: the
+          # object's closing brace is the byte after the 11 of `"p":{"a":1}`.
+          assert sp_query(ctx, sql, %{p: %{a: 1}}) ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body:
+                        "serde json error: JSON objects are not supported as query " <>
+                          "parameters. Expected null, boolean, number, or string " <>
+                          "at line 1 column #{db + 47}"
+                    }}
+
+          # `z` follows the array, so the comma after it is not read: 15 bytes of
+          # `"a":1,"p":[1,2]`, with and without the `format` (statement).
+          array =
+            "serde json error: JSON arrays are not supported as query parameters. " <>
+              "Expected null, boolean, number, or string. at line 1 column "
+
+          params = %{a: 1, p: [1, 2], z: 1}
+
+          assert sp_query(ctx, sql, params) ===
+                   {:error, %{status: 400, body: array <> Integer.to_string(db + 50)}}
+
+          assert sp_execute(ctx, sql, params) ===
+                   {:error, %{status: 400, body: array <> Integer.to_string(db + 34)}}
+
+          # 401 digits after `"p":` (4 bytes) are all read.
+          assert sp_query(ctx, sql, %{p: Integer.pow(10, 400)}) ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body: "serde json error: number out of range at line 1 column #{db + 440}"
+                    }}
         end
 
         test "a number the engine's JSON parser cannot read stops it where the number ends",
@@ -3320,13 +3511,13 @@ defmodule InfluxElixir.Contract.SQLParser do
                 %{a: 1, p: big, z: "x"},
                 %{a: 1.5, p: big, z: big}
               ] do
-            {read, _last} = sp_params_read(ctx, sql, params, "p", "json")
+            {read, _last} = sp_params_read(ctx, params, "p", "json")
             assert sp_query(ctx, sql, params) === out_of_range.(read), inspect(params)
           end
 
           # A statement run with `execute_sql` carries no `format` in its body.
           params = %{a: 1, p: big}
-          {read, _last} = sp_params_read(ctx, sql, params, "p", nil)
+          {read, _last} = sp_params_read(ctx, params, "p", nil)
           assert sp_execute(ctx, sql, params) === out_of_range.(read)
 
           # serde_json multiplies the digits it keeps by a power of ten, so

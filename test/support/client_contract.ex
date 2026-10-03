@@ -57,10 +57,11 @@ defmodule InfluxElixir.ClientContract do
     * `:sql_query` — SQL queries, aggregates, CTEs, filters, joins, casts
     * `:sql_semantics` — OFFSET, DISTINCT, parameters, literals, NULLs, references
     * `:influxql_scalar` — InfluxQL, scalar functions, query formats
-    * `:v2` — buckets, v2 write rules and Flux (`:v2` profile only)
+    * `:v2_write` — buckets, v2 write rules, bodies, precision, duplicates (`:v2` profile only)
+    * `:v2_flux` — the Flux pipeline and queries (`:v2` profile only)
   """
 
-  @parts [:write_admin, :sql_query, :sql_semantics, :influxql_scalar, :v2]
+  @parts [:write_admin, :sql_query, :sql_semantics, :influxql_scalar, :v2_write, :v2_flux]
 
   @doc false
   defmacro __using__(opts) do
@@ -100,7 +101,7 @@ defmodule InfluxElixir.ClientContract do
       end
 
     v3 = fn part, builder -> {part, if(v3_sql, do: builder.(client), else: nil)} end
-    v2 = fn builder -> {:v2, if(v2_ops, do: builder.(client), else: nil)} end
+    v2 = fn part, builder -> {part, if(v2_ops, do: builder.(client), else: nil)} end
 
     [
       {:write_admin, health_tests(client, version)},
@@ -129,6 +130,7 @@ defmodule InfluxElixir.ClientContract do
       v3.(:write_admin, &gzip_tests/1),
       v3.(:write_admin, &escaping_tests/1),
       {:sql_semantics, execute_tests},
+      v3.(:sql_semantics, &statement_tests/1),
       v3.(:influxql_scalar, &influxql_tests/1),
       v3.(:influxql_scalar, &influxql_select_tests/1),
       v3.(:sql_semantics, &reference_tests/1),
@@ -142,13 +144,13 @@ defmodule InfluxElixir.ClientContract do
       v3.(:influxql_scalar, &influxql_where_tests/1),
       v3.(:write_admin, &tab_tests/1),
       {:write_admin, timestamp_range_tests(client, version)},
-      v2.(&bucket_tests/1),
-      v2.(&v2_write_rule_tests/1),
-      v2.(&v2_body_tests/1),
-      v2.(&v2_precision_tests/1),
-      v2.(&v2_duplicate_tests/1),
-      v2.(&v2_flux_pipeline_tests/1),
-      v2.(&flux_tests/1)
+      v2.(:v2_write, &bucket_tests/1),
+      v2.(:v2_write, &v2_write_rule_tests/1),
+      v2.(:v2_write, &v2_body_tests/1),
+      v2.(:v2_write, &v2_precision_tests/1),
+      v2.(:v2_write, &v2_duplicate_tests/1),
+      v2.(:v2_flux, &v2_flux_pipeline_tests/1),
+      v2.(:v2_flux, &flux_tests/1)
     ]
   end
 
@@ -856,6 +858,118 @@ defmodule InfluxElixir.ClientContract do
   end
 
   # ---------------------------------------------------------------------------
+  # Statements the engine's parser does not read (v3_core, v3_enterprise)
+  # ---------------------------------------------------------------------------
+
+  defp statement_tests(client) do
+    quote location: :keep do
+      describe "execute_sql/3 — contract: a text that is no statement" do
+        test "a text that starts no statement is the parser's error, at its position", ctx do
+          query = &unquote(client).query_sql(ctx.conn, &1, database: ctx.database)
+          exec = &unquote(client).execute_sql(ctx.conn, &1, database: ctx.database)
+          found = &~s|SQL error: ParserError("Expected: an SQL statement, found: #{&1}")|
+
+          for {text, token, position} <- [
+                {"FOO bar", "FOO", "Line: 1, Column: 1"},
+                {"SELEC 1", "SELEC", "Line: 1, Column: 1"},
+                {"1", "1", "Line: 1, Column: 1"},
+                {"42 + 1", "42", "Line: 1, Column: 1"},
+                {"1.5", "1.5", "Line: 1, Column: 1"},
+                {"123abc", "123", "Line: 1, Column: 1"},
+                {"foo.bar", "foo", "Line: 1, Column: 1"},
+                {"FOO;", "FOO", "Line: 1, Column: 1"},
+                {"'abc'", "'abc'", "Line: 1, Column: 1"},
+                {"* from t", "*", "Line: 1, Column: 1"},
+                {", select", ",", "Line: 1, Column: 1"},
+                {"@@", "@@", "Line: 1, Column: 1"},
+                {"ünï", "ünï", "Line: 1, Column: 1"},
+                {"  FOO bar", "FOO", "Line: 1, Column: 3"},
+                {"\n  FOO bar", "FOO", "Line: 2, Column: 3"},
+                {"LOCK TABLE t", "LOCK", "Line: 1, Column: 1"},
+                {"RESET x", "RESET", "Line: 1, Column: 1"},
+                {"LISTEN x", "LISTEN", "Line: 1, Column: 1"},
+                {"@@x", "@@x", "Line: 1, Column: 1"},
+                {"@x y", "@x", "Line: 1, Column: 1"},
+                {"1e5", "1e5", "Line: 1, Column: 1"},
+                {"1.e5", "1.e5", "Line: 1, Column: 1"},
+                {".5", ".5", "Line: 1, Column: 1"},
+                {"1e", "1", "Line: 1, Column: 1"},
+                {"0x1f", "X'1f'", "Line: 1, Column: 1"},
+                {"0x", "X''", "Line: 1, Column: 1"},
+                {"0X1F", "0", "Line: 1, Column: 1"},
+                {"'a''b'", "'a'b'", "Line: 1, Column: 1"},
+                {~S|"a""b"|, ~S|\"a\"b\"|, "Line: 1, Column: 1"},
+                {"N'x'", "N'x'", "Line: 1, Column: 1"},
+                {"n'x'", "N'x'", "Line: 1, Column: 1"},
+                {"b'1'", "B'1'", "Line: 1, Column: 1"},
+                {"E'x'", "E'x'", "Line: 1, Column: 1"},
+                {"r'x'", "R'x'", "Line: 1, Column: 1"},
+                {"U&'x'", "U&'x'", "Line: 1, Column: 1"},
+                {"u&'x'", "U&'x'", "Line: 1, Column: 1"},
+                {"X'1f'", "X'1f'", "Line: 1, Column: 1"},
+                {"x'zz'", "X'zz'", "Line: 1, Column: 1"},
+                {"Q'x'", "Q", "Line: 1, Column: 1"},
+                {"$a", "$a", "Line: 1, Column: 1"},
+                {"$$x$$", "$$x$$", "Line: 1, Column: 1"},
+                {"`a b`", "`a b`", "Line: 1, Column: 1"},
+                {"#a", "#a", "Line: 1, Column: 1"},
+                {"!= x", "<>", "Line: 1, Column: 1"},
+                {"|| x", "||", "Line: 1, Column: 1"},
+                {"/* c */ foo", "foo", "Line: 1, Column: 9"},
+                {"/* /* n */ */ foo", "foo", "Line: 1, Column: 15"},
+                {"-- c\nfoo", "foo", "Line: 2, Column: 1"}
+              ] do
+            expected = {:error, %{status: 400, body: found.("#{token} at #{position}")}}
+            assert query.(text) === expected, text
+            assert exec.(text) === expected, text
+          end
+        end
+
+        test "a statement word alone is what the parser needs next, or the engine's answer",
+             ctx do
+          query = &unquote(client).query_sql(ctx.conn, &1, database: ctx.database)
+          exec = &unquote(client).execute_sql(ctx.conn, &1, database: ctx.database)
+          parser = &{400, ~s|SQL error: ParserError("Expected: #{&1}")|}
+          not_implemented = &{405, "This feature is not implemented: " <> &1}
+
+          # Why this list: a statement word that needs a name, one that needs an expression
+          # or a keyword, a `;` after one (its position is the error's), a lower case word,
+          # leading space, and the words the engine answers with a 405 or a planning error.
+          for {text, expected} <- [
+                {"update", parser.("identifier, found: EOF")},
+                {"UPDATE", parser.("identifier, found: EOF")},
+                {"UPDATE;", parser.("identifier, found: ; at Line: 1, Column: 7")},
+                {" update ;", parser.("identifier, found: ; at Line: 1, Column: 9")},
+                {"delete", parser.("identifier, found: EOF")},
+                {"insert", parser.("identifier, found: EOF")},
+                {"grant", parser.("a privilege keyword, found: EOF")},
+                {"revoke", parser.("a privilege keyword, found: EOF")},
+                {"create", parser.("an object type after CREATE, found: EOF")},
+                {"select", parser.("an expression, found: EOF")},
+                {"explain", parser.("an SQL statement, found: EOF")},
+                {"values", parser.("(, found: EOF")},
+                {"start", parser.("TRANSACTION, found: EOF")},
+                {"truncate", parser.("identifier, found: EOF")},
+                {"set", parser.("identifier, found: EOF")},
+                {"begin", not_implemented.("Unsupported SQL statement: BEGIN")},
+                {"END", not_implemented.("COMMIT AND END not supported")},
+                {"vacuum;", not_implemented.("Unsupported SQL statement: VACUUM")},
+                {"commit",
+                 {400, "Error during planning: Statement not supported: TransactionEnd"}},
+                {"show",
+                 {400,
+                  "Error during planning: '' is not a variable which can be viewed with 'SHOW'"}}
+              ] do
+            expected = {:error, %{status: elem(expected, 0), body: elem(expected, 1)}}
+            assert query.(text) === expected, text
+            assert exec.(text) === expected, text
+          end
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Execute SQL (v3_core, v3_enterprise)
   # ---------------------------------------------------------------------------
 
@@ -898,37 +1012,6 @@ defmodule InfluxElixir.ClientContract do
 
           assert {:ok, ^rows} = exec.("SELECT * FROM contract_del")
           assert [%{"value" => 1, "time" => %DateTime{}}] = rows
-        end
-
-        test "a text that starts no statement is the parser's error, at its position", ctx do
-          query = &unquote(client).query_sql(ctx.conn, &1, database: ctx.database)
-          exec = &unquote(client).execute_sql(ctx.conn, &1, database: ctx.database)
-          found = &"SQL error: ParserError(\"Expected: an SQL statement, found: #{&1}\")"
-
-          for {text, token, position} <- [
-                {"FOO bar", "FOO", "Line: 1, Column: 1"},
-                {"SELEC 1", "SELEC", "Line: 1, Column: 1"},
-                {"1", "1", "Line: 1, Column: 1"},
-                {"42 + 1", "42", "Line: 1, Column: 1"},
-                {"1.5", "1.5", "Line: 1, Column: 1"},
-                {"123abc", "123", "Line: 1, Column: 1"},
-                {"foo.bar", "foo", "Line: 1, Column: 1"},
-                {"FOO;", "FOO", "Line: 1, Column: 1"},
-                {"'abc'", "'abc'", "Line: 1, Column: 1"},
-                {"* from t", "*", "Line: 1, Column: 1"},
-                {", select", ",", "Line: 1, Column: 1"},
-                {"@@", "@@", "Line: 1, Column: 1"},
-                {"ünï", "ünï", "Line: 1, Column: 1"},
-                {"  FOO bar", "FOO", "Line: 1, Column: 3"},
-                {"\n  FOO bar", "FOO", "Line: 2, Column: 3"},
-                {"LOCK TABLE t", "LOCK", "Line: 1, Column: 1"},
-                {"RESET x", "RESET", "Line: 1, Column: 1"},
-                {"LISTEN x", "LISTEN", "Line: 1, Column: 1"}
-              ] do
-            expected = {:error, %{status: 400, body: found.("#{token} at #{position}")}}
-            assert query.(text) === expected, text
-            assert exec.(text) === expected, text
-          end
         end
 
         test "a statement the engine reads and does not run is its planning error", ctx do
@@ -2032,15 +2115,25 @@ defmodule InfluxElixir.ClientContract do
 
           {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
 
-          assert Enum.map(rows, &Map.drop(&1, ["time"])) === [
+          # The 100.0 outlier (median 3.0, bound 9.0) is screened out of the second
+          # candle; the bins are the minutes the points fall in.
+          assert rows === [
                    %{
+                     "time" => ~U[2023-11-14 22:13:00.000000Z],
                      "open" => 1.0,
                      "high" => 2.5,
                      "low" => 1.0,
                      "close" => 2.5,
                      "volume" => 30.0
                    },
-                   %{"open" => 3.0, "high" => 4.0, "low" => 3.0, "close" => 4.0, "volume" => 70.0}
+                   %{
+                     "time" => ~U[2023-11-14 22:14:00.000000Z],
+                     "open" => 3.0,
+                     "high" => 4.0,
+                     "low" => 3.0,
+                     "close" => 4.0,
+                     "volume" => 70.0
+                   }
                  ]
         end
 
@@ -2985,7 +3078,7 @@ defmodule InfluxElixir.ClientContract do
                 "#{m},host=h1 v=1i #{now - 7200}",
                 "#{m},host=h2 v=2i #{now - 1800}",
                 "#{m},host=h12 v=3i #{now - 600}",
-                "#{m} v=4i #{now - 300}",
+                "#{m} v=4i #{now - 330}",
                 "#{m},host=H1 v=5i #{now - 60}",
                 "#{m},host=old v=6i #{now - 90_000}"
               ],

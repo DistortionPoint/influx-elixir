@@ -3,8 +3,8 @@ defmodule InfluxElixir.IntegrationHelper do
   Shared helpers for integration tests against real InfluxDB instances.
 
   Reads connection config from environment variables with defaults
-  matching the Docker Compose dev setup. Starts a dedicated Finch pool
-  and provides ready-to-use connection keyword lists.
+  matching the Docker Compose dev setup. Every connection list needs a
+  `:finch_name` (the caller starts the pool) and is otherwise ready to use.
 
   ## Environment Variables
 
@@ -39,8 +39,7 @@ defmodule InfluxElixir.IntegrationHelper do
       database: env("INFLUX_V2_BUCKET", "metrics"),
       api_version: :v2,
       scheme: :http,
-      name: :integration_v2,
-      finch_name: :integration_finch
+      name: :integration_v2
     ]
 
     Keyword.merge(base, overrides)
@@ -56,8 +55,7 @@ defmodule InfluxElixir.IntegrationHelper do
       port: env_int("INFLUX_V3_CORE_PORT", 8181),
       token: "",
       scheme: :http,
-      name: :integration_v3_core,
-      finch_name: :integration_finch
+      name: :integration_v3_core
     ]
 
     Keyword.merge(base, overrides)
@@ -73,29 +71,10 @@ defmodule InfluxElixir.IntegrationHelper do
       port: env_int("INFLUX_V3_ENT_PORT", 8182),
       token: "",
       scheme: :http,
-      name: :integration_v3_ent,
-      finch_name: :integration_finch
+      name: :integration_v3_ent
     ]
 
     Keyword.merge(base, overrides)
-  end
-
-  @doc """
-  Starts the shared Finch pool for integration tests.
-
-  Call this from `setup_all` in your integration test module:
-
-      setup_all do
-        InfluxElixir.IntegrationHelper.start_finch()
-        :ok
-      end
-  """
-  @spec start_finch() :: pid()
-  def start_finch do
-    case Finch.start_link(name: :integration_finch, pools: %{default: [size: 5]}) do
-      {:ok, pid} -> pid
-      {:error, {:already_started, pid}} -> pid
-    end
   end
 
   @doc """
@@ -111,8 +90,7 @@ defmodule InfluxElixir.IntegrationHelper do
       host: env("INFLUX_V3_AUTH_HOST", "localhost"),
       port: env_int("INFLUX_V3_AUTH_PORT", 8183),
       scheme: :http,
-      name: :integration_v3_core_auth,
-      finch_name: :integration_finch
+      name: :integration_v3_core_auth
     ]
 
     base = Keyword.merge(base, overrides)
@@ -150,7 +128,7 @@ defmodule InfluxElixir.IntegrationHelper do
     url = "#{scheme}://#{host}:#{port}/health"
 
     request = Finch.build(:get, url)
-    finch_name = Keyword.get(conn, :finch_name, :integration_finch)
+    finch_name = Keyword.fetch!(conn, :finch_name)
 
     case Finch.request(request, finch_name, receive_timeout: 2_000) do
       {:ok, %Finch.Response{}} -> true

@@ -66,7 +66,20 @@ This is a library consumed as a dependency. Key distinctions:
 ```
 lib/influx_elixir.ex                    # Public API facade
 lib/influx_elixir/
-├── client.ex                           # HTTP client (Finch wrapper)
+├── client.ex                           # Client behaviour (HTTP and Local implement it)
+├── client/
+│   ├── http.ex                         # HTTP client (Finch wrapper)
+│   ├── query_params.ex                 # `$param` normalisation shared by both clients
+│   ├── local.ex                        # PUBLIC in-memory test double: facade, docs, specs
+│   └── local/                          # Local's internals, all `@moduledoc false`
+│       ├── admin/                      # database, bucket, token and health operations
+│       ├── flux/                       # v2 Flux parser/evaluator and the query path
+│       ├── influxql/                   # InfluxQL parser, planner (to SQL) and query path
+│       ├── line_protocol/              # line protocol scanner, parser and v2/v3 dialects
+│       ├── shared/                     # format answers, scope, durations, integer limits
+│       ├── sql/                        # SQL lexer, parser, planner, executor, query path
+│       ├── store/                      # ETS store, database rules, bucket derivations
+│       └── write/                      # write path and request-body (gzip/UTF-8) reading
 ├── connection.ex                       # Named connection manager
 ├── config.ex                           # Connection configuration
 ├── write/
@@ -82,11 +95,16 @@ lib/influx_elixir/
 │   └── response_parser.ex             # JSONL/CSV/JSON response parsing
 ├── admin/
 │   ├── databases.ex                    # v3 database CRUD
-│   ├── buckets.es                      # v2 bucket CRUD (compat)
+│   ├── buckets.ex                      # v2 bucket CRUD (compat)
 │   ├── tokens.ex                       # v3 token management
 │   └── health.ex                       # Health/ping checks
 └── telemetry.ex                        # Telemetry event emission
 ```
+
+Files under `client/local/` are grouped by area, not by module name: module names stay
+`InfluxElixir.Client.Local.<Name>` whatever the subdirectory. Only `Client.Local` is public API;
+keep every other Local module `@moduledoc false` (HexDocs lists only the modules in `mix.exs`
+`groups_for_modules`), and never reference a hidden module from a public `@doc`.
 
 ### Key Patterns
 1. **HTTP-Only (initially)**: Finch-based HTTP client, no Arrow Flight gRPC yet

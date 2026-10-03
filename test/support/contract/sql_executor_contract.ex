@@ -47,6 +47,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
       cast_helpers(),
       ijf_helpers(),
       batch_helpers(),
+      guard_helpers(),
       cast_range_helpers()
     ]
 
@@ -96,8 +97,12 @@ defmodule InfluxElixir.Contract.SQLExecutor do
       {:folding, simplifier_tests()},
       {:folding, simplifier_null_tests()},
       {:folding, batch_tests()},
+      {:folding, guard_float_tests()},
+      {:folding, guard_integer_tests()},
       {:folding, cast_range_tests()},
       {:folding, division_range_tests()},
+      {:folding, bounds_arithmetic_tests()},
+      {:folding, division_force_tests()},
       {:folding, decimal_literal_tests()},
       {:folding, decimal_refusal_tests()},
       {:folding, wide_literal_tests()},
@@ -2793,8 +2798,10 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                    sxc_vs([5, 100_000, -7, 300])
         end
 
+        @tag local_divergence: "Local refuses what the engine answers by how a table is stored"
         @tag engine_bug: "closed connection"
-        test "with a conjunct it cannot take, the constant is read per row", ctx do
+        test "with a conjunct it cannot take, the constant is read per row (Local refuses one shape by name)",
+             ctx do
           m = sxc_cast_data(ctx)
           min = @sxc_negated_min
 
@@ -2809,13 +2816,22 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                 "v = 5 OR v > #{min}",
                 "v IS NOT NULL AND v > #{min}",
                 "s = #{min}",
-                "v > #{min} AND s = 'a'",
                 "v > #{min} AND t",
                 "v > #{min} AND v <> 5",
                 "v > #{min} AND v IN (1, 2)",
                 "v > #{min} AND v IS NULL"
               ] do
             assert sxc_query(ctx, "SELECT v FROM #{m} WHERE #{where}") === @sxc_closed, where
+          end
+
+          # A conjunct over another column: the engine may run it first (a persisted table
+          # reads the cheaper column first), and then no row reaches the constant.
+          refused = "SELECT v FROM #{m} WHERE v > #{min} AND s = 'a'"
+
+          if sxc_local?() do
+            assert sxc_error(ctx, refused) === sxc_batch_refusal()
+          else
+            assert sxc_query(ctx, refused) === @sxc_closed
           end
 
           assert sxc_error(ctx, "SELECT v FROM #{m} WHERE v > #{min} AND time > 5") ===
@@ -2868,7 +2884,8 @@ defmodule InfluxElixir.Contract.SQLExecutor do
 
         @tag local_divergence: "Local refuses what it cannot pin down by name"
         @tag engine_bug: "closed connection; DataFusion internal error in the interval analysis"
-        test "a minimum divided by -1 beside another comparison is the engine's own bug", ctx do
+        test "a minimum divided by -1 beside another comparison is the engine's own bug (Local refuses it by name)",
+             ctx do
           m = sxc_cast_data(ctx)
           local? = sxc_local?()
           division = "#{@sxc_int64_min_expr} / -1"
@@ -3032,8 +3049,8 @@ defmodule InfluxElixir.Contract.SQLExecutor do
       def sxc_batch_refusal do
         sxc_refused(
           "a WHERE whose AND or OR runs an operand that fails over a row the other operand " <>
-            "leaves out: the engine runs it over a batch of rows, and whether the row is met " <>
-            "depends on how it batches them"
+            "leaves out: whether the engine fails the query depends on how the table is " <>
+            "stored (freshly written or persisted) and on how it batches the rows"
         )
       end
     end
@@ -3086,22 +3103,28 @@ defmodule InfluxElixir.Contract.SQLExecutor do
         test "an AND or an OR that is not one of those leaves the constant to fail", ctx do
           m = sxc_ijf(ctx)
 
-          assert sxc_query(ctx, "SELECT i FROM #{m} WHERE j = 7 OR (j = 7 OR 1/0 > 1)") ===
-                   @sxc_closed
-
-          # The double refuses these: the engine runs the constant over a batch of rows.
-          for {where, engine} <- [
-                {"j = 7 AND (j = 7 AND 1/0 > 1)", @sxc_closed},
-                {"j = 7 AND i > 0 AND (1/0 > 1 OR j = 7)", @sxc_closed},
-                {"j = 7 AND i > 0 AND (j = 7 OR 1/0 > 1)", {:ok, sxc_is([3])}}
+          # Why this list: a row the left side keeps reaches the constant, in an AND of a
+          # row-free conjunct and in an OR whose first side fails: the query fails however
+          # the engine batches the rows.
+          for where <- [
+                "j = 7 OR (j = 7 OR 1/0 > 1)",
+                "j = 7 AND (j = 7 AND 1/0 > 1)",
+                "j = 7 AND i > 0 AND (1/0 > 1 OR j = 7)"
               ] do
-            sql = "SELECT i FROM #{m} WHERE #{where}"
+            assert sxc_query(ctx, "SELECT i FROM #{m} WHERE #{where}") === @sxc_closed, where
+          end
+        end
 
-            if sxc_local?() do
-              assert sxc_error(ctx, sql) === sxc_batch_refusal(), where
-            else
-              assert sxc_query(ctx, sql) === engine, where
-            end
+        @tag local_divergence: "Local refuses what the engine answers by how it batches rows"
+        test "an OR that holds the constant as its second side is run over the whole batch",
+             ctx do
+          m = sxc_ijf(ctx)
+          sql = "SELECT i FROM #{m} WHERE j = 7 AND i > 0 AND (j = 7 OR 1/0 > 1)"
+
+          if sxc_local?() do
+            assert sxc_error(ctx, sql) === sxc_batch_refusal()
+          else
+            assert sxc_query(ctx, sql) === {:ok, sxc_is([3])}
           end
         end
 
@@ -3258,8 +3281,10 @@ defmodule InfluxElixir.Contract.SQLExecutor do
   defp batch_tests do
     quote location: :keep do
       describe "SQL executor — contract: an AND or an OR over a batch of rows" do
+        @tag local_divergence: "Local refuses what the engine answers by how a table is stored"
         @tag engine_bug: "closed connection"
-        test "a right operand that fails for a row the left one leaves out", ctx do
+        test "a right operand that fails for a row the left one leaves out (Local refuses it by name)",
+             ctx do
           m = sxc_batch(ctx)
 
           for where <- [
@@ -3277,6 +3302,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
           end
         end
 
+        @tag local_divergence: "Local refuses what the engine answers by how a table is stored"
         test "the engine answers when the left operand selects few rows", ctx do
           m = sxc_batch(ctx)
           sql = "SELECT count(*) AS c FROM #{m} WHERE j = 7 AND 100 / j > 1"
@@ -3297,6 +3323,236 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                    ctx,
                    "SELECT count(*) AS c FROM #{m} WHERE j < 5 AND 100 / j > 1"
                  ) === @sxc_closed
+        end
+      end
+    end
+  end
+
+  # Twenty rows, `k` from 0 to 19, host `h<k mod 4>` and region `r<k mod 2>` as tags; `total`
+  # and `used` as floats, `ti` and `ui` as integers and `n` an integer. Rows 0 and 8 have a zero
+  # `total`, `used`, `ti`, `ui` and `n`: they are two of the five rows of host h0 and of
+  # region r0.
+  # The ratio `used / total` of the others is `(k mod 4) / 4`.
+  defp guard_helpers do
+    quote location: :keep do
+      def sxc_guard_rows do
+        for k <- 0..19 do
+          zero? = k in [0, 8]
+          total = if zero?, do: 0.0, else: 100.0 * (1 + rem(k, 3))
+          used = if zero?, do: 0.0, else: total * rem(k, 4) / 4
+
+          %{
+            k: k,
+            host: "h#{rem(k, 4)}",
+            region: "r#{rem(k, 2)}",
+            total: total,
+            used: used,
+            n: if(zero?, do: 0, else: 1 + rem(k, 7))
+          }
+        end
+      end
+
+      def sxc_guard(ctx) do
+        m = sxc_name("sxc_guard")
+        float = &:erlang.float_to_binary(&1, decimals: 1)
+
+        sxc_write(
+          ctx,
+          for row <- sxc_guard_rows() do
+            "#{m},host=#{row.host},region=#{row.region} k=#{row.k}i,total=#{float.(row.total)}," <>
+              "used=#{float.(row.used)},ti=#{trunc(row.total)}i,ui=#{trunc(row.used)}i," <>
+              "n=#{row.n}i #{sxc_ns(row.k + 1)}"
+          end
+        )
+
+        m
+      end
+
+      # The query for the `k` of the rows `where` keeps, and the response for the `k` in `ks`.
+      def sxc_guard_sql(m, where), do: "SELECT k FROM #{m} WHERE #{where} ORDER BY k"
+      def sxc_ks(ks), do: Enum.map(ks, &%{"k" => &1})
+    end
+  end
+
+  defp guard_float_tests do
+    quote location: :keep do
+      describe "SQL executor — contract: a ratio a guard keeps the zero rows out of" do
+        test "a division of floats by a total that is zero on two rows answers", ctx do
+          m = sxc_guard(ctx)
+          above = [3, 7, 11, 15, 19]
+          positive = [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19]
+
+          # Why this list: the guard idioms of a ratio (`<>`, `!=`, `IS NOT NULL`, `NOT`,
+          # parentheses, a tag, a second guard), each with the rows 0 and 8, whose 0.0 / 0.0 is
+          # a NaN, left out by `total`, in every shape the ratio can stand in: a comparison, a
+          # product, `abs`, `round`, `ceil`, `floor`, `BETWEEN`, `IN`, `NOT IN`, `%`, `OR`, `NOT`.
+          for {where, ks} <- [
+                {"total > 0 AND used / total > 0.5", above},
+                {"total <> 0 AND used / total > 0.5", above},
+                {"total != 0 AND used / total * 100 > 50", above},
+                {"total > 0 AND abs(used / total) > 0.5", above},
+                {"total > 0 AND round(used / total, 2) > 0.5", above},
+                {"total > 0 AND used / total BETWEEN 0.2 AND 0.8", positive},
+                {"total > 0 AND used / total IN (0.5, 0.25)",
+                 [1, 2, 5, 6, 9, 10, 13, 14, 17, 18]},
+                {"total > 0 AND used / total NOT IN (0.5, 0.25)", [3, 4, 7, 11, 12, 15, 16, 19]},
+                {"total > 0 AND used % total = 0", [4, 12, 16]},
+                {"host = 'h1' AND used / total > 0.5", []},
+                {"total IS NOT NULL AND total > 0 AND used / total > 0.5", above},
+                {"total > 0 AND (used / total > 0.5 OR host = 'h0')",
+                 [3, 4, 7, 11, 12, 15, 16, 19]},
+                {"total > 0 AND NOT (used / total > 0.5)",
+                 [1, 2, 4, 5, 6, 9, 10, 12, 13, 14, 16, 17, 18]},
+                {"used > 0 AND used / total > 0.5", above},
+                {"(total > 0) AND (used / total > 0.5)", above},
+                {"total > 0.0 AND ceil(used / total) = 1", positive},
+                {"NOT (total = 0) AND used / total > 0.5", above},
+                {"total > 0 AND used / total * 100 BETWEEN 20 AND 80", positive},
+                {"total > 0 AND floor(used / total * 10) = 5", [2, 6, 10, 14, 18]},
+                {"host = 'h3' AND total > 0 AND used / total > 0.5", above},
+                {"used / total > 0.5 AND host = 'h1'", []}
+              ] do
+            assert sxc_rows(ctx, sxc_guard_sql(m, where)) === sxc_ks(ks), where
+          end
+        end
+
+        test "a NaN in a row the guard leaves out is not a failure", ctx do
+          m = sxc_name("sxc_nan")
+
+          sxc_write(ctx, [
+            "#{m},host=h1 used=0.0,total=0i #{sxc_ns(1)}",
+            "#{m},host=h1 used=5.0,total=2i #{sxc_ns(2)}",
+            "#{m},host=h2 used=9.0,total=3i #{sxc_ns(3)}"
+          ])
+
+          # Why this list: the idioms of a ratio of a float by an integer that is zero on the
+          # first row (0.0 / 0 is a NaN), each beside the guard that leaves that row out.
+          for {where, used} <- [
+                {"total > 0 AND used / total > 0.5", [5.0, 9.0]},
+                {"total > 0 AND used / total * 100 > 50", [5.0, 9.0]},
+                {"total > 0 AND host = 'h1'", [5.0]},
+                {"total > 0 AND abs(used / total) > 0.5", [5.0, 9.0]},
+                {"total > 0 AND round(used / total) > 0", [5.0, 9.0]},
+                {"total > 0 AND used / total BETWEEN 0.5 AND 5", [5.0, 9.0]},
+                {"total > 0 AND used / total IN (2.5, 3.0)", [5.0, 9.0]},
+                {"total > 0 AND used % total = 0", [9.0]}
+              ] do
+            assert sxc_rows(ctx, "SELECT used FROM #{m} WHERE #{where} ORDER BY used") ===
+                     Enum.map(used, &%{"used" => &1}),
+                   where
+          end
+        end
+      end
+    end
+  end
+
+  defp guard_integer_tests do
+    quote location: :keep do
+      describe "SQL executor — contract: an integer division a guard keeps the zero rows out of" do
+        test "a conjunct over tags keeps the zero rows out, wherever it stands", ctx do
+          m = sxc_guard(ctx)
+          h1 = [1, 5, 9, 13, 17]
+          not_h0 = [1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19]
+
+          # Why this list: a tag compared, set, matched and ranged, in either order and beside
+          # other conjuncts, with every zero row on a host or region the tag conjunct leaves out
+          # (a conjunct over tags is applied by the scan, before the others, in a fresh write and
+          # in a persisted table alike); a NULL in the set leaves every row out.
+          for {where, ks} <- [
+                {"host = 'h1' AND 100 / n > 1", h1},
+                {"100 / n > 1 AND host = 'h1'", h1},
+                {"host <> 'h0' AND 100 / n > 1", not_h0},
+                {"100 / n > 1 AND host <> 'h0'", not_h0},
+                {"host IN ('h1', 'h2') AND 100 / n > 1", [1, 2, 5, 6, 9, 10, 13, 14, 17, 18]},
+                {"(host = 'h1' OR host = 'h3') AND 100 / n > 1",
+                 [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]},
+                {"host LIKE 'h1%' AND 100 / n > 1", h1},
+                {"region = 'r1' AND 100 / n > 1", [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]},
+                {"n > 0 AND host = 'h1' AND 100 / n > 1", h1},
+                {"host = 'h1' AND n > 0 AND 100 / n > 1", h1},
+                {"host = 'h1' AND ui * 100 / ti > 20", h1},
+                {"host IN ('a', NULL) AND 100 / n > 1", []},
+                {"host = 'zz' AND 100 / n > 1", []}
+              ] do
+            assert sxc_rows(ctx, sxc_guard_sql(m, where)) === sxc_ks(ks), where
+          end
+        end
+
+        test "a guard on the divisor's own column that keeps no row leaves the division unrun",
+             ctx do
+          m = sxc_guard(ctx)
+
+          for where <- ["n IS NULL AND 100 / n > 1", "n IS NULL AND 100 / n > 1 AND host = 'h1'"] do
+            assert sxc_rows(ctx, sxc_guard_sql(m, where)) === [], where
+          end
+        end
+
+        @tag engine_bug: "closed connection"
+        test "a row the guard keeps, and the division fails for, fails the query", ctx do
+          m = sxc_guard(ctx)
+
+          # Why this list: the zero rows reach the division in every shape of guard.
+          for where <- [
+                "n < 5 AND 100 / n > 1",
+                "n <= 0 AND 100 / n > 1",
+                "host = 'h0' AND 100 / n > 1",
+                "100 / n > 1 AND n < 5",
+                "100 / n > 1 AND host = 'h0'",
+                "100 / n > 1"
+              ] do
+            assert sxc_query(ctx, sxc_guard_sql(m, where)) === @sxc_closed, where
+          end
+        end
+
+        @tag local_divergence: "Local refuses what the engine answers by how a table is stored"
+        @tag engine_bug: "closed connection"
+        test "a guard that leaves the zero rows out only by the order the engine runs them in (Local refuses it by name)",
+             ctx do
+          m = sxc_guard(ctx)
+
+          # Why this list: a guard on a number, in every shape that keeps most rows, and the
+          # other order. A fresh write runs the division over the whole batch when the guard
+          # keeps over a fifth of it, and a persisted table runs the guard first when it reads
+          # no more of the columns: so the same data fails freshly written and answers later.
+          for where <- [
+                "n > 0 AND 100 / n > 1",
+                "n <> 0 AND 100 / n > 1",
+                "n >= 1 AND 100 / n > 1",
+                "NOT (n = 0) AND 100 / n > 1",
+                "total > 0 AND ui * 100 / ti > 20",
+                "ti >= 1 AND 1000 / ti > 0",
+                "ti > 0 AND ui * 100 / ti > 20",
+                "ui * 100 / ti > 20 AND ti > 0"
+              ] do
+            sql = sxc_guard_sql(m, where)
+
+            if sxc_local?() do
+              assert sxc_error(ctx, sql) === sxc_batch_refusal(), where
+            else
+              assert sxc_query(ctx, sql) === @sxc_closed, where
+            end
+          end
+        end
+
+        @tag local_divergence: "Local refuses what the engine answers by how a table is stored"
+        @tag engine_bug: "closed connection"
+        test "a NULL left of a division the engine may run over the zero rows closes the connection (Local refuses it by name)",
+             ctx do
+          m = sxc_guard(ctx)
+
+          for where <- [
+                "n NOT BETWEEN NULL AND 5 AND 100 / n > 1",
+                "host = 'h1' AND NULL AND 100 / 0 > 1",
+                "n = NULL AND 100 / 0 > 1"
+              ] do
+            sql = sxc_guard_sql(m, where)
+
+            if sxc_local?() do
+              assert sxc_error(ctx, sql) === sxc_batch_refusal(), where
+            else
+              assert sxc_query(ctx, sql) === @sxc_closed, where
+            end
+          end
         end
       end
     end
@@ -3414,7 +3670,9 @@ defmodule InfluxElixir.Contract.SQLExecutor do
         end
 
         @tag engine_bug: "DataFusion internal error"
-        test "beside another comparison the engine's analysis fails in its own way", ctx do
+        @tag local_divergence: "Local refuses by name what the engine fails in its analysis"
+        test "beside another comparison the engine's analysis fails in its own way (Local refuses it by name)",
+             ctx do
           m = sxc_cast_range(ctx)
           sql = "SELECT i FROM #{m} WHERE CAST(u AS BIGINT) = -5 AND i = 1"
 
@@ -3481,6 +3739,227 @@ defmodule InfluxElixir.Contract.SQLExecutor do
           end
 
           assert sxc_rows(ctx, "SELECT i FROM #{m} WHERE i > 0 AND 1/0.0 = 1") === []
+        end
+      end
+    end
+  end
+
+  defp bounds_arithmetic_tests do
+    quote location: :keep do
+      describe "SQL executor — contract: arithmetic on a column the analysis does not solve" do
+        test "an unsigned column's arithmetic, or an integer's with a float, is no bound", ctx do
+          m = sxc_cast_range(ctx)
+
+          # Why this list: every operation on an unsigned column (a sum and a difference of
+          # either order, a product, a quotient, the comparison operators and a float
+          # literal) is a decimal's and is not solved; an integer column's with a float
+          # constant is a float's. Beside a bound that leaves the column no value the
+          # answer is the rows, none.
+          for where <- [
+                "u + 1 > 5 AND u < 3",
+                "u - 1 > 5 AND u < 3",
+                "1 + u > 5 AND u < 3",
+                "u + 1 >= 5 AND u < 3",
+                "u + 1 = 5 AND u < 3",
+                "u + 1.5 > 5 AND u < 3",
+                "u + 1 > 5.5 AND u < 3",
+                "u * 2 > 100 AND u < 3",
+                "u / 2 > 100 AND u < 3",
+                "u + 0 > 100 AND u < 3",
+                "u * 1 > 100.5 AND u < 3",
+                "v + 1.5 > 5 AND v < 3",
+                "v - 1.5 > 5 AND v < 3",
+                "1.5 + v > 5 AND v < 3",
+                "v * 2.5 > 100 AND v < 3",
+                "v / 2.5 > 100 AND v < 3",
+                "v * 1 > 100.5 AND v < 3"
+              ] do
+            assert sxc_rows(ctx, "SELECT i FROM #{m} WHERE #{where}") === [], where
+          end
+        end
+
+        @tag engine_bug: "DataFusion internal error"
+        test "what the optimizer removes before the analysis leaves the bare column", ctx do
+          m = sxc_cast_range(ctx)
+
+          # Why this list: a product or quotient with the integer one (either order), a double
+          # negation and parentheses, on each type; a float column's product with the float one.
+          for {where, sides} <- [
+                {"u * 1 > 100 AND u < 3", "lhs:Null, rhs:UInt64"},
+                {"u / 1 > 100 AND u < 3", "lhs:Null, rhs:UInt64"},
+                {"-(-u) > 100 AND u < 3", "lhs:Null, rhs:UInt64"},
+                {"(u) > 100 AND u < 3", "lhs:Null, rhs:UInt64"},
+                {"1 * v > 100 AND v < 3", "lhs:Null, rhs:Int64"},
+                {"v * 1 > 100 AND v < 3", "lhs:Null, rhs:Int64"},
+                {"v / 1 > 100 AND v < 3", "lhs:Null, rhs:Int64"},
+                {"-(-v) > 100 AND v < 3", "lhs:Null, rhs:Int64"},
+                {"(v) > 100 AND v < 3", "lhs:Null, rhs:Int64"},
+                {"f * 1 > 100 AND f < 3", "lhs:Null, rhs:Float64"},
+                {"f * 1.0 > 100 AND f < 3", "lhs:Null, rhs:Float64"},
+                {"CAST(v AS BIGINT) + 1 > 100 AND v < 3", "lhs:Int64, rhs:Null"}
+              ] do
+            assert sxc_error(ctx, "SELECT i FROM #{m} WHERE #{where}") ===
+                     {500, sxc_interval(sides)},
+                   where
+          end
+        end
+      end
+    end
+  end
+
+  defp division_force_tests do
+    quote location: :keep do
+      describe "SQL executor — contract: a division by zero that forces a column" do
+        @tag engine_bug: "DataFusion internal error"
+        test "a column divided by zero is forced to zero: the bounds leave it out or not", ctx do
+          m = sxc_cast_range(ctx)
+
+          division =
+            &{500, sxc_internal("Intervals must have the same data type for division, #{&1}")}
+
+          # Why this list: the division before every comparison, with the comparisons that
+          # leave 0 out (above it, below it, a bound that is exclusive at it, an equality, a
+          # range, a set of one) and the types of the column; a comparison of another column
+          # before the column's own; the body is the division's.
+          for {where, sides} <- [
+                {"v / 0 = 1 AND v > 0", "lhs:Null, rhs:Int64"},
+                {"v / 0 = 1 AND v >= 1", "lhs:Null, rhs:Int64"},
+                {"v / 0 = 1 AND v < 0", "lhs:Null, rhs:Int64"},
+                {"v / 0 = 1 AND v <= -1", "lhs:Null, rhs:Int64"},
+                {"v / 0 = 1 AND v = 3", "lhs:Null, rhs:Int64"},
+                {"v / 0 IN (1) AND v > 0", "lhs:Null, rhs:Int64"},
+                {"v / 0 = 5 AND v > 0", "lhs:Null, rhs:Int64"},
+                {"v / 0 = 1 AND v > 0 AND v < 9", "lhs:Null, rhs:Int64"},
+                {"v / 0 = 1 AND v BETWEEN 1 AND 5", "lhs:Null, rhs:Int64"},
+                {"v / 0 = 1 AND u > 0 AND v > 0", "lhs:Null, rhs:Int64"},
+                {"v / 0 = 1 AND NOT (v < 1)", "lhs:Null, rhs:Int64"},
+                {"1 / 0 = 1 AND v / 0 = 1 AND v > 0", "lhs:Null, rhs:Int64"},
+                {"CAST(v AS BIGINT) / 0 = 1 AND v > 0", "lhs:Null, rhs:Int64"},
+                {"f / 0 = 1 AND f > 0", "lhs:Null, rhs:Float64"},
+                {"f / 0.0 = 1 AND f > 0", "lhs:Null, rhs:Float64"}
+              ] do
+            assert sxc_error(ctx, "SELECT i FROM #{m} WHERE #{where}") === division.(sides),
+                   where
+          end
+        end
+
+        @tag engine_bug: "DataFusion internal error"
+        test "a comparison before the division names its own interval", ctx do
+          m = sxc_cast_range(ctx)
+
+          # Why this list: the comparison first, of the column or of another; a sum with a
+          # constant forces the column to another value (`(v + 1) / 0` to -1), and its body
+          # is the first comparison's whichever stands first.
+          for {where, sides} <- [
+                {"v > 0 AND v / 0 = 1", "lhs:Null, rhs:Int64"},
+                {"v < 9 AND v / 0 = 1 AND v > 0", "lhs:Int64, rhs:Null"},
+                {"u > 0 AND v / 0 = 1 AND v > 0", "lhs:Null, rhs:UInt64"},
+                {"f > 0 AND v / 0 = 1 AND v > 0", "lhs:Null, rhs:Float64"},
+                {"(v + 1) / 0 = 1 AND v > 0", "lhs:Null, rhs:Int64"},
+                {"(v + 1) / 0 = 1 AND v < -1", "lhs:Int64, rhs:Null"},
+                {"(v + 1) / 0 = 1 AND v > -1", "lhs:Null, rhs:Int64"},
+                {"(v - 1) / 0 = 1 AND v > 1", "lhs:Null, rhs:Int64"},
+                {"(1 + v) / 0 = 1 AND v > 100", "lhs:Null, rhs:Int64"},
+                {"f > 0 AND f / 0 = 1", "lhs:Null, rhs:Float64"}
+              ] do
+            assert sxc_error(ctx, "SELECT i FROM #{m} WHERE #{where}") ===
+                     {500, sxc_interval(sides)},
+                   where
+          end
+        end
+
+        @tag engine_bug: "closed connection"
+        test "a bound that leaves the forced value in is no failure of the analysis", ctx do
+          m = sxc_cast_range(ctx)
+
+          # Why this list: bounds that hold 0 (or -1 for a sum), in either order, a set of two,
+          # a float literal that is no bound of an integer column, an unsigned column and a
+          # bound of the integer column the analysis does not take.
+          for where <- [
+                "v / 0 = 1 AND v < 5",
+                "v / 0 = 1 AND v >= 0",
+                "v / 0 = 1 AND v <= 0",
+                "v / 0 = 1 AND v > -1",
+                "v / 0 = 1 AND v = 0",
+                "v / 0 = 1 AND v BETWEEN -5 AND 5",
+                "v / 0 = 1 AND v IN (1, 2)",
+                "v / 0 = 1 AND v > 0.5",
+                "v / 0 = 1 AND v > 0 AND v < 10 AND v <> 5",
+                "v / 0 = 1 AND v * 2 > 0",
+                "v / 0 = 1 AND i > 0 AND i < 5",
+                "v >= 0 AND v / 0 = 1",
+                "v < 5 AND v / 0 = 1",
+                "v > -1 AND v / 0 = 1",
+                "u / 0 = 1 AND u > 0",
+                "u / 0 = 1 AND u >= 0",
+                "(v + 1) / 0 = 1 AND v < 5",
+                "(v + 1) / 0 = 1 AND v >= -1",
+                "(v + 1) / 0 = 1 AND v > -2",
+                "(v * 2) / 0 = 1 AND v < 100",
+                "v % 0 = 1 AND v > 0",
+                "v / 0 > 1 AND v > 0",
+                "v / 0 + 1 > 1 AND v > 0"
+              ] do
+            assert sxc_query(ctx, "SELECT i FROM #{m} WHERE #{where}") === @sxc_closed, where
+          end
+        end
+
+        test "a float column divided by zero, or an integer by a float zero, answers", ctx do
+          m = sxc_cast_range(ctx)
+
+          for where <- [
+                "f / 0 = 1 AND f >= 0",
+                "f / 0 = 1 AND f < 5",
+                "f / 0 = 1",
+                "f / 0 = 1 AND f > -1",
+                "f >= 0 AND f / 0 = 1",
+                "v / 0.0 = 1 AND v > 0",
+                "v / 0.0 = 1 AND v >= 0",
+                "v = 0 AND v / 0 = 1"
+              ] do
+            assert sxc_rows(ctx, "SELECT i FROM #{m} WHERE #{where}") === [], where
+          end
+        end
+
+        @tag local_divergence: "Local refuses what the engine fails in words it does not model"
+        @tag engine_bug: "DataFusion internal error"
+        test "a dividend of another shape, or an operation of the interval it does not model (Local refuses it by name)",
+             ctx do
+          m = sxc_cast_range(ctx)
+
+          dividend =
+            "a WHERE with an expression that divides by zero beside a dividend of a shape " <>
+              "the analysis solves in its own words: the engine's answer is not pinned down"
+
+          propagated =
+            "a WHERE that may leave a numeric column no value, with an arithmetic comparison " <>
+              "of a column that, with the other comparisons of it, leaves it no value: the " <>
+              "engine's answer is not pinned down"
+
+          for {where, local, engine} <- [
+                {"2 * v / 0 = 1 AND v > 0", dividend,
+                 "Intervals must have the same data type for multiplication, lhs:Int64, rhs:Null"},
+                {"(v * 2) / 0 = 1 AND v > 100", dividend,
+                 "Intervals must have the same data type for multiplication, lhs:Null, rhs:Int64"},
+                {"-v / 0 = 1 AND v > 0", dividend,
+                 "Can not run arithmetic negative on scalar value NULL"},
+                {"v / 0 + 1 = 1 AND v > 0", dividend,
+                 "Intervals must have the same data type for division, lhs:Null, rhs:Int64"},
+                {"-v > 100 AND v > 0", propagated,
+                 "Can not run arithmetic negative on scalar value NULL"},
+                {"v * 2 > 100 AND v < 0", propagated,
+                 "Intervals must have the same data type for multiplication, lhs:Null, rhs:Int64"},
+                {"v < 3 AND v * 2 > 100", propagated,
+                 "Only intervals with the same data type are comparable, lhs:Int64, rhs:Null"}
+              ] do
+            sql = "SELECT i FROM #{m} WHERE #{where}"
+
+            if sxc_local?() do
+              assert sxc_error(ctx, sql) === sxc_refused(local), where
+            else
+              assert sxc_error(ctx, sql) === {500, sxc_internal(engine)}, where
+            end
+          end
         end
       end
     end
@@ -3602,6 +4081,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
   defp decimal_refusal_tests do
     quote location: :keep do
       describe "SQL executor — contract: a decimal whose type the double does not know" do
+        @tag local_divergence: "Local refuses a decimal whose precision it does not model"
         test "an expression whose precision the double does not know is refused", ctx do
           m = sxc_unsigned(ctx)
 
@@ -3637,7 +4117,9 @@ defmodule InfluxElixir.Contract.SQLExecutor do
         end
 
         @tag engine_bug: "closed connection"
-        test "a float column past what the decimal holds closes the connection", ctx do
+        @tag local_divergence: "Local refuses what the engine answers by closing the connection"
+        test "a float column past what the decimal holds closes the connection (Local refuses it by name)",
+             ctx do
           m = sxc_name("sxc_decf")
           sxc_write(ctx, ["#{m} u=5u,f=1.0e21 #{sxc_ns(1)}"])
           sql = "SELECT u FROM #{m} WHERE u / 2 > f"
@@ -3750,6 +4232,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                       "#{m}.j, #{m}.time."}
         end
 
+        @tag local_divergence: "Local refuses a * beside other select items by name"
         test "a * beside other select items is refused, not counted as one item", ctx do
           m = sxc_ijf(ctx)
 
@@ -3819,7 +4302,8 @@ defmodule InfluxElixir.Contract.SQLExecutor do
         end
 
         @tag engine_bug: "DataFusion internal error"
-        test "a product, a quotient or a negation that leaves no value is the engine's own error",
+        @tag local_divergence: "Local refuses what the engine fails in its interval analysis"
+        test "a product, a quotient or a negation that leaves no value is the engine's own error (Local refuses it by name)",
              ctx do
           m = sxc_ijf(ctx)
 

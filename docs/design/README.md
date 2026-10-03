@@ -67,8 +67,9 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-10-02 | [`fourth-review`](2026-10-02_fourth-review.md) | Local: float overflow answers null, UInt64 columns typed, `INTEGER` casts are Int32, failing constants fold to the optimizer's 500, executor split; InfluxQL reserved words and second statements; re-entrant lock raises; whole-result `===` assertions, clock-free backpressure test |
 | 2026-10-02 | [`third-review`](2026-10-02_third-review.md) | Local: unaliased aggregates named as DataFusion names them, empty time and numeric ranges fail as on Core, qualified field lists, number literals, UTC aliases; InfluxQL parse errors and `GROUP BY` order; store locks without `:global`; strict `===` in contract tests |
 | 2026-10-02 | [`local-write-concurrency-retention-and-mixed-types`](2026-10-02_local-write-concurrency-retention-and-mixed-types.md) | Local: batched store writes (50 concurrent writers in 0.4 s, was a timeout), bounded chunked parse, v2 retention 422, mixed field types cut at the first differing group, `delete_bucket` clears data |
+| 2026-10-02 | [`sixth-review`](2026-10-02_sixth-review.md) | Review of 2b7b801: false refusals removed (guarded division, unsigned OR), InfluxQL GROUP BY time and fill, package file list fixed, Local internals by area and hidden from docs, engine facts moved into contracts, contract-tag lint |
 | 2026-10-02 | [`fifth-review`](2026-10-02_fifth-review.md) | Review of e71cf7b: query performance restored, scratch script removed from lib, contract modules split per part (suite 27-41 s → 8-10 s), shared test helpers, whole-row assertions, clock-free batch-writer retry tests |
-| 2026-10-02 | [`local-sql-simplifier-and-intervals`](2026-10-02_local-sql-simplifier-and-intervals.md) | Local SQL: the simplifier's rules, casts and divisions in the interval analysis, decimal-versus-float casts, integer literals past `UInt64`, `AND`/`OR` batches refused, `ORDER BY` aliases, `round`/`trunc` scales, parser errors for garbage statements; 100k-point regression fixed |
+| 2026-10-02 | [`local-sql-simplifier-and-intervals`](2026-10-02_local-sql-simplifier-and-intervals.md) | Local SQL: the simplifier's rules, casts, unsigned and float arithmetic and divisions by zero in the interval analysis, decimal-versus-float casts, integer literals past `UInt64`, the order the engine runs `AND`/`OR` operands in (fresh write against persisted table: guards answered, tag guards, what is refused), literal and parenthesised operands, `ORDER BY` aliases, `round`/`trunc` scales, the tokens of statement parser errors; 100k-point regression fixed |
 | 2026-09-30 | [`writer-timer-csv-gzip-restart`](2026-09-30_writer-timer-csv-gzip-restart.md) | BatchWriter timer re-armed; one-column v3 CSV rows kept; `gzip:` owned by `Writer`, Local reads bodies as the engines do; killed connection restarts alone; HTTP `execute_sql` params and `database: nil`; encoder 6x; token API mismatch recorded |
 | 2026-09-30 | [`local-write-speed-and-line-endings`](2026-09-30_local-write-speed-and-line-endings.md) | Local writes ~40% faster (byte trims, per-write column-kind cache, lazy `time` check); CRLF, `\r` and whitespace-only lines as both engines answer them |
 | 2026-09-29 | [`query-admin-modules-delegate`](2026-09-29_query-admin-modules-delegate.md) | `Query.*` and `Admin.*` call the facade: connection names resolve and queries emit telemetry, as through `InfluxElixir` |
@@ -111,4 +112,41 @@ docker run -d --rm --name influx3_auth -p 8183:8181 influxdb:3-core \
 mix test test/integration/tokens_v3_core_auth_test.exs --include v3_core_auth --include integration
 
 docker stop influx3_verify influx2_verify influx3_auth
+```
+
+## Contract tags
+
+The contract modules in `test/support` run each test against `Client.Local` and,
+in `test/integration`, against a real engine. Two tags say where the double and
+the engine part ways.
+
+- `@tag local_divergence: "why"` marks a test whose body branches on the client
+  under test, because `Client.Local` refuses by name what the engine answers. The
+  branch must be there for the tag and the tag for the branch:
+  `test/influx_elixir/contract_tags_test.exs` reads the contract sources and fails
+  on either one without the other, or on a tag with no reason.
+  `mix test test/influx_elixir/client/contract_local --only local_divergence`
+  lists them (add `--trace` to see the names).
+- `@tag engine_bug: "what"` marks a test that pins an engine defect (a closed
+  connection, a DataFusion internal error, a wrong answer) exactly as the engine
+  gives it today. When the double only refuses such a case, the test has both
+  assertions, the double's exact refusal text and the engine's answer, and its name
+  ends with `(Local refuses it by name)`.
+
+### Re-checking the pins after an engine upgrade
+
+After upgrading an engine, run only the engine-bug pins against it. A test that
+carries the `engine_bug` tag is run by `--only engine_bug` even though its module
+is excluded as `:integration`, so no `--include` is needed (adding
+`--include integration` would run the whole directory instead, since an included
+tag brings in every test it matches):
+
+```bash
+# Core: every pin the engine still shows (a failure means the defect is fixed or
+# changed: update the pin and the double together)
+mix test test/integration/contract_v3_core --only engine_bug --trace
+# Enterprise, when one is running on the configured port
+mix test test/integration/contract_v3_enterprise --only engine_bug --trace
+# The double's side of the same pins
+mix test test/influx_elixir/client/contract_local --only engine_bug --trace
 ```
