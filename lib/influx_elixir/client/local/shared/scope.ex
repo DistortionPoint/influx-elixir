@@ -4,7 +4,7 @@ defmodule InfluxElixir.Client.Local.Scope do
   # connection's profile has the operation, which database the call is for, and
   # whether the engine has it.
 
-  alias InfluxElixir.Client.Local.{DatabaseRules, LineProtocolParser, Store}
+  alias InfluxElixir.Client.Local.{DatabaseRules, LineProtocolParser, Retention, Store}
 
   # Operations supported by each profile.
   # An operation not in the list returns {:error, :unsupported_operation}.
@@ -123,6 +123,14 @@ defmodule InfluxElixir.Client.Local.Scope do
   def database_names(table) do
     table |> Store.databases() |> MapSet.put(DatabaseRules.internal()) |> Enum.sort()
   end
+
+  @doc """
+  A database's retention in whole seconds, or `nil` for none: `_internal`
+  keeps seven days (verified), a database its `retention_period`.
+  """
+  @spec retention(Store.t(), binary()) :: Retention.t()
+  def retention(_table, "_internal"), do: 7 * 86_400
+  def retention(table, database), do: Store.retention(table, database)
 
   @doc "`format:` as `Client.HTTP` sends it; see `InfluxElixir.Client.Local.Format`."
   @spec query_format(keyword()) :: term()

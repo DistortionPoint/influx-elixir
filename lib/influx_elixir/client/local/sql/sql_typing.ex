@@ -28,6 +28,8 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
       query
       | projection_columns: projection(query.projection_columns, unsigned?),
         select_columns: select_columns(query.select_columns, unsigned?),
+        having: having(query.having, unsigned?),
+        group_by_columns: groups(query.group_by_columns, unsigned?),
         where: nodes(query.where, unsigned?),
         order_by: order_by(query.order_by, unsigned?)
     }
@@ -50,8 +52,22 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
 
   defp select_columns(columns, unsigned?) do
     Enum.map(columns, fn
-      {:aggregate, agg, expr, output} -> {:aggregate, agg, expr(expr, unsigned?), output}
-      column -> column
+      {:aggregate, agg, expr, output} ->
+        {:aggregate, agg, expr(expr, unsigned?), output}
+
+      {:expression, expr, aggs, output} ->
+        {:expression, expr(expr, unsigned?), retype_aggs(aggs, unsigned?), output}
+
+      column ->
+        column
+    end)
+  end
+
+  @spec retype_aggs([{binary(), SQLParser.select_column()}], unsigned()) ::
+          [{binary(), SQLParser.select_column()}]
+  defp retype_aggs(aggs, unsigned?) do
+    Enum.map(aggs, fn {name, column} ->
+      {name, select_columns([column], unsigned?) |> hd()}
     end)
   end
 
@@ -62,6 +78,20 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
       term -> term
     end)
   end
+
+  defp groups(nil, _unsigned?), do: nil
+
+  defp groups(items, unsigned?) do
+    Enum.map(items, fn
+      {:expr, expr} -> {:expr, expr(expr, unsigned?)}
+      column -> column
+    end)
+  end
+
+  defp having(nil, _unsigned?), do: nil
+
+  defp having(%{nodes: nodes, aggs: aggs}, unsigned?),
+    do: %{nodes: nodes(nodes, unsigned?), aggs: retype_aggs(aggs, unsigned?)}
 
   @spec nodes([SQLParser.where_node()], unsigned()) :: [SQLParser.where_node()]
   defp nodes(nodes, unsigned?), do: Enum.map(nodes, &node(&1, unsigned?))

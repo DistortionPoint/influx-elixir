@@ -12,6 +12,7 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   # contains.
 
   alias InfluxElixir.Client.Local.{
+    SQLAggExpr,
     SQLClauses,
     SQLError,
     SQLExpr,
@@ -43,6 +44,7 @@ defmodule InfluxElixir.Client.Local.SQLBind do
     parts = [
       query.projection_columns,
       query.select_columns,
+      query.having,
       query.where,
       query.order_by,
       query.limit,
@@ -56,12 +58,14 @@ defmodule InfluxElixir.Client.Local.SQLBind do
       names ->
         with :ok <- all_bound(names, params),
              {:ok, where} <- bind_where_nodes(query.where, params),
+             {:ok, having} <- bind_having(query.having, params),
              {:ok, limit, offset, limit_error} <-
                SQLLimit.bind(query.limit, query.offset, params) do
           {:ok,
            %{
              query
              | where: where,
+               having: having,
                projection_columns: bind_projection(query.projection_columns, params),
                select_columns: bind_select_columns(query.select_columns, params),
                order_by: bind_order_by(query.order_by, params),
@@ -245,10 +249,35 @@ defmodule InfluxElixir.Client.Local.SQLBind do
 
   defp bind_select_columns(columns, params) do
     Enum.map(columns, fn
-      {:aggregate, agg, expr, output} -> {:aggregate, agg, bind_expr(expr, params), output}
-      {:constant, {:param, name}, output} -> {:constant, Map.fetch!(params, name), output}
-      column -> column
+      {:aggregate, agg, expr, output} ->
+        {:aggregate, agg, bind_expr(expr, params), output}
+
+      {:constant, {:param, name}, output} ->
+        {:constant, Map.fetch!(params, name), output}
+
+      {:expression, expr, aggs, output} ->
+        {:expression, bind_expr(expr, params), bind_aggs(aggs, params), output}
+
+      column ->
+        column
     end)
+  end
+
+  @spec bind_aggs([{binary(), SQLSelect.column()}], %{binary() => term()}) ::
+          [{binary(), SQLSelect.column()}]
+  defp bind_aggs(aggs, params) do
+    names = Enum.map(aggs, &elem(&1, 0))
+    columns = bind_select_columns(Enum.map(aggs, &elem(&1, 1)), params)
+    Enum.zip(names, columns)
+  end
+
+  @spec bind_having(SQLAggExpr.having_t() | nil, %{binary() => term()}) ::
+          {:ok, SQLAggExpr.having_t() | nil} | {:error, map()}
+  defp bind_having(nil, _params), do: {:ok, nil}
+
+  defp bind_having(%{nodes: nodes, aggs: aggs}, params) do
+    with {:ok, nodes} <- bind_where_nodes(nodes, params),
+         do: {:ok, %{nodes: nodes, aggs: bind_aggs(aggs, params)}}
   end
 
   @spec bind_order_by(SQLClauses.order_by(), %{binary() => term()}) :: SQLClauses.order_by()

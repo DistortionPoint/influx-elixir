@@ -199,11 +199,13 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert BatchWriter.backoff_delay(3, 0, 100) === 800
     end
 
-    test "jitter adds randomness within the bound" do
-      # base=100, attempt=1, jitter=50 → between 200 and 250
-      delay = BatchWriter.backoff_delay(1, 50, 100)
-      assert delay >= 200
-      assert delay <= 250
+    test "jitter adds 1..jitter_ms to the delay and is not constant" do
+      # base=7000, attempt=1, jitter=20 → between 14_001 and 14_020
+      delays = for _draw <- 1..30, do: BatchWriter.backoff_delay(1, 20, 7_000)
+
+      assert Enum.all?(delays, &(&1 in 14_001..14_020))
+      # 30 draws from 20 values are all equal with probability 20^-29.
+      assert length(Enum.uniq(delays)) > 1
     end
   end
 
@@ -255,58 +257,64 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       :ok = BatchWriter.write(pid, line(1.0, 1))
       :ok = BatchWriter.write(pid, line(2.0, 2))
       assert BatchWriter.stats(pid) === stats(1, 0, byte_size(first))
-      assert is_integer(:erlang.read_timer(timer_ref(pid)))
 
       :ok = BatchWriter.write(pid, line(3.0, 3))
       send(pid, :flush)
       assert BatchWriter.stats(pid) === stats(2, 0, byte_size(first) + byte_size(line(3.0, 3)))
-
-      assert BatchWriter.stats(pid) === stats(2, 0, byte_size(first) + byte_size(line(3.0, 3)))
       assert stored(conn, "cpu") === [row(1.0, 1), row(2.0, 2), row(3.0, 3)]
-    end
-
-    test "the timer keeps flushing after an explicit flush/2", %{conn: conn} do
-      pid = start_writer(conn, flush_interval_ms: 50)
-
-      :ok = BatchWriter.write(pid, line(1.0, 1))
-      :ok = BatchWriter.flush(pid)
-      assert BatchWriter.stats(pid) === stats(1, 0, byte_size(line(1.0, 1)))
-
-      :ok = BatchWriter.write(pid, line(2.0, 2))
-      await_writes(pid, 2)
-
-      assert BatchWriter.stats(pid) === stats(2, 0, byte_size(line(1.0, 1) <> line(2.0, 2)))
-      assert stored(conn, "cpu") === [row(1.0, 1), row(2.0, 2)]
-    end
-
-    test "the timer keeps flushing after a write_sync/3", %{conn: conn} do
-      pid = start_writer(conn, flush_interval_ms: 50)
-
-      :ok = BatchWriter.write_sync(pid, line(1.0, 1))
-      :ok = BatchWriter.write(pid, line(2.0, 2))
-      await_writes(pid, 2)
-
-      assert BatchWriter.stats(pid) === stats(2, 0, byte_size(line(1.0, 1) <> line(2.0, 2)))
     end
   end
 
-  # The writer's pending flush timer, from its state.
-  defp timer_ref(pid), do: :sys.get_state(pid).timer_ref
+  # Every timer the writer sets goes through `:erlang.send_after`, and every one
+  # it drops through `:erlang.cancel_timer`. The delay of the first is the one
+  # thing that tells jitter (or a backoff base) from its absence, and it is
+  # random or buried in a timer wheel. A trace session on the writer hands the
+  # test each call's arguments as a message, so the delays and the order of the
+  # calls are read exactly and no clock is involved. The session belongs to this
+  # test: it traces only the writer under test, and is destroyed when the test
+  # ends, so no trace pattern outlives it.
+  defp trace_timers(pid) do
+    session = :trace.session_create(:batch_writer_timers, self(), [])
+    on_exit(fn -> :trace.session_destroy(session) end)
+
+    1 = :trace.process(session, pid, true, [:call])
+    2 = :trace.function(session, {:erlang, :send_after, :_}, true, [:global])
+    2 = :trace.function(session, {:erlang, :cancel_timer, :_}, true, [:global])
+    :ok
+  end
+
+  # The timer calls the writer makes, in order, up to and including the next
+  # `send_after` of `kind`: `[:cancel_timer, {:send_after, delay}]`.
+  defp timer_calls(pid, kind) do
+    receive do
+      {:trace, ^pid, :call, {:erlang, :cancel_timer, _args}} ->
+        [:cancel_timer | timer_calls(pid, kind)]
+
+      {:trace, ^pid, :call, {:erlang, :send_after, [delay, _dest, message | _opts]}} ->
+        if kind_of(message) === kind,
+          do: [{:send_after, delay}],
+          else: [{:send_after, delay} | timer_calls(pid, kind)]
+    after
+      5_000 -> flunk("the writer set no #{kind} timer")
+    end
+  end
+
+  defp kind_of(:flush), do: :flush
+  defp kind_of({:retry, _chain, _attempt}), do: :retry
+  defp kind_of(_message), do: :other
+
+  defp next_retry_delay(pid) do
+    pid |> timer_calls(:retry) |> List.last() |> elem(1)
+  end
 
   # Every flush restarts the interval (the moduledoc's promise): the pending
-  # timer is cancelled and a new one runs. Intervals here are far longer than
+  # timer is cancelled and a new one is set. Intervals here are far longer than
   # the test, so no timer fires and no clock is read.
   defp assert_restarts_timer(pid, trigger) do
-    before = timer_ref(pid)
-    assert is_integer(:erlang.read_timer(before))
-
+    :ok = trace_timers(pid)
     trigger.()
 
-    pending = timer_ref(pid)
-    assert is_reference(pending)
-    assert pending != before
-    assert :erlang.read_timer(before) === false
-    assert is_integer(:erlang.read_timer(pending))
+    assert [:cancel_timer, {:send_after, 600_000}] = timer_calls(pid, :flush)
   end
 
   describe "the flush interval restarts on every flush" do
@@ -344,36 +352,6 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
-  # Every timer the writer sets goes through `:erlang.send_after`, whose delay
-  # is the one thing that tells jitter (or a backoff base) from its absence,
-  # and it is random or buried in a timer wheel. Call tracing the writer
-  # hands the test each call's arguments as a message, so the delays are
-  # read exactly and no clock is involved. The trace pattern is set once and
-  # only the writer under test is traced.
-  defp trace_timers(pid) do
-    :erlang.trace_pattern({:erlang, :send_after, :_}, true, [:global])
-    1 = :erlang.trace(pid, true, [:call])
-    :ok
-  end
-
-  defp next_flush_delay(pid) do
-    receive do
-      {:trace, ^pid, :call, {:erlang, :send_after, [delay, _dest, :flush | _opts]}} -> delay
-    after
-      5_000 -> flunk("the writer set no flush timer")
-    end
-  end
-
-  defp next_retry_delay(pid) do
-    receive do
-      {:trace, ^pid, :call,
-       {:erlang, :send_after, [delay, _dest, {:retry, _chain, _attempt} | _opts]}} ->
-        delay
-    after
-      5_000 -> flunk("the writer set no retry timer")
-    end
-  end
-
   describe "jitter_ms on the flush timer" do
     test "adds 1..jitter_ms to every interval", %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 600_000, jitter_ms: 20)
@@ -383,7 +361,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
         for i <- 1..30 do
           :ok = BatchWriter.write(pid, line(i, i))
           :ok = BatchWriter.flush(pid)
-          next_flush_delay(pid)
+          next_flush_delay_after_cancel(pid)
         end
 
       assert Enum.all?(delays, &(&1 in 600_001..600_020))
@@ -398,8 +376,15 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       :ok = BatchWriter.write(pid, line(1.0, 1))
       :ok = BatchWriter.flush(pid)
 
-      assert next_flush_delay(pid) === 600_000
+      assert next_flush_delay_after_cancel(pid) === 600_000
     end
+  end
+
+  # The delay of the flush timer set by the flush the test just made, which
+  # first cancels the pending one.
+  defp next_flush_delay_after_cancel(pid) do
+    assert [:cancel_timer, {:send_after, delay}] = timer_calls(pid, :flush)
+    delay
   end
 
   describe "retry timers" do
@@ -421,31 +406,6 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       :ok = BatchWriter.write(pid, "cpu value=1.0")
 
       assert next_retry_delay(pid) === 14_000
-      :ok = stop_supervised!(BatchWriter)
-    end
-
-    test "jitter_ms adds 1..jitter_ms to a retry's delay", %{finch: finch} do
-      pid =
-        start_http_writer(finch, TestServer.controlled(owner: answering_owner(503)),
-          batch_size: 100,
-          max_retries: 2,
-          base_retry_delay_ms: 7_000,
-          jitter_ms: 20
-        )
-
-      :ok = trace_timers(pid)
-
-      # Each flush starts a chain whose first attempt fails at once; its retry is
-      # 14_000 away.
-      delays =
-        for i <- 1..30 do
-          :ok = BatchWriter.write(pid, "cpu value=#{i}.0")
-          :ok = BatchWriter.flush(pid)
-          next_retry_delay(pid)
-        end
-
-      assert Enum.all?(delays, &(&1 in 14_001..14_020))
-      assert length(Enum.uniq(delays)) > 1
       :ok = stop_supervised!(BatchWriter)
     end
   end

@@ -116,6 +116,56 @@ defmodule InfluxElixir.Client.Local.SQLMask do
     end
   end
 
+  @doc """
+  A masked text with the `FROM` that is not a clause's blanked: one inside
+  parentheses (`EXTRACT(minute FROM time)`) and the one of `IS [NOT] DISTINCT
+  FROM`. Offsets are those of the text.
+  """
+  @spec hide_inner_from(binary()) :: binary()
+  def hide_inner_from(masked) do
+    masked
+    |> hide_in_parentheses(0, [])
+    |> IO.iodata_to_binary()
+    |> then(
+      &Regex.replace(~r/\b(IS\s+(?:NOT\s+)?DISTINCT\s+)FROM\b/iu, &1, fn _all, head ->
+        head <> "xxxx"
+      end)
+    )
+  end
+
+  @spec hide_in_parentheses(binary(), non_neg_integer(), iodata()) :: iodata()
+  defp hide_in_parentheses(<<>>, _depth, acc), do: Enum.reverse(acc)
+
+  defp hide_in_parentheses(<<?(, rest::binary>>, depth, acc),
+    do: hide_in_parentheses(rest, depth + 1, [?( | acc])
+
+  defp hide_in_parentheses(<<?), rest::binary>>, depth, acc),
+    do: hide_in_parentheses(rest, max(depth - 1, 0), [?) | acc])
+
+  defp hide_in_parentheses(<<word::binary-size(4), rest::binary>> = text, depth, acc)
+       when depth > 0 do
+    if String.upcase(word) == "FROM" and boundary?(acc) and not word_start?(rest),
+      do: hide_in_parentheses(rest, depth, ["xxxx" | acc]),
+      else: skip_byte(text, depth, acc)
+  end
+
+  defp hide_in_parentheses(text, depth, acc), do: skip_byte(text, depth, acc)
+
+  defp skip_byte(<<byte, rest::binary>>, depth, acc),
+    do: hide_in_parentheses(rest, depth, [byte | acc])
+
+  @spec boundary?(iodata()) :: boolean()
+  defp boundary?([]), do: true
+  defp boundary?([byte | _acc]) when is_integer(byte), do: not word_byte?(byte)
+  defp boundary?(_other), do: true
+
+  @spec word_start?(binary()) :: boolean()
+  defp word_start?(<<byte, _rest::binary>>), do: word_byte?(byte)
+  defp word_start?(<<>>), do: false
+
+  @spec word_byte?(byte()) :: boolean()
+  defp word_byte?(byte), do: byte in ?a..?z or byte in ?A..?Z or byte in ?0..?9 or byte == ?_
+
   @doc "The text a `{start, length}` capture covers, or `\"\"` for a group that did not match."
   @spec cut(binary(), {integer(), non_neg_integer()}) :: binary()
   def cut(_text, {-1, _length}), do: ""

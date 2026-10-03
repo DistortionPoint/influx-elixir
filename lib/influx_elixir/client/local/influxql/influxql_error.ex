@@ -21,11 +21,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
     order_time: "invalid ORDER BY, expected TIME column",
     limit: "invalid LIMIT clause, expected unsigned integer",
     offset: "invalid OFFSET clause, expected unsigned integer",
+    slimit: "invalid SLIMIT clause, expected unsigned integer",
+    soffset: "invalid SOFFSET clause, expected unsigned integer",
     group_by: "invalid GROUP BY clause, expected BY",
     distinct: "invalid DISTINCT expression, expected identifier",
     unsigned: "unable to parse unsigned integer",
     time_call: "invalid TIME call, expected 1 or 2 arguments",
+    time_interval: "invalid TIME call, expected a duration for the interval",
+    time_close: "invalid TIME call, expected ')'",
+    wildcard_type: "invalid wildcard type specifier, expected TAG or FIELD",
+    data_type:
+      "invalid data type for tag or field reference, " <>
+        "expected float, integer, unsigned, string, boolean, field, tag",
     fill: "invalid FILL option, expected NULL, NONE, PREVIOUS, LINEAR, or a number",
+    comment: "invalid inline comment, missing closing */",
     unterminated_string: "unterminated string literal",
     unterminated_regex: "unterminated regex literal"
   }
@@ -56,6 +65,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   defp leftover(whole, pos), do: binary_part(whole, pos, byte_size(whole) - pos)
 
   @split_prefix "rewriting statement\ncaused by\nsplit condition\ncaused by\n"
+
+  @doc "The error the engine raises while it rewrites the statement."
+  @spec rewrite_error(binary()) :: binary()
+  def rewrite_error(message), do: "rewriting statement\ncaused by\n" <> message
 
   @doc """
   The planning error the engine raises while it splits the `WHERE` from its

@@ -14,9 +14,13 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     SQLError,
     SQLExecutor,
     SQLIdentifiers,
+    SQLInformation,
     SQLLexer,
     SQLParser,
+    SQLRewrite,
+    SQLShow,
     SQLStatement,
+    SQLSyntax,
     Store
   }
 
@@ -71,7 +75,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
       statement_kind(statement) == :query ->
         Format.answer(
           Scope.query_format(opts),
-          fn -> query_database(table, database, statement, params) end,
+          fn -> query_database(table, database, {sql, statement}, params) end,
           database,
           params
         )
@@ -87,22 +91,38 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
   defp parsed(sql, %{status: 400, body: "Client.Local: " <> _rest} = refusal),
     do: SQLStatement.parser_error(sql) || refusal
 
+  # Several statements are the engine's 405 once each of them reads.
+  defp parsed(sql, %{status: 405} = several) do
+    case SQLSyntax.check_statements(sql) do
+      :ok -> several
+      {:error, _error} = parse_error -> elem(parse_error, 1)
+    end
+  end
+
   defp parsed(_sql, error), do: error
 
-  @spec query_database(Store.t(), binary(), binary(), QueryParams.t()) ::
+  @spec query_database(Store.t(), binary(), {binary(), binary()}, QueryParams.t()) ::
           InfluxElixir.Client.query_result()
-  defp query_database(table, database, sql, params) do
+  defp query_database(table, database, {original, statement}, params) do
+    # The parser's error names the line and column of the text as it was written, comments
+    # and all; the text the lexer rewrote (dollar-quoted and escape strings) is read as
+    # rewritten, by `SQLParser`.
     with :ok <- Scope.database_exists(table, database),
-         do: run_query(table, database, sql, params)
+         :ok <- written_syntax(original),
+         do: run_query(table, database, statement, params)
   end
+
+  @spec written_syntax(binary()) :: :ok | {:error, SQLError.t()}
+  defp written_syntax(original), do: SQLSyntax.check_statements(original)
 
   @spec run_query(Store.t(), binary(), binary(), QueryParams.t()) ::
           InfluxElixir.Client.query_result()
   defp run_query(table, database, sql, params) do
-    with {:ok, query} <- SQLParser.parse_select(sql) do
+    with {:ok, text} <- show(table, database, SQLRewrite.apply(sql)),
+         {:ok, query} <- SQLParser.parse_select(text) do
       case SQLExecutor.run(
              query,
-             &Scope.point_source(table, database, &1),
+             &SQLInformation.fetch(table, database, &1),
              QueryParams.engine_values(params),
              &Store.column_kind(table, database, &1, &2)
            ) do
@@ -110,6 +130,25 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
         rows -> {:ok, rows}
       end
     end
+  end
+
+  # `SHOW TABLES` and `SHOW COLUMNS` are the queries the engine runs for them.
+  @spec show(Store.t(), binary(), binary()) :: {:ok, binary()} | {:error, SQLError.t()}
+  defp show(table, database, sql) do
+    case SQLShow.rewrite(sql) do
+      :nomatch -> {:ok, sql}
+      {:error, _error} = error -> error
+      {:ok, query, nil} -> {:ok, query}
+      {:ok, query, measurement} -> exists(table, database, measurement, query)
+    end
+  end
+
+  @spec exists(Store.t(), binary(), binary(), binary()) ::
+          {:ok, binary()} | {:error, SQLError.t()}
+  defp exists(table, database, measurement, query) do
+    if Store.table?(table, database, measurement),
+      do: {:ok, query},
+      else: {:error, SQLError.planning("table 'public.iox.#{measurement}' not found")}
   end
 
   @spec query_sql_stream(
@@ -176,6 +215,9 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
         {:planning, message} ->
           {:error, %{status: 400, body: "Error during planning: " <> message}}
 
+        {:refusal, message} ->
+          {:error, SQLError.refusal(message)}
+
         :unsupported ->
           {:error,
            SQLStatement.parser_error(sql) ||
@@ -205,7 +247,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
 
   # Regexes nested in a list cannot be module attributes on OTP 28, so the
   # table is a function.
-  @spec statement_kinds() :: [{Regex.t(), atom() | {:planning, binary()}}]
+  @spec statement_kinds() :: [{Regex.t(), atom() | {:planning | :refusal, binary()}}]
   defp statement_kinds do
     [
       # Statements the engine answers with rows. The ones the double does
@@ -213,6 +255,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
       # refused by name there, not reported as unimplemented.
       {~r/^(?i)(?:SELECT|WITH|EXPLAIN|SHOW|DESCRIBE)\b|^\(/, :query},
       {~r/^(?i)DELETE\b/, :delete},
+      {~r/^(?i)VALUES\b/, {:refusal, "a VALUES statement: the double reads no VALUES rows"}},
       {~r/^(?i)INSERT\b/, {:planning, "DML not supported: Insert Into"}},
       {~r/^(?i)UPDATE\b/, {:planning, "DML not supported: Update"}},
       {~r/^(?i)CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b/,
@@ -234,7 +277,8 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     ]
   end
 
-  @spec statement_kind(binary()) :: :query | :delete | {:planning, binary()} | :unsupported
+  @spec statement_kind(binary()) ::
+          :query | :delete | {:planning, binary()} | {:refusal, binary()} | :unsupported
   defp statement_kind(sql) do
     Enum.find_value(statement_kinds(), :unsupported, fn {pattern, kind} ->
       if Regex.match?(pattern, sql), do: kind

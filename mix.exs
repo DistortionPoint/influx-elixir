@@ -29,7 +29,9 @@ defmodule InfluxElixir.MixProject do
           # Test support modules (not library code)
           InfluxElixir.InfluxCase,
           InfluxElixir.IntegrationHelper,
-          InfluxElixir.TestHelper
+          InfluxElixir.TestHelper,
+          # The contracts and their helpers live in test/support
+          ~r/^InfluxElixir\.(Contract|ClientContract|TestSupport|TestServer|TokenContract)/
         ]
       ],
 
@@ -88,8 +90,45 @@ defmodule InfluxElixir.MixProject do
         "credo --strict",
         "dialyzer",
         "sobelow --config"
-      ]
+      ],
+      test: &run_tests/1
     ]
+  end
+
+  # The 65 integration modules cost about 23 s of CPU to compile and every one of
+  # them is excluded by tag unless `--include integration` is given. A bare
+  # `mix test` therefore runs only the test directories that are not
+  # `test/integration`. The integration suites are compiled when a path under
+  # `test/integration` is named, or when INTEGRATION=1 is set:
+  #
+  #     mix test test/integration/contract_v3_core --include integration --include v3_core
+  #     INTEGRATION=1 mix test --include integration --include v3_core
+  @non_unit_test_entries ~w(integration support fixtures test_helper.exs)
+
+  defp run_tests(args) do
+    Mix.Task.run("test", test_args(args, System.get_env("INTEGRATION")))
+  end
+
+  defp test_args(args, integration) do
+    if integration in [nil, "", "0"] and not Enum.any?(args, &test_path?/1) do
+      unit_test_paths() ++ args
+    else
+      args
+    end
+  end
+
+  defp test_path?(arg) do
+    [path | _line_filters] = String.split(arg, ":")
+    String.starts_with?(path, "test") and File.exists?(path)
+  end
+
+  defp unit_test_paths do
+    "test"
+    |> File.ls!()
+    |> Enum.reject(&(&1 in @non_unit_test_entries))
+    |> Enum.filter(&(File.dir?(Path.join("test", &1)) or String.ends_with?(&1, "_test.exs")))
+    |> Enum.sort()
+    |> Enum.map(&Path.join("test", &1))
   end
 
   defp dialyzer do

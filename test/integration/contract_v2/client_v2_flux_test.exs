@@ -1,7 +1,7 @@
 defmodule InfluxElixir.Integration.ContractV2.ClientV2FluxTest do
   @moduledoc """
   The `:v2_flux` part of `InfluxElixir.ClientContract`
-  (the Flux pipeline and queries)
+  (Flux query errors)
   against the real server of the `:v2` profile.
   Run with `mix test --include integration --include v2`.
   """

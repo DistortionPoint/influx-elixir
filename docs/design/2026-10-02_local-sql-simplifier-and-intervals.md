@@ -352,3 +352,52 @@ on Core tables of the same shapes (the guard idioms, the tag guards, the
 suites run the tests themselves. The benchmark is
 `tmp/`-local; reductions at 100,000 points, b98d373 against this change,
 are in the commit message.
+
+---
+
+## Addendum: the sixth review's SQL changes
+
+**Guarded division.** `SQLBatch.filter/2` probed every row for a failing
+operand. It now decides from the data: a conjunction is guarded only when a
+divisor holds `0` or `-1`, a negation or `abs` meets the `Int64` minimum, a
+`round`/`trunc` scale leaves `Int32`, or a cast or call can fail on a value
+present. Otherwise it is the plain filter. A guarded query splits the rows
+into risk-free ones (the tag guard decides them) and risky ones. Reductions
+at 2,000 points, min of 3, against the commit before: guarded division
+235,170 against 236,059; the same selecting 93,130 against 187,995; `OR` guard
+253,436 against 291,734; plain `WHERE` 104,863 against 125,317. A table with a
+zero in every row costs more than before (about 300K against 24K) because
+the engine's failure is now computed instead of guessed.
+`SQLCondition` no longer calls `SQLBatch`, which breaks the runtime cycle
+between them; the executor calls `SQLBatch.filter/2`.
+
+**Engine-shaped errors.** `SQLSyntax` is a token recogniser that returns the
+parser's own message (`Expected: an expression, found: EOF`, `Expected: end
+of statement, found: X at Line: L, Column: C`, ...) for a statement the
+engine's parser rejects, and gives up (`:ok`) on a construct it does not read.
+It was fuzzed over about 3,600 mutated queries against Core. A `WHERE` that is
+no boolean, `LIKE` over `time` and `GROUP BY ()` (405, "Empty tuple not
+supported yet") carry the planner's bodies. `iox.t` and `public.iox.t` resolve
+to the table, another schema or catalog is "table '...' not found";
+`information_schema.tables|columns|schemata` and `SHOW TABLES|COLUMNS` are
+modelled, pinned to Core 3.10.1.
+
+**Expressions.** `SQLExpr` reads a full boolean grammar (`CASE`, `IN`,
+`BETWEEN`, `LIKE`, `IS [NOT] NULL|TRUE|FALSE|DISTINCT FROM`, `||`, `::`);
+`SQLExprType`, `SQLExprCheck`, `SQLScalarCheck` and `SQLCoerce` give the
+planner's type and coercion errors; `SQLScalar` evaluates the string and math
+functions. Aggregates inside expressions and `HAVING` are placeholders
+(`__agN__`) evaluated per group (`SQLAggExpr`). Core facts found on the way:
+a column name is never parenthesised (`ag.n + Int64(1) * ag.x - Int64(1)`);
+`pow` overflow, a negative `pow` exponent, `substr` with a negative length and
+an integer division by zero close the connection; `IS DISTINCT FROM` swallows
+a following `AND`/`OR` into its right operand; a JSON NaN or infinity is
+`null` with the key present.
+
+**Still refused** (listed in the guide): the date and time functions
+(`date_trunc`, `extract`, `INTERVAL` arithmetic, the string `date_bin`),
+`date_bin_gapfill`, `approx_percentile_cont`, windows, joins other than
+`CROSS JOIN`, set operations, subqueries, `VALUES`, `ROLLUP`/`CUBE`, table
+functions and the `system.*` tables. `var_*`/`stddev*` can differ from the
+engine in the last digit: its result depends on how it splits the rows into
+batches (merging two halves of eleven values gave six different last digits).

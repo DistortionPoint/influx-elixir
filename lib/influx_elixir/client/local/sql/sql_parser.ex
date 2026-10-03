@@ -30,6 +30,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   alias InfluxElixir.Client.Local.{
     LineProtocolParser,
+    SQLAggExpr,
     SQLBind,
     SQLClauses,
     SQLDistinctOn,
@@ -39,9 +40,12 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     SQLLexer,
     SQLLimit,
     SQLMask,
+    SQLNoFrom,
     SQLPredicate,
     SQLQualifier,
     SQLSelect,
+    SQLSyntax,
+    SQLTable,
     SQLTime,
     SQLWhere
   }
@@ -52,7 +56,13 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @select_pattern ~r/(?i)^\s*SELECT\s+(?<distinct>DISTINCT\s+)?(?<columns>.+?)\s+FROM\s+(?:"(?<quoted>[^"]+)"|(?<bare>(?:[^\s\\]|\\.)+))\s*(?<rest>.*)$/su
 
   @typedoc false
-  @typep split :: %{distinct: boolean(), columns: binary(), table: binary(), rest: binary()}
+  @typep split :: %{
+           distinct: boolean(),
+           columns: binary(),
+           table: binary(),
+           table_error: SQLError.t() | nil,
+           rest: binary()
+         }
 
   @typedoc "An arithmetic expression; see `t:InfluxElixir.Client.Local.SQLExpr.t/0`."
   @type expr :: SQLExpr.t()
@@ -64,7 +74,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @type aggregate :: SQLSelect.aggregate()
 
   @typedoc "One column of an aggregate or grouped select list."
-  @type select_column :: SQLSelect.column()
+  @type select_column :: SQLSelect.column() | SQLAggExpr.column()
 
   @typedoc "The comparison, set and pattern operators of a predicate."
   @type where_op :: SQLPredicate.op()
@@ -109,7 +119,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           limit: non_neg_integer() | nil,
           offset: non_neg_integer() | nil,
           group_by_interval: non_neg_integer() | nil,
-          group_by_columns: [binary()] | nil,
+          group_by_columns: [binary() | {:expr, SQLExpr.t()}] | nil,
           select_columns: [select_column()] | nil,
           distinct_columns: [binary()] | nil,
           distinct_on: [binary()] | nil,
@@ -119,7 +129,9 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           qualifier: binary(),
           qualified: %{binary() => binary()},
           plan_error: SQLError.t() | nil,
-          limit_error: SQLError.t() | nil
+          limit_error: SQLError.t() | nil,
+          table_error: SQLError.t() | nil,
+          having: SQLAggExpr.having_t() | nil
         }
 
   @typedoc """
@@ -140,12 +152,23 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_select(binary(), keyword()) :: {:ok, parsed_query()} | {:error, term()}
   def parse_select(sql, opts \\ []) do
     with {:ok, scrubbed} <- SQLLexer.scrub(sql),
+         :ok <- syntax(sql, opts),
          {:ok, text} <- unwrap(scrubbed),
          {:ok, cte_sources, main_sql} <- split_ctes(String.trim(fold_identifiers(text, opts))),
          {:ok, ctes} <- parse_ctes(cte_sources),
          {:ok, main} <- parse_single_select(main_sql) do
       {:ok, %{main | ctes: ctes}}
+    else
+      {:error, %{body: body} = error} -> {:error, %{error | body: SQLNoFrom.restore(body)}}
+      other -> other
     end
+  end
+
+  # The text the double writes itself (from InfluxQL) is well formed; any
+  # other is read as the engine's parser reads it.
+  @spec syntax(binary(), keyword()) :: :ok | {:error, SQLError.t()}
+  defp syntax(sql, opts) do
+    if Keyword.get(opts, :identifiers, :fold) == :exact, do: :ok, else: SQLSyntax.check(sql)
   end
 
   # A query in parentheses is the query (`(SELECT ...)`, `((SELECT ...))`). An
@@ -232,7 +255,9 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @spec parse_single_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
   defp parse_single_select(sql) do
-    {sql, cross_join} = sql |> String.trim() |> SQLQualifier.split_cross_join()
+    {sql, cross_join} =
+      sql |> String.trim() |> SQLNoFrom.add_table() |> SQLQualifier.split_cross_join()
+
     {normalised, qualifier, qualified} = SQLQualifier.strip(sql, cross_join)
 
     {normalised, on} = SQLDistinctOn.split(normalised)
@@ -247,7 +272,14 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          {:ok, split, normalised} <- resolve_references(split, normalised, naming),
          {:ok, query} <- dispatch_select(split, normalised, naming),
          {:ok, query} <- SQLDistinctOn.apply(query, on) do
-      {:ok, %{query | cross_join: cross_join, qualifier: qualifier, qualified: qualified}}
+      {:ok,
+       %{
+         query
+         | cross_join: cross_join,
+           qualifier: qualifier,
+           qualified: qualified,
+           table_error: split.table_error
+       }}
     end
   end
 
@@ -285,7 +317,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp item_name(item, qualifier) do
     parsed =
       if SQLSelect.aggregate_query?(item),
-        do: SQLSelect.parse_list(item, qualifier),
+        do: SQLAggExpr.parse_list(item, qualifier),
         else: parse_projection_column(item, qualifier)
 
     case parsed do
@@ -306,31 +338,69 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @spec split_select(binary()) :: {:ok, split()} | {:error, term()}
   defp split_select(sql) do
-    case Regex.named_captures(@select_pattern, SQLMask.mask(sql), return: :index) do
+    masked = sql |> SQLMask.mask() |> SQLMask.hide_inner_from()
+
+    case Regex.named_captures(@select_pattern, masked, return: :index) do
       nil ->
         unsupported(sql)
 
       indexes ->
         part = fn name -> SQLMask.cut(sql, Map.fetch!(indexes, name)) end
 
-        table =
-          case part.("quoted") do
-            "" -> LineProtocolParser.unescape_measurement(part.("bare"))
-            quoted -> String.replace(quoted, ~s(""), ~s("))
-          end
+        {table, table_error} = table_reference(part.("quoted"), part.("bare"))
 
-        {:ok, select_parts(part.("distinct") != "", String.trim(part.("columns")), table, part)}
+        {:ok,
+         select_parts(
+           part.("distinct") != "",
+           String.trim(part.("columns")),
+           {table, table_error},
+           part
+         )}
     end
   end
 
   # `SELECT DISTINCT FROM t` has no column: the pattern reads DISTINCT as the
   # (only) column, and the engine reads it as a DISTINCT over nothing.
-  @spec select_parts(boolean(), binary(), binary(), (binary() -> binary())) :: split()
-  defp select_parts(distinct, columns, table, part) do
-    if not distinct and String.upcase(columns) == "DISTINCT",
-      do: %{distinct: true, columns: "", table: table, rest: part.("rest")},
-      else: %{distinct: distinct, columns: columns, table: table, rest: part.("rest")}
+  @spec select_parts(
+          boolean(),
+          binary(),
+          {binary(), SQLError.t() | nil},
+          (binary() -> binary())
+        ) :: split()
+  defp select_parts(distinct, columns, {table, table_error}, part) do
+    # The engine reads a comma that ends the select list as nothing.
+    columns = Regex.replace(~r/,\s*\z/u, columns, "")
+
+    {distinct, columns} =
+      if not distinct and String.upcase(columns) == "DISTINCT",
+        do: {true, ""},
+        else: {distinct, columns}
+
+    %{
+      distinct: distinct,
+      columns: columns,
+      table: table,
+      table_error: table_error,
+      rest: part.("rest")
+    }
   end
+
+  # The table a `FROM` names: a quoted one is a measurement of that name, a
+  # bare one with dots is a qualified reference (see `SQLTable`), any other
+  # a measurement.
+  @spec table_reference(binary(), binary()) :: {binary(), SQLError.t() | nil}
+  defp table_reference("", bare) do
+    if Regex.match?(~r/\A[\p{L}\p{N}_$]+(?:\.[\p{L}\p{N}_$]+)+\z/u, bare) do
+      case SQLTable.resolve(bare) do
+        {:ok, %{measurement: measurement}} -> {measurement, nil}
+        {:error, error} -> {bare, error}
+      end
+    else
+      {LineProtocolParser.unescape_measurement(bare), nil}
+    end
+  end
+
+  defp table_reference(quoted, _bare), do: {String.replace(quoted, ~s(""), ~s(")), nil}
 
   @spec dispatch_select(split(), binary(), binary() | nil) ::
           {:ok, parsed_query()} | {:error, term()}
@@ -339,9 +409,17 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   defp dispatch_select(split, sql, qualifier) do
     cond do
-      SQLSelect.aggregate_query?(sql) -> parse_aggregate_select(split, sql, qualifier)
-      split.columns == "*" -> build_star_query(split.table, split.rest)
-      true -> build_columns_query(split.columns, split.table, split.rest, qualifier)
+      split.columns == "*" and SQLClauses.empty_tuple_error(split.rest) ->
+        build_star_query(split.table, split.rest)
+
+      SQLSelect.aggregate_query?(sql) ->
+        parse_aggregate_select(split, sql, qualifier)
+
+      split.columns == "*" ->
+        build_star_query(split.table, split.rest)
+
+      true ->
+        build_columns_query(split.columns, split.table, split.rest, qualifier)
     end
   end
 
@@ -352,8 +430,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # called `offset` or `over` (both fine on the engine) is not mistaken for
   # one; string literals are blanked first so `note = 'select from join'`
   # is not either.
-  @unsupported_construct ~r/(?i)\b(JOIN|UNION|EXCEPT|INTERSECT|HAVING)\b|\b(OVER)\s*\(/u
-  @clause_keywords ~w(WHERE GROUP ORDER LIMIT OFFSET)
+  @unsupported_construct ~r/(?i)\b(JOIN|UNION|EXCEPT|INTERSECT)\b|\b(OVER)\s*\(|\b(ROLLUP|CUBE)\s*\(|\b(GROUPING)\s+SETS\b|\bFROM\s*\(\s*(VALUES)\b/u
+  @clause_keywords ~w(WHERE GROUP HAVING ORDER LIMIT OFFSET)
 
   @spec check_clauses(binary()) :: :ok | {:error, term()}
   defp check_clauses(sql) do
@@ -396,17 +474,21 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_aggregate_select(split(), binary(), binary() | nil) ::
           {:ok, parsed_query()} | {:error, term()}
   defp parse_aggregate_select(%{table: measurement, rest: rest} = split, sql, qualifier) do
-    with {:ok, columns} <- SQLSelect.parse_list(split.columns, qualifier),
+    with {:ok, columns} <- SQLAggExpr.parse_list(split.columns, qualifier),
          :ok <- check_unique(Enum.map(columns, &elem(&1, tuple_size(&1) - 1))),
+         :ok <- SQLClauses.check_group_items(rest),
          {:ok, interval_ns} <- SQLClauses.interval(sql),
          :ok <- SQLClauses.check_date_bins(split.columns, interval_ns),
+         {:ok, groups} <- SQLClauses.group_columns(sql),
          {:ok, where} <- SQLWhere.nodes(rest),
+         {:ok, having} <- SQLAggExpr.having(rest, qualifier, groups, columns),
          :ok <- reject_expr_order(SQLClauses.order_by(rest)) do
       {:ok,
        new_query(measurement, where, rest,
          group_by_interval: interval_ns,
-         group_by_columns: SQLClauses.group_columns(sql),
-         select_columns: columns
+         group_by_columns: groups,
+         select_columns: columns,
+         having: having
        )}
     end
   end
@@ -433,8 +515,10 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         cross_join: nil,
         qualifier: measurement,
         qualified: %{},
-        plan_error: SQLLimit.planning_error(rest),
-        limit_error: SQLLimit.deferred(rest)
+        plan_error: SQLClauses.empty_tuple_error(rest) || SQLLimit.planning_error(rest),
+        limit_error: SQLLimit.deferred(rest),
+        table_error: nil,
+        having: nil
       },
       Map.new(overrides)
     )
@@ -450,7 +534,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       columns == "" ->
         build_distinct_query([], table, rest, qualifier)
 
-      Regex.match?(~r/^\w+(\s*,\s*\w+)*$/u, columns) ->
+      Regex.match?(~r/^[\p{L}_]\w*(\s*,\s*[\p{L}_]\w*)*$/u, columns) ->
         build_distinct_query(split_columns(columns), table, rest, qualifier)
 
       true ->

@@ -1,20 +1,28 @@
 defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @moduledoc false
-  # Arithmetic in the select list of an InfluxQL `SELECT`, as the engine reads
-  # and computes it (verified):
+  # Expressions in the select list of an InfluxQL `SELECT`, as the engine reads
+  # and computes them (verified):
   #
   #   * `+ - * / %`, signs, parentheses, numbers, fields, tags, aggregates
-  #     (`sum(n) + 1`) and `field::float` / `field::integer`; `x::type` binds to
-  #     the name only, a double sign (`- -n`) and `&`, `|`, `^` are not read
+  #     (`sum(n) + 1`), `field::float` / `field::integer`, the math functions
+  #     (`abs round floor ceil sqrt ln log pow`) and the transforms of a field or an aggregate
+  #     (`derivative(mean(f), 1m)`, see `InfluxQLTransform`); `x::type` binds
+  #     to the name only, a double sign (`- -n`) and `&`, `|`, `^` are not read
   #   * a column is named by the names in it joined by `_` (`usage + 1` is
-  #     `usage`, `usage + n` is `usage_n`, `sum(n) * mean(n)` is `sum_mean`),
-  #     then numbered like any other name
+  #     `usage`, `usage + n` is `usage_n`, `sum(n) * mean(n)` is `sum_mean`, a
+  #     call is its function's name whatever it holds), then numbered like any
+  #     other name
   #   * the types are the fields': a signed integer, an unsigned one (it wraps
   #     at 2^64, a negative literal beside it is `2^64 + n - 1`), a float.
   #     `+ - *` on two integers wrap at 64 bits; `/` of two signed integers is
   #     a float division, of two unsigned ones an integer division; `%` is the
   #     remainder with the sign of the dividend; a division by zero is zero;
   #     a float beside an integer makes the operation a float one
+  #   * `abs` keeps the type of its argument, `round floor ceil` and the rest
+  #     answer floats, `pow` of an integer by a literal integer is an integer;
+  #     a result that is not a finite number (the root of a negative, the
+  #     logarithm of zero) is null, and unlike a missing value it is written:
+  #     the column is in the row, with null in it
   #   * a row of a plain select is kept when a field the list names is in it,
   #     whatever the expression comes to there; the expression of an aggregate
   #     is computed over the aggregates after `fill()` has filled them
@@ -24,9 +32,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   #     tag and integer`
   #   * what the double does not reproduce is refused by name: a remainder or a
   #     division by a zero it only finds in the data, a negative fraction cast
-  #     to an integer, an unsigned cast, an expression of constants alone
+  #     to an integer, an unsigned cast, an expression of constants alone, a
+  #     math function of a string, a boolean or an unsigned field
 
-  alias InfluxElixir.Client.Local.{InfluxQLAggregate, InfluxQLError, SQLLimits}
+  alias InfluxElixir.Client.Local.{Durations, InfluxQLAggregate, InfluxQLError, SQLLimits}
 
   require SQLLimits
 
@@ -37,10 +46,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
           | {:ref, binary()}
           | {:cast, binary(), :float | :integer}
           | {:agg, binary(), binary()}
+          | {:fn, binary(), [ast()]}
+          | {:transform, binary(), ast(), integer() | nil}
           | {:neg, ast()}
           | {:bin, binary(), ast(), ast()}
 
-  @aggregates ~w(mean sum count min max first last median spread stddev)
+  @aggregates ~w(mean sum count min max first last median spread stddev mode)
+  @transforms ~w(derivative non_negative_derivative difference non_negative_difference
+                 cumulative_sum moving_average elapsed)
+  @one_argument ~w(abs round floor ceil sqrt ln)
+  @two_arguments ~w(log pow)
+  @functions @one_argument ++ @two_arguments
+  @wild_in_arithmetic "unsupported binary expression: contains a wildcard or regular expression"
+  @wild_names @aggregates ++ @transforms ++ @functions ++ ["percentile", "integral"]
 
   # ---------------------------------------------------------------------------
   # Reading
@@ -48,14 +66,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   @doc """
   Reads the text of a select item as an expression (without its alias):
-  `{:ok, ast}`, or `:error` for what is not arithmetic the double reads.
+  `{:ok, ast}`, `{:wild, name, arguments, target}` for a call with `*` or a
+  regular expression for its field (`mean(*)`, `percentile(/re/, 90)`), or
+  `:error` for what is not an expression the double reads.
   """
-  @spec parse(binary()) :: {:ok, ast()} | :error
+  @spec parse(binary()) ::
+          {:ok, ast()}
+          | {:wild, binary(), [ast()], term()}
+          | {:multi, binary(), binary(), [binary()], pos_integer()}
+          | {:planning, binary()}
+          | {:expand_error, binary()}
+          | :error
   def parse(text) do
     with {:ok, tokens} <- tokenize(text, []),
-         {:ok, ast, []} <- sum(tokens) do
-      {:ok, ast}
+         {:ok, ast, []} <- sum(tokens),
+         {:ok, classified} <- classify(ast) do
+      {:ok, classified}
     else
+      {:wild, _name, _arguments, _target} = wild -> wild
+      {:multi, _kind, _field, _tags, _limit} = multi -> multi
+      {:planning, _message} = planning -> planning
+      {:expand_error, _message} = error -> error
       _unread -> :error
     end
   end
@@ -63,6 +94,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @spec tokenize(binary(), list()) :: {:ok, list()} | :error
   defp tokenize(<<>>, acc), do: {:ok, Enum.reverse(acc)}
   defp tokenize(<<c, rest::binary>>, acc) when c in [?\s, ?\t, ?\n, ?\r], do: tokenize(rest, acc)
+
+  defp tokenize(<<?*, rest::binary>>, acc)
+       when acc == [] or hd(acc) in [{:op, "("}, {:op, ","}] do
+    case Regex.run(~r/^::(field|tag)(?![\w:])/i, rest) do
+      [all, kind] -> tokenize(rest_after(rest, all), [{:star, String.downcase(kind)} | acc])
+      nil -> tokenize(rest, [{:star, nil} | acc])
+    end
+  end
+
+  defp tokenize(<<?/, rest::binary>>, acc)
+       when acc == [] or hd(acc) in [{:op, "("}, {:op, ","}] do
+    case regex_end(rest, []) do
+      {:ok, source, after_regex} -> tokenize(after_regex, [{:regex, source} | acc])
+      :error -> :error
+    end
+  end
 
   defp tokenize(<<c, rest::binary>>, acc) when c in [?+, ?-, ?*, ?/, ?%, ?(, ?), ?,],
     do: tokenize(rest, [{:op, <<c>>} | acc])
@@ -76,6 +123,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp tokenize(text, acc) do
     cond do
+      match = Regex.run(~r/^(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+(?![\w.])/u, text) ->
+        [all] = match
+        tokenize(rest_after(text, all), [{:duration, duration_ns(all)} | acc])
+
       match = Regex.run(~r/^(?:\d+\.\d+|\.\d+|\d+)(?![\w.])/, text) ->
         tokenize(rest_after(text, hd(match)), [{:number, hd(match)} | acc])
 
@@ -86,6 +137,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       true ->
         :error
     end
+  end
+
+  # The body of a regular expression up to its closing slash; `\/` is a slash.
+  @spec regex_end(binary(), iodata()) :: {:ok, binary(), binary()} | :error
+  defp regex_end(<<?\\, ?/, rest::binary>>, acc), do: regex_end(rest, ["/" | acc])
+
+  defp regex_end(<<?/, rest::binary>>, acc),
+    do: {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary(), rest}
+
+  defp regex_end(<<c, rest::binary>>, acc), do: regex_end(rest, [<<c>> | acc])
+  defp regex_end(<<>>, _acc), do: :error
+
+  defp duration_ns(text) do
+    ~r/(\d+)(ns|ms|u|µ|s|m|h|d|w)/u
+    |> Regex.scan(text)
+    |> Enum.reduce(0, fn [_all, count, unit], total ->
+      total + String.to_integer(count) * Durations.ns(unit)
+    end)
   end
 
   defp rest_after(text, prefix),
@@ -128,9 +197,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp unary([{:op, "+"} | rest]), do: atom(rest)
   defp unary(tokens), do: atom(tokens)
 
-  @spec atom(list()) :: {:ok, ast(), list()} | :error
+  @spec atom(list()) :: {:ok, term(), list()} | :error
   defp atom([{:number, text} | rest]), do: literal(text, 1, rest)
   defp atom([{:str, content} | rest]), do: {:ok, {:str, content}, rest}
+  defp atom([{:duration, ns} | rest]), do: {:ok, {:dur, ns}, rest}
+  defp atom([{:regex, source} | rest]), do: {:ok, {:regex, source}, rest}
+  defp atom([{:star, kind} | rest]), do: {:ok, {:star, kind}, rest}
 
   defp atom([{:op, "("} | rest]) do
     case sum(rest) do
@@ -139,16 +211,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     end
   end
 
-  defp atom([{:name, name, nil}, {:op, "("}, {:name, arg, nil}, {:op, ")"} | rest])
-       when is_binary(name) do
-    if String.downcase(name) in @aggregates,
-      do: {:ok, {:agg, String.downcase(name), arg}, rest},
-      else: :error
+  defp atom([{:name, name, nil}, {:op, "("} | rest]) when is_binary(name) do
+    with {:ok, arguments, after_call} <- arguments(rest, []),
+         do: {:ok, {:call, String.downcase(name), arguments}, after_call}
   end
 
   defp atom([{:name, name, nil} | rest]), do: {:ok, {:ref, name}, rest}
   defp atom([{:name, name, cast} | rest]), do: {:ok, {:cast, name, cast_type(cast)}, rest}
   defp atom(_tokens), do: :error
+
+  # The arguments of a call, after its `(`.
+  defp arguments([{:op, ")"} | rest], []), do: {:ok, [], rest}
+
+  defp arguments(tokens, acc) do
+    with {:ok, argument, rest} <- sum(tokens) do
+      case rest do
+        [{:op, ","} | more] -> arguments(more, [argument | acc])
+        [{:op, ")"} | after_call] -> {:ok, Enum.reverse([argument | acc]), after_call}
+        _unclosed -> :error
+      end
+    end
+  end
 
   defp cast_type("float"), do: :float
   defp cast_type("integer"), do: :integer
@@ -168,6 +251,165 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp float_text(text), do: text
 
   # ---------------------------------------------------------------------------
+  # Calls
+  # ---------------------------------------------------------------------------
+
+  # The calls of a parsed expression become what they are: an aggregate of a
+  # field, a math function, a transform. A call with `*` or a regular
+  # expression for its field stands for several columns and is the whole
+  # expression, or nothing.
+  @spec classify(term()) ::
+          {:ok, ast()}
+          | {:wild, binary(), [ast()], term()}
+          | {:multi, binary(), binary(), [binary()], pos_integer()}
+          | {:planning, binary()}
+          | {:expand_error, binary()}
+          | :error
+  defp classify({:call, name, arguments}) when name in ["top", "bottom"],
+    do: multi(name, arguments)
+
+  defp classify({:call, name, arguments} = call) do
+    case Enum.split_with(arguments, &match?({kind, _} when kind in [:star, :regex], &1)) do
+      {[], _plain} ->
+        classify_call(call)
+
+      {[target], plain} ->
+        if name in @wild_names, do: {:wild, name, plain, target}, else: :error
+
+      _several ->
+        :error
+    end
+  end
+
+  defp classify({:neg, operand}),
+    do: with({:ok, o} <- classify_inner(operand), do: {:ok, {:neg, o}})
+
+  defp classify({:bin, op, left, right}) do
+    case {classify(left), classify(right)} do
+      {{:ok, l}, {:ok, r}} -> {:ok, {:bin, op, l, r}}
+      {{:wild, _n, _a, _t}, _right} -> {:expand_error, @wild_in_arithmetic}
+      {_left, {:wild, _n, _a, _t}} -> {:expand_error, @wild_in_arithmetic}
+      _other -> :error
+    end
+  end
+
+  defp classify({kind, _payload} = _leaf) when kind in [:star, :regex, :dur], do: :error
+  defp classify(leaf), do: {:ok, leaf}
+
+  # Inside another expression a call with `*` is no column of its own.
+  defp classify_inner(ast) do
+    case classify(ast) do
+      {:ok, classified} -> {:ok, classified}
+      _other -> :error
+    end
+  end
+
+  # `top(f, n)`, `top(f, tag, ..., n)`: the whole item, several rows.
+  defp multi(name, arguments) when length(arguments) < 2 do
+    {:planning,
+     "invalid number of arguments for #{name}, expected at least 2, got #{length(arguments)}"}
+  end
+
+  defp multi(name, [field | rest]) do
+    {tags, [last]} = Enum.split(rest, -1)
+
+    case {field, last, Enum.all?(tags, &match?({:ref, _}, &1))} do
+      {{:ref, f}, {:lit, {:int, n}}, true} when n > 0 ->
+        {:multi, name, f, for({:ref, tag} <- tags, do: tag), n}
+
+      {_field, {:lit, {:int, n}}, _tags} when n <= 0 ->
+        {:planning, "limit (#{n}) for #{name} must be greater than 0"}
+
+      {_field, {:lit, {:float, x}}, _tags} ->
+        {:planning,
+         "expected integer as last argument for #{name}, got Literal(Float(#{Float.to_string(x)}))"}
+
+      {_field, {:str, content}, _tags} ->
+        {:planning,
+         "expected integer as last argument for #{name}, got Literal(String(#{inspect(content)}))"}
+
+      _other ->
+        :error
+    end
+  end
+
+  defp classify_call({:call, name, [argument]}) when name in @aggregates do
+    case classify_inner(argument) do
+      {:ok, {:ref, field}} -> {:ok, {:agg, name, field}}
+      _other -> :error
+    end
+  end
+
+  defp classify_call({:call, "percentile", [argument, {:lit, {_kind, n}}]}) do
+    case classify_inner(argument) do
+      {:ok, {:ref, field}} -> {:ok, {:agg, "percentile:" <> number_text(n), field}}
+      _other -> :error
+    end
+  end
+
+  defp classify_call({:call, "integral", [argument | unit]}) when length(unit) <= 1 do
+    with {:ok, {:ref, field}} <- classify_inner(argument),
+         {:ok, ns} <- integral_unit(unit) do
+      {:ok, {:agg, "integral:" <> Integer.to_string(ns), field}}
+    else
+      _unread -> :error
+    end
+  end
+
+  defp classify_call({:call, name, [argument]}) when name in @one_argument,
+    do: function(name, [argument])
+
+  defp classify_call({:call, name, [first, second]}) when name in @two_arguments,
+    do: function(name, [first, second])
+
+  defp classify_call({:call, name, arguments}) when name in @transforms,
+    do: transform(name, arguments)
+
+  defp classify_call(_call), do: :error
+
+  defp integral_unit([]), do: {:ok, 1_000_000_000}
+  defp integral_unit([{:dur, ns}]) when ns > 0, do: {:ok, ns}
+  defp integral_unit(_other), do: :error
+
+  defp function(name, arguments) do
+    classified = Enum.map(arguments, &classify_inner/1)
+
+    if Enum.all?(classified, &match?({:ok, _}, &1)),
+      do: {:ok, {:fn, name, for({:ok, ast} <- classified, do: ast)}},
+      else: :error
+  end
+
+  defp transform(name, [argument | options]) do
+    with {:ok, inner} <- classify_inner(argument),
+         true <- inner_ok?(inner),
+         {:ok, parameter} <- transform_parameter(name, options) do
+      {:ok, {:transform, name, inner, parameter}}
+    else
+      _unread -> :error
+    end
+  end
+
+  defp transform(_name, []), do: :error
+
+  # A transform reads a field or one aggregate of a field.
+  defp inner_ok?({:ref, _field}), do: true
+  defp inner_ok?({:agg, _fun, _field}), do: true
+  defp inner_ok?(_other), do: false
+
+  defp transform_parameter("moving_average", [{:lit, {:int, n}}]), do: {:ok, n}
+  defp transform_parameter("moving_average", _other), do: :error
+  defp transform_parameter("cumulative_sum", []), do: {:ok, nil}
+  defp transform_parameter(name, []) when name in @transforms, do: {:ok, nil}
+  defp transform_parameter("cumulative_sum", _other), do: :error
+  defp transform_parameter("difference", _other), do: :error
+  defp transform_parameter("non_negative_difference", _other), do: :error
+  defp transform_parameter(_name, [{:dur, ns}]), do: {:ok, ns}
+  defp transform_parameter(_name, _other), do: :error
+
+  defp number_text(n) when is_integer(n), do: Integer.to_string(n)
+  defp number_text(x) when is_float(x), do: Float.to_string(x)
+
+  # ---------------------------------------------------------------------------
   # What an expression is made of
   # ---------------------------------------------------------------------------
 
@@ -182,10 +424,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp names({:ref, name}), do: [name]
   defp names({:cast, name, _type}), do: [name]
-  defp names({:agg, fun, _arg}), do: [fun]
+  defp names({:agg, fun, _arg}), do: [function_name(fun)]
+  defp names({:fn, name, _arguments}), do: [name]
+  defp names({:transform, name, _inner, _parameter}), do: [name]
   defp names({:neg, operand}), do: names(operand)
   defp names({:bin, _op, left, right}), do: names(left) ++ names(right)
   defp names(_literal), do: []
+
+  @doc "The name of an aggregate function (`percentile:95` is `percentile`)."
+  @spec function_name(binary()) :: binary()
+  def function_name(fun), do: fun |> String.split(":") |> hd()
 
   @doc "The fields (and tags) an expression reads."
   @spec refs(ast()) :: [binary()]
@@ -193,6 +441,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   def refs({:cast, name, _type}), do: [name]
   def refs({:neg, operand}), do: refs(operand)
   def refs({:bin, _op, left, right}), do: refs(left) ++ refs(right)
+  def refs({:fn, _name, arguments}), do: Enum.flat_map(arguments, &refs/1)
+  def refs({:transform, _name, inner, _parameter}), do: refs(inner)
   def refs(_other), do: []
 
   @doc "The aggregates an expression holds, as `{fun, argument}`."
@@ -200,7 +450,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   def aggregates({:agg, fun, arg}), do: [{fun, arg}]
   def aggregates({:neg, operand}), do: aggregates(operand)
   def aggregates({:bin, _op, left, right}), do: aggregates(left) ++ aggregates(right)
+  def aggregates({:fn, _name, arguments}), do: Enum.flat_map(arguments, &aggregates/1)
+  def aggregates({:transform, _name, inner, _parameter}), do: aggregates(inner)
   def aggregates(_other), do: []
+
+  @doc """
+  The transforms an expression holds, whole (`{:transform, name, inner,
+  parameter}`), in the order they are read.
+  """
+  @spec transforms(ast()) :: [ast()]
+  def transforms({:transform, _name, _inner, _parameter} = transform), do: [transform]
+  def transforms({:neg, operand}), do: transforms(operand)
+  def transforms({:bin, _op, left, right}), do: transforms(left) ++ transforms(right)
+  def transforms({:fn, _name, arguments}), do: Enum.flat_map(arguments, &transforms/1)
+  def transforms(_other), do: []
 
   @doc """
   The expression with each aggregate replaced by a reference to the column
@@ -210,7 +473,30 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   def hoist({:agg, fun, arg}, key), do: {:ref, key.({fun, arg})}
   def hoist({:neg, operand}, key), do: {:neg, hoist(operand, key)}
   def hoist({:bin, op, left, right}, key), do: {:bin, op, hoist(left, key), hoist(right, key)}
+  def hoist({:fn, name, arguments}, key), do: {:fn, name, Enum.map(arguments, &hoist(&1, key))}
+
+  def hoist({:transform, name, inner, parameter}, key),
+    do: {:transform, name, hoist(inner, key), parameter}
+
   def hoist(other, _key), do: other
+
+  @doc """
+  The expression with each transform replaced by a reference to the column
+  `key.(transform)` names.
+  """
+  @spec hoist_transforms(ast(), (ast() -> binary())) :: ast()
+  def hoist_transforms({:transform, _name, _inner, _parameter} = transform, key),
+    do: {:ref, key.(transform)}
+
+  def hoist_transforms({:neg, operand}, key), do: {:neg, hoist_transforms(operand, key)}
+
+  def hoist_transforms({:bin, op, left, right}, key),
+    do: {:bin, op, hoist_transforms(left, key), hoist_transforms(right, key)}
+
+  def hoist_transforms({:fn, name, arguments}, key),
+    do: {:fn, name, Enum.map(arguments, &hoist_transforms(&1, key))}
+
+  def hoist_transforms(other, _key), do: other
 
   # ---------------------------------------------------------------------------
   # Types
@@ -231,6 +517,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       {:engine, body} -> {:error, {:engine, body}}
       {:refuse, message} -> {:error, "unsupported InfluxQL (#{message})"}
       {:ok, _type} -> :ok
+    end
+  end
+
+  @doc "The type an expression comes to, for the columns after it."
+  @spec result_type(ast(), %{binary() => atom()}, MapSet.t(binary())) :: atom()
+  def result_type(ast, types, tags) do
+    case infer(ast, types, tags) do
+      {:ok, {type, _literal}} -> type
+      _error -> :unknown
     end
   end
 
@@ -263,6 +558,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     {:ok, {aggregate_type(fun, Map.get(types, arg)), false}}
   end
 
+  defp infer({:fn, name, arguments}, types, tags) do
+    inferred = Enum.map(arguments, &infer(&1, types, tags))
+
+    case Enum.find(inferred, &(not match?({:ok, _}, &1))) do
+      nil -> function_type(name, for({:ok, type} <- inferred, do: type), arguments)
+      error -> error
+    end
+  end
+
+  defp infer({:transform, name, inner, _parameter}, types, tags) do
+    with {:ok, {type, _literal}} <- infer(inner, types, tags) do
+      transform_type(name, type)
+    end
+  end
+
   defp infer({:neg, operand}, types, tags),
     do: infer({:bin, "*", {:lit, {:int, -1}}, operand}, types, tags)
 
@@ -281,10 +591,61 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp target_type(:unknown, _target), do: :unknown
   defp target_type(_type, target), do: target
 
-  defp aggregate_type("count", _type), do: :integer
+  defp aggregate_type(fun, _type) when fun in ["count"], do: :integer
   defp aggregate_type(fun, _type) when fun in ["mean", "stddev"], do: :float
   defp aggregate_type(_fun, nil), do: :unknown
   defp aggregate_type(_fun, type), do: type
+
+  # The type of a math function of its arguments.
+  @spec function_type(binary(), [type()], [ast()]) :: inferred()
+  defp function_type(name, types, arguments) do
+    case Enum.find(types, fn {type, _literal} -> type not in [:integer, :float, :unknown] end) do
+      {type, _literal} ->
+        {:refuse, "#{name}() of a #{type}"}
+
+      nil ->
+        function_result(name, types, arguments)
+    end
+  end
+
+  defp function_result("abs", [{type, _literal}], _arguments), do: {:ok, {type, false}}
+
+  defp function_result("pow", [{:integer, _l1}, {:integer, _l2}], [_base, {:lit, {:int, n}}])
+       when n >= 0,
+       do: {:ok, {:integer, false}}
+
+  defp function_result("pow", [{:integer, _l1}, {:integer, _l2}], _arguments),
+    do: {:refuse, "pow() of an integer by that exponent"}
+
+  defp function_result(_name, types, _arguments) do
+    if Enum.any?(types, fn {type, _literal} -> type == :unknown end),
+      do: {:ok, {:unknown, false}},
+      else: {:ok, {:float, false}}
+  end
+
+  defp transform_type(name, type) when name in ["difference", "cumulative_sum"] do
+    if type in [:integer, :float, :unknown],
+      do: {:ok, {type, false}},
+      else: {:refuse, "#{name}() of a #{type}"}
+  end
+
+  defp transform_type("elapsed", type) do
+    if type in [:integer, :float, :unsigned, :string, :boolean, :unknown],
+      do: {:ok, {:integer, false}},
+      else: {:refuse, "elapsed() of a #{type}"}
+  end
+
+  defp transform_type("non_negative_difference", type) do
+    if type in [:integer, :float, :unknown],
+      do: {:ok, {type, false}},
+      else: {:refuse, "non_negative_difference() of a #{type}"}
+  end
+
+  defp transform_type(name, type) do
+    if type in [:integer, :float, :unknown],
+      do: {:ok, {:float, false}},
+      else: {:refuse, "#{name}() of a #{type}"}
+  end
 
   @spec operation(binary(), type(), type()) :: inferred()
   defp operation(op, {lt, _ll} = l, {rt, _rl} = r) do
@@ -328,19 +689,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # Computing
   # ---------------------------------------------------------------------------
 
-  @two64 18_446_744_073_709_551_616
-
-  @typedoc "A value: a signed or unsigned integer, a float, or null."
-  @type value :: {:int, integer()} | {:uint, non_neg_integer()} | {:float, float()} | nil
+  @typedoc """
+  A value: a signed or unsigned integer, a float, null, or `:nan`, a number that
+  is not finite (written as a null that is in the row).
+  """
+  @type value :: {:int, integer()} | {:uint, non_neg_integer()} | {:float, float()} | nil | :nan
 
   @doc """
-  The value of `ast` over a row (`env`: name to value); `nil` for null.
-  Throws `{:refused, message}` for what the double does not reproduce.
+  The value of `ast` over a row (`env`: name to value); `nil` for null, `:nan`
+  for a number that is not finite. Throws `{:refused, message}` for what the
+  double does not reproduce.
   """
-  @spec eval(ast(), map(), map()) :: number() | nil
+  @spec eval(ast(), map(), map()) :: number() | nil | :nan
   def eval(ast, env, types) do
     case value(ast, env, types) do
       nil -> nil
+      :nan -> :nan
       {_kind, number} -> number
     end
   end
@@ -350,6 +714,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp value({:lit, {:float, x}}, _env, _types), do: {:float, x}
   defp value({:ref, name}, env, types), do: typed(Map.get(types, name), Map.get(env, name))
   defp value({:cast, name, target}, env, types), do: cast(name, target, env, types)
+
+  defp value({:fn, name, arguments}, env, types),
+    do: call(name, Enum.map(arguments, &value(&1, env, types)))
 
   defp value({:neg, operand}, env, types),
     do: value({:bin, "*", operand, {:lit, {:int, -1}}}, env, types)
@@ -383,9 +750,55 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp truncate(_negative_fraction),
     do: throw({:refused, "unsupported InfluxQL (a negative fraction cast to integer)"})
 
+  # A math function of its argument values: null in, null out; a result that
+  # is not a finite number is `:nan`.
+  @spec call(binary(), [value()]) :: value()
+  defp call(name, arguments) do
+    cond do
+      nil in arguments -> nil
+      :nan in arguments -> :nan
+      true -> compute(name, arguments)
+    end
+  end
+
+  @spec compute(binary(), [value()]) :: value()
+
+  defp compute("abs", [{:int, n}]) when n == -9_223_372_036_854_775_808,
+    do: throw({:refused, "unsupported InfluxQL (abs() of the smallest integer)"})
+
+  defp compute("abs", [{:int, n}]), do: {:int, abs(n)}
+  defp compute("abs", [{:float, x}]), do: {:float, abs(x)}
+  defp compute("round", [{_kind, x}]), do: {:float, round(x) * 1.0}
+  defp compute("floor", [{_kind, x}]), do: {:float, Float.floor(x * 1.0)}
+  defp compute("ceil", [{_kind, x}]), do: {:float, Float.ceil(x * 1.0)}
+
+  defp compute("pow", [{:int, base}, {:int, exponent}]) do
+    result = Integer.pow(base, exponent)
+
+    if SQLLimits.is_int64(result),
+      do: {:int, result},
+      else: throw({:refused, "unsupported InfluxQL (pow() beyond 64-bit integers)"})
+  end
+
+  defp compute("pow", [{_k1, x}, {_k2, y}]), do: float(fn -> :math.pow(x * 1.0, y * 1.0) end)
+
+  defp compute("log", [{_k1, x}, {_k2, base}]),
+    do: float(fn -> :math.log(x) / :math.log(base) end)
+
+  defp compute("sqrt", [{_kind, x}]), do: float(fn -> :math.sqrt(x * 1.0) end)
+  defp compute("ln", [{_kind, x}]), do: float(fn -> :math.log(x * 1.0) end)
+
+  defp float(compute) do
+    {:float, compute.()}
+  rescue
+    ArithmeticError -> :nan
+  end
+
   @spec apply_op(binary(), value(), value()) :: value()
   defp apply_op(_op, nil, _right), do: nil
   defp apply_op(_op, _left, nil), do: nil
+  defp apply_op(_op, :nan, _right), do: :nan
+  defp apply_op(_op, _left, :nan), do: :nan
 
   defp apply_op(op, left, right) do
     case common(left, right) do
@@ -405,7 +818,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp common({:int, x}, {:uint, y}), do: {:uint, to_unsigned(x), y}
 
   defp to_unsigned(n) when n >= 0, do: n
-  defp to_unsigned(n), do: @two64 + n - 1
+  defp to_unsigned(n), do: SQLLimits.uint64_max() + n
 
   defp int_op("/", x, y), do: float_op("/", x * 1.0, y * 1.0)
   defp int_op("%", _x, 0), do: refuse_remainder()

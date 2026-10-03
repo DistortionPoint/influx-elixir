@@ -49,8 +49,8 @@ defmodule InfluxElixir.Client.Local do
 
   ## Storage
 
-  Each instance is one ETS table owned by `Client.Local.Store`,
-  which alone knows the key layout. Every mutation is a single insert or
+  Each instance is one ETS table whose key layout is private to the
+  double. Every mutation is a single insert or
   delete of its own key, so concurrent writers — `async: true` tests sharing
   one database, `BatchWriter` flushes racing direct writes — never
   read-modify-write a shared value and no write is ever lost.
@@ -115,8 +115,7 @@ defmodule InfluxElixir.Client.Local do
       `v=5.` leaves `.`, `v=1e` leaves `e`, `v=.5` and `v=+5` are no
       fields at all, `v=1 100 200` leaves `200`; a tag set that cannot be
       read is "Tag set malformed", "Expected tag key" or "Expected tag
-      value", and a field named twice is refused. See
-      `Client.Local.LineProtocolParser` for the grammar.
+      value", and a field named twice is refused.
     * Under the `:v2` profile the rules are InfluxDB 2's, verified against
       2.7, which parses with Go's `ParsePoints` and words its errors after
       the scanner that failed: a field type conflict is HTTP 422
@@ -162,8 +161,7 @@ defmodule InfluxElixir.Client.Local do
   the engine's "No field named" error. `'...'` is a string, a doubled quote
   one quote; `E'...'` or `e'...'` a string with backslash escapes
   (`E'it\\'s'`, `E'a\\nb'`, `E'\\x41'`), read as the engine's tokenizer reads
-  them. See `Client.Local.SQLIdentifiers` and
-  `Client.Local.SQLLexer`. (InfluxQL identifiers are
+  them. (InfluxQL identifiers are
   case-sensitive and are not folded.) The subset:
 
     * `SELECT * FROM measurement`
@@ -205,8 +203,37 @@ defmodule InfluxElixir.Client.Local do
       told apart; the engine refuses the unqualified reference too. A shared
       column written with a qualifier (`a.v`) is refused by name, since the
       engine resolves it to a side. Other
-      joins, set operations, `HAVING` and window functions are
-      rejected by name rather than silently ignored.
+      joins, set operations (`UNION`, `INTERSECT`, `EXCEPT`), subqueries and
+      window functions are rejected by name rather than silently ignored.
+    * Expressions, answered as the engine does (verified against InfluxDB 3
+      Core, bodies of its errors included): `CASE`, `COALESCE`, `NULLIF`,
+      `GREATEST`, `LEAST`; `lower`, `upper`, `length`, `substr`,
+      `starts_with`; `sqrt`, `ln`, `log`, `pow`; `IS [NOT] DISTINCT FROM`,
+      `IS [NOT] TRUE|FALSE`; a `SELECT` with no `FROM` (`SELECT 1 + 1 two`);
+      an alias with no `AS` (`SELECT n a`); an expression of aggregates
+      (`sum(n) / count(n)`), a `GROUP BY` expression, and `HAVING` with a
+      comparison. These work in `WHERE` too.
+    * `information_schema.tables`, `.columns` and `.schemata`, `SHOW TABLES`
+      and `SHOW COLUMNS FROM t`, and the qualified names `iox.t` and
+      `public.iox.t`. Another schema or catalog is the engine's "table not
+      found".
+    * A statement the engine's parser rejects (an empty `WHERE`, a trailing
+      `ORDER BY`, a missing operand, an unclosed parenthesis) answers with
+      the parser's own message and position, and a `WHERE` that is not a
+      boolean, `LIKE` over a time, and `GROUP BY ()` with the planner's.
+    * Refused by name, because the double does not model them: `date_trunc`,
+      `extract` / `date_part`, `INTERVAL` arithmetic and the string form of
+      `date_bin`, `date_bin_gapfill` with `locf` / `interpolate`,
+      `approx_percentile_cont` and `approx_median`, window functions, `JOIN`
+      other than `CROSS JOIN`, `UNION` / `INTERSECT` / `EXCEPT`, subqueries,
+      `FROM (VALUES ...)`, `ROLLUP` / `CUBE` / `GROUPING SETS`, table
+      functions, the `system.*` tables and the other `information_schema`
+      views, `SHOW` other than `TABLES` and `COLUMNS`, `concat`, `trim`,
+      `replace`, `bool_and`, `array_agg`, `FILTER (WHERE ...)`, a `HAVING`
+      that is no comparison or has no `GROUP BY`, `COALESCE` of text with a
+      number, and a comparison of `time` inside a select item. The last
+      digit of `var_*` and `stddev*` can differ from the engine's, whose
+      result depends on how it splits the rows into batches.
     * Table qualifiers and aliases: `FROM q AS w` / `FROM q w`, and
       `w.time` in any clause (or `q.time` with no alias: the engine knows an
       aliased table by the alias alone). One table per query, so the prefix
@@ -245,16 +272,15 @@ defmodule InfluxElixir.Client.Local do
       `NOT b`); any other bare column is the engine's planning error
       ("Cannot create filter with non-boolean predicate 't.n' returning
       Int64").
-    * What the engine's simplifier removes before a row is read is not run
-      (`Client.Local.SQLSimplify`): `x AND false`, `x OR true`,
+    * What the engine's simplifier removes before a row is read is not run:
+      `x AND false`, `x OR true`,
       the absorption `A AND (A OR B)`, a comparison with a NULL literal, and
       `x = x` or `x IS NULL` of a constant. An `AND` or an `OR` whose right
       operand fails for a row the left one leaves out (`j <> 0 AND 100 / j >
       1`) is refused by name: the engine runs it over a batch of rows, and
       whether it meets that row depends on how it batches them. An integer
       literal past `UInt64` is a double, as on the engine, and a decimal
-      expression compared with a float past `1e20` is its cast error (see
-      `Client.Local.SQLDecimal`).
+      expression compared with a float past `1e20` is its cast error.
     * `WHERE col IN (v1, v2, ...)` and `WHERE col NOT IN (v1, v2, ...)` — each
       item a literal, a column or an expression, as in SQL (a bare word is
       a column reference, never a string)
@@ -412,7 +438,7 @@ defmodule InfluxElixir.Client.Local do
 
   `format:` is answered as `Client.HTTP` answers it — `:csv` rows carry
   the engine's CSV strings, `:parquet` is refused by name, an unknown
-  format is the engine's 400: see `Client.Local.Format`.
+  format is the engine's 400.
 
   Anything outside this subset is rejected with
   `{:error, %{status: 400, body: "Client.Local: ..."}}`. The `Client.Local:`
@@ -431,7 +457,29 @@ defmodule InfluxElixir.Client.Local do
   number is read as the engine's JSON parser reads it — an integer outside
   `Int64`/`UInt64` is a float, and one past the float range is the engine's
   `number out of range` 400 — and an object or an array is its 400 too;
-  see `InfluxElixir.Client.QueryParams` and `Client.Local.Format`.
+  see `InfluxElixir.Client.QueryParams`.
+
+  ## Flux Query Support (v2 profile)
+
+  `query_flux/3` runs a pipeline `from(bucket: "b") |> range(...) |> ...`
+  and applies every stage or refuses the query by name:
+
+    * `from(bucket: "b")` — first; a bucket that does not exist is the
+      engine's 404
+    * `range(start:[, stop:])` — required, once; Unix seconds, RFC3339,
+      a duration from now (`-1h`, `-30m`, `-7d`, `-2w`) or `now()`
+    * `filter(fn: (r) => ...)` — `r.key` or `r["key"]` compared with
+      `== != < <= > >=` against a string, number or boolean, combined with
+      `and`, `or`, `not` and parentheses
+    * `first()`, `last()`, `min()`, `max()` — the selected row per table
+    * `mean()`, `sum()`, `count()` — one row per table, without `_time`
+    * `limit(n:[, offset:])` — per table
+    * `yield(name: "x")` — names the result
+
+  Any other function (`aggregateWindow`, `pivot`, `group`, `sort`, ...),
+  arguments to the selectors and aggregates, or a predicate or time the
+  double does not model is `{:error, %{status: 400, body: json}}` whose
+  message starts `Client.Local: unsupported Flux`.
 
   ## Write Bodies
 
@@ -527,7 +575,7 @@ defmodule InfluxElixir.Client.Local do
 
   On the v3 profiles each name must be one InfluxDB 3 accepts, and
   `:v3_core` holds at most 5; `start/1` raises `ArgumentError` with the
-  engine's message otherwise (see `Client.Local.DatabaseRules`).
+  engine's message otherwise.
     * `:profile` - InfluxDB version profile to emulate. Determines which
       operations are available. Operations outside the profile return
       `{:error, :unsupported_operation}`. Valid values:
@@ -570,7 +618,7 @@ defmodule InfluxElixir.Client.Local do
 
     if profile != :v2, do: DatabaseRules.check_start!(databases, profile)
 
-    # A public ETS store (see `Client.Local.Store`): every
+    # A public ETS store: every
     # mutation is one insert or delete of its own key, so no process is
     # needed to make concurrent writers safe.
     org = Keyword.get(opts, :org) || "local"
@@ -589,9 +637,9 @@ defmodule InfluxElixir.Client.Local do
         {:error, %{body: why}} -> ExUnit.Callbacks.on_exit(fn -> :ok end); flunk(why)
       end
 
-  Queries outside the subset (CTEs, joins, window functions, `median`, ...)
-  belong in an integration test against a real InfluxDB; see the testing
-  guide.
+  Queries outside the subset (joins, window functions, `UNION`, subqueries,
+  date and time functions, ...) belong in an integration test against a real
+  InfluxDB; see the testing guide.
   """
   @spec check_sql(binary()) :: :ok | {:error, %{status: 400, body: binary()}}
   def check_sql(sql) do
@@ -711,21 +759,33 @@ defmodule InfluxElixir.Client.Local do
   Answers what InfluxDB 3 answers, verified against the engine:
 
     * `SHOW DATABASES` — `%{"iox::database" => name, "deleted" => false}`
-    * `SHOW MEASUREMENTS` — `%{"iox::measurement" => "measurements", "name" => m}`
-    * `SHOW TAG KEYS [FROM m]` — `%{"iox::measurement" => m, "tagKey" => k}`
-    * `SHOW FIELD KEYS [FROM m]` — `%{"iox::measurement" => m, "fieldKey" => k,
-      "fieldType" => "integer" | "unsigned" | "float" | "string" | "boolean"}`
-    * `SHOW TAG VALUES [FROM m] WITH KEY ... [WHERE ...]` —
-      `%{"iox::measurement" => m, "key" => k, "value" => v}` by measurement,
-      key and value, a row without `"value"` when a point lacks the key,
-      over the last 24 hours unless the `WHERE` bounds `time`
-    * `SELECT ...` — InfluxQL, not SQL: see `Client.Local.InfluxQL`
-      for the row shape (`iox::measurement` and `time` on every row, time
-      order, `mean`/`count`/... aggregates stamped with the `WHERE`'s lower
-      bound on `time`, an unknown column or measurement is `{:ok, []}`,
-      `LIMIT` and `OFFSET` per selected field), for InfluxQL's `WHERE` (a
-      missing tag is `''`, regexes, durations, integers and durations as
-      nanoseconds next to `time`) and for what is refused by name
+    * `SHOW MEASUREMENTS`, `SHOW TAG KEYS`, `SHOW FIELD KEYS`, `SHOW TAG
+      VALUES` and `SHOW RETENTION POLICIES`, with `ON`, `FROM` (names and
+      `/re/`), `WITH MEASUREMENT`, `WITH KEY`, `WHERE`, `LIMIT` and `OFFSET`,
+      answered from the schema in the engine's order, over the last 24 hours
+      unless the `WHERE` bounds `time`; the engine's parse errors at their
+      positions
+    * `SELECT ...` — InfluxQL, not SQL. Rows have `iox::measurement` and
+      `time` on every row, in time order; aggregates are stamped with the
+      `WHERE`'s lower bound on `time`; an unknown column or measurement is
+      `{:ok, []}`; `LIMIT` and `OFFSET` apply per series. The `WHERE` follows
+      InfluxQL (a missing tag is `''`, a missing column null, regexes,
+      durations, and integers or durations as nanoseconds next to `time`). The
+      select list takes columns, `*`, `*::field`, `/re/`, arithmetic, the
+      aggregates `MEAN SUM COUNT MIN MAX FIRST LAST MEDIAN SPREAD STDDEV MODE
+      PERCENTILE INTEGRAL`, `TOP` and `BOTTOM`, `F(*)`, the math functions
+      `ABS ROUND FLOOR CEIL SQRT LN LOG POW` and the transforms `DERIVATIVE
+      NON_NEGATIVE_DERIVATIVE DIFFERENCE NON_NEGATIVE_DIFFERENCE CUMULATIVE_SUM
+      MOVING_AVERAGE ELAPSED`; `FROM` lists names and `/re/`; `GROUP BY` takes
+      tags, fields, `*`, `/re/` and `time(every[, offset])` with `fill(...)`;
+      then `ORDER BY time`, `LIMIT`, `OFFSET`, `SLIMIT`/`SOFFSET` (the
+      engine's 405) and `tz('UTC')`.
+
+  Anything outside this subset (`INTO`, subqueries, a `tz()` of another zone,
+  and the like) is refused by name with `{:error, %{status: 400, body:
+  "Client.Local: unsupported InfluxQL (...)"}}`, never answered wrongly. The
+  "Testing with LocalClient" guide's InfluxQL section lists the behaviour in
+  full.
   """
   @impl true
   @spec query_influxql(
@@ -737,8 +797,11 @@ defmodule InfluxElixir.Client.Local do
     do: InfluxQLQuery.query_influxql(conn, influxql, opts)
 
   @doc """
-  Executes a Flux query as InfluxDB 2 does; see `Client.Local.Flux`
-  for the stages supported. Every stage is applied or the query is refused
+  Executes a Flux query as InfluxDB 2 does. The pipeline starts with
+  `from(bucket: "b")` and takes `range` (required), `filter`, `first`,
+  `last`, `min`, `max`, `mean`, `sum`, `count`, `limit` and `yield`; the
+  "Flux Queries" section of the "Testing with LocalClient" guide has the
+  detail. Every stage is applied or the query is refused
   (`{:error, %{status: 400, body: json}}` naming it) — a stage is never
   skipped. Rows use the engine's long shape, one per field value:
 
@@ -765,11 +828,32 @@ defmodule InfluxElixir.Client.Local do
 
   Creating an existing database is `:ok` (the engine's 409, which
   `Client.HTTP` treats as success). A name the engine refuses is its 400,
-  and a sixth database on the `:v3_core` profile its 422 — see
-  `Client.Local.DatabaseRules`. `retention:` must be a
+  and a sixth database on the `:v3_core` profile its 422. `retention:` must be a
   duration the engine reads (`"30d"`, `"1h 30m"`, `"1.5h"`, `"0"`), or it
-  is the engine's 400; the double keeps no retention for a database, so nothing
-  expires. (A v2 bucket's `retention:` is applied: see `create_bucket/3`.)
+  is the engine's 400. The database keeps it, in whole seconds, and applies it
+  as InfluxDB 3 does (verified against Core):
+
+    * a write is never refused for its age: a point older than the retention
+      is accepted (204, with or without `accept_partial`) and stored
+    * a read sees only the chunks that still hold a point at or after
+      `now - retention`. A chunk is one table's points within one 10-minute
+      window (a multiple of 600 s since the epoch), so an expired point is
+      shown for as long as the newest point of its chunk is, and hidden with
+      it. SQL, InfluxQL and `SHOW TAG VALUES` all read this way; the tables
+      and columns an expired point created stay in the schema
+      (`SHOW MEASUREMENTS`, `SHOW TAG KEYS`, `information_schema`)
+    * the period is read in whole seconds (`1500ms` is `1s`, `100ms` is `0`),
+      a month is 30.44 days and a year 365.25; a retention of `"0"` (or under
+      a second) is zero, not none: every point before now is hidden. Omit
+      `retention:` for data that never expires
+    * `SHOW RETENTION POLICIES` prints it as `autogen` with the period in the
+      engine's format (`1h0m0s`, `168h0m0s`, `30s`, `0s` for none)
+    * creating a database that exists changes nothing, its retention
+      included (the engine's 409, which `Client.HTTP` treats as success); the
+      engine can change it (`PUT /api/v3/configure/database`) but this
+      library has no call for it
+
+  (A v2 bucket's `retention:` is applied differently: see `create_bucket/3`.)
   """
   @impl true
   @spec create_database(

@@ -1,7 +1,7 @@
 defmodule InfluxElixir.ContractLocal.V2.ClientV2FluxTest do
   @moduledoc """
   The `:v2_flux` part of `InfluxElixir.ClientContract`
-  (the Flux pipeline and queries)
+  (Flux query errors)
   against `Client.Local` with the `:v2` profile.
   """
 

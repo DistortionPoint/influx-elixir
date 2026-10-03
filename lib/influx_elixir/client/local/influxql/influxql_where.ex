@@ -18,7 +18,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   require SQLLimits
 
-  @doc "Plans a `WHERE`; see `InfluxElixir.Client.Local.InfluxQL.where_plan/3`."
+  @doc "Plans a `WHERE`; see `InfluxElixir.Client.Local.InfluxQL.where_plan/3`. The option `:extend_lower` reads the lower bounds that much earlier in the SQL."
   @spec where_plan(
           binary(),
           MapSet.t(binary()),
@@ -34,8 +34,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         InfluxQLTime.check_bare(tree)
         ctx = {tags, types}
         now = Keyword.get_lazy(opts, :now, fn -> System.os_time(:nanosecond) end)
+
+        times = %{
+          now: now,
+          extend: Keyword.get(opts, :extend_lower, 0),
+          known: Keyword.get(opts, :known)
+        }
+
         deferred = InfluxQLTyped.bare_condition(tree, ctx)
-        {sql, bounds, checks} = if deferred, do: {"true", [], []}, else: plan(tree, ctx, now)
+        {sql, bounds, checks} = if deferred, do: {"true", [], []}, else: plan(tree, ctx, times)
         idents = for {:ident, name} <- tokens, into: MapSet.new(), do: name
 
         {:ok,
@@ -156,29 +163,34 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   # The tree as SQL, with the lower bounds its `time` comparisons give and the
   # checks to run over the rows for what the SQL engine does not read as the
   # engine does.
-  @spec plan(tuple(), {MapSet.t(binary()), map()}, integer()) ::
+  @typep times :: %{
+           now: integer(),
+           extend: non_neg_integer(),
+           known: MapSet.t(binary()) | nil
+         }
+
+  @spec plan(tuple(), {MapSet.t(binary()), map()}, times()) ::
           {binary(), [InfluxQL.bound()], [{binary(), InfluxQLArithmetic.check()}]}
-  defp plan({:cmp, tokens}, {tags, _types} = ctx, now) do
+  defp plan({:cmp, tokens}, {tags, _types} = ctx, times) do
     if Enum.any?(tokens, &InfluxQLTokens.time?/1) do
-      {sql, lowers} = time_plan(tokens, tags, now)
+      {sql, lowers} = time_plan(tokens, tags, times)
       {sql, lowers, []}
     else
-      {sql, checks} = InfluxQLTyped.plan_comparison(tokens, ctx)
-      {sql, [], checks}
+      plan_typed(tokens, ctx, times.known)
     end
   end
 
-  defp plan({:group, node}, ctx, now) do
-    {sql, lowers, checks} = plan(node, ctx, now)
+  defp plan({:group, node}, ctx, times) do
+    {sql, lowers, checks} = plan(node, ctx, times)
     {"(" <> sql <> ")", lowers, checks}
   end
 
-  defp plan({:and, nodes}, ctx, now), do: join_plans(nodes, " AND ", ctx, now)
+  defp plan({:and, nodes}, ctx, times), do: join_plans(nodes, " AND ", ctx, times)
 
   # The comparisons are planned first: what the engine reads wrongly in one is
   # its error, before the refusal of the connective.
-  defp plan({:or, nodes}, ctx, now) do
-    joined = join_plans(nodes, " OR ", ctx, now)
+  defp plan({:or, nodes}, ctx, times) do
+    joined = join_plans(nodes, " OR ", ctx, times)
 
     if Enum.any?(nodes, &mentions_time_node?/1),
       do: throw({:refused, "unsupported InfluxQL (a time comparison inside OR)"})
@@ -186,8 +198,32 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     joined
   end
 
-  defp join_plans(nodes, separator, ctx, now) do
-    {sqls, lowers, checks} = nodes |> Enum.map(&plan(&1, ctx, now)) |> unzip3()
+  # A comparison that reads a column the measurement does not have is null for
+  # every point, so false (verified: `host = 'a' OR zone = 'z'` finds the points
+  # of host a, `zone != 'z'` none). `known` is the measurement's columns, `nil`
+  # when the caller does not know them.
+  @spec plan_typed(list(), {MapSet.t(binary()), map()}, MapSet.t(binary()) | nil) ::
+          {binary(), [InfluxQL.bound()], [{binary(), InfluxQLArithmetic.check()}]}
+  defp plan_typed(tokens, ctx, known) do
+    if absent_column?(tokens, known) do
+      {"(1 = 0)", [], []}
+    else
+      {sql, checks} = InfluxQLTyped.plan_comparison(tokens, ctx)
+      {sql, [], checks}
+    end
+  end
+
+  defp absent_column?(_tokens, nil), do: false
+
+  defp absent_column?(tokens, known) do
+    Enum.any?(tokens, fn
+      {:ident, name} -> not MapSet.member?(known, name)
+      _token -> false
+    end)
+  end
+
+  defp join_plans(nodes, separator, ctx, times) do
+    {sqls, lowers, checks} = nodes |> Enum.map(&plan(&1, ctx, times)) |> unzip3()
     {Enum.join(sqls, separator), Enum.concat(lowers), Enum.concat(checks)}
   end
 
@@ -202,9 +238,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   # A comparison with `time` on one side and a time on the other.
   @flipped %{"=" => "=", "<" => ">", "<=" => ">=", ">" => "<", ">=" => "<="}
 
-  defp time_plan(tokens, tags, now) do
+  defp time_plan(tokens, tags, times) do
     case time_sides(tokens) do
-      {op, comparand} -> time_comparison(op, comparand, now)
+      {op, comparand} -> time_comparison(op, comparand, times)
       :other -> {tokens |> InfluxQLSql.rewrite(tags, []) |> Enum.join(" "), []}
     end
   end
@@ -244,9 +280,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp time_comparison(op, _comparand, _now) when op not in ["=", "<", "<=", ">", ">="],
     do: throw({:refused, "unsupported InfluxQL (time #{op} ...)"})
 
-  defp time_comparison(op, comparand, now) do
+  # A lower bound is read earlier by `extend` nanoseconds for the SQL (the
+  # transforms that look back scan one bucket before the range, see
+  # `InfluxQLRun`); the bounds it gives are the statement's own.
+  defp time_comparison(op, comparand, %{now: now, extend: extend}) do
     ns = time_ns(comparand, now)
-    {"time #{op} '#{iso_ns(ns)}'", bounds(op, ns)}
+    scanned = if op in [">=", ">"], do: ns - extend, else: ns
+    {"time #{op} '#{iso_ns(scanned)}'", bounds(op, ns)}
   end
 
   # What a time is compared with, in nanoseconds since the epoch: a lone

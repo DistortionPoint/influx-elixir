@@ -62,6 +62,18 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
       else: ~s|"#{String.replace(name, "\"", "\"\"")}"|
   end
 
+  @doc """
+  How the engine words the name of a relation in an error: a reference of
+  several lower case words (`iox.m`, `public.iox.m`) as written, any other
+  name as `render_identifier/1` words it.
+  """
+  @spec render_qualifier(binary()) :: binary()
+  def render_qualifier(name) do
+    if Regex.match?(~r/\A[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)+\z/, name),
+      do: name,
+      else: render_identifier(name)
+  end
+
   @doc "The `$name` placeholder's name, or `nil`."
   @spec param_name(binary()) :: binary() | nil
   def param_name(text) do

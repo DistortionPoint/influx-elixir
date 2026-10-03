@@ -28,9 +28,12 @@ defmodule InfluxElixir.Admin.Databases do
     * `opts` - optional keyword list:
       * `:retention` - retention period as a duration string, e.g. `"30d"`,
         `"1h 30m"` or `"1.5h"` (units are case-sensitive: `M` months, `m`
-        minutes); omit it for data that never expires. Anything else — an
+        minutes); omit it for data that never expires (`"0"` is a period of
+        zero, which hides every point before now). Anything else — an
         integer number of seconds, as a v2 bucket takes — is InfluxDB 3's
-        400 `expected a duration`, from `Client.Local` too
+        400 `expected a duration`, from `Client.Local` too. Expired points are
+        accepted by a write and hidden from queries, a 10-minute chunk at a
+        time; see `InfluxElixir.Client.Local.create_database/3`
 
   ## Returns
 

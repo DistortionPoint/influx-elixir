@@ -8,6 +8,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   alias InfluxElixir.Client.Local.{
     Format,
     InfluxQL,
+    InfluxQLRegex,
+    InfluxQLShow,
+    InfluxQLShowParser,
+    InfluxQLWild,
     LineProtocolParser,
     Scope,
     SQLExecutor,
@@ -30,81 +34,210 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     end
   end
 
-  @show_databases ~r/^(?i)SHOW\s+DATABASES\s*;?$/
-  @show_measurements ~r/^(?i)SHOW\s+MEASUREMENTS\s*;?$/
-  @show_keys ~r/^(?i)SHOW\s+(TAG|FIELD)\s+KEYS(?:\s+FROM\s+("(?:[^"\\]|\\.)+"|\S+?))?\s*;?$/
-
   @spec do_query_influxql(Store.t(), map(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   defp do_query_influxql(table, conn, raw, opts) do
     # The engine's positions count the text as sent, blanks included.
     influxql = String.trim(raw)
 
-    if String.match?(influxql, @show_databases) do
-      {:ok, Enum.map(Scope.database_names(table), &%{"iox::database" => &1, "deleted" => false})}
-    else
-      # The engine parses the statement before it looks for the database.
-      with {:ok, statement} <- influxql_statement(influxql, raw),
-           {:ok, database} <- influxql_database(opts, conn),
-           :ok <- Scope.database_exists(table, database) do
-        case statement do
-          :show_measurements -> {:ok, show_measurements(table, database)}
-          {:show_keys, match} -> {:ok, show_keys(table, database, match)}
-          {:show_tag_values, spec} -> show_tag_values(table, database, spec)
-          {:select, query} -> influxql_select(table, database, query)
-        end
+    # The engine parses the statement before it looks for the database.
+    with {:ok, statement} <- influxql_statement(influxql, raw) do
+      case statement do
+        {:show, spec} ->
+          show(table, conn, opts, spec)
+
+        {:select, query} ->
+          with {:ok, database} <- influxql_database(opts, conn),
+               :ok <- Scope.database_exists(table, database) do
+            influxql_select(table, database, query)
+          end
       end
     end
   end
 
   @spec influxql_statement(binary(), binary()) ::
-          {:ok,
-           :show_measurements
-           | {:show_keys, [binary()]}
-           | {:show_tag_values, map()}
-           | {:select, map()}}
-          | {:error, term()}
+          {:ok, {:show, map()} | {:select, map()}} | {:error, term()}
   defp influxql_statement(influxql, raw) do
-    cond do
-      String.match?(influxql, @show_measurements) ->
-        {:ok, :show_measurements}
-
-      match = Regex.run(@show_keys, influxql) ->
-        {:ok, {:show_keys, match}}
-
-      show = InfluxQL.parse_show_tag_values(influxql) ->
-        case show do
-          {:ok, spec} ->
-            {:ok, {:show_tag_values, spec}}
-
-          {:error, {:engine, body}} ->
-            {:error, %{status: 400, body: body}}
-
-          {:error, message} ->
-            {:error, %{status: 400, body: "Client.Local: #{message}: #{influxql}"}}
-        end
-
-      true ->
+    case InfluxQLShowParser.parse(raw) do
+      nil ->
         with {:ok, query} <- influxql_parse(raw, influxql), do: {:ok, {:select, query}}
+
+      {:ok, spec} ->
+        {:ok, {:show, Map.put(spec, :statement, influxql)}}
+
+      {:error, {:engine, body}} ->
+        {:error, %{status: 400, body: body}}
+
+      {:error, message} ->
+        {:error, %{status: 400, body: "Client.Local: #{message}: #{influxql}"}}
     end
   end
 
-  # `SHOW TAG VALUES`, as InfluxDB 3 answers it (verified): a row per
-  # distinct value of each listed key, by measurement, key and value, plus
-  # a row without `value` when a point in range lacks the key; a
-  # measurement without the key has no rows. Without a WHERE on `time`,
-  # only the last 24 hours count.
-  @show_tag_values_window "time >= now() - INTERVAL '86400 seconds'"
+  # `SHOW`, as InfluxDB 3 answers it (verified).
+  @spec show(Store.t(), map(), keyword(), map()) :: InfluxElixir.Client.query_result()
+  defp show(table, _conn, _opts, %{kind: :databases}) do
+    {:ok, Enum.map(Scope.database_names(table), &%{"iox::database" => &1, "deleted" => false})}
+  end
 
-  @spec show_tag_values(Store.t(), binary(), map()) :: {:ok, [map()]} | {:error, map()}
-  defp show_tag_values(table, database, spec) do
-    measurements =
-      if spec.measurement, do: [spec.measurement], else: Store.measurements(table, database)
+  defp show(table, conn, opts, spec) do
+    with {:ok, scope} <- show_scope(spec, opts, conn),
+         :ok <- show_exists(table, scope),
+         :ok <- show_planned(spec) do
+      show_rows(table, scope, spec)
+    end
+  end
 
-    measurements
-    |> Enum.sort()
-    |> Enum.reduce_while({:ok, []}, fn m, {:ok, acc} ->
-      case tag_value_rows(table, database, m, spec) do
+  # The database a statement is about: its `ON`, which must be the `db` of the
+  # call when the call has one, else that one. `SHOW RETENTION POLICIES` of
+  # neither covers every database.
+  @spec show_scope(map(), keyword(), InfluxElixir.Client.Local.conn()) ::
+          {:ok, binary() | :all} | {:error, map()}
+  defp show_scope(%{on: on, kind: kind}, opts, conn) do
+    case {on, Scope.resolve_database(opts, conn)} do
+      {nil, {:ok, database}} ->
+        {:ok, database}
+
+      {nil, {:error, :no_database_specified}} ->
+        if kind == :retention, do: {:ok, :all}, else: influxql_database(opts, conn)
+
+      {on, {:error, :no_database_specified}} ->
+        {:ok, on}
+
+      {on, {:ok, on}} ->
+        {:ok, on}
+
+      {on, {:ok, param}} ->
+        {:error,
+         %{
+           status: 400,
+           body:
+             "provided a database in both the parameters (#{param}) and query string " <>
+               "(#{on}) that do not match, if providing a query that specifies the " <>
+               "database, you can omit the 'database' parameter from your request"
+         }}
+    end
+  end
+
+  # What the engine raises when it plans the statement, after the database.
+  @spec show_planned(map()) :: :ok | {:error, map()}
+  defp show_planned(%{planning: nil}), do: :ok
+  defp show_planned(%{planning: {:engine, body}}), do: {:error, %{status: 400, body: body}}
+
+  defp show_planned(%{planning: {:engine, status, body}}),
+    do: {:error, %{status: status, body: body}}
+
+  @spec show_exists(Store.t(), binary() | :all) :: :ok | {:error, map()}
+  defp show_exists(_table, :all), do: :ok
+  defp show_exists(table, database), do: Scope.database_exists(table, database)
+
+  @spec show_rows(Store.t(), binary() | :all, map()) :: InfluxElixir.Client.query_result()
+  defp show_rows(table, database, %{kind: :retention}) do
+    databases = if database == :all, do: Scope.database_names(table), else: [database]
+
+    {:ok,
+     InfluxQLShow.retention_rows(for name <- databases, do: {name, Scope.retention(table, name)})}
+  end
+
+  # Measurements come sorted. A WHERE keeps those with a point in range that
+  # satisfies it; LIMIT and OFFSET count the measurements.
+  defp show_rows(table, database, %{kind: :measurements} = spec) do
+    names =
+      InfluxQLShow.select_measurements(
+        Store.measurements(table, database),
+        spec.measurement && [spec.measurement]
+      )
+
+    with nil <- show_window_error(spec),
+         {:ok, kept} <- show_filter(table, database, names, spec) do
+      {:ok,
+       kept
+       |> InfluxQLShow.measurement_window(spec)
+       |> Enum.map(&%{"iox::measurement" => "measurements", "name" => &1})}
+    end
+  end
+
+  # The engine fails a WHERE with a LIMIT or OFFSET on a measurement that
+  # exists with an internal error of the SQL engine (verified).
+  defp show_rows(table, database, %{kind: :tag_keys} = spec) do
+    names = show_names(table, database, spec)
+
+    if spec.where != nil and names != [] and (spec.limit != nil or spec.offset > 0) do
+      show_refusal(
+        spec,
+        "SHOW TAG KEYS with WHERE and LIMIT or OFFSET (the engine fails it with an internal error)"
+      )
+    else
+      show_collect(names, &tag_key_rows(table, database, &1, spec))
+    end
+  end
+
+  defp show_rows(table, database, %{kind: :field_keys} = spec) do
+    fields =
+      table
+      |> Store.columns(database)
+      |> Enum.filter(&match?({_m, _column, "iox::column_type::field::" <> _type}, &1))
+      |> Enum.group_by(&elem(&1, 0))
+
+    show_collect(show_names(table, database, spec), fn name ->
+      rows =
+        for {^name, column, kind} <- Map.get(fields, name, []) do
+          %{
+            "iox::measurement" => name,
+            "fieldKey" => column,
+            "fieldType" => LineProtocolParser.v2_field_type(kind)
+          }
+        end
+
+      {:ok, InfluxQLShow.window(rows, spec.limit, spec.offset)}
+    end)
+  end
+
+  # With a LIMIT or OFFSET and no measurement that has a key to list, the
+  # engine fails with an internal error of the SQL engine (verified).
+  defp show_rows(table, database, %{kind: :tag_values} = spec) do
+    names = show_names(table, database, spec)
+
+    if (spec.limit != nil or spec.offset > 0) and
+         not Enum.any?(names, &key_listed?(table, database, &1, spec)) do
+      show_refusal(
+        spec,
+        "SHOW TAG VALUES with LIMIT or OFFSET and no key to list (the engine fails it " <>
+          "with an internal error)"
+      )
+    else
+      with {:ok, rows} <- show_collect(names, &tag_value_rows(table, database, &1, spec)) do
+        one_group(rows, spec)
+      end
+    end
+  end
+
+  # The planning error of a LIMIT or OFFSET the engine reads as negative.
+  @spec show_window_error(map()) :: nil | {:error, map()}
+  defp show_window_error(spec) do
+    case InfluxQLShow.window_error(spec.limit, spec.offset) do
+      nil -> nil
+      body -> {:error, %{status: 400, body: body}}
+    end
+  end
+
+  @spec key_listed?(Store.t(), binary(), binary(), map()) :: boolean()
+  defp key_listed?(table, database, measurement, spec) do
+    table
+    |> Store.tag_columns(database, measurement)
+    |> Enum.any?(&InfluxQL.key_listed?(&1, spec.keys))
+  end
+
+  @spec show_names(Store.t(), binary(), map()) :: [binary()]
+  defp show_names(table, database, spec),
+    do: InfluxQLShow.select_measurements(Store.measurements(table, database), spec.from)
+
+  # The rows of each measurement in turn, in the order of the measurements.
+  @spec show_collect([binary()], (binary() -> {:ok, [map()]} | {:error, map()})) ::
+          {:ok, [map()]} | {:error, map()}
+  defp show_collect(names, rows_of) do
+    names
+    |> Enum.reduce_while({:ok, []}, fn name, {:ok, acc} ->
+      case rows_of.(name) do
         {:ok, rows} -> {:cont, {:ok, [rows | acc]}}
         {:error, _reason} = error -> {:halt, error}
       end
@@ -115,50 +248,150 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     end
   end
 
-  @spec tag_value_rows(Store.t(), binary(), binary(), map()) :: {:ok, [map()]} | {:error, map()}
+  @spec show_refusal(map(), binary()) :: {:error, map()}
+  defp show_refusal(spec, what),
+    do:
+      {:error,
+       %{status: 400, body: "Client.Local: unsupported InfluxQL (#{what}): #{spec.statement}"}}
+
+  # The names with a point in range that satisfies the WHERE; all of them
+  # without one.
+  @spec show_filter(Store.t(), binary(), [binary()], map()) ::
+          {:ok, [binary()]} | {:error, map()}
+  defp show_filter(_table, _database, names, %{where: nil}), do: {:ok, names}
+
+  defp show_filter(table, database, names, spec) do
+    Enum.reduce_while(names, {:ok, []}, fn name, {:ok, kept} ->
+      case show_points(table, database, name, spec) do
+        {:ok, []} -> {:cont, {:ok, kept}}
+        {:ok, [_point | _rest]} -> {:cont, {:ok, [name | kept]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, kept} -> {:ok, Enum.reverse(kept)}
+      error -> error
+    end
+  end
+
+  # A measurement's tag keys, sorted: with a WHERE, those some point in range
+  # that satisfies it has a value for.
+  @spec tag_key_rows(Store.t(), binary(), binary(), map()) :: {:ok, [map()]} | {:error, map()}
+  defp tag_key_rows(table, database, measurement, spec) do
+    tags = table |> Store.tag_columns(database, measurement) |> Enum.sort()
+
+    with {:ok, keys} <- present_tags(table, database, measurement, tags, spec) do
+      {:ok,
+       keys
+       |> InfluxQLShow.window(spec.limit, spec.offset)
+       |> Enum.map(&%{"iox::measurement" => measurement, "tagKey" => &1})}
+    end
+  end
+
+  defp present_tags(_table, _database, _measurement, tags, %{where: nil}), do: {:ok, tags}
+
+  defp present_tags(table, database, measurement, tags, spec) do
+    with {:ok, points} <- show_points(table, database, measurement, spec) do
+      {:ok, Enum.filter(tags, fn tag -> Enum.any?(points, &Map.has_key?(&1, tag)) end)}
+    end
+  end
+
+  # A row per distinct value of each listed key, by measurement, key and
+  # value, plus a row without `value` when a point in range lacks the key; a
+  # measurement without the key has no rows. LIMIT and OFFSET count the rows
+  # of each key of each measurement.
+  @spec tag_value_rows(Store.t(), binary(), binary(), map()) ::
+          {:ok, [map()]} | {:error, map()}
   defp tag_value_rows(table, database, measurement, spec) do
     tags = Store.tag_columns(table, database, measurement)
     keys = tags |> Enum.filter(&InfluxQL.key_listed?(&1, spec.keys)) |> Enum.sort()
 
     with [_first | _rest] <- keys,
-         {:ok, where} <- tag_values_where(spec.where, tags) do
-      sql = ~s|SELECT * FROM "#{measurement}" WHERE | <> where
-
-      case run_influxql_sql(table, database, sql, tags) do
-        {:ok, rows} -> {:ok, Enum.flat_map(keys, &key_value_rows(measurement, &1, rows))}
-        {:error, _no_table_or_column} -> {:ok, []}
-      end
+         {:ok, points} <- show_points(table, database, measurement, spec) do
+      {:ok, Enum.flat_map(keys, &key_value_rows(measurement, &1, points, spec))}
     else
       [] -> {:ok, []}
       {:error, _reason} = error -> error
     end
   end
 
-  # The statement's WHERE, parenthesised so an `OR` in it binds before the
-  # default window, which applies unless the WHERE bounds `time` itself.
-  @spec tag_values_where(binary() | nil, MapSet.t(binary())) ::
-          {:ok, binary()} | {:error, map()}
-  defp tag_values_where(nil, _tags), do: {:ok, @show_tag_values_window}
+  @spec key_value_rows(binary(), binary(), [map()], map()) :: [map()]
+  defp key_value_rows(measurement, key, points, spec) do
+    values = for %{^key => value} <- points, do: value
+    base = %{"iox::measurement" => measurement, "key" => key}
+    missing = if Enum.any?(points, &(not Map.has_key?(&1, key))), do: [base], else: []
 
-  defp tag_values_where(where, tags) do
-    case influxql_where(where, tags, %{}, Store.now_ns()) do
-      {:ok, %{where: " WHERE " <> sql}} ->
-        if InfluxQL.mentions_time?(where),
-          do: {:ok, sql},
-          else: {:ok, "(#{sql}) AND " <> @show_tag_values_window}
+    rows =
+      (values |> Enum.uniq() |> Enum.sort() |> Enum.map(&Map.put(base, "value", &1))) ++ missing
+
+    InfluxQLShow.window(rows, spec.limit, spec.offset)
+  end
+
+  # The engine lists the groups a LIMIT or OFFSET cuts in an order of its own
+  # (verified: not the sorted one), so only a single group is answered.
+  @spec one_group([map()], map()) :: {:ok, [map()]} | {:error, map()}
+  defp one_group(rows, spec) do
+    groups = rows |> Enum.uniq_by(&{&1["iox::measurement"], &1["key"]}) |> length()
+
+    if (spec.limit != nil or spec.offset > 0) and groups > 1,
+      do:
+        show_refusal(
+          spec,
+          "SHOW TAG VALUES with LIMIT or OFFSET over several measurements or keys: " <>
+            "the engine lists them in an order the double does not reproduce"
+        ),
+      else: {:ok, rows}
+  end
+
+  # The points of a measurement a SHOW statement counts: those its WHERE
+  # keeps, of the last day unless the WHERE names `time` (verified). A column
+  # the measurement lacks keeps none.
+  @show_window "time >= now() - INTERVAL '86400 seconds'"
+
+  @spec show_points(Store.t(), binary(), binary(), map()) :: {:ok, [map()]} | {:error, map()}
+  defp show_points(table, database, measurement, spec) do
+    tags = Store.tag_columns(table, database, measurement)
+    types = field_types(table, database, measurement)
+
+    with {:ok, plan} <- show_plan(spec, tags, types) do
+      sql = ~s|SELECT * FROM "#{measurement}" WHERE | <> plan.condition
+
+      case run_influxql_sql(table, database, sql, plan.tags, plan.checks) do
+        {:ok, points} -> {:ok, points}
+        {:error, _no_column} -> no_column(spec)
+      end
+    end
+  end
+
+  # A column the measurement lacks is null to the engine, so a comparison with
+  # it keeps nothing; beside an `OR` the rest of the condition still counts,
+  # which the double's SQL cannot say.
+  @spec no_column(map()) :: {:ok, []} | {:error, map()}
+  defp no_column(%{where: where} = spec) do
+    if where =~ ~r/\bOR\b/i,
+      do: show_refusal(spec, "a WHERE with OR that names a column the measurement lacks"),
+      else: {:ok, []}
+  end
+
+  # The WHERE, parenthesised so an `OR` in it binds before the window.
+  @spec show_plan(map(), MapSet.t(binary()), map()) :: {:ok, map()} | {:error, map()}
+  defp show_plan(%{where: nil}, _tags, _types),
+    do: {:ok, %{condition: @show_window, tags: MapSet.new(), checks: []}}
+
+  defp show_plan(%{where: where} = spec, tags, types) do
+    case influxql_where(where, tags, types, Store.now_ns()) do
+      {:ok, %{deferred: deferred}} when deferred != nil ->
+        show_refusal(spec, "a bare column as the WHERE of a SHOW statement")
+
+      {:ok, %{where: " WHERE " <> sql} = plan} ->
+        condition =
+          if InfluxQL.mentions_time?(where), do: sql, else: "(#{sql}) AND " <> @show_window
+
+        {:ok, %{condition: condition, tags: plan.tags, checks: plan.checks}}
 
       {:error, %{body: body} = error} ->
         {:error, %{error | body: InfluxQL.unframe_split(body)}}
     end
-  end
-
-  @spec key_value_rows(binary(), binary(), [map()]) :: [map()]
-  defp key_value_rows(measurement, key, rows) do
-    values = for %{^key => value} <- rows, do: value
-    base = %{"iox::measurement" => measurement, "key" => key}
-    missing = if Enum.any?(rows, &(not Map.has_key?(&1, key))), do: [base], else: []
-
-    (values |> Enum.uniq() |> Enum.sort() |> Enum.map(&Map.put(base, "value", &1))) ++ missing
   end
 
   # HTTP sends an InfluxQL query without `db` when there is none, and the
@@ -179,44 +412,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     end
   end
 
-  @spec show_measurements(Store.t(), binary()) :: [map()]
-  defp show_measurements(table, database) do
-    table
-    |> Store.measurements(database)
-    |> Enum.map(&%{"iox::measurement" => "measurements", "name" => &1})
-  end
-
-  # Tag and field keys come from the column schema, in (measurement, key)
-  # order.
-  @spec show_keys(Store.t(), binary(), [binary()]) :: [map()]
-  defp show_keys(table, database, [_full, kind | from]) do
-    only =
-      case from do
-        [m] -> m |> String.trim("\"") |> LineProtocolParser.unescape_measurement()
-        [] -> nil
-      end
-
-    for {m, column, type} <- Store.columns(table, database),
-        only in [nil, m],
-        row = key_row(String.upcase(kind), m, column, type),
-        row != nil do
-      row
-    end
-  end
-
-  @spec key_row(binary(), term(), binary(), binary()) :: map() | nil
-  defp key_row("TAG", m, column, "iox::column_type::tag"),
-    do: %{"iox::measurement" => m, "tagKey" => column}
-
-  defp key_row("FIELD", m, column, "iox::column_type::field::" <> _type = kind),
-    do: %{
-      "iox::measurement" => m,
-      "fieldKey" => column,
-      "fieldType" => LineProtocolParser.v2_field_type(kind)
-    }
-
-  defp key_row(_kind, _m, _column, _type), do: nil
-
   # The statement's WHERE is evaluated by the SQL engine (the grammar the two
   # share: comparisons, AND/OR/NOT, time literals, now()); InfluxQL then
   # shapes the rows. A measurement or column the engine does not know is an
@@ -227,13 +422,71 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   @spec influxql_select(Store.t(), binary(), InfluxQL.query()) ::
           InfluxElixir.Client.query_result()
   defp influxql_select(table, database, query) do
+    with {:ok, names} <- measurement_names(table, database, query) do
+      names
+      |> Enum.reduce_while({:ok, []}, fn name, {:ok, groups} ->
+        case influxql_select_one(table, database, %{query | measurement: name}) do
+          {:ok, rows} -> {:cont, {:ok, [rows | groups]}}
+          error -> {:halt, error}
+        end
+      end)
+      |> case do
+        {:ok, groups} -> {:ok, groups |> Enum.reverse() |> Enum.concat()}
+        error -> error
+      end
+    end
+  end
+
+  # The measurements a `FROM` selects from, by name (verified): the names it
+  # lists and those the regular expressions in it match, each once, whatever the
+  # order they are written in. The answer has the rows of each in turn, a
+  # `LIMIT` counting in each.
+  @spec measurement_names(Store.t(), binary(), InfluxQL.query()) ::
+          {:ok, [binary()]} | {:error, map()}
+  defp measurement_names(table, database, %{sources: sources}) do
+    existing = Store.measurements(table, database)
+
+    names =
+      Enum.flat_map(sources, fn
+        {:name, name} ->
+          [name]
+
+        {:regex, source} ->
+          regex = InfluxQLRegex.compile(source)
+          Enum.filter(existing, &Regex.match?(regex, &1))
+      end)
+
+    {:ok, names |> Enum.uniq() |> Enum.sort()}
+  catch
+    {:refused, {:engine, status, body}} -> {:error, %{status: status, body: body}}
+    {:refused, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+  end
+
+  @spec influxql_select_one(Store.t(), binary(), InfluxQL.query()) ::
+          InfluxElixir.Client.query_result()
+  defp influxql_select_one(table, database, query) do
     tags = Store.tag_columns(table, database, query.measurement)
     types = field_types(table, database, query.measurement)
     now = Store.now_ns()
 
-    with {:ok, plan} <- influxql_where(query.where, tags, types, now),
+    case influxql_wild(query, types, tags) do
+      :empty ->
+        {:ok, []}
+
+      {:ok, query} ->
+        influxql_planned(table, database, query, types, tags, now)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp influxql_planned(table, database, query, types, tags, now) do
+    with {:ok, extend} <- influxql_lookback(query),
+         {:ok, plan} <- influxql_where(query.where, tags, types, now, extend, true),
          :ok <- influxql_items(query, types, tags),
          :ok <- influxql_window(table, database, query),
+         :ok <- influxql_stride(table, database, query),
          :ok <- influxql_deferred(plan) do
       if empty_range?(plan),
         do: {:ok, []},
@@ -241,7 +494,31 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     end
   end
 
+  # The wildcards of the select list, written out for this measurement.
+  @spec influxql_wild(InfluxQL.query(), map(), MapSet.t(binary())) ::
+          {:ok, InfluxQL.query()} | :empty | {:error, map()}
+  defp influxql_wild(query, types, tags) do
+    case InfluxQLWild.expand(query, types, tags) do
+      {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+      other -> other
+    end
+  catch
+    {:refused, {:engine, status, body}} -> {:error, %{status: status, body: body}}
+    {:refused, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+  end
+
+  # The transforms that compare with the bucket before scan one bucket before
+  # the range.
+  @spec influxql_lookback(InfluxQL.query()) :: {:ok, non_neg_integer()} | {:error, map()}
+  defp influxql_lookback(query) do
+    case InfluxQL.lookback(query) do
+      {:ok, extend} -> {:ok, extend}
+      {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+    end
+  end
+
   # A range the bounds on `time` leave empty answers nothing, as it does there.
+
   @spec empty_range?(map()) :: boolean()
   defp empty_range?(%{lowers: [_low | _lows] = lowers, uppers: [_up | _ups] = uppers}),
     do: Enum.max(lowers) > Enum.min(uppers)
@@ -316,6 +593,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     end
   end
 
+  # `GROUP BY time(0s)` of a measurement that exists is the engine's execution
+  # error, whatever the points (verified); of one that does not, an empty answer.
+  @spec influxql_stride(Store.t(), binary(), InfluxQL.query()) :: :ok | {:error, map()}
+  defp influxql_stride(table, database, %{group_time: {0, _offset}, measurement: measurement}) do
+    if measurement in Store.measurements(table, database),
+      do:
+        {:error,
+         %{
+           status: 500,
+           body:
+             "query error: error while executing plan: " <>
+               "Execution error: DATE_BIN stride must be non-zero"
+         }},
+      else: :ok
+  end
+
+  defp influxql_stride(_table, _database, _query), do: :ok
+
   # An error the engine raises after it has planned the LIMIT.
   @spec influxql_deferred(map()) :: :ok | {:error, map()}
   defp influxql_deferred(%{deferred: nil}), do: :ok
@@ -347,12 +642,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
              deferred: binary() | nil
            }}
           | {:error, map()}
-  defp influxql_where(nil, _tags, _types, _now) do
+  defp influxql_where(where, tags, types, now),
+    do: influxql_where(where, tags, types, now, 0, false)
+
+  defp influxql_where(nil, _tags, _types, _now, _extend, _known?) do
     {:ok, %{where: "", lowers: [], uppers: [], checks: [], tags: MapSet.new(), deferred: nil}}
   end
 
-  defp influxql_where(where, tags, types, now) do
-    case InfluxQL.where_plan(where, tags, types, now: now) do
+  defp influxql_where(where, tags, types, now, extend, known?) do
+    known = if known?, do: MapSet.union(tags, MapSet.new(Map.keys(types)))
+
+    case InfluxQL.where_plan(where, tags, types, now: now, extend_lower: extend, known: known) do
       {:ok, plan} ->
         {:ok,
          %{
@@ -360,7 +660,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
            lowers: plan.lowers,
            uppers: plan.uppers,
            checks: plan.checks,
-           tags: MapSet.intersection(tags, plan.idents),
+           tags: MapSet.new(Enum.filter(tags, &MapSet.member?(plan.idents, &1))),
            deferred: plan.deferred
          }}
 
@@ -394,7 +694,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           MapSet.t(binary()),
           [{binary(), InfluxQL.check()}]
         ) :: {:ok, [map()]} | {:error, term()}
-  defp run_influxql_sql(table, database, sql, fill_tags, checks \\ []) do
+  defp run_influxql_sql(table, database, sql, fill_tags, checks) do
     blank_tags = Map.new(fill_tags, &{&1, ""})
     columns = Enum.map(checks, &elem(&1, 0))
 
@@ -406,7 +706,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
     with {:ok, query} <- SQLParser.parse_select(sql, identifiers: :exact),
          rows when is_list(rows) <- SQLExecutor.run_influxql(query, fetch) do
-      {:ok, Enum.map(rows, &(&1 |> Map.drop(columns) |> drop_blank_tags(fill_tags)))}
+      {:ok, strip_helpers(rows, columns, Enum.to_list(fill_tags))}
     else
       {:error, _reason} = error -> error
     end
@@ -431,11 +731,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     end)
   end
 
-  @spec drop_blank_tags(map(), MapSet.t(binary())) :: map()
-  defp drop_blank_tags(row, tags) do
-    Enum.reduce(tags, row, fn tag, row ->
-      if Map.get(row, tag) == "", do: Map.delete(row, tag), else: row
+  # The check columns and the tags filled with "" are the double's own: they do
+  # not reach the answer. With neither, the rows are the answer as they are.
+  @spec strip_helpers([map()], [binary()], [binary()]) :: [map()]
+  defp strip_helpers(rows, [], []), do: rows
+
+  defp strip_helpers(rows, columns, blank_tags) do
+    Enum.map(rows, fn row ->
+      Enum.reduce(blank_tags, drop_columns(row, columns), &drop_blank_tag/2)
     end)
+  end
+
+  defp drop_columns(row, []), do: row
+  defp drop_columns(row, columns), do: Map.drop(row, columns)
+
+  defp drop_blank_tag(tag, row) do
+    if Map.get(row, tag) == "", do: Map.delete(row, tag), else: row
   end
 
   @spec influxql_result(
@@ -467,6 +778,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp run_select(query, rows, tags, opts) do
     {:ok, InfluxQL.run(query, rows, tags, opts)}
   catch
+    {:refused, {:engine, status, body}} -> {:error, %{status: status, body: body}}
     {:refused, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
   end
 
@@ -475,6 +787,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     case InfluxQL.parse(raw) do
       {:ok, query} -> {:ok, query}
       {:error, {:engine, body}} -> {:error, %{status: 400, body: body}}
+      {:error, {:engine, status, body}} -> {:error, %{status: status, body: body}}
       {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}: #{influxql}"}}
     end
   end

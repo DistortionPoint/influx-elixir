@@ -18,6 +18,8 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   #     are defined for one
 
   alias InfluxElixir.Client.Local.{
+    SQLAggExpr,
+    SQLCondition,
     SQLError,
     SQLEval,
     SQLNumber,
@@ -44,6 +46,42 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     end)
   end
 
+  @doc """
+  The output rows of one group: its row, unless a `HAVING` leaves it out
+  (`having` is `nil` for none). The condition reads the group's first row,
+  the aggregates it names and the names of the select list.
+  """
+  @spec reduce_group(
+          [SQLSelect.column()],
+          SQLAggExpr.having_t() | nil,
+          points(),
+          integer() | nil
+        ) :: [map()]
+  def reduce_group(columns, having, points, bucket_ts) do
+    row = reduce_columns(columns, points, bucket_ts)
+
+    if is_nil(having) or having_holds?(having, points, bucket_ts, row), do: [row], else: []
+  end
+
+  @spec having_holds?(SQLAggExpr.having_t(), points(), integer() | nil, map()) :: boolean()
+  defp having_holds?(%{nodes: nodes, aggs: aggs}, points, bucket_ts, row) do
+    SQLCondition.matches_all?(group_row(points, aggs, bucket_ts, row), nodes)
+  end
+
+  # The row an expression of a group is evaluated over: the group's first
+  # row, the select list's outputs and the values of the aggregates the
+  # expression names.
+  @spec group_row(points(), [{binary(), SQLSelect.column()}], integer() | nil, map()) ::
+          SQLRow.point()
+  defp group_row(points, aggs, bucket_ts, outputs \\ %{}) do
+    base = List.first(points) || %{measurement: "", tags: %{}, fields: %{}, timestamp: nil}
+
+    values =
+      Map.new(aggs, fn {name, column} -> {name, column_result(column, points, bucket_ts)} end)
+
+    %{base | fields: base.fields |> Map.merge(outputs) |> Map.merge(values)}
+  end
+
   # A null result is no key.
   @spec put(map(), binary(), term()) :: map()
   defp put(row, _key, nil), do: row
@@ -66,6 +104,9 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     values = points |> Enum.map(&SQLEval.eval(expr, &1)) |> Enum.reject(&is_nil/1)
     compute(agg, values)
   end
+
+  defp column_result({:expression, expr, aggs, _alias}, points, bucket_ts),
+    do: SQLEval.eval(expr, group_row(points, aggs, bucket_ts))
 
   # COUNT(*) — every matching row counts, regardless of field nullity.
   defp column_result({:count_star, _alias}, points, _bucket_ts), do: length(points)

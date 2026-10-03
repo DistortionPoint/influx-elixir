@@ -169,6 +169,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   # A predicate the engine reads as a constant before it reads its operands.
   @spec leaf(SQLPredicate.clause()) :: tree()
   defp leaf({op, _left, nil}) when op in @comparisons, do: :null
+  defp leaf({:truthy_expr, {:expr, {:lit, nil}}, _nil}), do: :null
   defp leaf({:in, _left, [nil]}), do: :null
   defp leaf({:not_in, _left, [nil]}), do: :null
 

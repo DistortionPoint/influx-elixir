@@ -25,9 +25,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
 
   require SQLLimits
 
-  @two64 18_446_744_073_709_551_616
-  @two63 9_223_372_036_854_775_808
-
   @comparison ["=", "!=", "<>", "<", "<=", ">", ">="]
 
   @typedoc "A value: a signed or unsigned integer, a float, or `nil` for null."
@@ -58,7 +55,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   end
 
   @spec fold_kind(binary(), atom(), [number(), ...]) :: number() | nil
-  defp fold_kind("sum", :unsigned, values), do: Integer.mod(Enum.sum(values), @two64)
+  defp fold_kind("sum", :unsigned, values), do: SQLLimits.wrap_uint64(Enum.sum(values))
   defp fold_kind("sum", :integer, values), do: wrap_signed(Enum.sum(values))
   defp fold_kind("sum", _float, values), do: float_sum(values)
   defp fold_kind(_mean, :float, values), do: values |> float_sum() |> divided(length(values))
@@ -186,7 +183,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
 
   # A literal is signed when it fits, else unsigned.
   @spec integer(integer()) :: {:ok, value()} | :error
-  defp integer(n) when n >= -@two63 and n <= SQLLimits.int64_max(), do: {:ok, {:int, n}}
+  defp integer(n) when SQLLimits.is_int64(n), do: {:ok, {:int, n}}
 
   defp integer(n) when n > SQLLimits.int64_max() and n <= SQLLimits.uint64_max(),
     do: {:ok, {:uint, n}}
@@ -251,13 +248,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   @spec unsigned(value()) :: non_neg_integer() | nil
   defp unsigned({:uint, n}), do: n
   defp unsigned({:int, n}) when n >= 0, do: n
-  defp unsigned({:int, n}) when n == -@two63, do: nil
-  defp unsigned({:int, n}), do: @two64 + n - 1
+  defp unsigned({:int, n}) when n == SQLLimits.int64_min(), do: nil
+  defp unsigned({:int, n}), do: SQLLimits.uint64_max() + n
 
   @spec uint_op(binary(), non_neg_integer(), non_neg_integer()) :: value()
   defp uint_op("/", _x, 0), do: nil
   defp uint_op("/", x, y), do: {:uint, div(x, y)}
-  defp uint_op(op, x, y), do: {:uint, Integer.mod(arith(op, x, y), @two64)}
+  defp uint_op(op, x, y), do: {:uint, SQLLimits.wrap_uint64(arith(op, x, y))}
 
   @spec int_op(binary(), integer(), integer()) :: value()
   defp int_op("/", _x, 0), do: nil
@@ -283,7 +280,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   defp float_arith("/", x, y), do: x / y
 
   @spec wrap_signed(integer()) :: integer()
-  defp wrap_signed(n), do: Integer.mod(n + @two63, @two64) - @two63
+  defp wrap_signed(n), do: SQLLimits.wrap_int64(n)
 
   @spec compare(binary(), value(), value()) :: boolean()
   defp compare(_op, nil, _right), do: false

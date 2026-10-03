@@ -12,11 +12,15 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
   alias InfluxElixir.Client.Local.{
     LineProtocolParser,
+    SQLAggExpr,
+    SQLAggType,
     SQLClauses,
     SQLError,
     SQLExpr,
+    SQLInformation,
     SQLLiteral,
-    SQLParser
+    SQLParser,
+    SQLWhere
   }
 
   @typedoc "A stored point, as `InfluxElixir.Client.Local` keeps it."
@@ -39,7 +43,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   # and WHERE see the table's fields; the later clauses see the select
   # list's output as well.
   @typedoc "The clause a reference stands in."
-  @type clause :: :where | :select | :order | :group | :on
+  @type clause :: :where | :select | :having | :order | :group | :on
 
   @doc "Every tag and field name any of the points has."
   @spec point_columns([point()]) :: MapSet.t(binary())
@@ -62,6 +66,19 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @doc "`:ok`, or the engine's schema error for the first column the query names that is not there."
   @spec check([relation()], SQLParser.parsed_query()) :: :ok | {:error, term()}
   def check(relations, query) do
+    with :ok <- no_table_star(relations, query), do: check_columns(relations, query)
+  end
+
+  # `SELECT *` with no `FROM` has no table to expand.
+  @spec no_table_star([relation()], SQLParser.parsed_query()) :: :ok | {:error, term()}
+  defp no_table_star(relations, query) do
+    if star?(query) and Enum.any?(relations, &(&1.qualifier == SQLInformation.dual())),
+      do: {:error, SQLError.planning("SELECT * with no tables specified is not valid")},
+      else: :ok
+  end
+
+  @spec check_columns([relation()], SQLParser.parsed_query()) :: :ok | {:error, term()}
+  defp check_columns(relations, query) do
     refs = clause_refs(query)
 
     if refs == [] or Enum.any?(relations, &unknown_schema?/1) do
@@ -128,16 +145,17 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     output_name? = query.distinct_on != nil and ref in output_names(query)
 
     valid =
-      if clause in [:order, :group, :on] and not output_name?,
+      if clause in [:order, :group, :on, :having] and not output_name?,
         do: projection_fields(query, listed) ++ fields,
         else: fields
 
     printed = printed(ref, query.qualified)
 
+    known = if valid == [], do: [], else: ["Valid fields are #{Enum.join(valid, ", ")}."]
+
     body =
       Enum.join(
-        ["Schema error: No field named #{printed}." | case_hint(ref, printed, listed)] ++
-          ["Valid fields are #{Enum.join(valid, ", ")}."],
+        ["Schema error: No field named #{printed}." | case_hint(ref, printed, listed)] ++ known,
         " "
       )
 
@@ -150,7 +168,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   defp printed(ref, qualified) when is_binary(ref) do
     case Map.fetch(qualified, ref) do
       {:ok, relation} ->
-        SQLLiteral.render_identifier(relation) <> "." <> SQLLiteral.render_identifier(ref)
+        SQLLiteral.render_qualifier(relation) <> "." <> SQLLiteral.render_identifier(ref)
 
       :error ->
         SQLExpr.ref_text(ref)
@@ -193,7 +211,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
   @spec field_text(binary(), binary()) :: binary()
   defp field_text(qualifier, column),
-    do: SQLLiteral.render_identifier(qualifier) <> "." <> SQLLiteral.render_identifier(column)
+    do: SQLLiteral.render_qualifier(qualifier) <> "." <> SQLLiteral.render_identifier(column)
 
   # The select list's output fields as the engine lists them: a column
   # qualified by its relation, anything else (an alias, an expression, an
@@ -260,9 +278,34 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
     tagged(:where, where_refs(query.where)) ++
       tagged(:select, select_refs) ++
+      tagged(:having, having_refs(query.having, aliases)) ++
       tagged(:order, order_by_refs) ++
-      tagged(:group, query.group_by_columns || []) ++
+      tagged(:group, group_refs(query.group_by_columns)) ++
       tagged(:on, query.distinct_on || [])
+  end
+
+  # The columns a `HAVING` reads that are neither an aggregate's name nor a
+  # name of the select list, and those its aggregates read.
+  @spec having_refs(SQLAggExpr.having_t() | nil, [binary()]) :: [SQLExpr.column_ref()]
+  defp having_refs(nil, _aliases), do: []
+
+  defp having_refs(%{nodes: nodes, aggs: aggs}, aliases) do
+    plain =
+      for ref <- where_refs(nodes),
+          not (is_binary(ref) and (SQLAggExpr.placeholder?(ref) or ref in aliases)),
+          do: ref
+
+    plain ++ Enum.flat_map(aggs, fn {_name, column} -> select_column_refs(column) end)
+  end
+
+  @spec group_refs([binary() | {:expr, SQLExpr.t()}] | nil) :: [SQLExpr.column_ref()]
+  defp group_refs(nil), do: []
+
+  defp group_refs(items) do
+    Enum.flat_map(items, fn
+      {:expr, expr} -> expr_fields(expr)
+      column -> [column]
+    end)
   end
 
   # In a `SELECT *` a number in `ORDER BY` is a position among the columns.
@@ -365,6 +408,12 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     do: [field, ordering]
 
   defp select_column_refs({:grouping_column, source, _alias}), do: [source]
+
+  defp select_column_refs({:expression, expr, aggs, _alias}) do
+    SQLAggExpr.plain_columns(expr) ++
+      Enum.flat_map(aggs, fn {_name, column} -> select_column_refs(column) end)
+  end
+
   defp select_column_refs({:constant, _value, _alias}), do: []
 
   @doc "The columns a `WHERE` reads."
@@ -392,6 +441,10 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   defp operand_fields(column) when is_binary(column), do: [column]
   defp operand_fields(operand), do: expr_fields(operand)
 
+  # The values of an IN list or a BETWEEN that are expressions (the others are literals).
+  @spec operand_exprs([term()]) :: [term()]
+  defp operand_exprs(values), do: for({:expr, _expr} = value <- values, do: value)
+
   @doc "The columns an expression, or a plan item over expressions, reads."
   @spec expr_fields(term()) :: [SQLExpr.column_ref()]
   def expr_fields({:expr, expr}), do: expr_fields(expr)
@@ -399,11 +452,21 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   def expr_fields({:uint_col, name}), do: [name]
   def expr_fields(items) when is_list(items), do: Enum.flat_map(items, &expr_fields/1)
   def expr_fields({:aggregate, _agg, expr}), do: expr_fields(expr)
+  def expr_fields({:aggs, aggs, item}), do: SQLAggType.fields(aggs) ++ expr_fields(item)
+  def expr_fields({:agg_ref, _name}), do: []
+  def expr_fields({:constant, _call, _ancestors}), do: []
   def expr_fields({:cut, call}), do: expr_fields(call)
+  def expr_fields({:lazy_cut, call}), do: expr_fields(call)
+  def expr_fields({:null_cut, call}), do: expr_fields(call)
+  def expr_fields({:expr_check, node}), do: expr_fields(node)
+  def expr_fields({:logical, tree}), do: SQLWhere.truthy_columns(tree)
   def expr_fields({:pattern, _kind, expr, _rest}), do: expr_fields(expr)
   def expr_fields({:compare, _op, left, _right}), do: expr_fields(left)
-  def expr_fields({:in_list, left, _values}), do: expr_fields(left)
-  def expr_fields({:range, left, _low, _high}), do: expr_fields(left)
+  def expr_fields({:in_list, left, values}), do: expr_fields([left | operand_exprs(values)])
+
+  def expr_fields({:range, left, low, high}),
+    do: expr_fields([left | operand_exprs([low, high])])
+
   def expr_fields(expr), do: Enum.flat_map(SQLExpr.children(expr), &expr_fields/1)
 
   @doc """

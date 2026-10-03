@@ -20,9 +20,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeExpr do
   #   * what the whole expression comes to, an instant or a length, is the
   #     nanoseconds since the epoch the `time` column is compared with
 
-  alias InfluxElixir.Client.Local.InfluxQLTime
+  alias InfluxElixir.Client.Local.{InfluxQLTime, SQLLimits}
 
-  @two63 9_223_372_036_854_775_808
+  require SQLLimits
 
   # An instant (`now?` when it is, or comes from, `now()`) or a length; an
   # integer literal is a length that remembers it is not a duration.
@@ -35,7 +35,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeExpr do
   @spec eval(list(), integer()) :: integer()
   def eval(tokens, now) do
     case sum(tokens, now) do
-      {{:ts, ns, _now?}, []} when ns >= -@two63 and ns < @two63 -> ns
+      {{:ts, ns, _now?}, []} when SQLLimits.is_int64(ns) -> ns
       {{:ts, ns, _now?}, []} -> InfluxQLTime.out_of_range(ns)
       {{_length, ns}, []} -> ns
       _leftover -> refuse("a time compared with an expression")
@@ -115,7 +115,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeExpr do
   defp apply_op("-", a, b), do: a - b
 
   @spec span(integer()) :: value()
-  defp span(ns) when ns >= -@two63 and ns < @two63, do: {:dur, ns}
+  defp span(ns) when SQLLimits.is_int64(ns), do: {:dur, ns}
   defp span(_ns), do: refuse("a length beyond 64-bit nanoseconds")
 
   @spec refuse(binary()) :: no_return()

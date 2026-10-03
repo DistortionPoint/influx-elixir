@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`Client.Local` InfluxQL: the functions and clauses dashboards send.**
+  `GROUP BY *`, `/re/`, fields and `::type`, with the engine's parse errors at
+  their positions (`GROUP BY time(`, `fill(previous`, a trailing comma, ...);
+  `percentile`, `mode`, `top`, `bottom`, `integral`, `abs round floor ceil sqrt
+  ln log pow`, the transforms `derivative`, `non_negative_derivative`,
+  `difference`, `non_negative_difference`, `cumulative_sum`, `moving_average`
+  and `elapsed` (of fields, and of aggregates in a `GROUP BY time`, with the
+  engine's scan of the bucket before the range), `F(*)`, `F(/re/)`,
+  `*::field`, `*::tag`, `/re/` columns, `FROM` with several names or `/re/`,
+  `first`/`last`/`min`/`max` of booleans, `/* */` comments, `tz('UTC')`,
+  `SLIMIT`/`SOFFSET` (the engine's 405) and `SHOW MEASUREMENTS | TAG KEYS |
+  FIELD KEYS | TAG VALUES | RETENTION POLICIES` with `ON`, `FROM`, `WITH`,
+  `WHERE`, `LIMIT` and `OFFSET`. A look-around or atomic group in a regular
+  expression is the engine's 500. A Grafana-style corpus of 167 statements
+  went from 62 refusals of what the engine answers to 4.
+- `config :influx_elixir, :local_influxql_max_rows` (default 2,000,000) sets the
+  most rows of a `GROUP BY time` series `Client.Local` will hold.
+- **`Client.Local` SQL: the expressions dashboards send.** Aggregate
+  arithmetic (`sum(n) / count(n)`, `max(x) - min(x)`), `HAVING`, `CASE`,
+  `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `lower`, `upper`, `length`,
+  `substr`, `starts_with`, `sqrt`, `ln`, `log`, `pow` (in `WHERE` too),
+  `IS [NOT] DISTINCT FROM`, `IS [NOT] TRUE`, an alias without `AS`, `SELECT`
+  without `FROM`, `information_schema.tables`/`columns`/`schemata`,
+  `SHOW TABLES`/`COLUMNS` and `iox.`/`public.iox.` table names, with the
+  engine's names, types and errors. A 162-query dashboard corpus went from 93
+  refusals of what the engine answers to 37; what stays refused is listed in
+  the testing guide. Aggregates carry their result types, so `sum(n) + host`
+  is the engine's coercion error; a `CASE` with a text `WHEN` compares as
+  text; `n == 1`, `SELECT ALL`, `FETCH FIRST`, `OFFSET n ROWS`, backtick
+  names, `FROM (t)` and `FROM a, b` are read as the engine reads them, and
+  parser errors are positioned on the statement as written.
 - **`Client.Local` InfluxQL `GROUP BY time(every[, offset])` with `fill()`.**
   Every bucket of the range is answered (buckets start at multiples of
   `every` from the epoch, shifted by `offset`; the range is the `WHERE`
@@ -39,11 +70,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Test suite layout.** Each contract runs as per-part async modules
   (`test/influx_elixir/client/contract_local/<profile>/`,
   `test/integration/contract_<profile>/`): `mix test` takes 8-10 s instead
-  of 27-41 s. The integration one-liners start Core with
+  of 27-41 s, and a plain `mix test` no longer compiles the integration
+  modules (`INTEGRATION=1`, or an explicit `test/integration` path, includes
+  them). The integration one-liners start Core with
   `--wal-flush-interval 10ms`, since a write is answered when the WAL
   flushes: the Core suite takes 18 s instead of 8½ minutes.
 
 ### Fixed
+- **`Client.Local` discarded a v3 database's `retention:`.** On Core a
+  database created with `retention_period: "1h"` accepts a point of any age
+  (204, whatever `accept_partial` says) and hides expired data from SQL,
+  InfluxQL and `SHOW TAG VALUES`, a 10-minute chunk of a table at a time: an
+  expired point is shown for as long as the newest point of its chunk is.
+  Tables and columns stay in the schema. `SHOW RETENTION POLICIES` prints the
+  period (`1h0m0s`, `168h0m0s`, `30s`; `0s` for none). The double returned
+  every row and always `0s`; it now keeps the period in whole seconds and
+  applies all of this. A period of `"0"` (or under a second) is a retention of
+  zero, not none: every point before now is hidden, as on Core. Creating a
+  database that exists keeps its retention. Verified against Core;
+  Enterprise's was not. See
+  `docs/design/2026-10-03_local-database-retention.md`.
+- **`Client.Local` InfluxQL found no rows for an `OR` naming a column the
+  measurement lacks** (`host = 'a' OR zone = 'z'`); such a comparison is now
+  false, as on the engine. Refusals no longer say "invalid statement" for
+  statements the engine answers.
+- **`Client.Local` SQL answered with error bodies the engine does not give**
+  for qualified table names, `information_schema`, an empty `WHERE`, a
+  trailing `ORDER BY`, a non-boolean `WHERE`, `LIKE` on `time` and
+  `GROUP BY ()`; it now answers, or gives the engine's parser and planner
+  errors.
 - **The Hex package carried the wrong files.** `files:` sat outside
   `package()` in `mix.exs`, so Hex used its default list: 0.1.40 and earlier
   shipped `priv/plts/dialyzer.plt` and `.formatter.exs` and left out

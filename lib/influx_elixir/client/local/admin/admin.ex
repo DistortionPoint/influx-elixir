@@ -5,7 +5,7 @@ defmodule InfluxElixir.Client.Local.Admin do
   # profile's capabilities before it calls here.
 
   alias InfluxElixir.Admin.TokenRequest
-  alias InfluxElixir.Client.Local.{Buckets, DatabaseRules, Scope, Store}
+  alias InfluxElixir.Client.Local.{Buckets, DatabaseRules, Retention, Scope, Store}
 
   @spec create_database(
           InfluxElixir.Client.connection(),
@@ -14,47 +14,44 @@ defmodule InfluxElixir.Client.Local.Admin do
         ) :: :ok | {:error, term()}
   def create_database(%{table: table} = conn, name, opts \\ []) do
     with :ok <- Scope.require_capability(conn, :create_database),
-         :ok <- check_retention(Keyword.get(opts, :retention), name),
-         :ok <-
-           Store.create_database(table, name, &DatabaseRules.check_new(name, &1, conn.profile)) do
-      :ok
+         {:ok, retention} <- retention(Keyword.get(opts, :retention), name) do
+      Store.create_database(
+        table,
+        name,
+        &DatabaseRules.check_new(name, &1, conn.profile),
+        retention
+      )
     end
   end
 
   # `retention:` is sent as the engine's `retention_period`, a duration
   # string it reads before anything else in the request (verified against
-  # InfluxDB 3 Core): one or more `<number><unit>` parts, optionally
-  # spaced, a fraction allowed (`1.5h`), units case-sensitive (`M` months,
-  # `m` minutes), or a bare `0`. Anything else is its 400, ending in the
+  # InfluxDB 3 Core; the grammar and what the double does with the period
+  # are in `Retention`). Anything it cannot read is its 400, ending in the
   # `at line 1 column N` its JSON parser appends: the byte just before the
-  # closing brace of the body `Client.HTTP` sends (verified). The double
-  # stores no retention for a database: nothing expires.
-  @duration_units ~w(nanos nsec ns usec us µs millis msec ms seconds second secs sec s
-                     minutes minute mins min m hours hour hrs hr h days day d weeks week w
-                     months month M years year y)
-  @duration ~r/^\s*(?:0|(?:\d+(?:\.\d+)?\s*(?:#{Enum.join(@duration_units, "|")})\s*)+)\s*$/u
+  # closing brace of the body `Client.HTTP` sends (verified). Without a
+  # `retention:` the database has none.
+  @spec retention(term(), binary()) :: {:ok, Retention.t()} | {:error, map()}
+  defp retention(nil, _name), do: {:ok, nil}
 
-  @spec check_retention(term(), binary()) :: :ok | {:error, map()}
-  defp check_retention(nil, _name), do: :ok
-
-  defp check_retention(retention, name) when is_boolean(retention),
+  defp retention(retention, name) when is_boolean(retention),
     do: retention_error("invalid type: boolean `#{retention}`", retention, name)
 
-  defp check_retention(retention, name) when is_binary(retention) or is_atom(retention) do
+  defp retention(retention, name) when is_binary(retention) or is_atom(retention) do
     text = to_string(retention)
 
-    if Regex.match?(@duration, text),
-      do: :ok,
+    if Retention.valid?(text),
+      do: {:ok, Retention.seconds(text)},
       else: retention_error(~s|invalid value: string "#{text}"|, retention, name)
   end
 
-  defp check_retention(retention, name) when is_integer(retention),
+  defp retention(retention, name) when is_integer(retention),
     do: retention_error("invalid type: integer `#{retention}`", retention, name)
 
-  defp check_retention(retention, name) when is_float(retention),
+  defp retention(retention, name) when is_float(retention),
     do: retention_error("invalid type: floating point `#{retention}`", retention, name)
 
-  defp check_retention(retention, name),
+  defp retention(retention, name),
     do: retention_error("invalid type: `#{inspect(retention)}`", retention, name)
 
   @spec retention_error(binary(), term(), binary()) :: {:error, map()}

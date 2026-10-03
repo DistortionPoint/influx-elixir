@@ -38,7 +38,16 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   # at planning (an operator applied to the wrong type) fails the query whatever
   # the rows are.
 
-  alias InfluxElixir.Client.Local.{SQLCondition, SQLError, SQLExpr, SQLParser, SQLRow, SQLWhere}
+  alias InfluxElixir.Client.Local.{
+    SQLCondition,
+    SQLError,
+    SQLEval,
+    SQLExpr,
+    SQLNumber,
+    SQLParser,
+    SQLRow,
+    SQLWhere
+  }
 
   @typep point :: SQLRow.point()
   @typep verdict :: boolean() | nil
@@ -47,7 +56,12 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   @typep entry :: {verdict(), risk()}
   @typep state :: :ok | :maybe | :fail
   @typep kind :: :tag | :time | :constant | :other
-  @typep plan :: %{columns: tuple(), kinds: tuple(), fallible: [non_neg_integer()]}
+  @typep plan :: %{
+           columns: tuple(),
+           kinds: tuple(),
+           tags: [boolean()],
+           fallible: [non_neg_integer()]
+         }
   @typep acc :: %{
            kept: [point()],
            counts: %{non_neg_integer() => non_neg_integer()},
@@ -59,31 +73,129 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   @state_rank %{ok: 0, maybe: 1, fail: 2}
 
   @doc """
-  Whether an operand that can fail stands beside another one of a `WHERE`, so
-  that the order the engine runs them in decides the query.
+  Whether an operand that fails for some row of `points` stands beside another
+  one of a `WHERE`, so that the order the engine runs them in decides the
+  query. An operation that no row makes fail (a division whose divisor is
+  never zero) is not one: the conjunction is then answered row by row.
   """
-  @spec guarded?([SQLParser.where_node()]) :: boolean()
-  def guarded?(conjunction) do
-    (multiple?(conjunction) and Enum.any?(conjunction, &fallible?/1)) or
-      Enum.any?(conjunction, &nested_guard?/1)
+  @spec guarded?([point()], [SQLParser.where_node()]) :: boolean()
+  def guarded?(points, conjunction) do
+    (multiple?(conjunction) and Enum.any?(conjunction, &fails?(&1, points))) or
+      Enum.any?(conjunction, &nested_guard?(&1, points))
   end
 
-  @spec nested_guard?(SQLParser.where_node()) :: boolean()
-  defp nested_guard?({:or, branches}) do
-    (multiple?(branches) and Enum.any?(branches, &fallible_conjunction?/1)) or
-      Enum.any?(branches, &guarded?/1)
+  @spec nested_guard?(SQLParser.where_node(), [point()]) :: boolean()
+  defp nested_guard?({:or, branches}, points) do
+    (multiple?(branches) and Enum.any?(branches, &fails_in?(&1, points))) or
+      Enum.any?(branches, &guarded?(points, &1))
   end
 
-  defp nested_guard?({:not, conjunction}), do: guarded?(conjunction)
-  defp nested_guard?(_clause), do: false
+  defp nested_guard?({:not, conjunction}, points), do: guarded?(points, conjunction)
+  defp nested_guard?(_clause, _points), do: false
 
   @spec multiple?([term()]) :: boolean()
   defp multiple?([_first, _second | _rest]), do: true
   defp multiple?(_parts), do: false
 
-  @spec fallible_conjunction?([SQLParser.where_node()]) :: boolean()
-  defp fallible_conjunction?(conjunction), do: Enum.any?(conjunction, &fallible?/1)
+  @spec fails_in?([SQLParser.where_node()], [point()]) :: boolean()
+  defp fails_in?(conjunction, points), do: Enum.any?(conjunction, &fails?(&1, points))
 
+  # Whether an operation inside the node fails for some row.
+  @spec fails?(SQLParser.where_node(), [point()]) :: boolean()
+  defp fails?(node, points),
+    do:
+      node
+      |> SQLWhere.exprs()
+      |> Enum.any?(&SQLExpr.any?(&1, fn expr -> fails_on?(expr, points) end))
+
+  # Whether an operation that can fail does so for a row. A division or a
+  # remainder fails for a divisor of zero (or `-1`, which overflows the
+  # smallest integer), a negation or `abs` for the smallest integer, `round`
+  # for a scale past `Int32`; only the operand is read. The other operations
+  # fail for a value, so they are run.
+  @spec fails_on?(SQLExpr.t(), [point()]) :: boolean()
+  defp fails_on?({:op, op, _left, divisor}, points) when op in [:/, :rem],
+    do: any_value?(divisor, points, &risky_divisor?/1)
+
+  defp fails_on?({:call, function, [_arg]}, _points)
+       when function in [:round, :trunc, :floor, :ceil],
+       do: false
+
+  defp fails_on?({:call, :abs, [arg]}, points), do: any_value?(arg, points, &risky_minimum?/1)
+  defp fails_on?({:neg, arg}, points), do: any_value?(arg, points, &risky_minimum?/1)
+
+  defp fails_on?({:call, function, [_arg, scale]}, points) when function in [:round, :trunc],
+    do: any_value?(scale, points, &risky_scale?/1)
+
+  defp fails_on?({:cast, _inner, :string}, _points), do: false
+
+  defp fails_on?({:cast, _inner, _type} = expr, points),
+    do: any_value?(expr, points, &(&1 == :error))
+
+  defp fails_on?({:call, _function, _args} = expr, points),
+    do: any_value?(expr, points, &(&1 == :error))
+
+  defp fails_on?(_other, _points), do: false
+
+  # Whether `risky?` holds for the value an operand takes in some row (once,
+  # when it reads no column). An operand that cannot be evaluated is `:error`.
+  @spec any_value?(SQLExpr.t(), [point()], (term() -> boolean())) :: boolean()
+  defp any_value?(_operand, [], _risky?), do: false
+
+  defp any_value?({:field, name}, points, risky?) when is_binary(name) and name != "time",
+    do: any_field?(points, name, risky?)
+
+  defp any_value?(operand, [first | _rest] = points, risky?) do
+    if SQLExpr.columns(operand) == [],
+      do: risky?.(SQLEval.eval(operand, first)),
+      else: Enum.any?(points, &risky?.(SQLEval.eval(operand, &1)))
+  catch
+    {:query_error, _error} -> risky?.(:error)
+  end
+
+  @spec any_field?([point()], binary(), (term() -> boolean())) :: boolean()
+  defp any_field?([], _name, _risky?), do: false
+
+  defp any_field?([%{tags: tags, fields: fields} | rest], name, risky?) do
+    value =
+      case tags do
+        %{^name => tag} -> tag
+        _no_tag -> Map.get(fields, name)
+      end
+
+    risky?.(value) or any_field?(rest, name, risky?)
+  end
+
+  @spec risky_divisor?(term()) :: boolean()
+  defp risky_divisor?(nil), do: false
+  defp risky_divisor?(value) when value == 0 or value == -1, do: true
+  defp risky_divisor?({:u, 0}), do: true
+  defp risky_divisor?({:int, _bits, value}), do: value in [0, -1]
+  defp risky_divisor?({:dec, coefficient, _scale}), do: coefficient == 0
+  defp risky_divisor?(value) when is_number(value) or value in [:inf, :neg_inf, :nan], do: false
+  defp risky_divisor?({:u, _value}), do: false
+  defp risky_divisor?(_other), do: true
+
+  @spec risky_minimum?(term()) :: boolean()
+  defp risky_minimum?(nil), do: false
+  defp risky_minimum?(value) when is_integer(value), do: value == SQLNumber.minimum(:int64)
+  defp risky_minimum?({:int, bits, value}), do: value == SQLNumber.minimum(bits)
+  defp risky_minimum?(value) when is_float(value) or value in [:inf, :neg_inf, :nan], do: false
+  defp risky_minimum?({:u, _value}), do: false
+  defp risky_minimum?({:dec, _coefficient, _scale}), do: false
+  defp risky_minimum?(_other), do: true
+
+  @spec risky_scale?(term()) :: boolean()
+  defp risky_scale?(nil), do: false
+
+  defp risky_scale?(value) when is_integer(value),
+    do: value > 2_147_483_647 or value < -2_147_483_648
+
+  defp risky_scale?({:int, _bits, _value}), do: false
+  defp risky_scale?(_other), do: true
+
+  # The operations the engine can fail on, whatever the rows hold: where the
+  # operands of a conjunct are run is counted for them alone.
   @spec fallible?(SQLParser.where_node()) :: boolean()
   defp fallible?(node),
     do: node |> SQLWhere.exprs() |> Enum.any?(fn expr -> SQLExpr.any?(expr, &can_fail?/1) end)
@@ -109,12 +221,23 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   end
 
   @doc """
-  The points that satisfy a conjunction, or the throw of `{:query_error, error}`
-  the engine's outcome calls for: the closed connection when the query fails
-  in both storage states, the refusal when the two differ.
+  The points that satisfy a parsed `WHERE` conjunction, row by row, unless an
+  operand fails for some row and stands beside another: then the engine's order
+  of evaluation decides the query, and the throw of `{:query_error, error}` is
+  the outcome it calls for: the closed connection when the query fails in both
+  storage states, the refusal when the two differ.
   """
   @spec filter([point()], [SQLParser.where_node()]) :: [point()]
+  def filter(points, []), do: points
+
   def filter(points, conjunction) do
+    if guarded?(points, conjunction),
+      do: probe_filter(points, conjunction),
+      else: Enum.filter(points, &SQLCondition.matches_all?(&1, conjunction))
+  end
+
+  @spec probe_filter([point()], [SQLParser.where_node()]) :: [point()]
+  defp probe_filter(points, conjunction) do
     plan = plan(points, conjunction)
 
     start = %{
@@ -143,9 +266,12 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
     columns = Enum.map(conjunction, &MapSet.new(SQLWhere.columns(&1)))
     tags = tag_columns(points, columns)
 
+    kinds = Enum.map(columns, &kind(&1, tags))
+
     %{
       columns: List.to_tuple(columns),
-      kinds: columns |> Enum.map(&kind(&1, tags)) |> List.to_tuple(),
+      kinds: List.to_tuple(kinds),
+      tags: Enum.map(kinds, &(&1 == :tag)),
       fallible: for({node, index} <- Enum.with_index(conjunction), fallible?(node), do: index)
     }
   end
@@ -176,7 +302,55 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
 
   @spec row(point(), [SQLParser.where_node()], plan(), acc()) :: acc()
   defp row(point, conjunction, plan, acc) do
-    entries = Enum.map(conjunction, &probe(point, &1))
+    case probe_all(conjunction, point, [], true) do
+      {verdicts, true} -> clean_row(point, verdicts, plan, acc)
+      {entries, false} -> risky_row(point, entries, plan, acc)
+    end
+  end
+
+  # What a row gives: its verdicts alone when no conjunct risks anything, as
+  # nearly every row does, else every conjunct's entry.
+  @spec probe_all([SQLParser.where_node()], point(), [verdict()] | [entry()], boolean()) ::
+          {[verdict()], true} | {[entry()], false}
+  defp probe_all([], _point, acc, clean?), do: {Enum.reverse(acc), clean?}
+
+  defp probe_all([node | rest], point, acc, true) do
+    case probe(point, node) do
+      {value, :none} -> probe_all(rest, point, [value | acc], true)
+      entry -> probe_all(rest, point, [entry | Enum.map(acc, &as_entry/1)], false)
+    end
+  end
+
+  defp probe_all([node | rest], point, acc, false),
+    do: probe_all(rest, point, [probe(point, node) | acc], false)
+
+  @spec as_entry(verdict()) :: entry()
+  defp as_entry(value), do: {value, :none}
+
+  # A row of clean verdicts is left out by a conjunct over tags that is not
+  # true, and kept when every conjunct is.
+  @spec clean_row(point(), [verdict()], plan(), acc()) :: acc()
+  defp clean_row(point, verdicts, plan, acc) do
+    cond do
+      pruned_by_tag?(verdicts, plan.tags) ->
+        acc
+
+      Enum.all?(verdicts, &(&1 == true)) ->
+        %{count_prefixes(acc, verdicts, plan) | kept: [point | acc.kept]}
+
+      true ->
+        count_prefixes(acc, verdicts, plan)
+    end
+  end
+
+  @spec pruned_by_tag?([verdict()], [boolean()]) :: boolean()
+  defp pruned_by_tag?([], []), do: false
+
+  defp pruned_by_tag?([verdict | verdicts], [tag? | tags]),
+    do: (tag? and verdict != true) or pruned_by_tag?(verdicts, tags)
+
+  @spec risky_row(point(), [entry()], plan(), acc()) :: acc()
+  defp risky_row(point, entries, plan, acc) do
     throw_plan_error(entries)
     throw_refusal(entries, plan)
 

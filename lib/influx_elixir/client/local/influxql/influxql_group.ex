@@ -1,142 +1,476 @@
 defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   @moduledoc false
-  # The `GROUP BY` clause of an InfluxQL `SELECT`: tags, at most one
-  # `time(every[, offset])` and a trailing `fill(...)` (verified):
+  # The `GROUP BY` clause of an InfluxQL `SELECT` and the `fill()` after it, read
+  # the way the engine's parser reads them (verified), with its errors at its
+  # positions:
   #
-  #   * `every` is a positive duration (`1m`, `1h30m`), `offset` a duration with
-  #     a sign, taken modulo `every`; both are whole microseconds, which is
-  #     what the rows carry
-  #   * `fill` is `null`, `none`, `previous`, `linear` (in any case) or a number
-  #     (`1`, `-2`, `1.5`, `.5`); without `GROUP BY time` it changes nothing
-  #   * what the double does not read is refused by name: a second `time()`,
-  #     `time(0s)`, a call that is not durations, any other `fill` option
+  #   * a dimension is `time(every[, offset])`, `*` or `*::tag` / `*::field`
+  #     (every tag of the measurement; the cast changes nothing), `/regex/` (the
+  #     tags whose key matches, unanchored and case-sensitive), or a name, bare or
+  #     double-quoted, with an optional `::type` (a cast changes nothing). A name
+  #     that is a field groups by its values
+  #   * only the first `time()` counts; a later one is read and ignored
+  #   * a dimension that cannot be read ends the list at the comma before it
+  #     (the statement is then left over from there); a first one that cannot
+  #     is "invalid GROUP BY clause"
+  #   * `every` and `offset` are durations (`1m`, `1h30m`), `offset` with an
+  #     optional sign, `every` too; what a bucket of that size would need is
+  #     decided when there are points to put in it (`InfluxQLBuckets`)
+  #   * `fill(...)` follows the dimensions: `null`, `none`, `previous`, `linear`
+  #     (any case) or a number (`1`, `-2`, `1.5`, `.5`, signed), blanks allowed
+  #     inside; an option that is none of them is "invalid FILL option" where
+  #     it starts, one that is read but not closed by `)` leaves the statement
+  #     from `fill`
+  #   * after the clause only `ORDER BY`, `LIMIT`, `OFFSET`, `SLIMIT`,
+  #     `SOFFSET` or `tz(` may follow; anything else is left over
+  #
+  # What the double does not read is refused by name: a name that is `time`, a
+  # dotted name, an integer for `every`, an offset that is not a duration.
 
-  alias InfluxElixir.Client.Local.{InfluxQLBuckets, InfluxQLText, InfluxQLTokens}
+  alias InfluxElixir.Client.Local.{
+    Durations,
+    InfluxQLBuckets,
+    InfluxQLError,
+    InfluxQLText,
+    SQLLimits
+  }
 
-  @typedoc "A parsed `GROUP BY`; `fill` is `nil` when the clause has none."
+  require SQLLimits
+
+  @typedoc "A dimension that is not `time()`."
+  @type dimension :: {:tag, binary()} | :wildcard | {:regex, binary()}
+
+  @typedoc "A parsed `GROUP BY`; `fill` is `nil` when the statement has none."
   @type t :: %{
-          tags: [binary()],
-          time: nil | {pos_integer(), integer()},
+          dimensions: [dimension()],
+          time: nil | {integer(), integer()},
           fill: InfluxQLBuckets.fill() | nil
         }
 
-  @doc """
-  Parses the text after `GROUP BY` (`\"\"` for none) and the option of the
-  `fill()` after it (`nil` for none).
-  """
-  @spec parse(binary(), binary() | nil) :: {:ok, t()} | {:error, binary()}
-  def parse(dimensions, fill_text) do
-    with {:ok, fill} <- parse_fill(fill_text),
-         {:ok, parts} <- parse_dimensions(dimensions) do
-      times = for {:time, time} <- parts, do: time
+  @types ~w(float integer unsigned string boolean field tag)
+  @after_clause ~r/^(?:ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)(?![\w])|^tz\s*\(/i
+  @options ~w(null none previous linear)
 
-      case times do
-        [] -> {:ok, %{tags: for({:tag, tag} <- parts, do: tag), time: nil, fill: fill}}
-        [time] -> {:ok, %{tags: for({:tag, tag} <- parts, do: tag), time: time, fill: fill}}
-        _several -> {:error, "unsupported InfluxQL (GROUP BY with more than one time())"}
+  @doc """
+  Reads the `GROUP BY` clause (and the `fill()` after it) of `masked_rest`, the
+  text after `FROM <measurement>` with its literals masked; `whole` is the
+  statement as sent and `at` where `masked_rest` starts in it.
+
+  Returns `{result, masked_rest}`: `result` is `:none` when the text has no
+  `GROUP BY` in the place of one (the other checks read the text as it is),
+  `{:ok, t()}`, or the error; the text comes back with the clause blanked to
+  spaces, byte for byte, so that every position stays the engine's.
+  """
+  @spec extract(binary(), non_neg_integer(), binary()) ::
+          {:none | {:ok, t()} | {:error, term()}, binary()}
+  def extract(whole, at, masked_rest) do
+    with [{from, length}] <- Regex.run(~r/\bGROUP\s+BY(?![\w])/i, masked_rest, return: :index),
+         true <- plain_before?(binary_part(masked_rest, 0, from)),
+         text = binary_part(whole, at, byte_size(masked_rest)),
+         start = from + length,
+         false <- blank?(text, start) do
+      case clause(text, start, at, whole) do
+        {:ok, group, stop} -> {{:ok, group}, blank(masked_rest, from, stop)}
+        {:error, _error} = error -> {error, blank(masked_rest, from, byte_size(masked_rest))}
       end
+    else
+      _not_a_clause -> {:none, masked_rest}
     end
   end
 
-  @spec parse_fill(binary() | nil) :: {:ok, InfluxQLBuckets.fill() | nil} | {:error, binary()}
-  defp parse_fill(nil), do: {:ok, nil}
+  # What stands before `GROUP BY`: nothing, or a `WHERE` the keyword cannot be
+  # part of (an operator or connective before it wants an operand, which a
+  # reserved word is not).
+  @spec plain_before?(binary()) :: boolean()
+  defp plain_before?(before) do
+    cond do
+      before =~ ~r/^\s*$/ -> true
+      before =~ ~r/\b(?:ORDER|LIMIT|OFFSET)\b/i -> false
+      before =~ ~r/(?:[-+*=<>(,~!]|(?<![_\/])\/|\b(?:AND|OR))\s*$/i -> false
+      true -> before =~ ~r/^\s*WHERE\s+\S/i
+    end
+  end
 
-  defp parse_fill(option) do
-    option = String.trim(option)
+  @spec blank?(binary(), non_neg_integer()) :: boolean()
+  defp blank?(text, start),
+    do: text |> binary_part(start, byte_size(text) - start) |> String.trim() == ""
+
+  @spec blank(binary(), non_neg_integer(), non_neg_integer()) :: binary()
+  defp blank(masked_rest, from, stop) do
+    <<before::binary-size(from), _clause::binary-size(stop - from), rest::binary>> = masked_rest
+    before <> String.duplicate(" ", stop - from) <> rest
+  end
+
+  # ---------------------------------------------------------------------------
+  # Dimensions
+  # ---------------------------------------------------------------------------
+
+  @spec clause(binary(), non_neg_integer(), non_neg_integer(), binary()) ::
+          {:ok, t(), non_neg_integer()} | {:error, term()}
+  defp clause(text, start, at, whole) do
+    ctx = %{text: text, at: at, whole: whole}
+
+    with {:ok, dimensions, stop} <- dimensions(ctx, skip(text, start), [], 0),
+         {:ok, fill, stop} <- fill(ctx, stop) do
+      leftover(ctx, stop, dimensions, fill)
+    end
+  end
+
+  # The dimensions, then where the list ends. `first` is the position of the
+  # first dimension; a later one that cannot be read ends the list before its
+  # comma.
+  defp dimensions(ctx, pos, acc, count) do
+    case dimension(ctx, pos) do
+      {:ok, dimension, stop} ->
+        after_blank = skip(ctx.text, stop)
+
+        if byte_at(ctx.text, after_blank) == ?, do
+          dimensions(ctx, skip(ctx.text, after_blank + 1), [dimension | acc], count + 1)
+          |> backtrack(ctx, after_blank, [dimension | acc], stop)
+        else
+          {:ok, Enum.reverse([dimension | acc]), stop}
+        end
+
+      :none when count == 0 ->
+        {:error, {:engine, error(ctx, :group, pos)}}
+
+      :none ->
+        :none
+
+      {:error, _error} = error ->
+        error
+    end
+  end
+
+  # A dimension after a comma that could not be read ends the list before the
+  # comma: the comma is the first thing left over.
+  defp backtrack(:none, _ctx, _comma, acc, stop), do: {:ok, Enum.reverse(acc), stop}
+  defp backtrack(result, _ctx, _comma, _acc, _stop), do: result
+
+  @spec dimension(map(), non_neg_integer()) ::
+          {:ok, term(), non_neg_integer()} | :none | {:error, term()}
+  defp dimension(%{text: text} = ctx, pos) do
+    rest = binary_part(text, pos, byte_size(text) - pos)
 
     cond do
-      String.downcase(option) in ["null", "none", "previous", "linear"] ->
-        {:ok, option |> String.downcase() |> String.to_atom()}
-
-      Regex.match?(~r/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/, option) ->
-        {:ok, {:number, number(option)}}
-
-      true ->
-        {:error, "unsupported InfluxQL (fill(#{option}))"}
+      rest == "" -> :none
+      String.starts_with?(rest, "*") -> wildcard(ctx, pos)
+      String.starts_with?(rest, "/") -> regex(ctx, pos)
+      String.starts_with?(rest, "\"") -> quoted(ctx, pos)
+      rest =~ ~r/^time(?![\w])/i and not (rest =~ ~r/^time\s*::/i) -> time_call(ctx, pos)
+      true -> bare(ctx, pos, rest)
     end
   end
 
-  @spec number(binary()) :: integer() | float()
-  defp number(text) do
-    if String.contains?(text, "."),
-      do: text |> String.trim_leading("+") |> normalise() |> String.to_float(),
-      else: text |> String.trim_leading("+") |> String.to_integer()
+  defp wildcard(ctx, pos) do
+    after_star = pos + 1
+
+    case cast(ctx, after_star, ~w(tag field), :wildcard_type) do
+      {:ok, stop} -> {:ok, :wildcard, stop}
+      other -> other
+    end
   end
 
-  defp normalise("-." <> fraction), do: "-0." <> fraction
-  defp normalise("." <> fraction), do: "0." <> fraction
-  defp normalise(text), do: text
+  defp regex(ctx, pos) do
+    rest = binary_part(ctx.text, pos + 1, byte_size(ctx.text) - pos - 1)
 
-  @spec parse_dimensions(binary()) ::
-          {:ok, [{:tag, binary()} | {:time, {pos_integer(), integer()}}]} | {:error, binary()}
-  defp parse_dimensions(text) do
-    text
-    |> split_commas([], [], 0, nil)
-    |> Enum.reduce_while({:ok, []}, fn piece, {:ok, acc} ->
-      case dimension(String.trim(piece)) do
-        {:ok, part} -> {:cont, {:ok, [part | acc]}}
-        {:error, _message} = error -> {:halt, error}
+    case close_regex(rest, 0) do
+      {:ok, size} ->
+        pattern = rest |> binary_part(0, size) |> String.replace("\\/", "/")
+        {:ok, {:regex, pattern}, pos + 1 + size + 1}
+
+      :unterminated ->
+        {:error, {:engine, error(ctx, :unterminated_regex, byte_size(ctx.whole) - ctx.at)}}
+    end
+  end
+
+  defp close_regex(<<?\\, ?/, rest::binary>>, size), do: close_regex(rest, size + 2)
+  defp close_regex(<<?/, _rest::binary>>, size), do: {:ok, size}
+  defp close_regex(<<_byte, rest::binary>>, size), do: close_regex(rest, size + 1)
+  defp close_regex(<<>>, _size), do: :unterminated
+
+  defp quoted(ctx, pos) do
+    rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
+
+    case Regex.run(~r/^"(?:[^"\\]|\\.)*"/s, rest) do
+      [quoted] ->
+        name = InfluxQLText.unquote_ident(quoted)
+        named(ctx, name, pos + byte_size(quoted))
+
+      nil ->
+        {:error, {:engine, error(ctx, :unterminated_string, byte_size(ctx.whole) - ctx.at)}}
+    end
+  end
+
+  defp bare(ctx, pos, rest) do
+    case Regex.run(~r/^[A-Za-z_][A-Za-z0-9_]*/, rest) do
+      [word] ->
+        if InfluxQLText.reserved_start(rest) != nil,
+          do: :none,
+          else: dotted_or_named(ctx, word, pos + byte_size(word))
+
+      nil ->
+        :none
+    end
+  end
+
+  defp dotted_or_named(ctx, word, stop) do
+    if byte_at(ctx.text, stop) == ?.,
+      do: {:error, "unsupported InfluxQL (GROUP BY a dotted name)"},
+      else: named(ctx, word, stop)
+  end
+
+  defp named(ctx, name, stop) do
+    with {:ok, stop} <- cast(ctx, stop, @types, :data_type), do: {:ok, {:tag, name}, stop}
+  end
+
+  # An optional `::type` right after a name; a type word must be followed by
+  # something that cannot continue it.
+  @spec cast(map(), non_neg_integer(), [binary()], atom()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  defp cast(ctx, pos, types, kind) do
+    if binary_part(ctx.text, pos, min(2, byte_size(ctx.text) - pos)) == "::" do
+      rest = binary_part(ctx.text, pos + 2, byte_size(ctx.text) - pos - 2)
+      alternatives = Enum.join(types, "|")
+
+      case Regex.run(~r/^(?:#{alternatives})(?![\w:])/i, rest) do
+        [word] -> {:ok, pos + 2 + byte_size(word)}
+        nil -> {:error, {:engine, error(ctx, kind, pos + 2)}}
       end
+    else
+      {:ok, pos}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # time(every[, offset])
+  # ---------------------------------------------------------------------------
+
+  defp time_call(ctx, pos) do
+    after_word = pos + 4
+    open = skip(ctx.text, after_word)
+
+    if byte_at(ctx.text, open) == ?(,
+      do: interval(ctx, open + 1),
+      else: {:error, {:engine, error(ctx, :time_call, after_word)}}
+  end
+
+  defp interval(ctx, pos) do
+    case duration(ctx.text, skip(ctx.text, pos)) do
+      {:ok, every, stop} ->
+        after_interval(ctx, every, stop)
+
+      {:integer, stop} ->
+        integer_interval(ctx, stop)
+
+      :big ->
+        {:error, "unsupported InfluxQL (a duration beyond 64 bits)"}
+
+      :none ->
+        {:error, {:engine, error(ctx, :time_interval, pos)}}
+    end
+  end
+
+  # An integer for the interval reads, and then fails planning there: refused
+  # by name when the call is otherwise whole, its parse error when it is not.
+  defp integer_interval(ctx, stop) do
+    case after_interval(ctx, 0, stop) do
+      {:ok, _time, _stop} ->
+        {:error, "unsupported InfluxQL (GROUP BY time() with an integer interval)"}
+
+      error ->
+        error
+    end
+  end
+
+  defp after_interval(ctx, every, stop) do
+    comma = skip(ctx.text, stop)
+
+    case byte_at(ctx.text, comma) do
+      ?, -> offset(ctx, every, stop, skip(ctx.text, comma + 1))
+      ?) -> {:ok, {:time, {every, 0}}, comma + 1}
+      _other -> {:error, {:engine, error(ctx, :time_close, stop)}}
+    end
+  end
+
+  defp offset(ctx, every, interval_stop, pos) do
+    case duration(ctx.text, pos) do
+      {:ok, offset, stop} ->
+        close = skip(ctx.text, stop)
+
+        if byte_at(ctx.text, close) == ?),
+          do: {:ok, {:time, {every, offset}}, close + 1},
+          else: {:error, {:engine, error(ctx, :time_close, stop)}}
+
+      :big ->
+        {:error, "unsupported InfluxQL (a duration beyond 64 bits)"}
+
+      :none when pos < byte_size(ctx.text) ->
+        refuse_offset(ctx, interval_stop, pos)
+
+      _other ->
+        {:error, {:engine, error(ctx, :time_close, interval_stop)}}
+    end
+  end
+
+  defp refuse_offset(ctx, interval_stop, pos) do
+    if binary_part(ctx.text, pos, byte_size(ctx.text) - pos) =~ ~r/^now\s*\(/i,
+      do: {:error, "unsupported InfluxQL (GROUP BY time() offset of now())"},
+      else: {:error, {:engine, error(ctx, :time_close, interval_stop)}}
+  end
+
+  # A duration with an optional sign, as nanoseconds, or `:integer` for a plain
+  # integer (the engine reads it as an interval and fails planning), or `:none`.
+  @spec duration(binary(), non_neg_integer()) ::
+          {:ok, integer(), non_neg_integer()} | {:integer, non_neg_integer()} | :big | :none
+  defp duration(text, pos) do
+    rest = binary_part(text, pos, byte_size(text) - pos)
+
+    case Regex.run(~r/^([+-]?)((?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+)/u, rest) do
+      [whole, sign, parts] ->
+        total = duration_total(parts)
+
+        if total > SQLLimits.int64_max(),
+          do: :big,
+          else: {:ok, if(sign == "-", do: -total, else: total), pos + byte_size(whole)}
+
+      nil ->
+        case Regex.run(~r/^[+-]?\d+/, rest) do
+          [digits] -> {:integer, pos + byte_size(digits)}
+          nil -> :none
+        end
+    end
+  end
+
+  defp duration_total(parts) do
+    ~r/(\d+)(ns|ms|u|µ|s|m|h|d|w)/u
+    |> Regex.scan(parts)
+    |> Enum.reduce(0, fn [_all, count, unit], total ->
+      total + String.to_integer(count) * Durations.ns(unit)
     end)
-    |> case do
-      {:ok, parts} -> {:ok, Enum.reverse(parts)}
-      error -> error
+  end
+
+  # ---------------------------------------------------------------------------
+  # fill(...)
+  # ---------------------------------------------------------------------------
+
+  # `fill` after the dimensions: `{:ok, fill | nil, stop}`; a `fill` that is
+  # none (no parenthesis, an option that is not closed) is left over.
+  @spec fill(map(), non_neg_integer()) ::
+          {:ok, InfluxQLBuckets.fill() | nil, non_neg_integer()} | {:error, term()}
+  defp fill(ctx, stop) do
+    pos = skip(ctx.text, stop)
+    rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
+
+    with [word] <- Regex.run(~r/^fill(?![\w])/i, rest),
+         open = skip(ctx.text, pos + byte_size(word)),
+         ?( <- byte_at(ctx.text, open) do
+      fill_option(ctx, open + 1, stop)
+    else
+      _no_fill -> {:ok, nil, stop}
     end
   end
 
-  # The pieces between the commas that are outside parentheses and quotes.
-  @spec split_commas(binary(), [binary()], iodata(), non_neg_integer(), byte() | nil) ::
-          [binary()]
-  defp split_commas(<<>>, pieces, current, _depth, _quote),
-    do: Enum.reverse([IO.iodata_to_binary(Enum.reverse(current)) | pieces])
+  defp fill_option(ctx, option_at, stop) do
+    pos = skip(ctx.text, option_at)
+    rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
 
-  defp split_commas(<<q, rest::binary>>, pieces, current, depth, nil) when q in [?", ?'],
-    do: split_commas(rest, pieces, [<<q>> | current], depth, q)
+    case option(rest) do
+      {:ok, fill, size} ->
+        close = skip(ctx.text, pos + size)
 
-  defp split_commas(<<q, rest::binary>>, pieces, current, depth, q),
-    do: split_commas(rest, pieces, [<<q>> | current], depth, nil)
+        if byte_at(ctx.text, close) == ?),
+          do: {:ok, fill, close + 1},
+          else: {:ok, nil, stop}
 
-  defp split_commas(<<?,, rest::binary>>, pieces, current, 0, nil),
-    do: split_commas(rest, [IO.iodata_to_binary(Enum.reverse(current)) | pieces], [], 0, nil)
-
-  defp split_commas(<<c, rest::binary>>, pieces, current, depth, nil) when c in [?(, ?)] do
-    depth = if c == ?(, do: depth + 1, else: max(depth - 1, 0)
-    split_commas(rest, pieces, [<<c>> | current], depth, nil)
-  end
-
-  defp split_commas(<<c, rest::binary>>, pieces, current, depth, quote),
-    do: split_commas(rest, pieces, [<<c>> | current], depth, quote)
-
-  @spec dimension(binary()) ::
-          {:ok, {:tag, binary()} | {:time, {pos_integer(), integer()}}} | {:error, binary()}
-  defp dimension(piece) do
-    case Regex.run(~r/^time\s*\((.*)\)$/is, piece) do
-      [_all, arguments] -> time_call(arguments)
-      nil -> {:ok, {:tag, InfluxQLText.unquote_ident(piece)}}
+      :error ->
+        {:error, {:engine, error(ctx, :fill, option_at)}}
     end
   end
 
-  # `time(every)` and `time(every, offset)`.
-  @spec time_call(binary()) :: {:ok, {:time, {pos_integer(), integer()}}} | {:error, binary()}
-  defp time_call(arguments) do
-    case InfluxQLTokens.tokenize(arguments, []) do
-      {:ok, [{:duration, every, _text}]} -> time_dimension(every, 0)
-      {:ok, [{:duration, every, _text}, {:raw, ","} | offset]} -> offset_call(every, offset)
-      _other -> {:error, "unsupported InfluxQL (GROUP BY time(#{String.trim(arguments)}))"}
+  @spec option(binary()) :: {:ok, InfluxQLBuckets.fill(), non_neg_integer()} | :error
+  defp option(rest) do
+    case Regex.run(~r/^(?:(null|none|previous|linear)(?![\w])|([+-]?)(\d*\.\d+|\d+))/i, rest) do
+      [word, keyword] when keyword != "" and byte_size(word) > 0 ->
+        keyword = String.downcase(keyword)
+        if keyword in @options, do: {:ok, String.to_atom(keyword), byte_size(word)}, else: :error
+
+      [word, "", sign, number] ->
+        number(sign, number, byte_size(word))
+
+      _other ->
+        :error
     end
   end
 
-  defp offset_call(every, [{:duration, offset, _text}]), do: time_dimension(every, offset)
+  @spec number(binary(), binary(), non_neg_integer()) ::
+          {:ok, InfluxQLBuckets.fill(), non_neg_integer()} | :error
+  defp number(sign, text, size) do
+    if String.contains?(text, ".") do
+      case text |> InfluxQLText.leading_zero() |> Float.parse() do
+        {float, ""} when abs(float) < 1.0e308 -> {:ok, {:number, signed(sign, float)}, size}
+        _other -> :error
+      end
+    else
+      value = String.to_integer(text)
 
-  defp offset_call(every, [{:raw, sign}, {:duration, offset, _text}]) when sign in ["+", "-"],
-    do: time_dimension(every, if(sign == "-", do: -offset, else: offset))
+      if value > SQLLimits.int64_max(),
+        do: :error,
+        else: {:ok, {:number, signed(sign, value)}, size}
+    end
+  end
 
-  defp offset_call(_every, _other), do: {:error, "unsupported InfluxQL (GROUP BY time() offset)"}
+  defp signed("-", number), do: -number
+  defp signed(_sign, number), do: number
 
-  defp time_dimension(every, offset)
-       when every > 0 and rem(every, 1000) == 0 and rem(offset, 1000) == 0,
-       do: {:ok, {:time, {every, offset}}}
+  @doc """
+  The option of a `fill()` that follows no `GROUP BY` (`nil` when there is
+  none): it is read, and changes nothing.
+  """
+  @spec parse_loose_fill(binary() | nil) ::
+          {:ok, InfluxQLBuckets.fill() | nil} | {:error, binary()}
+  def parse_loose_fill(nil), do: {:ok, nil}
 
-  defp time_dimension(_every, _offset),
-    do: {:error, "unsupported InfluxQL (GROUP BY time() of zero or under a microsecond)"}
+  def parse_loose_fill(option) do
+    case option(String.trim(option)) do
+      {:ok, fill, _size} -> {:ok, fill}
+      :error -> {:error, "unsupported InfluxQL (fill(#{String.trim(option)}))"}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # What follows
+  # ---------------------------------------------------------------------------
+
+  defp leftover(ctx, stop, dimensions, fill) do
+    pos = skip(ctx.text, stop)
+    rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
+
+    if rest == "" or rest =~ @after_clause do
+      times = for {:time, time} <- dimensions, do: time
+      others = for dimension <- dimensions, not match?({:time, _time}, dimension), do: dimension
+      {:ok, %{dimensions: others, time: List.first(times), fill: fill}, stop}
+    else
+      {:error, {:engine, error(ctx, :nom, pos)}}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Text helpers
+  # ---------------------------------------------------------------------------
+
+  @spec error(map(), atom(), non_neg_integer()) :: binary()
+  defp error(ctx, kind, pos), do: InfluxQLError.syntax_error_body(kind, ctx.at + pos, ctx.whole)
+
+  # The position after the blanks that start at `pos`.
+  @spec skip(binary(), non_neg_integer()) :: non_neg_integer()
+  defp skip(text, pos) do
+    case text |> binary_part(pos, byte_size(text) - pos) |> then(&Regex.run(~r/^\s*/, &1)) do
+      [blanks] -> pos + byte_size(blanks)
+    end
+  end
+
+  @spec byte_at(binary(), non_neg_integer()) :: byte() | nil
+  defp byte_at(text, pos) when pos < byte_size(text), do: :binary.at(text, pos)
+  defp byte_at(_text, _pos), do: nil
 end

@@ -28,10 +28,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   # empty one is the same row every time, so a `LIMIT` over a range of millions
   # of buckets reads only the buckets it keeps.
 
-  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLAggregate}
+  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLAggregate, SQLLimits}
 
-  @max_buckets 1_000_000
-  @two64 18_446_744_073_709_551_616
+  require SQLLimits
+
+  @default_max_rows 2_000_000
+  @max_scan 500_000
+
+  @doc """
+  The most rows a series may answer, which is what the double holds in memory (a
+  row is about 300 bytes; the engine streams, and answers 1.2 million rows for a
+  fortnight in seconds). Configurable with `config :influx_elixir,
+  :local_influxql_max_rows, n`.
+  """
+  @spec max_rows() :: pos_integer()
+  def max_rows,
+    do: Application.get_env(:influx_elixir, :local_influxql_max_rows, @default_max_rows)
 
   @typedoc "How empty buckets are filled."
   @type fill :: :null | :none | :previous | :linear | {:number, integer() | float()}
@@ -52,7 +64,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   """
   @spec series(
           [map()],
-          {pos_integer(), integer()},
+          {integer(), integer()},
           fill(),
           keyword(),
           ([map()] -> [{binary(), InfluxQLAggregate.result(), InfluxQLAggregate.spec()}])
@@ -60,6 +72,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   def series([], _group, _fill, _opts, _compute), do: []
 
   def series(rows, {every, offset}, fill, opts, compute) do
+    check_resolution(every, offset)
     timed = Enum.map(rows, &{time_ns(&1), &1})
     lower = Keyword.get(opts, :lower) || timed |> hd() |> elem(0)
     upper = Keyword.get(opts, :upper) || Keyword.fetch!(opts, :now)
@@ -74,19 +87,31 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
           {every, offset},
           {first, last},
           fill,
-          {compute, Keyword.get(opts, :descending, false)}
+          {compute, Keyword.get(opts, :descending, false), Keyword.get(opts, :window)}
         )
   end
 
+  # The rows carry whole microseconds: a bucket of a length or an offset that
+  # is not, or a length that is not positive, is not answered once there are
+  # points to put in it.
+  @spec check_resolution(integer(), integer()) :: :ok
+  defp check_resolution(every, offset)
+       when every > 0 and rem(every, 1000) == 0 and rem(offset, 1000) == 0,
+       do: :ok
+
+  defp check_resolution(_every, _offset),
+    do: refuse("GROUP BY time() of zero, negative or under a microsecond")
+
   @spec filled(
           [{integer(), map()}],
-          {pos_integer(), integer()},
+          {integer(), integer()},
           {integer(), integer()},
           fill(),
-          {function(), boolean()}
+          {function(), boolean(), non_neg_integer() | nil}
         ) :: Enumerable.t({integer(), map()})
-  defp filled(timed, {every, offset}, {first, last}, fill, {compute, descending?}) do
+  defp filled(timed, {every, offset}, {first, last}, fill, {compute, descending?, window}) do
     count = div(last - first, every) + 1
+    check_rows(fill, count, window)
 
     groups =
       Enum.group_by(
@@ -106,7 +131,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
     if Enum.any?(present, fn {_index, {present?, _cells}} -> present? end) do
       empty = row(empty_results)
       lazy_back? = fill in [:null, :none] or match?({:number, _number}, fill)
-      indexes = if descending? and lazy_back?, do: (count - 1)..0//-1, else: 0..(count - 1)
+      indexes = bucket_indexes(fill, present, count, descending? and lazy_back?)
 
       buckets =
         indexes
@@ -124,11 +149,34 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
     end
   end
 
+  # The buckets to walk. `fill(none)` drops the empty ones, so it walks only the
+  # present ones: a range of billions of buckets is no more work than its points.
+  @spec bucket_indexes(fill(), %{integer() => row()}, pos_integer(), boolean()) ::
+          Enumerable.t(integer())
+  defp bucket_indexes(:none, present, _count, descending?) do
+    kept = for {index, {true, _cells}} <- present, do: index
+    Enum.sort(kept, if(descending?, do: :desc, else: :asc))
+  end
+
+  defp bucket_indexes(_fill, _present, count, true), do: (count - 1)..0//-1
+  defp bucket_indexes(_fill, _present, count, false), do: 0..(count - 1)//1
+
+  # Every bucket but the dropped ones is a row: more than the double holds is
+  # refused before any is made, unless a `LIMIT` stops short of that.
+  @spec check_rows(fill(), pos_integer(), non_neg_integer() | nil) :: :ok
+  defp check_rows(fill, count, nil) when fill != :none do
+    if count > max_rows(),
+      do: refuse("more than #{max_rows()} rows in a series"),
+      else: :ok
+  end
+
+  defp check_rows(_fill, _count, _window), do: :ok
+
   # Every bucket, for a fill that cannot give the latest first without them.
   @spec read_all(Enumerable.t(), pos_integer()) :: list()
   defp read_all(buckets, count) do
-    if count > @max_buckets,
-      do: refuse("a fill that reads more than #{@max_buckets} buckets"),
+    if count > max_rows(),
+      do: refuse("a fill that reads more than #{max_rows()} buckets"),
       else: Enum.to_list(buckets)
   end
 
@@ -168,7 +216,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
         Stream.filter(rows, fn {_index, {present?, _cells}} -> present? end)
 
       :previous ->
-        carry_previous(rows)
+        carry_previous(rows, specs)
 
       :linear ->
         linear(rows, specs)
@@ -207,14 +255,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   defp cast(number, :float), do: number * 1.0
   defp cast(number, :integer) when is_integer(number), do: number
   defp cast(number, :integer), do: trunc(number)
-  defp cast(number, :unsigned) when is_integer(number), do: Integer.mod(number, @two64)
+  defp cast(number, :unsigned) when is_integer(number), do: SQLLimits.wrap_uint64(number)
   defp cast(number, :unsigned) when number >= 0, do: trunc(number)
   defp cast(_number, type), do: refuse("fill() with a number on a #{type} column")
 
   # Each column takes the last value it had.
-  @spec carry_previous(indexed()) :: indexed()
-  defp carry_previous(rows) do
+  # With a `count()` among the columns the engine breaks the connection when the
+  # first bucket is empty (verified), as it does for a linear fill of one; the
+  # double refuses.
+  @spec carry_previous(indexed(), specs()) :: indexed()
+  defp carry_previous(rows, specs) do
+    counts? = Enum.any?(specs, &match?({_name, {:count, _type}}, &1))
+
     Stream.transform(rows, nil, fn {index, {present?, cells}}, last ->
+      if last == nil and not present? and counts?,
+        do: refuse("fill(previous) with count() when the first bucket is empty")
+
       last = last || Enum.map(cells, fn _cell -> :null end)
 
       filled =
@@ -229,26 +285,35 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
     end)
   end
 
-  # The engine breaks the connection of a `count` filled linearly: refused.
+  # The engine breaks the connection of a `count` filled linearly when a bucket
+  # is empty, and of a text or boolean column whatever the buckets: refused.
   @spec linear(indexed(), specs()) :: indexed()
   defp linear(rows, specs) do
-    if Enum.any?(specs, &match?({_name, {:count, _type}}, &1)) do
-      refuse("fill(linear) with count()")
-    else
-      types = Enum.map(specs, fn {_name, {_kind, type}} -> type end)
-      rows = Enum.to_list(rows)
-      indexes = Enum.map(rows, &elem(&1, 0))
-      present = Enum.map(rows, fn {_index, {present?, _cells}} -> present? end)
+    if Enum.any?(specs, fn {_name, {_kind, type}} -> type in [:string, :boolean] end),
+      do: refuse("fill(linear) on a string or boolean column"),
+      else: linear_rows(rows, specs)
+  end
 
-      rows
-      |> Enum.map(fn {_index, {_present?, cells}} -> cells end)
-      |> transpose()
-      |> Enum.zip_with(types, &interpolate/2)
-      |> transpose()
-      |> Enum.zip_with(Enum.zip(indexes, present), fn cells, {index, present?} ->
-        {index, {present?, cells}}
-      end)
-    end
+  @spec linear_rows(indexed(), specs()) :: indexed()
+  defp linear_rows(rows, specs) do
+    types = Enum.map(specs, fn {_name, {_kind, type}} -> type end)
+    rows = rows |> Enum.take(@max_scan + 1) |> bounded_scan()
+
+    if Enum.any?(specs, &match?({_name, {:count, _type}}, &1)) and
+         Enum.any?(rows, fn {_index, {present?, _cells}} -> not present? end),
+       do: refuse("fill(linear) with count() over an empty bucket")
+
+    indexes = Enum.map(rows, &elem(&1, 0))
+    present = Enum.map(rows, fn {_index, {present?, _cells}} -> present? end)
+
+    rows
+    |> Enum.map(fn {_index, {_present?, cells}} -> cells end)
+    |> transpose()
+    |> Enum.zip_with(types, &interpolate/2)
+    |> transpose()
+    |> Enum.zip_with(Enum.zip(indexes, present), fn cells, {index, present?} ->
+      {index, {present?, cells}}
+    end)
   end
 
   # A null cell between two values is on the line through them, by the
@@ -293,6 +358,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
 
   defp line(_y0, _y1, _ratio, type), do: refuse("fill(linear) on a #{type} column")
 
+  @spec bounded_scan(list()) :: list()
+  defp bounded_scan(rows) when length(rows) > @max_scan,
+    do: refuse("fill(linear) over more than 500000 buckets")
+
+  defp bounded_scan(rows), do: rows
+
   @spec transpose([[term()]]) :: [[term()]]
   defp transpose([]), do: []
   defp transpose(rows), do: rows |> Enum.zip() |> Enum.map(&Tuple.to_list/1)
@@ -300,8 +371,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   @spec time_ns(map()) :: integer()
   defp time_ns(%{"time" => time}), do: DateTime.to_unix(time, :microsecond) * 1000
 
+  @doc false
   @spec bucket_start(integer(), pos_integer(), integer()) :: integer()
-  defp bucket_start(ns, every, offset), do: Integer.floor_div(ns - offset, every) * every + offset
+  def bucket_start(ns, every, offset), do: Integer.floor_div(ns - offset, every) * every + offset
 
   @spec refuse(binary()) :: no_return()
   defp refuse(what), do: throw({:refused, "unsupported InfluxQL (#{what})"})

@@ -1,70 +1,14 @@
 defmodule InfluxElixir.Client.Local.InfluxQLShow do
   @moduledoc false
-  # `SHOW TAG VALUES`, and whether a `WHERE` names `time`.
+  # What a `SHOW` statement does with what it read (`InfluxQLShowParser`),
+  # as InfluxDB 3 does it (verified): which of the names it lists, in what
+  # order, and the part of them `LIMIT` and `OFFSET` keep. The store and the
+  # SQL engine are asked by `InfluxQLQuery`; this module is pure.
 
-  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLCheck, InfluxQLText, InfluxQLTokens}
+  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLShowParser, InfluxQLTokens, Retention}
 
-  @show_tag_values ~r/^\s*SHOW\s+TAG\s+VALUES(?:\s+FROM\s+(?<from>"(?:[^"\\]|\\.)+"|[\w\-]+))?\s+WITH\s+KEY\s*(?<op>=~|!~|!=|=|IN\b)\s*(?<spec>.+?)(?:\s+WHERE\s+(?<where>.+?))?\s*;?\s*$/is
-
-  @doc """
-  Parses `SHOW TAG VALUES [FROM m] WITH KEY = k | != k | =~ /re/ | !~ /re/ |
-  IN (k, ...) [WHERE ...]`, or `nil` when the statement is not one.
-  `LIMIT` and `OFFSET` are refused by name: the engine applies them per
-  measurement in an order the double does not reproduce.
-  """
-  @spec parse_show_tag_values(binary()) ::
-          nil
-          | {:ok,
-             %{measurement: binary() | nil, keys: InfluxQL.key_filter(), where: binary() | nil}}
-          | {:error, binary() | {:engine, binary()}}
-  def parse_show_tag_values(statement) do
-    with %{} = captures <- Regex.named_captures(@show_tag_values, statement),
-         :ok <- check_where(statement, captures["where"]) do
-      if Regex.match?(~r/\b(?:LIMIT|OFFSET)\b/i, captures["where"] <> " " <> captures["spec"]) do
-        {:error, "unsupported InfluxQL (SHOW TAG VALUES with LIMIT/OFFSET)"}
-      else
-        with {:ok, keys} <-
-               key_filter(String.upcase(captures["op"]), String.trim(captures["spec"])) do
-          {:ok,
-           %{
-             measurement:
-               captures["from"]
-               |> InfluxQLText.blank_to_nil()
-               |> then(&(&1 && InfluxQLText.unquote_ident(&1))),
-             keys: keys,
-             where: InfluxQLText.blank_to_nil(captures["where"])
-           }}
-        end
-      end
-    end
-  end
-
-  # The `WHERE` is read as that of a `SELECT` is, with the positions of the
-  # statement as sent.
-  @spec check_where(binary(), binary()) :: :ok | {:error, {:engine, binary()}}
-  defp check_where(_statement, ""), do: :ok
-
-  defp check_where(statement, where) do
-    masked = InfluxQLText.mask_literals(statement)
-    InfluxQLCheck.check_where(statement, 0, masked, InfluxQLText.blank_to_nil(where))
-  end
-
-  @spec key_filter(binary(), binary()) :: {:ok, InfluxQL.key_filter()} | {:error, binary()}
-  defp key_filter(op, "/" <> _rest = spec) when op in ["=~", "!~"] do
-    case Regex.compile(spec |> String.trim("/") |> String.replace("\\/", "/"), "u") do
-      {:ok, regex} -> {:ok, {:regex, regex, op == "=~"}}
-      {:error, _reason} -> {:error, "unsupported InfluxQL (invalid regex #{spec})"}
-    end
-  end
-
-  defp key_filter("IN", "(" <> _rest = spec) do
-    keys = spec |> String.trim_leading("(") |> String.trim_trailing(")") |> String.split(",")
-    {:ok, {:in, Enum.map(keys, &(&1 |> String.trim() |> InfluxQLText.unquote_ident()))}}
-  end
-
-  defp key_filter("=", spec), do: {:ok, {:eq, InfluxQLText.unquote_ident(spec)}}
-  defp key_filter("!=", spec), do: {:ok, {:ne, InfluxQLText.unquote_ident(spec)}}
-  defp key_filter(op, spec), do: {:error, "unsupported InfluxQL (WITH KEY #{op} #{spec})"}
+  @int64_max 9_223_372_036_854_775_807
+  @two_64 18_446_744_073_709_551_616
 
   @doc "Whether a tag key is one a `key_filter/0` lists."
   @spec key_listed?(binary(), InfluxQL.key_filter()) :: boolean()
@@ -82,5 +26,85 @@ defmodule InfluxElixir.Client.Local.InfluxQLShow do
       {:ok, tokens} -> Enum.any?(tokens, &InfluxQLTokens.time?/1)
       _not_or_refusal -> false
     end
+  end
+
+  @doc """
+  The measurements a `FROM` list (or `WITH MEASUREMENT`, as a one-item list)
+  selects among those the database has, in their order; all of them without
+  one. A name the database lacks selects nothing.
+  """
+  @spec select_measurements([binary()], [InfluxQLShowParser.source()] | nil) :: [binary()]
+  def select_measurements(names, nil), do: names
+
+  def select_measurements(names, sources),
+    do: Enum.filter(names, fn name -> Enum.any?(sources, &selects?(&1, name)) end)
+
+  @spec selects?(InfluxQLShowParser.source(), binary()) :: boolean()
+  defp selects?({:name, wanted}, name), do: wanted == name
+  defp selects?({:regex, regex}, name), do: Regex.match?(regex, name)
+
+  @doc """
+  The planning error of `SHOW MEASUREMENTS` for a `LIMIT` or `OFFSET` beyond
+  the signed 64-bit range, which the engine reads as the negative number it
+  wraps to (verified: the `LIMIT` is judged first; an `OFFSET` beside a
+  `LIMIT` fails in another rule), or `nil`.
+  """
+  @spec window_error(non_neg_integer() | nil, non_neg_integer()) :: binary() | nil
+  def window_error(limit, offset) do
+    cond do
+      limit != nil and limit > @int64_max ->
+        failed("eliminate_limit", "LIMIT must be >= 0", limit)
+
+      offset > @int64_max and limit != nil ->
+        failed("push_down_limit", "OFFSET must be >=0", offset)
+
+      offset > @int64_max ->
+        failed("eliminate_limit", "OFFSET must be >=0", offset)
+
+      true ->
+        nil
+    end
+  end
+
+  @spec failed(binary(), binary(), non_neg_integer()) :: binary()
+  defp failed(rule, message, value) do
+    "Optimizer rule '#{rule}' failed\ncaused by\n" <>
+      "Error during planning: #{message}, '#{value - @two_64}' was provided"
+  end
+
+  @doc """
+  The measurements `LIMIT` and `OFFSET` keep. With a `WHERE` and an `OFFSET`
+  but no `LIMIT` the engine keeps none (verified, whatever the offset past
+  zero and however many measurements match).
+  """
+  @spec measurement_window([binary()], map()) :: [binary()]
+  def measurement_window(_names, %{where: where, limit: nil, offset: offset})
+      when where != nil and offset > 0,
+      do: []
+
+  def measurement_window(names, %{limit: limit, offset: offset}),
+    do: window(names, limit, offset)
+
+  @doc "`LIMIT` and `OFFSET` over a list: the offset is dropped first, then the limit taken."
+  @spec window([term()], non_neg_integer() | nil, non_neg_integer()) :: [term()]
+  def window(items, limit, offset) do
+    dropped = Enum.drop(items, offset)
+    if limit, do: Enum.take(dropped, limit), else: dropped
+  end
+
+  @doc """
+  The rows of `SHOW RETENTION POLICIES` for databases: each has the one policy
+  `autogen`, whose duration is the database's retention as the engine prints it
+  (`0s` for a database without one).
+  """
+  @spec retention_rows([{binary(), Retention.t()}]) :: [map()]
+  def retention_rows(databases) do
+    Enum.map(databases, fn {database, retention} ->
+      %{
+        "iox::database" => database,
+        "name" => "autogen",
+        "duration" => Retention.format(retention)
+      }
+    end)
   end
 end

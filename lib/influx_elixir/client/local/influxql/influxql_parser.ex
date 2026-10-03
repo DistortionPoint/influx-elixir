@@ -26,14 +26,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   defp unsupported do
     [
       {~r/\bINTO\b/i, "INTO"},
-      {~r/\bS(?:LIMIT|OFFSET)\b/i, "SLIMIT/SOFFSET"},
-      {~r/\bFROM\s*\(/i, "subqueries"},
-      {~r/\bGROUP\s+BY\s+\*/i, "GROUP BY *"},
-      {~r/\btz\s*\(/i, "tz()"}
+      {~r/\bFROM\s*\(/i, "subqueries"}
     ]
   end
 
-  @select ~r/^\s*SELECT\s+(?<items>.+?)\s+FROM\s+(?<from>"(?:[^"\\]|\\.)+"|[A-Za-z_][\w\-]*)(?<rest>.*)$/is
+  @source ~S{"(?:[^"\\]|\\.)+"|/(?:[^/\\]|\\.)+/|[A-Za-z_][\w\-]*}
+  @select Regex.compile!(
+            "^\\s*SELECT\\s+(?<items>.+?)\\s+FROM\\s+" <>
+              "(?<from>(?:#{@source})(?:\\s*,\\s*(?:#{@source}))*)(?<rest>.*)$",
+            "is"
+          )
 
   @function ~r/^(?<fn>[A-Za-z_]\w*)\s*\(\s*(?<arg>\*|"[^"]+"|'(?:[^'\\]|\\.)*'|[+-]?[\w.]+)\s*\)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is
   @literal ~r/^(?:'(?:[^'\\]|\\.)*'|[+-]?(?:\d+\.\d+|\.\d+|\d+)|\d+(?:ns|ms|u|µ|s|m|h|d|w)|true|false)(?:\s+AS\s+(?:"[^"]+"|\w+))?$/isu
@@ -44,40 +46,64 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   Parses an InfluxQL `SELECT`. Returns `{:error, message}` for syntax the
   engine rejects and for the constructs listed in the moduledoc.
   """
-  @spec parse(binary()) :: {:ok, InfluxQL.query()} | {:error, binary() | {:engine, binary()}}
+  @spec parse(binary()) ::
+          {:ok, InfluxQL.query()}
+          | {:error, binary() | {:engine, binary()} | {:engine, pos_integer(), binary()}}
   def parse(statement) do
-    {clean, masked} = blank_comments(statement, InfluxQLText.mask_literals(statement))
+    case parse_statement(statement) do
+      {:error, :unread_shape} ->
+        {:error, "unsupported InfluxQL (that shape of statement)"}
+
+      {:error, :unread_order} ->
+        {:error, "unsupported InfluxQL (clauses the double does not read in that order)"}
+
+      other ->
+        other
+    end
+  end
+
+  # `parse/1` with the statements it cannot read as atoms: a statement after a
+  # `;` that does not read is judged by what it looks like.
+  @spec parse_statement(binary()) ::
+          {:ok, InfluxQL.query()} | {:error, atom() | binary() | tuple()}
+  defp parse_statement(statement) do
+    {clean, masked, unclosed} = blank_comments(statement, InfluxQLText.mask_literals(statement))
     {head, masked_head, tail} = split_statement(clean, masked)
 
-    with :ok <- InfluxQLCheck.check_literals(clean),
+    with :ok <- check_comment(unclosed, clean),
+         :ok <- InfluxQLCheck.check_literals(clean),
          :ok <- check_supported(masked_head),
          :ok <- InfluxQLSelectCheck.check_select(clean, masked_head),
          %{"items" => items, "from" => from, "rest" => rest} <-
-           slices(@select, masked_head, head) || {:error, "invalid statement"},
+           slices(@select, masked_head, head) || {:error, :unread_shape},
          %{"items" => masked_items, "rest" => masked_rest} =
            slices(@select, masked_head, masked_head),
          at = byte_size(head) - byte_size(rest),
          :ok <- InfluxQLCheck.check_empty_where(clean, at, masked_rest),
+         {group_result, masked_rest} = InfluxQLGroup.extract(clean, at, masked_rest),
          %{} = clauses <-
            slices(InfluxQLText.clauses(), masked_rest, rest) ||
              clauses_error(clean, at, masked_rest),
          {where, swallowed} = InfluxQLCheck.cut_where(masked_rest, clauses["where"]),
          :ok <- InfluxQLCheck.check_where(clean, at, masked_rest, where),
+         :ok <- group_error(group_result),
          :ok <- InfluxQLCheck.check_group(clean, at, masked_rest),
          :ok <- InfluxQLCheck.check_swallowed(clean, at, masked_rest, swallowed),
          :ok <- InfluxQLCheck.check_unsigned(clean, at, masked_rest),
-         :ok <- check_group_time(clauses["group"]),
          :ok <- InfluxQLCheck.check_fill(clean, at, masked_rest),
-         {:ok, group} <- InfluxQLGroup.parse(clauses["group"], fill_option(clauses)),
+         {:ok, group} <- group_of(group_result, clauses),
          {:ok, items} <- parse_items(items, masked_items),
          {:ok, items} <- InfluxQLNames.resolve(items),
+         :ok <- check_tz(clauses),
+         :ok <- not_implemented(clauses),
          :ok <- check_single(statement, tail) do
       {:ok,
        %{
          items: items,
-         measurement: InfluxQLText.unquote_ident(from),
+         measurement: from |> sources() |> measurement_name(),
+         sources: sources(from),
          where: where,
-         group_by: group.tags,
+         group_by: group.dimensions,
          group_time: group.time,
          fill: group.fill || :null,
          descending: String.upcase(clauses["dir"]) == "DESC",
@@ -87,14 +113,44 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     end
   end
 
-  # A `--` outside a literal comments out the rest of its line. The comment
-  # becomes spaces, byte for byte, in the statement and its mask, so every
-  # offset stays the engine's.
-  @spec blank_comments(binary(), binary()) :: {binary(), binary()}
+  # A `--` outside a literal comments out the rest of its line, `/* ... */`
+  # (not nested) comments out what it holds. The comment becomes spaces, byte
+  # for byte, in the statement and its mask, so every offset stays the
+  # engine's. A `/*` never closed is the lexer's error at the `*` (verified),
+  # returned as its position.
+  @comments ~r/--[^\n]*|\/\*.*?\*\/|\/\*/s
+
+  @spec blank_comments(binary(), binary()) :: {binary(), binary(), non_neg_integer() | nil}
   defp blank_comments(statement, masked) do
-    comments = ~r/--[^\n]*/ |> Regex.scan(masked, return: :index) |> List.flatten()
-    {Enum.reduce(comments, statement, &blank/2), Enum.reduce(comments, masked, &blank/2)}
+    comments =
+      @comments
+      |> Regex.scan(masked, return: :index)
+      |> List.flatten()
+      |> Enum.reject(&regex_closing?(&1, masked))
+
+    unclosed =
+      Enum.find_value(comments, fn {at, size} ->
+        if size == 2 and binary_part(masked, at, 2) == "/*", do: at + 2
+      end)
+
+    {Enum.reduce(comments, statement, &blank/2), Enum.reduce(comments, masked, &blank/2),
+     unclosed}
   end
+
+  # The slash that closes `=~ /re/` is not the start of a comment.
+  @spec regex_closing?({non_neg_integer(), non_neg_integer()}, binary()) :: boolean()
+  defp regex_closing?({at, _size}, masked) when at > 0 do
+    binary_part(masked, at, 2) == "/*" and
+      binary_part(masked, 0, at) =~ ~r/[=!]~\s*\/_*$/
+  end
+
+  defp regex_closing?(_comment, _masked), do: false
+
+  @spec check_comment(non_neg_integer() | nil, binary()) :: :ok | {:error, {:engine, binary()}}
+  defp check_comment(nil, _statement), do: :ok
+
+  defp check_comment(at, statement),
+    do: {:error, {:engine, InfluxQLError.syntax_error_body(:comment, at, statement)}}
 
   @spec blank({non_neg_integer(), non_neg_integer()}, binary()) :: binary()
   defp blank({from, length}, text) do
@@ -126,7 +182,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
   defp check_single(statement, after_semicolon) do
     rest = binary_part(statement, after_semicolon, byte_size(statement) - after_semicolon)
-    {clean_rest, _masked} = blank_comments(rest, InfluxQLText.mask_literals(rest))
+    {clean_rest, _masked, _unclosed} = blank_comments(rest, InfluxQLText.mask_literals(rest))
     [skipped] = Regex.run(~r/^[\s;]*/, clean_rest)
     start = after_semicolon + byte_size(skipped)
 
@@ -146,7 +202,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
   @spec next_statement_error(binary(), binary(), non_neg_integer()) :: {:error, term()}
   defp next_statement_error(statement, next, start) do
-    case parse(next) do
+    case parse_statement(next) do
       {:ok, _query} ->
         {:error, {:engine, @only_one}}
 
@@ -156,19 +212,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
       {:error, "unsupported" <> _rest} = refusal ->
         refusal
 
-      {:error, message} ->
+      {:error, reason} ->
         cond do
           Regex.match?(@other_statements, next) ->
             {:error, {:engine, @only_one}}
 
           Regex.match?(@known_statements, next) ->
-            {:error, "#{message} (in a statement after `;`)"}
+            {:error, "unsupported InfluxQL (#{unread(reason)} after a `;`)"}
 
           true ->
             {:error, {:engine, InfluxQLError.syntax_error_body(:nom, start, statement)}}
         end
     end
   end
+
+  defp unread(:unread_order), do: "clauses the double does not read in that order"
+  defp unread(:unread_shape), do: "that shape of statement"
+  defp unread(message) when is_binary(message), do: message
 
   @spec check_supported(binary()) :: :ok | {:error, binary()}
   defp check_supported(masked) do
@@ -210,6 +270,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   @spec parse_item(binary()) :: {:ok, InfluxQL.item()} | {:error, binary()}
   defp parse_item("*"), do: {:ok, :star}
 
+  defp parse_item("*::" <> _kind = text) do
+    case String.downcase(text) do
+      "*::field" -> {:ok, {:wild_column, {:star, "field"}}}
+      "*::tag" -> {:ok, {:wild_column, {:star, "tag"}}}
+      _other -> {:error, "unsupported select item: #{text}"}
+    end
+  end
+
+  defp parse_item("/" <> _rest = text) do
+    case Regex.run(~r/^\/((?:[^\/\\]|\\.)+)\/(?:\s+AS\s+(?:"[^"]+"|\w+))?$/is, text) do
+      [_all, source] -> {:ok, {:wild_column, {:regex, String.replace(source, "\\/", "/")}}}
+      nil -> {:error, "unsupported select item: #{text}"}
+    end
+  end
+
   defp parse_item(text) do
     cond do
       Regex.match?(@literal, text) ->
@@ -234,14 +309,40 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # Arithmetic over fields and aggregates, with its alias.
   @spec expression_item(binary()) :: {:ok, InfluxQL.item()} | {:error, binary()}
   defp expression_item(text) do
-    with %{"body" => body, "alias" => alias} <-
-           Regex.named_captures(~r/^(?<body>.+?)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is, text),
-         {:ok, ast} <- InfluxQLExpr.parse(body) do
-      {:ok, {:expr, ast, InfluxQLText.blank_to_nil(InfluxQLText.unquote_ident(alias))}}
-    else
+    %{"body" => body, "alias" => alias} =
+      Regex.named_captures(~r/^(?<body>.+?)(?:\s+AS\s+(?<alias>"[^"]+"|\w+))?$/is, text)
+
+    alias = InfluxQLText.blank_to_nil(InfluxQLText.unquote_ident(alias))
+
+    case InfluxQLExpr.parse(body) do
+      {:ok, {:agg, fun, field}} -> {:ok, {:aggregate, fun, field, alias}}
+      {:ok, ast} -> {:ok, {:expr, ast, alias}}
+      {:multi, kind, field, tags, limit} -> {:ok, {:multi, kind, field, tags, limit, alias}}
+      {:wild, name, extra, target} -> {:ok, {:wild_call, name, extra, target, alias}}
+      {:expand_error, message} -> {:ok, {:expand_error, message}}
+      {:planning, message} -> {:ok, {:planning_error, message}}
       _unread -> {:error, "unsupported select item: #{text}"}
     end
   end
+
+  # The measurements `FROM` names: names and regular expressions, in order.
+  @spec sources(binary()) :: [{:name, binary()} | {:regex, binary()}]
+  defp sources(from) do
+    ~r/"(?:[^"\\]|\\.)+"|\/(?:[^\/\\]|\\.)+\/|[A-Za-z_][\w\-]*/
+    |> Regex.scan(from)
+    |> Enum.map(fn
+      ["/" <> _body = regex] ->
+        {:regex, regex |> String.slice(1..-2//1) |> String.replace("\\/", "/")}
+
+      [name] ->
+        {:name, InfluxQLText.unquote_ident(name)}
+    end)
+  end
+
+  # The one name a statement selects from, when it names one.
+  @spec measurement_name([{:name | :regex, binary()}]) :: binary()
+  defp measurement_name([{:name, name}]), do: name
+  defp measurement_name(_sources), do: ""
 
   # The time column is named `time` unless it is aliased, whatever its case.
   @spec column_item(binary(), binary()) :: InfluxQL.item()
@@ -256,10 +357,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
     cond do
       fun not in @aggregates ->
-        {:error, "unsupported InfluxQL function: #{text}"}
+        expression_item(text)
+
+      arg == "*" and fun == "distinct" ->
+        {:error, "unsupported InfluxQL (distinct(*))"}
 
       arg == "*" and fun != "count" ->
-        {:error, "unsupported InfluxQL (#{fun}(*))"}
+        {:ok,
+         {:wild_call, fun, [], {:star, nil},
+          InfluxQLText.blank_to_nil(InfluxQLText.unquote_ident(alias))}}
 
       arg == "*" ->
         {:ok,
@@ -301,7 +407,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
     case fills do
       [] ->
-        {:error, "invalid clauses"}
+        clause_error(whole, at, masked_rest)
 
       [[{fill_at, _size}]] ->
         if Regex.match?(
@@ -316,19 +422,62 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     end
   end
 
+  # The first clause the engine's parser stops at: each clause keyword in turn is
+  # read for its own error; when none has one, the clauses are in an order the
+  # double does not read.
+  @spec clause_error(binary(), non_neg_integer(), binary()) :: {:error, term()}
+  defp clause_error(whole, at, masked_rest) do
+    ~r/\b(?:ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b/i
+    |> Regex.scan(masked_rest, return: :index)
+    |> Enum.find_value({:error, :unread_order}, fn [{from, _size}] ->
+      case InfluxQLCheck.check_swallowed(whole, at, masked_rest, {from}) do
+        {:error, {:engine, _body}} = error -> error
+        _no_error_of_its_own -> nil
+      end
+    end)
+  end
+
   # The option of the `fill()` the statement has, `nil` for none.
   @spec fill_option(map()) :: binary() | nil
   defp fill_option(%{"fillcall" => ""}), do: nil
   defp fill_option(%{"fill" => option}), do: option
 
-  # A tag named `time` (`GROUP BY "time"`, `time::tag`) is a column of its own
-  # next to the time column; the double does not reproduce that.
-  @spec check_group_time(binary()) :: :ok | {:error, binary()}
-  defp check_group_time(text) do
-    if Regex.match?(~r/(?:^|,)\s*(?:"time"|time\s*::)/i, text),
-      do: {:error, "unsupported InfluxQL (GROUP BY a tag named time)"},
-      else: :ok
+  # `tz('UTC')` changes nothing (the times are written in UTC anyway); another
+  # zone writes the times with its offset and aligns the buckets of a `GROUP BY
+  # time` to its days, which needs a time zone database the double does not
+  # carry.
+  @spec check_tz(map()) :: :ok | {:error, binary()}
+  defp check_tz(%{"tzcall" => ""}), do: :ok
+  defp check_tz(%{"tz" => "UTC"}), do: :ok
+  defp check_tz(%{"tz" => zone}), do: {:error, "unsupported InfluxQL (tz('#{zone}'))"}
+
+  # `SLIMIT` and `SOFFSET` read, then the engine's planner says it has no such
+  # feature, whatever the measurement.
+  @spec not_implemented(map()) :: :ok | {:error, {:engine, pos_integer(), binary()}}
+  defp not_implemented(%{"slimit" => "", "soffset" => ""}), do: :ok
+
+  defp not_implemented(_clauses),
+    do:
+      {:error,
+       {:engine, 405,
+        InfluxQLError.rewrite_error("This feature is not implemented: SLIMIT or SOFFSET")}}
+
+  @spec group_error(term()) ::
+          :ok | {:error, term()}
+  defp group_error({:error, _error} = error), do: error
+  defp group_error(_result), do: :ok
+
+  # The clause as `InfluxQLGroup` read it; without one in its place the text
+  # may still hold a `fill()` (read, and changing nothing).
+  @spec group_of(term(), map()) :: {:ok, InfluxQLGroup.t()} | {:error, binary()}
+  defp group_of({:ok, group}, _clauses), do: {:ok, group}
+
+  defp group_of(:none, %{"group" => ""} = clauses) do
+    with {:ok, fill} <- InfluxQLGroup.parse_loose_fill(fill_option(clauses)),
+         do: {:ok, %{dimensions: [], time: nil, fill: fill}}
   end
+
+  defp group_of(:none, _clauses), do: {:error, "unsupported InfluxQL (that GROUP BY clause)"}
 
   @spec alias_or(binary(), binary()) :: binary()
   defp alias_or("", column), do: column

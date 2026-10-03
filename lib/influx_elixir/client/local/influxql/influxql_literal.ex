@@ -8,7 +8,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
   # `Literal(Float(1.5))`, `Literal(String("a"))`,
   # `Literal(Duration(Duration(5000000000)))`).
 
-  alias InfluxElixir.Client.Local.{Durations, InfluxQLError, SQLLimits}
+  alias InfluxElixir.Client.Local.{Durations, InfluxQLError, InfluxQLText, SQLLimits}
 
   require SQLLimits
 
@@ -55,17 +55,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
   # is out of reach.
   @spec float(binary()) :: {:ok, binary()} | {:error, binary()}
   defp float(text) do
-    value = text |> String.trim_leading("+") |> normalise() |> String.to_float()
+    value = text |> String.trim_leading("+") |> InfluxQLText.leading_zero() |> String.to_float()
 
     if value == 0.0 or (abs(value) >= 1.0e-4 and abs(value) < 1.0e16),
       do: {:ok, "Float(#{value |> Float.to_string() |> plain()})"},
       else: {:error, "a float constant of that size"}
   end
 
-  @spec normalise(binary()) :: binary()
-  defp normalise("-." <> fraction), do: "-0." <> fraction
-  defp normalise("." <> fraction), do: "0." <> fraction
-  defp normalise(text), do: text
+  @doc """
+  A float as Rust's `Display` writes it (`2.0` is `2`, `0.5` is `0.5`, never an
+  exponent), the way the engine words a number in its errors.
+  """
+  @spec display(float()) :: binary()
+  def display(value) when is_float(value),
+    do: value |> Float.to_string() |> plain() |> String.replace_suffix(".0", "")
 
   # Elixir prints the shortest digits with an exponent where Rust prints the
   # digits in full (`1.0e14` is `100000000000000.0`).

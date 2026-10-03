@@ -1,8 +1,6 @@
 defmodule InfluxElixir.Client.Local.SqlExpressionTest do
   use ExUnit.Case, async: true
 
-  import InfluxElixir.TestSupport.LocalHelpers
-
   alias InfluxElixir.Client.Local
 
   setup do
@@ -33,113 +31,49 @@ defmodule InfluxElixir.Client.Local.SqlExpressionTest do
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Issue #18: projected arithmetic, CTEs, table qualifiers. Expected values
-  # recorded from InfluxDB 3 Core (docs/design/2026-09-15_local-ctes-projected-expressions.md).
-  # ---------------------------------------------------------------------------
-
-  describe "query_sql/3 — projected expressions, CTEs and qualifiers" do
-    setup %{conn: conn} do
-      :ok = Local.create_database(conn, "cte_db")
-
-      lines =
-        Enum.join(
-          [
-            "q,provider=a bid=1.0,ask=3.0 1000000000",
-            "q,provider=a bid=2.0,ask=4.0 61000000000",
-            "q,provider=b bid=10.0 121000000000",
-            "q,provider=b bid=5.0,ask=7.0 122000000000"
-          ],
-          "\n"
-        )
-
-      {:ok, :written} = Local.write(conn, lines, database: "cte_db")
-      {:ok, db: "cte_db"}
-    end
-
+  describe "Client.Local: SQL constructs it does not model" do
     test "joins, set operations and windows are rejected by name, not ignored",
-         %{conn: conn, db: db} do
-      for {sql, construct, rendered} <- [
-            {~s|SELECT bid FROM "q" INNER JOIN "q" AS r ON q.time = r.time|, "JOIN",
-             "select bid from q inner join q as r on time = r.time"},
-            {~s|SELECT bid FROM "q" UNION SELECT ask FROM "q"|, "UNION",
-             "select bid from q union select ask from q"},
-            {~s|SELECT provider, COUNT(*) AS n FROM "q" GROUP BY provider HAVING n > 1|, "HAVING",
-             "select provider, count(*) as n from q group by provider having n > 1"}
-          ] do
-        assert {:error, %{status: 400, body: body}} = Local.query_sql(conn, sql, database: db)
-        assert body === "Client.Local: unsupported SQL construct #{construct}: #{rendered}", sql
-      end
+         %{conn: conn} do
+      InfluxElixir.TestSupport.Check.each_case(
+        [
+          {~s|SELECT bid FROM "q" INNER JOIN "q" AS r ON q.time = r.time|, "JOIN",
+           "select bid from q inner join q as r on time = r.time"},
+          {~s|SELECT bid FROM "q" UNION SELECT ask FROM "q"|, "UNION",
+           "select bid from q union select ask from q"},
+          {~s|SELECT bid FROM "q" WHERE time > 0 INTERSECT SELECT ask FROM "q"|, "INTERSECT",
+           "select bid from q where time > 0 intersect select ask from q"},
+          {~s|SELECT tag, ROW_NUMBER() OVER (ORDER BY time) AS n FROM "m"|, "OVER",
+           "select tag, row_number() over (order by time) as n from m"}
+        ],
+        fn {sql, construct, rendered} ->
+          assert {:error, %{status: 400, body: body}} =
+                   Local.query_sql(conn, sql, database: "test_db")
+
+          assert body === "Client.Local: unsupported SQL construct #{construct}: #{rendered}"
+        end
+      )
     end
   end
 
-  describe "query_sql/3 — keyword-like column names and literals are not constructs" do
-    setup %{conn: conn} do
-      :ok = Local.create_database(conn, "kw_db")
+  describe "Client.Local: a malformed boolean expression" do
+    test "is the engine's parser error", %{conn: conn} do
+      assert Local.query_sql(conn, ~s|SELECT host FROM "m" WHERE (host = 'a'|,
+               database: "test_db"
+             ) ===
+               {:error,
+                %{status: 400, body: ~s|SQL error: ParserError("Expected: ), found: EOF")|}}
 
-      {:ok, :written} =
-        Local.write(
-          conn,
-          ~s|m,tag=x offset=1i,over=2i,note="select from join" 1000000000\n| <>
-            ~s|m,tag=y offset=3i,over=4i,note="plain" 2000000000|,
-          database: "kw_db"
-        )
-
-      {:ok, db: "kw_db"}
-    end
-
-    test "a window function is still refused by name", %{conn: conn, db: db} do
-      assert {:error,
-              %{
-                status: 400,
-                body:
-                  "Client.Local: unsupported SQL construct OVER: " <>
-                    "select tag, row_number() over (order by time) as n from m"
-              }} =
-               Local.query_sql(
-                 conn,
-                 ~s|SELECT tag, ROW_NUMBER() OVER (ORDER BY time) AS n FROM "m"|,
-                 database: db
-               )
+      assert Local.query_sql(conn, ~s|SELECT host FROM "m" WHERE host = 'a' AND|,
+               database: "test_db"
+             ) ===
+               {:error,
+                %{
+                  status: 400,
+                  body: ~s|SQL error: ParserError("Expected: an expression, found: EOF")|
+                }}
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # WHERE boolean logic, BETWEEN, LIKE, <>, LIMIT 0 and string-vs-number
-  # comparison. Every expected value recorded from InfluxDB 3 Core first
-  # (docs/design/2026-09-15_local-where-boolean-logic.md).
-  # ---------------------------------------------------------------------------
-
-  describe "query_sql/3 — WHERE OR / NOT / parentheses, BETWEEN, LIKE, <>, LIMIT 0" do
-    setup %{conn: conn} do
-      :ok = Local.create_database(conn, "where_db")
-
-      lines =
-        Enum.join(
-          [
-            "m,host=a,rack=1 v=1.0,n=1i 1000000000",
-            "m,host=b,rack=2 v=2.5,n=2i 2000000000",
-            "m,host=c v=3.0,n=3i 3000000000",
-            "m,host=d,rack=4 v=4.0,n=4i 4000000000",
-            "m,host=e,rack=10 v=5.0,n=5i 5000000000"
-          ],
-          "\n"
-        )
-
-      {:ok, :written} = Local.write(conn, lines, database: "where_db")
-      {:ok, db: "where_db"}
-    end
-
-    test "malformed boolean expressions are rejected, not truncated", %{conn: conn, db: db} do
-      assert {:error, %{status: 400, body: "Client.Local: unbalanced parenthesis in WHERE"}} =
-               Local.query_sql(conn, ~s|SELECT host FROM "m" WHERE (host = 'a'|, database: db)
-
-      assert {:error, %{status: 400, body: "Client.Local: unsupported WHERE clause"}} =
-               Local.query_sql(conn, ~s|SELECT host FROM "m" WHERE host = 'a' AND|, database: db)
-    end
-  end
-
-  # ---------------------------------------------------------------------------
   # Issue #20: CAST in WHERE (and everywhere an expression is allowed),
   # `::TYPE`, ORDER BY expressions and multiple terms. Expected values
   # recorded from InfluxDB 3 Core (docs/design/2026-09-16_local-cast-order-by.md).
@@ -372,5 +306,11 @@ defmodule InfluxElixir.Client.Local.SqlExpressionTest do
       assert {:error, %{status: 400, body: "Client.Local: unsupported column expression: *"}} =
                Local.query_sql(conn, ~s|SELECT * FROM "p" GROUP BY host|, database: "test_db")
     end
+  end
+
+  # The level tags of the rows a query returns, in order.
+  defp levels(conn, db, sql) do
+    {:ok, rows} = Local.query_sql(conn, sql, database: db)
+    Enum.map(rows, & &1["level"])
   end
 end

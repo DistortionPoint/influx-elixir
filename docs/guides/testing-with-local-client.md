@@ -169,6 +169,38 @@ InfluxDB 3 Core):
 - `list_databases/1` and `SHOW DATABASES` include the engine's own
   `_internal`, which cannot be dropped (500).
 
+### Retention
+
+`create_database(conn, "metrics", retention: "1h")` is kept and applied as
+InfluxDB 3 does (verified against Core):
+
+```elixir
+:ok = Local.create_database(conn, "metrics", retention: "1h")
+
+# A write is never refused for a point's age: this is accepted (204).
+{:ok, :written} = Local.write(conn, "m v=1i #{two_hours_ago_ns}\nm v=2i #{a_minute_ago_ns}",
+  database: "metrics")
+
+# A query sees the chunks that still hold a point at or after now - 1h.
+{:ok, [%{"v" => 2}]} = Local.query_sql(conn, "SELECT v FROM m", database: "metrics")
+{:ok, [%{"duration" => "1h0m0s"}]} =
+  Local.query_influxql(conn, "SHOW RETENTION POLICIES", database: "metrics")
+```
+
+- Expiry hides, it does not refuse: SQL, InfluxQL and `SHOW TAG VALUES` all
+  skip expired data, and `accept_partial: false` does not make the write
+  fail. The tables and columns an expired point created stay in the
+  schema.
+- The engine expires a 10-minute chunk of a table (a multiple of 600 s
+  since the epoch), not a point. An expired point stays visible while a
+  newer point of its chunk is, so a test that wants a point gone writes it
+  at least ten minutes beyond the retention.
+- The period is read in whole seconds (`1500ms` is `1s`, anything shorter
+  is `0`). `"0"` is a retention of zero, not none: every point before now is
+  hidden. Omit `retention:` for data that never expires; `SHOW RETENTION
+  POLICIES` then says `0s`.
+- Creating a database that exists keeps the retention it has.
+
 ## Profile Enforcement
 
 If you pick the wrong profile, operations fail the same way they would
@@ -520,8 +552,11 @@ never matches), `first`, `last`, `min`, `max` (the selected row per table),
 `mean`, `sum`, `count` (one row per table, without `_time`), `limit(n:,
 offset:)` per table, and `yield(name:)`. Tables are numbered per series in
 measurement, tag, field order. Any other stage, such as `aggregateWindow`,
-`pivot`, `group` or `sort`, is a 400 naming it; a missing bucket is the
-engine's 404. Against a real server, set `api_version: :v2` on the
+`pivot`, `group` or `sort`, is a 400 naming it (`Client.Local: unsupported
+Flux function: pivot()`); so are arguments to `first`, `last`, `min`,
+`max`, `mean`, `sum` and `count`, a second `range`, a `filter` predicate
+or `range` time the double does not read, and a `yield` that is not
+`yield(name: "x")`. A missing bucket is the engine's 404. Against a real server, set `api_version: :v2` on the
 connection so writes go to `/api/v2/write`.
 
 ## Params
@@ -830,6 +865,58 @@ Local.query_sql(conn, ~s|SELECT * FROM "prices" WHERE time >= $start|,
 `WHERE col IS NULL` and `WHERE col IS NOT NULL` test whether the row has the
 field or tag.
 
+## Expressions, information_schema and What Stays Refused
+
+Beyond the arithmetic projection above, `query_sql/3` answers these as
+InfluxDB 3 Core does (each verified against Core 3.10.1, error bodies
+included):
+
+```elixir
+Local.query_sql(conn, """
+SELECT host,
+       CASE WHEN avg(cpu) > 80 THEN 'hot' ELSE 'ok' END AS state,
+       sum(cpu) / count(cpu) AS mean_cpu
+FROM metrics
+WHERE lower(region) = 'eu' AND cpu IS DISTINCT FROM 0
+GROUP BY host
+HAVING count(*) > 10
+""", database: "test_db")
+```
+
+- `CASE`, `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`
+- `lower`, `upper`, `length`, `substr`, `starts_with`, `sqrt`, `ln`, `log`, `pow`
+- `IS [NOT] DISTINCT FROM`, `IS [NOT] TRUE|FALSE`
+- `SELECT 1` with no `FROM`, and an alias without `AS` (`SELECT n a`)
+- expressions of aggregates, `GROUP BY` expressions, `HAVING <comparison>`
+- `information_schema.tables|columns|schemata`, `SHOW TABLES`,
+  `SHOW COLUMNS FROM t`, and the names `iox.t` and `public.iox.t`
+
+A malformed statement gets the engine's parser error (`SQL error:
+ParserError("Expected: an expression, found: EOF")`), and the planner's errors
+for a `WHERE` that is not a boolean, `LIKE` over `time`, `GROUP BY ()` and a
+function called with the wrong type are the engine's too.
+
+### What stays refused
+
+These answer `{:error, %{status: 400, body: "Client.Local: ..."}}`. Test them
+against a real InfluxDB (see "Running Against a Real InfluxDB"):
+
+- `date_trunc`, `extract`, `date_part`, `INTERVAL` arithmetic, and the string
+  form `date_bin('1 minute', time)` (the `INTERVAL` form is modelled)
+- `date_bin_gapfill` with `locf` / `interpolate`
+- `approx_percentile_cont`, `approx_median`, `bool_and`, `bool_or`,
+  `array_agg`, `FILTER (WHERE ...)`
+- window functions (`OVER`), `JOIN` (other than `CROSS JOIN`), `UNION`,
+  `INTERSECT`, `EXCEPT`, subqueries, `FROM (VALUES ...)`
+- `ROLLUP`, `CUBE`, `GROUPING SETS`, table functions, `system.*` tables,
+  other `information_schema` views and `SHOW` variants
+- `concat`, `trim`, `replace` and the other string functions not listed above
+- `HAVING` without a comparison or without a `GROUP BY`; `COALESCE` mixing
+  text and numbers; a comparison of `time` inside a select item
+
+The last digit of `var_*` and `stddev*` can differ from the engine's: it
+depends on how the engine splits the rows into batches.
+
 ## Checking a Query Before Running It
 
 `InfluxElixir.Client.Local.check_sql/1` parses a query without executing it
@@ -867,11 +954,11 @@ Local.query_influxql(conn, "SELECT SUM(v), COUNT(*) FROM o", database: "db")
 ```
 
 Rows come in time order and drop when they carry no selected field. A lone
-selector (`MAX`, `MIN`, `FIRST`, `LAST`) returns its point's time and the
-columns beside it. `LIMIT` and `OFFSET` apply per `GROUP BY` series. An
-unknown column or measurement is `{:ok, []}`. `SHOW DATABASES`,
-`SHOW MEASUREMENTS`, `SHOW TAG KEYS [FROM m]` and `SHOW FIELD KEYS [FROM m]`
-are answered from the schema.
+selector (`MAX`, `MIN`, `FIRST`, `LAST`, `PERCENTILE`) returns its point's time
+and the columns beside it. `LIMIT` and `OFFSET` apply per `GROUP BY` series
+(and per measurement of a `FROM` list). An unknown column or measurement is
+`{:ok, []}`, and in a `WHERE` a column the measurement lacks is null, so false
+(`host = 'a' OR zone = 'z'` finds host `a`).
 
 InfluxQL's `WHERE` is not SQL's, and the double follows the engine
 (verified):
@@ -880,26 +967,74 @@ InfluxQL's `WHERE` is not SQL's, and the double follows the engine
   without `host`, and `host = ''` finds them. A missing field stays null.
 - `host =~ /h1/` and `host !~ /h1/` match anywhere in the value
   (`/^h1$/` to anchor, `(?i)` to ignore case). A regex on a field, or `<`,
-  `>`, `<=` or `>=` on a tag, is false.
+  `>`, `<=` or `>=` on a tag, is false. Look-around and atomic groups are the
+  engine's 500 (`Invalid regex ... look-around ... is not supported`).
 - `time > now() - 30m` works with `s`, `m`, `h`, `d` and `w` durations.
 - `"host"` and `"usage"` are exact identifiers; InfluxQL folds no case.
-- InfluxQL has no `NOT`: it is the engine's parse error.
+- InfluxQL has no `NOT`: it is the engine's parse error. `/* ... */` and
+  `-- ...` are comments.
 
-`SHOW TAG VALUES [FROM m] WITH KEY = k` (also `!= k`, `=~ /re/`, `!~ /re/`,
-`IN (a, b)`, and an optional `WHERE`) lists each value once, by
-measurement, key and value, plus a row without `"value"` when a point
-lacks the key. Only the last 24 hours count unless the `WHERE` bounds
-`time`, as on the engine.
+### SHOW
 
-`GROUP BY time(every[, offset])` with `fill(null | none | previous |
-linear | n)` answers every bucket of its range as the engine does (from the
-first point to `now()` without time bounds); `median`, `spread`, `stddev`,
-`count(distinct(f))` and arithmetic in the select list (`usage + 1`,
-`sum(n) / count(n)`, `n::float`) are answered; `now()` and durations
-fold with quoted times in a `time` comparison. `INTO`, subqueries, several
-measurements in `FROM`, `fill(linear)` with a `count`, the values of
-`distinct(f)` and `LIMIT` / `OFFSET` on `SHOW TAG VALUES` are refused by
-name.
+`SHOW DATABASES`, `SHOW RETENTION POLICIES` (`autogen`, with the database's
+`retention:` as `1h0m0s`, or `0s` for none),
+`SHOW MEASUREMENTS`, `SHOW TAG KEYS`, `SHOW FIELD KEYS` and `SHOW TAG VALUES`
+are answered from the schema, with `ON db`, `FROM` (names and `/re/`),
+`WITH MEASUREMENT`, `WITH KEY`, `WHERE`, `LIMIT` and `OFFSET`. Only the last
+24 hours count for a `WHERE` that does not bound `time`. The engine's parse
+errors are given at their positions. Refused by name: `LIMIT`/`OFFSET` on
+`SHOW TAG VALUES` over several keys, a `WHERE` with `OR` on a column the
+measurement lacks, a time comparison inside `OR`, and the engine's internal
+errors (a `WHERE` of a bare column, a `TAG KEYS` with `WHERE` and `LIMIT`).
+
+### SELECT
+
+`GROUP BY` takes tags, fields, `*` (every tag), `/re/` (the tags whose key
+matches) and `time(every[, offset])` (the first one counts), with `fill(null |
+none | previous | linear | n)`; the engine's parse errors for a malformed
+clause are given at their positions. The buckets run from the first point (or
+the range's start) to `now()`: `fill(none)` and `LIMIT` read only the buckets
+they keep, and a series of more than 2,000,000 rows (set
+`config :influx_elixir, :local_influxql_max_rows, n`) is refused rather than
+held in memory (a fortnight at one second is 1.2 million rows).
+
+Functions: `mean sum count min max first last median spread stddev mode
+percentile distinct`, `top` and `bottom` (with tags), `integral`, the math
+functions `abs round floor ceil sqrt ln log pow` (a result that is not finite
+is a null that is in the row), and the transforms `derivative`,
+`non_negative_derivative`, `difference`, `non_negative_difference`,
+`cumulative_sum`, `moving_average` and `elapsed` of a field or of an aggregate
+in a `GROUP BY time` (the transforms that compare with the bucket before scan
+one bucket before the range, as the engine does). `F(*)`, `F(/re/)`, `*::field`,
+`*::tag` and `/re/` in the select list, `FROM` with several names or `/re/`,
+`tz('UTC')`, `SLIMIT`/`SOFFSET` (the engine's 405) and arithmetic in the select
+list (`usage + 1`, `sum(n) / count(n)`, `n::float`) are answered.
+
+Refused by name, because the double cannot answer them as the engine does:
+
+- `INTO`, subqueries, `tz()` of a zone other than UTC (needs a time zone
+  database), a statement after `;` that is not a parse error.
+- Float results that depend on how the engine adds up in parallel (`stddev`,
+  the `mean` and `sum` of many floats) can differ in the last digits.
+- `fill(linear)` on a text or boolean column or with a `count` over an empty
+  bucket, `fill(previous)` with a `count` when the first bucket is empty (the
+  engine breaks the connection), `mode()` of values equally often there,
+  `integral()` in a `GROUP BY time`, `elapsed()` of an aggregate, a transform
+  over points of several series that share a time, a transform of a field in a
+  `GROUP BY time`, in descending order after data in the bucket before the
+  range, beside `cumulative_sum`, a `GROUP BY` a field the select list also
+  reads, a `GROUP BY` a tag called `time`, an integer or `now()` for `time()`,
+  a bucket under a microsecond.
+- `top`/`bottom` and `percentile` in arithmetic (the engine ignores the
+  arithmetic), a math function over a selector other than the engine's 500,
+  `distinct(f)` of a field (the engine lists the values in the order of its
+  hash), `mean(b)`/`sum(b)` of a boolean (the engine's long type error).
+- Columns beside a selector in a `GROUP BY time`, `*` beside other items,
+  select items that end up with the same name, a remainder by zero, a negative
+  fraction cast to an integer, an expression of constants, one that mixes
+  aggregates and fields.
+- A quoted time in a form the double does not tell from the engine's, a time
+  comparison inside `OR`, a regular expression with `\u` or a back reference.
 
 ## Running Against a Real InfluxDB
 
@@ -960,7 +1095,9 @@ This library's own contract suite is that second tier:
 server, and reads `INFLUX_V3_CORE_HOST` / `INFLUX_V3_CORE_PORT` (defaults
 `localhost` / `8181`); the v2 suite reads `INFLUX_V2_HOST`, `INFLUX_V2_PORT`,
 `INFLUX_V2_TOKEN`, `INFLUX_V2_ORG` and `INFLUX_V2_BUCKET`. Every statement
-in this guide about what the real engine returns was recorded that way.
+in this guide about what the real engine returns was recorded that way. This
+library's `mix test` does not compile `test/integration` unless a path under it
+is named or `INTEGRATION=1` is set, so the unit suite stays fast.
 
 ## Write Rules
 
@@ -1072,7 +1209,7 @@ nothing is stored; `time` as a field is dropped silently, as a tag it is a
   `selector_first|last|min|max`, `first_value` / `last_value` with an inner
   `ORDER BY`) with optional `GROUP BY DATE_BIN` or `GROUP BY <columns>`.
   Anything else is rejected with a `Client.Local:` prefixed 400 — see
-  `check_sql/1` above.
+  `check_sql/1` above and "What stays refused" in the SQL section above.
 - **`format: :parquet`**: refused with a `Client.Local:` 400 — the double
   holds no Parquet writer. `format: :csv` is modelled: values come back as
   the engine's CSV strings (`"1.5"`, `"1e16"`, `"true"`), empty cells

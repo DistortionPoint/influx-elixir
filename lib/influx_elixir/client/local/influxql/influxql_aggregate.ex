@@ -18,7 +18,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   #   * the columns are named after the function, a name taken twice is
   #     `name_1`, `name_2`
 
-  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLArithmetic, SQLLimits}
+  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLArithmetic, InfluxQLExpr, SQLLimits}
 
   require SQLLimits
 
@@ -36,11 +36,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   @doc "Whether `fun` is an aggregate the double computes."
   @spec function?(binary()) :: boolean()
   def function?(fun),
-    do: fun in ~w(mean sum count min max first last median spread stddev distinct)
+    do:
+      fun in ~w(mean sum count min max first last median spread stddev distinct mode) or
+        String.starts_with?(fun, "percentile:") or String.starts_with?(fun, "integral:")
 
   @doc "Whether `fun` is a selector: it returns the point it chose, with its time and columns."
   @spec selector?(binary()) :: boolean()
-  def selector?(fun), do: fun in @selectors
+  def selector?(fun), do: fun in @selectors or String.starts_with?(fun, "percentile:")
 
   @doc """
   The named results of `aggregates` over `rows`, with the `spec` of each
@@ -103,7 +105,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   end
 
   defp compute({:aggregate, fun, field, alias}, rows, _fields, _tags, types) do
-    [{alias || fun, apply_function(fun, rows, field, types), spec(fun, field, types)}]
+    [
+      {alias || InfluxQLExpr.function_name(fun), apply_function(fun, rows, field, types),
+       spec(fun, field, types)}
+    ]
   end
 
   @doc "The type of the values an aggregate of `field` comes to."
@@ -112,6 +117,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
 
   @spec spec(binary(), binary(), map()) :: spec()
   defp spec("count", _field, _types), do: {:count, :integer}
+  defp spec("integral:" <> _flags, _field, _types), do: {:other, :float}
   defp spec(fun, _field, _types) when fun in ["mean", "stddev"], do: {:other, :float}
   defp spec(_fun, field, types), do: {:other, Map.get(types, field, :float)}
 
@@ -121,6 +127,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   defp apply_function(fun, rows, field, _types) when fun in @selectors,
     do: select(fun, rows, field)
 
+  defp apply_function("percentile:" <> rest, rows, field, _types) do
+    [percent | flags] = String.split(rest, ":")
+    percentile(rows, field, percent |> Float.parse() |> elem(0), flags == ["bucket"])
+  end
+
+  defp apply_function("mode", rows, field, _types), do: mode(rows, field)
+
+  defp apply_function("integral:" <> flags, rows, field, types),
+    do: integral(rows, field, flags, types)
+
   defp apply_function("median", rows, field, _types), do: median(rows, field)
   defp apply_function("spread", rows, field, types), do: spread(rows, field, types)
   defp apply_function("stddev", rows, field, _types), do: stddev(rows, field)
@@ -129,6 +145,89 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
     case numbers(rows, field) do
       [] -> :none
       values -> {:value, InfluxQLArithmetic.fold(fun, values, Map.get(types, field)), nil}
+    end
+  end
+
+  # The value at rank `trunc(n * p / 100 + 0.5)` of the sorted points (equal
+  # values keep their time order), a selector: it returns that point. A rank
+  # below 1 has no value, nor has one of `n` and over, except in a bucket of a
+  # `GROUP BY time`, where `n` is the largest (verified).
+  @spec percentile([map()], binary(), number(), boolean()) :: result()
+  defp percentile(rows, field, percent, bucket?) do
+    points = Enum.filter(rows, &orderable?(&1[field]))
+    count = length(points)
+    rank = trunc(count * percent / 100.0 + 0.5)
+
+    cond do
+      points == [] ->
+        :none
+
+      rank >= 1 and (rank < count or (bucket? and rank == count)) ->
+        point = points |> Enum.sort_by(& &1[field]) |> Enum.at(rank - 1)
+        {:value, point[field], point}
+
+      true ->
+        :null
+    end
+  end
+
+  # The area under the points of a series by the trapezoid rule, in `unit`
+  # (verified: the time is the range's, as for any aggregate; one point has an
+  # area of zero; each pair adds a rectangle and a triangle in the unit, which
+  # is what the engine's floats come to). Over the buckets of a `GROUP BY time`
+  # the engine carries the line across the bucket edges and the gaps, which the
+  # double does not.
+  @spec integral([map()], binary(), binary(), map()) :: result()
+  defp integral(rows, field, flags, types) do
+    cond do
+      Map.get(types, field) in [:string, :boolean] ->
+        throw({:refused, "unsupported InfluxQL (integral() of a #{Map.get(types, field)} field)"})
+
+      flags |> String.split(":") |> tl() == ["bucket"] ->
+        throw({:refused, "unsupported InfluxQL (integral() in a GROUP BY time)"})
+
+      true ->
+        unit = flags |> String.split(":") |> hd() |> String.to_integer()
+
+        case for(%{^field => value, "time" => time} <- rows, is_number(value), do: {time, value}) do
+          [] -> :none
+          points -> {:value, area(points, unit), nil}
+        end
+    end
+  end
+
+  defp area([_one], _unit), do: 0.0
+
+  defp area(points, unit) do
+    points
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.reduce(0.0, fn [{t0, y0}, {t1, y1}], total ->
+      span = DateTime.diff(t1, t0, :microsecond) * 1000
+      total + (y0 * span / unit + (y1 - y0) * span / unit / 2)
+    end)
+  end
+
+  # The value that is most often there; of several the engine's choice is in an
+  # order the double does not reproduce (verified), so it refuses.
+  @spec mode([map()], binary()) :: result()
+  defp mode(rows, field) do
+    values = for %{^field => value} <- rows, orderable?(value), do: value
+
+    case values do
+      [] ->
+        :none
+
+      _values ->
+        counts = Enum.frequencies(values)
+        top = counts |> Map.values() |> Enum.max()
+
+        case for({value, ^top} <- counts, do: value) do
+          [best] ->
+            {:value, best, nil}
+
+          _tied ->
+            throw({:refused, "unsupported InfluxQL (mode() of values equally often there)"})
+        end
     end
   end
 
@@ -248,9 +347,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
       if fun in ["first", "last"],
         do: Enum.filter(rows, &Map.has_key?(&1, field)),
         else: Enum.filter(rows, &orderable?(&1[field]))
-
-    if Enum.any?(candidates, &is_boolean(&1[field])),
-      do: throw({:refused, "unsupported InfluxQL (#{fun}() of a boolean field)"})
 
     case candidates do
       [] -> :none

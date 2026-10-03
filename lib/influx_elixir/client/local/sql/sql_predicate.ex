@@ -12,6 +12,7 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
 
   alias InfluxElixir.Client.Local.{
     Format,
+    SQLCompare,
     SQLError,
     SQLExpr,
     SQLLiteral,
@@ -22,7 +23,9 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
 
   @typedoc "The comparison, set and pattern operators of a predicate."
   @type op ::
-          :eq
+          :non_boolean
+          | :truthy_expr
+          | :eq
           | :gt
           | :lt
           | :gte
@@ -79,7 +82,10 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
          :nomatch <- between_predicate(trimmed),
          :nomatch <- pattern_predicate(trimmed),
          :nomatch <- constant_predicate(trimmed),
-         :nomatch <- column_predicate(trimmed) do
+         :nomatch <- column_predicate(trimmed),
+         :nomatch <- distinct_predicate(trimmed),
+         :nomatch <- boolean_test_predicate(trimmed),
+         :nomatch <- expression_predicate(trimmed) do
       parse_binary_where_clause(trimmed)
     end
   end
@@ -190,6 +196,90 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     end
   end
 
+  @distinct_pattern ~r/^(.+?)\s+IS\s+(NOT\s+)?DISTINCT\s+FROM\s+(.+)$/isu
+  @boolean_test_pattern ~r/^(.+?)\s+IS\s+(NOT\s+)?(TRUE|FALSE)$/isu
+
+  # `a IS [NOT] DISTINCT FROM b`: equality that counts a null as a value. It
+  # is evaluated as the expression it is (see `InfluxElixir.Client.Local.SQLEval`);
+  # `time` is not read here.
+  @spec distinct_predicate(binary()) :: {:ok, clause()} | {:error, map()} | :nomatch
+  defp distinct_predicate(text) do
+    case SQLMask.run(@distinct_pattern, text) do
+      [_full, left, negated, right] ->
+        with {:ok, left} <- parse_value(String.trim(left)),
+             {:ok, right} <- parse_boolean_value(String.trim(right)) do
+          expression_clause({:is_distinct, left, right, negated != ""})
+        end
+
+      nil ->
+        :nomatch
+    end
+  end
+
+  # `a IS [NOT] TRUE` and `IS [NOT] FALSE`.
+  @spec boolean_test_predicate(binary()) :: {:ok, clause()} | {:error, map()} | :nomatch
+  defp boolean_test_predicate(text) do
+    case SQLMask.run(@boolean_test_pattern, text) do
+      [_full, operand, negated, value] ->
+        with {:ok, operand} <- parse_value(String.trim(operand)) do
+          expression_clause({:is_bool, operand, String.upcase(value) == "TRUE", negated != ""})
+        end
+
+      nil ->
+        :nomatch
+    end
+  end
+
+  # A call, a `CASE` or any other expression that is no comparison stands as a
+  # condition: it must be a boolean (`WHERE starts_with(s, 'x')`).
+  @spec expression_predicate(binary()) :: {:ok, clause()} | :nomatch
+  defp expression_predicate(text) do
+    case SQLExpr.parse_arithmetic(text) do
+      {:ok, {kind, _a} = expr} when kind == :neg ->
+        expression_clause(expr)
+
+      {:ok, {kind, _name, _args} = expr} when kind == :call ->
+        expression_clause(expr)
+
+      {:ok, {kind, _op, _left, _right} = expr} when kind == :op ->
+        expression_clause(expr)
+
+      {:ok, {kind, _operand, _whens, _otherwise} = expr} when kind == :case ->
+        expression_clause(expr)
+
+      {:ok, {kind, _left, _right} = expr} when kind == :concat ->
+        expression_clause(expr)
+
+      _other ->
+        :nomatch
+    end
+  end
+
+  # The operand text as an expression: a column, a literal or an expression.
+  @spec parse_value(binary()) :: {:ok, SQLExpr.t()} | {:error, map()}
+  defp parse_value(text) do
+    with {:ok, operand} <- parse_operand(text) do
+      case operand do
+        "time" -> unsupported_where("time in IS [NOT] DISTINCT FROM or IS [NOT] TRUE: " <> text)
+        {:expr, expr} -> {:ok, expr}
+        column -> {:ok, {:field, column}}
+      end
+    end
+  end
+
+  # The right side of `IS DISTINCT FROM` is a whole expression, with the `AND`
+  # and `OR` that follow it.
+  @spec parse_boolean_value(binary()) :: {:ok, SQLExpr.t()} | {:error, map()}
+  defp parse_boolean_value(text) do
+    case SQLExpr.parse(text) do
+      {:ok, expr} -> {:ok, expr}
+      {:error, _reason} -> unsupported_where(text)
+    end
+  end
+
+  @spec expression_clause(SQLExpr.t()) :: {:ok, clause()}
+  defp expression_clause(expr), do: {:ok, {:truthy_expr, {:expr, expr}, nil}}
+
   # `WHERE true` and `WHERE false` are conditions that hold for every row or
   # none. Any other lone literal is not a boolean, which the engine's
   # planner refuses (verified), naming the literal in its own rendering.
@@ -199,7 +289,7 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     cond do
       String.upcase(text) == "TRUE" -> {:ok, :always}
       String.upcase(text) == "FALSE" -> {:ok, :never}
-      String.upcase(text) == "NULL" -> {:ok, {:eq, "time", nil}}
+      String.upcase(text) == "NULL" -> expression_clause({:lit, nil})
       Regex.match?(~r/^-?[0-9]+$/u, text) -> non_boolean_filter("Int64(#{text})", "Int64")
       match?({_float, ""}, SQLLiteral.parse_float(text)) -> float_filter(text)
       SQLLiteral.string?(text) -> non_boolean_filter(~s|Utf8("#{SQLLiteral.body(text)}")|, "Utf8")
@@ -207,18 +297,28 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     end
   end
 
-  @spec float_filter(binary()) :: {:error, map()}
+  @spec float_filter(binary()) :: {:ok, clause()}
   defp float_filter(text) do
     {value, ""} = SQLLiteral.parse_float(text)
     non_boolean_filter("Float64(#{Format.render_decimal(value)})", "Float64")
   end
 
-  @spec non_boolean_filter(binary(), binary()) :: {:error, map()}
-  defp non_boolean_filter(expression, type) do
-    {:error,
-     SQLError.planning(
-       "Cannot create filter with non-boolean predicate '#{expression}' returning #{type}"
-     )}
+  # A literal that is no condition. Alone it is the planner's error (see
+  # `non_boolean_error/2`); beside an `AND`, an `OR` or a `NOT` it is that
+  # operator's type error, which the plan finds once the columns are typed.
+  @spec non_boolean_filter(binary(), binary()) :: {:ok, clause()}
+  defp non_boolean_filter(expression, type),
+    do: {:ok, {:non_boolean, {:expr, {:lit, nil}}, {expression, type}}}
+
+  @doc """
+  The planner's error for a `WHERE` that is one literal, or one column, that
+  is not a boolean.
+  """
+  @spec non_boolean_error(binary(), binary()) :: SQLError.t()
+  def non_boolean_error(expression, type) do
+    SQLError.planning(
+      "Cannot create filter with non-boolean predicate '#{expression}' returning #{type}"
+    )
   end
 
   # The pattern's captures, cut from the unmasked text, with the first parsed
@@ -287,24 +387,9 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   defp like_op(true), do: :not_like
   defp like_op(false), do: :like
 
-  # SQL LIKE: `%` is any run, `_` any single character (a code point:
-  # `'caf_'` matches "café", and `ILIKE 'éa'` matches "Éa", verified), `\`
-  # makes the next character literal (`'al\%%'` matches "al%pha"); everything
-  # else is literal. LIKE is case-sensitive on the engine, ILIKE is not.
   @doc "A LIKE (or, with `case_insensitive`, ILIKE) pattern as an anchored regular expression."
   @spec like_regex(binary(), boolean()) :: Regex.t()
-  def like_regex(pattern, case_insensitive) do
-    source = pattern |> String.codepoints() |> like_source([])
-
-    Regex.compile!("\\A" <> source <> "\\z", if(case_insensitive, do: "isu", else: "su"))
-  end
-
-  @spec like_source([binary()], [binary()]) :: binary()
-  defp like_source([], acc), do: acc |> Enum.reverse() |> Enum.join()
-  defp like_source(["\\", char | rest], acc), do: like_source(rest, [Regex.escape(char) | acc])
-  defp like_source(["%" | rest], acc), do: like_source(rest, [".*" | acc])
-  defp like_source(["_" | rest], acc), do: like_source(rest, ["." | acc])
-  defp like_source([char | rest], acc), do: like_source(rest, [Regex.escape(char) | acc])
+  defdelegate like_regex(pattern, case_insensitive), to: SQLCompare
 
   @comparison_operators %{
     ">=" => :gte,
@@ -551,8 +636,8 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
       SQLLiteral.identifier?(text) ->
         {:ok, SQLLiteral.identifier_name(text)}
 
-      match?({:ok, _expr}, SQLExpr.parse(text)) ->
-        {:ok, expr} = SQLExpr.parse(text)
+      match?({:ok, _expr}, SQLExpr.parse_arithmetic(text)) ->
+        {:ok, expr} = SQLExpr.parse_arithmetic(text)
         {:ok, {:expr, expr}}
 
       true ->
@@ -590,8 +675,8 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
       SQLLiteral.identifier?(text) ->
         {:ok, {:expr, {:field, SQLLiteral.identifier_name(text)}}}
 
-      match?({:ok, _expr}, SQLExpr.parse(text)) ->
-        {:ok, expr} = SQLExpr.parse(text)
+      match?({:ok, _expr}, SQLExpr.parse_arithmetic(text)) ->
+        {:ok, expr} = SQLExpr.parse_arithmetic(text)
         {:ok, {:expr, expr}}
 
       true ->

@@ -11,6 +11,8 @@ defmodule InfluxElixir.Client.Local.Store do
   # never read-modify-write a shared value and no write is lost:
   #
   #   * `{:database, name}` => `true`
+  #   * `{:retention, name}` => the database's retention in whole seconds, present only
+  #     for a database created with one (see `Retention`)
   #   * `{:bucket, name}` => `%{retention: seconds}`
   #   * `{:token, name}` => the token map, and `:token_id` => the last id given
   #     (a token is created by one insert of its full map, under a lock that
@@ -32,6 +34,8 @@ defmodule InfluxElixir.Client.Local.Store do
   # The store is policy-free: what a write may contain, which errors the
   # engine returns and how a query reads rows live in `Client.Local` and the
   # modules it delegates to.
+
+  alias InfluxElixir.Client.Local.Retention
 
   @typedoc "A stored point."
   @type point :: InfluxElixir.Client.Local.LineProtocolParser.point()
@@ -76,20 +80,40 @@ defmodule InfluxElixir.Client.Local.Store do
   called with the registered databases while no other process creates one,
   so a limit such as Core's five cannot be passed by concurrent first
   writes (each would have seen four). A database that exists is `:ok`
-  without taking the lock. `check` returns `:ok` or `{:error, reason}`.
+  without taking the lock, and keeps the retention it has: the engine's 409
+  changes nothing. `check` returns `:ok` or `{:error, reason}`. `retention`
+  is the new database's, in whole seconds, or `nil` for none.
   """
-  @spec create_database(t(), binary(), (Enumerable.t(binary()) -> :ok | {:error, term()})) ::
-          :ok | {:error, term()}
-  def create_database(table, name, check) do
+  @spec create_database(
+          t(),
+          binary(),
+          (Enumerable.t(binary()) -> :ok | {:error, term()}),
+          Retention.t()
+        ) :: :ok | {:error, term()}
+  def create_database(table, name, check, retention \\ nil) do
     if database?(table, name) do
       :ok
     else
       with_lock(table, :databases, fn ->
         with :ok <- check.(databases(table)) do
           put_database(table, name)
+          put_retention(table, name, retention)
           :ok
         end
       end)
+    end
+  end
+
+  @spec put_retention(t(), binary(), Retention.t()) :: true
+  defp put_retention(_table, _name, nil), do: true
+  defp put_retention(table, name, seconds), do: :ets.insert(table, {{:retention, name}, seconds})
+
+  @doc "A database's retention in whole seconds, or `nil` when it has none."
+  @spec retention(t(), binary()) :: Retention.t()
+  def retention(table, name) do
+    case :ets.lookup(table, {:retention, name}) do
+      [{_key, seconds}] -> seconds
+      [] -> nil
     end
   end
 
@@ -162,6 +186,7 @@ defmodule InfluxElixir.Client.Local.Store do
   def drop_database(table, name) do
     if database?(table, name) do
       delete_data(table, name)
+      :ets.delete(table, {:retention, name})
       :ets.delete(table, {:database, name})
       :ok
     else
@@ -321,6 +346,10 @@ defmodule InfluxElixir.Client.Local.Store do
     )
   end
 
+  @spec unexpired([point()], t(), binary()) :: [point()]
+  defp unexpired(points, table, database),
+    do: Retention.visible(points, retention(table, database), now_ns())
+
   # The measurements of the series keys that occur more than once.
   @spec repeated_measurements([tuple()]) :: [binary()]
   defp repeated_measurements(keys) do
@@ -367,11 +396,16 @@ defmodule InfluxElixir.Client.Local.Store do
   @doc """
   A measurement's points in insertion order, duplicates merged. InfluxDB —
   both versions, verified — treats points with the same tags and time as
-  one point whose fields merge, the later write winning per field.
+  one point whose fields merge, the later write winning per field. The
+  points of a database with a retention are the ones `Retention.visible/3`
+  leaves.
   """
   @spec points(t(), binary(), binary()) :: [point()]
   def points(table, database, measurement) do
-    points = :ets.select(table, [{{{:point, database, measurement, :_}, :"$1"}, [], [:"$1"]}])
+    points =
+      table
+      |> :ets.select([{{{:point, database, measurement, :_}, :"$1"}, [], [:"$1"]}])
+      |> unexpired(table, database)
 
     if :ets.member(table, {:duplicates, database, measurement}),
       do: merge_duplicates(points),
@@ -387,7 +421,10 @@ defmodule InfluxElixir.Client.Local.Store do
   def points_in_db(table, database, only \\ :all)
 
   def points_in_db(table, database, :all) do
-    points = :ets.select(table, [{{{:point, database, :_, :_}, :"$1"}, [], [:"$1"]}])
+    points =
+      table
+      |> :ets.select([{{{:point, database, :_, :_}, :"$1"}, [], [:"$1"]}])
+      |> unexpired(table, database)
 
     if :ets.match(table, {{:duplicates, database, :_}}, 1) == :"$end_of_table",
       do: points,

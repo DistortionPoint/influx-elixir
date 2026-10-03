@@ -64,14 +64,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
   @spec name(item()) :: binary() | nil
   defp name({:column, _column, name}), do: name
   defp name({:aggregate, _fun, :star, _alias}), do: nil
-  defp name({:aggregate, fun, _arg, alias}), do: alias || fun
+  defp name({:aggregate, fun, _arg, alias}), do: alias || InfluxQLExpr.function_name(fun)
   defp name({:expr, ast, alias}), do: alias || InfluxQLExpr.name(ast)
+  defp name({:multi, kind, _field, _tags, _limit, alias}), do: alias || kind
   defp name(_item), do: nil
 
   @spec rename(item(), binary()) :: item()
   defp rename({:column, column, _name}, name), do: {:column, column, name}
   defp rename({:aggregate, fun, arg, _alias}, name), do: {:aggregate, fun, arg, name}
   defp rename({:expr, ast, _alias}, name), do: {:expr, ast, name}
+
+  defp rename({:multi, kind, field, tags, limit, _alias}, name),
+    do: {:multi, kind, field, tags, limit, name}
 
   @spec take(binary(), MapSet.t(binary())) :: {binary(), MapSet.t(binary())}
   defp take(name, taken), do: take(name, name, 0, taken)
@@ -91,6 +95,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
     do: {:aggregate, fun, arg, "time_1"}
 
   defp lead_time({:expr, ast, "time"}), do: {:expr, ast, "time_1"}
+
+  defp lead_time({:multi, kind, field, tags, limit, "time"}),
+    do: {:multi, kind, field, tags, limit, "time_1"}
+
   defp lead_time(item), do: item
 
   @spec check([item()], boolean()) :: {:ok, [item()]} | {:error, binary()}

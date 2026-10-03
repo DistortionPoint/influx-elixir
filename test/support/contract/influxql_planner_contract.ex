@@ -19,6 +19,8 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
     InfluxQLAggregateCases,
     InfluxQLArithmeticCases,
     InfluxQLBucketCases,
+    InfluxQLCallCases,
+    InfluxQLShowCases,
     InfluxQLWhereCases
   }
 
@@ -27,10 +29,13 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
     client = Keyword.fetch!(opts, :client)
 
     quote location: :keep do
-      import InfluxElixir.Contract.InfluxQLPlanner, only: [fixture: 2, run: 3, outcome: 3]
+      import InfluxElixir.Contract.InfluxQLPlanner, only: [fixture: 2, raw: 3, outcome: 3]
 
       unquote(conditions(client))
       unquote(buckets(client))
+      unquote(calls(client))
+      unquote(shows(client))
+      unquote(show_helpers(client))
       unquote(helpers(client))
     end
   end
@@ -178,6 +183,144 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
     end
   end
 
+  defp calls(client) do
+    quote location: :keep do
+      describe "InfluxQL dimensions, transforms, selectors and wildcards — contract" do
+        setup ctx do
+          names = InfluxQLCallCases.names(InfluxElixir.IntegrationHelper.unique_name("ipc"))
+          write(ctx, unquote(client), InfluxQLCallCases.fixture(names))
+          {:ok, names: names}
+        end
+
+        test "GROUP BY dimensions, fill options, comments, SLIMIT and regular expressions", ctx do
+          check_rows(ctx, InfluxQLCallCases.dimensions())
+        end
+
+        test "fill() over empty buckets and ranges of millions of buckets", ctx do
+          check_rows(ctx, InfluxQLCallCases.fills())
+        end
+
+        test "derivative, difference, cumulative_sum, moving_average, elapsed and integral",
+             ctx do
+          check_rows(ctx, InfluxQLCallCases.transforms())
+        end
+
+        test "percentile, mode, top, bottom and the selectors of booleans", ctx do
+          check_rows(ctx, InfluxQLCallCases.calls())
+        end
+
+        test "math functions of fields and aggregates", ctx do
+          check_rows(ctx, InfluxQLCallCases.math())
+        end
+
+        test "a column the measurement lacks is null in a comparison, and false", ctx do
+          check_rows(ctx, InfluxQLCallCases.where())
+        end
+
+        test "wildcards in the select list and measurements in FROM", ctx do
+          check_rows(ctx, InfluxQLCallCases.wildcards())
+        end
+
+        test "a GROUP BY the parser cannot read is its error at its position", ctx do
+          for {clause, error} <- InfluxQLCallCases.parse_errors() do
+            prefix =
+              "SELECT count(v) FROM #{ctx.names["k1"]} WHERE time >= '2024-01-01T00:00:00Z' "
+
+            assert outcome(unquote(client), ctx, prefix <> clause) ===
+                     {:error, 400,
+                      InfluxQLCallCases.parse_error_body(byte_size(prefix), clause, error)},
+                   clause
+          end
+        end
+
+        @tag engine_bug: "closed connection"
+        @tag local_divergence:
+               "the engine breaks the connection of a fill that has no value to carry; Local refuses by name"
+        test "what the engine answers by closing the connection", ctx do
+          for template <- InfluxQLCallCases.closed() do
+            statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
+            result = InfluxElixir.Contract.InfluxQLPlanner.raw(unquote(client), ctx, statement)
+
+            if unquote(client) === InfluxElixir.Client.Local,
+              do:
+                assert(
+                  match?(
+                    {:error, %{status: 400, body: "Client.Local: unsupported InfluxQL (" <> _}},
+                    result
+                  ),
+                  statement
+                ),
+              else:
+                assert(
+                  result === {:error, {:connection_error, %Mint.TransportError{reason: :closed}}},
+                  statement
+                )
+          end
+        end
+      end
+    end
+  end
+
+  defp shows(client) do
+    quote location: :keep do
+      describe "InfluxQL SHOW statements — contract" do
+        setup ctx do
+          names =
+            "ips"
+            |> InfluxElixir.IntegrationHelper.unique_name()
+            |> InfluxQLShowCases.names()
+            |> Map.put("db", ctx.database)
+
+          write(ctx, unquote(client), InfluxQLShowCases.fixture(names))
+          {:ok, names: names}
+        end
+
+        test "SHOW MEASUREMENTS with WITH MEASUREMENT, WHERE, LIMIT, OFFSET and ON", ctx do
+          check_show(ctx, InfluxQLShowCases.measurements())
+        end
+
+        test "SHOW TAG KEYS with FROM, WHERE, LIMIT, OFFSET and ON", ctx do
+          check_show(ctx, InfluxQLShowCases.tag_keys())
+        end
+
+        test "SHOW FIELD KEYS with FROM, LIMIT, OFFSET and ON", ctx do
+          check_show(ctx, InfluxQLShowCases.field_keys())
+        end
+
+        test "SHOW TAG VALUES with WITH KEY, WHERE, LIMIT, OFFSET and ON", ctx do
+          check_show(ctx, InfluxQLShowCases.tag_values())
+        end
+
+        test "SHOW RETENTION POLICIES", ctx do
+          check_show(ctx, InfluxQLShowCases.retention())
+        end
+
+        test "a SHOW statement the parser cannot read is its error at its position", ctx do
+          check_show(ctx, InfluxQLShowCases.errors())
+        end
+      end
+    end
+  end
+
+  defp show_helpers(client) do
+    quote location: :keep do
+      defp check_show(ctx, cases) do
+        for {template, expected} <- cases do
+          statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
+
+          actual =
+            case InfluxElixir.Contract.InfluxQLPlanner.raw(unquote(client), ctx, statement) do
+              {:ok, rows} -> rows
+              {:error, %{status: status, body: body}} -> {:error, status, body}
+            end
+
+          assert actual === InfluxElixir.Contract.InfluxQLPlanner.fill_names(expected, ctx.names),
+                 statement
+        end
+      end
+    end
+  end
+
   defp helpers(client) do
     quote location: :keep do
       defp write(ctx, client, lines) do
@@ -188,29 +331,30 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
       end
 
       defp check_ids(ctx, key, field, cases) do
-        for {statement, expected} <- cases do
-          template =
-            "SELECT #{field} FROM ~m WHERE " <>
-              String.replace(statement, ~r/^SELECT \w+ FROM ~m WHERE /, "")
-
-          real = String.replace(template, "~m", ctx.names[key])
-          result = run(unquote(client), ctx, real)
+        InfluxElixir.TestSupport.Check.check_cases(cases, fn {condition, expected} ->
+          statement = "SELECT #{field} FROM #{ctx.names[key]} WHERE " <> condition
 
           actual =
-            case result do
+            case raw(unquote(client), ctx, statement) do
               {:ok, rows} -> Enum.map(rows, & &1[field])
               {:error, %{status: status, body: body}} -> {:error, status, body}
             end
 
-          assert actual === expected, statement
-        end
+          if actual === expected,
+            do: :ok,
+            else: {:mismatch, %{expected: expected, actual: actual}}
+        end)
       end
 
       defp check_rows(ctx, cases) do
-        for {template, expected} <- cases do
+        InfluxElixir.TestSupport.Check.check_cases(cases, fn {template, expected} ->
           statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
-          assert outcome(unquote(client), ctx, statement) === expected, template
-        end
+          actual = outcome(unquote(client), ctx, statement)
+
+          if actual === expected,
+            do: :ok,
+            else: {:mismatch, %{expected: expected, actual: actual}}
+        end)
       end
 
       defp bucket_statement(ctx, clause) do
@@ -233,13 +377,20 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
   end
 
   @doc false
+  @spec fill_names(term(), %{binary() => binary()}) :: term()
+  def fill_names(text, names) when is_binary(text), do: statement(text, names)
+  def fill_names(list, names) when is_list(list), do: Enum.map(list, &fill_names(&1, names))
+  def fill_names(%{} = map, names), do: Map.new(map, fn {k, v} -> {k, fill_names(v, names)} end)
+
+  def fill_names(tuple, names) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> Enum.map(&fill_names(&1, names)) |> List.to_tuple()
+
+  def fill_names(other, _names), do: other
+
+  @doc false
   @spec raw(module(), map(), binary()) :: InfluxElixir.Client.query_result()
   def raw(client, ctx, statement),
     do: client.query_influxql(ctx.conn, statement, database: ctx.database)
-
-  @doc false
-  @spec run(module(), map(), binary()) :: InfluxElixir.Client.query_result()
-  def run(client, ctx, statement), do: raw(client, ctx, statement)
 
   @doc """
   The answer of a statement as the cases write it: the rows as `{time,

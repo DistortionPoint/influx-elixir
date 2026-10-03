@@ -12,9 +12,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   #     `AND` or `OR` a 500 "invalid expr stack", and in parentheses a plain
   #     type error (`check_bare/1`)
 
-  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLTokens}
+  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLTokens, SQLLimits}
 
-  @two63 9_223_372_036_854_775_808
+  require SQLLimits
+
   @day_seconds 86_400
 
   @date ~r/^(\d{4})-(\d{2})-(\d{2})$/
@@ -118,7 +119,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
     ns = seconds * 1_000_000_000 + fraction_ns(fraction)
 
     cond do
-      ns >= -@two63 and ns < @two63 -> {:ok, ns}
+      SQLLimits.is_int64(ns) -> {:ok, ns}
       zone not in ["Z", "z"] or byte_size(fraction) not in [0, 3, 6, 9] -> :unknown
       true -> {:out_of_range, shown(year, month, day, {hour, minute, second}, fraction)}
     end

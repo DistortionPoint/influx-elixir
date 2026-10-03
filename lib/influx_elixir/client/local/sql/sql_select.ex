@@ -95,13 +95,61 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   def aggregate_query?(sql) do
     masked = SQLMask.mask(sql)
 
-    Regex.match?(~r/(?i)DATE_BIN|\bGROUP\s+BY\b/u, masked) or
+    Regex.match?(~r/(?i)DATE_BIN|\bGROUP\s+BY\b|\bHAVING\b/u, masked) or
       Regex.match?(@aggregate_call, masked) or Regex.match?(@influxql_call, masked)
   end
 
   @doc "Whether a text calls an aggregate function."
   @spec aggregate_call?(binary()) :: boolean()
   def aggregate_call?(text), do: Regex.match?(@aggregate_call, text)
+
+  @doc "Whether a text calls an InfluxQL-only function (`FIRST`, `LAST`), which SQL does not have."
+  @spec influxql_call?(binary()) :: boolean()
+  def influxql_call?(text), do: Regex.match?(@influxql_call, SQLMask.mask(text))
+
+  @call_start ~r/(?i)(?<![\w."])(?:#{@aggregate_alternation})\s*\(/u
+
+  @doc """
+  The calls of aggregate functions in a text, outermost only, as
+  `{start, length}` byte spans: the name, the parenthesised arguments and, for
+  a selector, its `['value']` or `['time']` subscript.
+  """
+  @spec aggregate_spans(binary()) :: [{non_neg_integer(), pos_integer()}]
+  def aggregate_spans(text) do
+    @call_start
+    |> Regex.scan(SQLMask.mask(text), return: :index)
+    |> Enum.map(fn [{start, length}] -> {start, length} end)
+    |> Enum.reduce({[], 0}, fn {start, length}, {spans, covered} ->
+      if start < covered, do: {spans, covered}, else: take_span(text, start, length, spans)
+    end)
+    |> elem(0)
+    |> Enum.reverse()
+  end
+
+  @typep span :: {non_neg_integer(), pos_integer()}
+
+  @spec take_span(binary(), non_neg_integer(), pos_integer(), [span()]) ::
+          {[span()], non_neg_integer()}
+  defp take_span(text, start, length, spans) do
+    after_open = binary_part(text, start + length, byte_size(text) - start - length)
+
+    case SQLMask.balanced(after_open) do
+      {:ok, _inside, tail} ->
+        tail = Regex.replace(~r/\A\s*\[\s*'(?:value|time)'\s*\]/u, tail, "")
+        stop = byte_size(text) - byte_size(tail)
+        {[{start, stop - start} | spans], stop}
+
+      :error ->
+        {spans, byte_size(text)}
+    end
+  end
+
+  @doc """
+  One select item parsed as an aggregate item (see `parse_list/2`): the column,
+  or the error.
+  """
+  @spec parse_item(binary(), binary() | nil) :: {:ok, column()} | {:error, term()}
+  def parse_item(item, qualifier), do: parse_single_column(item, qualifier)
 
   @doc """
   The aggregate SELECT list as columns, or the first column's error.
@@ -131,8 +179,41 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   def split_alias(item) do
     case SQLMask.run(~r/^(.+?)\s+AS\s+(\w+|"(?:[^"]|"")*")\s*$/isu, item) do
       [_full, body, alias_text] -> {String.trim(body), name(alias_text)}
-      nil -> {String.trim(item), nil}
+      nil -> implicit_alias(item)
     end
+  end
+
+  # Words that go on an expression or end one: the last word of a text is an
+  # alias only when it is none of them and the text before it is a whole
+  # expression (`n a`, `count(*) c`, `CASE ... END k`; not `n + a`, `n IS NULL`).
+  @continuations ~w(AND OR NOT IS IN LIKE ILIKE BETWEEN WHEN THEN ELSE CASE DISTINCT FROM ON BY
+    ESCAPE ASC DESC NULLS FIRST LAST INTERVAL OVER FILTER WITHIN GROUP)
+  @alias_stops ~w(END NULL TRUE FALSE)
+
+  @spec implicit_alias(binary()) :: {binary(), binary() | nil}
+  defp implicit_alias(item) do
+    case SQLMask.run(~r/^(.*?[\w)"'\]])\s+([\p{L}_]\w*|"(?:[^"]|"")*")\s*$/su, item) do
+      [_full, body, word] ->
+        if alias_word?(word) and expression_end?(body),
+          do: {String.trim(body), name(word)},
+          else: {String.trim(item), nil}
+
+      nil ->
+        {String.trim(item), nil}
+    end
+  end
+
+  @spec alias_word?(binary()) :: boolean()
+  defp alias_word?(word), do: String.upcase(word) not in (@continuations ++ @alias_stops)
+
+  # Whether the text ends an expression: its last word is not one that goes
+  # on, and it does not end with an operator.
+  @spec expression_end?(binary()) :: boolean()
+  defp expression_end?(body) do
+    last = body |> String.split(~r/[^\w"]+/u, trim: true) |> List.last()
+
+    not (is_nil(last) or
+           (Regex.match?(~r/\A\w+\z/u, last) and String.upcase(last) in @continuations))
   end
 
   @doc "A column name as written (a word, or a quoted identifier) as the name it holds."

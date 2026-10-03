@@ -134,28 +134,31 @@ defmodule InfluxElixir.Contract.WriteRules do
             unquote(client).write(ctx.conn, "c v=1i 1700000000000000000", database: ctx.database)
 
           # tag then field, field then tag, string then float, boolean then integer
-          for {first, second, column, expected, got, rendered} <- [
-                {"t,host=a v=1i", ~s|t host="b",v=2i|, "host", "tag", "field::string",
-                 "t host=b,v=2i"},
-                {~s|f host="a",v=1i|, "f,host=b v=2i", "host", "field::string", "tag",
-                 "f,host=b v=2i"},
-                {~s|s s="x"|, "s s=1.0", "s", "field::string", "field::float", "s s=1"},
-                {"b b=true", "b b=1i", "b", "field::boolean", "field::integer", "b b=1i"}
-              ] do
-            {:ok, :written} = unquote(client).write(ctx.conn, first, database: ctx.database)
+          InfluxElixir.TestSupport.Check.each_case(
+            [
+              {"t,host=a v=1i", ~s|t host="b",v=2i|, "host", "tag", "field::string",
+               "t host=b,v=2i"},
+              {~s|f host="a",v=1i|, "f,host=b v=2i", "host", "field::string", "tag",
+               "f,host=b v=2i"},
+              {~s|s s="x"|, "s s=1.0", "s", "field::string", "field::float", "s s=1"},
+              {"b b=true", "b b=1i", "b", "field::boolean", "field::integer", "b b=1i"}
+            ],
+            fn {first, second, column, expected, got, rendered} ->
+              {:ok, :written} = unquote(client).write(ctx.conn, first, database: ctx.database)
 
-            assert {:error, %{status: 400, body: body}} =
-                     unquote(client).write(ctx.conn, second, database: ctx.database),
-                   second
+              assert {:error, %{status: 400, body: body}} =
+                       unquote(client).write(ctx.conn, second, database: ctx.database),
+                     second
 
-            assert Jason.decode!(body) ===
-                     InfluxElixir.Contract.WriteRules.partial(
-                       1,
-                       InfluxElixir.Contract.WriteRules.conflict(column, expected, got),
-                       rendered
-                     ),
-                   second
-          end
+              assert Jason.decode!(body) ===
+                       InfluxElixir.Contract.WriteRules.partial(
+                         1,
+                         InfluxElixir.Contract.WriteRules.conflict(column, expected, got),
+                         rendered
+                       ),
+                     second
+            end
+          )
 
           assert {:ok, :written} =
                    unquote(client).write(ctx.conn, "c w=1.0 1700000000000000002",
@@ -176,8 +179,7 @@ defmodule InfluxElixir.Contract.WriteRules do
           )
         end
 
-        # The single conflicting line is pinned by the shared contract; this is
-        # a syntax error and a conflict together, with every bad line listed.
+        # A syntax error and a conflict together, with every bad line listed.
         test "every bad line is reported; the other lines are stored", ctx do
           conflict =
             InfluxElixir.Contract.WriteRules.conflict(
@@ -209,22 +211,48 @@ defmodule InfluxElixir.Contract.WriteRules do
   defp parse_error_tests(client) do
     quote location: :keep do
       describe "write/3 — lines the engine cannot parse" do
-        test "no field, an empty tag value, an empty tag key and trailing content", ctx do
-          for {lp, message} <- [
-                {"cpu value=notanumber", "No fields were provided"},
-                {"cpu value=abci", "No fields were provided"},
-                {"m =1i", "No fields were provided"},
-                {"m,host= v=1i", "Expected tag value, got ` v=1i`"},
-                {"m,=a v=1i", "Expected tag key, got `=a v=1i`"},
-                {"cpu value=1i badtimestamp",
-                 "Could not parse entire line. Found trailing content: ` badtimest...`"}
-              ] do
-            assert {:error, %{status: 400, body: body}} =
-                     unquote(client).write(ctx.conn, lp, database: ctx.database),
-                   lp
+        # The grammar errors (empty tag key or value, trailing content) are
+        # pinned for every shape in InfluxElixir.Contract.InfluxQLFluxLP.
+        test "text where a value should be leaves the line with no field", ctx do
+          InfluxElixir.TestSupport.Check.each_case(
+            ["cpu value=notanumber", "cpu value=abci", "m =1i"],
+            fn lp ->
+              assert {:error, %{status: 400, body: body}} =
+                       unquote(client).write(ctx.conn, lp, database: ctx.database),
+                     lp
 
-            assert InfluxElixir.Contract.WriteRules.partial_errors(body) === [{1, message}], lp
-          end
+              assert InfluxElixir.Contract.WriteRules.partial_errors(body) ===
+                       [{1, "No fields were provided"}],
+                     lp
+            end
+          )
+        end
+
+        test "a key that is both a tag and a field of one line is a type conflict", ctx do
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).write(ctx.conn, "w,host=a host=1i", database: ctx.database)
+
+          assert Jason.decode!(body) ===
+                   InfluxElixir.Contract.WriteRules.partial(
+                     1,
+                     InfluxElixir.Contract.WriteRules.conflict("host", "tag", "field::integer"),
+                     "w,host=a host=1i"
+                   )
+        end
+
+        test "an integer beyond int64 is refused where it is parsed", ctx do
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).write(ctx.conn, "w v=9223372036854775808i",
+                     database: ctx.database
+                   )
+
+          assert Jason.decode!(body) ===
+                   InfluxElixir.Contract.WriteRules.partial(
+                     1,
+                     "Unable to parse integer value `9223372036854775808`",
+                     # the engine cuts original_line to 20 bytes
+                     "w v=9223372036854775"
+                   )
         end
       end
     end
@@ -233,6 +261,22 @@ defmodule InfluxElixir.Contract.WriteRules do
   defp time_column_tests(client) do
     quote location: :keep do
       describe "write/3 — the time column and rejected lines" do
+        test "on a new table, time as a tag or a field is the reserved-column error", ctx do
+          InfluxElixir.TestSupport.Check.each_case(["t,time=x v=1i", "t time=5i,v=1i"], fn lp ->
+            assert {:error, %{status: 400, body: body}} =
+                     unquote(client).write(ctx.conn, lp, database: ctx.database),
+                   lp
+
+            assert Jason.decode!(body) ===
+                     InfluxElixir.Contract.WriteRules.partial(
+                       1,
+                       "'time' is a reserved column",
+                       lp
+                     ),
+                   lp
+          end)
+        end
+
         test "on an existing table, time as a tag or field conflicts with the timestamp",
              ctx do
           {:ok, :written} =
@@ -240,20 +284,23 @@ defmodule InfluxElixir.Contract.WriteRules do
               database: ctx.database
             )
 
-          for {lp, got} <- [
-                {"e,time=x v=1i", "tag"},
-                {"e time=5i,v=1i", "field::integer"}
-              ] do
-            assert {:error, %{status: 400, body: body}} =
-                     unquote(client).write(ctx.conn, lp, database: ctx.database),
-                   lp
+          InfluxElixir.TestSupport.Check.each_case(
+            [
+              {"e,time=x v=1i", "tag"},
+              {"e time=5i,v=1i", "field::integer"}
+            ],
+            fn {lp, got} ->
+              assert {:error, %{status: 400, body: body}} =
+                       unquote(client).write(ctx.conn, lp, database: ctx.database),
+                     lp
 
-            assert InfluxElixir.Contract.WriteRules.partial_errors(body) ===
-                     [
-                       {1, InfluxElixir.Contract.WriteRules.conflict("time", "timestamp", got)}
-                     ],
-                   lp
-          end
+              assert InfluxElixir.Contract.WriteRules.partial_errors(body) ===
+                       [
+                         {1, InfluxElixir.Contract.WriteRules.conflict("time", "timestamp", got)}
+                       ],
+                     lp
+            end
+          )
         end
 
         # A line that is rejected still registers the new columns it names: `n`
@@ -411,7 +458,7 @@ defmodule InfluxElixir.Contract.WriteRules do
         end
 
         test "a flag that is not a boolean is the engine's 400", ctx do
-          for key <- [:accept_partial, :no_sync] do
+          InfluxElixir.TestSupport.Check.each_case([:accept_partial, :no_sync], fn key ->
             assert {:error,
                     %{status: 400, body: "serde error: provided string was not `true` or `false`"}} =
                      unquote(client).write(ctx.conn, "m5 v=1i 1", [
@@ -419,7 +466,7 @@ defmodule InfluxElixir.Contract.WriteRules do
                        {key, "yes"}
                      ]),
                    inspect(key)
-          end
+          end)
         end
       end
     end
@@ -432,19 +479,22 @@ defmodule InfluxElixir.Contract.WriteRules do
           {:ok, :written} =
             unquote(client).write(ctx.conn, "r v=1i,a=1i 1", database: ctx.database)
 
-          for {lp, rendered} <- [
-                {"r    v=2.50,a=3i   2", "r v=2.5,a=3i 2"},
-                {"r,t=x v=1e3 4", "r,t=x v=1000 4"},
-                {~s(r v="s" 6), "r v=s 6"},
-                {"r v=1.5e-7 8", "r v=0.00000015 8"}
-              ] do
-            assert {:error, %{status: 400, body: body}} =
-                     unquote(client).write(ctx.conn, lp, database: ctx.database),
-                   lp
+          InfluxElixir.TestSupport.Check.each_case(
+            [
+              {"r    v=2.50,a=3i   2", "r v=2.5,a=3i 2"},
+              {"r,t=x v=1e3 4", "r,t=x v=1000 4"},
+              {~s(r v="s" 6), "r v=s 6"},
+              {"r v=1.5e-7 8", "r v=0.00000015 8"}
+            ],
+            fn {lp, rendered} ->
+              assert {:error, %{status: 400, body: body}} =
+                       unquote(client).write(ctx.conn, lp, database: ctx.database),
+                     lp
 
-            assert [%{"original_line" => ^rendered} = entry] = Jason.decode!(body)["data"], lp
-            assert Map.keys(entry) === ["error_message", "line_number", "original_line"], lp
-          end
+              assert [%{"original_line" => ^rendered} = entry] = Jason.decode!(body)["data"], lp
+              assert Map.keys(entry) === ["error_message", "line_number", "original_line"], lp
+            end
+          )
         end
       end
     end
@@ -462,17 +512,23 @@ defmodule InfluxElixir.Contract.WriteRules do
           db = InfluxElixir.IntegrationHelper.unique_name("contract_nodb")
           body = ~s({"error":"query error: database not found: #{db}"})
 
-          for sql <- ["SELECT * FROM m", "SELECT 1", "DELETE FROM m", "SELEC 1"] do
-            assert {:error, %{status: 404, body: ^body}} =
-                     unquote(client).query_sql(ctx.conn, sql, database: db),
-                   sql
-          end
+          InfluxElixir.TestSupport.Check.each_case(
+            ["SELECT * FROM m", "SELECT 1", "DELETE FROM m", "SELEC 1"],
+            fn sql ->
+              assert {:error, %{status: 404, body: ^body}} =
+                       unquote(client).query_sql(ctx.conn, sql, database: db),
+                     sql
+            end
+          )
 
-          for influxql <- ["SELECT value FROM m", "SHOW MEASUREMENTS"] do
-            assert {:error, %{status: 404, body: ^body}} =
-                     unquote(client).query_influxql(ctx.conn, influxql, database: db),
-                   influxql
-          end
+          InfluxElixir.TestSupport.Check.each_case(
+            ["SELECT value FROM m", "SHOW MEASUREMENTS"],
+            fn influxql ->
+              assert {:error, %{status: 404, body: ^body}} =
+                       unquote(client).query_influxql(ctx.conn, influxql, database: db),
+                     influxql
+            end
+          )
         end
 
         test "InfluxQL with no database anywhere is the engine's 400", ctx do
@@ -493,7 +549,8 @@ defmodule InfluxElixir.Contract.WriteRules do
   defp name_tests(client) do
     quote location: :keep do
       describe "database names" do
-        test "more names the engine refuses, with the first rule each breaks", ctx do
+        test "a refused name is a 400 naming the first rule it breaks, on create and write",
+             ctx do
           invalid =
             "invalid character in database or rp name: must be ASCII, containing only " <>
               "letters, numbers, underscores, or hyphens"
@@ -504,41 +561,55 @@ defmodule InfluxElixir.Contract.WriteRules do
 
           start = "db name did not start with a number or letter"
 
-          for {name, message} <- [
-                {"-", start},
-                {"_a/b/c", start},
-                {"a.b", invalid},
-                {"héllo", invalid},
-                {"a b", invalid},
-                {"a.b/", invalid},
-                {"x/", retention},
-                {"a//b", retention},
-                {"a/b/c", retention}
-              ] do
-            assert {:error, %{status: 400, body: body}} =
-                     unquote(client).create_database(ctx.conn, name, []),
-                   inspect(name)
+          InfluxElixir.TestSupport.Check.each_case(
+            [
+              {"", "db name cannot be empty"},
+              {"_x", start},
+              {"-", start},
+              {"_a/b/c", start},
+              {"a.b", invalid},
+              {"héllo", invalid},
+              {"a b", invalid},
+              {"a.b/", invalid},
+              {"a.b/c/d", invalid},
+              {"a/", retention},
+              {"x/", retention},
+              {"a//b", retention},
+              {"a/b/c", retention}
+            ],
+            fn {name, message} ->
+              assert {:error, %{status: 400, body: body}} =
+                       unquote(client).create_database(ctx.conn, name, []),
+                     inspect(name)
 
-            assert Jason.decode!(body) === %{"error" => message}, inspect(name)
-          end
+              assert Jason.decode!(body) === %{"error" => message}, inspect(name)
+
+              assert {:error, %{status: 400, body: ^body}} =
+                       unquote(client).write(ctx.conn, "m v=1i", database: name),
+                     inspect(name)
+            end
+          )
         end
 
         test "names the engine accepts, a retention policy and 200 characters included",
              ctx do
           base = InfluxElixir.IntegrationHelper.unique_name("contract_nm")
 
-          for name <- [
-                base,
-                "1" <> base,
-                String.upcase(base) <> "-b",
-                base <> "_b",
-                base <> "/_b",
-                base <> "/B",
-                "c" <> String.duplicate("c", 199)
-              ] do
-            assert :ok = unquote(client).create_database(ctx.conn, name, []), inspect(name)
-            assert :ok = unquote(client).delete_database(ctx.conn, name), inspect(name)
-          end
+          InfluxElixir.TestSupport.Check.each_case(
+            [
+              base,
+              "1" <> base,
+              String.upcase(base) <> "-b",
+              base <> "_b",
+              base <> "/_b",
+              base <> "/B",
+              "c" <> String.duplicate("c", 199)
+            ],
+            fn name ->
+              assert :ok = unquote(client).create_database(ctx.conn, name, []), inspect(name)
+              assert :ok = unquote(client).delete_database(ctx.conn, name), inspect(name)
+            end
+          )
         end
       end
     end

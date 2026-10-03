@@ -63,12 +63,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlannerTest do
                  "(a renamed time column beside an aggregate): #{statement}"
     end
 
-    test "a tag called time in GROUP BY", %{conn: conn} do
+    test "a tag called time in GROUP BY, once there are points to group", %{conn: conn} do
       for group <- ["\"time\"", "time::tag", "k, \"time\""] do
         statement = "SELECT i FROM m GROUP BY #{group}"
 
         assert refused(conn, statement) ===
-                 "Client.Local: unsupported InfluxQL (GROUP BY a tag named time): #{statement}"
+                 "Client.Local: unsupported InfluxQL (GROUP BY a tag named time)"
       end
     end
 

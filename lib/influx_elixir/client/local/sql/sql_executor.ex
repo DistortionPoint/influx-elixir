@@ -34,7 +34,9 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   alias InfluxElixir.Client.Local.{
     LineProtocolParser,
     SQLAggregate,
+    SQLBatch,
     SQLClauses,
+    SQLCoerce,
     SQLCondition,
     SQLError,
     SQLEval,
@@ -57,8 +59,12 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @typedoc "A stored point, as `InfluxElixir.Client.Local` keeps it."
   @type point :: LineProtocolParser.point()
 
-  @typedoc "Fetches a measurement's points, or `:error` when there is no such measurement."
-  @type fetch :: (binary() -> {:ok, [point()]} | :error)
+  @typedoc """
+  Fetches a measurement's points, or `:error` when there is no such measurement.
+  A relation with a declared schema (an `information_schema` view) also gives
+  its columns, which it has whether or not it has a row.
+  """
+  @type fetch :: (binary() -> {:ok, [point()]} | {:ok, [point()], [binary()]} | :error)
 
   @typedoc """
   Looks up a stored column's kind from its measurement and name: the
@@ -191,7 +197,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     unsigned? = unsigned_columns(query, sources, kinds)
     fetch_source = &fetch_source(fetch, &1, sources)
 
-    with {:ok, source} <- source(fetch, m, sources),
+    with :ok <- table_error(query),
+         {:ok, source} <- source(fetch, m, sources),
          {:ok, joined, relations} <- SQLJoin.cross_join(source, query, fetch_source),
          :ok <- SQLClauses.unreadable_order(query.order_by),
          :ok <- SQLSchema.check(relations, query),
@@ -200,6 +207,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
          {:ok, bound} <- SQLParser.bind(query, params),
          typed = SQLTyping.retype(bound, unsigned?),
          :ok <- SQLPlan.check(joined, typed, unsigned?),
+         typed = SQLCoerce.apply(typed, joined, unsigned?),
          :ok <- SQLGrouping.check(typed),
          :ok <- SQLTime.first_invalid(typed.where),
          :ok <- limit_error(typed),
@@ -226,6 +234,10 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   defp rows(joined, query, final?),
     do: query_rows(filter(joined, query.where), ordered(query), final?)
+
+  @spec table_error(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
+  defp table_error(%{table_error: nil}), do: :ok
+  defp table_error(%{table_error: error}), do: {:error, error}
 
   @spec plan_error(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
   defp plan_error(%{plan_error: nil}), do: :ok
@@ -322,7 +334,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp output_items(expr, query), do: SQLExpr.map_children(expr, &output_items(&1, query))
 
   @spec filter([point()], [SQLParser.where_node()]) :: [point()]
-  defp filter(points, conjunction), do: SQLCondition.filter(points, conjunction)
+  defp filter(points, conjunction), do: SQLBatch.filter(points, conjunction)
 
   @spec query_rows([point()], SQLParser.parsed_query(), boolean()) :: [map()]
   defp query_rows(points, query, final?) do
@@ -352,8 +364,11 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
         {:ok, cte}
 
       :error ->
-        with {:ok, points} <- fetch.(measurement),
-             do: {:ok, %{points: points, columns: nil, pushdown: true}}
+        case fetch.(measurement) do
+          {:ok, points} -> {:ok, %{points: points, columns: nil, pushdown: true}}
+          {:ok, points, columns} -> {:ok, %{points: points, columns: columns, pushdown: true}}
+          :error -> :error
+        end
     end
   end
 
@@ -552,7 +567,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp execute_aggregate_query(points, %{group_by_interval: nil, group_by_columns: nil} = query) do
     # Scalar aggregate: all filtered points form a single bucket. Always
     # produce one row, even when no points matched (so COUNT returns 0).
-    [SQLAggregate.reduce_columns(query.select_columns, points, nil)]
+    SQLAggregate.reduce_group(query.select_columns, query.having, points, nil)
   end
 
   # One group per (DATE_BIN bucket, grouping-column values) — either part
@@ -565,14 +580,20 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
     points
     |> Enum.group_by(fn point ->
-      {bucket_start(point, interval_ns), Enum.map(columns, &SQLRow.sort_value(point, &1))}
+      {bucket_start(point, interval_ns), Enum.map(columns, &group_value(point, &1))}
     end)
-    |> Enum.map(fn {{bucket_ts, _values}, bucket_points} ->
-      SQLAggregate.reduce_columns(query.select_columns, bucket_points, bucket_ts)
+    |> Enum.flat_map(fn {{bucket_ts, _values}, bucket_points} ->
+      SQLAggregate.reduce_group(query.select_columns, query.having, bucket_points, bucket_ts)
     end)
     |> apply_order_by_rows(query.order_by, time_alias)
     |> apply_limit(query.limit, query.offset)
   end
+
+  # What a point is grouped by for a `GROUP BY` item: a column's value, or an
+  # expression's.
+  @spec group_value(point(), binary() | {:expr, SQLExpr.t()}) :: term()
+  defp group_value(point, {:expr, expr}), do: SQLEval.eval(expr, point)
+  defp group_value(point, column), do: SQLRow.sort_value(point, column)
 
   # The start of the point's DATE_BIN bucket (nil when there is no bucket).
   # Times before the epoch floor (-5 ns is in the bucket that starts before

@@ -113,7 +113,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # A binary operator at the end of `text`, with where its operand starts.
   @spec operator_before(binary()) :: {byte(), non_neg_integer()} | nil
   defp operator_before(text) do
-    with [_all, {at, 1}, {operand_at, 0}] <-
+    # A regular expression for a column (`SELECT /re/ FROM`) ends in a slash too.
+    with false <- text =~ ~r/(?:^|,)\s*\/(?:[^\/\\]|\\.)+\/\s*$/s,
+         [_all, {at, 1}, {operand_at, 0}] <-
            Regex.run(~r/([+\-*\/%&|^])\s*()(?:[+\-(]\s*)*$/, text, return: :index),
          true <- binary_operator?(text, at) do
       {:binary.at(text, at), operand_at}
@@ -145,14 +147,36 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
        else: :ok
   end
 
-  # The comma-separated pieces of a text, each with its offset in the statement.
+  # The comma-separated pieces of a text (its literals masked), each with its
+  # offset in the statement. A comma inside parentheses (`percentile(f, 95)`)
+  # does not separate.
   @spec comma_pieces(binary(), non_neg_integer()) :: [{binary(), non_neg_integer()}]
   @doc false
   def comma_pieces(text, base) do
     text
-    |> String.split(",")
+    |> split_top_level(0, 0, [])
     |> Enum.map_reduce(base, &{{&1, &2}, &2 + byte_size(&1) + 1})
     |> elem(0)
+  end
+
+  @spec split_top_level(binary(), non_neg_integer(), non_neg_integer(), [binary()]) :: [binary()]
+  defp split_top_level(text, from, depth, pieces) do
+    case top_level_comma(text, from, depth) do
+      nil -> Enum.reverse([binary_part(text, from, byte_size(text) - from) | pieces])
+      at -> split_top_level(text, at + 1, 0, [binary_part(text, from, at - from) | pieces])
+    end
+  end
+
+  @spec top_level_comma(binary(), non_neg_integer(), non_neg_integer()) :: non_neg_integer() | nil
+  defp top_level_comma(text, at, _depth) when at >= byte_size(text), do: nil
+
+  defp top_level_comma(text, at, depth) do
+    case :binary.at(text, at) do
+      ?, when depth == 0 -> at
+      ?( -> top_level_comma(text, at + 1, depth + 1)
+      ?) -> top_level_comma(text, at + 1, max(depth - 1, 0))
+      _other -> top_level_comma(text, at + 1, depth)
+    end
   end
 
   @spec check_each_item(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
@@ -186,6 +210,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     text = String.trim_trailing(text)
 
     cond do
+      # A regular expression for columns (`/re/`, `/re/ AS x`) is no division.
+      text =~ ~r/^\/(?:[^\/\\]|\\.)+\/(?:\s+AS\s+(?:"[^"]+"|\w+))?$/s ->
+        :ok
+
       String.downcase(text) == "distinct" and last? ->
         {:error, {:engine, InfluxQLError.syntax_error_body(:distinct, from_keyword_at, whole)}}
 

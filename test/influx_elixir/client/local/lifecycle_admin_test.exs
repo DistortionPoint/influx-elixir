@@ -1,8 +1,6 @@
 defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
   use ExUnit.Case, async: true
 
-  import InfluxElixir.TestSupport.LocalHelpers
-
   alias InfluxElixir.Client.Local
 
   setup do
@@ -195,75 +193,6 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
     end
   end
 
-  # Bucket admin covered by contract tests (contract_local_v2_test.exs)
-
-  # Token admin covered by contract tests (contract_local_v3_enterprise_test.exs)
-
-  # Health covered by contract tests (all contract_local_*_test.exs)
-
-  # ---------------------------------------------------------------------------
-  # execute_sql/3 — DELETE support
-  # ---------------------------------------------------------------------------
-
-  describe "execute_sql/3 — DELETE (v3_enterprise supports)" do
-    setup do
-      {:ok, conn} =
-        Local.start(
-          databases: ["del_db"],
-          profile: :v3_enterprise
-        )
-
-      {:ok, :written} =
-        Local.write(
-          conn,
-          "cpu,host=web01 value=10i 1\ncpu,host=web02 value=20i 2\ncpu,host=web01 value=30i 3",
-          database: "del_db"
-        )
-
-      {:ok, conn: conn, db: "del_db"}
-    end
-
-    test "DELETE FROM removes every point and leaves an empty table", %{conn: conn, db: db} do
-      assert Local.execute_sql(conn, "DELETE FROM cpu", database: db) ===
-               {:ok, %{"rows_affected" => 3}}
-
-      # The table stays in the catalog: no rows, not "table not found".
-      assert {:ok, []} = Local.query_sql(conn, "SELECT * FROM cpu", database: db)
-    end
-
-    test "DELETE follows SQL's identifier rules, as SELECT does", %{conn: conn, db: db} do
-      {:ok, :written} =
-        Local.write(conn, "Cpu,Host=a v=1i 1\nCpu,Host=b v=2i 2", database: db)
-
-      # Unquoted names fold: `Cpu` and `HOST` are table cpu and its host tag.
-      assert Local.execute_sql(conn, ~s|DELETE FROM Cpu WHERE HOST = 'web01'|, database: db) ===
-               {:ok, %{"rows_affected" => 2}}
-
-      assert Local.query_sql(conn, "SELECT * FROM cpu", database: db) ===
-               {:ok,
-                [%{"host" => "web02", "time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 20}]}
-
-      assert Local.execute_sql(conn, ~s|DELETE FROM "Cpu" WHERE "Host" = 'a'|, database: db) ===
-               {:ok, %{"rows_affected" => 1}}
-
-      assert Local.query_sql(conn, ~s|SELECT * FROM "Cpu"|, database: db) ===
-               {:ok, [%{"Host" => "b", "time" => ~U[1970-01-01 00:00:00.000000Z], "v" => 2}]}
-    end
-
-    test "DELETE FROM with WHERE removes matching points only",
-         %{conn: conn, db: db} do
-      assert Local.execute_sql(
-               conn,
-               "DELETE FROM cpu WHERE host = 'web01'",
-               database: db
-             ) === {:ok, %{"rows_affected" => 2}}
-
-      assert Local.query_sql(conn, "SELECT * FROM cpu", database: db) ===
-               {:ok,
-                [%{"host" => "web02", "time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 20}]}
-    end
-  end
-
   # ---------------------------------------------------------------------------
   # query_sql/3 — multi-database isolation
   # ---------------------------------------------------------------------------
@@ -342,4 +271,7 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
                {:ok, [%{"host" => "c"}]}
     end
   end
+
+  # The instant `us` microseconds past 1_700_000_000 s.
+  defp iq_time(us), do: DateTime.from_unix!(1_700_000_000_000_000 + us, :microsecond)
 end

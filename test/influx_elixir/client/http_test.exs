@@ -193,7 +193,7 @@ defmodule InfluxElixir.Client.HTTPTest do
       conn = connection(ClosedPort.port(), [])
       stream = HTTP.query_sql_stream(conn, "SELECT 1")
 
-      # The port was closed — Finch will fail to connect.
+      # Nothing listens on the port (see ClosedPort): the connection is refused.
       error = assert_raise StreamError, fn -> Enum.to_list(stream) end
 
       assert %StreamError{

@@ -20,7 +20,7 @@ defmodule InfluxElixir.Contract.SQLExpressions do
 
     * `:where` — OR, NOT, LIKE, ILIKE, booleans, `%`, unary minus, comparands
     * `:order` — ORDER BY keys, nulls, positions, GROUP BY references, OFFSET
-    * `:cte` — projected expressions, CTEs, schema errors, InfluxQL NOT
+    * `:cte` — projected expressions, CTEs, InfluxQL NOT
   """
 
   @parts [:where, :order, :cte]
@@ -57,7 +57,6 @@ defmodule InfluxElixir.Contract.SQLExpressions do
       {:order, offset_tests(client)},
       {:order, grouped_tests(client)},
       {:cte, projection_tests(client)},
-      {:cte, schema_error_tests(client)},
       {:cte, influxql_tests(client)}
     ]
   end
@@ -135,12 +134,21 @@ defmodule InfluxElixir.Contract.SQLExpressions do
                  ) === ["d", "e"]
         end
 
-        test "_ in LIKE is one character and a null never matches", ctx do
+        test "_ in LIKE is one character", ctx do
           assert sxe_col(ctx, "SELECT host FROM m WHERE host LIKE '_' ORDER BY host", "host") ===
                    ["a", "b", "c", "d", "e"]
 
           assert sxe_col(ctx, "SELECT host FROM m WHERE rack LIKE '1%' ORDER BY host", "host") ===
                    ["a", "e"]
+        end
+
+        # Host c has no rack: LIKE '%' matches every text, and still not a null.
+        test "a null never matches LIKE, not even '%'", ctx do
+          assert sxe_col(ctx, "SELECT host FROM m WHERE rack LIKE '%' ORDER BY host", "host") ===
+                   ["a", "b", "d", "e"]
+
+          assert sxe_col(ctx, "SELECT host FROM m WHERE rack NOT LIKE '1%' ORDER BY host", "host") ===
+                   ["b", "d"]
         end
 
         # rack is a tag: "1", "2", "4", "10". DataFusion keeps the column Utf8 and
@@ -241,6 +249,21 @@ defmodule InfluxElixir.Contract.SQLExpressions do
 
           assert sxe_rows(ctx, "SELECT price FROM p WHERE 2 * price > volume") ===
                    [%{"price" => 100.0}]
+        end
+
+        test "arithmetic on the right side of a WHERE comparison", ctx do
+          sxe_write(ctx, [
+            "p price=1.0,volume=10.0 1700000000000000000",
+            "p price=2.5,volume=20.0 1700000010000000000",
+            "p price=100.0,volume=1.0 1700000090000000000"
+          ])
+
+          assert sxe_col(
+                   ctx,
+                   "SELECT price FROM p WHERE price <= volume * 0.2 ORDER BY price",
+                   "price"
+                 ) ===
+                   [1.0, 2.5]
         end
       end
     end
@@ -404,10 +427,13 @@ defmodule InfluxElixir.Contract.SQLExpressions do
 
           select = "SELECT DATE_BIN(INTERVAL '1 minute', time) AS bucket, h, COUNT(v) AS c FROM m"
 
-          for group <- ["DATE_BIN(INTERVAL '1 minute', time), h", "bucket, h", "1, 2"] do
-            assert sxe_rows(ctx, "#{select} GROUP BY #{group} ORDER BY bucket, h") === expected,
-                   group
-          end
+          InfluxElixir.TestSupport.Check.each_case(
+            ["DATE_BIN(INTERVAL '1 minute', time), h", "bucket, h", "1, 2"],
+            fn group ->
+              assert sxe_rows(ctx, "#{select} GROUP BY #{group} ORDER BY bucket, h") === expected,
+                     group
+            end
+          )
         end
 
         test "a select alias or a position names the grouping column", ctx do
@@ -461,6 +487,35 @@ defmodule InfluxElixir.Contract.SQLExpressions do
                    [%{"twice" => 6}, %{"twice" => 8}]
         end
 
+        test "a short last page is what remains; past the last row is empty", ctx do
+          assert sxe_col(ctx, "SELECT host FROM p ORDER BY time LIMIT 2 OFFSET 4", "host") ===
+                   ["e"]
+
+          assert sxe_col(ctx, "SELECT host FROM p ORDER BY time LIMIT 2 OFFSET 10", "host") === []
+        end
+
+        test "OFFSET needs no LIMIT and may come before it", ctx do
+          assert sxe_col(ctx, "SELECT host FROM p ORDER BY time OFFSET 3", "host") === ["d", "e"]
+
+          assert sxe_col(ctx, "SELECT host FROM p ORDER BY time OFFSET 3 LIMIT 1", "host") ===
+                   ["d"]
+        end
+
+        test "OFFSET applies to DISTINCT rows", ctx do
+          assert sxe_col(
+                   ctx,
+                   "SELECT DISTINCT host FROM p ORDER BY host LIMIT 2 OFFSET 2",
+                   "host"
+                 ) === ["c", "d"]
+        end
+
+        test "a negative OFFSET is the optimizer's planning error", ctx do
+          assert sxe_error(ctx, "SELECT host FROM p LIMIT 2 OFFSET -1") ===
+                   {400,
+                    "Optimizer rule 'push_down_limit' failed\ncaused by\nError during " <>
+                      "planning: OFFSET must be >=0, '-1' was provided"}
+        end
+
         test "the reported pagination query", ctx do
           sql = """
           SELECT *
@@ -503,21 +558,24 @@ defmodule InfluxElixir.Contract.SQLExpressions do
             ~S|date_bin(IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 0, | <>
               ~S|nanoseconds: 60000000000 }"),p.time), max(p.v)|
 
-          for {sql, column, appears} <- [
-                {"SELECT host, v FROM p GROUP BY host", "v", "p.host"},
-                {"SELECT host, MAX(v) AS m FROM p", "host", "max(p.v)"},
-                {"SELECT host, DATE_BIN(INTERVAL '1 minute', time) AS t, MAX(v) AS m FROM p " <>
-                   "GROUP BY DATE_BIN(INTERVAL '1 minute', time)", "host", date_bin}
-              ] do
-            assert sxe_error(ctx, sql) ===
-                     {400,
-                      "Error during planning: Column in SELECT must be in GROUP BY or an " <>
-                        "aggregate function: While expanding wildcard, column \"p.#{column}\" " <>
-                        "must appear in the GROUP BY clause or must be part of an aggregate " <>
-                        "function, currently only \"#{appears}\" appears in the SELECT " <>
-                        "clause satisfies this requirement"},
-                   sql
-          end
+          InfluxElixir.TestSupport.Check.each_case(
+            [
+              {"SELECT host, v FROM p GROUP BY host", "v", "p.host"},
+              {"SELECT host, MAX(v) AS m FROM p", "host", "max(p.v)"},
+              {"SELECT host, DATE_BIN(INTERVAL '1 minute', time) AS t, MAX(v) AS m FROM p " <>
+                 "GROUP BY DATE_BIN(INTERVAL '1 minute', time)", "host", date_bin}
+            ],
+            fn {sql, column, appears} ->
+              assert sxe_error(ctx, sql) ===
+                       {400,
+                        "Error during planning: Column in SELECT must be in GROUP BY or an " <>
+                          "aggregate function: While expanding wildcard, column \"p.#{column}\" " <>
+                          "must appear in the GROUP BY clause or must be part of an aggregate " <>
+                          "function, currently only \"#{appears}\" appears in the SELECT " <>
+                          "clause satisfies this requirement"},
+                     sql
+            end
+          )
         end
 
         test "ORDER BY is honoured on GROUP BY column aggregates", ctx do
@@ -573,11 +631,6 @@ defmodule InfluxElixir.Contract.SQLExpressions do
                    [%{"n" => 4}]
         end
 
-        test "a CTE over a missing table reports the table-not-found error", ctx do
-          assert sxe_error(ctx, "WITH w AS (SELECT bid FROM nope) SELECT * FROM w") ===
-                   {400, "Error during planning: table 'public.iox.nope' not found"}
-        end
-
         test "table aliases and qualified columns are accepted in every clause", ctx do
           assert sxe_rows(ctx, "SELECT q.bid, q.time FROM q AS q ORDER BY q.time LIMIT 1") ===
                    [%{"bid" => 1.0, "time" => ~U[1970-01-01 00:00:01.000000Z]}]
@@ -595,53 +648,6 @@ defmodule InfluxElixir.Contract.SQLExpressions do
 
           # A qualifier-looking string literal is untouched.
           assert sxe_rows(ctx, "SELECT provider FROM q WHERE provider = 'q.x'") === []
-        end
-      end
-    end
-  end
-
-  # An unknown column anywhere is the engine's schema error, listing its fields.
-  defp schema_error_tests(_client) do
-    quote location: :keep do
-      describe "SQL expressions — contract: an unknown column is a schema error" do
-        setup ctx do
-          sxe_write(ctx, [
-            "p,host=a v=1.0 1700000000000000000",
-            "p,host=b v=2.0 1700000001000000000"
-          ])
-        end
-
-        # ORDER BY and GROUP BY list the select list's fields before the table's
-        # (`*` is every field).
-        test "in SELECT, aggregates, selectors, WHERE, GROUP BY, ORDER BY and DISTINCT", ctx do
-          table = "p.host, p.time, p.v"
-
-          for {sql, fields} <- [
-                {"SELECT nosuch FROM p", table},
-                {"SELECT host, nosuch AS n FROM p", table},
-                {"SELECT * FROM p WHERE nosuch = 1", table},
-                {"SELECT * FROM p WHERE nosuch IS NULL", table},
-                {"SELECT * FROM p WHERE nosuch IN ('a')", table},
-                {"SELECT * FROM p WHERE v > 0 OR nosuch LIKE 'a%'", table},
-                {"SELECT * FROM p ORDER BY nosuch", "#{table}, #{table}"},
-                {"SELECT host FROM p GROUP BY nosuch", "p.host, #{table}"},
-                {"SELECT MAX(nosuch) AS m FROM p", table},
-                {"SELECT MAX(v + nosuch) AS m FROM p", table},
-                {"SELECT nosuch, COUNT(*) AS n FROM p GROUP BY nosuch", table},
-                {"SELECT DISTINCT nosuch FROM p", table},
-                {"SELECT selector_first(nosuch, time)['value'] AS f FROM p", table},
-                {"SELECT selector_first(v, nosuch)['value'] AS f FROM p", table},
-                {"SELECT first_value(nosuch ORDER BY time) AS f FROM p", table},
-                {"SELECT COUNT(DISTINCT nosuch) AS n FROM p", table}
-              ] do
-            assert sxe_error(ctx, sql) ===
-                     {500, "Schema error: No field named nosuch. Valid fields are #{fields}."},
-                   sql
-          end
-
-          # A CTE exposes only the columns it selects.
-          assert sxe_error(ctx, "WITH w AS (SELECT host FROM p) SELECT nosuch FROM w") ===
-                   {500, "Schema error: No field named nosuch. Valid fields are w.host."}
         end
       end
     end

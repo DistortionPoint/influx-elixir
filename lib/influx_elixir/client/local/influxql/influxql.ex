@@ -16,12 +16,14 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   # This module is the entry point; the work is in modules of its own, which
   # are pure: `InfluxElixir.Client.Local.InfluxQLParser` turns the statement
   # into a query map (its checks are `InfluxQLCheck`, `InfluxQLSelectCheck`
-  # and `InfluxQLParens`, its words `InfluxQLReserved`, its errors
+  # and `InfluxQLParens`, its words `InfluxQLText`, its dimensions `InfluxQLGroup`,
+  # its regular expressions `InfluxQLRegex`, its errors
   # `InfluxQLError`), `InfluxQLWhere` plans the `WHERE` (`InfluxQLTokens`,
   # `InfluxQLTyped`, `InfluxQLArithmetic`, `InfluxQLTime`, `InfluxQLSql`),
   # `InfluxQLRun` shapes the rows the caller has already filtered with the
   # statement's `WHERE` clause (Client.Local runs it through its SQL engine)
-  # and put in time order, and `InfluxQLShow` answers `SHOW TAG VALUES`.
+  # and put in time order, and `InfluxQLShowParser` reads the `SHOW` statements
+  # that `InfluxQLShow` and `InfluxQLQuery` answer.
   #
   # `WHERE` follows InfluxQL, not SQL (`where_plan/3`): a missing tag is the
   # empty string (`host != 'a'` keeps points without `host`, `host = ''`
@@ -42,7 +44,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   # joined by `AND`, so one inside an `OR` is refused by name. `SHOW TAG
   # VALUES [FROM m] WITH KEY = | != | =~ | !~ | IN (...)` [WHERE ...] lists
   # values as the engine does, over the last 24 hours unless the `WHERE`
-  # bounds `time` (`parse_show_tag_values/1`).
+  # bounds `time` (`InfluxElixir.Client.Local.InfluxQLShowParser`).
   #
   # A reserved word (`reserved?/1`) is no bare identifier: the engine's parse
   # errors for it, for a reserved word where an operand is wanted (after a
@@ -77,27 +79,35 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   # comparison fold with quoted times (`InfluxQLTimeExpr`); and the checks of
   # the select list the engine plans are `InfluxQLPlan`.
   #
-  # Refused by name, rather than answered wrongly: `GROUP BY` a tag called
-  # `time`, a second `time()`, `time(0s)` or under a microsecond, a `fill()`
-  # option the double does not read, `fill(linear)` with a `count` or on a
-  # text column (the engine breaks the connection), a number to `fill()` on a
-  # text column that is not an integer or a plain fraction, more than a
-  # million rows in a series, `INTO`, `SLIMIT`/`SOFFSET`, subqueries, `GROUP BY
-  # *`, functions other than `MEAN SUM COUNT MIN MAX FIRST LAST MEDIAN SPREAD
-  # STDDEV`, `F(*)` other than `COUNT(*)`, `distinct(f)` of a field (the engine
-  # lists the values in the order of its hash), columns beside a selector in a
-  # `GROUP BY time`, `*` beside other items, select items that end up with the
-  # same name, arithmetic with a remainder by zero, a negative fraction cast
-  # to an integer, an expression of constants, or one that mixes aggregates and
-  # fields, the spread of negative values, several measurements in `FROM`,
-  # `LIMIT` / `OFFSET` on `SHOW TAG VALUES`, an unsigned field compared with a
-  # string, a string field or a tag compared with an integer past the signed
-  # range, a field compared with a constant the double cannot fold, a bare
-  # non-boolean field inside `AND` / `OR`, a quoted time in a form the double
-  # does not tell from the engine's, a regular expression with `\\u` or a back
-  # reference, and a statement after a `;` that the double does not read. A
-  # keyword inside a quoted string, quoted identifier or regular expression is
-  # not one: `WHERE k = 'into'` is answered.
+  # Also answered (see `docs/design/2026-10-02_influxql-planner-and-module-split.md`):
+  # `GROUP BY` as the engine's parser reads it (`InfluxQLGroup`: `*`, `/re/`,
+  # fields, the first `time()`, its errors at their positions), `fill()` over
+  # the buckets that hold points, `/* */` comments, `SLIMIT` (405), `tz('UTC')`,
+  # `percentile`, `mode`, `top`, `bottom`, `integral`, the math functions, the
+  # transforms of fields and of aggregates (`InfluxQLTransform`), `F(*)`,
+  # `*::field`, `/re/` columns and `FROM` lists (`InfluxQLWild`), booleans in
+  # `first`/`last`/`min`/`max`, and the `SHOW` statements (`InfluxQLShowParser`).
+  #
+  # Refused by name, rather than answered wrongly: `INTO`, subqueries, `tz()`
+  # of a zone other than UTC, `mode()` of values equally often there, `GROUP BY`
+  # a tag called `time` or a field the select list reads, `fill(linear)` on a
+  # text or boolean column (and with a `count` over an empty bucket) and
+  # `fill(previous)` with a `count` while the first bucket is empty (the engine
+  # breaks the connection), a series of more than `local_influxql_max_rows`,
+  # transforms over points that share a time, `elapsed()` or `integral()` over
+  # buckets, `percentile` or `top` in arithmetic, `distinct(f)` of a field (the
+  # engine lists the values in the order of its hash), columns beside a selector
+  # in a `GROUP BY time`, `*` beside other items, select items that end up with
+  # the same name, a remainder by zero, a negative fraction cast to an integer,
+  # an expression of constants, one that mixes aggregates and fields, the
+  # spread of negative values, an unsigned field compared with a string, a
+  # string field or a tag compared with an integer past the signed range, a
+  # field compared with a constant the double cannot fold, a bare non-boolean
+  # field inside `AND` / `OR`, a quoted time in a form the double does not tell
+  # from the engine's, a regular expression with `\\u` or a back reference, and
+  # a statement after a `;` that the double does not read. A keyword inside a
+  # quoted string, quoted identifier or regular expression is not one:
+  # `WHERE k = 'into'` is answered.
 
   alias InfluxElixir.Client.Local.{
     InfluxQLArithmetic,
@@ -119,6 +129,8 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
           | {:column, binary(), binary()}
           | {:literal, binary()}
           | {:expr, InfluxElixir.Client.Local.InfluxQLExpr.ast(), binary() | nil}
+          | {:multi, binary(), binary(), [binary()], pos_integer(), binary() | nil}
+          | {:planning_error, binary()}
           | {:aggregate, binary(),
              binary() | :star | {:distinct, binary()} | {:literal, binary()}, binary() | nil}
 
@@ -126,9 +138,10 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   @type query :: %{
           items: [item()],
           measurement: binary(),
+          sources: [{:name | :regex, binary()}],
           where: binary() | nil,
           group_by: [binary()],
-          group_time: nil | {pos_integer(), integer()},
+          group_time: nil | {integer(), integer()},
           fill: InfluxElixir.Client.Local.InfluxQLBuckets.fill(),
           descending: boolean(),
           limit: non_neg_integer() | nil,
@@ -170,7 +183,9 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   Parses an InfluxQL `SELECT`. Returns `{:error, message}` for syntax the
   engine rejects and for the constructs listed in the moduledoc.
   """
-  @spec parse(binary()) :: {:ok, query()} | {:error, binary() | {:engine, binary()}}
+  @spec parse(binary()) ::
+          {:ok, query()}
+          | {:error, binary() | {:engine, binary()} | {:engine, pos_integer(), binary()}}
   defdelegate parse(statement), to: InfluxQLParser
 
   @doc """
@@ -240,21 +255,18 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   @spec unframe_split(binary()) :: binary()
   defdelegate unframe_split(body), to: InfluxQLError
 
+  @doc """
+  How far before the range the points of a query are scanned, in nanoseconds:
+  one bucket for the transforms of a `GROUP BY time` that compare with the
+  bucket before, none otherwise.
+  """
+  @spec lookback(query()) :: {:ok, non_neg_integer()} | {:error, binary()}
+  defdelegate lookback(query), to: InfluxQLRun
+
   @doc "Whether a bare word is one InfluxQL reserves (any case)."
+
   @spec reserved?(binary()) :: boolean()
   defdelegate reserved?(word), to: InfluxQLText
-
-  @doc """
-  Parses `SHOW TAG VALUES [FROM m] WITH KEY = k | != k | =~ /re/ | !~ /re/ |
-  IN (k, ...) [WHERE ...]`, or `nil` when the statement is not one.
-  `LIMIT` and `OFFSET` are refused by name: the engine applies them per
-  measurement in an order the double does not reproduce.
-  """
-  @spec parse_show_tag_values(binary()) ::
-          nil
-          | {:ok, %{measurement: binary() | nil, keys: key_filter(), where: binary() | nil}}
-          | {:error, binary() | {:engine, binary()}}
-  defdelegate parse_show_tag_values(statement), to: InfluxQLShow
 
   @doc "Whether a tag key is one a `key_filter/0` lists."
   @spec key_listed?(binary(), key_filter()) :: boolean()

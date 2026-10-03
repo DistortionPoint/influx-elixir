@@ -32,19 +32,29 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   # for the order the engine reports them in). `floor` and `ceil` with a second
   # argument are the engine's 405.
 
-  alias InfluxElixir.Client.Local.{SQLCast, SQLError, SQLLimits, SQLNumber, SQLParser}
+  alias InfluxElixir.Client.Local.{
+    SQLCast,
+    SQLError,
+    SQLLimits,
+    SQLNumber,
+    SQLParser,
+    SQLScalar,
+    SQLScalarCheck
+  }
 
   require SQLLimits
 
-  @type name :: :abs | :round | :trunc | :floor | :ceil
-  @type context :: :where | :where_cut | :select | :order_by
+  @type name :: :abs | :round | :trunc | :floor | :ceil | :coalesce | :nullif | SQLScalar.name()
+  @type context :: :where | :where_cut | :select | :select_cut | :order_by
 
   @names %{
     "abs" => :abs,
     "round" => :round,
     "trunc" => :trunc,
     "floor" => :floor,
-    "ceil" => :ceil
+    "ceil" => :ceil,
+    "coalesce" => :coalesce,
+    "nullif" => :nullif
   }
 
   @doc "Whether an Arrow type name is one of the engine's numeric types."
@@ -64,7 +74,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
 
   @doc "The function a name (any case) calls, or `nil` for any other name."
   @spec lookup(binary()) :: name() | nil
-  def lookup(name), do: Map.get(@names, String.downcase(name))
+  def lookup(name), do: Map.get(@names, String.downcase(name)) || SQLScalar.lookup(name)
 
   @doc """
   Evaluates a call the planner has accepted (`check/3`), its arguments
@@ -77,6 +87,27 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   end
 
   @spec compute(name(), [SQLNumber.t()]) :: SQLNumber.t()
+  # `COALESCE` and `NULLIF` are read by `InfluxElixir.Client.Local.SQLEval`;
+  # a call with the wrong number of arguments is the planner's error before
+  # a row is read.
+  defp compute(name, args)
+       when name in [
+              :lower,
+              :upper,
+              :length,
+              :substr,
+              :starts_with,
+              :sqrt,
+              :ln,
+              :log,
+              :pow,
+              :power
+            ],
+       do: SQLScalar.compute(name, args)
+
+  defp compute(name, _args) when name in [:coalesce, :nullif, :greatest, :least],
+    do: throw({:query_error, SQLError.refusal("#{name} with that many arguments")})
+
   # The magnitude of the `Int64` minimum overflows, whether the engine folds
   # a constant or reads a column (verified): it closes the connection.
   defp compute(:abs, [SQLLimits.int64_min()]), do: throw({:query_error, SQLError.closed()})
@@ -208,7 +239,11 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   """
   @spec check(name(), [binary() | nil], context()) :: :ok | {:error, map()}
   def check(name, types, context) do
-    if Enum.any?(types, &is_nil/1), do: :ok, else: refusal(name, types, context)
+    cond do
+      SQLScalar.function?(name) -> SQLScalarCheck.check(name, types, context)
+      Enum.any?(types, &is_nil/1) -> :ok
+      true -> refusal(name, types, context)
+    end
   end
 
   @spec refusal(name(), [binary()], context()) :: :ok | {:error, map()}
@@ -290,7 +325,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
     error =
       case context do
         :where -> SQLError.coercion(head <> tail)
-        cut when cut in [:order_by, :where_cut] -> SQLError.coercion(head)
+        cut when cut in [:order_by, :where_cut, :select_cut] -> SQLError.coercion(head)
         :select -> SQLError.planning(head <> tail)
       end
 
@@ -312,6 +347,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   @spec native(binary()) :: binary()
   def native("Utf8"), do: "String"
   def native("Dictionary(Int32, Utf8)"), do: "String"
+  def native("Utf8View"), do: "String"
   def native("Timestamp(ns)"), do: "Timestamp(Nanosecond, None)"
   def native(type), do: type
 
@@ -331,7 +367,12 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   def type_of({:neg, inner}, columns), do: type_of(inner, columns)
   def type_of({:cast, _inner, type}, _columns), do: SQLCast.arrow_type(type)
   def type_of({:call, :abs, [arg]}, columns), do: type_of(arg, columns)
-  def type_of({:call, _name, _args}, _columns), do: "Float64"
+
+  def type_of({:call, name, args}, columns) do
+    if SQLScalar.function?(name),
+      do: SQLScalar.type_of(name, Enum.map(args, &type_of(&1, columns))),
+      else: "Float64"
+  end
 
   def type_of({:op, _op, left, right}, columns) do
     case {type_of(left, columns), type_of(right, columns)} do

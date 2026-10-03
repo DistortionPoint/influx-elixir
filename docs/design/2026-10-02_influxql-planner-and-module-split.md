@@ -111,7 +111,7 @@ Behaviour first, each as the engine does it or refused by name.
 
 Structure: `InfluxQL` is the entry point and the types; the work is in
 `InfluxQLParser` (+ `InfluxQLCheck`, `InfluxQLSelectCheck`, `InfluxQLParens`,
-`InfluxQLReserved`, `InfluxQLError`), `InfluxQLWhere` (+ `InfluxQLTokens`,
+`InfluxQLText`, `InfluxQLError`), `InfluxQLWhere` (+ `InfluxQLTokens`,
 `InfluxQLTyped`, `InfluxQLArithmetic`, `InfluxQLTime`, `InfluxQLSql`),
 `InfluxQLRun`, `InfluxQLShow`, `InfluxQLNames` and `InfluxQLLiteral`. The line
 protocol parser keeps `LineProtocolParser` as the entry point (types,
@@ -126,8 +126,8 @@ does (its planner errors come without the frame a `SELECT` gets).
 
 | File | Change |
 |------|--------|
-| `lib/influx_elixir/client/local/influxql.ex` | entry point, types, delegates |
-| `lib/influx_elixir/client/local/influxql_*.ex` | the split, and the new modules above |
+| `lib/influx_elixir/client/local/influxql/influxql.ex` | entry point, types, delegates |
+| `lib/influx_elixir/client/local/influxql/influxql_*.ex` | the split, and the new modules above; third pass: `InfluxQLGroup` (parser), `InfluxQLRegex`, `InfluxQLTransform`, `InfluxQLWild`, `InfluxQLShowParser` |
 | `lib/influx_elixir/client/local/line_protocol_*.ex` | the split |
 | `lib/influx_elixir/client/local.ex` | `check_items`, checks over rows, status of engine errors, `store_lines` shortened |
 | `test/support/contract/influxql_flux_lp_contract.ex` | `===` contract tests for each behaviour above, and for `SHOW TAG VALUES` |
@@ -209,10 +209,11 @@ there keeps its value. `ORDER BY time DESC`, `LIMIT` and `OFFSET` apply after
 the fill, per series. `fill()` without `GROUP BY time` changes nothing, but
 `fill(none)`/`fill(linear)` of plain columns is the engine's planning error.
 Refused by name: `fill(linear)` with a `count` or on text (Core breaks the
-connection), a second `time()`, `time(0s)`, a number on a string column that
-is not a plain integer or fraction, and more than a million rows in a series
-(a `LIMIT` stops the stream early, so an unbounded `time(1m)` since 2024 with
-`LIMIT 2` is answered).
+connection), a number on a string column that is not a plain integer or
+fraction, and more than a million rows in a series (a `LIMIT` stops the
+stream early, so an unbounded `time(1m)` since 2024 with `LIMIT 2` is
+answered). The third pass below answers a second `time()` and `time(0s)`,
+raises the cap and narrows the `fill(linear)` rule.
 
 **Aggregates.** `median` (the middle; the mean of the middle two, an integer
 for integers, truncated toward zero), `spread` (`max - min`, but an integer
@@ -254,3 +255,156 @@ Core's answer varies with the data or with how its optimizer folds the
 expression, or is an error the double words differently: `distinct(f)` (hash
 order), `median(*)`, `max(f), n` per bucket, the errors of `fill()` options
 written with a blank, `time()` calls other than durations, `ts + now()`.
+
+---
+
+## Third pass: dashboards, `GROUP BY` as the parser reads it, and the functions Grafana sends
+
+A review of the sixth commit found wrong answers (a `GROUP BY` the double
+silently dropped), engine-shaped bodies Core never gives, a hang, a refusal of
+what Core answers, and 62 of 167 statements of a Grafana-style corpus refused.
+Everything below was read from Core (`curl localhost:8181/api/v3/query_influxql`,
+`--wal-flush-interval 10ms`) and compared statement by statement with the double
+(about 1,500 statements; the ones that differ are refused by name or are float
+digits). The answers are pinned in `test/support/contract/influxql_call_cases.ex`
+and `influxql_show_cases.ex`, run by `influxql_planner_contract.ex` against
+`Client.Local` and, as an integration test, against Core.
+
+**`GROUP BY` is parsed, not matched** (`InfluxQLGroup.extract/3`). The clause
+is read where the old clause regex found it, blanked in the text (byte for byte,
+so positions stay the engine's) and the rest goes on. A dimension is `time(...)`,
+`*` (every tag; `*::tag` and `*::field` the same), `/re/` (the tags whose key
+matches, unanchored, case-sensitive), or a name with an optional `::type`
+(ignored); a name that is a field groups by its values. Only the first
+`time()` counts (`time(1m), time(2m)` is 1m; a later `time(0s)` is ignored).
+Errors, with the position the engine gives: `invalid TIME call, expected 1 or 2
+arguments` after the word, `... expected a duration for the interval` after the
+`(`, `... expected ')'` after the last thing read (before blanks), `invalid
+GROUP BY clause, expected wildcard, TIME, identifier or regular expression`
+where a first dimension starts, `invalid data type for tag or field reference,
+expected float, integer, ...` and `invalid wildcard type specifier, expected TAG
+or FIELD` after the `::` (a type word must not be followed by a word character or
+`:`), `invalid FILL option, expected NULL, NONE, PREVIOUS, LINEAR, or a number`
+after `fill(`, `unterminated regex literal` at the end of the text. A dimension
+that cannot be read after a comma ends the list there; the statement is then
+`invalid InfluxQL statement at pos N. Parsing Error: Nom("<rest>", Tag)` from
+the comma, a `fill` that is not whole (`fill`, `fill(previous`, `fill(1 2)`,
+`fill(1.)`, `fill(1e3)`) from the `fill`, anything after the clause that is not
+`ORDER`, `LIMIT`, `OFFSET`, `SLIMIT`, `SOFFSET` or `tz(` from itself. A `fill`
+number is an integer up to `2^63 - 1` (the sign is not counted: `-2^63` is the
+error) or a float. 64 clauses are pinned with their positions
+(`InfluxQLCallCases.parse_errors/0`).
+
+`time(every)` with an `every` that is not a whole number of microseconds, or an
+offset that is not, answers `[]` when there are no points and is refused by name
+when there are (the rows carry microseconds). `time(0s)` is the engine's 500
+`DATE_BIN stride must be non-zero` for a measurement that exists. A field in
+`GROUP BY` that the select list also reads makes the aggregate disappear or a
+column come twice (`a_1`) on the engine: refused. `GROUP BY "time"` groups by the
+time column in an order that changes between runs: refused once there are rows.
+
+**Comments.** `/* ... */` (not nested) is blanked like `--`; one never closed is
+`invalid inline comment, missing closing */ at pos N` (N is after the `/*`).
+`SLIMIT`/`SOFFSET` read and then 405 `This feature is not implemented: SLIMIT or
+SOFFSET`, the unsigned-integer parse errors first. `tz('UTC')` changes nothing;
+another zone needs a time zone database and is refused.
+
+**Regular expressions** (`InfluxQLRegex`): look-around and atomic groups are the
+engine's 500 `Invalid regex\ncaused by\nExternal error: regex parse error:\n    <pattern>\n    <carets>\nerror: look-around, including look-ahead and look-behind, is not
+supported` (`unrecognized flag` for `(?>`), with the carets under the group;
+other constructs the double's engine reads differently are refused.
+
+**`fill()` and the work it does.** `fill(none)` walks only the buckets that hold
+points, so `WHERE time >= 0 GROUP BY time(1s) fill(none) LIMIT 3` is instant
+(it ran 20 s). `fill(previous)` with a `count()` while the first bucket is empty
+and `fill(linear)` on a string or boolean column (or with a `count()` over an
+empty bucket) break Core's connection: refused by name. A series of more than
+2,000,000 rows (`:local_influxql_max_rows`; a fortnight at one second is 1.21
+million and takes about 400 MB) is refused before any row is made, unless a
+`LIMIT` stops short of it; `fill(linear)` reads at most 500,000 buckets. `fill(n)`
+of a boolean column is the 500 `no conversion from n to Boolean`; the number is
+written as Rust's `Display` writes it (`2.0` is `2`).
+
+**Transforms** (`InfluxQLTransform`, planned in `InfluxQLExpr`/`InfluxQLPlan`,
+run in `InfluxQLRun`): `derivative`, `non_negative_derivative`, `difference`,
+`non_negative_difference`, `cumulative_sum`, `moving_average(n)`, `elapsed`. Over
+a field they read the points of a series (the first has no result; `elapsed` is 0
+there), over an aggregate the buckets of a `GROUP BY time` (`... aggregate
+requires a GROUP BY interval` without one). A null (empty bucket) is skipped and
+the next value is compared with the last before it, over the real time between
+the two. `derivative`'s unit defaults to 1s over a field and to the `GROUP BY`
+interval over an aggregate; it is `dx / (dt / unit)`. In descending order the
+sequence is read in that order. The transforms that compare with the bucket
+before (all but `cumulative_sum`) make the engine scan one interval before the
+range, and **the first bucket is then computed from the points of the whole
+bucket, not clipped at the lower bound** (`derivative(mean(v)) WHERE time >=
+B+25` compares a first bucket of 15 with a previous of 3): the double reads the
+SQL with the lower bounds `every` earlier (`where_plan(..., extend_lower:)`),
+and the bucket before is an ordinary bucket under the `fill()` (a `count()`'s
+zero, the number of `fill(n)`), dropped from the answer. Rows are dropped when
+the select list is transforms alone and none has a result; beside another
+column every bucket stays. Refused: transforms over points that share a time
+(of series `GROUP BY` does not separate), of a field in a `GROUP BY time`,
+beside an aggregate, `elapsed` and `integral` over buckets, descending order
+after data in the bucket before the range.
+
+**Math** `abs round floor ceil sqrt ln log pow` (the trigonometric functions
+and `exp` differ from Core in the last digit): `abs` keeps the type, `round`,
+`floor`, `ceil` answer floats, `pow` of an integer by a literal integer an
+integer; a result that is not finite is a null that is in the row (`sqrt=nil`).
+A math function over the only selector of the list is the engine's 500
+`unexpected selector function: abs`.
+
+**Selectors and aggregates.** `percentile(f, n)` is the value at rank
+`trunc(count * n / 100 + 0.5)` of the sorted points (equal values in time order),
+a selector (the point's time); no rank below 1, none at `count` or over, except
+in a bucket of a `GROUP BY time`, where `count` is the last (verified for 1 to 60
+points). `mode` is the value that is most often there; of several the engine's
+choice follows its hash order: refused. `top(f, n)`/`bottom(f, n)` and with tags
+answer the chosen points (earlier wins a tie) with their own times in time order
+(ties in the order of the ranks), per bucket, `fill` adds nothing; beside any
+other function they are the engine's planning errors. `first`, `last`, `min`,
+`max`, `percentile` and `mode` take booleans (`false < true`). `integral(f[,
+unit])` is the trapezoid area of the points of the series (zero for one); in a
+`GROUP BY time` the engine carries the line across the edges: refused. A lone
+selector inside arithmetic keeps its point's time (`max(v) * 2`); `percentile`
+inside arithmetic is answered by the engine without the arithmetic: refused.
+
+**Wildcards and `FROM`** (`InfluxQLWild`). `*::field`, `*::tag` (alone: nothing
+to answer), `/re/` (fields and tags whose name matches; an alias is ignored),
+`F(*)` and `F(/re/)` (`F_field` columns, `alias_field` after `AS`; the numeric
+fields for `mean sum median spread stddev percentile integral` and the math
+functions, the numeric and boolean ones for `min`/`max`, every field for `first`
+and `last`; a wildcard in arithmetic is `unsupported binary expression: contains
+a wildcard or regular expression`). `FROM` takes names and `/re/`, each
+measurement once, sorted, `LIMIT`/`OFFSET` counting in each.
+
+**`WHERE` on a column the measurement lacks** is null, so false in every
+comparison (`host = 'a' OR zone = 'z'` finds host `a`); it was an empty answer.
+
+**`SHOW`** (`InfluxQLShowParser`, `InfluxQLShow`): see the cases module for each
+form; the refusals are listed in the guide.
+
+**Performance** against HEAD~1, reductions at 100k points (min of 3): `SELECT *`
+17.40M (HEAD 20.73M), `WHERE` 5.79M (5.98M), `mean` 12.77M (15.98M), `GROUP BY
+host` 13.90M (16.07M). The cause was not `project/3` but the two passes the
+caller made over every row to drop the helper columns it adds (a `Map.drop` and a
+`MapSet` walk per row even when there were none); with neither it returns the
+rows as they are. Now within 1% of HEAD~1.
+
+**Refusal rate** on a 167-statement Grafana-style corpus (cpu/mem/net/http
+measurements, `$timeFilter`, `GROUP BY time($__interval)`, `fill`, transforms,
+math, wildcards, `SHOW`, subqueries, `INTO`): refused although Core answers 62
+before, 4 after (`mode` with ties, `tz()` of a named zone twice, a subquery;
+`INTO` is the engine's parse error and refused too); answered differently 11 before, 11 after (none a wrong
+shape: `SHOW` lists of a shared database, a tie in time, `stddev`/`integral`
+last digits).
+
+### Not reproduced
+
+`WHERE 'a' = host AND host = 'a'` returned 0 rows on Core in the review; 17
+shapes of it (aggregate, raw, grouped, bounded, ten and a thousand rows)
+answered the right count on Core 3 here (the four forms with the literal on
+the left, with and without a `time` bound, an `OR`, a raw select) and are
+pinned as ordinary cases (`InfluxQLCallCases.where/0`); the review's
+measurement was not available, so the engine bug could not be pinned.

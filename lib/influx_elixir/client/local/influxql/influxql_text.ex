@@ -57,6 +57,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
 
   def unquote_ident(ident), do: ident
 
+  @doc "A number written with no digit before its point (`.5`, `-.5`) with the zero Elixir reads it with."
+  @spec leading_zero(binary()) :: binary()
+  def leading_zero("-." <> fraction), do: "-0." <> fraction
+  def leading_zero("." <> fraction), do: "0." <> fraction
+  def leading_zero(text), do: text
+
   @doc "`nil` for blank text, the trimmed text otherwise."
   @spec blank_to_nil(binary()) :: binary() | nil
   def blank_to_nil(""), do: nil
@@ -79,7 +85,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
     )
   end
 
-  @clauses ~r/^\s*(?:WHERE\s+(?<where>.+?))?\s*(?:GROUP\s+BY\s+(?<group>.+?))?\s*(?<fillcall>fill\s*\((?<fill>[^)]*)\))?\s*(?:ORDER\s+BY\s+(?:time\s+(?=ASC|DESC)|(?=ASC\b|DESC\b)|time\b)(?<dir>ASC|DESC)?)?\s*(?:LIMIT\s+(?<limit>\d+))?\s*(?:OFFSET\s+(?<offset>\d+))?\s*;?\s*$/is
+  @clauses ~r/^\s*(?:WHERE\s+(?<where>.+?))?\s*(?:GROUP\s+BY\s+(?<group>.+?))?\s*(?<fillcall>fill\s*\((?<fill>[^)]*)\))?\s*(?:ORDER\s+BY\s+(?:time\s+(?=ASC|DESC)|(?=ASC\b|DESC\b)|time\b)(?<dir>ASC|DESC)?)?\s*(?:LIMIT\s+(?<limit>\d+))?\s*(?:OFFSET\s+(?<offset>\d+))?\s*(?:SLIMIT\s+(?<slimit>\d+))?\s*(?:SOFFSET\s+(?<soffset>\d+))?\s*(?<tzcall>TZ\s*\(\s*'(?<tz>[^']*)'\s*\))?\s*;?\s*$/is
 
   @doc """
   The regular expression that cuts what follows `FROM <measurement>` into its

@@ -6,7 +6,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   #
   #   * `-- ...` to the end of the line, and `/* ... */` (which nest), are
   #     comments and leave no trace: a quote inside one opens nothing
-  #   * `'...'` is a string and `"..."` a quoted identifier; inside either, a
+  #   * `'...'` is a string and `"..."` or `` `...` `` a quoted identifier; inside either, a
   #     doubled quote is one quote and nothing else has a meaning
   #   * `$$...$$` and `$tag$...$tag$` are dollar-quoted strings, and `E'...'`
   #     or `e'...'` a string with backslash escapes, rewritten as ordinary
@@ -68,7 +68,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   defp scan(<<?;, rest::binary>>, state, chunk),
     do: scan(rest, %{state | statements: [text(chunk) | state.statements]}, [])
 
-  defp scan(<<q, rest::binary>> = input, state, chunk) when q in [?', ?"] do
+  defp scan(<<q, rest::binary>> = input, state, chunk) when q in [?', ?", ?`] do
     case take_quoted(rest, q, [q]) do
       {:ok, literal, after_literal} -> scan(after_literal, state, [literal | chunk])
       :error -> {:error, unterminated(q, state.whole, input)}
@@ -97,7 +97,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   # escape string; `E'` or `e'` at the start of a token does.
   defp scan(<<c::utf8, rest::binary>> = input, state, chunk) do
     if word_char?(c) do
-      {word, after_word} = take_tag(input, [])
+      {word, after_word} = take_word(input)
 
       case after_word do
         <<?', body::binary>> when word in ["E", "e"] ->
@@ -160,6 +160,14 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
         scan(after_word, state, chunk)
     end
   end
+
+  @doc """
+  The text of an escape string whose opening `E'` was read: the characters up
+  to the closing quote with the backslash escapes decoded, and what follows the
+  quote; `:error` when the string is not closed or an escape is not one.
+  """
+  @spec escaped(binary()) :: {:ok, binary(), binary()} | :error
+  def escaped(body), do: take_escaped(body, [])
 
   @spec take_escaped(binary(), [binary()]) :: {:ok, binary(), binary()} | :error
   defp take_escaped(<<?', ?', rest::binary>>, acc), do: take_escaped(rest, ["'" | acc])
@@ -298,6 +306,22 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
     end
   end
 
+  # A word: the letters, digits and underscores of a name, and the `$` after the first of them
+  # (`b$$` is one word, which opens no dollar-quoted string).
+  @spec take_word(binary()) :: {binary(), binary()}
+  defp take_word(<<first::utf8, rest::binary>>) do
+    {tail, after_word} = take_tail(rest, [])
+    {<<first::utf8>> <> tail, after_word}
+  end
+
+  defp take_tail(<<c::utf8, rest::binary>> = input, acc) do
+    if word_char?(c) or c == ?$,
+      do: take_tail(rest, [<<c::utf8>> | acc]),
+      else: {acc |> Enum.reverse() |> IO.iodata_to_binary(), input}
+  end
+
+  defp take_tail(<<>>, acc), do: {acc |> Enum.reverse() |> IO.iodata_to_binary(), <<>>}
+
   @spec take_tag(binary(), [binary()]) :: {binary(), binary()}
   defp take_tag(<<c::utf8, rest::binary>> = input, acc) do
     if word_char?(c),
@@ -313,6 +337,9 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
 
   defp unterminated(?", whole, input),
     do: located(whole, input, "Expected close delimiter '\"' before EOF.")
+
+  defp unterminated(?`, whole, input),
+    do: located(whole, input, "Expected close delimiter '`' before EOF.")
 
   # The position of the text `input`, a suffix of `whole`.
   @spec located(binary(), binary(), binary()) :: SQLError.t()

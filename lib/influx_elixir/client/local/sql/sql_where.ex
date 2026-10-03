@@ -63,7 +63,7 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   @spec parse(binary()) :: {:ok, [node_t()], tree() | nil} | {:error, map()}
   defp parse(rest) do
     case SQLMask.run(
-           ~r/(?i)WHERE\s+(.+?)(?:\s+GROUP\b|\s+ORDER\b|\s+#{@limit_start}|$)/su,
+           ~r/(?i)WHERE\s+(.+?)(?:\s+GROUP\b|\s+HAVING\b|\s+ORDER\b|\s+#{@limit_start}|$)/su,
            rest
          ) do
       [_full_match, clauses_str] -> parse_clauses(clauses_str)
@@ -74,7 +74,8 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   @spec parse_clauses(binary()) :: {:ok, [node_t()], tree()} | {:error, map()}
   defp parse_clauses(str) do
     with {:ok, tokens} <- tokenize_where(str),
-         {:ok, conj, tree, []} <- where_or(tokens) do
+         {:ok, conj, tree, []} <- where_or(tokens),
+         :ok <- lone_literal(tree) do
       {:ok, conj, tree}
     else
       {:ok, _conj, _tree, _leftover} ->
@@ -85,6 +86,13 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
     end
   end
 
+  # A `WHERE` that is one literal which is no boolean is the planner's error.
+  @spec lone_literal(tree()) :: :ok | {:error, SQLError.t()}
+  defp lone_literal({:leaf, {:non_boolean, _operand, {expression, type}}}),
+    do: {:error, SQLPredicate.non_boolean_error(expression, type)}
+
+  defp lone_literal(_tree), do: :ok
+
   @typep where_token :: :lparen | :rparen | :and | :or | :not | {:pred, binary()}
 
   # Scans the clause text into grouping parentheses, the three keywords and
@@ -93,7 +101,7 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   # `BETWEEN a AND b`) stay inside its text; string literals are opaque.
   @spec tokenize_where(binary()) :: {:ok, [where_token()]} | {:error, map()}
   defp tokenize_where(str) do
-    scan_where(str, %{buf: "", depth: 0, between: false, tokens: []})
+    scan_where(str, %{buf: "", depth: 0, between: false, distinct: false, tokens: []})
   end
 
   @spec scan_where(binary(), map()) :: {:ok, [where_token()]} | {:error, map()}
@@ -178,6 +186,12 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   defp scan_keyword("AND", rest, %{between: true} = state),
     do: scan_where(rest, %{append(state, "AND") | between: false})
 
+  # The right side of `IS [NOT] DISTINCT FROM` takes whatever follows it at
+  # its depth, `AND` and `OR` included (verified: `n IS DISTINCT FROM 4 AND b`
+  # is `n IS DISTINCT FROM (4 AND b)`).
+  defp scan_keyword(word, rest, %{distinct: true} = state) when word in ["AND", "OR"],
+    do: scan_where(rest, append(state, word))
+
   defp scan_keyword("AND", rest, state), do: scan_where(rest, state |> flush_pred() |> emit(:and))
   defp scan_keyword("OR", rest, state), do: scan_where(rest, state |> flush_pred() |> emit(:or))
 
@@ -197,7 +211,8 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   defp append(state, text) do
     buf = state.buf <> text
     between = state.between or Regex.match?(~r/\bBETWEEN\s*$/iu, buf)
-    %{state | buf: buf, between: between}
+    distinct = state.distinct or Regex.match?(~r/\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\s*$/iu, buf)
+    %{state | buf: buf, between: between, distinct: distinct}
   end
 
   @spec emit(map(), where_token()) :: map()
@@ -206,8 +221,17 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   @spec flush_pred(map()) :: map()
   defp flush_pred(state) do
     case String.trim(state.buf) do
-      "" -> %{state | buf: "", between: false}
-      text -> %{state | buf: "", between: false, tokens: [{:pred, text} | state.tokens]}
+      "" ->
+        %{state | buf: "", between: false, distinct: false}
+
+      text ->
+        %{
+          state
+          | buf: "",
+            between: false,
+            distinct: false,
+            tokens: [{:pred, text} | state.tokens]
+        }
     end
   end
 
@@ -275,6 +299,16 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   # What a node reads
   # ---------------------------------------------------------------------------
 
+  @doc "The columns a `WHERE` tree uses as a condition on their own (`WHERE b AND n > 1`)."
+  @spec truthy_columns(tree()) :: [binary()]
+  def truthy_columns({:leaf, {:truthy, column, _nil}}), do: [column]
+
+  def truthy_columns({kind, left, right}) when kind in [:and, :or],
+    do: truthy_columns(left) ++ truthy_columns(right)
+
+  def truthy_columns({:not, inner}), do: truthy_columns(inner)
+  def truthy_columns(_leaf), do: []
+
   @doc """
   The arithmetic expressions a node holds, in the order written: the operands
   of a predicate that are expressions, and those of every predicate inside an
@@ -299,6 +333,10 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   @spec columns(node_t()) :: [binary()]
   def columns({:or, branches}), do: Enum.flat_map(branches, &conjunction_columns/1)
   def columns({:not, conjunction}), do: conjunction_columns(conjunction)
+
+  # The `NULL` literal read as a condition (`HAVING NULL`) is a comparison of `time` with
+  # null that never holds, and reads no column.
+  def columns({:eq, "time", nil}), do: []
 
   def columns({_op, left, _right} = clause) do
     own = if is_binary(left), do: [left], else: []

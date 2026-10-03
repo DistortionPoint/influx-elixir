@@ -22,7 +22,7 @@ defmodule InfluxElixir.Contract.SQLAggregates do
 
     * `:buckets` — DISTINCT, bucketed and scalar aggregates, COUNT
     * `:candles` — first_value/last_value, OHLCV candles, median
-    * `:statements` — CROSS JOIN, a failed stream, an unknown column, DML and DDL
+    * `:statements` — CROSS JOIN, a failed stream, a quoted operand, DML and DDL
   """
 
   @parts [:buckets, :candles, :statements]
@@ -55,6 +55,7 @@ defmodule InfluxElixir.Contract.SQLAggregates do
       {:buckets, distinct_tests()},
       {:buckets, bucket_tests()},
       {:buckets, count_tests()},
+      {:buckets, omission_tests()},
       {:candles, candle_tests()},
       {:candles, ordered_tests()},
       {:candles, median_tests()},
@@ -170,6 +171,49 @@ defmodule InfluxElixir.Contract.SQLAggregates do
                  ]
         end
 
+        test "hour, minutes and seconds all name the same one-hour bucket", ctx do
+          hour_us = div(sa_hour(), 1000)
+          start_us = div(sa_midnight(), 1000)
+
+          # One point half an hour into each hour: one point per bucket.
+          expected =
+            for hour <- 0..5 do
+              %{
+                "time" => DateTime.from_unix!(start_us + hour * hour_us, :microsecond),
+                "cnt" => 1
+              }
+            end
+
+          InfluxElixir.TestSupport.Check.each_case(
+            ["1 hour", "60 minutes", "3600 seconds"],
+            fn interval ->
+              sql = """
+              SELECT DATE_BIN(INTERVAL '#{interval}', time) AS time, COUNT(usage) AS cnt
+              FROM "cpu"
+              GROUP BY DATE_BIN(INTERVAL '#{interval}', time)
+              ORDER BY time ASC
+              """
+
+              assert sa_rows(ctx, sql) === expected
+            end
+          )
+        end
+
+        test "ORDER BY the bucket DESC lists the newest first, and LIMIT keeps the newest", ctx do
+          sql = """
+          SELECT DATE_BIN(INTERVAL '2 hours', time) AS time, COUNT(usage) AS cnt
+          FROM "cpu"
+          GROUP BY DATE_BIN(INTERVAL '2 hours', time)
+          ORDER BY time DESC
+          LIMIT 2
+          """
+
+          assert sa_rows(ctx, sql) === [
+                   %{"time" => ~U[2023-11-14 04:00:00.000000Z], "cnt" => 2},
+                   %{"time" => ~U[2023-11-14 02:00:00.000000Z], "cnt" => 2}
+                 ]
+        end
+
         test "a scalar aggregate honours WHERE; over no rows COUNT is 0 and AVG is omitted",
              ctx do
           assert sa_rows(
@@ -199,21 +243,73 @@ defmodule InfluxElixir.Contract.SQLAggregates do
 
           assert sa_rows(ctx, sql) === []
         end
+      end
+    end
+  end
 
-        test "a table that does not exist is the engine's planning error", ctx do
-          sql = """
-          SELECT DATE_BIN(INTERVAL '1 hour', time) AS time, AVG(usage) AS avg_usage
-          FROM "nonexistent"
-          GROUP BY DATE_BIN(INTERVAL '1 hour', time)
-          ORDER BY time ASC
-          """
+  defp omission_tests do
+    quote location: :keep do
+      describe "query_sql/3 — omitted nulls, integer arithmetic and now() contract" do
+        test "SELECT * and a column list leave out a column that is null for the row", ctx do
+          sa_write(ctx, [
+            "m,provider=a,symbol=X value=1.0 1000000000",
+            "m,provider=b,symbol=Y value=3.0 3000000000",
+            "m,provider=b,symbol=Y other=4.0 4000000000"
+          ])
 
-          assert sa_query(ctx, sql) ===
-                   {:error,
-                    %{
-                      status: 400,
-                      body: "Error during planning: table 'public.iox.nonexistent' not found"
-                    }}
+          assert sa_rows(ctx, ~s|SELECT * FROM "m" WHERE provider = 'b' ORDER BY time|) === [
+                   %{
+                     "provider" => "b",
+                     "symbol" => "Y",
+                     "value" => 3.0,
+                     "time" => ~U[1970-01-01 00:00:03.000000Z]
+                   },
+                   %{
+                     "provider" => "b",
+                     "symbol" => "Y",
+                     "other" => 4.0,
+                     "time" => ~U[1970-01-01 00:00:04.000000Z]
+                   }
+                 ]
+
+          assert sa_rows(ctx, ~s|SELECT provider, other FROM "m" WHERE provider = 'a'|) ===
+                   [%{"provider" => "a"}]
+        end
+
+        test "a selector over no rows leaves the column out", ctx do
+          sa_write(ctx, ["m,symbol=X value=1.0 1000000000"])
+
+          assert sa_rows(
+                   ctx,
+                   ~s|SELECT selector_last(value, time)['value'] AS v FROM "m" | <>
+                     ~s|WHERE symbol = 'nope'|
+                 ) === [%{}]
+        end
+
+        test "integer operands divide as integers", ctx do
+          sa_write(ctx, ["ints n=3i 1000000000", "ints n=5i 2000000000"])
+
+          assert sa_rows(
+                   ctx,
+                   ~s|SELECT SUM(n / 2) AS halves, SUM(n * n) AS squares, AVG(n) AS a FROM "ints"|
+                 ) === [%{"halves" => 3, "squares" => 34, "a" => 4.0}]
+        end
+
+        test "now() arithmetic chains intervals and is case-insensitive", ctx do
+          now_ns = System.os_time(:nanosecond)
+
+          sa_write(ctx, [
+            "q price=1.0 #{now_ns - 60_000_000_000}",
+            "q price=2.0 #{now_ns - 600_000_000_000}",
+            "q price=3.0 #{now_ns - 3_600_000_000_000}",
+            "q price=4.0 #{now_ns - 7_200_000_000_000}"
+          ])
+
+          sql =
+            ~s|SELECT price FROM "q" WHERE time >= now() - INTERVAL '1 hour' - INTERVAL '30 minutes' | <>
+              ~s|AND time < NOW() + INTERVAL '1 day' ORDER BY price|
+
+          assert sa_rows(ctx, sql) === [%{"price" => 1.0}, %{"price" => 2.0}, %{"price" => 3.0}]
         end
       end
     end
@@ -264,12 +360,21 @@ defmodule InfluxElixir.Contract.SQLAggregates do
                    [%{"n" => 6, "p" => 5}]
         end
 
-        test "COUNT(DISTINCT col) is 0 over no rows and counts per group", ctx do
+        test "COUNT(DISTINCT col) counts distinct non-null values", ctx do
+          assert sa_rows(
+                   ctx,
+                   ~s|SELECT COUNT(DISTINCT provider) AS n, COUNT(DISTINCT bid) AS b FROM "quotes"|
+                 ) === [%{"n" => 3, "b" => 2}]
+        end
+
+        test "COUNT(DISTINCT col) is 0 over no rows", ctx do
           assert sa_rows(
                    ctx,
                    ~s|SELECT COUNT(DISTINCT provider) AS n FROM "quotes" WHERE provider = 'zzz'|
                  ) === [%{"n" => 0}]
+        end
 
+        test "COUNT(DISTINCT col) counts per group", ctx do
           assert sa_rows(
                    ctx,
                    ~s|SELECT provider, COUNT(DISTINCT symbol) AS n FROM "quotes" | <>
@@ -415,14 +520,72 @@ defmodule InfluxElixir.Contract.SQLAggregates do
       describe "query_sql/3 — median per bucket contract" do
         setup ctx do
           sa_write(ctx, [
-            "p,symbol=X,provider=a price=1.0 1700000000000000000",
-            "p,symbol=X,provider=a price=2.5 1700000010000000000",
-            "p,symbol=X,provider=a price=3.0 1700000070000000000",
-            "p,symbol=X,provider=a price=4.0 1700000080000000000",
-            "p,symbol=X,provider=a price=100.0 1700000090000000000",
+            "p,symbol=X,provider=a price=1.0,volume=10.0 1700000000000000000",
+            "p,symbol=X,provider=a price=2.5,volume=20.0 1700000010000000000",
+            "p,symbol=X,provider=a price=3.0,volume=30.0 1700000070000000000",
+            "p,symbol=X,provider=a price=4.0,volume=40.0 1700000080000000000",
+            "p,symbol=X,provider=a price=100.0,volume=1.0 1700000090000000000",
             "q n=1i 1700000000000000000",
-            "q n=2i 1700000001000000000"
+            "q n=2i 1700000001000000000",
+            "q n=3i 1700000002000000000",
+            "q n=4i 1700000003000000000"
           ])
+        end
+
+        test "median over a float field and over an expression", ctx do
+          assert sa_rows(
+                   ctx,
+                   ~s|SELECT median(price) AS med, median(volume) AS mv, | <>
+                     ~s|median(price * 2) AS twice FROM "p"|
+                 ) === [%{"med" => 3.0, "mv" => 20.0, "twice" => 6.0}]
+        end
+
+        test "median of integers is an integer", ctx do
+          assert sa_rows(ctx, ~s|SELECT median(n) AS med FROM "q"|) === [%{"med" => 2}]
+        end
+
+        test "median over no rows leaves the column out", ctx do
+          assert sa_rows(ctx, ~s|SELECT median(price) AS med FROM "p" WHERE price > 1000|) ===
+                   [%{}]
+        end
+
+        test "a median screens the outlier out of a candle", ctx do
+          sql = """
+          WITH w AS (SELECT price, volume, time FROM p WHERE symbol = 'X'),
+          ref AS (SELECT median(price) AS med FROM w)
+          SELECT
+            DATE_BIN(INTERVAL '1 minute', w.time) AS time,
+            selector_first(w.price, w.time)['value'] AS open,
+            max(w.price) AS high,
+            min(w.price) AS low,
+            selector_last(w.price, w.time)['value'] AS close,
+            sum(w.volume) AS volume
+          FROM w CROSS JOIN ref
+          WHERE ref.med <= 0 OR (w.price <= ref.med * 3 AND w.price >= ref.med / 3)
+          GROUP BY DATE_BIN(INTERVAL '1 minute', w.time)
+          ORDER BY time ASC
+          """
+
+          # The 100.0 outlier (median 3.0, bound 9.0) is screened out of the second
+          # candle; the bins are the minutes the points fall in.
+          assert sa_rows(ctx, sql) === [
+                   %{
+                     "time" => ~U[2023-11-14 22:13:00.000000Z],
+                     "open" => 1.0,
+                     "high" => 2.5,
+                     "low" => 1.0,
+                     "close" => 2.5,
+                     "volume" => 30.0
+                   },
+                   %{
+                     "time" => ~U[2023-11-14 22:14:00.000000Z],
+                     "open" => 3.0,
+                     "high" => 4.0,
+                     "low" => 3.0,
+                     "close" => 4.0,
+                     "volume" => 70.0
+                   }
+                 ]
         end
 
         test "the mean of the two middles, over a filter and per minute", ctx do
@@ -482,24 +645,6 @@ defmodule InfluxElixir.Contract.SQLAggregates do
           assert rows |> Enum.map(& &1["price"]) |> Enum.frequencies() ===
                    %{1.0 => 2, 2.5 => 2, 3.0 => 2}
         end
-
-        test "a time both sides carry is ambiguous", ctx do
-          assert sa_query(ctx, ~s|SELECT price, time FROM "p" CROSS JOIN "q"|) ===
-                   {:error,
-                    %{
-                      status: 500,
-                      body: "Schema error: Ambiguous reference to unqualified field time"
-                    }}
-        end
-
-        test "a table that does not exist is the engine's planning error", ctx do
-          assert sa_query(ctx, ~s|SELECT price FROM "p" CROSS JOIN nope|) ===
-                   {:error,
-                    %{
-                      status: 400,
-                      body: "Error during planning: table 'public.iox.nope' not found"
-                    }}
-        end
       end
     end
   end
@@ -558,51 +703,61 @@ defmodule InfluxElixir.Contract.SQLAggregates do
           test "DML is the engine's planning error, whatever the kind", ctx do
             sa_write(ctx, ["cpu v=1i 1700000000000000000"])
 
-            for {sql, kind} <- [
-                  {"DELETE FROM cpu", "Delete"},
-                  {"delete from cpu where v = 1", "Delete"},
-                  {"INSERT INTO cpu (time, v) VALUES ('2023-11-14T22:13:20Z', 5)", "Insert Into"},
-                  {"UPDATE cpu SET v = 2", "Update"}
-                ] do
-              assert sa_execute(ctx, sql) ===
-                       {:error,
-                        %{
-                          status: 400,
-                          body: "Error during planning: DML not supported: " <> kind
-                        }},
-                     sql
-            end
+            InfluxElixir.TestSupport.Check.each_case(
+              [
+                {"DELETE FROM cpu", "Delete"},
+                {"delete from cpu where v = 1", "Delete"},
+                {"INSERT INTO cpu (time, v) VALUES ('2023-11-14T22:13:20Z', 5)", "Insert Into"},
+                {"UPDATE cpu SET v = 2", "Update"}
+              ],
+              fn {sql, kind} ->
+                assert sa_execute(ctx, sql) ===
+                         {:error,
+                          %{
+                            status: 400,
+                            body: "Error during planning: DML not supported: " <> kind
+                          }},
+                       sql
+              end
+            )
           end
 
           test "DDL is the engine's planning error; anything else is its 405", ctx do
             sa_write(ctx, ["cpu v=1i 1700000000000000000"])
 
-            for {sql, kind} <- [
-                  {"CREATE TABLE foo (id INT)", "CreateMemoryTable"},
-                  {"CREATE VIEW vv AS SELECT * FROM cpu", "CreateView"},
-                  {"CREATE DATABASE x", "CreateCatalog"},
-                  {"DROP TABLE cpu", "DropTable"},
-                  {"DROP VIEW vv", "DropView"}
-                ] do
-              assert sa_execute(ctx, sql) ===
-                       {:error,
-                        %{
-                          status: 400,
-                          body: "Error during planning: DDL not supported: " <> kind
-                        }},
-                     sql
-            end
+            InfluxElixir.TestSupport.Check.each_case(
+              [
+                {"CREATE TABLE foo (id INT)", "CreateMemoryTable"},
+                {"CREATE VIEW vv AS SELECT * FROM cpu", "CreateView"},
+                {"CREATE DATABASE x", "CreateCatalog"},
+                {"DROP TABLE cpu", "DropTable"},
+                {"DROP VIEW vv", "DropView"}
+              ],
+              fn {sql, kind} ->
+                assert sa_execute(ctx, sql) ===
+                         {:error,
+                          %{
+                            status: 400,
+                            body: "Error during planning: DDL not supported: " <> kind
+                          }},
+                       sql
+              end
+            )
 
-            for sql <- ["ALTER TABLE cpu ADD COLUMN y INT", "TRUNCATE cpu"] do
-              assert sa_execute(ctx, sql) ===
-                       {:error,
-                        %{
-                          status: 405,
-                          body:
-                            "This feature is not implemented: Unsupported SQL statement: " <> sql
-                        }},
-                     sql
-            end
+            InfluxElixir.TestSupport.Check.each_case(
+              ["ALTER TABLE cpu ADD COLUMN y INT", "TRUNCATE cpu"],
+              fn sql ->
+                assert sa_execute(ctx, sql) ===
+                         {:error,
+                          %{
+                            status: 405,
+                            body:
+                              "This feature is not implemented: Unsupported SQL statement: " <>
+                                sql
+                          }},
+                       sql
+              end
+            )
           end
         end
       end

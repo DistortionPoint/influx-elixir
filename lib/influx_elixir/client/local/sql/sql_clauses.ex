@@ -34,7 +34,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
 
   @limit_start SQLLimit.start_source()
 
-  @group_clause ~r/(?i)(\bGROUP\s+BY\s+)(.+?)(?=\s+ORDER\b|\s+#{@limit_start}|\s*$)/su
+  @group_clause ~r/(?i)(\bGROUP\s+BY\s+)(.+?)(?=\s+HAVING\b|\s+ORDER\b|\s+#{@limit_start}|\s*$)/su
   @order_clause ~r/(?i)(\bORDER\s+BY\s+)(.+?)(?=\s+#{@limit_start}|\s*$)/su
 
   @doc """
@@ -228,25 +228,111 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   defp group_by_items(sql) do
     case SQLMask.run(@group_clause, sql) do
       [_full, _keyword, list] ->
-        list |> SQLMask.split_commas() |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+        list
+        |> SQLMask.split_commas()
+        |> Enum.map(&(&1 |> String.trim() |> unparenthesize()))
+        |> Enum.reject(&(&1 == ""))
 
       nil ->
         []
     end
   end
 
+  # `GROUP BY (n)` and `GROUP BY ((n))` group by `n`; a tuple, `(n, x)`, is
+  # left as written.
+  @spec unparenthesize(binary()) :: binary()
+  defp unparenthesize("(" <> inner = item) do
+    with {:ok, body, ""} <- SQLMask.balanced(inner),
+         [_single] <- SQLMask.split_commas(body),
+         trimmed when trimmed != "" <- String.trim(body) do
+      unparenthesize(trimmed)
+    else
+      _tuple_or_empty -> item
+    end
+  end
+
+  defp unparenthesize(item), do: item
+
+  @doc """
+  The refusal of a `GROUP BY` that holds a tuple (`GROUP BY (n, x)`): the
+  engine groups by a struct of them, which the double does not model.
+  """
+  @spec check_group_items(binary()) :: :ok | {:error, SQLError.t()}
+  def check_group_items(sql) do
+    items = group_by_items(sql)
+
+    cond do
+      Enum.any?(items, &tuple?/1) ->
+        {:error, SQLError.refusal("a tuple in GROUP BY: it groups by a struct of its items")}
+
+      Enum.any?(items, &SQLSelect.constant/1) ->
+        {:error, SQLError.refusal("a constant in GROUP BY: it groups every row as one")}
+
+      true ->
+        :ok
+    end
+  end
+
+  @spec tuple?(binary()) :: boolean()
+  defp tuple?("(" <> inner) do
+    case SQLMask.balanced(inner) do
+      {:ok, body, ""} -> match?([_, _ | _], SQLMask.split_commas(body)) and body != ""
+      _other -> false
+    end
+  end
+
+  defp tuple?(_item), do: false
+
   @spec date_bin_item?(binary()) :: boolean()
   defp date_bin_item?(item), do: Regex.match?(~r/^DATE_BIN\s*\(/iu, item)
 
+  @spec empty_tuple?(binary()) :: boolean()
+  defp empty_tuple?(item), do: Regex.match?(~r/\A\(\s*\)\z/u, item)
+
   @doc """
-  The bare-column `GROUP BY` items of a statement (a quoted name as the name
-  it holds), or `nil` when there are none.
+  The engine's 405 for a `GROUP BY` with an empty tuple (`GROUP BY ()`), or
+  `nil`. It is found after the tables and columns are, and before the
+  grouping is checked.
   """
-  @spec group_columns(binary()) :: [binary()] | nil
+  @spec empty_tuple_error(binary()) :: SQLError.t() | nil
+  def empty_tuple_error(sql) do
+    if Enum.any?(group_by_items(sql), &empty_tuple?/1),
+      do: %{status: 405, body: "This feature is not implemented: Empty tuple not supported yet"}
+  end
+
+  @doc """
+  The `GROUP BY` items of a statement that are not its `DATE_BIN` bucket: a
+  column (a quoted name as the name it holds) or an expression
+  (`{:expr, expr}`); `nil` when there are none.
+  """
+  @spec group_columns(binary()) ::
+          {:ok, [binary() | {:expr, SQLExpr.t()}] | nil} | {:error, SQLError.t()}
   def group_columns(sql) do
-    case sql |> group_by_items() |> Enum.reject(&date_bin_item?/1) do
-      [] -> nil
-      columns -> Enum.map(columns, &SQLSelect.name/1)
+    items = sql |> group_by_items() |> Enum.reject(&(date_bin_item?(&1) or empty_tuple?(&1)))
+
+    items
+    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+      case group_item(item) do
+        {:ok, parsed} -> {:cont, {:ok, [parsed | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, []} -> {:ok, nil}
+      {:ok, parsed} -> {:ok, Enum.reverse(parsed)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @spec group_item(binary()) :: {:ok, binary() | {:expr, SQLExpr.t()}} | {:error, SQLError.t()}
+  defp group_item(item) do
+    if Regex.match?(~r/\A(?:\w+|"(?:[^"]|"")*")\z/u, item) do
+      {:ok, SQLSelect.name(item)}
+    else
+      case SQLExpr.parse(item) do
+        {:ok, expr} -> {:ok, {:expr, expr}}
+        {:error, _reason} -> {:error, SQLError.refusal("unsupported GROUP BY: #{item}")}
+      end
     end
   end
 

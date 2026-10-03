@@ -28,7 +28,7 @@ defmodule InfluxElixir.Contract.SQLParser do
     * `:parameters` — bound parameters
   """
 
-  @parts [:literals_time, :functions_text, :names_select, :parameters]
+  @parts [:literals_time, :functions_text, :names_select, :parameters, :modelled]
 
   @doc false
   defmacro __using__(opts) do
@@ -94,6 +94,8 @@ defmodule InfluxElixir.Contract.SQLParser do
       {:functions_text, limit_tests()},
       {:functions_text, function_tests()},
       {:functions_text, trunc_tests()},
+      {:modelled, modelled_tests()},
+      {:modelled, modelled_error_tests()},
       {:functions_text, parenthesised_name_tests()},
       {:literals_time, time_limit_tests()},
       {:names_select, cte_edge_tests()},
@@ -544,19 +546,15 @@ defmodule InfluxElixir.Contract.SQLParser do
           end
         end
 
-        @tag local_divergence: "Local refuses a comparison in the select list by name"
-        test "a comparison in the select list is the same error, or refused by name", ctx do
+        test "a comparison in the select list is the same error", ctx do
           m = sp_measurement("sp_timeselect")
           sp_write(ctx, ["#{m} v=1 #{sp_ns(0)}"])
 
           expected =
-            if sp_local?(),
-              do: "Client.Local: unsupported column: time > $t as x",
-              else:
-                sp_coercion(
-                  "Cannot infer common argument type for comparison operation " <>
-                    "Timestamp(ns) > UInt64"
-                )
+            sp_coercion(
+              "Cannot infer common argument type for comparison operation " <>
+                "Timestamp(ns) > UInt64"
+            )
 
           assert sp_query(ctx, "select time > $t as x from #{m}", %{t: 0}) ===
                    {:error, %{status: 400, body: expected}}
@@ -2927,11 +2925,11 @@ defmodule InfluxElixir.Contract.SQLParser do
         test "a function the double does not model is refused by name, or answered", ctx do
           m = sp_fixture(ctx)
 
-          result = sp_query(ctx, "SELECT sqrt(f) FROM #{m} ORDER BY time LIMIT 1")
+          result = sp_query(ctx, "SELECT cbrt(f) FROM #{m} ORDER BY time LIMIT 1")
 
           if sp_local?(),
             do: assert({:error, %{status: 400, body: "Client.Local: " <> _reason}} = result),
-            else: assert(result === {:ok, [%{"sqrt(#{m}.f)" => 1.224744871391589}]})
+            else: assert(result === {:ok, [%{"cbrt(#{m}.f)" => 1.1447142425533319}]})
         end
 
         @tag local_divergence: "Local refuses a binary value by name"
@@ -2942,6 +2940,239 @@ defmodule InfluxElixir.Contract.SQLParser do
           if sp_local?(),
             do: assert({:error, %{status: 400, body: "Client.Local: " <> _reason}} = result),
             else: assert(result === {:ok, [%{"v" => 1}, %{"v" => 3}]})
+        end
+      end
+    end
+  end
+
+  defp modelled_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: expressions, functions and the engine's errors" do
+        defp sp_modelled(ctx) do
+          m = sp_measurement("sp_mod")
+
+          rows = [
+            "host=h0,region=r0 n=0i,x=0.0,s=\"s0\",b=true,v=-20i",
+            "host=h1,region=r1 n=1i,x=1.5,s=\"s1\",b=false,v=-10i",
+            "host=h2,region=r0 n=2i,x=3.0,s=\"s2\",b=true,v=0i",
+            "host=h0,region=r1 n=3i,x=4.5,b=false,v=10i",
+            "host=h1,region=r0 n=4i,x=6.0,s=\"s0\",b=true,v=20i",
+            "host=h2,region=r1 x=7.5,s=\"s1\",b=false,v=30i",
+            "host=h0,region=r0 n=6i,x=9.0,s=\"s2\",b=true,v=40i",
+            "host=h1,region=r1 n=7i,b=false,v=50i",
+            "host=h2,region=r0 n=8i,x=12.0,s=\"s0\",b=true,v=60i",
+            "host=h0,region=r1 n=9i,x=13.5,s=\"s1\",b=false,v=70i",
+            "host=h1,region=r0 n=10i,x=15.0,s=\"s2\",b=true,v=80i",
+            "host=h2,region=r1 n=11i,x=16.5,b=false,v=90i"
+          ]
+
+          lines =
+            rows
+            |> Enum.with_index()
+            |> Enum.map(fn {row, i} ->
+              [tags, fields] = String.split(row, " ", parts: 2)
+              "#{m},#{tags} #{fields} #{sp_ns(i * 30)}"
+            end)
+
+          sp_write(ctx, lines)
+          m
+        end
+
+        test "CASE, COALESCE and NULLIF answer as the engine does", ctx do
+          m = sp_modelled(ctx)
+
+          assert sp_query(
+                   ctx,
+                   "SELECT n, CASE WHEN n < 3 THEN 'low' WHEN n < 8 THEN 'mid' ELSE 'high' END " <>
+                     "AS k FROM #{m} WHERE n IS NOT NULL ORDER BY n LIMIT 4"
+                 ) ===
+                   {:ok,
+                    [
+                      %{"n" => 0, "k" => "low"},
+                      %{"n" => 1, "k" => "low"},
+                      %{"n" => 2, "k" => "low"},
+                      %{"n" => 3, "k" => "mid"}
+                    ]}
+
+          assert sp_query(
+                   ctx,
+                   "SELECT coalesce(n, -1) AS c, nullif(n, 3) AS z FROM #{m} ORDER BY time LIMIT 5"
+                 ) ===
+                   {:ok,
+                    [
+                      %{"c" => 0, "z" => 0},
+                      %{"c" => 1, "z" => 1},
+                      %{"c" => 2, "z" => 2},
+                      %{"c" => 3},
+                      %{"c" => 4, "z" => 4}
+                    ]}
+        end
+
+        test "an expression of aggregates, HAVING and an implicit alias", ctx do
+          m = sp_modelled(ctx)
+
+          assert sp_query(
+                   ctx,
+                   "SELECT sum(n) / count(n) AS r, max(x) - min(x) AS spread FROM #{m}"
+                 ) === {:ok, [%{"r" => 5, "spread" => 16.5}]}
+
+          assert sp_query(
+                   ctx,
+                   "SELECT host, sum(n) + 1 AS s FROM #{m} GROUP BY host HAVING sum(n) > 10 " <>
+                     "ORDER BY host"
+                 ) ===
+                   {:ok,
+                    [
+                      %{"host" => "h0", "s" => 19},
+                      %{"host" => "h1", "s" => 23},
+                      %{"host" => "h2", "s" => 22}
+                    ]}
+
+          assert sp_query(ctx, "SELECT n a FROM #{m} WHERE n < 3 ORDER BY a") ===
+                   {:ok, [%{"a" => 0}, %{"a" => 1}, %{"a" => 2}]}
+
+          assert sp_query(ctx, "SELECT 1 + 1 two") === {:ok, [%{"two" => 2}]}
+        end
+
+        test "string and math functions, in the select list and in WHERE", ctx do
+          m = sp_modelled(ctx)
+
+          assert sp_query(
+                   ctx,
+                   "SELECT lower(s) AS l, upper(s) AS u, length(s) AS len, substr(s, 2) AS sub " <>
+                     "FROM #{m} WHERE s = 's1' LIMIT 1"
+                 ) === {:ok, [%{"l" => "s1", "u" => "S1", "len" => 2, "sub" => "1"}]}
+
+          assert sp_query(ctx, "SELECT n FROM #{m} WHERE starts_with(s, 's1') ORDER BY n") ===
+                   {:ok, [%{"n" => 1}, %{"n" => 9}, %{}]}
+
+          assert sp_query(ctx, "SELECT sqrt(x) AS r, pow(n, 2) AS p FROM #{m} WHERE n = 4") ===
+                   {:ok, [%{"r" => 2.449489742783178, "p" => 16}]}
+
+          assert sp_query(ctx, "SELECT n FROM #{m} WHERE abs(v) > 50 ORDER BY n") ===
+                   {:ok, [%{"n" => 8}, %{"n" => 9}, %{"n" => 10}, %{"n" => 11}]}
+
+          assert sp_query(
+                   ctx,
+                   "SELECT n FROM #{m} WHERE lower(s) = 's0' OR length(s) > 5 ORDER BY n"
+                 ) === {:ok, [%{"n" => 0}, %{"n" => 4}, %{"n" => 8}]}
+
+          assert {:error, %{status: 400, body: body}} =
+                   sp_query(ctx, "SELECT sqrt(host) FROM #{m}")
+
+          assert String.starts_with?(
+                   body,
+                   "Error during planning: Failed to coerce arguments to satisfy a call to " <>
+                     "'sqrt' function: coercion from Dictionary(Int32, Utf8) to the signature " <>
+                     "Uniform(1, [Float64, Float32]) failed"
+                 )
+        end
+      end
+    end
+  end
+
+  defp modelled_error_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: the engine's errors for what the double models" do
+        test "IS TRUE answers; IS DISTINCT FROM swallows what follows it", ctx do
+          m = sp_modelled(ctx)
+
+          assert sp_query(ctx, "SELECT n FROM #{m} WHERE b IS TRUE ORDER BY n LIMIT 3") ===
+                   {:ok, [%{"n" => 0}, %{"n" => 2}, %{"n" => 4}]}
+
+          assert sp_query(ctx, "SELECT n FROM #{m} WHERE n IS DISTINCT FROM 3 AND n < 5") ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body:
+                        "type_coercion\ncaused by\nError during planning: Cannot infer common " <>
+                          "argument type for logical boolean operation Int64 AND Boolean"
+                    }}
+        end
+
+        test "a WHERE that is not a boolean, and LIKE over a time, are the planner's errors",
+             ctx do
+          m = sp_modelled(ctx)
+
+          assert sp_query(ctx, "SELECT n FROM #{m} WHERE 5 AND n > 1") ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body:
+                        "type_coercion\ncaused by\nError during planning: Cannot infer common " <>
+                          "argument type for logical boolean operation Int64 AND Boolean"
+                    }}
+
+          assert sp_query(ctx, "SELECT n FROM #{m} WHERE time LIKE '2026%'") ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body:
+                        "type_coercion\ncaused by\nError during planning: There isn't a common " <>
+                          "type to coerce Timestamp(ns) and Utf8 in LIKE expression"
+                    }}
+
+          assert sp_query(ctx, "SELECT n FROM #{m} GROUP BY ()") ===
+                   {:error,
+                    %{
+                      status: 405,
+                      body: "This feature is not implemented: Empty tuple not supported yet"
+                    }}
+        end
+
+        test "an unfinished clause is the engine's parser error", ctx do
+          m = sp_modelled(ctx)
+
+          for sql <- [
+                "SELECT n FROM #{m} WHERE",
+                "SELECT n FROM #{m} ORDER BY",
+                "SELECT n FROM #{m} WHERE n = "
+              ] do
+            assert sp_query(ctx, sql) ===
+                     {:error,
+                      %{
+                        status: 400,
+                        body: ~s|SQL error: ParserError("Expected: an expression, found: EOF")|
+                      }},
+                   sql
+          end
+        end
+
+        test "qualified table names and information_schema", ctx do
+          m = sp_modelled(ctx)
+
+          assert sp_query(ctx, "SELECT n FROM public.iox.#{m} WHERE n < 2 ORDER BY n") ===
+                   {:ok, [%{"n" => 0}, %{"n" => 1}]}
+
+          assert sp_query(ctx, "SELECT n FROM nosuch.iox.#{m}") ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body: "Error during planning: table 'nosuch.iox.#{m}' not found"
+                    }}
+
+          assert sp_query(
+                   ctx,
+                   "SELECT table_name FROM information_schema.tables WHERE table_schema = 'iox' " <>
+                     "AND table_name = '#{m}'"
+                 ) === {:ok, [%{"table_name" => m}]}
+
+          assert sp_query(
+                   ctx,
+                   "SELECT column_name, data_type FROM information_schema.columns " <>
+                     "WHERE table_name = '#{m}' ORDER BY column_name"
+                 ) ===
+                   {:ok,
+                    [
+                      %{"column_name" => "b", "data_type" => "Boolean"},
+                      %{"column_name" => "host", "data_type" => "Dictionary(Int32, Utf8)"},
+                      %{"column_name" => "n", "data_type" => "Int64"},
+                      %{"column_name" => "region", "data_type" => "Dictionary(Int32, Utf8)"},
+                      %{"column_name" => "s", "data_type" => "Utf8"},
+                      %{"column_name" => "time", "data_type" => "Timestamp(ns)"},
+                      %{"column_name" => "v", "data_type" => "Int64"},
+                      %{"column_name" => "x", "data_type" => "Float64"}
+                    ]}
         end
       end
     end

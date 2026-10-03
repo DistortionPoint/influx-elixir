@@ -7,7 +7,7 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
   # use is recorded: the engine names a column it cannot find as it was written
   # (`t.nosuch`).
 
-  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLLiteral, SQLMask}
+  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLLiteral, SQLMask, SQLTable}
 
   # `FROM w CROSS JOIN ref [AS r]`: the right side is taken out of the text
   # (the rest of the parser sees one table) and recorded with its alias so
@@ -23,7 +23,7 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
   """
   @spec split_cross_join(binary()) :: {binary(), {binary(), [binary()]} | nil}
   def split_cross_join(sql) do
-    case Regex.run(@cross_join_pattern, SQLMask.mask(sql), return: :index) do
+    case Regex.run(@cross_join_pattern, hidden_mask(sql), return: :index) do
       [{start, length}, left, table | alias_name] ->
         name = sql |> SQLMask.cut(table) |> table_name()
         names = [name | Enum.map(alias_name, &SQLMask.cut(sql, &1))]
@@ -57,7 +57,7 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
         nil -> []
       end
 
-    case Regex.run(@from_alias_pattern, SQLMask.mask(sql), return: :index) do
+    case Regex.run(@from_alias_pattern, hidden_mask(sql), return: :index) do
       [{start, length}, from_clause, _table, alias_name] ->
         # The alias (with its `AS`) is whatever follows the table in the match.
         {from_start, from_length} = from_clause
@@ -75,13 +75,25 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
 
       [_full, _from_clause, table] ->
         table_text = table_name(SQLMask.cut(sql, table))
-        {text, qualified} = drop_qualifiers(sql, [table_text | joined_names])
+        also = table_qualifiers(SQLMask.cut(sql, table), table_text)
+        {text, qualified} = drop_qualifiers(sql, [table_text | also] ++ joined_names)
         {text, table_text, qualified}
 
       nil ->
         {sql, "", %{}}
     end
   end
+
+  # A bare table is also known by the tails of its full name (`m` is
+  # `iox.m` and `public.iox.m`); a quoted one only by its name.
+  @spec table_qualifiers(binary(), binary()) :: [binary()]
+  defp table_qualifiers("\"" <> _quoted, _table_text), do: []
+  defp table_qualifiers(_raw, table_text), do: SQLTable.qualifiers(table_text)
+
+  # The text with its strings blanked and the `FROM` of a function and of
+  # `IS DISTINCT FROM` hidden: what is left is the `FROM` of the query.
+  @spec hidden_mask(binary()) :: binary()
+  defp hidden_mask(sql), do: sql |> SQLMask.mask() |> SQLMask.hide_inner_from()
 
   # A table as the engine names it: a quoted one without its quotes, a
   # doubled quote one quote.

@@ -46,7 +46,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # A clause keyword inside what the clause regex took for the `WHERE` means
   # the clause after it is malformed: the condition ends there, and that
   # clause is what the engine reads next.
-  @clause_keyword ~r/\b(?:GROUP|ORDER|LIMIT|OFFSET)\b/i
+  @clause_keyword ~r/\b(?:GROUP|ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b/i
 
   @spec cut_where(binary(), binary()) :: {binary() | nil, {non_neg_integer()} | nil}
   @doc false
@@ -103,7 +103,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       text =~ ~r/^ORDER\s+BY/i ->
         check_order(text, start, whole)
 
-      text =~ ~r/^(?:LIMIT|OFFSET)(?![\w])/i ->
+      text =~ ~r/^(?:S?LIMIT|S?OFFSET)(?![\w])/i ->
         check_count(text, start, whole)
 
       text =~ ~r/^GROUP(?![\w])/i ->
@@ -113,7 +113,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
         {:error, {:engine, InfluxQLError.syntax_error_body(:nom, start, whole)}}
 
       true ->
-        {:error, "invalid clauses"}
+        {:error, :unread_order}
     end
   end
 
@@ -127,7 +127,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
 
     cond do
       after_by =~ ~r/^(?:time|asc|desc)(?![\w])/i ->
-        {:error, "invalid clauses"}
+        {:error, :unread_order}
 
       InfluxQLText.reserved_start(after_by) == nil and after_by =~ ~r/^[A-Za-z_]/ ->
         {:error, {:engine, InfluxQLError.syntax_error_body(:order_time, start + size, whole)}}
@@ -141,14 +141,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # unsigned integer", where it starts; nothing leaves the clause unparsed.
   @spec check_count(binary(), non_neg_integer(), binary()) :: {:error, term()}
   defp check_count(text, start, whole) do
-    [_all, {word, _word_size}, {at, _blank}, {_rest_at, rest_size}] =
-      Regex.run(~r/^(LIMIT|OFFSET)\s*()(.*)$/is, text, return: :index)
+    [_all, {word, word_size}, {at, _blank}, {_rest_at, rest_size}] =
+      Regex.run(~r/^(S?LIMIT|S?OFFSET)\s*()(.*)$/is, text, return: :index)
 
-    kind = if text |> binary_part(word, 1) |> String.upcase() == "L", do: :limit, else: :offset
+    kind = text |> binary_part(word, word_size) |> String.downcase() |> String.to_existing_atom()
 
     cond do
       rest_size == 0 -> {:error, {:engine, InfluxQLError.syntax_error_body(:nom, start, whole)}}
-      binary_part(text, at, 1) =~ ~r/\d/ -> {:error, "invalid clauses"}
+      binary_part(text, at, 1) =~ ~r/\d/ -> {:error, :unread_order}
       true -> {:error, {:engine, InfluxQLError.syntax_error_body(kind, start + at, whole)}}
     end
   end
@@ -161,7 +161,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
         {:error, {:engine, InfluxQLError.syntax_error_body(:nom, start, whole)}}
 
       text =~ ~r/^GROUP\s+BY(?![\w])/i ->
-        {:error, "invalid clauses"}
+        {:error, :unread_order}
 
       true ->
         [{_at, size}] = Regex.run(~r/^GROUP\s*/i, text, return: :index)
@@ -345,7 +345,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   def check_unsigned(whole, at, masked_rest) do
     indexes = Regex.named_captures(InfluxQLText.clauses(), masked_rest, return: :index)
 
-    Enum.find_value(["limit", "offset"], :ok, fn clause ->
+    Enum.find_value(["limit", "offset", "slimit", "soffset"], :ok, fn clause ->
       with {from, length} when from >= 0 <- indexes[clause],
            digits = binary_part(masked_rest, from, length),
            true <- String.to_integer(digits) > SQLLimits.uint64_max() do

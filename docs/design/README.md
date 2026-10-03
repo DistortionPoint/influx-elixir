@@ -67,6 +67,8 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-10-02 | [`fourth-review`](2026-10-02_fourth-review.md) | Local: float overflow answers null, UInt64 columns typed, `INTEGER` casts are Int32, failing constants fold to the optimizer's 500, executor split; InfluxQL reserved words and second statements; re-entrant lock raises; whole-result `===` assertions, clock-free backpressure test |
 | 2026-10-02 | [`third-review`](2026-10-02_third-review.md) | Local: unaliased aggregates named as DataFusion names them, empty time and numeric ranges fail as on Core, qualified field lists, number literals, UTC aliases; InfluxQL parse errors and `GROUP BY` order; store locks without `:global`; strict `===` in contract tests |
 | 2026-10-02 | [`local-write-concurrency-retention-and-mixed-types`](2026-10-02_local-write-concurrency-retention-and-mixed-types.md) | Local: batched store writes (50 concurrent writers in 0.4 s, was a timeout), bounded chunked parse, v2 retention 422, mixed field types cut at the first differing group, `delete_bucket` clears data |
+| 2026-10-03 | [`seventh-review`](2026-10-03_seventh-review.md) | Review of 69cf692: InfluxQL GROUP BY wrong answers and fill(none) hang fixed, dashboard refusal rates cut (InfluxQL 37%→2.4%, SQL 57%→23%), retention modelled, each fact pinned once, mix test skips integration compiles |
+| 2026-10-03 | [`local-database-retention`](2026-10-03_local-database-retention.md) | Local applies a v3 database's `retention:` as Core does: writes accepted, reads hide 10-minute chunks older than `now - retention`, schema stays, `0` is a zero period, `SHOW RETENTION POLICIES` prints it (`1h0m0s`) |
 | 2026-10-02 | [`sixth-review`](2026-10-02_sixth-review.md) | Review of 2b7b801: false refusals removed (guarded division, unsigned OR), InfluxQL GROUP BY time and fill, package file list fixed, Local internals by area and hidden from docs, engine facts moved into contracts, contract-tag lint |
 | 2026-10-02 | [`fifth-review`](2026-10-02_fifth-review.md) | Review of e71cf7b: query performance restored, scratch script removed from lib, contract modules split per part (suite 27-41 s → 8-10 s), shared test helpers, whole-row assertions, clock-free batch-writer retry tests |
 | 2026-10-02 | [`local-sql-simplifier-and-intervals`](2026-10-02_local-sql-simplifier-and-intervals.md) | Local SQL: the simplifier's rules, casts, unsigned and float arithmetic and divisions by zero in the interval analysis, decimal-versus-float casts, integer literals past `UInt64`, the order the engine runs `AND`/`OR` operands in (fresh write against persisted table: guards answered, tag guards, what is refused), literal and parenthesised operands, `ORDER BY` aliases, `round`/`trunc` scales, the tokens of statement parser errors; 100k-point regression fixed |
@@ -85,7 +87,14 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 
 Claims about server behaviour are checked against a real InfluxDB before
 they are written down. No compose file is kept in the repo; these one-liners
-match the defaults in `test/support/integration_helper.ex`:
+match the defaults in `test/support/integration_helper.ex`.
+
+A bare `mix test` runs the unit suite only: the 65 integration modules cost about
+23 s of CPU to compile and every one is excluded by tag, so `mix.exs` does not
+hand `test/integration` to the test task unless a path is named (as below) or
+`INTEGRATION=1` is set (`INTEGRATION=1 mix test --include integration --include
+v3_core` compiles and runs them all). CI's `mix test --cover` therefore runs
+exactly the tests it always ran.
 
 ```bash
 # InfluxDB 3 Core on 8181 (HTTP and Flight, no auth). A write is answered
