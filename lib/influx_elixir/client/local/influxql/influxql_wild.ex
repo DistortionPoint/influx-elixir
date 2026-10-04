@@ -36,8 +36,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
   @spec expand(InfluxQL.query(), %{binary() => atom()}, MapSet.t(binary())) ::
           {:ok, InfluxQL.query()} | :empty | {:error, binary()}
   def expand(%{items: items} = query, types, tags) do
+    star_columns? = InfluxQLNames.star_written_out?(items)
+
     cond do
-      not Enum.any?(items, &wild?/1) ->
+      not (star_columns? or Enum.any?(items, &wild?/1)) ->
         {:ok, query}
 
       unknown = Enum.find(items, &unknown_call?/1) ->
@@ -45,7 +47,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
         {:error, "unsupported InfluxQL (#{name}() of a wildcard)"}
 
       true ->
-        case Enum.flat_map(items, &expand_item(&1, types, tags)) do
+        shown = shown_tags(query, tags)
+        stars = if star_columns?, do: star_columns(query, types, shown)
+
+        case Enum.flat_map(items, &expand_item(&1, types, shown, stars)) do
           [] ->
             :empty
 
@@ -56,6 +61,43 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
     end
   end
 
+  # With a regular expression among the dimensions the wildcards stand for the tags it
+  # groups by and no other (verified: `SELECT * ... GROUP BY /host/` has no `region`).
+  @spec shown_tags(InfluxQL.query(), MapSet.t(binary())) :: MapSet.t(binary())
+  defp shown_tags(%{group_by: dimensions}, tags) do
+    if Enum.any?(dimensions, &match?({:regex, _source}, &1)),
+      do: MapSet.intersection(tags, dimensions |> grouped(tags) |> MapSet.new()),
+      else: tags
+  end
+
+  # The tags a `GROUP BY` names, which the rows carry as dimensions.
+  @spec grouped([term()], MapSet.t(binary())) :: [binary()]
+  defp grouped(dimensions, tags) do
+    Enum.flat_map(dimensions, fn
+      {:tag, name} ->
+        [name]
+
+      :wildcard ->
+        MapSet.to_list(tags)
+
+      {:regex, source} ->
+        regex = InfluxQLRegex.compile(source, :expand)
+        Enum.filter(tags, &Regex.match?(regex, &1))
+
+      _other ->
+        []
+    end)
+  end
+
+  # `*` written out once for each time it is selected: every field and tag, the dimensions of
+  # the `GROUP BY` apart (they are columns of the row already), each as a column of its
+  # own; a name taken twice is numbered by `InfluxQLNames`.
+  @spec star_columns(InfluxQL.query(), %{binary() => atom()}, MapSet.t(binary())) :: [term()]
+  defp star_columns(%{group_by: dimensions}, types, tags) do
+    names = Map.keys(types) ++ (MapSet.to_list(tags) -- grouped(dimensions, tags))
+    for name <- names |> Enum.uniq() |> Enum.sort(), do: {:column, name, name}
+  end
+
   defp unknown_call?({:wild_call, name, _extra, _target, _alias}), do: name not in @known
   defp unknown_call?(_item), do: false
 
@@ -63,31 +105,33 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
   defp wild?({:wild_call, _name, _extra, _target, _alias}), do: true
   defp wild?(_item), do: false
 
-  defp expand_item({:wild_column, {:star, "field"}}, types, _tags),
+  defp expand_item(:star, _types, _tags, stars) when stars != nil, do: stars
+
+  defp expand_item({:wild_column, {:star, "field"}}, types, _tags, _stars),
     do: for(field <- sorted(Map.keys(types)), do: {:column, field, field})
 
-  defp expand_item({:wild_column, {:star, "tag"}}, _types, tags),
+  defp expand_item({:wild_column, {:star, "tag"}}, _types, tags, _stars),
     do: for(tag <- sorted(tags), do: {:column, tag, tag})
 
-  defp expand_item({:wild_column, {:regex, source}}, types, tags) do
-    regex = InfluxQLRegex.compile(source)
+  defp expand_item({:wild_column, {:regex, source}}, types, tags, _stars) do
+    regex = InfluxQLRegex.compile(source, :expand)
     names = Enum.uniq(sorted(Map.keys(types)) ++ sorted(tags))
     for name <- names, Regex.match?(regex, name), do: {:column, name, name}
   end
 
-  defp expand_item({:wild_call, name, extra, target, alias}, types, _tags) do
+  defp expand_item({:wild_call, name, extra, target, alias}, types, _tags, _stars) do
     for {field, type} <- fields_of(target, types),
         takes?(name, type),
         item = call_item(name, extra, field, "#{alias || name}_#{field}"),
         do: item
   end
 
-  defp expand_item(item, _types, _tags), do: [item]
+  defp expand_item(item, _types, _tags, _stars), do: [item]
 
   defp fields_of({:star, _kind}, types), do: types |> Enum.sort() |> Enum.to_list()
 
   defp fields_of({:regex, source}, types) do
-    regex = InfluxQLRegex.compile(source)
+    regex = InfluxQLRegex.compile(source, :expand)
     types |> Enum.sort() |> Enum.filter(fn {field, _type} -> Regex.match?(regex, field) end)
   end
 

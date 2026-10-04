@@ -54,6 +54,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
           | {:param, binary()}
           | {:op, :+ | :- | :* | :/ | :rem, t(), t()}
           | {:neg, t()}
+          | {:pos, t()}
           | {:cast, t(), cast_type()}
           | {:call, SQLFunctions.name(), [t()]}
           | {:cmp, comparison(), t(), t()}
@@ -628,6 +629,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   @doc "The expressions directly inside an expression, in the order written."
   @spec children(t()) :: [t()]
   def children({:neg, inner}), do: [inner]
+  def children({:pos, inner}), do: [inner]
   def children({:not, inner}), do: [inner]
   def children({:cast, inner, _type}), do: [inner]
   def children({:op, _op, left, right}), do: [left, right]
@@ -657,6 +659,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   """
   @spec map_children(t(), (t() -> t())) :: t()
   def map_children({:neg, inner}, fun), do: {:neg, fun.(inner)}
+  def map_children({:pos, inner}, fun), do: {:pos, fun.(inner)}
   def map_children({:not, inner}, fun), do: {:not, fun.(inner)}
   def map_children({:cast, inner, type}, fun), do: {:cast, fun.(inner), type}
   def map_children({:op, op, left, right}, fun), do: {:op, op, fun.(left), fun.(right)}
@@ -716,17 +719,12 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   """
   @spec ref_text(column_ref()) :: binary()
   def ref_text({:qualified, qualifier, column}),
-    do: SQLLiteral.render_identifier(bare_name(qualifier)) <> "." <> render_part(column)
+    do: SQLLiteral.render_identifier(SQLLiteral.unquoted(qualifier)) <> "." <> render_part(column)
 
   def ref_text(name), do: SQLLiteral.render_identifier(name)
 
   @spec render_part(binary()) :: binary()
-  defp render_part(part), do: SQLLiteral.render_identifier(bare_name(part))
-
-  @spec bare_name(binary()) :: binary()
-  defp bare_name(text) do
-    if SQLLiteral.identifier?(text), do: SQLLiteral.identifier_name(text), else: text
-  end
+  defp render_part(part), do: SQLLiteral.render_identifier(SQLLiteral.unquoted(part))
 
   @doc """
   An expression as the engine writes it in a column's name: columns
@@ -758,6 +756,9 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
     do: "#{render(left, qualifier, casts)} #{symbol(op)} #{render(right, qualifier, casts)}"
 
   def render({:neg, inner}, qualifier, casts), do: "(- #{render(inner, qualifier, casts)})"
+
+  # The engine prints a unary plus as its operand.
+  def render({:pos, inner}, qualifier, casts), do: render(inner, qualifier, casts)
 
   def render({:call, function, args}, qualifier, :display) do
     shown = Enum.map_join(args, ", ", &render(&1, qualifier, :display))

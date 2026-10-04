@@ -152,9 +152,6 @@ defmodule InfluxElixir.Client.Local.SQLScalarRefusalsTest do
           {"CREATE SCHEMA",
            "Client.Local: that CREATE or DROP of a database or a schema: the engine's error " <>
              "for it is not modelled"},
-          {"GRANT SELECT",
-           "Client.Local: the statement \"GRANT SELECT\" is not run: the engine's wording of " <>
-             "it (its keywords in capitals) is not modelled"},
           {"MERGE INTO m USING m c2 ON true WHEN MATCHED THEN DELETE",
            "Client.Local: the statement \"MERGE INTO m USING m c2 ON true WHEN MATCHED THEN " <>
              "DELETE\" is not run: the engine's wording of it (its keywords in capitals) is " <>

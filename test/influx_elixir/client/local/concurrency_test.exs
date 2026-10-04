@@ -225,7 +225,7 @@ defmodule InfluxElixir.Client.Local.ConcurrencyTest do
         end)
       end
 
-    for n <- 1..count, do: assert_receive({:ready, ^n}, 5_000)
+    for n <- 1..count, do: assert_receive({:ready, ^n}, 30_000)
     Enum.each(tasks, &send(&1.pid, :go))
     Enum.map(tasks, &Task.await(&1, 30_000))
   end

@@ -133,6 +133,7 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp compute(:count, values), do: length(values)
   defp compute(:count_distinct, values), do: values |> Enum.uniq() |> length()
   defp compute(_agg, []), do: nil
+  defp compute(:sum_distinct, values), do: compute(:sum, Enum.uniq(values))
   defp compute(:avg, values), do: average(values)
   defp compute(:sum, [first | _rest] = values), do: Enum.reduce(values, zero(first), &add(&2, &1))
   # MIN/MAX also run over `time`, so the comparison is the sort's.
@@ -271,7 +272,11 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
         ) ::
           term()
   defp selector(kind, field, ordering, access, points) do
-    candidates = Enum.reject(points, &is_nil(Map.get(&1.fields, field)))
+    candidates = Enum.reject(points, &is_nil(SQLRow.column_value(&1, field)))
+
+    # The engine cannot order a tag: it closes the connection (verified).
+    if kind in [:min, :max] and Enum.any?(candidates, &Map.has_key?(&1.tags, field)),
+      do: throw({:query_error, SQLError.closed()})
 
     case pick(kind, candidates, field, ordering) do
       nil -> nil
@@ -286,20 +291,23 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     do: pick_by_order(kind, points, ordering)
 
   defp pick(:min, points, field, _ordering),
-    do: Enum.min_by(points, &Map.get(&1.fields, field), &SQLSort.value_order/2)
+    do: Enum.min_by(points, &SQLRow.column_value(&1, field), &SQLSort.value_order/2)
 
   defp pick(:max, points, field, _ordering),
-    do: Enum.max_by(points, &Map.get(&1.fields, field), fn a, b -> SQLSort.value_order(b, a) end)
+    do:
+      Enum.max_by(points, &SQLRow.column_value(&1, field), fn a, b ->
+        SQLSort.value_order(b, a)
+      end)
 
   @spec selector_access(SQLRow.point(), binary(), :value | :time | :struct) :: term()
-  defp selector_access(point, field, :value), do: Map.get(point.fields, field)
+  defp selector_access(point, field, :value), do: SQLRow.column_value(point, field)
   defp selector_access(point, _field, :time), do: SQLRow.nanoseconds_to_datetime(point.timestamp)
 
   # The engine's struct (verified): `%{"time" => ..., "value" => ...}`.
   defp selector_access(point, field, :struct) do
     %{
       "time" => SQLRow.nanoseconds_to_datetime(point.timestamp),
-      "value" => Map.get(point.fields, field)
+      "value" => SQLRow.column_value(point, field)
     }
   end
 

@@ -28,11 +28,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   @typedoc "What an aggregate comes to over some rows."
   @type result :: {:value, term(), map() | nil} | :none | :null
 
+  @typedoc "What a column holds: a field's type, or `:time` for the time an aggregate chose."
+  @type column_type :: InfluxQL.field_type() | :time
+
   @typedoc """
   How an aggregate fills an empty bucket: `:count` columns are zero (not null)
   there, and `type` is what a number given to `fill()` is cast to.
   """
-  @type spec :: {:count | :other, InfluxQL.field_type()}
+  @type spec :: {:count | :other, column_type()}
 
   @doc "Whether `fun` is an aggregate the double computes."
   @spec function?(binary()) :: boolean()
@@ -40,6 +43,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
     do:
       fun in ~w(mean sum count min max first last median spread stddev distinct mode) or
         String.starts_with?(fun, "percentile:") or String.starts_with?(fun, "integral:")
+
+  @doc """
+  The `named` results of a row that is answered, with each `count` that found nothing zero
+  (verified: `count(v), count(n)` over points that have an `n` and no `v` is `0` and the
+  count of `n`).
+  """
+  @spec zero_counts([{binary(), result(), spec()}]) :: [{binary(), result(), spec()}]
+  def zero_counts(named) do
+    if Enum.all?(named, fn {_name, result, _spec} -> result == :none end),
+      do: named,
+      else:
+        Enum.map(named, fn
+          {name, :none, {:count, _type} = spec} -> {name, {:value, 0, nil}, spec}
+          other -> other
+        end)
+  end
 
   @doc "Whether `fun` is a selector: it returns the point it chose, with its time and columns."
   @spec selector?(binary()) :: boolean()
@@ -75,12 +94,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
           [{binary(), result(), spec()}]
   defp name_columns(aggregates, rows, fields, tags, types) do
     beside? = length(aggregates) > 1
+    timed = if Enum.any?(aggregates, &time_argument?/1), do: time_rows(aggregates, rows, fields)
 
     {named, _names} =
       Enum.flat_map_reduce(aggregates, %{}, fn item, names ->
         item
         |> beside(beside?)
-        |> compute(rows, fields, tags, types)
+        |> compute(if(time_argument?(item), do: timed, else: rows), fields, tags, types)
         |> tap(&check_null(item, &1, beside?, types))
         |> Enum.map_reduce(names, fn {name, result, spec}, names ->
           {unique, names} = unique_name(name, names)
@@ -90,6 +110,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
 
     named
   end
+
+  # The aggregates of `time` beside those of fields read only the points where one of the
+  # fields they aggregate has a value (verified: `max(time), count(s)` is the latest point
+  # that has an `s`, and a series or bucket with none is not answered). With no field
+  # beside them they read every point.
+  @spec time_rows([InfluxQL.item()], [map()], [binary()]) :: [map()]
+  defp time_rows(aggregates, rows, fields) do
+    read = aggregates |> Enum.reject(&time_argument?/1) |> Enum.flat_map(&read_fields(&1, fields))
+
+    if read == [],
+      do: rows,
+      else: Enum.filter(rows, fn row -> Enum.any?(read, &Map.has_key?(row, &1)) end)
+  end
+
+  @spec read_fields(InfluxQL.item(), [binary()]) :: [binary()]
+  defp read_fields({:aggregate, _fun, :star, _alias}, fields), do: fields
+  defp read_fields({:aggregate, "count", {:distinct, field}, _alias}, _fields), do: [field]
+  defp read_fields({:aggregate, _fun, field, _alias}, _fields) when is_binary(field), do: [field]
 
   # A `percentile()` that is not alone in the select list reads its rank as in a
   # bucket of a `GROUP BY time`: the last value is the one of rank `n` (verified;
@@ -170,11 +208,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   end
 
   @doc "The type of the values an aggregate of `field` comes to."
-  @spec result_type(binary(), binary(), map()) :: InfluxQL.field_type()
+  @spec result_type(binary(), binary(), map()) :: column_type()
   def result_type(fun, field, types), do: fun |> spec(field, types) |> elem(1)
 
   @spec spec(binary(), binary(), map()) :: spec()
   defp spec("count", _field, _types), do: {:count, :integer}
+  defp spec(_fun, "time", _types), do: {:other, :time}
   defp spec("integral:" <> _flags, _field, _types), do: {:other, :float}
   defp spec(fun, _field, _types) when fun in ["mean", "stddev"], do: {:other, :float}
   defp spec(_fun, field, types), do: {:other, Map.get(types, field, :float)}

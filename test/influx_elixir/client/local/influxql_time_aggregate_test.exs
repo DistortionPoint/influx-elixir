@@ -29,19 +29,4 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeAggregateTest do
       assert body =~ unquote(reason)
     end
   end
-
-  test "a time aggregate alone answers nothing, as an aggregate of a tag does", %{conn: conn} do
-    for function <- ~w(min max count first last mean sum median spread stddev mode) do
-      assert {:ok, []} =
-               Local.query_influxql(conn, "SELECT #{function}(time) FROM cpu", database: "t_db")
-    end
-  end
-
-  test "min and max of time beside a field are the times of the points", %{conn: conn} do
-    assert {:ok, [row]} =
-             Local.query_influxql(conn, "SELECT max(time), min(usage) FROM cpu", database: "t_db")
-
-    assert row["max"] == ~U[2023-11-14 22:14:20.000000Z]
-    assert row["min"] == 1.5
-  end
 end

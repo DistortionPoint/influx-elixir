@@ -11,6 +11,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     InfluxQLRegex,
     InfluxQLShow,
     InfluxQLShowParser,
+    InfluxQLTokens,
     InfluxQLWild,
     LineProtocolParser,
     Scope,
@@ -176,7 +177,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp tag_key_list(table, database, spec) do
     names = show_names(table, database, spec)
 
+    tagless_error =
+      if spec.where != nil and tagless?(table, database, names),
+        do: split_error(table, database, names, spec)
+
     cond do
+      tagless_error != nil ->
+        tagless_error
+
       spec.where != nil and names != [] and (spec.limit != nil or spec.offset > 0) ->
         show_refusal(
           spec,
@@ -184,7 +192,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
         )
 
       spec.where != nil and tagless?(table, database, names) ->
-        tagless_where(spec)
+        tagless_where(table, database, names, spec)
 
       true ->
         show_collect(names, &tag_key_rows(table, database, &1, spec))
@@ -197,23 +205,91 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     do: Enum.any?(names, &Enum.empty?(Store.tag_columns(table, database, &1)))
 
   # `SHOW TAG KEYS WHERE ...` fails to plan once a measurement it lists has no tag column
-  # (verified, whatever the condition): the engine builds an aggregate of nothing. A `now()`
-  # in the condition is its error first, which the double does not order.
-  @spec tagless_where(map()) :: {:error, map()}
-  defp tagless_where(spec) do
-    if Regex.match?(~r/\bnow\s*\(/i, spec.where) do
-      show_refusal(spec, "SHOW TAG KEYS WHERE now() over a measurement with no tag")
-    else
-      {:error,
-       %{
-         status: 400,
-         body:
-           "Error during planning: Aggregate requires at least one grouping or aggregate " <>
-             "expression. Aggregate without grouping expressions nor aggregate expressions is " <>
-             "logically equivalent to, but less efficient than, VALUES producing single row. " <>
-             "Please use VALUES instead."
-       }}
+  # (verified, whatever the condition): the engine builds an aggregate of nothing. The planner
+  # splits the `time` comparisons off the condition before that, so their errors (`time != x`,
+  # a time that is no timestamp) come first; a `now()` in the rest of the condition is its
+  # error first, which the double does not order.
+  @spec tagless_where(Store.t(), binary(), [binary()], map()) :: {:error, map()}
+  defp tagless_where(table, database, names, spec) do
+    case split_error(table, database, names, spec) do
+      {:error, _error} = error ->
+        error
+
+      nil ->
+        if Regex.match?(~r/\bnow\s*\(/i, spec.where) do
+          show_refusal(spec, "SHOW TAG KEYS WHERE now() over a measurement with no tag")
+        else
+          aggregate_of_nothing()
+        end
     end
+  end
+
+  @spec split_error(Store.t(), binary(), [binary()], map()) :: {:error, map()} | nil
+  defp split_error(table, database, names, spec) do
+    name = Enum.find(names, &Enum.empty?(Store.tag_columns(table, database, &1)))
+    tags = Store.tag_columns(table, database, name)
+
+    case influxql_where(spec.where, tags, field_types(table, database, name), Store.now_ns(), 0) do
+      {:error, %{body: body} = error} ->
+        if InfluxQL.mentions_time?(spec.where),
+          do: {:error, %{error | body: InfluxQL.unframe_split(body)}}
+
+      {:ok, _plan} ->
+        if odd_time?(spec.where),
+          do:
+            show_refusal(
+              spec,
+              "SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement " <>
+                "with no tag"
+            )
+    end
+  end
+
+  # A `time` in arithmetic, beside a name or matched by a regular expression: the engine's
+  # planning error is its own (`time = time`, `time - 1 > 0`), which the double does not word
+  # for a measurement it fails to plan anyway.
+  @spec odd_time?(binary()) :: boolean()
+  defp odd_time?(where) do
+    case InfluxQLTokens.tokenize(where, []) do
+      {:ok, tokens} ->
+        tokens
+        |> Enum.with_index()
+        |> Enum.any?(fn {token, at} ->
+          InfluxQLTokens.time?(token) and odd_neighbours?(tokens, at)
+        end)
+
+      _unread ->
+        false
+    end
+  end
+
+  defp odd_neighbours?(tokens, at) do
+    before = if at > 0, do: Enum.at(tokens, at - 1)
+    before2 = if at > 1, do: Enum.at(tokens, at - 2)
+    next = Enum.at(tokens, at + 1)
+    next2 = Enum.at(tokens, at + 2)
+
+    arithmetic?(before) or arithmetic?(next) or
+      match?({:op, op} when op in ["=~", "!~"], next) or
+      match?({:op, op} when op in ["=~", "!~"], before) or
+      (match?({:op, _op}, next) and match?({:ident, _name}, next2)) or
+      (match?({:op, _op}, before) and match?({:ident, _name}, before2))
+  end
+
+  defp arithmetic?({:raw, op}), do: op in ["+", "-", "*", "/"]
+  defp arithmetic?(_token), do: false
+
+  @spec aggregate_of_nothing() :: {:error, map()}
+  defp aggregate_of_nothing do
+    {:error,
+     %{
+       status: 400,
+       body:
+         "Error during planning: Aggregate requires at least one grouping or aggregate " <>
+           "expression. Aggregate without grouping expressions nor aggregate expressions is " <>
+           "logically equivalent to, but less efficient than, VALUES producing single row. " <>
+           "Please use VALUES instead."
+     }}
   end
 
   defp field_key_list(table, database, spec) do
@@ -497,7 +573,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           [name]
 
         {:regex, source} ->
-          regex = InfluxQLRegex.compile(source)
+          regex = InfluxQLRegex.compile(source, :from)
           Enum.filter(existing, &Regex.match?(regex, &1))
       end)
 
@@ -771,6 +847,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     else
       {:error, _reason} = error -> error
     end
+  catch
+    # What a check finds in the points: the engine breaks the connection, or the double
+    # refuses by name.
+    :closed_connection -> {:error, SQLError.closed()}
+    {:refused, {:engine, status, body}} -> {:error, %{status: status, body: body}}
+    {:refused, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
   end
 
   @spec fill_tags([LineProtocolParser.point()], map()) :: [LineProtocolParser.point()]

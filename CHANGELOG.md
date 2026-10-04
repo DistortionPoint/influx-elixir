@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` InfluxQL aggregates of `time` read every point** (0.1.41).
+  `max(time), count(s)` is the latest point that has an `s` (as are `first`,
+  `last`, `min`, `mode` and `count(distinct(time))`, in a series, a bucket and
+  beside plain columns or expressions); a series or bucket with no such point
+  is not answered; `fill(0)` fills a time with the epoch; `count()` of a field
+  no point holds is `0` beside another value, and `count(*)` lists every
+  field of the measurement. Arithmetic with a time, a boolean or a string
+  (`max(time) - min(time)`, `v + true`) is the engine's `incompatible
+  operands` 400, and `abs(min(time))` answers nothing instead of a 500.
+- **`Client.Local` InfluxQL `WHERE` answered strings, divisions and calls the
+  engine does not**: `'a' + 'a' = 'aa'` and `s + s = 'xx'` concatenate, a
+  string, boolean or tag under any other operator is null (`s + 1`, `-b`),
+  `/ 0` is `0` (it closed the connection, or kept every point), `abs()` is
+  computed and its misuse is the planner's 400, a sign before a string or
+  boolean or a second one before a name is the parse error, a comment is
+  echoed as written; every other function is refused by name (it answered
+  `[]`).
+- **`Client.Local` InfluxQL**: a regex with an unknown flag in `FROM`, the
+  select list, `GROUP BY` or a function argument is the planner's 400 (it was
+  the `WHERE` 500); `SELECT *, *` and `*` beside columns number their names;
+  `top(v, host, 1) ... GROUP BY host` has `host_1`; `AS 1`, `mean((v))`,
+  `mean(v + 1)` and `top(v, *::tag, 2)` are the engine's errors; `SELECT *
+  ... GROUP BY /host/` has only the grouped tags; `SHOW TAG KEYS WHERE time
+  != x` over a measurement with no tag is the time error; an aggregate
+  stamped with a bound that is not a whole microsecond (`time >
+  1700000000000000000`) answers the microsecond `Client.HTTP` reads from the
+  engine.
 - **`Client.Local` raised `ArithmeticError` on InfluxQL transforms** (0.1.41).
   `derivative(v, 0s)`, `elapsed(v, 0s)` and `moving_average(v, 0)` now give
   the engine's 400 ("duration argument must be positive", "moving_average
@@ -44,9 +71,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Client.Local` printed a token created on a whole second as `….000Z`**;
   the engine prints `…Z` with no fraction (it is to the millisecond
   otherwise).
+- **`Client.Local` SQL aggregate queries scanned every point** to list
+  columns an `ORDER BY` might name, even with no `ORDER BY` (`count(*)` cost
+  8.8×); they are back to their earlier cost.
+- **`Client.Local` SQL raised on a selector under a text function**
+  (`length(selector_first(s, time))`) and answered selector shapes the
+  engine rejects (`selector_max(v, v)`, a selector in `CASE` or compared in
+  `HAVING`); these are the engine's errors now. `selector_first(host, time)`
+  returned no value for a tag.
+- **`Client.Local` SQL refused `GRANT ALL`, `MERGE` and `NULL - time`**, which
+  0.1.41 answered as the engine does, and answered `substr(NULL, 'a')`,
+  `NULL || 1`, `host || n` and `count(distinct -1)` differently from the
+  engine; statements the engine does not run (`CREATE SEQUENCE`, `DROP INDEX`,
+  `create trigger t`) now carry its exact wording.
 - **`mix test` chose the wrong tests** for an absolute or `./` path, a path
-  outside `test/`, `--only=v2`, and an `--include` of an integration tag
-  without a path. The arguments are now read as `mix test` reads them.
+  outside `test/`, `--only=v2`, an `--include` of an integration tag
+  without a path, and a path after a switch it did not know
+  (`--no-compile test/x_test.exs` ran the whole suite). A path is now
+  recognised by what it is.
 
 ### Changed
 - The integration one-liners pin `influxdb:3.10.1-core`, the version the

@@ -57,8 +57,33 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
       {:error, :unread_order} ->
         {:error, "unsupported InfluxQL (clauses the double does not read in that order)"}
 
+      {:error, {:engine, body}} ->
+        {:error, {:engine, echo_comments(body, statement)}}
+
       other ->
         other
+    end
+  end
+
+  # An error that quotes the rest of the statement quotes it as sent, comments and all
+  # (verified: `WHERE --host = 0` is `Nom("where --host = 0", Tag)`); the double blanks a
+  # comment byte for byte to read the statement, so the quoted text is put back.
+  @spec echo_comments(binary(), binary()) :: binary()
+  defp echo_comments(body, statement) do
+    {clean, _masked, _unclosed} = blank_comments(statement, InfluxQLText.mask_literals(statement))
+
+    with true <- clean != statement,
+         [_all, {at, length}] <-
+           Regex.run(~r/Nom\((".*"), (?:Tag|Char)\)$/s, body, return: :index),
+         quoted = binary_part(body, at, length),
+         size = byte_size(clean),
+         from when from != nil <-
+           Enum.find(0..size, &(inspect(binary_part(clean, &1, size - &1)) == quoted)) do
+      binary_part(body, 0, at) <>
+        inspect(binary_part(statement, from, size - from)) <>
+        binary_part(body, at + length, byte_size(body) - at - length)
+    else
+      _unquoted -> body
     end
   end
 
@@ -328,6 +353,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
       {:wild, name, extra, target} -> {:ok, {:wild_call, name, extra, target, alias}}
       {:expand_error, message} -> {:ok, {:expand_error, message}}
       {:planning, message} -> {:ok, {:planning_error, message}}
+      {:argument, name, argument} -> {:ok, {:argument_error, name, argument}}
       _unread -> {:error, "unsupported select item: #{text}"}
     end
   end

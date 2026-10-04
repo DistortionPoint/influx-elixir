@@ -24,6 +24,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
           | :sum
           | :count
           | :count_distinct
+          | :sum_distinct
           | :min
           | :max
           | :median
@@ -471,7 +472,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
           {:ok, column()} | {:error, term()}
   defp parse_agg_column(col, body, alias_name, qualifier) do
     count_star = ~r/(?i)^\s*COUNT\s*\(\s*\*\s*\)\s*$/u
-    count_distinct = ~r/(?i)^\s*COUNT\s*\(\s*DISTINCT\s+#{@name}\s*\)\s*$/u
+    distinct = ~r/(?i)^\s*(COUNT|SUM)\s*\(\s*DISTINCT\s+(.+?)\s*\)\s*$/us
 
     cond do
       error = time_aggregate_error(body) ->
@@ -482,40 +483,100 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
           {:ok, {:count_star, output}}
         end
 
-      match = Regex.run(count_distinct, body) ->
-        [_full, column] = match
-        count_distinct_column(col, column, alias_name, qualifier)
+      match = Regex.run(distinct, body) ->
+        [_full, func, argument] = match
+        distinct_column(col, String.downcase(func), argument, alias_name, qualifier)
 
       true ->
         parse_agg_column_arg(col, body, alias_name, qualifier)
     end
   end
 
-  # `COUNT(DISTINCT x)`: of a column, or of a constant (`1`, `NULL`, `true`), which is `1`
-  # over any rows and `0` over none (or for the null).
-  @spec count_distinct_column(binary(), binary(), binary() | nil, binary() | nil) ::
+  # `COUNT(DISTINCT x)` and `SUM(DISTINCT x)`: of a column, of a constant (`1`, `-1`, `NULL`,
+  # `true`: one value over any rows, none over none) or of any expression. A leading `+` is
+  # the engine's no-op (`+n` is the column `n`).
+  @spec distinct_column(binary(), binary(), binary(), binary() | nil, binary() | nil) ::
           {:ok, column()} | {:error, term()}
-  defp count_distinct_column(col, word, alias_name, qualifier) do
-    case SQLExpr.parse(word) do
-      {:ok, constant} when elem(constant, 0) in [:lit, :uint] ->
-        with {:ok, output} <-
-               output_name(col, alias_name, fn ->
-                 "count(DISTINCT #{SQLExpr.render(constant, qualifier, :drop)})"
-               end) do
-          {:ok, {:aggregate, :count_distinct, constant, output}}
-        end
+  defp distinct_column(col, "count", word, alias_name, qualifier) do
+    case plus_expression(word) do
+      {:ok, {:field, _name} = expr} ->
+        if Regex.match?(~r/\A#{@name}\z/u, word),
+          do: count_distinct_field(col, word, alias_name, qualifier),
+          else: distinct_expression(col, :count_distinct, expr, alias_name, qualifier)
 
-      _column ->
-        column = name(word)
+      {:ok, expr} ->
+        distinct_expression(col, :count_distinct, expr, alias_name, qualifier)
 
-        with {:ok, output} <-
-               output_name(col, alias_name, fn ->
-                 "count(DISTINCT #{column_name(column, qualifier)})"
-               end) do
-          {:ok, {:count_distinct, column, output}}
-        end
+      {:error, _reason} ->
+        {:error, SQLError.refusal("invalid aggregate: #{col}")}
     end
   end
+
+  defp distinct_column(col, "sum", word, alias_name, qualifier) do
+    case plus_expression(word) do
+      {:ok, expr} -> distinct_expression(col, :sum_distinct, expr, alias_name, qualifier)
+      {:error, _reason} -> {:error, SQLError.refusal("invalid aggregate: #{col}")}
+    end
+  end
+
+  @spec count_distinct_field(binary(), binary(), binary() | nil, binary() | nil) ::
+          {:ok, column()} | {:error, term()}
+  defp count_distinct_field(col, word, alias_name, qualifier) do
+    column = name(word)
+
+    with {:ok, output} <-
+           output_name(col, alias_name, fn ->
+             "count(DISTINCT #{column_name(column, qualifier)})"
+           end) do
+      {:ok, {:count_distinct, column, output}}
+    end
+  end
+
+  @spec distinct_expression(
+          binary(),
+          :count_distinct | :sum_distinct,
+          SQLExpr.t(),
+          binary() | nil,
+          binary() | nil
+        ) :: {:ok, column()} | {:error, term()}
+  defp distinct_expression(col, agg, expr, alias_name, qualifier) do
+    function = agg |> Atom.to_string() |> String.replace_suffix("_distinct", "")
+
+    with {:ok, output} <-
+           output_name(col, alias_name, fn ->
+             "#{function}(DISTINCT #{SQLExpr.render(expr, qualifier, :drop)})"
+           end) do
+      {:ok, {:aggregate, agg, expr, output}}
+    end
+  end
+
+  # The argument with its leading `+` signs as the unary plus (a number's own sign is part of
+  # the number).
+  @spec plus_expression(binary()) :: {:ok, SQLExpr.t()} | {:error, term()}
+  defp plus_expression(text) do
+    {signs, rest} = split_plus(text, 0)
+
+    with {:ok, expr} <- SQLExpr.parse(rest) do
+      {:ok, if(number?(expr), do: expr, else: wrap_plus(expr, signs))}
+    end
+  end
+
+  @spec split_plus(binary(), non_neg_integer()) :: {non_neg_integer(), binary()}
+  defp split_plus(text, count) do
+    case Regex.run(~r/\A\s*\+(.*)\z/s, text) do
+      [_all, rest] -> split_plus(rest, count + 1)
+      nil -> {count, String.trim(text)}
+    end
+  end
+
+  @spec number?(SQLExpr.t()) :: boolean()
+  defp number?({:lit, value}), do: is_number(value)
+  defp number?({:uint, _value}), do: true
+  defp number?(_expr), do: false
+
+  @spec wrap_plus(SQLExpr.t(), non_neg_integer()) :: SQLExpr.t()
+  defp wrap_plus(expr, 0), do: expr
+  defp wrap_plus(expr, count), do: wrap_plus({:pos, expr}, count - 1)
 
   # One argument, which may be an arithmetic expression over fields and
   # numeric literals (`SUM(value * value)`), as the real engine allows.
@@ -620,9 +681,11 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
       [_full, kind, field, ordering | access] ->
         selector = String.to_existing_atom(String.downcase(kind))
         access = List.first(access, "")
+        literal = literal_type(ordering)
         {field, ordering} = {name(field), name(ordering)}
 
-        with {:ok, output} <-
+        with :ok <- literal_ordering(selector, literal),
+             {:ok, output} <-
                output_name(col, alias_name, fn ->
                  selector_name(kind, field, ordering, access, qualifier)
                end) do
@@ -638,6 +701,27 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
              "selector_first|last|min|max(field, time)[['value' | 'time']] [AS alias]: #{col}"
          )}
     end
+  end
+
+  # The type of a second argument written as a constant rather than as a column.
+  @spec literal_type(binary()) :: binary() | nil
+  defp literal_type(text) do
+    cond do
+      Regex.match?(~r/\A\d+\z/, text) -> "Int64"
+      String.downcase(text) == "null" -> "Null"
+      String.downcase(text) in ["true", "false"] -> "Boolean"
+      true -> nil
+    end
+  end
+
+  @spec literal_ordering(atom(), binary() | nil) :: :ok | {:error, map()}
+  defp literal_ordering(_selector, nil), do: :ok
+
+  defp literal_ordering(selector, type) do
+    {:error,
+     SQLError.planning(
+       "selector_#{selector} second argument must be a timestamp, but got #{type}"
+     )}
   end
 
   @spec selector_name(binary(), binary(), binary(), binary(), binary() | nil) :: binary()

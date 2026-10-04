@@ -39,7 +39,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     context = %{
       query: query,
       tags: tags,
-      time: lower_time(Keyword.get(opts, :lower)),
       fields: Keyword.get(opts, :fields),
       types: Keyword.get(opts, :types, %{}),
       expr_refs: for({:expr, ast, _name} <- query.items, ref <- InfluxQLExpr.refs(ast), do: ref),
@@ -48,7 +47,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       now: Keyword.get_lazy(opts, :now, fn -> System.os_time(:nanosecond) end),
       sources: Map.new(for({:column, column, name} <- query.items, do: {name, column})),
       body: query.items |> leading_time_off() |> Enum.map(&compile_item/1),
-      star?: query.items == [:star]
+      star?: query.items == [:star],
+      ungrouped: ungrouped_tags(query, tags)
     }
 
     query
@@ -171,6 +171,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       else: :ok
   end
 
+  # With a regular expression among the dimensions a `*` stands for the tags it groups by and no
+  # other (verified: `SELECT * ... GROUP BY /host/` has no `region`).
+  @spec ungrouped_tags(InfluxQL.query(), MapSet.t(binary())) :: [binary()]
+  defp ungrouped_tags(%{items: items, group_by: dimensions}, tags) do
+    if :star in items and Enum.any?(dimensions, &match?({:regex, _source}, &1)) do
+      grouped = dimensions |> Enum.flat_map(&dimension_keys(&1, tags)) |> MapSet.new()
+      tags |> MapSet.difference(grouped) |> MapSet.to_list()
+    else
+      []
+    end
+  end
+
   # The columns a dimension groups by: a name, every tag (`*`), the tags a
   # regular expression matches.
   @spec dimension_keys(InfluxQLGroup.dimension(), MapSet.t(binary())) :: [binary()]
@@ -178,7 +190,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   defp dimension_keys(:wildcard, tags), do: MapSet.to_list(tags)
 
   defp dimension_keys({:regex, source}, tags) do
-    regex = InfluxQLRegex.compile(source)
+    regex = InfluxQLRegex.compile(source, :expand)
     Enum.filter(tags, &Regex.match?(regex, &1))
   end
 
@@ -189,6 +201,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     {is_nil(value), value}
   end
 
+  # The engine stamps the lower bound to the nanosecond; `Client.HTTP` reads
+  # every time, in every format, to the microsecond (the digits after the sixth
+  # are dropped), which is the floor of the instant, so the double answers the
+  # same.
   @spec lower_time(integer() | nil) :: DateTime.t()
   defp lower_time(nil), do: @epoch
   defp lower_time(ns), do: DateTime.from_unix!(Integer.floor_div(ns, 1_000), :microsecond)
@@ -224,6 +240,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   @spec project([map()], map(), map()) :: [map()]
   defp project(rows, %{query: query, body: body} = context, base) do
     rows = if query.descending, do: Enum.reverse(rows), else: rows
+
+    rows =
+      if context.ungrouped == [], do: rows, else: Enum.map(rows, &Map.drop(&1, context.ungrouped))
+
     time_name = InfluxQLNames.time_name(query.items)
 
     star? = context.star?
@@ -297,38 +317,85 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   defp time_column?(column), do: byte_size(column) == 4 and String.downcase(column) == "time"
 
   @spec aggregate([map()], [InfluxQL.item()], map(), map()) :: [map()]
-  defp aggregate(rows, items, %{tags: tags, time: time, types: types}, base) do
+  defp aggregate(rows, items, %{tags: tags, lower_ns: lower, types: types}, base) do
     plan = expression_plan(items, types, tags)
-    fields = if count_star?(plan.aggregates), do: field_names(rows, tags), else: []
+    fields = if count_star?(plan.aggregates), do: field_names(types, tags), else: []
 
-    field_columns? =
-      Enum.any?(items, fn
-        {:column, column, _name} ->
-          Map.has_key?(types, column) and not MapSet.member?(tags, column)
+    beside = beside_fields(items, tags, types)
+    field_columns? = beside != []
+    rows = rows_with(rows, plan.aggregates, beside)
 
-        _item ->
-          false
-      end)
-
-    named = InfluxQLAggregate.columns(plan.aggregates, rows, fields, tags, types, field_columns?)
+    named =
+      plan.aggregates
+      |> InfluxQLAggregate.columns(rows, fields, tags, types, field_columns?)
+      |> InfluxQLAggregate.zero_counts()
 
     values = for {name, {:value, value, _point}, _spec} <- named, into: %{}, do: {name, value}
 
     cond do
       Enum.all?(named, fn {_name, result, _spec} -> result == :none end) ->
-        []
+        silent_selector(items, rows, beside)
 
       lone_selector?(for({:aggregate, _fun, _arg, _alias} = item <- items, do: item)) and
-          plan.exprs == [] ->
-        lone_selector_row(named, items, base, values)
+          plain_expressions?(items) ->
+        lone_selector_row(named, items, base, values, types)
 
       lone_selector_expression?(plan) ->
-        expression_row(named, base, finish(values, plan), time)
+        expression_row(named, base, finish(values, plan))
 
       true ->
-        [base |> Map.put("time", time) |> Map.merge(finish(values, plan))]
+        [
+          base
+          |> Map.put("time", lower_time(lower))
+          |> Map.merge(finish(values, plan))
+        ]
     end
   end
+
+  # A selector with no value beside columns that have points: the engine answers a row with the
+  # series and nothing else (verified), which a row cannot be here without its time.
+  @spec silent_selector([InfluxQL.item()], [map()], [binary()]) :: []
+  defp silent_selector(items, rows, beside) do
+    lone? = lone_selector?(for({:aggregate, _fun, _arg, _alias} = item <- items, do: item))
+
+    if lone? and Enum.any?(beside, fn field -> Enum.any?(rows, &Map.has_key?(&1, field)) end),
+      do:
+        throw(
+          {:refused,
+           "unsupported InfluxQL (a selector with no value beside columns that have points)"}
+        ),
+      else: []
+  end
+
+  # The fields the plain columns and expressions of the list read, beside an aggregate.
+  @spec beside_fields([InfluxQL.item()], MapSet.t(binary()), map()) :: [binary()]
+  defp beside_fields(items, tags, types) do
+    items
+    |> Enum.flat_map(fn
+      {:column, column, _name} -> [column]
+      {:expr, ast, _name} -> if plain_expression?(ast), do: InfluxQLExpr.refs(ast), else: []
+      _item -> []
+    end)
+    |> Enum.filter(&(Map.has_key?(types, &1) and not MapSet.member?(tags, &1)))
+    |> Enum.uniq()
+  end
+
+  defp plain_expressions?(items),
+    do: Enum.all?(items, fn item -> not match?({:expr, _, _}, item) or plain_item?(item) end)
+
+  defp plain_item?({:expr, ast, _name}), do: plain_expression?(ast)
+
+  defp plain_expression?(ast),
+    do: InfluxQLExpr.aggregates(ast) == [] and InfluxQLExpr.transforms(ast) == []
+
+  # A `min`, `max`, `first`, `last` or `mode` of `time` beside fields chooses among the points
+  # that have one of them (verified: `max(time), v` is the latest point with a `v`).
+  @spec rows_with([map()], [InfluxQL.item()], [binary()]) :: [map()]
+  defp rows_with(rows, [{:aggregate, fun, "time", _alias}], [_field | _more] = fields)
+       when fun in ["min", "max", "first", "last", "mode"],
+       do: Enum.filter(rows, fn row -> Enum.any?(fields, &Map.has_key?(row, &1)) end)
+
+  defp rows_with(rows, _aggregates, _fields), do: rows
 
   # The only selector of the list inside arithmetic still returns its point's
   # time (verified: `max(v) * 2`).
@@ -341,31 +408,53 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
 
   defp lone_selector_expression?(_plan), do: false
 
-  defp expression_row([{_name, {:value, _value, point}, _spec}], base, values, _time),
+  defp expression_row([{_name, {:value, _value, point}, _spec}], base, values),
     do: [base |> Map.put("time", point["time"]) |> Map.merge(values)]
 
-  defp expression_row(_named, _base, _values, _time), do: []
+  defp expression_row(_named, _base, _values), do: []
 
   # The point a lone selector chose, with its time and the columns beside it;
   # a selector with no result there answers nothing.
-  @spec lone_selector_row([tuple()], [InfluxQL.item()], map(), map()) :: [map()]
-  defp lone_selector_row([{_name, {:value, _value, point}, _spec}], items, base, values) do
+  @spec lone_selector_row([tuple()], [InfluxQL.item()], map(), map(), map()) :: [map()]
+  defp lone_selector_row([{_name, {:value, _value, point}, _spec}], items, base, values, types) do
     columns =
       for {:column, column, name} <- items,
           Map.has_key?(point, column),
           into: %{},
           do: {name, point[column]}
 
-    [base |> Map.put("time", point["time"]) |> Map.merge(columns) |> Map.merge(values)]
+    computed =
+      for {:expr, ast, name} <- items,
+          {:ok, value} <- [computed(ast, point, types)],
+          into: %{},
+          do: {name, value}
+
+    [
+      base
+      |> Map.put("time", point["time"])
+      |> Map.merge(columns)
+      |> Map.merge(computed)
+      |> Map.merge(values)
+    ]
   end
 
-  defp lone_selector_row(_named, _items, _base, _values), do: []
+  defp lone_selector_row(_named, _items, _base, _values, _types), do: []
+
+  # An expression of the columns of the chosen point: null is no column, a number that is not
+  # finite is a null that is written.
+  defp computed(ast, point, types) do
+    case InfluxQLExpr.eval(ast, point, types) do
+      nil -> :null
+      :nan -> {:ok, nil}
+      value -> {:ok, value}
+    end
+  end
 
   # `GROUP BY time(...)`: a row for every bucket, as `InfluxQLBuckets` fills them.
   @spec bucketed([map()], map(), map()) :: Enumerable.t()
   defp bucketed(rows, %{query: query, tags: tags, types: types} = context, base) do
     plan = expression_plan(query.items, types, tags)
-    fields = if count_star?(plan.aggregates), do: field_names(rows, tags), else: []
+    fields = if count_star?(plan.aggregates), do: field_names(types, tags), else: []
 
     bucket_aggregates = Enum.map(plan.aggregates, &mark_bucket/1)
 
@@ -711,7 +800,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
           not InfluxQLNames.time_item?(item),
           do: {column, name}
 
-    tag_columns = Enum.map(tags, &{&1, &1})
+    # The columns of a row take their names in this order: the dimensions of the series, the
+    # selected value, the tags it was chosen by, the other columns; a name taken is numbered
+    # (verified: `top(v, host, 1) ... GROUP BY host` has `host` and `host_1`).
+    taken = MapSet.new([time_name | Map.keys(base)])
+    {value_name, taken} = InfluxQLNames.unique(alias || kind, taken)
+    {tag_names, taken} = Enum.map_reduce(tags, taken, &InfluxQLNames.unique/2)
+
+    {column_names, _taken} =
+      Enum.map_reduce(columns, taken, fn {_column, name}, taken ->
+        InfluxQLNames.unique(name, taken)
+      end)
+
+    tag_columns = Enum.zip(tags, tag_names)
+    columns = columns |> Enum.map(&elem(&1, 0)) |> Enum.zip(column_names)
 
     points =
       Enum.flat_map(groups, fn group ->
@@ -733,7 +835,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       base
       |> Map.put(time_name, point["time"])
       |> Map.merge(beside)
-      |> Map.put(alias || kind, point[field])
+      |> Map.put(value_name, point[field])
     end
   end
 
@@ -796,13 +898,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   defp count_star?(aggregates),
     do: Enum.any?(aggregates, &match?({:aggregate, "count", :star, _alias}, &1))
 
-  # The field names the rows hold, sorted: only `COUNT(*)` needs them.
-  @spec field_names([map()], MapSet.t(binary())) :: [binary()]
-  defp field_names(rows, tags) do
-    rows
-    |> Enum.reduce(MapSet.new(), fn row, names ->
-      row |> Map.keys() |> MapSet.new() |> MapSet.union(names)
-    end)
+  # The field names of the measurement, sorted: only `COUNT(*)` needs them. The engine counts
+  # every field the measurement has, zero where the points read have none (verified).
+  @spec field_names(map(), MapSet.t(binary())) :: [binary()]
+  defp field_names(types, tags) do
+    types
+    |> Map.keys()
     |> Enum.reject(&(&1 == "time" or MapSet.member?(tags, &1)))
     |> Enum.sort()
   end

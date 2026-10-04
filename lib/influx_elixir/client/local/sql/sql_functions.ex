@@ -63,6 +63,10 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
            when type in ["Int64", "UInt64", "Float64", "Decimal128(?)", "Int32", "Int16", "Int8"]
 
   @integer_types ["Int64", "Int32", "Int16", "Int8"]
+  @scale_types ["Null" | @integer_types]
+
+  # The null literal is typed `Null`, which every signature coerces.
+  defguardp is_numeric_or_null(type) when is_numeric_type(type) or type == "Null"
 
   @int32_min -2_147_483_648
   @int32_max 2_147_483_647
@@ -254,7 +258,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
     do: planning(name, [], "'#{name}' does not support zero arguments", context)
 
   defp refusal(:abs, [type], context) do
-    if is_numeric_type(type),
+    if is_numeric_or_null(type),
       do: :ok,
       else:
         planning(
@@ -274,11 +278,11 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
         context
       )
 
-  defp refusal(name, [type], _context) when name in [:round, :trunc] and is_numeric_type(type),
+  defp refusal(name, [type], _context) when name in [:round, :trunc] and is_numeric_or_null(type),
     do: :ok
 
   defp refusal(name, [type, scale], _context)
-       when name in [:round, :trunc] and is_numeric_type(type) and scale in @integer_types,
+       when name in [:round, :trunc] and is_numeric_or_null(type) and scale in @scale_types,
        do: :ok
 
   defp refusal(name, types, context) when name in [:round, :trunc] do
@@ -296,7 +300,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
 
   @spec rounding_refusal(:floor | :ceil, [binary()], context()) :: :ok | {:error, map()}
   defp rounding_refusal(name, [type], context) do
-    if is_numeric_type(type),
+    if is_numeric_or_null(type),
       do: :ok,
       else:
         planning(
@@ -360,6 +364,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   def type_of({:uint, _value}, _columns), do: "UInt64"
   def type_of({:uint_col, _name}, _columns), do: "UInt64"
   def type_of({:neg, inner}, columns), do: type_of(inner, columns)
+  def type_of({:pos, inner}, columns), do: type_of(inner, columns)
   def type_of({:cast, _inner, type}, _columns), do: SQLCast.arrow_type(type)
   def type_of({:call, :abs, [arg]}, columns), do: type_of(arg, columns)
 

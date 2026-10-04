@@ -364,6 +364,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # The end of `AS` when the alias after it is reserved.
   @spec reserved_alias(binary(), non_neg_integer()) :: non_neg_integer() | nil
   defp reserved_alias(text, start) do
+    # An alias is an identifier or a quoted one: a number, a quote or a sign is not (verified).
+    case Regex.run(~r/\s(AS)(?![\w])\s*(?=[\d'.+-])/i, text, return: :index) do
+      [_all, {as_at, as_length}] -> start + as_at + as_length
+      nil -> reserved_word_alias(text, start)
+    end
+  end
+
+  defp reserved_word_alias(text, start) do
     case Regex.run(~r/\s(AS)(?![\w])\s*([A-Za-z_]\w*)/i, text, return: :index) do
       [_all, {as_at, as_length}, {alias_at, _length}] ->
         <<_skip::binary-size(alias_at), alias_and_rest::binary>> = text

@@ -14,7 +14,13 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   # error the engine words as an internal or an execution error is then a 500
   # without the planner's prefix.
 
-  alias InfluxElixir.Client.Local.{SQLCommonType, SQLError, SQLFunctions, SQLNativeType}
+  alias InfluxElixir.Client.Local.{
+    SQLCommonType,
+    SQLError,
+    SQLExprType,
+    SQLFunctions,
+    SQLNativeType
+  }
 
   @text "Coercion(TypeSignatureClass::Native(LogicalType(Native(String), String)))"
   @internal_tail "\nThis issue was likely caused by a bug in DataFusion's code. Please help us " <>
@@ -45,6 +51,9 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
       {:refuse, why} ->
         {:error, SQLError.refusal(why)}
 
+      {:convert, type} ->
+        {:error, SQLError.coercion("Cannot automatically convert #{type} to Utf8")}
+
       {kind, head, shown, candidates} ->
         {:error, error(kind, head, shown, types, candidates, context)}
     end
@@ -55,6 +64,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   @spec problem(atom(), [binary() | nil]) ::
           :ok
           | {:refuse, binary()}
+          | {:convert, binary()}
           | {:planning | :internal | :execution, binary(), binary(), binary()}
   defp problem(name, []) when name in [:greatest, :least] do
     {:execution,
@@ -118,6 +128,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   @typep problem ::
            :ok
            | {:refuse, binary()}
+           | {:convert, binary()}
            | {:planning | :internal | :execution, binary(), binary(), binary()}
 
   @spec typed_problem(atom(), [binary()]) :: problem()
@@ -130,7 +141,9 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
     do: math_problem(name, types)
 
   defp typed_problem(name, types) when name in [:greatest, :least] do
-    if SQLCommonType.common(types, :coalesce) == :mixed,
+    typed = Enum.reject(types, &(&1 == "Null"))
+
+    if length(typed) > 1 and SQLCommonType.common(typed, :coalesce) == :mixed,
       do: {:refuse, "#{name} of arguments with no common type the double models"},
       else: :ok
   end
@@ -156,6 +169,12 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   # `left` and `right` take anything cast to text and an integer of 64 bits or fewer.
   defp text_problem(name, [first, count]) when name in [:left, :right] do
     cond do
+      SQLExprType.struct?(first) and (count in @integer_arguments or count == "Null") ->
+        {:convert, first}
+
+      first == "Timestamp(ns)" and count == "Null" ->
+        :ok
+
       first == "Timestamp(ns)" ->
         {:refuse,
          "#{name} of a timestamp: the engine writes its nanoseconds as text, which the " <>
@@ -178,7 +197,9 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
        "length of a timestamp: the engine writes its nanoseconds as text, which the double " <>
          "keeps only to the microsecond"}
 
-  defp length_problem(types) when length(types) == 1, do: :ok
+  defp length_problem([type]) do
+    if SQLExprType.struct?(type), do: {:convert, type}, else: :ok
+  end
 
   defp length_problem(types) do
     {:planning,
@@ -189,7 +210,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
 
   @spec math_problem(atom(), [binary()]) :: problem()
   defp math_problem(name, types) when name in [:sqrt, :ln] do
-    if length(types) == 1 and hd(types) in @numbers do
+    if length(types) == 1 and hd(types) in ["Null" | @numbers] do
       :ok
     else
       {:planning,
@@ -205,7 +226,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
         {:refuse,
          "pow of an unsigned or narrow integer: the engine's coercion for it is not modelled"}
 
-      length(types) == 2 and Enum.all?(types, &(&1 in ["Int64", "Float64"])) ->
+      length(types) == 2 and Enum.all?(types, &(&1 in ["Null", "Int64", "Float64"])) ->
         :ok
 
       true ->
@@ -217,7 +238,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   end
 
   defp math_problem(:log, types) do
-    if length(types) in [1, 2] and Enum.all?(types, &(&1 in ["Int64", "Float64"])),
+    if length(types) in [1, 2] and Enum.all?(types, &(&1 in ["Null", "Int64", "Float64"])),
       do: :ok,
       else: {:refuse, "log of those arguments: the engine's error for them is not modelled"}
   end
@@ -231,14 +252,21 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
         :ok
 
       type when type in @shown_types ->
-        {:internal,
-         "Expect TypeSignatureClass::Native(LogicalType(Native(String), String)) but received " <>
-           "NativeType::#{SQLNativeType.native(type)}, DataType: #{type}.", Atom.to_string(name),
-         text_candidate(name)}
+        internal_text(name, type)
 
       type ->
-        {:refuse, "#{name} of a #{type}: the engine's error for it is not modelled"}
+        if SQLExprType.struct?(type),
+          do: internal_text(name, type),
+          else: {:refuse, "#{name} of a #{type}: the engine's error for it is not modelled"}
     end
+  end
+
+  @spec internal_text(atom(), binary()) :: {:internal, binary(), binary(), binary()}
+  defp internal_text(name, type) do
+    {:internal,
+     "Expect TypeSignatureClass::Native(LogicalType(Native(String), String)) but received " <>
+       "NativeType::#{SQLNativeType.native(type)}, DataType: #{type}.", Atom.to_string(name),
+     text_candidate(name)}
   end
 
   @substr_candidate "substr(str, start_pos, length)"
@@ -277,7 +305,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   @spec substr_argument(binary(), non_neg_integer(), [binary()], [binary()]) ::
           nil | {:execution, binary(), binary(), binary()}
   defp substr_argument(type, 0, ordinal, types) do
-    if type not in @text_types,
+    if type not in ["Null" | @text_types],
       do:
         substr_error(
           "The #{Enum.at(ordinal, 0)} argument of the substr function can only be a string, " <>
@@ -287,7 +315,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   end
 
   defp substr_argument(type, index, ordinal, types) do
-    if type not in @integers,
+    if type not in ["Null" | @integers],
       do:
         substr_error(
           "The #{Enum.at(ordinal, index)} argument of the substr function can only be an " <>
@@ -299,6 +327,21 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   # A timestamp is named by its native type in this message.
   @spec printed(binary()) :: binary()
   defp printed("Timestamp(ns)"), do: "Timestamp(Nanosecond, None)"
+
+  # A selector's struct, as the arrow type is debug printed there.
+  defp printed("Struct(" <> _fields = type) do
+    case Regex.run(~r/\AStruct\("value": (.+), "time": Timestamp\(ns\)\)\z/, type) do
+      [_all, value] ->
+        ~S|Struct([Field { name: \"value\", data_type: | <>
+          value <>
+          ~S|, nullable: true }, Field { name: \"time\", data_type: | <>
+          "Timestamp(Nanosecond, None), nullable: true }])"
+
+      nil ->
+        type
+    end
+  end
+
   defp printed(type), do: type
 
   @spec substr_error(binary(), [binary()] | nil) ::

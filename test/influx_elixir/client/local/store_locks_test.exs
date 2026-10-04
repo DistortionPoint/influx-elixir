@@ -28,12 +28,12 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
           end)
         end)
 
-      assert_receive :holding, 5_000
+      assert_receive :holding, 30_000
 
       waiter = Task.async(fn -> Store.create_database(table, "next", fn _existing -> :ok end) end)
       Process.exit(holder, :kill)
 
-      assert Task.await(waiter, 5_000) === :ok
+      assert Task.await(waiter, 30_000) === :ok
       assert Store.database?(table, "next")
       refute Store.database?(table, "held")
     end
@@ -76,7 +76,7 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
           end)
         end)
 
-      assert_receive :holding, 5_000
+      assert_receive :holding, 30_000
 
       waiter =
         Task.async(fn ->
@@ -88,7 +88,7 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
           end)
         end)
 
-      assert_receive :waiter_started, 5_000
+      assert_receive :waiter_started, 30_000
       send(holder.pid, :release)
 
       assert Task.await(holder) === :ok

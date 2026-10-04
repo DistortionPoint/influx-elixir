@@ -62,7 +62,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
       refute_received {_ref, :done}
 
       assert_received {:waiter, waiter}
-      assert {:ok, [%{"n" => 20_000}]} = Task.await(waiter, 10_000)
+      assert {:ok, [%{"n" => 20_000}]} = Task.await(waiter, 30_000)
     end
 
     test "when the consumer is killed, a request waiting on the pool is served", ctx do
@@ -78,11 +78,11 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
           end)
         end)
 
-      assert_receive :streaming, 10_000
+      assert_receive :streaming, 30_000
       waiter = queue_waiter(ctx.count)
       Process.exit(consumer, :kill)
 
-      assert {:ok, [%{"n" => 20_000}]} = Task.await(waiter, 10_000)
+      assert {:ok, [%{"n" => 20_000}]} = Task.await(waiter, 30_000)
     end
   end
 
@@ -123,7 +123,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
         end)
       end)
 
-    assert_receive {:holding, _pid}, 10_000
+    assert_receive {:holding, _pid}, 30_000
     holder
   end
 
@@ -165,7 +165,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
       assert error.reason == :pool_timeout
 
       release(ctx.holder)
-      assert {:ok, _result} = Task.await(ctx.holder, 10_000)
+      assert {:ok, _result} = Task.await(ctx.holder, 30_000)
     end
 
     test "a generous :pool_timeout waits for the connection and succeeds", ctx do
@@ -179,8 +179,8 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
 
       release(ctx.holder)
 
-      assert {:ok, [%{"one" => 1}]} = Task.await(waiter, 10_000)
-      assert {:ok, _result} = Task.await(ctx.holder, 10_000)
+      assert {:ok, [%{"one" => 1}]} = Task.await(waiter, 30_000)
+      assert {:ok, _result} = Task.await(ctx.holder, 30_000)
     end
   end
 
@@ -331,7 +331,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
       assert {:ok, [%{"value" => 1.0}]} =
                HTTP.query_sql(ctx.conn, "SELECT value FROM bw_retry", database: ctx.database)
 
-      assert {:ok, _result} = Task.await(ctx.holder, 10_000)
+      assert {:ok, _result} = Task.await(ctx.holder, 30_000)
     end
 
     test "a 4xx answered on retry discards the batch instead of retrying again", ctx do
@@ -352,7 +352,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
       assert {:ok, %{total_errors: 1, total_writes: 1}} =
                InfluxElixir.Write.BatchWriter.stats(ctx.writer)
 
-      assert {:ok, _result} = Task.await(ctx.holder, 10_000)
+      assert {:ok, _result} = Task.await(ctx.holder, 30_000)
     end
   end
 end

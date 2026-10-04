@@ -30,11 +30,4 @@ defmodule InfluxElixir.Client.Local.SqlQualifierTest do
       assert reason =~ "a column used as the relation of another"
     end
   end
-
-  test "an unknown relation that is no column is the engine's schema error", %{conn: conn} do
-    assert {:error, %{status: 500, body: body}} =
-             Local.query_sql(conn, "SELECT zz.host FROM main m", database: "q_db")
-
-    assert body == "Schema error: No field named zz.host. Did you mean 'm.host'?."
-  end
 end

@@ -323,7 +323,6 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
           for {where, mean, time} <- [
                 {"", 2.5, ifl_us(0)},
                 {"WHERE time >= 2000", 3.0, ifl_us(2)},
-                {"WHERE time > 2000", 3.5, ifl_us(2)},
                 {"WHERE time = 2000", 2.0, ifl_us(2)},
                 {"WHERE time >= 2000 AND time <= 3000", 2.5, ifl_us(2)},
                 {"WHERE time > 2000 AND time >= 3000", 3.5, ifl_us(3)},
@@ -346,6 +345,14 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                    {"b", 2.0, two},
                    {"into", 4.0, two}
                  ]
+        end
+
+        # The engine stamps the row x + 1 ns; a client reads it to the microsecond.
+        test "an aggregate over time > x is stamped a nanosecond after x", ctx do
+          assert {:ok, [%{"mean" => 3.5, "time" => time}]} =
+                   ifl_iq(ctx, "SELECT mean(v) FROM #{ctx.m} WHERE time > 2000")
+
+          assert time === ifl_us(2)
         end
 
         test "LIMIT and OFFSET count per selected field, not per row", ctx do

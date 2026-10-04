@@ -49,6 +49,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @type ast ::
           {:lit, {:int, integer()} | {:float, float()}}
           | {:str, binary()}
+          | {:bool, boolean()}
           | {:ref, binary()}
           | {:cast, binary(), :float | :integer}
           | {:agg, binary(), binary()}
@@ -60,6 +61,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @aggregates ~w(mean sum count min max first last median spread stddev mode)
   @transforms ~w(derivative non_negative_derivative difference non_negative_difference
                  cumulative_sum moving_average elapsed)
+  @field_functions @aggregates ++
+                     ~w(percentile integral derivative non_negative_derivative difference
+                        non_negative_difference cumulative_sum moving_average elapsed)
   @one_argument ~w(abs round floor ceil sqrt ln)
   @two_arguments ~w(log pow)
   @functions @one_argument ++ @two_arguments
@@ -83,6 +87,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
           | {:multi, binary(), binary(), [binary()], pos_integer()}
           | {:planning, binary()}
           | {:expand_error, binary()}
+          | {:argument, binary(), term()}
           | :error
   def parse(text) do
     with {:ok, tokens} <- tokenize(text, []),
@@ -94,6 +99,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       {:multi, _kind, _field, _tags, _limit} = multi -> multi
       {:planning, _message} = planning -> planning
       {:expand_error, _message} = error -> error
+      {:argument, _name, _argument} = argument -> argument
       _unread -> :error
     end
   end
@@ -140,14 +146,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       match = Regex.run(~r/^("(?:[^"\\]|\\.)+"|[A-Za-z_][\w.]*)(?:::(float|integer))?/, text) ->
         [all, name | cast] = match
 
-        tokenize(rest_after(text, all), [
-          {:name, InfluxQLText.unquote_ident(name), List.first(cast)} | acc
-        ])
+        tokenize(rest_after(text, all), [name_token(name, List.first(cast)) | acc])
 
       true ->
         :error
     end
   end
+
+  # An unquoted `true` or `false` is a boolean, a quoted one a name.
+  defp name_token(name, nil) do
+    if String.downcase(name) in ["true", "false"],
+      do: {:bool, String.downcase(name) == "true"},
+      else: {:name, InfluxQLText.unquote_ident(name), nil}
+  end
+
+  defp name_token(name, cast), do: {:name, InfluxQLText.unquote_ident(name), cast}
 
   # The body of a regular expression up to its closing slash; `\/` is a slash.
   @spec regex_end(binary(), iodata()) :: {:ok, binary(), binary()} | :error
@@ -175,12 +188,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp rest_after(text, prefix),
     do: binary_part(text, byte_size(prefix), byte_size(text) - byte_size(prefix))
 
-  @spec sum(list()) :: {:ok, ast(), list()} | :error
+  @spec sum(list()) :: {:ok, term(), list()} | :error
   defp sum(tokens) do
     with {:ok, left, rest} <- product(tokens), do: more(rest, left, ["+", "-"], &product/1)
   end
 
-  @spec product(list()) :: {:ok, ast(), list()} | :error
+  @spec product(list()) :: {:ok, term(), list()} | :error
   defp product(tokens) do
     with {:ok, left, rest} <- unary(tokens), do: more(rest, left, ["*", "/", "%"], &unary/1)
   end
@@ -197,8 +210,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp more(tokens, left, _ops, _next), do: {:ok, left, tokens}
 
   # One sign, then what it applies to (`- -n` is the engine's parse error).
-  @spec unary(list()) :: {:ok, ast(), list()} | :error
+  @spec unary(list()) :: {:ok, term(), list()} | :error
   defp unary([{:op, "-"}, {:number, text} | rest]), do: literal(text, -1, rest)
+
+  defp unary([{:op, "-"}, {kind, _value} | _rest]) when kind in [:str, :bool], do: :error
 
   defp unary([{:op, "-"} | rest]) do
     with {:ok, operand, after_operand} <- atom(rest), do: {:ok, {:neg, operand}, after_operand}
@@ -210,20 +225,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @spec atom(list()) :: {:ok, term(), list()} | :error
   defp atom([{:number, text} | rest]), do: literal(text, 1, rest)
   defp atom([{:str, content} | rest]), do: {:ok, {:str, content}, rest}
+  defp atom([{:bool, value} | rest]), do: {:ok, {:bool, value}, rest}
   defp atom([{:duration, ns} | rest]), do: {:ok, {:dur, ns}, rest}
   defp atom([{:regex, source} | rest]), do: {:ok, {:regex, source}, rest}
   defp atom([{:star, kind} | rest]), do: {:ok, {:star, kind}, rest}
 
   defp atom([{:op, "("} | rest]) do
     case sum(rest) do
-      {:ok, ast, [{:op, ")"} | after_group]} -> {:ok, ast, after_group}
+      {:ok, ast, [{:op, ")"} | after_group]} -> {:ok, {:paren, ast}, after_group}
       _unbalanced -> :error
     end
   end
 
   defp atom([{:name, name, nil}, {:op, "("} | rest]) when is_binary(name) do
-    with {:ok, arguments, after_call} <- arguments(rest, []),
-         do: {:ok, {:call, String.downcase(name), arguments}, after_call}
+    name = String.downcase(name)
+
+    with {:ok, arguments, after_call} <- arguments(rest, [], name in ["top", "bottom"]),
+         do: {:ok, {:call, name, arguments}, after_call}
   end
 
   defp atom([{:name, name, nil} | rest]), do: {:ok, {:ref, name}, rest}
@@ -231,17 +249,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp atom(_tokens), do: :error
 
   # The arguments of a call, after its `(`.
-  defp arguments([{:op, ")"} | rest], []), do: {:ok, [], rest}
+  defp arguments([{:op, ")"} | rest], [], _keep?), do: {:ok, [], rest}
 
-  defp arguments(tokens, acc) do
+  defp arguments(tokens, acc, keep?) do
     with {:ok, argument, rest} <- sum(tokens) do
+      argument = if acc == [] or keep?, do: argument, else: unparen(argument)
+
       case rest do
-        [{:op, ","} | more] -> arguments(more, [argument | acc])
+        [{:op, ","} | more] -> arguments(more, [argument | acc], keep?)
         [{:op, ")"} | after_call] -> {:ok, Enum.reverse([argument | acc]), after_call}
         _unclosed -> :error
       end
     end
   end
+
+  # Only the first argument of a call keeps its parentheses (all of them for `top()` and
+  # `bottom()`, which the double refuses): for a function of a field they are the planning
+  # error (see `argument_error/4`), for the others a group means nothing.
+  defp unparen({:paren, inner}), do: unparen(inner)
+  defp unparen(other), do: other
 
   defp cast_type("float"), do: :float
   defp cast_type("integer"), do: :integer
@@ -274,14 +300,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
           | {:multi, binary(), binary(), [binary()], pos_integer()}
           | {:planning, binary()}
           | {:expand_error, binary()}
+          | {:argument, binary(), term()}
           | :error
   defp classify({:call, name, arguments} = call) when name in ["top", "bottom"] do
-    if Enum.any?(arguments, &match?({kind, _} when kind in [:star, :regex], &1)),
-      do: classify_wild(call),
-      else: multi(name, arguments)
+    cond do
+      wildcard?(List.first(arguments)) -> classify_wild(call)
+      Enum.any?(arguments, &wildcard?/1) -> wildcard_arguments(name, arguments)
+      true -> multi(name, arguments)
+    end
   end
 
   defp classify({:call, _name, _arguments} = call), do: classify_wild(call)
+
+  defp classify({:paren, inner}), do: classify(inner)
 
   defp classify({:neg, operand}),
     do: with({:ok, o} <- classify_inner(operand), do: {:ok, {:neg, o}})
@@ -290,15 +321,53 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     case {classify(left), classify(right)} do
       {{:ok, l}, {:ok, r}} -> {:ok, {:bin, op, l, r}}
       {{:planning, _message} = planning, _right} -> planning
+      {{:argument, _n, _a} = argument, _right} -> argument
       {{:wild, _n, _a, _t}, _right} -> {:expand_error, @wild_in_arithmetic}
       {_left, {:wild, _n, _a, _t}} -> {:expand_error, @wild_in_arithmetic}
       {_left, {:planning, _message} = planning} -> planning
+      {_left, {:argument, _n, _a} = argument} -> argument
       _other -> :error
     end
   end
 
   defp classify({kind, _payload} = _leaf) when kind in [:star, :regex, :dur], do: :error
   defp classify(leaf), do: {:ok, leaf}
+
+  defp wildcard?({kind, _target}), do: kind in [:star, :regex]
+  defp wildcard?(_argument), do: false
+
+  # `top(f, *::tag, n)`: the last argument is judged first (verified: a limit that is no
+  # positive integer, or a wildcard), then the ones between, which must be fields or tags.
+  defp wildcard_arguments(name, [_field | rest]) do
+    {between, last} = Enum.split(rest, -1)
+
+    case {last, Enum.find(between, &wildcard?/1)} do
+      {[{kind, _target} = target], _between} when kind in [:star, :regex] ->
+        {:planning, "expected integer as last argument for #{name}, got #{wildcard_text(target)}"}
+
+      {[{:lit, {:int, n}}], _between} when n <= 0 ->
+        {:planning, "limit (#{n}) for #{name} must be greater than 0"}
+
+      {[{:lit, {:float, x}}], _between} ->
+        {:planning,
+         "expected integer as last argument for #{name}, got Literal(Float(#{Float.to_string(x)}))"}
+
+      {[{:str, content}], _between} ->
+        {:planning,
+         "expected integer as last argument for #{name}, got Literal(String(#{inspect(content)}))"}
+
+      {[{:lit, {:int, _n}}], target} when target != nil ->
+        {:planning, "only fields or tags are allow for #{name}(), got #{wildcard_text(target)}"}
+
+      _other ->
+        :error
+    end
+  end
+
+  defp wildcard_text({:star, nil}), do: "Wildcard(None)"
+  defp wildcard_text({:star, "tag"}), do: "Wildcard(Some(Tag))"
+  defp wildcard_text({:star, "field"}), do: "Wildcard(Some(Field))"
+  defp wildcard_text({:regex, source}), do: "Literal(Regex(Regex(#{inspect(source)})))"
 
   # A call with `*` or a regular expression among its arguments stands for the calls of the
   # fields it names.
@@ -307,11 +376,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
           | {:wild, binary(), [ast()], term()}
           | {:planning, binary()}
           | {:expand_error, binary()}
+          | {:argument, binary(), term()}
           | :error
   defp classify_wild({:call, name, arguments} = call) do
     case Enum.split_with(arguments, &match?({kind, _} when kind in [:star, :regex], &1)) do
       {[], _plain} ->
-        classify_call(call)
+        classify_plain(call)
 
       {[{:star, "tag"}], _plain} ->
         if name in @wild_names,
@@ -329,12 +399,28 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     end
   end
 
+  # A function of a field given a group in parentheses or arithmetic, not the field: the
+  # planning error of `argument_error/4`.
+  defp classify_plain({:call, name, [argument | _rest]} = call) when name in @field_functions do
+    if nested_argument?(argument),
+      do: {:argument, name, argument},
+      else: classify_call(call)
+  end
+
+  defp classify_plain(call), do: classify_call(call)
+
+  defp nested_argument?({:paren, _inner}), do: true
+  defp nested_argument?({:neg, _operand}), do: true
+  defp nested_argument?({:bin, _op, _left, _right}), do: true
+  defp nested_argument?(_other), do: false
+
   # Inside another expression a call with `*` is no column of its own; a
   # planning error found in it is the error of the whole.
   defp classify_inner(ast) do
     case classify(ast) do
       {:ok, classified} -> {:ok, classified}
       {:planning, _message} = planning -> planning
+      {:argument, _n, _a} = argument -> argument
       _other -> :error
     end
   end
@@ -404,6 +490,83 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp classify_call(_call), do: :error
 
   @doc """
+  The engine's planning error for a function of a field given something else (a group in
+  parentheses, arithmetic): it words the argument as its parser read it, with the type of
+  every field (verified). An argument with a typing error of its own is that error; one the
+  double does not word is refused by name.
+  """
+  @spec argument_error(binary(), term(), %{binary() => atom()}, MapSet.t(binary())) ::
+          {:error, {:engine, binary()} | binary()}
+  def argument_error(name, argument, types, tags) do
+    refusal = {:error, "unsupported InfluxQL (#{name}() of that argument)"}
+
+    with {:ok, plain} <- classify_inner(argument),
+         :ok <- check(plain, types, tags),
+         {:ok, text} <- render(argument, types, tags) do
+      {:error,
+       {:engine, InfluxQLError.select_error("expected field argument in #{name}(), got #{text}")}}
+    else
+      {:error, _reason} = error -> error
+      _unread -> refusal
+    end
+  end
+
+  @spec render(term(), map(), MapSet.t(binary())) :: {:ok, binary()} | :error
+  defp render({:paren, inner}, types, tags), do: wrap("Nested", render(inner, types, tags))
+  defp render({:lit, {:int, n}}, _types, _tags), do: {:ok, "Literal(Integer(#{n}))"}
+
+  defp render({:lit, {:float, x}}, _types, _tags) do
+    text = Float.to_string(x)
+    if String.contains?(text, "e"), do: :error, else: {:ok, "Literal(Float(#{text}))"}
+  end
+
+  defp render({:str, content}, _types, _tags) do
+    if content =~ ~r/^[\w ]*$/, do: {:ok, ~s|Literal(String("#{content}"))|}, else: :error
+  end
+
+  defp render({:bool, value}, _types, _tags), do: {:ok, "Literal(Boolean(#{value}))"}
+  defp render({:star, nil}, _types, _tags), do: {:ok, "Wildcard(None)"}
+
+  defp render({:ref, name}, types, tags) do
+    type =
+      cond do
+        String.downcase(name) == "time" -> "Some(Timestamp)"
+        MapSet.member?(tags, name) -> "Some(Tag)"
+        true -> type_text(Map.get(types, name))
+      end
+
+    {:ok, "VarRef(VarRef { name: Identifier(#{inspect(name)}), data_type: #{type} })"}
+  end
+
+  defp render({:neg, operand}, types, tags),
+    do: render({:bin, "*", {:lit, {:int, -1}}, operand}, types, tags)
+
+  defp render({:bin, op, left, right}, types, tags) do
+    with {:ok, l} <- render(left, types, tags),
+         {:ok, r} <- render(right, types, tags) do
+      {:ok, "Binary(Binary { lhs: #{l}, op: #{operator_text(op)}, rhs: #{r} })"}
+    end
+  end
+
+  defp render(_other, _types, _tags), do: :error
+
+  defp wrap(name, {:ok, text}), do: {:ok, "#{name}(#{text})"}
+  defp wrap(_name, :error), do: :error
+
+  defp type_text(nil), do: "None"
+  defp type_text(:float), do: "Some(Float)"
+  defp type_text(:integer), do: "Some(Integer)"
+  defp type_text(:unsigned), do: "Some(Unsigned)"
+  defp type_text(:string), do: "Some(String)"
+  defp type_text(:boolean), do: "Some(Boolean)"
+
+  defp operator_text("+"), do: "Add"
+  defp operator_text("-"), do: "Sub"
+  defp operator_text("*"), do: "Mul"
+  defp operator_text("/"), do: "Div"
+  defp operator_text("%"), do: "Mod"
+
+  @doc """
   The unit of an `integral()` from its argument list (none: a second): `{:ok,
   nanoseconds}`, the engine's planning error as `{:planning, message}` for a
   duration that is not positive, or `:error` for what is no duration.
@@ -434,6 +597,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       planning = Enum.find(classified, &match?({:planning, _message}, &1)) ->
         planning
 
+      argument = Enum.find(classified, &match?({:argument, _name, _argument}, &1)) ->
+        argument
+
       true ->
         :error
     end
@@ -446,6 +612,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       {:ok, {:transform, name, inner, parameter}}
     else
       {:planning, _message} = planning -> planning
+      {:argument, _n, _a} = argument -> argument
       _unread -> :error
     end
   end
@@ -570,18 +737,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # ---------------------------------------------------------------------------
 
   @typedoc "What an operand is: its type, and whether it is a literal."
-  @type type :: {:integer | :unsigned | :float | :string | :tag | :boolean | :unknown, boolean()}
+  @type type ::
+          {:integer | :unsigned | :float | :string | :tag | :boolean | :timestamp | :unknown,
+           boolean()}
 
   @doc """
   The engine's planning error for the first operation of `ast` it cannot
   type, `:ok` when there is none. `types` is the type of each field, `tags`
-  the tag columns.
+  the tag columns. A function of a time is the engine's error only when it runs a plan,
+  which it does when a field is aggregated beside it (`physical?`, verified: `abs(max(time))`
+  alone answers nothing, beside `count(v)` it is the error).
   """
-  @spec check(ast(), %{binary() => atom()}, MapSet.t(binary())) ::
+  @spec check(ast(), %{binary() => atom()}, MapSet.t(binary()), boolean()) ::
           :ok | {:error, {:engine, binary()} | binary()}
-  def check(ast, types, tags) do
+  def check(ast, types, tags, physical? \\ false) do
     case infer(ast, types, tags) do
       {:engine, body} -> {:error, {:engine, body}}
+      {:physical, body} -> if physical?, do: {:error, {:engine, body}}, else: :ok
+      {:physical_refuse, message} -> if physical?, do: refusal(message), else: :ok
       {:refuse, message} -> {:error, "unsupported InfluxQL (#{message})"}
       {:ok, _type} -> :ok
     end
@@ -596,15 +769,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     end
   end
 
-  @typep inferred :: {:ok, type()} | {:engine, binary()} | {:refuse, binary()}
+  @typep inferred ::
+           {:ok, type()}
+           | {:engine, binary()}
+           | {:physical, binary()}
+           | {:physical_refuse, binary()}
+           | {:refuse, binary()}
+
+  defp refusal(message), do: {:error, "unsupported InfluxQL (#{message})"}
 
   @spec infer(ast(), map(), MapSet.t(binary())) :: inferred()
   defp infer({:lit, {:int, _n}}, _types, _tags), do: {:ok, {:integer, true}}
   defp infer({:lit, {:float, _x}}, _types, _tags), do: {:ok, {:float, true}}
   defp infer({:str, _content}, _types, _tags), do: {:ok, {:string, true}}
+  defp infer({:bool, _value}, _types, _tags), do: {:ok, {:boolean, true}}
 
   defp infer({:ref, name}, types, tags) do
     cond do
+      String.downcase(name) == "time" -> {:ok, {:timestamp, false}}
       MapSet.member?(tags, name) -> {:ok, {:tag, false}}
       Map.has_key?(types, name) -> {:ok, {Map.fetch!(types, name), false}}
       true -> {:ok, {:unknown, false}}
@@ -620,6 +802,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     with {:ok, {type, _literal}} <- infer({:ref, name}, types, tags),
          do: cast_type_of(type, :integer)
   end
+
+  defp infer({:agg, fun, "time"}, _types, _tags) when fun in ~w(min max first last mode),
+    do: {:ok, {:timestamp, false}}
 
   defp infer({:agg, fun, arg}, types, _tags) do
     {:ok, {aggregate_type(fun, Map.get(types, arg)), false}}
@@ -667,6 +852,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @spec function_type(binary(), [type()], [ast()]) :: inferred()
   defp function_type(name, types, arguments) do
     case Enum.find(types, fn {type, _literal} -> type not in [:integer, :float, :unknown] end) do
+      {:timestamp, _literal} ->
+        timestamp_function(name)
+
       {type, _literal} ->
         {:refuse, "#{name}() of a #{type}"}
 
@@ -674,6 +862,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
         function_result(name, types, arguments)
     end
   end
+
+  # The engine plans a math function of a time only when it runs the plan (a field is
+  # aggregated beside it); `abs` is worded as its library words it, the others are refused.
+  @spec timestamp_function(binary()) :: inferred()
+  defp timestamp_function("abs") do
+    {:physical,
+     "Error during planning: Function 'abs' expects NativeType::Numeric but received " <>
+       "NativeType::Timestamp(Nanosecond, None) No function matches the given name and " <>
+       "argument types 'abs(Timestamp(ns))'. You might need to add explicit type casts." <>
+       "\n\tCandidate functions:\n\tabs(Numeric(1))"}
+  end
+
+  defp timestamp_function(name), do: {:physical_refuse, "#{name}() of a timestamp"}
 
   defp function_result("abs", [{type, _literal}], _arguments), do: {:ok, {type, false}}
 
@@ -714,13 +915,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       else: {:refuse, "#{name}() of a #{type}"}
   end
 
+  # Operands that take no part in arithmetic: the engine's `incompatible operands`.
+  @no_arithmetic [:tag, :string, :boolean, :timestamp]
+
   @spec operation(binary(), type(), type()) :: inferred()
   defp operation(op, {lt, _ll} = l, {rt, _rl} = r) do
     cond do
-      lt == :boolean or rt == :boolean ->
-        {:refuse, "a boolean in arithmetic"}
-
-      lt in [:tag, :string] or rt in [:tag, :string] ->
+      lt in @no_arithmetic or rt in @no_arithmetic ->
         {:engine, incompatible(op, lt, rt)}
 
       {lt, rt} in [{:integer, :unsigned}, {:unsigned, :integer}] and not literal?(l, r) ->

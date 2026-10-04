@@ -28,7 +28,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
 
   @boolean_nodes [:not, :is_null, :is_bool, :is_distinct]
   @predicate_nodes [:in, :between, :like]
-  @value_nodes [:concat, :case, :neg]
+  @value_nodes [:concat, :case, :neg, :pos]
 
   @typedoc "What an expression evaluates to."
   @type value :: SQLNumber.t() | binary() | boolean() | DateTime.t() | nil
@@ -183,6 +183,8 @@ defmodule InfluxElixir.Client.Local.SQLEval do
         case_result(branch, otherwise, point)
     end
   end
+
+  defp eval_value({:pos, inner}, point), do: eval(inner, point)
 
   defp eval_value({:neg, inner}, point) do
     case eval(inner, point) do

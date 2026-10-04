@@ -72,18 +72,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
           {binary(), [{binary(), InfluxQLArithmetic.check()}]}
   @doc false
   def plan_comparison(tokens, {tags, types}) do
-    # A tag under arithmetic is null, so false for every row (see `InfluxQLWhereArith`).
-    if InfluxQLWhereArith.null?(tokens, tags, types) do
-      {"(1 = 0)", []}
-    else
-      with nil <- typed_comparison(tokens, tags, types),
-           :unsupported <- InfluxQLArithmetic.compile(tokens, types) do
-        {plain(tokens, tags, types), []}
-      else
-        :written -> {plain(tokens, tags, types), []}
-        sql when is_binary(sql) -> {sql, []}
-        {:ok, check} -> check_sql(check)
-      end
+    # A tag, a string or a boolean under arithmetic is null, so false for every row; the `+`
+    # of two strings is concatenation (see `InfluxQLWhereArith`).
+    cond do
+      InfluxQLWhereArith.null?(tokens, tags, types) ->
+        {"(1 = 0)", []}
+
+      match?({:ok, _joined}, InfluxQLWhereArith.concatenation(tokens, tags, types)) ->
+        {:ok, joined} = InfluxQLWhereArith.concatenation(tokens, tags, types)
+        {plain(joined, tags, types), []}
+
+      true ->
+        with nil <- typed_comparison(tokens, tags, types),
+             :unsupported <- InfluxQLArithmetic.compile(tokens, types) do
+          {plain(tokens, tags, types), []}
+        else
+          :written -> {plain(tokens, tags, types), []}
+          sql when is_binary(sql) -> {sql, []}
+          {:ok, check} -> check_sql(check)
+        end
     end
   end
 

@@ -28,7 +28,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   # empty one is the same row every time, so a `LIMIT` over a range of millions
   # of buckets reads only the buckets it keeps.
 
-  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLAggregate, SQLLimits}
+  alias InfluxElixir.Client.Local.{InfluxQLAggregate, SQLLimits}
 
   require SQLLimits
 
@@ -251,13 +251,26 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   end
 
   # A number given to `fill()` as the column's type reads it.
-  @spec cast(integer() | float(), InfluxQL.field_type()) :: term()
+  @spec cast(integer() | float(), InfluxQLAggregate.column_type()) :: term()
   defp cast(number, :float), do: number * 1.0
+  defp cast(number, :time), do: number |> trunc() |> epoch_time()
   defp cast(number, :integer) when is_integer(number), do: number
   defp cast(number, :integer), do: trunc(number)
   defp cast(number, :unsigned) when is_integer(number), do: SQLLimits.wrap_uint64(number)
   defp cast(number, :unsigned) when number >= 0, do: trunc(number)
   defp cast(_number, type), do: refuse("fill() with a number on a #{type} column")
+
+  # A number given to `fill()` is nanoseconds from the epoch in a column of times (verified:
+  # `fill(0)` is 1970-01-01T00:00:00). `Client.HTTP` reads the engine's time to the
+  # microsecond (its floor), so the double answers the same.
+  @spec epoch_time(integer()) :: DateTime.t()
+  defp epoch_time(ns) do
+    if SQLLimits.is_int64(ns),
+      do: DateTime.from_unix!(Integer.floor_div(ns, 1000), :microsecond),
+      else: refuse("fill() with a number outside the times the double holds")
+  rescue
+    ArgumentError -> refuse("fill() with a number outside the times the double holds")
+  end
 
   # Each column takes the last value it had.
   # With a `count()` among the columns the engine breaks the connection when the
@@ -289,8 +302,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   # is empty, and of a text or boolean column whatever the buckets: refused.
   @spec linear(indexed(), specs()) :: indexed()
   defp linear(rows, specs) do
-    if Enum.any?(specs, fn {_name, {_kind, type}} -> type in [:string, :boolean] end),
-      do: refuse("fill(linear) on a string or boolean column"),
+    if Enum.any?(specs, fn {_name, {_kind, type}} -> type in [:string, :boolean, :time] end),
+      do: refuse("fill(linear) on a string, boolean or time column"),
       else: linear_rows(rows, specs)
   end
 
@@ -319,7 +332,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   # A null cell between two values is on the line through them, by the
   # position of its bucket: `y0 + (y1 - y0) * ((i - p) / (q - p))`, an
   # integer one truncated toward zero.
-  @spec interpolate([cell()], InfluxQL.field_type()) :: [cell()]
+  @spec interpolate([cell()], InfluxQLAggregate.column_type()) :: [cell()]
   defp interpolate(cells, type) do
     indexed = Enum.with_index(cells)
     before = scan_known(indexed)
@@ -348,7 +361,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
     |> elem(0)
   end
 
-  @spec line(number() | nil, number() | nil, float(), InfluxQL.field_type()) :: term()
+  @spec line(number() | nil, number() | nil, float(), InfluxQLAggregate.column_type()) :: term()
   defp line(y0, y1, ratio, :float) when is_number(y0) and is_number(y1),
     do: y0 + (y1 - y0) * ratio
 

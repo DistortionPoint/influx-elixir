@@ -51,7 +51,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlannerTest do
     end
 
     test "* beside other items, a renamed time beside an aggregate", %{conn: conn} do
-      statement = "SELECT *, i FROM m"
+      # `* , i` is answered (the wildcard is written out, `i` and `i_1`); beside an aggregate
+      # the double does not tell the engine's answer from its neighbours.
+      statement = "SELECT *, max(i) FROM m"
 
       assert refused(conn, statement) ===
                "Client.Local: unsupported InfluxQL (* beside other select items): #{statement}"

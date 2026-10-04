@@ -124,6 +124,30 @@ defmodule InfluxElixir.Contract.InfluxQLFixCases do
     end)
   end
 
+  @doc """
+  Aggregates stamped with the lower bound of a range that holds no whole microsecond
+  (`time > x` starts at `x + 1` ns, and at the smallest 64-bit time past the largest): the
+  engine answers to the nanosecond (`22:13:20.000000001`, `1677-09-21T00:12:43.145224192`),
+  which a client reads to the microsecond, and so does the double.
+  """
+  @spec nanosecond_stamps() :: [{binary(), term()}]
+  def nanosecond_stamps do
+    [
+      {"SELECT count(usage) FROM ~f4 WHERE time > 9223372036854775807",
+       [{"1677-09-21 00:12:43", %{"count" => 5}}]},
+      {"SELECT mean(usage) FROM ~f4 WHERE time > 1700000000000000000",
+       [{"2023-11-14 22:13:20", %{"mean" => 4.0}}]},
+      {"SELECT mean(usage) FROM ~f4 WHERE time >= 1700000000000000001",
+       [{"2023-11-14 22:13:20", %{"mean" => 4.0}}]},
+      {"SELECT mean(usage) FROM ~f4 WHERE time >= '2023-11-14T22:13:20.000000001Z'",
+       [{"2023-11-14 22:13:20", %{"mean" => 4.0}}]},
+      {"SELECT min(time), mean(usage) FROM ~f4 WHERE time > 1700000000000000000",
+       [{"2023-11-14 22:13:20", %{"mean" => 4.0, "min" => ~U[2023-11-14 22:13:30.000000Z]}}]},
+      {"SELECT count(usage) FROM ~f4 WHERE time > 1700000000000000000 GROUP BY host",
+       [{"2023-11-14 22:13:20", %{"count" => 4, "host" => "h1"}}]}
+    ]
+  end
+
   @doc "Durations and windows the planner refuses, in the order it refuses them."
   @spec planning_arguments() :: [
           {binary(), [{binary(), map()}] | {:error, pos_integer(), binary()} | :closed}
@@ -906,6 +930,12 @@ defmodule InfluxElixir.Contract.InfluxQLFixCases do
        [{"1970-01-01 00:00:00", %{"max" => ~U[2023-11-14 22:14:00.000000Z], "min" => 1.5}}]},
       {"SELECT min(time), max(time), count(time) FROM ~f4", []},
       {"SELECT min(time) FROM ~f4", []},
+      {"SELECT max(time) FROM ~f4", []},
+      {"SELECT sum(time) FROM ~f4", []},
+      {"SELECT median(time) FROM ~f4", []},
+      {"SELECT spread(time) FROM ~f4", []},
+      {"SELECT stddev(time) FROM ~f4", []},
+      {"SELECT mode(time) FROM ~f4", []},
       {"SELECT min(time), min(time), max(usage) FROM ~f4",
        [
          {"1970-01-01 00:00:00",
@@ -1248,8 +1278,6 @@ defmodule InfluxElixir.Contract.InfluxQLFixCases do
          {"2023-11-14 22:13:50", %{"usage" => 4.5}},
          {"2023-11-14 22:14:00", %{"usage" => 5.5}}
        ]},
-      {"SELECT count(usage) FROM ~f4 WHERE time > 9223372036854775807",
-       [{"1677-09-21 00:12:43", %{"count" => 5}}]},
       {"SELECT usage FROM ~f4 WHERE host =~ /(?i-)a/",
        {:error, 500,
         "Invalid regex\ncaused by\nExternal error: regex parse error:\n    (?i-)a\n       ^\nerror: dangling flag negation operator"}},

@@ -29,10 +29,17 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   import SQLFunctions, only: [is_numeric_type: 1]
 
+  @typedoc "What a check fails with: the engine's error, or its closing of the connection."
+  @type failure :: map() | {:connection_error, Mint.TransportError.t()}
+
   @typedoc "A stored point, as `InfluxElixir.Client.Local` keeps it."
   @type point :: InfluxElixir.Client.Local.SQLRow.point()
 
   @decimal "Decimal128(?)"
+
+  # A struct given to a function of text is converted by the type coercion, after the
+  # planner has found everything else wrong with the query (verified against Core).
+  @conversion "type_coercion\ncaused by\nError during planning: Cannot automatically convert"
   @tag "Dictionary(Int32, Utf8)"
 
   # What `AND` and `OR` accept: a boolean, or the null literal (typed `Null`).
@@ -61,7 +68,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   `unsigned?` says which columns are `UInt64`.
   """
   @spec check([point()], SQLParser.parsed_query(), (binary() -> boolean())) ::
-          :ok | {:error, map()}
+          :ok | {:error, failure()}
   def check(points, query, unsigned?) do
     checks =
       Enum.sort_by(
@@ -74,13 +81,36 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
       )
 
     case checks do
-      [] -> :ok
-      _checks -> check_items(checks, column_types(points, plan_columns(checks), unsigned?))
+      [] ->
+        :ok
+
+      _checks ->
+        aliased = struct_aliases(query)
+
+        wanted =
+          plan_columns(checks) ++ Enum.map(aliased, fn {_name, column} -> elem(column, 2) end)
+
+        types = column_types(points, wanted, unsigned?)
+        check_items(checks, Map.merge(SQLAggType.types(aliased, types), types))
     end
   end
 
+  # The select items a `HAVING` reads by their alias that are a selector's whole struct, which
+  # the engine compares as the struct (a table's column of that name wins).
+  @spec struct_aliases(SQLParser.parsed_query()) :: [{binary(), SQLParser.select_column()}]
+  defp struct_aliases(%{having: %{nodes: nodes}, select_columns: columns})
+       when is_list(columns) do
+    referenced = SQLWhere.conjunction_columns(nodes)
+
+    for {:selector, _selector, _field, _ordering, :struct, name} = column <- columns,
+        name in referenced,
+        do: {name, column}
+  end
+
+  defp struct_aliases(_query), do: []
+
   @spec rank(SQLFunctions.context(), term()) :: 0..6
-  defp rank(_context, {:neg, _inner}), do: 4
+  defp rank(_context, {kind, _inner}) when kind in [:neg, :pos], do: 4
 
   defp rank(context, {:constant, _call, ancestors}) do
     case SQLConstantCall.phase(ancestors, context) do
@@ -107,7 +137,13 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp select_items(query) do
     projected = Enum.flat_map(query.projection_columns || [], &items(elem(&1, 0)))
 
-    aggregated = Enum.flat_map(query.select_columns || [], &aggregate_items/1)
+    grouped? = (query.group_by_columns || []) != []
+
+    aggregated =
+      query.select_columns
+      |> List.wrap()
+      |> Enum.flat_map(&aggregate_items/1)
+      |> Enum.map(&selector_scope(&1, grouped?))
 
     having =
       Enum.flat_map((query.having && query.having.aggs) || [], &aggregate_items(elem(&1, 1)))
@@ -145,7 +181,17 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     items ++ Enum.flat_map(unreferenced, &aggregate_items/1)
   end
 
+  # A selector's arguments are typed whatever stands above it: the second must be a timestamp.
+  defp aggregate_items({:selector, selector, field, ordering, _kind, _alias}),
+    do: [{:selector_check, selector, field, ordering, false}]
+
   defp aggregate_items(_other), do: []
+
+  @spec selector_scope(term(), boolean()) :: term()
+  defp selector_scope({:selector_check, selector, field, ordering, _grouped}, grouped?),
+    do: {:selector_check, selector, field, ordering, grouped?}
+
+  defp selector_scope(item, _grouped?), do: item
 
   # The `AND`s, `OR`s and `NOT`s of a `WHERE`, whose operands must be
   # booleans; a `WHERE` that is one predicate has none.
@@ -314,6 +360,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     do: plan_items(left, state) ++ plan_items(right, state) ++ [mark(op, elem(state, 1))]
 
   defp plan_predicate_items({:neg, inner} = neg, state), do: plan_items(inner, state) ++ [neg]
+  defp plan_predicate_items({:pos, inner} = pos, state), do: plan_items(inner, state) ++ [pos]
 
   defp plan_predicate_items({:field, name}, _state) when is_binary(name),
     do: if(SQLAggExpr.placeholder?(name), do: [{:agg_ref, name}], else: [])
@@ -411,19 +458,29 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     do: Enum.flat_map(checks, fn {_context, item} -> SQLSchema.expr_fields(item) end)
 
   @spec check_items([{SQLFunctions.context(), term()}], %{binary() => binary()}) ::
-          :ok | {:error, map()}
+          :ok | {:error, failure()}
   defp check_items(checks, columns) do
-    Enum.reduce_while(checks, :ok, fn {context, item}, :ok ->
+    Enum.reduce_while(checks, :ok, fn {context, item}, deferred ->
       case item |> check_item(context, columns) |> decimal_guard() do
-        :ok -> {:cont, :ok}
-        {:error, _reason} = error -> {:halt, error}
+        :ok ->
+          {:cont, deferred}
+
+        {:error, %{body: @conversion <> _rest}} = error ->
+          {:cont, if(match?({:error, %{}}, deferred), do: deferred, else: error)}
+
+        # The engine closes the connection when it runs the plan, after all of its errors.
+        {:error, {:connection_error, _reason}} = closed ->
+          {:cont, if(deferred == :ok, do: closed, else: deferred)}
+
+        {:error, _reason} = error ->
+          {:halt, error}
       end
     end)
   end
 
   # An error that would print a decimal's type cannot be worded: the
   # precision of an `Int64` with a `UInt64` is not tracked.
-  @spec decimal_guard(:ok | {:error, map()}) :: :ok | {:error, map()}
+  @spec decimal_guard(:ok | {:error, failure()}) :: :ok | {:error, failure()}
   defp decimal_guard({:error, %{body: body}} = error) do
     if String.contains?(body, @decimal),
       do:
@@ -435,10 +492,11 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
       else: error
   end
 
+  defp decimal_guard({:error, {:connection_error, _reason}} = closed), do: closed
   defp decimal_guard(:ok), do: :ok
 
   @spec check_item(term(), SQLFunctions.context(), %{binary() => binary()}) ::
-          :ok | {:error, map()}
+          :ok | {:error, failure()}
   defp check_item({:cut, call}, :where, columns), do: check_item(call, :where_cut, columns)
   defp check_item({:cut, call}, context, columns), do: check_item(call, context, columns)
 
@@ -491,17 +549,52 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   # The engine words a negation the same wherever it stands.
   defp check_item({:neg, inner}, _context, columns), do: check_negation(inner, columns)
 
+  defp check_item({:pos, inner}, _context, columns) do
+    case SQLFunctions.type_of(inner, columns) do
+      type when type in [nil, "Null", "Timestamp(ns)"] or is_numeric_type(type) ->
+        :ok
+
+      _not_numeric ->
+        planning_error(
+          "Unary operator '+' only supports numeric, interval and timestamp types",
+          :select
+        )
+    end
+  end
+
   defp check_item({:aggregate, agg, expr}, _context, columns),
     do: check_aggregate(agg, expr, columns)
 
+  defp check_item({:selector_check, selector, field, ordering, grouped?}, _context, columns),
+    do: check_selector(selector, columns[field], columns[ordering], grouped?)
+
   defp check_item(item, context, columns), do: check_where_item(item, context, columns)
 
-  # The `NULL` literal has the type `Null` to the functions whose signatures coerce it with the
-  # other arguments (`left(NULL, 1.5)` is a type error); to any other it is a type not known.
+  # A selector's second argument must be a timestamp (verified against Core); the first, a
+  # tag, closes the connection under `selector_min` and `selector_max` where the query is not
+  # grouped (a grouped one fails when a group is read, see `SQLAggregate`).
+  @spec check_selector(atom(), binary() | nil, binary() | nil, boolean()) ::
+          :ok | {:error, failure()}
+  defp check_selector(selector, _value, ordering, _grouped?)
+       when ordering not in [nil, "Timestamp(ns)"] do
+    {:error,
+     SQLError.planning(
+       "selector_#{selector} second argument must be a timestamp, but got #{ordering}"
+     )}
+  end
+
+  defp check_selector(selector, @tag, _ordering, false) when selector in [:min, :max],
+    do: {:error, SQLError.closed()}
+
+  defp check_selector(_selector, _value, _ordering, _grouped?), do: :ok
+
+  # The `NULL` literal has the type `Null` to every function: its signature coerces it with
+  # the other arguments (`left(NULL, 1.5)` and `round(NULL, host)` are type errors).
   @spec argument_type(atom(), SQLExpr.t(), %{binary() => binary()}) :: binary() | nil
-  defp argument_type(function, {:lit, nil}, _columns)
-       when function in [:left, :right, :starts_with],
-       do: "Null"
+  defp argument_type(_function, {:lit, nil}, _columns), do: "Null"
+
+  defp argument_type(_function, arg, columns) when elem(arg, 0) in [:op, :neg, :pos],
+    do: arithmetic_type(arg, columns)
 
   defp argument_type(_function, arg, columns), do: SQLExprType.type_of(arg, columns)
 
@@ -658,9 +751,20 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   @spec arithmetic_type(SQLParser.expr(), %{binary() => binary()}) :: binary() | nil | :mixed
   defp arithmetic_type({:lit, nil}, _columns), do: "Null"
 
+  # A negation keeps the null's type (`-NULL + 'a'` is `Utf8 + Utf8`).
+  defp arithmetic_type({:neg, inner}, columns) do
+    case arithmetic_type(inner, columns) do
+      "Null" -> "Null"
+      _typed -> SQLExprType.type_of({:neg, inner}, columns)
+    end
+  end
+
+  defp arithmetic_type({:pos, inner}, columns), do: arithmetic_type(inner, columns)
+
+  # The engine types `NULL + NULL` as an `Int64` (`NULL + NULL + 'a'` is `Int64 + Utf8`).
   defp arithmetic_type({:op, _op, left, right} = expr, columns) do
     case {arithmetic_type(left, columns), arithmetic_type(right, columns)} do
-      {"Null", "Null"} -> "Null"
+      {"Null", "Null"} -> "Int64"
       {"Null", type} -> if is_numeric_type(type), do: type, else: nil
       {type, "Null"} -> if is_numeric_type(type), do: type, else: nil
       _typed -> SQLExprType.type_of(expr, columns)
@@ -673,6 +777,20 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   # a number is fine and a text or a boolean is an operation on that type with itself.
   @spec null_operand(atom(), binary(), SQLFunctions.context()) :: :ok | {:error, map()}
   defp null_operand(_op, type, _context) when type == "Null" or is_numeric_type(type), do: :ok
+
+  # The null beside a timestamp is a timestamp: a difference of them is null, and any other
+  # operator is the temporal operation the engine has no result type for.
+  defp null_operand(:-, "Timestamp(ns)", _context), do: :ok
+
+  defp null_operand(op, "Timestamp(ns)", context) do
+    operation = "Timestamp(ns) #{SQLExpr.symbol(op)} Timestamp(ns)"
+
+    planning_error(
+      "Cannot get result type for temporal operation #{operation}: Invalid argument error: " <>
+        "Invalid timestamp arithmetic operation: #{operation}",
+      context
+    )
+  end
 
   defp null_operand(op, type, context) when type in ["Utf8", "Boolean", @tag] do
     operation = "#{type} #{SQLExpr.symbol(op)} #{type}"
@@ -706,6 +824,8 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   @spec check_aggregate(SQLParser.aggregate(), SQLParser.expr(), %{binary() => binary()}) ::
           :ok | {:error, map()}
+  defp check_aggregate(:sum_distinct, expr, columns), do: check_aggregate(:sum, expr, columns)
+
   defp check_aggregate(agg, expr, columns) do
     case SQLExprType.type_of(expr, columns) do
       nil -> null_aggregate(agg, expr)

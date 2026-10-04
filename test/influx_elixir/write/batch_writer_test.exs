@@ -299,7 +299,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
           do: [{:send_after, delay}],
           else: [{:send_after, delay} | timer_calls(pid, kind)]
     after
-      5_000 -> flunk("the writer set no #{kind} timer")
+      @await -> flunk("the writer set no #{kind} timer")
     end
   end
 
@@ -430,7 +430,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
           Process.exit(self(), :kill)
         end)
 
-      assert_receive {:DOWN, ^monitor, :process, ^linked, :killed}, 5_000
+      assert_receive {:DOWN, ^monitor, :process, ^linked, :killed}, @await
 
       assert BatchWriter.stats(pid) === stats(0, 0, 0)
       assert Process.alive?(pid)
@@ -588,7 +588,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   # is the writer's very next message: the stats returned are exactly those
   # after this answer was handled and before any retry timer could be.
   defp answer_with_stats(pid, body, status) do
-    assert_receive {:request, handler, ^body}, 5_000
+    assert_receive {:request, handler, ^body}, @await
     reader = Task.async(fn -> BatchWriter.stats(pid) end)
     Await.until(fn -> queued_calls(pid, :stats) == 1 end)
     TestServer.respond(handler, status)
@@ -716,7 +716,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
         )
 
       first = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
-      assert_receive {:request, held, "cpu value=1.0"}, 5_000
+      assert_receive {:request, held, "cpu value=1.0"}, @await
 
       # Queued behind the held attempt, so it is the writer's next message.
       second = Task.async(fn -> BatchWriter.write(pid, "cpu value=2.0") end)
@@ -728,9 +728,9 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       # Chain 1's one retry fails and ends it (error 1); the deferred line then
       # flushes into chain 2, which succeeds.
-      assert_receive {:request, retry, "cpu value=1.0"}, 5_000
+      assert_receive {:request, retry, "cpu value=1.0"}, @await
       TestServer.respond(retry, 503)
-      assert_receive {:request, deferred, "cpu value=2.0"}, 5_000
+      assert_receive {:request, deferred, "cpu value=2.0"}, @await
       TestServer.respond(deferred, 204)
 
       assert BatchWriter.stats(pid) === stats(1, 1, 13)
@@ -766,7 +766,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
         )
 
       one = Task.async(fn -> BatchWriter.write_sync(pid, "cpu value=1.0") end)
-      assert_receive {:request, held, "cpu value=1.0"}, 5_000
+      assert_receive {:request, held, "cpu value=1.0"}, @await
       TestServer.respond(held, 503)
 
       # Chain 1 is now retrying; the second caller starts a chain of its own.
@@ -775,7 +775,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       # Whichever of chain 1's retry and the second call the writer takes
       # first, chain 1 ends on a 400 and chain 2 on a 204.
       for _request <- 1..2 do
-        assert_receive {:request, handler, body}, 5_000
+        assert_receive {:request, handler, body}, @await
         TestServer.respond(handler, if(body == "cpu value=1.0", do: 400, else: 204))
       end
 
@@ -800,7 +800,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       # Chain 1's first attempt: held while the writer is blocked on it, so
       # the next two calls are queued behind it in a known order.
       first = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
-      assert_receive {:request, held, "cpu value=1.0"}, 5_000
+      assert_receive {:request, held, "cpu value=1.0"}, @await
 
       second = Task.async(fn -> BatchWriter.write(pid, "cpu value=2.0") end)
       Await.until(fn -> queued_calls(pid, :write) == 1 end)
@@ -811,7 +811,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert :ok = Task.await(first, @await)
 
       # Chain 2's first attempt, started by the queued flush before any retry.
-      assert_receive {:request, chain_two, "cpu value=2.0"}, 5_000
+      assert_receive {:request, chain_two, "cpu value=2.0"}, @await
       TestServer.respond(chain_two, 503)
       assert :ok = Task.await(second, @await)
       assert :ok = Task.await(flush, @await)
@@ -840,11 +840,11 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       # The next request is chain 2's retry, not a flush of the ten lines; it
       # succeeds, and only then do the ten buffered lines go out in one write.
-      assert_receive {:request, retry, "cpu value=2.0"}, 5_000
+      assert_receive {:request, retry, "cpu value=2.0"}, @await
       TestServer.respond(retry, 204)
 
       accepted = Enum.map_join(1..10, "\n", &"cpu value=#{&1}.5")
-      assert_receive {:request, buffered, ^accepted}, 5_000
+      assert_receive {:request, buffered, ^accepted}, @await
       TestServer.respond(buffered, 204)
 
       assert BatchWriter.stats(pid) === stats(2, 1, 13 + byte_size(accepted))
@@ -863,7 +863,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       # The first attempt reached the server, so the writer has taken the
       # call; the write below is queued behind it and lands in the buffer
       # while the chain waits to retry.
-      assert_receive {:seen, "cpu value=1.0"}, 5_000
+      assert_receive {:seen, "cpu value=1.0"}, @await
       :ok = BatchWriter.write(pid, "cpu value=2.0")
 
       :ok = stop_supervised!(BatchWriter)
@@ -879,7 +879,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       pid = start_http_writer(finch, TestServer.controlled(), max_retries: 0)
 
       caller = Task.async(fn -> BatchWriter.write_sync(pid, "cpu value=1.0") end)
-      assert_receive {:request, handler, "cpu value=1.0"}, 5_000
+      assert_receive {:request, handler, "cpu value=1.0"}, @await
       TestServer.respond(handler, 503)
 
       assert {:error, %{status: 503}} = Task.await(caller, @await)
@@ -905,7 +905,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
         TestServer.respond(handler, 503)
         answer_until_chain_two_is_held(false)
     after
-      5_000 -> flunk("no request arrived from the writer")
+      @await -> flunk("no request arrived from the writer")
     end
   end
 end

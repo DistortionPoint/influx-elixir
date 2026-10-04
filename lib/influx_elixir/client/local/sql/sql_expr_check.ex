@@ -22,6 +22,8 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
   @type context :: :select | :where | :order_by
 
+  @tag "Dictionary(Int32, Utf8)"
+
   # What `AND` and `OR` accept: a boolean, or the null literal (typed `Null`).
   @logical ["Boolean", "Null"]
 
@@ -151,29 +153,57 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   @spec check_concat(SQLExpr.t(), SQLExpr.t(), %{binary() => binary()}, context()) ::
           :ok | {:error, map()}
   defp check_concat(left, right, columns, context) do
-    case {type(left, columns), type(right, columns)} do
+    case {concat_type(left, columns), concat_type(right, columns)} do
       {l, r} when is_binary(l) and is_binary(r) ->
         cond do
-          "Timestamp(ns)" in [l, r] and (text?(l) or text?(r)) ->
+          not concatenable?(l, r) ->
+            concat_error(l, r, context)
+
+          "Timestamp(ns)" in [l, r] ->
             {:error,
              SQLError.refusal(
                "a timestamp concatenated as text: the engine writes its nanoseconds, which " <>
                  "the double keeps only to the microsecond"
              )}
 
-          text?(l) or text?(r) ->
-            if SQLExprType.struct?(l) or SQLExprType.struct?(r),
-              do: concat_error(l, r, context),
-              else: :ok
-
           true ->
-            concat_error(l, r, context)
+            :ok
         end
 
       _text_or_unknown ->
         :ok
     end
   end
+
+  # What the engine joins (verified over every pair of a text, a tag, a number, a boolean,
+  # a timestamp and the null): anything beside plain text, and a tag beside a tag or the
+  # null (the null beside plain text too). A struct beside anything is no text.
+  @spec concatenable?(binary(), binary()) :: boolean()
+  defp concatenable?(left, right) do
+    cond do
+      SQLExprType.struct?(left) or SQLExprType.struct?(right) -> false
+      plain_text?(left) or plain_text?(right) -> true
+      left == @tag -> right in [@tag, "Null"]
+      left == "Null" -> right == @tag
+      true -> false
+    end
+  end
+
+  @spec plain_text?(binary()) :: boolean()
+  defp plain_text?(type), do: type in ["Utf8", "Utf8View", "LargeUtf8"]
+
+  # The type of a `||` operand: the null literal, negated or not, is `Null`.
+  @spec concat_type(SQLExpr.t(), %{binary() => binary()}) :: SQLExprType.type()
+  defp concat_type({:lit, nil}, _columns), do: "Null"
+
+  defp concat_type({:neg, inner}, columns) do
+    case concat_type(inner, columns) do
+      "Null" -> "Null"
+      _typed -> type({:neg, inner}, columns)
+    end
+  end
+
+  defp concat_type(expr, columns), do: type(expr, columns)
 
   @spec concat_error(binary(), binary(), context()) :: {:error, map()}
   defp concat_error(left, right, context) do
@@ -334,7 +364,9 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
     Enum.all?(types, &is_binary/1) and
       (("Boolean" in types and Enum.any?(types, &(&1 != "Boolean"))) or
-         ("Timestamp(ns)" in types and Enum.any?(types, &(&1 in @not_time))))
+         ("Timestamp(ns)" in types and Enum.any?(types, &(&1 in @not_time))) or
+         (Enum.any?(types, &SQLExprType.struct?/1) and
+            not Enum.all?(types, &SQLExprType.struct?/1)))
   end
 
   defp uncomparable?(_operand_type, _conditions), do: false

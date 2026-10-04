@@ -20,10 +20,28 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
   """
   @spec resolve([item()]) :: {:ok, [item()]} | {:error, binary()}
   def resolve(items) do
-    # a list with a constant in it is the engine's planning error, whatever its names
-    if Enum.any?(items, &InfluxQLLiteral.literal_item?/1),
+    # a list with a constant in it is the engine's planning error, whatever its names; a `*`
+    # that is written out beside other columns names them all once it is (`InfluxQLWild`)
+    if Enum.any?(items, &InfluxQLLiteral.literal_item?/1) or star_written_out?(items),
       do: {:ok, items},
       else: resolve_names(items)
+  end
+
+  @doc """
+  Whether a `*` of the list is written out as columns: beside another `*`, or beside a column or a
+  wildcard (alone, or beside an aggregate, it is left to the rows).
+  """
+  @spec star_written_out?([item()]) :: boolean()
+  def star_written_out?(items) do
+    stars = Enum.count(items, &(&1 == :star))
+
+    stars > 1 or
+      (stars == 1 and
+         Enum.any?(items, fn
+           {:column, _column, _name} = item -> not time_item?(item)
+           {:wild_column, _target} -> true
+           _item -> false
+         end))
   end
 
   @spec resolve_names([item()]) :: {:ok, [item()]} | {:error, binary()}
@@ -77,6 +95,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
   defp rename({:multi, kind, field, tags, limit, _alias}, name),
     do: {:multi, kind, field, tags, limit, name}
 
+  @doc "The name `name` becomes among those `taken`: itself, else `name_1`, `name_2`..."
+  @spec unique(binary(), MapSet.t(binary())) :: {binary(), MapSet.t(binary())}
+  def unique(name, taken), do: take(name, taken)
+
   @spec take(binary(), MapSet.t(binary())) :: {binary(), MapSet.t(binary())}
   defp take(name, taken), do: take(name, name, 0, taken)
 
@@ -101,12 +123,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
 
   defp lead_time(item), do: item
 
+  # What may stand beside a `*`: other columns and wildcards, which are written out beside it
+  # (see `InfluxQLWild`), and the time.
+  defp star_companion?(:star), do: true
+  defp star_companion?({:column, _column, _name}), do: true
+  defp star_companion?({:wild_column, _target}), do: true
+  defp star_companion?(_item), do: false
+
   @spec check([item()], boolean()) :: {:ok, [item()]} | {:error, binary()}
   defp check(items, explicit_time?) do
     names = items |> Enum.map(&name/1) |> Enum.reject(&is_nil/1)
 
     cond do
-      :star in items and Enum.any?(items, &(&1 != :star and not time_item?(&1))) ->
+      :star in items and Enum.any?(items, &(not star_companion?(&1))) ->
         {:error, "unsupported InfluxQL (* beside other select items)"}
 
       length(names) != length(Enum.uniq(names)) ->

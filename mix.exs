@@ -140,12 +140,22 @@ defmodule InfluxElixir.MixProject do
     end
   end
 
+  # A path is recognised by what it is, not by where OptionParser leaves it:
+  # a switch this list does not know (`--no-compile`, `--force`) would take
+  # the path after it as its value.
   defp explicit_selection?(args) do
-    {opts, paths, _unknown} = OptionParser.parse(args, switches: @test_switches)
+    {opts, _paths, _unknown} = OptionParser.parse(args, switches: @test_switches)
     tags = Keyword.get_values(opts, :include) ++ Keyword.get_values(opts, :only)
 
-    paths != [] or opts[:failed] == true or opts[:stale] == true or
+    Enum.any?(args, &path_argument?/1) or opts[:failed] == true or opts[:stale] == true or
       Enum.any?(tags, &(hd(String.split(&1, ":")) in @integration_tags))
+  end
+
+  defp path_argument?("-" <> _switch), do: false
+
+  defp path_argument?(arg) do
+    path = arg |> String.split(":") |> hd()
+    String.ends_with?(path, ".exs") or (path != "" and File.exists?(path))
   end
 
   defp unit_test_paths do

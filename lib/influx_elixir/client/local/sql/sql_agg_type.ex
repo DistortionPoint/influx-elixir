@@ -56,6 +56,9 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   # of it fail the plan before this is read.
   defp result({:aggregate, agg, {:lit, nil}, _name}, _columns), do: null_result(agg)
 
+  defp result({:aggregate, :sum_distinct, expr, name}, columns),
+    do: result({:aggregate, :sum, expr, name}, columns)
+
   defp result({:aggregate, agg, expr, _name}, columns) do
     kept(agg, SQLExprType.type_of(expr, columns))
   end
@@ -77,7 +80,7 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   end
 
   @spec null_result(SQLSelect.aggregate()) :: binary() | nil
-  defp null_result(agg) when agg in [:min, :max, :sum, :avg], do: nil
+  defp null_result(agg) when agg in [:min, :max, :sum, :sum_distinct, :avg], do: nil
   defp null_result(_statistic), do: "Float64"
 
   # An aggregate of an argument it does not take (the engine fails the plan with its own

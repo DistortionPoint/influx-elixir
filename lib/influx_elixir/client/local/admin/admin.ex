@@ -225,13 +225,16 @@ defmodule InfluxElixir.Client.Local.Admin do
     }
   end
 
+  @doc false
   # The engine prints a token's times to the millisecond, and with no fraction
   # at all when the milliseconds are zero (`…:53Z`, verified against Core).
+  # Public only so the whole-second case, which a created token reaches by
+  # chance, can be tested directly.
   @spec token_time(DateTime.t()) :: binary()
-  defp token_time(%DateTime{microsecond: {0, _precision}} = time),
+  def token_time(%DateTime{microsecond: {0, _precision}} = time),
     do: time |> DateTime.truncate(:second) |> DateTime.to_iso8601()
 
-  defp token_time(time), do: DateTime.to_iso8601(time)
+  def token_time(time), do: DateTime.to_iso8601(time)
 
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}

@@ -36,7 +36,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
     fill: "invalid FILL option, expected NULL, NONE, PREVIOUS, LINEAR, or a number",
     comment: "invalid inline comment, missing closing */",
     unterminated_string: "unterminated string literal",
-    unterminated_regex: "unterminated regex literal"
+    unterminated_regex: "unterminated regex literal",
+    unary:
+      "unexpected unary expression: expected literal integer, float, duration, field, " <>
+        "function or parenthesis"
   }
 
   @doc """

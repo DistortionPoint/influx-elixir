@@ -13,6 +13,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     InfluxQLTimeExpr,
     InfluxQLTokens,
     InfluxQLTyped,
+    InfluxQLWhereArith,
     SQLLimits
   }
 
@@ -176,7 +177,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   @spec plan(tuple(), {MapSet.t(binary()), map()}, times()) ::
           {binary(), [InfluxQL.bound()], [{binary(), InfluxQLArithmetic.check()}]}
-  defp plan({:cmp, tokens}, {tags, _types} = ctx, times) do
+  defp plan({:cmp, tokens}, {tags, types} = ctx, times) do
+    check_calls(tokens, tags, types)
+
     if Enum.any?(tokens, &InfluxQLTokens.time?/1) do
       {sql, lowers} = time_plan(tokens, tags, times)
       {sql, lowers, []}
@@ -220,11 +223,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   defp absent_column?(_tokens, nil), do: false
 
+  # The name of a call is no column.
   defp absent_column?(tokens, known) do
-    Enum.any?(tokens, fn
-      {:ident, name} -> not MapSet.member?(known, name)
-      _token -> false
+    tokens
+    |> Enum.chunk_every(2, 1, [nil])
+    |> Enum.any?(fn
+      [{:ident, name}, next] -> next != {:raw, "("} and not MapSet.member?(known, name)
+      _tokens -> false
     end)
+  end
+
+  # The calls of a comparison are `abs()` of a number, or the engine's planning error, or
+  # refused by name.
+  @spec check_calls(list(), MapSet.t(binary()), map()) :: :ok
+  defp check_calls(tokens, tags, types) do
+    case InfluxQLWhereArith.call_error(tokens, tags, types) do
+      :ok -> :ok
+      {:engine, body} -> throw({:refused, {:engine, body}})
+      {:refuse, message} -> throw({:refused, message})
+    end
   end
 
   defp join_plans(nodes, separator, ctx, times) do

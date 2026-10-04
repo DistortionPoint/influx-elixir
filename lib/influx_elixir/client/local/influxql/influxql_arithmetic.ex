@@ -12,7 +12,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   #     `2^64 + n - 1` (the lowest 64-bit integer is null), so `u * -1` is
   #     `u * (2^64 - 2)`; next to a float both are floats
   #   * `+`, `-` and `*` wrap at the range of the type, signed as well as
-  #     unsigned; `/` truncates and a division by zero is null
+  #     unsigned; `/` of two signed integers is a float division, of unsigned ones it
+  #     truncates, and a division by zero is zero, whatever the type
+  #     (verified: `n / 0 = 0` and `v / 0 = 0` keep every point that has the field, `> 0` none)
+  #   * `abs(x)` is the absolute value, in the type of `x`; of the smallest 64-bit integer it
+  #     breaks the connection (verified)
   #   * `-x` is `x * -1`, so `-u` is not the negation of `u`
   #   * a comparison with a null is false, and an unsigned and an integer
   #     compare as unsigned: `j > u` for `j = -5` is `2^64 - 6 > u`
@@ -35,6 +39,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
           {:lit, value()}
           | {:field, binary(), :int | :uint | :float}
           | {:op, binary(), expr(), expr()}
+          | {:abs, expr()}
 
   @typedoc "A comparison to evaluate over rows."
   @type check :: {:check, binary(), expr(), expr()}
@@ -78,15 +83,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
 
   @doc """
   The comparison of `tokens` (those of `InfluxElixir.Client.Local.InfluxQLTokens`)
-  to evaluate over rows, when it is one of numbers with an unsigned field in
-  it; `:unsupported` for anything else. `types` maps each field to its type.
+  to evaluate over rows, when it is one of numbers with an unsigned field, a division or
+  an `abs()` in it; `:unsupported` for anything else. `types` maps each field to its type.
   """
   @spec compile(list(), %{binary() => atom()}) :: {:ok, check()} | :unsupported
   def compile(tokens, types) do
     with {left, op, right} <- split(tokens),
          {l, []} <- sum(left, types),
          {r, []} <- sum(right, types),
-         true <- unsigned?(l) or unsigned?(r) do
+         true <- evaluated?(l) or evaluated?(r) do
       {:ok, {:check, op, l, r}}
     else
       _other -> :unsupported
@@ -107,10 +112,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
     end
   end
 
-  @spec unsigned?(expr()) :: boolean()
-  defp unsigned?({:field, _name, :uint}), do: true
-  defp unsigned?({:op, _op, left, right}), do: unsigned?(left) or unsigned?(right)
-  defp unsigned?(_expr), do: false
+  # The SQL engine does not follow the engine's rules for an unsigned field, a division
+  # (by zero) or an `abs()`.
+  @spec evaluated?(expr()) :: boolean()
+  defp evaluated?({:field, _name, :uint}), do: true
+  defp evaluated?({:op, "/", _left, _right}), do: true
+  defp evaluated?({:op, _op, left, right}), do: evaluated?(left) or evaluated?(right)
+  defp evaluated?({:abs, _operand}), do: true
+  defp evaluated?(_expr), do: false
 
   # `sum := product (("+" | "-") product)*`, `product := unary (("*" | "/") unary)*`.
   @spec sum(list(), map()) :: {expr(), list()} | :error
@@ -147,6 +156,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   end
 
   defp unary([{:raw, "+"} | rest], types), do: unary(rest, types)
+
+  defp unary([{:ident, name}, {:raw, "("} | rest], types) do
+    with true <- String.downcase(name) == "abs",
+         {expr, [{:raw, ")"} | after_call]} <- sum(rest, types) do
+      {{:abs, expr}, after_call}
+    else
+      _other -> :error
+    end
+  end
 
   defp unary([{:raw, "("} | rest], types) do
     case sum(rest, types) do
@@ -211,6 +229,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   defp eval({:field, name, kind}, row), do: field_value(kind, Map.get(row, name))
 
   defp eval({:op, op, left, right}, row), do: apply_op(op, eval(left, row), eval(right, row))
+  defp eval({:abs, operand}, row), do: absolute(eval(operand, row))
+
+  @spec absolute(value()) :: value()
+  defp absolute({:int, n}) when n == -9_223_372_036_854_775_808, do: throw(:closed_connection)
+
+  defp absolute({:int, n}), do: {:int, abs(n)}
+  defp absolute({:float, x}), do: {:float, abs(x)}
+  defp absolute(other), do: other
 
   defp field_value(:int, n) when is_integer(n), do: {:int, n}
   defp field_value(:uint, n) when is_integer(n), do: {:uint, n}
@@ -252,13 +278,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   defp unsigned({:int, n}), do: SQLLimits.uint64_max() + n
 
   @spec uint_op(binary(), non_neg_integer(), non_neg_integer()) :: value()
-  defp uint_op("/", _x, 0), do: nil
+  defp uint_op("/", _x, 0), do: {:uint, 0}
   defp uint_op("/", x, y), do: {:uint, div(x, y)}
   defp uint_op(op, x, y), do: {:uint, SQLLimits.wrap_uint64(arith(op, x, y))}
 
   @spec int_op(binary(), integer(), integer()) :: value()
-  defp int_op("/", _x, 0), do: nil
-  defp int_op("/", x, y), do: {:int, wrap_signed(div(x, y))}
+  defp int_op("/", x, y), do: float_op("/", x * 1.0, y * 1.0)
   defp int_op(op, x, y), do: {:int, wrap_signed(arith(op, x, y))}
 
   defp arith("+", x, y), do: x + y
@@ -266,7 +291,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   defp arith("*", x, y), do: x * y
 
   @spec float_op(binary(), float(), float()) :: value()
-  defp float_op("/", _x, y) when y == 0.0, do: nil
+  defp float_op("/", _x, y) when y == 0.0, do: {:float, 0.0}
 
   defp float_op(op, x, y) do
     {:float, float_arith(op, x, y)}

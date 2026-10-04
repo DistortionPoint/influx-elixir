@@ -115,7 +115,19 @@ defmodule InfluxElixir.Contract.SQLScalarRefusals do
       {:sel, "CASE time WHEN 's' THEN 'a' END"},
       {:sel, "CASE time WHEN s THEN 'a' END"},
       {:sel, "CASE s WHEN time THEN 'a' END"},
-      {:sel, "CASE host WHEN time THEN 'a' END"}
+      {:sel, "CASE host WHEN time THEN 'a' END"},
+      {:raw, "replace into m values (1)"},
+      {:raw, "select +s from main limit 1"},
+      {:raw, "select log('a',NULL) from main"},
+      {:raw, "select log(NULL,'a') from main"},
+      {:raw, "select log(NULL,host) from main"},
+      {:raw, "select log(NULL,time) from main"},
+      {:raw, "select log(NULL,true) from main"},
+      {:raw, "select log(host,NULL) from main"},
+      {:raw, "select log(time,NULL) from main"},
+      {:raw, "select log(true,NULL) from main"},
+      {:raw, "select starts_with(NULL,time) from main"},
+      {:raw, "select starts_with(time,NULL) from main"}
     ]
   end
 
@@ -149,7 +161,11 @@ defmodule InfluxElixir.Contract.SQLScalarRefusals do
       {:raw, "SELECT host, sum(v) * 2 AS t, n FROM main GROUP BY host"},
       {:raw, "SELECT host, approx_median(n) AS t, region FROM main GROUP BY host"},
       {:raw, "SELECT host, array_agg(n) AS t, region FROM main GROUP BY host"},
-      {:raw, "SELECT avg(DISTINCT n) + 1 AS r FROM main"}
+      {:raw, "SELECT avg(DISTINCT n) + 1 AS r FROM main"},
+      {:raw, "select count(distinct n, v) from main"},
+      {:raw, "select selector_max(v) from main"},
+      {:raw, "select selector_max(v, 'a') from main"},
+      {:raw, "select selector_max(v, time + 1) from main"}
     ]
   end
 
@@ -211,7 +227,31 @@ defmodule InfluxElixir.Contract.SQLScalarRefusals do
       {:raw, "SELECT main.n, ping.v FROM main, ping ORDER BY main.n"},
       {:raw, "SELECT n FROM main, ping, mext ORDER BY n"},
       {:raw, "SELECT 1 N'a' z"},
-      {:raw, "SELECT 1 X'AB' z"}
+      {:raw, "SELECT 1 X'AB' z"},
+      {:raw, "create index i on m (a)"},
+      {:raw, "desc 'a'"},
+      {:raw, "drop extension a, b"},
+      {:raw, "insert into"},
+      {:raw, "insert into information_schema.tables values (1)"},
+      {:raw, "insert or replace into m values (1)"},
+      {:raw, "insert overwrite m values (1)"},
+      {:raw, "select 1 union table a"},
+      {:raw, "update information_schema.tables set v = 1"},
+      {:raw, "update main set v = 1 where zzz.v = 1"},
+      {:raw, "update main set v = main.zzz"},
+      {:raw, "update main set v = n.zzz"},
+      {:raw, "update main set v = zzz.n"},
+      {:raw, "update main set v = zzz.n.q"},
+      {:raw, "attach database 'd' as e"},
+      {:raw, "create trigger t before insert on m"},
+      {:raw, "desc 'a b'"},
+      {:raw, "grant select () on m to u"},
+      {:raw, "merge into m as a using t as b on a.x = b.x when matched then update set x = 1"},
+      {:raw, "merge into m using (select 1) as t on true"},
+      {:raw,
+       "merge into m using t on true when matched then delete when not matched then insert values (1)"},
+      {:raw, "merge into m using t on true when not matched then insert (a) values (1)"},
+      {:raw, "merge into m using t on x = 1"}
     ]
   end
 

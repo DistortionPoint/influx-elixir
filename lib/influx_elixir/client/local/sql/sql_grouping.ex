@@ -64,14 +64,13 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
 
   defp check_having(%{having: %{nodes: nodes}} = query, grouped, relations) do
     outputs = for column <- query.select_columns, do: elem(column, tuple_size(column) - 1)
-    columns = SQLSchema.table_columns(relations)
 
     qualified = for {:qualified, _relation, _name} = ref <- SQLSchema.where_refs(nodes), do: ref
 
     problem =
       Enum.find_value(
         SQLWhere.conjunction_columns(nodes) ++ qualified,
-        &having_problem(&1, query, grouped, outputs, columns)
+        &having_problem(&1, query, grouped, outputs, relations)
       )
 
     case problem do
@@ -86,12 +85,12 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
           SQLParser.parsed_query(),
           [binary()],
           [binary()],
-          MapSet.t(binary())
+          [SQLSchema.relation()]
         ) :: nil | {:ungrouped, binary()} | {:refuse, binary()}
-  defp having_problem({:qualified, relation, _name} = ref, _query, _grouped, outputs, columns) do
-    taken = unquoted(relation)
+  defp having_problem({:qualified, relation, _name} = ref, _query, _grouped, outputs, relations) do
+    taken = SQLLiteral.unquoted(relation)
 
-    if taken in outputs or MapSet.member?(columns, taken),
+    if taken in outputs or SQLSchema.column?(relations, taken),
       do:
         {:refuse,
          "a HAVING name #{SQLExpr.ref_text(ref)} whose relation is a column or a select item: " <>
@@ -99,7 +98,7 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
       else: {:ungrouped, SQLExpr.ref_text(ref)}
   end
 
-  defp having_problem(name, query, grouped, outputs, columns) do
+  defp having_problem(name, query, grouped, outputs, relations) do
     cond do
       SQLAggExpr.placeholder?(name) or name in grouped ->
         nil
@@ -107,17 +106,12 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
       MapSet.member?(Map.get(query.qualified_in, :having, MapSet.new()), name) ->
         {:ungrouped, SQLSchema.written_name(name, query.qualified)}
 
-      name in outputs and not MapSet.member?(columns, name) ->
+      name in outputs and not SQLSchema.column?(relations, name) ->
         nil
 
       true ->
         {:ungrouped, "#{query.qualifier}.#{name}"}
     end
-  end
-
-  @spec unquoted(binary()) :: binary()
-  defp unquoted(text) do
-    if SQLLiteral.identifier?(text), do: SQLLiteral.identifier_name(text), else: text
   end
 
   # The first column an expression reads outside an aggregate that is not

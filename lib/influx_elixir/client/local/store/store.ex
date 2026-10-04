@@ -188,9 +188,10 @@ defmodule InfluxElixir.Client.Local.Store do
   @spec drop_database(t(), binary()) :: :ok | :error
   def drop_database(table, name) do
     if database?(table, name) do
+      # The database goes first, so no reader finds it while its data is being removed.
+      :ets.delete(table, {:database, name})
       delete_data(table, name)
       :ets.delete(table, {:retention, name})
-      :ets.delete(table, {:database, name})
       :ok
     else
       :error

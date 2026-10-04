@@ -20,12 +20,7 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # the 405 or the planning error of a statement that needs nothing more
   # (`BEGIN`, `COMMIT`, `SHOW`).
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLIdentifiers, SQLTokenizer}
-
-  # The privileges `GRANT`, `REVOKE` and `DENY` take (every other word is where the parser
-  # expects a privilege keyword).
-  @privileges ~w(ALL SELECT INSERT UPDATE DELETE TRUNCATE REFERENCES TRIGGER CREATE USAGE CONNECT
-    EXECUTE TEMPORARY MODIFY MONITOR)
+  alias InfluxElixir.Client.Local.{SQLDdl, SQLError, SQLGrant, SQLIdentifiers, SQLTokenizer}
 
   # The words a statement of the engine's parser may start with (every one
   # of them was checked: none is `Expected: an SQL statement`).
@@ -208,9 +203,14 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   @spec phrase(binary(), SQLTokenizer.tokens()) :: SQLError.t() | nil
   defp phrase(word, [next | _rest]) when word in ["GRANT", "REVOKE", "DENY"] do
     case next do
-      {:eof, _printed, _upper, _line, _col} -> nil
-      {:word, _printed, upper, _line, _col} when upper in @privileges -> nil
-      token -> expected("a privilege keyword", token)
+      {:eof, _printed, _upper, _line, _col} ->
+        nil
+
+      {:word, _printed, upper, _line, _col} = token ->
+        if SQLGrant.privilege?(upper), do: nil, else: expected("a privilege keyword", token)
+
+      token ->
+        expected("a privilege keyword", token)
     end
   end
 
@@ -250,17 +250,13 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   defp merged(_name, _rest), do: nil
 
   @spec expected(binary(), SQLTokenizer.token()) :: SQLError.t()
-  defp expected(what, {:eof, _printed, _upper, _line, _col}),
-    do: SQLError.parser("Expected: #{what}, found: EOF")
-
-  defp expected(what, {_kind, printed, _upper, line, col}),
-    do: SQLError.parser("Expected: #{what}, found: #{printed} at Line: #{line}, Column: #{col}")
+  defp expected(what, token), do: SQLDdl.expected(what, token)
 
   # The words the engine prints in capitals when it names a statement it does not run
   # (the keywords of the statements above, and the words that follow them).
   @display_words @statement_words ++
                    ~w(TABLE TRANSACTION COLUMN ADD INT ALL ON TO LOGS SAVEPOINT CURSOR FOR IS AS
-                      MATERIALIZED VIEW DATA DATABASE SCHEMA)
+                      MATERIALIZED VIEW DATA DATABASE SCHEMA USING FOREIGN WRAPPER)
 
   @doc """
   A statement the engine does not run as it names it in its error: the keywords in capitals
@@ -273,11 +269,14 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
     text = statement |> String.trim() |> String.replace_suffix(";", "") |> String.trim()
 
     cond do
-      Regex.match?(~r/\A(?:MERGE|GRANT|REVOKE|DENY)\b/i, text) ->
-        privilege_or_merge_display(text)
+      Regex.match?(~r/\A(?:GRANT|REVOKE|DENY)\b/i, text) ->
+        SQLGrant.display(text)
+
+      Regex.match?(~r/\AMERGE\b/i, text) ->
+        merge_display(text)
 
       Regex.match?(~r/\A[A-Za-z_][\w$]*(?:\s+[A-Za-z_][\w$]*)*\z/, text) ->
-        {:ok, text |> String.split() |> Enum.map_join(" ", &display_word/1) |> release()}
+        {:ok, text |> String.split() |> display_words() |> Enum.join(" ") |> release()}
 
       Enum.all?(Regex.scan(~r/[A-Za-z_][\w$]*/, text), fn [word] ->
         word == String.upcase(word) or String.upcase(word) not in @display_words
@@ -289,60 +288,91 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
     end
   end
 
-  # The `MERGE` and the privilege statements the double names: `MERGE [INTO] a USING b ON true
-  # WHEN MATCHED THEN DELETE` and `GRANT p [ON t] TO u` (`REVOKE ... FROM`, `DENY ... TO`)
-  # for one privilege. Their other forms print aliases, lists and clauses the double does not
-  # model.
-  @spec privilege_or_merge_display(binary()) :: {:ok, binary()} | :unknown
-  defp privilege_or_merge_display(text) do
+  # `MERGE [INTO] a USING b ON true|false [WHEN MATCHED THEN DELETE]` is named as the engine
+  # prints it: the condition in lower case, a space after it when no clause follows (verified).
+  # Its other forms print aliases, lists and clauses the double does not model.
+  @spec merge_display(binary()) :: {:ok, binary()} | :unknown
+  defp merge_display(text) do
     name = "([A-Za-z_][\\w$]*)"
-    privilege = Enum.join(@privileges -- ["ALL"], "|")
 
     merge =
       Regex.compile!(
-        "\\AMERGE(\\s+INTO)?\\s+#{name}\\s+USING\\s+#{name}\\s+ON\\s+TRUE\\s+WHEN" <>
-          "\\s+MATCHED\\s+THEN\\s+DELETE\\z",
+        "\\AMERGE(\\s+INTO)?\\s+#{name}\\s+USING\\s+#{name}\\s+ON\\s+(TRUE|FALSE)" <>
+          "(\\s+WHEN\\s+MATCHED\\s+THEN\\s+DELETE)?\\z",
         "i"
       )
 
-    grant =
-      Regex.compile!(
-        "\\A(GRANT|REVOKE|DENY)\\s+(#{privilege})(?:\\s+ON\\s+#{name})?\\s+(TO|FROM)\\s+#{name}\\z",
-        "i"
-      )
-
-    cond do
-      match = Regex.run(merge, text) ->
-        [_all, into, target, source] = match
+    case Regex.run(merge, text) do
+      [_all, into, target, source, condition | clause] ->
         into = if into == "", do: "", else: " INTO"
-        {:ok, "MERGE#{into} #{target} USING #{source} ON true WHEN MATCHED THEN DELETE"}
+        clause = if clause in [[], [""]], do: " ", else: " WHEN MATCHED THEN DELETE"
 
-      match = Regex.run(grant, text) ->
-        [_all, verb, privilege, object, direction, user] = match
-        on = if object == "", do: "", else: " ON #{object}"
+        {:ok, "MERGE#{into} #{target} USING #{source} ON #{String.downcase(condition)}#{clause}"}
 
-        if String.upcase(verb) == "REVOKE" == (String.upcase(direction) == "FROM"),
-          do:
-            {:ok,
-             "#{String.upcase(verb)} #{String.upcase(privilege)}#{on} #{String.upcase(direction)} #{user}"},
-          else: :unknown
-
-      true ->
+      nil ->
         :unknown
     end
   end
 
-  @spec display_word(binary()) :: binary()
-  defp display_word(word) do
-    upper = String.upcase(word)
-    if upper in @display_words, do: upper, else: word
+  # The words after the verb that are keywords where they stand (the kind of object a
+  # `CREATE`, `DROP` or `FLUSH` names), which as identifiers further on stay as written.
+  @kind_words ~w(SEQUENCE ROLE USER EXTENSION POLICY CONNECTOR VIRTUAL SERVER REPAIR TABLES
+                 PRIVILEGES TRIGGER PROCEDURE DOMAIN SECRET INDEX TYPE STAGE DATABASE)
+
+  @spec display_words([binary()]) :: [binary()]
+  defp display_words(words) do
+    words
+    |> Enum.with_index()
+    |> Enum.map(fn {word, index} ->
+      upper = String.upcase(word)
+
+      cond do
+        upper in @display_words -> upper
+        index == 1 and upper in @kind_words -> upper
+        true -> word
+      end
+    end)
+    |> condition_words()
   end
+
+  # `IF [NOT] EXISTS` after the kind of object.
+  @spec condition_words([binary()]) :: [binary()]
+  defp condition_words([verb, kind | rest]) do
+    [verb, kind | condition(rest)]
+  end
+
+  defp condition_words(words), do: words
+
+  @spec condition([binary()]) :: [binary()]
+  defp condition([word, second, third | rest] = words) do
+    case Enum.map([word, second, third], &String.upcase/1) do
+      ["IF", "NOT", "EXISTS"] -> ["IF", "NOT", "EXISTS" | rest]
+      ["IF", "EXISTS" | _name] -> ["IF", "EXISTS", third | rest]
+      _no_condition -> words
+    end
+  end
+
+  defp condition([word, second | rest] = words) do
+    if Enum.map([word, second], &String.upcase/1) == ["IF", "EXISTS"],
+      do: ["IF", "EXISTS" | rest],
+      else: words
+  end
+
+  defp condition(words), do: words
 
   # `RELEASE s` is named `RELEASE SAVEPOINT s`.
   @spec release(binary()) :: binary()
   defp release("RELEASE SAVEPOINT" <> _name = text), do: text
   defp release("RELEASE " <> name), do: "RELEASE SAVEPOINT " <> name
   defp release(text), do: text
+
+  @doc """
+  The engine's error for a statement that is a word alone (`bare_error/1`) or one of the
+  `CREATE`, `DROP`, `DESC` and `ATTACH` statements whose parser error was verified, a
+  refusal for the other shapes of those statements, `nil` for any other text.
+  """
+  @spec error(binary()) :: SQLError.t() | nil
+  def error(sql), do: bare_error(sql) || SQLDdl.error(sql) || SQLGrant.error(sql)
 
   @doc """
   The engine's answer to a statement word with nothing after it but a `;`

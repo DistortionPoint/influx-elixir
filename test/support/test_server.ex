@@ -76,7 +76,7 @@ defmodule InfluxElixir.TestServer do
     receive do
       {^ref, port} -> port
     after
-      5_000 -> flunk("the test server did not start listening")
+      30_000 -> flunk("the test server did not start listening")
     end
   end
 

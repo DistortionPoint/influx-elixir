@@ -64,14 +64,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
 
   defp walk([{at, ?)} | _rest], [], _count, _masked, _closed), do: {:excess, at}
 
-  # A pair with nothing in it is as unreadable as a `(` left open.
+  # A pair with nothing in it is as unreadable as a `(` left open, unless it is the call of a
+  # function with no arguments (`abs()`: the planner has its say).
   defp walk([{at, ?)} | rest], [{offset, ordinal} | outer], count, masked, _closed) do
     inside = binary_part(masked, offset + 1, at - offset - 1)
 
-    if String.trim(inside) == "",
+    if String.trim(inside) == "" and not call?(masked, offset),
       do: {:open, offset, ordinal},
       else: walk(rest, outer, count, masked, at + 1)
   end
+
+  defp call?(masked, offset),
+    do: masked |> binary_part(0, offset) |> String.match?(~r/[A-Za-z_]\w*$/)
 
   # The tokens before the `(` that has `ordinal` before it, latest first.
   @spec before_open(list(), non_neg_integer()) :: list()

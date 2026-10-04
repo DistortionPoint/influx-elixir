@@ -21,6 +21,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
     InfluxQLBucketCases,
     InfluxQLCallCases,
     InfluxQLFixCases,
+    InfluxQLShapeCases,
     InfluxQLShowCases,
     InfluxQLWhereCases
   }
@@ -37,6 +38,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
       unquote(calls(client))
       unquote(shows(client))
       unquote(fixes(client))
+      unquote(shapes(client))
       unquote(show_helpers(client))
       unquote(fix_helpers(client))
       unquote(helpers(client))
@@ -338,6 +340,10 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           check_fix(ctx, InfluxQLFixCases.parse_errors())
         end
 
+        test "aggregates stamped with a time that holds a nanosecond", ctx do
+          check_fix(ctx, InfluxQLFixCases.nanosecond_stamps())
+        end
+
         @tag engine_bug: "closed connection"
         test "the percentile of an integer field with no value breaks the connection", ctx do
           check_fix(ctx, InfluxQLFixCases.closed_or_empty())
@@ -346,6 +352,63 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
         test "SHOW over a column the measurement lacks, and a condition that is no boolean",
              ctx do
           check_show_fix(ctx, InfluxQLFixCases.shows())
+        end
+      end
+    end
+  end
+
+  defp shapes(client) do
+    quote location: :keep do
+      describe "InfluxQL times, arithmetic, wildcards, regular expressions and conditions — contract" do
+        setup ctx do
+          names = InfluxQLShapeCases.names(InfluxElixir.IntegrationHelper.unique_name("ipg"))
+          write(ctx, unquote(client), InfluxQLShapeCases.fixture(names))
+          {:ok, names: names}
+        end
+
+        test "aggregates of time beside fields, count() of nothing and fills of times", ctx do
+          check_fix(ctx, InfluxQLShapeCases.aggregates())
+        end
+
+        test "the select list: time and string arithmetic, wildcards, aliases and arguments",
+             ctx do
+          check_fix(ctx, InfluxQLShapeCases.select())
+        end
+
+        test "conditions: strings that add, divisions by zero, abs(), signs and comments", ctx do
+          check_fix(ctx, InfluxQLShapeCases.conditions())
+        end
+
+        test "SHOW over a measurement with no tag and a condition on time", ctx do
+          check_fix(ctx, InfluxQLShapeCases.shows())
+        end
+
+        @tag local_divergence:
+               "what the engine answers and the double does not compute is refused by name"
+        test "statements the double refuses by name", ctx do
+          InfluxElixir.TestSupport.Check.check_cases(
+            InfluxQLShapeCases.refusals(),
+            fn {template, expected} ->
+              statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
+
+              actual =
+                InfluxElixir.Contract.InfluxQLPlanner.fix_outcome(
+                  unquote(client),
+                  ctx,
+                  statement
+                )
+
+              expected = InfluxElixir.Contract.InfluxQLPlanner.fill_names(expected, ctx.names)
+
+              refused? = match?({:error, 400, "Client.Local: " <> _rest}, actual)
+
+              cond do
+                unquote(client) === InfluxElixir.Client.Local and refused? -> :ok
+                unquote(client) !== InfluxElixir.Client.Local and actual === expected -> :ok
+                true -> {:mismatch, %{expected: expected, actual: actual}}
+              end
+            end
+          )
         end
       end
     end

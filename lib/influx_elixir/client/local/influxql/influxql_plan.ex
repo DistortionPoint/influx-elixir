@@ -39,7 +39,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
           | {:error, {:engine, binary()} | {:engine, pos_integer(), binary()} | binary()}
   def check(%{items: items, group_time: group_time} = query, types, tags) do
     with :ok <- early_error(query),
-         :ok <- item_errors(items),
+         :ok <- item_errors(items, types, tags),
          :ok <- distinct_alone(items),
          :ok <- multi_rules(items),
          :ok <- transforms(query),
@@ -99,13 +99,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   @spec expressions([InfluxQL.item()], map(), MapSet.t(binary())) ::
           :ok | {:error, {:engine, binary()} | binary()}
   defp expressions(items, types, tags) do
+    physical? = Enum.any?(items, &field_aggregate?(&1, types, tags))
+
     Enum.find_value(items, :ok, fn
-      {:expr, ast, _alias} -> expression(ast, types, tags)
+      {:expr, ast, _alias} -> expression(ast, types, tags, physical?)
       _item -> nil
     end)
   end
 
-  defp expression(ast, types, tags) do
+  defp expression(ast, types, tags, physical?) do
     cond do
       InfluxQLExpr.refs(ast) == [] and InfluxQLExpr.aggregates(ast) == [] ->
         {:error, "unsupported InfluxQL (an expression of constants)"}
@@ -114,7 +116,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
         {:error, "unsupported InfluxQL (an expression of aggregates and fields)"}
 
       true ->
-        with :ok <- InfluxQLExpr.check(ast, types, tags), do: nil
+        with :ok <- InfluxQLExpr.check(ast, types, tags, physical?), do: nil
     end
   end
 
@@ -291,12 +293,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   defp offset_error(body), do: {:error, {:engine, body}}
 
   # The first item, in order, that is a constant or a call the engine refuses.
-  @spec item_errors([InfluxQL.item()]) :: :ok | {:error, {:engine, binary()}}
-  defp item_errors(items), do: Enum.find_value(items, :ok, &item_error/1)
+  @spec item_errors([InfluxQL.item()], map(), MapSet.t(binary())) ::
+          :ok | {:error, {:engine, binary()} | binary()}
+  defp item_errors(items, types, tags),
+    do: Enum.find_value(items, :ok, &item_error(&1, types, tags))
 
-  defp item_error({:planning_error, message}), do: planning(message)
+  defp item_error({:planning_error, message}, _types, _tags), do: planning(message)
 
-  defp item_error(item) do
+  defp item_error({:argument_error, name, argument}, types, tags),
+    do: InfluxQLExpr.argument_error(name, argument, types, tags)
+
+  defp item_error(item, _types, _tags) do
     case InfluxQLLiteral.constant_error([item]) do
       :ok -> nil
       error -> error
@@ -313,6 +320,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     calls = for item <- items, call <- item_aggregates(item), do: call
 
     case calls do
+      [{_fun, "time"}] ->
+        :ok
+
       [{fun, _field}] ->
         if selector_name?(fun), do: lone_selector_expression(items, fun), else: :ok
 
@@ -426,7 +436,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   defp fill_needs_aggregate(_query), do: :ok
 
-  @spec no_mix([InfluxQL.item()]) :: :ok | {:error, {:engine, binary()}}
+  @spec no_mix([InfluxQL.item()]) :: :ok | {:error, {:engine, binary()} | binary()}
   defp no_mix(items) do
     aggregates = Enum.filter(items, &aggregate?/1)
     plain = Enum.reject(items, &(aggregate?(&1) or time?(&1)))
@@ -434,6 +444,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     cond do
       aggregates == [] or plain == [] ->
         :ok
+
+      refusal = mix_refusal(aggregates, plain) ->
+        refusal
 
       Enum.any?(aggregates, &(not selector?(&1))) ->
         planning("mixing aggregate and non-aggregate columns is not supported")
@@ -445,6 +458,37 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
         :ok
     end
   end
+
+  # An expression over fields that reads the time column (the engine's own schema error).
+  defp time_expression?({:expr, ast, _alias}),
+    do: Enum.any?(InfluxQLExpr.refs(ast), &(String.downcase(&1) == "time"))
+
+  defp time_expression?(_item), do: false
+
+  # Columns beside an expression that reads the time, or beside arithmetic over a selector (the
+  # engine takes that for a selector, and answers): the double does not word what it does.
+  @spec mix_refusal([InfluxQL.item()], [InfluxQL.item()]) :: {:error, binary()} | nil
+  defp mix_refusal(aggregates, plain) do
+    cond do
+      Enum.any?(plain, &time_expression?/1) ->
+        {:error, "unsupported InfluxQL (a function of time beside an aggregate)"}
+
+      Enum.any?(aggregates, &selector_expression?/1) ->
+        {:error, "unsupported InfluxQL (arithmetic on a selector beside columns)"}
+
+      true ->
+        nil
+    end
+  end
+
+  defp selector_expression?({:expr, ast, _alias}) do
+    case InfluxQLExpr.aggregates(ast) do
+      [{fun, _arg}] -> InfluxQLAggregate.selector?(fun)
+      _several -> false
+    end
+  end
+
+  defp selector_expression?(_item), do: false
 
   # One selector with columns beside it, per bucket, is answered by the engine
   # and not by the double.

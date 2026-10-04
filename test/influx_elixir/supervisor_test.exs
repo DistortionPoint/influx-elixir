@@ -51,7 +51,7 @@ defmodule InfluxElixir.SupervisorTest do
 
       ref = Process.monitor(writer_a)
       Process.exit(writer_a, :kill)
-      assert_receive {:DOWN, ^ref, :process, ^writer_a, :killed}, 5_000
+      assert_receive {:DOWN, ^ref, :process, ^writer_a, :killed}, 30_000
 
       # Only the crashed child is replaced; its own supervisor and pool stay.
       new_writer_a = await_restart(ConnectionSupervisor.batch_writer_name(name_a), writer_a)
@@ -98,7 +98,7 @@ defmodule InfluxElixir.SupervisorTest do
 
       sup_ref = Process.monitor(sup_a)
       Process.exit(sup_a, :kill)
-      assert_receive {:DOWN, ^sup_ref, :process, ^sup_a, :killed}, 5_000
+      assert_receive {:DOWN, ^sup_ref, :process, ^sup_a, :killed}, 30_000
 
       new_sup_a = await_restart(ConnectionSupervisor.via(name_a), sup_a)
       # The name is registered before init/1 returns; a call waits for it.

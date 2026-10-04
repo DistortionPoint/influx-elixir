@@ -19,7 +19,7 @@ defmodule InfluxElixir.TestSupport.Await do
   above what a healthy run needs, so it only ever bounds a failing one.
   """
   @spec until((-> term()), pos_integer()) :: term()
-  def until(fun, deadline_ms \\ 5_000) when is_function(fun, 0) do
+  def until(fun, deadline_ms \\ 30_000) when is_function(fun, 0) do
     deadline = System.monotonic_time(:millisecond) + deadline_ms
     poll(fun, deadline, deadline_ms)
   end

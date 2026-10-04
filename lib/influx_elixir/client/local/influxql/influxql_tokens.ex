@@ -6,7 +6,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # `{:syntax_error, kind, rest}` with the text left from the error, which
   # `InfluxElixir.Client.Local.InfluxQLCheck` turns into the engine's body.
 
-  alias InfluxElixir.Client.Local.{Durations, InfluxQLText, SQLLimits}
+  alias InfluxElixir.Client.Local.{Durations, InfluxQLText, SQLIdentifiers, SQLLimits}
 
   require SQLLimits
 
@@ -36,12 +36,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp lex(<<?', rest::binary>>, acc) do
     {content, rest} = take_until(rest, ?', [])
     # InfluxQL escapes a quote with a backslash, SQL by doubling it.
-    tokenize(rest, [{:str, String.replace(content, "\\'", "''")} | acc])
+    operand_token({:str, String.replace(content, "\\'", "''")}, rest, acc)
   end
 
   defp lex(<<?", rest::binary>>, acc) do
     {name, rest} = take_until(rest, ?", [])
-    tokenize(rest, [{:ident, String.replace(name, "\\\"", "\"")} | acc])
+    operand_token({:ident, String.replace(name, "\\\"", "\"")}, rest, acc)
   end
 
   defp lex(<<?/, _rest::binary>> = text, []), do: {:syntax_error, :where_unparsed, text}
@@ -49,7 +49,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp lex(<<?/, rest::binary>>, [{:op, op} | _tokens] = acc) when op in ["=~", "!~"] do
     {pattern, rest} = take_regex(rest, [])
 
-    if word_next?(rest),
+    if SQLIdentifiers.word_next?(rest),
       do: {:syntax_error, :nom, rest},
       else: tokenize(rest, [{:regex, pattern} | acc])
   end
@@ -124,14 +124,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     end
   end
 
-  # Whether a letter, digit or underscore comes next: a flag after a regular expression
-  # (`/re/i`) is left over, the engine has none.
-  @spec word_next?(binary()) :: boolean()
-  defp word_next?(<<c, _more::binary>>), do: c in ?0..?9 or c in ?a..?z or c in ?A..?Z or c == ?_
-  defp word_next?(_ended), do: false
-
+  # A letter, digit or underscore next (`SQLIdentifiers.word_next?/1`) after a regular
+  # expression (`/re/i`) is a flag the engine has none for: it is left over.
   @spec leftover?(binary()) :: boolean()
-  defp leftover?(rest), do: word_next?(rest) or String.starts_with?(rest, ".")
+  defp leftover?(rest), do: SQLIdentifiers.word_next?(rest) or String.starts_with?(rest, ".")
 
   # A number that a letter, digit, underscore or dot follows is cut short
   # there, which the engine cannot continue from.
@@ -218,8 +214,29 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp word_token(upcased, word, rest, acc) do
     if InfluxQLText.reserved?(word) and not String.starts_with?(rest, ":"),
       do: {:syntax_error, reserved_kind(acc), word <> rest},
-      else: tokenize(rest, [plain_word(upcased, word) | acc])
+      else: operand_token(plain_word(upcased, word), rest, acc)
   end
+
+  # A minus sign takes a number, a name, a call or a parenthesis; before a string or a
+  # boolean, or a second minus sign and a name, the engine's parser stops at the end of the
+  # operand (verified).
+  @spec operand_token(tuple(), binary(), list()) ::
+          {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
+  defp operand_token(token, rest, acc) do
+    if unary_error?(token, acc),
+      do: {:syntax_error, :unary, rest},
+      else: tokenize(rest, [token | acc])
+  end
+
+  defp unary_error?({:str, _content}, acc), do: negated?(acc)
+
+  defp unary_error?({:raw, word}, acc),
+    do: String.upcase(word) in ["TRUE", "FALSE"] and negated?(acc)
+
+  defp unary_error?({:ident, _name}, [{:raw, "-"}, {:raw, "-"} = first | before]),
+    do: negated?([first | before])
+
+  defp unary_error?(_token, _acc), do: false
 
   # What stands before a word where an operand is expected decides the
   # error (see `check_where/4`).

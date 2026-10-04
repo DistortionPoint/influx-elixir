@@ -26,6 +26,11 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @typedoc "A stored point, as `InfluxElixir.Client.Local` keeps it."
   @type point :: LineProtocolParser.point()
 
+  # How near a name must be to another, in edits per character of the longer one, for the
+  # engine to suggest it: a field within half, a select item within three fifths (verified).
+  @field_ratio {1, 2}
+  @item_ratio {3, 5}
+
   @typedoc """
   One relation of a `FROM`: the name its columns are qualified with, its
   points, and its columns in order when it is a CTE (a table's are its
@@ -120,7 +125,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @spec check_against_all_rows([relation()], SQLParser.parsed_query(), [{clause(), term()}]) ::
           :ok | {:error, term()}
   defp check_against_all_rows(relations, query, refs) do
-    listed = Enum.map(relations, &{&1.qualifier, full_columns(&1)})
+    listed = listed_columns(relations)
     known = listed |> Enum.flat_map(&elem(&1, 1)) |> MapSet.new()
 
     case Enum.find(refs, fn {_clause, ref} -> not known?(ref, known) end) do
@@ -132,6 +137,14 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @doc "Every column the relations have, a table's from its rows and a CTE's as it declared them."
   @spec table_columns([relation()]) :: MapSet.t(binary())
   def table_columns(relations), do: relations |> Enum.flat_map(&full_columns/1) |> MapSet.new()
+
+  @doc "Whether any relation has the column, read from every row only when asked."
+  @spec column?([relation()], binary()) :: boolean()
+  def column?(relations, name), do: MapSet.member?(table_columns(relations), name)
+
+  # The relations with their columns, as the engine's error text lists them.
+  @spec listed_columns([relation()]) :: [{binary(), [binary()]}]
+  defp listed_columns(relations), do: Enum.map(relations, &{&1.qualifier, full_columns(&1)})
 
   # A CTE's columns are as it declared them; a table's are every column any
   # of its rows has, sorted as the engine's schema is (byte order).
@@ -160,7 +173,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
           {binary(), [binary()]}
         ]) :: boolean()
   defp column_as_relation?({:qualified, relation, _name}, _query, listed) do
-    name = unquoted(relation)
+    name = SQLLiteral.unquoted(relation)
 
     not Enum.any?(listed, fn {qualifier, _columns} -> qualifier == name end) and
       Enum.any?(listed, fn {_qualifier, columns} -> name in columns end)
@@ -182,7 +195,13 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     written_with_relation? =
       clause in [:order, :group] and written_with_relation?(ref, query, clause)
 
-    valid = valid_fields(clause, written_with_relation?, output_name?, fields, query, listed)
+    # A name written with its relation in an aggregate of a `HAVING` is looked up in the
+    # table alone (verified), where one written bare also sees the select list.
+    valid =
+      if clause == :having and written_with_relation?(ref, query, :having),
+        do: fields,
+        else: valid_fields(clause, written_with_relation?, output_name?, fields, query, listed)
+
     printed = printed(ref, query.qualified)
 
     case suggestion(clause, ref, query, listed) do
@@ -219,16 +238,10 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   defp known_fields(ref, valid) do
     name = bare_name(ref)
 
-    case Enum.find(valid, &close_to_field?(name, &1)) do
+    case Enum.find(valid, &close?(name, &1, @field_ratio)) do
       nil -> ["Valid fields are #{Enum.join(valid, ", ")}."]
       field -> ["Did you mean '#{field}'?."]
     end
-  end
-
-  @spec close_to_field?(binary(), binary()) :: boolean()
-  defp close_to_field?(name, field) do
-    longest = max(String.length(name), String.length(field))
-    edit_distance(name, field) * 2 <= longest
   end
 
   # The fields the engine lists: the table's, the select list's before them in a clause that
@@ -288,7 +301,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
         {:suggest, field}
 
       [] ->
-        if Enum.any?(outputs, fn {output, _field} -> close?(output, name) end),
+        if Enum.any?(outputs, fn {output, _field} -> close?(output, name, @item_ratio) end),
           do:
             {:refuse,
              "an ORDER BY name close to a select item: the engine suggests the item by a " <>
@@ -302,11 +315,11 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
   defp suggestion(_clause, _ref, _query, _listed), do: nil
 
-  # Whether two names are within half their length of each other in edits.
-  @spec close?(binary(), binary()) :: boolean()
-  defp close?(left, right) do
+  # Whether two names are within a share of the longer one's length of each other in edits.
+  @spec close?(binary(), binary(), {pos_integer(), pos_integer()}) :: boolean()
+  defp close?(left, right, {numerator, denominator}) do
     longest = max(String.length(left), String.length(right))
-    longest > 0 and edit_distance(left, right) * 5 <= longest * 3
+    longest > 0 and edit_distance(left, right) * denominator <= longest * numerator
   end
 
   @spec edit_distance(binary(), binary()) :: non_neg_integer()
@@ -334,7 +347,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     do: not String.starts_with?(field, "\"") and String.contains?(field, ".")
 
   @spec bare_name(SQLExpr.column_ref()) :: binary()
-  defp bare_name({:qualified, _relation, name}), do: unquoted(name)
+  defp bare_name({:qualified, _relation, name}), do: SQLLiteral.unquoted(name)
   defp bare_name(name), do: name
 
   # `ORDER BY t.x` beside a select item called `x` that is no column of `t` is ambiguous to
@@ -347,7 +360,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
          query.distinct_on != nil do
       :ok
     else
-      listed = Enum.map(relations, &{&1.qualifier, full_columns(&1)})
+      listed = listed_columns(relations)
       outputs = Enum.zip(output_names(query), projection_fields(query, listed))
 
       ambiguous =
@@ -380,11 +393,12 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   defp check_order_available(_relations, %{select_columns: nil}), do: :ok
   defp check_order_available(_relations, %{distinct_on: on}) when on != nil, do: :ok
 
+  defp check_order_available(_relations, %{order_by: []}), do: :ok
+
   defp check_order_available(relations, query) do
     if Enum.any?(relations, &unknown_schema?/1) do
       :ok
     else
-      listed = Enum.map(relations, &{&1.qualifier, full_columns(&1)})
       grouped = for item <- query.group_by_columns || [], is_binary(item), do: item
       outputs = output_names(query)
 
@@ -399,7 +413,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
       case unavailable do
         nil -> :ok
-        ref -> {:error, unavailable_order(ref, query, listed)}
+        ref -> {:error, unavailable_order(ref, query, listed_columns(relations))}
       end
     end
   end
@@ -455,7 +469,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   end
 
   defp case_hint({:qualified, qualifier, column}, printed, listed, _qualified) do
-    {relation, name} = {unquoted(qualifier), unquoted(column)}
+    {relation, name} = {SQLLiteral.unquoted(qualifier), SQLLiteral.unquoted(column)}
 
     folded? =
       Enum.any?(listed, fn {qualifier, columns} ->
@@ -473,11 +487,6 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     "Column names are case sensitive. You can use double quotes to refer to the " <>
       "\"#{printed}\" column or set the datafusion.sql_parser.enable_ident_normalization " <>
       "configuration."
-  end
-
-  @spec unquoted(binary()) :: binary()
-  defp unquoted(text) do
-    if SQLLiteral.identifier?(text), do: SQLLiteral.identifier_name(text), else: text
   end
 
   @spec qualify(binary(), [binary()]) :: [binary()]
@@ -749,6 +758,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     do: Enum.flat_map(SQLAggType.arguments(aggs), &expr_fields/1) ++ expr_fields(item)
 
   def expr_fields({:agg_ref, _name}), do: []
+  def expr_fields({:selector_check, _selector, field, ordering, _grouped}), do: [field, ordering]
   def expr_fields({:constant, _call, _ancestors}), do: []
   def expr_fields({:cut, call}), do: expr_fields(call)
   def expr_fields({:lazy_cut, call}), do: expr_fields(call)

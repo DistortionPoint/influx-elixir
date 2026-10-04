@@ -11,6 +11,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     Format,
     LineProtocolParser,
     Scope,
+    SQLDml,
     SQLError,
     SQLExecutor,
     SQLIdentifiers,
@@ -64,7 +65,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
           InfluxElixir.Client.query_result()
   defp answer_statement(%{table: table} = conn, {database, sql, statement}, params, opts) do
     cond do
-      error = SQLStatement.bare_error(sql) ->
+      error = SQLStatement.error(sql) ->
         Format.answer(
           Scope.query_format(opts),
           fn -> with :ok <- Scope.database_exists(table, database), do: {:error, error} end,
@@ -221,6 +222,15 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
         :delete ->
           {:error, delete_error(table, database, trimmed)}
 
+        kind when kind in [:insert, :update] ->
+          {:error,
+           SQLDml.error(
+             kind,
+             sql,
+             Store.measurements(table, database),
+             &table_columns(table, database, &1)
+           )}
+
         {:planning, message} ->
           {:error, %{status: 400, body: "Error during planning: " <> message}}
 
@@ -269,7 +279,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
 
   @spec bare_statement(binary()) :: :ok | {:error, SQLError.t()}
   defp bare_statement(sql) do
-    case SQLStatement.bare_error(sql) do
+    case SQLStatement.error(sql) do
       nil -> :ok
       error -> {:error, error}
     end
@@ -289,8 +299,8 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
       {~r/^(?i)(?:SELECT|WITH|EXPLAIN|SHOW|DESC|DESCRIBE)\b|^\(/, :query},
       {~r/^(?i)DELETE\b/, :delete},
       {~r/^(?i)VALUES\b/, {:refusal, "a VALUES statement: the double reads no VALUES rows"}},
-      {~r/^(?i)INSERT\b/, {:planning, "DML not supported: Insert Into"}},
-      {~r/^(?i)UPDATE\b/, {:planning, "DML not supported: Update"}},
+      {~r/^(?i)INSERT\b/, :insert},
+      {~r/^(?i)UPDATE\b/, :update},
       {~r/^(?i)CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b/,
        {:planning, "DDL not supported: CreateView"}},
       {~r/^(?i)CREATE\s+DATABASE\s+(?:IF\s+NOT\s+EXISTS\s+)?#{@object}\s*;?\s*$/,
@@ -318,8 +328,21 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     ]
   end
 
+  # A table's columns as the engine's schema lists them: sorted, `time` among them.
+  @spec table_columns(Store.t(), binary(), binary()) :: [binary()]
+  defp table_columns(table, database, measurement) do
+    columns = for {^measurement, column, _kind} <- Store.columns(table, database), do: column
+    ["time" | columns] |> Enum.uniq() |> Enum.sort()
+  end
+
   @spec statement_kind(binary()) ::
-          :query | :delete | {:planning, binary()} | {:refusal, binary()} | :unsupported
+          :query
+          | :delete
+          | :insert
+          | :update
+          | {:planning, binary()}
+          | {:refusal, binary()}
+          | :unsupported
   defp statement_kind(sql) do
     Enum.find_value(statement_kinds(), :unsupported, fn {pattern, kind} ->
       if Regex.match?(pattern, sql), do: kind

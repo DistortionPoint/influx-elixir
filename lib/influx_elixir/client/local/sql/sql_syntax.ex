@@ -21,7 +21,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # without a verdict and leaves the text to the rest of the double, which
   # answers it or refuses it by name.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLStatement, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{SQLError, SQLLiteral, SQLStatement, SQLTokenizer}
 
   @top {__MODULE__, :top}
   @refusal {__MODULE__, :refusal}
@@ -180,12 +180,24 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp constant?(tokens) do
     tokens
     |> Enum.zip([nil | tokens])
-    |> Enum.all?(fn
-      {{:word, _printed, _upper, _line, _col}, {:word, _p, "AS", _l, _c}} -> true
-      {{:word, _printed, upper, _line, _col}, _previous} -> upper in @own_words
-      {_token, _previous} -> true
+    |> Enum.zip(Enum.drop(tokens, 1) ++ [nil])
+    |> Enum.zip(Enum.drop(tokens, 2) ++ [nil, nil])
+    |> Enum.all?(fn {{{token, previous}, next}, after_next} ->
+      constant_token?(token, previous, {next, after_next})
     end)
   end
+
+  # A word after `AS` or `TABLE` is named by the statement, and so is the name of a common
+  # table (`name AS (`) and the keyword `WITH` that starts them.
+  @spec constant_token?(token(), token() | nil, {token() | nil, token() | nil}) :: boolean()
+  defp constant_token?({:word, _printed, upper, _line, _col}, previous, {next, after_next}) do
+    match?({:word, _p, kind, _l, _c} when kind in ["AS", "TABLE"], previous) or
+      upper in ["WITH", "TABLE" | @own_words] or
+      (match?({:word, _q, "AS", _l2, _c2}, next) and
+         match?({:symbol, _s, "(", _l3, _c3}, after_next))
+  end
+
+  defp constant_token?(_token, _previous, _following), do: true
 
   # `SELECT ... INTO name` is the engine's `CREATE TABLE AS`, which it refuses once the
   # select has planned. The double plans the select without the clause (`SQLRewrite`) and
@@ -303,6 +315,21 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     refuse("a query that begins with FROM: the engine reads it, this double does not")
     throw(:bail)
   end
+
+  # `TABLE name` as a query body reads, and the planner refuses it (verified).
+  defp select_term([{:word, _p, "TABLE", _l, _c}, {kind, printed, _u, _l2, _c2} | rest])
+       when kind in [:word, :quoted] do
+    case rest do
+      [{:symbol, _s, ".", _l3, _c3} | _more] ->
+        throw(:bail)
+
+      _end_of_name ->
+        Process.put(@planner, "Query TABLE #{SQLLiteral.unquoted(printed)} not implemented yet")
+        rest
+    end
+  end
+
+  defp select_term([{:word, _p, "TABLE", _l, _c}, token | _rest]), do: fail("Table name", [token])
 
   defp select_term(tokens), do: fail("SELECT, VALUES, or a subquery in the query body", tokens)
 

@@ -22,9 +22,11 @@ defmodule InfluxElixir.Client.Local.SqlQueryMechanicsTest do
 
   describe "Client.Local: query_sql/3 given a statement that is not a query" do
     test "answers as execute_sql does", %{conn: conn} do
-      assert {:error,
-              %{status: 400, body: "Error during planning: DML not supported: Insert Into"}} =
-               Local.query_sql(conn, "INSERT INTO cpu VALUES (1)", database: "test_db")
+      statement = "INSERT INTO cpu VALUES (1)"
+      answer = Local.execute_sql(conn, statement, database: "test_db")
+
+      assert {:error, %{status: 400}} = answer
+      assert Local.query_sql(conn, statement, database: "test_db") === answer
     end
   end
 

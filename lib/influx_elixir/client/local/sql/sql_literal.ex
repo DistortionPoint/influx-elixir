@@ -51,6 +51,10 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
     text |> binary_part(1, byte_size(text) - 2) |> String.replace("\"\"", "\"")
   end
 
+  @doc "The name a text holds: a `\"...\"` identifier unwrapped, any other text as it is."
+  @spec unquoted(binary()) :: binary()
+  def unquoted(text), do: if(identifier?(text), do: identifier_name(text), else: text)
+
   @doc """
   How the engine words a column name in an error: bare when it is a lower
   case word, otherwise quoted with its quotes doubled.

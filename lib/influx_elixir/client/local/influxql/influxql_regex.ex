@@ -26,6 +26,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
   #
   # Every function throws `{:refused, message}` or `{:refused, {:engine, 500, body}}`.
 
+  alias InfluxElixir.Client.Local.InfluxQLError
+
   @kept_letters ~c"dDwWsSpPx"
   @look_around "look-around, including look-ahead and look-behind, is not supported"
   @flag_letters ["i", "m", "s", "U", "u", "x", "R"]
@@ -46,11 +48,31 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
     end
   end
 
-  @doc "The compiled regular expression of `source`, or a throw."
-  @spec compile(binary()) :: Regex.t()
-  def compile(source) do
+  @doc """
+  The compiled regular expression of `source`, or a throw. `frame` says where the expression
+  stands: in a condition (`:where`, the default: the engine's 500 for the crate's error), in
+  `FROM` (`:from`) or among the columns of the select list, its function arguments and
+  `GROUP BY` (`:expand`), where the planner wraps the same error as a 400 that names the
+  expression (verified).
+  """
+  @spec compile(binary(), :where | :from | :expand) :: Regex.t()
+  def compile(source, frame \\ :where) do
     {:ok, regex} = source |> pattern() |> Regex.compile("u")
     regex
+  catch
+    {:refused, {:engine, 500, body}} when frame != :where ->
+      throw({:refused, {:engine, 400, planning_error(source, body, frame)}})
+  end
+
+  @spec planning_error(binary(), binary(), :from | :expand) :: binary()
+  defp planning_error(source, body, frame) do
+    [_frame, detail] = String.split(body, "External error: ", parts: 2)
+    message = "invalid regular expression '/#{source}/': " <> detail
+
+    case frame do
+      :from -> "Error during planning: " <> message
+      :expand -> InfluxQLError.expand_error(message)
+    end
   end
 
   @spec unescape(binary(), iodata()) :: binary()
