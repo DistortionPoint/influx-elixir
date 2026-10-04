@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` SQL: the order of the engine's errors, exact number folding,
+  and refusals that say why**: the stages at which Core finds a query's errors
+  (plan build, placeholders, the analyzer's `WHERE`, aggregate, `HAVING`, select
+  and `ORDER BY`, then the optimizer and the physical plan) are one ordered table
+  (`SQLStage`) in place of float ranks; an unbound `$n` is found after the
+  select list's planner errors and before the analyzer's; a `HAVING`'s plan
+  errors come before every `WHERE` coercion error; numbers fold pairwise with
+  Core's exact types (`Int64` with `UInt64` is `Decimal128(20, 0)`, that with a
+  `Float64` `Decimal128(35, 15)`), so `avg`/`sum`/`stddev` of `coalesce(tag, n)`
+  answer as Core does; `IN`/`BETWEEN` with `NULL` operands, `HAVING NOT y`,
+  `-3::text`, `first_value(1e3 ...)`, `BETWEEN` with `::` casts, a negation under
+  a relation the optimizer proves empty and `count(DISTINCT ...)` names are Core's;
+  a mid-statement `;` is the parser's error at the `;`, `DELETE FROM (` and
+  `INSERT INTO t ;` are its errors, and `=>` is one token; `FROM main`, `SET
+  TIME ZONE`, `?` and a `DELETE` of a subquery are refused by name. Typing a
+  chain of N operators is linear again (`i+i+..` x 6400: 2.2 s to 0.63 s). The
+  refusal tables pin each case's exact reason, and the ratchet compares it.
 - **`Client.Local` SQL typed an expression in three ways and answered what
   Core refuses**: one table (`SQLExprType`) now decides every type, with an
   exact memo keyed by the node; `-(n < 1)`, `-coalesce(s, 'x')`, `-CASE ...`
@@ -164,6 +181,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that names a directory (`--exclude lib`) was taken for a path. The rule is
   now `mix/test_args.ex`, with its own test: known switches and their values
   are skipped, and every other argument is a path when it is one.
+- **`Client.Local` InfluxQL: ties, unsigned booleans, conditions that are no
+  boolean, the order of errors and quotient windows** (each verified against
+  Core 3.10.1, pinned in `InfluxQLOrderCases`): `top(v, host, n)` and
+  `bottom(v, host, n)` rank the points they chose by their own times, not by the
+  times their series began at (`v = 9` at 5s of `b`, 6s of `c`, 8s of `a`:
+  `top(v, host, 2)` is `b` and `c`; descending, `a` and `c`); an unsigned field
+  or a number made of one against a boolean field, in either order and with any
+  operator, is `Cannot infer common argument type for comparison operation
+  UInt64 = Boolean` with no `type_coercion` prefix (it was `Int64`), a tag over
+  an unsigned field (`host > u`) compares as text and keeps every point that has
+  the unsigned value, and the error comes after the select list's and before
+  the `LIMIT`'s; a condition that is a number made of an unsigned field (`-u`,
+  `u + 1`, `abs(u)`) is `Boolean AND UInt64`, and with a `tz()` clause the
+  planner's filter error (`Cannot create filter with non-boolean predicate
+  'Int64(0)' returning Int64`, the arithmetic ones refused by name); a
+  comparison of the `time` beside an operand that is no boolean, a boolean field
+  included, is the 500 `invalid expr stack`; the operands of an expression that
+  cannot be typed (`-f + time, -0.0`) are the error before the condition is
+  split and before `field must contain at least one variable`, and the second
+  `top()` is the error of the selectors that cannot be combined before a
+  constant that follows it; `fill(none)` and `fill(linear)` of a grouping with
+  nothing to aggregate are the fill error; `LIMIT` and `OFFSET` of a column that
+  is a quotient (`sum(f) / count(f) ... GROUP BY time(1m)`) do not count the
+  buckets where it is null.
+- **Contract and unit tests of the double's own tests**: the cost test of a
+  `HAVING` that names an alias compares the cost of one more reference over a
+  table of 1500 and of 6000 rows (a re-read of the columns per reference costs
+  3.6 times as much on the larger table; the correct code 0.8), the store-lock
+  tests release or kill the holder only once the waiter is contending for the
+  lock, the case-table test folds blanks beside operators and SQL comments into
+  a statement's identity (not the regular expressions of InfluxQL), checks that
+  a pin's spellings differ in what the pin says, and lists the SQL spellings
+  still waiting to be taken out of the SQL tables, and the `mix test` switch
+  list is checked against the switches `mix test` documents.
 
 ### Changed
 - The integration one-liners pin `influxdb:3.10.1-core`, the version the

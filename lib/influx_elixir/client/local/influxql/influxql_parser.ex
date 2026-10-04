@@ -134,7 +134,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
          descending: String.upcase(clauses["dir"]) == "DESC",
          limit: to_int(clauses["limit"]),
          offset: to_int(clauses["offset"]) || 0,
-         rewrite_error: Map.get(group, :rewrite_error)
+         rewrite_error: Map.get(group, :rewrite_error),
+         tz: clauses["tzcall"] != ""
        }}
     end
   end

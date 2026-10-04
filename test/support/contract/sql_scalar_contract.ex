@@ -23,6 +23,8 @@ defmodule InfluxElixir.Contract.SQLScalar do
     * `:where` — `SELECT v FROM main WHERE <text> ORDER BY time`, the list of `v`
     * `:order` — `SELECT v FROM main ORDER BY <text>, time`, the list of `v`
     * `:raw` — the text is the statement, the answer its rows
+    * `:raw_sorted` — as `:raw`, the rows compared as a set: for a statement whose rows the
+      engine gives in the order of its catalog, which no `ORDER BY` can fix (`SHOW TABLES`)
 
   `expected` is `{:ok, answer}`, `{:error, status, body}` or the client's closed
   connection error. A table named `*_refusable` holds what the double may refuse
@@ -116,6 +118,7 @@ defmodule InfluxElixir.Contract.SQLScalar do
   def statement(:where, text), do: {"SELECT v FROM main WHERE #{text} ORDER BY time", "v"}
   def statement(:order, text), do: {"SELECT v FROM main ORDER BY #{text}, time", "v"}
   def statement(:raw, text), do: {text, nil}
+  def statement(:raw_sorted, text), do: {text, nil}
 
   @doc """
   A case as `{kind, text, expected}`, with `expected` as the clients answer: the tables
@@ -129,10 +132,22 @@ defmodule InfluxElixir.Contract.SQLScalar do
   def decode({kind, text, :closed}),
     do: {kind, text, {:error, {:connection_error, %Mint.TransportError{reason: :closed}}}}
 
+  @doc "The answer and the expected one, with the rows of a `:raw_sorted` case in one order."
+  @spec align(atom(), term(), term()) :: {term(), term()}
+  def align(:raw_sorted, {:ok, actual}, {:ok, expected})
+      when is_list(actual) and is_list(expected),
+      do: {{:ok, Enum.sort(actual)}, {:ok, Enum.sort(expected)}}
+
+  def align(_kind, actual, expected), do: {actual, expected}
+
   @doc "Whether an answer is the double's refusal by name."
   @spec refusal?(term()) :: boolean()
-  def refusal?({:error, 400, "Client.Local: " <> _reason}), do: true
-  def refusal?(_outcome), do: false
+  def refusal?(outcome), do: refusal_reason(outcome) != nil
+
+  @doc "The reason the double gives for refusing by name, `nil` for any other answer."
+  @spec refusal_reason(term()) :: binary() | nil
+  def refusal_reason({:error, 400, "Client.Local: " <> reason}), do: reason
+  def refusal_reason(_outcome), do: nil
 
   defp helpers(client) do
     quote location: :keep do
@@ -171,7 +186,9 @@ defmodule InfluxElixir.Contract.SQLScalar do
       def ss_check(ctx, cases) do
         InfluxElixir.TestSupport.Check.check_cases(cases, fn entry ->
           {kind, text, expected} = InfluxElixir.Contract.SQLScalar.decode(entry)
-          actual = ss_outcome(ctx, kind, text)
+
+          {actual, expected} =
+            InfluxElixir.Contract.SQLScalar.align(kind, ss_outcome(ctx, kind, text), expected)
 
           if InfluxElixir.TestSupport.Check.rows_close?(actual, expected),
             do: :ok,
@@ -180,23 +197,44 @@ defmodule InfluxElixir.Contract.SQLScalar do
       end
 
       # The same for a table the double may refuse by name. `local_refusals` is the
-      # pinned set of `{kind, text}` it refuses (`InfluxElixir.Contract.SQLScalarRefusals`):
-      # a case refused and not in it regressed, a case in it that is answered now
-      # moves to the table of answers; each fails naming the case. A real engine
-      # refuses none.
+      # pinned set of `{kind, text, reason}` it refuses
+      # (`InfluxElixir.Contract.SQLScalarRefusals`): a case refused and not in it
+      # regressed, a case in it that is answered now moves to the table of answers, and a
+      # case refused for another reason than the pinned one fails with both; each fails
+      # naming the case. A real engine refuses none.
       def ss_check_refusable(ctx, cases, local_refusals) do
-        pinned = if ss_local?(), do: local_refusals, else: []
+        pinned =
+          if ss_local?(),
+            do: for({kind, text, _why} <- local_refusals, do: {kind, text}),
+            else: []
+
+        reasons =
+          if ss_local?(),
+            do: Map.new(local_refusals, fn {k, t, why} -> {{k, t}, why} end),
+            else: %{}
 
         InfluxElixir.TestSupport.Check.check_ratchet(
           cases,
           fn entry ->
             {kind, text, expected} = InfluxElixir.Contract.SQLScalar.decode(entry)
-            actual = ss_outcome(ctx, kind, text)
+
+            {actual, expected} =
+              InfluxElixir.Contract.SQLScalar.align(kind, ss_outcome(ctx, kind, text), expected)
+
+            reason = if ss_local?(), do: InfluxElixir.Contract.SQLScalar.refusal_reason(actual)
 
             cond do
-              InfluxElixir.TestSupport.Check.rows_close?(actual, expected) -> :ok
-              ss_local?() and InfluxElixir.Contract.SQLScalar.refusal?(actual) -> :refused
-              true -> {:mismatch, %{expected: expected, actual: actual}}
+              InfluxElixir.TestSupport.Check.rows_close?(actual, expected) ->
+                :ok
+
+              reason == nil ->
+                {:mismatch, %{expected: expected, actual: actual}}
+
+              Map.get(reasons, {kind, text}, reason) == reason ->
+                :refused
+
+              true ->
+                {:mismatch, %{pinned_reason: Map.fetch!(reasons, {kind, text}), actual: actual}}
             end
           end,
           pinned,
@@ -299,9 +337,16 @@ defmodule InfluxElixir.Contract.SQLScalar do
   defp core_catalog_test(:v3_core) do
     quote location: :keep do
       describe "SQL scalar — contract: the system tables of InfluxDB 3 Core" do
+        @tag local_divergence: "Local refuses by name some of what the engine answers"
         test "SHOW TABLES, the schemata and the columns of the system tables", ctx do
           ss_fixture(ctx)
           ss_check(ctx, InfluxElixir.Contract.SQLCatalogCases.catalog_core())
+
+          ss_check_refusable(
+            ctx,
+            InfluxElixir.Contract.SQLCatalogCases.catalog_core_refusable(),
+            InfluxElixir.Contract.SQLScalarRefusals.catalog_core()
+          )
         end
       end
     end

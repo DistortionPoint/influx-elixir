@@ -20,7 +20,7 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
 
   alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLSelect}
 
-  import SQLExprType, only: [is_numeric_type: 1]
+  import SQLExprType, only: [is_decimal_type: 1, is_numeric_type: 1]
 
   @tag "Dictionary(Int32, Utf8)"
   @decimal "Decimal128(?)"
@@ -126,7 +126,7 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   defp kept(agg, @tag) when agg in [:min, :max], do: "Utf8"
   defp kept(agg, type) when agg in [:min, :max], do: type
   defp kept(_agg, type) when not is_numeric_type(type), do: nil
-  defp kept(agg, @decimal) when agg in [:sum, :avg], do: @decimal
+  defp kept(agg, type) when agg in [:sum, :avg] and is_decimal_type(type), do: @decimal
   defp kept(agg, _type) when agg in [:avg, :stddev, :stddev_pop, :var, :var_pop], do: "Float64"
   defp kept(:sum, type) when type in @signed, do: "Int64"
   defp kept(:sum, type) when type in ["UInt64", "Float64"], do: type

@@ -157,6 +157,7 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
   """
   @type having_t :: %{
           nodes: [SQLWhere.node_t()],
+          tree: SQLWhere.tree() | nil,
           aggs: [{binary(), SQLSelect.column()}]
         }
 
@@ -183,7 +184,7 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
         with {:ok, replaced, aggs} <- replace_aggregates(text, qualifier),
              {:ok, nodes} <- SQLWhere.nodes("WHERE " <> replaced),
              :ok <- check_having(nodes, aggs, groups, select_columns, text) do
-          {:ok, %{nodes: nodes, aggs: aggs}}
+          {:ok, %{nodes: nodes, tree: SQLWhere.tree("WHERE " <> replaced), aggs: aggs}}
         end
     end
   end

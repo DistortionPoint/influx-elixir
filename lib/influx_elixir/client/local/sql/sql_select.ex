@@ -305,25 +305,52 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
     end
   end
 
-  # An item with no alias is named by the engine; a name the double cannot
-  # write is refused, and an alias spares the question.
+  # An item with no alias is named by the engine; a name the double cannot write is refused,
+  # and an alias spares the question. The refusal is not made where the item is read: the
+  # engine's own errors for the rest of the query (a function of the wrong type in another
+  # item) come before the answer it computes, and so before this refusal. The item is given a
+  # name no query can write, and `check_named/1` refuses it once the query has planned.
+  @unnamed "\u0000unnamed\u0000"
+
   @doc """
   The output name of select item `col`: its `alias_name`, else the name
-  `default` writes for it. A `default` that throws `:unrenderable` is a
-  refusal by name.
+  `default` writes for it. A `default` that throws `:unrenderable` has the name of an item
+  that `check_named/1` refuses.
   """
-  @spec output_name(binary(), binary() | nil, (-> binary())) :: {:ok, binary()} | {:error, map()}
+  @spec output_name(binary(), binary() | nil, (-> binary())) :: {:ok, binary()}
   def output_name(_col, alias_name, _default) when is_binary(alias_name), do: {:ok, alias_name}
 
   def output_name(col, nil, default) do
     {:ok, default.()}
   catch
     :unrenderable ->
-      {:error,
-       SQLError.refusal(
-         "the name the engine gives this select item cannot be written here (a column of " <>
-           "a joined table); add AS alias: " <> col
-       )}
+      {:ok, "#{@unnamed}#{System.unique_integer([:positive])}#{@unnamed}#{col}"}
+  end
+
+  @doc """
+  The refusal of a query with a select item whose name the engine gives and the double cannot
+  write (see `output_name/3`), or `:ok`.
+  """
+  @spec check_named(map()) :: :ok | {:error, map()}
+  def check_named(query) do
+    names =
+      Enum.map(List.wrap(query.select_columns), &elem(&1, tuple_size(&1) - 1)) ++
+        Enum.map(List.wrap(query.projection_columns), &elem(&1, 1))
+
+    case Enum.find(names, &(is_binary(&1) and String.starts_with?(&1, @unnamed))) do
+      nil ->
+        :ok
+
+      unnamed ->
+        [_empty, _number, col] = String.split(unnamed, @unnamed, parts: 3)
+
+        {:error,
+         SQLError.refusal(
+           "the name the engine gives this select item cannot be written here (it holds a " <>
+             "column of a joined table, or a cast the double does not write in a name); " <>
+             "add AS alias: " <> col
+         )}
+    end
   end
 
   @spec parse_constant_column(binary(), {SQLExpr.t(), binary() | nil}, binary() | nil) ::
@@ -370,15 +397,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
     case Regex.named_captures(@ordered_agg_pattern, body) do
       %{"func" => func, "field" => field, "ordering" => ordering, "direction" => direction}
       when ordering != "" ->
-        agg = ordered_agg_end(func, direction)
-        {field, ordering} = {name(field), name(ordering)}
-
-        with {:ok, output} <-
-               output_name(col, alias_name, fn ->
-                 ordered_name(func, field, ordering, direction, qualifier)
-               end) do
-          {:ok, {:ordered_aggregate, agg, field, ordering, output}}
-        end
+        ordered_aggregate(col, {func, field, ordering, direction}, alias_name, qualifier)
 
       %{"func" => func} ->
         {:error,
@@ -390,6 +409,39 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
 
       nil ->
         {:error, SQLError.refusal("invalid aggregate: #{col}")}
+    end
+  end
+
+  # Whether the text of an argument is a column: a quoted name, or a word that begins with a
+  # letter or an underscore and is no literal.
+  @spec column_token?(binary()) :: boolean()
+  defp column_token?("\"" <> _quoted), do: true
+
+  defp column_token?(token),
+    do:
+      Regex.match?(~r/\A[A-Za-z_]/, token) and
+        String.downcase(token) not in ["true", "false", "null"]
+
+  # A number or a keyword is no column (`first_value(1e3 ORDER BY time)` takes a constant,
+  # which the double does not model).
+  @spec ordered_aggregate(
+          binary(),
+          {binary(), binary(), binary(), binary()},
+          binary() | nil,
+          binary() | nil
+        ) :: {:ok, column()} | {:error, term()}
+  defp ordered_aggregate(col, {func, field, ordering, direction}, alias_name, qualifier) do
+    if column_token?(field) and column_token?(ordering) do
+      {field, ordering} = {name(field), name(ordering)}
+
+      with {:ok, output} <-
+             output_name(col, alias_name, fn ->
+               ordered_name(func, field, ordering, direction, qualifier)
+             end) do
+        {:ok, {:ordered_aggregate, ordered_agg_end(func, direction), field, ordering, output}}
+      end
+    else
+      {:error, SQLError.refusal("invalid aggregate: #{col}")}
     end
   end
 

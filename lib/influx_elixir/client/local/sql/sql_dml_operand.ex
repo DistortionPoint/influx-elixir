@@ -24,16 +24,16 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   # Nothing that only a later pass finds is an error here: a negation of text, a `LIKE` of a
   # number, a constant the optimizer cannot fold.
 
-  alias InfluxElixir.Client.Local.{SQLDmlExpr, SQLDmlName, SQLError, SQLFunctions}
+  alias InfluxElixir.Client.Local.{SQLDmlExpr, SQLDmlName, SQLDmlType, SQLError, SQLFunctions}
 
   @typedoc "What the operands of a statement are read against."
   @type ctx :: %{
-          table: binary(),
+          table: binary() | nil,
           columns: [binary()],
           types: %{binary() => binary()},
           relation: [binary()],
           relation_text: binary(),
-          planner: (binary(), binary() -> :ok | {:error, term()})
+          planner: (binary() | nil, binary() -> :ok | {:error, term()})
         }
 
   @typedoc "`:ok`, the engine's error, or a refusal by name of what the double does not model."
@@ -50,6 +50,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
           | :float
           | :num
           | :decimal
+          | :date
+          | :clock
+          | :interval
+          | :binary
+          | :list
           | :str
           | :unknown
 
@@ -102,15 +107,18 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   def eager({:ref, parts}, ctx), do: compound(parts, ctx)
 
+  def eager({:zero_param, text}, _ctx),
+    do: {:error, SQLError.planning("Invalid placeholder, zero is not a valid index: " <> text)}
+
   def eager({:call, name, args}, ctx) do
     cond do
       not known_function?(name) -> {:refuse, "a function the double does not know"}
+      converted_alone?(name, args) -> {:refuse, "a call the planner converts on its own"}
       args == :star -> :ok
       true -> eager(args, ctx)
     end
   end
 
-  # The planner types the operand of a unary plus as it reads it.
   def eager({:pos, inner}, ctx) do
     with :ok <- eager(inner, ctx),
          :ok <- plan_top(inner, ctx),
@@ -131,6 +139,17 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
          do: eager(inner, ctx)
   end
 
+  # A cast to a type the planner cannot plan fails when the planner reaches it, after what
+  # it casts.
+  def eager({:cast, inner, type, _try}, ctx) do
+    with :ok <- eager(inner, ctx) do
+      case type do
+        {:unsupported, printed} -> {:error, SQLDmlType.unsupported(printed)}
+        _planned -> :ok
+      end
+    end
+  end
+
   def eager(node, ctx) do
     case SQLDmlExpr.children(node) do
       [] -> :ok
@@ -138,6 +157,15 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     end
   end
 
+  # Calls the engine converts before it reads their arguments: `substr(x)` and `substring(x)`
+  # are a `SUBSTRING` with neither `FROM` nor `FOR` (an error that prints the parse tree),
+  # `floor` and `ceil` with a second argument a scale.
+  @spec converted_alone?(binary(), [SQLDmlExpr.ast()] | :star) :: boolean()
+  defp converted_alone?(name, [_one]) when name in ["substr", "substring"], do: true
+  defp converted_alone?(name, [_a, _b]) when name in ["floor", "ceil"], do: true
+  defp converted_alone?(_name, _args), do: false
+
+  # The planner types the operand of a unary plus as it reads it.
   @spec escape_length(binary() | nil) :: check()
   defp escape_length(nil), do: :ok
 
@@ -328,18 +356,25 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   is an error, printed as the planner prints it, where the double can print it.
   """
   @spec predicate(SQLDmlExpr.ast(), ctx()) :: check()
-  def predicate({:bin, op, _left, _right}, _ctx) when op in @comparisons, do: :ok
-  def predicate({:not, _inner}, _ctx), do: :ok
-  def predicate({:is, _inner, _what, _negated}, _ctx), do: :ok
-  def predicate({:in, _inner, _items, _negated}, _ctx), do: :ok
-  def predicate({:between, _inner, _low, _high, _negated}, _ctx), do: :ok
-  def predicate({:like, _inner, _pattern, _negated, _word, _escape}, _ctx), do: :ok
-  def predicate({:bool, _value}, _ctx), do: :ok
-  def predicate(:null, _ctx), do: :ok
-  def predicate(:param, _ctx), do: :ok
-  def predicate({:call, name, _args}, _ctx) when name in @boolean_functions, do: :ok
+  def predicate(operand, ctx) do
+    if exotic_in_cast?(operand) and param?(operand),
+      do: {:refuse, "a placeholder beside a cast to a type the double has no planner for"},
+      else: predicate_type(operand, ctx)
+  end
 
-  def predicate({:ref, parts}, ctx) do
+  @spec predicate_type(SQLDmlExpr.ast(), ctx()) :: check()
+  defp predicate_type({:bin, op, _left, _right}, _ctx) when op in @comparisons, do: :ok
+  defp predicate_type({:not, _inner}, _ctx), do: :ok
+  defp predicate_type({:is, _inner, _what, _negated}, _ctx), do: :ok
+  defp predicate_type({:in, _inner, _items, _negated}, _ctx), do: :ok
+  defp predicate_type({:between, _inner, _low, _high, _negated}, _ctx), do: :ok
+  defp predicate_type({:like, _inner, _pattern, _negated, _word, _escape}, _ctx), do: :ok
+  defp predicate_type({:bool, _value}, _ctx), do: :ok
+  defp predicate_type(:null, _ctx), do: :ok
+  defp predicate_type(:param, _ctx), do: :ok
+  defp predicate_type({:call, name, _args}, _ctx) when name in @boolean_functions, do: :ok
+
+  defp predicate_type({:ref, parts}, ctx) do
     {column, _quoted} = List.last(parts)
 
     case resolve(parts, ctx) do
@@ -357,11 +392,18 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     end
   end
 
-  def predicate({:num, text}, _ctx), do: literal_predicate(text)
-  def predicate({:neg, {:num, text}}, _ctx), do: literal_predicate("-" <> text)
-  def predicate({:pos, {:num, text}}, _ctx), do: literal_predicate(text)
+  defp predicate_type({:num, text}, _ctx), do: literal_predicate(text)
+  defp predicate_type({:neg, {:num, text}}, _ctx), do: literal_predicate("-" <> text)
+  defp predicate_type({:pos, {:num, text}}, _ctx), do: literal_predicate(text)
 
-  def predicate({:str, body}, _ctx) do
+  # A sign in front of a boolean is the boolean's type, which is all the planner checks.
+  defp predicate_type({sign, inner}, ctx) when sign in [:neg, :pos] do
+    if type_of(inner, ctx) == :bool,
+      do: :ok,
+      else: {:refuse, "a WHERE that is not a comparison, a boolean or a name"}
+  end
+
+  defp predicate_type({:str, body}, _ctx) do
     if Regex.match?(~r/\A[A-Za-z0-9 _.-]*\z/, body),
       do: non_boolean(~s|Utf8("#{body}")|, "Utf8"),
       else: {:refuse, "a predicate that is a string with a character the double does not print"}
@@ -369,10 +411,10 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   # A value the planner cannot type is let by, and one it can is no boolean: the double knows
   # the first by the select item's errors of the same operand.
-  def predicate({:bin, _op, _left, _right} = operand, ctx), do: untyped(operand, ctx)
-  def predicate({:call, _name, _args} = call, ctx), do: untyped(call, ctx)
+  defp predicate_type({:bin, _op, _left, _right} = operand, ctx), do: untyped(operand, ctx)
+  defp predicate_type({:call, _name, _args} = call, ctx), do: untyped(call, ctx)
 
-  def predicate(_other, _ctx),
+  defp predicate_type(_other, _ctx),
     do: {:refuse, "a WHERE that is not a comparison, a boolean or a name"}
 
   @spec untyped(SQLDmlExpr.ast(), ctx()) :: check()
@@ -427,7 +469,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   """
   @spec value(SQLDmlExpr.ast(), binary(), ctx()) :: check()
   def value(operand, column, ctx) do
-    with :ok <- plan_top(operand, ctx), do: convertible(operand, ctx.types[column], ctx)
+    with :ok <- plan_top(operand, ctx),
+         do: convertible(operand, ctx.types[column], ctx, :planning)
   end
 
   @doc """
@@ -448,25 +491,29 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     end)
   end
 
-  # A value is converted to its column's type, which fails for a boolean and a timestamp (or a
-  # duration, the difference of two timestamps) only.
-  @spec convertible(SQLDmlExpr.ast(), binary() | nil, ctx()) :: check()
-  defp convertible(operand, target, ctx) do
-    case {target, type_of(operand, ctx)} do
-      {"Boolean", :time} ->
-        conversion("Timestamp(ns)", "Boolean")
+  @doc """
+  The conversion of an operand to the Arrow type `target` of a column. `mode` is `:planning`
+  for the projection of an `UPDATE` or of an `INSERT ... SELECT` (`Cannot automatically
+  convert`) and `:values` for the cells of an `INSERT ... VALUES` (the engine's
+  `type mismatch and can't cast`).
+  """
+  @spec convert(SQLDmlExpr.ast(), binary() | nil, ctx(), :planning | :values) :: check()
+  def convert(operand, target, ctx, mode), do: convertible(operand, target, ctx, mode)
 
-      {"Boolean", :duration} ->
-        conversion("Duration(ns)", "Boolean")
+  # A value is converted to its column's type, which fails for a few pairs only (verified
+  # for the source types a `CAST` can make): a boolean and a timestamp (or a duration, the
+  # difference of two timestamps) into each other, and the date, time, interval, binary and
+  # list types into the numbers, booleans and timestamps their kernels do not cast.
+  @spec convertible(SQLDmlExpr.ast(), binary() | nil, ctx(), :planning | :values) :: check()
+  defp convertible(operand, target, ctx, mode) do
+    case {unconvertible(operand, target, ctx), type_of(operand, ctx)} do
+      {{:no, from}, _type} ->
+        conversion(mode, from, target)
 
-      {"Timestamp(ns)", :bool} ->
-        conversion("Boolean", "Timestamp(ns)")
+      {:known, _type} ->
+        :ok
 
-      {"Timestamp(ns)", :duration} ->
-        conversion("Duration(ns)", "Timestamp(ns)")
-
-      {target, type}
-      when target in ["Boolean", "Timestamp(ns)"] and type in [:unknown, :decimal] ->
+      {:ok, type} when target in ["Boolean", "Timestamp(ns)"] and type in [:unknown, :decimal] ->
         {:refuse, "a value whose type is not known where a boolean or a timestamp is assigned"}
 
       _convertible ->
@@ -474,9 +521,58 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     end
   end
 
-  @spec conversion(binary(), binary()) :: {:error, SQLError.t()}
-  defp conversion(from, to),
+  @spec unconvertible(SQLDmlExpr.ast(), binary() | nil, ctx()) ::
+          :ok | :known | {:no, binary()}
+  defp unconvertible({:cast, _inner, %{family: family, arrow: arrow}, _try}, target, _ctx)
+       when family in ~w(date clock interval binary list)a do
+    if target in non_castable(family, arrow), do: {:no, arrow}, else: :ok
+  end
+
+  # A cast to a decimal is known by its precision: it cannot be cast to a boolean.
+  defp unconvertible({:cast, _inner, %{family: :decimal, arrow: arrow}, _try}, target, _ctx),
+    do: if(target == "Boolean", do: {:no, arrow}, else: :known)
+
+  defp unconvertible(operand, target, ctx) do
+    case {target, type_of(operand, ctx)} do
+      {"Boolean", :time} -> {:no, "Timestamp(ns)"}
+      {"Boolean", :duration} -> {:no, "Duration(ns)"}
+      {"Timestamp(ns)", :bool} -> {:no, "Boolean"}
+      {"Timestamp(ns)", :duration} -> {:no, "Duration(ns)"}
+      _convertible -> :ok
+    end
+  end
+
+  # The column types a value of each such family cannot be cast to.
+  @spec non_castable(atom(), binary()) :: [binary()]
+  defp non_castable(:date, _arrow), do: ["UInt64", "Float64", "Boolean"]
+  defp non_castable(:clock, _arrow), do: ["UInt64", "Float64", "Boolean", "Timestamp(ns)"]
+
+  # A fixed-size list is not cast to text either.
+  defp non_castable(:list, "FixedSizeList" <> _rest),
+    do: [
+      "UInt64",
+      "Int64",
+      "Float64",
+      "Boolean",
+      "Timestamp(ns)",
+      "Utf8",
+      "Dictionary(Int32, Utf8)"
+    ]
+
+  defp non_castable(family, _arrow) when family in [:interval, :binary, :list],
+    do: ["UInt64", "Int64", "Float64", "Boolean", "Timestamp(ns)"]
+
+  @spec conversion(:planning | :values, binary(), binary() | nil) :: {:error, map()}
+  defp conversion(:planning, from, to),
     do: {:error, SQLError.planning("Cannot automatically convert #{from} to #{to}")}
+
+  defp conversion(:values, from, to),
+    do:
+      {:error,
+       %{
+         status: 500,
+         body: "Execution error: type mismatch and can't cast to got #{from} and #{to}"
+       }}
 
   # ---------------------------------------------------------------------------
   # Typing an operand as a select item
@@ -496,6 +592,13 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   def plan_top({:ref, parts}, ctx), do: typed_name(parts, ctx)
 
   def plan_top(operand, ctx) do
+    if exotic_nested?(operand, true),
+      do: {:refuse, "an operator or a call over a cast to a type the double has no planner for"},
+      else: plan_typed(operand, ctx)
+  end
+
+  @spec plan_typed(SQLDmlExpr.ast(), ctx()) :: check()
+  defp plan_typed(operand, ctx) do
     if type_of(operand, ctx) == :duration do
       # The difference of two timestamps is a duration, which no select item here can be.
       {:bin, _op, left, right} = operand
@@ -547,6 +650,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
       :ok ->
         :ok
 
+      # The optimizer's errors are found when the plan is optimized, which a DML statement
+      # never is (it is refused first): `UPDATE t SET f = coalesce('a', 1)` is the refusal.
+      {:error, %{body: "Optimizer rule " <> _rest}} ->
+        :ok
+
       # A negation is checked late, after the planning an update stops at.
       {:error, %{body: "Error during planning: Negation only supports" <> _rest}} ->
         :ok
@@ -558,6 +666,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
       {:error, _reason} = error ->
         error
+
+      {:refuse, _why} = refusal ->
+        refusal
     end
   end
 
@@ -584,8 +695,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp lower({:like, _a, _b, _c, _d, _e} = node, _ctx), do: {@bool_dummy, calls(node)}
 
   # The planner types a cast as its type, and what it casts only when it builds the projection.
-  defp lower({:cast, inner, type, try?}, _ctx),
-    do: {cast_stand_in(type) || {:cast, {:num, "0"}, type, try?}, [inner]}
+  defp lower({:cast, inner, type, try?}, _ctx), do: {cast_stand_in(type, try?), [inner]}
 
   defp lower({:call, name, args}, ctx) when is_list(args) do
     kinds = args |> Enum.map(&type_of(&1, ctx)) |> Enum.uniq()
@@ -622,16 +732,52 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     {lowered, Enum.concat(operands)}
   end
 
-  @spec cast_stand_in(binary()) :: SQLDmlExpr.ast() | nil
-  defp cast_stand_in(type) do
-    case String.downcase(type) do
-      bool when bool in ["boolean", "bool"] -> @bool_dummy
-      "timestamp" -> @time_dummy
-      float when float in ["double", "float8"] -> {:num, "0.5"}
-      int when int in ["bigint", "int8"] -> {:num, "0"}
-      _other -> nil
-    end
-  end
+  # What the planner types a cast as: a node of that type. The casts to a type the double has
+  # no planner for stand as a number of the family (those that sit in an operator are refused
+  # before, see `exotic_nested?/2`).
+  @spec cast_stand_in(SQLDmlType.t(), boolean()) :: SQLDmlExpr.ast()
+  defp cast_stand_in(%{family: :bool}, _try?), do: @bool_dummy
+  defp cast_stand_in(%{family: :timestamp}, _try?), do: @time_dummy
+  defp cast_stand_in(%{family: :float, arrow: "Float64"}, _try?), do: {:num, "0.5"}
+  defp cast_stand_in(%{family: :int, bits: 64}, _try?), do: {:num, "0"}
+  defp cast_stand_in(%{family: :uint}, _try?), do: {:num, "9223372036854775808"}
+
+  defp cast_stand_in(%{sql: sql} = type, try?) when is_binary(sql),
+    do: {:cast, {:num, "0"}, type, try?}
+
+  defp cast_stand_in(_type, _try?), do: {:num, "0"}
+
+  # Types the double has no planner for: an operator or a call over a cast to one of them
+  # is not planned.
+  @spec exotic?(SQLDmlType.t()) :: boolean()
+  defp exotic?(%{family: family}) when family in ~w(date clock interval binary list decimal)a,
+    do: true
+
+  defp exotic?(%{arrow: "Float32"}), do: true
+  defp exotic?(_type), do: false
+
+  # A cast to such a type anywhere in an operand, and a placeholder anywhere in it (a
+  # placeholder takes its type from what stands beside it, which fails for such a cast).
+  @spec exotic_in_cast?(SQLDmlExpr.ast()) :: boolean()
+  defp exotic_in_cast?({:cast, inner, type, _try}),
+    do: exotic?(type) or exotic_in_cast?(inner)
+
+  defp exotic_in_cast?(node), do: node |> SQLDmlExpr.children() |> Enum.any?(&exotic_in_cast?/1)
+
+  @spec param?(SQLDmlExpr.ast()) :: boolean()
+  defp param?(:param), do: true
+  defp param?(node), do: node |> SQLDmlExpr.children() |> Enum.any?(&param?/1)
+  # Whether a cast to such a type sits where the planner types it through an operator.
+  @spec exotic_nested?(SQLDmlExpr.ast(), boolean()) :: boolean()
+  defp exotic_nested?({:cast, _inner, type, _try}, root?), do: not root? and exotic?(type)
+  defp exotic_nested?({:not, _inner}, _root?), do: false
+  defp exotic_nested?({:in, _a, _b, _c}, _root?), do: false
+  defp exotic_nested?({:between, _a, _b, _c, _d}, _root?), do: false
+  defp exotic_nested?({:like, _a, _b, _c, _d, _e}, _root?), do: false
+  defp exotic_nested?({:is, _a, what, _c}, _root?) when not is_tuple(what), do: false
+
+  defp exotic_nested?(node, _root?),
+    do: node |> SQLDmlExpr.children() |> Enum.any?(&exotic_nested?(&1, false))
 
   # The calls in an operand that the planner types, outermost first: it reaches a call through
   # anything but a test of a value (`IS ...`).
@@ -727,15 +873,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp column_type(type) when type in ["Utf8", "Dictionary(Int32, Utf8)"], do: :str
   defp column_type(_type), do: :unknown
 
-  @spec cast_type(binary()) :: type()
-  defp cast_type(type) do
-    case type |> String.downcase() |> String.replace(~r/\(.*\)/, "") do
-      bool when bool in ["boolean", "bool"] -> :bool
-      int when int in ~w(int integer bigint smallint tinyint int4 int8 long) -> :int
-      float when float in ~w(float double real float4 float8 decimal numeric) -> :float
-      text when text in ~w(text varchar string char) -> :str
-      "timestamp" -> :time
-      _other -> :unknown
-    end
-  end
+  @spec cast_type(SQLDmlType.t()) :: type()
+  defp cast_type({:unsupported, _printed}), do: :unknown
+  defp cast_type(%{family: :timestamp}), do: :time
+  defp cast_type(%{family: family}), do: family
 end

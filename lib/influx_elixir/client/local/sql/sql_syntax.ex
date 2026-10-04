@@ -95,9 +95,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     |> SQLTokenizer.split()
     |> Enum.reduce_while(:ok, fn {offset, piece}, :ok ->
       positioned = SQLTokenizer.blank(binary_part(sql, 0, offset)) <> piece
-      statement = String.replace_suffix(positioned, ";", "")
 
-      case first_token_error(statement) do
+      case first_token_error(positioned) do
         nil -> verdict(check(positioned))
         error -> {:halt, {:error, error}}
       end
@@ -108,8 +107,12 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # with nothing after it (`DELETE`, `USE`); the other answers of a bare word (`BEGIN`, `END`)
   # are the planner's, which a text of several statements never reaches.
   @spec first_token_error(binary()) :: SQLError.t() | nil
-  defp first_token_error(statement) do
-    SQLStatement.parser_error(statement) || parse_only(SQLStatement.bare_error(statement))
+  defp first_token_error(positioned) do
+    # A `;` ends nothing the parser needs to read: it is the token it finds where the
+    # statement has no more (verified: `SELECT ; FROM t` is "found: ;" at the `;`).
+    statement = String.replace_suffix(positioned, ";", "")
+
+    SQLStatement.parser_error(statement) || parse_only(SQLStatement.bare_error(positioned))
   end
 
   defp parse_only(%{body: "SQL error: ParserError" <> _rest} = error), do: error
@@ -231,13 +234,76 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     do: read_query(tokens)
 
   defp statement([{:word, _p, "DELETE", _l, _c}, {:word, _q, "FROM", _l2, _c2} | rest]) do
-    _target = object_name(rest)
+    rest |> delete_target() |> delete_where()
+    :ok
+  catch
+    {:syntax, expected, token} -> {:error, parser_error(expected, token)}
+    :bail -> :ok
+  end
+
+  defp statement([{:word, _p, "INSERT", _l, _c}, {:word, _q, "INTO", _l2, _c2} | rest]) do
+    rest |> object_name() |> insert_source()
     :ok
   catch
     {:syntax, expected, token} -> {:error, parser_error(expected, token)}
   end
 
+  # `UPDATE t SET` wants the column it assigns: a `;` or the end of the text is not one.
+  defp statement([{:word, _p, "UPDATE", _l, _c} | rest]) do
+    case object_name(rest) do
+      [{:word, _q, "SET", _l2, _c2}, {kind, _r, _u, _l3, _c3} = token | _more]
+      when kind == :eof or (kind == :symbol and elem(token, 1) == ";") ->
+        {:error, parser_error("identifier", token)}
+
+      _read ->
+        :ok
+    end
+  catch
+    {:syntax, expected, token} -> {:error, parser_error(expected, token)}
+  end
+
   defp statement(_tokens), do: :ok
+
+  # What an `INSERT` inserts is a query: with the text ended there is none to read. (What
+  # follows otherwise is read by the DML reader, with the rest of the statement.)
+  @spec insert_source(tokens()) :: tokens()
+  defp insert_source([{:eof, _p, _u, _l, _c} | _rest] = tokens),
+    do: fail("SELECT, VALUES, or a subquery in the query body", tokens)
+
+  defp insert_source([{:symbol, _p, ";", _l, _c} | _rest] = tokens),
+    do: fail("SELECT, VALUES, or a subquery in the query body", tokens)
+
+  defp insert_source(tokens), do: tokens
+
+  # The name a `DELETE FROM` deletes from; in parentheses it is a table name again (the
+  # planner refuses the statement whatever it deletes from) or a subquery, which the engine's
+  # error prints as the statement it parsed (verified), which the double does not.
+  @spec delete_target(tokens()) :: tokens()
+  defp delete_target([{:symbol, _p, "(", _l, _c} | rest]) do
+    case rest do
+      [{:word, _q, word, _l2, _c2} | _more] when word in ["SELECT", "WITH"] ->
+        refuse("a DELETE FROM a subquery: the engine's error for it prints the parsed query")
+        throw(:bail)
+
+      _name ->
+        rest |> object_name() |> close_paren()
+    end
+  end
+
+  defp delete_target(tokens), do: object_name(tokens)
+
+  # `WHERE` wants an expression: with the statement ended there is none. (The expression
+  # itself is read by the DML reader, which knows the engine's types.)
+  @spec delete_where(tokens()) :: tokens()
+  defp delete_where([{:word, _p, "WHERE", _l, _c}, {:eof, _q, _u, _l2, _c2} | _rest] = tokens),
+    do: fail("an expression", tl(tokens))
+
+  defp delete_where(
+         [{:word, _p, "WHERE", _l, _c}, {:symbol, _q, ";", _l2, _c2} | _rest] = tokens
+       ),
+       do: fail("an expression", tl(tokens))
+
+  defp delete_where(tokens), do: tokens
 
   @spec read_query(tokens()) :: :ok | {:error, SQLError.t()}
   defp read_query(tokens) do
@@ -451,7 +517,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp after_item([{:symbol, _p, ",", _l, _c} | rest]) do
     case rest do
       [{:eof, _q, _u, _l2, _c2} | _more] -> rest
-      [{:symbol, _q, bracket, _l2, _c2} | _more] when bracket in [")", "]"] -> rest
+      [{:symbol, _q, bracket, _l2, _c2} | _more] when bracket in [")", "]", ";"] -> rest
       [{:word, _q, upper, _l2, _c2} | _more] when upper in @column_reserved -> rest
       _item -> projection(rest)
     end
@@ -1178,6 +1244,10 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp before_and([{:symbol, _p, symbol, _l, _c} | rest]) when symbol in @bound_operators,
     do: rest |> operand() |> before_and()
+
+  # A cast of the low bound (`BETWEEN 1::bigint AND 3`).
+  defp before_and([{:symbol, _p, "::", _l, _c}, {:word, _q, _u, _l2, _c2} | rest]),
+    do: rest |> type_arguments() |> before_and()
 
   defp before_and(tokens), do: tokens
 end

@@ -827,4 +827,17 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   """
   @spec bind(parsed_query(), %{binary() => term()}) :: {:ok, parsed_query()} | {:error, map()}
   defdelegate bind(query, params), to: SQLBind
+
+  @doc """
+  See `InfluxElixir.Client.Local.SQLBind.bind_partial/2`.
+  """
+  @spec bind_partial(parsed_query(), %{binary() => term()}) ::
+          {:ok, parsed_query()} | {:error, SQLError.t()}
+  defdelegate bind_partial(query, params), to: SQLBind
+
+  @doc """
+  See `InfluxElixir.Client.Local.SQLBind.problem/2`.
+  """
+  @spec problem(parsed_query(), %{binary() => term()}) :: :ok | {:error, SQLError.t()}
+  defdelegate problem(query, params), to: SQLBind
 end

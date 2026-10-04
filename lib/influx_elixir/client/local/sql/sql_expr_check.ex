@@ -159,7 +159,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
             )
 
           "Timestamp(ns)" in [l, r] and (text?(l) or text?(r)) ->
-            time_with_text(left, right, operation)
+            time_with_text(left, right, negated)
 
           true ->
             :ok
@@ -174,19 +174,16 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   # '2023-10-01'` is true of every instant but that midnight). A text it cannot read is the
   # optimizer's error for it, a text the double cannot read as a timestamp (a column, an
   # expression) is refused by name.
-  @spec time_with_text(SQLExpr.t(), SQLExpr.t(), binary()) :: :ok | {:error, map()}
-  defp time_with_text({:field, "time"}, {:lit, text}, _operation) when is_binary(text),
+  @spec time_with_text(SQLExpr.t(), SQLExpr.t(), boolean()) :: :ok | {:error, map()}
+  defp time_with_text({:field, "time"}, {:lit, text}, _negated) when is_binary(text),
     do: timestamp_text(text)
 
-  defp time_with_text({:lit, text}, {:field, "time"}, _operation) when is_binary(text),
+  defp time_with_text({:lit, text}, {:field, "time"}, _negated) when is_binary(text),
     do: timestamp_text(text)
 
-  defp time_with_text(_left, _right, operation) do
-    {:error,
-     SQLError.late_refusal(
-       "#{operation} of a time and text that is not a literal: the engine reads the text as " <>
-         "a timestamp (an error or a closed connection), which is not modelled"
-     )}
+  defp time_with_text(_left, _right, negated) do
+    kind = if negated, do: :not_distinct, else: :distinct
+    {:error, SQLError.late_refusal({:distinct_time_text, kind})}
   end
 
   @spec timestamp_text(binary()) :: :ok | {:error, map()}
@@ -201,11 +198,12 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
           :ok | {:error, map()}
   defp check_like(inner, pattern, ilike, columns) do
     word = if ilike, do: "ILIKE", else: "LIKE"
+    kind = if ilike, do: :ilike, else: :like
 
     case {type(inner, columns), type(pattern, columns)} do
       {l, r} when is_binary(l) and is_binary(r) ->
         nulls? = SQLNullType.null_valued?(inner) or SQLNullType.null_valued?(pattern)
-        like_types(l, r, word, nulls?)
+        like_types(l, r, {word, kind}, nulls?)
 
       {l, r} ->
         null_like(l, r, null?(inner, columns), null?(pattern, columns))
@@ -214,8 +212,9 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
   # A text with a text is matched. A tag beside a number the engine matches as text, beside a
   # timestamp it closes the connection (verified); any other pair has no common type.
-  @spec like_types(binary(), binary(), binary(), boolean()) :: :ok | {:error, map()}
-  defp like_types(left, right, word, nulls?) do
+  @spec like_types(binary(), binary(), {binary(), :like | :ilike}, boolean()) ::
+          :ok | {:error, map()}
+  defp like_types(left, right, {word, kind}, nulls?) do
     cond do
       text?(left) and text?(right) ->
         :ok
@@ -227,10 +226,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
         :ok
 
       order = tag_number_order(left, right) ->
-        {:error,
-         SQLError.late_refusal(
-           "#{word} of #{order}: the engine matches the number as text, which is not modelled"
-         )}
+        {:error, SQLError.late_refusal({:pattern_number, kind, order})}
 
       true ->
         coercion("There isn't a common type to coerce #{left} and #{right} in #{word} expression")
@@ -238,11 +234,11 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   end
 
   # Which way round a tag and a number stand (a tag of numbers counts as a tag).
-  @spec tag_number_order(binary(), binary()) :: binary() | nil
+  @spec tag_number_order(binary(), binary()) :: :tag_number | :number_tag | nil
   defp tag_number_order(left, right) do
     cond do
-      tag_beside_number?(left, right) -> "a tag and a number"
-      tag_beside_number?(right, left) -> "a number and a tag"
+      tag_beside_number?(left, right) -> :tag_number
+      tag_beside_number?(right, left) -> :number_tag
       true -> nil
     end
   end
@@ -273,18 +269,26 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   defp null?(expr, scope), do: raw_type(expr, scope) == "Null"
 
   @spec check_in(SQLExpr.t(), [SQLExpr.t()], scope()) :: :ok | {:error, map()}
-  defp check_in(inner, items, columns) do
-    types = Enum.map(items, &raw_type(&1, columns))
-    operand = type(inner, columns)
+  defp check_in(inner, items, columns),
+    do: in_types(raw_type(inner, columns), Enum.map(items, &raw_type(&1, columns)))
 
+  @doc """
+  The engine's error for an `IN` list, or `:ok`, from the types of the operand and of the
+  items (`"Null"` for the null literal, anything that is no type name for a type not known,
+  which is never refused). The null is compatible with every type: `b IN (NULL, NULL)` and
+  `b IN (NULL, b)` plan, `b IN (NULL, 1)` does not; and the null operand beside a list whose
+  own types clash has no common type (verified: `NULL IN (true, 1)`).
+  """
+  @spec in_types(SQLExprType.type(), [SQLExprType.type()]) :: :ok | {:error, map()}
+  def in_types(operand, types) do
     cond do
-      is_binary(operand) and Enum.all?(types, &is_binary/1) and
-          Enum.any?(types, &incompatible?(&1, operand)) ->
+      not Enum.all?(types, &is_binary/1) ->
+        :ok
+
+      is_binary(operand) and operand != "Null" and Enum.any?(types, &incompatible?(&1, operand)) ->
         in_error(operand, types)
 
-      # The null beside a list is compatible with every type, the list's own types are not
-      # (verified: `NULL IN (true, 1)` has no common type).
-      null?(inner, columns) and Enum.all?(types, &is_binary/1) and clash?(types) ->
+      operand == "Null" and clash?(types) ->
         in_error("Null", types)
 
       true ->
@@ -302,21 +306,42 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   # Whether two of the types, the null apart, have no common type.
   @spec clash?([binary()]) :: boolean()
   defp clash?(types) do
-    typed = Enum.reject(types, &(&1 == "Null"))
+    typed = types |> Enum.reject(&(&1 == "Null")) |> Enum.uniq()
     Enum.any?(typed, fn left -> Enum.any?(typed, &incompatible?(left, &1)) end)
   end
 
   @spec check_between(SQLExpr.t(), SQLExpr.t(), SQLExpr.t(), scope()) ::
           :ok | {:error, map()}
-  defp check_between(inner, low, high, columns) do
-    operand = type(inner, columns)
+  defp check_between(inner, low, high, columns),
+    do: between_types(raw_type(inner, columns), raw_type(low, columns), raw_type(high, columns))
 
-    bound =
-      Enum.find([type(low, columns), type(high, columns)], fn bound ->
-        is_binary(operand) and is_binary(bound) and incompatible?(bound, operand)
-      end)
+  @doc """
+  The engine's error for a `BETWEEN`, or `:ok`, from the types of the operand and of the two
+  bounds (see `in_types/2`). The engine coerces the operand with the low bound and that with
+  the high bound, and the error names the operand and the bound it failed at (verified:
+  `b BETWEEN NULL AND 1` fails at `Boolean` and `Int64`, `NULL BETWEEN true AND 5` at `Null`
+  and `Int64`, since the null took the type of the low bound).
+  """
+  @spec between_types(SQLExprType.type(), SQLExprType.type(), SQLExprType.type()) ::
+          :ok | {:error, map()}
+  def between_types(operand, low, high) do
+    [low, high]
+    |> Enum.reduce_while(operand, fn bound, common ->
+      cond do
+        not (is_binary(common) and is_binary(bound)) ->
+          {:cont, common}
 
-    if bound, do: {:error, SQLError.between_coercion(operand, bound)}, else: :ok
+        incompatible?(bound, common) ->
+          {:halt, {:error, SQLError.between_coercion(operand, bound)}}
+
+        true ->
+          {:cont, if(common == "Null", do: bound, else: common)}
+      end
+    end)
+    |> case do
+      {:error, _error} = error -> error
+      _common -> :ok
+    end
   end
 
   @spec check_concat(SQLExpr.t(), SQLExpr.t(), scope(), context()) ::
@@ -329,11 +354,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
             concat_error(l, r, context)
 
           "Timestamp(ns)" in [l, r] ->
-            {:error,
-             SQLError.late_refusal(
-               "a timestamp concatenated as text: the engine writes its nanoseconds, which " <>
-                 "the double keeps only to the microsecond"
-             )}
+            {:error, SQLError.late_refusal(:timestamp_concat)}
 
           true ->
             :ok
@@ -405,8 +426,12 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   defp text?(type), do: type in ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"]
 
   # Two types the engine finds no common type for in an `IN`, a `BETWEEN` or an
-  # `IS DISTINCT FROM`: a boolean with anything else, a timestamp with a number.
+  # `IS DISTINCT FROM`: a boolean with anything else, a timestamp with a number. The null
+  # has a common type with every type (verified: `b IN (NULL, NULL)` and `b IN (NULL, b)` plan).
   @spec incompatible?(binary(), binary()) :: boolean()
+  defp incompatible?("Null", _right), do: false
+  defp incompatible?(_left, "Null"), do: false
+
   defp incompatible?(left, right) do
     left == "Boolean" != (right == "Boolean") or
       SQLNativeType.struct?(left) != SQLNativeType.struct?(right) or
@@ -459,11 +484,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
         planner(message, context)
 
       true ->
-        {:error,
-         SQLError.late_refusal(
-           "a comparison of time with text or another time in the select list: the engine " <>
-             "reads the other side as a timestamp, which is not modelled"
-         )}
+        {:error, SQLError.late_refusal(:compare_time_text)}
     end
   end
 
@@ -502,11 +523,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
         )
 
       timestamp_with_text?(operand_type, conditions) ->
-        {:error,
-         SQLError.late_refusal(
-           "a CASE comparing time with text: the engine reads the text as a timestamp, " <>
-             "which is not modelled"
-         )}
+        {:error, SQLError.late_refusal(:case_time_text)}
 
       SQLExprType.common(results, :case) == :mixed ->
         mixed_results(results)
@@ -515,8 +532,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
         uncastable_error(Enum.find(conditions, &uncastable_condition?/1))
 
       is_nil(operand) and Enum.any?(conditions, &(is_binary(&1) and &1 != "Boolean")) ->
-        {:error,
-         SQLError.late_refusal("a CASE condition that is not a boolean: the engine casts it")}
+        {:error, SQLError.late_refusal(:case_condition)}
 
       true ->
         :ok
@@ -595,7 +611,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
     case SQLExprType.common(types, :coalesce) do
       :mixed -> mixed_coalesce(types, context)
-      common -> text_cast("COALESCE", args, types, common)
+      common -> text_cast(:coalesce, args, types, common)
     end
   end
 
@@ -603,7 +619,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   # and fails when it runs the plan, with the cast's error when the text is a literal that
   # reads as no number (it folds the constant), with a closed connection when a value of a
   # column does not cast. The double does not cast text, so it refuses what could cast.
-  @spec text_cast(binary(), [SQLExpr.t()], [SQLExprType.type()], SQLExprType.type()) ::
+  @spec text_cast(:coalesce | :nullif, [SQLExpr.t()], [SQLExprType.type()], SQLExprType.type()) ::
           :ok | {:error, map()}
   defp text_cast(name, args, types, common) do
     if SQLCommonType.number_with_text?(types) do
@@ -617,11 +633,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
            )}
 
         nil ->
-          {:error,
-           SQLError.late_refusal(
-             "#{name} of arguments with no common type the double models (a number with text, " <>
-               "or a type other than Int64, Float64, text and Boolean)"
-           )}
+          {:error, SQLError.late_refusal({:no_common_type, name})}
       end
     else
       :ok
@@ -648,11 +660,11 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
         context
       )
     else
-      mixed_refusal("COALESCE", types)
+      mixed_refusal(:coalesce, types)
     end
   end
 
-  defp mixed_coalesce(types, _context), do: mixed_refusal("COALESCE", types)
+  defp mixed_coalesce(types, _context), do: mixed_refusal(:coalesce, types)
 
   @spec check_nullif([SQLExpr.t()], scope(), context()) ::
           :ok | {:error, map()}
@@ -678,7 +690,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
       true ->
         with :ok <- nullif_types(types, context),
-             do: text_cast("NULLIF", args, types, SQLExprType.common(types, :nullif))
+             do: text_cast(:nullif, args, types, SQLExprType.common(types, :nullif))
     end
   end
 
@@ -703,7 +715,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
         )
 
       SQLExprType.common(types, :nullif) == :mixed ->
-        mixed_refusal("NULLIF", types)
+        mixed_refusal(:nullif, types)
 
       true ->
         :ok
@@ -714,35 +726,32 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
   # Numbers with text the engine casts to one another when it runs the plan (the connection
   # closes where a value does not cast); any other mix is its planning error, not worded here.
-  @spec mixed_refusal(binary(), [SQLExprType.type()]) :: {:error, map()}
+  @spec mixed_refusal(:coalesce | :nullif, [SQLExprType.type()]) :: {:error, map()}
   defp mixed_refusal(name, types) do
     if SQLCommonType.number_with_text?(types) do
-      {:error,
-       SQLError.late_refusal(
-         "#{name} of arguments with no common type the double models (a number with text, " <>
-           "or a type other than Int64, Float64, text and Boolean)"
-       )}
+      {:error, SQLError.late_refusal({:no_common_type, name})}
     else
       mixed_numbers(name, types)
     end
   end
 
   # Numbers the double does not combine are computed by the engine, with no planning error.
-  @spec mixed_numbers(binary(), [SQLExprType.type()]) :: {:error, map()}
+  @spec mixed_numbers(:coalesce | :nullif, [SQLExprType.type()]) :: {:error, map()}
   defp mixed_numbers(name, types) do
     if SQLCommonType.numbers?(types) do
-      {:error,
-       SQLError.late_refusal(
-         "#{name} of numbers the double does not combine (an unsigned integer beside another number)"
-       )}
+      {:error, SQLError.late_refusal({:numbers_not_combined, name})}
     else
       {:error,
        SQLError.refusal(
-         "#{name} of arguments with no common type the double models (a type other than " <>
+         "#{call_word(name)} of arguments with no common type the double models (a type other than " <>
            "Int64, Float64, text and Boolean beside another)"
        )}
     end
   end
+
+  @spec call_word(:coalesce | :nullif) :: binary()
+  defp call_word(:coalesce), do: "COALESCE"
+  defp call_word(:nullif), do: "NULLIF"
 
   # The planner's own error carries no prefix in the select list; elsewhere it
   # is found by the type coercion.

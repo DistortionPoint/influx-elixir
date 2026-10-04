@@ -56,9 +56,19 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
   @typedoc "Which of the two typings of the engine: before or after the coercion."
   @type phase :: :plan | :coerced
 
+  @doc """
+  Whether an Arrow type name is a decimal: `Decimal128(?)` stands for one whose precision is
+  not tracked (the result of an arithmetic operator on an `Int64` and a `UInt64`), the other
+  two for those the engine's fold of a mix of numbers gives (see
+  `InfluxElixir.Client.Local.SQLCommonType.planned/2`).
+  """
+  defguard is_decimal_type(type)
+           when type in ["Decimal128(?)", "Decimal128(20, 0)", "Decimal128(35, 15)"]
+
   @doc "Whether an Arrow type name is one of the engine's numeric types."
   defguard is_numeric_type(type)
-           when type in ["Int64", "UInt64", "Float64", "Decimal128(?)", "Int32", "Int16", "Int8"]
+           when type in ["Int64", "UInt64", "Float64", "Int32", "Int16", "Int8"] or
+                  is_decimal_type(type)
 
   @doc "Whether a type is one of the engine's numeric types (`is_numeric_type/1` outside a guard)."
   @spec numeric?(type()) :: boolean()
@@ -69,9 +79,9 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
   `memo` (see `InfluxElixir.Client.Local.SQLTyped`) are taken as they are.
   """
   @spec type_of(SQLExpr.t(), columns(), SQLTyped.t(), phase()) :: type()
-  def type_of(expr, columns, memo \\ %{}, phase \\ :coerced)
+  def type_of(expr, columns, memo \\ [], phase \\ :coerced)
 
-  def type_of(expr, columns, memo, phase) when map_size(memo) > 0 and is_tuple(expr) do
+  def type_of(expr, columns, memo, phase) when memo != [] and is_tuple(expr) do
     case SQLTyped.recall(memo, expr) do
       {:ok, {coerced, _planned}} when phase == :coerced -> coerced
       {:ok, {_coerced, planned}} -> planned
@@ -86,7 +96,7 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
   from the types of its parts.
   """
   @spec pair(SQLExpr.t(), columns(), SQLTyped.t()) :: {type(), type()}
-  def pair(expr, columns, memo) when map_size(memo) > 0 and is_tuple(expr) do
+  def pair(expr, columns, memo) when memo != [] and is_tuple(expr) do
     case SQLTyped.recall(memo, expr) do
       {:ok, pair} -> pair
       :error -> types_of(expr, columns, memo)
@@ -105,7 +115,7 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
 
   @doc "The type of an expression, with a `Null` read as a type not known (`nil`)."
   @spec known_type(SQLExpr.t(), columns(), SQLTyped.t(), phase()) :: type()
-  def known_type(expr, columns, memo \\ %{}, phase \\ :coerced),
+  def known_type(expr, columns, memo \\ [], phase \\ :coerced),
     do: known(type_of(expr, columns, memo, phase))
 
   @doc "A type with `Null` read as not known."
@@ -160,12 +170,13 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
     do: arithmetic(type_of(left, columns, memo, phase), type_of(right, columns, memo, phase))
 
   def node_type({:case, _operand, whens, otherwise}, columns, memo, phase) do
-    results = Enum.map(whens, &elem(&1, 1)) ++ List.wrap(otherwise)
-    types = Enum.map(results, &type_of(&1, columns, memo, phase))
+    thens = Enum.map(whens, &type_of(elem(&1, 1), columns, memo, phase))
+    others = Enum.map(List.wrap(otherwise), &type_of(&1, columns, memo, phase))
 
     case phase do
-      :coerced -> case_type(types)
-      :plan -> first_result(types)
+      # The engine folds the types of the results from the `ELSE`.
+      :coerced -> case_type(thens ++ others, others ++ thens)
+      :plan -> first_result(thens ++ others)
     end
   end
 
@@ -203,21 +214,21 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
   # The type of a `CASE` once coerced: the type its results share. Results that share none are
   # the error of the `CASE` (found after the errors of what stands around it), so what stands
   # around it sees the type the planner gave it.
-  @spec case_type([type()]) :: type()
-  defp case_type(types) do
+  @spec case_type([type()], [type()]) :: type()
+  defp case_type(types, folded) do
     case SQLCommonType.common(types, :case) do
-      :mixed -> mixed_case_type(types)
+      :mixed -> mixed_case_type(types, folded)
       type -> type
     end
   end
 
   # Results that share no type the double models: numbers of the engine's own (an `Int64` with
   # a `UInt64` is a decimal), text beside a timestamp (a timestamp), else the first result.
-  @spec mixed_case_type([type()]) :: type()
-  defp mixed_case_type(types) do
+  @spec mixed_case_type([type()], [type()]) :: type()
+  defp mixed_case_type(types, folded) do
     cond do
       time_with_text?(types) -> "Timestamp(ns)"
-      (planned = SQLCommonType.planned(types, :case)) != :mixed -> planned
+      (planned = SQLCommonType.planned(folded, :case)) != :mixed -> planned
       true -> first_result(types)
     end
   end

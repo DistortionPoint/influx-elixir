@@ -20,47 +20,105 @@ defmodule InfluxElixir.Client.Local.SQLError do
   # The refusals of what the engine computes without a planning error: the double declines
   # to compute it (the cast of a number to text, of text to a timestamp), and the engine's
   # own answer is a value, or an error found when it runs the plan (the connection closes).
-  # Whatever planning error the rest of the query has comes before it. Each starts with one
-  # of these words.
-  @late_refusals [
-    "a CASE condition that is not a boolean",
-    "a CASE comparing time with text",
-    "a comparison of time with text",
-    "a timestamp concatenated as text",
-    "IS DISTINCT FROM of a time and text",
-    "IS NOT DISTINCT FROM of a time and text",
-    "LIKE of a number and a tag",
-    "LIKE of a tag and a number",
-    "ILIKE of a number and a tag",
-    "ILIKE of a tag and a number",
-    "COALESCE of arguments with no common type the double models (a number with text, or",
-    "NULLIF of arguments with no common type the double models (a number with text, or",
-    "COALESCE of numbers the double does not combine",
-    "NULLIF of numbers the double does not combine",
-    "greatest of numbers the double does not combine",
-    "least of numbers the double does not combine",
-    "greatest of a number and text",
-    "least of a number and text"
-  ]
+  # Whatever planning error the rest of the query has comes before it.
+  #
+  # Each is one of a closed set of reasons, so that the refusal of a reason that is not in it
+  # is a type error caught when the code is checked, not a failure when a query runs, and so
+  # that `late?/1` knows exactly the words that were given out.
+  @typedoc "A call a refusal names."
+  @type call :: :coalesce | :nullif | :greatest | :least
+
+  @typedoc "Why the double declines to compute what the engine computes."
+  @type late_reason ::
+          :case_condition
+          | :case_time_text
+          | :compare_time_text
+          | :timestamp_concat
+          | {:distinct_time_text, :distinct | :not_distinct}
+          | {:pattern_number, :like | :ilike, :tag_number | :number_tag}
+          | {:no_common_type, :coalesce | :nullif}
+          | {:numbers_not_combined, call()}
+          | {:number_and_text, :greatest | :least}
+
+  @late_messages Map.new(
+                   [
+                     {:case_condition,
+                      "a CASE condition that is not a boolean: the engine casts it"},
+                     {:case_time_text,
+                      "a CASE comparing time with text: the engine reads the text as a " <>
+                        "timestamp, which is not modelled"},
+                     {:compare_time_text,
+                      "a comparison of time with text or another time in the select list: the " <>
+                        "engine reads the other side as a timestamp, which is not modelled"},
+                     {:timestamp_concat,
+                      "a timestamp concatenated as text: the engine writes its nanoseconds, " <>
+                        "which the double keeps only to the microsecond"}
+                   ] ++
+                     for(
+                       {kind, word} <- [
+                         distinct: "IS DISTINCT FROM",
+                         not_distinct: "IS NOT DISTINCT FROM"
+                       ],
+                       do:
+                         {{:distinct_time_text, kind},
+                          "#{word} of a time and text that is not a literal: the engine reads " <>
+                            "the text as a timestamp (an error or a closed connection), which " <>
+                            "is not modelled"}
+                     ) ++
+                     for(
+                       {pattern, word} <- [like: "LIKE", ilike: "ILIKE"],
+                       {order, text} <- [
+                         tag_number: "a tag and a number",
+                         number_tag: "a number and a tag"
+                       ],
+                       do:
+                         {{:pattern_number, pattern, order},
+                          "#{word} of #{text}: the engine matches the number as text, which is " <>
+                            "not modelled"}
+                     ) ++
+                     for(
+                       {call, word} <- [coalesce: "COALESCE", nullif: "NULLIF"],
+                       do:
+                         {{:no_common_type, call},
+                          "#{word} of arguments with no common type the double models (a number " <>
+                            "with text, or a type other than Int64, Float64, text and Boolean)"}
+                     ) ++
+                     for(
+                       {call, word} <- [
+                         coalesce: "COALESCE",
+                         nullif: "NULLIF",
+                         greatest: "greatest",
+                         least: "least"
+                       ],
+                       do:
+                         {{:numbers_not_combined, call},
+                          "#{word} of numbers the double does not combine (an unsigned " <>
+                            "integer beside another number)"}
+                     ) ++
+                     for(
+                       call <- [:greatest, :least],
+                       do:
+                         {{:number_and_text, call},
+                          "#{call} of a number and text: the engine casts the text to the " <>
+                            "number when it runs the plan, which is not modelled"}
+                     )
+                 )
+
+  @late_bodies Map.new(@late_messages, fn {_reason, message} ->
+                 {"Client.Local: " <> message, true}
+               end)
 
   @doc """
-  The refusal of what the engine computes without a planning error (see `late?/1`). The
-  message starts with one of the words in `late_refusals/0`.
+  The refusal of what the engine computes without a planning error (see `late?/1`).
   """
-  @spec late_refusal(binary()) :: t()
-  def late_refusal(message) do
-    unless Enum.any?(@late_refusals, &String.starts_with?(message, &1)) do
-      raise ArgumentError, "not a refusal of a value the engine computes: #{message}"
-    end
-
-    refusal(message)
+  @spec late_refusal(late_reason()) :: t()
+  for {reason, message} <- @late_messages do
+    def late_refusal(unquote(Macro.escape(reason))), do: refusal(unquote(message))
   end
 
   @doc "Whether an error is a refusal of what the engine computes without a planning error."
   @spec late?(term()) :: boolean()
-  def late?(%{body: "Client.Local: " <> message}),
-    do: Enum.any?(@late_refusals, &String.starts_with?(message, &1))
-
+  def late?(%{body: body}), do: is_map_key(@late_bodies, body)
   def late?(_error), do: false
 
   @doc "The engine's planning error, `Error during planning: <message>`."

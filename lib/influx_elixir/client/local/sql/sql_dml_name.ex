@@ -12,6 +12,115 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
   #   * a qualified name that only differs from a field by case says so
   #     (`Column names are case sensitive. You can use double quotes ...`)
 
+  alias InfluxElixir.Client.Local.{SQLDmlCatalog, SQLError, SQLTokenizer}
+
+  @typep token :: SQLTokenizer.token()
+
+  @doc """
+  A table name from the tokens: one to many parts, each a word (read in lower case), a quoted
+  name or a string, and the tokens after it.
+  """
+  @spec reference([token()]) :: {:ok, [binary()], [token()]} | {:refuse, binary()}
+  def reference([{:word, _p, "TABLE", _l, _c} | _rest]), do: {:refuse, "TABLE as a table name"}
+
+  def reference([{kind, printed, _u, _l, _c} | rest]) when kind in [:word, :quoted, :string] do
+    part = part(kind, printed)
+
+    case rest do
+      [{:symbol, ".", _u2, _l2, _c2} | more] ->
+        with {:ok, parts, rest} <- reference(more), do: {:ok, [part | parts], rest}
+
+      _end_of_name ->
+        {:ok, [part], rest}
+    end
+  end
+
+  def reference(_tokens), do: {:refuse, "that spelling"}
+
+  @spec part(atom(), binary()) :: binary()
+  defp part(:word, printed), do: String.downcase(printed)
+
+  defp part(:quoted, printed),
+    do: printed |> String.slice(1..-2//1) |> String.replace("\"\"", "\"")
+
+  defp part(:string, printed), do: printed |> String.slice(1..-2//1) |> String.replace("''", "'")
+
+  @doc """
+  The one resolver of the table a statement names (verified against InfluxDB 3 Core, the same
+  for `INSERT`, `UPDATE` and `DELETE`): `{:ok, table}` for a table of the database's schema
+  that is there, `{:ok, {:catalog, schema, table}}` for one of the engine's own (`system`,
+  `information_schema`), else the planner's error as it prints the name it looked for:
+  `public.iox.` and the name for one part or for `iox.` and the name, the parts as written
+  otherwise.
+  """
+  @spec lookup([binary()], [binary()]) ::
+          {:ok, binary() | {:catalog, binary(), binary()}} | {:error, SQLError.t()}
+  def lookup(parts, tables) do
+    case parts do
+      [table] ->
+        found(table, tables)
+
+      ["iox", table] ->
+        found(table, tables)
+
+      ["public", "iox", table] ->
+        found(table, tables)
+
+      [schema, table] when schema in ["system", "information_schema"] ->
+        engine(schema, table)
+
+      ["public", schema, table] when schema in ["system", "information_schema"] ->
+        engine(schema, table)
+
+      [_schema, _table] ->
+        missing_in(parts)
+
+      [_catalog, _schema, _table] ->
+        missing_in(parts)
+
+      _compound ->
+        compound(parts)
+    end
+  end
+
+  @spec engine(binary(), binary()) ::
+          {:ok, {:catalog, binary(), binary()}} | {:error, SQLError.t()}
+  defp engine(schema, table) do
+    if SQLDmlCatalog.columns(schema, table),
+      do: {:ok, {:catalog, schema, table}},
+      else: {:error, SQLError.planning("table 'public.#{schema}.#{table}' not found")}
+  end
+
+  @doc """
+  A table named with more than three parts is an error the planner finds as it reads the
+  statement, before it refuses a clause of it.
+  """
+  @spec arity([binary()]) :: :ok | {:error, SQLError.t()}
+  def arity(parts) when length(parts) > 3, do: compound(parts)
+  def arity(_parts), do: :ok
+
+  @spec found(binary(), [binary()]) :: {:ok, binary()} | {:error, SQLError.t()}
+  defp found(table, tables) do
+    if table in tables,
+      do: {:ok, table},
+      else: {:error, SQLError.planning("table 'public.iox.#{table}' not found")}
+  end
+
+  @spec missing_in([binary()]) :: {:error, SQLError.t()}
+  defp missing_in(parts) do
+    qualified = if length(parts) == 2, do: ["public" | parts], else: parts
+    {:error, SQLError.planning("table '#{Enum.join(qualified, ".")}' not found")}
+  end
+
+  @spec compound([binary()]) :: {:error, SQLError.t()}
+  defp compound(parts) do
+    {:error,
+     SQLError.planning(
+       "Unsupported compound identifier '#{Enum.join(parts, ".")}'. " <>
+         "Expected 1, 2 or 3 parts, got #{length(parts)}"
+     )}
+  end
+
   @doc "A name as the engine prints it."
   @spec quote_ident(binary()) :: binary()
   def quote_ident(name) do
@@ -32,6 +141,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
   is the relation the fields are listed through (`nil` for none), `columns` the table's.
   """
   @spec no_field(binary(), binary(), binary() | nil, [binary()]) :: map()
+  def no_field(printed, _name, _qualifier, []),
+    do: %{status: 500, body: "Schema error: No field named #{printed}."}
+
   def no_field(printed, name, qualifier, columns) do
     fields = Enum.map(columns, &field(qualifier, &1))
     folded? = qualifier != nil and String.contains?(printed, ".") and folded?(printed, fields)
@@ -39,6 +151,19 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
     %{
       status: 500,
       body: "Schema error: No field named #{printed}." <> detail(printed, name, fields, folded?)
+    }
+  end
+
+  @doc """
+  The error for a quoted name that differs from a column only by case (`INSERT INTO n ("K")`).
+  """
+  @spec case_hint(binary(), [binary()]) :: map()
+  def case_hint(name, columns) do
+    printed = quote_always(name)
+
+    %{
+      status: 500,
+      body: "Schema error: No field named #{printed}." <> detail(printed, name, columns, true)
     }
   end
 

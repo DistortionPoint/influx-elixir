@@ -6,6 +6,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   alias InfluxElixir.Client.Local.{
     InfluxQLArithmetic,
     InfluxQLSql,
+    InfluxQLTime,
     InfluxQLTokens,
     InfluxQLWhereArith,
     SQLLimits
@@ -72,6 +73,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
           {binary(), [{binary(), InfluxQLArithmetic.check()}]}
   @doc false
   def plan_comparison(tokens, {tags, types}) do
+    tokens = InfluxQLWhereArith.tag_over_unsigned(tokens, tags, types)
     unsigned_clash(InfluxQLWhereArith.unsigned_clash(tokens, tags, types))
 
     # A tag, a string or a boolean under arithmetic is null, so false for every row; the `+`
@@ -97,18 +99,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     end
   end
 
-  @spec unsigned_clash({:boolean, binary()} | :text | nil) :: :ok
+  @spec unsigned_clash({:boolean, binary(), :unsigned_first | :boolean_first} | :text | nil) ::
+          :ok
   defp unsigned_clash(nil), do: :ok
 
   defp unsigned_clash(:text),
     do: throw({:refused, "unsupported InfluxQL (an unsigned number ordered against a string)"})
 
-  defp unsigned_clash({:boolean, op}) do
+  defp unsigned_clash({:boolean, op, order}) do
+    {left, right} =
+      if order == :unsigned_first, do: {"UInt64", "Boolean"}, else: {"Boolean", "UInt64"}
+
     throw(
-      {:refused,
-       {:engine,
-        "Error during planning: Cannot infer common argument type for comparison " <>
-          "operation UInt64 #{op} Boolean"}}
+      {:deferred,
+       "Error during planning: Cannot infer common argument type for comparison " <>
+         "operation #{left} #{op} #{right}"}
     )
   end
 
@@ -331,10 +336,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     op = if op == "<>", do: "!=", else: op
 
     throw(
-      {:refused,
-       {:engine,
-        "Error during planning: Cannot infer common argument type for comparison " <>
-          "operation #{left} #{op} #{right}"}}
+      {:deferred,
+       "Error during planning: Cannot infer common argument type for comparison " <>
+         "operation #{left} #{op} #{right}"}
     )
   end
 
@@ -352,14 +356,157 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   # and a bare field, constant or duration as the whole condition. Beside a comparison in an
   # `AND` or an `OR` a bare operand keeps no point at all (`:empty`), unless it is an
   # unsigned constant, or the operands are bare both: the engine's error then.
-  @spec bare_condition(tuple(), {MapSet.t(binary()), map()}) ::
+  @spec bare_condition(tuple(), {MapSet.t(binary()), map()}, %{table: binary()} | nil) ::
           {pos_integer(), binary()} | :empty | nil
   @doc false
-  def bare_condition(tree, ctx) do
+  def bare_condition(tree, ctx, filter \\ nil) do
     if now_outside_time?(tree),
       do: {405, "This feature is not implemented: now"},
-      else: bare_type(tree, ctx)
+      else: tree |> bare_type(ctx) |> filtered(tree, ctx, filter)
   end
+
+  # With a `tz()` clause the engine plans the condition as a filter of its own and does not
+  # coerce it to a boolean first (verified): a lone operand that is no boolean is the error of
+  # the filter, without the `type_coercion` prefix, naming the predicate as the planner prints
+  # it. `filter` is the measurement of a statement that has the clause. What the double cannot
+  # print as the planner does is refused by name.
+  @spec filtered(term(), tuple(), {MapSet.t(binary()), map()}, %{table: binary()} | nil) ::
+          term()
+  defp filtered({400, _body} = bare, tree, {tags, types}, %{table: table}) do
+    case lone_comparison(tree) do
+      {:cmp, tokens} ->
+        try do
+          {printed, type} = filter_predicate(strip_parens(tokens), tags, types, table)
+
+          {400,
+           "Error during planning: Cannot create filter with non-boolean predicate " <>
+             "'#{printed}' returning #{type}"}
+        catch
+          :unprintable ->
+            {400,
+             "Client.Local: unsupported InfluxQL (a condition that is no boolean beside tz())"}
+        end
+
+      nil ->
+        bare
+    end
+  end
+
+  defp filtered(result, _tree, _ctx, _filter), do: result
+
+  defp lone_comparison({:group, node}), do: lone_comparison(node)
+  defp lone_comparison({:cmp, _tokens} = node), do: node
+  defp lone_comparison(_node), do: nil
+
+  @spec filter_predicate(list(), MapSet.t(binary()), map(), binary()) ::
+          {binary(), binary()} | no_return()
+  defp filter_predicate([{:raw, "+"} | rest], tags, types, table) when rest != [],
+    do: filter_predicate(strip_parens(rest), tags, types, table)
+
+  defp filter_predicate([{:raw, "-"}, {:number, text}], _tags, _types, _table) do
+    case {number_kind(text, -1), Integer.parse(text)} do
+      {:integer, {n, ""}} -> {"Int64(#{-n})", "Int64"}
+      {:float, _fraction} -> {"Float64(-#{float_text(text)})", "Float64"}
+      _beyond -> unprintable()
+    end
+  end
+
+  defp filter_predicate([{:raw, "-"} | rest], tags, types, table) do
+    case strip_parens(rest) do
+      [{:ident, name}] -> negated_field(name, tags, types, table)
+      _other -> unprintable()
+    end
+  end
+
+  defp filter_predicate([{:number, text}], _tags, _types, _table) do
+    case number_kind(text, 1) do
+      :integer -> {"Int64(#{elem(Integer.parse(text), 0)})", "Int64"}
+      :unsigned -> {"UInt64(#{elem(Integer.parse(text), 0)})", "UInt64"}
+      :float -> {"Float64(#{float_text(text)})", "Float64"}
+      nil -> unprintable()
+    end
+  end
+
+  defp filter_predicate([{:str, content}], _tags, _types, _table) do
+    if Regex.match?(~r/\A[A-Za-z0-9 _.,;:!?@#%&*+=<>\/()\[\]{}|~-]*\z/, content),
+      do: {"Utf8(\"#{content}\")", "Utf8"},
+      else: unprintable()
+  end
+
+  defp filter_predicate([{:ident, name}], tags, types, table) do
+    name_ok!(name, table)
+
+    if MapSet.member?(tags, name) do
+      {"CASE WHEN #{table}.#{name} IS NULL THEN Dictionary(Int32, Utf8(\"\")) " <>
+         "ELSE #{table}.#{name} END", Map.fetch!(@arrow_types, :tag)}
+    else
+      {"#{table}.#{name}", Map.fetch!(@arrow_types, Map.fetch!(types, name))}
+    end
+  end
+
+  defp filter_predicate(_tokens, _tags, _types, _table), do: unprintable()
+
+  # A sign before a number field is the product with the constant the planner folds it to.
+  defp negated_field(name, tags, types, table) do
+    name_ok!(name, table)
+
+    case {MapSet.member?(tags, name), Map.get(types, name)} do
+      {false, :integer} -> {"Int64(-1) * #{table}.#{name}", "Int64"}
+      {false, :float} -> {"Float64(-1) * #{table}.#{name}", "Float64"}
+      {false, :unsigned} -> {"UInt64(18446744073709551614) * #{table}.#{name}", "UInt64"}
+      _other -> unprintable()
+    end
+  end
+
+  # The names the planner prints as they are written: lower case words.
+  defp name_ok!(name, table) do
+    unless Regex.match?(~r/\A[a-z_][a-z0-9_]*\z/, name) and
+             Regex.match?(~r/\A[a-z_][a-z0-9_]*\z/, table),
+           do: unprintable()
+  end
+
+  # A float as the planner prints it: whole numbers without a fraction, no exponent.
+  defp float_text(text) do
+    {value, ""} = Float.parse(text)
+
+    cond do
+      value == Float.round(value) and abs(value) < 1.0e15 -> Integer.to_string(trunc(value))
+      String.contains?(Float.to_string(value), "e") -> unprintable()
+      true -> Float.to_string(value)
+    end
+  end
+
+  @spec unprintable() :: no_return()
+  defp unprintable, do: throw(:unprintable)
+
+  # The planner splits the `time` out of a condition before it types the rest, and breaks its
+  # stack when an operand that is no boolean stands anywhere in a condition that compares the
+  # `time` (verified: `time >= x AND 0`, `0 OR time < y`, `time >= x AND (f > 1 OR g)`, and
+  # in parentheses too; without a comparison of the `time` it is the type error).
+  @spec check_stack(tuple(), {MapSet.t(binary()), map()}) :: :ok
+  @doc false
+  def check_stack(tree, ctx) do
+    if InfluxQLTime.mentions_time_comparison?(tree) and operand_inside?(tree, ctx),
+      do: InfluxQLTime.refuse_stack(),
+      else: :ok
+  end
+
+  defp operand_inside?({:group, node}, ctx), do: operand_inside?(node, ctx)
+
+  defp operand_inside?({kind, nodes}, ctx) when kind in [:and, :or],
+    do: Enum.any?(nodes, &operand_inside?(&1, ctx))
+
+  defp operand_inside?({:cmp, tokens}, {tags, types}) do
+    tokens = strip_parens(tokens)
+
+    case standalone_field(tokens, tags, types) do
+      nil -> false
+      :boolean -> match?([{:ident, _name}], tokens)
+      _type -> true
+    end
+  end
+
+  defp operand_inside?(_node, _ctx), do: false
 
   @spec bare_type(tuple(), {MapSet.t(binary()), map()}) ::
           {pos_integer(), binary()} | :empty | nil

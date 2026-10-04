@@ -59,6 +59,9 @@ defmodule InfluxElixir.Contract.InfluxQLProjectionCases do
   @spec coercions() :: [{binary(), term()}]
   def coercions do
     [
+      {"select n, true + 1 from ~p1",
+       {:error, 400,
+        "rewriting statement\ncaused by\nexpand projection\ncaused by\nError during planning: incompatible operands for operator +: boolean and integer"}},
       {"select n from ~p1 where u + s = 1",
        {:error, 400,
         "Error during planning: Cannot coerce arithmetic expression UInt64 + Utf8 to valid types"}},
@@ -2036,9 +2039,6 @@ defmodule InfluxElixir.Contract.InfluxQLProjectionCases do
       {"select n from ~p1 where u % s = 1",
        {:error, 400,
         "Error during planning: Cannot coerce arithmetic expression UInt64 % Utf8 to valid types"}},
-      {"select n, true + 1 from ~p1",
-       {:error, 400,
-        "rewriting statement\ncaused by\nexpand projection\ncaused by\nError during planning: incompatible operands for operator +: boolean and integer"}},
       {"select abs(time), * from ~p1",
        {:error, 400,
         "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Timestamp(Nanosecond, None) No function matches the given name and argument types 'abs(Timestamp(ns))'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
@@ -2796,7 +2796,6 @@ defmodule InfluxElixir.Contract.InfluxQLProjectionCases do
   def refusal_reasons do
     %{
       "select n from ~p1 where u % s = 1" => "unsupported InfluxQL WHERE: % s = 1",
-      "select n, true + 1 from ~p1" => "unsupported InfluxQL (an expression of constants)",
       "select abs(time), * from ~p1" => "unsupported InfluxQL (* beside other select items)",
       "select abs(time), max(n) from ~p1" =>
         "unsupported InfluxQL (a function of time beside an aggregate)",

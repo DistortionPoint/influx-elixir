@@ -60,6 +60,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       group
       |> series(context, key)
       |> window(context)
+      |> Enum.map(&Map.delete(&1, :null_quotients))
     end)
   end
 
@@ -86,9 +87,57 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   defp window(rows, %{query: %{limit: nil, offset: 0}}), do: bounded(rows)
 
   defp window(rows, %{query: query} = context) do
-    if row_window?(context),
-      do: rows |> Stream.drop(query.offset) |> take(query.limit) |> bounded(),
-      else: window_per_field(rows, context)
+    cond do
+      division_fields(query) != [] -> window_divisions(rows, context)
+      row_window?(context) -> rows |> Stream.drop(query.offset) |> take(query.limit) |> bounded()
+      true -> window_per_field(rows, context)
+    end
+  end
+
+  # The columns of a bucket that are quotients and come to null: the mark a row of the buckets
+  # carries to its window, which `run/4` takes off.
+  @spec null_quotients(map(), map(), [binary()]) :: [binary()]
+  defp null_quotients(values, plan, quotients) do
+    for {name, ast} <- plan.exprs,
+        name in quotients,
+        InfluxQLExpr.eval(ast, values, plan.types) == nil,
+        do: name
+  end
+
+  # The columns that are quotients (every aggregate in them is an operand of a division): a
+  # bucket where they are null is not counted by their window (verified: `sum(f) / count(f)
+  # ... GROUP BY time(1m) LIMIT 3 OFFSET 2` answers the third to the fifth bucket that has a
+  # quotient, where `sum(f) + count(f)` and `sum(f) / count(f) + sum(g)` count the buckets
+  # that have none too; with no `LIMIT` and no `OFFSET` the null buckets are all answered).
+  @spec division_fields(InfluxQL.query()) :: [binary()]
+  defp division_fields(%{limit: nil, offset: 0}), do: []
+
+  defp division_fields(%{items: items}),
+    do: for({:expr, ast, name} <- items, InfluxQLExpr.quotients?(ast), do: name)
+
+  # The window of a statement with a column that divides: the other columns count every
+  # bucket as the window of a row does, a column that divides counts the buckets that have
+  # its value, and a bucket is answered with the columns whose window holds it (a bucket no
+  # column holds is not answered).
+  defp window_divisions(rows, %{query: query, plan: %{fields: fields}}) do
+    dividing = division_fields(query)
+    indexed = Enum.with_index(rows)
+
+    counted =
+      Map.new(fields, fn field ->
+        indices =
+          for {row, index} <- indexed,
+              field not in dividing or field not in Map.get(row, :null_quotients, []),
+              do: index
+
+        {field, indices |> Enum.drop(query.offset) |> take(query.limit) |> MapSet.new()}
+      end)
+
+    for {row, index} <- indexed,
+        holding = for(field <- fields, MapSet.member?(counted[field], index), do: field),
+        holding != [] do
+      Map.drop(row, for(field <- fields, field not in holding, do: field))
+    end
   end
 
   defp row_window?(%{query: %{items: items}, plan: plan}) do
@@ -465,6 +514,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     end
   end
 
+  # How many buckets are needed to answer the window: none are left out when a column
+  # divides (its null buckets are not counted) or a transform reads the buckets before them.
+  defp bucket_window(plan, query) do
+    if plan.transforms == [] and division_fields(query) == [],
+      do: query.limit && query.limit + query.offset
+  end
+
   # `GROUP BY time(...)`: a row for every bucket, as `InfluxQLBuckets` fills them.
   @spec bucketed([map()], map(), map()) :: Enumerable.t()
   defp bucketed(rows, %{query: query, tags: tags, types: types} = context, base) do
@@ -482,7 +538,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       upper: context.upper_ns,
       now: context.now,
       descending: query.descending,
-      window: if(plan.transforms == [], do: query.limit && query.limit + query.offset)
+      window: bucket_window(plan, query)
     ]
 
     buckets = InfluxQLBuckets.series(rows, query.group_time, query.fill, opts, compute)
@@ -490,9 +546,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     # A list of transforms alone answers only the buckets they have a result for
     drop_empty? = Enum.all?(query.items, &(transform_item?(&1) or InfluxQLNames.time_item?(&1)))
 
+    quotients = division_fields(query)
+
     if plan.transforms == [] do
       Stream.map(buckets, fn {start, values} ->
-        base |> Map.put("time", ns_time(start)) |> Map.merge(finish(values, plan))
+        base
+        |> Map.put("time", ns_time(start))
+        |> Map.merge(finish(values, plan))
+        |> Map.put(:null_quotients, null_quotients(values, plan, quotients))
       end)
     else
       buckets
@@ -842,7 +903,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     points =
       Enum.flat_map(groups, fn group ->
         group
-        |> choose(kind, field, tags, limit)
+        |> choose(kind, field, tags, {limit, query.descending})
         |> Enum.sort_by(fn {rank, point} -> {time_ns(point), rank} end)
         |> Enum.map(&elem(&1, 1))
       end)
@@ -907,14 +968,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   end
 
   # The chosen points of a group of rows, as `{rank, point}`.
-  defp choose(rows, kind, field, tags, limit) do
+  defp choose(rows, kind, field, tags, {limit, descending?}) do
     points =
       if tags == [] do
         rows
       else
         rows
         |> Enum.group_by(fn point -> Enum.map(tags, &point[&1]) end)
-        |> best_of_each(kind, field)
+        |> best_of_each(kind, field, descending?)
       end
 
     {valued, empty} = Enum.split_with(points, &orderable?(&1[field]))
@@ -927,17 +988,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     |> Enum.map(fn {point, rank} -> {rank, point} end)
   end
 
-  # The first point with the best value of each group, in the order the groups
-  # first appear.
-  defp best_of_each(groups, kind, field) do
+  # The first point (of the scan) with the best value of each group, in the order of their
+  # own times: the scan's order, so that a tie of the values goes to the point the scan
+  # meets first (verified: with `v = 9` at 5s of `b`, 6s of `c` and 8s of `a`, whose
+  # earliest points are 1s, 9s and 10s, `top(v, host, 2)` answers `b` and `c`, and in
+  # descending order `a` and `c`; the order of the groups' first points does not rank them).
+  defp best_of_each(groups, kind, field, descending?) do
     groups
     |> Map.values()
-    |> Enum.sort_by(&time_ns(hd(&1)))
     |> Enum.map(fn points ->
       Enum.reduce(points, fn point, best ->
         if better?(kind, point[field], best[field]), do: point, else: best
       end)
     end)
+    |> Enum.sort_by(&time_ns/1, if(descending?, do: :desc, else: :asc))
   end
 
   defp better?(kind, value, best) do

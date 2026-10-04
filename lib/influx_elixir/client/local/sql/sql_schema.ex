@@ -284,11 +284,18 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
       nil ->
         known = known_fields(ref, valid)
 
+        # A clause that reads the select list's names also folds the case of those.
+        outputs =
+          if clause in [:order, :group, :on, :having] and not written_with_relation? and
+               not output_name?,
+             do: output_names(query),
+             else: []
+
         body =
           Enum.join(
             [
               "Schema error: No field named #{printed}."
-              | case_hint(ref, printed, listed, query.qualified)
+              | case_hint(ref, printed, listed, query.qualified, outputs)
             ] ++
               known,
             " "
@@ -501,9 +508,16 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   defp unavailable_order(ref, query, listed) do
     known = ref |> known_fields(projection_fields(query, listed)) |> Enum.map(&(" " <> &1))
 
+    hint =
+      ref
+      |> case_hint(holder_field(ref, listed), [], query.qualified, output_names(query))
+      |> Enum.map(&(" " <> &1))
+
     %{
       status: 500,
-      body: "Schema error: No field named #{holder_field(ref, listed)}.#{Enum.join(known)}"
+      body:
+        "Schema error: No field named #{holder_field(ref, listed)}.#{Enum.join(hint)}" <>
+          Enum.join(known)
     }
   end
 
@@ -528,21 +542,25 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
   # A qualified name that would resolve if its case were folded gets the
   # engine's pointer to quoting (verified).
-  @spec case_hint(SQLExpr.column_ref(), binary(), [{binary(), [binary()]}], %{
-          binary() => binary()
-        }) :: [binary()]
-  defp case_hint(ref, printed, listed, qualified) when is_binary(ref) do
+  @spec case_hint(
+          SQLExpr.column_ref(),
+          binary(),
+          [{binary(), [binary()]}],
+          %{binary() => binary()},
+          [binary()]
+        ) :: [binary()]
+  defp case_hint(ref, printed, listed, qualified, outputs) when is_binary(ref) do
     flat = String.downcase(join_flat(Map.get(qualified, ref), ref))
 
     folded? =
       Enum.any?(listed, fn {qualifier, columns} ->
         Enum.any?(columns, &(String.downcase(join_flat(qualifier, &1)) == flat))
-      end)
+      end) or Enum.any?(outputs, &(String.downcase(&1) == flat))
 
     if folded?, do: [case_sensitive_hint(printed)], else: []
   end
 
-  defp case_hint({:qualified, qualifier, column}, printed, listed, _qualified) do
+  defp case_hint({:qualified, qualifier, column}, printed, listed, _qualified, _outputs) do
     {relation, name} = {SQLLiteral.unquoted(qualifier), SQLLiteral.unquoted(column)}
 
     folded? =

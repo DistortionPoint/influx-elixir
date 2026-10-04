@@ -34,6 +34,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         {tree, _rest} = parse_or(tokens)
         InfluxQLTime.check_bare(tree)
         ctx = {tags, types}
+        InfluxQLTyped.check_stack(tree, ctx)
         now = Keyword.get_lazy(opts, :now, fn -> System.os_time(:nanosecond) end)
 
         times = %{
@@ -44,7 +45,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         }
 
         {deferred, {sql, bounds, checks}} =
-          case InfluxQLTyped.bare_condition(tree, ctx) do
+          case InfluxQLTyped.bare_condition(tree, ctx, Keyword.get(opts, :filter)) do
             nil -> {nil, plan(tree, ctx, times)}
             :empty -> {nil, {"(1 = 0)", [], []}}
             error -> {error, {"true", [], []}}
@@ -59,7 +60,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
            uppers: for({:upper, ns} <- bounds, do: ns),
            checks: checks,
            idents: idents,
-           deferred: deferred
+           deferred: deferred,
+           clash: nil
          }}
 
       {:syntax_error, _kind, rest} ->
@@ -69,7 +71,39 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         error
     end
   catch
-    {:refused, message} -> {:error, message}
+    {:refused, message} ->
+      {:error, message}
+
+    # The planning error of a comparison is raised after the errors of the statement's
+    # rewriting (the select list, the grouping) and before those of its `LIMIT`: the plan holds
+    # nothing, and the caller raises the error in its turn (verified: `count(f), g ... WHERE
+    # b <= u` is the mixing of aggregate and non-aggregate columns, not the comparison).
+    {:deferred, body} ->
+      late_clash(where, body, Keyword.get(opts, :late_clash, false))
+  end
+
+  defp late_clash(_where, body, false), do: {:error, {:engine, body}}
+
+  defp late_clash(where, body, true) do
+    idents = for {:ident, name} <- tokens_of(where), into: MapSet.new(), do: name
+
+    {:ok,
+     %{
+       sql: "true",
+       lowers: [],
+       uppers: [],
+       checks: [],
+       idents: idents,
+       deferred: nil,
+       clash: {400, body}
+     }}
+  end
+
+  defp tokens_of(where) do
+    case InfluxQLTokens.tokenize(where, []) do
+      {:ok, tokens} -> tokens
+      _error -> []
+    end
   end
 
   # The condition as a tree: `OR` of `AND`s of comparisons and

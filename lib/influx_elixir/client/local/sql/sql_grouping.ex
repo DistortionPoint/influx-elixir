@@ -258,6 +258,21 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
   defp having_columns(%{having: nil}), do: []
   defp having_columns(%{having: %{aggs: aggs}}), do: Enum.map(aggs, &elem(&1, 1))
 
+  @doc """
+  The engine's text of an aggregate in the predicate of a `HAVING` that is no boolean, or
+  `:unrenderable`. It is the text of the group error's list, but for `count(*)`, which the
+  planner has aliased: `count(Int64(1)) AS count(*)`.
+  """
+  @spec filter_term(SQLParser.select_column(), binary()) :: binary() | :unrenderable
+  def filter_term({:count_star, _alias}, _table), do: "count(Int64(1)) AS count(*)"
+
+  def filter_term(column, table) do
+    case aggregate_term(column, table) do
+      term when is_binary(term) -> term
+      _unrenderable -> :unrenderable
+    end
+  end
+
   @spec aggregate_terms([SQLParser.select_column()], binary()) ::
           {:ok, [binary()]} | :unrenderable
   defp aggregate_terms(select_columns, table) do
@@ -277,7 +292,7 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
     do: "count(DISTINCT #{table}.#{column})"
 
   defp aggregate_term({:aggregate, agg, expr, _alias}, table) do
-    "#{agg}(#{SQLExpr.render(expr, table, :refuse)})"
+    aggregate_call(agg) <> SQLExpr.render(expr, table, :refuse) <> ")"
   catch
     :unrenderable -> :unrenderable
   end
@@ -292,4 +307,11 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
     do: :unrenderable
 
   defp aggregate_term(_group_or_constant, _table), do: nil
+
+  # The engine prints `count(DISTINCT x)` and `sum(DISTINCT x)`, where the double names the
+  # aggregates `count_distinct` and `sum_distinct`.
+  @spec aggregate_call(atom()) :: binary()
+  defp aggregate_call(:count_distinct), do: "count(DISTINCT "
+  defp aggregate_call(:sum_distinct), do: "sum(DISTINCT "
+  defp aggregate_call(agg), do: "#{agg}("
 end

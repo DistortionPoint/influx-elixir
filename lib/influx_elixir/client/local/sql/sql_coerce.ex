@@ -164,7 +164,9 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
   # `Utf8` one to text.
   @spec cast(SQLExpr.t(), SQLExprType.type(), %{binary() => binary()}) :: SQLExpr.t()
   defp cast(expr, "Float64", types) do
-    if SQLExprType.type_of(expr, types) == "Int64", do: {:cast, expr, :float}, else: expr
+    if SQLExprType.type_of(expr, types) in ["Int64", "UInt64"],
+      do: {:cast, expr, :float},
+      else: expr
   end
 
   defp cast(expr, text, types) when text in ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"] do

@@ -266,13 +266,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   defp grouped_in_connective?({:group, node}), do: grouped_in_connective?(node)
   defp grouped_in_connective?(_node), do: false
 
+  @doc "Whether a comparison of the `time` stands anywhere in the condition tree."
   @spec mentions_time_comparison?(tuple()) :: boolean()
-  defp mentions_time_comparison?({:cmp, tokens}),
+  def mentions_time_comparison?({:cmp, tokens}),
     do: Enum.any?(tokens, &match?({:op, _op}, &1)) and Enum.any?(tokens, &InfluxQLTokens.time?/1)
 
-  defp mentions_time_comparison?({:group, node}), do: mentions_time_comparison?(node)
+  def mentions_time_comparison?({:group, node}), do: mentions_time_comparison?(node)
 
-  defp mentions_time_comparison?({_kind, nodes}),
+  def mentions_time_comparison?({_kind, nodes}),
     do: Enum.any?(nodes, &mentions_time_comparison?/1)
 
   # `(time) AND i > 1`: the engine types the two sides and refuses; the
@@ -322,6 +323,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
     "type_coercion\ncaused by\nError during planning: Cannot infer common argument type " <>
       "for logical boolean operation Boolean AND Timestamp(ns)"
   end
+
+  @doc "The engine's error for a condition that splits its `time` from an operand that is no boolean."
+  @spec refuse_stack() :: no_return()
+  def refuse_stack, do: refuse(500, "invalid expr stack")
 
   @spec refuse(pos_integer(), binary()) :: no_return()
   defp refuse(400, body), do: throw({:refused, {:engine, 400, body}})

@@ -42,16 +42,43 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   @spec bind(SQLParser.parsed_query(), %{binary() => term()}) ::
           {:ok, SQLParser.parsed_query()} | {:error, map()}
   def bind(query, params) do
+    with :ok <- problem(query, params), do: bind_partial(query, params)
+  end
+
+  @doc """
+  The engine's error for the first `$name` of a query, in the order the engine replaces them,
+  that has no value (or has one that is no scalar), or `:ok`. The engine finds it once it has
+  built the plan, after the errors of the select list and the `HAVING`'s grouping and before
+  those of the type coercion, so the executor hands it to the planner's check instead of
+  raising it first (see `InfluxElixir.Client.Local.SQLStage`).
+  """
+  @spec problem(SQLParser.parsed_query(), %{binary() => term()}) :: :ok | {:error, map()}
+  def problem(query, params) do
+    case placeholders(plan_order(query)) do
+      [] -> :ok
+      names -> all_bound(names, params)
+    end
+  end
+
+  @doc """
+  Binds the `$name`s of a query that have a value and leaves the rest as they are, for the
+  planner to find the engine's error for them (see `problem/2`). A predicate that holds
+  a placeholder with no value is left whole.
+  """
+  @spec bind_partial(SQLParser.parsed_query(), %{binary() => term()}) ::
+          {:ok, SQLParser.parsed_query()} | {:error, map()}
+  def bind_partial(query, params) do
     case placeholders(plan_order(query)) do
       [] ->
         {:ok, query}
 
-      names ->
-        with :ok <- all_bound(names, params),
-             {:ok, where} <- bind_where_nodes(query.where, params),
+      _names ->
+        limits = for {:param, name} <- [query.limit, query.offset], into: %{}, do: {name, nil}
+
+        with {:ok, where} <- bind_where_nodes(query.where, params),
              {:ok, having} <- bind_having(query.having, params),
              {:ok, limit, offset, limit_error} <-
-               SQLLimit.bind(query.limit, query.offset, params) do
+               SQLLimit.bind(query.limit, query.offset, Map.merge(limits, params)) do
           {:ok,
            %{
              query
@@ -165,39 +192,33 @@ defmodule InfluxElixir.Client.Local.SQLBind do
     with {:ok, bound} <- bind_where_nodes(nodes, params), do: {:ok, {:not, bound}}
   end
 
-  defp bind_node({op, "time", {low, high}}, params) when op in [:between, :not_between] do
-    case SQLTime.between(op, resolve_time(low, params), resolve_time(high, params)) do
-      {:error, error} -> {:ok, SQLPredicate.deferred_clause(error)}
-      ok -> ok
-    end
+  defp bind_node({op, "time", _rest} = node, params)
+       when op in @comparison_ops or op in [:between, :not_between, :in, :not_in] do
+    if unbound?(node, params), do: {:ok, node}, else: bind_time_node(node, params)
   end
 
-  defp bind_node({op, "time", items}, params) when op in [:in, :not_in] do
-    case SQLTime.in_list(Enum.map(items, &resolve_time(&1, params))) do
-      {:ok, bounds} -> {:ok, {op, "time", bounds}}
-      {:error, error} -> {:ok, SQLPredicate.deferred_clause(error)}
-    end
-  end
-
-  defp bind_node({op, "time", value}, params) when op in @comparison_ops,
-    do: bind_time_comparison(op, value, params)
-
-  defp bind_node({op, left, {:like_param, name, case_insensitive}}, params)
+  defp bind_node({op, left, {:like_param, name, case_insensitive}} = node, params)
        when op in [:like, :not_like] do
-    with {:ok, pattern} <- pattern_param(Map.fetch!(params, name), "LIKE"),
+    with {:ok, value} <- Map.fetch(params, name),
+         {:ok, pattern} <- pattern_param(value, "LIKE"),
          {:ok, regex} <- SQLPredicate.like_regex(pattern, case_insensitive) do
       {:ok, {op, bind_operand(left, params), regex}}
     else
+      :error -> {:ok, node}
       {:error, :pattern_too_large} -> {:error, SQLCompare.pattern_too_large()}
       {:error, _error} = error -> error
     end
   end
 
-  defp bind_node({op, left, {:regex_param, name, symbol}}, params)
+  defp bind_node({op, left, {:regex_param, name, symbol}} = node, params)
        when op in [:regex, :not_regex] do
-    with {:ok, pattern} <- pattern_param(Map.fetch!(params, name), "regex"),
+    with {:ok, value} <- Map.fetch(params, name),
+         {:ok, pattern} <- pattern_param(value, "regex"),
          {:ok, regex} <- SQLPredicate.compile_regex(pattern, symbol) do
       {:ok, {op, bind_operand(left, params), {regex, symbol}}}
+    else
+      :error -> {:ok, node}
+      {:error, _error} = error -> error
     end
   end
 
@@ -219,6 +240,29 @@ defmodule InfluxElixir.Client.Local.SQLBind do
 
   defp bind_node({op, left, right}, params), do: {:ok, {op, bind_operand(left, params), right}}
 
+  # Whether a term holds a `$name` the params have no value for.
+  @spec unbound?(term(), %{binary() => term()}) :: boolean()
+  defp unbound?(term, params), do: Enum.any?(placeholders(term), &(not is_map_key(params, &1)))
+
+  @spec bind_time_node(SQLWhere.node_t(), %{binary() => term()}) ::
+          {:ok, SQLWhere.node_t()} | {:error, map()}
+  defp bind_time_node({op, "time", {low, high}}, params) when op in [:between, :not_between] do
+    case SQLTime.between(op, resolve_time(low, params), resolve_time(high, params)) do
+      {:error, error} -> {:ok, SQLPredicate.deferred_clause(error)}
+      ok -> ok
+    end
+  end
+
+  defp bind_time_node({op, "time", items}, params) when op in [:in, :not_in] do
+    case SQLTime.in_list(Enum.map(items, &resolve_time(&1, params))) do
+      {:ok, bounds} -> {:ok, {op, "time", bounds}}
+      {:error, error} -> {:ok, SQLPredicate.deferred_clause(error)}
+    end
+  end
+
+  defp bind_time_node({op, "time", value}, params) when op in @comparison_ops,
+    do: bind_time_comparison(op, value, params)
+
   @spec bind_operand(SQLPredicate.operand(), %{binary() => term()}) :: SQLPredicate.operand()
   defp bind_operand({:expr, expr}, params), do: {:expr, bind_expr(expr, params)}
   defp bind_operand(column, _params), do: column
@@ -227,18 +271,26 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   # boolean turned around (`$p = col`) is refused: the engine words a type
   # error in the order the sides are written.
   @spec bind_comparand(term(), %{binary() => term()}) :: {:ok, term()} | {:error, map()}
-  defp bind_comparand({:param, name}, params), do: {:ok, comparand(Map.fetch!(params, name))}
+  defp bind_comparand({:param, name} = param, params) do
+    case Map.fetch(params, name) do
+      {:ok, value} -> {:ok, comparand(value)}
+      :error -> {:ok, param}
+    end
+  end
 
-  defp bind_comparand({:param, name, :left}, params) do
-    case Map.fetch!(params, name) do
-      value when is_boolean(value) ->
+  defp bind_comparand({:param, name, :left} = param, params) do
+    case Map.fetch(params, name) do
+      :error ->
+        {:ok, param}
+
+      {:ok, value} when is_boolean(value) ->
         {:error,
          SQLError.refusal(
            "a boolean parameter on the left of a comparison is outside the double's " <>
              "subset; write the column first: $#{name}"
          )}
 
-      value ->
+      {:ok, value} ->
         {:ok, comparand(value)}
     end
   end
@@ -251,7 +303,12 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   defp comparand(value), do: value
 
   @spec bind_expr(SQLExpr.t(), %{binary() => term()}) :: SQLExpr.t()
-  defp bind_expr({:param, name}, params), do: param_expr(Map.fetch!(params, name))
+  defp bind_expr({:param, name} = param, params) do
+    case Map.fetch(params, name) do
+      {:ok, value} -> param_expr(value)
+      :error -> param
+    end
+  end
 
   defp bind_expr(expr, params), do: SQLExpr.map_children(expr, &bind_expr(&1, params))
 
@@ -279,8 +336,11 @@ defmodule InfluxElixir.Client.Local.SQLBind do
       {:aggregate, agg, expr, output} ->
         {:aggregate, agg, bind_expr(expr, params), output}
 
-      {:constant, {:param, name}, output} ->
-        {:constant, Map.fetch!(params, name), output}
+      {:constant, {:param, name}, output} = column ->
+        case Map.fetch(params, name) do
+          {:ok, value} -> {:constant, value, output}
+          :error -> column
+        end
 
       {:expression, expr, aggs, output} ->
         {:expression, bind_expr(expr, params), bind_aggs(aggs, params), output}
@@ -302,9 +362,9 @@ defmodule InfluxElixir.Client.Local.SQLBind do
           {:ok, SQLAggExpr.having_t() | nil} | {:error, map()}
   defp bind_having(nil, _params), do: {:ok, nil}
 
-  defp bind_having(%{nodes: nodes, aggs: aggs}, params) do
+  defp bind_having(%{nodes: nodes, aggs: aggs} = having, params) do
     with {:ok, nodes} <- bind_where_nodes(nodes, params),
-         do: {:ok, %{nodes: nodes, aggs: bind_aggs(aggs, params)}}
+         do: {:ok, %{having | nodes: nodes, aggs: bind_aggs(aggs, params)}}
   end
 
   @spec bind_order_by(SQLClauses.order_by(), %{binary() => term()}) :: SQLClauses.order_by()

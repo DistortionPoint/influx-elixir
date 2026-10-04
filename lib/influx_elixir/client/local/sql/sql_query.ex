@@ -209,19 +209,10 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
         # The statement follows SQL's identifier rules, as a SELECT does:
         # `DELETE FROM "Cpu" WHERE "Host" = 'a'`.
         :delete when profile == :v3_enterprise ->
-          case Regex.run(
-                 ~r/^(?i)DELETE\s+FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+)(.*)$/s,
-                 SQLIdentifiers.normalize(trimmed)
-               ) do
-            [_full, measurement_raw, rest] ->
-              execute_delete(table, database, measurement_raw, rest)
-
-            nil ->
-              {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}}
-          end
+          enterprise_delete(table, database, sql, trimmed)
 
         :delete ->
-          {:error, delete_error(table, database, trimmed)}
+          {:error, delete_error(table, database, sql)}
 
         kind when kind in [:insert, :update] ->
           {:error,
@@ -272,11 +263,13 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     end
   end
 
-  # A `DELETE` the parser does not read (`DELETE FROM` with no table) is its error, whatever
-  # the engine does with one that reads.
+  # A `DELETE` or `INSERT` the parser does not read (`DELETE FROM` with no table) is its
+  # error, whatever the engine does with one that reads.
   @spec delete_syntax(binary(), binary()) :: :ok | {:error, SQLError.t()}
   defp delete_syntax(sql, trimmed) do
-    if statement_kind(trimmed) == :delete, do: SQLSyntax.check_statements(sql), else: :ok
+    if statement_kind(trimmed) in [:delete, :insert],
+      do: SQLSyntax.check_statements(sql),
+      else: :ok
   end
 
   @spec bare_statement(binary()) :: :ok | {:error, SQLError.t()}
@@ -301,6 +294,12 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
       {~r/^(?i)(?:SELECT|WITH|EXPLAIN|SHOW|DESC|DESCRIBE)\b|^\(/, :query},
       {~r/^(?i)DELETE\b/, :delete},
       {~r/^(?i)VALUES\b/, {:refusal, "a VALUES statement: the double reads no VALUES rows"}},
+      {~r/^(?i)FROM\b/,
+       {:refusal, "a query that begins with FROM: the engine reads it, this double does not"}},
+      {~r/^(?i)SET\s+TIME\s+ZONE\b/,
+       {:refusal,
+        "SET TIME ZONE: the engine's error for it prints the statement as it parsed it, " <>
+          "which the double does not"}},
       {~r/^(?i)INSERT\b/, :insert},
       {~r/^(?i)UPDATE\b/, :update},
       {~r/^(?i)CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\b/,
@@ -362,7 +361,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
   defp arrow_type("iox::column_type::field::boolean"), do: "Boolean"
 
   # An operand of an `UPDATE` planned as a select item of the table (see `SQLDmlPlan`).
-  @spec plan_operand(Store.t(), binary(), binary(), binary()) ::
+  @spec plan_operand(Store.t(), binary(), binary() | nil, binary()) ::
           :ok | {:error, term()} | {:refuse, binary()}
   defp plan_operand(table, database, measurement, text) do
     SQLDmlPlan.check(
@@ -387,25 +386,39 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     end)
   end
 
-  # The planner finds the table of a `DELETE` before it refuses the statement.
+  # The planner reads a `DELETE` as it reads an `UPDATE`: its table by the same resolver and
+  # its `WHERE` against the table's columns (`SQLDml`).
   @spec delete_error(Store.t(), binary(), binary()) :: map()
   defp delete_error(table, database, statement) do
-    case Regex.run(
-           ~r/^(?i)DELETE\s+FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+)(.*)$/s,
-           SQLIdentifiers.normalize(statement)
-         ) do
-      [_full, raw, _rest] ->
-        name = delete_target(raw)
+    SQLDml.error(
+      :delete,
+      statement,
+      Store.measurements(table, database),
+      &table_columns(table, database, &1),
+      &plan_operand(table, database, &1, &2)
+    )
+  end
 
-        if name in Store.measurements(table, database),
-          do: %{status: 400, body: "Error during planning: DML not supported: Delete"},
-          else: %{
-            status: 400,
-            body: "Error during planning: table 'public.iox.#{name}' not found"
-          }
+  # The parser reads a `DELETE` before any edition plans it: its error for a statement it
+  # does not read is the answer wherever the statement would have been run.
+  @spec enterprise_delete(Store.t(), binary(), binary(), binary()) ::
+          {:ok, map()} | {:error, term()}
+  defp enterprise_delete(table, database, sql, trimmed) do
+    case delete_error(table, database, sql) do
+      %{body: "SQL error: ParserError" <> _rest} = error ->
+        {:error, error}
 
-      nil ->
-        %{status: 400, body: "Error during planning: DML not supported: Delete"}
+      _planned ->
+        case Regex.run(
+               ~r/^(?i)DELETE\s+FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+)(.*)$/s,
+               SQLIdentifiers.normalize(trimmed)
+             ) do
+          [_full, measurement_raw, rest] ->
+            execute_delete(table, database, measurement_raw, rest)
+
+          nil ->
+            {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}}
+        end
     end
   end
 

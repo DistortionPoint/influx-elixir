@@ -45,7 +45,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
          :ok <- multi_rules(items),
          :ok <- multi_schema(query, types, tags),
          :ok <- transforms(query),
-         :ok <- group_needs_aggregate(items, group_time),
+         :ok <- group_needs_aggregate(query),
          :ok <- fill_needs_aggregate(query),
          :ok <- no_mix(items),
          :ok <- group_selector_columns(items, group_time),
@@ -384,11 +384,54 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   defp offset_error(nil), do: :ok
   defp offset_error(body), do: {:error, {:engine, body}}
 
-  # The first item, in order, that is a constant or a call the engine refuses.
+  # The operands an expression of the list cannot be typed from (`incompatible operands`) are
+  # found while the projection is expanded, for the whole list, before the engine splits the
+  # condition and before it gathers what the statement selects (verified: `-f + time, -0.0`
+  # and `top(f, 2), top(g, 2), f + time` are the operand error, not `field must contain at
+  # least one variable` or the selectors that cannot be combined). A column the measurement
+  # lacks is no operand it types (`nosuch + max(time)` answers nothing).
+  @spec expand_errors([InfluxQL.item()], map(), MapSet.t(binary())) ::
+          :ok | {:error, {:engine, binary()}}
+  def expand_errors(items, types, tags) do
+    Enum.find_value(items, :ok, fn
+      {:expr, ast, _alias} ->
+        with {:error, {:engine, body}} = error <- InfluxQLExpr.check_expanding(ast, types, tags),
+             true <- String.contains?(body, "\nexpand projection\n"),
+             false <- String.contains?(body, "unknown") do
+          error
+        else
+          _other -> nil
+        end
+
+      _item ->
+        nil
+    end)
+  end
+
+  # The first item, in order, that is a constant or a call the engine refuses; a second
+  # `top()` or `bottom()` is the error of the selectors that cannot be combined at the
+  # second one, so before a constant that stands after it and not before (verified:
+  # `top(f, 2), top(g, 2), 1` and `1, top(f, 2), top(g, 2)`).
   @spec item_errors([InfluxQL.item()], map(), MapSet.t(binary())) ::
           :ok | {:error, {:engine, binary()} | binary()}
-  defp item_errors(items, types, tags),
-    do: Enum.find_value(items, :ok, &item_error(&1, types, tags))
+  defp item_errors(items, types, tags), do: item_errors(items, types, tags, 0)
+
+  defp item_errors([], _types, _tags, _multis), do: :ok
+
+  defp item_errors([{:multi, kind, _f, _t, _n, _a} | _rest], _types, _tags, multis)
+       when multis > 0,
+       do: planning("selector function #{kind}() cannot be combined with other functions")
+
+  defp item_errors([item | rest], types, tags, multis) do
+    case item_error(item, types, tags) do
+      nil ->
+        count = if match?({:multi, _k, _f, _t, _n, _a}, item), do: 1, else: 0
+        item_errors(rest, types, tags, multis + count)
+
+      error ->
+        error
+    end
+  end
 
   defp item_error({:planning_error, message}, _types, _tags), do: planning(message)
 
@@ -541,13 +584,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
        else: :ok
   end
 
-  @spec group_needs_aggregate([InfluxQL.item()], term()) :: :ok | {:error, {:engine, binary()}}
-  defp group_needs_aggregate(_items, nil), do: :ok
+  # A `GROUP BY time()` of a list with nothing to aggregate; when the statement also fills with
+  # `none` or `linear`, which need something to fill, that is the error it words first
+  # (verified).
+  @spec group_needs_aggregate(InfluxQL.query()) :: :ok | {:error, {:engine, binary()}}
+  defp group_needs_aggregate(%{group_time: nil}), do: :ok
 
-  defp group_needs_aggregate(items, _group_time) do
-    if Enum.any?(items, &aggregate?/1),
-      do: :ok,
-      else: planning("GROUP BY requires at least one aggregate function")
+  defp group_needs_aggregate(%{items: items, fill: fill} = query) do
+    cond do
+      Enum.any?(items, &aggregate?/1) -> :ok
+      fill in [:none, :linear] -> fill_needs_aggregate(%{query | group_time: nil})
+      true -> planning("GROUP BY requires at least one aggregate function")
+    end
   end
 
   # `fill(none)` and `fill(linear)` need something to fill: an aggregate or a

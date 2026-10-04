@@ -150,7 +150,8 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
           descending: boolean(),
           limit: non_neg_integer() | nil,
           offset: non_neg_integer(),
-          rewrite_error: binary() | nil
+          rewrite_error: binary() | nil,
+          tz: boolean()
         }
 
   @typedoc """
@@ -171,7 +172,8 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
           uppers: [bound()],
           checks: [{binary(), check()}],
           idents: MapSet.t(binary()),
-          deferred: {pos_integer(), binary()} | nil
+          deferred: {pos_integer(), binary()} | nil,
+          clash: {pos_integer(), binary()} | nil
         }
 
   @typedoc "A comparison of numbers the SQL cannot make; see `where_plan/0`."
@@ -219,7 +221,10 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   comparison of a field with a literal follows the engine's rules for the
   two types (see `InfluxElixir.Client.Local.InfluxQLTyped`). `deferred` is the engine's
   error for a bare field as the whole condition, which it raises after it has
-  checked `LIMIT` and `OFFSET`. `checks` are the comparisons of numbers with
+  checked `LIMIT` and `OFFSET`. `clash` is its error for a comparison of types that cannot be
+  compared (an unsigned number and a boolean), which the planner raises before it checks them
+  but after the errors of the select list; the option `:late_clash` gives it so, where it is
+  otherwise the error of the plan. `checks` are the comparisons of numbers with
   an unsigned field in them, which follow the engine's casts and wrap (see
   `InfluxElixir.Client.Local.InfluxQLArithmetic`) and which the SQL engine
   cannot make: the SQL reads each one's column, which the caller fills with
@@ -250,6 +255,16 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   """
   @spec early_error(query()) :: :ok | {:error, {:engine, binary()}}
   defdelegate early_error(query), to: InfluxQLPlan
+
+  @doc """
+  The error the engine raises while it expands the projection of a statement over a
+  measurement of these `types` and `tags`, from the operands of its expressions: after
+  `early_error/1` and before the engine reads the `WHERE`. `:ok` when there is none.
+  """
+  @spec expand_errors(query(), %{binary() => field_type()}, MapSet.t(binary())) ::
+          :ok | {:error, {:engine, binary()}}
+  def expand_errors(%{items: items}, types, tags),
+    do: InfluxQLPlan.expand_errors(items, types, tags)
 
   @doc """
   Whether a row (field name to value) satisfies a check of a `where_plan/3`:

@@ -16,6 +16,24 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
   alias InfluxElixir.Client.Local.Store
   alias InfluxElixir.TestSupport.Await
 
+  # Waits until `pid` is contending for a lock: its reductions grow three times in a row
+  # while the function it was started to run has not run. A process that is not yet in the
+  # store's wait loop is parked in a `receive` and gains none; one that is in it wakes
+  # again and again, so only a contender keeps growing. This reads nothing private of the
+  # store, and no clock decides when it ends: each step waits for the growth itself.
+  defp await_contending(pid) do
+    {:reductions, first} = Process.info(pid, :reductions)
+
+    Enum.reduce(1..3, first, fn _step, seen ->
+      Await.until(fn ->
+        case Process.info(pid, :reductions) do
+          {:reductions, now} when now > seen -> now
+          _gone_or_idle -> false
+        end
+      end)
+    end)
+  end
+
   describe "a lock holder" do
     test "that is killed does not block the next creator" do
       table = Store.new([])
@@ -32,6 +50,10 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
       assert_receive :holding, 30_000
 
       waiter = Task.async(fn -> Store.create_database(table, "next", fn _existing -> :ok end) end)
+
+      # The holder is killed only once the waiter is contending for the lock it holds.
+      await_contending(waiter.pid)
+      refute Store.database?(table, "next")
       Process.exit(holder, :kill)
 
       assert Task.await(waiter, 30_000) === :ok
@@ -90,6 +112,12 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
         end)
 
       assert_receive :waiter_started, 30_000
+
+      # The holder is released only once the waiter is contending for its lock, and the
+      # waiter's function has not run.
+      await_contending(waiter.pid)
+      refute_received :waiter_ran
+      refute Store.database?(table, "other")
       send(holder.pid, :release)
 
       assert Task.await(holder, 30_000) === :ok
@@ -122,13 +150,10 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
 
       dropper = Task.async(fn -> Store.drop_database(table, "gone") end)
 
-      # The drop is waiting on the lock once it is inside the store's wait loop; the
-      # creation holds the lock until it is told to release it, so the drop cannot
-      # have gone further, and the database it is to remove is still there.
-      Await.until(fn ->
-        Process.info(dropper.pid, :current_function) === {:current_function, {Store, :acquire, 2}}
-      end)
-
+      # The creation holds the lock until it is told to release it, so a drop that is
+      # contending for the lock cannot have gone further, and the database it is to
+      # remove is still there.
+      await_contending(dropper.pid)
       assert Store.database?(table, "gone")
 
       send(holder.pid, :release)

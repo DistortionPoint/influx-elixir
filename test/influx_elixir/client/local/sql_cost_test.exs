@@ -14,13 +14,44 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
   setup do
     {:ok, conn} = Local.start(databases: ["cost_db"])
 
+    write_rows(conn, 1500)
+    {:ok, conn: conn}
+  end
+
+  defp write_rows(conn, count) do
     lines =
-      Enum.map_join(1..1500, "\n", fn i ->
+      Enum.map_join(1..count, "\n", fn i ->
         "main,host=h#{rem(i, 5)} n=#{i}i,x=#{i}.5 #{1_700_000_000_000_000_000 + i * 1_000_000_000}"
       end)
 
     {:ok, :written} = Local.write(conn, lines, database: "cost_db", precision: :nanosecond)
-    {:ok, conn: conn}
+  end
+
+  # The reductions of a grouped query whose HAVING names its select alias `count` times: the
+  # least of three runs, as the first run of a text may fill a cache that the tests running
+  # beside this one share (the work of a run that finds them filled does not vary).
+  defp having_cost(conn, count) do
+    sql =
+      "SELECT host, count(*) AS c FROM main GROUP BY host HAVING " <>
+        Enum.join(List.duplicate("c > 0", count), " AND ") <> " ORDER BY host"
+
+    1..3
+    |> Enum.map(fn _run ->
+      {reductions, {:ok, kept}} =
+        reductions(fn -> Local.query_sql(conn, sql, database: "cost_db") end)
+
+      assert length(kept) === 5
+      reductions
+    end)
+    |> Enum.min()
+  end
+
+  # What one more reference costs: the cost of `count` references less the cost of one,
+  # over the `count - 1` the first lacks. The caches of a connection's first query are
+  # filled before anything is measured.
+  defp per_reference_cost(conn, count) do
+    having_cost(conn, 1)
+    (having_cost(conn, count) - having_cost(conn, 1)) / (count - 1)
   end
 
   defp reductions(fun) do
@@ -31,19 +62,31 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
   end
 
   describe "a HAVING that names a select alias" do
-    test "costs the table's columns once, however many times it names it", %{conn: conn} do
-      having = fn count ->
-        "SELECT host, count(*) AS c FROM main GROUP BY host HAVING " <>
-          Enum.join(List.duplicate("c > 0", count), " AND ") <> " ORDER BY host"
-      end
+    # Every reference costs its own condition to evaluate, so the cost is a line in the
+    # number of references and never flat. What tells a reference from a re-read of the
+    # table's columns is what the line's slope depends on: a reference evaluates a
+    # condition over the groups (five here, whatever the table holds), a re-read walks
+    # the rows. The same query over 1500 and over 6000 rows must therefore not add more per
+    # reference on the larger table (measured 0.8 times: the same condition over the same five
+    # groups, and the larger table's fixed cost is not in the difference), where a re-read adds
+    # about four times as much (measured 3.6 times with the columns read once more per
+    # reference). The bound sits between them, with room for the noise of the reductions count.
+    test "costs no more per reference over a table four times as large", %{conn: conn} do
+      small = per_reference_cost(conn, 7)
 
-      cost = fn count ->
-        {reductions, {:ok, kept}} =
-          reductions(fn -> Local.query_sql(conn, having.(count), database: "cost_db") end)
+      {:ok, big_conn} = Local.start(databases: ["cost_db"])
+      write_rows(big_conn, 6000)
+      big = per_reference_cost(big_conn, 7)
+      assert small > 0
 
-        assert length(kept) === 5
-        reductions
-      end
+      assert big <= small * 1.5,
+             "a reference costs #{small} reductions over 1500 rows and #{big} over 6000"
+
+      "a reference costs #{small} reductions over 1500 rows and #{big} over 6000"
+    end
+
+    test "the cost is a line in the references", %{conn: conn} do
+      cost = fn count -> having_cost(conn, count) end
 
       # Warm the caches the first query of a connection fills.
       cost.(1)
@@ -52,25 +95,11 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
       seven = cost.(7)
       fourteen = cost.(14)
 
-      # Each reference costs its own condition to evaluate, so the cost is a line in the
-      # number of references and is never flat. Two bounds tell that line from a re-read
-      # of the table's columns per reference (which is also a line, but a steep one):
-      #
-      # - the slope does not grow: the 7 references from 7 to 14 cost no more than 1.3
-      #   times the 6 from 1 to 7 (measured 1.10; the 7 over 6 references alone is 1.17,
-      #   so 1.3 leaves room for the noise of the reductions count and for nothing else);
-      # - a reference costs a small part of the whole query: under 15% of the cost of
-      #   one reference, which already reads the columns once (measured 5%), where a
-      #   re-read of 1500 rows would cost as much as that first read did.
-      added_first = seven - one
-      added_second = fourteen - seven
-
-      assert added_second <= added_first * 1.3,
+      # The 7 references from 7 to 14 cost no more than 1.3 times the 6 from 1 to 7
+      # (measured 1.10; the 7 over 6 references alone is 1.17, so 1.3 leaves room for the
+      # noise of the reductions count and for nothing else).
+      assert fourteen - seven <= (seven - one) * 1.3,
              "references 1/7/14 cost #{one}/#{seven}/#{fourteen} reductions"
-
-      assert added_first / 6 <= one * 0.15,
-             "references 1/7 cost #{one}/#{seven} reductions: a reference costs more than " <>
-               "a fraction of the columns' read"
     end
   end
 

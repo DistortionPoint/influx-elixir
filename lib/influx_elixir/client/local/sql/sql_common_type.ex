@@ -105,29 +105,63 @@ defmodule InfluxElixir.Client.Local.SQLCommonType do
 
   @doc """
   The type the engine gives the mix, for the errors that name it: as `common/2`, and for
-  numbers the double does not combine the type the engine combines them to (`Float64` beside
-  a float, `Decimal128` for a signed integer with an unsigned one). The values of such a mix
-  are not the double's to compute (`common/2` is `:mixed` for them).
+  numbers the double does not combine the type the engine combines them to. The engine folds
+  the types pairwise from the left, `Int64` with `UInt64` giving `Decimal128(20, 0)` and that
+  with a `Float64` giving `Decimal128(35, 15)`, so `greatest(i, f, u)` is a `Float64` and
+  `greatest(i, u, f)` a `Decimal128(35, 15)`. The values of such a mix are not the double's to
+  compute (`common/2` is `:mixed` for them).
+
+  The types are in the order the engine folds them: the arguments of a call as written, and
+  the `ELSE` of a `CASE` ahead of its `THEN`s.
   """
   @spec planned([type()], :case | :coalesce | :nullif) :: type()
   def planned(types, mode) do
     case common(types, mode) do
-      :mixed -> numbers_type(types)
-      type -> type
+      unpinned when unpinned in [:mixed, "Decimal128(?)"] ->
+        case numbers_type(types) do
+          :mixed -> unpinned
+          folded -> folded
+        end
+
+      type ->
+        type
     end
   end
 
+  @d20 "Decimal128(20, 0)"
+  @d35 "Decimal128(35, 15)"
+  @signed %{"Int8" => 8, "Int16" => 16, "Int32" => 32, "Int64" => 64}
+
+  # The types folded pairwise, each verified against Core (`arrow_typeof` of `greatest`,
+  # `coalesce`, `nullif` and `CASE` over a signed integer, an unsigned one and a float, in
+  # every order); `:mixed` for a type the fold does not know.
   @spec numbers_type([type()]) :: type()
   defp numbers_type(types) do
-    typed = types |> Enum.reject(&(is_nil(&1) or &1 == "Null")) |> Enum.uniq()
+    typed = Enum.reject(types, &(is_nil(&1) or &1 == "Null"))
 
-    cond do
-      not numbers?(typed) -> :mixed
-      "Float64" in typed -> "Float64"
-      "UInt64" in typed and "Int64" in typed -> "Decimal128(?)"
-      true -> :mixed
-    end
+    if typed != [] and Enum.all?(typed, &foldable?/1),
+      do: Enum.reduce(typed, &fold(&2, &1)),
+      else: :mixed
   end
+
+  @spec foldable?(type()) :: boolean()
+  defp foldable?(type),
+    do: is_map_key(@signed, type) or type in ["UInt64", "Float64", @d20, @d35]
+
+  # The type of the engine's coercion of two numbers.
+  @spec fold(binary(), binary()) :: binary()
+  defp fold(same, same), do: same
+  defp fold(@d35, _other), do: @d35
+  defp fold(_other, @d35), do: @d35
+  defp fold(@d20, "Float64"), do: @d35
+  defp fold("Float64", @d20), do: @d35
+  defp fold(@d20, _integer), do: @d20
+  defp fold(_integer, @d20), do: @d20
+  defp fold("Float64", _integer), do: "Float64"
+  defp fold(_integer, "Float64"), do: "Float64"
+  defp fold("UInt64", _signed), do: @d20
+  defp fold(_signed, "UInt64"), do: @d20
+  defp fold(left, right), do: if(@signed[left] >= @signed[right], do: left, else: right)
 
   # A tag among text cast to a number makes a tag of numbers (`coalesce(host, 1)` is a
   # `Dictionary(Int32, Int64)`), which the double does not model.
@@ -157,7 +191,7 @@ defmodule InfluxElixir.Client.Local.SQLCommonType do
   @spec mixed([binary() | :mixed], :case | :coalesce | :nullif) :: type()
   defp mixed(families, mode) do
     cond do
-      Enum.sort(families) == ["Float64", "Int64"] -> "Float64"
+      Enum.sort(families) in [["Float64", "Int64"], ["Float64", "UInt64"]] -> "Float64"
       mode == :case and Enum.sort(families) in [["Int64", "Utf8"], ["Float64", "Utf8"]] -> "Utf8"
       mode != :case and "Utf8" in families -> cast_to_number(List.delete(families, "Utf8"))
       mode != :case -> unsigned_with(families)

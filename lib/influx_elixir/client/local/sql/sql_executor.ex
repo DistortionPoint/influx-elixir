@@ -50,6 +50,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     SQLRange,
     SQLRow,
     SQLSchema,
+    SQLSelect,
     SQLSimplify,
     SQLSort,
     SQLTime,
@@ -205,17 +206,17 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
          :ok <- order_available(relations, query),
          {:ok, query} <- SQLSchema.resolve_ordinals(query, relations),
          :ok <- plan_error(query),
-         {:ok, bound} <- SQLParser.bind(query, params),
+         {:ok, bound} <- SQLParser.bind_partial(query, params),
          typed = SQLTyping.retype(bound, unsigned?),
-         :ok <- SQLPlan.check(joined, typed, unsigned?),
+         :ok <- SQLPlan.check(joined, typed, unsigned?, plan_options(query, params, relations)),
          typed = SQLCoerce.apply(typed, joined, unsigned?),
-         :ok <- SQLGrouping.check(typed, relations),
          :ok <- SQLTime.first_invalid(typed.where),
          :ok <- limit_error(typed),
          :ok <- SQLFold.check(typed),
          simplified = SQLSimplify.apply(typed),
          :ok <- SQLRange.check_time(simplified, source.pushdown),
-         :ok <- check_value_range(simplified, joined, sources, kinds, unsigned?) do
+         :ok <- check_value_range(simplified, joined, sources, kinds, unsigned?),
+         :ok <- SQLSelect.check_named(simplified) do
       {:ok, rows(joined, simplified, final?), relations}
     else
       :error -> {:error, table_not_found(m)}
@@ -226,6 +227,21 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     # cannot be performed) are thrown from the evaluator and become the
     # engine's error here.
     {:query_error, error} -> {:error, error}
+  end
+
+  # What the planner's check finds besides the errors of the expressions: the grouping of the
+  # select list and the `HAVING`, and the `$name` with no value, each at the place the engine
+  # finds it (see `InfluxElixir.Client.Local.SQLStage`).
+  @spec plan_options(SQLParser.parsed_query(), %{binary() => term()}, [SQLSchema.relation()]) ::
+          SQLPlan.plan_options()
+  defp plan_options(query, params, relations) do
+    placeholder =
+      case SQLParser.problem(query, params) do
+        :ok -> nil
+        {:error, error} -> error
+      end
+
+    [group: fn -> SQLGrouping.check(query, relations) end, placeholder: placeholder]
   end
 
   # A `LIMIT 0` plans no scan (verified: `WHERE v > 1 / 0 LIMIT 0` is `[]`,

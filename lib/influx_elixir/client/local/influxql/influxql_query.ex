@@ -609,10 +609,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     end
   end
 
+  # What the engine raises while it expands the projection, before it splits the `WHERE`.
+  @spec influxql_expanding(InfluxQL.query(), map(), MapSet.t(binary())) :: :ok | {:error, map()}
+  defp influxql_expanding(query, types, tags) do
+    case InfluxQL.expand_errors(query, types, tags) do
+      :ok -> :ok
+      {:error, {:engine, body}} -> {:error, %{status: 400, body: body}}
+    end
+  end
+
   defp influxql_planned(table, database, query, types, tags, now) do
-    with {:ok, extend} <- influxql_lookback(query),
-         {:ok, plan} <- influxql_where(query.where, tags, types, now, extend),
-         :ok <- influxql_items(query, types, tags),
+    with :ok <- influxql_expanding(query, types, tags),
+         {:ok, extend} <- influxql_lookback(query),
+         {:ok, plan} <- influxql_where(query.where, tags, types, now, extend, select_opts(query)),
+         :ok <- refusal_after(influxql_items(query, types, tags), table, database, query, plan),
+         :ok <- influxql_clash(table, database, query, plan),
          :ok <- influxql_window(table, database, query),
          :ok <- influxql_stride(table, database, query),
          :ok <- influxql_deferred(table, database, query, plan) do
@@ -621,6 +632,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
         else: influxql_rows(table, database, query, plan, types, tags, now)
     end
   end
+
+  # The measurement of a statement with a `tz()` clause over one measurement, which the engine
+  # plans the `WHERE` of as a filter.
+  @spec select_opts(InfluxQL.query()) :: keyword()
+  defp select_opts(query), do: [filter: filter(query), late_clash: true]
+
+  @spec filter(InfluxQL.query()) :: %{table: binary()} | nil
+  defp filter(%{tz: true, sources: [{:name, name}]}), do: %{table: name}
+  defp filter(_query), do: nil
 
   # The wildcards of the select list, written out for this measurement.
   @spec influxql_wild(InfluxQL.query(), map(), MapSet.t(binary())) ::
@@ -738,6 +758,36 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
   defp influxql_stride(_table, _database, _query), do: :ok
 
+  # A select list the double refuses by name is a list the engine plans: the error it raises
+  # for the condition (`clash` or `deferred`) stands in its place when it has one.
+  @spec refusal_after(:ok | {:error, map()}, Store.t(), binary(), InfluxQL.query(), map()) ::
+          :ok | {:error, map()}
+  defp refusal_after(
+         {:error, %{body: "Client.Local: " <> _name}} = refusal,
+         table,
+         db,
+         query,
+         plan
+       ) do
+    with :ok <- influxql_clash(table, db, query, plan),
+         :ok <- influxql_deferred(table, db, query, plan) do
+      refusal
+    end
+  end
+
+  defp refusal_after(result, _table, _database, _query, _plan), do: result
+
+  # The error of a comparison of types that cannot be compared, which the engine raises before
+  # it plans the LIMIT, of a measurement that exists.
+  @spec influxql_clash(Store.t(), binary(), InfluxQL.query(), map()) :: :ok | {:error, map()}
+  defp influxql_clash(table, database, query, %{clash: {status, body}}) do
+    if query.measurement in Store.measurements(table, database),
+      do: {:error, %{status: status, body: body}},
+      else: :ok
+  end
+
+  defp influxql_clash(_table, _database, _query, _plan), do: :ok
+
   # An error the engine raises after it has planned the LIMIT, of a
   # measurement that exists.
   @spec influxql_deferred(Store.t(), binary(), InfluxQL.query(), map()) :: :ok | {:error, map()}
@@ -766,17 +816,30 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
              uppers: [InfluxQL.bound()],
              checks: [term()],
              tags: MapSet.t(binary()),
-             deferred: {pos_integer(), binary()} | nil
+             deferred: {pos_integer(), binary()} | nil,
+             clash: {pos_integer(), binary()} | nil
            }}
           | {:error, map()}
-  defp influxql_where(nil, _tags, _types, _now, _extend) do
-    {:ok, %{where: "", lowers: [], uppers: [], checks: [], tags: MapSet.new(), deferred: nil}}
+  defp influxql_where(where, tags, types, now, extend, select_opts \\ [])
+
+  defp influxql_where(nil, _tags, _types, _now, _extend, _select_opts) do
+    {:ok,
+     %{
+       where: "",
+       lowers: [],
+       uppers: [],
+       checks: [],
+       tags: MapSet.new(),
+       deferred: nil,
+       clash: nil
+     }}
   end
 
-  defp influxql_where(where, tags, types, now, extend) do
+  defp influxql_where(where, tags, types, now, extend, select_opts) do
     known = MapSet.union(tags, MapSet.new(Map.keys(types)))
+    opts = [now: now, extend_lower: extend, known: known] ++ select_opts
 
-    case InfluxQL.where_plan(where, tags, types, now: now, extend_lower: extend, known: known) do
+    case InfluxQL.where_plan(where, tags, types, opts) do
       {:ok, plan} ->
         {:ok,
          %{
@@ -785,7 +848,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
            uppers: plan.uppers,
            checks: plan.checks,
            tags: MapSet.new(Enum.filter(tags, &MapSet.member?(plan.idents, &1))),
-           deferred: plan.deferred
+           deferred: plan.deferred,
+           clash: plan.clash
          }}
 
       {:error, {:engine, body}} ->

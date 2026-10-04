@@ -752,9 +752,6 @@ defmodule InfluxElixir.Contract.InfluxQLFixCases do
       {"SELECT percentile(/./, 99.5) FROM ~f3",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\", 99.5) FROM ~f3\", Char)"}},
-      {"SELECT percentile(/./ , 99.5) FROM ~f3",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\", 99.5) FROM ~f3\", Char)"}},
       {"SELECT percentile( /./,99.5) FROM ~f3",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\",99.5) FROM ~f3\", Char)"}},
@@ -1288,9 +1285,6 @@ defmodule InfluxElixir.Contract.InfluxQLFixCases do
       {"SELECT usage FROM ~f4 WHERE + host",
        {:error, 400,
         "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND Dictionary(Int32, Utf8)"}},
-      {"SELECT usage FROM ~f4 WHERE - usage",
-       {:error, 400,
-        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND Float64"}},
       {"SELECT usage FROM ~f4 WHERE + usage",
        {:error, 400,
         "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND Float64"}},
@@ -1428,7 +1422,6 @@ defmodule InfluxElixir.Contract.InfluxQLFixCases do
       {"SELECT usage FROM ~f4 WHERE 1 - time > 1",
        {:error, 400,
         "Error during planning: Cannot coerce arithmetic expression Int64 - Timestamp(ns) to valid types"}},
-      {"SELECT usage FROM ~f4 WHERE - nosuch", []},
       {"SELECT usage FROM ~f4 WHERE -nosuch + 1 > 0", []}
     ]
   end

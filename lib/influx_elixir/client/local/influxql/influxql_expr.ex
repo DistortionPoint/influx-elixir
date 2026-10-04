@@ -687,6 +687,39 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   def refs({:transform, _name, inner, _parameter}), do: refs(inner)
   def refs(_other), do: []
 
+  @doc "Whether an expression divides (`/`) anywhere in it."
+  @spec divides?(ast()) :: boolean()
+  def divides?({:bin, "/", _left, _right}), do: true
+  def divides?({:bin, _op, left, right}), do: divides?(left) or divides?(right)
+  def divides?({:neg, operand}), do: divides?(operand)
+  def divides?({:fn, _name, arguments}), do: Enum.any?(arguments, &divides?/1)
+  def divides?({:transform, _name, inner, _parameter}), do: divides?(inner)
+  def divides?(_other), do: false
+
+  @doc """
+  Whether an expression of aggregates is made of quotients: it divides, and every aggregate in
+  it is an operand of a division (`sum(f) / count(f)`, `(sum(f) + 1) / 2`, `sum(f) / 2 + sum(g) / 2`;
+  not `sum(f) / count(f) + sum(g)`).
+  """
+  @spec quotients?(ast()) :: boolean()
+  def quotients?(ast),
+    do: divides?(ast) and aggregates(ast) != [] and undivided_aggregates(ast) == []
+
+  defp undivided_aggregates({:bin, "/", _left, _right}), do: []
+  defp undivided_aggregates({:agg, fun, arg}), do: [{fun, arg}]
+  defp undivided_aggregates({:neg, operand}), do: undivided_aggregates(operand)
+
+  defp undivided_aggregates({:bin, _op, left, right}),
+    do: undivided_aggregates(left) ++ undivided_aggregates(right)
+
+  defp undivided_aggregates({:fn, _name, arguments}),
+    do: Enum.flat_map(arguments, &undivided_aggregates/1)
+
+  defp undivided_aggregates({:transform, _name, inner, _parameter}),
+    do: undivided_aggregates(inner)
+
+  defp undivided_aggregates(_other), do: []
+
   @doc "The aggregates an expression holds, as `{fun, argument}`."
   @spec aggregates(ast()) :: [{binary(), binary()}]
   def aggregates({:agg, fun, arg}), do: [{fun, arg}]
@@ -767,6 +800,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       {:ok, _type} -> :ok
     end
   end
+
+  @doc """
+  `check/4` of the operands as the engine types them while it expands the projection, where
+  the result of `median()` is a float whatever it reads (verified: `median(b) + time` words
+  `float and timestamp`); the plan that follows types it as its argument (`spread(i) /
+  median(u)` is `cannot use / between an integer and unsigned`).
+  """
+  @spec check_expanding(ast(), map(), MapSet.t(binary())) ::
+          :ok | {:error, {:engine, binary()} | binary()}
+  def check_expanding(ast, types, tags), do: check(median_as_mean(ast), types, tags, false)
+
+  defp median_as_mean({:agg, "median", arg}), do: {:agg, "mean", arg}
+  defp median_as_mean({:neg, operand}), do: {:neg, median_as_mean(operand)}
+
+  defp median_as_mean({:bin, op, left, right}),
+    do: {:bin, op, median_as_mean(left), median_as_mean(right)}
+
+  defp median_as_mean({:fn, name, arguments}),
+    do: {:fn, name, Enum.map(arguments, &median_as_mean/1)}
+
+  defp median_as_mean(other), do: other
 
   @doc "The type an expression comes to, for the columns after it."
   @spec result_type(ast(), %{binary() => atom()}, MapSet.t(binary())) :: atom()

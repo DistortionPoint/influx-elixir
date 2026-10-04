@@ -83,13 +83,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
 
   @doc """
   What an unsigned operand does to a comparison the double does not compute (verified): a
-  computed unsigned side (`u + 1`, `-u`, `(u)`, `abs(u)`, `u / 2`) against a boolean constant
-  is the planning error naming `UInt64` (`{:boolean, op}`), and against a string that is
+  computed unsigned side (`u + 1`, `-u`, `(u)`, `abs(u)`, `u / 2`) against a boolean constant,
+  and an unsigned side of any kind against a boolean field, in either order, is the planning
+  error naming `UInt64` and `Boolean` in the order written (`{:boolean, op, :unsigned_first}`
+  or `{:boolean, op, :boolean_first}`), and against a string that is
   concatenated that it is below (`u < 'a' + 'b'`, `'a' + 'b' > u`) is not null as for the other
   numbers but the engine's comparison of text (`:text`, refused by the caller). `nil` for
   anything else.
   """
-  @spec unsigned_clash(list(), MapSet.t(binary()), map()) :: {:boolean, binary()} | :text | nil
+  @spec unsigned_clash(list(), MapSet.t(binary()), map()) ::
+          {:boolean, binary(), :unsigned_first | :boolean_first} | :text | nil
   def unsigned_clash(tokens, tags, types) do
     with {:ok, [left, right], op} <- sides(tokens),
          true <- unsigned_valued?(left, types) or unsigned_valued?(right, types) do
@@ -99,11 +102,50 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
     end
   end
 
-  defp unsigned_outcome(op, left, right, tags, types) do
+  @doc """
+  A comparison of a tag over an unsigned number (`host > u`, `host >= u + 1`) written the other
+  way round (`u < host`), which the SQL engine reads as the engine of InfluxQL does: the
+  tag as text, so every point that has the unsigned value is kept (verified: the SQL reads the
+  first order as no point at all). Any other comparison is returned as it is.
+  """
+  @spec tag_over_unsigned(list(), MapSet.t(binary()), map()) :: list()
+  def tag_over_unsigned(tokens, tags, types) do
+    with {:ok, [[{:ident, name}] = left, right], op} when op in [">", ">="] <- sides(tokens),
+         true <- MapSet.member?(tags, name),
+         true <- unsigned_valued?(right, types) do
+      right ++ [{:op, flipped(op)}] ++ left
+    else
+      _other -> tokens
+    end
+  end
+
+  defp flipped(">"), do: "<"
+  defp flipped(">="), do: "<="
+
+  defp unsigned_outcome(op, left, right, tags, types),
+    do: boolean_clash(op, left, right, types) || text_clash(op, left, right, tags, types)
+
+  defp boolean_clash(op, left, right, types) do
     cond do
       boolean_constant?(right) and length(left) > 1 and unsigned_valued?(left, types) ->
-        {:boolean, if(op == "<>", do: "!=", else: op)}
+        {:boolean, written(op), :unsigned_first}
 
+      boolean_field?(right, types) and unsigned_valued?(left, types) ->
+        {:boolean, written(op), :unsigned_first}
+
+      boolean_field?(left, types) and unsigned_valued?(right, types) ->
+        {:boolean, written(op), :boolean_first}
+
+      boolean_constant?(left) and length(right) > 1 and unsigned_valued?(right, types) ->
+        {:boolean, written(op), :boolean_first}
+
+      true ->
+        nil
+    end
+  end
+
+  defp text_clash(op, left, right, tags, types) do
+    cond do
       op in ["<", "<="] and concatenated_text?(right, tags, types) and
           unsigned_valued?(left, types) ->
         :text
@@ -119,6 +161,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
 
   defp boolean_constant?([{:raw, word}]), do: String.upcase(word) in ["TRUE", "FALSE"]
   defp boolean_constant?(_tokens), do: false
+
+  # A side that is one boolean field (in parentheses or not).
+  defp boolean_field?(tokens, types) do
+    case strip_parens(tokens) do
+      [{:ident, name}] -> Map.get(types, name) == :boolean
+      _other -> false
+    end
+  end
+
+  # The operator as the engine words it.
+  defp written("<>"), do: "!="
+  defp written(op), do: op
 
   defp concatenated_text?(tokens, tags, types),
     do: side_kind(tokens, tags, types) == {:ok, :string} and binary_plus?(tokens)
@@ -223,7 +277,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   The type of an expression that stands alone as a condition and is more than one operand
   (arithmetic, signs, parentheses), or `nil` when it is null or the double cannot type it.
   """
-  @spec standalone(list(), MapSet.t(binary()), map()) :: :integer | :float | :tag | :string | nil
+  @spec standalone(list(), MapSet.t(binary()), map()) ::
+          :integer | :unsigned | :float | :tag | :string | nil
   def standalone(tokens, tags, types) do
     cond do
       Enum.any?(tokens, &match?({:op, _op}, &1)) ->
@@ -234,11 +289,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
         nil
 
       abs_call(tokens) != nil ->
-        number_type(argument_type(abs_call(tokens), tags, types))
+        abs_type(abs_call(tokens), tags, types)
 
       true ->
         case side_kind(tokens, tags, types) do
-          {:ok, kind} when kind in [:integer, :float, :tag, :string] -> kind
+          {:ok, kind} when kind in [:integer, :unsigned, :float, :tag, :string] -> kind
           _other -> nil
         end
     end
@@ -256,6 +311,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   end
 
   defp abs_call(_tokens), do: nil
+
+  # `abs(u)` of an unsigned number is unsigned too (verified: the planner words
+  # `Boolean AND UInt64` for a condition that is `abs(u)`).
+  defp abs_type(argument, tags, types) do
+    case side_kind(argument, tags, types) do
+      {:ok, :unsigned} -> :unsigned
+      _other -> number_type(argument_type(argument, tags, types))
+    end
+  end
 
   # `abs` keeps the type of a number; of a column the measurement lacks it is a float.
   defp number_type(type) when type in [:integer, :float], do: type

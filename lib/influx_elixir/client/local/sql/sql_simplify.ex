@@ -55,6 +55,72 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
     {:or, []} in nodes or {:eq, "time", nil} in nodes
   end
 
+  @doc """
+  Whether the engine's optimizer proves that the query answers no row, and replaces its plan
+  with an empty relation: no physical plan is then built for its select list, so what the
+  physical planner would refuse (a negation of an unsigned integer) is never met (verified
+  against Core). It is a `LIMIT 0`; a `HAVING` that is false; and a `WHERE` that is false (a
+  `NULL`, a constant, an `AND` with a false, two equalities of a column to different values,
+  or `IN` lists that share none), but not for an aggregate that is not grouped, which answers
+  its one row whatever the `WHERE` leaves.
+  """
+  @spec empty?(SQLParser.parsed_query()) :: boolean()
+  def empty?(query) do
+    query.limit == 0 or having_never?(query.having) or
+      ((never?(query) or contradiction?(where(query))) and not one_group?(query))
+  end
+
+  @spec having_never?(map() | nil) :: boolean()
+  defp having_never?(%{nodes: nodes}), do: {:or, []} in nodes
+  defp having_never?(_none), do: false
+
+  # An aggregate with no `GROUP BY` answers one row of the aggregates of no row.
+  @spec one_group?(SQLParser.parsed_query()) :: boolean()
+  defp one_group?(query),
+    do:
+      query.select_columns != nil and (query.group_by_columns || []) == [] and
+        is_nil(query.group_by_interval)
+
+  # Two top-level conjuncts that read a column and share no value of it: `x = 1 AND x = 2`,
+  # `x IN (1, 2) AND x = 3` (verified for integers, unsigned integers, floats, text, tags and
+  # `time` strings; an integer beside a float is not folded, nor is a range, nor an `OR`).
+  @spec contradiction?([SQLParser.where_node()]) :: boolean()
+  defp contradiction?(nodes) do
+    nodes
+    |> Enum.flat_map(&value_set/1)
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Enum.any?(fn {_column, sets} -> disjoint?(sets) end)
+  end
+
+  @spec value_set(SQLParser.where_node()) :: [{binary(), MapSet.t()}]
+  defp value_set({:eq, column, value}) when is_binary(column),
+    do: value_set({:in, column, [value]})
+
+  defp value_set({:in, column, values}) when is_binary(column) and is_list(values) do
+    keys = Enum.map(values, &value_key/1)
+    if :error in keys, do: [], else: [{column, MapSet.new(keys)}]
+  end
+
+  defp value_set(_node), do: []
+
+  # A literal as the engine compares it: integers and unsigned integers are the same number,
+  # a float or a string only itself.
+  @spec value_key(term()) :: {atom(), term()} | :error
+  defp value_key(value) when is_integer(value), do: {:int, value}
+  defp value_key({:uint, value}) when is_integer(value), do: {:int, value}
+  defp value_key(value) when is_float(value), do: {:float, value}
+  defp value_key(value) when is_binary(value), do: {:str, value}
+  defp value_key(_other), do: :error
+
+  # Whether the sets, all of one kind of value, have no value in common.
+  @spec disjoint?([MapSet.t()]) :: boolean()
+  defp disjoint?([_one]), do: false
+
+  defp disjoint?(sets) do
+    kinds = sets |> Enum.flat_map(&MapSet.to_list/1) |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
+    length(kinds) == 1 and Enum.reduce(sets, &MapSet.intersection/2) == MapSet.new()
+  end
+
   @spec where(SQLParser.parsed_query()) :: [SQLParser.where_node()]
   defp where(%{where_tree: nil, where: where}), do: where
 

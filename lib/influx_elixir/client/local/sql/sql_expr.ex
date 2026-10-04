@@ -24,7 +24,14 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   # that stands for a select item without an alias. The engine writes no
   # parentheses in it, whatever the grouping of the text was.
 
-  alias InfluxElixir.Client.Local.{Format, SQLCompare, SQLFunctions, SQLLimits, SQLLiteral}
+  alias InfluxElixir.Client.Local.{
+    Format,
+    SQLCast,
+    SQLCompare,
+    SQLFunctions,
+    SQLLimits,
+    SQLLiteral
+  }
 
   require SQLLimits
 
@@ -436,7 +443,12 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
 
   # A `-` directly before a number is the number's sign, as DataFusion reads
   # it (verified); before anything else, even a parenthesised number, it is a
-  # negation.
+  # negation. So is it before a number that a `::` casts: the cast binds tighter than the
+  # sign (verified: `-3::text` is the negation of a text, `(-3)::text` is "-3").
+  defp parse_primary([{:tok, "-"}, {:num, _text}, {:tok, "::"} | _cast] = [_minus | tokens]) do
+    with {:ok, inner, rest} <- parse_factor(tokens), do: {:ok, {:neg, inner}, rest}
+  end
+
   defp parse_primary([{:tok, "-"}, {:num, text} | rest]), do: {:ok, number(text, true), rest}
 
   defp parse_primary([{:tok, "-"} | rest]) do
@@ -779,9 +791,10 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   # The name of a `length` is the text the query gave it, which prints the arguments of the
   # calls under it apart by a comma and a space (verified: `length(coalesce(s, 'a'))` is
   # `length(coalesce(cpu.s, Utf8("a")))`, where `abs(coalesce(s, 'a'))` has no space).
-  # A cast under it keeps its text there (`length(CAST(cpu.n AS Utf8))`), which is refused.
+  # A cast under it keeps its text there (`length(CAST(cpu.n AS Utf8))`, the one cast to a
+  # text that a `length` takes); any other cast is refused.
   def render({:call, :length, [arg]}, qualifier, :drop),
-    do: "length(#{render(arg, qualifier, :display)})"
+    do: "length(#{render(named_casts(arg, qualifier), qualifier, :display)})"
 
   def render({:call, function, args}, qualifier, casts),
     do: "#{function}(#{Enum.map_join(args, ",", &render(&1, qualifier, casts))})"
@@ -887,6 +900,18 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
 
   defp precedence(op) when op in [:+, :-], do: 30
   defp precedence(_product), do: 40
+
+  # The casts to text under a `length` as the engine's name for the item writes them
+  # (`length(CAST(cpu.n AS Utf8))`), as raw text for the planner's printing of the rest; any
+  # other cast is refused.
+  @spec named_casts(t(), binary() | nil) :: t()
+  defp named_casts({:cast, inner, type}, qualifier) do
+    if SQLCast.arrow_type(type) == "Utf8",
+      do: {:raw, "CAST(#{render(named_casts(inner, qualifier), qualifier, :display)} AS Utf8)"},
+      else: throw(:unrenderable)
+  end
+
+  defp named_casts(expr, qualifier), do: map_children(expr, &named_casts(&1, qualifier))
 
   # The words and expressions of a name, one space apart.
   @spec join([binary() | t()], binary() | nil, casts()) :: binary()

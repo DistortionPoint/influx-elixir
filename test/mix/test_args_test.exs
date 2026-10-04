@@ -14,6 +14,39 @@ defmodule InfluxElixir.MixTestArgsTest do
   # A name that cannot exist, to show that a bare word is not a path.
   @no_such_path "ft6_no_such_path"
 
+  # The switches `mix test` documents that take no value. A switch Mix documents that is in
+  # neither this list nor `valued_switches/0` fails the cross-check below, so a new Mix
+  # release cannot add a valued switch unnoticed.
+  @boolean_switches ~w(--all-warnings --color --no-color --cover --failed
+                       --force --listen-on-stdin --no-archives-check --no-compile
+                       --no-deps-check --no-elixir-version-check --no-start
+                       --preload-modules --raise --stale --trace --warnings-as-errors)
+
+  # The switches in the "Command line options" list of `mix test`'s own documentation.
+  # Mix's `@switches` is a private module attribute, so the documentation is the one
+  # public record of what the task declares.
+  defp documented_switches do
+    {:docs_v1, _anno, _language, _format, %{"en" => doc}, _meta, _docs} =
+      Code.fetch_docs(Mix.Tasks.Test)
+
+    ~r/^\s+\* `(--[a-z-]+)/m
+    |> Regex.scan(doc, capture: :all_but_first)
+    |> List.flatten()
+    |> Enum.sort()
+  end
+
+  describe "valued_switches/0" do
+    test "is checked against the switches Mix's test task documents, not against itself" do
+      documented = documented_switches()
+      valued = MixTestArgs.valued_switches()
+
+      assert valued -- documented === [], "not a switch of mix test"
+
+      assert Enum.sort(documented -- valued) === Enum.sort(@boolean_switches),
+             "a documented switch is neither valued nor known to take no value"
+    end
+  end
+
   describe "args/3 without INTEGRATION" do
     test "prepends the unit paths only when nothing chooses the tests" do
       Check.check_cases(

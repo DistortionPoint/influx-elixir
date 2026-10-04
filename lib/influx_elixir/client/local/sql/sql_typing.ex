@@ -90,8 +90,8 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
 
   defp having(nil, _unsigned?), do: nil
 
-  defp having(%{nodes: nodes, aggs: aggs}, unsigned?),
-    do: %{nodes: nodes(nodes, unsigned?), aggs: retype_aggs(aggs, unsigned?)}
+  defp having(%{nodes: nodes, aggs: aggs} = having, unsigned?),
+    do: %{having | nodes: nodes(nodes, unsigned?), aggs: retype_aggs(aggs, unsigned?)}
 
   @spec nodes([SQLParser.where_node()], unsigned()) :: [SQLParser.where_node()]
   defp nodes(nodes, unsigned?), do: Enum.map(nodes, &node(&1, unsigned?))

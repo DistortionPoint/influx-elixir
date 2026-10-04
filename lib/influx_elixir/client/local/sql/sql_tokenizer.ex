@@ -21,6 +21,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   @symbols [
     "<=>",
     "==",
+    "=>",
     "!~~*",
     "!~~",
     "~~*",

@@ -24,7 +24,8 @@ defmodule InfluxElixir.Client.Local.SQLDecimal do
 
   alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLExprType}
 
-  @decimal "Decimal128(?)"
+  import SQLExprType, only: [is_decimal_type: 1]
+
   @precisions %{:/ => 35, :rem => 35, :+ => 36, :- => 36, :* => 38}
   @two_127 170_141_183_460_469_231_731_687_303_715_884_105_728.0
   @scale 1.0e15
@@ -35,7 +36,7 @@ defmodule InfluxElixir.Client.Local.SQLDecimal do
   """
   @spec check(SQLExpr.t(), [term()], %{binary() => binary()}) :: :ok | {:error, SQLError.t()}
   def check(left, values, columns) do
-    with @decimal <- SQLExprType.type_of(left, columns),
+    with decimal when is_decimal_type(decimal) <- SQLExprType.type_of(left, columns),
          literal when literal != nil <- Enum.find_value(values, &too_large/1) do
       error(left, literal, columns)
     else

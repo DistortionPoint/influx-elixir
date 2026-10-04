@@ -21,6 +21,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
     InfluxQLBucketCases,
     InfluxQLCallCases,
     InfluxQLFixCases,
+    InfluxQLOrderCases,
     InfluxQLProjectionCases,
     InfluxQLShapeCases,
     InfluxQLShowCases,
@@ -41,6 +42,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
       unquote(fixes(client))
       unquote(shapes(client))
       unquote(projections(client))
+      unquote(orders(client))
       unquote(show_helpers(client))
       unquote(fix_helpers(client))
       unquote(helpers(client))
@@ -452,6 +454,50 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
             ctx,
             InfluxQLProjectionCases.refusals(),
             InfluxQLProjectionCases.refusal_reasons()
+          )
+        end
+      end
+    end
+  end
+
+  defp orders(client) do
+    quote location: :keep do
+      describe "InfluxQL ties, unsigned booleans, conditions that are no boolean and the order of errors — contract" do
+        setup ctx do
+          names = InfluxQLOrderCases.names(InfluxElixir.IntegrationHelper.unique_name("ipo"))
+          write(ctx, unquote(client), InfluxQLOrderCases.fixture(names))
+          {:ok, names: names}
+        end
+
+        test "a tie of top() and bottom() of a tag goes to the point whose own time is first",
+             ctx do
+          check_fix(ctx, InfluxQLOrderCases.ties())
+        end
+
+        test "an unsigned field against a boolean, and a tag over an unsigned field", ctx do
+          check_fix(ctx, InfluxQLOrderCases.unsigned_booleans())
+        end
+
+        test "a condition that is no boolean, with and without tz() and beside a time", ctx do
+          check_fix(ctx, InfluxQLOrderCases.non_boolean_conditions())
+        end
+
+        test "the errors of the projection come before those of the condition and the list",
+             ctx do
+          check_fix(ctx, InfluxQLOrderCases.expansion_order())
+        end
+
+        test "LIMIT and OFFSET of a column that is a quotient skip the null buckets", ctx do
+          check_fix(ctx, InfluxQLOrderCases.quotient_windows())
+        end
+
+        @tag local_divergence:
+               "what the engine answers and the double does not compute is refused by name"
+        test "statements the double refuses by name, each for its own reason", ctx do
+          check_refusals(
+            ctx,
+            InfluxQLOrderCases.refusals(),
+            InfluxQLOrderCases.refusal_reasons()
           )
         end
       end

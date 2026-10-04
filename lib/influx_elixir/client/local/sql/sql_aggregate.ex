@@ -26,7 +26,8 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     SQLParser,
     SQLRow,
     SQLSelect,
-    SQLSort
+    SQLSort,
+    SQLWhere
   }
 
   @typedoc "A group's points."
@@ -35,16 +36,59 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   # The order an ascending sort (and `first_value`/`last_value`) puts nulls in.
   @ascending {:asc, :nulls_last}
 
+  @distinct_literal "a DISTINCT aggregate of a literal beside another aggregate over no row: " <>
+                      "the engine's answer for it is not modelled"
+
   @doc """
   One output row of an aggregate or grouped select list: each column over the
   group's `points`; `bucket_ts` is the group's `DATE_BIN` bucket start.
   """
   @spec reduce_columns([SQLSelect.column()], points(), integer() | nil) :: map()
   def reduce_columns(columns, points, bucket_ts) do
+    if points == [] and distinct_literal_quirk?(columns) do
+      throw({:query_error, SQLError.refusal(@distinct_literal)})
+    end
+
     Enum.reduce(columns, %{}, fn column, row ->
       put(row, elem(column, tuple_size(column) - 1), column_result(column, points, bucket_ts))
     end)
   end
+
+  # Over no row the engine answers `count(DISTINCT 'a')` and `sum(DISTINCT 1)` of a literal as
+  # 1 beside a `min`, `max` or `sum` (verified: `SELECT max(i), count(distinct 'x y') FROM t
+  # WHERE i > 100` is 1; beside `count`, `avg`, `median` or alone it is 0), a rewrite of the
+  # engine's that the double does not model. An aggregate not verified either way is refused too.
+  @spec distinct_literal_quirk?([SQLSelect.column()]) :: boolean()
+  defp distinct_literal_quirk?(columns) do
+    aggregates =
+      Enum.flat_map(columns, fn
+        {:expression, _expr, aggs, _alias} -> Enum.map(aggs, &elem(&1, 1))
+        column -> [column]
+      end)
+
+    {literals, others} = Enum.split_with(aggregates, &distinct_literal?/1)
+
+    literals != [] and Enum.any?(others, &(aggregate?(&1) and not safe_beside_literal?(&1)))
+  end
+
+  @spec distinct_literal?(SQLSelect.column()) :: boolean()
+  defp distinct_literal?({:aggregate, agg, {kind, value}, _alias})
+       when agg in [:count_distinct, :sum_distinct] and kind in [:lit, :uint],
+       do: not is_nil(value)
+
+  defp distinct_literal?(_column), do: false
+
+  @spec aggregate?(SQLSelect.column()) :: boolean()
+  defp aggregate?(column), do: elem(column, 0) not in [:grouping_column, :constant, :time_bucket]
+
+  @spec safe_beside_literal?(SQLSelect.column()) :: boolean()
+  defp safe_beside_literal?({:count_star, _alias}), do: true
+  defp safe_beside_literal?({:count_distinct, _column, _alias}), do: true
+
+  defp safe_beside_literal?({:aggregate, agg, _expr, _alias}),
+    do: agg in [:count, :count_distinct, :avg, :median]
+
+  defp safe_beside_literal?(_column), do: false
 
   @doc """
   The output rows of one group: its row, unless a `HAVING` leaves it out
@@ -58,9 +102,28 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
           integer() | nil
         ) :: [map()]
   def reduce_group(columns, having, points, bucket_ts) do
-    row = reduce_columns(columns, points, bucket_ts)
+    cond do
+      is_nil(having) ->
+        [reduce_columns(columns, points, bucket_ts)]
 
-    if is_nil(having) or having_holds?(having, points, bucket_ts, row), do: [row], else: []
+      # The select list is computed for the groups the `HAVING` keeps (verified: the
+      # negation of an unsigned sum, which fails, is never met when the `HAVING` is false).
+      not names_outputs?(having, columns) ->
+        if having_holds?(having, points, bucket_ts, %{}),
+          do: [reduce_columns(columns, points, bucket_ts)],
+          else: []
+
+      true ->
+        row = reduce_columns(columns, points, bucket_ts)
+        if having_holds?(having, points, bucket_ts, row), do: [row], else: []
+    end
+  end
+
+  # Whether a `HAVING` reads the name of a select item (and so needs the row).
+  @spec names_outputs?(SQLAggExpr.having_t(), [SQLSelect.column()]) :: boolean()
+  defp names_outputs?(%{nodes: nodes}, columns) do
+    outputs = Enum.map(columns, &elem(&1, tuple_size(&1) - 1))
+    Enum.any?(SQLWhere.conjunction_columns(nodes), &(&1 in outputs))
   end
 
   @spec having_holds?(SQLAggExpr.having_t(), points(), integer() | nil, map()) :: boolean()
