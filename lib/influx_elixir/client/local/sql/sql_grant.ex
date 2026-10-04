@@ -32,15 +32,23 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   @object_kinds ~w(SCHEMA DATABASE SEQUENCE VIEW)
   @all_kinds ~w(TABLES SEQUENCES FUNCTIONS)
   @error_kinds ["FUNCTION" | @object_kinds]
-  @grantee_kinds ~w(ROLE GROUP USER)
+  @grantee_kinds ~w(ROLE GROUP USER SHARE APPLICATION)
   # The words after `ON` that begin an object the double has not worded, and what may follow
   # `ALL` for one (the engine reads them as an object, and it prints them differently).
   @unworded_objects ~w(PROCEDURE WAREHOUSE USER INTEGRATION CONNECTION FUTURE)
   @unworded_all ~w(VIEWS MATERIALIZED EXTERNAL)
 
-  @doc "Whether a word (in capitals) is a privilege the parser reads."
+  @doc "Whether a word (in capitals) is a privilege the parser reads (`ROLE r` is one)."
   @spec privilege?(binary()) :: boolean()
-  def privilege?(word), do: word == "ALL" or word in @privileges
+  def privilege?(word), do: word in ["ALL", "ROLE"] or word in @privileges
+
+  @doc "Whether the tokens begin with a privilege the parser reads (`DATABASE ROLE r` is one)."
+  @spec privilege_start?([SQLTokenizer.token()]) :: boolean()
+  def privilege_start?([{:word, _p, "DATABASE", _l, _c}, {:word, _p2, "ROLE", _l2, _c2} | _rest]),
+    do: true
+
+  def privilege_start?([{:word, _p, word, _l, _c} | _rest]), do: privilege?(word)
+  def privilege_start?(_tokens), do: false
 
   @doc "The engine's name for a statement of these, or `:unknown`."
   @spec display(binary()) :: {:ok, binary()} | :unknown
@@ -79,6 +87,8 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
         :refuse -> nil
       end
     else
+      {:bad, token} -> identifier_error(token)
+      {:keyword, token} -> SQLDdl.expected("a privilege keyword", token)
       _unread -> nil
     end
   end
@@ -179,7 +189,11 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
 
   defp identifier_error(_token), do: nil
 
-  @spec privileges([SQLTokenizer.token()]) :: {:ok, binary(), [SQLTokenizer.token()]} | :error
+  @spec privileges([SQLTokenizer.token()]) ::
+          {:ok, binary(), [SQLTokenizer.token()]}
+          | :error
+          | {:bad, SQLTokenizer.token()}
+          | {:keyword, SQLTokenizer.token()}
   defp privileges([{:word, _p, "ALL", _l, _c}, {:word, _p2, "PRIVILEGES", _l2, _c2} | rest]),
     do: {:ok, "ALL PRIVILEGES", rest}
 
@@ -187,19 +201,50 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   defp privileges(tokens), do: privilege_list(tokens, [])
 
   @spec privilege_list([SQLTokenizer.token()], [binary()]) ::
-          {:ok, binary(), [SQLTokenizer.token()]} | :error
+          {:ok, binary(), [SQLTokenizer.token()]}
+          | :error
+          | {:bad, SQLTokenizer.token()}
+          | {:keyword, SQLTokenizer.token()}
   defp privilege_list([{:word, _p, word, _l, _c} | rest], found) when word in @privileges do
-    with {:ok, columns, rest} <- columns(word, rest) do
-      found = [word <> columns | found]
+    with {:ok, columns, rest} <- columns(word, rest),
+         do: more_privileges([word <> columns | found], rest)
+  end
 
-      case rest do
-        [{:symbol, ",", _p2, _l2, _c2} | more] -> privilege_list(more, found)
-        _end -> {:ok, found |> Enum.reverse() |> Enum.join(", "), rest}
-      end
+  # `DATABASE ROLE r`, like `ROLE r` below.
+  defp privilege_list(
+         [{:word, _p, "DATABASE", _l, _c}, {:word, _p2, "ROLE", _l2, _c2} | rest],
+         found
+       ) do
+    case grantee_name(rest) do
+      {:ok, name, rest} -> more_privileges(["DATABASE ROLE " <> name | found], rest)
+      {:bad, _token} = bad -> bad
     end
   end
 
+  # `ROLE r`: a role is a privilege here, with a name.
+  defp privilege_list([{:word, _p, "ROLE", _l, _c} | rest], found) do
+    case grantee_name(rest) do
+      {:ok, name, rest} -> more_privileges(["ROLE " <> name | found], rest)
+      {:bad, _token} = bad -> bad
+    end
+  end
+
+  # After a comma the parser wants a privilege, and says so at the token that is none.
+  defp privilege_list([{kind, _p, _u, _l, _c} = token | _rest], [_found | _more])
+       when kind in [:word, :quoted, :string, :number, :symbol],
+       do: {:keyword, token}
+
   defp privilege_list(_tokens, _found), do: :error
+
+  @spec more_privileges([binary()], [SQLTokenizer.token()]) ::
+          {:ok, binary(), [SQLTokenizer.token()]}
+          | :error
+          | {:bad, SQLTokenizer.token()}
+          | {:keyword, SQLTokenizer.token()}
+  defp more_privileges(found, [{:symbol, ",", _p, _l, _c} | more]),
+    do: privilege_list(more, found)
+
+  defp more_privileges(found, rest), do: {:ok, found |> Enum.reverse() |> Enum.join(", "), rest}
 
   @spec columns(binary(), [SQLTokenizer.token()]) ::
           {:ok, binary(), [SQLTokenizer.token()]} | :error
@@ -350,6 +395,13 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
        do: :refuse
 
   defp grantee([{:word, _p, "PUBLIC", _l, _c} | rest]), do: {:ok, "PUBLIC ", rest}
+
+  # `DATABASE ROLE d` and `APPLICATION ROLE a` are kinds of grantee of two words.
+  defp grantee([{:word, _p, first, _l, _c}, {:word, _p2, "ROLE", _l2, _c2}, next | rest])
+       when first in ["DATABASE", "APPLICATION"] do
+    with {:ok, name, rest} <- grantee_name([next | rest]),
+         do: {:ok, first <> " ROLE " <> name, rest}
+  end
 
   defp grantee([{:word, _p, kind, _l, _c}, next | rest]) when kind in @grantee_kinds do
     with {:ok, name, rest} <- grantee_name([next | rest]), do: {:ok, kind <> " " <> name, rest}

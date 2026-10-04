@@ -690,13 +690,15 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
 
         # A constant argument is the planner's error or the double's refusal (see
         # `selector_error/1`), found once the columns are: the column reads as `time` until
-        # then.
+        # then. The engine names it as the constant it is, which tells it from `time`.
+        shown = {{field, constant}, {ordering, literal}}
+
         {field, ordering} =
           {if(constant, do: "time", else: field), if(literal, do: "time", else: ordering)}
 
         with {:ok, output} <-
                output_name(col, alias_name, fn ->
-                 selector_name(kind, field, ordering, access, qualifier)
+                 selector_name(kind, shown, access, qualifier)
                end) do
           # Without a subscript the engine returns the whole struct.
           kind = if access == "", do: :struct, else: String.to_existing_atom(access)
@@ -762,11 +764,23 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
     end)
   end
 
-  @spec selector_name(binary(), binary(), binary(), binary(), binary() | nil) :: binary()
-  defp selector_name(kind, field, ordering, access, qualifier) do
+  # An argument of a selector as the engine names it: a column by its name, a constant by its
+  # type (`Int64(1)`).
+  @spec shown_argument(binary(), binary() | nil, binary() | nil) :: binary()
+  defp shown_argument(text, nil, qualifier), do: column_name(text, qualifier)
+  defp shown_argument(_text, "Null", _qualifier), do: "NULL"
+  defp shown_argument(text, type, _qualifier), do: "#{type}(#{text})"
+
+  @spec selector_name(
+          binary(),
+          {{binary(), binary() | nil}, {binary(), binary() | nil}},
+          binary(),
+          binary() | nil
+        ) :: binary()
+  defp selector_name(kind, {{field, constant}, {ordering, literal}}, access, qualifier) do
     subscript = if access == "", do: "", else: "[#{access}]"
 
-    "selector_#{String.downcase(kind)}(#{column_name(field, qualifier)}," <>
-      "#{column_name(ordering, qualifier)})" <> subscript
+    "selector_#{String.downcase(kind)}(#{shown_argument(field, constant, qualifier)}," <>
+      "#{shown_argument(ordering, literal, qualifier)})" <> subscript
   end
 end

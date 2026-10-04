@@ -101,7 +101,7 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   # `BETWEEN a AND b`) stay inside its text; string literals are opaque.
   @spec tokenize_where(binary()) :: {:ok, [where_token()]} | {:error, map()}
   defp tokenize_where(str) do
-    scan_where(str, %{buf: "", depth: 0, between: false, distinct: false, tokens: []})
+    scan_where(str, %{buf: "", tail: "", depth: 0, between: false, distinct: false, tokens: []})
   end
 
   @spec scan_where(binary(), map()) :: {:ok, [where_token()]} | {:error, map()}
@@ -207,13 +207,46 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   defp word_boundary?(""), do: true
   defp word_boundary?(buf), do: String.ends_with?(buf, [" ", "\n", "\t", "("])
 
+  # The keywords that change how the text after them is read are looked for at the end of the
+  # predicate so far, and only in its last characters (`tail`): reading the whole of a long
+  # predicate for every character added to it would be quadratic in its length.
+  @tail_length 120
+
   @spec append(map(), binary()) :: map()
   defp append(state, text) do
     buf = state.buf <> text
-    between = state.between or Regex.match?(~r/\bBETWEEN\s*$/iu, buf)
-    distinct = state.distinct or Regex.match?(~r/\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\s*$/iu, buf)
-    %{state | buf: buf, between: between, distinct: distinct}
+    tail = tail_of(state.tail <> text)
+
+    # Only the end of a keyword, or a blank after it, can complete one of them.
+    if closes_keyword?(text) do
+      between = state.between or Regex.match?(~r/\bBETWEEN\s*$/iu, tail)
+      distinct = state.distinct or Regex.match?(~r/\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\s*$/iu, tail)
+      %{state | buf: buf, tail: tail, between: between, distinct: distinct}
+    else
+      %{state | buf: buf, tail: tail}
+    end
   end
+
+  # `BETWEEN` ends in an `N`, `FROM` in an `M`.
+  @spec closes_keyword?(binary()) :: boolean()
+  defp closes_keyword?(text), do: text in ["n", "N", "m", "M", " ", "\n", "\t", "\r"]
+
+  # The last characters of a text, cut at a character.
+  @spec tail_of(binary()) :: binary()
+  defp tail_of(text) when byte_size(text) <= 2 * @tail_length, do: text
+
+  defp tail_of(text) do
+    cut = byte_size(text) - @tail_length
+    <<_head::binary-size(^cut), rest::binary>> = text
+    drop_partial(rest)
+  end
+
+  # A cut can land inside a multibyte character: its bytes are dropped.
+  @spec drop_partial(binary()) :: binary()
+  defp drop_partial(<<byte, rest::binary>>) when Bitwise.band(byte, 0xC0) == 0x80,
+    do: drop_partial(rest)
+
+  defp drop_partial(text), do: text
 
   @spec emit(map(), where_token()) :: map()
   defp emit(state, token), do: %{state | tokens: [token | state.tokens]}
@@ -222,12 +255,13 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   defp flush_pred(state) do
     case String.trim(state.buf) do
       "" ->
-        %{state | buf: "", between: false, distinct: false}
+        %{state | buf: "", tail: "", between: false, distinct: false}
 
       text ->
         %{
           state
           | buf: "",
+            tail: "",
             between: false,
             distinct: false,
             tokens: [{:pred, text} | state.tokens]

@@ -76,7 +76,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   `CAST(expr AS type)` targets (and their synonyms): the integer types by
   width (`INTEGER` is 32 bits), `DOUBLE`, and text.
   """
-  @type cast_type :: :int8 | :int16 | :int32 | :int64 | :float | :string
+  @type cast_type :: :int8 | :int16 | :int32 | :int64 | :float | :string | :decimal
 
   @typedoc "How `render/3` treats a `CAST`: written as the engine names it (gone), or refused."
   @type casts :: :drop | :refuse | :display
@@ -316,9 +316,12 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   defp parse_is_kind(left, "FALSE", negated, rest),
     do: {:ok, {:is_bool, left, false, negated}, rest}
 
+  # What follows `IS [NOT] DISTINCT FROM` is the whole rest of the expression, down to an `OR`
+  # (verified against Core: `1 IS DISTINCT FROM 2 OR true` is `1 IS DISTINCT FROM (2 OR true)`,
+  # the error of an `Int64 OR Boolean`).
   defp parse_is_kind(left, "DISTINCT", negated, [{:word, from} | rest]) do
     if keyword?(from, "FROM") do
-      with {:ok, right, rest} <- parse_concat(rest),
+      with {:ok, right, rest} <- parse_or(rest),
            do: {:ok, {:is_distinct, left, right, negated}, rest}
     else
       {:error, :unexpected_token}
@@ -773,6 +776,13 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
     end
   end
 
+  # The name of a `length` is the text the query gave it, which prints the arguments of the
+  # calls under it apart by a comma and a space (verified: `length(coalesce(s, 'a'))` is
+  # `length(coalesce(cpu.s, Utf8("a")))`, where `abs(coalesce(s, 'a'))` has no space).
+  # A cast under it keeps its text there (`length(CAST(cpu.n AS Utf8))`), which is refused.
+  def render({:call, :length, [arg]}, qualifier, :drop),
+    do: "length(#{render(arg, qualifier, :display)})"
+
   def render({:call, function, args}, qualifier, casts),
     do: "#{function}(#{Enum.map_join(args, ",", &render(&1, qualifier, casts))})"
 
@@ -837,8 +847,11 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   defp render_form({:in, inner, items, negated}, qualifier, casts) do
     word = if negated, do: "NOT IN", else: "IN"
 
-    "#{render(inner, qualifier, casts)} #{word} " <>
-      Enum.map_join(items, ", ", &render(&1, qualifier, casts))
+    list = Enum.map_join(items, ", ", &render(&1, qualifier, casts))
+    # The planner's text of a list is in brackets and parentheses (`IN ([a, b])`); the name
+    # of a select item is not.
+    list = if casts == :display, do: "([#{list}])", else: list
+    "#{render(inner, qualifier, casts)} #{word} " <> list
   end
 
   defp render_form({:between, inner, low, high, negated}, qualifier, casts) do

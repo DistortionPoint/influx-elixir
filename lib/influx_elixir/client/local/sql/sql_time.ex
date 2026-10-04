@@ -278,6 +278,12 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   # A timestamp string, as Arrow reads it
   # ---------------------------------------------------------------------------
 
+  @doc """
+  A quoted timestamp's text as nanoseconds since the epoch, or the optimizer's error for it.
+  """
+  @spec timestamp_ns(binary()) :: {:ok, integer()} | {:error, SQLError.t()}
+  def timestamp_ns(text), do: literal(text)
+
   # A quoted timestamp's text as nanoseconds since the epoch, or the
   # optimizer's error for it.
   @spec literal(binary()) :: {:ok, integer()} | {:error, SQLError.t()}

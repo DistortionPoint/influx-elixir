@@ -100,11 +100,10 @@ defmodule InfluxElixir.MixProject do
   #
   #     mix test --only v3_core
   #     mix test test/integration/contract_v3_core --include integration --include v3_core
+  #
   # The rule is `InfluxElixir.MixTestArgs` (mix/test_args.ex, tested in
   # test/mix/test_args_test.exs). It is loaded here, when this project's tests
   # run, not at the top of the file: the package ships mix.exs without mix/.
-  @non_unit_test_entries ~w(integration support fixtures test_helper.exs)
-
   defp run_tests(args) do
     Code.require_file("mix/test_args.ex", __DIR__)
 
@@ -112,19 +111,10 @@ defmodule InfluxElixir.MixProject do
       apply(InfluxElixir.MixTestArgs, :args, [
         args,
         System.get_env("INTEGRATION"),
-        unit_test_paths()
+        apply(InfluxElixir.MixTestArgs, :unit_test_paths, ["test"])
       ])
 
     Mix.Task.run("test", args)
-  end
-
-  defp unit_test_paths do
-    "test"
-    |> File.ls!()
-    |> Enum.reject(&(&1 in @non_unit_test_entries))
-    |> Enum.filter(&(File.dir?(Path.join("test", &1)) or String.ends_with?(&1, "_test.exs")))
-    |> Enum.sort()
-    |> Enum.map(&Path.join("test", &1))
   end
 
   defp dialyzer do

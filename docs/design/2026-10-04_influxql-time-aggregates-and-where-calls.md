@@ -91,7 +91,7 @@ listed, with the engine's answer, in `InfluxQLShapeCases.refusals/0`.
 | File | Change |
 |------|--------|
 | `lib/influx_elixir/client/local/influxql/*.ex` | the changes above |
-| `test/support/contract/influxql_shape_cases.ex` | new: 640 statements with Core's answers, and 110 refusals |
+| `test/support/contract/influxql_shape_cases.ex` | new: 791 statements with Core's answers (measured at b04c320: 304 aggregates + 157 select + 285 conditions + 45 shows) and 115 refusals; after [`2026-10-04_influxql-projection-plan`](2026-10-04_influxql-projection-plan.md), which took out two statements written twice and moved two refusals to the answers: 791 (303 aggregates + 158 select + 285 conditions + 45 shows) and 113 refusals, each pinned to its reason by `refusal_reasons/0` |
 | `test/support/contract/influxql_fix_cases.ex` | `max/sum/median/spread/stddev/mode(time)`; the nanosecond stamps |
 | `test/support/contract/influxql_planner_contract.ex`, `influxql_flux_lp_contract.ex` | wire the tables; the shape refusals are the one `local_divergence` test |
 | `CHANGELOG.md` | |
@@ -99,9 +99,11 @@ listed, with the engine's answer, in `InfluxQLShapeCases.refusals/0`.
 ## Verification
 
 - Each statement of `InfluxQLShapeCases` was run on Core and on the double;
-  the table holds only those they answer alike. 435 statements of 707 differed
-  from Core at 1b8ff04 and are now equal; none that was equal differs, except
-  the five that stamp a bound that is not a whole microsecond (above).
+  the table holds only those they answer alike. 579 of its 791 statements
+  differed from Core at 1b8ff04 (220 of 303 aggregates, 109 of 158 select, 233
+  of 285 conditions, 17 of 45 shows) and none differs now; 68 of the 113
+  refusals were refused by name at 1b8ff04 and all 113 are now. The bound that
+  is not a whole microsecond is stamped as the client reads it (above).
 - `mix test --only v3_core` (Core, no auth), `mix test`, `mix test --cover`,
   `mix credo --strict`, `mix dialyzer`, `MIX_ENV=test mix compile --force
   --warnings-as-errors`.

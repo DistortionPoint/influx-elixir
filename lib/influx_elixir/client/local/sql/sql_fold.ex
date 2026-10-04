@@ -115,6 +115,10 @@ defmodule InfluxElixir.Client.Local.SQLFold do
   @spec constant(SQLExpr.t()) :: {:ok, term()} | :error
   def constant(expr) do
     if foldable?(expr), do: {:ok, SQLEval.eval(expr, @no_point)}, else: :error
+  rescue
+    # An expression the type check has not seen yet may be one the evaluator is not given
+    # (`NOT 0`): it has no value to know.
+    _error in [ArgumentError, FunctionClauseError, ArithmeticError] -> :error
   catch
     {:query_error, _error} -> :error
   end

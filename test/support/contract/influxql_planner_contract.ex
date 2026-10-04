@@ -21,6 +21,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
     InfluxQLBucketCases,
     InfluxQLCallCases,
     InfluxQLFixCases,
+    InfluxQLProjectionCases,
     InfluxQLShapeCases,
     InfluxQLShowCases,
     InfluxQLWhereCases
@@ -39,6 +40,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
       unquote(shows(client))
       unquote(fixes(client))
       unquote(shapes(client))
+      unquote(projections(client))
       unquote(show_helpers(client))
       unquote(fix_helpers(client))
       unquote(helpers(client))
@@ -245,6 +247,9 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
         @tag local_divergence:
                "the engine breaks the connection of a fill that has no value to carry; Local refuses by name"
         test "what the engine answers by closing the connection", ctx do
+          assert Enum.sort(Map.keys(InfluxQLCallCases.closed_reasons())) ===
+                   Enum.sort(InfluxQLCallCases.closed())
+
           for template <- InfluxQLCallCases.closed() do
             statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
             result = InfluxElixir.Contract.InfluxQLPlanner.raw(unquote(client), ctx, statement)
@@ -252,9 +257,10 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
             if unquote(client) === InfluxElixir.Client.Local,
               do:
                 assert(
-                  match?(
-                    {:error, %{status: 400, body: "Client.Local: unsupported InfluxQL (" <> _}},
-                    result
+                  InfluxElixir.Contract.InfluxQLPlanner.refused_as?(
+                    result,
+                    statement,
+                    Map.fetch!(InfluxQLCallCases.closed_reasons(), template)
                   ),
                   statement
                 ),
@@ -385,29 +391,67 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
 
         @tag local_divergence:
                "what the engine answers and the double does not compute is refused by name"
-        test "statements the double refuses by name", ctx do
-          InfluxElixir.TestSupport.Check.check_cases(
+        test "statements the double refuses by name, each for its own reason", ctx do
+          check_refusals(
+            ctx,
             InfluxQLShapeCases.refusals(),
-            fn {template, expected} ->
-              statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
+            InfluxQLShapeCases.refusal_reasons()
+          )
+        end
+      end
+    end
+  end
 
-              actual =
-                InfluxElixir.Contract.InfluxQLPlanner.fix_outcome(
-                  unquote(client),
-                  ctx,
-                  statement
-                )
+  defp projections(client) do
+    quote location: :keep do
+      describe "InfluxQL projections: names, windows and coercions — contract" do
+        setup ctx do
+          names =
+            InfluxQLProjectionCases.names(InfluxElixir.IntegrationHelper.unique_name("ipj"))
 
-              expected = InfluxElixir.Contract.InfluxQLPlanner.fill_names(expected, ctx.names)
+          write(ctx, unquote(client), InfluxQLProjectionCases.fixture(names))
+          {:ok, names: names}
+        end
 
-              refused? = match?({:error, 400, "Client.Local: " <> _rest}, actual)
+        test "an unsigned number beside a string, a boolean, a tag or the time", ctx do
+          check_fix(ctx, InfluxQLProjectionCases.coercions())
+        end
 
-              cond do
-                unquote(client) === InfluxElixir.Client.Local and refused? -> :ok
-                unquote(client) !== InfluxElixir.Client.Local and actual === expected -> :ok
-                true -> {:mismatch, %{expected: expected, actual: actual}}
-              end
-            end
+        test "a math function of a time beside an operand or a field", ctx do
+          check_fix(ctx, InfluxQLProjectionCases.time_functions())
+        end
+
+        test "LIMIT and OFFSET count per selected column, under its name", ctx do
+          check_fix(ctx, InfluxQLProjectionCases.windows())
+        end
+
+        test "the names of the columns, in the order of the select list", ctx do
+          check_fix(ctx, InfluxQLProjectionCases.column_names())
+        end
+
+        test "the time in parentheses is a column of its own", ctx do
+          check_fix(ctx, InfluxQLProjectionCases.parenthesised_time())
+        end
+
+        test "a column the measurement lacks beside a tag, a string or a boolean", ctx do
+          check_fix(ctx, InfluxQLProjectionCases.absent_columns())
+        end
+
+        test "a tie of top() and bottom() in descending order goes to the later point", ctx do
+          check_fix(ctx, InfluxQLProjectionCases.descending())
+        end
+
+        test "top() and bottom() beside arithmetic, and a function before a selector", ctx do
+          check_fix(ctx, InfluxQLProjectionCases.selectors())
+        end
+
+        @tag local_divergence:
+               "what the engine answers and the double does not compute is refused by name"
+        test "statements the double refuses by name, each for its own reason", ctx do
+          check_refusals(
+            ctx,
+            InfluxQLProjectionCases.refusals(),
+            InfluxQLProjectionCases.refusal_reasons()
           )
         end
       end
@@ -461,6 +505,39 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
 
   defp fix_helpers(client) do
     quote location: :keep do
+      # The statements the double refuses by name: the engine answers each as the table says;
+      # the double refuses it for the reason pinned (a statement with no pinned reason, one
+      # refused for another reason and one now answered all fail naming the statement), and a
+      # reason pinned for a statement the table does not hold fails as well.
+      defp check_refusals(ctx, cases, reasons) do
+        templates = Enum.map(cases, &elem(&1, 0))
+
+        assert Enum.sort(Map.keys(reasons)) === Enum.sort(templates),
+               "the pinned reasons and the refusals are not the same statements"
+
+        InfluxElixir.TestSupport.Check.check_cases(cases, fn {template, expected} ->
+          statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
+
+          actual =
+            InfluxElixir.Contract.InfluxQLPlanner.fix_outcome(unquote(client), ctx, statement)
+
+          expected = InfluxElixir.Contract.InfluxQLPlanner.fill_names(expected, ctx.names)
+          reason = Map.fetch!(reasons, template)
+
+          cond do
+            unquote(client) !== InfluxElixir.Client.Local and actual === expected ->
+              :ok
+
+            unquote(client) === InfluxElixir.Client.Local and
+                InfluxElixir.Contract.InfluxQLPlanner.refused_as?(actual, statement, reason) ->
+              :ok
+
+            true ->
+              {:mismatch, %{expected: expected, actual: actual, refused_as: reason}}
+          end
+        end)
+      end
+
       defp check_fix(ctx, cases) do
         InfluxElixir.TestSupport.Check.check_cases(cases, fn {template, expected} ->
           statement = InfluxElixir.Contract.InfluxQLPlanner.statement(template, ctx.names)
@@ -578,6 +655,19 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
   # in the columns, and the row is stamped `nil`.
   defp time_text(nil), do: nil
   defp time_text(time), do: Calendar.strftime(time, "%Y-%m-%d %H:%M:%S")
+
+  @doc """
+  Whether an answer is the double's refusal by name for `reason`: `Client.Local: <reason>`,
+  with the statement after it when it is the parser that refuses.
+  """
+  @spec refused_as?(term(), binary(), binary()) :: boolean()
+  def refused_as?({:error, %{status: 400, body: body}}, statement, reason),
+    do: refused_as?({:error, 400, body}, statement, reason)
+
+  def refused_as?({:error, 400, body}, statement, reason),
+    do: body in ["Client.Local: " <> reason, "Client.Local: " <> reason <> ": " <> statement]
+
+  def refused_as?(_answer, _statement, _reason), do: false
 
   @doc """
   `outcome/3`, or `:closed` for the connection the engine breaks mid-response.

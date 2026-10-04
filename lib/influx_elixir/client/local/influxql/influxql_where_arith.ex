@@ -20,12 +20,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   #   * `abs()` takes one number; anything else is the engine's planning error, worded here
   #     (`call_error/3`)
 
+  alias InfluxElixir.Client.Local.InfluxQLTokens
+
   @comparison ["=", "!=", "<>", "<", "<=", ">", ">=", "=~", "!~"]
   @equality ["=", "!=", "<>"]
   @numbers [:integer, :float, :unsigned]
+  @uncoercible [:string, :boolean, :tag, :timestamp]
+
+  @arrow %{
+    integer: "Int64",
+    unsigned: "UInt64",
+    float: "Float64",
+    string: "Utf8",
+    boolean: "Boolean",
+    tag: "Dictionary(Int32, Utf8)",
+    timestamp: "Timestamp(ns)",
+    null: "Float64"
+  }
 
   @typedoc "The type of an expression: a number, a tag, a string, a boolean, a regular expression, or null."
-  @type kind :: :integer | :float | :unsigned | :tag | :string | :boolean | :regex | :null
+  @type kind ::
+          :integer | :float | :unsigned | :tag | :string | :boolean | :regex | :null | :timestamp
 
   @doc """
   Whether a comparison, or an expression alone, is null because a tag, a string or a boolean is
@@ -271,6 +286,50 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
       {:ok, kind, []} -> {:ok, kind}
       _other -> :error
     end
+  catch
+    {:coerce, _left, _op, _right} -> :error
+  end
+
+  @doc """
+  The planning error of arithmetic the engine cannot coerce (verified): an unsigned number
+  beside a string, a boolean, a tag or the time under an arithmetic operator, in either order,
+  worded with the Arrow type of each operand as written (`UInt64 + Utf8`). The other numbers
+  beside these are a null (see `null?/3`); a column the measurement lacks, and an expression
+  that came to null, are null beside an unsigned number too. `nil` when nothing is wrong.
+  """
+  @spec coercion_error(list(), MapSet.t(binary()), map()) :: binary() | nil
+  def coercion_error(tokens, tags, types) do
+    case sides(tokens) do
+      {:ok, parts, _op} ->
+        typed = typed_names(tokens, tags, types)
+        Enum.each(parts, &expression(&1, tags, typed))
+        nil
+
+      :error ->
+        nil
+    end
+  catch
+    {:coerce, left, op, right} ->
+      "Error during planning: Cannot coerce arithmetic expression " <>
+        "#{Map.fetch!(@arrow, left)} #{op} #{Map.fetch!(@arrow, right)} to valid types"
+  end
+
+  # The types of the names the tokens read: those of the measurement, the time, and `:absent`
+  # for a column it lacks.
+  defp typed_names(tokens, tags, types) do
+    tokens
+    |> Enum.chunk_every(2, 1, [nil])
+    |> Enum.reduce(types, fn
+      [{:ident, name}, next], acc when next != {:raw, "("} ->
+        cond do
+          InfluxQLTokens.time?({:ident, name}) -> Map.put(acc, name, :timestamp)
+          MapSet.member?(tags, name) or Map.has_key?(acc, name) -> acc
+          true -> Map.put(acc, name, :absent)
+        end
+
+      _tokens, acc ->
+        acc
+    end)
   end
 
   # sum := product (("+" | "-") product)*
@@ -345,8 +404,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
       MapSet.member?(tags, name) ->
         {:ok, :tag, rest}
 
-      Map.get(types, name) in [:integer, :float, :unsigned, :string, :boolean] ->
+      Map.get(types, name) in [:integer, :float, :unsigned, :string, :boolean, :timestamp] ->
         {:ok, types[name], rest}
+
+      Map.get(types, name) == :absent ->
+        {:ok, :null, rest}
 
       true ->
         :error
@@ -363,6 +425,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   defp combine("+", :string, :tag), do: :error
   defp combine("+", :string, :string), do: {:ok, :string}
 
+  # An unsigned number beside a string, a boolean, a tag or the time is not the null the other
+  # numbers make of it: the engine cannot coerce it (verified, in either order).
+  defp combine(op, left, right)
+       when (left == :unsigned and right in @uncoercible) or
+              (right == :unsigned and left in @uncoercible),
+       do: throw({:coerce, left, op, right})
+
   defp combine(_op, left, right)
        when left not in @numbers or right not in @numbers,
        do: {:ok, :null}
@@ -377,16 +446,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   # ---------------------------------------------------------------------------
   # Calls
   # ---------------------------------------------------------------------------
-
-  @arrow %{
-    integer: "Int64",
-    float: "Float64",
-    string: "Utf8",
-    boolean: "Boolean",
-    tag: "Dictionary(Int32, Utf8)",
-    timestamp: "Timestamp(ns)",
-    null: "Float64"
-  }
 
   @native %{
     string: "String",

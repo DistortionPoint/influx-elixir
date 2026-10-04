@@ -18,9 +18,9 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   #
   # A type that is not known is `nil`, which is never refused.
 
-  alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLFunctions, SQLSelect}
+  alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLSelect}
 
-  import SQLFunctions, only: [is_numeric_type: 1]
+  import SQLExprType, only: [is_numeric_type: 1]
 
   @tag "Dictionary(Int32, Utf8)"
   @decimal "Decimal128(?)"
@@ -44,6 +44,35 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
         do: {name, type}
   end
 
+  @doc """
+  The types of the select items output as one of `names`, by that name; an item whose type
+  is not known is left out. A `HAVING` names such an item by its alias.
+  """
+  @spec output_types([SQLSelect.column()], [binary()], %{binary() => binary()}) :: %{
+          binary() => binary()
+        }
+  def output_types(select_columns, names, columns) do
+    for column <- select_columns,
+        name = output_name(column),
+        name in names,
+        type = result(column, columns),
+        into: %{},
+        do: {name, type}
+  end
+
+  @doc "The expressions the select items output as one of `names` read."
+  @spec output_arguments([SQLSelect.column()], [binary()]) :: [SQLExpr.t()]
+  def output_arguments(select_columns, names) do
+    for column <- select_columns, output_name(column) in names, arg <- argument(column), do: arg
+  end
+
+  # The name a select item is output as: the last element of each of its shapes.
+  @spec output_name(SQLSelect.column()) :: binary() | nil
+  defp output_name(column) do
+    name = elem(column, tuple_size(column) - 1)
+    if is_binary(name), do: name
+  end
+
   @spec result(SQLSelect.column(), %{binary() => binary()}) :: binary() | nil
   defp result({:count_star, _name}, _columns), do: "Int64"
   defp result({:count_distinct, _column, _name}, _columns), do: "Int64"
@@ -59,25 +88,32 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   defp result({:aggregate, :sum_distinct, expr, name}, columns),
     do: result({:aggregate, :sum, expr, name}, columns)
 
-  defp result({:aggregate, agg, expr, _name}, columns) do
-    kept(agg, SQLExprType.type_of(expr, columns))
-  end
+  defp result({:aggregate, agg, expr, _name}, columns),
+    do: kept(agg, SQLExprType.known_type(expr, columns))
 
   defp result({:ordered_aggregate, _end, field, _ordering, _name}, columns),
-    do: SQLFunctions.type_of({:field, field}, columns)
+    do: Map.get(columns, field)
 
   defp result({:selector, _selector, field, _ordering, :value, _name}, columns),
-    do: SQLFunctions.type_of({:field, field}, columns)
+    do: Map.get(columns, field)
 
   defp result({:selector, _selector, _field, _ordering, :time, _name}, _columns),
     do: "Timestamp(ns)"
 
   defp result({:selector, _selector, field, _ordering, :struct, _name}, columns) do
-    case SQLFunctions.type_of({:field, field}, columns) do
+    case Map.get(columns, field) do
       nil -> nil
       type -> ~s|Struct("value": #{type}, "time": Timestamp(ns))|
     end
   end
+
+  # An expression over aggregates (`sum(n) + 1`) has the type of its operators over the
+  # aggregates' results (an aggregate whose type is not known leaves the expression's so).
+  defp result({:expression, expr, aggs, _name}, columns),
+    do: SQLExprType.known_type(expr, Map.merge(columns, types(aggs, columns)))
+
+  defp result({:grouping_column, source, _name}, columns), do: Map.get(columns, source)
+  defp result(_other, _columns), do: nil
 
   @spec null_result(SQLSelect.aggregate()) :: binary() | nil
   defp null_result(agg) when agg in [:min, :max, :sum, :sum_distinct, :avg], do: nil
@@ -102,5 +138,7 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   defp argument({:count_distinct, column, _name}), do: [{:field, column}]
   defp argument({:ordered_aggregate, _end, field, _ordering, _name}), do: [{:field, field}]
   defp argument({:selector, _selector, field, _ordering, _kind, _name}), do: [{:field, field}]
+  defp argument({:grouping_column, source, _name}), do: [{:field, source}]
+  defp argument({:expression, _expr, aggs, _name}), do: arguments(aggs)
   defp argument(_other), do: []
 end

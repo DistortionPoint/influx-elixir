@@ -676,7 +676,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
       lower: Enum.max(plan.lowers, fn -> nil end),
       upper: Enum.min(plan.uppers, fn -> nil end),
       now: now,
-      fields: window_fields(table, database, query),
       types: types
     )
   end
@@ -748,18 +747,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     if query.measurement in Store.measurements(table, database),
       do: {:error, %{status: status, body: body}},
       else: :ok
-  end
-
-  # The field names a LIMIT or OFFSET counts per field, from the schema;
-  # a query without either does not read them.
-  @spec window_fields(Store.t(), binary(), InfluxQL.query()) :: [binary()] | nil
-  defp window_fields(_table, _database, %{limit: nil, offset: 0}), do: nil
-
-  defp window_fields(table, database, query) do
-    for {measurement, column, "iox::column_type::field::" <> _type} <-
-          Store.columns(table, database),
-        measurement == query.measurement,
-        do: column
   end
 
   # The WHERE as SQL (with its leading ` WHERE `, or nothing), the lower

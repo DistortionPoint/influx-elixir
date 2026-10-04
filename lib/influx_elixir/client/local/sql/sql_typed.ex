@@ -9,22 +9,23 @@ defmodule InfluxElixir.Client.Local.SQLTyped do
   # parts found, and so every node is typed once; typing a node from its whole tree is
   # quadratic in the length of a chain.
   #
-  # The list is the latest first and only its first `@window` nodes are looked in: the parts
-  # a node is typed from were checked just before it. A node not found is typed from its
-  # parts, which is the same answer found slower. The answer for a node depends only on the
-  # node and the columns' types, so a node is never wrong for being found by equality.
+  # The memo is a map keyed by the node itself, so a node is found exactly (never by its
+  # place in a list, and never missed for being far back): the type of a node depends only on
+  # the node and the types of the columns it is typed against, so a memo belongs to one set of
+  # column types and is never shared between two.
 
-  @window 256
+  @typedoc "Typed nodes and their types."
+  @type t :: %{optional(term()) => term()}
 
-  @typedoc "Typed nodes and their types, the latest first."
-  @type t :: [{term(), term()}]
+  @doc "A memo with no node typed."
+  @spec new() :: t()
+  def new, do: %{}
 
-  @doc "The type found for `node`, or `:error` when it was not typed lately."
+  @doc "The type found for `node`, or `:error` when it was not typed."
   @spec recall(t(), term()) :: {:ok, term()} | :error
-  def recall(typed, node), do: recall(typed, node, @window)
+  def recall(memo, node), do: Map.fetch(memo, node)
 
-  @spec recall(t(), term(), non_neg_integer()) :: {:ok, term()} | :error
-  defp recall([{node, type} | _rest], node, _budget), do: {:ok, type}
-  defp recall([_other | rest], node, budget) when budget > 0, do: recall(rest, node, budget - 1)
-  defp recall(_typed, _node, _budget), do: :error
+  @doc "The memo with `node` typed as `type`."
+  @spec put(t(), term(), term()) :: t()
+  def put(memo, node, type), do: Map.put(memo, node, type)
 end

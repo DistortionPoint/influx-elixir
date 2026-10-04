@@ -2269,6 +2269,21 @@ defmodule InfluxElixir.Contract.InfluxQLCallCases do
     ]
   end
 
+  @doc "The reason the double gives for each statement of `closed/0` (`Client.Local: <reason>`), where the engine breaks the connection."
+  @spec closed_reasons() :: %{binary() => binary()}
+  def closed_reasons do
+    %{
+      "SELECT last(s) FROM ~k1 WHERE time >= '2024-01-01T00:00:00Z' AND time < '2024-01-01T00:05:00Z' GROUP BY time(1m) fill(linear)" =>
+        "unsupported InfluxQL (fill(linear) on a string, boolean or time column)",
+      "SELECT count(c) FROM ~k1 WHERE host='c' AND time >= '2024-01-01T00:01:30Z' AND time < '2024-01-01T00:05:00Z' GROUP BY time(30s) fill(previous)" =>
+        "unsupported InfluxQL (fill(previous) with count() when the first bucket is empty)",
+      "SELECT mean(c), count(c) FROM ~k1 WHERE host='c' AND time >= '2024-01-01T00:01:30Z' AND time < '2024-01-01T00:05:00Z' GROUP BY time(30s) fill(previous)" =>
+        "unsupported InfluxQL (fill(previous) with count() when the first bucket is empty)",
+      "SELECT last(b) FROM ~k1 WHERE time >= '2024-01-01T00:00:00Z' AND time < '2024-01-01T00:05:00Z' GROUP BY time(1m) fill(linear)" =>
+        "unsupported InfluxQL (fill(linear) on a string, boolean or time column)"
+    }
+  end
+
   @spec at(integer()) :: integer()
   defp at(seconds), do: (@base + seconds) * 1_000_000_000
 end

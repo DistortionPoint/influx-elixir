@@ -37,19 +37,40 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
           Enum.join(List.duplicate("c > 0", count), " AND ") <> " ORDER BY host"
       end
 
-      {_warm, {:ok, rows}} =
-        reductions(fn -> Local.query_sql(conn, having.(1), database: "cost_db") end)
+      cost = fn count ->
+        {reductions, {:ok, kept}} =
+          reductions(fn -> Local.query_sql(conn, having.(count), database: "cost_db") end)
 
-      assert length(rows) === 5
+        assert length(kept) === 5
+        reductions
+      end
 
-      {one, _answer} =
-        reductions(fn -> Local.query_sql(conn, having.(1), database: "cost_db") end)
+      # Warm the caches the first query of a connection fills.
+      cost.(1)
 
-      {seven, {:ok, kept}} =
-        reductions(fn -> Local.query_sql(conn, having.(7), database: "cost_db") end)
+      one = cost.(1)
+      seven = cost.(7)
+      fourteen = cost.(14)
 
-      assert length(kept) === 5
-      assert seven < one * 1.5, "7 references cost #{seven} reductions, 1 cost #{one}"
+      # Each reference costs its own condition to evaluate, so the cost is a line in the
+      # number of references and is never flat. Two bounds tell that line from a re-read
+      # of the table's columns per reference (which is also a line, but a steep one):
+      #
+      # - the slope does not grow: the 7 references from 7 to 14 cost no more than 1.3
+      #   times the 6 from 1 to 7 (measured 1.10; the 7 over 6 references alone is 1.17,
+      #   so 1.3 leaves room for the noise of the reductions count and for nothing else);
+      # - a reference costs a small part of the whole query: under 15% of the cost of
+      #   one reference, which already reads the columns once (measured 5%), where a
+      #   re-read of 1500 rows would cost as much as that first read did.
+      added_first = seven - one
+      added_second = fourteen - seven
+
+      assert added_second <= added_first * 1.3,
+             "references 1/7/14 cost #{one}/#{seven}/#{fourteen} reductions"
+
+      assert added_first / 6 <= one * 0.15,
+             "references 1/7 cost #{one}/#{seven} reductions: a reference costs more than " <>
+               "a fraction of the columns' read"
     end
   end
 

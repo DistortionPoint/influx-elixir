@@ -319,8 +319,11 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     order_by =
       query.order_by
       |> Enum.map(fn
-        {{:expr, expr}, direction} -> {{:expr, output_items(expr, query)}, direction}
-        column -> column
+        {{:expr, expr}, direction} ->
+          {{:expr, SQLClauses.output_items(expr, query.projection_columns)}, direction}
+
+        column ->
+          column
       end)
       |> Enum.reject(fn
         {{:expr, expr}, _direction} -> SQLExpr.columns(expr) == []
@@ -329,21 +332,6 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
     %{query | order_by: order_by}
   end
-
-  # A name in an `ORDER BY` expression that is a select item's output name is
-  # that item, not a column of the table of the same name (verified:
-  # `SELECT i AS j ... ORDER BY j + 1` sorts by `i + 1`).
-  @spec output_items(SQLExpr.t(), SQLParser.parsed_query()) :: SQLExpr.t()
-  defp output_items({:field, name} = field, %{projection_columns: projection})
-       when is_binary(name) and is_list(projection) do
-    case List.keyfind(projection, name, 1) do
-      {source, ^name} when is_binary(source) -> {:field, source}
-      {expr, ^name} -> expr
-      nil -> field
-    end
-  end
-
-  defp output_items(expr, query), do: SQLExpr.map_children(expr, &output_items(&1, query))
 
   @spec filter([point()], [SQLParser.where_node()]) :: [point()]
   defp filter(points, conjunction), do: SQLBatch.filter(points, conjunction)
@@ -654,9 +642,15 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   defp apply_order_by_rows(rows, order_by, time_alias) do
     keys =
-      Enum.map(order_by, fn {column, direction} ->
-        key = if column == "time" and time_alias, do: time_alias, else: column
-        {&Map.get(&1, key), direction}
+      Enum.map(order_by, fn
+        # An expression is evaluated over the output row (a `SELECT DISTINCT` may order by one).
+        {{:expr, expr}, direction} ->
+          {&SQLEval.eval(expr, %{tags: %{}, fields: &1, timestamp: nil, measurement: ""}),
+           direction}
+
+        {column, direction} ->
+          key = if column == "time" and time_alias, do: time_alias, else: column
+          {&Map.get(&1, key), direction}
       end)
 
     SQLSort.sort_by_keys(rows, keys)

@@ -42,17 +42,7 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   @spec bind(SQLParser.parsed_query(), %{binary() => term()}) ::
           {:ok, SQLParser.parsed_query()} | {:error, map()}
   def bind(query, params) do
-    parts = [
-      query.projection_columns,
-      query.select_columns,
-      query.having,
-      query.where,
-      query.order_by,
-      query.limit,
-      query.offset
-    ]
-
-    case placeholders(parts) do
+    case placeholders(plan_order(query)) do
       [] ->
         {:ok, query}
 
@@ -77,6 +67,38 @@ defmodule InfluxElixir.Client.Local.SQLBind do
         end
     end
   end
+
+  # The parts of a query that may hold a `$name`, in the order the engine meets them: it
+  # replaces the placeholders of the plan from the scan up (verified against Core, each pair
+  # of clauses): the `WHERE`, the arguments of the aggregates, the `HAVING`, the select list,
+  # the `ORDER BY`, then `OFFSET`, and `LIMIT` last.
+  @spec plan_order(SQLParser.parsed_query()) :: [term()]
+  defp plan_order(query) do
+    columns = List.wrap(query.select_columns)
+    having = query.having || %{nodes: [], aggs: []}
+
+    [
+      query.where,
+      Enum.flat_map(columns, &aggregate_part/1),
+      having.aggs,
+      having.nodes,
+      query.projection_columns,
+      Enum.flat_map(columns, &projected_part/1),
+      query.order_by,
+      query.offset,
+      query.limit
+    ]
+  end
+
+  @spec aggregate_part(SQLSelect.column()) :: [term()]
+  defp aggregate_part({:aggregate, _agg, _expr, _output} = column), do: [column]
+  defp aggregate_part({:expression, _expr, aggs, _output}), do: [aggs]
+  defp aggregate_part(_column), do: []
+
+  @spec projected_part(SQLSelect.column()) :: [term()]
+  defp projected_part({:expression, expr, _aggs, _output}), do: [expr]
+  defp projected_part({:aggregate, _agg, _expr, _output}), do: []
+  defp projected_part(column), do: [column]
 
   # Every `$name` in a term, in order.
   @spec placeholders(term()) :: [binary()]

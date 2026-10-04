@@ -33,17 +33,16 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   # argument are the engine's 405.
 
   alias InfluxElixir.Client.Local.{
-    SQLCast,
     SQLError,
+    SQLExprType,
     SQLLimits,
     SQLNativeType,
-    SQLNullType,
     SQLNumber,
-    SQLParser,
     SQLScalar,
-    SQLScalarCheck,
-    SQLTyped
+    SQLScalarCheck
   }
+
+  import SQLExprType, only: [is_numeric_type: 1]
 
   require SQLLimits
 
@@ -59,10 +58,6 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
     "coalesce" => :coalesce,
     "nullif" => :nullif
   }
-
-  @doc "Whether an Arrow type name is one of the engine's numeric types."
-  defguard is_numeric_type(type)
-           when type in ["Int64", "UInt64", "Float64", "Decimal128(?)", "Int32", "Int16", "Int8"]
 
   @integer_types ["Int64", "Int32", "Int16", "Int8"]
   @scale_types ["Null" | @integer_types]
@@ -351,93 +346,4 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
     do: "\ttrunc(Float32, Int64)\n\ttrunc(Float64, Int64)\n\ttrunc(Float64)\n\ttrunc(Float32)"
 
   defp candidates(name), do: "\t#{name}(Float64/Float32)"
-
-  @doc """
-  The Arrow type an expression has, given the columns' types, or `nil`
-  when it cannot be known.
-  """
-  @spec type_of(SQLParser.expr(), %{binary() => binary()}) :: binary() | nil
-  def type_of(expr, columns), do: type_of(expr, columns, [])
-
-  # The expression's calls that `SQLExprType` types itself, which a type found by it is for.
-  @expr_typed [:coalesce, :nullif, :greatest, :least]
-
-  @doc """
-  `type_of/2` with the nodes `known` to be typed already (see `InfluxElixir.Client.Local.SQLTyped`),
-  which are not typed again. A call `SQLExprType` types on its own is not taken from there.
-  """
-  @spec type_of(SQLParser.expr(), %{binary() => binary()}, SQLTyped.t()) :: binary() | nil
-  def type_of(expr, columns, known)
-      when known != [] and is_tuple(expr) and tuple_size(expr) > 0 do
-    if recallable?(expr) do
-      case SQLTyped.recall(known, expr) do
-        {:ok, type} -> type
-        :error -> node_type(expr, columns, known)
-      end
-    else
-      node_type(expr, columns, known)
-    end
-  end
-
-  def type_of(expr, columns, known), do: node_type(expr, columns, known)
-
-  @spec recallable?(tuple()) :: boolean()
-  defp recallable?({kind, _inner}) when kind in [:neg, :pos], do: true
-  defp recallable?({:op, _op, _left, _right}), do: true
-  defp recallable?({:call, name, _args}), do: name not in @expr_typed
-  defp recallable?(_other), do: false
-
-  @doc """
-  The type of the node from the types of its parts, without looking for the node itself.
-  """
-  @spec node_type(SQLParser.expr(), %{binary() => binary()}, SQLTyped.t()) :: binary() | nil
-  def node_type({:field, ref}, columns, _known), do: Map.get(columns, ref)
-  def node_type({:lit, value}, _columns, _known) when is_integer(value), do: "Int64"
-  def node_type({:lit, value}, _columns, _known) when is_float(value), do: "Float64"
-  def node_type({:lit, value}, _columns, _known) when value in [:inf, :neg_inf], do: "Float64"
-  def node_type({:lit, value}, _columns, _known) when is_binary(value), do: "Utf8"
-  def node_type({:lit, value}, _columns, _known) when is_boolean(value), do: "Boolean"
-  def node_type({:uint, _value}, _columns, _known), do: "UInt64"
-  def node_type({:uint_col, _name}, _columns, _known), do: "UInt64"
-  def node_type({:neg, inner}, columns, known), do: type_of(inner, columns, known)
-  def node_type({:pos, inner}, columns, known), do: type_of(inner, columns, known)
-  def node_type({:cast, _inner, type}, _columns, _known), do: SQLCast.arrow_type(type)
-  def node_type({:call, :abs, [arg]}, columns, known), do: type_of(arg, columns, known)
-
-  def node_type({:call, name, args}, columns, known) do
-    if SQLScalar.function?(name),
-      do: SQLScalar.type_of(name, Enum.map(args, &type_of(&1, columns, known))),
-      else: "Float64"
-  end
-
-  # The null beside a number is typed as the number (`NULL + NULL` is an `Int64`).
-  def node_type({:op, op, left, right}, columns, known) do
-    case {operand_type(left, columns, known), operand_type(right, columns, known)} do
-      {left_type, right_type} when is_numeric_type(left_type) and is_numeric_type(right_type) ->
-        SQLNumber.result_type(left_type, right_type)
-
-      {left_type, right_type} when left_type == "Null" or right_type == "Null" ->
-        case SQLNullType.arithmetic(op, left_type || :unknown, right_type || :unknown) do
-          :unknown -> nil
-          type -> type
-        end
-
-      _not_arithmetic ->
-        nil
-    end
-  end
-
-  def node_type(_other, _columns, _known), do: nil
-
-  @spec operand_type(SQLParser.expr(), %{binary() => binary()}, SQLTyped.t()) :: binary() | nil
-  defp operand_type({:lit, nil}, _columns, _known), do: "Null"
-
-  defp operand_type({kind, inner}, columns, known) when kind in [:neg, :pos],
-    do:
-      if(operand_type(inner, columns, known) == "Null",
-        do: "Null",
-        else: type_of(inner, columns, known)
-      )
-
-  defp operand_type(expr, columns, known), do: type_of(expr, columns, known)
 end

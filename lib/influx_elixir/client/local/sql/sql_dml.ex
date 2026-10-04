@@ -11,11 +11,14 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   #     there; over one that is, with a column list of columns it has (the first that it has
   #     not is `Schema error: No field named <column>`), or with no list and `VALUES` rows of
   #     numbers (a row of the wrong length is `Inconsistent data length across values list`)
-  #   * `UPDATE name [[AS] alias] SET column = operand [, ...] [WHERE operand = operand]`
-  #     (an operand is a number, a string, a name, or `abs` of a number or a numeric column)
-  #     over a table that is not there; over one that is, when every column the statement
-  #     reads is one it has. Any other update (a subquery, `CASE`, `CAST`, an operator, a
-  #     clause after the assignments) is refused by name
+  #   * `UPDATE name [[AS] alias] SET column = operand [, ...] [WHERE operand] [RETURNING ..]
+  #     [LIMIT ..]`: the parser reads it (`SQLDmlExpr`) and the planner's steps are followed
+  #     in their order (see UPDATE below): the targets, the names and calls of the `WHERE`,
+  #     each value's names, types and conversion to its column's type. A shape of operand
+  #     that was not verified (a subquery, `CASE`, an interval, a function the double does
+  #     not know) is refused by name
+  #   * a leading `;` is read as the engine reads it: an empty statement before the one
+  #     that follows
   #   * the parser's own errors for a statement that stops short (`UPDATE name`,
   #     `INSERT INTO name (a)`, `INSERT INTO name VALUES`) or goes on with a word it does
   #     not read
@@ -23,37 +26,53 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   # The schema of the name decides little: `iox` is the database, any other schema has no
   # table.
 
-  alias InfluxElixir.Client.Local.{SQLDdl, SQLError, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{
+    SQLDdl,
+    SQLDmlExpr,
+    SQLDmlName,
+    SQLDmlOperand,
+    SQLError,
+    SQLTokenizer
+  }
 
   @sources ~w(VALUES SELECT WITH)
-  # Words the update's shape never reads as a name or a function (the double has not seen
-  # what the engine makes of one there).
-  @reserved ~w(SET WHERE AND OR NOT NULL TRUE FALSE IS IN BETWEEN LIKE ILIKE AS SELECT FROM CASE
-               WHEN THEN ELSE END CAST TRY_CAST INTERVAL RETURNING LIMIT OFFSET ORDER GROUP BY
-               HAVING FOR UNION EXCEPT INTERSECT JOIN ON USING WITH VALUES DISTINCT ALL ANY SOME
-               EXISTS DEFAULT UPDATE INSERT DELETE INTO CROSS INNER LEFT RIGHT FULL NATURAL
-               OUTER LATERAL WINDOW OVER FILTER ESCAPE SIMILAR ASC DESC NULLS TABLE ARRAY ROW
-               UNNEST CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP EXTRACT
-               POSITION SUBSTRING TRIM OVERLAY COLLATE AT ZONE)
-
-  @typep assigned :: {[binary()], [read()]}
-  @typep read :: [binary()] | {:numeric, [binary()]}
   @query_body "SELECT, VALUES, or a subquery in the query body"
 
   @typep token :: SQLTokenizer.token()
-  @typep columns_of :: (binary() | {:numeric, binary()} -> [binary()])
+
+  @typedoc """
+  Gives a table's columns (sorted, `time` among them), `{:types, table}` their Arrow types.
+  """
+  @type columns_of :: (binary() | {:types, binary()} -> [binary()] | [{binary(), binary()}])
+
+  @typedoc "Plans an operand as a select item of the table, the errors it has there."
+  @type planner :: (binary(), binary() -> :ok | {:error, term()} | {:refuse, binary()})
+
+  @typep env :: %{columns_of: columns_of(), planner: planner()}
 
   @doc """
   The planner's error for an `INSERT` or an `UPDATE`, given the names of the database's
-  tables and a function giving a table's columns (sorted, `time` among them), or a refusal
-  by name for a shape that was not verified.
+  tables, a function giving a table's columns and a function planning an operand as a select
+  item, or a refusal by name for a shape that was not verified.
   """
-  @spec error(:insert | :update, binary(), [binary()], columns_of()) :: SQLError.t() | map()
-  def error(kind, statement, tables, columns_of) do
-    case SQLTokenizer.tokenize(statement) do
-      {:ok, tokens} -> answer(kind, split_end(tokens), tables, columns_of)
+  @spec error(:insert | :update, binary(), [binary()], columns_of(), planner()) ::
+          SQLError.t() | map()
+  def error(kind, statement, tables, columns_of, planner) do
+    env = %{columns_of: columns_of, planner: planner}
+
+    case SQLTokenizer.tokenize(without_leading_semicolons(statement)) do
+      {:ok, tokens} -> answer(kind, split_end(tokens), tables, env)
       :bail -> not_modelled(kind, "a statement the tokenizer does not read")
     end
+  end
+
+  # The empty statements before the statement are blanked, so that the line and column of
+  # what it says stay those of the text (the tokenizer ends a text at its first `;`).
+  @spec without_leading_semicolons(binary()) :: binary()
+  defp without_leading_semicolons(statement) do
+    [leading] = Regex.run(~r/\A[\s;]*/u, statement)
+    size = byte_size(leading)
+    String.replace(leading, ";", " ") <> binary_part(statement, size, byte_size(statement) - size)
   end
 
   # The statement's tokens and the token that ends it (its `;`, or the end of the text).
@@ -65,16 +84,16 @@ defmodule InfluxElixir.Client.Local.SQLDml do
     end
   end
 
-  @spec answer(:insert | :update, {[token()], token()}, [binary()], columns_of()) ::
+  @spec answer(:insert | :update, {[token()], token()}, [binary()], env()) ::
           SQLError.t() | map()
-  defp answer(:insert, {[_insert, {:word, _p, "INTO", _l, _c} | rest], stop}, tables, cols),
-    do: insert(rest, stop, tables, cols)
+  defp answer(:insert, {[_insert, {:word, _p, "INTO", _l, _c} | rest], stop}, tables, env),
+    do: insert(rest, stop, tables, env.columns_of)
 
-  defp answer(:insert, {[_insert | rest], stop}, tables, cols),
-    do: insert(rest, stop, tables, cols)
+  defp answer(:insert, {[_insert | rest], stop}, tables, env),
+    do: insert(rest, stop, tables, env.columns_of)
 
-  defp answer(:update, {[_update | rest], stop}, tables, cols),
-    do: update(rest, stop, tables, cols)
+  defp answer(:update, {[_update | rest], stop}, tables, env),
+    do: update(rest, stop, tables, env)
 
   # ---------------------------------------------------------------------------
   # INSERT
@@ -108,70 +127,94 @@ defmodule InfluxElixir.Client.Local.SQLDml do
     do: source_error(source) || not_found(name)
 
   defp inserted({:found, table}, listed, source, tables, columns_of) do
+    columns = columns_of.(table)
+
     cond do
       error = source_error(source) -> error
       table not in tables -> not_found(table)
-      listed == nil -> inserted_values(table, source, columns_of.(table))
-      true -> known_columns(listed, columns_of.(table))
+      listed == nil -> inserted_values(source, length(columns), false)
+      true -> unknown_column(listed, columns) || inserted_values(source, length(listed), true)
     end
   end
 
-  # An insert with no column list is read by the length of its rows.
-  @spec inserted_values(binary(), [token()], [binary()]) :: SQLError.t() | map()
-  defp inserted_values(_table, [{:word, _p, "VALUES", _l, _c} | rows], columns) do
-    case row_lengths(rows) do
+  # The rows of a `VALUES` are counted against the columns listed, or against the table's when
+  # none are; a query as the source is not read (a table with a list takes it, one without is
+  # not modelled).
+  @spec inserted_values([token()], non_neg_integer(), boolean()) :: SQLError.t() | map()
+  defp inserted_values([{:word, _p, "VALUES", _l, _c} | rows], expected, _listed?) do
+    case row_lengths(rows, []) do
       {:ok, lengths} ->
-        case Enum.find_index(lengths, &(&1 != length(columns))) do
+        case Enum.find_index(lengths, &(&1 != expected)) do
           nil ->
             dml(:insert)
 
           row ->
             SQLError.planning(
               "Inconsistent data length across values list: got #{Enum.at(lengths, row)} " <>
-                "values in row #{row} but expected #{length(columns)}"
+                "values in row #{row} but expected #{expected}"
             )
         end
 
       :error ->
-        not_modelled(
-          :insert,
-          "values that are not numbers or strings into a table with no column list"
-        )
+        not_modelled(:insert, "values the double cannot count")
     end
   end
 
-  defp inserted_values(_table, _source, _columns),
+  defp inserted_values(_source, _expected, true), do: dml(:insert)
+
+  defp inserted_values(_source, _expected, false),
     do: not_modelled(:insert, "no column list over a query into a table")
 
-  # The number of values of each `VALUES` row, when every value is a number.
-  @spec row_lengths([token()]) :: {:ok, [pos_integer()]} | :error
-  defp row_lengths(tokens), do: row_lengths(tokens, [])
-
+  # The number of values of each `VALUES` row (the commas of its top level, plus one).
+  @spec row_lengths([token()], [pos_integer()]) :: {:ok, [pos_integer()]} | :error
   defp row_lengths([], found), do: {:ok, Enum.reverse(found)}
 
   defp row_lengths([{:symbol, "(", _u, _l, _c} | rest], found) do
-    case Enum.split_while(rest, &(not match?({:symbol, ")", _u, _l, _c}, &1))) do
-      {inside, [_close | more]} -> row(inside, more, found)
-      {_inside, []} -> :error
+    with {:ok, inside, more} <- group(rest, 0, []),
+         {:ok, count} <- value_count(inside) do
+      case more do
+        [{:symbol, ",", _u2, _l2, _c2} | next] -> row_lengths(next, [count | found])
+        [] -> row_lengths([], [count | found])
+        _other -> :error
+      end
     end
   end
 
   defp row_lengths(_tokens, _found), do: :error
 
-  @spec row([token()], [token()], [pos_integer()]) :: {:ok, [pos_integer()]} | :error
-  defp row(inside, more, found) do
-    values = Enum.reject(inside, &match?({:symbol, ",", _u, _l, _c}, &1))
+  # The tokens up to the parenthesis that closes a group, and those after it.
+  @spec group([token()], non_neg_integer(), [token()]) :: {:ok, [token()], [token()]} | :error
+  defp group([], _depth, _found), do: :error
+  defp group([{:symbol, ")", _u, _l, _c} | rest], 0, found), do: {:ok, Enum.reverse(found), rest}
 
-    if inside != [] and Enum.all?(values, &(elem(&1, 0) in [:number, :string])) and
-         length(inside) == 2 * length(values) - 1 do
-      case more do
-        [{:symbol, ",", _u, _l, _c} | next] -> row_lengths(next, [length(values) | found])
-        [] -> row_lengths([], [length(values) | found])
-        _other -> :error
-      end
-    else
-      :error
-    end
+  defp group([{:symbol, ")", _u, _l, _c} = token | rest], depth, found),
+    do: group(rest, depth - 1, [token | found])
+
+  defp group([{:symbol, "(", _u, _l, _c} = token | rest], depth, found),
+    do: group(rest, depth + 1, [token | found])
+
+  defp group([token | rest], depth, found), do: group(rest, depth, [token | found])
+
+  # The values of a row: split at the commas outside parentheses, none of them empty.
+  @spec value_count([token()]) :: {:ok, pos_integer()} | :error
+  defp value_count(inside) do
+    {values, last, _depth} =
+      Enum.reduce(inside, {[], [], 0}, fn
+        {:symbol, "(", _u, _l, _c} = token, {values, current, depth} ->
+          {values, [token | current], depth + 1}
+
+        {:symbol, ")", _u, _l, _c} = token, {values, current, depth} ->
+          {values, [token | current], depth - 1}
+
+        {:symbol, ",", _u, _l, _c}, {values, current, 0} ->
+          {[current | values], [], 0}
+
+        token, {values, current, depth} ->
+          {values, [token | current], depth}
+      end)
+
+    all = [last | values]
+    if Enum.any?(all, &(&1 == [])), do: :error, else: {:ok, length(all)}
   end
 
   # The columns an insert lists: `nil` for none, and the tokens after them. A parenthesis
@@ -209,6 +252,14 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   defp source_read([{:word, _p, "VALUES", _l, _c}], stop),
     do: {:error, SQLDdl.expected("(", stop)}
 
+  # A comma that nothing follows wants another row.
+  defp source_read([{:word, _p, "VALUES", _l, _c} | rows], stop) do
+    case List.last(rows) do
+      {:symbol, ",", _u, _l2, _c2} -> {:error, SQLDdl.expected("(", stop)}
+      _row -> :ok
+    end
+  end
+
   defp source_read([{:word, _p, upper, _l, _c} | _rest], _stop) when upper in @sources, do: :ok
   defp source_read([{:symbol, "(", _u, _l, _c} | _rest], _stop), do: :ok
 
@@ -233,221 +284,167 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   # UPDATE
   # ---------------------------------------------------------------------------
 
-  @spec update([token()], token(), [binary()], columns_of()) :: SQLError.t() | map()
-  defp update(tokens, stop, tables, columns_of) do
+  # What the planner does with `UPDATE table [alias] SET target = operand, ... [WHERE operand]`
+  # (verified against InfluxDB 3 Core, in this order):
+  #
+  #   1. the parser reads the statement (`SQLDmlExpr`); a `RETURNING` clause and then a `LIMIT`
+  #      clause are refused, before the table is looked up
+  #   2. the table is looked up (a name of more than three parts is an error of its own)
+  #   3. every target is checked, in order, against the table's columns by its last name
+  #      (`a.b.c.d.n` assigns `n`), spelled exactly as written: `USAGE` is not `usage`. The
+  #      fields it lists are qualified by the table as written, not by the alias
+  #   4. the `WHERE` is planned (`SQLDmlOperand`)
+  #   5. the value of each column that is assigned, in the order of the table's columns (the last
+  #      of two assignments to a column wins) is planned, and converted to the column's type
+  #
+  # and then `DML not supported: Update`.
+
+  @spec update([token()], token(), [binary()], env()) :: SQLError.t() | map()
+  defp update(
+         [{:word, _p, "OR", _l, _c}, {:word, _p2, conflict, _l2, _c2} | rest],
+         stop,
+         tables,
+         env
+       )
+       when conflict in ~w(REPLACE IGNORE ABORT ROLLBACK FAIL),
+       do: update(rest, stop, tables, env, true)
+
+  defp update(tokens, stop, tables, env), do: update(tokens, stop, tables, env, false)
+
+  @spec update([token()], token(), [binary()], env(), boolean()) :: SQLError.t() | map()
+  defp update(tokens, stop, tables, env, conflict?) do
     with {:ok, reference, rest} <- reference(tokens),
-         {:ok, alias_name, rest} <- alias_name(rest, stop),
-         {:ok, assignments} <- set(rest, stop),
-         {:ok, assigned} <- assigned(assignments),
-         {:ok, table} <- resolve(reference, tables) do
-      updated(table, alias_name, assigned, tables, columns_of)
+         {:ok, clauses} <- SQLDmlExpr.clauses(rest ++ [stop]) do
+      cond do
+        clauses.returning -> SQLError.planning("Update-returning clause not yet supported")
+        conflict? -> SQLError.planning("ON conflict not supported")
+        clauses.limit -> limit_error()
+        true -> updated(reference, clauses, tables, env)
+      end
     else
       {:error, error} -> error
       {:refuse, why} -> not_modelled(:update, why)
     end
   end
 
-  # `[AS] alias` before `SET`.
-  @spec alias_name([token()], token()) ::
-          {:ok, binary() | nil, [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
-  defp alias_name([{:word, _p, "SET", _l, _c} | _rest] = tokens, _stop), do: {:ok, nil, tokens}
+  @spec limit_error() :: map()
+  defp limit_error,
+    do: %{status: 405, body: "This feature is not implemented: Update-limit clause not supported"}
 
-  defp alias_name([{:word, _p, "AS", _l, _c}, {:word, printed, upper, _l2, _c2} | rest], _stop)
-       when upper not in @reserved,
-       do: {:ok, String.downcase(printed), rest}
+  @spec updated([binary()], SQLDmlExpr.clauses(), [binary()], env()) :: SQLError.t() | map()
+  defp updated(reference, clauses, tables, env) do
+    case resolve(reference, tables) do
+      {:ok, {:missing, name}} ->
+        not_found(name)
 
-  defp alias_name([{:word, printed, upper, _l, _c} | rest], _stop) when upper not in @reserved,
-    do: {:ok, String.downcase(printed), rest}
+      {:ok, {:found, table}} ->
+        cond do
+          table not in tables -> not_found(table)
+          clauses.from -> not_modelled(:update, "an update with a FROM clause")
+          true -> updated_table(table, reference, clauses, env)
+        end
 
-  defp alias_name([{:word, _p, _upper, _l, _c} | _rest], _stop),
-    do: {:refuse, "an alias that is one of SQL's own words"}
+      {:error, error} ->
+        error
 
-  defp alias_name([token | _rest], _stop), do: {:error, SQLDdl.expected("SET", token)}
-  defp alias_name([], stop), do: {:error, SQLDdl.expected("SET", stop)}
-
-  @spec set([token()], token()) :: {:ok, [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
-  defp set([{:word, _p, "SET", _l, _c}], stop), do: {:error, SQLDdl.expected("identifier", stop)}
-  defp set([{:word, _p, "SET", _l, _c} | assignments], _stop), do: {:ok, assignments}
-  defp set([token | _rest], _stop), do: {:error, SQLDdl.expected("SET", token)}
-  defp set([], stop), do: {:error, SQLDdl.expected("SET", stop)}
-
-  @spec updated(
-          {:found, binary()} | {:missing, binary()},
-          binary() | nil,
-          assigned(),
-          [binary()],
-          columns_of()
-        ) :: SQLError.t() | map()
-  defp updated({:missing, name}, _alias, _assigned, _tables, _columns_of), do: not_found(name)
-
-  defp updated({:found, table}, alias_name, assigned, tables, columns_of) do
-    if table in tables,
-      do: updated_columns(table, alias_name, assigned, columns_of),
-      else: not_found(table)
+      {:refuse, why} ->
+        not_modelled(:update, why)
+    end
   end
 
-  # An update of a table that is there: the columns it assigns and the names it reads must
-  # be the table's. An assignment's target is its last name (`main.v` and `zzz.v` assign `v`).
-  @spec updated_columns(binary(), binary() | nil, assigned(), columns_of()) ::
-          SQLError.t() | map()
-  defp updated_columns(table, alias_name, {targets, reads}, columns_of) do
-    qualifiers = Enum.reject([table, alias_name], &is_nil/1)
+  @spec updated_table(binary(), [binary()], SQLDmlExpr.clauses(), env()) :: SQLError.t() | map()
+  defp updated_table(table, reference, clauses, env) do
+    columns = env.columns_of.(table)
+    relation = if clauses.alias, do: [clauses.alias], else: reference
 
-    case read_columns(reads, qualifiers) do
-      {:ok, read} -> unknown_column(read, targets, table, alias_name, columns_of)
+    ctx = %{
+      table: table,
+      columns: columns,
+      types: Map.new(env.columns_of.({:types, table})),
+      relation: relation,
+      relation_text: Enum.map_join(relation, ".", &SQLDmlName.quote_name/1),
+      planner: env.planner
+    }
+
+    with :ok <- targets(clauses.assignments, reference, columns),
+         :ok <- where(clauses.where, ctx),
+         :ok <- values(clauses.assignments, ctx) do
+      dml(:update)
+    else
+      {:error, error} -> error
       {:refuse, why} -> not_modelled(:update, why)
     end
   end
 
-  @spec unknown_column(
-          [{binary(), boolean(), boolean()}],
-          [binary()],
-          binary(),
-          binary() | nil,
-          columns_of()
-        ) :: SQLError.t() | map()
-  defp unknown_column(read, targets, table, alias_name, columns_of) do
-    columns = columns_of.(table)
+  # The target of each assignment, by the last name it is written with.
+  @spec targets([{[SQLDmlExpr.name()] | :tuple, SQLDmlExpr.ast()}], [binary()], [binary()]) ::
+          SQLDmlOperand.check()
+  defp targets(assignments, reference, columns) do
+    qualifier = Enum.map_join(reference, ".", &SQLDmlName.quote_name/1)
 
-    unknown =
-      Enum.find(Enum.map(targets, &{&1, false, false}) ++ read, fn {name, _qualified, _num} ->
-        name not in columns
-      end)
+    Enum.reduce_while(assignments, :ok, fn
+      {:tuple, _value}, :ok ->
+        {:halt, {:error, SQLError.planning("Tuples are not supported")}}
 
-    case unknown do
-      nil -> numbers(read, table, columns_of)
-      {name, false, _num} when alias_name == nil -> no_field(name, table, columns)
-      _qualified_or_aliased -> not_modelled(:update, "a column the table lacks, through a name")
-    end
+      {names, _value}, :ok ->
+        {name, _quoted} = List.last(names)
+
+        if name in columns,
+          do: {:cont, :ok},
+          else: {:halt, {:error, no_target(name, qualifier, columns)}}
+    end)
   end
 
-  # `abs` is verified on a number; of a column that is not one the engine says so in words
-  # the double has not read.
-  @spec numbers([{binary(), boolean(), boolean()}], binary(), columns_of()) ::
-          SQLError.t() | map()
-  defp numbers(read, table, columns_of) do
-    numeric = columns_of.({:numeric, table})
+  @spec no_target(binary(), binary(), [binary()]) :: map()
+  defp no_target(name, qualifier, columns),
+    do: SQLDmlName.no_field(SQLDmlName.quote_ident(name), name, qualifier, columns)
 
-    if Enum.all?(read, fn {name, _qualified, must} -> not must or name in numeric end),
-      do: dml(:update),
-      else: not_modelled(:update, "abs of a column that is not a number")
+  @spec where(SQLDmlExpr.ast() | nil, SQLDmlOperand.ctx()) :: SQLDmlOperand.check()
+  defp where(nil, _ctx), do: :ok
+
+  defp where(predicate, ctx) do
+    with :ok <- SQLDmlOperand.eager(predicate, ctx),
+         :ok <- SQLDmlOperand.lazy(predicate, ctx),
+         do: SQLDmlOperand.predicate(predicate, ctx)
   end
 
-  defp read_parts({:numeric, parts}), do: parts
-  defp read_parts(parts), do: parts
+  # The value assigned to each column, in the order of the table's columns.
+  @spec values([{[SQLDmlExpr.name()] | :tuple, SQLDmlExpr.ast()}], SQLDmlOperand.ctx()) ::
+          SQLDmlOperand.check()
+  defp values(assignments, ctx) do
+    assigned =
+      Map.new(assignments, fn {names, value} -> {names |> List.last() |> elem(0), value} end)
 
-  defp numeric?({:numeric, _parts}), do: true
-  defp numeric?(_parts), do: false
+    columns = Enum.filter(ctx.columns, &is_map_key(assigned, &1))
 
-  # The columns a statement reads, each with whether it was written through a relation: a
-  # name before a `.` is that relation, which must be the table or its alias.
-  @spec read_columns([read()], [binary()]) ::
-          {:ok, [{binary(), boolean(), boolean()}]} | {:refuse, binary()}
-  defp read_columns(reads, qualifiers) do
-    Enum.reduce_while(reads, {:ok, []}, fn read, {:ok, found} ->
-      {relations, [name]} = read |> read_parts() |> Enum.split(-1)
+    columns
+    |> Enum.reduce_while(:ok, fn column, :ok ->
+      value = Map.fetch!(assigned, column)
 
-      if Enum.all?(relations, &(&1 in qualifiers)),
-        do: {:cont, {:ok, [{name, relations != [], numeric?(read)} | found]}},
-        else: {:halt, {:refuse, "a column read through a relation that is not the table"}}
+      with :ok <- SQLDmlOperand.eager(value, ctx),
+           :ok <- SQLDmlOperand.lazy(value, ctx),
+           :ok <- SQLDmlOperand.value(value, column, ctx) do
+        {:cont, :ok}
+      else
+        failure -> {:halt, failure}
+      end
     end)
     |> case do
-      {:ok, found} -> {:ok, Enum.reverse(found)}
-      refusal -> refusal
+      :ok -> deep_values(columns, assigned, ctx)
+      failure -> failure
     end
   end
 
-  # The assignments of an update, of the one shape that was verified:
-  #
-  #     name[.name[.name]] = operand [, ...] [WHERE operand = operand]
-  #
-  # where an operand is a number, a string, a name of up to three parts, or a call of a
-  # function on such operands. Anything else (a subquery, `CASE`, `CAST`, `::`, an
-  # interval, an operator, `FROM`, `RETURNING`, a clause after the `WHERE`) is refused by
-  # name: it was not verified, and a word the shape does not read is not a column.
-  @spec assigned([token()]) :: {:ok, assigned()} | {:refuse, binary()}
-  defp assigned(tokens), do: assignments(tokens, [], [])
-
-  @spec assignments([token()], [binary()], [read()]) ::
-          {:ok, assigned()} | {:refuse, binary()}
-  defp assignments(tokens, targets, reads) do
-    with {:ok, target, rest} <- name_parts(tokens),
-         [{:symbol, "=", _u, _l, _c} | rest] <- rest,
-         {:ok, found, rest} <- operand(rest) do
-      targets = [List.last(target) | targets]
-      reads = Enum.reverse(found, reads)
-
-      case rest do
-        [] -> {:ok, {Enum.reverse(targets), Enum.reverse(reads)}}
-        [{:symbol, ",", _u, _l, _c} | more] -> assignments(more, targets, reads)
-        [{:word, _p, "WHERE", _l, _c} | condition] -> where(condition, targets, reads)
-        _other -> {:refuse, "an update with more than assignments and one equality"}
+  # What typing the top of each value did not reach, as the projection of the update finds it.
+  @spec deep_values([binary()], map(), SQLDmlOperand.ctx()) :: SQLDmlOperand.check()
+  defp deep_values(columns, assigned, ctx) do
+    Enum.reduce_while(columns, :ok, fn column, :ok ->
+      case SQLDmlOperand.deep(Map.fetch!(assigned, column), ctx) do
+        :ok -> {:cont, :ok}
+        failure -> {:halt, failure}
       end
-    else
-      {:refuse, _why} = refusal -> refusal
-      _other -> {:refuse, "an assignment of anything but `column = operand`"}
-    end
+    end)
   end
-
-  @spec where([token()], [binary()], [read()]) :: {:ok, assigned()} | {:refuse, binary()}
-  defp where(tokens, targets, reads) do
-    with {:ok, left, rest} <- operand(tokens),
-         [{:symbol, "=", _u, _l, _c} | rest] <- rest,
-         {:ok, right, []} <- operand(rest) do
-      {:ok, {Enum.reverse(targets), Enum.reverse(reads, left ++ right)}}
-    else
-      {:refuse, _why} = refusal -> refusal
-      _other -> {:refuse, "a WHERE of anything but one equality of operands"}
-    end
-  end
-
-  # An operand: the names it reads (each as its parts), and the tokens after it.
-  @spec operand([token()]) ::
-          {:ok, [read()], [token()]} | {:refuse, binary()}
-  defp operand([{kind, _p, _u, _l, _c} | rest]) when kind in [:number, :string],
-    do: {:ok, [], rest}
-
-  # The one call that was verified: `abs` of a number, or of a column (which must be a number).
-  defp operand([{:word, _p, "ABS", _l, _c}, {:symbol, "(", _u, _l2, _c2} | rest]) do
-    case rest do
-      [{:number, _p2, _u2, _l3, _c3}, {:symbol, ")", _u3, _l4, _c4} | more] ->
-        {:ok, [], more}
-
-      _name ->
-        case name_parts(rest) do
-          {:ok, parts, [{:symbol, ")", _u2, _l3, _c3} | more]} -> {:ok, [{:numeric, parts}], more}
-          _other -> {:refuse, "abs of anything but a number or a column"}
-        end
-    end
-  end
-
-  defp operand([{:word, _p, _upper, _l, _c}, {:symbol, "(", _u, _l2, _c2} | _rest]),
-    do: {:refuse, "a call of a function other than abs"}
-
-  defp operand(tokens) do
-    with {:ok, parts, rest} <- name_parts(tokens), do: {:ok, [parts], rest}
-  end
-
-  # `name`, `name.name` or `name.name.name`: bare words that are not SQL's own.
-  @spec name_parts([token()]) :: {:ok, [binary()], [token()]} | {:refuse, binary()}
-  defp name_parts([{:word, printed, upper, _l, _c} | rest]) when upper not in @reserved do
-    part = String.downcase(printed)
-
-    case rest do
-      [{:symbol, ".", _u, _l2, _c2} | more] ->
-        with {:ok, parts, rest} <- name_parts(more),
-             true <- length(parts) < 3 do
-          {:ok, [part | parts], rest}
-        else
-          _other -> {:refuse, "a name of more than three parts"}
-        end
-
-      _end_of_name ->
-        {:ok, [part], rest}
-    end
-  end
-
-  defp name_parts(_tokens), do: {:refuse, "an update reading anything but plain names"}
 
   # ---------------------------------------------------------------------------
   # The table
@@ -481,7 +478,9 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   # Where the name points: a table of the database (`iox` is its schema), or one that cannot be
   # there. The planner prints the name it looked for with its catalog and schema.
   @spec resolve([binary()], [binary()]) ::
-          {:ok, {:found, binary()} | {:missing, binary()}} | {:refuse, binary()}
+          {:ok, {:found, binary()} | {:missing, binary()}}
+          | {:error, SQLError.t()}
+          | {:refuse, binary()}
   defp resolve([table], _tables), do: {:ok, {:found, table}}
   defp resolve(["iox", table], _tables), do: {:ok, {:found, table}}
   defp resolve(["public", "iox", table], _tables), do: {:ok, {:found, table}}
@@ -492,6 +491,14 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   defp resolve([catalog, schema, table], _tables) when catalog != "public",
     do: {:ok, {:missing, "#{catalog}.#{schema}.#{table}"}}
 
+  defp resolve(parts, _tables) when length(parts) > 3 do
+    {:error,
+     SQLError.planning(
+       "Unsupported compound identifier '#{Enum.join(parts, ".")}'. " <>
+         "Expected 1, 2 or 3 parts, got #{length(parts)}"
+     )}
+  end
+
   defp resolve(_parts, _tables),
     do: {:refuse, "a table named in a schema the double does not model"}
 
@@ -500,25 +507,17 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   # ---------------------------------------------------------------------------
 
   # The columns an insert lists must be the table's.
-  @spec known_columns([binary()], [binary()]) :: SQLError.t() | map()
-  defp known_columns(named, columns) do
+  @spec unknown_column([binary()], [binary()]) :: map() | nil
+  defp unknown_column(named, columns) do
     case Enum.find(named, &(&1 not in columns)) do
-      nil -> dml(:insert)
-      unknown -> no_field(unknown, nil, columns)
+      nil -> nil
+      unknown -> SQLDmlName.no_field(unknown, unknown, nil, columns)
     end
   end
 
   @spec dml(:insert | :update) :: map()
   defp dml(:insert), do: SQLError.planning("DML not supported: Insert Into")
   defp dml(:update), do: SQLError.planning("DML not supported: Update")
-
-  # An update names the fields with their table (`main.v`), an insert without (verified).
-  @spec no_field(binary(), binary() | nil, [binary()]) :: map()
-  defp no_field(name, table, columns) do
-    valid = Enum.map_join(columns, ", ", &if(table, do: "#{table}.#{&1}", else: &1))
-
-    %{status: 500, body: "Schema error: No field named #{name}. Valid fields are #{valid}."}
-  end
 
   # A table the planner did not find: a name of the database's schema is printed with it.
   @spec not_found(binary()) :: map()

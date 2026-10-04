@@ -17,6 +17,52 @@ defmodule InfluxElixir.Client.Local.SQLError do
   @spec refusal(binary()) :: t()
   def refusal(message), do: %{status: 400, body: "Client.Local: " <> message}
 
+  # The refusals of what the engine computes without a planning error: the double declines
+  # to compute it (the cast of a number to text, of text to a timestamp), and the engine's
+  # own answer is a value, or an error found when it runs the plan (the connection closes).
+  # Whatever planning error the rest of the query has comes before it. Each starts with one
+  # of these words.
+  @late_refusals [
+    "a CASE condition that is not a boolean",
+    "a CASE comparing time with text",
+    "a comparison of time with text",
+    "a timestamp concatenated as text",
+    "IS DISTINCT FROM of a time and text",
+    "IS NOT DISTINCT FROM of a time and text",
+    "LIKE of a number and a tag",
+    "LIKE of a tag and a number",
+    "ILIKE of a number and a tag",
+    "ILIKE of a tag and a number",
+    "COALESCE of arguments with no common type the double models (a number with text, or",
+    "NULLIF of arguments with no common type the double models (a number with text, or",
+    "COALESCE of numbers the double does not combine",
+    "NULLIF of numbers the double does not combine",
+    "greatest of numbers the double does not combine",
+    "least of numbers the double does not combine",
+    "greatest of a number and text",
+    "least of a number and text"
+  ]
+
+  @doc """
+  The refusal of what the engine computes without a planning error (see `late?/1`). The
+  message starts with one of the words in `late_refusals/0`.
+  """
+  @spec late_refusal(binary()) :: t()
+  def late_refusal(message) do
+    unless Enum.any?(@late_refusals, &String.starts_with?(message, &1)) do
+      raise ArgumentError, "not a refusal of a value the engine computes: #{message}"
+    end
+
+    refusal(message)
+  end
+
+  @doc "Whether an error is a refusal of what the engine computes without a planning error."
+  @spec late?(term()) :: boolean()
+  def late?(%{body: "Client.Local: " <> message}),
+    do: Enum.any?(@late_refusals, &String.starts_with?(message, &1))
+
+  def late?(_error), do: false
+
   @doc "The engine's planning error, `Error during planning: <message>`."
   @spec planning(binary()) :: t()
   def planning(message), do: %{status: 400, body: "Error during planning: " <> message}

@@ -38,6 +38,26 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   @order_clause ~r/(?i)(\bORDER\s+BY\s+)(.+?)(?=\s+#{@limit_start}|\s*$)/su
 
   @doc """
+  An expression of an `ORDER BY` with each name that is a select item's output name read as
+  that item, not as a column of the table of the same name (verified: `SELECT i AS j ...
+  ORDER BY j + 1` sorts by `i + 1`, and `SELECT s AS usage ... ORDER BY usage + 1` is the
+  error of `s + 1` where the table has a `usage` column). `projection` is the query's
+  projected items.
+  """
+  @spec output_items(SQLExpr.t(), [{binary() | SQLExpr.t(), binary()}] | nil) :: SQLExpr.t()
+  def output_items({:field, name} = field, projection)
+      when is_binary(name) and is_list(projection) do
+    case List.keyfind(projection, name, 1) do
+      {source, ^name} when is_binary(source) -> {:field, source}
+      {expr, ^name} -> expr
+      nil -> field
+    end
+  end
+
+  def output_items(expr, projection),
+    do: SQLExpr.map_children(expr, &output_items(&1, projection))
+
+  @doc """
   Rewrites the positions and select aliases of the clauses in `rest`, the
   text after the table, to the items they name. `columns` is the select list;
   `namer` gives the output name of an item without an alias, or `nil`

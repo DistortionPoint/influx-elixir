@@ -85,7 +85,9 @@ defmodule InfluxElixir.Contract.SQLScalar do
     # SQL is the v3 profiles' query language; v2 has none of it.
     if profile in [:v3_core, :v3_enterprise] do
       tests =
-        for {test_part, block} <- test_blocks(), part == :all or part == test_part, do: block
+        for {test_part, block} <- test_blocks(profile),
+            part == :all or part == test_part,
+            do: block
 
       quote location: :keep do
         (unquote_splicing([helpers(client), checks() | tests]))
@@ -94,14 +96,14 @@ defmodule InfluxElixir.Contract.SQLScalar do
   end
 
   # Every block of tests with the part it belongs to, in order.
-  @spec test_blocks() :: [{atom(), Macro.t()}]
-  defp test_blocks do
+  @spec test_blocks(atom()) :: [{atom(), Macro.t()}]
+  defp test_blocks(profile) do
     [
       {:expressions, expression_tests()},
       {:functions, function_tests()},
       {:errors, error_tests()},
       {:aggregates, aggregate_tests()},
-      {:catalog, catalog_tests()}
+      {:catalog, catalog_tests(profile)}
     ]
   end
 
@@ -292,8 +294,25 @@ defmodule InfluxElixir.Contract.SQLScalar do
     end
   end
 
-  defp catalog_tests do
+  # The system tables are those of an edition: only a Core is asked for the lists that name
+  # them (`SQLCatalogCases.catalog_core/0`), so that another edition is not pinned to them.
+  defp core_catalog_test(:v3_core) do
     quote location: :keep do
+      describe "SQL scalar — contract: the system tables of InfluxDB 3 Core" do
+        test "SHOW TABLES, the schemata and the columns of the system tables", ctx do
+          ss_fixture(ctx)
+          ss_check(ctx, InfluxElixir.Contract.SQLCatalogCases.catalog_core())
+        end
+      end
+    end
+  end
+
+  defp core_catalog_test(_other), do: nil
+
+  defp catalog_tests(profile) do
+    quote location: :keep do
+      unquote(core_catalog_test(profile))
+
       describe "SQL scalar — contract: the parser and the catalog" do
         @tag local_divergence: "Local refuses by name some of what the engine answers"
         test "the statements the parser reads, and its errors for those it does not", ctx do

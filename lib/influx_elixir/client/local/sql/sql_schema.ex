@@ -837,10 +837,12 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   def expr_fields({:cut, call}), do: expr_fields(call)
   def expr_fields({:lazy_cut, call}), do: expr_fields(call)
   def expr_fields({:null_cut, call}), do: expr_fields(call)
+  def expr_fields({:case_cut, call}), do: expr_fields(call)
   def expr_fields({:expr_check, node}), do: expr_fields(node)
   def expr_fields({:logical, tree}), do: SQLWhere.truthy_columns(tree)
+  def expr_fields({:logical_ops, tree}), do: SQLWhere.truthy_columns(tree)
   def expr_fields({:pattern, _kind, expr, _rest}), do: expr_fields(expr)
-  def expr_fields({:compare, _op, left, _right}), do: expr_fields(left)
+  def expr_fields({:compare, _op, left, right}), do: expr_fields([left | operand_exprs([right])])
   def expr_fields({:in_list, left, values}), do: expr_fields([left | operand_exprs(values)])
 
   def expr_fields({:range, left, low, high}),

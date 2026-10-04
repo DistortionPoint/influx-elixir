@@ -201,16 +201,15 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   end
 
   @spec phrase(binary(), SQLTokenizer.tokens()) :: SQLError.t() | nil
-  defp phrase(word, [next | _rest]) when word in ["GRANT", "REVOKE", "DENY"] do
+  defp phrase(word, [next | _more] = tokens) when word in ["GRANT", "REVOKE", "DENY"] do
     case next do
       {:eof, _printed, _upper, _line, _col} ->
         nil
 
-      {:word, _printed, upper, _line, _col} = token ->
-        if SQLGrant.privilege?(upper), do: nil, else: expected("a privilege keyword", token)
-
       token ->
-        expected("a privilege keyword", token)
+        if SQLGrant.privilege_start?(tokens),
+          do: nil,
+          else: expected("a privilege keyword", token)
     end
   end
 

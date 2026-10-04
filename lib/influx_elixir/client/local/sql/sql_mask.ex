@@ -194,16 +194,34 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   """
   @spec balanced(binary()) :: {:ok, binary(), binary()} | :error
   def balanced(str) do
-    case closing_paren(mask(str), 1, 0) do
+    case closing_paren(str, 1, 0) do
       nil -> :error
       at -> {:ok, binary_part(str, 0, at), binary_part(str, at + 1, byte_size(str) - at - 1)}
     end
   end
 
+  # Read in place, a literal skipped as `mask/2` does (a doubled quote does not close it): a
+  # text is not copied whole to find the one parenthesis, which would be quadratic in the
+  # length of the text for every call in it.
   @spec closing_paren(binary(), pos_integer(), non_neg_integer()) :: non_neg_integer() | nil
   defp closing_paren(<<>>, _depth, _at), do: nil
+
+  defp closing_paren(<<q, rest::binary>>, depth, at) when q in [?', ?"] do
+    case skip_literal(rest, q, at + 1) do
+      {rest, at} -> closing_paren(rest, depth, at)
+      :error -> nil
+    end
+  end
+
   defp closing_paren(<<?), _rest::binary>>, 1, at), do: at
   defp closing_paren(<<?), rest::binary>>, depth, at), do: closing_paren(rest, depth - 1, at + 1)
   defp closing_paren(<<?(, rest::binary>>, depth, at), do: closing_paren(rest, depth + 1, at + 1)
   defp closing_paren(<<_byte, rest::binary>>, depth, at), do: closing_paren(rest, depth, at + 1)
+
+  @spec skip_literal(binary(), byte(), non_neg_integer()) ::
+          {binary(), non_neg_integer()} | :error
+  defp skip_literal(<<d, d, rest::binary>>, d, at), do: skip_literal(rest, d, at + 2)
+  defp skip_literal(<<d, rest::binary>>, d, at), do: {rest, at + 1}
+  defp skip_literal(<<_byte, rest::binary>>, d, at), do: skip_literal(rest, d, at + 1)
+  defp skip_literal(<<>>, _d, _at), do: :error
 end

@@ -181,6 +181,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
           {binary(), [InfluxQL.bound()], [{binary(), InfluxQLArithmetic.check()}]}
   defp plan({:cmp, tokens}, {tags, types} = ctx, times) do
     check_calls(tokens, tags, types, times.alone)
+    check_coercion(tokens, tags, types)
 
     if Enum.any?(tokens, &InfluxQLTokens.time?/1) do
       {sql, lowers} = time_plan(tokens, tags, times)
@@ -244,6 +245,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
       :ok -> :ok
       {:engine, body} -> throw({:refused, {:engine, body}})
       {:refuse, message} -> throw({:refused, message})
+    end
+  end
+
+  # An unsigned number under arithmetic with a string, a boolean, a tag or the time is the
+  # planner's coercion error.
+  @spec check_coercion(list(), MapSet.t(binary()), map()) :: :ok
+  defp check_coercion(tokens, tags, types) do
+    case InfluxQLWhereArith.coercion_error(tokens, tags, types) do
+      nil -> :ok
+      body -> throw({:refused, {:engine, 400, body}})
     end
   end
 

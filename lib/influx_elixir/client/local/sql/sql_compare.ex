@@ -58,7 +58,12 @@ defmodule InfluxElixir.Client.Local.SQLCompare do
   @doc "A three-valued negation: unknown stays unknown."
   @spec negate(boolean() | nil) :: boolean() | nil
   def negate(nil), do: nil
-  def negate(value), do: not value
+  def negate(value) when is_boolean(value), do: not value
+
+  # A value that is no boolean reaches a negation the type check did not see (the type of an
+  # expression it has none for): the double declines it, and does not fail on it.
+  def negate(_value),
+    do: throw({:query_error, SQLError.refusal("NOT of a value the double has no type for")})
 
   @doc "Whether `actual op value` holds; a null on either side is not true."
   @spec compare(term(), atom(), term()) :: boolean()

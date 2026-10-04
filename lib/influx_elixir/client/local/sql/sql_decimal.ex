@@ -22,7 +22,7 @@ defmodule InfluxElixir.Client.Local.SQLDecimal do
   # is 35 for `/` and `%`, 36 for `+` and `-`, and 38 for `*`. The precision of
   # any other shape of expression is not modelled and is refused by name.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLFunctions}
+  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLExprType}
 
   @decimal "Decimal128(?)"
   @precisions %{:/ => 35, :rem => 35, :+ => 36, :- => 36, :* => 38}
@@ -35,7 +35,7 @@ defmodule InfluxElixir.Client.Local.SQLDecimal do
   """
   @spec check(SQLExpr.t(), [term()], %{binary() => binary()}) :: :ok | {:error, SQLError.t()}
   def check(left, values, columns) do
-    with @decimal <- SQLFunctions.type_of(left, columns),
+    with @decimal <- SQLExprType.type_of(left, columns),
          literal when literal != nil <- Enum.find_value(values, &too_large/1) do
       error(left, literal, columns)
     else
@@ -75,7 +75,7 @@ defmodule InfluxElixir.Client.Local.SQLDecimal do
   defp precision(_other, _columns), do: nil
 
   @spec integer?(SQLExpr.t(), %{binary() => binary()}) :: boolean()
-  defp integer?(expr, columns), do: SQLFunctions.type_of(expr, columns) in ["Int64", "UInt64"]
+  defp integer?(expr, columns), do: SQLExprType.type_of(expr, columns) in ["Int64", "UInt64"]
 
   @spec body(float() | :inf | :neg_inf, pos_integer()) :: :ok | {:error, SQLError.t()}
   defp body(literal, precision) do

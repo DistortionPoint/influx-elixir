@@ -52,6 +52,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
          :ok <- text_aggregate(items, types),
          :ok <- time_aggregate(items, types, tags),
          :ok <- expressions(items, types, tags),
+         :ok <- call_before_selector(query, types),
          :ok <- lone_selector_calls(items),
          :ok <- group_field_read(query, types, tags) do
       fill_number_on_text(query, types)
@@ -101,8 +102,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   @spec expressions([InfluxQL.item()], map(), MapSet.t(binary())) ::
           :ok | {:error, {:engine, binary()} | binary()}
   defp expressions(items, types, tags) do
-    physical? = Enum.any?(items, &field_aggregate?(&1, types, tags))
+    physical? =
+      Enum.any?(items, &(field_aggregate?(&1, types, tags) or field_read?(&1, types, tags)))
 
+    # The engine rewrites the whole list before it plans a function: its operand errors come
+    # first, a function of a time after them.
+    case first_expression_error(items, types, tags, false) do
+      :ok when physical? -> first_expression_error(items, types, tags, true)
+      result -> result
+    end
+  end
+
+  defp first_expression_error(items, types, tags, physical?) do
     Enum.find_value(items, :ok, fn
       {:expr, ast, _alias} -> expression(ast, types, tags, physical?)
       _item -> nil
@@ -215,6 +226,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   defp field_aggregate?(_item, _types, _tags), do: false
 
+  # A plain field in the list (a column, or an expression of fields) makes the engine run the plan
+  # of the row, which is where it rejects a math function of a time (verified: `abs(time), n`
+  # is the error, `abs(time), host` answers nothing).
+  defp field_read?({:column, column, _name}, types, tags), do: field?(column, types, tags)
+
+  defp field_read?({:expr, ast, _alias}, types, tags),
+    do: Enum.any?(InfluxQLExpr.refs(ast), &field?(&1, types, tags))
+
+  defp field_read?(_item, _types, _tags), do: false
+
   defp field?(name, types, tags), do: Map.has_key?(types, name) and not MapSet.member?(tags, name)
 
   # A number given to `fill()` cannot become the value of a text column.
@@ -270,6 +291,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     end
   end
 
+  # Arithmetic of the columns of the point `top()` chose is answered; one of aggregates or
+  # transforms (they read the series, not the point) is not.
+  defp aggregating_expression?({:expr, ast, _alias}),
+    do: InfluxQLExpr.aggregates(ast) != [] or InfluxQLExpr.transforms(ast) != []
+
+  defp aggregating_expression?(_item), do: false
+
   defp multi_columns(kind, field, columns, items, {table, types, tags}) do
     field_beside? =
       Enum.any?(columns, fn {column, _name, _item} -> field?(column, types, tags) end)
@@ -277,7 +305,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     aliased = Enum.find(columns, &aliased_time?/1)
 
     cond do
-      Enum.any?(items, &match?({:expr, _ast, _alias}, &1)) ->
+      Enum.any?(items, &aggregating_expression?/1) ->
         {:error, "unsupported InfluxQL (#{kind}() beside an expression)"}
 
       field_beside? and MapSet.member?(tags, field) ->
@@ -373,6 +401,40 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
       error -> error
     end
   end
+
+  # A math function written before the only selector of the list is the engine's internal
+  # error, which names the first function of the list (verified: `abs(n), top(n, 2)`,
+  # `n + abs(n), max(n)`, `sqrt(abs(n)), min(n)` are `unexpected selector function: sqrt`
+  # and the like; after the selector, or beside an aggregate that is no selector, it is not).
+  # `top()` and `bottom()` do it in every shape, the other selectors but in a `GROUP BY
+  # time`, where the double refuses columns beside them. A measurement the double knows no
+  # columns of is no plan.
+  @spec call_before_selector(InfluxQL.query(), map()) ::
+          :ok | {:error, {:engine, 500, binary()}}
+  defp call_before_selector(%{items: items, group_time: group_time}, types) do
+    selectors = Enum.filter(items, &selector?/1)
+
+    with [selector] <- selectors,
+         true <- map_size(types) > 0,
+         true <- multi?(selector) or group_time == nil,
+         false <- Enum.any?(items, &(aggregate?(&1) and not selector?(&1))),
+         [_first | _rest] = before <- Enum.take_while(items, &(&1 != selector)),
+         name when is_binary(name) <- Enum.find_value(before, &plain_call/1) do
+      {:error,
+       {:engine, 500,
+        "External error: InfluxQL internal error: unexpected selector function: " <> name}}
+    else
+      _other -> :ok
+    end
+  end
+
+  defp plain_call({:expr, ast, _alias}) do
+    if InfluxQLExpr.refs(ast) != [] and InfluxQLExpr.aggregates(ast) == [] and
+         InfluxQLExpr.transforms(ast) == [],
+       do: InfluxQLExpr.first_call(ast)
+  end
+
+  defp plain_call(_item), do: nil
 
   # A math function over the only selector of the list is the engine's internal
   # error; over it in a deeper shape, or an arithmetic on a `percentile()` the

@@ -8,8 +8,19 @@ defmodule InfluxElixir.MixTestArgs do
   # Something asks for them, or for a chosen set of tests, when the arguments
   # name a path, give `--failed` or `--stale` (Mix's manifests choose those),
   # or include an integration tag; or when INTEGRATION is set.
+  #
+  # INTEGRATION is set when it holds any value but the empty string, `0` and
+  # `false` (the spellings of "off" a shell user reaches for). The docs and the
+  # changelog only ever write `INTEGRATION=1`, and CI does not set it, so every
+  # other value reads as the request it looks like.
+
+  @unset_integration [nil, "", "0", "false"]
 
   @integration_tags ~w(integration v2 v3_core v3_core_auth v3_enterprise)
+
+  # What under the test directory is not a unit tier: the integration suites,
+  # the support code, the fixtures and the helper.
+  @non_unit_test_entries ~w(integration support fixtures test_helper.exs)
 
   # The switches of `mix test` that take a value: their value is never a path,
   # whatever it names (`--exclude lib`, `--only test`, `--seed 0`).
@@ -20,21 +31,40 @@ defmodule InfluxElixir.MixTestArgs do
   @doc """
   The arguments to run `mix test` with: `args` with `unit_paths` first, unless
   the arguments or `integration` (the INTEGRATION environment variable) choose
-  the tests. `exists?` tells whether a path names a file or a directory.
+  the tests.
   """
-  @spec args([binary()], binary() | nil, [binary()], (binary() -> boolean())) :: [binary()]
-  def args(args, integration, unit_paths, exists? \\ &File.exists?/1) do
-    if integration in [nil, "", "0"] and not explicit_selection?(args, exists?),
+  @spec args([binary()], binary() | nil, [binary()]) :: [binary()]
+  def args(args, integration, unit_paths) do
+    if integration in @unset_integration and not explicit_selection?(args),
       do: unit_paths ++ args,
       else: args
   end
 
+  @doc """
+  The unit tier under `test_dir`: every directory and every `*_test.exs` file in
+  it but the integration suites, the support code, the fixtures and the helper,
+  sorted, as paths below `test_dir`.
+  """
+  @spec unit_test_paths(binary()) :: [binary()]
+  def unit_test_paths(test_dir) do
+    test_dir
+    |> File.ls!()
+    |> Enum.reject(&(&1 in @non_unit_test_entries))
+    |> Enum.filter(&(File.dir?(Path.join(test_dir, &1)) or String.ends_with?(&1, "_test.exs")))
+    |> Enum.sort()
+    |> Enum.map(&Path.join(test_dir, &1))
+  end
+
+  @doc "The switches of `mix test` that take a value, whose value is never a path."
+  @spec valued_switches() :: [binary()]
+  def valued_switches, do: @valued
+
   @doc "Whether the arguments choose which tests run."
-  @spec explicit_selection?([binary()], (binary() -> boolean())) :: boolean()
-  def explicit_selection?(args, exists? \\ &File.exists?/1) do
+  @spec explicit_selection?([binary()]) :: boolean()
+  def explicit_selection?(args) do
     {positionals, flags, tags} = split(args, [], [], [])
 
-    Enum.any?(positionals, &path?(&1, exists?)) or
+    Enum.any?(positionals, &path?/1) or
       Enum.any?(flags, &(&1 in ["--failed", "--stale"])) or
       Enum.any?(tags, &(hd(String.split(&1, ":")) in @integration_tags))
   end
@@ -69,8 +99,8 @@ defmodule InfluxElixir.MixTestArgs do
   defp tag(switch, value, tags) when switch in ["--include", "--only"], do: [value | tags]
   defp tag(_switch, _value, tags), do: tags
 
-  defp path?(arg, exists?) do
+  defp path?(arg) do
     path = arg |> String.split(":") |> hd()
-    String.ends_with?(path, ".exs") or (path != "" and exists?.(path))
+    String.ends_with?(path, ".exs") or (path != "" and File.exists?(path))
   end
 end

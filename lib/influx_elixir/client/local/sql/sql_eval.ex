@@ -19,12 +19,13 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     SQLCompare,
     SQLError,
     SQLExpr,
+    SQLExprType,
     SQLFunctions,
-    SQLNullType,
     SQLNumber,
     SQLPlan,
     SQLRow,
-    SQLScalar
+    SQLScalar,
+    SQLTime
   }
 
   @boolean_nodes [:not, :is_null, :is_bool, :is_distinct]
@@ -124,6 +125,16 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   defp eval_boolean({:is_bool, inner, expected, negated}, point),
     do: eval(inner, point) == expected != negated
 
+  # `time` beside a text literal: the engine reads the text as a timestamp, compared with the
+  # instant the point holds to the nanosecond.
+  defp eval_boolean({:is_distinct, {:field, "time"}, {:lit, text}, negated}, point)
+       when is_binary(text),
+       do: time_distinct(text, point) != negated
+
+  defp eval_boolean({:is_distinct, {:lit, text}, {:field, "time"}, negated}, point)
+       when is_binary(text),
+       do: time_distinct(text, point) != negated
+
   defp eval_boolean({:is_distinct, left, right, negated}, point) do
     distinct =
       case {eval(left, point), eval(right, point)} do
@@ -134,6 +145,16 @@ defmodule InfluxElixir.Client.Local.SQLEval do
       end
 
     distinct != negated
+  end
+
+  @spec time_distinct(binary(), SQLRow.point()) :: boolean()
+  defp time_distinct(text, point) do
+    case {SQLTime.timestamp_ns(text), SQLRow.sort_value(point, "time")} do
+      {{:ok, _instant}, nil} -> true
+      {{:ok, instant}, held} when is_integer(held) -> held != instant
+      {{:ok, instant}, %DateTime{} = held} -> DateTime.to_unix(held, :nanosecond) != instant
+      {{:error, error}, _held} -> throw({:query_error, error})
+    end
   end
 
   @spec eval_predicate(SQLExpr.t(), SQLRow.point()) :: value()
@@ -399,7 +420,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
         call_function(call, point)
 
       true ->
-        case SQLNullType.constant_type(base) do
+        case SQLExprType.constant_type(base) do
           "Null" -> nil
           :unknown -> throw({:query_error, log_null_refusal()})
           _typed -> 0.0
@@ -411,7 +432,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   @spec typed_null_base?(SQLExpr.t(), SQLRow.point()) :: boolean()
   defp typed_null_base?(base, point) do
     constant?(base) and is_nil(eval(base, point)) and
-      SQLNullType.constant_type(base) not in ["Null", :unknown]
+      SQLExprType.constant_type(base) not in ["Null", :unknown]
   end
 
   # `log(CAST(NULL AS DOUBLE), NULL)` is null, and with a typed null beside it the base is the
@@ -419,7 +440,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   @spec typed_null_log(SQLExpr.t(), SQLRow.point()) :: value()
   defp typed_null_log(argument, point) do
     if constant?(argument) and is_nil(eval(argument, point)) do
-      case SQLNullType.constant_type(argument) do
+      case SQLExprType.constant_type(argument) do
         "Null" -> nil
         :unknown -> throw({:query_error, log_null_refusal()})
         _typed -> 1.0

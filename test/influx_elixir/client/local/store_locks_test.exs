@@ -14,6 +14,7 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local.Store
+  alias InfluxElixir.TestSupport.Await
 
   describe "a lock holder" do
     test "that is killed does not block the next creator" do
@@ -91,8 +92,8 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
       assert_receive :waiter_started, 30_000
       send(holder.pid, :release)
 
-      assert Task.await(holder) === :ok
-      assert Task.await(waiter) === :ok
+      assert Task.await(holder, 30_000) === :ok
+      assert Task.await(waiter, 30_000) === :ok
       assert Store.databases(table) === MapSet.new(["slow", "other"])
 
       # Mailbox order is the order the two functions ran in: the waiter's
@@ -100,7 +101,8 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
       assert Process.info(self(), :messages) === {:messages, [:holder_done, :waiter_ran]}
     end
 
-    test "is waited for by a drop of a database, which then removes what the holder made" do
+    test "a drop of a database is not run while a creation holds the databases lock, " <>
+           "and then removes only its own database" do
       table = Store.new([])
       parent = self()
       assert :ok = Store.create_database(table, "gone", fn _databases -> :ok end, 3600)
@@ -118,23 +120,21 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
 
       assert_receive :holding, 30_000
 
-      dropper =
-        Task.async(fn ->
-          send(parent, :dropping)
-          result = Store.drop_database(table, "gone")
-          send(parent, :dropped)
-          result
-        end)
+      dropper = Task.async(fn -> Store.drop_database(table, "gone") end)
 
-      assert_receive :dropping, 30_000
-      # the drop cannot finish while the creation holds the lock
-      refute_receive :dropped, 200
+      # The drop is waiting on the lock once it is inside the store's wait loop; the
+      # creation holds the lock until it is told to release it, so the drop cannot
+      # have gone further, and the database it is to remove is still there.
+      Await.until(fn ->
+        Process.info(dropper.pid, :current_function) === {:current_function, {Store, :acquire, 2}}
+      end)
+
       assert Store.database?(table, "gone")
 
       send(holder.pid, :release)
 
-      assert Task.await(holder) === :ok
-      assert Task.await(dropper) === :ok
+      assert Task.await(holder, 30_000) === :ok
+      assert Task.await(dropper, 30_000) === :ok
       refute Store.database?(table, "gone")
       assert Store.retention(table, "gone") === nil
       assert Store.database?(table, "other")

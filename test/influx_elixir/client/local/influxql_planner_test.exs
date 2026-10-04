@@ -39,15 +39,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlannerTest do
   end
 
   describe "refused by name" do
-    test "select items that end up with the same name", %{conn: conn} do
+    test "aggregates that end up with the same name", %{conn: conn} do
+      # The engine words each aggregate as its plan prints it, which the double does not.
       for statement <- [
-            "SELECT i AS time, j AS time FROM m",
-            "SELECT first(i) AS time, last(i) AS time FROM m"
+            "SELECT first(i) AS time, last(i) AS time FROM m",
+            "SELECT mean(i) AS k_1, mean(j) AS k FROM m GROUP BY k"
           ] do
         assert refused(conn, statement) ===
                  "Client.Local: unsupported InfluxQL " <>
-                   "(select items that end up with the same name): #{statement}"
+                   "(select items that end up with the same name)"
       end
+    end
+
+    test "columns that end up with the same name are the engine's planning error",
+         %{conn: conn} do
+      assert refused(conn, "SELECT i AS time, j AS time FROM m") ===
+               ~s|Error during planning: Projections require unique expression names but the | <>
+                 ~s|expression "m.i AS time_1" at position 1 and "m.j AS time_1" at | <>
+                 ~s|position 2 have the same name. Consider aliasing ("AS") one of them.|
     end
 
     test "* beside other items, a renamed time beside an aggregate", %{conn: conn} do

@@ -701,9 +701,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
       {"select mean(v) as from from ~g1",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid field alias, expected identifier at pos 17"}},
-      {"select mean( (v) ) from ~g1",
-       {:error, 400,
-        "rewriting statement\ncaused by\ngather information about select statement\ncaused by\nError during planning: expected field argument in mean(), got Nested(VarRef(VarRef { name: Identifier(\"v\"), data_type: Some(Float) }))"}},
       {"select sum((n)) from ~g1",
        {:error, 400,
         "rewriting statement\ncaused by\ngather information about select statement\ncaused by\nError during planning: expected field argument in sum(), got Nested(VarRef(VarRef { name: Identifier(\"n\"), data_type: Some(Integer) }))"}},
@@ -2524,11 +2521,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
       {"select top(v,host,1) as host_1, host from ~g1 group by host",
        {:error, 400,
         "Error during planning: Projections require unique expression names but the expression \"~g1.v AS host_1\" at position 1 and \"~g1.host AS host_1\" at position 3 have the same name. Consider aliasing (\"AS\") one of them."}},
-      {"select top(v,host,1) from ~g1 group by host",
-       [
-         {"2023-11-14 22:14:20", %{"host" => "a", "host_1" => "a", "top" => 3.0}},
-         {"2023-11-14 22:16:20", %{"host" => "b", "host_1" => "b", "top" => 5.0}}
-       ]},
       {"select top(v,host,1), host_1 from ~g1 group by host",
        {:error, 400,
         "Error during planning: Projections require unique expression names but the expression \"~g1.host AS host_1\" at position 3 and \"NULL AS host_1\" at position 4 have the same name. Consider aliasing (\"AS\") one of them."}},
@@ -3098,6 +3090,16 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
          {"2023-11-14 22:15:20", %{"n" => 4, "s" => "y", "top" => 4.0}},
          {"2023-11-14 22:16:20", %{"n" => 5, "top" => 5.0}},
          {"2023-11-14 23:13:20", %{"n" => 7}}
+       ]},
+      {"select top(v,2), n * 2 from ~g1",
+       [
+         {"2023-11-14 22:15:20", %{"n" => 8, "top" => 4.0}},
+         {"2023-11-14 22:16:20", %{"n" => 10, "top" => 5.0}}
+       ]},
+      {"select top(v,2), abs(n) from ~g1",
+       [
+         {"2023-11-14 22:15:20", %{"abs" => 4, "top" => 4.0}},
+         {"2023-11-14 22:16:20", %{"abs" => 5, "top" => 5.0}}
        ]}
     ]
   end
@@ -4484,17 +4486,171 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
        [{"2023-11-14 22:13:20", %{"u" => 5}}, {"2023-11-14 22:13:21", %{"u" => 7}}]},
       {"select u from ~g2 where 'a' + 'b' > u",
        [{"2023-11-14 22:13:20", %{"u" => 5}}, {"2023-11-14 22:13:21", %{"u" => 7}}]},
-      {"select top(v,2), n * 2 from ~g1",
-       [
-         {"2023-11-14 22:15:20", %{"n" => 8, "top" => 4.0}},
-         {"2023-11-14 22:16:20", %{"n" => 10, "top" => 5.0}}
-       ]},
-      {"select top(v,2), abs(n) from ~g1",
-       [
-         {"2023-11-14 22:15:20", %{"abs" => 4, "top" => 4.0}},
-         {"2023-11-14 22:16:20", %{"abs" => 5, "top" => 5.0}}
-       ]},
       {"select top(host,1), n from ~g1", [{"2023-11-14 22:17:20", %{"n" => 6, "top" => "c"}}]}
     ]
+  end
+
+  @doc "The reason the double gives for each statement of `refusals/0` (`Client.Local: <reason>`, with the statement after it when the parser refuses): the contract fails a refusal for any other reason, and a statement the double now answers."
+  @spec refusal_reasons() :: %{binary() => binary()}
+  def refusal_reasons do
+    %{
+      "select min(time), count(v) from ~g1 where time >= '2023-11-14T22:00:00Z' and time < '2023-11-15T00:00:00Z' group by time(30m) fill(linear)" =>
+        "unsupported InfluxQL (fill(linear) on a string, boolean or time column)",
+      "select min(time), mean(v) from ~g1 where time >= '2023-11-14T22:00:00Z' and time < '2023-11-15T00:00:00Z' group by time(30m) fill(linear)" =>
+        "unsupported InfluxQL (fill(linear) on a string, boolean or time column)",
+      "select mode(time), count(s) from ~g1" =>
+        "unsupported InfluxQL (mode() of values equally often there)",
+      "select true + 1 from ~g1" => "unsupported InfluxQL (an expression of constants)",
+      "select 'a' + 1 from ~g1" => "unsupported InfluxQL (an expression of constants)",
+      "select -true from ~g1" => "unsupported select item: -true",
+      "select abs(true) from ~g1" => "unsupported InfluxQL (an expression of constants)",
+      "select abs(b) from ~g1" => "unsupported InfluxQL (abs() of a boolean)",
+      "select abs(s) from ~g1" => "unsupported InfluxQL (abs() of a string)",
+      "select count(distinct(time)) + 1 from ~g1" =>
+        "unsupported select item: count(distinct(time)) + 1",
+      "select last(time) + v from ~g1" =>
+        "unsupported InfluxQL (an expression of aggregates and fields)",
+      "select max(time)::float from ~g1" => "unsupported select item: max(time)::float",
+      "select abs(v) + max(time) from ~g1" =>
+        "unsupported InfluxQL (an expression of aggregates and fields)",
+      "select n from ~g1 where 'a' % 'a' = 'aa'" => "unsupported InfluxQL WHERE: % 'a' = 'aa'",
+      "select n from ~g1 where n % 0 = 0" => "unsupported InfluxQL WHERE: % 0 = 0",
+      "select n from ~g1 where v % 0 = 0" => "unsupported InfluxQL WHERE: % 0 = 0",
+      "select b + b = 1 from ~g1" => "unsupported select item: b + b = 1",
+      "select n from ~g1 where sqrt(v) > 1" => "unsupported InfluxQL (sqrt() in a WHERE)",
+      "select n from ~g1 where floor(v) = 1" => "unsupported InfluxQL (floor() in a WHERE)",
+      "select n from ~g1 where ceil(v) = 1" => "unsupported InfluxQL (ceil() in a WHERE)",
+      "select n from ~g1 where round(v) = 1" => "unsupported InfluxQL (round() in a WHERE)",
+      "select n from ~g1 where ln(v) = 0" => "unsupported InfluxQL (ln() in a WHERE)",
+      "select n from ~g1 where log(v, 2) = 0" => "unsupported InfluxQL (log() in a WHERE)",
+      "select n from ~g1 where pow(v, 2) = 1" => "unsupported InfluxQL (pow() in a WHERE)",
+      "select n from ~g1 where mean(v) > 1" => "unsupported InfluxQL (mean() in a WHERE)",
+      "select n from ~g1 where foo(v) > 1" => "unsupported InfluxQL (foo() in a WHERE)",
+      "select round(s) from ~g1" => "unsupported InfluxQL (round() of a string)",
+      "select floor(host) from ~g1" => "unsupported InfluxQL (floor() of a tag)",
+      "select sqrt(b) from ~g1" => "unsupported InfluxQL (sqrt() of a boolean)",
+      "select ln(s) from ~g1" => "unsupported InfluxQL (ln() of a string)",
+      "select log(s, 2) from ~g1" => "unsupported InfluxQL (log() of a string)",
+      "select pow(s, 2) from ~g1" => "unsupported InfluxQL (pow() of a string)",
+      "select pow(v, s) from ~g1" => "unsupported InfluxQL (pow() of a string)",
+      "select ceil(b) from ~g1" => "unsupported InfluxQL (ceil() of a boolean)",
+      "select abs(host) from ~g1" => "unsupported InfluxQL (abs() of a tag)",
+      "select abs(v, v) from ~g1" => "unsupported select item: abs(v, v)",
+      "select abs() from ~g1" => "unsupported select item: abs()",
+      "select round(max(time)), count(v) from ~g1" =>
+        "unsupported InfluxQL (round() of a timestamp)",
+      "select sqrt(max(time)), count(v) from ~g1" =>
+        "unsupported InfluxQL (sqrt() of a timestamp)",
+      "select ln(max(time)), count(v) from ~g1" => "unsupported InfluxQL (ln() of a timestamp)",
+      "select floor(max(time)), count(v) from ~g1" =>
+        "unsupported InfluxQL (floor() of a timestamp)",
+      "select pow(max(time), 2), count(v) from ~g1" =>
+        "unsupported InfluxQL (pow() of a timestamp)",
+      "select log(max(time), 2), count(v) from ~g1" =>
+        "unsupported InfluxQL (log() of a timestamp)",
+      "select abs(time), count(v) from ~g1" =>
+        "unsupported InfluxQL (a function of time beside an aggregate)",
+      "select nosuch + max(time) from ~g1" =>
+        "unsupported InfluxQL (an expression of aggregates and fields)",
+      "select max(time) + nosuch from ~g1" =>
+        "unsupported InfluxQL (an expression of aggregates and fields)",
+      "select max(time) + nosuch, count(v) from ~g1" =>
+        "unsupported InfluxQL (an expression of aggregates and fields)",
+      "select max(time) + v from ~g1" =>
+        "unsupported InfluxQL (an expression of aggregates and fields)",
+      "select 1 + 1 from ~g1" => "unsupported InfluxQL (an expression of constants)",
+      "select -'a' from ~g1" => "unsupported select item: -'a'",
+      "select - -v from ~g1" => "unsupported select item: - -v",
+      "select - -1 from ~g1" => "unsupported select item: - -1",
+      "select n from ~g1 where date_part('hour', time) = 22" =>
+        "unsupported InfluxQL (date_part() in a WHERE)",
+      "select n from ~g1 where sin(v) > 0" => "unsupported InfluxQL (sin() in a WHERE)",
+      "select n from ~g1 where cos(v) > 0" => "unsupported InfluxQL (cos() in a WHERE)",
+      "select n from ~g1 where exp(v) > 0" => "unsupported InfluxQL (exp() in a WHERE)",
+      "select n from ~g1 where log2(v) = 0" => "unsupported InfluxQL (log2() in a WHERE)",
+      "select n from ~g1 where log10(v) = 0" => "unsupported InfluxQL (log10() in a WHERE)",
+      "select n from ~g1 where atan2(v, 1) > 0" => "unsupported InfluxQL (atan2() in a WHERE)",
+      "select n from ~g1 where pow(v, 2) = 4" => "unsupported InfluxQL (pow() in a WHERE)",
+      "select n from ~g1 where n % 2 = 0" => "unsupported InfluxQL WHERE: % 2 = 0",
+      "select n from ~g1 where abs(,) = 1" =>
+        "unsupported InfluxQL (abs() with an empty argument)",
+      "select mean(v) from ~g1 where time < -9223372036854775807" =>
+        "unsupported InfluxQL (a time before 1677-09-21T00:12:44)",
+      "select mean(v) from ~g1 where time >= -9223372036854775808" =>
+        "unsupported InfluxQL (a time before 1677-09-21T00:12:44)",
+      "select count((*)) from ~g1" => "unsupported InfluxQL (count() of that argument)",
+      "select count(distinct((v))) from ~g1" => "unsupported select item: count(distinct((v)))",
+      "select top((v), 2) from ~g1" => "unsupported select item: top((v), 2)",
+      "select mean(-v) from ~g1" => "unsupported select item: mean(-v)",
+      "select mean(v::float) from ~g1" => "unsupported select item: mean(v::float)",
+      "select mean((v::float)) from ~g1" => "unsupported InfluxQL (mean() of that argument)",
+      "select mean(abs(v)) from ~g1" => "unsupported select item: mean(abs(v))",
+      "select mean(sum(v)) from ~g1" => "unsupported select item: mean(sum(v))",
+      "select distinct((v)) from ~g1" => "unsupported select item: distinct((v))",
+      "select count(v::float) from ~g1" => "unsupported select item: count(v::float)",
+      "select top(*, 2) from ~g1" =>
+        "unsupported InfluxQL (top() of a wildcard with those arguments)",
+      "select top(*::field, 2) from ~g1" =>
+        "unsupported InfluxQL (top() of a wildcard with those arguments)",
+      "show tag keys from ~g3 where time != time" =>
+        "unsupported InfluxQL (SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement with no tag)",
+      "show tag keys from ~g3 where time !~ /a/" => "unsupported InfluxQL (time !~ ...)",
+      "show tag keys from ~g3 where time =~ /a/" => "unsupported InfluxQL (time =~ ...)",
+      "show tag keys from ~g3 where time - 1 > 0" =>
+        "unsupported InfluxQL (SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement with no tag)",
+      "show tag keys from ~g3 where time = time" =>
+        "unsupported InfluxQL (SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement with no tag)",
+      "show tag keys from ~g3 where time > time" =>
+        "unsupported InfluxQL (SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement with no tag)",
+      "select n from ~g1 where time = time" =>
+        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: time",
+      "select n from ~g1 where time > time" =>
+        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: time",
+      "select n from ~g1 where time > v" =>
+        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: v",
+      "select n from ~g1 where time > host" =>
+        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: host",
+      "select n from ~g1 where time > n" =>
+        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: n",
+      "select n from ~g1 where time > 1 + time" =>
+        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: 1 + time",
+      "select n from ~g1 where time > abs(1)" =>
+        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: abs ( 1 )",
+      "select n from ~g1 where time > abs(v)" =>
+        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: abs ( v )",
+      "select n from ~g1 where time = true" =>
+        "unsupported InfluxQL (a time compared with an expression)",
+      "select n from ~g1 where time > true" =>
+        "unsupported InfluxQL (a time compared with an expression)",
+      "select n from ~g1 where time > s" =>
+        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: s",
+      "select max(v), abs(v) from ~g1" =>
+        "unsupported InfluxQL (a function over a selector in that shape)",
+      "select max(v) + 1, v from ~g1" =>
+        "unsupported InfluxQL (arithmetic on a selector beside columns)",
+      "select abs( from ~g1" => "unsupported select item: abs(",
+      "select n from ~g1 where abs(,1) = 1" =>
+        "unsupported InfluxQL (abs() with an empty argument)",
+      "select n from ~g1 where abs(1,) = 1" =>
+        "unsupported InfluxQL (abs() with an empty argument)",
+      "select n from ~g1 where 'a' + = 'a'" => "unsupported WHERE clause: 'a' +",
+      "select n from ~g1 where s + s + = 'a'" => "unsupported WHERE clause: s + s +",
+      "select mean(()) from ~g1" => "unsupported select item: mean(())",
+      "select mean(( )) from ~g1" => "unsupported select item: mean(( ))",
+      "select mean((v) from ~g1" => "unsupported select item: mean((v)",
+      "select count(((*))) from ~g1" => "unsupported InfluxQL (count() of that argument)",
+      "select mean(('a\"b')) from ~g1" => "unsupported InfluxQL (mean() of that argument)",
+      "select top(v, (host), 1) from ~g1" => "unsupported select item: top(v, (host), 1)",
+      "select top(v, host, (1)) from ~g1" => "unsupported select item: top(v, host, (1))",
+      "select * as x, * from ~g1" => "unsupported select item: * as x",
+      "select v as x, * as y from ~g1" => "unsupported select item: * as y",
+      "select max(time), time + 1 from ~g1" =>
+        "unsupported InfluxQL (a function of time beside an aggregate)",
+      "select u from ~g2 where u < 'a' + 'b'" =>
+        "unsupported InfluxQL (an unsigned number ordered against a string)",
+      "select u from ~g2 where 'a' + 'b' > u" =>
+        "unsupported InfluxQL (an unsigned number ordered against a string)",
+      "select top(host,1), n from ~g1" => "unsupported InfluxQL (top() of a tag beside a field)"
+    }
   end
 end

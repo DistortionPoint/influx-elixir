@@ -8,12 +8,13 @@ defmodule InfluxElixir.MixTestArgsTest do
 
   @unit ["test/influx_elixir"]
 
-  # What exists on disk, for the cases: a test file, a directory and a name
-  # (`lib`, `test`, `0`) that is also an option's value.
-  @existing ~w(test test/influx_elixir test/influx_elixir/x_test.exs lib 0 tmp/x_test.exs)
-  defp exists?(path), do: path in @existing
+  # Paths of this repository, which the tests run from: a test file, a
+  # directory and names (`lib`, `mix.exs`) that are also an option's value.
+  @test_file "test/mix/test_args_test.exs"
+  # A name that cannot exist, to show that a bare word is not a path.
+  @no_such_path "ft6_no_such_path"
 
-  describe "args/4 without INTEGRATION" do
+  describe "args/3 without INTEGRATION" do
     test "prepends the unit paths only when nothing chooses the tests" do
       Check.check_cases(
         [
@@ -30,19 +31,23 @@ defmodule InfluxElixir.MixTestArgsTest do
           {~w(--only zzz), :unit},
           {~w(--exclude integration), :unit},
           {~w(--profile-require time), :unit},
+          {[@no_such_path], :unit},
+          {["--only", "mix.exs"], :unit},
           # A path, in any form, chooses.
-          {~w(test/influx_elixir/x_test.exs), :as_given},
-          {~w(test/influx_elixir/x_test.exs:12), :as_given},
-          {~w(test/influx_elixir/x_test.exs:12:20), :as_given},
-          {~w(./test/influx_elixir/x_test.exs), :as_given},
+          {[@test_file], :as_given},
+          {[@test_file <> ":12"], :as_given},
+          {[@test_file <> ":12:20"], :as_given},
+          {["./" <> @test_file], :as_given},
           {~w(test), :as_given},
+          {~w(lib), :as_given},
+          {~w(mix.exs), :as_given},
           {~w(tmp/x_test.exs), :as_given},
           {~w(nosuch_test.exs), :as_given},
           # A path after a switch `mix test` does not take a value for.
-          {~w(--no-compile test/influx_elixir/x_test.exs), :as_given},
-          {~w(--force test/influx_elixir/x_test.exs), :as_given},
-          {~w(--profile-require time test/influx_elixir/x_test.exs), :as_given},
-          {~w(test/influx_elixir/x_test.exs --no-deps-check), :as_given},
+          {["--no-compile", @test_file], :as_given},
+          {["--force", @test_file], :as_given},
+          {["--profile-require", "time", @test_file], :as_given},
+          {[@test_file, "--no-deps-check"], :as_given},
           # Mix's manifests choose.
           {~w(--failed), :as_given},
           {~w(--stale), :as_given},
@@ -54,19 +59,67 @@ defmodule InfluxElixir.MixTestArgsTest do
           {~w(--only v3_core_auth), :as_given}
         ],
         fn {args, expected} ->
-          wanted = if expected == :unit, do: @unit ++ args, else: args
-          got = MixTestArgs.args(args, nil, @unit, &exists?/1)
+          wanted = if expected === :unit, do: @unit ++ args, else: args
+          got = MixTestArgs.args(args, nil, @unit)
           if got === wanted, do: :ok, else: {:mismatch, %{expected: wanted, actual: got}}
         end
       )
     end
+
+    test "a valued switch never makes its value a path, whatever the value names" do
+      for switch <- MixTestArgs.valued_switches(),
+          args <- [[switch, "lib"], [switch <> "=lib"]] do
+        assert MixTestArgs.args(args, nil, @unit) === @unit ++ args,
+               "#{inspect(args)} chose the tests"
+      end
+    end
+
+    test "a valued switch that is last has no value to swallow" do
+      for switch <- MixTestArgs.valued_switches() do
+        assert MixTestArgs.args([switch], nil, @unit) === @unit ++ [switch]
+      end
+    end
   end
 
-  describe "args/4 with INTEGRATION" do
-    test "set, the arguments are kept as given; empty or 0, they are not set" do
-      assert MixTestArgs.args(~w(--cover), "1", @unit, &exists?/1) === ~w(--cover)
-      assert MixTestArgs.args(~w(--cover), "", @unit, &exists?/1) === @unit ++ ~w(--cover)
-      assert MixTestArgs.args(~w(--cover), "0", @unit, &exists?/1) === @unit ++ ~w(--cover)
+  describe "args/3 with INTEGRATION" do
+    test "set to anything but empty, 0 or false, the arguments are kept as given" do
+      for value <- ["1", "true", "yes", "FALSE", " "] do
+        assert MixTestArgs.args(~w(--cover), value, @unit) === ~w(--cover)
+      end
+    end
+
+    test "empty, 0 or false, it is not set" do
+      for value <- ["", "0", "false"] do
+        assert MixTestArgs.args(~w(--cover), value, @unit) === @unit ++ ~w(--cover)
+      end
+    end
+  end
+
+  describe "unit_test_paths/1" do
+    test "is every directory and test file of the test directory but the non-unit entries" do
+      paths = MixTestArgs.unit_test_paths("test")
+
+      assert paths === Enum.sort(paths)
+      assert "test/influx_elixir" in paths
+      assert "test/mix" in paths
+
+      for entry <- ~w(integration support fixtures test_helper.exs) do
+        refute "test/#{entry}" in paths
+      end
+
+      for path <- paths do
+        assert File.dir?(path) or String.ends_with?(path, "_test.exs")
+      end
+    end
+
+    test "a bare run of the project's tests selects exactly them" do
+      unit = MixTestArgs.unit_test_paths("test")
+      assert MixTestArgs.args([], nil, unit) === unit
+      assert MixTestArgs.args(["--cover"], nil, unit) === unit ++ ["--cover"]
+    end
+
+    test "a missing directory is an error, not an empty tier" do
+      assert_raise File.Error, fn -> MixTestArgs.unit_test_paths(@no_such_path) end
     end
   end
 end

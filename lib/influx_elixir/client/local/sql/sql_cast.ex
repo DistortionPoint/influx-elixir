@@ -72,6 +72,7 @@ defmodule InfluxElixir.Client.Local.SQLCast do
   def arrow_type(:int64), do: "Int64"
   def arrow_type(:float), do: "Float64"
   def arrow_type(:string), do: "Utf8"
+  def arrow_type(:decimal), do: "Decimal128(?)"
 
   @doc "Whether the integer is in the range of the integer type with `bits` bits."
   @spec fits?(integer(), 8 | 16 | 32 | 64) :: boolean()
@@ -86,6 +87,15 @@ defmodule InfluxElixir.Client.Local.SQLCast do
   defp convert(value, type) when type in @integer_types, do: to_integer(value, bits(type))
   defp convert(value, :float), do: to_float(value)
   defp convert(value, :string), do: to_string_value(value)
+  defp convert(value, :decimal), do: to_decimal(value)
+
+  # An integer of either sign as the decimal the engine makes of it beside the other (`Int64`
+  # with `UInt64`); only the coalescing functions make one, not a cast written in a query.
+  @spec to_decimal(term()) :: {:ok, SQLNumber.decimal()} | :error
+  defp to_decimal({:dec, _coefficient, _scale} = decimal), do: {:ok, decimal}
+  defp to_decimal({:u, value}), do: {:ok, {:dec, value, 0}}
+  defp to_decimal(value) when is_integer(value), do: {:ok, {:dec, value, 0}}
+  defp to_decimal(_value), do: :error
 
   @spec to_integer(term(), 8 | 16 | 32 | 64) :: {:ok, term()} | :error
   defp to_integer(value, bits) when is_boolean(value),

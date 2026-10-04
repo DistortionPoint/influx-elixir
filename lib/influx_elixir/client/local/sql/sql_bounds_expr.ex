@@ -23,7 +23,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
   #     arithmetic, in words that depend on the operation and the order of the
   #     conjuncts, which the double does not model.
 
-  alias InfluxElixir.Client.Local.{SQLCast, SQLExpr, SQLFold, SQLFunctions, SQLNumber}
+  alias InfluxElixir.Client.Local.{SQLCast, SQLExpr, SQLExprType, SQLFold, SQLNumber}
 
   @typedoc "What the interval analysis reads a numeric column as."
   @type column_type :: :int64 | :uint64 | :float64 | :other
@@ -320,7 +320,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
         {column, arrow(type_of.(column))}
       end
 
-    SQLFunctions.type_of(expr, columns) in ["Int64", "UInt64", "Int32", "Int16", "Int8"]
+    SQLExprType.type_of(expr, columns) in ["Int64", "UInt64", "Int32", "Int16", "Int8"]
   end
 
   @spec arrow(column_type() | nil) :: binary() | nil

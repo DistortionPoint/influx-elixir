@@ -8,6 +8,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` SQL typed an expression in three ways and answered what
+  Core refuses**: one table (`SQLExprType`) now decides every type, with an
+  exact memo keyed by the node; `-(n < 1)`, `-coalesce(s, 'x')`, `-CASE ...`
+  and a unary plus of a non-number are the `Negation only supports ...` 400;
+  `abs(coalesce(n, 1)) + 's'` names `Int64`; a `HAVING` that reads a select
+  alias types it (`abs(y)` of `max(s)` was an `ArgumentError`; `y + 1 > 1`
+  answered `[]`) and binds its placeholders (`HAVING count(*) > $1` answered
+  `[]`), which the planner meets in its own order; an `ORDER BY` name that is a
+  select item's output is that item; the select list's coercion errors come
+  after the planner's, the operands of a `||` fail as the planner's, and a
+  `WHERE` that is one typed non-boolean expression is refused first, as on
+  Core; `time IS [NOT] DISTINCT FROM '<timestamp>'` compares the instants and
+  `IS DISTINCT FROM`'s right side is the rest of the expression; `COALESCE`,
+  `NULLIF`, `GREATEST` and `LEAST` of a number and text are typed as the
+  number; a leading `;` before `INSERT`/`UPDATE` no longer raises and `UPDATE`
+  is read by an operand parser (aliases, case-sensitive targets, qualified
+  field lists, `abs` of a non-number); `GRANT ROLE`, `DATABASE ROLE`, `TO
+  SHARE`/`APPLICATION` are the engine's 405; `SELECT DISTINCT ... HAVING ...
+  ORDER BY upper(host)` answers; a `HAVING` of 900 terms costs 24 M reductions
+  (951 M).
+- **`Client.Local` SQL: the random-expression regressions and the `UPDATE`
+  modules' coverage**: a tag beside a number (`coalesce(host, 1)`) is
+  `Dictionary(Int32, Int64)`, an `Int64` with a `UInt64` in `COALESCE`,
+  `NULLIF`, `GREATEST` and `LEAST` a decimal computed as Core does, a `CASE` of
+  text and a timestamp a timestamp; the errors of a predicate are found in the
+  engine's order (the `AND`s, `OR`s, operators and calls left to right, the
+  `NOT`, `IN`, `LIKE` and `CASE` coercions after them); `WHERE ok = s` and `WHERE
+  u >= ok` (two columns, one a boolean) were answered `[]` and are the planning
+  error; `NULL IN (true, 1)` is the error; `length(coalesce(s, 'a'))` is named as
+  Core names it; `NOT 0` under `IS NULL` no longer raises; `INSERT ... VALUES`
+  counts the rows against its column list; `UPDATE` reads a string as an alias,
+  checks a `LIKE`'s escape and no longer words a trailing dot as a name. The
+  `UPDATE`/`INSERT` modules are covered to 100% by contract cases with Core's
+  answers.
+- **`Client.Local` InfluxQL kept no point for an unsigned field beside text**
+  (`u + s = 1`), where the engine's error is `Cannot coerce arithmetic
+  expression UInt64 + Utf8`; `true / abs(time)` raised. Column names,
+  `LIMIT`/`OFFSET` per column and the duplicate-name error now come from one
+  projection plan in the engine's order: `time AS n, *` keeps the time,
+  `usage AS host, top(n, host, 2)` names the tag `host_1`, and `top()` beside
+  plain fields counts per column. A descending `top()`/`bottom()` tie goes
+  to the later point, as on the engine.
 - **`Client.Local` InfluxQL counted missing fields and compared mismatched
   kinds**: `count()` of a field the measurement lacks is omitted (it was a
   `0`), still taking its name

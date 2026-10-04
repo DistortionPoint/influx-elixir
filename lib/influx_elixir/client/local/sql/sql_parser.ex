@@ -466,7 +466,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         {:error, SQLError.refusal("unsupported DISTINCT query: #{sql}")}
 
       true ->
-        with {:ok, query} <- parse_aggregate_select(split, sql, qualifier) do
+        with {:ok, query} <- parse_aggregate_select(split, sql, qualifier, :allowed) do
           {_order_by, error} = parse_distinct_order_by(split_columns(columns), split.table, rest)
           {:ok, %{query | distinct_rows: true, plan_error: error || query.plan_error}}
         end
@@ -521,9 +521,22 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec unsupported(binary()) :: {:error, term()}
   defp unsupported(sql), do: {:error, SQLError.refusal("unsupported SQL: #{sql}")}
 
-  @spec parse_aggregate_select(split(), binary(), binary() | nil) ::
-          {:ok, parsed_query()} | {:error, term()}
-  defp parse_aggregate_select(%{table: measurement, rest: rest} = split, sql, qualifier) do
+  # `expr_order` says whether an `ORDER BY` of an expression is refused: grouped rows have no
+  # source point to evaluate one against, but the rows of a `SELECT DISTINCT` are the output
+  # rows, which every column an expression may read is in.
+  @spec expr_order(:refused | :allowed, binary()) :: :ok | {:error, term()}
+  defp expr_order(:refused, rest), do: reject_expr_order(SQLClauses.order_by(rest))
+  defp expr_order(:allowed, _rest), do: :ok
+
+  @spec parse_aggregate_select(
+          split(),
+          binary(),
+          binary() | nil,
+          :refused | :allowed
+        ) :: {:ok, parsed_query()} | {:error, term()}
+  defp parse_aggregate_select(split, sql, qualifier, order \\ :refused)
+
+  defp parse_aggregate_select(%{table: measurement, rest: rest} = split, sql, qualifier, order) do
     with {:ok, columns} <- SQLAggExpr.parse_list(split.columns, qualifier),
          :ok <- check_unique(Enum.map(columns, &elem(&1, tuple_size(&1) - 1))),
          :ok <- SQLClauses.check_group_items(rest),
@@ -532,7 +545,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          {:ok, groups} <- SQLClauses.group_columns(sql),
          {:ok, where} <- SQLWhere.nodes(rest),
          {:ok, having} <- SQLAggExpr.having(rest, qualifier, groups, columns),
-         :ok <- reject_expr_order(SQLClauses.order_by(rest)) do
+         :ok <- expr_order(order, rest) do
       query =
         new_query(measurement, where, rest,
           group_by_interval: interval_ns,

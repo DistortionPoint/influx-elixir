@@ -670,6 +670,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @spec function_name(binary()) :: binary()
   def function_name(fun), do: fun |> String.split(":") |> hd()
 
+  @doc "The name of the first function an expression calls, in the order it is written."
+  @spec first_call(ast()) :: binary() | nil
+  def first_call({:fn, name, _arguments}), do: name
+  def first_call({:neg, operand}), do: first_call(operand)
+  def first_call({:bin, _op, left, right}), do: first_call(left) || first_call(right)
+  def first_call(_other), do: nil
+
   @doc "The fields (and tags) an expression reads."
   @spec refs(ast()) :: [binary()]
   def refs({:ref, name}), do: [name]
@@ -830,11 +837,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     do: infer({:bin, "*", {:lit, {:int, -1}}, operand}, types, tags)
 
   defp infer({:bin, op, left, right}, types, tags) do
-    with {:ok, l} <- infer(left, types, tags),
-         {:ok, r} <- infer(right, types, tags) do
+    with {:ok, l} <- operand(infer(left, types, tags)),
+         {:ok, r} <- operand(infer(right, types, tags)) do
       operation(op, l, r)
     end
   end
+
+  # A math function of a time is a timestamp to the operation around it: the engine rejects the
+  # operation when it rewrites the projection (`incompatible operands`), before the plan that
+  # would reject the function (verified: `1 / abs(time)`, `true + abs(time)`, `-abs(time)`).
+  @spec operand(inferred()) :: inferred()
+  defp operand({:physical, _body}), do: {:ok, {:timestamp, false}}
+  defp operand({:physical_refuse, _message}), do: {:ok, {:timestamp, false}}
+  defp operand(inferred), do: inferred
 
   defp cast_type_of(type, target) when type in [:integer, :float, :unknown],
     do: {:ok, {target_type(type, target), false}}
@@ -919,9 +934,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # Operands that take no part in arithmetic: the engine's `incompatible operands`.
   @no_arithmetic [:tag, :string, :boolean, :timestamp]
 
+  # A column the measurement lacks beside a tag, a string or a boolean is a constant false of the
+  # type of the other operand (verified: `nosuch / host` is `false`, as are `nosuch / 'x'` and
+  # `nosuch + ok`; beside a number it is null).
+  @text_types [:tag, :string, :boolean]
+
   @spec operation(binary(), type(), type()) :: inferred()
   defp operation(op, {lt, _ll} = l, {rt, _rl} = r) do
     cond do
+      absent_text?(lt, rt) ->
+        {:ok, {if(lt == :unknown, do: rt, else: lt), false}}
+
       lt in @no_arithmetic or rt in @no_arithmetic ->
         {:engine, incompatible(op, lt, rt)}
 
@@ -937,6 +960,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp literal?({_lt, left}, {_rt, right}), do: left or right
 
+  defp absent_text?(:unknown, type), do: type in @text_types
+  defp absent_text?(type, :unknown), do: type in @text_types
+  defp absent_text?(_left, _right), do: false
+
+  @doc """
+  `ast` with the operation that is a constant false (a column the measurement lacks beside a
+  tag, a string or a boolean) replaced by the constant.
+  """
+  @spec fold(ast(), map(), MapSet.t(binary())) :: ast()
+  def fold({:bin, _op, left, right} = ast, types, tags) do
+    with {:ok, {left_type, _literal}} <- infer(left, types, tags),
+         {:ok, {right_type, _literal}} <- infer(right, types, tags),
+         true <- absent_text?(left_type, right_type) do
+      {:bool, false}
+    else
+      _other -> ast
+    end
+  end
+
+  def fold(ast, _types, _tags), do: ast
+
   defp incompatible(op, left, right) do
     InfluxQLError.expand_error(
       "incompatible operands for operator #{op}: #{type_name(left)} and #{type_name(right)}"
@@ -945,8 +989,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp type_name(type), do: Atom.to_string(type)
 
-  defp result(_op, {:unknown, _l}, _right), do: {:unknown, false}
-  defp result(_op, _left, {:unknown, _r}), do: {:unknown, false}
+  defp result(_op, {:unknown, _l}, {:unknown, _r}), do: {:unknown, false}
+  defp result(_op, {:unknown, _l}, {type, _r}), do: {type, false}
+  defp result(_op, {type, _l}, {:unknown, _r}), do: {type, false}
   defp result(_op, {:float, _l}, _right), do: {:float, false}
   defp result(_op, _left, {:float, _r}), do: {:float, false}
   defp result("/", {:integer, _l}, {:integer, _r}), do: {:float, false}
@@ -962,14 +1007,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   A value: a signed or unsigned integer, a float, null, or `:nan`, a number that
   is not finite (written as a null that is in the row).
   """
-  @type value :: {:int, integer()} | {:uint, non_neg_integer()} | {:float, float()} | nil | :nan
+  @type value ::
+          {:int, integer()}
+          | {:uint, non_neg_integer()}
+          | {:float, float()}
+          | {:bool, boolean()}
+          | nil
+          | :nan
 
   @doc """
   The value of `ast` over a row (`env`: name to value); `nil` for null, `:nan`
   for a number that is not finite. Throws `{:refused, message}` for what the
   double does not reproduce.
   """
-  @spec eval(ast(), map(), map()) :: number() | nil | :nan
+  @spec eval(ast(), map(), map()) :: number() | boolean() | nil | :nan
   def eval(ast, env, types) do
     case value(ast, env, types) do
       nil -> nil
@@ -981,6 +1032,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @spec value(ast(), map(), map()) :: value()
   defp value({:lit, {:int, n}}, _env, _types), do: {:int, n}
   defp value({:lit, {:float, x}}, _env, _types), do: {:float, x}
+  defp value({:bool, value}, _env, _types), do: {:bool, value}
   defp value({:ref, name}, env, types), do: typed(Map.get(types, name), Map.get(env, name))
   defp value({:cast, name, target}, env, types), do: cast(name, target, env, types)
 
@@ -992,6 +1044,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp value({:bin, op, left, right}, env, types),
     do: apply_op(op, value(left, env, types), value(right, env, types))
+
+  # A string or a boolean has no value in arithmetic: the planner refuses such an expression
+  # (`infer/3`) before any row is read, so this is a form the double has not seen.
+  defp value(_other, _env, _types),
+    do: throw({:refused, "unsupported InfluxQL (a string or a boolean in an expression)"})
 
   defp typed(_type, :nan), do: :nan
   defp typed(:integer, n) when is_integer(n), do: {:int, n}

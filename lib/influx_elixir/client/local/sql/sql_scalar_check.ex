@@ -56,6 +56,9 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
       {:refuse, why} ->
         {:error, SQLError.refusal(why)}
 
+      {:late, why} ->
+        {:error, SQLError.late_refusal(why)}
+
       {:convert, type} ->
         {:error, SQLError.coercion("Cannot automatically convert #{type} to Utf8")}
 
@@ -153,6 +156,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   @typep problem ::
            :ok
            | {:refuse, binary()}
+           | {:late, binary()}
            | {:convert, binary()}
            | {:planning | :internal | :execution, binary(), binary(), binary()}
 
@@ -168,9 +172,25 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   defp typed_problem(name, types) when name in [:greatest, :least] do
     typed = Enum.reject(types, &(&1 == "Null"))
 
-    if length(typed) > 1 and SQLCommonType.common(typed, :coalesce) == :mixed,
-      do: {:refuse, "#{name} of arguments with no common type the double models"},
-      else: :ok
+    cond do
+      length(typed) < 2 ->
+        :ok
+
+      SQLCommonType.number_with_text?(typed) ->
+        {:late,
+         "#{name} of a number and text: the engine casts the text to the number when it " <>
+           "runs the plan, which is not modelled"}
+
+      SQLCommonType.common(typed, :coalesce) == :mixed and SQLCommonType.numbers?(typed) ->
+        {:late,
+         "#{name} of numbers the double does not combine (an unsigned integer beside another number)"}
+
+      SQLCommonType.common(typed, :coalesce) == :mixed ->
+        {:refuse, "#{name} of arguments with no common type the double models"}
+
+      true ->
+        :ok
+    end
   end
 
   @spec text_problem(atom(), [binary()]) :: problem()

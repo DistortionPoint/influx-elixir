@@ -141,7 +141,7 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
 
   defp compared_as_text(operand, whens, types) do
     values = [operand | Enum.map(whens, &elem(&1, 0))]
-    families = values |> Enum.map(&SQLExprType.type_of(&1, types)) |> Enum.map(&family/1)
+    families = values |> Enum.map(&SQLExprType.known_type(&1, types)) |> Enum.map(&family/1)
 
     if "Utf8" in families and Enum.all?(families, &(&1 in [nil, "Utf8" | @numbers])) do
       {cast(operand, "Utf8", types),
@@ -167,9 +167,16 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
     if SQLExprType.type_of(expr, types) == "Int64", do: {:cast, expr, :float}, else: expr
   end
 
-  defp cast(expr, text, types) when text in ["Utf8", "Utf8View"] do
+  defp cast(expr, text, types) when text in ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"] do
     if SQLExprType.type_of(expr, types) in @numbers,
       do: {:cast, expr, :string},
+      else: expr
+  end
+
+  # An integer beside one of the other sign is a decimal.
+  defp cast(expr, "Decimal128(?)", types) do
+    if SQLExprType.type_of(expr, types) in ["Int64", "UInt64"],
+      do: {:cast, expr, :decimal},
       else: expr
   end
 

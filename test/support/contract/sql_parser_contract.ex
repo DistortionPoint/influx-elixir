@@ -115,6 +115,7 @@ defmodule InfluxElixir.Contract.SQLParser do
       {:literals_time, leap_second_tests()},
       {:functions_text, small_fidelity_tests()},
       {:parameters, parameter_tests()},
+      {:parameters, having_param_tests()},
       {:parameters, parameter_kind_tests()},
       {:parameters, parameter_type_tests()},
       {:parameters, request_param_tests()},
@@ -1640,6 +1641,119 @@ defmodule InfluxElixir.Contract.SQLParser do
                       status: 400,
                       body: "Error during planning: table 'public.iox.#{missing}' not found"
                     }}
+        end
+      end
+    end
+  end
+
+  defp having_param_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: parameters in a HAVING and in the plan's order" do
+        test "a HAVING binds its placeholders", ctx do
+          m = sp_measurement("sp_param_having")
+
+          sp_write(ctx, [
+            "#{m},host=a v=1i #{sp_ns(0)}",
+            "#{m},host=a v=2i #{sp_ns(1)}",
+            "#{m},host=b v=3i #{sp_ns(2)}"
+          ])
+
+          unbound = fn name ->
+            {:error,
+             %{
+               status: 400,
+               body: "Error during planning: No value found for placeholder with name $#{name}"
+             }}
+          end
+
+          having = "select host, count(*) as c from #{m} group by host having count(*) > $1"
+          both = {:ok, [%{"host" => "a", "c" => 2}, %{"host" => "b", "c" => 1}]}
+
+          assert sp_query(ctx, having) === unbound.("1")
+          assert sp_query(ctx, having, %{"2" => 1}) === unbound.("1")
+
+          assert sp_query(ctx, having <> " order by host", %{"1" => 1}) ===
+                   {:ok, [%{"host" => "a", "c" => 2}]}
+
+          assert sp_query(ctx, having <> " order by host", %{"1" => 0}) === both
+          assert sp_query(ctx, having, %{"1" => 100}) === {:ok, []}
+          assert sp_query(ctx, having, %{"1" => nil}) === {:ok, []}
+
+          # In an expression, a list, a range and an alias, and under DISTINCT.
+          for {sql, params, rows} <- [
+                {"select host, count(*) as c from #{m} group by host having count(*) + $1 > 2",
+                 %{"1" => 1}, [%{"host" => "a", "c" => 2}]},
+                {"select host, count(*) as c from #{m} group by host having count(*) in ($1, $2)",
+                 %{"1" => 2, "2" => 100}, [%{"host" => "a", "c" => 2}]},
+                {"select host, count(*) as c from #{m} group by host having count(*) between $1 and $2",
+                 %{"1" => 2, "2" => 100}, [%{"host" => "a", "c" => 2}]},
+                {"select host, count(*) as c from #{m} group by host having c > $1", %{"1" => 1},
+                 [%{"host" => "a", "c" => 2}]},
+                {"select host, sum(v) as s from #{m} group by host having sum(v) > $1",
+                 %{"1" => 2.5}, [%{"host" => "a", "s" => 3}, %{"host" => "b", "s" => 3}]},
+                {"select distinct host from #{m} group by host having count(*) > $1", %{"1" => 1},
+                 [%{"host" => "a"}]}
+              ] do
+            assert {:ok, answer} =
+                     sp_query(
+                       ctx,
+                       sql <>
+                         if(String.contains?(sql, "distinct"), do: "", else: " order by host"),
+                       params
+                     )
+
+            assert answer === rows, sql
+          end
+
+          assert sp_query(
+                   ctx,
+                   "select distinct host from #{m} group by host having count(*) > $1"
+                 ) === unbound.("1")
+
+          # A value the comparison has no type for is the type coercion's error.
+          assert sp_query(ctx, having, %{"1" => true}) ===
+                   {:error,
+                    %{
+                      status: 400,
+                      body:
+                        "type_coercion\ncaused by\nError during planning: Cannot infer common " <>
+                          "argument type for comparison operation Int64 > Boolean"
+                    }}
+        end
+
+        test "the planner meets the placeholders in the order of its plan", ctx do
+          m = sp_measurement("sp_param_order")
+          sp_write(ctx, ["#{m},host=a v=1i #{sp_ns(0)}"])
+
+          unbound = fn name ->
+            {:error,
+             %{
+               status: 400,
+               body: "Error during planning: No value found for placeholder with name $#{name}"
+             }}
+          end
+
+          # The WHERE, the HAVING, the select list, the ORDER BY, then OFFSET and LIMIT: each
+          # pair is asked with its names in both orders, and the first in the plan is named.
+          orders = [
+            fn a, b -> "select v + $#{b} as c from #{m} where v > $#{a}" end,
+            fn a, b ->
+              "select host, count(*) as c from #{m} where v > $#{a} group by host " <>
+                "having count(*) > $#{b}"
+            end,
+            fn a, b ->
+              "select host, count(*) + $#{b} as c from #{m} group by host " <>
+                "having count(*) > $#{a}"
+            end,
+            fn a, b -> "select v + $#{a} as c from #{m} order by v + $#{b}" end,
+            fn a, b -> "select v from #{m} order by v + $#{a} offset $#{b}" end,
+            fn a, b -> "select v from #{m} limit $#{b} offset $#{a}" end
+          ]
+
+          for build <- orders do
+            assert sp_query(ctx, build.("1", "2")) === unbound.("1")
+            assert sp_query(ctx, build.("2", "1")) === unbound.("2")
+          end
         end
       end
     end

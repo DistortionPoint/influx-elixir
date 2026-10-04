@@ -205,8 +205,6 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
       an aggregate row is stamped with it, and with the epoch without one
       (verified: `WHERE time >= 2` answers `mean` at 2 ns, `WHERE time < 3`
       at the epoch; with `GROUP BY` every series carries it)
-    * `:fields` - the measurement's field names, when `LIMIT` or `OFFSET`
-      need them (they are read from the rows otherwise)
   """
   @spec run(query(), [map()], MapSet.t(binary()), keyword()) :: [map()]
   defdelegate run(query, rows, tags, opts \\ []), to: InfluxQLRun
