@@ -98,9 +98,9 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
       and    := not ('AND' not)*
       not    := 'NOT' not | test
       test   := concat (comparison concat | 'IS' ... | 'NOT'? 'IN' ... | ...)*
-      concat := sum ('||' sum)*
+      concat := sum
       sum    := term   (('+' | '-') term)*
-      term   := factor (('*' | '/' | '%') factor)*
+      term   := factor (('*' | '/' | '%' | '||') factor)*
       factor := '-' factor | number | string | identifier | '(' or ')'
               | 'CASE' ... 'END' | function '(' [or (',' or)*] ')'
 
@@ -354,30 +354,24 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   end
 
   defp parse_like(left, tokens, kind, negated) do
-    with {:ok, pattern, rest} <- parse_concat(tokens) do
-      ilike = kind == "ILIKE"
-
-      regex =
-        case pattern do
-          {:lit, text} when is_binary(text) -> SQLCompare.like_regex(text, ilike)
-          _dynamic -> nil
-        end
-
+    with {:ok, pattern, rest} <- parse_concat(tokens),
+         ilike = kind == "ILIKE",
+         {:ok, regex} <- literal_regex(pattern, ilike) do
       {:ok, {:like, left, pattern, negated, ilike, regex}, rest}
     end
   end
 
+  @spec literal_regex(t(), boolean()) :: {:ok, Regex.t() | nil} | {:error, term()}
+  defp literal_regex({:lit, text}, ilike) when is_binary(text) do
+    SQLCompare.like_regex(text, ilike)
+  end
+
+  defp literal_regex(_dynamic, _ilike), do: {:ok, nil}
+
+  # The operand of a comparison, `BETWEEN`, `LIKE` and `IN`: the sums. `||` is read
+  # with the products, as the engine's parser does.
   @spec parse_concat([term()]) :: parsed()
-  defp parse_concat(tokens) do
-    with {:ok, left, rest} <- parse_sum(tokens), do: parse_concat_tail(left, rest)
-  end
-
-  defp parse_concat_tail(left, [{:tok, "||"} | rest]) do
-    with {:ok, right, rest} <- parse_sum(rest),
-         do: parse_concat_tail({:concat, left, right}, rest)
-  end
-
-  defp parse_concat_tail(left, rest), do: {:ok, left, rest}
+  defp parse_concat(tokens), do: parse_sum(tokens)
 
   @spec parse_sum([term()]) :: parsed()
   defp parse_sum(tokens) do
@@ -404,6 +398,14 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   defp parse_product_tail(left, [{:tok, op} | rest]) when op in ["*", "/", "%"] do
     with {:ok, right, rest} <- parse_factor(rest) do
       parse_product_tail({:op, operator(op), left, right}, rest)
+    end
+  end
+
+  # `||` has the precedence of `*`, `/` and `%`, left to right with them (verified on
+  # Core: `'a' || 1 + 2` is `('a' || 1) + 2`, an arithmetic error on text).
+  defp parse_product_tail(left, [{:tok, "||"} | rest]) do
+    with {:ok, right, rest} <- parse_factor(rest) do
+      parse_product_tail({:concat, left, right}, rest)
     end
   end
 

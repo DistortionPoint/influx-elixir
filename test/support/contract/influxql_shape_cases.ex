@@ -1121,7 +1121,46 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
             "a_1" => ~U[2023-11-14 22:16:20.000000Z],
             "count" => 5
           }}
-       ]}
+       ]},
+      {"select count(v), count(nosuch) from ~g1", [{"1970-01-01 00:00:00", %{"count" => 5}}]},
+      {"select count(nosuch), count(v) from ~g1", [{"1970-01-01 00:00:00", %{"count_1" => 5}}]},
+      {"select count(*), count(s) from ~g2",
+       [{"1970-01-01 00:00:00", %{"count_i" => 2, "count_u" => 2, "count_w" => 2}}]},
+      {"select count(*), count(nosuch) from ~g2",
+       [{"1970-01-01 00:00:00", %{"count_i" => 2, "count_u" => 2, "count_w" => 2}}]},
+      {"select count(v) + count(s) from ~g3", [{"1970-01-01 00:00:00", %{}}]},
+      {"select sum(v), count(s) from ~g3", [{"1970-01-01 00:00:00", %{"sum" => 1.0}}]},
+      {"select count(s), mean(v) from ~g1, ~g3",
+       [
+         {"1970-01-01 00:00:00", %{"count" => 5, "mean" => 3.0}},
+         {"1970-01-01 00:00:00", %{"mean" => 1.0}}
+       ]},
+      {"select count(s), last(v) from ~g3", [{"1970-01-01 00:00:00", %{"last" => 1.0}}]},
+      {"select count(v), count(nosuch) from ~g1 group by host",
+       [
+         {"1970-01-01 00:00:00", %{"count" => 3, "host" => "a"}},
+         {"1970-01-01 00:00:00", %{"count" => 2, "host" => "b"}}
+       ]},
+      {"select count(v), count(nosuch), count(n) from ~g1 group by host",
+       [
+         {"1970-01-01 00:00:00", %{"count" => 3, "count_2" => 3, "host" => "a"}},
+         {"1970-01-01 00:00:00", %{"count" => 2, "count_2" => 2, "host" => "b"}},
+         {"1970-01-01 00:00:00", %{"count" => 0, "count_2" => 2, "host" => "c"}}
+       ]},
+      {"select count(v), count(nosuch) from ~g1 where time >= '2023-11-14T22:00:00Z' and time < '2023-11-15T00:00:00Z' group by time(1h)",
+       [{"2023-11-14 22:00:00", %{"count" => 5}}, {"2023-11-14 23:00:00", %{"count" => 0}}]},
+      {"select count(nosuch), count(v) from ~g1 where time >= '2023-11-14T22:00:00Z' and time < '2023-11-15T00:00:00Z' group by time(1h) fill(0)",
+       [
+         {"2023-11-14 22:00:00", %{"count" => 0, "count_1" => 5}},
+         {"2023-11-14 23:00:00", %{"count" => 0, "count_1" => 0}}
+       ]},
+      {"select count(v), count(nosuch) as c from ~g1",
+       [{"1970-01-01 00:00:00", %{"count" => 5}}]},
+      {"select count(v), count(distinct nosuch) from ~g1",
+       [{"1970-01-01 00:00:00", %{"count" => 5}}]},
+      {"select count(distinct nosuch), count(v) from ~g1",
+       [{"1970-01-01 00:00:00", %{"count_1" => 5}}]},
+      {"select count(v), count(nosuch) + 1 from ~g1", [{"1970-01-01 00:00:00", %{"count" => 5}}]}
     ]
   end
 
@@ -2468,7 +2507,598 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
             "region_1" => "us"
           }}
        ]},
-      {"select *, * from nosuch", []}
+      {"select *, * from nosuch", []},
+      {"select top(v,1), host from ~g1 group by host",
+       [
+         {"2023-11-14 22:14:20", %{"host" => "a", "top" => 3.0}},
+         {"2023-11-14 22:16:20", %{"host" => "b", "top" => 5.0}}
+       ]},
+      {"select top(v,host,1), host from ~g1 group by host",
+       [
+         {"2023-11-14 22:14:20", %{"host" => "a", "host_1" => "a", "top" => 3.0}},
+         {"2023-11-14 22:16:20", %{"host" => "b", "host_1" => "b", "top" => 5.0}}
+       ]},
+      {"select top(v,host,1) as host_1 from ~g1 group by host",
+       {:error, 400,
+        "Error during planning: Projections require unique expression names but the expression \"~g1.v AS host_1\" at position 2 and \"~g1.host AS host_1\" at position 3 have the same name. Consider aliasing (\"AS\") one of them."}},
+      {"select top(v,host,1) as host_1, host from ~g1 group by host",
+       {:error, 400,
+        "Error during planning: Projections require unique expression names but the expression \"~g1.v AS host_1\" at position 1 and \"~g1.host AS host_1\" at position 3 have the same name. Consider aliasing (\"AS\") one of them."}},
+      {"select top(v,host,1) from ~g1 group by host",
+       [
+         {"2023-11-14 22:14:20", %{"host" => "a", "host_1" => "a", "top" => 3.0}},
+         {"2023-11-14 22:16:20", %{"host" => "b", "host_1" => "b", "top" => 5.0}}
+       ]},
+      {"select top(v,host,1), host_1 from ~g1 group by host",
+       {:error, 400,
+        "Error during planning: Projections require unique expression names but the expression \"~g1.host AS host_1\" at position 3 and \"NULL AS host_1\" at position 4 have the same name. Consider aliasing (\"AS\") one of them."}},
+      {"select top(v,host,1), host, host from ~g1 group by host",
+       {:error, 400,
+        "Error during planning: Projections require unique expression names but the expression \"~g1.host AS host_1\" at position 3 and \"~g1.host AS host_1\" at position 4 have the same name. Consider aliasing (\"AS\") one of them."}},
+      {"select top(v,1) as host, host from ~g1 group by host",
+       {:error, 400,
+        "Error during planning: Projections require unique expression names but the expression \"~g1.v AS host_1\" at position 2 and \"~g1.host AS host_1\" at position 3 have the same name. Consider aliasing (\"AS\") one of them."}},
+      {"select top(v,1) as host_1, host from ~g1 group by host",
+       [
+         {"2023-11-14 22:14:20", %{"host" => "a", "host_1" => 3.0}},
+         {"2023-11-14 22:16:20", %{"host" => "b", "host_1" => 5.0}}
+       ]},
+      {"select top(v,1), host as h from ~g1 group by host",
+       [
+         {"2023-11-14 22:14:20", %{"h" => "a", "host" => "a", "top" => 3.0}},
+         {"2023-11-14 22:16:20", %{"h" => "b", "host" => "b", "top" => 5.0}}
+       ]},
+      {"select top(v,host,1), host as h from ~g1 group by host",
+       [
+         {"2023-11-14 22:14:20", %{"h" => "a", "host" => "a", "host_1" => "a", "top" => 3.0}},
+         {"2023-11-14 22:16:20", %{"h" => "b", "host" => "b", "host_1" => "b", "top" => 5.0}}
+       ]},
+      {"select top(v,host,1), host, region from ~g1 group by host",
+       [
+         {"2023-11-14 22:14:20",
+          %{"host" => "a", "host_1" => "a", "region" => "eu", "top" => 3.0}},
+         {"2023-11-14 22:16:20",
+          %{"host" => "b", "host_1" => "b", "region" => "us", "top" => 5.0}}
+       ]},
+      {"select top(v,region,host,1), host, region from ~g1 group by region",
+       [
+         {"2023-11-14 22:14:20",
+          %{"host" => "a", "host_1" => "a", "region" => "eu", "region_1" => "eu", "top" => 3.0}},
+         {"2023-11-14 22:16:20",
+          %{"host" => "b", "host_1" => "b", "region" => "us", "region_1" => "us", "top" => 5.0}}
+       ]},
+      {"select top(v,1), host from ~g1 group by host, region",
+       [
+         {"2023-11-14 22:14:20", %{"host" => "a", "region" => "eu", "top" => 3.0}},
+         {"2023-11-14 22:16:20", %{"host" => "b", "region" => "us", "top" => 5.0}}
+       ]},
+      {"select host, top(v,host,1) from ~g1 group by host",
+       [
+         {"2023-11-14 22:14:20", %{"host" => "a", "host_1" => "a", "top" => 3.0}},
+         {"2023-11-14 22:16:20", %{"host" => "b", "host_1" => "b", "top" => 5.0}}
+       ]},
+      {"select bottom(v,host,1), host from ~g1 group by host",
+       [
+         {"2023-11-14 22:13:20", %{"bottom" => 1.0, "host" => "a", "host_1" => "a"}},
+         {"2023-11-14 22:15:20", %{"bottom" => 4.0, "host" => "b", "host_1" => "b"}}
+       ]},
+      {"select top(v,host,1), host from ~g1",
+       [{"2023-11-14 22:16:20", %{"host" => "b", "host_1" => "b", "top" => 5.0}}]},
+      {"select top(v,2), n from ~g1 group by host",
+       [
+         {"2023-11-14 22:13:50", %{"host" => "a", "n" => 2, "top" => 2.0}},
+         {"2023-11-14 22:14:20", %{"host" => "a", "n" => 3, "top" => 3.0}},
+         {"2023-11-14 22:15:20", %{"host" => "b", "n" => 4, "top" => 4.0}},
+         {"2023-11-14 22:16:20", %{"host" => "b", "n" => 5, "top" => 5.0}},
+         {"2023-11-14 22:17:20", %{"host" => "c", "n" => 6}},
+         {"2023-11-14 23:13:20", %{"host" => "c", "n" => 7}}
+       ]},
+      {"select top(v,7), n from ~g1",
+       [
+         {"2023-11-14 22:13:20", %{"n" => 1, "top" => 1.0}},
+         {"2023-11-14 22:13:50", %{"n" => 2, "top" => 2.0}},
+         {"2023-11-14 22:14:20", %{"n" => 3, "top" => 3.0}},
+         {"2023-11-14 22:15:20", %{"n" => 4, "top" => 4.0}},
+         {"2023-11-14 22:16:20", %{"n" => 5, "top" => 5.0}},
+         {"2023-11-14 22:17:20", %{"n" => 6}},
+         {"2023-11-14 23:13:20", %{"n" => 7}}
+       ]},
+      {"select bottom(v,7), n from ~g1",
+       [
+         {"2023-11-14 22:13:20", %{"bottom" => 1.0, "n" => 1}},
+         {"2023-11-14 22:13:50", %{"bottom" => 2.0, "n" => 2}},
+         {"2023-11-14 22:14:20", %{"bottom" => 3.0, "n" => 3}},
+         {"2023-11-14 22:15:20", %{"bottom" => 4.0, "n" => 4}},
+         {"2023-11-14 22:16:20", %{"bottom" => 5.0, "n" => 5}},
+         {"2023-11-14 22:17:20", %{"n" => 6}},
+         {"2023-11-14 23:13:20", %{"n" => 7}}
+       ]},
+      {"select top(v,2), s from ~g1 where host = 'c'", [{"2023-11-14 22:17:20", %{"s" => "x"}}]},
+      {"select top(v,2), host from ~g1 where host = 'c'", []},
+      {"select top(v,3), n from ~g1 where host = 'c'",
+       [{"2023-11-14 22:17:20", %{"n" => 6}}, {"2023-11-14 23:13:20", %{"n" => 7}}]},
+      {"select top(v,host,5), n from ~g1",
+       [
+         {"2023-11-14 22:14:20", %{"host" => "a", "n" => 3, "top" => 3.0}},
+         {"2023-11-14 22:16:20", %{"host" => "b", "n" => 5, "top" => 5.0}},
+         {"2023-11-14 22:17:20", %{"host" => "c", "n" => 6}}
+       ]},
+      {"select top(v,2) as n, n from ~g1 group by host",
+       [
+         {"2023-11-14 22:13:50", %{"host" => "a", "n" => 2.0, "n_1" => 2}},
+         {"2023-11-14 22:14:20", %{"host" => "a", "n" => 3.0, "n_1" => 3}},
+         {"2023-11-14 22:15:20", %{"host" => "b", "n" => 4.0, "n_1" => 4}},
+         {"2023-11-14 22:16:20", %{"host" => "b", "n" => 5.0, "n_1" => 5}},
+         {"2023-11-14 22:17:20", %{"host" => "c", "n_1" => 6}},
+         {"2023-11-14 23:13:20", %{"host" => "c", "n_1" => 7}}
+       ]},
+      {"select (s) from ~g1",
+       [
+         {"2023-11-14 22:13:20", %{"s" => "x"}},
+         {"2023-11-14 22:13:50", %{"s" => "x"}},
+         {"2023-11-14 22:14:20", %{"s" => "y"}},
+         {"2023-11-14 22:15:20", %{"s" => "y"}},
+         {"2023-11-14 22:17:20", %{"s" => "x"}}
+       ]},
+      {"select ((s)) from ~g1",
+       [
+         {"2023-11-14 22:13:20", %{"s" => "x"}},
+         {"2023-11-14 22:13:50", %{"s" => "x"}},
+         {"2023-11-14 22:14:20", %{"s" => "y"}},
+         {"2023-11-14 22:15:20", %{"s" => "y"}},
+         {"2023-11-14 22:17:20", %{"s" => "x"}}
+       ]},
+      {"select +s from ~g1",
+       [
+         {"2023-11-14 22:13:20", %{"s" => "x"}},
+         {"2023-11-14 22:13:50", %{"s" => "x"}},
+         {"2023-11-14 22:14:20", %{"s" => "y"}},
+         {"2023-11-14 22:15:20", %{"s" => "y"}},
+         {"2023-11-14 22:17:20", %{"s" => "x"}}
+       ]},
+      {"select (b) from ~g1",
+       [{"2023-11-14 22:13:20", %{"b" => true}}, {"2023-11-14 22:15:20", %{"b" => false}}]},
+      {"select +b from ~g1",
+       [{"2023-11-14 22:13:20", %{"b" => true}}, {"2023-11-14 22:15:20", %{"b" => false}}]},
+      {"select (s) as t from ~g1",
+       [
+         {"2023-11-14 22:13:20", %{"t" => "x"}},
+         {"2023-11-14 22:13:50", %{"t" => "x"}},
+         {"2023-11-14 22:14:20", %{"t" => "y"}},
+         {"2023-11-14 22:15:20", %{"t" => "y"}},
+         {"2023-11-14 22:17:20", %{"t" => "x"}}
+       ]},
+      {"select (host), s from ~g1",
+       [
+         {"2023-11-14 22:13:20", %{"host" => "a", "s" => "x"}},
+         {"2023-11-14 22:13:50", %{"host" => "a", "s" => "x"}},
+         {"2023-11-14 22:14:20", %{"host" => "a", "s" => "y"}},
+         {"2023-11-14 22:15:20", %{"host" => "b", "s" => "y"}},
+         {"2023-11-14 22:17:20", %{"host" => "c", "s" => "x"}}
+       ]},
+      {"select (s), s from ~g1",
+       [
+         {"2023-11-14 22:13:20", %{"s" => "x", "s_1" => "x"}},
+         {"2023-11-14 22:13:50", %{"s" => "x", "s_1" => "x"}},
+         {"2023-11-14 22:14:20", %{"s" => "y", "s_1" => "y"}},
+         {"2023-11-14 22:15:20", %{"s" => "y", "s_1" => "y"}},
+         {"2023-11-14 22:17:20", %{"s" => "x", "s_1" => "x"}}
+       ]},
+      {"select s, (s), +s from ~g1",
+       [
+         {"2023-11-14 22:13:20", %{"s" => "x", "s_1" => "x", "s_2" => "x"}},
+         {"2023-11-14 22:13:50", %{"s" => "x", "s_1" => "x", "s_2" => "x"}},
+         {"2023-11-14 22:14:20", %{"s" => "y", "s_1" => "y", "s_2" => "y"}},
+         {"2023-11-14 22:15:20", %{"s" => "y", "s_1" => "y", "s_2" => "y"}},
+         {"2023-11-14 22:17:20", %{"s" => "x", "s_1" => "x", "s_2" => "x"}}
+       ]},
+      {"select (n) from ~g1",
+       [
+         {"2023-11-14 22:13:20", %{"n" => 1}},
+         {"2023-11-14 22:13:50", %{"n" => 2}},
+         {"2023-11-14 22:14:20", %{"n" => 3}},
+         {"2023-11-14 22:15:20", %{"n" => 4}},
+         {"2023-11-14 22:16:20", %{"n" => 5}},
+         {"2023-11-14 22:17:20", %{"n" => 6}},
+         {"2023-11-14 23:13:20", %{"n" => 7}}
+       ]},
+      {"select time as v, * from ~g1",
+       [
+         nil: %{
+           "b" => true,
+           "host" => "a",
+           "n" => 1,
+           "region" => "eu",
+           "s" => "x",
+           "v" => ~U[2023-11-14 22:13:20.000000Z],
+           "v_1" => 1.0
+         },
+         nil: %{
+           "host" => "a",
+           "n" => 2,
+           "region" => "eu",
+           "s" => "x",
+           "v" => ~U[2023-11-14 22:13:50.000000Z],
+           "v_1" => 2.0
+         },
+         nil: %{
+           "host" => "a",
+           "n" => 3,
+           "region" => "eu",
+           "s" => "y",
+           "v" => ~U[2023-11-14 22:14:20.000000Z],
+           "v_1" => 3.0
+         },
+         nil: %{
+           "b" => false,
+           "host" => "b",
+           "n" => 4,
+           "region" => "us",
+           "s" => "y",
+           "v" => ~U[2023-11-14 22:15:20.000000Z],
+           "v_1" => 4.0
+         },
+         nil: %{
+           "host" => "b",
+           "n" => 5,
+           "region" => "us",
+           "v" => ~U[2023-11-14 22:16:20.000000Z],
+           "v_1" => 5.0
+         },
+         nil: %{
+           "host" => "c",
+           "n" => 6,
+           "region" => "us",
+           "s" => "x",
+           "v" => ~U[2023-11-14 22:17:20.000000Z]
+         },
+         nil: %{"host" => "c", "n" => 7, "region" => "us", "v" => ~U[2023-11-14 23:13:20.000000Z]}
+       ]},
+      {"select *, time as v from ~g1",
+       [
+         nil: %{
+           "b" => true,
+           "host" => "a",
+           "n" => 1,
+           "region" => "eu",
+           "s" => "x",
+           "v" => 1.0,
+           "v_1" => ~U[2023-11-14 22:13:20.000000Z]
+         },
+         nil: %{
+           "host" => "a",
+           "n" => 2,
+           "region" => "eu",
+           "s" => "x",
+           "v" => 2.0,
+           "v_1" => ~U[2023-11-14 22:13:50.000000Z]
+         },
+         nil: %{
+           "host" => "a",
+           "n" => 3,
+           "region" => "eu",
+           "s" => "y",
+           "v" => 3.0,
+           "v_1" => ~U[2023-11-14 22:14:20.000000Z]
+         },
+         nil: %{
+           "b" => false,
+           "host" => "b",
+           "n" => 4,
+           "region" => "us",
+           "s" => "y",
+           "v" => 4.0,
+           "v_1" => ~U[2023-11-14 22:15:20.000000Z]
+         },
+         nil: %{
+           "host" => "b",
+           "n" => 5,
+           "region" => "us",
+           "v" => 5.0,
+           "v_1" => ~U[2023-11-14 22:16:20.000000Z]
+         },
+         nil: %{
+           "host" => "c",
+           "n" => 6,
+           "region" => "us",
+           "s" => "x",
+           "v_1" => ~U[2023-11-14 22:17:20.000000Z]
+         },
+         nil: %{
+           "host" => "c",
+           "n" => 7,
+           "region" => "us",
+           "v_1" => ~U[2023-11-14 23:13:20.000000Z]
+         }
+       ]},
+      {"select time as n, * from ~g1",
+       [
+         nil: %{
+           "b" => true,
+           "host" => "a",
+           "n" => ~U[2023-11-14 22:13:20.000000Z],
+           "n_1" => 1,
+           "region" => "eu",
+           "s" => "x",
+           "v" => 1.0
+         },
+         nil: %{
+           "host" => "a",
+           "n" => ~U[2023-11-14 22:13:50.000000Z],
+           "n_1" => 2,
+           "region" => "eu",
+           "s" => "x",
+           "v" => 2.0
+         },
+         nil: %{
+           "host" => "a",
+           "n" => ~U[2023-11-14 22:14:20.000000Z],
+           "n_1" => 3,
+           "region" => "eu",
+           "s" => "y",
+           "v" => 3.0
+         },
+         nil: %{
+           "b" => false,
+           "host" => "b",
+           "n" => ~U[2023-11-14 22:15:20.000000Z],
+           "n_1" => 4,
+           "region" => "us",
+           "s" => "y",
+           "v" => 4.0
+         },
+         nil: %{
+           "host" => "b",
+           "n" => ~U[2023-11-14 22:16:20.000000Z],
+           "n_1" => 5,
+           "region" => "us",
+           "v" => 5.0
+         },
+         nil: %{
+           "host" => "c",
+           "n" => ~U[2023-11-14 22:17:20.000000Z],
+           "n_1" => 6,
+           "region" => "us",
+           "s" => "x"
+         },
+         nil: %{
+           "host" => "c",
+           "n" => ~U[2023-11-14 23:13:20.000000Z],
+           "n_1" => 7,
+           "region" => "us"
+         }
+       ]},
+      {"select time as host, * from ~g1",
+       [
+         nil: %{
+           "b" => true,
+           "host" => ~U[2023-11-14 22:13:20.000000Z],
+           "host_1" => "a",
+           "n" => 1,
+           "region" => "eu",
+           "s" => "x",
+           "v" => 1.0
+         },
+         nil: %{
+           "host" => ~U[2023-11-14 22:13:50.000000Z],
+           "host_1" => "a",
+           "n" => 2,
+           "region" => "eu",
+           "s" => "x",
+           "v" => 2.0
+         },
+         nil: %{
+           "host" => ~U[2023-11-14 22:14:20.000000Z],
+           "host_1" => "a",
+           "n" => 3,
+           "region" => "eu",
+           "s" => "y",
+           "v" => 3.0
+         },
+         nil: %{
+           "b" => false,
+           "host" => ~U[2023-11-14 22:15:20.000000Z],
+           "host_1" => "b",
+           "n" => 4,
+           "region" => "us",
+           "s" => "y",
+           "v" => 4.0
+         },
+         nil: %{
+           "host" => ~U[2023-11-14 22:16:20.000000Z],
+           "host_1" => "b",
+           "n" => 5,
+           "region" => "us",
+           "v" => 5.0
+         },
+         nil: %{
+           "host" => ~U[2023-11-14 22:17:20.000000Z],
+           "host_1" => "c",
+           "n" => 6,
+           "region" => "us",
+           "s" => "x"
+         },
+         nil: %{
+           "host" => ~U[2023-11-14 23:13:20.000000Z],
+           "host_1" => "c",
+           "n" => 7,
+           "region" => "us"
+         }
+       ]},
+      {"select *, time as host from ~g1",
+       [
+         nil: %{
+           "b" => true,
+           "host" => "a",
+           "host_1" => ~U[2023-11-14 22:13:20.000000Z],
+           "n" => 1,
+           "region" => "eu",
+           "s" => "x",
+           "v" => 1.0
+         },
+         nil: %{
+           "host" => "a",
+           "host_1" => ~U[2023-11-14 22:13:50.000000Z],
+           "n" => 2,
+           "region" => "eu",
+           "s" => "x",
+           "v" => 2.0
+         },
+         nil: %{
+           "host" => "a",
+           "host_1" => ~U[2023-11-14 22:14:20.000000Z],
+           "n" => 3,
+           "region" => "eu",
+           "s" => "y",
+           "v" => 3.0
+         },
+         nil: %{
+           "b" => false,
+           "host" => "b",
+           "host_1" => ~U[2023-11-14 22:15:20.000000Z],
+           "n" => 4,
+           "region" => "us",
+           "s" => "y",
+           "v" => 4.0
+         },
+         nil: %{
+           "host" => "b",
+           "host_1" => ~U[2023-11-14 22:16:20.000000Z],
+           "n" => 5,
+           "region" => "us",
+           "v" => 5.0
+         },
+         nil: %{
+           "host" => "c",
+           "host_1" => ~U[2023-11-14 22:17:20.000000Z],
+           "n" => 6,
+           "region" => "us",
+           "s" => "x"
+         },
+         nil: %{
+           "host" => "c",
+           "host_1" => ~U[2023-11-14 23:13:20.000000Z],
+           "n" => 7,
+           "region" => "us"
+         }
+       ]},
+      {"select time as t, * from ~g1",
+       [
+         nil: %{
+           "b" => true,
+           "host" => "a",
+           "n" => 1,
+           "region" => "eu",
+           "s" => "x",
+           "t" => ~U[2023-11-14 22:13:20.000000Z],
+           "v" => 1.0
+         },
+         nil: %{
+           "host" => "a",
+           "n" => 2,
+           "region" => "eu",
+           "s" => "x",
+           "t" => ~U[2023-11-14 22:13:50.000000Z],
+           "v" => 2.0
+         },
+         nil: %{
+           "host" => "a",
+           "n" => 3,
+           "region" => "eu",
+           "s" => "y",
+           "t" => ~U[2023-11-14 22:14:20.000000Z],
+           "v" => 3.0
+         },
+         nil: %{
+           "b" => false,
+           "host" => "b",
+           "n" => 4,
+           "region" => "us",
+           "s" => "y",
+           "t" => ~U[2023-11-14 22:15:20.000000Z],
+           "v" => 4.0
+         },
+         nil: %{
+           "host" => "b",
+           "n" => 5,
+           "region" => "us",
+           "t" => ~U[2023-11-14 22:16:20.000000Z],
+           "v" => 5.0
+         },
+         nil: %{
+           "host" => "c",
+           "n" => 6,
+           "region" => "us",
+           "s" => "x",
+           "t" => ~U[2023-11-14 22:17:20.000000Z]
+         },
+         nil: %{"host" => "c", "n" => 7, "region" => "us", "t" => ~U[2023-11-14 23:13:20.000000Z]}
+       ]},
+      {"select top(v,2), time as t from ~g1",
+       {:error, 500,
+        "Schema error: No field named t. Valid fields are ~g1.b, ~g1.host, ~g1.n, ~g1.region, ~g1.s, ~g1.time, ~g1.v."}},
+      {"select top(v,2), time as t, n from ~g1",
+       {:error, 500,
+        "Schema error: No field named t. Valid fields are ~g1.b, ~g1.host, ~g1.n, ~g1.region, ~g1.s, ~g1.time, ~g1.v."}},
+      {"select top(v,2), n, time as t from ~g1",
+       {:error, 500,
+        "Schema error: No field named t. Valid fields are ~g1.b, ~g1.host, ~g1.n, ~g1.region, ~g1.s, ~g1.time, ~g1.v."}},
+      {"select top(v,2), n, time as t from ~g1 where host = 'zz'",
+       {:error, 500,
+        "Schema error: No field named t. Valid fields are ~g1.b, ~g1.host, ~g1.n, ~g1.region, ~g1.s, ~g1.time, ~g1.v."}},
+      {"select bottom(v,2), time as t from ~g1",
+       {:error, 500,
+        "Schema error: No field named t. Valid fields are ~g1.b, ~g1.host, ~g1.n, ~g1.region, ~g1.s, ~g1.time, ~g1.v."}},
+      {"select top(v,2), n, time as t from ~g1 group by host",
+       {:error, 500,
+        "Schema error: No field named t. Valid fields are ~g1.b, ~g1.host, ~g1.n, ~g1.region, ~g1.s, ~g1.time, ~g1.v."}},
+      {"select top(v,2), time as t from ~g3",
+       {:error, 500, "Schema error: No field named t. Valid fields are ~g3.time, ~g3.v."}},
+      {"select top(v,2), time as v from ~g1",
+       [
+         nil: %{"top" => 4.0, "v" => ~U[2023-11-14 22:15:20.000000Z]},
+         nil: %{"top" => 5.0, "v" => ~U[2023-11-14 22:16:20.000000Z]}
+       ]},
+      {"select top(nosuch,1), n from ~g1",
+       {:error, 500,
+        "Schema error: No field named nosuch. Valid fields are ~g1.b, ~g1.host, ~g1.n, ~g1.region, ~g1.s, ~g1.time, ~g1.v."}},
+      {"select top(nosuch,host,1), n from ~g1",
+       {:error, 500,
+        "Schema error: No field named nosuch. Valid fields are ~g1.b, ~g1.host, ~g1.n, ~g1.region, ~g1.s, ~g1.time, ~g1.v."}},
+      {"select top(nosuch,1), n from ~g1 where host = 'zz'",
+       {:error, 500,
+        "Schema error: No field named nosuch. Valid fields are ~g1.b, ~g1.host, ~g1.n, ~g1.region, ~g1.s, ~g1.time, ~g1.v."}},
+      {"select top(nosuch,1), n, time as t from ~g1",
+       {:error, 500,
+        "Schema error: No field named nosuch. Valid fields are ~g1.b, ~g1.host, ~g1.n, ~g1.region, ~g1.s, ~g1.time, ~g1.v."}},
+      {"select top(nosuch,1), host from ~g1", []},
+      {"select top(v,2), n, time from ~g1",
+       [
+         {"2023-11-14 22:15:20", %{"n" => 4, "top" => 4.0}},
+         {"2023-11-14 22:16:20", %{"n" => 5, "top" => 5.0}}
+       ]},
+      {"select top(v,2), time as t from nosuch", []},
+      {"select top(v,7), n from ~g1 order by time desc",
+       [
+         {"2023-11-14 23:13:20", %{"n" => 7}},
+         {"2023-11-14 22:17:20", %{"n" => 6}},
+         {"2023-11-14 22:16:20", %{"n" => 5, "top" => 5.0}},
+         {"2023-11-14 22:15:20", %{"n" => 4, "top" => 4.0}},
+         {"2023-11-14 22:14:20", %{"n" => 3, "top" => 3.0}},
+         {"2023-11-14 22:13:50", %{"n" => 2, "top" => 2.0}},
+         {"2023-11-14 22:13:20", %{"n" => 1, "top" => 1.0}}
+       ]},
+      {"select top(v,3), n from ~g1 limit 2 offset 1",
+       [
+         {"2023-11-14 22:15:20", %{"n" => 4, "top" => 4.0}},
+         {"2023-11-14 22:16:20", %{"n" => 5, "top" => 5.0}}
+       ]},
+      {"select top(v,2), n, s from ~g1 where time >= '2023-11-14T22:00:00Z' and time < '2023-11-15T00:00:00Z' group by time(30m)",
+       [
+         {"2023-11-14 22:15:20", %{"n" => 4, "s" => "y", "top" => 4.0}},
+         {"2023-11-14 22:16:20", %{"n" => 5, "top" => 5.0}},
+         {"2023-11-14 23:13:20", %{"n" => 7}}
+       ]}
     ]
   end
 
@@ -3167,7 +3797,147 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
        ]},
       {"select n from ~g1 where -9223372036854775807 - 2 / 0 = 0", []},
       {"select n from ~g1 where abs(-9223372036854775807 - 1) = 1", :closed},
-      {"select *, * from ~g1 where v > 100", []}
+      {"select *, * from ~g1 where v > 100", []},
+      {"select n from ~g1 where abs(1) != 'x'", []},
+      {"select n from ~g1 where abs(v) < 's'", []},
+      {"select n from ~g1 where abs(-n) != s", []},
+      {"select n from ~g1 where 'a' + 'b' != 0", []},
+      {"select n from ~g1 where abs(n) < 'x'", []},
+      {"select n from ~g1 where abs(1) = true", []},
+      {"select n from ~g1 where abs(n) < true", []},
+      {"select n from ~g1 where -v != 'x'", []},
+      {"select n from ~g1 where n / 2 < s", []},
+      {"select n from ~g1 where 1 / 0 != 'x'", []},
+      {"select n from ~g1 where (s) != 0", []},
+      {"select n from ~g1 where n / 0 = 'x'", []},
+      {"select n from ~g1 where abs(n) != host", []},
+      {"select n from ~g1 where n * 2 = true", []},
+      {"select n from ~g1 where n * 2 != false", []},
+      {"select n from ~g1 where n * 2 !~ /1/", []},
+      {"select n from ~g1 where n + 1 =~ /1/", []},
+      {"select n from ~g1 where 1 = 'x'", []},
+      {"select n from ~g1 where 'a' != 1", []},
+      {"select n from ~g1 where (n) != 'x'", []},
+      {"select n from ~g1 where n != s", []},
+      {"select n from ~g1 where b != n", []},
+      {"select n from ~g1 where host < n + 1", []},
+      {"select n from ~g1 where host != 1", []},
+      {"select n from ~g1 where abs(n) != 'x' and n = 1", []},
+      {"select n from ~g1 where (abs(n) != 'x') or n = 1",
+       [{"2023-11-14 22:13:20", %{"n" => 1}}]},
+      {"select n from ~g1 where abs(n) = 'x' or n = 1", [{"2023-11-14 22:13:20", %{"n" => 1}}]},
+      {"select n from ~g1 where host = (host)", []},
+      {"select n from ~g1 where (host) = host", []},
+      {"select n from ~g1 where (host) < 'x'", []},
+      {"select n from ~g1 where 'x' < (s)", []},
+      {"select n from ~g1 where (s) < 'y'", []},
+      {"select n from ~g1 where (b) < true", []},
+      {"select n from ~g1 where abs(n) < 3",
+       [{"2023-11-14 22:13:20", %{"n" => 1}}, {"2023-11-14 22:13:50", %{"n" => 2}}]},
+      {"select n from ~g1 where abs(v) =~ /1/", []},
+      {"select n from ~g1 where abs(-s) > 0", []},
+      {"select n from ~g1 where abs(host + 1) > 0", []},
+      {"select n from ~g1 where abs(n) + 1 > 2",
+       [
+         {"2023-11-14 22:13:50", %{"n" => 2}},
+         {"2023-11-14 22:14:20", %{"n" => 3}},
+         {"2023-11-14 22:15:20", %{"n" => 4}},
+         {"2023-11-14 22:16:20", %{"n" => 5}},
+         {"2023-11-14 22:17:20", %{"n" => 6}},
+         {"2023-11-14 23:13:20", %{"n" => 7}}
+       ]},
+      {"select u from ~g2 where u * -9223372036854775808 > 0", :closed},
+      {"select u from ~g2 where u + -9223372036854775808 = 0", :closed},
+      {"select u from ~g2 where -9223372036854775808 - u < 0", :closed},
+      {"select u from ~g2 where u * -1 > 5",
+       [{"2023-11-14 22:13:20", %{"u" => 5}}, {"2023-11-14 22:13:21", %{"u" => 7}}]},
+      {"select n from ~g1 where abs()",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: 'abs' does not support zero arguments No function matches the given name and argument types 'abs()'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where (abs())",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: 'abs' does not support zero arguments No function matches the given name and argument types 'abs()'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs() > 0",
+       {:error, 400,
+        "Error during planning: 'abs' does not support zero arguments No function matches the given name and argument types 'abs()'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where -abs()",
+       {:error, 400,
+        "Error during planning: 'abs' does not support zero arguments No function matches the given name and argument types 'abs()'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs() + 1",
+       {:error, 400,
+        "Error during planning: 'abs' does not support zero arguments No function matches the given name and argument types 'abs()'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs() and n = 1",
+       {:error, 400,
+        "Error during planning: 'abs' does not support zero arguments No function matches the given name and argument types 'abs()'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs(v, n)",
+       {:error, 400, "Error during planning: Function 'abs' expects 1 arguments but received 2"}},
+      {"select n from ~g1 where abs(v, n, 1)",
+       {:error, 400, "Error during planning: Function 'abs' expects 1 arguments but received 3"}},
+      {"select n from ~g1 where (abs(v, n))",
+       {:error, 400, "Error during planning: Function 'abs' expects 1 arguments but received 2"}},
+      {"select n from ~g1 where abs(1, 2)",
+       {:error, 400, "Error during planning: Function 'abs' expects 1 arguments but received 2"}},
+      {"select n from ~g1 where abs(v, n) > 0",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs(v, n) + 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs(v, n) and n = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where n = 1 and abs(v, n)",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs(s)",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::String"}},
+      {"select n from ~g1 where (abs(s))",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::String"}},
+      {"select n from ~g1 where -abs(s)",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::String No function matches the given name and argument types 'abs(Utf8)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs(s) + 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::String No function matches the given name and argument types 'abs(Utf8)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs(s) and n = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::String No function matches the given name and argument types 'abs(Utf8)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs(s) or n = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::String No function matches the given name and argument types 'abs(Utf8)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs(abs(s))",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::String"}},
+      {"select n from ~g1 where abs(abs())",
+       {:error, 400,
+        "Error during planning: 'abs' does not support zero arguments No function matches the given name and argument types 'abs()'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~g1 where abs(abs(v, n))",
+       {:error, 400, "Error during planning: Function 'abs' expects 1 arguments but received 2"}},
+      {"select u from ~g2 where u + 1 = true",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select u from ~g2 where (u) != true",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 != Boolean"}},
+      {"select u from ~g2 where abs(u) < true",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 < Boolean"}},
+      {"select u from ~g2 where u / 2 >= true",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 >= Boolean"}},
+      {"select u from ~g2 where -u <> false",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 != Boolean"}},
+      {"select u from ~g2 where u > 'a' + 'b'", []},
+      {"select u from ~g2 where 'a' + 'b' < u", []},
+      {"select u from ~g2 where u * 1.5 = true", []},
+      {"select u from ~g2 where 9223372036854775808 * u > 0",
+       [{"2023-11-14 22:13:20", %{"u" => 5}}, {"2023-11-14 22:13:21", %{"u" => 7}}]},
+      {"select u from ~g2 where i * -9223372036854775808 > 0", []},
+      {"select u from ~g2 where i + u > 0",
+       [{"2023-11-14 22:13:20", %{"u" => 5}}, {"2023-11-14 22:13:21", %{"u" => 7}}]}
     ]
   end
 
@@ -3709,7 +4479,22 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
        ]},
       {"select max(time), time + 1 from ~g1",
        {:error, 400,
-        "rewriting statement\ncaused by\nexpand projection\ncaused by\nError during planning: incompatible operands for operator +: timestamp and integer"}}
+        "rewriting statement\ncaused by\nexpand projection\ncaused by\nError during planning: incompatible operands for operator +: timestamp and integer"}},
+      {"select u from ~g2 where u < 'a' + 'b'",
+       [{"2023-11-14 22:13:20", %{"u" => 5}}, {"2023-11-14 22:13:21", %{"u" => 7}}]},
+      {"select u from ~g2 where 'a' + 'b' > u",
+       [{"2023-11-14 22:13:20", %{"u" => 5}}, {"2023-11-14 22:13:21", %{"u" => 7}}]},
+      {"select top(v,2), n * 2 from ~g1",
+       [
+         {"2023-11-14 22:15:20", %{"n" => 8, "top" => 4.0}},
+         {"2023-11-14 22:16:20", %{"n" => 10, "top" => 5.0}}
+       ]},
+      {"select top(v,2), abs(n) from ~g1",
+       [
+         {"2023-11-14 22:15:20", %{"abs" => 4, "top" => 4.0}},
+         {"2023-11-14 22:16:20", %{"abs" => 5, "top" => 5.0}}
+       ]},
+      {"select top(host,1), n from ~g1", [{"2023-11-14 22:17:20", %{"n" => 6, "top" => "c"}}]}
     ]
   end
 end

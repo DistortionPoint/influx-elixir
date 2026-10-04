@@ -19,7 +19,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     InfluxQLAggregate,
     InfluxQLError,
     InfluxQLExpr,
-    InfluxQLLiteral
+    InfluxQLLiteral,
+    InfluxQLNames
   }
 
   @numeric ~w(mean sum median spread stddev)
@@ -42,6 +43,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
          :ok <- item_errors(items, types, tags),
          :ok <- distinct_alone(items),
          :ok <- multi_rules(items),
+         :ok <- multi_schema(query, types, tags),
          :ok <- transforms(query),
          :ok <- group_needs_aggregate(items, group_time),
          :ok <- fill_needs_aggregate(query),
@@ -246,6 +248,68 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   defp number_text(number) when is_integer(number), do: Integer.to_string(number)
   defp number_text(number) when is_float(number), do: InfluxQLLiteral.display(number)
+
+  # What `top()` and `bottom()` read beside other columns (verified): a field the measurement
+  # lacks, with a field beside it, and a `time` that is aliased, are the schema error that lists
+  # the columns of the measurement (the field comes first, else the alias, unless that is a
+  # column); beside a tag as the field, or an expression of columns, the double has no answer.
+  @spec multi_schema(InfluxQL.query(), map(), MapSet.t(binary())) ::
+          :ok | {:error, {:engine, 500, binary()} | binary()}
+  defp multi_schema(%{items: items, measurement: table}, types, tags) do
+    case Enum.find(items, &match?({:multi, _kind, _field, _tags, _limit, _alias}, &1)) do
+      # a measurement the double knows no columns of is no schema to name
+      {:multi, _kind, _field, _by, _limit, _alias} when map_size(types) == 0 ->
+        :ok
+
+      {:multi, kind, field, _by, _limit, _alias} ->
+        columns = for {:column, column, name} = item <- items, do: {column, name, item}
+        multi_columns(kind, field, columns, items, {table, types, tags})
+
+      nil ->
+        :ok
+    end
+  end
+
+  defp multi_columns(kind, field, columns, items, {table, types, tags}) do
+    field_beside? =
+      Enum.any?(columns, fn {column, _name, _item} -> field?(column, types, tags) end)
+
+    aliased = Enum.find(columns, &aliased_time?/1)
+
+    cond do
+      Enum.any?(items, &match?({:expr, _ast, _alias}, &1)) ->
+        {:error, "unsupported InfluxQL (#{kind}() beside an expression)"}
+
+      field_beside? and MapSet.member?(tags, field) ->
+        {:error, "unsupported InfluxQL (#{kind}() of a tag beside a field)"}
+
+      field_beside? and not Map.has_key?(types, field) and field != "time" ->
+        schema_error(table, field, types, tags)
+
+      aliased != nil ->
+        {_column, name, _item} = aliased
+        if known_column?(name, types, tags), do: :ok, else: schema_error(table, name, types, tags)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp known_column?(name, types, tags),
+    do: name == "time" or Map.has_key?(types, name) or MapSet.member?(tags, name)
+
+  defp aliased_time?({_column, name, item}),
+    do: InfluxQLNames.time_item?(item) and name != "time"
+
+  defp schema_error(table, name, types, tags) do
+    valid =
+      ["time" | Map.keys(types) ++ MapSet.to_list(tags)]
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.map_join(", ", &"#{table}.#{&1}")
+
+    {:error, {:engine, 500, "Schema error: No field named #{name}. Valid fields are #{valid}."}}
+  end
 
   # `top()` and `bottom()` stand alone: any other function beside them, or a
   # second one, is the engine's planning error (verified); columns beside them

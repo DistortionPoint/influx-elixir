@@ -184,18 +184,24 @@ defmodule InfluxElixir.Client.Local.Store do
   Drops a database with everything in it — points, schema, the
   duplicate index — so a re-created database starts empty. `:error` when
   it was not registered.
+
+  It takes the lock that `create_database/4` takes: a database created by another
+  process while this one removes the data of an earlier one of its name would otherwise lose
+  its retention and the points it was written.
   """
   @spec drop_database(t(), binary()) :: :ok | :error
   def drop_database(table, name) do
-    if database?(table, name) do
-      # The database goes first, so no reader finds it while its data is being removed.
-      :ets.delete(table, {:database, name})
-      delete_data(table, name)
-      :ets.delete(table, {:retention, name})
-      :ok
-    else
-      :error
-    end
+    with_lock(table, :databases, fn ->
+      if database?(table, name) do
+        # The database goes first, so no reader finds it while its data is being removed.
+        :ets.delete(table, {:database, name})
+        delete_data(table, name)
+        :ets.delete(table, {:retention, name})
+        :ok
+      else
+        :error
+      end
+    end)
   end
 
   # Everything written to a database or bucket: points, schema, the series

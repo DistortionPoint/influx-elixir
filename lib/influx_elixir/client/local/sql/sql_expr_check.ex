@@ -18,11 +18,23 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   # `COALESCE`, a comparison of `time`, a `CASE` condition that is not a
   # boolean) is refused by name. A type not known is never refused.
 
-  alias InfluxElixir.Client.Local.{SQLCast, SQLError, SQLExpr, SQLExprType}
+  alias InfluxElixir.Client.Local.{
+    SQLCast,
+    SQLError,
+    SQLExpr,
+    SQLExprType,
+    SQLNativeType,
+    SQLNullType,
+    SQLTyped
+  }
 
   @type context :: :select | :where | :order_by
 
+  # What the types of an operand are read with: the columns' types, and the nodes typed already.
+  @typep scope :: {%{binary() => binary()}, SQLTyped.t()}
+
   @tag "Dictionary(Int32, Utf8)"
+  @numbers ["Int64", "UInt64", "Float64", "Int32", "Int16", "Int8"]
 
   # What `AND` and `OR` accept: a boolean, or the null literal (typed `Null`).
   @logical ["Boolean", "Null"]
@@ -30,47 +42,57 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   # What a timestamp has no common type with, as the engine's `CASE` finds it.
   @not_time ["Boolean", "Int64", "UInt64", "Float64", "Int32", "Int16", "Int8"]
 
-  @doc "`:ok`, or the error for the operator at the top of `node` (its operands were checked)."
-  @spec check(SQLExpr.t(), %{binary() => binary()}, context()) :: :ok | {:error, map()}
-  def check({:cmp, op, left, right}, columns, context),
+  @doc """
+  `:ok`, or the error for the operator at the top of `node` (its operands were checked).
+  `known` are the nodes already typed (see `InfluxElixir.Client.Local.SQLTyped`), which the
+  operands are not typed again from.
+  """
+  @spec check(SQLExpr.t(), %{binary() => binary()}, context(), SQLTyped.t()) ::
+          :ok | {:error, map()}
+  def check(node, columns, context, known \\ []), do: check_node(node, {columns, known}, context)
+
+  @spec check_node(SQLExpr.t(), scope(), context()) :: :ok | {:error, map()}
+  defp check_node({:cmp, op, left, right}, columns, context),
     do: comparison(op, type(left, columns), type(right, columns), context)
 
-  def check({kind, left, right}, columns, context) when kind in [:and, :or],
+  defp check_node({kind, left, right}, columns, context) when kind in [:and, :or],
     do: check_logical(kind, left, right, columns, context)
 
-  def check({:not, inner}, columns, _context), do: boolean_operand(type(inner, columns))
+  defp check_node({:not, inner}, columns, _context), do: boolean_operand(type(inner, columns))
 
-  def check({:is_bool, inner, _value, _negated}, columns, _context),
+  defp check_node({:is_bool, inner, _value, _negated}, columns, _context),
     do: boolean_operand(type(inner, columns))
 
-  def check({:is_distinct, left, right, negated}, columns, context),
+  defp check_node({:is_distinct, left, right, negated}, columns, context),
     do: check_distinct(left, right, negated, columns, context)
 
-  def check({:like, inner, pattern, _negated, ilike, _regex}, columns, _context),
+  defp check_node({:like, inner, pattern, _negated, ilike, _regex}, columns, _context),
     do: check_like(inner, pattern, ilike, columns)
 
-  def check({:in, inner, items, _negated}, columns, _context),
+  defp check_node({:in, inner, items, _negated}, columns, _context),
     do: check_in(inner, items, columns)
 
-  def check({:between, inner, low, high, _negated}, columns, _context),
+  defp check_node({:between, inner, low, high, _negated}, columns, _context),
     do: check_between(inner, low, high, columns)
 
-  def check({:concat, left, right}, columns, context),
+  defp check_node({:concat, left, right}, columns, context),
     do: check_concat(left, right, columns, context)
 
-  def check({:cast, inner, target}, columns, _context),
+  defp check_node({:cast, inner, target}, columns, _context),
     do: check_cast(type(inner, columns), target)
 
-  def check({:case, operand, whens, otherwise}, columns, _context),
+  defp check_node({:case, operand, whens, otherwise}, columns, _context),
     do: check_case(operand, whens, otherwise, columns)
 
-  def check({:call, :coalesce, args}, columns, context),
+  defp check_node({:call, :coalesce, args}, columns, context),
     do: check_coalesce(args, columns, context)
 
-  def check({:call, :nullif, args}, columns, context), do: check_nullif(args, columns, context)
-  def check(_other, _columns, _context), do: :ok
+  defp check_node({:call, :nullif, args}, columns, context),
+    do: check_nullif(args, columns, context)
 
-  @spec check_logical(:and | :or, SQLExpr.t(), SQLExpr.t(), %{binary() => binary()}, context()) ::
+  defp check_node(_other, _columns, _context), do: :ok
+
+  @spec check_logical(:and | :or, SQLExpr.t(), SQLExpr.t(), scope(), context()) ::
           :ok | {:error, map()}
   defp check_logical(kind, left, right, columns, context) do
     case {logical_type(left, columns), logical_type(right, columns)} do
@@ -85,44 +107,99 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     end
   end
 
-  @spec check_distinct(SQLExpr.t(), SQLExpr.t(), boolean(), %{binary() => binary()}, context()) ::
+  @spec check_distinct(SQLExpr.t(), SQLExpr.t(), boolean(), scope(), context()) ::
           :ok | {:error, map()}
   defp check_distinct(left, right, negated, columns, context) do
     operation = if negated, do: "IS NOT DISTINCT FROM", else: "IS DISTINCT FROM"
 
     case {type(left, columns), type(right, columns)} do
       {l, r} when is_binary(l) and is_binary(r) ->
-        if incompatible?(l, r),
-          do:
+        cond do
+          incompatible?(l, r) ->
             planner(
               "Cannot infer common argument type for comparison operation #{l} #{operation} #{r}",
               context
-            ),
-          else: :ok
+            )
+
+          "Timestamp(ns)" in [l, r] and (text?(l) or text?(r)) ->
+            {:error,
+             SQLError.refusal(
+               "#{operation} of a time and text: the engine reads the text as a timestamp " <>
+                 "(an error or a closed connection), which is not modelled"
+             )}
+
+          true ->
+            :ok
+        end
 
       _comparable ->
         :ok
     end
   end
 
-  @spec check_like(SQLExpr.t(), SQLExpr.t(), boolean(), %{binary() => binary()}) ::
+  @spec check_like(SQLExpr.t(), SQLExpr.t(), boolean(), scope()) ::
           :ok | {:error, map()}
   defp check_like(inner, pattern, ilike, columns) do
     word = if ilike, do: "ILIKE", else: "LIKE"
 
     case {type(inner, columns), type(pattern, columns)} do
       {l, r} when is_binary(l) and is_binary(r) ->
-        if text?(l) and text?(r),
-          do: :ok,
-          else:
-            coercion("There isn't a common type to coerce #{l} and #{r} in #{word} expression")
+        like_types(l, r, word)
 
-      _text_or_unknown ->
-        :ok
+      {l, r} ->
+        null_like(l, r, null?(inner), null?(pattern))
     end
   end
 
-  @spec check_in(SQLExpr.t(), [SQLExpr.t()], %{binary() => binary()}) :: :ok | {:error, map()}
+  # A text with a text is matched. A tag beside a number the engine matches as text, beside a
+  # timestamp it closes the connection (verified); any other pair has no common type.
+  @spec like_types(binary(), binary(), binary()) :: :ok | {:error, map()}
+  defp like_types(left, right, word) do
+    cond do
+      text?(left) and text?(right) ->
+        :ok
+
+      @tag in [left, right] and "Timestamp(ns)" in [left, right] ->
+        {:error, SQLError.closed()}
+
+      @tag == right and left in @numbers ->
+        {:error,
+         SQLError.refusal(
+           "#{word} of a number and a tag: the engine matches the number as text, which is " <>
+             "not modelled"
+         )}
+
+      @tag == left and right in @numbers ->
+        {:error,
+         SQLError.refusal(
+           "#{word} of a tag and a number: the engine matches the number as text, which is " <>
+             "not modelled"
+         )}
+
+      true ->
+        coercion("There isn't a common type to coerce #{left} and #{right} in #{word} expression")
+    end
+  end
+
+  # The untyped `NULL` beside a number, a boolean or a timestamp closes the connection (verified);
+  # beside text it is null.
+  @spec null_like(SQLExprType.type(), SQLExprType.type(), boolean(), boolean()) ::
+          :ok | {:error, map()}
+  defp null_like(left, right, left_null?, right_null?) do
+    cond do
+      left_null? and typed_non_text?(right) -> {:error, SQLError.closed()}
+      right_null? and typed_non_text?(left) -> {:error, SQLError.closed()}
+      true -> :ok
+    end
+  end
+
+  @spec typed_non_text?(SQLExprType.type()) :: boolean()
+  defp typed_non_text?(type), do: is_binary(type) and not text?(type)
+
+  @spec null?(SQLExpr.t()) :: boolean()
+  defp null?(expr), do: SQLNullType.constant_type(expr) == "Null"
+
+  @spec check_in(SQLExpr.t(), [SQLExpr.t()], scope()) :: :ok | {:error, map()}
   defp check_in(inner, items, columns) do
     types = Enum.map(items, &type(&1, columns))
     operand = type(inner, columns)
@@ -137,7 +214,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     end
   end
 
-  @spec check_between(SQLExpr.t(), SQLExpr.t(), SQLExpr.t(), %{binary() => binary()}) ::
+  @spec check_between(SQLExpr.t(), SQLExpr.t(), SQLExpr.t(), scope()) ::
           :ok | {:error, map()}
   defp check_between(inner, low, high, columns) do
     operand = type(inner, columns)
@@ -150,7 +227,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     if bound, do: {:error, SQLError.between_coercion(operand, bound)}, else: :ok
   end
 
-  @spec check_concat(SQLExpr.t(), SQLExpr.t(), %{binary() => binary()}, context()) ::
+  @spec check_concat(SQLExpr.t(), SQLExpr.t(), scope(), context()) ::
           :ok | {:error, map()}
   defp check_concat(left, right, columns, context) do
     case {concat_type(left, columns), concat_type(right, columns)} do
@@ -181,7 +258,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   @spec concatenable?(binary(), binary()) :: boolean()
   defp concatenable?(left, right) do
     cond do
-      SQLExprType.struct?(left) or SQLExprType.struct?(right) -> false
+      SQLNativeType.struct?(left) or SQLNativeType.struct?(right) -> false
       plain_text?(left) or plain_text?(right) -> true
       left == @tag -> right in [@tag, "Null"]
       left == "Null" -> right == @tag
@@ -193,7 +270,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   defp plain_text?(type), do: type in ["Utf8", "Utf8View", "LargeUtf8"]
 
   # The type of a `||` operand: the null literal, negated or not, is `Null`.
-  @spec concat_type(SQLExpr.t(), %{binary() => binary()}) :: SQLExprType.type()
+  @spec concat_type(SQLExpr.t(), scope()) :: SQLExprType.type()
   defp concat_type({:lit, nil}, _columns), do: "Null"
 
   defp concat_type({:neg, inner}, columns) do
@@ -216,7 +293,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   # A struct (the result of a selector) cannot be cast to anything.
   @spec check_cast(SQLExprType.type(), SQLExpr.cast_type()) :: :ok | {:error, map()}
   defp check_cast(type, target) do
-    if SQLExprType.struct?(type),
+    if SQLNativeType.struct?(type),
       do:
         {:error,
          %{
@@ -228,12 +305,12 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
       else: :ok
   end
 
-  @spec type(SQLExpr.t(), %{binary() => binary()}) :: SQLExprType.type()
-  defp type(expr, columns), do: SQLExprType.type_of(expr, columns)
+  @spec type(SQLExpr.t(), scope()) :: SQLExprType.type()
+  defp type(expr, {columns, known}), do: SQLExprType.type_of(expr, columns, known)
 
   # The type of an operand of `AND` or `OR`, where the engine types the null
   # literal as `Null`.
-  @spec logical_type(SQLExpr.t(), %{binary() => binary()}) :: SQLExprType.type()
+  @spec logical_type(SQLExpr.t(), scope()) :: SQLExprType.type()
   defp logical_type({:lit, nil}, _columns), do: "Null"
   defp logical_type(expr, columns), do: type(expr, columns)
 
@@ -245,7 +322,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   @spec incompatible?(binary(), binary()) :: boolean()
   defp incompatible?(left, right) do
     left == "Boolean" != (right == "Boolean") or
-      SQLExprType.struct?(left) != SQLExprType.struct?(right) or
+      SQLNativeType.struct?(left) != SQLNativeType.struct?(right) or
       ("Timestamp(ns)" in [left, right] and
          Enum.any?([left, right], &(&1 in ["Int64", "UInt64", "Float64"])))
   end
@@ -265,7 +342,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
         timestamp_comparison(op, left, right, context)
 
       left == "Boolean" != (right == "Boolean") or
-          SQLExprType.struct?(left) != SQLExprType.struct?(right) ->
+          SQLNativeType.struct?(left) != SQLNativeType.struct?(right) ->
         planner(
           "Cannot infer common argument type for comparison operation #{left} " <>
             "#{SQLExpr.symbol(op)} #{right}",
@@ -318,7 +395,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
           SQLExpr.t() | nil,
           [{SQLExpr.t(), SQLExpr.t()}],
           SQLExpr.t() | nil,
-          %{binary() => binary()}
+          scope()
         ) :: :ok | {:error, map()}
   defp check_case(operand, whens, otherwise, columns) do
     conditions = Enum.map(whens, &type(elem(&1, 0), columns))
@@ -365,8 +442,8 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     Enum.all?(types, &is_binary/1) and
       (("Boolean" in types and Enum.any?(types, &(&1 != "Boolean"))) or
          ("Timestamp(ns)" in types and Enum.any?(types, &(&1 in @not_time))) or
-         (Enum.any?(types, &SQLExprType.struct?/1) and
-            not Enum.all?(types, &SQLExprType.struct?/1)))
+         (Enum.any?(types, &SQLNativeType.struct?/1) and
+            not Enum.all?(types, &SQLNativeType.struct?/1)))
   end
 
   defp uncomparable?(_operand_type, _conditions), do: false
@@ -393,7 +470,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   defp mixed_results(_results),
     do: {:error, SQLError.refusal("a CASE whose results have no common type the double models")}
 
-  @spec check_coalesce([SQLExpr.t()], %{binary() => binary()}, context()) ::
+  @spec check_coalesce([SQLExpr.t()], scope(), context()) ::
           :ok | {:error, map()}
   defp check_coalesce([], _columns, context) do
     planner(
@@ -433,7 +510,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
   defp mixed_coalesce(_types, _context), do: mixed_refusal("COALESCE")
 
-  @spec check_nullif([SQLExpr.t()], %{binary() => binary()}, context()) ::
+  @spec check_nullif([SQLExpr.t()], scope(), context()) ::
           :ok | {:error, map()}
   defp check_nullif(args, columns, context) do
     types = Enum.map(args, &type(&1, columns))

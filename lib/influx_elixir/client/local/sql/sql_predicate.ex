@@ -151,9 +151,13 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
 
   @spec like_clause([binary()]) :: {:ok, clause()} | {:error, map()}
   defp like_clause([_full, left, negated, kind, pattern]) do
-    with {:ok, operand} <- parse_operand(String.trim(left)) do
-      regex = like_regex(SQLLiteral.unescape(pattern), String.upcase(kind) == "ILIKE")
+    with {:ok, operand} <- parse_operand(String.trim(left)),
+         {:ok, regex} <-
+           like_regex(SQLLiteral.unescape(pattern), String.upcase(kind) == "ILIKE") do
       {:ok, {like_op(negated != ""), operand, regex}}
+    else
+      {:error, :pattern_too_large} -> {:error, SQLCompare.pattern_too_large()}
+      {:error, _error} = error -> error
     end
   end
 
@@ -388,7 +392,7 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   defp like_op(false), do: :like
 
   @doc "A LIKE (or, with `case_insensitive`, ILIKE) pattern as an anchored regular expression."
-  @spec like_regex(binary(), boolean()) :: Regex.t()
+  @spec like_regex(binary(), boolean()) :: {:ok, Regex.t()} | {:error, :pattern_too_large}
   defdelegate like_regex(pattern, case_insensitive), to: SQLCompare
 
   @comparison_operators %{

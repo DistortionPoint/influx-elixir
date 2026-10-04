@@ -5,6 +5,7 @@
       files: %{
         included: [
           "lib/",
+          "mix/",
           "src/",
           "test/",
           "web/",

@@ -30,7 +30,8 @@ defmodule InfluxElixir.Client.Local.SQLShow do
 
   @show ~r/\A\s*SHOW\s+(?:(TABLES)|COLUMNS\s+(?:FROM|IN)\s+([\p{L}\p{N}_$.]+))\s*\z/iu
 
-  @describe ~r/\A\s*DESC(?:RIBE)?\s+([\p{L}\p{N}_$.]+)\s*\z/iu
+  @describe ~r/\A\s*DESC(?:RIBE)?\s+((?:EXTENDED|FORMATTED)\s+)?([\p{L}\p{N}_$.]+)\s*\z/iu
+  @modifiers ~w(extended formatted)
 
   @doc """
   The query a `SHOW` or a `DESCRIBE` is, with the `iox` table that must exist for it to be
@@ -46,13 +47,25 @@ defmodule InfluxElixir.Client.Local.SQLShow do
       {[_all, "", reference], _no_describe} ->
         columns(String.downcase(reference), :show)
 
-      {nil, [_all, reference]} ->
-        columns(String.downcase(reference), :describe)
+      {nil, [_all, modifier, reference]} ->
+        described(modifier, String.downcase(reference))
 
       {nil, nil} ->
         :nomatch
     end
   end
+
+  # `DESC EXTENDED t` and `DESC FORMATTED t` describe `t`. Without one of them, the words are
+  # not a table: the parser wants a name after the modifier.
+  @spec described(binary(), binary()) ::
+          {:ok, binary(), binary() | nil} | {:error, map()} | :nomatch
+  defp described("", reference) do
+    if reference |> String.split(".") |> hd() |> then(&(&1 in @modifiers)),
+      do: :nomatch,
+      else: columns(reference, :describe)
+  end
+
+  defp described(_modifier, reference), do: columns(reference, :describe)
 
   @spec columns(binary(), :show | :describe) ::
           {:ok, binary(), binary() | nil} | {:error, map()}

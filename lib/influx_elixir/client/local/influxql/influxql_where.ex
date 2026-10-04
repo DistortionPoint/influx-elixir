@@ -39,7 +39,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         times = %{
           now: now,
           extend: Keyword.get(opts, :extend_lower, 0),
-          known: Keyword.get(opts, :known)
+          known: Keyword.get(opts, :known),
+          alone: true
         }
 
         {deferred, {sql, bounds, checks}} =
@@ -172,13 +173,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   @typep times :: %{
            now: integer(),
            extend: non_neg_integer(),
-           known: MapSet.t(binary()) | nil
+           known: MapSet.t(binary()) | nil,
+           alone: boolean()
          }
 
   @spec plan(tuple(), {MapSet.t(binary()), map()}, times()) ::
           {binary(), [InfluxQL.bound()], [{binary(), InfluxQLArithmetic.check()}]}
   defp plan({:cmp, tokens}, {tags, types} = ctx, times) do
-    check_calls(tokens, tags, types)
+    check_calls(tokens, tags, types, times.alone)
 
     if Enum.any?(tokens, &InfluxQLTokens.time?/1) do
       {sql, lowers} = time_plan(tokens, tags, times)
@@ -193,12 +195,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     {"(" <> sql <> ")", lowers, checks}
   end
 
-  defp plan({:and, nodes}, ctx, times), do: join_plans(nodes, " AND ", ctx, times)
+  defp plan({:and, nodes}, ctx, times),
+    do: join_plans(nodes, " AND ", ctx, %{times | alone: false})
 
   # The comparisons are planned first: what the engine reads wrongly in one is
   # its error, before the refusal of the connective.
   defp plan({:or, nodes}, ctx, times) do
-    joined = join_plans(nodes, " OR ", ctx, times)
+    joined = join_plans(nodes, " OR ", ctx, %{times | alone: false})
 
     if Enum.any?(nodes, &mentions_time_node?/1),
       do: throw({:refused, "unsupported InfluxQL (a time comparison inside OR)"})
@@ -234,10 +237,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   end
 
   # The calls of a comparison are `abs()` of a number, or the engine's planning error, or
-  # refused by name.
-  @spec check_calls(list(), MapSet.t(binary()), map()) :: :ok
-  defp check_calls(tokens, tags, types) do
-    case InfluxQLWhereArith.call_error(tokens, tags, types) do
+  # refused by name. `alone` is whether the comparison is the whole condition.
+  @spec check_calls(list(), MapSet.t(binary()), map(), boolean()) :: :ok
+  defp check_calls(tokens, tags, types, alone) do
+    case InfluxQLWhereArith.call_error(tokens, tags, types, alone) do
       :ok -> :ok
       {:engine, body} -> throw({:refused, {:engine, body}})
       {:refuse, message} -> throw({:refused, message})

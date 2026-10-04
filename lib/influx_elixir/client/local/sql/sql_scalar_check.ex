@@ -17,7 +17,6 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   alias InfluxElixir.Client.Local.{
     SQLCommonType,
     SQLError,
-    SQLExprType,
     SQLFunctions,
     SQLNativeType
   }
@@ -41,10 +40,16 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   @typedoc "Where a call stands (see `InfluxElixir.Client.Local.SQLFunctions.context/0`)."
   @type context :: SQLFunctions.context()
 
-  @doc "`:ok`, or the engine's planning error for a call with arguments of these types."
-  @spec check(atom(), [binary() | nil], context()) :: :ok | {:error, map()}
-  def check(name, types, context) do
-    case problem(name, types) do
+  @doc """
+  `:ok`, or the engine's planning error for a call with arguments of these types. `nulls`
+  says which arguments are the null whatever the rows (see
+  `InfluxElixir.Client.Local.SQLNullType.null_valued?/1`): a call with one is null, and what
+  the double cannot compute of the other arguments' types (a timestamp's text, a narrow
+  integer's coercion) is not asked of it.
+  """
+  @spec check(atom(), [binary() | nil], context(), [boolean()]) :: :ok | {:error, map()}
+  def check(name, types, context, nulls \\ []) do
+    case problem(name, types, nulls) do
       :ok ->
         :ok
 
@@ -61,11 +66,31 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
 
   # What is wrong with a call: `:ok`, a refusal, or the engine's head (with its
   # kind, the function it names and its candidate signatures).
-  @spec problem(atom(), [binary() | nil]) ::
-          :ok
-          | {:refuse, binary()}
-          | {:convert, binary()}
-          | {:planning | :internal | :execution, binary(), binary(), binary()}
+  @spec problem(atom(), [binary() | nil], [boolean()]) :: problem()
+  defp problem(name, types, nulls) do
+    cond do
+      null_slice?(name, types, nulls) -> :ok
+      null_math?(name, types, nulls) -> :ok
+      true -> problem(name, types)
+    end
+  end
+
+  # `left(time, NULL + NULL)`: the null count makes the text of the timestamp unneeded.
+  @spec null_slice?(atom(), [binary() | nil], [boolean()]) :: boolean()
+  defp null_slice?(name, ["Timestamp(ns)", count], [_first, true]) when name in [:left, :right],
+    do: count in @integer_arguments or count == "Null"
+
+  defp null_slice?(_name, _types, _nulls), do: false
+
+  # `pow(CAST(NULL AS INT), NULL)`: a null whatever the integers' coercion would be.
+  @spec null_math?(atom(), [binary() | nil], [boolean()]) :: boolean()
+  defp null_math?(name, types, nulls) when name in [:pow, :power, :log] do
+    Enum.any?(nulls) and types != [] and Enum.all?(types, &(&1 in ["Null" | @numbers]))
+  end
+
+  defp null_math?(_name, _types, _nulls), do: false
+
+  @spec problem(atom(), [binary() | nil]) :: problem()
   defp problem(name, []) when name in [:greatest, :least] do
     {:execution,
      "Function '#{name}' user-defined coercion failed with \"Error during planning: #{name} was " <>
@@ -169,7 +194,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   # `left` and `right` take anything cast to text and an integer of 64 bits or fewer.
   defp text_problem(name, [first, count]) when name in [:left, :right] do
     cond do
-      SQLExprType.struct?(first) and (count in @integer_arguments or count == "Null") ->
+      SQLNativeType.struct?(first) and (count in @integer_arguments or count == "Null") ->
         {:convert, first}
 
       first == "Timestamp(ns)" and count == "Null" ->
@@ -198,7 +223,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
          "keeps only to the microsecond"}
 
   defp length_problem([type]) do
-    if SQLExprType.struct?(type), do: {:convert, type}, else: :ok
+    if SQLNativeType.struct?(type), do: {:convert, type}, else: :ok
   end
 
   defp length_problem(types) do
@@ -255,7 +280,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
         internal_text(name, type)
 
       type ->
-        if SQLExprType.struct?(type),
+        if SQLNativeType.struct?(type),
           do: internal_text(name, type),
           else: {:refuse, "#{name} of a #{type}: the engine's error for it is not modelled"}
     end

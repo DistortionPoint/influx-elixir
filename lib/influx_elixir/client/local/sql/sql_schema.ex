@@ -68,13 +68,16 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   # ("No field named prod"), not an empty or unsorted result. The usual
   # cause is a typo or a forgotten pair of quotes around a string literal.
   # With no rows the schema is unknown, so nothing is checked.
-  @doc "`:ok`, or the engine's schema error for the first column the query names that is not there."
-  @spec check([relation()], SQLParser.parsed_query()) :: :ok | {:error, term()}
-  def check(relations, query) do
+  @doc """
+  `:ok`, or the engine's schema error for the first column the query names that is not there.
+  `never?` says that the `WHERE` is false for every row (see
+  `InfluxElixir.Client.Local.SQLSimplify.never?/1`).
+  """
+  @spec check([relation()], SQLParser.parsed_query(), boolean()) :: :ok | {:error, term()}
+  def check(relations, query, never? \\ false) do
     with :ok <- no_table_star(relations, query),
-         :ok <- check_columns(relations, query),
-         :ok <- check_order_ambiguous(relations, query),
-         do: check_order_available(relations, query)
+         :ok <- check_columns(relations, query, never?),
+         do: check_order_ambiguous(relations, query)
   end
 
   # `SELECT *` with no `FROM` has no table to expand.
@@ -85,10 +88,58 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
       else: :ok
   end
 
-  @spec check_columns([relation()], SQLParser.parsed_query()) :: :ok | {:error, term()}
-  defp check_columns(relations, query) do
-    refs = clause_refs(query)
+  @spec check_columns([relation()], SQLParser.parsed_query(), boolean()) ::
+          :ok | {:error, term()}
+  defp check_columns(relations, query, never?) do
+    refs = query |> clause_refs() |> reached(query, never?)
 
+    # A selector's constant second argument is the planner's error once the `WHERE` and the
+    # select list are resolved, and before the other clauses are (verified).
+    case Map.get(query, :selector_error) do
+      nil ->
+        check_refs(relations, query, refs)
+
+      error ->
+        early = Enum.filter(refs, fn {clause, _ref} -> clause in [:where, :select] end)
+        with :ok <- check_refs(relations, query, early), do: {:error, error}
+    end
+  end
+
+  # A `WHERE` that is false for every row leaves the engine's plan empty before the `ORDER BY`
+  # term that is a column written with its relation is resolved (verified: `WHERE false ORDER
+  # BY m.host` is `[]` whatever `m` is, where `ORDER BY zzz` and `ORDER BY m.host + 1` are
+  # errors).
+  # An aggregate query without a `GROUP BY` resolves it all the same.
+  @spec reached([{clause(), term()}], SQLParser.parsed_query(), boolean()) ::
+          [{clause(), term()}]
+  defp reached(refs, query, never?) do
+    if never? and
+         (query.select_columns == nil or query.group_by_columns != nil) do
+      written = written_in(query, :order)
+
+      skipped =
+        for term <- query.order_by, ref = bare_qualified(term, written), do: {:order, ref}
+
+      Enum.reduce(skipped, refs, &List.delete(&2, &1))
+    else
+      refs
+    end
+  end
+
+  # An `ORDER BY` term that is one column written with its relation (`m.host`, or `t.host` of
+  # the table `t` itself, which the parser has read as `host`).
+  @spec bare_qualified({term(), term()}, MapSet.t(binary())) :: SQLExpr.column_ref() | nil
+  defp bare_qualified({{:expr, {:field, {:qualified, _rel, _col} = ref}}, _direction}, _written),
+    do: ref
+
+  defp bare_qualified({ref, _direction}, written) when is_binary(ref),
+    do: if(MapSet.member?(written, ref), do: ref)
+
+  defp bare_qualified(_term, _written), do: nil
+
+  @spec check_refs([relation()], SQLParser.parsed_query(), [{clause(), term()}]) ::
+          :ok | {:error, term()}
+  defp check_refs(relations, query, refs) do
     if refs == [] or Enum.any?(relations, &unknown_schema?/1) do
       :ok
     else
@@ -129,10 +180,29 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     known = listed |> Enum.flat_map(&elem(&1, 1)) |> MapSet.new()
 
     case Enum.find(refs, fn {_clause, ref} -> not known?(ref, known) end) do
-      nil -> :ok
-      {clause, ref} -> {:error, no_field(ref, clause, query, listed)}
+      nil ->
+        :ok
+
+      {clause, ref} ->
+        {:error, query |> then(&no_field(ref, clause, &1, listed)) |> coerced(ref, clause, query)}
     end
   end
+
+  # A column written with its relation inside an `ORDER BY` expression is found missing by the
+  # type coercion, which says so (verified: `ORDER BY m.host + 1`, `ORDER BY abs(m.n)`).
+  @spec coerced(map(), SQLExpr.column_ref(), clause(), SQLParser.parsed_query()) :: map()
+  defp coerced(
+         %{body: "Schema error: " <> _rest} = error,
+         {:qualified, _rel, _col} = ref,
+         :order,
+         query
+       ) do
+    if Enum.any?(query.order_by, &match?({{:expr, {:field, ^ref}}, _direction}, &1)),
+      do: error,
+      else: %{error | body: "type_coercion\ncaused by\n" <> error.body}
+  end
+
+  defp coerced(error, _ref, _clause, _query), do: error
 
   @doc "Every column the relations have, a table's from its rows and a CTE's as it declared them."
   @spec table_columns([relation()]) :: MapSet.t(binary())
@@ -389,13 +459,17 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   # In an aggregate query a table column in `ORDER BY` is one of the `GROUP BY` terms or an
   # output of the select list; any other is the engine's schema error, which lists the
   # outputs alone and names the column with its relation.
+  @doc """
+  `:ok`, or the engine's schema error for an `ORDER BY` column of an aggregate query that is
+  neither grouped nor an output. The engine finds a select list that is not grouped first.
+  """
   @spec check_order_available([relation()], SQLParser.parsed_query()) :: :ok | {:error, map()}
-  defp check_order_available(_relations, %{select_columns: nil}), do: :ok
-  defp check_order_available(_relations, %{distinct_on: on}) when on != nil, do: :ok
+  def check_order_available(_relations, %{select_columns: nil}), do: :ok
+  def check_order_available(_relations, %{distinct_on: on}) when on != nil, do: :ok
 
-  defp check_order_available(_relations, %{order_by: []}), do: :ok
+  def check_order_available(_relations, %{order_by: []}), do: :ok
 
-  defp check_order_available(relations, query) do
+  def check_order_available(relations, query) do
     if Enum.any?(relations, &unknown_schema?/1) do
       :ok
     else

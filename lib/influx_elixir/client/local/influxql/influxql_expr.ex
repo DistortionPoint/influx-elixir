@@ -38,6 +38,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   alias InfluxElixir.Client.Local.{
     Durations,
     InfluxQLError,
+    InfluxQLKernel,
     InfluxQLLiteral,
     InfluxQLText,
     SQLLimits
@@ -1064,59 +1065,5 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   end
 
   @spec apply_op(binary(), value(), value()) :: value()
-  defp apply_op(_op, nil, _right), do: nil
-  defp apply_op(_op, _left, nil), do: nil
-  defp apply_op(_op, :nan, _right), do: :nan
-  defp apply_op(_op, _left, :nan), do: :nan
-
-  defp apply_op(op, left, right) do
-    case common(left, right) do
-      {:float, x, y} -> float_op(op, x, y)
-      {:uint, x, y} -> uint_op(op, x, y)
-      {:int, x, y} -> int_op(op, x, y)
-    end
-  end
-
-  # The type both are taken to: a float with a number makes floats, an unsigned
-  # with a signed literal an unsigned (a negative one as `2^64 + n - 1`).
-  defp common({:float, x}, {_kind, y}), do: {:float, x, y * 1.0}
-  defp common({_kind, x}, {:float, y}), do: {:float, x * 1.0, y}
-  defp common({:int, x}, {:int, y}), do: {:int, x, y}
-  defp common({:uint, x}, {:uint, y}), do: {:uint, x, y}
-  defp common({:uint, x}, {:int, y}), do: {:uint, x, to_unsigned(y)}
-  defp common({:int, x}, {:uint, y}), do: {:uint, to_unsigned(x), y}
-
-  defp to_unsigned(n) when n >= 0, do: n
-  defp to_unsigned(n), do: SQLLimits.uint64_max() + n
-
-  defp int_op("/", x, y), do: float_op("/", x * 1.0, y * 1.0)
-  defp int_op("%", _x, 0), do: refuse_remainder()
-  defp int_op("%", x, y), do: {:int, SQLLimits.wrap_int64(rem(x, y))}
-  defp int_op(op, x, y), do: {:int, SQLLimits.wrap_int64(arith(op, x, y))}
-
-  defp uint_op("/", _x, 0), do: {:uint, 0}
-  defp uint_op("/", x, y), do: {:uint, div(x, y)}
-  defp uint_op("%", _x, 0), do: refuse_remainder()
-  defp uint_op("%", x, y), do: {:uint, rem(x, y)}
-  defp uint_op(op, x, y), do: {:uint, SQLLimits.wrap_uint64(arith(op, x, y))}
-
-  defp float_op("/", _x, y) when y == 0.0, do: {:float, 0.0}
-  defp float_op("%", _x, y) when y == 0.0, do: refuse_remainder()
-
-  defp float_op(op, x, y) do
-    {:float, float_arith(op, x, y)}
-  rescue
-    ArithmeticError -> nil
-  end
-
-  @spec refuse_remainder() :: no_return()
-  defp refuse_remainder, do: throw({:refused, "unsupported InfluxQL (a remainder by zero)"})
-
-  defp arith("+", x, y), do: x + y
-  defp arith("-", x, y), do: x - y
-  defp arith("*", x, y), do: x * y
-
-  defp float_arith("%", x, y), do: :math.fmod(x, y)
-  defp float_arith("/", x, y), do: x / y
-  defp float_arith(op, x, y), do: arith(op, x, y)
+  defp apply_op(op, left, right), do: InfluxQLKernel.apply_op(op, left, right)
 end

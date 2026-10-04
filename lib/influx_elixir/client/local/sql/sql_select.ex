@@ -586,7 +586,10 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   defp parse_agg_column_arg(col, body, alias_name, qualifier) do
     one_arg = ~r/(?i)^\s*(#{@plain_alternation})\s*\((.+)\)\s*$/su
 
+    # `DISTINCT +n` is the engine's `DISTINCT` of `+n`, which reads as the sum of a column
+    # `distinct` and `n`: only `COUNT` and `SUM` take a `DISTINCT` (see `distinct_column/5`).
     with [_full, func, expr_str] <- Regex.run(one_arg, body),
+         false <- Regex.match?(~r/\A\s*DISTINCT(?![\w$])/iu, expr_str),
          {:ok, expr} <- SQLExpr.parse(expr_str),
          agg = Map.fetch!(@plain_aggregates, String.downcase(func)),
          :ok <- check_time_argument(agg, expr, col),
@@ -682,10 +685,16 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
         selector = String.to_existing_atom(String.downcase(kind))
         access = List.first(access, "")
         literal = literal_type(ordering)
+        constant = literal_type(field)
         {field, ordering} = {name(field), name(ordering)}
 
-        with :ok <- literal_ordering(selector, literal),
-             {:ok, output} <-
+        # A constant argument is the planner's error or the double's refusal (see
+        # `selector_error/1`), found once the columns are: the column reads as `time` until
+        # then.
+        {field, ordering} =
+          {if(constant, do: "time", else: field), if(literal, do: "time", else: ordering)}
+
+        with {:ok, output} <-
                output_name(col, alias_name, fn ->
                  selector_name(kind, field, ordering, access, qualifier)
                end) do
@@ -703,25 +712,54 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
     end
   end
 
-  # The type of a second argument written as a constant rather than as a column.
+  # The type of an argument written as a constant rather than as a column: an integer is the
+  # narrowest of `Int64` and `UInt64` it fits, else a `Float64`, as is a number with an
+  # exponent (`1e3`).
   @spec literal_type(binary()) :: binary() | nil
   defp literal_type(text) do
     cond do
-      Regex.match?(~r/\A\d+\z/, text) -> "Int64"
+      Regex.match?(~r/\A\d+\z/, text) -> integer_type(String.to_integer(text))
+      Regex.match?(~r/\A\d+[eE]\d+\z/, text) -> "Float64"
       String.downcase(text) == "null" -> "Null"
       String.downcase(text) in ["true", "false"] -> "Boolean"
       true -> nil
     end
   end
 
-  @spec literal_ordering(atom(), binary() | nil) :: :ok | {:error, map()}
-  defp literal_ordering(_selector, nil), do: :ok
+  @spec integer_type(non_neg_integer()) :: binary()
+  defp integer_type(number) when number <= 9_223_372_036_854_775_807, do: "Int64"
+  defp integer_type(number) when number <= 18_446_744_073_709_551_615, do: "UInt64"
+  defp integer_type(_number), do: "Float64"
 
-  defp literal_ordering(selector, type) do
-    {:error,
-     SQLError.planning(
-       "selector_#{selector} second argument must be a timestamp, but got #{type}"
-     )}
+  @doc """
+  The planner's error for a selector whose second argument is a constant, which it raises
+  once the table and the columns of the statement are found, or `nil`. A selector over a
+  constant first argument is the engine's struct of that constant and the time of a row, and
+  which row decides it is not modelled: that is the double's refusal, at the same place.
+  """
+  @spec selector_error(binary()) :: map() | nil
+  def selector_error(columns) do
+    masked = SQLMask.mask(columns)
+
+    ~r/(?i)\bSELECTOR_(FIRST|LAST|MIN|MAX)\s*\(\s*#{@name}\s*,\s*(\w+)\s*\)/u
+    |> Regex.scan(masked)
+    |> Enum.find_value(fn [call, selector, field, ordering] ->
+      cond do
+        type = literal_type(ordering) ->
+          SQLError.planning(
+            "selector_#{String.downcase(selector)} second argument must be a timestamp, " <>
+              "but got #{type}"
+          )
+
+        literal_type(field) ->
+          SQLError.refusal(
+            "a selector over a constant instead of a column is not modelled: #{call}"
+          )
+
+        true ->
+          nil
+      end
+    end)
   end
 
   @spec selector_name(binary(), binary(), binary(), binary(), binary() | nil) :: binary()

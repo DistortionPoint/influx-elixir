@@ -122,6 +122,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           group_by_columns: [binary() | {:expr, SQLExpr.t()}] | nil,
           select_columns: [select_column()] | nil,
           distinct_columns: [binary()] | nil,
+          distinct_rows: boolean(),
+          selector_error: SQLError.t() | nil,
           distinct_on: [binary()] | nil,
           projection_columns: [projection()] | nil,
           ctes: [{binary(), parsed_query()}],
@@ -259,8 +261,19 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     {sql, cross_join} =
       sql |> String.trim() |> SQLNoFrom.add_table() |> SQLQualifier.split_cross_join()
 
-    {normalised, qualifier, qualified, zones} = SQLQualifier.strip(sql, cross_join)
+    with {:ok, {normalised, qualifier, qualified, zones}} <- SQLQualifier.strip(sql, cross_join) do
+      parse_stripped(normalised, qualifier, qualified, zones, cross_join)
+    end
+  end
 
+  @spec parse_stripped(
+          binary(),
+          binary(),
+          %{binary() => binary()},
+          SQLQualifier.zones(),
+          {binary(), [binary()]} | nil
+        ) :: {:ok, parsed_query()} | {:error, term()}
+  defp parse_stripped(normalised, qualifier, qualified, zones, cross_join) do
     {normalised, on} = SQLDistinctOn.split(normalised)
 
     # A column of a joined table is qualified by the side that holds it,
@@ -412,8 +425,11 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   @spec dispatch_select(split(), binary(), binary() | nil) ::
           {:ok, parsed_query()} | {:error, term()}
-  defp dispatch_select(%{distinct: true} = split, sql, qualifier),
-    do: parse_distinct_select(split, sql, qualifier)
+  defp dispatch_select(%{distinct: true} = split, sql, qualifier) do
+    if having?(split.rest),
+      do: parse_distinct_having(split, sql, qualifier),
+      else: parse_distinct_select(split, sql, qualifier)
+  end
 
   defp dispatch_select(split, sql, qualifier) do
     cond do
@@ -428,6 +444,32 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
       true ->
         build_columns_query(split.columns, split.table, split.rest, qualifier)
+    end
+  end
+
+  @spec having?(binary()) :: boolean()
+  defp having?(rest), do: rest |> SQLMask.mask() |> then(&Regex.match?(~r/(?i)\bHAVING\b/u, &1))
+
+  # `SELECT DISTINCT a, b FROM t GROUP BY ... HAVING ...`: the groups the `HAVING` keeps
+  # (with its checks), then the distinct rows of them, then `ORDER BY` and `LIMIT`. A
+  # select list of anything but plain columns, with an `ORDER BY`, is not read.
+  @spec parse_distinct_having(split(), binary(), binary() | nil) ::
+          {:ok, parsed_query()} | {:error, term()}
+  defp parse_distinct_having(%{columns: columns, rest: rest} = split, sql, qualifier) do
+    plain? = Regex.match?(~r/^[\p{L}_]\w*(\s*,\s*[\p{L}_]\w*)*$/u, columns)
+
+    cond do
+      columns == "" ->
+        {:error, SQLError.refusal("unsupported DISTINCT query: #{sql}")}
+
+      not plain? and SQLClauses.order_by(rest) != [] ->
+        {:error, SQLError.refusal("unsupported DISTINCT query: #{sql}")}
+
+      true ->
+        with {:ok, query} <- parse_aggregate_select(split, sql, qualifier) do
+          {_order_by, error} = parse_distinct_order_by(split_columns(columns), split.table, rest)
+          {:ok, %{query | distinct_rows: true, plan_error: error || query.plan_error}}
+        end
     end
   end
 
@@ -491,13 +533,15 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          {:ok, where} <- SQLWhere.nodes(rest),
          {:ok, having} <- SQLAggExpr.having(rest, qualifier, groups, columns),
          :ok <- reject_expr_order(SQLClauses.order_by(rest)) do
-      {:ok,
-       new_query(measurement, where, rest,
-         group_by_interval: interval_ns,
-         group_by_columns: groups,
-         select_columns: columns,
-         having: having
-       )}
+      query =
+        new_query(measurement, where, rest,
+          group_by_interval: interval_ns,
+          group_by_columns: groups,
+          select_columns: columns,
+          having: having
+        )
+
+      {:ok, %{query | selector_error: SQLSelect.selector_error(split.columns)}}
     end
   end
 
@@ -517,6 +561,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         group_by_columns: nil,
         select_columns: nil,
         distinct_columns: nil,
+        distinct_rows: false,
+        selector_error: nil,
         distinct_on: nil,
         projection_columns: nil,
         ctes: [],
@@ -581,6 +627,12 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           [SQLExpr.column_ref()]
   defp unselected_columns({target, _direction}, columns) when is_binary(target),
     do: if(target in columns, do: [], else: [target])
+
+  # A column written with its relation is no name of the select list: if the relation is the
+  # table's it was read as the column itself, and if it is not it is the schema error, which
+  # the double finds before this one.
+  defp unselected_columns({{:expr, {:field, {:qualified, _rel, _col}}}, _direction}, _columns),
+    do: []
 
   defp unselected_columns({{:expr, expr}, _direction}, columns),
     do: expr |> SQLExpr.columns() |> Enum.reject(&(&1 in columns))

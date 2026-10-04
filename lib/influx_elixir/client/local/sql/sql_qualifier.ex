@@ -7,7 +7,7 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
   # use is recorded: the engine names a column it cannot find as it was written
   # (`t.nosuch`).
 
-  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLLiteral, SQLMask, SQLTable}
+  alias InfluxElixir.Client.Local.{LineProtocolParser, SQLError, SQLLiteral, SQLMask, SQLTable}
 
   @typedoc "The columns a query wrote with a relation, by the clause they stand in."
   @type zones :: %{(:group | :having | :order) => MapSet.t(binary())}
@@ -51,8 +51,24 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
   columns written with one in each of the clauses `GROUP BY`, `HAVING` and `ORDER BY`.
   """
   @spec strip(binary(), {binary(), [binary()]} | nil) ::
-          {binary(), binary(), %{binary() => binary()}, zones()}
+          {:ok, {binary(), binary(), %{binary() => binary()}, zones()}} | {:error, map()}
   def strip(sql, cross_join) do
+    {:ok, strip_names(sql, cross_join)}
+  catch
+    :long_name -> {:error, long_name_refusal()}
+  end
+
+  @spec long_name_refusal() :: map()
+  defp long_name_refusal do
+    SQLError.refusal(
+      "a table name or alias too long for the double to match the columns written with it " <>
+        "(the engine answers that the table is not found)"
+    )
+  end
+
+  @spec strip_names(binary(), {binary(), [binary()]} | nil) ::
+          {binary(), binary(), %{binary() => binary()}, zones()}
+  defp strip_names(sql, cross_join) do
     # The joined table is known by its alias when it has one, by its name
     # otherwise.
     joined_names =
@@ -121,8 +137,16 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
     quoted =
       Enum.map_join(qualifiers, "|", &Regex.escape(~s("#{String.replace(&1, ~s("), ~s(""))}")))
 
+    # The names are in the pattern, which the regex engine bounds: a name past that is a
+    # name the double does not match.
     pattern =
-      ~r/'(?:[^']|'')*'|(?:#{quoted})\.(?=[\w"])|"[^"]*"|(?<![\w."])(?:#{names})\.(?=\w)/u
+      case Regex.compile(
+             ~s{'(?:[^']|'')*'|(?:#{quoted})\\.(?=[\\w"])|"[^"]*"|(?<![\\w."])(?:#{names})\\.(?=\\w)},
+             "u"
+           ) do
+        {:ok, pattern} -> pattern
+        {:error, _reason} -> throw(:long_name)
+      end
 
     clauses = clause_starts(sql)
 

@@ -48,6 +48,13 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
     %{query | where: where(query), projection_columns: projection(query.projection_columns)}
   end
 
+  @doc "Whether the `WHERE` is false for every row once the simplifier has folded it."
+  @spec never?(SQLParser.parsed_query()) :: boolean()
+  def never?(query) do
+    nodes = where(query)
+    {:or, []} in nodes or {:eq, "time", nil} in nodes
+  end
+
   @spec where(SQLParser.parsed_query()) :: [SQLParser.where_node()]
   defp where(%{where_tree: nil, where: where}), do: where
 

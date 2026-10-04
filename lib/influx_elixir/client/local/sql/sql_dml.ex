@@ -11,8 +11,11 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   #     there; over one that is, with a column list of columns it has (the first that it has
   #     not is `Schema error: No field named <column>`), or with no list and `VALUES` rows of
   #     numbers (a row of the wrong length is `Inconsistent data length across values list`)
-  #   * `UPDATE name [[AS] alias] SET ...` over a table that is not there; over one that is,
-  #     when every column the statement reads is one it has
+  #   * `UPDATE name [[AS] alias] SET column = operand [, ...] [WHERE operand = operand]`
+  #     (an operand is a number, a string, a name, or `abs` of a number or a numeric column)
+  #     over a table that is not there; over one that is, when every column the statement
+  #     reads is one it has. Any other update (a subquery, `CASE`, `CAST`, an operator, a
+  #     clause after the assignments) is refused by name
   #   * the parser's own errors for a statement that stops short (`UPDATE name`,
   #     `INSERT INTO name (a)`, `INSERT INTO name VALUES`) or goes on with a word it does
   #     not read
@@ -23,11 +26,22 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   alias InfluxElixir.Client.Local.{SQLDdl, SQLError, SQLTokenizer}
 
   @sources ~w(VALUES SELECT WITH)
-  @update_words ~w(SET WHERE AND OR NOT NULL TRUE FALSE IS IN BETWEEN LIKE ILIKE AS)
+  # Words the update's shape never reads as a name or a function (the double has not seen
+  # what the engine makes of one there).
+  @reserved ~w(SET WHERE AND OR NOT NULL TRUE FALSE IS IN BETWEEN LIKE ILIKE AS SELECT FROM CASE
+               WHEN THEN ELSE END CAST TRY_CAST INTERVAL RETURNING LIMIT OFFSET ORDER GROUP BY
+               HAVING FOR UNION EXCEPT INTERSECT JOIN ON USING WITH VALUES DISTINCT ALL ANY SOME
+               EXISTS DEFAULT UPDATE INSERT DELETE INTO CROSS INNER LEFT RIGHT FULL NATURAL
+               OUTER LATERAL WINDOW OVER FILTER ESCAPE SIMILAR ASC DESC NULLS TABLE ARRAY ROW
+               UNNEST CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP EXTRACT
+               POSITION SUBSTRING TRIM OVERLAY COLLATE AT ZONE)
+
+  @typep assigned :: {[binary()], [read()]}
+  @typep read :: [binary()] | {:numeric, [binary()]}
   @query_body "SELECT, VALUES, or a subquery in the query body"
 
   @typep token :: SQLTokenizer.token()
-  @typep columns_of :: (binary() -> [binary()])
+  @typep columns_of :: (binary() | {:numeric, binary()} -> [binary()])
 
   @doc """
   The planner's error for an `INSERT` or an `UPDATE`, given the names of the database's
@@ -224,8 +238,9 @@ defmodule InfluxElixir.Client.Local.SQLDml do
     with {:ok, reference, rest} <- reference(tokens),
          {:ok, alias_name, rest} <- alias_name(rest, stop),
          {:ok, assignments} <- set(rest, stop),
+         {:ok, assigned} <- assigned(assignments),
          {:ok, table} <- resolve(reference, tables) do
-      updated(table, alias_name, assignments, tables, columns_of)
+      updated(table, alias_name, assigned, tables, columns_of)
     else
       {:error, error} -> error
       {:refuse, why} -> not_modelled(:update, why)
@@ -237,11 +252,15 @@ defmodule InfluxElixir.Client.Local.SQLDml do
           {:ok, binary() | nil, [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
   defp alias_name([{:word, _p, "SET", _l, _c} | _rest] = tokens, _stop), do: {:ok, nil, tokens}
 
-  defp alias_name([{:word, _p, "AS", _l, _c}, {:word, printed, _u, _l2, _c2} | rest], _stop),
+  defp alias_name([{:word, _p, "AS", _l, _c}, {:word, printed, upper, _l2, _c2} | rest], _stop)
+       when upper not in @reserved,
+       do: {:ok, String.downcase(printed), rest}
+
+  defp alias_name([{:word, printed, upper, _l, _c} | rest], _stop) when upper not in @reserved,
     do: {:ok, String.downcase(printed), rest}
 
-  defp alias_name([{:word, printed, _u, _l, _c} | rest], _stop),
-    do: {:ok, String.downcase(printed), rest}
+  defp alias_name([{:word, _p, _upper, _l, _c} | _rest], _stop),
+    do: {:refuse, "an alias that is one of SQL's own words"}
 
   defp alias_name([token | _rest], _stop), do: {:error, SQLDdl.expected("SET", token)}
   defp alias_name([], stop), do: {:error, SQLDdl.expected("SET", stop)}
@@ -255,121 +274,82 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   @spec updated(
           {:found, binary()} | {:missing, binary()},
           binary() | nil,
-          [token()],
+          assigned(),
           [binary()],
           columns_of()
         ) :: SQLError.t() | map()
-  defp updated({:missing, name}, _alias, _assignments, _tables, _columns_of), do: not_found(name)
+  defp updated({:missing, name}, _alias, _assigned, _tables, _columns_of), do: not_found(name)
 
-  defp updated({:found, table}, alias_name, assignments, tables, columns_of) do
+  defp updated({:found, table}, alias_name, assigned, tables, columns_of) do
     if table in tables,
-      do: updated_columns(table, alias_name, assignments, columns_of.(table)),
+      do: updated_columns(table, alias_name, assigned, columns_of),
       else: not_found(table)
   end
 
-  # An update of a table that is there: the columns it assigns and the words it reads must be
-  # the table's. An assignment's target is its last name (`main.v` and `zzz.v` assign `v`).
-  @spec updated_columns(binary(), binary() | nil, [token()], [binary()]) :: SQLError.t() | map()
-  defp updated_columns(table, alias_name, assignments, columns) do
+  # An update of a table that is there: the columns it assigns and the names it reads must
+  # be the table's. An assignment's target is its last name (`main.v` and `zzz.v` assign `v`).
+  @spec updated_columns(binary(), binary() | nil, assigned(), columns_of()) ::
+          SQLError.t() | map()
+  defp updated_columns(table, alias_name, {targets, reads}, columns_of) do
     qualifiers = Enum.reject([table, alias_name], &is_nil/1)
-    {set_part, where_part} = split_where(assignments)
 
-    with :ok <- plain_names(assignments),
-         {:ok, targets, values} <- targets(set_part),
-         {:ok, read} <- reads(values ++ where_part, qualifiers) do
-      unknown = Enum.find(targets ++ read, fn {name, _qualified} -> name not in columns end)
-
-      case unknown do
-        nil -> dml(:update)
-        {name, false} when alias_name == nil -> no_field(name, table, columns)
-        _qualified_or_aliased -> not_modelled(:update, "a column the table lacks, through a name")
-      end
-    else
+    case read_columns(reads, qualifiers) do
+      {:ok, read} -> unknown_column(read, targets, table, alias_name, columns_of)
       {:refuse, why} -> not_modelled(:update, why)
     end
   end
 
-  @spec plain_names([token()]) :: :ok | {:refuse, binary()}
-  defp plain_names(tokens) do
-    if Enum.any?(tokens, &(elem(&1, 0) in [:quoted, :placeholder])),
-      do: {:refuse, "an update naming a quoted column"},
-      else: :ok
-  end
+  @spec unknown_column(
+          [{binary(), boolean(), boolean()}],
+          [binary()],
+          binary(),
+          binary() | nil,
+          columns_of()
+        ) :: SQLError.t() | map()
+  defp unknown_column(read, targets, table, alias_name, columns_of) do
+    columns = columns_of.(table)
 
-  # The tokens before a top-level `WHERE` and after it.
-  @spec split_where([token()]) :: {[token()], [token()]}
-  defp split_where(tokens), do: split_where(tokens, 0, [])
+    unknown =
+      Enum.find(Enum.map(targets, &{&1, false, false}) ++ read, fn {name, _qualified, _num} ->
+        name not in columns
+      end)
 
-  defp split_where([], _depth, before), do: {Enum.reverse(before), []}
-
-  defp split_where([{:word, _p, "WHERE", _l, _c} | rest], 0, before),
-    do: {Enum.reverse(before), rest}
-
-  defp split_where([{:symbol, "(", _u, _l, _c} = token | rest], depth, before),
-    do: split_where(rest, depth + 1, [token | before])
-
-  defp split_where([{:symbol, ")", _u, _l, _c} = token | rest], depth, before),
-    do: split_where(rest, max(depth - 1, 0), [token | before])
-
-  defp split_where([token | rest], depth, before), do: split_where(rest, depth, [token | before])
-
-  # `target = value, target = value`: the target columns (their last name) and the value tokens.
-  @spec targets([token()]) ::
-          {:ok, [{binary(), boolean()}], [token()]} | {:refuse, binary()}
-  defp targets(tokens), do: targets(split_assignments(tokens, 0, [], []), [], [])
-
-  defp targets([], names, values), do: {:ok, Enum.reverse(names), values}
-
-  defp targets([assignment | rest], names, values) do
-    case Enum.split_while(assignment, &(not match?({:symbol, "=", _u, _l, _c}, &1))) do
-      {target, [_equals | value]} ->
-        case Enum.reverse(target) do
-          [{:word, printed, _u, _l, _c} | _before] ->
-            targets(rest, [{String.downcase(printed), false} | names], values ++ value)
-
-          _other ->
-            {:refuse, "an assignment to anything but a column"}
-        end
-
-      {_target, []} ->
-        {:refuse, "an assignment with no value"}
+    case unknown do
+      nil -> numbers(read, table, columns_of)
+      {name, false, _num} when alias_name == nil -> no_field(name, table, columns)
+      _qualified_or_aliased -> not_modelled(:update, "a column the table lacks, through a name")
     end
   end
 
-  # Assignments are separated by the commas outside any parenthesis.
-  @spec split_assignments([token()], non_neg_integer(), [token()], [[token()]]) :: [[token()]]
-  defp split_assignments([], _depth, [], found), do: Enum.reverse(found)
+  # `abs` is verified on a number; of a column that is not one the engine says so in words
+  # the double has not read.
+  @spec numbers([{binary(), boolean(), boolean()}], binary(), columns_of()) ::
+          SQLError.t() | map()
+  defp numbers(read, table, columns_of) do
+    numeric = columns_of.({:numeric, table})
 
-  defp split_assignments([], _depth, current, found),
-    do: Enum.reverse([Enum.reverse(current) | found])
+    if Enum.all?(read, fn {name, _qualified, must} -> not must or name in numeric end),
+      do: dml(:update),
+      else: not_modelled(:update, "abs of a column that is not a number")
+  end
 
-  defp split_assignments([{:symbol, ",", _u, _l, _c} | rest], 0, current, found),
-    do: split_assignments(rest, 0, [], [Enum.reverse(current) | found])
+  defp read_parts({:numeric, parts}), do: parts
+  defp read_parts(parts), do: parts
 
-  defp split_assignments([{:symbol, "(", _u, _l, _c} = token | rest], depth, current, found),
-    do: split_assignments(rest, depth + 1, [token | current], found)
+  defp numeric?({:numeric, _parts}), do: true
+  defp numeric?(_parts), do: false
 
-  defp split_assignments([{:symbol, ")", _u, _l, _c} = token | rest], depth, current, found),
-    do: split_assignments(rest, max(depth - 1, 0), [token | current], found)
-
-  defp split_assignments([token | rest], depth, current, found),
-    do: split_assignments(rest, depth, [token | current], found)
-
-  # The columns an expression reads, each with whether it was written through a relation: a
+  # The columns a statement reads, each with whether it was written through a relation: a
   # name before a `.` is that relation, which must be the table or its alias.
-  @spec reads([token()], [binary()]) ::
-          {:ok, [{binary(), boolean()}]} | {:refuse, binary()}
-  defp reads(tokens, qualifiers) do
-    following = Enum.drop(tokens, 1) ++ [nil]
-    previous = [nil | tokens]
+  @spec read_columns([read()], [binary()]) ::
+          {:ok, [{binary(), boolean(), boolean()}]} | {:refuse, binary()}
+  defp read_columns(reads, qualifiers) do
+    Enum.reduce_while(reads, {:ok, []}, fn read, {:ok, found} ->
+      {relations, [name]} = read |> read_parts() |> Enum.split(-1)
 
-    Enum.zip([tokens, following, previous])
-    |> Enum.reduce_while({:ok, []}, fn {token, next, before}, {:ok, found} ->
-      case read(token, next, before, qualifiers) do
-        :skip -> {:cont, {:ok, found}}
-        {:column, name} -> {:cont, {:ok, [name | found]}}
-        {:refuse, why} -> {:halt, {:refuse, why}}
-      end
+      if Enum.all?(relations, &(&1 in qualifiers)),
+        do: {:cont, {:ok, [{name, relations != [], numeric?(read)} | found]}},
+        else: {:halt, {:refuse, "a column read through a relation that is not the table"}}
     end)
     |> case do
       {:ok, found} -> {:ok, Enum.reverse(found)}
@@ -377,29 +357,97 @@ defmodule InfluxElixir.Client.Local.SQLDml do
     end
   end
 
-  @spec read(token(), token() | nil, token() | nil, [binary()]) ::
-          :skip | {:column, {binary(), boolean()}} | {:refuse, binary()}
-  defp read({:word, printed, upper, _l, _c}, next, before, qualifiers) do
-    name = String.downcase(printed)
-    dotted_before? = match?({:symbol, ".", _u, _l2, _c2}, before)
+  # The assignments of an update, of the one shape that was verified:
+  #
+  #     name[.name[.name]] = operand [, ...] [WHERE operand = operand]
+  #
+  # where an operand is a number, a string, a name of up to three parts, or a call of a
+  # function on such operands. Anything else (a subquery, `CASE`, `CAST`, `::`, an
+  # interval, an operator, `FROM`, `RETURNING`, a clause after the `WHERE`) is refused by
+  # name: it was not verified, and a word the shape does not read is not a column.
+  @spec assigned([token()]) :: {:ok, assigned()} | {:refuse, binary()}
+  defp assigned(tokens), do: assignments(tokens, [], [])
 
-    cond do
-      match?({:symbol, "(", _u, _l2, _c2}, next) -> :skip
-      match?({:symbol, ".", _u, _l2, _c2}, next) -> relation(name, qualifiers)
-      dotted_before? -> {:column, {name, true}}
-      upper in @update_words -> :skip
-      true -> {:column, {name, false}}
+  @spec assignments([token()], [binary()], [read()]) ::
+          {:ok, assigned()} | {:refuse, binary()}
+  defp assignments(tokens, targets, reads) do
+    with {:ok, target, rest} <- name_parts(tokens),
+         [{:symbol, "=", _u, _l, _c} | rest] <- rest,
+         {:ok, found, rest} <- operand(rest) do
+      targets = [List.last(target) | targets]
+      reads = Enum.reverse(found, reads)
+
+      case rest do
+        [] -> {:ok, {Enum.reverse(targets), Enum.reverse(reads)}}
+        [{:symbol, ",", _u, _l, _c} | more] -> assignments(more, targets, reads)
+        [{:word, _p, "WHERE", _l, _c} | condition] -> where(condition, targets, reads)
+        _other -> {:refuse, "an update with more than assignments and one equality"}
+      end
+    else
+      {:refuse, _why} = refusal -> refusal
+      _other -> {:refuse, "an assignment of anything but `column = operand`"}
     end
   end
 
-  defp read(_token, _next, _before, _qualifiers), do: :skip
-
-  @spec relation(binary(), [binary()]) :: :skip | {:refuse, binary()}
-  defp relation(name, qualifiers) do
-    if name in qualifiers,
-      do: :skip,
-      else: {:refuse, "a column read through a relation that is not the table"}
+  @spec where([token()], [binary()], [read()]) :: {:ok, assigned()} | {:refuse, binary()}
+  defp where(tokens, targets, reads) do
+    with {:ok, left, rest} <- operand(tokens),
+         [{:symbol, "=", _u, _l, _c} | rest] <- rest,
+         {:ok, right, []} <- operand(rest) do
+      {:ok, {Enum.reverse(targets), Enum.reverse(reads, left ++ right)}}
+    else
+      {:refuse, _why} = refusal -> refusal
+      _other -> {:refuse, "a WHERE of anything but one equality of operands"}
+    end
   end
+
+  # An operand: the names it reads (each as its parts), and the tokens after it.
+  @spec operand([token()]) ::
+          {:ok, [read()], [token()]} | {:refuse, binary()}
+  defp operand([{kind, _p, _u, _l, _c} | rest]) when kind in [:number, :string],
+    do: {:ok, [], rest}
+
+  # The one call that was verified: `abs` of a number, or of a column (which must be a number).
+  defp operand([{:word, _p, "ABS", _l, _c}, {:symbol, "(", _u, _l2, _c2} | rest]) do
+    case rest do
+      [{:number, _p2, _u2, _l3, _c3}, {:symbol, ")", _u3, _l4, _c4} | more] ->
+        {:ok, [], more}
+
+      _name ->
+        case name_parts(rest) do
+          {:ok, parts, [{:symbol, ")", _u2, _l3, _c3} | more]} -> {:ok, [{:numeric, parts}], more}
+          _other -> {:refuse, "abs of anything but a number or a column"}
+        end
+    end
+  end
+
+  defp operand([{:word, _p, _upper, _l, _c}, {:symbol, "(", _u, _l2, _c2} | _rest]),
+    do: {:refuse, "a call of a function other than abs"}
+
+  defp operand(tokens) do
+    with {:ok, parts, rest} <- name_parts(tokens), do: {:ok, [parts], rest}
+  end
+
+  # `name`, `name.name` or `name.name.name`: bare words that are not SQL's own.
+  @spec name_parts([token()]) :: {:ok, [binary()], [token()]} | {:refuse, binary()}
+  defp name_parts([{:word, printed, upper, _l, _c} | rest]) when upper not in @reserved do
+    part = String.downcase(printed)
+
+    case rest do
+      [{:symbol, ".", _u, _l2, _c2} | more] ->
+        with {:ok, parts, rest} <- name_parts(more),
+             true <- length(parts) < 3 do
+          {:ok, [part | parts], rest}
+        else
+          _other -> {:refuse, "a name of more than three parts"}
+        end
+
+      _end_of_name ->
+        {:ok, [part], rest}
+    end
+  end
+
+  defp name_parts(_tokens), do: {:refuse, "an update reading anything but plain names"}
 
   # ---------------------------------------------------------------------------
   # The table

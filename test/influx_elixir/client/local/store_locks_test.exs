@@ -99,5 +99,45 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
       # function can only run once the holder's has returned.
       assert Process.info(self(), :messages) === {:messages, [:holder_done, :waiter_ran]}
     end
+
+    test "is waited for by a drop of a database, which then removes what the holder made" do
+      table = Store.new([])
+      parent = self()
+      assert :ok = Store.create_database(table, "gone", fn _databases -> :ok end, 3600)
+
+      holder =
+        Task.async(fn ->
+          Store.create_database(table, "other", fn _databases ->
+            send(parent, :holding)
+
+            receive do
+              :release -> :ok
+            end
+          end)
+        end)
+
+      assert_receive :holding, 30_000
+
+      dropper =
+        Task.async(fn ->
+          send(parent, :dropping)
+          result = Store.drop_database(table, "gone")
+          send(parent, :dropped)
+          result
+        end)
+
+      assert_receive :dropping, 30_000
+      # the drop cannot finish while the creation holds the lock
+      refute_receive :dropped, 200
+      assert Store.database?(table, "gone")
+
+      send(holder.pid, :release)
+
+      assert Task.await(holder) === :ok
+      assert Task.await(dropper) === :ok
+      refute Store.database?(table, "gone")
+      assert Store.retention(table, "gone") === nil
+      assert Store.database?(table, "other")
+    end
   end
 end

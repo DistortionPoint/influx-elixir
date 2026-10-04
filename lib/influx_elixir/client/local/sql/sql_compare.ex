@@ -29,11 +29,23 @@ defmodule InfluxElixir.Client.Local.SQLCompare do
   makes the next character literal (`'al\\%%'` matches "al%pha"); everything
   else is literal. `LIKE` is case-sensitive on the engine, `ILIKE` is not.
   """
-  @spec like_regex(binary(), boolean()) :: Regex.t()
+  @spec like_regex(binary(), boolean()) :: {:ok, Regex.t()} | {:error, :pattern_too_large}
   def like_regex(pattern, case_insensitive) do
     source = pattern |> String.codepoints() |> like_source([])
 
-    Regex.compile!("\\A" <> source <> "\\z", if(case_insensitive, do: "isu", else: "su"))
+    case Regex.compile("\\A" <> source <> "\\z", if(case_insensitive, do: "isu", else: "su")) do
+      {:ok, regex} -> {:ok, regex}
+      {:error, _reason} -> {:error, :pattern_too_large}
+    end
+  end
+
+  @doc "The refusal of a `LIKE` pattern too long for the regular expression it is matched by."
+  @spec pattern_too_large() :: map()
+  def pattern_too_large do
+    SQLError.refusal(
+      "a LIKE pattern of more than tens of thousands of characters: the double matches it with " <>
+        "a regular expression of bounded size"
+    )
   end
 
   @spec like_source([binary()], [binary()]) :: binary()

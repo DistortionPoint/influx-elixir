@@ -72,10 +72,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
           {binary(), [{binary(), InfluxQLArithmetic.check()}]}
   @doc false
   def plan_comparison(tokens, {tags, types}) do
+    unsigned_clash(InfluxQLWhereArith.unsigned_clash(tokens, tags, types))
+
     # A tag, a string or a boolean under arithmetic is null, so false for every row; the `+`
     # of two strings is concatenation (see `InfluxQLWhereArith`).
     cond do
-      InfluxQLWhereArith.null?(tokens, tags, types) ->
+      InfluxQLWhereArith.null?(tokens, tags, types) or
+          InfluxQLWhereArith.incompatible?(tokens, tags, types) ->
         {"(1 = 0)", []}
 
       match?({:ok, _joined}, InfluxQLWhereArith.concatenation(tokens, tags, types)) ->
@@ -92,6 +95,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
           {:ok, check} -> check_sql(check)
         end
     end
+  end
+
+  @spec unsigned_clash({:boolean, binary()} | :text | nil) :: :ok
+  defp unsigned_clash(nil), do: :ok
+
+  defp unsigned_clash(:text),
+    do: throw({:refused, "unsupported InfluxQL (an unsigned number ordered against a string)"})
+
+  defp unsigned_clash({:boolean, op}) do
+    throw(
+      {:refused,
+       {:engine,
+        "Error during planning: Cannot infer common argument type for comparison " <>
+          "operation UInt64 #{op} Boolean"}}
+    )
   end
 
   @spec check_sql(InfluxQLArithmetic.check()) ::

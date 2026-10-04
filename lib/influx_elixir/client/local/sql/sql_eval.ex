@@ -20,6 +20,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     SQLError,
     SQLExpr,
     SQLFunctions,
+    SQLNullType,
     SQLNumber,
     SQLPlan,
     SQLRow,
@@ -97,10 +98,16 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   # one form: a product or a quotient by one dropped (`log(x, 1 * x)`) and the
   # operands of a sum or a product in one order (`log(x + 1, 1 + x)`). It does not
   # drop a sum of zero (`log(x, x + 0)` is not folded), and a constant is computed.
+  #
+  # Nor does it compute `log(base, 1)` of a base that is not a constant (`log(x, 1)` is `0.0`
+  # for every row, a null one too) or a typed null one (`log(CAST(NULL AS DOUBLE), 1)`): the
+  # optimizer folds it to zero. A constant base is computed, as is the untyped `NULL` one.
   defp eval_call({:call, :log, [base, argument]} = call, point) do
     {base, argument} = {log_form(base), log_form(argument)}
 
     cond do
+      log_of_one?(argument, point) -> log_zero(call, base, point)
+      typed_null_base?(base, point) -> typed_null_log(argument, point)
       constant?(base) -> call_function(call, point)
       base == argument -> 1.0
       without_cast(base) == without_cast(argument) -> throw({:query_error, log_cast_refusal()})
@@ -274,8 +281,12 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   end
 
   @spec pattern_regex(value(), boolean()) :: Regex.t() | nil
-  defp pattern_regex(pattern, ilike) when is_binary(pattern),
-    do: SQLCompare.like_regex(pattern, ilike)
+  defp pattern_regex(pattern, ilike) when is_binary(pattern) do
+    case SQLCompare.like_regex(pattern, ilike) do
+      {:ok, regex} -> regex
+      {:error, :pattern_too_large} -> throw({:query_error, SQLCompare.pattern_too_large()})
+    end
+  end
 
   defp pattern_regex(_pattern, _ilike), do: nil
 
@@ -361,6 +372,68 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     SQLError.refusal(
       "log of an expression and its cast to a float: whether the engine folds it to 1.0 " <>
         "depends on the column's type"
+    )
+  end
+
+  # Whether the argument of a `log` is the number one, once the optimizer has folded it.
+  @spec log_of_one?(SQLExpr.t(), SQLRow.point()) :: boolean()
+  defp log_of_one?(argument, point) do
+    constant?(argument) and
+      case eval(argument, point) do
+        nil -> false
+        value -> SQLNumber.numeric?(value) and SQLNumber.to_float(value) == 1.0
+      end
+  end
+
+  # `log(base, 1)`: zero, unless the base is a constant, which is computed. A constant base that
+  # is a typed null (`CAST(NULL AS DOUBLE)`) is zero too, and with any other number the engine
+  # closes the connection or folds it in a way the double has not read: that is refused by
+  # name. The `NULL` literal's own type gives null.
+  @spec log_zero(SQLExpr.t(), SQLExpr.t(), SQLRow.point()) :: value()
+  defp log_zero(call, base, point) do
+    cond do
+      not constant?(base) ->
+        0.0
+
+      not is_nil(eval(base, point)) ->
+        call_function(call, point)
+
+      true ->
+        case SQLNullType.constant_type(base) do
+          "Null" -> nil
+          :unknown -> throw({:query_error, log_null_refusal()})
+          _typed -> 0.0
+        end
+    end
+  end
+
+  # A typed null base beside a number that is not one.
+  @spec typed_null_base?(SQLExpr.t(), SQLRow.point()) :: boolean()
+  defp typed_null_base?(base, point) do
+    constant?(base) and is_nil(eval(base, point)) and
+      SQLNullType.constant_type(base) not in ["Null", :unknown]
+  end
+
+  # `log(CAST(NULL AS DOUBLE), NULL)` is null, and with a typed null beside it the base is the
+  # argument, one (verified); with any other number the connection closes.
+  @spec typed_null_log(SQLExpr.t(), SQLRow.point()) :: value()
+  defp typed_null_log(argument, point) do
+    if constant?(argument) and is_nil(eval(argument, point)) do
+      case SQLNullType.constant_type(argument) do
+        "Null" -> nil
+        :unknown -> throw({:query_error, log_null_refusal()})
+        _typed -> 1.0
+      end
+    else
+      throw({:query_error, log_null_refusal()})
+    end
+  end
+
+  @spec log_null_refusal() :: SQLError.t()
+  defp log_null_refusal do
+    SQLError.refusal(
+      "log of a typed NULL base and a number other than one: the engine closes the connection " <>
+        "or folds it in a way the double has not read"
     )
   end
 

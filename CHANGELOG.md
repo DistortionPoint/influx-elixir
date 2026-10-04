@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` InfluxQL counted missing fields and compared mismatched
+  kinds**: `count()` of a field the measurement lacks is omitted (it was a
+  `0`), still taking its name
+  (`count(nosuch), count(v)` is `count_1`); a comparison between kinds that do
+  not compare (a number against a string, a boolean or a tag, strings and
+  booleans in order, two tags, a regular expression against a number) keeps no
+  point whatever the sides are (`abs(1) != 'x'`, `n / 0 = 'x'`, `(s) != 0`,
+  `abs(n) < true`); an unsigned side against a boolean is the planner's
+  `UInt64` 400; `abs()` words its errors as the planner does for a call that
+  is the whole condition or part of one; `top()` and `bottom()` number the
+  tag columns beside them as the engine does (`top(v, 1), host GROUP BY host`
+  has `host` once; `top(v, host, 1) AS host_1 ... GROUP BY host` is the
+  `Projections require unique expression names` 400), answer the points with
+  no value after those that have one when a field is beside them, and answer
+  the schema error for an aliased `time` or a field the measurement lacks;
+  `(s)`, `+s`, `(b)` and `(host)` are the column; `*` beside a `time` column
+  that takes a field's name numbers the later of the two; one typed
+  arithmetic kernel serves the select list and the `WHERE`.
 - **`Client.Local` InfluxQL aggregates of `time` read every point** (0.1.41).
   `max(time), count(s)` is the latest point that has an `s` (as are `first`,
   `last`, `min`, `mode` and `count(distinct(time))`, in a series, a bucket and
@@ -84,11 +102,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NULL || 1`, `host || n` and `count(distinct -1)` differently from the
   engine; statements the engine does not run (`CREATE SEQUENCE`, `DROP INDEX`,
   `create trigger t`) now carry its exact wording.
+- **`Client.Local` SQL gave `||` the precedence of `+`**: `'a' || 1 + 2`
+  answered `"a3"`; it binds like `*`, as on the engine, so that is the
+  engine's coercion error. `SELECT DISTINCT … HAVING` ignored the `HAVING`.
+- **`Client.Local` SQL read SQL words in `UPDATE` as columns**
+  (`… SET n = CASE …` gave "No field named case"). `UPDATE`, `GRANT`,
+  `REVOKE`, `DENY` and `DESC` now answer only the shapes verified against
+  the engine and refuse the rest by name; `||`, `LIKE`, `IS DISTINCT FROM`
+  and aggregates of a computed `NULL` follow the engine's typing.
+- **`Client.Local` raised on a table name of about 4,100 characters** or a
+  `LIKE` pattern past about 64,000, and an expression of hundreds of
+  operators took seconds to type (900 terms: 5 s); these are refusals by name
+  and a single typing pass. A `HAVING` naming a select alias several times
+  read the table's columns once per name.
 - **`mix test` chose the wrong tests** for an absolute or `./` path, a path
   outside `test/`, `--only=v2`, an `--include` of an integration tag
   without a path, and a path after a switch it did not know
-  (`--no-compile test/x_test.exs` ran the whole suite). A path is now
-  recognised by what it is.
+  (`--no-compile test/x_test.exs` ran the whole suite), and an option's value
+  that names a directory (`--exclude lib`) was taken for a path. The rule is
+  now `mix/test_args.ex`, with its own test: known switches and their values
+  are skipped, and every other argument is a path when it is one.
 
 ### Changed
 - The integration one-liners pin `influxdb:3.10.1-core`, the version the

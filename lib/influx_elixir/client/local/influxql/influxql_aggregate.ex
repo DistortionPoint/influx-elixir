@@ -192,19 +192,29 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
         do: {"#{alias || "count"}_" <> field, count(rows, field), {:count, :integer}}
   end
 
-  defp compute({:aggregate, "count", {:distinct, field}, alias}, rows, _fields, _tags, _types) do
-    [{alias || "count", count_distinct(rows, field), {:count, :integer}}]
+  defp compute({:aggregate, "count", {:distinct, field}, alias}, rows, _fields, tags, types) do
+    [{alias || "count", count_distinct(rows, field), count_spec(field, tags, types)}]
   end
 
   defp compute({:aggregate, "distinct", field, alias}, rows, _fields, tags, _types) do
     [{alias || "distinct", distinct(rows, field, tags), {:other, :float}}]
   end
 
-  defp compute({:aggregate, fun, field, alias}, rows, _fields, _tags, types) do
-    [
-      {alias || InfluxQLExpr.function_name(fun), apply_function(fun, rows, field, types),
-       spec(fun, field, types)}
-    ]
+  defp compute({:aggregate, fun, field, alias}, rows, _fields, tags, types) do
+    spec = if fun == "count", do: count_spec(field, tags, types), else: spec(fun, field, types)
+
+    [{alias || InfluxQLExpr.function_name(fun), apply_function(fun, rows, field, types), spec}]
+  end
+
+  # A `count()` of a field the measurement does not have is a null (never the zero of a count
+  # that found no point), omitted from the row and from a bucket unless `fill()` gives it a
+  # value (verified: `count(v), count(nosuch)` is `count` only, and the omitted column still
+  # takes its name, the next `count` being `count_1`).
+  @spec count_spec(binary(), MapSet.t(binary()), map()) :: spec()
+  defp count_spec(field, tags, types) do
+    if field == "time" or MapSet.member?(tags, field) or Map.has_key?(types, field),
+      do: {:count, :integer},
+      else: {:other, :integer}
   end
 
   @doc "The type of the values an aggregate of `field` comes to."

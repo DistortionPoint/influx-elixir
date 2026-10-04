@@ -348,13 +348,29 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
     case parsed do
       {:ok, {:agg, fun, field}} -> {:ok, {:aggregate, fun, field, alias}}
-      {:ok, ast} -> {:ok, {:expr, ast, alias}}
+      {:ok, ast} -> {:ok, column_or_expression(ast, alias)}
       {:multi, kind, field, tags, limit} -> {:ok, {:multi, kind, field, tags, limit, alias}}
       {:wild, name, extra, target} -> {:ok, {:wild_call, name, extra, target, alias}}
       {:expand_error, message} -> {:ok, {:expand_error, message}}
       {:planning, message} -> {:ok, {:planning_error, message}}
       {:argument, name, argument} -> {:ok, {:argument_error, name, argument}}
       _unread -> {:error, "unsupported select item: #{text}"}
+    end
+  end
+
+  # A column in parentheses, or under a plus sign, is the column (verified: `(s)`, `((s))`,
+  # `+s`, `(b)` and `(host)` answer a string, a boolean or a tag as `s`, `b` and `host`
+  # do); anything else is arithmetic.
+  @spec column_or_expression(term(), binary() | nil) :: InfluxQL.item()
+  defp column_or_expression(ast, alias) do
+    case ast do
+      {:ref, name} ->
+        if String.downcase(name) == "time",
+          do: {:expr, ast, alias},
+          else: {:column, name, alias || name}
+
+      _other ->
+        {:expr, ast, alias}
     end
   end
 

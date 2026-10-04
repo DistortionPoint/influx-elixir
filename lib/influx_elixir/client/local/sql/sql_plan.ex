@@ -22,8 +22,11 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     SQLExprType,
     SQLFunctions,
     SQLNativeType,
+    SQLNullType,
+    SQLNumber,
     SQLParser,
     SQLSchema,
+    SQLTyped,
     SQLWhere
   }
 
@@ -34,6 +37,15 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   @typedoc "A stored point, as `InfluxElixir.Client.Local` keeps it."
   @type point :: InfluxElixir.Client.Local.SQLRow.point()
+
+  # The arithmetic nodes typed so far, the latest first, to be reused by the next.
+  @typep typed :: [{SQLParser.expr(), binary() | nil | :mixed}]
+
+  # What the checks before an item typed: the arithmetic nodes as operands, and the nodes
+  # as `SQLExprType` types them.
+  @typep memo :: {typed(), SQLTyped.t()}
+
+  @untyped {[], []}
 
   @decimal "Decimal128(?)"
 
@@ -70,6 +82,24 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   @spec check([point()], SQLParser.parsed_query(), (binary() -> boolean())) ::
           :ok | {:error, failure()}
   def check(points, query, unsigned?) do
+    if SQLNullType.duration_misuse?(query) do
+      {:error, duration_refusal()}
+    else
+      check_types(points, query, unsigned?)
+    end
+  end
+
+  @spec duration_refusal() :: map()
+  defp duration_refusal do
+    SQLError.refusal(
+      "a difference of a null and time used in an operation: the engine types it as a " <>
+        "Duration(ns), and its error for each use is not modelled"
+    )
+  end
+
+  @spec check_types([point()], SQLParser.parsed_query(), (binary() -> boolean())) ::
+          :ok | {:error, failure()}
+  defp check_types(points, query, unsigned?) do
     checks =
       Enum.sort_by(
         Enum.map(select_items(query), &{:select, &1}) ++
@@ -453,30 +483,130 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp operand_expr({:expr, expr}), do: expr
   defp operand_expr(column), do: {:field, column}
 
+  # The columns the checks name. The parts of a term that are items of their own (an
+  # operator under an operator, a call under a comparison) are named by those items, so
+  # each item names only what it holds directly: walking its whole term would walk the
+  # parts below it once for every item above them, which is quadratic in the length of
+  # a nested sum or chain.
   @spec plan_columns([{SQLFunctions.context(), term()}]) :: [binary()]
   defp plan_columns(checks),
-    do: Enum.flat_map(checks, fn {_context, item} -> SQLSchema.expr_fields(item) end)
+    do: Enum.flat_map(checks, fn {_context, item} -> item_fields(item) end)
 
+  @spec item_fields(term()) :: [SQLExpr.column_ref()]
+  defp item_fields({wrapper, item}) when wrapper in [:cut, :lazy_cut, :null_cut],
+    do: item_fields(item)
+
+  defp item_fields({:expr_check, node}), do: node_fields(node)
+
+  defp item_fields({:aggs, aggs, item}),
+    do: Enum.flat_map(SQLAggType.arguments(aggs), &SQLSchema.expr_fields/1) ++ item_fields(item)
+
+  defp item_fields({:aggregate, _agg, expr}), do: own_fields(expr)
+  defp item_fields({:compare, _op, left, _right}), do: own_fields(left)
+  defp item_fields({:pattern, _kind, expr, _rest}), do: own_fields(expr)
+
+  defp item_fields({:in_list, left, values}),
+    do: own_fields([left | for({:expr, _expr} = value <- values, do: value)])
+
+  defp item_fields({:range, left, low, high}),
+    do: own_fields([left | for({:expr, _expr} = value <- [low, high], do: value)])
+
+  defp item_fields({kind, _first} = node) when kind in [:neg, :pos], do: node_fields(node)
+  defp item_fields({:op, _op, _left, _right} = node), do: node_fields(node)
+  defp item_fields({:call, _name, _args} = node), do: node_fields(node)
+  defp item_fields(item), do: SQLSchema.expr_fields(item)
+
+  @spec node_fields(SQLExpr.t()) :: [SQLExpr.column_ref()]
+  defp node_fields(node), do: Enum.flat_map(SQLExpr.children(node), &own_fields/1)
+
+  # The columns a term names that no item of its own names: those of the parts that are
+  # not themselves items.
+  @spec own_fields(term()) :: [SQLExpr.column_ref()]
+  defp own_fields({:expr, expr}), do: own_fields(expr)
+  defp own_fields({:field, name}), do: [name]
+  defp own_fields({:uint_col, name}), do: [name]
+  defp own_fields(terms) when is_list(terms), do: Enum.flat_map(terms, &own_fields/1)
+  defp own_fields(term) when is_tuple(term) and tuple_size(term) > 0, do: own_tuple_fields(term)
+  defp own_fields(_leaf), do: []
+
+  @spec own_tuple_fields(tuple()) :: [SQLExpr.column_ref()]
+  defp own_tuple_fields(term) do
+    if item_term?(term), do: [], else: node_fields(term)
+  end
+
+  # The expressions `plan_items/2` makes an item of, wherever they stand.
+  @spec item_term?(tuple()) :: boolean()
+  defp item_term?({:op, _op, _left, _right}), do: true
+  defp item_term?({:cmp, _op, _left, _right}), do: true
+  defp item_term?({kind, _inner}) when kind in [:neg, :pos], do: true
+  defp item_term?({:not, inner}), do: not is_list(inner)
+  defp item_term?({kind, _left, _right}) when kind in [:and, :or, :concat], do: true
+  defp item_term?({:cast, _inner, _type}), do: true
+  defp item_term?({:call, _name, _args}), do: true
+  defp item_term?({:constant, _call, _ancestors}), do: true
+  defp item_term?({:is_bool, _inner, _value, _negated}), do: true
+  defp item_term?({:is_distinct, _left, _right, _negated}), do: true
+  defp item_term?({:in, _inner, items, _negated}), do: is_list(items)
+  defp item_term?({:between, _inner, _low, _high, _negated}), do: true
+  defp item_term?({:like, _inner, _pattern, _negated, _ilike, _regex}), do: true
+  defp item_term?({:case, _operand, _whens, _otherwise}), do: true
+  defp item_term?(_other), do: false
+
+  # The items are checked in order, each carrying what the ones before it typed (`memo`): an
+  # operator is typed from the types of its sides, which the items of the operators below it
+  # have typed already, so a long sum is typed once per operator and not again for every
+  # operator above it. A `CASE`, a `COALESCE` and a `||` nest the same way.
   @spec check_items([{SQLFunctions.context(), term()}], %{binary() => binary()}) ::
           :ok | {:error, failure()}
   defp check_items(checks, columns) do
-    Enum.reduce_while(checks, :ok, fn {context, item}, deferred ->
-      case item |> check_item(context, columns) |> decimal_guard() do
-        :ok ->
-          {:cont, deferred}
+    {outcome, _memo} =
+      Enum.reduce_while(checks, {:ok, @untyped}, fn {context, item}, {deferred, memo} ->
+        case item |> check_item(context, columns, memo) |> decimal_guard() do
+          :ok ->
+            {:cont, {deferred, remember(item, columns, memo)}}
 
-        {:error, %{body: @conversion <> _rest}} = error ->
-          {:cont, if(match?({:error, %{}}, deferred), do: deferred, else: error)}
+          {:error, %{body: @conversion <> _rest}} = error ->
+            {:cont,
+             {if(match?({:error, %{}}, deferred), do: deferred, else: error),
+              remember(item, columns, memo)}}
 
-        # The engine closes the connection when it runs the plan, after all of its errors.
-        {:error, {:connection_error, _reason}} = closed ->
-          {:cont, if(deferred == :ok, do: closed, else: deferred)}
+          # The engine closes the connection when it runs the plan, after all of its errors.
+          {:error, {:connection_error, _reason}} = closed ->
+            {:cont,
+             {if(deferred == :ok, do: closed, else: deferred), remember(item, columns, memo)}}
 
-        {:error, _reason} = error ->
-          {:halt, error}
-      end
-    end)
+          {:error, _reason} = error ->
+            {:halt, {error, memo}}
+        end
+      end)
+
+    outcome
   end
+
+  # What an item typed, added to what was typed before it, the latest first: the type of an
+  # operator as an operand of arithmetic, and the type of an expression whatever it stands in.
+  @spec remember(term(), %{binary() => binary()}, memo()) :: memo()
+  defp remember({wrapper, item}, columns, memo) when wrapper in [:cut, :lazy_cut, :null_cut],
+    do: remember(item, columns, memo)
+
+  defp remember({:expr_check, node}, columns, memo)
+       when elem(node, 0) in [:concat, :case, :call],
+       do: remember_known(node, columns, memo)
+
+  defp remember({:call, _name, _args} = call, columns, memo),
+    do: remember_known(call, columns, memo)
+
+  defp remember(item, columns, {typed, _known} = memo)
+       when is_tuple(item) and elem(item, 0) in [:op, :neg, :pos] do
+    {_typed, known} = remember_known(item, columns, memo)
+    {[{item, node_type(item, columns, typed)} | typed], known}
+  end
+
+  defp remember(_item, _columns, memo), do: memo
+
+  @spec remember_known(SQLExpr.t(), %{binary() => binary()}, memo()) :: memo()
+  defp remember_known(node, columns, {typed, known}),
+    do: {typed, [{node, SQLExprType.node_type(node, columns, known)} | known]}
 
   # An error that would print a decimal's type cannot be worded: the
   # precision of an `Int64` with a `UInt64` is not tracked.
@@ -495,63 +625,71 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp decimal_guard({:error, {:connection_error, _reason}} = closed), do: closed
   defp decimal_guard(:ok), do: :ok
 
-  @spec check_item(term(), SQLFunctions.context(), %{binary() => binary()}) ::
+  @spec check_item(term(), SQLFunctions.context(), %{binary() => binary()}, memo()) ::
           :ok | {:error, failure()}
-  defp check_item({:cut, call}, :where, columns), do: check_item(call, :where_cut, columns)
-  defp check_item({:cut, call}, context, columns), do: check_item(call, context, columns)
+  defp check_item({:cut, call}, :where, columns, memo),
+    do: check_item(call, :where_cut, columns, memo)
+
+  defp check_item({:cut, call}, context, columns, memo),
+    do: check_item(call, context, columns, memo)
 
   # Only an IS NULL cuts the error of a call in the select list (verified against Core: a
   # CAST, BETWEEN, IN, LIKE or NOT there leaves the planner's whole message).
-  defp check_item({:null_cut, call}, :select, columns),
-    do: check_item(call, :select_cut, columns)
+  defp check_item({:null_cut, call}, :select, columns, memo),
+    do: check_item(call, :select_cut, columns, memo)
 
   # An operator the select list types only when it coerces the expression.
-  defp check_item({:lazy_cut, node}, :select, columns),
-    do: check_item(node, :select_cut, columns)
+  defp check_item({:lazy_cut, node}, :select, columns, memo),
+    do: check_item(node, :select_cut, columns, memo)
 
-  defp check_item({:lazy_cut, node}, context, columns),
-    do: check_item({:cut, node}, context, columns)
+  defp check_item({:lazy_cut, node}, context, columns, memo),
+    do: check_item({:cut, node}, context, columns, memo)
 
-  defp check_item({:null_cut, call}, context, columns),
-    do: check_item({:cut, call}, context, columns)
+  defp check_item({:null_cut, call}, context, columns, memo),
+    do: check_item({:cut, call}, context, columns, memo)
 
   # The parts of an expression over aggregates are typed with the aggregates'
   # results. `MIN(NULL)` and `MAX(NULL)` are the null to the planner (verified against
   # Core: `MIN(NULL) + 'a'` fails as `Utf8 + Utf8` does, `MIN(NULL) + 1` is null).
-  defp check_item({:aggs, aggs, item}, context, columns) do
+  # The aggregates' results change the types of the columns, so what was typed without them
+  # is not reused.
+  defp check_item({:aggs, aggs, item}, context, columns, _memo) do
     nulls = for {name, _column} = agg <- aggs, null_extreme?(agg), do: name
 
     check_item(
       nullify(item, nulls),
       context,
-      Map.merge(columns, SQLAggType.types(aggs, columns))
+      Map.merge(columns, SQLAggType.types(aggs, columns)),
+      @untyped
     )
   end
 
-  defp check_item({:constant, call, ancestors}, context, _columns),
+  defp check_item({:constant, call, ancestors}, context, _columns, _memo),
     do: SQLConstantCall.check(call, ancestors, context)
 
-  defp check_item({:call, function, args}, context, columns) do
-    types = Enum.map(args, &argument_type(function, &1, columns))
-    SQLFunctions.check(function, types, context)
+  defp check_item({:call, function, args}, context, columns, memo) do
+    types = Enum.map(args, &argument_type(function, &1, columns, memo))
+    SQLFunctions.check(function, types, context, Enum.map(args, &SQLNullType.null_valued?/1))
   end
 
-  defp check_item({:op, op, left, right}, context, columns),
-    do: check_arithmetic(op, left, right, context, columns)
+  defp check_item({:op, op, left, right}, context, columns, {typed, _known}),
+    do: check_arithmetic(op, left, right, context, columns, typed)
 
   # The first sentence of a call's error where the planning is cut.
-  defp check_item({:expr_check, node}, cut, columns) when cut in [:where_cut, :select_cut],
-    do: SQLExprCheck.check(node, columns, :order_by)
+  defp check_item({:expr_check, node}, cut, columns, {_typed, known})
+       when cut in [:where_cut, :select_cut],
+       do: SQLExprCheck.check(node, columns, :order_by, known)
 
-  defp check_item({:expr_check, node}, context, columns),
-    do: SQLExprCheck.check(node, columns, context)
+  defp check_item({:expr_check, node}, context, columns, {_typed, known}),
+    do: SQLExprCheck.check(node, columns, context, known)
 
   # The engine words a negation the same wherever it stands.
-  defp check_item({:neg, inner}, _context, columns), do: check_negation(inner, columns)
+  defp check_item({:neg, inner}, _context, columns, {_typed, known}),
+    do: check_negation(inner, columns, known)
 
-  defp check_item({:pos, inner}, _context, columns) do
-    case SQLFunctions.type_of(inner, columns) do
-      type when type in [nil, "Null", "Timestamp(ns)"] or is_numeric_type(type) ->
+  defp check_item({:pos, inner}, _context, columns, {_typed, known}) do
+    case SQLFunctions.type_of(inner, columns, known) || null_type(inner) do
+      type when type in [nil, "Timestamp(ns)"] or is_numeric_type(type) ->
         :ok
 
       _not_numeric ->
@@ -562,13 +700,18 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     end
   end
 
-  defp check_item({:aggregate, agg, expr}, _context, columns),
+  defp check_item({:aggregate, agg, expr}, _context, columns, _memo),
     do: check_aggregate(agg, expr, columns)
 
-  defp check_item({:selector_check, selector, field, ordering, grouped?}, _context, columns),
-    do: check_selector(selector, columns[field], columns[ordering], grouped?)
+  defp check_item(
+         {:selector_check, selector, field, ordering, grouped?},
+         _context,
+         columns,
+         _memo
+       ),
+       do: check_selector(selector, columns[field], columns[ordering], grouped?)
 
-  defp check_item(item, context, columns), do: check_where_item(item, context, columns)
+  defp check_item(item, context, columns, _memo), do: check_where_item(item, context, columns)
 
   # A selector's second argument must be a timestamp (verified against Core); the first, a
   # tag, closes the connection under `selector_min` and `selector_max` where the query is not
@@ -590,13 +733,15 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   # The `NULL` literal has the type `Null` to every function: its signature coerces it with
   # the other arguments (`left(NULL, 1.5)` and `round(NULL, host)` are type errors).
-  @spec argument_type(atom(), SQLExpr.t(), %{binary() => binary()}) :: binary() | nil
-  defp argument_type(_function, {:lit, nil}, _columns), do: "Null"
+  @spec argument_type(atom(), SQLExpr.t(), %{binary() => binary()}, memo()) :: binary() | nil
+  defp argument_type(_function, {:lit, nil}, _columns, _memo), do: "Null"
 
-  defp argument_type(_function, arg, columns) when elem(arg, 0) in [:op, :neg, :pos],
-    do: arithmetic_type(arg, columns)
+  defp argument_type(_function, arg, columns, {typed, _known})
+       when elem(arg, 0) in [:op, :neg, :pos],
+       do: arithmetic_type(arg, columns, typed)
 
-  defp argument_type(_function, arg, columns), do: SQLExprType.type_of(arg, columns)
+  defp argument_type(_function, arg, columns, {_typed, known}),
+    do: SQLExprType.type_of(arg, columns, known) || null_type(arg)
 
   # The plan item with the aggregates called `names` read as the null literal.
   @spec nullify(term(), [binary()]) :: term()
@@ -706,10 +851,11 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
           SQLParser.expr(),
           SQLParser.expr(),
           SQLFunctions.context(),
-          %{binary() => binary()}
+          %{binary() => binary()},
+          typed()
         ) :: :ok | {:error, map()}
-  defp check_arithmetic(op, left, right, context, columns) do
-    case {arithmetic_type(left, columns), arithmetic_type(right, columns)} do
+  defp check_arithmetic(op, left, right, context, columns, typed) do
+    case {arithmetic_type(left, columns, typed), arithmetic_type(right, columns, typed)} do
       {"Null", type} when is_binary(type) ->
         null_operand(op, type, context)
 
@@ -747,31 +893,52 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   # The type of an operand of an arithmetic operator: the null literal is `Null` (which the
   # engine coerces to the other operand's type), and an operation over it has the type of
-  # its other side.
-  @spec arithmetic_type(SQLParser.expr(), %{binary() => binary()}) :: binary() | nil | :mixed
-  defp arithmetic_type({:lit, nil}, _columns), do: "Null"
+  # its other side. An operator typed already (`typed`) is not typed again.
+  @spec arithmetic_type(SQLParser.expr(), %{binary() => binary()}, typed()) ::
+          binary() | nil | :mixed
+  defp arithmetic_type(expr, columns, typed)
+       when typed != [] and elem(expr, 0) in [:op, :neg, :pos] do
+    case SQLTyped.recall(typed, expr) do
+      {:ok, type} -> type
+      :error -> node_type(expr, columns, typed)
+    end
+  end
+
+  defp arithmetic_type(expr, columns, typed), do: node_type(expr, columns, typed)
+
+  @spec node_type(SQLParser.expr(), %{binary() => binary()}, typed()) ::
+          binary() | nil | :mixed
+  defp node_type({:lit, nil}, _columns, _typed), do: "Null"
 
   # A negation keeps the null's type (`-NULL + 'a'` is `Utf8 + Utf8`).
-  defp arithmetic_type({:neg, inner}, columns) do
-    case arithmetic_type(inner, columns) do
+  defp node_type({:neg, inner}, columns, typed) do
+    case arithmetic_type(inner, columns, typed) do
       "Null" -> "Null"
       _typed -> SQLExprType.type_of({:neg, inner}, columns)
     end
   end
 
-  defp arithmetic_type({:pos, inner}, columns), do: arithmetic_type(inner, columns)
+  defp node_type({:pos, inner}, columns, typed), do: arithmetic_type(inner, columns, typed)
 
   # The engine types `NULL + NULL` as an `Int64` (`NULL + NULL + 'a'` is `Int64 + Utf8`).
-  defp arithmetic_type({:op, _op, left, right} = expr, columns) do
-    case {arithmetic_type(left, columns), arithmetic_type(right, columns)} do
+  # Each node is typed from the types of its sides, which are typed once: the operators of a
+  # long sum nest, and typing a node again from its whole tree is quadratic in their number.
+  defp node_type({:op, _op, left, right}, columns, typed) do
+    case {arithmetic_type(left, columns, typed), arithmetic_type(right, columns, typed)} do
       {"Null", "Null"} -> "Int64"
       {"Null", type} -> if is_numeric_type(type), do: type, else: nil
       {type, "Null"} -> if is_numeric_type(type), do: type, else: nil
-      _typed -> SQLExprType.type_of(expr, columns)
+      {left_type, right_type} -> operator_type(left_type, right_type)
     end
   end
 
-  defp arithmetic_type(expr, columns), do: SQLExprType.type_of(expr, columns)
+  defp node_type(expr, columns, _typed), do: SQLExprType.type_of(expr, columns)
+
+  @spec operator_type(binary() | nil | :mixed, binary() | nil | :mixed) :: binary() | nil
+  defp operator_type(left, right) when is_numeric_type(left) and is_numeric_type(right),
+    do: SQLNumber.result_type(left, right)
+
+  defp operator_type(_left, _right), do: nil
 
   # An operator with the null on one side: the engine types the null as the other side, so
   # a number is fine and a text or a boolean is an operation on that type with itself.
@@ -810,9 +977,10 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
      )}
   end
 
-  @spec check_negation(SQLParser.expr(), %{binary() => binary()}) :: :ok | {:error, map()}
-  defp check_negation(inner, columns) do
-    case SQLFunctions.type_of(inner, columns) do
+  @spec check_negation(SQLParser.expr(), %{binary() => binary()}, SQLTyped.t()) ::
+          :ok | {:error, map()}
+  defp check_negation(inner, columns, known) do
+    case SQLFunctions.type_of(inner, columns, known) do
       type
       when type in [nil, "Timestamp(ns)", "Int64", "Int32", "Int16", "Int8", "Float64", @decimal] ->
         :ok
@@ -827,20 +995,59 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp check_aggregate(:sum_distinct, expr, columns), do: check_aggregate(:sum, expr, columns)
 
   defp check_aggregate(agg, expr, columns) do
-    case SQLExprType.type_of(expr, columns) do
-      nil -> null_aggregate(agg, expr)
-      type when is_binary(type) -> aggregate_refusal(agg, type)
-      :mixed -> :ok
+    with :ok <- unary_plus(expr, columns) do
+      case SQLExprType.type_of(expr, columns) do
+        nil -> null_aggregate(agg, expr)
+        type when is_binary(type) -> aggregate_refusal(agg, type)
+        :mixed -> :ok
+      end
     end
   end
+
+  # `count(DISTINCT +NULL)`: the unary plus is the first thing the planner finds wrong.
+  @spec unary_plus(SQLParser.expr(), %{binary() => binary()}) :: :ok | {:error, failure()}
+  defp unary_plus({:pos, _inner} = plus, columns),
+    do: check_item(plus, :select, columns, @untyped)
+
+  defp unary_plus(_expr, _columns), do: :ok
 
   # `SUM(NULL)` and `AVG(NULL)` are planning errors (verified against Core); the
   # other aggregates of a null are null.
   @spec null_aggregate(SQLParser.aggregate(), SQLParser.expr()) :: :ok | {:error, map()}
-  defp null_aggregate(agg, {:lit, nil}) when agg in [:sum, :avg],
-    do: aggregate_refusal(agg, "Null")
+  # A computed null (`-NULL`, a `CASE` of nulls) is typed as the engine types it
+  # (`SQLNullType`): `Null` for `-NULL`, `Utf8View` for `NULLIF(NULL, NULL)`.
+  defp null_aggregate(agg, expr) do
+    if SQLExpr.columns(expr) == [] do
+      case SQLNullType.constant_type(expr) do
+        "Null" when agg in [:sum, :avg] ->
+          aggregate_refusal(agg, "Null")
 
-  defp null_aggregate(_agg, _expr), do: :ok
+        "Null" ->
+          :ok
+
+        :unknown ->
+          {:error,
+           SQLError.refusal(
+             "an aggregate of a NULL expression whose type the double does not know: the " <>
+               "engine's error for it is not modelled"
+           )}
+
+        type ->
+          aggregate_refusal(agg, type)
+      end
+    else
+      :ok
+    end
+  end
+
+  # The type of a constant that reads no column, `nil` where it is not known.
+  @spec null_type(SQLParser.expr()) :: binary() | nil
+  defp null_type(expr) do
+    case SQLNullType.constant_type(expr) do
+      :unknown -> nil
+      type -> type
+    end
+  end
 
   @spec check_pattern(
           atom(),
@@ -954,7 +1161,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp boolean_mismatch?(left, right),
     do:
       left == "Boolean" != (right == "Boolean") or
-        SQLExprType.struct?(left) != SQLExprType.struct?(right)
+        SQLNativeType.struct?(left) != SQLNativeType.struct?(right)
 
   @spec boolean_mismatch_with?(binary(), binary() | nil | :unknown) :: boolean()
   defp boolean_mismatch_with?(column, type) when is_binary(type),

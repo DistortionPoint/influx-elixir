@@ -201,7 +201,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
          {:ok, source} <- source(fetch, m, sources),
          {:ok, joined, relations} <- SQLJoin.cross_join(source, query, fetch_source),
          :ok <- SQLClauses.unreadable_order(query.order_by),
-         :ok <- SQLSchema.check(relations, query),
+         :ok <- SQLSchema.check(relations, query, SQLSimplify.never?(query)),
+         :ok <- order_available(relations, query),
          {:ok, query} <- SQLSchema.resolve_ordinals(query, relations),
          :ok <- plan_error(query),
          {:ok, bound} <- SQLParser.bind(query, params),
@@ -234,6 +235,17 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   defp rows(joined, query, final?),
     do: query_rows(filter(joined, query.where), ordered(query), final?)
+
+  # An `ORDER BY` column an aggregate query does not output is the engine's schema error, but a
+  # select list that is not grouped is found first (verified: `SELECT host, count(*) FROM t
+  # ORDER BY n` is the grouping error).
+  @spec order_available([SQLSchema.relation()], SQLParser.parsed_query()) ::
+          :ok | {:error, term()}
+  defp order_available(relations, query) do
+    with {:error, _reason} = unavailable <- SQLSchema.check_order_available(relations, query) do
+      with :ok <- SQLGrouping.check_select(query), do: unavailable
+    end
+  end
 
   @spec table_error(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
   defp table_error(%{table_error: nil}), do: :ok
@@ -563,7 +575,26 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     |> apply_limit(query.limit, query.offset)
   end
 
+  # `SELECT DISTINCT ... GROUP BY ... HAVING ...`: the groups the `HAVING` keeps, each row
+  # once (sorted by its values, as `execute_distinct_query/2`, unless `ORDER BY` says
+  # otherwise), then `LIMIT`.
   @spec execute_aggregate_query([point()], SQLParser.parsed_query()) :: [map()]
+  defp execute_aggregate_query(points, %{distinct_rows: true} = query) do
+    names = for column <- query.select_columns, do: elem(column, tuple_size(column) - 1)
+
+    rows =
+      execute_aggregate_query(points, %{query | distinct_rows: false, limit: nil, offset: nil})
+
+    rows
+    |> Enum.uniq()
+    |> then(fn rows ->
+      if query.order_by == [],
+        do: Enum.sort_by(rows, fn row -> Enum.map(names, &Map.get(row, &1)) end),
+        else: rows
+    end)
+    |> apply_limit(query.limit, query.offset)
+  end
+
   defp execute_aggregate_query(points, %{group_by_interval: nil, group_by_columns: nil} = query) do
     # Scalar aggregate: all filtered points form a single bucket. Always
     # produce one row, even when no points matched (so COUNT returns 0).

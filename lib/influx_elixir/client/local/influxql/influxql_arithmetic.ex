@@ -25,7 +25,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   #
   # The comparisons handled here are those of numbers: fields, constants,
   # `+ - * /`, signs and parentheses.
-  alias InfluxElixir.Client.Local.SQLLimits
+  alias InfluxElixir.Client.Local.{InfluxQLKernel, SQLLimits}
 
   require SQLLimits
 
@@ -61,7 +61,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
 
   @spec fold_kind(binary(), atom(), [number(), ...]) :: number() | nil
   defp fold_kind("sum", :unsigned, values), do: SQLLimits.wrap_uint64(Enum.sum(values))
-  defp fold_kind("sum", :integer, values), do: wrap_signed(Enum.sum(values))
+  defp fold_kind("sum", :integer, values), do: SQLLimits.wrap_int64(Enum.sum(values))
   defp fold_kind("sum", _float, values), do: float_sum(values)
   defp fold_kind(_mean, :float, values), do: values |> float_sum() |> divided(length(values))
   defp fold_kind(_mean, _integer, values), do: Enum.sum(values) / length(values)
@@ -228,8 +228,36 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
 
   defp eval({:field, name, kind}, row), do: field_value(kind, Map.get(row, name))
 
-  defp eval({:op, op, left, right}, row), do: apply_op(op, eval(left, row), eval(right, row))
+  defp eval({:op, op, left, right}, row) do
+    if lowest_beside_unsigned?(left, right), do: throw(:closed_connection)
+    apply_op(op, eval(left, row), eval(right, row))
+  end
+
   defp eval({:abs, operand}, row), do: absolute(eval(operand, row))
+
+  # The lowest 64-bit integer written as a constant beside an unsigned operand breaks the
+  # engine's connection (verified: `u * -9223372036854775808 > 0`, whatever the operator).
+  @spec lowest_beside_unsigned?(expr(), expr()) :: boolean()
+  defp lowest_beside_unsigned?(left, right) do
+    lowest = {:lit, {:int, SQLLimits.int64_min()}}
+    (left == lowest and kind(right) == :uint) or (right == lowest and kind(left) == :uint)
+  end
+
+  @spec kind(expr()) :: :int | :uint | :float
+  defp kind({:field, _name, kind}), do: kind
+  defp kind({:lit, {kind, _n}}), do: kind
+  defp kind({:abs, operand}), do: kind(operand)
+  defp kind({:op, "/", left, right}), do: division_kind(kind(left), kind(right))
+  defp kind({:op, _op, left, right}), do: common_kind(kind(left), kind(right))
+
+  defp division_kind(:int, :int), do: :float
+  defp division_kind(left, right), do: common_kind(left, right)
+
+  defp common_kind(:float, _other), do: :float
+  defp common_kind(_other, :float), do: :float
+  defp common_kind(:uint, _other), do: :uint
+  defp common_kind(_other, :uint), do: :uint
+  defp common_kind(_int, _other), do: :int
 
   @spec absolute(value()) :: value()
   defp absolute({:int, n}) when n == -9_223_372_036_854_775_808, do: throw(:closed_connection)
@@ -244,84 +272,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   defp field_value(_kind, _value), do: nil
 
   @spec apply_op(binary(), value(), value()) :: value()
-  defp apply_op(_op, nil, _right), do: nil
-  defp apply_op(_op, _left, nil), do: nil
-
-  defp apply_op(op, left, right) do
-    case common(left, right) do
-      {:float, x, y} -> float_op(op, x, y)
-      {:uint, x, y} -> uint_op(op, x, y)
-      {:int, x, y} -> int_op(op, x, y)
-      nil -> nil
-    end
-  end
-
-  # Both values as the type the engine casts them to.
-  @spec common(value(), value()) :: {:float | :uint | :int, number(), number()} | nil
-  defp common({:float, _x} = left, right), do: floats(left, right)
-  defp common(left, {:float, _y} = right), do: floats(left, right)
-
-  defp common({:int, x}, {:int, y}), do: {:int, x, y}
-
-  defp common(left, right) do
-    with x when x != nil <- unsigned(left), y when y != nil <- unsigned(right), do: {:uint, x, y}
-  end
-
-  defp floats(left, right), do: {:float, to_float(left), to_float(right)}
-
-  defp to_float({_kind, n}), do: n * 1.0
-
-  @spec unsigned(value()) :: non_neg_integer() | nil
-  defp unsigned({:uint, n}), do: n
-  defp unsigned({:int, n}) when n >= 0, do: n
-  defp unsigned({:int, n}) when n == SQLLimits.int64_min(), do: nil
-  defp unsigned({:int, n}), do: SQLLimits.uint64_max() + n
-
-  @spec uint_op(binary(), non_neg_integer(), non_neg_integer()) :: value()
-  defp uint_op("/", _x, 0), do: {:uint, 0}
-  defp uint_op("/", x, y), do: {:uint, div(x, y)}
-  defp uint_op(op, x, y), do: {:uint, SQLLimits.wrap_uint64(arith(op, x, y))}
-
-  @spec int_op(binary(), integer(), integer()) :: value()
-  defp int_op("/", x, y), do: float_op("/", x * 1.0, y * 1.0)
-  defp int_op(op, x, y), do: {:int, wrap_signed(arith(op, x, y))}
-
-  defp arith("+", x, y), do: x + y
-  defp arith("-", x, y), do: x - y
-  defp arith("*", x, y), do: x * y
-
-  @spec float_op(binary(), float(), float()) :: value()
-  defp float_op("/", _x, y) when y == 0.0, do: {:float, 0.0}
-
-  defp float_op(op, x, y) do
-    {:float, float_arith(op, x, y)}
-  rescue
-    ArithmeticError -> nil
-  end
-
-  defp float_arith("+", x, y), do: x + y
-  defp float_arith("-", x, y), do: x - y
-  defp float_arith("*", x, y), do: x * y
-  defp float_arith("/", x, y), do: x / y
-
-  @spec wrap_signed(integer()) :: integer()
-  defp wrap_signed(n), do: SQLLimits.wrap_int64(n)
+  defp apply_op(op, left, right), do: InfluxQLKernel.apply_op(op, left, right)
 
   @spec compare(binary(), value(), value()) :: boolean()
-  defp compare(_op, nil, _right), do: false
-  defp compare(_op, _left, nil), do: false
-
-  defp compare(op, left, right) do
-    case common(left, right) do
-      {_type, x, y} -> relation(op, x, y)
-      nil -> false
-    end
-  end
-
-  defp relation("=", x, y), do: x == y
-  defp relation(op, x, y) when op in ["!=", "<>"], do: x != y
-  defp relation("<", x, y), do: x < y
-  defp relation("<=", x, y), do: x <= y
-  defp relation(">", x, y), do: x > y
-  defp relation(">=", x, y), do: x >= y
+  defp compare(op, left, right), do: InfluxQLKernel.compare(op, left, right)
 end

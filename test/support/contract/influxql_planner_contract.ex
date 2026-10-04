@@ -568,12 +568,16 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
 
   defp answered({:ok, rows}) do
     for row <- rows do
-      {Calendar.strftime(row["time"], "%Y-%m-%d %H:%M:%S"),
-       row |> Map.delete("time") |> Map.delete("iox::measurement")}
+      {time_text(row["time"]), row |> Map.delete("time") |> Map.delete("iox::measurement")}
     end
   end
 
   defp answered({:error, %{status: status, body: body}}), do: {:error, status, body}
+
+  # A row whose time column is renamed (`time AS t`) has none under `time`: its time is
+  # in the columns, and the row is stamped `nil`.
+  defp time_text(nil), do: nil
+  defp time_text(time), do: Calendar.strftime(time, "%Y-%m-%d %H:%M:%S")
 
   @doc """
   `outcome/3`, or `:closed` for the connection the engine breaks mid-response.

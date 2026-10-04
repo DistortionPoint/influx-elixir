@@ -91,9 +91,9 @@ listed, with the engine's answer, in `InfluxQLShapeCases.refusals/0`.
 | File | Change |
 |------|--------|
 | `lib/influx_elixir/client/local/influxql/*.ex` | the changes above |
-| `test/support/contract/influxql_shape_cases.ex` | new: 638 statements with Core's answers, and 112 refusals |
-| `test/support/contract/influxql_fix_cases.ex` | `max/sum/median/spread/stddev/mode(time)`; the nanosecond stamps (a divergence) |
-| `test/support/contract/influxql_planner_contract.ex`, `influxql_flux_lp_contract.ex` | wire the tables; two `local_divergence` tests |
+| `test/support/contract/influxql_shape_cases.ex` | new: 640 statements with Core's answers, and 110 refusals |
+| `test/support/contract/influxql_fix_cases.ex` | `max/sum/median/spread/stddev/mode(time)`; the nanosecond stamps |
+| `test/support/contract/influxql_planner_contract.ex`, `influxql_flux_lp_contract.ex` | wire the tables; the shape refusals are the one `local_divergence` test |
 | `CHANGELOG.md` | |
 
 ## Verification

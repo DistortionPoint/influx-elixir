@@ -24,8 +24,20 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
   def check(%{select_columns: nil}, _relations), do: :ok
 
   def check(query, relations) do
+    with :ok <- check_select(query), do: check_having(query, grouped_columns(query), relations)
+  end
+
+  @doc """
+  `:ok`, or the engine's planning error for a projected plain column of an aggregate query
+  that is not in its `GROUP BY`: the select list alone, which the engine checks before it
+  resolves an `ORDER BY` column that is not an output.
+  """
+  @spec check_select(SQLParser.parsed_query()) :: :ok | {:error, term()}
+  def check_select(%{select_columns: nil}), do: :ok
+
+  def check_select(query) do
     items = query.group_by_columns || []
-    grouped = for item <- items, is_binary(item), do: item
+    grouped = grouped_columns(query)
     expressions = for {:expr, expr} <- items, do: expr
 
     ungrouped =
@@ -42,7 +54,7 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
 
     case ungrouped do
       nil ->
-        check_having(query, grouped, relations)
+        :ok
 
       {:column, column} ->
         {:error, ungrouped_error(query, "#{query.qualifier}.#{column}", "SELECT")}
@@ -51,6 +63,10 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
         {:error, ungrouped_refusal(column)}
     end
   end
+
+  @spec grouped_columns(SQLParser.parsed_query()) :: [binary()]
+  defp grouped_columns(query),
+    do: for(item <- query.group_by_columns || [], is_binary(item), do: item)
 
   # A column a `HAVING` reads that is neither grouped nor an aggregate's. A name the table
   # has is that column; any other is the name of a select item (verified against Core: an
@@ -67,16 +83,28 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
 
     qualified = for {:qualified, _relation, _name} = ref <- SQLSchema.where_refs(nodes), do: ref
 
-    problem =
-      Enum.find_value(
-        SQLWhere.conjunction_columns(nodes) ++ qualified,
-        &having_problem(&1, query, grouped, outputs, relations)
-      )
+    # The relations' columns come from every row of every table: read at the first name that
+    # needs them, once for the query.
+    refs = SQLWhere.conjunction_columns(nodes) ++ qualified
 
-    case problem do
+    case first_problem(refs, query, grouped, outputs, {relations, nil}) do
       nil -> :ok
       {:ungrouped, printed} -> {:error, ungrouped_error(query, printed, "HAVING")}
       {:refuse, why} -> {:error, SQLError.refusal(why)}
+    end
+  end
+
+  @spec first_problem([term()], SQLParser.parsed_query(), [binary()], [binary()], tuple()) ::
+          nil | {:ungrouped, binary()} | {:refuse, binary()}
+  defp first_problem([], _query, _grouped, _outputs, _relations), do: nil
+
+  defp first_problem([ref | more], query, grouped, outputs, relations) do
+    case having_problem(ref, query, grouped, outputs, relations) do
+      {nil, columns} ->
+        first_problem(more, query, grouped, outputs, {elem(relations, 0), columns})
+
+      {problem, _columns} ->
+        problem
     end
   end
 
@@ -85,33 +113,52 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
           SQLParser.parsed_query(),
           [binary()],
           [binary()],
-          [SQLSchema.relation()]
-        ) :: nil | {:ungrouped, binary()} | {:refuse, binary()}
-  defp having_problem({:qualified, relation, _name} = ref, _query, _grouped, outputs, relations) do
+          {[SQLSchema.relation()], MapSet.t(binary()) | nil}
+        ) :: {nil | {:ungrouped, binary()} | {:refuse, binary()}, MapSet.t(binary()) | nil}
+  defp having_problem(
+         {:qualified, relation, _name} = ref,
+         _query,
+         _grouped,
+         outputs,
+         {relations, columns}
+       ) do
     taken = SQLLiteral.unquoted(relation)
+    {column?, columns} = column?(taken in outputs, relations, columns, taken)
 
-    if taken in outputs or SQLSchema.column?(relations, taken),
+    if taken in outputs or column?,
       do:
-        {:refuse,
-         "a HAVING name #{SQLExpr.ref_text(ref)} whose relation is a column or a select item: " <>
-           "the engine reads it as a field of that column"},
-      else: {:ungrouped, SQLExpr.ref_text(ref)}
+        {{:refuse,
+          "a HAVING name #{SQLExpr.ref_text(ref)} whose relation is a column or a select " <>
+            "item: the engine reads it as a field of that column"}, columns},
+      else: {{:ungrouped, SQLExpr.ref_text(ref)}, columns}
   end
 
-  defp having_problem(name, query, grouped, outputs, relations) do
+  defp having_problem(name, query, grouped, outputs, {relations, columns}) do
     cond do
       SQLAggExpr.placeholder?(name) or name in grouped ->
-        nil
+        {nil, columns}
 
       MapSet.member?(Map.get(query.qualified_in, :having, MapSet.new()), name) ->
-        {:ungrouped, SQLSchema.written_name(name, query.qualified)}
+        {{:ungrouped, SQLSchema.written_name(name, query.qualified)}, columns}
 
-      name in outputs and not SQLSchema.column?(relations, name) ->
-        nil
+      name in outputs ->
+        {column?, columns} = column?(false, relations, columns, name)
+        {if(column?, do: {:ungrouped, "#{query.qualifier}.#{name}"}), columns}
 
       true ->
-        {:ungrouped, "#{query.qualifier}.#{name}"}
+        {{:ungrouped, "#{query.qualifier}.#{name}"}, columns}
     end
+  end
+
+  # Whether a relation has the column, with the columns once they were read (`skip` when the
+  # answer does not matter).
+  @spec column?(boolean(), [SQLSchema.relation()], MapSet.t(binary()) | nil, binary()) ::
+          {boolean(), MapSet.t(binary()) | nil}
+  defp column?(true, _relations, columns, _name), do: {false, columns}
+
+  defp column?(false, relations, columns, name) do
+    columns = columns || SQLSchema.table_columns(relations)
+    {MapSet.member?(columns, name), columns}
   end
 
   # The first column an expression reads outside an aggregate that is not

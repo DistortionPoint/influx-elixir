@@ -14,6 +14,7 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   alias InfluxElixir.Client.Local.{
     SQLAggExpr,
     SQLClauses,
+    SQLCompare,
     SQLError,
     SQLExpr,
     SQLLimit,
@@ -161,8 +162,12 @@ defmodule InfluxElixir.Client.Local.SQLBind do
 
   defp bind_node({op, left, {:like_param, name, case_insensitive}}, params)
        when op in [:like, :not_like] do
-    with {:ok, pattern} <- pattern_param(Map.fetch!(params, name), "LIKE") do
-      {:ok, {op, bind_operand(left, params), SQLPredicate.like_regex(pattern, case_insensitive)}}
+    with {:ok, pattern} <- pattern_param(Map.fetch!(params, name), "LIKE"),
+         {:ok, regex} <- SQLPredicate.like_regex(pattern, case_insensitive) do
+      {:ok, {op, bind_operand(left, params), regex}}
+    else
+      {:error, :pattern_too_large} -> {:error, SQLCompare.pattern_too_large()}
+      {:error, _error} = error -> error
     end
   end
 

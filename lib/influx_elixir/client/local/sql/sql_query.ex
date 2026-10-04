@@ -329,7 +329,14 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
   end
 
   # A table's columns as the engine's schema lists them: sorted, `time` among them.
-  @spec table_columns(Store.t(), binary(), binary()) :: [binary()]
+  @spec table_columns(Store.t(), binary(), binary() | {:numeric, binary()}) :: [binary()]
+  defp table_columns(table, database, {:numeric, measurement}) do
+    for {^measurement, column, "iox::column_type::field::" <> type} <-
+          Store.columns(table, database),
+        type in ["integer", "uinteger", "float"],
+        do: column
+  end
+
   defp table_columns(table, database, measurement) do
     columns = for {^measurement, column, _kind} <- Store.columns(table, database), do: column
     ["time" | columns] |> Enum.uniq() |> Enum.sort()

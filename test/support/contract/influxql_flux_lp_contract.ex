@@ -348,7 +348,7 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
         end
 
         # The engine stamps the row x + 1 ns; a client reads it to the microsecond.
-        test "an aggregate over time > x is stamped a nanosecond after x", ctx do
+        test "an aggregate over time > x is stamped with x to the microsecond", ctx do
           assert {:ok, [%{"mean" => 3.5, "time" => time}]} =
                    ifl_iq(ctx, "SELECT mean(v) FROM #{ctx.m} WHERE time > 2000")
 

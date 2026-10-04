@@ -15,7 +15,7 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
   # A type that is not known (a column no row has, a `NULL`) is `nil`, which
   # is never refused.
 
-  alias InfluxElixir.Client.Local.{SQLCommonType, SQLExpr, SQLFunctions}
+  alias InfluxElixir.Client.Local.{SQLCommonType, SQLExpr, SQLFunctions, SQLTyped}
 
   @booleans [:cmp, :and, :or, :not, :is_null, :is_bool, :is_distinct, :in, :between, :like]
 
@@ -24,36 +24,67 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
 
   @doc "The type of an expression."
   @spec type_of(SQLExpr.t(), %{binary() => binary()}) :: type()
-  def type_of(expr, _columns) when is_tuple(expr) and elem(expr, 0) in @booleans, do: "Boolean"
+  def type_of(expr, columns), do: type_of(expr, columns, [])
 
-  def type_of({:concat, left, right}, columns) do
-    if "Utf8View" in [type_of(left, columns), type_of(right, columns)],
+  @doc """
+  The type of an expression, the nodes `known` to be typed already (see
+  `InfluxElixir.Client.Local.SQLTyped`) taken as they are.
+  """
+  @spec type_of(SQLExpr.t(), %{binary() => binary()}, SQLTyped.t()) :: type()
+  def type_of(expr, columns, known)
+      when known != [] and is_tuple(expr) and tuple_size(expr) > 0 do
+    if recallable?(expr) do
+      case SQLTyped.recall(known, expr) do
+        {:ok, type} -> type
+        :error -> node_type(expr, columns, known)
+      end
+    else
+      node_type(expr, columns, known)
+    end
+  end
+
+  def type_of(expr, columns, known), do: node_type(expr, columns, known)
+
+  # The nodes typed from the types of the nodes under them.
+  @spec recallable?(tuple()) :: boolean()
+  defp recallable?({:concat, _left, _right}), do: true
+  defp recallable?({:case, _operand, _whens, _otherwise}), do: true
+  defp recallable?({:call, _name, _args}), do: true
+  defp recallable?({kind, _inner}) when kind in [:neg, :pos], do: true
+  defp recallable?({:op, _op, _left, _right}), do: true
+  defp recallable?(_other), do: false
+
+  @doc """
+  The type of the node from the types of its parts, without looking for the node itself.
+  """
+  @spec node_type(SQLExpr.t(), %{binary() => binary()}, SQLTyped.t()) :: type()
+  def node_type(expr, _columns, _known) when is_tuple(expr) and elem(expr, 0) in @booleans,
+    do: "Boolean"
+
+  def node_type({:concat, left, right}, columns, known) do
+    if "Utf8View" in [type_of(left, columns, known), type_of(right, columns, known)],
       do: "Utf8View",
       else: "Utf8"
   end
 
-  def type_of({:case, _operand, whens, otherwise}, columns) do
+  def node_type({:case, _operand, whens, otherwise}, columns, known) do
     results = Enum.map(whens, &elem(&1, 1)) ++ List.wrap(otherwise)
-    common(Enum.map(results, &type_of(&1, columns)), :case)
+    common(Enum.map(results, &type_of(&1, columns, known)), :case)
   end
 
-  def type_of({:call, :coalesce, args}, columns),
-    do: common(Enum.map(args, &type_of(&1, columns)), :coalesce)
+  def node_type({:call, :coalesce, args}, columns, known),
+    do: common(Enum.map(args, &type_of(&1, columns, known)), :coalesce)
 
-  def type_of({:call, name, args}, columns) when name in [:greatest, :least],
-    do: common(Enum.map(args, &type_of(&1, columns)), :coalesce)
+  def node_type({:call, name, args}, columns, known) when name in [:greatest, :least],
+    do: common(Enum.map(args, &type_of(&1, columns, known)), :coalesce)
 
-  def type_of({:call, :nullif, [left, right]}, columns),
-    do: common([type_of(left, columns), type_of(right, columns)], :coalesce)
+  def node_type({:call, :nullif, [left, right]}, columns, known),
+    do: common([type_of(left, columns, known), type_of(right, columns, known)], :coalesce)
 
-  def type_of({:cast, inner, type}, columns),
+  def node_type({:cast, inner, type}, columns, _known),
     do: SQLFunctions.type_of({:cast, inner, type}, columns)
 
-  def type_of(expr, columns), do: SQLFunctions.type_of(expr, columns)
-
-  @doc "Whether an Arrow type is a struct (the result of a selector), which has no common type."
-  @spec struct?(type()) :: boolean()
-  def struct?(type), do: is_binary(type) and String.starts_with?(type, "Struct(")
+  def node_type(expr, columns, known), do: SQLFunctions.node_type(expr, columns, known)
 
   @doc "See `InfluxElixir.Client.Local.SQLCommonType.common/2`."
   @spec common([type()], :case | :coalesce) :: type()

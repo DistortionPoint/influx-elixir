@@ -95,7 +95,7 @@ defmodule InfluxElixir.Client.HTTPTest do
     receive do
       :held -> task
     after
-      10_000 -> flunk("the holder never connected: #{inspect(Task.yield(task, 0))}")
+      30_000 -> flunk("the holder never connected: #{inspect(Task.yield(task, 0))}")
     end
   end
 

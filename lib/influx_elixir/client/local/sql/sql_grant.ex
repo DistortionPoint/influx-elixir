@@ -15,8 +15,12 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   # `SELECT`, `INSERT`, `UPDATE` and `REFERENCES`; an object is a name list, `TABLE` and a
   # name list (which prints as the names alone), `SCHEMA`, `DATABASE`, `SEQUENCE`, `VIEW` or
   # `FUNCTION` and a name list, or `ALL TABLES | SEQUENCES | FUNCTIONS IN SCHEMA` and a name
-  # list; a grantee is a name, a string or a word, with `ROLE`, `GROUP` or `USER` before it.
-  # Any other shape is not worded.
+  # list; a grantee is a name, a string or a word, with `ROLE`, `GROUP` or `USER` before it
+  # (the engine writes `PUBLIC`, as the last grantee only, with a space after it). Any other
+  # shape is not worded: the engine reads more kinds of object (`PROCEDURE`, `WAREHOUSE`,
+  # `USER`, `INTEGRATION`, `CONNECTION`, `FUTURE ...`, `ALL VIEWS IN SCHEMA`, ...) than the
+  # double has worded, and a `FUNCTION` takes one name and arguments, so these are refused by
+  # name, and so is the parser error of a statement that has one.
 
   alias InfluxElixir.Client.Local.{SQLDdl, SQLError, SQLTokenizer}
 
@@ -25,9 +29,14 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   @privileges ~w(SELECT INSERT UPDATE DELETE TRUNCATE REFERENCES TRIGGER CREATE USAGE CONNECT
     EXECUTE TEMPORARY MODIFY MONITOR)
   @column_privileges ~w(SELECT INSERT UPDATE REFERENCES)
-  @object_kinds ~w(SCHEMA DATABASE SEQUENCE VIEW FUNCTION)
+  @object_kinds ~w(SCHEMA DATABASE SEQUENCE VIEW)
   @all_kinds ~w(TABLES SEQUENCES FUNCTIONS)
+  @error_kinds ["FUNCTION" | @object_kinds]
   @grantee_kinds ~w(ROLE GROUP USER)
+  # The words after `ON` that begin an object the double has not worded, and what may follow
+  # `ALL` for one (the engine reads them as an object, and it prints them differently).
+  @unworded_objects ~w(PROCEDURE WAREHOUSE USER INTEGRATION CONNECTION FUTURE)
+  @unworded_all ~w(VIEWS MATERIALIZED EXTERNAL)
 
   @doc "Whether a word (in capitals) is a privilege the parser reads."
   @spec privilege?(binary()) :: boolean()
@@ -37,7 +46,7 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   @spec display(binary()) :: {:ok, binary()} | :unknown
   def display(text) do
     with {:ok, tokens} <- SQLTokenizer.tokenize(text),
-         [{:word, _p, verb, _l, _c} | rest] <- Enum.reject(tokens, &closing?/1),
+         [{:word, _p, verb, _l, _c} | rest] <- Enum.reject(tokens, &SQLDdl.end_of?/1),
          {:ok, privileges, rest} <- privileges(rest),
          {:ok, object, rest} <- object(rest),
          true <- object != "" or verb != "DENY",
@@ -67,6 +76,7 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
         {:ok, "", [token | _more]} when verb == "DENY" -> denied(token)
         {:ok, _object, rest} -> after_object(verb, rest)
         :error -> object_error(rest)
+        :refuse -> nil
       end
     else
       _unread -> nil
@@ -99,7 +109,7 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
         [{:word, _p2, "TABLE", _l2, _c2} | more] ->
           more
 
-        [{:word, _p2, kind, _l2, _c2} | more] when kind in @object_kinds ->
+        [{:word, _p2, kind, _l2, _c2} | more] when kind in @error_kinds ->
           more
 
         _plain ->
@@ -140,26 +150,34 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
 
   @spec after_direction(binary(), [SQLTokenizer.token()]) ::
           SQLError.t() | nil
-  defp after_direction(verb, [first | _more] = rest) do
+  defp after_direction(_verb, []), do: nil
+
+  defp after_direction(verb, rest) do
     case grantees(rest) do
       {:ok, _grantees, rest} ->
-        with {:ok, _tail, [next | _more]} <- tail(verb, rest), false <- closing?(next) do
+        with {:ok, _tail, [next | _more]} <- tail(verb, rest), false <- SQLDdl.end_of?(next) do
           SQLDdl.expected("end of statement", next)
         else
+          {:bad, token} -> identifier_error(token)
           _valid -> nil
         end
 
-      :error ->
-        SQLDdl.expected("identifier", first)
+      {:bad, token} ->
+        identifier_error(token)
+
+      :refuse ->
+        nil
     end
   end
 
-  defp after_direction(_verb, []), do: nil
+  # The parser wants a name at `token`. It says so for a symbol, a number or the end of the
+  # text; for any other token the double has not read what it says.
+  @spec identifier_error(SQLTokenizer.token()) :: SQLError.t() | nil
+  defp identifier_error({kind, _printed, _upper, _line, _col} = token)
+       when kind in [:symbol, :number, :eof],
+       do: SQLDdl.expected("identifier", token)
 
-  @spec closing?(SQLTokenizer.token()) :: boolean()
-  defp closing?({:eof, _p, _u, _l, _c}), do: true
-  defp closing?({:symbol, ";", _u, _l, _c}), do: true
-  defp closing?(_token), do: false
+  defp identifier_error(_token), do: nil
 
   @spec privileges([SQLTokenizer.token()]) :: {:ok, binary(), [SQLTokenizer.token()]} | :error
   defp privileges([{:word, _p, "ALL", _l, _c}, {:word, _p2, "PRIVILEGES", _l2, _c2} | rest]),
@@ -194,13 +212,37 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
 
   defp columns(_word, rest), do: {:ok, "", rest}
 
-  # `ON ...`, or nothing.
-  @spec object([SQLTokenizer.token()]) :: {:ok, binary(), [SQLTokenizer.token()]} | :error
+  # `ON ...`, or nothing. `:refuse` for an object the double has not worded.
+  @spec object([SQLTokenizer.token()]) ::
+          {:ok, binary(), [SQLTokenizer.token()]} | :error | :refuse
+  # `FUTURE` before `TO` or `FROM` is a name (`GRANT SELECT ON future TO u`, verified).
+  defp object(
+         [
+           {:word, _p, "ON", _l, _c},
+           {:word, _p2, "FUTURE", _l2, _c2},
+           {:word, _p3, to, _l3, _c3} | _rest
+         ] = tokens
+       )
+       when to in ["TO", "FROM"],
+       do: object_names(tl(tokens))
+
+  defp object([{:word, _p, "ON", _l, _c}, {:word, _p2, word, _l2, _c2} | _rest])
+       when word in @unworded_objects,
+       do: :refuse
+
+  defp object([
+         {:word, _p, "ON", _l, _c},
+         {:word, _p2, "ALL", _l2, _c2},
+         {:word, _p3, word, _l3, _c3} | _rest
+       ])
+       when word in @unworded_all,
+       do: :refuse
+
   defp object([{:word, _p, "ON", _l, _c} | rest]), do: object_names(rest)
   defp object(rest), do: {:ok, "", rest}
 
   @spec object_names([SQLTokenizer.token()]) ::
-          {:ok, binary(), [SQLTokenizer.token()]} | :error
+          {:ok, binary(), [SQLTokenizer.token()]} | :error | :refuse
   defp object_names([
          {:word, _p, "ALL", _l, _c},
          {:word, _p2, kind, _l2, _c2},
@@ -213,6 +255,15 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   end
 
   defp object_names([{:word, _p, "TABLE", _l, _c} | rest]), do: plain_names(rest)
+
+  # A function takes one name and, in the engine's text, arguments: that is not worded.
+  defp object_names([{:word, _p, "FUNCTION", _l, _c} | rest]) do
+    case dotted(rest) do
+      {:ok, _name, [{:symbol, mark, _p2, _l2, _c2} | _more]} when mark in [",", "("] -> :refuse
+      {:ok, name, rest} -> {:ok, "ON FUNCTION " <> name, rest}
+      _no_name -> :error
+    end
+  end
 
   defp object_names([{:word, _p, kind, _l, _c} | rest]) when kind in @object_kinds do
     with {:ok, names, rest} <- name_list(rest, []), do: {:ok, "ON #{kind} #{names}", rest}
@@ -229,20 +280,26 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   @spec name_list([SQLTokenizer.token()], [binary()]) ::
           {:ok, binary(), [SQLTokenizer.token()]} | :error
   defp name_list(tokens, found) do
-    with {:ok, name, rest} <- dotted(tokens) do
-      found = [name | found]
+    case dotted(tokens) do
+      {:ok, name, rest} ->
+        found = [name | found]
 
-      case rest do
-        [{:symbol, ",", _p, _l, _c} | more] ->
-          name_list(more, found)
+        case rest do
+          [{:symbol, ",", _p, _l, _c} | more] ->
+            name_list(more, found)
 
-        _end ->
-          {:ok, found |> Enum.reverse() |> Enum.join(", "), rest}
-      end
+          _end ->
+            {:ok, found |> Enum.reverse() |> Enum.join(", "), rest}
+        end
+
+      _no_name ->
+        :error
     end
   end
 
-  @spec dotted([SQLTokenizer.token()]) :: {:ok, binary(), [SQLTokenizer.token()]} | :error
+  # The token the parser wants a name at, when there is none, is `{:bad, token}`.
+  @spec dotted([SQLTokenizer.token()]) ::
+          {:ok, binary(), [SQLTokenizer.token()]} | {:bad, SQLTokenizer.token()} | :refuse
   defp dotted([{kind, printed, _u, _l, _c} | rest]) when kind in [:word, :quoted] do
     case rest do
       [{:symbol, ".", _p, _l2, _c2} | more] ->
@@ -253,7 +310,8 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
     end
   end
 
-  defp dotted(_tokens), do: :error
+  defp dotted([token | _rest]), do: {:bad, token}
+  defp dotted([]), do: :refuse
 
   @spec direction(binary(), [SQLTokenizer.token()]) ::
           {:ok, binary(), [SQLTokenizer.token()]} | :error
@@ -264,11 +322,12 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
 
   defp direction(_verb, _tokens), do: :error
 
-  @spec grantees([SQLTokenizer.token()]) :: {:ok, binary(), [SQLTokenizer.token()]} | :error
+  @typep named_or_not :: {:ok, binary(), [SQLTokenizer.token()]} | {:bad, SQLTokenizer.token()}
+
+  @spec grantees([SQLTokenizer.token()]) :: named_or_not() | :refuse
   defp grantees(tokens), do: grantee_list(tokens, [])
 
-  @spec grantee_list([SQLTokenizer.token()], [binary()]) ::
-          {:ok, binary(), [SQLTokenizer.token()]} | :error
+  @spec grantee_list([SQLTokenizer.token()], [binary()]) :: named_or_not() | :refuse
   defp grantee_list(tokens, found) do
     with {:ok, grantee, rest} <- grantee(tokens) do
       found = [grantee | found]
@@ -283,29 +342,28 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
     end
   end
 
-  # A grantee may be written with `ROLE`, `GROUP` or `USER` before it.
-  @spec grantee([SQLTokenizer.token()]) :: {:ok, binary(), [SQLTokenizer.token()]} | :error
-  defp grantee([{:word, _p, kind, _l, _c}, next | rest] = tokens) when kind in @grantee_kinds do
-    if grantee_start?(next) do
-      with {:ok, name, rest} <- grantee_name([next | rest]), do: {:ok, kind <> " " <> name, rest}
-    else
-      grantee_name(tokens)
-    end
+  # A grantee may be written with `ROLE`, `GROUP` or `USER` before it, which then wants a
+  # name. `PUBLIC` is the engine's own and ends the list (`PUBLIC, x` is not read by it).
+  @spec grantee([SQLTokenizer.token()]) :: named_or_not() | :refuse
+  defp grantee([{:word, _p, "PUBLIC", _l, _c}, {:symbol, mark, _p2, _l2, _c2} | _rest])
+       when mark in [",", "."],
+       do: :refuse
+
+  defp grantee([{:word, _p, "PUBLIC", _l, _c} | rest]), do: {:ok, "PUBLIC ", rest}
+
+  defp grantee([{:word, _p, kind, _l, _c}, next | rest]) when kind in @grantee_kinds do
+    with {:ok, name, rest} <- grantee_name([next | rest]), do: {:ok, kind <> " " <> name, rest}
   end
 
   defp grantee(tokens), do: grantee_name(tokens)
 
-  @spec grantee_start?(SQLTokenizer.token()) :: boolean()
-  defp grantee_start?({kind, _p, _u, _l, _c}), do: kind in [:word, :quoted, :string]
-
-  @spec grantee_name([SQLTokenizer.token()]) ::
-          {:ok, binary(), [SQLTokenizer.token()]} | :error
+  @spec grantee_name([SQLTokenizer.token()]) :: named_or_not()
   defp grantee_name([{:string, printed, _u, _l, _c} | rest]), do: {:ok, printed, rest}
   defp grantee_name(tokens), do: dotted(tokens)
 
   # What may follow the grantees, in the order the parser reads it.
   @spec tail(binary(), [SQLTokenizer.token()]) ::
-          {:ok, [binary()], [SQLTokenizer.token()]} | :error
+          {:ok, [binary()], [SQLTokenizer.token()]} | {:bad, SQLTokenizer.token()}
   defp tail("GRANT", tokens) do
     with {:ok, option, tokens} <- grant_option(tokens),
          {:ok, grantor, tokens} <- named(tokens, "AS"),
@@ -336,34 +394,34 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   defp grant_option(tokens), do: {:ok, [], tokens}
 
   @spec named([SQLTokenizer.token()], binary()) ::
-          {:ok, [binary()], [SQLTokenizer.token()]} | :error
-  defp named([{:word, _p, word, _l, _c} | rest], word) do
-    case rest do
-      [{kind, printed, _u, _l2, _c2} | more] when kind in [:word, :quoted] ->
-        {:ok, [word, printed], more}
+          {:ok, [binary()], [SQLTokenizer.token()]} | {:bad, SQLTokenizer.token()}
+  defp named([{:word, _p, word, _l, _c}, {kind, printed, _u, _l2, _c2} | more], word)
+       when kind in [:word, :quoted, :string],
+       do: {:ok, [word, printed], more}
 
-      _no_name ->
-        :error
-    end
-  end
-
+  defp named([{:word, _p, word, _l, _c}, token | _more], word), do: {:bad, token}
   defp named(tokens, _word), do: {:ok, [], tokens}
 
   @spec granted_by([SQLTokenizer.token()]) ::
-          {:ok, [binary()], [SQLTokenizer.token()]} | :error
+          {:ok, [binary()], [SQLTokenizer.token()]} | {:bad, SQLTokenizer.token()}
   defp granted_by([
          {:word, _p, "GRANTED", _l, _c},
          {:word, _p2, "BY", _l2, _c2},
          {kind, printed, _u, _l3, _c3} | rest
        ])
-       when kind in [:word, :quoted],
+       when kind in [:word, :quoted, :string],
        do: {:ok, ["GRANTED", "BY", printed], rest}
+
+  defp granted_by([{:word, _p, "GRANTED", _l, _c}, {:word, _p2, "BY", _l2, _c2}, token | _rest]),
+    do: {:bad, token}
 
   defp granted_by(tokens), do: {:ok, [], tokens}
 
   @spec cascade([SQLTokenizer.token()]) :: {:ok, [binary()], [SQLTokenizer.token()]}
-  defp cascade([{:word, _p, word, _l, _c} | rest]) when word in ["CASCADE", "RESTRICT"],
-    do: {:ok, [word], rest}
-
-  defp cascade(tokens), do: {:ok, [], tokens}
+  defp cascade(tokens) do
+    case SQLDdl.cascade(tokens) do
+      {:ok, word, rest} -> {:ok, [word], rest}
+      :none -> {:ok, [], tokens}
+    end
+  end
 end

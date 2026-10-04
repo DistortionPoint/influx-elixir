@@ -100,62 +100,22 @@ defmodule InfluxElixir.MixProject do
   #
   #     mix test --only v3_core
   #     mix test test/integration/contract_v3_core --include integration --include v3_core
+  # The rule is `InfluxElixir.MixTestArgs` (mix/test_args.ex, tested in
+  # test/mix/test_args_test.exs). It is loaded here, when this project's tests
+  # run, not at the top of the file: the package ships mix.exs without mix/.
   @non_unit_test_entries ~w(integration support fixtures test_helper.exs)
 
   defp run_tests(args) do
-    Mix.Task.run("test", test_args(args, System.get_env("INTEGRATION")))
-  end
+    Code.require_file("mix/test_args.ex", __DIR__)
 
-  # The unit paths are prepended only when nothing else says which tests to
-  # run: no path, no `--failed` or `--stale` (Mix's own manifests choose
-  # those), and no `--include`/`--only` of an integration tag. The arguments
-  # are read as `mix test` reads them, so `--only=v2` and a value after a
-  # switch are not taken for paths.
-  @integration_tags ~w(integration v2 v3_core v3_core_auth v3_enterprise)
-  @test_switches [
-    include: :keep,
-    exclude: :keep,
-    only: :keep,
-    failed: :boolean,
-    stale: :boolean,
-    cover: :boolean,
-    trace: :boolean,
-    raise: :boolean,
-    color: :boolean,
-    warnings_as_errors: :boolean,
-    seed: :integer,
-    slowest: :integer,
-    max_cases: :integer,
-    max_failures: :integer,
-    timeout: :integer,
-    formatter: :keep,
-    partitions: :integer
-  ]
+    args =
+      apply(InfluxElixir.MixTestArgs, :args, [
+        args,
+        System.get_env("INTEGRATION"),
+        unit_test_paths()
+      ])
 
-  defp test_args(args, integration) do
-    if integration in [nil, "", "0"] and not explicit_selection?(args) do
-      unit_test_paths() ++ args
-    else
-      args
-    end
-  end
-
-  # A path is recognised by what it is, not by where OptionParser leaves it:
-  # a switch this list does not know (`--no-compile`, `--force`) would take
-  # the path after it as its value.
-  defp explicit_selection?(args) do
-    {opts, _paths, _unknown} = OptionParser.parse(args, switches: @test_switches)
-    tags = Keyword.get_values(opts, :include) ++ Keyword.get_values(opts, :only)
-
-    Enum.any?(args, &path_argument?/1) or opts[:failed] == true or opts[:stale] == true or
-      Enum.any?(tags, &(hd(String.split(&1, ":")) in @integration_tags))
-  end
-
-  defp path_argument?("-" <> _switch), do: false
-
-  defp path_argument?(arg) do
-    path = arg |> String.split(":") |> hd()
-    String.ends_with?(path, ".exs") or (path != "" and File.exists?(path))
+    Mix.Task.run("test", args)
   end
 
   defp unit_test_paths do

@@ -314,23 +314,42 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
 
   defp skip_if_exists(tokens), do: tokens
 
+  @doc "The `CASCADE` or `RESTRICT` that opens the tokens, and the tokens after it."
+  @spec cascade([SQLTokenizer.token()]) :: {:ok, binary(), [SQLTokenizer.token()]} | :none
+  def cascade([{:word, _p, option, _l, _c} | rest]) when option in ["CASCADE", "RESTRICT"],
+    do: {:ok, option, rest}
+
+  def cascade(_tokens), do: :none
+
   # The end, with `CASCADE` or `RESTRICT` before it or not.
   @spec cascade_end?([SQLTokenizer.token()]) :: boolean()
-  defp cascade_end?([{:word, _p, option, _l, _c} | rest]) when option in ["CASCADE", "RESTRICT"],
-    do: cascade_end?(rest)
-
-  defp cascade_end?([token]), do: end_of?(token)
-  defp cascade_end?([token, {:eof, _p, _u, _l, _c}]), do: end_of?(token)
-  defp cascade_end?(_tokens), do: false
+  defp cascade_end?(tokens) do
+    case {cascade(tokens), tokens} do
+      {{:ok, _option, rest}, _tokens} -> cascade_end?(rest)
+      {:none, [token]} -> end_of?(token)
+      {:none, [token, {:eof, _p, _u, _l, _c}]} -> end_of?(token)
+      {:none, _tokens} -> false
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # DESC, ATTACH
   # ---------------------------------------------------------------------------
 
   @spec describe([SQLTokenizer.token()]) :: SQLError.t() | nil
-  defp describe([{:number, _p, _u, _l, _c} = number | _rest]), do: expected("identifier", number)
+  # `DESC EXTENDED t` and `DESC FORMATTED t` are `DESC t` (verified): the word is the
+  # statement's own, not a table, so `DESC extended` wants a name after it.
+  defp describe([{:word, _p, modifier, _l, _c} | rest])
+       when modifier in ["EXTENDED", "FORMATTED"],
+       do: describe_name(rest)
 
-  defp describe(tokens) do
+  defp describe(tokens), do: describe_name(tokens)
+
+  @spec describe_name([SQLTokenizer.token()]) :: SQLError.t() | nil
+  defp describe_name([{:number, _p, _u, _l, _c} = number | _rest]),
+    do: expected("identifier", number)
+
+  defp describe_name(tokens) do
     case name(tokens) do
       {:ok, [next | _rest]} ->
         unless end_of?(next), do: expected("end of statement", next)
@@ -386,10 +405,11 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
     end
   end
 
+  @doc "Whether a token ends the statement: its end, or its `;`."
   @spec end_of?(SQLTokenizer.token()) :: boolean()
-  defp end_of?({:eof, _p, _u, _l, _c}), do: true
-  defp end_of?({:symbol, ";", _u, _l, _c}), do: true
-  defp end_of?(_token), do: false
+  def end_of?({:eof, _p, _u, _l, _c}), do: true
+  def end_of?({:symbol, ";", _u, _l, _c}), do: true
+  def end_of?(_token), do: false
 
   @doc """
   The parser's `Expected: <what>, found: <token>` for a token, at its line and column.
