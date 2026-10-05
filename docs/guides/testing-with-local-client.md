@@ -914,8 +914,13 @@ against a real InfluxDB (see "Running Against a Real InfluxDB"):
 - `HAVING` without a comparison or without a `GROUP BY`; `COALESCE` mixing
   text and numbers; a comparison of `time` inside a select item
 
-The last digit of `var_*` and `stddev*` can differ from the engine's: it
-depends on how the engine splits the rows into batches.
+`var_*` and `stddev*` add the values one by one, in the order the engine scans a
+whole table (by the tags in the order of their names, then by time), and the
+last digits match the engine's there. Under a `WHERE`, a `GROUP BY`, an
+expression argument or more than one batch of rows the engine adds in another
+order, so the last digits of `var_*`, `stddev*` and of the `sum` and `avg` of
+floats can differ from its. Compare them with a tolerance (the contract uses a
+relative `1.0e-12`); `sum` and `avg` of whole numbers are exact.
 
 ## Checking a Query Before Running It
 
@@ -982,7 +987,17 @@ InfluxQL's `WHERE` is not SQL's, and the double follows the engine
 - Clauses come in the engine's order (`WHERE`, `GROUP BY`, `fill()`, `ORDER BY`,
   `LIMIT`, `OFFSET`, `SLIMIT`, `SOFFSET`, `tz()`): the first one out of its place
   is the parse error at its start, and of two bad operands the leftmost is the
-  error (a number past the unsigned range stands before a later `SLIMIT x`).
+  error (a number past the unsigned range stands before a later `SLIMIT x`, a `fill()` option
+  that does not read before a later bad `LIMIT`). A `fill(` where an operand is wanted
+  (`WHERE fill(1)`, `WHERE n > 1 AND fill(1)`) is the engine's `invalid expression, the only
+  valid function calls ...` at the call; behind a whole condition it is the clause, and what
+  follows it must be `ORDER BY` or later (`fill(1) GROUP BY host` is left over from the
+  `GROUP`). A sign may stand apart from the digits of a `fill()` number (`fill(- 1)`).
+- A comparison of constants (`1 = 1`, `'a' = 'b'`, `'us' =~ /a/`) or of a column the
+  measurement lacks with a string, a regular expression, a boolean or a tag keeps no point
+  beside a bare operand and raises no error; a missing column compared with a number does the
+  same beside numbers, and beside a string or a tag it is refused by name (Core's `Cannot
+  infer common argument type`). A string constant under `=~` / `!~` keeps no point.
 
 ### SHOW
 
@@ -1053,8 +1068,9 @@ Refused by name, because the double cannot answer them as the engine does:
 
 - `INTO`, subqueries, `tz()` of a zone other than UTC (needs a time zone
   database), a statement after `;` that is not a parse error.
-- Float results that depend on how the engine adds up in parallel (`stddev`,
-  the `mean` and `sum` of many floats) can differ in the last digits.
+- Float results that depend on the order the engine adds in (`stddev`, the
+  `mean` and `sum` of many floats) are answered, and can differ from the
+  engine's in the last digits: compare them with a tolerance.
 - `fill(linear)` on a text or boolean column or with a `count` over an empty
   bucket, `fill(previous)` with a `count` when the first bucket is empty (the
   engine breaks the connection), `mode()` of values equally often there,

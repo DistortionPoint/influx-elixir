@@ -55,7 +55,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
         end)
         |> Enum.take(3)
 
-      assert length(rows) == 3
+      assert length(rows) === 3
 
       # The stream ran in this process: nothing of it is left in the mailbox.
       refute_received {_ref, {:data, _chunk}}
@@ -90,7 +90,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
   # returns once the waiting process is blocked on its checkout.
   defp queue_waiter(count) do
     waiter = Task.async(count)
-    Await.until(fn -> Process.info(waiter.pid, :status) == {:status, :waiting} end)
+    Await.until(fn -> Process.info(waiter.pid, :status) === {:status, :waiting} end)
     waiter
   end
 
@@ -111,7 +111,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
           )
 
         Finch.stream(request, finch, :fresh, fn _chunk, acc ->
-          if acc == :fresh do
+          if acc === :fresh do
             send(test_pid, {:holding, self()})
 
             receive do
@@ -161,8 +161,8 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
           |> Enum.to_list()
         end
 
-      assert error.kind == :transport
-      assert error.reason == :pool_timeout
+      assert error.kind === :transport
+      assert error.reason === :pool_timeout
 
       release(ctx.holder)
       assert {:ok, _result} = Task.await(ctx.holder, 30_000)
@@ -210,9 +210,9 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
                )
 
       # Same rows on both transports, including `time` as a DateTime.
-      assert flight_row == http_row
+      assert flight_row === http_row
       assert %{"host" => "a", "value" => 1.5, "count" => 2} = flight_row
-      assert flight_row["time"] == ~U[2023-11-14 22:13:20.000000Z]
+      assert flight_row["time"] === ~U[2023-11-14 22:13:20.000000Z]
     end
 
     test "a null column is absent from the row, as over HTTP, for every field type", ctx do
@@ -237,9 +237,9 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
                  tls: false
                )
 
-      assert flight_rows == http_rows
+      assert flight_rows === http_rows
       assert [_full, sparse] = flight_rows
-      assert Enum.sort(Map.keys(sparse)) == ["c", "host", "time", "v"]
+      assert Enum.sort(Map.keys(sparse)) === ["c", "host", "time", "v"]
     end
 
     test "structs, lists, durations and Utf8View strings are the same over Flight", ctx do
@@ -321,7 +321,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
       Await.until(
         fn ->
           {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(ctx.writer)
-          stats.total_writes == 1
+          stats.total_writes === 1
         end,
         10_000
       )
@@ -341,7 +341,7 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
       Await.until(
         fn ->
           {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(ctx.writer)
-          stats.total_errors == 1
+          stats.total_errors === 1
         end,
         10_000
       )

@@ -176,7 +176,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           highest = days_since_2024(slack)
           assert first["time"] === ~U[2024-01-01 00:00:00.000000Z]
           assert first["mean"] === 5.25
-          assert Enum.all?(rest, &(map_size(Map.drop(&1, ["time", "iox::measurement"])) == 0))
+          assert Enum.all?(rest, &(map_size(Map.drop(&1, ["time", "iox::measurement"])) === 0))
           assert (length(rest) + 1) in lowest..highest
         end
 
@@ -538,6 +538,11 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
 
         test "fill() with a number, of a text column, a selector and a raw select", ctx do
           check_fix(ctx, InfluxQLDefectCases.fills())
+        end
+
+        test "fill() in or behind a condition, GROUP BY beside one, constants beside bare operands",
+             ctx do
+          check_fix(ctx, InfluxQLDefectCases.clause_tail())
         end
 
         test "every pair of kinds of operand of AND and OR, and chains and groups of three",

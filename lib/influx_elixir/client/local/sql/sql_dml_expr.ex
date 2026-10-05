@@ -571,7 +571,17 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
     end
   end
 
+  @cut_off "a statement that ends inside a value the double cannot read: "
   @openers ["(", "[", "{"]
+
+  @doc """
+  Whether a refusal is that of a statement that ends (at its `;`) inside a value the double
+  cannot read: the engine's parse error for it was not verified, and a text of several
+  statements must not be taken for one whose first reads.
+  """
+  @spec cut_off?(binary()) :: boolean()
+  def cut_off?(@cut_off <> _why), do: true
+  def cut_off?(_why), do: false
   @closers [")", "]", "}"]
 
   @spec skip_cell([token()], non_neg_integer(), binary()) :: parsed(cell())
@@ -584,6 +594,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp skip_cell([{:symbol, close, _u, _l, _c} | rest], depth, why) when close in @closers,
     do: skip_cell(rest, max(depth - 1, 0), why)
 
+  # The tokens of a statement end at its `;` or its end, which a cell the parser stopped at
+  # may not reach: what the engine says of such a cell was not verified.
+  defp skip_cell([], _depth, why), do: {:refuse, @cut_off <> why}
   defp skip_cell([{:eof, _p, _u, _l, _c} | _rest], _depth, why), do: {:refuse, why}
   defp skip_cell([_token | rest], depth, why), do: skip_cell(rest, depth, why)
 

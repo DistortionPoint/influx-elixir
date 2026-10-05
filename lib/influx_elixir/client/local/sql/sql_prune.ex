@@ -27,8 +27,17 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
     SQLSimplify
   }
 
-  @typedoc "Whether the error of a negation stands, is dropped, or is not known."
-  @type verdict :: :keep | :drop | :unknown
+  @typedoc "Whether the error of a negation stands, is dropped, or is not known (and why)."
+  @type verdict :: :keep | :drop | {:unknown, cause()}
+
+  @typedoc "Why the double does not know: see `InfluxElixir.Client.Local.SQLPlan`."
+  @type cause :: :uncertain | :literals | :nested | :grouped | :outer
+
+  @typedoc """
+  What the optimizer does not plan of an expression (see `unused/2`): the outputs nothing reads,
+  `:dead` for all of it, `:outer` for a query where whether it is dead is not known.
+  """
+  @type marks :: [binary() | :dead | :outer]
 
   @typedoc "The Arrow types of the named columns."
   @type types :: (names :: [binary()] -> %{binary() => binary()})
@@ -40,18 +49,35 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   the columns it is asked for, `unused` the outputs of the query nothing reads (see `unused/2`),
   or `nil` for the query that answers.
   """
-  @spec verdict(term(), SQLParser.parsed_query(), types(), [binary()] | nil) :: verdict()
+  @spec verdict(term(), SQLParser.parsed_query(), types(), marks() | nil) :: verdict()
   def verdict({:neg, _inner} = item, query, types, unused) do
-    if is_list(unused) and item in negations(unused_terms(query, unused), []) do
+    if is_list(unused) and (:dead in unused or unplanned?(item, query, unused)) do
       :drop
     else
       columns = types.(equality_columns(query.where, []))
 
       cond do
-        SQLSimplify.empty?(query, columns) -> :drop
-        SQLContradict.unknown?(predicates(query.where, []), columns) -> :unknown
-        item in removed(query, columns) -> :drop
-        true -> :keep
+        SQLSimplify.empty?(query, columns) ->
+          :drop
+
+        cause =
+            SQLContradict.unknown(predicates(query.where, []), query.where, columns) ->
+          {:unknown, cause}
+
+        SQLSimplify.nested_in?(query) ->
+          {:unknown, :nested}
+
+        SQLContradict.grouped_overlap?(query.where) ->
+          {:unknown, :grouped}
+
+        not survives?(item, query, columns) ->
+          :drop
+
+        is_list(unused) and :outer in unused ->
+          {:unknown, :outer}
+
+        true ->
+          :keep
       end
     end
   end
@@ -71,27 +97,48 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   end
 
   @doc """
-  The outputs of the common table expressions that no query after them reads, by the name of
-  the expression. The optimizer plans neither these nor the `ORDER BY` of an expression with no
-  limit (a sort changes nothing above it that reads no order).
+  What the optimizer does not plan of the common table expressions, by the name of the
+  expression: `:dead` for an expression the query that answers proves it does not read at all
+  (its `WHERE` is false, or it is a `LIMIT 0`), `:outer` when the double cannot tell whether
+  it does (`WHERE n = 1 AND n = 2` over the expression's columns, whose types it does not
+  know here), and the outputs no query after it reads. The optimizer plans neither these nor
+  the `ORDER BY` of an expression with no limit (a sort changes nothing above it that reads no
+  order).
   """
   @spec unused([{binary(), SQLParser.parsed_query()}], SQLParser.parsed_query()) :: %{
-          binary() => [binary()]
+          binary() => marks()
         }
   def unused(ctes, main) do
-    if Enum.any?(ctes, fn {_name, query} -> negations(terms(query), []) != [] end) do
-      {found, _read} =
-        ctes
-        |> Enum.reverse()
-        |> Enum.reduce({%{}, reads(main, [], :final)}, fn {name, query}, {found, read} ->
-          unused = unused_outputs(query, read)
-          {Map.put(found, name, unused), merge(read, reads(query, unused, {:cte, read}))}
-        end)
+    cond do
+      not Enum.any?(ctes, fn {_name, query} -> negations(all_terms(query), []) != [] end) ->
+        %{}
 
-      found
-    else
-      %{}
+      SQLSimplify.reads_nothing?(main) ->
+        Map.new(ctes, fn {name, _query} -> {name, [:dead]} end)
+
+      true ->
+        marks = if outer_unknown?(main), do: [:outer], else: []
+
+        {found, _read} =
+          ctes
+          |> Enum.reverse()
+          |> Enum.reduce({%{}, reads(main, [], :final)}, fn {name, query}, {found, read} ->
+            unused = unused_outputs(query, read)
+
+            {Map.put(found, name, marks ++ unused),
+             merge(read, reads(query, unused, {:cte, read}))}
+          end)
+
+        found
     end
+  end
+
+  # Whether the query that answers may fold its `WHERE` to nothing by a rule the double cannot
+  # apply without the types of the expression's columns.
+  @spec outer_unknown?(SQLParser.parsed_query()) :: boolean()
+  defp outer_unknown?(main) do
+    SQLContradict.unknown(predicates(main.where, []), main.where, %{}) != nil or
+      SQLSimplify.nested_in?(main) or SQLContradict.grouped_overlap?(main.where)
   end
 
   @doc """
@@ -99,7 +146,7 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   so no row evaluates them (and an `ORDER BY` that holds a negation, which nothing needs, is
   left out).
   """
-  @spec nullify(SQLParser.parsed_query(), [binary()] | nil) :: SQLParser.parsed_query()
+  @spec nullify(SQLParser.parsed_query(), marks() | nil) :: SQLParser.parsed_query()
   def nullify(query, nil), do: query
   def nullify(query, []), do: query
 
@@ -156,7 +203,6 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   @spec ref_name(term()) :: binary()
   defp ref_name({:qualified, _relation, name}), do: name
   defp ref_name(name) when is_binary(name), do: name
-  defp ref_name(other), do: inspect(other)
 
   @spec live_columns([SQLParser.projection()] | nil, [binary()]) ::
           [SQLParser.projection()] | nil
@@ -173,13 +219,31 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   @spec unused_outputs(SQLParser.parsed_query(), reads()) :: [binary()]
   defp unused_outputs(query, read) do
     if is_list(query.projection_columns) and read != :all and plain?(query) do
+      sorted = sort_refs(query)
+
       for {expr, output} <- query.projection_columns,
           is_binary(output),
           output not in read,
+          output not in sorted,
           not is_nil(expr),
           do: output
     else
       []
+    end
+  end
+
+  # The names the `ORDER BY` of a query reads, which is planned when the query has a limit (the
+  # sort then orders the rows the limit keeps): an output named there is read by the query.
+  @spec sort_refs(SQLParser.parsed_query()) :: [binary()]
+  defp sort_refs(query) do
+    if sort_dead?(query) do
+      []
+    else
+      Enum.flat_map(query.order_by, fn
+        {{:expr, expr}, _direction} -> Enum.filter(SQLExpr.columns(expr), &is_binary/1)
+        {name, _direction} when is_binary(name) -> [name]
+        {_other, _direction} -> []
+      end)
     end
   end
 
@@ -190,25 +254,51 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   end
 
   # What of a query is never planned: its unused outputs and, with no limit, its `ORDER BY`.
-  @spec unused_terms(SQLParser.parsed_query(), [binary()]) :: [term()]
+  @spec unused_terms(SQLParser.parsed_query(), marks()) :: [term()]
   defp unused_terms(query, unused) do
     columns = for {expr, output} <- query.projection_columns || [], output in unused, do: expr
     [columns, if(sort_dead?(query), do: query.order_by, else: [])]
   end
 
+  @spec unplanned?(term(), SQLParser.parsed_query(), marks()) :: boolean()
+  defp unplanned?(item, query, unused) do
+    item in negations(unused_terms(query, unused), []) and
+      item not in negations(live_terms(query, unused), [])
+  end
+
+  # What of a query is planned: everything but its unused outputs and, with no limit, its
+  # `ORDER BY`. A negation that stands both in a term that is not planned and in one that is,
+  # is planned.
+  @spec live_terms(SQLParser.parsed_query(), marks()) :: [term()]
+  defp live_terms(query, unused) do
+    columns = for {expr, output} <- query.projection_columns || [], output not in unused, do: expr
+
+    [
+      columns,
+      query.select_columns,
+      query.group_by_columns,
+      query.where,
+      query.having,
+      if(sort_dead?(query), do: [], else: query.order_by)
+    ]
+  end
+
   @spec sort_dead?(SQLParser.parsed_query()) :: boolean()
   defp sort_dead?(query), do: is_nil(query.limit) and is_nil(query.offset)
 
-  @spec terms(SQLParser.parsed_query()) :: [term()]
-  defp terms(query), do: [query.projection_columns, query.order_by]
+  @spec all_terms(SQLParser.parsed_query()) :: [term()]
+  defp all_terms(query),
+    do: [query.projection_columns, query.order_by, query.where, query.having]
 
-  # The negations the simplified query no longer holds.
-  @spec removed(SQLParser.parsed_query(), %{binary() => binary()}) :: [term()]
-  defp removed(query, columns) do
+  # Whether the negation still stands in the simplified query. It is gone when the simplifier
+  # removed every occurrence of it from the `WHERE` and the select list (`-u > NULL AND n > 1`
+  # is the `NULL` that is not empty, and its `-u` is still the one of `SELECT -u`).
+  @spec survives?(term(), SQLParser.parsed_query(), %{binary() => binary()}) :: boolean()
+  defp survives?(item, query, columns) do
     simplified = SQLSimplify.apply_strict(query, columns)
 
-    negations([query.where, query.projection_columns], []) --
-      negations([simplified.where, simplified.projection_columns], [])
+    item not in negations([query.where, query.projection_columns], []) or
+      item in negations([simplified.where, simplified.projection_columns], [])
   end
 
   @spec negations(term(), [term()]) :: [term()]
@@ -223,8 +313,9 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   defp predicates({:not, nodes}, found) when is_list(nodes), do: predicates(nodes, found)
   defp predicates(nodes, found) when is_list(nodes), do: Enum.reduce(nodes, found, &predicates/2)
 
-  defp predicates({op, _operand, _rest} = clause, found) when op in [:eq, :in],
-    do: [clause | found]
+  defp predicates({op, _operand, _rest} = clause, found)
+       when op in [:eq, :in, :not_in, :is_null, :is_not_null, :gt, :gte, :lt, :lte, :truthy_expr],
+       do: [clause | found]
 
   defp predicates(_other, found), do: found
 

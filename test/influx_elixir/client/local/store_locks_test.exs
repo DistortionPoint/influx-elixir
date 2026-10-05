@@ -10,16 +10,24 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
   deleted, numbered) is observable through `Client.Local` and is tested there, in
   `InfluxElixir.Client.Local.ConcurrencyTest` and in the contracts.
 
-  None of these tests asks whether a process is blocked on the lock, which only
-  the store's private retry loop could tell. Each holder runs a function that is
-  inside the critical section from the moment it sends `:holding` until it returns, so
-  an outcome that would break mutual exclusion is visible to it, or in the order the
-  functions ran, whichever way the other process was scheduled.
+  These tests target `Store`'s lock directly, which is justified: a function that runs
+  inside the lock and waits for a message cannot be built from the public API.
+
+  A test that releases the holder must first know that the other process is waiting for
+  the lock, or a broken lock would pass whenever that process arrived late (after the
+  release, it would take a free lock). `waiting_for_lock/1` asks the process where it is
+  (`Process.info/2` with `:current_function`) and polls with `Await.until/2` until it is in
+  `Store.acquire/2`, the retry loop of the lock: a coupling to the module under test and to
+  nothing else. Each holder also runs a function that is inside the critical section from the
+  moment it sends `:holding` until it returns, so an outcome that would break mutual
+  exclusion is visible to it, or in the order the functions ran, whichever way the other
+  process was scheduled.
   """
 
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local.Store
+  alias InfluxElixir.TestSupport.Await
 
   # The bound on every wait for a message: far above what a healthy run needs, so it only
   # ever ends a failing one.
@@ -33,6 +41,14 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
     after
       @bound -> flunk("neither :holder_done nor :waiter_ran arrived")
     end
+  end
+
+  # Blocks until the process is in the lock's retry loop, `Store.acquire/2`: it has asked for
+  # the lock and not been given it. The loop is a private function of the module under test.
+  defp waiting_for_lock(pid) do
+    Await.until(fn ->
+      Process.info(pid, :current_function) === {:current_function, {Store, :acquire, 2}}
+    end)
   end
 
   describe "a lock holder" do
@@ -60,6 +76,7 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
         end)
 
       assert_receive :waiter_started, @bound
+      waiting_for_lock(waiter.pid)
       Process.exit(holder, :kill)
 
       assert Task.await(waiter, @bound) === :ok
@@ -118,6 +135,7 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
         end)
 
       assert_receive :waiter_started, @bound
+      waiting_for_lock(waiter.pid)
       send(holder.pid, :release)
 
       assert Task.await(holder, @bound) === :ok
@@ -160,6 +178,7 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
         end)
 
       assert_receive :dropper_started, @bound
+      waiting_for_lock(dropper.pid)
       send(holder.pid, :release)
 
       assert Task.await(holder, @bound) === :ok

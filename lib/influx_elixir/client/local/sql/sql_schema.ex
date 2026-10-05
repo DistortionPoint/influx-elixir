@@ -208,10 +208,6 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @spec table_columns([relation()]) :: MapSet.t(binary())
   def table_columns(relations), do: relations |> Enum.flat_map(&full_columns/1) |> MapSet.new()
 
-  @doc "Whether any relation has the column, read from every row only when asked."
-  @spec column?([relation()], binary()) :: boolean()
-  def column?(relations, name), do: MapSet.member?(table_columns(relations), name)
-
   # The relations with their columns, as the engine's error text lists them.
   @spec listed_columns([relation()]) :: [{binary(), [binary()]}]
   defp listed_columns(relations), do: Enum.map(relations, &{&1.qualifier, full_columns(&1)})

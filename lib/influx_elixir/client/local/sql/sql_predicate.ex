@@ -142,13 +142,33 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   @spec pattern_predicate(binary()) :: {:ok, clause()} | {:error, map()} | :nomatch
   defp pattern_predicate(text) do
     cond do
-      match = SQLMask.run(@like_pattern, text) -> like_clause(match)
+      match = SQLMask.run(@like_pattern, text) -> literal_clause(match, &like_clause/1)
       match = SQLMask.run(@like_param_pattern, text) -> like_param_clause(match)
-      match = SQLMask.run(@regex_pattern, text) -> regex_clause(match)
+      match = SQLMask.run(@regex_pattern, text) -> literal_clause(match, &regex_clause/1)
       match = SQLMask.run(@regex_param_pattern, text) -> regex_param_clause(match)
       true -> :nomatch
     end
   end
+
+  # The pattern operators read one string literal on their right: `s ~ 'v' || '1'` is a
+  # concatenation, `s ~ 'v' @x 'c'` is no expression, and the double reads neither.
+  @spec literal_clause([binary()], ([binary()] -> {:ok, clause()} | {:error, map()})) ::
+          {:ok, clause()} | {:error, map()}
+  defp literal_clause(match, read) do
+    if single_literal?(List.last(match)) do
+      read.(match)
+    else
+      {:error,
+       SQLError.refusal(
+         "a pattern operator whose right side is more than one string literal: the double " <>
+           "reads only a literal or a parameter"
+       )}
+    end
+  end
+
+  # Whether the text between the quotes of a match is the body of one string literal.
+  @spec single_literal?(binary()) :: boolean()
+  defp single_literal?(body), do: Regex.match?(~r/\A'x*'\z/, SQLMask.mask("'" <> body <> "'"))
 
   @spec like_clause([binary()]) :: {:ok, clause()} | {:error, map()}
   defp like_clause([_full, left, negated, kind, pattern]) do
@@ -172,9 +192,19 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
 
   @spec regex_clause([binary()]) :: {:ok, clause()} | {:error, map()}
   defp regex_clause([_full, left, op, pattern]) do
-    with {:ok, operand} <- parse_operand(String.trim(left)),
-         {:ok, regex} <- compile_regex(SQLLiteral.unescape(pattern), op) do
-      {:ok, {regex_op(op), operand, {regex, op}}}
+    with {:ok, operand} <- parse_operand(String.trim(left)) do
+      case compile_regex(SQLLiteral.unescape(pattern), op) do
+        {:ok, regex} ->
+          {:ok, {regex_op(op), operand, {regex, op}}}
+
+        {:error, %{body: "Client.Local: " <> _reason}} = refusal ->
+          refusal
+
+        # The optimizer finds an invalid pattern after the analyzer has typed the query, as it
+        # finds an unreadable time: the error waits for that stage (`SQLTime.first_invalid/1`).
+        {:error, error} ->
+          {:ok, {:eq, "time", {:invalid_time, error}}}
+      end
     end
   end
 
@@ -389,8 +419,12 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
       {{:error, message}, _pcre} ->
         {:error, SQLError.simplify("Invalid regex\ncaused by\nExternal error: " <> message)}
 
-      {:unknown, {:ok, regex}} ->
-        {:ok, regex}
+      {{:unknown, cause}, _pcre} ->
+        {:error,
+         SQLError.refusal(
+           "a regular expression with #{cause}: the double does not know how the engine's " <>
+             "crate reads it"
+         )}
 
       {:ok, {:ok, regex}} ->
         {:ok, regex}
@@ -399,13 +433,6 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
         {:error,
          SQLError.refusal(
            "a regular expression the engine's crate reads and the double's PCRE rejects"
-         )}
-
-      {:unknown, {:error, _pcre}} ->
-        {:error,
-         SQLError.refusal(
-           "a regular expression with a fault the double does not word as the engine's " <>
-             "crate does"
          )}
     end
   end

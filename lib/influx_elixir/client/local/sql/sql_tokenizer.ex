@@ -301,7 +301,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   # decoded, `E'a'b'` for `E'a''b'`), `N'..'` and the others are not.
   @spec word(binary(), pos_integer(), pos_integer(), tokens()) :: {:ok, tokens()} | :bail
   defp word(text, line, col, acc) do
-    [literal] = Regex.run(~r/\A[\p{L}_][\p{L}\p{N}_$]*/u, text)
+    literal = binary_part(text, 0, word_length(text, 0))
     after_word = binary_tail(text, literal)
 
     if String.length(literal) == 1 and String.starts_with?(after_word, "'") do
@@ -310,6 +310,18 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
       emit(text, literal, :word, line, col, acc)
     end
   end
+
+  # The bytes of the word at the start of `text` (a letter or `_`, then letters, digits, `_`
+  # and `$`). Read by walking the bytes: a regex over the whole rest of the text validates all
+  # of it as UTF-8 at every word, which makes a long statement cost the square of its length.
+  @spec word_length(binary(), non_neg_integer()) :: non_neg_integer()
+  defp word_length(<<c::utf8, rest::binary>>, size) do
+    if SQLIdentifiers.word_char?(c) or c == ?$,
+      do: word_length(rest, size + byte_size(<<c::utf8>>)),
+      else: size
+  end
+
+  defp word_length(_end_or_invalid, size), do: size
 
   @spec escape_string(binary(), binary(), pos_integer(), pos_integer(), tokens()) ::
           {:ok, tokens()} | :bail

@@ -37,7 +37,8 @@ defmodule InfluxElixir.Client.Local.SQLError do
           | :timestamp_concat
           | {:distinct_time_text, :distinct | :not_distinct}
           | {:pattern_number, :like | :ilike, :tag_number | :number_tag}
-          | {:no_common_type, :coalesce | :nullif, :integer | :float | :decimal}
+          | {:no_common_type, :coalesce | :nullif, :integer | :float | :decimal, :tag | :text,
+             :select | :where | :order_by}
           | {:numbers_not_combined, call()}
           | {:number_and_text, :greatest | :least}
 
@@ -87,11 +88,17 @@ defmodule InfluxElixir.Client.Local.SQLError do
                          float: "a float",
                          decimal: "a decimal"
                        ],
+                       {text, kind} <- [tag: "a tag", text: "text"],
+                       {place, where_} <- [
+                         select: "in a select list",
+                         where: "in a WHERE",
+                         order_by: "in an ORDER BY"
+                       ],
                        do:
-                         {{:no_common_type, call, family},
-                          "#{word} of #{shown} with text: the engine casts the text to the " <>
-                            "number when it runs the plan (and closes the connection when a " <>
-                            "value does not cast), which is not modelled"}
+                         {{:no_common_type, call, family, text, place},
+                          "#{word} of #{shown} with #{kind} #{where_}: the engine casts the " <>
+                            "text to the number when it runs the plan (and closes the connection " <>
+                            "when a value does not cast), which is not modelled"}
                      ) ++
                      for(
                        {call, word} <- [

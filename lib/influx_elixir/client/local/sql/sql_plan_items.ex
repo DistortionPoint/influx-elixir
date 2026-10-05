@@ -20,10 +20,10 @@ defmodule InfluxElixir.Client.Local.SQLPlanItems do
 
   @comparisons [:eq, :ne, :gt, :lt, :gte, :lte]
 
-  @doc "The expression of an operand of a `WHERE`: a column is a field."
+  # The expression of an operand of a `WHERE`: a column is a field.
   @spec operand_expr(SQLParser.operand()) :: SQLExpr.t()
-  def operand_expr({:expr, expr}), do: expr
-  def operand_expr(column), do: {:field, column}
+  defp operand_expr({:expr, expr}), do: expr
+  defp operand_expr(column), do: {:field, column}
 
   # Every part of a term the planner types, the innermost first. The engine
   # types a part in one of two passes (verified, over every pairing of a

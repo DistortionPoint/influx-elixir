@@ -39,6 +39,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     SQLClauses,
     SQLCoerce,
     SQLCondition,
+    SQLContradict,
     SQLError,
     SQLEval,
     SQLExpr,
@@ -116,21 +117,66 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     unused = SQLPrune.unused(query.ctes, query)
 
     query.ctes
-    |> Enum.reduce_while({:ok, %{}}, fn {name, cte_query}, {:ok, sources} ->
-      with {:ok, rows, relations} <-
-             select(cte_query, fetch, sources, params, kinds, false, Map.get(unused, name, [])),
+    |> Enum.reduce_while({:ok, %{}, nil}, fn {name, cte_query}, {:ok, sources, held} ->
+      with {:ok, rows, relations, found} <-
+             run_cte(cte_query, fetch, sources, params, kinds, Map.get(unused, name, [])),
            :ok <- SQLTyping.check_cte_outputs(cte_query) do
         cte = cte_source(name, rows, relations, cte_query, sources, kinds)
-        {:cont, {:ok, Map.put(sources, name, cte)}}
+        {:cont, {:ok, Map.put(sources, name, cte), first_held(held, found)}}
       else
         {:error, _reason} = error -> {:halt, error}
       end
     end)
     |> case do
-      {:ok, sources} -> execute_select(query, fetch, sources, params, kinds)
+      {:ok, sources, held} -> execute_select(query, fetch, sources, params, kinds, held)
       {:error, _reason} = error -> error
     end
   end
+
+  # A common table expression's rows, with the error it has that the engine finds after the
+  # errors of the queries that read the expression, when it has one: the error of its physical
+  # plan (a negation), or one of the analyzer or the optimizer (a type error, an invalid regex)
+  # when its columns are known without its rows. The expression then has no rows, and the
+  # error is answered if the query that reads it has no error found before it.
+  @spec run_cte(
+          SQLParser.parsed_query(),
+          fetch(),
+          %{binary() => source()},
+          %{binary() => term()},
+          kinds_mode(),
+          SQLPrune.marks()
+        ) :: {:ok, [map()], [SQLSchema.relation()], term()} | {:error, term()}
+  defp run_cte(query, fetch, sources, params, kinds, unused) do
+    case select(query, fetch, sources, params, kinds, false, unused) do
+      {:ok, rows, relations} ->
+        {:ok, rows, relations, nil}
+
+      {:held, error, relations} ->
+        {:ok, [], relations, {:physical, error}}
+
+      {:error, _reason} = error ->
+        if held_stage?(query, error), do: {:ok, [], [], {:analyzer, error}}, else: error
+    end
+  end
+
+  # The error of an expression with listed columns that the analyzer or the optimizer finds.
+  @spec held_stage?(SQLParser.parsed_query(), {:error, term()}) :: boolean()
+  defp held_stage?(query, {:error, %{body: body}}) when is_binary(body) do
+    not SQLSchema.star?(query) and analyzer_body?(body)
+  end
+
+  defp held_stage?(_query, _error), do: false
+
+  @spec analyzer_body?(binary()) :: boolean()
+  defp analyzer_body?(body),
+    do:
+      String.starts_with?(body, "type_coercion\n") or String.starts_with?(body, "Optimizer rule")
+
+  # The first error held, an analyzer's before a physical plan's.
+  @spec first_held(term(), term()) :: term()
+  defp first_held(nil, found), do: found
+  defp first_held({:physical, _error}, {:analyzer, _other} = found), do: found
+  defp first_held(held, _found), do: held
 
   # What a query reads from: its points; its columns in order when it is a
   # CTE (a table's are its points', sorted); and whether a filter above it
@@ -142,14 +188,24 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           fetch(),
           %{binary() => source()},
           %{binary() => term()},
-          kinds_mode()
+          kinds_mode(),
+          term()
         ) :: [map()] | {:error, term()}
-  defp execute_select(query, fetch, sources, params, kinds) do
+  defp execute_select(query, fetch, sources, params, kinds, held) do
     case select(query, fetch, sources, params, kinds, true, nil) do
+      {:ok, _rows, _relations} when held != nil -> elem(held, 1)
       {:ok, rows, _relations} -> response_rows(rows, query)
-      {:error, _reason} = error -> error
+      {:error, _reason} = error -> outranked(error, held)
     end
   end
+
+  # The error of the query that reads the expressions, unless one of an expression found its
+  # error in the same stage first (the analyzer reads the expression before the query).
+  @spec outranked({:error, term()}, term()) :: {:error, term()}
+  defp outranked({:error, %{body: body}} = error, {:analyzer, held}) when is_binary(body),
+    do: if(analyzer_body?(body), do: held, else: error)
+
+  defp outranked(error, _held), do: error
 
   # The rows of a `SELECT *` are the points' own, and `point_to_row/2` has
   # written their `UInt64`s as the response carries them.
@@ -199,11 +255,15 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           %{binary() => term()},
           kinds_mode(),
           boolean(),
-          [binary()] | nil
-        ) :: {:ok, [map()], [SQLSchema.relation()]} | {:error, term()}
-  defp select(%{measurement: m} = query, fetch, sources, params, kinds, final?, unused) do
+          SQLPrune.marks() | nil
+        ) ::
+          {:ok, [map()], [SQLSchema.relation()]}
+          | {:held, term(), [SQLSchema.relation()]}
+          | {:error, term()}
+  defp select(%{measurement: m} = query, fetch, all_sources, params, kinds, final?, unused) do
+    fetch_source = &fetch_source(fetch, &1, all_sources)
+    sources = visible_sources(query, all_sources)
     unsigned? = unsigned_columns(query, sources, kinds)
-    fetch_source = &fetch_source(fetch, &1, sources)
 
     with :ok <- table_error(query),
          {:ok, source} <- source(fetch, m, sources),
@@ -245,6 +305,18 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     {:query_error, error} -> {:error, error}
   end
 
+  # A table written with its schema (`iox.m`, `public.iox.m`) is the measurement, whatever
+  # common table expression has the name `m` (verified: a name of one part is the only one a
+  # `WITH` name stands for).
+  @spec visible_sources(SQLParser.parsed_query(), %{binary() => source()}) :: %{
+          binary() => source()
+        }
+  defp visible_sources(%{qualifier: written, measurement: measurement}, sources) do
+    if written != measurement and String.contains?(written, "."),
+      do: Map.delete(sources, measurement),
+      else: sources
+  end
+
   # What the engine does after the planner: the optimizer folds the constants, the scan takes
   # its range, and last the physical plan is built, where the negation of a type it does not
   # support is found (`plan` holds that error, to be answered if nothing before it is found).
@@ -256,8 +328,11 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           [point()],
           [SQLSchema.relation()],
           {source(), %{binary() => source()}, kinds_mode(), (binary() -> boolean())},
-          {boolean(), [binary()] | nil}
-        ) :: {:ok, [map()], [SQLSchema.relation()]} | {:error, term()}
+          {boolean(), SQLPrune.marks() | nil}
+        ) ::
+          {:ok, [map()], [SQLSchema.relation()]}
+          | {:held, term(), [SQLSchema.relation()]}
+          | {:error, term()}
   defp finish(
          plan,
          typed,
@@ -275,12 +350,34 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
          :ok <- SQLRange.check_time(simplified, source.pushdown),
          :ok <- check_value_range(simplified, joined, sources, kinds, unsigned?),
          :ok <- SQLSelect.check_named(simplified),
-         :ok <- plan do
-      {:ok, rows(joined, simplified, final?, empty?(simplified, joined, unsigned?)), relations}
+         :ok <- null_difference(typed.where) do
+      cond do
+        plan == :ok ->
+          empty? = (is_list(unused) and :dead in unused) or empty?(simplified, joined, unsigned?)
+          {:ok, rows(joined, simplified, final?, empty?), relations}
+
+        final? ->
+          plan
+
+        true ->
+          {:held, plan, relations}
+      end
     else
       {:error, %{body: "Client.Local: " <> _reason}} when plan != :ok -> plan
       {:error, _reason} = error -> error
     end
+  end
+
+  @spec null_difference([SQLParser.where_node()]) :: :ok | {:error, SQLError.t()}
+  defp null_difference(where) do
+    if SQLContradict.null_difference?(where),
+      do:
+        {:error,
+         SQLError.refusal(
+           "an IN list and a NOT IN list of one operand, one of them with a NULL: the engine " <>
+             "takes one list out of the other, which the double does not model"
+         )},
+      else: :ok
   end
 
   # A placeholder numbered zero is the engine's error as the expression it stands in is
@@ -314,7 +411,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           %{binary() => term()},
           [SQLSchema.relation()],
           SQLError.t() | nil,
-          [binary()] | nil
+          SQLPrune.marks() | nil
         ) :: SQLPlan.plan_options()
   defp plan_options(query, params, relations, ordinal, unused) do
     placeholder =
@@ -366,12 +463,11 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # `InfluxElixir.Client.Local.SQLClauses.resolve_references/4`): the parser left it unread.
   @spec ordinal_error(SQLParser.parsed_query(), [SQLSchema.relation()]) :: SQLError.t() | nil
   defp ordinal_error(query, relations) do
-    case SQLSchema.output_columns(query, relations) do
-      nil ->
-        nil
-
-      columns ->
-        Enum.find_value(query.order_by, &SQLClauses.position_error(elem(&1, 0), length(columns)))
+    with true <- Enum.any?(query.order_by, &SQLClauses.position_term?(elem(&1, 0))),
+         columns when is_list(columns) <- SQLSchema.output_columns(query, relations) do
+      Enum.find_value(query.order_by, &SQLClauses.position_error(elem(&1, 0), length(columns)))
+    else
+      _no_position -> nil
     end
   end
 

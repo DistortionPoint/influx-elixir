@@ -30,15 +30,17 @@ defmodule InfluxElixir.Client.Local.SQLCastType do
 
   @doc """
   Reads the type at the front of an expression parser's tokens: the cast target and the tokens
-  after the type, or why the double does not compute the cast.
+  after the type, or why the double does not compute the cast. `operand` is the expression
+  cast, which a refusal of an unsigned integer names the kind of (a `NULL`, a literal, a
+  column or another expression: the engine's answers for them differ).
   """
-  @spec read([expr_token()]) ::
+  @spec read([expr_token()], SQLExpr.t()) ::
           {:ok, SQLExpr.cast_type(), [expr_token()]} | {:error, {:cast_type, binary()}}
-  def read(tokens) do
+  def read(tokens, operand) do
     window = tokens |> Enum.take(@window) |> Enum.take_while(&typed?/1)
 
     case window |> Enum.map(&grammar_token/1) |> SQLDmlType.parse() do
-      {:ok, type, rest} -> target(type, Enum.drop(tokens, length(window) - length(rest)))
+      {:ok, type, rest} -> target(type, Enum.drop(tokens, length(window) - length(rest)), operand)
       _unread -> {:error, {:cast_type, "a type the double does not read"}}
     end
   end
@@ -49,32 +51,47 @@ defmodule InfluxElixir.Client.Local.SQLCastType do
   """
   @spec type?(binary()) :: boolean()
   def type?(text) do
-    {:ok, tokens} = SQLTokenizer.tokenize(text)
-    match?({:ok, _type, [{:eof, _printed, _upper, _line, _col}]}, SQLDmlType.parse(tokens))
+    case SQLTokenizer.tokenize(text) do
+      {:ok, tokens} ->
+        match?({:ok, _type, [{:eof, _printed, _upper, _line, _col}]}, SQLDmlType.parse(tokens))
+
+      :bail ->
+        false
+    end
   end
 
-  @spec target(SQLDmlType.t(), [expr_token()]) ::
+  @spec target(SQLDmlType.t(), [expr_token()], SQLExpr.t()) ::
           {:ok, SQLExpr.cast_type(), [expr_token()]} | {:error, {:cast_type, binary()}}
-  defp target(%{family: :int, bits: 8}, rest), do: {:ok, :int8, rest}
-  defp target(%{family: :int, bits: 16}, rest), do: {:ok, :int16, rest}
-  defp target(%{family: :int, bits: 32}, rest), do: {:ok, :int32, rest}
-  defp target(%{family: :int, bits: 64}, rest), do: {:ok, :int64, rest}
-  defp target(%{family: :float, arrow: "Float64"}, rest), do: {:ok, :float, rest}
-  defp target(%{family: :str}, rest), do: {:ok, :string, rest}
+  defp target(%{family: :int, bits: 8}, rest, _operand), do: {:ok, :int8, rest}
+  defp target(%{family: :int, bits: 16}, rest, _operand), do: {:ok, :int16, rest}
+  defp target(%{family: :int, bits: 32}, rest, _operand), do: {:ok, :int32, rest}
+  defp target(%{family: :int, bits: 64}, rest, _operand), do: {:ok, :int64, rest}
+  defp target(%{family: :float, arrow: "Float64"}, rest, _operand), do: {:ok, :float, rest}
+  defp target(%{family: :str}, rest, _operand), do: {:ok, :string, rest}
 
-  defp target({:unsupported, printed}, _rest) do
+  defp target({:unsupported, printed}, _rest, _operand) do
     {:error,
      {:cast_type,
       "a cast to a type the engine cannot plan (#{printed}): its error (405) stands among " <>
         "the schema errors of the query in an order that is not modelled"}}
   end
 
-  defp target(%{family: :uint, arrow: arrow}, _rest), do: unmodelled(arrow)
-  defp target(%{arrow: arrow}, _rest), do: unmodelled(arrow)
+  defp target(%{family: :uint, arrow: arrow}, _rest, operand),
+    do: unmodelled("of #{operand_kind(operand)} to #{arrow}")
+
+  defp target(%{arrow: arrow}, _rest, _operand), do: unmodelled("to #{arrow}")
 
   @spec unmodelled(binary()) :: {:error, {:cast_type, binary()}}
-  defp unmodelled(arrow),
-    do: {:error, {:cast_type, "a cast to #{arrow}: the double does not model that type"}}
+  defp unmodelled(cast),
+    do: {:error, {:cast_type, "a cast #{cast}: the double does not model that type"}}
+
+  # What is cast, for the refusal of an unsigned integer: the engine's answer for it depends on
+  # whether it is a `NULL`, a literal, a column or something computed.
+  @spec operand_kind(SQLExpr.t()) :: binary()
+  defp operand_kind({:lit, nil}), do: "NULL"
+  defp operand_kind({:lit, _value}), do: "a literal"
+  defp operand_kind({:field, _column}), do: "a column"
+  defp operand_kind(_expression), do: "an expression"
 
   # The tokens a type is made of: its words, a size and the punctuation of one.
   @spec typed?(expr_token()) :: boolean()
@@ -84,7 +101,8 @@ defmodule InfluxElixir.Client.Local.SQLCastType do
   defp typed?(_token), do: false
 
   # An expression token as the type grammar reads it (the lines and columns it names in a
-  # parser error are not used: the syntax check has judged the text before).
+  # parser error are not used: the expression parser's tokens come from a text the tokenizer
+  # read, and a text it did not read never gets here, `type?/1` being false for it).
   @spec grammar_token(expr_token()) :: SQLTokenizer.token()
   defp grammar_token({:word, word}), do: {:word, word, String.upcase(word), 1, 1}
   defp grammar_token({:num, text}), do: {:number, text, text, 1, 1}

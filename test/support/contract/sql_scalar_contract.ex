@@ -79,7 +79,7 @@ defmodule InfluxElixir.Contract.SQLScalar do
     profile = Keyword.fetch!(opts, :profile)
     part = Keyword.get(opts, :part, :all)
 
-    unless part == :all or part in @parts do
+    unless part === :all or part in @parts do
       raise ArgumentError,
             "unknown :part #{inspect(part)}, expected :all or one of #{inspect(@parts)}"
     end
@@ -88,7 +88,7 @@ defmodule InfluxElixir.Contract.SQLScalar do
     if profile in [:v3_core, :v3_enterprise] do
       tests =
         for {test_part, block} <- test_blocks(profile, local?(client, __CALLER__)),
-            part == :all or part == test_part,
+            part === :all or part === test_part,
             do: block
 
       quote location: :keep do
@@ -142,7 +142,7 @@ defmodule InfluxElixir.Contract.SQLScalar do
 
   @doc "Whether an answer is the double's refusal by name."
   @spec refusal?(term()) :: boolean()
-  def refusal?(outcome), do: refusal_reason(outcome) != nil
+  def refusal?(outcome), do: refusal_reason(outcome) !== nil
 
   @doc "The reason the double gives for refusing by name, `nil` for any other answer."
   @spec refusal_reason(term()) :: binary() | nil
@@ -227,10 +227,10 @@ defmodule InfluxElixir.Contract.SQLScalar do
               InfluxElixir.TestSupport.Check.rows_close?(actual, expected) ->
                 :ok
 
-              reason == nil ->
+              reason === nil ->
                 {:mismatch, %{expected: expected, actual: actual}}
 
-              Map.get(reasons, {kind, text}, reason) == reason ->
+              Map.get(reasons, {kind, text}, reason) === reason ->
                 :refused
 
               true ->
@@ -334,7 +334,7 @@ defmodule InfluxElixir.Contract.SQLScalar do
 
   # Whether the client is the double (`Client.Local`), whatever edition it plays.
   @spec local?(Macro.t(), Macro.Env.t()) :: boolean()
-  defp local?(client, env), do: Macro.expand(client, env) == InfluxElixir.Client.Local
+  defp local?(client, env), do: Macro.expand(client, env) === InfluxElixir.Client.Local
 
   # The system tables are those of an edition: a real server is asked for the lists that name
   # them (`SQLCatalogCases.catalog_system/0`) only when it is a Core, so that another edition
@@ -376,7 +376,7 @@ defmodule InfluxElixir.Contract.SQLScalar do
 
   defp catalog_tests(profile, local?) do
     quote location: :keep do
-      unquote(system_catalog_test(profile == :v3_core or local?))
+      unquote(system_catalog_test(profile === :v3_core or local?))
       unquote(core_catalog_test(profile))
 
       describe "SQL scalar — contract: the parser and the catalog" do

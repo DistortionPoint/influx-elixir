@@ -119,15 +119,43 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   @spec check_statements(binary()) :: :ok | {:error, SQLError.t()}
   def check_statements(sql) do
     pieces = SQLTokenizer.split(sql)
+    several? = match?([_one, _two | _more], pieces)
 
-    Enum.reduce_while(pieces, :ok, fn {offset, piece}, :ok ->
+    pieces
+    |> Enum.reduce_while(false, fn {offset, piece}, unread? ->
       positioned = SQLTokenizer.blank(binary_part(sql, 0, offset)) <> piece
 
-      case first_token_error(positioned) do
-        nil -> verdict(check(positioned, match?([_one, _two | _more], pieces)))
-        error -> {:halt, {:error, error}}
+      case statement_verdict(positioned, several?) do
+        :ok -> {:cont, unread? or SQLTokenizer.tokenize(positioned) == :bail}
+        {:error, _error} = error -> {:halt, {:failed, error, unread?}}
       end
     end)
+    |> case do
+      {:failed, {:error, error}, true} -> {:error, after_unread(error)}
+      {:failed, error, false} -> error
+      _read -> :ok
+    end
+  end
+
+  # The error of a statement after one the double cannot read (a `{` or `#` its tokenizer does
+  # not know): the engine stops at the first statement that does not read, which may be that
+  # one, so the later error is not the engine's.
+  @spec after_unread(SQLError.t()) :: SQLError.t()
+  defp after_unread(%{body: "SQL error: ParserError" <> _rest}) do
+    SQLError.refusal(
+      "a parser error in a statement after one the double cannot read: the engine reports " <>
+        "the first statement that does not read"
+    )
+  end
+
+  defp after_unread(error), do: error
+
+  @spec statement_verdict(binary(), boolean()) :: :ok | {:error, SQLError.t()}
+  defp statement_verdict(positioned, several?) do
+    case first_token_error(positioned) do
+      nil -> check(positioned, several?)
+      error -> {:error, error}
+    end
   end
 
   # The parser's error for a statement that starts with no statement, or is a statement word
@@ -158,9 +186,6 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
     statement(tokens)
   end
-
-  defp verdict(:ok), do: {:cont, :ok}
-  defp verdict({:error, _error} = error), do: {:halt, error}
 
   # What a text that reads is still answered with: the engine's `TOP` is no feature of its
   # planner (405), and a spelling the double cannot read is refused by name.
@@ -1033,10 +1058,12 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # The type of a cast, read by the one grammar of types (`SQLDmlType`): a name, its size, the
   # words that go with it, the array suffixes. A type it cannot read is the engine's parser
   # error at the token; one it reads and the double does not is refused by name.
-  defp data_type([{:word, _p, _u, _l, _c} | _rest] = tokens), do: type_name(tokens)
+  defp data_type([{:word, _p, _u, _l, _c} | _rest] = tokens), do: read_type(tokens, true)
   defp data_type(tokens), do: fail("a data type name", tokens)
 
-  defp type_name(tokens) do
+  defp type_name(tokens), do: read_type(tokens, false)
+
+  defp read_type(tokens, in_cast?) do
     case SQLDmlType.parse(tokens) do
       {:ok, _type, rest} ->
         rest
@@ -1044,10 +1071,24 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
       {:error, error} ->
         throw({:fail, error})
 
+      {:refuse, "the type " <> _name = reason} when in_cast? ->
+        custom_type(tokens, reason)
+
       {:refuse, reason} ->
         refuse("a cast to #{reason}")
         throw(:bail)
     end
+  end
+
+  # A type name of the user's (the engine plans none): the parser takes the name and expects
+  # the end of the cast, so a word after it is its error (`CAST(n AS f TIMESTAMP)`, verified);
+  # a name alone is the planner's 405, which the double refuses.
+  defp custom_type([_name, {:word, _p, _u, _l, _c} | _rest] = tokens, _reason),
+    do: tokens |> tl() |> close_paren()
+
+  defp custom_type(_tokens, reason) do
+    refuse("a cast to #{reason}")
+    throw(:bail)
   end
 
   # `INTERVAL '1 minute'` and `INTERVAL '1' minute`. The engine's planner reads no `TO`

@@ -24,10 +24,10 @@ defmodule InfluxElixirTest do
     test "constructs a Point struct with defaults" do
       point = InfluxElixir.point("cpu", %{"value" => 0.64})
 
-      assert point.measurement == "cpu"
-      assert point.fields == %{"value" => 0.64}
-      assert point.tags == %{}
-      assert point.timestamp == nil
+      assert point.measurement === "cpu"
+      assert point.fields === %{"value" => 0.64}
+      assert point.tags === %{}
+      assert point.timestamp === nil
     end
 
     test "constructs a Point struct with tags and timestamp" do
@@ -37,8 +37,8 @@ defmodule InfluxElixirTest do
           timestamp: 1_630_424_257_000_000_000
         )
 
-      assert point.tags == %{"host" => "server01"}
-      assert point.timestamp == 1_630_424_257_000_000_000
+      assert point.tags === %{"host" => "server01"}
+      assert point.timestamp === 1_630_424_257_000_000_000
     end
   end
 
@@ -275,7 +275,7 @@ defmodule InfluxElixirTest do
 
   describe "resolve_connection/1" do
     test "passes through a keyword config unchanged", %{conn: conn} do
-      assert InfluxElixir.resolve_connection(conn) == conn
+      assert InfluxElixir.resolve_connection(conn) === conn
     end
 
     test "resolves an atom name via Connection registry" do
@@ -286,7 +286,7 @@ defmodule InfluxElixirTest do
       on_exit(fn -> InfluxElixir.Connection.delete(name) end)
 
       resolved = InfluxElixir.resolve_connection(name)
-      assert resolved[:host] == "resolve-host"
+      assert resolved[:host] === "resolve-host"
     end
 
     test "raises ArgumentError for unregistered atom name" do

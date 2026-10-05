@@ -180,7 +180,8 @@ defmodule InfluxElixir.Client.Local.SQLTime do
 
   @doc """
   A `time` IN list once its items are known: a bare number fails the whole
-  list, which the engine words with every item's type, a string being `Utf8`.
+  list, which the engine words with every item's type, a string being `Utf8` and `now()` (with
+  or without an interval) a `Timestamp(ns)`.
   """
   @spec in_list([bound()]) :: {:ok, [bound()]} | {:error, SQLError.t()}
   def in_list(bounds) do
@@ -188,6 +189,7 @@ defmodule InfluxElixir.Client.Local.SQLTime do
       types =
         Enum.map_join(bounds, ", ", fn
           {:number, type} -> type
+          {:now, _offset} -> "Timestamp(ns)"
           nil -> "Null"
           _other -> "Utf8"
         end)

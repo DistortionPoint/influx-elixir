@@ -97,12 +97,11 @@ defmodule InfluxElixir.Client.Local.SQLConstantCall do
 
   defp coercion(message, _ancestors), do: SQLError.coercion(message)
 
-  @doc """
-  Whether the optimizer reports the call: it stands directly under an `IS [NOT] NULL`,
-  with only `CAST`s between. It reports after the passes that type the query.
-  """
+  # Whether the optimizer reports the call: it stands directly under an `IS [NOT] NULL`,
+  # with only `CAST`s between.
+  # It reports after the passes that type the query.
   @spec optimizer?(ancestors()) :: boolean()
-  def optimizer?(ancestors), do: hd_or(Enum.drop_while(ancestors, &(&1 == :cast))) == :isnull
+  defp optimizer?(ancestors), do: hd_or(Enum.drop_while(ancestors, &(&1 == :cast))) == :isnull
 
   @spec hd_or([atom()]) :: atom() | nil
   defp hd_or([]), do: nil

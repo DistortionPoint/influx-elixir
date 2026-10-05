@@ -237,8 +237,53 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   @spec pattern_match(atom(), term(), binary()) :: boolean()
   defp pattern_match(:like, regex, text), do: Regex.match?(regex, text)
   defp pattern_match(:not_like, regex, text), do: not Regex.match?(regex, text)
-  defp pattern_match(:regex, {regex, _op}, text), do: Regex.match?(regex, text)
-  defp pattern_match(:not_regex, {regex, _op}, text), do: not Regex.match?(regex, text)
+  defp pattern_match(:regex, {regex, _op}, text), do: regex_match?(regex, text)
+  defp pattern_match(:not_regex, {regex, _op}, text), do: not regex_match?(regex, text)
+
+  # PCRE is the double's matcher. For a text that is not ASCII the engine's crate reads `\w`,
+  # `\d`, `\s` and `\b` as other sets of characters and folds other characters in a
+  # case-insensitive match, and PCRE's `$` ends a text before its last newline where the
+  # crate's does not. The double declines such a match rather than answer.
+  @spec regex_match?(Regex.t(), binary()) :: boolean()
+  defp regex_match?(regex, text) do
+    if text_differs?(regex, text) do
+      throw(
+        {:query_error,
+         SQLError.refusal(
+           "a regular expression over a text where PCRE and the engine's crate differ (a " <>
+             "non-ASCII text beside \\w, \\d, \\s, \\b or a case-insensitive match; a newline " <>
+             "beside $)"
+         )}
+      )
+    end
+
+    Regex.match?(regex, text)
+  end
+
+  @spec text_differs?(Regex.t(), binary()) :: boolean()
+  defp text_differs?(regex, text) do
+    cond do
+      String.contains?(text, "\n") -> String.contains?(regex.source, "$")
+      byte_size(text) == String.length(text) -> false
+      true -> unicode_sensitive?(regex)
+    end
+  end
+
+  @spec unicode_sensitive?(Regex.t()) :: boolean()
+  defp unicode_sensitive?(regex) do
+    :caseless in Regex.opts(regex) or
+      String.contains?(regex.source, [
+        "\\w",
+        "\\W",
+        "\\d",
+        "\\D",
+        "\\s",
+        "\\S",
+        "\\b",
+        "\\B",
+        "(?i"
+      ])
+  end
 
   @spec pattern_type_error(atom(), term(), term()) :: binary()
   defp pattern_type_error(op, _regex, value) when op in [:like, :not_like],

@@ -9045,7 +9045,15 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
        :error, 400,
        "Error during planning: Unary operator '+' only supports numeric, interval and timestamp types"},
       {:raw, "update main set v = (abs(s), 1)", :error, 405,
-       "This feature is not implemented: Only identifiers and literals are supported in tuples"}
+       "This feature is not implemented: Only identifiers and literals are supported in tuples"},
+      {:raw, "UPDATE main SET s = ((region + host) || abs('+1'))", :error, 400,
+       "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Dictionary(Int32, Utf8) to valid types"},
+      {:raw, "UPDATE main SET s = CAST(region + host AS TIMESTAMP)", :error, 400,
+       "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Dictionary(Int32, Utf8) to valid types"},
+      {:raw, "UPDATE main SET s = 'a' WHERE (region + host) || 'a' = 'b'", :error, 400,
+       "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Dictionary(Int32, Utf8) to valid types"},
+      {:raw, "INSERT INTO main (s) SELECT (region + host) || $1 FROM main", :error, 400,
+       "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Dictionary(Int32, Utf8) to valid types"}
     ]
   end
 
@@ -10537,7 +10545,11 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
       {:raw, "UPDATE main SET s = $0 + CAST(n)", :error, 400,
        "Error during planning: Invalid placeholder, zero is not a valid index: $0"},
       {:raw, "UPDATE main SET s = $0 + CAST(n, 1)", :error, 400,
-       "Error during planning: Invalid placeholder, zero is not a valid index: $0"}
+       "Error during planning: Invalid placeholder, zero is not a valid index: $0"},
+      {:raw, "INSERT INTO m (f) VALUES ((CASE WHEN n THEN 1 ; END))", :error, 400,
+       "SQL error: ParserError(\"Expected: ), found: WHEN at Line: 1, Column: 33\")"},
+      {:raw, "INSERT INTO main (s) VALUES (CASE WHEN n THEN 1 ; END)", :error, 400,
+       "SQL error: ParserError(\"Expected: ), found: WHEN at Line: 1, Column: 35\")"}
     ]
   end
 
@@ -11862,6 +11874,8 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
   @spec catalog_core() :: [tuple()]
   def catalog_core do
     [
+      {:raw, "DELETE FROM main WHERE (region + host) || 'a' = 'b'", :error, 400,
+       "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Dictionary(Int32, Utf8) to valid types"},
       {:raw, "DELETE FROM iox.main", :error, 400,
        "Error during planning: DML not supported: Delete"},
       {:raw, "DELETE FROM public.main", :error, 400,

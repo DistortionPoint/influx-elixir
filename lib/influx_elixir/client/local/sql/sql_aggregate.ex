@@ -173,13 +173,13 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
 
   defp column_result({:aggregate, agg, expr, _alias}, points, bucket_ts)
        when agg in @spread do
-    values = points |> Enum.map(&SQLEval.eval(expr, &1)) |> Enum.reject(&is_nil/1)
+    values = points |> scan_order() |> Enum.map(&SQLEval.eval(expr, &1)) |> Enum.reject(&is_nil/1)
 
-    spread(values, agg, bucket_ts == :scalar)
+    spread(values, agg, bucket_ts === :scalar)
   end
 
   defp column_result({:aggregate, agg, expr, _alias}, points, _bucket_ts) do
-    values = points |> Enum.map(&SQLEval.eval(expr, &1)) |> Enum.reject(&is_nil/1)
+    values = points |> scan_order() |> Enum.map(&SQLEval.eval(expr, &1)) |> Enum.reject(&is_nil/1)
     compute(agg, values)
   end
 
@@ -211,10 +211,16 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp compute(_agg, []), do: nil
   defp compute(:sum_distinct, values), do: compute(:sum, Enum.uniq(values))
   defp compute(:avg, values), do: average(values)
-  defp compute(:sum, [first | _rest] = values), do: Enum.reduce(values, zero(first), &add(&2, &1))
+
+  defp compute(:sum, [first | _rest] = values),
+    do: Enum.reduce(values, zero(first), &add(&2, &1))
+
   # MIN/MAX also run over `time`, so the comparison is the sort's.
   defp compute(:min, values), do: Enum.min(values, &SQLSort.value_order/2)
-  defp compute(:max, values), do: Enum.max(values, fn a, b -> SQLSort.value_order(b, a) end)
+
+  defp compute(:max, values),
+    do: Enum.max(values, fn a, b -> SQLSort.value_order(b, a) end)
+
   defp compute(:median, values), do: median(values)
   # Sample forms need at least two values, exactly as the real engine
   # (STDDEV of one row is null); population forms are defined for one.
@@ -259,7 +265,8 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
         values |> Enum.map(&integer_of/1) |> Enum.sum() |> Kernel./(length(values))
 
       true ->
-        values |> sum_floats() |> divide(length(values) * 1.0)
+        sum = sum_floats(values)
+        divide(sum, length(values) * 1.0)
     end
   end
 
@@ -300,6 +307,31 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp halve({:dec, coefficient, scale}), do: {:dec, div(coefficient, 2), scale}
   defp halve(value), do: SQLNumber.arithmetic(:/, value, if(is_integer(value), do: 2, else: 2.0))
 
+  # The order the double adds the values of an aggregate in: the rows by the values of their
+  # tags in the order of the tags' names, then by time, which is the order of the engine's scan
+  # for the whole table (verified on Core: the variance of eight rows over two tags is
+  # `7.359374999999999` in that order, which is the engine's, and `7.359375` in the order they
+  # were written; three more columns agree). Under a `WHERE`, an expression, a group or more
+  # than one batch of rows the engine's order is another (`var_pop(n / 3)` of the same eight
+  # rows is `0.984375` on the engine and `0.9843749999999999` in this order), so the last
+  # digits of a sum, a mean or a variance of floats can differ there.
+  @spec scan_order(points()) :: points()
+  defp scan_order(points) do
+    case points |> Enum.map(&(&1.tags |> Map.keys() |> Enum.sort())) |> Enum.uniq() do
+      [names] ->
+        if Enum.all?(points, &is_integer(&1.timestamp)),
+          do: Enum.sort_by(points, &scan_key(&1, names)),
+          else: points
+
+      _mixed_tags ->
+        points
+    end
+  end
+
+  @spec scan_key(map(), [binary()]) :: {[term()], term()}
+  defp scan_key(point, names),
+    do: {Enum.map(names, &Map.fetch!(point.tags, &1)), point.timestamp}
+
   # The sample or population variance or deviation of the values.
   @spec spread([SQLNumber.t()], SQLParser.aggregate(), boolean()) :: term()
   defp spread([], _agg, _scalar?), do: nil
@@ -308,13 +340,15 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp spread(values, agg, scalar?) do
     divisor = if agg in [:var, :stddev], do: length(values) - 1, else: length(values)
     variance = variance(values, divisor, scalar?)
-    if agg in [:var, :var_pop], do: variance, else: square_root(variance)
+    result = if agg in [:var, :var_pop], do: variance, else: square_root(variance)
+    result
   end
 
-  # The variance as the engine's accumulator makes it: one pass over the values in the order
-  # they are read, updating the count, the mean and the sum of the squared distances from the
-  # mean (Welford) as each arrives, so that equal values have a variance of exactly zero (a
-  # two-pass mean of `55.7` three times is not `55.7`). The sum is over `divisor`.
+  # The variance as the engine's accumulator makes it: one pass over the values, updating the
+  # count, the mean and the sum of the squared distances from the mean (Welford) as each
+  # arrives, so that equal values have a variance of exactly zero (a two-pass mean of `55.7`
+  # three times is not `55.7`). The sum is over `divisor`. The values come in `scan_order/1`;
+  # where the engine reads the rows in another order, the last digits can differ.
   @spec variance([SQLNumber.t()], pos_integer(), boolean()) :: float() | SQLNumber.special()
   defp variance(values, divisor, scalar?) do
     {count, mean, squares} = Enum.reduce(values, {0, 0.0, 0.0}, &welford/2)

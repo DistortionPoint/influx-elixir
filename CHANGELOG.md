@@ -8,6 +8,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` SQL: no raise on a stray character after a cast, pruning only by verified
+  folds, unverified regex refused**: `n::int # a` raised `MatchError`; it is refused by name.
+  `n IN (NULL, 1) AND n = 2` was counted as a one-element list and answered `[]` where the
+  engine reports a negation error; lists are counted as written, `IN` lists nested one level
+  right fold as the engine folds them, and NULL folds the double has not verified are refused
+  by name. A regex construct the engine's crate reads differently from PCRE (`[a&&b]`,
+  `(?>a)`, `\b{start}`, `\p{Greek}`, `\w` over non-ASCII text, ...) is refused by name; it
+  answered PCRE's matches. `s ~ 'v' || '1'` took the text between the first and last quote
+  as the pattern; it is refused. `INTERVAL '+N days'` and padded intervals are the engine's
+  syntax error. A CTE no longer captures `iox.m`; a CTE's negation is pruned under an empty
+  outer query. Float `sum`/`avg` and `var`/`stddev` read rows in the engine's scan order
+  (tags, then time); their last digits can still differ under a filter or grouping.
+  `SELECT *` no longer counts the select list's columns over every row (+15% removed).
+- **`Client.Local` InfluxQL: `fill()` behind or inside a condition, `GROUP BY` beside a
+  `WHERE`, bare operands beside constants, the sign of a `fill()` number**: a `fill(` where an
+  operand is wanted (`WHERE fill(1)`, `WHERE n > 1 AND fill(1)`) is Core's `invalid expression,
+  the only valid function calls are ...` at the call (it answered all rows, and an
+  `invalid conditional expression` at the connective); a `fill()` that follows a whole
+  condition ends it, and what stands behind (`fill(2)`, `GROUP BY host`, `= 2`, any word) is
+  left over from where it starts; an unclosed `fill(` is `invalid FILL option` at the end of
+  the parenthesis, and of a `fill()` option and a later bad `LIMIT` / `ORDER BY` operand the
+  leftmost is the error. `fill(- 1)` is minus one (a sign may stand apart from its digits).
+  `WHERE c GROUP BY * LIMIT x` (and `/re/`) read the raw text of the clause it had blanked
+  and answered a `Nom` error at the `GROUP`; it is the `LIMIT` error. A comparison of
+  constants, and of a column the measurement lacks with a number, beside a bare operand no
+  longer refuses the whole condition (Core answers `[]`; 616 of the 645 statements of the
+  second corpus that 6e5b8fd had begun to refuse), a bare string beside the latter is
+  refused by name (Core's `Cannot infer common argument type`), a string constant under
+  `=~` / `!~` keeps no point, and `(true)` or a missing column beside a `time` comparison is
+  the 500 `invalid expr stack`. `fill(n)` drops the rows no column holds a value in (`f + n`
+  where one is missing), as Core does. The error of a clause is carried with its position
+  (no more reading it back out of the body), and a second statement that does not parse is
+  the error before the planner's `SLIMIT` 405. A 1 800-statement random corpus against Core:
+  no wrong answer left that is not a refusal or Core's own clock.
+- **`Client.Local` DML: linear tokenizing, no raise, refusals split by cause**: the SQL
+  tokenizer read each word with a regex over the rest of the text (which validates all of it
+  as UTF-8 each time), so an `UPDATE`, a `DELETE` or an `INSERT ... SELECT` of a chain of `n`
+  words cost the square of `n` (1600 terms cost 7.3 times 400); it walks the word's bytes and
+  costs 3.95 times. An arithmetic operator over two tags in an operand is the planner's
+  `Cannot coerce arithmetic expression ...` again (it was refused by name; verified against
+  Core in 2528 shapes), and a statement cut by a `;` inside a value the double cannot read
+  (`INSERT INTO m (f) VALUES ((CASE WHEN n THEN 1 ; END))`) is refused by name instead of
+  raising. The coarse refusals of a `WHERE` that is no boolean, of an unknown function and of
+  two select items with one name say what they stopped at.
 - **`Client.Local` INSERT / UPDATE / DELETE: planned in linear time, `ORDER BY` in
   calls, the names of an `INSERT ... SELECT`, one table resolver**: a chain of
   `||` was typed once for every prefix of it (100 terms: 279 ms in an `INSERT`,

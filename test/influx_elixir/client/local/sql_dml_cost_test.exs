@@ -42,12 +42,16 @@ defmodule InfluxElixir.Client.Local.SQLDmlCostTest do
     do: Enum.reduce(1..count, "1", fn _position, inner -> "#{name}(#{inner}, 1)" end)
 
   # A statement of four times the length costs about four times as much when the work is a line
-  # in the length, sixteen when it is a square. The bound sits between them, with room for the
-  # fixed cost of the statement and for the noise of the reductions count.
+  # in the length, sixteen when it is a square. The bounds sit around four: above it a square
+  # (an UPDATE of 1600 terms cost 7.3 times one of 400 when the tokenizer read each word
+  # with a regex over the rest of the text), and below 2.5 a statement the double refused
+  # early, which would otherwise pass for cheap.
   defp assert_linear(conn, statement) do
-    short = cost(conn, statement.(100))
-    long = cost(conn, statement.(400))
-    assert long / short < 7.0, "100 terms cost #{short} reductions, 400 cost #{long}"
+    short = cost(conn, statement.(400))
+    long = cost(conn, statement.(1600))
+    ratio = long / short
+    assert ratio < 5.0, "400 terms cost #{short} reductions, 1600 cost #{long}"
+    assert ratio > 2.5, "400 terms cost #{short} reductions, 1600 cost #{long}"
   end
 
   describe "a chain of ||" do

@@ -10,7 +10,7 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
   @doc false
   @spec blocks(Macro.t(), atom()) :: [Macro.t()]
   def blocks(client, profile) do
-    version = if profile == :v2, do: :v2, else: :v3
+    version = if profile === :v2, do: :v2, else: :v3
 
     v3 =
       if profile in [:v3_core, :v3_enterprise] do
@@ -105,7 +105,7 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
              ctx do
           lp = "cpu,host=server01 value=0.64 1630424257000000000"
 
-          assert {:ok, :written} ==
+          assert {:ok, :written} ===
                    unquote(client).write(
                      ctx.conn,
                      lp,
@@ -127,7 +127,7 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
             ctx,
             :database,
             "contract_new_db",
-            fn name -> assert :ok == unquote(client).create_database(ctx.conn, name, []) end
+            fn name -> assert :ok === unquote(client).create_database(ctx.conn, name, []) end
           )
         end
 
@@ -322,7 +322,7 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
             assert %{"data" => [%{"line_number" => 1, "error_message" => message}]} =
                      Jason.decode!(body)
 
-            assert message ==
+            assert message ===
                      "Measurements, tag keys and values, and field keys may not end " <>
                        "with a backslash",
                    lp
@@ -618,7 +618,7 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
       describe "write/3 — timestamp range contract" do
         test "the largest timestamp per precision is stored; one more is refused", ctx do
           m = InfluxElixir.IntegrationHelper.unique_name("contract_ts")
-          v2? = unquote(version) == :v2
+          v2? = unquote(version) === :v2
 
           InfluxElixir.TestSupport.Check.each_case(
             [
@@ -642,7 +642,7 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
               if v2? do
                 assert %{"message" => message} = Jason.decode!(body)
 
-                assert message ==
+                assert message ===
                          "unable to parse '#{m} v=1i #{over}': time outside range " <>
                            "-9223372036854775806 - 9223372036854775806"
               else
@@ -858,7 +858,7 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
 
           # The body is read before the database is created.
           assert {:ok, databases} = unquote(client).list_databases(ctx.conn)
-          refute Enum.any?(databases, &(&1["name"] == db))
+          refute Enum.any?(databases, &(&1["name"] === db))
         end
 
         test "the request's parameters are read before its body", ctx do

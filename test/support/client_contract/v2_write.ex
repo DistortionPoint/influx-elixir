@@ -87,7 +87,7 @@ defmodule InfluxElixir.ClientContract.V2Write do
                          "orgID" => org_id,
                          "retentionRules" => [%{"type" => "expire", "everySeconds" => 0}]
                        }
-                     ] = Enum.filter(buckets, &(&1["name"] == name))
+                     ] = Enum.filter(buckets, &(&1["name"] === name))
 
               assert is_binary(id) and is_binary(org_id)
             end
@@ -143,7 +143,7 @@ defmodule InfluxElixir.ClientContract.V2Write do
               :ok = unquote(client).create_bucket(ctx.conn, name, retention: 3600)
 
               {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
-              bucket = Enum.find(buckets, &(&1["name"] == name))
+              bucket = Enum.find(buckets, &(&1["name"] === name))
               assert [%{"type" => "expire", "everySeconds" => 3600}] = bucket["retentionRules"]
 
               assert {:error, %{status: 500, body: body}} =
@@ -186,7 +186,7 @@ defmodule InfluxElixir.ClientContract.V2Write do
 
           assert %{"code" => "unprocessable entity", "message" => message} = Jason.decode!(body)
 
-          assert message ==
+          assert message ===
                    "failure writing points to database: partial write: field type conflict: " <>
                      ~s|input field "v" on measurement "#{m}" is type float, already exists as | <>
                      "type integer dropped=1"
@@ -217,7 +217,7 @@ defmodule InfluxElixir.ClientContract.V2Write do
           assert {:error, %{status: 422, body: body}} =
                    unquote(client).write(ctx.conn, lp, database: ctx.database)
 
-          assert Jason.decode!(body)["message"] ==
+          assert Jason.decode!(body)["message"] ===
                    "failure writing points to database: partial write: field type conflict: " <>
                      ~s|input field "v" on measurement "#{m}" is type float, already exists as | <>
                      "type integer dropped=2"
@@ -250,7 +250,7 @@ defmodule InfluxElixir.ClientContract.V2Write do
                          database: ctx.database
                        )
 
-              assert Jason.decode!(body)["message"] ==
+              assert Jason.decode!(body)["message"] ===
                        "failure writing points to database: partial write: field type conflict: " <>
                          ~s|input field "#{field}" on measurement "#{name}" is type #{got}, | <>
                          "already exists as type #{existing} dropped=1"
@@ -279,7 +279,7 @@ defmodule InfluxElixir.ClientContract.V2Write do
 
           {:ok, rows} = unquote(client).query_flux(ctx.conn, flux)
 
-          assert rows |> Enum.map(&{&1["k"], &1["_field"], &1["_value"]}) |> Enum.sort() ==
+          assert rows |> Enum.map(&{&1["k"], &1["_field"], &1["_value"]}) |> Enum.sort() ===
                    [{"a", "v", 2}, {"a", "w", 9}, {"b", "v", 3}]
 
           assert [_one_time] = rows |> Enum.map(& &1["_time"]) |> Enum.uniq()
@@ -404,7 +404,7 @@ defmodule InfluxElixir.ClientContract.V2Write do
             ~s|from(bucket: "#{ctx.database}") \|> range(start: 0) \|> filter(fn: (r) => r._measurement == "#{shared}")|
           )
 
-        assert shared_rows |> Enum.map(&{&1["host"], &1["_field"], &1["_value"]}) |> Enum.sort() ==
+        assert shared_rows |> Enum.map(&{&1["host"], &1["_field"], &1["_value"]}) |> Enum.sort() ===
                  [{"a", "host", 1}, {"b", "v", 2}]
       end
 

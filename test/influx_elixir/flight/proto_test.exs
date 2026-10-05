@@ -180,7 +180,7 @@ defmodule InfluxElixir.Flight.ProtoTest do
 
   describe "FlightService.Service" do
     test "has the correct gRPC service name" do
-      assert FlightService.Service.__meta__(:name) ==
+      assert FlightService.Service.__meta__(:name) ===
                "arrow.flight.protocol.FlightService"
     end
 

@@ -34,6 +34,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
       "invalid data type for tag or field reference, " <>
         "expected float, integer, unsigned, string, boolean, field, tag",
     fill: "invalid FILL option, expected NULL, NONE, PREVIOUS, LINEAR, or a number",
+    call:
+      "invalid expression, the only valid function calls are 'now' with no arguments, " <>
+        "date_part(<literal>, time), or scalar math functions",
     comment: "invalid inline comment, missing closing */",
     unterminated_string: "unterminated string literal",
     unterminated_regex: "unterminated regex literal",

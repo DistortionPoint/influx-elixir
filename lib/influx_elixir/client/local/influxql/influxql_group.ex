@@ -57,13 +57,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   text after `FROM <measurement>` with its literals masked; `whole` is the
   statement as sent and `at` where `masked_rest` starts in it.
 
-  Returns `{result, masked_rest}`: `result` is `:none` when the text has no
+  Returns `{result, masked_rest, rest}`: `result` is `:none` when the text has no
   `GROUP BY` in the place of one (the other checks read the text as it is),
-  `{:ok, t()}`, or the error; the text comes back with the clause blanked to
-  spaces, byte for byte, so that every position stays the engine's.
+  `{:ok, t()}`, or the error; the text comes back, masked and as sent, with the clause blanked
+  to spaces, byte for byte, so that every position stays the engine's.
   """
   @spec extract(binary(), non_neg_integer(), binary()) ::
-          {:none | {:ok, t()} | {:error, term()}, binary()}
+          {:none | {:ok, t()} | {:error, term()}, binary(), binary()}
   def extract(whole, at, masked_rest) do
     with [{from, length}] <- Regex.run(~r/\bGROUP\s+BY(?![\w])/i, masked_rest, return: :index),
          true <- plain_before?(binary_part(masked_rest, 0, from)),
@@ -71,11 +71,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
          start = from + length,
          false <- blank?(text, start) do
       case clause(text, start, at, whole) do
-        {:ok, group, stop} -> {{:ok, group}, blank(masked_rest, from, stop)}
-        {:error, _error} = error -> {error, blank(masked_rest, from, byte_size(masked_rest))}
+        {:ok, group, stop} ->
+          {{:ok, group}, blank(masked_rest, from, stop), blank(text, from, stop)}
+
+        {:error, _error} = error ->
+          size = byte_size(masked_rest)
+          {error, blank(masked_rest, from, size), blank(text, from, size)}
       end
     else
-      _not_a_clause -> {:none, masked_rest}
+      _not_a_clause -> {:none, masked_rest, binary_part(whole, at, byte_size(masked_rest))}
     end
   end
 
@@ -86,7 +90,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   defp plain_before?(before) do
     cond do
       before =~ ~r/^\s*$/ -> true
-      before =~ ~r/\b(?:ORDER|LIMIT|OFFSET)\b/i -> false
+      before =~ ~r/\b(?:ORDER|S?LIMIT|S?OFFSET)\b/i -> false
+      # A `fill()` before it ends the clauses `GROUP BY` may follow: what comes after is left
+      # over (see `InfluxQLCheck.cut_where/2`).
+      before =~ ~r/(?<![\w])fill\s*\(/i -> false
       before =~ ~r/(?:[-+*=<>(,~!]|(?<![_\/])\/|\b(?:AND|OR))\s*$/i -> false
       true -> before =~ ~r/^\s*WHERE\s+\S/i
     end
@@ -111,9 +118,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   defp clause(text, start, at, whole) do
     ctx = %{text: text, at: at, whole: whole}
 
-    with {:ok, dimensions, stop} <- dimensions(ctx, skip(text, start), [], 0),
-         {:ok, fill, stop} <- fill(ctx, stop) do
-      leftover(ctx, stop, dimensions, fill)
+    with {:ok, dimensions, stop} <- dimensions(ctx, skip(text, start), [], 0) do
+      case fill(ctx, stop) do
+        {:ok, fill, stop} -> leftover(ctx, stop, dimensions, fill)
+        {:bad_option, pos} -> {:error, {:engine, error(ctx, :fill, pos)}}
+      end
     end
   end
 
@@ -386,7 +395,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   # `fill` after the dimensions: `{:ok, fill | nil, stop}`; a `fill` that is
   # none (no parenthesis, an option that is not closed) is left over.
   @spec fill(map(), non_neg_integer()) ::
-          {:ok, InfluxQLBuckets.fill() | nil, non_neg_integer()} | {:error, term()}
+          {:ok, InfluxQLBuckets.fill() | nil, non_neg_integer()}
+          | {:bad_option, non_neg_integer()}
   defp fill(ctx, stop) do
     pos = skip(ctx.text, stop)
     rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
@@ -413,13 +423,37 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
           else: {:ok, nil, stop}
 
       :error ->
-        {:error, {:engine, error(ctx, :fill, option_at)}}
+        {:bad_option, option_at}
     end
   end
 
+  @doc """
+  Reads the `fill(...)` that starts at `from` in `text` (the statement from where its clauses
+  start), the way the clause is read after the dimensions or, with none, after the `WHERE`:
+  `{:ok, stop}` where the call ends, `{:bad_option, pos}` for an option that is none of the
+  engine's (`pos` is where the option starts) and `{:unclosed, from}` for one read but not
+  closed by `)`, which leaves the statement from the `fill`.
+  """
+  @spec read_fill(binary(), non_neg_integer()) ::
+          {:ok, non_neg_integer()}
+          | {:bad_option, non_neg_integer()}
+          | {:unclosed, non_neg_integer()}
+  def read_fill(text, from) do
+    case fill(%{text: text}, from) do
+      {:ok, nil, _stop} -> {:unclosed, from}
+      {:ok, _fill, stop} -> {:ok, stop}
+      {:bad_option, _pos} = bad -> bad
+    end
+  end
+
+  # The option of a `fill()`: a keyword, or a number whose sign may stand apart from its
+  # digits (verified: `fill(- 1)` is `-1`, `fill(- - 1)` and `fill(- x)` are no options).
   @spec option(binary()) :: {:ok, InfluxQLBuckets.fill(), non_neg_integer()} | :error
   defp option(rest) do
-    case Regex.run(~r/^(?:(null|none|previous|linear)(?![\w])|([+-]?)(\d*\.\d+|\d+))/i, rest) do
+    case Regex.run(
+           ~r/^(?:(null|none|previous|linear)(?![\w])|([+-]?)\s*(\d*\.\d+|\d+))/i,
+           rest
+         ) do
       [word, keyword] when keyword != "" and byte_size(word) > 0 ->
         case option_atom(String.downcase(keyword)) do
           nil -> :error

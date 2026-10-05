@@ -612,11 +612,10 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
 
   defp together([{:error, first} | more] = failures) do
     case Enum.find(more, &match?({:refuse, _why}, &1)) do
-      {:refuse, "a function the double does not know"} ->
-        {:error, together_status(first, failures)}
-
       {:refuse, _why} = refusal ->
-        refusal
+        if SQLDmlOperand.unknown_function?(refusal),
+          do: {:error, together_status(first, failures)},
+          else: refusal
 
       nil ->
         {:error, together_status(first, failures)}
@@ -631,8 +630,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   end
 
   defp planner_error?({:error, %{status: 400}}), do: true
-  defp planner_error?({:refuse, "a function the double does not know"}), do: true
-  defp planner_error?(_failure), do: false
+  defp planner_error?(failure), do: SQLDmlOperand.unknown_function?(failure)
 
   # The planner builds the projection item by item: it types the item, then what the item holds
   # that typing its top did not reach (what a cast holds, whether a value can be null), before it

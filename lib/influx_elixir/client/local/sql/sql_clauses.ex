@@ -226,6 +226,16 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   end
 
   @doc """
+  Whether an `ORDER BY` term can be a position or a number the planner reads as one (so that
+  the count of the select items matters): a term that is not one is never an error of position,
+  and the count (a pass over every row for `SELECT *`) need not be taken.
+  """
+  @spec position_term?(term()) :: boolean()
+  def position_term?(target) when is_binary(target), do: Regex.match?(~r/\A[0-9.]/, target)
+  def position_term?({:expr, {:lit, _value}}), do: true
+  def position_term?(_term), do: false
+
+  @doc """
   The engine's error for an `ORDER BY` term that is a position among `count` select items and
   names none, or `nil` for any other term. A number with a fraction reads as an expression.
   """

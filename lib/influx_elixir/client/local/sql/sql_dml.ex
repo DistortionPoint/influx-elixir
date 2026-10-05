@@ -90,12 +90,18 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   that of the text.
   """
   @spec parse_error([token()]) :: SQLError.t() | map() | nil
-  def parse_error(tokens) do
+  def parse_error([{:word, _p, word, _l, _c} | _rest] = tokens) do
     case parsed(split_end(tokens)) do
       {:error, %{body: "SQL error: ParserError" <> _rest} = error} -> error
+      {:refuse, why} -> if SQLDmlExpr.cut_off?(why), do: not_modelled(kind_of(word), why)
       _other -> nil
     end
   end
+
+  @spec kind_of(binary()) :: :insert | :update | :delete
+  defp kind_of("INSERT"), do: :insert
+  defp kind_of("UPDATE"), do: :update
+  defp kind_of("DELETE"), do: :delete
 
   @spec parsed({[token()], token()}) :: term()
   defp parsed({[{:word, _p, "INSERT", _l, _c} | rest], stop}), do: SQLDmlInsert.parse(rest, stop)

@@ -6,15 +6,20 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   #
   # Two rules fold, and only these:
   #
-  #   * two `IN` lists that are the two sides of one `AND` become the `IN` list of the values
-  #     they share, or `false` when they share none (`n IN (1, 2) AND n IN (3, 4)`). A one-element
-  #     list is an `IN` list here, so `n IN (1) AND n IN (2, 3)` folds; the two must be
-  #     adjacent in the tree (`n IN (1, 2) AND v > 0 AND n IN (3, 4)` does not fold), and
-  #     `NULL` shares nothing
+  #   * two `IN` lists of one operand become the `IN` list of the values they share, or `false`
+  #     when they share none (`n IN (1, 2) AND n IN (3, 4)`). A one-element list is an `IN` list
+  #     here, so `n IN (1) AND n IN (2, 3)` folds; the two must be adjacent in the tree (`n IN
+  #     (1, 2) AND v > 0 AND n IN (3, 4)` does not fold). The node `A AND (B AND R)` folds as
+  #     well when `A` is a leaf and the first predicate of its right operand is `B` (see
+  #     `InfluxElixir.Client.Local.SQLSimplify.nested_in?/1`), and not when `B` is deeper in a
+  #     right operand that starts with something else. A `NULL` in a list shares nothing, and a
+  #     list of nothing but `NULL` shares nothing with any list
   #   * among all the top-level conjuncts of what is left, two equalities of one operand to
   #     different values (`n = 1 AND v > 0 AND n = 2`); a one-element `IN` counts as an equality
-  #     here, but a longer one never does (`n = 1 AND n IN (2, 3)` does not fold), and no `OR`
-  #     or `NOT` is looked into (`(n = 1 AND n = 2) OR (n = 3 AND n = 4)` does not fold)
+  #     here (also when it is written with a value repeated, `n IN (1, 1)`), but a longer one
+  #     never does (`n = 1 AND n IN (2, 3)` does not fold, nor does `n IN (NULL, 1) AND n = 2`),
+  #     and no `OR` or `NOT` is looked into (`(n = 1 AND n = 2) OR (n = 3 AND n = 4)` does not
+  #     fold)
   #
   # The operand is any expression, compared by its text (`n + 1 = 1 AND n + 1 = 2`), the
   # literal any constant expression, and the two fold only when they are compared in the same
@@ -24,8 +29,11 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   # `' 1'`), else the column is compared as text; a string beside a float column is always text;
   # a number beside a text column is its text. A boolean never folds (`b = true AND b = false`).
   #
-  # What this does not know it says so (`unknown?/2`) instead of guessing: the caller refuses
-  # by name a query whose answer depends on it.
+  # The engine folds more than that, in ways the double has not verified: a `NULL` in an `IN`
+  # list beside an equality or a `NULL`, `time IS NULL` (time is never null), a `NOT IN` beside
+  # a test of its operand, a group of an `OR` that repeats a branch. What this does not know it
+  # says so (`unknown/3`, `uncertain?/2`, `grouped_overlap?/1`) instead of guessing: the caller
+  # refuses by name a query whose answer depends on it.
 
   alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLFold}
 
@@ -46,14 +54,39 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   """
   @spec intersect(clause(), clause(), types()) :: :none | :empty | {:ok, clause()}
   def intersect({:in, left, xs}, {:in, other, ys}, types) when is_list(xs) and is_list(ys) do
-    cond do
-      not same_operand?(left, other) -> :none
-      nulls?(xs) or nulls?(ys) -> :empty
-      true -> fold(left, xs, ys, types)
-    end
+    if same_operand?(left, other) and nil not in xs and nil not in ys,
+      do: intersect_lists(left, {xs, ys}, class(left, types), types),
+      else: :none
   end
 
   def intersect(_left, _right, _types), do: :none
+
+  @doc """
+  The same for two `IN` lists of which one holds a `NULL`: they fold into the list of the
+  values they share when they are the whole filter (`n IN (NULL, 1) AND n IN (2)`, verified);
+  beside other clauses the engine folds some and not others, and the double does not say.
+  """
+  @spec intersect_nulls(clause(), clause(), types()) :: :none | :empty | {:ok, clause()}
+  def intersect_nulls({:in, left, xs}, {:in, other, ys}, types)
+      when is_list(xs) and is_list(ys) do
+    if same_operand?(left, other) and (nil in xs or nil in ys),
+      do: intersect_lists(left, {xs, ys}, class(left, types), types),
+      else: :none
+  end
+
+  def intersect_nulls(_left, _right, _types), do: :none
+
+  @spec intersect_lists(operand(), {[term()], [term()]}, atom(), types()) ::
+          :none | :empty | {:ok, clause()}
+  defp intersect_lists(operand, {xs, ys}, class, types) do
+    cond do
+      nulls?(xs) and nulls?(ys) -> :empty
+      nulls?(xs) -> if plain_list?(class, ys), do: :empty, else: :none
+      nulls?(ys) -> if plain_list?(class, xs), do: :empty, else: :none
+      respelled?(class, xs) or respelled?(class, ys) -> :none
+      true -> fold(operand, xs, ys, types)
+    end
+  end
 
   @spec fold(operand(), [term()], [term()], types()) :: :none | :empty | {:ok, clause()}
   defp fold(operand, xs, ys, types) do
@@ -69,28 +102,282 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
     end
   end
 
-  @doc "Whether two equalities of the clauses (top-level conjuncts) are to different values."
+  @doc """
+  Whether two equalities of the clauses (top-level conjuncts) are to different values. The
+  equalities of an operand that is an expression (`abs(n) = 1 AND abs(n) = 2`) fold only when
+  the first conjunct is one of them (verified: with another conjunct before them, the engine
+  does not fold them), and are not looked into otherwise (`unknown/3` says so).
+  """
   @spec conflict?([clause()], types()) :: boolean()
   def conflict?(clauses, types) do
+    clauses |> conflicts(types) |> Enum.any?(&(is_binary(&1) or first?(&1, clauses, types)))
+  end
+
+  # The operands compared to different values.
+  @spec conflicts([clause()], types()) :: [term()]
+  defp conflicts(clauses, types) do
     clauses
     |> Enum.flat_map(&equality(&1, types))
     |> Enum.group_by(fn {operand, form, _value} -> {operand, form} end, &elem(&1, 2))
-    |> Enum.any?(fn {_group, values} -> not Enum.all?(values, &(&1 == hd(values))) end)
+    |> Enum.filter(fn {_group, values} -> not Enum.all?(values, &(&1 == hd(values))) end)
+    |> Enum.map(fn {{operand, _form}, _values} -> operand end)
+  end
+
+  # Whether the first conjunct is an equality of the operand.
+  @spec first?(term(), [clause()], types()) :: boolean()
+  defp first?(operand, [first | _rest], types),
+    do: Enum.any?(equality(first, types), &(elem(&1, 0) == operand))
+
+  defp first?(_operand, [], _types), do: false
+
+  # Whether an expression is compared to different values where the double does not know that
+  # the engine folds them (the first conjunct is not one of them).
+  @spec late_conflict?([clause()], types()) :: boolean()
+  defp late_conflict?(clauses, types) do
+    clauses
+    |> conflicts(types)
+    |> Enum.any?(&(is_tuple(&1) and not first?(&1, clauses, types)))
   end
 
   @doc """
-  Whether the clauses compare one operand to two or more literals of which one is of a kind
-  that is not modelled, so that whether they fold is not known.
+  What the double does not know of a `WHERE` that has a negation: `:uncertain` when it holds a
+  shape the double has no verified rule for (see `uncertain?/2`) or compares an expression to
+  different values with a first conjunct that is none of them (the engine folds only those),
+  `:literals` when its top-level conjuncts compare one operand to two or more different
+  literals of which one is of a kind that is not modelled, else `nil`. `clauses` are the
+  predicates wherever they stand, `where` the conjuncts of the whole (the engine looks into no
+  `OR` or `NOT` for equalities that contradict).
   """
-  @spec unknown?([clause()], types()) :: boolean()
-  def unknown?(clauses, types) do
+  @spec unknown([clause()], [term()], types()) :: :uncertain | :literals | nil
+  def unknown(clauses, where, types) do
+    cond do
+      uncertain?(clauses, types) or late_conflict?(where, types) -> :uncertain
+      shared_unmodelled?(where, types) -> :literals
+      true -> nil
+    end
+  end
+
+  @doc """
+  Whether an operand that an `OR` or a `NOT` of a `WHERE` compares to literals is also tested
+  by the whole: the engine simplifies the group first (it drops a repeated branch, and the
+  equalities of an `OR` are one `IN` list) and may then fold it with an `IN` list of two or
+  more values of that operand at the top (`n IN (3, 4) AND (n IN (2, 2) OR n = 1)`), or with
+  an equality when it dropped a branch (`n = 2 AND (n = 1 OR 1 = n)`). A group of different
+  values beside an equality is not (`n = 1 AND (n = 2 OR n = 3)`, verified).
+  """
+
+  @spec grouped_overlap?([term()]) :: boolean()
+  def grouped_overlap?(where) do
+    top_lists =
+      for {:in, operand, literals} <- where,
+          is_list(literals),
+          match?([_first, _second | _more], Enum.uniq(literals)),
+          do: operand_key(operand)
+
+    top = for {op, operand, _rest} <- where, op in [:eq, :in, :not_in], do: operand_key(operand)
+
+    where
+    |> Enum.flat_map(&groups/1)
+    |> Enum.any?(fn items -> Enum.any?(items, &overlaps?(&1, items, top_lists, top)) end)
+  end
+
+  @spec overlaps?({term(), [term()]}, [{term(), [term()]}], [term()], [term()]) ::
+          boolean()
+  defp overlaps?({key, _literals}, items, top_lists, top) do
+    literals = for {^key, list} <- items, value <- list, do: value
+    key in top_lists or (key in top and length(literals) != length(Enum.uniq(literals)))
+  end
+
+  @doc """
+  Whether a `WHERE` tests one operand with an `IN` list and a `NOT IN` list of which one holds
+  a `NULL`: the engine takes the one list out of the other (`n IN (5, NULL) AND n NOT IN (NULL,
+  3)` keeps `n = 5`, verified), where three-valued logic keeps no row, and the double does not
+  model that.
+  """
+  @spec null_difference?([term()]) :: boolean()
+  def null_difference?(where) do
+    lists = where |> collect_lists([]) |> Enum.reverse()
+
+    Enum.any?(lists, fn
+      {:in, key, literals} ->
+        Enum.any?(lists, fn
+          {:not_in, ^key, other} -> nil in literals or nil in other
+          _other -> false
+        end)
+
+      _not_in ->
+        false
+    end)
+  end
+
+  @spec collect_lists(term(), [{atom(), term(), [term()]}]) :: [{atom(), term(), [term()]}]
+  defp collect_lists({op, operand, literals}, found)
+       when op in [:in, :not_in] and is_list(literals),
+       do: [{op, operand_key(operand), literals} | found]
+
+  defp collect_lists({:or, branches}, found), do: collect_lists(Enum.concat(branches), found)
+  defp collect_lists({:not, nodes}, found), do: collect_lists(nodes, found)
+
+  defp collect_lists(nodes, found) when is_list(nodes),
+    do: Enum.reduce(nodes, found, &collect_lists/2)
+
+  defp collect_lists(_node, found), do: found
+
+  # The comparisons to literals of each `OR` and `NOT` group of a clause, as `{operand, list}`.
+  @spec groups(term()) :: [[{term(), [term()]}]]
+  defp groups({:or, branches}), do: group_of(Enum.concat(branches))
+  defp groups({:not, nodes}), do: group_of(nodes)
+  defp groups(_clause), do: []
+
+  @spec group_of([term()]) :: [[{term(), [term()]}]]
+  defp group_of(nodes) do
+    items =
+      for {op, operand, rest} <- nodes,
+          is_tuple(operand) or is_binary(operand),
+          op in [:eq, :in, :not_in],
+          do: {operand_key(operand), List.wrap(rest)}
+
+    [items | Enum.flat_map(nodes, &groups/1)]
+  end
+
+  # Shapes whose folding the double has not verified, so that it does not guess:
+  #
+  #   * a `NULL` in an `IN` list beside a clause the engine folds it with in a way the double
+  #     does not read (see `foldable_with_null?/3`), and a `NOT IN` list with a `NULL`
+  #   * a test of `time` for `NULL` (it is never null, and the engine proves it)
+  #   * a `NOT IN` beside another test of its operand
+  #   * a list whose literals are written in different spellings of one value (`IN (1, '1')`)
+  #   * an integer equal to a float beside two more tests (the engine fails internally)
+  @doc "Whether the clauses hold a shape of the kind named above."
+  @spec uncertain?([clause()], types()) :: boolean()
+  def uncertain?(clauses, types) do
+    Enum.any?(clauses, &time_null?/1) or null_list_beside?(clauses) or
+      not_in_beside?(clauses) or Enum.any?(clauses, &respelled_clause?(&1, types)) or
+      float_beside?(clauses, types)
+  end
+
+  @spec time_null?(clause()) :: boolean()
+  defp time_null?({op, "time", _nil}) when op in [:is_null, :is_not_null], do: true
+  defp time_null?(_clause), do: false
+
+  @spec null_list_beside?([clause()]) :: boolean()
+  defp null_list_beside?(clauses) do
+    Enum.any?(clauses, fn
+      {:not_in, _operand, literals} when is_list(literals) ->
+        nil in literals
+
+      {:in, operand, literals} = clause when is_list(literals) ->
+        nil in literals and
+          Enum.any?(List.delete(clauses, clause), &foldable_with_null?(&1, operand, literals))
+
+      _clause ->
+        false
+    end)
+  end
+
+  # Whether a clause beside `operand IN (literals)`, which holds a `NULL`, is folded with it
+  # in a way the double does not read. Verified on Core: a range comparison with a value is
+  # not, and an equality is not with a list that holds a value beside its `NULL` (`n IN (NULL,
+  # 1) AND n = 2` is not empty). A list of nothing but `NULL` is a `NULL` to the engine, which
+  # folds it with most things; any list with a `NULL` is folded with a `NULL`, a test for
+  # `NULL`, a `NOT IN` of its operand and an `IN` list of its operand that is not beside it in
+  # the tree (the double reads only the lists that are, `intersect/3`).
+  @spec foldable_with_null?(clause(), term(), [term()]) :: boolean()
+  defp foldable_with_null?({op, _operand, value}, _other, _literals)
+       when op in [:gt, :gte, :lt, :lte],
+       do: value == nil
+
+  defp foldable_with_null?({:eq, _operand, nil}, _other, _literals), do: true
+  defp foldable_with_null?({:eq, _operand, _literal}, _other, literals), do: nulls?(literals)
+
+  defp foldable_with_null?({:in, operand, list}, other, literals) when is_list(list),
+    do: operand_key(operand) == operand_key(other) or nulls?(literals) or nulls?(list)
+
+  defp foldable_with_null?({:not_in, operand, _list}, other, literals),
+    do: operand_key(operand) == operand_key(other) or nulls?(literals)
+
+  defp foldable_with_null?({:truthy_expr, _expr, _nil}, _other, _literals), do: true
+
+  defp foldable_with_null?({op, _operand, _nil}, _other, _literals)
+       when op in [:is_null, :is_not_null],
+       do: true
+
+  defp foldable_with_null?(_clause, _other, _literals), do: false
+
+  # An integer operand compared for equality to a float and to something else, with a third
+  # test in the query: the engine's range analysis fails with an internal error (verified:
+  # `n IN (2) AND n > 0 AND n = 1.5`, `n IN (2) AND g > 0 AND n = 1.5`), which the double does
+  # not reproduce.
+  @spec float_beside?([clause()], types()) :: boolean()
+  defp float_beside?(clauses, types) do
+    Enum.any?(clauses, fn clause ->
+      with {op, operand, rest} when op in [:eq, :in] <- clause,
+           true <- class(operand, types) in [:i64, :u64],
+           true <- Enum.any?(List.wrap(rest), &is_float/1) do
+        length(clauses) >= 3 and
+          Enum.count(clauses, &(elem(&1, 0) in [:eq, :in] and elem(&1, 1) == operand)) >= 2
+      else
+        _other -> false
+      end
+    end)
+  end
+
+  @spec not_in_beside?([clause()]) :: boolean()
+  defp not_in_beside?(clauses) do
+    tested =
+      for {op, operand, _rest} <- clauses, op in [:eq, :in], do: operand_key(operand)
+
+    Enum.any?(clauses, fn
+      {:not_in, operand, _literals} -> operand_key(operand) in tested
+      _clause -> false
+    end)
+  end
+
+  @spec respelled_clause?(clause(), types()) :: boolean()
+  defp respelled_clause?({:in, operand, literals}, types) when is_list(literals),
+    do: respelled?(class(operand, types), literals)
+
+  defp respelled_clause?(_clause, _types), do: false
+
+  # A list of several literals the engine reads as one value (`IN (1, '1')`).
+  @spec respelled?(atom(), [term()]) :: boolean()
+  defp respelled?(class, literals) do
+    match?([_, _ | _], literals |> Enum.reject(&is_nil/1) |> Enum.uniq()) and
+      match?({_form, [_one]}, list_keys(class, literals))
+  end
+
+  # A list of literals of the kind of the column itself (`NULL` aside), none of them a string
+  # beside a number.
+  @spec plain_list?(atom(), [term()]) :: boolean()
+  defp plain_list?(class, literals) do
+    Enum.all?(literals, fn
+      nil ->
+        true
+
+      literal ->
+        case {class, key(class, literal)} do
+          {:text, {:text, _text}} -> is_binary(literal)
+          {class, {class, _value}} when class in [:i64, :u64, :f64] -> not is_binary(literal)
+          _other -> false
+        end
+    end)
+  end
+
+  @spec shared_unmodelled?([clause()], types()) :: boolean()
+  defp shared_unmodelled?(clauses, types) do
     clauses
     |> Enum.flat_map(&compared/1)
     |> Enum.group_by(&operand_key(elem(&1, 0)), & &1)
     |> Enum.any?(fn {_operand, members} ->
-      match?([_, _ | _], members) and Enum.any?(members, &unmodelled?(&1, types))
+      match?([_, _ | _], members) and differing?(members) and
+        Enum.any?(members, &unmodelled?(&1, types))
     end)
   end
+
+  # Two or more different literals: the same one written again cannot contradict itself.
+  @spec differing?([{operand(), :eq | :in, [term()]}]) :: boolean()
+  defp differing?(members),
+    do: match?([_, _ | _], members |> Enum.flat_map(&elem(&1, 2)) |> Enum.uniq())
 
   # ---------------------------------------------------------------------------
   # The clauses
@@ -105,9 +392,14 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
     end
   end
 
+  # A list is an equality when it is one literal, however often it is written (`n IN (1, 1)`,
+  # verified); a `NULL` or a second literal of another spelling (`IN (1, '1')`, `IN (NULL, 1)`)
+  # makes it no equality, and `unknown?/2` says that the engine's reading of it is not known.
   defp equality({:in, operand, literals}, types) when is_list(literals) do
-    case list_keys(class(operand, types), literals) do
-      {form, [{value, _original}]} -> [{operand_key(operand), form, value}]
+    with [_one] <- Enum.uniq(literals),
+         {form, [{value, _original}]} <- list_keys(class(operand, types), literals) do
+      [{operand_key(operand), form, value}]
+    else
       _other -> []
     end
   end
@@ -179,11 +471,7 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   end
 
   @spec operand_type(operand(), types()) :: term()
-  defp operand_type({:expr, expr}, types) do
-    SQLExprType.known_type(expr, types)
-  rescue
-    _error -> nil
-  end
+  defp operand_type({:expr, expr}, types), do: SQLExprType.known_type(expr, types)
 
   defp operand_type(column, types), do: Map.get(types, column)
 

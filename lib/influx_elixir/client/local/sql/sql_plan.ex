@@ -80,7 +80,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
           placeholder: nil | failure(),
           limit: nil | failure(),
           ordinal: nil | failure(),
-          unused: [binary()] | nil
+          unused: SQLPrune.marks() | nil
         ]
 
   @doc """
@@ -162,7 +162,12 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   # The negations the engine never meets, whose errors are dropped (see `SQLPrune`): asked
   # about only for a negation that fails, so a query without one pays nothing.
-  @spec prune([point()], SQLParser.parsed_query(), (binary() -> boolean()), [binary()] | nil) ::
+  @spec prune(
+          [point()],
+          SQLParser.parsed_query(),
+          (binary() -> boolean()),
+          SQLPrune.marks() | nil
+        ) ::
           (term() -> SQLPrune.verdict())
   defp prune(points, query, unsigned?, unused) do
     types = fn names -> column_types(points, names, unsigned?) end
@@ -792,18 +797,50 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     case mode.prune.(item) do
       :keep -> outcome
       :drop -> :ok
-      :unknown -> {:error, unknown_prune()}
+      {:unknown, cause} -> {:error, unknown_prune(cause)}
     end
   end
 
   defp pruned(outcome, _item, _mode), do: outcome
 
-  @spec unknown_prune() :: map()
-  defp unknown_prune do
+  @spec unknown_prune(SQLPrune.cause()) :: map()
+  defp unknown_prune(:literals) do
     SQLError.refusal(
       "a negation that fails beside equalities of one expression to literals of a kind not " <>
         "modelled: whether the engine proves the query empty before it plans the negation is " <>
         "not known"
+    )
+  end
+
+  defp unknown_prune(:uncertain) do
+    SQLError.refusal(
+      "a negation that fails beside a NULL in an IN list, a test of time for NULL, or a NOT IN " <>
+        "beside another test of its operand: whether the engine proves the query empty before " <>
+        "it plans the negation is not known"
+    )
+  end
+
+  defp unknown_prune(:nested) do
+    SQLError.refusal(
+      "a negation that fails beside two IN lists of one operand where the second starts a " <>
+        "nested AND: whether the engine folds them, and so proves the query empty before it " <>
+        "plans the negation, is not known"
+    )
+  end
+
+  defp unknown_prune(:grouped) do
+    SQLError.refusal(
+      "a negation that fails beside an operand that the conjunction and an OR or NOT of it " <>
+        "both test: whether the engine folds them, and so proves the query empty before it " <>
+        "plans the negation, is not known"
+    )
+  end
+
+  defp unknown_prune(:outer) do
+    SQLError.refusal(
+      "a negation in a common table expression beside a query that may fold its WHERE to " <>
+        "nothing, which the double cannot tell without the types of the expression's columns: " <>
+        "whether the engine plans the expression is not known"
     )
   end
 

@@ -562,7 +562,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
           assert late["open"] === 60 and late["high"] === 60 and late["close"] === 60
 
           # selector_*['time'] is a DateTime on every transport.
-          assert early["low_at"] ==
+          assert early["low_at"] ===
                    ctx.agg_base_ts
                    |> DateTime.from_unix!(:nanosecond)
                    |> DateTime.truncate(:microsecond)
@@ -782,7 +782,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
 
           {:ok, rows} = unquote(client).query_sql(ctx.conn, sql, database: ctx.database)
 
-          assert Enum.map(rows, &{&1["open"], &1["high"], &1["close"]}) ==
+          assert Enum.map(rows, &{&1["open"], &1["high"], &1["close"]}) ===
                    [{2.0, 2.0, 2.0}, {3.0, 3.0, 3.0}, {6.0, 6.0, 6.0}]
         end
 
@@ -836,7 +836,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                    ctx,
                    "host",
                    "SELECT host FROM contract_wh WHERE v > 3 OR v < 2 ORDER BY host"
-                 ) ==
+                 ) ===
                    ["a", "d", "e"]
 
           assert InfluxElixir.ClientContract.column(
@@ -844,7 +844,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                    ctx,
                    "host",
                    "SELECT host FROM contract_wh WHERE host = 'a' OR host = 'b' AND v > 2 ORDER BY host"
-                 ) ==
+                 ) ===
                    ["a", "b"]
 
           assert InfluxElixir.ClientContract.column(
@@ -852,7 +852,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                    ctx,
                    "host",
                    "SELECT host FROM contract_wh WHERE (host = 'a' OR host = 'b') AND v > 2"
-                 ) ==
+                 ) ===
                    ["b"]
 
           assert InfluxElixir.ClientContract.column(
@@ -860,7 +860,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                    ctx,
                    "host",
                    "SELECT host FROM contract_wh WHERE NOT (host = 'a' OR host = 'b') ORDER BY host"
-                 ) ==
+                 ) ===
                    ["c", "d", "e"]
 
           assert InfluxElixir.ClientContract.column(
@@ -868,7 +868,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                    ctx,
                    "host",
                    "SELECT host FROM contract_wh WHERE v <> 1.0 ORDER BY host"
-                 ) ==
+                 ) ===
                    ["b", "c", "d", "e"]
         end
 
@@ -885,7 +885,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                  ctx,
                  "host",
                  "SELECT host FROM contract_wh WHERE v BETWEEN 2 AND 3 ORDER BY host"
-               ) ==
+               ) ===
                  ["b", "c"]
 
         assert InfluxElixir.ClientContract.column(
@@ -893,7 +893,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                  ctx,
                  "host",
                  "SELECT host FROM contract_wh WHERE v NOT BETWEEN 2 AND 3 ORDER BY host"
-               ) ==
+               ) ===
                  ["a", "d", "e"]
 
         assert InfluxElixir.ClientContract.column(
@@ -901,7 +901,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                  ctx,
                  "host",
                  "SELECT host FROM contract_wh WHERE time BETWEEN '2023-11-14T22:13:22Z' AND '2023-11-14T22:13:23Z' ORDER BY host"
-               ) ==
+               ) ===
                  ["b", "c"]
 
         assert InfluxElixir.ClientContract.column(
@@ -930,7 +930,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                  ctx,
                  "host",
                  "SELECT host FROM contract_wh WHERE host NOT LIKE 'a%' ORDER BY host"
-               ) ==
+               ) ===
                  ["b", "c", "d", "e"]
 
         assert InfluxElixir.ClientContract.column(
@@ -952,7 +952,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                  ctx,
                  "host",
                  "SELECT host FROM contract_wh WHERE rack >= 10 ORDER BY host"
-               ) ==
+               ) ===
                  ["b", "d", "e"]
 
         assert {:error,
@@ -993,7 +993,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                    ctx,
                    "level",
                    "SELECT level FROM contract_cast WHERE CAST(level AS INTEGER) <= 20 AND symbol = 'X' ORDER BY time"
-                 ) ==
+                 ) ===
                    ["5", "20"]
 
           assert InfluxElixir.ClientContract.column(
@@ -1001,7 +1001,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                    ctx,
                    "level",
                    "SELECT level FROM contract_cast WHERE level::INTEGER <= 20 AND symbol = 'X' ORDER BY time"
-                 ) ==
+                 ) ===
                    ["5", "20"]
 
           assert InfluxElixir.ClientContract.column(
@@ -1009,7 +1009,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
                    ctx,
                    "level",
                    "SELECT level FROM contract_cast WHERE symbol = 'X' ORDER BY CAST(level AS INTEGER) DESC"
-                 ) ==
+                 ) ===
                    ["100", "20", "5"]
 
           {:ok, [row]} =
@@ -1028,7 +1028,7 @@ defmodule InfluxElixir.ClientContract.SqlQuery do
               database: ctx.database
             )
 
-          assert Enum.map(rows, &{&1["symbol"], &1["level"]}) ==
+          assert Enum.map(rows, &{&1["symbol"], &1["level"]}) ===
                    [{"Y", "20"}, {"X", "5"}, {"X", "20"}, {"X", "100"}]
         end
 

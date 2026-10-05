@@ -24,10 +24,6 @@ defmodule InfluxElixir.Client.Local.SQLShow do
 
   alias InfluxElixir.Client.Local.{SQLError, SQLTable}
 
-  @system_tables ~w(distinct_caches influxdb_schema last_caches parquet_files
-    processing_engine_logs processing_engine_trigger_arguments processing_engine_triggers
-    queries)
-
   @show ~r/\A\s*SHOW\s+(?:(TABLES)|COLUMNS\s+(?:FROM|IN)\s+([\p{L}\p{N}_$.]+))\s*\z/iu
 
   @describe ~r/\A\s*DESC(?:RIBE)?\s+((?:EXTENDED|FORMATTED)\s+)?([\p{L}\p{N}_$.]+)\s*\z/iu
@@ -94,13 +90,11 @@ defmodule InfluxElixir.Client.Local.SQLShow do
     end
   end
 
-  defp columns("information_schema", name, form) when name in ~w(tables columns schemata),
-    do: {:ok, columns_sql("information_schema", name, form), nil}
-
-  defp columns("system", name, form) when name in @system_tables,
-    do: {:ok, columns_sql("system", name, form), nil}
-
-  defp columns(schema, name, _form), do: unresolved(schema <> "." <> name)
+  defp columns(schema, name, form) do
+    if SQLTable.modelled?(schema, name),
+      do: {:ok, columns_sql(schema, name, form), nil},
+      else: unresolved(schema <> "." <> name)
+  end
 
   # A table the engine has not (or a view the double does not model): the
   # error of reading it in a `FROM`.

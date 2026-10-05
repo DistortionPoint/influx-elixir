@@ -2501,7 +2501,7 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                      %{
                        status: 400,
                        body:
-                         "Client.Local: a cast to #{arrow}: the double does not model that type"
+                         "Client.Local: a cast of a column to #{arrow}: the double does not model that type"
                      }}
                 ),
               else: assert(result === {:ok, [%{"c" => 5}]})

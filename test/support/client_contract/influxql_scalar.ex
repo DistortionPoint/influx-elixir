@@ -110,10 +110,10 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
         end
 
         test "a missing tag is the empty string; regexes are unanchored", ctx do
-          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "host =~ /h1/") ==
+          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "host =~ /h1/") ===
                    [1, 3]
 
-          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "host =~ /^h1$/") ==
+          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "host =~ /^h1$/") ===
                    [1]
 
           assert InfluxElixir.ClientContract.where_values(
@@ -122,10 +122,10 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                    "host =~ /(?i)h1/"
                  ) === [1, 3, 5]
 
-          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "host !~ /h1/") ==
+          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "host !~ /h1/") ===
                    [6, 2, 4, 5]
 
-          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "host != 'h1'") ==
+          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "host != 'h1'") ===
                    [6, 2, 3, 4, 5]
 
           assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "host = ''") === [
@@ -134,7 +134,7 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
         end
 
         test "ordering a tag, or a regex on a field, is false", ctx do
-          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "host > 'h0'") ==
+          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "host > 'h0'") ===
                    []
 
           assert InfluxElixir.ClientContract.where_values(
@@ -159,7 +159,7 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                    "time > now() - 1h AND time < now() - 5m"
                  ) === [2, 3, 4]
 
-          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "\"host\" = 'h2'") ==
+          assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "\"host\" = 'h2'") ===
                    [2]
         end
 
@@ -214,7 +214,7 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                  "v > -.5 AND v < +2.0"
                ) === [1]
 
-        assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "v >= 004") ==
+        assert InfluxElixir.ClientContract.where_values(unquote(client), ctx, "v >= 004") ===
                  [6, 4, 5]
       end
 
@@ -358,7 +358,7 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
               database: ctx.database
             )
 
-          assert Enum.map(keys, &{&1["fieldKey"], &1["fieldType"]}) ==
+          assert Enum.map(keys, &{&1["fieldKey"], &1["fieldType"]}) ===
                    [{"s", "string"}, {"v", "integer"}, {"w", "integer"}]
         end
       end
@@ -628,7 +628,7 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                    "abs(f) BETWEEN 1 AND 3"
                  ) === [1, 2]
 
-          assert InfluxElixir.ClientContract.unix_times(unquote(client), ctx, "abs(f) IN (2.5)") ==
+          assert InfluxElixir.ClientContract.unix_times(unquote(client), ctx, "abs(f) IN (2.5)") ===
                    [1, 2]
 
           assert InfluxElixir.ClientContract.unix_times(
@@ -637,10 +637,10 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                    "abs(f) NOT IN (2.5)"
                  ) === [3]
 
-          assert InfluxElixir.ClientContract.unix_times(unquote(client), ctx, "abs(f) IS NULL") ==
+          assert InfluxElixir.ClientContract.unix_times(unquote(client), ctx, "abs(f) IS NULL") ===
                    [4]
 
-          assert InfluxElixir.ClientContract.unix_times(unquote(client), ctx, "abs(f * 2) = 5") ==
+          assert InfluxElixir.ClientContract.unix_times(unquote(client), ctx, "abs(f * 2) = 5") ===
                    [1, 2]
 
           assert InfluxElixir.ClientContract.unix_times(
@@ -725,7 +725,7 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                      "SELECT f FROM #{ctx.m} WHERE abs(firm) > 1"
                    )
 
-          assert body ==
+          assert body ===
                    "type_coercion\ncaused by\n" <>
                      head <>
                      " No function matches the given name and argument types " <>
@@ -739,7 +739,7 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                      "SELECT f FROM #{ctx.m} WHERE floor(b) > 1"
                    )
 
-          assert body ==
+          assert body ===
                    "type_coercion\ncaused by\nError during planning: Failed to coerce arguments " <>
                      "to satisfy a call to 'floor' function: coercion from Boolean to the " <>
                      "signature Uniform(1, [Float64, Float32]) failed No function matches the " <>
@@ -753,7 +753,7 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                      "SELECT f FROM #{ctx.m} ORDER BY abs(time)"
                    )
 
-          assert body ==
+          assert body ===
                    "type_coercion\ncaused by\nError during planning: Function 'abs' expects " <>
                      "NativeType::Numeric but received NativeType::Timestamp(Nanosecond, None)"
         end
@@ -766,7 +766,7 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                      "SELECT f FROM #{ctx.m} WHERE abs(f, 1) > 1"
                    )
 
-          assert body ==
+          assert body ===
                    "type_coercion\ncaused by\nError during planning: Function 'abs' expects 1 " <>
                      "arguments but received 2 No function matches the given name and " <>
                      "argument types 'abs(Float64, Int64)'. You might need to add explicit " <>
@@ -783,7 +783,7 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                      "SELECT round() AS r FROM #{ctx.m}"
                    )
 
-          assert body ==
+          assert body ===
                    "Error during planning: 'round' does not support zero arguments No " <>
                      "function matches the given name and argument types 'round()'. You " <>
                      "might need to add explicit type casts." <> round_candidates
@@ -795,7 +795,7 @@ defmodule InfluxElixir.ClientContract.InfluxqlScalar do
                      "SELECT round(f, 1.5) AS r FROM #{ctx.m}"
                    )
 
-          assert body ==
+          assert body ===
                    "Error during planning: Failed to coerce arguments to satisfy a call to " <>
                      "'round' function: coercion from Float64, Float64 to the signature " <>
                      "OneOf([Exact([Float64, Int64]), Exact([Float32, Int64]), " <>

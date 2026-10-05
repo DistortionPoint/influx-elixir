@@ -132,7 +132,7 @@ defmodule InfluxElixir.OptionalDependencyTest do
       end
       """
 
-      assert source |> parse() |> compile_time_needs(Decimal) ==
+      assert source |> parse() |> compile_time_needs(Decimal) ===
                [{4, :struct}, {5, :struct}]
     end
 
@@ -150,7 +150,7 @@ defmodule InfluxElixir.OptionalDependencyTest do
       end
       """
 
-      assert source |> parse() |> compile_time_needs(Decimal) ==
+      assert source |> parse() |> compile_time_needs(Decimal) ===
                [
                  {2, :import},
                  {3, :import},

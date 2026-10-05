@@ -43,11 +43,11 @@ defmodule InfluxElixir.Client.Local.SQLScalarRefusalsTest do
            "Client.Local: a timestamp concatenated as text: the engine writes its " <>
              "nanoseconds, which the double keeps only to the microsecond"},
           {"SELECT coalesce(n, s) FROM m",
-           "Client.Local: COALESCE of an integer with text: the engine casts the text to the " <>
+           "Client.Local: COALESCE of an integer with text in a select list: the engine casts the text to the " <>
              "number when it runs the plan (and closes the connection when a value does not " <>
              "cast), which is not modelled"},
           {"SELECT nullif(n, s) FROM m",
-           "Client.Local: NULLIF of an integer with text: the engine casts the text to the " <>
+           "Client.Local: NULLIF of an integer with text in a select list: the engine casts the text to the " <>
              "number when it runs the plan (and closes the connection when a value does not " <>
              "cast), which is not modelled"},
           {"SELECT nosuch(a => 1) AS r",

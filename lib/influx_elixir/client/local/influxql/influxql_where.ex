@@ -47,7 +47,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         # The planner raises the error of a comparison, and that of a connective it cannot type,
         # as it builds the filter, leaves first and in order: each comparison of a condition with
         # a bare operand is planned as the connectives are typed.
-        leaf = &plan_comparisons(&1, ctx, %{times | alone: false})
+        leaf = &plan_comparisons(&1, ctx, %{times | alone: false}, &2)
 
         {deferred, {sql, bounds, checks}} =
           case InfluxQLTyped.bare_condition(tree, ctx, Keyword.get(opts, :filter), leaf) do
@@ -315,21 +315,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   # A comparison of a condition with a bare operand, planned for the error the planner raises
   # at it (see `late_clash`). A comparison the double refuses is found among the connectives'
-  # errors in an order it does not tell, and it refuses the whole.
-  @spec plan_comparisons(tuple(), {MapSet.t(binary()), map()}, map()) :: term()
-  defp plan_comparisons({:cmp, tokens} = leaf, ctx, times) do
-    # A column the measurement lacks, and a comparison of constants (the engine folds it), are
-    # typed in ways of their own beside a bare operand (verified: `nosuch AND s` is an error,
-    # `nosuch AND u` none).
-    if (absent_column?(tokens, times.known) and MapSet.size(times.known || MapSet.new()) > 0) or
-         constants_comparison?(tokens),
-       do:
-         throw(
-           {:refused,
-            "unsupported InfluxQL (a bare non-boolean operand beside a column the " <>
-              "measurement lacks or a comparison of constants)"}
-         )
+  # errors in an order it does not tell, and it refuses the whole. A comparison of constants
+  # and one of a column the measurement lacks raise no error of their own beside a bare operand
+  # (verified over every kind of operand and pairs and chains of three), and are not planned:
+  # the pair they are in keeps no point (see `InfluxQLTyped`).
+  @spec plan_comparisons(tuple(), {MapSet.t(binary()), map()}, map(), boolean()) :: term()
+  defp plan_comparisons({:cmp, tokens} = leaf, ctx, times, other_bare?) do
+    cond do
+      constants_comparison?(tokens) -> check_constants(tokens)
+      absent_leaf?(tokens, times.known) -> check_absent(tokens, ctx, other_bare?)
+      true -> plan_leaf(leaf, ctx, times)
+    end
+  end
 
+  defp plan_leaf(leaf, ctx, times) do
     plan(leaf, ctx, times)
   catch
     {:refused, _reason} ->
@@ -343,6 +342,73 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     Enum.any?(tokens, &match?({:op, _op}, &1)) and
       not Enum.any?(tokens, &(match?({:ident, _name}, &1) or InfluxQLTokens.time?(&1)))
   end
+
+  # Of the comparisons of constants those of numbers, strings and regular expressions are
+  # verified (mixed, too: `'a' = 1`), and arithmetic over one kind of constant; arithmetic over
+  # strings and numbers (`1 = 1 + 'a'`) is typed as a null, and the rest (booleans, durations,
+  # `now()`) is not verified.
+  defp check_constants(tokens) do
+    kinds = for token <- tokens, kind = constant_kind(token), uniq: true, do: kind
+
+    operands = kinds -- [:arithmetic]
+
+    if :other in kinds or
+         (:arithmetic in kinds and (length(operands) > 1 or :bool in operands)),
+       do:
+         throw(
+           {:refused, "unsupported InfluxQL (a bare operand beside that comparison of constants)"}
+         ),
+       else: :ok
+  end
+
+  defp constant_kind({:number, _text}), do: :number
+  defp constant_kind({:str, _content}), do: :string
+  defp constant_kind({:regex, _pattern}), do: :regex
+  defp constant_kind({:raw, op}) when op in ["+", "-", "*", "/"], do: :arithmetic
+  defp constant_kind({:raw, paren}) when paren in ["(", ")"], do: nil
+  defp constant_kind({:op, _op}), do: nil
+
+  defp constant_kind({:raw, word}),
+    do: if(String.upcase(word) in ["TRUE", "FALSE"], do: :bool, else: :other)
+
+  defp constant_kind(_token), do: :other
+
+  defp absent_leaf?(_tokens, nil), do: false
+
+  defp absent_leaf?(tokens, known),
+    do: MapSet.size(known) > 0 and absent_column?(tokens, known)
+
+  # A column the measurement lacks, compared with a number (or another such column), is typed
+  # as a null number: beside a bare string, tag or other non-number the planner's error is
+  # raised (verified: `nosuch = 1 AND s` is an error, `nosuch = 1 AND n` and `nosuch = 's'
+  # AND s` are none). Beside non-number bare operands only the comparison with a string, a
+  # regular expression, a boolean or a tag is known to keep no error.
+  defp check_absent(_tokens, _ctx, false), do: :ok
+
+  defp check_absent(tokens, {tags, _types}, true) do
+    case tokens do
+      [{:ident, _name}, {:op, _op}, partner] -> string_partner?(partner, tags)
+      [partner, {:op, _op}, {:ident, _name}] -> string_partner?(partner, tags)
+      _other -> false
+    end
+    |> case do
+      true ->
+        :ok
+
+      false ->
+        throw(
+          {:refused,
+           "unsupported InfluxQL (a bare string or tag beside a comparison of a column " <>
+             "the measurement lacks)"}
+        )
+    end
+  end
+
+  defp string_partner?({:str, _content}, _tags), do: true
+  defp string_partner?({:regex, _pattern}, _tags), do: true
+  defp string_partner?({:raw, word}, _tags), do: String.upcase(word) in ["TRUE", "FALSE"]
+  defp string_partner?({:ident, name}, tags), do: MapSet.member?(tags, name)
+  defp string_partner?(_token, _tags), do: false
 
   defp join_plans(nodes, separator, ctx, times) do
     {sqls, lowers, checks} = nodes |> Enum.map(&plan(&1, ctx, times)) |> unzip3()

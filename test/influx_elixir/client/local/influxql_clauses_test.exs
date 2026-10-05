@@ -44,6 +44,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
           Local.query_influxql(conn, statement, database: "clauses_db")
         rescue
           exception -> {:raised, Exception.message(exception)}
+        catch
+          kind, reason -> {kind, reason}
         end
 
       assert match?({:ok, rows} when is_list(rows), answer) or
@@ -87,18 +89,129 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
                ~s|Parsing Error: Nom("LIMIT 2 OFFSET 1", Tag)|
   end
 
-  test "no atom is made from the text of a statement" do
-    # The first statement in a fresh VM met an atom that did not exist yet, and raised; a
-    # test cannot make a VM fresh, so the source is read for the calls that make atoms.
-    offenders =
-      for file <- Path.wildcard("lib/influx_elixir/client/local/influxql/*.ex"),
-          {line, number} <- file |> File.read!() |> String.split("\n") |> Enum.with_index(1),
-          String.match?(
-            line,
-            ~r/\b(?:to_atom|to_existing_atom|binary_to_atom|binary_to_existing_atom)\b/
-          ),
-          do: "#{file}:#{number}"
+  # A text no atom exists for: the VM has not met it, and no other test can write it.
+  defp unique_text, do: "zz_" <> Integer.to_string(System.unique_integer([:positive]))
 
-    assert offenders === []
+  defp answered?(answer),
+    do:
+      match?({:ok, rows} when is_list(rows), answer) or
+        match?(
+          {:error, %{status: status, body: body}}
+          when status in [400, 404, 405, 500] and is_binary(body),
+          answer
+        )
+
+  defp ask(fun, statement) do
+    answer =
+      try do
+        fun.(statement)
+      rescue
+        exception -> {:raised, Exception.message(exception)}
+      catch
+        kind, reason -> {kind, reason}
+      end
+
+    assert answered?(answer), "#{statement} => #{inspect(answer)}"
+  end
+
+  describe "no atom is made from the text of a statement" do
+    # The first statement in a fresh VM met an atom that did not exist yet, and raised. A
+    # test cannot make a VM fresh, but it can use a text that no atom exists for and ask the
+    # VM, after the statements, whether one was made for it: `String.to_existing_atom/1` of
+    # the text raises when none was. The text stands where the statements read names and
+    # operands: as a measurement, a field, a tag, a function, a time unit, and the operand of
+    # each clause.
+    test "in an InfluxQL statement", %{conn: conn} do
+      text = unique_text()
+
+      {:ok, :written} =
+        Local.write(conn, "#{text},t=a #{text}=1.5 1000000000", database: "clauses_db")
+
+      statements = [
+        "SELECT #{text} FROM #{text}",
+        "SELECT #{text}(v) FROM m",
+        "SELECT mean(#{text}) FROM #{text} GROUP BY #{text}",
+        "SELECT v FROM #{text}.#{text}",
+        "SELECT v FROM m WHERE #{text} = '#{text}'",
+        "SELECT v FROM m WHERE host = #{text}",
+        "SELECT v FROM m WHERE time > #{text}",
+        "SELECT v FROM m LIMIT #{text}",
+        "SELECT v FROM m OFFSET #{text}",
+        "SELECT v FROM m LIMIT #{text} OFFSET #{text}",
+        "SELECT v FROM m SLIMIT #{text}",
+        "SELECT v FROM m SOFFSET #{text}",
+        "SELECT v FROM m SLIMIT #{text} SOFFSET #{text}",
+        "SELECT v FROM m GROUP BY #{text}",
+        "SELECT v FROM m GROUP BY time(#{text})",
+        "SELECT v FROM m GROUP BY host fill(#{text})",
+        "SELECT mean(v) FROM m GROUP BY time(1s) fill(#{text})",
+        "SELECT v FROM m ORDER BY #{text}",
+        "SELECT v FROM m ORDER BY time #{text}",
+        "SELECT v AS #{text} FROM m",
+        "SELECT v::#{text} FROM m",
+        "SHOW TAG KEYS FROM #{text}",
+        "SHOW FIELD KEYS FROM #{text}",
+        "SHOW TAG VALUES FROM #{text} WITH KEY = #{text}",
+        "SHOW #{text}"
+      ]
+
+      for statement <- statements do
+        ask(&Local.query_influxql(conn, &1, database: "clauses_db"), statement)
+        ask(&Local.query_influxql(conn, &1, database: text), statement)
+      end
+
+      assert_no_atom(text)
+    end
+
+    test "in a SQL statement", %{conn: conn} do
+      text = unique_text()
+
+      {:ok, :written} =
+        Local.write(conn, "#{text},t=a #{text}=1.5 1000000000", database: "clauses_db")
+
+      statements = [
+        "SELECT #{text} FROM #{text}",
+        "SELECT \"#{text}\" FROM \"#{text}\"",
+        "SELECT #{text}(v) FROM m",
+        "SELECT v AS #{text} FROM m",
+        "SELECT v FROM m AS #{text}",
+        "SELECT #{text}.v FROM m AS #{text}",
+        "SELECT v FROM #{text}.m",
+        "SELECT v FROM m WHERE #{text} = '#{text}'",
+        "SELECT v FROM m WHERE host = #{text}",
+        "SELECT v FROM m WHERE v IN (#{text}, 1)",
+        "SELECT v FROM m GROUP BY #{text}",
+        "SELECT v FROM m ORDER BY #{text}",
+        "SELECT v FROM m LIMIT #{text}",
+        "SELECT v FROM m LIMIT 1 OFFSET #{text}",
+        "SELECT CAST(v AS #{text}) FROM m",
+        "SELECT v::#{text} FROM m",
+        "SELECT date_trunc('#{text}', time) FROM m",
+        "SELECT v FROM m WHERE time > now() - interval '#{text}'",
+        "WITH #{text} AS (SELECT v FROM m) SELECT * FROM #{text}",
+        "INSERT INTO #{text} (#{text}) VALUES (#{text})",
+        "INSERT INTO m (#{text}) VALUES (1)",
+        "INSERT INTO m (v) SELECT #{text} FROM #{text}",
+        "UPDATE #{text} SET #{text} = #{text} WHERE #{text} = #{text}",
+        "UPDATE m SET #{text} = #{text}(v)",
+        "DELETE FROM #{text} WHERE #{text} = #{text}",
+        "DELETE FROM m WHERE #{text} = '#{text}'",
+        "SHOW #{text}",
+        "SELECT * FROM information_schema.#{text}"
+      ]
+
+      for statement <- statements do
+        ask(&Local.query_sql(conn, &1, database: "clauses_db"), statement)
+        ask(&Local.query_sql(conn, &1, database: text), statement)
+      end
+
+      assert_no_atom(text)
+    end
+
+    defp assert_no_atom(text) do
+      for spelling <- [text, String.upcase(text)] do
+        assert_raise ArgumentError, fn -> String.to_existing_atom(spelling) end
+      end
+    end
   end
 end

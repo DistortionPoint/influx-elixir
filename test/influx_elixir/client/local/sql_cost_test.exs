@@ -126,6 +126,11 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
   end
 
   describe "a name or a pattern past the size of the regular expression that matches it" do
+    @name_reason "Client.Local: a table name or alias too long for the double to match the " <>
+                   "columns written with it (the engine answers that the table is not found)"
+    @pattern_reason "Client.Local: a LIKE pattern of more than tens of thousands of characters: " <>
+                      "the double matches it with a regular expression of bounded size"
+
     test "a table name is a refusal by name", %{conn: conn} do
       name = String.duplicate("a", 4100)
 
@@ -134,29 +139,40 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
             ~s(SELECT 1 FROM "#{name}"),
             "SELECT #{name}.n FROM #{name}"
           ] do
-        assert {:error, %{status: 400, body: "Client.Local: " <> _reason}} =
-                 Local.query_sql(conn, sql, database: "cost_db")
+        assert Local.query_sql(conn, sql, database: "cost_db") ===
+                 {:error, %{status: 400, body: @name_reason}}
       end
     end
 
-    test "a LIKE pattern is a refusal by name", %{conn: conn} do
+    test "a LIKE pattern in a WHERE is a refusal by name", %{conn: conn} do
       pattern = String.duplicate("a", 70_000)
 
-      for sql <- [
-            "SELECT v FROM main WHERE host LIKE '#{pattern}'",
-            "SELECT host LIKE '#{pattern}' AS r FROM main"
-          ] do
-        assert {:error, %{status: 400, body: "Client.Local: " <> _reason}} =
-                 Local.query_sql(conn, sql, database: "cost_db")
-      end
+      assert Local.query_sql(conn, "SELECT v FROM main WHERE host LIKE '#{pattern}'",
+               database: "cost_db"
+             ) === {:error, %{status: 400, body: @pattern_reason}}
+    end
+
+    test "a LIKE pattern in the select list is a refusal by name, naming the column",
+         %{conn: conn} do
+      pattern = String.duplicate("a", 70_000)
+
+      assert Local.query_sql(conn, "SELECT host LIKE '#{pattern}' AS r FROM main",
+               database: "cost_db"
+             ) ===
+               {:error,
+                %{
+                  status: 400,
+                  body:
+                    "Client.Local: unsupported column: host like '#{pattern}' as r " <>
+                      "(its LIKE pattern is too large for the double)"
+                }}
     end
 
     test "a LIKE pattern bound as a parameter is a refusal by name", %{conn: conn} do
-      assert {:error, %{status: 400, body: "Client.Local: " <> _reason}} =
-               Local.query_sql(conn, "SELECT n FROM main WHERE host LIKE $p",
-                 database: "cost_db",
-                 params: %{"p" => String.duplicate("a", 70_000)}
-               )
+      assert Local.query_sql(conn, "SELECT n FROM main WHERE host LIKE $p",
+               database: "cost_db",
+               params: %{"p" => String.duplicate("a", 70_000)}
+             ) === {:error, %{status: 400, body: @pattern_reason}}
     end
   end
 end

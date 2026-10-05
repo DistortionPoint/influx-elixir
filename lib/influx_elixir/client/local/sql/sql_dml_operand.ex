@@ -82,6 +82,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   @bool_dummy {:bool, true}
 
   @comparisons ~w(= == <> != < > <= >= <=> ~ ~* !~ !~* ~~ ~~* !~~ !~~* AND OR)
+  @unknown_function ", a function the double does not know"
   @arithmetic ~w(+ - * / %)
   @exact [:int, :uint, :float, :decimal]
   @exact_numbers [:int, :uint, :float]
@@ -140,7 +141,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   def eager({:call, name, args}, ctx) do
     cond do
-      not known_function?(name) -> {:refuse, "a function the double does not know"}
+      not known_function?(name) -> {:refuse, "a call to #{name}" <> @unknown_function}
       converted_alone?(name, args) -> {:refuse, "a call the planner converts on its own"}
       args == :star -> :ok
       true -> eager(args, ctx)
@@ -305,21 +306,12 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp trivially_typed?({:ref, parts}, ctx), do: column?(parts, ctx)
   defp trivially_typed?(_node, _ctx), do: false
 
-  # The planner finds the type of an operand twice, as it reads it (a placeholder in it has no
-  # type yet: the planner gives it one once the statement is read) and when it coerces it, and
-  # words some errors differently (an arithmetic operator over tags: `Cannot get result type`
-  # as it reads it, `Cannot coerce` after, of two tags): the double words the second.
+  # The planner finds the type of an operand as it reads it (a placeholder in it has no type
+  # yet: the planner gives it one once the statement is read). An arithmetic operator over two
+  # tags is the planner's `Cannot coerce` there as anywhere else (verified, in a `||`, a cast,
+  # a call, a unary sign, an `IS`, in `UPDATE`, `DELETE` and `INSERT ... SELECT`).
   @spec early_top(SQLDmlExpr.ast(), ctx()) :: check()
-  defp early_top(node, ctx), do: early(plan_top(node, Map.put(ctx, :infer, false)))
-
-  @spec early(check()) :: check()
-  defp early({:error, %{body: body}} = error) do
-    if Regex.match?(~r{arithmetic expression Dictionary\([^)]*\) [-+*/%] Dictionary\(}, body),
-      do: {:refuse, "an arithmetic error over two tags found as the planner reads an operand"},
-      else: error
-  end
-
-  defp early(other), do: other
+  defp early_top(node, ctx), do: plan_top(node, Map.put(ctx, :infer, false))
 
   # Calls the engine converts before it reads their arguments: `substr(x)` and `substring(x)`
   # are a `SUBSTRING` with neither `FROM` nor `FOR` (an error that prints the parse tree),
@@ -583,6 +575,16 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp reachable({:like, _inner, _pattern, _negated, _word, _escape}, _ctx), do: :ok
   defp reachable(node, ctx), do: reachable(SQLDmlExpr.children(node), ctx)
 
+  @doc """
+  Whether a check is the refusal of a call to a function the double does not know (which the
+  planner finds with the errors of its own, where the double cannot say which comes first).
+  """
+  @spec unknown_function?(check()) :: boolean()
+  def unknown_function?({:refuse, "a call to " <> rest}),
+    do: String.ends_with?(rest, @unknown_function)
+
+  def unknown_function?(_check), do: false
+
   @spec known_function?(binary()) :: boolean()
   defp known_function?(name) do
     name in @known_functions or name in @float_functions or name in @text_functions or
@@ -810,7 +812,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp predicate_type({sign, inner}, ctx) when sign in [:neg, :pos] do
     if type_of(inner, ctx) == :bool,
       do: :ok,
-      else: {:refuse, "a WHERE that is not a comparison, a boolean or a name"}
+      else: {:refuse, "a WHERE that is a sign in front of a value that is not a boolean"}
   end
 
   defp predicate_type({:str, body}, _ctx) do
@@ -824,21 +826,43 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp predicate_type({:bin, _op, _left, _right} = operand, ctx), do: untyped(operand, ctx)
   defp predicate_type({:call, _name, _args} = call, ctx), do: untyped(call, ctx)
 
+  defp predicate_type({:cast, _inner, _type, _try}, _ctx),
+    do: {:refuse, "a WHERE that is a cast, which the planner types as the cast type"}
+
+  defp predicate_type({:tuple, _items}, _ctx),
+    do: {:refuse, "a WHERE that is a row of values"}
+
   defp predicate_type(_other, _ctx),
-    do: {:refuse, "a WHERE that is not a comparison, a boolean or a name"}
+    do: {:refuse, "a WHERE of a kind the double has not verified"}
 
   @spec untyped(SQLDmlExpr.ast(), ctx()) :: check()
   defp untyped(operand, ctx) do
     case plan_top(operand, ctx) do
-      :ok -> if type_of(operand, ctx) == :bool, do: :ok, else: not_boolean_value()
+      :ok -> if type_of(operand, ctx) == :bool, do: :ok, else: not_boolean_value(operand)
       {:error, %{body: "Client.Local: " <> why}} -> {:refuse, why}
       {:error, _typed_wrong} -> :ok
       {:refuse, _why} = refusal -> refusal
     end
   end
 
-  @spec not_boolean_value() :: check()
-  defp not_boolean_value, do: {:refuse, "a WHERE that is a value that is not a boolean"}
+  @spec not_boolean_value(SQLDmlExpr.ast()) :: check()
+  defp not_boolean_value({:bin, "||", _left, _right}),
+    do: {:refuse, "a WHERE that is a concatenation, a value that is not a boolean"}
+
+  defp not_boolean_value({:bin, _op, _left, _right}),
+    do: {:refuse, "a WHERE that is arithmetic, a value that is not a boolean"}
+
+  defp not_boolean_value({:call, name, _args}) when name in @now,
+    do: {:refuse, "a WHERE that is the time of the query, a value that is not a boolean"}
+
+  defp not_boolean_value({:call, name, _args}) when name in @aggregates,
+    do: {:refuse, "a WHERE that is an aggregate, a value that is not a boolean"}
+
+  defp not_boolean_value({:call, _name, _args}),
+    do: {:refuse, "a WHERE that is a call of a function with a value that is not a boolean"}
+
+  defp not_boolean_value({:ordered, _call, _terms}),
+    do: {:refuse, "a WHERE that is an ordered aggregate, a value that is not a boolean"}
 
   @spec literal_predicate(binary()) :: check()
   defp literal_predicate(text) do

@@ -71,14 +71,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   # `fill(number)` of a plain select, grouped by tags or not: a number column (a field, or
   # an expression that comes to one) that a row the answer holds lacks takes the number,
   # cast to the column's type, and a text or boolean column stays null, as does a value that an
-  # expression computed to null (`sqrt` of a negative) (verified). The rows
-  # are those the windows of `LIMIT` and `OFFSET` kept, so the fill never changes which rows
-  # are answered.
+  # expression computed to null (`sqrt` of a negative) (verified). A row none of whose columns
+  # holds a value, not even that null (`f + n` where one of them is missing), is no row of the
+  # answer (verified: it is answered without the fill, and not with it), so it is dropped, not
+  # filled. The rows are those the windows of `LIMIT` and `OFFSET` kept, so the fill never
+  # changes which rows are answered.
   @spec fill_numbers([map()], map()) :: [map()]
   defp fill_numbers(rows, %{query: %{fill: {:number, number}} = query} = context) do
-    if Enum.any?(query.items, &(aggregate_item?(&1) or raw_transform_item?(&1))),
-      do: rows,
-      else: Enum.map(rows, &fill_row(&1, filled_columns(context, number)))
+    if Enum.any?(query.items, &(aggregate_item?(&1) or raw_transform_item?(&1))) do
+      rows
+    else
+      columns = filled_columns(context, number)
+      names = for %{role: :field, name: name} <- context.plan.entries, do: name
+
+      for row <- rows, Enum.any?(names, &Map.has_key?(row, &1)), do: fill_row(row, columns)
+    end
   end
 
   defp fill_numbers(rows, _context), do: rows

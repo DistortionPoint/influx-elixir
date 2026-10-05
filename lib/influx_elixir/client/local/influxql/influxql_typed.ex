@@ -362,16 +362,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   # `{:tree, tree}` with such pairs put to false), unless the engine's planner refuses the
   # pair (see `operand/4`): that error is thrown as `{:deferred, body}`, the planner's, among
   # the errors of the comparisons (`leaf` plans each one, in the order the planner builds
-  # them).
+  # them; it is told whether a bare operand of the condition is no number).
   @spec bare_condition(
           tuple(),
           {MapSet.t(binary()), map()},
           %{table: binary()} | nil,
-          (tuple() -> term())
+          (tuple(), boolean() -> term())
         ) ::
           {pos_integer(), binary()} | :empty | {:tree, tuple()} | nil
   @doc false
-  def bare_condition(tree, ctx, filter \\ nil, leaf \\ & &1) do
+  def bare_condition(tree, ctx, filter \\ nil, leaf \\ fn _node, _other? -> :ok end) do
     if now_outside_time?(tree),
       do: {405, "This feature is not implemented: now"},
       else: tree |> bare_type(ctx, leaf) |> filtered(tree, ctx, filter)
@@ -509,18 +509,34 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     do: Enum.any?(nodes, &operand_inside?(&1, ctx))
 
   defp operand_inside?({:cmp, tokens}, {tags, types}) do
-    tokens = strip_parens(tokens)
+    stripped = strip_parens(tokens)
 
-    case standalone_field(tokens, tags, types) do
-      nil -> false
-      :boolean -> match?([{:ident, _name}], tokens)
+    case standalone_field(stripped, tags, types) do
+      nil -> absent_bare?(stripped, tags, types) or parenthesised_boolean?(tokens, stripped)
+      :boolean -> match?([{:ident, _name}], stripped)
       _type -> true
     end
   end
 
   defp operand_inside?(_node, _ctx), do: false
 
-  @spec bare_type(tuple(), {MapSet.t(binary()), map()}, (tuple() -> term())) ::
+  # A bare column the measurement lacks stands as an operand that is no boolean, too (verified:
+  # `nosuch AND time > 0` breaks the stack like `f AND time > 0`).
+  defp absent_bare?([{:ident, name}], tags, types) do
+    (MapSet.size(tags) > 0 or map_size(types) > 0) and not MapSet.member?(tags, name) and
+      not Map.has_key?(types, name) and not InfluxQLTokens.time?({:ident, name})
+  end
+
+  defp absent_bare?(_tokens, _tags, _types), do: false
+
+  # A boolean constant in parentheses stands as an operand that is no boolean, too (verified:
+  # `time > x AND (true)` breaks the stack, `time > x AND true` does not).
+  defp parenthesised_boolean?(tokens, [{:raw, word}] = stripped),
+    do: tokens != stripped and String.upcase(word) in ["TRUE", "FALSE"]
+
+  defp parenthesised_boolean?(_tokens, _stripped), do: false
+
+  @spec bare_type(tuple(), {MapSet.t(binary()), map()}, (tuple(), boolean() -> term())) ::
           {pos_integer(), binary()} | :empty | {:tree, tuple()} | nil
   defp bare_type({:group, node}, ctx, leaf), do: bare_type(node, ctx, leaf)
 
@@ -536,7 +552,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     if bare_inside?(tree, ctx) do
       if null_beside_bare?(tree, ctx), do: refuse_bare()
 
-      case operand(tree, ctx, true, leaf) do
+      other? = any_leaf?(tree, &other_bare_leaf?(&1, ctx))
+
+      case operand(tree, ctx, true, &leaf.(&1, other?)) do
         {:bool, _node, false} -> nil
         {:bool, @never, true} -> :empty
         {:bool, node, true} -> {:tree, node}
@@ -641,6 +659,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     do: standalone_field(strip_parens(tokens), tags, types) not in [nil, :boolean]
 
   defp bare_leaf?(_node, _ctx), do: false
+
+  # A bare operand that is not a number (a string, a tag, an unsigned constant, a duration).
+  defp other_bare_leaf?({:cmp, tokens}, {tags, types}),
+    do:
+      standalone_field(strip_parens(tokens), tags, types) not in [nil, :boolean, :integer, :float]
+
+  defp other_bare_leaf?(_node, _ctx), do: false
 
   @spec logical_error(:and | :or, binary(), binary()) :: binary()
   defp logical_error(kind, left, right) do

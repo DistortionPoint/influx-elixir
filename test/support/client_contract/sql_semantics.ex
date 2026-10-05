@@ -9,7 +9,7 @@ defmodule InfluxElixir.ClientContract.SqlSemantics do
   @spec blocks(Macro.t(), atom()) :: [Macro.t()]
   def blocks(client, profile) when profile in [:v3_core, :v3_enterprise] do
     execute_tests =
-      if profile == :v3_enterprise,
+      if profile === :v3_enterprise,
         do: execute_tests_enterprise(client),
         else: execute_tests_core(client)
 
@@ -416,7 +416,7 @@ defmodule InfluxElixir.ClientContract.SqlSemantics do
                      "SELECT rack FROM #{ctx.m} ORDER BY rack NULLS FIRST"
                    ),
                    & &1["rack"]
-                 ) ==
+                 ) ===
                    [nil, "1", "2"]
 
           assert Enum.map(
@@ -454,7 +454,7 @@ defmodule InfluxElixir.ClientContract.SqlSemantics do
                      "SELECT host FROM #{ctx.m} WHERE NOT b ORDER BY time"
                    ),
                    & &1["host"]
-                 ) ==
+                 ) ===
                    ["b"]
 
           assert Enum.map(

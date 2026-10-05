@@ -47,10 +47,13 @@ defmodule InfluxElixir.Client.Local.SQLNamedArg do
       lower in @aggregate_same ->
         SQLError.planning("Aggregate function '#{lower}' does not support named arguments")
 
-      true ->
+      is_map_key(@aggregate, lower) ->
         SQLError.planning(
           "Aggregate function '#{@aggregate[lower]}' does not support named arguments"
         )
+
+      true ->
+        unknown_before(name)
     end
   end
 

@@ -65,14 +65,15 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
       {key, shown} = describe(operand, alias_name, ctx)
 
       case seen do
-        %{^key => {first_position, first_shown}} ->
-          {:halt, {:duplicate, first_position, first_shown, position, shown}}
+        %{^key => {first_position, first_shown, first_operand}} ->
+          {:halt,
+           {:duplicate, {first_position, first_shown, first_operand}, {position, shown, operand}}}
 
         _unseen ->
-          {:cont, Map.put(seen, key, {position, shown})}
+          {:cont, Map.put(seen, key, {position, shown, operand})}
       end
     end)
-    |> verdict()
+    |> verdict(ctx)
   end
 
   # The output has a column of the table (qualified by it) and an item named as a column of it
@@ -113,9 +114,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
     end
   end
 
-  @spec verdict(map() | {:duplicate, term(), term(), term(), term()}) ::
+  @spec verdict(map() | {:duplicate, term(), term()}, SQLDmlOperand.ctx()) ::
           SQLDmlOperand.check()
-  defp verdict({:duplicate, first, first_shown, second, second_shown})
+  defp verdict({:duplicate, {first, first_shown, _operand}, {second, second_shown, _other}}, _ctx)
        when is_binary(first_shown) and is_binary(second_shown) do
     {:error,
      SQLError.planning(
@@ -125,11 +126,44 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
      )}
   end
 
-  defp verdict({:duplicate, _first, _first_shown, _second, _second_shown}) do
-    {:refuse, "two select items that have the same name, which the double does not print"}
+  # The words of the error print both expressions: the refusal names the first that the double
+  # does not print, by what it cannot print of it.
+  defp verdict({:duplicate, {_position, nil, first_operand}, _second}, ctx),
+    do: unprintable(first_operand, ctx)
+
+  defp verdict({:duplicate, _first, {_position, nil, second_operand}}, ctx),
+    do: unprintable(second_operand, ctx)
+
+  defp verdict(%{}, _ctx), do: :ok
+
+  @spec unprintable(SQLDmlExpr.ast(), SQLDmlOperand.ctx()) :: {:refuse, binary()}
+  defp unprintable(operand, ctx),
+    do: {:refuse, "two select items that have the same name, one #{cause(operand, ctx)}"}
+
+  # What the double cannot print of an expression: the first part of it that it cannot, else
+  # the expression itself.
+  @spec cause(SQLDmlExpr.ast(), SQLDmlOperand.ctx()) :: binary()
+  defp cause(operand, ctx) do
+    case Enum.find(SQLDmlExpr.children(operand), &(render(&1, ctx, :display) === :unknown)) do
+      nil -> own_cause(operand)
+      part -> cause(part, ctx)
+    end
   end
 
-  defp verdict(%{}), do: :ok
+  @spec own_cause(SQLDmlExpr.ast()) :: binary()
+  defp own_cause({:str, _body}),
+    do: "with a string whose characters the double does not print"
+
+  defp own_cause({:num, _text}), do: "with a number the double does not print"
+  defp own_cause({:ref, _parts}), do: "with a name the double does not print as a column"
+
+  defp own_cause({:cast, _inner, _type, _try}),
+    do: "with a cast to a type the double does not print"
+
+  defp own_cause({:call, _name, _args}), do: "with a call the double does not print"
+  defp own_cause({:ordered, _call, _terms}), do: "with a call the double does not print"
+  defp own_cause({:bin, _op, _left, _right}), do: "with an operator the double does not print"
+  defp own_cause(_other), do: "with an expression of a kind the double does not print"
 
   # The key an item is compared by, and the expression as the error prints it (`nil` when the
   # double does not print it).

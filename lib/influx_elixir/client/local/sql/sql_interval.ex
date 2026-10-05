@@ -31,11 +31,39 @@ defmodule InfluxElixir.Client.Local.SQLInterval do
   """
   @spec overflow(binary(), binary() | nil) :: binary() | nil
   def overflow(text, unit) do
-    case pairs(String.split(text), unit) do
-      {:ok, pairs} -> first_error(pairs, text)
-      :error -> nil
+    words = String.split(text)
+
+    case pairs(words, unit) do
+      {:ok, pairs} when unit == nil ->
+        if exact?(text, words), do: first_error(pairs, text), else: invalid(text)
+
+      {:ok, pairs} ->
+        first_error(pairs, text)
+
+      :error ->
+        nil
     end
   end
+
+  # The literal as the engine's parser reads it: no space around it, the numbers and units set
+  # apart by one space, and no `+` before a number (verified: `' 1 day'`, `'1  day'`, `'1 day\t'`
+  # and `'+1 day'` are the parser's error, not an interval, where `'1\tday'` is one day). Only
+  # ASCII text is judged, since the error names the text as Rust escapes it.
+  @spec exact?(binary(), [binary()]) :: boolean()
+  defp exact?(text, words),
+    do: not (String.printable?(text) and ascii?(text)) or exact_words?(text, words)
+
+  @spec exact_words?(binary(), [binary()]) :: boolean()
+  defp exact_words?(text, words),
+    do:
+      text == String.trim(text) and not String.contains?(text, "  ") and
+        not Enum.any?(words, &String.starts_with?(&1, "+"))
+
+  @spec ascii?(binary()) :: boolean()
+  defp ascii?(text), do: byte_size(text) == String.length(text)
+
+  @spec invalid(binary()) :: binary()
+  defp invalid(text), do: "Parser error: Invalid input syntax for type interval: #{inspect(text)}"
 
   # `[{number, unit}]` of `1 year 2 days`, or of `5` with the unit written after the literal.
   @spec pairs([binary()], binary() | nil) :: {:ok, [{binary(), binary()}]} | :error

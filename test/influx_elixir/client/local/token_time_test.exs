@@ -1,4 +1,10 @@
 defmodule InfluxElixir.Client.Local.TokenTimeTest do
+  @moduledoc """
+  How a token's times are printed. `Admin.token_time/1` is tested directly because it is a
+  pure function of the time it is given: through `create_token` the time is the real clock's,
+  which cannot be made to stand at a whole second or a given millisecond.
+  """
+
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local.Admin

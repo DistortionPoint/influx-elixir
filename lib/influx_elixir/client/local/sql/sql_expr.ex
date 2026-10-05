@@ -437,7 +437,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
 
   # `expr::TYPE` is `CAST(expr AS TYPE)`.
   defp parse_shorthand(expr, [{:tok, "::"}, {:word, _type} | _more] = tokens) do
-    with {:ok, target, rest} <- SQLCastType.read(tl(tokens)),
+    with {:ok, target, rest} <- SQLCastType.read(tl(tokens), expr),
          do: parse_shorthand({:cast, expr, target}, rest)
   end
 
@@ -507,7 +507,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   defp parse_cast(tokens) do
     with {:ok, inner, [{:word, as_kw}, {:word, _type} | _more] = after_inner}
          when as_kw in ["AS", "as", "As"] <- parse_or(tokens),
-         {:ok, target, [{:tok, ")"} | rest]} <- SQLCastType.read(tl(after_inner)) do
+         {:ok, target, [{:tok, ")"} | rest]} <- SQLCastType.read(tl(after_inner), inner) do
       {:ok, {:cast, inner, target}, rest}
     else
       {:error, _reason} = error -> error

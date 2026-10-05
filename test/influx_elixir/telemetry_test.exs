@@ -4,16 +4,27 @@ defmodule InfluxElixir.TelemetryTest do
   alias InfluxElixir.Telemetry
   alias InfluxElixir.TestSupport.Telemetry, as: Forward
 
-  # A span's function that takes at least this long, so a duration has a
-  # guaranteed floor to be checked against (the monotonic clock never reads
-  # less than the sleep waited).
-  @floor System.convert_time_unit(1, :millisecond, :native)
+  # A span's function that takes a moment (so that a duration of nothing would be seen) and
+  # reports how long it ran, by the monotonic clock read inside it: the span's duration spans
+  # the function, so it can never be less than that.
+  defp timed(fun) do
+    parent = self()
 
-  defp slowly(result) do
     fn ->
-      Process.sleep(1)
-      result
+      started = System.monotonic_time()
+
+      try do
+        Process.sleep(1)
+        fun.()
+      after
+        send(parent, {:inner_elapsed, System.monotonic_time() - started})
+      end
     end
+  end
+
+  defp assert_spans_function(duration) do
+    assert_received {:inner_elapsed, inner_elapsed}
+    assert duration >= inner_elapsed
   end
 
   # Runs `emit` and returns the readings of a clock taken before and after it,
@@ -45,10 +56,10 @@ defmodule InfluxElixir.TelemetryTest do
       Forward.attach([[:influx_elixir, :write, :stop]])
       metadata = %{database: "testdb", point_count: 2, bytes: 100}
 
-      assert Telemetry.span_write(metadata, slowly({:ok, :written})) === {:ok, :written}
+      assert Telemetry.span_write(metadata, timed(fn -> {:ok, :written} end)) === {:ok, :written}
 
       assert_receive {:telemetry, [:influx_elixir, :write, :stop], measurements, recv_meta}
-      assert measurements.duration >= @floor
+      assert_spans_function(measurements.duration)
       assert recv_meta.database === "testdb"
     end
 
@@ -57,15 +68,12 @@ defmodule InfluxElixir.TelemetryTest do
       metadata = %{database: "testdb", point_count: 1, bytes: 10}
 
       assert_raise RuntimeError, "boom", fn ->
-        Telemetry.span_write(metadata, fn ->
-          Process.sleep(1)
-          raise "boom"
-        end)
+        Telemetry.span_write(metadata, timed(fn -> raise "boom" end))
       end
 
       assert_receive {:telemetry, [:influx_elixir, :write, :exception], measurements, recv_meta}
 
-      assert measurements.duration >= @floor
+      assert_spans_function(measurements.duration)
       assert recv_meta.database === "testdb"
       assert recv_meta.kind === :error
     end
@@ -103,11 +111,11 @@ defmodule InfluxElixir.TelemetryTest do
       Forward.attach([[:influx_elixir, :query, :stop]])
       metadata = %{database: "testdb", transport: :flight}
 
-      assert Telemetry.span_query(metadata, slowly({:ok, [%{"col" => 1}]})) ===
+      assert Telemetry.span_query(metadata, timed(fn -> {:ok, [%{"col" => 1}]} end)) ===
                {:ok, [%{"col" => 1}]}
 
       assert_receive {:telemetry, [:influx_elixir, :query, :stop], measurements, recv_meta}
-      assert measurements.duration >= @floor
+      assert_spans_function(measurements.duration)
       assert recv_meta.transport === :flight
     end
 
@@ -116,15 +124,12 @@ defmodule InfluxElixir.TelemetryTest do
       metadata = %{database: "testdb", transport: :http}
 
       assert_raise ArgumentError, "bad query", fn ->
-        Telemetry.span_query(metadata, fn ->
-          Process.sleep(1)
-          raise ArgumentError, "bad query"
-        end)
+        Telemetry.span_query(metadata, timed(fn -> raise ArgumentError, "bad query" end))
       end
 
       assert_receive {:telemetry, [:influx_elixir, :query, :exception], measurements, recv_meta}
 
-      assert measurements.duration >= @floor
+      assert_spans_function(measurements.duration)
       assert recv_meta.database === "testdb"
       assert recv_meta.kind === :error
     end

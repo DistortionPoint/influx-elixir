@@ -239,7 +239,7 @@ defmodule InfluxElixir.Client.Local.SqlAggregateRefusalsTest do
     # a "Did you mean" suggestion that varies from run to run (verified); the
     # double refuses by name with the same status.
     test "an unknown function is refused by name", %{conn: conn, db: db} do
-      assert Local.query_sql(conn, ~s|SELECT price FROM "q" WHERE time >= foo()|, database: db) ==
+      assert Local.query_sql(conn, ~s|SELECT price FROM "q" WHERE time >= foo()|, database: db) ===
                {:error,
                 %{
                   status: 400,

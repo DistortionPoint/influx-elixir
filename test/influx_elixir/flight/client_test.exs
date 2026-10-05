@@ -111,7 +111,7 @@ defmodule InfluxElixir.Flight.ClientTest do
 
   describe "resolve_connect_timeout/1" do
     test "uses :connect_timeout when set" do
-      assert Client.resolve_connect_timeout(connect_timeout: 100, timeout: 5_000) ==
+      assert Client.resolve_connect_timeout(connect_timeout: 100, timeout: 5_000) ===
                100
     end
 

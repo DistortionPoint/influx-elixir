@@ -165,7 +165,7 @@ defmodule InfluxElixir.Write.LineProtocolTest do
 
       assert {:ok, lp} = LineProtocol.encode(point)
 
-      assert lp ==
+      assert lp ===
                ~S(m=é\,\ ü,t\ é\=\,\ k=v\ ü\=\,\ x f\ é\=\,\ k="v é,= \"q\" \\ x")
     end
   end

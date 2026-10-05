@@ -4,6 +4,10 @@ defmodule InfluxElixir.Client.Local.RetentionVisibilityTest do
   definition (a chunk is shown for as long as its newest point is), the markers the
   store keeps so that a read with nothing expired does not look at the points, and the
   answers a query gives either way.
+
+  `Retention.visible/3` is tested directly because it is a pure function of its clock: the
+  public calls read the real one, and the definition is checked against many fixed clocks
+  and chunk edges that no real clock could be made to stand at.
   """
 
   use ExUnit.Case, async: true
@@ -129,11 +133,17 @@ defmodule InfluxElixir.Client.Local.RetentionVisibilityTest do
          %{conn: conn} do
       now = System.os_time(:nanosecond)
       long_ago = now - 7_200 * @second
+
+      # The retention puts the cut-off in the middle of a chunk, five minutes from either
+      # end, whatever the time of day: the query reads the clock a little later than this test
+      # does, and a cut-off at the end of a chunk could move into the next one by then.
+      chunk_start = div(now - 3_600 * @second, @chunk) * @chunk
+      retention = div(now - (chunk_start + div(@chunk, 2)), @second)
+      :ok = Local.create_database(conn, "middle", retention: "#{retention}s")
+
       # The chunk the cut-off falls in: its first nanosecond is older than the
       # cut-off, its last is not.
-      chunk_start = div(now - 3_600 * @second, @chunk) * @chunk
-
-      write(conn, "kept", [
+      write(conn, "middle", [
         "m,k=a v=1 #{long_ago}",
         "m,k=a v=2 #{long_ago + @second}",
         "m,k=b v=3 #{chunk_start + 1}",
@@ -141,7 +151,7 @@ defmodule InfluxElixir.Client.Local.RetentionVisibilityTest do
         "m,k=b v=5 #{now}"
       ])
 
-      assert {:ok, rows} = Local.query_sql(conn, "SELECT v FROM m ORDER BY v", database: "kept")
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT v FROM m ORDER BY v", database: "middle")
       assert Enum.map(rows, & &1["v"]) === [3.0, 4.0, 5.0]
     end
 

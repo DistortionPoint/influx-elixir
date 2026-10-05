@@ -274,9 +274,9 @@ defmodule InfluxElixir.Client.Local.SQLTable do
   # The words of the errors
   # ---------------------------------------------------------------------------
 
-  @doc "The planner's error for a table it cannot find, as it prints the name it looked for."
+  # The planner's error for a table it cannot find, as it prints the name it looked for.
   @spec not_found(binary()) :: SQLError.t()
-  def not_found(printed), do: SQLError.planning("table '#{printed}' not found")
+  defp not_found(printed), do: SQLError.planning("table '#{printed}' not found")
 
   @doc "The error for a measurement of the `iox` schema that the database has not."
   @spec iox_not_found(binary()) :: SQLError.t()
@@ -313,6 +313,15 @@ defmodule InfluxElixir.Client.Local.SQLTable do
       nil -> nil
     end
   end
+
+  @doc """
+  Whether the double holds the columns of a table of the engine's own schema in its
+  `information_schema` (all eight of `system`, three of the views).
+  """
+  @spec modelled?(binary(), binary()) :: boolean()
+  def modelled?("system", table), do: table in system_tables()
+  def modelled?("information_schema", table), do: table in @modelled
+  def modelled?(_schema, _table), do: false
 
   @doc "The names of the tables of the `system` schema, in the order the engine lists them."
   @spec system_tables() :: [binary()]

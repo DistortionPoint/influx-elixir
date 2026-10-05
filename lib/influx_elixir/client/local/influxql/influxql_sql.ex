@@ -28,6 +28,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   @spec rewrite(list(), MapSet.t(binary()), MapSet.t(binary()), [binary()]) :: [binary()]
   def rewrite([], _tags, _strings, acc), do: Enum.reverse(acc)
 
+  # A regular expression matched against a string constant keeps no point, whether it matches
+  # or not (verified: `'us' =~ /us/` and `'us' !~ /zzz/` are both empty, and an `OR` beside
+  # either reads as if it were false).
+  def rewrite([{:str, _content}, {:op, op}, {:regex, _pattern} | rest], tags, strings, acc)
+      when op in ["=~", "!~"],
+      do: rewrite(rest, tags, strings, ["(1 = 0)" | acc])
+
   def rewrite([{:ident, name}, {:op, op}, {:regex, pattern} | rest], tags, strings, acc) do
     regex = InfluxQLRegex.pattern(pattern)
 

@@ -47,7 +47,7 @@ defmodule InfluxElixir.Client.Local.SQLBind do
 
   @doc """
   The engine's error for the first `$name` of a query, in the order the engine replaces them,
-  that has no value (or has one that is no scalar), or `:ok`. The engine finds it once it has
+  that has no value, or `:ok`. The engine finds it once it has
   built the plan, after the errors of the select list and the `HAVING`'s grouping and before
   those of the type coercion, so the executor hands it to the planner's check instead of
   raising it first (see `InfluxElixir.Client.Local.SQLStage`).
@@ -166,9 +166,6 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   defp all_bound(names, params) do
     Enum.find_value(names, :ok, fn name ->
       case Map.fetch(params, name) do
-        {:ok, value} when is_map(value) or is_list(value) ->
-          {:error, SQLError.refusal("the parameter $#{name} is a JSON object or array")}
-
         {:ok, _scalar} ->
           nil
 

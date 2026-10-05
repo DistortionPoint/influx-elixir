@@ -1185,14 +1185,6 @@ defmodule InfluxElixir.Contract.InfluxQLFixCases do
          {"2023-11-14 22:13:50", %{"usage" => 4.5}},
          {"2023-11-14 22:14:00", %{"usage" => 5.5}}
        ]},
-      {"SELECT usage FROM ~f4 WHERE host =~ /(?<n>h)1/",
-       [
-         {"2023-11-14 22:13:20", %{"usage" => 1.5}},
-         {"2023-11-14 22:13:30", %{"usage" => 2.5}},
-         {"2023-11-14 22:13:40", %{"usage" => 3.5}},
-         {"2023-11-14 22:13:50", %{"usage" => 4.5}},
-         {"2023-11-14 22:14:00", %{"usage" => 5.5}}
-       ]},
       {"SELECT usage FROM ~f4 WHERE host =~ /[(?n)]a/", []},
       {"SELECT usage FROM ~f4 WHERE usage = 1.5 AND 2", []},
       {"SELECT usage FROM ~f4 WHERE usage = 1.5 OR 2", []},

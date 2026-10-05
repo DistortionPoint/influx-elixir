@@ -8,7 +8,6 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
-  alias InfluxElixir.Client.Local.Store
   alias InfluxElixir.TestSupport.Await
 
   # Helpers
@@ -24,6 +23,9 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
     assert {:error, %{body: body}} = result
     Jason.decode!(body)
   end
+
+  # The later of the two clocks the BEAM has: the double's own reading of "now".
+  defp clock, do: max(System.os_time(:nanosecond), System.system_time(:nanosecond))
 
   # Returns once the clock reads later than it did, so that a second stamp
   # taken after this call cannot equal one taken before it. Fails the test,
@@ -43,9 +45,6 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
                   ~s|input field "time" on measurement "m" is invalid dropped=|
 
   defp drop_body(message), do: %{"code" => "unprocessable entity", "message" => message}
-
-  defp stored(measurement, tags, v, timestamp),
-    do: %{measurement: measurement, tags: tags, fields: %{"v" => v}, timestamp: timestamp}
 
   # The message with the clock's reading and the bucket's id masked, and the
   # bounds it printed.
@@ -83,7 +82,7 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
       :ok = Local.create_bucket(conn, "hourly", retention: 10_800)
       :ok = Local.create_bucket(conn, "daily", retention: 259_200)
 
-      now = Store.now_ns()
+      now = System.os_time(:nanosecond)
       hour = Integer.floor_div(now, @hour_ns) * @hour_ns
       yesterday = Integer.floor_div(now, 24 * @hour_ns) * 24 * @hour_ns - 24 * @hour_ns
 
@@ -147,7 +146,7 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
       conn = v2_conn([])
       :ok = Local.create_bucket(conn, "short", retention: 7200)
       :ok = Local.create_bucket(conn, "forever")
-      {:ok, conn: conn, now: Store.now_ns()}
+      {:ok, conn: conn, now: System.os_time(:nanosecond)}
     end
 
     test "a bucket that keeps everything accepts a point of any age", %{conn: conn} do
@@ -170,9 +169,10 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
     end
 
     test "the lower bound is the retention before now", %{conn: conn} do
-      first = Store.now_ns()
+      # The double's clock is the later of the two the BEAM has.
+      first = clock()
       body = error_body(Local.write(conn, "m v=1i 5", database: "short"))
-      last = Store.now_ns()
+      last = clock()
 
       assert {_masked, [bound, same]} = masked_retention(conn, "short", body)
       assert bound === same
@@ -288,33 +288,28 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
              }
     end
 
-    test "the store holds nothing of the bucket" do
-      table = Store.new([])
-      Store.put_bucket(table, "b", %{retention: 0})
-      Store.register_column(table, "b", "m", "v", "iox::column_type::field::integer")
-      Store.store_points(table, "b", [stored("m", %{}, 1, 5)])
-      Store.store_points(table, "b", [stored("m", %{}, 2, 5)])
+    test "the bucket holds nothing of it when it is made again under the name" do
+      conn = v2_conn(["b"])
+      read = ~s|from(bucket: "b") \|> range(start: 0)|
 
-      # The same series and time twice: one merged point, and the series
-      # index and the duplicate marker hold something to be deleted.
-      assert Store.points(table, "b", "m") ===
-               [%{measurement: "m", tags: %{}, fields: %{"v" => 2}, timestamp: 5}]
+      fields = fn ->
+        conn |> Local.query_flux(read) |> elem(1) |> Enum.map(&{&1["_field"], &1["_value"]})
+      end
 
-      assert :ok = Store.delete_bucket(table, "b")
+      # The same series and time twice: one merged point, the later write's value.
+      assert {:ok, :written} = Local.write(conn, "m v=1i 5", database: "b")
+      assert {:ok, :written} = Local.write(conn, "m v=2i 5", database: "b")
+      assert fields.() === [{"v", 2}]
 
-      assert Store.points(table, "b", "m") === []
-      assert Store.column_kind(table, "b", "m", "v") === nil
+      assert :ok = Local.delete_bucket(conn, "b")
+      assert :ok = Local.create_bucket(conn, "b")
+      assert Local.query_flux(conn, read) === {:ok, []}
 
-      # A bucket made again under the name reads nothing back, and takes the
-      # same series and time as a first write: one point, with only its own
-      # fields, not merged with anything the deleted bucket held.
-      Store.put_bucket(table, "b", %{retention: 0})
-      assert Store.points(table, "b", "m") === []
-
-      Store.store_points(table, "b", [%{stored("m", %{}, 3, 5) | fields: %{"w" => 3}}])
-
-      assert Store.points(table, "b", "m") ===
-               [%{measurement: "m", tags: %{}, fields: %{"w" => 3}, timestamp: 5}]
+      # The field `v` was an integer: made again, the bucket takes it as a float. The same
+      # series and time as a first write is one point with only its own fields, not merged
+      # with anything the deleted bucket held.
+      assert {:ok, :written} = Local.write(conn, "m v=2.5,w=3i 5", database: "b")
+      assert Enum.sort(fields.()) === [{"v", 2.5}, {"w", 3}]
     end
   end
 
@@ -322,13 +317,13 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
     test "a bucket of hour-long groups reads up to the first group of another type" do
       conn = v2_conn([])
       :ok = Local.create_bucket(conn, "hourly", retention: 10_800)
-      hour = Integer.floor_div(Store.now_ns(), @hour_ns) * @hour_ns
+      hour = Integer.floor_div(System.os_time(:nanosecond), @hour_ns) * @hour_ns
 
       assert {:ok, :written} =
                Local.write(
                  conn,
-                 "m v=1i #{hour - 2 * @hour_ns + 5 * @minute_ns}\n" <>
-                   "m v=2.5 #{hour - @hour_ns + 5 * @minute_ns}\n" <>
+                 "m v=1i #{hour - 2 * @hour_ns + 30 * @minute_ns}\n" <>
+                   "m v=2.5 #{hour - @hour_ns + 30 * @minute_ns}\n" <>
                    "m v=3i #{hour}",
                  database: "hourly"
                )

@@ -106,22 +106,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
            slices(@select, masked_head, masked_head),
          at = byte_size(head) - byte_size(rest),
          :ok <- InfluxQLCheck.check_empty_where(clean, at, masked_rest),
-         {group_result, masked_rest} = InfluxQLGroup.extract(clean, at, masked_rest),
+         {group_result, masked_rest, rest} = InfluxQLGroup.extract(clean, at, masked_rest),
          %{} = clauses <-
            slices(InfluxQLText.clauses(), masked_rest, rest) ||
              clauses_error(clean, at, masked_rest),
          {where, swallowed} = InfluxQLCheck.cut_where(masked_rest, clauses["where"]),
+         :ok <- InfluxQLCheck.check_where_call(clean, at, masked_rest, where),
          :ok <- InfluxQLCheck.check_where(clean, at, masked_rest, where),
          :ok <- group_error(group_result),
          :ok <- InfluxQLCheck.check_group(clean, at, masked_rest),
          :ok <- InfluxQLCheck.check_operands(clean, at, masked_rest, swallowed),
-         :ok <- InfluxQLCheck.check_fill(clean, at, masked_rest),
          {:ok, group} <- group_of(group_result, clauses),
          {:ok, items} <- parse_items(items, masked_items),
          {:ok, items} <- InfluxQLNames.resolve(items),
+         :ok <- check_single(statement, tail),
          :ok <- check_tz(clauses),
-         :ok <- not_implemented(clauses),
-         :ok <- check_single(statement, tail) do
+         :ok <- not_implemented(clauses) do
       {:ok,
        %{
          items: items,
@@ -470,30 +470,31 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # double does not read.
   @spec clause_error(binary(), non_neg_integer(), binary()) :: {:error, term()}
   defp clause_error(whole, at, masked_rest) do
-    stops =
+    stop =
       ~r/\b(?:GROUP|ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b/i
       |> Regex.scan(masked_rest, return: :index)
-      |> Enum.find_value({:error, :unread_order}, fn [{from, _size}] ->
+      |> Enum.find_value(fn [{from, _size}] ->
         case InfluxQLCheck.check_swallowed(whole, at, masked_rest, {from}) do
-          {:error, {:engine, _body}} = error -> error
+          {_pos, {:error, {:engine, _body}}} = error -> error
           _no_error_of_its_own -> nil
         end
       end)
 
-    stops =
-      case stops do
-        {:error, :unread_order} -> out_of_order(whole, at, masked_rest)
-        error -> error
-      end
+    # A number past the unsigned range, and a `fill()` whose option does not read, stand before
+    # the clause that does not read when they are the leftmost (`LIMIT 99999999999999999999
+    # SLIMIT x` is the overflow, `fill(x) ORDER BY y` the option).
+    case stop || out_of_order(whole, at, masked_rest) do
+      {_pos, {:error, {:engine, _body}}} = stop ->
+        [
+          stop,
+          InfluxQLCheck.check_unsigned(whole, at, masked_rest),
+          InfluxQLCheck.fill_error(whole, at, masked_rest)
+        ]
+        |> Enum.reject(&is_nil/1)
+        |> InfluxQLCheck.first_error()
 
-    # A number past the unsigned range stands before the clause that does not read when
-    # it is the leftmost (`LIMIT 99999999999999999999 SLIMIT x` is the overflow).
-    case {stops, InfluxQLCheck.check_unsigned(whole, at, masked_rest)} do
-      {{:error, {:engine, _stop}} = stop, {:error, {:engine, _overflow}} = overflow} ->
-        InfluxQLCheck.first_error([stop, overflow])
-
-      {stops, _fits} ->
-        stops
+      {_pos, error} ->
+        error
     end
   end
 
@@ -513,7 +514,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     "tz" => 8
   }
 
-  @spec out_of_order(binary(), non_neg_integer(), binary()) :: {:error, term()}
+  @spec out_of_order(binary(), non_neg_integer(), binary()) :: InfluxQLCheck.positioned()
   defp out_of_order(whole, at, masked_rest) do
     ~r/(?<![\w])(WHERE|GROUP\s+BY|fill\s*\(|ORDER\s+BY|LIMIT|OFFSET|SLIMIT|SOFFSET|TZ\s*\()/i
     |> Regex.scan(masked_rest, return: :index, capture: :all_but_first)
@@ -523,12 +524,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
       if rank > highest,
         do: {:cont, rank},
-        else:
-          {:halt, {:error, {:engine, InfluxQLError.syntax_error_body(:nom, at + from, whole)}}}
+        else: {:halt, InfluxQLCheck.fail(:nom, at + from, whole)}
     end)
     |> case do
-      {:error, _reason} = error -> error
-      _in_order -> {:error, :unread_order}
+      {_pos, _error} = error -> error
+      _in_order -> InfluxQLCheck.unread()
     end
   end
 

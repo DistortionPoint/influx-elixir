@@ -639,7 +639,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
     case SQLExprType.common(types, :coalesce) do
       :mixed -> mixed_coalesce(types, context)
-      common -> text_cast(:coalesce, args, types, common)
+      common -> text_cast(:coalesce, args, types, {common, context})
     end
   end
 
@@ -647,9 +647,13 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   # and fails when it runs the plan, with the cast's error when the text is a literal that
   # reads as no number (it folds the constant), with a closed connection when a value of a
   # column does not cast. The double does not cast text, so it refuses what could cast.
-  @spec text_cast(:coalesce | :nullif, [SQLExpr.t()], [SQLExprType.type()], SQLExprType.type()) ::
-          :ok | {:error, map()}
-  defp text_cast(name, args, types, common) do
+  @spec text_cast(
+          :coalesce | :nullif,
+          [SQLExpr.t()],
+          [SQLExprType.type()],
+          {SQLExprType.type(), context()}
+        ) :: :ok | {:error, map()}
+  defp text_cast(name, args, types, {common, context}) do
     if SQLCommonType.number_with_text?(types) do
       number = String.replace(common, ~r/\ADictionary\(Int32, (.+)\)\z/, "\\1")
 
@@ -661,7 +665,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
            )}
 
         nil ->
-          {:error, SQLError.late_refusal({:no_common_type, name, number_family(types)})}
+          {:error, no_common_type(name, types, context)}
       end
     else
       :ok
@@ -688,11 +692,11 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
         context
       )
     else
-      mixed_refusal(:coalesce, types)
+      mixed_refusal(:coalesce, types, context)
     end
   end
 
-  defp mixed_coalesce(types, _context), do: mixed_refusal(:coalesce, types)
+  defp mixed_coalesce(types, context), do: mixed_refusal(:coalesce, types, context)
 
   @spec check_nullif([SQLExpr.t()], scope(), context()) ::
           :ok | {:error, map()}
@@ -718,7 +722,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
       true ->
         with :ok <- nullif_types(types, context),
-             do: text_cast(:nullif, args, types, SQLExprType.common(types, :nullif))
+             do: text_cast(:nullif, args, types, {SQLExprType.common(types, :nullif), context})
     end
   end
 
@@ -743,7 +747,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
         )
 
       SQLExprType.common(types, :nullif) == :mixed ->
-        mixed_refusal(:nullif, types)
+        mixed_refusal(:nullif, types, context)
 
       true ->
         :ok
@@ -754,10 +758,10 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
   # Numbers with text the engine casts to one another when it runs the plan (the connection
   # closes where a value does not cast); any other mix is its planning error, not worded here.
-  @spec mixed_refusal(:coalesce | :nullif, [SQLExprType.type()]) :: {:error, map()}
-  defp mixed_refusal(name, types) do
+  @spec mixed_refusal(:coalesce | :nullif, [SQLExprType.type()], context()) :: {:error, map()}
+  defp mixed_refusal(name, types, context) do
     if SQLCommonType.number_with_text?(types) do
-      {:error, SQLError.late_refusal({:no_common_type, name, number_family(types)})}
+      {:error, no_common_type(name, types, context)}
     else
       mixed_numbers(name, types)
     end
@@ -788,6 +792,17 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
       true -> :integer
     end
   end
+
+  # The refusal of a number beside text: by the call, the kind of number, whether the text is a
+  # tag or not, and where the call stands.
+  @spec no_common_type(:coalesce | :nullif, [SQLExprType.type()], context()) :: SQLError.t()
+  defp no_common_type(name, types, context) do
+    text = if Enum.any?(types, &tag_type?/1), do: :tag, else: :text
+    SQLError.late_refusal({:no_common_type, name, number_family(types), text, context})
+  end
+
+  @spec tag_type?(SQLExprType.type()) :: boolean()
+  defp tag_type?(type), do: is_binary(type) and String.starts_with?(type, "Dictionary")
 
   @spec call_word(:coalesce | :nullif) :: binary()
 

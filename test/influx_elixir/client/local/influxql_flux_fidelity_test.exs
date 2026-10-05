@@ -8,7 +8,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxFidelityTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
-  alias InfluxElixir.Client.Local.Store
 
   # Helpers
   # ---------------------------------------------------------------------------
@@ -147,9 +146,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxFidelityTest do
       # `time > x` starts one nanosecond after x, and the row carries whole
       # microseconds: the stamp lies between the bounds of a bracket of the
       # call, whatever the clock reads in it.
-      first = Store.now_ns()
+      first = System.os_time(:nanosecond)
       answer = iql(conn, "SELECT mean(v) FROM fresh WHERE time > now() - 1h")
-      last = Store.now_ns()
+      last = System.os_time(:nanosecond)
 
       assert {:ok, [%{"time" => time} = row]} = answer
       assert Map.delete(row, "time") === %{"iox::measurement" => "fresh", "mean" => 1.0}
