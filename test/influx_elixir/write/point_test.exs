@@ -7,10 +7,10 @@ defmodule InfluxElixir.Write.PointTest do
     test "creates a point with only measurement and fields" do
       point = Point.new("cpu", %{"value" => 0.64})
 
-      assert point.measurement == "cpu"
-      assert point.fields == %{"value" => 0.64}
-      assert point.tags == %{}
-      assert point.timestamp == nil
+      assert point.measurement === "cpu"
+      assert point.fields === %{"value" => 0.64}
+      assert point.tags === %{}
+      assert point.timestamp === nil
     end
 
     test "creates a point with tags" do
@@ -19,23 +19,23 @@ defmodule InfluxElixir.Write.PointTest do
           tags: %{"host" => "server01", "region" => "us-east-1"}
         )
 
-      assert point.tags == %{"host" => "server01", "region" => "us-east-1"}
+      assert point.tags === %{"host" => "server01", "region" => "us-east-1"}
     end
 
     test "creates a point with integer timestamp" do
       point = Point.new("cpu", %{"value" => 1.0}, timestamp: 1_630_424_257_000_000_000)
-      assert point.timestamp == 1_630_424_257_000_000_000
+      assert point.timestamp === 1_630_424_257_000_000_000
     end
 
     test "creates a point with DateTime timestamp" do
       dt = ~U[2021-08-31 16:37:37Z]
       point = Point.new("cpu", %{"value" => 1.0}, timestamp: dt)
-      assert point.timestamp == dt
+      assert point.timestamp === dt
     end
 
     test "defaults tags to empty map when not provided" do
       point = Point.new("cpu", %{"v" => 1})
-      assert point.tags == %{}
+      assert point.tags === %{}
     end
 
     test "defaults timestamp to nil when not provided" do
@@ -50,12 +50,12 @@ defmodule InfluxElixir.Write.PointTest do
 
     test "accepts boolean field values" do
       point = Point.new("status", %{"active" => true})
-      assert point.fields["active"] == true
+      assert point.fields["active"] === true
     end
 
     test "accepts string field values" do
       point = Point.new("event", %{"msg" => "hello world"})
-      assert point.fields["msg"] == "hello world"
+      assert point.fields["msg"] === "hello world"
     end
 
     test "raises ArgumentError when measurement is missing" do

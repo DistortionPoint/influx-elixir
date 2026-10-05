@@ -31,6 +31,8 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
     "log(Coercion(TypeSignatureClass::Float, implicit_coercion=ImplicitCoercion([Numeric], default_type=Float64), Coercion(TypeSignatureClass::Decimal))",
     "log(Coercion(TypeSignatureClass::Float, implicit_coercion=ImplicitCoercion([Numeric], default_type=Float64), Coercion(TypeSignatureClass::Float, implicit_coercion=ImplicitCoercion([Numeric], default_type=Float64))"
   ]
+  @bug "This issue was likely caused by a bug in DataFusion's code. Please help us to resolve " <>
+         "this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues"
   @numbers ["Int64", "Int32", "Int16", "Int8", "UInt64", "Float64"]
   @integer_arguments ["Int64", "Int32", "Int16", "Int8"]
   @integers ["Int64", "Int32", "Int16", "Int8", "UInt64"]
@@ -158,7 +160,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
            | {:refuse, binary()}
            | {:late, SQLError.late_reason()}
            | {:convert, binary()}
-           | {:planning | :internal | :execution, binary(), binary(), binary()}
+           | {:planning | :matching | :internal | :execution, binary(), binary(), binary()}
 
   @spec typed_problem(atom(), [binary()]) :: problem()
   defp typed_problem(name, types) when name in [:lower, :upper, :starts_with, :left, :right],
@@ -280,9 +282,94 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   end
 
   defp math_problem(:log, types) do
-    if length(types) in [1, 2] and Enum.all?(types, &(&1 in ["Null", "Int64", "Float64"])),
-      do: :ok,
-      else: {:refuse, "log of those arguments: the engine's error for them is not modelled"}
+    cond do
+      length(types) in [1, 2] and Enum.all?(types, &(&1 in ["Null", "Int64", "Float64"])) ->
+        :ok
+
+      length(types) > 2 ->
+        log_failure(types, arity_errors(types))
+
+      Enum.any?(types, &(&1 in ["UInt64", "Int32", "Int16", "Int8"])) ->
+        {:refuse,
+         "log of an unsigned or narrow integer: the engine's coercion for it is not modelled"}
+
+      true ->
+        log_text_failure(types)
+    end
+  end
+
+  # `log` of a text, a boolean or a timestamp: the engine tries each of its four signatures, and
+  # the message lists why each failed (verified against Core, each type in each place).
+  @spec log_text_failure([binary()]) :: problem()
+  defp log_text_failure(types) do
+    case Enum.find(types, &(&1 not in ["Null" | @numbers] and native(&1) == nil)) do
+      nil ->
+        log_failure(types, signature_errors(types))
+
+      other ->
+        {:refuse,
+         "log of an argument of the type #{other}: the engine's error for it is not modelled"}
+    end
+  end
+
+  # The errors of the signatures for one and for two arguments.
+  @spec signature_errors([binary()]) :: [binary()]
+  defp signature_errors([only]) do
+    [
+      expectation("Decimal", only),
+      expectation("Float", only),
+      "Error during planning: Function 'log' expects 2 arguments but received 1",
+      "Error during planning: Function 'log' expects 2 arguments but received 1"
+    ]
+  end
+
+  defp signature_errors([base, value]) do
+    wrong_count = "Error during planning: Function 'log' expects 1 arguments but received 2"
+
+    [
+      wrong_count,
+      wrong_count,
+      first_failure(base, value, "Decimal"),
+      first_failure(base, value, "Float")
+    ]
+  end
+
+  # A signature of two arguments fails at the first argument that does not satisfy it: the base is
+  # a `Float` in both, the value a `Decimal` in the first and a `Float` in the second.
+  @spec first_failure(binary(), binary(), binary()) :: binary()
+  defp first_failure(base, value, value_class) do
+    if base in ["Null" | @numbers],
+      do: expectation(value_class, value),
+      else: expectation("Float", base)
+  end
+
+  @spec arity_errors([binary()]) :: [binary()]
+  defp arity_errors(types) do
+    count = length(types)
+
+    for expected <- [1, 1, 2, 2],
+        do:
+          "Error during planning: Function 'log' expects #{expected} arguments but received #{count}"
+  end
+
+  # `Internal error: Expect TypeSignatureClass::Float but received NativeType::String ...`.
+  @spec expectation(binary(), binary()) :: binary()
+  defp expectation(class, type) do
+    "Internal error: Expect TypeSignatureClass::#{class} but received NativeType::" <>
+      "#{native(type)}, DataType: #{type}.\n#{@bug}"
+  end
+
+  @spec native(binary()) :: binary() | nil
+  defp native(type) when type in ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"], do: "String"
+  defp native("Boolean"), do: "Boolean"
+  defp native("Timestamp(ns)"), do: "Timestamp(Nanosecond, None)"
+  defp native(_type), do: nil
+
+  @spec log_failure([binary()], [binary()]) :: problem()
+  defp log_failure(_types, errors) do
+    {:matching,
+     "Internal error: Function 'log' failed to match any signature, errors: " <>
+       Enum.join(errors, ",") <> ".\n" <> @bug, "log", Enum.join(@log_candidates, "\n\t")}
   end
 
   # An argument of a type that is not text, for a function of text.
@@ -422,7 +509,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
 
   # The error as the call stands.
   @spec error(
-          :planning | :internal | :execution,
+          :planning | :matching | :internal | :execution,
           binary(),
           binary(),
           [binary() | nil],
@@ -459,14 +546,15 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
     }
   end
 
-  @spec word(:planning | :internal | :execution, binary()) :: binary()
+  @spec word(:planning | :matching | :internal | :execution, binary()) :: binary()
   defp word(:planning, head), do: head
+  defp word(:matching, head), do: head
   defp word(:internal, head), do: "Internal error: " <> head <> @internal_tail
   defp word(:execution, head), do: "Execution error: " <> head
 
   # Under a `CAST`, an `ORDER BY` and the like the message is its first
   # sentence: a planning error keeps the planner's prefix, the others are a 500.
-  @spec cut(:planning | :internal | :execution, binary(), context()) :: map()
+  @spec cut(:planning | :matching | :internal | :execution, binary(), context()) :: map()
   defp cut(:planning, head, _context), do: SQLError.coercion(head)
 
   defp cut(_kind, head, _context),

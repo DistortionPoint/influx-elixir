@@ -18,6 +18,7 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     SQLLiteral,
     SQLMask,
     SQLNumber,
+    SQLRustRegex,
     SQLTime
   }
 
@@ -277,7 +278,7 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   defp parse_boolean_value(text) do
     case SQLExpr.parse(text) do
       {:ok, expr} -> {:ok, expr}
-      {:error, _reason} -> unsupported_where(text)
+      {:error, _reason} -> {:error, SQLExpr.refusal("WHERE clause", text, text)}
     end
   end
 
@@ -375,14 +376,36 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   """
   @spec compile_regex(binary(), binary()) :: {:ok, Regex.t()} | {:error, SQLError.t()}
   def compile_regex(pattern, op) do
-    case Regex.compile(pattern, if(String.ends_with?(op, "*"), do: "iu", else: "u")) do
-      {:ok, regex} ->
+    flags = if String.ends_with?(op, "*"), do: "iu", else: "u"
+
+    case {SQLRustRegex.check(pattern), Regex.compile(pattern, flags)} do
+      {:differs, _pcre} ->
+        {:error,
+         SQLError.refusal(
+           "a regular expression with \\< or \\>, word boundaries in the engine's crate that PCRE " <>
+             "reads as the characters"
+         )}
+
+      {{:error, message}, _pcre} ->
+        {:error, SQLError.simplify("Invalid regex\ncaused by\nExternal error: " <> message)}
+
+      {:unknown, {:ok, regex}} ->
         {:ok, regex}
 
-      {:error, {reason, _position}} ->
+      {:ok, {:ok, regex}} ->
+        {:ok, regex}
+
+      {:ok, {:error, _pcre}} ->
         {:error,
-         SQLError.simplify(
-           "Invalid regex\ncaused by\nExternal error: regex parse error: #{reason}"
+         SQLError.refusal(
+           "a regular expression the engine's crate reads and the double's PCRE rejects"
+         )}
+
+      {:unknown, {:error, _pcre}} ->
+        {:error,
+         SQLError.refusal(
+           "a regular expression with a fault the double does not word as the engine's " <>
+             "crate does"
          )}
     end
   end
@@ -394,6 +417,27 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   @doc "A LIKE (or, with `case_insensitive`, ILIKE) pattern as an anchored regular expression."
   @spec like_regex(binary(), boolean()) :: {:ok, Regex.t()} | {:error, :pattern_too_large}
   defdelegate like_regex(pattern, case_insensitive), to: SQLCompare
+
+  # What a predicate has after its first operand when it holds none of the operators the double
+  # reads: the word or symbol that is none.
+  @spec no_operator(binary()) :: binary()
+  defp no_operator(text) do
+    case String.split(text, ~r/\s+/u, parts: 3) do
+      [_operand, second | _rest] ->
+        if String.upcase(second) in ~w(LIKE ILIKE NOT IN BETWEEN IS),
+          do:
+            "#{second} of these operands: the double reads it only beside a column and a literal",
+          else: "#{second} is not an operator the double reads"
+
+      _alone ->
+        "it holds no operator the double reads"
+    end
+  end
+
+  # What a placeholder beside a literal or another placeholder is typed by: the engine takes it
+  # from the other side, which the double does not.
+  @placeholder_side "a $name beside a literal, NULL or another $name: the engine types it from " <>
+                      "the other side, which is not modelled"
 
   @comparison_operators %{
     ">=" => :gte,
@@ -412,7 +456,7 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     # before their one-character prefixes.
     case Regex.run(~r/>=|<=|!=|<>|>|<|=/u, SQLMask.mask(trimmed), return: :index) do
       nil ->
-        {:error, SQLError.refusal("unsupported WHERE clause: #{trimmed}")}
+        unsupported_where(trimmed, no_operator(trimmed))
 
       [{start, length}] ->
         text = binary_part(trimmed, start, length)
@@ -468,7 +512,10 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
         {:ok, deferred_clause(SQLTime.comparison_type_error(type, text, "Timestamp(ns)"))}
 
       false ->
-        unsupported_where(trimmed)
+        unsupported_where(
+          trimmed,
+          "the left of a comparison with time is neither a literal, a $name nor NULL"
+        )
 
       {:error, _reason} = error ->
         error
@@ -486,10 +533,10 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
         constant_comparison(op, left, right, trimmed)
 
       SQLLiteral.param?(left) and (SQLLiteral.param?(right) or SQLLiteral.literal?(right)) ->
-        unsupported_where(trimmed)
+        unsupported_where(trimmed, @placeholder_side)
 
       SQLLiteral.literal?(left) and SQLLiteral.param?(right) ->
-        unsupported_where(trimmed)
+        unsupported_where(trimmed, @placeholder_side)
 
       SQLLiteral.literal?(left) or SQLLiteral.param?(left) ->
         turned_around(mirror(op), right, left, trimmed)
@@ -509,7 +556,7 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   defp null_comparison(op, right, trimmed) do
     cond do
       SQLLiteral.literal?(right) or null?(right) -> {:ok, {:eq, "time", nil}}
-      SQLLiteral.param?(right) -> unsupported_where(trimmed)
+      SQLLiteral.param?(right) -> unsupported_where(trimmed, @placeholder_side)
       true -> comparison(op, right, "NULL")
     end
   end
@@ -518,9 +565,13 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   defp on_the_left({:param, name}), do: {:param, name, :left}
   defp on_the_left(value), do: value
 
-  @spec unsupported_where(binary()) :: {:error, map()}
-  defp unsupported_where(text),
-    do: {:error, SQLError.refusal("unsupported WHERE clause: #{text}")}
+  @spec unsupported_where(binary(), binary() | nil) :: {:error, map()}
+  defp unsupported_where(text, reason \\ nil),
+    do: {:error, SQLError.refusal("unsupported WHERE clause: #{text}#{because(reason)}")}
+
+  @spec because(binary() | nil) :: binary()
+  defp because(nil), do: ""
+  defp because(reason), do: " (#{reason})"
 
   # The column is the comparison's left side. The engine words a type error
   # in the order the sides are written, which a boolean turned around would
@@ -555,7 +606,11 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     if (SQLNumber.numeric?(l) and SQLNumber.numeric?(r)) or (is_binary(l) and is_binary(r)) or
          (is_boolean(l) and is_boolean(r)),
        do: {:ok, if(compare_constants(op, l, r), do: :always, else: :never)},
-       else: unsupported_where(trimmed)
+       else:
+         unsupported_where(
+           trimmed,
+           "two literals of kinds the engine casts to one another, which the double does not"
+         )
   end
 
   # A literal's value; a number past the range of a double is an infinity.
@@ -631,12 +686,17 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
       SQLLiteral.identifier?(text) ->
         {:ok, SQLLiteral.identifier_name(text)}
 
-      match?({:ok, _expr}, SQLExpr.parse_arithmetic(text)) ->
-        {:ok, expr} = SQLExpr.parse_arithmetic(text)
-        {:ok, {:expr, expr}}
-
       true ->
-        unsupported_where(text)
+        arithmetic_operand(text)
+    end
+  end
+
+  # An expression over columns and literals, or the refusal that says why it is not read.
+  @spec arithmetic_operand(binary()) :: {:ok, {:expr, SQLExpr.t()}} | {:error, map()}
+  defp arithmetic_operand(text) do
+    case SQLExpr.parse_arithmetic(text) do
+      {:ok, expr} -> {:ok, {:expr, expr}}
+      {:error, _reason} -> {:error, SQLExpr.refusal("WHERE clause", text, text)}
     end
   end
 
@@ -670,12 +730,8 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
       SQLLiteral.identifier?(text) ->
         {:ok, {:expr, {:field, SQLLiteral.identifier_name(text)}}}
 
-      match?({:ok, _expr}, SQLExpr.parse_arithmetic(text)) ->
-        {:ok, expr} = SQLExpr.parse_arithmetic(text)
-        {:ok, {:expr, expr}}
-
       true ->
-        unsupported_where(text)
+        arithmetic_operand(text)
     end
   end
 

@@ -27,7 +27,9 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   alias InfluxElixir.Client.Local.{
     Format,
     SQLCast,
+    SQLCastType,
     SQLCompare,
+    SQLError,
     SQLFunctions,
     SQLLimits,
     SQLLiteral
@@ -95,7 +97,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   @number "(?:[0-9]+\\.[0-9]*|\\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?"
   @quoted ~S{"(?:[^"]|"")*"}
   @name "(?:\\w+|#{@quoted})"
-  @token ~r/\A\s*(?:(#{@number})|'((?:[^']|'')*)'|\$(\w+)|(#{@name}(?:\.#{@name})?)|(<=|>=|<>|!=|\|\||::|[()+\-*\/%,=<>]))/u
+  @token ~r/\A\s*(?:(#{@number})|'((?:[^']|'')*)'|\$(\w+)|(#{@name}(?:\.#{@name})?)|(<=|>=|<>|!=|=>|\|\||::|[()+\-*\/%,=<>]))/u
 
   @doc """
   Parses an expression, boolean operators included (recursive descent,
@@ -134,7 +136,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
          {:ok, ast, []} <- entry.(tokens) do
       {:ok, ast}
     else
-      {:ok, _ast, _leftover} -> {:error, :trailing_tokens}
+      {:ok, _ast, leftover} -> unexpected(:trailing_tokens, leftover)
       {:error, _reason} = error -> error
     end
   end
@@ -153,7 +155,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
         tokenize(String.trim_leading(after_token), [expr_token(groups) | acc])
 
       nil ->
-        {:error, :unexpected_character}
+        {:error, {:unexpected_character, String.first(rest)}}
     end
   end
 
@@ -309,11 +311,11 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
 
     case rest do
       [{:word, kind} | more] -> parse_is_kind(left, String.upcase(kind), negated, more)
-      _other -> {:error, :unexpected_token}
+      other -> unexpected(:unexpected_token, other)
     end
   end
 
-  defp parse_is(_left, _rest), do: {:error, :unexpected_token}
+  defp parse_is(_left, rest), do: unexpected(:unexpected_token, rest)
 
   defp parse_is_kind(left, "NULL", negated, rest), do: {:ok, {:is_null, left, negated}, rest}
 
@@ -331,23 +333,23 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
       with {:ok, right, rest} <- parse_or(rest),
            do: {:ok, {:is_distinct, left, right, negated}, rest}
     else
-      {:error, :unexpected_token}
+      unexpected(:unexpected_token, [{:word, from} | rest])
     end
   end
 
-  defp parse_is_kind(_left, _kind, _negated, _rest), do: {:error, :unsupported_is}
+  defp parse_is_kind(_left, kind, _negated, _rest), do: {:error, {:unsupported_is, kind}}
 
   defp parse_in(left, [{:tok, "("} | rest], negated) do
     with {:ok, items, rest} <- parse_list(rest, []), do: {:ok, {:in, left, items, negated}, rest}
   end
 
-  defp parse_in(_left, _rest, _negated), do: {:error, :unexpected_token}
+  defp parse_in(_left, rest, _negated), do: unexpected(:unexpected_token, rest)
 
   defp parse_list(tokens, acc) do
     case parse_or(tokens) do
       {:ok, item, [{:tok, ","} | rest]} -> parse_list(rest, [item | acc])
       {:ok, item, [{:tok, ")"} | rest]} -> {:ok, Enum.reverse([item | acc]), rest}
-      {:ok, _item, _rest} -> {:error, :unbalanced_parenthesis}
+      {:ok, _item, rest} -> unexpected(:unbalanced_parenthesis, rest)
       {:error, _reason} = error -> error
     end
   end
@@ -359,7 +361,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
       {:ok, {:between, left, low, high, negated}, rest}
     else
       {:error, _reason} = error -> error
-      _shape -> {:error, :unexpected_token}
+      _shape -> unexpected(:unexpected_token, tokens)
     end
   end
 
@@ -434,11 +436,12 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   end
 
   # `expr::TYPE` is `CAST(expr AS TYPE)`.
-  defp parse_shorthand(expr, [{:tok, "::"}, {:word, type} | rest]) do
-    with {:ok, target} <- cast_type(type), do: parse_shorthand({:cast, expr, target}, rest)
+  defp parse_shorthand(expr, [{:tok, "::"}, {:word, _type} | _more] = tokens) do
+    with {:ok, target, rest} <- SQLCastType.read(tl(tokens)),
+         do: parse_shorthand({:cast, expr, target}, rest)
   end
 
-  defp parse_shorthand(_expr, [{:tok, "::"} | _rest]), do: {:error, :invalid_cast}
+  defp parse_shorthand(_expr, [{:tok, "::"} | rest]), do: unexpected(:invalid_cast, rest)
   defp parse_shorthand(expr, rest), do: {:ok, expr, rest}
 
   # A `-` directly before a number is the number's sign, as DataFusion reads
@@ -479,12 +482,12 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   defp parse_primary([{:tok, "("} | rest]) do
     case parse_or(rest) do
       {:ok, inner, [{:tok, ")"} | rest]} -> {:ok, inner, rest}
-      {:ok, _inner, _rest} -> {:error, :unbalanced_parenthesis}
+      {:ok, _inner, rest} -> unexpected(:unbalanced_parenthesis, rest)
       {:error, _reason} = error -> error
     end
   end
 
-  defp parse_primary(_tokens), do: {:error, :unexpected_token}
+  defp parse_primary(tokens), do: unexpected(:unexpected_token, tokens)
 
   # A bare `true`, `false` or `null` is a literal; any other word a column.
   defp parse_word(word, rest, _tokens), do: {:ok, word_value(word), rest}
@@ -502,13 +505,13 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   # CAST(expr AS type): the tokens are `(`, the expression, `AS`, the type
   # name and `)`.
   defp parse_cast(tokens) do
-    with {:ok, inner, [{:word, as_kw}, {:word, type}, {:tok, ")"} | rest]}
+    with {:ok, inner, [{:word, as_kw}, {:word, _type} | _more] = after_inner}
          when as_kw in ["AS", "as", "As"] <- parse_or(tokens),
-         {:ok, target} <- cast_type(type) do
+         {:ok, target, [{:tok, ")"} | rest]} <- SQLCastType.read(tl(after_inner)) do
       {:ok, {:cast, inner, target}, rest}
     else
       {:error, _reason} = error -> error
-      _shape -> {:error, :invalid_cast}
+      _shape -> unexpected(:invalid_cast, tokens)
     end
   end
 
@@ -528,10 +531,10 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
         [{:word, end_word} | rest] ->
           if keyword?(end_word, "END"),
             do: {:ok, {:case, operand, whens, otherwise}, rest},
-            else: {:error, :invalid_case}
+            else: unexpected(:invalid_case, [{:word, end_word} | rest])
 
-        _other ->
-          {:error, :invalid_case}
+        other ->
+          unexpected(:invalid_case, other)
       end
     end
   end
@@ -550,7 +553,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
         case_whens(rest, [{condition, result} | acc])
       else
         {:error, _reason} = error -> error
-        _shape -> {:error, :invalid_case}
+        _shape -> unexpected(:invalid_case, rest)
       end
     else
       case_whens_done([{:word, word} | rest], acc)
@@ -559,7 +562,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
 
   defp case_whens(tokens, acc), do: case_whens_done(tokens, acc)
 
-  defp case_whens_done(_tokens, []), do: {:error, :invalid_case}
+  defp case_whens_done(tokens, []), do: unexpected(:invalid_case, tokens)
   defp case_whens_done(tokens, acc), do: {:ok, Enum.reverse(acc), tokens}
 
   defp case_else([{:word, word} | rest] = tokens) do
@@ -571,6 +574,78 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   end
 
   defp case_else(tokens), do: {:ok, nil, tokens}
+
+  # The error for the token the parser stopped at (`nil` for the end of the text).
+  @spec unexpected(atom(), [term()]) :: {:error, {atom(), binary() | nil}}
+  defp unexpected(kind, tokens), do: {:error, {kind, tokens |> List.first() |> token_text()}}
+
+  @spec token_text(term()) :: binary() | nil
+  defp token_text(nil), do: nil
+  defp token_text({:word, word}), do: word
+  defp token_text({:num, text}), do: text
+  defp token_text({:str, text}), do: "'" <> text <> "'"
+  defp token_text({:tok, symbol}), do: symbol
+  defp token_text({:param, name}), do: "$" <> name
+  defp token_text({:quoted, name}), do: name
+  defp token_text({:qualified, qualifier, column}), do: qualifier <> "." <> column
+
+  @doc """
+  The refusal for text the expression parser cannot read, which says why when the parser knows
+  (the token it stopped at, the function it has not, the type of a cast it does not compute),
+  else only what was refused. `label` names where the text stood (`column`, `WHERE clause`),
+  `printed` is the text as written there and `text` the expression read from it.
+  """
+  @spec refusal(binary(), binary(), binary()) :: SQLError.t()
+  def refusal(label, printed, text) do
+    case parse(text) do
+      {:error, {:cast_type, message}} ->
+        SQLError.refusal(message)
+
+      {:error, reason} ->
+        SQLError.refusal("unsupported #{label}: #{printed} (#{describe(reason)})")
+
+      {:ok, _expr} ->
+        SQLError.refusal("unsupported #{label}: #{printed}")
+    end
+  end
+
+  @spec describe(term()) :: binary()
+  defp describe({:unsupported_function, name}),
+    do: "the function #{name} is not one the double has"
+
+  defp describe({:unexpected_character, char}), do: "the character #{char} is not one it reads"
+
+  defp describe({:trailing_tokens, token}),
+    do: "it goes on at #{token}, where an operator is expected"
+
+  defp describe({:unexpected_token, "*"}), do: "* is a wildcard, not an expression"
+  defp describe({:unexpected_token, nil}), do: "the text ends where an operand is expected"
+  defp describe({:unexpected_token, token}), do: "#{token} is not an operand it reads here"
+  defp describe({:unbalanced_parenthesis, nil}), do: "a parenthesis is not closed"
+
+  defp describe({:unbalanced_parenthesis, token}),
+    do: "#{token} stands where a parenthesis closes"
+
+  defp describe({:invalid_cast, nil}),
+    do: "a cast ends where its type or its parenthesis is expected"
+
+  defp describe({:invalid_cast, token}),
+    do: "#{token} stands where a cast reads its type or closes"
+
+  defp describe({:invalid_case, nil}),
+    do: "a CASE ends where WHEN, THEN, ELSE or END is expected"
+
+  defp describe({:invalid_case, token}),
+    do: "#{token} stands where a CASE reads WHEN, THEN, ELSE or END"
+
+  defp describe({:named_argument, name}),
+    do: "the argument #{name} is named, and the double reads no named argument"
+
+  defp describe({:unsupported_is, kind}),
+    do: "IS #{kind} is not a test it reads"
+
+  defp describe(:pattern_too_large), do: "its LIKE pattern is too large for the double"
+  defp describe(other), do: inspect(other)
 
   @spec keyword?(binary(), binary()) :: boolean()
   defp keyword?(word, keyword), do: String.upcase(word) == keyword
@@ -605,6 +680,10 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   defp parse_call(function, [{:tok, ")"} | rest]), do: {:ok, {:call, function, []}, rest}
   defp parse_call(function, tokens), do: parse_call_args(function, tokens, [])
 
+  defp parse_call_args(_function, [{kind, name}, {:tok, "=>"} | _rest], _args)
+       when kind in [:word, :quoted],
+       do: {:error, {:named_argument, name}}
+
   defp parse_call_args(function, tokens, args) do
     case parse_or(tokens) do
       {:ok, arg, [{:tok, ","} | rest]} ->
@@ -613,29 +692,11 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
       {:ok, arg, [{:tok, ")"} | rest]} ->
         {:ok, {:call, function, Enum.reverse([arg | args])}, rest}
 
-      {:ok, _arg, _rest} ->
-        {:error, :unbalanced_parenthesis}
+      {:ok, _arg, rest} ->
+        unexpected(:unbalanced_parenthesis, rest)
 
       {:error, _reason} = error ->
         error
-    end
-  end
-
-  # The SQL type names DataFusion accepts for the casts the double performs
-  # (verified: `INT` is `Int32`, `SMALLINT` `Int16`, `TINYINT` `Int8`,
-  # `BIGINT` `Int64`, `DOUBLE` `Float64`); anything else is outside the
-  # subset, `FLOAT` and `REAL` (`Float32`) and the unsigned and decimal types
-  # among it.
-  @spec cast_type(binary()) :: {:ok, cast_type()} | {:error, term()}
-  defp cast_type(type) do
-    case String.upcase(type) do
-      t when t in ~w(INTEGER INT INT4) -> {:ok, :int32}
-      t when t in ~w(SMALLINT INT2) -> {:ok, :int16}
-      "TINYINT" -> {:ok, :int8}
-      t when t in ~w(BIGINT INT8) -> {:ok, :int64}
-      t when t in ~w(DOUBLE FLOAT8) -> {:ok, :float}
-      t when t in ~w(VARCHAR STRING TEXT CHAR) -> {:ok, :string}
-      _other -> {:error, {:unsupported_cast_type, type}}
     end
   end
 

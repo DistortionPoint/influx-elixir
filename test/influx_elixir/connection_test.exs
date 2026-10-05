@@ -22,9 +22,9 @@ defmodule InfluxElixir.ConnectionTest do
 
       assert :ok = Connection.put(name, config)
       assert {:ok, retrieved} = Connection.get(name)
-      assert retrieved[:host] == "localhost"
-      assert retrieved[:token] == "abc"
-      assert retrieved[:port] == 8086
+      assert retrieved[:host] === "localhost"
+      assert retrieved[:token] === "abc"
+      assert retrieved[:port] === 8086
     end
 
     test "stored config is returned verbatim as a keyword list" do
@@ -35,7 +35,7 @@ defmodule InfluxElixir.ConnectionTest do
 
       Connection.put(name, config)
       assert {:ok, got} = Connection.get(name)
-      assert got == config
+      assert got === config
     end
 
     test "overwriting a name replaces the stored config" do
@@ -46,7 +46,7 @@ defmodule InfluxElixir.ConnectionTest do
       Connection.put(name, host: "second", token: "t")
 
       assert {:ok, got} = Connection.get(name)
-      assert got[:host] == "second"
+      assert got[:host] === "second"
     end
 
     test "different names are stored independently" do
@@ -63,8 +63,8 @@ defmodule InfluxElixir.ConnectionTest do
 
       assert {:ok, a} = Connection.get(name_a)
       assert {:ok, b} = Connection.get(name_b)
-      assert a[:host] == "alpha"
-      assert b[:host] == "beta"
+      assert a[:host] === "alpha"
+      assert b[:host] === "beta"
     end
   end
 
@@ -99,7 +99,7 @@ defmodule InfluxElixir.ConnectionTest do
 
       Connection.put(name, host: "h", token: "t")
       config = Connection.fetch!(name)
-      assert config[:host] == "h"
+      assert config[:host] === "h"
     end
 
     test "raises an ArgumentError that names the missing connection" do
@@ -163,7 +163,7 @@ defmodule InfluxElixir.ConnectionTest do
 
       assert {:error, :not_found} = Connection.get(name_a)
       assert {:ok, b} = Connection.get(name_b)
-      assert b[:host] == "b"
+      assert b[:host] === "b"
     end
   end
 
@@ -173,11 +173,11 @@ defmodule InfluxElixir.ConnectionTest do
 
   describe "finch_name/1" do
     test "derives the pool name from the connection name" do
-      assert Connection.finch_name(:my_conn) == :influx_elixir_my_conn_finch
+      assert Connection.finch_name(:my_conn) === :influx_elixir_my_conn_finch
     end
 
     test "returns different atoms for different connection names" do
-      refute Connection.finch_name(:conn_a) == Connection.finch_name(:conn_b)
+      refute Connection.finch_name(:conn_a) === Connection.finch_name(:conn_b)
     end
   end
 end

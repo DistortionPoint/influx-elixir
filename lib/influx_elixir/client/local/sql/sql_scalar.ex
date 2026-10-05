@@ -203,9 +203,13 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
   defp natural_log(:inf), do: :inf
   defp natural_log(_negative_or_special), do: :nan
 
+  # The engine takes the exponent of an integer power as a `u32` and closes the connection for
+  # one it cannot (verified: `power(1, 4294967296)`).
+  @u32_max 4_294_967_295
+
   @spec power(term(), term()) :: term()
   defp power(base, exponent) when is_integer(base) and is_integer(exponent) do
-    if exponent < 0, do: closed(), else: checked_power(base, exponent)
+    if exponent < 0 or exponent > @u32_max, do: closed(), else: checked_power(base, exponent)
   end
 
   defp power(base, exponent) do
@@ -222,6 +226,8 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
   defp tagged?(value), do: is_tuple(value)
 
   @spec checked_power(integer(), non_neg_integer()) :: integer()
+  defp checked_power(base, exponent) when abs(base) >= 2 and exponent > 64, do: closed()
+
   defp checked_power(base, exponent) do
     result = Integer.pow(base, exponent)
 

@@ -78,8 +78,32 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
       |> Enum.map(&(&1 |> String.trim() |> select_item(namer)))
 
     with {:ok, rest} <- rewrite_clause(rest, @group_clause, &group_term(&1, items, qualified)) do
-      rewrite_clause(rest, @order_clause, &order_term(&1, items))
+      order_clause(rest, items)
     end
+  end
+
+  # A position of the `ORDER BY` that names no item is the engine's error as it plans the sort,
+  # after the errors of the tables and columns and of the select list: the clause is left as it
+  # is, for the planner's check to raise the error at its place.
+  @spec order_clause(binary(), [{binary(), binary()}]) :: {:ok, binary()} | {:error, map()}
+  defp order_clause(rest, items) do
+    case rewrite_clause(rest, @order_clause, &order_term(&1, items)) do
+      {:error, %{body: "Error during planning: " <> message}} = error ->
+        if position_error?(message), do: {:ok, rest}, else: error
+
+      other ->
+        other
+    end
+  end
+
+  @spec position_error?(binary()) :: boolean()
+  defp position_error?(message) do
+    String.starts_with?(message, [
+      "Order by column out of bounds",
+      "Order by index starts at 1",
+      "number too large to fit",
+      "invalid digit found"
+    ])
   end
 
   # {expression, output name} of one select item.
@@ -157,9 +181,10 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
 
   @spec order_term(binary(), [{binary(), binary()}]) :: {:ok, binary()} | {:error, map()}
   defp order_term(term, items) do
+    # The direction and the placement of the nulls follow the target, each of them optional.
     {target, direction} =
-      case SQLMask.run(~r/^(.+?)\s+(ASC|DESC)$/isu, term) do
-        [_full, target, direction] -> {target, " " <> direction}
+      case SQLMask.run(~r/^(.+?)((?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?)$/isu, term) do
+        [_full, target, direction] -> {target, direction}
         nil -> {term, ""}
       end
 
@@ -199,6 +224,25 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
         :not_positional
     end
   end
+
+  @doc """
+  The engine's error for an `ORDER BY` term that is a position among `count` select items and
+  names none, or `nil` for any other term. A number with a fraction reads as an expression.
+  """
+  @spec position_error(term(), non_neg_integer()) :: SQLError.t() | nil
+  def position_error(target, count) when is_binary(target) do
+    case order_position(target, count) do
+      {:error, error} -> error
+      _positional_or_not -> nil
+    end
+  end
+
+  def position_error({:expr, {:lit, value}}, _count) do
+    if value == :inf or (is_float(value) and match?(<<0::1, _rest::63>>, <<value::float>>)),
+      do: SQLError.planning("invalid digit found in string")
+  end
+
+  def position_error(_term, _count), do: nil
 
   @spec checked_position(non_neg_integer(), non_neg_integer()) ::
           {:ok, pos_integer()} | {:error, SQLError.t()}
@@ -361,7 +405,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
     else
       case SQLExpr.parse(item) do
         {:ok, expr} -> {:ok, {:expr, expr}}
-        {:error, _reason} -> {:error, SQLError.refusal("unsupported GROUP BY: #{item}")}
+        {:error, _reason} -> {:error, SQLExpr.refusal("GROUP BY", item, item)}
       end
     end
   end
@@ -486,10 +530,18 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   @spec order_expression(binary()) :: {:expr, SQLExpr.t()}
   defp order_expression(target) do
     case SQLExpr.parse(target) do
+      {:ok, {:lit, value} = expr} when is_float(value) -> {:expr, parenthesized(expr, target)}
       {:ok, expr} -> {:expr, expr}
       {:error, _reason} -> {:expr, {:unreadable, target}}
     end
   end
+
+  # A number with a fraction in parentheses is an expression of a constant, not the position
+  # that the bare number is taken for (verified: `ORDER BY (1.5)` sorts by nothing, where
+  # `ORDER BY 1.5` is an error); a cast to the same type keeps the two apart.
+  @spec parenthesized(SQLExpr.t(), binary()) :: SQLExpr.t()
+  defp parenthesized(expr, target),
+    do: if(String.starts_with?(target, "("), do: {:cast, expr, :float}, else: expr)
 
   @doc """
   The refusal of an `ORDER BY` term the double cannot read (a function it
@@ -501,7 +553,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   def unreadable_order(order_by) do
     case Enum.find(order_by, &match?({{:expr, {:unreadable, _text}}, _direction}, &1)) do
       {{:expr, {:unreadable, text}}, _direction} ->
-        {:error, SQLError.refusal("unsupported ORDER BY: #{text}")}
+        {:error, SQLExpr.refusal("ORDER BY", text, text)}
 
       nil ->
         :ok

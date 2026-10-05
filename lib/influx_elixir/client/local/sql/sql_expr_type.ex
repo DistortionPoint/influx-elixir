@@ -36,6 +36,7 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
   # for a `CASE`, and for what is made of one.
 
   alias InfluxElixir.Client.Local.{
+    SQLAggType,
     SQLCast,
     SQLCommonType,
     SQLExpr,
@@ -142,6 +143,11 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
   def node_type(expr, _columns, _memo, _phase)
       when is_tuple(expr) and elem(expr, 0) in @booleans,
       do: "Boolean"
+
+  # An aggregate the planner types differently from the coercion has its planner type under
+  # the key `SQLAggType.plan_key/1` gives.
+  def node_type({:field, ref}, columns, _memo, :plan) when is_binary(ref),
+    do: Map.get(columns, SQLAggType.plan_key(ref)) || Map.get(columns, ref)
 
   def node_type({:field, ref}, columns, _memo, _phase), do: Map.get(columns, ref)
   def node_type({:lit, nil}, _columns, _memo, _phase), do: "Null"

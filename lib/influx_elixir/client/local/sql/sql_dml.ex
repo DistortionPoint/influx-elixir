@@ -1,11 +1,13 @@
 defmodule InfluxElixir.Client.Local.SQLDml do
   @moduledoc false
   # The planner's answer to an `INSERT`, an `UPDATE` or a `DELETE`, which it never runs
-  # (verified against InfluxDB 3 Core): the planner's steps are followed in their order, and
-  # the answer is the first error of them, else `DML not supported: <kind>`. A statement is
+  # (verified against InfluxDB 3 Core 3.10.1): the planner's steps are followed in their order,
+  # and the answer is the first error of them, else `DML not supported: <kind>`. A statement is
   # read by the module of its kind (`SQLDmlInsert`, `SQLDmlDelete`, and `UPDATE` below); all
-  # three look their table up by `SQLDmlName.lookup/2`, read their operands with
-  # `SQLDmlExpr` and plan them with `SQLDmlOperand`.
+  # three look their table up by `SQLDmlName.lookup/2` (which is `SQLTable.locate/1`, the
+  # resolver a query uses too), read their operands with `SQLDmlExpr` and plan them with
+  # `SQLDmlOperand`. What the reader declines to read it asks `SQLSyntax` to read, and
+  # `parse_error/1` is what `SQLSyntax` asks of it for a statement followed by another.
   #
   # The double answers the shapes it verified and refuses the rest by name:
   #
@@ -26,13 +28,14 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   # table.
 
   alias InfluxElixir.Client.Local.{
-    SQLDmlCatalog,
     SQLDmlDelete,
     SQLDmlExpr,
     SQLDmlInsert,
     SQLDmlName,
     SQLDmlOperand,
     SQLError,
+    SQLSyntax,
+    SQLTable,
     SQLTokenizer
   }
 
@@ -63,10 +66,41 @@ defmodule InfluxElixir.Client.Local.SQLDml do
     env = %{tables: tables, columns_of: columns_of, planner: planner}
 
     case SQLTokenizer.tokenize(without_leading_semicolons(statement)) do
-      {:ok, tokens} -> answer(kind, split_end(tokens), env)
+      {:ok, tokens} -> kind |> answer(split_end(tokens), env) |> or_syntax(statement)
       :bail -> not_modelled(kind, "a statement the tokenizer does not read")
     end
   end
+
+  # What this reader declines to read, the syntax reader may (`DELETE FROM`, with no table, is the
+  # parser's error): it is asked only then, as it reads the whole text again.
+  @spec or_syntax(SQLError.t() | map(), binary()) :: SQLError.t() | map()
+  defp or_syntax(%{body: "Client.Local: " <> _reason} = refusal, statement) do
+    case SQLSyntax.check_statements(statement) do
+      {:error, error} -> error
+      :ok -> refusal
+    end
+  end
+
+  defp or_syntax(answer, _statement), do: answer
+
+  @doc """
+  The parser's error for the tokens of an `INSERT`, an `UPDATE` or a `DELETE` (the token that
+  ends the text last), `nil` when it reads them or this reader does not say. The parser reads a
+  statement whole before it reads the next one of the same text, so its error for the first is
+  that of the text.
+  """
+  @spec parse_error([token()]) :: SQLError.t() | map() | nil
+  def parse_error(tokens) do
+    case parsed(split_end(tokens)) do
+      {:error, %{body: "SQL error: ParserError" <> _rest} = error} -> error
+      _other -> nil
+    end
+  end
+
+  @spec parsed({[token()], token()}) :: term()
+  defp parsed({[{:word, _p, "INSERT", _l, _c} | rest], stop}), do: SQLDmlInsert.parse(rest, stop)
+  defp parsed({[{:word, _p, "UPDATE", _l, _c} | rest], stop}), do: parse_update(rest, stop)
+  defp parsed({[{:word, _p, "DELETE", _l, _c} | rest], stop}), do: SQLDmlDelete.parse(rest, stop)
 
   # The empty statements before the statement are blanked, so that the line and column of
   # what it says stay those of the text (the tokenizer ends a text at its first `;`).
@@ -112,7 +146,7 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   end
 
   @doc false
-  @type table :: binary() | {:catalog, binary(), binary()}
+  @type table :: binary() | {:catalog, [SQLTable.column()]}
 
   @spec context(table(), [binary()], env()) :: SQLDmlOperand.ctx()
   def context(table, relation, env) do
@@ -131,10 +165,10 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   # A table's columns in the order the engine lists them, and their Arrow types by name.
   @doc false
   @spec table_schema(table(), env()) :: {[binary()], %{binary() => binary()}}
-  def table_schema({:catalog, schema, name}, _env) do
-    columns = SQLDmlCatalog.columns(schema, name)
-    {Enum.map(columns, &elem(&1, 0)), Map.new(columns)}
-  end
+  def table_schema({:catalog, columns}, _env),
+    do:
+      {Enum.map(columns, &elem(&1, 0)),
+       Map.new(columns, fn {name, type, _nullable} -> {name, type} end)}
 
   def table_schema(table, env),
     do: {env.columns_of.(table), Map.new(env.columns_of.({:types, table}))}
@@ -193,20 +227,8 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   #   5. the value of each column that is assigned, in the order of the table's columns (the last
   #      of two assignments to a column wins) is planned, and converted to the column's type
   @spec update([token()], token(), env()) :: SQLError.t() | map()
-  defp update(
-         [{:word, _p, "OR", _l, _c}, {:word, _p2, conflict, _l2, _c2} | rest],
-         stop,
-         env
-       )
-       when conflict in ~w(REPLACE IGNORE ABORT ROLLBACK FAIL),
-       do: update(rest, stop, env, true)
-
-  defp update(tokens, stop, env), do: update(tokens, stop, env, false)
-
-  @spec update([token()], token(), env(), boolean()) :: SQLError.t() | map()
-  defp update(tokens, stop, env, conflict?) do
-    with {:ok, reference, rest} <- SQLDmlName.reference(tokens),
-         {:ok, clauses} <- SQLDmlExpr.clauses(rest ++ [stop]),
+  defp update(tokens, stop, env) do
+    with {:ok, reference, clauses, conflict?} <- parse_update(tokens, stop),
          :ok <- SQLDmlName.arity(reference) do
       cond do
         clauses.returning -> SQLError.planning("Update-returning clause not yet supported")
@@ -218,6 +240,27 @@ defmodule InfluxElixir.Client.Local.SQLDml do
       {:error, error} -> error
       {:refuse, why} -> not_modelled(:update, why)
     end
+  end
+
+  # What the parser reads of an `UPDATE`: the table, the clauses, and whether an `OR REPLACE`
+  # (or the like) came before the table.
+  @spec parse_update([token()], token()) ::
+          {:ok, [binary()], SQLDmlExpr.clauses(), boolean()}
+          | {:error, SQLError.t() | map()}
+          | {:refuse, binary()}
+  defp parse_update(
+         [{:word, _p, "OR", _l, _c}, {:word, _p2, conflict, _l2, _c2} | rest],
+         stop
+       )
+       when conflict in ~w(REPLACE IGNORE ABORT ROLLBACK FAIL),
+       do: parse_update(rest, stop, true)
+
+  defp parse_update(tokens, stop), do: parse_update(tokens, stop, false)
+
+  defp parse_update(tokens, stop, conflict?) do
+    with {:ok, reference, rest} <- SQLDmlName.reference(tokens),
+         {:ok, clauses} <- SQLDmlExpr.clauses(rest ++ [stop]),
+         do: {:ok, reference, clauses, conflict?}
   end
 
   @spec limit_error() :: map()
@@ -326,8 +369,11 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   @spec deep_values([binary()], map(), SQLDmlOperand.ctx()) :: SQLDmlOperand.check()
   defp deep_values(columns, assigned, ctx) do
     Enum.reduce_while(columns, :ok, fn column, :ok ->
-      case SQLDmlOperand.deep(Map.fetch!(assigned, column), ctx) do
-        :ok -> {:cont, :ok}
+      value = Map.fetch!(assigned, column)
+
+      with :ok <- SQLDmlOperand.deep(value, ctx), :ok <- SQLDmlOperand.late(value, ctx) do
+        {:cont, :ok}
+      else
         failure -> {:halt, failure}
       end
     end)

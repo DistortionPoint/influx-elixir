@@ -10,7 +10,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   # right (`InfluxElixir.Client.Local.SQLWhere.tree/1`):
   #
   #   * `x AND false` is false and `x OR true` is true, in either order, and
-  #     `x AND true` and `x OR false` are `x`
+  #     `x AND true` and `x OR false` are `x`; `NULL AND NULL` and `NULL OR NULL` are `NULL`
   #   * absorption, purely on the syntax of two binary nodes: `A AND (A OR B)`
   #     and `A OR (A AND B)` are `A`, with `A` on either side of either node,
   #     and the pair standing anywhere in a larger `AND` or `OR`. A third
@@ -27,31 +27,67 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   #     folded first and fails the query, and the comparisons of `time` the
   #     scan takes its range from stay)
   #
+  # That last rule, and the one of `BETWEEN`, are about the rows a filter reads: a row is never
+  # run through a conjunct once another is NULL. They are not what the optimizer proves: it
+  # replaces the plan with an empty relation only for a filter that is a constant false or NULL
+  # as a whole, so `n = 1 AND NULL` is not empty to it and `n = NULL AND n = NULL` is. The
+  # `strict` reading of a `WHERE` leaves those two rules out and adds the contradictory
+  # equalities of `InfluxElixir.Client.Local.SQLContradict`; it is what decides whether the
+  # physical plan is built for the select list (`InfluxElixir.Client.Local.SQLPrune`).
+  #
   # In a select list an arithmetic operation with a NULL literal operand is
   # NULL without reading the other operand, when that reads a column.
   #
   # The result is the `WHERE` as a conjunction list again, or the list it was
   # when nothing is removed.
 
-  alias InfluxElixir.Client.Local.{SQLExpr, SQLFold, SQLParser, SQLPredicate, SQLWhere}
+  alias InfluxElixir.Client.Local.{
+    SQLContradict,
+    SQLExpr,
+    SQLFold,
+    SQLParser,
+    SQLPredicate,
+    SQLWhere
+  }
 
   @comparisons [:eq, :ne, :gt, :lt, :gte, :lte]
 
   @typep tree :: SQLWhere.tree() | :null
+  @typep context :: %{strict: boolean(), types: %{binary() => binary()}}
+
+  @plain %{strict: false, types: %{}}
 
   @doc """
   The query with the part of its `WHERE` and select list the engine's
   simplifier removes taken out.
   """
   @spec apply(SQLParser.parsed_query()) :: SQLParser.parsed_query()
-  def apply(query) do
-    %{query | where: where(query), projection_columns: projection(query.projection_columns)}
+  def apply(query), do: simplify_query(query, @plain)
+
+  @doc """
+  The same, read as the optimizer reads a filter (see the top of this module): `types` are the
+  Arrow types of the columns of the equalities, to know which of them contradict.
+  """
+  @spec apply_strict(SQLParser.parsed_query(), %{binary() => binary()}) ::
+          SQLParser.parsed_query()
+  def apply_strict(query, types), do: simplify_query(query, strict(types))
+
+  @spec simplify_query(SQLParser.parsed_query(), context()) :: SQLParser.parsed_query()
+  defp simplify_query(query, context) do
+    %{
+      query
+      | where: where(query, context),
+        projection_columns: projection(query.projection_columns)
+    }
   end
+
+  @spec strict(%{binary() => binary()}) :: context()
+  defp strict(types), do: %{strict: true, types: types}
 
   @doc "Whether the `WHERE` is false for every row once the simplifier has folded it."
   @spec never?(SQLParser.parsed_query()) :: boolean()
   def never?(query) do
-    nodes = where(query)
+    nodes = where(query, @plain)
     {:or, []} in nodes or {:eq, "time", nil} in nodes
   end
 
@@ -59,15 +95,17 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   Whether the engine's optimizer proves that the query answers no row, and replaces its plan
   with an empty relation: no physical plan is then built for its select list, so what the
   physical planner would refuse (a negation of an unsigned integer) is never met (verified
-  against Core). It is a `LIMIT 0`; a `HAVING` that is false; and a `WHERE` that is false (a
-  `NULL`, a constant, an `AND` with a false, two equalities of a column to different values,
-  or `IN` lists that share none), but not for an aggregate that is not grouped, which answers
-  its one row whatever the `WHERE` leaves.
+  against Core). It is a `LIMIT 0`; a `HAVING` that is false; and a `WHERE` that is, as a whole,
+  false or `NULL` once the simplifier has folded it (a constant, an `AND` with a false, equalities
+  of one expression to different values, or `IN` lists that share none, see
+  `InfluxElixir.Client.Local.SQLContradict`), but not for an aggregate that is not grouped,
+  which answers its one row whatever the `WHERE` leaves. `types` are the Arrow types of the
+  columns the equalities read.
   """
-  @spec empty?(SQLParser.parsed_query()) :: boolean()
-  def empty?(query) do
+  @spec empty?(SQLParser.parsed_query(), %{binary() => binary()}) :: boolean()
+  def empty?(query, types \\ %{}) do
     query.limit == 0 or having_never?(query.having) or
-      ((never?(query) or contradiction?(where(query))) and not one_group?(query))
+      (filter_false?(query, types) and not one_group?(query))
   end
 
   @spec having_never?(map() | nil) :: boolean()
@@ -81,58 +119,44 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
       query.select_columns != nil and (query.group_by_columns || []) == [] and
         is_nil(query.group_by_interval)
 
-  # Two top-level conjuncts that read a column and share no value of it: `x = 1 AND x = 2`,
-  # `x IN (1, 2) AND x = 3` (verified for integers, unsigned integers, floats, text, tags and
-  # `time` strings; an integer beside a float is not folded, nor is a range, nor an `OR`).
-  @spec contradiction?([SQLParser.where_node()]) :: boolean()
-  defp contradiction?(nodes) do
-    nodes
-    |> Enum.flat_map(&value_set/1)
-    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
-    |> Enum.any?(fn {_column, sets} -> disjoint?(sets) end)
+  # The strict `WHERE` is a constant false or NULL as a whole.
+  @spec filter_false?(SQLParser.parsed_query(), %{binary() => binary()}) :: boolean()
+  defp filter_false?(query, types) do
+    case simplified(query, strict(types)) do
+      {:ok, tree} -> tree in [{:const, false}, :null]
+      :error -> {:or, []} in query.where or {:eq, "time", nil} in query.where
+    end
   end
 
-  @spec value_set(SQLParser.where_node()) :: [{binary(), MapSet.t()}]
-  defp value_set({:eq, column, value}) when is_binary(column),
-    do: value_set({:in, column, [value]})
-
-  defp value_set({:in, column, values}) when is_binary(column) and is_list(values) do
-    keys = Enum.map(values, &value_key/1)
-    if :error in keys, do: [], else: [{column, MapSet.new(keys)}]
-  end
-
-  defp value_set(_node), do: []
-
-  # A literal as the engine compares it: integers and unsigned integers are the same number,
-  # a float or a string only itself.
-  @spec value_key(term()) :: {atom(), term()} | :error
-  defp value_key(value) when is_integer(value), do: {:int, value}
-  defp value_key({:uint, value}) when is_integer(value), do: {:int, value}
-  defp value_key(value) when is_float(value), do: {:float, value}
-  defp value_key(value) when is_binary(value), do: {:str, value}
-  defp value_key(_other), do: :error
-
-  # Whether the sets, all of one kind of value, have no value in common.
-  @spec disjoint?([MapSet.t()]) :: boolean()
-  defp disjoint?([_one]), do: false
-
-  defp disjoint?(sets) do
-    kinds = sets |> Enum.flat_map(&MapSet.to_list/1) |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
-    length(kinds) == 1 and Enum.reduce(sets, &MapSet.intersection/2) == MapSet.new()
-  end
-
-  @spec where(SQLParser.parsed_query()) :: [SQLParser.where_node()]
-  defp where(%{where_tree: nil, where: where}), do: where
-
-  defp where(%{where_tree: tree, where: where}) do
-    leaves = leaves(where)
-
-    with {:ok, bound} <- bind_leaves(tree, leaves),
-         simplified when simplified != bound <- bound |> simplify() |> top_level_null() do
+  @spec where(SQLParser.parsed_query(), context()) :: [SQLParser.where_node()]
+  defp where(%{where: where} = query, context) do
+    with {:ok, bound} <- bound(query),
+         simplified when simplified != bound <- bound |> simplify(context) |> finish(context) do
       flatten(simplified)
     else
       _unchanged -> where
     end
+  end
+
+  # The simplified `WHERE` as a tree.
+  @spec simplified(SQLParser.parsed_query(), context()) :: {:ok, tree()} | :error
+  defp simplified(query, context) do
+    with {:ok, bound} <- bound(query), do: {:ok, bound |> simplify(context) |> finish(context)}
+  end
+
+  # The `WHERE` as written, with the predicates the query now has.
+  @spec bound(SQLParser.parsed_query()) :: {:ok, SQLWhere.tree()} | :error
+  defp bound(%{where_tree: nil}), do: :error
+  defp bound(%{where_tree: tree, where: where}), do: bind_leaves(tree, leaves(where))
+
+  # What is left once the rules have run over the tree: the rows' reading of a NULL conjunct,
+  # or the optimizer's reading of the equalities.
+  @spec finish(tree(), context()) :: tree()
+  defp finish(tree, %{strict: false}), do: top_level_null(tree)
+
+  defp finish(tree, %{strict: true, types: types}) do
+    clauses = for {:leaf, clause} <- conjuncts(tree), do: clause
+    if SQLContradict.conflict?(clauses, types), do: {:const, false}, else: tree
   end
 
   # ---------------------------------------------------------------------------
@@ -193,20 +217,45 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   # The rules
   # ---------------------------------------------------------------------------
 
-  @spec simplify(tree()) :: tree()
-  defp simplify({:and, left, right}), do: conjoin(simplify(left), simplify(right))
-  defp simplify({:or, left, right}), do: disjoin(simplify(left), simplify(right))
-  defp simplify({:not, inner}), do: negate(simplify(inner))
-  defp simplify({:leaf, clause}), do: leaf(clause)
-  defp simplify(other), do: other
+  @spec simplify(tree(), context()) :: tree()
+  # An `IN (NULL)` beside an `IN` list folds with it (to nothing) before it is read as a NULL.
+  defp simplify({:and, {:leaf, left_clause} = left, {:leaf, right_clause} = right}, context) do
+    case SQLContradict.intersect(left_clause, right_clause, context.types) do
+      :empty -> {:const, false}
+      _no_fold -> conjoin(simplify(left, context), simplify(right, context), context)
+    end
+  end
 
-  @spec conjoin(tree(), tree()) :: tree()
-  defp conjoin({:const, false} = never, _right), do: never
-  defp conjoin(_left, {:const, false} = never), do: never
-  defp conjoin({:const, true}, right), do: right
-  defp conjoin(left, {:const, true}), do: left
+  defp simplify({:and, left, right}, context),
+    do: conjoin(simplify(left, context), simplify(right, context), context)
 
-  defp conjoin(left, right) do
+  defp simplify({:or, left, right}, context),
+    do: disjoin(simplify(left, context), simplify(right, context))
+
+  defp simplify({:not, inner}, context), do: negate(simplify(inner, context))
+  defp simplify({:leaf, clause}, context), do: leaf(clause, context)
+  defp simplify(other, _context), do: other
+
+  @spec conjoin(tree(), tree(), context()) :: tree()
+  defp conjoin({:const, false} = never, _right, _context), do: never
+  defp conjoin(_left, {:const, false} = never, _context), do: never
+  defp conjoin({:const, true}, right, _context), do: right
+  defp conjoin(left, {:const, true}, _context), do: left
+  defp conjoin(:null, :null, _context), do: :null
+
+  # Two `IN` lists beside each other fold into the list of the values they share.
+  defp conjoin({:leaf, left} = lhs, {:leaf, right} = rhs, context) do
+    case SQLContradict.intersect(left, right, context.types) do
+      :empty -> {:const, false}
+      {:ok, shared} -> {:leaf, shared}
+      :none -> absorb(lhs, rhs)
+    end
+  end
+
+  defp conjoin(left, right, _context), do: absorb(left, right)
+
+  @spec absorb(tree(), tree()) :: tree()
+  defp absorb(left, right) do
     cond do
       absorbs?(left, right, :or) -> left
       absorbs?(right, left, :or) -> right
@@ -219,6 +268,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   defp disjoin(_left, {:const, true} = always), do: always
   defp disjoin({:const, false}, right), do: right
   defp disjoin(left, {:const, false}), do: left
+  defp disjoin(:null, :null), do: :null
 
   defp disjoin(left, right) do
     cond do
@@ -239,26 +289,35 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   defp negate(:null), do: :null
   defp negate(inner), do: {:not, inner}
 
-  # A predicate the engine reads as a constant before it reads its operands.
-  @spec leaf(SQLPredicate.clause()) :: tree()
-  defp leaf({op, _left, nil}) when op in @comparisons, do: :null
-  defp leaf({:truthy_expr, {:expr, {:lit, nil}}, _nil}), do: :null
-  defp leaf({:in, _left, [nil]}), do: :null
-  defp leaf({:not_in, _left, [nil]}), do: :null
+  # A predicate the engine reads as a constant before it reads its operands. A `BETWEEN` with
+  # a NULL bound is NULL for the rows (its other operand is never read), but for the optimizer
+  # only when both bounds are: `n BETWEEN 1 AND NULL` is `n >= 1 AND NULL`.
+  @spec leaf(SQLPredicate.clause(), context()) :: tree()
+  defp leaf({op, _left, nil}, _context) when op in @comparisons, do: :null
+  defp leaf({:truthy_expr, {:expr, {:lit, nil}}, _nil}, _context), do: :null
+  defp leaf({:in, _left, [nil]}, _context), do: :null
+  defp leaf({:not_in, _left, [nil]}, _context), do: :null
 
-  defp leaf({:between, operand, {low, high}} = clause) when low == nil or high == nil,
-    do: if(constant_operand?(operand), do: {:leaf, clause}, else: :null)
+  defp leaf({:between, _operand, {nil, nil}}, %{strict: true}), do: :null
 
-  defp leaf({:eq, {:expr, expr}, {:expr, expr}} = clause),
+  defp leaf({:between, _operand, {low, high}} = clause, %{strict: true})
+       when low == nil or high == nil,
+       do: {:leaf, clause}
+
+  defp leaf({:between, operand, {low, high}} = clause, %{strict: false})
+       when low == nil or high == nil,
+       do: if(constant_operand?(operand), do: {:leaf, clause}, else: :null)
+
+  defp leaf({:eq, {:expr, expr}, {:expr, expr}} = clause, _context),
     do: if(pure?(expr), do: {:const, true}, else: {:leaf, clause})
 
-  defp leaf({:is_null, {:expr, expr}, _nil} = clause),
+  defp leaf({:is_null, {:expr, expr}, _nil} = clause, _context),
     do: if(pure?(expr), do: {:const, null_constant?(expr)}, else: {:leaf, clause})
 
-  defp leaf({:is_not_null, {:expr, expr}, _nil} = clause),
+  defp leaf({:is_not_null, {:expr, expr}, _nil} = clause, _context),
     do: if(pure?(expr), do: {:const, not null_constant?(expr)}, else: {:leaf, clause})
 
-  defp leaf(clause), do: {:leaf, clause}
+  defp leaf(clause, _context), do: {:leaf, clause}
 
   # No column, no placeholder and no function: nothing the optimizer cannot
   # fold, and nothing a row changes.

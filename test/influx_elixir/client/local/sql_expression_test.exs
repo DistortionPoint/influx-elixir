@@ -23,7 +23,9 @@ defmodule InfluxElixir.Client.Local.SqlExpressionTest do
       assert {:error,
               %{
                 status: 400,
-                body: "Client.Local: unsupported column expression: approx_median(value) as m"
+                body:
+                  "Client.Local: unsupported column expression: approx_median(value) as m (the " <>
+                    "function approx_median is not one the double has)"
               } = err} = Local.check_sql(sql)
 
       {:ok, conn} = Local.start(databases: ["chk"])
@@ -74,7 +76,7 @@ defmodule InfluxElixir.Client.Local.SqlExpressionTest do
                {:error,
                 %{
                   status: 400,
-                  body: "Client.Local: unsupported column: cast(level as boolean) as b"
+                  body: "Client.Local: a cast to Boolean: the double does not model that type"
                 }}
     end
 
@@ -97,7 +99,12 @@ defmodule InfluxElixir.Client.Local.SqlExpressionTest do
       {:ok, :written} =
         Local.write(conn, "p,host=a v=1.0 1700000000000000000", database: "test_db")
 
-      assert {:error, %{status: 400, body: "Client.Local: unsupported column expression: *"}} =
+      assert {:error,
+              %{
+                status: 400,
+                body:
+                  "Client.Local: unsupported column expression: * (* is a wildcard, not an expression)"
+              }} =
                Local.query_sql(conn, ~s|SELECT * FROM "p" GROUP BY host|, database: "test_db")
     end
   end

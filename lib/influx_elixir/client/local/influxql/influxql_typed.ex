@@ -52,6 +52,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     interval: "Interval(MonthDayNano)"
   }
 
+  # A pair of operands that keeps no point, in a tree: no row is true.
+  @never {:never, nil}
+  @bare_types [:integer, :unsigned, :float, :string, :tag, :interval]
+
   @comparison_ops ["=", "!=", "<>", "<", "<=", ">", ">="]
   @flipped_ops %{
     "=" => "=",
@@ -353,16 +357,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   # The engine's status and error for a condition it plans and refuses, raised after the
   # LIMIT: `now()` anywhere but in a comparison of `time` (it is not implemented there),
-  # and a bare field, constant or duration as the whole condition. Beside a comparison in an
-  # `AND` or an `OR` a bare operand keeps no point at all (`:empty`), unless it is an
-  # unsigned constant, or the operands are bare both: the engine's error then.
-  @spec bare_condition(tuple(), {MapSet.t(binary()), map()}, %{table: binary()} | nil) ::
-          {pos_integer(), binary()} | :empty | nil
+  # and a bare field, constant or duration as the whole condition. In an `AND` or an `OR` a
+  # pair with a bare operand keeps no point (`:empty` when that is the whole condition, else
+  # `{:tree, tree}` with such pairs put to false), unless the engine's planner refuses the
+  # pair (see `operand/4`): that error is thrown as `{:deferred, body}`, the planner's, among
+  # the errors of the comparisons (`leaf` plans each one, in the order the planner builds
+  # them).
+  @spec bare_condition(
+          tuple(),
+          {MapSet.t(binary()), map()},
+          %{table: binary()} | nil,
+          (tuple() -> term())
+        ) ::
+          {pos_integer(), binary()} | :empty | {:tree, tuple()} | nil
   @doc false
-  def bare_condition(tree, ctx, filter \\ nil) do
+  def bare_condition(tree, ctx, filter \\ nil, leaf \\ & &1) do
     if now_outside_time?(tree),
       do: {405, "This feature is not implemented: now"},
-      else: tree |> bare_type(ctx) |> filtered(tree, ctx, filter)
+      else: tree |> bare_type(ctx, leaf) |> filtered(tree, ctx, filter)
   end
 
   # With a `tz()` clause the engine plans the condition as a filter of its own and does not
@@ -508,11 +520,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   defp operand_inside?(_node, _ctx), do: false
 
-  @spec bare_type(tuple(), {MapSet.t(binary()), map()}) ::
-          {pos_integer(), binary()} | :empty | nil
-  defp bare_type({:group, node}, ctx), do: bare_type(node, ctx)
+  @spec bare_type(tuple(), {MapSet.t(binary()), map()}, (tuple() -> term())) ::
+          {pos_integer(), binary()} | :empty | {:tree, tuple()} | nil
+  defp bare_type({:group, node}, ctx, leaf), do: bare_type(node, ctx, leaf)
 
-  defp bare_type({:cmp, tokens}, {tags, types}) do
+  defp bare_type({:cmp, tokens}, {tags, types}, _leaf) do
     case tokens |> strip_parens() |> standalone_field(tags, types) do
       nil -> nil
       :boolean -> nil
@@ -520,65 +532,115 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     end
   end
 
-  defp bare_type({kind, nodes}, ctx) when kind in [:and, :or] do
-    members = Enum.map(nodes, &member_kind(&1, ctx))
+  defp bare_type({kind, _nodes} = tree, ctx, leaf) when kind in [:and, :or] do
+    if bare_inside?(tree, ctx) do
+      if null_beside_bare?(tree, ctx), do: refuse_bare()
 
-    cond do
-      :nested in members ->
-        refuse_bare()
-
-      Enum.any?(nodes, &null_member?(&1, ctx)) and Enum.any?(members, &(&1 != :ok)) ->
-        refuse_bare()
-
-      Enum.all?(members, &(&1 == :ok)) ->
-        nil
-
-      true ->
-        logical_outcome(kind, members)
+      case operand(tree, ctx, true, leaf) do
+        {:bool, _node, false} -> nil
+        {:bool, @never, true} -> :empty
+        {:bool, node, true} -> {:tree, node}
+      end
     end
   end
 
-  defp bare_type(_node, _ctx), do: nil
+  defp bare_type(_node, _ctx, _leaf), do: nil
 
   @spec refuse_bare() :: no_return()
   defp refuse_bare,
     do: throw({:refused, "unsupported InfluxQL (a bare non-boolean field inside AND/OR)"})
 
-  # What a member of an `AND` or `OR` is: a comparison or a boolean (`:ok`), a bare operand
-  # with its type, or a connective that holds one (`:nested`).
-  @spec member_kind(tuple(), {MapSet.t(binary()), map()}) :: :ok | :nested | {:bare, atom()}
-  defp member_kind({:group, node}, ctx), do: member_kind(node, ctx)
+  # The engine types a condition from the leaves up (verified over every pair of operand types
+  # and over chains of three and four): a comparison or a boolean field is a boolean, and so is
+  # an `AND` or an `OR` that is typed, but one with a bare operand (a field, a constant, a tag)
+  # keeps no point whatever the other side is (`b OR s OR b` is `b`: the pair `b OR s` is false).
+  # The operands of the connective are not coerced to each other when one is an unsigned
+  # number, or when both are numbers (`Int64 AND Int64`): that is the planner's error.
+  # `operand/4` is `{type, node, touched}`: `:bool` or `{:bare, type}`, the node with the pairs
+  # that keep no point put to `@never`, and whether it changed.
+  @spec operand(tuple(), {MapSet.t(binary()), map()}, boolean(), (tuple() -> term())) ::
+          {:bool | {:bare, atom()}, tuple(), boolean()}
+  defp operand({:group, node}, ctx, _top?, leaf) do
+    {type, inner, touched} = operand(node, ctx, false, leaf)
+    {type, if(touched, do: {:group, inner}, else: {:group, node}), touched}
+  end
 
-  defp member_kind({:cmp, tokens}, {tags, types}) do
+  defp operand({:cmp, tokens} = node, {tags, types}, _top?, leaf) do
+    leaf.(node)
+
     case tokens |> strip_parens() |> standalone_field(tags, types) do
-      type when type in [nil, :boolean] -> :ok
-      type -> {:bare, type}
+      type when type in [nil, :boolean] -> {:bool, node, false}
+      type -> {{:bare, type}, node, true}
     end
   end
 
-  defp member_kind({kind, nodes}, ctx) when kind in [:and, :or],
-    do: if(Enum.any?(nodes, &bare_member?(&1, ctx)), do: :nested, else: :ok)
+  defp operand({kind, [first | rest]} = node, ctx, top?, leaf) when kind in [:and, :or] do
+    {_type, combined, touched} =
+      Enum.reduce(rest, operand(first, ctx, false, leaf), fn next,
+                                                             {left, left_node, left_touched} ->
+        {right, right_node, right_touched} = operand(next, ctx, false, leaf)
+        check_pair(kind, left, right, top? and length(rest) == 1)
 
-  defp member_kind(_node, _ctx), do: :ok
+        if left == :bool and right == :bool,
+          do: {:bool, {kind, [left_node, right_node]}, left_touched or right_touched},
+          else: {:bool, @never, true}
+      end)
 
-  # Two operands, both bare or one an unsigned constant, are the planner's error; a bare
-  # operand beside comparisons keeps no point.
-  @spec logical_outcome(:and | :or, [:ok | {:bare, atom()}]) :: {pos_integer(), binary()} | :empty
-  defp logical_outcome(kind, [left, right] = members) do
-    if Enum.all?(members, &match?({:bare, _type}, &1)) or {:bare, :unsigned} in members,
-      do: {400, logical_error(kind, operand_type(left), operand_type(right))},
-      else: :empty
+    {:bool, if(touched, do: combined, else: node), touched}
   end
 
-  defp logical_outcome(_kind, members) do
-    if Enum.all?(members, &match?({:bare, _type}, &1)) or {:bare, :unsigned} in members,
-      do: refuse_bare(),
-      else: :empty
+  defp operand(node, _ctx, _top?, _leaf), do: {:bool, node, false}
+
+  @spec check_pair(:and | :or, :bool | {:bare, atom()}, :bool | {:bare, atom()}, boolean()) ::
+          :ok
+  defp check_pair(kind, left, right, pair?) do
+    {l, r} = {operand_kind(left), operand_kind(right)}
+
+    refused? =
+      :unsigned in [l, r] or (numeric?(l) and numeric?(r)) or [l, r] === [:interval, :interval]
+
+    if refused?,
+      do: throw({:deferred, logical_error(kind, type_name(l, r, pair?), type_name(r, l, pair?))}),
+      else: :ok
   end
 
-  @spec operand_type(:ok | {:bare, atom()}) :: binary()
-  defp operand_type(:ok), do: "Boolean"
-  defp operand_type({:bare, type}), do: Map.fetch!(@arrow_types, type)
+  defp operand_kind(:bool), do: :boolean
+  defp operand_kind({:bare, type}) when type in @bare_types, do: type
+  defp operand_kind({:bare, _other}), do: refuse_bare()
+
+  defp numeric?(kind), do: kind in [:integer, :float]
+
+  # The type as the planner words it: a signed integer beside an unsigned one is cast to it,
+  # and a tag is a string when the condition is that pair alone.
+  @spec type_name(atom(), atom(), boolean()) :: binary()
+  defp type_name(:integer, :unsigned, _pair?), do: "UInt64"
+  defp type_name(:tag, :unsigned, true), do: "Utf8"
+  defp type_name(:boolean, _other, _pair?), do: "Boolean"
+  defp type_name(kind, _other, _pair?), do: Map.fetch!(@arrow_types, kind)
+
+  # A member that is a tag under arithmetic is null where the others are conditions; beside a
+  # bare operand the engine words the type of the null (verified: `Boolean OR Utf8`).
+  defp null_beside_bare?(tree, ctx),
+    do: any_leaf?(tree, &null_leaf?(&1, ctx)) and bare_inside?(tree, ctx)
+
+  defp bare_inside?(tree, ctx), do: any_leaf?(tree, &bare_leaf?(&1, ctx))
+
+  defp any_leaf?({:group, node}, fun), do: any_leaf?(node, fun)
+
+  defp any_leaf?({kind, nodes}, fun) when kind in [:and, :or],
+    do: Enum.any?(nodes, &any_leaf?(&1, fun))
+
+  defp any_leaf?(leaf, fun), do: fun.(leaf)
+
+  defp null_leaf?({:cmp, tokens}, {tags, types}),
+    do: InfluxQLWhereArith.null?(tokens, tags, types)
+
+  defp null_leaf?(_node, _ctx), do: false
+
+  defp bare_leaf?({:cmp, tokens}, {tags, types}),
+    do: standalone_field(strip_parens(tokens), tags, types) not in [nil, :boolean]
+
+  defp bare_leaf?(_node, _ctx), do: false
 
   @spec logical_error(:and | :or, binary(), binary()) :: binary()
   defp logical_error(kind, left, right) do
@@ -678,25 +740,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   end
 
   defp strip_parens(tokens), do: tokens
-
-  defp bare_member?({:group, node}, ctx), do: bare_member?(node, ctx)
-
-  defp bare_member?({:cmp, tokens}, {tags, types}),
-    do: bare_field(strip_parens(tokens), tags, types) not in [nil, :boolean]
-
-  defp bare_member?({kind, nodes}, ctx) when kind in [:and, :or],
-    do: Enum.any?(nodes, &bare_member?(&1, ctx))
-
-  defp bare_member?(_node, _ctx), do: false
-
-  # A member that is a tag under arithmetic, null where the others are conditions; beside a
-  # bare operand the engine words the type of the null (verified: `Boolean OR Utf8`).
-  defp null_member?({:group, node}, ctx), do: null_member?(node, ctx)
-
-  defp null_member?({:cmp, tokens}, {tags, types}),
-    do: InfluxQLWhereArith.null?(tokens, tags, types)
-
-  defp null_member?(_node, _ctx), do: false
 
   @spec bare_error(atom()) :: binary()
   defp bare_error(type) do

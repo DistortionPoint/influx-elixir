@@ -55,12 +55,39 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
 
     case swallowed(masked_rest, indexes["where"]) do
       {at, from} ->
-        {InfluxQLText.blank_to_nil(binary_part(raw_where, 0, at)), {from}}
+        {where, _fill_rest} = without_fill(binary_part(raw_where, 0, at), masked_rest, indexes)
+        {InfluxQLText.blank_to_nil(where), {from}}
 
       nil ->
-        {InfluxQLText.blank_to_nil(raw_where), swallowed_in_group(masked_rest, indexes["group"])}
+        {where, fill_rest} = without_fill(raw_where, masked_rest, indexes)
+
+        {InfluxQLText.blank_to_nil(where),
+         fill_rest || swallowed_in_group(masked_rest, indexes["group"])}
     end
   end
+
+  # The condition without a `fill(...)` call that follows it (`WHERE c fill(1) LIMIT x`: the
+  # fill is the clause after the condition, not a part of it), and where the text behind the
+  # call starts when something other than blanks stands there: the engine reads that as a
+  # clause, and the clause is not one the double reads.
+  @spec without_fill(binary(), binary(), map()) :: {binary(), {non_neg_integer()} | nil}
+  defp without_fill(where, masked_rest, %{"where" => {from, _length}}) when from >= 0 do
+    masked = binary_part(masked_rest, from, min(byte_size(where), byte_size(masked_rest) - from))
+
+    case Regex.run(~r/(?<![\w])fill\s*\([^)]*\)/i, masked, return: :index) do
+      [{start, size}] ->
+        rest = binary_part(masked, start + size, byte_size(masked) - start - size)
+        blanks = byte_size(rest) - byte_size(String.trim_leading(rest))
+
+        {binary_part(where, 0, start),
+         if(String.trim(rest) == "", do: nil, else: {from + start + size + blanks})}
+
+      _no_fill ->
+        {where, nil}
+    end
+  end
+
+  defp without_fill(where, _masked_rest, _indexes), do: {where, nil}
 
   defp swallowed_in_group(masked_rest, index) do
     case swallowed(masked_rest, index) do
@@ -144,7 +171,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     [_all, {word, word_size}, {at, _blank}, {_rest_at, rest_size}] =
       Regex.run(~r/^(S?LIMIT|S?OFFSET)\s*()(.*)$/is, text, return: :index)
 
-    kind = text |> binary_part(word, word_size) |> String.downcase() |> String.to_existing_atom()
+    kind = text |> binary_part(word, word_size) |> String.downcase() |> count_clause()
 
     cond do
       rest_size == 0 -> {:error, {:engine, InfluxQLError.syntax_error_body(:nom, start, whole)}}
@@ -152,6 +179,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       true -> {:error, {:engine, InfluxQLError.syntax_error_body(kind, start + at, whole)}}
     end
   end
+
+  # The clause a word names, as a literal: the words are matched by a fixed pattern, and an
+  # atom is never made from the statement's text.
+  @spec count_clause(binary()) :: :limit | :offset | :slimit
+  defp count_clause("limit"), do: :limit
+  defp count_clause("offset"), do: :offset
+  defp count_clause("slimit"), do: :slimit
+  # A bad operand of `SOFFSET` is worded as one of `SLIMIT` (verified): the parser reads the
+  # two as one alternative.
+  defp count_clause("soffset"), do: :slimit
 
   # `GROUP` must be followed by `BY`; `GROUP` or `GROUP BY` at the very end of
   # the text is unparsed, with blanks after it the dimension is wanted there.
@@ -342,22 +379,56 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     end
   end
 
+  # The clauses are read left to right, and the first operand that does not read ends the
+  # statement: of a clause keyword swallowed by the clause before it (see `check_swallowed/4`)
+  # and a number past the unsigned range (see `check_unsigned/3`), the one that stands
+  # first is the error (verified: `LIMIT 99999999999999999999 SLIMIT x` is the overflow).
+  @spec check_operands(binary(), non_neg_integer(), binary(), {non_neg_integer()} | nil) ::
+          :ok | {:error, term()}
+  @doc false
+  def check_operands(whole, at, masked_rest, swallowed) do
+    errors =
+      for check <- [
+            check_swallowed(whole, at, masked_rest, swallowed),
+            check_unsigned(whole, at, masked_rest)
+          ],
+          match?({:error, _reason}, check),
+          do: check
+
+    case errors do
+      [] -> :ok
+      [_one | _more] -> first_error(errors)
+    end
+  end
+
+  @doc "The error among `errors` that the parser meets first: the one at the leftmost position."
+  @spec first_error([{:error, term()}, ...]) :: {:error, term()}
+  def first_error(errors), do: Enum.min_by(errors, &error_position/1)
+
+  defp error_position({:error, {:engine, body}}) do
+    case Regex.run(~r/ at pos (\d+)/, body) do
+      [_all, digits] -> String.to_integer(digits)
+      nil -> 0
+    end
+  end
+
+  defp error_position({:error, _other}), do: 0
+
   # `LIMIT` and `OFFSET` are unsigned 64-bit integers; a longer number is a
   # parse error at the end of its digits. One that fits but not the signed
   # range is a planning error (`check_window/1`).
   @spec check_unsigned(binary(), non_neg_integer(), binary()) :: :ok | {:error, term()}
   @doc false
   def check_unsigned(whole, at, masked_rest) do
-    indexes = Regex.named_captures(InfluxQLText.clauses(), masked_rest, return: :index)
-
-    Enum.find_value(["limit", "offset", "slimit", "soffset"], :ok, fn clause ->
-      with {from, length} when from >= 0 <- indexes[clause],
-           digits = binary_part(masked_rest, from, length),
-           true <- String.to_integer(digits) > SQLLimits.uint64_max() do
-        {:error, {:engine, InfluxQLError.syntax_error_body(:unsigned, at + from + length, whole)}}
-      else
-        _fits -> nil
-      end
+    # Read from the text, not from the clauses: a clause behind one that is overflowing
+    # may not read at all, and the overflow stands first.
+    ~r/(?<![\w])(?:limit|offset|slimit|soffset)\s+(\d+)/i
+    |> Regex.scan(masked_rest, return: :index)
+    |> Enum.find_value(:ok, fn [_all, {from, length}] ->
+      if masked_rest |> binary_part(from, length) |> String.to_integer() > SQLLimits.uint64_max(),
+        do:
+          {:error,
+           {:engine, InfluxQLError.syntax_error_body(:unsigned, at + from + length, whole)}}
     end)
   end
 end

@@ -8,6 +8,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` INSERT / UPDATE / DELETE: planned in linear time, `ORDER BY` in
+  calls, the names of an `INSERT ... SELECT`, one table resolver**: a chain of
+  `||` was typed once for every prefix of it (100 terms: 279 ms in an `INSERT`,
+  315 ms in an `UPDATE`; 400 terms: 5 s); it is typed once per link, and the
+  text a chain is planned as nests no deeper than one pair of parentheses. An
+  array or map literal in `VALUES` (`ARRAY[1,2]`, `[1,2][1]`, `{a: 1}`) is one
+  cell and not a parse error, an `ORDER BY` inside a call
+  (`first_value(n ORDER BY time)`, `count(* ORDER BY n)`) is read, and a `;`
+  in the middle of a statement gives the parser's own error for the statement
+  that stops short (`UPDATE m SET v = ; 1`, `INSERT INTO m (v) ; VALUES (1)`).
+  The items of an `INSERT ... SELECT` are compared by name: two items with one
+  name are the planner's `Projections require unique expression names ...`
+  (literals, columns, aliases, operators, casts and the common calls are printed
+  as the planner prints them, and an item whose name the double cannot print is
+  refused by name), the errors of several items are the one error that holds
+  them all (400 when each is the planner's own, else 500: `SELECT $0, host`,
+  `SELECT CAST(1 AS UUID), CAST(2 AS UUID)`), `SELECT *` with no table is an
+  error, a column of the table named as another item is ambiguous, an aggregate
+  beside a column is refused, and the type and null-ness errors of an item come
+  before the count of the items. A `CAST` to a timestamp, a `||` and a unary `+`
+  find the type of their operand where they stand (a row of values that starts with
+  anything but a name or a literal is the engine's `Only identifiers and literals are
+  supported in tuples`, a type in the column list of a table alias that never closes is
+  the parser's error at the type, a name the table lacks inside
+  `CAST(v AS TIMESTAMP)` is found before the one beside it), the type of a cast
+  is read before what it casts, a `TRY_CAST` types nothing it holds, an
+  aggregate under a test is not typed, a placeholder has no type inside the
+  operand of a `||`, a placeholder beside an operand that fails to type is
+  refused, and a number above the largest `Int64` is a `UInt64`. `SQLTable`
+  resolves the table of a statement and of a query (`locate/1`), lists the
+  columns of the engine's own tables once (`engine_columns/2`) and words the
+  not-found and compound-name errors once, so `SELECT * FROM system.nosuch` is
+  the planner's `table 'public.system.nosuch' not found`. A single `INSERT` or
+  `DELETE` is no longer tokenized and checked a second time before it is planned
+  (an `INSERT` of 2000 rows: 108M reductions, 1.34 s, to 78M, 0.97 s). The contract asks the double for
+  the system tables in either edition (`catalog_system/0`) and a real server only
+  when it is a Core.
+- **`Client.Local` InfluxQL: no atom from the text, the planner's order of
+  errors, and the operands of `AND` / `OR`**: `SELECT v FROM m SLIMIT x` as the
+  first statement of a VM raised `ArgumentError` (`String.to_existing_atom` on
+  the clause word; the clause words are literals now, and `SOFFSET x` is worded
+  as the `SLIMIT` clause as on Core); of two bad operands the leftmost is the
+  error, and the first clause out of the engine's order is the parse error at its
+  start (`... fill(null) SLIMIT 1 LIMIT 2 OFFSET 1`). The errors of rewriting
+  the statement (a constant alone in parentheses, `n * (-3)`, `mixing aggregate
+  and non-aggregate columns`, a transform of a field in a `GROUP BY time`) come
+  before the `WHERE`'s, a select list that reads no field is empty whatever the
+  `WHERE` holds (`SELECT count(host) ... WHERE host`), and the `WHERE`'s
+  comparison that cannot be typed (`UInt64 >= Boolean`) comes before the select
+  list's (`cannot use / between an integer and unsigned`). A field, constant or
+  tag inside `AND`/`OR` is typed leaves first as the planner types it, for pairs,
+  chains of three or more and groups (a pair with such an operand keeps no point;
+  unsigned operands and two numbers are its `Cannot infer common argument type`
+  error); `fill(n)` of a plain select fills the number columns a row lacks, of a
+  selector over a string or boolean column is the engine's `no conversion`
+  error; aggregates of a tag and of a boolean are the engine's coercion errors.
+  The planner contract pins 432 statements of these (`InfluxQLDefectCases`).
 - **`Client.Local` SQL: the order of the engine's errors, exact number folding,
   and refusals that say why**: the stages at which Core finds a query's errors
   (plan build, placeholders, the analyzer's `WHERE`, aggregate, `HAVING`, select

@@ -13,7 +13,7 @@ defmodule InfluxElixir.SupervisorTest do
   defp await_restart(name, old_pid) do
     Await.until(fn ->
       case Process.whereis(name) do
-        pid when is_pid(pid) and pid != old_pid -> pid
+        pid when is_pid(pid) and pid !== old_pid -> pid
         _other -> nil
       end
     end)

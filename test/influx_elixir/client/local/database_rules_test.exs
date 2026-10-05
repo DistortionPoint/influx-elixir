@@ -19,7 +19,7 @@ defmodule InfluxElixir.Client.Local.DatabaseRulesTest do
             "a/B",
             String.duplicate("c", 200)
           ] do
-        assert DatabaseRules.check_new(name, @none, :v3_core) == :ok, inspect(name)
+        assert DatabaseRules.check_new(name, @none, :v3_core) === :ok, inspect(name)
       end
     end
 

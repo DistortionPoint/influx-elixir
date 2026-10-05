@@ -44,9 +44,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
           alone: true
         }
 
+        # The planner raises the error of a comparison, and that of a connective it cannot type,
+        # as it builds the filter, leaves first and in order: each comparison of a condition with
+        # a bare operand is planned as the connectives are typed.
+        leaf = &plan_comparisons(&1, ctx, %{times | alone: false})
+
         {deferred, {sql, bounds, checks}} =
-          case InfluxQLTyped.bare_condition(tree, ctx, Keyword.get(opts, :filter)) do
+          case InfluxQLTyped.bare_condition(tree, ctx, Keyword.get(opts, :filter), leaf) do
             nil -> {nil, plan(tree, ctx, times)}
+            {:tree, bare_tree} -> {nil, plan(bare_tree, ctx, times)}
             :empty -> {nil, {"(1 = 0)", [], []}}
             error -> {error, {"true", [], []}}
           end
@@ -85,19 +91,32 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp late_clash(_where, body, false), do: {:error, {:engine, body}}
 
   defp late_clash(where, body, true) do
-    idents = for {:ident, name} <- tokens_of(where), into: MapSet.new(), do: name
+    tokens = tokens_of(where)
+    {tree, _rest} = parse_or(tokens)
+    idents = for {:ident, name} <- tokens, into: MapSet.new(), do: name
 
-    {:ok,
-     %{
-       sql: "true",
-       lowers: [],
-       uppers: [],
-       checks: [],
-       idents: idents,
-       deferred: nil,
-       clash: {400, body}
-     }}
+    # The error of a comparison stands in for the plan, and with it the refusals the rest of
+    # the condition would have been planned into.
+    if time_inside_or?(tree) do
+      {:error, "unsupported InfluxQL (a time comparison inside OR)"}
+    else
+      {:ok,
+       %{
+         sql: "true",
+         lowers: [],
+         uppers: [],
+         checks: [],
+         idents: idents,
+         deferred: nil,
+         clash: {400, body}
+       }}
+    end
   end
+
+  defp time_inside_or?({:or, nodes}), do: Enum.any?(nodes, &mentions_time_node?/1)
+  defp time_inside_or?({:and, nodes}), do: Enum.any?(nodes, &time_inside_or?/1)
+  defp time_inside_or?({:group, node}), do: time_inside_or?(node)
+  defp time_inside_or?(_leaf), do: false
 
   defp tokens_of(where) do
     case InfluxQLTokens.tokenize(where, []) do
@@ -225,6 +244,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     end
   end
 
+  defp plan({:never, nil}, _ctx, _times), do: {"(1 = 0)", [], []}
+
   defp plan({:group, node}, ctx, times) do
     {sql, lowers, checks} = plan(node, ctx, times)
     {"(" <> sql <> ")", lowers, checks}
@@ -292,6 +313,37 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     end
   end
 
+  # A comparison of a condition with a bare operand, planned for the error the planner raises
+  # at it (see `late_clash`). A comparison the double refuses is found among the connectives'
+  # errors in an order it does not tell, and it refuses the whole.
+  @spec plan_comparisons(tuple(), {MapSet.t(binary()), map()}, map()) :: term()
+  defp plan_comparisons({:cmp, tokens} = leaf, ctx, times) do
+    # A column the measurement lacks, and a comparison of constants (the engine folds it), are
+    # typed in ways of their own beside a bare operand (verified: `nosuch AND s` is an error,
+    # `nosuch AND u` none).
+    if (absent_column?(tokens, times.known) and MapSet.size(times.known || MapSet.new()) > 0) or
+         constants_comparison?(tokens),
+       do:
+         throw(
+           {:refused,
+            "unsupported InfluxQL (a bare non-boolean operand beside a column the " <>
+              "measurement lacks or a comparison of constants)"}
+         )
+
+    plan(leaf, ctx, times)
+  catch
+    {:refused, _reason} ->
+      throw(
+        {:refused,
+         "unsupported InfluxQL (a bare non-boolean operand beside a comparison the engine refuses)"}
+      )
+  end
+
+  defp constants_comparison?(tokens) do
+    Enum.any?(tokens, &match?({:op, _op}, &1)) and
+      not Enum.any?(tokens, &(match?({:ident, _name}, &1) or InfluxQLTokens.time?(&1)))
+  end
+
   defp join_plans(nodes, separator, ctx, times) do
     {sqls, lowers, checks} = nodes |> Enum.map(&plan(&1, ctx, times)) |> unzip3()
     {Enum.join(sqls, separator), Enum.concat(lowers), Enum.concat(checks)}
@@ -302,6 +354,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   end
 
   defp mentions_time_node?({:cmp, tokens}), do: Enum.any?(tokens, &InfluxQLTokens.time?/1)
+  defp mentions_time_node?({:never, nil}), do: false
   defp mentions_time_node?({:group, node}), do: mentions_time_node?(node)
   defp mentions_time_node?({_kind, nodes}), do: Enum.any?(nodes, &mentions_time_node?/1)
 

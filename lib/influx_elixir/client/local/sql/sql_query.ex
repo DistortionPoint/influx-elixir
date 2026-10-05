@@ -23,6 +23,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     SQLShow,
     SQLStatement,
     SQLSyntax,
+    SQLTable,
     Store
   }
 
@@ -158,7 +159,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
   defp exists(table, database, measurement, query) do
     if Store.table?(table, database, measurement),
       do: {:ok, query},
-      else: {:error, SQLError.planning("table 'public.iox.#{measurement}' not found")}
+      else: {:error, SQLTable.iox_not_found(measurement)}
   end
 
   @spec query_sql_stream(
@@ -200,8 +201,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
          :ok <- Format.check_params(params, nil, database),
          :ok <- Scope.database_exists(table, database),
          {:ok, trimmed} <- scrubbed(sql),
-         :ok <- bare_statement(sql),
-         :ok <- delete_syntax(sql, trimmed) do
+         :ok <- bare_statement(sql) do
       case statement_kind(trimmed) do
         :query ->
           query_sql(conn, sql, opts)
@@ -261,15 +261,6 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
       {:ok, _statement} = ok -> ok
       {:error, reason} -> {:error, parsed(sql, reason)}
     end
-  end
-
-  # A `DELETE` or `INSERT` the parser does not read (`DELETE FROM` with no table) is its
-  # error, whatever the engine does with one that reads.
-  @spec delete_syntax(binary(), binary()) :: :ok | {:error, SQLError.t()}
-  defp delete_syntax(sql, trimmed) do
-    if statement_kind(trimmed) in [:delete, :insert],
-      do: SQLSyntax.check_statements(sql),
-      else: :ok
   end
 
   @spec bare_statement(binary()) :: :ok | {:error, SQLError.t()}
@@ -437,5 +428,8 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
 
       {:ok, %{"rows_affected" => count}}
     end
+  catch
+    # A `WHERE` that is no boolean is found per point, as in a query.
+    {:query_error, error} -> {:error, error}
   end
 end

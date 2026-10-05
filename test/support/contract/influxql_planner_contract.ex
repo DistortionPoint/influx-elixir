@@ -20,6 +20,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
     InfluxQLArithmeticCases,
     InfluxQLBucketCases,
     InfluxQLCallCases,
+    InfluxQLDefectCases,
     InfluxQLFixCases,
     InfluxQLOrderCases,
     InfluxQLProjectionCases,
@@ -43,6 +44,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
       unquote(shapes(client))
       unquote(projections(client))
       unquote(orders(client))
+      unquote(defects(client))
       unquote(show_helpers(client))
       unquote(fix_helpers(client))
       unquote(helpers(client))
@@ -498,6 +500,58 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
             ctx,
             InfluxQLOrderCases.refusals(),
             InfluxQLOrderCases.refusal_reasons()
+          )
+        end
+      end
+    end
+  end
+
+  defp defects(client) do
+    quote location: :keep do
+      describe "InfluxQL clauses in order, the planner's order of errors and the operands of AND and OR — contract" do
+        setup ctx do
+          names = InfluxQLDefectCases.names(InfluxElixir.IntegrationHelper.unique_name("ipd"))
+          write(ctx, unquote(client), InfluxQLDefectCases.fixture(names))
+          {:ok, names: names}
+        end
+
+        test "clauses are read in their order, and the first that does not read is the error",
+             ctx do
+          check_fix(ctx, InfluxQLDefectCases.clause_order())
+        end
+
+        test "the errors of rewriting the statement come before those of the planner", ctx do
+          check_fix(ctx, InfluxQLDefectCases.rewriting())
+        end
+
+        test "the planner's errors of the condition and of the select list, in its order", ctx do
+          check_fix(ctx, InfluxQLDefectCases.planner_order())
+        end
+
+        test "a select list that reads no field is answered empty, whatever the condition", ctx do
+          check_fix(ctx, InfluxQLDefectCases.no_field())
+        end
+
+        test "the aggregates of a tag, alone, in arithmetic and beside fields", ctx do
+          check_fix(ctx, InfluxQLDefectCases.tag_aggregates())
+        end
+
+        test "fill() with a number, of a text column, a selector and a raw select", ctx do
+          check_fix(ctx, InfluxQLDefectCases.fills())
+        end
+
+        test "every pair of kinds of operand of AND and OR, and chains and groups of three",
+             ctx do
+          check_fix(ctx, InfluxQLDefectCases.connectives())
+        end
+
+        @tag local_divergence:
+               "what the engine answers and the double does not compute is refused by name"
+        test "statements the double refuses by name, each for its own reason", ctx do
+          check_refusals(
+            ctx,
+            InfluxQLDefectCases.refusals(),
+            InfluxQLDefectCases.refusal_reasons()
           )
         end
       end

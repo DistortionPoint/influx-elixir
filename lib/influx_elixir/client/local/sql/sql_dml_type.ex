@@ -84,13 +84,6 @@ defmodule InfluxElixir.Client.Local.SQLDmlType do
   def unsupported(printed),
     do: %{status: 405, body: "This feature is not implemented: Unsupported SQL type " <> printed}
 
-  @doc """
-  The SQL the double's own planner reads for a type, or `nil` for a type it has no cast for
-  (its casts are the integers of 8 to 64 bits, `DOUBLE` and text).
-  """
-  @spec local_sql(t()) :: binary() | nil
-  def local_sql(%{sql: sql}), do: sql
-
   # ---------------------------------------------------------------------------
   # The name
   # ---------------------------------------------------------------------------

@@ -47,6 +47,13 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   end
 
   @doc """
+  Both readings of the `WHERE ...` clause out of one parse: the conjunction list of `nodes/1` and
+  the tree of `tree/1`.
+  """
+  @spec parsed(binary()) :: {:ok, [node_t()], tree() | nil} | {:error, SQLError.t()}
+  def parsed(rest), do: parse(rest)
+
+  @doc """
   The `WHERE ...` clause as written: the same predicates in binary `AND` and
   `OR` nodes, left to right, parentheses kept as the grouping they make, which
   the conjunction list of `nodes/1` does not keep. `nil` when there is no
@@ -78,8 +85,8 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
          :ok <- lone_literal(tree) do
       {:ok, conj, tree}
     else
-      {:ok, _conj, _tree, _leftover} ->
-        {:error, SQLError.refusal("unsupported WHERE clause: #{str}")}
+      {:ok, _conj, _tree, leftover} ->
+        {:error, SQLError.refusal("unsupported WHERE clause: #{str} (#{stray(leftover)})")}
 
       {:error, _reason} = error ->
         error
@@ -327,7 +334,24 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
     end
   end
 
-  defp where_factor(_tokens), do: {:error, SQLError.refusal("unsupported WHERE clause")}
+  defp where_factor(tokens),
+    do: {:error, SQLError.refusal("unsupported WHERE clause (#{wanted(tokens)})")}
+
+  # What stands where a condition is wanted, or after the last one.
+  @spec wanted([where_token()]) :: binary()
+  defp wanted([]), do: "the clause ends where a condition is expected"
+  defp wanted([token | _rest]), do: "#{token_name(token)} stands where a condition is expected"
+
+  @spec stray([where_token()]) :: binary()
+  defp stray([token | _rest]), do: "#{token_name(token)} follows a complete condition"
+
+  @spec token_name(where_token()) :: binary()
+  defp token_name(:and), do: "AND"
+  defp token_name(:or), do: "OR"
+  defp token_name(:not), do: "NOT"
+  defp token_name(:lparen), do: "("
+  defp token_name(:rparen), do: ")"
+  defp token_name({:pred, text}), do: text
 
   # ---------------------------------------------------------------------------
   # What a node reads

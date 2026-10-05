@@ -40,7 +40,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       body = ~s({"a":1}\n{"a":2}\n{"a":3})
 
       assert {:ok, rows} = ResponseParser.parse(body, :jsonl)
-      assert length(rows) == 3
+      assert length(rows) === 3
       assert Enum.map(rows, & &1["a"]) === [1, 2, 3]
     end
 
@@ -92,7 +92,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
 
       assert {:ok, [first, second]} = ResponseParser.parse(body, :csv)
 
-      assert first == %{
+      assert first === %{
                "iox::measurement" => "m",
                "time" => ~U[2023-11-14 22:13:20.000000Z],
                "v" => "1.5",
@@ -124,7 +124,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
 
       assert %{"table" => 0, "_value" => "x, y", "_field" => "label", "host" => "a"} = label_row
       assert %{"table" => 1, "_value" => 42.5, "_field" => "value"} = value_row
-      assert value_row["_time"] == ~U[2023-11-14 22:13:20.000000Z]
+      assert value_row["_time"] === ~U[2023-11-14 22:13:20.000000Z]
       refute Map.has_key?(value_row, "")
     end
 
@@ -200,7 +200,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       body = ~s([{"measurement":"cpu","value":1.5}])
 
       assert {:ok, [row]} = ResponseParser.parse(body)
-      assert row["measurement"] == "cpu"
+      assert row["measurement"] === "cpu"
       assert row["value"] === 1.5
     end
 
@@ -234,7 +234,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
     test "leaves invalid time strings as-is" do
       row = %{"time" => "not a date"}
       result = ResponseParser.coerce_types(row)
-      assert result["time"] == "not a date"
+      assert result["time"] === "not a date"
     end
 
     test "a date-shaped string that is not a timestamp stays a string" do

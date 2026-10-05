@@ -19,6 +19,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   }
 
   @aggregates ~w(mean sum count min max first last median spread stddev distinct)
+  @no_variable "field must contain at least one variable"
 
   # Regexes nested in a list cannot be module attributes on OTP 28, so the
   # table is a function.
@@ -113,8 +114,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
          :ok <- InfluxQLCheck.check_where(clean, at, masked_rest, where),
          :ok <- group_error(group_result),
          :ok <- InfluxQLCheck.check_group(clean, at, masked_rest),
-         :ok <- InfluxQLCheck.check_swallowed(clean, at, masked_rest, swallowed),
-         :ok <- InfluxQLCheck.check_unsigned(clean, at, masked_rest),
+         :ok <- InfluxQLCheck.check_operands(clean, at, masked_rest, swallowed),
          :ok <- InfluxQLCheck.check_fill(clean, at, masked_rest),
          {:ok, group} <- group_of(group_result, clauses),
          {:ok, items} <- parse_items(items, masked_items),
@@ -354,6 +354,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
       {:wild, name, extra, target} -> {:ok, {:wild_call, name, extra, target, alias}}
       {:expand_error, message} -> {:ok, {:expand_error, message}}
       {:planning, message} -> {:ok, {:planning_error, message}}
+      {:paren_constant, ast} -> {:ok, {:planning_error, @no_variable, ast}}
       {:argument, name, argument} -> {:ok, {:argument_error, name, argument}}
       _unread -> {:error, "unsupported select item: #{text}"}
     end
@@ -453,22 +454,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # read it.
   @spec clauses_error(binary(), non_neg_integer(), binary()) :: {:error, term()}
   defp clauses_error(whole, at, masked_rest) do
-    fills = Regex.scan(~r/\bfill\s*\(/i, masked_rest, return: :index)
+    case clause_error(whole, at, masked_rest) do
+      {:error, :unread_order} ->
+        if Regex.match?(~r/\bfill\s*\(/i, masked_rest),
+          do: {:error, "unsupported InfluxQL (fill() outside GROUP BY)"},
+          else: {:error, :unread_order}
 
-    case fills do
-      [] ->
-        clause_error(whole, at, masked_rest)
-
-      [[{fill_at, _size}]] ->
-        if Regex.match?(
-             ~r/\b(?:ORDER\s+BY|LIMIT|OFFSET)\b/i,
-             binary_part(masked_rest, 0, fill_at)
-           ),
-           do: {:error, {:engine, InfluxQLError.syntax_error_body(:nom, at + fill_at, whole)}},
-           else: {:error, "unsupported InfluxQL (fill() outside GROUP BY)"}
-
-      [_first, [{second_at, _size}] | _more] ->
-        {:error, {:engine, InfluxQLError.syntax_error_body(:nom, at + second_at, whole)}}
+      error ->
+        error
     end
   end
 
@@ -477,15 +470,69 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # double does not read.
   @spec clause_error(binary(), non_neg_integer(), binary()) :: {:error, term()}
   defp clause_error(whole, at, masked_rest) do
-    ~r/\b(?:GROUP|ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b/i
-    |> Regex.scan(masked_rest, return: :index)
-    |> Enum.find_value({:error, :unread_order}, fn [{from, _size}] ->
-      case InfluxQLCheck.check_swallowed(whole, at, masked_rest, {from}) do
-        {:error, {:engine, _body}} = error -> error
-        _no_error_of_its_own -> nil
+    stops =
+      ~r/\b(?:GROUP|ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b/i
+      |> Regex.scan(masked_rest, return: :index)
+      |> Enum.find_value({:error, :unread_order}, fn [{from, _size}] ->
+        case InfluxQLCheck.check_swallowed(whole, at, masked_rest, {from}) do
+          {:error, {:engine, _body}} = error -> error
+          _no_error_of_its_own -> nil
+        end
+      end)
+
+    stops =
+      case stops do
+        {:error, :unread_order} -> out_of_order(whole, at, masked_rest)
+        error -> error
       end
-    end)
+
+    # A number past the unsigned range stands before the clause that does not read when
+    # it is the leftmost (`LIMIT 99999999999999999999 SLIMIT x` is the overflow).
+    case {stops, InfluxQLCheck.check_unsigned(whole, at, masked_rest)} do
+      {{:error, {:engine, _stop}} = stop, {:error, {:engine, _overflow}} = overflow} ->
+        InfluxQLCheck.first_error([stop, overflow])
+
+      {stops, _fits} ->
+        stops
+    end
   end
+
+  # The clauses of a statement come in one order (`WHERE`, `GROUP BY`, `fill()`, `ORDER BY`,
+  # `LIMIT`, `OFFSET`, `SLIMIT`, `SOFFSET`, `tz()`), each once; the parser reads them in turn
+  # and what follows the last it could read is left over from where the first clause that is
+  # out of its place starts (verified: `SLIMIT 1 LIMIT 2` is left over from `LIMIT`).
+  @clause_ranks %{
+    "where" => 0,
+    "group" => 1,
+    "fill" => 2,
+    "order" => 3,
+    "limit" => 4,
+    "offset" => 5,
+    "slimit" => 6,
+    "soffset" => 7,
+    "tz" => 8
+  }
+
+  @spec out_of_order(binary(), non_neg_integer(), binary()) :: {:error, term()}
+  defp out_of_order(whole, at, masked_rest) do
+    ~r/(?<![\w])(WHERE|GROUP\s+BY|fill\s*\(|ORDER\s+BY|LIMIT|OFFSET|SLIMIT|SOFFSET|TZ\s*\()/i
+    |> Regex.scan(masked_rest, return: :index, capture: :all_but_first)
+    |> Enum.reduce_while(-1, fn [{from, size}], highest ->
+      word = masked_rest |> binary_part(from, size) |> String.downcase() |> clause_word()
+      rank = Map.fetch!(@clause_ranks, word)
+
+      if rank > highest,
+        do: {:cont, rank},
+        else:
+          {:halt, {:error, {:engine, InfluxQLError.syntax_error_body(:nom, at + from, whole)}}}
+    end)
+    |> case do
+      {:error, _reason} = error -> error
+      _in_order -> {:error, :unread_order}
+    end
+  end
+
+  defp clause_word(text), do: text |> String.split(~r/[\s(]/, parts: 2) |> hd()
 
   # The option of the `fill()` the statement has, `nil` for none.
   @spec fill_option(map()) :: binary() | nil

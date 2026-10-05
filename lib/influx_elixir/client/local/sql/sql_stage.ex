@@ -11,31 +11,38 @@ defmodule InfluxElixir.Client.Local.SQLStage do
   # them: an item of a check has the stage it is found at (its rank), and so has an error that
   # is held back until the stages before it are clear (its position).
   #
-  # Building the plan (an error carries no `type_coercion` prefix):
+  # Building the plan (an error carries no `type_coercion` prefix), in the order the engine
+  # builds it, the tables first, then the `WHERE`, the select list, the grouping, the `HAVING`
+  # and the `ORDER BY`:
   #
-  #   * `:where_built`, `:select_built_concat`, `:order_built` — the operands of a `||`,
-  #     which the planner types as it builds it, in the `WHERE`, the select list, the `ORDER BY`
+  #   * `:where_built`, `:select_built_concat` — the operands of a `||`, which the planner
+  #     types as it builds it, in the `WHERE` and in the select list
   #   * `:select_built` — the select list's calls, operators and aggregates (and the arguments
   #     of the aggregates of a `HAVING`)
+  #   * `:order_ordinal` — an `ORDER BY` position that names no select item
   #   * `:group` — a column of the select list or of a `HAVING` that is not grouped
   #   * `:having_filter` — a `HAVING` that is typed and is no boolean
-  #   * `:order_built` — see above, after the `HAVING` is built
+  #   * `:order_built` — the operands of a `||` in the `ORDER BY`, after the `HAVING` is built
   #
   # Replacing the placeholders:
   #
   #   * `:placeholder` — a `$n` with no value
   #
   # The analyzer (an error carries the `type_coercion` prefix), the plan's clauses from the
-  # scan up, the `WHERE` first and the select list last but for the `ORDER BY`; in a `WHERE`
-  # and a `HAVING` the kinds of errors have an order of their own:
+  # scan up, the `WHERE` first, then the aggregates' arguments, the `HAVING`, the rest of the
+  # select list, the `ORDER BY` and the `LIMIT` last; in a `WHERE` and a `HAVING` the kinds of
+  # errors have an order of their own:
   #
   #   * `:where_logical`, `:having_logical` — the `AND`s, `OR`s and `NOT`s between the
   #     operators and calls the planner types
   #   * `:where_calls`, `:having_calls` — their calls, operators, comparisons and regexes
   #   * `:where_coerced`, `:having_coerced` — their `LIKE`s, `IN` lists and `BETWEEN`s, and
   #     what stands under a cast, a test of a value or a `NOT`
+  #   * `:aggregate_coerced` — the arguments of the aggregates, which the aggregate node
+  #     under the `HAVING` holds
   #   * `:select_coerced` — the errors of the select list that the analyzer finds
   #   * `:order_calls` — the `ORDER BY`'s calls and operators
+  #   * `:limit_coerced` — a `LIMIT` or `OFFSET` that is no integer, the plan's top
   #
   # After the analyzer:
   #
@@ -52,6 +59,7 @@ defmodule InfluxElixir.Client.Local.SQLStage do
     :where_built,
     :select_built_concat,
     :select_built,
+    :order_ordinal,
     :group,
     :having_filter,
     :order_built,
@@ -59,11 +67,13 @@ defmodule InfluxElixir.Client.Local.SQLStage do
     :where_logical,
     :where_calls,
     :where_coerced,
+    :aggregate_coerced,
     :having_logical,
     :having_calls,
     :having_coerced,
     :select_coerced,
     :order_calls,
+    :limit_coerced,
     :negation,
     :optimizer,
     :physical,
@@ -78,6 +88,7 @@ defmodule InfluxElixir.Client.Local.SQLStage do
           :where_built
           | :select_built_concat
           | :select_built
+          | :order_ordinal
           | :group
           | :having_filter
           | :order_built
@@ -85,11 +96,13 @@ defmodule InfluxElixir.Client.Local.SQLStage do
           | :where_logical
           | :where_calls
           | :where_coerced
+          | :aggregate_coerced
           | :having_logical
           | :having_calls
           | :having_coerced
           | :select_coerced
           | :order_calls
+          | :limit_coerced
           | :negation
           | :optimizer
           | :physical
@@ -97,10 +110,6 @@ defmodule InfluxElixir.Client.Local.SQLStage do
           | :conversion
           | :closed
           | :unmodelled
-
-  @doc "The stages, in the order the engine meets them."
-  @spec all() :: [t()]
-  def all, do: @stages
 
   @doc "Where a stage stands among the others: the earlier, the smaller."
   @spec index(t()) :: non_neg_integer()

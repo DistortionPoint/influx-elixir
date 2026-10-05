@@ -95,7 +95,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
           {:boolean, binary(), :unsigned_first | :boolean_first} | :text | nil
   def unsigned_clash(tokens, tags, types) do
     with {:ok, [left, right], op} <- sides(tokens),
-         true <- unsigned_valued?(left, types) or unsigned_valued?(right, types) do
+         true <-
+           unsigned_valued?(left, types) or unsigned_valued?(right, types) or
+             unsigned_literal?(left) or unsigned_literal?(right) do
       unsigned_outcome(op, left, right, tags, types)
     else
       _other -> nil
@@ -140,9 +142,40 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
         {:boolean, written(op), :boolean_first}
 
       true ->
+        literal_clash(op, left, right)
+    end
+  end
+
+  # An unsigned constant against a boolean constant, in either order.
+  defp literal_clash(op, left, right) do
+    cond do
+      boolean_constant?(right) and unsigned_literal?(left) ->
+        {:boolean, written(op), :unsigned_first}
+
+      boolean_constant?(left) and unsigned_literal?(right) ->
+        {:boolean, written(op), :boolean_first}
+
+      true ->
         nil
     end
   end
+
+  # A number written past the signed range, which the engine reads as an unsigned constant.
+  defp unsigned_literal?([{:raw, "("} | _rest] = tokens) do
+    case strip_parens(tokens) do
+      [{:raw, "("} | _still] -> false
+      inner -> unsigned_literal?(inner)
+    end
+  end
+
+  defp unsigned_literal?([{:number, text}]) do
+    match?(
+      {n, ""} when n > 9_223_372_036_854_775_807 and n <= 18_446_744_073_709_551_615,
+      Integer.parse(text)
+    )
+  end
+
+  defp unsigned_literal?(_tokens), do: false
 
   defp text_clash(op, left, right, tags, types) do
     cond do

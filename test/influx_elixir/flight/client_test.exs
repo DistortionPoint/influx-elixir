@@ -10,25 +10,25 @@ defmodule InfluxElixir.Flight.ClientTest do
       payload = Client.build_ticket_payload("mydb", "SELECT * FROM cpu")
       decoded = Jason.decode!(payload)
 
-      assert decoded["database"] == "mydb"
-      assert decoded["sql_query"] == "SELECT * FROM cpu"
-      assert decoded["query_type"] == "sql"
+      assert decoded["database"] === "mydb"
+      assert decoded["sql_query"] === "SELECT * FROM cpu"
+      assert decoded["query_type"] === "sql"
     end
 
     test "encodes database name correctly" do
       payload = Client.build_ticket_payload("metrics_prod", "SELECT 1")
-      assert Jason.decode!(payload)["database"] == "metrics_prod"
+      assert Jason.decode!(payload)["database"] === "metrics_prod"
     end
 
     test "encodes complex SQL without modification" do
       sql = "SELECT time, value FROM cpu WHERE host = $host ORDER BY time DESC LIMIT 100"
       payload = Client.build_ticket_payload("db", sql)
-      assert Jason.decode!(payload)["sql_query"] == sql
+      assert Jason.decode!(payload)["sql_query"] === sql
     end
 
     test "query_type is always 'sql'" do
       payload = Client.build_ticket_payload("db", "SELECT 1")
-      assert Jason.decode!(payload)["query_type"] == "sql"
+      assert Jason.decode!(payload)["query_type"] === "sql"
     end
   end
 
@@ -41,15 +41,15 @@ defmodule InfluxElixir.Flight.ClientTest do
     test "ticket field contains JSON payload" do
       ticket = Client.build_ticket("mydb", "SELECT 1")
       decoded = Jason.decode!(ticket.ticket)
-      assert decoded["database"] == "mydb"
-      assert decoded["sql_query"] == "SELECT 1"
+      assert decoded["database"] === "mydb"
+      assert decoded["sql_query"] === "SELECT 1"
     end
 
     test "ticket can be protobuf-encoded" do
       ticket = Client.build_ticket("sensors", "SELECT * FROM temp")
       encoded = Protobuf.encode(ticket)
       decoded = Protobuf.decode(encoded, Ticket)
-      assert Jason.decode!(decoded.ticket)["database"] == "sensors"
+      assert Jason.decode!(decoded.ticket)["database"] === "sensors"
     end
 
     test "roundtrips database and query through protobuf encoding" do
@@ -59,8 +59,8 @@ defmodule InfluxElixir.Flight.ClientTest do
       encoded = Protobuf.encode(ticket)
       decoded_ticket = Protobuf.decode(encoded, Ticket)
       payload = Jason.decode!(decoded_ticket.ticket)
-      assert payload["database"] == db
-      assert payload["sql_query"] == sql
+      assert payload["database"] === db
+      assert payload["sql_query"] === sql
     end
   end
 
@@ -116,11 +116,11 @@ defmodule InfluxElixir.Flight.ClientTest do
     end
 
     test "falls back to :timeout when :connect_timeout is absent" do
-      assert Client.resolve_connect_timeout(timeout: 5_000) == 5_000
+      assert Client.resolve_connect_timeout(timeout: 5_000) === 5_000
     end
 
     test "falls back to 30s default when neither is set" do
-      assert Client.resolve_connect_timeout([]) == 30_000
+      assert Client.resolve_connect_timeout([]) === 30_000
     end
   end
 

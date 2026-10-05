@@ -22,14 +22,27 @@ defmodule InfluxElixir.Client.Local.SQLDmlDelete do
   """
   @spec error([token()], token(), SQLDml.env()) :: SQLError.t() | map()
   def error(tokens, stop, env) do
-    with {:ok, reference, rest} <- SQLDmlName.reference(skip_from(tokens)),
-         {:ok, clauses} <- SQLDmlExpr.delete_clauses(rest ++ [stop]),
+    with {:ok, reference, clauses} <- parse(tokens, stop),
          :ok <- SQLDmlName.arity(reference) do
       answer(reference, clauses, env)
     else
       {:error, error} -> error
       {:refuse, why} -> SQLDml.not_modelled(:delete, why)
     end
+  end
+
+  @doc """
+  What the parser reads of a `DELETE` from the tokens after the keyword and the token that ends
+  it: the table and the clauses.
+  """
+  @spec parse([token()], token()) ::
+          {:ok, [binary()], SQLDmlExpr.delete_clauses()}
+          | {:error, SQLError.t() | map()}
+          | {:refuse, binary()}
+  def parse(tokens, stop) do
+    with {:ok, reference, rest} <- SQLDmlName.reference(skip_from(tokens)),
+         {:ok, clauses} <- SQLDmlExpr.delete_clauses(rest ++ [stop]),
+         do: {:ok, reference, clauses}
   end
 
   @spec skip_from([token()]) :: [token()]

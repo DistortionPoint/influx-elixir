@@ -11,7 +11,12 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
   # is not. A `$name` is checked the same way once
   # `InfluxElixir.Client.Local.SQLBind` knows its value.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLMask}
+  alias InfluxElixir.Client.Local.{SQLError, SQLLimits, SQLMask}
+
+  require SQLLimits
+
+  @int64_max SQLLimits.int64_max()
+  @uint64_max SQLLimits.uint64_max()
 
   @typedoc "A LIMIT or OFFSET as the parser keeps it: a count, a `$name` or none."
   @type clause :: non_neg_integer() | {:param, binary()} | nil
@@ -25,6 +30,7 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
 
   @typep token ::
            {:count, non_neg_integer()}
+           | {:wide, non_neg_integer()}
            | {:negative, binary()}
            | {:name, binary()}
            | {:type, binary()}
@@ -94,16 +100,37 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
     upper = String.upcase(token)
 
     cond do
-      Regex.match?(~r/^[0-9]+$/u, token) -> {:count, String.to_integer(token)}
-      Regex.match?(~r/^-[0-9]+$/u, token) -> {:negative, token}
-      Regex.match?(~r/^(?:[0-9]+\.[0-9]*|\.[0-9]+)$/u, token) -> {:type, "Float64"}
-      upper == "NULL" -> :null
-      upper in @limit_keywords or Regex.match?(~r/^[=<>!,)~]/u, token) -> :not_a_clause
-      match = Regex.run(~r/^\$(\w+)$/u, token) -> {:param, List.last(match)}
-      Regex.match?(~r/^[\p{L}_]\w*$/u, token) -> {:name, token}
-      true -> :other
+      Regex.match?(~r/^[0-9]+$/u, token) ->
+        integer_token(String.to_integer(token))
+
+      Regex.match?(~r/^-[0-9]+$/u, token) ->
+        {:negative, token}
+
+      Regex.match?(~r/^(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?$/u, token) ->
+        {:type, "Float64"}
+
+      upper == "NULL" ->
+        :null
+
+      upper in @limit_keywords or Regex.match?(~r/^[=<>!,)~]/u, token) ->
+        :not_a_clause
+
+      match = Regex.run(~r/^\$(\w+)$/u, token) ->
+        {:param, List.last(match)}
+
+      Regex.match?(~r/^[\p{L}_]\w*$/u, token) ->
+        {:name, token}
+
+      true ->
+        :other
     end
   end
+
+  # A whole number is a count; past `Int64` the engine types it `UInt64`, and past that `Float64`.
+  @spec integer_token(non_neg_integer()) :: token()
+  defp integer_token(number) when number > @uint64_max, do: {:type, "Float64"}
+  defp integer_token(number) when number > @int64_max, do: {:wide, number}
+  defp integer_token(number), do: {:count, number}
 
   # Whatever follows the first clause must be clauses and nothing else.
   @spec trailing_garbage?([{non_neg_integer(), term()}], binary()) :: boolean()
@@ -171,6 +198,12 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
       {{"LIMIT", {:negative, n}}, _offset} ->
         {:error, optimizer_error("eliminate_limit", "LIMIT must be >= 0, '#{n}' was provided")}
 
+      {{"LIMIT", {:wide, n}}, _offset} ->
+        {:error, uncastable(n)}
+
+      {_limit, {"OFFSET", {:wide, n}}} ->
+        {:error, uncastable(n)}
+
       {_limit, {"OFFSET", {:negative, n}}} ->
         rule =
           if match?({"LIMIT", {:count, _n}}, limit),
@@ -183,6 +216,11 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
         :ok
     end
   end
+
+  # The optimizer folds the number as an `Int64` and cannot.
+  @spec uncastable(non_neg_integer()) :: SQLError.t()
+  defp uncastable(number),
+    do: SQLError.simplify("Arrow error: Cast error: Can't cast value #{number} to type Int64")
 
   @spec optimizer_error(binary(), binary()) :: SQLError.t()
   defp optimizer_error(rule, message) do
@@ -235,7 +273,7 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
 
   defp value_token({:param, name}, params) do
     case Map.fetch!(params, name) do
-      value when is_integer(value) and value >= 0 -> {:count, value}
+      value when is_integer(value) and value >= 0 -> integer_token(value)
       value when is_integer(value) -> {:negative, Integer.to_string(value)}
       value when is_float(value) -> {:type, "Float64"}
       value when is_binary(value) -> {:type, "Utf8"}

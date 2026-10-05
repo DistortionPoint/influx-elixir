@@ -90,7 +90,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
   @spec check_node(SQLExpr.t(), scope(), context()) :: :ok | {:error, map()}
   defp check_node({:cmp, op, left, right}, columns, context),
-    do: comparison(op, type(left, columns), type(right, columns), context)
+    do: comparison(op, type(left, columns), type(right, columns), context, param?(left, right))
 
   defp check_node({kind, left, right}, columns, context) when kind in [:and, :or],
     do: check_logical(kind, left, right, columns, context)
@@ -443,15 +443,29 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   defp word(:and), do: "AND"
   defp word(:or), do: "OR"
 
-  @spec comparison(SQLExpr.comparison(), SQLExprType.type(), SQLExprType.type(), context()) ::
-          :ok | {:error, map()}
-  defp comparison(op, left, right, context) do
+  # Whether either side of a comparison is a bound `$name`: a non-negative integer one is a
+  # `{:uint, n}`, which no literal is unless it is past `Int64` (taken for a literal).
+  @spec param?(SQLExpr.t(), SQLExpr.t()) :: boolean()
+  defp param?(left, right), do: bound?(left) or bound?(right)
+
+  @spec bound?(SQLExpr.t()) :: boolean()
+  defp bound?({:uint, number}), do: number <= 9_223_372_036_854_775_807
+  defp bound?(_expr), do: false
+
+  @spec comparison(
+          SQLExpr.comparison(),
+          SQLExprType.type(),
+          SQLExprType.type(),
+          context(),
+          boolean()
+        ) :: :ok | {:error, map()}
+  defp comparison(op, left, right, context, param?) do
     cond do
       not (is_binary(left) and is_binary(right)) ->
         :ok
 
       "Timestamp(ns)" in [left, right] ->
-        timestamp_comparison(op, left, right, context)
+        timestamp_comparison(op, left, right, context, param?)
 
       left == "Boolean" != (right == "Boolean") or
           SQLNativeType.struct?(left) != SQLNativeType.struct?(right) ->
@@ -467,20 +481,21 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   end
 
   # A number has no order against a timestamp: the planner's error for a
-  # literal, the type coercion's for a parameter (a non-negative integer one
-  # is a `UInt64`). A comparison of timestamps, or with text or a null, is
-  # not modelled.
-  @spec timestamp_comparison(SQLExpr.comparison(), binary(), binary(), context()) ::
+  # literal or a column, the type coercion's for a parameter (a non-negative integer one
+  # is a `UInt64`; verified: `time > $t` and `time > u` differ in the wrapper). A comparison of
+  # timestamps, or with text or a null, is not modelled.
+  @spec timestamp_comparison(SQLExpr.comparison(), binary(), binary(), context(), boolean()) ::
           {:error, map()}
-  defp timestamp_comparison(op, left, right, context) do
+  defp timestamp_comparison(op, left, right, context, param?) do
     message =
       "Cannot infer common argument type for comparison operation #{left} #{SQLExpr.symbol(op)} #{right}"
 
     cond do
-      "UInt64" in [left, right] and "Timestamp(ns)" in [left, right] and left != right ->
+      param? and "UInt64" in [left, right] and left != right ->
         coercion(message)
 
-      Enum.any?([left, right], &(&1 in ["Int64", "Float64", "Boolean"])) and left != right ->
+      Enum.any?([left, right], &(&1 in ["Int64", "UInt64", "Float64", "Boolean"])) and
+          left != right ->
         planner(message, context)
 
       true ->
@@ -579,8 +594,24 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     "Timestamp(ns)" in types and Enum.any?(types, &(is_binary(&1) and text?(&1)))
   end
 
+  @case_numbers ["Int64", "UInt64", "Float64"]
+
   @spec mixed_results([SQLExprType.type()]) :: {:error, map()}
-  defp mixed_results([then_type, else_type]) when is_binary(then_type) and is_binary(else_type) do
+  defp mixed_results(results) do
+    cond do
+      Enum.all?(results, &(&1 in @case_numbers)) ->
+        {:error, SQLError.late_refusal(:case_numbers)}
+
+      match?([a, b] when is_binary(a) and is_binary(b), results) ->
+        mixed_pair(results)
+
+      true ->
+        {:error, SQLError.refusal("a CASE whose results have no common type the double models")}
+    end
+  end
+
+  @spec mixed_pair([SQLExprType.type()]) :: {:error, map()}
+  defp mixed_pair([then_type, else_type]) do
     if "Boolean" in [then_type, else_type],
       do:
         coercion(
@@ -590,9 +621,6 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
       else:
         {:error, SQLError.refusal("a CASE whose results have no common type the double models")}
   end
-
-  defp mixed_results(_results),
-    do: {:error, SQLError.refusal("a CASE whose results have no common type the double models")}
 
   @spec check_coalesce([SQLExpr.t()], scope(), context()) ::
           :ok | {:error, map()}
@@ -633,7 +661,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
            )}
 
         nil ->
-          {:error, SQLError.late_refusal({:no_common_type, name})}
+          {:error, SQLError.late_refusal({:no_common_type, name, number_family(types)})}
       end
     else
       :ok
@@ -729,7 +757,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   @spec mixed_refusal(:coalesce | :nullif, [SQLExprType.type()]) :: {:error, map()}
   defp mixed_refusal(name, types) do
     if SQLCommonType.number_with_text?(types) do
-      {:error, SQLError.late_refusal({:no_common_type, name})}
+      {:error, SQLError.late_refusal({:no_common_type, name, number_family(types)})}
     else
       mixed_numbers(name, types)
     end
@@ -741,15 +769,28 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     if SQLCommonType.numbers?(types) do
       {:error, SQLError.late_refusal({:numbers_not_combined, name})}
     else
+      shown = types |> Enum.map(&to_string/1) |> Enum.uniq() |> Enum.join(", ")
+
       {:error,
        SQLError.refusal(
-         "#{call_word(name)} of arguments with no common type the double models (a type other than " <>
-           "Int64, Float64, text and Boolean beside another)"
+         "#{call_word(name)} of #{shown}: they have no common type the double models (it models " <>
+           "Int64, Float64, text and Boolean, each beside its own kind)"
        )}
     end
   end
 
+  # The kind of number a mix of a number with text holds.
+  @spec number_family([SQLExprType.type()]) :: :integer | :float | :decimal
+  defp number_family(types) do
+    cond do
+      "Float64" in types -> :float
+      Enum.any?(types, &(is_binary(&1) and String.starts_with?(&1, "Decimal128"))) -> :decimal
+      true -> :integer
+    end
+  end
+
   @spec call_word(:coalesce | :nullif) :: binary()
+
   defp call_word(:coalesce), do: "COALESCE"
   defp call_word(:nullif), do: "NULLIF"
 

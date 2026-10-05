@@ -8,8 +8,13 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   # tag is dictionary encoded, a field typed by its value, `time` a timestamp;
   # an integer column the store registered as unsigned is a `UInt64`). An
   # unknown type is never refused. A decimal (the result of an `Int64` with a
-  # `UInt64`) has a precision the double does not track, so an error that
-  # would print its type is refused by name.
+  # `UInt64`) has the precision `InfluxElixir.Client.Local.SQLDecimal` knows for the shapes it
+  # models; an error that would print the type of one whose precision is not known is refused by
+  # name (`Decimal128(?)`).
+  #
+  # The parts a term is checked in come from `InfluxElixir.Client.Local.SQLPlanItems`, the
+  # order the engine finds the errors in from `InfluxElixir.Client.Local.SQLStage`, and the
+  # negations it never plans from `InfluxElixir.Client.Local.SQLPrune`.
 
   alias InfluxElixir.Client.Local.{
     SQLAggExpr,
@@ -27,11 +32,13 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     SQLNativeType,
     SQLNullType,
     SQLParser,
+    SQLPlanItems,
     SQLPredicate,
+    SQLPrune,
     SQLSchema,
     SQLSelect,
-    SQLSimplify,
     SQLStage,
+    SQLTime,
     SQLTyped,
     SQLWhere
   }
@@ -70,7 +77,10 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   """
   @type plan_options :: [
           group: (-> :ok | {:error, term()}),
-          placeholder: nil | failure()
+          placeholder: nil | failure(),
+          limit: nil | failure(),
+          ordinal: nil | failure(),
+          unused: [binary()] | nil
         ]
 
   @doc """
@@ -83,16 +93,29 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     duration? = SQLNullType.duration_misuse?(query)
 
     case check_types(points, query, unsigned?, duration?, options) do
-      :ok when duration? -> {:error, duration_refusal()}
+      :ok when duration? -> {:error, duration_refusal("a place the check does not walk")}
       outcome -> outcome
     end
   end
 
-  @spec duration_refusal() :: map()
-  defp duration_refusal do
+  @doc """
+  `:ok` for the outcome of `check/4` unless it is an error of the engine's physical plan, which
+  is found after every error of the optimizer and of the scan: the caller holds that one, runs
+  what is left of its checks, and answers it only if they find nothing.
+  """
+  @spec unless_physical(:ok | {:error, failure()}) :: :ok | {:error, failure()}
+  def unless_physical(
+        {:error, %{body: "Error during planning: Negation only supports" <> _rest}}
+      ),
+      do: :ok
+
+  def unless_physical(outcome), do: outcome
+
+  @spec duration_refusal(binary()) :: map()
+  defp duration_refusal(use) do
     SQLError.refusal(
-      "a difference of a null and time used in an operation: the engine types it as a " <>
-        "Duration(ns), and its error for each use is not modelled"
+      "a difference of a null and time used in #{use}: the engine types it as a " <>
+        "Duration(ns), and its error for that use is not modelled"
     )
   end
 
@@ -105,12 +128,12 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
         ) :: :ok | {:error, failure()}
   defp check_types(points, query, unsigned?, duration?, options) do
     checks =
-      (Enum.map(select_items(query), &{:select, &1}) ++
-         Enum.map(planned_items(query.where, :where), &{:where, &1}) ++
+      (Enum.map(select_items(query), &select_check/1) ++
+         Enum.map(SQLPlanItems.planned_items(query.where), &{:where, &1}) ++
          logical_items(query.where_tree) ++
          having_items(query) ++
          plan_gates(query, options) ++
-         Enum.map(planned_items(ordered_terms(query), :order_by), &{:order_by, &1}))
+         Enum.map(SQLPlanItems.planned_items(ordered_terms(query)), &{:order_by, &1}))
       |> Enum.map(fn {context, item} ->
         {SQLStage.index(rank(context, item)), check_context(context), item}
       end)
@@ -129,52 +152,22 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
       checks = Enum.map(checks, &with_columns(&1, types))
 
       with :ok <- filter_error(filter, query, columns),
-           do: check_items(checks, columns, %{duration?: duration?, pruned?: pruned(query)})
+           do:
+             check_items(checks, columns, %{
+               duration?: duration?,
+               prune: prune(points, query, unsigned?, Keyword.get(options, :unused))
+             })
     end
   end
 
-  # The items the engine never meets, whose errors are dropped: the negation of a type it does
-  # not support is found only when the physical plan is built, and the optimizer has by then
-  # replaced the plan of a query that answers no row with an empty relation, and removed from
-  # the `WHERE` what its simplifier proves is not needed (`-u > 1 OR true`, verified against
-  # Core).
-  @spec pruned(SQLParser.parsed_query()) :: (term(), plan_context() -> boolean())
-  defp pruned(query) do
-    if SQLSimplify.empty?(query) do
-      fn item, _context -> negation?(item) end
-    else
-      removed = removed_negations(query)
-      fn item, _context -> negation?(item) and item in removed end
-    end
+  # The negations the engine never meets, whose errors are dropped (see `SQLPrune`): asked
+  # about only for a negation that fails, so a query without one pays nothing.
+  @spec prune([point()], SQLParser.parsed_query(), (binary() -> boolean()), [binary()] | nil) ::
+          (term() -> SQLPrune.verdict())
+  defp prune(points, query, unsigned?, unused) do
+    types = fn names -> column_types(points, names, unsigned?) end
+    fn item -> SQLPrune.verdict(item, query, types, unused) end
   end
-
-  # The negations of the `WHERE` that its simplified form no longer holds; the simplifier is
-  # run only if there is a negation in the `WHERE` to ask about.
-  @spec removed_negations(SQLParser.parsed_query()) :: [term()]
-  defp removed_negations(query) do
-    if contains_negation?(query.where),
-      do: negations(query.where, []) -- negations(SQLSimplify.apply(query).where, []),
-      else: []
-  end
-
-  @spec negation?(term()) :: boolean()
-  defp negation?({:neg, _inner}), do: true
-  defp negation?(_item), do: false
-
-  @spec contains_negation?(term()) :: boolean()
-  defp contains_negation?({:neg, _inner}), do: true
-
-  defp contains_negation?(tuple) when is_tuple(tuple),
-    do: contains_negation?(Tuple.to_list(tuple))
-
-  defp contains_negation?(list) when is_list(list), do: Enum.any?(list, &contains_negation?/1)
-  defp contains_negation?(_leaf), do: false
-
-  @spec negations(term(), [term()]) :: [term()]
-  defp negations({:neg, inner} = node, found), do: negations(inner, [node | found])
-  defp negations(tuple, found) when is_tuple(tuple), do: negations(Tuple.to_list(tuple), found)
-  defp negations(list, found) when is_list(list), do: Enum.reduce(list, found, &negations/2)
-  defp negations(_leaf, found), do: found
 
   # The context an item is checked in: a `HAVING` is checked as a `WHERE` is.
   @spec check_context(atom()) :: plan_context()
@@ -200,7 +193,19 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
         error -> [{:select, {:placeholder_check, error}}]
       end
 
-    group ++ placeholder
+    limit =
+      case Keyword.get(options, :limit) do
+        nil -> []
+        error -> [{:select, {:limit_check, error}}]
+      end
+
+    ordinal =
+      case Keyword.get(options, :ordinal) do
+        nil -> []
+        error -> [{:select, {:ordinal_check, error}}]
+      end
+
+    group ++ placeholder ++ limit ++ ordinal
   end
 
   # The predicate of a `WHERE` that is one expression or one column, which the planner makes
@@ -353,8 +358,8 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp typed?({:expr, expr}, columns) do
     outcome =
       expr
-      |> items()
-      |> Enum.filter(&planner_typed?/1)
+      |> SQLPlanItems.items()
+      |> Enum.filter(&SQLPlanItems.planner_typed?/1)
       |> Enum.map(&{SQLStage.index(rank(:where, &1)), :where_plan, &1})
       |> Enum.sort_by(&elem(&1, 0))
       |> check_items(columns, plain_mode())
@@ -367,68 +372,6 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
       {:error, error} -> SQLError.late?(error)
     end
   end
-
-  # The items of a `WHERE` or an `ORDER BY`, the parts under the operand of a `||` marked
-  # `{:planned, item}`. The planner builds a `||` by the types of its operands (it chooses
-  # between the concatenation of text and of lists by them), so every operator and call under
-  # one is typed as the plan is built, and its error is the planner's, not the type
-  # coercion's: unwrapped, and found before the type coercion finds anything, a `WHERE`'s
-  # before the select list's and an `ORDER BY`'s after (verified: `WHERE 'a' || (n + 's') = 'x'`
-  # is the arithmetic error without the `type_coercion` prefix, and before the error of
-  # `abs(s)` in the select list).
-  @spec planned_items(term(), :where | :select | :order_by) :: [term()]
-  defp planned_items(term, _context),
-    do: term |> annotate([]) |> plan_items({false, false, false}) |> flat()
-
-  # An item without the cuts over it.
-  @spec unwrap(term()) :: term()
-  defp unwrap({wrapper, item}) when wrapper in [:cut, :lazy_cut, :null_cut, :case_cut],
-    do: unwrap(item)
-
-  defp unwrap(item), do: item
-
-  @spec item_node(term()) :: term()
-  defp item_node({wrapper, item}) when wrapper in [:cut, :lazy_cut, :null_cut, :case_cut],
-    do: item_node(item)
-
-  defp item_node({:expr_check, node}), do: node
-  defp item_node({:op, _op, _left, _right} = node), do: node
-  defp item_node({:call, _name, _args} = node), do: node
-  defp item_node(_item), do: nil
-
-  # Every part of a term, the term itself among them.
-  @spec subtree(term(), %{term() => true}) :: %{term() => true}
-  defp subtree(tuple, nodes) when is_tuple(tuple),
-    do: tuple |> Tuple.to_list() |> Enum.reduce(Map.put(nodes, tuple, true), &subtree/2)
-
-  defp subtree(terms, nodes) when is_list(terms), do: Enum.reduce(terms, nodes, &subtree/2)
-  defp subtree(_leaf, nodes), do: nodes
-
-  # The parts of an expression the planner types as it builds the plan, whose errors keep it
-  # from typing the expression: the operators and the calls of functions. The rest (a `LIKE`,
-  # an `IN` list, a `CASE`, a `NOT`) is typed by the type coercion.
-  @spec planner_typed?(term()) :: boolean()
-  defp planner_typed?({wrapper, item}) when wrapper in [:cut, :planned],
-    do: planner_typed?(item)
-
-  # What the planner leaves to the type coercion (the conditions of a `CASE`, its later
-  # results, what stands under an `IS NULL` or an operator that types its operands late).
-  defp planner_typed?({wrapper, _item}) when wrapper in [:lazy_cut, :null_cut, :case_cut],
-    do: false
-
-  defp planner_typed?({kind, _first}) when kind in [:neg, :pos], do: false
-  defp planner_typed?({:op, _op, _left, _right}), do: true
-  defp planner_typed?({:call, _name, _args}), do: true
-  defp planner_typed?({:compare, _op, _left, _right}), do: true
-
-  defp planner_typed?({:expr_check, {kind, _left, _right}})
-       when kind in [:cmp, :and, :or, :concat],
-       do: true
-
-  defp planner_typed?({:expr_check, {:cmp, _op, _left, _right}}), do: true
-  defp planner_typed?({:expr_check, {:is_distinct, _left, _right, _negated}}), do: true
-  defp planner_typed?({:expr_check, {:call, name, _args}}), do: name in [:coalesce, :nullif]
-  defp planner_typed?(_item), do: false
 
   @spec filter_text({:expr, SQLExpr.t()} | {:column, binary()}, binary(), binary()) ::
           :ok | {:error, failure()}
@@ -486,11 +429,14 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   # which the analyzer coerces as it does a `WHERE`, after the one below it).
   @spec rank(:select | :where | :having | :order_by, term()) :: SQLStage.t()
   defp rank(:where, {:planned, _item}), do: :where_built
+  defp rank(:aggregate, item), do: rank(:select, item)
   defp rank(:select, {:planned, _item}), do: :select_built_concat
   defp rank(:order_by, {:planned, _item}), do: :order_built
   defp rank(_context, {kind, _inner}) when kind in [:neg, :pos], do: :negation
   defp rank(:select, {:group_check, _check}), do: :group
   defp rank(:select, {:placeholder_check, _error}), do: :placeholder
+  defp rank(:select, {:limit_check, _error}), do: :limit_coerced
+  defp rank(:select, {:ordinal_check, _error}), do: :order_ordinal
 
   defp rank(context, {:constant, _call, ancestors}) do
     case SQLConstantCall.phase(ancestors, context) do
@@ -531,10 +477,16 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp rank(:where, _item), do: :where_calls
   defp rank(:order_by, _item), do: :order_calls
 
+  # The context of a select item: the argument of an aggregate is typed with the aggregate,
+  # below the `HAVING`, the rest of the select list above it.
+  @spec select_check(term()) :: {:select | :aggregate, term()}
+  defp select_check({:argument, item}), do: {:aggregate, item}
+  defp select_check(item), do: {:select, item}
+
   @spec select_items(SQLParser.parsed_query()) :: [term()]
   defp select_items(query) do
     projected =
-      Enum.flat_map(query.projection_columns || [], &planned_items(elem(&1, 0), :select))
+      Enum.flat_map(query.projection_columns || [], &SQLPlanItems.planned_items(elem(&1, 0)))
 
     grouped? = (query.group_by_columns || []) != []
 
@@ -557,7 +509,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp having_items(%{having: nil}), do: []
 
   defp having_items(%{having: %{nodes: nodes, aggs: aggs} = having} = query) do
-    parts = for item <- items(nodes), not match?({:agg_ref, _name}, item), do: item
+    parts = for item <- SQLPlanItems.items(nodes), not match?({:agg_ref, _name}, item), do: item
     tree = having[:tree] || having_tree(nodes)
 
     filter =
@@ -597,14 +549,14 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   @spec aggregate_items(SQLParser.select_column()) :: [term()]
   defp aggregate_items({:aggregate, agg, expr, _alias}),
-    do: items(expr) ++ [{:aggregate, agg, expr}]
+    do: Enum.map(SQLPlanItems.items(expr), &{:argument, &1}) ++ [{:aggregate, agg, expr}]
 
   # The items of an expression over aggregates in the order the engine meets
   # them: each aggregate where its call stands, and the expression's parts
   # typed with the aggregates' results.
   defp aggregate_items({:expression, expr, aggs, _alias}) do
     by_name = Map.new(aggs)
-    parts = items(expr)
+    parts = SQLPlanItems.items(expr)
 
     items =
       Enum.flat_map(parts, fn
@@ -641,349 +593,6 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp logical_parts({:not, _inner} = tree), do: [{:logical_ops, tree}, {:logical, tree}]
   defp logical_parts({:leaf, {:truthy_expr, _expr, _nil}} = tree), do: [{:logical, tree}]
   defp logical_parts(_tree), do: []
-
-  @comparisons [:eq, :ne, :gt, :lt, :gte, :lte]
-
-  # Every part of a term the planner types, the innermost first. The engine
-  # types a part in one of two passes (verified, over every pairing of a
-  # call, a CAST, a function, an arithmetic operator and a negation under a
-  # comparison, an IS [NOT] NULL, a BETWEEN, an IN list, a LIKE and a NOT):
-  # the plain one, and a later one for the parts that are `cut`, which
-  # words a failing call by its first sentence, without the tail naming its
-  # signatures. A part is cut when it stands
-  #
-  #   * under an IS [NOT] NULL, a BETWEEN, an IN list, a LIKE or a NOT, or
-  #   * under a CAST that no function call stands above (`CAST(abs(s) AS INT)
-  #     > 1`, but not `abs(CAST(abs(s) AS INT)) > 1`).
-  #
-  # The state is `{function_above?, cut?, planned?}`: `planned?` says the part stands under the
-  # operand of a `||`, which the planner types as it builds it (`false` where it does not,
-  # `:never` where the parts under a `||` are not told from the others, see `planned_items/2`).
-  @typep state :: {boolean(), boolean(), boolean() | :never}
-
-  # The parts of a term the planner types (see `plan_items/2`), the calls with no
-  # argument among them with what stands above each.
-  @spec items(term()) :: [term()]
-  defp items(term), do: term |> annotate([]) |> plan_items({false, false, :never}) |> flat()
-
-  # Each call with no argument as `{:constant, call, ancestors}`, the ancestors
-  # nearest first (see `InfluxElixir.Client.Local.SQLConstantCall`).
-  @spec annotate(term(), [atom()]) :: term()
-  defp annotate({:call, name, []} = call, ancestors) when is_atom(name),
-    do: {:constant, call, ancestors}
-
-  # The parts of these the planner types only later, when it coerces them.
-  defp annotate({:in, left, items, negated}, ancestors) when is_list(items) do
-    {:in, annotate(left, [:other | ancestors]), annotate(items, slot(left, [:other | ancestors])),
-     negated}
-  end
-
-  defp annotate({:is_bool, inner, value, negated}, ancestors),
-    do: {:is_bool, annotate(inner, [:deferred, :other | ancestors]), value, negated}
-
-  defp annotate({:between, inner, low, high, negated}, ancestors) do
-    bounds = slot(inner, [:other | ancestors])
-
-    {:between, annotate(inner, [:other | ancestors]), annotate(low, bounds),
-     annotate(high, bounds), negated}
-  end
-
-  defp annotate({:like, inner, pattern, negated, ilike, regex}, ancestors) do
-    {:like, annotate(inner, [:other | ancestors]),
-     annotate(pattern, slot(inner, [:other | ancestors])), negated, ilike, regex}
-  end
-
-  defp annotate({:case, operand, whens, otherwise}, ancestors) do
-    deferred = [:deferred, :other | ancestors]
-    plain = [:other | ancestors]
-
-    {:case, annotate(operand, deferred),
-     Enum.map(whens, fn {condition, result} ->
-       {annotate(condition, if(operand, do: deferred, else: [:when | deferred])),
-        annotate(result, plain)}
-     end), annotate(otherwise, plain)}
-  end
-
-  defp annotate({:expr, _expr} = operand, ancestors),
-    do: operand |> Tuple.to_list() |> Enum.map(&annotate(&1, ancestors)) |> List.to_tuple()
-
-  defp annotate(term, ancestors) when is_tuple(term) and tuple_size(term) > 0 do
-    inner = if is_atom(elem(term, 0)), do: [ancestor(elem(term, 0)) | ancestors], else: ancestors
-    term |> Tuple.to_list() |> Enum.map(&annotate(&1, inner)) |> List.to_tuple()
-  end
-
-  defp annotate(terms, ancestors) when is_list(terms),
-    do: Enum.map(terms, &annotate(&1, ancestors))
-
-  defp annotate(other, _ancestors), do: other
-
-  # The ancestors of a list item, a bound or a pattern: the engine types them only when
-  # it coerces the expression, unless the operand beside them is a constant, which it
-  # folds at once.
-  @spec slot(SQLExpr.t(), [atom()]) :: [atom()]
-  defp slot(operand, ancestors),
-    do: if(constant_operand?(operand), do: ancestors, else: [:deferred | ancestors])
-
-  @spec constant_operand?(SQLExpr.t()) :: boolean()
-  defp constant_operand?({:is_null, _inner, _negated}), do: true
-  defp constant_operand?(operand), do: SQLExpr.columns(operand) == []
-
-  @spec ancestor(atom()) :: :cast | :neg | :isnull | :other
-  defp ancestor(:cast), do: :cast
-  defp ancestor(:neg), do: :neg
-  defp ancestor(tag) when tag in [:is_null, :is_not_null], do: :isnull
-  defp ancestor(_tag), do: :other
-
-  # The items come as nested lists (a part's, then another's, then its own): joining the lists
-  # of the parts would copy the items of everything under an operator once for each operator
-  # above it, which is quadratic in the length of a chain; `flat/1` makes the one list.
-  @spec plan_items(term(), state()) :: [term()]
-  defp plan_items(term, state)
-
-  defp plan_items({:constant, _call, _ancestors} = constant, _state), do: [constant]
-
-  defp plan_items({:call, name, args} = call, state) when name in [:coalesce, :nullif],
-    do: [plan_items(args, state), mark({:expr_check, call}, state)]
-
-  defp plan_items({:cmp, _op, left, right} = node, state),
-    do: [plan_items(left, state), plan_items(right, state), mark({:expr_check, node}, state)]
-
-  # The operands of a `||` are typed as the plan is built.
-  defp plan_items({:concat, left, right} = node, state) do
-    operands = planned(state)
-
-    [plan_items(left, operands), plan_items(right, operands), mark({:expr_check, node}, state)]
-  end
-
-  defp plan_items({kind, left, right} = node, state) when kind in [:and, :or],
-    do: [plan_items(left, state), plan_items(right, state), mark({:expr_check, node}, state)]
-
-  defp plan_items({:not, inner} = node, state) when not is_list(inner),
-    do: [lazy(inner, state), mark({:expr_check, node}, state)]
-
-  defp plan_items({:is_bool, inner, _value, _negated} = node, state),
-    do: [deferred(inner, unplanned(state)), mark({:expr_check, node}, state)]
-
-  defp plan_items({:is_distinct, left, right, _negated} = node, state),
-    do: [plan_items(left, state), plan_items(right, state), mark({:expr_check, node}, state)]
-
-  defp plan_items(term, state), do: plan_predicate_items(term, state)
-
-  @spec plan_predicate_items(term(), state()) :: [term()]
-  defp plan_predicate_items({:in, left, items, _negated} = node, state)
-       when is_list(items) and not is_nil(left),
-       do: [
-         lazy(left, state),
-         slot_items(left, items, state),
-         mark({:expr_check, node}, state)
-       ]
-
-  defp plan_predicate_items({:between, inner, low, high, _negated} = node, state),
-    do: [
-      lazy(inner, state),
-      slot_items(inner, [low, high], state),
-      mark({:expr_check, node}, state)
-    ]
-
-  defp plan_predicate_items({:like, inner, pattern, _negated, _ilike, _regex} = node, state),
-    do: [
-      lazy(inner, state),
-      slot_items(inner, pattern, state),
-      mark({:expr_check, node}, state)
-    ]
-
-  # The planner types a `CASE` by its first result: the conditions and the later results are
-  # left to the type coercion.
-  defp plan_predicate_items({:case, operand, whens, otherwise} = node, state) do
-    conditions = List.wrap(operand) ++ Enum.map(whens, &elem(&1, 0))
-    [first | later] = Enum.map(whens, &elem(&1, 1))
-
-    [
-      deferred(conditions, unplanned(state)),
-      plan_items(first, state),
-      case_lazy(later ++ List.wrap(otherwise), unplanned(state)),
-      mark({:expr_check, node}, state)
-    ]
-  end
-
-  defp plan_predicate_items(
-         {:call, _function, args} = call,
-         {_function_above, cut, planned} = state
-       ),
-       do: [plan_items(args, {true, cut, planned}), mark(call, state)]
-
-  defp plan_predicate_items({:cast, inner, _type} = node, {function_above, cut, planned} = state),
-    do: [
-      plan_items(inner, {function_above, cut or not function_above, planned}),
-      mark({:expr_check, node}, state)
-    ]
-
-  defp plan_predicate_items({:op, _op, left, right} = op, state),
-    do: [plan_items(left, state), plan_items(right, state), mark(op, state)]
-
-  defp plan_predicate_items({:neg, inner} = neg, state), do: [plan_items(inner, state), neg]
-  defp plan_predicate_items({:pos, inner} = pos, state), do: [plan_items(inner, state), pos]
-
-  defp plan_predicate_items({:field, name}, _state) when is_binary(name),
-    do: if(SQLAggExpr.placeholder?(name), do: [{:agg_ref, name}], else: [])
-
-  defp plan_predicate_items(term, state), do: plan_condition_items(term, state)
-
-  @spec plan_condition_items(term(), state()) :: [term()]
-  defp plan_condition_items({kind, left, rest}, state)
-       when kind in [:like, :not_like, :regex, :not_regex] do
-    operand = operand_expr(left)
-    [plan_items(operand, cut_state(state)), {:pattern, kind, operand, rest}]
-  end
-
-  defp plan_condition_items({op, left, right}, state) when op in @comparisons and left != "time",
-    do: [
-      plan_items(left, state),
-      plan_items(right, state),
-      mark({:compare, op, operand_expr(left), right}, state)
-    ]
-
-  defp plan_condition_items({op, left, values}, state)
-       when op in [:in, :not_in] and left != "time",
-       do: [
-         plan_items(left, cut_state(state)),
-         plan_items(values, cut_state(state)),
-         {:in_list, operand_expr(left), values}
-       ]
-
-  defp plan_condition_items({op, left, {low, high}}, state)
-       when op in [:between, :not_between] and left != "time",
-       do: [
-         plan_items(left, cut_state(state)),
-         plan_items([low, high], cut_state(state)),
-         {:range, operand_expr(left), low, high}
-       ]
-
-  # What an `IS [NOT] NULL` tests is not among the parts the planner types for a `||`.
-  defp plan_condition_items({op, left, _nil}, state) when op in [:is_null, :is_not_null],
-    do:
-      left |> plan_items(state |> cut_state() |> unplanned()) |> flat() |> Enum.map(&null_mark/1)
-
-  defp plan_condition_items({:not, nodes}, state), do: plan_items(nodes, cut_state(state))
-
-  defp plan_condition_items({:time_type_error, "time", error}, _state), do: [{:time_type, error}]
-
-  defp plan_condition_items(terms, state) when is_list(terms),
-    do: Enum.map(terms, &plan_items(&1, state))
-
-  defp plan_condition_items(term, state) when is_tuple(term),
-    do: term |> Tuple.to_list() |> plan_items(state)
-
-  defp plan_condition_items(_other, _state), do: []
-
-  @spec flat([term()]) :: [term()]
-  defp flat(items), do: List.flatten(items)
-
-  # The parts the planner types only when it coerces the expression are cut like
-  # what stands under an `IS [NOT] NULL`.
-  @spec deferred(term(), state()) :: [term()]
-  defp deferred(parts, state),
-    do: parts |> plan_items(cut_state(state)) |> flat() |> Enum.map(&null_mark/1)
-
-  # The list items, bounds and pattern of an operand: deferred, but a call beside a
-  # constant operand is typed at once.
-  @spec slot_items(SQLExpr.t(), term(), state()) :: [term()]
-  defp slot_items(operand, parts, state) do
-    if constant_operand?(operand), do: lazy(parts, state), else: deferred(parts, state)
-  end
-
-  # The parts the planner types only when it coerces the expression, which it does
-  # for an operator (not for a call) in the select list: they are cut like what
-  # stands under an `IS [NOT] NULL`.
-  @spec lazy(term(), state()) :: [term()]
-  defp lazy(parts, state) do
-    # The arguments of a call are typed as the call is, wherever it stands.
-    typed = call_arguments(parts, %{})
-
-    parts
-    |> plan_items(cut_state(state))
-    |> flat()
-    |> Enum.map(fn item ->
-      if is_map_key(typed, item_node(item)), do: item, else: lazy_mark(item)
-    end)
-  end
-
-  @spec cut_state(state()) :: state()
-  defp cut_state({function_above, _cut, planned}), do: {function_above, true, planned}
-
-  # The state of what stands under the operand of a `||`, and of what does not.
-  @spec planned(state()) :: state()
-  defp planned({function_above, cut, false}), do: {function_above, cut, true}
-  defp planned(state), do: state
-
-  @spec unplanned(state()) :: state()
-  defp unplanned({function_above, cut, true}), do: {function_above, cut, false}
-  defp unplanned(state), do: state
-
-  # Every part of the arguments of the calls among the parts.
-  @spec call_arguments(term(), %{term() => true}) :: %{term() => true}
-  defp call_arguments({:call, _name, args} = call, nodes),
-    do: call |> Tuple.to_list() |> Enum.reduce(subtree(args, nodes), &call_arguments/2)
-
-  defp call_arguments(tuple, nodes) when is_tuple(tuple),
-    do: tuple |> Tuple.to_list() |> Enum.reduce(nodes, &call_arguments/2)
-
-  defp call_arguments(terms, nodes) when is_list(terms),
-    do: Enum.reduce(terms, nodes, &call_arguments/2)
-
-  defp call_arguments(_leaf, nodes), do: nodes
-
-  # The later results of a `CASE`: the planner types only the first, so a call among the
-  # others is met when the expression is coerced, like an operator (verified: with a bad
-  # `BETWEEN` as the first result, the error is the `BETWEEN`'s, not the later call's).
-  @spec case_lazy(term(), state()) :: [term()]
-  defp case_lazy(parts, state) do
-    parts
-    |> lazy(state)
-    |> Enum.map(fn
-      {:cut, {:call, _name, _args} = call} -> {:case_cut, call}
-      item -> item
-    end)
-  end
-
-  @spec lazy_mark(term()) :: term()
-  defp lazy_mark({:cut, {:op, _op, _left, _right}} = item), do: lazy_cut(item)
-  defp lazy_mark({:cut, {:expr_check, {:call, _name, _args}}} = item), do: item
-  defp lazy_mark({:cut, {:expr_check, _node}} = item), do: lazy_cut(item)
-  defp lazy_mark(item), do: item
-
-  @spec lazy_cut({:cut, term()}) :: {:lazy_cut, term()}
-  defp lazy_cut({:cut, item}), do: {:lazy_cut, item}
-
-  # What stands under an IS [NOT] NULL is cut by it, which the select list tells
-  # from a cut by anything else.
-  @spec null_mark(term()) :: term()
-  defp null_mark({:cut, item}), do: {:null_cut, item}
-  defp null_mark(item), do: item
-
-  # An item the cuts over it and the `||` under which it stands (see `planned_items/2`) mark.
-  @spec mark(term(), state()) :: term()
-  defp mark(item, {_function_above, cut, planned}) do
-    item |> cut_item(cut) |> planned_item(planned)
-  end
-
-  @spec cut_item(term(), boolean()) :: term()
-  defp cut_item(item, true), do: {:cut, item}
-  defp cut_item(item, false), do: item
-
-  # The operators and calls the planner types, under the operand of a `||`.
-  @spec planned_item(term(), boolean() | :never) :: term()
-  defp planned_item(item, true) do
-    if item_node(item) != nil and planner_typed?(unwrap(item)),
-      do: {:planned, item},
-      else: item
-  end
-
-  defp planned_item(item, _not_planned), do: item
-
-  @spec operand_expr(SQLParser.operand()) :: SQLParser.expr()
-  defp operand_expr({:expr, expr}), do: expr
-  defp operand_expr(column), do: {:field, column}
 
   # The columns the checks name. The parts of a term that are items of their own (an
   # operator under an operator, a call under a comparison) are named by those items, so
@@ -1029,6 +638,8 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp item_fields({:aggs, _aggs, item}), do: item_fields(item)
   defp item_fields({:group_check, _check}), do: []
   defp item_fields({:placeholder_check, _error}), do: []
+  defp item_fields({:limit_check, _error}), do: []
+  defp item_fields({:ordinal_check, _error}), do: []
 
   defp item_fields({:aggregate, _agg, expr}), do: own_fields(expr)
   defp item_fields({:compare, _op, left, right}), do: own_fields([left, right])
@@ -1113,14 +724,14 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   # The contexts of the checks: those of the functions, and the one that types a predicate as
   # the planner does (see `typed?/2`).
-  @typep plan_context :: SQLFunctions.context() | :where_plan
+  @typep plan_context :: SQLFunctions.context() | :where_plan | :aggregate
 
   # How the items are checked: whether a use of a duration ends the check (see `duration_use?/1`),
-  # and which items the engine never meets (see `pruned/1`).
-  @typep mode :: %{duration?: boolean(), pruned?: (term(), plan_context() -> boolean())}
+  # and which negations the engine never meets (see `prune/3`).
+  @typep mode :: %{duration?: boolean(), prune: (term() -> SQLPrune.verdict())}
 
   @spec plain_mode() :: mode()
-  defp plain_mode, do: %{duration?: false, pruned?: fn _item, _context -> false end}
+  defp plain_mode, do: %{duration?: false, prune: fn _item -> :keep end}
 
   @spec check_items(
           [{non_neg_integer(), plan_context(), term()}],
@@ -1148,40 +759,79 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
        when position < rank,
        do: {:halt, {:done, error}}
 
-  defp check_next({_rank, context, item}, {deferred, scopes}, columns, mode) do
+  defp check_next({_rank, :aggregate, item}, state, columns, mode),
+    do: check_item_next(:select, true, item, state, columns, mode)
+
+  defp check_next({_rank, context, item}, state, columns, mode),
+    do: check_item_next(context, false, item, state, columns, mode)
+
+  defp check_item_next(context, aggregate?, item, {deferred, scopes}, columns, mode) do
     coerced? = context == :select and elem(item, 0) in [:lazy_cut, :null_cut, :case_cut]
-    {key, item, scope} = enter(item, columns, scopes)
+    {key, item, scope} = enter(item, columns, scopes, context)
     {scope_columns, memo, _nulls} = scope
 
     # The engine's error for a use of a duration is its own and is found where the use stands,
     # so the double's refusal for it ends the check there (it is not one of the refusals that
     # stand with the errors of the type coercion).
-    if mode.duration? and duration_use?(item) do
-      {:halt, {:done, {:error, duration_refusal()}}}
+    use = if mode.duration?, do: duration_use(item)
+
+    if use do
+      {:halt, {:done, {:error, duration_refusal(use)}}}
     else
       outcome = item |> check_item(context, scope_columns, memo) |> decimal_guard()
-      outcome = if mode.pruned?.(item, context), do: :ok, else: outcome
+      outcome = pruned(outcome, item, mode)
       scopes = List.keystore(scopes, key, 0, {key, remember(item, scope)})
-      continue(outcome, {context, coerced?}, deferred, scopes)
+      continue(outcome, {context, coerced?, aggregate?}, deferred, scopes)
     end
   end
 
+  # The error of a negation the engine never meets is dropped; where whether it meets it is not
+  # known, the double refuses.
+  @spec pruned(:ok | {:error, failure()}, term(), mode()) :: :ok | {:error, failure()}
+  defp pruned({:error, _error} = outcome, {:neg, _inner} = item, mode) do
+    case mode.prune.(item) do
+      :keep -> outcome
+      :drop -> :ok
+      :unknown -> {:error, unknown_prune()}
+    end
+  end
+
+  defp pruned(outcome, _item, _mode), do: outcome
+
+  @spec unknown_prune() :: map()
+  defp unknown_prune do
+    SQLError.refusal(
+      "a negation that fails beside equalities of one expression to literals of a kind not " <>
+        "modelled: whether the engine proves the query empty before it plans the negation is " <>
+        "not known"
+    )
+  end
+
   # `coerced?` says the item stands where the planner types it only when it coerces the
+
   # expression (under a lazy or null cut of the select list): every error it has, the
   # double's refusals too, is found by the type coercion.
   @spec continue(
           :ok | {:error, failure()},
-          {plan_context(), boolean()},
+          {plan_context(), boolean(), boolean()},
           deferred(),
           scopes()
         ) :: {:cont, {deferred(), scopes()}} | {:halt, {:done, term()}}
   defp continue(:ok, _where, deferred, scopes), do: {:cont, {deferred, scopes}}
 
-  defp continue({:error, error} = outcome, {context, coerced?}, deferred, scopes) do
+  defp continue({:error, error} = outcome, {context, coerced?, aggregate?}, deferred, scopes) do
     case {position(error, context), coerced?} do
-      {nil, false} -> {:halt, {:done, outcome}}
-      {nil, true} -> {:cont, {defer(deferred, :select_coerced, outcome), scopes}}
-      {position, _coerced?} -> {:cont, {defer(deferred, position, outcome), scopes}}
+      {nil, false} ->
+        {:halt, {:done, outcome}}
+
+      {nil, true} ->
+        {:cont, {defer(deferred, :select_coerced, outcome), scopes}}
+
+      {:select_coerced, _coerced?} when aggregate? ->
+        {:cont, {defer(deferred, :aggregate_coerced, outcome), scopes}}
+
+      {position, _coerced?} ->
+        {:cont, {defer(deferred, position, outcome), scopes}}
     end
   end
 
@@ -1248,22 +898,27 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   # The scope an item is checked in, made once, and the item as it is checked there: the
   # aggregates that are the null read as the null literal.
-  @spec enter(term(), %{binary() => binary()}, scopes()) :: {term(), term(), scope()}
-  defp enter({:aggs, aggs, item}, columns, scopes) do
+  @spec enter(term(), %{binary() => binary()}, scopes(), plan_context()) ::
+          {term(), term(), scope()}
+  defp enter({:aggs, aggs, item}, columns, scopes, context) do
+    # A `HAVING` is built over the aggregates' output, which the engine has typed already: it
+    # sees the type coercion's types of them, not the planner's.
+    key = if context == :where, do: {:having, aggs}, else: aggs
+
     scope =
-      case List.keyfind(scopes, aggs, 0) do
-        {_aggs, scope} ->
+      case List.keyfind(scopes, key, 0) do
+        {_key, scope} ->
           scope
 
         nil ->
           nulls = for {name, _column} = agg <- aggs, null_extreme?(agg), do: name
-          {Map.merge(columns, SQLAggType.types(aggs, columns)), SQLTyped.new(), nulls}
+          {Map.merge(columns, aggregate_types(aggs, columns, context)), SQLTyped.new(), nulls}
       end
 
-    {aggs, nullify(item, elem(scope, 2)), scope}
+    {key, nullify(item, elem(scope, 2)), scope}
   end
 
-  defp enter(item, columns, scopes) do
+  defp enter(item, columns, scopes, _context) do
     scope =
       case List.keyfind(scopes, :base, 0) do
         {:base, scope} -> scope
@@ -1271,6 +926,16 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
       end
 
     {:base, item, scope}
+  end
+
+  @spec aggregate_types([{binary(), term()}], %{binary() => binary()}, plan_context()) ::
+          %{binary() => binary()}
+  defp aggregate_types(aggs, columns, context) do
+    types = SQLAggType.types(aggs, columns)
+
+    if context == :where,
+      do: Map.reject(types, fn {name, _type} -> SQLAggType.plan_key?(name) end),
+      else: types
   end
 
   # What an item typed, added to what was typed before it: the type of an expression
@@ -1291,33 +956,60 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp remember_node(node, {columns, memo, nulls}),
     do: {columns, SQLTyped.put(memo, node, SQLExprType.types_of(node, columns, memo)), nulls}
 
-  # Whether an item operates on the difference of a null and `time` (`time - NULL`), which the
-  # engine types as a `Duration(ns)`: the error of each use is its own, and not modelled.
-  @spec duration_use?(term()) :: boolean()
-  defp duration_use?({wrapper, item})
+  # What an item does with the difference of a null and `time` (`time - NULL`), which the engine
+  # types as a `Duration(ns)`: the error of each use is its own, and not modelled. `nil` for an
+  # item that does not use one.
+  @spec duration_use(term()) :: binary() | nil
+  defp duration_use({wrapper, item})
        when wrapper in [:cut, :lazy_cut, :null_cut, :case_cut, :planned],
-       do: duration_use?(item)
+       do: duration_use(item)
 
-  defp duration_use?({:aggs, _aggs, item}), do: duration_use?(item)
-  defp duration_use?({:expr_check, node}), do: Enum.any?(SQLExpr.children(node), &duration?/1)
-  defp duration_use?({:aggregate, _agg, expr}), do: duration?(expr)
-  defp duration_use?({:compare, _op, left, right}), do: Enum.any?([left, right], &duration?/1)
-  defp duration_use?({:pattern, _kind, expr, _rest}), do: duration?(expr)
-  defp duration_use?({:in_list, left, values}), do: Enum.any?([left | values], &duration?/1)
+  defp duration_use({:aggs, _aggs, item}), do: duration_use(item)
 
-  defp duration_use?({:range, left, low, high}),
-    do: Enum.any?([left, low, high], &duration?/1)
+  defp duration_use({:expr_check, node}),
+    do: if(Enum.any?(SQLExpr.children(node), &duration?/1), do: node_use(node))
 
-  defp duration_use?({kind, _first} = node) when kind in [:neg, :pos],
-    do: Enum.any?(SQLExpr.children(node), &duration?/1)
+  defp duration_use({:aggregate, agg, expr}),
+    do: if(duration?(expr), do: "the aggregate #{agg}")
 
-  defp duration_use?({:op, _op, _left, _right} = node),
-    do: Enum.any?(SQLExpr.children(node), &duration?/1)
+  defp duration_use({:compare, _op, left, right}),
+    do: if(Enum.any?([left, right], &duration?/1), do: "a comparison")
 
-  defp duration_use?({:call, _name, _args} = node),
-    do: Enum.any?(SQLExpr.children(node), &duration?/1)
+  defp duration_use({:pattern, _kind, expr, _rest}),
+    do: if(duration?(expr), do: "a LIKE or a regular expression")
 
-  defp duration_use?(_item), do: false
+  defp duration_use({:in_list, left, values}),
+    do: if(Enum.any?([left | values], &duration?/1), do: "an IN list")
+
+  defp duration_use({:range, left, low, high}),
+    do: if(Enum.any?([left, low, high], &duration?/1), do: "a BETWEEN")
+
+  defp duration_use({kind, _first} = node) when kind in [:neg, :pos],
+    do: if(Enum.any?(SQLExpr.children(node), &duration?/1), do: "a sign")
+
+  defp duration_use({:op, _op, _left, _right} = node),
+    do: if(Enum.any?(SQLExpr.children(node), &duration?/1), do: node_use(node))
+
+  defp duration_use({:call, _name, _args} = node),
+    do: if(Enum.any?(SQLExpr.children(node), &duration?/1), do: node_use(node))
+
+  defp duration_use(_item), do: nil
+
+  @spec node_use(tuple()) :: binary()
+  defp node_use({:op, op, _left, _right}), do: "the operator #{op}"
+  defp node_use({:call, name, _args}), do: "the function #{name}"
+  defp node_use({:cmp, _op, _left, _right}), do: "a comparison"
+  defp node_use({kind, _left, _right}) when kind in [:and, :or], do: "AND or OR"
+  defp node_use({:concat, _left, _right}), do: "||"
+  defp node_use({:not, _inner}), do: "NOT"
+  defp node_use({:cast, _inner, _type}), do: "a CAST"
+  defp node_use({:case, _operand, _whens, _otherwise}), do: "a CASE"
+  defp node_use({:is_bool, _inner, _value, _negated}), do: "IS TRUE or IS FALSE"
+  defp node_use({:is_distinct, _left, _right, _negated}), do: "IS DISTINCT FROM"
+  defp node_use({:in, _inner, _items, _negated}), do: "an IN list"
+  defp node_use({:between, _inner, _low, _high, _negated}), do: "a BETWEEN"
+  defp node_use({:like, _inner, _pattern, _negated, _ilike, _regex}), do: "a LIKE"
+  defp node_use(_node), do: "another expression"
 
   @spec duration?(term()) :: boolean()
   defp duration?({:expr, expr}), do: SQLNullType.duration?(expr)
@@ -1485,6 +1177,8 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   # value, and a `HAVING` that is no boolean (its aggregates typed by their results).
   defp check_item({:group_check, check}, _context, _columns, _memo), do: check.()
   defp check_item({:placeholder_check, error}, _context, _columns, _memo), do: {:error, error}
+  defp check_item({:limit_check, error}, _context, _columns, _memo), do: {:error, error}
+  defp check_item({:ordinal_check, error}, _context, _columns, _memo), do: {:error, error}
 
   defp check_item({:filter, tree, names, measurement}, _context, columns, _memo),
     do: having_filter(tree, names, measurement, columns)
@@ -1656,8 +1350,8 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   @spec leaf_error(term(), %{binary() => binary()}) :: :ok | {:error, failure()}
   defp leaf_error(expr, columns) do
     expr
-    |> items()
-    |> Enum.filter(&(uncut?(&1) and (planner_typed?(&1) or regex?(&1))))
+    |> SQLPlanItems.items()
+    |> Enum.filter(&(uncut?(&1) and (SQLPlanItems.planner_typed?(&1) or regex?(&1))))
     |> Enum.map(&{SQLStage.index(rank(:where, &1)), :where, &1})
     |> Enum.sort_by(&elem(&1, 0))
     |> check_items(columns, plain_mode())
@@ -1911,14 +1605,20 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     case {SQLExprType.known_type(left, columns, SQLTyped.new(), :plan),
           value_type(right, columns)} do
       {column, value} when is_binary(column) and is_binary(value) ->
-        if boolean_mismatch?(column, value),
-          do:
+        cond do
+          boolean_mismatch?(column, value) ->
             {:error,
              SQLError.coercion(
                "Cannot infer common argument type for comparison operation " <>
                  "#{column} #{SQLExpr.symbol(op)} #{value}"
-             )},
-          else: :ok
+             )}
+
+          column == "Timestamp(ns)" and is_binary(right) ->
+            timestamp_text(right)
+
+          true ->
+            :ok
+        end
 
       _unknown ->
         :ok
@@ -1929,6 +1629,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
           :ok | {:error, map()}
   defp check_in_list(left, values, columns) do
     with :ok <- boolean_list(left, values, columns),
+         :ok <- timestamp_texts(left, values, columns),
          do: SQLDecimal.check(left, values, columns)
   end
 
@@ -1945,6 +1646,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
           :ok | {:error, map()}
   defp check_range(left, low, high, columns) do
     with :ok <- boolean_range(left, low, high, columns),
+         :ok <- timestamp_texts(left, [low, high], columns),
          do: SQLDecimal.check(left, [low, high], columns)
   end
 
@@ -1965,6 +1667,13 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp value_type(nil), do: nil
   defp value_type(value) when is_boolean(value), do: "Boolean"
   defp value_type({:uint, _value}), do: "UInt64"
+
+  defp value_type(value) when is_integer(value) and value > 9_223_372_036_854_775_807,
+    do: if(value <= 18_446_744_073_709_551_615, do: "UInt64", else: "Float64")
+
+  defp value_type(value) when is_integer(value) and value < -9_223_372_036_854_775_808,
+    do: "Float64"
+
   defp value_type(value) when is_integer(value), do: "Int64"
   defp value_type(value) when is_float(value), do: "Float64"
   defp value_type(value) when is_binary(value), do: "Utf8"
@@ -1981,7 +1690,52 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp boolean_mismatch?(left, right),
     do:
       left == "Boolean" != (right == "Boolean") or
-        SQLNativeType.struct?(left) != SQLNativeType.struct?(right)
+        SQLNativeType.struct?(left) != SQLNativeType.struct?(right) or
+        timestamp_and_number?(left, right)
+
+  # A number has no order against a timestamp (verified: `max(time) > 5`, `max(time) > count(*)`
+  # and `5 < min(time)` are all the type error).
+  @spec timestamp_and_number?(binary(), binary()) :: boolean()
+  defp timestamp_and_number?(left, right) do
+    numbers = ["Int64", "UInt64", "Float64"]
+
+    ("Timestamp(ns)" == left and right in numbers) or
+      ("Timestamp(ns)" == right and left in numbers)
+  end
+
+  @spec timestamp_texts(SQLParser.expr(), [term()], %{binary() => binary()}) ::
+          :ok | {:error, map()}
+  defp timestamp_texts(left, values, columns) do
+    if SQLExprType.known_type(left, columns, SQLTyped.new(), :plan) == "Timestamp(ns)" do
+      values
+      |> Enum.filter(&is_binary/1)
+      |> Enum.find_value(:ok, fn text ->
+        case timestamp_text(text) do
+          :ok -> nil
+          error -> error
+        end
+      end)
+    else
+      :ok
+    end
+  end
+
+  # A text beside a timestamp that is not the column `time` is read by the engine as a
+  # timestamp; one it cannot read is the optimizer's error, which comes after the planner's.
+  @spec timestamp_text(binary()) :: :ok | {:error, map()}
+  defp timestamp_text(text) do
+    case SQLTime.param(text) do
+      {:invalid_time, _error} ->
+        {:error,
+         SQLError.refusal(
+           "a text the engine cannot read as a timestamp, beside a timestamp that is not the " <>
+             "column time: the optimizer's error for it comes after the planner's"
+         )}
+
+      _instant ->
+        :ok
+    end
+  end
 
   # The type of an item of an `IN` list or a bound of a `BETWEEN`: `Null` for the null, and
   # anything that is no type name for a type not known.

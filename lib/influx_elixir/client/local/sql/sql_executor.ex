@@ -35,6 +35,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     LineProtocolParser,
     SQLAggregate,
     SQLBatch,
+    SQLBind,
     SQLClauses,
     SQLCoerce,
     SQLCondition,
@@ -47,12 +48,14 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     SQLNumber,
     SQLParser,
     SQLPlan,
+    SQLPrune,
     SQLRange,
     SQLRow,
     SQLSchema,
     SQLSelect,
     SQLSimplify,
     SQLSort,
+    SQLTable,
     SQLTime,
     SQLTyping
   }
@@ -110,9 +113,12 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec run_query(SQLParser.parsed_query(), fetch(), %{binary() => term()}, kinds_mode()) ::
           [map()] | {:error, term()}
   defp run_query(query, fetch, params, kinds) do
+    unused = SQLPrune.unused(query.ctes, query)
+
     query.ctes
     |> Enum.reduce_while({:ok, %{}}, fn {name, cte_query}, {:ok, sources} ->
-      with {:ok, rows, relations} <- select(cte_query, fetch, sources, params, kinds, false),
+      with {:ok, rows, relations} <-
+             select(cte_query, fetch, sources, params, kinds, false, Map.get(unused, name, [])),
            :ok <- SQLTyping.check_cte_outputs(cte_query) do
         cte = cte_source(name, rows, relations, cte_query, sources, kinds)
         {:cont, {:ok, Map.put(sources, name, cte)}}
@@ -139,7 +145,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           kinds_mode()
         ) :: [map()] | {:error, term()}
   defp execute_select(query, fetch, sources, params, kinds) do
-    case select(query, fetch, sources, params, kinds, true) do
+    case select(query, fetch, sources, params, kinds, true, nil) do
       {:ok, rows, _relations} -> response_rows(rows, query)
       {:error, _reason} = error -> error
     end
@@ -192,9 +198,10 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           %{binary() => source()},
           %{binary() => term()},
           kinds_mode(),
-          boolean()
+          boolean(),
+          [binary()] | nil
         ) :: {:ok, [map()], [SQLSchema.relation()]} | {:error, term()}
-  defp select(%{measurement: m} = query, fetch, sources, params, kinds, final?) do
+  defp select(%{measurement: m} = query, fetch, sources, params, kinds, final?, unused) do
     unsigned? = unsigned_columns(query, sources, kinds)
     fetch_source = &fetch_source(fetch, &1, sources)
 
@@ -202,22 +209,31 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
          {:ok, source} <- source(fetch, m, sources),
          {:ok, joined, relations} <- SQLJoin.cross_join(source, query, fetch_source),
          :ok <- SQLClauses.unreadable_order(query.order_by),
-         :ok <- SQLSchema.check(relations, query, SQLSimplify.never?(query)),
-         :ok <- order_available(relations, query),
+         :ok <- zero_placeholder(query, relations),
+         ordinal = ordinal_error(query, relations),
+         checked = unordered(query, ordinal),
+         :ok <- SQLSchema.check(relations, checked, SQLSimplify.never?(query)),
+         :ok <- order_available(relations, checked),
          {:ok, query} <- SQLSchema.resolve_ordinals(query, relations),
          :ok <- plan_error(query),
          {:ok, bound} <- SQLParser.bind_partial(query, params),
          typed = SQLTyping.retype(bound, unsigned?),
-         :ok <- SQLPlan.check(joined, typed, unsigned?, plan_options(query, params, relations)),
-         typed = SQLCoerce.apply(typed, joined, unsigned?),
-         :ok <- SQLTime.first_invalid(typed.where),
-         :ok <- limit_error(typed),
-         :ok <- SQLFold.check(typed),
-         simplified = SQLSimplify.apply(typed),
-         :ok <- SQLRange.check_time(simplified, source.pushdown),
-         :ok <- check_value_range(simplified, joined, sources, kinds, unsigned?),
-         :ok <- SQLSelect.check_named(simplified) do
-      {:ok, rows(joined, simplified, final?), relations}
+         plan =
+           SQLPlan.check(
+             joined,
+             typed,
+             unsigned?,
+             plan_options(query, params, relations, ordinal, unused)
+           ),
+         :ok <- SQLPlan.unless_physical(plan) do
+      finish(
+        plan,
+        typed,
+        joined,
+        relations,
+        {source, sources, kinds, unsigned?},
+        {final?, unused}
+      )
     else
       :error -> {:error, table_not_found(m)}
       {:error, _reason} = error -> error
@@ -229,28 +245,107 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     {:query_error, error} -> {:error, error}
   end
 
+  # What the engine does after the planner: the optimizer folds the constants, the scan takes
+  # its range, and last the physical plan is built, where the negation of a type it does not
+  # support is found (`plan` holds that error, to be answered if nothing before it is found).
+  # What the double declines to word in those stages (a refusal) leaves the negation's error
+  # as the answer, as the planner's check found it.
+  @spec finish(
+          :ok | {:error, term()},
+          SQLParser.parsed_query(),
+          [point()],
+          [SQLSchema.relation()],
+          {source(), %{binary() => source()}, kinds_mode(), (binary() -> boolean())},
+          {boolean(), [binary()] | nil}
+        ) :: {:ok, [map()], [SQLSchema.relation()]} | {:error, term()}
+  defp finish(
+         plan,
+         typed,
+         joined,
+         relations,
+         {source, sources, kinds, unsigned?},
+         {final?, unused}
+       ) do
+    typed = SQLCoerce.apply(typed, joined, unsigned?)
+    simplified = typed |> SQLPrune.nullify(unused) |> SQLSimplify.apply()
+
+    with :ok <- SQLTime.first_invalid(typed.where),
+         :ok <- limit_error(typed),
+         :ok <- SQLFold.check(typed),
+         :ok <- SQLRange.check_time(simplified, source.pushdown),
+         :ok <- check_value_range(simplified, joined, sources, kinds, unsigned?),
+         :ok <- SQLSelect.check_named(simplified),
+         :ok <- plan do
+      {:ok, rows(joined, simplified, final?, empty?(simplified, joined, unsigned?)), relations}
+    else
+      {:error, %{body: "Client.Local: " <> _reason}} when plan != :ok -> plan
+      {:error, _reason} = error -> error
+    end
+  end
+
+  # A placeholder numbered zero is the engine's error as the expression it stands in is
+
+  # converted: before the errors of types, and before the errors of the columns beside it. Which
+  # of two items of a select list comes first is the item order, which a column that does not
+  # exist in an item before it would change; the double refuses that text.
+  @spec zero_placeholder(SQLParser.parsed_query(), [SQLSchema.relation()]) ::
+          :ok | {:error, term()}
+  defp zero_placeholder(query, relations) do
+    with {:error, error} <- SQLBind.zero(query) do
+      case SQLSchema.check(relations, query, false) do
+        :ok ->
+          {:error, error}
+
+        {:error, _schema} ->
+          {:error,
+           SQLError.refusal(
+             "a placeholder numbered zero beside a column that does not exist: which of the " <>
+               "two errors the engine gives first depends on the clause"
+           )}
+      end
+    end
+  end
+
   # What the planner's check finds besides the errors of the expressions: the grouping of the
   # select list and the `HAVING`, and the `$name` with no value, each at the place the engine
   # finds it (see `InfluxElixir.Client.Local.SQLStage`).
-  @spec plan_options(SQLParser.parsed_query(), %{binary() => term()}, [SQLSchema.relation()]) ::
-          SQLPlan.plan_options()
-  defp plan_options(query, params, relations) do
+  @spec plan_options(
+          SQLParser.parsed_query(),
+          %{binary() => term()},
+          [SQLSchema.relation()],
+          SQLError.t() | nil,
+          [binary()] | nil
+        ) :: SQLPlan.plan_options()
+  defp plan_options(query, params, relations, ordinal, unused) do
     placeholder =
       case SQLParser.problem(query, params) do
         :ok -> nil
         {:error, error} -> error
       end
 
-    [group: fn -> SQLGrouping.check(query, relations) end, placeholder: placeholder]
+    [
+      group: fn -> SQLGrouping.check(query, relations) end,
+      placeholder: placeholder,
+      limit: limit_coercion(query),
+      ordinal: ordinal,
+      unused: unused
+    ]
   end
 
   # A `LIMIT 0` plans no scan (verified: `WHERE v > 1 / 0 LIMIT 0` is `[]`,
   # where without it the connection closes), so no row is evaluated.
-  @spec rows([point()], SQLParser.parsed_query(), boolean()) :: [map()]
-  defp rows(_joined, %{limit: 0}, _final?), do: []
+  @spec rows([point()], SQLParser.parsed_query(), boolean(), boolean()) :: [map()]
+  defp rows(_joined, %{limit: 0}, _final?, _empty?), do: []
+  defp rows(_joined, _query, _final?, true), do: []
 
-  defp rows(joined, query, final?),
+  defp rows(joined, query, final?, false),
     do: query_rows(filter(joined, query.where), ordered(query), final?)
+
+  # Whether the optimizer replaces the plan with an empty relation (see `SQLPrune.empty?/2`).
+  @spec empty?(SQLParser.parsed_query(), [point()], (binary() -> boolean())) :: boolean()
+  defp empty?(query, joined, unsigned?) do
+    SQLPrune.empty?(query, fn names -> SQLPlan.column_types(joined, names, unsigned?) end)
+  end
 
   # An `ORDER BY` column an aggregate query does not output is the engine's schema error, but a
   # select list that is not grouped is found first (verified: `SELECT host, count(*) FROM t
@@ -267,8 +362,36 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp table_error(%{table_error: nil}), do: :ok
   defp table_error(%{table_error: error}), do: {:error, error}
 
+  # The first position of the `ORDER BY` that names no select item (see
+  # `InfluxElixir.Client.Local.SQLClauses.resolve_references/4`): the parser left it unread.
+  @spec ordinal_error(SQLParser.parsed_query(), [SQLSchema.relation()]) :: SQLError.t() | nil
+  defp ordinal_error(query, relations) do
+    case SQLSchema.output_columns(query, relations) do
+      nil ->
+        nil
+
+      columns ->
+        Enum.find_value(query.order_by, &SQLClauses.position_error(elem(&1, 0), length(columns)))
+    end
+  end
+
+  # The planner raises the error of a position after the errors of the clauses before the
+  # `ORDER BY` and before those of its terms, which the checks of the columns leave out.
+  @spec unordered(SQLParser.parsed_query(), SQLError.t() | nil) :: SQLParser.parsed_query()
+  defp unordered(query, nil), do: query
+  defp unordered(query, _ordinal), do: %{query | order_by: []}
+
+  # A `LIMIT` or `OFFSET` that is no integer is an error of the plan's top, found by the type
+  # coercion after the errors of the clauses below it: the planner's check finds it there.
+  @limit_coercion "type_coercion\ncaused by\nError during planning: Expected "
+
+  @spec limit_coercion(SQLParser.parsed_query()) :: SQLError.t() | nil
+  defp limit_coercion(%{plan_error: %{body: @limit_coercion <> _rest} = error}), do: error
+  defp limit_coercion(_query), do: nil
+
   @spec plan_error(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
   defp plan_error(%{plan_error: nil}), do: :ok
+  defp plan_error(%{plan_error: %{body: @limit_coercion <> _rest}}), do: :ok
   defp plan_error(%{plan_error: error}), do: {:error, error}
 
   @spec limit_error(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
@@ -461,13 +584,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # The same shape and wording the real engine returns for a missing table
   # (HTTP 400, planning error), so consumer code matching `%{status: 400}`
   # can be exercised against the double.
-  @spec table_not_found(binary()) :: %{status: 400, body: binary()}
-  defp table_not_found(measurement) do
-    %{
-      status: 400,
-      body: "Error during planning: table 'public.iox.#{measurement}' not found"
-    }
-  end
+  @spec table_not_found(binary()) :: SQLError.t()
+  defp table_not_found(measurement), do: SQLTable.iox_not_found(measurement)
 
   # SELECT col, expr AS alias, ...: rows are projected first so ORDER BY can
   # name a projected alias (`ORDER BY mid DESC`) as well as any source column.
@@ -602,7 +720,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp execute_aggregate_query(points, %{group_by_interval: nil, group_by_columns: nil} = query) do
     # Scalar aggregate: all filtered points form a single bucket. Always
     # produce one row, even when no points matched (so COUNT returns 0).
-    SQLAggregate.reduce_group(query.select_columns, query.having, points, nil)
+    SQLAggregate.reduce_group(query.select_columns, query.having, points, :scalar)
   end
 
   # One group per (DATE_BIN bucket, grouping-column values) — either part

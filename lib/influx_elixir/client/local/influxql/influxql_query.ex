@@ -8,6 +8,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   alias InfluxElixir.Client.Local.{
     Format,
     InfluxQL,
+    InfluxQLPlan,
     InfluxQLRegex,
     InfluxQLShow,
     InfluxQLShowParser,
@@ -621,25 +622,60 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp influxql_planned(table, database, query, types, tags, now) do
     with :ok <- influxql_expanding(query, types, tags),
          {:ok, extend} <- influxql_lookback(query),
-         {:ok, plan} <- influxql_where(query.where, tags, types, now, extend, select_opts(query)),
-         :ok <- refusal_after(influxql_items(query, types, tags), table, database, query, plan),
-         :ok <- influxql_clash(table, database, query, plan),
+         {:ok, plan} <- influxql_planned_where(query, tags, types, now, extend),
+         items = influxql_items(query, types, tags),
+         :ok <- influxql_selected(items, table, database, query, plan, types),
          :ok <- influxql_window(table, database, query),
          :ok <- influxql_stride(table, database, query),
          :ok <- influxql_deferred(table, database, query, plan) do
       if empty_range?(plan),
         do: {:ok, []},
         else: influxql_rows(table, database, query, plan, types, tags, now)
+    else
+      :empty -> {:ok, []}
+      {:error, _reason} = error -> error
     end
   end
 
-  # The measurement of a statement with a `tz()` clause over one measurement, which the engine
-  # plans the `WHERE` of as a filter.
+  # The condition of the statement, planned. What the engine finds wrong in it while it plans
+  # the filter is found only for a select list that reads a field (see `influxql_selected/6`):
+  # one that reads none is answered empty, but for the errors of rewriting the statement.
+  @spec influxql_planned_where(
+          InfluxQL.query(),
+          MapSet.t(binary()),
+          map(),
+          integer(),
+          non_neg_integer()
+        ) :: {:ok, map()} | :empty | {:error, map()}
+  defp influxql_planned_where(query, tags, types, now, extend) do
+    case influxql_where(query.where, tags, types, now, extend, select_opts(query)) do
+      {:error, %{body: body}} = error ->
+        if String.starts_with?(body, ["rewriting statement", "Client.Local: "]),
+          do: error,
+          else: unread_where(error, query, types, tags)
+
+      result ->
+        result
+    end
+  end
+
+  defp unread_where(error, query, types, tags) do
+    case influxql_items(query, types, tags) do
+      {:error, %{body: "rewriting statement" <> _gather}} = rewriting ->
+        rewriting
+
+      _no_rewriting_error ->
+        if InfluxQLPlan.reads_field?(query.items, types), do: error, else: :empty
+    end
+  end
+
+  # The measurement a statement with a `tz()` clause is planned over (each one the `FROM`
+  # names or matches, in turn), the engine plans the `WHERE` of as a filter.
   @spec select_opts(InfluxQL.query()) :: keyword()
   defp select_opts(query), do: [filter: filter(query), late_clash: true]
 
   @spec filter(InfluxQL.query()) :: %{table: binary()} | nil
-  defp filter(%{tz: true, sources: [{:name, name}]}), do: %{table: name}
+  defp filter(%{tz: true, measurement: name}), do: %{table: name}
   defp filter(_query), do: nil
 
   # The wildcards of the select list, written out for this measurement.
@@ -758,24 +794,73 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
   defp influxql_stride(_table, _database, _query), do: :ok
 
-  # A select list the double refuses by name is a list the engine plans: the error it raises
-  # for the condition (`clash` or `deferred`) stands in its place when it has one.
-  @spec refusal_after(:ok | {:error, map()}, Store.t(), binary(), InfluxQL.query(), map()) ::
-          :ok | {:error, map()}
-  defp refusal_after(
-         {:error, %{body: "Client.Local: " <> _name}} = refusal,
-         table,
-         db,
-         query,
-         plan
-       ) do
-    with :ok <- influxql_clash(table, db, query, plan),
-         :ok <- influxql_deferred(table, db, query, plan) do
-      refusal
+  # What the engine finds of the select list and of the condition, in its order (verified):
+  #
+  #   1. the errors of rewriting the statement (every one worded `rewriting statement`),
+  #      whatever the condition holds
+  #   2. a select list that reads no field of the measurement selects no point: an empty
+  #      answer, the condition and the window never planned
+  #   3. the condition's comparison that cannot be typed (`clash`), raised when the planner
+  #      builds the filter, before the select list is planned
+  #   4. the select list's own planning errors, the double's refusals among them
+  #   5. the condition's error after that (`deferred`), then the rest
+  @constants "Client.Local: unsupported InfluxQL (an expression of constants)"
+
+  @spec influxql_selected(
+          :ok | {:error, map()},
+          Store.t(),
+          binary(),
+          InfluxQL.query(),
+          map(),
+          map()
+        ) :: :ok | :empty | {:error, map()}
+  defp influxql_selected({:error, %{body: body}} = error, table, db, query, plan, types) do
+    cond do
+      String.starts_with?(body, "rewriting statement") ->
+        error
+
+      body == @constants and not InfluxQLPlan.reads_field?(query.items, types) ->
+        :empty
+
+      String.starts_with?(body, "Client.Local: ") ->
+        refusal_after(error, table, db, query, plan)
+
+      not InfluxQLPlan.reads_field?(query.items, types) ->
+        :empty
+
+      true ->
+        with :ok <- influxql_clash(table, db, query, plan), do: error
     end
   end
 
-  defp refusal_after(result, _table, _database, _query, _plan), do: result
+  defp influxql_selected(:ok, table, db, query, plan, types) do
+    if InfluxQLPlan.reads_field?(query.items, types),
+      do: influxql_clash(table, db, query, plan),
+      else: :empty
+  end
+
+  # A select list the double refuses by name is a list the engine plans, and the error it
+  # raises for the condition (`clash` or `deferred`) stands in its place when it has one; a
+  # list it fails to plan is not: the schema error of arithmetic on a selector beside columns,
+  # and the coercion error of a function given a string, a boolean or a tag. The planner
+  # raises those before the analyzer finds the condition's own (`deferred`), but after the
+  # comparisons it cannot type (`clash`).
+  @unplanned_call ~r/\(\w+\(\) of an? (?:string|boolean|unsigned|tag|timestamp)\b|several aggregates of a type|arithmetic on a selector beside columns|a transform of a field beside an aggregate|a function of time beside an aggregate|GROUP BY a field that the select list reads/
+
+  @spec refusal_after({:error, map()}, Store.t(), binary(), InfluxQL.query(), map()) ::
+          {:error, map()}
+  defp refusal_after({:error, %{body: body}} = refusal, table, db, query, plan) do
+    if Regex.match?(@unplanned_call, body) do
+      with :ok <- influxql_clash(table, db, query, plan), do: refusal
+    else
+      with :ok <- influxql_clash(table, db, query, plan),
+           :ok <- influxql_window(table, db, query),
+           :ok <- influxql_stride(table, db, query),
+           :ok <- influxql_deferred(table, db, query, plan) do
+        refusal
+      end
+    end
+  end
 
   # The error of a comparison of types that cannot be compared, which the engine raises before
   # it plans the LIMIT, of a measurement that exists.

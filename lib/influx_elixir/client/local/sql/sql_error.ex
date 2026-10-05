@@ -32,11 +32,12 @@ defmodule InfluxElixir.Client.Local.SQLError do
   @type late_reason ::
           :case_condition
           | :case_time_text
+          | :case_numbers
           | :compare_time_text
           | :timestamp_concat
           | {:distinct_time_text, :distinct | :not_distinct}
           | {:pattern_number, :like | :ilike, :tag_number | :number_tag}
-          | {:no_common_type, :coalesce | :nullif}
+          | {:no_common_type, :coalesce | :nullif, :integer | :float | :decimal}
           | {:numbers_not_combined, call()}
           | {:number_and_text, :greatest | :least}
 
@@ -44,6 +45,9 @@ defmodule InfluxElixir.Client.Local.SQLError do
                    [
                      {:case_condition,
                       "a CASE condition that is not a boolean: the engine casts it"},
+                     {:case_numbers,
+                      "a CASE whose results are an unsigned integer beside another number: the " <>
+                        "engine's common type for them is not modelled"},
                      {:case_time_text,
                       "a CASE comparing time with text: the engine reads the text as a " <>
                         "timestamp, which is not modelled"},
@@ -78,10 +82,16 @@ defmodule InfluxElixir.Client.Local.SQLError do
                      ) ++
                      for(
                        {call, word} <- [coalesce: "COALESCE", nullif: "NULLIF"],
+                       {family, shown} <- [
+                         integer: "an integer",
+                         float: "a float",
+                         decimal: "a decimal"
+                       ],
                        do:
-                         {{:no_common_type, call},
-                          "#{word} of arguments with no common type the double models (a number " <>
-                            "with text, or a type other than Int64, Float64, text and Boolean)"}
+                         {{:no_common_type, call, family},
+                          "#{word} of #{shown} with text: the engine casts the text to the " <>
+                            "number when it runs the plan (and closes the connection when a " <>
+                            "value does not cast), which is not modelled"}
                      ) ++
                      for(
                        {call, word} <- [

@@ -12,7 +12,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
   #   * a qualified name that only differs from a field by case says so
   #     (`Column names are case sensitive. You can use double quotes ...`)
 
-  alias InfluxElixir.Client.Local.{SQLDmlCatalog, SQLError, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{SQLError, SQLTable, SQLTokenizer}
 
   @typep token :: SQLTokenizer.token()
 
@@ -46,49 +46,25 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
   defp part(:string, printed), do: printed |> String.slice(1..-2//1) |> String.replace("''", "'")
 
   @doc """
-  The one resolver of the table a statement names (verified against InfluxDB 3 Core, the same
-  for `INSERT`, `UPDATE` and `DELETE`): `{:ok, table}` for a table of the database's schema
-  that is there, `{:ok, {:catalog, schema, table}}` for one of the engine's own (`system`,
-  `information_schema`), else the planner's error as it prints the name it looked for:
-  `public.iox.` and the name for one part or for `iox.` and the name, the parts as written
-  otherwise.
+  The table a statement names (verified against InfluxDB 3 Core, the same for `INSERT`, `UPDATE`
+  and `DELETE`), resolved by `SQLTable.locate/1`, the resolver a query uses too: `{:ok, table}`
+  for a table of the database's schema that is there, `{:ok, {:catalog, columns}}` for one of
+  the engine's own (`system`, `information_schema`), else the planner's error as it prints the
+  name it looked for.
   """
   @spec lookup([binary()], [binary()]) ::
-          {:ok, binary() | {:catalog, binary(), binary()}} | {:error, SQLError.t()}
+          {:ok, binary() | {:catalog, [SQLTable.column()]}} | {:error, SQLError.t()}
   def lookup(parts, tables) do
-    case parts do
-      [table] ->
-        found(table, tables)
-
-      ["iox", table] ->
-        found(table, tables)
-
-      ["public", "iox", table] ->
-        found(table, tables)
-
-      [schema, table] when schema in ["system", "information_schema"] ->
-        engine(schema, table)
-
-      ["public", schema, table] when schema in ["system", "information_schema"] ->
-        engine(schema, table)
-
-      [_schema, _table] ->
-        missing_in(parts)
-
-      [_catalog, _schema, _table] ->
-        missing_in(parts)
-
-      _compound ->
-        compound(parts)
+    case SQLTable.locate(parts) do
+      {:iox, table} -> iox(table, tables)
+      {:engine, _schema, _table, columns} -> {:ok, {:catalog, columns}}
+      {:error, _error} = error -> error
     end
   end
 
-  @spec engine(binary(), binary()) ::
-          {:ok, {:catalog, binary(), binary()}} | {:error, SQLError.t()}
-  defp engine(schema, table) do
-    if SQLDmlCatalog.columns(schema, table),
-      do: {:ok, {:catalog, schema, table}},
-      else: {:error, SQLError.planning("table 'public.#{schema}.#{table}' not found")}
+  @spec iox(binary(), [binary()]) :: {:ok, binary()} | {:error, SQLError.t()}
+  defp iox(table, tables) do
+    if table in tables, do: {:ok, table}, else: {:error, SQLTable.iox_not_found(table)}
   end
 
   @doc """
@@ -96,30 +72,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
   statement, before it refuses a clause of it.
   """
   @spec arity([binary()]) :: :ok | {:error, SQLError.t()}
-  def arity(parts) when length(parts) > 3, do: compound(parts)
+  def arity(parts) when length(parts) > 3, do: {:error, SQLTable.compound(parts)}
   def arity(_parts), do: :ok
-
-  @spec found(binary(), [binary()]) :: {:ok, binary()} | {:error, SQLError.t()}
-  defp found(table, tables) do
-    if table in tables,
-      do: {:ok, table},
-      else: {:error, SQLError.planning("table 'public.iox.#{table}' not found")}
-  end
-
-  @spec missing_in([binary()]) :: {:error, SQLError.t()}
-  defp missing_in(parts) do
-    qualified = if length(parts) == 2, do: ["public" | parts], else: parts
-    {:error, SQLError.planning("table '#{Enum.join(qualified, ".")}' not found")}
-  end
-
-  @spec compound([binary()]) :: {:error, SQLError.t()}
-  defp compound(parts) do
-    {:error,
-     SQLError.planning(
-       "Unsupported compound identifier '#{Enum.join(parts, ".")}'. " <>
-         "Expected 1, 2 or 3 parts, got #{length(parts)}"
-     )}
-  end
 
   @doc "A name as the engine prints it."
   @spec quote_ident(binary()) :: binary()

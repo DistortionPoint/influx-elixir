@@ -51,7 +51,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
   @types ~w(float integer unsigned string boolean field tag)
   @after_clause ~r/^(?:ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)(?![\w])|^tz\s*\(/i
-  @options ~w(null none previous linear)
 
   @doc """
   Reads the `GROUP BY` clause (and the `fill()` after it) of `masked_rest`, the
@@ -422,8 +421,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   defp option(rest) do
     case Regex.run(~r/^(?:(null|none|previous|linear)(?![\w])|([+-]?)(\d*\.\d+|\d+))/i, rest) do
       [word, keyword] when keyword != "" and byte_size(word) > 0 ->
-        keyword = String.downcase(keyword)
-        if keyword in @options, do: {:ok, String.to_atom(keyword), byte_size(word)}, else: :error
+        case option_atom(String.downcase(keyword)) do
+          nil -> :error
+          fill -> {:ok, fill, byte_size(word)}
+        end
 
       [word, "", sign, number] ->
         number(sign, number, byte_size(word))
@@ -432,6 +433,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
         :error
     end
   end
+
+  # The fill a keyword names, as a literal: an atom is never made from the statement's text.
+  @spec option_atom(binary()) :: :null | :none | :previous | :linear | nil
+  defp option_atom("null"), do: :null
+  defp option_atom("none"), do: :none
+  defp option_atom("previous"), do: :previous
+  defp option_atom("linear"), do: :linear
+  defp option_atom(_other), do: nil
 
   @spec number(binary(), binary(), non_neg_integer()) ::
           {:ok, InfluxQLBuckets.fill(), non_neg_integer()} | :error

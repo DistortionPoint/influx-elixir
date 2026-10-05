@@ -190,18 +190,18 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
   describe "root_table_pos/1" do
     test "reads the root table position from the first four bytes" do
       buf = <<24::little-32, 0, 0, 0, 0>>
-      assert FB.root_table_pos(buf) == 24
+      assert FB.root_table_pos(buf) === 24
     end
 
     test "returns 0 when root offset is zero" do
       buf = <<0::little-32, 0, 0>>
-      assert FB.root_table_pos(buf) == 0
+      assert FB.root_table_pos(buf) === 0
     end
 
     test "correctly interprets little-endian byte order" do
       # 0x00000008 little-endian = <<8, 0, 0, 0>>
       buf = <<8, 0, 0, 0, 0, 0, 0, 0>>
-      assert FB.root_table_pos(buf) == 8
+      assert FB.root_table_pos(buf) === 8
     end
 
     test "reads table position from a real constructed buffer" do
@@ -241,7 +241,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       {vtable_pos, vtable_size} = FB.read_vtable(buf, table_pos)
       # The vtable header starts with vtable_size as uint16
       <<declared::little-16, _rest::binary>> = binary_part(buf, vtable_pos, vtable_size)
-      assert declared == vtable_size
+      assert declared === vtable_size
     end
 
     test "two-field table vtable has larger size" do
@@ -265,7 +265,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
-      assert FB.read_int32(buf, pos) == 77
+      assert FB.read_int32(buf, pos) === 77
     end
 
     test "returns nil for an absent field (offset 0 in vtable)" do
@@ -274,7 +274,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       # slot 1 has offset 0 in our single-field table
       result = FB.field_pos(buf, table_pos, vt_pos, vt_size, 1)
-      assert result == nil
+      assert result === nil
     end
 
     test "returns nil when field index is beyond the vtable" do
@@ -283,7 +283,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       # Very large index — beyond any vtable we built
       result = FB.field_pos(buf, table_pos, vt_pos, vt_size, 100)
-      assert result == nil
+      assert result === nil
     end
 
     test "both fields present in two-field table" do
@@ -293,8 +293,8 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       pos0 = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
       pos1 = FB.field_pos(buf, table_pos, vt_pos, vt_size, 1)
       # slot 0 is an int32, slot 1 an int16 (see build_two_field_table/2)
-      assert FB.read_int32(buf, pos0) == 10
-      assert FB.read_int16(buf, pos1) == 20
+      assert FB.read_int32(buf, pos0) === 10
+      assert FB.read_int16(buf, pos1) === 20
     end
 
     test "field position differs from table_pos" do
@@ -302,7 +302,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
-      assert pos != table_pos
+      assert pos !== table_pos
     end
   end
 
@@ -316,7 +316,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
-      assert FB.read_int32(buf, pos) == 12_345
+      assert FB.read_int32(buf, pos) === 12_345
     end
 
     test "reads a negative int32 value" do
@@ -324,7 +324,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
-      assert FB.read_int32(buf, pos) == -1
+      assert FB.read_int32(buf, pos) === -1
     end
 
     test "reads zero" do
@@ -332,7 +332,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
-      assert FB.read_int32(buf, pos) == 0
+      assert FB.read_int32(buf, pos) === 0
     end
 
     test "reads max int32" do
@@ -340,12 +340,12 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
-      assert FB.read_int32(buf, pos) == 2_147_483_647
+      assert FB.read_int32(buf, pos) === 2_147_483_647
     end
 
     test "reads arbitrary position in a raw binary" do
       buf = <<0::32, 42::little-signed-32, 0::32>>
-      assert FB.read_int32(buf, 4) == 42
+      assert FB.read_int32(buf, 4) === 42
     end
   end
 
@@ -355,82 +355,82 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 1)
-      assert FB.read_int16(buf, pos) == 32_767
+      assert FB.read_int16(buf, pos) === 32_767
     end
 
     test "reads negative int16" do
       buf = <<0::32, -300::little-signed-16>>
-      assert FB.read_int16(buf, 4) == -300
+      assert FB.read_int16(buf, 4) === -300
     end
 
     test "reads zero int16" do
       buf = <<0::32, 0::little-signed-16>>
-      assert FB.read_int16(buf, 4) == 0
+      assert FB.read_int16(buf, 4) === 0
     end
   end
 
   describe "read_int64/2" do
     test "reads an int64 value" do
       buf = <<0::32, 9_999_999_999::little-signed-64>>
-      assert FB.read_int64(buf, 4) == 9_999_999_999
+      assert FB.read_int64(buf, 4) === 9_999_999_999
     end
 
     test "reads a negative int64" do
       buf = <<0::32, -1::little-signed-64>>
-      assert FB.read_int64(buf, 4) == -1
+      assert FB.read_int64(buf, 4) === -1
     end
 
     test "reads a timestamp-like nanosecond value" do
       ts = 1_630_424_257_000_000_000
       buf = <<0::32, ts::little-signed-64>>
-      assert FB.read_int64(buf, 4) == ts
+      assert FB.read_int64(buf, 4) === ts
     end
   end
 
   describe "read_uint8/2" do
     test "reads zero" do
       buf = <<0::32, 0::8>>
-      assert FB.read_uint8(buf, 4) == 0
+      assert FB.read_uint8(buf, 4) === 0
     end
 
     test "reads 255" do
       buf = <<0::32, 255::8>>
-      assert FB.read_uint8(buf, 4) == 255
+      assert FB.read_uint8(buf, 4) === 255
     end
 
     test "reads a mid-range value" do
       buf = <<0::32, 42::8>>
-      assert FB.read_uint8(buf, 4) == 42
+      assert FB.read_uint8(buf, 4) === 42
     end
 
     test "reads the schema message header type discriminator" do
       # header_type = 1 (Schema), stored as uint8
       buf = <<0::32, 1::8>>
-      assert FB.read_uint8(buf, 4) == 1
+      assert FB.read_uint8(buf, 4) === 1
     end
   end
 
   describe "read_bool/2" do
     test "reads true when byte is non-zero" do
       buf = <<0::32, 1::8>>
-      assert FB.read_bool(buf, 4) == true
+      assert FB.read_bool(buf, 4) === true
     end
 
     test "reads false when byte is zero" do
       buf = <<0::32, 0::8>>
-      assert FB.read_bool(buf, 4) == false
+      assert FB.read_bool(buf, 4) === false
     end
 
     test "any non-zero byte is true" do
       buf = <<0::32, 255::8>>
-      assert FB.read_bool(buf, 4) == true
+      assert FB.read_bool(buf, 4) === true
     end
 
     test "reads consecutive bool positions" do
       buf = <<0::32, 0::8, 1::8, 0::8>>
-      assert FB.read_bool(buf, 4) == false
-      assert FB.read_bool(buf, 5) == true
-      assert FB.read_bool(buf, 6) == false
+      assert FB.read_bool(buf, 4) === false
+      assert FB.read_bool(buf, 5) === true
+      assert FB.read_bool(buf, 6) === false
     end
   end
 
@@ -444,7 +444,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       offset_pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
-      assert FB.read_string(buf, offset_pos) == "hello"
+      assert FB.read_string(buf, offset_pos) === "hello"
     end
 
     test "reads an empty string" do
@@ -452,7 +452,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       offset_pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
-      assert FB.read_string(buf, offset_pos) == ""
+      assert FB.read_string(buf, offset_pos) === ""
     end
 
     test "reads a column name string" do
@@ -460,7 +460,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       offset_pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
-      assert FB.read_string(buf, offset_pos) == "temperature"
+      assert FB.read_string(buf, offset_pos) === "temperature"
     end
 
     test "reads a utf-8 string with multi-byte characters" do
@@ -468,7 +468,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       table_pos = FB.root_table_pos(buf)
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       offset_pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
-      assert FB.read_string(buf, offset_pos) == "caf\u00e9"
+      assert FB.read_string(buf, offset_pos) === "caf\u00e9"
     end
 
     test "reads string length correctly for long names" do
@@ -478,8 +478,8 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       offset_pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
       result = FB.read_string(buf, offset_pos)
-      assert byte_size(result) == 64
-      assert result == long_name
+      assert byte_size(result) === 64
+      assert result === long_name
     end
   end
 
@@ -503,12 +503,12 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       # Manually crafted: at position 4 we store rel_offset=8,
       # so read_offset(buf, 4) = 4 + 8 = 12
       buf = <<0, 0, 0, 0, 8::little-unsigned-32, 0, 0, 0, 0>>
-      assert FB.read_offset(buf, 4) == 12
+      assert FB.read_offset(buf, 4) === 12
     end
 
     test "zero relative offset resolves to the offset_pos itself" do
       buf = <<0, 0, 0, 0, 0::little-unsigned-32>>
-      assert FB.read_offset(buf, 4) == 4
+      assert FB.read_offset(buf, 4) === 4
     end
   end
 
@@ -523,7 +523,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       offset_pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
       {_elem_start, count} = FB.read_vector_header(buf, offset_pos)
-      assert count == 3
+      assert count === 3
     end
 
     test "empty vector returns count 0" do
@@ -532,7 +532,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       offset_pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
       {_elem_start, count} = FB.read_vector_header(buf, offset_pos)
-      assert count == 0
+      assert count === 0
     end
 
     test "single-element vector returns count 1" do
@@ -541,7 +541,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       offset_pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
       {_elem_start, count} = FB.read_vector_header(buf, offset_pos)
-      assert count == 1
+      assert count === 1
     end
 
     test "element_start is past the count header" do
@@ -553,7 +553,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       # The vector header resolves to vec_pos, and elem_start = vec_pos + 4
       # vec_pos is read_offset(buf, offset_pos), so:
       vec_pos = FB.read_offset(buf, offset_pos)
-      assert elem_start == vec_pos + 4
+      assert elem_start === vec_pos + 4
     end
   end
 
@@ -568,14 +568,14 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       # at index 0: offset_pos = elem_start + 0*4, result = offset_pos + rel
       buf = <<0, 0, 0, 0, 4::little-unsigned-32, 8::little-unsigned-32>>
       # elem_start = 4, index = 0 => offset_pos = 4, rel = 4, result = 8
-      assert FB.read_vector_table(buf, 4, 0) == 8
+      assert FB.read_vector_table(buf, 4, 0) === 8
     end
 
     test "reads second element table offset" do
       # elem_start = 4, index 0 rel=4, index 1 rel=8
       buf = <<0, 0, 0, 0, 4::little-unsigned-32, 8::little-unsigned-32>>
       # index 1: offset_pos = 4 + 1*4 = 8, rel = 8, result = 16
-      assert FB.read_vector_table(buf, 4, 1) == 16
+      assert FB.read_vector_table(buf, 4, 1) === 16
     end
 
     test "index arithmetic: each element stride is 4 bytes" do
@@ -591,11 +591,11 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
         >>
 
       # index 0: pos=4, result=4+10=14
-      assert FB.read_vector_table(buf, 4, 0) == 14
+      assert FB.read_vector_table(buf, 4, 0) === 14
       # index 1: pos=8, result=8+20=28
-      assert FB.read_vector_table(buf, 4, 1) == 28
+      assert FB.read_vector_table(buf, 4, 1) === 28
       # index 2: pos=12, result=12+30=42
-      assert FB.read_vector_table(buf, 4, 2) == 42
+      assert FB.read_vector_table(buf, 4, 2) === 42
     end
 
     test "round-trips through a constructed vector table — element count is correct" do
@@ -608,7 +608,7 @@ defmodule InfluxElixir.Flight.FlatBufferTest do
       {vt_pos, vt_size} = FB.read_vtable(buf, table_pos)
       offset_pos = FB.field_pos(buf, table_pos, vt_pos, vt_size, 0)
       {_elem_start, count} = FB.read_vector_header(buf, offset_pos)
-      assert count == 3
+      assert count === 3
     end
   end
 end

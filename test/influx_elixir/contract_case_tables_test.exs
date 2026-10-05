@@ -34,6 +34,12 @@ defmodule InfluxElixir.ContractCaseTablesTest do
   nothing else, so a third spelling cannot hide in a group pinned for another. A pin that
   no cases share is stale, and a spelling no pin names is a case written twice.
 
+  Every pin also says how many cases its group holds, so that a spelling added to a pinned
+  group is a failure and not absorbed by the pin. A `:position` pin (the SQL parser's
+  errors, which name `Line: 1, Column: 7`) says that the members differ in the place they
+  name and in nothing else: once the places are taken out their expectations are equal, so
+  a mistyped word in one of them fails.
+
   The SQL tables are not this file's to edit: a spelling of a statement that a SQL table
   repeats is listed in `@sql_duplicates_awaiting_removal` until its owner takes it out, and
   the test fails when a listed spelling is gone, so the list only ever shrinks.
@@ -208,6 +214,9 @@ defmodule InfluxElixir.ContractCaseTablesTest do
     catalog_core: {@catalog, :catalog_core_refusable}
   }
 
+  # Every pin is `{kind, members}`: the number of cases the group holds, so that a spelling
+  # added to a pinned group is seen and not absorbed.
+  #
   # Why a group is kept: `{:differs, reason}` when its members are answered differently
   # (the spelling is what the answer depends on), `{:same_answer, relations, reason}` when
   # they are answered alike and the spelling is what a contract pins (a lexer fact); the
@@ -215,9 +224,19 @@ defmodule InfluxElixir.ContractCaseTablesTest do
   #
   # The error of a parser names the place it stopped at, and a blank or a line before or
   # after the text moves it; and it prints the word it read as written:
-  @stop_place {:differs,
+  #
+  # `{:position, reason}` is a group whose errors differ only in the place they name
+  # (`Line: 1, Column: 7`, `at pos 12`) and in the text quoted from there on: its members are
+  # equal once those are taken out, so a mistyped word in one of them fails.
+  @stop_place {:position,
                "the blanks around the text move where the parser says it stopped, so the " <>
-                 "errors differ"}
+                 "errors name another place"}
+  # An InfluxQL parse error has a message of its own for where the text ends (`Nom(...)`
+  # for the end of the text, `invalid LIMIT clause` for a blank after the keyword): a
+  # blank at the end is another error, not only another place.
+  @parse_stop {:differs,
+               "the blanks around the text move where the parser says it stopped, and a " <>
+                 "blank at the end is another error from the one at the end of the text"}
   @word_as_written {:differs,
                     "the error prints the word as written, so the spellings are answered " <>
                       "differently"}
@@ -255,85 +274,86 @@ defmodule InfluxElixir.ContractCaseTablesTest do
   # written twice. A group whose members are answered alike is `:same_answer`.
   @spelling_pins %{
     # Different answers: the spelling is what the engine's answer depends on.
-    {:sql, "create;"} => @stop_place,
-    {:sql, "delete from main where;"} => @stop_place,
-    {:sql, "delete from;"} => @stop_place,
-    {:sql, "delete;"} => @stop_place,
-    {:sql, "drop;"} => @stop_place,
-    {:sql, "explain;"} => @stop_place,
-    {:sql, "insert into;"} => @stop_place,
-    {:sql, "select 1+;"} => @stop_place,
-    {:sql, "select i from mext limit;"} => @stop_place,
-    {:sql, "select i from mext order by i,;"} => @stop_place,
-    {:sql, "select i from mext where;"} => @stop_place,
-    {:sql, "select i from;"} => @stop_place,
-    {:sql, "select;"} => @stop_place,
-    {:sql, "update main set;"} => @stop_place,
-    {:sql, "update;"} => @stop_place,
-    {:sql, "use;"} => @stop_place,
-    {:sql, "values;"} => @stop_place,
-    {:sql, "with;"} => @stop_place,
-    {:sql, ";;select x y z"} => @stop_place,
-    {:sql, "grant x"} => @stop_place,
-    {:sql, "select 1 x y"} => @comment_place,
-    {:sql, "select n from main where n=1"} => @comment_end,
-    {:sql, "select n from main where s='é' foo"} => @comment_place,
-    {:sql, "select n from main where n = 1 foo"} => @stop_place,
-    {:sql, "select 5 div 2"} => @word_as_written,
+    {:sql, "create;"} => {@stop_place, 2},
+    {:sql, "delete from main where;"} => {@stop_place, 2},
+    {:sql, "delete from;"} => {@stop_place, 2},
+    {:sql, "delete;"} => {@stop_place, 2},
+    {:sql, "drop;"} => {@stop_place, 2},
+    {:sql, "explain;"} => {@stop_place, 2},
+    {:sql, "insert into;"} => {@stop_place, 2},
+    {:sql, "select 1+;"} => {@stop_place, 2},
+    {:sql, "select i from mext limit;"} => {@stop_place, 2},
+    {:sql, "select i from mext order by i,;"} => {@stop_place, 2},
+    {:sql, "select i from mext where;"} => {@stop_place, 2},
+    {:sql, "select i from;"} => {@stop_place, 2},
+    {:sql, "select;"} => {@stop_place, 2},
+    {:sql, "update main set;"} => {@stop_place, 2},
+    {:sql, "update;"} => {@stop_place, 2},
+    {:sql, "use;"} => {@stop_place, 2},
+    {:sql, "values;"} => {@stop_place, 2},
+    {:sql, "with;"} => {@stop_place, 2},
+    {:sql, ";;select x y z"} => {@stop_place, 2},
+    {:sql, "grant x"} => {@stop_place, 2},
+    {:sql, "select 1 x y"} => {@comment_place, 2},
+    {:sql, "select n from main where n=1"} => {@comment_end, 3},
+    {:sql, "select n from main where s='é' foo"} => {@comment_place, 2},
+    {:sql, "select n from main where n = 1 foo"} => {@stop_place, 8},
+    {:sql, "select 5 div 2"} => {@word_as_written, 2},
     {:sql, "select 0x10 as r from main limit 1"} =>
-      {:differs, "the hex prefix is read in lower case only"},
-    {:influxql, "show"} => @stop_place,
-    {:influxql, "show;"} => @stop_place,
-    {:influxql, "show tag"} => @stop_place,
-    {:influxql, "show tag keys from"} => @stop_place,
-    {:influxql, "show tag keys from \"m\" where"} => @stop_place,
-    {:influxql, "show tag keys from \"m\","} => @stop_place,
-    {:influxql, "show tag keys from \"m\" limit 1 offset"} => @stop_place,
-    {:influxql, "show tag values from \"m\" with"} => @stop_place,
-    {:influxql, "show measurements extra"} => @stop_place,
-    {:influxql, "show measurements limit"} => @stop_place,
-    {:influxql, "show measurements on"} => @stop_place,
-    {:influxql, "show measurements with"} => @stop_place,
-    {:influxql, "select mean(()) from ~g1"} => @stop_place,
+      {{:differs, "the hex prefix is read in lower case only"}, 2},
+    {:influxql, "show"} => {@parse_stop, 3},
+    {:influxql, "show;"} => {@parse_stop, 2},
+    {:influxql, "show tag"} => {@parse_stop, 2},
+    {:influxql, "show tag keys from"} => {@parse_stop, 2},
+    {:influxql, "show tag keys from \"m\" where"} => {@parse_stop, 2},
+    {:influxql, "show tag keys from \"m\","} => {@parse_stop, 2},
+    {:influxql, "show tag keys from \"m\" limit 1 offset"} => {@parse_stop, 2},
+    {:influxql, "show tag values from \"m\" with"} => {@parse_stop, 2},
+    {:influxql, "show measurements extra"} => {@parse_stop, 2},
+    {:influxql, "show measurements limit"} => {@parse_stop, 2},
+    {:influxql, "show measurements on"} => {@parse_stop, 2},
+    {:influxql, "show measurements with"} => {@parse_stop, 2},
+    {:influxql, "select mean(()) from ~g1"} => {@word_as_written, 2},
     {:influxql,
      "select count(v) from ~f1 where time >= '1970-01-01T00:00:00Z' and " <>
-       "time < '1970-01-01T01:00:00Z' group"} => @stop_place,
+       "time < '1970-01-01T01:00:00Z' group"} => {@parse_stop, 4},
     {:influxql,
      "select count(v) from ~f1 where time >= '1970-01-01T00:00:00Z' and " <>
-       "time < '1970-01-01T01:00:00Z' group by"} => @stop_place,
-    {:influxql, "show tag values from \"~m6\" with key = host"} => @key_case,
-    {:influxql, "show measurements with measurement =~ /^~p/ where host = 'h1'"} => @key_case,
+       "time < '1970-01-01T01:00:00Z' group by"} => {@parse_stop, 2},
+    {:influxql, "show tag values from \"~m6\" with key = host"} => {@key_case, 2},
+    {:influxql, "show measurements with measurement =~ /^~p/ where host = 'h1'"} =>
+      {@key_case, 2},
     # The same answer: both spellings are kept for the lexer fact they pin.
-    {:sql, ";select n from main where"} => @blanks,
-    {:sql, "drop schema s"} => @keyword_case,
-    {:sql, "grant all on m to u"} => @keyword_case,
-    {:sql, "grant select"} => @keyword_case,
-    {:sql, "insert into main (v) values (1)"} => @blanks,
-    {:sql, "merge into m using t on true when matched then delete"} => @keyword_case,
-    {:sql, "merge into main using main on true when matched then delete"} => @keyword_case,
-    {:sql, "show columns from main"} => @case_and_blanks,
+    {:sql, ";select n from main where"} => {@blanks, 2},
+    {:sql, "drop schema s"} => {@keyword_case, 2},
+    {:sql, "grant all on m to u"} => {@keyword_case, 2},
+    {:sql, "grant select"} => {@keyword_case, 2},
+    {:sql, "insert into main (v) values (1)"} => {@blanks, 2},
+    {:sql, "merge into m using t on true when matched then delete"} => {@keyword_case, 2},
+    {:sql, "merge into main using main on true when matched then delete"} => {@keyword_case, 2},
+    {:sql, "show columns from main"} => {@case_and_blanks, 3},
     {:sql, "select host,count(*) as c from main group by host having c > 3 order by host"} =>
-      @name_case,
-    {:sql, "select host as having from main order by time limit 2"} => @keyword_case,
-    {:sql, "select right(s,1) as r from main order by time"} => @name_case,
-    {:sql, "select zz.host from main"} => @name_case,
-    {:influxql, "select v + true from ~g1"} => @keyword_case,
-    {:influxql, "show tag keys from \"~m3\""} => @keyword_case,
-    {:influxql, "show tag keys from \"~m3\",\"~m4\""} => @blanks,
-    {:influxql, "show tag keys on"} => @blanks,
-    {:influxql, "group by time(2m,x)"} => @blanks,
-    {:influxql, "show tag values from \"~m3\" with key = host"} => @case_and_blanks,
-    {:influxql, "show tag values from \"~m3\" with key in (host,region)"} => @blanks,
-    {:influxql, "show tag values from \"m\""} => @blanks,
-    {:influxql, "show tag values"} => @blanks,
-    {:influxql, "show measurements with measurement =~ /^~p/"} => @blanks,
-    {:influxql, "show retention policies"} => @keyword_case,
-    {:influxql, "select count(distinct v) from ~f1"} => @case_and_blanks,
-    {:influxql, "select percentile(/./,99.5) from ~f3"} => @rest_as_written,
+      {@name_case, 2},
+    {:sql, "select host as having from main order by time limit 2"} => {@keyword_case, 2},
+    {:sql, "select right(s,1) as r from main order by time"} => {@name_case, 2},
+    {:sql, "select zz.host from main"} => {@name_case, 2},
+    {:influxql, "select v + true from ~g1"} => {@keyword_case, 2},
+    {:influxql, "show tag keys from \"~m3\""} => {@keyword_case, 2},
+    {:influxql, "show tag keys from \"~m3\",\"~m4\""} => {@blanks, 2},
+    {:influxql, "show tag keys on"} => {@blanks, 2},
+    {:influxql, "group by time(2m,x)"} => {@blanks, 2},
+    {:influxql, "show tag values from \"~m3\" with key = host"} => {@case_and_blanks, 3},
+    {:influxql, "show tag values from \"~m3\" with key in (host,region)"} => {@blanks, 2},
+    {:influxql, "show tag values from \"m\""} => {@blanks, 2},
+    {:influxql, "show tag values"} => {@blanks, 2},
+    {:influxql, "show measurements with measurement =~ /^~p/"} => {@blanks, 3},
+    {:influxql, "show retention policies"} => {@keyword_case, 2},
+    {:influxql, "select count(distinct v) from ~f1"} => {@case_and_blanks, 3},
+    {:influxql, "select percentile(/./,99.5) from ~f3"} => {@rest_as_written, 2},
     {:influxql,
      "select mean(usage) from ~m1 where time >= '2024-01-01T00:00:00Z' and " <>
-       "time < '2024-01-01T00:05:00Z' group by time(1m) fill(none)"} => @keyword_case,
-    {:influxql, "select n from ~g1 where abs(v) = 1"} => @name_case
+       "time < '2024-01-01T00:05:00Z' group by time(1m) fill(none)"} => {@keyword_case, 2},
+    {:influxql, "select n from ~g1 where abs(v) = 1"} => {@name_case, 2}
   }
 
   @pins for {{dialect, text}, pin} <- @spelling_pins,
@@ -361,12 +381,40 @@ defmodule InfluxElixir.ContractCaseTablesTest do
 
   @refusal_tables for {name, 0} <- @refusals.__info__(:functions), do: {@refusals, name}
 
-  test "the scan finds the case tables of every cases module" do
-    modules = @tables |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
+  # The cases modules by their sources: a table is a public function of no arguments that a
+  # file `*_cases.ex` of the test support defines, found here without loading the module, so
+  # that a table the scan above misses (or one it takes for a table that is none) is seen.
+  @case_files Path.wildcard(Path.expand("../support/**/*_cases.ex", __DIR__))
+  @refusal_file Path.expand("../support/contract/sql_scalar_refusals.ex", __DIR__)
 
-    assert length(modules) >= 11
-    assert length(@tables) >= 59
-    assert length(@refusal_tables) >= 7
+  test "the scan finds exactly the case tables the sources of the cases modules define" do
+    assert Enum.any?(@case_files)
+
+    from_sources =
+      for file <- @case_files,
+          {module, name} <- source_tables(file),
+          into: MapSet.new(),
+          do: {module, name}
+
+    assert MapSet.new(@tables) === from_sources
+    assert length(@tables) === MapSet.size(from_sources)
+    assert @tables |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> length() === length(@case_files)
+
+    assert MapSet.new(@refusal_tables) === MapSet.new(source_tables(@refusal_file))
+    assert Enum.any?(@refusal_tables)
+  end
+
+  # `{module, name}` of every public function of no arguments a source file defines
+  # (`def name do`, `def name, do:`).
+  defp source_tables(file) do
+    source = File.read!(file)
+    [_all, module] = Regex.run(~r/^defmodule ([\w.]+) do/m, source)
+    module = Module.concat([module])
+
+    ~r/^  def ([a-z_]\w*[?!]?)(?:\(\))?(?: do\b|,\s*do:)/m
+    |> Regex.scan(source, capture: :all_but_first)
+    |> List.flatten()
+    |> Enum.map(&{module, String.to_atom(&1)})
   end
 
   test "no case is written twice, in its table or (for SQL) in another" do
@@ -383,8 +431,8 @@ defmodule InfluxElixir.ContractCaseTablesTest do
     flawed =
       for {{_scope, identity}, group} <- groups(),
           length(group) > 1,
-          pin <- [Map.get(@pins, identity)],
-          problem = pin_problem(pin, group),
+          {pin, members} <- [Map.get(@pins, identity)],
+          problem = pin_problem(pin, members, group),
           do: "#{inspect(identity)} #{problem}: #{describe(group)}"
 
     assert Enum.sort(flawed) === []
@@ -415,15 +463,19 @@ defmodule InfluxElixir.ContractCaseTablesTest do
   end
 
   test "every pin is of a known kind and has a reason" do
-    for {identity, pin} <- @pins do
+    for {identity, {pin, members}} <- @pins do
       reason =
         case pin do
           {:differs, reason} -> reason
+          {:position, reason} -> reason
           {:same_answer, relations, reason} when is_list(relations) -> reason
         end
 
       assert is_binary(reason) and String.length(reason) >= 10,
              "no reason for #{inspect(identity)}"
+
+      assert is_integer(members) and members >= 2,
+             "a pinned group holds at least two cases: #{inspect(identity)}"
     end
   end
 
@@ -604,15 +656,22 @@ defmodule InfluxElixir.ContractCaseTablesTest do
   defp sql_identity(kind, text), do: {:sql, {kind, Normaliser.normalise(text, :sql)}}
 
   # Why a pinned group is not what its pin says, or `nil`.
-  defp pin_problem(pin, group) do
+  defp pin_problem(pin, members, group) do
     spellings = Enum.map(group, & &1.spelling)
 
     cond do
+      length(group) !== members ->
+        "holds #{length(group)} cases and its pin says #{members}: a spelling was added or " <>
+          "taken out"
+
       length(Enum.uniq(spellings)) < length(spellings) ->
         "has a spelling twice"
 
       match?({:differs, _reason}, pin) and not distinct?(group) ->
         "has cases with the same expectation: a case written twice, or a :same_answer"
+
+      match?({:position, _reason}, pin) ->
+        position_problem(group)
 
       match?({:same_answer, _relations, _reason}, pin) ->
         same_answer_problem(pin, group)
@@ -620,6 +679,34 @@ defmodule InfluxElixir.ContractCaseTablesTest do
       true ->
         nil
     end
+  end
+
+  # A `:position` group is answered differently by every member, and the answers are one
+  # once the place they name and the text quoted from it are taken out.
+  defp position_problem(group) do
+    folded = group |> Enum.map(&fold_position(&1.expectation)) |> Enum.uniq()
+
+    cond do
+      not distinct?(group) ->
+        "has cases with the same expectation as written: a case written twice, or a :same_answer"
+
+      length(folded) > 1 ->
+        "has expectations that differ in more than the place the parser stopped at: " <>
+          inspect(folded, limit: :infinity)
+
+      true ->
+        nil
+    end
+  end
+
+  # An expectation without the place an error names (`Line: 1, Column: 7`, `at pos 12`) and
+  # without the text quoted from where the parser stopped (`Nom("rest", Tag)`).
+  defp fold_position(expectation) do
+    expectation
+    |> inspect(limit: :infinity, printable_limit: :infinity)
+    |> String.replace(~r/Line: \d+, Column: \d+/, "Line: _, Column: _")
+    |> String.replace(~r/at pos \d+/, "at pos _")
+    |> String.replace(~r/Nom\(\\".*?\\", (Tag|Char)\)/, "Nom(_, \\1)")
   end
 
   # A `:same_answer` group is answered alike by every member, and its members differ in the

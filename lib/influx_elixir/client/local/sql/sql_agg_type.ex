@@ -16,6 +16,14 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   #     timestamp, the whole struct a `Struct("value": ..., "time": ...)`
   #   * the null as an argument: the statistics are floats
   #
+  # The engine types an aggregate twice, as it does any expression (see
+  # `InfluxElixir.Client.Local.SQLExprType`): the planner types its argument before the
+  # coercion, so the argument of a `CASE` has the type of its first result, and the error of an
+  # operator over the aggregate names it (`sum(CASE WHEN b THEN n ELSE v END) + 'a'` is `Int64 +
+  # Utf8`); the type coercion then gives the `CASE` the type its results share, and the errors it
+  # finds name that (`NOT sum(CASE ...)` is a `Float64`). `types/2` has the second type under
+  # the name of the aggregate and, where the first differs, under `plan_key/1` of it.
+  #
   # A type that is not known is `nil`, which is never refused.
 
   alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLSelect}
@@ -38,11 +46,29 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
           binary() => binary()
         }
   def types(aggs, columns) do
-    for {name, column} <- aggs,
-        type = result(column, columns),
-        into: %{},
-        do: {name, type}
+    Enum.reduce(aggs, %{}, fn {name, column}, found ->
+      coerced = result(column, columns, :coerced)
+      planned = result(column, columns, :plan)
+
+      found
+      |> put_type(name, coerced)
+      |> put_type(plan_key(name), if(planned != coerced, do: planned))
+    end)
   end
+
+  @plan_prefix "\u0000plan:"
+
+  @doc "The name an aggregate's planner type stands under in the types of the columns."
+  @spec plan_key(binary()) :: binary()
+  def plan_key(name), do: @plan_prefix <> name
+
+  @doc "Whether a name in the types is the key of an aggregate's planner type."
+  @spec plan_key?(binary()) :: boolean()
+  def plan_key?(name), do: String.starts_with?(name, @plan_prefix)
+
+  @spec put_type(%{binary() => binary()}, binary(), binary() | nil) :: %{binary() => binary()}
+  defp put_type(found, _name, nil), do: found
+  defp put_type(found, name, type), do: Map.put(found, name, type)
 
   @doc """
   The types of the select items output as one of `names`, by that name; an item whose type
@@ -55,7 +81,7 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
     for column <- select_columns,
         name = output_name(column),
         name in names,
-        type = result(column, columns),
+        type = result(column, columns, :coerced),
         into: %{},
         do: {name, type}
   end
@@ -73,34 +99,36 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
     if is_binary(name), do: name
   end
 
-  @spec result(SQLSelect.column(), %{binary() => binary()}) :: binary() | nil
-  defp result({:count_star, _name}, _columns), do: "Int64"
-  defp result({:count_distinct, _column, _name}, _columns), do: "Int64"
+  @spec result(SQLSelect.column(), %{binary() => binary()}, SQLExprType.phase()) ::
+          binary() | nil
+  defp result({:count_star, _name}, _columns, _phase), do: "Int64"
+  defp result({:count_distinct, _column, _name}, _columns, _phase), do: "Int64"
 
-  defp result({:aggregate, agg, _expr, _name}, _columns) when agg in [:count, :count_distinct],
-    do: "Int64"
+  defp result({:aggregate, agg, _expr, _name}, _columns, _phase)
+       when agg in [:count, :count_distinct],
+       do: "Int64"
 
   # The null as an argument (verified against Core): the statistics are floats; `MIN` and
   # `MAX` of it are typed by the engine only after the plan (not modelled), `SUM` and `AVG`
   # of it fail the plan before this is read.
-  defp result({:aggregate, agg, {:lit, nil}, _name}, _columns), do: null_result(agg)
+  defp result({:aggregate, agg, {:lit, nil}, _name}, _columns, _phase), do: null_result(agg)
 
-  defp result({:aggregate, :sum_distinct, expr, name}, columns),
-    do: result({:aggregate, :sum, expr, name}, columns)
+  defp result({:aggregate, :sum_distinct, expr, name}, columns, phase),
+    do: result({:aggregate, :sum, expr, name}, columns, phase)
 
-  defp result({:aggregate, agg, expr, _name}, columns),
-    do: kept(agg, SQLExprType.known_type(expr, columns))
+  defp result({:aggregate, agg, expr, _name}, columns, phase),
+    do: kept(agg, SQLExprType.known_type(expr, columns, [], phase))
 
-  defp result({:ordered_aggregate, _end, field, _ordering, _name}, columns),
+  defp result({:ordered_aggregate, _end, field, _ordering, _name}, columns, _phase),
     do: Map.get(columns, field)
 
-  defp result({:selector, _selector, field, _ordering, :value, _name}, columns),
+  defp result({:selector, _selector, field, _ordering, :value, _name}, columns, _phase),
     do: Map.get(columns, field)
 
-  defp result({:selector, _selector, _field, _ordering, :time, _name}, _columns),
+  defp result({:selector, _selector, _field, _ordering, :time, _name}, _columns, _phase),
     do: "Timestamp(ns)"
 
-  defp result({:selector, _selector, field, _ordering, :struct, _name}, columns) do
+  defp result({:selector, _selector, field, _ordering, :struct, _name}, columns, _phase) do
     case Map.get(columns, field) do
       nil -> nil
       type -> ~s|Struct("value": #{type}, "time": Timestamp(ns))|
@@ -109,11 +137,11 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
 
   # An expression over aggregates (`sum(n) + 1`) has the type of its operators over the
   # aggregates' results (an aggregate whose type is not known leaves the expression's so).
-  defp result({:expression, expr, aggs, _name}, columns),
-    do: SQLExprType.known_type(expr, Map.merge(columns, types(aggs, columns)))
+  defp result({:expression, expr, aggs, _name}, columns, phase),
+    do: SQLExprType.known_type(expr, Map.merge(columns, types(aggs, columns)), [], phase)
 
-  defp result({:grouping_column, source, _name}, columns), do: Map.get(columns, source)
-  defp result(_other, _columns), do: nil
+  defp result({:grouping_column, source, _name}, columns, _phase), do: Map.get(columns, source)
+  defp result(_other, _columns, _phase), do: nil
 
   @spec null_result(SQLSelect.aggregate()) :: binary() | nil
   defp null_result(agg) when agg in [:min, :max, :sum, :sum_distinct, :avg], do: nil

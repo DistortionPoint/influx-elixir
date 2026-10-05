@@ -61,6 +61,23 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   end
 
   @doc """
+  The engine's error for a placeholder numbered zero (`$0`, `$00`), or `:ok`. The engine
+  refuses it as it converts the expression it stands in, whether the query has a value for it or
+  not, so it comes before the errors of types and before those of the columns that stand
+  beside it in the same condition.
+  """
+  @spec zero(SQLParser.parsed_query()) :: :ok | {:error, map()}
+  def zero(query) do
+    case Enum.find(placeholders(plan_order(query)), &String.match?(&1, ~r/\A0+\z/)) do
+      nil ->
+        :ok
+
+      name ->
+        {:error, SQLError.planning("Invalid placeholder, zero is not a valid index: $#{name}")}
+    end
+  end
+
+  @doc """
   Binds the `$name`s of a query that have a value and leaves the rest as they are, for the
   planner to find the engine's error for them (see `problem/2`). A predicate that holds
   a placeholder with no value is left whole.

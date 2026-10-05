@@ -19,18 +19,18 @@ defmodule InfluxElixir.Flight.ProtoTest do
       ticket = %Ticket{ticket: payload}
       encoded = Protobuf.encode(ticket)
       decoded = Protobuf.decode(encoded, Ticket)
-      assert decoded.ticket == payload
+      assert decoded.ticket === payload
     end
 
     test "encodes empty ticket" do
       ticket = %Ticket{ticket: ""}
       encoded = Protobuf.encode(ticket)
       decoded = Protobuf.decode(encoded, Ticket)
-      assert decoded.ticket == ""
+      assert decoded.ticket === ""
     end
 
     test "struct defaults to empty bytes" do
-      assert %Ticket{}.ticket == ""
+      assert %Ticket{}.ticket === ""
     end
   end
 
@@ -39,22 +39,22 @@ defmodule InfluxElixir.Flight.ProtoTest do
       desc = %FlightDescriptor{type: 2, cmd: "SELECT * FROM cpu"}
       encoded = Protobuf.encode(desc)
       decoded = Protobuf.decode(encoded, FlightDescriptor)
-      assert decoded.type == 2
-      assert decoded.cmd == "SELECT * FROM cpu"
+      assert decoded.type === 2
+      assert decoded.cmd === "SELECT * FROM cpu"
     end
 
     test "encodes and decodes with path" do
       desc = %FlightDescriptor{type: 1, path: ["bucket", "table"]}
       encoded = Protobuf.encode(desc)
       decoded = Protobuf.decode(encoded, FlightDescriptor)
-      assert decoded.path == ["bucket", "table"]
+      assert decoded.path === ["bucket", "table"]
     end
 
     test "defaults to empty values" do
       desc = %FlightDescriptor{}
-      assert desc.type == 0
-      assert desc.cmd == ""
-      assert desc.path == []
+      assert desc.type === 0
+      assert desc.cmd === ""
+      assert desc.path === []
     end
   end
 
@@ -63,11 +63,11 @@ defmodule InfluxElixir.Flight.ProtoTest do
       loc = %Location{uri: "grpc+tls://influxdb.example.com:443"}
       encoded = Protobuf.encode(loc)
       decoded = Protobuf.decode(encoded, Location)
-      assert decoded.uri == "grpc+tls://influxdb.example.com:443"
+      assert decoded.uri === "grpc+tls://influxdb.example.com:443"
     end
 
     test "defaults to empty string" do
-      assert %Location{}.uri == ""
+      assert %Location{}.uri === ""
     end
   end
 
@@ -80,15 +80,15 @@ defmodule InfluxElixir.Flight.ProtoTest do
 
       encoded = Protobuf.encode(endpoint)
       decoded = Protobuf.decode(encoded, FlightEndpoint)
-      assert decoded.ticket.ticket == "tok"
-      assert length(decoded.location) == 1
-      assert hd(decoded.location).uri == "grpc://host:443"
+      assert decoded.ticket.ticket === "tok"
+      assert length(decoded.location) === 1
+      assert hd(decoded.location).uri === "grpc://host:443"
     end
 
     test "defaults to nil ticket and empty locations" do
       ep = %FlightEndpoint{}
-      assert ep.ticket == nil
-      assert ep.location == []
+      assert ep.ticket === nil
+      assert ep.location === []
     end
   end
 
@@ -106,18 +106,18 @@ defmodule InfluxElixir.Flight.ProtoTest do
 
       encoded = Protobuf.encode(info)
       decoded = Protobuf.decode(encoded, FlightInfo)
-      assert decoded.schema == <<1, 2, 3>>
-      assert decoded.flight_descriptor.cmd == "q"
-      assert decoded.total_records == 1_000
-      assert decoded.total_bytes == 512_000
-      assert length(decoded.endpoint) == 1
+      assert decoded.schema === <<1, 2, 3>>
+      assert decoded.flight_descriptor.cmd === "q"
+      assert decoded.total_records === 1_000
+      assert decoded.total_bytes === 512_000
+      assert length(decoded.endpoint) === 1
     end
 
     test "defaults correctly" do
       info = %FlightInfo{}
-      assert info.schema == ""
-      assert info.total_records == 0
-      assert info.total_bytes == 0
+      assert info.schema === ""
+      assert info.total_records === 0
+      assert info.total_bytes === 0
     end
   end
 
@@ -132,23 +132,23 @@ defmodule InfluxElixir.Flight.ProtoTest do
 
       encoded = Protobuf.encode(fd)
       decoded = Protobuf.decode(encoded, FlightData)
-      assert decoded.data_header == <<10, 20, 30>>
-      assert decoded.app_metadata == "meta"
-      assert decoded.data_body == <<40, 50, 60>>
+      assert decoded.data_header === <<10, 20, 30>>
+      assert decoded.app_metadata === "meta"
+      assert decoded.data_body === <<40, 50, 60>>
     end
 
     test "data_body field number is 1000 (high field number survives round-trip)" do
       fd = %FlightData{data_body: "body_content"}
       encoded = Protobuf.encode(fd)
       decoded = Protobuf.decode(encoded, FlightData)
-      assert decoded.data_body == "body_content"
+      assert decoded.data_body === "body_content"
     end
 
     test "defaults to empty binaries" do
       fd = %FlightData{}
-      assert fd.data_header == ""
-      assert fd.app_metadata == ""
-      assert fd.data_body == ""
+      assert fd.data_header === ""
+      assert fd.app_metadata === ""
+      assert fd.data_body === ""
     end
   end
 
@@ -157,14 +157,14 @@ defmodule InfluxElixir.Flight.ProtoTest do
       req = %HandshakeRequest{protocol_version: 1, payload: "bearer-token"}
       encoded = Protobuf.encode(req)
       decoded = Protobuf.decode(encoded, HandshakeRequest)
-      assert decoded.protocol_version == 1
-      assert decoded.payload == "bearer-token"
+      assert decoded.protocol_version === 1
+      assert decoded.payload === "bearer-token"
     end
 
     test "defaults to zero version and empty payload" do
       req = %HandshakeRequest{}
-      assert req.protocol_version == 0
-      assert req.payload == ""
+      assert req.protocol_version === 0
+      assert req.payload === ""
     end
   end
 
@@ -173,8 +173,8 @@ defmodule InfluxElixir.Flight.ProtoTest do
       resp = %HandshakeResponse{protocol_version: 2, payload: "session-token"}
       encoded = Protobuf.encode(resp)
       decoded = Protobuf.decode(encoded, HandshakeResponse)
-      assert decoded.protocol_version == 2
-      assert decoded.payload == "session-token"
+      assert decoded.protocol_version === 2
+      assert decoded.payload === "session-token"
     end
   end
 
@@ -196,21 +196,21 @@ defmodule InfluxElixir.Flight.ProtoTest do
     test "DoGet is a server-streaming call" do
       rpc_call =
         FlightService.Service.__rpc_calls__()
-        |> Enum.find(fn {name, _req, _resp, _opts} -> name == :DoGet end)
+        |> Enum.find(fn {name, _req, _resp, _opts} -> name === :DoGet end)
 
       {_name, {_req, req_stream?}, {_resp, resp_stream?}, _opts} = rpc_call
-      assert req_stream? == false
-      assert resp_stream? == true
+      assert req_stream? === false
+      assert resp_stream? === true
     end
 
     test "GetFlightInfo is a unary call" do
       rpc_call =
         FlightService.Service.__rpc_calls__()
-        |> Enum.find(fn {name, _req, _resp, _opts} -> name == :GetFlightInfo end)
+        |> Enum.find(fn {name, _req, _resp, _opts} -> name === :GetFlightInfo end)
 
       {_name, {_req, req_stream?}, {_resp, resp_stream?}, _opts} = rpc_call
-      assert req_stream? == false
-      assert resp_stream? == false
+      assert req_stream? === false
+      assert resp_stream? === false
     end
   end
 end

@@ -28,7 +28,7 @@ defmodule InfluxElixir.TestSupport.Telemetry do
   @doc false
   @spec forward_event([atom()], map(), map(), %{test_pid: pid()}) :: :ok
   def forward_event(event, measurements, metadata, %{test_pid: test_pid}) do
-    if self() == test_pid, do: send(test_pid, {:telemetry, event, measurements, metadata})
+    if self() === test_pid, do: send(test_pid, {:telemetry, event, measurements, metadata})
     :ok
   end
 end

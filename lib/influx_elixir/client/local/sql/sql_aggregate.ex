@@ -33,6 +33,11 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   @typedoc "A group's points."
   @type points :: [SQLRow.point()]
 
+  # The aggregates of a spread: over one accumulator (the engine merges one for each of its
+  # partitions, which the double cannot know: merged series of equal values would not have a
+  # variance of exactly zero, as the engine has it).
+  @spread [:var, :stddev, :var_pop, :stddev_pop]
+
   # The order an ascending sort (and `first_value`/`last_value`) puts nulls in.
   @ascending {:asc, :nulls_last}
 
@@ -43,7 +48,7 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   One output row of an aggregate or grouped select list: each column over the
   group's `points`; `bucket_ts` is the group's `DATE_BIN` bucket start.
   """
-  @spec reduce_columns([SQLSelect.column()], points(), integer() | nil) :: map()
+  @spec reduce_columns([SQLSelect.column()], points(), integer() | nil | :scalar) :: map()
   def reduce_columns(columns, points, bucket_ts) do
     if points == [] and distinct_literal_quirk?(columns) do
       throw({:query_error, SQLError.refusal(@distinct_literal)})
@@ -99,7 +104,7 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
           [SQLSelect.column()],
           SQLAggExpr.having_t() | nil,
           points(),
-          integer() | nil
+          integer() | nil | :scalar
         ) :: [map()]
   def reduce_group(columns, having, points, bucket_ts) do
     cond do
@@ -126,7 +131,8 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     Enum.any?(SQLWhere.conjunction_columns(nodes), &(&1 in outputs))
   end
 
-  @spec having_holds?(SQLAggExpr.having_t(), points(), integer() | nil, map()) :: boolean()
+  @spec having_holds?(SQLAggExpr.having_t(), points(), integer() | nil | :scalar, map()) ::
+          boolean()
   defp having_holds?(%{nodes: nodes, aggs: aggs}, points, bucket_ts, row) do
     SQLCondition.matches_all?(group_row(points, aggs, bucket_ts, row), nodes)
   end
@@ -134,7 +140,7 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   # The row an expression of a group is evaluated over: the group's first
   # row, the select list's outputs and the values of the aggregates the
   # expression names.
-  @spec group_row(points(), [{binary(), SQLSelect.column()}], integer() | nil, map()) ::
+  @spec group_row(points(), [{binary(), SQLSelect.column()}], integer() | nil | :scalar, map()) ::
           SQLRow.point()
   defp group_row(points, aggs, bucket_ts, outputs \\ %{}) do
     base = List.first(points) || %{measurement: "", tags: %{}, fields: %{}, timestamp: nil}
@@ -152,7 +158,7 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp put(row, _key, nil), do: row
   defp put(row, key, value), do: Map.put(row, key, value)
 
-  @spec column_result(SQLSelect.column(), points(), integer() | nil) :: term()
+  @spec column_result(SQLSelect.column(), points(), integer() | nil | :scalar) :: term()
   defp column_result({:time_bucket, _alias}, _points, bucket_ts),
     do: SQLRow.nanoseconds_to_datetime(bucket_ts)
 
@@ -163,6 +169,13 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
       [first | _rest] -> SQLRow.column_value(first, source)
       [] -> nil
     end
+  end
+
+  defp column_result({:aggregate, agg, expr, _alias}, points, bucket_ts)
+       when agg in @spread do
+    values = points |> Enum.map(&SQLEval.eval(expr, &1)) |> Enum.reject(&is_nil/1)
+
+    spread(values, agg, bucket_ts == :scalar)
   end
 
   defp column_result({:aggregate, agg, expr, _alias}, points, _bucket_ts) do
@@ -205,12 +218,6 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp compute(:median, values), do: median(values)
   # Sample forms need at least two values, exactly as the real engine
   # (STDDEV of one row is null); population forms are defined for one.
-  defp compute(:var, [_one]), do: nil
-  defp compute(:stddev, [_one]), do: nil
-  defp compute(:var, values), do: variance(values, length(values) - 1)
-  defp compute(:stddev, values), do: :var |> compute(values) |> square_root()
-  defp compute(:var_pop, values), do: variance(values, length(values))
-  defp compute(:stddev_pop, values), do: :var_pop |> compute(values) |> square_root()
 
   # The sum starts from the type's zero, so the sum of `-0.0` is `0.0`
   # (verified).
@@ -293,32 +300,53 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp halve({:dec, coefficient, scale}), do: {:dec, div(coefficient, 2), scale}
   defp halve(value), do: SQLNumber.arithmetic(:/, value, if(is_integer(value), do: 2, else: 2.0))
 
-  # The sample or population variance: the squared distances from the mean,
-  # over `divisor`.
-  @spec variance([SQLNumber.t()], pos_integer()) :: float() | SQLNumber.special()
-  defp variance(values, divisor) do
-    count = length(values)
+  # The sample or population variance or deviation of the values.
+  @spec spread([SQLNumber.t()], SQLParser.aggregate(), boolean()) :: term()
+  defp spread([], _agg, _scalar?), do: nil
+  defp spread([_one], agg, _scalar?) when agg in [:var, :stddev], do: nil
 
-    mean =
-      if integer_values?(values),
-        do: values |> Enum.map(&integer_of/1) |> Enum.sum() |> Kernel./(count),
-        else: values |> sum_floats() |> divide(count * 1.0)
-
-    values
-    |> Enum.map(&SQLNumber.to_float/1)
-    |> Enum.reduce(0.0, fn value, acc -> add(acc, squared_distance(value, mean)) end)
-    |> divide(divisor * 1.0)
+  defp spread(values, agg, scalar?) do
+    divisor = if agg in [:var, :stddev], do: length(values) - 1, else: length(values)
+    variance = variance(values, divisor, scalar?)
+    if agg in [:var, :var_pop], do: variance, else: square_root(variance)
   end
 
-  @spec squared_distance(float() | SQLNumber.special(), float() | SQLNumber.special()) ::
-          float() | SQLNumber.special()
-  defp squared_distance(value, mean) do
-    distance = SQLNumber.arithmetic(:-, value, mean)
-    SQLNumber.arithmetic(:*, distance, distance)
+  # The variance as the engine's accumulator makes it: one pass over the values in the order
+  # they are read, updating the count, the mean and the sum of the squared distances from the
+  # mean (Welford) as each arrives, so that equal values have a variance of exactly zero (a
+  # two-pass mean of `55.7` three times is not `55.7`). The sum is over `divisor`.
+  @spec variance([SQLNumber.t()], pos_integer(), boolean()) :: float() | SQLNumber.special()
+  defp variance(values, divisor, scalar?) do
+    {count, mean, squares} = Enum.reduce(values, {0, 0.0, 0.0}, &welford/2)
+    divide(merged(scalar? and count == 1, mean, squares), divisor * 1.0)
   end
 
-  @spec square_root(float() | SQLNumber.special() | nil) :: float() | SQLNumber.special() | nil
-  defp square_root(nil), do: nil
+  # The engine merges the accumulator into an empty one for the final result, and the merge
+  # adds `delta * delta * 0` for the distance `delta` of the means: no change, unless the square
+  # of a mean past 1.3e154 overflows, when it is `inf * 0` and the variance is a NaN (verified:
+  # two rows of 1.7e308 have a null deviation). The variance of the whole table that is a single
+  # row is not merged (verified: one row of 1e308 has a variance of 0.0, a group of one has none).
+  @spec merged(boolean(), SQLNumber.t(), SQLNumber.t()) :: SQLNumber.t()
+  defp merged(true, _mean, squares), do: squares
+
+  defp merged(false, mean, squares) do
+    delta = SQLNumber.arithmetic(:-, 0.0, mean)
+    nothing = SQLNumber.arithmetic(:*, SQLNumber.arithmetic(:*, delta, delta), 0.0)
+    add(squares, nothing)
+  end
+
+  @spec welford(SQLNumber.t(), {non_neg_integer(), SQLNumber.t(), SQLNumber.t()}) ::
+          {pos_integer(), SQLNumber.t(), SQLNumber.t()}
+  defp welford(value, {count, mean, squares}) do
+    value = SQLNumber.to_float(value)
+    count = count + 1
+    first_distance = SQLNumber.arithmetic(:-, value, mean)
+    mean = add(divide(first_distance, count * 1.0), mean)
+    second_distance = SQLNumber.arithmetic(:-, value, mean)
+    {count, mean, add(squares, SQLNumber.arithmetic(:*, first_distance, second_distance))}
+  end
+
+  @spec square_root(float() | SQLNumber.special()) :: float() | SQLNumber.special()
   defp square_root(special) when special in [:inf, :nan], do: special
   defp square_root(:neg_inf), do: :nan
   defp square_root(value) when value < 0, do: :nan

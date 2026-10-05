@@ -14,14 +14,14 @@ defmodule InfluxElixir.Admin.BucketsTest do
       assert :ok = Buckets.create(conn, "my_bucket")
 
       assert {:ok, [bucket]} = Buckets.list(conn)
-      assert bucket["name"] == "my_bucket"
+      assert bucket["name"] === "my_bucket"
       # With no expiry a bucket's shard groups are a week long (verified).
-      assert bucket["retentionRules"] == [
+      assert bucket["retentionRules"] === [
                %{"type" => "expire", "everySeconds" => 0, "shardGroupDurationSeconds" => 604_800}
              ]
 
       assert is_binary(bucket["id"])
-      assert bucket["type"] == "user"
+      assert bucket["type"] === "user"
     end
 
     test ":retention is kept in seconds and listed as the bucket's rule", %{conn: conn} do
@@ -46,7 +46,9 @@ defmodule InfluxElixir.Admin.BucketsTest do
     test "a retention under one hour is refused the way InfluxDB 2 refuses it", %{conn: conn} do
       assert {:error, %{status: 500, body: body}} = Buckets.create(conn, "short", retention: 60)
 
-      assert Jason.decode!(body)["message"] == "retention policy duration must be at least 1h0m0s"
+      assert Jason.decode!(body)["message"] ===
+               "retention policy duration must be at least 1h0m0s"
+
       assert {:ok, []} = Buckets.list(conn)
     end
   end

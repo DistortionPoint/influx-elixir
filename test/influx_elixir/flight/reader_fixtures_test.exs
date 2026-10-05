@@ -51,7 +51,7 @@ defmodule InfluxElixir.Flight.ReaderFixturesTest do
           {-1, "-PT0.000000001S"},
           {7_199_750_000_000, "PT7199.75S"}
         ] do
-      assert Reader.render_duration(ns) == text
+      assert Reader.render_duration(ns) === text
     end
   end
 end

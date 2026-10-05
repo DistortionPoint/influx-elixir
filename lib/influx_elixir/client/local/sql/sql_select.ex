@@ -16,7 +16,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   # that depends on which side of a `CROSS JOIN` holds a column is refused by
   # name, and so is a cast, whose place in a name the double does not model.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLLiteral, SQLMask, SQLTime}
+  alias InfluxElixir.Client.Local.{SQLCastType, SQLError, SQLExpr, SQLLiteral, SQLMask, SQLTime}
 
   @typedoc "Plain aggregates; `:stddev`/`:var` are the sample forms, as in InfluxDB."
   @type aggregate ::
@@ -205,12 +205,22 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   defp implicit_alias(item) do
     case SQLMask.run(~r/^(.*?[\w)"'\]])\s+([\p{L}_]\w*|"(?:[^"]|"")*")\s*$/su, item) do
       [_full, body, word] ->
-        if alias_word?(word) and expression_end?(body),
+        if alias_word?(word) and expression_end?(body) and not type_word?(body, word),
           do: {String.trim(body), name(word)},
           else: {String.trim(item), nil}
 
       nil ->
         {String.trim(item), nil}
+    end
+  end
+
+  # Whether the last word goes on the type a cast before it names (`n::BIGINT UNSIGNED`,
+  # `n::TIMESTAMP WITH TIME ZONE`), rather than naming the item (`n::INT ARRAY`).
+  @spec type_word?(binary(), binary()) :: boolean()
+  defp type_word?(body, word) do
+    case SQLMask.run(~r/::\s*([^:]+)$/su, body) do
+      [_full, tail] -> SQLCastType.type?(tail <> " " <> word)
+      nil -> false
     end
   end
 
@@ -652,7 +662,17 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
       {:ok, {:aggregate, agg, expr, output}}
     else
       {:error, %{status: 400}} = error -> error
+      {:error, _reason} -> {:error, SQLExpr.refusal("aggregate", col, call_argument(body))}
       _no_match -> {:error, SQLError.refusal("invalid aggregate: #{col}")}
+    end
+  end
+
+  # The text between the parentheses of a call.
+  @spec call_argument(binary()) :: binary()
+  defp call_argument(body) do
+    case Regex.run(~r/\((.+)\)\s*$/su, body) do
+      [_full, argument] -> argument
+      nil -> body
     end
   end
 
@@ -734,7 +754,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   defp parse_selector_column(col, body, alias_name, qualifier) do
     case Regex.run(@selector_pattern, body) do
       [_full, kind, field, ordering | access] ->
-        selector = String.to_existing_atom(String.downcase(kind))
+        selector = selector_kind(kind)
         access = List.first(access, "")
         literal = literal_type(ordering)
         constant = literal_type(field)
@@ -753,7 +773,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
                  selector_name(kind, shown, access, qualifier)
                end) do
           # Without a subscript the engine returns the whole struct.
-          kind = if access == "", do: :struct, else: String.to_existing_atom(access)
+          kind = selector_access(access)
           {:ok, {:selector, selector, field, ordering, kind, output}}
         end
 
@@ -763,6 +783,26 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
            "selector functions are supported as " <>
              "selector_first|last|min|max(field, time)[['value' | 'time']] [AS alias]: #{col}"
          )}
+    end
+  end
+
+  @spec selector_kind(binary()) :: :first | :last | :min | :max
+  defp selector_kind(kind) do
+    case String.downcase(kind) do
+      "first" -> :first
+      "last" -> :last
+      "min" -> :min
+      "max" -> :max
+    end
+  end
+
+  # Without a subscript the engine returns the whole struct.
+  @spec selector_access(binary()) :: :value | :time | :struct
+  defp selector_access(access) do
+    case String.downcase(access) do
+      "" -> :struct
+      "value" -> :value
+      "time" -> :time
     end
   end
 

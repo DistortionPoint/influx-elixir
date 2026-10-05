@@ -701,10 +701,11 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     end)
   end
 
-  # In a `SELECT *` a number in `ORDER BY` is a position among the columns.
+  # A number in `ORDER BY` is a position among the columns: in a `SELECT *` it is resolved with
+  # the columns, and in another select the parser has replaced the positions that name an item,
+  # so one that is left names none (the error of the plan, not of a column).
   @spec ordinal?(SQLParser.parsed_query(), binary()) :: boolean()
-  defp ordinal?(query, term),
-    do: star?(query) and SQLClauses.order_position(term, 0) != :not_positional
+  defp ordinal?(_query, term), do: SQLClauses.order_position(term, 0) != :not_positional
 
   @doc "Whether the query selects `*`."
   @spec star?(SQLParser.parsed_query()) :: boolean()

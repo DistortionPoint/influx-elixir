@@ -28,8 +28,9 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
   end
 
   # The reductions of a grouped query whose HAVING names its select alias `count` times: the
-  # least of three runs, as the first run of a text may fill a cache that the tests running
-  # beside this one share (the work of a run that finds them filled does not vary).
+  # least of three runs. There is no cache to fill: the first call of a function loads the
+  # module it lives in, which costs reductions the later calls do not (the work of a run
+  # that finds the modules loaded does not vary).
   defp having_cost(conn, count) do
     sql =
       "SELECT host, count(*) AS c FROM main GROUP BY host HAVING " <>
@@ -47,8 +48,8 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
   end
 
   # What one more reference costs: the cost of `count` references less the cost of one,
-  # over the `count - 1` the first lacks. The caches of a connection's first query are
-  # filled before anything is measured.
+  # over the `count - 1` the first lacks. The modules a connection's first query loads
+  # are loaded before anything is measured.
   defp per_reference_cost(conn, count) do
     having_cost(conn, 1)
     (having_cost(conn, count) - having_cost(conn, 1)) / (count - 1)
@@ -81,8 +82,6 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
 
       assert big <= small * 1.5,
              "a reference costs #{small} reductions over 1500 rows and #{big} over 6000"
-
-      "a reference costs #{small} reductions over 1500 rows and #{big} over 6000"
     end
 
     test "the cost is a line in the references", %{conn: conn} do
@@ -110,6 +109,11 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
           database: "cost_db"
         )
       end
+
+      # Run both shapes once before measuring: the first call of a function loads its module,
+      # which would be counted in `short` and in nothing else.
+      assert {:ok, [%{"r" => 300}]} = sum.(300)
+      assert {:ok, [%{"r" => 900}]} = sum.(900)
 
       {short, {:ok, [%{"r" => 300}]}} = reductions(fn -> sum.(300) end)
       {long, answer} = reductions(fn -> sum.(900) end)

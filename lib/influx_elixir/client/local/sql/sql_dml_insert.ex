@@ -1,7 +1,7 @@
 defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   @moduledoc false
-  # The planner's answer to an `INSERT`, which it never runs (verified against InfluxDB 3
-  # Core), for `InfluxElixir.Client.Local.SQLDml`. The steps are the planner's, in its order:
+  # The planner's answer to an `INSERT`, which it never runs (verified against InfluxDB 3 Core
+  # 3.10.1), for `InfluxElixir.Client.Local.SQLDml`. The steps are the planner's, in its order:
   #
   #   1. the parser reads the statement: `INSERT [INTO] [TABLE] name [(column, ...)] source`,
   #      the source a `VALUES` list, a `SELECT`, a `WITH`, a `TABLE name` or a parenthesized one
@@ -17,21 +17,29 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   #          cannot plan); then the rows are counted against the columns; then column by
   #          column each cell is typed, as a select item is, and cast to the column's type,
   #          which fails for a few pairs (`Execution error: type mismatch and can't cast`)
-  #        * `SELECT items [FROM table]`: the table, each item as an operand of that table,
-  #          the count of the items against the columns (`Column count doesn't match insert
-  #          query!`), each item's conversion to its column (`Cannot automatically convert`)
+  #        * `SELECT items [FROM table]`: the table; each item read as an operand of that table
+  #          (the errors of several items are one error of the planner, `read_items/3`); that no
+  #          two items have the same name (`SQLDmlItem`); each item typed, and what typing its
+  #          top does not reach (`project_items/2`); that no column of the table is named as an
+  #          item; the count of the items against the columns (`Column count doesn't match
+  #          insert query!`); each item's conversion to its column (`Cannot automatically
+  #          convert`)
   #        * `TABLE name` is `Query TABLE name not implemented yet`
   #   6. `DML not supported: Insert Into`
   #
   # A source whose planning the double does not model (a `WITH`, a union, a select with a
   # clause) is a refusal by name once the steps before it have passed.
 
-  alias InfluxElixir.Client.Local.{SQLDdl, SQLDml, SQLDmlExpr, SQLDmlName, SQLDmlOperand}
-  alias InfluxElixir.Client.Local.{SQLError, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{SQLDdl, SQLDml, SQLDmlExpr, SQLDmlItem, SQLDmlName}
+  alias InfluxElixir.Client.Local.{SQLDmlOperand, SQLError, SQLTokenizer}
 
   @query_body "SELECT, VALUES, or a subquery in the query body"
 
   @typep token :: SQLTokenizer.token()
+
+  # The token that ends a statement: the end of the text, or its `;`.
+  defguardp is_end(kind, upper) when kind == :eof or (kind == :symbol and upper == ";")
+
   @typep source ::
            {:values, [[SQLDmlExpr.cell()]]}
            | {:select, SQLDmlExpr.select()}
@@ -39,29 +47,58 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
            | {:unmodelled, binary()}
            | :default_values
 
+  @typedoc "What the parser reads of an `INSERT`."
+  @type parsed :: %{
+          reference: [binary()],
+          partitioned: boolean(),
+          listed: [{binary(), boolean()}] | nil,
+          source: source(),
+          trailing: [token()]
+        }
+
   @doc """
   The answer to an `INSERT` from the tokens after the keyword and the token that ends it.
   """
   @spec error([token()], token(), SQLDml.env()) :: SQLError.t() | map()
-  def error([{:word, _p, word, _l, _c} | _rest], _stop, _env)
-      when word in ["OVERWRITE", "OR", "IGNORE"],
-      do: SQLDml.not_modelled(:insert, "that spelling")
-
   def error(tokens, stop, env) do
+    with {:ok, parsed} <- parse(tokens, stop),
+         :ok <- SQLDmlName.arity(parsed.reference),
+         :ok <- partitioned(parsed.partitioned),
+         :ok <- default_values(parsed.source),
+         :ok <- returning(parsed.trailing) do
+      planned(parsed.reference, parsed.listed, continued(parsed.source, parsed.trailing), env)
+    else
+      {:error, error} -> error
+      {:refuse, why} -> SQLDml.not_modelled(:insert, why)
+    end
+  end
+
+  @doc """
+  What the parser reads of an `INSERT` from the tokens after the keyword and the token that ends
+  it: its errors are the parser's own, which a statement that is followed by another has before
+  it is planned.
+  """
+  @spec parse([token()], token()) ::
+          {:ok, parsed()} | {:error, SQLError.t() | map()} | {:refuse, binary()}
+  def parse([{:word, _p, word, _l, _c} | _rest], _stop)
+      when word in ["OVERWRITE", "OR", "IGNORE"],
+      do: {:refuse, "that spelling"}
+
+  def parse(tokens, stop) do
     with {:ok, reference, rest} <- SQLDmlName.reference(skip_keywords(tokens)),
          {:ok, partitioned, rest} <- partition(rest ++ [stop]),
          {:ok, listed, rest} <- column_list(rest),
          {:ok, source, trailing} <- source(rest, listed, stop),
          {:ok, trailing} <- SQLDmlExpr.query_suffix(trailing),
-         :ok <- trailing_syntax(trailing),
-         :ok <- SQLDmlName.arity(reference),
-         :ok <- partitioned(partitioned),
-         :ok <- default_values(source),
-         :ok <- returning(trailing) do
-      planned(reference, listed, continued(source, trailing), env)
-    else
-      {:error, error} -> error
-      {:refuse, why} -> SQLDml.not_modelled(:insert, why)
+         :ok <- trailing_syntax(trailing) do
+      {:ok,
+       %{
+         reference: reference,
+         partitioned: partitioned,
+         listed: listed,
+         source: source,
+         trailing: trailing
+       }}
     end
   end
 
@@ -130,9 +167,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   # What the parser says of the text after the table and its column list, and the source.
   @spec source([token()], term(), token()) ::
           {:ok, source(), [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
-  defp source([{kind, _p, upper, _l, _c} = token], _listed, _stop)
-       when kind == :eof or (kind == :symbol and upper == ";"),
-       do: {:error, SQLDdl.expected(@query_body, token)}
+  defp source([{kind, _p, upper, _l, _c} = token], _listed, _stop) when is_end(kind, upper),
+    do: {:error, SQLDdl.expected(@query_body, token)}
 
   defp source([{:word, _p, "VALUES", _l, _c} | rest], _listed, _stop) do
     with {:ok, rows, trailing} <- SQLDmlExpr.rows(rest), do: {:ok, {:values, rows}, trailing}
@@ -237,7 +273,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
 
   defp trailing_syntax([{:word, _p, upper, _l, _c} | _rest]) when upper in @continuing, do: :ok
 
-  defp trailing_syntax([{kind, _p, upper, _l, _c}]) when kind == :eof or upper == ";", do: :ok
+  defp trailing_syntax([{kind, _p, upper, _l, _c}]) when is_end(kind, upper), do: :ok
 
   defp trailing_syntax([token | _rest]),
     do: {:error, SQLDdl.expected("end of statement", token)}
@@ -271,7 +307,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
       [{:word, _p3, "RETURNING", _l3, _c3} | _more] ->
         {:error, SQLError.planning("Insert-returning clause not supported")}
 
-      [{kind, _p3, upper, _l3, _c3}] when kind == :eof or upper == ";" ->
+      [{kind, _p3, upper, _l3, _c3}] when is_end(kind, upper) ->
         {:error, SQLError.planning("Inserts with an alias not supported")}
 
       _other ->
@@ -286,8 +322,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   @spec continued(source(), [token()]) :: source()
   defp continued(source, []), do: source
 
-  defp continued(source, [{kind, _p, upper, _l, _c}]) when kind == :eof or upper == ";",
-    do: source
+  defp continued(source, [{kind, _p, upper, _l, _c}]) when is_end(kind, upper), do: source
 
   defp continued(_source, _trailing),
     do: {:unmodelled, "an insert with a clause after its source"}
@@ -421,7 +456,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   # index zero.
   @spec numbered(SQLDmlExpr.cell()) :: SQLDmlExpr.cell()
   defp numbered({:bare_placeholder, text}) do
-    if Regex.match?(~r/\A\$0+\z/, text), do: {:zero_param, text}, else: :param
+    if Regex.match?(~r/\A\$0+\z/, text), do: {:zero_param, text}, else: {:param, text}
   end
 
   defp numbered(cell), do: cell
@@ -464,10 +499,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   @spec type_cells([[SQLDmlExpr.cell()]], [binary() | nil], SQLDmlOperand.ctx()) ::
           SQLDmlOperand.check()
   defp type_cells(rows, target_types, ctx) do
-    target_types
-    |> Enum.with_index()
-    |> Enum.reduce_while(:ok, fn {target, index}, :ok ->
-      case type_column(Enum.map(rows, &Enum.at(&1, index)), target, ctx) do
+    rows
+    |> Enum.zip_with(& &1)
+    |> Enum.zip(target_types)
+    |> Enum.reduce_while(:ok, fn {cells, target}, :ok ->
+      case type_column(cells, target, ctx) do
         :ok -> {:cont, :ok}
         failure -> {:halt, failure}
       end
@@ -495,9 +531,13 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
           :ok | {:error, map()} | {:refuse, binary()}
   defp plan_select(%{items: items, from: from}, types, env) do
     with {:ok, ctx, columns} <- select_context(from, env),
-         operands = expand(items, columns),
-         :ok <- read_items(items, ctx),
-         :ok <- type_items(operands, ctx),
+         expanded = expand(items, columns),
+         operands = Enum.map(expanded, &elem(&1, 0)),
+         :ok <- read_items(items, ctx, from),
+         :ok <- SQLDmlItem.unique(expanded, ctx),
+         :ok <- project_items(operands, ctx),
+         :ok <- grouped(operands),
+         :ok <- SQLDmlItem.ambiguous(expanded, ctx),
          :ok <- same_count(operands, types) do
       convert_items(operands, types, ctx)
     end
@@ -515,36 +555,96 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
     end
   end
 
-  # The operands a select list stands for: `*` is each column of the table.
-  @spec expand([{:expr, SQLDmlExpr.ast()} | :star], [binary()]) :: [SQLDmlExpr.ast()]
+  # The operands a select list stands for, each with its alias: `*` is each column of the table.
+  @spec expand([{:expr, SQLDmlExpr.ast(), SQLDmlExpr.item_alias()} | :star], [binary()]) ::
+          [{SQLDmlExpr.ast(), SQLDmlExpr.item_alias()}]
   defp expand(items, columns) do
     Enum.flat_map(items, fn
-      {:expr, operand} -> [operand]
-      :star -> Enum.map(columns, &{:ref, [{&1, false}]})
+      {:expr, operand, item_alias} -> [{operand, item_alias}]
+      :star -> Enum.map(columns, &{{:ref, [{&1, false}]}, nil})
     end)
   end
 
-  @spec read_items([{:expr, SQLDmlExpr.ast()} | :star], SQLDmlOperand.ctx()) ::
-          SQLDmlOperand.check()
-  defp read_items(items, ctx) do
-    Enum.reduce_while(items, :ok, fn
-      :star, :ok ->
-        {:cont, :ok}
-
-      {:expr, operand}, :ok ->
-        with :ok <- SQLDmlOperand.eager(operand, ctx), :ok <- SQLDmlOperand.lazy(operand, ctx) do
-          {:cont, :ok}
-        else
-          failure -> {:halt, failure}
-        end
-    end)
+  # The planner reads every item of the list and keeps what it finds wrong in each: the names and
+  # calls of an item, in the order of the item. One item with fault is that fault. Several are
+  # one error of the planner that holds them all, which prints the first and is an internal
+  # error (500) unless each is the planner's own (400).
+  # A list that calls an aggregate and names a column outside of it is a grouping error of the
+  # planner, in words (the grouping of the list, the columns it has) the double does not print:
+  # it is refused once the items have been typed, whose errors it does not hide.
+  @spec grouped([SQLDmlExpr.ast()]) :: SQLDmlOperand.check()
+  defp grouped(operands) do
+    if SQLDmlOperand.ungrouped?(operands),
+      do: {:refuse, "an aggregate beside a column that is outside of one"},
+      else: :ok
   end
 
-  @spec type_items([SQLDmlExpr.ast()], SQLDmlOperand.ctx()) :: SQLDmlOperand.check()
-  defp type_items(operands, ctx) do
+  @spec read_items(
+          [{:expr, SQLDmlExpr.ast(), SQLDmlExpr.item_alias()} | :star],
+          SQLDmlOperand.ctx(),
+          term()
+        ) :: SQLDmlOperand.check()
+  defp read_items(items, ctx, from) do
+    items
+    |> Enum.map(&read_item(&1, ctx, from))
+    |> Enum.reject(&(&1 == :ok))
+    |> together()
+  end
+
+  @spec read_item(
+          {:expr, SQLDmlExpr.ast(), SQLDmlExpr.item_alias()} | :star,
+          SQLDmlOperand.ctx(),
+          term()
+        ) :: SQLDmlOperand.check()
+  defp read_item(:star, _ctx, nil),
+    do: {:error, SQLError.planning("SELECT * with no tables specified is not valid")}
+
+  defp read_item(:star, _ctx, _from), do: :ok
+
+  defp read_item({:expr, operand, _alias}, ctx, _from) do
+    with :ok <- SQLDmlOperand.eager(operand, ctx), do: SQLDmlOperand.lazy(operand, ctx)
+  end
+
+  @spec together([SQLDmlOperand.check()]) :: SQLDmlOperand.check()
+  defp together([]), do: :ok
+  defp together([single]), do: single
+  defp together([{:refuse, _why} = refusal | _more]), do: refusal
+
+  defp together([{:error, first} | more] = failures) do
+    case Enum.find(more, &match?({:refuse, _why}, &1)) do
+      {:refuse, "a function the double does not know"} ->
+        {:error, together_status(first, failures)}
+
+      {:refuse, _why} = refusal ->
+        refusal
+
+      nil ->
+        {:error, together_status(first, failures)}
+    end
+  end
+
+  # The first message, with the status of the planner's own errors (400) only when all are.
+  @spec together_status(map(), [SQLDmlOperand.check()]) :: map()
+  defp together_status(first, failures) do
+    own? = Enum.all?(failures, &planner_error?/1)
+    %{first | status: if(own?, do: 400, else: 500)}
+  end
+
+  defp planner_error?({:error, %{status: 400}}), do: true
+  defp planner_error?({:refuse, "a function the double does not know"}), do: true
+  defp planner_error?(_failure), do: false
+
+  # The planner builds the projection item by item: it types the item, then what the item holds
+  # that typing its top did not reach (what a cast holds, whether a value can be null), before it
+  # counts the items against the columns.
+  @spec project_items([SQLDmlExpr.ast()], SQLDmlOperand.ctx()) :: SQLDmlOperand.check()
+  defp project_items(operands, ctx) do
     Enum.reduce_while(operands, :ok, fn operand, :ok ->
-      case SQLDmlOperand.plan_top(operand, ctx) do
-        :ok -> {:cont, :ok}
+      with :ok <- SQLDmlOperand.plan_top(operand, ctx),
+           :ok <- SQLDmlOperand.deep(operand, ctx),
+           :ok <- SQLDmlOperand.late(operand, ctx) do
+        {:cont, :ok}
+      else
         failure -> {:halt, failure}
       end
     end)

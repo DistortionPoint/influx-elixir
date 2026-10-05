@@ -4084,9 +4084,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
       {"select -true from ~g1",
        {:error, 400,
         "error in InfluxQL statement: parsing error: unexpected unary expression: expected literal integer, float, duration, field, function or parenthesis at pos 12"}},
-      {"select abs(true) from ~g1",
-       {:error, 400,
-        "rewriting statement\ncaused by\ngather information about select statement\ncaused by\nError during planning: field must contain at least one variable"}},
       {"select abs(b) from ~g1",
        {:error, 400,
         "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Boolean No function matches the given name and argument types 'abs(Boolean)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
@@ -4173,10 +4170,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
        {:error, 500, "Schema error: No field named ~g1.time. Valid fields are \"count(~g1.v)\"."}},
       {"select nosuch + max(time) from ~g1", []},
       {"select max(time) + nosuch from ~g1", []},
-      {"select max(time) + nosuch, count(v) from ~g1",
-       {:error, 400,
-        "rewriting statement\ncaused by\ngather information about select statement\ncaused by\nError during planning: mixing aggregate and non-aggregate columns is not supported"}},
-      {"select 1 + 1 from ~g1", []},
       {"select -'a' from ~g1",
        {:error, 400,
         "error in InfluxQL statement: parsing error: unexpected unary expression: expected literal integer, float, duration, field, function or parenthesis at pos 11"}},
@@ -4495,7 +4488,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
       "select mode(time), count(s) from ~g1" =>
         "unsupported InfluxQL (mode() of values equally often there)",
       "select -true from ~g1" => "unsupported select item: -true",
-      "select abs(true) from ~g1" => "unsupported InfluxQL (an expression of constants)",
       "select abs(b) from ~g1" => "unsupported InfluxQL (abs() of a boolean)",
       "select abs(s) from ~g1" => "unsupported InfluxQL (abs() of a string)",
       "select count(distinct(time)) + 1 from ~g1" =>
@@ -4539,12 +4531,9 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
       "select abs(time), count(v) from ~g1" =>
         "unsupported InfluxQL (a function of time beside an aggregate)",
       "select nosuch + max(time) from ~g1" =>
-        "unsupported InfluxQL (an expression of aggregates and fields)",
+        "unsupported InfluxQL (arithmetic on a selector beside columns)",
       "select max(time) + nosuch from ~g1" =>
-        "unsupported InfluxQL (an expression of aggregates and fields)",
-      "select max(time) + nosuch, count(v) from ~g1" =>
-        "unsupported InfluxQL (an expression of aggregates and fields)",
-      "select 1 + 1 from ~g1" => "unsupported InfluxQL (an expression of constants)",
+        "unsupported InfluxQL (arithmetic on a selector beside columns)",
       "select -'a' from ~g1" => "unsupported select item: -'a'",
       "select - -v from ~g1" => "unsupported select item: - -v",
       "select - -1 from ~g1" => "unsupported select item: - -1",
@@ -4619,8 +4608,10 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
         "unsupported InfluxQL (abs() with an empty argument)",
       "select n from ~g1 where abs(1,) = 1" =>
         "unsupported InfluxQL (abs() with an empty argument)",
-      "select n from ~g1 where 'a' + = 'a'" => "unsupported WHERE clause: 'a' +",
-      "select n from ~g1 where s + s + = 'a'" => "unsupported WHERE clause: s + s +",
+      "select n from ~g1 where 'a' + = 'a'" =>
+        "unsupported WHERE clause: 'a' + (the text ends where an operand is expected)",
+      "select n from ~g1 where s + s + = 'a'" =>
+        "unsupported WHERE clause: s + s + (the text ends where an operand is expected)",
       "select mean(()) from ~g1" => "unsupported select item: mean(())",
       "select mean(( )) from ~g1" => "unsupported select item: mean(( ))",
       "select mean((v) from ~g1" => "unsupported select item: mean((v)",

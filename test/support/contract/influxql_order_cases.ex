@@ -1759,6 +1759,14 @@ defmodule InfluxElixir.Contract.InfluxQLOrderCases do
        ]},
       {"select sum(usage)/count(usage) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' limit 1",
        [{"2023-10-01 00:00:00", %{"sum_count" => 8.2}}]},
+      # A group has one row, so `limit 1` keeps every group's row and `offset 1` drops them all
+      # (the twin pair: the same statement answers three rows and none).
+      {"select sum(usage)/count(usage) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by host limit 1",
+       [
+         {"2023-10-01 00:00:00", %{"host" => "a", "sum_count" => 7.75}},
+         {"2023-10-01 00:00:00", %{"host" => "b", "sum_count" => 6.25}},
+         {"2023-10-01 00:00:00", %{"host" => "c", "sum_count" => 10.0}}
+       ]},
       {"select sum(usage)/count(usage) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by host limit 1 offset 1",
        []}
     ]

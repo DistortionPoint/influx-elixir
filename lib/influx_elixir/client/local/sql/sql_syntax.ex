@@ -21,7 +21,16 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # without a verdict and leaves the text to the rest of the double, which
   # answers it or refuses it by name.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLLiteral, SQLStatement, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{
+    SQLDml,
+    SQLDmlType,
+    SQLError,
+    SQLInterval,
+    SQLLiteral,
+    SQLNamedArg,
+    SQLStatement,
+    SQLTokenizer
+  }
 
   @top {__MODULE__, :top}
   @refusal {__MODULE__, :refusal}
@@ -29,6 +38,9 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   @into {__MODULE__, :into}
   @depth {__MODULE__, :depth}
   @set_operation {__MODULE__, :set_operation}
+  @named {__MODULE__, :named}
+  @unknown_call {__MODULE__, :unknown_call}
+  @arrow {__MODULE__, :arrow}
 
   @typep token :: SQLTokenizer.token()
   @typep tokens :: SQLTokenizer.tokens()
@@ -68,14 +80,29 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   @logical_words ~w(AND OR XOR)
   @bound_operators ~w(+ - * / % ||)
   @table_function {__MODULE__, :table_function}
-  @flags [@table_function, @top, @refusal, @planner, @into, @depth, @set_operation]
+  @several {__MODULE__, :several}
+  @flags [
+    @several,
+    @table_function,
+    @top,
+    @refusal,
+    @planner,
+    @into,
+    @depth,
+    @set_operation,
+    @named,
+    @unknown_call,
+    @arrow
+  ]
 
   @doc """
   `:ok` when the text reads as a statement (or this grammar cannot say), else
   the engine's parser error.
   """
-  @spec check(binary()) :: :ok | {:error, SQLError.t()}
-  def check(sql) do
+  @spec check(binary(), boolean()) :: :ok | {:error, SQLError.t()}
+  def check(sql, several? \\ false) do
+    Process.put(@several, several?)
+
     case SQLTokenizer.tokenize(sql) do
       {:ok, tokens} -> tokens |> read() |> flagged(tokens)
       :bail -> :ok
@@ -91,13 +118,13 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   """
   @spec check_statements(binary()) :: :ok | {:error, SQLError.t()}
   def check_statements(sql) do
-    sql
-    |> SQLTokenizer.split()
-    |> Enum.reduce_while(:ok, fn {offset, piece}, :ok ->
+    pieces = SQLTokenizer.split(sql)
+
+    Enum.reduce_while(pieces, :ok, fn {offset, piece}, :ok ->
       positioned = SQLTokenizer.blank(binary_part(sql, 0, offset)) <> piece
 
       case first_token_error(positioned) do
-        nil -> verdict(check(positioned))
+        nil -> verdict(check(positioned, match?([_one, _two | _more], pieces)))
         error -> {:halt, {:error, error}}
       end
     end)
@@ -146,6 +173,12 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
       reason = Process.get(@refusal) ->
         {:error, SQLError.refusal(reason)}
 
+      named = Process.get(@named) ->
+        {:error, named_verdict(named, tokens)}
+
+      message = Process.get(@arrow) ->
+        {:error, arrow_verdict(message, tokens)}
+
       Process.get(@table_function) ->
         {:error, SQLError.refusal("a table function in FROM: the engine has none")}
 
@@ -161,6 +194,36 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   end
 
   defp flagged(error, _tokens), do: error
+
+  # A call with a named argument is the planner's error for the function, whatever its
+  # arguments hold: the double answers it for a text that names no table and no column,
+  # where nothing else can come before it.
+  # An interval literal that overflows is an error of the engine's parser of intervals, found
+  # as the planner reads the literal: the double answers it for a text that names no table and no
+  # column, where nothing else can come before it.
+  @spec arrow_verdict(binary(), tokens()) :: map()
+  defp arrow_verdict(message, tokens) do
+    if constant?(tokens, true),
+      do: %{status: 500, body: "Arrow error: " <> message},
+      else:
+        SQLError.refusal(
+          "an INTERVAL that does not fit, in a text that names columns or tables: which " <>
+            "error the engine gives first depends on the clause"
+        )
+  end
+
+  @spec named_verdict({token(), binary() | nil}, tokens()) :: SQLError.t()
+  defp named_verdict({_name, unknown}, _tokens) when is_binary(unknown),
+    do: SQLNamedArg.unknown_before(unknown)
+
+  defp named_verdict({{:word, printed, _upper, _l, _c}, nil}, tokens) do
+    if constant?(tokens, true),
+      do: SQLNamedArg.error(printed),
+      else: SQLNamedArg.with_names()
+  end
+
+  defp named_verdict({{_kind, printed, _upper, _l, _c}, nil}, _tokens),
+    do: SQLNamedArg.unknown_before(printed)
 
   # The planner's refusal of a construct the parser read. It comes after the planner has
   # found the tables and columns of the text, so it is the engine's answer only where the
@@ -179,16 +242,24 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   # Whether the text names no table, column or function: its words are the statement's own
   # (or follow `AS`, which names an item whatever the word is).
-  @spec constant?(tokens()) :: boolean()
-  defp constant?(tokens) do
+  @spec constant?(tokens(), boolean()) :: boolean()
+  defp constant?(tokens, calls? \\ false) do
     tokens
     |> Enum.zip([nil | tokens])
     |> Enum.zip(Enum.drop(tokens, 1) ++ [nil])
     |> Enum.zip(Enum.drop(tokens, 2) ++ [nil, nil])
     |> Enum.all?(fn {{{token, previous}, next}, after_next} ->
-      constant_token?(token, previous, {next, after_next})
+      constant_token?(token, previous, {next, after_next}) or
+        (calls? and called_or_named?(token, next))
     end)
   end
+
+  # A function's name, or the name of an argument, is no table or column.
+  @spec called_or_named?(token(), token() | nil) :: boolean()
+  defp called_or_named?({:word, _printed, _upper, _line, _col}, next),
+    do: match?({:symbol, "(", _u, _l, _c}, next) or match?({:symbol, "=>", _u, _l, _c}, next)
+
+  defp called_or_named?(_token, _next), do: false
 
   # A word after `AS` or `TABLE` is named by the statement, and so is the name of a common
   # table (`name AS (`) and the keyword `WITH` that starts them.
@@ -233,7 +304,22 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp statement([{:symbol, _printed, "(", _line, _col} | _rest] = tokens),
     do: read_query(tokens)
 
-  defp statement([{:word, _p, "DELETE", _l, _c}, {:word, _q, "FROM", _l2, _c2} | rest]) do
+  # A statement that changes data is read whole by the DML reader, which has the parser's error
+  # for it: where the text holds several statements (the parser reads each whole, the first with
+  # an error is the answer) the reader is asked here; a statement alone is read by the reader when
+  # it is planned. The checks below only add what that reader does not say.
+  defp statement([{:word, _p, word, _l, _c} | _rest] = tokens)
+       when word in ["INSERT", "UPDATE", "DELETE"] do
+    case Process.get(@several, false) && SQLDml.parse_error(tokens) do
+      error when error in [nil, false] -> dml_statement(tokens)
+      error -> {:error, error}
+    end
+  end
+
+  defp statement(_tokens), do: :ok
+
+  @spec dml_statement(tokens()) :: :ok | {:error, SQLError.t()}
+  defp dml_statement([{:word, _p, "DELETE", _l, _c}, {:word, _q, "FROM", _l2, _c2} | rest]) do
     rest |> delete_target() |> delete_where()
     :ok
   catch
@@ -241,7 +327,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     :bail -> :ok
   end
 
-  defp statement([{:word, _p, "INSERT", _l, _c}, {:word, _q, "INTO", _l2, _c2} | rest]) do
+  defp dml_statement([{:word, _p, "INSERT", _l, _c}, {:word, _q, "INTO", _l2, _c2} | rest]) do
     rest |> object_name() |> insert_source()
     :ok
   catch
@@ -249,7 +335,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   end
 
   # `UPDATE t SET` wants the column it assigns: a `;` or the end of the text is not one.
-  defp statement([{:word, _p, "UPDATE", _l, _c} | rest]) do
+  defp dml_statement([{:word, _p, "UPDATE", _l, _c} | rest]) do
     case object_name(rest) do
       [{:word, _q, "SET", _l2, _c2}, {kind, _r, _u, _l3, _c3} = token | _more]
       when kind == :eof or (kind == :symbol and elem(token, 1) == ";") ->
@@ -262,7 +348,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     {:syntax, expected, token} -> {:error, parser_error(expected, token)}
   end
 
-  defp statement(_tokens), do: :ok
+  defp dml_statement(_tokens), do: :ok
 
   # What an `INSERT` inserts is a query: with the text ended there is none to read. (What
   # follows otherwise is read by the DML reader, with the rest of the statement.)
@@ -348,7 +434,24 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     end
   end
 
-  defp with_clause([{:word, _p, "WITH", _l, _c} | rest]), do: common_tables(rest)
+  # The engine reads an `INSERT`, `UPDATE` or `DELETE` after a `WITH` as the body of the query and
+  # answers that it is not implemented, printing the statement as it parsed it (verified), which
+  # the double does not.
+  defp with_clause([{:word, _p, "WITH", _l, _c} | rest]) do
+    case common_tables(rest) do
+      [{:word, _q, word, _l2, _c2} | _more] when word in ["INSERT", "UPDATE", "DELETE"] ->
+        refuse(
+          "#{word} after a WITH clause: the engine's error for it prints the statement as it " <>
+            "parsed it"
+        )
+
+        throw(:bail)
+
+      tokens ->
+        tokens
+    end
+  end
+
   defp with_clause(tokens), do: tokens
 
   defp common_tables([
@@ -603,7 +706,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
       # `FROM name(...)` calls a table function, which the engine does not have.
       [{:symbol, _p, "(", _l, _c} | args] ->
         Process.put(@table_function, true)
-        args |> call_arguments() |> table_alias()
+        args |> call_arguments(nil) |> table_alias()
 
       after_name ->
         table_alias(after_name)
@@ -927,19 +1030,31 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp cast_expression(tokens), do: identifier(tokens)
 
-  @type_words ~w(PRECISION WITH WITHOUT TIME ZONE VARYING UNSIGNED SIGNED)
-
-  defp data_type([{:word, _p, _u, _l, _c} | rest]), do: rest |> type_words() |> type_arguments()
+  # The type of a cast, read by the one grammar of types (`SQLDmlType`): a name, its size, the
+  # words that go with it, the array suffixes. A type it cannot read is the engine's parser
+  # error at the token; one it reads and the double does not is refused by name.
+  defp data_type([{:word, _p, _u, _l, _c} | _rest] = tokens), do: type_name(tokens)
   defp data_type(tokens), do: fail("a data type name", tokens)
 
-  defp type_words([{:word, _p, word, _l, _c} | rest]) when word in @type_words,
-    do: type_words(rest)
+  defp type_name(tokens) do
+    case SQLDmlType.parse(tokens) do
+      {:ok, _type, rest} ->
+        rest
 
-  defp type_words(tokens), do: tokens
+      {:error, error} ->
+        throw({:fail, error})
+
+      {:refuse, reason} ->
+        refuse("a cast to #{reason}")
+        throw(:bail)
+    end
+  end
 
   # `INTERVAL '1 minute'` and `INTERVAL '1' minute`. The engine's planner reads no `TO`
   # field and no precision (405); an interval of any other expression is not read here.
-  defp interval([_interval, {kind, _p, _u, _l, _c} | rest]) when kind in [:string, :number] do
+  defp interval([_interval, {kind, printed, _u, _l, _c} | rest])
+       when kind in [:string, :number] do
+    interval_overflow(kind, printed, rest)
     {unit_end, precision} = rest |> interval_unit() |> interval_precision()
 
     case interval_to(unit_end) do
@@ -957,6 +1072,24 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     _read = operand(rest)
     refuse("an INTERVAL of an expression that is not a string or a number")
     throw(:bail)
+  end
+
+  # An interval literal that does not fit one is the engine's error as the literal is read.
+  defp interval_overflow(kind, printed, rest) do
+    text = if kind == :string, do: String.slice(printed, 1..-2//1), else: printed
+
+    unit =
+      case rest do
+        [{:word, _q, unit, _l, _c} | _more] when unit in @interval_units -> unit
+        _no_unit -> nil
+      end
+
+    with message when is_binary(message) <- SQLInterval.overflow(text, unit),
+         true <- is_nil(Process.get(@arrow)) do
+      Process.put(@arrow, message)
+    end
+
+    :ok
   end
 
   defp interval_unit([{:word, _q, unit, _l, _c} | more]) when unit in @interval_units, do: more
@@ -1030,12 +1163,27 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp skip_to_close([_token | rest], depth), do: skip_to_close(rest, depth)
 
   # A name, a name with qualifiers, or a call.
-  defp identifier([_name | rest]) do
+  defp identifier([name | rest]) do
     case qualified(rest) do
-      [{:symbol, _p, "(", _l, _c} | args] -> args |> call_arguments() |> after_call()
-      after_name -> after_name
+      [{:symbol, _p, "(", _l, _c} | args] ->
+        called(name)
+        args |> call_arguments(name) |> after_call()
+
+      after_name ->
+        after_name
     end
   end
+
+  # A function the double does not know, called before any named argument, is noted: the
+  # engine's error for it may come first.
+  defp called({:word, printed, _upper, _l, _c}) do
+    if is_nil(Process.get(@named)) and not SQLNamedArg.known?(printed),
+      do: Process.put(@unknown_call, Process.get(@unknown_call) || printed)
+
+    :ok
+  end
+
+  defp called(_name), do: :ok
 
   defp qualified([{:symbol, _p, ".", _l, _c}, {kind, _q, _u, _l2, _c2} | rest])
        when kind in [:word, :quoted],
@@ -1046,26 +1194,47 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp qualified(tokens), do: tokens
 
-  defp call_arguments([{:symbol, _p, ")", _l, _c} | rest]), do: rest
+  defp call_arguments([{:symbol, _p, ")", _l, _c} | rest], _name), do: rest
 
-  defp call_arguments([{:word, _p, quantifier, _l, _c} | rest])
+  defp call_arguments([{:word, _p, quantifier, _l, _c} | rest], name)
        when quantifier in ["DISTINCT", "ALL"],
-       do: argument_list(rest)
+       do: argument_list(rest, name)
 
-  defp call_arguments(tokens), do: argument_list(tokens)
+  defp call_arguments(tokens, name), do: argument_list(tokens, name)
 
-  defp argument_list(tokens) do
-    case tokens |> argument() |> argument_order() do
-      [{:symbol, _p, ",", _l, _c} | rest] -> argument_list(rest)
+  defp argument_list(tokens, name) do
+    case tokens |> argument(name) |> argument_order() do
+      [{:symbol, _p, ",", _l, _c} | rest] -> argument_list(rest, name)
       [{:symbol, _p, ")", _l, _c} | rest] -> rest
       [{:word, _p, word, _l, _c} | _rest] when word in ["IGNORE", "RESPECT", "ON"] -> throw(:bail)
       other -> fail(")", other)
     end
   end
 
-  # An argument is an expression, or the `*` of `count(*)`.
-  defp argument([{:symbol, _p, "*", _l, _c} | rest]), do: rest
-  defp argument(tokens), do: expression(tokens)
+  # An argument is an expression, the `*` of `count(*)`, or `name => expression`. The parser
+  # tries the named form first and, when what follows the arrow does not read, goes back and
+  # reads the name as an expression, so the error is at the arrow (`abs(x => )`).
+  defp argument([{:symbol, _p, "*", _l, _c} | rest], _name), do: rest
+
+  defp argument([{kind, _p, _u, _l, _c}, {:symbol, _q, "=>", _l2, _c2} | value] = tokens, name)
+       when kind in [:word, :quoted, :string] do
+    named(name)
+
+    try do
+      expression(value)
+    catch
+      {:syntax, _expected, _token} -> fail(")", tl(tokens))
+    end
+  end
+
+  defp argument(tokens, _name), do: expression(tokens)
+
+  defp named(nil), do: :ok
+
+  defp named(name) do
+    if is_nil(Process.get(@named)), do: Process.put(@named, {name, Process.get(@unknown_call)})
+    :ok
+  end
 
   # `first_value(x ORDER BY t)`.
   defp argument_order([{:word, _p, "ORDER", _l, _c}, {:word, _q, "BY", _l2, _c2} | rest]),
@@ -1127,8 +1296,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp infix_step([{:symbol, _p, symbol, _l, _c} | rest]) when symbol in @operators,
     do: operand_after_operator(rest)
 
-  defp infix_step([{:symbol, _p, "::", _l, _c}, {:word, _q, _u, _l2, _c2} | rest]),
-    do: type_arguments(rest)
+  defp infix_step([{:symbol, _p, "::", _l, _c}, {:word, _q, _u, _l2, _c2} | _rest] = tokens),
+    do: type_name(tl(tokens))
 
   defp infix_step([{:symbol, _p, symbol, _l, _c} | _rest])
        when symbol in ["::", "[", "->", ":", "("],
@@ -1175,10 +1344,6 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
        do: throw(:bail)
 
   defp infix_step(tokens), do: tokens
-
-  # The arguments of a type (`DECIMAL(10, 2)`), if it has any.
-  defp type_arguments([{:symbol, _p, "(", _l, _c} | rest]), do: skip_to_close(rest)
-  defp type_arguments(tokens), do: tokens
 
   defp operand_after_operator([{:word, _p, word, _l, _c}, {:symbol, _q, "(", _l2, _c2} | _rest])
        when word in ["ANY", "ALL", "SOME"],
@@ -1246,8 +1411,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     do: rest |> operand() |> before_and()
 
   # A cast of the low bound (`BETWEEN 1::bigint AND 3`).
-  defp before_and([{:symbol, _p, "::", _l, _c}, {:word, _q, _u, _l2, _c2} | rest]),
-    do: rest |> type_arguments() |> before_and()
+  defp before_and([{:symbol, _p, "::", _l, _c}, {:word, _q, _u, _l2, _c2} | _rest] = tokens),
+    do: tokens |> tl() |> type_name() |> before_and()
 
   defp before_and(tokens), do: tokens
 end

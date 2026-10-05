@@ -590,7 +590,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   defp answer_with_stats(pid, body, status) do
     assert_receive {:request, handler, ^body}, @await
     reader = Task.async(fn -> BatchWriter.stats(pid) end)
-    Await.until(fn -> queued_calls(pid, :stats) == 1 end)
+    Await.until(fn -> queued_calls(pid, :stats) === 1 end)
     TestServer.respond(handler, status)
     Task.await(reader, @await)
   end
@@ -720,7 +720,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       # Queued behind the held attempt, so it is the writer's next message.
       second = Task.async(fn -> BatchWriter.write(pid, "cpu value=2.0") end)
-      Await.until(fn -> queued_calls(pid, :write) == 1 end)
+      Await.until(fn -> queued_calls(pid, :write) === 1 end)
 
       TestServer.respond(held, 503)
       assert :ok = Task.await(first, @await)
@@ -776,7 +776,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       # first, chain 1 ends on a 400 and chain 2 on a 204.
       for _request <- 1..2 do
         assert_receive {:request, handler, body}, @await
-        TestServer.respond(handler, if(body == "cpu value=1.0", do: 400, else: 204))
+        TestServer.respond(handler, if(body === "cpu value=1.0", do: 400, else: 204))
       end
 
       assert {:error, %{status: 400}} = Task.await(one, @await)
@@ -803,9 +803,9 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert_receive {:request, held, "cpu value=1.0"}, @await
 
       second = Task.async(fn -> BatchWriter.write(pid, "cpu value=2.0") end)
-      Await.until(fn -> queued_calls(pid, :write) == 1 end)
+      Await.until(fn -> queued_calls(pid, :write) === 1 end)
       flush = Task.async(fn -> BatchWriter.flush(pid) end)
-      Await.until(fn -> queued_calls(pid, :flush) == 1 end)
+      Await.until(fn -> queued_calls(pid, :flush) === 1 end)
 
       TestServer.respond(held, 503)
       assert :ok = Task.await(first, @await)
@@ -822,7 +822,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       writes =
         for i <- 1..11 do
           task = Task.async(fn -> BatchWriter.write(pid, "cpu value=#{i}.5") end)
-          Await.until(fn -> queued_calls(pid, :write) == i end)
+          Await.until(fn -> queued_calls(pid, :write) === i end)
           task
         end
 

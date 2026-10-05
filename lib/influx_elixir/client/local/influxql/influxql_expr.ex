@@ -78,12 +78,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   @doc """
   Reads the text of a select item as an expression (without its alias):
-  `{:ok, ast}`, `{:wild, name, arguments, target}` for a call with `*` or a
+  `{:ok, ast}`, `{:paren_constant, ast}` for one with a constant alone in a group (the
+  engine's planning error, found once the operands are typed), `{:wild, name, arguments,
+  target}` for a call with `*` or a
   regular expression for its field (`mean(*)`, `percentile(/re/, 90)`), or
   `:error` for what is not an expression the double reads.
   """
   @spec parse(binary()) ::
           {:ok, ast()}
+          | {:paren_constant, ast()}
           | {:wild, binary(), [ast()], term()}
           | {:multi, binary(), binary(), [binary()], pos_integer()}
           | {:planning, binary()}
@@ -94,7 +97,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     with {:ok, tokens} <- tokenize(text, []),
          {:ok, ast, []} <- sum(tokens),
          {:ok, classified} <- classify(ast) do
-      {:ok, classified}
+      if paren_constant?(ast), do: {:paren_constant, classified}, else: {:ok, classified}
     else
       {:wild, _name, _arguments, _target} = wild -> wild
       {:multi, _kind, _field, _tags, _limit} = multi -> multi
@@ -254,7 +257,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp arguments(tokens, acc, keep?) do
     with {:ok, argument, rest} <- sum(tokens) do
-      argument = if acc == [] or keep?, do: argument, else: unparen(argument)
+      argument = if acc == [] or keep?, do: argument, else: unparen_group(argument)
 
       case rest do
         [{:op, ","} | more] -> arguments(more, [argument | acc], keep?)
@@ -269,6 +272,33 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # error (see `argument_error/4`), for the others a group means nothing.
   defp unparen({:paren, inner}), do: unparen(inner)
   defp unparen(other), do: other
+
+  # A group around a constant stays (`pow(n, (2))`): it is the planning error of
+  # `paren_constant?/1`; any other group means nothing.
+  defp unparen_group({:paren, _inner} = group),
+    do:
+      if(match?({kind, _value} when kind in [:lit, :dur], unparen(group)),
+        do: group,
+        else: unparen(group)
+      )
+
+  defp unparen_group(other), do: other
+
+  # Whether a constant stands alone in a group anywhere in an expression as it was read
+  # (`n * (3)`, `-(3)`, `(1 + 2) * (3)`): the engine's planner takes the group for a node it
+  # cannot find a variable in, and words "field must contain at least one variable" for the
+  # whole field (verified), whatever else the field holds.
+  @spec paren_constant?(term()) :: boolean()
+  defp paren_constant?({:paren, inner}),
+    do: match?({:lit, _number}, unparen(inner)) or paren_constant?(inner)
+
+  defp paren_constant?({:neg, operand}), do: paren_constant?(operand)
+
+  defp paren_constant?({:bin, _op, left, right}),
+    do: paren_constant?(left) or paren_constant?(right)
+
+  defp paren_constant?({:call, _name, arguments}), do: Enum.any?(arguments, &paren_constant?/1)
+  defp paren_constant?(_other), do: false
 
   defp cast_type("float"), do: :float
   defp cast_type("integer"), do: :integer
@@ -687,6 +717,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   def refs({:transform, _name, inner, _parameter}), do: refs(inner)
   def refs(_other), do: []
 
+  @doc "Whether a string or a boolean stands anywhere in an expression."
+  @spec text_literal?(ast()) :: boolean()
+  def text_literal?({:bool, _value}), do: true
+  def text_literal?({:str, _content}), do: true
+  def text_literal?({:neg, operand}), do: text_literal?(operand)
+  def text_literal?({:bin, _op, left, right}), do: text_literal?(left) or text_literal?(right)
+  def text_literal?({:fn, _name, arguments}), do: Enum.any?(arguments, &text_literal?/1)
+  def text_literal?(_other), do: false
+
   @doc "Whether an expression divides (`/`) anywhere in it."
   @spec divides?(ast()) :: boolean()
   def divides?({:bin, "/", _left, _right}), do: true
@@ -868,8 +907,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp infer({:agg, fun, "time"}, _types, _tags) when fun in ~w(min max first last mode),
     do: {:ok, {:timestamp, false}}
 
-  defp infer({:agg, fun, arg}, types, _tags) do
-    {:ok, {aggregate_type(fun, Map.get(types, arg)), false}}
+  # A tag keeps its type through the aggregates that return a value of the column; the others
+  # (`count`, `mean`, `median`, `stddev`) come to numbers (verified).
+  defp infer({:agg, fun, arg}, types, tags) do
+    if not Map.has_key?(types, arg) and MapSet.member?(tags, arg) and
+         (fun in ~w(first last min max mode sum spread) or String.starts_with?(fun, "percentile:")),
+       do: {:ok, {:tag, false}},
+       else: {:ok, {aggregate_type(fun, Map.get(types, arg)), false}}
   end
 
   defp infer({:fn, name, arguments}, types, tags) do
@@ -915,6 +959,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp aggregate_type(fun, _type) when fun in ["count"], do: :integer
   defp aggregate_type(fun, _type) when fun in ["mean", "stddev"], do: :float
+  defp aggregate_type("median", type) when type in [:string, :boolean], do: :float
   defp aggregate_type(_fun, nil), do: :unknown
   defp aggregate_type(_fun, type), do: type
 

@@ -13,8 +13,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     InfluxQLNames,
     InfluxQLProjection,
     InfluxQLRegex,
-    InfluxQLTransform
+    InfluxQLTransform,
+    SQLLimits
   }
+
+  require SQLLimits
 
   @epoch DateTime.from_unix!(0, :microsecond)
 
@@ -61,8 +64,65 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       |> series(context, key)
       |> window(context)
       |> Enum.map(&Map.delete(&1, :null_quotients))
+      |> fill_numbers(context)
     end)
   end
+
+  # `fill(number)` of a plain select, grouped by tags or not: a number column (a field, or
+  # an expression that comes to one) that a row the answer holds lacks takes the number,
+  # cast to the column's type, and a text or boolean column stays null, as does a value that an
+  # expression computed to null (`sqrt` of a negative) (verified). The rows
+  # are those the windows of `LIMIT` and `OFFSET` kept, so the fill never changes which rows
+  # are answered.
+  @spec fill_numbers([map()], map()) :: [map()]
+  defp fill_numbers(rows, %{query: %{fill: {:number, number}} = query} = context) do
+    if Enum.any?(query.items, &(aggregate_item?(&1) or raw_transform_item?(&1))),
+      do: rows,
+      else: Enum.map(rows, &fill_row(&1, filled_columns(context, number)))
+  end
+
+  defp fill_numbers(rows, _context), do: rows
+
+  defp fill_row(row, columns) do
+    Enum.reduce(columns, row, fn {name, value}, row -> Map.put_new(row, name, value) end)
+  end
+
+  # The number columns of the projection with the value each takes, by name.
+  @spec filled_columns(map(), number()) :: [{binary(), number()}]
+  defp filled_columns(%{plan: plan, types: types, tags: tags}, number) do
+    for %{role: :field, kind: kind, name: name} = entry <- plan.entries,
+        kind in [:column, :star, :expr],
+        type = column_type(entry, plan, types, tags),
+        type in [:float, :integer, :unsigned],
+        do: {name, cast_fill(number, type)}
+  end
+
+  defp column_type(%{kind: :expr, item: index}, plan, types, tags) do
+    case Enum.at(plan.items, index) do
+      {:expr, ast, _name} -> InfluxQLExpr.result_type(ast, types, tags)
+      _other -> nil
+    end
+  end
+
+  defp column_type(%{source: source}, _plan, types, _tags), do: Map.get(types, source)
+
+  # The number as a value of the column's type: an integer is itself in an integer column,
+  # wraps (two's complement) into an unsigned one and is a float in a float one; a float is
+  # cut toward zero and saturates at the range of an integer column.
+  @spec cast_fill(number(), :float | :integer | :unsigned) :: number()
+  defp cast_fill(number, :float), do: number * 1.0
+  defp cast_fill(number, :integer) when is_integer(number), do: number
+
+  defp cast_fill(number, :integer),
+    do: number |> trunc() |> min(SQLLimits.int64_max()) |> max(-SQLLimits.int64_max() - 1)
+
+  defp cast_fill(number, :unsigned) when is_integer(number) and number < 0,
+    do: number + SQLLimits.uint64_max() + 1
+
+  defp cast_fill(number, :unsigned) when is_integer(number), do: number
+
+  defp cast_fill(number, :unsigned),
+    do: number |> trunc() |> min(SQLLimits.uint64_max()) |> max(0)
 
   # The rows of arithmetic or a transform of aggregates are stamped `time`; the engine names the
   # time column by its alias (`difference(mean(v)), time AS t`).

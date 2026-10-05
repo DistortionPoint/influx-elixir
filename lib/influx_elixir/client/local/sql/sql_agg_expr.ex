@@ -92,7 +92,7 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
   defp read(text, item) do
     case SQLExpr.parse(text) do
       {:ok, expr} -> {:ok, expr}
-      {:error, _reason} -> {:error, SQLError.refusal("unsupported column expression: #{item}")}
+      {:error, _reason} -> {:error, SQLExpr.refusal("column expression", item, text)}
     end
   end
 
@@ -182,9 +182,9 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
 
       [_full, text] ->
         with {:ok, replaced, aggs} <- replace_aggregates(text, qualifier),
-             {:ok, nodes} <- SQLWhere.nodes("WHERE " <> replaced),
+             {:ok, nodes, tree} <- SQLWhere.parsed("WHERE " <> replaced),
              :ok <- check_having(nodes, aggs, groups, select_columns, text) do
-          {:ok, %{nodes: nodes, tree: SQLWhere.tree("WHERE " <> replaced), aggs: aggs}}
+          {:ok, %{nodes: nodes, tree: tree, aggs: aggs}}
         end
     end
   end

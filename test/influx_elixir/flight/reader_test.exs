@@ -109,7 +109,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
   # Pad a binary to 4-byte alignment with null bytes.
   defp pad4(bin) do
     r = rem(byte_size(bin), 4)
-    if r == 0, do: bin, else: bin <> :binary.copy(<<0>>, 4 - r)
+    if r === 0, do: bin, else: bin <> :binary.copy(<<0>>, 4 - r)
   end
 
   # Build a self-contained field blob.
@@ -547,7 +547,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       end
 
     rem_bytes = rem(bitmap_bytes, alignment)
-    pad = if rem_bytes == 0, do: 0, else: alignment - rem_bytes
+    pad = if rem_bytes === 0, do: 0, else: alignment - rem_bytes
     prefix = bitmap <> :binary.copy(<<0>>, pad)
     prefix_size = byte_size(prefix)
 
@@ -614,32 +614,32 @@ defmodule InfluxElixir.Flight.ReaderTest do
     test "extracts column name from Int64 schema" do
       header = schema_msg([{"value", 2, [bit_width: 64, is_signed: true]}])
       {:ok, cols} = Reader.parse_schema(header)
-      assert length(cols) == 1
-      assert hd(cols).name == "value"
+      assert length(cols) === 1
+      assert hd(cols).name === "value"
     end
 
     test "maps Int64 (bitWidth=64, signed) to type_id 6" do
       header = schema_msg([{"value", 2, [bit_width: 64, is_signed: true]}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 6
+      assert col.type_id === 6
     end
 
     test "maps Int32 (bitWidth=32, signed) to type_id 4" do
       header = schema_msg([{"count", 2, [bit_width: 32, is_signed: true]}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 4
+      assert col.type_id === 4
     end
 
     test "maps Int16 (bitWidth=16, signed) to type_id 3" do
       header = schema_msg([{"small", 2, [bit_width: 16, is_signed: true]}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 3
+      assert col.type_id === 3
     end
 
     test "maps Int8 (bitWidth=8, signed) to type_id 2" do
       header = schema_msg([{"tiny", 2, [bit_width: 8, is_signed: true]}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 2
+      assert col.type_id === 2
     end
   end
 
@@ -651,25 +651,25 @@ defmodule InfluxElixir.Flight.ReaderTest do
     test "maps UInt64 (bitWidth=64, unsigned) to type_id 10" do
       header = schema_msg([{"u64", 2, [bit_width: 64, is_signed: false]}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 10
+      assert col.type_id === 10
     end
 
     test "maps UInt32 (bitWidth=32, unsigned) to type_id 9" do
       header = schema_msg([{"u32", 2, [bit_width: 32, is_signed: false]}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 9
+      assert col.type_id === 9
     end
 
     test "maps UInt16 (bitWidth=16, unsigned) to type_id 8" do
       header = schema_msg([{"u16", 2, [bit_width: 16, is_signed: false]}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 8
+      assert col.type_id === 8
     end
 
     test "maps UInt8 (bitWidth=8, unsigned) to type_id 7" do
       header = schema_msg([{"u8", 2, [bit_width: 8, is_signed: false]}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 7
+      assert col.type_id === 7
     end
   end
 
@@ -681,19 +681,19 @@ defmodule InfluxElixir.Flight.ReaderTest do
     test "maps Float64 (precision=2) to type_id 12" do
       header = schema_msg([{"temp", 3, [precision: 2]}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 12
+      assert col.type_id === 12
     end
 
     test "maps Float32 (precision=1) to type_id 11" do
       header = schema_msg([{"reading", 3, [precision: 1]}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 11
+      assert col.type_id === 11
     end
 
     test "defaults to Float64 when precision not specified" do
       header = schema_msg([{"f", 3, []}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 12
+      assert col.type_id === 12
     end
   end
 
@@ -705,19 +705,19 @@ defmodule InfluxElixir.Flight.ReaderTest do
     test "maps Bool (type_type=6) to type_id 14" do
       header = schema_msg([{"active", 6, []}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 14
+      assert col.type_id === 14
     end
 
     test "maps Utf8 (type_type=5) to type_id 15" do
       header = schema_msg([{"host", 5, []}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 15
+      assert col.type_id === 15
     end
 
     test "maps Timestamp (type_type=10) to type_id 20" do
       header = schema_msg([{"time", 10, []}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id == 20
+      assert col.type_id === 20
     end
   end
 
@@ -734,7 +734,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
         ])
 
       {:ok, cols} = Reader.parse_schema(header)
-      assert length(cols) == 2
+      assert length(cols) === 2
       names = Enum.map(cols, & &1.name)
       assert "time" in names
       assert "value" in names
@@ -749,10 +749,10 @@ defmodule InfluxElixir.Flight.ReaderTest do
         ])
 
       {:ok, cols} = Reader.parse_schema(header)
-      assert length(cols) == 3
-      assert Enum.at(cols, 0).name == "time"
-      assert Enum.at(cols, 1).name == "host"
-      assert Enum.at(cols, 2).name == "cpu"
+      assert length(cols) === 3
+      assert Enum.at(cols, 0).name === "time"
+      assert Enum.at(cols, 1).name === "host"
+      assert Enum.at(cols, 2).name === "cpu"
     end
 
     test "assigns correct type_ids to a mixed-type schema" do
@@ -765,9 +765,9 @@ defmodule InfluxElixir.Flight.ReaderTest do
         ])
 
       {:ok, cols} = Reader.parse_schema(header)
-      assert length(cols) == 4
+      assert length(cols) === 4
       # Timestamp=20, Utf8=15, Float64=12, Bool=14
-      assert Enum.map(cols, & &1.type_id) == [20, 15, 12, 14]
+      assert Enum.map(cols, & &1.type_id) === [20, 15, 12, 14]
     end
 
     test "each column map has name and type_id keys" do
@@ -789,7 +789,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 3)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) == 3
+      assert length(rows) === 3
       assert Enum.at(rows, 0)["value"] === 10
       assert Enum.at(rows, 1)["value"] === 20
       assert Enum.at(rows, 2)["value"] === 30
@@ -827,7 +827,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 3)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) == 3
+      assert length(rows) === 3
       assert_in_delta Enum.at(rows, 0)["temp"], 1.5, 1.0e-9
       assert_in_delta Enum.at(rows, 1)["temp"], 2.5, 1.0e-9
       assert_in_delta Enum.at(rows, 2)["temp"], 3.14, 1.0e-9
@@ -854,7 +854,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 3)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) == 3
+      assert length(rows) === 3
       assert Enum.at(rows, 0)["flag"] === true
       assert Enum.at(rows, 1)["flag"] === false
       assert Enum.at(rows, 2)["flag"] === true
@@ -881,7 +881,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) == 2
+      assert length(rows) === 2
       assert Enum.at(rows, 0)["host"] === "server01"
       assert Enum.at(rows, 1)["host"] === "server02"
     end
@@ -953,7 +953,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, all_specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) == 2
+      assert length(rows) === 2
       assert Enum.at(rows, 0)["count"] === 1
       assert Enum.at(rows, 1)["count"] === 2
       assert_in_delta Enum.at(rows, 0)["value"], 0.1, 1.0e-9
@@ -989,7 +989,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch2 = batch_fd(body2, specs2, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch1, batch2])
-      assert length(rows) == 4
+      assert length(rows) === 4
       assert Enum.map(rows, fn r -> r["v"] end) === [1, 2, 3, 4]
     end
 
@@ -1003,7 +1003,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
         end)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema | batches])
-      assert length(rows) == 5
+      assert length(rows) === 5
       assert Enum.map(rows, fn r -> r["n"] end) === [1, 2, 3, 4, 5]
     end
   end
@@ -1128,7 +1128,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) == 2
+      assert length(rows) === 2
       assert_in_delta Enum.at(rows, 0)["reading"], 1.0, 1.0e-5
       assert_in_delta Enum.at(rows, 1)["reading"], -2.5, 1.0e-5
     end
@@ -1805,7 +1805,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       # With no buffer specs, decode_column gets [] and returns nils
       assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert length(rows) == 1
+      assert length(rows) === 1
       assert hd(rows)["v"] === nil
     end
   end
@@ -1878,7 +1878,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch = batch_fd(body, specs, 2)
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) == 2
+      assert length(rows) === 2
       assert Enum.at(rows, 0)["s"] === nil
       assert Enum.at(rows, 1)["s"] === nil
     end
@@ -1894,7 +1894,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       fd = %FlightData{data_header: msg_header, data_body: <<0::64, 0::64>>}
 
       assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert length(rows) == 2
+      assert length(rows) === 2
       assert Enum.all?(rows, fn r -> r["v"] === nil end)
     end
   end

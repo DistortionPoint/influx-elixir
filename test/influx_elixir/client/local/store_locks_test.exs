@@ -9,29 +9,30 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
   Everything else the store does (what is stored, merged, listed, limited,
   deleted, numbered) is observable through `Client.Local` and is tested there, in
   `InfluxElixir.Client.Local.ConcurrencyTest` and in the contracts.
+
+  None of these tests asks whether a process is blocked on the lock, which only
+  the store's private retry loop could tell. Each holder runs a function that is
+  inside the critical section from the moment it sends `:holding` until it returns, so
+  an outcome that would break mutual exclusion is visible to it, or in the order the
+  functions ran, whichever way the other process was scheduled.
   """
 
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local.Store
-  alias InfluxElixir.TestSupport.Await
 
-  # Waits until `pid` is contending for a lock: its reductions grow three times in a row
-  # while the function it was started to run has not run. A process that is not yet in the
-  # store's wait loop is parked in a `receive` and gains none; one that is in it wakes
-  # again and again, so only a contender keeps growing. This reads nothing private of the
-  # store, and no clock decides when it ends: each step waits for the growth itself.
-  defp await_contending(pid) do
-    {:reductions, first} = Process.info(pid, :reductions)
+  # The bound on every wait for a message: far above what a healthy run needs, so it only
+  # ever ends a failing one.
+  @bound 30_000
 
-    Enum.reduce(1..3, first, fn _step, seen ->
-      Await.until(fn ->
-        case Process.info(pid, :reductions) do
-          {:reductions, now} when now > seen -> now
-          _gone_or_idle -> false
-        end
-      end)
-    end)
+  # The next of the two messages that tell the order the functions ran in: the mailbox is
+  # scanned in arrival order, so this is the one that was sent first.
+  defp next_run do
+    receive do
+      message when message in [:holder_done, :waiter_ran] -> message
+    after
+      @bound -> flunk("neither :holder_done nor :waiter_ran arrived")
+    end
   end
 
   describe "a lock holder" do
@@ -47,16 +48,21 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
           end)
         end)
 
-      assert_receive :holding, 30_000
+      assert_receive :holding, @bound
 
-      waiter = Task.async(fn -> Store.create_database(table, "next", fn _existing -> :ok end) end)
+      # The waiter is started while the holder is inside the lock; whether it has reached
+      # the lock when the holder is killed, its creation must go through, and the killed
+      # holder's database must never exist.
+      waiter =
+        Task.async(fn ->
+          send(parent, :waiter_started)
+          Store.create_database(table, "next", fn _existing -> :ok end)
+        end)
 
-      # The holder is killed only once the waiter is contending for the lock it holds.
-      await_contending(waiter.pid)
-      refute Store.database?(table, "next")
+      assert_receive :waiter_started, @bound
       Process.exit(holder, :kill)
 
-      assert Task.await(waiter, 30_000) === :ok
+      assert Task.await(waiter, @bound) === :ok
       assert Store.database?(table, "next")
       refute Store.database?(table, "held")
     end
@@ -99,7 +105,7 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
           end)
         end)
 
-      assert_receive :holding, 30_000
+      assert_receive :holding, @bound
 
       waiter =
         Task.async(fn ->
@@ -111,22 +117,17 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
           end)
         end)
 
-      assert_receive :waiter_started, 30_000
-
-      # The holder is released only once the waiter is contending for its lock, and the
-      # waiter's function has not run.
-      await_contending(waiter.pid)
-      refute_received :waiter_ran
-      refute Store.database?(table, "other")
+      assert_receive :waiter_started, @bound
       send(holder.pid, :release)
 
-      assert Task.await(holder, 30_000) === :ok
-      assert Task.await(waiter, 30_000) === :ok
+      assert Task.await(holder, @bound) === :ok
+      assert Task.await(waiter, @bound) === :ok
       assert Store.databases(table) === MapSet.new(["slow", "other"])
 
-      # Mailbox order is the order the two functions ran in: the waiter's
-      # function can only run once the holder's has returned.
-      assert Process.info(self(), :messages) === {:messages, [:holder_done, :waiter_ran]}
+      # The waiter's function can only run once the holder's has returned, however the two
+      # were scheduled: the holder's message is the first of the two to have been sent.
+      assert next_run() === :holder_done
+      assert next_run() === :waiter_ran
     end
 
     test "a drop of a database is not run while a creation holds the databases lock, " <>
@@ -143,23 +144,27 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
             receive do
               :release -> :ok
             end
+
+            # still inside the lock: no drop has removed the database in the meantime
+            send(parent, {:still_there, Store.database?(table, "gone")})
+            :ok
           end)
         end)
 
-      assert_receive :holding, 30_000
+      assert_receive :holding, @bound
 
-      dropper = Task.async(fn -> Store.drop_database(table, "gone") end)
+      dropper =
+        Task.async(fn ->
+          send(parent, :dropper_started)
+          Store.drop_database(table, "gone")
+        end)
 
-      # The creation holds the lock until it is told to release it, so a drop that is
-      # contending for the lock cannot have gone further, and the database it is to
-      # remove is still there.
-      await_contending(dropper.pid)
-      assert Store.database?(table, "gone")
-
+      assert_receive :dropper_started, @bound
       send(holder.pid, :release)
 
-      assert Task.await(holder, 30_000) === :ok
-      assert Task.await(dropper, 30_000) === :ok
+      assert Task.await(holder, @bound) === :ok
+      assert Task.await(dropper, @bound) === :ok
+      assert_receive {:still_there, true}, @bound
       refute Store.database?(table, "gone")
       assert Store.retention(table, "gone") === nil
       assert Store.database?(table, "other")

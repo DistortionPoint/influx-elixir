@@ -104,10 +104,19 @@ defmodule InfluxElixir.Client.Local.SQLTime do
     end
   end
 
+  # An integer is an `Int64`, a positive one past it a `UInt64`, anything past that a `Float64`.
+  @spec integer_type(integer()) :: binary()
+  defp integer_type(number)
+       when number >= -9_223_372_036_854_775_808 and number <= 9_223_372_036_854_775_807,
+       do: "Int64"
+
+  defp integer_type(number) when number > 0 and number <= 18_446_744_073_709_551_615, do: "UInt64"
+  defp integer_type(_number), do: "Float64"
+
   @spec number_type(binary()) :: binary() | nil
   defp number_type(text) do
     cond do
-      SQLLiteral.integer?(text) -> "Int64"
+      SQLLiteral.integer?(text) -> integer_type(String.to_integer(text))
       SQLLiteral.float?(text) -> "Float64"
       true -> nil
     end

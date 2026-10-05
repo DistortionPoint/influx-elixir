@@ -350,7 +350,7 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
       assert {:ok, [^one, ^two]} = Local.list_buckets(conn)
 
       assert two["orgID"] === one["orgID"]
-      assert one["id"] != two["id"]
+      assert one["id"] !== two["id"]
 
       # Another connection to the same org lists the same ids; another org does not.
       {:ok, same} = Local.start(profile: :v2, org: "acme")

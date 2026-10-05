@@ -543,11 +543,12 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          {:ok, interval_ns} <- SQLClauses.interval(sql),
          :ok <- SQLClauses.check_date_bins(split.columns, interval_ns),
          {:ok, groups} <- SQLClauses.group_columns(sql),
-         {:ok, where} <- SQLWhere.nodes(rest),
+         {:ok, where, tree} <- SQLWhere.parsed(rest),
          {:ok, having} <- SQLAggExpr.having(rest, qualifier, groups, columns),
          :ok <- expr_order(order, rest) do
       query =
         new_query(measurement, where, rest,
+          where_tree: tree,
           group_by_interval: interval_ns,
           group_by_columns: groups,
           select_columns: columns,
@@ -566,7 +567,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       %{
         measurement: measurement,
         where: where,
-        where_tree: SQLWhere.tree(rest),
+        where_tree: Keyword.get_lazy(overrides, :where_tree, fn -> SQLWhere.tree(rest) end),
         order_by: SQLClauses.order_by(rest),
         limit: SQLLimit.limit(rest),
         offset: SQLLimit.offset(rest),
@@ -639,7 +640,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec unselected_columns({binary() | {:expr, expr()}, direction()}, [binary()]) ::
           [SQLExpr.column_ref()]
   defp unselected_columns({target, _direction}, columns) when is_binary(target),
-    do: if(target in columns, do: [], else: [target])
+    do:
+      if(target in columns or SQLClauses.position_error(target, 0) != nil, do: [], else: [target])
 
   # A column written with its relation is no name of the select list: if the relation is the
   # table's it was read as the column itself, and if it is not it is the schema error, which
@@ -671,11 +673,12 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec build_distinct_query([binary()], binary(), binary(), binary() | nil) ::
           {:ok, parsed_query()} | {:error, map()}
   defp build_distinct_query(columns, measurement, rest, qualifier) do
-    with {:ok, where} <- SQLWhere.nodes(rest) do
+    with {:ok, where, tree} <- SQLWhere.parsed(rest) do
       {order_by, error} = parse_distinct_order_by(columns, qualifier || measurement, rest)
 
       {:ok,
        new_query(measurement, where, rest,
+         where_tree: tree,
          order_by: order_by,
          distinct_columns: columns,
          plan_error: error || SQLLimit.planning_error(rest)
@@ -686,8 +689,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec build_star_query(binary(), binary()) ::
           {:ok, parsed_query()} | {:error, map()}
   defp build_star_query(measurement, rest) do
-    with {:ok, where} <- SQLWhere.nodes(rest) do
-      {:ok, new_query(measurement, where, rest, [])}
+    with {:ok, where, tree} <- SQLWhere.parsed(rest) do
+      {:ok, new_query(measurement, where, rest, where_tree: tree)}
     end
   end
 
@@ -696,8 +699,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   defp build_columns_query(columns_str, measurement, rest, qualifier) do
     with {:ok, projection} <- parse_projection_columns(columns_str, qualifier),
          :ok <- check_unique(Enum.map(projection, fn {_source, output} -> output end)),
-         {:ok, where} <- SQLWhere.nodes(rest) do
-      {:ok, new_query(measurement, where, rest, projection_columns: projection)}
+         {:ok, where, tree} <- SQLWhere.parsed(rest) do
+      {:ok, new_query(measurement, where, rest, where_tree: tree, projection_columns: projection)}
     end
   end
 
@@ -796,7 +799,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         end
 
       {:error, _reason} ->
-        {:error, SQLError.refusal("unsupported column: #{col}")}
+        {:error, SQLExpr.refusal("column", col, body)}
     end
   end
 

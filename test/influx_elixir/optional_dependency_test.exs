@@ -89,7 +89,7 @@ defmodule InfluxElixir.OptionalDependencyTest do
   defp normalise_segments(segments), do: segments
 
   describe "the library's optional dependencies" do
-    if @optional_modules == [] do
+    if @optional_modules === [] do
       @describetag skip: "the library declares no optional dependency"
     end
 
@@ -107,7 +107,7 @@ defmodule InfluxElixir.OptionalDependencyTest do
             {line, form} <- compile_time_needs(ast, module),
             do: "#{Path.relative_to_cwd(path)}:#{line} #{form}s #{inspect(module)}"
 
-      assert offenders == []
+      assert offenders === []
     end
   end
 
@@ -176,7 +176,7 @@ defmodule InfluxElixir.OptionalDependencyTest do
       end
       """
 
-      assert source |> parse() |> compile_time_needs(Decimal) == []
+      assert source |> parse() |> compile_time_needs(Decimal) === []
     end
   end
 end

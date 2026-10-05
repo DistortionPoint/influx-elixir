@@ -115,7 +115,7 @@ defmodule InfluxElixir.Client.ProfileRejectionTest do
           e in InfluxElixir.StreamError -> e
         end
 
-      assert error.kind == :unsupported
+      assert error.kind === :unsupported
     end
 
     test "execute_sql returns {:error, :unsupported_operation}",

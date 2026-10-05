@@ -87,7 +87,7 @@ defmodule InfluxElixir.Contract.SQLScalar do
     # SQL is the v3 profiles' query language; v2 has none of it.
     if profile in [:v3_core, :v3_enterprise] do
       tests =
-        for {test_part, block} <- test_blocks(profile),
+        for {test_part, block} <- test_blocks(profile, local?(client, __CALLER__)),
             part == :all or part == test_part,
             do: block
 
@@ -98,14 +98,14 @@ defmodule InfluxElixir.Contract.SQLScalar do
   end
 
   # Every block of tests with the part it belongs to, in order.
-  @spec test_blocks(atom()) :: [{atom(), Macro.t()}]
-  defp test_blocks(profile) do
+  @spec test_blocks(atom(), boolean()) :: [{atom(), Macro.t()}]
+  defp test_blocks(profile, local?) do
     [
       {:expressions, expression_tests()},
       {:functions, function_tests()},
       {:errors, error_tests()},
       {:aggregates, aggregate_tests()},
-      {:catalog, catalog_tests(profile)}
+      {:catalog, catalog_tests(profile, local?)}
     ]
   end
 
@@ -332,13 +332,33 @@ defmodule InfluxElixir.Contract.SQLScalar do
     end
   end
 
-  # The system tables are those of an edition: only a Core is asked for the lists that name
-  # them (`SQLCatalogCases.catalog_core/0`), so that another edition is not pinned to them.
-  defp core_catalog_test(:v3_core) do
+  # Whether the client is the double (`Client.Local`), whatever edition it plays.
+  @spec local?(Macro.t(), Macro.Env.t()) :: boolean()
+  defp local?(client, env), do: Macro.expand(client, env) == InfluxElixir.Client.Local
+
+  # The system tables are those of an edition: a real server is asked for the lists that name
+  # them (`SQLCatalogCases.catalog_system/0`) only when it is a Core, so that another edition
+  # is not pinned to them. The double has no edition branch for them, so it answers them as a
+  # Core whatever edition it plays, and the contract asks it for all of them.
+  defp system_catalog_test(true) do
     quote location: :keep do
       describe "SQL scalar — contract: the system tables of InfluxDB 3 Core" do
-        @tag local_divergence: "Local refuses by name some of what the engine answers"
         test "SHOW TABLES, the schemata and the columns of the system tables", ctx do
+          ss_fixture(ctx)
+          ss_check(ctx, InfluxElixir.Contract.SQLCatalogCases.catalog_system())
+        end
+      end
+    end
+  end
+
+  defp system_catalog_test(false), do: nil
+
+  # A Core refuses a `DELETE` that another edition runs: only a Core is asked for them.
+  defp core_catalog_test(:v3_core) do
+    quote location: :keep do
+      describe "SQL scalar — contract: the DELETE statements of InfluxDB 3 Core" do
+        @tag local_divergence: "Local refuses by name some of what the engine answers"
+        test "a DELETE is planned and refused, whatever its table and its WHERE", ctx do
           ss_fixture(ctx)
           ss_check(ctx, InfluxElixir.Contract.SQLCatalogCases.catalog_core())
 
@@ -354,8 +374,9 @@ defmodule InfluxElixir.Contract.SQLScalar do
 
   defp core_catalog_test(_other), do: nil
 
-  defp catalog_tests(profile) do
+  defp catalog_tests(profile, local?) do
     quote location: :keep do
+      unquote(system_catalog_test(profile == :v3_core or local?))
       unquote(core_catalog_test(profile))
 
       describe "SQL scalar — contract: the parser and the catalog" do

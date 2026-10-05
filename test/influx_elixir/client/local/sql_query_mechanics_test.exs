@@ -140,7 +140,9 @@ defmodule InfluxElixir.Client.Local.SqlQueryMechanicsTest do
       assert {:error,
               %{
                 status: 400,
-                body: "Client.Local: unsupported WHERE clause: severity similar to 'h%'"
+                body:
+                  "Client.Local: unsupported WHERE clause: severity similar to 'h%' (similar is " <>
+                    "not an operator the double reads)"
               }} =
                Local.query_sql(
                  conn,

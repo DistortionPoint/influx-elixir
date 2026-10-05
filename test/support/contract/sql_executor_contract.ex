@@ -2486,14 +2486,23 @@ defmodule InfluxElixir.Contract.SQLExecutor do
           m = sxc_cast_data(ctx)
           local? = sxc_local?()
 
-          for type <- ["INT UNSIGNED", "BIGINT UNSIGNED", "SMALLINT UNSIGNED"] do
+          for {type, arrow} <- [
+                {"INT UNSIGNED", "UInt32"},
+                {"BIGINT UNSIGNED", "UInt64"},
+                {"SMALLINT UNSIGNED", "UInt16"}
+              ] do
             result = sxc_query(ctx, "SELECT cast(v AS #{type}) AS c FROM #{m} WHERE v = 5")
 
             if local?,
               do:
                 assert(
-                  {:error, %{status: 400, body: "Client.Local: unsupported column" <> _more}} =
-                    result
+                  result ===
+                    {:error,
+                     %{
+                       status: 400,
+                       body:
+                         "Client.Local: a cast to #{arrow}: the double does not model that type"
+                     }}
                 ),
               else: assert(result === {:ok, [%{"c" => 5}]})
           end
@@ -2511,7 +2520,10 @@ defmodule InfluxElixir.Contract.SQLExecutor do
               assert(
                 result ===
                   {:error,
-                   %{status: 400, body: "Client.Local: unsupported ORDER BY: cast(f as float)"}}
+                   %{
+                     status: 400,
+                     body: "Client.Local: a cast to Float32: the double does not model that type"
+                   }}
               ),
             else: assert(result === {:ok, sxc_vs([100_000, 5, 300, -7])})
         end

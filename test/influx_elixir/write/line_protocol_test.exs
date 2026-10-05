@@ -7,37 +7,37 @@ defmodule InfluxElixir.Write.LineProtocolTest do
     test "encodes a minimal point with float field" do
       point = Point.new("cpu", %{"value" => 0.64})
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "cpu value=0.64"
+      assert lp === "cpu value=0.64"
     end
 
     test "encodes a point with integer field (i suffix)" do
       point = Point.new("cpu", %{"count" => 42})
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "cpu count=42i"
+      assert lp === "cpu count=42i"
     end
 
     test "encodes a point with boolean true field" do
       point = Point.new("status", %{"active" => true})
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "status active=true"
+      assert lp === "status active=true"
     end
 
     test "encodes a point with boolean false field" do
       point = Point.new("status", %{"active" => false})
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "status active=false"
+      assert lp === "status active=false"
     end
 
     test "encodes a point with string field (double-quoted)" do
       point = Point.new("event", %{"msg" => "hello"})
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == ~s(event msg="hello")
+      assert lp === ~s(event msg="hello")
     end
 
     test "encodes a point with integer timestamp" do
       point = Point.new("cpu", %{"value" => 1.0}, timestamp: 1_630_424_257_000_000_000)
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "cpu value=1.0 1630424257000000000"
+      assert lp === "cpu value=1.0 1630424257000000000"
     end
 
     test "encodes a point with DateTime timestamp" do
@@ -84,7 +84,7 @@ defmodule InfluxElixir.Write.LineProtocolTest do
     test "encodes a single tag" do
       point = Point.new("cpu", %{"v" => 1.0}, tags: %{"host" => "server01"})
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "cpu,host=server01 v=1.0"
+      assert lp === "cpu,host=server01 v=1.0"
     end
 
     test "sorts tags lexicographically by key" do
@@ -100,7 +100,7 @@ defmodule InfluxElixir.Write.LineProtocolTest do
         Point.new("cpu", %{"v" => 1.0}, tags: %{"host" => "s1", "region" => "us-east"})
 
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "cpu,host=s1,region=us-east v=1.0"
+      assert lp === "cpu,host=s1,region=us-east v=1.0"
     end
   end
 
@@ -175,7 +175,7 @@ defmodule InfluxElixir.Write.LineProtocolTest do
       large_int = 9_007_199_254_740_993
       point = Point.new("cpu", %{"big" => large_int})
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "cpu big=#{large_int}i"
+      assert lp === "cpu big=#{large_int}i"
     end
 
     test "very large integer (beyond 2^53) round-trips" do
@@ -183,19 +183,19 @@ defmodule InfluxElixir.Write.LineProtocolTest do
       max_int64 = 9_223_372_036_854_775_807
       point = Point.new("cpu", %{"max" => max_int64})
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "cpu max=#{max_int64}i"
+      assert lp === "cpu max=#{max_int64}i"
     end
 
     test "negative integer gets i suffix" do
       point = Point.new("cpu", %{"delta" => -5})
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "cpu delta=-5i"
+      assert lp === "cpu delta=-5i"
     end
 
     test "zero integer gets i suffix" do
       point = Point.new("cpu", %{"count" => 0})
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "cpu count=0i"
+      assert lp === "cpu count=0i"
     end
 
     test "float 0.64 is encoded as-is" do
@@ -222,7 +222,7 @@ defmodule InfluxElixir.Write.LineProtocolTest do
         )
 
       assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp == "cpu,host=server01 value=0.64 1630424257000000000"
+      assert lp === "cpu,host=server01 value=0.64 1630424257000000000"
     end
   end
 
@@ -344,7 +344,7 @@ defmodule InfluxElixir.Write.LineProtocolTest do
     test "encodes a single-element list" do
       point = Point.new("cpu", %{"v" => 1.0})
       assert {:ok, lp} = LineProtocol.encode([point])
-      assert lp == "cpu v=1.0"
+      assert lp === "cpu v=1.0"
     end
 
     test "encodes multiple points as newline-delimited" do
@@ -355,9 +355,9 @@ defmodule InfluxElixir.Write.LineProtocolTest do
 
       assert {:ok, lp} = LineProtocol.encode(points)
       lines = String.split(lp, "\n")
-      assert length(lines) == 2
-      assert Enum.at(lines, 0) == "cpu v=1.0"
-      assert Enum.at(lines, 1) == "mem free=512i"
+      assert length(lines) === 2
+      assert Enum.at(lines, 0) === "cpu v=1.0"
+      assert Enum.at(lines, 1) === "mem free=512i"
     end
 
     test "returns error when any point in list is invalid" do
@@ -397,7 +397,7 @@ defmodule InfluxElixir.Write.LineProtocolTest do
   describe "encode!/1" do
     test "returns binary on success" do
       point = Point.new("cpu", %{"v" => 1.0})
-      assert LineProtocol.encode!(point) == "cpu v=1.0"
+      assert LineProtocol.encode!(point) === "cpu v=1.0"
     end
 
     test "raises ArgumentError on failure" do

@@ -23,7 +23,7 @@ defmodule InfluxElixir.ChangelogTest do
     assert ["Unreleased" | versions] = headings()
     parsed = Enum.map(versions, &Version.parse!/1)
 
-    assert parsed == Enum.sort(parsed, {:desc, Version})
-    assert parsed == Enum.uniq(parsed)
+    assert parsed === Enum.sort(parsed, {:desc, Version})
+    assert parsed === Enum.uniq(parsed)
   end
 end

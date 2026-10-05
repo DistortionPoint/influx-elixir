@@ -24,7 +24,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
           | {:str, binary()}
           | {:bool, boolean()}
           | :null
-          | :param
+          | {:param, binary()}
+          | {:zero_param, binary()}
+          | {:ordered, ast(), [{ast(), binary()}]}
           | {:ref, [name()]}
           | {:call, binary(), [ast()] | :star}
           | {:neg | :pos | :not, ast()}
@@ -70,6 +72,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   @call_suffixes ~w(FILTER OVER WITHIN IGNORE RESPECT)
 
   @comparisons ~w(= == <> != < > <= >= <=> ~ ~* !~ !~* ~~ ~~* !~~ !~~*)
+  # The operators that read from the left and group: `(a + b) + c` is `a + b + c`.
+  @chained ~w(|| + - * / % AND OR)
 
   # ---------------------------------------------------------------------------
   # The clauses
@@ -131,7 +135,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
           {:ok, pos_integer(), [token()]} | {:error, SQLError.t()}
   defp alias_column_list([{kind, _p, _u, _l, _c} | rest], count)
        when kind in [:word, :quoted, :string] do
-    case rest do
+    case column_type(rest) do
       [{:symbol, ",", _u2, _l2, _c2} | more] -> alias_column_list(more, count + 1)
       [{:symbol, ")", _u2, _l2, _c2} | more] -> {:ok, count, more}
       [token | _more] -> {:error, SQLDdl.expected(")", token)}
@@ -140,6 +144,35 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
 
   defp alias_column_list([token | _rest], _count),
     do: {:error, SQLDdl.expected("identifier", token)}
+
+  # A name in the list of an alias may be followed by a data type, which the planner takes
+  # whatever it is: a word, with sizes in parentheses and brackets (`a int`, `a varchar(3)`,
+  # `a int[]`).
+  @spec column_type([token()]) :: [token()]
+  defp column_type([{:word, _p, _u, _l, _c} | rest] = tokens) do
+    # A size or bracket that is never closed is no type: the parser gives the word back.
+    case brackets(rest) do
+      nil -> tokens
+      more -> more
+    end
+  end
+
+  defp column_type(tokens), do: tokens
+
+  @spec brackets([token()]) :: [token()] | nil
+  defp brackets([{:symbol, open, _u, _l, _c} | rest]) when open in ["(", "["] do
+    with more when more != nil <- closing_bracket(rest, open), do: brackets(more)
+  end
+
+  defp brackets(tokens), do: tokens
+
+  @spec closing_bracket([token()], binary()) :: [token()] | nil
+  defp closing_bracket([{:symbol, close, _u, _l, _c} | rest], open)
+       when (open == "(" and close == ")") or (open == "[" and close == "]"),
+       do: rest
+
+  defp closing_bracket([{:eof, _p, _u, _l, _c} | _rest], _open), do: nil
+  defp closing_bracket([_token | rest], open), do: closing_bracket(rest, open)
 
   @doc """
   The arguments of a table that is a function (`DELETE FROM name(args)`), read as the
@@ -389,34 +422,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp several([{:symbol, ",", _u, _l, _c} | rest]), do: from_tables(rest)
   defp several(tokens), do: {:ok, false, tokens}
 
-  # The alias of a delete is dropped, and a list of names after it is not read (the engine
-  # accepts what stands in the parentheses).
+  # The alias of a delete is dropped, and the names after it are read and dropped.
   @spec delete_alias([token()]) :: parsed(binary() | nil)
   defp delete_alias(tokens) do
-    with {:ok, name, rest} <- alias_word(tokens) do
-      case rest do
-        [{:symbol, "(", _u, _l, _c} | more] when name != nil ->
-          skip_parenthesis(more, 0, name)
-
-        _no_columns ->
-          {:ok, name, rest}
-      end
-    end
+    with {:ok, name, _columns, rest} <- alias_with_columns(tokens), do: {:ok, name, rest}
   end
-
-  @spec skip_parenthesis([token()], non_neg_integer(), binary()) :: parsed(binary())
-  defp skip_parenthesis([{:symbol, ")", _u, _l, _c} | rest], 0, name), do: {:ok, name, rest}
-
-  defp skip_parenthesis([{:symbol, ")", _u, _l, _c} | rest], depth, name),
-    do: skip_parenthesis(rest, depth - 1, name)
-
-  defp skip_parenthesis([{:symbol, "(", _u, _l, _c} | rest], depth, name),
-    do: skip_parenthesis(rest, depth + 1, name)
-
-  defp skip_parenthesis([{:eof, _p, _u, _l, _c} = token | _rest], _depth, _name),
-    do: {:error, SQLDdl.expected(")", token)}
-
-  defp skip_parenthesis([_token | rest], depth, name), do: skip_parenthesis(rest, depth, name)
 
   # A delete drops its alias, so any quoted one is read as a word.
   @spec plain_alias([token()]) :: [token()]
@@ -561,19 +571,21 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
     end
   end
 
+  @openers ["(", "[", "{"]
+  @closers [")", "]", "}"]
+
   @spec skip_cell([token()], non_neg_integer(), binary()) :: parsed(cell())
   defp skip_cell([{:symbol, sep, _u, _l, _c} | _rest] = tokens, 0, why) when sep in [",", ")"],
     do: {:ok, {:opaque, why}, tokens}
 
-  defp skip_cell([{:symbol, "(", _u, _l, _c} | rest], depth, why),
+  defp skip_cell([{:symbol, open, _u, _l, _c} | rest], depth, why) when open in @openers,
     do: skip_cell(rest, depth + 1, why)
 
-  defp skip_cell([{:symbol, ")", _u, _l, _c} | rest], depth, why),
-    do: skip_cell(rest, depth - 1, why)
+  defp skip_cell([{:symbol, close, _u, _l, _c} | rest], depth, why) when close in @closers,
+    do: skip_cell(rest, max(depth - 1, 0), why)
 
   defp skip_cell([{:eof, _p, _u, _l, _c} | _rest], _depth, why), do: {:refuse, why}
   defp skip_cell([_token | rest], depth, why), do: skip_cell(rest, depth, why)
-  defp skip_cell([], _depth, why), do: {:refuse, why}
 
   # A placeholder that stands alone in a cell is read by its name before the row is planned.
   @spec cell([token()]) :: parsed(cell())
@@ -593,9 +605,12 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
 
   defp cell(tokens), do: expr(tokens)
 
+  @typedoc "The alias of a select item: its text (lower case when unquoted) and whether quoted."
+  @type item_alias :: name() | nil
+
   @typedoc "A `SELECT` source: its items, the table it reads and the tokens after it."
   @type select :: %{
-          items: [{:expr, ast()} | :star],
+          items: [{:expr, ast(), item_alias()} | :star],
           from: {[binary()], binary() | nil} | nil,
           rest: [token()]
         }
@@ -620,22 +635,32 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
 
   defp select_items(tokens, found) do
     with {:ok, item, rest} <- expr(tokens) do
-      select_more(select_alias(rest), [{:expr, item} | found])
+      {item_alias, rest} = select_alias(rest)
+      select_more(rest, [{:expr, item, item_alias} | found])
     end
   end
 
-  @spec select_alias([token()]) :: [token()]
-  defp select_alias([{:word, _p, "AS", _l, _c}, {kind, _p2, _u, _l2, _c2} | rest])
+  @spec select_alias([token()]) :: {item_alias(), [token()]}
+  defp select_alias([{:word, _p, "AS", _l, _c}, {kind, printed, _u, _l2, _c2} | rest])
        when kind in [:word, :quoted],
-       do: rest
+       do: {alias_of(kind, printed), rest}
 
   defp select_alias([{:word, _p, upper, _l, _c} | _rest] = tokens)
        when upper in @alias_reserved or upper in @join_words,
-       do: tokens
+       do: {nil, tokens}
 
-  defp select_alias([{:word, _p, _upper, _l, _c} | rest]), do: rest
-  defp select_alias([{:string, _p, _upper, _l, _c} | rest]), do: rest
-  defp select_alias(tokens), do: tokens
+  defp select_alias([{:word, printed, _upper, _l, _c} | rest]),
+    do: {alias_of(:word, printed), rest}
+
+  defp select_alias([{:string, printed, _upper, _l, _c} | rest]),
+    do: {alias_of(:quoted, printed), rest}
+
+  defp select_alias(tokens), do: {nil, tokens}
+
+  # An unquoted alias is folded to lower case, a quoted one is as written.
+  @spec alias_of(atom(), binary()) :: name()
+  defp alias_of(:word, printed), do: {String.downcase(printed), false}
+  defp alias_of(:quoted, printed), do: {String.slice(printed, 1..-2//1), true}
 
   @spec select_more([token()], [term()]) :: parsed([term()])
   defp select_more([{:symbol, ",", _u, _l, _c} | rest], found) do
@@ -848,10 +873,14 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp expect_word([{:word, _p, word, _l, _c} | rest], word), do: {:ok, rest}
   defp expect_word([token | _rest], word), do: {:error, SQLDdl.expected(word, token)}
 
-  # `CAST(x)` without `AS` is read by the engine as a call of a function named `cast`.
+  # `CAST(x)` and `CAST(x, y)` without `AS` are read by the engine as a call of a function named
+  # `cast`.
   @spec as_word([token()]) :: {:ok, [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
   defp as_word([{:word, _p, "AS", _l, _c} | rest]), do: {:ok, rest}
-  defp as_word([{:symbol, ")", _u, _l, _c} | _rest]), do: {:refuse, "a CAST without AS"}
+
+  defp as_word([{:symbol, close, _u, _l, _c} | _rest]) when close in [")", ","],
+    do: {:refuse, "a CAST without AS"}
+
   defp as_word([token | _rest]), do: {:error, SQLDdl.expected("AS", token)}
 
   @spec expr_list([token()]) :: parsed([ast()])
@@ -886,16 +915,16 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
        when name != "" and binary_part(name, 0, 1) == "0" do
     if Regex.match?(~r/\A0+\z/, name),
       do: {:ok, {:zero_param, text}, rest},
-      else: {:ok, :param, rest}
+      else: {:ok, {:param, text}, rest}
   end
 
-  defp prefix([{:placeholder, "$" <> name, _u, _l, _c} | rest]) when name != "",
-    do: {:ok, :param, rest}
+  defp prefix([{:placeholder, "$" <> name = text, _u, _l, _c} | rest]) when name != "",
+    do: {:ok, {:param, text}, rest}
 
   defp prefix([{:placeholder, _p, _u, _l, _c} | _rest]), do: {:refuse, "a placeholder"}
 
   defp prefix([{:word, _p, "CURRENT_TIMESTAMP", _l, _c} | rest]),
-    do: {:ok, {:call, "now", []}, rest}
+    do: {:ok, {:call, "current_timestamp", []}, rest}
 
   defp prefix([{:quoted, _p, _u, _l, _c} | _rest] = tokens), do: reference(tokens)
 
@@ -945,8 +974,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   end
 
   # `:name` is a placeholder as `$name` is.
-  defp prefix([{:symbol, ":", _u, _l, _c}, {:word, _p, _upper, _l2, _c2} | rest]),
-    do: {:ok, :param, rest}
+  defp prefix([{:symbol, ":", _u, _l, _c}, {:word, printed, _upper, _l2, _c2} | rest]),
+    do: {:ok, {:param, ":" <> printed}, rest}
 
   defp prefix([{:symbol, symbol, _u, _l, _c} | _rest]) when symbol in ["[", "{", "@", ":", "?"],
     do: {:refuse, "#{symbol} in an operand"}
@@ -984,14 +1013,65 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp call(name, [{:symbol, "*", _u, _l, _c}, {:symbol, ")", _u2, _l2, _c2} | rest]),
     do: suffix({:call, name, :star}, rest)
 
+  defp call(name, [{:symbol, "*", _u, _l, _c} | rest]) do
+    with {:ok, terms, rest} <- call_order(rest),
+         {:ok, rest} <- expect_symbol(rest, ")"),
+         do: suffix(ordered({:call, name, :star}, terms), rest)
+  end
+
   defp call(_name, [{:word, _p, modifier, _l, _c} | _rest]) when modifier in ["DISTINCT", "ALL"],
     do: {:refuse, "a call with #{String.downcase(modifier)}"}
 
   defp call(name, tokens) do
     with {:ok, args, rest} <- expr_list(tokens),
+         {:ok, terms, rest} <- call_order(rest),
          {:ok, rest} <- expect_symbol(rest, ")"),
-         do: suffix({:call, name, args}, rest)
+         do: suffix(ordered({:call, name, args}, terms), rest)
   end
+
+  # `ORDER BY term [ASC | DESC] [NULLS FIRST | LAST], ...` inside the parentheses of a call: the
+  # planner reads the terms after the arguments. Each term keeps the words that follow it.
+  @spec call_order([token()]) :: parsed([{ast(), binary()}])
+  defp call_order([{:word, _p, "ORDER", _l, _c}, {:word, _p2, "BY", _l2, _c2} | rest]),
+    do: call_terms(rest, [])
+
+  defp call_order(tokens), do: {:ok, [], tokens}
+
+  @spec call_terms([token()], [{ast(), binary()}]) :: parsed([{ast(), binary()}])
+  defp call_terms(tokens, found) do
+    with {:ok, term, rest} <- expr(tokens) do
+      {words, rest} = direction_words(rest)
+      found = [{term, words} | found]
+
+      case rest do
+        [{:symbol, ",", _u, _l, _c} | more] -> call_terms(more, found)
+        _end -> {:ok, Enum.reverse(found), rest}
+      end
+    end
+  end
+
+  # The words after an ordering term, as written (upper case).
+  @spec direction_words([token()]) :: {binary(), [token()]}
+  defp direction_words([{:word, _p, dir, _l, _c} | rest]) when dir in ["ASC", "DESC"] do
+    {nulls, rest} = nulls_words(rest)
+    {String.trim(dir <> " " <> nulls), rest}
+  end
+
+  defp direction_words(rest) do
+    {nulls, rest} = nulls_words(rest)
+    {nulls, rest}
+  end
+
+  @spec nulls_words([token()]) :: {binary(), [token()]}
+  defp nulls_words([{:word, _p, "NULLS", _l, _c}, {:word, _p2, nulls, _l2, _c2} | rest])
+       when nulls in ["FIRST", "LAST"],
+       do: {"NULLS " <> nulls, rest}
+
+  defp nulls_words(rest), do: {"", rest}
+
+  @spec ordered(ast(), [{ast(), binary()}]) :: ast()
+  defp ordered(call, []), do: call
+  defp ordered(call, terms), do: {:ordered, call, terms}
 
   @spec suffix(ast(), [token()]) :: parsed(ast())
   defp suffix(_call, [{:word, _p, word, _l, _c} | _rest]) when word in @call_suffixes,
@@ -1054,6 +1134,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   @doc "The operands directly under an operand, in the order the engine reads them."
   @spec children(ast()) :: [ast()]
   def children({:call, _name, args}) when is_list(args), do: args
+  def children({:ordered, call, terms}), do: [call | Enum.map(terms, &elem(&1, 0))]
   def children({kind, inner}) when kind in [:neg, :pos, :not], do: [inner]
   def children({:bin, _op, left, right}), do: [left, right]
   def children({:is, inner, {:distinct, other}, _negated}), do: [inner, other]
@@ -1077,9 +1158,20 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   def unparse({:str, body}, _names), do: "'" <> String.replace(body, "'", "''") <> "'"
   def unparse({:bool, value}, _names), do: Atom.to_string(value)
   def unparse(:null, _names), do: "NULL"
-  def unparse(:param, _names), do: "NULL"
+  def unparse({:param, _text}, _names), do: "NULL"
   def unparse({:ref, parts}, names), do: names.(parts)
   def unparse({:call, name, :star}, _names), do: name <> "(*)"
+
+  def unparse({:ordered, {:call, name, args}, terms}, names) do
+    inside = if args == :star, do: "*", else: Enum.map_join(args, ", ", &unparse(&1, names))
+
+    ordering =
+      Enum.map_join(terms, ", ", fn {term, words} ->
+        String.trim(unparse(term, names) <> " " <> words)
+      end)
+
+    name <> "(" <> inside <> " ORDER BY " <> ordering <> ")"
+  end
 
   def unparse({:call, name, args}, names),
     do: name <> "(" <> Enum.map_join(args, ", ", &unparse(&1, names)) <> ")"
@@ -1090,6 +1182,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   def unparse({:neg, inner}, names), do: "(- " <> unparse(inner, names) <> ")"
   # The planner types a unary plus as its operand and finds fault with it only late.
   def unparse({:pos, inner}, names), do: unparse(inner, names)
+
+  # A chain of one operator that reads from the left (`a || b || c`) is one pair of parentheses,
+  # not one for each link: the text of a chain of `n` terms nests no deeper than one.
+  def unparse({:bin, op, left, right}, names) when op in @chained,
+    do: "(" <> chain(left, op, names) <> " " <> op <> " " <> unparse(right, names) <> ")"
 
   def unparse({:bin, op, left, right}, names),
     do:
@@ -1108,7 +1205,13 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   def unparse({:cast, inner, type, try?}, names),
     do:
       if(try?, do: "TRY_CAST(", else: "CAST(") <>
-        unparse(inner, names) <> " AS " <> SQLDmlType.local_sql(type) <> ")"
+        unparse(inner, names) <> " AS " <> type.sql <> ")"
+
+  @spec chain(ast(), binary(), ([name()] -> binary())) :: binary()
+  defp chain({:bin, op, left, right}, op, names) when op in @chained,
+    do: chain(left, op, names) <> " " <> op <> " " <> unparse(right, names)
+
+  defp chain(operand, _op, names), do: unparse(operand, names)
 
   @spec sql_operator(binary()) :: binary()
   defp sql_operator("=="), do: "="

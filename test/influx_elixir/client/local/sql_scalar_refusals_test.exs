@@ -1,10 +1,11 @@
 defmodule InfluxElixir.Client.Local.SQLScalarRefusalsTest do
   @moduledoc """
   The SQL expressions, functions and `SHOW` statements `Client.Local` refuses by
-  name instead of answering as the engine does. What the engine answers to the
-  rest is pinned for the double and for the real servers by
-  `InfluxElixir.Contract.SQLScalar`; its `*_refusable` tables accept these
-  refusals without pinning their words, which are pinned here.
+  name instead of answering as the engine does, with the exact words of a few of them.
+  What the engine answers to the rest is pinned for the double and for the real servers by
+  `InfluxElixir.Contract.SQLScalar`; its `*_refusable` tables pin the exact reason of
+  every refusal in `InfluxElixir.Contract.SQLScalarRefusals`, so that a refusal cannot
+  change its words, or turn into another refusal, unnoticed.
   """
 
   use ExUnit.Case, async: true
@@ -42,11 +43,16 @@ defmodule InfluxElixir.Client.Local.SQLScalarRefusalsTest do
            "Client.Local: a timestamp concatenated as text: the engine writes its " <>
              "nanoseconds, which the double keeps only to the microsecond"},
           {"SELECT coalesce(n, s) FROM m",
-           "Client.Local: COALESCE of arguments with no common type the double models (a " <>
-             "number with text, or a type other than Int64, Float64, text and Boolean)"},
+           "Client.Local: COALESCE of an integer with text: the engine casts the text to the " <>
+             "number when it runs the plan (and closes the connection when a value does not " <>
+             "cast), which is not modelled"},
           {"SELECT nullif(n, s) FROM m",
-           "Client.Local: NULLIF of arguments with no common type the double models (a " <>
-             "number with text, or a type other than Int64, Float64, text and Boolean)"},
+           "Client.Local: NULLIF of an integer with text: the engine casts the text to the " <>
+             "number when it runs the plan (and closes the connection when a value does not " <>
+             "cast), which is not modelled"},
+          {"SELECT nosuch(a => 1) AS r",
+           "Client.Local: a call to nosuch, a function the double does not know, beside a call " <>
+             "with a named argument: which of the two errors the engine gives first is not modelled"},
           {"SELECT greatest(n, b) FROM m",
            "Client.Local: greatest of arguments with no common type the double models"},
           {"SELECT CASE WHEN n THEN 1 END FROM m",
@@ -55,9 +61,8 @@ defmodule InfluxElixir.Client.Local.SQLScalarRefusalsTest do
            "Client.Local: a CASE whose results have no common type the double models"},
           {"SELECT pow(1e300 * 1e300, 2.0) FROM m",
            "Client.Local: pow of an infinity or a NaN: the engine's result for it is not modelled"},
-          {"SELECT log(s) FROM m",
-           "Client.Local: log of those arguments: the engine's error for them is not modelled"},
-          {"SELECT s ~ 's' FROM m", "Client.Local: unsupported column: s ~ 's' as r"}
+          {"SELECT s ~ 's' FROM m",
+           "Client.Local: unsupported column: s ~ 's' as r (the character ~ is not one it reads)"}
         ],
         fn {sql, body} ->
           sql = String.replace(sql, ~r/ FROM m\z/, " AS r FROM m")
@@ -99,7 +104,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarRefusalsTest do
       assert {:error, %{status: 400, body: body}} =
                Local.query_sql(conn, "SELECT n <=> 1 FROM m WHERE", [])
 
-      assert body ==
+      assert body ===
                ~s|SQL error: ParserError("Expected: an expression, found: EOF")|
     end
   end
@@ -117,7 +122,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarRefusalsTest do
              "information_schema.tables, information_schema.columns and " <>
              "information_schema.schemata"},
           {"SHOW COLUMNS FROM system.nosuch",
-           "Client.Local: system.nosuch: the engine's system tables are not modelled"},
+           "Error during planning: table 'public.system.nosuch' not found"},
           {"SELECT * FROM system.queries",
            "Client.Local: system.queries: the engine's system tables are not modelled"},
           {"SHOW SCHEMAS", "Client.Local: unsupported SQL: show schemas"},

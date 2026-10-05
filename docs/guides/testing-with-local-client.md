@@ -973,6 +973,16 @@ InfluxQL's `WHERE` is not SQL's, and the double follows the engine
 - `"host"` and `"usage"` are exact identifiers; InfluxQL folds no case.
 - InfluxQL has no `NOT`: it is the engine's parse error. `/* ... */` and
   `-- ...` are comments.
+- A field, a constant or a tag that is no comparison inside `AND` / `OR`
+  (`WHERE s AND v > 1`, `WHERE b OR n OR v > 1`) is typed the way the planner
+  types it, leaves first: a pair with such an operand keeps no point (`b OR s OR b`
+  is `b`), but the planner refuses the pair when one operand is unsigned or both
+  are numbers (`Int64 AND Int64`) with its `Cannot infer common argument type`
+  error, among the errors of the comparisons in the order it builds them.
+- Clauses come in the engine's order (`WHERE`, `GROUP BY`, `fill()`, `ORDER BY`,
+  `LIMIT`, `OFFSET`, `SLIMIT`, `SOFFSET`, `tz()`): the first one out of its place
+  is the parse error at its start, and of two bad operands the leftmost is the
+  error (a number past the unsigned range stands before a later `SLIMIT x`).
 
 ### SHOW
 
@@ -1023,6 +1033,22 @@ overflows is a null that is in the row (an integer wraps at 64 bits), and a
 in a `GROUP BY time`, breaks the connection as the engine does
 (`{:error, {:connection_error, %Mint.TransportError{reason: :closed}}}`).
 
+The engine finds a statement's errors in an order, and the double keeps it: the
+errors of rewriting the statement first (a constant that is the whole field,
+`mixing aggregate and non-aggregate columns`, a transform of a field in a
+`GROUP BY time`, an operand a function cannot take), whatever the `WHERE` holds;
+then a select list that reads no field (tags, `time`, a column the measurement
+lacks, an expression of numbers alone) is answered empty without the `WHERE` or
+the `LIMIT` being planned; then the comparisons of the `WHERE` it cannot type
+and its `AND`/`OR` it cannot type; then the select list's own planning errors
+(`mean(s)`, `u / n`); then a `WHERE` that is no boolean. A constant alone in
+parentheses (`n * (3)`, `-(3)`, `pow(n, (2))`) is the planner's `field must
+contain at least one variable`. An aggregate of a tag is the planner's coercion
+error beside a field (`mean(host), mean(usage)`) and empty alone; `fill(n)` of a
+plain select fills the number columns that a row lacks with `n` cut to the column's
+type (a string or boolean column stays null), and of a selector over a string or
+boolean column is the engine's `no conversion` error.
+
 Refused by name, because the double cannot answer them as the engine does:
 
 - `INTO`, subqueries, `tz()` of a zone other than UTC (needs a time zone
@@ -1033,19 +1059,20 @@ Refused by name, because the double cannot answer them as the engine does:
   bucket, `fill(previous)` with a `count` when the first bucket is empty (the
   engine breaks the connection), `mode()` of values equally often there,
   `integral()` in a `GROUP BY time`, `elapsed()` of an aggregate, a transform
-  over points of several series that share a time, a transform of a field in a
-  `GROUP BY time`, in descending order after data in the bucket before the
-  range, beside `cumulative_sum`, a `GROUP BY` a field the select list also
+  over points of several series that share a time, in descending order after
+  data in the bucket before the range, beside `cumulative_sum`, a `GROUP BY` a field the select list also
   reads, a `GROUP BY` a tag called `time`, an integer or `now()` for `time()`,
   a bucket under a microsecond.
 - `top`/`bottom` and `percentile` in arithmetic (the engine ignores the
   arithmetic), a math function over a selector other than the engine's 500,
   `distinct(f)` of a field (the engine lists the values in the order of its
-  hash), `mean(b)`/`sum(b)` of a boolean (the engine's long type error).
+  hash).
 - Columns beside a selector in a `GROUP BY time`, `*` beside other items,
   select items that end up with the same name, a remainder by zero, a negative
-  fraction cast to an integer, an expression of constants, one that mixes
-  aggregates and fields.
+  fraction cast to an integer, arithmetic on a selector beside columns, several
+  aggregates of a type they do not take (the engine names one of them in an
+  order of its own), an aggregate of a tag beside fields it is not a dimension
+  of when it answers, and clauses out of order with a malformed one among them.
 - A quoted time in a form the double does not tell from the engine's, a time
   comparison inside `OR`, a regular expression with `\u` or a back reference.
 

@@ -128,7 +128,12 @@ defmodule InfluxElixir.Client.Local.SqlAggregateRefusalsTest do
       sql = "SELECT AVG(price, time) AS avg FROM \"trades\""
 
       assert {:error,
-              %{status: 400, body: "Client.Local: invalid aggregate: avg(price, time) as avg"}} =
+              %{
+                status: 400,
+                body:
+                  "Client.Local: unsupported aggregate: avg(price, time) as avg (it goes on at ,, " <>
+                    "where an operator is expected)"
+              }} =
                Local.query_sql(conn, sql, database: db)
     end
   end
@@ -152,9 +157,11 @@ defmodule InfluxElixir.Client.Local.SqlAggregateRefusalsTest do
       for {column, group, message} <- [
             # A function call that is not DATE_BIN nor a recognised aggregate
             {"weird_func(temp) AS alias", "DATE_BIN(INTERVAL '1 hour', time)",
-             "unsupported column expression: weird_func(temp) as alias"},
+             "unsupported column expression: weird_func(temp) as alias (the function " <>
+               "weird_func is not one the double has)"},
             {"INVALID_FUNC(temp) AS bad", "DATE_BIN(INTERVAL '1 hour', time)",
-             "unsupported column expression: invalid_func(temp) as bad"},
+             "unsupported column expression: invalid_func(temp) as bad (the function " <>
+               "invalid_func is not one the double has)"},
             # DATE_BIN without the INTERVAL keyword
             {"AVG(temp) AS avg_temp", "DATE_BIN('1 hour', time)",
              "invalid DATE_BIN: date_bin('1 hour', time) as time"},
@@ -185,7 +192,12 @@ defmodule InfluxElixir.Client.Local.SqlAggregateRefusalsTest do
 
     test "VARIANCE is not a DataFusion function and is rejected", %{conn: conn, db: db} do
       assert {:error,
-              %{status: 400, body: "Client.Local: unsupported column: variance(value) as v"}} =
+              %{
+                status: 400,
+                body:
+                  "Client.Local: unsupported column: variance(value) as v (the function " <>
+                    "variance is not one the double has)"
+              }} =
                Local.query_sql(conn, ~s|SELECT VARIANCE(value) AS v FROM "m"|, database: db)
     end
 
@@ -193,7 +205,11 @@ defmodule InfluxElixir.Client.Local.SqlAggregateRefusalsTest do
       sql = ~s|SELECT AVG(value, other) AS a FROM "m"|
 
       assert {:error, %{status: 400, body: body}} = Local.query_sql(conn, sql, database: db)
-      assert body === "Client.Local: invalid aggregate: avg(value, other) as a", sql
+
+      assert body ===
+               "Client.Local: unsupported aggregate: avg(value, other) as a (it goes on at ,, " <>
+                 "where an operator is expected)",
+             sql
     end
 
     test "a malformed expression is the engine's parser error", %{conn: conn, db: db} do

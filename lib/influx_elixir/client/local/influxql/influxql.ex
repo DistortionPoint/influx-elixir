@@ -135,6 +135,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
           | {:expr, InfluxElixir.Client.Local.InfluxQLExpr.ast(), binary() | nil}
           | {:multi, binary(), binary(), [binary()], pos_integer(), binary() | nil}
           | {:planning_error, binary()}
+          | {:planning_error, binary(), InfluxElixir.Client.Local.InfluxQLExpr.ast()}
           | {:aggregate, binary(),
              binary() | :star | {:distinct, binary()} | {:literal, binary()}, binary() | nil}
 
