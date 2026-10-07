@@ -7,6 +7,11 @@ defmodule InfluxElixir.Client.Local.SQLError do
   # Every constructor returns `%{status: status, body: body}`, the shape
   # `Client.HTTP` returns for a non-success response.
 
+  # How the bodies of the errors the engine's analyzer and optimizer find begin (`coercion/1`,
+  # `between_coercion/2` and `simplify/1` write them with these, `analyzer?/1` reads them).
+  @coercion "type_coercion\n"
+  @optimizer "Optimizer rule "
+
   @typedoc "An HTTP-style error answer."
   @type t :: %{status: pos_integer(), body: binary()}
 
@@ -138,6 +143,17 @@ defmodule InfluxElixir.Client.Local.SQLError do
   def late?(%{body: body}), do: is_map_key(@late_bodies, body)
   def late?(_error), do: false
 
+  @doc """
+  Whether an error is one the engine's analyzer (the type coercion pass) or its optimizer finds,
+  which come before the planner's own errors of the query that reads the table they were found
+  in, and after those of the expression itself.
+  """
+  @spec analyzer?(term()) :: boolean()
+  def analyzer?(%{body: body}) when is_binary(body),
+    do: String.starts_with?(body, [@coercion, @optimizer])
+
+  def analyzer?(_error), do: false
+
   @doc "The engine's planning error, `Error during planning: <message>`."
   @spec planning(binary()) :: t()
   def planning(message), do: %{status: 400, body: "Error during planning: " <> message}
@@ -148,7 +164,7 @@ defmodule InfluxElixir.Client.Local.SQLError do
   """
   @spec coercion(binary()) :: t()
   def coercion(message),
-    do: %{status: 400, body: "type_coercion\ncaused by\nError during planning: " <> message}
+    do: %{status: 400, body: @coercion <> "caused by\nError during planning: " <> message}
 
   @doc """
   The engine's SQL tokenizer error at a position: `SQL error:
@@ -187,7 +203,7 @@ defmodule InfluxElixir.Client.Local.SQLError do
   def simplify(message),
     do: %{
       status: 500,
-      body: "Optimizer rule 'simplify_expressions' failed\ncaused by\n" <> message
+      body: @optimizer <> "'simplify_expressions' failed\ncaused by\n" <> message
     }
 
   @doc """
@@ -293,7 +309,8 @@ defmodule InfluxElixir.Client.Local.SQLError do
     %{
       status: 500,
       body:
-        "type_coercion\ncaused by\nInternal error: Failed to coerce types #{operand_type} and " <>
+        @coercion <>
+          "caused by\nInternal error: Failed to coerce types #{operand_type} and " <>
           "#{bound_type} in BETWEEN expression.\nThis issue was likely caused by a bug in " <>
           "DataFusion's code. Please help us to resolve this by filing a bug report in our " <>
           "issue tracker: https://github.com/apache/datafusion/issues"

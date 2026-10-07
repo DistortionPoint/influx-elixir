@@ -29,7 +29,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
       else: lex(text, acc)
   end
 
-  def tokenize(text, []), do: lex(text, [])
+  # A condition that starts with what can start no operand (after any parentheses and signs)
+  # is not read at all: the statement is left from its `WHERE` (verified: `WHERE = 1`,
+  # `WHERE != 1 AND n`, `WHERE ) 1`, `WHERE ((>= 1))`, `WHERE -* n`).
+  def tokenize(text, []) do
+    if operand_missing?(text), do: {:syntax_error, :where_unparsed, text}, else: lex(text, [])
+  end
 
   @spec lex(binary(), list()) ::
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
@@ -49,7 +54,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp lex(<<?/, rest::binary>>, [{:op, op} | _tokens] = acc) when op in ["=~", "!~"] do
     {pattern, rest} = take_regex(rest, [])
 
-    if SQLIdentifiers.word_next?(rest),
+    if SQLIdentifiers.word_next?(rest) and not connective?(rest),
       do: {:syntax_error, :nom, rest},
       else: tokenize(rest, [{:regex, pattern} | acc])
   end
@@ -60,6 +65,46 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
 
   defp lex(<<c, rest::binary>>, acc) when c in [?=, ?<, ?>],
     do: operand(rest, {:op, <<c>>}, acc)
+
+  # A binary `+` or `-` fails where its operand should start when nothing that can start one
+  # stands there (verified: `(f +)`, `f + = 1`, `f > 1 + )` fail at the `)` or the operator).
+  defp lex(<<c, rest::binary>>, [previous | _before] = acc) when c in [?+, ?-] do
+    if operand_end?(previous) and operand_missing?(rest),
+      do: {:syntax_error, :reserved_failure, Regex.replace(~r/\A[ \t\r\n]+/, rest, "")},
+      else: tokenize(rest, [{:raw, <<c>>} | acc])
+  end
+
+  # A `*` or `/` that no operand follows is left over from itself (verified: `f * AND n`,
+  # `f > 1 AND f *`); inside parentheses the whole parenthesised condition fails, which the
+  # double does not place.
+  defp lex(<<c, rest::binary>> = text, [previous | _before] = acc) when c in [?*, ?/] do
+    cond do
+      not (operand_end?(previous) and (operand_missing?(rest) or String.trim(rest) == "")) ->
+        tokenize(rest, [{:raw, <<c>>} | acc])
+
+      open_parens(acc) == 0 ->
+        {:syntax_error, :nom, text}
+
+      true ->
+        {:error, "unsupported InfluxQL WHERE: " <> text}
+    end
+  end
+
+  # A `,` outside every parenthesis ends the condition: what follows is left over from it.
+  defp lex(<<?,, rest::binary>> = text, [previous | _before] = acc) do
+    if operand_end?(previous) and open_parens(acc) == 0,
+      do: {:syntax_error, :nom, text},
+      else: tokenize(rest, [{:raw, ","} | acc])
+  end
+
+  # A `(` after a number or a string is no call: it is left over (unless an earlier `)` closed
+  # nothing, which ends the condition first).
+  defp lex(<<?(, _rest::binary>> = text, [{kind, _value} | _before] = acc)
+       when kind in [:number, :str] do
+    if open_parens(acc) >= 0,
+      do: {:syntax_error, :nom, text},
+      else: tokenize(binary_part(text, 1, byte_size(text) - 1), [{:raw, "("} | acc])
+  end
 
   defp lex(<<c, rest::binary>>, acc) when c in [?(, ?), ?+, ?-, ?*, ?/, ?,],
     do: tokenize(rest, [{:raw, <<c>>} | acc])
@@ -134,7 +179,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   @spec number_token(binary(), binary(), list()) ::
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
   defp number_token(number, rest, acc) do
-    if leftover?(rest) do
+    if leftover?(rest) and not spaced_connective?(rest) do
       {:syntax_error, :nom, rest}
     else
       case integer_overflow(number, acc) do
@@ -150,11 +195,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # reads it.
   @spec leftover_token?(term(), binary()) :: boolean()
   defp leftover_token?({:regex, _pattern}, text),
-    do: Regex.match?(~r/^(?:[\d.'"+\-*\/,(]|[A-Za-z_])/, text) and not connective?(text)
+    do:
+      Regex.match?(~r/^(?:[\d.'"+\-*\/,(]|[A-Za-z_]|[#@$?}\][\\`{~]|!(?![=~]))/, text) and
+        not connective?(text)
 
   defp leftover_token?(previous, text),
     do:
-      operand_end?(previous) and Regex.match?(~r/^(?:['"\d]|\.\d|[A-Za-z_])/, text) and
+      operand_end?(previous) and
+        Regex.match?(~r/^(?:['"\d]|\.\d|[A-Za-z_]|[#@$?}\][\\`{~]|!(?![=~]))/, text) and
         not connective?(text)
 
   @spec operand_end?(term()) :: boolean()
@@ -162,6 +210,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp operand_end?({:duration, _total, _text}), do: true
   defp operand_end?({:raw, word}), do: String.upcase(word) in ["TRUE", "FALSE", "NOW()", ")"]
   defp operand_end?(_token), do: false
+
+  # A connective that a blank or a parenthesis follows (`100OR 1`): a number may end before it.
+  @spec spaced_connective?(binary()) :: boolean()
+  defp spaced_connective?(text), do: Regex.match?(~r/^(?:AND|OR)(?=[ \t\r\n(])/i, text)
 
   @spec connective?(binary()) :: boolean()
   defp connective?(text), do: Regex.match?(~r/^(?:AND|OR)(?![\w])/i, text)
@@ -206,6 +258,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     cond do
       reserved_kind(acc) != :nom -> {:syntax_error, reserved_kind(acc), word <> rest}
       String.trim(rest) == "" -> {:syntax_error, :operand, rest}
+      operand_missing?(rest) -> {:syntax_error, :operand, rest}
+      Regex.match?(~r/\A['".]/, rest) -> {:syntax_error, :nom, word <> rest}
       String.starts_with?(String.trim_leading(rest), "/") -> {:syntax_error, :operand, rest}
       true -> tokenize(rest, [{:raw, word} | acc])
     end
@@ -281,6 +335,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
       trimmed == "" ->
         {:syntax_error, :operand, rest}
 
+      cannot_start_operand?(trimmed) and inside_call?(acc) ->
+        {:error, "unsupported InfluxQL WHERE: " <> rest}
+
       cannot_start_operand?(trimmed) ->
         {:syntax_error, :operand, rest}
 
@@ -292,10 +349,37 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     end
   end
 
-  # A closing parenthesis, a connective or a dot with no digit after it.
+  # Whether the innermost parenthesis still open is the one of a call (a name stands before it).
+  defp inside_call?(tokens), do: inside_call?(tokens, 0)
+
+  defp inside_call?([{:raw, ")"} | rest], pending), do: inside_call?(rest, pending + 1)
+
+  defp inside_call?([{:raw, "("} | rest], 0), do: match?([{:ident, _name} | _more], rest)
+  defp inside_call?([{:raw, "("} | rest], pending), do: inside_call?(rest, pending - 1)
+  defp inside_call?([_token | rest], pending), do: inside_call?(rest, pending)
+  defp inside_call?([], _pending), do: false
+
+  defp open_parens(tokens) do
+    Enum.reduce(tokens, 0, fn
+      {:raw, "("}, depth -> depth + 1
+      {:raw, ")"}, depth -> depth - 1
+      _token, depth -> depth
+    end)
+  end
+
+  # What follows a connective or a sign and can start no operand, however many opening
+  # parentheses and signs come between: a closing parenthesis, a comparison operator or one
+  # of `* % & | ^ ,`. The blanks are those of the engine (a form feed is none).
+  @spec operand_missing?(binary()) :: boolean()
+  defp operand_missing?(rest),
+    do: Regex.match?(~r/\A[ \t\r\n(+\-]*[)=!<>*%&|^,]/, rest)
+
+  # What can start no operand after a comparison operator (verified: the error is at the end
+  # of the operator): a closing parenthesis, a comparison operator or other symbol, a connective
+  # or a dot with no digit after it.
   @spec cannot_start_operand?(binary()) :: boolean()
   defp cannot_start_operand?(text),
-    do: Regex.match?(~r/^(?:\)|[-+]?\.(?!\d)|(?:AND|OR)\b)/i, text)
+    do: Regex.match?(~r/^(?:[)=!<>*%&|^,;#@$?}\]\[\\`{~]|[-+]?\.(?!\d)|(?:AND|OR)\b)/i, text)
 
   @spec rest_after(binary(), binary()) :: binary()
   defp rest_after(text, prefix),

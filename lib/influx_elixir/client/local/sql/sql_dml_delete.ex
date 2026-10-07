@@ -38,7 +38,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlDelete do
   @spec parse([token()], token()) ::
           {:ok, [binary()], SQLDmlExpr.delete_clauses()}
           | {:error, SQLError.t() | map()}
-          | {:refuse, binary()}
+          | {:refuse, SQLDml.reason()}
   def parse(tokens, stop) do
     with {:ok, reference, rest} <- SQLDmlName.reference(skip_from(tokens)),
          {:ok, clauses} <- SQLDmlExpr.delete_clauses(rest ++ [stop]),
@@ -79,7 +79,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlDelete do
     end
   end
 
-  @spec not_function(SQLDmlExpr.delete_clauses()) :: :ok | {:refuse, binary()}
+  @spec not_function(SQLDmlExpr.delete_clauses()) :: :ok | {:refuse, SQLDml.reason()}
   defp not_function(%{function: true}), do: {:refuse, "a delete of a table function"}
   defp not_function(_clauses), do: :ok
 end

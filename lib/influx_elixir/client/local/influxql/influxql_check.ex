@@ -8,6 +8,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # past the unsigned range.
 
   alias InfluxElixir.Client.Local.{
+    InfluxQLArgs,
     InfluxQLError,
     InfluxQLGroup,
     InfluxQLParens,
@@ -48,13 +49,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # the clause after it is malformed: the condition ends there, and that
   # clause is what the engine reads next.
   @clause_keyword ~r/\b(?:GROUP|ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b/i
-  @fill_call ~r/(?<![\w])fill\s*\(/i
-  @open_operand ~r/(?:[-+*=<>(,~!]|(?<![_\/])\/|\b(?:AND|OR))\s*$/i
+
+  # The functions the engine's parser accepts in a condition: the scalar math functions.
+  @math_functions ~w(abs sin cos tan asin acos atan atan2 exp log ln log2 log10 sqrt pow floor ceil round date_part)
 
   # Where the text the double has not read starts: the clause keyword a clause swallowed
   # (`{from}`), or the `fill()` that follows a complete condition (`{:fill, from}`, see
   # `split_fill/3`), each as an offset in the text after `FROM`.
   @type unread :: {non_neg_integer()} | {:fill, non_neg_integer()}
+
+  @typep check :: (-> :ok | {:error, term()})
 
   # An error with the position the engine reports it at: the parser reads left to right, so of
   # several errors the one at the leftmost position is the one it meets.
@@ -102,7 +106,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   defp split_fill(where, masked_rest, %{"where" => {from, _length}}) when from >= 0 do
     masked = binary_part(masked_rest, from, min(byte_size(where), byte_size(masked_rest) - from))
 
-    with [{start, _size}] <- Regex.run(@fill_call, masked, return: :index),
+    with [{start, _size}] <- Regex.run(InfluxQLText.fill_call(), masked, return: :index),
          true <- clause_position?(masked, start) do
       {binary_part(where, 0, start), {:fill, from + start}}
     else
@@ -141,36 +145,138 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     [{from, length}] = Regex.run(~r/\bWHERE\s+/i, masked_rest, return: :index)
     masked = binary_part(masked_rest, from + length, byte_size(where))
 
-    with [{start, size}] <- Regex.run(@fill_call, masked, return: :index),
-         {:ok, _tokens} <- InfluxQLTokens.tokenize(binary_part(where, 0, start) <> "0", []),
-         true <- closes_nothing_before?(binary_part(masked, 0, start)) do
-      after_call = binary_part(masked, start + size, byte_size(masked) - start - size)
+    # The clauses taken out of the text (blanked) are in the statement the parser reads.
+    text = InfluxQLText.mask_literals(binary_part(whole, at, byte_size(masked_rest)))
+    calls = Regex.scan(~r/(?<![\w])([A-Za-z_]\w*)\s*\(/, masked, return: :index)
 
-      if after_call =~ ~r/^[^()]*\)/,
-        do:
-          {:error,
-           {:engine, InfluxQLError.syntax_error_body(:call, at + from + length + start, whole)}},
-        else: {:error, "unsupported InfluxQL (fill() in a WHERE)"}
+    read_calls(calls, %{
+      whole: whole,
+      at: at,
+      text: text,
+      where: where,
+      masked: masked,
+      from: from + length
+    })
+  end
+
+  # The calls of the condition, left to right: the first that fails is the answer. What
+  # stands before a call is read first: its own error, if it has one, is the engine's (the
+  # check of the `WHERE` reports it), so a call behind one is not read.
+  defp read_calls([], _ctx), do: :ok
+
+  defp read_calls([[{start, size}, {name_at, name_size}] | calls], ctx) do
+    name = ctx.masked |> binary_part(name_at, name_size) |> String.downcase()
+
+    # `now()` has no arguments to read, a connective before a parenthesis is no call.
+    if name in ["now", "and", "or", "not"] or InfluxQLText.reserved?(name),
+      do: read_calls(calls, ctx),
+      else: read_call(name, start, size, calls, ctx)
+  end
+
+  defp read_call(name, start, size, calls, ctx) do
+    with {:ok, _tokens} <- InfluxQLTokens.tokenize(binary_part(ctx.where, 0, start) <> "0", []),
+         false <- InfluxQLParens.excess_close?(binary_part(ctx.masked, 0, start)),
+         false <- top_level_comma?(binary_part(ctx.masked, 0, start)) do
+      call_at = ctx.from + start
+
+      case call_result(ctx, name, call_at, call_at + size - 1) do
+        :next -> read_calls(calls, ctx)
+        result -> result
+      end
     else
-      _earlier_error_or_none -> :ok
+      _earlier_error -> :ok
     end
   end
 
-  # Whether no `)` before the end of `text` closes a `(` that was not opened in it.
-  @spec closes_nothing_before?(binary()) :: boolean()
-  defp closes_nothing_before?(text) do
-    depth =
-      text
-      |> String.replace(~r/(?<![\w])now\s*\(\s*\)/i, "")
-      |> String.graphemes()
-      |> Enum.reduce_while(0, fn
-        "(", depth -> {:cont, depth + 1}
-        ")", 0 -> {:halt, :excess}
-        ")", depth -> {:cont, depth - 1}
-        _other, depth -> {:cont, depth}
+  # A `,` outside every parenthesis is where the condition ends: the engine leaves the rest
+  # over, so a call behind it is not read.
+  defp top_level_comma?(text) do
+    text
+    |> :binary.bin_to_list()
+    |> Enum.reduce_while(0, fn
+      ?(, depth -> {:cont, depth + 1}
+      ?), depth -> {:cont, depth - 1}
+      ?,, 0 -> {:halt, :comma}
+      _byte, depth -> {:cont, depth}
+    end)
+    |> Kernel.==(:comma)
+  end
+
+  # A call is read as the engine reads it: its arguments first. Arguments that do not read are
+  # the parser's failure where they stop (`fill(+)`, `fill(1.)`, `abs(n x)`); arguments that
+  # read are a call the engine does not know unless it is one of the scalar math functions
+  # (verified: `fill`, `mean`, `trunc` and `foo` are not; `date_part` is read elsewhere).
+  # Arguments the double cannot place are refused for a call that is no math function.
+  @spec call_result(map(), binary(), non_neg_integer(), non_neg_integer()) ::
+          :next | {:error, term()}
+  defp call_result(ctx, name, call_at, open_at) do
+    case {InfluxQLArgs.read(ctx.text, open_at), name in @math_functions} do
+      {{:ok, _stop}, false} ->
+        {:error, {:engine, InfluxQLError.syntax_error_body(:call, ctx.at + call_at, ctx.whole)}}
+
+      {{:fail, :eot}, _math?} ->
+        failure_at(ctx.at + byte_size(ctx.text), ctx.whole)
+
+      {{:fail, pos}, _math?} ->
+        failure_at(ctx.at + pos, ctx.whole)
+
+      {:unknown, false} ->
+        {:error, "unsupported InfluxQL (#{name}() in a WHERE)"}
+
+      {_read_or_unknown, true} ->
+        :next
+    end
+  end
+
+  defp failure_at(pos, whole) do
+    {_pos, error} = fail(:failure, pos, whole)
+    error
+  end
+
+  # The error the `WHERE` condition has, with where the parser meets it, for a statement whose
+  # clauses do not read: the condition comes before every clause, so its error is the
+  # engine's whatever the clauses hold (`WHERE time > now-() - 1d GROUP BY time(1h)
+  # ORDER BY host` fails at `()`, not at `host`).
+  @spec condition_error(binary(), non_neg_integer(), binary(), binary()) :: positioned() | nil
+  @doc false
+  def condition_error(whole, at, masked_rest, rest) do
+    with [{0, length}] <- Regex.run(~r/\A\s*WHERE\s+/i, masked_rest, return: :index),
+         where = condition_text(rest, masked_rest, length),
+         true <- where != "",
+         {:error, reason} = error <- first_condition_error(whole, at, masked_rest, where) do
+      positioned_condition_error(error, reason, whole)
+    else
+      _no_error_of_its_own -> nil
+    end
+  end
+
+  # An error of the engine's stands where the parser meets it. A condition the double does not
+  # read is refused first (position 0): what stands behind it may hold an error that the engine
+  # meets only if the condition reads.
+  defp positioned_condition_error(error, {:engine, body}, whole) do
+    with pos when pos != nil <- InfluxQLError.position(body, whole), do: {pos, error}
+  end
+
+  defp positioned_condition_error(error, _refusal, _whole), do: {0, error}
+
+  defp first_condition_error(whole, at, masked_rest, where) do
+    with :ok <- check_where_call(whole, at, masked_rest, where),
+         do: check_where(whole, at, masked_rest, where)
+  end
+
+  # The condition's text: up to the first clause that stands after a complete operand (a
+  # `fill(` where an operand is wanted is a call in it).
+  defp condition_text(rest, masked_rest, start) do
+    condition = binary_part(masked_rest, start, byte_size(masked_rest) - start)
+
+    stop =
+      ~r/(?<![\w])(?:GROUP(?![\w])|ORDER\s+BY|S?LIMIT|S?OFFSET|tz\s*\(|fill\s*\()/i
+      |> Regex.scan(condition, return: :index)
+      |> Enum.find_value(byte_size(condition), fn [{from, _size}] ->
+        if clause_position?(condition, from), do: from
       end)
 
-    depth != :excess
+    rest |> binary_part(start, stop) |> String.trim_trailing()
   end
 
   # Where a clause keyword stands inside a clause's text (not at its start):
@@ -193,7 +299,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # operator unless it closes a regular expression (masked to underscores up to it).
   @spec completes_operand?(binary(), non_neg_integer(), non_neg_integer()) :: boolean()
   defp completes_operand?(masked_rest, from, at),
-    do: not (binary_part(masked_rest, from, at) =~ @open_operand)
+    do: not (binary_part(masked_rest, from, at) =~ InfluxQLText.open_operand())
 
   # The error the parser meets at `unread` (`nil` for none): the clause keyword it stands at
   # is read for its own error, a `fill()` for its option and for what follows it.
@@ -256,8 +362,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   def fail(kind, pos, whole),
     do: {pos, {:error, {:engine, InfluxQLError.syntax_error_body(kind, pos, whole)}}}
 
-  # A statement the double does not read in that order: refused, the position that of the
-  # statement's start so that any error of the engine's stands before it.
+  # A statement the double does not read in that order: refused. Its position is 0, the start
+  # of the statement, so that it is the leftmost of the errors and stands before every error of
+  # the engine's: what the double has not read may hold an error that the engine meets first.
   @spec unread() :: positioned()
   @doc false
   def unread, do: {0, {:error, :unread_order}}
@@ -404,7 +511,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       {:syntax_error, kind, after_error} ->
         [{from, length}] = Regex.run(~r/\bWHERE\s+/i, masked_rest, return: :index)
         pos = at + from + length + byte_size(where) - byte_size(after_error)
-        {:error, {:engine, InfluxQLError.where_error_body(kind, pos, at + from, whole)}}
+        masked = binary_part(masked_rest, from + length, byte_size(where))
+        error_at = byte_size(where) - byte_size(after_error)
+
+        case group_failure(kind, masked, error_at) do
+          nil ->
+            {:error, {:engine, InfluxQLError.where_error_body(kind, pos, at + from, whole)}}
+
+          group ->
+            {:error, {:engine, group_failure_body(group, at + from, at + from + length, whole)}}
+        end
 
       {:ok, tokens} ->
         [{from, length}] = Regex.run(~r/\bWHERE\s+/i, masked_rest, return: :index)
@@ -415,6 +531,68 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
         :ok
     end
   end
+
+  # What the engine's parser does with a parenthesised condition that does not read inside: it
+  # is no operand, and the error is that of the operand missing where the group stands (verified:
+  # `WHERE (n > 1 'a')` is left unparsed from the `WHERE`, `AND (n > 1 'a')` fails at the end of
+  # the `AND`, `n > (1e2 = 1)` at the end of the `>`). The group is the outermost one open where
+  # the leftover stands, and a parenthesis after a name is a call, which reads its own errors.
+  @spec group_failure(atom(), binary(), non_neg_integer()) ::
+          :where_unparsed | {:operand_after, non_neg_integer()} | nil
+  defp group_failure(:nom, masked, error_at) do
+    with open when open != nil <- outermost_group(binary_part(masked, 0, error_at)) do
+      before = masked |> binary_part(0, open) |> String.trim_trailing()
+
+      cond do
+        Regex.match?(~r/\A[ \t\r\n(+\-]*\z/, before) ->
+          :where_unparsed
+
+        Regex.match?(~r/(?:\A|[^\w])(?:AND|OR)\z/i, before) ->
+          {:operand_after, byte_size(before)}
+
+        Regex.match?(~r/(?:=~|!~|!=|<>|<=|>=|=|<|>)\z/, before) ->
+          {:operand_after, byte_size(before)}
+
+        true ->
+          nil
+      end
+    end
+  end
+
+  defp group_failure(_kind, _masked, _error_at), do: nil
+
+  # Where the outermost parenthesis that is no call and is still open at the end of `text` is.
+  defp outermost_group(text) do
+    ~r/[()]/
+    |> Regex.scan(text, return: :index)
+    |> List.flatten()
+    |> Enum.reduce([], fn {at, 1}, open ->
+      case :binary.at(text, at) do
+        ?( -> [{call_or_group(text, at), at} | open]
+        ?) -> Enum.drop(open, 1)
+      end
+    end)
+    |> Enum.reverse()
+    |> Enum.find_value(fn
+      {:group, at} -> at
+      {:call, _at} -> nil
+    end)
+  end
+
+  defp call_or_group(text, at) do
+    if text
+       |> binary_part(0, at)
+       |> String.trim_trailing()
+       |> String.match?(~r/(?<![\w])(?!(?:and|or|not)\z)[A-Za-z_]\w*\s*\z/i),
+       do: :call,
+       else: :group
+  end
+
+  defp group_failure_body(:where_unparsed, where_at, _start, whole),
+    do: InfluxQLError.syntax_error_body(:nom, where_at, whole)
+
+  defp group_failure_body({:operand_after, offset}, _where_at, start, whole),
+    do: InfluxQLError.syntax_error_body(:operand, start + offset, whole)
 
   # `GROUP BY`: a first dimension that is a reserved word is "invalid GROUP BY
   # clause" where it starts; a later one leaves the list from the comma before
@@ -462,7 +640,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   @spec fill_error(binary(), non_neg_integer(), binary()) :: positioned() | nil
   @doc false
   def fill_error(whole, at, masked_rest) do
-    case Regex.run(@fill_call, masked_rest, return: :index) do
+    case Regex.run(InfluxQLText.fill_call(), masked_rest, return: :index) do
       [{call_at, _size}] ->
         read_fill_error(whole, at, binary_part(whole, at, byte_size(masked_rest)), call_at)
 
@@ -499,6 +677,65 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       [] -> :ok
       errors -> first_error(errors)
     end
+  end
+
+  @doc """
+  The first of the `checks` (functions that answer `:ok` or an error) that fails, or, when it
+  fails with a parse error of the engine's, the parse error of the checks after it that stands
+  further left in the statement: the parser reads left to right and stops at the first
+  error, whichever check finds it (`WHERE time > now-() - 1d GROUP BY time(1h) fill(- x)`
+  fails at `()`, not at `x`). A check after the first that raises has no say. A `{:final,
+  check}` reads a stretch of the statement in full (a call in the condition, whose errors
+  all stand inside it): its parse error is the answer.
+  """
+  @spec earliest([check() | {:final, check()}], binary()) :: :ok | {:error, term()}
+  def earliest([], _whole), do: :ok
+
+  def earliest([{:final, check} | checks], whole) do
+    case check.() do
+      {:error, {:engine, _body}} = error -> error
+      other -> earliest_after(other, checks, whole)
+    end
+  end
+
+  def earliest([check | checks], whole), do: earliest_after(check.(), checks, whole)
+
+  defp earliest_after(result, checks, whole) do
+    case result do
+      :ok ->
+        earliest(checks, whole)
+
+      {:error, {:engine, body}} = error ->
+        case position(body, whole) do
+          nil -> error
+          at -> further_left(checks, whole, {error, at})
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp further_left(checks, whole, best) do
+    checks
+    |> Enum.reduce(best, fn check, {_error, at} = best ->
+      with {:error, {:engine, body}} = error <- guarded(check),
+           pos when is_integer(pos) <- position(body, whole),
+           true <- pos < at do
+        {error, pos}
+      else
+        _not_further_left -> best
+      end
+    end)
+    |> elem(0)
+  end
+
+  defp position(body, whole), do: InfluxQLError.position(body, whole)
+
+  defp guarded(check) do
+    check.()
+  rescue
+    _error -> :ok
   end
 
   @doc "The error among `errors` that the parser meets first: the one at the leftmost position."

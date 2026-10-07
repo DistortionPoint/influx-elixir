@@ -2015,7 +2015,10 @@ defmodule InfluxElixir.Contract.SQLParser do
                 {"selector_min(v, time)['time']",
                  %{"selector_min(#{m}.v,#{m}.time)[time]" => first}}
               ] do
-            assert sp_query(ctx, "SELECT #{select} FROM #{m}") === {:ok, [row]}, select
+            # The last digits of a float sum, mean or variance are not reproducible (the engine
+            # itself differs from run to run), so floats compare at the relative tolerance.
+            assert {:ok, [actual]} = sp_query(ctx, "SELECT #{select} FROM #{m}")
+            InfluxElixir.TestSupport.Check.assert_rows_close([actual], [row])
           end
         end
 

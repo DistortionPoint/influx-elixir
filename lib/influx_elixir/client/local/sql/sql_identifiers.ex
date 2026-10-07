@@ -140,17 +140,64 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
 
   defp take_word(<<>>, acc), do: {Enum.reverse(acc), <<>>}
 
+  # The characters beyond ASCII that are letters (`\p{L}`), and letters or numbers (`\p{L}` and
+  # `\p{N}`), as ranges `{first, last}` found once, when this module is compiled, by the regular
+  # expression that used to classify each character as it was read (a call of it for each
+  # character of a word cost 3.4 microseconds: 5,000 accented letters took 17 ms). Beyond plane
+  # 3 and the tags of plane 14 no character is assigned a letter or a number.
+  letter = Regex.compile!("\\A\\p{L}\\z", "u")
+  letter_or_number = Regex.compile!("\\A[\\p{L}\\p{N}]\\z", "u")
+  codes = Enum.concat([0x80..0xD7FF, 0xE000..0x3FFFF, 0xE0000..0xE0FFF])
+
+  to_ranges = fn pattern ->
+    codes
+    |> Enum.filter(&Regex.match?(pattern, <<&1::utf8>>))
+    |> Enum.chunk_while(
+      nil,
+      fn
+        code, nil -> {:cont, {code, code}}
+        code, {first, last} when code == last + 1 -> {:cont, {first, code}}
+        code, range -> {:cont, range, {code, code}}
+      end,
+      fn
+        nil -> {:cont, nil}
+        range -> {:cont, range, nil}
+      end
+    )
+    |> List.to_tuple()
+  end
+
+  @letters to_ranges.(letter)
+  @words to_ranges.(letter_or_number)
+
   @doc "Whether a character starts an identifier: a letter of any script, or `_`."
   @spec word_start?(char()) :: boolean()
   def word_start?(c) when c in ?a..?z or c in ?A..?Z or c == ?_, do: true
   def word_start?(c) when c < 128, do: false
-  def word_start?(c), do: Regex.match?(~r/\A\p{L}\z/u, <<c::utf8>>)
+  def word_start?(c), do: ranged?(@letters, c)
 
   @doc "Whether a character goes on an identifier: a letter or digit of any script, or `_`."
   @spec word_char?(char()) :: boolean()
   def word_char?(c) when c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_, do: true
   def word_char?(c) when c < 128, do: false
-  def word_char?(c), do: Regex.match?(~r/\A[\p{L}\p{N}]\z/u, <<c::utf8>>)
+  def word_char?(c), do: ranged?(@words, c)
+
+  # Whether the character is in one of the sorted, disjoint ranges of a tuple.
+  @spec ranged?(tuple(), char()) :: boolean()
+  defp ranged?(ranges, c), do: ranged?(ranges, c, 0, tuple_size(ranges) - 1)
+
+  defp ranged?(_ranges, _c, low, high) when low > high, do: false
+
+  defp ranged?(ranges, c, low, high) do
+    middle = div(low + high, 2)
+    {first, last} = elem(ranges, middle)
+
+    cond do
+      c < first -> ranged?(ranges, c, low, middle - 1)
+      c > last -> ranged?(ranges, c, middle + 1, high)
+      true -> true
+    end
+  end
 
   @doc "Whether a byte is an ASCII letter, digit or `_`, for the passes that read bytes."
   @spec word_byte?(byte()) :: boolean()

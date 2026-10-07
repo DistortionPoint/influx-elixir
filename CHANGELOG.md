@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` SQL: IN pairs under NOT, regex the crate reads differently, float
+  aggregates in store order**: `NOT (i IN (NULL) AND i IN (2))` and `NOT (i IN (0) AND
+  i IN (1, 2))` kept three-valued logic where the engine folds the contradiction (256 rows for
+  Core's 300); such pairs under `NOT`/`OR` are refused by name. `\v`, possessive quantifiers
+  (`a++a`), `(?m)` or `\z` beside text with a newline, whitespace inside a counted repetition
+  and huge nested repetitions are refused (they answered PCRE's matches); a non-ASCII escape
+  is the engine's `unrecognized escape sequence`. The fixed scan order for float aggregates is
+  gone: the engine's own float `sum` differs from run to run, and the order cost 2.5 times the
+  work. `NULL = NULL` over a CTE, `OFFSET` on a one-row aggregate and `ORDER BY NULL` answer as
+  the engine does; `LIKE ... ESCAPE '\'` and `LIKE 'w' || '%'` are answered again. A deep call
+  nest in an `INSERT` was re-typed at every level (800 levels 28.6M to 9.7M reductions), and a
+  long non-ASCII word is tokenized 5 times faster.
+- **`Client.Local` InfluxQL: operators with no operand, `fill()` arguments, invalid UTF-8**:
+  `WHERE f OR =~ /a/` and `(x AND )` answered `[]`; they are the engine's `invalid
+  conditional expression` at the operator. A call's arguments in a `WHERE` are read as the
+  engine reads them (`fill(+)` is its `Nom` failure, not the call error), the leftmost parse
+  error wins across clauses, and `fill(-\f1)` is an invalid `FILL` option. InfluxQL and Flux
+  text that is not valid UTF-8, and such a database name, raised `ArgumentError`; they are
+  refused by name.
+- **Tests: load-sensitive bounds, atoms, cost and clocks**: three tests failed under heavy load
+  on Finch's 5-second pool start and checkout and a 30-second await; they no longer depend on
+  either. The atom test covers Flux, line protocol, admin names and query parameters. Every
+  cost test has a lower bound and pins the refusal it measures; batch-writer refutations stop
+  the writer first; telemetry no longer brackets the wall clock.
 - **`Client.Local` SQL: no raise on a stray character after a cast, pruning only by verified
   folds, unverified regex refused**: `n::int # a` raised `MatchError`; it is refused by name.
   `n IN (NULL, 1) AND n = 2` was counted as a one-element list and answered `[]` where the
@@ -18,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answered PCRE's matches. `s ~ 'v' || '1'` took the text between the first and last quote
   as the pattern; it is refused. `INTERVAL '+N days'` and padded intervals are the engine's
   syntax error. A CTE no longer captures `iox.m`; a CTE's negation is pruned under an empty
-  outer query. Float `sum`/`avg` and `var`/`stddev` read rows in the engine's scan order
-  (tags, then time); their last digits can still differ under a filter or grouping.
+  outer query. Float `sum`/`avg` and `var`/`stddev` were read in a scan order (tags, then
+  time; withdrawn in the next review).
   `SELECT *` no longer counts the select list's columns over every row (+15% removed).
 - **`Client.Local` InfluxQL: `fill()` behind or inside a condition, `GROUP BY` beside a
   `WHERE`, bare operands beside constants, the sign of a `fill()` number**: a `fill(` where an

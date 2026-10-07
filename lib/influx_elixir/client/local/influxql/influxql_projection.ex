@@ -177,7 +177,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
     {entries, taken}
   end
 
-  defp piece({{:multi, _kind, field, tags, _limit, _alias} = item, index}, taken, _star, _schema) do
+  defp piece(
+         {{:multi, _kind, field, tags, _limit, _alias} = item, index},
+         taken,
+         _star,
+         _schema
+       ) do
     {written, taken} = InfluxQLNames.unique(InfluxQLNames.item_name(item), taken)
 
     chosen =

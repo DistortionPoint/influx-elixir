@@ -220,7 +220,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       Enum.reduce(fields, %{}, fn field, kept ->
         field
         |> window_indices(rows, query)
-        |> Enum.reduce(kept, fn index, kept -> Map.update(kept, index, [field], &[field | &1]) end)
+        |> Enum.reduce(kept, &Map.update(&2, &1, [field], fn fields -> [field | fields] end))
       end)
 
     last = kept |> Map.keys() |> Enum.max(fn -> -1 end)

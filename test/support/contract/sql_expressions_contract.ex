@@ -6,7 +6,9 @@ defmodule InfluxElixir.Contract.SQLExpressions do
   as by the engine (rows, error status and body). Every expectation here was
   read from a Core.
 
-      use InfluxElixir.Contract.SQLExpressions, client: InfluxElixir.Client.Local, profile: :v3_core
+      use InfluxElixir.Contract.SQLExpressions,
+        client: InfluxElixir.Client.Local,
+        profile: :v3_core
 
   The `setup` callback must return `conn` and `database`, as
   for the shared contract. Every test writes its own table into the database

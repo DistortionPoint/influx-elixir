@@ -228,8 +228,8 @@ defmodule InfluxElixir.Client.Local.SQLBind do
        when op in [:regex, :not_regex] do
     with {:ok, value} <- Map.fetch(params, name),
          {:ok, pattern} <- pattern_param(value, "regex"),
-         {:ok, regex} <- SQLPredicate.compile_regex(pattern, symbol) do
-      {:ok, {op, bind_operand(left, params), {regex, symbol}}}
+         {:ok, term} <- SQLPredicate.compile_regex(pattern, symbol) do
+      {:ok, {op, bind_operand(left, params), term}}
     else
       :error -> {:ok, node}
       {:error, _error} = error -> error

@@ -35,18 +35,31 @@ defmodule InfluxElixir.TelemetryTest do
     {before, clock.()}
   end
 
+  # A wall-clock time is read apart from the monotonic clock, and the wall clock can be
+  # stepped backwards while a test runs, so no reading of it brackets an event. The
+  # monotonic readings taken around the emit, moved by the clock's offset, say where it
+  # stands; a minute either way tolerates a step and still fails a wrong unit or clock.
+  @wall_clock_tolerance_s 60
+  defp assert_wall_clock(system_time, from_mono, to_mono) do
+    offset = System.time_offset()
+    tolerance = System.convert_time_unit(@wall_clock_tolerance_s, :second, :native)
+
+    assert system_time >= from_mono + offset - tolerance
+    assert system_time <= to_mono + offset + tolerance
+  end
+
   describe "span_write/2" do
     test "emits :start event before the function executes" do
       Forward.attach([[:influx_elixir, :write, :start]])
       metadata = %{database: "testdb", point_count: 1, bytes: 42}
 
       {before, later} =
-        bracketed(&System.system_time/0, fn ->
+        bracketed(&System.monotonic_time/0, fn ->
           Telemetry.span_write(metadata, fn -> :ok end)
         end)
 
       assert_receive {:telemetry, [:influx_elixir, :write, :start], measurements, recv_meta}
-      assert measurements.system_time >= before and measurements.system_time <= later
+      assert_wall_clock(measurements.system_time, before, later)
       assert recv_meta.database === "testdb"
       assert recv_meta.point_count === 1
       assert recv_meta.bytes === 42
@@ -97,12 +110,12 @@ defmodule InfluxElixir.TelemetryTest do
       metadata = %{database: "testdb", transport: :http}
 
       {before, later} =
-        bracketed(&System.system_time/0, fn ->
+        bracketed(&System.monotonic_time/0, fn ->
           Telemetry.span_query(metadata, fn -> {:ok, []} end)
         end)
 
       assert_receive {:telemetry, [:influx_elixir, :query, :start], measurements, recv_meta}
-      assert measurements.system_time >= before and measurements.system_time <= later
+      assert_wall_clock(measurements.system_time, before, later)
       assert recv_meta.database === "testdb"
       assert recv_meta.transport === :http
     end
@@ -148,12 +161,12 @@ defmodule InfluxElixir.TelemetryTest do
   end
 
   # `system_time` is wall-clock time and `monotonic_time` the monotonic
-  # clock's, in native units: each lies between the readings taken around
-  # the emit, which an arbitrary offset or the wrong clock would fail.
+  # clock's, in native units: the monotonic time lies between the readings taken around
+  # the emit, and the wall-clock time near them (see assert_wall_clock/3).
   defp assert_start_times(emit) do
-    before = {System.system_time(), System.monotonic_time()}
+    before = System.monotonic_time()
     emit.()
-    {before, {System.system_time(), System.monotonic_time()}}
+    {before, System.monotonic_time()}
   end
 
   describe "write_start/1" do
@@ -161,11 +174,11 @@ defmodule InfluxElixir.TelemetryTest do
       Forward.attach([[:influx_elixir, :write, :start]])
       meta = %{database: "mydb", point_count: 5, bytes: 200}
 
-      {{from_system, from_mono}, {to_system, to_mono}} =
+      {from_mono, to_mono} =
         assert_start_times(fn -> Telemetry.write_start(meta) end)
 
       assert_receive {:telemetry, [:influx_elixir, :write, :start], measurements, recv_meta}
-      assert measurements.system_time >= from_system and measurements.system_time <= to_system
+      assert_wall_clock(measurements.system_time, from_mono, to_mono)
       assert measurements.monotonic_time >= from_mono and measurements.monotonic_time <= to_mono
       assert recv_meta === meta
     end
@@ -207,11 +220,11 @@ defmodule InfluxElixir.TelemetryTest do
       Forward.attach([[:influx_elixir, :query, :start]])
       meta = %{database: "mydb", transport: :http}
 
-      {{from_system, from_mono}, {to_system, to_mono}} =
+      {from_mono, to_mono} =
         assert_start_times(fn -> Telemetry.query_start(meta) end)
 
       assert_receive {:telemetry, [:influx_elixir, :query, :start], measurements, recv_meta}
-      assert measurements.system_time >= from_system and measurements.system_time <= to_system
+      assert_wall_clock(measurements.system_time, from_mono, to_mono)
       assert measurements.monotonic_time >= from_mono and measurements.monotonic_time <= to_mono
       assert recv_meta === meta
     end

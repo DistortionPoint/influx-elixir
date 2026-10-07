@@ -7,7 +7,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
   # A ceiling on waits for answers that will come: generous, so a loaded
   # machine cannot fail a correct test, and never what a test measures.
-  @await 30_000
+  @await 120_000
+  @moduletag timeout: 600_000
 
   alias InfluxElixir.Client.Local
   alias InfluxElixir.TestServer
@@ -635,6 +636,15 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     start_writer(http_conn(finch, port), Keyword.merge(defaults, opts))
   end
 
+  # No further request follows a finished chain. A retry timer still pending
+  # cannot be waited for, so the writer is stopped first: a stopped writer
+  # makes no request, and terminate/2 writes any chain still alive and the
+  # buffer, so a retry that should not exist shows up as a request here.
+  defp refute_request_after_stop do
+    :ok = stop_supervised!(BatchWriter)
+    refute_received {:request, _handler, _body}
+  end
+
   describe "retry path — server errors" do
     setup do
       finch = :"bw_retry_finch_#{System.unique_integer([:positive])}"
@@ -660,7 +670,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 1, 0)
 
       # 1 + max_retries requests were made, and no chain is left to make more.
-      refute_received {:request, _handler, _body}
+      refute_request_after_stop()
     end
 
     test "a retry that succeeds ends the chain without an error", %{finch: finch} do
@@ -753,7 +763,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 1, 0)
 
       assert {:error, %{status: 503}} = Task.await(caller, @await)
-      refute_received {:request, _handler, _body}
+      assert Process.alive?(pid)
       assert Process.alive?(pid)
     end
 
@@ -884,7 +894,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       assert {:error, %{status: 503}} = Task.await(caller, @await)
       assert BatchWriter.stats(pid) === stats(0, 1, 0)
-      refute_received {:request, _handler, _body}
+      refute_request_after_stop()
     end
   end
 

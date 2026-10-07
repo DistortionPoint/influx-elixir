@@ -17,7 +17,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
   #   * a measurement with none of them answers nothing; a function the double
   #     does not know is refused by name, never answered with nothing
 
-  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLExpr, InfluxQLNames, InfluxQLRegex}
+  alias InfluxElixir.Client.Local.{
+    InfluxQL,
+    InfluxQLError,
+    InfluxQLExpr,
+    InfluxQLNames,
+    InfluxQLRegex
+  }
 
   @numeric ~w(integer unsigned float)a
   @numeric_functions ~w(mean sum median spread stddev percentile integral abs round floor ceil sqrt ln
@@ -186,7 +192,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
 
   defp call_item_of("percentile", [{:str, content}], _field, _column) do
     {:planning_error,
-     "expected number for percentile(), got Literal(String(#{inspect(content)}))"}
+     "expected number for percentile(), got Literal(String(#{InfluxQLError.rust_debug(content)}))"}
   end
 
   defp call_item_of("percentile", [{:lit, {_kind, percent}}], field, column),

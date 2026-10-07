@@ -287,6 +287,9 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
           {:ok, {binary(), binary()}} | :not_positional | {:error, map()}
   defp positional(term, items) do
     case Integer.parse(term) do
+      {n, ""} when n > 9_223_372_036_854_775_807 ->
+        :not_positional
+
       {n, ""} when n >= 1 and n <= length(items) ->
         {:ok, Enum.at(items, n - 1)}
 
@@ -531,6 +534,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   @spec order_target(binary()) :: binary() | {:expr, SQLExpr.t()}
   defp order_target(target) do
     cond do
+      String.upcase(target) in ~w(NULL TRUE FALSE) -> order_expression(target)
       Regex.match?(~r/^\w+$/u, target) -> target
       SQLLiteral.identifier?(target) -> SQLLiteral.identifier_name(target)
       true -> order_expression(target)

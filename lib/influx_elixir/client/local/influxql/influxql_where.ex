@@ -338,8 +338,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
       )
   end
 
+  # A comparison has an operand on each side of its operator: a leaf that starts or ends with
+  # one (`= 1`, `=~ /a/`) is no comparison of constants, whatever it holds (the engine's parser
+  # refuses it where it stands, see `InfluxQLTokens`).
   defp constants_comparison?(tokens) do
     Enum.any?(tokens, &match?({:op, _op}, &1)) and
+      not match?({:op, _op}, List.first(tokens)) and
+      not match?({:op, _op}, List.last(tokens)) and
       not Enum.any?(tokens, &(match?({:ident, _name}, &1) or InfluxQLTokens.time?(&1)))
   end
 
@@ -386,23 +391,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp check_absent(_tokens, _ctx, false), do: :ok
 
   defp check_absent(tokens, {tags, _types}, true) do
-    case tokens do
-      [{:ident, _name}, {:op, _op}, partner] -> string_partner?(partner, tags)
-      [partner, {:op, _op}, {:ident, _name}] -> string_partner?(partner, tags)
-      _other -> false
-    end
-    |> case do
-      true ->
-        :ok
-
-      false ->
+    if absent_with_string_partner?(tokens, tags),
+      do: :ok,
+      else:
         throw(
           {:refused,
            "unsupported InfluxQL (a bare string or tag beside a comparison of a column " <>
              "the measurement lacks)"}
         )
-    end
   end
+
+  defp absent_with_string_partner?([{:ident, _name}, {:op, _op}, partner], tags),
+    do: string_partner?(partner, tags)
+
+  defp absent_with_string_partner?([partner, {:op, _op}, {:ident, _name}], tags),
+    do: string_partner?(partner, tags)
+
+  defp absent_with_string_partner?(_tokens, _tags), do: false
 
   defp string_partner?({:str, _content}, _tags), do: true
   defp string_partner?({:regex, _pattern}, _tags), do: true

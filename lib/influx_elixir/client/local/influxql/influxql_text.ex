@@ -87,8 +87,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
 
   @clauses ~r/^\s*(?:WHERE\s+(?<where>.+?))?\s*(?:GROUP\s+BY\s+(?<group>.+?))?\s*(?<fillcall>fill\s*\((?<fill>[^)]*)\))?\s*(?:ORDER\s+BY\s+(?:time\s+(?=ASC|DESC)|(?=ASC\b|DESC\b)|time\b)(?<dir>ASC|DESC)?)?\s*(?:LIMIT\s+(?<limit>\d+))?\s*(?:OFFSET\s+(?<offset>\d+))?\s*(?:SLIMIT\s+(?<slimit>\d+))?\s*(?:SOFFSET\s+(?<soffset>\d+))?\s*(?<tzcall>TZ\s*\(\s*'(?<tz>[^']*)'\s*\))?\s*;?\s*$/is
 
+  @open_operand ~r/(?:[-+*=<>(,~!]|(?<![_\/])\/|\b(?:AND|OR))\s*$/i
+  @fill_call ~r/(?<![\w])fill\s*\(/i
+
+  @doc """
+  Matches a masked text that ends where an operand is wanted: after an operator, a sign, a
+  comma, an opening parenthesis or a connective. A slash is an operator unless it closes a
+  regular expression (masked to underscores up to it).
+  """
+  @spec open_operand() :: Regex.t()
+  def open_operand, do: @open_operand
+
+  @doc "Matches the start of a `fill(` call in a masked text."
+  @spec fill_call() :: Regex.t()
+  def fill_call, do: @fill_call
+
   @doc """
   The regular expression that cuts what follows `FROM <measurement>` into its
+
   clauses (`where`, `group`, `fillcall` with its option `fill`, `dir`, `limit`,
   `offset`), run over a masked statement.
   """

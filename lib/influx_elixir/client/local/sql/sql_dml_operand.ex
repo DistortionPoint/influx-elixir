@@ -31,6 +31,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   alias InfluxElixir.Client.Local.{
     SQLCommonType,
+    SQLDml,
     SQLDmlExpr,
     SQLDmlName,
     SQLDmlType,
@@ -51,7 +52,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
         }
 
   @typedoc "`:ok`, the engine's error, or a refusal by name of what the double does not model."
-  @type check :: :ok | {:error, SQLError.t() | map()} | {:refuse, binary()}
+  @type check :: :ok | {:error, SQLError.t() | map()} | {:refuse, SQLDml.reason()}
 
   @typedoc "The type of an operand as far as the checks tell."
   @type type ::
@@ -82,7 +83,6 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   @bool_dummy {:bool, true}
 
   @comparisons ~w(= == <> != < > <= >= <=> ~ ~* !~ !~* ~~ ~~* !~~ !~~* AND OR)
-  @unknown_function ", a function the double does not know"
   @arithmetic ~w(+ - * / %)
   @exact [:int, :uint, :float, :decimal]
   @exact_numbers [:int, :uint, :float]
@@ -96,7 +96,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   @same_type_functions ~w(coalesce nullif greatest least min max first_value last_value)
   # The functions the engine has that the double reads (its own, `SQLFunctions`, besides these).
   @known_functions ~w(count sum avg median stddev stddev_pop var var_pop approx_distinct
-                      approx_median now current_timestamp date_trunc date_bin locf interpolate length)
+                      approx_median now current_timestamp date_trunc date_bin locf
+                      interpolate length)
 
   # The aggregate functions: a select list that calls one groups every column outside of one.
   # The calls of the time (`CURRENT_TIMESTAMP` is the call `now()`, named as it was written).
@@ -141,7 +142,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   def eager({:call, name, args}, ctx) do
     cond do
-      not known_function?(name) -> {:refuse, "a call to #{name}" <> @unknown_function}
+      not known_function?(name) -> {:refuse, {:unknown_function, name}}
       converted_alone?(name, args) -> {:refuse, "a call the planner converts on its own"}
       args == :star -> :ok
       true -> eager(args, ctx)
@@ -580,8 +581,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   planner finds with the errors of its own, where the double cannot say which comes first).
   """
   @spec unknown_function?(check()) :: boolean()
-  def unknown_function?({:refuse, "a call to " <> rest}),
-    do: String.ends_with?(rest, @unknown_function)
+  def unknown_function?({:refuse, {:unknown_function, _name}}), do: true
 
   def unknown_function?(_check), do: false
 
@@ -1231,9 +1231,14 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp lower({:cast, _inner, type, true}, _ctx), do: {cast_stand_in(type, true), []}
 
   defp lower({:call, name, args}, ctx) when is_list(args) do
-    kinds = args |> Enum.map(&type_of(&1, ctx)) |> Enum.uniq()
+    # Only a call of these over arguments of one kind, time or boolean, stands for that kind; a
+    # number or a text among the arguments settles it without typing the rest (typing each
+    # argument at every level of a nest of calls costs the square of its depth).
+    kinds =
+      if name in ~w(coalesce nullif greatest least) and not Enum.any?(args, &other_literal?/1),
+        do: args |> Enum.map(&type_of(&1, ctx)) |> Enum.uniq()
 
-    if name in ~w(coalesce nullif greatest least) and kinds in [[:time], [:bool]] do
+    if kinds in [[:time], [:bool]] do
       {if(kinds == [:time], do: @time_dummy, else: @bool_dummy), args}
     else
       {lowered, operands} = lower_all(args, ctx)
@@ -1283,6 +1288,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     do: [other, other]
 
   defp inferred(pair, _ctx), do: pair
+
+  # A literal that is neither a time nor a boolean.
+  @spec other_literal?(SQLDmlExpr.ast()) :: boolean()
+  defp other_literal?({kind, _value}) when kind in [:num, :str], do: true
+  defp other_literal?(_node), do: false
 
   @spec lower_all([SQLDmlExpr.ast()], ctx()) :: {[SQLDmlExpr.ast()], [SQLDmlExpr.ast()]}
   defp lower_all(parts, ctx) do

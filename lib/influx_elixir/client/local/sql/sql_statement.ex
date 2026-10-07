@@ -161,16 +161,24 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   starts with, `nil` when it starts with a statement word or a `(`, or the
   refusal of a first token whose printing is not known.
   """
-  @spec parser_error(binary()) :: SQLError.t() | nil
-  def parser_error(sql) do
+  @spec parser_error(binary(), SQLTokenizer.result() | nil) ::
+          SQLError.t() | nil
+  def parser_error(sql, tokenized \\ nil) do
     {blank, rest} = split_blank(sql)
 
     cond do
       not String.valid?(rest) or rest == "" or String.starts_with?(rest, "(") ->
         nil
 
+      # The parser reads a statement that begins with `CASE` as the start of an expression, and
+      # its error is wherever that expression ends (`case x` is `Expected: WHEN, found: EOF`).
+      Regex.match?(~r/\Acase\b/i, rest) ->
+        SQLError.refusal(
+          "a statement that starts with CASE: the engine's parser reads it as an expression"
+        )
+
       statement_word?(rest) ->
-        phrase_error(sql)
+        phrase_error(sql, tokenized)
 
       true ->
         case printed(rest) do
@@ -192,9 +200,10 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
 
   # The parser's error for a statement of one of these words whose next token is not one it
   # can go on with: a privilege (`GRANT x`), `AS` (`ATTACH x`), `USING` (`MERGE INTO t`).
-  @spec phrase_error(binary()) :: SQLError.t() | nil
-  defp phrase_error(sql) do
-    case SQLTokenizer.tokenize(sql) do
+  @spec phrase_error(binary(), SQLTokenizer.result() | nil) ::
+          SQLError.t() | nil
+  defp phrase_error(sql, tokenized) do
+    case tokenized || SQLTokenizer.tokenize(sql) do
       {:ok, [{:word, _printed, word, _line, _col} | rest]} -> phrase(word, rest)
       _unread -> nil
     end
@@ -550,7 +559,9 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # double does not know.
   @spec symbol(binary()) :: {:ok, binary()} | nil
   defp symbol(rest) do
-    case Enum.find(Enum.sort_by(@symbols, &(-String.length(&1))), &String.starts_with?(rest, &1)) do
+    longest_first = Enum.sort_by(@symbols, &(-String.length(&1)))
+
+    case Enum.find(longest_first, &String.starts_with?(rest, &1)) do
       nil ->
         nil
 

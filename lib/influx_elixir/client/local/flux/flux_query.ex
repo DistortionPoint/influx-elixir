@@ -103,6 +103,13 @@ defmodule InfluxElixir.Client.Local.FluxQuery do
 
   @spec flux_parse(binary()) :: {:ok, Flux.query()} | {:error, map()}
   defp flux_parse(flux) do
+    if String.valid?(flux), do: flux_read(flux), else: flux_unreadable()
+  end
+
+  defp flux_unreadable,
+    do: {:error, flux_error(400, "invalid", "Client.Local: the Flux text is not valid UTF-8")}
+
+  defp flux_read(flux) do
     # The clock untimed points are stamped with, plus a nanosecond: `stop`
     # is exclusive and the clock can read the same value for a write and
     # the query right after it, which on a real server never happen at

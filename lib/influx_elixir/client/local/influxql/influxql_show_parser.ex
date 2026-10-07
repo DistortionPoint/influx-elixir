@@ -219,7 +219,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
        {:engine,
         InfluxQLShowText.prefix() <>
           "invalid InfluxQL statement at pos 0. " <>
-          "Parsing Error: Nom(#{inspect(rest(ctx, after_show))}, Many1)"}}
+          "Parsing Error: Nom(#{InfluxQLError.rust_debug(rest(ctx, after_show))}, Many1)"}}
     else
       {:error, "unsupported InfluxQL (SHOW with blanks before it and nothing after)"}
     end

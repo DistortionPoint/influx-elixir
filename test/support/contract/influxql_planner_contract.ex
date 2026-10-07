@@ -550,6 +550,11 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           check_fix(ctx, InfluxQLDefectCases.connectives())
         end
 
+        test "an operand or a call's arguments that do not read fail where the parser stops",
+             ctx do
+          check_fix(ctx, InfluxQLDefectCases.parse_errors())
+        end
+
         @tag local_divergence:
                "what the engine answers and the double does not compute is refused by name"
         test "statements the double refuses by name, each for its own reason", ctx do

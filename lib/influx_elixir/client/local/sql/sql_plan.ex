@@ -812,13 +812,24 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     )
   end
 
-  defp unknown_prune(:uncertain) do
-    SQLError.refusal(
-      "a negation that fails beside a NULL in an IN list, a test of time for NULL, or a NOT IN " <>
-        "beside another test of its operand: whether the engine proves the query empty before " <>
-        "it plans the negation is not known"
-    )
-  end
+  defp unknown_prune(:time_null), do: not_proved("a test of time for NULL (time is never null)")
+
+  defp unknown_prune(:null_list),
+    do: not_proved("a NULL in an IN list, beside a clause the engine folds it with")
+
+  defp unknown_prune(:not_in), do: not_proved("a NOT IN list and another test of its operand")
+
+  defp unknown_prune(:respelled),
+    do: not_proved("an IN list that writes one value in two spellings (IN (1, '1'))")
+
+  defp unknown_prune(:float),
+    do: not_proved("an integer equal to a float and to something else, with a third test")
+
+  defp unknown_prune(:late_conflict),
+    do:
+      not_proved(
+        "an expression compared to different values, the first conjunct being none of them"
+      )
 
   defp unknown_prune(:nested) do
     SQLError.refusal(
@@ -841,6 +852,15 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
       "a negation in a common table expression beside a query that may fold its WHERE to " <>
         "nothing, which the double cannot tell without the types of the expression's columns: " <>
         "whether the engine plans the expression is not known"
+    )
+  end
+
+  # What the refusals of a negation that fails beside a shape the double has no rule for share.
+  @spec not_proved(binary()) :: map()
+  defp not_proved(beside) do
+    SQLError.refusal(
+      "a negation that fails beside #{beside}: whether the engine proves the query empty " <>
+        "before it plans the negation is not known"
     )
   end
 
@@ -1798,7 +1818,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   def pattern_error(kind, type, rest) when kind in [:like, :not_like],
     do: "There isn't a common type to coerce #{type} and Utf8 in #{like_word(rest)} expression"
 
-  def pattern_error(_kind, type, {_regex, op}),
+  def pattern_error(_kind, type, {_regex, op, _guard}),
     do: "Cannot infer common argument type for regex operation #{type} #{op} Utf8"
 
   # `ILIKE` is a `LIKE` whose pattern ignores case; the engine names it in

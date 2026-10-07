@@ -680,7 +680,8 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     plain =
       for ref <- where_refs(nodes),
           not (is_binary(ref) and
-                 (SQLAggExpr.placeholder?(ref) or ref in aliases or MapSet.member?(qualified, ref))),
+                 (SQLAggExpr.placeholder?(ref) or ref in aliases or
+                    MapSet.member?(qualified, ref))),
           not match?({:qualified, _relation, _name}, ref),
           do: ref
 
@@ -815,6 +816,9 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
       {:not, conjunction} ->
         where_refs(conjunction)
+
+      {:eq, :null, nil} ->
+        []
 
       {op, left, {low, high}} when op in [:between, :not_between] ->
         operand_fields(left) ++ expr_fields([low, high])

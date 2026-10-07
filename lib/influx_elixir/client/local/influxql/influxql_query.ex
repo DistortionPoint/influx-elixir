@@ -43,8 +43,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     # The engine's positions count the text as sent, blanks included.
     influxql = String.trim(raw)
 
-    # The engine parses the statement before it looks for the database.
-    with {:ok, statement} <- influxql_statement(influxql, raw) do
+    # The engine parses the statement before it looks for the database. Text that is not
+    # UTF-8 is refused first: how the engine reads it is not verified, and the double's
+    # readers (and its error bodies, which quote the text) take UTF-8.
+    with :ok <- utf8(raw),
+         {:ok, statement} <- influxql_statement(influxql, raw) do
       case statement do
         {:show, spec} ->
           show(table, conn, opts, spec)
@@ -56,6 +59,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           end
       end
     end
+  end
+
+  @spec utf8(binary()) :: :ok | {:error, map()}
+  defp utf8(text) do
+    if String.valid?(text),
+      do: :ok,
+      else: {:error, %{status: 400, body: "Client.Local: the InfluxQL text is not valid UTF-8"}}
   end
 
   @spec influxql_statement(binary(), binary()) ::
@@ -230,7 +240,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     name = Enum.find(names, &Enum.empty?(Store.tag_columns(table, database, &1)))
     tags = Store.tag_columns(table, database, name)
 
-    case influxql_where(spec.where, tags, field_types(table, database, name), Store.now_ns(), 0) do
+    types = field_types(table, database, name)
+
+    case influxql_where(spec.where, tags, types, Store.now_ns(), 0) do
       {:error, %{body: body} = error} ->
         if InfluxQL.mentions_time?(spec.where),
           do: {:error, %{error | body: InfluxQL.unframe_split(body)}}

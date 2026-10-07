@@ -60,9 +60,29 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
     ":"
   ]
 
+  @typedoc """
+  What the tokenizer makes of a text: its tokens, `:bail` for a text it does not read, or the
+  character that is not a letter, a digit or a symbol of the engine's tokenizer, in a name or on
+  its own outside quotes (the engine's parser error for it is not modelled).
+  """
+  @type result :: {:ok, tokens()} | :bail | {:unread, binary()}
+
   @doc "The tokens of a text, or `:bail` when it holds one this tokenizer does not read."
   @spec tokenize(binary()) :: {:ok, tokens()} | :bail
-  def tokenize(sql), do: tokenize(sql, 1, 1, [])
+  def tokenize(sql) do
+    case scan(sql) do
+      {:unread, _char} -> :bail
+      read -> read
+    end
+  end
+
+  @doc """
+  The same, but a character beyond ASCII that is no letter (a name with a digit of another
+  script, a symbol the engine's tokenizer reads as a character) is told apart from a text that is
+  not read at all.
+  """
+  @spec scan(binary()) :: result()
+  def scan(sql), do: tokenize(sql, 1, 1, [])
 
   @doc """
   Whether a token is a hexadecimal number (`0x1F`), which the engine reads as a binary value.
@@ -182,7 +202,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   # Tokens: `{kind, printed, upper, line, column}`
   # ---------------------------------------------------------------------------
 
-  @spec tokenize(binary(), pos_integer(), pos_integer(), tokens()) :: {:ok, tokens()} | :bail
+  @spec tokenize(binary(), pos_integer(), pos_integer(), tokens()) :: result()
   defp tokenize(<<>>, line, col, acc),
     do: {:ok, Enum.reverse([{:eof, "EOF", "EOF", line, col} | acc])}
 
@@ -229,7 +249,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   defp digit_next?(_text), do: false
 
   @spec block_comment(binary(), pos_integer(), pos_integer(), pos_integer(), tokens()) ::
-          {:ok, tokens()} | :bail
+          result()
   defp block_comment(<<"*/", rest::binary>>, 1, line, col, acc),
     do: tokenize(rest, line, col + 2, acc)
 
@@ -251,7 +271,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   # prints as the engine's tokenizer prints it: the text between the quotes,
   # undoubled, in the quotes.
   @spec quoted(binary(), binary(), byte(), atom(), pos_integer(), pos_integer(), tokens()) ::
-          {:ok, tokens()} | :bail
+          result()
   defp quoted(text, rest, mark, kind, line, col, acc) do
     case SQLIdentifiers.take_quoted(rest, mark) do
       {:ok, raw_body, after_quote} ->
@@ -277,7 +297,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
 
   # `0x1F` is a binary value to the engine, printed `X'1F'`, which the double refuses by
   # name once the text reads; any other number prints as written, with its `L`.
-  @spec number(binary(), pos_integer(), pos_integer(), tokens()) :: {:ok, tokens()} | :bail
+  @spec number(binary(), pos_integer(), pos_integer(), tokens()) :: result()
   defp number(text, line, col, acc) do
     case SQLIdentifiers.take_number(text) do
       {"0x" <> digits = raw, _rest} ->
@@ -290,7 +310,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
 
   # A token of the text as written, which may span lines, printed as the engine prints it.
   @spec raw_token(binary(), binary(), atom(), binary(), pos_integer(), pos_integer(), tokens()) ::
-          {:ok, tokens()} | :bail
+          result()
   defp raw_token(text, raw, kind, printed, line, col, acc) do
     {next_line, next_col} = advance(raw, line, col)
     token = {kind, printed, printed, line, col}
@@ -299,17 +319,44 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
 
   # A one-letter word directly before a quote prefixes a string: `E'..'` is read (it prints
   # decoded, `E'a'b'` for `E'a''b'`), `N'..'` and the others are not.
-  @spec word(binary(), pos_integer(), pos_integer(), tokens()) :: {:ok, tokens()} | :bail
+  @spec word(binary(), pos_integer(), pos_integer(), tokens()) :: result()
   defp word(text, line, col, acc) do
     literal = binary_part(text, 0, word_length(text, 0))
     after_word = binary_tail(text, literal)
 
-    if String.length(literal) == 1 and String.starts_with?(after_word, "'") do
-      if literal in ["E", "e"], do: escape_string(text, after_word, line, col, acc), else: :bail
-    else
-      emit(text, literal, :word, line, col, acc)
+    cond do
+      char = not_a_letter(literal) ->
+        {:unread, char}
+
+      String.length(literal) == 1 and String.starts_with?(after_word, "'") ->
+        if literal in ["E", "e"],
+          do: escape_string(text, after_word, line, col, acc),
+          else: :bail
+
+      true ->
+        emit(text, literal, :word, line, col, acc)
     end
   end
+
+  # A character of a word beyond ASCII that is no letter (`a٣`, `a` and a combining mark): the
+  # engine's tokenizer ends the word before it and the parser errs at it, where the double's
+  # name reads on (a digit of any script goes on a word). The double does not model that error.
+  @spec not_a_letter(binary()) :: binary() | nil
+  defp not_a_letter(literal) do
+    if byte_size(literal) == String.length(literal) do
+      nil
+    else
+      Enum.find(String.codepoints(literal), fn <<c::utf8>> ->
+        c >= 128 and not SQLIdentifiers.word_start?(c)
+      end)
+    end
+  end
+
+  # A character the tokenizer has no symbol for: beyond ASCII it is the engine's parser error,
+  # which the double does not model, and not a text to read on.
+  @spec unread(binary()) :: result()
+  defp unread(<<c::utf8, _rest::binary>>) when c >= 128, do: {:unread, <<c::utf8>>}
+  defp unread(_text), do: :bail
 
   # The bytes of the word at the start of `text` (a letter or `_`, then letters, digits, `_`
   # and `$`). Read by walking the bytes: a regex over the whole rest of the text validates all
@@ -324,7 +371,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   defp word_length(_end_or_invalid, size), do: size
 
   @spec escape_string(binary(), binary(), pos_integer(), pos_integer(), tokens()) ::
-          {:ok, tokens()} | :bail
+          result()
   defp escape_string(text, <<?', body::binary>>, line, col, acc) do
     case SQLLexer.escaped(body) do
       {:ok, decoded, rest} ->
@@ -341,7 +388,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
     do: binary_part(text, byte_size(literal), byte_size(text) - byte_size(literal))
 
   @spec placeholder(binary(), pos_integer(), pos_integer(), tokens()) ::
-          {:ok, tokens()} | :bail
+          result()
   defp placeholder(text, line, col, acc) do
     case dollar_string(text) do
       {:ok, raw} ->
@@ -373,10 +420,10 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
     end
   end
 
-  @spec symbol(binary(), pos_integer(), pos_integer(), tokens()) :: {:ok, tokens()} | :bail
+  @spec symbol(binary(), pos_integer(), pos_integer(), tokens()) :: result()
   defp symbol(text, line, col, acc) do
     case Enum.find(@symbols, &String.starts_with?(text, &1)) do
-      nil -> :bail
+      nil -> unread(text)
       "!=" -> emit(text, "!=", :symbol, line, col, acc, "<>")
       symbol -> emit(text, symbol, :symbol, line, col, acc)
     end
@@ -390,7 +437,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
           pos_integer(),
           tokens(),
           binary() | nil
-        ) :: {:ok, tokens()} | :bail
+        ) :: result()
   defp emit(text, literal, kind, line, col, acc, printed \\ nil) do
     token = {kind, printed || literal, String.upcase(literal), line, col}
     tokenize(binary_tail(text, literal), line, col + String.length(literal), [token | acc])

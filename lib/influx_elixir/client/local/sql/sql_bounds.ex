@@ -375,6 +375,9 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
     end
   end
 
+  # The NULL literal as a condition (`NULL = NULL`) disables the analysis as the comparison of
+  # `time` with NULL it stood for did, without reading a column of that name.
+  defp clause(_op, :null, _rhs, _type_of), do: [{:disabler, ["time"]}]
   defp clause(:is_not_null, "time", _rhs, _type_of), do: []
   defp clause(_op, "time", _rhs, _type_of), do: [{:disabler, ["time"]}]
 

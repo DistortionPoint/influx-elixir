@@ -1,13 +1,12 @@
 defmodule InfluxElixir.Client.Local.RetentionVisibilityTest do
   @moduledoc """
   Which points a database with a retention shows: `Retention.visible/3` against the
-  definition (a chunk is shown for as long as its newest point is), the markers the
-  store keeps so that a read with nothing expired does not look at the points, and the
-  answers a query gives either way.
+  definition (a chunk is shown for as long as its newest point is), and the answers a
+  query gives through the store.
 
   `Retention.visible/3` is tested directly because it is a pure function of its clock: the
-  public calls read the real one, and the definition is checked against many fixed clocks
-  and chunk edges that no real clock could be made to stand at.
+  public calls read the real one, and the definition is checked against several fixed
+  clocks, and cut-offs on a chunk edge, that no real clock could be made to stand at.
   """
 
   use ExUnit.Case, async: true
@@ -23,8 +22,8 @@ defmodule InfluxElixir.Client.Local.RetentionVisibilityTest do
     do: %{measurement: measurement, timestamp: @now - seconds_ago * @second, tags: %{}}
 
   # The rule as stated: the newest point of each chunk decides.
-  defp reference(points, seconds) do
-    cutoff = @now - seconds * @second
+  defp reference(points, seconds, now \\ @now) do
+    cutoff = now - seconds * @second
     chunk = fn p -> {p.measurement, Integer.floor_div(p.timestamp, @chunk)} end
 
     newest =
@@ -84,21 +83,49 @@ defmodule InfluxElixir.Client.Local.RetentionVisibilityTest do
     end
   end
 
-  describe "chunks/1 and oldest_chunk/1" do
-    test "lists each chunk of each measurement once" do
-      points = [point("m", 1), point("m", 2), point("m", 700), point("n", 1)]
+  describe "visible/3 at other clocks" do
+    # A clock `retention` seconds after a chunk edge puts the cut-off exactly on it.
+    @edge 1_667 * @chunk
 
-      assert points |> Retention.chunks() |> Enum.sort() ===
-               Enum.sort([
-                 {"m", Integer.floor_div(@now - @second, @chunk)},
-                 {"m", Integer.floor_div(@now - 700 * @second, @chunk)},
-                 {"n", Integer.floor_div(@now - @second, @chunk)}
-               ])
+    defp at(measurement, timestamp),
+      do: %{measurement: measurement, timestamp: timestamp, tags: %{}}
+
+    test "a cut-off on a chunk edge hides the chunk before it and shows the one after" do
+      now = @edge + 600 * @second
+      before_edge = at("m", @edge - 1)
+      on_edge = at("m", @edge)
+      older = at("m", @edge - @chunk - 5)
+
+      points = [older, before_edge, on_edge]
+
+      assert Retention.visible(points, 600, now) === [on_edge]
+      assert Retention.visible(points, 600, now) === reference(points, 600, now)
     end
 
-    test "the oldest chunk is the one the cut-off falls in" do
-      cutoff = Retention.cutoff(60, @now)
-      assert Retention.oldest_chunk(cutoff) === Integer.floor_div(cutoff, @chunk)
+    test "a chunk whose newest point is exactly the cut-off is shown" do
+      cutoff = @edge + 100 * @second
+      now = cutoff + 60 * @second
+      newest = at("m", cutoff)
+      earlier = at("m", @edge + 1)
+
+      assert Retention.visible([earlier, newest], 60, now) === [earlier, newest]
+      assert Retention.visible([earlier, at("m", cutoff - 1)], 60, now) === []
+    end
+
+    test "the clock decides which chunks have expired, and they only ever expire" do
+      points = for age <- [10, 700, 1_300, 1_900], do: point("m", age)
+
+      shown =
+        for shift <- [0, 600, 1_200, 1_800, 2_400] do
+          now = @now + shift * @second
+          visible = Retention.visible(points, 2_000, now)
+          assert visible === reference(points, 2_000, now)
+          length(visible)
+        end
+
+      assert shown === Enum.sort(shown, :desc)
+      assert List.first(shown) === 4
+      assert List.last(shown) === 0
     end
   end
 

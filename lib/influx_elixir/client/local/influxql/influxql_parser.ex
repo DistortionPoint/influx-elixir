@@ -8,6 +8,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
   alias InfluxElixir.Client.Local.{
     InfluxQL,
+    InfluxQLArgs,
     InfluxQLCheck,
     InfluxQLError,
     InfluxQLExpr,
@@ -79,9 +80,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
          quoted = binary_part(body, at, length),
          size = byte_size(clean),
          from when from != nil <-
-           Enum.find(0..size, &(inspect(binary_part(clean, &1, size - &1)) == quoted)) do
+           Enum.find(
+             0..size,
+             &(InfluxQLError.rust_debug(binary_part(clean, &1, size - &1)) == quoted)
+           ) do
       binary_part(body, 0, at) <>
-        inspect(binary_part(statement, from, size - from)) <>
+        InfluxQLError.rust_debug(binary_part(statement, from, size - from)) <>
         binary_part(body, at + length, byte_size(body) - at - length)
     else
       _unquoted -> body
@@ -98,6 +102,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
     with :ok <- check_comment(unclosed, clean),
          :ok <- InfluxQLCheck.check_literals(clean),
+         :ok <- check_blanks(masked_head),
          :ok <- check_supported(masked_head),
          :ok <- InfluxQLSelectCheck.check_select(clean, masked_head),
          %{"items" => items, "from" => from, "rest" => rest} <-
@@ -109,13 +114,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
          {group_result, masked_rest, rest} = InfluxQLGroup.extract(clean, at, masked_rest),
          %{} = clauses <-
            slices(InfluxQLText.clauses(), masked_rest, rest) ||
-             clauses_error(clean, at, masked_rest),
+             clean
+             |> clauses_error(at, masked_rest, rest)
+             |> readable_items_first(items, masked_items),
          {where, swallowed} = InfluxQLCheck.cut_where(masked_rest, clauses["where"]),
-         :ok <- InfluxQLCheck.check_where_call(clean, at, masked_rest, where),
-         :ok <- InfluxQLCheck.check_where(clean, at, masked_rest, where),
-         :ok <- group_error(group_result),
-         :ok <- InfluxQLCheck.check_group(clean, at, masked_rest),
-         :ok <- InfluxQLCheck.check_operands(clean, at, masked_rest, swallowed),
+         :ok <-
+           [
+             {:final, fn -> InfluxQLCheck.check_where_call(clean, at, masked_rest, where) end},
+             fn -> InfluxQLCheck.check_where(clean, at, masked_rest, where) end,
+             fn -> group_error(group_result) end,
+             fn -> InfluxQLCheck.check_group(clean, at, masked_rest) end,
+             fn -> InfluxQLCheck.check_operands(clean, at, masked_rest, swallowed) end
+           ]
+           |> InfluxQLCheck.earliest(clean)
+           |> readable_items_first(items, masked_items),
          {:ok, group} <- group_of(group_result, clauses),
          {:ok, items} <- parse_items(items, masked_items),
          {:ok, items} <- InfluxQLNames.resolve(items),
@@ -256,6 +268,62 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   defp unread(:unread_order), do: "clauses the double does not read in that order"
   defp unread(:unread_shape), do: "that shape of statement"
   defp unread(message) when is_binary(message), do: message
+
+  # The select list comes before every clause. A parse error of a clause stands only when the
+  # list reads: one the double cannot read (`derivative(usage, )`, `-*`) may be an error of
+  # the engine's before it, so the double refuses it, whatever a clause behind it holds.
+  @spec readable_items_first(:ok | {:error, term()}, binary(), binary()) ::
+          :ok | {:error, term()}
+  defp readable_items_first({:error, {:engine, _body}} = error, items, masked_items) do
+    with {:error, message} when is_binary(message) <- parse_items(items, masked_items),
+         false <- engine_reads?(masked_items) do
+      {:error, message}
+    else
+      _the_clause_error_stands -> error
+    end
+  end
+
+  defp readable_items_first(result, _items, _masked_items), do: result
+
+  # Whether every item reads as an expression for the engine, which the double only fails to
+  # compute (`usage::field` is no parse error).
+  @spec engine_reads?(binary()) :: boolean()
+  defp engine_reads?(masked_items) do
+    masked_items
+    |> InfluxQLSelectCheck.comma_pieces(0)
+    |> Enum.all?(fn {piece, _at} -> InfluxQLArgs.item?(piece) end)
+  end
+
+  # A form feed and a vertical tab are no blanks to the engine, and what it does with them
+  # outside a literal is verified in one place only: the sign of a `fill()` number
+  # (`fill(-\f1)` is an invalid option). The double reads them as blanks elsewhere, so it
+  # refuses them there.
+  @comparison ~S{(?:[A-Za-z_]\w*|"_*")\s*(?:=~|!~|!=|<>|<=|>=|=|<|>)\s*(?:'_*'|[-+]?\d+(?:\.\d+)?|/_*/)}
+  @after_condition ~S{\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|\bOFFSET\b|\bSLIMIT\b|\bSOFFSET\b|\bfill\s*\(}
+
+  @spec check_blanks(binary()) :: :ok | {:error, binary()}
+  defp check_blanks(masked) do
+    unverified = Regex.replace(~r/(fill\s*\(\s*[+-])[\f\v]/i, masked, "\\1")
+
+    if String.contains?(unverified, ["\f", "\v"]) or
+         (unverified != masked and not verified_condition?(masked)),
+       do: {:error, "unsupported InfluxQL (a form feed or vertical tab outside a literal)"},
+       else: :ok
+  end
+
+  # Whether the condition of the statement, if it has one, is plain comparisons of a name with
+  # a constant joined by `AND`/`OR`: the engine reads them as the double does, so an error
+  # that stands behind them is the one the engine meets.
+  @spec verified_condition?(binary()) :: boolean()
+  defp verified_condition?(masked) do
+    case Regex.run(~r/\bWHERE\s+(.*?)\s*(?:#{@after_condition}|\z)/is, masked) do
+      [_all, where] ->
+        Regex.match?(~r/\A#{@comparison}(?:\s+(?:AND|OR)\s+#{@comparison})*\z/i, where)
+
+      nil ->
+        true
+    end
+  end
 
   @spec check_supported(binary()) :: :ok | {:error, binary()}
   defp check_supported(masked) do
@@ -452,9 +520,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # `LIMIT`, `OFFSET` or another `fill()` is left over from itself (verified);
   # one elsewhere that the grammar did not take is where the double does not
   # read it.
-  @spec clauses_error(binary(), non_neg_integer(), binary()) :: {:error, term()}
-  defp clauses_error(whole, at, masked_rest) do
-    case clause_error(whole, at, masked_rest) do
+  @spec clauses_error(binary(), non_neg_integer(), binary(), binary()) :: {:error, term()}
+  defp clauses_error(whole, at, masked_rest, rest) do
+    case clause_error(whole, at, masked_rest, rest) do
       {:error, :unread_order} ->
         if Regex.match?(~r/\bfill\s*\(/i, masked_rest),
           do: {:error, "unsupported InfluxQL (fill() outside GROUP BY)"},
@@ -468,8 +536,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # The first clause the engine's parser stops at: each clause keyword in turn is
   # read for its own error; when none has one, the clauses are in an order the
   # double does not read.
-  @spec clause_error(binary(), non_neg_integer(), binary()) :: {:error, term()}
-  defp clause_error(whole, at, masked_rest) do
+  @spec clause_error(binary(), non_neg_integer(), binary(), binary()) :: {:error, term()}
+  defp clause_error(whole, at, masked_rest, rest) do
+    case InfluxQLCheck.condition_error(whole, at, masked_rest, rest) do
+      {_pos, error} -> error
+      nil -> clauses_stop(whole, at, masked_rest)
+    end
+  end
+
+  @spec clauses_stop(binary(), non_neg_integer(), binary()) :: {:error, term()}
+  defp clauses_stop(whole, at, masked_rest) do
     stop =
       ~r/\b(?:GROUP|ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b/i
       |> Regex.scan(masked_rest, return: :index)

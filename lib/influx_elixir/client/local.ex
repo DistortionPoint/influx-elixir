@@ -235,7 +235,8 @@ defmodule InfluxElixir.Client.Local do
       and its kin without parentheses, `TIMESTAMP '...'` and the other typed
       literals, the difference of two timestamps, the `system.*` tables and
       the other `information_schema` views, `SHOW` other than `TABLES` and
-      `COLUMNS`, `concat`, `trim`, `replace`, `bool_and`, `array_agg`, `FILTER (WHERE ...)`, a `HAVING`
+      `COLUMNS`, `concat`, `trim`, `replace`, `bool_and`, `array_agg`,
+      `FILTER (WHERE ...)`, a `HAVING`
       that is no comparison or has no `GROUP BY`, `COALESCE` of text with a
       number, and a comparison of `time` inside a select item. The last
       digit of `var_*` and `stddev*` can differ from the engine's, whose

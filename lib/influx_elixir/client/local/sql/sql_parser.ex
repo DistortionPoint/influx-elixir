@@ -261,7 +261,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     {sql, cross_join} =
       sql |> String.trim() |> SQLNoFrom.add_table() |> SQLQualifier.split_cross_join()
 
-    with {:ok, {normalised, qualifier, qualified, zones}} <- SQLQualifier.strip(sql, cross_join) do
+    with {:ok, {normalised, qualifier, qualified, zones}} <-
+           SQLQualifier.strip(sql, cross_join) do
       parse_stripped(normalised, qualifier, qualified, zones, cross_join)
     end
   end

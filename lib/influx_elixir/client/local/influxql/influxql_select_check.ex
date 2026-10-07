@@ -4,9 +4,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # reporting the position the engine reports (see
   # `InfluxElixir.Client.Local.InfluxQLError`).
 
-  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLText}
+  alias InfluxElixir.Client.Local.{InfluxQLArgs, InfluxQLError, InfluxQLText}
 
   @select_start ~r/^\s*SELECT(?![\w])\s*/i
+  @regex_column ~r/^\/(?:[^\/\\]|\\.)+\/(?:\s+AS\s+(?:"[^"]+"|\w+))?$/s
 
   # An operator, what follows it up to the operand (signs and opening
   # parentheses) and the word the operand starts with.
@@ -63,7 +64,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
 
       :none ->
         rest = masked |> binary_part(items_at, byte_size(masked) - items_at) |> String.trim()
-        body = reserved_operand(rest, items_at, whole)
+        body = reserved_operand(rest, items_at, whole, :off)
         {:error, {:engine, body || InfluxQLError.syntax_error_body(:nom, 0, whole)}}
     end
   end
@@ -194,31 +195,45 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
 
     pieces
     |> Enum.with_index()
-    |> Enum.find_value(:ok, fn {{piece, at}, index} ->
-      case check_item(whole, piece, at, index, index == last, from_keyword_at) do
-        :ok -> nil
-        error -> error
+    |> Enum.reduce_while(true, fn {{piece, at}, index}, prior_read? ->
+      case check_item(whole, piece, at, {index, index == last, prior_read?}, from_keyword_at) do
+        :ok -> {:cont, prior_read? and readable_piece?(piece)}
+        error -> {:halt, error}
       end
     end)
+    |> case do
+      {:error, _reason} = error -> error
+      _all_checked -> :ok
+    end
+  end
+
+  # Whether the engine reads the item: an expression with an alias, or a regular expression for
+  # columns. An item behind one that it may not read is not read for the failures it holds, the
+  # statement being unreadable before it.
+  @spec readable_piece?(binary()) :: boolean()
+  defp readable_piece?(piece) do
+    text = String.trim(piece)
+    InfluxQLArgs.item?(text) or Regex.match?(@regex_column, text)
   end
 
   @spec check_item(
           binary(),
           binary(),
           non_neg_integer(),
-          non_neg_integer(),
-          boolean(),
+          {non_neg_integer(), boolean(), boolean()},
           non_neg_integer()
         ) ::
           :ok | {:error, term()}
-  defp check_item(whole, piece, at, index, last?, from_keyword_at) do
+  defp check_item(whole, piece, at, {index, last?, prior_read?}, from_keyword_at) do
     text = String.trim_leading(piece)
     start = at + byte_size(piece) - byte_size(text)
     text = String.trim_trailing(text)
 
+    eot = list_end(prior_read?, last?, from_keyword_at, at + byte_size(piece))
+
     cond do
       # A regular expression for columns (`/re/`, `/re/ AS x`) is no division.
-      text =~ ~r/^\/(?:[^\/\\]|\\.)+\/(?:\s+AS\s+(?:"[^"]+"|\w+))?$/s ->
+      Regex.match?(@regex_column, text) ->
         :ok
 
       String.downcase(text) == "distinct" and last? ->
@@ -230,7 +245,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
       index > 0 and unreadable_start?(text) ->
         {:error, {:engine, InfluxQLError.syntax_error_body(:nom, 0, whole)}}
 
-      body = reserved_operand(text, start, whole) ->
+      body = reserved_operand(text, start, whole, eot) ->
         {:error, {:engine, body}}
 
       pos = reserved_alias(text, start) ->
@@ -243,6 +258,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
         :ok
     end
   end
+
+  # Where the text of the list ends for a call or an operator left open: before the `FROM` that
+  # ends it, or the `,` that ends the item; `:off` for an item behind one the engine may not read.
+  defp list_end(false, _last?, _from_keyword_at, _comma_at), do: :off
+  defp list_end(true, true, from_keyword_at, _comma_at), do: from_keyword_at
+  defp list_end(true, false, _from_keyword_at, comma_at), do: comma_at
 
   # Whether an item after the first cannot start a field.
   @spec unreadable_start?(binary()) :: boolean()
@@ -284,12 +305,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # The first place a reserved word stands where an operand is wanted: after
   # a binary operator, or first in a call's parentheses. The engine fails
   # there (see `check_select/2`).
-  @spec reserved_operand(binary(), non_neg_integer(), binary()) :: binary() | nil
-  defp reserved_operand(text, start, whole) do
+  @spec reserved_operand(binary(), non_neg_integer(), binary(), non_neg_integer() | :off) ::
+          binary() | nil
+  defp reserved_operand(text, start, whole, eot) do
     [
       operator_hit(text, start, whole),
       argument_hit(text, start, whole),
-      wildcard_hit(text, start, whole)
+      wildcard_hit(text, start, whole),
+      list_hit(text, start, whole, eot),
+      leftover_hit(text, start, whole, eot)
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.min_by(&elem(&1, 0), fn -> nil end)
@@ -347,6 +371,33 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
       true -> {at, InfluxQLError.syntax_error_body(:distinct, at + token_at, whole)}
     end
   end
+
+  # The arguments of a call that are not `expression {, expression}` closed by `)`: the engine
+  # fails where they stop reading (see `InfluxQLArgs`). A call left open at the end of the list
+  # fails at the `FROM` that ends it (`eot`), which only the last item has. With no `FROM`
+  # (`:off`) the text is the whole statement, not a list, and is not read.
+  @spec list_hit(binary(), non_neg_integer(), binary(), non_neg_integer() | :off) ::
+          {non_neg_integer(), binary()} | nil
+  defp list_hit(_text, _start, _whole, :off), do: nil
+
+  defp list_hit(text, start, whole, eot) do
+    case InfluxQLArgs.item_failure(text) do
+      {:fail, :eot} when is_integer(eot) -> failure_hit(eot, whole)
+      {:fail, at} when is_integer(at) -> failure_hit(start + at, whole)
+      _read_or_unknown -> nil
+    end
+  end
+
+  # A select item followed by what is no part of it leaves the statement unparsed from its
+  # start; the position it ranks at is where the leftover starts.
+  defp leftover_hit(_text, _start, _whole, :off), do: nil
+
+  defp leftover_hit(text, start, whole, _eot) do
+    with at when at != nil <- InfluxQLArgs.item_leftover(text),
+         do: {start + at, InfluxQLError.syntax_error_body(:nom, 0, whole)}
+  end
+
+  defp failure_hit(pos, whole), do: {pos, InfluxQLError.syntax_error_body(:failure, pos, whole)}
 
   # A regular expression stands alone in a call's parentheses: the engine fails
   # from whatever follows it (`percentile(/re/, 90)` fails at the comma). A `*`

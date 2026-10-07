@@ -65,7 +65,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
          :ok <- SQLDmlName.arity(parsed.reference),
          :ok <- partitioned(parsed.partitioned),
          :ok <- default_values(parsed.source),
-         :ok <- returning(parsed.trailing) do
+         :ok <- returning(parsed.trailing),
+         :ok <- readable(parsed.source) do
       planned(parsed.reference, parsed.listed, continued(parsed.source, parsed.trailing), env)
     else
       {:error, error} -> error
@@ -73,13 +74,34 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
     end
   end
 
+  # A value the double cannot read may hold the parse error the engine reports before it plans
+  # anything (`VALUES (f, case when when ...)` is a parse error, not the `f` that is no column):
+  # the planner's errors of the cells it did read are not the engine's answer, so the statement
+  # is refused.
+  @spec readable(term()) :: :ok | {:refuse, SQLDml.reason()}
+  defp readable({:values, rows}) do
+    case rows |> Enum.concat() |> Enum.find(&unread?/1) do
+      {:opaque, why} -> {:refuse, why}
+      nil -> :ok
+    end
+  end
+
+  defp readable(_source), do: :ok
+
+  # A cell the double cannot plan whose text it did read to the end (a type it does not model is
+  # still a type name to the parser) cannot hide a parse error; any other can.
+  @spec unread?(SQLDmlExpr.cell()) :: boolean()
+  defp unread?({:opaque, "the type " <> _name}), do: false
+  defp unread?({:opaque, _why}), do: true
+  defp unread?(_cell), do: false
+
   @doc """
   What the parser reads of an `INSERT` from the tokens after the keyword and the token that ends
   it: its errors are the parser's own, which a statement that is followed by another has before
   it is planned.
   """
   @spec parse([token()], token()) ::
-          {:ok, parsed()} | {:error, SQLError.t() | map()} | {:refuse, binary()}
+          {:ok, parsed()} | {:error, SQLError.t() | map()} | {:refuse, SQLDml.reason()}
   def parse([{:word, _p, word, _l, _c} | _rest], _stop)
       when word in ["OVERWRITE", "OR", "IGNORE"],
       do: {:refuse, "that spelling"}
@@ -117,7 +139,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
 
   # `PARTITION (expr, ...)` between the table and the columns or the source.
   @spec partition([token()]) ::
-          {:ok, boolean(), [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, boolean(), [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   defp partition([
          {:word, _p, "PARTITION", _l, _c} | [{:symbol, "(", _u, _l2, _c2} | _more] = rest
        ]) do
@@ -166,7 +188,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
 
   # What the parser says of the text after the table and its column list, and the source.
   @spec source([token()], term(), token()) ::
-          {:ok, source(), [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, source(), [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   defp source([{kind, _p, upper, _l, _c} = token], _listed, _stop) when is_end(kind, upper),
     do: {:error, SQLDdl.expected(@query_body, token)}
 
@@ -201,7 +223,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
 
   # `WITH name AS (`: what the parser says before the body; the body is not read.
   @spec with_head([token()]) ::
-          {:ok, source(), [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, source(), [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   defp with_head([{:word, _p, name, _l, _c} | rest]) when name not in ["RECURSIVE"] do
     case rest do
       [{:word, _p2, "AS", _l2, _c2}, {:symbol, "(", _u, _l3, _c3} | _more] ->
@@ -221,7 +243,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   defp with_head(_tokens), do: {:refuse, "a WITH the double does not read"}
 
   @spec table_source([token()], token()) ::
-          {:ok, source(), [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, source(), [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   defp table_source([{:word, printed, _u, _l, _c}, next | more], _stop) do
     case trailing_syntax([next | more]) do
       :ok -> {:ok, {:table, printed}, [next | more]}
@@ -234,7 +256,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
 
   # `( query )` is the query; one that does not close is the parser's error.
   @spec parenthesized([token()], term(), token()) ::
-          {:ok, source(), [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, source(), [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   defp parenthesized([_open | rest], listed, stop) do
     case closing(rest, 0, []) do
       {:ok, inner, trailing} ->
@@ -347,7 +369,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   # The columns the source's values go to, in order: the ones listed (checked one by one), or
   # all of the table's.
   @spec targets([{binary(), boolean()}] | nil, [binary()]) ::
-          {:ok, [binary()]} | {:error, map()} | {:refuse, binary()}
+          {:ok, [binary()]} | {:error, map()} | {:refuse, SQLDml.reason()}
   defp targets(nil, columns), do: {:ok, columns}
 
   defp targets(listed, columns) do
@@ -368,7 +390,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
     }
 
   # A quoted name that a column has in lower case gets the planner's hint on case.
-  @spec unknown(binary(), boolean(), [binary()]) :: {:error, map()} | {:refuse, binary()}
+  @spec unknown(binary(), boolean(), [binary()]) :: {:error, map()} | {:refuse, SQLDml.reason()}
   defp unknown(name, false, columns),
     do: {:error, SQLDmlName.no_field(SQLDmlName.quote_ident(name), name, nil, columns)}
 
@@ -386,7 +408,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   end
 
   @spec plan_source(source(), [binary() | nil], SQLDml.env()) ::
-          :ok | {:error, map()} | {:refuse, binary()}
+          :ok | {:error, map()} | {:refuse, SQLDml.reason()}
   defp plan_source({:unmodelled, why}, _types, _env), do: {:refuse, why}
 
   defp plan_source({:table, name}, _types, _env) do
@@ -405,7 +427,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   # ---------------------------------------------------------------------------
 
   @spec plan_values([[SQLDmlExpr.cell()]], [binary() | nil], SQLDml.env()) ::
-          :ok | {:error, map()} | {:refuse, binary()}
+          :ok | {:error, map()} | {:refuse, SQLDml.reason()}
   defp plan_values(rows, types, env) do
     ctx = SQLDml.empty_context(env)
 
@@ -528,7 +550,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   # ---------------------------------------------------------------------------
 
   @spec plan_select(SQLDmlExpr.select(), [binary() | nil], SQLDml.env()) ::
-          :ok | {:error, map()} | {:refuse, binary()}
+          :ok | {:error, map()} | {:refuse, SQLDml.reason()}
   defp plan_select(%{items: items, from: from}, types, env) do
     with {:ok, ctx, columns} <- select_context(from, env),
          expanded = expand(items, columns),
@@ -544,7 +566,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   end
 
   @spec select_context({[binary()], binary() | nil} | nil, SQLDml.env()) ::
-          {:ok, SQLDmlOperand.ctx(), [binary()]} | {:error, map()} | {:refuse, binary()}
+          {:ok, SQLDmlOperand.ctx(), [binary()]} | {:error, map()} | {:refuse, SQLDml.reason()}
   defp select_context(nil, env), do: {:ok, SQLDml.empty_context(env), []}
 
   defp select_context({reference, alias_name}, env) do

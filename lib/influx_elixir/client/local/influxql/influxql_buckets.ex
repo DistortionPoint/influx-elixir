@@ -59,8 +59,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   order. `compute` gives the named results of the aggregates over the rows of
   a bucket. Options: `:lower` and `:upper` (inclusive bounds in nanoseconds
   or `nil`), `:now` and `:descending` (the buckets come latest first; a
-  fill that looks back or ahead reads them all). Throws `{:refused, message}` for what the double does
-  not read as the engine.
+  fill that looks back or ahead reads them all). Throws `{:refused, message}` for what the
+  double does not read as the engine.
   """
   @spec series(
           [map()],

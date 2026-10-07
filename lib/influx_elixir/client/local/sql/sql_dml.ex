@@ -50,7 +50,7 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   Plans an operand as a select item of the table (of no table for `nil`), the errors it has
   there.
   """
-  @type planner :: (binary() | nil, binary() -> :ok | {:error, term()} | {:refuse, binary()})
+  @type planner :: (binary() | nil, binary() -> :ok | {:error, term()} | {:refuse, reason()})
 
   @typedoc "What a statement is planned against: the tables, their columns and the planner."
   @type env :: %{tables: [binary()], columns_of: columns_of(), planner: planner()}
@@ -142,14 +142,31 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   def dml(:update), do: SQLError.planning("DML not supported: Update")
   def dml(:delete), do: SQLError.planning("DML not supported: Delete")
 
+  @typedoc """
+  Why a statement is refused: the words that finish "an INSERT with ...", or one of the causes
+  the callers tell apart, which are tags and not words they search for in a message:
+  `{:cut_off, why}` for a statement that ends (at its `;`) inside a value the double cannot read,
+  and `{:unknown_function, name}` for a call of a function the double does not know.
+  """
+  @type reason :: binary() | {:cut_off, binary()} | {:unknown_function, binary()}
+
   @doc false
-  @spec not_modelled(:insert | :update | :delete, binary()) :: SQLError.t()
+  @spec not_modelled(:insert | :update | :delete, reason()) :: SQLError.t()
   def not_modelled(kind, why) do
     SQLError.refusal(
-      "#{kind |> Atom.to_string() |> String.upcase()} with #{why}: the engine's answer for it " <>
-        "is not modelled"
+      "#{kind |> Atom.to_string() |> String.upcase()} with #{reason_text(why)}: the engine's " <>
+        "answer for it is not modelled"
     )
   end
+
+  @spec reason_text(reason()) :: binary()
+  defp reason_text({:cut_off, why}),
+    do: "a statement that ends inside a value the double cannot read: " <> why
+
+  defp reason_text({:unknown_function, name}),
+    do: "a call to #{name}, a function the double does not know"
+
+  defp reason_text(why), do: why
 
   @doc false
   @type table :: binary() | {:catalog, [SQLTable.column()]}
@@ -253,7 +270,7 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   @spec parse_update([token()], token()) ::
           {:ok, [binary()], SQLDmlExpr.clauses(), boolean()}
           | {:error, SQLError.t() | map()}
-          | {:refuse, binary()}
+          | {:refuse, reason()}
   defp parse_update(
          [{:word, _p, "OR", _l, _c}, {:word, _p2, conflict, _l2, _c2} | rest],
          stop
@@ -310,7 +327,7 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   # An alias that names the columns names all of them (and then renames the fields, which the
   # double does not model).
   @spec alias_columns(non_neg_integer() | nil, [binary()]) ::
-          :ok | {:error, map()} | {:refuse, binary()}
+          :ok | {:error, map()} | {:refuse, reason()}
   defp alias_columns(nil, _columns), do: :ok
 
   defp alias_columns(count, columns) when count == length(columns),

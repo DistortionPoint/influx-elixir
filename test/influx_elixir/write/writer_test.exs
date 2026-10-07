@@ -63,7 +63,7 @@ defmodule InfluxElixir.Write.WriterTest do
 
     test "the :client opt selects the client and is not forwarded to it" do
       finch = :"writer_test_finch_#{System.unique_integer([:positive])}"
-      start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
+      start_supervised!({Finch, name: finch, pools: %{"http://127.0.0.1:1" => [size: 1]}})
       http_conn = [host: "127.0.0.1", port: 1, scheme: :http, token: "t", finch_name: finch]
 
       # Only the HTTP client can produce a transport error.

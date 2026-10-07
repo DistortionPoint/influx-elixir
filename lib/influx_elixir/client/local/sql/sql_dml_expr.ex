@@ -13,7 +13,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   # array, a window, a typed string, a placeholder) is a refusal by name: its answer was not
   # verified. The tree is typed and checked by `InfluxElixir.Client.Local.SQLDml`.
 
-  alias InfluxElixir.Client.Local.{SQLDdl, SQLDmlName, SQLDmlType, SQLError, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{SQLDdl, SQLDml, SQLDmlName, SQLDmlType, SQLError, SQLTokenizer}
 
   @typedoc "A name written in a statement: its text (lower case when unquoted) and whether quoted."
   @type name :: {binary(), boolean()}
@@ -51,11 +51,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
         }
 
   @typep token :: SQLTokenizer.token()
-  @typep parsed(t) :: {:ok, t, [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+  @typep parsed(t) :: {:ok, t, [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
 
   # A word that begins no alias, so that what follows it is read as the clause it opens.
   @alias_reserved ~w(WITH SELECT WHERE GROUP ORDER UNION EXCEPT INTERSECT LIMIT OFFSET FETCH
-                     VALUES HAVING ON USING SET RETURNING WINDOW QUALIFY)
+                     VALUES HAVING ON USING SET RETURNING WINDOW QUALIFY END WHEN THEN ELSE)
   # A word that opens a join or a `FROM` where the engine reads more of the table.
   @join_words ~w(FROM JOIN INNER CROSS LEFT RIGHT FULL OUTER NATURAL)
 
@@ -83,7 +83,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   The clauses of an update from the tokens after its table, the token that ends the
   statement last.
   """
-  @spec clauses([token()]) :: {:ok, clauses()} | {:error, SQLError.t()} | {:refuse, binary()}
+  @spec clauses([token()]) ::
+          {:ok, clauses()} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   def clauses(tokens) do
     with {:ok, function, tokens} <- table_args(tokens),
          {:ok, alias_name, alias_columns, rest} <- alias_with_columns(tokens),
@@ -118,7 +119,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   @spec alias_with_columns([token()]) ::
           {:ok, binary() | nil, non_neg_integer() | nil, [token()]}
           | {:error, SQLError.t()}
-          | {:refuse, binary()}
+          | {:refuse, SQLDml.reason()}
   defp alias_with_columns(tokens) do
     with {:ok, name, rest} <- alias_word(tokens), do: alias_columns(name, rest)
   end
@@ -390,7 +391,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   the table as written.
   """
   @spec delete_clauses([token()]) ::
-          {:ok, delete_clauses()} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, delete_clauses()} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   def delete_clauses([{:word, _p, upper, _l, _c} | _rest]) when upper in @join_words,
     do: {:refuse, "a delete that goes on with #{String.downcase(upper)}"}
 
@@ -451,11 +452,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   planned by an insert), in either order.
   """
   @spec query_suffix([token()]) ::
-          {:ok, [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   def query_suffix(tokens), do: query_suffix(tokens, [])
 
   @spec query_suffix([token()], [binary()]) ::
-          {:ok, [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   defp query_suffix([{:word, _p, word, _l, _c} | more] = tokens, seen)
        when word in ["LIMIT", "OFFSET"] do
     if word in seen do
@@ -571,7 +572,6 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
     end
   end
 
-  @cut_off "a statement that ends inside a value the double cannot read: "
   @openers ["(", "[", "{"]
 
   @doc """
@@ -579,8 +579,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   cannot read: the engine's parse error for it was not verified, and a text of several
   statements must not be taken for one whose first reads.
   """
-  @spec cut_off?(binary()) :: boolean()
-  def cut_off?(@cut_off <> _why), do: true
+  @spec cut_off?(SQLDml.reason()) :: boolean()
+  def cut_off?({:cut_off, _why}), do: true
   def cut_off?(_why), do: false
   @closers [")", "]", "}"]
 
@@ -596,7 +596,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
 
   # The tokens of a statement end at its `;` or its end, which a cell the parser stopped at
   # may not reach: what the engine says of such a cell was not verified.
-  defp skip_cell([], _depth, why), do: {:refuse, @cut_off <> why}
+  defp skip_cell([], _depth, why), do: {:refuse, {:cut_off, why}}
   defp skip_cell([{:eof, _p, _u, _l, _c} | _rest], _depth, why), do: {:refuse, why}
   defp skip_cell([_token | rest], depth, why), do: skip_cell(rest, depth, why)
 
@@ -632,7 +632,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   The items and the table of a plain `SELECT items [FROM table [[AS] alias]]` from the tokens
   after the keyword.
   """
-  @spec select([token()]) :: {:ok, select()} | {:error, SQLError.t()} | {:refuse, binary()}
+  @spec select([token()]) :: {:ok, select()} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   def select([{:word, _p, upper, _l, _c} | _rest]) when upper in ["DISTINCT", "ALL", "TOP"],
     do: {:refuse, "a select with #{String.downcase(upper)}"}
 
@@ -692,7 +692,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp select_more(rest, found), do: {:ok, Enum.reverse(found), rest}
 
   @spec select_from([token()], [term()]) ::
-          {:ok, select()} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, select()} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   defp select_from([{:word, _p, "FROM", _l, _c} | rest], items) do
     with {:ok, parts, rest} <- SQLDmlName.reference(rest),
          {:ok, alias_name, rest} <- alias_name(rest) do
@@ -734,7 +734,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   end
 
   # The precedence of the operator the tokens begin with, and which it is.
-  @spec operator([token()]) :: :none | {non_neg_integer(), term()} | {:refuse, binary()}
+  @spec operator([token()]) :: :none | {non_neg_integer(), term()} | {:refuse, SQLDml.reason()}
   defp operator([{:word, _p, "OR", _l, _c} | _rest]), do: {5, :or}
   defp operator([{:word, _p, "AND", _l, _c} | _rest]), do: {10, :and}
   defp operator([{:word, _p, "IS", _l, _c} | _rest]), do: {17, :is}
@@ -888,7 +888,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
 
   # `CAST(x)` and `CAST(x, y)` without `AS` are read by the engine as a call of a function named
   # `cast`.
-  @spec as_word([token()]) :: {:ok, [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+  @spec as_word([token()]) ::
+          {:ok, [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   defp as_word([{:word, _p, "AS", _l, _c} | rest]), do: {:ok, rest}
 
   defp as_word([{:symbol, close, _u, _l, _c} | _rest]) when close in [")", ","],
@@ -962,6 +963,18 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
        when upper in @typed_strings,
        do: {:refuse, "a typed string"}
 
+  # A `CASE` the parser reads whole is an expression the double does not model. One it cannot read
+  # is not an error of its own: the engine's parser tries the `CASE` and, failing, reads the
+  # word as a name (`CASE WHEN WHEN` is the name `case` and a `WHEN` where the statement goes
+  # on, verified), so what follows is the error.
+  defp prefix([{:word, _p, "CASE", _l, _c} | rest] = tokens) do
+    case case_tail(rest) do
+      :ok -> {:refuse, "case in an operand"}
+      :malformed -> reference(tokens)
+      {:refuse, _why} = refusal -> refusal
+    end
+  end
+
   defp prefix([{:word, _p, upper, _l, _c} | _rest]) when upper in @refused_words,
     do: {:refuse, "#{String.downcase(upper)} in an operand"}
 
@@ -994,6 +1007,45 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
     do: {:refuse, "#{symbol} in an operand"}
 
   defp prefix([token | _rest]), do: {:error, SQLDdl.expected("an expression", token)}
+
+  # What follows `CASE`: `[operand] WHEN a THEN b [WHEN ...] [ELSE c] END`.
+  @spec case_tail([token()]) :: :ok | :malformed | {:refuse, SQLDml.reason()}
+  defp case_tail(tokens) do
+    with {:ok, rest} <- case_operand(tokens),
+         {:ok, rest} <- case_whens(rest, 0),
+         {:ok, rest} <- case_else(rest),
+         do: case_end(rest)
+  end
+
+  defp case_operand([{:word, _p, "WHEN", _l, _c} | _more] = tokens), do: {:ok, tokens}
+  defp case_operand(tokens), do: case_part(tokens)
+
+  defp case_whens([{:word, _p, "WHEN", _l, _c} | rest], count) do
+    with {:ok, rest} <- case_part(rest),
+         {:ok, rest} <- case_word(rest, "THEN"),
+         {:ok, rest} <- case_part(rest),
+         do: case_whens(rest, count + 1)
+  end
+
+  defp case_whens(_tokens, 0), do: :malformed
+  defp case_whens(tokens, _count), do: {:ok, tokens}
+
+  defp case_else([{:word, _p, "ELSE", _l, _c} | rest]), do: case_part(rest)
+  defp case_else(tokens), do: {:ok, tokens}
+
+  defp case_end([{:word, _p, "END", _l, _c} | _more]), do: :ok
+  defp case_end(_tokens), do: :malformed
+
+  defp case_word([{:word, _p, word, _l, _c} | rest], word), do: {:ok, rest}
+  defp case_word(_tokens, _word), do: :malformed
+
+  defp case_part(tokens) do
+    case expr(tokens) do
+      {:ok, _ast, rest} -> {:ok, rest}
+      {:error, _error} -> :malformed
+      {:refuse, _why} = refusal -> refusal
+    end
+  end
 
   # The rest of `(a, b, ...)` after its first operand: a row, which only a tuple target takes.
   @spec tuple_rest(ast(), [token()]) :: parsed(ast())

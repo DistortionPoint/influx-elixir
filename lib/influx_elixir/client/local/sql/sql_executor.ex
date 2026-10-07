@@ -111,6 +111,10 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   @typep kinds_mode :: kinds() | nil | :unchecked
 
+  # An error of a common table expression held back until the query that reads it has been
+  # checked: the physical plan's (a negation), or the analyzer's or the optimizer's.
+  @typep held :: nil | {:physical, {:error, term()}} | {:analyzer, {:error, term()}}
+
   @spec run_query(SQLParser.parsed_query(), fetch(), %{binary() => term()}, kinds_mode()) ::
           [map()] | {:error, term()}
   defp run_query(query, fetch, params, kinds) do
@@ -161,19 +165,11 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   # The error of an expression with listed columns that the analyzer or the optimizer finds.
   @spec held_stage?(SQLParser.parsed_query(), {:error, term()}) :: boolean()
-  defp held_stage?(query, {:error, %{body: body}}) when is_binary(body) do
-    not SQLSchema.star?(query) and analyzer_body?(body)
-  end
-
-  defp held_stage?(_query, _error), do: false
-
-  @spec analyzer_body?(binary()) :: boolean()
-  defp analyzer_body?(body),
-    do:
-      String.starts_with?(body, "type_coercion\n") or String.starts_with?(body, "Optimizer rule")
+  defp held_stage?(query, {:error, error}),
+    do: not SQLSchema.star?(query) and SQLError.analyzer?(error)
 
   # The first error held, an analyzer's before a physical plan's.
-  @spec first_held(term(), term()) :: term()
+  @spec first_held(held(), held()) :: held()
   defp first_held(nil, found), do: found
   defp first_held({:physical, _error}, {:analyzer, _other} = found), do: found
   defp first_held(held, _found), do: held
@@ -189,7 +185,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           %{binary() => source()},
           %{binary() => term()},
           kinds_mode(),
-          term()
+          held()
         ) :: [map()] | {:error, term()}
   defp execute_select(query, fetch, sources, params, kinds, held) do
     case select(query, fetch, sources, params, kinds, true, nil) do
@@ -201,9 +197,9 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   # The error of the query that reads the expressions, unless one of an expression found its
   # error in the same stage first (the analyzer reads the expression before the query).
-  @spec outranked({:error, term()}, term()) :: {:error, term()}
-  defp outranked({:error, %{body: body}} = error, {:analyzer, held}) when is_binary(body),
-    do: if(analyzer_body?(body), do: held, else: error)
+  @spec outranked({:error, term()}, held()) :: {:error, term()}
+  defp outranked({:error, error} = failure, {:analyzer, held}),
+    do: if(SQLError.analyzer?(error), do: held, else: failure)
 
   defp outranked(error, _held), do: error
 
@@ -350,7 +346,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
          :ok <- SQLRange.check_time(simplified, source.pushdown),
          :ok <- check_value_range(simplified, joined, sources, kinds, unsigned?),
          :ok <- SQLSelect.check_named(simplified),
-         :ok <- null_difference(typed.where) do
+         :ok <- null_difference(typed.where),
+         :ok <- fold_gap(typed) do
       cond do
         plan == :ok ->
           empty? = (is_list(unused) and :dead in unused) or empty?(simplified, joined, unsigned?)
@@ -366,6 +363,26 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
       {:error, %{body: "Client.Local: " <> _reason}} when plan != :ok -> plan
       {:error, _reason} = error -> error
     end
+  end
+
+  # Two lists of one operand where the engine's fold of them changes a row's answer (see
+  # `SQLContradict.fold_gap?/1`).
+  @spec fold_gap(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
+  defp fold_gap(query) do
+    terms = %{
+      filters: [query.where, query.having],
+      values: [query.projection_columns, query.order_by]
+    }
+
+    if SQLContradict.fold_gap?(terms),
+      do:
+        {:error,
+         SQLError.refusal(
+           "two IN lists (or an IN and a NOT IN list) of one operand under a NOT or inside an " <>
+             "expression: the engine folds the pair to a constant before it reads a row, " <>
+             "which the double does not model there"
+         )},
+      else: :ok
   end
 
   @spec null_difference([SQLParser.where_node()]) :: :ok | {:error, SQLError.t()}
@@ -813,10 +830,15 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     |> apply_limit(query.limit, query.offset)
   end
 
-  defp execute_aggregate_query(points, %{group_by_interval: nil, group_by_columns: nil} = query) do
+  defp execute_aggregate_query(
+         points,
+         %{group_by_interval: nil, group_by_columns: nil} = query
+       ) do
     # Scalar aggregate: all filtered points form a single bucket. Always
     # produce one row, even when no points matched (so COUNT returns 0).
-    SQLAggregate.reduce_group(query.select_columns, query.having, points, :scalar)
+    query.select_columns
+    |> SQLAggregate.reduce_group(query.having, points, :scalar)
+    |> apply_limit(query.limit, query.offset)
   end
 
   # One group per (DATE_BIN bucket, grouping-column values) — either part

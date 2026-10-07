@@ -100,12 +100,26 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   the engine's parser error.
   """
   @spec check(binary(), boolean()) :: :ok | {:error, SQLError.t()}
-  def check(sql, several? \\ false) do
+  def check(sql, several? \\ false), do: check_tokens(SQLTokenizer.scan(sql), several?)
+
+  # The same over a text that is already tokenized.
+  @spec check_tokens(SQLTokenizer.result(), boolean()) :: :ok | {:error, SQLError.t()}
+  defp check_tokens(tokenized, several?) do
     Process.put(@several, several?)
 
-    case SQLTokenizer.tokenize(sql) do
-      {:ok, tokens} -> tokens |> read() |> flagged(tokens)
-      :bail -> :ok
+    case tokenized do
+      {:ok, tokens} ->
+        tokens |> read() |> flagged(tokens)
+
+      :bail ->
+        :ok
+
+      {:unread, char} ->
+        {:error,
+         SQLError.refusal(
+           "the character #{inspect(char)} in a name or outside quotes: the engine's parser error " <>
+             "for it is not modelled"
+         )}
     end
   after
     Enum.each(@flags, &Process.delete/1)
@@ -124,9 +138,10 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     pieces
     |> Enum.reduce_while(false, fn {offset, piece}, unread? ->
       positioned = SQLTokenizer.blank(binary_part(sql, 0, offset)) <> piece
+      tokenized = SQLTokenizer.scan(positioned)
 
-      case statement_verdict(positioned, several?) do
-        :ok -> {:cont, unread? or SQLTokenizer.tokenize(positioned) == :bail}
+      case statement_verdict(positioned, tokenized, several?) do
+        :ok -> {:cont, unread? or tokenized == :bail}
         {:error, _error} = error -> {:halt, {:failed, error, unread?}}
       end
     end)
@@ -150,10 +165,11 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp after_unread(error), do: error
 
-  @spec statement_verdict(binary(), boolean()) :: :ok | {:error, SQLError.t()}
-  defp statement_verdict(positioned, several?) do
-    case first_token_error(positioned) do
-      nil -> check(positioned, several?)
+  @spec statement_verdict(binary(), SQLTokenizer.result(), boolean()) ::
+          :ok | {:error, SQLError.t()}
+  defp statement_verdict(positioned, tokenized, several?) do
+    case first_token_error(positioned, tokenized) do
+      nil -> check_tokens(tokenized, several?)
       error -> {:error, error}
     end
   end
@@ -161,14 +177,32 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # The parser's error for a statement that starts with no statement, or is a statement word
   # with nothing after it (`DELETE`, `USE`); the other answers of a bare word (`BEGIN`, `END`)
   # are the planner's, which a text of several statements never reaches.
-  @spec first_token_error(binary()) :: SQLError.t() | nil
-  defp first_token_error(positioned) do
+  @spec first_token_error(binary(), SQLTokenizer.result()) :: SQLError.t() | nil
+  defp first_token_error(positioned, tokenized) do
     # A `;` ends nothing the parser needs to read: it is the token it finds where the
     # statement has no more (verified: `SELECT ; FROM t` is "found: ;" at the `;`).
     statement = String.replace_suffix(positioned, ";", "")
 
-    SQLStatement.parser_error(statement) || parse_only(SQLStatement.bare_error(positioned))
+    SQLStatement.parser_error(statement, without_semicolon(statement != positioned, tokenized)) ||
+      parse_only(SQLStatement.bare_error(positioned))
   end
+
+  # The tokens of the statement without its closing `;`, from the tokens of the text with it
+  # (the end of the text then stands where the `;` did), so that a piece is tokenized once.
+  @spec without_semicolon(boolean(), SQLTokenizer.result()) :: SQLTokenizer.result() | nil
+  defp without_semicolon(false, tokenized), do: tokenized
+
+  defp without_semicolon(true, {:ok, tokens}) do
+    case Enum.split(tokens, -2) do
+      {before, [{:symbol, ";", _upper, line, col}, {:eof, printed, upper, _l, _c}]} ->
+        {:ok, before ++ [{:eof, printed, upper, line, col}]}
+
+      _other ->
+        nil
+    end
+  end
+
+  defp without_semicolon(true, other), do: other
 
   defp parse_only(%{body: "SQL error: ParserError" <> _rest} = error), do: error
   defp parse_only(_other), do: nil
@@ -497,6 +531,10 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
        when kind in [:word, :quoted],
        do: throw(:bail)
 
+  defp common_tables([{kind, _p, _u, _l, _c}, {:word, _q, "AS", _l2, _c2} | rest])
+       when kind in [:word, :quoted],
+       do: fail("(", rest)
+
   defp common_tables([{kind, _p, _u, _l, _c} | _rest] = tokens) when kind in [:word, :quoted],
     do: fail("AS", tl(tokens))
 
@@ -524,6 +562,15 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   end
 
   defp select_term([{:word, _p, "TABLE", _l, _c}, token | _rest]), do: fail("Table name", [token])
+
+  # The engine's parser reads a statement that changes data as a query body (inside parentheses,
+  # after a set operator), and only the planner refuses it: its error for what follows is not
+  # modelled.
+  defp select_term([{:word, _p, word, _l, _c} | _rest])
+       when word in ["INSERT", "UPDATE", "DELETE"] do
+    refuse("an #{word} as a query body")
+    throw(:bail)
+  end
 
   defp select_term(tokens), do: fail("SELECT, VALUES, or a subquery in the query body", tokens)
 
@@ -1059,6 +1106,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # words that go with it, the array suffixes. A type it cannot read is the engine's parser
   # error at the token; one it reads and the double does not is refused by name.
   defp data_type([{:word, _p, _u, _l, _c} | _rest] = tokens), do: read_type(tokens, true)
+  defp data_type([{:quoted, printed, _u, _l, _c} | rest]), do: unsupported_type(printed, rest)
   defp data_type(tokens), do: fail("a data type name", tokens)
 
   defp type_name(tokens), do: read_type(tokens, false)
@@ -1173,6 +1221,15 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp unsupported_interval(what, rest) do
     defer("Unsupported Interval Expression with " <> what)
+    rest
+  end
+
+  # A type written as a quoted name is the planner's error (`i::"int"`, verified on Core for any
+  # name, `"int"` and `"foo"` alike), found where the cast is converted, which the text's other
+  # errors may come before: the double answers it where the text names no table and no column.
+  @spec unsupported_type(binary(), tokens()) :: tokens()
+  defp unsupported_type(printed, rest) do
+    defer("Unsupported SQL type " <> printed)
     rest
   end
 
@@ -1337,6 +1394,9 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp infix_step([{:symbol, _p, symbol, _l, _c} | rest]) when symbol in @operators,
     do: operand_after_operator(rest)
 
+  defp infix_step([{:symbol, _p, "::", _l, _c}, {:quoted, printed, _u, _l2, _c2} | rest]),
+    do: unsupported_type(printed, rest)
+
   defp infix_step([{:symbol, _p, "::", _l, _c}, {:word, _q, _u, _l2, _c2} | _rest] = tokens),
     do: type_name(tl(tokens))
 
@@ -1454,6 +1514,9 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # A cast of the low bound (`BETWEEN 1::bigint AND 3`).
   defp before_and([{:symbol, _p, "::", _l, _c}, {:word, _q, _u, _l2, _c2} | _rest] = tokens),
     do: tokens |> tl() |> type_name() |> before_and()
+
+  defp before_and([{:symbol, _p, "::", _l, _c}, {:quoted, printed, _u, _l2, _c2} | rest]),
+    do: printed |> unsupported_type(rest) |> before_and()
 
   defp before_and(tokens), do: tokens
 end

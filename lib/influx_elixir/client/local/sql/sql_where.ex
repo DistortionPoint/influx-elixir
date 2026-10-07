@@ -392,9 +392,9 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   def columns({:or, branches}), do: Enum.flat_map(branches, &conjunction_columns/1)
   def columns({:not, conjunction}), do: conjunction_columns(conjunction)
 
-  # The `NULL` literal read as a condition (`HAVING NULL`) is a comparison of `time` with
-  # null that never holds, and reads no column.
-  def columns({:eq, "time", nil}), do: []
+  # The `NULL` literal read as a condition (`NULL = NULL`, `HAVING NULL`) never holds and reads
+  # no column (not even `time`, which a table made by a `WITH` may not have).
+  def columns({:eq, :null, nil}), do: []
 
   def columns({_op, left, _right} = clause) do
     own = if is_binary(left), do: [left], else: []

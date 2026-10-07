@@ -914,13 +914,22 @@ against a real InfluxDB (see "Running Against a Real InfluxDB"):
 - `HAVING` without a comparison or without a `GROUP BY`; `COALESCE` mixing
   text and numbers; a comparison of `time` inside a select item
 
-`var_*` and `stddev*` add the values one by one, in the order the engine scans a
-whole table (by the tags in the order of their names, then by time), and the
-last digits match the engine's there. Under a `WHERE`, a `GROUP BY`, an
-expression argument or more than one batch of rows the engine adds in another
-order, so the last digits of `var_*`, `stddev*` and of the `sum` and `avg` of
-floats can differ from its. Compare them with a tolerance (the contract uses a
+The last digits of the `sum`, `avg`, `var_*` and `stddev*` of floats are not reproducible, not
+even by the engine: twelve runs of one `SELECT sum(f)` on InfluxDB 3 Core gave four different
+last digits. `Client.Local`
+adds the values in the order they were written and keeps a single pass for the variance, so its
+digits are one valid answer and no more. Compare these with a tolerance (the contract uses a
 relative `1.0e-12`); `sum` and `avg` of whole numbers are exact.
+
+A regular expression (`~`) is matched with PCRE where the engine's crate reads the same
+pattern the same way. Patterns it reads differently (`\v`, a quantifier followed by `+`,
+white space in a count, a Unicode property or class it was not checked against, a repetition so
+large that Core closes the connection) are refused by name, and `\w`, `\d`, `\s`, `\b`, a
+case-insensitive match, `$`, `\z` and `(?m)` are refused over a text where the two differ (one
+that is not ASCII, or has a newline). That depends on the data: one such row in a table
+refuses a query that was answered before the row was written. `LIKE 'p' ESCAPE '\'` and a
+pattern of literals joined by `||` are answered; any other `ESCAPE` character is refused.
+
 
 ## Checking a Query Before Running It
 

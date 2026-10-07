@@ -31,7 +31,8 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   @type verdict :: :keep | :drop | {:unknown, cause()}
 
   @typedoc "Why the double does not know: see `InfluxElixir.Client.Local.SQLPlan`."
-  @type cause :: :uncertain | :literals | :nested | :grouped | :outer
+  @type cause ::
+          SQLContradict.uncertainty() | :literals | :nested | :grouped | :outer
 
   @typedoc """
   What the optimizer does not plan of an expression (see `unused/2`): the outputs nothing reads,

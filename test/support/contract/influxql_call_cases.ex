@@ -39,7 +39,10 @@ defmodule InfluxElixir.Contract.InfluxQLCallCases do
 
     c =
       for {{v, n}, s} <-
-            Enum.zip([{1.0, 1}, {2.0, 4}, {4.0, 9}, {10.0, 5}, {20.0, 50}], [0, 30, 60, 210, 240]) do
+            Enum.zip(
+              [{1.0, 1}, {2.0, 4}, {4.0, 9}, {10.0, 5}, {20.0, 50}],
+              [0, 30, 60, 210, 240]
+            ) do
         "#{k1},host=c,region=west v=#{v},c=#{n}i #{at(10 + s)}"
       end
 

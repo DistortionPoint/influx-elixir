@@ -94,6 +94,9 @@ defmodule InfluxElixir.Client.Local.Scope do
            body: "Client.Local: the _internal database's system tables are not modelled"
          }}
 
+      not String.valid?(database) ->
+        {:error, %{status: 400, body: "Client.Local: the database name is not valid UTF-8"}}
+
       true ->
         {:error,
          %{

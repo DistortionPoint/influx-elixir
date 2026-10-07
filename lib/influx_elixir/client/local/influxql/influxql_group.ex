@@ -93,8 +93,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
       before =~ ~r/\b(?:ORDER|S?LIMIT|S?OFFSET)\b/i -> false
       # A `fill()` before it ends the clauses `GROUP BY` may follow: what comes after is left
       # over (see `InfluxQLCheck.cut_where/2`).
-      before =~ ~r/(?<![\w])fill\s*\(/i -> false
-      before =~ ~r/(?:[-+*=<>(,~!]|(?<![_\/])\/|\b(?:AND|OR))\s*$/i -> false
+      before =~ InfluxQLText.fill_call() -> false
+      before =~ InfluxQLText.open_operand() -> false
       true -> before =~ ~r/^\s*WHERE\s+\S/i
     end
   end
@@ -451,7 +451,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   @spec option(binary()) :: {:ok, InfluxQLBuckets.fill(), non_neg_integer()} | :error
   defp option(rest) do
     case Regex.run(
-           ~r/^(?:(null|none|previous|linear)(?![\w])|([+-]?)\s*(\d*\.\d+|\d+))/i,
+           ~r/^(?:(null|none|previous|linear)(?![\w])|([+-]?)[ \t\r\n]*(\d*\.\d+|\d+))/i,
            rest
          ) do
       [word, keyword] when keyword != "" and byte_size(word) > 0 ->

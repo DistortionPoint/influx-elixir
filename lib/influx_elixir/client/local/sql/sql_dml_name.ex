@@ -91,8 +91,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
   def quote_name(text), do: quote_ident(text)
 
   @doc """
-  The engine's schema error for `printed`, a name written with `name` as its last part. `qualifier`
-  is the relation the fields are listed through (`nil` for none), `columns` the table's.
+  The engine's schema error for `printed`, a name written with `name` as its last part.
+  `qualifier` is the relation the fields are listed through (`nil` for none), `columns` the table's.
   """
   @spec no_field(binary(), binary(), binary() | nil, [binary()]) :: map()
   def no_field(printed, _name, _qualifier, []),

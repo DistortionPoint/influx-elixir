@@ -22,15 +22,22 @@ defmodule InfluxElixir.Client.Local.SQLDmlCostTest do
     {:ok, conn: conn}
   end
 
+  # The refusal each kind of statement ends in: the stage measured is the planning of the
+  # statement, up to the engine's refusal of DML, so a statement refused earlier (a parse or a
+  # schema error) cannot pass for cheap.
+  @insert_refusal "Error during planning: DML not supported: Insert Into"
+  @update_refusal "Error during planning: DML not supported: Update"
+  @delete_refusal "Error during planning: DML not supported: Delete"
+
   # The reductions of a statement, the least of three runs (the first call of a function loads
   # the module it lives in, which costs reductions the later calls do not).
-  defp cost(conn, sql) do
+  defp cost(conn, sql, refusal) do
     1..3
     |> Enum.map(fn _run ->
       {:reductions, before} = Process.info(self(), :reductions)
       answer = Local.query_sql(conn, sql, database: "dml_cost_db")
       {:reductions, after_} = Process.info(self(), :reductions)
-      assert {:error, %{status: 400}} = answer
+      assert answer === {:error, %{status: 400, body: refusal}}
       after_ - before
     end)
     |> Enum.min()
@@ -41,46 +48,63 @@ defmodule InfluxElixir.Client.Local.SQLDmlCostTest do
   defp nest(name, count),
     do: Enum.reduce(1..count, "1", fn _position, inner -> "#{name}(#{inner}, 1)" end)
 
-  # A statement of four times the length costs about four times as much when the work is a line
-  # in the length, sixteen when it is a square. The bounds sit around four: above it a square
+  # A statement of four times the size costs about four times as much when the work is a line
+  # in the size, sixteen when it is a square. The bounds sit around four: above it a square
   # (an UPDATE of 1600 terms cost 7.3 times one of 400 when the tokenizer read each word
   # with a regex over the rest of the text), and below 2.5 a statement the double refused
   # early, which would otherwise pass for cheap.
-  defp assert_linear(conn, statement) do
-    short = cost(conn, statement.(400))
-    long = cost(conn, statement.(1600))
+  defp assert_linear(conn, statement, refusal, opts \\ []) do
+    {small, large} = Keyword.get(opts, :sizes, {400, 1600})
+    upper = Keyword.get(opts, :upper, 5.0)
+    short = cost(conn, statement.(small), refusal)
+    long = cost(conn, statement.(large), refusal)
     ratio = long / short
-    assert ratio < 5.0, "400 terms cost #{short} reductions, 1600 cost #{long}"
-    assert ratio > 2.5, "400 terms cost #{short} reductions, 1600 cost #{long}"
+    assert ratio < upper, "#{small} cost #{short} reductions, #{large} cost #{long}"
+    assert ratio > 2.5, "#{small} cost #{short} reductions, #{large} cost #{long}"
   end
 
   describe "a chain of ||" do
     test "in the values of an INSERT is typed once per link", %{conn: conn} do
-      assert_linear(conn, &"INSERT INTO main (s) VALUES (#{chain("'a'", &1)})")
+      assert_linear(conn, &"INSERT INTO main (s) VALUES (#{chain("'a'", &1)})", @insert_refusal)
     end
 
     test "in an UPDATE is typed once per link", %{conn: conn} do
-      assert_linear(conn, &"UPDATE main SET s = #{chain("s", &1)}")
+      assert_linear(conn, &"UPDATE main SET s = #{chain("s", &1)}", @update_refusal)
     end
 
     test "in the WHERE of a DELETE is typed once per link", %{conn: conn} do
-      assert_linear(conn, &"DELETE FROM main WHERE (#{chain("s", &1)}) = 'a'")
+      assert_linear(conn, &"DELETE FROM main WHERE (#{chain("s", &1)}) = 'a'", @delete_refusal)
     end
 
     test "in the select of an INSERT is typed once per link", %{conn: conn} do
-      assert_linear(conn, &"INSERT INTO main (s) SELECT #{chain("s", &1)} FROM main")
+      assert_linear(
+        conn,
+        &"INSERT INTO main (s) SELECT #{chain("s", &1)} FROM main",
+        @insert_refusal
+      )
     end
 
     test "that a number breaks is typed once per link too", %{conn: conn} do
-      assert_linear(conn, &"INSERT INTO main (s) VALUES (#{chain("'a'", &1)} || 1 || 2)")
+      assert_linear(
+        conn,
+        &"INSERT INTO main (s) VALUES (#{chain("'a'", &1)} || 1 || 2)",
+        @insert_refusal
+      )
     end
   end
 
   describe "a nest of calls" do
+    # Measured: 50 -> 200 costs about 4.3 times as much (it was 6), and each doubling
+    # from 100 to 800 a little more than the last (2.0, 2.1, 2.2, 2.4; it was 2.6, 2.9, 3.3).
+    # The call typed the kinds of its arguments at every level; it does so only beside no literal.
     test "in the values of an INSERT costs a line in its depth", %{conn: conn} do
-      short = cost(conn, "INSERT INTO main (v) VALUES (#{nest("coalesce", 50)})")
-      long = cost(conn, "INSERT INTO main (v) VALUES (#{nest("coalesce", 200)})")
-      assert long / short < 7.0, "50 deep cost #{short} reductions, 200 deep cost #{long}"
+      assert_linear(
+        conn,
+        &"INSERT INTO main (v) VALUES (#{nest("coalesce", &1)})",
+        @insert_refusal,
+        sizes: {50, 200},
+        upper: 5.0
+      )
     end
   end
 
@@ -93,9 +117,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlCostTest do
           Enum.map_join(1..rows, ", ", fn _position -> row end)
       end
 
-      short = cost(conn, statement.(100))
-      long = cost(conn, statement.(400))
-      assert long / short < 6.0, "100 rows cost #{short} reductions, 400 cost #{long}"
+      assert_linear(conn, statement, @insert_refusal, sizes: {100, 400})
     end
   end
 end

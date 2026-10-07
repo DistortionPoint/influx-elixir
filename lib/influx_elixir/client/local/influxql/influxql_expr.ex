@@ -385,7 +385,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
       {[{:str, content}], _between} ->
         {:planning,
-         "expected integer as last argument for #{name}, got Literal(String(#{inspect(content)}))"}
+         "expected integer as last argument for #{name}, got Literal(String(#{InfluxQLError.rust_debug(content)}))"}
 
       {[{:lit, {:int, _n}}], target} when target != nil ->
         {:planning, "only fields or tags are allow for #{name}(), got #{wildcard_text(target)}"}
@@ -398,7 +398,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp wildcard_text({:star, nil}), do: "Wildcard(None)"
   defp wildcard_text({:star, "tag"}), do: "Wildcard(Some(Tag))"
   defp wildcard_text({:star, "field"}), do: "Wildcard(Some(Field))"
-  defp wildcard_text({:regex, source}), do: "Literal(Regex(Regex(#{inspect(source)})))"
+
+  defp wildcard_text({:regex, source}),
+    do: "Literal(Regex(Regex(#{InfluxQLError.rust_debug(source)})))"
 
   # A call with `*` or a regular expression among its arguments stands for the calls of the
   # fields it names.
@@ -478,7 +480,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
       {_field, {:str, content}, _tags} ->
         {:planning,
-         "expected integer as last argument for #{name}, got Literal(String(#{inspect(content)}))"}
+         "expected integer as last argument for #{name}, got Literal(String(#{InfluxQLError.rust_debug(content)}))"}
 
       _other ->
         :error
@@ -566,7 +568,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
         true -> type_text(Map.get(types, name))
       end
 
-    {:ok, "VarRef(VarRef { name: Identifier(#{inspect(name)}), data_type: #{type} })"}
+    {:ok,
+     "VarRef(VarRef { name: Identifier(#{InfluxQLError.rust_debug(name)}), data_type: #{type} })"}
   end
 
   defp render({:neg, operand}, types, tags),
@@ -737,7 +740,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   @doc """
   Whether an expression of aggregates is made of quotients: it divides, and every aggregate in
-  it is an operand of a division (`sum(f) / count(f)`, `(sum(f) + 1) / 2`, `sum(f) / 2 + sum(g) / 2`;
+  it is an operand of a division (`sum(f) / count(f)`, `(sum(f) + 1) / 2`,
+  `sum(f) / 2 + sum(g) / 2`;
   not `sum(f) / count(f) + sum(g)`).
   """
   @spec quotients?(ast()) :: boolean()

@@ -92,7 +92,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   @spec never?(SQLParser.parsed_query()) :: boolean()
   def never?(query) do
     nodes = where(query, @plain)
-    {:or, []} in nodes or {:eq, "time", nil} in nodes
+    {:or, []} in nodes or {:eq, :null, nil} in nodes
   end
 
   @doc """
@@ -145,7 +145,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
           simplified_false?(tree, context)
 
       :error ->
-        {:or, []} in query.where or {:eq, "time", nil} in query.where
+        {:or, []} in query.where or {:eq, :null, nil} in query.where
     end
   end
 
@@ -306,7 +306,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   defp flatten({:leaf, clause}), do: [clause]
   defp flatten({:const, true}), do: []
   defp flatten({:const, false}), do: [{:or, []}]
-  defp flatten(:null), do: [{:eq, "time", nil}]
+  defp flatten(:null), do: [{:eq, :null, nil}]
 
   @spec branches(tree()) :: [tree()]
   defp branches({:or, left, right}), do: branches(left) ++ branches(right)

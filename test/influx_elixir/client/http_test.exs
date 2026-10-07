@@ -1,6 +1,9 @@
 defmodule InfluxElixir.Client.HTTPTest do
   use ExUnit.Case, async: true
 
+  # The holder waits well above any load (see hold_the_connection/1).
+  @moduletag timeout: 600_000
+
   alias InfluxElixir.Client.HTTP
   alias InfluxElixir.{StreamError, TestServer}
   alias InfluxElixir.TestSupport.{Check, ClosedPort}
@@ -55,9 +58,12 @@ defmodule InfluxElixir.Client.HTTPTest do
   @timed_out {:error, {:connection_error, %Mint.TransportError{reason: :timeout}}}
 
   # A pool of one connection, so a second request has to wait for the first.
+  # The pool for the port is started with Finch, so no request has to start one
+  # (a call that times out under load).
   defp connection(port, extra) do
     finch = :"http_test_finch_#{System.unique_integer([:positive])}"
-    start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}}, id: finch)
+    pools = %{"http://127.0.0.1:#{port}" => [size: 1]}
+    start_supervised!({Finch, name: finch, pools: pools}, id: finch)
 
     [
       host: "127.0.0.1",
@@ -89,13 +95,13 @@ defmodule InfluxElixir.Client.HTTPTest do
   defp hold_the_connection(conn) do
     task =
       Task.async(fn ->
-        HTTP.query_sql(conn, "SELECT 1", timeout: 5_000, pool_timeout: 5_000)
+        HTTP.query_sql(conn, "SELECT 1", timeout: 240_000, pool_timeout: 240_000)
       end)
 
     receive do
       :held -> task
     after
-      30_000 -> flunk("the holder never connected: #{inspect(Task.yield(task, 0))}")
+      240_000 -> flunk("the holder never connected: #{inspect(Task.yield(task, 0))}")
     end
   end
 

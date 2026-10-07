@@ -37,6 +37,10 @@ The tests had their own gaps:
 
 ## Decision
 
+> **Note, 2026-10-07:** the claim below that rows are read in the engine's scan order was
+> withdrawn: Core's float `sum` is not deterministic, so no order reproduces it. See
+> [`2026-10-07_sixteenth-review-sql`](2026-10-07_sixteenth-review-sql.md).
+
 - **Refuse by name what is not verified.** Where the double does not know
   the engine's exact rule, it refuses by name instead of extending a model:
   - NULL folds beyond the verified ones;

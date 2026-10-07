@@ -25,6 +25,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
     SQLPlan,
     SQLPredicate,
     SQLRow,
+    SQLRustRegex,
     Store
   }
 
@@ -91,6 +92,8 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   @pattern_ops [:like, :not_like, :regex, :not_regex]
 
   @spec matches_condition?(point(), SQLParser.where_clause()) :: boolean() | nil
+  defp matches_condition?(_point, {:eq, :null, nil}), do: nil
+
   defp matches_condition?(point, {:truthy, column, _nil}), do: truthy(point, column)
 
   defp matches_condition?(point, {:truthy_expr, {:expr, expr}, _nil}),
@@ -237,22 +240,26 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   @spec pattern_match(atom(), term(), binary()) :: boolean()
   defp pattern_match(:like, regex, text), do: Regex.match?(regex, text)
   defp pattern_match(:not_like, regex, text), do: not Regex.match?(regex, text)
-  defp pattern_match(:regex, {regex, _op}, text), do: regex_match?(regex, text)
-  defp pattern_match(:not_regex, {regex, _op}, text), do: not regex_match?(regex, text)
+  defp pattern_match(:regex, {regex, _op, guard}, text), do: regex_match?(regex, guard, text)
+
+  defp pattern_match(:not_regex, {regex, _op, guard}, text),
+    do: not regex_match?(regex, guard, text)
 
   # PCRE is the double's matcher. For a text that is not ASCII the engine's crate reads `\w`,
   # `\d`, `\s` and `\b` as other sets of characters and folds other characters in a
-  # case-insensitive match, and PCRE's `$` ends a text before its last newline where the
-  # crate's does not. The double declines such a match rather than answer.
-  @spec regex_match?(Regex.t(), binary()) :: boolean()
-  defp regex_match?(regex, text) do
-    if text_differs?(regex, text) do
+  # case-insensitive match, and for a text with a newline it ends a line, a text and a
+  # `$` elsewhere (`InfluxElixir.Client.Local.SQLRustRegex.guard/1`). The double declines such a
+  # match rather than answer: it depends on the data, so one such row in a table refuses a
+  # query that was answered before the row was written.
+  @spec regex_match?(Regex.t(), SQLRustRegex.guard(), binary()) :: boolean()
+  defp regex_match?(regex, guard, text) do
+    if SQLRustRegex.differs?(guard, text) do
       throw(
         {:query_error,
          SQLError.refusal(
            "a regular expression over a text where PCRE and the engine's crate differ (a " <>
              "non-ASCII text beside \\w, \\d, \\s, \\b or a case-insensitive match; a newline " <>
-             "beside $)"
+             "beside $, \\z or (?m)"
          )}
       )
     end
@@ -260,36 +267,12 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
     Regex.match?(regex, text)
   end
 
-  @spec text_differs?(Regex.t(), binary()) :: boolean()
-  defp text_differs?(regex, text) do
-    cond do
-      String.contains?(text, "\n") -> String.contains?(regex.source, "$")
-      byte_size(text) == String.length(text) -> false
-      true -> unicode_sensitive?(regex)
-    end
-  end
-
-  @spec unicode_sensitive?(Regex.t()) :: boolean()
-  defp unicode_sensitive?(regex) do
-    :caseless in Regex.opts(regex) or
-      String.contains?(regex.source, [
-        "\\w",
-        "\\W",
-        "\\d",
-        "\\D",
-        "\\s",
-        "\\S",
-        "\\b",
-        "\\B",
-        "(?i"
-      ])
-  end
-
   @spec pattern_type_error(atom(), term(), term()) :: binary()
   defp pattern_type_error(op, _regex, value) when op in [:like, :not_like],
     do: like_type_error(value)
 
-  defp pattern_type_error(_op, {_regex, symbol}, value), do: regex_type_error(value, symbol)
+  defp pattern_type_error(_op, {_regex, symbol, _guard}, value),
+    do: regex_type_error(value, symbol)
 
   # The planner's text of a filter that is no condition.
   @spec filter_text(SQLExpr.t(), point()) :: binary()
@@ -387,7 +370,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   @spec regex_type_error(term(), binary()) :: binary()
   defp regex_type_error(value, op) do
     "type_coercion\ncaused by\nError during planning: " <>
-      SQLPlan.pattern_error(:regex, SQLPlan.arrow_type(value), {nil, op})
+      SQLPlan.pattern_error(:regex, SQLPlan.arrow_type(value), {nil, op, nil})
   end
 
   # DataFusion: "There isn't a common type to coerce Float64 and Utf8 in

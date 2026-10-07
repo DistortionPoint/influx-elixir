@@ -92,27 +92,48 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
   # A text no atom exists for: the VM has not met it, and no other test can write it.
   defp unique_text, do: "zz_" <> Integer.to_string(System.unique_integer([:positive]))
 
-  defp answered?(answer),
-    do:
-      match?({:ok, rows} when is_list(rows), answer) or
-        match?(
-          {:error, %{status: status, body: body}}
-          when status in [400, 404, 405, 500] and is_binary(body),
-          answer
-        )
+  # The 500s the double gives on purpose, because the engine does (verified, and pinned in the
+  # SQL contract tables): the answer for a name no table has as a field. A 500 with any other
+  # body is a defect: the double ran into something it did not expect.
+  @pinned_500_prefixes ["Schema error: No field named "]
 
-  defp ask(fun, statement) do
+  defp answered?(answer) do
+    case answer do
+      :ok ->
+        true
+
+      {:ok, _result} ->
+        true
+
+      {:error, reason} when is_atom(reason) or is_tuple(reason) ->
+        true
+
+      {:error, %{status: 500, body: body}} when is_binary(body) ->
+        String.starts_with?(body, @pinned_500_prefixes)
+
+      {:error, %{status: status, body: body}} ->
+        status in [400, 404, 405, 409, 422] and is_binary(body)
+
+      _other ->
+        false
+    end
+  end
+
+  # Runs `fun` and asserts that it answered, by name, with an exception nowhere.
+  defp ask_call(label, fun) do
     answer =
       try do
-        fun.(statement)
+        fun.()
       rescue
         exception -> {:raised, Exception.message(exception)}
       catch
         kind, reason -> {kind, reason}
       end
 
-    assert answered?(answer), "#{statement} => #{inspect(answer)}"
+    assert answered?(answer), "#{label} => #{inspect(answer)}"
   end
+
+  defp ask(fun, statement), do: ask_call(statement, fn -> fun.(statement) end)
 
   describe "no atom is made from the text of a statement" do
     # The first statement in a fresh VM met an atom that did not exist yet, and raised. A
@@ -204,6 +225,213 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
         ask(&Local.query_sql(conn, &1, database: "clauses_db"), statement)
         ask(&Local.query_sql(conn, &1, database: text), statement)
       end
+
+      assert_no_atom(text)
+    end
+
+    test "in more SQL statements: EXPLAIN, SET, COPY, SHOW and the rest", %{conn: conn} do
+      text = unique_text()
+
+      statements = [
+        "EXPLAIN SELECT #{text} FROM #{text}",
+        "EXPLAIN ANALYZE SELECT v FROM #{text}",
+        "EXPLAIN VERBOSE SELECT v FROM m WHERE #{text} = 1",
+        "EXPLAIN #{text}",
+        "SET #{text} = #{text}",
+        "SET #{text} TO '#{text}'",
+        "SET TIME ZONE '#{text}'",
+        "SET TIME ZONE #{text}",
+        "RESET #{text}",
+        "COPY m TO '#{text}'",
+        "COPY #{text} TO '#{text}' (FORMAT #{text})",
+        "COPY (SELECT #{text} FROM m) TO '#{text}'",
+        "COPY m FROM '#{text}'",
+        "SHOW TABLES",
+        "SHOW TABLES FROM #{text}",
+        "SHOW COLUMNS FROM #{text}",
+        "SHOW COLUMNS IN #{text} FROM #{text}",
+        "SHOW ALL",
+        "SHOW #{text} #{text}",
+        "SHOW CREATE TABLE #{text}",
+        "SHOW FUNCTIONS LIKE '#{text}'",
+        "DESCRIBE #{text}",
+        "DESC #{text}",
+        "CREATE TABLE #{text} (#{text} INT)",
+        "CREATE VIEW #{text} AS SELECT v FROM m",
+        "CREATE DATABASE #{text}",
+        "DROP TABLE #{text}",
+        "DROP DATABASE #{text}",
+        "PREPARE #{text} AS SELECT v FROM m",
+        "EXECUTE #{text}(#{text})",
+        "DEALLOCATE #{text}",
+        "BEGIN #{text}",
+        "USE #{text}",
+        "VALUES (#{text}), (#{text})",
+        "SELECT * FROM (SELECT #{text} FROM m) AS #{text}",
+        "SELECT v FROM m UNION SELECT #{text} FROM #{text}"
+      ]
+
+      for statement <- statements do
+        ask(&Local.query_sql(conn, &1, database: "clauses_db"), statement)
+        ask(&Local.execute_sql(conn, &1, database: "clauses_db"), statement)
+      end
+
+      assert_no_atom(text)
+    end
+
+    test "in the parameters of a SQL or an InfluxQL query", %{conn: conn} do
+      text = unique_text()
+
+      sql = [
+        {"SELECT v FROM m WHERE host = $#{text}", %{text => "a"}},
+        {"SELECT v FROM m WHERE host = $#{text}", %{text => text}},
+        {"SELECT v FROM m WHERE host = $#{text}", %{text => 1}},
+        {"SELECT v FROM m WHERE host = $#{text}", %{text => nil}},
+        {"SELECT v FROM m WHERE host = $#{text}", %{"other_#{text}" => "a"}},
+        {"SELECT v FROM m WHERE host = $1", %{text => "a"}},
+        {"SELECT $#{text} FROM m", %{text => [text]}},
+        {"SELECT v FROM m LIMIT $#{text}", %{text => text}}
+      ]
+
+      for {statement, params} <- sql do
+        label = "#{statement} #{inspect(params)}"
+
+        ask_call(label, fn ->
+          Local.query_sql(conn, statement, database: "clauses_db", params: params)
+        end)
+
+        ask_call(label, fn ->
+          Local.query_influxql(conn, statement, database: "clauses_db", params: params)
+        end)
+      end
+
+      assert_no_atom(text)
+    end
+
+    test "in the Flux of a query" do
+      text = unique_text()
+      {:ok, v2} = Local.start(profile: :v2, org: text)
+      :ok = Local.create_bucket(v2, "b")
+      :ok = Local.create_bucket(v2, text)
+      {:ok, :written} = Local.write(v2, "m,host=a v=1.5 1000000000", database: "b")
+
+      {:ok, :written} =
+        Local.write(v2, "#{text},#{text}=a #{text}=1.5 1000000000", database: text)
+
+      base = ~s/from(bucket: "b") |> range(start: 0)/
+
+      queries = [
+        ~s/from(bucket: "#{text}") |> range(start: 0)/,
+        ~s/from(bucket: #{text}) |> range(start: 0)/,
+        ~s/from(#{text}: "b") |> range(start: 0)/,
+        ~s/#{text}(bucket: "b") |> range(start: 0)/,
+        ~s/#{base} |> #{text}()/,
+        ~s/#{base} |> #{text}(#{text}: "#{text}")/,
+        ~s/#{base} |> filter(fn: (r) => r._measurement == "#{text}")/,
+        ~s/#{base} |> filter(fn: (r) => r.#{text} == "#{text}")/,
+        ~s/#{base} |> filter(fn: (r) => r["#{text}"] == #{text})/,
+        ~s/#{base} |> filter(fn: (#{text}) => #{text}._field == "#{text}")/,
+        ~s/#{base} |> filter(#{text}: (r) => r._field == "v")/,
+        ~s/#{base} |> filter(fn: (r) => r._field == "v" and r.#{text} != "#{text}")/,
+        ~s/from(bucket: "b") |> range(start: #{text})/,
+        ~s/from(bucket: "b") |> range(start: 0, stop: #{text})/,
+        ~s/from(bucket: "b") |> range(start: -#{text}h)/,
+        ~s/from(bucket: "b") |> range(#{text}: 0)/,
+        ~s/#{base} |> limit(n: #{text})/,
+        ~s/#{base} |> first(column: "#{text}")/,
+        ~s/#{base} |> yield(name: "#{text}")/,
+        ~s/#{base} |> yield(#{text}: "#{text}")/,
+        ~s/import "#{text}"\n#{base}/,
+        ~s/import "#{text}"\nimport #{text} "#{text}"\n#{base}/,
+        ~s/import "#{text}"\n#{base} |> #{text}.sum()/,
+        ~s/#{text} = #{text}\n#{base}/,
+        ~s/option #{text} = "#{text}"\n#{base}/
+      ]
+
+      for flux <- queries do
+        ask_call(flux, fn -> Local.query_flux(v2, flux) end)
+        ask_call(flux, fn -> Local.query_flux(v2, flux, database: text) end)
+      end
+
+      assert_no_atom(text)
+    end
+
+    test "in line protocol: names, tags, string values, escapes and parameters", %{conn: conn} do
+      text = unique_text()
+      {:ok, v2} = Local.start(profile: :v2, org: text)
+      :ok = Local.create_bucket(v2, text)
+
+      payloads = [
+        "#{text},#{text}=#{text} #{text}=1.5 1",
+        "#{text},#{text}=#{text} #{text}=1i 1",
+        ~s|#{text},t=a #{text}="#{text}" 1|,
+        ~s|#{text},t=a f="#{text} \\" \\\\ #{text}" 1|,
+        ~s|#{text},t=a f=#{text} 1|,
+        ~s|#{text},t=a f=#{text}i 1|,
+        ~s|#{text},t=a f=1 #{text}|,
+        ~s|#{text}\\ x,#{text}\\,k=\\ #{text}\\=v f=1 1|,
+        ~s|m,#{text}\\ k=a\\ #{text} #{text}\\ f=1 1|,
+        ~s|m,t=a f=t,#{text}=T,g=#{text} 1|,
+        "#{text} #{text}",
+        "#{text}",
+        "m,#{text} f=1 1",
+        "m,t=#{text} #{text} 1",
+        "# #{text}\n#{text},t=a f=1 1\n\n#{text} f=2 2"
+      ]
+
+      for payload <- payloads do
+        ask_call(payload, fn -> Local.write(conn, payload, database: "clauses_db") end)
+        ask_call(payload, fn -> Local.write(conn, payload, database: text) end)
+        ask_call(payload, fn -> Local.write(v2, payload, database: text) end)
+
+        ask_call(payload, fn ->
+          Local.write(v2, payload, database: text, org: text, bucket: text, precision: text)
+        end)
+
+        ask_call(payload, fn ->
+          Local.write(conn, payload, database: "clauses_db", precision: text)
+        end)
+      end
+
+      assert_raise ArgumentError, fn -> Local.start(profile: text) end
+      assert_no_atom(text)
+    end
+
+    test "in the names of databases, buckets and tokens", %{conn: conn} do
+      text = unique_text()
+      {:ok, v2} = Local.start(profile: :v2, org: text)
+      {:ok, enterprise} = Local.start(profile: :v3_enterprise, org: text, databases: [text])
+
+      calls = [
+        {"create_database", fn -> Local.create_database(conn, text) end},
+        {"create_database retention",
+         fn -> Local.create_database(conn, text, retention: text) end},
+        {"create_database again", fn -> Local.create_database(conn, text) end},
+        {"list_databases", fn -> Local.list_databases(conn) end},
+        {"delete_database", fn -> Local.delete_database(conn, text) end},
+        {"delete_database missing", fn -> Local.delete_database(conn, text) end},
+        {"create_token", fn -> Local.create_token(conn, text) end},
+        {"create_token again", fn -> Local.create_token(conn, text) end},
+        {"create_token expiry", fn -> Local.create_token(conn, text, expiry_secs: text) end},
+        {"create_token permissions",
+         fn -> Local.create_token(enterprise, text, permissions: ["db:#{text}:read"]) end},
+        {"create_token bad permissions",
+         fn ->
+           Local.create_token(enterprise, "p_#{text}", permissions: [text, "#{text}:#{text}"])
+         end},
+        {"delete_token", fn -> Local.delete_token(conn, text) end},
+        {"delete_token missing", fn -> Local.delete_token(conn, text) end},
+        {"create_bucket", fn -> Local.create_bucket(v2, text) end},
+        {"create_bucket retention", fn -> Local.create_bucket(v2, text, retention: text) end},
+        {"list_buckets", fn -> Local.list_buckets(v2) end},
+        {"delete_bucket", fn -> Local.delete_bucket(v2, text) end},
+        {"delete_bucket missing", fn -> Local.delete_bucket(v2, text) end},
+        {"v3 bucket", fn -> Local.create_bucket(conn, text) end},
+        {"v2 database", fn -> Local.create_database(v2, text) end},
+        {"health", fn -> Local.health(enterprise) end}
+      ]
+
+      for {label, call} <- calls, do: ask_call(label, call)
 
       assert_no_atom(text)
     end

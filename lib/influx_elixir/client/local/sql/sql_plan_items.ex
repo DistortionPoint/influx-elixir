@@ -217,6 +217,8 @@ defmodule InfluxElixir.Client.Local.SQLPlanItems do
     [plan_items(operand, cut_state(state)), {:pattern, kind, operand, rest}]
   end
 
+  defp plan_condition_items({:eq, :null, nil}, _state), do: []
+
   defp plan_condition_items({op, left, right}, state) when op in @comparisons and left != "time",
     do: [
       plan_items(left, state),

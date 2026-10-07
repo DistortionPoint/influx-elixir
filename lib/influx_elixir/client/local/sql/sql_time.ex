@@ -339,7 +339,8 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   @spec date(binary()) :: {:ok, Date.t(), binary()} | {:error, binary()}
   defp date(<<y::binary-size(4), ?-, m::binary-size(2), ?-, d::binary-size(2), rest::binary>>) do
     with true <- digits?(y <> m <> d),
-         {:ok, date} <- Date.new(String.to_integer(y), String.to_integer(m), String.to_integer(d)) do
+         [year, month, day] = Enum.map([y, m, d], &String.to_integer/1),
+         {:ok, date} <- Date.new(year, month, day) do
       {:ok, date, rest}
     else
       _invalid -> {:error, "error parsing date"}
