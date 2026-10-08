@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.42] - 2026-10-08
+
 ### Fixed
 - **`Client.Local` InfluxQL: one order of parse errors, carriage returns, dotted names**: a
   stray quote or comment no longer wins over an earlier parse error (a lexer error stands only
