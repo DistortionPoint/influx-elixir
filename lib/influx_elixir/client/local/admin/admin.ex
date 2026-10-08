@@ -14,6 +14,7 @@ defmodule InfluxElixir.Client.Local.Admin do
         ) :: :ok | {:error, term()}
   def create_database(%{table: table} = conn, name, opts \\ []) do
     with :ok <- Scope.require_capability(conn, :create_database),
+         :ok <- utf8_name(name, "database"),
          {:ok, retention} <- retention(Keyword.get(opts, :retention), name) do
       Store.create_database(
         table,
@@ -77,6 +78,7 @@ defmodule InfluxElixir.Client.Local.Admin do
           :ok | {:error, term()}
   def delete_database(%{table: table} = conn, name) do
     with :ok <- Scope.require_capability(conn, :delete_database),
+         :ok <- utf8_name(name, "database"),
          :ok <- deletable(name) do
       # Dropping a database drops its tables: points and schema go with it,
       # so a re-created database starts empty.
@@ -85,6 +87,15 @@ defmodule InfluxElixir.Client.Local.Admin do
         :error -> {:error, %{status: 404, body: "the requested resource was not found: #{name}"}}
       end
     end
+  end
+
+  # A name is written into a JSON body or a URL, which only UTF-8 text can be, so no
+  # engine answer exists for one that is not: the double refuses it by name.
+  @spec utf8_name(binary(), binary()) :: :ok | {:error, map()}
+  defp utf8_name(name, kind) do
+    if String.valid?(name),
+      do: :ok,
+      else: {:error, %{status: 400, body: "Client.Local: the #{kind} name is not valid UTF-8"}}
   end
 
   # The engine's answer for its own database (verified).
@@ -102,7 +113,8 @@ defmodule InfluxElixir.Client.Local.Admin do
           keyword()
         ) :: :ok | {:error, term()}
   def create_bucket(%{table: table} = conn, name, opts \\ []) do
-    with :ok <- Scope.require_capability(conn, :create_bucket) do
+    with :ok <- Scope.require_capability(conn, :create_bucket),
+         :ok <- utf8_name(name, "bucket") do
       case Keyword.get(opts, :retention, 0) do
         seconds when seconds in 1..3599 ->
           {:error,
@@ -148,7 +160,8 @@ defmodule InfluxElixir.Client.Local.Admin do
   @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_bucket(%{table: table} = conn, name) do
-    with :ok <- Scope.require_capability(conn, :delete_bucket) do
+    with :ok <- Scope.require_capability(conn, :delete_bucket),
+         :ok <- utf8_name(name, "bucket") do
       case Store.delete_bucket(table, name) do
         :ok -> :ok
         :error -> {:error, %{status: 404, body: "bucket not found: #{name}"}}
@@ -167,6 +180,7 @@ defmodule InfluxElixir.Client.Local.Admin do
         ) :: {:ok, map()} | {:error, term()}
   def create_token(%{table: table, profile: profile} = conn, name, opts \\ []) do
     with :ok <- Scope.require_capability(conn, :create_token),
+         :ok <- utf8_name(name, "token"),
          {:ok, {kind, _path, body}} <- TokenRequest.build(name, opts),
          :ok <- token_endpoint(kind, profile),
          {:ok, expiry_secs} <- check_expiry(Keyword.get(opts, :expiry_secs), body) do
@@ -239,7 +253,8 @@ defmodule InfluxElixir.Client.Local.Admin do
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_token(%{table: table} = conn, name) do
-    with :ok <- Scope.require_capability(conn, :delete_token) do
+    with :ok <- Scope.require_capability(conn, :delete_token),
+         :ok <- utf8_name(name, "token") do
       cond do
         name == "_admin" ->
           {:error, %{status: 405, body: "cannot delete operator token"}}

@@ -782,6 +782,36 @@ defmodule InfluxElixir.Flight.ReaderTest do
   # Tests: decode_flight_data/1 — Int64 column round-trip
   # ---------------------------------------------------------------------------
 
+  describe "decode_flight_data/1 — a row count the body cannot hold" do
+    # A corrupt header must not make the reader build a column of a trillion rows.
+    test "is an error, not an allocation" do
+      schema = schema_fd([{"value", 2, [bit_width: 64, is_signed: true]}])
+      {body, specs} = int64_column([10, 20, 30])
+      refused = {:error, {:decode_error, "a row count the record batch's body cannot hold"}}
+
+      for count <- [1 <<< 40, -1] do
+        assert decode_bounded([schema, batch_fd(body, specs, count)]) === {:answered, refused}
+      end
+    end
+  end
+
+  # Decodes in a process whose heap is capped at about 40 MB, so a regression that
+  # allocates by a corrupt count fails the test instead of taking the machine's memory.
+  defp decode_bounded(frames) do
+    test = self()
+
+    {pid, ref} =
+      spawn_monitor(fn ->
+        Process.flag(:max_heap_size, %{size: 5_000_000, kill: true, error_logger: false})
+        send(test, {:decoded, self(), Reader.decode_flight_data(frames)})
+      end)
+
+    receive do
+      {:decoded, ^pid, answer} -> {:answered, answer}
+      {:DOWN, ^ref, :process, ^pid, reason} -> {:died, reason}
+    end
+  end
+
   describe "decode_flight_data/1 — Int64 columns" do
     test "decodes three Int64 values" do
       schema = schema_fd([{"value", 2, [bit_width: 64, is_signed: true]}])

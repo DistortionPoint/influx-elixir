@@ -301,6 +301,21 @@ defmodule InfluxElixir.ContractCaseTablesTest do
     {:sql, "select 5 div 2"} => {@word_as_written, 2},
     {:sql, "select 0x10 as r from main limit 1"} =>
       {{:differs, "the hex prefix is read in lower case only"}, 2},
+    {:influxql, "select usage from ~p1 group by host"} =>
+      {{:differs,
+        "a carriage return right after GROUP leaves the statement over from it; after BY it is the missing BY"},
+       2},
+    {:influxql, "select usage from ~p1 order by time"} =>
+      {{:differs,
+        "the error quotes the statement as written, from the ORDER, carriage return and all"}, 2},
+    {:influxql, "select usage from ~p1"} =>
+      {{:differs,
+        "the error quotes the statement as written, so the carriage return after SELECT and after FROM differ"},
+       2},
+    {:influxql, "select usage from ~p1 where n > 1 and n < 5"} =>
+      {{:differs,
+        "a carriage return right after AND is left over (quoted as written, \\r or \\r\\n); after a blank it is a blank and the rows are answered"},
+       3},
     {:influxql, "show"} => {@parse_stop, 3},
     {:influxql, "show;"} => {@parse_stop, 2},
     {:influxql, "show tag"} => {@parse_stop, 2},

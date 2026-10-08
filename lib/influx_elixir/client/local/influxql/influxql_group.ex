@@ -121,7 +121,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     with {:ok, dimensions, stop} <- dimensions(ctx, skip(text, start), [], 0) do
       case fill(ctx, stop) do
         {:ok, fill, stop} -> leftover(ctx, stop, dimensions, fill)
-        {:bad_option, pos} -> {:error, {:engine, error(ctx, :fill, pos)}}
+        {:bad_option, pos} -> fail(ctx, :fill, pos)
       end
     end
   end
@@ -142,7 +142,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
         end
 
       :none when count == 0 ->
-        {:error, {:engine, error(ctx, :group, pos)}}
+        fail(ctx, :group, pos)
 
       :none ->
         :none
@@ -190,7 +190,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
         {:ok, {:regex, pattern}, pos + 1 + size + 1}
 
       :unterminated ->
-        {:error, {:engine, error(ctx, :unterminated_regex, byte_size(ctx.whole) - ctx.at)}}
+        fail(ctx, :unterminated_regex, byte_size(ctx.whole) - ctx.at, pos)
     end
   end
 
@@ -208,7 +208,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
         named(ctx, name, pos + byte_size(quoted))
 
       nil ->
-        {:error, {:engine, error(ctx, :unterminated_string, byte_size(ctx.whole) - ctx.at)}}
+        fail(ctx, :unterminated_string, byte_size(ctx.whole) - ctx.at, pos)
     end
   end
 
@@ -245,7 +245,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
       case Regex.run(~r/^(?:#{alternatives})(?![\w:])/i, rest) do
         [word] -> {:ok, pos + 2 + byte_size(word)}
-        nil -> {:error, {:engine, error(ctx, kind, pos + 2)}}
+        nil -> fail(ctx, kind, pos + 2)
       end
     else
       {:ok, pos}
@@ -262,7 +262,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
     if byte_at(ctx.text, open) == ?(,
       do: interval(ctx, open + 1),
-      else: {:error, {:engine, error(ctx, :time_call, after_word)}}
+      else: fail(ctx, :time_call, after_word)
   end
 
   defp interval(ctx, pos) do
@@ -277,7 +277,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
         {:error, "unsupported InfluxQL (a duration beyond 64 bits)"}
 
       :none ->
-        {:error, {:engine, error(ctx, :time_interval, pos)}}
+        fail(ctx, :time_interval, pos)
     end
   end
 
@@ -299,7 +299,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     case byte_at(ctx.text, comma) do
       ?, -> offset(ctx, every, stop, skip(ctx.text, comma + 1))
       ?) -> {:ok, {:time, {every, 0}}, comma + 1}
-      _other -> {:error, {:engine, error(ctx, :time_close, stop)}}
+      _other -> fail(ctx, :time_close, stop)
     end
   end
 
@@ -310,7 +310,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
         if byte_at(ctx.text, close) == ?),
           do: {:ok, {:time, {every, offset}}, close + 1},
-          else: {:error, {:engine, error(ctx, :time_close, stop)}}
+          else: fail(ctx, :time_close, stop)
 
       :big ->
         {:error, "unsupported InfluxQL (a duration beyond 64 bits)"}
@@ -319,7 +319,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
         refuse_offset(ctx, every, interval_stop, pos)
 
       _other ->
-        {:error, {:engine, error(ctx, :time_close, interval_stop)}}
+        fail(ctx, :time_close, interval_stop)
     end
   end
 
@@ -334,7 +334,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
         timestamp_offset(ctx, every, pos, match)
 
       true ->
-        {:error, {:engine, error(ctx, :time_close, interval_stop)}}
+        fail(ctx, :time_close, interval_stop)
     end
   end
 
@@ -347,7 +347,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
     cond do
       byte_at(ctx.text, close) != ?) ->
-        {:error, {:engine, error(ctx, :time_close, stop)}}
+        fail(ctx, :time_close, stop)
 
       InfluxQLTime.classify(content) == :invalid ->
         {:ok, {:time, {every, {:invalid, InfluxQLError.offset_error(quoted)}}}, close + 1}
@@ -364,7 +364,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   defp duration(text, pos) do
     rest = binary_part(text, pos, byte_size(text) - pos)
 
-    case Regex.run(~r/^([+-]?)((?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+)/u, rest) do
+    case Regex.run(~r/^([+-]?)((?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+)/, rest) do
       [whole, sign, parts] ->
         total = duration_total(parts)
 
@@ -381,7 +381,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   end
 
   defp duration_total(parts) do
-    ~r/(\d+)(ns|ms|u|µ|s|m|h|d|w)/u
+    ~r/(\d+)(ns|ms|u|µ|s|m|h|d|w)/
     |> Regex.scan(parts)
     |> Enum.reduce(0, fn [_all, count, unit], total ->
       total + String.to_integer(count) * Durations.ns(unit)
@@ -526,7 +526,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
       {:ok, %{dimensions: others, time: time, fill: fill, rewrite_error: rewrite_error}, stop}
     else
-      {:error, {:engine, error(ctx, :nom, pos)}}
+      fail(ctx, :nom, pos)
     end
   end
 
@@ -542,6 +542,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
   @spec error(map(), atom(), non_neg_integer()) :: binary()
   defp error(ctx, kind, pos), do: InfluxQLError.syntax_error_body(kind, ctx.at + pos, ctx.whole)
+
+  # The error of `kind` at `pos` (text offsets), with where the parser meets it in the
+  # statement: `pos` unless the token that fails starts at `start` (an unterminated quote).
+  @spec fail(map(), atom(), non_neg_integer(), non_neg_integer() | nil) ::
+          {:error, {:engine, binary(), non_neg_integer()}}
+  defp fail(ctx, kind, pos, start \\ nil),
+    do: {:error, {:engine, error(ctx, kind, pos), ctx.at + (start || pos)}}
 
   # The position after the blanks that start at `pos`.
   @spec skip(binary(), non_neg_integer()) :: non_neg_integer()

@@ -20,7 +20,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlType do
   # row for is a refusal: the engine prints some names in capitals and some as they were
   # written, which only the rows know.
 
-  alias InfluxElixir.Client.Local.{SQLDdl, SQLError, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{SQLDdl, SQLDml, SQLError, SQLTokenizer}
 
   @typedoc "What the planner treats a type as."
   @type family ::
@@ -43,7 +43,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlType do
           | {:unsupported, binary()}
 
   @typep token :: SQLTokenizer.token()
-  @typep parsed :: {:ok, t(), [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+  @typep parsed :: {:ok, t(), [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   @typep base ::
            t()
            | {:integer, pos_integer(), binary()}
@@ -88,7 +88,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlType do
   # The name
   # ---------------------------------------------------------------------------
 
-  @spec base(binary(), [token()]) :: {:ok, base(), [token()]} | {:refuse, binary()}
+  @spec base(binary(), [token()]) :: {:ok, base(), [token()]} | {:refuse, SQLDml.reason()}
   defp base(bool, rest) when bool in ["BOOLEAN", "BOOL"], do: {:ok, plain(:bool, "Boolean"), rest}
   defp base("DATE", rest), do: {:ok, plain(:date, "Date32"), rest}
   defp base("BYTEA", rest), do: {:ok, plain(:binary, "Binary"), rest}
@@ -136,10 +136,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlType do
   defp base(upper, _rest), do: {:refuse, "the type #{String.downcase(upper)}"}
 
   # A float name followed by `UNSIGNED` is a name the planner cannot plan; alone it is a float.
-  @spec floating(binary(), [token()]) :: {:ok, base(), [token()]} | {:refuse, binary()}
+  @spec floating(binary(), [token()]) :: {:ok, base(), [token()]} | {:refuse, SQLDml.reason()}
   defp floating(name, rest), do: floating(name, rest, plain(:float, "Float32"))
 
-  @spec floating(binary(), [token()], t()) :: {:ok, base(), [token()]} | {:refuse, binary()}
+  @spec floating(binary(), [token()], t()) ::
+          {:ok, base(), [token()]} | {:refuse, SQLDml.reason()}
   defp floating(name, [{:word, _p, "UNSIGNED", _l, _c} | rest], _type),
     do: {:ok, {:unsupported, name <> " UNSIGNED"}, rest}
 
@@ -149,7 +150,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlType do
   defp floating(_name, rest, type), do: {:ok, type, rest}
 
   # A name the planner cannot plan takes no size, but the double does not read one.
-  @spec unplanned(binary(), [token()]) :: {:ok, t(), [token()]} | {:refuse, binary()}
+  @spec unplanned(binary(), [token()]) :: {:ok, t(), [token()]} | {:refuse, SQLDml.reason()}
   defp unplanned(_name, [{:symbol, "(", _u, _l, _c} | _rest]),
     do: {:refuse, "an unplanned type with a size"}
 
@@ -169,7 +170,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlType do
   # ---------------------------------------------------------------------------
 
   @spec sized(base(), [token()]) ::
-          {:ok, t(), [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, t(), [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   defp sized({:integer, bits, name}, rest) do
     with {:ok, _sizes, rest} <- sizes(rest, 1), do: {:ok, integer(bits, name), rest}
   end
@@ -223,12 +224,12 @@ defmodule InfluxElixir.Client.Local.SQLDmlType do
 
   # `(n)`, or `(n, m)` where the type takes two numbers.
   @spec sizes([token()], 1 | 2) ::
-          {:ok, [binary()], [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, [binary()], [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   defp sizes([{:symbol, "(", _u, _l, _c} | rest], most), do: size_list(rest, most, [])
   defp sizes(rest, _most), do: {:ok, [], rest}
 
   @spec size_list([token()], 1 | 2, [binary()]) ::
-          {:ok, [binary()], [token()]} | {:error, SQLError.t()} | {:refuse, binary()}
+          {:ok, [binary()], [token()]} | {:error, SQLError.t()} | {:refuse, SQLDml.reason()}
   defp size_list([{:number, size, _u, _l, _c} | rest], most, found) do
     found = found ++ [size]
 
@@ -271,7 +272,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlType do
   # `UNSIGNED`, `SIGNED`, `WITH TIME ZONE`
   # ---------------------------------------------------------------------------
 
-  @spec sign(t(), [token()]) :: {:ok, t(), [token()]} | {:refuse, binary()}
+  @spec sign(t(), [token()]) :: {:ok, t(), [token()]} | {:refuse, SQLDml.reason()}
   defp sign(%{family: :int, bits: bits} = type, [{:word, _p, "UNSIGNED", _l, _c} | rest]),
     do: {:ok, %{type | family: :uint, arrow: "UInt#{bits}", sql: nil}, rest}
 

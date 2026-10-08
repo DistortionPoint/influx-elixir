@@ -17,7 +17,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   # stops reading half way, a second statement after `;` that is neither a
   # `SHOW` nor text the engine cannot read.
 
-  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLShowClauses, InfluxQLShowText}
+  alias InfluxElixir.Client.Local.{
+    InfluxQLError,
+    InfluxQLLex,
+    InfluxQLShowClauses,
+    InfluxQLShowText,
+    InfluxQLText
+  }
+
+  require InfluxQLLex
 
   import InfluxElixir.Client.Local.InfluxQLShowText,
     only: [at_byte: 2, error: 2, rest: 2, skip_ws: 2, word_at: 2, ws?: 2]
@@ -69,10 +77,26 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
     scanned = scan(raw)
     ctx = %{raw: raw, clean: scanned.clean, masked: scanned.masked, size: byte_size(raw)}
 
-    with after_show when after_show != nil <- start(ctx),
+    with :ok <- keyword_cr(ctx),
+         after_show when after_show != nil <- start(ctx),
          :ok <- scanned_error(scanned, ctx) do
       statement(ctx, after_show)
     end
+  end
+
+  # A carriage return right after a keyword is no blank to the engine (see `InfluxQLLex`); what
+  # it answers for it depends on the keyword and is not placed here, so the double refuses.
+  @spec keyword_cr(ctx()) :: :ok | {:error, binary()}
+  defp keyword_cr(ctx) do
+    reserved =
+      ~r/(?<![\w])([A-Za-z_]\w*)\r/
+      |> Regex.scan(ctx.masked, capture: :all_but_first)
+      |> Enum.any?(fn [word] -> InfluxQLText.reserved?(word) end)
+
+    if reserved,
+      do:
+        {:error, "unsupported InfluxQL (a carriage return after a keyword in a SHOW statement)"},
+      else: :ok
   end
 
   @spec scanned_error(map(), ctx()) :: :ok | {:error, {:engine, binary()}}
@@ -131,7 +155,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   defp walk(<<op::binary-size(2), rest::binary>>, at, _regex?, state) when op in ["=~", "!~"],
     do: walk(rest, at + 2, true, put(state, op, op))
 
-  defp walk(<<c, rest::binary>>, at, regex?, state) when c in [?\s, ?\t, ?\n, ?\r],
+  defp walk(<<c, rest::binary>>, at, regex?, state) when InfluxQLLex.is_blank(c),
     do: walk(rest, at + 1, regex?, put(state, <<c>>, <<c>>))
 
   defp walk(<<?,, rest::binary>>, at, _regex?, state),

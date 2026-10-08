@@ -23,7 +23,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   # The text is masked: the inside of the literals and the comments are blanks of the same
   # size.
 
-  alias InfluxElixir.Client.Local.InfluxQLText
+  alias InfluxElixir.Client.Local.{InfluxQLLex, InfluxQLText}
+
+  require InfluxQLLex
 
   @typedoc "Where a call's arguments fail (`:eot`: at the end of the text), or that they read."
   @type result :: {:ok, non_neg_integer()} | {:fail, non_neg_integer() | :eot} | :unknown
@@ -45,7 +47,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   @plain_operators [?*, ?/, ?%, ?&]
 
   # A number, or a duration: a count of each unit the engine knows, then nothing else.
-  @number ~r/\A(?:(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+|\d*\.\d+|\d+)/u
+  @number ~r/\A(?:(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+|\d*\.\d+|\d+)/
   @name ~r/\A[A-Za-z_]\w*/
   # The characters the parser is known to stop at after an operand.
   @stops ~r/\A[A-Za-z0-9_.'"#:}!=<>]/
@@ -282,11 +284,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   end
 
   defp primary(:string, _text, at, rest, _call?) do
-    quote_char = binary_part(rest, 0, 1)
-
     # The closing quote is optional: the text may end inside the literal, which is its own error.
-    [literal] = Regex.run(~r/\A#{quote_char}[^#{quote_char}]*#{quote_char}?/, rest)
-    {:ok, at + byte_size(literal)}
+    size =
+      case :binary.match(rest, binary_part(rest, 0, 1), scope: {1, byte_size(rest) - 1}) do
+        {close, 1} -> close + 1
+        :nomatch -> byte_size(rest)
+      end
+
+    {:ok, at + size}
   end
 
   defp primary(:star, text, at, _rest, _call?) do
@@ -368,7 +373,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   @spec skip(binary(), non_neg_integer()) :: non_neg_integer()
   defp skip(text, at) do
     case text do
-      <<_before::binary-size(at), c, _rest::binary>> when c in [?\s, ?\t, ?\r, ?\n] ->
+      <<_before::binary-size(at), c, _rest::binary>> when InfluxQLLex.is_blank(c) ->
         skip(text, at + 1)
 
       _other ->

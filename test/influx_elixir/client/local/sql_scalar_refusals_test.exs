@@ -159,8 +159,8 @@ defmodule InfluxElixir.Client.Local.SQLScalarRefusalsTest do
              "for it is not modelled"},
           {"MERGE INTO m USING m c2 ON true WHEN MATCHED THEN DELETE",
            "Client.Local: the statement \"MERGE INTO m USING m c2 ON true WHEN MATCHED THEN " <>
-             "DELETE\" is not run: the engine's wording of it (its keywords in capitals) is " <>
-             "not modelled"}
+             "DELETE\" is not run: the engine's wording of a MERGE INTO statement (its keywords " <>
+             "in capitals) is not modelled"}
         ],
         fn {sql, body} ->
           assert {:error, %{status: 400, body: ^body}} = Local.query_sql(conn, sql, [])

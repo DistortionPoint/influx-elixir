@@ -4,6 +4,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   # position it names in the statement as sent, and the planning errors it
   # raises while it rewrites the statement.
 
+  alias InfluxElixir.Client.Local.InfluxQLLex
+
   @engine_error_prefix "error in InfluxQL statement: parsing error: "
 
   # What a parse error says, by kind; the position follows as `at pos N`.
@@ -82,6 +84,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
     ~s("#{body}")
   end
 
+  # The characters Rust's `{:?}` writes as `\u{..}`: control, separator and mark characters.
+  @escaped ~r/\A[\p{C}\p{Zl}\p{Zp}\p{Zs}\p{Mn}\p{Me}]\z/u
+
   defp escape_char(0), do: "\\0"
   defp escape_char(?\t), do: "\\t"
   defp escape_char(?\r), do: "\\r"
@@ -94,7 +99,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   defp escape_char(cp) do
     char = <<cp::utf8>>
 
-    if Regex.match?(~r/\A[\p{C}\p{Zl}\p{Zp}\p{Zs}\p{Mn}\p{Me}]\z/u, char),
+    if Regex.match?(@escaped, char),
       do: "\\u{" <> hex(cp) <> "}",
       else: char
   end
@@ -102,27 +107,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   defp hex(cp), do: cp |> Integer.to_string(16) |> String.downcase()
 
   @doc """
-  Where in `whole` the parser stopped for the body of one of its parse errors (`nil` for a
-  body that is none): the position the body names, or for a failure, which names none, where
-  the text it quotes starts.
+  Where in `whole` the text starts that `quoted` (the output of `rust_debug/1`, quotes included)
+  is the debug form of, when it is the end of `whole`: the inverse of quoting, read once, from
+  the size of the text.
   """
-  @spec position(binary(), binary()) :: non_neg_integer() | nil
-  def position(body, whole) do
-    case Regex.run(~r/Parsing Failure: Nom\((".*"), Char\)\z/s, body) do
-      [_all, quoted] -> quoted_at(quoted, whole)
-      nil -> named_position(body)
-    end
-  end
-
-  defp named_position(body) do
-    case Regex.run(~r/ at pos (\d+)(?:\.|\z)/, body) do
-      [_all, pos] -> String.to_integer(pos)
-      nil -> nil
-    end
-  end
-
-  # The quoted text is the end of the statement: its size says where it starts.
-  defp quoted_at(quoted, whole) do
+  @spec quoted_start(binary(), binary()) :: non_neg_integer() | nil
+  def quoted_start(quoted, whole) do
     text = unquote_debug(binary_part(quoted, 1, byte_size(quoted) - 2), [])
     pos = byte_size(whole) - byte_size(text)
     if pos >= 0 and leftover(whole, pos) == text, do: pos
@@ -146,10 +136,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
 
   # How many blanks (a space, a tab, a carriage return, a line feed) the statement starts with.
   @spec leading_blanks(binary()) :: non_neg_integer()
-  defp leading_blanks(whole) do
-    [blanks] = Regex.run(~r/\A[ \t\r\n]*/, whole)
-    byte_size(blanks)
-  end
+  defp leading_blanks(whole), do: byte_size(whole) - byte_size(InfluxQLLex.trim_blanks(whole))
 
   @spec leftover(binary(), non_neg_integer()) :: binary()
   defp leftover(whole, pos), do: binary_part(whole, pos, byte_size(whole) - pos)
@@ -215,7 +202,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   end
 
   @doc """
-  The body for a `WHERE` the tokens of which stop at `pos`, by the `kind`
+  `where_error_body/4` with the position the parser meets the error at (the order of the
+  errors of a statement, see `InfluxElixir.Client.Local.InfluxQLCheck.leftmost/2`): the
+  position the body names, or for a failure, where the text it quotes starts.
+  """
+  @spec where_error(atom(), non_neg_integer(), non_neg_integer(), binary()) ::
+          {non_neg_integer(), binary()}
+  def where_error(kind, pos, where_at, whole),
+    do: {where_key(kind, pos, where_at, whole), where_error_body(kind, pos, where_at, whole)}
+
+  defp where_key(:where_unparsed, _pos, where_at, _whole), do: where_at
+  defp where_key(:reserved_operand, pos, _where_at, whole), do: before_operand(whole, pos)
+  defp where_key(:reserved_operator, pos, _where_at, whole), do: before_operand(whole, pos) - 1
+  defp where_key(_kind, pos, _where_at, _whole), do: pos
+
+  @doc """
+  The body for a `WHERE` the tokens of which stop at `pos`
+  , by the `kind`
   `InfluxElixir.Client.Local.InfluxQLTokens` gives: `where_at` is where the
   `WHERE` starts.
   """

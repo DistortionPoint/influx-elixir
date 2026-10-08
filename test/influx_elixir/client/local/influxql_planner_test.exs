@@ -138,8 +138,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlannerTest do
 
       statement = "SELECT mean(-i) FROM m"
 
-      assert refused(conn, statement) ===
-               "Client.Local: unsupported select item: mean(-i): #{statement}"
+      why = "unsupported InfluxQL (a signed argument that is no number): mean(-i)"
+      assert refused(conn, statement) === "Client.Local: " <> why <> ": " <> statement
     end
   end
 end

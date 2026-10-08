@@ -39,7 +39,7 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   #     brace with nothing before it is the crate's error
   #   * a quantifier followed by `+` is not read (possessive to PCRE)
   #   * a pattern of several lines, or one that may be too large for the crate to compile (see
-  #     `size/1`), is not read
+  #     `SQLRegexCost`), is not read
 
   @escapes ~c"dDwWsSbBAzntrfa"
   @class_escapes ~c"dDwWsSntrfa"
@@ -51,10 +51,10 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
     Z Zs Zl Zp Cc Cf Co)
   @single ~w(L M N P S Z)
 
-  # The largest count of a repetition (`u32`), and the cost the double lets a pattern have (see
-  # `size/1`).
+  alias InfluxElixir.Client.Local.{SQLRegexCost, SQLRegexGuard}
+
+  # The largest count of a repetition (`u32`).
   @max_count 4_294_967_295
-  @max_cost 250_000
 
   @several_lines "a pattern of several lines"
   @group "a group other than (?:...) and the flag groups (?i) (?s) (?m)"
@@ -68,7 +68,6 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   @property "a Unicode property the double has not verified"
   @possessive "a quantifier followed by + (possessive to PCRE, a repeated repeat to the crate)"
   @spaced "white space inside a counted repetition (PCRE reads it as text)"
-  @too_big "a repetition so large that the crate may refuse to compile the pattern"
 
   @unclosed "unclosed counted repetition"
   @decimal_empty "repetition quantifier expects a valid decimal"
@@ -84,12 +83,16 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   """
   @type result :: :ok | :differs | {:unknown, binary()} | {:error, binary()}
 
-  @typedoc """
-  What a compiled pattern can tell about a text without running it: whether a text with a newline
-  (`:newline`) or with a character that is not ASCII (`:unicode`) is read another way by PCRE
-  and the crate.
-  """
-  @type guard :: %{newline: boolean(), unicode: boolean()}
+  @typedoc "What a compiled pattern can tell about a text; see `SQLRegexGuard`."
+  @type guard :: SQLRegexGuard.t()
+
+  @doc "What PCRE and the crate read differently for some texts; see `SQLRegexGuard.of/1`."
+  @spec guard(Regex.t()) :: guard()
+  defdelegate guard(regex), to: SQLRegexGuard, as: :of
+
+  @doc "Whether the double declines the text for the guard; see `SQLRegexGuard.differs?/2`."
+  @spec differs?(guard(), binary()) :: boolean()
+  defdelegate differs?(guard, text), to: SQLRegexGuard
 
   @doc """
   The engine's error text for the pattern, `:ok` for a pattern it compiles, `:differs` for one
@@ -102,53 +105,12 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
     else
       chars = String.codepoints(pattern)
 
-      case scan(chars, 0, length(chars), [], false) do
+      case scan(chars, 0, length(chars), [], false, SQLRegexCost.new()) do
         {:error, start, stop, message} -> {:error, format(pattern, start, stop, message)}
-        :ok -> size(chars)
         verdict -> verdict
       end
     end
   end
-
-  @doc """
-  What of a pattern PCRE and the crate read differently for some texts, found once when the
-  pattern is compiled (not for every row). For a text with a newline: `$`, `\\z` and the `(?m`
-  flag, whose ends and starts of lines are not alike; for a text that is not ASCII: `\\w`, `\\d`,
-  `\\s`, `\\b` (other sets of characters in the crate) and a case-insensitive match (other
-  folding).
-  """
-  @spec guard(Regex.t()) :: guard()
-  def guard(%Regex{source: source} = regex) do
-    %{
-      newline: String.contains?(source, ["$", "\\z", "(?m"]),
-      unicode:
-        :caseless in Regex.opts(regex) or
-          String.contains?(source, ["\\w", "\\W", "\\d", "\\D", "\\s", "\\S", "\\b", "\\B", "(?i"])
-    }
-  end
-
-  @doc """
-  Whether the double declines to match the text: it is one the pattern's `guard/1` says the two
-  read differently. This depends on the data, not on the query alone: one row with a newline
-  or a character that is not ASCII refuses a query that was answered before it was written.
-  """
-  @spec differs?(guard(), binary()) :: boolean()
-  def differs?(%{newline: false, unicode: false}, _text), do: false
-  def differs?(%{newline: true, unicode: false}, text), do: newline?(text)
-
-  def differs?(%{newline: false, unicode: true}, text),
-    do: not newline?(text) and not ascii?(text)
-
-  def differs?(%{newline: true, unicode: true}, text),
-    do: newline?(text) or not ascii?(text)
-
-  @spec newline?(binary()) :: boolean()
-  defp newline?(text), do: :binary.match(text, "\n") != :nomatch
-
-  @spec ascii?(binary()) :: boolean()
-  defp ascii?(<<byte, rest::binary>>) when byte < 128, do: ascii?(rest)
-  defp ascii?(<<>>), do: true
-  defp ascii?(_text), do: false
 
   @spec format(binary(), non_neg_integer(), non_neg_integer(), binary()) :: binary()
   defp format(pattern, start, stop, message) do
@@ -156,18 +118,26 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
     "regex parse error:\n    #{pattern}\n    #{pointer}\nerror: #{message}"
   end
 
-  # `groups` are the starts of the groups still open, `atom?` says something to repeat precedes.
-  @spec scan([binary()], non_neg_integer(), non_neg_integer(), [non_neg_integer()], boolean()) ::
-          verdict()
-  defp scan([], _at, _length, [], _atom?), do: :ok
+  # `groups` are the starts of the groups still open, `atom?` says something to repeat precedes,
+  # and `cost` is what the pattern read so far costs the crate to compile (`SQLRegexCost`): the
+  # one reader of the pattern is also the one that weighs it.
+  @spec scan(
+          [binary()],
+          non_neg_integer(),
+          non_neg_integer(),
+          [non_neg_integer()],
+          boolean(),
+          SQLRegexCost.t()
+        ) :: verdict()
+  defp scan([], _at, _length, [], _atom?, cost), do: SQLRegexCost.verdict(cost)
 
-  defp scan([], _at, _length, [start | _open], _atom?),
+  defp scan([], _at, _length, [start | _open], _atom?, _cost),
     do: {:error, start, start + 1, "unclosed group"}
 
-  defp scan(["\\" | rest], at, length, groups, _atom?),
-    do: escape(rest, at, length, groups)
+  defp scan(["\\" | rest], at, length, groups, _atom?, cost),
+    do: escape(rest, at, length, groups, cost)
 
-  defp scan(["(" | rest], at, length, groups, _atom?) do
+  defp scan(["(" | rest], at, length, groups, _atom?, cost) do
     case group(rest, at) do
       {:error, _start, _stop, _message} = error ->
         error
@@ -176,48 +146,58 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
         unknown
 
       {:ok, taken} ->
-        scan(Enum.drop(rest, taken), at + 1 + taken, length, [at | groups], false)
+        scan(
+          Enum.drop(rest, taken),
+          at + 1 + taken,
+          length,
+          [at | groups],
+          false,
+          SQLRegexCost.open(cost)
+        )
 
       :flags ->
-        flags(Enum.drop(rest, 3), at + 4, length, groups)
+        flags(Enum.drop(rest, 3), at + 4, length, groups, SQLRegexCost.atom(cost, 0))
     end
   end
 
-  defp scan([")" | _rest], at, _length, [], _atom?),
+  defp scan([")" | _rest], at, _length, [], _atom?, _cost),
     do: {:error, at, at + 1, "unopened group"}
 
-  defp scan([")" | rest], at, length, [_group | groups], _atom?),
-    do: scan(rest, at + 1, length, groups, true)
+  defp scan([")" | rest], at, length, [_group | groups], _atom?, cost),
+    do: scan(rest, at + 1, length, groups, true, SQLRegexCost.close(cost))
 
-  defp scan(["|" | rest], at, length, groups, _atom?),
-    do: scan(rest, at + 1, length, groups, false)
+  defp scan(["|" | rest], at, length, groups, _atom?, cost),
+    do: scan(rest, at + 1, length, groups, false, SQLRegexCost.alternate(cost))
 
-  defp scan(["[" | rest], at, length, groups, _atom?), do: class(rest, at, length, groups)
+  defp scan(["[" | rest], at, length, groups, _atom?, cost),
+    do: class(rest, at, length, groups, cost)
 
-  defp scan([operator | _rest], at, _length, _groups, false) when operator in ["*", "+", "?"],
-    do: {:error, at, at + 1, @missing}
+  defp scan([operator | _rest], at, _length, _groups, false, _cost)
+       when operator in ["*", "+", "?"],
+       do: {:error, at, at + 1, @missing}
 
   # A quantifier followed by `+` is possessive to PCRE and a repeat of a repeat to the crate.
-  defp scan([operator, "+" | _rest], _at, _length, _groups, true)
+  defp scan([operator, "+" | _rest], _at, _length, _groups, true, _cost)
        when operator in ["*", "+", "?"],
        do: {:unknown, @possessive}
 
-  defp scan([operator | rest], at, length, groups, true) when operator in ["*", "+", "?"],
-    do: scan(rest, at + 1, length, groups, true)
+  defp scan([operator | rest], at, length, groups, true, cost) when operator in ["*", "+", "?"],
+    do: scan(rest, at + 1, length, groups, true, cost)
 
   # A brace with nothing before it is the crate's error whatever follows it.
-  defp scan(["{" | _rest], at, _length, _groups, false), do: {:error, at, at + 1, @missing}
+  defp scan(["{" | _rest], at, _length, _groups, false, _cost),
+    do: {:error, at, at + 1, @missing}
 
-  defp scan(["{" | rest], at, length, groups, true) do
+  defp scan(["{" | rest], at, length, groups, true, cost) do
     case counted(rest, at) do
       {:ok, taken, low, high, spaced?} ->
         after_count = Enum.drop(rest, taken - 1)
 
         cond do
-          high != nil and high < low -> invalid_range(at, taken)
+          high != nil and high < low -> invalid_range(at, taken + lazy(after_count))
           spaced? -> {:unknown, @spaced}
           match?(["+" | _more], after_count) -> {:unknown, @possessive}
-          true -> scan(after_count, at + taken, length, groups, true)
+          true -> scan(after_count, at + taken, length, groups, true, repeated(cost, low, high))
         end
 
       {:error, _start, _stop, _message} = error ->
@@ -225,16 +205,40 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
     end
   end
 
-  defp scan([_char | rest], at, length, groups, _atom?),
-    do: scan(rest, at + 1, length, groups, true)
+  defp scan([char | rest], at, length, groups, _atom?, cost),
+    do:
+      scan(
+        rest,
+        at + 1,
+        length,
+        groups,
+        true,
+        SQLRegexCost.atom(cost, SQLRegexCost.character(char))
+      )
+
+  # A count repeats what precedes it as often as its largest number (one more for `{n,}`).
+  @spec repeated(SQLRegexCost.t(), non_neg_integer(), non_neg_integer() | nil) :: SQLRegexCost.t()
+  defp repeated(cost, low, nil), do: SQLRegexCost.repeat(cost, low + 1)
+  defp repeated(cost, _low, high), do: SQLRegexCost.repeat(cost, high)
 
   # What follows a flag group, which sets flags and repeats nothing.
-  @spec flags([binary()], non_neg_integer(), non_neg_integer(), [non_neg_integer()]) ::
+  @spec flags(
+          [binary()],
+          non_neg_integer(),
+          non_neg_integer(),
+          [non_neg_integer()],
+          SQLRegexCost.t()
+        ) ::
           verdict()
-  defp flags([operator | _rest], _at, _length, _groups) when operator in ["*", "+", "?", "{"],
-    do: {:unknown, @flag_repeat}
+  defp flags([operator | _rest], _at, _length, _groups, _cost)
+       when operator in ["*", "+", "?", "{"],
+       do: {:unknown, @flag_repeat}
 
-  defp flags(rest, at, length, groups), do: scan(rest, at, length, groups, false)
+  defp flags(rest, at, length, groups, cost), do: scan(rest, at, length, groups, false, cost)
+  # The crate's error for an impossible count points through the `?` that makes it lazy.
+  @spec lazy([binary()]) :: 0 | 1
+  defp lazy(["?" | _rest]), do: 1
+  defp lazy(_rest), do: 0
 
   @spec invalid_range(non_neg_integer(), pos_integer()) :: error()
   defp invalid_range(at, taken),
@@ -355,51 +359,86 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   # ---------------------------------------------------------------------------
 
   # The escape after a backslash that stood at `at`.
-  @spec escape([binary()], non_neg_integer(), non_neg_integer(), [non_neg_integer()]) ::
+  @spec escape(
+          [binary()],
+          non_neg_integer(),
+          non_neg_integer(),
+          [non_neg_integer()],
+          SQLRegexCost.t()
+        ) ::
           verdict()
-  defp escape([], at, _length, _groups),
+  defp escape([], at, _length, _groups, _cost),
     do: {:error, at, at + 1, "incomplete escape sequence, reached end of pattern prematurely"}
 
-  defp escape([property | rest], at, length, groups) when property in ["p", "P"] do
+  defp escape([property | rest], at, length, groups, cost) when property in ["p", "P"] do
     case unicode(property, rest, at, length) do
-      {:ok, taken} -> scan(Enum.drop(rest, taken), at + 2 + taken, length, groups, true)
-      other -> other
+      {:ok, taken} ->
+        scan(
+          Enum.drop(rest, taken),
+          at + 2 + taken,
+          length,
+          groups,
+          true,
+          SQLRegexCost.atom(cost, 1200)
+        )
+
+      other ->
+        other
     end
   end
 
-  defp escape(["x" | rest], at, length, groups) do
+  defp escape(["x" | rest], at, length, groups, cost) do
     case hex(rest) do
-      {:ok, taken} -> scan(Enum.drop(rest, taken), at + 2 + taken, length, groups, true)
-      :error -> {:unknown, @escape}
+      {:ok, taken} ->
+        scan(
+          Enum.drop(rest, taken),
+          at + 2 + taken,
+          length,
+          groups,
+          true,
+          SQLRegexCost.atom(cost, 1)
+        )
+
+      :error ->
+        {:unknown, @escape}
     end
   end
 
-  defp escape(["v" | _rest], _at, _length, _groups), do: {:unknown, @vertical}
+  defp escape(["v" | _rest], _at, _length, _groups, _cost), do: {:unknown, @vertical}
 
-  defp escape([<<digit>> | _rest], at, _length, _groups) when digit in ?0..?9,
+  defp escape([<<digit>> | _rest], at, _length, _groups, _cost) when digit in ?0..?9,
     do: {:error, at, at + 2, "backreferences are not supported"}
 
-  defp escape([<<letter>>, "{" | _rest], _at, _length, _groups) when letter in ~c"bB",
+  defp escape([<<letter>>, "{" | _rest], _at, _length, _groups, _cost) when letter in ~c"bB",
     do: {:unknown, @escape}
 
-  defp escape([<<letter>> | rest], at, length, groups) when letter in @escapes,
-    do: scan(rest, at + 2, length, groups, true)
+  defp escape([<<letter>> | rest], at, length, groups, cost) when letter in @escapes,
+    do:
+      scan(
+        rest,
+        at + 2,
+        length,
+        groups,
+        true,
+        SQLRegexCost.atom(cost, SQLRegexCost.escape(<<letter>>))
+      )
 
-  defp escape([<<letter>> | _rest], _at, _length, _groups) when letter in ~c"uU",
+  defp escape([<<letter>> | _rest], _at, _length, _groups, _cost) when letter in ~c"uU",
     do: {:unknown, @escape}
 
-  defp escape([<<letter>> | _rest], at, _length, _groups)
+  defp escape([<<letter>> | _rest], at, _length, _groups, _cost)
        when letter in ?a..?z or letter in ?A..?Z,
        do: {:error, at, at + 2, "unrecognized escape sequence"}
 
-  defp escape([<<char>> | _rest], _at, _length, _groups) when char in [?<, ?>], do: :differs
+  defp escape([<<char>> | _rest], _at, _length, _groups, _cost) when char in [?<, ?>],
+    do: :differs
 
   # The crate escapes ASCII punctuation (and space and controls) and nothing else.
-  defp escape([char | _rest], at, _length, _groups) when byte_size(char) > 1,
+  defp escape([char | _rest], at, _length, _groups, _cost) when byte_size(char) > 1,
     do: {:error, at, at + 2, "unrecognized escape sequence"}
 
-  defp escape([_punctuation | rest], at, length, groups),
-    do: scan(rest, at + 2, length, groups, true)
+  defp escape([_punctuation | rest], at, length, groups, cost),
+    do: scan(rest, at + 2, length, groups, true, SQLRegexCost.atom(cost, 1))
 
   # What follows `\x` when it is a character: two hex digits, or hex digits in braces that are a
   # code point (how many characters are taken after the `x`).
@@ -468,9 +507,15 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   # open a class as characters (so `[--a]` is not the range of PCRE), and a `]` that comes first
   # (no hyphen before it) as a character too; its error for a class that does not end points at
   # what it took (`[^]`, `[-`, but only the `[` when the text ends in the hyphens).
-  @spec class([binary()], non_neg_integer(), non_neg_integer(), [non_neg_integer()]) ::
+  @spec class(
+          [binary()],
+          non_neg_integer(),
+          non_neg_integer(),
+          [non_neg_integer()],
+          SQLRegexCost.t()
+        ) ::
           verdict()
-  defp class(rest, at, length, groups) do
+  defp class(rest, at, length, groups, cost) do
     {negated, body} = if match?(["^" | _more], rest), do: {1, tl(rest)}, else: {0, rest}
     {dashes, body} = Enum.split_while(body, &(&1 == "-"))
 
@@ -487,7 +532,14 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
         {:unknown, @class_dashes}
 
       {:ok, taken} ->
-        scan(Enum.drop(body, taken), opened + taken, length, groups, true)
+        scan(
+          Enum.drop(body, taken),
+          opened + taken,
+          length,
+          groups,
+          true,
+          SQLRegexCost.atom(cost, SQLRegexCost.class(Enum.take(body, taken), negated == 1))
+        )
 
       :unclosed ->
         width = if dashes != [] and body == [], do: 1, else: opened - at
@@ -569,105 +621,4 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   end
 
   defp class_items([_char | rest], at, taken), do: class_items(rest, at + 1, taken + 1)
-
-  # ---------------------------------------------------------------------------
-  # Size
-  # ---------------------------------------------------------------------------
-
-  # The crate compiles a repetition by copying what it repeats, and gives up on a pattern whose
-  # copies exceed its limit: on Core `(a{1000}){1000}`, `\w{1000}` and `(.{1000}){100}` close the
-  # connection instead of answering (verified), and PCRE answers them. A pattern is costed (a
-  # character 1, `.` and a negated class 20, a class 4, `\w`, `\d`, `\s`, `\pL` and their kin
-  # 1200, a group the sum of what it holds, a repetition the product of its count and the cost
-  # of what it repeats) and one above `@max_cost` is not read. The weights are fitted to what
-  # Core did, not the crate's: every pattern probed that it answered costs less than the
-  # bound or at it (`(a{500}){500}` 250,000; `\w{200}` and `\pL{200}` 240,000;
-  # `(.{100}){100}` 200,000; `[a-z]{10000}`), and every one it closed the connection on costs
-  # more (`(a{600}){600}` 360,000; `(a{300}){1000}` 300,000; `\w{300}` and `\pL{300}` 360,000;
-  # `(.{200}){100}` 400,000; `(\pL{50}){10}` 600,000; `(\w{20}){20}` 480,000). Between the two
-  # the bound is a guess, and what is above it is refused, not answered.
-  @spec size([binary()]) :: :ok | {:unknown, binary()}
-  defp size(chars) do
-    {cost, _rest} = sequence(chars, 0)
-    if cost > @max_cost, do: {:unknown, @too_big}, else: :ok
-  end
-
-  # The cost of what stands up to a `)` (not taken) or the end; alternatives add up.
-  @spec sequence([binary()], non_neg_integer()) :: {non_neg_integer(), [binary()]}
-  defp sequence([], cost), do: {cost, []}
-  defp sequence([")" | _rest] = rest, cost), do: {cost, rest}
-
-  defp sequence(chars, cost) do
-    {unit, rest} = atom(chars)
-    {times, rest} = repeats(rest, 1)
-    sequence(rest, cost + unit * times)
-  end
-
-  @spec atom([binary()]) :: {non_neg_integer(), [binary()]}
-  defp atom(["|" | rest]), do: {0, rest}
-  defp atom(["." | rest]), do: {20, rest}
-
-  defp atom(["\\", property, "{" | rest]) when property in ["p", "P"],
-    do: {1200, rest |> Enum.drop_while(&(&1 != "}")) |> Enum.drop(1)}
-
-  defp atom(["\\", property, _letter | rest]) when property in ["p", "P"], do: {1200, rest}
-  defp atom(["\\", escape | rest]) when escape in ~w(d D w W s S), do: {1200, rest}
-  defp atom(["\\", _escape | rest]), do: {1, rest}
-
-  defp atom(["(", "?", flag, ")" | rest]) when flag in ["i", "s", "m"], do: {0, rest}
-
-  defp atom(["(" | rest]) do
-    opening =
-      case rest do
-        ["?", ":" | _more] -> 2
-        ["?", _flag, ":" | _more] -> 3
-        _plain -> 0
-      end
-
-    {cost, [")" | rest]} = rest |> Enum.drop(opening) |> sequence(0)
-    {cost, rest}
-  end
-
-  defp atom(["[" | rest]), do: class_cost(rest)
-  defp atom([_char | rest]), do: {1, rest}
-
-  # A class is read to its `]`, as `class/4` read it; one with `\w` or `\p` in it costs as they.
-  @spec class_cost([binary()]) :: {non_neg_integer(), [binary()]}
-  defp class_cost(rest) do
-    {base, rest} = if match?(["^" | _more], rest), do: {20, tl(rest)}, else: {4, rest}
-    {dashes, rest} = Enum.split_while(rest, &(&1 == "-"))
-    rest = if dashes == [] and match?(["]" | _more], rest), do: tl(rest), else: rest
-    class_end(rest, base)
-  end
-
-  @spec class_end([binary()], non_neg_integer()) :: {non_neg_integer(), [binary()]}
-  defp class_end(["]" | rest], cost), do: {cost, rest}
-
-  defp class_end(["\\", escape | rest], _cost) when escape in ~w(p P d D w W s S),
-    do: class_end(rest, 1200)
-
-  defp class_end(["\\", _escape | rest], cost), do: class_end(rest, cost)
-  defp class_end([_char | rest], cost), do: class_end(rest, cost)
-  defp class_end([], cost), do: {cost, []}
-
-  # The quantifiers after an atom, multiplied: `*`, `+` and `?` repeat once more at most, a
-  # count by its largest number (one more for `{n,}`).
-  @spec repeats([binary()], non_neg_integer()) :: {non_neg_integer(), [binary()]}
-  defp repeats([operator | rest], times) when operator in ["*", "+", "?"],
-    do: repeats(rest, times)
-
-  defp repeats(["{" | rest], times) do
-    {inner, tail} = Enum.split_while(rest, &(&1 != "}"))
-
-    count =
-      case inner |> Enum.join() |> String.split(",") |> Enum.map(&String.trim/1) do
-        [low] -> String.to_integer(low)
-        [low, ""] -> String.to_integer(low) + 1
-        [_low, high] -> String.to_integer(high)
-      end
-
-    repeats(Enum.drop(tail, 1), times * max(count, 1))
-  end
-
-  defp repeats(rest, times), do: {times, rest}
 end

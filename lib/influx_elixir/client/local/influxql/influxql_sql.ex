@@ -68,10 +68,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   def rewrite([token | rest], tags, strings, acc),
     do: rewrite(rest, tags, strings, [token_sql(token) | acc])
 
+  # The SQL path refuses a bare `.*` (its simplifier rewrites it under a negation, which is not
+  # the expression's meaning). InfluxQL has no `NOT`, and the engine answers its `=~ /.*/` and
+  # `!~ /.*/` on a tag as the expression reads (verified: a missing tag is the empty string,
+  # which `.*` matches), so the pattern is written as the group the SQL path does not rewrite.
   @spec regex_sql(binary(), binary(), binary()) :: binary()
-  defp regex_sql(name, op, regex),
-    do:
-      "#{ident_sql(name)} #{if op == "=~", do: "~", else: "!~"} '#{String.replace(regex, "'", "''")}'"
+  defp regex_sql(name, op, regex) do
+    regex = if regex == ".*", do: "(?:.*)", else: regex
+
+    operator = if op == "=~", do: "~", else: "!~"
+    "#{ident_sql(name)} #{operator} '#{String.replace(regex, "'", "''")}'"
+  end
 
   # The engine's optimizer folds `!~ /.*/` on a string field into `= ''`
   # (verified: it keeps the points whose value is the empty string, and no

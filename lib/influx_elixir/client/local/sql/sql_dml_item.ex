@@ -26,7 +26,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
   # items of one shape have the same name, and the error is refused by name, as its words cannot
   # be printed. Items of different shapes are taken to have different names.
 
-  alias InfluxElixir.Client.Local.{SQLDmlExpr, SQLDmlOperand, SQLError}
+  alias InfluxElixir.Client.Local.{SQLDml, SQLDmlExpr, SQLDmlOperand, SQLError}
 
   @typep item :: {SQLDmlExpr.ast(), SQLDmlExpr.item_alias()}
   @typep mode :: :display | :name
@@ -136,7 +136,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
 
   defp verdict(%{}, _ctx), do: :ok
 
-  @spec unprintable(SQLDmlExpr.ast(), SQLDmlOperand.ctx()) :: {:refuse, binary()}
+  @spec unprintable(SQLDmlExpr.ast(), SQLDmlOperand.ctx()) :: {:refuse, SQLDml.reason()}
   defp unprintable(operand, ctx),
     do: {:refuse, "two select items that have the same name, one #{cause(operand, ctx)}"}
 

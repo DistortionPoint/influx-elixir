@@ -257,10 +257,29 @@ defmodule InfluxElixir.Client.HTTP do
   @spec sql_request_body(binary(), binary(), keyword(), term()) ::
           {:ok, binary()} | {:error, QueryParams.error()}
   defp sql_request_body(database, sql, opts, format) do
-    with {:ok, params} <- query_params(opts) do
+    with {:ok, params} <- query_params(opts),
+         :ok <- encodable_text(sql),
+         :ok <- encodable_text(database) do
       {:ok, QueryParams.request_body(database, sql, params, format)}
     end
   end
+
+  # A request body is JSON, which holds only UTF-8 text: text that is not is
+  # the caller's error, returned as one, never a `Jason.EncodeError` raised.
+  @spec json_body(map()) :: {:ok, binary()} | {:error, {:unencodable_body, binary()}}
+  defp json_body(map) do
+    case Jason.encode(map) do
+      {:ok, body} -> {:ok, body}
+      {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
+    end
+  end
+
+  @spec encodable_text(binary() | nil) :: :ok | {:error, {:unencodable_body, binary()}}
+  defp encodable_text(text) when is_binary(text) do
+    if String.valid?(text), do: :ok, else: json_body(%{"text" => text})
+  end
+
+  defp encodable_text(nil), do: :ok
 
   @spec http_query_sql(keyword(), binary(), keyword()) :: InfluxElixir.Client.query_result()
   defp http_query_sql(connection, sql, opts) do
@@ -355,12 +374,11 @@ defmodule InfluxElixir.Client.HTTP do
         body_map
       end
 
-    body = Jason.encode!(body_map)
-
     url = base_url(connection) <> "/api/v3/query_influxql"
     headers = json_headers(connection)
 
-    with {:ok, %Finch.Response{body: resp_body}} <-
+    with {:ok, body} <- json_body(body_map),
+         {:ok, %Finch.Response{body: resp_body}} <-
            request(:post, url, headers, body, connection, opts, [200]) do
       ResponseParser.parse(resp_body, format)
     end
@@ -378,17 +396,17 @@ defmodule InfluxElixir.Client.HTTP do
 
     # The `#datatype` annotation lets ResponseParser type each column
     # (double/long/boolean/RFC3339) instead of returning every cell as text.
-    body =
-      Jason.encode!(%{
-        "query" => flux,
-        "type" => "flux",
-        "dialect" => %{"annotations" => ["datatype"], "header" => true, "delimiter" => ","}
-      })
+    body_map = %{
+      "query" => flux,
+      "type" => "flux",
+      "dialect" => %{"annotations" => ["datatype"], "header" => true, "delimiter" => ","}
+    }
 
     url = base_url(connection) <> "/api/v2/query?org=#{query_value(org)}"
     headers = json_headers(connection)
 
-    with {:ok, %Finch.Response{body: resp_body}} <-
+    with {:ok, body} <- json_body(body_map),
+         {:ok, %Finch.Response{body: resp_body}} <-
            request(:post, url, headers, body, connection, opts, [200]) do
       ResponseParser.parse(resp_body, :flux_csv)
     end
@@ -413,13 +431,12 @@ defmodule InfluxElixir.Client.HTTP do
         retention -> Map.put(body_map, "retention_period", retention)
       end
 
-    body = Jason.encode!(body_map)
-
     url = base_url(connection) <> "/api/v3/configure/database"
     headers = json_headers(connection)
 
     # 409 = already exists, which is success for an idempotent create.
-    with {:ok, _response} <-
+    with {:ok, body} <- json_body(body_map),
+         {:ok, _response} <-
            request(:post, url, headers, body, connection, opts, [200, 201, 409]) do
       :ok
     end
@@ -471,14 +488,13 @@ defmodule InfluxElixir.Client.HTTP do
   def create_bucket(connection, name, opts \\ []) do
     retention = Keyword.get(opts, :retention, 0)
 
-    with {:ok, org_id} <- resolve_org_id(connection, opts) do
-      body =
-        Jason.encode!(%{
-          "name" => name,
-          "orgID" => org_id,
-          "retentionRules" => [%{"everySeconds" => retention}]
-        })
-
+    with {:ok, org_id} <- resolve_org_id(connection, opts),
+         {:ok, body} <-
+           json_body(%{
+             "name" => name,
+             "orgID" => org_id,
+             "retentionRules" => [%{"everySeconds" => retention}]
+           }) do
       url = base_url(connection) <> "/api/v2/buckets"
       headers = json_headers(connection)
 
@@ -1028,8 +1044,14 @@ defmodule InfluxElixir.Client.HTTP do
   @spec decode_line(binary()) :: map()
   defp decode_line(line) do
     case Jason.decode(line) do
-      {:ok, row} -> ResponseParser.coerce_types(row)
-      {:error, reason} -> raise InfluxElixir.StreamError, kind: :decode, reason: reason
+      {:ok, row} when is_map(row) ->
+        ResponseParser.coerce_types(row)
+
+      {:ok, other} ->
+        raise InfluxElixir.StreamError, kind: :decode, reason: {:unexpected_json, other}
+
+      {:error, reason} ->
+        raise InfluxElixir.StreamError, kind: :decode, reason: reason
     end
   end
 

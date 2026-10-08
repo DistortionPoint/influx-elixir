@@ -47,7 +47,7 @@ defmodule InfluxElixir.Config do
 
   @schema [
     host: [
-      type: :string,
+      type: {:custom, __MODULE__, :host, []},
       required: true,
       doc: "InfluxDB host (hostname or IP, no scheme)"
     ],
@@ -74,7 +74,7 @@ defmodule InfluxElixir.Config do
           "both clients default :database to the first item if :database is unset."
     ],
     port: [
-      type: :pos_integer,
+      type: {:in, 1..65_535},
       default: 8086,
       doc: "Port number"
     ],
@@ -102,7 +102,7 @@ defmodule InfluxElixir.Config do
       doc: "Connection-level Finch pool checkout timeout in ms (default: 5_000)"
     ],
     flight_port: [
-      type: :pos_integer,
+      type: {:in, 1..65_535},
       doc: "Arrow Flight gRPC port used by `transport: :flight` queries (default: 443)"
     ],
     batch_writer: [
@@ -138,6 +138,19 @@ defmodule InfluxElixir.Config do
   def validate(opts) do
     NimbleOptions.validate(opts, @schema)
   end
+
+  # A host is written into every request's URL: an empty one, or one with a
+  # blank or control character, cannot be (Mint refuses it at the request,
+  # far from the option that caused it).
+  @doc false
+  @spec host(term()) :: {:ok, binary()} | {:error, binary()}
+  def host(host) when is_binary(host) and host != "" do
+    if String.match?(host, ~r/[\s[:cntrl:]]/u) or not String.valid?(host),
+      do: {:error, "expected :host to have no blank or control character, got: #{inspect(host)}"},
+      else: {:ok, host}
+  end
+
+  def host(host), do: {:error, "expected :host to be a non-empty string, got: #{inspect(host)}"}
 
   @doc """
   Validates connection options, raising on error.

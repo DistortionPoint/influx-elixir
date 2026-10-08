@@ -11,7 +11,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
   # from `ctx.clean`. Every position is a byte offset into the statement as
   # sent.
 
-  alias InfluxElixir.Client.Local.{InfluxQLRegex, InfluxQLText}
+  alias InfluxElixir.Client.Local.{InfluxQLLex, InfluxQLRegex, InfluxQLText}
+
+  require InfluxQLLex
 
   @typedoc "The scanned statement."
   @type ctx :: %{
@@ -52,7 +54,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
 
   @doc "Whether a blank stands at `at`."
   @spec ws?(ctx(), non_neg_integer()) :: boolean()
-  def ws?(ctx, at), do: at_byte(ctx, at) in [" ", "\t", "\n", "\r"]
+  def ws?(ctx, at), do: match?(<<c>> when InfluxQLLex.is_blank(c), at_byte(ctx, at))
 
   @doc "The position after the blanks that start at `at`."
   @spec skip_ws(ctx(), non_neg_integer()) :: non_neg_integer()

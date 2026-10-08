@@ -66,11 +66,30 @@ defmodule InfluxElixir.Client.Local.Format do
      }}
   end
 
-  defp accept(format, database) do
-    if to_string(format) in @engine_formats,
-      do: :ok,
-      else: {:error, %{status: 400, body: unknown_variant(format, database)}}
+  defp accept(format, database) when is_atom(format) or is_binary(format) do
+    text = to_string(format)
+
+    cond do
+      not String.valid?(text) ->
+        {:error,
+         refusal(
+           "format: a value that is not valid UTF-8 (the client cannot write it into the " <>
+             "request body)"
+         )}
+
+      text in @engine_formats ->
+        :ok
+
+      true ->
+        {:error, %{status: 400, body: unknown_variant(format, database)}}
+    end
   end
+
+  defp accept(_format, _database),
+    do: {:error, refusal("format: a value that is neither an atom nor a string")}
+
+  @spec refusal(binary()) :: map()
+  defp refusal(reason), do: %{status: 400, body: "Client.Local: " <> reason}
 
   @doc """
   The engine's 400 for the request's parameters, or `:ok`. The engine reads

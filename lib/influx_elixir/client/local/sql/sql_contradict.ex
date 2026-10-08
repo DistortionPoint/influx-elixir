@@ -30,7 +30,7 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   # a number beside a text column is its text. A boolean never folds (`b = true AND b = false`).
   #
   # The engine folds more than that, in ways the double has not verified: a `NULL` in an `IN`
-  # list beside an equality or a `NULL`, `time IS NULL` (time is never null), a `NOT IN` beside
+  # list beside an equality or a `NULL`, a `NOT IN` beside
   # a test of its operand, a group of an `OR` that repeats a branch. What this does not know it
   # says so (`unknown/3`, `uncertainty/2`, `grouped_overlap?/1`) instead of guessing: the caller
   # refuses by name a query whose answer depends on it.
@@ -116,9 +116,20 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
       (`n NOT IN (0, 1) OR n NOT IN (2)`), for a `NULL` row too, which a filter keeps and
       three-valued logic does not; `NOT (n IN (7)) OR NOT (n IN (0))` is the same
 
-  The fold depends on the operand's type and on the engine's rule for a `NULL` in a list, which
-  the double does not model, so a caller refuses it. `filters` are the `WHERE` and `HAVING`
-  (what a filter keeps), `values` the select list and `ORDER BY` (what an expression is).
+  The double does not check that the lists share no value (lists that share one fold to the
+  `IN` of what they share, which three-valued logic reads alike, but the double has not
+  verified every spelling), nor does it model the operand's type or the engine's rule for a
+  `NULL` in a list: any such pair is a gap, and a caller refuses it. The two operands are the
+  same when they differ only by a cast (the engine drops one that changes nothing), and an `OR`
+  of equalities and `IN` lists of one operand counts as one `IN` list (the engine merges it
+  first). `time` is never `NULL`, so its pairs are no gap.
+
+  `filters` are the `WHERE` and `HAVING` (what a filter keeps), `values` everything else an
+  expression is read for: the select list, the arguments of aggregates, `GROUP BY` and `ORDER
+  BY`. Only `AND`, `OR` and the lists of conjuncts keep a node in `filters`: under a `NOT`, a
+  comparison, a test (`IS NULL`), a function, a `CASE` or a cast the node is a value. A `HAVING`
+  names its aggregates `__agN__`; `fold_gap?/1` reads each as the aggregate it stands for
+  (`max(n) IN (0) AND max(n) IN (1)` is a pair).
   """
   @spec fold_gap?(%{filters: [term()], values: [term()]}) :: boolean()
   def fold_gap?(%{filters: filters, values: values}),
@@ -128,8 +139,10 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
 
   @spec gap?(term(), mode()) :: boolean()
   defp gap?({:and, _left, _right} = expr, mode) do
-    chain = expr |> chain(:and) |> Enum.map(&polarity/1)
-    (mode == :value and positive_pair?(chain)) or Enum.any?(chain(expr, :and), &gap?(&1, mode))
+    members = chain(expr, :and)
+
+    (mode == :value and positive_pair?(Enum.map(members, &polarity/1))) or
+      Enum.any?(members, &gap?(&1, mode))
   end
 
   defp gap?({:or, _left, _right} = expr, mode) do
@@ -149,12 +162,33 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
       Enum.any?(nodes, &gap?(&1, mode))
   end
 
-  defp gap?(%{nodes: nodes}, mode), do: gap?(nodes, mode)
+  defp gap?(%{nodes: nodes} = having, mode), do: gap?(having_nodes(having, nodes), mode)
 
-  defp gap?(tuple, mode) when is_tuple(tuple),
-    do: tuple |> Tuple.to_list() |> Enum.any?(&gap?(&1, mode))
+  # Anything else is a value, however it stands in a filter: only a connective keeps a
+  # missing row and a false one alike.
+  defp gap?(tuple, _mode) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> Enum.any?(&gap?(&1, :value))
 
   defp gap?(_other, _mode), do: false
+
+  # The nodes of a `HAVING` with each `__agN__` replaced by the aggregate it stands for.
+  @spec having_nodes(map(), [term()]) :: [term()]
+  defp having_nodes(%{aggs: aggs}, nodes) do
+    names = Map.new(aggs, fn {name, column} -> {name, {:aggregate_of, column}} end)
+    substitute(nodes, names)
+  end
+
+  defp having_nodes(_having, nodes), do: nodes
+
+  @spec substitute(term(), %{binary() => term()}) :: term()
+  defp substitute(name, names) when is_binary(name), do: Map.get(names, name, name)
+  defp substitute({:field, name}, names) when is_binary(name), do: substitute(name, names)
+
+  defp substitute(tuple, names) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> Enum.map(&substitute(&1, names)) |> List.to_tuple()
+
+  defp substitute(list, names) when is_list(list), do: Enum.map(list, &substitute(&1, names))
+  defp substitute(other, _names), do: other
 
   # The operands of nested `AND`s (or `OR`s) of expressions, however they are grouped.
   @spec chain(term(), :and | :or) :: [term()]
@@ -178,25 +212,77 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   end
 
   # The operand a member tests against a list and whether it is a `NOT IN` (a `NOT` of an `IN`
-  # is one), else `nil`.
+  # is one, an `OR` of equalities and lists of one operand is an `IN`, and so is an `IN` that
+  # is compared to `true`), else `nil`.
   @spec polarity(term()) :: {term(), boolean()} | nil
   defp polarity({op, operand, list}) when op in [:in, :not_in] and is_list(list),
-    do: {operand_key(operand), op == :not_in}
+    do: listed(fold_key(operand), op == :not_in)
 
   defp polarity({:in, operand, list, negated}) when is_list(list),
-    do: {expr_key(operand), negated}
+    do: listed(fold_key(operand), negated)
 
   defp polarity({:not, [member]}), do: flip(polarity(member))
   defp polarity({:not, member}) when is_tuple(member), do: flip(polarity(member))
+  defp polarity({:eq, {:expr, inner}, true}), do: polarity(inner)
+  defp polarity({:eq, {:expr, inner}, false}), do: flip(polarity(inner))
+  defp polarity({:cmp, :eq, inner, {:lit, true}}), do: polarity(inner)
+  defp polarity({:cmp, :eq, inner, {:lit, false}}), do: flip(polarity(inner))
+  defp polarity({:or, _left, _right} = expr), do: merged(chain(expr, :or))
+
+  defp polarity({:or, branches}) when is_list(branches) do
+    if Enum.all?(branches, &match?([_one], &1)),
+      do: merged(Enum.map(branches, fn [member] -> member end)),
+      else: nil
+  end
+
   defp polarity(_member), do: nil
+
+  # The members of an `OR` that are all equalities or `IN` lists of one operand: the engine
+  # merges them into one `IN` list before it folds that with another.
+  @spec merged([term()]) :: {term(), boolean()} | nil
+  defp merged(members) do
+    case members |> Enum.map(&equality_key/1) |> Enum.uniq() do
+      [key] when key != nil -> {key, false}
+      _other -> nil
+    end
+  end
+
+  @spec equality_key(term()) :: term()
+  defp equality_key({:eq, operand, literal}) when literal != nil, do: listed_key(operand)
+
+  defp equality_key({:cmp, :eq, operand, {:lit, value}}) when value != nil,
+    do: listed_key(operand)
+
+  defp equality_key({:in, operand, list}) when is_list(list), do: listed_key(operand)
+  defp equality_key({:in, operand, list, false}) when is_list(list), do: listed_key(operand)
+  defp equality_key(_member), do: nil
+
+  @spec listed_key(term()) :: term()
+  defp listed_key(operand) do
+    case listed(fold_key(operand), false) do
+      {key, _negative} -> key
+      nil -> nil
+    end
+  end
+
+  # `time` is never `NULL`: the folded constant is what three-valued logic says.
+  @spec listed(term(), boolean()) :: {term(), boolean()} | nil
+  defp listed("time", _negated), do: nil
+  defp listed(key, negated), do: {key, negated}
 
   @spec flip({term(), boolean()} | nil) :: {term(), boolean()} | nil
   defp flip({operand, negative?}), do: {operand, not negative?}
   defp flip(nil), do: nil
 
-  @spec expr_key(term()) :: term()
-  defp expr_key({:field, name}) when is_binary(name), do: name
-  defp expr_key(other), do: {:expr, other}
+  # An operand as the engine compares it: a column however it is written, without the casts
+  # that change nothing (the double does not tell which those are, and a cast that does change
+  # something only makes it refuse more).
+  @spec fold_key(term()) :: term()
+  defp fold_key({:expr, expr}), do: fold_key(expr)
+  defp fold_key({:cast, inner, _type}), do: fold_key(inner)
+  defp fold_key({:field, name}) when is_binary(name), do: name
+  defp fold_key(name) when is_binary(name), do: name
+  defp fold_key(other), do: {:expr, other}
 
   @doc """
   Whether two equalities of the clauses (top-level conjuncts) are to different values. The
@@ -235,16 +321,44 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
     |> Enum.any?(&(is_tuple(&1) and not first?(&1, clauses, types)))
   end
 
+  # The shapes the double has no verified rule for, with what a refusal says of each: the one
+  # table (the caller words the refusal, `beside/1`; `uncertainty/2` finds them).
+  @beside %{
+    null_not_in_list: "a NOT IN list with a NULL (the engine takes it out of an IN list)",
+    null_beside_null_comparison:
+      "a NULL in an IN list, beside a comparison to NULL, which the engine folds with it",
+    null_only_list_beside_equality:
+      "an IN list of nothing but NULL, beside an equality, which the engine folds with it",
+    null_beside_in_list:
+      "a NULL in an IN list, beside another IN list that the engine folds with it",
+    null_beside_not_in_list:
+      "a NULL in an IN list, beside a NOT IN list that the engine folds with it",
+    null_beside_bare_condition:
+      "a NULL in an IN list, beside a bare condition, which the engine folds with it",
+    null_beside_null_test:
+      "a NULL in an IN list, beside a test for NULL, which the engine folds with it",
+    not_in: "a NOT IN list and another test of its operand",
+    respelled: "an IN list that writes one value in two spellings (IN (1, '1'))",
+    float: "an integer equal to a float and to something else, with a third test",
+    late_conflict:
+      "an expression compared to different values, the first conjunct being none of them"
+  }
+
   @typedoc """
-  A shape the double has no verified rule for (see `uncertainty/2`): `:time_null` a test of
-  `time` for `NULL`, `:null_list` a `NULL` in an `IN` list beside a clause the engine folds it
-  with, `:not_in` a `NOT IN` beside another test of its operand, `:respelled` a list that writes
-  one value in two spellings, `:float` an integer equal to a float beside two more tests, and
+  A shape the double has no verified rule for (see `uncertainty/2` and `beside/1`, which words
+  each): a `NULL` in an `IN` list beside a clause the engine folds it with (`:null_beside_*`
+  and `:null_only_list_beside_equality`), or a `NOT IN` list with one (`:null_not_in_list`),
+  `:not_in` a `NOT IN` beside another test of its operand, `:respelled` a list that writes one
+  value in two spellings, `:float` an integer equal to a float beside two more tests, and
   `:late_conflict` an expression compared to different values with a first conjunct that is
   none of them.
   """
   @type uncertainty ::
-          :time_null | :null_list | :not_in | :respelled | :float | :late_conflict
+          unquote(@beside |> Map.keys() |> Enum.sort() |> Enum.reduce(&{:|, [], [&1, &2]}))
+
+  @doc "What a refusal says the double does not know, for an `uncertainty/2`; else `nil`."
+  @spec beside(term()) :: binary() | nil
+  def beside(cause), do: Map.get(@beside, cause)
 
   @doc """
   What the double does not know of a `WHERE` that has a negation: the `uncertainty/2` of its
@@ -351,7 +465,6 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   #
   #   * a `NULL` in an `IN` list beside a clause the engine folds it with in a way the double
   #     does not read (see `foldable_with_null?/3`), and a `NOT IN` list with a `NULL`
-  #   * a test of `time` for `NULL` (it is never null, and the engine proves it)
   #   * a `NOT IN` beside another test of its operand
   #   * a list whose literals are written in different spellings of one value (`IN (1, '1')`)
   #   * an integer equal to a float beside two more tests (the engine fails internally)
@@ -359,8 +472,7 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   @spec uncertainty([clause()], types()) :: uncertainty() | nil
   def uncertainty(clauses, types) do
     cond do
-      Enum.any?(clauses, &time_null?/1) -> :time_null
-      null_list_beside?(clauses) -> :null_list
+      cause = null_list_cause(clauses) -> cause
       not_in_beside?(clauses) -> :not_in
       Enum.any?(clauses, &respelled_clause?(&1, types)) -> :respelled
       float_beside?(clauses, types) -> :float
@@ -368,53 +480,64 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
     end
   end
 
-  @spec time_null?(clause()) :: boolean()
-  defp time_null?({op, "time", _nil}) when op in [:is_null, :is_not_null], do: true
-  defp time_null?(_clause), do: false
-
-  @spec null_list_beside?([clause()]) :: boolean()
-  defp null_list_beside?(clauses) do
-    Enum.any?(clauses, fn
+  # The first clause a `NULL` in a list is found beside in a way the double does not read, as the
+  # cause named in `@beside`: `:null_not_in` a `NOT IN` list with a `NULL` (the engine takes it
+  # out of an `IN` list of the operand, or folds it alone), or the clause beside an `IN` list
+  # with one.
+  @spec null_list_cause([clause()]) :: uncertainty() | nil
+  defp null_list_cause(clauses) do
+    Enum.find_value(clauses, fn
       {:not_in, _operand, literals} when is_list(literals) ->
-        nil in literals
+        if nil in literals, do: :null_not_in_list
 
       {:in, operand, literals} = clause when is_list(literals) ->
-        nil in literals and
-          Enum.any?(List.delete(clauses, clause), &foldable_with_null?(&1, operand, literals))
+        if nil in literals do
+          clauses
+          |> List.delete(clause)
+          |> Enum.find_value(&foldable_with_null(&1, operand, literals))
+        end
 
       _clause ->
-        false
+        nil
     end)
   end
 
-  # Whether a clause beside `operand IN (literals)`, which holds a `NULL`, is folded with it
-  # in a way the double does not read. Verified on Core: a range comparison with a value is
+  # The cause when a clause beside `operand IN (literals)`, which holds a `NULL`, is folded with
+  # it in a way the double does not read. Verified on Core: a range comparison with a value is
   # not, and an equality is not with a list that holds a value beside its `NULL` (`n IN (NULL,
   # 1) AND n = 2` is not empty). A list of nothing but `NULL` is a `NULL` to the engine, which
   # folds it with most things; any list with a `NULL` is folded with a `NULL`, a test for
   # `NULL`, a `NOT IN` of its operand and an `IN` list of its operand that is not beside it in
   # the tree (the double reads only the lists that are, `intersect/3`).
-  @spec foldable_with_null?(clause(), term(), [term()]) :: boolean()
-  defp foldable_with_null?({op, _operand, value}, _other, _literals)
+  @spec foldable_with_null(clause(), term(), [term()]) :: uncertainty() | nil
+  defp foldable_with_null({op, _operand, value}, _other, _literals)
        when op in [:gt, :gte, :lt, :lte],
-       do: value == nil
+       do: if(value == nil, do: :null_beside_null_comparison)
 
-  defp foldable_with_null?({:eq, _operand, nil}, _other, _literals), do: true
-  defp foldable_with_null?({:eq, _operand, _literal}, _other, literals), do: nulls?(literals)
+  defp foldable_with_null({:eq, _operand, nil}, _other, _literals),
+    do: :null_beside_null_comparison
 
-  defp foldable_with_null?({:in, operand, list}, other, literals) when is_list(list),
-    do: operand_key(operand) == operand_key(other) or nulls?(literals) or nulls?(list)
+  defp foldable_with_null({:eq, _operand, _literal}, _other, literals),
+    do: if(nulls?(literals), do: :null_only_list_beside_equality)
 
-  defp foldable_with_null?({:not_in, operand, _list}, other, literals),
-    do: operand_key(operand) == operand_key(other) or nulls?(literals)
+  defp foldable_with_null({:in, operand, list}, other, literals) when is_list(list) do
+    if operand_key(operand) == operand_key(other) or nulls?(literals) or nulls?(list),
+      do: :null_beside_in_list
+  end
 
-  defp foldable_with_null?({:truthy_expr, _expr, _nil}, _other, _literals), do: true
+  defp foldable_with_null({:not_in, operand, _list}, other, literals) do
+    if operand_key(operand) == operand_key(other) or nulls?(literals),
+      do: :null_beside_not_in_list
+  end
 
-  defp foldable_with_null?({op, _operand, _nil}, _other, _literals)
+  defp foldable_with_null({:truthy_expr, _expr, _nil}, _other, _literals),
+    do: :null_beside_bare_condition
+
+  defp foldable_with_null({op, _operand, _nil}, _other, _literals)
        when op in [:is_null, :is_not_null],
-       do: true
+       do: :null_beside_null_test
 
-  defp foldable_with_null?(_clause, _other, _literals), do: false
+  defp foldable_with_null(_clause, _other, _literals), do: nil
 
   # An integer operand compared for equality to a float and to something else, with a third
   # test in the query: the engine's range analysis fails with an internal error (verified:

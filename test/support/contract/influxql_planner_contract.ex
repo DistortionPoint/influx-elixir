@@ -555,6 +555,15 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           check_fix(ctx, InfluxQLDefectCases.parse_errors())
         end
 
+        test "lexer errors, blanks, dotted names and operand characters: the leftmost error",
+             ctx do
+          check_fix(ctx, InfluxQLDefectCases.lexing())
+        end
+
+        test "the pattern .* is answered as the expression reads, not rewritten", ctx do
+          check_fix(ctx, InfluxQLDefectCases.any_regex())
+        end
+
         @tag local_divergence:
                "what the engine answers and the double does not compute is refused by name"
         test "statements the double refuses by name, each for its own reason", ctx do

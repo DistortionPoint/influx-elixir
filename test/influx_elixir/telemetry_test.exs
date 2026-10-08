@@ -4,6 +4,12 @@ defmodule InfluxElixir.TelemetryTest do
   alias InfluxElixir.Telemetry
   alias InfluxElixir.TestSupport.Telemetry, as: Forward
 
+  # Spins until the monotonic clock has advanced past `started`, so the time read after it is
+  # never equal to the time read before: no sleep, no timing assumption, only the clock.
+  defp spin_past(started) do
+    if System.monotonic_time() > started, do: :ok, else: spin_past(started)
+  end
+
   # A span's function that takes a moment (so that a duration of nothing would be seen) and
   # reports how long it ran, by the monotonic clock read inside it: the span's duration spans
   # the function, so it can never be less than that.
@@ -14,7 +20,7 @@ defmodule InfluxElixir.TelemetryTest do
       started = System.monotonic_time()
 
       try do
-        Process.sleep(1)
+        spin_past(started)
         fun.()
       after
         send(parent, {:inner_elapsed, System.monotonic_time() - started})
@@ -160,22 +166,13 @@ defmodule InfluxElixir.TelemetryTest do
     end
   end
 
-  # `system_time` is wall-clock time and `monotonic_time` the monotonic
-  # clock's, in native units: the monotonic time lies between the readings taken around
-  # the emit, and the wall-clock time near them (see assert_wall_clock/3).
-  defp assert_start_times(emit) do
-    before = System.monotonic_time()
-    emit.()
-    {before, System.monotonic_time()}
-  end
-
   describe "write_start/1" do
     test "emits the event with system_time measurement" do
       Forward.attach([[:influx_elixir, :write, :start]])
       meta = %{database: "mydb", point_count: 5, bytes: 200}
 
       {from_mono, to_mono} =
-        assert_start_times(fn -> Telemetry.write_start(meta) end)
+        bracketed(&System.monotonic_time/0, fn -> Telemetry.write_start(meta) end)
 
       assert_receive {:telemetry, [:influx_elixir, :write, :start], measurements, recv_meta}
       assert_wall_clock(measurements.system_time, from_mono, to_mono)
@@ -221,7 +218,7 @@ defmodule InfluxElixir.TelemetryTest do
       meta = %{database: "mydb", transport: :http}
 
       {from_mono, to_mono} =
-        assert_start_times(fn -> Telemetry.query_start(meta) end)
+        bracketed(&System.monotonic_time/0, fn -> Telemetry.query_start(meta) end)
 
       assert_receive {:telemetry, [:influx_elixir, :query, :start], measurements, recv_meta}
       assert_wall_clock(measurements.system_time, from_mono, to_mono)

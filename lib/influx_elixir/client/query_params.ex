@@ -26,7 +26,7 @@ defmodule InfluxElixir.Client.QueryParams do
     * `{:invalid_param, name, :unsupported_type}` — a value `Jason` cannot
       encode (a tuple, a pid, a function)
     * `{:invalid_param, name, :unsupported_key}` — a name that is not a
-      string, an atom or a number (a tuple)
+      string, an atom or a number (a tuple), or a string that is not UTF-8
     * `{:invalid_param, name, :unsupported_params}` — `params:` itself is
       neither a map nor a keyword list
 
@@ -80,7 +80,13 @@ defmodule InfluxElixir.Client.QueryParams do
   defp entry(other), do: {:error, {:invalid_param, inspect(other), :unsupported_key}}
 
   @spec key_name(term()) :: {:ok, binary()} | {:error, error()}
-  defp key_name(key) when is_binary(key), do: {:ok, key}
+  # A name is written into a JSON body, which only UTF-8 text can be.
+  defp key_name(key) when is_binary(key) do
+    if String.valid?(key),
+      do: {:ok, key},
+      else: {:error, {:invalid_param, inspect(key), :unsupported_key}}
+  end
+
   defp key_name(key) when is_atom(key) or is_number(key), do: {:ok, to_string(key)}
   defp key_name(key), do: {:error, {:invalid_param, inspect(key), :unsupported_key}}
 

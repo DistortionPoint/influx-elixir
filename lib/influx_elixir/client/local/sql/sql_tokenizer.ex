@@ -395,9 +395,13 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
         raw_token(text, raw, :literal, raw, line, col, acc)
 
       :none ->
-        case Regex.run(~r/\A\$[\p{L}\p{N}_]*/u, text) do
-          [literal] -> emit(text, literal, :placeholder, line, col, acc)
-          nil -> :bail
+        case text do
+          <<?$, rest::binary>> ->
+            literal = binary_part(text, 0, 1 + tag_length(rest, 0))
+            emit(text, literal, :placeholder, line, col, acc)
+
+          _no_dollar ->
+            :bail
         end
 
       :bail ->
@@ -407,18 +411,36 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
 
   # `$$..$$` and `$tag$..$tag$`, as written.
   @spec dollar_string(binary()) :: {:ok, binary()} | :none | :bail
-  defp dollar_string(text) do
-    case Regex.run(~r/\A\$([\p{L}\p{N}_]*)\$/u, text) do
-      [open, _tag] ->
+  defp dollar_string(<<?$, after_dollar::binary>> = text) do
+    size = tag_length(after_dollar, 0)
+
+    case after_dollar do
+      <<_tag::binary-size(size), ?$, _rest::binary>> ->
+        open = binary_part(text, 0, size + 2)
+
         case :binary.split(binary_tail(text, open), open) do
           [body, _after] -> {:ok, open <> body <> open}
           [_unterminated] -> :bail
         end
 
-      nil ->
+      _no_close ->
         :none
     end
   end
+
+  defp dollar_string(_text), do: :none
+
+  # The bytes of the tag or name at the start of `text`: letters, digits and `_` of any script.
+  # Walked, not matched: a regex over the whole rest of the text validates all of it as UTF-8
+  # at every `$`, which costs the square of the statement's length in placeholders.
+  @spec tag_length(binary(), non_neg_integer()) :: non_neg_integer()
+  defp tag_length(<<c::utf8, rest::binary>>, size) do
+    if SQLIdentifiers.word_char?(c),
+      do: tag_length(rest, size + byte_size(<<c::utf8>>)),
+      else: size
+  end
+
+  defp tag_length(_end_or_invalid, size), do: size
 
   @spec symbol(binary(), pos_integer(), pos_integer(), tokens()) :: result()
   defp symbol(text, line, col, acc) do

@@ -15,8 +15,9 @@ defmodule InfluxElixir.StreamError do
     * `:http_status` — the server responded with a non-success status; the
       `:status` and `:body` fields carry the response
     * `:transport` — a Finch/Mint transport error occurred; `:reason` carries it
-    * `:decode` — a JSONL line could not be decoded as JSON; `:reason` carries
-      the decode error
+    * `:decode` — a JSONL line could not be decoded as JSON, or is JSON but
+      not an object; `:reason` carries the decode error, or
+      `{:unexpected_json, value}`
     * `:unsupported` — the operation is not supported by the connection's
       profile (raised by `InfluxElixir.Client.Local` for capability parity)
 

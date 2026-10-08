@@ -4487,16 +4487,19 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
         "unsupported InfluxQL (fill(linear) on a string, boolean or time column)",
       "select mode(time), count(s) from ~g1" =>
         "unsupported InfluxQL (mode() of values equally often there)",
-      "select -true from ~g1" => "unsupported select item: -true",
+      "select -true from ~g1" =>
+        "unsupported InfluxQL (a sign before a boolean, a string or a sign): -true",
       "select abs(b) from ~g1" => "unsupported InfluxQL (abs() of a boolean)",
       "select abs(s) from ~g1" => "unsupported InfluxQL (abs() of a string)",
       "select count(distinct(time)) + 1 from ~g1" =>
-        "unsupported select item: count(distinct(time)) + 1",
-      "select max(time)::float from ~g1" => "unsupported select item: max(time)::float",
+        "unsupported InfluxQL (arithmetic on count(distinct())): count(distinct(time)) + 1",
+      "select max(time)::float from ~g1" =>
+        "unsupported InfluxQL (a cast inside or after a call): max(time)::float",
       "select n from ~g1 where 'a' % 'a' = 'aa'" => "unsupported InfluxQL WHERE: % 'a' = 'aa'",
       "select n from ~g1 where n % 0 = 0" => "unsupported InfluxQL WHERE: % 0 = 0",
       "select n from ~g1 where v % 0 = 0" => "unsupported InfluxQL WHERE: % 0 = 0",
-      "select b + b = 1 from ~g1" => "unsupported select item: b + b = 1",
+      "select b + b = 1 from ~g1" =>
+        "unsupported InfluxQL (a comparison in a select item): b + b = 1",
       "select n from ~g1 where sqrt(v) > 1" => "unsupported InfluxQL (sqrt() in a WHERE)",
       "select n from ~g1 where floor(v) = 1" => "unsupported InfluxQL (floor() in a WHERE)",
       "select n from ~g1 where ceil(v) = 1" => "unsupported InfluxQL (ceil() in a WHERE)",
@@ -4513,8 +4516,9 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
       "select pow(v, s) from ~g1" => "unsupported InfluxQL (pow() of a string)",
       "select ceil(b) from ~g1" => "unsupported InfluxQL (ceil() of a boolean)",
       "select abs(host) from ~g1" => "unsupported InfluxQL (abs() of a tag)",
-      "select abs(v, v) from ~g1" => "unsupported select item: abs(v, v)",
-      "select abs() from ~g1" => "unsupported select item: abs()",
+      "select abs(v, v) from ~g1" =>
+        "unsupported InfluxQL (a call with more arguments than it takes): abs(v, v)",
+      "select abs() from ~g1" => "unsupported InfluxQL (a call without arguments): abs()",
       "select round(max(time)), count(v) from ~g1" =>
         "unsupported InfluxQL (round() of a timestamp)",
       "select sqrt(max(time)), count(v) from ~g1" =>
@@ -4532,9 +4536,12 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
         "unsupported InfluxQL (arithmetic on a selector beside columns)",
       "select max(time) + nosuch from ~g1" =>
         "unsupported InfluxQL (arithmetic on a selector beside columns)",
-      "select -'a' from ~g1" => "unsupported select item: -'a'",
-      "select - -v from ~g1" => "unsupported select item: - -v",
-      "select - -1 from ~g1" => "unsupported select item: - -1",
+      "select -'a' from ~g1" =>
+        "unsupported InfluxQL (a sign before a boolean, a string or a sign): -'a'",
+      "select - -v from ~g1" =>
+        "unsupported InfluxQL (a sign before a boolean, a string or a sign): - -v",
+      "select - -1 from ~g1" =>
+        "unsupported InfluxQL (a sign before a boolean, a string or a sign): - -1",
       "select n from ~g1 where date_part('hour', time) = 22" =>
         "unsupported InfluxQL (date_part() in a WHERE)",
       "select n from ~g1 where sin(v) > 0" => "unsupported InfluxQL (sin() in a WHERE)",
@@ -4550,15 +4557,23 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
       "select mean(v) from ~g1 where time >= -9223372036854775808" =>
         "unsupported InfluxQL (a time before 1677-09-21T00:12:44)",
       "select count((*)) from ~g1" => "unsupported InfluxQL (count() of that argument)",
-      "select count(distinct((v))) from ~g1" => "unsupported select item: count(distinct((v)))",
-      "select top((v), 2) from ~g1" => "unsupported select item: top((v), 2)",
-      "select mean(-v) from ~g1" => "unsupported select item: mean(-v)",
-      "select mean(v::float) from ~g1" => "unsupported select item: mean(v::float)",
+      "select count(distinct((v))) from ~g1" =>
+        "unsupported InfluxQL (a parenthesised argument of a call): count(distinct((v)))",
+      "select top((v), 2) from ~g1" =>
+        "unsupported InfluxQL (a parenthesised argument of a call): top((v), 2)",
+      "select mean(-v) from ~g1" =>
+        "unsupported InfluxQL (a signed argument that is no number): mean(-v)",
+      "select mean(v::float) from ~g1" =>
+        "unsupported InfluxQL (a cast inside or after a call): mean(v::float)",
       "select mean((v::float)) from ~g1" => "unsupported InfluxQL (mean() of that argument)",
-      "select mean(abs(v)) from ~g1" => "unsupported select item: mean(abs(v))",
-      "select mean(sum(v)) from ~g1" => "unsupported select item: mean(sum(v))",
-      "select distinct((v)) from ~g1" => "unsupported select item: distinct((v))",
-      "select count(v::float) from ~g1" => "unsupported select item: count(v::float)",
+      "select mean(abs(v)) from ~g1" =>
+        "unsupported InfluxQL (an expression as the argument of an aggregate): mean(abs(v))",
+      "select mean(sum(v)) from ~g1" =>
+        "unsupported InfluxQL (an expression as the argument of an aggregate): mean(sum(v))",
+      "select distinct((v)) from ~g1" =>
+        "unsupported InfluxQL (a parenthesised argument of a call): distinct((v))",
+      "select count(v::float) from ~g1" =>
+        "unsupported InfluxQL (a cast inside or after a call): count(v::float)",
       "select top(*, 2) from ~g1" =>
         "unsupported InfluxQL (top() of a wildcard with those arguments)",
       "select top(*::field, 2) from ~g1" =>
@@ -4601,10 +4616,12 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
         "unsupported InfluxQL (arithmetic on a selector beside columns)",
       "select count(((*))) from ~g1" => "unsupported InfluxQL (count() of that argument)",
       "select mean(('a\"b')) from ~g1" => "unsupported InfluxQL (mean() of that argument)",
-      "select top(v, (host), 1) from ~g1" => "unsupported select item: top(v, (host), 1)",
-      "select top(v, host, (1)) from ~g1" => "unsupported select item: top(v, host, (1))",
-      "select * as x, * from ~g1" => "unsupported select item: * as x",
-      "select v as x, * as y from ~g1" => "unsupported select item: * as y",
+      "select top(v, (host), 1) from ~g1" =>
+        "unsupported InfluxQL (a parenthesised argument of a call): top(v, (host), 1)",
+      "select top(v, host, (1)) from ~g1" =>
+        "unsupported InfluxQL (a parenthesised argument of a call): top(v, host, (1))",
+      "select * as x, * from ~g1" => "unsupported InfluxQL (an alias on *): * as x",
+      "select v as x, * as y from ~g1" => "unsupported InfluxQL (an alias on *): * as y",
       "select u from ~g2 where u < 'a' + 'b'" =>
         "unsupported InfluxQL (an unsigned number ordered against a string)",
       "select u from ~g2 where 'a' + 'b' > u" =>

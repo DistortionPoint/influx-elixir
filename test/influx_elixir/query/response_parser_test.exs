@@ -26,6 +26,14 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       assert {:error, {:unexpected_json, 42}} = ResponseParser.parse("42", :json)
     end
 
+    test "an array with an element that is not an object is an error, not a crash" do
+      assert ResponseParser.parse("[1]", :json) === {:error, {:unexpected_json, 1}}
+      assert ResponseParser.parse("[null]", :json) === {:error, {:unexpected_json, nil}}
+
+      assert ResponseParser.parse(~s([{"a":1},[]]), :json) ===
+               {:error, {:unexpected_json, []}}
+    end
+
     test "coerces time fields to DateTime" do
       body =
         ~s([{"time":"2026-03-12T10:00:00Z","value":1}])
@@ -55,6 +63,13 @@ defmodule InfluxElixir.Query.ResponseParserTest do
 
       assert {:error, {:jsonl_parse_error, _reason}} =
                ResponseParser.parse(body, :jsonl)
+    end
+
+    test "a line that is JSON but not an object is an error, not a crash" do
+      assert ResponseParser.parse(~s({"a":1}\n"str"), :jsonl) ===
+               {:error, {:unexpected_json, "str"}}
+
+      assert ResponseParser.parse("[1]", :jsonl) === {:error, {:unexpected_json, [1]}}
     end
   end
 
@@ -100,6 +115,16 @@ defmodule InfluxElixir.Query.ResponseParserTest do
              }
 
       refute Map.has_key?(second, "b")
+    end
+  end
+
+  describe "parse/2 with a body that is not CSV" do
+    # A proxy's error page or a body cut off inside a quoted cell.
+    test "is an error for both CSV formats, not a crash" do
+      for format <- [:csv, :flux_csv], body <- [~s("a\nb), ~s({"a":1}\n{)] do
+        assert {:error, {:csv_parse_error, message}} = ResponseParser.parse(body, format)
+        assert is_binary(message)
+      end
     end
   end
 

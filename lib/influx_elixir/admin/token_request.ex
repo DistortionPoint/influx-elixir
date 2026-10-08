@@ -28,26 +28,34 @@ defmodule InfluxElixir.Admin.TokenRequest do
   `{:error, {:invalid_permission, permission}}`, before any request.
   """
   @spec build(binary(), keyword()) ::
-          {:ok, {kind(), binary(), binary()}} | {:error, {:invalid_permission, term()}}
+          {:ok, {kind(), binary(), binary()}}
+          | {:error, {:invalid_permission, term()} | {:unencodable_body, binary()}}
   def build(name, opts) do
     expiry = Keyword.get(opts, :expiry_secs)
 
     case Keyword.get(opts, :permissions, []) do
       [] ->
-        {:ok, {:admin, @admin_path, encode([{"token_name", name}, {"expiry_secs", expiry}])}}
+        with {:ok, body} <- encode([{"token_name", name}, {"expiry_secs", expiry}]) do
+          {:ok, {:admin, @admin_path, body}}
+        end
 
       permissions ->
-        with {:ok, parsed} <- parse_permissions(permissions) do
-          body =
-            encode([{"token_name", name}, {"permissions", parsed}, {"expiry_secs", expiry}])
-
+        with {:ok, parsed} <- parse_permissions(permissions),
+             {:ok, body} <-
+               encode([{"token_name", name}, {"permissions", parsed}, {"expiry_secs", expiry}]) do
           {:ok, {:resource, @resource_path, body}}
         end
     end
   end
 
-  @spec encode([{binary(), term()}]) :: binary()
-  defp encode(pairs), do: Jason.encode!(Jason.OrderedObject.new(pairs))
+  # JSON holds only UTF-8 text: a name that is not is the caller's error, not a raise.
+  @spec encode([{binary(), term()}]) :: {:ok, binary()} | {:error, {:unencodable_body, binary()}}
+  defp encode(pairs) do
+    case Jason.encode(Jason.OrderedObject.new(pairs)) do
+      {:ok, body} -> {:ok, body}
+      {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
+    end
+  end
 
   @spec parse_permissions([term()]) :: {:ok, [Jason.OrderedObject.t()]} | {:error, term()}
   defp parse_permissions(permissions) do

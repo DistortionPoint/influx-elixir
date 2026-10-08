@@ -18,6 +18,7 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     SQLLiteral,
     SQLMask,
     SQLNumber,
+    SQLRegexRewrite,
     SQLRustRegex,
     SQLTime
   }
@@ -91,16 +92,19 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     end
   end
 
-  @spec null_predicate(binary()) :: {:ok, clause()} | :nomatch
+  # `time` is never null: the engine folds a test of it to a constant before it reads a row
+  # (verified: `-u` beside `time IS NULL AND ...` is no error, the plan being empty, and beside
+  # `time IS NOT NULL AND ...` the negation fails as if the test were not there).
+  @spec null_predicate(binary()) :: {:ok, clause() | :always | :never} | :nomatch
   defp null_predicate(text) do
     cond do
       match = operand_match(@is_not_null_pattern, text) ->
         [key] = match
-        {:ok, {:is_not_null, key, nil}}
+        {:ok, if(key == "time", do: :always, else: {:is_not_null, key, nil})}
 
       match = operand_match(@is_null_pattern, text) ->
         [key] = match
-        {:ok, {:is_null, key, nil}}
+        {:ok, if(key == "time", do: :never, else: {:is_null, key, nil})}
 
       true ->
         :nomatch
@@ -489,16 +493,31 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
          )}
 
       :ok ->
-        case Regex.compile(pattern, flags) do
-          {:ok, regex} ->
-            {:ok, {regex, op, SQLRustRegex.guard(regex)}}
-
-          {:error, _pcre} ->
-            {:error,
-             SQLError.refusal(
-               "a regular expression the engine's crate reads and the double's PCRE rejects"
-             )}
+        case SQLRegexRewrite.unverified(pattern, op) do
+          nil -> compile_checked(pattern, flags, op)
+          cause -> {:error, SQLError.refusal(rewrite_reason(cause))}
         end
+    end
+  end
+
+  @spec rewrite_reason(binary()) :: binary()
+  defp rewrite_reason(cause) do
+    "a regular expression with #{cause}: the engine rewrites the pattern before it runs, " <>
+      "which the double does not model"
+  end
+
+  @spec compile_checked(binary(), binary(), binary()) ::
+          {:ok, {Regex.t(), binary(), SQLRustRegex.guard()}} | {:error, SQLError.t()}
+  defp compile_checked(pattern, flags, op) do
+    case Regex.compile(pattern, flags) do
+      {:ok, regex} ->
+        {:ok, {regex, op, SQLRustRegex.guard(regex)}}
+
+      {:error, _pcre} ->
+        {:error,
+         SQLError.refusal(
+           "a regular expression the engine's crate reads and the double's PCRE rejects"
+         )}
     end
   end
 

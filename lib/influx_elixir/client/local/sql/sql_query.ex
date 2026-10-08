@@ -249,9 +249,55 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
 
       :unknown ->
         SQLError.refusal(
-          "the statement #{inspect(statement)} is not run: the engine's wording of it " <>
-            "(its keywords in capitals) is not modelled"
+          "the statement #{inspect(statement)} is not run: the engine's wording of " <>
+            "#{kind_name(statement)} (its keywords in capitals) is not modelled"
         )
+    end
+  end
+
+  # What the statement is called in a refusal: its first two words, which the double reads to
+  # tell the kinds it has no wording for (`MERGE INTO`, `CREATE INDEX`), and for a grant the
+  # object or the grantees that it does not read.
+  @spec kind_name(binary()) :: binary()
+  defp kind_name(statement) do
+    case Regex.run(~r/\A\s*([A-Za-z]+)(?:\s+([A-Za-z]+))?/, statement, capture: :all_but_first) do
+      [first, second] ->
+        "a #{String.upcase(first)} #{String.upcase(second)} statement" <> grant_object(statement)
+
+      [first] ->
+        "a #{String.upcase(first)} statement"
+
+      nil ->
+        "this statement"
+    end
+  end
+
+  @spec grant_object(binary()) :: binary()
+  defp grant_object(statement) do
+    cond do
+      not Regex.match?(~r/\A\s*(?:GRANT|REVOKE|DENY)\b/i, statement) ->
+        ""
+
+      object = Regex.run(~r/\bON\s+((?:ALL|FUTURE)\s+[A-Za-z]+|[A-Za-z]+)\b/i, statement) ->
+        object |> List.last() |> object_phrase(statement)
+
+      Regex.match?(~r/\(\s*\)/, statement) ->
+        " with an empty column list"
+
+      true ->
+        ""
+    end
+  end
+
+  @spec object_phrase(binary(), binary()) :: binary()
+  defp object_phrase(object, statement) do
+    upper = String.upcase(object)
+
+    cond do
+      String.starts_with?(upper, ["ALL ", "FUTURE "]) -> " on #{upper}"
+      upper in ~w(PROCEDURE WAREHOUSE USER CONNECTION INTEGRATION FUNCTION) -> " on #{upper}"
+      Regex.match?(~r/\bPUBLIC\b/i, statement) -> " to PUBLIC beside other grantees or qualified"
+      true -> ""
     end
   end
 

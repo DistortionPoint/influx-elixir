@@ -12,7 +12,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
   #   * a qualified name that only differs from a field by case says so
   #     (`Column names are case sensitive. You can use double quotes ...`)
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLTable, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{SQLDml, SQLError, SQLTable, SQLTokenizer}
 
   @typep token :: SQLTokenizer.token()
 
@@ -20,7 +20,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
   A table name from the tokens: one to many parts, each a word (read in lower case), a quoted
   name or a string, and the tokens after it.
   """
-  @spec reference([token()]) :: {:ok, [binary()], [token()]} | {:refuse, binary()}
+  @spec reference([token()]) :: {:ok, [binary()], [token()]} | {:refuse, SQLDml.reason()}
   def reference([{:word, _p, "TABLE", _l, _c} | _rest]), do: {:refuse, "TABLE as a table name"}
 
   def reference([{kind, printed, _u, _l, _c} | rest]) when kind in [:word, :quoted, :string] do

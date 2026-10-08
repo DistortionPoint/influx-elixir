@@ -259,7 +259,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
          SQLError.refusal(
            "a regular expression over a text where PCRE and the engine's crate differ (a " <>
              "non-ASCII text beside \\w, \\d, \\s, \\b or a case-insensitive match; a newline " <>
-             "beside $, \\z or (?m)"
+             "beside $, \\z or (?m))"
          )}
       )
     end

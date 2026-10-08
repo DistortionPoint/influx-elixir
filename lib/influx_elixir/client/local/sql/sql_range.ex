@@ -72,7 +72,6 @@ defmodule InfluxElixir.Client.Local.SQLRange do
 
     cond do
       :never in leaves or :never in constraints -> false
-      Enum.any?(leaves, &match?({:is_null, "time", _nil}, &1)) -> false
       length(Enum.uniq(equal)) > 1 -> false
       Enum.any?(equal, &(&1 in different)) -> false
       true -> bounds_empty?(constraints, equal)

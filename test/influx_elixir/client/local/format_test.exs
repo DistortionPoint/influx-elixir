@@ -29,6 +29,15 @@ defmodule InfluxElixir.Client.Local.FormatTest do
     end
   end
 
+  test "a format the client cannot write into its request body is refused, not raised", %{
+    conn: conn
+  } do
+    for format <- [<<255>>, 5, %{}, [:csv]] do
+      assert {:error, %{status: 400, body: "Client.Local: format: a value that is " <> _why}} =
+               Local.query_sql(conn, "SELECT v FROM m", database: "db", format: format)
+    end
+  end
+
   test "a query error is answered before the format", %{conn: conn} do
     for format <- [:csv, :pretty] do
       assert {:error, %{status: 400, body: "Error during planning: table" <> _rest}} =

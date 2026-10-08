@@ -43,7 +43,7 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
   # alias from FROM and the `qualifier.` prefixes outside string literals.
   # A keyword after the table is a clause (or an unsupported construct that
   # `check_clauses/1` will name), never an alias.
-  @from_alias_pattern ~r/(?i)(FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+))(?:\s+(?:AS\s+)?(?!(?:#{Enum.join(@not_an_alias, "|")})\b)(\w+))?/u
+  @from_alias_pattern ~r/(?i)(FROM\s+("[^"]+"|(?:[^\s\\(]|\\.)(?:[^\s\\]|\\.)*))(?:\s+(?:AS\s+)?(?!(?:#{Enum.join(@not_an_alias, "|")})\b)(\w+))?/u
 
   @doc """
   The text without the qualifiers of its table (and of the joined one), the

@@ -6,8 +6,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # `{:syntax_error, kind, rest}` with the text left from the error, which
   # `InfluxElixir.Client.Local.InfluxQLCheck` turns into the engine's body.
 
-  alias InfluxElixir.Client.Local.{Durations, InfluxQLText, SQLIdentifiers, SQLLimits}
+  alias InfluxElixir.Client.Local.{
+    Durations,
+    InfluxQLLex,
+    InfluxQLText,
+    SQLIdentifiers,
+    SQLLimits
+  }
 
+  require InfluxQLLex
   require SQLLimits
 
   @doc false
@@ -19,7 +26,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
   @doc false
   def tokenize(<<>>, acc), do: {:ok, Enum.reverse(acc)}
-  def tokenize(<<c, rest::binary>>, acc) when c in [?\s, ?\t, ?\n, ?\r], do: tokenize(rest, acc)
+  def tokenize(<<c, rest::binary>>, acc) when InfluxQLLex.is_blank(c), do: tokenize(rest, acc)
 
   # A token that follows an operand with no operator between them is where the engine's
   # parser stops: the condition ended before it.
@@ -33,7 +40,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # is not read at all: the statement is left from its `WHERE` (verified: `WHERE = 1`,
   # `WHERE != 1 AND n`, `WHERE ) 1`, `WHERE ((>= 1))`, `WHERE -* n`).
   def tokenize(text, []) do
-    if operand_missing?(text), do: {:syntax_error, :where_unparsed, text}, else: lex(text, [])
+    if InfluxQLLex.operand_missing?(text),
+      do: {:syntax_error, :where_unparsed, text},
+      else: lex(text, [])
   end
 
   @spec lex(binary(), list()) ::
@@ -69,8 +78,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # A binary `+` or `-` fails where its operand should start when nothing that can start one
   # stands there (verified: `(f +)`, `f + = 1`, `f > 1 + )` fail at the `)` or the operator).
   defp lex(<<c, rest::binary>>, [previous | _before] = acc) when c in [?+, ?-] do
-    if operand_end?(previous) and operand_missing?(rest),
-      do: {:syntax_error, :reserved_failure, Regex.replace(~r/\A[ \t\r\n]+/, rest, "")},
+    if operand_end?(previous) and InfluxQLLex.operand_missing?(rest),
+      do: {:syntax_error, :reserved_failure, InfluxQLLex.trim_blanks(rest)},
       else: tokenize(rest, [{:raw, <<c>>} | acc])
   end
 
@@ -79,7 +88,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # double does not place.
   defp lex(<<c, rest::binary>> = text, [previous | _before] = acc) when c in [?*, ?/] do
     cond do
-      not (operand_end?(previous) and (operand_missing?(rest) or String.trim(rest) == "")) ->
+      not (operand_end?(previous) and
+               (InfluxQLLex.operand_missing?(rest) or String.trim(rest) == "")) ->
         tokenize(rest, [{:raw, <<c>>} | acc])
 
       open_parens(acc) == 0 ->
@@ -109,11 +119,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp lex(<<c, rest::binary>>, acc) when c in [?(, ?), ?+, ?-, ?*, ?/, ?,],
     do: tokenize(rest, [{:raw, <<c>>} | acc])
 
+  # A number, a duration, `now()` or a word, read from the start of the text (not a Unicode
+  # pattern: it would check the whole text for UTF-8 at every token).
+  @lexeme Regex.compile!(
+            "^(?:((?:\\d+(?:ns|ms|u|µ|s|m|h|d|w))+)|(\\d*\\.\\d+|\\d+)|" <>
+              "(now\\s*\\(\\s*\\))|([A-Za-z_]\\w*))"
+          )
+
   defp lex(text, acc) do
-    case Regex.run(
-           ~r/^(?:((?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+)|(\d*\.\d+|\d+)|(now\s*\(\s*\))|([A-Za-z_]\w*))/u,
-           text
-         ) do
+    case Regex.run(@lexeme, text) do
       [full, duration] ->
         duration_token(duration, rest_after(text, full), acc)
 
@@ -157,7 +171,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp duration_total(<<>>, _rest, total), do: {:ok, total}
 
   defp duration_total(text, rest, total) do
-    [part, n, unit] = Regex.run(~r/^(\d+)(ns|ms|u|µ|s|m|h|d|w)/u, text)
+    [part, n, unit] = Regex.run(~r/^(\d+)(ns|ms|u|µ|s|m|h|d|w)/, text)
     count = String.to_integer(n)
     after_count = binary_part(text, byte_size(n), byte_size(text) - byte_size(n)) <> rest
     after_part = binary_part(text, byte_size(part), byte_size(text) - byte_size(part))
@@ -179,7 +193,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   @spec number_token(binary(), binary(), list()) ::
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
   defp number_token(number, rest, acc) do
-    if leftover?(rest) and not spaced_connective?(rest) do
+    if leftover?(rest) and not InfluxQLLex.spaced_connective?(rest) do
       {:syntax_error, :nom, rest}
     else
       case integer_overflow(number, acc) do
@@ -193,27 +207,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # beside an operand, or after a regular expression (which ends its comparison) anything but
   # a connective or a closing parenthesis. A comparison operator is left to the clause that
   # reads it.
+  # The characters no token starts with, and `!` but for `!=` and `!~`.
+  @stray "[#@$?}\\][\\\\`{~\\x80-\\xFF]|!(?![=~])"
+  @after_regex Regex.compile!("^(?:[\\d.'\"+\\-*\\/,(]|[A-Za-z_]|" <> @stray <> ")")
+  @after_operand Regex.compile!("^(?:['\"\\d]|\\.\\d|[A-Za-z_]|" <> @stray <> ")")
+
   @spec leftover_token?(term(), binary()) :: boolean()
   defp leftover_token?({:regex, _pattern}, text),
-    do:
-      Regex.match?(~r/^(?:[\d.'"+\-*\/,(]|[A-Za-z_]|[#@$?}\][\\`{~]|!(?![=~]))/, text) and
-        not connective?(text)
+    do: Regex.match?(@after_regex, text) and not connective?(text)
 
   defp leftover_token?(previous, text),
-    do:
-      operand_end?(previous) and
-        Regex.match?(~r/^(?:['"\d]|\.\d|[A-Za-z_]|[#@$?}\][\\`{~]|!(?![=~]))/, text) and
-        not connective?(text)
+    do: operand_end?(previous) and Regex.match?(@after_operand, text) and not connective?(text)
 
   @spec operand_end?(term()) :: boolean()
   defp operand_end?({kind, _value}) when kind in [:ident, :number, :str], do: true
   defp operand_end?({:duration, _total, _text}), do: true
   defp operand_end?({:raw, word}), do: String.upcase(word) in ["TRUE", "FALSE", "NOW()", ")"]
   defp operand_end?(_token), do: false
-
-  # A connective that a blank or a parenthesis follows (`100OR 1`): a number may end before it.
-  @spec spaced_connective?(binary()) :: boolean()
-  defp spaced_connective?(text), do: Regex.match?(~r/^(?:AND|OR)(?=[ \t\r\n(])/i, text)
 
   @spec connective?(binary()) :: boolean()
   defp connective?(text), do: Regex.match?(~r/^(?:AND|OR)(?![\w])/i, text)
@@ -257,8 +267,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp word_token(upcased, word, rest, acc) when upcased in ["AND", "OR"] do
     cond do
       reserved_kind(acc) != :nom -> {:syntax_error, reserved_kind(acc), word <> rest}
+      InfluxQLLex.cr_after?(rest, 0) -> {:syntax_error, :nom, word <> rest}
       String.trim(rest) == "" -> {:syntax_error, :operand, rest}
-      operand_missing?(rest) -> {:syntax_error, :operand, rest}
+      InfluxQLLex.operand_missing?(rest) -> {:syntax_error, :operand, rest}
       Regex.match?(~r/\A['".]/, rest) -> {:syntax_error, :nom, word <> rest}
       String.starts_with?(String.trim_leading(rest), "/") -> {:syntax_error, :operand, rest}
       true -> tokenize(rest, [{:raw, word} | acc])
@@ -335,10 +346,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
       trimmed == "" ->
         {:syntax_error, :operand, rest}
 
-      cannot_start_operand?(trimmed) and inside_call?(acc) ->
+      InfluxQLLex.cannot_start_operand?(trimmed) and inside_call?(acc) ->
         {:error, "unsupported InfluxQL WHERE: " <> rest}
 
-      cannot_start_operand?(trimmed) ->
+      InfluxQLLex.cannot_start_operand?(trimmed) ->
         {:syntax_error, :operand, rest}
 
       op not in ["=~", "!~"] and String.starts_with?(trimmed, "/") ->
@@ -366,20 +377,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
       _token, depth -> depth
     end)
   end
-
-  # What follows a connective or a sign and can start no operand, however many opening
-  # parentheses and signs come between: a closing parenthesis, a comparison operator or one
-  # of `* % & | ^ ,`. The blanks are those of the engine (a form feed is none).
-  @spec operand_missing?(binary()) :: boolean()
-  defp operand_missing?(rest),
-    do: Regex.match?(~r/\A[ \t\r\n(+\-]*[)=!<>*%&|^,]/, rest)
-
-  # What can start no operand after a comparison operator (verified: the error is at the end
-  # of the operator): a closing parenthesis, a comparison operator or other symbol, a connective
-  # or a dot with no digit after it.
-  @spec cannot_start_operand?(binary()) :: boolean()
-  defp cannot_start_operand?(text),
-    do: Regex.match?(~r/^(?:[)=!<>*%&|^,;#@$?}\]\[\\`{~]|[-+]?\.(?!\d)|(?:AND|OR)\b)/i, text)
 
   @spec rest_after(binary(), binary()) :: binary()
   defp rest_after(text, prefix),

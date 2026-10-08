@@ -1,12 +1,9 @@
 defmodule InfluxElixir.Client.HTTPTest do
   use ExUnit.Case, async: true
 
-  # The holder waits well above any load (see hold_the_connection/1).
-  @moduletag timeout: 600_000
-
   alias InfluxElixir.Client.HTTP
   alias InfluxElixir.{StreamError, TestServer}
-  alias InfluxElixir.TestSupport.{Check, ClosedPort}
+  alias InfluxElixir.TestSupport.{Await, Check, ClosedPort}
 
   # ---------------------------------------------------------------------------
   # init_connection — :database resolution parity with Client.Local
@@ -50,12 +47,24 @@ defmodule InfluxElixir.Client.HTTPTest do
   # Timeouts (issues #8 and #14)
   #
   # The HTTP transport once dropped :timeout on the floor. opts > connection >
-  # default, for the receive timeout and for the pool checkout alike. A server
-  # that accepts a connection and never answers makes the precedence show: the
-  # request returns when the timeout that won runs out, or not at all.
+  # default, for the receive timeout and for the pool checkout alike.
+  #
+  # Two kinds of test, because the defaults (30 s receive, 5 s checkout) cannot be
+  # waited for or told apart from a short value that ran out:
+  #
+  #   * "the option wins" runs a request against a server that never answers. The
+  #     option is short (40 ms) and the value that must lose is far above the failure
+  #     bound (600 s), so the request answers at once when the option applied and is
+  #     still waiting at the bound when the wrong value did. The bound only ends a
+  #     failing run; a passing one never depends on it.
+  #   * "the connection's applies" and "the defaults" read the resolvers, which the
+  #     requests call (public only for this), so nothing waits for a default to expire.
   # ---------------------------------------------------------------------------
 
   @timed_out {:error, {:connection_error, %Mint.TransportError{reason: :timeout}}}
+
+  # Longer than any failure bound: a request that waits this long has used the wrong value.
+  @never 600_000
 
   # A pool of one connection, so a second request has to wait for the first.
   # The pool for the port is started with Finch, so no request has to start one
@@ -75,14 +84,11 @@ defmodule InfluxElixir.Client.HTTPTest do
     ] ++ extra
   end
 
-  # The request's answer, or `:hung` when it is still waiting after `wait` ms.
-  # Each wait is well below the timeout a wrong precedence would apply (30 s
-  # or more for the receive timeout; Finch's 5 s for the pool checkout), and
-  # far above the one under test, so a loaded machine cannot flip the result.
-  defp answer_within(wait, fun) do
+  # The request's answer, or `:hung` when it is still waiting at the failure bound.
+  defp answer(fun) do
     task = Task.async(fun)
 
-    case Task.yield(task, wait) || Task.shutdown(task, :brutal_kill) do
+    case Task.yield(task, Await.bound()) || Task.shutdown(task, :brutal_kill) do
       {:ok, answer} -> answer
       _no_answer -> :hung
     end
@@ -90,83 +96,77 @@ defmodule InfluxElixir.Client.HTTPTest do
 
   # The first request holds the pool's only connection while the black hole
   # keeps it waiting for an answer.
-  # It names its own :pool_timeout: the connection's may be short, and under
-  # load the holder would then fail at checkout and never connect.
+  #
+  # The holder names its own :pool_timeout: the connection's may be short, and under
+  # load the holder would then fail at checkout and never connect. It relies on Finch
+  # connecting lazily, inside the checkout of its request: the pool starts without a
+  # connection, so the black hole's `:held` is sent exactly when the holder's request
+  # has taken the pool's only connection, and every later request must wait for it.
   defp hold_the_connection(conn) do
     task =
       Task.async(fn ->
-        HTTP.query_sql(conn, "SELECT 1", timeout: 240_000, pool_timeout: 240_000)
+        HTTP.query_sql(conn, "SELECT 1", timeout: @never, pool_timeout: @never)
       end)
 
     receive do
       :held -> task
     after
-      240_000 -> flunk("the holder never connected: #{inspect(Task.yield(task, 0))}")
+      Await.bound() -> flunk("the holder never connected: #{inspect(Task.yield(task, 0))}")
     end
   end
 
   describe "the receive timeout" do
     test "the option wins over the connection's" do
-      conn = connection(TestServer.black_hole(), timeout: 60_000)
+      conn = connection(TestServer.black_hole(), timeout: @never)
 
-      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1", timeout: 40) end) ===
-               @timed_out
+      assert answer(fn -> HTTP.query_sql(conn, "SELECT 1", timeout: 40) end) === @timed_out
     end
 
-    test "the connection's applies when the option is absent" do
-      conn = connection(TestServer.black_hole(), timeout: 40)
-      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1") end) === @timed_out
-    end
-
-    test "a nil option falls through to the connection's" do
-      conn = connection(TestServer.black_hole(), timeout: 40)
-
-      assert answer_within(20_000, fn -> HTTP.query_sql(conn, "SELECT 1", timeout: nil) end) ===
-               @timed_out
-    end
-
-    test "every query function reads it" do
-      conn = connection(TestServer.black_hole(), timeout: 40)
+    test "every query function reads the option" do
+      conn = connection(TestServer.black_hole(), timeout: @never)
 
       # Concurrent, so the three timeouts run their course in one wait.
       answers =
         [
-          fn -> HTTP.query_sql(conn, "SELECT 1") end,
-          fn -> HTTP.execute_sql(conn, "SELECT 1") end,
-          fn -> HTTP.query_influxql(conn, "SELECT 1") end
+          fn -> HTTP.query_sql(conn, "SELECT 1", timeout: 40) end,
+          fn -> HTTP.execute_sql(conn, "SELECT 1", timeout: 40) end,
+          fn -> HTTP.query_influxql(conn, "SELECT 1", timeout: 40) end
         ]
-        |> Enum.map(&Task.async(fn -> answer_within(20_000, &1) end))
-        |> Enum.map(&Task.await(&1, 30_000))
+        |> Enum.map(&Task.async(fn -> answer(&1) end))
+        |> Enum.map(&Task.await(&1, 2 * Await.bound()))
 
       assert answers === [@timed_out, @timed_out, @timed_out]
+    end
+
+    test "the connection's applies when the option is absent or nil" do
+      assert HTTP.resolve_timeout([], timeout: 40) === 40
+      assert HTTP.resolve_timeout([timeout: nil], timeout: 40) === 40
+      assert HTTP.resolve_timeout([timeout: 40], timeout: @never) === 40
     end
   end
 
   describe "the pool checkout timeout" do
+    # The holder waits for a connection (up to the bound) and the request after it for an
+    # answer (up to the bound again): a hang fails at the second, not at ExUnit's default.
+    @describetag timeout: 3 * Await.bound()
+
     test "the option wins over the connection's" do
-      conn = connection(TestServer.black_hole(notify: self()), pool_timeout: 60_000)
+      conn = connection(TestServer.black_hole(notify: self()), pool_timeout: @never)
       holder = hold_the_connection(conn)
 
       query = fn -> HTTP.query_sql(conn, "SELECT 1", pool_timeout: 40) end
-      assert answer_within(3_000, query) === {:error, {:connection_error, :pool_timeout}}
+      assert answer(query) === {:error, {:connection_error, :pool_timeout}}
 
       Task.shutdown(holder, :brutal_kill)
     end
 
     test "the connection's applies when the option is absent, and is independent of :timeout" do
-      conn = connection(TestServer.black_hole(notify: self()), pool_timeout: 40, timeout: 180_000)
-      holder = hold_the_connection(conn)
-
-      assert answer_within(3_000, fn -> HTTP.query_sql(conn, "SELECT 1") end) ===
-               {:error, {:connection_error, :pool_timeout}}
-
-      Task.shutdown(holder, :brutal_kill)
+      assert HTTP.resolve_pool_timeout([], pool_timeout: 40, timeout: 180_000) === 40
+      assert HTTP.resolve_pool_timeout([pool_timeout: nil], pool_timeout: 40) === 40
+      assert HTTP.resolve_pool_timeout([pool_timeout: 40], pool_timeout: @never) === 40
     end
   end
 
-  # The defaults (30 s receive, 5 s checkout) are only visible as a wait that
-  # long, which is not worth a test; the precedence above is behavioural. This
-  # one reads the defaults from the resolvers (public only for this test).
   describe "the timeout defaults" do
     test "are 30 seconds to receive and 5 to check out when nothing names one" do
       assert HTTP.resolve_timeout([], host: "h") === 30_000
@@ -219,11 +219,43 @@ defmodule InfluxElixir.Client.HTTPTest do
   # request is made, and that `params: nil` is not one of them.
   # ---------------------------------------------------------------------------
 
+  describe "text that is not UTF-8" do
+    # A request body is JSON, which holds only UTF-8 text; nothing is sent.
+    test "is an error from every function that sends it, never a raise" do
+      conn = connection(ClosedPort.port(), [])
+      bad = <<0xFF>>
+      sql = "SELECT '" <> bad <> "'"
+
+      unencodable = fn text ->
+        {:error, {:unencodable_body, "invalid byte 0xFF in #{inspect(text)}"}}
+      end
+
+      assert HTTP.query_sql(conn, sql) === unencodable.(sql)
+      assert HTTP.query_sql(conn, "SELECT 1", database: "d" <> bad) === unencodable.("d" <> bad)
+      assert HTTP.execute_sql(conn, sql) === unencodable.(sql)
+      assert HTTP.query_influxql(conn, sql) === unencodable.(sql)
+      assert HTTP.query_flux(conn, "x" <> bad) === unencodable.("x" <> bad)
+      assert HTTP.create_database(conn, "x" <> bad) === unencodable.("x" <> bad)
+      assert HTTP.create_token(conn, "t" <> bad) === unencodable.("t" <> bad)
+
+      assert %StreamError{kind: :transport, reason: {:unencodable_body, _message}} =
+               assert_raise(StreamError, fn ->
+                 conn |> HTTP.query_sql_stream(sql) |> Enum.to_list()
+               end)
+    end
+  end
+
   describe "a parameter that cannot be sent" do
     @closed {:error, {:connection_error, %Mint.TransportError{reason: :econnrefused}}}
 
     test "is refused by every query function before anything is sent" do
-      conn = [host: "localhost", port: 1, scheme: "http", token: "t", database: "db"]
+      conn = [
+        host: "localhost",
+        port: ClosedPort.port(),
+        scheme: "http",
+        token: "t",
+        database: "db"
+      ]
 
       for {params, error} <- [
             {%{p: Decimal.new("NaN")}, {:invalid_param, "p", :non_finite_decimal}},

@@ -96,30 +96,37 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
 
   defp safe_beside_literal?(_column), do: false
 
+  @typedoc "A `HAVING` with whether it reads the names of the select list (see `prepare/2`)."
+  @type prepared :: nil | {SQLAggExpr.having_t(), boolean()}
+
   @doc """
-  The output rows of one group: its row, unless a `HAVING` leaves it out
-  (`having` is `nil` for none). The condition reads the group's first row,
-  the aggregates it names and the names of the select list.
+  The `HAVING` of a query read once for all its groups: whether it names an item of the select
+  list decides whether the condition needs the group's row.
   """
-  @spec reduce_group(
-          [SQLSelect.column()],
-          SQLAggExpr.having_t() | nil,
-          points(),
-          integer() | nil | :scalar
-        ) :: [map()]
-  def reduce_group(columns, having, points, bucket_ts) do
-    cond do
-      is_nil(having) ->
+  @spec prepare(SQLAggExpr.having_t() | nil, [SQLSelect.column()]) :: prepared()
+  def prepare(nil, _columns), do: nil
+  def prepare(having, columns), do: {having, names_outputs?(having, columns)}
+
+  @doc """
+  The output rows of one group: its row, unless a `HAVING` (as `prepare/2` read it, `nil` for
+  none) leaves it out. The condition reads the group's first row, the aggregates it names and
+  the names of the select list.
+  """
+  @spec reduce_group([SQLSelect.column()], prepared(), points(), integer() | nil | :scalar) ::
+          [map()]
+  def reduce_group(columns, prepared, points, bucket_ts) do
+    case prepared do
+      nil ->
         [reduce_columns(columns, points, bucket_ts)]
 
       # The select list is computed for the groups the `HAVING` keeps (verified: the
       # negation of an unsigned sum, which fails, is never met when the `HAVING` is false).
-      not names_outputs?(having, columns) ->
+      {having, false} ->
         if having_holds?(having, points, bucket_ts, %{}),
           do: [reduce_columns(columns, points, bucket_ts)],
           else: []
 
-      true ->
+      {having, true} ->
         row = reduce_columns(columns, points, bucket_ts)
         if having_holds?(having, points, bucket_ts, row), do: [row], else: []
     end
@@ -230,8 +237,6 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     do: Enum.max(values, fn a, b -> SQLSort.value_order(b, a) end)
 
   defp compute(:median, values), do: median(values)
-  # Sample forms need at least two values, exactly as the real engine
-  # (STDDEV of one row is null); population forms are defined for one.
 
   # The sum starts from the type's zero, so the sum of `-0.0` is `0.0`
   # (verified).
@@ -314,7 +319,9 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp halve({:dec, coefficient, scale}), do: {:dec, div(coefficient, 2), scale}
   defp halve(value), do: SQLNumber.arithmetic(:/, value, if(is_integer(value), do: 2, else: 2.0))
 
-  # The sample or population variance or deviation of the values.
+  # The sample or population variance or deviation of the values. Sample forms need at least two
+  # values, exactly as the real engine (STDDEV of one row is null); population forms are defined
+  # for one.
   @spec spread([SQLNumber.t()], SQLParser.aggregate(), boolean()) :: term()
   defp spread([], _agg, _scalar?), do: nil
   defp spread([_one], agg, _scalar?) when agg in [:var, :stddev], do: nil
@@ -325,13 +332,70 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     if agg in [:var, :var_pop], do: variance, else: square_root(variance)
   end
 
-  # The variance as the engine's accumulator makes it: one pass over the values, updating the
-  # count, the mean and the sum of the squared distances from the mean (Welford) as each
-  # arrives, so that equal values have a variance of exactly zero (a two-pass mean of `55.7`
-  # three times is not `55.7`). The sum is over `divisor`. The values come in the order the
-  # points are stored (see `values/2`); the last digits can differ from the engine's.
+  # The variance of the values over `divisor`. The engine accumulates in one pass (Welford) per
+  # partition of the scan and merges the partitions, so its last digits depend on how the scan was
+  # split and are not reproducible (see `values/2`); on data whose spread is small beside its
+  # magnitude (`1e9 + k * 0.001`) they are far from the true value, and which of its digits it
+  # gives varies from one run to the next. The values here are read in the order the points are
+  # stored, where a single Welford pass over a sorted run of them drifts further from any answer
+  # the engine gives than the true variance is, so a run of ordinary floats (finite, below
+  # `1.0e140` in magnitude, which cannot overflow) is the corrected two-pass variance with
+  # compensated sums: the mean first, then the sum of the squared distances less the square of
+  # the sum of the distances over the count. Equal values have a variance of exactly zero. Values
+  # that are not ordinary (an infinity, a NaN, a magnitude where a square overflows) take the
+  # one-pass accumulator, which reproduces the engine's overflow results.
   @spec variance([SQLNumber.t()], pos_integer(), boolean()) :: float() | SQLNumber.special()
   defp variance(values, divisor, scalar?) do
+    floats = Enum.map(values, &SQLNumber.to_float/1)
+
+    if Enum.all?(floats, &ordinary?/1),
+      do: two_pass(floats) / divisor,
+      else: welford_variance(floats, divisor, scalar?)
+  end
+
+  @ordinary_limit 1.0e140
+
+  @spec ordinary?(term()) :: boolean()
+  defp ordinary?(value), do: is_float(value) and abs(value) <= @ordinary_limit
+
+  # The sum of the squared distances from the mean of ordinary floats.
+  @spec two_pass([float(), ...]) :: float()
+  defp two_pass([first | rest] = floats) do
+    if Enum.all?(rest, &(&1 == first)), do: 0.0, else: spread_about_mean(floats)
+  end
+
+  @spec spread_about_mean([float(), ...]) :: float()
+  defp spread_about_mean(floats) do
+    count = length(floats)
+    mean = floats |> Enum.reduce({0.0, 0.0}, &compensate(&2, &1)) |> total() |> Kernel./(count)
+
+    {squares, distances} =
+      Enum.reduce(floats, {{0.0, 0.0}, {0.0, 0.0}}, fn value, {squares, distances} ->
+        distance = value - mean
+        {compensate(squares, distance * distance), compensate(distances, distance)}
+      end)
+
+    off = total(distances)
+    max(total(squares) - off * off / count, 0.0)
+  end
+
+  # Neumaier's compensated sum: the running sum and the low part it has lost.
+  @spec compensate({float(), float()}, float()) :: {float(), float()}
+  defp compensate({sum, lost}, value) do
+    next = sum + value
+
+    if abs(sum) >= abs(value),
+      do: {next, lost + (sum - next + value)},
+      else: {next, lost + (value - next + sum)}
+  end
+
+  @spec total({float(), float()}) :: float()
+  defp total({sum, lost}), do: sum + lost
+
+  # The engine's one-pass accumulator (Welford), for the values the two-pass sum cannot take.
+  @spec welford_variance([SQLNumber.t()], pos_integer(), boolean()) ::
+          float() | SQLNumber.special()
+  defp welford_variance(values, divisor, scalar?) do
     {count, mean, squares} = Enum.reduce(values, {0, 0.0, 0.0}, &welford/2)
     divide(merged(scalar? and count == 1, mean, squares), divisor * 1.0)
   end

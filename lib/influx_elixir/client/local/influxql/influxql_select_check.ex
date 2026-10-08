@@ -4,7 +4,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # reporting the position the engine reports (see
   # `InfluxElixir.Client.Local.InfluxQLError`).
 
-  alias InfluxElixir.Client.Local.{InfluxQLArgs, InfluxQLError, InfluxQLText}
+  alias InfluxElixir.Client.Local.{InfluxQLArgs, InfluxQLCheck, InfluxQLError, InfluxQLText}
 
   @select_start ~r/^\s*SELECT(?![\w])\s*/i
   @regex_column ~r/^\/(?:[^\/\\]|\\.)+\/(?:\s+AS\s+(?:"[^"]+"|\w+))?$/s
@@ -29,44 +29,67 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   #     `FROM`
   #   * `FROM` followed by nothing, by a reserved word or by a character that
   #     starts no identifier is "invalid FROM clause", where the name starts
-  @spec check_select(binary(), binary()) :: :ok | {:error, term()}
+  @spec check_select(binary(), binary()) :: InfluxQLCheck.positioned() | nil
   @doc false
   def check_select(whole, masked) do
     case Regex.run(@select_start, masked, return: :index) do
       [{0, items_at}] -> check_list(whole, masked, items_at)
-      _no_select -> :ok
+      _no_select -> nil
     end
   end
 
-  @spec check_list(binary(), binary(), non_neg_integer()) :: :ok | {:error, term()}
+  # An error of the engine's with the position the parser meets it at.
+  @spec engine(non_neg_integer(), binary()) :: InfluxQLCheck.positioned()
+  defp engine(key, body), do: {key, {:error, {:engine, body}}}
+
+  @spec check_list(binary(), binary(), non_neg_integer()) :: InfluxQLCheck.positioned() | nil
   defp check_list(whole, masked, items_at) do
     rest = binary_part(masked, items_at, byte_size(masked) - items_at)
 
     if rest == "" or reserved_item?(rest) or reserved_item?(skip_signs(rest)) or
          not field_start?(skip_signs(rest)) do
-      {:error, {:engine, InfluxQLError.syntax_error_body(:field, items_at, whole)}}
+      engine(items_at, InfluxQLError.syntax_error_body(:field, items_at, whole))
     else
       check_from_keyword(whole, masked, items_at)
     end
   end
 
-  @spec check_from_keyword(binary(), binary(), non_neg_integer()) :: :ok | {:error, term()}
+  @spec check_from_keyword(binary(), binary(), non_neg_integer()) ::
+          InfluxQLCheck.positioned() | nil
   defp check_from_keyword(whole, masked, items_at) do
     case from_keyword(masked, items_at) do
       {:from, from_at, from_length} ->
         items = binary_part(masked, items_at, from_at - items_at)
 
-        with :ok <- check_each_item(whole, items, items_at, from_at + 1),
-             do: check_from(masked, from_at + from_length)
+        check_each_item(whole, items, items_at, from_at + 1) ||
+          check_from(masked, from_at + from_length)
 
       {:operator, operator, operand_at} ->
-        {:error, {:engine, operator_body(operator, operand_at, whole)}}
+        engine(operand_at, operator_body(operator, operand_at, whole))
 
       :none ->
         rest = masked |> binary_part(items_at, byte_size(masked) - items_at) |> String.trim()
-        body = reserved_operand(rest, items_at, whole, :off)
-        {:error, {:engine, body || InfluxQLError.syntax_error_body(:nom, 0, whole)}}
+
+        # No `FROM`: the list is the rest of the statement, and the engine leaves it unparsed
+        # where an item stops reading (an item followed by what is no part of it), else as late
+        # as it can be, so that a literal left open in it is the error.
+        reserved_operand(rest, items_at, whole, :off) ||
+          engine(none_key(masked, items_at), InfluxQLError.syntax_error_body(:nom, 0, whole))
     end
+  end
+
+  @spec none_key(binary(), non_neg_integer()) :: non_neg_integer()
+  defp none_key(masked, items_at) do
+    masked
+    |> binary_part(items_at, byte_size(masked) - items_at)
+    |> comma_pieces(items_at)
+    |> Enum.find_value(byte_size(masked), fn {piece, at} ->
+      text = String.trim_leading(piece)
+      start = at + byte_size(piece) - byte_size(text)
+
+      with leftover when leftover != nil <- InfluxQLArgs.item_leftover(String.trim(text)),
+           do: start + leftover
+    end)
   end
 
   @spec skip_signs(binary()) :: binary()
@@ -145,14 +168,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   defp operator_body(_operator, _operand_at, whole),
     do: InfluxQLError.syntax_error_body(:nom, 0, whole)
 
-  @spec check_from(binary(), non_neg_integer()) :: :ok | {:error, term()}
+  @spec check_from(binary(), non_neg_integer()) :: InfluxQLCheck.positioned() | nil
   defp check_from(masked, from_end) do
     rest = binary_part(masked, from_end, byte_size(masked) - from_end)
 
     if rest == "" or InfluxQLText.reserved_start(rest) != nil or
          not (rest =~ ~r/^[A-Za-z_"\/(]/),
-       do: {:error, {:engine, InfluxQLError.syntax_error_body(:from, from_end, masked)}},
-       else: :ok
+       do: engine(from_end, InfluxQLError.syntax_error_body(:from, from_end, masked)),
+       else: nil
   end
 
   # The comma-separated pieces of a text (its literals masked), each with its
@@ -188,7 +211,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   end
 
   @spec check_each_item(binary(), binary(), non_neg_integer(), non_neg_integer()) ::
-          :ok | {:error, term()}
+          InfluxQLCheck.positioned() | nil
   defp check_each_item(whole, items, items_at, from_keyword_at) do
     pieces = comma_pieces(items, items_at)
     last = length(pieces) - 1
@@ -197,13 +220,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     |> Enum.with_index()
     |> Enum.reduce_while(true, fn {{piece, at}, index}, prior_read? ->
       case check_item(whole, piece, at, {index, index == last, prior_read?}, from_keyword_at) do
-        :ok -> {:cont, prior_read? and readable_piece?(piece)}
+        nil -> {:cont, prior_read? and readable_piece?(piece)}
         error -> {:halt, error}
       end
     end)
     |> case do
-      {:error, _reason} = error -> error
-      _all_checked -> :ok
+      {_key, {:error, _reason}} = error -> error
+      _all_checked -> nil
     end
   end
 
@@ -223,7 +246,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
           {non_neg_integer(), boolean(), boolean()},
           non_neg_integer()
         ) ::
-          :ok | {:error, term()}
+          InfluxQLCheck.positioned() | nil
   defp check_item(whole, piece, at, {index, last?, prior_read?}, from_keyword_at) do
     text = String.trim_leading(piece)
     start = at + byte_size(piece) - byte_size(text)
@@ -234,30 +257,92 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     cond do
       # A regular expression for columns (`/re/`, `/re/ AS x`) is no division.
       Regex.match?(@regex_column, text) ->
-        :ok
+        nil
 
       String.downcase(text) == "distinct" and last? ->
-        {:error, {:engine, InfluxQLError.syntax_error_body(:distinct, from_keyword_at, whole)}}
+        engine(
+          from_keyword_at,
+          InfluxQLError.syntax_error_body(:distinct, from_keyword_at, whole)
+        )
 
       String.downcase(text) == "distinct" ->
-        {:error, "unsupported InfluxQL (DISTINCT)"}
+        InfluxQLCheck.refuse(start, "unsupported InfluxQL (DISTINCT)")
 
       index > 0 and unreadable_start?(text) ->
-        {:error, {:engine, InfluxQLError.syntax_error_body(:nom, 0, whole)}}
+        engine(start, InfluxQLError.syntax_error_body(:nom, 0, whole))
 
-      body = reserved_operand(text, start, whole, eot) ->
-        {:error, {:engine, body}}
+      kind = dangling_dot(text) ->
+        engine(start, dangling_dot_body(kind, index, start, whole))
+
+      hit = reserved_operand(text, start, whole, eot) ->
+        hit
 
       pos = reserved_alias(text, start) ->
-        {:error, {:engine, InfluxQLError.syntax_error_body(:alias, pos, whole)}}
+        engine(pos, InfluxQLError.syntax_error_body(:alias, pos, whole))
 
       unreadable?(text) ->
-        {:error, {:engine, InfluxQLError.syntax_error_body(:nom, 0, whole)}}
+        engine(start, InfluxQLError.syntax_error_body(:nom, 0, whole))
 
       true ->
-        :ok
+        nil
     end
   end
+
+  # A name with a dot and no name after it (`m.`, `m.f.`, `m.1`, `"m".`, `m. AS a`; blanks may
+  # stand after the dot, a reserved word is no name) is no field (verified): the first item
+  # fails as "expected field" where the list starts, a later one, or a dot in an alias, leaves
+  # the statement unparsed. In a call's arguments, and as the operand of a binary operator, it
+  # is another failure (see `InfluxQLArgs` and `operator_hit/3`).
+  @dotted ~r/(?<![\w.])(?:[A-Za-z_]\w*|"_*")(?:\.\s*(?:[A-Za-z_]\w*|"_*"))*\./
+
+  @spec dangling_dot(binary()) :: :alias | :field | nil
+  defp dangling_dot(text) do
+    @dotted
+    |> Regex.scan(text, return: :index)
+    |> Enum.find_value(fn [{from, length}] ->
+      stop = from + length
+      next = text |> binary_part(stop, byte_size(text) - stop) |> String.trim_leading()
+      before = text |> binary_part(0, from) |> String.trim_trailing()
+
+      cond do
+        next =~ ~r/\A(?:[A-Za-z_]|")/ and InfluxQLText.reserved_start(next) == nil -> nil
+        # `m.*` and `m./re/` are qualified wildcards, read elsewhere.
+        next =~ ~r/\A[*\/]/ -> nil
+        # Only a name that stands where an item or an operand starts can be one: after an operand
+        # (`(n)f.`) the item is left over from the name, after an operator or in a call other
+        # errors come first (see `operator_hit/3` and `InfluxQLArgs`).
+        before =~ ~r/(?:\A|\s)AS\z/i -> :alias
+        inside_call?(before) or before =~ ~r/(?:[\w)"']|[+\-*\/%&|^])\z/ -> nil
+        true -> :field
+      end
+    end)
+  end
+
+  # Whether the text ends inside the parentheses of a call (a name stands before the innermost
+  # `(` still open).
+  @spec inside_call?(binary()) :: boolean()
+  defp inside_call?(prefix) do
+    prefix
+    |> :binary.bin_to_list()
+    |> Enum.with_index()
+    |> Enum.reduce([], fn
+      {?(, at}, open -> [call_before?(prefix, at) | open]
+      {?), _at}, open -> Enum.drop(open, 1)
+      {_byte, _at}, open -> open
+    end)
+    |> Enum.any?()
+  end
+
+  defp call_before?(text, at),
+    do: text |> binary_part(0, at) |> String.trim_trailing() |> String.match?(~r/[A-Za-z_]\w*\z/)
+
+  @spec dangling_dot_body(:alias | :field, non_neg_integer(), non_neg_integer(), binary()) ::
+          binary()
+  defp dangling_dot_body(:field, 0, start, whole),
+    do: InfluxQLError.syntax_error_body(:field, start, whole)
+
+  defp dangling_dot_body(_kind, _index, _start, whole),
+    do: InfluxQLError.syntax_error_body(:nom, 0, whole)
 
   # Where the text of the list ends for a call or an operator left open: before the `FROM` that
   # ends it, or the `,` that ends the item; `:off` for an item behind one the engine may not read.
@@ -297,7 +382,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   defp number_leftover?(text) do
     not Regex.match?(~r{(?:^|[(,])\s*/}, text) and
       Regex.match?(
-        ~r/(?<![\w.])(?>(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+|\d*\.\d+|\d+)(?=[A-Za-z0-9_.])/u,
+        ~r/(?<![\w.])(?>(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+|\d*\.\d+|\d+)(?=[A-Za-z0-9_.])/,
         text
       )
   end
@@ -306,7 +391,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # a binary operator, or first in a call's parentheses. The engine fails
   # there (see `check_select/2`).
   @spec reserved_operand(binary(), non_neg_integer(), binary(), non_neg_integer() | :off) ::
-          binary() | nil
+          InfluxQLCheck.positioned() | nil
   defp reserved_operand(text, start, whole, eot) do
     [
       operator_hit(text, start, whole),
@@ -317,7 +402,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.min_by(&elem(&1, 0), fn -> nil end)
-    |> then(fn hit -> hit && elem(hit, 1) end)
+    |> then(fn hit -> hit && engine(elem(hit, 0), elem(hit, 1)) end)
   end
 
   @spec operator_hit(binary(), non_neg_integer(), binary()) :: {non_neg_integer(), binary()} | nil

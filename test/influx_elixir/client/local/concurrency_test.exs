@@ -2,6 +2,7 @@ defmodule InfluxElixir.Client.Local.ConcurrencyTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
+  alias InfluxElixir.TestSupport.Await
   alias InfluxElixir.TestSupport.Tokens, as: TokenShape
 
   setup do
@@ -38,7 +39,7 @@ defmodule InfluxElixir.Client.Local.ConcurrencyTest do
           end)
         end
 
-      Enum.each(tasks, &Task.await(&1, 30_000))
+      Enum.each(tasks, &Task.await(&1, Await.bound()))
 
       expected = for w <- 1..writers, i <- 1..per_writer, do: "W#{w}X#{i}"
       assert {:ok, rows} = Local.query_sql(conn, "SELECT symbol FROM prices", database: db)
@@ -225,8 +226,8 @@ defmodule InfluxElixir.Client.Local.ConcurrencyTest do
         end)
       end
 
-    for n <- 1..count, do: assert_receive({:ready, ^n}, 30_000)
+    for n <- 1..count, do: assert_receive({:ready, ^n}, Await.bound())
     Enum.each(tasks, &send(&1.pid, :go))
-    Enum.map(tasks, &Task.await(&1, 30_000))
+    Enum.map(tasks, &Task.await(&1, Await.bound()))
   end
 end

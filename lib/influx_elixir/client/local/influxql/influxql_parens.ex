@@ -11,37 +11,50 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
   # parenthesis, after an operand the parenthesis is left over. The last
   # parenthesis left open decides.
 
-  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLTokens}
+  alias InfluxElixir.Client.Local.{InfluxQLCheck, InfluxQLError, InfluxQLTokens}
 
   # `now()` has parentheses of its own, which are no grouping.
   @parens ~r/(?<![\w])now\s*\(\s*\)|[()]/i
 
   @doc """
-  `:ok` when the parentheses of the `WHERE` balance, else the engine's error.
+  `nil` when the parentheses of the `WHERE` balance, else the engine's error with its position.
   `tokens` are those of the condition, `masked` its text with the inside of
   literals blanked, `start` where it starts in `whole` (the statement as
   sent) and `where_at` where its `WHERE` does.
   """
   @spec check(list(), binary(), non_neg_integer(), non_neg_integer(), binary()) ::
-          :ok | {:error, {:engine, binary()}}
+          InfluxQLCheck.positioned() | nil
   def check(tokens, masked, start, where_at, whole) do
     case scan(masked) do
       :balanced ->
-        :ok
+        nil
 
       {:excess, offset} ->
-        {:error, {:engine, InfluxQLError.syntax_error_body(:nom, start + offset, whole)}}
+        InfluxQLCheck.fail(:nom, start + offset, whole)
 
       {:open, offset, ordinal} ->
         kind = tokens |> before_open(ordinal) |> InfluxQLTokens.reserved_kind()
-        body = InfluxQLError.where_error_body(kind, start + offset, where_at, whole)
-        {:error, {:engine, body}}
+        {_key, body} = InfluxQLError.where_error(kind, start + offset, where_at, whole)
+
+        # A `(` left open is found when the condition ends, not where it stands: whatever the
+        # parser meets inside the condition comes first (verified: a call it refuses, `fill(1)`,
+        # is the error before, inside or after an open parenthesis).
+        {start + byte_size(masked), {:error, {:engine, body}}}
     end
   end
 
   @doc "Whether a `)` in `masked` closes nothing: the condition ends there."
   @spec excess_close?(binary()) :: boolean()
-  def excess_close?(masked), do: match?({:excess, _offset}, scan(masked))
+  def excess_close?(masked), do: excess_offset(masked) != nil
+
+  @doc "Where the first `)` in `masked` that closes nothing stands, `nil` for none."
+  @spec excess_offset(binary()) :: non_neg_integer() | nil
+  def excess_offset(masked) do
+    case scan(masked) do
+      {:excess, offset} -> offset
+      _balanced_or_open -> nil
+    end
+  end
 
   # The first `)` that closes nothing, else the last `(` left open with the
   # number of `(` before it.

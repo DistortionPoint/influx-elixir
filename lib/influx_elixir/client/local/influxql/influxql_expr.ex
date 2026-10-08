@@ -39,11 +39,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     Durations,
     InfluxQLError,
     InfluxQLKernel,
+    InfluxQLLex,
     InfluxQLLiteral,
     InfluxQLText,
     SQLLimits
   }
 
+  require InfluxQLLex
   require SQLLimits
 
   @typedoc "An expression."
@@ -110,7 +112,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   @spec tokenize(binary(), list()) :: {:ok, list()} | :error
   defp tokenize(<<>>, acc), do: {:ok, Enum.reverse(acc)}
-  defp tokenize(<<c, rest::binary>>, acc) when c in [?\s, ?\t, ?\n, ?\r], do: tokenize(rest, acc)
+  defp tokenize(<<c, rest::binary>>, acc) when InfluxQLLex.is_blank(c), do: tokenize(rest, acc)
 
   defp tokenize(<<?*, rest::binary>>, acc)
        when acc == [] or hd(acc) in [{:op, "("}, {:op, ","}] do
@@ -140,7 +142,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp tokenize(text, acc) do
     cond do
-      match = Regex.run(~r/^(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+(?![\w.])/u, text) ->
+      match = Regex.run(~r/^(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+(?![\w.])/, text) ->
         [all] = match
         duration(rest_after(text, all), duration_ns(all), acc)
 
@@ -182,7 +184,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp duration(rest, ns, acc), do: tokenize(rest, [{:duration, ns} | acc])
 
   defp duration_ns(text) do
-    ~r/(\d+)(ns|ms|u|µ|s|m|h|d|w)/u
+    ~r/(\d+)(ns|ms|u|µ|s|m|h|d|w)/
     |> Regex.scan(text)
     |> Enum.reduce(0, fn [_all, count, unit], total ->
       total + String.to_integer(count) * Durations.ns(unit)

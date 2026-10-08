@@ -18,7 +18,11 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
   release, it would take a free lock). `waiting_for_lock/1` asks the process where it is
   (`Process.info/2` with `:current_function`) and polls with `Await.until/2` until it is in
   `Store.acquire/2`, the retry loop of the lock: a coupling to the module under test and to
-  nothing else. Each holder also runs a function that is inside the critical section from the
+  nothing else. That coupling is two facts about `Store`'s private lock, and a change to
+  either breaks these tests loudly (the wait ends at the failure bound, it never passes):
+  the retry loop is the function `{Store, :acquire, 2}`, and it retries on a short sleep of
+  about 1 ms, so a waiter is inside `acquire/2` for as long as the lock is held. Rename the
+  function or give the loop another shape and `waiting_for_lock/1` must follow. Each holder also runs a function that is inside the critical section from the
   moment it sends `:holding` until it returns, so an outcome that would break mutual
   exclusion is visible to it, or in the order the functions ran, whichever way the other
   process was scheduled.
@@ -29,9 +33,9 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
   alias InfluxElixir.Client.Local.Store
   alias InfluxElixir.TestSupport.Await
 
-  # The bound on every wait for a message: far above what a healthy run needs, so it only
-  # ever ends a failing one.
-  @bound 30_000
+  # The shared failure bound (`Await.bound/0`) on every wait for a message: far above what a
+  # healthy run needs, so it only ever ends a failing one.
+  @bound Await.bound()
 
   # The next of the two messages that tell the order the functions ran in: the mailbox is
   # scanned in arrival order, so this is the one that was sent first.

@@ -51,7 +51,7 @@ defmodule InfluxElixir.SupervisorTest do
 
       ref = Process.monitor(writer_a)
       Process.exit(writer_a, :kill)
-      assert_receive {:DOWN, ^ref, :process, ^writer_a, :killed}, 30_000
+      assert_receive {:DOWN, ^ref, :process, ^writer_a, :killed}, Await.bound()
 
       # Only the crashed child is replaced; its own supervisor and pool stay.
       new_writer_a = await_restart(ConnectionSupervisor.batch_writer_name(name_a), writer_a)
@@ -92,18 +92,20 @@ defmodule InfluxElixir.SupervisorTest do
         InfluxElixir.remove_connection(name_b)
       end)
 
-      top = Process.monitor(Process.whereis(InfluxElixir.Supervisor))
+      top = Process.whereis(InfluxElixir.Supervisor)
       finch_b = Process.whereis(ConnectionSupervisor.finch_name(name_b))
       writer_b = Process.whereis(ConnectionSupervisor.batch_writer_name(name_b))
 
       sup_ref = Process.monitor(sup_a)
       Process.exit(sup_a, :kill)
-      assert_receive {:DOWN, ^sup_ref, :process, ^sup_a, :killed}, 30_000
+      assert_receive {:DOWN, ^sup_ref, :process, ^sup_a, :killed}, Await.bound()
 
       new_sup_a = await_restart(ConnectionSupervisor.via(name_a), sup_a)
       # The name is registered before init/1 returns; a call waits for it.
       assert [_finch, _writer] = Supervisor.which_children(new_sup_a)
-      refute_received {:DOWN, ^top, :process, _pid, _reason}
+      # The top-level supervisor stayed up through the restart: same name, same live pid.
+      assert Process.whereis(InfluxElixir.Supervisor) === top
+      assert Process.alive?(top)
       assert new_sup_a !== sup_a
       assert {:ok, :written} = InfluxElixir.write(name_a, "cpu v=2i")
       assert InfluxElixir.query_sql(name_a, "SELECT v FROM cpu") === {:ok, [%{"v" => 2}]}

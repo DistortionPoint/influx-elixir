@@ -22,6 +22,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     SQLClauses,
     SQLCommonType,
     SQLConstantCall,
+    SQLContradict,
     SQLDecimal,
     SQLError,
     SQLExpr,
@@ -812,25 +813,6 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     )
   end
 
-  defp unknown_prune(:time_null), do: not_proved("a test of time for NULL (time is never null)")
-
-  defp unknown_prune(:null_list),
-    do: not_proved("a NULL in an IN list, beside a clause the engine folds it with")
-
-  defp unknown_prune(:not_in), do: not_proved("a NOT IN list and another test of its operand")
-
-  defp unknown_prune(:respelled),
-    do: not_proved("an IN list that writes one value in two spellings (IN (1, '1'))")
-
-  defp unknown_prune(:float),
-    do: not_proved("an integer equal to a float and to something else, with a third test")
-
-  defp unknown_prune(:late_conflict),
-    do:
-      not_proved(
-        "an expression compared to different values, the first conjunct being none of them"
-      )
-
   defp unknown_prune(:nested) do
     SQLError.refusal(
       "a negation that fails beside two IN lists of one operand where the second starts a " <>
@@ -854,6 +836,8 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
         "whether the engine plans the expression is not known"
     )
   end
+
+  defp unknown_prune(cause), do: cause |> SQLContradict.beside() |> not_proved()
 
   # What the refusals of a negation that fails beside a shape the double has no rule for share.
   @spec not_proved(binary()) :: map()

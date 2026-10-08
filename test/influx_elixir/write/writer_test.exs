@@ -2,6 +2,7 @@ defmodule InfluxElixir.Write.WriterTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
+  alias InfluxElixir.TestSupport.ClosedPort
   alias InfluxElixir.Write.Writer
 
   setup do
@@ -61,17 +62,21 @@ defmodule InfluxElixir.Write.WriterTest do
                {:ok, [%{"time" => ~U[2023-11-14 22:13:20.000000Z]}]}
     end
 
-    test "the :client opt selects the client and is not forwarded to it" do
+    # Only the HTTP client can answer with a refused connection, so this error proves
+    # the :client opt was taken and used. Neither real client reads a :client key from its
+    # options (HTTP builds its Finch options from :timeout and :pool_timeout alone, Local
+    # reads named keys), so no real client answers differently were it forwarded.
+    test "the :client opt selects the client" do
+      port = ClosedPort.port()
       finch = :"writer_test_finch_#{System.unique_integer([:positive])}"
-      start_supervised!({Finch, name: finch, pools: %{"http://127.0.0.1:1" => [size: 1]}})
-      http_conn = [host: "127.0.0.1", port: 1, scheme: :http, token: "t", finch_name: finch]
+      start_supervised!({Finch, name: finch, pools: %{"http://127.0.0.1:#{port}" => [size: 1]}})
+      http_conn = [host: "127.0.0.1", port: port, scheme: :http, token: "t", finch_name: finch]
 
-      # Only the HTTP client can produce a transport error.
-      assert {:error, {:connection_error, _reason}} =
-               Writer.write(http_conn, "cpu value=1.0",
-                 database: "w",
-                 client: InfluxElixir.Client.HTTP
-               )
+      assert Writer.write(http_conn, "cpu value=1.0",
+               database: "w",
+               client: InfluxElixir.Client.HTTP
+             ) ===
+               {:error, {:connection_error, %Mint.TransportError{reason: :econnrefused}}}
     end
   end
 end

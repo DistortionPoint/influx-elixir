@@ -31,7 +31,8 @@ defmodule InfluxElixir.Write.BatchWriter do
                     max_retries: [
                       type: :non_neg_integer,
                       default: 3,
-                      doc: "retry attempts for 5xx and transport errors. 4xx is never retried."
+                      doc:
+                        "retry attempts for 5xx, 408, 429 and transport errors; other 4xx are not retried"
                     ],
                     base_retry_delay_ms: [
                       type: :non_neg_integer,
@@ -114,8 +115,10 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   ## Retry Policy
 
-  Only 5xx and network errors are retried using asynchronous exponential
-  backoff with optional jitter. 4xx errors are discarded and logged.
+  5xx, 408 (request timeout), 429 (too many requests) and network errors
+  are retried using asynchronous exponential backoff with optional jitter.
+  Any other 4xx is the batch's own fault, would fail again, and is
+  discarded and logged.
   Retries are non-blocking — the GenServer continues to accept messages
   between retry attempts. A `write_sync/3` caller whose batch is being
   retried is answered with that chain's final result.
@@ -132,6 +135,10 @@ defmodule InfluxElixir.Write.BatchWriter do
   alias InfluxElixir.Write.Writer
 
   @backpressure_multiplier 10
+
+  # A 4xx the same batch would get again. 408 and 429 ask the client to try
+  # later; discarding the batch on them would lose it while the server is busy.
+  defguardp permanent?(status) when status in 400..499 and status not in [408, 429]
 
   # GenServer.call wait-bound defaults. Generous enough to cover one HTTP
   # write at the default `Client.HTTP.@default_timeout` (30s). `write_sync`
@@ -437,7 +444,7 @@ defmodule InfluxElixir.Write.BatchWriter do
       {:ok, :written} ->
         finish_chain(state, chain, :ok)
 
-      {:error, %{status: status}} = error when status in 400..499 ->
+      {:error, %{status: status}} = error when permanent?(status) ->
         Logger.warning("[BatchWriter] 4xx error (#{status}) — discarding batch")
 
         finish_chain(state, chain, error)
@@ -550,11 +557,12 @@ defmodule InfluxElixir.Write.BatchWriter do
       {:ok, :written} ->
         finish_flush_immediate(state, lines, :ok)
 
-      # Clients report HTTP failures as %{status, body}. A 4xx is the
-      # payload's fault and will never succeed on retry, so it is discarded.
+      # Clients report HTTP failures as %{status, body}. A 4xx other than
+      # 408 and 429 is the payload's fault and will never succeed on retry,
+      # so it is discarded.
       # (The clause used to match {:http_error, status}, a shape no client
       # produces, so bad batches were retried with backoff.)
-      {:error, %{status: status}} = error when status in 400..499 ->
+      {:error, %{status: status}} = error when permanent?(status) ->
         Logger.warning("[BatchWriter] 4xx error (#{status}) — discarding batch")
 
         finish_flush_immediate(state, lines, error)

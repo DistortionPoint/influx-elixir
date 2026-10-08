@@ -190,7 +190,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp execute_select(query, fetch, sources, params, kinds, held) do
     case select(query, fetch, sources, params, kinds, true, nil) do
       {:ok, _rows, _relations} when held != nil -> elem(held, 1)
-      {:ok, rows, _relations} -> response_rows(rows, query)
+      {:ok, rows, _relations} -> response_rows(rows)
       {:error, _reason} = error -> outranked(error, held)
     end
   end
@@ -203,11 +203,11 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
 
   defp outranked(error, _held), do: error
 
-  # The rows of a `SELECT *` are the points' own, and `point_to_row/2` has
-  # written their `UInt64`s as the response carries them.
-  @spec response_rows([map()], SQLParser.parsed_query()) :: [map()]
-  defp response_rows(rows, query),
-    do: if(SQLSchema.star?(query), do: rows, else: Enum.map(rows, &response_row/1))
+  # The rows as the response carries them. The rows of a `SELECT *` of a table are the points'
+  # own (`point_to_row/2` has written their `UInt64`s), but those of a common table expression
+  # hold what its select list computed: a narrow integer (`length(s)`) is the number.
+  @spec response_rows([map()]) :: [map()]
+  defp response_rows(rows), do: Enum.map(rows, &response_row/1)
 
   # The row as the response carries it: a `UInt64` and a decimal as the
   # number the engine writes, an infinity or a NaN as the `null` that is
@@ -366,37 +366,41 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   end
 
   # Two lists of one operand where the engine's fold of them changes a row's answer (see
-  # `SQLContradict.fold_gap?/1`).
+  # `SQLContradict.fold_gap?/1`). The select list, the arguments of its aggregates, `GROUP BY`
+  # and `ORDER BY` are values; a `HAVING` is read with the aggregates it names.
   @spec fold_gap(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
   defp fold_gap(query) do
     terms = %{
       filters: [query.where, query.having],
-      values: [query.projection_columns, query.order_by]
+      values: [
+        query.projection_columns,
+        query.select_columns,
+        query.group_by_columns,
+        query.order_by
+      ]
     }
 
-    if SQLContradict.fold_gap?(terms),
-      do:
-        {:error,
-         SQLError.refusal(
-           "two IN lists (or an IN and a NOT IN list) of one operand under a NOT or inside an " <>
-             "expression: the engine folds the pair to a constant before it reads a row, " <>
-             "which the double does not model there"
-         )},
-      else: :ok
+    refuse_when(
+      SQLContradict.fold_gap?(terms),
+      "two IN lists (or an IN and a NOT IN list) of one operand under a NOT or inside an " <>
+        "expression: the engine folds the pair to a constant before it reads a row, " <>
+        "which the double does not model there"
+    )
   end
 
   @spec null_difference([SQLParser.where_node()]) :: :ok | {:error, SQLError.t()}
   defp null_difference(where) do
-    if SQLContradict.null_difference?(where),
-      do:
-        {:error,
-         SQLError.refusal(
-           "an IN list and a NOT IN list of one operand, one of them with a NULL: the engine " <>
-             "takes one list out of the other, which the double does not model"
-         )},
-      else: :ok
+    refuse_when(
+      SQLContradict.null_difference?(where),
+      "an IN list and a NOT IN list of one operand, one of them with a NULL: the engine " <>
+        "takes one list out of the other, which the double does not model"
+    )
   end
 
+  # The double's refusal when the shape is one it does not model, else `:ok`.
+  @spec refuse_when(boolean(), binary()) :: :ok | {:error, SQLError.t()}
+  defp refuse_when(true, reason), do: {:error, SQLError.refusal(reason)}
+  defp refuse_when(false, _reason), do: :ok
   # A placeholder numbered zero is the engine's error as the expression it stands in is
 
   # converted: before the errors of types, and before the errors of the columns beside it. Which
@@ -837,7 +841,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     # Scalar aggregate: all filtered points form a single bucket. Always
     # produce one row, even when no points matched (so COUNT returns 0).
     query.select_columns
-    |> SQLAggregate.reduce_group(query.having, points, :scalar)
+    |> SQLAggregate.reduce_group(prepare_having(query), points, :scalar)
     |> apply_limit(query.limit, query.offset)
   end
 
@@ -848,17 +852,21 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     interval_ns = query.group_by_interval
     columns = query.group_by_columns || []
     time_alias = if interval_ns, do: find_time_bucket_alias(query.select_columns)
+    having = prepare_having(query)
 
     points
     |> Enum.group_by(fn point ->
       {bucket_start(point, interval_ns), Enum.map(columns, &group_value(point, &1))}
     end)
     |> Enum.flat_map(fn {{bucket_ts, _values}, bucket_points} ->
-      SQLAggregate.reduce_group(query.select_columns, query.having, bucket_points, bucket_ts)
+      SQLAggregate.reduce_group(query.select_columns, having, bucket_points, bucket_ts)
     end)
     |> apply_order_by_rows(query.order_by, time_alias)
     |> apply_limit(query.limit, query.offset)
   end
+
+  @spec prepare_having(SQLParser.parsed_query()) :: SQLAggregate.prepared()
+  defp prepare_having(query), do: SQLAggregate.prepare(query.having, query.select_columns)
 
   # What a point is grouped by for a `GROUP BY` item: a column's value, or an
   # expression's.

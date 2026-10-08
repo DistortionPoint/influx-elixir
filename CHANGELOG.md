@@ -8,6 +8,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` InfluxQL: one order of parse errors, carriage returns, dotted names**: a
+  stray quote or comment no longer wins over an earlier parse error (a lexer error stands only
+  where the parser reaches the token), a `)` that closes nothing wins over a later bad token,
+  `SELECT m. FROM m` is "expected field", a carriage return right after a keyword fails as it
+  does on Core, non-ASCII letters and digits are no identifier or number characters, and
+  `=~ /.*/` is answered again. Tokenizing is linear (parse reductions at 1,600 terms: 5.7M to
+  1.4M). Refusals of select items name why.
+- **`Client.Local` SQL: regex cost read once, IN pairs everywhere, the engine's rewrites,
+  variance**: `s ~ '\x{4a}'` raised (a second reader of the pattern disagreed with the first);
+  the cost of a pattern is now summed by the one reader (`SQLRegexCost`, with `SQLRegexGuard`
+  beside it), 24% fewer reductions per check. An `IN` pair the engine folds to a constant is
+  refused wherever a `NULL` operand shows it (an aggregate's argument, `GROUP BY`, a `HAVING`
+  beside the aggregates it names, a comparison, a test, a cast, an `OR` of equalities), and
+  `time`, never `NULL`, is not refused; `time IS [NOT] NULL` folds to a constant as the engine
+  does (24 cases of unsigned negation are answered). Patterns the engine rewrites before it
+  runs them are refused by name: an anchored literal beside `~*`, a literal backslash, `.*`.
+  `format:` of invalid UTF-8 or a non-string is a refusal, not a `Jason.EncodeError`; a `WITH`
+  over `length(s)` answers `3`, not `{:int, 32, 3}`; a refusal echoes the whole statement; the
+  caret of `a{2,1}?` spans the `?`. The variance of ordinary floats is the corrected two-pass
+  with compensated sums (51% fewer reductions; the true value, which the engine's merged
+  partitions scatter around, where store-order Welford drifted 30 times further). Refusal
+  reasons name the statement or the clause they are about.
+- **`Client.HTTP` raised on text that is not UTF-8**: SQL, InfluxQL or Flux text, a database
+  name, a bucket name or a token name that is not UTF-8 raised `Jason.EncodeError` out of
+  `query_sql`, `execute_sql`, `query_influxql`, `query_flux`, `create_database`,
+  `create_bucket` and `create_token`. Nothing is sent: they return `{:error,
+  {:unencodable_body, message}}`, and `query_sql_stream` raises `InfluxElixir.StreamError`.
+- **`Flight.Reader` allocated by a corrupt count**: a record batch's row count or field
+  length, or a list column's offsets, were trusted as read, so one corrupt byte of a frame
+  could build a column of billions of rows (36 of 1,950 corrupted frames went past 400 MB). A
+  count the batch's body cannot hold is now `{:error, {:decode_error, _}}`, and list offsets
+  are clamped to the child array. No valid frame decodes differently.
+- **Connection options a request cannot use are refused up front**:
+  `InfluxElixir.Config.validate/1` accepted a `:port` or `:flight_port` above 65535 and an
+  empty `:host`, or one with a blank or control character; each failed later, at the first
+  request, far from the option. They are now validation errors. A host that is a name, an IPv4 address, a bracketed IPv6 address or
+  non-ASCII text is still accepted.
+- **`ResponseParser.parse/2` raised on a body it could not read**: a CSV body that is not
+  CSV (a proxy's HTML error page, a body cut off inside a quoted cell) raised
+  `NimbleCSV.ParseError`, and a JSON array or JSONL line holding something other than an object
+  raised `FunctionClauseError`, out of `query_sql`/`query_influxql`/`query_flux`. They are now
+  `{:error, {:csv_parse_error, message}}` and `{:error, {:unexpected_json, value}}`; a streamed
+  line that is not an object raises `InfluxElixir.StreamError` (`kind: :decode`) as a line
+  that is not JSON already did.
+- **`BatchWriter` dropped batches on 408 and 429**: every 4xx was discarded as the batch's own
+  fault, including 408 (request timeout) and 429 (too many requests), which ask the client to
+  try later. A batch refused while the server was busy was lost. Both are now retried like a
+  5xx, with the same backoff and `:max_retries`; any other 4xx is still discarded.
+- **Names and parameters that are not UTF-8**: `Local.create_token` raised on a token name
+  that is not UTF-8, `delete_database` quoted the bytes into its 404, and `create_bucket`
+  accepted such a name; every database, bucket and token name that is not UTF-8 is now refused
+  by name. A query parameter whose name is not UTF-8 is `{:invalid_param, name,
+  :unsupported_key}` for both clients (`Client.HTTP` could not have written it as JSON).
 - **`Client.Local` SQL: IN pairs under NOT, regex the crate reads differently, float
   aggregates in store order**: `NOT (i IN (NULL) AND i IN (2))` and `NOT (i IN (0) AND
   i IN (1, 2))` kept three-valued logic where the engine folds the contradiction (256 rows for

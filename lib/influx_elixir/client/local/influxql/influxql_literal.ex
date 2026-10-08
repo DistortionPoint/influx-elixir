@@ -31,7 +31,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
       Regex.match?(~r/^[+-]?(?:\d+\.\d+|\.\d+)$/, text) ->
         float(text)
 
-      Regex.match?(~r/^\d+(?:ns|ms|u|µ|s|m|h|d|w)$/u, text) ->
+      Regex.match?(~r/^\d+(?:ns|ms|u|µ|s|m|h|d|w)$/, text) ->
         duration(text)
 
       String.starts_with?(text, "'") and String.ends_with?(text, "'") and byte_size(text) > 1 ->
@@ -138,7 +138,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
 
   @spec duration(binary()) :: {:ok, binary()}
   defp duration(text) do
-    [count, unit] = Regex.run(~r/^(\d+)(ns|ms|u|µ|s|m|h|d|w)$/u, text, capture: :all_but_first)
+    [count, unit] = Regex.run(~r/^(\d+)(ns|ms|u|µ|s|m|h|d|w)$/, text, capture: :all_but_first)
     ns = String.to_integer(count) * Durations.ns(unit)
     {:ok, "Duration(Duration(#{ns}))"}
   end

@@ -30,6 +30,7 @@ defmodule InfluxElixir.Client.QueryParamsTest do
             {%{{1, 2} => 1}, {"{1, 2}", :unsupported_key}},
             {[{[1], 1}], {"[1]", :unsupported_key}},
             {[1], {"1", :unsupported_key}},
+            {%{<<0xFF>> => 1}, {inspect(<<0xFF>>), :unsupported_key}},
             {5, {"5", :unsupported_params}},
             {"p", {~s|"p"|, :unsupported_params}},
             {%URI{}, {inspect(%URI{}), :unsupported_params}}

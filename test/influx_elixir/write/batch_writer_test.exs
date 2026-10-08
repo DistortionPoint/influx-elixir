@@ -5,27 +5,28 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   # below trigger those deliberately, so keep the output out of the run.
   @moduletag capture_log: true
 
-  # A ceiling on waits for answers that will come: generous, so a loaded
-  # machine cannot fail a correct test, and never what a test measures.
-  @await 120_000
-  @moduletag timeout: 600_000
-
   alias InfluxElixir.Client.Local
   alias InfluxElixir.TestServer
   alias InfluxElixir.TestSupport.Await
   alias InfluxElixir.Write.{BatchWriter, Point}
+
+  # The shared failure bound on waits for answers that will come: generous, so a loaded
+  # machine cannot fail a correct test, and never what a test measures.
+  @await Await.bound()
 
   setup do
     {:ok, conn} = Local.start()
     {:ok, conn: conn}
   end
 
+  # The flush interval defaults to ten minutes, far past any test: no timer fires unless a
+  # test names a short interval itself (the timer-based flush tests do).
   defp start_writer(conn, extra_opts \\ []) do
     defaults = [
       connection: conn,
       database: "test_db",
       batch_size: 10,
-      flush_interval_ms: 100,
+      flush_interval_ms: 600_000,
       jitter_ms: 0,
       max_retries: 1
     ]
@@ -231,7 +232,10 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   # the tests poll the writer's public stats, with a deadline that fails
   # loudly: nothing waits longer than needed or passes by luck.
   defp await_writes(pid, writes) do
-    Await.until(fn -> match?({:ok, %{total_writes: ^writes}}, BatchWriter.stats(pid)) end)
+    Await.until(
+      fn -> match?({:ok, %{total_writes: ^writes}}, BatchWriter.stats(pid)) end,
+      Await.bound()
+    )
   end
 
   describe "timer-based flush" do
@@ -686,6 +690,46 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 0, 0)
       assert :ok = Task.await(writer, @await)
       assert answer_with_stats(pid, "cpu value=1.0", 204) === stats(1, 0, 13)
+
+      # The success ended the chain: no further request, even from the writer's last write.
+      refute_request_after_stop()
+    end
+
+    # 408 and 429 ask the client to try later; a batch dropped on them is lost while the
+    # server is busy.
+    for status <- [408, 429] do
+      test "a #{status} is retried like a 5xx", %{finch: finch} do
+        pid =
+          start_http_writer(finch, TestServer.controlled(),
+            batch_size: 1,
+            max_retries: 2,
+            base_retry_delay_ms: 1
+          )
+
+        writer = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
+
+        assert answer_with_stats(pid, "cpu value=1.0", unquote(status)) === stats(0, 0, 0)
+        assert :ok = Task.await(writer, @await)
+        assert answer_with_stats(pid, "cpu value=1.0", 204) === stats(1, 0, 13)
+        refute_request_after_stop()
+      end
+    end
+
+    for status <- [404, 413] do
+      test "a #{status} ends the batch at once, with retries left", %{finch: finch} do
+        pid =
+          start_http_writer(finch, TestServer.controlled(),
+            batch_size: 1,
+            max_retries: 2,
+            base_retry_delay_ms: 1
+          )
+
+        writer = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
+
+        assert answer_with_stats(pid, "cpu value=1.0", unquote(status)) === stats(0, 1, 0)
+        assert :ok = Task.await(writer, @await)
+        refute_request_after_stop()
+      end
     end
 
     test "backpressure: the buffer is bounded at 10 x batch_size while a chain is in flight",
@@ -764,7 +808,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       assert {:error, %{status: 503}} = Task.await(caller, @await)
       assert Process.alive?(pid)
-      assert Process.alive?(pid)
+      assert BatchWriter.stats(pid) === stats(0, 1, 0)
     end
 
     test "a write_sync caller during another chain gets its own chain's result",

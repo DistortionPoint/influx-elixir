@@ -97,30 +97,40 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
   # body is a defect: the double ran into something it did not expect.
   @pinned_500_prefixes ["Schema error: No field named "]
 
-  defp answered?(answer) do
-    case answer do
-      :ok ->
-        true
+  # The atoms and tuples Local documents as errors: a refusal by name (`Client.Local`,
+  # `Shared.Format`, `QueryParams`), never a raw internal term.
+  @documented_atoms [:no_database_specified, :unsupported_operation]
+  @invalid_param_reasons [
+    :non_finite_decimal,
+    :unsupported_type,
+    :unsupported_key,
+    :unsupported_params
+  ]
+  @answer_statuses [400, 404, 405, 409, 422]
 
-      {:ok, _result} ->
-        true
+  defp answered?(:ok), do: true
+  defp answered?({:ok, :written}), do: true
+  defp answered?({:ok, rows}) when is_list(rows), do: Enum.all?(rows, &is_map/1)
+  defp answered?({:ok, result}) when is_map(result), do: true
+  defp answered?({:error, reason}) when reason in @documented_atoms, do: true
+  defp answered?({:error, {:unsupported_format, _format}}), do: true
+  # `Admin.Tokens` documents this for a permission not in `kind:name:action` form.
+  defp answered?({:error, {:invalid_permission, permission}}), do: is_binary(permission)
 
-      {:error, reason} when is_atom(reason) or is_tuple(reason) ->
-        true
+  defp answered?({:error, {:invalid_param, name, reason}}),
+    do: is_binary(name) and reason in @invalid_param_reasons
 
-      {:error, %{status: 500, body: body}} when is_binary(body) ->
-        String.starts_with?(body, @pinned_500_prefixes)
+  defp answered?({:error, %{status: 500, body: body}}) when is_binary(body),
+    do: String.starts_with?(body, @pinned_500_prefixes)
 
-      {:error, %{status: status, body: body}} ->
-        status in [400, 404, 405, 409, 422] and is_binary(body)
+  defp answered?({:error, %{status: status, body: body}}),
+    do: status in @answer_statuses and is_binary(body)
 
-      _other ->
-        false
-    end
-  end
+  defp answered?(_other), do: false
 
-  # Runs `fun` and asserts that it answered, by name, with an exception nowhere.
-  defp ask_call(label, fun) do
+  # Runs `fun` and asserts that it answered, by name, with an exception nowhere, and that
+  # no atom now exists for the text; a failure names the statement (`label`) that did it.
+  defp ask_call(text, label, fun) do
     answer =
       try do
         fun.()
@@ -131,9 +141,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
       end
 
     assert answered?(answer), "#{label} => #{inspect(answer)}"
+    assert_no_atom(text, label)
   end
 
-  defp ask(fun, statement), do: ask_call(statement, fn -> fun.(statement) end)
+  defp ask(text, fun, statement), do: ask_call(text, statement, fn -> fun.(statement) end)
 
   describe "no atom is made from the text of a statement" do
     # The first statement in a fresh VM met an atom that did not exist yet, and raised. A
@@ -177,11 +188,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
       ]
 
       for statement <- statements do
-        ask(&Local.query_influxql(conn, &1, database: "clauses_db"), statement)
-        ask(&Local.query_influxql(conn, &1, database: text), statement)
+        ask(text, &Local.query_influxql(conn, &1, database: "clauses_db"), statement)
+        ask(text, &Local.query_influxql(conn, &1, database: text), statement)
       end
 
-      assert_no_atom(text)
+      assert_no_atom(text, "the test as a whole")
     end
 
     test "in a SQL statement", %{conn: conn} do
@@ -222,11 +233,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
       ]
 
       for statement <- statements do
-        ask(&Local.query_sql(conn, &1, database: "clauses_db"), statement)
-        ask(&Local.query_sql(conn, &1, database: text), statement)
+        ask(text, &Local.query_sql(conn, &1, database: "clauses_db"), statement)
+        ask(text, &Local.query_sql(conn, &1, database: text), statement)
       end
 
-      assert_no_atom(text)
+      assert_no_atom(text, "the test as a whole")
     end
 
     test "in more SQL statements: EXPLAIN, SET, COPY, SHOW and the rest", %{conn: conn} do
@@ -272,11 +283,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
       ]
 
       for statement <- statements do
-        ask(&Local.query_sql(conn, &1, database: "clauses_db"), statement)
-        ask(&Local.execute_sql(conn, &1, database: "clauses_db"), statement)
+        ask(text, &Local.query_sql(conn, &1, database: "clauses_db"), statement)
+        ask(text, &Local.execute_sql(conn, &1, database: "clauses_db"), statement)
       end
 
-      assert_no_atom(text)
+      assert_no_atom(text, "the test as a whole")
     end
 
     test "in the parameters of a SQL or an InfluxQL query", %{conn: conn} do
@@ -296,16 +307,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
       for {statement, params} <- sql do
         label = "#{statement} #{inspect(params)}"
 
-        ask_call(label, fn ->
+        ask_call(text, label, fn ->
           Local.query_sql(conn, statement, database: "clauses_db", params: params)
         end)
 
-        ask_call(label, fn ->
+        ask_call(text, label, fn ->
           Local.query_influxql(conn, statement, database: "clauses_db", params: params)
         end)
       end
 
-      assert_no_atom(text)
+      assert_no_atom(text, "the test as a whole")
     end
 
     test "in the Flux of a query" do
@@ -349,11 +360,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
       ]
 
       for flux <- queries do
-        ask_call(flux, fn -> Local.query_flux(v2, flux) end)
-        ask_call(flux, fn -> Local.query_flux(v2, flux, database: text) end)
+        ask_call(text, flux, fn -> Local.query_flux(v2, flux) end)
+        ask_call(text, flux, fn -> Local.query_flux(v2, flux, database: text) end)
       end
 
-      assert_no_atom(text)
+      assert_no_atom(text, "the test as a whole")
     end
 
     test "in line protocol: names, tags, string values, escapes and parameters", %{conn: conn} do
@@ -380,21 +391,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
       ]
 
       for payload <- payloads do
-        ask_call(payload, fn -> Local.write(conn, payload, database: "clauses_db") end)
-        ask_call(payload, fn -> Local.write(conn, payload, database: text) end)
-        ask_call(payload, fn -> Local.write(v2, payload, database: text) end)
+        ask_call(text, payload, fn -> Local.write(conn, payload, database: "clauses_db") end)
+        ask_call(text, payload, fn -> Local.write(conn, payload, database: text) end)
+        ask_call(text, payload, fn -> Local.write(v2, payload, database: text) end)
 
-        ask_call(payload, fn ->
+        ask_call(text, payload, fn ->
           Local.write(v2, payload, database: text, org: text, bucket: text, precision: text)
         end)
 
-        ask_call(payload, fn ->
+        ask_call(text, payload, fn ->
           Local.write(conn, payload, database: "clauses_db", precision: text)
         end)
       end
 
       assert_raise ArgumentError, fn -> Local.start(profile: text) end
-      assert_no_atom(text)
+      assert_no_atom(text, "the test as a whole")
     end
 
     test "in the names of databases, buckets and tokens", %{conn: conn} do
@@ -431,14 +442,49 @@ defmodule InfluxElixir.Client.Local.InfluxQLClausesTest do
         {"health", fn -> Local.health(enterprise) end}
       ]
 
-      for {label, call} <- calls, do: ask_call(label, call)
+      for {label, call} <- calls, do: ask_call(text, label, call)
 
-      assert_no_atom(text)
+      assert_no_atom(text, "the test as a whole")
     end
 
-    defp assert_no_atom(text) do
-      for spelling <- [text, String.upcase(text)] do
-        assert_raise ArgumentError, fn -> String.to_existing_atom(spelling) end
+    # Every spelling the tests send or derive: the text, upper-, lower- and capitalised, and
+    # with the prefixes of the derived names (`other_`, `p_`, `v2_`).
+    defp spellings(text) do
+      for base <- [text, "other_" <> text, "p_" <> text, "v2_" <> text],
+          form <- [base, String.upcase(base), String.downcase(base), String.capitalize(base)],
+          uniq: true,
+          do: form
+    end
+
+    defp assert_no_atom(text, label) do
+      for spelling <- spellings(text) do
+        try do
+          atom = String.to_existing_atom(spelling)
+          flunk("#{label}: an atom was made for #{inspect(spelling)}: #{inspect(atom)}")
+        rescue
+          ArgumentError -> :ok
+        end
+      end
+
+      :ok
+    end
+
+    test "the check fails for an atom made from any spelling (positive control)" do
+      for make <- [
+            & &1,
+            &String.upcase/1,
+            &String.downcase/1,
+            &String.capitalize/1,
+            &("other_" <> &1),
+            &("p_" <> &1),
+            &("v2_" <> &1)
+          ] do
+        text = unique_text()
+        _atom = text |> make.() |> String.to_atom()
+
+        assert_raise ExUnit.AssertionError, ~r/an atom was made for/, fn ->
+          assert_no_atom(text, "control")
+        end
       end
     end
   end

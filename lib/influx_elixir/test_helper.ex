@@ -20,7 +20,7 @@ defmodule InfluxElixir.TestHelper do
         test "writes and reads data", %{conn: conn} do
           {:ok, :written} = InfluxElixir.write(conn, "cpu value=1.0", database: "mydb")
           {:ok, [row]} = InfluxElixir.query_sql(conn, "SELECT * FROM cpu", database: "mydb")
-          assert row["value"] == 1.0
+          assert row["value"] === 1.0
         end
       end
 

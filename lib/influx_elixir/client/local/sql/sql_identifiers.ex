@@ -210,9 +210,19 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
 
   @spec quoted_identifier(binary()) :: iodata()
   defp quoted_identifier(name) do
-    if Regex.match?(~r/\A[\p{L}_][\p{L}\p{N}_]*\z/u, name) and
-         String.downcase(name) not in @keywords,
-       do: name,
-       else: [?", name, ?"]
+    if plain_word?(name) and String.downcase(name) not in @keywords,
+      do: name,
+      else: [?", name, ?"]
   end
+
+  # Whether the name is one word: a start, then characters that go on a word (the same tables
+  # that read a word in a text).
+  @spec plain_word?(binary()) :: boolean()
+  defp plain_word?(<<first::utf8, rest::binary>>), do: word_start?(first) and word_chars?(rest)
+  defp plain_word?(_name), do: false
+
+  @spec word_chars?(binary()) :: boolean()
+  defp word_chars?(<<>>), do: true
+  defp word_chars?(<<char::utf8, rest::binary>>), do: word_char?(char) and word_chars?(rest)
+  defp word_chars?(_name), do: false
 end

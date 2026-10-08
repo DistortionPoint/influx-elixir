@@ -1,9 +1,10 @@
 defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
   @moduledoc """
   What no engine can be asked: text that is not UTF-8 cannot be sent as JSON, so the double's
-  answer has no engine answer to match. Every entry point that reads text answers by name
-  and never raises (the InfluxQL and Flux readers and error bodies take UTF-8; a database
-  name is quoted in the 404).
+  answer has no engine answer to match. The SQL, InfluxQL and Flux texts, database, bucket and
+  token names, parameter names, the `format:` option and v3 line protocol (plain or gzip)
+  answer by name and never raise. A v2 write is the exception: InfluxDB 2.7 stores the bytes
+  as they are and returns them, and so does the double.
   """
 
   use ExUnit.Case, async: true
@@ -79,18 +80,100 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
     end
   end
 
+  describe "SQL" do
+    test "a statement, a database name or a format that is not UTF-8 is refused by name",
+         %{conn: c} do
+      assert Local.query_sql(c, "SELECT '" <> @bad <> "' AS a", database: "utf8_iql") ===
+               {:error, %{status: 400, body: "Client.Local: the SQL text is not valid UTF-8"}}
+
+      assert Local.query_sql(c, "SELECT 1", database: "utf8_iql" <> @bad) ===
+               {:error, %{status: 400, body: @name_refusal}}
+
+      assert Local.query_sql(c, "SELECT 1 AS a", database: "utf8_iql", format: @bad) ===
+               {:error,
+                %{
+                  status: 400,
+                  body:
+                    "Client.Local: format: a value that is not valid UTF-8 (the client " <>
+                      "cannot write it into the request body)"
+                }}
+    end
+
+    test "a parameter whose name or value is not UTF-8 is refused before any request",
+         %{conn: c} do
+      assert Local.query_sql(c, "SELECT $a AS a", database: "utf8_iql", params: %{"a" => @bad}) ===
+               {:error, {:invalid_param, "a", :unsupported_type}}
+
+      assert Local.query_sql(c, "SELECT 1 AS a", database: "utf8_iql", params: %{@bad => 1}) ===
+               {:error, {:invalid_param, inspect(@bad), :unsupported_key}}
+    end
+  end
+
+  describe "admin names" do
+    test "a database, bucket or token name that is not UTF-8 is refused by name, never raised",
+         %{conn: c, v2: v2} do
+      refusal = fn kind ->
+        {:error, %{status: 400, body: "Client.Local: the #{kind} name is not valid UTF-8"}}
+      end
+
+      assert Local.create_database(c, "x" <> @bad) === refusal.("database")
+      assert Local.delete_database(c, "x" <> @bad) === refusal.("database")
+      assert Local.create_bucket(v2, "x" <> @bad) === refusal.("bucket")
+      assert Local.delete_bucket(v2, "x" <> @bad) === refusal.("bucket")
+      assert Local.create_token(c, "t" <> @bad) === refusal.("token")
+      assert Local.delete_token(c, "t" <> @bad) === refusal.("token")
+    end
+  end
+
+  describe "v2 line protocol" do
+    # Verified against InfluxDB 2.7 (2026-10-08): the write is a 204, and a Flux query returns
+    # the tag's bytes as they were written.
+    test "a body that is not UTF-8 is stored as written, and read back as it was", %{v2: c} do
+      assert Local.write(c, "u,host=a" <> @bad <> "b v=1 1",
+               bucket: "utf8_flux",
+               org: "o",
+               database: "utf8_flux",
+               precision: :second
+             ) === {:ok, :written}
+
+      assert {:ok, [row]} =
+               Local.query_flux(c, @flux_head <> ~s/ |> filter(fn: (r) => r._measurement == "u")/,
+                 org: "o"
+               )
+
+      assert row["host"] === "a" <> @bad <> "b"
+    end
+  end
+
   describe "line protocol" do
+    test "a gzip body that inflates to text that is not UTF-8 is the same 400", %{conn: c} do
+      body = :zlib.gzip("m,host=" <> @bad <> " v=1 1")
+
+      assert Local.write(c, body, database: "utf8_iql", gzip: true) ===
+               {:error,
+                %{
+                  status: 400,
+                  body:
+                    "body content is not valid utf8: invalid utf-8 sequence of 1 bytes from index 7"
+                }}
+    end
+
     test "a body that is not UTF-8 is the engine's 400, wherever the bytes stand", %{conn: c} do
-      for body <- [
-            "m,host=" <> @bad <> " v=1 1",
-            @bad <> " v=1 1",
-            "m " <> @bad <> "=1 1",
-            "m v=\"" <> @bad <> "\" 1",
-            "# " <> @bad <> "\nm v=1 1",
-            "m v=1 " <> @bad
+      # The reason names the index of the first bad byte.
+      for {body, index} <- [
+            {"m,host=" <> @bad <> " v=1 1", 7},
+            {@bad <> " v=1 1", 0},
+            {"m " <> @bad <> "=1 1", 2},
+            {"m v=\"" <> @bad <> "\" 1", 5},
+            {"# " <> @bad <> "\nm v=1 1", 2},
+            {"m v=1 " <> @bad, 6}
           ] do
-        assert {:error, %{status: 400, body: "body content is not valid utf8: " <> _reason}} =
-                 Local.write(c, body, database: "utf8_iql")
+        body_text =
+          "body content is not valid utf8: invalid utf-8 sequence of 1 bytes from index " <>
+            Integer.to_string(index)
+
+        assert Local.write(c, body, database: "utf8_iql") ===
+                 {:error, %{status: 400, body: body_text}}
       end
     end
   end

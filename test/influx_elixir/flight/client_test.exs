@@ -3,7 +3,7 @@ defmodule InfluxElixir.Flight.ClientTest do
 
   alias InfluxElixir.Flight.Client
   alias InfluxElixir.Flight.Proto.Ticket
-  alias InfluxElixir.TestSupport.ClosedPort
+  alias InfluxElixir.TestSupport.{Await, ClosedPort}
 
   describe "build_ticket_payload/2" do
     test "produces valid JSON with required fields" do
@@ -135,12 +135,12 @@ defmodule InfluxElixir.Flight.ClientTest do
   describe "bounded_connect/2" do
     test "returns the fn's result when it completes in time" do
       assert {:ok, :channel} =
-               Client.bounded_connect(fn -> {:ok, :channel} end, 1_000)
+               Client.bounded_connect(fn -> {:ok, :channel} end, Await.bound())
     end
 
     test "propagates the fn's error tuple" do
       assert {:error, :nxdomain} =
-               Client.bounded_connect(fn -> {:error, :nxdomain} end, 1_000)
+               Client.bounded_connect(fn -> {:error, :nxdomain} end, Await.bound())
     end
 
     test "returns {:error, :connect_timeout} when fn exceeds the bound" do

@@ -50,7 +50,7 @@ defmodule InfluxElixir.Query.ResponseParser do
 
   def parse(body, :json) do
     case Jason.decode(body) do
-      {:ok, data} when is_list(data) -> {:ok, Enum.map(data, &coerce_types/1)}
+      {:ok, data} when is_list(data) -> rows(data)
       {:ok, data} when is_map(data) -> {:ok, [coerce_types(data)]}
       {:ok, other} -> {:error, {:unexpected_json, other}}
       {:error, reason} -> {:error, {:json_parse_error, reason}}
@@ -62,7 +62,8 @@ defmodule InfluxElixir.Query.ResponseParser do
     |> String.split("\n", trim: true)
     |> Enum.reduce_while({:ok, []}, fn line, {:ok, acc} ->
       case Jason.decode(line) do
-        {:ok, row} -> {:cont, {:ok, [coerce_types(row) | acc]}}
+        {:ok, row} when is_map(row) -> {:cont, {:ok, [coerce_types(row) | acc]}}
+        {:ok, other} -> {:halt, {:error, {:unexpected_json, other}}}
         {:error, reason} -> {:halt, {:error, {:jsonl_parse_error, reason}}}
       end
     end)
@@ -72,9 +73,9 @@ defmodule InfluxElixir.Query.ResponseParser do
     end
   end
 
-  def parse(body, :csv), do: {:ok, parse_csv(body)}
+  def parse(body, :csv), do: csv(&parse_csv/1, body)
 
-  def parse(body, :flux_csv), do: {:ok, parse_flux_csv(body)}
+  def parse(body, :flux_csv), do: csv(&parse_flux_csv/1, body)
 
   def parse(body, :parquet), do: {:ok, body}
 
@@ -90,6 +91,23 @@ defmodule InfluxElixir.Query.ResponseParser do
   @spec coerce_types(map()) :: map()
   def coerce_types(row) when is_map(row) do
     Map.new(row, fn {key, value} -> {key, coerce_value(key, value)} end)
+  end
+
+  # Every element of a JSON array of rows must be an object: a proxy's or a
+  # truncated body is an error for the caller, not a crash.
+  @spec rows(list()) :: {:ok, [map()]} | {:error, term()}
+  defp rows(data) do
+    if Enum.all?(data, &is_map/1),
+      do: {:ok, Enum.map(data, &coerce_types/1)},
+      else: {:error, {:unexpected_json, data |> Enum.reject(&is_map/1) |> hd()}}
+  end
+
+  # A body that is not CSV (an HTML error page, a cut-off quote) is an error.
+  @spec csv((binary() -> [map()]), binary()) :: {:ok, [map()]} | {:error, term()}
+  defp csv(parse, body) do
+    {:ok, parse.(body)}
+  rescue
+    error in NimbleCSV.ParseError -> {:error, {:csv_parse_error, Exception.message(error)}}
   end
 
   # ---------------------------------------------------------------------------

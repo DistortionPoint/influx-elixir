@@ -19,6 +19,22 @@ defmodule InfluxElixir.TestSupport.Await do
   # The pause between two checks of the condition: a polling interval, not a wait for it.
   @poll_ms 2
 
+  # The one failure bound every test wait shares (`assert_receive`, `Task.await`, `Await.until`,
+  # a receive's `after`): far above what a healthy run needs, so it only ever ends a failing
+  # one, and below ExUnit's 60 s test timeout, so a hang fails with the wait that named it
+  # instead of the generic test timeout.
+  @bound_ms 30_000
+
+  @doc """
+  The failure bound, in milliseconds, for any wait in a test.
+
+  Never a measurement: it decides nothing about a passing run. A test that must show a
+  value LOSING to another (a timeout option beating a default) gives the loser more than
+  this bound, so the bound ends the wait first if the wrong value ever applied.
+  """
+  @spec bound() :: pos_integer()
+  def bound, do: @bound_ms
+
   @doc """
   Calls `fun` until it returns a truthy value, and returns that value.
 
@@ -27,7 +43,7 @@ defmodule InfluxElixir.TestSupport.Await do
   passing run passes, it only ends a failing one.
   """
   @spec until((-> term()), pos_integer()) :: term()
-  def until(fun, deadline_ms \\ 30_000) when is_function(fun, 0) do
+  def until(fun, deadline_ms \\ @bound_ms) when is_function(fun, 0) do
     deadline = System.monotonic_time(:millisecond) + deadline_ms
     poll(fun, deadline, deadline_ms)
   end

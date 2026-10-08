@@ -43,7 +43,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowCondition do
   end
 
   defp condition(ctx, text, to, spec) do
-    case InfluxQLCheck.check_where(ctx.raw, 0, ctx.masked, text) do
+    case InfluxQLCheck.settle([InfluxQLCheck.check_where(ctx.raw, 0, ctx.masked, text)]) do
       :ok -> {:ok, %{spec | where: text}, to}
       {:error, _engine} = error -> error
     end

@@ -118,13 +118,17 @@ defmodule InfluxElixir.ConfigTest do
                Config.validate(host: "h", token: "t", api_version: :v1)
     end
 
-    test "rejects :port that is not a positive integer" do
-      assert {:error,
-              %NimbleOptions.ValidationError{
-                key: :port,
-                message: "invalid value for :port option: expected positive integer, got: -1"
-              }} =
-               Config.validate(host: "h", token: "t", port: -1)
+    test "rejects a :port or :flight_port outside 1..65535" do
+      for key <- [:port, :flight_port], port <- [-1, 0, 65_536] do
+        assert {:error, %NimbleOptions.ValidationError{key: ^key, message: message}} =
+                 Config.validate([{key, port}, host: "h"])
+
+        assert message ===
+                 "invalid value for #{inspect(key)} option: expected one of 1..65535, " <>
+                   "got: #{port}"
+      end
+
+      assert {:ok, _opts} = Config.validate(host: "h", port: 65_535, flight_port: 1)
     end
 
     test "rejects :pool_size that is not a positive integer" do
@@ -140,9 +144,21 @@ defmodule InfluxElixir.ConfigTest do
       assert {:error,
               %NimbleOptions.ValidationError{
                 key: :host,
-                message: "invalid value for :host option: expected string, got: 123"
+                message:
+                  "invalid value for :host option: expected :host to be a non-empty " <>
+                    "string, got: 123"
               }} =
                Config.validate(host: 123, token: "t")
+    end
+
+    test "rejects an empty :host, or one with a blank or control character" do
+      for host <- ["", "a b", "h\nx", "h\tx"] do
+        assert {:error, %NimbleOptions.ValidationError{key: :host}} = Config.validate(host: host)
+      end
+
+      for host <- ["localhost", "[::1]", "10.0.0.1", "日本.jp"] do
+        assert {:ok, _opts} = Config.validate(host: host)
+      end
     end
 
     test "rejects :token that is not a string" do

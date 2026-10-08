@@ -489,6 +489,7 @@ defmodule InfluxElixir.Flight.Reader do
     with {:ok, row_count, buffer_specs, meta} <-
            parse_record_batch_header(header),
          :ok <- check_uncompressed(meta),
+         :ok <- check_row_counts(row_count, meta.nodes, body),
          {:ok, col_vectors} <-
            decode_columns(columns, buffer_specs, body, row_count, meta) do
       {:ok, zip_columns(columns, col_vectors, row_count)}
@@ -551,6 +552,25 @@ defmodule InfluxElixir.Flight.Reader do
     else
       {:ok, 0, [], @empty_meta}
     end
+  end
+
+  # Every column is built to its row count, so a count from a corrupt header
+  # (one flipped byte of metadata) would allocate gigabytes. A column with
+  # data holds at least one bit per row in the body, which bounds the count
+  # by the bytes received; a column without buffers (the null type, or a
+  # batch that omits them) is bounded far above any batch the engine sends
+  # (8192 rows), which caps the cost of a corrupt count at a few megabytes.
+  @rows_without_body 1_048_576
+
+  @spec check_row_counts(integer(), [{integer(), integer()}], binary() | nil) ::
+          :ok | {:error, term()}
+  defp check_row_counts(row_count, nodes, body) do
+    limit = max(8 * byte_size(body || <<>>), @rows_without_body)
+    counts = [row_count | Enum.map(nodes, &elem(&1, 0))]
+
+    if Enum.all?(counts, &(&1 in 0..limit//1)),
+      do: :ok,
+      else: {:error, {:decode_error, "a row count the record batch's body cannot hold"}}
   end
 
   @spec parse_record_batch_table(binary(), non_neg_integer()) ::
@@ -737,7 +757,11 @@ defmodule InfluxElixir.Flight.Reader do
       |> slice(offsets)
       |> offsets_list(if kind == :list, do: 4, else: 8)
       |> pairs()
-      |> Enum.map(fn {from, to} -> for i <- from..(to - 1)//1, do: cell(items, i) end)
+      # Offsets lie inside the child array; clamped, a corrupt one cannot make
+      # a list of billions of nils.
+      |> Enum.map(fn {from, to} ->
+        for i <- max(from, 0)..(min(to, tuple_size(items)) - 1)//1, do: elem(items, i)
+      end)
       |> fit(len)
 
     {apply_nulls(lists, slice_validity(body, validity), len), cursor}

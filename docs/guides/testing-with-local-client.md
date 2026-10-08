@@ -68,8 +68,8 @@ defmodule MyApp.InfluxTest do
       database: "myapp_test"
     )
 
-    assert row["temp"] == 22.5
-    assert row["location"] == "lab"
+    assert row["temp"] === 22.5
+    assert row["location"] === "lab"
   end
 end
 ```
@@ -291,7 +291,7 @@ defmodule MyApp.FacadeTest do
       database: "myapp_test"
     )
 
-    assert row["temp"] == 22.5
+    assert row["temp"] === 22.5
   end
 end
 ```
@@ -913,13 +913,18 @@ against a real InfluxDB (see "Running Against a Real InfluxDB"):
 - `concat`, `trim`, `replace` and the other string functions not listed above
 - `HAVING` without a comparison or without a `GROUP BY`; `COALESCE` mixing
   text and numbers; a comparison of `time` inside a select item
-
 The last digits of the `sum`, `avg`, `var_*` and `stddev*` of floats are not reproducible, not
 even by the engine: twelve runs of one `SELECT sum(f)` on InfluxDB 3 Core gave four different
-last digits. `Client.Local`
-adds the values in the order they were written and keeps a single pass for the variance, so its
-digits are one valid answer and no more. Compare these with a tolerance (the contract uses a
-relative `1.0e-12`); `sum` and `avg` of whole numbers are exact.
+last digits, and on data whose spread is small beside its magnitude (`1e9 + k * 0.001`) the
+variance varies in its fifth significant digit from run to run, the engine merging the
+partitions of its scan in the order they finish. `Client.Local` adds the values of a `sum` and
+an `avg` in the order the points are stored, and computes a variance as the corrected two-pass
+variance with compensated sums (the true value to the last digit, which is where the engine's
+answers scatter around; a single pass in store order drifts further than they do). A value that
+is an infinity, a NaN or past `1e140` in magnitude sends the whole column to the one-pass
+accumulator, which has the engine's overflow results. Equal values have a variance of exactly
+`0.0`, where the engine sometimes gives a rounding residue (`7.2e-30`) from merging partitions. Compare these with a
+tolerance (the contract uses a relative `1.0e-12`); `sum` and `avg` of whole numbers are exact.
 
 A regular expression (`~`) is matched with PCRE where the engine's crate reads the same
 pattern the same way. Patterns it reads differently (`\v`, a quantifier followed by `+`,
@@ -927,8 +932,22 @@ white space in a count, a Unicode property or class it was not checked against, 
 large that Core closes the connection) are refused by name, and `\w`, `\d`, `\s`, `\b`, a
 case-insensitive match, `$`, `\z` and `(?m)` are refused over a text where the two differ (one
 that is not ASCII, or has a newline). That depends on the data: one such row in a table
-refuses a query that was answered before the row was written. `LIKE 'p' ESCAPE '\'` and a
+refuses a query that was answered before the row was written. The engine also rewrites some
+patterns before it runs them, and the rewrite is not the pattern's meaning: `s ~* '^abc$'`
+(an anchored literal, also in a group or an alternation of literals) keeps only the rows equal
+to `abc`, a pattern of literals with a backslash (`\\`, `\x5c`) becomes a `LIKE` that uses the
+backslash as its escape, and `.*` is answered differently under a negation. Those patterns are
+refused by name. `LIKE 'p' ESCAPE '\'` and a
 pattern of literals joined by `||` are answered; any other `ESCAPE` character is refused.
+
+Two `IN` lists of one operand (`n IN (0) AND n IN (1, 2)`, also an `IN` and a `NOT IN`, or an
+`OR` of equalities of that operand) are folded by the engine to a constant before it reads a
+row, and that constant is not what three-valued logic says of a row where the operand is
+`NULL`. Where the difference shows (under a `NOT`, in a comparison, a test, a `CASE`, a function
+or a cast, in the select list, an aggregate's argument, `GROUP BY`, `ORDER BY` or `HAVING`) the
+query is refused by name; as a `WHERE` of its own, or `AND`ed with other conditions, it is
+answered. The pair of `time` is never refused (it is never `NULL`), but a tag may be `NULL`, so
+its pairs are.
 
 
 ## Checking a Query Before Running It
