@@ -38,7 +38,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLLex do
   @spec trim_both_blanks(binary()) :: binary()
   def trim_both_blanks(text), do: text |> trim_blanks() |> trim_trailing_blanks()
 
-  @blank "[ \\t\\r\\n]"
+  # The blank as a regular expression piece, for the patterns below (see `InfluxQLBlankRegex`).
+  @blank InfluxElixir.Client.Local.InfluxQLBlankRegex.blank()
 
   # The characters after which an operand cannot start: a closing parenthesis, a comparison
   # or arithmetic operator, a comma, and the characters no token of the language starts with
@@ -54,7 +55,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLLex do
   # What stands directly against a connective (`AND#n`) and is no blank, operator, quote or
   # parenthesis: the connective is not read as one and the statement is left over from it
   # (verified for each of these characters and for `é`, `٣`, U+2003 and U+00A0).
-  @glued Regex.compile!("\\A(?:[#@$?}\\]\\[\\\\`{~]|[\\x80-\\xFF])")
+  @glued_set "[#@$?}\\]\\[\\\\`{~]|[\\x80-\\xFF]"
+  @glued Regex.compile!("\\A(?:" <> @glued_set <> ")")
 
   @doc "Whether the text, which follows a connective directly, starts with a glued character."
   @spec glued?(binary()) :: boolean()
@@ -77,7 +79,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLLex do
 
   # What can start no operand after a comparison operator (verified: the error is at the end
   # of the operator): one of those characters, a connective or a dot with no digit after it.
-  @cannot_start Regex.compile!("^(?:" <> @no_operand <> "|[-+]?\\.(?!\\d)|(?:AND|OR)\\b)", "i")
+  # A connective with a quote, a carriage return or a glued character directly against it is
+  # a name there, which starts an operand (see `InfluxQLTokens`).
+  @cannot_start Regex.compile!(
+                  "^(?:" <>
+                    @no_operand <>
+                    "|[-+]?\\.(?!\\d)|(?:AND|OR)\\b(?!['\"\\r]|" <> @glued_set <> "))",
+                  "i"
+                )
 
   # A connective that a blank or a parenthesis follows (`100OR 1`): a number may end before it.
   @spaced_connective Regex.compile!("^(?:AND|OR)(?=" <> @blank <> "|\\()", "i")

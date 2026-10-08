@@ -1,5 +1,6 @@
 defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
   @moduledoc false
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
   # The carriage return that stands directly after a keyword (see `InfluxQLLex`): the engine's
   # parser does not read the keyword, and fails where it should have (verified, each of these
   # with the keyword last in the text, in the middle, and with the rest of the statement
@@ -18,16 +19,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
   #
   # Each check answers its error with the position the parser meets it at, or `nil`.
 
-  alias InfluxElixir.Client.Local.{InfluxQLCheck, InfluxQLError}
+  alias InfluxElixir.Client.Local.{InfluxQLCheck, InfluxQLError, InfluxQLLex}
 
-  @select_stage ~r/(?<![\w])(SELECT|AS|FROM)\r/i
-  @clause_stage ~r/(?<![\w])(WHERE|GROUP|BY|ORDER|ASC|DESC|LIMIT|OFFSET|SLIMIT|SOFFSET)\r/i
-  @name_stage ~r/(?<![\w])(?:fill|tz)\r[ \t\r\n]*\(/i
+  @select_stage ~q/(?<![\w])(SELECT|AS|FROM)(?:\r|[\x80-\xFF])/i
+  @clause_stage ~q/(?<![\w])(WHERE|GROUP|BY|ORDER|ASC|DESC|LIMIT|OFFSET|SLIMIT|SOFFSET)(?:\r|[\x80-\xFF])/i
+  @name_stage ~q/(?<![\w])(?:fill|tz)\r[ \t\r\n]*\(/i
   @option_stage Regex.compile!(
                   "(?<![\\w])fill[ \\t\\r\\n]*(\\()[ \\t\\r\\n+\\-]*(?:null|none|previous|linear)\\r",
                   "i"
                 )
-  @condition_end ~r/(?<![\w])(?:GROUP|ORDER|S?LIMIT|S?OFFSET|tz|fill)(?![\w])/i
 
   @call_refusal "unsupported InfluxQL (a carriage return after fill, tz or a fill() option)"
 
@@ -63,7 +63,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
         keyword_error(word, from, masked_rest, at, whole)
       end)
 
-    InfluxQLCheck.leftmost([keywords | calls(whole, at, masked_rest)])
+    InfluxQLCheck.leftmost([
+      stray(whole, at, masked_rest),
+      keywords | calls(whole, at, masked_rest)
+    ])
+  end
+
+  # What stands directly after the source (past any blanks) and starts no clause: a
+  # non-ASCII character or a control character. The statement is left over from it, whatever
+  # the clauses behind it hold (verified for U+00A0, U+2003, `é`, `٣` and U+0001, with and
+  # without a blank before it, after a name and a quoted name).
+  @spec stray(binary(), non_neg_integer(), binary()) :: InfluxQLCheck.positioned() | nil
+  defp stray(whole, at, masked_rest) do
+    blanks = byte_size(masked_rest) - byte_size(InfluxQLLex.trim_blanks(masked_rest))
+
+    case binary_part(masked_rest, blanks, min(1, byte_size(masked_rest) - blanks)) do
+      <<c>> when c >= 0x80 or c == 1 -> InfluxQLCheck.fail(:nom, at + blanks, whole)
+      _other -> nil
+    end
   end
 
   # `fill` or `tz` with a carriage return before its parenthesis is left over from its name,
@@ -71,11 +88,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
   # after the parenthesis (verified, blanks, signs and the other clauses around). Inside a
   # condition the word is a call, whose errors are another's (see `InfluxQLCheck`): refused.
   defp calls(whole, at, masked_rest) do
+    stages = condition_stages(masked_rest)
+
     names =
       for [{from, _size}] <- Regex.scan(@name_stage, masked_rest, return: :index),
           do:
             call_error(
-              masked_rest,
+              stages,
               from,
               fn -> InfluxQLCheck.fail(:nom, at + from, whole) end,
               at
@@ -85,7 +104,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
       for [{from, _size}, {paren, 1}] <- Regex.scan(@option_stage, masked_rest, return: :index),
           do:
             call_error(
-              masked_rest,
+              stages,
               from,
               fn -> InfluxQLCheck.fail(:fill, at + paren + 1, whole) end,
               at
@@ -94,24 +113,31 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
     names ++ options
   end
 
-  defp call_error(masked_rest, from, answer, at) do
-    if in_condition?(masked_rest, from),
+  defp call_error(stages, from, answer, at) do
+    if in_condition?(stages, from),
       do: InfluxQLCheck.refuse(at + from, @call_refusal),
       else: answer.()
   end
 
+  # Where a `WHERE` condition starts and ends in the text, read once: the `WHERE` keywords and
+  # the clause keywords that end a condition, as `{end of the word, :where | :end}` in order.
+  @stage ~q/(?<![\w])(?:(WHERE)|(GROUP|ORDER|S?LIMIT|S?OFFSET|tz|fill))(?![\w])/i
+
+  defp condition_stages(masked_rest) do
+    for [{from, size}, {where, _size} | _rest] <- Regex.scan(@stage, masked_rest, return: :index) do
+      {from + size, if(where == from, do: :where, else: :end)}
+    end
+  end
+
   # Whether the text at `from` stands in a `WHERE` condition: after a `WHERE` with no clause
-  # keyword between.
-  defp in_condition?(masked_rest, from) do
-    before = binary_part(masked_rest, 0, from)
-
-    case List.last(Regex.scan(~r/(?<![\w])WHERE(?![\w])/i, before, return: :index)) do
-      nil ->
-        false
-
-      [{where, size}] ->
-        since = binary_part(before, where + size, byte_size(before) - where - size)
-        not Regex.match?(@condition_end, since)
+  # keyword between. The last keyword that ends before `from` decides.
+  defp in_condition?(stages, from) do
+    stages
+    |> Enum.take_while(fn {stop, _kind} -> stop <= from end)
+    |> List.last()
+    |> case do
+      {_stop, :where} -> true
+      _end_or_none -> false
     end
   end
 
@@ -119,8 +145,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
     before = binary_part(masked_rest, 0, from)
 
     cond do
-      before =~ ~r/(?<![\w])ORDER\s+BY\s+time\s+\z/i -> InfluxQLCheck.fail(:nom, at + from, whole)
-      before =~ ~r/(?<![\w])ORDER\s+BY\s+\z/i -> InfluxQLCheck.fail(:order_time, at + from, whole)
+      before =~ ~q/(?<![\w])ORDER\s+BY\s+time\s+\z/i -> InfluxQLCheck.fail(:nom, at + from, whole)
+      before =~ ~q/(?<![\w])ORDER\s+BY\s+\z/i -> InfluxQLCheck.fail(:order_time, at + from, whole)
       true -> nil
     end
   end
@@ -129,10 +155,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
     before = binary_part(masked_rest, 0, from)
 
     cond do
-      before =~ ~r/(?<![\w])GROUP\s+\z/i ->
+      before =~ ~q/(?<![\w])GROUP\s+\z/i ->
         InfluxQLCheck.fail(:group_by, at + from, whole)
 
-      order = Regex.run(~r/(?<![\w])ORDER\s+\z/i, before, return: :index) ->
+      order = Regex.run(~q/(?<![\w])ORDER\s+\z/i, before, return: :index) ->
         [{order_at, _size}] = order
         InfluxQLCheck.fail(:nom, at + order_at, whole)
 

@@ -68,11 +68,19 @@ defmodule InfluxElixir.Client.Local.Scope do
   `opts[:database]`, then the connection-level default; neither is the HTTP
   client's error.
   """
-  @spec resolve_database(keyword(), map()) :: {:ok, binary()} | {:error, :no_database_specified}
+  @spec resolve_database(keyword(), map()) ::
+          {:ok, binary()} | {:error, :no_database_specified | map()}
   def resolve_database(opts, conn) do
     case Keyword.get(opts, :database) || Map.get(conn, :database) do
-      nil -> {:error, :no_database_specified}
-      database -> {:ok, database}
+      nil ->
+        {:error, :no_database_specified}
+
+      database when is_binary(database) ->
+        {:ok, database}
+
+      # No engine answer exists for a name that is not text: refused by name, never raised.
+      _not_text ->
+        {:error, %{status: 400, body: "Client.Local: the database name is not a string"}}
     end
   end
 

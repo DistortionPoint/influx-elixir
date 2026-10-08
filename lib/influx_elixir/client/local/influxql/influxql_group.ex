@@ -1,5 +1,6 @@
 defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   @moduledoc false
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
   # The `GROUP BY` clause of an InfluxQL `SELECT` and the `fill()` after it, read
   # the way the engine's parser reads them (verified), with its errors at its
   # positions:
@@ -51,7 +52,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
         }
 
   @types ~w(float integer unsigned string boolean field tag)
-  @after_clause ~r/^(?:ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)(?![\w])|^tz\s*\(/i
+  @after_clause ~q/^(?:ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)(?![\w])|^tz\s*\(/i
 
   @doc """
   Reads the `GROUP BY` clause (and the `fill()` after it) of `masked_rest`, the
@@ -66,7 +67,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   @spec extract(binary(), non_neg_integer(), binary()) ::
           {:none | {:ok, t()} | {:error, term()}, binary(), binary()}
   def extract(whole, at, masked_rest) do
-    with [{from, length}] <- Regex.run(~r/\bGROUP\s+BY(?![\w])/i, masked_rest, return: :index),
+    with [{from, length}] <- Regex.run(~q/\bGROUP\s+BY(?![\w])/i, masked_rest, return: :index),
          true <- plain_before?(binary_part(masked_rest, 0, from)),
          text = binary_part(whole, at, byte_size(masked_rest)),
          start = from + length,
@@ -90,13 +91,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   @spec plain_before?(binary()) :: boolean()
   defp plain_before?(before) do
     cond do
-      before =~ ~r/^\s*$/ -> true
-      before =~ ~r/\b(?:ORDER|S?LIMIT|S?OFFSET)\b/i -> false
+      before =~ ~q/^\s*$/ -> true
+      before =~ ~q/\b(?:ORDER|S?LIMIT|S?OFFSET)\b/i -> false
       # A `fill()` before it ends the clauses `GROUP BY` may follow: what comes after is left
       # over (see `InfluxQLCheck.cut_where/2`).
       before =~ InfluxQLText.fill_call() -> false
       before =~ InfluxQLText.open_operand() -> false
-      true -> before =~ ~r/^\s*WHERE\s+\S/i
+      true -> before =~ ~q/^\s*WHERE\s+\S/i
     end
   end
 
@@ -169,7 +170,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
       String.starts_with?(rest, "*") -> wildcard(ctx, pos)
       String.starts_with?(rest, "/") -> regex(ctx, pos)
       String.starts_with?(rest, "\"") -> quoted(ctx, pos)
-      rest =~ ~r/^time(?![\w])/i and not (rest =~ ~r/^time\s*::/i) -> time_call(ctx, pos)
+      rest =~ ~q/^time(?![\w])/i and not (rest =~ ~q/^time\s*::/i) -> time_call(ctx, pos)
       true -> bare(ctx, pos, rest)
     end
   end
@@ -204,7 +205,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   defp quoted(ctx, pos) do
     rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
 
-    case Regex.run(~r/^"(?:[^"\\]|\\.)*"/s, rest) do
+    case Regex.run(~q/^"(?:[^"\\]|\\.)*"/s, rest) do
       [quoted] ->
         name = InfluxQLText.unquote_ident(quoted)
         named(ctx, name, pos + byte_size(quoted))
@@ -215,7 +216,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   end
 
   defp bare(ctx, pos, rest) do
-    case Regex.run(~r/^[A-Za-z_][A-Za-z0-9_]*/, rest) do
+    case Regex.run(~q/^[A-Za-z_][A-Za-z0-9_]*/, rest) do
       [word] ->
         if InfluxQLText.reserved_start(rest) != nil,
           do: :none,
@@ -245,7 +246,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
       rest = binary_part(ctx.text, pos + 2, byte_size(ctx.text) - pos - 2)
       alternatives = Enum.join(types, "|")
 
-      case Regex.run(~r/^(?:#{alternatives})(?![\w:])/i, rest) do
+      case Regex.run(~q/^(?:#{alternatives})(?![\w:])/i, rest) do
         [word] -> {:ok, pos + 2 + byte_size(word)}
         nil -> fail(ctx, kind, pos + 2)
       end
@@ -329,10 +330,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
 
     cond do
-      rest =~ ~r/^now\s*\(/i ->
+      rest =~ ~q/^now\s*\(/i ->
         {:error, "unsupported InfluxQL (GROUP BY time() offset of now())"}
 
-      match = Regex.run(~r/^'([^'\\]*)'/, rest) ->
+      match = Regex.run(~q/^'([^'\\]*)'/, rest) ->
         timestamp_offset(ctx, every, pos, match)
 
       true ->
@@ -366,7 +367,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   defp duration(text, pos) do
     rest = binary_part(text, pos, byte_size(text) - pos)
 
-    case Regex.run(~r/^([+-]?)((?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+)/, rest) do
+    case Regex.run(~q/^([+-]?)((?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+)/, rest) do
       [whole, sign, parts] ->
         total = duration_total(parts)
 
@@ -375,7 +376,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
           else: {:ok, if(sign == "-", do: -total, else: total), pos + byte_size(whole)}
 
       nil ->
-        case Regex.run(~r/^[+-]?\d+/, rest) do
+        case Regex.run(~q/^[+-]?\d+/, rest) do
           [digits] -> {:integer, pos + byte_size(digits)}
           nil -> :none
         end
@@ -383,7 +384,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   end
 
   defp duration_total(parts) do
-    ~r/(\d+)(ns|ms|u|µ|s|m|h|d|w)/
+    ~q/(\d+)(ns|ms|u|µ|s|m|h|d|w)/
     |> Regex.scan(parts)
     |> Enum.reduce(0, fn [_all, count, unit], total ->
       total + String.to_integer(count) * Durations.ns(unit)
@@ -403,7 +404,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     pos = skip(ctx.text, stop)
     rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
 
-    with [word] <- Regex.run(~r/^fill(?![\w])/i, rest),
+    with [word] <- Regex.run(~q/^fill(?![\w])/i, rest),
          open = skip(ctx.text, pos + byte_size(word)),
          ?( <- byte_at(ctx.text, open) do
       fill_option(ctx, open + 1, stop)
@@ -453,7 +454,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   @spec option(binary()) :: {:ok, InfluxQLBuckets.fill(), non_neg_integer()} | :error
   defp option(rest) do
     case Regex.run(
-           ~r/^(?:(null|none|previous|linear)(?![\w])|([+-]?)[ \t\r\n]*(\d*\.\d+|\d+))/i,
+           ~q/^(?:(null|none|previous|linear)(?![\w])|([+-]?)[ \t\r\n]*(\d*\.\d+|\d+))/i,
            rest
          ) do
       [word, keyword] when keyword != "" and byte_size(word) > 0 ->
@@ -555,7 +556,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   # The position after the blanks that start at `pos`.
   @spec skip(binary(), non_neg_integer()) :: non_neg_integer()
   defp skip(text, pos) do
-    case text |> binary_part(pos, byte_size(text) - pos) |> then(&Regex.run(~r/^\s*/, &1)) do
+    case text |> binary_part(pos, byte_size(text) - pos) |> then(&Regex.run(~q/^\s*/, &1)) do
       [blanks] -> pos + byte_size(blanks)
     end
   end

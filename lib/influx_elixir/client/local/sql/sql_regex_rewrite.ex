@@ -24,6 +24,14 @@ defmodule InfluxElixir.Client.Local.SQLRegexRewrite do
   # name (`unverified/2`); a pattern the rewrite leaves alone is run as written. The reader of
   # the pattern is the one `SQLRustRegex.check/1` has passed: its groups, escapes and classes
   # are the ones that reader knows.
+  #
+  # A pattern that is such an equality is declined for `~*` and `!~*` only when a literal
+  # holds a cased character (one whose upcase or downcase differs from it): with none, the
+  # equality and the case folding keep the same rows (`^2023$`, `^1$`, `^(?i)1$`).
+  #
+  # Preconditions: the pattern passed `SQLRustRegex.check/1`. The module does not rely on it
+  # to be total, though: an unknown flag leaves the flags as they are, and a `\x` escape that
+  # is no character (a surrogate, a code beyond Unicode) is no literal, whatever the reader.
 
   @backslash "a literal backslash (the engine turns a pattern of literals into a LIKE and " <>
                "leaves the backslash its escape)"
@@ -85,7 +93,8 @@ defmodule InfluxElixir.Client.Local.SQLRegexRewrite do
     end
   end
 
-  @typep item :: :start | :end | :lit | :other | {:group, [[item()]]} | {:cap, [[item()]]}
+  @typep item ::
+           :start | :end | :lit | :cased | :other | {:group, [[item()]]} | {:cap, [[item()]]}
   @typep flags :: %{ignore_case: boolean(), multi_line: boolean()}
 
   # The alternatives of a pattern or of a group, up to its `)` (taken) or the end of the text.
@@ -164,32 +173,50 @@ defmodule InfluxElixir.Client.Local.SQLRegexRewrite do
     {[{kind, alts} | items], outer, rest}
   end
 
-  # `(?s)` changes how `.` reads, which no literal depends on.
+  # `(?s)` changes how `.` reads, which no literal depends on; any other flag leaves the flags
+  # as they are.
   @spec set_flag(flags(), binary()) :: flags()
-  defp set_flag(flags, "i"), do: %{flags | ignore_case: true}
-  defp set_flag(flags, "m"), do: %{flags | multi_line: true}
-  defp set_flag(flags, "s"), do: flags
+  defp set_flag(flags, flag) do
+    case flag do
+      "i" -> %{flags | ignore_case: true}
+      "m" -> %{flags | multi_line: true}
+      _other -> flags
+    end
+  end
 
-  # A character is a literal unless `(?i)` is on and it has a case (the engine reads it as the
-  # set of its cases then).
-  @spec literal(binary(), flags()) :: :lit | :other
-  defp literal(char, %{ignore_case: true}), do: if(cased?(char), do: :other, else: :lit)
-  defp literal(_char, %{ignore_case: false}), do: :lit
+  # What a character is: a literal with no case (`:lit`), a literal with a case (`:cased`), or
+  # not a literal (`:other`: nothing, or a character that has a case while `(?i)` is on, which
+  # the engine reads as the set of its cases). Keyed by `{is a character, has a case, (?i)}`.
+  @kinds %{
+    {false, false, false} => :other,
+    {false, false, true} => :other,
+    {true, false, false} => :lit,
+    {true, false, true} => :lit,
+    {true, true, false} => :cased,
+    {true, true, true} => :other
+  }
+
+  @spec literal(binary() | nil, flags()) :: :lit | :cased | :other
+  defp literal(char, flags) do
+    character? = is_binary(char)
+    Map.fetch!(@kinds, {character?, character? and cased?(char), flags.ignore_case})
+  end
 
   @spec cased?(binary()) :: boolean()
   defp cased?(char), do: String.downcase(char) != char or String.upcase(char) != char
 
   @hex_digits ~w(0 1 2 3 4 5 6 7 8 9 a b c d e f)
 
-  # The character of hex digits (`SQLRustRegex.check/1` read them as a character).
-  @spec hex([binary()]) :: binary()
+  # The character of hex digits, or `nil` when they are no character (a surrogate or a code
+  # beyond Unicode), which is no literal.
+  @spec hex([binary()]) :: binary() | nil
   defp hex(digits) do
     code =
       Enum.reduce(digits, 0, fn digit, sum ->
         sum * 16 + (Enum.find_index(@hex_digits, &(&1 == String.downcase(digit))) || 0)
       end)
 
-    <<code::utf8>>
+    if code in 0..0x10FFFF and code not in 0xD800..0xDFFF, do: <<code::utf8>>
   end
 
   @spec repeat(binary()) :: :once | :zero | :many
@@ -265,8 +292,12 @@ defmodule InfluxElixir.Client.Local.SQLRegexRewrite do
   defp member(["\\", char | rest]), do: {span(Map.get(@controls, char, char)), rest}
   defp member([char | rest]), do: {span(char), rest}
 
-  @spec span(binary()) :: {non_neg_integer(), non_neg_integer()}
-  defp span(<<code::utf8>>), do: {code, code}
+  # A character that is none (see `hex/1`) stands for every code point: no class of one.
+  @spec span(binary() | nil) :: {non_neg_integer(), non_neg_integer()}
+  defp span(char) do
+    for(<<code::utf8 <- to_string(char)>>, do: code)
+    |> Enum.reduce(@everything_span, fn code, _span -> {code, code} end)
+  end
 
   # Plain groups are no node of the engine's tree, their items stand in their place; a plain
   # group of alternatives is not a literal.
@@ -290,9 +321,16 @@ defmodule InfluxElixir.Client.Local.SQLRegexRewrite do
   defp rewritten?(_items), do: false
 
   @spec literal_body?([item()]) :: boolean()
-  defp literal_body?([{:cap, alternatives}]), do: Enum.all?(alternatives, &literals?/1)
-  defp literal_body?(middle), do: literals?(middle)
+  defp literal_body?([{:cap, alternatives}]), do: cased_literals?(alternatives)
+  defp literal_body?(middle), do: cased_literals?([middle])
+
+  # The equality loses nothing to the operator's case folding when no character has a case
+  # (`^2023$`: the rows equal to the text are the rows that match it in any case), so only
+  # literals that hold a cased character are the ones the double declines.
+  @spec cased_literals?([[item()]]) :: boolean()
+  defp cased_literals?(alternatives),
+    do: Enum.all?(alternatives, &literals?/1) and Enum.any?(alternatives, &(:cased in &1))
 
   @spec literals?([item()]) :: boolean()
-  defp literals?(items), do: items != [] and Enum.all?(items, &(&1 == :lit))
+  defp literals?(items), do: items != [] and Enum.all?(items, &(&1 in [:lit, :cased]))
 end

@@ -77,6 +77,9 @@ defmodule InfluxElixir.Flight.Client do
   ## Returns
 
     * `{:ok, [map()]}` — list of row maps (column name → value)
+    * `{:error, {:ipv6_unsupported, host}}` — the host is an IPv6 address: the gRPC
+      client cannot connect to one (verified against InfluxDB 3 Core, which answers on
+      `[::1]` over HTTP); use the HTTP transport for it
     * `{:error, term()}` — gRPC or decode error
 
   ## Example
@@ -113,7 +116,14 @@ defmodule InfluxElixir.Flight.Client do
 
   @spec connect(connection(), keyword()) :: {:ok, GRPC.Channel.t()} | {:error, term()}
   defp connect(connection, opts) do
-    host = Map.fetch!(connection, :host)
+    case Map.fetch!(connection, :host) do
+      "[" <> _address = host -> {:error, {:ipv6_unsupported, host}}
+      host -> connect(host, connection, opts)
+    end
+  end
+
+  @spec connect(binary(), connection(), keyword()) :: {:ok, GRPC.Channel.t()} | {:error, term()}
+  defp connect(host, connection, opts) do
     port = Map.get(connection, :port, @default_port)
     use_tls = Keyword.get(opts, :tls, port == 443)
     connect_timeout = resolve_connect_timeout(opts)

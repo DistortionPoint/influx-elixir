@@ -81,6 +81,16 @@ defmodule InfluxElixir.Flight.ClientTest do
       end
     end
 
+    # The gRPC client cannot connect to an IPv6 address (verified against Core, which answers
+    # on [::1] over HTTP): a clear error before any connection, where it raised or said
+    # :no_addresses.
+    test "an IPv6 host is an error that names it, before any connection" do
+      for host <- ["[::1]", "[fe80::1]"] do
+        conn = %{host: host, port: 8181, token: "tok", database: "db"}
+        assert Client.query(conn, "SELECT 1", tls: false) === {:error, {:ipv6_unsupported, host}}
+      end
+    end
+
     test "raises KeyError when database is missing" do
       conn = %{host: "localhost", token: "tok"}
 

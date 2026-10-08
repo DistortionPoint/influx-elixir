@@ -1,5 +1,6 @@
 defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   @moduledoc false
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
   # The tokens of an InfluxQL `WHERE`, read as the engine's parser reads them:
   # strings, quoted identifiers, regular expressions, numbers, durations,
   # operators and words. What the parser cannot read comes back as
@@ -26,6 +27,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
   @doc false
   def tokenize(<<>>, acc), do: {:ok, Enum.reverse(acc)}
+  # A `.` that stands after an operand and a blank is where the condition ends (a dotted name
+  # has no blank in it; verified: `x .y`, `3 .`, `(3) .`, `'a' .`, `true .`, `now() .`).
+  def tokenize(<<c, rest::binary>>, [previous | _before] = acc) when InfluxQLLex.is_blank(c) do
+    trimmed = InfluxQLLex.trim_blanks(rest)
+
+    if String.starts_with?(trimmed, ".") and operand_end?(previous),
+      do: {:syntax_error, :nom, trimmed},
+      else: tokenize(rest, acc)
+  end
+
   def tokenize(<<c, rest::binary>>, acc) when InfluxQLLex.is_blank(c), do: tokenize(rest, acc)
 
   # A token that follows an operand with no operator between them is where the engine's
@@ -151,7 +162,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # pattern: it would check the whole text for UTF-8 at every token).
   @lexeme Regex.compile!(
             "^(?:((?:\\d+(?:ns|ms|u|µ|s|m|h|d|w))+)|(\\d*\\.\\d+|\\d+)|" <>
-              "(now\\s*\\(\\s*\\))|([A-Za-z_]\\w*))"
+              InfluxElixir.Client.Local.InfluxQLBlankRegex.blank_pattern(
+                "((?i:now)\\s*\\(\\s*\\))|([A-Za-z_]\\w*))"
+              )
           )
 
   defp lex(text, acc) do
@@ -199,7 +212,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp duration_total(<<>>, _rest, total), do: {:ok, total}
 
   defp duration_total(text, rest, total) do
-    [part, n, unit] = Regex.run(~r/^(\d+)(ns|ms|u|µ|s|m|h|d|w)/, text)
+    [part, n, unit] = Regex.run(~q/^(\d+)(ns|ms|u|µ|s|m|h|d|w)/, text)
     count = String.to_integer(n)
     after_count = binary_part(text, byte_size(n), byte_size(text) - byte_size(n)) <> rest
     after_part = binary_part(text, byte_size(part), byte_size(text) - byte_size(part))
@@ -244,6 +257,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp leftover_token?({:regex, _pattern}, text),
     do: Regex.match?(@after_regex, text) and not connective?(text)
 
+  # A parenthesis after `now()` or a boolean is left over: neither names a call.
+  defp leftover_token?({:raw, word}, <<?(, _rest::binary>>) when is_binary(word),
+    do: String.upcase(word) in ["NOW()", "TRUE", "FALSE"]
+
   defp leftover_token?(previous, text),
     do: operand_end?(previous) and Regex.match?(@after_operand, text) and not connective?(text)
 
@@ -254,7 +271,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp operand_end?(_token), do: false
 
   @spec connective?(binary()) :: boolean()
-  defp connective?(text), do: Regex.match?(~r/^(?:AND|OR)(?![\w])/i, text)
+  defp connective?(text), do: Regex.match?(~q/^(?:AND|OR)(?![\w])/i, text)
 
   # An integer literal fits the unsigned 64-bit range, a negated one the
   # signed range; a number with a fraction has no range.
@@ -287,19 +304,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   @spec word_token(binary(), binary(), binary(), list()) ::
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
   defp word_token("NOT", word, rest, acc) do
-    if Regex.match?(~r/^\s*(?!(?:AND|OR)\b)[A-Za-z_0-9."']/i, rest),
+    if Regex.match?(~q/^\s*(?!(?:AND|OR)\b)[A-Za-z_0-9."']/i, rest),
       do: {:syntax_error, :nom, InfluxQLLex.trim_blanks(rest)},
       else: tokenize(rest, [{:ident, word} | acc])
   end
 
+  # `AND` or `OR` where an operand is wanted is a name when a quote, a glued character or a
+  # carriage return stands directly against it (it is no connective there: verified at the
+  # start of the condition, after a comparison, a sign and a connective): the name is an
+  # operand and what follows it is left over as after any operand. Inside parentheses the
+  # whole group fails, which the double places at the `WHERE`.
   defp word_token(upcased, word, rest, acc) when upcased in ["AND", "OR"] do
     cond do
+      name_position?(acc, rest) -> operand_token({:ident, word}, rest, acc)
       reserved_kind(acc) != :nom -> {:syntax_error, reserved_kind(acc), word <> rest}
       InfluxQLLex.cr_after?(rest, 0) -> {:syntax_error, :nom, word <> rest}
       InfluxQLLex.glued?(rest) -> {:syntax_error, :nom, word <> rest}
       InfluxQLLex.trim_both_blanks(rest) == "" -> {:syntax_error, :operand, rest}
       InfluxQLLex.operand_missing?(rest) -> {:syntax_error, :operand, rest}
-      Regex.match?(~r/\A['".]/, rest) -> {:syntax_error, :nom, word <> rest}
+      Regex.match?(~q/\A['".]/, rest) -> {:syntax_error, :nom, word <> rest}
       String.starts_with?(InfluxQLLex.trim_blanks(rest), "/") -> {:syntax_error, :operand, rest}
       true -> tokenize(rest, [{:raw, word} | acc])
     end
@@ -309,6 +332,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     if InfluxQLText.reserved?(word) and not String.starts_with?(rest, ":"),
       do: {:syntax_error, reserved_kind(acc), word <> rest},
       else: operand_token(plain_word(upcased, word), rest, acc)
+  end
+
+  @spec name_position?(list(), binary()) :: boolean()
+  defp name_position?(acc, rest) do
+    reserved_kind(acc) != :nom and open_parens(acc) == 0 and
+      (InfluxQLLex.cr_after?(rest, 0) or InfluxQLLex.glued?(rest) or
+         Regex.match?(~q/\A['"]/, rest))
   end
 
   # A minus sign takes a number, a name, a call or a parenthesis; before a string or a

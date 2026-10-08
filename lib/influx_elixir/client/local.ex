@@ -691,7 +691,8 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()
-  def write(conn, payload, opts \\ []), do: Writes.write(conn, payload, opts)
+  def write(conn, payload, opts \\ []),
+    do: text(payload, "line protocol", fn -> Writes.write(conn, payload, opts) end)
 
   # ---------------------------------------------------------------------------
   # SQL Query
@@ -708,7 +709,8 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
-  def query_sql(conn, sql, opts \\ []), do: SQLQuery.query_sql(conn, sql, opts)
+  def query_sql(conn, sql, opts \\ []),
+    do: text(sql, "SQL text", fn -> SQLQuery.query_sql(conn, sql, opts) end)
 
   @doc """
   Executes a SQL query and returns results as a lazy `Stream`.
@@ -730,7 +732,18 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           keyword()
         ) :: Enumerable.t()
-  def query_sql_stream(conn, sql, opts \\ []), do: SQLQuery.query_sql_stream(conn, sql, opts)
+  def query_sql_stream(conn, sql, opts \\ [])
+
+  def query_sql_stream(conn, sql, opts) when is_binary(sql),
+    do: SQLQuery.query_sql_stream(conn, sql, opts)
+
+  def query_sql_stream(_conn, _sql, _opts) do
+    InfluxElixir.StreamError.stream(
+      kind: :http_status,
+      status: 400,
+      body: "Client.Local: the SQL text is not a string"
+    )
+  end
 
   @doc """
   Executes a SQL statement as InfluxDB 3 does (verified against Core).
@@ -754,7 +767,8 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map() | [map()]} | {:error, term()}
-  def execute_sql(conn, sql, opts \\ []), do: SQLQuery.execute_sql(conn, sql, opts)
+  def execute_sql(conn, sql, opts \\ []),
+    do: text(sql, "SQL text", fn -> SQLQuery.execute_sql(conn, sql, opts) end)
 
   # ---------------------------------------------------------------------------
   # InfluxQL and Flux queries
@@ -801,7 +815,8 @@ defmodule InfluxElixir.Client.Local do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(conn, influxql, opts \\ []),
-    do: InfluxQLQuery.query_influxql(conn, influxql, opts)
+    do:
+      text(influxql, "InfluxQL text", fn -> InfluxQLQuery.query_influxql(conn, influxql, opts) end)
 
   @doc """
   Executes a Flux query as InfluxDB 2 does. The pipeline starts with
@@ -824,7 +839,16 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
-  def query_flux(conn, flux, opts \\ []), do: FluxQuery.query_flux(conn, flux, opts)
+  def query_flux(conn, flux, opts \\ []),
+    do: text(flux, "Flux text", fn -> FluxQuery.query_flux(conn, flux, opts) end)
+
+  # A statement or a body that is not text has no engine answer the double could match: it
+  # is refused by name, never raised (`Client.HTTP` sends what JSON can encode).
+  @spec text(term(), binary(), (-> result)) :: result | {:error, map()} when result: term()
+  defp text(value, _what, run) when is_binary(value), do: run.()
+
+  defp text(_value, what, _run),
+    do: {:error, %{status: 400, body: "Client.Local: the #{what} is not a string"}}
 
   # ---------------------------------------------------------------------------
   # Database admin

@@ -560,6 +560,11 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           check_fix(ctx, InfluxQLDefectCases.lexing())
         end
 
+        test "keywords against non-blank characters, SHOW words, AND and OR as names, and what follows tz() or a dot",
+             ctx do
+          check_fix(ctx, InfluxQLDefectCases.blanks())
+        end
+
         test "the pattern .* is answered as the expression reads, not rewritten", ctx do
           check_fix(ctx, InfluxQLDefectCases.any_regex())
         end

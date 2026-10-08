@@ -1,5 +1,6 @@
 defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   @moduledoc false
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
   # The checks the engine's parser makes on the select list and `FROM`, each
   # reporting the position the engine reports (see
   # `InfluxElixir.Client.Local.InfluxQLError`).
@@ -12,12 +13,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     InfluxQLText
   }
 
-  @select_start ~r/^\s*SELECT(?![\w])\s*/i
-  @regex_column ~r/^\/(?:[^\/\\]|\\.)+\/(?:\s+AS\s+(?:"[^"]+"|\w+))?$/s
+  @select_start ~q/^\s*SELECT(?![\w])\s*/i
+  @regex_column ~q/^\/(?:[^\/\\]|\\.)+\/(?:\s+AS\s+(?:"[^"]+"|\w+))?$/s
 
   # An operator, what follows it up to the operand (signs and opening
   # parentheses) and the word the operand starts with.
-  @operand ~r/([+\-*\/%&|^])\s*()(?:[+\-(]\s*)*([A-Za-z_]\w*)(?![\w])/
+  @operand ~q/([+\-*\/%&|^])\s*()(?:[+\-(]\s*)*([A-Za-z_]\w*)(?![\w])/
 
   # The select list and `FROM`, as the engine's parser reads them (verified):
   #
@@ -103,13 +104,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   end
 
   @spec skip_signs(binary()) :: binary()
-  defp skip_signs(text), do: Regex.replace(~r/^(?:[+\-]\s*)+/, text, "")
+  defp skip_signs(text), do: Regex.replace(~q/^(?:[+\-]\s*)+/, text, "")
 
   # Whether a field can begin with the text: a name, a quoted name or string, a number, a
   # duration, a wildcard, a regular expression, a parenthesis or a bind parameter. Any other
   # character (`,`, `#`, `)`, a `.` with no digit after it) is where the engine expects a field.
   @spec field_start?(binary()) :: boolean()
-  defp field_start?(text), do: Regex.match?(~r/^(?:[A-Za-z_"'*\/(\d]|\.\d|\$\w)/, text)
+  defp field_start?(text), do: Regex.match?(~q/^(?:[A-Za-z_"'*\/(\d]|\.\d|\$\w)/, text)
 
   # `DISTINCT` is read by the select list, not refused as a reserved word.
   @spec reserved_item?(binary()) :: boolean()
@@ -128,7 +129,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
           | :none
   defp from_keyword(masked, items_at) do
     candidates =
-      for [{at, length}] <- Regex.scan(~r/\sFROM(?![\w])\s*/i, masked, return: :index),
+      for [{at, length}] <- Regex.scan(~q/\sFROM(?![\w])\s*/i, masked, return: :index),
           at >= items_at,
           do: {at, length}
 
@@ -155,9 +156,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   @spec operator_before(binary()) :: {byte(), non_neg_integer()} | nil
   defp operator_before(text) do
     # A regular expression for a column (`SELECT /re/ FROM`) ends in a slash too.
-    with false <- text =~ ~r/(?:^|,)\s*\/(?:[^\/\\]|\\.)+\/\s*$/s,
+    with false <- text =~ ~q/(?:^|,)\s*\/(?:[^\/\\]|\\.)+\/\s*$/s,
          [_all, {at, 1}, {operand_at, 0}] <-
-           Regex.run(~r/([+\-*\/%&|^])\s*()(?:[+\-(]\s*)*$/, text, return: :index),
+           Regex.run(~q/([+\-*\/%&|^])\s*()(?:[+\-(]\s*)*$/, text, return: :index),
          true <- binary_operator?(text, at) do
       {:binary.at(text, at), operand_at}
     else
@@ -171,7 +172,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     text
     |> binary_part(0, at)
     |> InfluxQLLex.trim_trailing_blanks()
-    |> String.match?(~r/[\w)"']$/)
+    |> String.match?(~q/[\w)"']$/)
   end
 
   @spec operator_body(byte(), non_neg_integer(), binary()) :: binary()
@@ -186,7 +187,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     rest = binary_part(masked, from_end, byte_size(masked) - from_end)
 
     if rest == "" or InfluxQLText.reserved_start(rest) != nil or
-         not (rest =~ ~r/^[A-Za-z_"\/(]/),
+         not (rest =~ ~q/^[A-Za-z_"\/(]/),
        do: engine(from_end, InfluxQLError.syntax_error_body(:from, from_end, masked)),
        else: nil
   end
@@ -306,7 +307,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # fails as "expected field" where the list starts, a later one, or a dot in an alias, leaves
   # the statement unparsed. In a call's arguments, and as the operand of a binary operator, it
   # is another failure (see `InfluxQLArgs` and `operator_hit/3`).
-  @dotted ~r/(?<![\w.])(?:[A-Za-z_]\w*|"_*")(?:\.\s*(?:[A-Za-z_]\w*|"_*"))*\./
+  @dotted ~q/(?<![\w.])(?:[A-Za-z_]\w*|"_*")(?:\.\s*(?:[A-Za-z_]\w*|"_*"))*\./
 
   @spec dangling_dot(binary()) :: :alias | :field | nil
   defp dangling_dot(text) do
@@ -318,14 +319,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
       before = text |> binary_part(0, from) |> InfluxQLLex.trim_trailing_blanks()
 
       cond do
-        next =~ ~r/\A(?:[A-Za-z_]|")/ and InfluxQLText.reserved_start(next) == nil -> nil
+        next =~ ~q/\A(?:[A-Za-z_]|")/ and InfluxQLText.reserved_start(next) == nil -> nil
         # `m.*` and `m./re/` are qualified wildcards, read elsewhere.
-        next =~ ~r/\A[*\/]/ -> nil
+        next =~ ~q/\A[*\/]/ -> nil
         # Only a name that stands where an item or an operand starts can be one: after an operand
         # (`(n)f.`) the item is left over from the name, after an operator or in a call other
         # errors come first (see `operator_hit/3` and `InfluxQLArgs`).
-        before =~ ~r/(?:\A|\s)AS\z/i -> :alias
-        inside_call?(before) or before =~ ~r/(?:[\w)"']|[+\-*\/%&|^])\z/ -> nil
+        before =~ ~q/(?:\A|\s)AS\z/i -> :alias
+        inside_call?(before) or before =~ ~q/(?:[\w)"']|[+\-*\/%&|^])\z/ -> nil
         true -> :field
       end
     end)
@@ -351,7 +352,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
       text
       |> binary_part(0, at)
       |> InfluxQLLex.trim_trailing_blanks()
-      |> String.match?(~r/[A-Za-z_]\w*\z/)
+      |> String.match?(~q/[A-Za-z_]\w*\z/)
 
   @spec dangling_dot_body(:alias | :field, non_neg_integer(), non_neg_integer(), binary()) ::
           binary()
@@ -380,7 +381,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # and then the statement. A text with a regular expression is not read for them.
   @spec stray?(binary()) :: boolean()
   defp stray?(text) do
-    not Regex.match?(~r{(?:^|[(,])\s*/}, text) and
+    not Regex.match?(~q{(?:^|[(,])\s*/}, text) and
       (String.contains?(text, "#") or excess_close?(String.to_charlist(text), 0))
   end
 
@@ -397,9 +398,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # expression is not read for numbers.
   @spec number_leftover?(binary()) :: boolean()
   defp number_leftover?(text) do
-    not Regex.match?(~r{(?:^|[(,])\s*/}, text) and
+    not Regex.match?(~q{(?:^|[(,])\s*/}, text) and
       Regex.match?(
-        ~r/(?<![\w.])(?>(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+|\d*\.\d+|\d+)(?=[A-Za-z0-9_.])/,
+        ~q/(?<![\w.])(?>(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+|\d*\.\d+|\d+)(?=[A-Za-z0-9_.])/,
         text
       )
   end
@@ -439,7 +440,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
 
   @spec argument_hit(binary(), non_neg_integer(), binary()) :: {non_neg_integer(), binary()} | nil
   defp argument_hit(text, start, whole) do
-    ~r/[A-Za-z_]\w*\s*\(\s*([A-Za-z_]\w*)/
+    ~q/[A-Za-z_]\w*\s*\(\s*([A-Za-z_]\w*)/
     |> Regex.scan(text, return: :index)
     |> Enum.find_value(fn [_all, {from, _length}] ->
       <<_skip::binary-size(from), word_and_rest::binary>> = text
@@ -456,7 +457,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   @spec reserved_argument(binary(), non_neg_integer(), binary()) ::
           {non_neg_integer(), binary()} | nil
   defp reserved_argument(word_and_rest, at, whole) do
-    case Regex.run(~r/^distinct(\s*)(\S?)/i, word_and_rest, return: :index) do
+    case Regex.run(~q/^distinct(\s*)(\S?)/i, word_and_rest, return: :index) do
       [_all, {_start, spaces}, {token_at, token_size}] ->
         token = binary_part(word_and_rest, token_at, token_size)
         distinct_hit(token, spaces, at, token_at, whole)
@@ -468,7 +469,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
 
   defp distinct_hit(token, spaces, at, token_at, whole) do
     cond do
-      token == "(" or (spaces > 0 and token =~ ~r/^[A-Za-z_"]$/) -> nil
+      token == "(" or (spaces > 0 and token =~ ~q/^[A-Za-z_"]$/) -> nil
       token in [")", ""] -> {at, InfluxQLError.syntax_error_body(:failure, at, whole)}
       true -> {at, InfluxQLError.syntax_error_body(:distinct, at + token_at, whole)}
     end
@@ -507,7 +508,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   @spec wildcard_hit(binary(), non_neg_integer(), binary()) ::
           {non_neg_integer(), binary()} | nil
   defp wildcard_hit(text, start, whole) do
-    ~r{[A-Za-z_]\w*\s*\(\s*(?:/(?:[^/\\]|\\.)+/\s*(?=[^)\s])|\*\s*(?=,\s*\)))}
+    ~q{[A-Za-z_]\w*\s*\(\s*(?:/(?:[^/\\]|\\.)+/\s*(?=[^)\s])|\*\s*(?=,\s*\)))}
     |> Regex.scan(text, return: :index)
     |> Enum.find_value(fn [{from, length}] ->
       {start + from, InfluxQLError.syntax_error_body(:failure, start + from + length, whole)}
@@ -518,14 +519,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   @spec reserved_alias(binary(), non_neg_integer()) :: non_neg_integer() | nil
   defp reserved_alias(text, start) do
     # An alias is an identifier or a quoted one: a number, a quote or a sign is not (verified).
-    case Regex.run(~r/\s(AS)(?![\w])\s*(?=[\d'.+-])/i, text, return: :index) do
+    case Regex.run(~q/\s(AS)(?![\w])\s*(?=[\d'.+-])/i, text, return: :index) do
       [_all, {as_at, as_length}] -> start + as_at + as_length
       nil -> reserved_word_alias(text, start)
     end
   end
 
   defp reserved_word_alias(text, start) do
-    case Regex.run(~r/\s(AS)(?![\w])\s*([A-Za-z_]\w*)/i, text, return: :index) do
+    case Regex.run(~q/\s(AS)(?![\w])\s*([A-Za-z_]\w*)/i, text, return: :index) do
       [_all, {as_at, as_length}, {alias_at, _length}] ->
         <<_skip::binary-size(alias_at), alias_and_rest::binary>> = text
         if InfluxQLText.reserved_start(alias_and_rest), do: start + as_at + as_length
@@ -538,7 +539,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # An `AS` last in the list: the word after it was cut off as `FROM`.
   @spec last_as(binary(), non_neg_integer()) :: non_neg_integer() | nil
   defp last_as(text, start) do
-    case Regex.run(~r/\s(AS)(?![\w])\s*$/i, text, return: :index) do
+    case Regex.run(~q/\s(AS)(?![\w])\s*$/i, text, return: :index) do
       [_all, {as_at, as_length}] -> start + as_at + as_length
       nil -> nil
     end

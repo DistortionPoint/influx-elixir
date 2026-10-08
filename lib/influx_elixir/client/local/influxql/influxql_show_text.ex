@@ -89,11 +89,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
     end
   end
 
+  # What may stand directly against a SHOW keyword for the engine to read it: a blank, the
+  # end of the statement, a `;`, or one of the characters of an operator or a parenthesis
+  # (`SHOW TAG KEYS(` is left over from the `(`). Any other character (a form feed, a vertical
+  # tab, a carriage return, a quote, a dot, `#`, `$`, a control character, a byte of a
+  # non-ASCII character) leaves the word unread, as if it were another word: verified for each
+  # ASCII character after `SHOW TAG KEYS`, and for U+00A0 and the control characters after the
+  # kinds and the clause words.
+  @keyword_end [nil, " ", "\t", "\n", ";", "(", ")", "*", ",", "=", "/", "+", "-", "<", ">"] ++
+                 ["!", "%", "&", "|", "^"]
+
+  @doc "Whether a keyword that ends at `at` is read as one (see the table above)."
+  @spec keyword_end?(ctx(), non_neg_integer()) :: boolean()
+  def keyword_end?(ctx, at), do: at_byte(ctx, at) in @keyword_end
+
   @doc "The keyword `name` at `at`: `{:ok, end of the word}` or `:no`."
   @spec keyword_here(ctx(), non_neg_integer(), binary()) :: {:ok, non_neg_integer()} | :no
   def keyword_here(ctx, at, name) do
     case word_at(ctx, at) do
-      {^name, to} -> {:ok, to}
+      {^name, to} -> if keyword_end?(ctx, to), do: {:ok, to}, else: :no
       _other -> :no
     end
   end

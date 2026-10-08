@@ -59,7 +59,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   """
   @spec read(binary(), non_neg_integer()) :: result()
   def read(text, open_at) do
-    case arguments(text, open_at + 1) do
+    case arguments(text, open_at + 1, :where) do
       {:ok, stop} -> {:ok, stop}
       {:fail, at} -> {:fail, at}
       _no_operand_or_unknown -> :unknown
@@ -74,7 +74,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   """
   @spec item?(binary()) :: boolean()
   def item?(text) do
-    case expression(text, skip(text, 0), false) do
+    case expression(text, skip(text, 0), :select) do
       {:ok, stop} -> aliased?(binary_part(text, stop, byte_size(text) - stop))
       _unread -> false
     end
@@ -93,7 +93,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   """
   @spec item_failure(binary()) :: {:fail, non_neg_integer() | :eot} | nil
   def item_failure(text) do
-    case expression(text, skip(text, 0), false) do
+    case expression(text, skip(text, 0), :select) do
       {:fail, at} -> {:fail, at}
       _read_or_unknown -> nil
     end
@@ -107,7 +107,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   """
   @spec item_leftover(binary()) :: non_neg_integer() | nil
   def item_leftover(text) do
-    with {:ok, stop} <- expression(text, skip(text, 0), false),
+    with {:ok, stop} <- expression(text, skip(text, 0), :select),
          at = skip(text, stop),
          <<_before::binary-size(at), rest::binary>> = text,
          true <- Regex.match?(~r/\A[A-Za-z0-9_'"]/, rest),
@@ -121,14 +121,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
 
   # The arguments of a call: a failure of an operator that leaves the text over is the call's
   # failure from here on.
-  @spec arguments(binary(), non_neg_integer()) :: read()
-  defp arguments(text, from) do
+  @spec arguments(binary(), non_neg_integer(), atom()) :: read()
+  defp arguments(text, from, mode) do
     at = skip(text, from)
 
     result =
       if char(text, at) == ?),
         do: {:ok, at + 1},
-        else: first_argument(text, at)
+        else: first_argument(text, at, mode)
 
     case result do
       {:plain_fail, at} -> {:fail, at}
@@ -138,9 +138,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
 
   # No operand where the first argument should start: a `,` or a group that does not read is where
   # it fails.
-  defp first_argument(text, at) do
-    case expression(text, at, true) do
-      {:ok, stop} -> after_argument(text, skip(text, stop))
+  defp first_argument(text, at, mode) do
+    case expression(text, at, mode) do
+      {:ok, stop} -> after_argument(text, skip(text, stop), mode)
       {:none, none_at} -> none_at(text, none_at)
       {:soft, sign_at} -> {:fail, sign_at}
       other -> other
@@ -155,10 +155,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   end
 
   # `,` and the next argument, or the `)` that closes the list.
-  defp after_argument(text, at) do
+  defp after_argument(text, at, mode) do
     case char(text, at) do
       ?) -> {:ok, at + 1}
-      ?, -> next_argument(text, at)
+      ?, -> next_argument(text, at, mode)
       nil -> {:fail, :eot}
       _leftover -> leftover(text, at)
     end
@@ -166,11 +166,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
 
   # An argument that does not start after a `,` takes the `,` back: the list is left from it,
   # when the next character is one the parser is known to stop at.
-  defp next_argument(text, comma) do
+  defp next_argument(text, comma, mode) do
     next = skip(text, comma + 1)
 
-    case expression(text, next, true) do
-      {:ok, stop} -> after_argument(text, skip(text, stop))
+    case expression(text, next, mode) do
+      {:ok, stop} -> after_argument(text, skip(text, stop), mode)
       {:none, _at} -> {:fail, comma}
       {:soft, _at} -> :unknown
       other -> other
@@ -185,38 +185,38 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   end
 
   # An operand, then the binary operators and their operands.
-  # `call?` is whether the expression stands in a call's arguments.
-  @spec expression(binary(), non_neg_integer(), boolean()) :: read()
-  defp expression(text, at, call?) do
-    case operand(text, at, call?) do
-      {:ok, stop} -> operators(text, stop, call?)
+  # `mode` is where the expression stands: `:where` (a condition) or `:select` (a select list).
+  @spec expression(binary(), non_neg_integer(), atom()) :: read()
+  defp expression(text, at, mode) do
+    case operand(text, at, mode) do
+      {:ok, stop} -> operators(text, stop, mode)
       other -> other
     end
   end
 
-  defp operators(text, stop, call?) do
+  defp operators(text, stop, mode) do
     at = skip(text, stop)
     operator = char(text, at)
 
     cond do
-      operator in @cut_operators -> cut(text, at, call?)
-      operator in @plain_operators -> plain(text, at, call?)
+      operator in @cut_operators -> cut(text, at, mode)
+      operator in @plain_operators -> plain(text, at, mode)
       true -> {:ok, stop}
     end
   end
 
-  defp cut(text, operator_at, call?) do
-    case operand(text, skip(text, operator_at + 1), call?) do
-      {:ok, stop} -> operators(text, stop, call?)
+  defp cut(text, operator_at, mode) do
+    case operand(text, skip(text, operator_at + 1), mode) do
+      {:ok, stop} -> operators(text, stop, mode)
       {:none, at} -> {:fail, at_or_eot(text, at)}
       {:soft, at} -> {:fail, at}
       other -> other
     end
   end
 
-  defp plain(text, operator_at, call?) do
-    case operand(text, skip(text, operator_at + 1), call?) do
-      {:ok, stop} -> operators(text, stop, call?)
+  defp plain(text, operator_at, mode) do
+    case operand(text, skip(text, operator_at + 1), mode) do
+      {:ok, stop} -> operators(text, stop, mode)
       {:none, _at} -> {:plain_fail, operator_at}
       {:soft, _at} -> :unknown
       other -> other
@@ -227,24 +227,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
 
   # An operand: signs, then a number, a name (with a type, or a call), a string, a `*` or a
   # parenthesised expression.
-  @spec operand(binary(), non_neg_integer(), boolean()) :: read()
-  defp operand(text, at, call?) do
+  @spec operand(binary(), non_neg_integer(), atom()) :: read()
+  defp operand(text, at, mode) do
     case char(text, at) do
-      sign when sign in [?+, ?-] -> signed(text, at, call?)
-      _other -> primary(text, at, call?)
+      sign when sign in [?+, ?-] -> signed(text, at, mode)
+      _other -> primary(text, at, mode)
     end
   end
 
-  # A sign before `*` or a regular expression is the engine's error for a unary expression,
-  # not a failure of the arguments.
-  defp signed(text, sign_at, call?) do
-    if char(text, skip(text, sign_at + 1)) in [?*, ?/, ?'],
+  # A sign before `*` (in a select list) or a regular expression is the engine's error for a
+  # unary expression, not a failure of the arguments. In a condition's call a `*` is no
+  # operand, and the sign fails (`abs(-*)` is left from the sign).
+  defp signed(text, sign_at, mode) do
+    next = char(text, skip(text, sign_at + 1))
+
+    if next in [?/, ?'] or (next == ?* and mode == :select),
       do: :unknown,
-      else: signed_operand(text, sign_at, call?)
+      else: signed_operand(text, sign_at, mode)
   end
 
-  defp signed_operand(text, sign_at, call?) do
-    case operand(text, skip(text, sign_at + 1), call?) do
+  defp signed_operand(text, sign_at, mode) do
+    case operand(text, skip(text, sign_at + 1), mode) do
       {:ok, stop} -> {:ok, stop}
       {:none, _at} -> {:soft, sign_at}
       {:soft, _at} -> {:soft, sign_at}
@@ -252,9 +255,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
     end
   end
 
-  defp primary(text, at, call?) do
+  defp primary(text, at, mode) do
     <<_before::binary-size(at), rest::binary>> = text
-    primary(classify(rest), text, at, rest, call?)
+    primary(classify(rest), text, at, rest, mode)
   end
 
   defp classify(""), do: :end
@@ -274,16 +277,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   defp classify_symbol(symbol) when symbol in [",", ")", "\f", "\v"], do: :none
   defp classify_symbol(_other), do: :other
 
-  defp primary(:end, _text, at, _rest, _call?), do: {:none, at}
-  defp primary(:none, _text, at, _rest, _call?), do: {:none, at}
-  defp primary(:other, _text, _at, _rest, _call?), do: :unknown
+  defp primary(:end, _text, at, _rest, _mode), do: {:none, at}
+  defp primary(:none, _text, at, _rest, _mode), do: {:none, at}
+  defp primary(:other, _text, _at, _rest, _mode), do: :unknown
 
-  defp primary(:number, _text, at, rest, _call?) do
+  defp primary(:number, _text, at, rest, _mode) do
     [number] = Regex.run(@number, rest)
     {:ok, at + byte_size(number)}
   end
 
-  defp primary(:string, _text, at, rest, _call?) do
+  defp primary(:string, _text, at, rest, _mode) do
     # The closing quote is optional: the text may end inside the literal, which is its own error.
     size =
       case :binary.match(rest, binary_part(rest, 0, 1), scope: {1, byte_size(rest) - 1}) do
@@ -294,14 +297,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
     {:ok, at + size}
   end
 
-  defp primary(:star, text, at, _rest, _call?) do
+  # A `*` is an operand in a select list (`count(*)`), and none in a condition's call: the
+  # parser fails where the `*` stands (verified: `abs(*)`, `now( *`, `abs((*))`, `abs(1, *)`).
+  defp primary(:star, _text, at, _rest, :where), do: {:none, at}
+
+  defp primary(:star, text, at, _rest, :select) do
     if char(text, at + 1) == ?:, do: :unknown, else: {:ok, at + 1}
   end
 
   # A group whose contents are not one expression closed by `)` fails where it starts: it is an
   # operand that was not there. A failure inside it stands.
-  defp primary(:group, text, at, _rest, call?) do
-    case expression(text, skip(text, at + 1), call?) do
+  defp primary(:group, text, at, _rest, mode) do
+    case expression(text, skip(text, at + 1), mode) do
       {:ok, stop} -> group_close(text, at, skip(text, stop))
       {:fail, inside} -> {:fail, inside}
       {:plain_fail, _inside} -> :unknown
@@ -310,11 +317,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
     end
   end
 
-  defp primary(:name, text, at, rest, _call?) do
+  defp primary(:name, text, at, rest, mode) do
     [name] = Regex.run(@name, rest)
 
     if operand_name?(rest, name),
-      do: name_tail(text, at, at + byte_size(name)),
+      do: name_tail(text, at, at + byte_size(name), mode),
       else: :unknown
   end
 
@@ -334,7 +341,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
 
   # A name, then its type (`usage::field`) or the arguments of the call it names. A `.` makes it
   # a dotted name, which needs another name after the dot.
-  defp name_tail(text, name_at, stop) do
+  defp name_tail(text, name_at, stop, mode) do
     case text do
       <<_before::binary-size(stop), "::", rest::binary>> ->
         typed(text, rest, stop)
@@ -344,7 +351,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
 
       _no_type ->
         at = skip(text, stop)
-        if char(text, at) == ?(, do: call(text, at), else: {:ok, stop}
+        if char(text, at) == ?(, do: call(text, at, mode), else: {:ok, stop}
     end
   end
 
@@ -361,8 +368,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   end
 
   # The arguments of a call inside an expression: its failures stand.
-  defp call(text, open_at) do
-    case arguments(text, open_at + 1) do
+  defp call(text, open_at, mode) do
+    case arguments(text, open_at + 1, mode) do
       {:ok, stop} -> {:ok, stop}
       {:fail, at} -> {:fail, at}
       _no_operand_or_unknown -> :unknown

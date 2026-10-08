@@ -1,5 +1,6 @@
 defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   @moduledoc false
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
   # The InfluxQL path of `InfluxElixir.Client.Local`: the `SHOW` statements, and
   # `SELECT` planned by `InfluxElixir.Client.Local.InfluxQL` and run over the
   # store through the SQL engine. `Client.Local.query_influxql/3` is the public
@@ -228,7 +229,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
         error
 
       nil ->
-        if Regex.match?(~r/\bnow\s*\(/i, spec.where) do
+        if Regex.match?(~q/\bnow\s*\(/i, spec.where) do
           show_refusal(spec, "SHOW TAG KEYS WHERE now() over a measurement with no tag")
         else
           aggregate_of_nothing()
@@ -503,7 +504,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # which the double's SQL cannot say.
   @spec no_column(map()) :: {:ok, []} | {:error, map()}
   defp no_column(%{where: where} = spec) do
-    if where =~ ~r/\bOR\b/i,
+    if where =~ ~q/\bOR\b/i,
       do: show_refusal(spec, "a WHERE with OR that names a column the measurement lacks"),
       else: {:ok, []}
   end
@@ -858,7 +859,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # and the coercion error of a function given a string, a boolean or a tag. The planner
   # raises those before the analyzer finds the condition's own (`deferred`), but after the
   # comparisons it cannot type (`clash`).
-  @unplanned_call ~r/\(\w+\(\) of an? (?:string|boolean|unsigned|tag|timestamp)\b|several aggregates of a type|arithmetic on a selector beside columns|a transform of a field beside an aggregate|a function of time beside an aggregate|GROUP BY a field that the select list reads/
+  @unplanned_call ~q/\(\w+\(\) of an? (?:string|boolean|unsigned|tag|timestamp)\b|several aggregates of a type|arithmetic on a selector beside columns|a transform of a field beside an aggregate|a function of time beside an aggregate|GROUP BY a field that the select list reads/
 
   @spec refusal_after({:error, map()}, Store.t(), binary(), InfluxQL.query(), map()) ::
           {:error, map()}

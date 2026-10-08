@@ -1,5 +1,6 @@
 defmodule InfluxElixir.Client.Local.InfluxQLText do
   @moduledoc false
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
   # The text of an InfluxQL statement, below the parser that reads it and the
   # checks that judge it:
   #
@@ -34,7 +35,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   """
   @spec reserved_start(binary(), keyword()) :: {binary(), non_neg_integer()} | nil
   def reserved_start(text, opts \\ []) do
-    with [_all, word] <- Regex.run(~r/^([A-Za-z_]\w*)(?![\w:])/, text),
+    with [_all, word] <- Regex.run(~q/^([A-Za-z_]\w*)(?![\w:])/, text),
          true <- reserved?(word),
          false <- Keyword.get(opts, :plain, false) and called?(text, word) do
       {word, byte_size(word)}
@@ -48,7 +49,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
     do:
       text
       |> binary_part(byte_size(word), byte_size(text) - byte_size(word))
-      |> then(&(&1 =~ ~r/^\s*\(/))
+      |> then(&(&1 =~ ~q/^\s*\(/))
 
   @doc "A quoted identifier without its quotes and escapes; any other text as it is."
   @spec unquote_ident(binary()) :: binary()
@@ -85,10 +86,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
     )
   end
 
-  @clauses ~r/^\s*(?:WHERE\s+(?<where>.+?))?\s*(?:GROUP\s+BY\s+(?<group>.+?))?\s*(?<fillcall>fill\s*\((?<fill>[^)]*)\))?\s*(?:ORDER\s+BY\s+(?:time\s+(?=ASC|DESC)|(?=ASC\b|DESC\b)|time\b)(?<dir>ASC|DESC)?)?\s*(?:LIMIT\s+(?<limit>\d+))?\s*(?:OFFSET\s+(?<offset>\d+))?\s*(?:SLIMIT\s+(?<slimit>\d+))?\s*(?:SOFFSET\s+(?<soffset>\d+))?\s*(?<tzcall>TZ\s*\(\s*'(?<tz>[^']*)'\s*\))?\s*;?\s*$/is
+  @clauses ~q/^\s*(?:WHERE\s+(?<where>.+?))?\s*(?:GROUP\s+BY\s+(?<group>.+?))?\s*(?<fillcall>fill\s*\((?<fill>[^)]*)\))?\s*(?:ORDER\s+BY\s+(?:time\s+(?=ASC|DESC)|(?=ASC\b|DESC\b)|time\b)(?<dir>ASC|DESC)?)?\s*(?:LIMIT\s+(?<limit>\d+))?\s*(?:OFFSET\s+(?<offset>\d+))?\s*(?:SLIMIT\s+(?<slimit>\d+))?\s*(?:SOFFSET\s+(?<soffset>\d+))?\s*(?<tzcall>TZ\s*\(\s*'(?<tz>[^']*)'\s*\))?\s*;?\s*$/is
 
-  @open_operand ~r/(?:[-+*=<>(,~!]|(?<![_\/])\/|\b(?:AND|OR))\s*$/i
-  @fill_call ~r/(?<![\w])fill\s*\(/i
+  @open_operand ~q/(?:[-+*=<>(,~!]|(?<![_\/])\/|\b(?:AND|OR))\s*$/i
+  @fill_call ~q/(?<![\w])fill\s*\(/i
 
   @doc """
   Matches a masked text that ends where an operand is wanted: after an operator, a sign, a

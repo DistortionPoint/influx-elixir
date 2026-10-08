@@ -1,5 +1,6 @@
 defmodule InfluxElixir.Client.Local.InfluxQLParens do
   @moduledoc false
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
   # The parentheses of an InfluxQL `WHERE`, as the engine's parser reads them
   # (verified). A `)` that closes nothing ends the condition: the statement is
   # left from it. A `(` that is never closed makes the parser give up on the
@@ -14,7 +15,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
   alias InfluxElixir.Client.Local.{InfluxQLCheck, InfluxQLError, InfluxQLLex, InfluxQLTokens}
 
   # `now()` has parentheses of its own, which are no grouping.
-  @parens ~r/(?<![\w])now\s*\(\s*\)|[()]/i
+  @parens ~q/(?<![\w])now\s*\(\s*\)|[()]/i
 
   @doc """
   `nil` when the parentheses of the `WHERE` balance, else the engine's error with its position.
@@ -93,7 +94,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
   end
 
   defp call?(masked, offset),
-    do: masked |> binary_part(0, offset) |> String.match?(~r/[A-Za-z_]\w*$/)
+    do: masked |> binary_part(0, offset) |> String.match?(~q/[A-Za-z_]\w*$/)
 
   # The tokens before the `(` that has `ordinal` before it, latest first.
   @spec before_open(list(), non_neg_integer()) :: list()

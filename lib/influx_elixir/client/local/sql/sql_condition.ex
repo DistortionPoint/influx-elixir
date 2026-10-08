@@ -228,10 +228,11 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
 
   # LIKE, ILIKE and the regular-expression operators over a text value; a
   # number or a boolean has no text to match.
-  @spec pattern_condition(term(), atom(), term()) :: boolean() | nil
   # The engine reads `s ~ '.*'` as the test that the value is not null: false, not unknown,
-  # for a null (verified: `NOT (s ~ '.*')` keeps the rows with no `s`).
-  defp pattern_condition(nil, :regex, {%Regex{source: ".*"}, _symbol, _guard}), do: false
+  # for a null (verified: `NOT (s ~ '.*')` keeps the rows with no `s`). The compiled pattern
+  # carries the `:not_null` marker (`SQLPredicate.compile_regex/2`).
+  @spec pattern_condition(term(), atom(), term()) :: boolean() | nil
+  defp pattern_condition(nil, :regex, {_regex, _symbol, _guard, :not_null}), do: false
   defp pattern_condition(nil, _op, _rest), do: nil
 
   defp pattern_condition(text, op, rest) when is_binary(text),
@@ -243,9 +244,11 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   @spec pattern_match(atom(), term(), binary()) :: boolean()
   defp pattern_match(:like, regex, text), do: Regex.match?(regex, text)
   defp pattern_match(:not_like, regex, text), do: not Regex.match?(regex, text)
-  defp pattern_match(:regex, {regex, _op, guard}, text), do: regex_match?(regex, guard, text)
 
-  defp pattern_match(:not_regex, {regex, _op, guard}, text),
+  defp pattern_match(:regex, {regex, _op, guard, _shape}, text),
+    do: regex_match?(regex, guard, text)
+
+  defp pattern_match(:not_regex, {regex, _op, guard, _shape}, text),
     do: not regex_match?(regex, guard, text)
 
   # PCRE is the double's matcher. For a text that is not ASCII the engine's crate reads `\w`,
@@ -274,7 +277,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   defp pattern_type_error(op, _regex, value) when op in [:like, :not_like],
     do: like_type_error(value)
 
-  defp pattern_type_error(_op, {_regex, symbol, _guard}, value),
+  defp pattern_type_error(_op, {_regex, symbol, _guard, _shape}, value),
     do: regex_type_error(value, symbol)
 
   # The planner's text of a filter that is no condition.
@@ -373,7 +376,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   @spec regex_type_error(term(), binary()) :: binary()
   defp regex_type_error(value, op) do
     "type_coercion\ncaused by\nError during planning: " <>
-      SQLPlan.pattern_error(:regex, SQLPlan.arrow_type(value), {nil, op, nil})
+      SQLPlan.pattern_error(:regex, SQLPlan.arrow_type(value), {nil, op, nil, nil})
   end
 
   # DataFusion: "There isn't a common type to coerce Float64 and Utf8 in

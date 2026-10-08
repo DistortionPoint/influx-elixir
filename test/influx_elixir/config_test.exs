@@ -152,7 +152,16 @@ defmodule InfluxElixir.ConfigTest do
     end
 
     test "options that are not a keyword list are a validation error, from both functions" do
-      for opts <- ["notalist", %{host: "h"}, nil] do
+      for opts <- [
+            "notalist",
+            %{host: "h"},
+            nil,
+            [1, 2],
+            [{"host", "x"}],
+            [:host],
+            [[host: "h"]],
+            [{:host, "ok"} | :improper]
+          ] do
         assert {:error, %NimbleOptions.ValidationError{}} = Config.validate(opts)
         assert_raise NimbleOptions.ValidationError, fn -> Config.validate!(opts) end
       end

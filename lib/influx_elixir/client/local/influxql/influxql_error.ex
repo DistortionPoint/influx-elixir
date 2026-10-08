@@ -1,5 +1,6 @@
 defmodule InfluxElixir.Client.Local.InfluxQLError do
   @moduledoc false
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
   # The 400 bodies of the engine's InfluxQL parser, by kind of error and the
   # position it names in the statement as sent, and the planning errors it
   # raises while it rewrites the statement.
@@ -85,7 +86,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   end
 
   # The characters Rust's `{:?}` writes as `\u{..}`: control, separator and mark characters.
-  @escaped ~r/\A[\p{C}\p{Zl}\p{Zp}\p{Zs}\p{Mn}\p{Me}]\z/u
+  @escaped ~q/\A[\p{C}\p{Zl}\p{Zp}\p{Zs}\p{Mn}\p{Me}]\z/u
 
   defp escape_char(0), do: "\\0"
   defp escape_char(?\t), do: "\\t"
@@ -196,7 +197,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   @doc "Moves the positions of a parse error body on by `by` bytes."
   @spec shift_position(binary(), non_neg_integer()) :: binary()
   def shift_position(body, by) do
-    Regex.replace(~r/at pos (\d+)/, body, fn _match, pos ->
+    Regex.replace(~q/at pos (\d+)/, body, fn _match, pos ->
       "at pos #{String.to_integer(pos) + by}"
     end)
   end
@@ -244,7 +245,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   @spec before_operand(binary(), non_neg_integer()) :: non_neg_integer()
   def before_operand(whole, pos) do
     skipped = whole |> binary_part(0, pos) |> String.reverse()
-    [spaces] = Regex.run(~r/^[\s(+\-]*/, skipped)
+    [spaces] = Regex.run(~q/^[\s(+\-]*/, skipped)
     pos - byte_size(spaces)
   end
 end

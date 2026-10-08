@@ -1802,7 +1802,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   def pattern_error(kind, type, rest) when kind in [:like, :not_like],
     do: "There isn't a common type to coerce #{type} and Utf8 in #{like_word(rest)} expression"
 
-  def pattern_error(_kind, type, {_regex, op, _guard}),
+  def pattern_error(_kind, type, {_regex, op, _guard, _shape}),
     do: "Cannot infer common argument type for regex operation #{type} #{op} Utf8"
 
   # `ILIKE` is a `LIKE` whose pattern ignores case; the engine names it in

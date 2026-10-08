@@ -4,7 +4,8 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
   answer has no engine answer to match. The SQL, InfluxQL and Flux texts, database, bucket and
   token names, parameter names, the `format:` option and v3 line protocol (plain or gzip)
   answer by name and never raise. A v2 write is the exception: InfluxDB 2.7 stores the bytes
-  as they are and returns them, and so does the double.
+  as they are and returns them, and so does the double. A value that is not text at all (nil, a
+  number, a map) has no engine answer either, and is refused by name the same way.
   """
 
   use ExUnit.Case, async: true
@@ -174,6 +175,42 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
 
         assert Local.write(c, body, database: "utf8_iql") ===
                  {:error, %{status: 400, body: body_text}}
+      end
+    end
+  end
+
+  describe "a value that is not text" do
+    test "as a statement, a body or a name is refused by name, never raised",
+         %{conn: c, v2: v2} do
+      refused = fn what ->
+        {:error, %{status: 400, body: "Client.Local: the #{what} is not a string"}}
+      end
+
+      for value <- [nil, 5, 1.5, :atom, ~c"text", %{}, {1}] do
+        assert Local.query_sql(c, value, database: "utf8_iql") === refused.("SQL text")
+        assert Local.execute_sql(c, value, database: "utf8_iql") === refused.("SQL text")
+        assert Local.query_influxql(c, value, database: "utf8_iql") === refused.("InfluxQL text")
+        assert Local.query_flux(v2, value, org: "o") === refused.("Flux text")
+        assert Local.write(c, value, database: "utf8_iql") === refused.("line protocol")
+        # `database: nil` is no option: the connection's database applies.
+        if value != nil do
+          assert Local.query_sql(c, "SELECT 1", database: value) === refused.("database name")
+          assert Local.write(c, "m v=1", database: value) === refused.("database name")
+        end
+
+        assert Local.create_database(c, value) === refused.("database name")
+        assert Local.delete_database(c, value) === refused.("database name")
+        assert Local.create_bucket(v2, value) === refused.("bucket name")
+        assert Local.delete_bucket(v2, value) === refused.("bucket name")
+        assert Local.create_token(c, value) === refused.("token name")
+        assert Local.delete_token(c, value) === refused.("token name")
+
+        error =
+          assert_raise InfluxElixir.StreamError, fn ->
+            c |> Local.query_sql_stream(value, database: "utf8_iql") |> Enum.to_list()
+          end
+
+        assert {error.status, error.body} === {400, "Client.Local: the SQL text is not a string"}
       end
     end
   end

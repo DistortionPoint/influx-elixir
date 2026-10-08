@@ -243,6 +243,22 @@ defmodule InfluxElixir.Client.HTTPTest do
                  conn |> HTTP.query_sql_stream(sql) |> Enum.to_list()
                end)
     end
+
+    test "a value JSON has no form for (a tuple, a pid) is the same error, never a raise" do
+      conn = connection(ClosedPort.port(), [])
+
+      for value <- [{1}, self(), fn -> :x end] do
+        assert {:error, {:unencodable_body, _message}} = HTTP.query_sql(conn, value)
+
+        assert {:error, {:unencodable_body, _message}} =
+                 HTTP.query_sql(conn, "SELECT 1", database: value)
+
+        assert %StreamError{reason: {:unencodable_body, _message}} =
+                 assert_raise(StreamError, fn ->
+                   conn |> HTTP.query_sql_stream("SELECT 1", database: value) |> Enum.to_list()
+                 end)
+      end
+    end
   end
 
   describe "a parameter that cannot be sent" do

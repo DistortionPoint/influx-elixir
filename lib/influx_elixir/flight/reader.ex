@@ -554,14 +554,20 @@ defmodule InfluxElixir.Flight.Reader do
     end
   end
 
-  # Every column is built to its row count, and every row is a map, so a
-  # count from a corrupt header (one flipped byte of metadata) would allocate
-  # gigabytes. A column with data holds at least one bit per row in the body,
-  # which bounds the count by the bytes received (with a small floor for a
-  # batch that omits its buffers). Only a batch of null-type columns has no
-  # body at all; it is bounded above any batch the engine sends (8192 rows).
+  # Every column is built to its row count, and every row is a map, so a count from a corrupt
+  # header (one flipped byte of metadata) would allocate gigabytes. Each node (one per field,
+  # depth-first, the order `decode_field/3` reads them) is bounded by its own field:
+  #
+  #   * a field with data holds at least one bit per row in the body, so its length is at most
+  #     8 per byte received (with a small floor for a batch that omits its buffers);
+  #   * a field with no buffers of its own (the null type; a struct, whose children carry its
+  #     data) is bounded by cells: its length times the batch's fields, at most
+  #     `@cells_without_body` — far above any batch the engine sends (8192 rows), and a few
+  #     megabytes at most for a corrupt one.
+  #
+  # A field of a type the reader does not decode is that error first, whatever its count.
   @rows_floor 64
-  @rows_of_nulls 65_536
+  @cells_without_body 524_288
 
   @spec check_row_counts(
           [column_schema()],
@@ -570,17 +576,31 @@ defmodule InfluxElixir.Flight.Reader do
           binary() | nil
         ) :: :ok | {:error, term()}
   defp check_row_counts(columns, row_count, nodes, body) do
-    limit =
-      if columns != [] and Enum.all?(columns, &(&1.kind == :null)),
-        do: @rows_of_nulls,
-        else: max(8 * byte_size(body || <<>>), @rows_floor)
+    fields = Enum.flat_map(columns, &flatten_field/1)
+    with_body = max(8 * byte_size(body || <<>>), @rows_floor)
+    without_body = div(@cells_without_body, max(length(fields), 1))
+    limit = fn kind -> if kind in [:null, :struct], do: without_body, else: with_body end
+    batch_limit = fields |> Enum.map(&limit.(&1.kind)) |> Enum.max(fn -> with_body end)
 
-    counts = [row_count | Enum.map(nodes, &elem(&1, 0))]
+    unsupported = Enum.find(fields, &match?({:unsupported, _type}, &1.kind))
+    lengths = Enum.zip(Enum.map(nodes, &elem(&1, 0)), fields)
 
-    if Enum.all?(counts, &(&1 in 0..limit//1)),
-      do: :ok,
-      else: {:error, {:decode_error, "a row count the record batch's body cannot hold"}}
+    cond do
+      unsupported ->
+        {:unsupported, type} = unsupported.kind
+        {:error, {:unsupported_arrow_type, type, unsupported.name}}
+
+      row_count in 0..batch_limit//1 and
+          Enum.all?(lengths, fn {len, field} -> len in 0..limit.(field.kind)//1 end) ->
+        :ok
+
+      true ->
+        {:error, {:decode_error, "a row count the record batch's body cannot hold"}}
+    end
   end
+
+  @spec flatten_field(column_schema()) :: [column_schema()]
+  defp flatten_field(field), do: [field | Enum.flat_map(field.children, &flatten_field/1)]
 
   @spec parse_record_batch_table(binary(), non_neg_integer()) ::
           {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}], map()}

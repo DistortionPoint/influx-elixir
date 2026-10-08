@@ -795,6 +795,19 @@ defmodule InfluxElixir.Flight.ReaderTest do
     end
   end
 
+  describe "decode_flight_data/1 — a batch of null-type columns, which has no body" do
+    test "is decoded at the engine's batch size, and refused when its cells pass the bound" do
+      nulls = fn count -> schema_fd(for i <- 1..count, do: {"c#{i}", 1, []}) end
+
+      assert {:answered, {:ok, rows}} = decode_bounded([nulls.(3), batch_fd(<<>>, [], 8192)])
+      assert length(rows) === 8192
+
+      assert decode_bounded([nulls.(200), batch_fd(<<>>, [], 8192)]) ===
+               {:answered,
+                {:error, {:decode_error, "a row count the record batch's body cannot hold"}}}
+    end
+  end
+
   # Decodes in a process whose heap is capped at about 40 MB, so a regression that
   # allocates by a corrupt count fails the test instead of taking the machine's memory.
   defp decode_bounded(frames) do

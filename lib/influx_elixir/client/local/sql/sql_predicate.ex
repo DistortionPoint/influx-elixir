@@ -470,7 +470,8 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   for every row. An invalid pattern is the optimizer's error.
   """
   @spec compile_regex(binary(), binary()) ::
-          {:ok, {Regex.t(), binary(), SQLRustRegex.guard()}} | {:error, SQLError.t()}
+          {:ok, {Regex.t(), binary(), SQLRustRegex.guard(), :match | :not_null}}
+          | {:error, SQLError.t()}
   def compile_regex(pattern, op) do
     flags = if String.ends_with?(op, "*"), do: "iu", else: "u"
 
@@ -507,11 +508,12 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   end
 
   @spec compile_checked(binary(), binary(), binary()) ::
-          {:ok, {Regex.t(), binary(), SQLRustRegex.guard()}} | {:error, SQLError.t()}
+          {:ok, {Regex.t(), binary(), SQLRustRegex.guard(), :match | :not_null}}
+          | {:error, SQLError.t()}
   defp compile_checked(pattern, flags, op) do
     case Regex.compile(pattern, flags) do
       {:ok, regex} ->
-        {:ok, {regex, op, SQLRustRegex.guard(regex)}}
+        {:ok, {regex, op, SQLRustRegex.guard(regex), shape(pattern)}}
 
       {:error, _pcre} ->
         {:error,
@@ -520,6 +522,11 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
          )}
     end
   end
+
+  # The engine reads the pattern `.*` as the test that the value is not null.
+  @spec shape(binary()) :: :match | :not_null
+  defp shape(".*"), do: :not_null
+  defp shape(_pattern), do: :match
 
   @spec like_op(boolean()) :: :like | :not_like
   defp like_op(true), do: :not_like

@@ -98,8 +98,9 @@ defmodule InfluxElixir.Client.Local.Admin do
       else: {:error, %{status: 400, body: "Client.Local: the #{kind} name is not valid UTF-8"}}
   end
 
-  # A name that is not text keeps the path it had before this check.
-  defp utf8_name(_name, _kind), do: :ok
+  # No engine answer exists for a name that is not text: refused by name, never raised.
+  defp utf8_name(_name, kind),
+    do: {:error, %{status: 400, body: "Client.Local: the #{kind} name is not a string"}}
 
   # The engine's answer for its own database (verified).
   @spec deletable(binary()) :: :ok | {:error, map()}

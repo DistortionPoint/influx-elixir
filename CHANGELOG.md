@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` InfluxQL: one blank rule, keywords against odd characters, `tz` last**:
+  InfluxQL blanks are a space, tab, CR or LF only; about 87 patterns also read `\v` and `\f`
+  as blanks, so `SHOW TAG\vKEYS` and `SHOW\vMEASUREMENTS` gave another error than the
+  engine's. A non-ASCII character right after `SELECT`, `FROM` or another clause keyword is
+  the engine's leftover from that keyword (it was a clause error). `AND` or `OR` where an
+  operand is wanted is a name, as the engine reads it. `tz('zone')` ends the statement, so
+  what follows it is left over (it was the `SLIMIT` 405). `NOW()` is `now()` in any case, and
+  a `(` after `now()` or a boolean is left over.
+- **Values that are not text, and options that are not a keyword list, raised**:
+  `Client.Local` raised on a statement, line protocol body, database, bucket or token name
+  that is not a string (`nil`, a number, a map); each is now a 400 refusal by name
+  (`query_sql_stream/3` raises `InfluxElixir.StreamError` with it). `Client.HTTP` raised
+  `Protocol.UndefinedError` on SQL or a database JSON cannot encode (a tuple, a pid); it is
+  `{:error, {:unencodable_body, message}}`. `InfluxElixir.Config.validate/1` of a list that
+  is not a keyword list (`[1, 2]`, `[{"host", "x"}]`, an improper list) is a validation
+  error.
+- **`Flight.Reader` bounds each field by its own kind**: the bound for a batch of null-type
+  columns counted rows, not cells, so 200 null columns of 8192 rows still went past 40 MB; a
+  field with no buffers of its own (the null type, a struct) is now bounded by the batch's
+  cells, and a field with data by its body. A field of a type the reader does not decode
+  (run-end encoded) is that error, not a misleading row-count error.
+- **`Flight.Client` and IPv6**: a bracketed IPv6 host (the form `Config` takes) made the gRPC
+  client raise `CaseClauseError` and crash the caller; the gRPC client cannot connect to an
+  IPv6 address at all (verified: Core answers on `[::1]` over HTTP), so `query/3` returns
+  `{:error, {:ipv6_unsupported, host}}`. The HTTP transport works over IPv6.
 - **`Client.Local` InfluxQL: glued connectives, bind parameters, Unicode blanks**: `AND#n`,
   `OR@` and other connectives glued to a character gave `invalid conditional expression`;
   they are the engine's `Nom` at the keyword. `$name` and `$1` are read as operands (their

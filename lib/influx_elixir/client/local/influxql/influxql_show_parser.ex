@@ -1,5 +1,6 @@
 defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   @moduledoc false
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
   # Reads an InfluxQL `SHOW` statement as the engine's parser does (verified
   # clause by clause against InfluxDB 3 Core): the kind (`DATABASES`,
   # `RETENTION POLICIES`, `MEASUREMENTS`, `TAG KEYS`, `TAG VALUES`,
@@ -28,7 +29,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   require InfluxQLLex
 
   import InfluxElixir.Client.Local.InfluxQLShowText,
-    only: [at_byte: 2, error: 2, rest: 2, skip_ws: 2, word_at: 2, ws?: 2]
+    only: [at_byte: 2, error: 2, keyword_end?: 2, rest: 2, skip_ws: 2, word_at: 2, ws?: 2]
 
   @type source :: {:name, binary()} | {:regex, Regex.t()}
 
@@ -50,7 +51,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   @only_one "must provide only one InfluxQl statement per query"
   @kinds ~w(databases retention measurements tag field)
 
-  @show_word ~r/^\s*show(?![A-Za-z0-9_])/i
+  @show_word ~q/^\s*show(?![A-Za-z0-9_])/i
 
   @clauses %{
     databases: [],
@@ -89,7 +90,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   @spec keyword_cr(ctx()) :: :ok | {:error, binary()}
   defp keyword_cr(ctx) do
     reserved =
-      ~r/(?<![\w])([A-Za-z_]\w*)\r/
+      ~q/(?<![\w])([A-Za-z_]\w*)\r/
       |> Regex.scan(ctx.masked, capture: :all_but_first)
       |> Enum.any?(fn [word] -> InfluxQLText.reserved?(word) end)
 
@@ -130,12 +131,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   defp walk(<<>>, _at, _regex?, state), do: state
 
   defp walk(<<"--", _rest::binary>> = text, at, regex?, state) do
-    [comment] = Regex.run(~r/^--[^\n]*/, text)
+    [comment] = Regex.run(~q/^--[^\n]*/, text)
     skip_comment(text, comment, at, regex?, state)
   end
 
   defp walk(<<"/*", _rest::binary>> = text, at, regex?, state) do
-    [comment] = Regex.run(~r/^\/\*.*?\*\/|^\/\*.*/s, text)
+    [comment] = Regex.run(~q/^\/\*.*?\*\/|^\/\*.*/s, text)
 
     state =
       if String.ends_with?(comment, "*/") and byte_size(comment) >= 4,
@@ -163,7 +164,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
 
   defp walk(<<c, _rest::binary>> = text, at, _regex?, state)
        when c in ?a..?z or c in ?A..?Z or c == ?_ do
-    [word] = Regex.run(~r/^[A-Za-z_][A-Za-z0-9_]*/, text)
+    [word] = Regex.run(~q/^[A-Za-z_][A-Za-z0-9_]*/, text)
     rest = binary_part(text, byte_size(word), byte_size(text) - byte_size(word))
     walk(rest, at + byte_size(word), String.downcase(word) == "from", put(state, word, word))
   end
@@ -230,8 +231,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
     cond do
       rest(ctx, after_show) in ["", ";"] -> many1(ctx, after_show)
       ws?(ctx, after_show) -> kind(ctx, skip_ws(ctx, after_show))
+      fail_after_show?(ctx, after_show) -> {:error, {:engine, show_fail(ctx, after_show)}}
       true -> {:error, "unsupported InfluxQL (SHOW followed by that)"}
     end
+  end
+
+  # What stands directly against `SHOW` and is no blank: the engine's statement list stops
+  # there with a `Fail` (verified for each of these characters; `(`, `=`, `,` and the end of
+  # the text are `Many1`, and a quote is not placed).
+  @spec fail_after_show?(ctx(), non_neg_integer()) :: boolean()
+  defp fail_after_show?(ctx, after_show),
+    do: match?(<<c>> when c in [?\v, ?\f, ?., 1, 0x7F] or c >= 0x80, at_byte(ctx, after_show))
+
+  @spec show_fail(ctx(), non_neg_integer()) :: binary()
+  defp show_fail(ctx, after_show) do
+    InfluxQLShowText.prefix() <>
+      "invalid InfluxQL statement at pos #{skip_ws(ctx, 0)}. " <>
+      "Parsing Error: Nom(#{InfluxQLError.rust_debug(rest(ctx, after_show))}, Fail)"
   end
 
   # `SHOW` and nothing after it: the statement list fails where it starts,
@@ -252,9 +268,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   @spec kind(ctx(), non_neg_integer()) :: {:ok, map()} | {:error, term()}
   defp kind(ctx, at) do
     case word_at(ctx, at) do
-      {word, to} when word in @kinds -> kind(ctx, at, word, to)
-      {_word, _to} -> error(@generic, at)
-      nil -> error(@generic, at)
+      {word, to} when word in @kinds ->
+        if keyword_end?(ctx, to), do: kind(ctx, at, word, to), else: error(@generic, at)
+
+      {_word, _to} ->
+        error(@generic, at)
+
+      nil ->
+        error(@generic, at)
     end
   end
 
@@ -291,7 +312,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
 
       case word_at(ctx, second) do
         {word, after_word} when is_map_key(words, word) ->
-          clauses(ctx, after_word, new(Map.fetch!(words, word)))
+          if keyword_end?(ctx, after_word),
+            do: clauses(ctx, after_word, new(Map.fetch!(words, word))),
+            else: error(message, second)
 
         _other ->
           error(message, second)
@@ -375,7 +398,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   # Text after the `;` that is no statement the double reads: if it does not
   # start like one the engine reads, it fails where it starts.
   defp second_statement(ctx, text, next) do
-    if Regex.match?(~r/^(?:SELECT|SHOW|EXPLAIN|CREATE|DELETE|DROP)(?![\w])/i, text),
+    if Regex.match?(~q/^(?:SELECT|SHOW|EXPLAIN|CREATE|DELETE|DROP)(?![\w])/i, text),
       do: {:error, "unsupported InfluxQL (a second statement after `;`)"},
       else: {:error, {:engine, InfluxQLError.syntax_error_body(:nom, next, ctx.raw)}}
   end

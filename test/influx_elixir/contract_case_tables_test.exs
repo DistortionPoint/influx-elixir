@@ -305,6 +305,9 @@ defmodule InfluxElixir.ContractCaseTablesTest do
       {{:differs,
         "a carriage return right after GROUP leaves the statement over from it; after BY it is the missing BY"},
        2},
+    {:influxql, "select usage from~p1 where now() (fill(1)"} => {@stop_place, 2},
+    {:influxql, "show\vmeasurements"} => {@stop_place, 2},
+    {:influxql, "select usage from~p1 where n>1"} => {@word_as_written, 2},
     {:influxql, "select usage from ~p1 group by host fill(null)"} =>
       {{:same_answer, [:blanks],
         "a carriage return anywhere inside the parentheses of fill() is the FILL option error " <>

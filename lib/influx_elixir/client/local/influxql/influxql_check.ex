@@ -1,5 +1,6 @@
 defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   @moduledoc false
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
   # The checks the engine's parser makes on the clauses of a statement, each
   # reporting the position the engine reports (see
   # `InfluxElixir.Client.Local.InfluxQLError`): the select list and `FROM`, the
@@ -50,7 +51,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # A clause keyword inside what the clause regex took for the `WHERE` means
   # the clause after it is malformed: the condition ends there, and that
   # clause is what the engine reads next.
-  @clause_keyword ~r/\b(?:GROUP|ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b/i
+  @clause_keyword ~q/\b(?:GROUP|ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b|(?<![\w.])tz(?=\s*\()/i
 
   # The functions the engine's parser accepts in a condition: the scalar math functions.
   @math_functions ~w(abs sin cos tan asin acos atan atan2 exp log ln log2 log10 sqrt pow floor ceil round date_part)
@@ -142,12 +143,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   def check_where_call(_whole, _at, _masked_rest, nil), do: nil
 
   def check_where_call(whole, at, masked_rest, where) do
-    [{from, length}] = Regex.run(~r/\bWHERE\s+/i, masked_rest, return: :index)
+    [{from, length}] = Regex.run(~q/\bWHERE\s+/i, masked_rest, return: :index)
     masked = binary_part(masked_rest, from + length, byte_size(where))
 
     # The clauses taken out of the text (blanked) are in the statement the parser reads.
     text = InfluxQLText.mask_literals(binary_part(whole, at, byte_size(masked_rest)))
-    calls = Regex.scan(~r/(?<![\w])([A-Za-z_]\w*)\s*\(/, masked, return: :index)
+    calls = Regex.scan(~q/(?<![\w])([A-Za-z_]\w*)\s*\(/, masked, return: :index)
 
     read_calls(calls, %{
       whole: whole,
@@ -167,17 +168,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   defp read_calls([[{start, size}, {name_at, name_size}] | calls], ctx) do
     name = ctx.masked |> binary_part(name_at, name_size) |> String.downcase()
 
-    # `now()` has no arguments to read, a connective before a parenthesis is no call.
-    if now_call?(name, ctx.masked, name_at) or name in ["and", "or", "not"] or
-         InfluxQLText.reserved?(name),
-       do: read_calls(calls, ctx),
-       else: read_call(name, start, size, calls, ctx)
+    if no_call?(name, name_at, ctx),
+      do: read_calls(calls, ctx),
+      else: read_call(name, start, size, calls, ctx)
   end
+
+  # `now()` has no arguments to read, a connective or a boolean before a parenthesis is no call.
+  defp no_call?(name, name_at, ctx),
+    do:
+      now_call?(name, ctx.masked, name_at) or name in ["and", "or", "not", "true", "false"] or
+        InfluxQLText.reserved?(name)
 
   # `now()` with nothing between the parentheses; `now(` left open or with arguments is a call
   # like any other.
   defp now_call?("now", masked, at),
-    do: masked |> binary_part(at, byte_size(masked) - at) |> String.match?(~r/\Anow\s*\(\s*\)/i)
+    do: masked |> binary_part(at, byte_size(masked) - at) |> String.match?(~q/\Anow\s*\(\s*\)/i)
 
   defp now_call?(_name, _masked, _at), do: false
 
@@ -187,7 +192,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
          false <- top_level_comma?(binary_part(ctx.masked, 0, start)) do
       call_at = ctx.from + start
 
-      case call_result(ctx, name, call_at, call_at + size - 1) do
+      case call_result(Map.put(ctx, :later, calls), name, call_at, call_at + size - 1) do
         :next -> read_calls(calls, ctx)
         result -> result
       end
@@ -223,10 +228,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
         fail(:call, ctx.at + call_at, ctx.whole)
 
       {{:fail, :eot}, _math?} ->
-        call_failure(ctx, call_at, open_at, byte_size(ctx.text))
+        failing(ctx, call_at, open_at, byte_size(ctx.text))
 
       {{:fail, pos}, _math?} ->
-        call_failure(ctx, call_at, open_at, pos)
+        failing(ctx, call_at, open_at, pos)
 
       {:unknown, false} ->
         refuse(ctx.at + call_at, "unsupported InfluxQL (#{name}() in a WHERE)")
@@ -234,6 +239,30 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       {_read_or_unknown, true} ->
         :next
     end
+  end
+
+  # The engine checks the name of a call that closes inside the arguments before it meets the
+  # failure behind it, which the double does not place (`x ( fill(1)` is the unknown `fill`,
+  # not the failure at the end of the text): refused. A failure inside the nested call stands.
+  @spec failing(map(), non_neg_integer(), non_neg_integer(), non_neg_integer()) :: positioned()
+  defp failing(ctx, call_at, open_at, pos) do
+    if closed_unknown_call?(ctx, pos),
+      do:
+        refuse(
+          ctx.at + call_at,
+          "unsupported InfluxQL (a call inside the arguments of a call that fails)"
+        ),
+      else: call_failure(ctx, call_at, open_at, pos)
+  end
+
+  defp closed_unknown_call?(ctx, pos) do
+    Enum.any?(ctx.later, fn [{start, size}, {name_at, name_size}] ->
+      name = ctx.masked |> binary_part(name_at, name_size) |> String.downcase()
+      paren = ctx.from + start + size - 1
+
+      not no_call?(name, name_at, ctx) and name not in @math_functions and paren < pos and
+        match?({:ok, stop} when stop <= pos, InfluxQLArgs.read(ctx.text, paren))
+    end)
   end
 
   # The call is read in full: whatever it fails at, the engine meets it where the call starts.
@@ -257,7 +286,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   @spec condition_error(binary(), non_neg_integer(), binary(), binary()) :: positioned() | nil
   @doc false
   def condition_error(whole, at, masked_rest, rest) do
-    with [{0, length}] <- Regex.run(~r/\A\s*WHERE\s+/i, masked_rest, return: :index),
+    with [{0, length}] <- Regex.run(~q/\A\s*WHERE\s+/i, masked_rest, return: :index),
          where = condition_text(rest, masked_rest, length),
          true <- where != "",
          {_key, {:error, _reason}} = error <-
@@ -287,7 +316,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     condition = binary_part(masked_rest, start, byte_size(masked_rest) - start)
 
     stop =
-      ~r/(?<![\w])(?:GROUP(?![\w])|ORDER\s+BY|S?LIMIT|S?OFFSET|tz\s*\(|fill\s*\()/i
+      ~q/(?<![\w])(?:GROUP(?![\w])|ORDER\s+BY|S?LIMIT|S?OFFSET|tz\s*\(|fill\s*\()/i
       |> Regex.scan(condition, return: :index)
       |> Enum.find_value(byte_size(condition), fn [{from, _size}] ->
         if clause_position?(condition, from), do: from
@@ -340,11 +369,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     start = at + from
 
     cond do
-      text =~ ~r/^ORDER\s+BY/i -> check_order(text, start, whole)
-      text =~ ~r/^(?:S?LIMIT|S?OFFSET)(?![\w])/i -> check_count(text, start, whole)
-      text =~ ~r/^GROUP(?![\w])/i -> check_group_keyword(text, start, whole)
-      text =~ ~r/^ORDER(?![\w])/i -> fail(:nom, start, whole)
+      text =~ ~q/^ORDER\s+BY/i -> check_order(text, start, whole)
+      text =~ ~q/^(?:S?LIMIT|S?OFFSET)(?![\w])/i -> check_count(text, start, whole)
+      text =~ ~q/^GROUP(?![\w])/i -> check_group_keyword(text, start, whole)
+      text =~ ~q/^ORDER(?![\w])/i -> fail(:nom, start, whole)
+      text =~ ~q/^tz\s*\(/i -> check_tz_clause(text, start, whole)
       true -> unread()
+    end
+  end
+
+  # The `tz('zone')` clause comes last: what stands after its parenthesis is left over from
+  # where it starts (verified: `x tz('UTC') < 1`, `x tz('UTC') LIMIT 1`, `x tz('UTC') SLIMIT 1`).
+  # Without anything after it the clauses are in an order the double does not read.
+  @spec check_tz_clause(binary(), non_neg_integer(), binary()) :: positioned()
+  defp check_tz_clause(text, start, whole) do
+    case Regex.run(~q/\Atz\s*\(\s*'_*'\s*\)\s*/i, text, return: :index) do
+      [{0, size}] when size < byte_size(text) -> fail(:nom, start + size, whole)
+      _none_or_last -> unread()
     end
   end
 
@@ -362,10 +403,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       text == "" ->
         nil
 
-      text =~ ~r/^(?:ORDER|S?LIMIT|S?OFFSET)(?![\w])/i ->
+      text =~ ~q/^(?:ORDER|S?LIMIT|S?OFFSET)(?![\w])/i ->
         check_swallowed(whole, at, masked_rest, {from})
 
-      text =~ ~r/^tz\s*\(/i ->
+      text =~ ~q/^tz\s*\(/i ->
         unread()
 
       true ->
@@ -397,14 +438,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # or TIME", at the end of `BY`.
   @spec check_order(binary(), non_neg_integer(), binary()) :: positioned()
   defp check_order(text, start, whole) do
-    [{_at, size}, {_blank, blank}] = Regex.run(~r/^ORDER\s+BY(\s*)/i, text, return: :index)
+    [{_at, size}, {_blank, blank}] = Regex.run(~q/^ORDER\s+BY(\s*)/i, text, return: :index)
     after_by = binary_part(text, size, byte_size(text) - size)
 
     cond do
-      after_by =~ ~r/^(?:time|asc|desc)(?![\w])/i ->
+      after_by =~ ~q/^(?:time|asc|desc)(?![\w])/i ->
         unread()
 
-      InfluxQLText.reserved_start(after_by) == nil and after_by =~ ~r/^[A-Za-z_]/ ->
+      InfluxQLText.reserved_start(after_by) == nil and after_by =~ ~q/^[A-Za-z_]/ ->
         fail(:order_time, start + size, whole)
 
       true ->
@@ -417,13 +458,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   @spec check_count(binary(), non_neg_integer(), binary()) :: positioned()
   defp check_count(text, start, whole) do
     [_all, {word, word_size}, {at, _blank}, {_rest_at, rest_size}] =
-      Regex.run(~r/^(S?LIMIT|S?OFFSET)\s*()(.*)$/is, text, return: :index)
+      Regex.run(~q/^(S?LIMIT|S?OFFSET)\s*()(.*)$/is, text, return: :index)
 
     kind = text |> binary_part(word, word_size) |> String.downcase() |> count_clause()
 
     cond do
       rest_size == 0 -> fail(:nom, start, whole)
-      binary_part(text, at, 1) =~ ~r/\d/ -> unread()
+      binary_part(text, at, 1) =~ ~q/\d/ -> unread()
       true -> fail(kind, start + at, whole)
     end
   end
@@ -443,17 +484,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   @spec check_group_keyword(binary(), non_neg_integer(), binary()) :: positioned()
   defp check_group_keyword(text, start, whole) do
     cond do
-      text =~ ~r/^GROUP(?:\s+BY)?$/i ->
+      text =~ ~q/^GROUP(?:\s+BY)?$/i ->
         fail(:nom, start, whole)
 
-      text =~ ~r/^GROUP\s+BY\s+$/i ->
+      text =~ ~q/^GROUP\s+BY\s+$/i ->
         fail(:group, start + byte_size(text), whole)
 
-      text =~ ~r/^GROUP\s+BY(?![\w])/i ->
+      text =~ ~q/^GROUP\s+BY(?![\w])/i ->
         unread()
 
       true ->
-        [{_at, size}] = Regex.run(~r/^GROUP\s*/i, text, return: :index)
+        [{_at, size}] = Regex.run(~q/^GROUP\s*/i, text, return: :index)
         fail(:group_by, start + size, whole)
     end
   end
@@ -520,7 +561,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
 
   defp unterminated(<<c, _rest::binary>> = text, at, state)
        when c in ?a..?z or c in ?A..?Z or c == ?_ or c in ?0..?9 or c == ?. do
-    [word] = Regex.run(~r/\A[A-Za-z0-9_.]+/, text)
+    [word] = Regex.run(~q/\A[A-Za-z0-9_.]+/, text)
     size = byte_size(word)
     rest = binary_part(text, size, byte_size(text) - size)
     unterminated(rest, at + size, after_word(String.downcase(word), state))
@@ -564,7 +605,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   @spec check_empty_where(binary(), non_neg_integer(), binary()) :: positioned() | nil
   @doc false
   def check_empty_where(whole, at, masked_rest) do
-    case Regex.run(~r/^(\s*)WHERE\s*$/i, masked_rest, return: :index) do
+    case Regex.run(~q/^(\s*)WHERE\s*$/i, masked_rest, return: :index) do
       [_all, {_from, blank}] -> fail(:nom, at + blank, whole)
       nil -> nil
     end
@@ -575,7 +616,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   def check_where(_whole, _at, _masked_rest, nil), do: nil
 
   def check_where(whole, at, masked_rest, where) do
-    [{from, length}] = Regex.run(~r/\bWHERE\s+/i, masked_rest, return: :index)
+    [{from, length}] = Regex.run(~q/\bWHERE\s+/i, masked_rest, return: :index)
     start = from + length
     where = where <> cr_after_connective(masked_rest, start, where)
     masked = binary_part(masked_rest, start, byte_size(where))
@@ -605,7 +646,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   defp cr_after_connective(masked_rest, start, where) do
     stop = start + byte_size(where)
 
-    if Regex.match?(~r/(?<![\w])(?:AND|OR)\z/i, where) and
+    if Regex.match?(~q/(?<![\w])(?:AND|OR)\z/i, where) and
          InfluxQLLex.cr_after?(masked_rest, stop),
        do: "\r",
        else: ""
@@ -654,13 +695,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       before = masked |> binary_part(0, open) |> InfluxQLLex.trim_trailing_blanks()
 
       cond do
-        Regex.match?(~r/\A[ \t\r\n(+\-]*\z/, before) ->
+        Regex.match?(~q/\A[ \t\r\n(+\-]*\z/, before) ->
           :where_unparsed
 
-        Regex.match?(~r/(?:\A|[^\w])(?:AND|OR)\z/i, before) ->
+        Regex.match?(~q/(?:\A|[^\w])(?:AND|OR)\z/i, before) ->
           {:operand_after, byte_size(before)}
 
-        Regex.match?(~r/(?:=~|!~|!=|<>|<=|>=|=|<|>)\z/, before) ->
+        Regex.match?(~q/(?:=~|!~|!=|<>|<=|>=|=|<|>)\z/, before) ->
           {:operand_after, byte_size(before)}
 
         true ->
@@ -673,7 +714,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
 
   # Where the outermost parenthesis that is no call and is still open at the end of `text` is.
   defp outermost_group(text) do
-    ~r/[()]/
+    ~q/[()]/
     |> Regex.scan(text, return: :index)
     |> List.flatten()
     |> Enum.reduce([], fn {at, 1}, open ->
@@ -693,7 +734,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     if text
        |> binary_part(0, at)
        |> InfluxQLLex.trim_trailing_blanks()
-       |> String.match?(~r/(?<![\w])(?!(?:and|or|not)\z)[A-Za-z_]\w*\s*\z/i),
+       |> String.match?(~q/(?<![\w])(?!(?:and|or|not)\z)[A-Za-z_]\w*\s*\z/i),
        do: :call,
        else: :group
   end
@@ -730,7 +771,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     start = at + byte_size(piece) - byte_size(text)
 
     cond do
-      text =~ ~r/^time\s*$/i ->
+      text =~ ~q/^time\s*$/i ->
         fail(:time_call, start + 4, whole)
 
       InfluxQLText.reserved_start(text) == nil and not String.starts_with?(text, "(") ->
@@ -852,7 +893,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   defp lexer_error({:lexer, _start, error}), do: {0, error}
 
   defp blanks?(whole, from, to) when to <= byte_size(whole),
-    do: binary_part(whole, from, to - from) =~ ~r/\A[ \t\r\n]*\z/
+    do: binary_part(whole, from, to - from) =~ ~q/\A[ \t\r\n]*\z/
 
   defp blanks?(_whole, _from, _to), do: false
 
@@ -864,7 +905,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   def check_unsigned(whole, at, masked_rest) do
     # Read from the text, not from the clauses: a clause behind one that is overflowing
     # may not read at all, and the overflow stands first.
-    ~r/(?<![\w])(?:limit|offset|slimit|soffset)\s+(\d+)/i
+    ~q/(?<![\w])(?:limit|offset|slimit|soffset)\s+(\d+)/i
     |> Regex.scan(masked_rest, return: :index)
     |> Enum.find_value(fn [_all, {from, length}] ->
       if masked_rest |> binary_part(from, length) |> String.to_integer() > SQLLimits.uint64_max(),

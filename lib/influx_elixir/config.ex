@@ -135,13 +135,15 @@ defmodule InfluxElixir.Config do
   """
   @spec validate(keyword()) ::
           {:ok, keyword()} | {:error, NimbleOptions.ValidationError.t()}
-  def validate(opts) when is_list(opts), do: NimbleOptions.validate(opts, @schema)
-
   def validate(opts) do
-    {:error,
-     %NimbleOptions.ValidationError{
-       message: "expected the options to be a keyword list, got: #{inspect(opts)}"
-     }}
+    if is_list(opts) and Keyword.keyword?(opts) do
+      NimbleOptions.validate(opts, @schema)
+    else
+      {:error,
+       %NimbleOptions.ValidationError{
+         message: "expected the options to be a keyword list, got: #{inspect(opts)}"
+       }}
+    end
   end
 
   # A host is written into every request's URL: an empty one, or one with a

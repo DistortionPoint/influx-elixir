@@ -22,6 +22,9 @@ defmodule InfluxElixir.MixProject do
         ignore_modules: [
           # Auto-generated gRPC stub (no logic to test)
           InfluxElixir.Flight.Proto.FlightService.Stub,
+          # Runs only while the InfluxQL patterns compile (the `~q` sigil), which runtime
+          # coverage cannot count; every InfluxQL contract case exercises what it produces
+          InfluxElixir.Client.Local.InfluxQLBlankRegex,
           # Test support modules (not library code)
           InfluxElixir.InfluxCase,
           InfluxElixir.IntegrationHelper,
