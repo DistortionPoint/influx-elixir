@@ -58,6 +58,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     operand_token({:ident, String.replace(name, "\\\"", "\"")}, rest, acc)
   end
 
+  # A bind parameter is an operand like a name (verified: what follows it is left over as it is
+  # after a name, `$a.b` and `$a::tag` from the dot and the colons). The double binds none.
+  defp lex(<<?$, _rest::binary>> = text, acc) do
+    case InfluxQLLex.take_param(text) do
+      {_param, <<?., _more::binary>> = rest} -> {:syntax_error, :nom, rest}
+      {_param, <<"::", _more::binary>> = rest} -> {:syntax_error, :nom, rest}
+      {param, rest} -> tokenize(rest, [{:param, param} | acc])
+      nil -> {:error, "unsupported InfluxQL WHERE: " <> text}
+    end
+  end
+
   defp lex(<<?/, _rest::binary>> = text, []), do: {:syntax_error, :where_unparsed, text}
 
   defp lex(<<?/, rest::binary>>, [{:op, op} | _tokens] = acc) when op in ["=~", "!~"] do
@@ -77,10 +88,26 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
 
   # A binary `+` or `-` fails where its operand should start when nothing that can start one
   # stands there (verified: `(f +)`, `f + = 1`, `f > 1 + )` fail at the `)` or the operator).
-  defp lex(<<c, rest::binary>>, [previous | _before] = acc) when c in [?+, ?-] do
-    if operand_end?(previous) and InfluxQLLex.operand_missing?(rest),
-      do: {:syntax_error, :reserved_failure, InfluxQLLex.trim_blanks(rest)},
-      else: tokenize(rest, [{:raw, <<c>>} | acc])
+  defp lex(<<c, rest::binary>> = text, [previous | _before] = acc) when c in [?+, ?-] do
+    cond do
+      not operand_end?(previous) ->
+        tokenize(rest, [{:raw, <<c>>} | acc])
+
+      InfluxQLLex.operand_missing?(rest) ->
+        {:syntax_error, :reserved_failure, InfluxQLLex.trim_blanks(rest)}
+
+      InfluxQLLex.trim_both_blanks(rest) != "" ->
+        tokenize(rest, [{:raw, <<c>>} | acc])
+
+      # A sign that ends the text fails the same way; after a `)` it is left over from a
+      # closed condition (`(f) +`) and fails inside an open group (`((f) +`), which the double
+      # does not tell apart from a call or an expression in parentheses.
+      previous == {:raw, ")"} ->
+        {:error, "unsupported InfluxQL WHERE: " <> text}
+
+      true ->
+        {:syntax_error, :reserved_failure, InfluxQLLex.trim_blanks(rest)}
+    end
   end
 
   # A `*` or `/` that no operand follows is left over from itself (verified: `f * AND n`,
@@ -89,7 +116,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp lex(<<c, rest::binary>> = text, [previous | _before] = acc) when c in [?*, ?/] do
     cond do
       not (operand_end?(previous) and
-               (InfluxQLLex.operand_missing?(rest) or String.trim(rest) == "")) ->
+               (InfluxQLLex.operand_missing?(rest) or
+                  InfluxQLLex.trim_both_blanks(rest) == "")) ->
         tokenize(rest, [{:raw, <<c>>} | acc])
 
       open_parens(acc) == 0 ->
@@ -220,7 +248,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     do: operand_end?(previous) and Regex.match?(@after_operand, text) and not connective?(text)
 
   @spec operand_end?(term()) :: boolean()
-  defp operand_end?({kind, _value}) when kind in [:ident, :number, :str], do: true
+  defp operand_end?({kind, _value}) when kind in [:ident, :number, :str, :param], do: true
   defp operand_end?({:duration, _total, _text}), do: true
   defp operand_end?({:raw, word}), do: String.upcase(word) in ["TRUE", "FALSE", "NOW()", ")"]
   defp operand_end?(_token), do: false
@@ -260,7 +288,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
   defp word_token("NOT", word, rest, acc) do
     if Regex.match?(~r/^\s*(?!(?:AND|OR)\b)[A-Za-z_0-9."']/i, rest),
-      do: {:syntax_error, :nom, String.trim_leading(rest)},
+      do: {:syntax_error, :nom, InfluxQLLex.trim_blanks(rest)},
       else: tokenize(rest, [{:ident, word} | acc])
   end
 
@@ -268,10 +296,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     cond do
       reserved_kind(acc) != :nom -> {:syntax_error, reserved_kind(acc), word <> rest}
       InfluxQLLex.cr_after?(rest, 0) -> {:syntax_error, :nom, word <> rest}
-      String.trim(rest) == "" -> {:syntax_error, :operand, rest}
+      InfluxQLLex.glued?(rest) -> {:syntax_error, :nom, word <> rest}
+      InfluxQLLex.trim_both_blanks(rest) == "" -> {:syntax_error, :operand, rest}
       InfluxQLLex.operand_missing?(rest) -> {:syntax_error, :operand, rest}
       Regex.match?(~r/\A['".]/, rest) -> {:syntax_error, :nom, word <> rest}
-      String.starts_with?(String.trim_leading(rest), "/") -> {:syntax_error, :operand, rest}
+      String.starts_with?(InfluxQLLex.trim_blanks(rest), "/") -> {:syntax_error, :operand, rest}
       true -> tokenize(rest, [{:raw, word} | acc])
     end
   end
@@ -337,7 +366,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   @spec operand(binary(), {:op, binary()}, list()) ::
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
   defp operand(rest, {:op, op} = token, acc) do
-    trimmed = String.trim_leading(rest)
+    trimmed = InfluxQLLex.trim_blanks(rest)
 
     cond do
       op in ["=~", "!~"] and not String.starts_with?(trimmed, "/") ->

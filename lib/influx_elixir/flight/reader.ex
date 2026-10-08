@@ -489,7 +489,7 @@ defmodule InfluxElixir.Flight.Reader do
     with {:ok, row_count, buffer_specs, meta} <-
            parse_record_batch_header(header),
          :ok <- check_uncompressed(meta),
-         :ok <- check_row_counts(row_count, meta.nodes, body),
+         :ok <- check_row_counts(columns, row_count, meta.nodes, body),
          {:ok, col_vectors} <-
            decode_columns(columns, buffer_specs, body, row_count, meta) do
       {:ok, zip_columns(columns, col_vectors, row_count)}
@@ -554,18 +554,27 @@ defmodule InfluxElixir.Flight.Reader do
     end
   end
 
-  # Every column is built to its row count, so a count from a corrupt header
-  # (one flipped byte of metadata) would allocate gigabytes. A column with
-  # data holds at least one bit per row in the body, which bounds the count
-  # by the bytes received; a column without buffers (the null type, or a
-  # batch that omits them) is bounded far above any batch the engine sends
-  # (8192 rows), which caps the cost of a corrupt count at a few megabytes.
-  @rows_without_body 1_048_576
+  # Every column is built to its row count, and every row is a map, so a
+  # count from a corrupt header (one flipped byte of metadata) would allocate
+  # gigabytes. A column with data holds at least one bit per row in the body,
+  # which bounds the count by the bytes received (with a small floor for a
+  # batch that omits its buffers). Only a batch of null-type columns has no
+  # body at all; it is bounded above any batch the engine sends (8192 rows).
+  @rows_floor 64
+  @rows_of_nulls 65_536
 
-  @spec check_row_counts(integer(), [{integer(), integer()}], binary() | nil) ::
-          :ok | {:error, term()}
-  defp check_row_counts(row_count, nodes, body) do
-    limit = max(8 * byte_size(body || <<>>), @rows_without_body)
+  @spec check_row_counts(
+          [column_schema()],
+          integer(),
+          [{integer(), integer()}],
+          binary() | nil
+        ) :: :ok | {:error, term()}
+  defp check_row_counts(columns, row_count, nodes, body) do
+    limit =
+      if columns != [] and Enum.all?(columns, &(&1.kind == :null)),
+        do: @rows_of_nulls,
+        else: max(8 * byte_size(body || <<>>), @rows_floor)
+
     counts = [row_count | Enum.map(nodes, &elem(&1, 0))]
 
     if Enum.all?(counts, &(&1 in 0..limit//1)),

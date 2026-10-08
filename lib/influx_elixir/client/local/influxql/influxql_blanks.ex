@@ -22,11 +22,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
 
   @select_stage ~r/(?<![\w])(SELECT|AS|FROM)\r/i
   @clause_stage ~r/(?<![\w])(WHERE|GROUP|BY|ORDER|ASC|DESC|LIMIT|OFFSET|SLIMIT|SOFFSET)\r/i
-  @call_stage Regex.compile!(
-                "(?<![\\w])(?:fill|tz)\\r[ \\t\\r\\n]*\\(|" <>
-                  "(?<![\\w])fill[ \\t\\r\\n]*\\([ \\t\\r\\n+\\-]*(?:null|none|previous|linear)\\r",
-                "i"
-              )
+  @name_stage ~r/(?<![\w])(?:fill|tz)\r[ \t\r\n]*\(/i
+  @option_stage Regex.compile!(
+                  "(?<![\\w])fill[ \\t\\r\\n]*(\\()[ \\t\\r\\n+\\-]*(?:null|none|previous|linear)\\r",
+                  "i"
+                )
+  @condition_end ~r/(?<![\w])(?:GROUP|ORDER|S?LIMIT|S?OFFSET|tz|fill)(?![\w])/i
 
   @call_refusal "unsupported InfluxQL (a carriage return after fill, tz or a fill() option)"
 
@@ -62,12 +63,56 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
         keyword_error(word, from, masked_rest, at, whole)
       end)
 
-    InfluxQLCheck.leftmost([keywords, calls(at, masked_rest)])
+    InfluxQLCheck.leftmost([keywords | calls(whole, at, masked_rest)])
   end
 
-  defp calls(at, masked_rest) do
-    with [{from, _size}] <- Regex.run(@call_stage, masked_rest, return: :index),
-         do: InfluxQLCheck.refuse(at + from, @call_refusal)
+  # `fill` or `tz` with a carriage return before its parenthesis is left over from its name,
+  # and a `fill()` option with one directly after it is an invalid option, read from just
+  # after the parenthesis (verified, blanks, signs and the other clauses around). Inside a
+  # condition the word is a call, whose errors are another's (see `InfluxQLCheck`): refused.
+  defp calls(whole, at, masked_rest) do
+    names =
+      for [{from, _size}] <- Regex.scan(@name_stage, masked_rest, return: :index),
+          do:
+            call_error(
+              masked_rest,
+              from,
+              fn -> InfluxQLCheck.fail(:nom, at + from, whole) end,
+              at
+            )
+
+    options =
+      for [{from, _size}, {paren, 1}] <- Regex.scan(@option_stage, masked_rest, return: :index),
+          do:
+            call_error(
+              masked_rest,
+              from,
+              fn -> InfluxQLCheck.fail(:fill, at + paren + 1, whole) end,
+              at
+            )
+
+    names ++ options
+  end
+
+  defp call_error(masked_rest, from, answer, at) do
+    if in_condition?(masked_rest, from),
+      do: InfluxQLCheck.refuse(at + from, @call_refusal),
+      else: answer.()
+  end
+
+  # Whether the text at `from` stands in a `WHERE` condition: after a `WHERE` with no clause
+  # keyword between.
+  defp in_condition?(masked_rest, from) do
+    before = binary_part(masked_rest, 0, from)
+
+    case List.last(Regex.scan(~r/(?<![\w])WHERE(?![\w])/i, before, return: :index)) do
+      nil ->
+        false
+
+      [{where, size}] ->
+        since = binary_part(before, where + size, byte_size(before) - where - size)
+        not Regex.match?(@condition_end, since)
+    end
   end
 
   defp keyword_error(word, from, masked_rest, at, whole) when word in ["asc", "desc"] do

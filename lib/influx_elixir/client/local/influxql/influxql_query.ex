@@ -8,6 +8,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   alias InfluxElixir.Client.Local.{
     Format,
     InfluxQL,
+    InfluxQLLex,
     InfluxQLPlan,
     InfluxQLRegex,
     InfluxQLShow,
@@ -41,7 +42,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           InfluxElixir.Client.query_result()
   defp do_query_influxql(table, conn, raw, opts) do
     # The engine's positions count the text as sent, blanks included.
-    influxql = String.trim(raw)
+    influxql = InfluxQLLex.trim_both_blanks(raw)
 
     # The engine parses the statement before it looks for the database. Text that is not
     # UTF-8 is refused first: how the engine reads it is not verified, and the double's

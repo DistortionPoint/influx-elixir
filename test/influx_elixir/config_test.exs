@@ -151,13 +151,39 @@ defmodule InfluxElixir.ConfigTest do
                Config.validate(host: 123, token: "t")
     end
 
-    test "rejects an empty :host, or one with a blank or control character" do
-      for host <- ["", "a b", "h\nx", "h\tx"] do
-        assert {:error, %NimbleOptions.ValidationError{key: :host}} = Config.validate(host: host)
+    test "options that are not a keyword list are a validation error, from both functions" do
+      for opts <- ["notalist", %{host: "h"}, nil] do
+        assert {:error, %NimbleOptions.ValidationError{}} = Config.validate(opts)
+        assert_raise NimbleOptions.ValidationError, fn -> Config.validate!(opts) end
+      end
+    end
+
+    # A host the request URL would read as something else sends the request elsewhere.
+    test "accepts only a host the request URL reads back as its host" do
+      for host <- [
+            "",
+            "a b",
+            "h\nx",
+            "h\tx",
+            <<0xFF>>,
+            "a" <> <<0xFF>> <> "b",
+            "[fe80::1%en0]",
+            "::1",
+            "http://x",
+            "x/y",
+            "host:8086",
+            "user@host",
+            "h?x",
+            "h#x",
+            "[::1",
+            "日本.jp"
+          ] do
+        assert {:error, %NimbleOptions.ValidationError{key: :host}} = Config.validate(host: host),
+               inspect(host)
       end
 
-      for host <- ["localhost", "[::1]", "10.0.0.1", "日本.jp"] do
-        assert {:ok, _opts} = Config.validate(host: host)
+      for host <- ["localhost", "[::1]", "10.0.0.1", "xn--wgv71a.jp", "a.b."] do
+        assert {:ok, _opts} = Config.validate(host: host), host
       end
     end
 

@@ -4,7 +4,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # reporting the position the engine reports (see
   # `InfluxElixir.Client.Local.InfluxQLError`).
 
-  alias InfluxElixir.Client.Local.{InfluxQLArgs, InfluxQLCheck, InfluxQLError, InfluxQLText}
+  alias InfluxElixir.Client.Local.{
+    InfluxQLArgs,
+    InfluxQLCheck,
+    InfluxQLError,
+    InfluxQLLex,
+    InfluxQLText
+  }
 
   @select_start ~r/^\s*SELECT(?![\w])\s*/i
   @regex_column ~r/^\/(?:[^\/\\]|\\.)+\/(?:\s+AS\s+(?:"[^"]+"|\w+))?$/s
@@ -68,7 +74,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
         engine(operand_at, operator_body(operator, operand_at, whole))
 
       :none ->
-        rest = masked |> binary_part(items_at, byte_size(masked) - items_at) |> String.trim()
+        rest =
+          masked
+          |> binary_part(items_at, byte_size(masked) - items_at)
+          |> InfluxQLLex.trim_both_blanks()
 
         # No `FROM`: the list is the rest of the statement, and the engine leaves it unparsed
         # where an item stops reading (an item followed by what is no part of it), else as late
@@ -84,10 +93,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     |> binary_part(items_at, byte_size(masked) - items_at)
     |> comma_pieces(items_at)
     |> Enum.find_value(byte_size(masked), fn {piece, at} ->
-      text = String.trim_leading(piece)
+      text = InfluxQLLex.trim_blanks(piece)
       start = at + byte_size(piece) - byte_size(text)
 
-      with leftover when leftover != nil <- InfluxQLArgs.item_leftover(String.trim(text)),
+      with leftover when leftover != nil <-
+             InfluxQLArgs.item_leftover(InfluxQLLex.trim_both_blanks(text)),
            do: start + leftover
     end)
   end
@@ -158,7 +168,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # An operator is binary when an operand stands before it.
   @spec binary_operator?(binary(), non_neg_integer()) :: boolean()
   defp binary_operator?(text, at) do
-    text |> binary_part(0, at) |> String.trim_trailing() |> String.match?(~r/[\w)"']$/)
+    text
+    |> binary_part(0, at)
+    |> InfluxQLLex.trim_trailing_blanks()
+    |> String.match?(~r/[\w)"']$/)
   end
 
   @spec operator_body(byte(), non_neg_integer(), binary()) :: binary()
@@ -235,7 +248,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # statement being unreadable before it.
   @spec readable_piece?(binary()) :: boolean()
   defp readable_piece?(piece) do
-    text = String.trim(piece)
+    text = InfluxQLLex.trim_both_blanks(piece)
     InfluxQLArgs.item?(text) or Regex.match?(@regex_column, text)
   end
 
@@ -248,9 +261,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
         ) ::
           InfluxQLCheck.positioned() | nil
   defp check_item(whole, piece, at, {index, last?, prior_read?}, from_keyword_at) do
-    text = String.trim_leading(piece)
+    text = InfluxQLLex.trim_blanks(piece)
     start = at + byte_size(piece) - byte_size(text)
-    text = String.trim_trailing(text)
+    text = InfluxQLLex.trim_trailing_blanks(text)
 
     eot = list_end(prior_read?, last?, from_keyword_at, at + byte_size(piece))
 
@@ -301,8 +314,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     |> Regex.scan(text, return: :index)
     |> Enum.find_value(fn [{from, length}] ->
       stop = from + length
-      next = text |> binary_part(stop, byte_size(text) - stop) |> String.trim_leading()
-      before = text |> binary_part(0, from) |> String.trim_trailing()
+      next = text |> binary_part(stop, byte_size(text) - stop) |> InfluxQLLex.trim_blanks()
+      before = text |> binary_part(0, from) |> InfluxQLLex.trim_trailing_blanks()
 
       cond do
         next =~ ~r/\A(?:[A-Za-z_]|")/ and InfluxQLText.reserved_start(next) == nil -> nil
@@ -334,7 +347,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   end
 
   defp call_before?(text, at),
-    do: text |> binary_part(0, at) |> String.trim_trailing() |> String.match?(~r/[A-Za-z_]\w*\z/)
+    do:
+      text
+      |> binary_part(0, at)
+      |> InfluxQLLex.trim_trailing_blanks()
+      |> String.match?(~r/[A-Za-z_]\w*\z/)
 
   @spec dangling_dot_body(:alias | :field, non_neg_integer(), non_neg_integer(), binary()) ::
           binary()

@@ -120,7 +120,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   @spec clause_position?(binary(), non_neg_integer()) :: boolean()
   defp clause_position?(masked, start) do
     before = binary_part(masked, 0, start)
-    String.trim(before) != "" and completes_operand?(masked, 0, start)
+    InfluxQLLex.trim_both_blanks(before) != "" and completes_operand?(masked, 0, start)
   end
 
   defp swallowed_in_group(masked_rest, index) do
@@ -168,10 +168,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     name = ctx.masked |> binary_part(name_at, name_size) |> String.downcase()
 
     # `now()` has no arguments to read, a connective before a parenthesis is no call.
-    if name in ["now", "and", "or", "not"] or InfluxQLText.reserved?(name),
-      do: read_calls(calls, ctx),
-      else: read_call(name, start, size, calls, ctx)
+    if now_call?(name, ctx.masked, name_at) or name in ["and", "or", "not"] or
+         InfluxQLText.reserved?(name),
+       do: read_calls(calls, ctx),
+       else: read_call(name, start, size, calls, ctx)
   end
+
+  # `now()` with nothing between the parentheses; `now(` left open or with arguments is a call
+  # like any other.
+  defp now_call?("now", masked, at),
+    do: masked |> binary_part(at, byte_size(masked) - at) |> String.match?(~r/\Anow\s*\(\s*\)/i)
+
+  defp now_call?(_name, _masked, _at), do: false
 
   defp read_call(name, start, size, calls, ctx) do
     with {:ok, _tokens} <- InfluxQLTokens.tokenize(binary_part(ctx.where, 0, start) <> "0", []),
@@ -285,7 +293,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
         if clause_position?(condition, from), do: from
       end)
 
-    rest |> binary_part(start, stop) |> String.trim_trailing()
+    rest |> binary_part(start, stop) |> InfluxQLLex.trim_trailing_blanks()
   end
 
   # Where a clause keyword stands inside a clause's text (not at its start):
@@ -347,7 +355,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   @spec after_fill(binary(), non_neg_integer(), binary(), non_neg_integer()) :: positioned() | nil
   defp after_fill(whole, at, masked_rest, stop) do
     rest = binary_part(masked_rest, stop, byte_size(masked_rest) - stop)
-    text = String.trim_leading(rest)
+    text = InfluxQLLex.trim_blanks(rest)
     from = stop + byte_size(rest) - byte_size(text)
 
     cond do
@@ -607,10 +615,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     pos = at + start + error_at
 
     case group_failure(kind, masked, error_at) do
-      nil -> positioned_where(kind, pos, at + from, whole)
-      group -> group_failure_error(group, at + from, at + start, whole)
+      nil -> positioned_where(kind, failure_start(kind, pos, whole), at + from, whole)
+      group -> group_failure_error(group, at + from, at + start, whole) |> found_at(pos)
     end
   end
+
+  # A sign with no operand fails the parser where the operand should start: past the blanks
+  # (verified: `WHERE (n + LIMIT 1` leaves `LIMIT 1`, `WHERE (n +` and `WHERE (n + ` leave "").
+  defp failure_start(:reserved_failure, pos, whole) do
+    rest = binary_part(whole, pos, byte_size(whole) - pos)
+    pos + byte_size(rest) - byte_size(InfluxQLLex.trim_blanks(rest))
+  end
+
+  defp failure_start(_kind, pos, _whole), do: pos
+
+  # A group that does not read is found where the parser gives up on it, not where its error
+  # points: a call the parser meets inside it first (`(fill(1) > 2 AND n 5)`) is the error, one
+  # it would meet after (`(n 5 AND fill(1) > 2)`) is not (verified). A `(` left open is found
+  # where the condition ends (see `InfluxQLParens`). Every failure of a group is keyed here.
+  @spec found_at(positioned(), non_neg_integer()) :: positioned()
+  @doc false
+  def found_at({_key, result}, found), do: {found, result}
 
   defp positioned_where(kind, pos, where_at, whole) do
     {key, body} = InfluxQLError.where_error(kind, pos, where_at, whole)
@@ -626,7 +651,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
           :where_unparsed | {:operand_after, non_neg_integer()} | nil
   defp group_failure(:nom, masked, error_at) do
     with open when open != nil <- outermost_group(binary_part(masked, 0, error_at)) do
-      before = masked |> binary_part(0, open) |> String.trim_trailing()
+      before = masked |> binary_part(0, open) |> InfluxQLLex.trim_trailing_blanks()
 
       cond do
         Regex.match?(~r/\A[ \t\r\n(+\-]*\z/, before) ->
@@ -667,7 +692,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   defp call_or_group(text, at) do
     if text
        |> binary_part(0, at)
-       |> String.trim_trailing()
+       |> InfluxQLLex.trim_trailing_blanks()
        |> String.match?(~r/(?<![\w])(?!(?:and|or|not)\z)[A-Za-z_]\w*\s*\z/i),
        do: :call,
        else: :group
@@ -701,7 +726,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   @spec group_dimension({{binary(), non_neg_integer()}, non_neg_integer()}, binary()) ::
           positioned() | nil
   defp group_dimension({{piece, at}, index}, whole) do
-    text = String.trim_leading(piece)
+    text = InfluxQLLex.trim_blanks(piece)
     start = at + byte_size(piece) - byte_size(text)
 
     cond do
@@ -802,15 +827,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   defp lexer?({:lexer, _start, _error}), do: true
   defp lexer?(_positioned), do: false
 
+  # The parser stops at the first error, whichever check finds it: the leftmost position of the
+  # engine's errors and the double's refusals together. A refusal at the position of an error of
+  # the engine's wins (the double does not know what the engine finds there), and of two of a
+  # kind the earlier check does.
   defp leftmost_parsed([]), do: nil
 
-  defp leftmost_parsed([{_pos, {:error, {:engine, _body}}} | _later] = results) do
+  defp leftmost_parsed(results) do
     results
-    |> Enum.filter(&match?({_pos, {:error, {:engine, _body}}}, &1))
-    |> Enum.min_by(fn {pos, _error} -> pos end)
+    |> Enum.with_index()
+    |> Enum.min_by(fn {{pos, error}, index} -> {pos, engine_rank(error), index} end)
+    |> elem(0)
   end
 
-  defp leftmost_parsed([refusal | _later]), do: refusal
+  defp engine_rank({:error, {:engine, _body}}), do: 1
+  defp engine_rank({:error, {:engine, _status, _body}}), do: 1
+  defp engine_rank(_refusal), do: 0
 
   defp lexer_first?({:lexer, start, _error}, {pos, {:error, {:engine, _body}}}, whole),
     do: start < pos or (start > pos and blanks?(whole, pos, start))

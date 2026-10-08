@@ -14,6 +14,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     InfluxQLError,
     InfluxQLExpr,
     InfluxQLGroup,
+    InfluxQLLex,
     InfluxQLLiteral,
     InfluxQLNames,
     InfluxQLSelectCheck,
@@ -393,7 +394,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   defp parse_items(text, masked) do
     masked
     |> InfluxQLSelectCheck.comma_pieces(0)
-    |> Enum.map(fn {piece, at} -> text |> binary_part(at, byte_size(piece)) |> String.trim() end)
+    |> Enum.map(fn {piece, at} ->
+      text |> binary_part(at, byte_size(piece)) |> InfluxQLLex.trim_both_blanks()
+    end)
     |> Enum.reduce_while({:ok, []}, fn text, {:ok, acc} ->
       case parse_item(text) do
         {:ok, item} -> {:cont, {:ok, [item | acc]}}

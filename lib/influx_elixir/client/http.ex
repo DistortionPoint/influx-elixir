@@ -274,12 +274,12 @@ defmodule InfluxElixir.Client.HTTP do
     end
   end
 
-  @spec encodable_text(binary() | nil) :: :ok | {:error, {:unencodable_body, binary()}}
+  @spec encodable_text(term()) :: :ok | {:error, {:unencodable_body, binary()}}
   defp encodable_text(text) when is_binary(text) do
     if String.valid?(text), do: :ok, else: json_body(%{"text" => text})
   end
 
-  defp encodable_text(nil), do: :ok
+  defp encodable_text(_not_text), do: :ok
 
   @spec http_query_sql(keyword(), binary(), keyword()) :: InfluxElixir.Client.query_result()
   defp http_query_sql(connection, sql, opts) do

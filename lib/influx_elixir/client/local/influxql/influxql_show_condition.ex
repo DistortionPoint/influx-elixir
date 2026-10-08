@@ -8,7 +8,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowCondition do
   # VALUES`. Each takes the spec read so far and returns it with the condition
   # added, with where the clause ends, or the engine's parse error.
 
-  alias InfluxElixir.Client.Local.InfluxQLCheck
+  alias InfluxElixir.Client.Local.{InfluxQLCheck, InfluxQLLex}
   alias InfluxElixir.Client.Local.InfluxQLShowText, as: Text
 
   @cond_end ~r/\b(?:LIMIT|OFFSET|SLIMIT|SOFFSET|GROUP|ORDER|FILL)\b|;/i
@@ -25,7 +25,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowCondition do
          true <- Text.ws?(ctx, at + 5) || :none do
       from = Text.skip_ws(ctx, at + 5)
       to = condition_end(ctx, from)
-      text = ctx.clean |> binary_part(from, to - from) |> String.trim_trailing()
+      text = ctx.clean |> binary_part(from, to - from) |> InfluxQLLex.trim_trailing_blanks()
 
       if text == "", do: :none, else: condition(ctx, text, from + byte_size(text), spec)
     end

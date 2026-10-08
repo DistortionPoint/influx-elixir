@@ -936,7 +936,7 @@ refuses a query that was answered before the row was written. The engine also re
 patterns before it runs them, and the rewrite is not the pattern's meaning: `s ~* '^abc$'`
 (an anchored literal, also in a group or an alternation of literals) keeps only the rows equal
 to `abc`, a pattern of literals with a backslash (`\\`, `\x5c`) becomes a `LIKE` that uses the
-backslash as its escape, and `.*` is answered differently under a negation. Those patterns are
+backslash as its escape, and `!~ '.*'` is answered differently. Those patterns are
 refused by name. `LIKE 'p' ESCAPE '\'` and a
 pattern of literals joined by `||` are answered; any other `ESCAPE` character is refused.
 

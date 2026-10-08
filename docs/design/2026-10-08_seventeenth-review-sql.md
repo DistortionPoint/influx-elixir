@@ -18,7 +18,7 @@
   (`CAST(i AS BIGINT) IN (0) AND i IN (1,2)`), beside an `OR` of equalities, and in a `HAVING`
   whose aggregates were `__agN__`.
 - **Rewrites of the engine's simplifier.** `s ~* '^abc$'` is an equality (case kept) on Core;
-  `s !~ '.*'` and `NOT (s ~ '.*')` are tests of the value's being empty or null; a pattern of
+  `s !~ '.*'` is a test of the value's being empty or null (and `s ~ '.*'` is false, not unknown, for a null: `NOT (s ~ '.*')` keeps the rows with no `s`); a pattern of
   literals with a backslash (`'\\'`, `'\x5c'`, `'[\\]'`) is a `LIKE` whose escape is the
   backslash.
 - Smaller: `format: <<255>>` raised `Jason.EncodeError`; `WITH c AS (SELECT length(s) ...)
@@ -40,7 +40,7 @@
   which three-valued logic reads alike, but the double has not verified every spelling.
 - **Rewrites** are refused by name (`SQLRegexRewrite`): an anchored literal (also in a group, a
   single-character class, an alternation of literals) beside `~*`/`!~*`; any literal backslash;
-  the pattern `.*`. A pattern the simplifier leaves alone (`^abc`, `abc$`, `^a.c$`, `^a[bB]$`,
+  the pattern `.*` beside `!~`/`!~*`. The engine decides on the parsed pattern: `(?s)^abc$`, `(?:^abc)$`, `^a[b-b]c$`, `^ab{1}?c$` are the equality too. A pattern the simplifier leaves alone (`^abc`, `abc$`, `^a.c$`, `^a[bB]$`,
   `(?i)^abc$`, `^ab1?$`) is run as written (all verified on Core).
 - **`time IS [NOT] NULL`** folds to a constant at the predicate (verified: `-u` beside `time IS
   NULL AND ...` is no error, beside `time IS NOT NULL AND ...` it is as if the test were not

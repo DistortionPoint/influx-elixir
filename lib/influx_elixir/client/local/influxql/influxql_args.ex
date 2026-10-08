@@ -81,7 +81,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   end
 
   defp aliased?(rest) do
-    String.trim(rest) == "" or
+    InfluxQLLex.trim_both_blanks(rest) == "" or
       Regex.match?(~r/\A[ \t]+AS[ \t]+(?:[A-Za-z_]\w*|"_*")[ \t]*\z/i, rest)
   end
 

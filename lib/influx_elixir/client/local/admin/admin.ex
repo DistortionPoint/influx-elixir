@@ -92,11 +92,14 @@ defmodule InfluxElixir.Client.Local.Admin do
   # A name is written into a JSON body or a URL, which only UTF-8 text can be, so no
   # engine answer exists for one that is not: the double refuses it by name.
   @spec utf8_name(binary(), binary()) :: :ok | {:error, map()}
-  defp utf8_name(name, kind) do
+  defp utf8_name(name, kind) when is_binary(name) do
     if String.valid?(name),
       do: :ok,
       else: {:error, %{status: 400, body: "Client.Local: the #{kind} name is not valid UTF-8"}}
   end
+
+  # A name that is not text keeps the path it had before this check.
+  defp utf8_name(_name, _kind), do: :ok
 
   # The engine's answer for its own database (verified).
   @spec deletable(binary()) :: :ok | {:error, map()}

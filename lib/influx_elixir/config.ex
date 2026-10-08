@@ -135,8 +135,13 @@ defmodule InfluxElixir.Config do
   """
   @spec validate(keyword()) ::
           {:ok, keyword()} | {:error, NimbleOptions.ValidationError.t()}
+  def validate(opts) when is_list(opts), do: NimbleOptions.validate(opts, @schema)
+
   def validate(opts) do
-    NimbleOptions.validate(opts, @schema)
+    {:error,
+     %NimbleOptions.ValidationError{
+       message: "expected the options to be a keyword list, got: #{inspect(opts)}"
+     }}
   end
 
   # A host is written into every request's URL: an empty one, or one with a
@@ -144,10 +149,22 @@ defmodule InfluxElixir.Config do
   # far from the option that caused it).
   @doc false
   @spec host(term()) :: {:ok, binary()} | {:error, binary()}
+  # The host is what the URL the client builds (`scheme://host:port`) reads back as its host:
+  # a name (non-ASCII names in their punycode `xn--` form), an IPv4 address, or an IPv6
+  # address in brackets. Anything else is read differently (`host:8086` drops the port,
+  # `x/y` and `h?x` move the rest into the path or query, `user@h` is user info, an IPv6
+  # zone `[fe80::1%en0]` is not a host) and would send the request somewhere else.
   def host(host) when is_binary(host) and host != "" do
-    if String.match?(host, ~r/[\s[:cntrl:]]/u) or not String.valid?(host),
-      do: {:error, "expected :host to have no blank or control character, got: #{inspect(host)}"},
-      else: {:ok, host}
+    with true <- String.valid?(host) and not String.match?(host, ~r/[\s[:cntrl:]]/),
+         {:ok, %URI{host: parsed, port: 1, userinfo: nil, path: nil, query: nil, fragment: nil}}
+         when parsed == host or "[" <> parsed <> "]" == host <- URI.new("http://#{host}:1") do
+      {:ok, host}
+    else
+      _not_a_host ->
+        {:error,
+         "expected :host to be a host name or an IP address (IPv6 in brackets), " <>
+           "got: #{inspect(host)}"}
+    end
   end
 
   def host(host), do: {:error, "expected :host to be a non-empty string, got: #{inspect(host)}"}
@@ -169,7 +186,10 @@ defmodule InfluxElixir.Config do
   """
   @spec validate!(keyword()) :: keyword()
   def validate!(opts) do
-    NimbleOptions.validate!(opts, @schema)
+    case validate(opts) do
+      {:ok, validated} -> validated
+      {:error, error} -> raise error
+    end
   end
 
   @doc """

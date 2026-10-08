@@ -11,7 +11,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   #     no keyword
   #   * the clauses after `FROM`
 
-  alias InfluxElixir.Client.Local.SQLMask
+  alias InfluxElixir.Client.Local.{InfluxQLLex, SQLMask}
 
   @reserved ~w(
     all alter analyze and any as asc begin by cardinality continuous create database
@@ -66,7 +66,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   @doc "`nil` for blank text, the trimmed text otherwise."
   @spec blank_to_nil(binary()) :: binary() | nil
   def blank_to_nil(""), do: nil
-  def blank_to_nil(text), do: String.trim(text)
+  def blank_to_nil(text), do: InfluxQLLex.trim_both_blanks(text)
 
   @doc """
   The statement with the inside of every quoted string, quoted identifier

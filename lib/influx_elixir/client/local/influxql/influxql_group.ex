@@ -31,6 +31,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     Durations,
     InfluxQLBuckets,
     InfluxQLError,
+    InfluxQLLex,
     InfluxQLText,
     InfluxQLTime,
     SQLLimits
@@ -101,7 +102,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
   @spec blank?(binary(), non_neg_integer()) :: boolean()
   defp blank?(text, start),
-    do: text |> binary_part(start, byte_size(text) - start) |> String.trim() == ""
+    do:
+      text |> binary_part(start, byte_size(text) - start) |> InfluxQLLex.trim_both_blanks() == ""
 
   @spec blank(binary(), non_neg_integer(), non_neg_integer()) :: binary()
   defp blank(masked_rest, from, stop) do
@@ -505,9 +507,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   def parse_loose_fill(nil), do: {:ok, nil}
 
   def parse_loose_fill(option) do
-    case option(String.trim(option)) do
+    case option(InfluxQLLex.trim_both_blanks(option)) do
       {:ok, fill, _size} -> {:ok, fill}
-      :error -> {:error, "unsupported InfluxQL (fill(#{String.trim(option)}))"}
+      :error -> {:error, "unsupported InfluxQL (fill(#{InfluxQLLex.trim_both_blanks(option)}))"}
     end
   end
 

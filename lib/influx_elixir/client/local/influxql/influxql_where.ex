@@ -19,6 +19,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   require SQLLimits
 
+  @param_refusal "unsupported InfluxQL (a bind parameter in a condition)"
+
   @doc "Plans a `WHERE`; see `InfluxElixir.Client.Local.InfluxQL.where_plan/3`. The option `:extend_lower` reads the lower bounds that much earlier in the SQL."
   @spec where_plan(
           binary(),
@@ -31,6 +33,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   def where_plan(where, tags, types \\ %{}, opts \\ []) do
     case InfluxQLTokens.tokenize(where, []) do
       {:ok, tokens} ->
+        # The engine binds the parameters (or says the first one has no value) as it plans,
+        # with planning errors of its own before and after that are not verified.
+        if Enum.any?(tokens, &match?({:param, _name}, &1)), do: throw({:refused, @param_refusal})
         {tree, _rest} = parse_or(tokens)
         InfluxQLTime.check_bare(tree)
         ctx = {tags, types}

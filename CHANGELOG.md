@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` InfluxQL: glued connectives, bind parameters, Unicode blanks**: `AND#n`,
+  `OR@` and other connectives glued to a character gave `invalid conditional expression`;
+  they are the engine's `Nom` at the keyword. `$name` and `$1` are read as operands (their
+  parse errors are the engine's) and a condition that reads one is refused by name. A
+  Unicode blank (`WHERE n > 1<NBSP>`) was trimmed and the rows answered; blanks are ASCII
+  only, in one place, as the engine reads them. Errors and refusals are ordered by where they
+  stand in the text, and a call error no longer loses to a group failure keyed at the
+  `WHERE`. A sign at the end of a condition (`(n > 1 +`, `time > now(`) is the engine's
+  `Parsing Failure`.
+- **Variance is Welford again**: the compensated two-pass variance of the previous fix
+  matched the engine less often than Welford, the engine's own accumulator (31 of 60 small
+  groups exact against 49). Equal values still have a variance of exactly zero.
+- **A name that is not text raised**: a non-binary database (`database: :name`) raised in
+  `Client.HTTP`, and a non-binary database, bucket or token name raised in `Client.Local`'s
+  admin functions, since the UTF-8 checks of the previous fix matched only binaries. Such
+  names take the path they took before.
 - **`Client.Local` InfluxQL: one order of parse errors, carriage returns, dotted names**: a
   stray quote or comment no longer wins over an earlier parse error (a lexer error stands only
   where the parser reaches the token), a `)` that closes nothing wins over a later bad token,
@@ -23,7 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   beside the aggregates it names, a comparison, a test, a cast, an `OR` of equalities), and
   `time`, never `NULL`, is not refused; `time IS [NOT] NULL` folds to a constant as the engine
   does (24 cases of unsigned negation are answered). Patterns the engine rewrites before it
-  runs them are refused by name: an anchored literal beside `~*`, a literal backslash, `.*`.
+  runs them are refused by name: an anchored literal beside `~*` (read as the engine parses it:
+  `(?s)^abc$`, `^a[b-b]c$` and `^ab{1}?c$` are the equality too), a literal backslash, `.*` beside
+  `!~`; `s ~ '.*'` is the match, false for a null.
   `format:` of invalid UTF-8 or a non-string is a refusal, not a `Jason.EncodeError`; a `WITH`
   over `length(s)` answers `3`, not `{:int, 32, 3}`; a refusal echoes the whole statement; the
   caret of `a{2,1}?` spans the `?`. The variance of ordinary floats is the corrected two-pass
@@ -38,13 +56,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Flight.Reader` allocated by a corrupt count**: a record batch's row count or field
   length, or a list column's offsets, were trusted as read, so one corrupt byte of a frame
   could build a column of billions of rows (36 of 1,950 corrupted frames went past 400 MB). A
-  count the batch's body cannot hold is now `{:error, {:decode_error, _}}`, and list offsets
-  are clamped to the child array. No valid frame decodes differently.
+  count above 8 rows per byte of the batch's body (65,536 for a batch of null-type columns,
+  which has no body) is now `{:error, {:decode_error, _}}`, and list offsets are clamped to
+  the child array. No valid frame decodes differently.
 - **Connection options a request cannot use are refused up front**:
-  `InfluxElixir.Config.validate/1` accepted a `:port` or `:flight_port` above 65535 and an
-  empty `:host`, or one with a blank or control character; each failed later, at the first
-  request, far from the option. They are now validation errors. A host that is a name, an IPv4 address, a bracketed IPv6 address or
-  non-ASCII text is still accepted.
+  `InfluxElixir.Config.validate/1` accepted a `:port` or `:flight_port` above 65535, an empty
+  `:host`, and hosts the request URL reads as something else (`host:8086` drops the port,
+  `x/y` or `h?x` move the rest into the path or query, `user@h`, an IPv6 zone
+  `[fe80::1%en0]`), which sent requests elsewhere or failed at the first one. A host must
+  now be a name (non-ASCII in its `xn--` form), an IPv4 address or a bracketed IPv6 address.
+  `validate/1` of something other than a keyword list is a validation error, and
+  `validate!/1` raises `NimbleOptions.ValidationError` for it (it raised
+  `FunctionClauseError`).
 - **`ResponseParser.parse/2` raised on a body it could not read**: a CSV body that is not
   CSV (a proxy's HTML error page, a body cut off inside a quoted cell) raised
   `NimbleCSV.ParseError`, and a JSON array or JSONL line holding something other than an object

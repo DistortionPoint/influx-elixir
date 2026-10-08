@@ -229,6 +229,9 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   # LIKE, ILIKE and the regular-expression operators over a text value; a
   # number or a boolean has no text to match.
   @spec pattern_condition(term(), atom(), term()) :: boolean() | nil
+  # The engine reads `s ~ '.*'` as the test that the value is not null: false, not unknown,
+  # for a null (verified: `NOT (s ~ '.*')` keeps the rows with no `s`).
+  defp pattern_condition(nil, :regex, {%Regex{source: ".*"}, _symbol, _guard}), do: false
   defp pattern_condition(nil, _op, _rest), do: nil
 
   defp pattern_condition(text, op, rest) when is_binary(text),

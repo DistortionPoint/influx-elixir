@@ -560,8 +560,6 @@ defmodule InfluxElixir.Write.BatchWriter do
       # Clients report HTTP failures as %{status, body}. A 4xx other than
       # 408 and 429 is the payload's fault and will never succeed on retry,
       # so it is discarded.
-      # (The clause used to match {:http_error, status}, a shape no client
-      # produces, so bad batches were retried with backoff.)
       {:error, %{status: status}} = error when permanent?(status) ->
         Logger.warning("[BatchWriter] 4xx error (#{status}) — discarding batch")
 

@@ -141,5 +141,41 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlannerTest do
       why = "unsupported InfluxQL (a signed argument that is no number): mean(-i)"
       assert refused(conn, statement) === "Client.Local: " <> why <> ": " <> statement
     end
+
+    test "a bind parameter in a condition, bound or not", %{conn: conn} do
+      # The engine plans `$name` as an operand and says the first one has no value (or binds
+      # it); its planning errors before and after that are not verified, so the double
+      # refuses, `params:` or not. A parse error anywhere in the statement still comes first.
+      for where <- ["i > $1", "i >$a", "k = $h", "i > 1 AND $n", "abs($a) > 1", "i > $\"a b\""] do
+        for opts <- [[database: "planner"], [database: "planner", params: %{"a" => 1}]] do
+          assert {:error, %{status: 400, body: body}} =
+                   Local.query_influxql(conn, "SELECT i FROM m WHERE " <> where, opts)
+
+          assert body === "Client.Local: unsupported InfluxQL (a bind parameter in a condition)"
+        end
+      end
+
+      assert refused(conn, "SELECT i FROM m WHERE i > $a.b") ===
+               "error in InfluxQL statement: parsing error: invalid InfluxQL statement at " <>
+                 ~s|pos 28. Parsing Error: Nom(".b", Tag)|
+    end
+
+    test "a sign that ends a condition after a closing parenthesis", %{conn: conn} do
+      for where <- ["(i > 1) +", "i > ((1 + 2) +"] do
+        assert refused(conn, "SELECT i FROM m WHERE " <> where) ===
+                 "Client.Local: unsupported InfluxQL WHERE: +"
+      end
+    end
+
+    test "a carriage return before the parenthesis of fill or tz inside a condition",
+         %{conn: conn} do
+      for where <- ["i > 1 tz\r('UTC')", "i > fill\r(null)"] do
+        statement = "SELECT i FROM m WHERE " <> where
+
+        assert refused(conn, statement) ===
+                 "Client.Local: unsupported InfluxQL " <>
+                   "(a carriage return after fill, tz or a fill() option): #{statement}"
+      end
+    end
   end
 end

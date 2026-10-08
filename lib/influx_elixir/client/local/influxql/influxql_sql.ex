@@ -68,7 +68,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   def rewrite([token | rest], tags, strings, acc),
     do: rewrite(rest, tags, strings, [token_sql(token) | acc])
 
-  # The SQL path refuses a bare `.*` (its simplifier rewrites it under a negation, which is not
+  # The SQL path refuses a bare `.*` beside `!~` (its simplifier rewrites that, which is not
   # the expression's meaning). InfluxQL has no `NOT`, and the engine answers its `=~ /.*/` and
   # `!~ /.*/` on a tag as the expression reads (verified: a missing tag is the empty string,
   # which `.*` matches), so the pattern is written as the group the SQL path does not rewrite.

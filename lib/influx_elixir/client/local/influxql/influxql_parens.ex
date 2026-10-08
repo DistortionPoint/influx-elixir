@@ -11,7 +11,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
   # parenthesis, after an operand the parenthesis is left over. The last
   # parenthesis left open decides.
 
-  alias InfluxElixir.Client.Local.{InfluxQLCheck, InfluxQLError, InfluxQLTokens}
+  alias InfluxElixir.Client.Local.{InfluxQLCheck, InfluxQLError, InfluxQLLex, InfluxQLTokens}
 
   # `now()` has parentheses of its own, which are no grouping.
   @parens ~r/(?<![\w])now\s*\(\s*\)|[()]/i
@@ -39,7 +39,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
         # A `(` left open is found when the condition ends, not where it stands: whatever the
         # parser meets inside the condition comes first (verified: a call it refuses, `fill(1)`,
         # is the error before, inside or after an open parenthesis).
-        {start + byte_size(masked), {:error, {:engine, body}}}
+        InfluxQLCheck.found_at({0, {:error, {:engine, body}}}, start + byte_size(masked))
     end
   end
 
@@ -74,9 +74,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
     do: {:open, offset, ordinal}
 
   defp walk([{at, ?(} | rest], open, count, masked, closed) do
-    if closed != nil and String.trim(binary_part(masked, closed, at - closed)) == "",
-      do: {:excess, at},
-      else: walk(rest, [{at, count} | open], count + 1, masked, nil)
+    if closed != nil and
+         InfluxQLLex.trim_both_blanks(binary_part(masked, closed, at - closed)) == "",
+       do: {:excess, at},
+       else: walk(rest, [{at, count} | open], count + 1, masked, nil)
   end
 
   defp walk([{at, ?)} | _rest], [], _count, _masked, _closed), do: {:excess, at}
@@ -86,7 +87,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
   defp walk([{at, ?)} | rest], [{offset, ordinal} | outer], count, masked, _closed) do
     inside = binary_part(masked, offset + 1, at - offset - 1)
 
-    if String.trim(inside) == "" and not call?(masked, offset),
+    if InfluxQLLex.trim_both_blanks(inside) == "" and not call?(masked, offset),
       do: {:open, offset, ordinal},
       else: walk(rest, outer, count, masked, at + 1)
   end

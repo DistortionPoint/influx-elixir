@@ -789,7 +789,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = int64_column([10, 20, 30])
       refused = {:error, {:decode_error, "a row count the record batch's body cannot hold"}}
 
-      for count <- [1 <<< 40, -1] do
+      for count <- [1 <<< 40, 1_048_576, 193, -1] do
         assert decode_bounded([schema, batch_fd(body, specs, count)]) === {:answered, refused}
       end
     end

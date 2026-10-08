@@ -102,7 +102,8 @@ defmodule InfluxElixir.Query.ResponseParser do
       else: {:error, {:unexpected_json, data |> Enum.reject(&is_map/1) |> hd()}}
   end
 
-  # A body that is not CSV (an HTML error page, a cut-off quote) is an error.
+  # A body CSV cannot read (a quote left open, a stray quote inside a cell) is an error. Text
+  # that reads as CSV, an HTML page among it, is rows like any other.
   @spec csv((binary() -> [map()]), binary()) :: {:ok, [map()]} | {:error, term()}
   defp csv(parse, body) do
     {:ok, parse.(body)}

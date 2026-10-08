@@ -45,6 +45,11 @@ Probing each module with malformed and hostile input found:
 - **408 and 429 are retried like a 5xx**, with the same backoff and
   `:max_retries`. Any other 4xx is still the batch's own fault and is
   discarded.
+> **Note, 2026-10-08 (eighteenth review):** the 1,048,576-row floor below still let a corrupt
+> count build 240 MB of rows, and the host rule let `host:8086`, `x/y` and `[fe80::1%en0]`
+> through. Both were tightened; see
+> [`2026-10-08_eighteenth-review`](2026-10-08_eighteenth-review.md).
+
 - **A count from a frame is bounded by what the frame holds.** A row count
   above `max(8 × body bytes, 1,048,576)` is a decode error, and list offsets
   are clamped to the child array. No valid frame decodes differently.

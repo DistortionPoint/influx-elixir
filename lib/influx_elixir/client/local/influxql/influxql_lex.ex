@@ -22,6 +22,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLLex do
   def trim_blanks(<<byte, rest::binary>>) when is_blank(byte), do: trim_blanks(rest)
   def trim_blanks(text), do: text
 
+  @doc "The text without the blanks it ends with."
+  @spec trim_trailing_blanks(binary()) :: binary()
+  def trim_trailing_blanks(<<>>), do: <<>>
+
+  def trim_trailing_blanks(text) do
+    size = byte_size(text) - 1
+
+    if is_blank(:binary.last(text)),
+      do: trim_trailing_blanks(binary_part(text, 0, size)),
+      else: text
+  end
+
+  @doc "The text without the blanks it starts and ends with."
+  @spec trim_both_blanks(binary()) :: binary()
+  def trim_both_blanks(text), do: text |> trim_blanks() |> trim_trailing_blanks()
+
   @blank "[ \\t\\r\\n]"
 
   # The characters after which an operand cannot start: a closing parenthesis, a comparison
@@ -29,7 +45,31 @@ defmodule InfluxElixir.Client.Local.InfluxQLLex do
   # (every byte of a non-ASCII character too: identifiers and numbers are ASCII, verified, so
   # `usagé` is `usag` and a leftover, and `٣` is no digit). The patterns that read statements
   # are not Unicode patterns, so that `\w` and `\d` are ASCII and the engine's rules hold.
-  @no_operand "[" <> Regex.escape(")=!<>*%&|^,;#@$?}][\\`{~") <> "\\x80-\\xFF]"
+  #
+  # A `$` starts a bind parameter (`$a`, `$1`, `$"a b"`, verified) and so starts an operand,
+  # unless nothing that names one follows it.
+  @no_operand "(?:[" <>
+                Regex.escape(")=!<>*%&|^,;#@?}][\\`{~") <> "\\x80-\\xFF]|\\$(?![\\w\"]))"
+
+  # What stands directly against a connective (`AND#n`) and is no blank, operator, quote or
+  # parenthesis: the connective is not read as one and the statement is left over from it
+  # (verified for each of these characters and for `é`, `٣`, U+2003 and U+00A0).
+  @glued Regex.compile!("\\A(?:[#@$?}\\]\\[\\\\`{~]|[\\x80-\\xFF])")
+
+  @doc "Whether the text, which follows a connective directly, starts with a glued character."
+  @spec glued?(binary()) :: boolean()
+  def glued?(text), do: Regex.match?(@glued, text)
+
+  @doc """
+  The bind parameter (`$name`, `$1`, `$"quoted name"`) the text starts with and what follows
+  it, or `nil` when it starts with none.
+  """
+  @spec take_param(binary()) :: {binary(), binary()} | nil
+  def take_param(text) do
+    with [param] <- Regex.run(~r/\A\$(?:\w+|"(?:[^"\\]|\\.)*")/s, text) do
+      {param, binary_part(text, byte_size(param), byte_size(text) - byte_size(param))}
+    end
+  end
 
   # What follows a connective or a sign and can start no operand, however many opening
   # parentheses and signs come between.
