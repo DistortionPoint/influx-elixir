@@ -3287,6 +3287,46 @@ defmodule InfluxElixir.Contract.InfluxQLDefectCases do
     ]
   end
 
+  @doc "Statements the double refused by name and now answers as the engine does."
+  @spec exact_answers() :: [{binary(), term()}]
+  def exact_answers do
+    [
+      {"select usage from ~p1 where fill(a.b) > 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid expression, the only valid function calls are 'now' with no arguments, date_part(<literal>, time), or scalar math functions at pos 28"}},
+      {"show\rtag values from ~p1 with key = host",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"\\rtag values from ~p1 with key = host\", Fail)"}},
+      {"\u00A0select usage from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"\\u{a0}select usage from ~p1\", Tag)"}},
+      {"select usage as\rx, from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select usage as\\rx, from ~p1\", Tag)"}},
+      {"SELECT usage FROM ~p1 ORDER BY time\u{A0}ASC",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 35. Parsing Error: Nom(\"\\u{a0}ASC\", Tag)"}},
+      {"SELECT usage FROM ~p1 ORDER BY time DESC\u{A0}",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 36. Parsing Error: Nom(\"DESC\\u{a0}\", Tag)"}},
+      {"SELECT usage FROM ~p1 LIMIT 1\u{A0}OFFSET 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 29. Parsing Error: Nom(\"\\u{a0}OFFSET 1\", Tag)"}},
+      {"SELECT usage FROM ~p1 tz\u{A0}('UTC')",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\"tz\\u{a0}('UTC')\", Tag)"}},
+      {"SELECT usage FROM ~p1 WHERE now( = 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"= 1\", Char)"}},
+      {"SELECT\vusage FROM ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"SELECT\\u{b}usage FROM ~p1\", Tag)"}},
+      {"SHOW(x)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"(x)\", Many1)"}}
+    ]
+  end
+
   @doc "Statements the engine answers and the double refuses by name, with the engine's answer. Each is pinned to its reason in `refusal_reasons/0`."
   @spec refusals() :: [{binary(), term()}]
   def refusals do
@@ -3370,9 +3410,6 @@ defmodule InfluxElixir.Contract.InfluxQLDefectCases do
       {"select usage from ~p1 where fill(1, +) > 1",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\", +) > 1\", Char)"}},
-      {"select usage from ~p1 where fill(a.b) > 1",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid expression, the only valid function calls are 'now' with no arguments, date_part(<literal>, time), or scalar math functions at pos 28"}},
       {"select mean((usage * )) from ~p1",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"(usage * )) from ~p1\", Char)"}},
@@ -3385,9 +3422,6 @@ defmodule InfluxElixir.Contract.InfluxQLDefectCases do
       {"show tag values from ~p1 with key = host where usage(nosuch > = 1)",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"> = 1)\", Char)"}},
-      {"show\rtag values from ~p1 with key = host",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"\\rtag values from ~p1 with key = host\", Fail)"}},
       {"show tag values from ~p1 with key = host where n > 1 and\rn < 5",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 53. Parsing Error: Nom(\"and\\rn < 5\", Tag)"}},
@@ -3436,27 +3470,9 @@ defmodule InfluxElixir.Contract.InfluxQLDefectCases do
       {"select usage from ~p1 where n > ((1 + 2) +",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"\", Char)"}},
-      {"\u00A0select usage from ~p1",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"\\u{a0}select usage from ~p1\", Tag)"}},
       {"select usage from ~p1 where time > now( limit 1",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"limit 1\", Char)"}},
-      {"select usage as\rx, from ~p1",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select usage as\\rx, from ~p1\", Tag)"}},
-      {"SELECT usage FROM ~p1 ORDER BY time\u{A0}ASC",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 35. Parsing Error: Nom(\"\\u{a0}ASC\", Tag)"}},
-      {"SELECT usage FROM ~p1 ORDER BY time DESC\u{A0}",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 36. Parsing Error: Nom(\"DESC\\u{a0}\", Tag)"}},
-      {"SELECT usage FROM ~p1 LIMIT 1\u{A0}OFFSET 1",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 29. Parsing Error: Nom(\"\\u{a0}OFFSET 1\", Tag)"}},
-      {"SELECT usage FROM ~p1 tz\u{A0}('UTC')",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\"tz\\u{a0}('UTC')\", Tag)"}},
       {"SELECT usage FROM ~p1 WHERE x.y < 1 <=",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid conditional expression at pos 38"}},
@@ -3469,18 +3485,9 @@ defmodule InfluxElixir.Contract.InfluxQLDefectCases do
       {"SELECT usage FROM ~p1 WHERE x ( fill(1)",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid expression, the only valid function calls are 'now' with no arguments, date_part(<literal>, time), or scalar math functions at pos 32"}},
-      {"SELECT usage FROM ~p1 WHERE now( = 1",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"= 1\", Char)"}},
       {"SHOW TAG KEYS\rFROM ~p1",
        {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid SHOW TAG statement, expected KEYS or VALUES at pos 9"}},
-      {"SELECT\vusage FROM ~p1",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"SELECT\\u{b}usage FROM ~p1\", Tag)"}},
-      {"SHOW(x)",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"(x)\", Many1)"}}
+        "error in InfluxQL statement: parsing error: invalid SHOW TAG statement, expected KEYS or VALUES at pos 9"}}
     ]
   end
 
@@ -3532,7 +3539,6 @@ defmodule InfluxElixir.Contract.InfluxQLDefectCases do
         "unsupported InfluxQL (arithmetic on a selector beside columns)",
       "select usage from ~p1 where fill(/a/) > 1" => "unsupported InfluxQL (fill() in a WHERE)",
       "select usage from ~p1 where fill(1, +) > 1" => "unsupported InfluxQL (fill() in a WHERE)",
-      "select usage from ~p1 where fill(a.b) > 1" => "unsupported InfluxQL (fill() in a WHERE)",
       "select mean((usage * )) from ~p1" =>
         "unsupported InfluxQL (a parenthesised argument of a call): mean((usage * ))",
       "select usage from ~p1 where (usage * ) and n" => "unsupported InfluxQL WHERE: * ) and n",
@@ -3540,8 +3546,6 @@ defmodule InfluxElixir.Contract.InfluxQLDefectCases do
         "unsupported InfluxQL WHERE: = 'x' or region = 'eu') and host = 'h1'",
       "show tag values from ~p1 with key = host where usage(nosuch > = 1)" =>
         "unsupported InfluxQL WHERE:  = 1)",
-      "show\rtag values from ~p1 with key = host" =>
-        "unsupported InfluxQL (a carriage return after a keyword in a SHOW statement)",
       "show tag values from ~p1 with key = host where n > 1 and\rn < 5" =>
         "unsupported InfluxQL (a carriage return after a keyword in a SHOW statement)",
       "show measurements\rlimit 1" =>
@@ -3572,31 +3576,16 @@ defmodule InfluxElixir.Contract.InfluxQLDefectCases do
         "unsupported InfluxQL (a bind parameter in a condition)",
       "select usage from ~p1 where (n > 1) +" => "unsupported InfluxQL WHERE: +",
       "select usage from ~p1 where n > ((1 + 2) +" => "unsupported InfluxQL WHERE: +",
-      " select usage from ~p1" => "unsupported InfluxQL (that shape of statement)",
       "select usage from ~p1 where time > now( limit 1" =>
         "unsupported InfluxQL (now() in a WHERE)",
-      "select usage as\rx, from ~p1" =>
-        "unsupported InfluxQL (a carriage return after a keyword in a select list that has another error)",
-      "SELECT usage FROM ~p1 ORDER BY time\u{A0}ASC" =>
-        "unsupported InfluxQL (clauses the double does not read in that order)",
-      "SELECT usage FROM ~p1 ORDER BY time DESC\u{A0}" =>
-        "unsupported InfluxQL (clauses the double does not read in that order)",
-      "SELECT usage FROM ~p1 LIMIT 1\u{A0}OFFSET 1" =>
-        "unsupported InfluxQL (clauses the double does not read in that order)",
-      "SELECT usage FROM ~p1 tz\u{A0}('UTC')" =>
-        "unsupported InfluxQL (clauses the double does not read in that order)",
       "SELECT usage FROM ~p1 WHERE x.y < 1 <=" => "unsupported InfluxQL WHERE: .y < 1 <=",
       "SELECT usage FROM ~p1 WHERE x.y < 1 <=  SLIMIT 1" =>
         "unsupported InfluxQL WHERE: .y < 1 <=",
       "SELECT usage FROM ~p1 WHERE x.y <= SLIMIT 1" => "unsupported InfluxQL WHERE: .y <=",
       "SELECT usage FROM ~p1 WHERE x ( fill(1)" =>
         "unsupported InfluxQL (a call inside the arguments of a call that fails)",
-      "SELECT usage FROM ~p1 WHERE now( = 1" => "unsupported InfluxQL (now() in a WHERE)",
       "SHOW TAG KEYS\rFROM ~p1" =>
-        "unsupported InfluxQL (a carriage return after a keyword in a SHOW statement)",
-      "SELECT\vusage FROM ~p1" =>
-        "unsupported InfluxQL (a form feed or vertical tab outside a literal)",
-      "SHOW(x)" => "unsupported InfluxQL (SHOW followed by that)"
+        "unsupported InfluxQL (a carriage return after a keyword in a SHOW statement)"
     }
   end
 end

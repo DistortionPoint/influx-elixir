@@ -248,17 +248,10 @@ defmodule InfluxElixir.Contract.InfluxQLGlueCases do
     ]
   end
 
-  @doc "Statements the engine answers (or rejects with a body the double does not give) and the double refuses by name, with the engine's answer."
-  @spec refusals() :: [{binary(), term()}]
-  def refusals do
+  @doc "Statements the double refused by name and now answers as the engine does."
+  @spec exact_answers() :: [{binary(), term()}]
+  def exact_answers do
     [
-      {"SELECT usage FROM(SELECT usage FROM ~p1) WHERE time < '2023-10-01T00:01:00Z'",
-       [{"2023-10-01 00:00:00", %{"usage" => 0.25}}]},
-      {"SELECT 1FROM ~p1",
-       {:error, 400,
-        "rewriting statement\ncaused by\ngather information about select statement\ncaused by\nError during planning: field must contain at least one variable"}},
-      {"SELECT usage+1FROM ~p1 WHERE time < '2023-10-01T00:01:00Z'",
-       [{"2023-10-01 00:00:00", %{"usage" => 1.25}}]},
       {"SELECT usage FROM ~p1 'x",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\"'x\", Tag)"}},
@@ -273,9 +266,143 @@ defmodule InfluxElixir.Contract.InfluxQLGlueCases do
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 41. Parsing Error: Nom(\"AS#C\", Tag)"}},
       {"SELECT usage FROM ~p1 ORDER BY time ASC 'x",
        {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 40. Parsing Error: Nom(\"'x\", Tag)"}},
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 40. Parsing Error: Nom(\"'x\", Tag)"}}
+    ]
+  end
+
+  @doc "Statements the engine answers (or rejects with a body the double does not give) and the double refuses by name, with the engine's answer."
+  @spec refusals() :: [{binary(), term()}]
+  def refusals do
+    [
+      {"SELECT usage FROM(SELECT usage FROM ~p1) WHERE time < '2023-10-01T00:01:00Z'",
+       [{"2023-10-01 00:00:00", %{"usage" => 0.25}}]},
+      {"SELECT 1FROM ~p1",
+       {:error, 400,
+        "rewriting statement\ncaused by\ngather information about select statement\ncaused by\nError during planning: field must contain at least one variable"}},
+      {"SELECT usage+1FROM ~p1 WHERE time < '2023-10-01T00:01:00Z'",
+       [{"2023-10-01 00:00:00", %{"usage" => 1.25}}]},
       {"SELECT usage FROM ~p1 WHERE ((usage > 0 AND n < 0)) OR ((usage > 5)) AND time < '2023-10-01T00:01:00Z'",
-       [{"2023-10-01 00:00:00", %{"usage" => 0.25}}]}
+       [{"2023-10-01 00:00:00", %{"usage" => 0.25}}]},
+      {"select+usage from ~p1 limit 1", [{"2023-10-01 00:00:00", %{"usage" => 0.25}}]},
+      # One distinct value: the engine's order of several is not fixed, so no answer pins it.
+      {"select distinct(n) from ~p1, ~p1 where time < '2023-10-01T00:01:00Z'",
+       [
+         {"1970-01-01 00:00:00", %{"distinct" => -10}}
+       ]},
+      {"select to.p(usage, 2), top(n, 2) from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select to.p(usage, 2), top(n, 2) from ~p1\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time(1m+1m)",
+       [
+         {"2023-10-01 00:00:00", %{"count" => 2}},
+         {"2023-10-01 00:02:00", %{"count" => 1}},
+         {"2023-10-01 00:04:00", %{"count" => 1}}
+       ]},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time((1m))",
+       [
+         {"2023-10-01 00:00:00", %{"count" => 1}},
+         {"2023-10-01 00:01:00", %{"count" => 1}},
+         {"2023-10-01 00:02:00", %{"count" => 1}},
+         {"2023-10-01 00:03:00", %{"count" => 0}},
+         {"2023-10-01 00:04:00", %{"count" => 1}}
+       ]},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time(1m,(1s))",
+       [
+         {"2023-09-30 23:59:01", %{"count" => 1}},
+         {"2023-10-01 00:00:01", %{"count" => 1}},
+         {"2023-10-01 00:01:01", %{"count" => 1}},
+         {"2023-10-01 00:02:01", %{"count" => 0}},
+         {"2023-10-01 00:03:01", %{"count" => 1}},
+         {"2023-10-01 00:04:01", %{"count" => 0}}
+       ]},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time(1m-1s)",
+       [
+         {"2023-09-30 23:59:31", %{"count" => 1}},
+         {"2023-10-01 00:00:30", %{"count" => 1}},
+         {"2023-10-01 00:01:29", %{"count" => 1}},
+         {"2023-10-01 00:02:28", %{"count" => 0}},
+         {"2023-10-01 00:03:27", %{"count" => 1}},
+         {"2023-10-01 00:04:26", %{"count" => 0}}
+       ]},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time ((1m))",
+       [
+         {"2023-10-01 00:00:00", %{"count" => 1}},
+         {"2023-10-01 00:01:00", %{"count" => 1}},
+         {"2023-10-01 00:02:00", %{"count" => 1}},
+         {"2023-10-01 00:03:00", %{"count" => 0}},
+         {"2023-10-01 00:04:00", %{"count" => 1}}
+       ]},
+      {"select sum(usage)/count(nosuch) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by time(1m)",
+       [
+         {"2023-10-01 00:00:00", %{}},
+         {"2023-10-01 00:01:00", %{}},
+         {"2023-10-01 00:02:00", %{}},
+         {"2023-10-01 00:04:00", %{}},
+         {"2023-10-01 00:05:00", %{}},
+         {"2023-10-01 00:06:00", %{}},
+         {"2023-10-01 00:07:00", %{}},
+         {"2023-10-01 00:08:00", %{}},
+         {"2023-10-01 00:09:00", %{}},
+         {"2023-10-01 00:11:00", %{}}
+       ]},
+      {"select sum(usage)/count(nosuch) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by host limit 1",
+       []},
+      {"select sum(usage) + count(nosuch) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by time(1m) limit 3 offset 2",
+       []},
+      {"select sum(nosuch)/count(usage) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by time(1m)",
+       [
+         {"2023-10-01 00:00:00", %{}},
+         {"2023-10-01 00:01:00", %{}},
+         {"2023-10-01 00:02:00", %{}},
+         {"2023-10-01 00:04:00", %{}},
+         {"2023-10-01 00:05:00", %{}},
+         {"2023-10-01 00:06:00", %{}},
+         {"2023-10-01 00:07:00", %{}},
+         {"2023-10-01 00:08:00", %{}},
+         {"2023-10-01 00:09:00", %{}},
+         {"2023-10-01 00:11:00", %{}}
+       ]},
+      {"select stddev(n) from ~p1, ~p1 where time < '2023-10-01T00:03:00Z'",
+       [{"1970-01-01 00:00:00", %{"stddev" => 1.7320508075688772}}]},
+      {"select usage from ~p1 where n > 1 tz('Foo/Bar') limit 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unable to find timezone at pos 46"}},
+      {"select usage from ~p1 where u + 1 = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select nosuch as host, usage from ~p1 group by host limit 1",
+       [{"2023-10-01 00:00:00", %{"usage" => 0.25}}]},
+      {"select usage from ~p1.~p1",
+       [
+         {"2023-10-01 00:00:00", %{"usage" => 0.25}},
+         {"2023-10-01 00:01:00", %{"usage" => 1.75}},
+         {"2023-10-01 00:02:00", %{"usage" => 3.25}},
+         {"2023-10-01 00:04:00", %{"usage" => 6.25}},
+         {"2023-10-01 00:05:00", %{"usage" => 7.75}},
+         {"2023-10-01 00:06:00", %{"usage" => 9.25}},
+         {"2023-10-01 00:07:00", %{"usage" => 10.75}},
+         {"2023-10-01 00:08:00", %{"usage" => 12.25}},
+         {"2023-10-01 00:09:00", %{"usage" => 13.75}},
+         {"2023-10-01 00:11:00", %{"usage" => 16.75}},
+         {"2023-10-01 00:12:00", %{"usage" => 18.25}},
+         {"2023-10-01 00:13:00", %{"usage" => 19.75}},
+         {"2023-10-01 00:14:00", %{"usage" => 21.25}},
+         {"2023-10-01 00:15:00", %{"usage" => 22.75}},
+         {"2023-10-01 00:16:00", %{"usage" => 24.25}},
+         {"2023-10-01 00:18:00", %{"usage" => 27.25}},
+         {"2023-10-01 00:19:00", %{"usage" => 28.75}},
+         {"2023-10-01 00:20:00", %{"usage" => 30.25}},
+         {"2023-10-01 00:21:00", %{"usage" => 31.75}},
+         {"2023-10-01 00:22:00", %{"usage" => 33.25}},
+         {"2023-10-01 00:23:00", %{"usage" => 34.75}},
+         {"2023-10-01 00:25:00", %{"usage" => 37.75}},
+         {"2023-10-01 00:26:00", %{"usage" => 39.25}},
+         {"2023-10-01 00:27:00", %{"usage" => 40.75}},
+         {"2023-10-01 00:28:00", %{"usage" => 42.25}},
+         {"2023-10-01 00:29:00", %{"usage" => 43.75}}
+       ]},
+      {"select usage from ~p1, autogen.~p1",
+       {:error, 400, "error in InfluxQL statement: can only perform queries on a single database"}}
     ]
   end
 
@@ -288,18 +415,41 @@ defmodule InfluxElixir.Contract.InfluxQLGlueCases do
       "SELECT 1FROM ~p1" => "unsupported InfluxQL (a number directly against FROM)",
       "SELECT usage+1FROM ~p1 WHERE time < '2023-10-01T00:01:00Z'" =>
         "unsupported InfluxQL (a number directly against FROM)",
-      "SELECT usage FROM ~p1 'x" =>
-        "unsupported InfluxQL (clauses the double does not read in that order)",
-      "SELECT usage FROM ~p1 LIMIT 1 'x" =>
-        "unsupported InfluxQL (clauses the double does not read in that order)",
-      "SELECT usage FROM ~p1 junk 'x" =>
-        "unsupported InfluxQL (clauses the double does not read in that order)",
-      "SELECT usage AS x FROM ~p1 ORDER BY time AS#C" =>
-        "unsupported InfluxQL (clauses the double does not read in that order)",
-      "SELECT usage FROM ~p1 ORDER BY time ASC 'x" =>
-        "unsupported InfluxQL (clauses the double does not read in that order)",
       "SELECT usage FROM ~p1 WHERE ((usage > 0 AND n < 0)) OR ((usage > 5)) AND time < '2023-10-01T00:01:00Z'" =>
-        "unsupported InfluxQL (a time comparison inside OR)"
+        "unsupported InfluxQL (a time comparison inside OR)",
+      "select+usage from ~p1 limit 1" => "unsupported InfluxQL (that shape of statement)",
+      "select distinct(n) from ~p1, ~p1 where time < '2023-10-01T00:01:00Z'" =>
+        "unsupported InfluxQL (distinct(): the values come in the engine's order)",
+      "select to.p(usage, 2), top(n, 2) from ~p1" =>
+        "unsupported InfluxQL (a call with more arguments than it takes): to.p(usage, 2)",
+      "select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time(1m+1m)" =>
+        "unsupported InfluxQL (GROUP BY time() of an expression)",
+      "select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time((1m))" =>
+        "unsupported InfluxQL (GROUP BY time() of an expression)",
+      "select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time(1m,(1s))" =>
+        "unsupported InfluxQL (GROUP BY time() of an expression)",
+      "select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time(1m-1s)" =>
+        "unsupported InfluxQL (GROUP BY time() of an expression)",
+      "select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time ((1m))" =>
+        "unsupported InfluxQL (GROUP BY time() of an expression)",
+      "select sum(usage)/count(nosuch) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by time(1m)" =>
+        "unsupported InfluxQL (an aggregate of a column the measurement lacks inside arithmetic)",
+      "select sum(usage)/count(nosuch) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by host limit 1" =>
+        "unsupported InfluxQL (an aggregate of a column the measurement lacks inside arithmetic)",
+      "select sum(usage) + count(nosuch) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by time(1m) limit 3 offset 2" =>
+        "unsupported InfluxQL (an aggregate of a column the measurement lacks inside arithmetic)",
+      "select sum(nosuch)/count(usage) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by time(1m)" =>
+        "unsupported InfluxQL (an aggregate of a column the measurement lacks inside arithmetic)",
+      "select stddev(n) from ~p1, ~p1 where time < '2023-10-01T00:03:00Z'" =>
+        "unsupported InfluxQL (stddev() of a measurement named twice in FROM)",
+      "select usage from ~p1 where n > 1 tz('Foo/Bar') limit 1" =>
+        "unsupported InfluxQL (a tz() zone other than UTC with a clause behind it)",
+      "select usage from ~p1 where u + 1 = (n > 1)" =>
+        "unsupported InfluxQL (an expression compared with a condition in parentheses)",
+      "select nosuch as host, usage from ~p1 group by host limit 1" =>
+        "unsupported InfluxQL (a column the measurement lacks aliased to a GROUP BY dimension)",
+      "select usage from ~p1.~p1" => "unsupported InfluxQL (a qualified source name)",
+      "select usage from ~p1, autogen.~p1" => "unsupported InfluxQL (a qualified source name)"
     }
   end
 
@@ -775,6 +925,778 @@ defmodule InfluxElixir.Contract.InfluxQLGlueCases do
       {"SELECT /usage/::fieldFROM ~p1",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"SELECT /usage/::fieldFROM ~p1\", Tag)"}}
+    ]
+  end
+
+  @doc "A text that starts with no statement keyword is left unparsed whole, whatever the rest holds (a literal or a comment never closed included), and so is SELECT directly against a character that is no blank, no operator, no parenthesis and no `;`. Nothing but blanks, comments and `;` is no statement."
+  @spec statement_start() :: [{binary(), term()}]
+  def statement_start do
+    [
+      {"foo",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"foo\", Tag)"}},
+      {"foo bar",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"foo bar\", Tag)"}},
+      {"(select usage from ~p1)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"(select usage from ~p1)\", Tag)"}},
+      {"drop",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"drop\", Tag)"}},
+      {"sebect usage from ~p1 where (n > 1)) /* x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"sebect usage from ~p1 where (n > 1)) /* x\", Tag)"}},
+      {"seélect usage from ~p1 /* x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"seélect usage from ~p1 /* x\", Tag)"}},
+      {"SELE\tCT /usage//FROM ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"SELE\\tCT /usage//FROM ~p1\", Tag)"}},
+      {"select\"usage from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select\\\"usage from ~p1\", Tag)"}},
+      {"select'usage from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select'usage from ~p1\", Tag)"}},
+      {"select#usage from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select#usage from ~p1\", Tag)"}},
+      {"select:usage from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select:usage from ~p1\", Tag)"}},
+      {"select@usage from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select@usage from ~p1\", Tag)"}},
+      {"select.usage from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select.usage from ~p1\", Tag)"}},
+      {"select]usage from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select]usage from ~p1\", Tag)"}},
+      {"select1 from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select1 from ~p1\", Tag)"}},
+      {"selectusage from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"selectusage from ~p1\", Tag)"}},
+      {"select!usage from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid SELECT statement, expected field at pos 6"}},
+      {"select(usage from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid SELECT statement, expected field at pos 6"}},
+      {";", {:error, 400, "must provide only one InfluxQl statement per query"}},
+      {" ", {:error, 400, "must provide only one InfluxQl statement per query"}},
+      {"-- c", {:error, 400, "must provide only one InfluxQl statement per query"}},
+      {";;", {:error, 400, "must provide only one InfluxQl statement per query"}},
+      {"SHW MEASUREMENTS WHERE 'x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"SHW MEASUREMENTS WHERE 'x\", Tag)"}}
+    ]
+  end
+
+  @doc "SHOW directly against a character that is no blank: an operator, a parenthesis or `;` is a `Many1`, any other (a letter, a digit, a quote, a dot, a carriage return) a `Fail`; nothing behind it is read."
+  @spec show_glue() :: [{binary(), term()}]
+  def show_glue do
+    [
+      {"SHOWx",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"x\", Fail)"}},
+      {"SHOW1 TAG KEYS",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"1 TAG KEYS\", Fail)"}},
+      {"SHOW_TAG KEYS ON:db",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"_TAG KEYS ON:db\", Fail)"}},
+      {"SHOWDATABASES",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"DATABASES\", Fail)"}},
+      {"SHOW\"x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"\\\"x\", Fail)"}},
+      {"SHOW'x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"'x\", Fail)"}},
+      {"SHOWzTAG KEYS FROM ~p1'",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"zTAG KEYS FROM ~p1'\", Fail)"}},
+      {"SHOWb TAG KEYS\u00A0",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"b TAG KEYS\\u{a0}\", Fail)"}},
+      {"SHOW*x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"*x\", Many1)"}},
+      {"SHOW=x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"=x\", Many1)"}},
+      {"SHOW<x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"<x\", Many1)"}},
+      {"SHOW,x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\",x\", Many1)"}},
+      {"SHOW+ x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"+ x\", Many1)"}},
+      {"SHOW\rTAG KEYS",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"\\rTAG KEYS\", Fail)"}},
+      {"SHOWe TAG 'x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"e TAG 'x\", Fail)"}}
+    ]
+  end
+
+  @doc "The list of sources after FROM: a bare name takes letters, digits and underscores, the list ends before a comma that no source follows, a name with a dot and no name after it is the FROM clause error at the name, and a measurement that two sources stand for is answered twice, each point repeated."
+  @spec sources() :: [{binary(), term()}]
+  def sources do
+    [
+      {"select usage from ~p1-1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 21. Parsing Error: Nom(\"-1\", Tag)"}},
+      {"select usage from zq-1 where n > 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 20. Parsing Error: Nom(\"-1 where n > 1\", Tag)"}},
+      {"select usage from ~p1, limit 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 21. Parsing Error: Nom(\", limit 1\", Tag)"}},
+      {"select usage from ~p1, ",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 21. Parsing Error: Nom(\", \", Tag)"}},
+      {"select usage from ~p1,5",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 21. Parsing Error: Nom(\",5\", Tag)"}},
+      {"select usage from ~p1. where n > 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid FROM clause, expected identifier, regular expression or subquery at pos 18"}},
+      {"select usage from ~p1.",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid FROM clause, expected identifier, regular expression or subquery at pos 18"}},
+      {"select usage from ~p1.1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid FROM clause, expected identifier, regular expression or subquery at pos 18"}},
+      {"select usage from ~p1.limit",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid FROM clause, expected identifier, regular expression or subquery at pos 18"}},
+      {"select usage from ~p1 .~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\".~p1\", Tag)"}},
+      {"select usage from ~p1 , where n > 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\", where n > 1\", Tag)"}},
+      {"select usage from ~p1.\"",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unterminated string literal at pos 23"}},
+      {"select usage from \"~p1\".",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid FROM clause, expected identifier, regular expression or subquery at pos 18"}},
+      {"select n from ~p1, ~p1 where time < '2023-10-01T00:03:00Z'",
+       [
+         {"2023-10-01 00:00:00", %{"n" => -10}},
+         {"2023-10-01 00:00:00", %{"n" => -10}},
+         {"2023-10-01 00:01:00", %{"n" => -7}},
+         {"2023-10-01 00:01:00", %{"n" => -7}}
+       ]},
+      {"select n from ~p1, /~p1/ where time < '2023-10-01T00:03:00Z'",
+       [
+         {"2023-10-01 00:00:00", %{"n" => -10}},
+         {"2023-10-01 00:00:00", %{"n" => -10}},
+         {"2023-10-01 00:01:00", %{"n" => -7}},
+         {"2023-10-01 00:01:00", %{"n" => -7}}
+       ]},
+      {"select n from ~p1, ~p1, ~p1 where time < '2023-10-01T00:03:00Z'",
+       [
+         {"2023-10-01 00:00:00", %{"n" => -10}},
+         {"2023-10-01 00:00:00", %{"n" => -10}},
+         {"2023-10-01 00:00:00", %{"n" => -10}},
+         {"2023-10-01 00:01:00", %{"n" => -7}},
+         {"2023-10-01 00:01:00", %{"n" => -7}},
+         {"2023-10-01 00:01:00", %{"n" => -7}}
+       ]},
+      {"select count(n) from ~p1, ~p1 where time < '2023-10-01T00:03:00Z'",
+       [{"1970-01-01 00:00:00", %{"count" => 4}}]},
+      {"select sum(n), mean(n) from ~p1, ~p1 where time < '2023-10-01T00:03:00Z'",
+       [{"1970-01-01 00:00:00", %{"mean" => -8.5, "sum" => -34}}]},
+      {"select n from ~p1, ~p1 where time < '2023-10-01T00:03:00Z' limit 2",
+       [{"2023-10-01 00:00:00", %{"n" => -10}}, {"2023-10-01 00:00:00", %{"n" => -10}}]},
+      {"select n from ~p1, ~p1 where time < '2023-10-01T00:03:00Z' limit 2 offset 1",
+       [{"2023-10-01 00:00:00", %{"n" => -10}}, {"2023-10-01 00:01:00", %{"n" => -7}}]},
+      {"select n from ~p1, ~p1 where time < '2023-10-01T00:03:00Z' order by time desc limit 3",
+       [
+         {"2023-10-01 00:01:00", %{"n" => -7}},
+         {"2023-10-01 00:01:00", %{"n" => -7}},
+         {"2023-10-01 00:00:00", %{"n" => -10}}
+       ]},
+      {"select * from ~p1, ~p1 where time < '2023-10-01T00:03:00Z' group by host limit 1",
+       [
+         {"2023-10-01 00:00:00",
+          %{"host" => "a", "n" => -10, "ok" => true, "region" => "us", "u" => 1, "usage" => 0.25}},
+         {"2023-10-01 00:01:00",
+          %{"host" => "b", "n" => -7, "region" => "eu", "s" => "str1", "usage" => 1.75}},
+         {"2023-10-01 00:02:00",
+          %{
+            "host" => "c",
+            "ok" => true,
+            "region" => "us",
+            "s" => "str2",
+            "u" => 3,
+            "usage" => 3.25
+          }}
+       ]},
+      {"select max(n), min(n) from ~p1, ~p1 where time < '2023-10-01T00:03:00Z'",
+       [{"1970-01-01 00:00:00", %{"max" => -7, "min" => -10}}]}
+    ]
+  end
+
+  @doc "Text that no clause starts at, before a clause or between two, is left over from where it starts: a name, a punctuation mark, a keyword against a character, a word that only starts with a keyword, a clause out of its place; a LIMIT, OFFSET, SLIMIT or SOFFSET that has a blank after it and nothing else is the missing number at the end."
+  @spec clause_junk() :: [{binary(), term()}]
+  def clause_junk do
+    [
+      {"select usage from ~p1 grou~ by host",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\"grou~ by host\", Tag)"}},
+      {"select usage from ~p1 whre n > 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\"whre n > 1\", Tag)"}},
+      {"select usage from ~p1 #limit 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\"#limit 1\", Tag)"}},
+      {"select usage from ~p1 limit 1 s~limit 2",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 30. Parsing Error: Nom(\"s~limit 2\", Tag)"}},
+      {"select usage from ~p1 GROUPBY host",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\"GROUPBY host\", Tag)"}},
+      {"select usage from ~p1 wher n > 1 fill(1) group",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\"wher n > 1 fill(1) group\", Tag)"}},
+      {"select usage from ~p1 (where n > 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\"(where n > 1\", Tag)"}},
+      {"select usage from ~p1 ,imit 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 28. Parsing Error: Nom(\"1\", Tag)"}},
+      {"select usage from ~p1 order by time desc[limit 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 36. Parsing Error: Nom(\"desc[limit 1\", Tag)"}},
+      {"select usage from ~p1 order by desc[limit 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid ORDER BY, expected TIME column at pos 31"}},
+      {"select usage from ~p1 order by asc'limit 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid ORDER BY, expected TIME column at pos 31"}},
+      {"select usage from ~p1 order by time desclimit 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 36. Parsing Error: Nom(\"desclimit 1\", Tag)"}},
+      {"select usage from ~p1 limit ",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid LIMIT clause, expected unsigned integer at pos 28"}},
+      {"select usage from ~p1 offset\t",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid OFFSET clause, expected unsigned integer at pos 29"}},
+      {"select usage from ~p1 group by host limit ;",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid LIMIT clause, expected unsigned integer at pos 42"}},
+      {"select usage from ~p1 where n > 1 offset ",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid OFFSET clause, expected unsigned integer at pos 41"}},
+      {"select usage from ~p1 limit 1 limit ",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 30. Parsing Error: Nom(\"limit \", Tag)"}},
+      {"select usage from ~p1 limit 1 offset 99999999999999999999 slimi  x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unable to parse unsigned integer at pos 57"}},
+      {"select usage from ~p1 offset 99999999999999999999 sxlimit x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unable to parse unsigned integer at pos 49"}},
+      {"select usage from ~p1 limit 99999999999999999999 s=imit x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unable to parse unsigned integer at pos 48"}},
+      {"select usage from ~p1 x tz('UTC')",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 22. Parsing Error: Nom(\"x tz('UTC')\", Tag)"}},
+      {"select usage from ~p1 tz('UTC') limit 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 32. Parsing Error: Nom(\"limit 1\", Tag)"}}
+    ]
+  end
+
+  @doc "GROUP BY: `time` directly against a character that is no blank, no operator and no parenthesis is a name, left over from that character (a dot makes it a dotted name with none after it); a name with a dot and no name after it is no dimension; a type needs a blank, an operator or the end after it."
+  @spec group_by_names() :: [{binary(), term()}]
+  def group_by_names do
+    [
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time#(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"#(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time$(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"$(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time'(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"'(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time\"(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"\\\"(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time[(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"[(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time](1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"](1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time\\(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"\\\\(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time{(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"{(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time}(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"}(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time~(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"~(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time`(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"`(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time:(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\":(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time?(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"?(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time@(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"@(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time\r(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 79. Parsing Error: Nom(\"(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time\u00A0(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"\\u{a0}(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by timeé(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"é(1m)\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time.(1m)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid GROUP BY clause, expected wildcard, TIME, identifier or regular expression at pos 74"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by host.",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid GROUP BY clause, expected wildcard, TIME, identifier or regular expression at pos 74"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by host.1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid GROUP BY clause, expected wildcard, TIME, identifier or regular expression at pos 74"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by \"host\".",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid GROUP BY clause, expected wildcard, TIME, identifier or regular expression at pos 74"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by host::tag#",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid data type for tag or field reference, expected float, integer, unsigned, string, boolean, field, tag at pos 80"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by host::tag.",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid data type for tag or field reference, expected float, integer, unsigned, string, boolean, field, tag at pos 80"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by *::tag#",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid wildcard type specifier, expected TAG or FIELD at pos 77"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by host, host.",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\", host.\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time(1m), host.",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 82. Parsing Error: Nom(\", host.\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by host::tags",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid data type for tag or field reference, expected float, integer, unsigned, string, boolean, field, tag at pos 80"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by host#",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 78. Parsing Error: Nom(\"#\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by host .x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 79. Parsing Error: Nom(\".x\", Tag)"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time ::tag",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid TIME call, expected 1 or 2 arguments at pos 78"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time as x",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid TIME call, expected 1 or 2 arguments at pos 78"}}
+    ]
+  end
+
+  @doc "The select list: `|` and `^` (like `+` and `-`) fail where the operand should be, a character that starts no operand in the arguments of a call fails there or at the comma before it, a name that is a reserved word directly against a character is an identifier, an item followed by junk after its alias, an operand after a missing one."
+  @spec select_junk() :: [{binary(), term()}]
+  def select_junk do
+    [
+      {"select usage^from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"from ~p1\", Char)"}},
+      {"select usage| from ~p1 group by host",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"from ~p1 group by host\", Char)"}},
+      {"select n^ from ~p1 where u = s",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"from ~p1 where u = s\", Char)"}},
+      {"select abs(n), median(n') from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"') from ~p1\", Char)"}},
+      {"select abs(n), top(nosuch, #2) from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\", #2) from ~p1\", Char)"}},
+      {"select bottom(usage, region,#2), abs(n) from ~p1 limit 3",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\",#2), abs(n) from ~p1 limit 3\", Char)"}},
+      {"select derivative(#, (1s)) from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"#, (1s)) from ~p1\", Char)"}},
+      {"select mean(usage | ( from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"( from ~p1\", Char)"}},
+      {"select mean(usage x) fro ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"x) fro ~p1\", Char)"}},
+      {"select abs(true', max(n) from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"', max(n) from ~p1\", Char)"}},
+      {"select to\"p(ok, 3) from ~p1 order by time desc",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select to\\\"p(ok, 3) from ~p1 order by time desc\", Tag)"}},
+      {"select to](n, 2), region as host from ~p1 group by region",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select to](n, 2), region as host from ~p1 group by region\", Tag)"}},
+      {"select usage as tim| from ~p1 limit 2",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select usage as tim| from ~p1 limit 2\", Tag)"}},
+      {"select usage as}a. from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select usage as}a. from ~p1\", Tag)"}},
+      {"select ((time#)) as time, usage from ~p1 limit 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid SELECT statement, expected field at pos 7"}},
+      {"select (1usage) from ~p1 limit 2",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid SELECT statement, expected field at pos 7"}},
+      {"select u}age. as a from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select u}age. as a from ~p1\", Tag)"}},
+      {"select usage + [q1. from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"[q1. from ~p1\", Char)"}},
+      {"SELECT( usage FROM\"~p1\" WHERE time < '2023-10-01T00:01:00Z'",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid SELECT statement, expected field at pos 6"}},
+      {"select count(ho't) from ~p1 where s",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"'t) from ~p1 where s\", Char)"}},
+      {"select usage + ~p1. fro ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select usage + ~p1. fro ~p1\", Tag)"}},
+      {"select mean(usage.) frm ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"usage.) frm ~p1\", Char)"}}
+    ]
+  end
+
+  @doc "A column compared with a condition in parentheses: the group is a boolean operand like `true`. A column that is no boolean never equals it nor orders against it, an unsigned column is the planner's error without the `type_coercion` prefix, a boolean column or another group is ordered against it as no row is true but compared for equality as the groups evaluate."
+  @spec nested_conditions() :: [{binary(), term()}]
+  def nested_conditions do
+    [
+      {"select usage from ~p1 where usage = (n > 1)", []},
+      {"select usage from ~p1 where usage > (n > 1)", []},
+      {"select usage from ~p1 where usage <> (n > 1)", []},
+      {"select usage from ~p1 where n = (usage < 5)", []},
+      {"select usage from ~p1 where host != (n > 1)", []},
+      {"select usage from ~p1 where s < (n > 1)", []},
+      {"select usage from ~p1 where u > (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 > Boolean"}},
+      {"select usage from ~p1 where u = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select usage from ~p1 where u <> (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 != Boolean"}},
+      {"select usage from ~p1 where u <= (ok = true)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 <= Boolean"}},
+      {"select usage from ~p1 where (n > 1) < u",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean < UInt64"}},
+      {"select usage from ~p1 where (n > 1) = u",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select usage from ~p1 where ok < (n > 1)", []},
+      {"select usage from ~p1 where ok >= (n > 1)", []},
+      {"select usage from ~p1 where ok > (host = 'a')", []},
+      {"select usage from ~p1 where ok = (n > 1)",
+       [
+         {"2023-10-01 00:06:00", %{"usage" => 9.25}},
+         {"2023-10-01 00:08:00", %{"usage" => 12.25}},
+         {"2023-10-01 00:14:00", %{"usage" => 21.25}},
+         {"2023-10-01 00:18:00", %{"usage" => 27.25}},
+         {"2023-10-01 00:20:00", %{"usage" => 30.25}},
+         {"2023-10-01 00:26:00", %{"usage" => 39.25}}
+       ]},
+      {"select usage from ~p1 where ok != (n > 1)",
+       [
+         {"2023-10-01 00:00:00", %{"usage" => 0.25}},
+         {"2023-10-01 00:05:00", %{"usage" => 7.75}},
+         {"2023-10-01 00:09:00", %{"usage" => 13.75}},
+         {"2023-10-01 00:11:00", %{"usage" => 16.75}},
+         {"2023-10-01 00:15:00", %{"usage" => 22.75}},
+         {"2023-10-01 00:21:00", %{"usage" => 31.75}},
+         {"2023-10-01 00:23:00", %{"usage" => 34.75}},
+         {"2023-10-01 00:29:00", %{"usage" => 43.75}}
+       ]},
+      {"select usage from ~p1 where (true) > (usage < 5)", []},
+      {"select usage from ~p1 where (true) = u",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select usage from ~p1 where (true) != u",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean != UInt64"}},
+      {"select usage from ~p1 where usage = (true)", []},
+      {"select usage from ~p1 where usage = ((true))", []},
+      {"select usage from ~p1 where 1 = (n > 1)", []},
+      {"select usage from ~p1 where 1.5 >= (n > 1)", []},
+      {"select usage from ~p1 where 'a' < (n > 1)", []},
+      {"select usage from ~p1 where -1 = (n > 1)", []},
+      {"select usage from ~p1 where (1) != (n > 1)", []},
+      {"select usage from ~p1 where (n) = (n > 1)", []},
+      {"select usage from ~p1 where n + 1 = (n > 1)", []},
+      {"select usage from ~p1 where abs(n) < (1 = 1)", []},
+      {"select usage from ~p1 where (n > 1) !~ /a/", []},
+      {"select usage from ~p1 where usage = (n > 1 and u > 1)", []},
+      {"select usage from ~p1 where usage = ((n > 1))", []},
+      {"select usage from ~p1 where nosuch = (n > 1)", []},
+      {"select usage from ~p1 where ok = (1 = 1)",
+       [
+         {"2023-10-01 00:00:00", %{"usage" => 0.25}},
+         {"2023-10-01 00:02:00", %{"usage" => 3.25}},
+         {"2023-10-01 00:06:00", %{"usage" => 9.25}},
+         {"2023-10-01 00:08:00", %{"usage" => 12.25}},
+         {"2023-10-01 00:12:00", %{"usage" => 18.25}},
+         {"2023-10-01 00:14:00", %{"usage" => 21.25}},
+         {"2023-10-01 00:18:00", %{"usage" => 27.25}},
+         {"2023-10-01 00:20:00", %{"usage" => 30.25}},
+         {"2023-10-01 00:26:00", %{"usage" => 39.25}}
+       ]}
+    ]
+  end
+
+  @doc "A column the measurement lacks: with `fill(number)` it is the number wherever it is read (a column of its own, an operand of arithmetic or of a call), and keeps no row by itself; beside the time it is a null, over a measurement that does not exist the time has no type; a name that has to be quoted is written quoted in the name of a column that joins several."
+  @spec absent_columns() :: [{binary(), term()}]
+  def absent_columns do
+    [
+      {"select nosuch, n from ~p1 fill(7) limit 3",
+       [
+         {"2023-10-01 00:00:00", %{"n" => -10, "nosuch" => 7}},
+         {"2023-10-01 00:01:00", %{"n" => -7, "nosuch" => 7}},
+         {"2023-10-01 00:03:00", %{"n" => -1, "nosuch" => 7}}
+       ]},
+      {"select nosuch + 1, n from ~p1 fill(7) limit 3",
+       [
+         {"2023-10-01 00:00:00", %{"n" => -10, "nosuch" => 8}},
+         {"2023-10-01 00:01:00", %{"n" => -7, "nosuch" => 8}},
+         {"2023-10-01 00:03:00", %{"n" => -1, "nosuch" => 8}}
+       ]},
+      {"select nosuch * 2, n from ~p1 fill(7) limit 3",
+       [
+         {"2023-10-01 00:00:00", %{"n" => -10, "nosuch" => 14}},
+         {"2023-10-01 00:01:00", %{"n" => -7, "nosuch" => 14}},
+         {"2023-10-01 00:03:00", %{"n" => -1, "nosuch" => 14}}
+       ]},
+      {"select abs(nosuch), n from ~p1 fill(7) limit 3",
+       [
+         {"2023-10-01 00:00:00", %{"abs" => 7, "n" => -10}},
+         {"2023-10-01 00:01:00", %{"abs" => 7, "n" => -7}},
+         {"2023-10-01 00:03:00", %{"abs" => 7, "n" => -1}}
+       ]},
+      {"select sqrt(nosuch), n from ~p1 fill(7) limit 3",
+       [
+         {"2023-10-01 00:00:00", %{"n" => -10, "sqrt" => 2.6457513110645907}},
+         {"2023-10-01 00:01:00", %{"n" => -7, "sqrt" => 2.6457513110645907}},
+         {"2023-10-01 00:03:00", %{"n" => -1, "sqrt" => 2.6457513110645907}}
+       ]},
+      {"select nosuch::float, n from ~p1 fill(7) limit 3",
+       [
+         {"2023-10-01 00:00:00", %{"n" => -10, "nosuch" => 7.0}},
+         {"2023-10-01 00:01:00", %{"n" => -7, "nosuch" => 7.0}},
+         {"2023-10-01 00:03:00", %{"n" => -1, "nosuch" => 7.0}}
+       ]},
+      {"select nosuch + n from ~p1 fill(7) limit 3",
+       [
+         {"2023-10-01 00:00:00", %{"nosuch_n" => -3}},
+         {"2023-10-01 00:01:00", %{"nosuch_n" => 0}},
+         {"2023-10-01 00:03:00", %{"nosuch_n" => 6}}
+       ]},
+      {"select n + nosuch from ~p1 fill(7) limit 3",
+       [
+         {"2023-10-01 00:00:00", %{"n_nosuch" => -3}},
+         {"2023-10-01 00:01:00", %{"n_nosuch" => 0}},
+         {"2023-10-01 00:03:00", %{"n_nosuch" => 6}}
+       ]},
+      {"select nosuch from ~p1 fill(7)", []},
+      {"select nosuch + nosuch2 from ~p1 fill(7)", []},
+      {"select nosuch, usage from ~p1 fill(1.5) limit 3",
+       [
+         {"2023-10-01 00:00:00", %{"nosuch" => 1.5, "usage" => 0.25}},
+         {"2023-10-01 00:01:00", %{"nosuch" => 1.5, "usage" => 1.75}},
+         {"2023-10-01 00:02:00", %{"nosuch" => 1.5, "usage" => 3.25}}
+       ]},
+      {"select nosuch, u from ~p1 fill(-5) limit 3",
+       [
+         {"2023-10-01 00:00:00", %{"nosuch" => -5, "u" => 1}},
+         {"2023-10-01 00:02:00", %{"nosuch" => -5, "u" => 3}},
+         {"2023-10-01 00:03:00", %{"nosuch" => -5, "u" => 4}}
+       ]},
+      {"select nosuch, s from ~p1 fill(7) limit 3",
+       [
+         {"2023-10-01 00:01:00", %{"nosuch" => 7, "s" => "str1"}},
+         {"2023-10-01 00:02:00", %{"nosuch" => 7, "s" => "str2"}},
+         {"2023-10-01 00:03:00", %{"nosuch" => 7, "s" => "str3"}}
+       ]},
+      {"select nosuch, host from ~p1 fill(7) limit 3", []},
+      {"select nosuch as x, n from ~p1 group by host fill(7) limit 2",
+       [
+         {"2023-10-01 00:00:00", %{"host" => "a", "n" => -10, "x" => 7}},
+         {"2023-10-01 00:03:00", %{"host" => "a", "n" => -1, "x" => 7}},
+         {"2023-10-01 00:01:00", %{"host" => "b", "n" => -7, "x" => 7}},
+         {"2023-10-01 00:04:00", %{"host" => "b", "n" => 2, "x" => 7}},
+         {"2023-10-01 00:05:00", %{"host" => "c", "n" => 5, "x" => 7}},
+         {"2023-10-01 00:08:00", %{"host" => "c", "n" => 14, "x" => 7}}
+       ]},
+      {"select nosuch, n from ~p1 where n > 10 fill(7) limit 3 offset 2",
+       [
+         {"2023-10-01 00:10:00", %{"n" => 20, "nosuch" => 7}},
+         {"2023-10-01 00:11:00", %{"n" => 23, "nosuch" => 7}},
+         {"2023-10-01 00:13:00", %{"n" => 29, "nosuch" => 7}}
+       ]},
+      {"select nosuch, n from ~p1 fill(null) limit 3",
+       [
+         {"2023-10-01 00:00:00", %{"n" => -10}},
+         {"2023-10-01 00:01:00", %{"n" => -7}},
+         {"2023-10-01 00:03:00", %{"n" => -1}}
+       ]},
+      {"select time + nosuch from ~p1", []},
+      {"select nosuch * abs(time) from ~p1", []},
+      {"select time / nosuch from ~p1", []},
+      {"select time + 1 from ~p1x", []},
+      {"select abs(time) + 1.5 from ~p1x", []},
+      {"select 1 + abs(time) from ~p1x", []},
+      {"select 1 + 'x' from ~p1x",
+       {:error, 400,
+        "rewriting statement\ncaused by\nexpand projection\ncaused by\nError during planning: incompatible operands for operator +: integer and string"}},
+      {"select 1.5 + true from ~p1x",
+       {:error, 400,
+        "rewriting statement\ncaused by\nexpand projection\ncaused by\nError during planning: incompatible operands for operator +: float and boolean"}},
+      {"select \"nosu.ch\" / ok from ~p1 limit 1",
+       [{"2023-10-01 00:00:00", %{"\"nosu.ch\"_ok" => false}}]},
+      {"select \"a b\" / ok from ~p1 limit 1",
+       [{"2023-10-01 00:00:00", %{"\"a b\"_ok" => false}}]},
+      {"select ok / \"a b\" from ~p1 limit 1",
+       [{"2023-10-01 00:00:00", %{"ok_\"a b\"" => false}}]},
+      {"select \"a-b\" + ok from ~p1 limit 1",
+       [{"2023-10-01 00:00:00", %{"\"a-b\"_ok" => false}}]}
+    ]
+  end
+
+  @doc "A time the planner cannot read is its error, before the stack of a condition with a bare operand breaks: the characters no form of a time has, after the date."
+  @spec timestamps() :: [{binary(), term()}]
+  def timestamps do
+    [
+      {"select n from ~p1 where time >= '2023-10-01T00:)0:00Z' and 0",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01T00:)0:00Z'\": '2023-10-01T00:)0:00Z' is not a valid timestamp"}},
+      {"select n from ~p1 where time >= '2023-10-01T00:00&:00Z' and (ok)",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01T00:00&:00Z'\": '2023-10-01T00:00&:00Z' is not a valid timestamp"}},
+      {"select n from ~p1 where time >= '2023-1|0-01T00:00:00Z' or 0",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-1|0-01T00:00:00Z'\": '2023-1|0-01T00:00:00Z' is not a valid timestamp"}},
+      {"select n from ~p1 where 0 and time >= '2023-10-01T0#:00:00Z'",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01T0#:00:00Z'\": '2023-10-01T0#:00:00Z' is not a valid timestamp"}},
+      {"select n from ~p1 where time >= '2023-10-01T00:00:0_Z' and u + 1",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01T00:00:0_Z'\": '2023-10-01T00:00:0_Z' is not a valid timestamp"}},
+      {"select n from ~p1 where time >= '2023;-10-01T00:00:00Z' and 0",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023;-10-01T00:00:00Z'\": '2023;-10-01T00:00:00Z' is not a valid timestamp"}},
+      {"select n from ~p1 where time >= '2023-10-01T00:$0:00Z' and (ok)",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01T00:$0:00Z'\": '2023-10-01T00:$0:00Z' is not a valid timestamp"}}
+    ]
+  end
+
+  @doc "GROUP BY time() of an expression is evaluated by the engine; the double reads durations only and refuses the rest by name, and a call that does not close, or has an operator with no operand after it, is the engine's parse error."
+  @spec time_calls() :: [{binary(), term()}]
+  def time_calls do
+    [
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time(1m,)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid TIME call, expected ')' at pos 81"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time(1%)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid TIME call, expected ')' at pos 80"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time(((",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid TIME call, expected a duration for the interval at pos 79"}},
+      {"select count(usage) from ~p1 where time < '2023-10-01T00:05:00Z' group by time(1m*)",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid TIME call, expected ')' at pos 81"}}
+    ]
+  end
+
+  @doc "An aggregate of a column the measurement lacks inside arithmetic, in buckets or a window, and a tz() zone other than UTC with a clause behind it, are not answered by the double."
+  @spec window_absent() :: [{binary(), term()}]
+  def window_absent do
+    [
+      {"select sum(cusage)/count(usage) + sum(n) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by time(1m)",
+       [
+         {"2023-10-01 00:00:00", %{}},
+         {"2023-10-01 00:01:00", %{}},
+         {"2023-10-01 00:02:00", %{}},
+         {"2023-10-01 00:03:00", %{}},
+         {"2023-10-01 00:04:00", %{}},
+         {"2023-10-01 00:05:00", %{}},
+         {"2023-10-01 00:06:00", %{}},
+         {"2023-10-01 00:07:00", %{}},
+         {"2023-10-01 00:08:00", %{}},
+         {"2023-10-01 00:09:00", %{}},
+         {"2023-10-01 00:10:00", %{}},
+         {"2023-10-01 00:11:00", %{}}
+       ]},
+      {"select sum(ubage)/count(usage), count(n) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by time(1m)",
+       [
+         {"2023-10-01 00:00:00", %{"count" => 1}},
+         {"2023-10-01 00:01:00", %{"count" => 1}},
+         {"2023-10-01 00:02:00", %{"count" => 0}},
+         {"2023-10-01 00:03:00", %{"count" => 1}},
+         {"2023-10-01 00:04:00", %{"count" => 1}},
+         {"2023-10-01 00:05:00", %{"count" => 1}},
+         {"2023-10-01 00:06:00", %{"count" => 1}},
+         {"2023-10-01 00:07:00", %{"count" => 0}},
+         {"2023-10-01 00:08:00", %{"count" => 1}},
+         {"2023-10-01 00:09:00", %{"count" => 1}},
+         {"2023-10-01 00:10:00", %{"count" => 1}},
+         {"2023-10-01 00:11:00", %{"count" => 1}}
+       ]},
+      {"select sum(usage)/count(nosuch) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z'",
+       [{"2023-10-01 00:00:00", %{}}]},
+      {"select sum(usage), sum(nosuch) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:12:00Z' group by time(1m)",
+       [
+         {"2023-10-01 00:00:00", %{"sum" => 0.25}},
+         {"2023-10-01 00:01:00", %{"sum" => 1.75}},
+         {"2023-10-01 00:02:00", %{"sum" => 3.25}},
+         {"2023-10-01 00:03:00", %{}},
+         {"2023-10-01 00:04:00", %{"sum" => 6.25}},
+         {"2023-10-01 00:05:00", %{"sum" => 7.75}},
+         {"2023-10-01 00:06:00", %{"sum" => 9.25}},
+         {"2023-10-01 00:07:00", %{"sum" => 10.75}},
+         {"2023-10-01 00:08:00", %{"sum" => 12.25}},
+         {"2023-10-01 00:09:00", %{"sum" => 13.75}},
+         {"2023-10-01 00:10:00", %{}},
+         {"2023-10-01 00:11:00", %{"sum" => 16.75}}
+       ]}
     ]
   end
 end

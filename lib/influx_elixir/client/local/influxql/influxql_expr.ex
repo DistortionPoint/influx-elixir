@@ -688,8 +688,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   def name(ast) do
     case ast |> names() |> Enum.reject(&is_nil/1) do
       [] -> nil
-      names -> Enum.join(names, "_")
+      [single] -> single
+      names -> names |> Enum.map(&quoted_if_needed/1) |> Enum.join("_")
     end
+  end
+
+  # A name the engine would have to quote to write it (a space, a dot, a hyphen...) is written
+  # quoted in the name of a column that joins several (verified: `"a b" / ok` is `"a b"_ok`).
+  defp quoted_if_needed(name) do
+    if Regex.match?(~r/\A[A-Za-z_][A-Za-z0-9_]*\z/, name), do: name, else: ~s("#{name}")
   end
 
   defp names({:ref, name}), do: [name]
@@ -893,10 +900,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp infer({:ref, name}, types, tags) do
     cond do
-      String.downcase(name) == "time" -> {:ok, {:timestamp, false}}
-      MapSet.member?(tags, name) -> {:ok, {:tag, false}}
-      Map.has_key?(types, name) -> {:ok, {Map.fetch!(types, name), false}}
-      true -> {:ok, {:unknown, false}}
+      # A measurement that does not exist has no schema to type the time by (verified: `time + 1`
+      # over one answers nothing, over a measurement that exists it is the engine's error).
+      String.downcase(name) == "time" and map_size(types) == 0 and MapSet.size(tags) == 0 ->
+        {:ok, {:unknown, false}}
+
+      String.downcase(name) == "time" ->
+        {:ok, {:timestamp, false}}
+
+      MapSet.member?(tags, name) ->
+        {:ok, {:tag, false}}
+
+      Map.has_key?(types, name) ->
+        {:ok, {Map.fetch!(types, name), false}}
+
+      true ->
+        {:ok, {:unknown, false}}
     end
   end
 
@@ -1049,6 +1068,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     cond do
       absent_text?(lt, rt) ->
         {:ok, {if(lt == :unknown, do: rt, else: lt), false}}
+
+      # A column the measurement lacks beside the time is a null, not a type that does not
+      # take part (verified: `time + nosuch`, `nosuch * abs(time)` answer nothing).
+      {lt, rt} in [{:unknown, :timestamp}, {:timestamp, :unknown}] ->
+        {:ok, {:unknown, false}}
 
       lt in @no_arithmetic or rt in @no_arithmetic ->
         {:engine, incompatible(op, lt, rt)}

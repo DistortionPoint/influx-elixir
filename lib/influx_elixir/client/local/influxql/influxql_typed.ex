@@ -76,7 +76,218 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   @spec plan_comparison(list(), {MapSet.t(binary()), map()}) ::
           {binary(), [{binary(), InfluxQLArithmetic.check()}]}
   @doc false
-  def plan_comparison(tokens, {tags, types}) do
+  def plan_comparison(tokens, {tags, types} = ctx) do
+    case nested_boolean(tokens, tags, types) do
+      :never -> {"(1 = 0)", []}
+      {:clash, op, order} -> boolean_clash(op, order)
+      nil -> plan_unnested(tokens, ctx)
+    end
+  end
+
+  # A column compared with a condition in parentheses (`v > (w > 1)`, `ok < (n > 1 AND u > 1)`,
+  # `(true) = u`): the group is a boolean operand like `true` (verified over every operator and
+  # type). A column that is no boolean never equals it nor orders against it (no row is true),
+  # an unsigned one is the planner's error naming `UInt64` and `Boolean` in the order written
+  # (without the `type_coercion` prefix), and a boolean column or another group is ordered
+  # against it as no row is true, but compared for equality as the groups evaluate.
+  @ordering_ops ["<", "<=", ">", ">="]
+  @equality_ops ["=", "!=", "<>", "=~", "!~"]
+
+  @spec nested_boolean(list(), MapSet.t(binary()), map()) ::
+          :never | {:clash, binary(), :unsigned_first | :boolean_first} | nil
+  defp nested_boolean(tokens, tags, types) do
+    with {left, op, right} when op in @ordering_ops or op in @equality_ops <-
+           split_comparison(tokens),
+         {:ok, shape} <- operand_sides(left, right, tags, types) do
+      nested_rule(shape, op)
+    else
+      _no_nested_boolean -> nil
+    end
+  end
+
+  defp nested_rule({:group_first, :group}, op), do: if(op in @ordering_ops, do: :never)
+  defp nested_rule({:group_first, type}, op), do: column_rule(type, op, :boolean_first)
+  defp nested_rule({:column_first, type}, op), do: column_rule(type, op, :unsigned_first)
+
+  defp column_rule(:unsigned, op, order), do: {:clash, if(op == "<>", do: "!=", else: op), order}
+  defp column_rule(:boolean, op, _order) when op in @equality_ops, do: nil
+  defp column_rule(:absent, _op, _order), do: nil
+  defp column_rule(_type, _op, _order), do: :never
+
+  defp operand_sides(left, right, tags, types) do
+    case {boolean_group?(left), boolean_group?(right)} do
+      {true, true} ->
+        {:ok, {:group_first, :group}}
+
+      {true, false} ->
+        with {:ok, type} <- column_type(right, tags, types), do: {:ok, {:group_first, type}}
+
+      {false, true} ->
+        with {:ok, type} <- column_type(left, tags, types), do: {:ok, {:column_first, type}}
+
+      {false, false} ->
+        nil
+    end
+  end
+
+  defp column_type(tokens, tags, types) do
+    case strip_group(tokens) do
+      {:ok, inner} -> column_type(inner, tags, types)
+      nil -> plain_type(tokens, tags, types)
+    end
+  end
+
+  defp plain_type([{:ident, name}], tags, types) do
+    cond do
+      String.downcase(name) == "time" -> nil
+      MapSet.member?(tags, name) -> {:ok, :tag}
+      Map.has_key?(types, name) -> {:ok, Map.fetch!(types, name)}
+      true -> {:ok, :absent}
+    end
+  end
+
+  # A number or a string is a constant that is no boolean either: never equal nor ordered.
+  defp plain_type([{:number, _text}], _tags, _types), do: {:ok, :constant}
+  defp plain_type([{:regex, _pattern}], _tags, _types), do: {:ok, :constant}
+
+  defp plain_type([{:raw, sign}, {:number, _text}], _tags, _types) when sign in ["-", "+"],
+    do: {:ok, :constant}
+
+  defp plain_type([{:str, _content}], _tags, _types), do: {:ok, :constant}
+
+  defp plain_type(tokens, tags, types) when length(tokens) > 1 do
+    if arithmetic_tokens?(tokens), do: arithmetic_type(tokens, tags, types)
+  end
+
+  defp plain_type(_tokens, _tags, _types), do: nil
+
+  # Arithmetic of numeric columns, numbers and the math functions is a number, no boolean
+  # either; one with an unsigned column in it (or a column of another type) is not placed.
+  @math_functions ~w(abs sin cos tan asin acos atan atan2 exp log ln log2 log10 sqrt pow floor ceil round)
+
+  defp arithmetic_tokens?(tokens) do
+    tokens
+    |> Enum.chunk_every(2, 1, [nil])
+    |> Enum.all?(fn
+      [{:number, _text}, _next] -> true
+      [{:raw, op}, _next] when op in ["+", "-", "*", "/", "%", "(", ")", ","] -> true
+      [{:ident, name}, {:raw, "("}] -> String.downcase(name) in @math_functions
+      [{:ident, _name}, _next] -> true
+      _other -> false
+    end)
+  end
+
+  defp arithmetic_type(tokens, tags, types) do
+    columns =
+      tokens
+      |> Enum.chunk_every(2, 1, [nil])
+      |> Enum.flat_map(fn
+        [{:ident, _name}, {:raw, "("}] -> []
+        [{:ident, name}, _next] -> [name]
+        _other -> []
+      end)
+
+    if Enum.all?(
+         columns,
+         &(not MapSet.member?(tags, &1) and Map.get(types, &1) in [:integer, :float])
+       ),
+       do: {:ok, :constant},
+       else:
+         throw(
+           {:refused,
+            "unsupported InfluxQL (an expression compared with a condition in parentheses)"}
+         )
+  end
+
+  # The contents of tokens that are one parenthesised group.
+  defp strip_group([{:raw, "("} | rest]) do
+    with [{:raw, ")"} | reversed] <- Enum.reverse(rest),
+         inner = Enum.reverse(reversed),
+         true <- balanced?(inner) do
+      {:ok, inner}
+    else
+      _not_one_group -> nil
+    end
+  end
+
+  defp strip_group(_tokens), do: nil
+
+  # `{left, operator, right}` when exactly one comparison operator stands outside every
+  # parenthesis.
+  defp split_comparison(tokens) do
+    case top_level_operators(tokens, 0, 0, []) do
+      [{at, op}] -> {Enum.take(tokens, at), op, Enum.drop(tokens, at + 1)}
+      _none_or_several -> nil
+    end
+  end
+
+  defp top_level_operators([], _depth, _at, acc), do: Enum.reverse(acc)
+
+  defp top_level_operators([{:raw, "("} | rest], depth, at, acc),
+    do: top_level_operators(rest, depth + 1, at + 1, acc)
+
+  defp top_level_operators([{:raw, ")"} | rest], depth, at, acc),
+    do: top_level_operators(rest, max(depth - 1, 0), at + 1, acc)
+
+  defp top_level_operators([{:op, op} | rest], 0, at, acc),
+    do: top_level_operators(rest, 0, at + 1, [{at, op} | acc])
+
+  defp top_level_operators([_token | rest], depth, at, acc),
+    do: top_level_operators(rest, depth, at + 1, acc)
+
+  # Tokens that are one parenthesised group (however deep) holding a comparison, `AND`, `OR` or
+  # a boolean constant.
+  defp boolean_group?([{:raw, "("} | rest]) do
+    with [{:raw, ")"} | reversed] <- Enum.reverse(rest),
+         inner = Enum.reverse(reversed),
+         true <- balanced?(inner) do
+      boolean_inside?(inner)
+    else
+      _not_one_group -> false
+    end
+  end
+
+  defp boolean_group?(_tokens), do: false
+
+  defp boolean_inside?([{:raw, word}]) when is_binary(word),
+    do: String.downcase(word) in ["true", "false"]
+
+  defp boolean_inside?([{:raw, "("} | _rest] = inner),
+    do: boolean_group?(inner) or connective_inside?(inner)
+
+  defp boolean_inside?(inner), do: connective_inside?(inner)
+
+  defp connective_inside?(inner) do
+    inner
+    |> Enum.reduce({0, false}, fn
+      {:raw, "("}, {depth, found} ->
+        {depth + 1, found}
+
+      {:raw, ")"}, {depth, found} ->
+        {depth - 1, found}
+
+      {:op, _op}, {0, _found} ->
+        {0, true}
+
+      {:raw, word}, {0, found} when is_binary(word) ->
+        {0, found or String.upcase(word) in ["AND", "OR"]}
+
+      _token, state ->
+        state
+    end)
+    |> elem(1)
+  end
+
+  defp balanced?(tokens) do
+    Enum.reduce_while(tokens, 0, fn
+      {:raw, "("}, depth -> {:cont, depth + 1}
+      {:raw, ")"}, 0 -> {:halt, :unbalanced}
+      {:raw, ")"}, depth -> {:cont, depth - 1}
+      _token, depth -> {:cont, depth}
+    end) == 0
+  end
+
+  defp plan_unnested(tokens, {tags, types}) do
     tokens = InfluxQLWhereArith.tag_over_unsigned(tokens, tags, types)
     unsigned_clash(InfluxQLWhereArith.unsigned_clash(tokens, tags, types))
 
@@ -110,7 +321,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp unsigned_clash(:text),
     do: throw({:refused, "unsupported InfluxQL (an unsigned number ordered against a string)"})
 
-  defp unsigned_clash({:boolean, op, order}) do
+  defp unsigned_clash({:boolean, op, order}), do: boolean_clash(op, order)
+
+  @spec boolean_clash(binary(), :unsigned_first | :boolean_first) :: no_return()
+  defp boolean_clash(op, order) do
     {left, right} =
       if order == :unsigned_first, do: {"UInt64", "Boolean"}, else: {"Boolean", "UInt64"}
 

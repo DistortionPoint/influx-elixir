@@ -9,6 +9,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   alias InfluxElixir.Client.Local.{
     Format,
     InfluxQL,
+    InfluxQLExpr,
     InfluxQLLex,
     InfluxQLPlan,
     InfluxQLRegex,
@@ -564,10 +565,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   @spec influxql_select(Store.t(), binary(), InfluxQL.query()) ::
           InfluxElixir.Client.query_result()
   defp influxql_select(table, database, query) do
-    with {:ok, names} <- measurement_names(table, database, query) do
+    with {:ok, names, copies} <- measurement_names(table, database, query) do
       names
       |> Enum.reduce_while({:ok, []}, fn name, {:ok, groups} ->
-        case influxql_select_one(table, database, %{query | measurement: name}) do
+        one = query |> Map.put(:copies, Map.fetch!(copies, name)) |> Map.put(:measurement, name)
+
+        case influxql_select_one(table, database, one) do
           {:ok, rows} -> {:cont, {:ok, [rows | groups]}}
           error -> {:halt, error}
         end
@@ -584,7 +587,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # order they are written in. The answer has the rows of each in turn, a
   # `LIMIT` counting in each.
   @spec measurement_names(Store.t(), binary(), InfluxQL.query()) ::
-          {:ok, [binary()]} | {:error, map()}
+          {:ok, [binary()], %{binary() => pos_integer()}} | {:error, map()}
   defp measurement_names(table, database, %{sources: sources}) do
     existing = Store.measurements(table, database)
 
@@ -598,7 +601,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           Enum.filter(existing, &Regex.match?(regex, &1))
       end)
 
-    {:ok, names |> Enum.uniq() |> Enum.sort()}
+    # A measurement that several of the sources stand for is read once for each: its points
+    # are repeated (verified: `FROM m, m` and `FROM m, /m/` answer every point twice).
+    copies = Enum.frequencies(names)
+    {:ok, names |> Enum.uniq() |> Enum.sort(), copies}
   catch
     {:refused, {:engine, status, body}} -> {:error, %{status: status, body: body}}
     {:refused, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
@@ -748,12 +754,47 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
     table
     |> run_influxql_sql(database, sql, plan.tags, plan.checks)
+    |> repeated(Map.get(query, :copies, 1), query)
     |> influxql_result(query, tags,
       lower: Enum.max(plan.lowers, fn -> nil end),
       upper: Enum.min(plan.uppers, fn -> nil end),
       now: now,
       types: types
     )
+  end
+
+  # The points of a measurement read once for each source that stands for it, one after the
+  # other (the engine merges the reads by time).
+  # The standard deviation of repeated points is not that of the points (verified); the double
+  # does not compute it from them.
+  defp repeated({:ok, rows}, copies, query) when copies > 1 do
+    if stddev?(query.items),
+      do:
+        {:error,
+         %{
+           status: 400,
+           body:
+             "Client.Local: unsupported InfluxQL (stddev() of a measurement named twice in FROM)"
+         }},
+      else: {:ok, Enum.flat_map(rows, &List.duplicate(&1, copies))}
+  end
+
+  defp repeated(result, _copies, _query), do: result
+
+  defp stddev?(items) do
+    Enum.any?(items, fn
+      {:aggregate, "stddev", _arg, _alias} ->
+        true
+
+      {:expr, ast, _alias} ->
+        Enum.any?(
+          InfluxQLExpr.aggregates(ast),
+          &match?({"stddev", _}, &1)
+        )
+
+      _other ->
+        false
+    end)
   end
 
   # The engine's planning error for a select item that is a constant, raised

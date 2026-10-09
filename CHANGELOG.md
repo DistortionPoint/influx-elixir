@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` InfluxQL: a differential fuzz against Core 3.10.1** (design document
+  `2026-10-09_influxql-differential-fuzz.md`): a text with no statement keyword, `SELECT` and
+  `SHOW` glued to a character, junk after the sources and between clauses, the list of sources
+  (`m-1`, `m, limit`, `m.`), a measurement named twice in `FROM` (its points twice), `ASC` and
+  `DESC` and `::type` need a keyword boundary, `LIMIT ` with no number, `GROUP BY time<c>(1m)`,
+  `|` and `^` with no operand, a parenthesised condition compared with a column (`v > (w > 1)`),
+  `time` over a measurement that does not exist, an invalid time before a bare operand, a column
+  the measurement lacks with `fill(number)`, and the name of arithmetic over a quoted name are
+  answered as Core answers; the rest is refused by name. A `SELECT` list of 4000 items takes
+  0.28 s, not 1.5 s (equal names were numbered in quadratic time).
 - **The rest of the client never raises on what a caller passes**:
   - `Client.HTTP`: options that are not a keyword list are
     `{:error, {:invalid_options, opts}}`, a value a URL carries that is not text (a

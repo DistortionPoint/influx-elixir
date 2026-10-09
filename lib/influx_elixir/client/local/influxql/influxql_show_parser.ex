@@ -51,7 +51,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   @only_one "must provide only one InfluxQl statement per query"
   @kinds ~w(databases retention measurements tag field)
 
-  @show_word ~q/^\s*show(?![A-Za-z0-9_])/i
+  @show_word ~q/^\s*show/i
 
   @clauses %{
     databases: [],
@@ -86,8 +86,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
       bad: bad
     }
 
-    with :ok <- keyword_cr(ctx),
-         after_show when after_show != nil <- start(ctx),
+    with after_show when after_show != nil <- start(ctx),
+         :ok <- glued(ctx, scanned, after_show),
+         :ok <- keyword_cr(ctx),
          :ok <- scanned_error(scanned, ctx) do
       statement(ctx, after_show)
     end
@@ -231,28 +232,37 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   # The offset after a leading `SHOW`, or `nil` when the text is no SHOW.
   @spec start(ctx()) :: non_neg_integer() | nil
   defp start(ctx) do
-    case word_at(ctx, skip_ws(ctx, 0)) do
-      {"show", at} -> at
-      _other -> nil
-    end
+    at = skip_ws(ctx, 0)
+
+    if at + 4 <= ctx.size and String.downcase(binary_part(ctx.masked, at, 4)) == "show",
+      do: at + 4
   end
 
   @spec statement(ctx(), non_neg_integer()) :: {:ok, map()} | {:error, term()}
   defp statement(ctx, after_show) do
-    cond do
-      rest(ctx, after_show) in ["", ";"] -> many1(ctx, after_show)
-      ws?(ctx, after_show) -> kind(ctx, skip_ws(ctx, after_show))
-      fail_after_show?(ctx, after_show) -> {:error, {:engine, show_fail(ctx, after_show)}}
-      true -> {:error, "unsupported InfluxQL (SHOW followed by that)"}
-    end
+    if rest(ctx, after_show) in ["", ";"],
+      do: many1(ctx, after_show),
+      else: kind(ctx, skip_ws(ctx, after_show))
   end
 
   # What stands directly against `SHOW` and is no blank: the engine's statement list stops
-  # there with a `Fail` (verified for each of these characters; `(`, `=`, `,` and the end of
-  # the text are `Many1`, and a quote is not placed).
-  @spec fail_after_show?(ctx(), non_neg_integer()) :: boolean()
-  defp fail_after_show?(ctx, after_show),
-    do: match?(<<c>> when c in [?\v, ?\f, ?., 1, 0x7F] or c >= 0x80, at_byte(ctx, after_show))
+  # there, before it reads anything else (a literal or a comment never closed behind it is
+  # never met). Against a character of an operator, a parenthesis or `;`
+  # (`InfluxQLText.operator_glue/0` and `;`) it is `Many1`; against any other, a letter, digit,
+  # quote, `.`, `\r`, a control character or a non-ASCII one included, it is a `Fail` (verified
+  # for each ASCII character, `\r`, a control character, `é` and U+00A0).
+  @spec glued(ctx(), map(), non_neg_integer()) :: :ok | {:error, term()}
+  defp glued(ctx, scanned, after_show) do
+    byte = at_byte(ctx, after_show)
+
+    cond do
+      byte == nil or rest(ctx, after_show) == ";" -> :ok
+      byte != "\r" and ws?(ctx, after_show) -> :ok
+      scanned.unclosed == after_show + 2 -> :ok
+      byte in [";" | InfluxQLText.operator_glue()] -> many1(ctx, after_show)
+      true -> {:error, {:engine, show_fail(ctx, after_show)}}
+    end
+  end
 
   @spec show_fail(ctx(), non_neg_integer()) :: binary()
   defp show_fail(ctx, after_show) do

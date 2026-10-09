@@ -4104,6 +4104,16 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
     ]
   end
 
+  @doc "Statements the double refused by name and now answers as the engine does."
+  @spec exact_answers() :: [{binary(), term()}]
+  def exact_answers do
+    [
+      {"select max(time)::float from ~g1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select max(time)::float from ~g1\", Tag)"}}
+    ]
+  end
+
   @doc "Statements the engine answers and the double refuses by name (`Client.Local: unsupported InfluxQL (...)`), with the engine's answer: a math function of a time or in a `WHERE`, a time in arithmetic beside a name, a selector with no value beside columns that have points, and the like."
   @spec refusals() :: [{binary(), term()}]
   def refusals do
@@ -4124,9 +4134,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
        {:error, 400,
         "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::String No function matches the given name and argument types 'abs(Utf8)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
       {"select count(distinct(time)) + 1 from ~g1", []},
-      {"select max(time)::float from ~g1",
-       {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select max(time)::float from ~g1\", Tag)"}},
       {"select n from ~g1 where 'a' % 'a' = 'aa'", []},
       {"select n from ~g1 where n % 0 = 0", :closed},
       {"select n from ~g1 where v % 0 = 0", []},
@@ -4493,8 +4500,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
       "select abs(s) from ~g1" => "unsupported InfluxQL (abs() of a string)",
       "select count(distinct(time)) + 1 from ~g1" =>
         "unsupported InfluxQL (arithmetic on count(distinct())): count(distinct(time)) + 1",
-      "select max(time)::float from ~g1" =>
-        "unsupported InfluxQL (a cast inside or after a call): max(time)::float",
       "select n from ~g1 where 'a' % 'a' = 'aa'" => "unsupported InfluxQL WHERE: % 'a' = 'aa'",
       "select n from ~g1 where n % 0 = 0" => "unsupported InfluxQL WHERE: % 0 = 0",
       "select n from ~g1 where v % 0 = 0" => "unsupported InfluxQL WHERE: % 0 = 0",

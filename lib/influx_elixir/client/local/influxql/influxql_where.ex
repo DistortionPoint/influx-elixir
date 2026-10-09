@@ -39,7 +39,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         {tree, _rest} = tokens |> nest() |> parse_or()
         InfluxQLTime.check_bare(tree)
         ctx = {tags, types}
-        InfluxQLTyped.check_stack(tree, ctx)
         now = Keyword.get_lazy(opts, :now, fn -> System.os_time(:nanosecond) end)
 
         times = %{
@@ -48,6 +47,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
           known: Keyword.get(opts, :known),
           alone: true
         }
+
+        # The planner reads the times of the condition before it types the rest: a time it
+        # cannot read is its error, before the stack breaks on a bare operand.
+        check_times(tree, tags, times)
+        InfluxQLTyped.check_stack(tree, ctx)
 
         # The planner raises the error of a comparison, and that of a connective it cannot type,
         # as it builds the filter, leaves first and in order: each comparison of a condition with
@@ -91,6 +95,28 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     # b <= u` is the mixing of aggregate and non-aggregate columns, not the comparison).
     {:deferred, body} ->
       late_clash(where, body, Keyword.get(opts, :late_clash, false))
+  end
+
+  defp check_times({:group, node}, tags, times), do: check_times(node, tags, times)
+
+  defp check_times({kind, nodes}, tags, times) when kind in [:and, :or],
+    do: Enum.each(nodes, &check_times(&1, tags, times))
+
+  defp check_times({:cmp, tokens}, tags, times) do
+    if Enum.any?(tokens, &InfluxQLTokens.time?/1), do: engine_time_error(tokens, tags, times)
+    :ok
+  end
+
+  defp check_times(_node, _tags, _times), do: :ok
+
+  # Only the planner's own error for a time is raised here; a time the double does not read is
+  # left to the stage that refuses it.
+  defp engine_time_error(tokens, tags, times) do
+    time_plan(tokens, tags, times)
+  catch
+    {:refused, {:engine, _status, _body}} = engine -> throw(engine)
+    {:refused, {:engine, _body}} = engine -> throw(engine)
+    {:refused, _message} -> :ok
   end
 
   defp late_clash(_where, body, false), do: {:error, {:engine, body}}

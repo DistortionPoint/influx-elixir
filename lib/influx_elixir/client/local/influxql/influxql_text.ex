@@ -13,6 +13,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   #   * the clauses after `FROM`
 
   alias InfluxElixir.Client.Local.{InfluxQLBlankRegex, InfluxQLLex, SQLMask}
+  @operator_glue ~w[( ) * , = / + - < > ! % & | ^]
+  @operator_glue_escaped Regex.escape(Enum.join(@operator_glue))
+  @operator_glue_class "[" <> @operator_glue_escaped <> "]"
+  @keyword_end "(?=\\z|[ \\t\\r\\n;" <> @operator_glue_escaped <> "])"
+  @reserved_start Regex.compile!(
+                    InfluxQLBlankRegex.blank_pattern("^([A-Za-z_]\\w*)(?![\\w:])" <> @keyword_end)
+                  )
 
   @reserved ~w(
     all alter analyze and any as asc begin by cardinality continuous create database
@@ -35,7 +42,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   """
   @spec reserved_start(binary(), keyword()) :: {binary(), non_neg_integer()} | nil
   def reserved_start(text, opts \\ []) do
-    with [_all, word] <- Regex.run(~q/^([A-Za-z_]\w*)(?![\w:])/, text),
+    with [_all, word] <- Regex.run(@reserved_start, text),
          true <- reserved?(word),
          false <- Keyword.get(opts, :plain, false) and called?(text, word) do
       {word, byte_size(word)}
@@ -97,9 +104,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   #     condition may start with them
   #   * `item_end`: the characters a select item may end with directly against `FROM` (`*`,
   #     `)`, a quote or the slash that closes a regular expression)
-  @operator_glue ~w[( ) * , = / + - < > ! % & | ^]
-  @operator_glue_escaped Regex.escape(Enum.join(@operator_glue))
-  @operator_glue_class "[" <> @operator_glue_escaped <> "]"
   @operand_open_chars "(+\\-"
   @operand_open_class "[" <> @operand_open_chars <> "]"
   @item_end_class "[*)\"'/]"
@@ -115,6 +119,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   @doc "`operator_glue/0` escaped, for the inside of a bracket class."
   @spec operator_glue_chars() :: binary()
   def operator_glue_chars, do: @operator_glue_escaped
+
+  @doc """
+  A piece of a regular expression for the end of a keyword that takes a word or a blank after
+  it (`ASC`, `DESC`): the end of the text, a blank, `;` or a character of an operator or a
+  parenthesis (verified for each ASCII character: against a word character it is another word,
+  against any other it is no keyword).
+  """
+  @spec keyword_end() :: binary()
+  def keyword_end, do: @keyword_end
 
   @doc "The characters a condition may start with, as the inside of a bracket class."
   @spec operand_open_chars() :: binary()
@@ -153,7 +166,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   @spec from_keyword_blanks() :: Regex.t()
   def from_keyword_blanks, do: @from_keyword_blanks
 
-  @clauses ~q/^\s*(?:WHERE(?:\s+|(?=#{@operand_open_class}))(?<where>.+?))?\s*(?:GROUP\s+BY\s+(?<group>.+?))?\s*(?<fillcall>fill\s*\((?<fill>[^)]*)\))?\s*(?:ORDER\s+BY\s+(?:time\s+(?=ASC|DESC)|(?=ASC\b|DESC\b)|time\b)(?<dir>ASC|DESC)?)?\s*(?:LIMIT\s+(?<limit>\d+))?\s*(?:OFFSET\s+(?<offset>\d+))?\s*(?:SLIMIT\s+(?<slimit>\d+))?\s*(?:SOFFSET\s+(?<soffset>\d+))?\s*(?<tzcall>TZ\s*\(\s*'(?<tz>[^']*)'\s*\))?\s*;?\s*$/is
+  @clauses ~q/^\s*(?:WHERE(?:\s+|(?=#{@operand_open_class}))(?<where>.+?))?\s*(?:GROUP\s+BY\s+(?<group>.+?))?\s*(?<fillcall>fill\s*\((?<fill>[^)]*)\))?\s*(?:ORDER\s+BY\s+(?:time\s+(?=ASC|DESC)|(?=ASC\b|DESC\b)|time\b)(?<dir>(?:ASC|DESC)#{@keyword_end})?)?\s*(?:LIMIT\s+(?<limit>\d+))?\s*(?:OFFSET\s+(?<offset>\d+))?\s*(?:SLIMIT\s+(?<slimit>\d+))?\s*(?:SOFFSET\s+(?<soffset>\d+))?\s*(?<tzcall>TZ\s*\(\s*'(?<tz>[^']*)'\s*\))?\s*;?\s*$/is
 
   @open_operand ~q/(?:[-+*=<>(,~!]|(?<![_\/])\/|\b(?:AND|OR))\s*$/i
   @fill_call ~q/(?<![\w])fill\s*\(/i

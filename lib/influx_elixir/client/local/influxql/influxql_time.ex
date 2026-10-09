@@ -59,6 +59,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
       not printable?(content) -> :unknown
       not Regex.match?(~r/^\s*[+-]?\d+-\d+-\d+/, content) -> :invalid
       Regex.match?(~r/^\d{5,}-\d+-\d+/, content) -> :invalid
+      # A character no form of a time has (verified for each of these after a date).
+      Regex.match?(~r/[!#$%&()*;<=>?@\[\]^_`{|}~]/, content) -> :invalid
       match = Regex.run(@date, content) -> read(match, "00", "00", "00", nil, "Z")
       match = Regex.run(@zoned, content) -> read_zoned(match)
       match = Regex.run(@naive_space, content) -> read_naive(match)

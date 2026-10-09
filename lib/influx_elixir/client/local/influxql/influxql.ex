@@ -141,6 +141,9 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
 
   @typedoc "A parsed `SELECT`."
   @type query :: %{
+          # How many of the `FROM` sources stand for this measurement (`FROM m, m` reads it
+          # twice), set per measurement as the statement is run.
+          optional(:copies) => pos_integer(),
           items: [item()],
           measurement: binary(),
           sources: [{:name | :regex, binary()}],

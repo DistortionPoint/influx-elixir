@@ -107,7 +107,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
     {pieces, _taken} =
       items
       |> Enum.with_index()
-      |> Enum.flat_map_reduce(MapSet.new(), &piece(&1, &2, star, schema))
+      |> Enum.flat_map_reduce(InfluxQLNames.new_taken(), &piece(&1, &2, star, schema))
 
     lead = lead_entry(pieces)
     rest = Enum.reject(pieces, &(&1 === lead))
@@ -126,6 +126,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
         do:
           throw(
             {:refused, "unsupported InfluxQL (a tag or a time aliased to a GROUP BY dimension)"}
+          )
+
+      if absent_captured?(pieces, schema),
+        do:
+          throw(
+            {:refused,
+             "unsupported InfluxQL (a column the measurement lacks aliased to a GROUP BY dimension)"}
           )
 
       if dimension_renamed?(query, pieces, schema),
@@ -165,8 +172,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
   end
 
   # The columns of one item, each with the name the select list gives it.
-  @spec piece({InfluxQL.item(), non_neg_integer()}, MapSet.t(binary()), [binary()], schema()) ::
-          {[entry()], MapSet.t(binary())}
+  @spec piece({InfluxQL.item(), non_neg_integer()}, InfluxQLNames.taken(), [binary()], schema()) ::
+          {[entry()], InfluxQLNames.taken()}
   defp piece({:star, index}, taken, star, schema) do
     {entries, taken} =
       Enum.map_reduce(star, taken, fn source, taken ->
@@ -289,6 +296,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
         piece.kind == :column and piece.role == :tag and piece.source in dimensions and
           piece.written != piece.source
       end)
+  end
+
+  # A column the measurement lacks, named as a dimension: the series the engine answers are not
+  # those of the dimension (verified: `SELECT nosuch AS host, usage ... GROUP BY host LIMIT 1`
+  # is one row, not one per host), which the double does not tell.
+  @spec absent_captured?([entry()], schema()) :: boolean()
+  defp absent_captured?(pieces, %{dimensions: dimensions, types: types, tags: tags}) do
+    Enum.any?(pieces, fn piece ->
+      piece.kind == :column and piece.role == :field and piece.written in dimensions and
+        piece.source != piece.written and not Map.has_key?(types, piece.source) and
+        not MapSet.member?(tags, piece.source)
+    end)
   end
 
   # A tag or the time aliased to the name of a dimension is the dimension: the engine tells the

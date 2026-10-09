@@ -390,9 +390,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   @spec check_tz_clause(binary(), non_neg_integer(), binary()) :: positioned()
   defp check_tz_clause(text, start, whole) do
     case Regex.run(~q/\Atz\s*\(\s*'_*'\s*\)\s*/i, text, return: :index) do
-      [{0, size}] when size < byte_size(text) -> fail(:nom, start + size, whole)
+      [{0, size}] when size < byte_size(text) -> tz_leftover(whole, start, size)
       _none_or_last -> unread()
     end
+  end
+
+  # What stands behind a `tz('UTC')` is left over; behind another zone the engine reads the name
+  # first and fails on a zone it does not know, which the double cannot tell from one it does.
+  defp tz_leftover(whole, start, size) do
+    zone = binary_part(whole, start, size)
+
+    if Regex.match?(~r/\Atz\s*\(\s*'UTC'\s*\)\s*\z/i, zone) and zone =~ "'UTC'",
+      do: fail(:nom, start + size, whole),
+      else:
+        refuse(start, "unsupported InfluxQL (a tz() zone other than UTC with a clause behind it)")
   end
 
   # After a `fill()` that follows the condition only the clauses from `ORDER BY` on may stand
@@ -448,8 +459,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     after_by = binary_part(text, size, byte_size(text) - size)
 
     cond do
-      after_by =~ ~q/^(?:time|asc|desc)(?![\w])/i ->
+      # `ASC` and `DESC` are keywords only where a blank, an operator or the end follows them
+      # (`DESC[` is a name that is no time column, verified).
+      after_by =~ ~q/^(?:time(?![\w])|(?:asc|desc)#{InfluxQLText.keyword_end()})/i ->
         unread()
+
+      after_by =~ ~q/^(?:asc|desc)(?![\w])/i ->
+        fail(:order_time, start + size, whole)
 
       InfluxQLText.reserved_start(after_by) == nil and after_by =~ ~q/^[A-Za-z_]/ ->
         fail(:order_time, start + size, whole)
@@ -469,6 +485,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     kind = text |> binary_part(word, word_size) |> String.downcase() |> count_clause()
 
     cond do
+      # The keyword read (a blank follows it) with nothing after: the operand is wanted at the
+      # end.
+      rest_size == 0 and at > word + word_size -> fail(kind, start + at, whole)
       rest_size == 0 -> fail(:nom, start, whole)
       binary_part(text, at, 1) =~ ~q/\d/ -> unread()
       true -> fail(kind, start + at, whole)
@@ -570,7 +589,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     [word] = Regex.run(~q/\A[A-Za-z0-9_.]+/, text)
     size = byte_size(word)
     rest = binary_part(text, size, byte_size(text) - size)
-    unterminated(rest, at + size, after_word(String.downcase(word), state))
+
+    # A name directly against a dot wants the next part of the name, which may be quoted.
+    next =
+      if String.ends_with?(word, "."),
+        do: :operand,
+        else: after_word(String.downcase(word), state)
+
+    unterminated(rest, at + size, next)
   end
 
   defp unterminated(<<byte, rest::binary>>, at, _state) when byte >= 0x80,

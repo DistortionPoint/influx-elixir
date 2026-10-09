@@ -50,8 +50,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   @number ~r/\A(?:(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+|\d*\.\d+|\d+)/
   @name ~r/\A[A-Za-z_]\w*/
   # The characters the parser is known to stop at after an operand.
-  @stops ~r/\A[A-Za-z0-9_.'"#:}!=<>]/
+  @stops ~r/\A[A-Za-z0-9_.'"#:}!=<>\[\]{~\\@?`$\x80-\xFF]/
   @types ~w(float integer unsigned string boolean field tag)
+  @param ~r/\A\$[\w"]/
+  @param_token ~r/\A\$(?:\w+|"[^"]*"?)/
+  @no_operand ~w(# @ { } [ ] \\ ~ ` ; : ? % & | ^ < > = ! . $)
 
   @doc """
   Reads the arguments of the call whose `(` stands at `open_at` in `text`: `{:ok, stop}` where
@@ -100,6 +103,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   end
 
   @doc """
+  Whether no field starts the text (after any signs): a parenthesis whose contents are not an
+  expression closed by `)` is no operand, and the select list fails where it starts.
+  """
+  @spec no_field?(binary()) :: boolean()
+  def no_field?(text) do
+    at = skip(text, 0)
+
+    char(text, at) == ?( and match?({:none, ^at}, expression(text, at, :select))
+  end
+
+  @doc """
   Where a select item that reads as an expression is followed by what is no part of it: a
   name, a number or a quoted text, other than an alias (`usage x`, `usage fill(1)`,
   `1e2derivative(f)`). The engine reads the item, finds `FROM` wanted, and leaves the whole
@@ -107,15 +121,43 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   """
   @spec item_leftover(binary()) :: non_neg_integer() | nil
   def item_leftover(text) do
-    with {:ok, stop} <- expression(text, skip(text, 0), :select),
-         at = skip(text, stop),
-         <<_before::binary-size(at), rest::binary>> = text,
-         true <- Regex.match?(~r/\A[A-Za-z0-9_'"]/, rest),
-         false <- Regex.match?(~r/\AAS(?![\w])/i, rest),
+    case expression(text, skip(text, 0), :select) do
+      {:ok, stop} ->
+        at = skip(text, stop)
+        <<_before::binary-size(at), rest::binary>> = text
+
+        if Regex.match?(~r/\AAS(?![\w])/i, rest),
+          do: alias_leftover(text, at, rest),
+          else: operand_leftover(at, rest)
+
+      _reads_whole_or_unknown ->
+        nil
+    end
+  end
+
+  defp operand_leftover(at, rest) do
+    with true <- Regex.match?(~r/\A[A-Za-z0-9_'"\[\]{}~\\@?`$#:\x80-\xFF]/, rest),
          nil <- InfluxQLText.reserved_start(rest, plain: true) do
       at
     else
-      _reads_whole_or_unknown -> nil
+      _no_leftover -> nil
+    end
+  end
+
+  # What stands after the alias of an item: the item is read whole, and the text behind it (a
+  # character that continues nothing) is left over.
+  defp alias_leftover(text, at, rest) do
+    with [alias_text, word] <- Regex.run(~r/\AAS[ \t\r\n]+([A-Za-z_]\w*|"[^"]*")/i, rest),
+         nil <- InfluxQLText.reserved_start(word, plain: true),
+         after_alias = at + byte_size(alias_text),
+         <<_before::binary-size(after_alias), tail::binary>> = text,
+         trimmed = InfluxQLLex.trim_blanks(tail),
+         true <- trimmed != "" and Regex.match?(~r/\A[^\s,]/, trimmed),
+         true <-
+           Regex.match?(~r/\A[A-Za-z0-9_'"\[\]{}~\\@?`$#:|^&*%+\-\/=<>!.\x80-\xFF]/, trimmed) do
+      after_alias + byte_size(tail) - byte_size(trimmed)
+    else
+      _no_leftover -> nil
     end
   end
 
@@ -266,6 +308,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
     cond do
       Regex.match?(@number, rest) -> :number
       Regex.match?(@name, rest) -> :name
+      Regex.match?(@param, rest) -> :param
       true -> classify_symbol(binary_part(rest, 0, 1))
     end
   end
@@ -275,9 +318,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   defp classify_symbol("("), do: :group
   defp classify_symbol("*"), do: :star
   defp classify_symbol(symbol) when symbol in [",", ")", "\f", "\v"], do: :none
+  # A character that starts no operand (verified for each: the parser fails where the operand
+  # should start, or at the comma before it), a non-ASCII byte too.
+  defp classify_symbol(<<byte>>) when byte >= 0x80, do: :none
+  defp classify_symbol(symbol) when symbol in @no_operand, do: :none
   defp classify_symbol(_other), do: :other
 
   defp primary(:end, _text, at, _rest, _mode), do: {:none, at}
+
+  # A bind parameter (`$a`, `$1`, `$"a b"`) is an operand.
+  defp primary(:param, _text, at, rest, _mode) do
+    [param] = Regex.run(@param_token, rest)
+    {:ok, at + byte_size(param)}
+  end
+
   defp primary(:none, _text, at, _rest, _mode), do: {:none, at}
   defp primary(:other, _text, _at, _rest, _mode), do: :unknown
 
@@ -325,10 +379,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
       else: :unknown
   end
 
-  # A name that can be an operand: no reserved word, and no connective or `NOT`.
+  # A name that can be an operand: no reserved word (read as one where a blank, an operator or
+  # the end follows it), and no connective or `NOT`.
   defp operand_name?(rest, name) do
-    InfluxQLText.reserved_start(rest, plain: true) == nil and not InfluxQLText.reserved?(name) and
-      String.downcase(name) not in ["and", "or", "not"]
+    InfluxQLText.reserved_start(rest) == nil and String.downcase(name) not in ["and", "or", "not"]
   end
 
   defp group_close(
@@ -347,11 +401,39 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
         typed(text, rest, stop)
 
       <<_before::binary-size(stop), ".", rest::binary>> ->
-        if Regex.match?(~r/\A[A-Za-z_"]/, rest), do: :unknown, else: {:none, name_at}
+        dotted(text, name_at, stop + 1, rest)
 
       _no_type ->
         at = skip(text, stop)
         if char(text, at) == ?(, do: call(text, at, mode), else: {:ok, stop}
+    end
+  end
+
+  # The names after a `.` (blanks may stand after the dot: `m. f` is `m.f`, verified): a dot
+  # with no name after it is no operand, a name read to its end is an operand (a call or a type
+  # after a dotted name is not placed).
+  @spec dotted(binary(), non_neg_integer(), non_neg_integer(), binary()) :: read()
+  defp dotted(text, name_at, after_dot, rest) do
+    trimmed = InfluxQLLex.trim_blanks(rest)
+    start = after_dot + byte_size(rest) - byte_size(trimmed)
+
+    case Regex.run(~r/\A(?:[A-Za-z_]\w*|"_*")/, trimmed) do
+      [part] ->
+        stop = start + byte_size(part)
+
+        case text do
+          <<_before::binary-size(stop), ".", more::binary>> ->
+            dotted(text, name_at, stop + 1, more)
+
+          <<_before::binary-size(stop), "::", _more::binary>> ->
+            :unknown
+
+          _end ->
+            if char(text, skip(text, stop)) == ?(, do: :unknown, else: {:ok, stop}
+        end
+
+      nil ->
+        {:none, name_at}
     end
   end
 

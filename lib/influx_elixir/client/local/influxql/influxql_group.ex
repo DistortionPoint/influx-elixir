@@ -170,9 +170,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
       String.starts_with?(rest, "*") -> wildcard(ctx, pos)
       String.starts_with?(rest, "/") -> regex(ctx, pos)
       String.starts_with?(rest, "\"") -> quoted(ctx, pos)
-      rest =~ ~q/^time(?![\w])/i and not (rest =~ ~q/^time\s*::/i) -> time_call(ctx, pos)
+      time_call?(rest) -> time_call(ctx, pos)
       true -> bare(ctx, pos, rest)
     end
+  end
+
+  # `time` is a call where a blank, `(`, an operator, `;` or the end follows it; against `::` it
+  # is a name with a cast, and against any other character (a carriage return included) it is a
+  # name, whatever stands behind it is left over (verified for each ASCII character).
+  defp time_call?(rest) do
+    rest =~ ~q/^time(?![\w])/i and
+      rest =~ ~q/^time(?:[ \t\n]|#{InfluxQLText.keyword_end()})/i and
+      not (rest =~ ~q/^time(?:::|\r)/i)
   end
 
   defp wildcard(ctx, pos) do
@@ -208,7 +217,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     case Regex.run(~q/^"(?:[^"\\]|\\.)*"/s, rest) do
       [quoted] ->
         name = InfluxQLText.unquote_ident(quoted)
-        named(ctx, name, pos + byte_size(quoted))
+        dotted_or_named(ctx, name, pos + byte_size(quoted))
 
       nil ->
         fail(ctx, :unterminated_string, byte_size(ctx.whole) - ctx.at, pos)
@@ -227,10 +236,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     end
   end
 
+  # A name directly against a `.` is a dotted name when a name follows (blanks allowed), which
+  # the double does not read; with none it is no dimension.
   defp dotted_or_named(ctx, word, stop) do
-    if byte_at(ctx.text, stop) == ?.,
-      do: {:error, "unsupported InfluxQL (GROUP BY a dotted name)"},
-      else: named(ctx, word, stop)
+    if byte_at(ctx.text, stop) == ?. do
+      after_dot = binary_part(ctx.text, stop + 1, byte_size(ctx.text) - stop - 1)
+
+      if InfluxQLLex.trim_blanks(after_dot) =~ ~q/^(?:[A-Za-z_]|")/,
+        do: {:error, "unsupported InfluxQL (GROUP BY a dotted name)"},
+        else: :none
+    else
+      named(ctx, word, stop)
+    end
   end
 
   defp named(ctx, name, stop) do
@@ -246,7 +263,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
       rest = binary_part(ctx.text, pos + 2, byte_size(ctx.text) - pos - 2)
       alternatives = Enum.join(types, "|")
 
-      case Regex.run(~q/^(?:#{alternatives})(?![\w:])/i, rest) do
+      case Regex.run(~q/^(?:#{alternatives})(?![\w:])#{InfluxQLText.keyword_end()}/i, rest) do
         [word] -> {:ok, pos + 2 + byte_size(word)}
         nil -> fail(ctx, kind, pos + 2)
       end
@@ -268,6 +285,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
       else: fail(ctx, :time_call, after_word)
   end
 
+  # The interval and the offset of `time()` are expressions the engine evaluates (`time(1m+1m)`,
+  # `time((1m))`); the double reads durations only.
+  @time_expression "unsupported InfluxQL (GROUP BY time() of an expression)"
+
+  # A group that holds a number or a duration and is closed, or an operand after an operator.
+  defp group_ahead?(text, pos),
+    do: binary_part(text, pos, byte_size(text) - pos) =~ ~q/^\(\s*[\d.][^()]*\)/
+
+  defp operand_ahead?(text, pos),
+    do: text |> binary_part(pos, byte_size(text) - pos) |> String.trim_leading() =~ ~q/^[\d.(]/
+
   defp interval(ctx, pos) do
     case duration(ctx.text, skip(ctx.text, pos)) do
       {:ok, every, stop} ->
@@ -280,7 +308,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
         {:error, "unsupported InfluxQL (a duration beyond 64 bits)"}
 
       :none ->
-        fail(ctx, :time_interval, pos)
+        if group_ahead?(ctx.text, pos),
+          do: {:error, @time_expression},
+          else: fail(ctx, :time_interval, pos)
     end
   end
 
@@ -300,9 +330,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     comma = skip(ctx.text, stop)
 
     case byte_at(ctx.text, comma) do
-      ?, -> offset(ctx, every, stop, skip(ctx.text, comma + 1))
-      ?) -> {:ok, {:time, {every, 0}}, comma + 1}
-      _other -> fail(ctx, :time_close, stop)
+      operator when operator in [?+, ?-, ?*, ?/] ->
+        if operand_ahead?(ctx.text, comma + 1),
+          do: {:error, @time_expression},
+          else: fail(ctx, :time_close, stop)
+
+      ?, ->
+        offset(ctx, every, stop, skip(ctx.text, comma + 1))
+
+      ?) ->
+        {:ok, {:time, {every, 0}}, comma + 1}
+
+      _other ->
+        fail(ctx, :time_close, stop)
     end
   end
 
@@ -330,6 +370,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
 
     cond do
+      group_ahead?(ctx.text, pos) ->
+        {:error, @time_expression}
+
       rest =~ ~q/^now\s*\(/i ->
         {:error, "unsupported InfluxQL (GROUP BY time() offset of now())"}
 

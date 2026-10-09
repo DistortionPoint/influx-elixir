@@ -50,7 +50,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
     explicit_time? = Enum.any?(items, &time_item?/1)
 
     {named, _taken} =
-      Enum.map_reduce(items, MapSet.new(), fn item, taken ->
+      Enum.map_reduce(items, new_taken(), fn item, taken ->
         case item_name(item) do
           nil ->
             {item, taken}
@@ -96,16 +96,32 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
     do: {:multi, kind, field, tags, limit, name}
 
   @doc "The name `name` becomes among those `taken`: itself, else `name_1`, `name_2`..."
-  @spec unique(binary(), MapSet.t(binary())) :: {binary(), MapSet.t(binary())}
+  @spec unique(binary(), taken()) :: {binary(), taken()}
   def unique(name, taken), do: take(name, taken)
 
-  @spec take(binary(), MapSet.t(binary())) :: {binary(), MapSet.t(binary())}
-  defp take(name, taken), do: take(name, name, 0, taken)
+  @typedoc "The names taken so far, each with the last number it was made unique with."
+  @type taken :: %{binary() => non_neg_integer()}
 
-  defp take(base, candidate, count, taken) do
-    if MapSet.member?(taken, candidate),
-      do: take(base, "#{base}_#{count + 1}", count + 1, taken),
-      else: {candidate, MapSet.put(taken, candidate)}
+  @doc "No name taken."
+  @spec new_taken() :: taken()
+  def new_taken, do: %{}
+
+  @spec take(binary(), taken()) :: {binary(), taken()}
+  defp take(name, taken) do
+    case taken do
+      %{^name => last} -> numbered(name, last + 1, taken)
+      _free -> {name, Map.put(taken, name, 0)}
+    end
+  end
+
+  # The name taken again resumes counting where it stopped, so that a list of n equal names is
+  # numbered in n steps and not n squared.
+  defp numbered(base, count, taken) do
+    candidate = "#{base}_#{count}"
+
+    if Map.has_key?(taken, candidate),
+      do: numbered(base, count + 1, taken),
+      else: {candidate, taken |> Map.put(base, count) |> Map.put(candidate, 0)}
   end
 
   # What may stand beside a `*`: other columns and wildcards, which are written out beside it

@@ -395,6 +395,10 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           check_fix(ctx, InfluxQLShapeCases.shows())
         end
 
+        test "statements the double refused by name and now answers (shape)", ctx do
+          check_fix(ctx, InfluxQLShapeCases.exact_answers())
+        end
+
         @tag local_divergence:
                "what the engine answers and the double does not compute is refused by name"
         test "statements the double refuses by name, each for its own reason", ctx do
@@ -571,6 +575,10 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           check_fix(ctx, InfluxQLDefectCases.any_regex())
         end
 
+        test "statements the double refused by name and now answers (defects)", ctx do
+          check_fix(ctx, InfluxQLDefectCases.exact_answers())
+        end
+
         @tag local_divergence:
                "what the engine answers and the double does not compute is refused by name"
         test "statements the double refuses by name, each for its own reason", ctx do
@@ -609,6 +617,65 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
 
         test "a :: with a type the engine does not know, glued to FROM or not", ctx do
           check_fix(ctx, InfluxQLGlueCases.casts())
+        end
+
+        test "a text that starts with no statement keyword, SELECT and SHOW against a character, and a text with no statement",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.statement_start())
+        end
+
+        test "SHOW directly against a character that is no blank",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.show_glue())
+        end
+
+        test "the list of sources after FROM: names, commas, dots, and a measurement named twice",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.sources())
+        end
+
+        test "text no clause starts at, before a clause or between two, and a keyword with a blank and no number after it",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.clause_junk())
+        end
+
+        test "time against a character, dotted dimensions, and the boundary of a type",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.group_by_names())
+        end
+
+        test "junk in the select list: operators with no operand, characters that start none, reserved words against a character, junk after an alias",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.select_junk())
+        end
+
+        test "a column compared with a condition in parentheses",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.nested_conditions())
+        end
+
+        test "a column the measurement lacks with fill(number), beside the time, over a measurement that does not exist, and in the name of a column",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.absent_columns())
+        end
+
+        test "a time the planner cannot read before the stack of a bare operand breaks",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.timestamps())
+        end
+
+        test "GROUP BY time() of an expression, or that does not close",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.time_calls())
+        end
+
+        test "an aggregate of a column the measurement lacks, in buckets or a window, and the statements the double refuses by name for it",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.window_absent())
+        end
+
+        test "statements the double refused by name and now answers (glue)", ctx do
+          check_fix(ctx, InfluxQLGlueCases.exact_answers())
         end
 
         @tag local_divergence:

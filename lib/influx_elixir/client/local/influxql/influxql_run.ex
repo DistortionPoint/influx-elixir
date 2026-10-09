@@ -357,11 +357,45 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   defp project(rows, %{query: query, body: body, plan: plan} = context, base) do
     rows = if query.descending, do: Enum.reverse(rows), else: rows
 
+    absent = absent_fill(context)
+
     for row <- rows,
         projected = projection(body, row, context.types),
         row_kept?(projected, row, context) do
+      projected =
+        if absent == %{},
+          do: projected,
+          else: projection(body, Map.merge(absent, row), absent_types(absent, context.types))
+
       base |> Map.put(plan.time, row["time"]) |> Map.merge(projected)
     end
+  end
+
+  # With `fill(number)` a column the measurement lacks is the number wherever it is read, a
+  # column of its own or an operand of arithmetic or a call (verified: `nosuch + 1` is the
+  # number plus one, `abs(nosuch)` its absolute value; it keeps no row by itself, only the
+  # fields of the measurement do).
+  @spec absent_fill(map()) :: %{binary() => number()}
+  defp absent_fill(%{query: %{fill: {:number, number}} = query, types: types} = context) do
+    columns = for {:column, source, _name} <- query.items, do: source
+    operands = for {:expr, ast, _name} <- query.items, ref <- InfluxQLExpr.refs(ast), do: ref
+
+    for ref <- columns ++ operands,
+        source_field?(ref, context),
+        not Map.has_key?(types, ref),
+        into: %{},
+        do: {ref, number}
+  end
+
+  defp absent_fill(_context), do: %{}
+
+  defp absent_types(absent, types) do
+    typed =
+      Map.new(absent, fn {name, number} ->
+        {name, if(is_integer(number), do: :integer, else: :float)}
+      end)
+
+    Map.merge(typed, types)
   end
 
   # The items without the first `time` column, which is the leading one.

@@ -56,10 +56,70 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
          :ok <- expressions(items, types, tags),
          :ok <- call_before_selector(query, types),
          :ok <- lone_selector_calls(items),
-         :ok <- group_field_read(query, types, tags) do
+         :ok <- group_field_read(query, types, tags),
+         :ok <- absent_aggregate(query, types, tags) do
       fill_number_on_text(query, types)
     end
   end
+
+  # An aggregate of a column the measurement lacks, inside arithmetic with other aggregates, in
+  # a statement with buckets or a window: the buckets (or rows) the engine answers are not
+  # those of the aggregates that have values (verified: `sum(f) / count(nosuch) ... GROUP BY
+  # time(1m)` has fewer buckets, `... GROUP BY host LIMIT 1` none), which the double does not
+  # tell.
+  @spec absent_aggregate(InfluxQL.query(), map(), MapSet.t(binary())) :: :ok | {:error, binary()}
+  defp absent_aggregate(%{items: items} = query, types, tags) do
+    windowed? = query.group_time != nil or query.limit != nil or query.offset > 0
+    known? = map_size(types) > 0 or MapSet.size(tags) > 0
+
+    absent? = fn {_fun, arg} ->
+      arg not in ["*", "time"] and not Map.has_key?(types, arg) and
+        not MapSet.member?(tags, arg)
+    end
+
+    refused? =
+      known? and Enum.any?(items, &absent_refused?(&1, items, query, absent?))
+
+    if windowed? and refused?,
+      do:
+        {:error,
+         "unsupported InfluxQL (an aggregate of a column the measurement lacks inside arithmetic)"},
+      else: :ok
+  end
+
+  defp absent_refused?({:expr, ast, _alias}, items, query, absent?) do
+    aggregates = InfluxQLExpr.aggregates(ast)
+    windowed_rows? = query.limit != nil or query.offset > 0
+
+    # Buckets windowed by LIMIT or OFFSET, of a quotient, are counted as the double does
+    # (verified over the statements that match); every other shape differs.
+    quotient_window? = InfluxQLExpr.quotients?(ast) and query.group_time != nil and windowed_rows?
+
+    not quotient_window? and length(aggregates) > 1 and Enum.any?(aggregates, absent?) and
+      not (not windowed_rows? and independent?(items, ast, absent?))
+  end
+
+  defp absent_refused?(_item, _items, _query, _absent?), do: false
+
+  # Whether the statement holds an aggregate of a column the measurement has that stands apart
+  # from the quotient with the missing one: another item, or a term added to it (verified: with
+  # `+ sum(n)` or a column `count(n)` beside it every bucket is answered).
+  defp independent?(items, ast, absent?) do
+    real = fn expr -> Enum.any?(InfluxQLExpr.aggregates(expr), &(not absent?.(&1))) end
+
+    other_item? =
+      Enum.any?(items, fn
+        {:aggregate, _fun, arg, _alias} when arg != :star -> true
+        {:expr, other, _alias} when other != ast -> real.(other)
+        _item -> false
+      end)
+
+    other_item? or
+      Enum.any?(terms(ast), &(real.(&1) and not Enum.any?(InfluxQLExpr.aggregates(&1), absent?)))
+  end
+
+  defp terms({:bin, op, left, right}) when op in ["+", "-"], do: terms(left) ++ terms(right)
+  defp terms(other), do: [other]
 
   # A field named in `GROUP BY` groups by its values. When the select list also
   # reads that field the engine answers oddly (the aggregate disappears, a

@@ -12,6 +12,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     InfluxQLArgs,
     InfluxQLBlanks,
     InfluxQLCheck,
+    InfluxQLClauseScan,
     InfluxQLError,
     InfluxQLExpr,
     InfluxQLGroup,
@@ -19,11 +20,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     InfluxQLLiteral,
     InfluxQLNames,
     InfluxQLSelectCheck,
+    InfluxQLSources,
     InfluxQLText,
     InfluxQLTokens
   }
 
   @aggregates ~w(mean sum count min max first last median spread stddev distinct)
+  @only_one "must provide only one InfluxQl statement per query"
   @no_variable "field must contain at least one variable"
   @cr_with_error "unsupported InfluxQL (a carriage return after a keyword in a select list " <>
                    "that has another error)"
@@ -40,7 +43,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     ]
   end
 
-  @source ~S{"(?:[^"\\]|\\.)+"|/(?:[^/\\]|\\.)+/|[A-Za-z_][\w\-]*}
+  @source ~S{"(?:[^"\\]|\\.)+"|/(?:[^/\\]|\\.)+/|[A-Za-z_]\w*}
   @select Regex.compile!(
             InfluxElixir.Client.Local.InfluxQLBlankRegex.blank_pattern(
               "^\\s*SELECT(?:\\s+|(?=[*(]))(?<items>.+?)(?:\\s+|(?<=#{InfluxQLText.item_end_class()}))FROM(?:\\s+|(?=/))" <>
@@ -112,10 +115,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
          :ok <- check_blanks(masked_head),
          :ok <- check_supported(masked_head),
          :ok <- check_select(clean, masked_head, lexer),
-         %{"items" => items, "from" => from, "rest" => rest} <-
+         %{"items" => items, "from" => from_all, "rest" => rest_all} <-
            slices(@select, masked_head, head) || unread(lexer, :unread_shape),
-         %{"items" => masked_items, "rest" => masked_rest} =
+         %{"items" => masked_items, "from" => masked_from_all, "rest" => masked_rest_all} =
            slices(@select, masked_head, masked_head),
+         {:ok, size} <- sources_end(masked_from_all <> masked_rest_all, head, lexer),
+         {from, rest} = split_at(from_all <> rest_all, size),
+         {_masked_from, masked_rest} = split_at(masked_from_all <> masked_rest_all, size),
          at = byte_size(head) - byte_size(rest),
          :ok <- InfluxQLCheck.settle([InfluxQLCheck.check_empty_where(clean, at, masked_rest)]),
          masked_all = masked_rest,
@@ -163,14 +169,64 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     end
   end
 
+  # Where the list of sources after `FROM` ends (see `InfluxQLSources`): a source that does not
+  # read is the engine's "invalid FROM clause" where it starts, a qualified one is refused.
+  @spec sources_end(binary(), binary(), InfluxQLCheck.lexer() | nil) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  defp sources_end(tail, head, lexer) do
+    from_at = byte_size(head) - byte_size(tail)
+
+    case InfluxQLSources.split(tail) do
+      {:ok, size} ->
+        {:ok, size}
+
+      # The name after the dot is read, then found missing: a literal left open there is the
+      # lexer's error, met before.
+      {:invalid, 0, detect} ->
+        error =
+          {from_at + detect + 1,
+           {:error, {:engine, InfluxQLError.syntax_error_body(:from, from_at, head)}}}
+
+        InfluxQLCheck.settle([lexer, error], head)
+
+      _invalid_or_qualified ->
+        {:error, "unsupported InfluxQL (a qualified source name)"}
+    end
+  end
+
+  @spec split_at(binary(), non_neg_integer()) :: {binary(), binary()}
+  defp split_at(text, size),
+    do: {binary_part(text, 0, size), binary_part(text, size, byte_size(text) - size)}
+
   # A statement starts with a keyword: one that starts with a quote or a slash is left unparsed
   # from there, as the text it is (the lexer reads no string or regular expression where the
   # statement list wants a keyword: verified for `'`, `'x`, `"x`, `/x`, with blanks before).
+  #
+  # Text that starts with no statement keyword is left unparsed whole (verified: `foo`,
+  # `(select n from m)`, `drop`, `sebect ...` whatever the rest holds, a literal or a comment
+  # never closed included: the lexer is not reached), and so is `SELECT` directly against a
+  # character that is no blank and no character of an operator, a parenthesis or `;` (`select"n`,
+  # `select#n`, `select:n`; against the others the keyword is read and the select list is what
+  # fails). Nothing but blanks, comments and `;` is no statement at all, and a text that starts
+  # with a `;` is read as before.
+  @select_glue Regex.compile!(
+                 InfluxElixir.Client.Local.InfluxQLBlankRegex.blank_pattern(
+                   "\\ASELECT[^\\w\\s;" <> InfluxQLText.operator_glue_chars() <> "]"
+                 ),
+                 "i"
+               )
+  @statement_start ~q/\A(?:(?:SELECT|SHOW|EXPLAIN|CREATE|DELETE)(?![\w])|DROP(?![\w])\s*\S)/i
+
   @spec not_a_token_to_start(binary()) :: :ok | {:error, {:engine, binary()}}
   defp not_a_token_to_start(clean) do
-    if clean =~ ~q/\A\s*['"\/]/,
-      do: {:error, {:engine, InfluxQLError.syntax_error_body(:nom, 0, clean)}},
-      else: :ok
+    text = InfluxQLLex.trim_blanks(clean)
+
+    cond do
+      text =~ ~q/\A[\s;]*\z/ -> {:error, {:engine, @only_one}}
+      text =~ ~q/\A;/ -> :ok
+      text =~ @statement_start and not (text =~ @select_glue) -> :ok
+      true -> {:error, {:engine, InfluxQLError.syntax_error_body(:nom, 0, clean)}}
+    end
   end
 
   # A `--` outside a literal comments out the rest of its line, `/* ... */`
@@ -242,6 +298,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # left unparsed, as for any other. Another error in the list may come first: refused.
   @spec cr_with_list(InfluxQLCheck.positioned(), InfluxQLCheck.positioned(), binary()) ::
           {:error, term()}
+  # Two errors that are one answer (both leave the whole statement unparsed) are that answer.
+  defp cr_with_list({_key, error}, {_list_key, error}, _masked_head), do: error
+
   defp cr_with_list({key, error}, {list_key, _error}, masked_head) do
     word = binary_part(masked_head, key, min(4, byte_size(masked_head) - key))
     size = if String.downcase(word) == "from", do: 4, else: 2
@@ -307,7 +366,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     end
   end
 
-  @only_one "must provide only one InfluxQl statement per query"
   @other_statements ~q/^SHOW\s+(?:DATABASES|MEASUREMENTS|TAG\s+(?:KEYS|VALUES)|FIELD\s+KEYS)\b/i
 
   # Statements the engine reads in ways the double does not follow; any
@@ -570,7 +628,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # The measurements `FROM` names: names and regular expressions, in order.
   @spec sources(binary()) :: [{:name, binary()} | {:regex, binary()}]
   defp sources(from) do
-    ~q/"(?:[^"\\]|\\.)+"|\/(?:[^\/\\]|\\.)+\/|[A-Za-z_][\w\-]*/
+    ~q/"(?:[^"\\]|\\.)+"|\/(?:[^\/\\]|\\.)+\/|[A-Za-z_]\w*/
     |> Regex.scan(from)
     |> Enum.map(fn
       ["/" <> _body = regex] ->
@@ -668,10 +726,24 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     if first_clause_error?(blank, at, masked_all) do
       blank
     else
-      InfluxQLCheck.leftmost([
-        blank,
+      junk = InfluxQLClauseScan.junk(whole, at, masked_all)
+
+      stop =
         InfluxQLCheck.condition_error(whole, at, masked_rest, rest) ||
           clauses_stop(whole, at, masked_rest)
+
+      # What is left over is the engine's answer, where the double has only found clauses in
+      # an order it does not read.
+      stop = if junk != nil and match?({_pos, {:error, :unread_order}}, stop), do: nil, else: stop
+
+      # A number past the unsigned range and a `fill()` option that does not read are met
+      # where they stand, before what is left over behind them.
+      InfluxQLCheck.leftmost([
+        blank,
+        junk,
+        stop,
+        InfluxQLCheck.check_unsigned(whole, at, masked_all),
+        InfluxQLCheck.fill_error(whole, at, masked_all)
       ])
     end
   end

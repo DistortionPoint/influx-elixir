@@ -55,7 +55,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     rest = binary_part(masked, items_at, byte_size(masked) - items_at)
 
     if rest == "" or reserved_item?(rest) or reserved_item?(skip_signs(rest)) or
-         not field_start?(skip_signs(rest)) do
+         not field_start?(skip_signs(rest)) or InfluxQLArgs.no_field?(skip_signs(rest)) do
       engine(items_at, InfluxQLError.syntax_error_body(:field, items_at, whole))
     else
       check_from_keyword(whole, masked, items_at)
@@ -86,7 +86,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
         # as it can be, so that a literal left open in it is the error.
         InfluxQLCheck.leftmost([
           bad_cast(rest, items_at, whole),
-          reserved_operand(rest, items_at, whole, :off)
+          reserved_operand(rest, items_at, whole, :off),
+          check_each_item(whole, rest, items_at, byte_size(masked))
         ]) ||
           engine(none_key(masked, items_at), InfluxQLError.syntax_error_body(:nom, 0, whole))
     end
@@ -178,7 +179,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     with false <- text =~ ~q/(?:^|,)\s*\/(?:[^\/\\]|\\.)+\/\s*$/s,
          [_all, {at, 1}, {operand_at, 0}] <-
            Regex.run(~q/([+\-*\/%&|^])\s*()(?:[+\-(]\s*)*$/, masked, return: :index),
-         true <- binary_operator?(masked, at) do
+         true <- binary_operator?(masked, at),
+         false <-
+           masked
+           |> binary_part(0, at)
+           |> String.match?(~q/(?:\A|\s)AS\s+(?:[A-Za-z_]\w*|"_*")\s*\z/i) do
       {:binary.at(text, at), operand_at}
     else
       _no_operator -> nil
@@ -204,7 +209,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   end
 
   @spec operator_body(byte(), non_neg_integer(), binary()) :: binary()
-  defp operator_body(operator, operand_at, whole) when operator in [?+, ?-],
+  defp operator_body(operator, operand_at, whole) when operator in [?+, ?-, ?|, ?^],
     do: InfluxQLError.syntax_error_body(:failure, operand_at, whole)
 
   defp operator_body(_operator, _operand_at, whole),
@@ -446,7 +451,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
         # errors come first (see `operator_hit/3` and `InfluxQLArgs`).
         before =~ ~q/(?:\A|\s)AS\z/i -> :alias
         inside_call?(before) or before =~ ~q/(?:[\w)"']|[+\-*\/%&|^])\z/ -> nil
-        true -> :field
+        # Only at the start of the item, behind signs and parentheses that open nothing else.
+        before =~ ~q/\A[\s+\-(]*\z/ -> :field
+        true -> nil
       end
     end)
   end
