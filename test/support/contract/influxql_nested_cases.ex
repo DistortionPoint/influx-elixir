@@ -1,7 +1,49 @@
 defmodule InfluxElixir.Contract.InfluxQLNestedCases do
-  @moduledoc "Statements over the `~p1` fixture of `InfluxElixir.Contract.InfluxQLProjectionCases` (and `~p2`, two points whose field is named with a double quote) with the answers InfluxDB 3 Core 3.10.1 gave when a condition in parentheses stands beside arithmetic or as an operand of a comparison, when a field is compared with a constant the engine folds, when the sources of a FROM are dotted or qualified, when a select list repeats a name or needs one quoted, and when a clause keyword comes where the clauses before it end the statement. `~db` is the database the statement is run in. The statements the double refuses by name, with the reason pinned, are `refusals/0`."
+  @moduledoc "Statements over the `~p1` fixture of `InfluxElixir.Contract.InfluxQLProjectionCases` (and `~p2`, two points whose field is named with a double quote) with the answers InfluxDB 3 Core 3.10.1 gave when a constant with signs stands alone as a condition, when a condition in parentheses stands beside arithmetic or as an operand of a comparison, when arithmetic with a column the measurement lacks stands beside a boolean, when comparisons are chained, when a time or a duration stands in a group, when a name has more than three parts or ends in a line feed, when a field is compared with a constant the engine folds, when the sources of a FROM are dotted or qualified, when a select list repeats a name or needs one quoted, and when a clause keyword comes where the clauses before it end the statement. `~db` is the database the statement is run in. The statements the double refuses by name, with the reason pinned, are `refusals/0`."
 
   alias InfluxElixir.Contract.InfluxQLProjectionCases
+
+  # The usage of the points of `~p1` that hold one, by the minute of the point, for the tables
+  # whose answers are a set of those points.
+  @usage %{
+    0 => 0.25,
+    1 => 1.75,
+    2 => 3.25,
+    4 => 6.25,
+    5 => 7.75,
+    6 => 9.25,
+    7 => 10.75,
+    8 => 12.25,
+    9 => 13.75,
+    11 => 16.75,
+    12 => 18.25,
+    13 => 19.75,
+    14 => 21.25,
+    15 => 22.75,
+    16 => 24.25,
+    18 => 27.25,
+    19 => 28.75,
+    20 => 30.25,
+    21 => 31.75,
+    22 => 33.25,
+    23 => 34.75,
+    25 => 37.75,
+    26 => 39.25,
+    27 => 40.75,
+    28 => 42.25,
+    29 => 43.75
+  }
+
+  # Every point that holds a usage, and those whose `ok` is false.
+  @every @usage |> Map.keys() |> Enum.sort()
+  @ok_false [5, 9, 11, 15, 21, 23, 27, 29]
+
+  defp rows(minutes) do
+    for minute <- minutes do
+      clock = minute |> Integer.to_string() |> String.pad_leading(2, "0")
+      {"2023-10-01 00:#{clock}:00", %{"usage" => Map.fetch!(@usage, minute)}}
+    end
+  end
 
   @doc "The names the cases use, from one unique `prefix`: `~p1` and `~p2` (the database, `~db`, is the run's own)."
   @spec names(binary()) :: %{binary() => binary()}
@@ -588,7 +630,7 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
     ]
   end
 
-  @doc "A field compared with a constant of numbers, `+`, `*` and signs, which the engine folds before it compares (a fraction without its integer part included), and a string or a tag compared with the lowest 64-bit integer, which keeps no point."
+  @doc "A field compared with a constant of numbers, `+`, `*` and signs, which the engine folds before it compares (a fraction without its integer part included; the 64-bit integer arithmetic wraps, so `9223372036854775807 + 1` is the lowest integer), and a string or a tag compared with the lowest 64-bit integer, which keeps no point."
   @spec constants() :: [{binary(), term()}]
   def constants do
     [
@@ -604,7 +646,22 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
          {"2023-10-01 00:28:00", %{"usage" => 42.25}},
          {"2023-10-01 00:29:00", %{"usage" => 43.75}}
        ]},
-      {"select usage from ~p1 where s = -9223372036854775808", []}
+      {"select usage from ~p1 where s = -9223372036854775808", []},
+      {"select usage from ~p1 where n > 9223372036854775807 + 1",
+       rows([0, 1, 4, 5, 6, 8, 9, 11, 13, 14, 15, 16, 18, 19, 20, 21, 23, 25, 26, 28, 29])},
+      {"select usage from ~p1 where usage > 9223372036854775807 + 1", rows(@every)},
+      {"select usage from ~p1 where n = 9223372036854775807 + 1", []},
+      {"select usage from ~p1 where n > 4611686018427387904 * 2",
+       rows([0, 1, 4, 5, 6, 8, 9, 11, 13, 14, 15, 16, 18, 19, 20, 21, 23, 25, 26, 28, 29])},
+      {"select usage from ~p1 where n < 3037000500 * 3037000500", []},
+      {"select usage from ~p1 where n > -9223372036854775808",
+       rows([0, 1, 4, 5, 6, 8, 9, 11, 13, 14, 15, 16, 18, 19, 20, 21, 23, 25, 26, 28, 29])},
+      {"select usage from ~p1 where 9223372036854775807 + 1 < 0", rows(@every)},
+      {"select usage from ~p1 where 9223372036854775807 + 1 > 0", []},
+      {"select usage from ~p1 where 9223372036854775807 * 9223372036854775807 > 0", rows(@every)},
+      {"select usage from ~p1 where -9223372036854775808 - 1 < 0", []},
+      {"select usage from ~p1 where 9223372036854775807 * -1 < 0", rows(@every)},
+      {"select usage from ~p1 where 9223372036854775807 + 1.0 > 0", rows(@every)}
     ]
   end
 
@@ -778,13 +835,606 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
     ]
   end
 
+  @doc "Arithmetic with a column the measurement lacks in it, as an operand of a comparison with `ok` or a condition in parentheses. The engine types the arithmetic by the types of its operands: a missing column beside a string, a tag, a boolean, a duration or the time makes the constant `false` (so `nosuch + 1h = ok` keeps the points `ok` is false for), beside a number a null, and the types fold left to right through signs, parentheses and calls; the coercion errors of its operands (a tag beside a string, an unsigned number beside text, the time beside anything but a duration) are raised whichever side they stand on. A quotient of a null and an integer is a null integer (unsigned beside an unsigned number, the planner's error beside a boolean), where a float makes a null of its own; and an unsigned number (a column, or an integer written beyond the signed range) against a boolean is that error whatever else is in its arithmetic."
+  @spec absent_arithmetic() :: [{binary(), term()}]
+  def absent_arithmetic do
+    [
+      {"select usage from ~p1 where nosuch + 1h = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + true = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + time = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch * time = ok", rows(@ok_false)},
+      {"select usage from ~p1 where (nosuch) + 'x' = ok", rows(@ok_false)},
+      {"select usage from ~p1 where -nosuch + 'x' = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + ('x') = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + ('x' + 'y') = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + nosuch2 + 'x' = ok", rows(@ok_false)},
+      {"select usage from ~p1 where (nosuch + nosuch2) + s = ok", rows(@ok_false)},
+      {"select usage from ~p1 where 'x' + 'y' + nosuch = ok", rows(@ok_false)},
+      {"select usage from ~p1 where abs(nosuch) + time = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Float64 + Timestamp(ns) to valid types"}},
+      {"select usage from ~p1 where time + 1 + nosuch = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) + Int64 to valid types"}},
+      {"select usage from ~p1 where nosuch - 'x' = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch / 1h = ok", rows(@ok_false)},
+      {"select usage from ~p1 where host + nosuch = ok", rows(@ok_false)},
+      {"select usage from ~p1 where ok + nosuch = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + 1 = ok", []},
+      {"select usage from ~p1 where nosuch + usage = ok", []},
+      {"select usage from ~p1 where nosuch + u = ok", []},
+      {"select usage from ~p1 where abs(nosuch) + 'x' = ok", []},
+      {"select usage from ~p1 where abs(nosuch) + nosuch2 = ok", []},
+      {"select usage from ~p1 where (nosuch + 1) + 'x' = ok", rows(@ok_false)},
+      {"select usage from ~p1 where (nosuch + 'x') + 1 = ok", []},
+      {"select usage from ~p1 where (nosuch + 'x') + 'y' = ok", []},
+      {"select usage from ~p1 where (nosuch + 'x') + nosuch2 = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + 'x' + 1 + 'y' = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + 'x' + 1 + time = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + 'x' + 1 + nosuch2 = ok", []},
+      {"select usage from ~p1 where nosuch + 'x' + 'y' + 'z' = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + 'x' + host = ok", []},
+      {"select usage from ~p1 where (nosuch + 1h) + time = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean + Timestamp(ns) to valid types"}},
+      {"select usage from ~p1 where nosuch + -s = ok", []},
+      {"select usage from ~p1 where 'x' * -s = ok", rows(@ok_false)},
+      {"select usage from ~p1 where 1 * -s = ok", []},
+      {"select usage from ~p1 where (true * -s) + 'x' = ok", []},
+      {"select usage from ~p1 where 1h * -s = ok", rows(@ok_false)},
+      {"select usage from ~p1 where 1h + 1h + nosuch = ok", rows(@ok_false)},
+      {"select usage from ~p1 where ok = nosuch + 1h", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + 1h != ok", rows([0, 2, 6, 8, 12, 14, 18, 20, 26])},
+      {"select usage from ~p1 where nosuch + 1h = true", []},
+      {"select usage from ~p1 where nosuch + 1h <> false", []},
+      {"select usage from ~p1 where nosuch + 1h = nosuch2 + 'x'", rows(@every)},
+      {"select usage from ~p1 where nosuch + 1h = nosuch2 + 1", []},
+      {"select usage from ~p1 where nosuch + 1h > ok", []},
+      {"select usage from ~p1 where nosuch + 1h = host", []},
+      {"select usage from ~p1 where nosuch + 1h = 1", []},
+      {"select usage from ~p1 where (n > 1) = nosuch + time", rows([0, 1])},
+      {"select usage from ~p1 where nosuch + 1h = (n > 1)", rows([0, 1])},
+      {"select usage from ~p1 where (n > 1) = (nosuch) + time", rows([0, 1])},
+      {"select usage from ~p1 where (n > 1) = (nosuch + 1) + time", rows([0, 1])},
+      {"select usage from ~p1 where (n > 1) != nosuch + true",
+       rows([4, 5, 6, 8, 9, 11, 13, 14, 15, 16, 18, 19, 20, 21, 23, 25, 26, 28, 29])},
+      {"select usage from ~p1 where (n > 1) = nosuch + 1 + 'x'", rows([0, 1])},
+      {"select usage from ~p1 where (n > 1) = (nosuch + 'x') + 1", []},
+      {"select usage from ~p1 where (n > 1) = nosuch + 1", []},
+      {"select usage from ~p1 where (n > 1) = nosuch2 + nosuch + 'x'", rows([0, 1])},
+      {"select usage from ~p1 where (w > 1) = host + s",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Utf8 to valid types"}},
+      {"select usage from ~p1 where host + 'a' = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Utf8 to valid types"}},
+      {"select usage from ~p1 where ((host + 'a')) = ((n > 1))",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Utf8 to valid types"}},
+      {"select usage from ~p1 where host + 'a' = nosuch",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Utf8 to valid types"}},
+      {"select usage from ~p1 where (n > 1) = 'a' + host",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Utf8 + Dictionary(Int32, Utf8) to valid types"}},
+      {"select usage from ~p1 where s + host = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Utf8 + Dictionary(Int32, Utf8) to valid types"}},
+      {"select usage from ~p1 where host + s = nosuch",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Utf8 to valid types"}},
+      {"select usage from ~p1 where u + 'x' = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Utf8 to valid types"}},
+      {"select usage from ~p1 where (n > 1) = u + host",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Dictionary(Int32, Utf8) to valid types"}},
+      {"select usage from ~p1 where (n > 1) = u + true",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Boolean to valid types"}},
+      {"select usage from ~p1 where (n > 1) = u + 1h",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Interval(MonthDayNano) to valid types"}},
+      {"select usage from ~p1 where (n > 1) = time + 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) + Int64 to valid types"}},
+      {"select usage from ~p1 where (n > 1) = (nosuch + 'x') + time",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean + Timestamp(ns) to valid types"}},
+      {"select usage from ~p1 where nosuch + 'x' + u = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean + UInt64 to valid types"}},
+      {"select usage from ~p1 where (n > 1) = nosuch + 1 + u",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select usage from ~p1 where (n > 1) = -nosuch + u",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select usage from ~p1 where nosuch + 1 + u = ok",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select usage from ~p1 where u + (nosuch + 1) = ok",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select usage from ~p1 where (nosuch + 1) * u = ok",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select usage from ~p1 where -nosuch * u = ok",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select usage from ~p1 where nosuch + u + 1 = ok", []},
+      {"select usage from ~p1 where u / 'x' = ok",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select usage from ~p1 where (u / 'x') + 1 = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select usage from ~p1 where true - (1 / u) = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean - UInt64 to valid types"}},
+      {"select usage from ~p1 where (nosuch + 'x') + u = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean + UInt64 to valid types"}},
+      {"select usage from ~p1 where u * (nosuch + 'x') = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 * Boolean to valid types"}},
+      {"select usage from ~p1 where 1h - time = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Interval(MonthDayNano) - Timestamp(ns) to valid types"}},
+      {"select usage from ~p1 where time * 1h = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) * Interval(MonthDayNano) to valid types"}},
+      {"select usage from ~p1 where time + time = ok",
+       {:error, 400,
+        "Error during planning: Cannot get result type for temporal operation Timestamp(ns) + Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: Timestamp(ns) + Timestamp(ns)"}},
+      {"select usage from ~p1 where time * time = ok",
+       {:error, 400,
+        "Error during planning: Cannot get result type for temporal operation Timestamp(ns) * Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: Timestamp(ns) * Timestamp(ns)"}},
+      {"select usage from ~p1 where 1h * 1h = ok",
+       {:error, 400,
+        "Error during planning: Cannot get result type for temporal operation Interval(MonthDayNano) * Interval(MonthDayNano): Invalid argument error: Invalid interval arithmetic operation: Interval(MonthDayNano) * Interval(MonthDayNano)"}},
+      {"select usage from ~p1 where time + 1.5 = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) + Float64 to valid types"}},
+      {"select usage from ~p1 where time + 'x' = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) + Utf8 to valid types"}},
+      {"select usage from ~p1 where 'x' + time = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Utf8 + Timestamp(ns) to valid types"}},
+      {"select usage from ~p1 where time + host = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) + Dictionary(Int32, Utf8) to valid types"}},
+      {"select usage from ~p1 where time + ok = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) + Boolean to valid types"}},
+      {"select usage from ~p1 where time + u = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) + UInt64 to valid types"}},
+      {"select usage from ~p1 where time + abs(n) = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) + Int64 to valid types"}},
+      {"select usage from ~p1 where time + abs(usage) = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) + Float64 to valid types"}},
+      {"select usage from ~p1 where 'x' * time - nosuch = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Utf8 * Timestamp(ns) to valid types"}},
+      {"select usage from ~p1 where ('x' + 'y') * time = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Utf8 * Timestamp(ns) to valid types"}},
+      {"select usage from ~p1 where ((-1h) + -1h) / nosuch = ok", rows(@ok_false)},
+      {"select usage from ~p1 where ('x') * ('x' + 'y') - host = ok", rows(@ok_false)},
+      {"select usage from ~p1 where ((s) * s) + ok = ok", rows(@ok_false)},
+      {"select usage from ~p1 where (n > 1) = nosuch + 1h", rows([0, 1])},
+      {"select usage from ~p1 where nosuch + 'x' = host + 'a'",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Utf8 to valid types"}},
+      {"select usage from ~p1 where -(u / 'x') = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select usage from ~p1 where 1 + (u / 'x') = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select usage from ~p1 where (u / 'x') + nosuch = ok", []},
+      {"select usage from ~p1 where nosuch + (u / 'x') = ok", []},
+      {"select usage from ~p1 where -(nosuch + 'x') = ok", []},
+      {"select usage from ~p1 where ('x' + 1) + 1 = ok", []},
+      {"select usage from ~p1 where ('x' + 1) + (nosuch + 1) = ok", []},
+      {"select usage from ~p1 where (nosuch + 1) + ('x' + 1) = ok", []},
+      {"select usage from ~p1 where ('x' + 1) + (nosuch * 1.5) = ok", []},
+      {"select usage from ~p1 where (nosuch * 1.5) + ('x' + 1) = ok", []},
+      {"select usage from ~p1 where (nosuch * 1.5) + u = ok", []},
+      {"select usage from ~p1 where (nosuch / 1.5) + u = ok", []},
+      {"select usage from ~p1 where (nosuch / 1) + u = ok",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select usage from ~p1 where (time + 1h) + nosuch = ok", rows(@ok_false)},
+      {"select usage from ~p1 where nosuch + (1h + time) = ok", rows(@ok_false)},
+      {"select usage from ~p1 where (time - 1h) + 'x' = ok",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) + Utf8 to valid types"}},
+      {"select usage from ~p1 where 18446744073709551615 = true",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select usage from ~p1 where true = 18446744073709551615",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select usage from ~p1 where u + 9223372036854775808 = ok",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select usage from ~p1 where ok = u + 9223372036854775808",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}}
+    ]
+  end
+
+  @doc "A constant with signs that stands alone as a condition: the lowest 64-bit integer written with a minus anywhere in its signs is a signed integer (without one it is unsigned), the type the planner names, beside a boolean no error and no point, and behind `tz()` the filter it prints."
+  @spec lone_constants() :: [{binary(), term()}]
+  def lone_constants do
+    [
+      {"select usage from ~p1 where - 9223372036854775808",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND Int64"}},
+      {"select usage from ~p1 where + - 9223372036854775808",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND Int64"}},
+      {"select usage from ~p1 where + 9223372036854775808",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND UInt64"}},
+      {"select usage from ~p1 where - 9223372036854775808 and ok", []},
+      {"select usage from ~p1 where ok or - 9223372036854775808", []},
+      {"select usage from ~p1 where - 9223372036854775808 tz('UTC')",
+       {:error, 400,
+        "Error during planning: Cannot create filter with non-boolean predicate 'Int64(-9223372036854775808)' returning Int64"}},
+      {"select usage from ~p1 where + 9223372036854775808 tz('UTC')",
+       {:error, 400,
+        "Error during planning: Cannot create filter with non-boolean predicate 'UInt64(9223372036854775808)' returning UInt64"}},
+      # Signs outside parentheses apply to the value: the literal in them stays unsigned.
+      {"select usage from ~p1 where -(9223372036854775808)",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND UInt64"}},
+      {"select usage from ~p1 where +(9223372036854775808)",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND UInt64"}},
+      {"select usage from ~p1 where -(-(9223372036854775808))",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND UInt64"}},
+      {"select usage from ~p1 where -(9223372036854775808) and ok",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for logical boolean operation UInt64 AND Boolean"}},
+      {"select usage from ~p1 where ok or -(9223372036854775808)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for logical boolean operation Boolean OR UInt64"}}
+    ]
+  end
+
+  @doc "A comparison chained with another is `(a = b) = c`: what is before the last operator is a condition in parentheses, compared as one is with a boolean column, `true`, another group, a number (never true), a string, a column the measurement lacks or an unsigned column (the planner's error)."
+  @spec chains() :: [{binary(), term()}]
+  def chains do
+    [
+      {"select usage from ~p1 where n > 1 = ok", rows([6, 8, 14, 18, 20, 26])},
+      {"select usage from ~p1 where n > 1 = true",
+       rows([4, 5, 6, 8, 9, 11, 13, 14, 15, 16, 18, 19, 20, 21, 23, 25, 26, 28, 29])},
+      {"select usage from ~p1 where n > 1 = 1", []},
+      {"select usage from ~p1 where ok = ok = 1", []},
+      {"select usage from ~p1 where ok = ok = ok", rows([0, 2, 6, 8, 12, 14, 18, 20, 26])},
+      {"select usage from ~p1 where ok = ok = 'x'", []},
+      {"select usage from ~p1 where ok = ok = nosuch", []},
+      {"select usage from ~p1 where ok = ok = host", []},
+      {"select usage from ~p1 where 1 = 1 = ok", rows([0, 2, 6, 8, 12, 14, 18, 20, 26])},
+      {"select usage from ~p1 where 1 = 1 = 1", []},
+      {"select usage from ~p1 where n = 1 = n", []},
+      {"select usage from ~p1 where (n > 1) = ok = 1", []},
+      {"select usage from ~p1 where (n > 1) = ok = ok",
+       rows([5, 6, 8, 9, 11, 14, 15, 18, 20, 21, 23, 26, 29])},
+      {"select usage from ~p1 where n > 1 = (n > 2)",
+       rows([0, 1, 5, 6, 8, 9, 11, 13, 14, 15, 16, 18, 19, 20, 21, 23, 25, 26, 28, 29])},
+      {"select usage from ~p1 where n > 1 = n > 2", []},
+      {"select usage from ~p1 where n > 1 = nosuch + 'x'", rows([0, 1])},
+      {"select usage from ~p1 where n > 1 = u",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select usage from ~p1 where u > 1 = ok", rows([2, 6, 8, 12, 14, 18, 20, 26])},
+      {"select usage from ~p1 where n > 1 > 0", []},
+      {"select usage from ~p1 where ok = ok != ok", rows(@ok_false)},
+      {"select usage from ~p1 where s = 'a' = ok", rows(@ok_false)},
+      {"select usage from ~p1 where host = 'a' = ok", rows([0, 5, 6, 11, 12, 18, 23, 29])},
+      {"select usage from ~p1 where host = 'a' = 1", []},
+      {"select usage from ~p1 where ok = true = true", rows([0, 2, 6, 8, 12, 14, 18, 20, 26])},
+      {"select usage from ~p1 where n > 1 = ok = ok",
+       rows([5, 6, 8, 9, 11, 14, 15, 18, 20, 21, 23, 26, 29])},
+      {"select usage from ~p1 where n > 1 = ok = 1", []},
+      {"select usage from ~p1 where abs(n) < usage = 1", []},
+      {"select usage from ~p1 where abs((n)) < usage = 1", []},
+      {"select usage from ~p1 where usage + 1h > (n > 1)", []}
+    ]
+  end
+
+  @doc "A comparison of the time inside a condition in parentheses that is an operand of a comparison is not split out of it: `time > 0` there is the planner's type error of the time against an integer, without the `type_coercion` wrapper the SQL engine words it with."
+  @spec time_in_groups() :: [{binary(), term()}]
+  def time_in_groups do
+    [
+      {"select usage from ~p1 where (time > 0) = ok",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) > Int64"}},
+      {"select usage from ~p1 where ok = (time > 0)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) > Int64"}},
+      {"select usage from ~p1 where ok = (n > 1 AND time > 0)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) > Int64"}},
+      {"select usage from ~p1 where ok = (time > 0 AND n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) > Int64"}},
+      {"select usage from ~p1 where (n > 1 AND time > 0) = ok",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) > Int64"}}
+    ]
+  end
+
+  @doc "A name of more than three parts (`a.b.c.d`) in the select list: the dot after the third part is left over, from the start of the statement for an item, from the dot for the argument of a call."
+  @spec long_names() :: [{binary(), term()}]
+  def long_names do
+    [
+      {"select a.b.c.d from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select a.b.c.d from ~p1\", Tag)"}},
+      {"select db.autogen.~p1.v from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select db.autogen.~p1.v from ~p1\", Tag)"}},
+      {"select count(a.b.c.d) from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\".d) from ~p1\", Char)"}},
+      {"select usage + a.b.c.d from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select usage + a.b.c.d from ~p1\", Tag)"}},
+      {"select usage, a.b.c.d from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select usage, a.b.c.d from ~p1\", Tag)"}},
+      {"select a.b.c from ~p1", []},
+      {"select ~p1.usage from ~p1", []},
+      {"select a.b.c.d.e from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select a.b.c.d.e from ~p1\", Tag)"}},
+      {"select abs(a.b.c.d) from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\".d) from ~p1\", Char)"}},
+      {"select a.b.c.d fro ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select a.b.c.d fro ~p1\", Tag)"}},
+      {"select \"a\".\"b\".\"c\".\"d\" from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select \\\"a\\\".\\\"b\\\".\\\"c\\\".\\\"d\\\" from ~p1\", Tag)"}}
+    ]
+  end
+
+  @doc "A quoted time that ends in a line feed (`'2023-10-01\\n'`), in any form the planner reads: it is not a valid timestamp, and the error quotes it twice, the first time as Rust's debug output writes it."
+  @spec time_strings() :: [{binary(), term()}]
+  def time_strings do
+    [
+      {"select usage from ~p1 where time > '2023-10-01\\n'",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01\\n'\": '2023-10-01\n' is not a valid timestamp"}},
+      {"select usage from ~p1 where time > '2023-10-01T00:05:00Z\\n'",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01T00:05:00Z\\n'\": '2023-10-01T00:05:00Z\n' is not a valid timestamp"}},
+      {"select usage from ~p1 where time > '2023-10-01 00:05:00\\n'",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01 00:05:00\\n'\": '2023-10-01 00:05:00\n' is not a valid timestamp"}},
+      {"select usage from ~p1 where time > '2023-10-01T00:05\\n'",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01T00:05\\n'\": '2023-10-01T00:05\n' is not a valid timestamp"}},
+      {"select usage from ~p1 where time > '2023-10-01 00:05\\n'",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01 00:05\\n'\": '2023-10-01 00:05\n' is not a valid timestamp"}},
+      {"select usage from ~p1 where time > '2023-10-01T00:05:00+01:00\\n'",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01T00:05:00+01:00\\n'\": '2023-10-01T00:05:00+01:00\n' is not a valid timestamp"}},
+      {"select usage from ~p1 where time <= '00:05:00\\n'",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'00:05:00\\n'\": '00:05:00\n' is not a valid timestamp"}},
+      {"select usage from ~p1 where time = '1696118700\\n'",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'1696118700\\n'\": '1696118700\n' is not a valid timestamp"}},
+      {"select usage from ~p1 where time > '2023-10-01\\n\\n'",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01\\n\\n'\": '2023-10-01\n\n' is not a valid timestamp"}},
+      {"select usage from ~p1 where time > '2023-10-01 '",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"'2023-10-01 '\": '2023-10-01 ' is not a valid timestamp"}},
+      {"select usage from ~p1 where time > ' 2023-10-01T00:05:00Z'",
+       rows([6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 25, 26, 27, 28, 29])}
+    ]
+  end
+
+  @doc "Names of a qualified source: the retention policy of a name with three parts is printed in the mismatch of the database, quoted unless it is a plain word that is no reserved word (a backslash, a double quote and a line feed escaped), and every part but the last may be a reserved word or an empty quoted name."
+  @spec qualified_names() :: [{binary(), term()}]
+  def qualified_names do
+    [
+      {"select usage from rv23.\"x y\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"x y\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"a\\\"b\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"a\\\"b\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"a\\\\b\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"a\\\\b\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"1a\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"1a\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"select\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"select\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"a-b\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"a-b\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"é\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"é\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"a\\nb\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"a\\nb\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"Select\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"Select\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"ab c\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"ab c\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"ab_1\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/ab_1) that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"_a\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/_a) that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"exact\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"exact\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from \"r v\".\"x y\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (r v/\"x y\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.\"\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23/\"\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rv23.autogen.~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (rv23) that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from db.select.~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (db/\"select\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from db.where.~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (db/\"where\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from db.AND.~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (db/\"AND\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from db.limit.~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (db/\"limit\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from db.\"\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (db/\"\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from db.foo.\"\"",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (db/foo) that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from rp.\"\"", []},
+      {"select usage from \"\"", []},
+      {"select usage from \"\".~p1", rows(@every)},
+      {"select usage from select.~p1", rows(@every)},
+      {"select usage from limit.~p1", rows(@every)},
+      {"select usage from select.x.~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (select/x) that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from select..~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (select) that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from \"\".x.\"\"",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (/x) that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from x.\"\".\"\"",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (x/\"\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from ~p1, \"\"", rows(@every)},
+      {"select usage from rp.\"\", ~p1",
+       {:error, 400, "error in InfluxQL statement: can only perform queries on a single database"}},
+      {"select usage from select.~p1, ~p1",
+       {:error, 400, "error in InfluxQL statement: can only perform queries on a single database"}},
+      {"select usage from ~db.\"\".~p1, ~db.select.~p1",
+       {:error, 400, "error in InfluxQL statement: can only perform queries on a single database"}},
+      {"select usage from ~db.\"\".~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (~db/\"\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from ~db.select.~p1",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (~db/\"select\") that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from db.rp.//",
+       {:error, 400,
+        "provided a database in both the parameters (~db) and query string (db/rp) that do not match, if providing a query that specifies the database, you can omit the 'database' parameter from your request"}},
+      {"select usage from db.select",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid FROM clause, expected identifier, regular expression or subquery at pos 18"}},
+      {"select usage from select",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid FROM clause, expected identifier, regular expression or subquery at pos 18"}},
+      {"select usage from ~p1.limit",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid FROM clause, expected identifier, regular expression or subquery at pos 18"}},
+      {"select usage from db.rp.select",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid FROM clause, expected identifier, regular expression or subquery at pos 18"}},
+      {"select usage from rp.select",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid FROM clause, expected identifier, regular expression or subquery at pos 18"}},
+      {"select usage from db.foo.select",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid FROM clause, expected identifier, regular expression or subquery at pos 18"}},
+      {"select usage from ~p1, x.\"",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unterminated string literal at pos 26"}},
+      {"select usage from ~p1, \"",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unterminated string literal at pos 24"}},
+      {"select usage from ~p1, x.y.\"",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unterminated string literal at pos 28"}}
+    ]
+  end
+
+  @doc "A duration in a condition in parentheses that is an operand of a comparison: where the group is a null (a column the measurement lacks) or is never planned (an ordering against a column) it changes nothing; where it is planned the double refuses (`refusals/0`)."
+  @spec durations() :: [{binary(), term()}]
+  def durations do
+    [
+      {"select usage from ~p1 where ok = (nosuch > 1h)", []},
+      {"select usage from ~p1 where usage > (n > 1h)", []}
+    ]
+  end
+
+  @doc "Statements that are long rather than odd: a condition in parentheses nested four hundred deep (each level compares `ok` with a group that holds the next, alternating `n > 1` and an absent `w > 1`), and a sum of eight hundred calls. The double answers each in a few hundred milliseconds in a process capped at five million words."
+  @spec deep_conditions() :: [{binary(), term()}]
+  def deep_conditions do
+    nested =
+      Enum.reduce(1..400, "n > 1", fn level, inner ->
+        if rem(level, 2) == 0,
+          do: "ok = (w > 1 AND " <> inner <> ")",
+          else: "ok = (n > 1 AND " <> inner <> ")"
+      end)
+
+    calls = Enum.join(List.duplicate("abs(1)", 800), " + ")
+
+    [
+      {"select usage from ~p1 where " <> nested, rows(@ok_false)},
+      {"select usage from ~p1 where " <> calls <> " > 0", rows(@every)}
+    ]
+  end
+
   @doc "Statements the engine answers (or rejects with a body the double does not give) and the double refuses by name, with the engine's answer."
   @spec refusals() :: [{binary(), term()}]
   def refusals do
     [
-      {"select usage from ~p1 where (n > 1) = ok = 1", []},
-      {"select usage from ~p1 where abs(n) < usage = 1", []},
-      {"select usage from ~p1 where abs((n)) < usage = 1", []},
+      {"select usage from ~p1 where ok = (n > 1h)", rows(@ok_false)},
+      {"select usage from ~p1 where ok = (n = 1h)", rows(@ok_false)},
+      {"select usage from ~p1 where (n > 1h) = ok", rows(@ok_false)},
+      {"select usage from ~p1 where ok = (usage > 1h)", rows(@ok_false)},
+      {"select usage from ~p1 where ok = (u > 1h)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 > Interval(MonthDayNano)"}},
+      {"select usage from ~p1 where true = (n > 1h)", []},
+      {"select usage from ~p1 where ok = (w > 1 AND time > 0)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) > Int64"}},
+      {"select usage from ~p1 where ok = (time > 0 AND w > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) > Int64"}},
+      {"select (a.b.c.d) from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid SELECT statement, expected field at pos 7"}},
+      {"select usage + (a.b.c.d) from ~p1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"(a.b.c.d) from ~p1\", Char)"}},
+      {"select usage from ~p1 where 18446744073709551615 + 1 > 0", []},
+      {"select usage from ~p1 where u > 18446744073709551615 + 1",
+       rows([0, 2, 4, 6, 7, 8, 11, 12, 14, 15, 16, 18, 19, 20, 22, 23, 26, 27, 28])},
       {"select usage from ~p1 where time > 0 and (n > 1) = (u > 1)",
        [
          {"2023-10-01 00:04:00", %{"usage" => 6.25}},
@@ -801,9 +1451,6 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
          {"2023-10-01 00:26:00", %{"usage" => 39.25}},
          {"2023-10-01 00:28:00", %{"usage" => 42.25}}
        ]},
-      {"select usage from ~p1 where usage + 1h > (n > 1)", []},
-      {"select usage from ~p1 where (n > 1) = nosuch + 1h",
-       [{"2023-10-01 00:00:00", %{"usage" => 0.25}}, {"2023-10-01 00:01:00", %{"usage" => 1.75}}]},
       {"select usage from ~p1 where u = 'a'", []},
       {"select usage from ~p1 where u > -9223372036854775808", :closed},
       {"select usage from ~p1 where s = 9223372036854775808", []},
@@ -844,9 +1491,6 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
        {:error, 400,
         "Error during planning: Cannot infer common argument type for comparison operation UInt64 > Boolean"}},
       {"select usage from ~p1 where u + usage = (n > 1)", []},
-      {"select usage from ~p1 where nosuch + 'x' = host + 'a'",
-       {:error, 400,
-        "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Utf8 to valid types"}},
       {"select usage from ~p1 where usage > (n > 1) % 2",
        {:error, 400,
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 44. Parsing Error: Nom(\"% 2\", Tag)"}},
@@ -863,7 +1507,11 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
         "error in InfluxQL statement: parsing error: unable to find timezone at pos 27"}},
       {"select usage from ~p1 where n > 1 tz('utc') limit 1",
        {:error, 400,
-        "error in InfluxQL statement: parsing error: unable to find timezone at pos 42"}}
+        "error in InfluxQL statement: parsing error: unable to find timezone at pos 42"}},
+      {"select usage from ~p1 where (18446744073709551615) * 2 > 0", rows(@every)},
+      {"select usage from ~p1 where (n > 1) = 1h", []},
+      {"select usage from ~p1 where time - time = ok", []},
+      {"select usage from ~p1 where (time - time) + nosuch = ok", rows(@ok_false)}
     ]
   end
 
@@ -871,14 +1519,32 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
   @spec refusal_reasons() :: %{binary() => binary()}
   def refusal_reasons do
     %{
-      "select usage from ~p1 where abs(n) < usage = 1" => "unsupported WHERE clause: usage = 1",
-      "select usage from ~p1 where abs((n)) < usage = 1" => "unsupported WHERE clause: usage = 1",
+      "select usage from ~p1 where ok = (n > 1h)" =>
+        "unsupported InfluxQL (a duration beside a condition in parentheses)",
+      "select usage from ~p1 where ok = (n = 1h)" =>
+        "unsupported InfluxQL (a duration beside a condition in parentheses)",
+      "select usage from ~p1 where (n > 1h) = ok" =>
+        "unsupported InfluxQL (a duration beside a condition in parentheses)",
+      "select usage from ~p1 where ok = (usage > 1h)" =>
+        "unsupported InfluxQL (a duration beside a condition in parentheses)",
+      "select usage from ~p1 where ok = (u > 1h)" =>
+        "unsupported InfluxQL (a duration beside a condition in parentheses)",
+      "select usage from ~p1 where true = (n > 1h)" =>
+        "unsupported InfluxQL (a duration beside a condition in parentheses)",
+      "select usage from ~p1 where ok = (w > 1 AND time > 0)" =>
+        "unsupported InfluxQL (a column the measurement lacks beside a time in a condition in parentheses)",
+      "select usage from ~p1 where ok = (time > 0 AND w > 1)" =>
+        "unsupported InfluxQL (a column the measurement lacks beside a time in a condition in parentheses)",
+      "select (a.b.c.d) from ~p1" =>
+        "unsupported InfluxQL (a name of more than three parts in parentheses)",
+      "select usage + (a.b.c.d) from ~p1" =>
+        "unsupported InfluxQL (a name of more than three parts in parentheses)",
+      "select usage from ~p1 where 18446744073709551615 + 1 > 0" =>
+        "unsupported InfluxQL (arithmetic of an integer beyond the signed range)",
+      "select usage from ~p1 where u > 18446744073709551615 + 1" =>
+        "unsupported InfluxQL (a field compared with a constant expression)",
       "select usage from ~p1 where time > 0 and (n > 1) = (u > 1)" =>
         "unsupported InfluxQL (an equality of two booleans beside a comparison of the time)",
-      "select usage from ~p1 where usage + 1h > (n > 1)" =>
-        "unsupported InfluxQL (an expression compared with a condition in parentheses)",
-      "select usage from ~p1 where (n > 1) = nosuch + 1h" =>
-        "unsupported InfluxQL (an expression compared with a condition in parentheses)",
       "select usage from ~p1 where u = 'a'" =>
         "unsupported InfluxQL (an unsigned field compared with a string)",
       "select usage from ~p1 where u > -9223372036854775808" =>
@@ -914,8 +1580,6 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
         "unsupported InfluxQL (a tz() zone other than UTC with a clause behind it)",
       "select usage from ~p1 where n > 1 tz('utc') limit 1" =>
         "unsupported InfluxQL (a tz() zone other than UTC with a clause behind it)",
-      "select usage from ~p1 where (n > 1) = ok = 1" =>
-        "unsupported InfluxQL (a comparison chained with another)",
       "select usage from ~p1 where time > 0 and ok = (n > 1)" =>
         "unsupported InfluxQL (an equality of two booleans beside a comparison of the time)",
       "select usage from ~p1 where u + 1 = (n > 1)" =>
@@ -924,13 +1588,19 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
         "unsupported InfluxQL (an expression compared with a condition in parentheses)",
       "select usage from ~p1 where u + usage = (n > 1)" =>
         "unsupported InfluxQL (an expression compared with a condition in parentheses)",
-      "select usage from ~p1 where nosuch + 'x' = host + 'a'" =>
-        "unsupported InfluxQL (an expression compared with a condition in parentheses)",
       "select usage from ~p1 where usage > (n > 1) % 2" => "unsupported InfluxQL WHERE: % 2",
       "select usage from ~p1 where date_part('year', time) = (n > 1)" =>
         "unsupported InfluxQL (date_part() in a WHERE)",
       "select usage from ~p1 where (n > 1) = date_part('year', time)" =>
-        "unsupported InfluxQL (date_part() in a WHERE)"
+        "unsupported InfluxQL (date_part() in a WHERE)",
+      "select usage from ~p1 where (18446744073709551615) * 2 > 0" =>
+        "unsupported InfluxQL (arithmetic of an integer beyond the signed range)",
+      "select usage from ~p1 where (n > 1) = 1h" =>
+        "unsupported InfluxQL (an expression compared with a condition in parentheses)",
+      "select usage from ~p1 where time - time = ok" =>
+        "unsupported InfluxQL (the difference of two timestamps)",
+      "select usage from ~p1 where (time - time) + nosuch = ok" =>
+        "unsupported InfluxQL (the difference of two timestamps)"
     }
   end
 end

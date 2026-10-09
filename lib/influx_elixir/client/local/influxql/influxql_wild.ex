@@ -186,7 +186,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
     case InfluxQLExpr.integral_unit(extra) do
       {:ok, unit} -> {:aggregate, "integral:" <> Integer.to_string(unit), field, column}
       {:planning, message} -> {:planning_error, message}
-      :error -> refuse("integral")
+      :error -> refuse_wild("integral")
     end
   end
 
@@ -205,18 +205,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
     case InfluxQLExpr.parse("#{name}(#{arguments})") do
       {:ok, ast} -> {:expr, ast, column}
       {:planning, message} -> {:planning_error, message}
-      _other -> refuse(name)
+      _other -> refuse_wild(name)
     end
   end
 
   defp argument_text(_name, {:lit, {_kind, number}}), do: InfluxQLExpr.number_text(number)
   defp argument_text(_name, {:dur, ns}), do: "#{ns}ns"
   defp argument_text(_name, {:neg, {:dur, ns}}), do: "-#{ns}ns"
-  defp argument_text(name, _other), do: refuse(name)
+  defp argument_text(name, _other), do: refuse_wild(name)
 
-  @spec refuse(binary()) :: no_return()
-  defp refuse(name),
-    do: throw({:refused, "unsupported InfluxQL (#{name}() of a wildcard with those arguments)"})
+  @spec refuse_wild(binary()) :: no_return()
+  defp refuse_wild(name),
+    do: InfluxQLError.refuse("#{name}() of a wildcard with those arguments")
 
   defp sorted(names), do: names |> Enum.to_list() |> Enum.sort()
 end

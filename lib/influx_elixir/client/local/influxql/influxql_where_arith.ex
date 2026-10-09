@@ -20,7 +20,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   #   * `abs()` takes one number; anything else is the engine's planning error, worded here
   #     (`call_error/3`)
 
-  alias InfluxElixir.Client.Local.InfluxQLTokens
+  alias InfluxElixir.Client.Local.{InfluxQLExpr, InfluxQLTokens}
 
   @comparison ["=", "!=", "<>", "<", "<=", ">", ">=", "=~", "!~"]
   @equality ["=", "!=", "<>"]
@@ -35,6 +35,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
     boolean: "Boolean",
     tag: "Dictionary(Int32, Utf8)",
     timestamp: "Timestamp(ns)",
+    duration: "Interval(MonthDayNano)",
+    false: "Boolean",
     null: "Float64"
   }
 
@@ -335,7 +337,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   # The argument of a condition that is `abs(argument)` and nothing else.
   defp abs_call([{:ident, name}, {:raw, "("} | rest]) do
     with true <- String.downcase(name) == "abs",
-         {inside, []} <- take_call(rest, 1, []),
+         {inside, []} <- InfluxQLTokens.take_call(rest),
          [argument] <- split_arguments(inside) do
       argument
     else
@@ -406,9 +408,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
         nil
     end
   catch
-    {:coerce, left, op, right} ->
-      "Error during planning: Cannot coerce arithmetic expression " <>
-        "#{Map.fetch!(@arrow, left)} #{op} #{Map.fetch!(@arrow, right)} to valid types"
+    {:coerce, left, op, right} -> coercion_body(left, op, right)
+  end
+
+  @doc "The Arrow type the engine names a kind of operand by."
+  @spec arrow(atom()) :: binary()
+  def arrow(kind), do: Map.fetch!(@arrow, kind)
+
+  @doc """
+  The planning error for arithmetic the engine cannot coerce, worded with the Arrow type of
+  each operand as written (`UInt64 + Utf8`).
+  """
+  @spec coercion_body(atom(), binary(), atom()) :: binary()
+  def coercion_body(left, op, right) do
+    "Error during planning: Cannot coerce arithmetic expression " <>
+      "#{Map.fetch!(@arrow, left)} #{op} #{Map.fetch!(@arrow, right)} to valid types"
   end
 
   # The types of the names the tokens read: those of the measurement, the time, and `:absent`
@@ -419,7 +433,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
     Enum.reduce(columns, types, fn name, acc ->
       cond do
         InfluxQLTokens.time?({:ident, name}) -> Map.put(acc, name, :timestamp)
-        MapSet.member?(tags, name) or Map.has_key?(acc, name) -> acc
+        not InfluxQLExpr.absent?(name, acc, tags) -> acc
         true -> Map.put(acc, name, :absent)
       end
     end)
@@ -475,7 +489,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   # double knows (its problems are `call_error/3`'s).
   defp factor([{:ident, name}, {:raw, "("} | rest], tags, types) do
     with true <- String.downcase(name) == "abs",
-         {inside, after_call} <- take_call(rest, 1, []),
+         {inside, after_call} <- InfluxQLTokens.take_call(rest),
          [argument] <- split_arguments(inside),
          {:ok, kind, []} <- expression(argument, tags, types),
          true <- kind in [:integer, :float, :unsigned, :null] do
@@ -514,8 +528,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   defp negate(_non_numeric), do: :null
 
   # A tag beside a string under `+` is the engine's coercion error, not a null.
-  defp combine("+", :tag, :string), do: :error
-  defp combine("+", :string, :tag), do: :error
+  defp combine("+", :tag, :string), do: throw({:coerce, :tag, "+", :string})
+  defp combine("+", :string, :tag), do: throw({:coerce, :string, "+", :tag})
   defp combine("+", :string, :string), do: {:ok, :string}
 
   # An unsigned number beside a string, a boolean, a tag or the time is not the null the other
@@ -575,29 +589,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
 
   # Whether the tokens are one call and nothing else.
   defp single_call?([{:ident, _name}, {:raw, "("} | rest]),
-    do: match?({_inside, []}, take_call(rest, 1, []))
+    do: match?({_inside, []}, InfluxQLTokens.take_call(rest))
 
   defp single_call?(_tokens), do: false
 
   # The calls in order of appearance, each with the tokens of its arguments.
   defp calls([{:ident, name}, {:raw, "("} | rest], acc) do
-    {inside, after_call} = take_call(rest, 1, [])
+    {inside, after_call} = InfluxQLTokens.take_call(rest)
     calls(inside ++ after_call, [{name, split_arguments(inside)} | acc])
   end
 
   defp calls([_token | rest], acc), do: calls(rest, acc)
   defp calls([], acc), do: Enum.reverse(acc)
-
-  defp take_call([], _depth, acc), do: {Enum.reverse(acc), []}
-  defp take_call([{:raw, ")"} | rest], 1, acc), do: {Enum.reverse(acc), rest}
-
-  defp take_call([{:raw, ")"} = token | rest], depth, acc),
-    do: take_call(rest, depth - 1, [token | acc])
-
-  defp take_call([{:raw, "("} = token | rest], depth, acc),
-    do: take_call(rest, depth + 1, [token | acc])
-
-  defp take_call([token | rest], depth, acc), do: take_call(rest, depth, [token | acc])
 
   defp split_arguments([]), do: []
 

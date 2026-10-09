@@ -723,6 +723,42 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           check_fix(ctx, InfluxQLNestedCases.sources_dots())
         end
 
+        test "arithmetic with a column the measurement lacks, beside a boolean or a group", ctx do
+          check_fix(ctx, InfluxQLNestedCases.absent_arithmetic())
+        end
+
+        test "a constant with signs that stands alone as a condition", ctx do
+          check_fix(ctx, InfluxQLNestedCases.lone_constants())
+        end
+
+        test "a comparison chained with another is the first compared with the last", ctx do
+          check_fix(ctx, InfluxQLNestedCases.chains())
+        end
+
+        test "a comparison of the time inside a condition in parentheses", ctx do
+          check_fix(ctx, InfluxQLNestedCases.time_in_groups())
+        end
+
+        test "a name of more than three parts in a select list", ctx do
+          check_fix(ctx, InfluxQLNestedCases.long_names())
+        end
+
+        test "a quoted time that ends in a line feed", ctx do
+          check_fix(ctx, InfluxQLNestedCases.time_strings())
+        end
+
+        test "the names of qualified sources, reserved words and empty names among them", ctx do
+          check_fix(ctx, InfluxQLNestedCases.qualified_names())
+        end
+
+        test "a duration in a condition in parentheses that is not planned", ctx do
+          check_fix(ctx, InfluxQLNestedCases.durations())
+        end
+
+        test "conditions nested four hundred deep and a sum of eight hundred calls", ctx do
+          check_fix(ctx, InfluxQLNestedCases.deep_conditions())
+        end
+
         test "a clause keyword where the clauses before it end the statement", ctx do
           check_fix(ctx, InfluxQLNestedCases.clause_ends())
         end

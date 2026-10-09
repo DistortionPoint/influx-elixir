@@ -33,7 +33,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   # either reads as if it were false).
   def rewrite([{:str, _content}, {:op, op}, {:regex, _pattern} | rest], tags, strings, acc)
       when op in ["=~", "!~"],
-      do: rewrite(rest, tags, strings, ["(1 = 0)" | acc])
+      do: rewrite(rest, tags, strings, [never() | acc])
 
   def rewrite([{:ident, name}, {:op, op}, {:regex, pattern} | rest], tags, strings, acc) do
     regex = InfluxQLRegex.pattern(pattern)
@@ -122,10 +122,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   @spec ident_sql(binary()) :: binary()
   @doc false
   def ident_sql(name) do
-    if Regex.match?(~r/^[A-Za-z_]\w*$/, name) and String.downcase(name) not in @sql_words,
+    if Regex.match?(~r/^[A-Za-z_]\w*\z/, name) and String.downcase(name) not in @sql_words,
       do: name,
       else: ~s("#{String.replace(name, "\"", "\"\"")}")
   end
+
+  @doc "The condition that no row meets, in the SQL the caller's engine reads."
+  @spec never() :: binary()
+  def never, do: "(1 = 0)"
 
   # False for every row, in the SQL the caller's engine reads.
   @spec always_false(binary()) :: binary()

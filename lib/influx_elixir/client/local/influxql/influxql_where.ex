@@ -65,7 +65,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
           case InfluxQLTyped.bare_condition(tree, ctx, Keyword.get(opts, :filter), leaf) do
             nil -> {nil, plan(tree, ctx, times)}
             {:tree, bare_tree} -> {nil, plan(bare_tree, ctx, times)}
-            :empty -> {nil, {"(1 = 0)", [], []}}
+            :empty -> {nil, {InfluxQLSql.never(), [], []}}
             error -> {error, {"true", [], []}}
           end
 
@@ -295,15 +295,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     # A condition in parentheses as an operand decides the comparison before the types of the
     # other side are coerced: the engine does not coerce them then (verified: `'x' + v > (w >
     # 1)` keeps no row and is no error, where `'x' + v > 1` is the coercion error).
-    placed = if time?, do: :unplaced, else: plan_nested(tokens, ctx, times)
+    # (The tokens are dead in the branch that plans the conditions inside the groups, which
+    # recurse: a statement nested n deep would hold n copies of them otherwise.)
+    case InfluxQLNested.classify(tokens, ctx, %{timed: times.timed and not times.first}) do
+      :unplaced ->
+        plan_flat(tokens, ctx, times, time?)
 
-    case placed do
-      {:planned, sql, checks} -> {sql, [], checks}
-      :unplaced -> plan_flat(tokens, ctx, times, time?)
+      classification ->
+        {sql, checks} = nested_sql(classification, ctx, times)
+        {sql, [], checks}
     end
   end
 
-  defp plan({:never, nil}, _ctx, _times), do: {"(1 = 0)", [], []}
+  defp plan({:never, nil}, _ctx, _times), do: {InfluxQLSql.never(), [], []}
 
   defp plan({:group, node}, ctx, times) do
     {sql, lowers, checks} = plan(node, ctx, times)
@@ -324,16 +328,49 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     joined
   end
 
-  # The condition inside such a group is planned as a condition: its comparisons are typed
-  # (`s > 'a'` is false for every row), and the groups inside it are planned the same way.
-  defp plan_nested(tokens, ctx, times) do
-    inner = fn group ->
-      {tree, _rest} = group |> nest() |> parse_or()
-      {sql, _lowers, checks} = plan(tree, ctx, %{times | alone: false})
-      {sql, checks}
-    end
+  @spec nested_sql(InfluxQLNested.classification(), {MapSet.t(binary()), map()}, times()) ::
+          {binary(), list()}
+  defp nested_sql(:never, _ctx, _times), do: {InfluxQLSql.never(), []}
 
-    InfluxQLNested.plan(tokens, ctx, %{timed: times.timed and not times.first}, inner)
+  defp nested_sql({same_or_different, left, right}, ctx, times)
+       when same_or_different in [:same, :different] do
+    {a, a_checks} = operand_sql(left, ctx, times)
+    {b, b_checks} = operand_sql(right, ctx, times)
+
+    sql =
+      if same_or_different == :same,
+        do: "((#{a} AND #{b}) OR (NOT #{a} AND NOT #{b}))",
+        else: "((#{a} AND NOT #{b}) OR (NOT #{a} AND #{b}))"
+
+    {sql, a_checks ++ b_checks}
+  end
+
+  # (What is needed after the SQL of an operand is worked out before it: the operand may hold
+  # the tokens of a condition nested n deep, and a frame that kept the whole classification
+  # would keep n copies of them.)
+  defp nested_sql({:column, operand, op, name}, ctx, times) do
+    prefix = "#{InfluxQLSql.ident_sql(name)} #{op} "
+    {sql, checks} = operand_sql(operand, ctx, times)
+    {prefix <> sql, checks}
+  end
+
+  defp nested_sql({:constant, operand, true}, ctx, times), do: operand_sql(operand, ctx, times)
+
+  defp nested_sql({:constant, operand, false}, ctx, times) do
+    {sql, checks} = operand_sql(operand, ctx, times)
+    {"NOT " <> sql, checks}
+  end
+
+  # The condition inside a group is planned as a condition: its comparisons are typed (`s > 'a'`
+  # is false for every row), and the groups inside it are planned the same way.
+  @spec operand_sql(InfluxQLNested.operand(), {MapSet.t(binary()), map()}, times()) ::
+          {binary(), list()}
+  defp operand_sql(false, _ctx, _times), do: {InfluxQLSql.never(), []}
+
+  defp operand_sql({:group, tokens}, ctx, times) do
+    {tree, _rest} = tokens |> nest() |> parse_or()
+    {sql, _lowers, checks} = plan(tree, ctx, %{times | alone: false})
+    {"(" <> sql <> ")", checks}
   end
 
   defp plan_flat(tokens, {tags, types} = ctx, times, time?) do
@@ -355,7 +392,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
           {binary(), [InfluxQL.bound()], [{binary(), InfluxQLArithmetic.check()}]}
   defp plan_typed(tokens, ctx, known) do
     if absent_column?(tokens, known) do
-      {"(1 = 0)", [], []}
+      {InfluxQLSql.never(), [], []}
     else
       {sql, checks} = InfluxQLTyped.plan_comparison(tokens, ctx)
       {sql, [], checks}
@@ -364,11 +401,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   defp absent_column?(_tokens, nil), do: false
 
-  # The name of a call is no column.
-  defp absent_column?(tokens, known) do
-    {columns, _calls} = InfluxQLTokens.split_names(tokens)
-    Enum.any?(columns, &(not MapSet.member?(known, &1)))
-  end
+  # (The name of a call is no column.)
+  defp absent_column?(tokens, known),
+    do: InfluxQLTokens.lacking(tokens, &MapSet.member?(known, &1)) != []
 
   # The calls of a comparison are `abs()` of a number, or the engine's planning error, or
   # refused by name. `alone` is whether the comparison is the whole condition.
@@ -630,10 +665,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         ns
 
       :invalid ->
-        message =
-          "Error during planning: invalid expression \"'#{content}'\": " <>
-            "'#{content}' is not a valid timestamp"
-
+        message = InfluxQLError.invalid_timestamp("'#{content}'")
         throw({:refused, {:engine, 400, InfluxQLError.split_error(message)}})
 
       {:out_of_range, shown} ->

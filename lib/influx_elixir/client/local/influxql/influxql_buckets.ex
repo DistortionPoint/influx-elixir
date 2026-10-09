@@ -28,6 +28,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   # empty one is the same row every time, so a `LIMIT` over a range of millions
   # of buckets reads only the buckets it keeps.
 
+  import InfluxElixir.Client.Local.InfluxQLError, only: [refuse: 1]
+
   alias InfluxElixir.Client.Local.{InfluxQLAggregate, SQLLimits}
 
   require SQLLimits
@@ -387,7 +389,4 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   @doc false
   @spec bucket_start(integer(), pos_integer(), integer()) :: integer()
   def bucket_start(ns, every, offset), do: Integer.floor_div(ns - offset, every) * every + offset
-
-  @spec refuse(binary()) :: no_return()
-  defp refuse(what), do: throw({:refused, "unsupported InfluxQL (#{what})"})
 end

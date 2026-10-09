@@ -5,14 +5,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   #
   #   * a condition in parentheses (`v > (w > 1)`, `ok = (n > 1 AND u > 1)`, `(w > 1) = (u >
   #     1)`, `true = (w > 1)`), a boolean operand like `true`
-  #   * arithmetic of a column the measurement lacks and a text operand, a column or a string
-  #     (`nosuch + 'x'`, `s * nosuch`): the engine reads it as `false`, a boolean that is no
-  #     null (`nosuch + 'x' = ok` keeps the points `ok` is false for, `nosuch + 'x' <> true`
-  #     all of them)
+  #   * the false of arithmetic of a column the measurement lacks and text, a boolean, a
+  #     duration or the time (`nosuch + 'x'`, `s * nosuch`, `nosuch + 1h`, `-nosuch + 'x'`,
+  #     `nosuch + nosuch2 + 'x'`; see `InfluxQLFold`): the engine reads it as `false`, a boolean
+  #     that is no null (`nosuch + 'x' = ok` keeps the points `ok` is false for, `nosuch + 'x'
+  #     <> true` all of them)
+  #   * a comparison chained with another, `a = b = c`, which is `(a = b) = c` (verified): the
+  #     comparisons before the last are a condition in parentheses
   #
   # The engine does not coerce the other side to a boolean first, so the arithmetic of the other
   # side is no error here (`'x' + v > (w > 1)` keeps no row, where `'x' + v > 1` is the
-  # coercion error):
+  # coercion error); the planner's coercion errors of arithmetic are raised all the same
+  # (`host + 'a' = (w > 1)` is `Dictionary(Int32, Utf8) + Utf8`):
   #
   #   * a column or expression that is no boolean never equals the boolean nor orders against it:
   #     no row is true (a tag, a string, a number, a column the measurement lacks, arithmetic of
@@ -22,161 +26,191 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   #   * a boolean (a boolean column, `true`, `false`, another of these) is ordered against it as
   #     no row is true, and compared for equality as the two evaluate
   #
-  # What the double cannot tell from the engine is refused by name: arithmetic with an unsigned
-  # column in it that has no column the measurement lacks, arithmetic of a tag with text
-  # beside a boolean, and a comparison chained with another.
-  #
-  # The scan that finds the layers of parentheses around a group is one pass, whatever their
-  # depth (`InfluxQLTokens.unwrap_group/1`).
+  # `classify/3` says which of these a comparison is, over data (`classification()`); the SQL is
+  # written by `InfluxQLWhere`, which plans the conditions inside the groups. What the double
+  # cannot tell from the engine is refused by name: arithmetic with an unsigned column in it
+  # that has no column the measurement lacks, a group beside a duration, an equality of two
+  # booleans beside a comparison of the time.
 
-  alias InfluxElixir.Client.Local.{InfluxQLExpr, InfluxQLText, InfluxQLTokens, InfluxQLTyped}
+  alias InfluxElixir.Client.Local.{
+    InfluxQLError,
+    InfluxQLFold,
+    InfluxQLText,
+    InfluxQLTokens
+  }
 
   @ordering_ops ["<", "<=", ">", ">="]
   @equality_ops ["=", "!=", "<>"]
   @connectives ["AND", "OR"]
-  @arithmetic_ops ["+", "-", "*", "/"]
 
-  # What the double reads as `false`, the boolean of arithmetic of a column the measurement
-  # lacks with text.
-  @false_sql "(1 = 0)"
+  @typedoc "A boolean of its own: the tokens inside a condition in parentheses, or the false."
+  @type operand :: {:group, list()} | false
 
-  @typedoc "What an operand is: a condition in parentheses, the `false` above, or neither."
-  @type kind :: :group | :weird | :other
+  @typedoc """
+  What a comparison with a boolean of its own comes to: no row is true (`:never`); two booleans
+  that are equal or not (`:same`, `:different`); a boolean column against one (`{:column,
+  operand, operator, column_name}`: `ok = (w > 1)`); one against `true` or `false`
+  (`{:constant, operand, wanted}`: the operand itself, or its negation).
+  """
+  @type classification ::
+          :never
+          | {:same | :different, operand(), operand()}
+          | {:column, operand(), binary(), binary()}
+          | {:constant, operand(), boolean()}
+
+  @typep ctx :: {MapSet.t(binary()), map()}
+  @typep side :: {list(), :group | false | :other, term()}
 
   @doc """
-  The comparison `tokens` make when a boolean of its own is an operand of it, as SQL with the
-  checks it needs, or `:unplaced` when the double does not place it (no such operand, a
-  comparison of the `time`). The errors
-  of the engine are thrown as `{:deferred, body}`, the refusals as `{:refused, message}`.
-  `inner` plans the condition inside a group (`tokens -> {sql, checks}`), so that its
-  comparisons are typed as they are anywhere else.
+  What the comparison `tokens` come to when a boolean of its own is an operand of it, or when
+  arithmetic with a column the measurement lacks in it decides it (a null; a null number with
+  an unsigned one, which is the planner's error beside a boolean), or `:unplaced` when the
+  double does not place it (no such operand; with `time` in a condition in parentheses or in
+  an operand that is no false, the SQL of the time). The errors of the engine are thrown as
+  `{:deferred, body}` or `{:refused, {:engine, 400, body}}`, the refusals as `{:refused,
+  message}`. `timed` says whether an equality of two booleans stands behind a comparison of the
+  time in the statement.
   """
-  @spec plan(
-          list(),
-          {MapSet.t(binary()), map()},
-          %{timed: boolean()},
-          (list() -> {binary(), list()})
-        ) :: {:planned, binary(), list()} | :unplaced
-  def plan(tokens, ctx, %{timed: timed}, inner) do
-    env = %{ctx: ctx, timed: timed, inner: inner}
-
-    case sides(tokens, env) do
-      {left, op, right} -> against(left, op, right, env)
-      nil -> :unplaced
+  @spec classify(list(), ctx(), %{timed: boolean()}) :: classification() | :unplaced
+  def classify(tokens, ctx, flags) do
+    with {left, op, right} <- operands(tokens),
+         {left, right} = {side(left, ctx), side(right, ctx)},
+         false <- time_comparison?(left, right),
+         :ok <- raise_coercion([left, right]) do
+      cond do
+        timed_side?(left, right) -> timed_group(left, right, ctx)
+        own_boolean?(left, right) -> against(left, op, right, ctx, flags)
+        true -> arithmetic(left, op, right, ctx)
+      end
+    else
+      _unplaced -> :unplaced
     end
   end
 
-  # `{{tokens, kind}, operator, {tokens, kind}}` when exactly one comparison operator stands
-  # outside every parenthesis and a boolean of its own stands on one side of it; `nil` for a
-  # comparison with none. A comparison chained with another (`a = b = c`) is `(a = b) = c`
-  # (verified): the comparisons before the last make a group, compared with a boolean (`ok`,
-  # `true`, another group); with any other operand the engine's answer is not verified and a
-  # chain with a group in it is refused.
-  defp sides(tokens, env) do
-    case top_level_operators(tokens, 0, 0, []) do
-      [{at, op}] ->
-        left = kinded(Enum.take(tokens, at), env)
-        right = kinded(Enum.drop(tokens, at + 1), env)
-        if elem(left, 1) != :other or elem(right, 1) != :other, do: {left, op, right}
+  # A comparison with the `time` itself on a side is read by the split of the time out of the
+  # condition (its comparand is a time, `now()` or a duration, whatever else it holds), not by
+  # the types of its arithmetic (verified: `time > 1 + time` is "found symbol", not a coercion).
+  defp time_comparison?({left, _lk, _lf}, {right, _rk, _rf}),
+    do: Enum.any?([left, right], &(unwrap(&1) |> bare_time?()))
 
-      [_first, _second | _more] = operators ->
-        chain(tokens, List.last(operators), env)
+  defp bare_time?([token]), do: InfluxQLTokens.time?(token)
+  defp bare_time?(_tokens), do: false
 
+  # The planner's coercion error of the arithmetic on a side, the left one first.
+  defp raise_coercion([]), do: :ok
+
+  defp raise_coercion([{_tokens, _kind, {:error, body}} | _sides]),
+    do: throw({:refused, {:engine, 400, body}})
+
+  defp raise_coercion([_side | sides]), do: raise_coercion(sides)
+
+  # The two sides of the comparison, split at the last operator outside every parenthesis: a
+  # chain `a = b = c` is `(a = b) = c` (verified), so what is before the last operator is a
+  # condition in parentheses. `nil` for a text with no operator.
+  defp operands(tokens) do
+    case InfluxQLTokens.at_top_level(tokens, &match?({:op, _op}, &1)) do
       [] ->
         nil
+
+      [{at, {:op, op}}] ->
+        {Enum.take(tokens, at), op, Enum.drop(tokens, at + 1)}
+
+      operators ->
+        {at, {:op, op}} = List.last(operators)
+        {[{:raw, "("}] ++ Enum.take(tokens, at) ++ [{:raw, ")"}], op, Enum.drop(tokens, at + 1)}
     end
   end
 
-  defp chain(tokens, {at, op}, env) do
-    prefix = Enum.take(tokens, at)
-    right = kinded(Enum.drop(tokens, at + 1), env)
+  # A side with what the engine makes of it: a condition in parentheses, the false of arithmetic
+  # (see `InfluxQLFold`), or neither, with the arithmetic it comes to.
+  @spec side(list(), ctx()) :: side()
+  defp side(tokens, ctx) do
+    if boolean_group?(tokens) do
+      {tokens, :group, :unread}
+    else
+      case InfluxQLFold.kind(tokens, ctx) do
+        {:ok, false} = fold -> {tokens, false, fold}
+        fold -> {tokens, :other, fold}
+      end
+    end
+  end
 
+  # A condition in parentheses, or an operand that is no false, with the time in it: the SQL of
+  # the time reads the comparison.
+  defp timed_side?(left, right) do
+    Enum.any?([left, right], fn {tokens, kind, _fold} ->
+      kind != false and Enum.any?(tokens, &InfluxQLTokens.time?/1)
+    end)
+  end
+
+  # The SQL of the time reads a condition in parentheses that has the time in it (the engine
+  # does not split the time out of it, and plans its comparisons by their types: `time > 0` there
+  # is a type error). A column the measurement lacks in it makes the SQL engine answer nothing
+  # before it types the time: refused by name.
+  defp timed_group(left, right, {tags, types}) do
+    if Enum.any?([left, right], fn {tokens, kind, _fold} ->
+         kind == :group and InfluxQLTokens.absent_columns(tokens, tags, types) != []
+       end),
+       do:
+         InfluxQLError.refuse(
+           "a column the measurement lacks beside a time in a condition in parentheses"
+         ),
+       else: :unplaced
+  end
+
+  defp own_boolean?({_l, left, _lf}, {_r, right, _rf}), do: [left, right] != [:other, :other]
+
+  # Neither side is a boolean of its own: arithmetic may still decide the comparison. A null
+  # (`nosuch + 1h`, `'x' + 1`) keeps no row; an unsigned number (what an unsigned column and a
+  # division by text make, or a null integer beside an unsigned column) is the planner's error
+  # beside a boolean. (The rest is the caller's.)
+  defp arithmetic({left, _lk, left_fold}, op, {right, _rk, right_fold}, {tags, types} = ctx) do
     cond do
-      elem(right, 1) != :other or boolean_operand?(elem(right, 0), env) ->
-        {{[{:raw, "("}] ++ prefix ++ [{:raw, ")"}], :group}, op, right}
+      nullish?(left_fold) or nullish?(right_fold) ->
+        if unsigned_column?(left ++ right, tags, types), do: :never, else: :unplaced
 
-      Enum.any?(top_level_groups(tokens), &boolean_group?/1) and not absent_in?(tokens, env) ->
-        chained()
+      left_fold == {:ok, :unsigned} ->
+        unsigned_beside(right, op, :right, {left, ctx})
+
+      right_fold == {:ok, :unsigned} ->
+        unsigned_beside(left, op, :left, {right, ctx})
 
       true ->
-        nil
+        :unplaced
     end
   end
 
-  defp boolean_operand?(tokens, env) do
-    match?({:column, :boolean}, operand(tokens, :other, env)) or
-      match?({:boolean, _value}, operand(tokens, :other, env))
+  defp nullish?({:ok, kind}), do: kind in [:unknown, :nn, :nnf, :nz]
+  defp nullish?(_fold), do: false
+
+  defp unsigned_column?(tokens, tags, types) do
+    {columns, _calls} = InfluxQLTokens.split_names(tokens)
+    Enum.any?(columns, &(Map.get(types, &1) == :unsigned and not MapSet.member?(tags, &1)))
   end
 
-  defp kinded(tokens, env), do: {tokens, kind(tokens, env)}
+  # An unsigned number made of a column the measurement lacks and an unsigned one (`nosuch + 1 +
+  # u`).
+  defp unsigned_null?(tokens, {tags, types}),
+    do: InfluxQLTokens.absent_columns(tokens, tags, types) != []
 
-  @spec kind(list(), map()) :: kind()
-  defp kind(tokens, env) do
+  # The unsigned side against `other`: the planner's error when that is a boolean standing on
+  # side `side` of the comparison. Against anything else no row is true when the unsigned number
+  # has a column the measurement lacks in it, else the comparison is the caller's.
+  defp unsigned_beside(other, op, side, {unsigned, {tags, types}}) do
     cond do
-      boolean_group?(tokens) -> :group
-      false_arithmetic?(tokens, env) -> :weird
-      true -> :other
+      boolean_operand?(other, types) -> clash(op, side)
+      unsigned_null?(unsigned, {tags, types}) -> :never
+      true -> :unplaced
     end
   end
 
-  @spec chained() :: no_return()
-  defp chained,
-    do: throw({:refused, "unsupported InfluxQL (a comparison chained with another)"})
-
-  defp top_level_operators([], _depth, _at, acc), do: Enum.reverse(acc)
-
-  defp top_level_operators([{:raw, "("} | rest], depth, at, acc),
-    do: top_level_operators(rest, depth + 1, at + 1, acc)
-
-  defp top_level_operators([{:raw, ")"} | rest], depth, at, acc),
-    do: top_level_operators(rest, max(depth - 1, 0), at + 1, acc)
-
-  defp top_level_operators([{:op, op} | rest], 0, at, acc),
-    do: top_level_operators(rest, 0, at + 1, [{at, op} | acc])
-
-  defp top_level_operators([_token | rest], depth, at, acc),
-    do: top_level_operators(rest, depth, at + 1, acc)
-
-  # The parenthesised groups that stand outside every parenthesis, each as its tokens (a
-  # parenthesis after a name is a call, not a group).
-  defp top_level_groups(tokens), do: top_level_groups(tokens, nil, 0, [], [])
-
-  defp top_level_groups([], _previous, _depth, _group, acc), do: Enum.reverse(acc)
-
-  defp top_level_groups([{:raw, "("} = token | rest], previous, 0, _group, acc) do
-    if match?({:ident, _name}, previous),
-      do: top_level_groups(rest, token, 1, :call, acc),
-      else: top_level_groups(rest, token, 1, [token], acc)
-  end
-
-  defp top_level_groups([{:raw, "("} = token | rest], _previous, depth, group, acc),
-    do: top_level_groups(rest, token, depth + 1, push(group, token), acc)
-
-  defp top_level_groups([{:raw, ")"} = token | rest], _previous, 1, group, acc) do
-    case group do
-      :call -> top_level_groups(rest, token, 0, [], acc)
-      _group -> top_level_groups(rest, token, 0, [], [Enum.reverse([token | group]) | acc])
+  defp boolean_operand?(tokens, types) do
+    case unwrap(tokens) do
+      [{:ident, name}] -> Map.get(types, name) == :boolean
+      [{:raw, word}] -> String.upcase(word) in ["TRUE", "FALSE"]
+      _expression -> false
     end
   end
-
-  defp top_level_groups([{:raw, ")"} = token | rest], _previous, depth, group, acc),
-    do: top_level_groups(rest, token, max(depth - 1, 0), push(group, token), acc)
-
-  defp top_level_groups([token | rest], _previous, depth, group, acc),
-    do: top_level_groups(rest, token, depth, push(group, token), acc)
-
-  defp push(:call, _token), do: :call
-  defp push(group, token), do: [token | group]
-
-  @flipped %{
-    "=" => "=",
-    "!=" => "!=",
-    "<>" => "<>",
-    "<" => ">",
-    "<=" => ">=",
-    ">" => "<",
-    ">=" => "<="
-  }
 
   @doc """
   A comparison with a group on its left and none on its right, turned round (`(w > 1) = x` is
@@ -186,8 +220,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   """
   @spec group_last(list()) :: list()
   def group_last(tokens) do
-    with [{at, op}] <- top_level_operators(tokens, 0, 0, []),
-         {:ok, flipped} <- Map.fetch(@flipped, op),
+    with [{at, {:op, op}}] <- InfluxQLTokens.at_top_level(tokens, &match?({:op, _op}, &1)),
+         {:ok, flipped} <- Map.fetch(flipped(), op),
          {left, right} = {Enum.take(tokens, at), Enum.drop(tokens, at + 1)},
          true <- boolean_group?(left) and not boolean_group?(right) do
       right ++ [{:op, flipped}] ++ left
@@ -196,87 +230,98 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
     end
   end
 
+  defp flipped do
+    %{
+      "=" => "=",
+      "!=" => "!=",
+      "<>" => "<>",
+      "<" => ">",
+      "<=" => ">=",
+      ">" => "<",
+      ">=" => "<="
+    }
+  end
+
   # ---------------------------------------------------------------------------
   # What the comparison comes to
   # ---------------------------------------------------------------------------
 
-  defp against({left, left_kind}, op, {right, right_kind}, env)
+  @spec against(side(), binary(), side(), ctx(), map()) :: classification()
+  defp against({_l, left_kind, _lf} = left, op, {_r, right_kind, _rf} = right, ctx, flags)
        when left_kind != :other and right_kind != :other,
-       do: pair({left, left_kind}, op, {right, right_kind}, env)
+       do: pair(left, op, right, ctx, flags)
 
-  defp against({left, left_kind}, op, {right, :other}, env),
-    do: against_boolean({left, left_kind}, op, right, :left, env)
+  defp against(left, op, {_r, :other, _rf} = right, ctx, flags),
+    do: with_boolean(left, op, right, :left, ctx, flags)
 
-  defp against({left, :other}, op, {right, right_kind}, env),
-    do: against_boolean({right, right_kind}, op, left, :right, env)
+  defp against({_l, :other, _lf} = left, op, right, ctx, flags),
+    do: with_boolean(right, op, left, :right, ctx, flags)
 
   # Two booleans of their own: no row is true for an ordering, the two evaluate for equality.
   # (The operator is one of the comparisons: `=~` and `!~` take a regular expression, which is
   # no boolean of its own, so a pair is never set by them.)
-  defp pair({left, left_kind}, op, {right, right_kind}, env) do
+  defp pair({left, left_kind, _lf}, op, {right, right_kind, _rf}, ctx, flags) do
     cond do
       op in @ordering_ops ->
-        never()
+        :never
 
-      absent_group?(left, left_kind, env) or absent_group?(right, right_kind, env) ->
-        never()
+      absent_group?(left, left_kind, ctx) or absent_group?(right, right_kind, ctx) ->
+        :never
 
-      env.timed and :group in [left_kind, right_kind] ->
+      flags.timed and :group in [left_kind, right_kind] ->
         refuse_timed()
 
-      op == "=" ->
-        same(sql_of(left, left_kind, env), sql_of(right, right_kind, env))
-
       true ->
-        different(sql_of(left, left_kind, env), sql_of(right, right_kind, env))
+        {if(op == "=", do: :same, else: :different), operand(left, left_kind),
+         operand(right, right_kind)}
     end
   end
 
-  defp same({a, a_checks}, {b, b_checks}),
-    do: {:planned, "((#{a} AND #{b}) OR (NOT #{a} AND NOT #{b}))", a_checks ++ b_checks}
-
-  defp different({a, a_checks}, {b, b_checks}),
-    do: {:planned, "((#{a} AND NOT #{b}) OR (NOT #{a} AND #{b}))", a_checks ++ b_checks}
-
-  defp never, do: {:planned, @false_sql, []}
-
-  # The SQL of a boolean of its own: the condition inside a group, planned as the condition it
-  # is, in parentheses; the false.
-  defp sql_of(group, :group, env) do
-    {sql, checks} = env.inner.(unwrap(group))
-    {"(" <> sql <> ")", checks}
-  end
-
-  defp sql_of(_tokens, :weird, _env), do: {@false_sql, []}
-
-  # A boolean of its own and the other side, which `side` says stood where.
-  defp against_boolean({tokens, kind}, op, other, side, env) do
-    if absent_group?(tokens, kind, env) do
-      never()
+  # The boolean of its own and the other side, which `side` says stood where.
+  defp with_boolean({tokens, kind, _fold}, op, {other, :other, fold}, side, ctx, flags) do
+    if absent_group?(tokens, kind, ctx) do
+      :never
     else
-      case operand(other, kind, env) do
-        {:column, :unsigned} -> clash(op, side)
-        {:column, :boolean} when op in @equality_ops -> column_equal(tokens, kind, op, other, env)
-        {:boolean, value} when op in @equality_ops -> constant_equal(tokens, kind, op, value, env)
-        _never_true -> never()
+      case other_operand(other, fold, ctx) do
+        {:column, _name, :unsigned} ->
+          clash(op, side)
+
+        :unsigned ->
+          clash(op, side)
+
+        {:column, name, :boolean} when op in @equality_ops ->
+          column_equal(tokens, kind, op, name, flags)
+
+        {:boolean, value} when op in @equality_ops ->
+          constant_equal(tokens, kind, op, value)
+
+        _never_true ->
+          :never
       end
     end
   end
 
   # `ok = (w > 1)`: the SQL reads the column first, the boolean second.
-  defp column_equal(_tokens, :group, _op, _column, %{timed: true}), do: refuse_timed()
+  defp column_equal(_tokens, :group, _op, _name, %{timed: true}), do: refuse_timed()
 
-  defp column_equal(tokens, kind, op, column, %{ctx: {tags, types}} = env) do
-    {sql, checks} = sql_of(tokens, kind, env)
-    {:planned, "#{InfluxQLTyped.plain(unwrap(column), tags, types)} #{op} #{sql}", checks}
-  end
+  defp column_equal(tokens, kind, op, name, _flags),
+    do: {:column, operand(tokens, kind), op, name}
 
   # `(w > 1) = true` is the group, `(w > 1) = false` its negation, `!=` the other way.
-  defp constant_equal(tokens, kind, op, value, env) do
-    {sql, checks} = sql_of(tokens, kind, env)
-    wanted = if op == "=", do: value, else: not value
-    {:planned, if(wanted, do: sql, else: "NOT " <> sql), checks}
+  defp constant_equal(tokens, kind, op, value),
+    do: {:constant, operand(tokens, kind), if(op == "=", do: value, else: not value)}
+
+  # A condition with a duration in it is no condition the SQL engine reads as the engine does
+  # (a number against a duration is false there, the SQL raises its own error).
+  defp operand(tokens, :group) do
+    inner = unwrap(tokens)
+
+    if Enum.any?(inner, &match?({:duration, _total, _text}, &1)),
+      do: InfluxQLError.refuse("a duration beside a condition in parentheses"),
+      else: {:group, inner}
   end
+
+  defp operand(_tokens, false), do: false
 
   # With a comparison of the `time` in the condition the engine splits the time out and rebuilds
   # the rest, and an equality of two booleans behind another condition of the statement does not
@@ -284,11 +329,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   # (w > 1)` keeps the points both are true for, `time > 0 AND ok != (w > 2)` none).
   @spec refuse_timed() :: no_return()
   defp refuse_timed,
-    do:
-      throw(
-        {:refused,
-         "unsupported InfluxQL (an equality of two booleans beside a comparison of the time)"}
-      )
+    do: InfluxQLError.refuse("an equality of two booleans beside a comparison of the time")
 
   @spec clash(binary(), :left | :right) :: no_return()
   defp clash(op, side) do
@@ -306,62 +347,73 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   # The other side
   # ---------------------------------------------------------------------------
 
-  # What the side that is no boolean of its own is: `{:column, type}`, `{:boolean, value}` for
-  # `true` or `false`, `:constant` for a number, a string or a regular expression,
-  # `:expression` for arithmetic the engine reads as no boolean. (The columns of the
-  # measurement are `tags` and `types`: the caller always knows them.)
-  defp operand(tokens, kind, %{ctx: {tags, types}} = env) do
-    tokens = unwrap(tokens)
-
-    case tokens do
+  # What the side that is no boolean of its own is: `{:column, name, type}`, `{:boolean, value}`
+  # for `true` or `false`, `:constant` for a number, a string or a regular expression,
+  # `:unsigned` for arithmetic of an unsigned number and a null integer, `:expression` for
+  # arithmetic the engine reads as no boolean. (The columns of the measurement are `tags` and
+  # `types`: the caller always knows them.)
+  defp other_operand(tokens, fold, ctx) do
+    case unwrap(tokens) do
       [{:ident, name}] ->
-        cond do
-          MapSet.member?(tags, name) -> {:column, :tag}
-          Map.has_key?(types, name) -> {:column, Map.fetch!(types, name)}
-          true -> {:column, :absent}
-        end
+        column(name, ctx)
 
+      # The only word that stands alone as an operand is `true` or `false` (the lexer makes a
+      # word of nothing else a `:raw` token but `now()`, which the engine's "not implemented"
+      # answers before the condition is planned, and the connectives, which are no operand).
       [{:raw, word}] ->
-        boolean_word(word)
+        {:boolean, String.downcase(word) == "true"}
 
-      [{kind_of_constant, _value}] when kind_of_constant in [:number, :regex, :str] ->
+      [{kind, _value}] when kind in [:number, :regex, :str] ->
         :constant
 
       [{:raw, sign}, {:number, _text}] when sign in ["-", "+"] ->
         :constant
 
-      _expression ->
-        expression(tokens, kind, env)
+      expression ->
+        expression(expression, fold, ctx)
     end
   end
 
-  # The only word that stands alone as an operand is `true` or `false` (the lexer makes a word
-  # of nothing else a `:raw` token but `now()`, which the engine's "not implemented" answers
-  # before the condition is planned, and the connectives, which are no operand).
-  defp boolean_word(word), do: {:boolean, String.downcase(word) == "true"}
+  defp column(name, {tags, types}) do
+    case {MapSet.member?(tags, name), Map.fetch(types, name)} do
+      {true, _type} -> {:column, name, :tag}
+      {false, {:ok, type}} -> {:column, name, type}
+      {false, :error} -> {:column, name, :absent}
+    end
+  end
 
-  # Arithmetic of numbers, strings, columns and the math functions. One with a column the
-  # measurement lacks is null (no row), one with an unsigned column in it is refused (the
-  # planner's error differs by the other operand), and so is a tag with text beside the false
-  # of arithmetic (the planner coerces it). So is arithmetic with any other operand, a duration
-  # or a boolean constant (verified: its answer is no row, the planner's coercion error or, with
-  # a column the measurement lacks, the false above, by operands the double does not tell).
-  defp expression(tokens, kind, %{ctx: {tags, types}}) do
+  # Arithmetic of numbers, strings, columns and the math functions. One that comes to a null
+  # (a column the measurement lacks in it, see `InfluxQLFold`) keeps no row; one with an
+  # unsigned column in it is refused (the planner's error differs by the other operand), and
+  # so is arithmetic with any other operand, a duration or a boolean constant, when no column
+  # the measurement lacks is in it (verified: its answer is no row or the planner's coercion
+  # error, by operands the double does not tell).
+  defp expression(_tokens, {:ok, kind}, _ctx) when kind in [:unknown, :nn, :nnf, :nz],
+    do: :expression
+
+  # An unsigned number made of a column the measurement lacks and an unsigned one is typed as an
+  # unsigned column is (verified: `(w > 1) = nosuch + 1 + u` is the planner's `Boolean = UInt64`).
+  defp expression(tokens, {:ok, :unsigned}, {tags, types} = ctx) do
+    if unsigned_null?(tokens, ctx),
+      do: :unsigned,
+      else: arithmetic_expression(tokens, tags, types)
+  end
+
+  defp expression(tokens, _fold, {tags, types}), do: arithmetic_expression(tokens, tags, types)
+
+  defp arithmetic_expression(tokens, tags, types) do
     {columns, calls} = InfluxQLTokens.split_names(tokens)
 
     cond do
       not Enum.all?(tokens, &arithmetic_token?/1) or
           not Enum.all?(calls, &InfluxQLText.math_function?/1) ->
-        refuse()
+        refuse_expression()
 
-      Enum.any?(columns, &InfluxQLExpr.absent?(&1, types, tags)) ->
+      InfluxQLTokens.absent_columns(tokens, tags, types) != [] ->
         :expression
 
       Enum.any?(columns, &(Map.get(types, &1) == :unsigned and not MapSet.member?(tags, &1))) ->
-        refuse()
-
-      kind == :weird and Enum.any?(columns, &MapSet.member?(tags, &1)) ->
-        refuse()
+        refuse_expression()
 
       true ->
         :expression
@@ -372,54 +424,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   defp arithmetic_token?({:raw, op}), do: op in ["+", "-", "*", "/", "%", "(", ")", ","]
   defp arithmetic_token?(_token), do: false
 
-  @spec refuse() :: no_return()
-  defp refuse,
-    do:
-      throw(
-        {:refused,
-         "unsupported InfluxQL (an expression compared with a condition in parentheses)"}
-      )
+  @spec refuse_expression() :: no_return()
+  defp refuse_expression,
+    do: InfluxQLError.refuse("an expression compared with a condition in parentheses")
 
   # A group that is one comparison of a column the measurement lacks (`(nosuch > 1)`) is a null
   # (verified: `ok = (nosuch > 1)` keeps no point), where in `AND` or `OR` such a comparison is
   # false (`(nosuch > 1 OR ok) = ok` keeps every point): the condition of the group is planned
   # as it is anywhere else then.
-  defp absent_group?(tokens, :group, env) do
-    absent_in?(tokens, env) and not connective_word_inside?(unwrap(tokens))
+  defp absent_group?(tokens, :group, {tags, types}) do
+    InfluxQLTokens.absent_columns(tokens, tags, types) != [] and
+      not connective_inside?(unwrap(tokens), false)
   end
 
-  defp absent_group?(_tokens, _kind, _env), do: false
-
-  # Whether tokens use a column the measurement lacks.
-  defp absent_in?(tokens, %{ctx: {tags, types}}) do
-    {columns, _calls} = InfluxQLTokens.split_names(tokens)
-    Enum.any?(columns, &InfluxQLExpr.absent?(&1, types, tags))
-  end
-
-  # Whether tokens are arithmetic of exactly a column the measurement lacks and a text operand:
-  # a string, or a column that is a string, a tag or a boolean (`nosuch + 'x'`, `s * nosuch`).
-  defp false_arithmetic?(tokens, %{ctx: {tags, types}}) do
-    case unwrap(tokens) do
-      [left, {:raw, op}, right] when op in @arithmetic_ops ->
-        (absent?(left, tags, types) and text?(right, tags, types)) or
-          (text?(left, tags, types) and absent?(right, tags, types))
-
-      _not_two_operands ->
-        false
-    end
-  end
-
-  defp absent?({:ident, name} = token, tags, types),
-    do: not InfluxQLTokens.time?(token) and InfluxQLExpr.absent?(name, types, tags)
-
-  defp absent?(_token, _tags, _types), do: false
-
-  defp text?({:str, _content}, _tags, _types), do: true
-
-  defp text?({:ident, name}, tags, types),
-    do: MapSet.member?(tags, name) or Map.get(types, name) in [:string, :boolean]
-
-  defp text?(_token, _tags, _types), do: false
+  defp absent_group?(_tokens, _kind, _ctx), do: false
 
   # ---------------------------------------------------------------------------
   # Groups
@@ -432,7 +450,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   @spec boolean_group?(list()) :: boolean()
   def boolean_group?(tokens) do
     case strip_group(tokens) do
-      {:ok, inner} -> boolean_inside?(inner)
+      {:ok, [{:raw, word}]} when is_binary(word) -> String.downcase(word) in ["true", "false"]
+      {:ok, inner} -> connective_inside?(inner, true)
       nil -> false
     end
   end
@@ -444,44 +463,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
     end
   end
 
-  defp boolean_inside?([{:raw, word}]) when is_binary(word),
-    do: String.downcase(word) in ["true", "false"]
-
-  defp boolean_inside?(inner), do: connective_inside?(inner)
-
-  # Whether an `AND` or an `OR` stands at the top of the tokens, outside every parenthesis.
-  defp connective_word_inside?(tokens) do
+  # Whether an `AND` or an `OR` stands at the top of the tokens, outside every parenthesis; with
+  # `operators?` a comparison operator makes a condition as well.
+  defp connective_inside?(tokens, operators?) do
     tokens
-    |> Enum.reduce({0, false}, fn
-      {:raw, "("}, {depth, found} -> {depth + 1, found}
-      {:raw, ")"}, {depth, found} -> {depth - 1, found}
-      {:raw, word}, {0, found} -> {0, found or String.upcase(word) in @connectives}
-      _token, state -> state
+    |> InfluxQLTokens.at_top_level(fn
+      {:op, _op} -> operators?
+      {:raw, word} -> String.upcase(word) in @connectives
+      _token -> false
     end)
-    |> elem(1)
-  end
-
-  # Whether an operator or a connective stands at the top of the tokens, outside every
-  # parenthesis.
-  defp connective_inside?(inner) do
-    inner
-    |> Enum.reduce({0, false}, fn
-      {:raw, "("}, {depth, found} ->
-        {depth + 1, found}
-
-      {:raw, ")"}, {depth, found} ->
-        {depth - 1, found}
-
-      {:op, _op}, {0, _found} ->
-        {0, true}
-
-      {:raw, word}, {0, found} when is_binary(word) ->
-        {0, found or String.upcase(word) in @connectives}
-
-      _token, state ->
-        state
-    end)
-    |> elem(1)
+    |> Enum.any?()
   end
 
   @doc """

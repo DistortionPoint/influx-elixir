@@ -20,6 +20,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeExpr do
   #   * what the whole expression comes to, an instant or a length, is the
   #     nanoseconds since the epoch the `time` column is compared with
 
+  import InfluxElixir.Client.Local.InfluxQLError, only: [refuse: 1]
+
   alias InfluxElixir.Client.Local.{InfluxQLTime, SQLLimits}
 
   require SQLLimits
@@ -117,7 +119,4 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeExpr do
   @spec span(integer()) :: value()
   defp span(ns) when SQLLimits.is_int64(ns), do: {:dur, ns}
   defp span(_ns), do: refuse("a length beyond 64-bit nanoseconds")
-
-  @spec refuse(binary()) :: no_return()
-  defp refuse(what), do: throw({:refused, "unsupported InfluxQL (#{what})"})
 end

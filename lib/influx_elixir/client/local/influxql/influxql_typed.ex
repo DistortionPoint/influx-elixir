@@ -31,7 +31,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   #     argument type"
   #   * a negative integer against an unsigned field is 2^64 + n - 1
   #     (`u > -1` is false for all but the largest)
-  #   * an unsigned field against a boolean is the same planning error;
+  #   * an unsigned field against a boolean is the same planning error (`InfluxQLNested`'s);
   #     against a string, a string field against a big integer and a tag
   #     against a big integer, the engine compares as text: refused by name
   #   * a bare field as the whole condition is a planning error (after the
@@ -76,9 +76,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   @spec plan_comparison(list(), {MapSet.t(binary()), map()}) ::
           {binary(), [{binary(), InfluxQLArithmetic.check()}]}
   @doc false
-  def plan_comparison(tokens, ctx), do: plan_unnested(tokens, ctx)
-
-  defp plan_unnested(tokens, {tags, types}) do
+  def plan_comparison(tokens, {tags, types}) do
+    check_unsigned_constants(tokens)
     tokens = InfluxQLWhereArith.tag_over_unsigned(tokens, tags, types)
     unsigned_clash(InfluxQLWhereArith.unsigned_clash(tokens, tags, types))
 
@@ -87,7 +86,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     cond do
       InfluxQLWhereArith.null?(tokens, tags, types) or
           InfluxQLWhereArith.incompatible?(tokens, tags, types) ->
-        {"(1 = 0)", []}
+        {InfluxQLSql.never(), []}
 
       match?({:ok, _joined}, InfluxQLWhereArith.concatenation(tokens, tags, types)) ->
         {:ok, joined} = InfluxQLWhereArith.concatenation(tokens, tags, types)
@@ -103,6 +102,31 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
           {:ok, check} -> check_sql(check)
         end
     end
+  end
+
+  # Arithmetic of constants with an integer beyond the signed range in it is done by the engine
+  # modulo 2^64 as unsigned (verified: `18446744073709551615 + 1 > 0` keeps no row); the SQL of
+  # the double does not wrap, so it is refused by name.
+  @spec check_unsigned_constants(list()) :: :ok
+  defp check_unsigned_constants(tokens) do
+    if unsigned_literals?(tokens) and
+         not Enum.any?(tokens, &match?({:ident, _name}, &1)) and
+         binary_operator?(tokens),
+       do:
+         throw(
+           {:refused, "unsupported InfluxQL (arithmetic of an integer beyond the signed range)"}
+         ),
+       else: :ok
+  end
+
+  defp binary_operator?(tokens) do
+    tokens
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.any?(fn
+      [{:number, _text}, {:raw, op}] -> op in ["+", "-", "*", "/"]
+      [{:raw, ")"}, {:raw, op}] -> op in ["+", "-", "*", "/"]
+      _pair -> false
+    end)
   end
 
   @spec unsigned_clash({:boolean, binary(), :unsigned_first | :boolean_first} | :text | nil) ::
@@ -133,9 +157,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     {"#{column} = true", [{column, check}]}
   end
 
-  @doc "The tokens as the SQL the caller's engine reads."
+  # The tokens as the SQL the caller's engine reads.
   @spec plain(list(), MapSet.t(binary()), map()) :: binary()
-  def plain(tokens, tags, types) do
+  defp plain(tokens, tags, types) do
     strings = for {name, :string} <- types, into: MapSet.new(), do: name
 
     tokens
@@ -205,21 +229,41 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   # the caller refuses.
   @spec constant_kind(list()) :: {:integer, integer()} | :float | :expression
   defp constant_kind(tokens) do
-    case fold_sum(tokens) do
-      {value, []} when is_float(value) ->
-        :float
-
-      {value, []}
-      when is_integer(value) and value >= -SQLLimits.int64_max() - 1 and
-             value <= SQLLimits.int64_max() ->
-        {:integer, value}
-
-      _unfoldable ->
-        :expression
+    if unsigned_literals?(tokens) do
+      :expression
+    else
+      case fold_sum(tokens) do
+        {value, []} when is_float(value) -> :float
+        {value, []} when is_integer(value) -> {:integer, wrap_int64(value)}
+        _unfoldable -> :expression
+      end
     end
   rescue
     _out_of_range in [ArgumentError, ArithmeticError] -> :expression
   end
+
+  # The engine does its 64-bit integer arithmetic modulo 2^64 (verified: `9223372036854775807 +
+  # 1` is the lowest integer, `3037000500 * 3037000500` a negative one).
+  defp wrap_int64(value) do
+    wrapped = Bitwise.band(value, SQLLimits.uint64_max())
+    if wrapped > SQLLimits.int64_max(), do: wrapped - SQLLimits.uint64_max() - 1, else: wrapped
+  end
+
+  # Whether an integer is written beyond the signed range, which the engine reads as an unsigned
+  # constant (the lowest 64-bit integer is the literal one past the highest, negated).
+  defp unsigned_literals?(tokens), do: unsigned_literals?(tokens, nil)
+
+  defp unsigned_literals?([], _previous), do: false
+
+  defp unsigned_literals?([{:number, text} = token | rest], previous) do
+    case Integer.parse(text) do
+      {n, ""} when n > SQLLimits.int64_max() + 1 -> true
+      {n, ""} when n > SQLLimits.int64_max() and previous != {:raw, "-"} -> true
+      _fits -> unsigned_literals?(rest, token)
+    end
+  end
+
+  defp unsigned_literals?([token | rest], _previous), do: unsigned_literals?(rest, token)
 
   defp fold_sum(tokens) do
     with {value, rest} <- fold_product(tokens),
@@ -289,7 +333,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
       :never -> "(#{column} IS NULL AND #{column} IS NOT NULL)"
       {:unsigned, n} -> "#{column} #{op} #{n}"
       :wrap -> wrapped_sql(column, op, literal)
-      :mismatch -> mismatch(type, literal, op, flipped?)
+      :mismatch -> mismatch(type, op, flipped?)
       :refuse -> throw({:refused, "unsupported InfluxQL (#{refusal(type, literal)})"})
     end
   end
@@ -314,7 +358,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   defp decide(:unsigned, {:integer, _n}, _op), do: :plain
   defp decide(:unsigned, :float, _op), do: :check
-  defp decide(:unsigned, :boolean, _op), do: :mismatch
   defp decide(:unsigned, :string, _op), do: :refuse
   defp decide(:boolean, :boolean, _op), do: :plain
   defp decide(:boolean, {:integer, n}, _op) when n > SQLLimits.int64_max(), do: :mismatch
@@ -339,11 +382,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     if op in ["=", ">", ">="], do: negative, else: "(#{column} >= 0 OR #{negative})"
   end
 
-  @spec mismatch(atom(), term(), binary(), boolean()) :: no_return()
-  defp mismatch(type, literal, op, flipped?) do
+  # A boolean field against an integer beyond the signed range, an unsigned literal. (An
+  # unsigned field against a boolean never gets here: `InfluxQLNested` raises that error first.)
+  @spec mismatch(atom(), binary(), boolean()) :: no_return()
+  defp mismatch(type, op, flipped?) do
     field = Map.fetch!(@arrow_types, type)
-    other = if literal == :boolean, do: "Boolean", else: "UInt64"
-    {left, right} = if flipped?, do: {other, field}, else: {field, other}
+    {left, right} = if flipped?, do: {"UInt64", field}, else: {field, "UInt64"}
     op = if flipped?, do: Map.fetch!(@flipped_ops, op), else: op
     op = if op == "<>", do: "!=", else: op
 
@@ -647,14 +691,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp bare_leaf?({:cmp, tokens}, {tags, types}),
     do: standalone_field(strip_parens(tokens), tags, types) not in [nil, :boolean]
 
-  defp bare_leaf?(_node, _ctx), do: false
-
   # A bare operand that is not a number (a string, a tag, an unsigned constant, a duration).
   defp other_bare_leaf?({:cmp, tokens}, {tags, types}),
     do:
       standalone_field(strip_parens(tokens), tags, types) not in [nil, :boolean, :integer, :float]
-
-  defp other_bare_leaf?(_node, _ctx), do: false
 
   @spec logical_error(:and | :or, binary(), binary()) :: binary()
   defp logical_error(kind, left, right) do
@@ -674,21 +714,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp now_outside_time?({kind, nodes}) when kind in [:and, :or],
     do: Enum.any?(nodes, &now_outside_time?/1)
 
-  defp now_outside_time?(_node), do: false
-
   # What a condition that is one operand is: a field, a constant, a duration, or a number
   # or numeric field with signs.
   @spec standalone_field(list(), MapSet.t(binary()), map()) :: atom() | nil
   defp standalone_field([{:duration, _total, _text}], _tags, _types), do: :interval
 
-  defp standalone_field([{:raw, sign} | rest], tags, types) when sign in ["-", "+"] do
-    case signed_operand(rest, tags, types) do
-      {:ok, type} ->
-        type
-
-      :none ->
-        bare_field([{:raw, sign} | rest], tags, types) ||
-          arithmetic_field([{:raw, sign} | rest], tags, types)
+  defp standalone_field([{:raw, sign} | _rest] = tokens, tags, types)
+       when sign in ["-", "+"] do
+    case signed_operand(tokens, false, tags, types) do
+      {:ok, type} -> type
+      :none -> arithmetic_field(tokens, tags, types)
     end
   end
 
@@ -699,46 +734,53 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp arithmetic_field(tokens, tags, types),
     do: InfluxQLWhereArith.standalone(tokens, tags, types)
 
-  # The type of an operand after signs: a number, or a numeric field.
-  @spec signed_operand(list(), MapSet.t(binary()), map()) :: {:ok, atom()} | :none
-  defp signed_operand([{:raw, sign} | rest], tags, types) when sign in ["-", "+"],
-    do: signed_operand(rest, tags, types)
+  # The type of an operand after signs: a number, or a numeric field. A minus anywhere in the
+  # signs makes the number a negative one (verified: `- 9223372036854775808` and `+ -
+  # 9223372036854775808` are the lowest signed integer, where `+ 9223372036854775808` is
+  # unsigned). (The lexer refuses a number past the range its signs allow, so a number here
+  # always has a type.)
+  @spec signed_operand(list(), boolean(), MapSet.t(binary()), map()) :: {:ok, atom()} | :none
+  defp signed_operand([{:raw, sign} | rest], negative?, tags, types) when sign in ["-", "+"],
+    do: signed_operand(rest, negative? or sign == "-", tags, types)
 
-  defp signed_operand([{:number, text}], _tags, _types) do
-    case number_kind(text, 1) do
-      nil -> :none
-      type -> {:ok, type}
+  # Signs outside parentheses apply to the value, not to the literal: a number past the signed
+  # range stays unsigned under them (verified: `-(9223372036854775808)` and
+  # `-(-(9223372036854775808))` are `UInt64`).
+  defp signed_operand([{:raw, "("} | _group] = tokens, _negative?, tags, types) do
+    case strip_parens(tokens) do
+      ^tokens -> :none
+      inner -> signed_operand(inner, false, tags, types)
     end
   end
 
-  defp signed_operand([{:ident, name}], tags, types) do
+  defp signed_operand([{:number, text}], negative?, _tags, _types),
+    do: {:ok, number_kind(text, if(negative?, do: -1, else: 1))}
+
+  defp signed_operand([{:ident, name}], _negative?, tags, types) do
     case field_kind(name, tags, types) do
       type when type in [:integer, :float] -> {:ok, type}
       _other -> :none
     end
   end
 
-  defp signed_operand(_tokens, _tags, _types), do: :none
+  defp signed_operand(_tokens, _negative?, _tags, _types), do: :none
 
   @spec bare_field(list(), MapSet.t(binary()), map()) :: atom() | nil
   defp bare_field([{:ident, name}], tags, types), do: field_kind(name, tags, types)
   defp bare_field([{:number, text}], _tags, _types), do: number_kind(text, 1)
-  defp bare_field([{:raw, "-"}, {:number, text}], _tags, _types), do: number_kind(text, -1)
   defp bare_field([{:str, _content}], _tags, _types), do: :string
   defp bare_field(_tokens, _tags, _types), do: nil
 
   # The type of a constant that stands alone as a condition.
-  @spec number_kind(binary(), 1 | -1) :: :float | :integer | :unsigned | nil
+  @spec number_kind(binary(), 1 | -1) :: :float | :integer | :unsigned
   defp number_kind(text, sign) do
     case Integer.parse(text) do
-      {n, ""} when sign * n >= -9_223_372_036_854_775_808 and n <= 9_223_372_036_854_775_807 ->
+      {n, ""}
+      when sign * n >= -9_223_372_036_854_775_808 and sign * n <= 9_223_372_036_854_775_807 ->
         :integer
 
-      {n, ""} when sign == 1 and n <= 18_446_744_073_709_551_615 ->
-        :unsigned
-
       {_n, ""} ->
-        nil
+        :unsigned
 
       _fraction ->
         :float
@@ -747,7 +789,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   # The tokens inside the parentheses around them, however many layers.
   @spec strip_parens(list()) :: list()
-  defp strip_parens(tokens), do: tokens |> InfluxQLTokens.unwrap_parens() |> elem(0)
+  defp strip_parens(tokens), do: tokens |> InfluxQLTokens.unwrap_group() |> elem(0)
 
   @spec bare_error(atom()) :: binary()
   defp bare_error(type) do

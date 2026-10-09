@@ -17,9 +17,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLSources do
 
   alias InfluxElixir.Client.Local.{InfluxQLLex, InfluxQLText}
 
-  @name ~S{"(?:[^"\\]|\\.)+"|[A-Za-z_]\w*}
-  @regex ~S{/(?:[^/\\]|\\.)+/}
+  @name ~S{"(?:[^"\\]|\\.)*"|[A-Za-z_]\w*}
+  @regex ~S{/(?:[^/\\]|\\.)*/}
   @name_start ~q/\A(?:#{@name})/
+
+  # The most sources a list is read to (a list longer is refused by name, never held): the
+  # engine's own planner takes seconds for a few thousand (2,500 copies of one measurement took
+  # 17 s), so nothing past that was verified.
+  @max_sources 2_500
   @regex_start ~q/\A#{@regex}/
 
   @typedoc """
@@ -35,7 +40,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLSources do
   @type result ::
           {:ok, [source()], non_neg_integer()}
           | {:missing_name, %{source_at: non_neg_integer(), wanted_at: non_neg_integer()}}
+          | {:too_many, pos_integer()}
           | :none
+
+  @doc "The most sources a list is read to."
+  @spec max_sources() :: pos_integer()
+  def max_sources, do: @max_sources
 
   @doc "The pattern of the start of one source, as a piece of a regular expression."
   @spec source_pattern() :: binary()
@@ -48,22 +58,28 @@ defmodule InfluxElixir.Client.Local.InfluxQLSources do
   @spec split(binary(), binary()) :: result()
   def split(masked, raw) do
     case source(masked, raw, 0) do
-      {:ok, source, stop} -> more(masked, raw, [source], stop)
+      {:ok, source, stop} -> more(masked, raw, {[source], 1}, stop)
       other -> other
     end
   end
 
   # After a source: a comma and another source, else the list ends here. A comma with no source
   # after it (or one that does not read) is left over, with all that follows.
-  @spec more(binary(), binary(), [source()], non_neg_integer()) :: result()
-  defp more(masked, raw, sources, stop) do
+  @spec more(binary(), binary(), {[source()], pos_integer()}, non_neg_integer()) :: result()
+  defp more(masked, raw, {sources, count}, stop) do
     at = InfluxQLLex.skip_blanks(masked, stop)
 
     case masked do
       <<_before::binary-size(at), ?,, _rest::binary>> ->
         case source(masked, raw, InfluxQLLex.skip_blanks(masked, at + 1)) do
-          {:ok, source, next_stop} -> more(masked, raw, [source | sources], next_stop)
-          _none_or_missing -> {:ok, Enum.reverse(sources), stop}
+          {:ok, _source, _next_stop} when count >= @max_sources ->
+            {:too_many, count + 1}
+
+          {:ok, source, next_stop} ->
+            more(masked, raw, {[source | sources], count + 1}, next_stop)
+
+          _none_or_missing ->
+            {:ok, Enum.reverse(sources), stop}
         end
 
       _no_comma ->
@@ -77,7 +93,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSources do
     case part(masked, at) do
       {:regex, size} -> {:ok, {value(:regex, raw, at, size), []}, at + size}
       {:name, size} -> qualified(masked, raw, at, [{:name, at, size}])
-      _reserved_or_none -> :none
+      :none -> :none
     end
   end
 
@@ -95,7 +111,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLSources do
         next(masked, raw, source_at, parts, stop + 1)
 
       _no_more_parts ->
-        {:ok, finished(raw, parts), stop}
+        ended(masked, raw, source_at, parts)
+    end
+  end
+
+  # The last part of a source is no reserved word (a quoted one is a name); the parts before it
+  # may be (verified: `select.m` and `db.where.m` are read, `db.rp.where`, `m.limit` and
+  # `where` are "invalid FROM clause").
+  @spec ended(binary(), binary(), non_neg_integer(), [tuple() | nil]) ::
+          {:ok, source(), non_neg_integer()} | {:missing_name, map()} | :none
+  defp ended(masked, raw, source_at, [{:name, at, size} | before] = parts) do
+    cond do
+      not InfluxQLText.reserved?(binary_part(masked, at, size)) ->
+        {:ok, finished(raw, parts), at + size}
+
+      before == [] ->
+        :none
+
+      true ->
+        {:missing_name, %{source_at: source_at, wanted_at: at}}
     end
   end
 
@@ -109,7 +143,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSources do
       {:name, size} ->
         qualified(masked, raw, source_at, [{:name, wanted_at, size} | parts])
 
-      _reserved_or_none ->
+      :none ->
         {:missing_name, %{source_at: source_at, wanted_at: wanted_at}}
     end
   end
@@ -132,22 +166,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLSources do
     {:regex, raw |> binary_part(at + 1, size - 2) |> String.replace("\\/", "/")}
   end
 
-  # A regular expression, or a name that is not a reserved word, at `at`.
-  @spec part(binary(), non_neg_integer()) ::
-          {:name | :regex, non_neg_integer()} | :reserved | :none
+  # A regular expression or a name (reserved or not, see `ended/4`) at `at`.
+  @spec part(binary(), non_neg_integer()) :: {:name | :regex, non_neg_integer()} | :none
   defp part(masked, at) do
     rest = binary_part(masked, at, byte_size(masked) - at)
 
     cond do
-      match = Regex.run(@regex_start, rest) ->
-        {:regex, byte_size(hd(match))}
-
-      match = Regex.run(@name_start, rest) ->
-        word = hd(match)
-        if InfluxQLText.reserved?(word), do: :reserved, else: {:name, byte_size(word)}
-
-      true ->
-        :none
+      match = Regex.run(@regex_start, rest) -> {:regex, byte_size(hd(match))}
+      match = Regex.run(@name_start, rest) -> {:name, byte_size(hd(match))}
+      true -> :none
     end
   end
 end

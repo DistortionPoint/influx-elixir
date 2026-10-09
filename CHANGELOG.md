@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local` InfluxQL: second review of the differential fuzz** (design document
+  `2026-10-09_influxql-fuzz-second-review.md`):
+  - Arithmetic with a column the measurement lacks is typed as Core types it, by the types of the
+    two operands: `nosuch + 1h = ok`, `nosuch + time = ok`, `-nosuch + 'x' = ok`,
+    `nosuch + ('x' + 'y') = ok`, `nosuch + nosuch2 + 'x' = ok` and the like keep the points `ok` is
+    false for (they answered `[]`). The coercion errors of either side of a comparison are raised
+    in the order written: `host + 'a' = nosuch` and `(w > 1) = host + s` are
+    `Dictionary(Int32, Utf8) + Utf8`, the time beside a number or a string, an unsigned number
+    beside text, two times (`Cannot get result type for temporal operation`). A null number beside
+    an unsigned one is `UInt64 = Boolean` beside a boolean.
+  - A comparison chained with another (`a = b = c`) is the first compared with the last, whatever
+    the last is.
+  - The retention policy of a three-part source is printed as Core prints it in the database
+    mismatch and in the 404 (`rv23/"x y"`, `rv23/"select"`; a backslash, a double quote and a line
+    feed escaped), and so is a reserved word in the name of a column (`"select"_k`). Reserved
+    words and empty quoted names may qualify a source (`db.select.m`, `db."".m`, `rp.""`); the last
+    part may not be reserved; `//` is a regular expression that matches every measurement.
+  - A quoted time that ends in a line feed (`'2023-10-01\n'`, the `\n` escape) is "not a valid
+    timestamp", as it is for Core, in every form (it read as the time).
+  - `(time > 0) = ok` and the like are Core's `Timestamp(ns) > Int64` without the `type_coercion`
+    wrapper the SQL engine words it with.
+  - A name of more than three parts in the select list (`SELECT a.b.c.d FROM m`) is Core's parse
+    error (the whole statement left unparsed; in the arguments of a call a `Failure` from the dot).
+  - Integer arithmetic of constants wraps at 64 bits as Core's does (`n > 9223372036854775807 + 1`
+    is `n >` the lowest integer); arithmetic with an unsigned constant is refused by name.
+  - The unterminated string right after the comma of a source list is the lexer's error.
+  - A column the measurement lacks beside the time in a condition in parentheses, and a duration
+    beside such a condition, are refused by name (the first answered `[]`, the second leaked the
+    SQL).
+  - Memory and time: a condition in parentheses nested 400 deep needs 0.8M words, not 6M (800 deep:
+    1.5M, not 20M); a sum of 3,000 calls takes 0.3 s, not 70 s; a list of more than 2,500 sources, a
+    statement of more than 262,144 bytes, and more than 20,000 points repeated over all the
+    measurements of a `FROM` are refused by name before they are read (a list of 100,000 sources
+    killed a process capped at 5M words).
+  - Refactors: the type of arithmetic is `InfluxQLFold`; `InfluxQLNested.classify/3` returns data
+    that `InfluxQLWhere` renders; `Tokens.at_top_level/2`, `take_call/1`, `lacking/2` and
+    `absent_columns/3` replace five depth walkers and five spellings of "a column the measurement
+    lacks"; `InfluxQLError.refuse/1`, `InfluxQLSql.never/0` and
+    `InfluxQLText.quoted_if_needed/1` are written once each.
+  - Constants and signs:
+    - A null divided by an integer is a null integer.
+    - The difference of two timestamps is refused by name. It answered `[]`.
+    - The lowest 64-bit integer behind signs is `Int64`; `- 9223372036854775808 tz('UTC')`
+      raised.
+    - Signs outside parentheses keep the literal's type: `-(9223372036854775808)` is
+      `UInt64`, as in Core.
+
 ## [0.1.43] - 2026-10-09
 
 ### Fixed

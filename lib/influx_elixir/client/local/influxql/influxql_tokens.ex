@@ -9,6 +9,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
 
   alias InfluxElixir.Client.Local.{
     Durations,
+    InfluxQLExpr,
     InfluxQLLex,
     InfluxQLText,
     SQLIdentifiers,
@@ -22,22 +23,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   @spec time?(term()) :: boolean()
   def time?({:ident, name}), do: String.downcase(name) == "time"
   def time?(_token), do: false
-
-  @doc """
-  The tokens inside the parentheses that open and close all of them, and how many layers there
-  were, found in one pass whatever their depth: a `(` first and a `)` last are one layer
-  (`(a) AND (b)` is `a) AND (b` in one: the parentheses are not matched, as the readers of the
-  result expect).
-  """
-  @spec unwrap_parens(list()) :: {list(), non_neg_integer()}
-  def unwrap_parens([{:raw, "("} | _rest] = tokens) do
-    opening = tokens |> Enum.take_while(&(&1 == {:raw, "("})) |> length()
-    closing = tokens |> Enum.reverse() |> Enum.take_while(&(&1 == {:raw, ")"})) |> length()
-    layers = min(opening, closing)
-    {Enum.slice(tokens, layers, length(tokens) - 2 * layers), layers}
-  end
-
-  def unwrap_parens(tokens), do: {tokens, 0}
 
   @doc """
   The tokens inside the layers of parentheses that wrap all of them (`((a))` is `a`), and how
@@ -105,6 +90,70 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     do: split_names(rest, [name | columns], calls)
 
   defp split_names([_token | rest], columns, calls), do: split_names(rest, columns, calls)
+
+  @doc """
+  The tokens outside every parenthesis for which `keep?` holds, as `{index, token}` in order
+  (the parentheses themselves are never offered). A `)` that closes nothing leaves the depth at
+  zero.
+  """
+  @spec at_top_level(list(), (term() -> boolean())) :: [{non_neg_integer(), term()}]
+  def at_top_level(tokens, keep?), do: at_top_level(tokens, keep?, 0, 0, [])
+
+  defp at_top_level([], _keep?, _depth, _at, acc), do: Enum.reverse(acc)
+
+  defp at_top_level([{:raw, "("} | rest], keep?, depth, at, acc),
+    do: at_top_level(rest, keep?, depth + 1, at + 1, acc)
+
+  defp at_top_level([{:raw, ")"} | rest], keep?, depth, at, acc),
+    do: at_top_level(rest, keep?, max(depth - 1, 0), at + 1, acc)
+
+  defp at_top_level([token | rest], keep?, 0, at, acc) do
+    acc = if keep?.(token), do: [{at, token} | acc], else: acc
+    at_top_level(rest, keep?, 0, at + 1, acc)
+  end
+
+  defp at_top_level([_token | rest], keep?, depth, at, acc),
+    do: at_top_level(rest, keep?, depth, at + 1, acc)
+
+  @doc """
+  The tokens of a call after its opening parenthesis: `{inside, after_call}`, the tokens up to
+  the parenthesis that closes it and those behind it (everything is inside a call that is never
+  closed).
+  """
+  @spec take_call(list()) :: {list(), list()}
+  def take_call(tokens), do: take_call(tokens, 1, [])
+
+  defp take_call([], _depth, acc), do: {Enum.reverse(acc), []}
+  defp take_call([{:raw, ")"} | rest], 1, acc), do: {Enum.reverse(acc), rest}
+
+  defp take_call([{:raw, ")"} = token | rest], depth, acc),
+    do: take_call(rest, depth - 1, [token | acc])
+
+  defp take_call([{:raw, "("} = token | rest], depth, acc),
+    do: take_call(rest, depth + 1, [token | acc])
+
+  defp take_call([token | rest], depth, acc), do: take_call(rest, depth, [token | acc])
+
+  @doc """
+  The columns the tokens read for which `present?` does not hold, in the order written (a
+  name followed by a parenthesis is the call of a function, not a column).
+  """
+  @spec lacking(list(), (binary() -> boolean())) :: [binary()]
+  def lacking(tokens, present?) do
+    {columns, _calls} = split_names(tokens)
+    Enum.reject(columns, present?)
+  end
+
+  @doc """
+  The columns the tokens read that the measurement lacks, in the order written: neither a
+  field (`types`), a tag nor the time.
+  """
+  @spec absent_columns(list(), MapSet.t(binary()), map()) :: [binary()]
+  def absent_columns(tokens, tags, types) do
+    lacking(tokens, fn name ->
+      time?({:ident, name}) or not InfluxQLExpr.absent?(name, types, tags)
+    end)
+  end
 
   @spec tokenize(binary(), list()) ::
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}

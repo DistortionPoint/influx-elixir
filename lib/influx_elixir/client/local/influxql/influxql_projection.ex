@@ -24,7 +24,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
   # A role is what the column is to the rows: `:time`, a `:dimension` of the series, a `:tag`
   # or a `:field`. A row of a plain select is kept when it holds a field.
 
+  import InfluxElixir.Client.Local.InfluxQLError, only: [refuse: 1]
+
   alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLExpr, InfluxQLNames}
+
+  @same_name "select items that end up with the same name"
 
   @typedoc "What a column is to the rows."
   @type role :: :time | :dimension | :tag | :field
@@ -439,14 +443,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
         "#{table}.#{source} AS #{name}"
 
       true ->
-        refuse()
+        refuse(@same_name)
     end
   end
 
-  defp expression(_entry, _table, _schema), do: refuse()
-
-  defp refuse,
-    do: throw({:refused, "unsupported InfluxQL (select items that end up with the same name)"})
+  defp expression(_entry, _table, _schema), do: refuse(@same_name)
 
   @doc "Whether an expression is the `time` column in parentheses (a column of its own)."
   @spec time_expr?(InfluxQLExpr.ast()) :: boolean()

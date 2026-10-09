@@ -4110,7 +4110,10 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
     [
       {"select max(time)::float from ~g1",
        {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select max(time)::float from ~g1\", Tag)"}}
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Error: Nom(\"select max(time)::float from ~g1\", Tag)"}},
+      {"show tag keys from ~g3 where time - 1 > 0",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) - Int64 to valid types"}}
     ]
   end
 
@@ -4298,9 +4301,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
       {"show tag keys from ~g3 where time =~ /a/",
        {:error, 400,
         "Error during planning: Aggregate requires at least one grouping or aggregate expression. Aggregate without grouping expressions nor aggregate expressions is logically equivalent to, but less efficient than, VALUES producing single row. Please use VALUES instead."}},
-      {"show tag keys from ~g3 where time - 1 > 0",
-       {:error, 400,
-        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) - Int64 to valid types"}},
       {"show tag keys from ~g3 where time = time",
        {:error, 400,
         "Error during planning: found symbol 'time', expected now() or a literal duration, float, integer and timestamp string"}},
@@ -4587,8 +4587,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
         "unsupported InfluxQL (SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement with no tag)",
       "show tag keys from ~g3 where time !~ /a/" => "unsupported InfluxQL (time !~ ...)",
       "show tag keys from ~g3 where time =~ /a/" => "unsupported InfluxQL (time =~ ...)",
-      "show tag keys from ~g3 where time - 1 > 0" =>
-        "unsupported InfluxQL (SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement with no tag)",
       "show tag keys from ~g3 where time = time" =>
         "unsupported InfluxQL (SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement with no tag)",
       "show tag keys from ~g3 where time > time" =>

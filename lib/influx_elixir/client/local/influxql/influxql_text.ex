@@ -85,6 +85,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
     end)
   end
 
+  @doc """
+  A name as the engine writes it where a name is printed (the column of an expression that joins
+  names, the retention policy of a database named in a mismatch or a 404): bare when it is
+  letters, digits and underscores that do not start with a digit and are no reserved word (any
+  case), else double-quoted with a backslash, a double quote and a line feed escaped (verified:
+  `"x y"`, `"1a"`, `"select"`, `"Select"`, `"é"`, `"a\\"b"`, `"a\\\\b"`, `"a\\nb"`).
+  """
+  @spec quoted_if_needed(binary()) :: binary()
+  def quoted_if_needed(name) do
+    if Regex.match?(~r/\A[A-Za-z_][A-Za-z0-9_]*\z/, name) and not reserved?(name),
+      do: name,
+      else: "\"" <> String.replace(name, ["\\", "\"", "\n"], &escaped/1) <> "\""
+  end
+
+  defp escaped("\n"), do: "\\n"
+  defp escaped(char), do: "\\" <> char
+
   @doc "A number written with no digit before its point (`.5`, `-.5`) with the zero Elixir reads it with."
   @spec leading_zero(binary()) :: binary()
   def leading_zero("-." <> fraction), do: "-0." <> fraction

@@ -25,7 +25,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
 
   @day_seconds 86_400
 
-  @date ~r/^(\d{4})-(\d{2})-(\d{2})$/
+  @date ~r/^(\d{4})-(\d{2})-(\d{2})\z/
   @zone "([Zz]|[Uu][Tt][Cc]|[+-]\\d{2}:?\\d{2})"
 
   # A time with a zone is read leniently (verified): blanks before it, a
@@ -33,16 +33,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   # blanks after the `T` or in place of it.
   @zoned Regex.compile!(
            "^\\s*\\+?(\\d{4})-(\\d{1,2})-(\\d{1,2})(?:[Tt]\\s*|\\s+)(\\d{1,2}):(\\d{1,2}):(\\d{1,2})" <>
-             "(?:\\.(\\d+))?[ \\t]*" <> @zone <> "$"
+             "(?:\\.(\\d+))?[ \\t]*" <> @zone <> "\\z"
          )
 
   # What follows a whole clock and is not a zone the engine reads.
-  @bad_zone ~r/^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?[\w.,:+\- ]*$/
-  @date_zone Regex.compile!("^\\d{4}-\\d{2}-\\d{2}[ \\t]*" <> @zone <> "$")
+  @bad_zone ~r/^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?[\w.,:+\- ]*\z/
+  @date_zone Regex.compile!("^\\d{4}-\\d{2}-\\d{2}[ \\t]*" <> @zone <> "\\z")
   @short_clock Regex.compile!(
-                 "^\\d{4}-\\d{2}-\\d{2}[Tt ]\\d{2}(?::\\d{2})?[ \\t]*" <> @zone <> "$"
+                 "^\\d{4}-\\d{2}-\\d{2}[Tt ]\\d{2}(?::\\d{2})?[ \\t]*" <> @zone <> "\\z"
                )
-  @naive_space ~r/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?$/
+  @naive_space ~r/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?\z/
 
   # ---------------------------------------------------------------------------
   # A quoted time
@@ -80,12 +80,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   defp naive_clock?(content),
     do:
       Regex.match?(
-        ~r/^\d{4}-\d{2}-\d{2}(?:[Tt]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?| \d{2}:\d{2})$/,
+        ~r/^\d{4}-\d{2}-\d{2}(?:[Tt]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?| \d{2}:\d{2})\z/,
         content
       )
 
   @spec trailing_blank?(binary()) :: boolean()
-  defp trailing_blank?(content), do: Regex.match?(~q/^\d{4}-\d{2}-\d{2}[Tt ]\S+\s+$/, content)
+  defp trailing_blank?(content),
+    do: Regex.match?(~q/^\d{4}-\d{2}-\d{2}(?:[Tt ]\S+)?\s+\z/, content)
 
   @spec read_zoned([binary()]) ::
           {:ok, integer()} | :invalid | {:out_of_range, binary()} | :unknown
@@ -234,7 +235,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   # connective), a `time` in parentheses, or something else.
   @spec kind(tuple()) :: :bare | :grouped | :other
   defp kind({:cmp, tokens}) do
-    case InfluxQLTokens.unwrap_parens(tokens) do
+    case InfluxQLTokens.unwrap_group(tokens) do
       {[token], depth} -> if InfluxQLTokens.time?(token), do: depth_kind(depth), else: :other
       _other -> :other
     end
@@ -315,8 +316,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   end
 
   @spec refuse_by_name() :: no_return()
-  defp refuse_by_name,
-    do: throw({:refused, "unsupported InfluxQL (a bare time inside a condition of that shape)"})
+  defp refuse_by_name, do: InfluxQLError.refuse("a bare time inside a condition of that shape")
 
   @spec type_coercion() :: binary()
   defp type_coercion do

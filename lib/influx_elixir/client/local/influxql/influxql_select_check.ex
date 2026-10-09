@@ -368,8 +368,52 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
       kind = dangling_dot(text) ->
         engine(start, dangling_dot_body(kind, index, start, whole))
 
+      hit = long_name(text, start, whole) ->
+        hit
+
       true ->
         nil
+    end
+  end
+
+  # A name of more than three parts (`a.b.c.d`, `db.autogen.m.v`: at most `db.rp.m` is one) is
+  # read up to its third part, and the dot after it is left over (verified). As an item (or a
+  # term of the arithmetic of one) that leaves the whole statement unparsed; in the arguments
+  # of a call the call fails from the dot. In parentheses that are no call the engine's answer
+  # differs by what stands before them (`(a.b.c.d)` is "expected field", after `+` the group
+  # fails): refused by name.
+  @long_name ~q/(?<![\w.])(?:[A-Za-z_]\w*|"_*")(?:\.(?:[A-Za-z_]\w*|"_*")){3,}/
+
+  @long_name_refusal "unsupported InfluxQL (a name of more than three parts in parentheses)"
+
+  @spec long_name(binary(), non_neg_integer(), binary()) :: InfluxQLCheck.positioned() | nil
+  defp long_name(text, start, whole) do
+    case Regex.run(@long_name, text, return: :index) do
+      [{from, length}] ->
+        parts = text |> binary_part(from, length) |> String.split(".")
+
+        dot_at =
+          start + from + (parts |> Enum.take(3) |> Enum.map(&byte_size/1) |> Enum.sum()) + 2
+
+        case paren_context(binary_part(text, 0, from)) do
+          :item -> engine(start, InfluxQLError.syntax_error_body(:nom, 0, whole))
+          :call -> engine(dot_at, InfluxQLError.syntax_error_body(:failure, dot_at, whole))
+          :group -> InfluxQLCheck.refuse(start + from, @long_name_refusal)
+        end
+
+      nil ->
+        nil
+    end
+  end
+
+  # What the innermost parenthesis still open at the end of the text is: none (`:item`), the
+  # parenthesis of a call (a name stands before it) or a group.
+  @spec paren_context(binary()) :: :item | :call | :group
+  defp paren_context(prefix) do
+    case open_parens(prefix) do
+      [] -> :item
+      [true | _outer] -> :call
+      [false | _outer] -> :group
     end
   end
 
@@ -461,7 +505,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # Whether the text ends inside the parentheses of a call (a name stands before the innermost
   # `(` still open).
   @spec inside_call?(binary()) :: boolean()
-  defp inside_call?(prefix) do
+  defp inside_call?(prefix), do: Enum.any?(open_parens(prefix))
+
+  # The parentheses still open at the end of the text, the innermost first: whether a name
+  # stands before each (it is the parenthesis of a call).
+  @spec open_parens(binary()) :: [boolean()]
+  defp open_parens(prefix) do
     prefix
     |> :binary.bin_to_list()
     |> Enum.with_index()
@@ -470,7 +519,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
       {?), _at}, open -> Enum.drop(open, 1)
       {_byte, _at}, open -> open
     end)
-    |> Enum.any?()
   end
 
   defp call_before?(text, at),

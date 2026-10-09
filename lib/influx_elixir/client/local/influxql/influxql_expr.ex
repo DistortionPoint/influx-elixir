@@ -556,7 +556,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   end
 
   defp render({:str, content}, _types, _tags) do
-    if content =~ ~r/^[\w ]*$/, do: {:ok, ~s|Literal(String("#{content}"))|}, else: :error
+    if content =~ ~r/^[\w ]*\z/, do: {:ok, ~s|Literal(String("#{content}"))|}, else: :error
   end
 
   defp render({:bool, value}, _types, _tags), do: {:ok, "Literal(Boolean(#{value}))"}
@@ -697,17 +697,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     case ast |> names() |> Enum.reject(&is_nil/1) do
       [] -> nil
       [single] -> single
-      names -> names |> Enum.map(&quoted_if_needed/1) |> Enum.join("_")
+      names -> names |> Enum.map(&InfluxQLText.quoted_if_needed/1) |> Enum.join("_")
     end
-  end
-
-  # A name the engine would have to quote to write it (a space, a dot, a hyphen...) is written
-  # quoted in the name of a column that joins several (verified: `"a b" / ok` is `"a b"_ok`),
-  # with a backslash and a double quote escaped by a backslash (`x"y / k` is `"x\"y"_k`).
-  defp quoted_if_needed(name) do
-    if Regex.match?(~r/\A[A-Za-z_][A-Za-z0-9_]*\z/, name),
-      do: name,
-      else: "\"" <> String.replace(name, ["\\", "\""], &("\\" <> &1)) <> "\""
   end
 
   defp names({:ref, name}), do: [name]

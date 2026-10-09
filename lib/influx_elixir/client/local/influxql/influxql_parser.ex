@@ -183,7 +183,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
     case InfluxQLSources.split(masked, raw) do
       {:ok, sources, size} ->
-        {:ok, sources, size}
+        if literal_after_comma?(masked, size, from_at, lexer),
+          do: InfluxQLCheck.settle([lexer], head),
+          else: {:ok, sources, size}
 
       # The name after the dot is read, then found missing: a literal left open there is the
       # lexer's error, met before.
@@ -194,9 +196,37 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
         InfluxQLCheck.settle([lexer, error], head)
 
+      {:too_many, _count} ->
+        {:error,
+         "unsupported InfluxQL (more than #{InfluxQLSources.max_sources()} sources in FROM)"}
+
       :none ->
         unread(lexer, :unread_shape)
     end
+  end
+
+  # Whether the list of sources ended at a comma that a literal never closed follows (a quote or
+  # a regular expression the parser meets as it reads the source after the comma: its lexer
+  # error comes before the comma is left over, verified: `FROM m, "x`).
+  @qualifiers ~q/\A(?:(?:[A-Za-z_]\w*|"(?:[^"\\]|\\.)*")\.\s*){0,2}\z/
+
+  @spec literal_after_comma?(
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          InfluxQLCheck.lexer() | nil
+        ) :: boolean()
+  defp literal_after_comma?(_masked, _size, _from_at, nil), do: false
+
+  defp literal_after_comma?(masked, size, from_at, {:lexer, start, _error}) do
+    comma_at = InfluxQLLex.skip_blanks(masked, size)
+    first = InfluxQLLex.skip_blanks(masked, comma_at + 1)
+
+    # (The name of a source may be qualified: what stands between the comma and the literal is
+    # the qualifiers before it, `m, x.y."`.)
+    start >= from_at + first and
+      match?(<<_before::binary-size(comma_at), ?,, _rest::binary>>, masked) and
+      Regex.match?(@qualifiers, binary_part(masked, first, start - from_at - first))
   end
 
   # A statement names one database (verified): sources written with different qualifiers (one
@@ -214,7 +244,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   end
 
   defp database_named([database, rp]) when rp in [nil, "autogen"], do: database
-  defp database_named([database, rp]), do: database <> "/" <> rp
+  defp database_named([database, rp]), do: database <> "/" <> InfluxQLText.quoted_if_needed(rp)
   defp database_named(_none_or_policy), do: nil
 
   @spec split_at(binary(), non_neg_integer()) :: {binary(), binary()}

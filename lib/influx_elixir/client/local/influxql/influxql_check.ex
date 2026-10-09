@@ -159,7 +159,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       text: text,
       where: where,
       masked: masked,
-      from: from + length
+      from: from + length,
+      limit: reading_limit(where, masked)
     })
   end
 
@@ -190,32 +191,54 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   defp now_call?(_name, _masked, _at), do: false
 
   defp read_call(name, start, size, calls, ctx) do
-    with {:ok, _tokens} <- InfluxQLTokens.tokenize(binary_part(ctx.where, 0, start) <> "0", []),
-         false <- InfluxQLParens.excess_close?(binary_part(ctx.masked, 0, start)),
-         false <- top_level_comma?(binary_part(ctx.masked, 0, start)) do
+    if start < ctx.limit do
       call_at = ctx.from + start
 
       case call_result(Map.put(ctx, :later, calls), name, call_at, call_at + size - 1) do
         :next -> read_calls(calls, ctx)
         result -> result
       end
-    else
-      _earlier_error -> nil
+    end
+  end
+
+  # Where the condition stops being one the parser reads from the start, by what stands before
+  # a call: a call behind it is not read. The text before a call fails to tokenize, has a `)`
+  # that closes nothing, or has a `,` outside every parenthesis (the condition ends there). The
+  # three are found in one pass over the condition, each as the offset where it starts; every
+  # call that starts at or after the least of them is behind an earlier error (and the text
+  # before a call is never read again for each call: the calls of a condition would be
+  # quadratic otherwise).
+  @spec reading_limit(binary(), binary()) :: non_neg_integer() | :infinity
+  defp reading_limit(where, masked) do
+    [tokens_error_at(where), InfluxQLParens.excess_offset(masked), top_level_comma_at(masked)]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.min(fn -> :infinity end)
+  end
+
+  # Where the tokens of the condition fail to read (`nil` for none). The text before a call is
+  # read with a `0` after it, which fails where the text itself fails at the call.
+  defp tokens_error_at(where) do
+    case InfluxQLTokens.tokenize(where, []) do
+      {:ok, _tokens} -> nil
+      {:syntax_error, _kind, rest} -> byte_size(where) - byte_size(rest)
+      {:error, "unsupported InfluxQL WHERE: " <> rest} -> byte_size(where) - byte_size(rest)
+      {:error, _unplaced} -> 0
     end
   end
 
   # A `,` outside every parenthesis is where the condition ends: the engine leaves the rest
-  # over, so a call behind it is not read.
-  defp top_level_comma?(text) do
-    text
-    |> :binary.bin_to_list()
-    |> Enum.reduce_while(0, fn
-      ?(, depth -> {:cont, depth + 1}
-      ?), depth -> {:cont, depth - 1}
-      ?,, 0 -> {:halt, :comma}
-      _byte, depth -> {:cont, depth}
-    end)
-    |> Kernel.==(:comma)
+  # over, so a call behind it is not read. Where the first one stands, `nil` for none.
+  defp top_level_comma_at(text), do: top_level_comma_at(text, 0, 0)
+
+  defp top_level_comma_at(text, at, _depth) when at >= byte_size(text), do: nil
+
+  defp top_level_comma_at(text, at, depth) do
+    case :binary.at(text, at) do
+      ?, when depth == 0 -> at
+      ?( -> top_level_comma_at(text, at + 1, depth + 1)
+      ?) -> top_level_comma_at(text, at + 1, max(depth - 1, 0))
+      _byte -> top_level_comma_at(text, at + 1, depth)
+    end
   end
 
   # A call is read as the engine reads it: its arguments first. Arguments that do not read are

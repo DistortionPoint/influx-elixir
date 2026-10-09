@@ -19,8 +19,9 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   # and `InfluxQLParens`, its words `InfluxQLText`, its sources `InfluxQLSources`, its
   # clauses `InfluxQLClauseScan`, its dimensions `InfluxQLGroup`, its regular expressions
   # `InfluxQLRegex`, its errors `InfluxQLError`), `InfluxQLWhere` plans the `WHERE`
-  # (`InfluxQLTokens`, `InfluxQLTyped`, `InfluxQLNested` for a comparison with a
-  # condition in parentheses as an operand, `InfluxQLArithmetic`, `InfluxQLTime`,
+  # (`InfluxQLTokens`, `InfluxQLTyped`, `InfluxQLNested` and `InfluxQLFold` for a comparison
+  # with a condition in parentheses or the false of arithmetic as an operand,
+  # `InfluxQLArithmetic`, `InfluxQLTime`,
   # `InfluxQLSql`),
   # `InfluxQLRun` shapes the rows the caller has already filtered with the
   # statement's `WHERE` clause (Client.Local runs it through its SQL engine)

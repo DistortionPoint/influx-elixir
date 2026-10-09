@@ -76,6 +76,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   def syntax_error_body(kind, pos, _whole),
     do: @engine_error_prefix <> "#{Map.fetch!(@messages, kind)} at pos #{pos}"
 
+  @doc """
+  Refuses the statement by name: throws `{:refused, "unsupported InfluxQL (what)"}`, which
+  the query path answers as a 400 `Client.Local: ...`.
+  """
+  @spec refuse(binary()) :: no_return()
+  def refuse(what), do: throw({:refused, "unsupported InfluxQL (#{what})"})
+
   @doc ~S"""
   A string as Rust's `{:?}` writes it, between double quotes, as the engine's errors quote
   the text they stop at: `\0 \t \r \n \\ \"` as such, any other control character, space
@@ -192,7 +199,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   @spec offset_error(binary()) :: binary()
   def offset_error(quoted) do
     "rewriting statement\ncaused by\nfind interval offset\ncaused by\n" <>
-      "Error during planning: invalid expression #{rust_debug(quoted)}: " <>
+      invalid_timestamp(quoted)
+  end
+
+  @doc """
+  The planner's error for a quoted time it cannot read: `quoted` is the literal as written,
+  quotes included, which the engine prints twice, once as Rust's `{:?}` writes it.
+  """
+  @spec invalid_timestamp(binary()) :: binary()
+  def invalid_timestamp(quoted) do
+    "Error during planning: invalid expression #{rust_debug(quoted)}: " <>
       "#{quoted} is not a valid timestamp"
   end
 

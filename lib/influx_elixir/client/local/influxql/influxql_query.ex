@@ -50,6 +50,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     # UTF-8 is refused first: how the engine reads it is not verified, and the double's
     # readers (and its error bodies, which quote the text) take UTF-8.
     with :ok <- utf8(raw),
+         :ok <- length_of(raw),
          {:ok, statement} <- influxql_statement(influxql, raw) do
       case statement do
         {:show, spec} ->
@@ -61,6 +62,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
             influxql_select(table, database, query)
           end
       end
+    end
+  end
+
+  # The parser holds about seven words for each byte of a statement (its mask, its blanked
+  # comments, its readers), so one of a megabyte would be killed in a process capped at five
+  # million words, and the engine itself answers a statement of a few hundred kilobytes with
+  # "URI too long" or "headers too large" over GET: past this size none is read.
+  @max_statement_bytes 262_144
+
+  @spec length_of(binary()) :: :ok | {:error, map()}
+  defp length_of(text) do
+    if byte_size(text) > @max_statement_bytes do
+      {:error,
+       %{
+         status: 400,
+         body:
+           "Client.Local: unsupported InfluxQL (a statement of more than " <>
+             "#{@max_statement_bytes} bytes)"
+       }}
+    else
+      :ok
     end
   end
 
@@ -575,6 +597,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     end
   end
 
+  # The most rows that the points of measurements named more than once in `FROM` make (see
+  # `repeated/3`): per measurement, and over all of them together.
+  @max_repeated_rows 20_000
+
   # The statement's WHERE is evaluated by the SQL engine (the grammar the two
   # share: comparisons, AND/OR/NOT, time literals, now()); InfluxQL then
   # shapes the rows. A measurement or column the engine does not know is an
@@ -586,17 +612,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           InfluxElixir.Client.query_result()
   defp influxql_select(table, database, query) do
     with {:ok, names, copies} <- measurement_names(table, database, query) do
+      # `held` is the rows the measurements that were repeated have made so far.
       names
-      |> Enum.reduce_while({:ok, []}, fn name, {:ok, groups} ->
+      |> Enum.reduce_while({:ok, [], 0}, fn name, {:ok, groups, held} ->
+        repeated? = Map.fetch!(copies, name) > 1
         one = query |> Map.put(:copies, Map.fetch!(copies, name)) |> Map.put(:measurement, name)
 
         case influxql_select_one(table, database, one) do
-          {:ok, rows} -> {:cont, {:ok, [rows | groups]}}
-          error -> {:halt, error}
+          {:ok, rows} when repeated? and held + length(rows) > @max_repeated_rows ->
+            {:halt, repeated_refusal()}
+
+          {:ok, rows} ->
+            {:cont, {:ok, [rows | groups], if(repeated?, do: held + length(rows), else: held)}}
+
+          error ->
+            {:halt, error}
         end
       end)
       |> case do
-        {:ok, groups} -> {:ok, groups |> Enum.reverse() |> Enum.concat()}
+        {:ok, groups, _held} -> {:ok, groups |> Enum.reverse() |> Enum.concat()}
         error -> error
       end
     end
@@ -787,27 +821,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # other (the engine merges the reads by time).
   # The standard deviation of repeated points is not that of the points (verified); the double
   # does not compute it from them. The repeated points are all held before `LIMIT` or an
-  # aggregate reads them, so a product of points and copies past `@max_repeated_rows` is
-  # refused by name, never read.
-  @max_repeated_rows 100_000
+  # aggregate reads them, so a product of points and copies, summed over the measurements the
+  # sources stand for, past `@max_repeated_rows` is refused by name, never read (a capped
+  # process held about fifty words for each row it shaped: a hundred thousand killed one at
+  # five million words).
 
   defp repeated({:ok, rows}, copies, query) when copies > 1 do
     cond do
-      stddev?(query.items) ->
-        refusal("stddev() of a measurement named twice in FROM")
-
-      length(rows) * copies > @max_repeated_rows ->
-        refusal(
-          "a measurement named more than once in FROM over more than " <>
-            "#{@max_repeated_rows} points"
-        )
-
-      true ->
-        {:ok, Enum.flat_map(rows, &List.duplicate(&1, copies))}
+      stddev?(query.items) -> refusal("stddev() of a measurement named twice in FROM")
+      length(rows) * copies > @max_repeated_rows -> repeated_refusal()
+      true -> {:ok, Enum.flat_map(rows, &List.duplicate(&1, copies))}
     end
   end
 
   defp repeated(result, _copies, _query), do: result
+
+  defp repeated_refusal do
+    refusal(
+      "a measurement named more than once in FROM over more than " <>
+        "#{@max_repeated_rows} points"
+    )
+  end
 
   defp refusal(reason),
     do: {:error, %{status: 400, body: "Client.Local: unsupported InfluxQL (#{reason})"}}
@@ -1120,6 +1154,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     if Map.get(row, tag) == "", do: Map.delete(row, tag), else: row
   end
 
+  # The planning errors the engine raises before the analyser that would wrap them (verified:
+  # no comparison error of the engine carries the wrapper).
+  @planner_errors [
+    "Error during planning: Cannot coerce arith",
+    "Error during planning: Cannot infer common argument type for comparison operation"
+  ]
+
   @spec influxql_result(
           {:ok, [map()]} | {:error, term()},
           InfluxQL.query(),
@@ -1137,11 +1178,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
       {:error, %{body: "Schema error: No field named" <> _rest}} ->
         {:ok, []}
 
-      # The planner raises its own coercion error, before the analyser that would wrap it.
-      {:error,
-       %{body: "type_coercion\ncaused by\nError during planning: Cannot coerce arith" <> rest} =
-           error} ->
-        {:error, %{error | body: "Error during planning: Cannot coerce arith" <> rest}}
+      # The planner raises its own coercion error of arithmetic or of a comparison (that of
+      # `time > 0` beside a boolean included), before the analyser that would wrap it.
+      {:error, %{body: "type_coercion\ncaused by\n" <> planner_error} = error} ->
+        if String.starts_with?(planner_error, @planner_errors),
+          do: {:error, %{error | body: planner_error}},
+          else: {:error, error}
 
       error ->
         error
