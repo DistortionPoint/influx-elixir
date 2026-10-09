@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.42] - 2026-10-08
+
 ### Fixed
 - **`Client.Local` InfluxQL: review of the differential fuzz** (design document
   `2026-10-09_influxql-fuzz-review.md`): a parenthesised condition beside arithmetic
