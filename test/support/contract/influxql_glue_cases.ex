@@ -266,7 +266,38 @@ defmodule InfluxElixir.Contract.InfluxQLGlueCases do
         "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 41. Parsing Error: Nom(\"AS#C\", Tag)"}},
       {"SELECT usage FROM ~p1 ORDER BY time ASC 'x",
        {:error, 400,
-        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 40. Parsing Error: Nom(\"'x\", Tag)"}}
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 40. Parsing Error: Nom(\"'x\", Tag)"}},
+      {"select usage from ~p1.~p1",
+       [
+         {"2023-10-01 00:00:00", %{"usage" => 0.25}},
+         {"2023-10-01 00:01:00", %{"usage" => 1.75}},
+         {"2023-10-01 00:02:00", %{"usage" => 3.25}},
+         {"2023-10-01 00:04:00", %{"usage" => 6.25}},
+         {"2023-10-01 00:05:00", %{"usage" => 7.75}},
+         {"2023-10-01 00:06:00", %{"usage" => 9.25}},
+         {"2023-10-01 00:07:00", %{"usage" => 10.75}},
+         {"2023-10-01 00:08:00", %{"usage" => 12.25}},
+         {"2023-10-01 00:09:00", %{"usage" => 13.75}},
+         {"2023-10-01 00:11:00", %{"usage" => 16.75}},
+         {"2023-10-01 00:12:00", %{"usage" => 18.25}},
+         {"2023-10-01 00:13:00", %{"usage" => 19.75}},
+         {"2023-10-01 00:14:00", %{"usage" => 21.25}},
+         {"2023-10-01 00:15:00", %{"usage" => 22.75}},
+         {"2023-10-01 00:16:00", %{"usage" => 24.25}},
+         {"2023-10-01 00:18:00", %{"usage" => 27.25}},
+         {"2023-10-01 00:19:00", %{"usage" => 28.75}},
+         {"2023-10-01 00:20:00", %{"usage" => 30.25}},
+         {"2023-10-01 00:21:00", %{"usage" => 31.75}},
+         {"2023-10-01 00:22:00", %{"usage" => 33.25}},
+         {"2023-10-01 00:23:00", %{"usage" => 34.75}},
+         {"2023-10-01 00:25:00", %{"usage" => 37.75}},
+         {"2023-10-01 00:26:00", %{"usage" => 39.25}},
+         {"2023-10-01 00:27:00", %{"usage" => 40.75}},
+         {"2023-10-01 00:28:00", %{"usage" => 42.25}},
+         {"2023-10-01 00:29:00", %{"usage" => 43.75}}
+       ]},
+      {"select usage from ~p1, autogen.~p1",
+       {:error, 400, "error in InfluxQL statement: can only perform queries on a single database"}}
     ]
   end
 
@@ -371,38 +402,7 @@ defmodule InfluxElixir.Contract.InfluxQLGlueCases do
        {:error, 400,
         "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
       {"select nosuch as host, usage from ~p1 group by host limit 1",
-       [{"2023-10-01 00:00:00", %{"usage" => 0.25}}]},
-      {"select usage from ~p1.~p1",
-       [
-         {"2023-10-01 00:00:00", %{"usage" => 0.25}},
-         {"2023-10-01 00:01:00", %{"usage" => 1.75}},
-         {"2023-10-01 00:02:00", %{"usage" => 3.25}},
-         {"2023-10-01 00:04:00", %{"usage" => 6.25}},
-         {"2023-10-01 00:05:00", %{"usage" => 7.75}},
-         {"2023-10-01 00:06:00", %{"usage" => 9.25}},
-         {"2023-10-01 00:07:00", %{"usage" => 10.75}},
-         {"2023-10-01 00:08:00", %{"usage" => 12.25}},
-         {"2023-10-01 00:09:00", %{"usage" => 13.75}},
-         {"2023-10-01 00:11:00", %{"usage" => 16.75}},
-         {"2023-10-01 00:12:00", %{"usage" => 18.25}},
-         {"2023-10-01 00:13:00", %{"usage" => 19.75}},
-         {"2023-10-01 00:14:00", %{"usage" => 21.25}},
-         {"2023-10-01 00:15:00", %{"usage" => 22.75}},
-         {"2023-10-01 00:16:00", %{"usage" => 24.25}},
-         {"2023-10-01 00:18:00", %{"usage" => 27.25}},
-         {"2023-10-01 00:19:00", %{"usage" => 28.75}},
-         {"2023-10-01 00:20:00", %{"usage" => 30.25}},
-         {"2023-10-01 00:21:00", %{"usage" => 31.75}},
-         {"2023-10-01 00:22:00", %{"usage" => 33.25}},
-         {"2023-10-01 00:23:00", %{"usage" => 34.75}},
-         {"2023-10-01 00:25:00", %{"usage" => 37.75}},
-         {"2023-10-01 00:26:00", %{"usage" => 39.25}},
-         {"2023-10-01 00:27:00", %{"usage" => 40.75}},
-         {"2023-10-01 00:28:00", %{"usage" => 42.25}},
-         {"2023-10-01 00:29:00", %{"usage" => 43.75}}
-       ]},
-      {"select usage from ~p1, autogen.~p1",
-       {:error, 400, "error in InfluxQL statement: can only perform queries on a single database"}}
+       [{"2023-10-01 00:00:00", %{"usage" => 0.25}}]}
     ]
   end
 
@@ -447,9 +447,7 @@ defmodule InfluxElixir.Contract.InfluxQLGlueCases do
       "select usage from ~p1 where u + 1 = (n > 1)" =>
         "unsupported InfluxQL (an expression compared with a condition in parentheses)",
       "select nosuch as host, usage from ~p1 group by host limit 1" =>
-        "unsupported InfluxQL (a column the measurement lacks aliased to a GROUP BY dimension)",
-      "select usage from ~p1.~p1" => "unsupported InfluxQL (a qualified source name)",
-      "select usage from ~p1, autogen.~p1" => "unsupported InfluxQL (a qualified source name)"
+        "unsupported InfluxQL (a column the measurement lacks aliased to a GROUP BY dimension)"
     }
   end
 

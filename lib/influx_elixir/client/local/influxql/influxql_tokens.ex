@@ -23,6 +23,89 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   def time?({:ident, name}), do: String.downcase(name) == "time"
   def time?(_token), do: false
 
+  @doc """
+  The tokens inside the parentheses that open and close all of them, and how many layers there
+  were, found in one pass whatever their depth: a `(` first and a `)` last are one layer
+  (`(a) AND (b)` is `a) AND (b` in one: the parentheses are not matched, as the readers of the
+  result expect).
+  """
+  @spec unwrap_parens(list()) :: {list(), non_neg_integer()}
+  def unwrap_parens([{:raw, "("} | _rest] = tokens) do
+    opening = tokens |> Enum.take_while(&(&1 == {:raw, "("})) |> length()
+    closing = tokens |> Enum.reverse() |> Enum.take_while(&(&1 == {:raw, ")"})) |> length()
+    layers = min(opening, closing)
+    {Enum.slice(tokens, layers, length(tokens) - 2 * layers), layers}
+  end
+
+  def unwrap_parens(tokens), do: {tokens, 0}
+
+  @doc """
+  The tokens inside the layers of parentheses that wrap all of them (`((a))` is `a`), and how
+  many layers there were; `{tokens, 0}` for tokens that are not one group (`(a) AND (b)`,
+  `(a) + 1`, an unbalanced list). One pass finds the layers, whatever their depth: the leading
+  parentheses, the trailing ones and the lowest depth between them, whichever is fewest.
+  """
+  @spec unwrap_group(list()) :: {list(), non_neg_integer()}
+  def unwrap_group([{:raw, "("} | _rest] = tokens) do
+    case group_layers(tokens) do
+      0 -> {tokens, 0}
+      layers -> {tokens |> Enum.drop(layers) |> Enum.drop(-layers), layers}
+    end
+  end
+
+  def unwrap_group(tokens), do: {tokens, 0}
+
+  defp group_layers(tokens) do
+    opening = tokens |> Enum.take_while(&(&1 == {:raw, "("})) |> length()
+    closing = tokens |> Enum.reverse() |> Enum.take_while(&(&1 == {:raw, ")"})) |> length()
+
+    case lowest_depth(tokens, 1, 0, opening, length(tokens) - closing, opening) do
+      :unbalanced -> 0
+      lowest -> lowest |> min(opening) |> min(closing)
+    end
+  end
+
+  # The lowest depth after a token from the last opening parenthesis to the last token before
+  # the closing ones, `:unbalanced` when the depth goes below zero or does not end at zero.
+  defp lowest_depth([], _index, 0, _first, _last, lowest), do: lowest
+  defp lowest_depth([], _index, _depth, _first, _last, _lowest), do: :unbalanced
+
+  defp lowest_depth([token | rest], index, depth, first, last, lowest) do
+    depth = depth + paren_step(token)
+
+    cond do
+      depth < 0 ->
+        :unbalanced
+
+      index >= first and index <= last ->
+        lowest_depth(rest, index + 1, depth, first, last, min(lowest, depth))
+
+      true ->
+        lowest_depth(rest, index + 1, depth, first, last, lowest)
+    end
+  end
+
+  defp paren_step({:raw, "("}), do: 1
+  defp paren_step({:raw, ")"}), do: -1
+  defp paren_step(_token), do: 0
+
+  @doc """
+  The names a list of tokens uses, in the order written: `{columns, calls}`, a name followed by
+  a `(` being the call of a function and any other a column.
+  """
+  @spec split_names(list()) :: {[binary()], [binary()]}
+  def split_names(tokens), do: split_names(tokens, [], [])
+
+  defp split_names([], columns, calls), do: {Enum.reverse(columns), Enum.reverse(calls)}
+
+  defp split_names([{:ident, name}, {:raw, "("} | _more] = tokens, columns, calls),
+    do: split_names(tl(tokens), columns, [name | calls])
+
+  defp split_names([{:ident, name} | rest], columns, calls),
+    do: split_names(rest, [name | columns], calls)
+
+  defp split_names([_token | rest], columns, calls), do: split_names(rest, columns, calls)
+
   @spec tokenize(binary(), list()) ::
           {:ok, list()} | {:syntax_error, atom(), binary()} | {:error, binary()}
   @doc false
@@ -42,7 +125,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # A token that follows an operand with no operator between them is where the engine's
   # parser stops: the condition ended before it.
   def tokenize(text, [previous | _before] = acc) do
-    if leftover_token?(previous, text),
+    if leftover_token?(previous, text) or operator_first_in_group?(acc, text),
       do: {:syntax_error, :nom, text},
       else: lex(text, acc)
   end
@@ -61,12 +144,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp lex(<<?', rest::binary>>, acc) do
     {content, rest} = take_until(rest, ?', [])
     # InfluxQL escapes a quote with a backslash, SQL by doubling it.
-    operand_token({:str, String.replace(content, "\\'", "''")}, rest, acc)
+    operand_token(
+      {:str, content |> InfluxQLText.unescape() |> String.replace("'", "''")},
+      rest,
+      acc
+    )
   end
 
   defp lex(<<?", rest::binary>>, acc) do
     {name, rest} = take_until(rest, ?", [])
-    operand_token({:ident, String.replace(name, "\\\"", "\"")}, rest, acc)
+    operand_token({:ident, InfluxQLText.unescape(name)}, rest, acc)
   end
 
   # A bind parameter is an operand like a name (verified: what follows it is left over as it is
@@ -250,8 +337,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # reads it.
   # The characters no token starts with, and `!` but for `!=` and `!~`.
   @stray "[#@$?}\\][\\\\`{~\\x80-\\xFF]|!(?![=~])"
+  @group_operator ~r/\A(?:[=<>*]|![=~])/
   @after_regex Regex.compile!("^(?:[\\d.'\"+\\-*\\/,(]|[A-Za-z_]|" <> @stray <> ")")
   @after_operand Regex.compile!("^(?:['\"\\d]|\\.\\d|[A-Za-z_]|" <> @stray <> ")")
+
+  # A comparison operator or `*` with nothing before it in a group (`( > 1)`, `(= 1)`, `(* 1)`)
+  # is left over from itself, and the group fails with it (verified: the error is the operand
+  # missing where the group stands, see `InfluxQLCheck`). A parenthesis after a name is the
+  # call of a function, which reads its own arguments.
+  @spec operator_first_in_group?(list(), binary()) :: boolean()
+  defp operator_first_in_group?([{:raw, "("} | before], text),
+    do: not match?([{:ident, _name} | _more], before) and Regex.match?(@group_operator, text)
+
+  defp operator_first_in_group?(_acc, _text), do: false
 
   @spec leftover_token?(term(), binary()) :: boolean()
   defp leftover_token?({:regex, _pattern}, text),

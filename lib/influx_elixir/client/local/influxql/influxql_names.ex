@@ -3,7 +3,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
   # The names the engine gives the columns of a select list (verified).
   #
   # A name taken twice becomes `name_1`, then `name_2`, in the order of the
-  # list, skipping a name already taken (`i AS i_1, i, i` is `i_1, i, i_2`).
+  # list, skipping a name already taken (`i AS i_1, i, i` is `i_1, i, i_2`) and one that a later
+  # item writes (`i, i, i AS i_1` is `i, i_2, i_1`: every item's written name is reserved before
+  # the repeated ones are numbered, an item the measurement lacks included, `v, v, v, v_1` is
+  # `v, v_2, v_3`).
   # That is the whole of the select list alone: the time that leads the answer,
   # the dimensions of the `GROUP BY` and the tags `top()` chooses by number a
   # name again and make the planning error of two columns with one name, which
@@ -49,6 +52,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
   defp resolve_names(items) do
     explicit_time? = Enum.any?(items, &time_item?/1)
 
+    reserved =
+      for item <- items, name = item_name(item), name != nil, into: %{}, do: {name, true}
+
     {named, _taken} =
       Enum.map_reduce(items, new_taken(), fn item, taken ->
         case item_name(item) do
@@ -56,7 +62,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
             {item, taken}
 
           name ->
-            {unique, taken} = take(name, taken)
+            {unique, taken} = take(name, taken, reserved)
             {rename(item, unique), taken}
         end
       end)
@@ -97,7 +103,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
 
   @doc "The name `name` becomes among those `taken`: itself, else `name_1`, `name_2`..."
   @spec unique(binary(), taken()) :: {binary(), taken()}
-  def unique(name, taken), do: take(name, taken)
+  def unique(name, taken), do: take(name, taken, %{})
 
   @typedoc "The names taken so far, each with the last number it was made unique with."
   @type taken :: %{binary() => non_neg_integer()}
@@ -106,21 +112,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
   @spec new_taken() :: taken()
   def new_taken, do: %{}
 
-  @spec take(binary(), taken()) :: {binary(), taken()}
-  defp take(name, taken) do
+  @spec take(binary(), taken(), %{binary() => true}) :: {binary(), taken()}
+  defp take(name, taken, reserved) do
     case taken do
-      %{^name => last} -> numbered(name, last + 1, taken)
+      %{^name => last} -> numbered(name, last + 1, taken, reserved)
       _free -> {name, Map.put(taken, name, 0)}
     end
   end
 
   # The name taken again resumes counting where it stopped, so that a list of n equal names is
   # numbered in n steps and not n squared.
-  defp numbered(base, count, taken) do
+  defp numbered(base, count, taken, reserved) do
     candidate = "#{base}_#{count}"
 
-    if Map.has_key?(taken, candidate),
-      do: numbered(base, count + 1, taken),
+    if Map.has_key?(taken, candidate) or Map.has_key?(reserved, candidate),
+      do: numbered(base, count + 1, taken, reserved),
       else: {candidate, taken |> Map.put(base, count) |> Map.put(candidate, 0)}
   end
 

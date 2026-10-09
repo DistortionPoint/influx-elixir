@@ -41,6 +41,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
       "invalid expression, the only valid function calls are 'now' with no arguments, " <>
         "date_part(<literal>, time), or scalar math functions",
     comment: "invalid inline comment, missing closing */",
+    escape_string: "invalid escape sequence, expected \\\\, \\' or \\n",
+    escape_name: "invalid escape sequence, expected \\\\, \\\" or \\n",
     unterminated_string: "unterminated string literal",
     unterminated_regex: "unterminated regex literal",
     unary:

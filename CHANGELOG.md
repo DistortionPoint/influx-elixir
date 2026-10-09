@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` InfluxQL: review of the differential fuzz** (design document
+  `2026-10-09_influxql-fuzz-review.md`): a parenthesised condition beside arithmetic
+  (`v > (w > 1) + 1`, `v > 1 + (w > 1)`, `-(w > 1)`) is the parse error Core gives (`Nom` at the
+  operator, `Failure` after `+`/`-`); a comparison with a condition in parentheses, `true` or
+  arithmetic of a missing column with text as an operand answers as Core does (`(w > 1) = ok`,
+  `true = (w > 1)`, `'x' + v > (w > 1)`, chained comparisons) and its inner condition is typed;
+  `FROM m, m.` is left over from the comma, qualified sources (`rp.m`, `db.rp.m`, `db..m`) name
+  the database they run in (`FROM m..x` is Core's database-mismatch error), sources qualified
+  differently are `can only perform queries on a single database`; a `tz()` zone other than
+  `'UTC'` with a clause behind it is refused (Core looks the zone up first); a name that needs
+  quoting is named with its `\` and `"` escaped (`"x\"y"_k`); equal select items are numbered
+  past every name the list writes (`v, v, v, v_1` is `v, v_2, v_3`); a backslash in a quoted name
+  or string is read as Core reads it (`\\`, `\n`) and any other escape is its `invalid escape
+  sequence` error. Deeply nested parentheses are scanned in one pass (depth 1600 was killed at 5M
+  words), and a measurement named in `FROM` many times over more than 100,000 points is refused by
+  name. The FROM grammar, the blank skipper, the math function list, the clause ranks and the
+  nested-condition rules are written once each.
+- **`Client.Local` InfluxQL: constants in a comparison**:
+  - A literal past what a float holds (`usage > 1 * <330 digits>.5`) raised. It is now
+    refused by name; Core answers no rows.
+  - Two comparisons answered differently from Core and are now refused by name:
+    - a float field against an integer division (`usage > 85 / 2`), which Core divides
+      as floats;
+    - a duration beside a condition in parentheses.
 - **`Client.Local` InfluxQL: a differential fuzz against Core 3.10.1** (design document
   `2026-10-09_influxql-differential-fuzz.md`): a text with no statement keyword, `SELECT` and
   `SHOW` glued to a character, junk after the sources and between clauses, the list of sources

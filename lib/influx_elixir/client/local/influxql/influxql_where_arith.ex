@@ -414,18 +414,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   # The types of the names the tokens read: those of the measurement, the time, and `:absent`
   # for a column it lacks.
   defp typed_names(tokens, tags, types) do
-    tokens
-    |> Enum.chunk_every(2, 1, [nil])
-    |> Enum.reduce(types, fn
-      [{:ident, name}, next], acc when next != {:raw, "("} ->
-        cond do
-          InfluxQLTokens.time?({:ident, name}) -> Map.put(acc, name, :timestamp)
-          MapSet.member?(tags, name) or Map.has_key?(acc, name) -> acc
-          true -> Map.put(acc, name, :absent)
-        end
+    {columns, _calls} = InfluxQLTokens.split_names(tokens)
 
-      _tokens, acc ->
-        acc
+    Enum.reduce(columns, types, fn name, acc ->
+      cond do
+        InfluxQLTokens.time?({:ident, name}) -> Map.put(acc, name, :timestamp)
+        MapSet.member?(tags, name) or Map.has_key?(acc, name) -> acc
+        true -> Map.put(acc, name, :absent)
+      end
     end)
   end
 
@@ -575,21 +571,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
     end)
   end
 
-  defp strip_parens([{:raw, "("} | rest] = tokens) do
-    case Enum.split(rest, -1) do
-      {inside, [{:raw, ")"}]} -> if balanced?(inside), do: strip_parens(inside), else: tokens
-      _other -> tokens
-    end
-  end
-
-  defp strip_parens(tokens), do: tokens
-
-  defp balanced?(tokens), do: balanced?(tokens, 0)
-  defp balanced?([], depth), do: depth == 0
-  defp balanced?(_tokens, depth) when depth < 0, do: false
-  defp balanced?([{:raw, "("} | rest], depth), do: balanced?(rest, depth + 1)
-  defp balanced?([{:raw, ")"} | rest], depth), do: balanced?(rest, depth - 1)
-  defp balanced?([_token | rest], depth), do: balanced?(rest, depth)
+  defp strip_parens(tokens), do: tokens |> InfluxQLTokens.unwrap_group() |> elem(0)
 
   # Whether the tokens are one call and nothing else.
   defp single_call?([{:ident, _name}, {:raw, "("} | rest]),

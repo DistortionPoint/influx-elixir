@@ -23,6 +23,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
     InfluxQLDefectCases,
     InfluxQLFixCases,
     InfluxQLGlueCases,
+    InfluxQLNestedCases,
     InfluxQLOrderCases,
     InfluxQLProjectionCases,
     InfluxQLShapeCases,
@@ -47,6 +48,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
       unquote(orders(client))
       unquote(defects(client))
       unquote(glue(client))
+      unquote(nested(client))
       unquote(show_helpers(client))
       unquote(fix_helpers(client))
       unquote(helpers(client))
@@ -685,6 +687,53 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
             ctx,
             InfluxQLGlueCases.refusals(),
             InfluxQLGlueCases.refusal_reasons()
+          )
+        end
+      end
+    end
+  end
+
+  defp nested(client) do
+    quote location: :keep do
+      describe "InfluxQL conditions in parentheses, dotted sources and repeated names — contract" do
+        setup ctx do
+          names = InfluxQLNestedCases.names(InfluxElixir.IntegrationHelper.unique_name("ipn"))
+          write(ctx, unquote(client), InfluxQLNestedCases.fixture(names))
+          {:ok, names: Map.put(names, "db", ctx.database)}
+        end
+
+        test "a condition in parentheses beside arithmetic", ctx do
+          check_fix(ctx, InfluxQLNestedCases.group_arithmetic())
+        end
+
+        test "a comparison with a condition in parentheses, or arithmetic of a column the measurement lacks with text, as an operand",
+             ctx do
+          check_fix(ctx, InfluxQLNestedCases.group_operands())
+        end
+
+        test "a field compared with a constant the engine folds", ctx do
+          check_fix(ctx, InfluxQLNestedCases.constants())
+        end
+
+        test "the names of the columns of a select list", ctx do
+          check_fix(ctx, InfluxQLNestedCases.column_names())
+        end
+
+        test "dotted and qualified sources", ctx do
+          check_fix(ctx, InfluxQLNestedCases.sources_dots())
+        end
+
+        test "a clause keyword where the clauses before it end the statement", ctx do
+          check_fix(ctx, InfluxQLNestedCases.clause_ends())
+        end
+
+        @tag local_divergence:
+               "what the engine answers and the double does not compute is refused by name"
+        test "statements the double refuses by name, each for its own reason", ctx do
+          check_refusals(
+            ctx,
+            InfluxQLNestedCases.refusals(),
+            InfluxQLNestedCases.refusal_reasons()
           )
         end
       end

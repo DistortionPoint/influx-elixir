@@ -53,9 +53,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # clause is what the engine reads next.
   @clause_keyword ~q/\b(?:GROUP|ORDER|LIMIT|OFFSET|SLIMIT|SOFFSET)\b|(?<![\w.])tz(?=\s*\()/i
 
-  # The functions the engine's parser accepts in a condition: the scalar math functions.
-  @math_functions ~w(abs sin cos tan asin acos atan atan2 exp log ln log2 log10 sqrt pow floor ceil round date_part)
-
   # Where the text the double has not read starts: the clause keyword a clause swallowed
   # (`{from}`), or the `fill()` that follows a complete condition (`{:fill, from}`, see
   # `split_fill/3`), each as an offset in the text after `FROM`.
@@ -229,7 +226,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   @spec call_result(map(), binary(), non_neg_integer(), non_neg_integer()) ::
           :next | positioned()
   defp call_result(ctx, name, call_at, open_at) do
-    case {InfluxQLArgs.read(ctx.text, open_at), name in @math_functions} do
+    case {InfluxQLArgs.read(ctx.text, open_at), InfluxQLText.math_function?(name)} do
       {{:ok, _stop}, false} ->
         fail(:call, ctx.at + call_at, ctx.whole)
 
@@ -266,7 +263,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       name = ctx.masked |> binary_part(name_at, name_size) |> String.downcase()
       paren = ctx.from + start + size - 1
 
-      not no_call?(name, name_at, ctx) and name not in @math_functions and paren < pos and
+      not no_call?(name, name_at, ctx) and not InfluxQLText.math_function?(name) and
+        paren < pos and
         match?({:ok, stop} when stop <= pos, InfluxQLArgs.read(ctx.text, paren))
     end)
   end
@@ -280,7 +278,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     arguments = binary_part(ctx.text, open_at, byte_size(ctx.text) - open_at)
 
     case unterminated(arguments, open_at, :operand) do
-      {kind, start} when start <= pos -> fail(kind, byte_size(ctx.whole), ctx.whole, key)
+      {kind, start, nil} when start <= pos -> fail(kind, byte_size(ctx.whole), ctx.whole, key)
       _read_to_the_failure -> fail(:failure, ctx.at + pos, ctx.whole, key)
     end
   end
@@ -398,13 +396,43 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # What stands behind a `tz('UTC')` is left over; behind another zone the engine reads the name
   # first and fails on a zone it does not know, which the double cannot tell from one it does.
   defp tz_leftover(whole, start, size) do
-    zone = binary_part(whole, start, size)
-
-    if Regex.match?(~r/\Atz\s*\(\s*'UTC'\s*\)\s*\z/i, zone) and zone =~ "'UTC'",
-      do: fail(:nom, start + size, whole),
-      else:
-        refuse(start, "unsupported InfluxQL (a tz() zone other than UTC with a clause behind it)")
+    if unknown_zone?(whole, start),
+      do: refuse_zone(start),
+      else: fail(:nom, start + size, whole)
   end
+
+  @doc """
+  Whether the `tz(` at `at` in `whole` names a zone the double does not know: any string but
+  `'UTC'` as written. The engine looks the zone up as soon as the string is read (verified:
+  `tz('Nowhere'! limit 1` is "unable to find timezone" at the end of the string, whatever
+  stands behind it), and its names are case sensitive (`tz('utc')` is unknown); which of the
+  others it knows needs a time zone database. A `tz(` with no string, or `'UTC'` with no
+  parenthesis closing it (`tz('UTC't)`), is no clause: it is left over as it stands.
+  """
+  @spec unknown_zone?(binary(), non_neg_integer()) :: boolean()
+  def unknown_zone?(whole, at) do
+    text = binary_part(whole, at, byte_size(whole) - at)
+
+    case Regex.run(~q/\Atz\s*\(\s*'([^']*)'/i, text) do
+      [_call, zone] -> zone != "UTC"
+      nil -> false
+    end
+  end
+
+  @doc """
+  Whether the `tz(` at `at` in `whole` is no clause the engine reads: it is not a closed call of
+  a string (`tz('UTC'!`, `tz('UTC't)`). The statement is then left over from the `tz`.
+  """
+  @spec broken_tz?(binary(), non_neg_integer()) :: boolean()
+  def broken_tz?(whole, at) do
+    text = binary_part(whole, at, byte_size(whole) - at)
+    Regex.match?(~q/\Atz\s*\(/i, text) and not Regex.match?(~q/\Atz\s*\(\s*'[^']*'\s*\)/i, text)
+  end
+
+  @doc "The refusal of a `tz()` clause with a clause behind it, from `at`."
+  @spec refuse_zone(non_neg_integer()) :: positioned()
+  def refuse_zone(at),
+    do: refuse(at, "unsupported InfluxQL (a tz() zone other than UTC with a clause behind it)")
 
   # After a `fill()` that follows the condition only the clauses from `ORDER BY` on may stand
   # (verified): anything else, `GROUP BY` and another `fill()` included, is left over from
@@ -543,8 +571,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     do: {:lexer, unclosed - 2, fail_body(:comment, unclosed, whole)}
 
   defp literal_error(whole) do
-    with {kind, start} <- unterminated(whole, 0, :operand),
-         do: {:lexer, start, fail_body(kind, byte_size(whole), whole)}
+    with {kind, start, at} <- unterminated(whole, 0, :operand),
+         do: {:lexer, start, fail_body(kind, at || byte_size(whole), whole)}
   end
 
   defp fail_body(kind, pos, whole),
@@ -558,8 +586,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # `LIMIT`, `OFFSET`, `SLIMIT`, `SOFFSET` and `fill()` are words and numbers, never literals
   # (`ORDER BY /` is "expected ASC, DESC or TIME"): `:order` and `:fill` are the states after
   # the words that lead to them.
+  #
+  # A literal read where an operand is wanted fails in the lexer when it is never closed, or when
+  # a backslash in it escapes anything but a backslash, the quote that closes it or `n`
+  # (verified: `\x` in `'a\xb'` and in `"a\xb"` is "invalid escape sequence" at the character
+  # after the backslash, the end of the text for a backslash that ends it). The result is `{kind,
+  # start, at}`: the error, where the literal starts and where the error is (`nil`: the end of the
+  # text).
   @spec unterminated(binary(), non_neg_integer(), :operand | :after | :order | :fill) ::
-          {:unterminated_string | :unterminated_regex, non_neg_integer()} | nil
+          {atom(), non_neg_integer(), non_neg_integer() | nil} | nil
   defp unterminated(<<>>, _at, _state), do: nil
 
   defp unterminated(<<blank, rest::binary>>, at, state) when InfluxQLLex.is_blank(blank),
@@ -568,15 +603,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   defp unterminated(<<quote, rest::binary>>, at, state) when quote in [?', ?"] do
     case {skip_literal(rest, quote, at + 1), state} do
       {{:ok, after_at, after_literal}, _state} -> unterminated(after_literal, after_at, :after)
-      {:unterminated, :operand} -> {:unterminated_string, at}
-      {:unterminated, _not_an_operand} -> nil
+      {:unterminated, :operand} -> {:unterminated_string, at, nil}
+      {{:invalid_escape, escape_at}, :operand} -> {escape_kind(quote), at, escape_at}
+      {_not_a_literal, _not_an_operand} -> nil
     end
   end
 
   defp unterminated(<<?/, rest::binary>>, at, :operand) do
     case skip_regex(rest, at + 1) do
       {:ok, after_at, after_literal} -> unterminated(after_literal, after_at, :after)
-      :unterminated -> {:unterminated_regex, at}
+      :unterminated -> {:unterminated_regex, at, nil}
     end
   end
 
@@ -629,13 +665,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   defp skip_regex(<<>>, _at), do: :unterminated
 
   @spec skip_literal(binary(), byte(), non_neg_integer()) ::
-          {:ok, non_neg_integer(), binary()} | :unterminated
-  defp skip_literal(<<?\\, _escaped, rest::binary>>, closing, at),
-    do: skip_literal(rest, closing, at + 2)
+          {:ok, non_neg_integer(), binary()}
+          | {:invalid_escape, non_neg_integer()}
+          | :unterminated
+  defp skip_literal(<<?\\, escaped, rest::binary>>, closing, at)
+       when escaped in [?\\, ?n] or escaped == closing,
+       do: skip_literal(rest, closing, at + 2)
+
+  defp skip_literal(<<?\\, _rest::binary>>, _closing, at), do: {:invalid_escape, at + 1}
 
   defp skip_literal(<<closing, rest::binary>>, closing, at), do: {:ok, at + 1, rest}
   defp skip_literal(<<_byte, rest::binary>>, closing, at), do: skip_literal(rest, closing, at + 1)
   defp skip_literal(<<>>, _closing, _at), do: :unterminated
+
+  defp escape_kind(?'), do: :escape_string
+  defp escape_kind(?"), do: :escape_name
 
   @spec check_empty_where(binary(), non_neg_integer(), binary()) :: positioned() | nil
   @doc false
@@ -656,24 +700,55 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     where = where <> cr_after_connective(masked_rest, start, where)
     masked = binary_part(masked_rest, start, byte_size(where))
 
+    # The parser meets the first error of the text, whichever check finds it: a condition in
+    # parentheses beside arithmetic (see `InfluxQLParens.group_error/1`) is read with the rest,
+    # unless the text inside the group fails first.
+    group = InfluxQLParens.group_error(masked)
+    positions = {at, from, start}
+
     case InfluxQLTokens.tokenize(where, []) do
       {:syntax_error, kind, after_error} ->
         error_at = byte_size(where) - byte_size(after_error)
 
         # A `)` that closes nothing ends the condition, whatever the tokens behind it hold
         # (verified: `WHERE (host = 'c')) AND f >== 1` is left over from the `)`).
-        case InfluxQLParens.excess_offset(binary_part(masked, 0, error_at)) do
-          nil -> where_syntax_error(kind, masked, error_at, {at, from, start}, whole)
-          offset -> fail(:nom, at + start + offset, whole)
-        end
+        tokens_error =
+          case InfluxQLParens.excess_offset(binary_part(masked, 0, error_at)) do
+            nil -> inside_operand(kind, masked, error_at, positions, whole)
+            offset -> fail(:nom, at + start + offset, whole)
+          end
+
+        leftmost([tokens_error, group_error(group, error_at, masked, positions, whole)])
 
       {:ok, tokens} ->
-        InfluxQLParens.check(tokens, masked, at + start, at + from, whole)
+        leftmost([
+          InfluxQLParens.check(tokens, masked, at + start, at + from, whole),
+          group_error(group, byte_size(masked), masked, positions, whole)
+        ])
 
       _refusal ->
         nil
     end
   end
+
+  # A text that fails inside a group that is the operand of arithmetic fails as the operand (see
+  # `InfluxQLParens.enclosing_error/2`); anywhere else it fails where it stands.
+  defp inside_operand(:reserved_failure, masked, error_at, positions, whole),
+    do: where_syntax_error(:reserved_failure, masked, error_at, positions, whole)
+
+  defp inside_operand(kind, masked, error_at, positions, whole) do
+    case InfluxQLParens.enclosing_error(masked, error_at) do
+      {enclosing, offset} -> where_syntax_error(enclosing, masked, offset, positions, whole)
+      nil -> where_syntax_error(kind, masked, error_at, positions, whole)
+    end
+  end
+
+  # The error of a group beside arithmetic, when the text reads up to its end (`read_to`).
+  defp group_error({kind, offset, limit}, read_to, masked, positions, whole)
+       when limit <= read_to,
+       do: where_syntax_error(kind, masked, offset, positions, whole)
+
+  defp group_error(_none_or_unread, _read_to, _masked, _positions, _whole), do: nil
 
   # The carriage return that stands right after a trailing `AND` or `OR`, which the clause
   # pattern took for a blank: the connective is not read as one with it there.
@@ -727,7 +802,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
           :where_unparsed | {:operand_after, non_neg_integer()} | nil
   defp group_failure(:nom, masked, error_at) do
     with open when open != nil <- outermost_group(binary_part(masked, 0, error_at)) do
-      before = masked |> binary_part(0, open) |> InfluxQLLex.trim_trailing_blanks()
+      # The signs in front of the group are a part of the operand: it is the operand missing.
+      before =
+        masked
+        |> binary_part(0, open)
+        |> InfluxQLLex.trim_trailing_blanks()
+        |> then(&Regex.replace(~q/[ \t\r\n+\-]+\z/, &1, ""))
 
       cond do
         Regex.match?(~q/\A[ \t\r\n(+\-]*\z/, before) ->

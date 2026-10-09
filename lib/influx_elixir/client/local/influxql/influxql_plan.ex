@@ -69,37 +69,35 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   # tell.
   @spec absent_aggregate(InfluxQL.query(), map(), MapSet.t(binary())) :: :ok | {:error, binary()}
   defp absent_aggregate(%{items: items} = query, types, tags) do
-    windowed? = query.group_time != nil or query.limit != nil or query.offset > 0
+    windowed_rows? = query.limit != nil or query.offset > 0
     known? = map_size(types) > 0 or MapSet.size(tags) > 0
 
     absent? = fn {_fun, arg} ->
-      arg not in ["*", "time"] and not Map.has_key?(types, arg) and
-        not MapSet.member?(tags, arg)
+      arg not in ["*", "time"] and InfluxQLExpr.absent?(arg, types, tags)
     end
 
-    refused? =
-      known? and Enum.any?(items, &absent_refused?(&1, items, query, absent?))
+    window = %{rows?: windowed_rows?, absent?: absent?}
 
-    if windowed? and refused?,
-      do:
-        {:error,
-         "unsupported InfluxQL (an aggregate of a column the measurement lacks inside arithmetic)"},
-      else: :ok
+    if known? and (query.group_time != nil or windowed_rows?) and
+         Enum.any?(items, &absent_refused?(&1, items, query, window)),
+       do:
+         {:error,
+          "unsupported InfluxQL (an aggregate of a column the measurement lacks inside arithmetic)"},
+       else: :ok
   end
 
-  defp absent_refused?({:expr, ast, _alias}, items, query, absent?) do
+  defp absent_refused?({:expr, ast, _alias}, items, query, %{rows?: rows?, absent?: absent?}) do
     aggregates = InfluxQLExpr.aggregates(ast)
-    windowed_rows? = query.limit != nil or query.offset > 0
 
     # Buckets windowed by LIMIT or OFFSET, of a quotient, are counted as the double does
     # (verified over the statements that match); every other shape differs.
-    quotient_window? = InfluxQLExpr.quotients?(ast) and query.group_time != nil and windowed_rows?
+    quotient_window? = InfluxQLExpr.quotients?(ast) and query.group_time != nil and rows?
 
     not quotient_window? and length(aggregates) > 1 and Enum.any?(aggregates, absent?) and
-      not (not windowed_rows? and independent?(items, ast, absent?))
+      (rows? or not independent?(items, ast, absent?))
   end
 
-  defp absent_refused?(_item, _items, _query, _absent?), do: false
+  defp absent_refused?(_item, _items, _query, _window), do: false
 
   # Whether the statement holds an aggregate of a column the measurement has that stands apart
   # from the quotient with the missing one: another item, or a term added to it (verified: with

@@ -22,6 +22,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLLex do
   def trim_blanks(<<byte, rest::binary>>) when is_blank(byte), do: trim_blanks(rest)
   def trim_blanks(text), do: text
 
+  @doc """
+  The offset of the first byte at or after `at` in `text` that is no blank (`at` itself when it
+  is past the end), so that no reader copies the text to skip the blanks.
+  """
+  @spec skip_blanks(binary(), non_neg_integer()) :: non_neg_integer()
+  def skip_blanks(text, at) do
+    case text do
+      <<_before::binary-size(at), c, _rest::binary>> when is_blank(c) -> skip_blanks(text, at + 1)
+      _other -> at
+    end
+  end
+
   @doc "The text without the blanks it ends with."
   @spec trim_trailing_blanks(binary()) :: binary()
   def trim_trailing_blanks(<<>>), do: <<>>

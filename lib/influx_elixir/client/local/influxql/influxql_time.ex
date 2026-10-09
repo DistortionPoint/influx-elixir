@@ -234,7 +234,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   # connective), a `time` in parentheses, or something else.
   @spec kind(tuple()) :: :bare | :grouped | :other
   defp kind({:cmp, tokens}) do
-    case unwrap(tokens, 0) do
+    case InfluxQLTokens.unwrap_parens(tokens) do
       {[token], depth} -> if InfluxQLTokens.time?(token), do: depth_kind(depth), else: :other
       _other -> :other
     end
@@ -245,15 +245,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
 
   defp depth_kind(0), do: :bare
   defp depth_kind(_depth), do: :grouped
-
-  defp unwrap([{:raw, "("} | rest] = tokens, depth) do
-    case Enum.split(rest, -1) do
-      {inside, [{:raw, ")"}]} -> unwrap(inside, depth + 1)
-      _unbalanced -> {tokens, depth}
-    end
-  end
-
-  defp unwrap(tokens, depth), do: {tokens, depth}
 
   @spec bare?(tuple()) :: boolean()
   defp bare?(node), do: kind(node) == :bare

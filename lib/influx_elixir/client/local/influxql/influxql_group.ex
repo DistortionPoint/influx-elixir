@@ -121,7 +121,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   defp clause(text, start, at, whole) do
     ctx = %{text: text, at: at, whole: whole}
 
-    with {:ok, dimensions, stop} <- dimensions(ctx, skip(text, start), [], 0) do
+    first = InfluxQLLex.skip_blanks(text, start)
+
+    with {:ok, dimensions, stop} <- dimensions(ctx, first, [], 0) do
       case fill(ctx, stop) do
         {:ok, fill, stop} -> leftover(ctx, stop, dimensions, fill)
         {:bad_option, pos} -> fail(ctx, :fill, pos)
@@ -135,10 +137,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   defp dimensions(ctx, pos, acc, count) do
     case dimension(ctx, pos) do
       {:ok, dimension, stop} ->
-        after_blank = skip(ctx.text, stop)
+        after_blank = InfluxQLLex.skip_blanks(ctx.text, stop)
 
         if byte_at(ctx.text, after_blank) == ?, do
-          dimensions(ctx, skip(ctx.text, after_blank + 1), [dimension | acc], count + 1)
+          dimensions(
+            ctx,
+            InfluxQLLex.skip_blanks(ctx.text, after_blank + 1),
+            [dimension | acc],
+            count + 1
+          )
           |> backtrack(ctx, after_blank, [dimension | acc], stop)
         else
           {:ok, Enum.reverse([dimension | acc]), stop}
@@ -178,11 +185,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   # `time` is a call where a blank, `(`, an operator, `;` or the end follows it; against `::` it
   # is a name with a cast, and against any other character (a carriage return included) it is a
   # name, whatever stands behind it is left over (verified for each ASCII character).
-  defp time_call?(rest) do
-    rest =~ ~q/^time(?![\w])/i and
-      rest =~ ~q/^time(?:[ \t\n]|#{InfluxQLText.keyword_end()})/i and
-      not (rest =~ ~q/^time(?:::|\r)/i)
-  end
+  @time_call Regex.compile!(
+               "^time(?=\\z|[ \\t\\n;" <> InfluxQLText.operator_glue_chars() <> "])",
+               "i"
+             )
+
+  defp time_call?(rest), do: Regex.match?(@time_call, rest)
 
   defp wildcard(ctx, pos) do
     after_star = pos + 1
@@ -278,7 +286,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
   defp time_call(ctx, pos) do
     after_word = pos + 4
-    open = skip(ctx.text, after_word)
+    open = InfluxQLLex.skip_blanks(ctx.text, after_word)
 
     if byte_at(ctx.text, open) == ?(,
       do: interval(ctx, open + 1),
@@ -297,7 +305,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     do: text |> binary_part(pos, byte_size(text) - pos) |> String.trim_leading() =~ ~q/^[\d.(]/
 
   defp interval(ctx, pos) do
-    case duration(ctx.text, skip(ctx.text, pos)) do
+    case duration(ctx.text, InfluxQLLex.skip_blanks(ctx.text, pos)) do
       {:ok, every, stop} ->
         after_interval(ctx, every, stop)
 
@@ -327,7 +335,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   end
 
   defp after_interval(ctx, every, stop) do
-    comma = skip(ctx.text, stop)
+    comma = InfluxQLLex.skip_blanks(ctx.text, stop)
 
     case byte_at(ctx.text, comma) do
       operator when operator in [?+, ?-, ?*, ?/] ->
@@ -336,7 +344,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
           else: fail(ctx, :time_close, stop)
 
       ?, ->
-        offset(ctx, every, stop, skip(ctx.text, comma + 1))
+        offset(ctx, every, stop, InfluxQLLex.skip_blanks(ctx.text, comma + 1))
 
       ?) ->
         {:ok, {:time, {every, 0}}, comma + 1}
@@ -349,7 +357,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   defp offset(ctx, every, interval_stop, pos) do
     case duration(ctx.text, pos) do
       {:ok, offset, stop} ->
-        close = skip(ctx.text, stop)
+        close = InfluxQLLex.skip_blanks(ctx.text, stop)
 
         if byte_at(ctx.text, close) == ?),
           do: {:ok, {:time, {every, offset}}, close + 1},
@@ -389,7 +397,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   # answered.
   defp timestamp_offset(ctx, every, pos, [quoted, content]) do
     stop = pos + byte_size(quoted)
-    close = skip(ctx.text, stop)
+    close = InfluxQLLex.skip_blanks(ctx.text, stop)
 
     cond do
       byte_at(ctx.text, close) != ?) ->
@@ -444,11 +452,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
           {:ok, InfluxQLBuckets.fill() | nil, non_neg_integer()}
           | {:bad_option, non_neg_integer()}
   defp fill(ctx, stop) do
-    pos = skip(ctx.text, stop)
+    pos = InfluxQLLex.skip_blanks(ctx.text, stop)
     rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
 
     with [word] <- Regex.run(~q/^fill(?![\w])/i, rest),
-         open = skip(ctx.text, pos + byte_size(word)),
+         open = InfluxQLLex.skip_blanks(ctx.text, pos + byte_size(word)),
          ?( <- byte_at(ctx.text, open) do
       fill_option(ctx, open + 1, stop)
     else
@@ -457,12 +465,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   end
 
   defp fill_option(ctx, option_at, stop) do
-    pos = skip(ctx.text, option_at)
+    pos = InfluxQLLex.skip_blanks(ctx.text, option_at)
     rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
 
     case option(rest) do
       {:ok, fill, size} ->
-        close = skip(ctx.text, pos + size)
+        close = InfluxQLLex.skip_blanks(ctx.text, pos + size)
 
         if byte_at(ctx.text, close) == ?),
           do: {:ok, fill, close + 1},
@@ -562,7 +570,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   # ---------------------------------------------------------------------------
 
   defp leftover(ctx, stop, dimensions, fill) do
-    pos = skip(ctx.text, stop)
+    pos = InfluxQLLex.skip_blanks(ctx.text, stop)
     rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)
 
     if rest == "" or rest =~ @after_clause do
@@ -595,14 +603,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
           {:error, {:engine, binary(), non_neg_integer()}}
   defp fail(ctx, kind, pos, start \\ nil),
     do: {:error, {:engine, error(ctx, kind, pos), ctx.at + (start || pos)}}
-
-  # The position after the blanks that start at `pos`.
-  @spec skip(binary(), non_neg_integer()) :: non_neg_integer()
-  defp skip(text, pos) do
-    case text |> binary_part(pos, byte_size(text) - pos) |> then(&Regex.run(~q/^\s*/, &1)) do
-      [blanks] -> pos + byte_size(blanks)
-    end
-  end
 
   @spec byte_at(binary(), non_neg_integer()) :: byte() | nil
   defp byte_at(text, pos) when pos < byte_size(text), do: :binary.at(text, pos)

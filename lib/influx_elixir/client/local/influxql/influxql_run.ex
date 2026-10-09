@@ -357,19 +357,36 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   defp project(rows, %{query: query, body: body, plan: plan} = context, base) do
     rows = if query.descending, do: Enum.reverse(rows), else: rows
 
-    absent = absent_fill(context)
+    # With `fill(number)` the columns the measurement lacks are the number in every row; the
+    # projection is made once, over the row with them, and the names that only the fill gave a
+    # value do not keep the row.
+    fill = absent_fill(context)
+    types = absent_types(fill, context.types)
+    filled_only = filled_only_names(body, fill)
 
     for row <- rows,
-        projected = projection(body, row, context.types),
-        row_kept?(projected, row, context) do
-      projected =
-        if absent == %{},
-          do: projected,
-          else: projection(body, Map.merge(absent, row), absent_types(absent, context.types))
-
+        projected = projection(body, Map.merge(fill, row), types),
+        row_kept?(projected, row, filled_only, context) do
       base |> Map.put(plan.time, row["time"]) |> Map.merge(projected)
     end
   end
+
+  # The names of the items that read no column but the ones the fill gives a value.
+  @spec filled_only_names([term()], %{binary() => number()}) :: MapSet.t(binary())
+
+  defp filled_only_names(body, fill) do
+    for item <- body, name = filled_only_name(item, fill), into: MapSet.new(), do: name
+  end
+
+  defp filled_only_name({:column, source, name}, fill),
+    do: if(Map.has_key?(fill, source), do: name)
+
+  defp filled_only_name({:expr, ast, name}, fill) do
+    refs = InfluxQLExpr.refs(ast)
+    if refs != [] and Enum.all?(refs, &Map.has_key?(fill, &1)), do: name
+  end
+
+  defp filled_only_name(_item, _fill), do: nil
 
   # With `fill(number)` a column the measurement lacks is the number wherever it is read, a
   # column of its own or an operand of arithmetic or a call (verified: `nosuch + 1` is the
@@ -381,8 +398,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     operands = for {:expr, ast, _name} <- query.items, ref <- InfluxQLExpr.refs(ast), do: ref
 
     for ref <- columns ++ operands,
-        source_field?(ref, context),
-        not Map.has_key?(types, ref),
+        not time_column?(ref),
+        InfluxQLExpr.absent?(ref, types, context.tags),
         into: %{},
         do: {ref, number}
   end
@@ -429,9 +446,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
 
   # A row is kept when it holds a field the list selects: a column's value, or
   # a field an expression reads, whatever the expression comes to.
-  @spec row_kept?(map(), map(), map()) :: boolean()
-  defp row_kept?(projected, row, %{expr_refs: refs, field_names: fields} = context) do
-    Enum.any?(projected, fn {name, _value} -> MapSet.member?(fields, name) end) or
+  @spec row_kept?(map(), map(), MapSet.t(binary()), map()) :: boolean()
+  defp row_kept?(projected, row, filled_only, %{expr_refs: refs, field_names: fields} = context) do
+    Enum.any?(projected, fn {name, _value} ->
+      MapSet.member?(fields, name) and not MapSet.member?(filled_only, name)
+    end) or
       Enum.any?(refs, &(Map.get(row, &1) != nil and source_field?(&1, context)))
   end
 

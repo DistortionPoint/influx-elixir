@@ -19,18 +19,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLClauseScan do
 
   alias InfluxElixir.Client.Local.{InfluxQLBlankRegex, InfluxQLCheck, InfluxQLLex, InfluxQLText}
 
-  @ranks %{
-    "where" => 0,
-    "group" => 1,
-    "fill" => 2,
-    "order" => 3,
-    "limit" => 4,
-    "offset" => 5,
-    "slimit" => 6,
-    "soffset" => 7,
-    "tz" => 8
-  }
-
   require InfluxQLLex
 
   @dir "(?:ASC|DESC)" <> InfluxQLText.keyword_end()
@@ -41,6 +29,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLClauseScan do
               "i"
             )
 
+  # A clause word, and the count a `LIMIT`-like clause reads after it.
+  @word ~q/\A([A-Za-z_]\w*)/
+  @counted ~q/\A\w+\s+\d+/
+
+  # The calls of the clauses that end where their parenthesis does. `fill()` takes an option
+  # of word characters, signs and points; `tz()` a zone, and only `'UTC'` (as written, case
+  # and all) is one the double knows: any other, an unknown zone to the engine or not, is a
+  # clause whose end the scan does not place (the zone is read from the statement as sent, the
+  # masked text holds only underscores in its place).
+  @fill_call ~q/\Afill\s*\(\s*[\w+\-.]*\s*\)/i
+  @tz_call ~q/\Atz\s*\(\s*(?-i:'UTC')\s*\)/i
+  @call_start ~q/\A[A-Za-z]+\s*\(/
+
   @doc """
   The error of the text left over, `nil` when the scan reaches the end of the text or a clause
   it does not read. `masked_rest` is the text after the source (its literals masked, comments
@@ -48,54 +49,63 @@ defmodule InfluxElixir.Client.Local.InfluxQLClauseScan do
   """
   @spec junk(binary(), non_neg_integer(), binary()) :: InfluxQLCheck.positioned() | nil
   def junk(whole, at, masked_rest) do
-    case scan(masked_rest, skip(masked_rest, 0), -1) do
+    raw = binary_part(whole, at, byte_size(masked_rest))
+
+    case scan({masked_rest, raw}, InfluxQLLex.skip_blanks(masked_rest, 0), -1) do
       pos when is_integer(pos) -> InfluxQLCheck.fail(:nom, at + pos, whole)
       nil -> nil
     end
   end
 
-  @spec scan(binary(), non_neg_integer(), integer()) :: non_neg_integer() | nil
-  defp scan(text, pos, _rank) when pos >= byte_size(text), do: nil
+  @spec scan({binary(), binary()}, non_neg_integer(), integer()) :: non_neg_integer() | nil
+  defp scan({masked, raw} = texts, pos, rank) do
+    case clause(binary_part(masked, pos, byte_size(masked) - pos), raw, pos) do
+      # The end of the text: every clause read, nothing left over.
+      :end ->
+        nil
 
-  defp scan(text, pos, rank) do
-    rest = binary_part(text, pos, byte_size(text) - pos)
-
-    case clause(rest) do
       :junk ->
         pos
 
       {name, size} ->
-        rank_of = Map.fetch!(@ranks, name)
+        rank_of = Map.fetch!(InfluxQLText.clause_ranks(), name)
 
         cond do
           rank_of <= rank -> pos
           size == :unknown -> nil
-          true -> scan(text, skip(text, pos + size), rank_of)
+          true -> scan(texts, InfluxQLLex.skip_blanks(masked, pos + size), rank_of)
         end
     end
   end
 
-  # The clause the text starts with: `{name, size}`, the size `:unknown` when its end is not
-  # placed or it does not read, `:junk` when none starts here.
-  @spec clause(binary()) :: {binary(), non_neg_integer() | :unknown} | :junk
-  defp clause(rest) do
-    case Regex.run(~q/\A([A-Za-z_]\w*)/, rest) do
-      [word, _name] -> keyword(String.downcase(word), word, rest)
-      nil -> :junk
+  # The clause the text starts with (`rest`, which starts at `pos` in `raw`): `{name, size}`, the
+  # size `:unknown` when its end is not placed or it does not read, `:junk` when none starts
+  # here, `:end` when the text is.
+  @spec clause(binary(), binary(), non_neg_integer()) ::
+          {binary(), non_neg_integer() | :unknown} | :junk | :end
+  defp clause("", _raw, _pos), do: :end
+
+  defp clause(rest, raw, pos) do
+    case Regex.run(@word, rest) do
+      [word, _name] ->
+        keyword(String.downcase(word), word, rest, binary_part(raw, pos, byte_size(rest)))
+
+      nil ->
+        :junk
     end
   end
 
-  defp keyword("where", word, rest) do
+  defp keyword("where", word, rest, _raw) do
     if blank_or_open?(rest, byte_size(word)), do: {"where", :unknown}, else: :junk
   end
 
-  defp keyword(name, word, rest) when name in ["group", "order"] do
+  defp keyword(name, word, rest, _raw) when name in ["group", "order"] do
     if blank_after?(rest, byte_size(word)), do: {name, by_clause(name, rest)}, else: :junk
   end
 
-  defp keyword(name, word, rest) when name in ["limit", "offset", "slimit", "soffset"] do
+  defp keyword(name, word, rest, _raw) when name in ["limit", "offset", "slimit", "soffset"] do
     with true <- blank_after?(rest, byte_size(word)),
-         [count] <- Regex.run(~q/\A#{word}\s+\d+/i, rest) do
+         [count] <- Regex.run(@counted, rest) do
       {name, byte_size(count)}
     else
       false -> :junk
@@ -103,22 +113,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLClauseScan do
     end
   end
 
-  defp keyword(name, _word, rest) when name in ["fill", "tz"] do
-    cond do
-      not (rest =~ ~q/\A[A-Za-z]+\s*\(/) -> :junk
-      name == "fill" -> call(name, rest, ~q/\Afill\s*\(\s*[\w+\-.]*\s*\)/i)
-      true -> call(name, rest, ~q/\Atz\s*\(\s*'_*'\s*\)/i)
-    end
-  end
-
-  defp keyword(_name, _word, _rest), do: :junk
-
-  defp call(name, rest, pattern) do
-    case Regex.run(pattern, rest) do
-      [call] -> {name, byte_size(call)}
+  defp keyword(name, _word, rest, raw) when name in ["fill", "tz"] do
+    with true <- Regex.match?(@call_start, rest),
+         [call] <- Regex.run(call_pattern(name), raw) do
+      {name, byte_size(call)}
+    else
+      false -> :junk
       nil -> {name, :unknown}
     end
   end
+
+  defp keyword(_name, _word, _rest, _raw), do: :junk
+
+  defp call_pattern("fill"), do: @fill_call
+  defp call_pattern("tz"), do: @tz_call
 
   # `ORDER BY time [ASC | DESC]` and `ORDER BY ASC | DESC` are read; `GROUP BY` is not placed.
   defp by_clause("group", _rest), do: :unknown
@@ -145,10 +153,5 @@ defmodule InfluxElixir.Client.Local.InfluxQLClauseScan do
       _end ->
         false
     end
-  end
-
-  defp skip(text, pos) do
-    rest = binary_part(text, pos, byte_size(text) - pos)
-    pos + byte_size(rest) - byte_size(InfluxQLLex.trim_blanks(rest))
   end
 end

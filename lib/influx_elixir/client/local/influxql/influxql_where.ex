@@ -8,6 +8,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     InfluxQL,
     InfluxQLArithmetic,
     InfluxQLError,
+    InfluxQLNested,
     InfluxQLSql,
     InfluxQLTime,
     InfluxQLTimeExpr,
@@ -45,7 +46,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
           now: now,
           extend: Keyword.get(opts, :extend_lower, 0),
           known: Keyword.get(opts, :known),
-          alone: true
+          alone: true,
+          timed: InfluxQLTime.mentions_time_comparison?(tree),
+          first: true
         }
 
         # The planner reads the times of the condition before it types the rest: a time it
@@ -278,20 +281,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
            now: integer(),
            extend: non_neg_integer(),
            known: MapSet.t(binary()) | nil,
-           alone: boolean()
+           alone: boolean(),
+           timed: boolean(),
+           first: boolean()
          }
 
   @spec plan(tuple(), {MapSet.t(binary()), map()}, times()) ::
           {binary(), [InfluxQL.bound()], [{binary(), InfluxQLArithmetic.check()}]}
   defp plan({:cmp, tokens}, {tags, types} = ctx, times) do
     check_calls(tokens, tags, types, times.alone)
-    check_coercion(tokens, tags, types)
+    time? = Enum.any?(tokens, &InfluxQLTokens.time?/1)
 
-    if Enum.any?(tokens, &InfluxQLTokens.time?/1) do
-      {sql, lowers} = time_plan(tokens, tags, times)
-      {sql, lowers, []}
-    else
-      plan_typed(tokens, ctx, times.known)
+    # A condition in parentheses as an operand decides the comparison before the types of the
+    # other side are coerced: the engine does not coerce them then (verified: `'x' + v > (w >
+    # 1)` keeps no row and is no error, where `'x' + v > 1` is the coercion error).
+    placed = if time?, do: :unplaced, else: plan_nested(tokens, ctx, times)
+
+    case placed do
+      {:planned, sql, checks} -> {sql, [], checks}
+      :unplaced -> plan_flat(tokens, ctx, times, time?)
     end
   end
 
@@ -316,6 +324,29 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     joined
   end
 
+  # The condition inside such a group is planned as a condition: its comparisons are typed
+  # (`s > 'a'` is false for every row), and the groups inside it are planned the same way.
+  defp plan_nested(tokens, ctx, times) do
+    inner = fn group ->
+      {tree, _rest} = group |> nest() |> parse_or()
+      {sql, _lowers, checks} = plan(tree, ctx, %{times | alone: false})
+      {sql, checks}
+    end
+
+    InfluxQLNested.plan(tokens, ctx, %{timed: times.timed and not times.first}, inner)
+  end
+
+  defp plan_flat(tokens, {tags, types} = ctx, times, time?) do
+    check_coercion(tokens, tags, types)
+
+    if time? do
+      {sql, lowers} = time_plan(InfluxQLNested.group_last(tokens), tags, times)
+      {sql, lowers, []}
+    else
+      plan_typed(tokens, ctx, times.known)
+    end
+  end
+
   # A comparison that reads a column the measurement does not have is null for
   # every point, so false (verified: `host = 'a' OR zone = 'z'` finds the points
   # of host a, `zone != 'z'` none). `known` is the measurement's columns, `nil`
@@ -335,12 +366,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   # The name of a call is no column.
   defp absent_column?(tokens, known) do
-    tokens
-    |> Enum.chunk_every(2, 1, [nil])
-    |> Enum.any?(fn
-      [{:ident, name}, next] -> next != {:raw, "("} and not MapSet.member?(known, name)
-      _tokens -> false
-    end)
+    {columns, _calls} = InfluxQLTokens.split_names(tokens)
+    Enum.any?(columns, &(not MapSet.member?(known, &1)))
   end
 
   # The calls of a comparison are `abs()` of a number, or the engine's planning error, or
@@ -467,7 +494,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp string_partner?(_token, _tags), do: false
 
   defp join_plans(nodes, separator, ctx, times) do
-    {sqls, lowers, checks} = nodes |> Enum.map(&plan(&1, ctx, times)) |> unzip3()
+    # Only the first of the conditions joined is the first of the statement's (see `plan_nested`).
+    {first, rest} = Enum.split(nodes, 1)
+    others = %{times | first: false}
+
+    {sqls, lowers, checks} =
+      (Enum.map(first, &plan(&1, ctx, times)) ++ Enum.map(rest, &plan(&1, ctx, others)))
+      |> unzip3()
+
     {Enum.join(sqls, separator), Enum.concat(lowers), Enum.concat(checks)}
   end
 

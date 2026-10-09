@@ -124,7 +124,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   def ident_sql(name) do
     if Regex.match?(~r/^[A-Za-z_]\w*$/, name) and String.downcase(name) not in @sql_words,
       do: name,
-      else: ~s("#{name}")
+      else: ~s("#{String.replace(name, "\"", "\"\"")}")
   end
 
   # False for every row, in the SQL the caller's engine reads.

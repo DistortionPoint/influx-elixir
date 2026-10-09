@@ -35,6 +35,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   @spec reserved?(binary()) :: boolean()
   def reserved?(word), do: String.downcase(word) in @reserved
 
+  # The functions the engine's parser accepts in a condition besides `now()`: the scalar math
+  # functions and `date_part(<literal>, time)`.
+  @math_functions ~w(abs sin cos tan asin acos atan atan2 exp log ln log2 log10 sqrt pow floor ceil round date_part)
+
+  @doc "Whether a function name (any case) is one a condition may call."
+  @spec math_function?(binary()) :: boolean()
+  def math_function?(name), do: String.downcase(name) in @math_functions
+
   @doc """
   The reserved word a text starts with, as `{word, length}`, unless a `::`
   follows (a cast, which the engine reads) or, with `plain: true`, a `(` (a
@@ -61,9 +69,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   @doc "A quoted identifier without its quotes and escapes; any other text as it is."
   @spec unquote_ident(binary()) :: binary()
   def unquote_ident("\"" <> _rest = quoted),
-    do: quoted |> String.trim("\"") |> String.replace("\\\"", "\"")
+    do: quoted |> binary_part(1, byte_size(quoted) - 2) |> unescape()
 
   def unquote_ident(ident), do: ident
+
+  @doc """
+  The text of a quoted name or string without its escapes (verified): `\\\\` is a backslash,
+  `\\n` a line feed and a backslash before the quote that closes it that quote. The lexer refuses
+  any other escape (see `InfluxQLCheck`), so none other is met here.
+  """
+  @spec unescape(binary()) :: binary()
+  def unescape(content) do
+    Regex.replace(~r/\\(.)/s, content, fn _escape, char ->
+      if char == "n", do: "\n", else: char
+    end)
+  end
 
   @doc "A number written with no digit before its point (`.5`, `-.5`) with the zero Elixir reads it with."
   @spec leading_zero(binary()) :: binary()
@@ -167,6 +187,26 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   def from_keyword_blanks, do: @from_keyword_blanks
 
   @clauses ~q/^\s*(?:WHERE(?:\s+|(?=#{@operand_open_class}))(?<where>.+?))?\s*(?:GROUP\s+BY\s+(?<group>.+?))?\s*(?<fillcall>fill\s*\((?<fill>[^)]*)\))?\s*(?:ORDER\s+BY\s+(?:time\s+(?=ASC|DESC)|(?=ASC\b|DESC\b)|time\b)(?<dir>(?:ASC|DESC)#{@keyword_end})?)?\s*(?:LIMIT\s+(?<limit>\d+))?\s*(?:OFFSET\s+(?<offset>\d+))?\s*(?:SLIMIT\s+(?<slimit>\d+))?\s*(?:SOFFSET\s+(?<soffset>\d+))?\s*(?<tzcall>TZ\s*\(\s*'(?<tz>[^']*)'\s*\))?\s*;?\s*$/is
+
+  # The clauses of a statement come in one order, each once; the parser reads them in turn and
+  # what follows the last it could read is left over from where the first clause that is out of
+  # its place starts (verified: `SLIMIT 1 LIMIT 2` is left over from `LIMIT`). `@clauses` above
+  # is written in the same order, and the readers of the clauses take their order from here.
+  @clause_ranks %{
+    "where" => 0,
+    "group" => 1,
+    "fill" => 2,
+    "order" => 3,
+    "limit" => 4,
+    "offset" => 5,
+    "slimit" => 6,
+    "soffset" => 7,
+    "tz" => 8
+  }
+
+  @doc "The rank of each clause keyword (lower case) in the order the parser reads them."
+  @spec clause_ranks() :: %{binary() => non_neg_integer()}
+  def clause_ranks, do: @clause_ranks
 
   @open_operand ~q/(?:[-+*=<>(,~!]|(?<![_\/])\/|\b(?:AND|OR))\s*$/i
   @fill_call ~q/(?<![\w])fill\s*\(/i

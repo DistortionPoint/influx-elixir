@@ -305,8 +305,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
   defp absent_captured?(pieces, %{dimensions: dimensions, types: types, tags: tags}) do
     Enum.any?(pieces, fn piece ->
       piece.kind == :column and piece.role == :field and piece.written in dimensions and
-        piece.source != piece.written and not Map.has_key?(types, piece.source) and
-        not MapSet.member?(tags, piece.source)
+        piece.source != piece.written and InfluxQLExpr.absent?(piece.source, types, tags)
     end)
   end
 

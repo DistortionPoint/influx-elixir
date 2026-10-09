@@ -27,6 +27,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
   @aggregates ~w(mean sum count min max first last median spread stddev distinct)
   @only_one "must provide only one InfluxQl statement per query"
+  @single_database "error in InfluxQL statement: can only perform queries on a single database"
   @no_variable "field must contain at least one variable"
   @cr_with_error "unsupported InfluxQL (a carriage return after a keyword in a select list " <>
                    "that has another error)"
@@ -43,11 +44,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     ]
   end
 
-  @source ~S{"(?:[^"\\]|\\.)+"|/(?:[^/\\]|\\.)+/|[A-Za-z_]\w*}
+  # The select list, and the text after `FROM` when a source starts there (the list of sources
+  # itself is read by `InfluxQLSources`).
   @select Regex.compile!(
             InfluxElixir.Client.Local.InfluxQLBlankRegex.blank_pattern(
               "^\\s*SELECT(?:\\s+|(?=[*(]))(?<items>.+?)(?:\\s+|(?<=#{InfluxQLText.item_end_class()}))FROM(?:\\s+|(?=/))" <>
-                "(?<from>(?:#{@source})(?:\\s*,\\s*(?:#{@source}))*)(?<rest>.*)$"
+                "(?=#{InfluxQLSources.source_pattern()})(?<tail>.*)$"
             ),
             "is"
           )
@@ -115,13 +117,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
          :ok <- check_blanks(masked_head),
          :ok <- check_supported(masked_head),
          :ok <- check_select(clean, masked_head, lexer),
-         %{"items" => items, "from" => from_all, "rest" => rest_all} <-
+         %{"items" => items, "tail" => after_from} <-
            slices(@select, masked_head, head) || unread(lexer, :unread_shape),
-         %{"items" => masked_items, "from" => masked_from_all, "rest" => masked_rest_all} =
+         %{"items" => masked_items, "tail" => masked_after_from} =
            slices(@select, masked_head, masked_head),
-         {:ok, size} <- sources_end(masked_from_all <> masked_rest_all, head, lexer),
-         {from, rest} = split_at(from_all <> rest_all, size),
-         {_masked_from, masked_rest} = split_at(masked_from_all <> masked_rest_all, size),
+         {:ok, sources, size} <- sources_end(masked_after_from, after_from, head, lexer),
+         {_from, rest} = split_at(after_from, size),
+         {_masked_from, masked_rest} = split_at(masked_after_from, size),
          at = byte_size(head) - byte_size(rest),
          :ok <- InfluxQLCheck.settle([InfluxQLCheck.check_empty_where(clean, at, masked_rest)]),
          masked_all = masked_rest,
@@ -144,6 +146,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
            ]
            |> InfluxQLCheck.settle(clean)
            |> readable_items_first(items, masked_items),
+         {:ok, sources, database} <- single_database(sources),
          {:ok, group} <- group_of(group_result, clauses),
          {:ok, items} <- parse_items(items, masked_items),
          {:ok, items} <- InfluxQLNames.resolve(items),
@@ -154,8 +157,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
       {:ok,
        %{
          items: items,
-         measurement: from |> sources() |> measurement_name(),
-         sources: sources(from),
+         measurement: measurement_name(sources),
+         sources: sources,
+         database: database,
          where: where,
          group_by: group.dimensions,
          group_time: group.time,
@@ -169,30 +173,49 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     end
   end
 
-  # Where the list of sources after `FROM` ends (see `InfluxQLSources`): a source that does not
-  # read is the engine's "invalid FROM clause" where it starts, a qualified one is refused.
-  @spec sources_end(binary(), binary(), InfluxQLCheck.lexer() | nil) ::
-          {:ok, non_neg_integer()} | {:error, term()}
-  defp sources_end(tail, head, lexer) do
-    from_at = byte_size(head) - byte_size(tail)
+  # Where the list of sources after `FROM` ends (see `InfluxQLSources`): a first source that does
+  # not read is the engine's "invalid FROM clause" where it starts. `masked` is the text after
+  # `FROM` with its literals masked, `raw` the same text as sent.
+  @spec sources_end(binary(), binary(), binary(), InfluxQLCheck.lexer() | nil) ::
+          {:ok, [InfluxQLSources.source()], non_neg_integer()} | {:error, term()}
+  defp sources_end(masked, raw, head, lexer) do
+    from_at = byte_size(head) - byte_size(masked)
 
-    case InfluxQLSources.split(tail) do
-      {:ok, size} ->
-        {:ok, size}
+    case InfluxQLSources.split(masked, raw) do
+      {:ok, sources, size} ->
+        {:ok, sources, size}
 
       # The name after the dot is read, then found missing: a literal left open there is the
       # lexer's error, met before.
-      {:invalid, 0, detect} ->
+      {:missing_name, %{wanted_at: wanted_at}} ->
         error =
-          {from_at + detect + 1,
+          {from_at + wanted_at + 1,
            {:error, {:engine, InfluxQLError.syntax_error_body(:from, from_at, head)}}}
 
         InfluxQLCheck.settle([lexer, error], head)
 
-      _invalid_or_qualified ->
-        {:error, "unsupported InfluxQL (a qualified source name)"}
+      :none ->
+        unread(lexer, :unread_shape)
     end
   end
+
+  # A statement names one database (verified): sources written with different qualifiers (one
+  # qualified beside one that is not, `n.m` beside `k.a`, `db..m` beside `db.autogen.a`) are the
+  # engine's error. A name with three parts (`db.rp.m`, `db..m`) names the database it must be
+  # run in: `db` alone for the retention policy `autogen` or none, else `db/rp` (the form the
+  # engine's own parameter takes); one with two (`rp.m`) names the retention policy, which the
+  # engine ignores.
+  @spec single_database([InfluxQLSources.source()]) ::
+          {:ok, [{:name | :regex, binary()}], binary() | nil} | {:error, term()}
+  defp single_database([{_source, qualifiers} | _more] = sources) do
+    if Enum.all?(sources, &match?({_source, ^qualifiers}, &1)),
+      do: {:ok, Enum.map(sources, &elem(&1, 0)), database_named(qualifiers)},
+      else: {:error, {:engine, @single_database}}
+  end
+
+  defp database_named([database, rp]) when rp in [nil, "autogen"], do: database
+  defp database_named([database, rp]), do: database <> "/" <> rp
+  defp database_named(_none_or_policy), do: nil
 
   @spec split_at(binary(), non_neg_integer()) :: {binary(), binary()}
   defp split_at(text, size),
@@ -625,20 +648,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     end
   end
 
-  # The measurements `FROM` names: names and regular expressions, in order.
-  @spec sources(binary()) :: [{:name, binary()} | {:regex, binary()}]
-  defp sources(from) do
-    ~q/"(?:[^"\\]|\\.)+"|\/(?:[^\/\\]|\\.)+\/|[A-Za-z_]\w*/
-    |> Regex.scan(from)
-    |> Enum.map(fn
-      ["/" <> _body = regex] ->
-        {:regex, regex |> String.slice(1..-2//1) |> String.replace("\\/", "/")}
-
-      [name] ->
-        {:name, InfluxQLText.unquote_ident(name)}
-    end)
-  end
-
   # The one name a statement selects from, when it names one.
   @spec measurement_name([{:name | :regex, binary()}]) :: binary()
   defp measurement_name([{:name, name}]), do: name
@@ -766,7 +775,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
       |> Regex.scan(masked_rest, return: :index)
       |> Enum.find_value(fn [{from, _size}] ->
         with true <- clause_position?(masked_rest, from),
-             {_pos, {:error, {:engine, _body}}} = error <-
+             {_pos, {:error, reason}} = error when reason != :unread_order <-
                InfluxQLCheck.check_swallowed(whole, at, masked_rest, {from}) do
           error
         else
@@ -807,39 +816,49 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     end
   end
 
-  # The clauses of a statement come in one order (`WHERE`, `GROUP BY`, `fill()`, `ORDER BY`,
-  # `LIMIT`, `OFFSET`, `SLIMIT`, `SOFFSET`, `tz()`), each once; the parser reads them in turn
-  # and what follows the last it could read is left over from where the first clause that is
-  # out of its place starts (verified: `SLIMIT 1 LIMIT 2` is left over from `LIMIT`).
-  @clause_ranks %{
-    "where" => 0,
-    "group" => 1,
-    "fill" => 2,
-    "order" => 3,
-    "limit" => 4,
-    "offset" => 5,
-    "slimit" => 6,
-    "soffset" => 7,
-    "tz" => 8
-  }
-
+  # The clauses come in one order (`InfluxQLText.clause_ranks/0`): what follows the last the
+  # parser could read is left over from where the first clause that is out of its place starts.
   @spec out_of_order(binary(), non_neg_integer(), binary()) :: InfluxQLCheck.positioned()
   defp out_of_order(whole, at, masked_rest) do
     ~q/(?<![\w])(WHERE|GROUP\s+BY|fill\s*\(|ORDER\s+BY|LIMIT|OFFSET|SLIMIT|SOFFSET|TZ\s*\()/i
     |> Regex.scan(masked_rest, return: :index, capture: :all_but_first)
-    |> Enum.reduce_while(-1, fn [{from, size}], highest ->
+    |> Enum.reduce_while({-1, nil, []}, fn [{from, size}], {highest, last_from, tzs} ->
       word = masked_rest |> binary_part(from, size) |> String.downcase() |> clause_word()
-      rank = Map.fetch!(@clause_ranks, word)
+      rank = Map.fetch!(InfluxQLText.clause_ranks(), word)
+      tzs = if word == "tz", do: [from | tzs], else: tzs
 
       if rank > highest,
-        do: {:cont, rank},
-        else: {:halt, InfluxQLCheck.fail(:nom, at + from, whole)}
+        do: {:cont, {rank, from, tzs}},
+        else:
+          {:halt, {:out_of_place, out_of_place(whole, at, from, last_from, tl_after(tzs, word))}}
     end)
     |> case do
-      {_pos, _error} = error -> error
+      {:out_of_place, positioned} -> positioned
       _in_order -> InfluxQLCheck.unread()
     end
   end
+
+  # The clause that stands out of its place is left over from where it starts. After a `tz()`
+  # of a zone other than `UTC` the engine reads the zone first and fails on one it does not
+  # know, which the double cannot tell from one it does: refused. A `tz(` the engine cannot read
+  # as a clause (`tz('UTC'!`) is no clause: the statement is left over from it.
+  defp out_of_place(whole, at, from, last_from, tzs) do
+    cond do
+      unknown = tzs |> Enum.reverse() |> Enum.find(&InfluxQLCheck.unknown_zone?(whole, at + &1)) ->
+        InfluxQLCheck.refuse_zone(at + unknown)
+
+      last_from != nil and InfluxQLCheck.broken_tz?(whole, at + last_from) ->
+        InfluxQLCheck.fail(:nom, at + last_from, whole)
+
+      true ->
+        InfluxQLCheck.fail(:nom, at + from, whole)
+    end
+  end
+
+  # The `tz` clauses read before the one that is out of place: the out of place one is itself
+  # left over, never read.
+  defp tl_after([_current | read], "tz"), do: read
+  defp tl_after(read, _word), do: read
 
   defp clause_word(text), do: text |> String.split(~q/[\s(]/, parts: 2) |> hd()
 

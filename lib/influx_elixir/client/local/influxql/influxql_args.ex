@@ -77,7 +77,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   """
   @spec item?(binary()) :: boolean()
   def item?(text) do
-    case expression(text, skip(text, 0), :select) do
+    case expression(text, InfluxQLLex.skip_blanks(text, 0), :select) do
       {:ok, stop} -> aliased?(binary_part(text, stop, byte_size(text) - stop))
       _unread -> false
     end
@@ -96,7 +96,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   """
   @spec item_failure(binary()) :: {:fail, non_neg_integer() | :eot} | nil
   def item_failure(text) do
-    case expression(text, skip(text, 0), :select) do
+    case expression(text, InfluxQLLex.skip_blanks(text, 0), :select) do
       {:fail, at} -> {:fail, at}
       _read_or_unknown -> nil
     end
@@ -108,7 +108,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   """
   @spec no_field?(binary()) :: boolean()
   def no_field?(text) do
-    at = skip(text, 0)
+    at = InfluxQLLex.skip_blanks(text, 0)
 
     char(text, at) == ?( and match?({:none, ^at}, expression(text, at, :select))
   end
@@ -121,9 +121,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   """
   @spec item_leftover(binary()) :: non_neg_integer() | nil
   def item_leftover(text) do
-    case expression(text, skip(text, 0), :select) do
+    case expression(text, InfluxQLLex.skip_blanks(text, 0), :select) do
       {:ok, stop} ->
-        at = skip(text, stop)
+        at = InfluxQLLex.skip_blanks(text, stop)
         <<_before::binary-size(at), rest::binary>> = text
 
         if Regex.match?(~r/\AAS(?![\w])/i, rest),
@@ -152,7 +152,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
          after_alias = at + byte_size(alias_text),
          <<_before::binary-size(after_alias), tail::binary>> = text,
          trimmed = InfluxQLLex.trim_blanks(tail),
-         true <- trimmed != "" and Regex.match?(~r/\A[^\s,]/, trimmed),
          true <-
            Regex.match?(~r/\A[A-Za-z0-9_'"\[\]{}~\\@?`$#:|^&*%+\-\/=<>!.\x80-\xFF]/, trimmed) do
       after_alias + byte_size(tail) - byte_size(trimmed)
@@ -165,7 +164,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   # failure from here on.
   @spec arguments(binary(), non_neg_integer(), atom()) :: read()
   defp arguments(text, from, mode) do
-    at = skip(text, from)
+    at = InfluxQLLex.skip_blanks(text, from)
 
     result =
       if char(text, at) == ?),
@@ -182,7 +181,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   # it fails.
   defp first_argument(text, at, mode) do
     case expression(text, at, mode) do
-      {:ok, stop} -> after_argument(text, skip(text, stop), mode)
+      {:ok, stop} -> after_argument(text, InfluxQLLex.skip_blanks(text, stop), mode)
       {:none, none_at} -> none_at(text, none_at)
       {:soft, sign_at} -> {:fail, sign_at}
       other -> other
@@ -209,10 +208,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   # An argument that does not start after a `,` takes the `,` back: the list is left from it,
   # when the next character is one the parser is known to stop at.
   defp next_argument(text, comma, mode) do
-    next = skip(text, comma + 1)
+    next = InfluxQLLex.skip_blanks(text, comma + 1)
 
     case expression(text, next, mode) do
-      {:ok, stop} -> after_argument(text, skip(text, stop), mode)
+      {:ok, stop} -> after_argument(text, InfluxQLLex.skip_blanks(text, stop), mode)
       {:none, _at} -> {:fail, comma}
       {:soft, _at} -> :unknown
       other -> other
@@ -237,7 +236,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   end
 
   defp operators(text, stop, mode) do
-    at = skip(text, stop)
+    at = InfluxQLLex.skip_blanks(text, stop)
     operator = char(text, at)
 
     cond do
@@ -248,7 +247,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   end
 
   defp cut(text, operator_at, mode) do
-    case operand(text, skip(text, operator_at + 1), mode) do
+    case operand(text, InfluxQLLex.skip_blanks(text, operator_at + 1), mode) do
       {:ok, stop} -> operators(text, stop, mode)
       {:none, at} -> {:fail, at_or_eot(text, at)}
       {:soft, at} -> {:fail, at}
@@ -257,7 +256,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   end
 
   defp plain(text, operator_at, mode) do
-    case operand(text, skip(text, operator_at + 1), mode) do
+    case operand(text, InfluxQLLex.skip_blanks(text, operator_at + 1), mode) do
       {:ok, stop} -> operators(text, stop, mode)
       {:none, _at} -> {:plain_fail, operator_at}
       {:soft, _at} -> :unknown
@@ -281,7 +280,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   # unary expression, not a failure of the arguments. In a condition's call a `*` is no
   # operand, and the sign fails (`abs(-*)` is left from the sign).
   defp signed(text, sign_at, mode) do
-    next = char(text, skip(text, sign_at + 1))
+    next = char(text, InfluxQLLex.skip_blanks(text, sign_at + 1))
 
     if next in [?/, ?'] or (next == ?* and mode == :select),
       do: :unknown,
@@ -289,7 +288,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   end
 
   defp signed_operand(text, sign_at, mode) do
-    case operand(text, skip(text, sign_at + 1), mode) do
+    case operand(text, InfluxQLLex.skip_blanks(text, sign_at + 1), mode) do
       {:ok, stop} -> {:ok, stop}
       {:none, _at} -> {:soft, sign_at}
       {:soft, _at} -> {:soft, sign_at}
@@ -362,8 +361,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   # A group whose contents are not one expression closed by `)` fails where it starts: it is an
   # operand that was not there. A failure inside it stands.
   defp primary(:group, text, at, _rest, mode) do
-    case expression(text, skip(text, at + 1), mode) do
-      {:ok, stop} -> group_close(text, at, skip(text, stop))
+    case expression(text, InfluxQLLex.skip_blanks(text, at + 1), mode) do
+      {:ok, stop} -> group_close(text, at, InfluxQLLex.skip_blanks(text, stop))
       {:fail, inside} -> {:fail, inside}
       {:plain_fail, _inside} -> :unknown
       :unknown -> :unknown
@@ -404,7 +403,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
         dotted(text, name_at, stop + 1, rest)
 
       _no_type ->
-        at = skip(text, stop)
+        at = InfluxQLLex.skip_blanks(text, stop)
         if char(text, at) == ?(, do: call(text, at, mode), else: {:ok, stop}
     end
   end
@@ -429,7 +428,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
             :unknown
 
           _end ->
-            if char(text, skip(text, stop)) == ?(, do: :unknown, else: {:ok, stop}
+            if char(text, InfluxQLLex.skip_blanks(text, stop)) == ?(,
+              do: :unknown,
+              else: {:ok, stop}
         end
 
       nil ->
@@ -455,18 +456,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
       {:ok, stop} -> {:ok, stop}
       {:fail, at} -> {:fail, at}
       _no_operand_or_unknown -> :unknown
-    end
-  end
-
-  # Past the blanks the engine skips: a space, a tab, a carriage return, a line feed.
-  @spec skip(binary(), non_neg_integer()) :: non_neg_integer()
-  defp skip(text, at) do
-    case text do
-      <<_before::binary-size(at), c, _rest::binary>> when InfluxQLLex.is_blank(c) ->
-        skip(text, at + 1)
-
-      _other ->
-        at
     end
   end
 

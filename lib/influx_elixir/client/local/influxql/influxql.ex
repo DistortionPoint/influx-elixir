@@ -16,10 +16,12 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   # This module is the entry point; the work is in modules of its own, which
   # are pure: `InfluxElixir.Client.Local.InfluxQLParser` turns the statement
   # into a query map (its checks are `InfluxQLCheck`, `InfluxQLSelectCheck`
-  # and `InfluxQLParens`, its words `InfluxQLText`, its dimensions `InfluxQLGroup`,
-  # its regular expressions `InfluxQLRegex`, its errors
-  # `InfluxQLError`), `InfluxQLWhere` plans the `WHERE` (`InfluxQLTokens`,
-  # `InfluxQLTyped`, `InfluxQLArithmetic`, `InfluxQLTime`, `InfluxQLSql`),
+  # and `InfluxQLParens`, its words `InfluxQLText`, its sources `InfluxQLSources`, its
+  # clauses `InfluxQLClauseScan`, its dimensions `InfluxQLGroup`, its regular expressions
+  # `InfluxQLRegex`, its errors `InfluxQLError`), `InfluxQLWhere` plans the `WHERE`
+  # (`InfluxQLTokens`, `InfluxQLTyped`, `InfluxQLNested` for a comparison with a
+  # condition in parentheses as an operand, `InfluxQLArithmetic`, `InfluxQLTime`,
+  # `InfluxQLSql`),
   # `InfluxQLRun` shapes the rows the caller has already filtered with the
   # statement's `WHERE` clause (Client.Local runs it through its SQL engine)
   # and put in time order, and `InfluxQLShowParser` reads the `SHOW` statements
@@ -147,6 +149,8 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
           items: [item()],
           measurement: binary(),
           sources: [{:name | :regex, binary()}],
+          # The database a three-part source (`db.rp.m`, `db..m`) names, else nil.
+          database: binary() | nil,
           where: binary() | nil,
           group_by: [binary()],
           group_time: nil | {integer(), integer()},

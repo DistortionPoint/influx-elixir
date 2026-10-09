@@ -56,7 +56,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           show(table, conn, opts, spec)
 
         {:select, query} ->
-          with {:ok, database} <- influxql_database(opts, conn),
+          with {:ok, database} <- select_database(query, opts, conn),
                :ok <- Scope.database_exists(table, database) do
             influxql_select(table, database, query)
           end
@@ -126,15 +126,35 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
         {:ok, on}
 
       {on, {:ok, param}} ->
-        {:error,
-         %{
-           status: 400,
-           body:
-             "provided a database in both the parameters (#{param}) and query string " <>
-               "(#{on}) that do not match, if providing a query that specifies the " <>
-               "database, you can omit the 'database' parameter from your request"
-         }}
+        {:error, database_mismatch(param, on)}
     end
+  end
+
+  # The database a `SELECT` is about: the one its `FROM` names (`db.rp.m`, `db..m`) when it
+  # names one, which must be the `db` of the call when the call has one (verified: checked
+  # before the database is looked up and before the statement is planned), else the call's.
+  @spec select_database(map(), keyword(), InfluxElixir.Client.Local.conn()) ::
+          {:ok, binary()} | {:error, map()}
+  defp select_database(%{database: nil}, opts, conn), do: influxql_database(opts, conn)
+
+  defp select_database(%{database: named}, opts, conn) do
+    case Scope.resolve_database(opts, conn) do
+      {:error, :no_database_specified} -> {:ok, named}
+      {:ok, ^named} -> {:ok, named}
+      {:ok, param} -> {:error, database_mismatch(param, named)}
+      {:error, %{}} = refusal -> refusal
+    end
+  end
+
+  @spec database_mismatch(binary(), binary()) :: map()
+  defp database_mismatch(param, named) do
+    %{
+      status: 400,
+      body:
+        "provided a database in both the parameters (#{param}) and query string " <>
+          "(#{named}) that do not match, if providing a query that specifies the " <>
+          "database, you can omit the 'database' parameter from your request"
+    }
   end
 
   # What the engine raises when it plans the statement, after the database.
@@ -766,20 +786,31 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # The points of a measurement read once for each source that stands for it, one after the
   # other (the engine merges the reads by time).
   # The standard deviation of repeated points is not that of the points (verified); the double
-  # does not compute it from them.
+  # does not compute it from them. The repeated points are all held before `LIMIT` or an
+  # aggregate reads them, so a product of points and copies past `@max_repeated_rows` is
+  # refused by name, never read.
+  @max_repeated_rows 100_000
+
   defp repeated({:ok, rows}, copies, query) when copies > 1 do
-    if stddev?(query.items),
-      do:
-        {:error,
-         %{
-           status: 400,
-           body:
-             "Client.Local: unsupported InfluxQL (stddev() of a measurement named twice in FROM)"
-         }},
-      else: {:ok, Enum.flat_map(rows, &List.duplicate(&1, copies))}
+    cond do
+      stddev?(query.items) ->
+        refusal("stddev() of a measurement named twice in FROM")
+
+      length(rows) * copies > @max_repeated_rows ->
+        refusal(
+          "a measurement named more than once in FROM over more than " <>
+            "#{@max_repeated_rows} points"
+        )
+
+      true ->
+        {:ok, Enum.flat_map(rows, &List.duplicate(&1, copies))}
+    end
   end
 
   defp repeated(result, _copies, _query), do: result
+
+  defp refusal(reason),
+    do: {:error, %{status: 400, body: "Client.Local: unsupported InfluxQL (#{reason})"}}
 
   defp stddev?(items) do
     Enum.any?(items, fn

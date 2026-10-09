@@ -683,6 +683,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # What an expression is made of
   # ---------------------------------------------------------------------------
 
+  @doc """
+  Whether a name is a column the measurement lacks: neither one of its fields (`types`) nor
+  one of its tags.
+  """
+  @spec absent?(binary(), map(), MapSet.t(binary())) :: boolean()
+  def absent?(name, types, tags),
+    do: not (Map.has_key?(types, name) or MapSet.member?(tags, name))
+
   @doc "The column name the engine gives an expression: the names in it joined by `_`."
   @spec name(ast()) :: binary() | nil
   def name(ast) do
@@ -694,9 +702,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   end
 
   # A name the engine would have to quote to write it (a space, a dot, a hyphen...) is written
-  # quoted in the name of a column that joins several (verified: `"a b" / ok` is `"a b"_ok`).
+  # quoted in the name of a column that joins several (verified: `"a b" / ok` is `"a b"_ok`),
+  # with a backslash and a double quote escaped by a backslash (`x"y / k` is `"x\"y"_k`).
   defp quoted_if_needed(name) do
-    if Regex.match?(~r/\A[A-Za-z_][A-Za-z0-9_]*\z/, name), do: name, else: ~s("#{name}")
+    if Regex.match?(~r/\A[A-Za-z_][A-Za-z0-9_]*\z/, name),
+      do: name,
+      else: "\"" <> String.replace(name, ["\\", "\""], &("\\" <> &1)) <> "\""
   end
 
   defp names({:ref, name}), do: [name]
@@ -911,11 +922,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       MapSet.member?(tags, name) ->
         {:ok, {:tag, false}}
 
-      Map.has_key?(types, name) ->
-        {:ok, {Map.fetch!(types, name), false}}
+      absent?(name, types, tags) ->
+        {:ok, {:unknown, false}}
 
       true ->
-        {:ok, {:unknown, false}}
+        {:ok, {Map.fetch!(types, name), false}}
     end
   end
 
