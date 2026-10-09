@@ -598,6 +598,19 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           check_fix(ctx, InfluxQLGlueCases.forms())
         end
 
+        test "a clause keyword, AS or ON directly against the next character, and parentheses of a WHERE nested",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.keyword_glue())
+        end
+
+        test "a regular expression for columns directly against FROM, AS or an operator", ctx do
+          check_fix(ctx, InfluxQLGlueCases.regex_columns())
+        end
+
+        test "a :: with a type the engine does not know, glued to FROM or not", ctx do
+          check_fix(ctx, InfluxQLGlueCases.casts())
+        end
+
         @tag local_divergence:
                "what the engine answers and the double does not compute is refused by name"
         test "statements the double refuses by name, each for its own reason", ctx do

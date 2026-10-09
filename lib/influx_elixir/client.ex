@@ -60,7 +60,7 @@ defmodule InfluxElixir.Client do
   @callback shutdown_connection(connection()) :: :ok
 
   # Write
-  @callback write(connection, binary(), keyword()) :: write_result()
+  @callback write(connection, iodata(), keyword()) :: write_result()
 
   # Query — v3 SQL (transport: :http | :flight selected via opts)
   @callback query_sql(connection, binary(), keyword()) :: query_result()

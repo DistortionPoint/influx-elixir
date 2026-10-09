@@ -126,7 +126,8 @@ defmodule InfluxElixir.Client.Local.Writes do
          %{
            status: 400,
            body:
-             "serde error: unknown variant `#{precision}`, expected one of `auto`, `s`, " <>
+             "serde error: unknown variant `#{String.replace_invalid(to_string(precision))}`, " <>
+               "expected one of `auto`, `s`, " <>
                "`second`, `millisecond`, `ms`, `microsecond`, `u`, `us`, `n`, `nanosecond`, `ns`"
          }}
     end

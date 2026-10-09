@@ -138,10 +138,9 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
     do: scan_where(rest, %{append(state, ")") | depth: state.depth - 1})
 
   defp scan_where(str, %{depth: 0} = state) do
-    case {word_boundary?(state.buf), Regex.run(~r/^(AND|OR|NOT)(?=\s|\(|$)/iu, str)} do
-      {true, [keyword, _word]} ->
-        rest = binary_part(str, byte_size(keyword), byte_size(str) - byte_size(keyword))
-        scan_keyword(String.upcase(keyword), rest, state)
+    case {word_boundary?(state.buf), keyword_prefix(str)} do
+      {true, {keyword, rest}} ->
+        scan_keyword(keyword, rest, state)
 
       _not_a_keyword ->
         <<c::utf8, rest::binary>> = str
@@ -151,6 +150,27 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
 
   defp scan_where(<<c::utf8, rest::binary>>, state),
     do: scan_where(rest, append(state, <<c::utf8>>))
+
+  # The `AND`, `OR` or `NOT` (any case) the text starts with, as `{keyword, rest}`, when a
+  # blank, a parenthesis or the end follows it. Read from the first bytes only: a pattern run
+  # on the whole of the rest would check all of it for UTF-8 each time, which is quadratic.
+  @spec keyword_prefix(binary()) :: {binary(), binary()} | nil
+  defp keyword_prefix(str) do
+    Enum.find_value(["AND", "OR", "NOT"], fn word ->
+      size = byte_size(word)
+
+      with <<head::binary-size(size), rest::binary>> <- str,
+           true <- String.upcase(head, :ascii) == word,
+           true <- keyword_end?(rest) do
+        {word, rest}
+      else
+        _no_keyword -> nil
+      end
+    end)
+  end
+
+  defp keyword_end?(<<>>), do: true
+  defp keyword_end?(<<c, _rest::binary>>), do: c in [?\s, ?\t, ?\n, ?\r, ?\v, ?\f, ?(]
 
   # A parenthesis that opens a predicate groups conditions when what follows
   # its closing one is the end, another closing parenthesis, `AND` or `OR`;

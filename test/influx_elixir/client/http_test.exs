@@ -262,6 +262,48 @@ defmodule InfluxElixir.Client.HTTPTest do
     end
   end
 
+  describe "options and URL values that cannot be sent" do
+    test "options that are not a keyword list are an error before anything is sent" do
+      conn = connection(ClosedPort.port(), [])
+
+      for opts <- [nil, :x, [1], [{:a, 1} | :t]] do
+        invalid = {:error, {:invalid_options, opts}}
+        assert HTTP.write(conn, "m f=1", opts) === invalid
+        assert HTTP.query_sql(conn, "SELECT 1", opts) === invalid
+        assert HTTP.execute_sql(conn, "SELECT 1", opts) === invalid
+        assert HTTP.query_influxql(conn, "SHOW DATABASES", opts) === invalid
+        assert HTTP.query_flux(conn, "buckets()", opts) === invalid
+        assert HTTP.create_database(conn, "x", opts) === invalid
+        assert HTTP.create_bucket(conn, "x", opts) === invalid
+        assert HTTP.create_token(conn, "x", opts) === invalid
+
+        assert %StreamError{kind: :transport, reason: {:invalid_options, ^opts}} =
+                 assert_raise(StreamError, fn ->
+                   conn |> HTTP.query_sql_stream("SELECT 1", opts) |> Enum.to_list()
+                 end)
+      end
+    end
+
+    test "a value a URL carries that is not text is an error naming it, never a raise" do
+      conn = connection(ClosedPort.port(), [])
+
+      for value <- [%{}, {1}, [1]] do
+        assert HTTP.write(conn, "m f=1", database: value) ===
+                 {:error, {:invalid_value, :database, value}}
+
+        assert HTTP.write(conn, "m f=1", precision: value) ===
+                 {:error, {:invalid_value, :precision, value}}
+
+        assert HTTP.query_flux(conn, "buckets()", org: value) ===
+                 {:error, {:invalid_value, :org, value}}
+
+        assert HTTP.delete_database(conn, value) === {:error, {:invalid_value, :name, value}}
+        assert HTTP.delete_token(conn, value) === {:error, {:invalid_value, :name, value}}
+        assert HTTP.delete_bucket(conn, value) === {:error, {:invalid_value, :bucket, value}}
+      end
+    end
+  end
+
   describe "a parameter that cannot be sent" do
     @closed {:error, {:connection_error, %Mint.TransportError{reason: :econnrefused}}}
 

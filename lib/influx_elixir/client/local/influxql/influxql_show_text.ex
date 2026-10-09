@@ -97,8 +97,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
   # non-ASCII character) leaves the word unread, as if it were another word: verified for each
   # ASCII character after `SHOW TAG KEYS`, and for U+00A0 and the control characters after the
   # kinds and the clause words.
-  @keyword_end [nil, " ", "\t", "\n", ";", "(", ")", "*", ",", "=", "/", "+", "-", "<", ">"] ++
-                 ["!", "%", "&", "|", "^"]
+  @keyword_end [nil, " ", "\t", "\n", ";" | InfluxQLText.operator_glue()]
 
   @doc "Whether a keyword that ends at `at` is read as one (see the table above)."
   @spec keyword_end?(ctx(), non_neg_integer()) :: boolean()

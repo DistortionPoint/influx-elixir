@@ -608,6 +608,10 @@ defmodule InfluxElixir.Client.Local do
   """
   @spec start(keyword()) :: {:ok, conn()}
   def start(opts \\ []) do
+    unless keyword?(opts) do
+      raise ArgumentError, "invalid options: expected a keyword list, got #{inspect(opts)}"
+    end
+
     profile = Keyword.get(opts, :profile, :v3_core)
 
     unless Scope.profile?(profile) do
@@ -620,9 +624,10 @@ defmodule InfluxElixir.Client.Local do
     # `:databases` is the default. With neither there is none, and an
     # operation that needs one is `{:error, :no_database_specified}` — no
     # "default" database the server does not have.
-    listed = Keyword.get(opts, :databases, [])
+    # `databases: nil` is none listed, as a config without the key gives it.
+    listed = Keyword.get(opts, :databases) || []
 
-    unless is_list(listed) and Enum.all?(listed, &is_binary/1) and
+    unless names?(listed) and
              (is_binary(opts[:database]) or is_nil(opts[:database])) do
       raise ArgumentError,
             "invalid databases: :databases must be a list of strings and :database a string, " <>
@@ -700,7 +705,7 @@ defmodule InfluxElixir.Client.Local do
   spellings each profile accepts and `auto`.
   """
   @impl true
-  @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
+  @spec write(InfluxElixir.Client.connection(), iodata(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(conn, payload, opts \\ []),
     do: text(iodata(payload), "line protocol", opts, &Writes.write(conn, &1, opts))
@@ -745,15 +750,14 @@ defmodule InfluxElixir.Client.Local do
         ) :: Enumerable.t()
   def query_sql_stream(conn, sql, opts \\ [])
 
-  def query_sql_stream(conn, sql, opts) when is_binary(sql) and is_list(opts),
-    do: SQLQuery.query_sql_stream(conn, sql, opts)
+  def query_sql_stream(conn, sql, opts) do
+    case text(sql, "SQL text", opts, &{:ok, &1}) do
+      {:ok, sql} ->
+        SQLQuery.query_sql_stream(conn, sql, opts)
 
-  def query_sql_stream(_conn, _sql, _opts) do
-    InfluxElixir.StreamError.stream(
-      kind: :http_status,
-      status: 400,
-      body: "Client.Local: the SQL text is not a string"
-    )
+      {:error, %{status: status, body: body}} ->
+        InfluxElixir.StreamError.stream(kind: :http_status, status: status, body: body)
+    end
   end
 
   @doc """
@@ -870,6 +874,11 @@ defmodule InfluxElixir.Client.Local do
     do: if(keyword?(opts), do: run.(), else: refused("the options are not a keyword list"))
 
   defp keyword?(opts), do: is_list(opts) and Keyword.keyword?(opts)
+
+  # A proper list of strings (an improper list is none).
+  defp names?([]), do: true
+  defp names?([name | rest]) when is_binary(name), do: names?(rest)
+  defp names?(_other), do: false
 
   defp refused(why), do: {:error, %{status: 400, body: "Client.Local: " <> why}}
 

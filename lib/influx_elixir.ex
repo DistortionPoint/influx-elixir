@@ -103,6 +103,10 @@ defmodule InfluxElixir do
 
   Goes through `InfluxElixir.Write.Writer`, so payloads over 1 KB are
   gzipped and a `[:influx_elixir, :write, ...]` telemetry span is emitted.
+  The line protocol may be a binary or iodata (a list of binaries and
+  bytes). A body that is neither, or options that are not a keyword list,
+  is the client's error (`{:error, {:invalid_body, body}}` and
+  `{:error, {:invalid_options, opts}}` over HTTP), never a raise.
 
   ## Options
 
@@ -122,7 +126,7 @@ defmodule InfluxElixir do
     * `:gzip` — `true` compresses every payload, `false` none; by default
       only payloads over 1 KB (see `InfluxElixir.Write.Writer.write/3`).
   """
-  @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
+  @spec write(InfluxElixir.Client.connection(), iodata(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(connection, line_protocol, opts \\ []) do
     Writer.write(resolve_connection(connection), line_protocol, opts)
@@ -134,7 +138,7 @@ defmodule InfluxElixir do
         when result: term()
   defp query_span(connection, opts, fun) do
     metadata = %{
-      database: Keyword.get(opts, :database) || connection_database(connection),
+      database: option(opts, :database) || connection_database(connection),
       transport: client()
     }
 
@@ -144,6 +148,11 @@ defmodule InfluxElixir do
   # Keyword list (HTTP) or map (Local); Access handles both.
   @spec connection_database(term()) :: binary() | nil
   defp connection_database(connection), do: connection[:database]
+
+  # Options that are not a keyword list are the client's error to name; the span reads none.
+  defp option(opts, key) do
+    if is_list(opts) and Keyword.keyword?(opts), do: Keyword.get(opts, key)
+  end
 
   # ---------- Query — v3 SQL ----------
 
@@ -407,6 +416,13 @@ defmodule InfluxElixir do
   """
   @spec add_connection(atom(), keyword()) :: Supervisor.on_start_child()
   def add_connection(name, opts) do
+    if is_list(opts) and Keyword.keyword?(opts),
+      do: start_connection(name, opts),
+      else: {:error, {:invalid_options, opts}}
+  end
+
+  @spec start_connection(atom(), keyword()) :: Supervisor.on_start_child()
+  defp start_connection(name, opts) do
     config = Keyword.put(opts, :name, name)
 
     child_spec =

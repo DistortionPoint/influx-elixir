@@ -80,6 +80,14 @@ defmodule InfluxElixir.Flight.Client do
     * `{:error, {:ipv6_unsupported, host}}` — the host is an IPv6 address: the gRPC
       client cannot connect to one (verified against InfluxDB 3 Core, which answers on
       `[::1]` over HTTP); use the HTTP transport for it
+    * `{:error, {:invalid_host, host}}` — the host is not a host name (a port belongs in
+      `:port`, not `"host:8181"`)
+    * `{:error, {:invalid_token, token}}` — the token is not a string
+    * `{:error, {:unencodable_body, message}}` — the database or the statement is not
+      what JSON can carry (text that is not UTF-8, a tuple)
+
+  A connection without `:host`, `:token` or `:database` raises `KeyError`: that is a
+  programming error, not an answer.
     * `{:error, term()}` — gRPC or decode error
 
   ## Example
@@ -93,13 +101,16 @@ defmodule InfluxElixir.Flight.Client do
 
     # Validate required keys eagerly before attempting any network calls.
     # Map.fetch!/2 raises KeyError with a clear message if a key is missing.
-    _host = Map.fetch!(connection, :host)
-    _token = Map.fetch!(connection, :token)
-    _database = Map.fetch!(connection, :database)
+    host = Map.fetch!(connection, :host)
+    token = Map.fetch!(connection, :token)
+    database = Map.fetch!(connection, :database)
 
     # The channel is closed on every path after connect, a raise included;
     # a failed DoGet used to leak it.
-    with {:ok, channel} <- connect(connection, opts) do
+    with :ok <- check_host(host),
+         :ok <- check_token(token),
+         {:ok, _payload} <- ticket_payload(database, sql),
+         {:ok, channel} <- open_channel(host, connection, opts) do
       try do
         with {:ok, flight_data_list} <- do_get(channel, connection, sql, timeout) do
           Reader.decode_flight_data(flight_data_list)
@@ -114,14 +125,37 @@ defmodule InfluxElixir.Flight.Client do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  @spec connect(connection(), keyword()) :: {:ok, GRPC.Channel.t()} | {:error, term()}
-  defp connect(connection, opts) do
-    host = Map.fetch!(connection, :host)
+  # An IPv6 address, bracketed (`[::1]`, as `Config` takes it) or bare (`::1`), has two
+  # colons or more; one colon is a port written into the host, which `:port` carries.
+  @spec check_host(term()) :: :ok | {:error, term()}
+  defp check_host("[" <> _address = host), do: {:error, {:ipv6_unsupported, host}}
 
-    # An IPv6 address, bracketed (`[::1]`, as `Config` takes it) or bare (`::1`), has a colon.
-    if String.contains?(host, ":"),
-      do: {:error, {:ipv6_unsupported, host}},
-      else: open_channel(host, connection, opts)
+  defp check_host(host) when is_binary(host) and host != "" do
+    case length(:binary.matches(host, ":")) do
+      0 -> if String.valid?(host), do: :ok, else: {:error, {:invalid_host, host}}
+      1 -> {:error, {:invalid_host, host}}
+      _ipv6 -> {:error, {:ipv6_unsupported, host}}
+    end
+  end
+
+  defp check_host(host), do: {:error, {:invalid_host, host}}
+
+  @spec check_token(term()) :: :ok | {:error, {:invalid_token, term()}}
+  defp check_token(token) when is_binary(token), do: :ok
+  defp check_token(token), do: {:error, {:invalid_token, token}}
+
+  # The ticket is JSON: a database or a statement JSON cannot carry (text that is not UTF-8,
+  # a tuple) is the caller's error before any connection, as over HTTP.
+  @spec ticket_payload(term(), term()) ::
+          {:ok, binary()} | {:error, {:unencodable_body, binary()}}
+  defp ticket_payload(database, sql) do
+    case Jason.encode(%{"database" => database, "sql_query" => sql, "query_type" => "sql"}) do
+      {:ok, payload} -> {:ok, payload}
+      {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
+    end
+  rescue
+    error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError] ->
+      {:error, {:unencodable_body, Exception.message(error)}}
   end
 
   @spec open_channel(binary(), connection(), keyword()) ::
@@ -159,30 +193,52 @@ defmodule InfluxElixir.Flight.Client do
 
   @doc false
   # Bounds the wall-clock duration of `fun`. Returns whatever `fun` returns
-  # if it completes in time, or `{:error, :connect_timeout}` if not. Uses
-  # Task.async/yield so the bound is library-version-agnostic — it does
+  # if it completes in time, or `{:error, :connect_timeout}` if not. Runs it
+  # in a monitored process so the bound is library-version-agnostic — it does
   # not rely on the underlying gRPC adapter exposing a connect-timeout
   # knob (which `grpc 0.11` does not).
   #
-  # A raise inside `fun` (the gRPC client raises on an address it cannot read) is the
-  # caller's `{:error, {:connect_failed, message}}`: the task is linked, and a crash would
-  # otherwise end the caller, which `query/3` promises an error tuple.
+  # The process is monitored, never linked: a raise, a throw or an exit inside `fun` (the
+  # gRPC client raises on an address it cannot read) is the caller's
+  # `{:error, {:connect_failed, message}}`, never its crash, whether or not it traps exits.
   @spec bounded_connect((-> result), non_neg_integer()) ::
           result | {:error, :connect_timeout | {:connect_failed, binary()}}
         when result: term()
   def bounded_connect(fun, timeout) when is_function(fun, 0) do
-    task =
-      Task.async(fn ->
-        try do
-          fun.()
-        rescue
-          error -> {:error, {:connect_failed, Exception.message(error)}}
-        end
+    caller = self()
+    tag = make_ref()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            fun.()
+          catch
+            kind, reason -> {:error, {:connect_failed, Exception.format_banner(kind, reason)}}
+          end
+
+        send(caller, {tag, result})
       end)
 
-    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
-      {:ok, result} -> result
-      nil -> {:error, :connect_timeout}
+    receive do
+      {^tag, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^pid, reason} ->
+        {:error, {:connect_failed, Exception.format_exit(reason)}}
+    after
+      timeout ->
+        Process.exit(pid, :kill)
+        Process.demonitor(monitor, [:flush])
+        # A result sent just before the kill is dropped with the rest.
+        receive do
+          {^tag, _late} -> :ok
+        after
+          0 -> :ok
+        end
+
+        {:error, :connect_timeout}
     end
   end
 

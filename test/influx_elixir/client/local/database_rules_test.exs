@@ -97,11 +97,22 @@ defmodule InfluxElixir.Client.Local.DatabaseRulesTest do
     end
 
     test "raises a named ArgumentError for names that are not strings" do
-      for opts <- [[database: 1], [databases: nil], [databases: [:a]], [databases: "a"]] do
+      for opts <- [[database: 1], [databases: [:a]], [databases: "a"], [databases: ["a" | "b"]]] do
         assert_raise ArgumentError, ~r/:databases must be a list of strings/, fn ->
           Local.start(opts)
         end
       end
+    end
+
+    test "raises a named ArgumentError for options that are not a keyword list" do
+      for opts <- [:x, nil, [1]] do
+        assert_raise ArgumentError, ~r/expected a keyword list/, fn -> Local.start(opts) end
+      end
+    end
+
+    test "databases: nil is none listed, as a config without the key gives it" do
+      assert {:ok, conn} = Local.start(databases: nil)
+      assert Local.query_sql(conn, "SELECT 1") === {:error, :no_database_specified}
     end
   end
 end

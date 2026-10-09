@@ -191,10 +191,6 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
         assert Local.execute_sql(c, value, database: "utf8_iql") === refused.("SQL text")
         assert Local.query_influxql(c, value, database: "utf8_iql") === refused.("InfluxQL text")
         assert Local.query_flux(v2, value, org: "o") === refused.("Flux text")
-        # A charlist is iodata, which is a body (see the iodata test below).
-        if not is_list(value),
-          do: assert(Local.write(c, value, database: "utf8_iql") === refused.("line protocol"))
-
         # `database: nil` is no option: the connection's database applies.
         if value != nil do
           assert Local.query_sql(c, "SELECT 1", database: value) === refused.("database name")
@@ -217,31 +213,69 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
       end
     end
 
-    test "as an option, or as the options themselves, is refused by name, never raised",
-         %{conn: c} do
-      refused = fn why -> {:error, %{status: 400, body: "Client.Local: " <> why}} end
+    test "as a write body (neither a string nor iodata) is refused by name", %{conn: c} do
+      for value <- [nil, 5, 1.5, :atom, %{}, {1}, [:a], [1 | :b]] do
+        assert Local.write(c, value, database: "utf8_iql") ===
+                 {:error, %{status: 400, body: "Client.Local: the line protocol is not a string"}}
+      end
+    end
+
+    test "as the options themselves is refused by name before anything else", %{conn: c} do
+      not_keyword =
+        {:error, %{status: 400, body: "Client.Local: the options are not a keyword list"}}
 
       for opts <- [nil, %{}, [1], [{"database", "x"}]] do
-        assert Local.query_sql(c, "SELECT 1", opts) ===
-                 refused.("the options are not a keyword list")
-
-        assert Local.write(c, "m v=1", opts) === refused.("the options are not a keyword list")
-
-        assert Local.create_database(c, "x", opts) ===
-                 refused.("the options are not a keyword list")
+        assert Local.query_sql(c, "SELECT 1", opts) === not_keyword
+        # The options are read first: a statement that is not text is not what is named.
+        assert Local.query_sql(c, 1, opts) === not_keyword
+        assert Local.write(c, "m v=1", opts) === not_keyword
+        assert Local.create_database(c, "x", opts) === not_keyword
       end
+    end
 
-      assert Local.check_sql(1) === refused.("the SQL text is not a string")
+    test "as the options of a stream is the same refusal, when the stream is read", %{conn: c} do
+      for opts <- [nil, [1], [{:a, 1} | :t]] do
+        error =
+          assert_raise InfluxElixir.StreamError, fn ->
+            c |> Local.query_sql_stream("SELECT 1", opts) |> Enum.to_list()
+          end
 
-      assert Local.query_influxql(c, "SHOW MEASUREMENTS ON utf8_iql", database: 1) ===
-               refused.("the database name is not a string")
+        assert {error.status, error.body} ===
+                 {400, "Client.Local: the options are not a keyword list"}
+      end
+    end
 
+    test "check_sql/1 of a value that is not text is refused by name" do
+      assert Local.check_sql(1) ===
+               {:error, %{status: 400, body: "Client.Local: the SQL text is not a string"}}
+    end
+
+    test "an InfluxQL :database that is not text is refused by name, with or without ON",
+         %{conn: c} do
+      for statement <- ["SELECT * FROM m", "SHOW MEASUREMENTS", "SHOW MEASUREMENTS ON utf8_iql"] do
+        assert Local.query_influxql(c, statement, database: 1) ===
+                 {:error, %{status: 400, body: "Client.Local: the database name is not a string"}}
+      end
+    end
+
+    test "a :precision that is no word is refused by name", %{conn: c} do
       assert Local.write(c, "m v=1", database: "utf8_iql", precision: %{}) ===
-               refused.("the precision is not a string")
+               {:error, %{status: 400, body: "Client.Local: the precision is not a string"}}
+    end
 
+    # Verified against Core: a byte that is not UTF-8 is written as U+FFFD in the reason.
+    test "a :precision that is not UTF-8 is the engine's 400, the bad byte replaced",
+         %{conn: c} do
+      assert {:error, %{status: 400, body: "serde error: unknown variant `a�b`, " <> _rest}} =
+               Local.write(c, "m v=1", database: "utf8_iql", precision: "a" <> @bad <> "b")
+    end
+
+    test "a :retention that is not UTF-8 is refused by name", %{conn: c} do
       assert Local.create_database(c, "x1", retention: @bad) ===
-               refused.("the retention is not valid UTF-8")
+               {:error, %{status: 400, body: "Client.Local: the retention is not valid UTF-8"}}
+    end
 
+    test ":permissions that are not a list are an invalid permission", %{conn: c} do
       assert Local.create_token(c, "t", permissions: 1) === {:error, {:invalid_permission, 1}}
     end
 

@@ -8,6 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The rest of the client never raises on what a caller passes**:
+  - `Client.HTTP`: options that are not a keyword list are
+    `{:error, {:invalid_options, opts}}`, a value a URL carries that is not text (a
+    database, a precision, an org, a name to delete) is `{:error, {:invalid_value, key,
+    value}}`, and a write body that is not iodata is `{:error, {:invalid_body, body}}`.
+  - The facade, `Write.Writer` and `add_connection/2` read options that are not a keyword
+    list without raising, and pass them to the client, which names them. `write/3` takes
+    iodata everywhere.
+  - `Local.query_sql_stream/3` refuses options that are not a keyword list (an improper
+    list raised; `[1]` ran).
+  - `Flight.Client.query/3`: a statement or database JSON cannot carry is
+    `{:unencodable_body, _}`, and a token that is not a string is `{:invalid_token, _}`.
+    A host that is not a host name is `{:invalid_host, _}`; a `"host:port"` is no longer
+    called IPv6. `bounded_connect/2` runs unlinked, so an exit or a throw in the connect is
+    `{:connect_failed, _}` too.
+  - `Local.start/1`: `databases: nil` is none listed, and options that are not a keyword
+    list raise its named `ArgumentError`.
+  - A precision that is not UTF-8 is written with U+FFFD in Local's 400, as Core writes it.
+- **`Client.Local` InfluxQL: every keyword glued to the next character, verified per keyword
+  against Core 3.10.1**:
+  - `GROUP BY"host"` and `GROUP BY*` answered rows; they are Core's 400s.
+  - `LIMIT`, `OFFSET`, `SLIMIT`, `SOFFSET`, `WHERE`, `ORDER BY`, `AS` and `SHOW … ON` against
+    any non-word character give Core's error at Core's position.
+  - `SELECT /v/FROM m` and `/v/AS x` are answered. `/v/*` was read as a comment.
+    `v::fieldFROM` gives Core's type error.
+  - `fill'(…)` and `ORDER'` raised `CaseClauseError`; they are answered.
+  - The glue character sets are defined once, in `InfluxQLText`.
+  - Conditions are scanned in linear time. A WHERE of 8,000 `AND`s takes 1.8 s, not 4 s;
+    4,000 nested parentheses take 0.09 s, not 0.7 s. This includes the SQL WHERE scan and
+    conjunct split.
 - **Every option that is not usable is a named error, never a raise**: `query_influxql` with
   a `:database` that is not a string raised `CaseClauseError` (a regression of the previous
   fix). Options that are not a keyword list, a `:precision` that is no word, a `:retention`

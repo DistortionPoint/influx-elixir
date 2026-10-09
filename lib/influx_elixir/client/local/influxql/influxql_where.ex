@@ -36,7 +36,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         # The engine binds the parameters (or says the first one has no value) as it plans,
         # with planning errors of its own before and after that are not verified.
         if Enum.any?(tokens, &match?({:param, _name}, &1)), do: throw({:refused, @param_refusal})
-        {tree, _rest} = parse_or(tokens)
+        {tree, _rest} = tokens |> nest() |> parse_or()
         InfluxQLTime.check_bare(tree)
         ctx = {tags, types}
         InfluxQLTyped.check_stack(tree, ctx)
@@ -97,7 +97,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   defp late_clash(where, body, true) do
     tokens = tokens_of(where)
-    {tree, _rest} = parse_or(tokens)
+    {tree, _rest} = tokens |> nest() |> parse_or()
     idents = for {:ident, name} <- tokens, into: MapSet.new(), do: name
 
     # The error of a comparison stands in for the plan, and with it the refusals the rest of
@@ -160,53 +160,67 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp done(rest, [single], _kind), do: {single, rest}
   defp done(rest, acc, kind), do: {{kind, Enum.reverse(acc)}, rest}
 
-  # A parenthesis opens a condition when it closes before an `AND`, an `OR`
-  # or the end and holds a comparison or connective; `(a + b) > 1` is an
-  # expression and stays a comparison.
-  defp parse_atom([{:raw, "("} | after_paren] = tokens) do
-    with {inside, [next | _more] = rest} <- split_group(after_paren, 1, []),
-         true <- boundary?(next) and condition?(inside) do
-      {node, []} = parse_or(inside)
-      {{:group, node}, rest}
-    else
-      {inside, []} -> if condition?(inside), do: group_to_end(inside), else: comparison(tokens)
-      _expression -> comparison(tokens)
+  # The tokens with every balanced pair of parentheses made one item, `{:nested, items,
+  # condition?}`, in one pass; `condition?` says whether an operator or a connective stands
+  # anywhere inside. A parenthesis that closes nothing, or is never closed, stays a token. The
+  # groups are then read without looking for their ends again: a condition nested to a depth
+  # of n would otherwise be scanned n times over.
+  @spec nest(list()) :: list()
+  defp nest(tokens), do: nest(tokens, [{[], false}])
+
+  # `frames` are the open groups, the innermost first, each with its items so far (latest
+  # first) and whether it holds a condition.
+  defp nest([], frames), do: close_all(frames)
+
+  defp nest([{:raw, "("} | rest], frames), do: nest(rest, [{[], false} | frames])
+
+  defp nest([{:raw, ")"} = token | rest], [{acc, cond?}]),
+    do: nest(rest, [{[token | acc], cond?}])
+
+  defp nest([{:raw, ")"} | rest], [{acc, cond?}, {outer, outer_cond?} | frames]) do
+    nest(rest, [{[{:nested, Enum.reverse(acc), cond?} | outer], outer_cond? or cond?} | frames])
+  end
+
+  defp nest([token | rest], [{acc, cond?} | frames]),
+    do: nest(rest, [{[token | acc], cond? or connective_token?(token)} | frames])
+
+  # What is left open stays tokens: the `(` and the items after it, in place.
+  defp close_all([{acc, _cond?}]), do: Enum.reverse(acc)
+
+  defp close_all([{acc, cond?}, {outer, outer_cond?} | frames]),
+    do: close_all([{acc ++ [{:raw, "("} | outer], outer_cond? or cond?} | frames])
+
+  defp connective_token?({:op, _op}), do: true
+  defp connective_token?({:raw, word}), do: String.upcase(word) in ["AND", "OR"]
+  defp connective_token?(_token), do: false
+
+  # A group opens a condition when it closes before an `AND`, an `OR` or the end and holds a
+  # comparison or connective; `(a + b) > 1` is an expression and stays a comparison.
+  defp parse_atom([{:nested, inside, condition?} | after_group] = items) do
+    case after_group do
+      [next | _more] when condition? ->
+        if boundary?(next), do: group(inside, after_group), else: comparison(items)
+
+      [] when condition? ->
+        group(inside, [])
+
+      _expression ->
+        comparison(items)
     end
   end
 
-  defp parse_atom(tokens), do: comparison(tokens)
+  defp parse_atom(items), do: comparison(items)
 
-  defp group_to_end(inside) do
+  defp group(inside, rest) do
     {node, []} = parse_or(inside)
-    {{:group, node}, []}
+    {{:group, node}, rest}
   end
-
-  # Tokens up to the closing parenthesis of the group just opened.
-  defp split_group([], _depth, _acc), do: :unbalanced
-
-  defp split_group([{:raw, ")"} | rest], 1, acc), do: {Enum.reverse(acc), rest}
-
-  defp split_group([{:raw, ")"} = token | rest], depth, acc),
-    do: split_group(rest, depth - 1, [token | acc])
-
-  defp split_group([{:raw, "("} = token | rest], depth, acc),
-    do: split_group(rest, depth + 1, [token | acc])
-
-  defp split_group([token | rest], depth, acc), do: split_group(rest, depth, [token | acc])
 
   defp boundary?({:raw, word}), do: String.upcase(word) in ["AND", "OR", ")"]
   defp boundary?(_token), do: false
 
-  defp condition?(tokens) do
-    Enum.any?(tokens, fn
-      {:op, _op} -> true
-      {:raw, word} -> String.upcase(word) in ["AND", "OR"]
-      _token -> false
-    end)
-  end
-
-  # Tokens up to the next `AND` or `OR` outside parentheses.
-  defp comparison(tokens), do: comparison(tokens, 0, [])
+  # Items up to the next `AND` or `OR` outside parentheses, as the tokens they are.
+  defp comparison(items), do: comparison(items, 0, [])
 
   defp comparison([], _depth, acc), do: {{:cmp, Enum.reverse(acc)}, []}
 
@@ -219,7 +233,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp comparison([{:raw, word} = token | rest], depth, acc),
     do: comparison(rest, depth_after(word, depth), [token | acc])
 
-  defp comparison([token | rest], depth, acc), do: comparison(rest, depth, [token | acc])
+  defp comparison([item | rest], depth, acc), do: comparison(rest, depth, flat(item, acc))
+
+  # An item as tokens, pushed on a reversed list.
+  defp flat({:nested, inside, _condition?}, acc),
+    do: [{:raw, ")"} | Enum.reduce(inside, [{:raw, "("} | acc], &flat/2)]
+
+  defp flat(token, acc), do: [token | acc]
 
   defp depth_after("(", depth), do: depth + 1
   defp depth_after(")", depth), do: max(depth - 1, 0)

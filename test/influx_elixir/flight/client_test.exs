@@ -91,6 +91,29 @@ defmodule InfluxElixir.Flight.ClientTest do
       end
     end
 
+    test "a host that is not a host name is an error that names it, before any connection" do
+      # A port belongs in `:port`: one colon is no IPv6 address.
+      for host <- ["localhost:8181", nil, ~c"localhost", "", 1] do
+        conn = %{host: host, port: 8181, token: "tok", database: "db"}
+        assert Client.query(conn, "SELECT 1", tls: false) === {:error, {:invalid_host, host}}
+      end
+    end
+
+    test "a token that is not a string is an error, before any connection" do
+      conn = %{host: "localhost", port: ClosedPort.port(), token: %{}, database: "db"}
+      assert Client.query(conn, "SELECT 1", tls: false) === {:error, {:invalid_token, %{}}}
+    end
+
+    test "a statement or a database JSON cannot carry is an error, before any connection" do
+      conn = %{host: "localhost", port: ClosedPort.port(), token: "tok", database: "db"}
+
+      assert {:error, {:unencodable_body, _message}} =
+               Client.query(conn, <<0xFF>>, tls: false)
+
+      assert {:error, {:unencodable_body, _message}} =
+               Client.query(%{conn | database: {1}}, "SELECT 1", tls: false)
+    end
+
     test "raises KeyError when database is missing" do
       conn = %{host: "localhost", token: "tok"}
 
@@ -148,9 +171,24 @@ defmodule InfluxElixir.Flight.ClientTest do
                Client.bounded_connect(fn -> {:ok, :channel} end, Await.bound())
     end
 
-    test "a raise inside the fn is an error tuple, not the caller's crash" do
-      assert {:error, {:connect_failed, "boom"}} =
-               Client.bounded_connect(fn -> raise "boom" end, Await.bound())
+    test "a raise, a throw or an exit inside the fn is an error tuple, not the caller's crash" do
+      for {fun, banner} <- [
+            {fn -> raise "boom" end, "** (RuntimeError) boom"},
+            {fn -> throw(:x) end, "** (throw) :x"},
+            {fn -> exit(:boom) end, "** (exit) :boom"},
+            {fn -> exit(:normal) end, "** (exit) normal"}
+          ] do
+        assert Client.bounded_connect(fun, Await.bound()) === {:error, {:connect_failed, banner}}
+      end
+    end
+
+    test "a caller that traps exits gets the same error tuple" do
+      Process.flag(:trap_exit, true)
+
+      assert Client.bounded_connect(fn -> exit(:boom) end, Await.bound()) ===
+               {:error, {:connect_failed, "** (exit) :boom"}}
+
+      refute_received {:EXIT, _pid, _reason}
     end
 
     test "propagates the fn's error tuple" do

@@ -550,7 +550,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     case {skip_literal(rest, quote, at + 1), state} do
       {{:ok, after_at, after_literal}, _state} -> unterminated(after_literal, after_at, :after)
       {:unterminated, :operand} -> {:unterminated_string, at}
-      {:unterminated, :after} -> nil
+      {:unterminated, _not_an_operand} -> nil
     end
   end
 
@@ -582,7 +582,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     do: unterminated(rest, at + 1, :operand)
 
   @spec after_word(binary(), atom()) :: :operand | :after | :order | :fill
-  defp after_word(word, _state) when word in ["limit", "offset", "slimit", "soffset"], do: :after
+  defp after_word(word, _state)
+       when word in ["limit", "offset", "slimit", "soffset", "asc", "desc"],
+       do: :after
+
   defp after_word("order", _state), do: :order
   defp after_word("by", :order), do: :after
   defp after_word("fill", _state), do: :fill

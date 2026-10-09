@@ -126,11 +126,14 @@ defmodule InfluxElixir.Client.HTTP do
   # ---------------------------------------------------------------------------
 
   @impl true
-  @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
+  @spec write(InfluxElixir.Client.connection(), iodata(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(connection, line_protocol, opts \\ []) do
-    with {:ok, database} <- resolve_database(opts, connection) do
-      precision = Keyword.get(opts, :precision, "nanosecond")
+    with :ok <- options(opts),
+         :ok <- iodata_body(line_protocol),
+         {:ok, database} <- resolve_database(opts, connection),
+         precision = Keyword.get(opts, :precision, "nanosecond"),
+         :ok <- url_values(database: database, precision: precision) do
       url = write_url(connection, database, precision) <> write_flags(connection, opts)
 
       headers =
@@ -199,10 +202,12 @@ defmodule InfluxElixir.Client.HTTP do
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_sql(connection, sql, opts \\ []) do
-    case Keyword.get(opts, :transport, :http) do
-      :flight -> flight_query_sql(connection, sql, opts)
-      :http -> http_query_sql(connection, sql, opts)
-      other -> {:error, {:unknown_transport, other}}
+    with :ok <- options(opts) do
+      case Keyword.get(opts, :transport, :http) do
+        :flight -> flight_query_sql(connection, sql, opts)
+        :http -> http_query_sql(connection, sql, opts)
+        other -> {:error, {:unknown_transport, other}}
+      end
     end
   end
 
@@ -308,7 +313,8 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: Enumerable.t()
   def query_sql_stream(connection, sql, opts \\ []) do
-    with {:ok, database} <- resolve_database(opts, connection),
+    with :ok <- options(opts),
+         {:ok, database} <- resolve_database(opts, connection),
          {:ok, body} <- sql_request_body(database, sql, opts, "jsonl") do
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
@@ -333,7 +339,8 @@ defmodule InfluxElixir.Client.HTTP do
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map() | [map()]} | {:error, term()}
   def execute_sql(connection, sql, opts \\ []) do
-    with {:ok, database} <- resolve_database(opts, connection),
+    with :ok <- options(opts),
+         {:ok, database} <- resolve_database(opts, connection),
          {:ok, body} <- sql_request_body(database, sql, opts, nil) do
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
@@ -361,6 +368,11 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(connection, influxql, opts \\ []) do
+    with :ok <- options(opts), do: influxql_request(connection, influxql, opts)
+  end
+
+  @spec influxql_request(keyword(), term(), keyword()) :: InfluxElixir.Client.query_result()
+  defp influxql_request(connection, influxql, opts) do
     database =
       case resolve_database(opts, connection) do
         {:ok, db} -> db
@@ -396,8 +408,14 @@ defmodule InfluxElixir.Client.HTTP do
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_flux(connection, flux, opts \\ []) do
-    org = Keyword.get(opts, :org, conn_val(connection, :org, ""))
+    with :ok <- options(opts),
+         org = Keyword.get(opts, :org, conn_val(connection, :org, "")),
+         :ok <- url_values(org: org),
+         do: flux_request(connection, flux, org, opts)
+  end
 
+  @spec flux_request(keyword(), term(), term(), keyword()) :: InfluxElixir.Client.query_result()
+  defp flux_request(connection, flux, org, opts) do
     # The `#datatype` annotation lets ResponseParser type each column
     # (double/long/boolean/RFC3339) instead of returning every cell as text.
     body_map = %{
@@ -427,6 +445,11 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: :ok | {:error, term()}
   def create_database(connection, name, opts \\ []) do
+    with :ok <- options(opts), do: create_database_request(connection, name, opts)
+  end
+
+  @spec create_database_request(keyword(), term(), keyword()) :: :ok | {:error, term()}
+  defp create_database_request(connection, name, opts) do
     body_map = %{"db" => name}
 
     body_map =
@@ -467,14 +490,12 @@ defmodule InfluxElixir.Client.HTTP do
   @spec delete_database(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_database(connection, name) do
-    url =
-      base_url(connection) <>
-        "/api/v3/configure/database?db=#{query_value(name)}"
-
+    url = base_url(connection) <> "/api/v3/configure/database?db="
     headers = auth_headers(connection)
 
-    with {:ok, _response} <-
-           request(:delete, url, headers, nil, connection, [], [200, 204]) do
+    with :ok <- url_values(name: name),
+         {:ok, _response} <-
+           request(:delete, url <> query_value(name), headers, nil, connection, [], [200, 204]) do
       :ok
     end
   end
@@ -490,6 +511,11 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: :ok | {:error, term()}
   def create_bucket(connection, name, opts \\ []) do
+    with :ok <- options(opts), do: create_bucket_request(connection, name, opts)
+  end
+
+  @spec create_bucket_request(keyword(), term(), keyword()) :: :ok | {:error, term()}
+  defp create_bucket_request(connection, name, opts) do
     retention = Keyword.get(opts, :retention, 0)
 
     with {:ok, org_id} <- resolve_org_id(connection, opts),
@@ -584,7 +610,8 @@ defmodule InfluxElixir.Client.HTTP do
   @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_bucket(connection, bucket) do
-    with {:ok, bucket_id} <- resolve_bucket_id(connection, bucket) do
+    with :ok <- url_values(bucket: bucket),
+         {:ok, bucket_id} <- resolve_bucket_id(connection, to_string(bucket)) do
       url = base_url(connection) <> "/api/v2/buckets/#{path_segment(bucket_id)}"
       headers = auth_headers(connection)
 
@@ -652,7 +679,8 @@ defmodule InfluxElixir.Client.HTTP do
   # The token endpoints are the ones InfluxDB 3 Core and Enterprise serve
   # (verified); `InfluxElixir.Admin.TokenRequest` builds the request.
   def create_token(connection, name, opts \\ []) do
-    with {:ok, {_kind, path, body}} <- TokenRequest.build(name, opts),
+    with :ok <- options(opts),
+         {:ok, {_kind, path, body}} <- TokenRequest.build(name, opts),
          {:ok, %Finch.Response{body: resp_body}} <-
            request(
              :post,
@@ -671,11 +699,12 @@ defmodule InfluxElixir.Client.HTTP do
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_token(connection, name) do
-    url = base_url(connection) <> "/api/v3/configure/token?token_name=#{query_value(name)}"
+    url = base_url(connection) <> "/api/v3/configure/token?token_name="
     headers = auth_headers(connection)
 
-    with {:ok, _response} <-
-           request(:delete, url, headers, nil, connection, [], [200, 204]) do
+    with :ok <- url_values(name: name),
+         {:ok, _response} <-
+           request(:delete, url <> query_value(name), headers, nil, connection, [], [200, 204]) do
       :ok
     end
   end
@@ -711,6 +740,41 @@ defmodule InfluxElixir.Client.HTTP do
   # bucket `a` (verified against InfluxDB 2.7).
   @spec query_value(term()) :: binary()
   defp query_value(value), do: value |> to_string() |> URI.encode_www_form()
+
+  # Options that are not a keyword list have nothing a request could be built from: the
+  # caller's error, never a raise.
+  @spec options(term()) :: :ok | {:error, {:invalid_options, term()}}
+  defp options(opts) do
+    if is_list(opts) and Keyword.keyword?(opts),
+      do: :ok,
+      else: {:error, {:invalid_options, opts}}
+  end
+
+  # A value written into a URL is text (an atom or a number is written as its text); a map,
+  # a tuple or a list has no form there: the caller's error, never a raise.
+  @spec url_values(keyword()) :: :ok | {:error, {:invalid_value, atom(), term()}}
+  defp url_values(values) do
+    case Enum.find(values, fn {_key, value} -> not url_text?(value) end) do
+      nil -> :ok
+      {key, value} -> {:error, {:invalid_value, key, value}}
+    end
+  end
+
+  defp url_text?(value), do: is_binary(value) or is_atom(value) or is_number(value)
+
+  # A write body is iodata (a binary, or a list of binaries and bytes): anything else has no
+  # bytes to send, the caller's error, never a raise.
+  @spec iodata_body(term()) :: :ok | {:error, {:invalid_body, term()}}
+  defp iodata_body(body) when is_binary(body), do: :ok
+
+  defp iodata_body(body) when is_list(body) do
+    _length = IO.iodata_length(body)
+    :ok
+  rescue
+    ArgumentError -> {:error, {:invalid_body, body}}
+  end
+
+  defp iodata_body(body), do: {:error, {:invalid_body, body}}
 
   # A path segment: everything but the unreserved characters is encoded.
   @spec path_segment(term()) :: binary()

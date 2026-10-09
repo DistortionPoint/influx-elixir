@@ -1,6 +1,7 @@
 defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   @moduledoc false
   import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
+  alias InfluxElixir.Client.Local.InfluxQLBlankRegex
   # The checks the engine's parser makes on the select list and `FROM`, each
   # reporting the position the engine reports (see
   # `InfluxElixir.Client.Local.InfluxQLError`).
@@ -14,7 +15,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   }
 
   @select_start ~q/^\s*SELECT(?![\w])\s*/i
-  @regex_column ~q/^\/(?:[^\/\\]|\\.)+\/(?:\s+AS\s+(?:"[^"]+"|\w+))?$/s
+  @regex_column ~q/^\/(?:[^\/\\]|\\.)+\/(?:\s*AS\s+(?:"[^"]+"|\w+))?$/s
 
   # An operator, what follows it up to the operand (signs and opening
   # parentheses) and the word the operand starts with.
@@ -83,7 +84,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
         # No `FROM`: the list is the rest of the statement, and the engine leaves it unparsed
         # where an item stops reading (an item followed by what is no part of it), else as late
         # as it can be, so that a literal left open in it is the error.
-        reserved_operand(rest, items_at, whole, :off) ||
+        InfluxQLCheck.leftmost([
+          bad_cast(rest, items_at, whole),
+          reserved_operand(rest, items_at, whole, :off)
+        ]) ||
           engine(none_key(masked, items_at), InfluxQLError.syntax_error_body(:nom, 0, whole))
     end
   end
@@ -130,7 +134,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   defp from_keyword(masked, items_at) do
     candidates =
       for [{at, length}] <-
-            Regex.scan(~q/(?:\s|(?<=[*)"']))FROM(?![\w])\s*/i, masked, return: :index),
+            Regex.scan(InfluxQLText.from_keyword_blanks(), masked, return: :index),
           at >= items_at,
           do: {at, length}
 
@@ -167,15 +171,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   # A binary operator at the end of `text`, with where its operand starts.
   @spec operator_before(binary()) :: {byte(), non_neg_integer()} | nil
   defp operator_before(text) do
-    # A regular expression for a column (`SELECT /re/ FROM`) ends in a slash too.
+    # A regular expression for a column (`SELECT /re/ FROM`) ends in a slash too, and one
+    # for an alias position is no division (`v AS/re/`): masked, they are operands.
+    masked = mask_regex_columns(text)
+
     with false <- text =~ ~q/(?:^|,)\s*\/(?:[^\/\\]|\\.)+\/\s*$/s,
          [_all, {at, 1}, {operand_at, 0}] <-
-           Regex.run(~q/([+\-*\/%&|^])\s*()(?:[+\-(]\s*)*$/, text, return: :index),
-         true <- binary_operator?(text, at) do
+           Regex.run(~q/([+\-*\/%&|^])\s*()(?:[+\-(]\s*)*$/, masked, return: :index),
+         true <- binary_operator?(masked, at) do
       {:binary.at(text, at), operand_at}
     else
       _no_operator -> nil
     end
+  end
+
+  # The regular expressions for columns (the first of an item, or the one after `AS`), as
+  # zeros byte for byte (an operand that is no name).
+  @spec mask_regex_columns(binary()) :: binary()
+  defp mask_regex_columns(text) do
+    Regex.replace(~q/(?:\A|,|\bAS)\s*\/((?:[^\/\\]|\\.)+)\//i, text, fn all, body ->
+      String.replace(all, "/" <> body <> "/", String.duplicate("0", byte_size(body) + 2))
+    end)
   end
 
   # An operator is binary when an operand stands before it.
@@ -311,8 +327,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
       index > 0 and unreadable_start?(text) ->
         engine(start, InfluxQLError.syntax_error_body(:nom, 0, whole))
 
-      kind = dangling_dot(text) ->
-        engine(start, dangling_dot_body(kind, index, start, whole))
+      hit = name_error(text, start, index, whole) ->
+        hit
 
       hit = reserved_operand(text, start, whole, eot) ->
         hit
@@ -325,6 +341,83 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
 
       true ->
         nil
+    end
+  end
+
+  # What the engine's parser stops at inside an item, before any other error of it: a regular
+  # expression for columns followed by anything but `AS`, an arithmetic operator or the end
+  # (`/re/ x`, `/re/(`, `/re/ = 1`) leaves the statement unparsed; a `::` with a type the
+  # engine does not know; a name with a dot and no name after it.
+  @regex_leftover ~q/\A\/(?:[^\/\\]|\\.)+\/\s*(?!AS(?![\w])|[+\-*\/%&|^]|\z)\S/is
+
+  @spec name_error(binary(), non_neg_integer(), non_neg_integer(), binary()) ::
+          InfluxQLCheck.positioned() | nil
+  defp name_error(text, start, index, whole) do
+    cond do
+      Regex.match?(@regex_leftover, text) ->
+        engine(start, InfluxQLError.syntax_error_body(:nom, 0, whole))
+
+      cast = bad_cast(text, start, whole) ->
+        cast
+
+      kind = dangling_dot(text) ->
+        engine(start, dangling_dot_body(kind, index, start, whole))
+
+      true ->
+        nil
+    end
+  end
+
+  # A `::` that names a type the engine does not know is its error at the end of the `::`
+  # (verified), whatever follows: a word glued to `FROM` (`v::fieldFROM m`, the word is
+  # `fieldFROM`), a number, a quote, nothing. The error is "invalid wildcard type specifier"
+  # after a `*` and "invalid data type" after a name. `FIELD` and `TAG` are read in any case,
+  # and so are the types of a name. A `::` after anything else (a call, a regular
+  # expression, a number, another type) is read as another failure: left to the other checks.
+  @field_types ~w(field tag)
+  @data_types ~w(float integer unsigned string boolean field tag)
+  @cast_name ~q/((?:[A-Za-z_]\w*|"_*")(?:\.(?:[A-Za-z_]\w*|"_*"))*)\z/
+  @cast_star ~q/(?:\A|[,(])\s*\*\z/
+
+  @spec bad_cast(binary(), non_neg_integer(), binary()) :: InfluxQLCheck.positioned() | nil
+  defp bad_cast(text, start, whole) do
+    masked = mask_regex_columns(text)
+
+    text
+    |> :binary.matches("::")
+    |> Enum.find_value(fn {at, 2} ->
+      before = binary_part(masked, 0, at)
+      after_cast = binary_part(text, at + 2, byte_size(text) - at - 2)
+      word = Regex.run(~q/\A\s*([A-Za-z_]\w*)/, after_cast, capture: :all_but_first)
+
+      with kind when kind != nil <- cast_kind(before),
+           true <- not valid_type?(kind, word) do
+        kind_error = if kind == :star, do: :wildcard_type, else: :data_type
+        engine(start + at + 2, InfluxQLError.syntax_error_body(kind_error, start + at + 2, whole))
+      else
+        _no_error -> nil
+      end
+    end)
+  end
+
+  defp valid_type?(:star, [word]), do: String.downcase(word) in @field_types
+  defp valid_type?(:name, [word]), do: String.downcase(word) in @data_types
+  defp valid_type?(_kind, nil), do: false
+
+  # What stands directly before a `::` (a blank between leaves the statement unparsed, verified
+  # for `v ::tag`): a wildcard, a name that starts an item or an operand, or
+  # something else (`nil`).
+  @spec cast_kind(binary()) :: :star | :name | nil
+  defp cast_kind(before) do
+    # A match of the star comes first: `true` in the `else` is that one.
+    with false <- Regex.match?(@cast_star, before),
+         [_all, {name_at, _size}] <- Regex.run(@cast_name, before, return: :index),
+         prefix = before |> binary_part(0, name_at) |> InfluxQLLex.trim_trailing_blanks(),
+         true <- Regex.match?(~q/(?:\A|[,(+\-*\/%&|^])\z/, prefix) do
+      :name
+    else
+      true -> :star
+      _other -> nil
     end
   end
 
@@ -451,12 +544,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
 
   @spec operator_hit(binary(), non_neg_integer(), binary()) :: {non_neg_integer(), binary()} | nil
   defp operator_hit(text, start, whole) do
+    masked = mask_regex_columns(text)
+
     @operand
-    |> Regex.scan(text, return: :index)
+    |> Regex.scan(masked, return: :index)
     |> Enum.find_value(fn [_all, {operator_at, 1}, {operand_at, 0}, {word_at, _length}] ->
       <<_skip::binary-size(word_at), word_and_rest::binary>> = text
 
-      if binary_operator?(text, operator_at) and
+      if binary_operator?(masked, operator_at) and
            InfluxQLText.reserved_start(word_and_rest, plain: true) != nil do
         operator = :binary.at(text, operator_at)
         {start + operand_at, operator_body(operator, start + operand_at, whole)}
@@ -541,11 +636,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     end)
   end
 
+  @bad_alias_start Regex.compile!(
+                     InfluxQLBlankRegex.blank_pattern(
+                       "\\s(AS)(?![\\w])\\s*(?=[\\d'." <>
+                         InfluxQLText.operator_glue_chars() <> "])"
+                     ),
+                     "i"
+                   )
+
   # The end of `AS` when the alias after it is reserved.
   @spec reserved_alias(binary(), non_neg_integer()) :: non_neg_integer() | nil
   defp reserved_alias(text, start) do
-    # An alias is an identifier or a quoted one: a number, a quote or a sign is not (verified).
-    case Regex.run(~q/\s(AS)(?![\w])\s*(?=[\d'.+-])/i, text, return: :index) do
+    # An alias is an identifier or a quoted one: a number, a single quote, a dot or a character of
+    # an operator or a parenthesis (`AS /re/`, `AS*x`, `AS(x`) is not (verified).
+    case Regex.run(@bad_alias_start, text, return: :index) do
       [_all, {as_at, as_length}] -> start + as_at + as_length
       nil -> reserved_word_alias(text, start)
     end

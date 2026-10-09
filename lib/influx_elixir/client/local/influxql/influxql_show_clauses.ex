@@ -23,12 +23,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowClauses do
   def clause(:offset, ctx, pos, spec), do: count(ctx, pos, "offset", :offset, spec)
   def clause(:with_key, ctx, pos, spec), do: with_key(ctx, pos, spec)
 
-  # `ON db`: past `ON` the engine wants a blank and a name; without them it is
-  # its error at the end of `ON`.
+  # `ON db`: past `ON` the engine wants a blank and a name; against a character of an operator or
+  # a parenthesis (`ON*`) it is its error at the end of `ON`, against any other character the word
+  # is not read and the clause is not there (`ON'db'`, `ON$db`; `Text.keyword_end?/2`).
   defp on(ctx, pos, spec) do
     with {:ok, at} <- Text.keyword(ctx, pos, "on"),
          to = at + 2,
-         true <- Text.at_byte(ctx, to) not in ["\"", "."] || :none do
+         true <- Text.keyword_end?(ctx, to) || :none do
       case Text.ws?(ctx, to) and Text.name_at(ctx, Text.skip_ws(ctx, to)) do
         {:ok, name, after_name} -> {:ok, %{spec | on: name}, after_name}
         {:error, _reason} = error -> error

@@ -137,6 +137,16 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       assert {:ok, config} = Connection.get(name)
       assert_local_config(config)
     end
+
+    test "options that are not a keyword list are an error, and nothing starts" do
+      name = unique_name()
+
+      for opts <- [nil, :x, [1]] do
+        assert InfluxElixir.add_connection(name, opts) === {:error, {:invalid_options, opts}}
+      end
+
+      assert {:error, :not_found} = Connection.get(name)
+    end
   end
 
   describe "remove_connection — registry cleanup" do

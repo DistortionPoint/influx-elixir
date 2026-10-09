@@ -464,8 +464,13 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   end
 
   @spec conjuncts(tree()) :: [tree()]
-  defp conjuncts({:and, left, right}), do: conjuncts(left) ++ conjuncts(right)
-  defp conjuncts(other), do: [other]
+  defp conjuncts(tree), do: conjuncts(tree, [])
+
+  # With the conjuncts after the tree as the accumulator: a tree that nests to the left (the
+  # shape of `a AND b AND c ...`) would copy its left side again at each level with `++`.
+  @spec conjuncts(tree(), [tree()]) :: [tree()]
+  defp conjuncts({:and, left, right}, acc), do: conjuncts(left, conjuncts(right, acc))
+  defp conjuncts(other, acc), do: [other | acc]
 
   # What a NULL conjunct leaves of the others: a constant (folded, so it
   # fails whatever else is there), and a comparison of `time`, which the scan

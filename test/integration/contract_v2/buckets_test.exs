@@ -33,7 +33,7 @@ defmodule InfluxElixir.Integration.ContractV2.BucketsTest do
       :ok = HTTP.create_bucket(ctx.conn, name, [])
 
       {:ok, listed} = HTTP.list_buckets(ctx.conn)
-      refute Enum.any?(listed, &(&1["id"] == other["id"]))
+      refute Enum.any?(listed, &(&1["id"] === other["id"]))
 
       assert :ok = HTTP.delete_bucket(ctx.conn, name)
       assert %{"name" => ^name} = api(ctx.conn, :get, "/api/v2/buckets/#{other["id"]}", nil)

@@ -35,14 +35,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     [
       {~q/\bINTO\b/i, "INTO"},
       {~q/\bFROM\s*\(/i, "subqueries"},
-      {~q/(?<![A-Za-z_\d])\d+(?:\.\d+)?FROM(?![\w])/i, "a number directly against FROM"}
+      {~q/(?<![A-Za-z_\d])\d+(?:\.\d+)?FROM(?![\w])/i, "a number directly against FROM"},
+      {~q/(?<![A-Za-z_\d])\d+(?:\.\d+)?AS(?![\w])/i, "a number directly against AS"}
     ]
   end
 
   @source ~S{"(?:[^"\\]|\\.)+"|/(?:[^/\\]|\\.)+/|[A-Za-z_][\w\-]*}
   @select Regex.compile!(
             InfluxElixir.Client.Local.InfluxQLBlankRegex.blank_pattern(
-              "^\\s*SELECT(?:\\s+|(?=[*(]))(?<items>.+?)(?:\\s+|(?<=[*)\"']))FROM(?:\\s+|(?=/))" <>
+              "^\\s*SELECT(?:\\s+|(?=[*(]))(?<items>.+?)(?:\\s+|(?<=#{InfluxQLText.item_end_class()}))FROM(?:\\s+|(?=/))" <>
                 "(?<from>(?:#{@source})(?:\\s*,\\s*(?:#{@source}))*)(?<rest>.*)$"
             ),
             "is"
@@ -196,11 +197,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
      unclosed}
   end
 
-  # The slash that closes `=~ /re/` is not the start of a comment.
+  # The slash that closes `=~ /re/` or a regular expression for columns (`SELECT /re/*`) is not
+  # the start of a comment.
   @spec regex_closing?({non_neg_integer(), non_neg_integer()}, binary()) :: boolean()
   defp regex_closing?({at, _size}, masked) when at > 0 do
     binary_part(masked, at, 2) == "/*" and
-      binary_part(masked, 0, at) =~ ~q/[=!]~\s*\/_*$/
+      (binary_part(masked, 0, at) =~ ~q/[=!]~\s*\/_*$/ or
+         binary_part(masked, 0, at) =~ ~q/(?:\bSELECT\s+|,\s*|\(\s*)\/(?:[^\/\\]|\\.)*\z/i)
   end
 
   defp regex_closing?(_comment, _masked), do: false
@@ -248,7 +251,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   @spec lexer_in_list(InfluxQLCheck.lexer() | nil, binary()) :: InfluxQLCheck.lexer() | nil
   defp lexer_in_list({:lexer, start, _error} = lexer, masked_head) do
     list_end =
-      case Regex.run(~q/(?:\s|(?<=[*)"']))FROM(?![\w])/i, masked_head, return: :index) do
+      case Regex.run(InfluxQLText.from_keyword(), masked_head, return: :index) do
         [{from, _size}] -> from
         nil -> byte_size(masked_head)
       end
@@ -453,7 +456,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   end
 
   defp parse_item("/" <> _rest = text) do
-    case Regex.run(~q/^\/((?:[^\/\\]|\\.)+)\/(?:\s+AS\s+(?:"[^"]+"|\w+))?$/is, text) do
+    case Regex.run(~q/^\/((?:[^\/\\]|\\.)+)\/(?:\s*AS\s+(?:"[^"]+"|\w+))?$/is, text) do
       [_all, source] -> {:ok, {:wild_column, {:regex, String.replace(source, "\\/", "/")}}}
       nil -> unsupported_item(text, "a regular expression column in that shape")
     end

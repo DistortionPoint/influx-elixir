@@ -110,9 +110,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
 
   # A comment never closed is the lexer's error at once. A string, quoted name or regular
   # expression never closed is not: the parser meets it only where it reads a token there
-  # (`InfluxQLShowText.lexer_error/2`), and anywhere else the clause fails at the quote.
-  # A comment never closed is the lexer's error at once. A string, quoted name or regular
-  # expression never closed is not: the parser meets it only where it reads a token there
   # (`InfluxQLShowText.lexer_error/2`); anywhere else the clause fails at the quote.
   @spec scanned_error(map(), ctx()) :: :ok | {:error, {:engine, binary()}}
   defp scanned_error(%{unclosed: at}, ctx) when is_integer(at),

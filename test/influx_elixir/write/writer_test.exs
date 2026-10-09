@@ -10,6 +10,34 @@ defmodule InfluxElixir.Write.WriterTest do
     {:ok, conn: conn}
   end
 
+  describe "write/3 — bodies and options it cannot read" do
+    test "iodata is the text it stands for, gzipped or not", %{conn: conn} do
+      assert Writer.write(conn, ["cpu value=", ["1.0", ?\s], "1"], database: "w") ===
+               {:ok, :written}
+
+      assert Writer.write(conn, ["cpu value=2.0 2"], database: "w", gzip: true) ===
+               {:ok, :written}
+
+      assert {:ok, [_one, _two]} = Local.query_sql(conn, "SELECT * FROM cpu", database: "w")
+    end
+
+    test "a body that is not iodata is the client's answer, never a raise", %{conn: conn} do
+      for body <- [5, %{}, [:a], nil] do
+        assert Writer.write(conn, body, database: "w") ===
+                 {:error, %{status: 400, body: "Client.Local: the line protocol is not a string"}}
+      end
+    end
+
+    test "options that are not a keyword list are the client's answer, never a raise",
+         %{conn: conn} do
+      for opts <- [nil, :x, [1]] do
+        assert Writer.write(conn, "cpu value=1.0 1", opts) ===
+                 {:error,
+                  %{status: 400, body: "Client.Local: the options are not a keyword list"}}
+      end
+    end
+  end
+
   describe "write/3" do
     test "writes line protocol through the configured client", %{conn: conn} do
       assert {:ok, :written} = Writer.write(conn, "cpu value=1.0 1", database: "w")
