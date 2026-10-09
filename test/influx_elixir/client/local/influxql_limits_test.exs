@@ -122,5 +122,32 @@ defmodule InfluxElixir.Client.Local.InfluxQLLimitsTest do
       assert {:ok, rows} = capped(conn, "SELECT v FROM nine WHERE " <> calls <> " > 0")
       assert length(rows) === 9
     end
+
+    # Core answers `abs(...abs(v)...) = 5` with the point whose `v` is 5 at the depths 1, 3, 10 and
+    # 50 (verified), so it does at any depth: the calls are read in one pass, not once for each
+    # call they hold (3.7 s at 500 deep, killed by the cap at 1,000).
+    test "a call nested eight thousand deep is answered", %{conn: conn} do
+      for depth <- [500, 1_000, 4_000, 8_000] do
+        nested = Enum.reduce(1..depth, "v", fn _level, inner -> "abs(" <> inner <> ")" end)
+        assert {:ok, rows} = capped(conn, "SELECT v FROM nine WHERE " <> nested <> " = 5")
+        assert Enum.map(rows, &{&1["v"], DateTime.to_unix(&1["time"])}) === [{5, 5}]
+      end
+    end
+
+    # Core answers `(ok = (ok = ... (v > 1)))` with the two points whose `ok` is false at the even
+    # depths and with none at the odd ones (verified at 1 to 8, 40 and 41): each group is read
+    # once, and not again for each group around it (19 s at 6,000 deep, killed at 12,000).
+    test "groups that alternate with a comparison are answered at any depth", %{conn: conn} do
+      for depth <- [1_500, 3_000, 6_000] do
+        nested = fn depth ->
+          Enum.reduce(1..depth, "(v > 1)", fn _level, inner -> "(ok = " <> inner <> ")" end)
+        end
+
+        assert {:ok, rows} = capped(conn, "SELECT v FROM flag WHERE " <> nested.(depth))
+        assert Enum.map(rows, &{&1["v"], DateTime.to_unix(&1["time"])}) === [{2, 2}, {3, 3}]
+
+        assert {:ok, []} === capped(conn, "SELECT v FROM flag WHERE " <> nested.(depth + 1))
+      end
+    end
   end
 end

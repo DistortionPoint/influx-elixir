@@ -25,6 +25,27 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   def time?(_token), do: false
 
   @doc """
+  Whether a comparison has the bare `time` on one side: `time op x` or `x op time`, the forms
+  the planner splits the time out of the condition by (verified: `time > 0`, `time > now()`,
+  `1 < time`, `time > 1h` and `time != 0` are split, where `time * 2 > 1`, `n * time = 1`,
+  `time + 1h > 0`, `-time > 0` and `(time) > 0` are planned as they are typed).
+  """
+  @spec time_comparison?(list()) :: boolean()
+  def time_comparison?([first, {:op, _op} | comparand] = tokens) when comparand != [],
+    do: time?(first) or time_last?(tokens)
+
+  def time_comparison?(tokens), do: time_last?(tokens)
+
+  defp time_last?(tokens) when length(tokens) > 2 do
+    case Enum.take(tokens, -2) do
+      [{:op, _op}, last] -> time?(last)
+      _other -> false
+    end
+  end
+
+  defp time_last?(_tokens), do: false
+
+  @doc """
   The tokens inside the layers of parentheses that wrap all of them (`((a))` is `a`), and how
   many layers there were; `{tokens, 0}` for tokens that are not one group (`(a) AND (b)`,
   `(a) + 1`, an unbalanced list). One pass finds the layers, whatever their depth: the leading

@@ -201,7 +201,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
       ?) -> {:ok, at + 1}
       ?, -> next_argument(text, at, mode)
       nil -> {:fail, :eot}
-      _leftover -> leftover(text, at)
+      _leftover -> leftover(text, at, mode)
     end
   end
 
@@ -219,10 +219,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   end
 
   # What stands after an operand where `,`, `)` or an operator should: the parser fails there.
-  defp leftover(text, at) do
+  # In a condition so does a `(` (`abs(1 (2))`, `abs(1h (2))`, `abs(true (2))`: verified); a name
+  # before it is a call, which `primary/5` has read.
+  defp leftover(text, at, mode) do
     <<_before::binary-size(at), rest::binary>> = text
 
-    if Regex.match?(@stops, rest), do: {:fail, at}, else: :unknown
+    if Regex.match?(@stops, rest) or (mode == :where and String.starts_with?(rest, "(")),
+      do: {:fail, at},
+      else: :unknown
   end
 
   # An operand, then the binary operators and their operands.
@@ -404,9 +408,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
 
       _no_type ->
         at = InfluxQLLex.skip_blanks(text, stop)
-        if char(text, at) == ?(, do: call(text, at, mode), else: {:ok, stop}
+
+        if char(text, at) == ?( and not boolean_word?(text, name_at, stop, mode),
+          do: call(text, at, mode),
+          else: {:ok, stop}
     end
   end
+
+  # `true` and `false` name no call in a condition: the `(` behind one is left over (verified:
+  # `abs(true (1))` fails at the parenthesis).
+  defp boolean_word?(text, name_at, stop, mode),
+    do:
+      mode == :where and
+        String.downcase(binary_part(text, name_at, stop - name_at)) in ["true", "false"]
 
   # The names after a `.` (blanks may stand after the dot: `m. f` is `m.f`, verified): a dot
   # with no name after it is no operand, a name read to its end is an operand (a call or a type

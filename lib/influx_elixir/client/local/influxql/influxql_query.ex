@@ -1128,11 +1128,28 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp answer_checks(points, []), do: points
 
   defp answer_checks(points, checks) do
+    refuse_zero_divisions(points, checks)
+
     Enum.map(points, fn %{fields: fields} = point ->
       answers =
         for {column, check} <- checks, into: %{}, do: {column, InfluxQL.holds?(check, fields)}
 
       %{point | fields: Map.merge(fields, answers)}
+    end)
+  end
+
+  # An unsigned division by zero that fails the engine's stream (over three points or more, at a
+  # point that is not the last) is refused by name.
+  @spec refuse_zero_divisions([LineProtocolParser.point()], [{binary(), InfluxQL.check()}]) ::
+          :ok
+  defp refuse_zero_divisions(points, _checks) when length(points) < 3, do: :ok
+
+  defp refuse_zero_divisions(points, checks) do
+    points
+    |> Enum.drop(-1)
+    |> Enum.each(fn %{fields: fields} ->
+      if Enum.any?(checks, fn {_column, check} -> InfluxQL.zero_division?(check, fields) end),
+        do: throw({:refused, "unsupported InfluxQL (an unsigned division by zero)"})
     end)
   end
 
@@ -1158,6 +1175,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # no comparison error of the engine carries the wrapper).
   @planner_errors [
     "Error during planning: Cannot coerce arith",
+    "Error during planning: Cannot get result type for temporal operation",
     "Error during planning: Cannot infer common argument type for comparison operation"
   ]
 

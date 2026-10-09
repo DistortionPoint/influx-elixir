@@ -4,10 +4,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   # comparisons, each comparison as SQL for the caller's engine, and the lower
   # bounds its `time` comparisons give.
 
+  import Bitwise, only: [|||: 2]
+
   alias InfluxElixir.Client.Local.{
     InfluxQL,
     InfluxQLArithmetic,
+    InfluxQLCalls,
     InfluxQLError,
+    InfluxQLExpr,
     InfluxQLNested,
     InfluxQLSql,
     InfluxQLTime,
@@ -21,6 +25,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   require SQLLimits
 
   @param_refusal "unsupported InfluxQL (a bind parameter in a condition)"
+
+  # What a group holds that the tokens of a comparison are read for (see `nest/2`).
+  @time 1
+  @duration 2
+  @absent 4
+  @call 8
 
   @doc "Plans a `WHERE`; see `InfluxElixir.Client.Local.InfluxQL.where_plan/3`. The option `:extend_lower` reads the lower bounds that much earlier in the SQL."
   @spec where_plan(
@@ -37,9 +47,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         # The engine binds the parameters (or says the first one has no value) as it plans,
         # with planning errors of its own before and after that are not verified.
         if Enum.any?(tokens, &match?({:param, _name}, &1)), do: throw({:refused, @param_refusal})
-        {tree, _rest} = tokens |> nest() |> parse_or()
-        InfluxQLTime.check_bare(tree)
         ctx = {tags, types}
+        {tree, _rest} = tokens |> nest(ctx) |> parse_or()
+        InfluxQLTime.check_bare(tree)
         now = Keyword.get_lazy(opts, :now, fn -> System.os_time(:nanosecond) end)
 
         times = %{
@@ -48,7 +58,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
           known: Keyword.get(opts, :known),
           alone: true,
           timed: InfluxQLTime.mentions_time_comparison?(tree),
-          first: true
+          first: true,
+          bare: false
         }
 
         # The planner reads the times of the condition before it types the rest: a time it
@@ -59,7 +70,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         # The planner raises the error of a comparison, and that of a connective it cannot type,
         # as it builds the filter, leaves first and in order: each comparison of a condition with
         # a bare operand is planned as the connectives are typed.
-        leaf = &plan_comparisons(&1, ctx, %{times | alone: false}, &2)
+        leaf = &plan_comparisons(&1, ctx, %{times | alone: false, bare: true}, &2)
 
         {deferred, {sql, bounds, checks}} =
           case InfluxQLTyped.bare_condition(tree, ctx, Keyword.get(opts, :filter), leaf) do
@@ -97,7 +108,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     # nothing, and the caller raises the error in its turn (verified: `count(f), g ... WHERE
     # b <= u` is the mixing of aggregate and non-aggregate columns, not the comparison).
     {:deferred, body} ->
-      late_clash(where, body, Keyword.get(opts, :late_clash, false))
+      late_clash(where, {tags, types}, body, Keyword.get(opts, :late_clash, false))
+
+    # The error of a division, which waits for the comparisons around it (see `join_plans/4`).
+    {:late, body} ->
+      {:error, {:engine, 400, body}}
   end
 
   defp check_times({:group, node}, tags, times), do: check_times(node, tags, times)
@@ -106,7 +121,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     do: Enum.each(nodes, &check_times(&1, tags, times))
 
   defp check_times({:cmp, tokens}, tags, times) do
-    if Enum.any?(tokens, &InfluxQLTokens.time?/1), do: engine_time_error(tokens, tags, times)
+    if Enum.any?(tokens, &InfluxQLTokens.time?/1),
+      do: engine_time_error(expand(tokens), tags, times)
+
     :ok
   end
 
@@ -122,11 +139,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     {:refused, _message} -> :ok
   end
 
-  defp late_clash(_where, body, false), do: {:error, {:engine, body}}
+  defp late_clash(_where, _ctx, body, false), do: {:error, {:engine, body}}
 
-  defp late_clash(where, body, true) do
+  defp late_clash(where, ctx, body, true) do
     tokens = tokens_of(where)
-    {tree, _rest} = tokens |> nest() |> parse_or()
+    {tree, _rest} = tokens |> nest(ctx) |> parse_or()
     idents = for {:ident, name} <- tokens, into: MapSet.new(), do: name
 
     # The error of a comparison stands in for the plan, and with it the refusals the rest of
@@ -190,34 +207,60 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp done(rest, acc, kind), do: {{kind, Enum.reverse(acc)}, rest}
 
   # The tokens with every balanced pair of parentheses made one item, `{:nested, items,
-  # condition?}`, in one pass; `condition?` says whether an operator or a connective stands
-  # anywhere inside. A parenthesis that closes nothing, or is never closed, stays a token. The
-  # groups are then read without looking for their ends again: a condition nested to a depth
-  # of n would otherwise be scanned n times over.
-  @spec nest(list()) :: list()
-  defp nest(tokens), do: nest(tokens, [{[], false}])
+  # condition?, facts}`, in one pass; `condition?` says whether an operator or a connective
+  # stands anywhere inside, `facts` what the group holds that the planner reads in the tokens of
+  # a comparison (a time, a duration, a column the measurement lacks, a call: bits). A
+  # parenthesis that closes nothing, or is never closed, stays a token. The groups are then read
+  # without looking for their ends again: a condition nested to a depth of n would otherwise be
+  # scanned n times over.
+  @spec nest(list(), {MapSet.t(binary()), map()}) :: list()
+  defp nest(tokens, ctx), do: nest(tokens, ctx, [{[], false, 0}])
 
   # `frames` are the open groups, the innermost first, each with its items so far (latest
-  # first) and whether it holds a condition.
-  defp nest([], frames), do: close_all(frames)
+  # first), whether it holds a condition and its facts.
+  defp nest([], _ctx, frames), do: close_all(frames)
 
-  defp nest([{:raw, "("} | rest], frames), do: nest(rest, [{[], false} | frames])
+  defp nest([{:raw, "("} | rest], ctx, frames), do: nest(rest, ctx, [{[], false, 0} | frames])
 
-  defp nest([{:raw, ")"} = token | rest], [{acc, cond?}]),
-    do: nest(rest, [{[token | acc], cond?}])
+  defp nest([{:raw, ")"} = token | rest], ctx, [{acc, cond?, facts}]),
+    do: nest(rest, ctx, [{[token | acc], cond?, facts}])
 
-  defp nest([{:raw, ")"} | rest], [{acc, cond?}, {outer, outer_cond?} | frames]) do
-    nest(rest, [{[{:nested, Enum.reverse(acc), cond?} | outer], outer_cond? or cond?} | frames])
+  defp nest(
+         [{:raw, ")"} | rest],
+         ctx,
+         [{acc, cond?, facts}, {outer, outer_cond?, outer_facts} | frames]
+       ) do
+    item = {:nested, Enum.reverse(acc), cond?, facts}
+    nest(rest, ctx, [{[item | outer], outer_cond? or cond?, outer_facts ||| facts} | frames])
   end
 
-  defp nest([token | rest], [{acc, cond?} | frames]),
-    do: nest(rest, [{[token | acc], cond? or connective_token?(token)} | frames])
+  defp nest([token | rest], ctx, [{acc, cond?, facts} | frames]) do
+    facts = facts ||| token_facts(token, rest, ctx)
+    nest(rest, ctx, [{[token | acc], cond? or connective_token?(token), facts} | frames])
+  end
 
   # What is left open stays tokens: the `(` and the items after it, in place.
-  defp close_all([{acc, _cond?}]), do: Enum.reverse(acc)
+  defp close_all([{acc, _cond?, _facts}]), do: Enum.reverse(acc)
 
-  defp close_all([{acc, cond?}, {outer, outer_cond?} | frames]),
-    do: close_all([{acc ++ [{:raw, "("} | outer], outer_cond? or cond?} | frames])
+  defp close_all([{acc, cond?, facts}, {outer, outer_cond?, outer_facts} | frames]),
+    do:
+      close_all([
+        {acc ++ [{:raw, "("} | outer], outer_cond? or cond?, outer_facts ||| facts} | frames
+      ])
+
+  # The time, `now()`, a duration, a column the measurement lacks, a call.
+  defp token_facts({:ident, name} = token, rest, {tags, types}) do
+    cond do
+      match?([{:raw, "("} | _more], rest) -> @call
+      InfluxQLTokens.time?(token) -> @time
+      InfluxQLExpr.absent?(name, types, tags) -> @absent
+      true -> 0
+    end
+  end
+
+  defp token_facts({:duration, _total, _text}, _rest, _ctx), do: @duration
+  defp token_facts({:raw, "now()"}, _rest, _ctx), do: @time
+  defp token_facts(_token, _rest, _ctx), do: 0
 
   defp connective_token?({:op, _op}), do: true
   defp connective_token?({:raw, word}), do: String.upcase(word) in ["AND", "OR"]
@@ -225,7 +268,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   # A group opens a condition when it closes before an `AND`, an `OR` or the end and holds a
   # comparison or connective; `(a + b) > 1` is an expression and stays a comparison.
-  defp parse_atom([{:nested, inside, condition?} | after_group] = items) do
+  defp parse_atom([{:nested, inside, condition?, _facts} | after_group] = items) do
     case after_group do
       [next | _more] when condition? ->
         if boundary?(next), do: group(inside, after_group), else: comparison(items)
@@ -262,13 +305,30 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp comparison([{:raw, word} = token | rest], depth, acc),
     do: comparison(rest, depth_after(word, depth), [token | acc])
 
+  # A condition in parentheses that holds nothing the comparison's own tokens are read for (no
+  # time, duration, call or column the measurement lacks in it) is read here, once, and the
+  # comparison holds its tree as one token: a condition nested n deep would be flattened to
+  # tokens and read again at each of its n levels otherwise.
+  defp comparison([{:nested, inside, true, 0} = item | rest], depth, acc) do
+    {node, []} = parse_or(inside)
+    comparison(rest, depth, [{:cond_group, node, item} | acc])
+  end
+
   defp comparison([item | rest], depth, acc), do: comparison(rest, depth, flat(item, acc))
 
   # An item as tokens, pushed on a reversed list.
-  defp flat({:nested, inside, _condition?}, acc),
+  defp flat({:nested, inside, _condition?, _facts}, acc),
     do: [{:raw, ")"} | Enum.reduce(inside, [{:raw, "("} | acc], &flat/2)]
 
+  defp flat({:cond_group, _node, item}, acc), do: flat(item, acc)
   defp flat(token, acc), do: [token | acc]
+
+  # The tokens of a comparison with the groups it holds as trees written out again.
+  defp expand(tokens) do
+    if Enum.any?(tokens, &match?({:cond_group, _node, _item}, &1)),
+      do: tokens |> Enum.reduce([], &flat/2) |> Enum.reverse(),
+      else: tokens
+  end
 
   defp depth_after("(", depth), do: depth + 1
   defp depth_after(")", depth), do: max(depth - 1, 0)
@@ -283,7 +343,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
            known: MapSet.t(binary()) | nil,
            alone: boolean(),
            timed: boolean(),
-           first: boolean()
+           first: boolean(),
+           bare: boolean()
          }
 
   @spec plan(tuple(), {MapSet.t(binary()), map()}, times()) ::
@@ -299,7 +360,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     # recurse: a statement nested n deep would hold n copies of them otherwise.)
     case InfluxQLNested.classify(tokens, ctx, %{timed: times.timed and not times.first}) do
       :unplaced ->
-        plan_flat(tokens, ctx, times, time?)
+        plan_flat(expand(tokens), ctx, times, time?)
 
       classification ->
         {sql, checks} = nested_sql(classification, ctx, times)
@@ -367,16 +428,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
           {binary(), list()}
   defp operand_sql(false, _ctx, _times), do: {InfluxQLSql.never(), []}
 
-  defp operand_sql({:group, tokens}, ctx, times) do
-    {tree, _rest} = tokens |> nest() |> parse_or()
+  defp operand_sql({:node, tree}, ctx, times) do
     {sql, _lowers, checks} = plan(tree, ctx, %{times | alone: false})
     {"(" <> sql <> ")", checks}
   end
 
+  defp operand_sql({:group, tokens}, ctx, times) do
+    {tree, _rest} = tokens |> nest(ctx) |> parse_or()
+    operand_sql({:node, tree}, ctx, times)
+  end
+
   defp plan_flat(tokens, {tags, types} = ctx, times, time?) do
-    check_coercion(tokens, tags, types)
+    check_coercion(tokens, tags, types, times.alone)
 
     if time? do
+      # (The SQL of the time raises its own error when it is run, which a pair with a bare
+      # operand, put to false, would never run.)
+      if times.bare and not InfluxQLTokens.time_comparison?(tokens),
+        do: InfluxQLError.refuse("a time in arithmetic beside a bare operand")
+
       {sql, lowers} = time_plan(InfluxQLNested.group_last(tokens), tags, times)
       {sql, lowers, []}
     else
@@ -402,14 +472,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp absent_column?(_tokens, nil), do: false
 
   # (The name of a call is no column.)
-  defp absent_column?(tokens, known),
-    do: InfluxQLTokens.lacking(tokens, &MapSet.member?(known, &1)) != []
+  defp absent_column?(tokens, known) do
+    present? = fn name -> InfluxQLTokens.time?({:ident, name}) or MapSet.member?(known, name) end
+    InfluxQLTokens.lacking(tokens, present?) != []
+  end
 
   # The calls of a comparison are `abs()` of a number, or the engine's planning error, or
   # refused by name. `alone` is whether the comparison is the whole condition.
   @spec check_calls(list(), MapSet.t(binary()), map(), boolean()) :: :ok
   defp check_calls(tokens, tags, types, alone) do
-    case InfluxQLWhereArith.call_error(tokens, tags, types, alone) do
+    case InfluxQLCalls.problem(tokens, {tags, types}, alone) do
       :ok -> :ok
       {:engine, body} -> throw({:refused, {:engine, body}})
       {:refuse, message} -> throw({:refused, message})
@@ -418,13 +490,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   # An unsigned number under arithmetic with a string, a boolean, a tag or the time is the
   # planner's coercion error.
-  @spec check_coercion(list(), MapSet.t(binary()), map()) :: :ok
-  defp check_coercion(tokens, tags, types) do
-    case InfluxQLWhereArith.coercion_error(tokens, tags, types) do
-      nil -> :ok
-      body -> throw({:refused, {:engine, 400, body}})
-    end
-  end
+  @spec check_coercion(list(), MapSet.t(binary()), map(), boolean()) :: :ok
+  defp check_coercion(tokens, tags, types, alone),
+    do: InfluxQLWhereArith.check_coercion(tokens, tags, types, alone)
 
   # A comparison of a condition with a bare operand, planned for the error the planner raises
   # at it (see `late_clash`). A comparison the double refuses is found among the connectives'
@@ -444,6 +512,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp plan_leaf(leaf, ctx, times) do
     plan(leaf, ctx, times)
   catch
+    # The coercion error of arithmetic is the engine's whatever bare operand stands beside it
+    # (verified: `time * 2 > 1 AND n`).
+    {:refused, {:engine, 400, "Error during planning: Cannot coerce arithmetic" <> _rest}} = error ->
+      throw(error)
+
     {:refused, _reason} ->
       throw(
         {:refused,
@@ -455,7 +528,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   # one (`= 1`, `=~ /a/`) is no comparison of constants, whatever it holds (the engine's parser
   # refuses it where it stands, see `InfluxQLTokens`).
   defp constants_comparison?(tokens) do
-    Enum.any?(tokens, &match?({:op, _op}, &1)) and
+    not Enum.any?(tokens, &match?({:cond_group, _node, _item}, &1)) and
+      Enum.any?(tokens, &match?({:op, _op}, &1)) and
       not match?({:op, _op}, List.first(tokens)) and
       not match?({:op, _op}, List.last(tokens)) and
       not Enum.any?(tokens, &(match?({:ident, _name}, &1) or InfluxQLTokens.time?(&1)))
@@ -493,8 +567,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   defp absent_leaf?(_tokens, nil), do: false
 
-  defp absent_leaf?(tokens, known),
-    do: MapSet.size(known) > 0 and absent_column?(tokens, known)
+  # (A comparison, or a column alone: arithmetic that stands as an operand is typed by its
+  # operands, `InfluxQLFold`.)
+  defp absent_leaf?(tokens, known) do
+    MapSet.size(known) > 0 and absent_column?(tokens, known) and
+      (Enum.any?(tokens, &match?({:op, _op}, &1)) or match?([{:ident, _name}], tokens))
+  end
 
   # A column the measurement lacks, compared with a number (or another such column), is typed
   # as a null number: beside a bare string, tag or other non-number the planner's error is
@@ -533,18 +611,38 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     {first, rest} = Enum.split(nodes, 1)
     others = %{times | first: false}
 
-    {sqls, lowers, checks} =
-      (Enum.map(first, &plan(&1, ctx, times)) ++ Enum.map(rest, &plan(&1, ctx, others)))
-      |> unzip3()
+    planned = Enum.map(first, &held(&1, ctx, times)) ++ Enum.map(rest, &held(&1, ctx, others))
 
-    {Enum.join(sqls, separator), Enum.concat(lowers), Enum.concat(checks)}
+    # The error of a division waits for the comparisons after it: theirs is the engine's.
+    case Enum.find(planned, &match?({:late, _body}, &1)) do
+      {:late, body} ->
+        throw({:late, body})
+
+      nil ->
+        {sqls, lowers, checks} = unzip3(planned)
+        {Enum.join(sqls, separator), Enum.concat(lowers), Enum.concat(checks)}
+    end
+  end
+
+  defp held(node, ctx, times) do
+    plan(node, ctx, times)
+  catch
+    {:late, body} -> {:late, body}
   end
 
   defp unzip3(plans) do
     {Enum.map(plans, &elem(&1, 0)), Enum.map(plans, &elem(&1, 1)), Enum.map(plans, &elem(&1, 2))}
   end
 
-  defp mentions_time_node?({:cmp, tokens}), do: Enum.any?(tokens, &InfluxQLTokens.time?/1)
+  # (An operand that is no comparison with the time in it is read by the SQL, which the double
+  # cannot combine with the rest of an `OR`; a comparison that has the time in its arithmetic is
+  # typed like any other.)
+  defp mentions_time_node?({:cmp, tokens}) do
+    InfluxQLTokens.time_comparison?(tokens) or
+      (Enum.any?(tokens, &InfluxQLTokens.time?/1) and
+         not Enum.any?(tokens, &match?({:op, _op}, &1)))
+  end
+
   defp mentions_time_node?({:never, nil}), do: false
   defp mentions_time_node?({:group, node}), do: mentions_time_node?(node)
   defp mentions_time_node?({_kind, nodes}), do: Enum.any?(nodes, &mentions_time_node?/1)
@@ -558,6 +656,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         time_comparison(op, comparand, times)
 
       :other ->
+        # (A duration in arithmetic with the time is the SQL's interval, whose error is the
+        # engine's `Timestamp(ns) = Int64` or a null by the operands: refused by name.)
+        if Enum.any?(tokens, &match?({:duration, _total, _text}, &1)),
+          do: InfluxQLError.refuse("a duration in arithmetic with the time")
+
         if {:raw, "now()"} not in tokens, do: negated_time(tokens, nil)
         {tokens |> InfluxQLSql.rewrite(tags, []) |> Enum.join(" "), []}
     end

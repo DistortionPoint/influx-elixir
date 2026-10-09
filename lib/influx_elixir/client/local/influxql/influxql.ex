@@ -284,6 +284,13 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   defdelegate holds?(check, row), to: InfluxQLArithmetic
 
   @doc """
+  Whether a row makes a side of a check an unsigned division by zero, which the engine fails
+  the stream on over three points or more (see `InfluxQLArithmetic.zero_division?/2`).
+  """
+  @spec zero_division?(check(), map()) :: boolean()
+  defdelegate zero_division?(check, row), to: InfluxQLArithmetic
+
+  @doc """
   The message of the engine's `WHERE` planning error without its frame, as
   `SHOW TAG VALUES` answers it.
   """

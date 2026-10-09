@@ -54,6 +54,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       raised.
     - Signs outside parentheses keep the literal's type: `-(9223372036854775808)` is
       `UInt64`, as in Core.
+- **`Client.Local` InfluxQL: third review of the differential fuzz** (design document
+  `2026-10-09_influxql-fuzz-third-review.md`):
+  - An integer written past the signed range is an unsigned constant everywhere it is typed:
+    `9223372036854775808 = (n > 1)`, `-(9223372036854775808) = ...`, `1 * 18446744073709551615 = ...`
+    are `UInt64 = Boolean` and `t * 18446744073709551615 = ...` the coercion error (they answered
+    `[]`). Behind a minus sign the lowest signed integer stays `Int64`.
+  - Arithmetic with a column the measurement lacks that stands alone, or beside a bare operand of
+    an `AND`, is typed by its operands: `nosuch * 'x' * u` is `Boolean * UInt64`, `-nosuch + u` the
+    `Boolean AND UInt64` of a bare unsigned operand, `nosuch * 'x' + time` `Boolean + Timestamp(ns)`
+    (they answered `[]`). `abs(nosuch + 'x')` is the planner's error for a boolean argument.
+  - An unsigned number divided by a boolean, the time or a duration is the planner's comparison of
+    that operand with `UInt64` at once (`u / b = 1`, `u / time`, `18446744073709551615 / b`), and
+    text or the time divided by an unsigned number is the quotient too (`time / u = b`). The quotient
+    of an unsigned number and text is null beside a null (`-nosuch + u / s = b`), null beside a float
+    when the other side is no number, the outer operation's error beside text, and the error of the
+    connective's second comparison wins over its division (`t / u = 1 OR t / u = b`).
+  - `-(time) = b` is `Int64 * Timestamp(ns)`; the sum, product or quotient of two times is the plain
+    temporal error, with no `type_coercion` wrapper; `-(nosuch + 'x')` is a null.
+  - Only a comparison with the bare `time` on a side breaks the planner's stack beside a bare
+    operand: `time * 2 > 1 AND b`, `n * time = 1 AND b` and `time + 1h > 0 AND n` are the coercion or
+    comparison errors (they were `invalid expr stack`), `nosuch * time = 1 AND b` is `[]` and
+    `nosuch * time * nosuch2 = 1 OR b` keeps the points `b` is true for. `time + 1h < now()` and
+    `-(time) = now()` are "not implemented: now". A comparison with the time in arithmetic beside a
+    bare operand that the SQL would raise on (`(time) > 0 AND n`) is refused by name (it answered
+    `[]`).
+  - An unsigned division by a zero the points make (`1 / u = 1`, `u / u = 1`, `n / u > 1`), which
+    fails Core's stream half way over three points or more, is refused by name.
+  - Time: `abs(abs(...(v)...)) > 0` nested 500 / 1,000 / 4,000 / 8,000 deep takes 0.17 / 0.05 / 0.23 /
+    0.43 s (3.6 s, killed, killed, not finished); `(ok = (ok = ... (v > 1)))` 1,500 / 6,000 / 12,000
+    deep takes 0.24 / 1.8 / 6.0 s (1.2 s, 44.9 s, killed).
+  - Refactors: `InfluxQLFold` is the only typer of arithmetic and `Fold.walk/2` the one precedence
+    walker (`InfluxQLWhereArith`'s evaluator, `InfluxQLTyped`'s constant folder and the calls'
+    reader run handlers over it; 354 + 76 lines deleted); `InfluxQLCalls` reads the calls of a
+    condition in one pass; the groups of a condition are read once; the dead `constant` flag, the
+    seven clauses of `Fold.nulls/4` (now a table) and the list of nulls written twice are gone.
+  - Coverage pass over the typer, the calls and the planner (design document
+    `2026-10-09_influxql-fuzz-third-review.md`, "Coverage pass"): `abs()` with the wrong number of
+    arguments names each by the type Core gives it (`abs(u, 1) = 1` is `abs(UInt64, Int64)`,
+    `abs(nosuch, 1)` `Null`, `abs(1h, 1)` `Interval(MonthDayNano)`; they all read `Float64`), and the
+    coercion error of an argument's arithmetic comes before the call's own (`abs(u + 's', 1) = 1`);
+    `abs()` of a duration is the planner's error for a duration; a bare operand that is computed
+    (`nosuch + 1`, `u + 's'`, `abs()`, `now()`, `abs(now())`) or that stands on a measurement that
+    does not exist breaks the planner's stack beside a comparison of the time, as any other does
+    (they answered rows, the call's error or "not implemented: now"); a parenthesis behind an
+    operand in the arguments of a call (`abs(1 (2))`, `abs(1h (1))`, `abs(true (1))`) is the
+    parser's failure at the parenthesis (it reached the SQL); `abs()` of a null as a bare operand
+    (`abs(nosuch + 1)`, `abs(-s)`) is refused by name (it answered `[]`). The dead leftovers of the
+    refactor are gone: the unsigned/boolean clash of `InfluxQLWhereArith` and `InfluxQLTyped`
+    (`InfluxQLNested` raises it first), `Typed.mismatch/3`, the `:never` outcome and the catch-all of
+    `Typed.decide/2`, `:huge` numbers (the lexer refuses them), the missing-argument machinery of the
+    walker (the parser refuses those statements) and the defaults of `typer/2` and `standalone/4`.
 
 ## [0.1.43] - 2026-10-09
 

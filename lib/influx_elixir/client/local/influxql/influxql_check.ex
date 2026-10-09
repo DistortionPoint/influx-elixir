@@ -151,17 +151,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
 
     # The clauses taken out of the text (blanked) are in the statement the parser reads.
     text = InfluxQLText.mask_literals(binary_part(whole, at, byte_size(masked_rest)))
-    calls = Regex.scan(~q/(?<![\w])([A-Za-z_]\w*)\s*\(/, masked, return: :index)
 
-    read_calls(calls, %{
-      whole: whole,
-      at: at,
-      text: text,
-      where: where,
-      masked: masked,
-      from: from + length,
-      limit: reading_limit(where, masked)
-    })
+    case Regex.scan(~q/(?<![\w])([A-Za-z_]\w*)\s*\(/, masked, return: :index) do
+      [] ->
+        nil
+
+      calls ->
+        read_calls(calls, %{
+          whole: whole,
+          at: at,
+          text: text,
+          where: where,
+          masked: masked,
+          from: from + length,
+          limit: :unread,
+          covered: 0
+        })
+    end
   end
 
   # The calls of the condition, left to right: the first that fails is the answer. What
@@ -191,15 +197,33 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   defp now_call?(_name, _masked, _at), do: false
 
   defp read_call(name, start, size, calls, ctx) do
-    if start < ctx.limit do
-      call_at = ctx.from + start
+    ctx = %{ctx | limit: ctx.limit |> read_limit(ctx)}
+    call_at = ctx.from + start
 
-      case call_result(Map.put(ctx, :later, calls), name, call_at, call_at + size - 1) do
-        :next -> read_calls(calls, ctx)
-        result -> result
-      end
+    cond do
+      not before_limit?(start, ctx.limit) ->
+        nil
+
+      # A math call inside the arguments of one that was read in full was read with it.
+      call_at < ctx.covered and InfluxQLText.math_function?(name) ->
+        read_calls(calls, ctx)
+
+      true ->
+        case call_result(Map.put(ctx, :later, calls), name, call_at, call_at + size - 1) do
+          {:next, stop} -> read_calls(calls, %{ctx | covered: max(ctx.covered, stop)})
+          :next -> read_calls(calls, ctx)
+          result -> result
+        end
     end
   end
+
+  # (The offset where the condition stops reading is found when the first call that is read
+  # needs it: a condition with no call, or only `now()`, never does.)
+  defp read_limit(:unread, ctx), do: reading_limit(ctx.where, ctx.masked)
+  defp read_limit(limit, _ctx), do: limit
+
+  defp before_limit?(_start, nil), do: true
+  defp before_limit?(start, limit), do: start < limit
 
   # Where the condition stops being one the parser reads from the start, by what stands before
   # a call: a call behind it is not read. The text before a call fails to tokenize, has a `)`
@@ -208,11 +232,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # call that starts at or after the least of them is behind an earlier error (and the text
   # before a call is never read again for each call: the calls of a condition would be
   # quadratic otherwise).
-  @spec reading_limit(binary(), binary()) :: non_neg_integer() | :infinity
+  @spec reading_limit(binary(), binary()) :: non_neg_integer() | nil
   defp reading_limit(where, masked) do
     [tokens_error_at(where), InfluxQLParens.excess_offset(masked), top_level_comma_at(masked)]
     |> Enum.reject(&is_nil/1)
-    |> Enum.min(fn -> :infinity end)
+    |> Enum.min(fn -> nil end)
   end
 
   # Where the tokens of the condition fail to read (`nil` for none). The text before a call is
@@ -222,7 +246,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       {:ok, _tokens} -> nil
       {:syntax_error, _kind, rest} -> byte_size(where) - byte_size(rest)
       {:error, "unsupported InfluxQL WHERE: " <> rest} -> byte_size(where) - byte_size(rest)
-      {:error, _unplaced} -> 0
     end
   end
 
@@ -247,7 +270,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # (verified: `fill`, `mean`, `trunc` and `foo` are not; `date_part` is read elsewhere).
   # Arguments the double cannot place are refused for a call that is no math function.
   @spec call_result(map(), binary(), non_neg_integer(), non_neg_integer()) ::
-          :next | positioned()
+          :next | {:next, non_neg_integer()} | positioned()
   defp call_result(ctx, name, call_at, open_at) do
     case {InfluxQLArgs.read(ctx.text, open_at), InfluxQLText.math_function?(name)} do
       {{:ok, _stop}, false} ->
@@ -262,7 +285,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       {:unknown, false} ->
         refuse(ctx.at + call_at, "unsupported InfluxQL (#{name}() in a WHERE)")
 
-      {_read_or_unknown, true} ->
+      {{:ok, stop}, true} ->
+        {:next, stop}
+
+      {_unknown, true} ->
         :next
     end
   end

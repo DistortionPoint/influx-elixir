@@ -17,32 +17,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   #   * arithmetic that stands alone as a condition is the planning error that names its type:
   #     an integer when both operands are, a float otherwise and for every division, a
   #     string for a concatenation
-  #   * `abs()` takes one number; anything else is the engine's planning error, worded here
-  #     (`call_error/3`)
+  #   * `abs()` takes one number; anything else is the engine's planning error, worded in
+  #     `InfluxQLCalls`
+  #
+  # The types of the arithmetic are `InfluxQLFold`'s; this module asks it and shapes the answer
+  # for the checks below.
 
-  alias InfluxElixir.Client.Local.{InfluxQLExpr, InfluxQLTokens}
+  alias InfluxElixir.Client.Local.{InfluxQLCalls, InfluxQLFold, InfluxQLTokens}
 
   @comparison ["=", "!=", "<>", "<", "<=", ">", ">=", "=~", "!~"]
   @equality ["=", "!=", "<>"]
-  @numbers [:integer, :float, :unsigned]
-  @uncoercible [:string, :boolean, :tag, :timestamp]
-
-  @arrow %{
-    integer: "Int64",
-    unsigned: "UInt64",
-    float: "Float64",
-    string: "Utf8",
-    boolean: "Boolean",
-    tag: "Dictionary(Int32, Utf8)",
-    timestamp: "Timestamp(ns)",
-    duration: "Interval(MonthDayNano)",
-    false: "Boolean",
-    null: "Float64"
-  }
 
   @typedoc "The type of an expression: a number, a tag, a string, a boolean, a regular expression, or null."
   @type kind ::
-          :integer | :float | :unsigned | :tag | :string | :boolean | :regex | :null | :timestamp
+          :integer | :float | :unsigned | :tag | :string | :boolean | :regex | :null
 
   @doc """
   Whether a comparison, or an expression alone, is null because a tag, a string or a boolean is
@@ -84,25 +72,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   end
 
   @doc """
-  What an unsigned operand does to a comparison the double does not compute (verified): a
-  computed unsigned side (`u + 1`, `-u`, `(u)`, `abs(u)`, `u / 2`) against a boolean constant,
-  and an unsigned side of any kind against a boolean field, in either order, is the planning
-  error naming `UInt64` and `Boolean` in the order written (`{:boolean, op, :unsigned_first}`
-  or `{:boolean, op, :boolean_first}`), and against a string that is
-  concatenated that it is below (`u < 'a' + 'b'`, `'a' + 'b' > u`) is not null as for the other
-  numbers but the engine's comparison of text (`:text`, refused by the caller). `nil` for
-  anything else.
+  What an unsigned operand does to a comparison the double does not compute (verified): against
+  a string that is concatenated that it is below (`u < 'a' + 'b'`, `'a' + 'b' > u`) it is not
+  null as for the other numbers but the engine's comparison of text (`:text`, refused by the
+  caller). `nil` for anything else. (An unsigned number against a boolean is the planning
+  error `InfluxQLNested` raises before a comparison gets here, whatever the number is made of:
+  its kind is `InfluxQLFold`'s.)
   """
-  @spec unsigned_clash(list(), MapSet.t(binary()), map()) ::
-          {:boolean, binary(), :unsigned_first | :boolean_first} | :text | nil
+  @spec unsigned_clash(list(), MapSet.t(binary()), map()) :: :text | nil
   def unsigned_clash(tokens, tags, types) do
-    with {:ok, [left, right], op} <- sides(tokens),
-         true <-
-           unsigned_valued?(left, types) or unsigned_valued?(right, types) or
-             unsigned_literal?(left) or unsigned_literal?(right) do
-      unsigned_outcome(op, left, right, tags, types)
-    else
-      _other -> nil
+    case sides(tokens) do
+      {:ok, [left, right], op} -> text_clash(op, left, right, tags, types)
+      _single -> nil
     end
   end
 
@@ -126,59 +107,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   defp flipped(">"), do: "<"
   defp flipped(">="), do: "<="
 
-  defp unsigned_outcome(op, left, right, tags, types),
-    do: boolean_clash(op, left, right, types) || text_clash(op, left, right, tags, types)
-
-  defp boolean_clash(op, left, right, types) do
-    cond do
-      boolean_constant?(right) and length(left) > 1 and unsigned_valued?(left, types) ->
-        {:boolean, written(op), :unsigned_first}
-
-      boolean_field?(right, types) and unsigned_valued?(left, types) ->
-        {:boolean, written(op), :unsigned_first}
-
-      boolean_field?(left, types) and unsigned_valued?(right, types) ->
-        {:boolean, written(op), :boolean_first}
-
-      boolean_constant?(left) and length(right) > 1 and unsigned_valued?(right, types) ->
-        {:boolean, written(op), :boolean_first}
-
-      true ->
-        literal_clash(op, left, right)
-    end
-  end
-
-  # An unsigned constant against a boolean constant, in either order.
-  defp literal_clash(op, left, right) do
-    cond do
-      boolean_constant?(right) and unsigned_literal?(left) ->
-        {:boolean, written(op), :unsigned_first}
-
-      boolean_constant?(left) and unsigned_literal?(right) ->
-        {:boolean, written(op), :boolean_first}
-
-      true ->
-        nil
-    end
-  end
-
-  # A number written past the signed range, which the engine reads as an unsigned constant.
-  defp unsigned_literal?([{:raw, "("} | _rest] = tokens) do
-    case strip_parens(tokens) do
-      [{:raw, "("} | _still] -> false
-      inner -> unsigned_literal?(inner)
-    end
-  end
-
-  defp unsigned_literal?([{:number, text}]) do
-    match?(
-      {n, ""} when n > 9_223_372_036_854_775_807 and n <= 18_446_744_073_709_551_615,
-      Integer.parse(text)
-    )
-  end
-
-  defp unsigned_literal?(_tokens), do: false
-
   defp text_clash(op, left, right, tags, types) do
     cond do
       op in ["<", "<="] and concatenated_text?(right, tags, types) and
@@ -193,21 +121,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
         nil
     end
   end
-
-  defp boolean_constant?([{:raw, word}]), do: String.upcase(word) in ["TRUE", "FALSE"]
-  defp boolean_constant?(_tokens), do: false
-
-  # A side that is one boolean field (in parentheses or not).
-  defp boolean_field?(tokens, types) do
-    case strip_parens(tokens) do
-      [{:ident, name}] -> Map.get(types, name) == :boolean
-      _other -> false
-    end
-  end
-
-  # The operator as the engine words it.
-  defp written("<>"), do: "!="
-  defp written(op), do: op
 
   defp concatenated_text?(tokens, tags, types),
     do: side_kind(tokens, tags, types) == {:ok, :string} and binary_plus?(tokens)
@@ -234,9 +147,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
     do: right == :regex and group(left) in [:number, :boolean]
 
   # An unsigned number is left to the engine's own errors (see `unsigned_clash/3`).
-  defp clash?(_op, left, right) when :regex in [left, right] or :null in [left, right],
-    do: false
-
   defp clash?(_op, left, right) when :unsigned in [left, right], do: false
 
   # Two tags are never equal and strings and booleans have equality only (verified, in
@@ -310,373 +220,103 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
 
   @doc """
   The type of an expression that stands alone as a condition and is more than one operand
-  (arithmetic, signs, parentheses), or `nil` when it is null or the double cannot type it.
+  (arithmetic, signs, parentheses, `abs()`), or `nil` when it is null, the engine cannot type
+  it or the double does not (a column the measurement lacks decides nothing here: an unsigned
+  number made of one and a null is unsigned all the same, `InfluxQLFold`). The quotient of an
+  unsigned number and text is unsigned beside a connective, and the coercion error of the
+  division when it is the whole condition (`alone`).
   """
-  @spec standalone(list(), MapSet.t(binary()), map()) ::
+  @spec standalone(list(), MapSet.t(binary()), map(), boolean()) ::
           :integer | :unsigned | :float | :tag | :string | nil
-  def standalone(tokens, tags, types) do
-    cond do
-      Enum.any?(tokens, &match?({:op, _op}, &1)) ->
-        nil
-
-      # A call the planner refuses is that error, before the type of a condition.
-      call_error(tokens, tags, types) != :ok ->
-        nil
-
-      abs_call(tokens) != nil ->
-        abs_type(abs_call(tokens), tags, types)
-
-      true ->
-        case side_kind(tokens, tags, types) do
-          {:ok, kind} when kind in [:integer, :unsigned, :float, :tag, :string] -> kind
-          _other -> nil
-        end
-    end
-  end
-
-  # The argument of a condition that is `abs(argument)` and nothing else.
-  defp abs_call([{:ident, name}, {:raw, "("} | rest]) do
-    with true <- String.downcase(name) == "abs",
-         {inside, []} <- InfluxQLTokens.take_call(rest),
-         [argument] <- split_arguments(inside) do
-      argument
+  def standalone(tokens, tags, types, alone) do
+    with false <- Enum.any?(tokens, &match?({:op, _op}, &1)),
+         # A call the planner refuses is that error, before the type of a condition.
+         :ok <- InfluxQLCalls.problem(tokens, {tags, types}),
+         {:ok, kind} when kind in [:integer, :unsigned, :float, :tag, :string] <-
+           InfluxQLFold.kind(tokens, {tags, types}, mode: if(alone, do: :alone, else: :loose)) do
+      kind
     else
-      _other -> nil
+      _undecided -> nil
     end
   end
 
-  defp abs_call(_tokens), do: nil
-
-  # `abs(u)` of an unsigned number is unsigned too (verified: the planner words
-  # `Boolean AND UInt64` for a condition that is `abs(u)`).
-  defp abs_type(argument, tags, types) do
-    case side_kind(argument, tags, types) do
-      {:ok, :unsigned} -> :unsigned
-      _other -> number_type(argument_type(argument, tags, types))
-    end
-  end
-
-  # `abs` keeps the type of a number; of a column the measurement lacks it is a float.
-  defp number_type(type) when type in [:integer, :float], do: type
-  defp number_type(:null), do: :float
-  defp number_type(_other), do: nil
-
-  # The sides of a comparison, or the whole as one side, with the operator.
+  # The sides of a comparison, or the whole as one side, with the operator. (A comparison with a
+  # side missing never gets here: the parser of the statement fails it first.) Two comparisons
+  # in a row (`n > 1 = true`) are decided by `InfluxQLNested`, not here.
   @spec sides(list()) :: {:ok, [list()], binary() | nil} | :error
   defp sides(tokens) do
     case Enum.split_while(tokens, &(not comparison?(&1))) do
-      {left, [{:op, op} | right]} when left != [] and right != [] ->
+      {left, [{:op, op} | right]} ->
         if Enum.any?(right, &comparison?/1), do: :error, else: {:ok, [left, right], op}
 
       {_whole, []} ->
         {:ok, [tokens], nil}
-
-      _other ->
-        :error
     end
   end
 
   defp comparison?({:op, op}), do: op in @comparison
   defp comparison?(_token), do: false
 
+  # What a side comes to for the checks above, from `InfluxQLFold`: a null (a string, a tag or
+  # a boolean under arithmetic) is `:null`, a regular expression `:regex`. A side the double
+  # does not decide is `:error`: one with the time or a column the measurement lacks in it (the
+  # planner's, `coercion_error/3`'s, and `InfluxQLNested`'s), an error of the engine, a duration.
   @spec side_kind(list(), MapSet.t(binary()), map()) :: {:ok, kind()} | :error
+  defp side_kind([{:regex, _pattern}], _tags, _types), do: {:ok, :regex}
+
   defp side_kind(tokens, tags, types) do
-    case expression(tokens, tags, types) do
-      {:ok, kind, []} -> {:ok, kind}
-      _other -> :error
+    with [] <- InfluxQLTokens.absent_columns(tokens, tags, types),
+         false <- Enum.any?(tokens, &InfluxQLTokens.time?/1),
+         {:ok, kind} <- InfluxQLFold.kind(tokens, {tags, types}) do
+      shaped(kind)
+    else
+      _undecided -> :error
     end
-  catch
-    {:coerce, _left, _op, _right} -> :error
   end
 
+  defp shaped(kind) when kind in [:integer, :float, :unsigned, :string, :tag, :boolean],
+    do: {:ok, kind}
+
+  defp shaped(kind) when kind in [:unknown, :nn, :nnf, :nz, false], do: {:ok, :null}
+  defp shaped(_duration_or_time), do: :error
+
   @doc """
-  The planning error of arithmetic the engine cannot coerce (verified): an unsigned number
-  beside a string, a boolean, a tag or the time under an arithmetic operator, in either order,
-  worded with the Arrow type of each operand as written (`UInt64 + Utf8`). The other numbers
-  beside these are a null (see `null?/3`); a column the measurement lacks, and an expression
-  that came to null, are null beside an unsigned number too. `nil` when nothing is wrong.
+  Raises the planning error of arithmetic the engine cannot coerce (verified): an unsigned
+  number beside a string, a boolean, a tag or the time under an arithmetic operator, in either
+  order, worded with the Arrow type of each operand as written (`UInt64 + Utf8`), the time
+  beside anything but a duration, two times, and the other errors of `InfluxQLFold`, on the
+  left side first. `:ok` when nothing is wrong.
   """
-  @spec coercion_error(list(), MapSet.t(binary()), map()) :: binary() | nil
-  def coercion_error(tokens, tags, types) do
-    case sides(tokens) do
+  @spec check_coercion(list(), MapSet.t(binary()), map(), boolean()) :: :ok
+  def check_coercion(tokens, tags, types, alone) do
+    # (A comparison with the bare time on a side is split by the planner, not typed.)
+    case if(InfluxQLTokens.time_comparison?(tokens), do: :error, else: sides(tokens)) do
+      {:ok, [_part] = parts, nil} ->
+        parts
+        |> Enum.map(
+          &InfluxQLFold.kind(&1, {tags, types}, mode: if(alone, do: :alone, else: :loose))
+        )
+        |> InfluxQLFold.raise_coercion()
+
       {:ok, parts, _op} ->
-        typed = typed_names(tokens, tags, types)
-        Enum.each(parts, &expression(&1, tags, typed))
-        nil
+        ctx = {tags, types}
+        loose = Enum.map(parts, &InfluxQLFold.kind(&1, ctx))
+
+        parts
+        |> Enum.zip(Enum.reverse(loose))
+        |> Enum.map(fn {part, other} -> InfluxQLFold.kind(part, ctx, mode: against(other)) end)
+        |> InfluxQLFold.raise_coercion()
 
       :error ->
-        nil
-    end
-  catch
-    {:coerce, left, op, right} -> coercion_body(left, op, right)
-  end
-
-  @doc "The Arrow type the engine names a kind of operand by."
-  @spec arrow(atom()) :: binary()
-  def arrow(kind), do: Map.fetch!(@arrow, kind)
-
-  @doc """
-  The planning error for arithmetic the engine cannot coerce, worded with the Arrow type of
-  each operand as written (`UInt64 + Utf8`).
-  """
-  @spec coercion_body(atom(), binary(), atom()) :: binary()
-  def coercion_body(left, op, right) do
-    "Error during planning: Cannot coerce arithmetic expression " <>
-      "#{Map.fetch!(@arrow, left)} #{op} #{Map.fetch!(@arrow, right)} to valid types"
-  end
-
-  # The types of the names the tokens read: those of the measurement, the time, and `:absent`
-  # for a column it lacks.
-  defp typed_names(tokens, tags, types) do
-    {columns, _calls} = InfluxQLTokens.split_names(tokens)
-
-    Enum.reduce(columns, types, fn name, acc ->
-      cond do
-        InfluxQLTokens.time?({:ident, name}) -> Map.put(acc, name, :timestamp)
-        not InfluxQLExpr.absent?(name, acc, tags) -> acc
-        true -> Map.put(acc, name, :absent)
-      end
-    end)
-  end
-
-  # sum := product (("+" | "-") product)*
-  defp expression(tokens, tags, types) do
-    with {:ok, left, rest} <- product(tokens, tags, types),
-         do: more(rest, left, ["+", "-"], &product(&1, tags, types))
-  end
-
-  # product := factor (("*" | "/") factor)*
-  defp product(tokens, tags, types) do
-    with {:ok, left, rest} <- factor(tokens, tags, types),
-         do: more(rest, left, ["*", "/"], &factor(&1, tags, types))
-  end
-
-  defp more([{:raw, op} | rest] = tokens, left, ops, next) do
-    if op in ops do
-      with {:ok, right, after_right} <- next.(rest),
-           {:ok, kind} <- combine(op, left, right),
-           do: more(after_right, kind, ops, next)
-    else
-      {:ok, left, tokens}
+        :ok
     end
   end
 
-  defp more(tokens, left, _ops, _next), do: {:ok, left, tokens}
-
-  defp factor([{:raw, "-"} | rest], tags, types) do
-    with {:ok, kind, after_operand} <- factor(rest, tags, types),
-         do: {:ok, negate(kind), after_operand}
-  end
-
-  defp factor([{:raw, "+"} | rest], tags, types), do: factor(rest, tags, types)
-
-  defp factor([{:raw, "("} | rest], tags, types) do
-    case expression(rest, tags, types) do
-      {:ok, kind, [{:raw, ")"} | after_group]} -> {:ok, kind, after_group}
-      _other -> :error
-    end
-  end
-
-  defp factor([{:number, text} | rest], _tags, _types) do
-    case Integer.parse(text) do
-      {n, ""} when n <= 9_223_372_036_854_775_807 -> {:ok, :integer, rest}
-      {_n, ""} -> :error
-      _fraction -> {:ok, :float, rest}
-    end
-  end
-
-  # `abs()` of one number keeps its type; of a null, a null. Any other call is no kind the
-  # double knows (its problems are `call_error/3`'s).
-  defp factor([{:ident, name}, {:raw, "("} | rest], tags, types) do
-    with true <- String.downcase(name) == "abs",
-         {inside, after_call} <- InfluxQLTokens.take_call(rest),
-         [argument] <- split_arguments(inside),
-         {:ok, kind, []} <- expression(argument, tags, types),
-         true <- kind in [:integer, :float, :unsigned, :null] do
-      {:ok, kind, after_call}
-    else
-      _other -> :error
-    end
-  end
-
-  defp factor([{:str, _content} | rest], _tags, _types), do: {:ok, :string, rest}
-  defp factor([{:regex, _pattern} | rest], _tags, _types), do: {:ok, :regex, rest}
-
-  defp factor([{:raw, word} | rest], _tags, _types) do
-    if String.upcase(word) in ["TRUE", "FALSE"], do: {:ok, :boolean, rest}, else: :error
-  end
-
-  defp factor([{:ident, name} | rest], tags, types) do
-    cond do
-      MapSet.member?(tags, name) ->
-        {:ok, :tag, rest}
-
-      Map.get(types, name) in [:integer, :float, :unsigned, :string, :boolean, :timestamp] ->
-        {:ok, types[name], rest}
-
-      Map.get(types, name) == :absent ->
-        {:ok, :null, rest}
-
-      true ->
-        :error
-    end
-  end
-
-  defp factor(_tokens, _tags, _types), do: :error
-
-  defp negate(kind) when kind in [:integer, :float, :unsigned], do: kind
-  defp negate(_non_numeric), do: :null
-
-  # A tag beside a string under `+` is the engine's coercion error, not a null.
-  defp combine("+", :tag, :string), do: throw({:coerce, :tag, "+", :string})
-  defp combine("+", :string, :tag), do: throw({:coerce, :string, "+", :tag})
-  defp combine("+", :string, :string), do: {:ok, :string}
-
-  # An unsigned number beside a string, a boolean, a tag or the time is not the null the other
-  # numbers make of it: the engine cannot coerce it (verified, in either order).
-  defp combine(op, left, right)
-       when (left == :unsigned and right in @uncoercible) or
-              (right == :unsigned and left in @uncoercible),
-       do: throw({:coerce, left, op, right})
-
-  defp combine(_op, left, right)
-       when left not in @numbers or right not in @numbers,
-       do: {:ok, :null}
-
-  defp combine(_op, :float, _right), do: {:ok, :float}
-  defp combine(_op, _left, :float), do: {:ok, :float}
-  defp combine(_op, :unsigned, _right), do: {:ok, :unsigned}
-  defp combine(_op, _left, :unsigned), do: {:ok, :unsigned}
-  defp combine("/", _left, _right), do: {:ok, :float}
-  defp combine(_op, _left, _right), do: {:ok, :integer}
-
-  # ---------------------------------------------------------------------------
-  # Calls
-  # ---------------------------------------------------------------------------
-
-  @native %{
-    string: "String",
-    boolean: "Boolean",
-    tag: "String",
-    timestamp: "Timestamp(Nanosecond, None)"
-  }
-
-  @signature "You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"
-
-  @doc """
-  The calls of a condition (a name followed by a parenthesis): the engine's planning error
-  for an `abs()` that does not take one number, as `{:engine, body}`, or a refusal by name
-  for any other call (the engine takes a library of math functions the double does not
-  compute); `:ok` when the calls are all `abs()` of numbers.
-  """
-  @spec call_error(list(), MapSet.t(binary()), map(), boolean()) ::
-          :ok | {:engine, binary()} | {:refuse, binary()}
-  def call_error(tokens, tags, types, alone \\ true) do
-    # The whole condition is one call (verified: the planner words the signature of a call
-    # that is part of something, and a zero-argument call that is the whole condition
-    # as a coercion error of its own).
-    whole? = alone and single_call?(strip_parens(tokens))
-
-    tokens
-    |> calls([])
-    |> Enum.with_index()
-    |> Enum.find_value(:ok, fn {call, index} ->
-      call_problem(call, %{whole: whole?, outermost: whole? and index == 0}, tags, types)
-    end)
-  end
-
-  defp strip_parens(tokens), do: tokens |> InfluxQLTokens.unwrap_group() |> elem(0)
-
-  # Whether the tokens are one call and nothing else.
-  defp single_call?([{:ident, _name}, {:raw, "("} | rest]),
-    do: match?({_inside, []}, InfluxQLTokens.take_call(rest))
-
-  defp single_call?(_tokens), do: false
-
-  # The calls in order of appearance, each with the tokens of its arguments.
-  defp calls([{:ident, name}, {:raw, "("} | rest], acc) do
-    {inside, after_call} = InfluxQLTokens.take_call(rest)
-    calls(inside ++ after_call, [{name, split_arguments(inside)} | acc])
-  end
-
-  defp calls([_token | rest], acc), do: calls(rest, acc)
-  defp calls([], acc), do: Enum.reverse(acc)
-
-  defp split_arguments([]), do: []
-
-  defp split_arguments(tokens) do
-    {arguments, current, _depth} =
-      Enum.reduce(tokens, {[], [], 0}, fn
-        {:raw, ","}, {done, current, 0} -> {[Enum.reverse(current) | done], [], 0}
-        {:raw, "("} = token, {done, current, depth} -> {done, [token | current], depth + 1}
-        {:raw, ")"} = token, {done, current, depth} -> {done, [token | current], depth - 1}
-        token, {done, current, depth} -> {done, [token | current], depth}
-      end)
-
-    Enum.reverse([Enum.reverse(current) | arguments])
-  end
-
-  defp call_problem({name, arguments}, position, tags, types) do
-    if String.downcase(name) == "abs" do
-      if [] in arguments and length(arguments) > 1,
-        do: {:refuse, "unsupported InfluxQL (abs() with an empty argument)"},
-        else: abs_problem(arguments, position, tags, types)
-    else
-      {:refuse, "unsupported InfluxQL (#{String.downcase(name)}() in a WHERE)"}
-    end
-  end
-
-  defp abs_problem([], %{outermost: outermost?}, _tags, _types) do
-    {:engine,
-     if(outermost?, do: "type_coercion\ncaused by\n", else: "") <>
-       "Error during planning: 'abs' does not support zero arguments No function matches the " <>
-       "given name and argument types 'abs()'. " <> @signature}
-  end
-
-  defp abs_problem([argument], %{whole: bare?}, tags, types) do
-    case argument_type(argument, tags, types) do
-      type when type in [:integer, :float, :null] ->
-        nil
-
-      type ->
-        {:engine,
-         "Error during planning: Function 'abs' expects NativeType::Numeric but received " <>
-           "NativeType::#{Map.fetch!(@native, type)}" <>
-           if(bare?,
-             do: "",
-             else:
-               " No function matches the given name and argument types " <>
-                 "'abs(#{Map.fetch!(@arrow, type)})'. " <> @signature
-           )}
-    end
-  end
-
-  defp abs_problem(arguments, %{whole: whole?}, tags, types) do
-    names = Enum.map_join(arguments, ", ", &Map.fetch!(@arrow, argument_type(&1, tags, types)))
-
-    {:engine,
-     "Error during planning: Function 'abs' expects 1 arguments but received " <>
-       "#{length(arguments)}" <>
-       if(whole?,
-         do: "",
-         else:
-           " No function matches the given name and argument types 'abs(#{names})'. " <>
-             @signature
-       )}
-  end
-
-  # What an argument comes to; a column the measurement lacks, or an expression the double does
-  # not type, is a number as far as the call is concerned.
-  defp argument_type(tokens, tags, types) do
-    case {tokens, side_kind(tokens, tags, types)} do
-      {[{:ident, name}], _kind} when is_binary(name) and name in ["time", "TIME", "Time"] ->
-        :timestamp
-
-      {_tokens, {:ok, kind}} when kind in [:integer, :float, :tag, :string, :boolean] ->
-        kind
-
-      _other ->
-        :null
-    end
-  end
+  # A comparison reads the quotient of an unsigned number and text as a comparison with a number
+  # does when the other side is a number, as one with a boolean does beside a boolean, and as one
+  # with text does beside anything else; an operand of a connective as the one with a boolean,
+  # the whole condition on its own as itself (see `InfluxQLFold`).
+  defp against({:ok, kind}) when kind in [:integer, :float, :unsigned], do: :strict
+  defp against({:ok, :boolean}), do: :loose
+  defp against(_other), do: :text
 end

@@ -1,5 +1,5 @@
 defmodule InfluxElixir.Contract.InfluxQLNestedCases do
-  @moduledoc "Statements over the `~p1` fixture of `InfluxElixir.Contract.InfluxQLProjectionCases` (and `~p2`, two points whose field is named with a double quote) with the answers InfluxDB 3 Core 3.10.1 gave when a constant with signs stands alone as a condition, when a condition in parentheses stands beside arithmetic or as an operand of a comparison, when arithmetic with a column the measurement lacks stands beside a boolean, when comparisons are chained, when a time or a duration stands in a group, when a name has more than three parts or ends in a line feed, when a field is compared with a constant the engine folds, when the sources of a FROM are dotted or qualified, when a select list repeats a name or needs one quoted, and when a clause keyword comes where the clauses before it end the statement. `~db` is the database the statement is run in. The statements the double refuses by name, with the reason pinned, are `refusals/0`."
+  @moduledoc "Statements over the `~p1` fixture of `InfluxElixir.Contract.InfluxQLProjectionCases` (and `~p2`, two points whose field is named with a double quote, and `~p3`, five points with a tag and an integer, a float, a boolean, an unsigned (one of them 0) and a string field) with the answers InfluxDB 3 Core 3.10.1 gave when a constant with signs stands alone as a condition, when a condition in parentheses stands beside arithmetic or as an operand of a comparison, when arithmetic with a column the measurement lacks stands beside a boolean, when comparisons are chained, when a time or a duration stands in a group, when a name has more than three parts or ends in a line feed, when a field is compared with a constant the engine folds, when the sources of a FROM are dotted or qualified, when a select list repeats a name or needs one quoted, when a clause keyword comes where the clauses before it end the statement, when `abs()` is called with the wrong number of arguments or a parenthesis stands behind its argument, when a minus sign stands before a constant in parentheses, when two strings are concatenated or a comparison is chained beside a bare operand, and when a computed bare operand stands beside a comparison of the time. `~db` is the database the statement is run in. The statements the double refuses by name, with the reason pinned, are `refusals/0`."
 
   alias InfluxElixir.Contract.InfluxQLProjectionCases
 
@@ -45,20 +45,28 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
     end
   end
 
-  @doc "The names the cases use, from one unique `prefix`: `~p1` and `~p2` (the database, `~db`, is the run's own)."
+  @doc "The names the cases use, from one unique `prefix`: `~p1`, `~p2` and `~p3` (the database, `~db`, is the run's own)."
   @spec names(binary()) :: %{binary() => binary()}
-  def names(prefix), do: %{"p1" => prefix <> "_p1", "p2" => prefix <> "_p2"}
+  def names(prefix),
+    do: %{"p1" => prefix <> "_p1", "p2" => prefix <> "_p2", "p3" => prefix <> "_p3"}
 
-  @doc "The fixture, as line protocol, with `names/1` substituted: `~p1` as in `InfluxElixir.Contract.InfluxQLProjectionCases`, `~p2` two points with the fields `x\"y`, `k` and `j`."
+  @doc "The fixture, as line protocol, with `names/1` substituted: `~p1` as in `InfluxElixir.Contract.InfluxQLProjectionCases`, `~p2` two points with the fields `x\"y`, `k` and `j`, `~p3` five points with the tag `t` and the fields `n` (integer), `f` (float), `b` (boolean), `u` (unsigned, one of them 0) and `s` (string), the last with `n` and `u` alone."
   @spec fixture(%{binary() => binary()}) :: [binary()]
   def fixture(names) do
     InfluxQLProjectionCases.fixture(names) ++
       Enum.map(
         [
           ~S|~p2 x"y=1.5,k=2.0,j=3i 1696118400000000000|,
-          ~S|~p2 x"y=2.5,k=4.0,j=1i 1696118460000000000|
+          ~S|~p2 x"y=2.5,k=4.0,j=1i 1696118460000000000|,
+          ~S|~p3,t=a n=1i,f=1.5,b=true,u=0u,s="x" 1696118400000000000|,
+          ~S|~p3,t=b n=2i,f=2.5,b=false,u=3u,s="y" 1696118460000000000|,
+          ~S|~p3,t=a n=-3i,f=0.5,b=true,u=5u,s="z" 1696118520000000000|,
+          ~S|~p3,t=b n=7i,f=-1.5,b=false,u=2u,s="x" 1696118580000000000|,
+          ~S|~p3,t=c n=4i,u=1u 1696118640000000000|
         ],
-        &String.replace(&1, "~p2", names["p2"])
+        fn line ->
+          line |> String.replace("~p2", names["p2"]) |> String.replace("~p3", names["p3"])
+        end
       )
   end
 
@@ -1408,6 +1416,721 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
     ]
   end
 
+  @doc "An integer written past the signed range (up to the unsigned) is an unsigned constant, behind signs as well (`-(9223372036854775808)` is `UInt64`, `-9223372036854775808` the lowest signed integer): beside a condition in parentheses it is the planner's `UInt64 = Boolean`, beside text, a boolean or a tag the coercion error of the arithmetic."
+  @spec big_constants() :: [{binary(), term()}]
+  def big_constants do
+    [
+      {"select n from ~p3 where 9223372036854775808 = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where (9223372036854775808) = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where -(9223372036854775808) = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where 9223372036854775808 + 1 = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where abs(9223372036854775808) = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where 1 * 18446744073709551615 = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where 18446744073709551615 = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where (n > 1) = 9223372036854775808",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where -9223372036854775808 = (n > 1)", []},
+      {"select n from ~p3 where t * 18446744073709551615 = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) * UInt64 to valid types"}},
+      {"select n from ~p3 where s * 18446744073709551615 = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Utf8 * UInt64 to valid types"}},
+      {"select n from ~p3 where b * 18446744073709551615 = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean * UInt64 to valid types"}},
+      {"select n from ~p3 where 'x' + 18446744073709551615 = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Utf8 + UInt64 to valid types"}},
+      {"select n from ~p3 where 18446744073709551615 - s = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 - Utf8 to valid types"}},
+      {"select n from ~p3 where t * 18446744073709551615 = b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) * UInt64 to valid types"}},
+      {"select n from ~p3 where 9223372036854775808 + b = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Boolean to valid types"}}
+    ]
+  end
+
+  @doc "Arithmetic with a column the measurement lacks that stands alone as a condition, or beside a bare operand of an `AND` or an `OR`: the types of its operands decide the error (the false of text, a null integer made unsigned by an unsigned column)."
+  @spec absent_arithmetic_alone() :: [{binary(), term()}]
+  def absent_arithmetic_alone do
+    [
+      {"select n from ~p3 where nosuch * 'x' * u",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean * UInt64 to valid types"}},
+      {"select n from ~p3 where nosuch * 'x' * u AND b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean * UInt64 to valid types"}},
+      {"select n from ~p3 where b AND nosuch * 'x' * u",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean * UInt64 to valid types"}},
+      {"select n from ~p3 where -nosuch * u + t",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Dictionary(Int32, Utf8) to valid types"}},
+      {"select n from ~p3 where nosuch * 'x' + time",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean + Timestamp(ns) to valid types"}},
+      {"select n from ~p3 where time / nosuch2 + time",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean + Timestamp(ns) to valid types"}},
+      {"select n from ~p3 where -nosuch + u",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND UInt64"}},
+      {"select n from ~p3 where nosuch + nosuch2 + u",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND UInt64"}},
+      {"select n from ~p3 where -nosuch + u AND b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for logical boolean operation UInt64 AND Boolean"}},
+      {"select n from ~p3 where nosuch * 'x' * u OR b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean * UInt64 to valid types"}}
+    ]
+  end
+
+  @doc "An unsigned number divided by text is unsigned alone (`UInt64 = Boolean` beside a boolean, `UInt64 AND Boolean` beside a connective), null beside a null, null beside a float when the other side is no number, and the coercion error of the division in other arithmetic; divided by a boolean, the time or a duration it is the planner's comparison of that operand with `UInt64`, whatever stands around it; text or the time divided by an unsigned number is the quotient too."
+  @spec unsigned_quotients() :: [{binary(), term()}]
+  def unsigned_quotients do
+    [
+      {"select n from ~p3 where u / time = 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) = UInt64"}},
+      {"select n from ~p3 where u / b = 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where u / true = 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where u / b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where u / true",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where u / time",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) = UInt64"}},
+      {"select n from ~p3 where u / 1h = 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Interval(MonthDayNano) = UInt64"}},
+      {"select n from ~p3 where u / b = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where u / time AND b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) = UInt64"}},
+      {"select n from ~p3 where time / u = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where time / abs(u) = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where 18446744073709551615 / b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where (u / s) / b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where (u / s) / b AND b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where (u / s) / time",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) = UInt64"}},
+      {"select n from ~p3 where u / s AND b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for logical boolean operation UInt64 AND Boolean"}},
+      {"select n from ~p3 where t / u = 1 OR t / u = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where t / u = b OR t / u = 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u / s = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where u / s = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u / s",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where t / u",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) / UInt64 to valid types"}},
+      {"select n from ~p3 where t + (u / s)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where f + (u / s) AND b", []},
+      {"select n from ~p3 where f + (u / s) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where -nosuch + u / s = b", []},
+      {"select n from ~p3 where -nosuch + u / s = 1", []},
+      {"select n from ~p3 where (nosuch * 1) + u / s = b", []},
+      {"select n from ~p3 where (nosuch / 1) + u / s = b", []},
+      {"select n from ~p3 where nosuch2 - u / b = b", []},
+      {"select n from ~p3 where u / s + 1.5 = b", []},
+      {"select n from ~p3 where u / s + 1.5 = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where -u / s - f = 'x'", []},
+      {"select n from ~p3 where u / s * f = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where nosuch + 'x' + (u / s) = b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Boolean + UInt64 to valid types"}},
+      {"select n from ~p3 where u / s + 'x' = b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Utf8 to valid types"}},
+      {"select n from ~p3 where 'x' + (u / s) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Utf8 + UInt64 to valid types"}},
+      {"select n from ~p3 where (u / s) - s AND b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 - Utf8 to valid types"}},
+      {"select n from ~p3 where abs(u / s) = b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where abs(u / s)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where 1 / (u / s) = b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where 'x' = (u / s)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where u / s = 'x'",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where u / s + 1.5 = 'x'", []},
+      {"select n from ~p3 where (u / s) + (u / s) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where (u / s) / 'x' = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where 'x' / (u / s) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where u / b + 1 = 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where -(u / b) = 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where abs(u / b) = 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}}
+    ]
+  end
+
+  @doc "`abs()` of the false of a column the measurement lacks and text is the planner's error for a boolean argument, worded with the signature unless the call is the whole condition."
+  @spec abs_of_a_boolean() :: [{binary(), term()}]
+  def abs_of_a_boolean do
+    [
+      {"select n from ~p3 where abs(nosuch + 'x') = b",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Boolean No function matches the given name and argument types 'abs(Boolean)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(nosuch + 'x') = (n > 1)",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Boolean No function matches the given name and argument types 'abs(Boolean)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(nosuch + 'x')",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Boolean"}},
+      {"select n from ~p3 where abs(nosuch + 'x') AND b",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Boolean No function matches the given name and argument types 'abs(Boolean)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(true)",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Boolean"}},
+      {"select n from ~p3 where abs(b) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Boolean No function matches the given name and argument types 'abs(Boolean)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}}
+    ]
+  end
+
+  @doc "The sum, product or quotient of two times is the planner's error for a temporal operation, plain (no `type_coercion` wrapper) wherever it stands."
+  @spec temporal_arithmetic() :: [{binary(), term()}]
+  def temporal_arithmetic do
+    [
+      {"select n from ~p3 where time + time",
+       {:error, 400,
+        "Error during planning: Cannot get result type for temporal operation Timestamp(ns) + Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: Timestamp(ns) + Timestamp(ns)"}},
+      {"select n from ~p3 where time * time",
+       {:error, 400,
+        "Error during planning: Cannot get result type for temporal operation Timestamp(ns) * Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: Timestamp(ns) * Timestamp(ns)"}},
+      {"select n from ~p3 where time / time",
+       {:error, 400,
+        "Error during planning: Cannot get result type for temporal operation Timestamp(ns) / Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: Timestamp(ns) / Timestamp(ns)"}},
+      {"select n from ~p3 where (time + time)",
+       {:error, 400,
+        "Error during planning: Cannot get result type for temporal operation Timestamp(ns) + Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: Timestamp(ns) + Timestamp(ns)"}},
+      {"select n from ~p3 where time + time AND n > 1",
+       {:error, 400,
+        "Error during planning: Cannot get result type for temporal operation Timestamp(ns) + Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: Timestamp(ns) + Timestamp(ns)"}},
+      {"select n from ~p3 where n > 1 AND time + time",
+       {:error, 400,
+        "Error during planning: Cannot get result type for temporal operation Timestamp(ns) + Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: Timestamp(ns) + Timestamp(ns)"}},
+      {"select n from ~p3 where time + time = b",
+       {:error, 400,
+        "Error during planning: Cannot get result type for temporal operation Timestamp(ns) + Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: Timestamp(ns) + Timestamp(ns)"}},
+      {"select n from ~p3 where time * time > 1",
+       {:error, 400,
+        "Error during planning: Cannot get result type for temporal operation Timestamp(ns) * Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: Timestamp(ns) * Timestamp(ns)"}}
+    ]
+  end
+
+  @doc "A minus sign before the time, in parentheses or not, is `-1 * time`; before the false of a column the measurement lacks and text, or before a duration, it is a null."
+  @spec negated_time() :: [{binary(), term()}]
+  def negated_time do
+    [
+      {"select n from ~p3 where -(time) = b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Int64 * Timestamp(ns) to valid types"}},
+      {"select n from ~p3 where -(time) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Int64 * Timestamp(ns) to valid types"}},
+      {"select n from ~p3 where -(time) = (n > 1)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Int64 * Timestamp(ns) to valid types"}},
+      {"select n from ~p3 where -(time)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Int64 * Timestamp(ns) to valid types"}},
+      {"select n from ~p3 where -(time + 1h) = b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Int64 * Timestamp(ns) to valid types"}},
+      {"select n from ~p3 where -(nosuch + 'x') = b", []},
+      {"select n from ~p3 where -(nosuch + 'x') + 'x' = b",
+       [{"2023-10-01 00:01:00", %{"n" => 2}}, {"2023-10-01 00:03:00", %{"n" => 7}}]},
+      {"select n from ~p3 where -(nosuch + 'x')", []}
+    ]
+  end
+
+  @doc "Only a comparison with the bare `time` on one side is split out of the condition (and breaks the planner's stack beside a bare operand); the time inside arithmetic is typed like any column."
+  @spec time_in_arithmetic() :: [{binary(), term()}]
+  def time_in_arithmetic do
+    [
+      {"select n from ~p3 where time * 2 > 1 AND b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) * Int64 to valid types"}},
+      {"select n from ~p3 where time * 2 > 1 AND n",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) * Int64 to valid types"}},
+      {"select n from ~p3 where time * 2 > 1 OR b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) * Int64 to valid types"}},
+      {"select n from ~p3 where n * time = 1 AND b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Int64 * Timestamp(ns) to valid types"}},
+      {"select n from ~p3 where n * time = 1 AND n",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Int64 * Timestamp(ns) to valid types"}},
+      {"select n from ~p3 where nosuch * time = 1 AND b", []},
+      {"select n from ~p3 where nosuch * time = 1 AND n", []},
+      {"select n from ~p3 where nosuch * time * nosuch2 = 1 AND b", []},
+      {"select n from ~p3 where nosuch * time * nosuch2 = 1 OR b",
+       [{"2023-10-01 00:00:00", %{"n" => 1}}, {"2023-10-01 00:02:00", %{"n" => -3}}]},
+      {"select n from ~p3 where time + 1 > 0 AND n",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) + Int64 to valid types"}},
+      {"select n from ~p3 where -time > 0 AND n",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Int64 * Timestamp(ns) to valid types"}},
+      {"select n from ~p3 where time - 1 > 0 AND b",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) - Int64 to valid types"}},
+      {"select n from ~p3 where time > 0 AND n",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND b",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > (0) AND n",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where 0 > time AND n",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > now() AND n",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 1h AND n",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 1h AND n > 1",
+       [
+         {"2023-10-01 00:01:00", %{"n" => 2}},
+         {"2023-10-01 00:03:00", %{"n" => 7}},
+         {"2023-10-01 00:04:00", %{"n" => 4}}
+       ]},
+      {"select n from ~p3 where time != 0 AND n",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid time comparison operator: !="}},
+      {"select n from ~p3 where -(time) = now()",
+       {:error, 405, "This feature is not implemented: now"}},
+      {"select n from ~p3 where time + 1h < now() AND n",
+       {:error, 405, "This feature is not implemented: now"}}
+    ]
+  end
+
+  @doc "An unsigned division by a constant zero is folded, a division inside a sum is read as any arithmetic, and a zero divisor at the last of the points is the quotient zero; the refusals of an unsigned division by a zero at another point of three or more are in `refusals/0` (the engine fails the stream there)."
+  @spec unsigned_division_by_zero() :: [{binary(), term()}]
+  def unsigned_division_by_zero do
+    [
+      {"select n from ~p3 where u / 0 = 0",
+       [
+         {"2023-10-01 00:00:00", %{"n" => 1}},
+         {"2023-10-01 00:01:00", %{"n" => 2}},
+         {"2023-10-01 00:02:00", %{"n" => -3}},
+         {"2023-10-01 00:03:00", %{"n" => 7}},
+         {"2023-10-01 00:04:00", %{"n" => 4}}
+       ]},
+      {"select n from ~p3 where u / 0 > 1", []},
+      {"select n from ~p3 where n + n / u > 1",
+       [
+         {"2023-10-01 00:01:00", %{"n" => 2}},
+         {"2023-10-01 00:02:00", %{"n" => -3}},
+         {"2023-10-01 00:03:00", %{"n" => 7}},
+         {"2023-10-01 00:04:00", %{"n" => 4}}
+       ]},
+      {"select n from ~p3 where u / 2 = 1",
+       [{"2023-10-01 00:01:00", %{"n" => 2}}, {"2023-10-01 00:03:00", %{"n" => 7}}]},
+      {"select n from ~p3 where u / (u - 1) = 1",
+       [{"2023-10-01 00:01:00", %{"n" => 2}}, {"2023-10-01 00:02:00", %{"n" => -3}}]},
+      {"select n from ~p3 where u / (u - 1) > 0",
+       [
+         {"2023-10-01 00:01:00", %{"n" => 2}},
+         {"2023-10-01 00:02:00", %{"n" => -3}},
+         {"2023-10-01 00:03:00", %{"n" => 7}}
+       ]},
+      {"select n from ~p3 where 1 / (u - 1) = 1", [{"2023-10-01 00:03:00", %{"n" => 7}}]}
+    ]
+  end
+
+  @doc "`abs()` with the wrong number of arguments is the planner's arity error, which names each argument by the type the engine gives it: `Null` for a column the measurement lacks and for the null that arithmetic of text and numbers makes, `Boolean` for the false of a column the measurement lacks and text, `UInt64` for the quotient of an unsigned number and anything it cannot divide, `Float64` for it beside a float, `Interval(MonthDayNano)` for a duration. The coercion error of the arithmetic inside an argument comes before the call's own, and as the whole condition so does the error of a quotient among the arguments; `abs()` of a duration is the planner's error for a duration."
+  @spec abs_arguments() :: [{binary(), term()}]
+  def abs_arguments do
+    [
+      {"select n from ~p3 where abs(u, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(UInt64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(1, u) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Int64, UInt64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(u, 1, 2) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 3 No function matches the given name and argument types 'abs(UInt64, Int64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(nosuch, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Null, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(nosuch + 1, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Null, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs('x' + 1, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Null, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(-s, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Null, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(nosuch + 'x', 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Boolean, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(1h, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Interval(MonthDayNano), Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(1h * 2, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Null, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(-1h, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Interval(MonthDayNano), Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(time + 1h, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Timestamp(ns), Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(u / s, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(UInt64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(u / b, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(UInt64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs('x' / u, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(UInt64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(u / s * 2, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(UInt64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(u / s * 2.5, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(f + u / s, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(u / s + 1.5 + 'x', 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Null, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(abs(nosuch), 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(nosuch2 - u / b, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Null, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(u + 's', 1) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Utf8 to valid types"}},
+      {"select n from ~p3 where abs(1, u + 's') = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Utf8 to valid types"}},
+      {"select n from ~p3 where abs(t + 's', 1) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Dictionary(Int32, Utf8) + Utf8 to valid types"}},
+      {"select n from ~p3 where abs(time * 2, 1) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression Timestamp(ns) * Int64 to valid types"}},
+      {"select n from ~p3 where abs(abs(u + 's'), 1) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Utf8 to valid types"}},
+      {"select n from ~p3 where abs(u + 's')",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Utf8 to valid types"}},
+      {"select n from ~p3 where abs(u + 's', 1)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Utf8 to valid types"}},
+      {"select n from ~p3 where abs(u, 1)",
+       {:error, 400, "Error during planning: Function 'abs' expects 1 arguments but received 2"}},
+      {"select n from ~p3 where abs(u / s, 1)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where abs(1, u / s)",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 / Utf8 to valid types"}},
+      {"select n from ~p3 where abs(u / b, 1)",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Boolean = UInt64"}},
+      {"select n from ~p3 where abs(1h)",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Interval(MonthDayNano)"}},
+      {"select n from ~p3 where abs(1h) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Interval(MonthDayNano) No function matches the given name and argument types 'abs(Interval(MonthDayNano))'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(1h + 1h) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Interval(MonthDayNano) No function matches the given name and argument types 'abs(Interval(MonthDayNano))'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where -abs(1h) = b",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::Interval(MonthDayNano) No function matches the given name and argument types 'abs(Interval(MonthDayNano))'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(u + 's' + 1) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Utf8 to valid types"}},
+      {"select n from ~p3 where abs(-(u + 's')) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Utf8 to valid types"}},
+      {"select n from ~p3 where abs(u + 's' + 1, 1) = 1",
+       {:error, 400,
+        "Error during planning: Cannot coerce arithmetic expression UInt64 + Utf8 to valid types"}},
+      {"select n from ~p3 where abs(n)",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND Int64"}},
+      {"select n from ~p3 where abs(u)",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND UInt64"}},
+      {"select n from ~p3 where abs(nosuch + 1) = 1", []},
+      {"select n from ~p3 where abs('x' + 1) = 1", []},
+      {"select n from ~p3 where abs(-s) = b", []},
+      {"select n from ~p3 where abs(abs(nosuch + 1), 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where abs(abs(nosuch + 1) + 1, 1) = 1",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}}
+    ]
+  end
+
+  @doc "A minus sign before a constant in parentheses is folded before the comparison, as the engine does."
+  @spec negated_constants() :: [{binary(), term()}]
+  def negated_constants do
+    [
+      {"select n from ~p3 where n = -(3)", [{"2023-10-01 00:02:00", %{"n" => -3}}]},
+      {"select n from ~p3 where n = -(1)", []},
+      {"select n from ~p3 where n = -(2 + 1)", [{"2023-10-01 00:02:00", %{"n" => -3}}]},
+      {"select n from ~p3 where n > -(1)",
+       [
+         {"2023-10-01 00:00:00", %{"n" => 1}},
+         {"2023-10-01 00:01:00", %{"n" => 2}},
+         {"2023-10-01 00:03:00", %{"n" => 7}},
+         {"2023-10-01 00:04:00", %{"n" => 4}}
+       ]},
+      {"select n from ~p3 where -(3) = n", [{"2023-10-01 00:02:00", %{"n" => -3}}]},
+      {"select n from ~p3 where n < -(-(2))",
+       [{"2023-10-01 00:00:00", %{"n" => 1}}, {"2023-10-01 00:02:00", %{"n" => -3}}]}
+    ]
+  end
+
+  @doc "The `+` of two strings is a concatenation of its own beside a bare operand of an `AND` or an `OR`, and compared with a tag."
+  @spec concatenated_strings() :: [{binary(), term()}]
+  def concatenated_strings do
+    [
+      {"select n from ~p3 where s + s AND n > 1", []},
+      {"select n from ~p3 where s + s OR n > 1", []},
+      {"select n from ~p3 where s + s = t", []},
+      {"select n from ~p3 where t = s + s", []},
+      {"select n from ~p3 where s + 'x' = t", []}
+    ]
+  end
+
+  @doc "A comparison chained with another (`n > 1 = true`) is a comparison like any other beside a bare operand of an `AND` or an `OR`."
+  @spec chains_beside_bare() :: [{binary(), term()}]
+  def chains_beside_bare do
+    [
+      {"select n from ~p3 where n > 1 = true AND n", []},
+      {"select n from ~p3 where n > 1 = true AND f", []},
+      {"select n from ~p3 where n > 1 = true OR n", []}
+    ]
+  end
+
+  @doc "The planner splits the time out of a condition before it types or plans the rest, and breaks its stack at any operand that is no comparison and no `true` or `false` on its own: arithmetic that is an error of the engine or a null, a column the measurement lacks, a call that fails or that the double does not compute, `now()`. Its error is the engine's whatever the operand holds."
+  @spec computed_bare_operands() :: [{binary(), term()}]
+  def computed_bare_operands do
+    [
+      {"select n from ~p3 where time > 0 AND nosuch + 1",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND 1h + 1h",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND u + 's'",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND 's' + 1",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND t + 's'",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND time + time",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND u / b",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND u / s",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND 1 / 0",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND 18446744073709551615 + 1",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND abs()",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND abs(n, 1)",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND abs(true)",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND abs(time)",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND abs(now())",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND abs(now() + 1h)",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND now()",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND now() - 1h",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where abs(now()) AND time > 0",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 OR abs(now())",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND sqrt(1)",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND abs(sqrt(1))",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where (time > 0) AND (u + 's')",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from ~p3 where time > 0 AND true",
+       [
+         {"2023-10-01 00:00:00", %{"n" => 1}},
+         {"2023-10-01 00:01:00", %{"n" => 2}},
+         {"2023-10-01 00:02:00", %{"n" => -3}},
+         {"2023-10-01 00:03:00", %{"n" => 7}},
+         {"2023-10-01 00:04:00", %{"n" => 4}}
+       ]},
+      {"select n from nomeasure where time > 0 AND x",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from nomeasure where time > 0 AND 1h",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from nomeasure, ~p3 where time > 0 AND x",
+       {:error, 500,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nExternal error: InfluxQL internal error: invalid expr stack"}},
+      {"select n from nomeasure where time > 0 AND true", []},
+      {"select n from nomeasure where x", []}
+    ]
+  end
+
+  @doc "A parenthesis behind an operand in the arguments of a call is where the parser fails (a name before it is a call of that name, which is its own error)."
+  @spec call_argument_parentheses() :: [{binary(), term()}]
+  def call_argument_parentheses do
+    [
+      {"select n from ~p3 where abs(1 (2)) = 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"(2)) = 1\", Char)"}},
+      {"select n from ~p3 where abs(1h (1)) = 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"(1)) = 1\", Char)"}},
+      {"select n from ~p3 where abs('x' (1)) = 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"(1)) = 1\", Char)"}},
+      {"select n from ~p3 where abs(true (1)) = 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"(1)) = 1\", Char)"}},
+      {"select n from ~p3 where abs((1) (2)) = 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"(2)) = 1\", Char)"}},
+      {"select n from ~p3 where abs(1 (2), 3) = 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"(2), 3) = 1\", Char)"}},
+      {"select n from ~p3 where abs(1, 2 (3)) = 1",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: invalid InfluxQL statement at pos 0. Parsing Failure: Nom(\"(3)) = 1\", Char)"}}
+    ]
+  end
+
   @doc "Statements the engine answers (or rejects with a body the double does not give) and the double refuses by name, with the engine's answer."
   @spec refusals() :: [{binary(), term()}]
   def refusals do
@@ -1511,7 +2234,43 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
       {"select usage from ~p1 where (18446744073709551615) * 2 > 0", rows(@every)},
       {"select usage from ~p1 where (n > 1) = 1h", []},
       {"select usage from ~p1 where time - time = ok", []},
-      {"select usage from ~p1 where (time - time) + nosuch = ok", rows(@ok_false)}
+      {"select usage from ~p1 where (time - time) + nosuch = ok", rows(@ok_false)},
+      {"select n from ~p3 where time + 1h = 1 AND b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) = Int64"}},
+      {"select n from ~p3 where time + 1h > 0",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) > Int64"}},
+      {"select n from ~p3 where time + 1h > 0 AND n",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) > Int64"}},
+      {"select n from ~p3 where (time) > 0 AND n",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation Timestamp(ns) > Int64"}},
+      {"select n from ~p3 where 1 / u = 1", :closed},
+      {"select n from ~p3 where u / u = 1", :closed},
+      {"select n from ~p3 where n / u > 1", :closed},
+      {"select n from ~p3 where -n / u > 1", :closed},
+      {"select n from ~p3 where n / abs(u) = 1", :closed},
+      {"select n from ~p3 where abs(1, 2) = 1 AND n",
+       {:error, 400,
+        "Error during planning: Function 'abs' expects 1 arguments but received 2 No function matches the given name and argument types 'abs(Int64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
+      {"select n from ~p3 where s > 9223372036854775808",
+       [
+         {"2023-10-01 00:00:00", %{"n" => 1}},
+         {"2023-10-01 00:01:00", %{"n" => 2}},
+         {"2023-10-01 00:02:00", %{"n" => -3}},
+         {"2023-10-01 00:03:00", %{"n" => 7}}
+       ]},
+      {"select n from ~p3 where abs(nosuch + 1)",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND Float64"}},
+      {"select n from ~p3 where abs(-s)",
+       {:error, 400,
+        "type_coercion\ncaused by\nError during planning: Cannot infer common argument type for logical boolean operation Boolean AND Float64"}},
+      {"select n from ~p3 where abs(nosuch + 1) AND n",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for logical boolean operation Float64 AND Int64"}}
     ]
   end
 
@@ -1600,7 +2359,35 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
       "select usage from ~p1 where time - time = ok" =>
         "unsupported InfluxQL (the difference of two timestamps)",
       "select usage from ~p1 where (time - time) + nosuch = ok" =>
-        "unsupported InfluxQL (the difference of two timestamps)"
+        "unsupported InfluxQL (the difference of two timestamps)",
+      "select n from ~p3 where time + 1h = 1 AND b" =>
+        "unsupported InfluxQL (a duration in arithmetic with the time)",
+      "select n from ~p3 where time + 1h > 0" =>
+        "unsupported InfluxQL (a duration in arithmetic with the time)",
+      "select n from ~p3 where time + 1h > 0 AND n" =>
+        "unsupported InfluxQL (a bare non-boolean operand beside a comparison the engine refuses)",
+      "select n from ~p3 where (time) > 0 AND n" =>
+        "unsupported InfluxQL (a bare non-boolean operand beside a comparison the engine refuses)",
+      "select n from ~p3 where 1 / u = 1" =>
+        "unsupported InfluxQL (an unsigned division by zero)",
+      "select n from ~p3 where u / u = 1" =>
+        "unsupported InfluxQL (an unsigned division by zero)",
+      "select n from ~p3 where n / u > 1" =>
+        "unsupported InfluxQL (an unsigned division by zero)",
+      "select n from ~p3 where -n / u > 1" =>
+        "unsupported InfluxQL (an unsigned division by zero)",
+      "select n from ~p3 where n / abs(u) = 1" =>
+        "unsupported InfluxQL (an unsigned division by zero)",
+      "select n from ~p3 where abs(1, 2) = 1 AND n" =>
+        "unsupported InfluxQL (a bare non-boolean operand beside a comparison the engine refuses)",
+      "select n from ~p3 where s > 9223372036854775808" =>
+        "unsupported InfluxQL (a string compared with an integer beyond 64 bits signed)",
+      "select n from ~p3 where abs(nosuch + 1)" =>
+        "unsupported InfluxQL (abs() of a null as a bare operand)",
+      "select n from ~p3 where abs(-s)" =>
+        "unsupported InfluxQL (abs() of a null as a bare operand)",
+      "select n from ~p3 where abs(nosuch + 1) AND n" =>
+        "unsupported InfluxQL (a bare non-boolean operand beside a comparison the engine refuses)"
     }
   end
 end

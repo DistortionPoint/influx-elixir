@@ -763,6 +763,63 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           check_fix(ctx, InfluxQLNestedCases.clause_ends())
         end
 
+        test "an integer past the signed range beside a condition in parentheses or text", ctx do
+          check_fix(ctx, InfluxQLNestedCases.big_constants())
+        end
+
+        test "arithmetic with a column the measurement lacks that stands alone", ctx do
+          check_fix(ctx, InfluxQLNestedCases.absent_arithmetic_alone())
+        end
+
+        test "an unsigned number divided by text, a boolean, the time or a duration", ctx do
+          check_fix(ctx, InfluxQLNestedCases.unsigned_quotients())
+        end
+
+        test "abs() of the false of a column the measurement lacks and text", ctx do
+          check_fix(ctx, InfluxQLNestedCases.abs_of_a_boolean())
+        end
+
+        test "the sum, product or quotient of two times", ctx do
+          check_fix(ctx, InfluxQLNestedCases.temporal_arithmetic())
+        end
+
+        test "a minus sign before the time or a false", ctx do
+          check_fix(ctx, InfluxQLNestedCases.negated_time())
+        end
+
+        test "the time inside arithmetic beside a bare operand", ctx do
+          check_fix(ctx, InfluxQLNestedCases.time_in_arithmetic())
+        end
+
+        test "an unsigned division by a zero that is folded", ctx do
+          check_fix(ctx, InfluxQLNestedCases.unsigned_division_by_zero())
+        end
+
+        test "abs() with the wrong number of arguments, named by the types of its arguments",
+             ctx do
+          check_fix(ctx, InfluxQLNestedCases.abs_arguments())
+        end
+
+        test "a minus sign before a constant in parentheses", ctx do
+          check_fix(ctx, InfluxQLNestedCases.negated_constants())
+        end
+
+        test "the concatenation of two strings beside a bare operand or a tag", ctx do
+          check_fix(ctx, InfluxQLNestedCases.concatenated_strings())
+        end
+
+        test "a chained comparison beside a bare operand", ctx do
+          check_fix(ctx, InfluxQLNestedCases.chains_beside_bare())
+        end
+
+        test "a computed bare operand beside a comparison of the time", ctx do
+          check_fix(ctx, InfluxQLNestedCases.computed_bare_operands())
+        end
+
+        test "a parenthesis behind an operand in the arguments of a call", ctx do
+          check_fix(ctx, InfluxQLNestedCases.call_argument_parentheses())
+        end
+
         @tag local_divergence:
                "what the engine answers and the double does not compute is refused by name"
         test "statements the double refuses by name, each for its own reason", ctx do

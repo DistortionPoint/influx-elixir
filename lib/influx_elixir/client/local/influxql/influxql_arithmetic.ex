@@ -14,7 +14,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   #   * `+`, `-` and `*` wrap at the range of the type, signed as well as
   #     unsigned; `/` of two signed integers is a float division, of unsigned ones it
   #     truncates, and a division by zero is zero, whatever the type
-  #     (verified: `n / 0 = 0` and `v / 0 = 0` keep every point that has the field, `> 0` none)
+  #     (verified: `n / 0 = 0` and `v / 0 = 0` keep every point that has the field, `> 0` none);
+  #     but an unsigned division by a zero that the points make, as the side of a comparison
+  #     (`1 / u = 1` for `u = 0`), fails the stream half way: the double refuses it by name
   #   * `abs(x)` is the absolute value, in the type of `x`; of the smallest 64-bit integer it
   #     breaks the connection (verified)
   #   * `-x` is `x * -1`, so `-u` is not the negation of `u`
@@ -223,6 +225,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   def holds?({:check, op, left, right}, row),
     do: compare(op, eval(left, row), eval(right, row))
 
+  @doc """
+  Whether a row makes a side of a check an unsigned division by zero (`1 / u` for `u = 0`,
+  `u / u`, `n / u`). The engine fails the stream half way when it divides so over three points
+  or more and the point is not the last of them (verified; over two points, or at the last of
+  the points, the quotient is zero): the double cannot give that failure, and refuses it.
+  """
+  @spec zero_division?(check(), map()) :: boolean()
+  def zero_division?({:check, _op, left, right}, row),
+    do: zero_division_side?(left, row) or zero_division_side?(right, row)
+
+  defp zero_division_side?({:op, "/", left, right}, row),
+    do: unsigned_zero_division?(eval(left, row), eval(right, row), right)
+
+  defp zero_division_side?(_expr, _row), do: false
+
   @spec eval(expr(), map()) :: value()
   defp eval({:lit, value}, _row), do: value
 
@@ -234,6 +251,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   end
 
   defp eval({:abs, operand}, row), do: absolute(eval(operand, row))
+
+  # (A constant zero divisor is folded, `u / 0 = 0` keeps every point, and a division inside a
+  # sum is not read so: `n + n / u > 1` answers.)
+  @spec unsigned_zero_division?(value(), value(), expr()) :: boolean()
+  defp unsigned_zero_division?(x, y, right) do
+    not match?({:lit, _value}, right) and (unsigned?(x) or unsigned?(y)) and
+      not match?({:float, _x}, x) and not match?({:float, _y}, y) and zero?(y)
+  end
+
+  defp unsigned?({:uint, _n}), do: true
+  defp unsigned?(_value), do: false
+
+  defp zero?({_kind, 0}), do: true
+  defp zero?(_value), do: false
 
   # The lowest 64-bit integer written as a constant beside an unsigned operand breaks the
   # engine's connection (verified: `u * -9223372036854775808 > 0`, whatever the operator).

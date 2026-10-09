@@ -267,10 +267,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   defp grouped_in_connective?({:group, node}), do: grouped_in_connective?(node)
   defp grouped_in_connective?(_node), do: false
 
-  @doc "Whether a comparison of the `time` stands anywhere in the condition tree."
+  @doc """
+  Whether a comparison with the bare `time` on a side stands anywhere in the condition tree: the
+  only comparison the planner splits the time out of the condition by (`time * 2 > 1` and
+  `n * time = 1` are not, they are planned as they are typed).
+  """
   @spec mentions_time_comparison?(tuple()) :: boolean()
-  def mentions_time_comparison?({:cmp, tokens}),
-    do: Enum.any?(tokens, &match?({:op, _op}, &1)) and Enum.any?(tokens, &InfluxQLTokens.time?/1)
+  def mentions_time_comparison?({:cmp, tokens}), do: InfluxQLTokens.time_comparison?(tokens)
 
   def mentions_time_comparison?({:group, node}), do: mentions_time_comparison?(node)
 

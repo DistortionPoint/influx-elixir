@@ -21,11 +21,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLSources do
   @regex ~S{/(?:[^/\\]|\\.)*/}
   @name_start ~q/\A(?:#{@name})/
 
+  @regex_start ~q/\A#{@regex}/
+
   # The most sources a list is read to (a list longer is refused by name, never held): the
   # engine's own planner takes seconds for a few thousand (2,500 copies of one measurement took
   # 17 s), so nothing past that was verified.
   @max_sources 2_500
-  @regex_start ~q/\A#{@regex}/
 
   @typedoc """
   A source: its name or regular expression, and the parts written before it (`[]`, `[rp]`
