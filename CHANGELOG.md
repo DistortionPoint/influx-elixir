@@ -8,6 +8,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Every option that is not usable is a named error, never a raise**: `query_influxql` with
+  a `:database` that is not a string raised `CaseClauseError` (a regression of the previous
+  fix). Options that are not a keyword list, a `:precision` that is no word, a `:retention`
+  or a v2 bucket name that is not UTF-8, and `:permissions` that are not a list now give a
+  named error in `Client.Local` (`Client.HTTP` too, for `:permissions`). `Local.check_sql/1`
+  of a non-string is a refusal. `Local.write/3` takes iodata, as `Client.HTTP` sends it.
+  `Client.HTTP` returns `{:error, {:unencodable_body, _}}` for an improper list or a map key
+  JSON cannot write (Jason raised). `Local.start/1` raises a named `ArgumentError` for
+  database names that are not strings.
+- **`Flight.Client` never ends the caller**: a bare IPv6 host (`::1`) still crashed it;
+  any host with a colon is `{:error, {:ipv6_unsupported, host}}`, and a raise inside the
+  connect is `{:error, {:connect_failed, message}}` instead of the linked task's crash.
+- **`Flight.Reader`**: a null or struct field may cover the batch's rows when other fields
+  carry data (a wide batch with a null column was refused); only a batch of such fields alone
+  is bounded by cells.
+- **`Client.Local` InfluxQL: keywords directly against the next character, as Core reads
+  them**:
+  - `WHERE(…)`, `WHERE+1 = 1`, `SELECT*FROM`, `SELECT(v)FROM`, `"v"FROM` and `FROM/re/` are
+    answered (they were refused or gave a wrong `Nom` body). `SHOW … WHERE(…)` is `[]`, as
+    Core gives.
+  - `LIMIT(1)`, `LIMIT-1`, `GROUP BY(a)` and their kin give Core's `Nom` error from the
+    keyword.
+  - `tz(…)` inside a condition gives Core's "only valid function calls" error at its
+    position.
+  - A statement that starts with a quote or `/` gives Core's `Nom` at the first character.
+  - A SHOW keyword against a quote gives Core's clause error, not "unterminated string
+    literal". The lexer error stays only where Core reads a name, a regex or an expression.
+    `SHOW MEASUREMENTS WITH MEASUREMENT = /x` raised `MatchError`; it gives Core's
+    "unterminated regex literal".
+  - Subqueries, a number glued to `FROM` and `WHERE` glued to a quote, `*`, `=` or `)` are
+    refused by name.
+  - A blank run is skipped once: 32,000 spaces tokenize in about 40 ms, not 1.4 s.
+  - The `~q` blank rewrite tracks bracket classes (`[]\s]`). A construct it cannot rewrite
+    (`\S` in a class, POSIX classes, `\Q…\E`, `\R`, `\h`, `\v`, `\p{Z}`, the `x` mode) now
+    fails the compile. That caught `[\f\v]` in the blank check, where PCRE's `\v` also
+    matches `\n` and `\r`.
 - **`Client.Local` InfluxQL: one blank rule, keywords against odd characters, `tz` last**:
   InfluxQL blanks are a space, tab, CR or LF only; about 87 patterns also read `\v` and `\f`
   as blanks, so `SHOW TAG\vKEYS` and `SHOW\vMEASUREMENTS` gave another error than the

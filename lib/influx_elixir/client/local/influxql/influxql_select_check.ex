@@ -68,8 +68,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
       {:from, from_at, from_length} ->
         items = binary_part(masked, items_at, from_at - items_at)
 
-        check_each_item(whole, items, items_at, from_at + 1) ||
-          check_from(masked, from_at + from_length)
+        check_each_item(whole, items, items_at, keyword_at(masked, from_at)) ||
+          check_from(whole, masked, from_at + from_length)
 
       {:operator, operator, operand_at} ->
         engine(operand_at, operator_body(operator, operand_at, whole))
@@ -129,7 +129,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
           | :none
   defp from_keyword(masked, items_at) do
     candidates =
-      for [{at, length}] <- Regex.scan(~q/\sFROM(?![\w])\s*/i, masked, return: :index),
+      for [{at, length}] <-
+            Regex.scan(~q/(?:\s|(?<=[*)"']))FROM(?![\w])\s*/i, masked, return: :index),
           at >= items_at,
           do: {at, length}
 
@@ -137,18 +138,29 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
       before = binary_part(masked, items_at, at - items_at)
 
       case operator_before(before) do
-        nil -> {:from, at, length}
-        {operator, operand_at} -> {:operator, operator, operand_start(before, operand_at, at)}
+        nil ->
+          {:from, at, length}
+
+        {operator, operand_at} ->
+          {:operator, operator, operand_start(before, operand_at, at, keyword_at(masked, at))}
       end
     end)
   end
 
+  # Where the word `FROM` starts: a `FROM` that follows a blank is found at the blank, one
+  # directly against the end of an item (`*FROM`, `)FROM`, `"a"FROM`, `'a'FROM`) at the word.
+  @spec keyword_at(binary(), non_neg_integer()) :: non_neg_integer()
+  defp keyword_at(masked, at) do
+    if binary_part(masked, at, 1) =~ ~q/\s/, do: at + 1, else: at
+  end
+
   # Where the operand after an operator starts: the `FROM` itself when nothing
   # follows the operator in the text before it.
-  @spec operand_start(binary(), non_neg_integer(), non_neg_integer()) :: non_neg_integer()
-  defp operand_start(before, operand_at, from_at) do
+  @spec operand_start(binary(), non_neg_integer(), non_neg_integer(), non_neg_integer()) ::
+          non_neg_integer()
+  defp operand_start(before, operand_at, from_at, keyword_at) do
     if operand_at == byte_size(before),
-      do: from_at + 1,
+      do: keyword_at,
       else: from_at - byte_size(before) + operand_at
   end
 
@@ -182,14 +194,28 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   defp operator_body(_operator, _operand_at, whole),
     do: InfluxQLError.syntax_error_body(:nom, 0, whole)
 
-  @spec check_from(binary(), non_neg_integer()) :: InfluxQLCheck.positioned() | nil
-  defp check_from(masked, from_end) do
+  # `FROM` directly against a quote leaves the whole statement unparsed (verified: `FROM"m"`,
+  # `FROM'm'`); against a slash or a parenthesis it reads (`FROM/m/`, `FROM(SELECT ...)`);
+  # against anything else the double does not tell and refuses.
+  @spec check_from(binary(), binary(), non_neg_integer()) :: InfluxQLCheck.positioned() | nil
+  defp check_from(whole, masked, from_end) do
     rest = binary_part(masked, from_end, byte_size(masked) - from_end)
+    glued? = rest != "" and binary_part(masked, from_end - 1, 1) =~ ~q/\S/
 
-    if rest == "" or InfluxQLText.reserved_start(rest) != nil or
-         not (rest =~ ~q/^[A-Za-z_"\/(]/),
-       do: engine(from_end, InfluxQLError.syntax_error_body(:from, from_end, masked)),
-       else: nil
+    cond do
+      glued? and rest =~ ~q/^["']/ ->
+        engine(from_end, InfluxQLError.syntax_error_body(:nom, 0, whole))
+
+      glued? and not (rest =~ ~q/^[\/(]/) ->
+        InfluxQLCheck.refuse(from_end, "unsupported InfluxQL (FROM directly against that)")
+
+      rest == "" or InfluxQLText.reserved_start(rest) != nil or
+          not (rest =~ ~q/^[A-Za-z_"\/(]/) ->
+        engine(from_end, InfluxQLError.syntax_error_body(:from, from_end, masked))
+
+      true ->
+        nil
+    end
   end
 
   # The comma-separated pieces of a text (its literals masked), each with its

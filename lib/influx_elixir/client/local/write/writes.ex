@@ -93,6 +93,11 @@ defmodule InfluxElixir.Client.Local.Writes do
           {:ok, LineProtocolParser.precision()} | {:error, map()}
   defp normalize_precision(nil, _profile), do: {:ok, :nanosecond}
 
+  # A precision that is no word (a map, a tuple) has no spelling the engine could be sent.
+  defp normalize_precision(precision, _profile)
+       when not (is_atom(precision) or is_binary(precision)),
+       do: {:error, %{status: 400, body: "Client.Local: the precision is not a string"}}
+
   defp normalize_precision(precision, :v2) do
     case Map.fetch(@v2_precisions, to_string(precision)) do
       {:ok, unit} ->

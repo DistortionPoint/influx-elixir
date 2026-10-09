@@ -116,14 +116,17 @@ defmodule InfluxElixir.Flight.Client do
 
   @spec connect(connection(), keyword()) :: {:ok, GRPC.Channel.t()} | {:error, term()}
   defp connect(connection, opts) do
-    case Map.fetch!(connection, :host) do
-      "[" <> _address = host -> {:error, {:ipv6_unsupported, host}}
-      host -> connect(host, connection, opts)
-    end
+    host = Map.fetch!(connection, :host)
+
+    # An IPv6 address, bracketed (`[::1]`, as `Config` takes it) or bare (`::1`), has a colon.
+    if String.contains?(host, ":"),
+      do: {:error, {:ipv6_unsupported, host}},
+      else: open_channel(host, connection, opts)
   end
 
-  @spec connect(binary(), connection(), keyword()) :: {:ok, GRPC.Channel.t()} | {:error, term()}
-  defp connect(host, connection, opts) do
+  @spec open_channel(binary(), connection(), keyword()) ::
+          {:ok, GRPC.Channel.t()} | {:error, term()}
+  defp open_channel(host, connection, opts) do
     port = Map.get(connection, :port, @default_port)
     use_tls = Keyword.get(opts, :tls, port == 443)
     connect_timeout = resolve_connect_timeout(opts)
@@ -161,13 +164,21 @@ defmodule InfluxElixir.Flight.Client do
   # not rely on the underlying gRPC adapter exposing a connect-timeout
   # knob (which `grpc 0.11` does not).
   #
-  # `Task.async` links the task to the caller, so a crash inside `fun`
-  # propagates to the caller — matching today's direct-call behaviour
-  # when `GRPC.Stub.connect/2` raises.
-  @spec bounded_connect((-> result), non_neg_integer()) :: result | {:error, :connect_timeout}
+  # A raise inside `fun` (the gRPC client raises on an address it cannot read) is the
+  # caller's `{:error, {:connect_failed, message}}`: the task is linked, and a crash would
+  # otherwise end the caller, which `query/3` promises an error tuple.
+  @spec bounded_connect((-> result), non_neg_integer()) ::
+          result | {:error, :connect_timeout | {:connect_failed, binary()}}
         when result: term()
   def bounded_connect(fun, timeout) when is_function(fun, 0) do
-    task = Task.async(fun)
+    task =
+      Task.async(fn ->
+        try do
+          fun.()
+        rescue
+          error -> {:error, {:connect_failed, Exception.message(error)}}
+        end
+      end)
 
     case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
       {:ok, result} -> result

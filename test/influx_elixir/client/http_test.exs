@@ -247,7 +247,8 @@ defmodule InfluxElixir.Client.HTTPTest do
     test "a value JSON has no form for (a tuple, a pid) is the same error, never a raise" do
       conn = connection(ClosedPort.port(), [])
 
-      for value <- [{1}, self(), fn -> :x end] do
+      # An improper list and a map key JSON has no form for make Jason raise, not return.
+      for value <- [{1}, self(), fn -> :x end, [1 | 2], %{{1} => 2}] do
         assert {:error, {:unencodable_body, _message}} = HTTP.query_sql(conn, value)
 
         assert {:error, {:unencodable_body, _message}} =

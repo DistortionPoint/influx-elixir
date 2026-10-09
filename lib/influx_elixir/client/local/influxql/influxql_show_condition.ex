@@ -8,26 +8,35 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowCondition do
   # VALUES`. Each takes the spec read so far and returns it with the condition
   # added, with where the clause ends, or the engine's parse error.
 
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
+
   alias InfluxElixir.Client.Local.{InfluxQLCheck, InfluxQLLex}
   alias InfluxElixir.Client.Local.InfluxQLShowText, as: Text
 
-  @cond_end ~r/\b(?:LIMIT|OFFSET|SLIMIT|SOFFSET|GROUP|ORDER|FILL)\b|;/i
+  @cond_end ~q/\b(?:LIMIT|OFFSET|SLIMIT|SOFFSET|GROUP|ORDER|FILL)\b|;/i
 
   # ---- WHERE ------------------------------------------------------------------
 
   @doc """
   The `WHERE` clause at `pos`: `:none` when it is not there or holds nothing;
-  a condition the engine stops reading half way is refused by name.
+  a condition the engine stops reading half way is refused by name. The keyword is read
+  wherever the engine reads it (`keyword_end?/2`): `WHERE(a = 1)` and `WHERE-1 = a` are
+  conditions as `WHERE (a = 1)` is.
   """
   @spec where(Text.ctx(), non_neg_integer(), map()) :: Text.step()
   def where(ctx, pos, spec) do
     with {:ok, at} <- Text.keyword(ctx, pos, "where"),
-         true <- Text.ws?(ctx, at + 5) || :none do
+         true <- Text.keyword_end?(ctx, at + 5) || :none do
       from = Text.skip_ws(ctx, at + 5)
       to = condition_end(ctx, from)
       text = ctx.clean |> binary_part(from, to - from) |> InfluxQLLex.trim_trailing_blanks()
 
-      if text == "", do: :none, else: condition(ctx, text, from + byte_size(text), spec)
+      cond do
+        text == "" -> :none
+        # The lexer meets a string never closed anywhere in an expression.
+        error = Text.lexer_error(ctx, from) -> error
+        true -> condition(ctx, text, from + byte_size(text), spec)
+      end
     end
   end
 
@@ -67,8 +76,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowCondition do
   # error.
   defp measurement_name(ctx, at, spec) do
     if Text.at_byte(ctx, at) == "/" do
-      {_source, to} = Text.regex_literal(ctx, at)
-      {:ok, Text.defer(spec, {:planning, "expected string but got regex"}), to}
+      with {:ok, _source, to} <- Text.regex_literal(ctx, at),
+           do: {:ok, Text.defer(spec, {:planning, "expected string but got regex"}), to}
     else
       case Text.source_at(ctx, at) do
         {:ok, item, to} -> {:ok, put_measurement(spec, item), to}

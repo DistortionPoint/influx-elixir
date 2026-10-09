@@ -582,7 +582,8 @@ defmodule InfluxElixir.Client.Local do
 
   On the v3 profiles each name must be one InfluxDB 3 accepts, and
   `:v3_core` holds at most 5; `start/1` raises `ArgumentError` with the
-  engine's message otherwise.
+  engine's message otherwise. It also raises `ArgumentError` when
+  `:databases` is not a list of strings or `:database` is not a string.
     * `:profile` - InfluxDB version profile to emulate. Determines which
       operations are available. Operations outside the profile return
       `{:error, :unsupported_operation}`. Valid values:
@@ -620,6 +621,14 @@ defmodule InfluxElixir.Client.Local do
     # operation that needs one is `{:error, :no_database_specified}` — no
     # "default" database the server does not have.
     listed = Keyword.get(opts, :databases, [])
+
+    unless is_list(listed) and Enum.all?(listed, &is_binary/1) and
+             (is_binary(opts[:database]) or is_nil(opts[:database])) do
+      raise ArgumentError,
+            "invalid databases: :databases must be a list of strings and :database a string, " <>
+              "got #{inspect(Keyword.take(opts, [:databases, :database]))}"
+    end
+
     database = Keyword.get(opts, :database) || List.first(listed)
     databases = Enum.uniq(listed ++ List.wrap(database))
 
@@ -649,6 +658,8 @@ defmodule InfluxElixir.Client.Local do
   InfluxDB; see the testing guide.
   """
   @spec check_sql(binary()) :: :ok | {:error, %{status: 400, body: binary()}}
+  def check_sql(sql) when not is_binary(sql), do: refused("the SQL text is not a string")
+
   def check_sql(sql) do
     case SQLParser.parse_select(sql) do
       {:ok, _query} -> :ok
@@ -692,7 +703,7 @@ defmodule InfluxElixir.Client.Local do
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(conn, payload, opts \\ []),
-    do: text(payload, "line protocol", fn -> Writes.write(conn, payload, opts) end)
+    do: text(iodata(payload), "line protocol", opts, &Writes.write(conn, &1, opts))
 
   # ---------------------------------------------------------------------------
   # SQL Query
@@ -710,7 +721,7 @@ defmodule InfluxElixir.Client.Local do
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_sql(conn, sql, opts \\ []),
-    do: text(sql, "SQL text", fn -> SQLQuery.query_sql(conn, sql, opts) end)
+    do: text(sql, "SQL text", opts, &SQLQuery.query_sql(conn, &1, opts))
 
   @doc """
   Executes a SQL query and returns results as a lazy `Stream`.
@@ -734,7 +745,7 @@ defmodule InfluxElixir.Client.Local do
         ) :: Enumerable.t()
   def query_sql_stream(conn, sql, opts \\ [])
 
-  def query_sql_stream(conn, sql, opts) when is_binary(sql),
+  def query_sql_stream(conn, sql, opts) when is_binary(sql) and is_list(opts),
     do: SQLQuery.query_sql_stream(conn, sql, opts)
 
   def query_sql_stream(_conn, _sql, _opts) do
@@ -768,7 +779,7 @@ defmodule InfluxElixir.Client.Local do
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map() | [map()]} | {:error, term()}
   def execute_sql(conn, sql, opts \\ []),
-    do: text(sql, "SQL text", fn -> SQLQuery.execute_sql(conn, sql, opts) end)
+    do: text(sql, "SQL text", opts, &SQLQuery.execute_sql(conn, &1, opts))
 
   # ---------------------------------------------------------------------------
   # InfluxQL and Flux queries
@@ -815,8 +826,7 @@ defmodule InfluxElixir.Client.Local do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(conn, influxql, opts \\ []),
-    do:
-      text(influxql, "InfluxQL text", fn -> InfluxQLQuery.query_influxql(conn, influxql, opts) end)
+    do: text(influxql, "InfluxQL text", opts, &InfluxQLQuery.query_influxql(conn, &1, opts))
 
   @doc """
   Executes a Flux query as InfluxDB 2 does. The pipeline starts with
@@ -840,15 +850,38 @@ defmodule InfluxElixir.Client.Local do
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_flux(conn, flux, opts \\ []),
-    do: text(flux, "Flux text", fn -> FluxQuery.query_flux(conn, flux, opts) end)
+    do: text(flux, "Flux text", opts, &FluxQuery.query_flux(conn, &1, opts))
 
-  # A statement or a body that is not text has no engine answer the double could match: it
-  # is refused by name, never raised (`Client.HTTP` sends what JSON can encode).
-  @spec text(term(), binary(), (-> result)) :: result | {:error, map()} when result: term()
-  defp text(value, _what, run) when is_binary(value), do: run.()
+  # A statement or a body that is not text, or options that are not a keyword list, have no
+  # engine answer the double could match: refused by name, never raised (`Client.HTTP` sends
+  # what JSON can encode).
+  @spec text(term(), binary(), term(), (binary() -> result)) :: result | {:error, map()}
+        when result: term()
+  defp text(value, what, opts, run) do
+    cond do
+      not keyword?(opts) -> refused("the options are not a keyword list")
+      is_binary(value) -> run.(value)
+      true -> refused("the #{what} is not a string")
+    end
+  end
 
-  defp text(_value, what, _run),
-    do: {:error, %{status: 400, body: "Client.Local: the #{what} is not a string"}}
+  @spec options(term(), (-> result)) :: result | {:error, map()} when result: term()
+  defp options(opts, run),
+    do: if(keyword?(opts), do: run.(), else: refused("the options are not a keyword list"))
+
+  defp keyword?(opts), do: is_list(opts) and Keyword.keyword?(opts)
+
+  defp refused(why), do: {:error, %{status: 400, body: "Client.Local: " <> why}}
+
+  # A body may be iodata, as `Client.HTTP` sends it; anything else stays as given.
+  @spec iodata(term()) :: term()
+  defp iodata(payload) when is_list(payload) do
+    IO.iodata_to_binary(payload)
+  rescue
+    ArgumentError -> payload
+  end
+
+  defp iodata(payload), do: payload
 
   # ---------------------------------------------------------------------------
   # Database admin
@@ -892,7 +925,8 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           keyword()
         ) :: :ok | {:error, term()}
-  def create_database(conn, name, opts \\ []), do: Admin.create_database(conn, name, opts)
+  def create_database(conn, name, opts \\ []),
+    do: options(opts, fn -> Admin.create_database(conn, name, opts) end)
 
   @doc """
   Returns the databases as maps with a single `"name"` key, sorted, with
@@ -935,7 +969,8 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           keyword()
         ) :: :ok | {:error, term()}
-  def create_bucket(conn, name, opts \\ []), do: Admin.create_bucket(conn, name, opts)
+  def create_bucket(conn, name, opts \\ []),
+    do: options(opts, fn -> Admin.create_bucket(conn, name, opts) end)
 
   @doc """
   Returns all buckets in this local instance as InfluxDB 2 lists them
@@ -981,7 +1016,8 @@ defmodule InfluxElixir.Client.Local do
           binary(),
           keyword()
         ) :: {:ok, map()} | {:error, term()}
-  def create_token(conn, name, opts \\ []), do: Admin.create_token(conn, name, opts)
+  def create_token(conn, name, opts \\ []),
+    do: options(opts, fn -> Admin.create_token(conn, name, opts) end)
 
   @doc """
   Deletes the token named `name` as InfluxDB 3 does: `:ok`, the engine's

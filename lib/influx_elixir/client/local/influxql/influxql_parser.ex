@@ -34,14 +34,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   defp unsupported do
     [
       {~q/\bINTO\b/i, "INTO"},
-      {~q/\bFROM\s*\(/i, "subqueries"}
+      {~q/\bFROM\s*\(/i, "subqueries"},
+      {~q/(?<![A-Za-z_\d])\d+(?:\.\d+)?FROM(?![\w])/i, "a number directly against FROM"}
     ]
   end
 
   @source ~S{"(?:[^"\\]|\\.)+"|/(?:[^/\\]|\\.)+/|[A-Za-z_][\w\-]*}
   @select Regex.compile!(
             InfluxElixir.Client.Local.InfluxQLBlankRegex.blank_pattern(
-              "^\\s*SELECT\\s+(?<items>.+?)\\s+FROM\\s+" <>
+              "^\\s*SELECT(?:\\s+|(?=[*(]))(?<items>.+?)(?:\\s+|(?<=[*)\"']))FROM(?:\\s+|(?=/))" <>
                 "(?<from>(?:#{@source})(?:\\s*,\\s*(?:#{@source}))*)(?<rest>.*)$"
             ),
             "is"
@@ -106,7 +107,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     {head, masked_head, tail} = split_statement(clean, masked)
     lexer = lexer_of(clean, unclosed, head)
 
-    with :ok <- check_blanks(masked_head),
+    with :ok <- not_a_token_to_start(clean),
+         :ok <- check_blanks(masked_head),
          :ok <- check_supported(masked_head),
          :ok <- check_select(clean, masked_head, lexer),
          %{"items" => items, "from" => from, "rest" => rest} <-
@@ -158,6 +160,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
          tz: clauses["tzcall"] != ""
        }}
     end
+  end
+
+  # A statement starts with a keyword: one that starts with a quote or a slash is left unparsed
+  # from there, as the text it is (the lexer reads no string or regular expression where the
+  # statement list wants a keyword: verified for `'`, `'x`, `"x`, `/x`, with blanks before).
+  @spec not_a_token_to_start(binary()) :: :ok | {:error, {:engine, binary()}}
+  defp not_a_token_to_start(clean) do
+    if clean =~ ~q/\A\s*['"\/]/,
+      do: {:error, {:engine, InfluxQLError.syntax_error_body(:nom, 0, clean)}},
+      else: :ok
   end
 
   # A `--` outside a literal comments out the rest of its line, `/* ... */`
@@ -236,7 +248,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   @spec lexer_in_list(InfluxQLCheck.lexer() | nil, binary()) :: InfluxQLCheck.lexer() | nil
   defp lexer_in_list({:lexer, start, _error} = lexer, masked_head) do
     list_end =
-      case Regex.run(~q/\sFROM(?![\w])/i, masked_head, return: :index) do
+      case Regex.run(~q/(?:\s|(?<=[*)"']))FROM(?![\w])/i, masked_head, return: :index) do
         [{from, _size}] -> from
         nil -> byte_size(masked_head)
       end
@@ -368,7 +380,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
   @spec check_blanks(binary()) :: :ok | {:error, binary()}
   defp check_blanks(masked) do
-    unverified = Regex.replace(~q/(fill\s*\(\s*[+-])[\f\v]/i, masked, "\\1")
+    unverified = Regex.replace(~q/(fill\s*\(\s*[+-])[\x0b\x0c]/i, masked, "\\1")
 
     if String.contains?(unverified, ["\f", "\v"]) or
          (unverified != masked and not verified_condition?(masked)),

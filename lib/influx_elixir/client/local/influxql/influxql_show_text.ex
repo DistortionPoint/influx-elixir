@@ -11,7 +11,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
   # from `ctx.clean`. Every position is a byte offset into the statement as
   # sent.
 
-  alias InfluxElixir.Client.Local.{InfluxQLLex, InfluxQLRegex, InfluxQLText}
+  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLLex, InfluxQLRegex, InfluxQLText}
 
   require InfluxQLLex
 
@@ -20,7 +20,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
           raw: binary(),
           clean: binary(),
           masked: binary(),
-          size: non_neg_integer()
+          size: non_neg_integer(),
+          bad: nil | {atom(), non_neg_integer()}
         }
 
   @typedoc "A parse result: the spec read so far and where the next clause starts."
@@ -137,15 +138,36 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
     if InfluxQLText.reserved?(word), do: :none, else: {:ok, word, at + byte_size(word)}
   end
 
+  # A quoted name never closed is the lexer's error at the end of the text: the parser meets
+  # it only here, where it reads a name (verified: after a keyword or in a clause that wants
+  # something else the quote is no token, see `lexer_error/2`).
   defp quoted_name(ctx, at) do
-    {close, 1} = :binary.match(ctx.masked, "\"", scope: {at + 1, ctx.size - at - 1})
-    inside = binary_part(ctx.clean, at + 1, close - at - 1)
+    case :binary.match(ctx.masked, "\"", scope: {at + 1, ctx.size - at - 1}) do
+      {close, 1} ->
+        inside = binary_part(ctx.clean, at + 1, close - at - 1)
 
-    case unescape(inside, at + 1, []) do
-      {:ok, name} -> {:ok, name, close + 1}
-      {:bad, pos} -> error("invalid escape sequence, expected \\\\, \\\" or \\n", pos)
+        case unescape(inside, at + 1, []) do
+          {:ok, name} -> {:ok, name, close + 1}
+          {:bad, pos} -> error("invalid escape sequence, expected \\\\, \\\" or \\n", pos)
+        end
+
+      :nomatch ->
+        {:error,
+         {:engine, InfluxQLError.syntax_error_body(:unterminated_string, ctx.size, ctx.raw)}}
     end
   end
+
+  @doc """
+  The lexer's error for a string, quoted name or regular expression never closed that starts
+  at or after `from`, `nil` when there is none. The parser meets it only where it reads a
+  token there: in an expression (a `WHERE`), a name or a regular expression. Anywhere else the
+  quote is what the clause fails at (verified: `LIMIT 'x`, `ON 'x`, `SHOW 'x`, `m 'x`).
+  """
+  @spec lexer_error(ctx(), non_neg_integer()) :: {:error, {:engine, binary()}} | nil
+  def lexer_error(%{bad: {kind, start}} = ctx, from) when start >= from,
+    do: {:error, {:engine, InfluxQLError.syntax_error_body(kind, ctx.size, ctx.raw)}}
+
+  def lexer_error(_ctx, _from), do: nil
 
   defp unescape(<<>>, _at, acc), do: {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary()}
   defp unescape(<<?\\, ?\\, rest::binary>>, at, acc), do: unescape(rest, at + 2, ["\\" | acc])
@@ -227,9 +249,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
   @spec regex_at(ctx(), non_neg_integer()) ::
           {:ok, term(), non_neg_integer()} | {:error, binary()}
   def regex_at(ctx, at) do
-    {source, to} = regex_literal(ctx, at)
-
-    {:ok, {:regex, InfluxQLRegex.compile(source)}, to}
+    with {:ok, source, to} <- regex_literal(ctx, at) do
+      {:ok, {:regex, InfluxQLRegex.compile(source)}, to}
+    end
   catch
     {:refused, message} when is_binary(message) ->
       {:error, message}
@@ -240,12 +262,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
 
   @doc """
   The text of the `/re/` at `at` as the engine reads it (`\\/` is a slash), and
-  where it ends.
+  where it ends; the lexer's error for one never closed.
   """
-  @spec regex_literal(ctx(), non_neg_integer()) :: {binary(), non_neg_integer()}
+  @spec regex_literal(ctx(), non_neg_integer()) ::
+          {:ok, binary(), non_neg_integer()} | {:error, {:engine, binary()}}
   def regex_literal(ctx, at) do
-    {close, 1} = :binary.match(ctx.masked, "/", scope: {at + 1, ctx.size - at - 1})
-    inside = binary_part(ctx.clean, at + 1, close - at - 1)
-    {String.replace(inside, "\\/", "/"), close + 1}
+    case :binary.match(ctx.masked, "/", scope: {at + 1, ctx.size - at - 1}) do
+      {close, 1} ->
+        inside = binary_part(ctx.clean, at + 1, close - at - 1)
+        {:ok, String.replace(inside, "\\/", "/"), close + 1}
+
+      :nomatch ->
+        {:error,
+         {:engine, InfluxQLError.syntax_error_body(:unterminated_regex, ctx.size, ctx.raw)}}
+    end
   end
 end

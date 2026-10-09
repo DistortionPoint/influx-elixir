@@ -34,7 +34,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
 
     if String.starts_with?(trimmed, ".") and operand_end?(previous),
       do: {:syntax_error, :nom, trimmed},
-      else: tokenize(rest, acc)
+      else: tokenize(trimmed, acc)
   end
 
   def tokenize(<<c, rest::binary>>, acc) when InfluxQLLex.is_blank(c), do: tokenize(rest, acc)

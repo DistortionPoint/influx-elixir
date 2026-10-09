@@ -76,7 +76,10 @@ defmodule InfluxElixir.Client.Local.Scope do
         {:error, :no_database_specified}
 
       database when is_binary(database) ->
-        {:ok, database}
+        if String.valid?(database),
+          do: {:ok, database},
+          else:
+            {:error, %{status: 400, body: "Client.Local: the database name is not valid UTF-8"}}
 
       # No engine answer exists for a name that is not text: refused by name, never raised.
       _not_text ->

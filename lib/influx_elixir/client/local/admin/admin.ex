@@ -41,9 +41,17 @@ defmodule InfluxElixir.Client.Local.Admin do
   defp retention(retention, name) when is_binary(retention) or is_atom(retention) do
     text = to_string(retention)
 
-    if Retention.valid?(text),
-      do: {:ok, Retention.seconds(text)},
-      else: retention_error(~s|invalid value: string "#{text}"|, retention, name)
+    cond do
+      # JSON holds only UTF-8 text: no engine answer exists for a retention that is not.
+      not String.valid?(text) ->
+        {:error, %{status: 400, body: "Client.Local: the retention is not valid UTF-8"}}
+
+      Retention.valid?(text) ->
+        {:ok, Retention.seconds(text)}
+
+      true ->
+        retention_error(~s|invalid value: string "#{text}"|, retention, name)
+    end
   end
 
   defp retention(retention, name) when is_integer(retention),

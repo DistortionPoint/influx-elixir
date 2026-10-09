@@ -22,6 +22,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
     InfluxQLCallCases,
     InfluxQLDefectCases,
     InfluxQLFixCases,
+    InfluxQLGlueCases,
     InfluxQLOrderCases,
     InfluxQLProjectionCases,
     InfluxQLShapeCases,
@@ -45,6 +46,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
       unquote(projections(client))
       unquote(orders(client))
       unquote(defects(client))
+      unquote(glue(client))
       unquote(show_helpers(client))
       unquote(fix_helpers(client))
       unquote(helpers(client))
@@ -576,6 +578,33 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
             ctx,
             InfluxQLDefectCases.refusals(),
             InfluxQLDefectCases.refusal_reasons()
+          )
+        end
+      end
+    end
+  end
+
+  defp glue(client) do
+    quote location: :keep do
+      describe "InfluxQL keywords against the next character, and strings never closed — contract" do
+        setup ctx do
+          names = InfluxQLGlueCases.names(InfluxElixir.IntegrationHelper.unique_name("ipq"))
+          write(ctx, unquote(client), InfluxQLGlueCases.fixture(names))
+          {:ok, names: names}
+        end
+
+        test "a keyword directly against a parenthesis, sign, slash, quote or `*`, a quote never closed where no token is read, and tz() where an operand is wanted",
+             ctx do
+          check_fix(ctx, InfluxQLGlueCases.forms())
+        end
+
+        @tag local_divergence:
+               "what the engine answers and the double does not compute is refused by name"
+        test "statements the double refuses by name, each for its own reason", ctx do
+          check_refusals(
+            ctx,
+            InfluxQLGlueCases.refusals(),
+            InfluxQLGlueCases.refusal_reasons()
           )
         end
       end

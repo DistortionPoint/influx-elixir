@@ -76,7 +76,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   @spec read(binary()) :: nil | {:ok, map()} | {:error, term()}
   defp read(raw) do
     scanned = scan(raw)
-    ctx = %{raw: raw, clean: scanned.clean, masked: scanned.masked, size: byte_size(raw)}
+    bad = if scanned.bad, do: {scanned.bad, scanned.bad_at}
+
+    ctx = %{
+      raw: raw,
+      clean: scanned.clean,
+      masked: scanned.masked,
+      size: byte_size(raw),
+      bad: bad
+    }
 
     with :ok <- keyword_cr(ctx),
          after_show when after_show != nil <- start(ctx),
@@ -100,12 +108,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
       else: :ok
   end
 
+  # A comment never closed is the lexer's error at once. A string, quoted name or regular
+  # expression never closed is not: the parser meets it only where it reads a token there
+  # (`InfluxQLShowText.lexer_error/2`), and anywhere else the clause fails at the quote.
+  # A comment never closed is the lexer's error at once. A string, quoted name or regular
+  # expression never closed is not: the parser meets it only where it reads a token there
+  # (`InfluxQLShowText.lexer_error/2`); anywhere else the clause fails at the quote.
   @spec scanned_error(map(), ctx()) :: :ok | {:error, {:engine, binary()}}
   defp scanned_error(%{unclosed: at}, ctx) when is_integer(at),
     do: {:error, {:engine, InfluxQLError.syntax_error_body(:comment, at, ctx.raw)}}
-
-  defp scanned_error(%{bad: kind}, ctx) when kind != nil,
-    do: {:error, {:engine, InfluxQLError.syntax_error_body(kind, ctx.size, ctx.raw)}}
 
   defp scanned_error(_scanned, _ctx), do: :ok
 
@@ -115,7 +126,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
 
   @spec scan(binary()) :: map()
   defp scan(raw) do
-    state = %{clean: [], masked: [], unclosed: nil, bad: nil}
+    state = %{clean: [], masked: [], unclosed: nil, bad: nil, bad_at: nil}
     state = walk(raw, 0, false, state)
 
     %{
@@ -188,12 +199,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   # A backslash escapes the byte after it inside a string or a quoted name,
   # only `\/` inside a regular expression. The inside is masked with `_`.
   @spec literal(binary(), byte(), non_neg_integer(), iodata(), map(), atom()) :: map()
-  defp literal(<<>>, _closing, _at, taken, state, kind) do
+  defp literal(<<>>, _closing, at, taken, state, kind) do
     inside = taken |> Enum.reverse() |> IO.iodata_to_binary()
     opening = binary_part(inside, 0, 1)
     body = binary_part(inside, 1, byte_size(inside) - 1)
     state = put(state, inside, opening <> String.duplicate("_", byte_size(body)))
-    %{state | bad: state.bad || kind}
+
+    if state.bad,
+      do: state,
+      else: %{state | bad: kind, bad_at: at - byte_size(inside)}
   end
 
   defp literal(<<?\\, ?/, rest::binary>>, ?/, at, taken, state, kind),

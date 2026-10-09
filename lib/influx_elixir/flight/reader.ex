@@ -561,9 +561,10 @@ defmodule InfluxElixir.Flight.Reader do
   #   * a field with data holds at least one bit per row in the body, so its length is at most
   #     8 per byte received (with a small floor for a batch that omits its buffers);
   #   * a field with no buffers of its own (the null type; a struct, whose children carry its
-  #     data) is bounded by cells: its length times the batch's fields, at most
-  #     `@cells_without_body` — far above any batch the engine sends (8192 rows), and a few
-  #     megabytes at most for a corrupt one.
+  #     data) may cover the batch's rows, which the body bounds when any field has data, or its
+  #     share of `@cells_without_body` (the items of a `List<Null>`; a batch of null columns
+  #     alone, bounded at most to those cells over its fields) — far above any batch the
+  #     engine sends (8192 rows), and a few megabytes at most for a corrupt count.
   #
   # A field of a type the reader does not decode is that error first, whatever its count.
   @rows_floor 64
@@ -578,9 +579,15 @@ defmodule InfluxElixir.Flight.Reader do
   defp check_row_counts(columns, row_count, nodes, body) do
     fields = Enum.flat_map(columns, &flatten_field/1)
     with_body = max(8 * byte_size(body || <<>>), @rows_floor)
-    without_body = div(@cells_without_body, max(length(fields), 1))
-    limit = fn kind -> if kind in [:null, :struct], do: without_body, else: with_body end
-    batch_limit = fields |> Enum.map(&limit.(&1.kind)) |> Enum.max(fn -> with_body end)
+    share = div(@cells_without_body, max(length(fields), 1))
+    data? = Enum.any?(fields, &(&1.kind not in [:null, :struct]))
+    # The rows a batch may hold: its body bounds them when any field has data, else the cells.
+    batch_limit = if data?, do: with_body, else: share
+    # A field without buffers may cover as many rows as the batch (a null column beside data
+    # columns), or its share of the cells (the items of a `List<Null>`).
+    limit = fn kind ->
+      if kind in [:null, :struct], do: max(batch_limit, share), else: with_body
+    end
 
     unsupported = Enum.find(fields, &match?({:unsupported, _type}, &1.kind))
     lengths = Enum.zip(Enum.map(nodes, &elem(&1, 0)), fields)

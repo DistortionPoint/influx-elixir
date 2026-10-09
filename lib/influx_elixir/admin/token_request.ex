@@ -57,7 +57,10 @@ defmodule InfluxElixir.Admin.TokenRequest do
     end
   end
 
-  @spec parse_permissions([term()]) :: {:ok, [Jason.OrderedObject.t()]} | {:error, term()}
+  @spec parse_permissions(term()) :: {:ok, [Jason.OrderedObject.t()]} | {:error, term()}
+  defp parse_permissions(permissions) when not is_list(permissions),
+    do: {:error, {:invalid_permission, permissions}}
+
   defp parse_permissions(permissions) do
     permissions
     |> Enum.reduce_while({:ok, []}, fn permission, {:ok, acc} ->

@@ -191,7 +191,10 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
         assert Local.execute_sql(c, value, database: "utf8_iql") === refused.("SQL text")
         assert Local.query_influxql(c, value, database: "utf8_iql") === refused.("InfluxQL text")
         assert Local.query_flux(v2, value, org: "o") === refused.("Flux text")
-        assert Local.write(c, value, database: "utf8_iql") === refused.("line protocol")
+        # A charlist is iodata, which is a body (see the iodata test below).
+        if not is_list(value),
+          do: assert(Local.write(c, value, database: "utf8_iql") === refused.("line protocol"))
+
         # `database: nil` is no option: the connection's database applies.
         if value != nil do
           assert Local.query_sql(c, "SELECT 1", database: value) === refused.("database name")
@@ -212,6 +215,41 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
 
         assert {error.status, error.body} === {400, "Client.Local: the SQL text is not a string"}
       end
+    end
+
+    test "as an option, or as the options themselves, is refused by name, never raised",
+         %{conn: c} do
+      refused = fn why -> {:error, %{status: 400, body: "Client.Local: " <> why}} end
+
+      for opts <- [nil, %{}, [1], [{"database", "x"}]] do
+        assert Local.query_sql(c, "SELECT 1", opts) ===
+                 refused.("the options are not a keyword list")
+
+        assert Local.write(c, "m v=1", opts) === refused.("the options are not a keyword list")
+
+        assert Local.create_database(c, "x", opts) ===
+                 refused.("the options are not a keyword list")
+      end
+
+      assert Local.check_sql(1) === refused.("the SQL text is not a string")
+
+      assert Local.query_influxql(c, "SHOW MEASUREMENTS ON utf8_iql", database: 1) ===
+               refused.("the database name is not a string")
+
+      assert Local.write(c, "m v=1", database: "utf8_iql", precision: %{}) ===
+               refused.("the precision is not a string")
+
+      assert Local.create_database(c, "x1", retention: @bad) ===
+               refused.("the retention is not valid UTF-8")
+
+      assert Local.create_token(c, "t", permissions: 1) === {:error, {:invalid_permission, 1}}
+    end
+
+    test "iodata is a body, as Client.HTTP sends it", %{conn: c} do
+      assert Local.write(c, ["io,host=a v=", ["2", ?\s], "1"], database: "utf8_iql") ===
+               {:ok, :written}
+
+      assert {:ok, [%{"v" => 2.0}]} = Local.query_sql(c, "SELECT v FROM io", database: "utf8_iql")
     end
   end
 end

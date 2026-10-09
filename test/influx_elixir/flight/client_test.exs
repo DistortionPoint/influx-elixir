@@ -85,7 +85,7 @@ defmodule InfluxElixir.Flight.ClientTest do
     # on [::1] over HTTP): a clear error before any connection, where it raised or said
     # :no_addresses.
     test "an IPv6 host is an error that names it, before any connection" do
-      for host <- ["[::1]", "[fe80::1]"] do
+      for host <- ["[::1]", "[fe80::1]", "::1"] do
         conn = %{host: host, port: 8181, token: "tok", database: "db"}
         assert Client.query(conn, "SELECT 1", tls: false) === {:error, {:ipv6_unsupported, host}}
       end
@@ -146,6 +146,11 @@ defmodule InfluxElixir.Flight.ClientTest do
     test "returns the fn's result when it completes in time" do
       assert {:ok, :channel} =
                Client.bounded_connect(fn -> {:ok, :channel} end, Await.bound())
+    end
+
+    test "a raise inside the fn is an error tuple, not the caller's crash" do
+      assert {:error, {:connect_failed, "boom"}} =
+               Client.bounded_connect(fn -> raise "boom" end, Await.bound())
     end
 
     test "propagates the fn's error tuple" do

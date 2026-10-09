@@ -272,6 +272,10 @@ defmodule InfluxElixir.Client.HTTP do
       {:ok, body} -> {:ok, body}
       {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
     end
+  rescue
+    # Jason raises instead of returning for an improper list or a map key it cannot write.
+    error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError] ->
+      {:error, {:unencodable_body, Exception.message(error)}}
   end
 
   @spec encodable_text(term()) :: :ok | {:error, {:unencodable_body, binary()}}

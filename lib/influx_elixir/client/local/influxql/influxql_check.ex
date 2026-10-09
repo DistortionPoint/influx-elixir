@@ -84,16 +84,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     end
   end
 
-  # The clauses' pattern takes a `fill(...)` for the clause after the condition wherever it
-  # can, `WHERE c AND fill(1)` included; one that stands where an operand is wanted is part of
-  # the condition (see `check_where_call/4`), which then holds the call (masked: the call's
-  # own text is not read).
+  # The clauses' pattern takes a `fill(...)` or a `tz(...)` for the clause after the condition
+  # wherever it can, `WHERE c AND fill(1)` included; one that stands where an operand is wanted
+  # is part of the condition (see `check_where_call/4`), which then holds the call (masked: the
+  # call's own text is not read).
   @spec take_call(binary(), binary(), map()) :: binary()
-  defp take_call(raw_where, masked_rest, %{"where" => {from, length}, "fillcall" => {call, size}})
-       when from >= 0 and call >= 0 do
-    if clause_position?(binary_part(masked_rest, from, length), length),
-      do: raw_where,
-      else: raw_where <> binary_part(masked_rest, from + length, call + size - from - length)
+  defp take_call(raw_where, masked_rest, %{"where" => {from, length}} = indexes)
+       when from >= 0 do
+    ["fillcall", "tzcall"]
+    |> Enum.find_value(raw_where, fn key ->
+      with {call, size} when call >= 0 <- Map.get(indexes, key),
+           false <- clause_position?(binary_part(masked_rest, from, length), length) do
+        raw_where <> binary_part(masked_rest, from + length, call + size - from - length)
+      else
+        _a_clause_or_absent -> nil
+      end
+    end)
   end
 
   defp take_call(raw_where, _masked_rest, _indexes), do: raw_where
@@ -143,7 +149,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   def check_where_call(_whole, _at, _masked_rest, nil), do: nil
 
   def check_where_call(whole, at, masked_rest, where) do
-    [{from, length}] = Regex.run(~q/\bWHERE\s+/i, masked_rest, return: :index)
+    [{from, length}] = Regex.run(~q/\bWHERE\s*/i, masked_rest, return: :index)
     masked = binary_part(masked_rest, from + length, byte_size(where))
 
     # The clauses taken out of the text (blanked) are in the statement the parser reads.
@@ -616,7 +622,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   def check_where(_whole, _at, _masked_rest, nil), do: nil
 
   def check_where(whole, at, masked_rest, where) do
-    [{from, length}] = Regex.run(~q/\bWHERE\s+/i, masked_rest, return: :index)
+    [{from, length}] = Regex.run(~q/\bWHERE\s*/i, masked_rest, return: :index)
     start = from + length
     where = where <> cr_after_connective(masked_rest, start, where)
     masked = binary_part(masked_rest, start, byte_size(where))

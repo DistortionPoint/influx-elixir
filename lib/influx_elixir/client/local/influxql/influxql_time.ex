@@ -12,6 +12,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   #     `AND` or `OR` a 500 "invalid expr stack", and in parentheses a plain
   #     type error (`check_bare/1`)
 
+  # The patterns here read the CONTENT of a quoted time literal, not statement text, so they
+  # are `~r` and keep PCRE's own `\s`, not `~q` (see `InfluxQLBlankRegex`): a vertical tab or a
+  # form feed in a time is not a form the double has verified, and `\s` taking it makes the
+  # time `:unknown`, which is refused by name, rather than a claim that Core refuses it. Only
+  # `trailing_blank?/1`, which claims a refusal, reads the blank as the language does (`~q`).
+  import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
+
   alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLTokens, SQLLimits}
 
   require SQLLimits
@@ -76,7 +83,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
       )
 
   @spec trailing_blank?(binary()) :: boolean()
-  defp trailing_blank?(content), do: Regex.match?(~r/^\d{4}-\d{2}-\d{2}[Tt ]\S+\s+$/, content)
+  defp trailing_blank?(content), do: Regex.match?(~q/^\d{4}-\d{2}-\d{2}[Tt ]\S+\s+$/, content)
 
   @spec read_zoned([binary()]) ::
           {:ok, integer()} | :invalid | {:out_of_range, binary()} | :unknown

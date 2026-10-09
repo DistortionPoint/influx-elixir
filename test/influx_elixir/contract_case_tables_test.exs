@@ -307,6 +307,7 @@ defmodule InfluxElixir.ContractCaseTablesTest do
        2},
     {:influxql, "select usage from~p1 where now() (fill(1)"} => {@stop_place, 2},
     {:influxql, "show\vmeasurements"} => {@stop_place, 2},
+    {:influxql, "'x"} => {@stop_place, 2},
     {:influxql, "select usage from~p1 where n>1"} => {@word_as_written, 2},
     {:influxql, "select usage from ~p1 group by host fill(null)"} =>
       {{:same_answer, [:blanks],

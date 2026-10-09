@@ -95,5 +95,13 @@ defmodule InfluxElixir.Client.Local.DatabaseRulesTest do
 
       assert {:ok, _conn} = Local.start(databases: ~w(a b c d e f), profile: :v3_enterprise)
     end
+
+    test "raises a named ArgumentError for names that are not strings" do
+      for opts <- [[database: 1], [databases: nil], [databases: [:a]], [databases: "a"]] do
+        assert_raise ArgumentError, ~r/:databases must be a list of strings/, fn ->
+          Local.start(opts)
+        end
+      end
+    end
   end
 end

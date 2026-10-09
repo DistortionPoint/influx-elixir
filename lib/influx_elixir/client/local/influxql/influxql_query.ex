@@ -109,6 +109,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           {:ok, binary() | :all} | {:error, map()}
   defp show_scope(%{on: on, kind: kind}, opts, conn) do
     case {on, Scope.resolve_database(opts, conn)} do
+      {_on, {:error, %{} = refusal}} ->
+        {:error, refusal}
+
       {nil, {:ok, database}} ->
         {:ok, database}
 
@@ -538,6 +541,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     case Scope.resolve_database(opts, conn) do
       {:ok, _database} = ok ->
         ok
+
+      {:error, %{}} = refusal ->
+        refusal
 
       {:error, :no_database_specified} ->
         {:error,

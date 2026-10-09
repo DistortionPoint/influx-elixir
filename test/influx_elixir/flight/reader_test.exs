@@ -806,6 +806,16 @@ defmodule InfluxElixir.Flight.ReaderTest do
                {:answered,
                 {:error, {:decode_error, "a row count the record batch's body cannot hold"}}}
     end
+
+    test "a null column beside a column with data covers the batch's rows, however wide" do
+      int = {"v", 2, [bit_width: 64, is_signed: true]}
+      schema = schema_fd([int | for(i <- 1..80, do: {"c#{i}", 1, []})])
+      {body, specs} = int64_column(Enum.to_list(1..8192))
+
+      assert {:answered, {:ok, rows}} = decode_bounded([schema, batch_fd(body, specs, 8192)])
+      assert length(rows) === 8192
+      assert List.last(rows)["v"] === 8192
+    end
   end
 
   # Decodes in a process whose heap is capped at about 40 MB, so a regression that

@@ -268,6 +268,9 @@ defmodule InfluxElixir.Client.Local.SQLRegexRewrite do
   @spec spans([binary()], boolean(), [{non_neg_integer(), non_neg_integer()}]) ::
           {[{non_neg_integer(), non_neg_integer()}], [binary()]}
   defp spans(["]" | rest], false, acc), do: {acc, rest}
+  # A class the pattern leaves open (`D[$[`; `SQLRustRegex.check/1` refuses it first) is no
+  # literal: total without that check.
+  defp spans([], _first?, acc), do: {[{0, 0x10FFFF} | acc], []}
 
   defp spans(chars, _first?, acc) do
     {low, rest} = member(chars)

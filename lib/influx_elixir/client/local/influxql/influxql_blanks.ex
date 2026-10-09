@@ -65,8 +65,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
 
     InfluxQLCheck.leftmost([
       stray(whole, at, masked_rest),
+      glued_sign(whole, at, masked_rest),
       keywords | calls(whole, at, masked_rest)
     ])
+  end
+
+  # `LIMIT`, `OFFSET`, `SLIMIT`, `SOFFSET` and `GROUP BY` with a parenthesis or a sign directly
+  # against them are not read as clauses: the statement is left over from the keyword (verified:
+  # `LIMIT(1)`, `LIMIT-1`, `LIMIT+1`, `OFFSET(1)`, `SLIMIT(1)`, `GROUP BY(host)`).
+  @glued_sign ~q/(?<![\w])(?:GROUP\s+BY|LIMIT|OFFSET|SLIMIT|SOFFSET)[(+\-]/i
+
+  @spec glued_sign(binary(), non_neg_integer(), binary()) :: InfluxQLCheck.positioned() | nil
+  defp glued_sign(whole, at, masked_rest) do
+    case Regex.run(@glued_sign, masked_rest, return: :index) do
+      [{from, _size}] -> InfluxQLCheck.fail(:nom, at + from, whole)
+      nil -> nil
+    end
   end
 
   # What stands directly after the source (past any blanks) and starts no clause: a
