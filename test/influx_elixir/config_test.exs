@@ -3,6 +3,9 @@ defmodule InfluxElixir.ConfigTest do
 
   alias InfluxElixir.Config
 
+  # The examples in the docs run; none touches global state.
+  doctest InfluxElixir.Config
+
   # ---------------------------------------------------------------------------
   # validate/1
   # ---------------------------------------------------------------------------

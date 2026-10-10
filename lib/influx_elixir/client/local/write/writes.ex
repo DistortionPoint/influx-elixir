@@ -26,22 +26,47 @@ defmodule InfluxElixir.Client.Local.Writes do
          {:ok, _no_sync} <- write_flag(opts, :no_sync, false, profile),
          {:ok, text} <- Body.read(payload, Keyword.get(opts, :gzip, false) == true, profile),
          :ok <- ensure_database(table, database, profile) do
-      case text
-           |> LineProtocolParser.parse_lines(precision, dialect(profile))
-           |> stamp_untimed() do
-        {:ok, lines} when profile != :v2 and not accept_partial ->
-          store_lines_atomically(table, database, lines)
+      result =
+        case text
+             |> LineProtocolParser.parse_lines(precision, dialect(profile))
+             |> stamp_untimed() do
+          {:ok, lines} when profile != :v2 and not accept_partial ->
+            store_lines_atomically(table, database, lines)
 
-        {:ok, lines} ->
-          store_lines(table, database, lines, profile)
+          {:ok, lines} ->
+            store_lines(table, database, lines, profile)
 
-        # InfluxDB 2 answers 204 to an empty payload; InfluxDB 3 refuses it.
-        {:error, _empty} when profile == :v2 ->
-          {:ok, :written}
+          # InfluxDB 2 answers 204 to an empty payload; InfluxDB 3 refuses it.
+          {:error, _empty} when profile == :v2 ->
+            {:ok, :written}
 
-        {:error, _reason} = error ->
-          error
-      end
+          {:error, _reason} = error ->
+            error
+        end
+
+      with :ok <- still_a_target(table, database, profile), do: result
+    end
+  end
+
+  # A drop of the database (or bucket) that ran while the points were stored removed the
+  # target but not what was stored after it. On InfluxDB 3 the write then comes after the
+  # drop, and a write creates the database it names, so the database is created again, with
+  # the points. On InfluxDB 2 a write never creates a bucket: it is the 404 of a bucket that
+  # does not exist, and what it stored goes. A target still there costs one lookup.
+  @spec still_a_target(Store.t(), binary(), InfluxElixir.Client.Local.profile()) ::
+          :ok | {:error, term()}
+  defp still_a_target(table, bucket, :v2) do
+    cond do
+      Store.bucket?(table, bucket) or Store.database?(table, bucket) -> :ok
+      Store.discard_orphaned(table, bucket) == :kept -> :ok
+      true -> bucket_not_found(bucket)
+    end
+  end
+
+  defp still_a_target(table, database, profile) do
+    with {:error, _reason} = error <- ensure_database(table, database, profile) do
+      Store.discard_orphaned(table, database)
+      error
     end
   end
 
@@ -418,17 +443,19 @@ defmodule InfluxElixir.Client.Local.Writes do
         :ok
 
       true ->
-        # The engine's answer for a bucket that does not exist (verified).
-        {:error,
-         %{
-           status: 404,
-           body:
-             Jason.encode!(%{
-               "code" => "not found",
-               "message" => "bucket \"#{bucket}\" not found"
-             })
-         }}
+        bucket_not_found(bucket)
     end
+  end
+
+  # The engine's answer for a bucket that does not exist (verified).
+  @spec bucket_not_found(binary()) :: {:error, map()}
+  defp bucket_not_found(bucket) do
+    {:error,
+     %{
+       status: 404,
+       body:
+         Jason.encode!(%{"code" => "not found", "message" => "bucket \"#{bucket}\" not found"})
+     }}
   end
 
   # `accept_partial: false` and `no_sync:` are InfluxDB 3 write parameters
@@ -626,8 +653,13 @@ defmodule InfluxElixir.Client.Local.Writes do
           Enum.map(point.tags, fn {k, _v} -> {k, LineProtocolParser.column_type(:tag, nil)} end),
         else: []
 
-    tags ++
-      Enum.map(point.fields, fn {k, v} -> {k, LineProtocolParser.column_type(:field, v)} end)
+    fields =
+      case point do
+        %{field_order: order} -> Enum.map(order, &{&1, Map.fetch!(point.fields, &1)})
+        _one_field_or_v2 -> point.fields
+      end
+
+    tags ++ Enum.map(fields, fn {k, v} -> {k, LineProtocolParser.column_type(:field, v)} end)
   end
 
   @spec conflict(
@@ -646,8 +678,8 @@ defmodule InfluxElixir.Client.Local.Writes do
      LineProtocolParser.v2_field_type(type)}
   end
 
-  # An unsigned integer is stored as the integer; the marker exists for the
-  # schema check alone.
+  # An unsigned integer is stored as the integer, and a point without the order of its
+  # fields; the marker and the order exist for the schema check alone.
   @spec strip_uint_markers(LineProtocolParser.point()) :: LineProtocolParser.point()
   defp strip_uint_markers(point) do
     fields =
@@ -656,6 +688,6 @@ defmodule InfluxElixir.Client.Local.Writes do
         {k, v} -> {k, v}
       end)
 
-    %{point | fields: fields}
+    point |> Map.delete(:field_order) |> Map.put(:fields, fields)
   end
 end

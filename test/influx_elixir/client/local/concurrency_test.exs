@@ -55,7 +55,7 @@ defmodule InfluxElixir.Client.Local.ConcurrencyTest do
 
       names
       |> Enum.map(&Task.async(fn -> Local.create_database(conn, &1) end))
-      |> Enum.each(&Task.await/1)
+      |> Enum.each(&Task.await(&1, Await.bound()))
 
       assert {:ok, dbs} = Local.list_databases(conn)
       assert dbs |> Enum.map(& &1["name"]) |> Enum.sort() === Enum.sort(["_internal" | names])
@@ -77,7 +77,7 @@ defmodule InfluxElixir.Client.Local.ConcurrencyTest do
       {:ok, %{"rows_affected" => 50}} =
         Local.execute_sql(ent, "DELETE FROM m WHERE k = 'old'", database: db)
 
-      Task.await(writer)
+      Task.await(writer, Await.bound())
 
       assert {:ok, rows} = Local.query_sql(ent, "SELECT k, v FROM m ORDER BY v", database: db)
       assert Enum.map(rows, &{&1["k"], &1["v"]}) === for(i <- 1..50, do: {"new", i})
@@ -141,8 +141,11 @@ defmodule InfluxElixir.Client.Local.ConcurrencyTest do
       assert conn |> Local.create_token("tok1") |> TokenShape.public() ===
                {:ok, %{"id" => 1, "name" => "tok1", "expiry" => nil}}
 
-      assert {:error, %{status: 409}} = Local.create_token(conn, "tok1")
-      assert {:error, %{status: 409}} = Local.create_token(conn, "_admin")
+      assert Local.create_token(conn, "tok1") ===
+               {:error, %{status: 409, body: "token name already exists, tok1"}}
+
+      assert Local.create_token(conn, "_admin") ===
+               {:error, %{status: 409, body: "token name already exists, _admin"}}
 
       assert conn |> Local.create_token("tok2") |> TokenShape.public() ===
                {:ok, %{"id" => 2, "name" => "tok2", "expiry" => nil}}
@@ -206,6 +209,70 @@ defmodule InfluxElixir.Client.Local.ConcurrencyTest do
 
       assert {:ok, [row]} = Local.query_sql(conn, "SELECT * FROM m", database: "db")
       assert Map.take(row, ["h", "v", "w"]) === %{"h" => "x", "v" => 3}
+    end
+  end
+
+  # A write that found its target and lost it to a drop while it parsed and stored its points
+  # left them behind: the target was not listed, and created again it held them. Each round
+  # starts a large write and a drop together, so the drop lands inside the write's parse more
+  # often than not; whichever order a round takes, a target that is not listed holds nothing.
+  describe "Client.Local: writes racing a drop" do
+    @rounds 20
+    @payload Enum.map_join(1..2_000, "\n", &"m v=#{&1}i #{&1}")
+
+    test "a dropped database is created again by the write after it, or holds nothing" do
+      {:ok, conn} = Local.start(profile: :v3_enterprise)
+
+      for _round <- 1..@rounds do
+        :ok = Local.create_database(conn, "racy")
+
+        [written, _dropped] =
+          at_once(2, fn
+            1 -> Local.write(conn, @payload, database: "racy")
+            2 -> Local.delete_database(conn, "racy")
+          end)
+
+        assert written === {:ok, :written}
+        {:ok, listed} = Local.list_databases(conn)
+
+        if %{"name" => "racy"} in listed do
+          :ok = Local.delete_database(conn, "racy")
+        else
+          :ok = Local.create_database(conn, "racy")
+
+          assert Local.query_sql(conn, "SELECT * FROM m", database: "racy") ===
+                   {:error,
+                    %{status: 400, body: "Error during planning: table 'public.iox.m' not found"}}
+
+          :ok = Local.delete_database(conn, "racy")
+        end
+      end
+    end
+
+    test "a deleted bucket is the write's 404, and holds nothing when created again" do
+      {:ok, conn} = Local.start(profile: :v2)
+
+      not_found =
+        {:error,
+         %{status: 404, body: ~s({"code":"not found","message":"bucket \\"racy\\" not found"})}}
+
+      for _round <- 1..@rounds do
+        :ok = Local.create_bucket(conn, "racy")
+
+        [written, :ok] =
+          at_once(2, fn
+            1 -> Local.write(conn, @payload, database: "racy")
+            2 -> Local.delete_bucket(conn, "racy")
+          end)
+
+        assert written in [{:ok, :written}, not_found]
+        :ok = Local.create_bucket(conn, "racy")
+
+        assert Local.query_flux(conn, ~s[from(bucket: "racy") |> range(start: 0)], []) ===
+                 {:ok, []}
+
+        :ok = Local.delete_bucket(conn, "racy")
+      end
     end
   end
 

@@ -33,7 +33,8 @@ defmodule InfluxElixir.Admin.Buckets do
 
   ## Returns
 
-    * `:ok` on success
+    * `:ok` on success, and for a bucket that exists, which is left as it was (its
+      retention unchanged): InfluxDB 2 answers that with a 422 conflict
     * `{:error, reason}` on failure
   """
   @spec create(InfluxElixir.Client.connection(), binary(), keyword()) ::

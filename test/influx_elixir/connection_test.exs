@@ -3,6 +3,10 @@ defmodule InfluxElixir.ConnectionTest do
 
   alias InfluxElixir.Connection
 
+  # Only api_version/1's examples run: the others put a fixed name (`:test`) in the registry
+  # every test shares.
+  doctest InfluxElixir.Connection, only: [api_version: 1]
+
   # Each test gets a unique atom prefix so async tests do not collide in
   # :persistent_term, which is a global VM-wide store.
   defp unique_name(suffix) do

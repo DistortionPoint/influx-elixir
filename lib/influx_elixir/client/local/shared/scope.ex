@@ -7,34 +7,26 @@ defmodule InfluxElixir.Client.Local.Scope do
   alias InfluxElixir.Client.Local.{DatabaseRules, LineProtocolParser, Retention, Store}
 
   # Operations supported by each profile.
-  # An operation not in the list returns {:error, :unsupported_operation}.
+  # An operation not in the list returns {:error, :unsupported_operation}. The two InfluxDB 3
+  # editions have the same operations; Enterprise's resource tokens are an option of
+  # `create_token/3`, refused on Core by the engine's own answer.
+  @v3_capabilities [
+    :health,
+    :write,
+    :query_sql,
+    :query_sql_stream,
+    :execute_sql,
+    :query_influxql,
+    :create_database,
+    :list_databases,
+    :delete_database,
+    :create_token,
+    :delete_token
+  ]
+
   @profile_capabilities %{
-    v3_core: [
-      :health,
-      :write,
-      :query_sql,
-      :query_sql_stream,
-      :execute_sql,
-      :query_influxql,
-      :create_database,
-      :list_databases,
-      :delete_database,
-      :create_token,
-      :delete_token
-    ],
-    v3_enterprise: [
-      :health,
-      :write,
-      :query_sql,
-      :query_sql_stream,
-      :execute_sql,
-      :query_influxql,
-      :create_database,
-      :list_databases,
-      :delete_database,
-      :create_token,
-      :delete_token
-    ],
+    v3_core: @v3_capabilities,
+    v3_enterprise: @v3_capabilities,
     v2: [
       :health,
       :write,

@@ -69,6 +69,17 @@ defmodule InfluxElixir.Client.Local.Store do
     ArgumentError -> :ok
   end
 
+  @doc """
+  Whether `table` is a store that has not been dropped (`drop/1`, or its owner's exit).
+  Anything that is no table is `false`.
+  """
+  @spec alive?(term()) :: boolean()
+  def alive?(table) do
+    :ets.info(table, :id) != :undefined
+  rescue
+    ArgumentError -> false
+  end
+
   # ---------------------------------------------------------------------------
   # Databases, buckets, tokens
   # ---------------------------------------------------------------------------
@@ -215,9 +226,12 @@ defmodule InfluxElixir.Client.Local.Store do
     :ets.match_delete(table, {{:chunk, name, :_, :_}})
   end
 
-  @doc "Registers a bucket with its metadata (replacing any earlier one)."
-  @spec put_bucket(t(), binary(), map()) :: true
-  def put_bucket(table, name, meta), do: :ets.insert(table, {{:bucket, name}, meta})
+  @doc """
+  Registers a bucket with its metadata unless one of that name exists, which is kept as it
+  is; `false` then. One insert, so of two concurrent creates exactly one registers.
+  """
+  @spec put_new_bucket(t(), binary(), map()) :: boolean()
+  def put_new_bucket(table, name, meta), do: :ets.insert_new(table, {{:bucket, name}, meta})
 
   @doc "Whether a bucket is registered."
   @spec bucket?(t(), binary()) :: boolean()
@@ -240,16 +254,39 @@ defmodule InfluxElixir.Client.Local.Store do
     |> Enum.sort()
   end
 
-  @doc "Removes a bucket; `:error` when it was not registered."
+  @doc """
+  Removes a bucket; `:error` when it was not registered. It takes the lock `drop_database/2`
+  takes, so `discard_orphaned/2` sees it whole.
+  """
   @spec delete_bucket(t(), binary()) :: :ok | :error
   def delete_bucket(table, name) do
-    if bucket?(table, name) do
-      :ets.delete(table, {:bucket, name})
-      delete_data(table, name)
-      :ok
-    else
-      :error
-    end
+    with_lock(table, :databases, fn ->
+      if bucket?(table, name) do
+        :ets.delete(table, {:bucket, name})
+        delete_data(table, name)
+        :ok
+      else
+        :error
+      end
+    end)
+  end
+
+  @doc """
+  Removes what was written to `name` when no database or bucket of that name is registered:
+  a write that found its target, then lost it to a drop while it stored its points, left them
+  behind it. `:discarded`, or `:kept` when the target is registered. Under the lock a drop
+  and a create take, so the target cannot come or go during the check.
+  """
+  @spec discard_orphaned(t(), binary()) :: :discarded | :kept
+  def discard_orphaned(table, name) do
+    with_lock(table, :databases, fn ->
+      if database?(table, name) or bucket?(table, name) do
+        :kept
+      else
+        delete_data(table, name)
+        :discarded
+      end
+    end)
   end
 
   @doc """

@@ -607,7 +607,7 @@ defmodule InfluxElixir.Client.Local do
   On the v3 profiles each name must be one InfluxDB 3 accepts, and
   `:v3_core` holds at most 5; `start/1` raises `ArgumentError` with the
   engine's message otherwise. It also raises `ArgumentError` when
-  `:databases` is not a list of strings or `:database` is not a string.
+  `:databases` is not a list of strings, or `:database` or `:org` is not a string.
     * `:profile` - InfluxDB version profile to emulate. Determines which
       operations are available. Operations outside the profile return
       `{:error, :unsupported_operation}`. Valid values:
@@ -667,6 +667,11 @@ defmodule InfluxElixir.Client.Local do
     # mutation is one insert or delete of its own key, so no process is
     # needed to make concurrent writers safe.
     org = Keyword.get(opts, :org) || "local"
+
+    unless is_binary(org) do
+      raise ArgumentError, "invalid org: :org must be a string, got #{inspect(org)}"
+    end
+
     {:ok, %{table: Store.new(databases), database: database, profile: profile, org: org}}
   end
 
@@ -700,14 +705,15 @@ defmodule InfluxElixir.Client.Local do
   Returns `true` if the given operation is supported by the connection's profile.
   """
   @spec supports?(conn(), atom()) :: boolean()
-  def supports?(%{profile: profile}, operation) do
-    Scope.supports?(%{profile: profile}, operation)
-  end
+  def supports?(%{profile: _profile} = conn, operation), do: Scope.supports?(conn, operation)
 
   @doc """
-  Stops a LocalClient instance and cleans up its ETS table.
+  Stops a `Client.Local` instance and deletes its ETS table.
 
-  Safe to call multiple times; a no-op if the table is already deleted.
+  Safe to call multiple times; a no-op if the table is already deleted. Every operation on a
+  stopped connection, or on one whose starting process has exited (the table goes with it),
+  is `{:error, %{status: 400, body: "Client.Local: the connection is stopped"}}`; a stream
+  raises it as an `InfluxElixir.StreamError` when enumerated.
   """
   @spec stop(conn()) :: :ok
   def stop(%{table: table}), do: Store.drop(table)
@@ -719,9 +725,11 @@ defmodule InfluxElixir.Client.Local do
   @doc """
   Parses line protocol binary and stores the resulting points in ETS.
 
-  The `database` is read from `opts[:database]`. If the database does not
-  exist an `{:error, %{status: 404, body: ...}}` is returned. If line protocol
-  cannot be parsed an `{:error, %{status: 400, body: ...}}` is returned.
+  The `database` is read from `opts[:database]`, else the connection's. On the v3 profiles a
+  write creates the database it names, as InfluxDB 3 does (even when every line is refused);
+  a name the engine refuses, or one past Core's five databases, is its error. On `:v2` the
+  bucket must exist, else the engine's `{:error, %{status: 404, body: ...}}`. Line protocol
+  that cannot be parsed is the engine's `{:error, %{status: 400, body: ...}}`.
 
   `gzip: true` says the payload is gzip-compressed (see "Write Bodies" in
   the moduledoc). Pass `precision:` to say what unit numeric timestamps are in (default
@@ -732,7 +740,10 @@ defmodule InfluxElixir.Client.Local do
   @spec write(InfluxElixir.Client.connection(), iodata(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(conn, payload, opts \\ []),
-    do: text(iodata(payload), "line protocol", opts, &Writes.write(conn, &1, opts))
+    do:
+      live(conn, fn ->
+        text(iodata(payload), "line protocol", opts, &Writes.write(conn, &1, opts))
+      end)
 
   # ---------------------------------------------------------------------------
   # SQL Query
@@ -750,7 +761,7 @@ defmodule InfluxElixir.Client.Local do
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_sql(conn, sql, opts \\ []),
-    do: text(sql, "SQL text", opts, &SQLQuery.query_sql(conn, &1, opts))
+    do: live(conn, fn -> text(sql, "SQL text", opts, &SQLQuery.query_sql(conn, &1, opts)) end)
 
   @doc """
   Executes a SQL query and returns results as a lazy `Stream`.
@@ -775,7 +786,7 @@ defmodule InfluxElixir.Client.Local do
   def query_sql_stream(conn, sql, opts \\ [])
 
   def query_sql_stream(conn, sql, opts) do
-    case text(sql, "SQL text", opts, &{:ok, &1}) do
+    case live(conn, fn -> text(sql, "SQL text", opts, &{:ok, &1}) end) do
       {:ok, sql} ->
         SQLQuery.query_sql_stream(conn, sql, opts)
 
@@ -807,7 +818,7 @@ defmodule InfluxElixir.Client.Local do
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map() | [map()]} | {:error, term()}
   def execute_sql(conn, sql, opts \\ []),
-    do: text(sql, "SQL text", opts, &SQLQuery.execute_sql(conn, &1, opts))
+    do: live(conn, fn -> text(sql, "SQL text", opts, &SQLQuery.execute_sql(conn, &1, opts)) end)
 
   # ---------------------------------------------------------------------------
   # InfluxQL and Flux queries
@@ -854,7 +865,10 @@ defmodule InfluxElixir.Client.Local do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(conn, influxql, opts \\ []),
-    do: text(influxql, "InfluxQL text", opts, &InfluxQLQuery.query_influxql(conn, &1, opts))
+    do:
+      live(conn, fn ->
+        text(influxql, "InfluxQL text", opts, &InfluxQLQuery.query_influxql(conn, &1, opts))
+      end)
 
   @doc """
   Executes a Flux query as InfluxDB 2 does. The pipeline starts with
@@ -878,7 +892,7 @@ defmodule InfluxElixir.Client.Local do
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_flux(conn, flux, opts \\ []),
-    do: text(flux, "Flux text", opts, &FluxQuery.query_flux(conn, &1, opts))
+    do: live(conn, fn -> text(flux, "Flux text", opts, &FluxQuery.query_flux(conn, &1, opts)) end)
 
   # A statement or a body that is not text, or options that are not a keyword list, have no
   # engine answer the double could match: refused by name, never raised (`Client.HTTP` sends
@@ -892,6 +906,18 @@ defmodule InfluxElixir.Client.Local do
       true -> refused("the #{what} is not a string")
     end
   end
+
+  # A stopped connection (`stop/1`, or the process that started it gone, which takes its store
+  # with it) is refused by name, as `Client.HTTP` names a pool that is not running, never an
+  # `ArgumentError` from ETS. A stop that lands while an operation runs is not covered.
+  @spec live(term(), (-> result)) :: result | {:error, map()} when result: term()
+  defp live(%{table: table}, run) do
+    if Store.alive?(table), do: run.(), else: refused("the connection is stopped")
+  end
+
+  # A connection `start/1` did not return (a keyword list for `Client.HTTP`, a host name) has
+  # no store to use: refused by name, never a FunctionClauseError.
+  defp live(_conn, _run), do: refused("the connection is not one Client.Local.start/1 returned")
 
   @spec options(term(), (-> result)) :: result | {:error, map()} when result: term()
   defp options(opts, run),
@@ -957,7 +983,7 @@ defmodule InfluxElixir.Client.Local do
           keyword()
         ) :: :ok | {:error, term()}
   def create_database(conn, name, opts \\ []),
-    do: options(opts, fn -> Admin.create_database(conn, name, opts) end)
+    do: live(conn, fn -> options(opts, fn -> Admin.create_database(conn, name, opts) end) end)
 
   @doc """
   Returns the databases as maps with a single `"name"` key, sorted, with
@@ -966,7 +992,7 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec list_databases(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
-  def list_databases(conn), do: Admin.list_databases(conn)
+  def list_databases(conn), do: live(conn, fn -> Admin.list_databases(conn) end)
 
   @doc """
   Deletes a database from this local instance.
@@ -978,7 +1004,7 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec delete_database(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_database(conn, name), do: Admin.delete_database(conn, name)
+  def delete_database(conn, name), do: live(conn, fn -> Admin.delete_database(conn, name) end)
 
   # ---------------------------------------------------------------------------
   # Bucket admin (v2 compat)
@@ -992,7 +1018,10 @@ defmodule InfluxElixir.Client.Local do
   duration must be at least 1h0m0s` (verified), and so does this.
   A write of a point older than the retention is refused as the engine
   refuses it (see "Write" in the moduledoc), and the period sets how long the
-  bucket's shard groups are. Creating an already-existing bucket is idempotent.
+  bucket's shard groups are. Creating a bucket that exists is `:ok` and leaves it as it was,
+  its retention unchanged: InfluxDB 2 answers a 422 conflict, which `Client.HTTP` takes as
+  success. A negative retention is the engine's 422 (verified), and one that is not an
+  integer is refused by name (`nil` is `0`).
   """
   @impl true
   @spec create_bucket(
@@ -1001,7 +1030,7 @@ defmodule InfluxElixir.Client.Local do
           keyword()
         ) :: :ok | {:error, term()}
   def create_bucket(conn, name, opts \\ []),
-    do: options(opts, fn -> Admin.create_bucket(conn, name, opts) end)
+    do: live(conn, fn -> options(opts, fn -> Admin.create_bucket(conn, name, opts) end) end)
 
   @doc """
   Returns all buckets in this local instance as InfluxDB 2 lists them
@@ -1014,7 +1043,7 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec list_buckets(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
-  def list_buckets(conn), do: Admin.list_buckets(conn)
+  def list_buckets(conn), do: live(conn, fn -> Admin.list_buckets(conn) end)
 
   @doc """
   Deletes a bucket from this local instance.
@@ -1028,7 +1057,7 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_bucket(conn, name), do: Admin.delete_bucket(conn, name)
+  def delete_bucket(conn, name), do: live(conn, fn -> Admin.delete_bucket(conn, name) end)
 
   # ---------------------------------------------------------------------------
   # Token admin
@@ -1048,7 +1077,7 @@ defmodule InfluxElixir.Client.Local do
           keyword()
         ) :: {:ok, map()} | {:error, term()}
   def create_token(conn, name, opts \\ []),
-    do: options(opts, fn -> Admin.create_token(conn, name, opts) end)
+    do: live(conn, fn -> options(opts, fn -> Admin.create_token(conn, name, opts) end) end)
 
   @doc """
   Deletes the token named `name` as InfluxDB 3 does: `:ok`, the engine's
@@ -1057,7 +1086,7 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_token(conn, name), do: Admin.delete_token(conn, name)
+  def delete_token(conn, name), do: live(conn, fn -> Admin.delete_token(conn, name) end)
 
   # ---------------------------------------------------------------------------
   # Health
@@ -1073,5 +1102,5 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec health(InfluxElixir.Client.connection()) ::
           {:ok, map()} | {:error, term()}
-  def health(conn), do: Admin.health(conn)
+  def health(conn), do: live(conn, fn -> Admin.health(conn) end)
 end

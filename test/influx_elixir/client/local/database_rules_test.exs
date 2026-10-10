@@ -33,22 +33,33 @@ defmodule InfluxElixir.Client.Local.DatabaseRulesTest do
     test "refuses what the engine refuses, with the first rule a name breaks" do
       {:ok, conn} = Local.start(profile: :v3_core)
 
-      for {name, start} <- [
-            {"", "db name cannot be empty"},
-            {"_x", "db name did not start"},
-            {"-", "db name did not start"},
-            {"_a/b/c", "db name did not start"},
-            {"a.b", "invalid character"},
-            {"héllo", "invalid character"},
-            {"a b", "invalid character"},
-            {"a.b/c/d", "invalid character"},
-            {"a.b/", "invalid character"},
-            {"x/", "db name with invalid retention policy"},
-            {"a//b", "db name with invalid retention policy"},
-            {"a/b/c", "db name with invalid retention policy"}
+      empty = "db name cannot be empty"
+      not_start = "db name did not start with a number or letter"
+
+      invalid_char =
+        "invalid character in database or rp name: must be ASCII, containing only " <>
+          "letters, numbers, underscores, or hyphens"
+
+      invalid_rp =
+        "db name with invalid retention policy, if providing a retention policy name, " <>
+          "must be of form '<db_name>/<rp_name>'"
+
+      for {name, message} <- [
+            {"", empty},
+            {"_x", not_start},
+            {"-", not_start},
+            {"_a/b/c", not_start},
+            {"a.b", invalid_char},
+            {"héllo", invalid_char},
+            {"a b", invalid_char},
+            {"a.b/c/d", invalid_char},
+            {"a.b/", invalid_char},
+            {"x/", invalid_rp},
+            {"a//b", invalid_rp},
+            {"a/b/c", invalid_rp}
           ] do
         assert {:error, %{status: 400, body: body}} = Local.create_database(conn, name, [])
-        assert %{"error" => ^start <> _rest} = Jason.decode!(body), inspect(name)
+        assert Jason.decode!(body) === %{"error" => message}, inspect(name)
       end
 
       assert {:ok, [%{"name" => "_internal"}]} = Local.list_databases(conn)
@@ -74,7 +85,13 @@ defmodule InfluxElixir.Client.Local.DatabaseRulesTest do
     test "an existing database passes at the limit; a bad name is still its 400" do
       conn = full_store(:v3_core)
       assert Local.create_database(conn, "a", []) === :ok
-      assert {:error, %{status: 400}} = Local.create_database(conn, "_f", [])
+
+      assert Local.create_database(conn, "_f", []) ===
+               {:error,
+                %{
+                  status: 400,
+                  body: ~s({"error":"db name did not start with a number or letter"})
+                }}
     end
   end
 
@@ -89,9 +106,14 @@ defmodule InfluxElixir.Client.Local.DatabaseRulesTest do
                ~s|Client.Local.start/1: _bad: {"error":"db name did not start with a number | <>
                  ~s|or letter"}|
 
-      assert_raise ArgumentError, ~r/exceed limit of 5 databases/, fn ->
-        Local.start(databases: ~w(a b c d e f), profile: :v3_core)
-      end
+      limit_error =
+        assert_raise ArgumentError, fn ->
+          Local.start(databases: ~w(a b c d e f), profile: :v3_core)
+        end
+
+      assert limit_error.message ===
+               ~s|Client.Local.start/1: f: {"error":"Adding a new database would exceed | <>
+                 ~s|limit of 5 databases"}|
 
       assert {:ok, _conn} = Local.start(databases: ~w(a b c d e f), profile: :v3_enterprise)
     end

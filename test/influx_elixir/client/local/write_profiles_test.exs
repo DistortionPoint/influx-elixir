@@ -12,7 +12,7 @@ defmodule InfluxElixir.Client.Local.WriteProfilesTest do
   alias InfluxElixir.Client.Local
 
   describe "Client.Local: a write to a database that does not exist" do
-    test "the :v3_enterprise profile creates it" do
+    test "creates the database the write names, listed beside the pre-created one" do
       {:ok, conn} = Local.start(databases: ["ent_db"], profile: :v3_enterprise)
 
       assert {:ok, :written} = Local.write(conn, "cpu value=1.0", database: "auto_db")

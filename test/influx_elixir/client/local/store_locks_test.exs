@@ -91,17 +91,23 @@ defmodule InfluxElixir.Client.Local.StoreLocksTest do
     test "that takes its own lock again raises instead of spinning" do
       table = Store.new([])
 
-      assert_raise RuntimeError, ~r/databases lock is already held by this process/, fn ->
-        Store.create_database(table, "outer", fn _databases ->
-          Store.create_database(table, "inner", fn _databases -> :ok end)
-        end)
-      end
+      assert_raise RuntimeError,
+                   "Client.Local.Store: the databases lock is already held by this process; " <>
+                     "a critical section cannot start another that takes it",
+                   fn ->
+                     Store.create_database(table, "outer", fn _databases ->
+                       Store.create_database(table, "inner", fn _databases -> :ok end)
+                     end)
+                   end
 
-      assert_raise RuntimeError, ~r/tokens lock is already held by this process/, fn ->
-        Store.create_token(table, "outer", fn _id ->
-          Store.create_token(table, "inner", fn id -> %{"id" => id} end)
-        end)
-      end
+      assert_raise RuntimeError,
+                   "Client.Local.Store: the tokens lock is already held by this process; " <>
+                     "a critical section cannot start another that takes it",
+                   fn ->
+                     Store.create_token(table, "outer", fn _id ->
+                       Store.create_token(table, "inner", fn id -> %{"id" => id} end)
+                     end)
+                   end
 
       # the raise released the locks: neither resource is stuck, nor half made
       refute Store.database?(table, "outer")

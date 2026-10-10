@@ -46,6 +46,17 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
 
   defp drop_body(message), do: %{"code" => "unprocessable entity", "message" => message}
 
+  # The masked message of `count` points dropped by a retention of `duration`, the oldest and
+  # the newest named by series key and time.
+  defp dropped(count, duration, {oldest, oldest_at}, {newest, newest_at}) do
+    "failure writing points to database: partial write: dropped #{count} points outside " <>
+      "retention policy of duration #{duration} - oldest point #{oldest} at #{oldest_at} " <>
+      "dropped because it violates a Retention Policy Lower Bound at BOUND, " <>
+      "newest point #{newest} at #{newest_at} dropped because it violates a " <>
+      "Retention Policy Lower Bound at BOUND dropped=#{count} for database: ID " <>
+      "for retention policy: autogen"
+  end
+
   # The message with the clock's reading and the bucket's id masked, and the
   # bounds it printed.
   defp masked_retention(conn, bucket, body) do
@@ -194,10 +205,13 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
       body = error_body(Local.write(conn, payload, database: "short"))
       assert {masked, _bounds} = masked_retention(conn, "short", body)
 
-      assert masked =~ "dropped 3 points"
-      assert masked =~ "oldest point m2,t=b,u=c at 2023-01-04T00:00:00.000000001Z dropped"
-      assert masked =~ "newest point m1,t=a at 2023-01-04T00:00:00.123456789Z dropped"
-      assert masked =~ "dropped=3 for database"
+      assert masked ===
+               dropped(
+                 3,
+                 "2h0m0s",
+                 {"m2,t=b,u=c", "2023-01-04T00:00:00.000000001Z"},
+                 {"m1,t=a", "2023-01-04T00:00:00.123456789Z"}
+               )
     end
 
     test "on a tie the first point of the payload is both the oldest and the newest",
@@ -210,8 +224,14 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
         )
 
       assert {masked, _bounds} = masked_retention(conn, "short", body)
-      assert masked =~ "oldest point m1 at 2023-01-04T00:00:00Z dropped"
-      assert masked =~ "newest point m1 at 2023-01-04T00:00:00Z dropped"
+
+      assert masked ===
+               dropped(
+                 2,
+                 "2h0m0s",
+                 {"m1", "2023-01-04T00:00:00Z"},
+                 {"m1", "2023-01-04T00:00:00Z"}
+               )
     end
 
     test "a series key is escaped as line protocol escapes it", %{conn: conn} do
@@ -220,19 +240,40 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
       assert {masked, _bounds} = masked_retention(conn, "short", body)
 
       key = ~S"m\ x\,y,a=z,b\ k\=1=v\,2\ 3"
-      assert masked =~ "oldest point #{key} at 2023-01-04T00:00:00Z dropped"
+
+      assert masked ===
+               dropped(1, "2h0m0s", {key, "2023-01-04T00:00:00Z"}, {key, "2023-01-04T00:00:00Z"})
     end
 
     test "the duration is Go's, in hours", %{conn: conn} do
       :ok = Local.create_bucket(conn, "odd", retention: 90_061)
       body = error_body(Local.write(conn, "m v=1i 5", database: "odd"))
       assert {masked, _bounds} = masked_retention(conn, "odd", body)
-      assert masked =~ "outside retention policy of duration 25h1m1s - "
+
+      assert masked ===
+               dropped(
+                 1,
+                 "25h1m1s",
+                 {"m", "1970-01-01T00:00:00.000000005Z"},
+                 {"m", "1970-01-01T00:00:00.000000005Z"}
+               )
     end
 
     test "the other points of the payload are written", %{conn: conn, now: now} do
-      assert {:error, %{status: 422}} =
-               Local.write(conn, "m v=1i 5\nm v=2i #{now - 60_000_000_000}", database: "short")
+      body =
+        error_body(
+          Local.write(conn, "m v=1i 5\nm v=2i #{now - 60_000_000_000}", database: "short")
+        )
+
+      assert {masked, _bounds} = masked_retention(conn, "short", body)
+
+      assert masked ===
+               dropped(
+                 1,
+                 "2h0m0s",
+                 {"m", "1970-01-01T00:00:00.000000005Z"},
+                 {"m", "1970-01-01T00:00:00.000000005Z"}
+               )
 
       assert {:ok, rows} =
                Local.query_flux(conn, ~s|from(bucket: "short") \|> range(start: -3h, stop: 1h)|)
@@ -241,7 +282,17 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
     end
 
     test "a point older than the retention registers no field type", %{conn: conn, now: now} do
-      assert {:error, %{status: 422}} = Local.write(conn, "m v=2.5 5", database: "short")
+      body = error_body(Local.write(conn, "m v=2.5 5", database: "short"))
+      assert {masked, _bounds} = masked_retention(conn, "short", body)
+
+      assert masked ===
+               dropped(
+                 1,
+                 "2h0m0s",
+                 {"m", "1970-01-01T00:00:00.000000005Z"},
+                 {"m", "1970-01-01T00:00:00.000000005Z"}
+               )
+
       assert {:ok, :written} = Local.write(conn, "m v=1i #{now}", database: "short")
     end
 
@@ -249,7 +300,14 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
          %{conn: conn} do
       body = error_body(Local.write(conn, "m time=1 5", database: "short"))
       assert {masked, _bounds} = masked_retention(conn, "short", body)
-      assert masked =~ "partial write: dropped 1 points outside retention policy"
+
+      assert masked ===
+               dropped(
+                 1,
+                 "2h0m0s",
+                 {"m", "1970-01-01T00:00:00.000000005Z"},
+                 {"m", "1970-01-01T00:00:00.000000005Z"}
+               )
     end
 
     test "a group's drop is reported instead of the retention drops", %{conn: conn, now: now} do
@@ -272,7 +330,12 @@ defmodule InfluxElixir.Client.Local.WriteBucketsV2Test do
       assert {:ok, :written} = Local.write(conn, "m v=1i 5", database: "other")
       assert :ok = Local.delete_bucket(conn, "b")
 
-      assert {:error, %{status: 422}} = Local.write(conn, "m v=1.5 5", database: "other")
+      assert error_body(Local.write(conn, "m v=1.5 5", database: "other")) ===
+               drop_body(
+                 "failure writing points to database: partial write: field type conflict: " <>
+                   ~s|input field "v" on measurement "m" is type float, | <>
+                   "already exists as type integer dropped=1"
+               )
 
       # `_stop` is the clock's reading; the rest of the row is exact.
       assert {:ok, [row]} = Local.query_flux(conn, ~s|from(bucket: "other") \|> range(start: 0)|)

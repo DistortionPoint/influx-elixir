@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local`'s buckets, writes and stopped connections** (design document
+  `2026-10-10_review-of-local-store-and-writes.md`):
+  - `create_bucket` answers `retention:` as InfluxDB 2.7 does. A negative value is its 422,
+    `nil` is no expiry, and any other non-integer is refused by name. It used to be stored,
+    and the next write raised.
+  - Creating a bucket that exists is `:ok` and keeps the bucket's retention, as over HTTP.
+    It used to overwrite the retention.
+  - A write racing `delete_database` or `delete_bucket` no longer leaves points behind that
+    a database later created under that name would show. On v3 the write creates the
+    database again; on v2 it gets the bucket's 404.
+  - Every operation on a stopped connection answers `Client.Local: the connection is
+    stopped`. It used to raise an ETS `ArgumentError`. This also covers a connection whose
+    starting process has exited.
+  - A connection that `start/1` did not return, such as `Client.HTTP`'s keyword config, is
+    refused by name (`Client.Local: the connection is not one Client.Local.start/1
+    returned`). It used to raise a `FunctionClauseError`.
+  - `start/1` raises `ArgumentError` for an `:org` that is not a string, as for its other
+    options. It used to be stored, and `list_buckets` raised.
+  - A large payload with an early bad line no longer copies every line into each parsing
+    chunk.
+  - A line refused on a partial v3 write types its fields in the line's order, up to the
+    refused one, as Core does. It used to go in name order, so `m b=1,a=2.0` with `a` an
+    integer left `b` untyped.
 - **Query results, health and streams** (design document
   `2026-10-10_review-of-query-and-admin.md`):
   - `Client.query_result` includes the binary that `format: :parquet` returns, which its spec

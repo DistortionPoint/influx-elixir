@@ -23,8 +23,9 @@ defmodule InfluxElixir.TestHelperTest do
 
       {:ok, conn: other} = setup_influx(databases: ["helper_db"], database: "helper_db")
 
-      assert {:error, %{status: 400, body: "Error during planning: table " <> _rest}} =
-               InfluxElixir.query_sql(other, "SELECT * FROM cpu")
+      assert InfluxElixir.query_sql(other, "SELECT * FROM cpu") ===
+               {:error,
+                %{status: 400, body: "Error during planning: table 'public.iox.cpu' not found"}}
 
       assert InfluxElixir.query_sql(conn, "SELECT * FROM cpu") ===
                {:ok, [%{"time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 1.0}]}

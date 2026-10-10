@@ -439,6 +439,51 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
                    )
         end
 
+        # A line refused for one field's type has typed the fields before it when the write is
+        # partial, and nothing when it is atomic (verified on Core 3.10.1).
+        # In the line's order, not the names': `b` before the bad `a` is typed, `c` after it
+        # is not.
+        test "a line refused on a partial write has typed the fields before the bad one", ctx do
+          m = InfluxElixir.IntegrationHelper.unique_name("contract_typed")
+          {:ok, :written} = unquote(client).write(ctx.conn, "#{m} a=1i 1", database: ctx.database)
+
+          assert {:error, %{status: 400}} =
+                   unquote(client).write(ctx.conn, "#{m} b=1,a=2.0,c=1 2", database: ctx.database)
+
+          assert unquote(client).write(ctx.conn, "#{m} c=1i 4", database: ctx.database) ===
+                   {:ok, :written}
+
+          assert {:error, %{status: 400, body: body}} =
+                   unquote(client).write(ctx.conn, "#{m} b=1i 3", database: ctx.database)
+
+          assert Jason.decode!(body) === %{
+                   "error" => "partial write of line protocol occurred",
+                   "data" => [
+                     %{
+                       "error_message" =>
+                         "invalid column type for column 'b', expected " <>
+                           "iox::column_type::field::float, got iox::column_type::field::integer",
+                       "line_number" => 1,
+                       "original_line" => binary_part("#{m} b=1i 3", 0, 20)
+                     }
+                   ]
+                 }
+        end
+
+        test "a line refused on an atomic write has typed nothing", ctx do
+          m = InfluxElixir.IntegrationHelper.unique_name("contract_untyped")
+          {:ok, :written} = unquote(client).write(ctx.conn, "#{m} a=1i 1", database: ctx.database)
+
+          assert {:error, %{status: 400}} =
+                   unquote(client).write(ctx.conn, "#{m} b=1,a=2.0 2",
+                     database: ctx.database,
+                     accept_partial: false
+                   )
+
+          assert unquote(client).write(ctx.conn, "#{m} b=1i 3", database: ctx.database) ===
+                   {:ok, :written}
+        end
+
         test "no_sync: true and a clean atomic payload are accepted", ctx do
           m = InfluxElixir.IntegrationHelper.unique_name("contract_nosync")
 

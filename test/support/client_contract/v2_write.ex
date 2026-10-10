@@ -9,6 +9,7 @@ defmodule InfluxElixir.ClientContract.V2Write do
   def blocks(client, :v2) do
     [
       bucket_tests(client),
+      bucket_conflict_tests(client),
       v2_write_rule_tests(client),
       v2_body_tests(client),
       v2_precision_tests(client),
@@ -160,6 +161,40 @@ defmodule InfluxElixir.ClientContract.V2Write do
 
           assert {:error, %{status: 404, body: "bucket not found: " <> ^name}} =
                    unquote(client).delete_bucket(ctx.conn, name)
+        end
+      end
+    end
+  end
+
+  defp bucket_conflict_tests(client) do
+    quote location: :keep do
+      describe "bucket admin — conflict contract" do
+        test "a bucket that exists is :ok and kept as it was; a negative retention is the 422",
+             ctx do
+          InfluxElixir.ClientContract.with_scratch(
+            unquote(client),
+            ctx,
+            :bucket,
+            "contract_dup",
+            fn name ->
+              :ok = unquote(client).create_bucket(ctx.conn, name, retention: 7200)
+
+              # The engine's 422 conflict comes before the hour's minimum.
+              assert unquote(client).create_bucket(ctx.conn, name, retention: 60) === :ok
+
+              {:ok, buckets} = unquote(client).list_buckets(ctx.conn)
+              bucket = Enum.find(buckets, &(&1["name"] === name))
+              assert [%{"type" => "expire", "everySeconds" => 7200}] = bucket["retentionRules"]
+
+              assert {:error, %{status: 422, body: body}} =
+                       unquote(client).create_bucket(ctx.conn, name <> "_neg", retention: -5)
+
+              assert Jason.decode!(body) === %{
+                       "code" => "unprocessable entity",
+                       "message" => "expiration seconds cannot be negative"
+                     }
+            end
+          )
         end
       end
     end

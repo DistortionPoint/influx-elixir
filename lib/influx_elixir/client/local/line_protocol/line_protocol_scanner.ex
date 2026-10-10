@@ -50,25 +50,27 @@ defmodule InfluxElixir.Client.Local.LineProtocolScanner do
   @spec parse_all([binary()], binary(), map()) :: [line_result()]
   @doc false
   def parse_all(lines, text, context) do
-    {chunks, _count, _physical} =
+    {chunks, _count, failed?} =
       lines
       |> Enum.chunk_every(@chunk_lines)
-      |> Enum.reduce({[], 0, nil}, fn chunk, {chunks, count, physical} ->
-        {results, count, physical} = parse_chunk(chunk, count, physical, text, context)
-        {[results | chunks], count, physical}
+      |> Enum.reduce({[], 0, false}, fn chunk, {chunks, count, failed?} ->
+        {results, count, chunk_failed?} = parse_chunk(chunk, count, context)
+        {[results | chunks], count, failed? or chunk_failed?}
       end)
 
-    chunks |> Enum.reverse() |> Enum.concat()
+    results = chunks |> Enum.reverse() |> Enum.concat()
+    if failed?, do: echo_physical(results, text), else: results
   end
 
-  # The results of one chunk, in order, with the numbering and the split
-  # physical lines carried on. A full chunk is parsed in a process of its
-  # own, which ends with the chunk and so cannot outlive its caller by more
-  # than that; a failure in it is raised again in the caller.
-  @spec parse_chunk([binary()], non_neg_integer(), tuple() | nil, binary(), map()) ::
-          {[line_result()], non_neg_integer(), tuple() | nil}
-  defp parse_chunk(chunk, count, physical, text, context) do
-    work = fn -> parse_lines_from(chunk, count, physical, text, context) end
+  # The results of one chunk, in order, with the numbering carried on and whether a line
+  # failed. A full chunk is parsed in a process of its own, which ends with the chunk and so
+  # cannot outlive its caller by more than that; a failure in it is raised again in the
+  # caller. Only the chunk goes to that process and only its results come back: the payload's
+  # physical lines, which an error echoes, are split once in the caller, after every chunk.
+  @spec parse_chunk([binary()], non_neg_integer(), map()) ::
+          {[line_result()], non_neg_integer(), boolean()}
+  defp parse_chunk(chunk, count, context) do
+    work = fn -> parse_lines_from(chunk, count, context) end
 
     if length(chunk) < @chunk_lines do
       work.()
@@ -111,46 +113,48 @@ defmodule InfluxElixir.Client.Local.LineProtocolScanner do
     end
   end
 
-  @spec parse_lines_from([binary()], non_neg_integer(), tuple() | nil, binary(), map()) ::
-          {[line_result()], non_neg_integer(), tuple() | nil}
-  defp parse_lines_from(chunk, count, physical, text, %{dialect: dialect} = context) do
-    {results, count, physical} =
-      Enum.reduce(chunk, {[], count, physical}, fn line, {acc, count, physical} ->
+  @spec parse_lines_from([binary()], non_neg_integer(), map()) ::
+          {[line_result()], non_neg_integer(), boolean()}
+  defp parse_lines_from(chunk, count, %{dialect: dialect} = context) do
+    {results, count, failed?} =
+      Enum.reduce(chunk, {[], count, false}, fn line, {acc, count, failed?} ->
         case content(line, dialect) do
-          :skip -> {acc, count, physical}
-          content -> parse_numbered(content, count + 1, text, context, {acc, physical})
+          :skip -> {acc, count, failed?}
+          content -> parse_numbered(content, count + 1, context, {acc, failed?})
         end
       end)
 
-    {Enum.reverse(results), count, physical}
+    {Enum.reverse(results), count, failed?}
   end
 
-  # One line, numbered `number` among the lines that count. The physical
-  # lines of the payload are split on the first error only.
-  @spec parse_numbered(
-          binary(),
-          pos_integer(),
-          binary(),
-          map(),
-          {[line_result()], tuple() | nil}
-        ) :: {[line_result()], pos_integer(), tuple() | nil}
-  defp parse_numbered(line, number, text, context, {acc, physical}) do
+  # One line, numbered `number` among the lines that count.
+  @spec parse_numbered(binary(), pos_integer(), map(), {[line_result()], boolean()}) ::
+          {[line_result()], pos_integer(), boolean()}
+  defp parse_numbered(line, number, context, {acc, failed?}) do
     case parse_line(line, context) do
       {:ok, point, shown} ->
-        {[{:ok, point, number, shown} | acc], number, physical}
+        {[{:ok, point, number, shown} | acc], number, failed?}
 
       {:error, message, shown} ->
-        physical = physical || text |> :binary.split("\n", [:global]) |> List.to_tuple()
-        {[{:error, echoed_error(message, number, shown, physical)} | acc], number, physical}
+        {[{:error, LineProtocolError.line_error(message, number, shown)} | acc], number, true}
     end
+  end
+
+  # The errors with the physical lines they echo, the payload split once.
+  @spec echo_physical([line_result()], binary()) :: [line_result()]
+  defp echo_physical(results, text) do
+    physical = text |> :binary.split("\n", [:global]) |> List.to_tuple()
+
+    Enum.map(results, fn
+      {:error, error} -> {:error, echoed_error(error, physical)}
+      ok -> ok
+    end)
   end
 
   # InfluxDB 3 echoes the physical line with the error's number; the
   # `:line` field keeps the failing line itself, which InfluxDB 2 quotes.
-  @spec echoed_error(binary(), pos_integer(), binary(), tuple()) :: line_error()
-  defp echoed_error(message, number, shown, physical) do
-    error = LineProtocolError.line_error(message, number, shown)
-
+  @spec echoed_error(line_error(), tuple()) :: line_error()
+  defp echoed_error(%{line_number: number} = error, physical) do
     cond do
       number < tuple_size(physical) ->
         %{error | original_line: LineProtocolError.echo(elem(physical, number - 1))}

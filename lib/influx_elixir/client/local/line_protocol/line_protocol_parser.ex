@@ -42,7 +42,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
           required(:tags) => %{binary() => binary()},
           required(:fields) => %{binary() => term()},
           required(:timestamp) => integer() | nil,
-          optional(:unreadable) => true
+          optional(:unreadable) => true,
+          optional(:field_order) => [binary()]
         }
 
   @typedoc """

@@ -127,29 +127,52 @@ defmodule InfluxElixir.Client.Local.Admin do
   def create_bucket(%{table: table} = conn, name, opts \\ []) do
     with :ok <- Scope.require_capability(conn, :create_bucket),
          :ok <- utf8_name(name, "bucket") do
-      case Keyword.get(opts, :retention, 0) do
-        seconds when seconds in 1..3599 ->
+      # InfluxDB 2.7's order (verified): the value's type, its sign, the name (a bucket that
+      # exists is a 422 conflict, which `Client.HTTP` answers `:ok`, the bucket kept as it
+      # was), then the hour's minimum. `nil` is sent as JSON null, which 2.7 reads as 0.
+      case Keyword.get(opts, :retention) || 0 do
+        seconds when not is_integer(seconds) ->
           {:error,
            %{
-             status: 500,
+             status: 400,
              body:
-               Jason.encode!(%{
-                 "code" => "internal error",
-                 "message" => "retention policy duration must be at least 1h0m0s"
-               })
+               "Client.Local: retention: must be a whole number of seconds, " <>
+                 "got #{inspect(seconds)}"
            }}
 
-        seconds ->
-          created_at =
-            case Store.bucket(table, name) do
-              %{created_at: at} -> at
-              _new -> nanosecond_timestamp()
-            end
+        seconds when seconds < 0 ->
+          v2_error(422, "unprocessable entity", "expiration seconds cannot be negative")
 
-          Store.put_bucket(table, name, %{retention: seconds, created_at: created_at})
-          :ok
+        seconds ->
+          create_new_bucket(table, name, seconds)
       end
     end
+  end
+
+  @spec create_new_bucket(Store.t(), binary(), non_neg_integer()) :: :ok | {:error, map()}
+  defp create_new_bucket(table, name, seconds) do
+    cond do
+      Store.bucket?(table, name) ->
+        :ok
+
+      seconds in 1..3599 ->
+        v2_error(500, "internal error", "retention policy duration must be at least 1h0m0s")
+
+      true ->
+        # One insert: of two creates of a new name one registers it, the other is the
+        # conflict, `:ok` as above.
+        Store.put_new_bucket(table, name, %{
+          retention: seconds,
+          created_at: nanosecond_timestamp()
+        })
+
+        :ok
+    end
+  end
+
+  @spec v2_error(pos_integer(), binary(), binary()) :: {:error, map()}
+  defp v2_error(status, code, message) do
+    {:error, %{status: status, body: Jason.encode!(%{"code" => code, "message" => message})}}
   end
 
   @spec list_buckets(InfluxElixir.Client.connection()) ::

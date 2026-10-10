@@ -19,11 +19,16 @@ defmodule InfluxElixir.Admin.DatabasesTest do
     end
 
     test "a valid retention duration is accepted and the database is created", %{conn: conn} do
-      # Local validates the duration but keeps no retention, so none is observable.
+      # Local keeps the retention in whole seconds; SHOW RETENTION POLICIES prints 30 days
+      # (720 hours) as the engine does.
       assert :ok = Databases.create(conn, "kept", retention: "30d")
 
       assert Databases.list(conn) ===
                {:ok, [%{"name" => "_internal"}, %{"name" => "kept"}, %{"name" => "test_db"}]}
+
+      assert Local.query_influxql(conn, "SHOW RETENTION POLICIES", database: "kept") ===
+               {:ok,
+                [%{"iox::database" => "kept", "name" => "autogen", "duration" => "720h0m0s"}]}
     end
 
     test "an unreadable retention duration is the engine's 400 and creates nothing", %{conn: conn} do

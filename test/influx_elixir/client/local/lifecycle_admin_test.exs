@@ -2,6 +2,7 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
+  alias InfluxElixir.TestSupport.Await
 
   setup do
     {:ok, conn} = Local.start(databases: ["test_db"])
@@ -43,9 +44,79 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
       assert {:ok, :written} = Local.write(conn, "m v=1i 1")
       assert :ok = Local.stop(conn)
 
-      assert_raise ArgumentError, fn ->
-        Local.query_sql(conn, "SELECT v FROM m", database: "gone")
+      # A named refusal, as Client.HTTP names a pool that is not running; it was an
+      # ArgumentError from ETS.
+      stopped = {:error, %{status: 400, body: "Client.Local: the connection is stopped"}}
+
+      for call <- [
+            fn -> Local.write(conn, "m v=2i 2") end,
+            fn -> Local.query_sql(conn, "SELECT v FROM m", database: "gone") end,
+            fn -> Local.execute_sql(conn, "SELECT v FROM m", database: "gone") end,
+            fn -> Local.query_influxql(conn, "SELECT v FROM m", database: "gone") end,
+            fn -> Local.query_flux(conn, ~s[from(bucket: "gone")], []) end,
+            fn -> Local.create_database(conn, "other") end,
+            fn -> Local.list_databases(conn) end,
+            fn -> Local.delete_database(conn, "gone") end,
+            fn -> Local.create_bucket(conn, "b") end,
+            fn -> Local.list_buckets(conn) end,
+            fn -> Local.delete_bucket(conn, "b") end,
+            fn -> Local.create_token(conn, "t") end,
+            fn -> Local.delete_token(conn, "t") end,
+            fn -> Local.health(conn) end
+          ] do
+        assert call.() === stopped
       end
+
+      error =
+        assert_raise InfluxElixir.StreamError, fn ->
+          conn |> Local.query_sql_stream("SELECT 1") |> Enum.to_list()
+        end
+
+      assert {error.status, error.body} === {400, "Client.Local: the connection is stopped"}
+
+      # A connection map whose store is no table at all has none to use either.
+      assert Local.health(%{conn | table: "no table"}) === stopped
+    end
+
+    test "a connection start/1 did not return is refused by name, never a raise" do
+      # Client.HTTP's keyword config handed to the double raised a FunctionClauseError.
+      refused =
+        {:error,
+         %{
+           status: 400,
+           body:
+             "Client.Local: the connection is not one " <>
+               "Client.Local.start/1 returned"
+         }}
+
+      for conn <- [[host: "h", token: "t"], :x, nil, %{profile: :v3_core}] do
+        assert Local.health(conn) === refused
+        assert Local.write(conn, "m v=1i 1", database: "d") === refused
+        assert Local.query_sql(conn, "SELECT 1", database: "d") === refused
+
+        error =
+          assert_raise InfluxElixir.StreamError, fn ->
+            conn |> Local.query_sql_stream("SELECT 1", database: "d") |> Enum.to_list()
+          end
+
+        assert {error.status, error.body} === {400, elem(refused, 1).body}
+      end
+    end
+
+    test "an :org that is not a string is an ArgumentError at start, as the other options are" do
+      # It was stored, and list_buckets raised from :crypto hashing it.
+      error = assert_raise ArgumentError, fn -> Local.start(profile: :v2, org: :acme) end
+      assert error.message === "invalid org: :org must be a string, got :acme"
+    end
+
+    test "a connection whose starting process has exited is stopped with it" do
+      # The process that starts a connection owns its table. The runtime deletes it as the
+      # process exits, which no message announces (it can end after the monitor's :DOWN), so
+      # the answer is polled for; before the refusal it was an ArgumentError from ETS.
+      {:ok, conn} = Task.await(Task.async(fn -> Local.start() end), Await.bound())
+      stopped = {:error, %{status: 400, body: "Client.Local: the connection is stopped"}}
+
+      assert Await.until(fn -> Local.health(conn) === stopped end)
     end
 
     test "pre-creates databases from options, listed with the engine's _internal" do
@@ -65,16 +136,11 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
       {:ok, conn_a} = Local.start(databases: ["only_a"])
       {:ok, conn_b} = Local.start(databases: ["only_b"])
 
-      {:ok, dbs_a} = Local.list_databases(conn_a)
-      {:ok, dbs_b} = Local.list_databases(conn_b)
+      assert Local.list_databases(conn_a) ===
+               {:ok, [%{"name" => "_internal"}, %{"name" => "only_a"}]}
 
-      names_a = Enum.map(dbs_a, & &1["name"])
-      names_b = Enum.map(dbs_b, & &1["name"])
-
-      assert "only_a" in names_a
-      refute "only_b" in names_a
-      assert "only_b" in names_b
-      refute "only_a" in names_b
+      assert Local.list_databases(conn_b) ===
+               {:ok, [%{"name" => "_internal"}, %{"name" => "only_b"}]}
 
       Local.stop(conn_a)
       Local.stop(conn_b)
@@ -87,7 +153,9 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
       assert Local.query_sql(conn, "SELECT v FROM m", database: "metrics") ===
                {:ok, [%{"v" => 1}]}
 
-      assert {:ok, [_internal, %{"name" => "metrics"}]} = Local.list_databases(conn)
+      assert Local.list_databases(conn) ===
+               {:ok, [%{"name" => "_internal"}, %{"name" => "metrics"}]}
+
       Local.stop(conn)
     end
 
@@ -105,18 +173,30 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
       assert {:ok, dbs} = Local.list_databases(conn)
       assert Enum.map(dbs, & &1["name"]) === ["_internal", "a", "b", "primary"]
       assert {:ok, :written} = Local.write(conn, "m v=1i")
-      assert {:ok, [_row]} = Local.query_sql(conn, "SELECT v FROM m", database: "primary")
+
+      assert Local.query_sql(conn, "SELECT v FROM m", database: "primary") ===
+               {:ok, [%{"v" => 1}]}
+
       Local.stop(conn)
     end
 
     test "refuses a database the engine would refuse, with the engine's message" do
-      assert_raise ArgumentError, ~r/a\.b: .*invalid character in database or rp name/, fn ->
-        Local.start(databases: ["a.b"])
-      end
+      invalid =
+        assert_raise ArgumentError, fn -> Local.start(databases: ["a.b"]) end
 
-      assert_raise ArgumentError, ~r/exceed limit of 5 databases/, fn ->
-        Local.start(databases: Enum.map(1..6, &"db#{&1}"))
-      end
+      assert invalid.message ===
+               ~s|Client.Local.start/1: a.b: {"error":"invalid character in database or rp | <>
+                 ~s|name: must be ASCII, containing only letters, numbers, underscores, or | <>
+                 ~s|hyphens"}|
+
+      over =
+        assert_raise ArgumentError, fn ->
+          Local.start(databases: Enum.map(1..6, &"db#{&1}"))
+        end
+
+      assert over.message ===
+               ~s|Client.Local.start/1: db6: {"error":"Adding a new database would exceed | <>
+                 ~s|limit of 5 databases"}|
     end
   end
 

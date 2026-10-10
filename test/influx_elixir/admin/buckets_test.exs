@@ -20,8 +20,8 @@ defmodule InfluxElixir.Admin.BucketsTest do
                %{"type" => "expire", "everySeconds" => 0, "shardGroupDurationSeconds" => 604_800}
              ]
 
-      # A bucket id is 16 lowercase hex digits, as InfluxDB 2's, and its links name it.
-      assert bucket["id"] =~ ~r/\A[0-9a-f]{16}\z/
+      # 16 lowercase hex digits, as InfluxDB 2's; the double derives it from the name.
+      assert bucket["id"] === "251c400b498dbc3b"
       assert bucket["links"]["self"] === "/api/v2/buckets/" <> bucket["id"]
       assert bucket["type"] === "user"
     end
@@ -52,6 +52,50 @@ defmodule InfluxElixir.Admin.BucketsTest do
                "retention policy duration must be at least 1h0m0s"
 
       assert {:ok, []} = Buckets.list(conn)
+    end
+
+    # InfluxDB 2.7 answers a bucket that exists with a 422 conflict (verified), which is
+    # success here; the bucket keeps the retention it was created with. The conflict comes
+    # before the hour's minimum, so a short retention is no 500 for it either.
+    test "a bucket that exists is :ok and kept as it was", %{conn: conn} do
+      :ok = Buckets.create(conn, "kept", retention: 7200)
+
+      assert Buckets.create(conn, "kept", retention: 3600) === :ok
+      assert Buckets.create(conn, "kept", retention: 60) === :ok
+
+      assert {:ok, [%{"retentionRules" => rules}]} = Buckets.list(conn)
+
+      assert rules === [
+               %{"type" => "expire", "everySeconds" => 7200, "shardGroupDurationSeconds" => 3600}
+             ]
+    end
+
+    test "a negative retention is the engine's 422, one not an integer refused by name, nil 0",
+         %{conn: conn} do
+      # Both verified on InfluxDB 2.7: `null` is read as no expiry.
+      assert Buckets.create(conn, "neg", retention: -5) ===
+               {:error,
+                %{
+                  status: 422,
+                  body:
+                    ~s({"code":"unprocessable entity",) <>
+                      ~s("message":"expiration seconds cannot be negative"})
+                }}
+
+      for retention <- [7200.5, "2h"] do
+        assert Buckets.create(conn, "odd", retention: retention) ===
+                 {:error,
+                  %{
+                    status: 400,
+                    body:
+                      "Client.Local: retention: must be a whole number of seconds, " <>
+                        "got #{inspect(retention)}"
+                  }}
+      end
+
+      assert Buckets.create(conn, "none", retention: nil) === :ok
+      assert {:ok, [%{"name" => "none", "retentionRules" => [rule]}]} = Buckets.list(conn)
+      assert rule["everySeconds"] === 0
     end
   end
 

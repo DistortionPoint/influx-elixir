@@ -51,15 +51,18 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
          {:ok, timestamp_text} <- v3_timestamp(rest),
          {:ok, timestamp} <- LineProtocolTime.parse_timestamp(timestamp_text, precision, :v3),
          tags = v3_tag_map(line, measurement, tags_raw, after_series),
-         {:ok, fields} <- v3_check_fields(tags, fields_raw),
+         {:ok, fields, field_order} <- v3_check_fields(tags, fields_raw),
          :ok <- v3_distinct_tags(tags, tags_raw) do
-      {:ok,
-       %{
-         measurement: LineProtocolEscape.unescape_measurement(measurement),
-         tags: tags,
-         fields: fields,
-         timestamp: timestamp
-       }}
+      point = %{
+        measurement: LineProtocolEscape.unescape_measurement(measurement),
+        tags: tags,
+        fields: fields,
+        timestamp: timestamp
+      }
+
+      # The engine types a line's fields in the line's order, up to one it refuses (verified):
+      # the order goes with a point of more than one field, until it is stored.
+      {:ok, if(map_size(fields) > 1, do: Map.put(point, :field_order, field_order), else: point)}
     end
   end
 
@@ -391,10 +394,11 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   # is checked by the store, because the engine's wording depends on
   # whether the table already exists. The field keys arrive as written and
   # are unescaped here.
-  @spec v3_check_fields(map(), [{binary(), term()}]) :: {:ok, map()} | {:error, binary()}
+  @spec v3_check_fields(map(), [{binary(), term()}]) ::
+          {:ok, map(), [binary()]} | {:error, binary()}
   defp v3_check_fields(tags, fields) do
     fields
-    |> Enum.reduce_while(%{}, fn {raw_key, value}, seen ->
+    |> Enum.reduce_while({%{}, []}, fn {raw_key, value}, {seen, order} ->
       key = LineProtocolEscape.unescape_tag(raw_key)
 
       cond do
@@ -408,12 +412,12 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
               LineProtocolNumber.column_type(:field, value)}}
 
         true ->
-          {:cont, Map.put(seen, key, value)}
+          {:cont, {Map.put(seen, key, value), [key | order]}}
       end
     end)
     |> case do
       {:error, _message} = error -> error
-      seen -> {:ok, seen}
+      {seen, order} -> {:ok, seen, Enum.reverse(order)}
     end
   end
 end
