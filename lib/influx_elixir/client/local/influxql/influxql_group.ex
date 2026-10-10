@@ -297,9 +297,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   # `time((1m))`); the double reads durations only.
   @time_expression "unsupported InfluxQL (GROUP BY time() of an expression)"
 
-  # A group that holds a number or a duration and is closed, or an operand after an operator.
+  # A group that holds a number or a duration and is closed, in as many parentheses as are
+  # written (`(1m)`, `((1m))`), or an operand after an operator.
   defp group_ahead?(text, pos),
-    do: binary_part(text, pos, byte_size(text) - pos) =~ ~q/^\(\s*[\d.][^()]*\)/
+    do: binary_part(text, pos, byte_size(text) - pos) =~ ~q/^\(+\s*[\d.][^()]*\)/
 
   defp operand_ahead?(text, pos),
     do: text |> binary_part(pos, byte_size(text) - pos) |> String.trim_leading() =~ ~q/^[\d.(]/

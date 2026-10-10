@@ -1,7 +1,8 @@
 defmodule InfluxElixir.Client.Local.InfluxQLWalk do
   @moduledoc false
   # The one precedence walker of the arithmetic of a condition, over a module that gives the
-  # values (`InfluxQLArithType` types them, `InfluxQLTyped` folds constants):
+  # values (`InfluxQLArithType` types them, `InfluxQLTyped` folds constants,
+  # `InfluxQLTimeComparand` prints them):
   #
   #     sum     := product (("+" | "-") product)*
   #     product := factor (("*" | "/") factor)*
@@ -12,46 +13,28 @@ defmodule InfluxElixir.Client.Local.InfluxQLWalk do
   # an expression is the first one in the text. It knows nothing of the values: a module that
   # implements the behaviour below gives them, with the options (`Opts`) it was asked with.
   #
-  # With `lazy` set the last operation of the expression is put off until the walk ends and is
-  # then combined in the mode `lazy` names, where the others are combined in `mode` (an
-  # operation is settled as soon as an operator, a sign or a comma follows it, or it is an
-  # argument: only the last operation of the whole condition is the condition's own, see
-  # `InfluxQLArithType`).
+  # A module may put off the last operation of the expression until the walk ends (`lazy/1`)
+  # and combine it with the options that callback gives, where the others are combined with
+  # those it was asked with (an operation is settled as soon as an operator, a sign or a comma
+  # follows it, or it is an argument: only the last operation of the whole condition is the
+  # condition's own, see `InfluxQLArithType`).
 
   defmodule Opts do
     @moduledoc false
     # What a walk is asked, handed to every callback:
     #
-    #   * `ctx`: the tags and the types of the fields of the measurement
-    #   * `mode`: how the quotient of an unsigned number and text is read (`InfluxQLArithType`)
-    #   * `lazy`: `nil`, or the mode of the last operation, which is put off (see above)
-    #   * `whole`: the condition is one call and nothing else (its error is worded without the
-    #     signature the planner lists beside a call that is part of something)
-    #   * `outermost`: the condition is a call with no arguments
-    #   * `operand`: the condition has no comparison, it is a bare operand
+    #   * `ctx`: what the module reads columns from (`InfluxQLArithType` and
+    #     `InfluxQLTimeComparand` give it the tags and the types of the fields of the
+    #     measurement)
     #   * `calls`: whether a name followed by a parenthesis is a call (a walk of constants has
     #     none)
+    #   * `state`: the module's own, which the walker passes on and never reads
+    #     (`InfluxQLArithType` keeps how it reads a quotient there, and the flags of a call)
 
-    @type mode :: :loose | :text | :strict | :alone
-
-    @type t :: %__MODULE__{
-            ctx: nil | {MapSet.t(binary()), map()},
-            mode: mode(),
-            lazy: nil | mode(),
-            whole: boolean(),
-            outermost: boolean(),
-            operand: boolean(),
-            calls: boolean()
-          }
+    @type t :: %__MODULE__{ctx: term(), calls: boolean(), state: term()}
 
     # `nil` for a walk that reads no column (the constants of `InfluxQLTyped`).
-    defstruct ctx: nil,
-              mode: :loose,
-              lazy: nil,
-              whole: false,
-              outermost: false,
-              operand: false,
-              calls: true
+    defstruct ctx: nil, calls: true, state: nil
   end
 
   @typedoc "A value of the module that is walked with: it is the module's own."
@@ -81,7 +64,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLWalk do
   @doc "A call: the name and the values of its arguments."
   @callback call(name :: binary(), arguments :: [value()], Opts.t()) :: outcome()
 
-  @optional_callbacks enter: 2, call: 3
+  @doc """
+  A group (`(sum)`) that has been read: the value it comes to. A module that prints its values
+  makes the parentheses part of it; without the callback the group is the value inside.
+  """
+  @callback group(value(), Opts.t()) :: outcome()
+
+  @doc """
+  `nil`, or the options to combine the last operation of an expression with, which is put off
+  until the walk knows it is the last (see above).
+  """
+  @callback lazy(Opts.t()) :: nil | Opts.t()
+
+  @optional_callbacks enter: 2, call: 3, group: 2, lazy: 1
 
   # An operation put off until the walk knows whether it is the last.
   @typep deferred :: {:lazy, binary(), value(), value()}
@@ -107,10 +102,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLWalk do
     end
   end
 
-  # The last operation is combined in the mode of the walk's end; any other value is settled.
+  # The last operation is combined with the options of the walk's end; any other value is
+  # settled.
   @spec finish(value() | deferred(), list(), module(), Opts.t()) :: result()
-  defp finish({:lazy, op, left, right}, [], mod, %Opts{lazy: last} = o) do
-    with {:ok, value} <- mod.combine(op, left, right, %{o | mode: last}), do: {:ok, value, []}
+  defp finish({:lazy, op, left, right}, [], mod, o) do
+    with {:ok, value} <- mod.combine(op, left, right, mod.lazy(o)), do: {:ok, value, []}
   end
 
   defp finish(value, rest, mod, o) do
@@ -122,10 +118,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLWalk do
   defp settle(value, _mod, _o), do: {:ok, value}
 
   @spec defer(binary(), value(), value(), module(), Opts.t()) :: outcome() | {:ok, deferred()}
-  defp defer(op, left, right, _mod, %Opts{lazy: last}) when last != nil,
-    do: {:ok, {:lazy, op, left, right}}
+  defp defer(op, left, right, mod, o) do
+    if lazy?(mod, o),
+      do: {:ok, {:lazy, op, left, right}},
+      else: mod.combine(op, left, right, o)
+  end
 
-  defp defer(op, left, right, mod, o), do: mod.combine(op, left, right, o)
+  defp lazy?(mod, o), do: function_exported?(mod, :lazy, 1) and mod.lazy(o) != nil
 
   defp sum(tokens, mod, o) do
     with {:ok, left, rest} <- product(tokens, mod, o),
@@ -169,7 +168,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWalk do
 
   defp factor([{:raw, "("} | rest], mod, o) do
     case sum(rest, mod, o) do
-      {:ok, value, [{:raw, ")"} | after_group]} -> {:ok, value, after_group}
+      {:ok, value, [{:raw, ")"} | after_group]} -> grouped(value, after_group, mod, o)
       {:error, _why} = error -> error
       _unread -> :unread
     end
@@ -180,13 +179,26 @@ defmodule InfluxElixir.Client.Local.InfluxQLWalk do
   end
 
   defp factor([{:ident, name}, {:raw, "("} | rest], mod, %Opts{calls: true} = o) do
-    with :ok <- mod.enter(name, o),
+    with :ok <- entered(mod, name, o),
          {:ok, values, after_call} <- arguments(rest, mod, o, []),
          {:ok, value} <- mod.call(name, values, o),
          do: {:ok, value, after_call}
   end
 
   defp factor(tokens, mod, o), do: mod.leaf(tokens, o)
+
+  # (A module without `enter/2` takes every call.)
+  defp entered(mod, name, o),
+    do: if(function_exported?(mod, :enter, 2), do: mod.enter(name, o), else: :ok)
+
+  # A group, as the module makes it of the value inside (the value itself, without `group/2`).
+  defp grouped(value, after_group, mod, o) do
+    if function_exported?(mod, :group, 2) do
+      with {:ok, grouped} <- mod.group(value, o), do: {:ok, grouped, after_group}
+    else
+      {:ok, value, after_group}
+    end
+  end
 
   # The arguments of a call up to its closing parenthesis (a call with none is `[]`). Only `,`
   # or `)` follows an argument, and none is missing (`abs(,1)`, `abs(1,)`, `abs(1 (2))`):

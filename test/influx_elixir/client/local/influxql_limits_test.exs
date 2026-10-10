@@ -191,4 +191,94 @@ defmodule InfluxElixir.Client.Local.InfluxQLLimitsTest do
       end
     end
   end
+
+  describe "select items" do
+    @item_refusal "Client.Local: unsupported InfluxQL (a select item nested or chained deeper " <>
+                    "than 160100 units, where InfluxDB 3 Core 3.10.1 overflows its stack: a call " <>
+                    "counts 256, a sign 100, an arithmetic operator 200, a parenthesis 100, " <>
+                    "after an operator 20)"
+
+    defp item_refusal(statement),
+      do: {:error, %{status: 400, body: @item_refusal <> ": " <> statement}}
+
+    defp nest(prefix, core, suffix, depth),
+      do: String.duplicate(prefix, depth) <> core <> String.duplicate(suffix, depth)
+
+    # Core 3.10.1 answers `abs(...abs(v)...)` in the select list 625 deep (13 s; the contract
+    # pins 400) and its stack overflows by 650 (641 verified as well); the double answers to 625.
+    test "calls nested 625 deep are answered, 626 and more are refused", %{conn: conn} do
+      assert {:ok, rows} =
+               capped(conn, "SELECT " <> nest("abs(", "v", ")", 625) <> " AS x FROM nine")
+
+      assert Enum.map(rows, & &1["x"]) === Enum.to_list(1..9)
+
+      for depth <- [626, 650, 1_000, 8_000] do
+        statement = "SELECT " <> nest("abs(", "v", ")", depth) <> " FROM nine"
+        assert capped(conn, statement) === item_refusal(statement)
+      end
+    end
+
+    # Answered by Core at 1,500 and 1,604 (it overflows by 1,900); sums of 800 terms; `v + (...)`
+    # 729 deep; `-(...)` 800 deep (it overflows by 850, 1,000 and 1,000).
+    test "parentheses, sums and signs are answered to the depth Core answers, refused past it",
+         %{conn: conn} do
+      sum = fn terms -> Enum.join(List.duplicate("v", terms), " + ") end
+
+      # `v` is 1 to 9: each item is a multiple of it (an even count of negations is `v`).
+      for {item, depth, times} <- [
+            {nest("(", "v", ")", 1_600), 1_600, 1},
+            {sum.(800), 800, 800},
+            {nest("v + (", "v", ")", 727), 727, 728},
+            {nest("-(", "v", ")", 800), 800, 1}
+          ] do
+        assert {:ok, rows} = capped(conn, "SELECT " <> item <> " AS x FROM nine"), "#{depth}"
+        assert Enum.map(rows, & &1["x"]) === Enum.map(1..9, &(&1 * times)), "#{depth}"
+      end
+
+      for item <- [
+            nest("(", "v", ")", 1_700),
+            nest("(", "v", ")", 3_000),
+            sum.(802),
+            sum.(900),
+            nest("v + (", "v", ")", 730),
+            nest("v + (", "v", ")", 1_000),
+            nest("-(", "v", ")", 803),
+            nest("-(", "v", ")", 1_200)
+          ] do
+        statement = "SELECT " <> item <> " FROM nine"
+        assert capped(conn, statement) === item_refusal(statement)
+      end
+    end
+
+    # Each item has the budget on its own, and an alias does not hide the next item.
+    test "a deep item is refused whichever it is, with an alias or after another item",
+         %{conn: conn} do
+      deep = nest("abs(", "v", ")", 700)
+
+      for statement <- [
+            "SELECT v, " <> deep <> " FROM nine",
+            "SELECT " <> deep <> " AS x, v FROM nine",
+            "SELECT v AS a, v + 1 AS b, " <> deep <> " AS c FROM nine"
+          ] do
+        assert capped(conn, statement) === item_refusal(statement)
+      end
+    end
+
+    # Any expression in `time()` is refused by name, a group in as many parentheses as written
+    # (the engine answers `time(((1m)))` and 1,500 parentheses; it overflows by 2,500).
+    test "the interval of GROUP BY time() in parentheses is refused by name, deep or not",
+         %{conn: conn} do
+      for depth <- [2, 3, 10, 1_500, 3_000] do
+        statement =
+          "SELECT count(v) FROM nine WHERE time >= 0 AND time < 100s GROUP BY time(" <>
+            nest("(", "1m", ")", depth) <> ")"
+
+        assert {:error, %{status: 400, body: body}} = capped(conn, statement)
+
+        assert body ===
+                 "Client.Local: unsupported InfluxQL (GROUP BY time() of an expression): " <>
+                   statement
+      end
+    end
+  end
 end

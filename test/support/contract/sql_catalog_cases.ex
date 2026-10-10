@@ -9068,7 +9068,12 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
        "SQL error: ParserError(\"Expected: end of statement, found: ALL at Line: 1, Column: 28\")"},
       {:raw, "SELECT v FROM ping ORDER BY v ANY (1)", :error, 400,
        "SQL error: ParserError(\"Expected: end of statement, found: ANY at Line: 1, Column: 31\")"},
-      {:raw, "SELECT v ANY FROM ping", :ok, [%{"any" => 1}]}
+      {:raw, "SELECT v ANY FROM ping", :ok, [%{"any" => 1}]},
+      # `||` binds as `*` does (sqlparser `MulDivModOp`), tighter than `+` and the comparisons.
+      {:raw, "SELECT 'a' || 'b' = 'ab' AS r", :ok, [%{"r" => true}]},
+      {:raw, "SELECT 2 * 3 || 'y' AS r", :ok, [%{"r" => "6y"}]},
+      {:raw, "SELECT 1 + 2 || 'y' AS r", :error, 400,
+       "Error during planning: Cannot coerce arithmetic expression Int64 + Utf8 to valid types"}
     ] ++ recursion()
   end
 
@@ -9089,7 +9094,11 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
       String.duplicate(pre, n) <> core <> String.duplicate(post, n)
     end
 
-    for {pre, core, post, depth} <- [{"coalesce(", "1", ", 1)", 48}, {"(v + ", "v", ")", 24}] do
+    for {pre, core, post, depth} <- [
+          {"coalesce(", "1", ", 1)", 48},
+          {"(v + ", "v", ")", 24},
+          {"- ", "1", "", 48}
+        ] do
       {:raw, "DELETE FROM main WHERE " <> nest.(pre, core, post, depth) <> " = 1", :error, 400,
        "Error during planning: DML not supported: Delete"}
     end
@@ -9116,7 +9125,16 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
       {"SELECT @@ AS x FROM ping", "coalesce(0, ", "v", ")", 47, [%{"x" => 0}]},
       {"SELECT v FROM ping WHERE @@", "true BETWEEN false AND (", "true", ")", 23, [%{"v" => 1}]},
       {"SELECT @@ AS x FROM ping", "(v + 2 * ", "v", ")", 15, [%{"x" => 65_535}]},
-      {"SELECT @@ AS x FROM ping", "(-v * ", "v", ")", 23, [%{"x" => -1}]}
+      {"SELECT @@ AS x FROM ping", "(-v * ", "v", ")", 23, [%{"x" => -1}]},
+      # The arguments of the calls the parser reads with a syntax of their own are
+      # `parse_expr`s, counted as any other (`CEIL`, `FLOOR`, `SUBSTRING`, `SUBSTR`).
+      {"SELECT CEIL(@@) AS x FROM ping", "- ", "1.5", "", 46, [%{"x" => 2.0}]},
+      {"SELECT FLOOR(@@) AS x FROM ping", "- ", "1.5", "", 46, [%{"x" => 1.0}]},
+      {"SELECT CEIL(@@) AS x FROM ping", "(1 + ", "1.5", ")", 23, [%{"x" => 25.0}]},
+      {"SELECT SUBSTRING('abc', @@) AS x FROM ping", "- ", "1", "", 46, [%{"x" => "abc"}]},
+      {"SELECT SUBSTR('abc', @@) AS x FROM ping", "- ", "1", "", 46, [%{"x" => "abc"}]},
+      # The right operand of `||` is read at its precedence, which `=` is not above.
+      {"SELECT 'a' = 'b' || @@ AS x FROM ping", "- ", "1", "", 45, [%{"x" => false}]}
     ]
 
     pairs =
@@ -9144,7 +9162,13 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
       {"UPDATE main SET v = @@", "(v + ", "v", ")", 24, "Update"},
       {"UPDATE main SET v = 1 WHERE @@ = 1", "abs(", "v", ")", 48, "Update"},
       {"DELETE FROM main WHERE @@ = 1", "coalesce(", "1", ", 1)", 48, "Delete"},
-      {"DELETE FROM main WHERE @@ = 1", "(v + ", "v", ")", 24, "Delete"}
+      {"DELETE FROM main WHERE @@ = 1", "(v + ", "v", ")", 24, "Delete"},
+      # A sign costs one level, as the operand of a statement the double plans as a query.
+      {"INSERT INTO main (v) VALUES (@@)", "- ", "1", "", 47, "Insert Into"},
+      {"INSERT INTO main (v) SELECT @@ FROM main", "- ", "1", "", 47, "Insert Into"},
+      {"UPDATE main SET v = @@", "- ", "1", "", 48, "Update"},
+      {"UPDATE main SET v = 1 WHERE @@ = 1", "- ", "1", "", 48, "Update"},
+      {"DELETE FROM main WHERE @@ = 1", "- ", "1", "", 48, "Delete"}
     ]
 
     # An edition that runs a `DELETE` answers the last depth with a delete, so the last depth
@@ -9185,20 +9209,50 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
     # answer does not depend on the length of the text). A `;` in a comment is no second
     # statement.
     pad = String.duplicate(" ", 9_000)
+    deep_sum = "SELECT " <> nest.("- ", "1 ", "", 60) <> nest.("+ 1 ", "", "", 2_100)
 
     padded = [
       {:raw,
        "SELECT /* ; */ v FROM ping WHERE " <>
          nest.("(v + ", "v", ")", 25) <> " > 0" <> pad, :error, 400, limit},
       {:raw, "SELECT " <> nest.("1 + ", "1", "", 29) <> " AS x" <> pad <> "FROM ping", :ok,
-       [%{"x" => 30}]}
+       [%{"x" => 30}]},
+      # The engine tokenizes the whole text before it parses any: a comment or a dollar-quoted
+      # string left open after the window is its tokenizer's error, not the nest's.
+      {:raw, deep_sum <> " /*", :error, 400,
+       "SQL error: TokenizerError(\"Unexpected EOF while in a multi-line comment at Line: 1, Column: 8533\")"},
+      {:raw, deep_sum <> " $$", :error, 400,
+       "SQL error: TokenizerError(\"Unterminated dollar-quoted string at Line: 1, Column: 8533\")"},
+      {:raw, deep_sum <> " $a$ x", :error, 400,
+       "SQL error: TokenizerError(\"Unterminated dollar-quoted, expected $ at Line: 1, Column: 8536\")"},
+      # (A token after it keeps this case apart from the open comment for the duplicate check.)
+      {:raw, deep_sum <> " /* closed */ + 1", :error, 400, limit},
+      # A run of blanks of 40,000 is read in linear time (the select list was quadratic in it).
+      {:raw, "SELECT 1" <> String.duplicate(" ", 40_000) <> "+ 1 AS x", :ok, [%{"x" => 2}]}
     ]
 
     # Past the limit the `NOT`s are swallowed by the parser's retry of the word as a name, and
     # the statement ends at the token after the last `NOT`: the engine's parser error.
     nots = fn n -> "SELECT v FROM ping WHERE " <> nest.("NOT ", "v > 0", "", n) end
 
+    # The calls with a syntax of their own whose arguments the double reads, and does not answer
+    # at the last depth: the first nest the parser refuses.
+    specials =
+      for {text, pre, core, post} <- [
+            {"SELECT SUBSTRING('abc' FROM @@) AS x FROM ping", "- ", "1", ""},
+            {"SELECT SUBSTRING('abc' FROM 1 FOR @@) AS x FROM ping", "- ", "3", ""},
+            {"SELECT OVERLAY('abc' PLACING 'x' FROM @@) AS x FROM ping", "- ", "1", ""},
+            {"SELECT TRY_CAST(@@ AS INT) AS x FROM ping", "- ", "1", ""},
+            {"SELECT EXTRACT(YEAR FROM @@) AS x FROM ping", "(", "TIMESTAMP '2023-01-02'", ")"},
+            {"SELECT EXTRACT(YEAR FROM @@)", "(", "now()", ")"},
+            {"SELECT POSITION('b' IN @@) AS x FROM ping", "(", "'abc'", ")"},
+            {"SELECT TRIM(BOTH 'x' FROM @@) AS x FROM ping", "(", "'xax'", ")"}
+          ] do
+        {:raw, String.replace(text, "@@", nest.(pre, core, post, 47)), :error, 400, limit}
+      end
+
     pairs ++
+      specials ++
       dml_pairs ++
       several ++
       padded ++
@@ -10702,7 +10756,38 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
       {:raw, "INSERT INTO m (f) VALUES ((CASE WHEN n THEN 1 ; END))", :error, 400,
        "SQL error: ParserError(\"Expected: ), found: WHEN at Line: 1, Column: 33\")"},
       {:raw, "INSERT INTO main (s) VALUES (CASE WHEN n THEN 1 ; END)", :error, 400,
-       "SQL error: ParserError(\"Expected: ), found: WHEN at Line: 1, Column: 35\")"}
+       "SQL error: ParserError(\"Expected: ), found: WHEN at Line: 1, Column: 35\")"},
+      # The precedences of the operators the engine's parser binds between `*` and `=`: `||` as
+      # `*` (above), `<<` and `>>` as `^`, then `&`, `|`, and the regular expression operators
+      # as `=`, so that a chain of them goes from the left. The double reads them (the right
+      # operand of each, and the low bound of a `BETWEEN`) and does not compute them.
+      {:raw, "SELECT 1 << 2 + 1 AS r", :ok, [%{"r" => 8}]},
+      {:raw, "SELECT 1 << 2 * 3 AS r", :ok, [%{"r" => 64}]},
+      {:raw, "SELECT 1 << 2 = 4 AS r", :ok, [%{"r" => true}]},
+      {:raw, "SELECT 1 | 2 << 1 AS r", :ok, [%{"r" => 5}]},
+      {:raw, "SELECT 3 ^ 1 << 1 AS r", :ok, [%{"r" => 4}]},
+      {:raw, "SELECT 2 & 3 << 1 AS r", :ok, [%{"r" => 4}]},
+      {:raw, "SELECT 5 | 3 ^ 1 AS r", :ok, [%{"r" => 7}]},
+      {:raw, "SELECT 'a' ~ 'a' = true AS r", :ok, [%{"r" => true}]},
+      {:raw, "SELECT 'a' = 'a' ~ 'a' AS r", :error, 400,
+       "Error during planning: Cannot infer common argument type for regex operation Boolean ~ Utf8"},
+      {:raw, "SELECT 1 BETWEEN 1 & 2 AND 3 AS r", :ok, [%{"r" => true}]},
+      {:raw, "SELECT 1 BETWEEN 1 | 2 AND 3 AS r", :ok, [%{"r" => false}]},
+      {:raw, "SELECT 1 BETWEEN 1 ^ 2 AND 3 AS r", :ok, [%{"r" => false}]},
+      {:raw, "SELECT 1 BETWEEN 1 << 2 AND 3 AS r", :ok, [%{"r" => false}]},
+      {:raw, "SELECT 1 BETWEEN 1 >> 2 AND 3 AS r", :ok, [%{"r" => true}]},
+      # The pattern of `LIKE` goes on with a comparison, `IN` or `BETWEEN` (precedence 19 against
+      # their 20); the second argument of `CEIL` and `FLOOR` is a scale only as a plain number.
+      {:raw, "SELECT 'ab' LIKE 'a' = 'b' AS r", :error, 400,
+       "type_coercion\ncaused by\nError during planning: There isn't a common type to coerce Utf8 and Boolean in LIKE expression"},
+      {:raw, "SELECT 'ab' LIKE 'a' IN ('b') AS r", :error, 400,
+       "type_coercion\ncaused by\nError during planning: There isn't a common type to coerce Utf8 and Boolean in LIKE expression"},
+      {:raw, "SELECT CEIL(1.5, - 1) AS x", :error, 400,
+       "Error during planning: Failed to coerce arguments to satisfy a call to 'ceil' function: coercion from Float64, Int64 to the signature Uniform(1, [Float64, Float32]) failed No function matches the given name and argument types 'ceil(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tceil(Float64/Float32)"},
+      {:raw, "SELECT FLOOR(1.5, - 1) AS x", :error, 400,
+       "Error during planning: Failed to coerce arguments to satisfy a call to 'floor' function: coercion from Float64, Int64 to the signature Uniform(1, [Float64, Float32]) failed No function matches the given name and argument types 'floor(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tfloor(Float64/Float32)"},
+      {:raw, "SELECT CEIL(1.5, n) AS x FROM main ORDER BY time LIMIT 1", :error, 400,
+       "Error during planning: Failed to coerce arguments to satisfy a call to 'ceil' function: coercion from Float64, Int64 to the signature Uniform(1, [Float64, Float32]) failed No function matches the given name and argument types 'ceil(Float64, Int64)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tceil(Float64/Float32)"}
     ] ++ deep_refusable()
   end
 
@@ -10718,7 +10803,6 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
 
     [
       {:raw, "EXPLAIN SELECT " <> open <> "1" <> close, :error, 400, limit},
-      {:raw, "SELECT EXTRACT(YEAR FROM " <> open <> "now()" <> close <> ")", :error, 400, limit},
       {:raw, "UPDATE main SET v = 1 RETURNING " <> open <> "v" <> close, :error, 400, limit},
       {:raw, "SELECT N'a', " <> open <> "1" <> close, :error, 400, limit},
       {:raw, "SELECT CAST(" <> nest <> " AS INT) AS x FROM ping", :error, 400, limit},

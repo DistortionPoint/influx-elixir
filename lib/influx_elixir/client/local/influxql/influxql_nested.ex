@@ -84,10 +84,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   message}`. `timed` says whether an equality of two booleans stands behind a comparison of the
   time in the statement.
   """
-  @spec classify(list(), ctx(), %{timed: boolean()}) :: classification() | :unplaced
+  @spec classify(list(), ctx(), %{timed: boolean(), alone: boolean()}) ::
+          classification() | :unplaced
   def classify(tokens, ctx, flags) do
     with {left, op, right} <- operands(tokens),
-         {left, right} = {side(left, ctx), side(right, ctx)},
+         {left, right} = clash_before_division(side(left, ctx), side(right, ctx), ctx, flags),
          false <- time_comparison?(left, right),
          :ok <- InfluxQLArithType.raise_first_error([elem(left, 2), elem(right, 2)]) do
       cond do
@@ -99,6 +100,39 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
       _unplaced -> :unplaced
     end
   end
+
+  # An unsigned number that waits for the error of a division (`u + u / s`, `u / u / b`) beside a
+  # boolean is the comparison's error, where the comparison is not the whole condition: the
+  # planner finds `UInt64 = Boolean` before the coercion of the division (verified: `u + u / s =
+  # b OR n > 1`, in either order, and `u + u / s = b AND ...`; on its own the division's error is
+  # the engine's).
+  defp clash_before_division(
+         {lt, lk, lf} = left,
+         {rt, rk, rf} = right,
+         {_tags, types} = ctx,
+         flags
+       ) do
+    if flags.alone do
+      {left, right}
+    else
+      {
+        if(pending_beside_boolean?(lf, lt, rt, ctx, types),
+          do: {lt, lk, {:ok, :unsigned}},
+          else: left
+        ),
+        if(pending_beside_boolean?(rf, rt, lt, ctx, types),
+          do: {rt, rk, {:ok, :unsigned}},
+          else: right
+        )
+      }
+    end
+  end
+
+  defp pending_beside_boolean?({:late, class, _body}, tokens, other, ctx, types)
+       when class in [:division, :comparison],
+       do: boolean_operand?(other, types) and InfluxQLArithType.pending_unsigned?(tokens, ctx)
+
+  defp pending_beside_boolean?(_fold, _tokens, _other, _ctx, _types), do: false
 
   # A comparison with the `time` itself on a side is read by the split of the time out of the
   # condition (its comparand is a time, `now()` or a duration, whatever else it holds), not by
@@ -134,7 +168,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
       {tokens, :group, :unread}
     else
       case InfluxQLArithType.kind(tokens, ctx) do
-        {:ok, false} = fold -> {tokens, false, fold}
+        {:ok, :false_constant} = fold -> {tokens, false, fold}
         fold -> {tokens, :other, fold}
       end
     end

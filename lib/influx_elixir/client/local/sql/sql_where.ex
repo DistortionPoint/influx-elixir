@@ -70,7 +70,7 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   @spec parse(binary()) :: {:ok, [node_t()], tree() | nil} | {:error, map()}
   defp parse(rest) do
     case SQLMask.run(
-           ~r/(?i)WHERE\s+(.+?)(?:\s+GROUP\b|\s+HAVING\b|\s+ORDER\b|\s+#{@limit_start}|$)/su,
+           ~r/(?i)WHERE\s+(.+?)(?<=\S)(?:\s+GROUP\b|\s+HAVING\b|\s+ORDER\b|\s+#{@limit_start}|\s*$)/su,
            rest
          ) do
       [_full_match, clauses_str] -> parse_clauses(clauses_str)

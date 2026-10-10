@@ -475,6 +475,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     end
   end
 
+  # (A plus sign between is no relief: `- + 'x'` is the minus sign before the string.)
+  defp negated?([{:raw, "+"} | before]), do: negated?(before)
   defp negated?(_acc), do: false
 
   # `NOT` is no keyword but a name like any other; a word, number or quoted

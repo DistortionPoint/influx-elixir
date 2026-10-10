@@ -409,7 +409,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     # 1)` keeps no row and is no error, where `'x' + v > 1` is the coercion error).
     # (The tokens are dead in the branch that plans the conditions inside the groups, which
     # recurse: a statement nested n deep would hold n copies of them otherwise.)
-    case InfluxQLNested.classify(tokens, ctx, %{timed: times.timed and not times.first}) do
+    flags = %{timed: times.timed and not times.first, alone: times.alone}
+
+    case InfluxQLNested.classify(tokens, ctx, flags) do
       :unplaced ->
         plan_flat(expand(tokens), ctx, times, time?)
 
@@ -666,12 +668,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
     planned = Enum.map(first, &held(&1, ctx, times)) ++ Enum.map(rest, &held(&1, ctx, others))
 
-    # The error of a division waits for the comparisons after it: theirs is the engine's.
-    case for({:late, class, body} <- planned, do: {class, body}) do
-      [_first | _rest] = lates ->
+    # The planner builds every comparison before it types any, so the errors of building one
+    # come first, in the order of the comparisons (they are thrown as they are met). Then comes
+    # the comparison of two types that do not meet, the first of them (`u = b OR n + (u / s) >
+    # 1` is the integer beside the quotient, `u + s / u = b OR u + s / u > 1` is `UInt64 =
+    # Boolean`); the error of a division waits for the comparisons after it: theirs is the
+    # engine's.
+    case {for({:deferred, body} <- planned, do: body),
+          for({:late, class, body} <- planned, do: {class, body})} do
+      {[body | _more], _lates} ->
+        throw({:deferred, body})
+
+      {[], [_first | _rest] = lates} ->
         lates |> InfluxQLArithType.pick_late() |> InfluxQLArithType.throw_late()
 
-      [] ->
+      {[], []} ->
         {sqls, lowers, checks} = unzip3(planned)
         {Enum.join(sqls, separator), Enum.concat(lowers), Enum.concat(checks)}
     end
@@ -681,6 +692,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     plan(node, ctx, times)
   catch
     {:late, class, body} -> {:late, class, body}
+    {:deferred, body} -> {:deferred, body}
   end
 
   defp unzip3(plans) do

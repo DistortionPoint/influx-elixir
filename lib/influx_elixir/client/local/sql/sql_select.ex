@@ -188,7 +188,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   """
   @spec split_alias(binary()) :: {binary(), binary() | nil}
   def split_alias(item) do
-    case SQLMask.run(~r/^(.+?)\s+AS\s+(\w+|"(?:[^"]|"")*")\s*$/isu, item) do
+    case SQLMask.run(~r/^(.+?)(?<=\S)\s+AS\s+(\w+|"(?:[^"]|"")*")\s*$/isu, item) do
       [_full, body, alias_text] -> {String.trim(body), name(alias_text)}
       nil -> implicit_alias(item)
     end
@@ -534,7 +534,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
           {:ok, column()} | {:error, term()}
   defp parse_agg_column(col, body, alias_name, qualifier) do
     count_star = ~r/(?i)^\s*COUNT\s*\(\s*\*\s*\)\s*$/u
-    distinct = ~r/(?i)^\s*(COUNT|SUM)\s*\(\s*DISTINCT\s+(.+?)\s*\)\s*$/us
+    distinct = ~r/(?i)^\s*(COUNT|SUM)\s*\(\s*DISTINCT\s+(.+?)(?<=\S)\s*\)\s*$/us
 
     cond do
       error = time_aggregate_error(body) ->

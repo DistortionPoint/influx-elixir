@@ -310,7 +310,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   defp shaped(kind) when kind in [:integer, :float, :unsigned, :string, :tag, :boolean],
     do: {:ok, kind}
 
-  defp shaped(kind) when kind in [:unknown, :nn, :nnf, :nz, :abs_null, false], do: {:ok, :null}
+  defp shaped(kind) when kind in [:unknown, :nn, :nnf, :nz, :abs_null, :false_constant],
+    do: {:ok, :null}
+
   defp shaped(_duration_or_time), do: :error
 
   @doc """

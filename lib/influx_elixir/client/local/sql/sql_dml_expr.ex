@@ -1244,7 +1244,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   def unparse({:tuple, items}, names),
     do: "(" <> Enum.map_join(items, ", ", &unparse(&1, names)) <> ")"
 
-  def unparse({:neg, inner}, names), do: "(- " <> unparse(inner, names) <> ")"
+  # A sign is not parenthesised: its operand is already (every operator below it is), and a
+  # pair of parentheses for each sign would double the depth the parser counts for a run of them.
+  def unparse({:neg, inner}, names), do: "- " <> unparse(inner, names)
   # The planner types a unary plus as its operand and finds fault with it only late.
   def unparse({:pos, inner}, names), do: unparse(inner, names)
 

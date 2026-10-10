@@ -1995,7 +1995,20 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
        ]},
       {"select n from ~p3 where -(3) = n", [{"2023-10-01 00:02:00", %{"n" => -3}}]},
       {"select n from ~p3 where n < -(-(2))",
-       [{"2023-10-01 00:00:00", %{"n" => 1}}, {"2023-10-01 00:02:00", %{"n" => -3}}]}
+       [{"2023-10-01 00:00:00", %{"n" => 1}}, {"2023-10-01 00:02:00", %{"n" => -3}}]},
+      # A plus sign between does not spare a string or a boolean from the minus sign before it.
+      {"select n from ~p3 where - + 'x' = b",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unexpected unary expression: expected literal integer, float, duration, field, function or parenthesis at pos 31"}},
+      {"select n from ~p3 where - + true = b",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unexpected unary expression: expected literal integer, float, duration, field, function or parenthesis at pos 32"}},
+      {"select n from ~p3 where b = - + 'x'",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unexpected unary expression: expected literal integer, float, duration, field, function or parenthesis at pos 35"}},
+      {"select n from ~p3 where n > 1 AND - + - 'x' = b",
+       {:error, 400,
+        "error in InfluxQL statement: parsing error: unexpected unary expression: expected literal integer, float, duration, field, function or parenthesis at pos 43"}}
     ]
   end
 
@@ -2475,6 +2488,158 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
     ]
   end
 
+  @doc "The quotient of two integers is a float, and beside an unsigned number the planner types it as the integer (`u + n / 2 = b` is `UInt64 = Boolean`, where `u + n / 2.0 = b` compares a float with a boolean and keeps no point); its value beside an unsigned number is the float cut toward zero and cast to unsigned (`u + n / 2 = 3` holds for `u = 5`, `n = -3`)."
+  @spec integer_quotients() :: [{binary(), term()}]
+  def integer_quotients do
+    [
+      {"select n from ~p3 where u + n / 1 = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u + (n / 1) = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where n / n + u = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u + 1 / 1 = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u + 4 / 2 = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u + n / 2 > b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 > Boolean"}},
+      {"select n from ~p3 where u + abs(n / 1) = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u + -(n / 1) = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u + n / 1 * 2 = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u * (n / 2) > b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 > Boolean"}},
+      {"select n from ~p3 where n / 2 - u = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u + n / 2.0 = b", []},
+      {"select n from ~p3 where u + f / 2 = b", []},
+      {"select n from ~p3 where u + n / 1 > 1",
+       [
+         {"2023-10-01 00:01:00", %{"n" => 2}},
+         {"2023-10-01 00:03:00", %{"n" => 7}},
+         {"2023-10-01 00:04:00", %{"n" => 4}}
+       ]},
+      {"select n from ~p3 where u + n / 2 = 5", [{"2023-10-01 00:03:00", %{"n" => 7}}]},
+      {"select n from ~p3 where u + n / 2 = 3",
+       [{"2023-10-01 00:02:00", %{"n" => -3}}, {"2023-10-01 00:04:00", %{"n" => 4}}]},
+      {"select n from ~p3 where u + n / 2 > 0.4",
+       [
+         {"2023-10-01 00:01:00", %{"n" => 2}},
+         {"2023-10-01 00:02:00", %{"n" => -3}},
+         {"2023-10-01 00:03:00", %{"n" => 7}},
+         {"2023-10-01 00:04:00", %{"n" => 4}}
+       ]},
+      {"select n from ~p3 where n / 3 + u = 3",
+       [{"2023-10-01 00:01:00", %{"n" => 2}}, {"2023-10-01 00:02:00", %{"n" => -3}}]},
+      {"select n from ~p3 where u - n / 2 > 1",
+       [
+         {"2023-10-01 00:01:00", %{"n" => 2}},
+         {"2023-10-01 00:02:00", %{"n" => -3}},
+         {"2023-10-01 00:03:00", %{"n" => 7}},
+         {"2023-10-01 00:04:00", %{"n" => 4}}
+       ]},
+      {"select n from ~p3 where u * (n / 5) > 1", [{"2023-10-01 00:03:00", %{"n" => 7}}]},
+      {"select n from ~p3 where u + n / 2 * 2 = 1",
+       [{"2023-10-01 00:00:00", %{"n" => 1}}, {"2023-10-01 00:02:00", %{"n" => -3}}]}
+    ]
+  end
+
+  @doc "A quotient of an unsigned number that waits for the error of its division is the comparison's error (`UInt64 = Boolean`) when the comparison with a boolean stands beside another condition, in either order, and the division's error when it stands alone."
+  @spec pending_across_connectives() :: [{binary(), term()}]
+  def pending_across_connectives do
+    [
+      {"select n from ~p3 where u + u / s = b OR u + u / s > 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u + u / s > 1 OR u + u / s = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u / u / b = b OR u / u / b > 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u / u / b > 1 OR u / u / b = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u + s / u = b OR u + s / u > 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u + s / u > 1 OR u + s / u = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where u + u / s = b AND n > 1",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}},
+      {"select n from ~p3 where n > 1 OR u + u / s = b",
+       {:error, 400,
+        "Error during planning: Cannot infer common argument type for comparison operation UInt64 = Boolean"}}
+    ]
+  end
+
+  @doc "Select items nested or chained to three quarters of the depth where the engine overflows its stack (650 calls, 1,900 parentheses, 850 terms, 1,000 levels of `n + (...)` or of `-(...)`): answered."
+  @spec deep_items() :: [{binary(), term()}]
+  def deep_items do
+    [
+      {"select " <>
+         String.duplicate("abs(", 400) <> "n" <> String.duplicate(")", 400) <> " as x from ~p3",
+       [
+         {"2023-10-01 00:00:00", %{"x" => 1}},
+         {"2023-10-01 00:01:00", %{"x" => 2}},
+         {"2023-10-01 00:02:00", %{"x" => 3}},
+         {"2023-10-01 00:03:00", %{"x" => 7}},
+         {"2023-10-01 00:04:00", %{"x" => 4}}
+       ]},
+      {"select " <>
+         String.duplicate("(", 1_000) <> "n" <> String.duplicate(")", 1_000) <> " as x from ~p3",
+       [
+         {"2023-10-01 00:00:00", %{"x" => 1}},
+         {"2023-10-01 00:01:00", %{"x" => 2}},
+         {"2023-10-01 00:02:00", %{"x" => -3}},
+         {"2023-10-01 00:03:00", %{"x" => 7}},
+         {"2023-10-01 00:04:00", %{"x" => 4}}
+       ]},
+      {"select " <> Enum.join(List.duplicate("n", 600), " + ") <> " as x from ~p3",
+       [
+         {"2023-10-01 00:00:00", %{"x" => 600}},
+         {"2023-10-01 00:01:00", %{"x" => 1200}},
+         {"2023-10-01 00:02:00", %{"x" => -1800}},
+         {"2023-10-01 00:03:00", %{"x" => 4200}},
+         {"2023-10-01 00:04:00", %{"x" => 2400}}
+       ]},
+      {"select " <>
+         String.duplicate("n + (", 500) <> "n" <> String.duplicate(")", 500) <> " as x from ~p3",
+       [
+         {"2023-10-01 00:00:00", %{"x" => 501}},
+         {"2023-10-01 00:01:00", %{"x" => 1002}},
+         {"2023-10-01 00:02:00", %{"x" => -1503}},
+         {"2023-10-01 00:03:00", %{"x" => 3507}},
+         {"2023-10-01 00:04:00", %{"x" => 2004}}
+       ]},
+      {"select " <>
+         String.duplicate("-(", 600) <> "n" <> String.duplicate(")", 600) <> " as x from ~p3",
+       [
+         {"2023-10-01 00:00:00", %{"x" => 1}},
+         {"2023-10-01 00:01:00", %{"x" => 2}},
+         {"2023-10-01 00:02:00", %{"x" => -3}},
+         {"2023-10-01 00:03:00", %{"x" => 7}},
+         {"2023-10-01 00:04:00", %{"x" => 4}}
+       ]}
+    ]
+  end
+
   @doc "The error of a quotient waits for the comparison, and a null beside it takes it away (`u / 1h > nosuch` keeps no point), the `abs()` of a null not (the engine types it `Float64`). Of two such errors the comparison of the unsigned number with the wrong type comes first and the division's last (arithmetic: the first of two divisions, the last of two comparisons of a quotient)."
   @spec null_erases_quotient_errors() :: [{binary(), term()}]
   def null_erases_quotient_errors do
@@ -2731,6 +2896,16 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
       {"select n from ~p4 where n / u > 0", :closed},
       {"select n from ~p4 where n < 3 and n / u > 0", :closed},
       {"select n from ~p4 where n / u > 0 or n = 1", :closed},
+      {"select n from ~p3 where u / (n / 2) > 0", :closed},
+      {"select n from ~p3 where (n / 2) / u > 0", :closed},
+      {"select count(n) from ~p3 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:05:00Z' group by time(((1m)))",
+       [
+         {"2023-10-01 00:00:00", %{"count" => 1}},
+         {"2023-10-01 00:01:00", %{"count" => 1}},
+         {"2023-10-01 00:02:00", %{"count" => 1}},
+         {"2023-10-01 00:03:00", %{"count" => 1}},
+         {"2023-10-01 00:04:00", %{"count" => 1}}
+       ]},
       {"select n from ~p3 where time =~ /x/", []},
       {"select n from ~p3 where time > 1h + n AND b",
        {:error, 400,
@@ -2866,6 +3041,12 @@ defmodule InfluxElixir.Contract.InfluxQLNestedCases do
         "unsupported InfluxQL (an unsigned division by zero)",
       "select n from ~p4 where n / u > 0 or n = 1" =>
         "unsupported InfluxQL (an unsigned division by zero)",
+      "select n from ~p3 where u / (n / 2) > 0" =>
+        "unsupported InfluxQL (an unsigned division by zero)",
+      "select n from ~p3 where (n / 2) / u > 0" =>
+        "unsupported InfluxQL (an unsigned division by zero)",
+      "select count(n) from ~p3 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T00:05:00Z' group by time(((1m)))" =>
+        "unsupported InfluxQL (GROUP BY time() of an expression)",
       "select n from ~p3 where time =~ /x/" => "unsupported InfluxQL (time =~ ...)",
       "select n from ~p3 where time > 1h + n AND b" =>
         "unsupported InfluxQL (a time compared with an operand the double cannot word)",

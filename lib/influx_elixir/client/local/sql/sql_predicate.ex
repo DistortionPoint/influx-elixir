@@ -60,15 +60,15 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   # The left side of these is a column or an expression (`abs(x) IS NULL`,
   # `price * 2 IN (...)`); a match whose left side is neither (the words
   # inside a string literal, say) is not one of them.
-  @not_in_pattern ~r/^(.+?)\s+NOT\s+IN\s*\((.*)\)\s*$/isu
-  @in_pattern ~r/^(.+?)\s+IN\s*\((.*)\)\s*$/isu
-  @is_not_null_pattern ~r/^(.+?)\s+IS\s+NOT\s+NULL$/isu
-  @is_null_pattern ~r/^(.+?)\s+IS\s+NULL$/isu
-  @between_pattern ~r/^(.+?)\s+(NOT\s+)?BETWEEN\s+(.+?)\s+AND\s+(.+)$/isu
-  @like_pattern ~r/^(.+?)\s+(NOT\s+)?(I?LIKE)\s+'(.*)'$/isu
-  @like_param_pattern ~r/^(.+?)\s+(NOT\s+)?(I?LIKE)\s+\$(\w+)$/isu
-  @regex_pattern ~r/^(.+?)\s*(!?~\*?)\s*'(.*)'$/su
-  @regex_param_pattern ~r/^(.+?)\s*(!?~\*?)\s*\$(\w+)$/su
+  @not_in_pattern ~r/^(.+?)(?<=\S)\s+NOT\s+IN\s*\((.*)\)\s*$/isu
+  @in_pattern ~r/^(.+?)(?<=\S)\s+IN\s*\((.*)\)\s*$/isu
+  @is_not_null_pattern ~r/^(.+?)(?<=\S)\s+IS\s+NOT\s+NULL$/isu
+  @is_null_pattern ~r/^(.+?)(?<=\S)\s+IS\s+NULL$/isu
+  @between_pattern ~r/^(.+?)(?<=\S)\s+(NOT\s+)?BETWEEN\s+(.+?)(?<=\S)\s+AND\s+(.+)$/isu
+  @like_pattern ~r/^(.+?)(?<=\S)\s+(NOT\s+)?(I?LIKE)\s+'(.*)'$/isu
+  @like_param_pattern ~r/^(.+?)(?<=\S)\s+(NOT\s+)?(I?LIKE)\s+\$(\w+)$/isu
+  @regex_pattern ~r/^(.+?)(?<=\S)\s*(!?~\*?)\s*'(.*)'$/su
+  @regex_param_pattern ~r/^(.+?)(?<=\S)\s*(!?~\*?)\s*\$(\w+)$/su
 
   @doc """
   Reads one predicate's text. `:always` and `:never` are a constant that
@@ -162,7 +162,7 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     end
   end
 
-  @escape_pattern ~r/^(.+?)\s+ESCAPE\s+'(.*)'$/isu
+  @escape_pattern ~r/^(.+?)(?<=\S)\s+ESCAPE\s+'(.*)'$/isu
 
   # `LIKE 'p' ESCAPE '\'` is the `LIKE` without the clause: the backslash is the escape character
   # the engine reads whatever the clause says (verified). Any other character is a run-time
@@ -294,8 +294,8 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     end
   end
 
-  @distinct_pattern ~r/^(.+?)\s+IS\s+(NOT\s+)?DISTINCT\s+FROM\s+(.+)$/isu
-  @boolean_test_pattern ~r/^(.+?)\s+IS\s+(NOT\s+)?(TRUE|FALSE)$/isu
+  @distinct_pattern ~r/^(.+?)(?<=\S)\s+IS\s+(NOT\s+)?DISTINCT\s+FROM\s+(.+)$/isu
+  @boolean_test_pattern ~r/^(.+?)(?<=\S)\s+IS\s+(NOT\s+)?(TRUE|FALSE)$/isu
 
   # `a IS [NOT] DISTINCT FROM b`: equality that counts a null as a value. It
   # is evaluated as the expression it is (see `InfluxElixir.Client.Local.SQLEval`);

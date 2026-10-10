@@ -161,7 +161,7 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
           aggs: [{binary(), SQLSelect.column()}]
         }
 
-  @having ~r/(?i)\bHAVING\s+(.+?)(?:\s+ORDER\b|\s+#{SQLLimit.start_source()}|\s*$)/su
+  @having ~r/(?i)\bHAVING\s+(.+?)(?<=\S)(?:\s+ORDER\b|\s+#{SQLLimit.start_source()}|\s*$)/su
 
   @doc """
   The `HAVING` of the text after the table, with `groups` the `GROUP BY` items

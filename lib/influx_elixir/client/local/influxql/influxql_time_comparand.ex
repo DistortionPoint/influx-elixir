@@ -24,7 +24,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
   # What is not verified (the arithmetic of strings, durations, floats and signed numbers, which
   # the planner prints in a form the double does not tell) is `:unclear`, and the caller refuses.
 
-  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLTokens}
+  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLTokens, InfluxQLWalk}
+  alias InfluxElixir.Client.Local.InfluxQLWalk.Opts
 
   @expected "expected now() or a literal duration, float, integer and timestamp string"
   @expected_literal "expected duration, float, integer, or timestamp string"
@@ -130,90 +131,49 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
   # The comparand
   # ---------------------------------------------------------------------------
 
-  # A node of the comparand as the planner prints it: the text, the error it raises (`nil` when
-  # it is a valid time) and whether the text is one the double knows how the planner prints.
-  @typep part :: {binary(), nil | :unclear | binary(), boolean()}
+  # The comparand is walked by `InfluxQLWalk`, which gives this module the nodes of it as the
+  # planner prints them (a `Part`): the text, the error it raises (`nil` when it is a valid
+  # time, `:unclear` when it is an error of a form the double does not tell) and whether the
+  # text is one the double knows how the planner prints.
+  @behaviour InfluxElixir.Client.Local.InfluxQLWalk
+
+  defmodule Part do
+    @moduledoc false
+    # A node of the comparand (see `InfluxQLTimeComparand`).
+    @type t :: %__MODULE__{text: binary(), error: nil | :unclear | binary(), clear: boolean()}
+    @enforce_keys [:text]
+    defstruct [:text, error: nil, clear: false]
+  end
 
   defp parse(tokens, ctx) do
-    case sum(tokens, ctx) do
-      {:ok, {_text, nil, _clear}, []} -> :valid
-      {:ok, {_text, :unclear, _clear}, []} -> :unclear
-      {:ok, {_text, error, _clear}, []} -> {:invalid, error}
+    # (A plus sign before a number is not verified, as a minus sign is not: it is made part of
+    # the number, which `number/3` leaves unclear.)
+    case InfluxQLWalk.walk(plus_numbers(tokens, nil), __MODULE__, %Opts{ctx: ctx}) do
+      {:ok, %Part{error: nil}, []} -> :valid
+      {:ok, %Part{error: :unclear}, []} -> :unclear
+      {:ok, %Part{error: error}, []} -> {:invalid, error}
       _unclear -> :unclear
     end
   end
 
-  @spec sum(list(), {MapSet.t(binary()), map()}) :: {:ok, part(), list()} | :unclear
-  defp sum(tokens, ctx) do
-    with {:ok, left, rest} <- product(tokens, ctx),
-         do: more(rest, left, ["+", "-"], &product/2, ctx)
-  end
+  # (A sign stands at the start, or behind an operator, a parenthesis or a comma.)
+  defp plus_numbers([{:raw, "+"}, {:number, text} | rest], previous)
+       when previous in [nil, "+", "-", "*", "/", "(", ","],
+       do: [{:number, "+" <> text} | plus_numbers(rest, text)]
 
-  defp product(tokens, ctx) do
-    with {:ok, left, rest} <- factor(tokens, ctx),
-         do: more(rest, left, ["*", "/"], &factor/2, ctx)
-  end
+  defp plus_numbers([{:raw, word} = token | rest], _previous),
+    do: [token | plus_numbers(rest, word)]
 
-  defp more([{:raw, op} | rest] = tokens, left, ops, next, ctx) do
-    if op in ops do
-      with {:ok, right, after_right} <- next.(rest, ctx),
-           do: more(after_right, binary(left, op, right), ops, next, ctx)
-    else
-      {:ok, left, tokens}
-    end
-  end
+  defp plus_numbers([token | rest], _previous), do: [token | plus_numbers(rest, :operand)]
+  defp plus_numbers([], _previous), do: []
 
-  defp more(tokens, left, _ops, _next, _ctx), do: {:ok, left, tokens}
+  # A number is clear when it is one integer; one behind a sign is not verified.
+  @impl InfluxQLWalk
+  def number(text, 1, _o), do: {:ok, %Part{text: text, clear: Regex.match?(~r/\A\d+\z/, text)}}
+  def number(_text, -1, _o), do: {:ok, %Part{text: "?"}}
 
-  # An expression that holds an error is that error, with the expression it is in.
-  defp binary({left_text, left_error, left_clear}, op, {right_text, right_error, right_clear}) do
-    text = left_text <> " " <> op <> " " <> right_text
-    clear = left_clear and right_clear
-
-    case left_error || right_error do
-      nil -> {text, nil, clear}
-      :unclear -> {text, :unclear, clear}
-      error when clear -> {text, "invalid expression \"#{text}\": #{error}", clear}
-      _unwordable -> {text, :unclear, clear}
-    end
-  end
-
-  # A sign before a number is not verified; before anything else it is the product with -1.
-  defp factor([{:raw, sign}, {:number, _text} | rest], _ctx) when sign in ["-", "+"],
-    do: {:ok, {"?", nil, false}, rest}
-
-  defp factor([{:raw, "+"} | rest], ctx), do: factor(rest, ctx)
-
-  defp factor([{:raw, "-"} | rest], ctx) do
-    with {:ok, operand, after_operand} <- factor(rest, ctx),
-         do: {:ok, binary({"-1", nil, true}, "*", operand), after_operand}
-  end
-
-  defp factor([{:raw, "("} | rest], ctx) do
-    case sum(rest, ctx) do
-      {:ok, {text, error, clear}, [{:raw, ")"} | after_group]} ->
-        {:ok, {"(" <> text <> ")", error, clear and not String.starts_with?(text, "(")},
-         after_group}
-
-      _unclear ->
-        :unclear
-    end
-  end
-
-  defp factor([{:number, text} | rest], _ctx) do
-    {:ok, {text, nil, Regex.match?(~r/\A\d+\z/, text)}, rest}
-  end
-
-  defp factor([{:ident, name}, {:raw, "("} | rest], ctx) do
-    with {:ok, arguments, after_call} <- arguments(rest, ctx, []) do
-      text = String.downcase(name) <> "(" <> Enum.map_join(arguments, ", ", &elem(&1, 0)) <> ")"
-      clear = Enum.all?(arguments, &elem(&1, 2))
-
-      {:ok, {text, "invalid function call '#{String.downcase(name)}'", clear}, after_call}
-    end
-  end
-
-  defp factor([{:ident, name} = token | rest], {tags, types}) do
+  @impl InfluxQLWalk
+  def leaf([{:ident, name} = token | rest], %Opts{ctx: {tags, types}}) do
     shown =
       cond do
         InfluxQLTokens.time?(token) -> "time::timestamp"
@@ -222,34 +182,69 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
         true -> name
       end
 
-    {:ok, {shown, "found symbol '#{shown}', #{@expected}", true}, rest}
+    {:ok, %Part{text: shown, error: "found symbol '#{shown}', #{@expected}", clear: true}, rest}
   end
 
-  defp factor([{:raw, "now()"} | rest], _ctx), do: {:ok, {"now()", nil, true}, rest}
+  def leaf([{:raw, "now()"} | rest], _o), do: {:ok, %Part{text: "now()", clear: true}, rest}
 
-  defp factor([{:raw, word} | rest], _ctx) do
+  def leaf([{:raw, word} | rest], _o) do
     if InfluxQLTokens.boolean_word?(word) do
       shown = String.downcase(word)
-      {:ok, {shown, "found literal '#{shown}', #{@expected_literal}", false}, rest}
+      {:ok, %Part{text: shown, error: "found literal '#{shown}', #{@expected_literal}"}, rest}
     else
-      :unclear
+      :unread
     end
   end
 
   # (A string or a duration is a time or another error of the planner's, its text unverified.)
-  defp factor([{kind, _value} | rest], _ctx) when kind in [:str, :param, :regex],
-    do: {:ok, {"?", nil, false}, rest}
+  def leaf([{kind, _value} | rest], _o) when kind in [:str, :param, :regex],
+    do: {:ok, %Part{text: "?"}, rest}
 
-  defp factor([{:duration, _total, _text} | rest], _ctx), do: {:ok, {"?", nil, false}, rest}
+  def leaf([{:duration, _total, _text} | rest], _o), do: {:ok, %Part{text: "?"}, rest}
+  def leaf(_tokens, _o), do: :unread
 
-  defp arguments([{:raw, ")"} | rest], _ctx, []), do: {:ok, [], rest}
+  # An expression that holds an error is that error, with the expression it is in.
+  @impl InfluxQLWalk
+  def combine(op, %Part{} = left, %Part{} = right, _o) do
+    text = left.text <> " " <> op <> " " <> right.text
+    clear = left.clear and right.clear
 
-  defp arguments(tokens, ctx, acc) do
-    with {:ok, argument, rest} <- sum(tokens, ctx) do
-      case rest do
-        [{:raw, ","} | more] -> arguments(more, ctx, [argument | acc])
-        [{:raw, ")"} | more] -> {:ok, Enum.reverse([argument | acc]), more}
-      end
+    case left.error || right.error do
+      nil -> {:ok, %Part{text: text, clear: clear}}
+      :unclear -> {:ok, %Part{text: text, error: :unclear, clear: clear}}
+      error when clear -> {:ok, %Part{text: text, error: invalid(text, error), clear: clear}}
+      _unwordable -> {:ok, %Part{text: text, error: :unclear, clear: clear}}
     end
+  end
+
+  defp invalid(text, error), do: "invalid expression \"#{text}\": #{error}"
+
+  # A sign before anything but a number is the product with -1.
+  @impl InfluxQLWalk
+  def negate(%Part{} = operand, o), do: combine("*", %Part{text: "-1", clear: true}, operand, o)
+
+  # A group keeps its parentheses; a group in a group is not verified.
+  @impl InfluxQLWalk
+  def group(%Part{} = inner, _o) do
+    {:ok,
+     %{
+       inner
+       | text: "(" <> inner.text <> ")",
+         clear: inner.clear and not starts_with_group?(inner)
+     }}
+  end
+
+  defp starts_with_group?(%Part{text: text}), do: String.starts_with?(text, "(")
+
+  @impl InfluxQLWalk
+  def call(name, arguments, _o) do
+    shown = String.downcase(name)
+
+    {:ok,
+     %Part{
+       text: shown <> "(" <> Enum.map_join(arguments, ", ", & &1.text) <> ")",
+       error: "invalid function call '#{shown}'",
+       clear: Enum.all?(arguments, & &1.clear)
+     }}
   end
 end

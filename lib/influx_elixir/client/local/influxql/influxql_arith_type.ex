@@ -7,7 +7,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   # reads the tokens once, left to right: the problems of the arithmetic and of the calls in it
   # (`abs()` is the only function) are found in the order they are written.
   #
-  # A value is `%Value{kind, pending, named, literal, deferred}`:
+  # A value is `%Value{kind, pending, named, literal, quotient, deferred}`:
   #
   #   * `kind` is what the arithmetic comes to (below)
   #   * `pending` is an error the value carries that is not raised yet, `nil` or `{class,
@@ -27,6 +27,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   #     quotient of an unsigned number and text is the rewriter's error that no null takes away
   #     (`n + (u / s)`, `(u / s) < n`, but `2 + (u / s)` is the division's). It is raised at once,
   #     where the planner's errors below are not
+  #   * `quotient` is whether the value is a float that the planner types as an integer: the
+  #     quotient of integers (`n / 2`, `4 / 2`, `n / 2 * 3`, `abs(n / 2)`). Alone, the value
+  #     is a float (`n / 2 = 1.5` holds), but beside an unsigned number the type of the
+  #     quotient is the integer's (`u + n / 2` is an unsigned number, where `u + 2.5` is a
+  #     float), so `u + n / 2 = b` is the planner's error of `UInt64 = Boolean`
   #   * `deferred` is the planning error of the operation or the call that made the value (the
   #     coercion of `u + 's'`, the signature of `abs(s)`), as a body. The planner raises it when
   #     the operation is an operand of another, which asks for the type of both operands in turn
@@ -38,13 +43,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   #
   # The kinds that are no type of the engine's:
   #
-  #   | kind       | what it is                                                           |
-  #   |------------|----------------------------------------------------------------------|
-  #   | `:unknown` | a column the measurement lacks                                       |
-  #   | `:nn`      | a null number of the type an integer makes (a "null number")        |
-  #   | `:nnf`     | a null number of the type a float makes (a "null number, float")    |
-  #   | `:nz`      | a null of its own: two operands that are no numbers (`'x' + 1`)    |
-  #   | `false`    | the constant false, a boolean that is no null (`nosuch + 'x'`)     |
+  #   | kind              | what it is                                                       |
+  #   |-------------------|------------------------------------------------------------------|
+  #   | `:unknown`        | a column the measurement lacks                                   |
+  #   | `:nn`             | a null number of the type an integer makes (a "null number")     |
+  #   | `:nnf`            | a null number of the type a float makes (a "null number, float") |
+  #   | `:nz`             | a null of its own: two operands that are no numbers (`'x' + 1`)  |
+  #   | `:false_constant` | the constant false, a boolean that is no null (`nosuch + 'x'`)   |
   #
   # The rules are about the types of the two operands, whatever the operator (`+ - * /`):
   #
@@ -91,7 +96,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
             | :nn
             | :nnf
             | :nz
-            | false
+            | :false_constant
             | :integer
             | :float
             | :unsigned
@@ -108,11 +113,36 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
             pending: nil | pending(),
             named: nil | kind(),
             literal: boolean(),
+            quotient: boolean(),
             deferred: nil | binary()
           }
 
     @enforce_keys [:kind]
-    defstruct [:kind, pending: nil, named: nil, literal: false, deferred: nil]
+    defstruct [:kind, pending: nil, named: nil, literal: false, quotient: false, deferred: nil]
+  end
+
+  defmodule Config do
+    @moduledoc false
+    # What a walk of `InfluxQLArithType` is asked, the `state` of its `InfluxQLWalk.Opts`:
+    #
+    #   * `mode`: how the quotient of an unsigned number and text is read
+    #   * `lazy`: `nil`, or the mode of the last operation, which is put off
+    #   * `whole`: the condition is one call and nothing else (its error is worded without the
+    #     signature the planner lists beside a call that is part of something)
+    #   * `outermost`: the condition is a call with no arguments
+    #   * `operand`: the condition has no comparison, it is a bare operand
+
+    @type mode :: :loose | :text | :strict | :alone
+
+    @type t :: %__MODULE__{
+            mode: mode(),
+            lazy: nil | mode(),
+            whole: boolean(),
+            outermost: boolean(),
+            operand: boolean()
+          }
+
+    defstruct mode: :loose, lazy: nil, whole: false, outermost: false, operand: false
   end
 
   @typedoc "What arithmetic comes to."
@@ -133,11 +163,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   error alone), `:strict` beside a number (the division's error beside a float and alone),
   `:alone` as the whole condition (the division's error beside text, too).
   """
-  @type mode :: Opts.mode()
+  @type mode :: Config.mode()
 
   @typedoc """
   What `kind/3` and `value/3` are asked: `mode` as above; `whole`, `outermost` and `operand` as
-  `InfluxQLWalk.Opts` (the flags of a call that is the whole condition, see `call_options/2`).
+  `Config` (the flags of a call that is the whole condition, see `call_options/2`).
   """
   @type opts :: [
           mode: mode(),
@@ -150,11 +180,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   @nulls [:unknown, :nn, :nnf, :nz]
   # (The nulls arithmetic makes: a column the measurement lacks is a float to `abs()`.)
   @known_nulls [:nn, :nnf, :nz]
-  @non_numeric [:string, :tag, :boolean, :duration, false]
+  @non_numeric [:string, :tag, :boolean, :duration, :false_constant]
 
   # (The false is a boolean to the engine.)
   @arrow %{
-    false => "Boolean",
+    false_constant: "Boolean",
     integer: "Int64",
     unsigned: "UInt64",
     float: "Float64",
@@ -166,7 +196,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   }
 
   @native %{
-    false => "Boolean",
+    false_constant: "Boolean",
     string: "String",
     boolean: "Boolean",
     tag: "String",
@@ -179,7 +209,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   @udiv_dividends [:timestamp | @non_numeric]
 
   # What an unsigned number divided is compared with `UInt64` at once.
-  @divisors [:boolean, false, :timestamp, :duration]
+  @divisors [:boolean, :false_constant, :timestamp, :duration]
 
   # The classes of pending error that a null beside the value takes away.
   @erasable [:quotient, :division, :comparison]
@@ -270,11 +300,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
 
   # Of several errors of quotients that wait, the engine raises the first of the comparisons of
   # an unsigned number with the wrong type (`(u / 1h) < (u / b)` is the duration's, `(u / s) <
-  # (u / 1h)` too), and else the last of the divisions (`(b / u) < (u / s)` is `UInt64 / Utf8`).
+  # (u / 1h)` too); else the first of the divisions that a sum, a product or a call made of a
+  # quotient (`u + s / u = f OR b / u = f` is `Utf8 / UInt64`, `f + u / s > 1 AND u * (s / u) >
+  # 1` is `UInt64 / Utf8`); else the last of the quotients themselves (`(b / u) < (u / s)` is
+  # `UInt64 / Utf8`).
   @doc false
   @spec pick_late([{atom(), binary()}]) :: {atom(), binary()}
-  def pick_late(lates),
-    do: Enum.find(lates, &match?({:comparison, _body}, &1)) || List.last(lates)
+  def pick_late(lates) do
+    Enum.find(lates, &match?({:comparison, _body}, &1)) ||
+      Enum.find(lates, &match?({:division, _body}, &1)) || List.last(lates)
+  end
 
   @doc false
   @spec throw_late({atom(), binary()}) :: no_return()
@@ -326,7 +361,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   # ---------------------------------------------------------------------------
 
   @doc """
-  The options of the calls of a condition `tokens` (see `InfluxQLWalk.Opts`): a call that is
+  The options of the calls of a condition `tokens` (see `Config`): a call that is
   the whole condition (`alone`: it is the whole `WHERE`, not a part of an `AND`, an `OR` or a
   group) is worded as the planner words a call that is the whole predicate (verified: a call
   that is part of something carries the signature, and a call with no arguments that is the
@@ -373,11 +408,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
 
     %Opts{
       ctx: ctx,
-      mode: if(mode == :alone, do: :strict, else: mode),
-      lazy: if(mode == :alone, do: :alone),
-      whole: Keyword.get(opts, :whole, false),
-      outermost: Keyword.get(opts, :outermost, false),
-      operand: Keyword.get(opts, :operand, false)
+      state: %Config{
+        mode: if(mode == :alone, do: :strict, else: mode),
+        lazy: if(mode == :alone, do: :alone),
+        whole: Keyword.get(opts, :whole, false),
+        outermost: Keyword.get(opts, :outermost, false),
+        operand: Keyword.get(opts, :operand, false)
+      }
     }
   end
 
@@ -397,6 +434,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
       {:error, {:engine, body}} -> {:error, body}
       {:error, {:refuse, message}} -> throw({:refused, message})
       :unread -> :unread
+    end
+  end
+
+  @doc """
+  Whether the arithmetic `tokens` make an unsigned number that waits for the error of a division
+  (`u + u / s`, `u / u / b`) as the whole of what it comes to.
+  """
+  @spec pending_unsigned?(list(), ctx()) :: boolean()
+  def pending_unsigned?(tokens, ctx) do
+    case value(tokens, ctx) do
+      {:ok, %Value{kind: :unsigned, pending: {class, _body}}} -> class in [:division, :comparison]
+      _other -> false
     end
   end
 
@@ -486,15 +535,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   defp negated(%Value{pending: pending} = value) when pending != nil, do: {:ok, value}
   defp negated(%Value{kind: :unknown}), do: {:ok, %Value{kind: :nn}}
 
-  defp negated(%Value{kind: kind})
+  defp negated(%Value{kind: kind, quotient: quotient})
        when kind in @numbers or kind in [:nn, :nnf, :nz, :duration],
-       do: {:ok, %Value{kind: kind}}
+       do: {:ok, %Value{kind: kind, quotient: quotient}}
 
   # The engine cannot negate a string, a tag, a boolean column or the false: the sign leaves a
   # null of its own (verified: `'x' * -s` is `false` beside `ok`, `1 * -s` a null;
   # `-(nosuch + 'x') + 'x' = ok` keeps the points `ok` is false for, `-(nosuch + 'x') = ok`
   # none). (A constant of these is a parse error.)
-  defp negated(%Value{kind: kind}) when kind in [:string, :tag, :boolean, false],
+  defp negated(%Value{kind: kind}) when kind in [:string, :tag, :boolean, :false_constant],
     do: {:ok, %Value{kind: :nz}}
 
   # `-time` is `-1 * time` (verified for `-(time)` and `-(time + 1h)`).
@@ -510,17 +559,46 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
     end
   end
 
+  # The last operation is put off, and combined in the mode `lazy` names.
   @impl InfluxQLWalk
-  def combine(op, left, right, %Opts{mode: mode}) do
+  def lazy(%Opts{state: %Config{lazy: nil}}), do: nil
+
+  def lazy(%Opts{state: %Config{lazy: last} = config} = o),
+    do: %{o | state: %{config | mode: last}}
+
+  @impl InfluxQLWalk
+  def combine(op, left, right, %Opts{state: %Config{mode: mode}}) do
     with {:ok, left} <- flush(left), {:ok, right} <- flush(right) do
       op |> operate(left, right, mode) |> own() |> named(op, left, right)
     end
   end
 
-  defp operate(op, %Value{pending: nil} = left, %Value{pending: nil} = right, _mode),
-    do: plain(op, left.kind, right.kind)
+  defp operate(op, %Value{pending: nil} = left, %Value{pending: nil} = right, _mode) do
+    op
+    |> plain(typed_beside(left, right), typed_beside(right, left))
+    |> quotient_of(left, right)
+  end
 
   defp operate(op, left, right, mode), do: divided(op, left, right, mode)
+
+  # The kind an operand is typed as beside the other: the quotient of integers is an integer
+  # beside an unsigned number (see `quotient` above).
+  defp typed_beside(%Value{kind: :float, quotient: true}, %Value{kind: :unsigned}), do: :integer
+  defp typed_beside(%Value{kind: kind}, _other), do: kind
+
+  # The result of an operation between two numbers the planner types as integers and the engine
+  # computes as floats is such a quotient again (`n / 2 * 3`, `4 / 2`).
+  defp quotient_of({:ok, %Value{kind: :float} = result}, left, right) do
+    if integer_typed?(left) and integer_typed?(right),
+      do: {:ok, %{result | quotient: true}},
+      else: {:ok, result}
+  end
+
+  defp quotient_of(outcome, _left, _right), do: outcome
+
+  defp integer_typed?(%Value{kind: :integer}), do: true
+  defp integer_typed?(%Value{kind: :float, quotient: true}), do: true
+  defp integer_typed?(_value), do: false
 
   # What the engine names the result of an operation by in a signature, when an operand is named
   # otherwise than it is typed (the `abs()` of a null is `Float64`, and a sum with it is typed
@@ -549,23 +627,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   # ---------------------------------------------------------------------------
 
   # A math function is a float; `abs()` of a number keeps its type.
-  defp signature(_name, [], %Opts{outermost: outermost}),
+  defp signature(_name, [], %Opts{state: %Config{outermost: outermost}}),
     do: {:own_error, zero_arguments(outermost)}
 
   # The engine types `abs()` of a null a float all the same, which beside no comparison is the
   # bare operand's error; the double reads such a null as no type (verified: `abs(nosuch + 1)`
   # is `Boolean AND Float64` alone, `Float64 AND Int64` beside `AND n`, where `abs(nosuch + 1) =
   # 1` keeps no point): refused by name.
-  defp signature(_name, [%Value{kind: kind}], %Opts{operand: true}) when kind in @known_nulls,
-    do: {:error, {:refuse, "unsupported InfluxQL (abs() of a null as a bare operand)"}}
+  defp signature(_name, [%Value{kind: kind}], %Opts{state: %Config{operand: true}})
+       when kind in @known_nulls,
+       do: {:error, {:refuse, "unsupported InfluxQL (abs() of a null as a bare operand)"}}
 
-  defp signature(_name, [argument], %Opts{whole: whole}), do: abs_call(argument, whole)
+  defp signature(_name, [argument], %Opts{state: %Config{whole: whole}}),
+    do: abs_call(argument, whole)
 
   # As the whole condition the engine coerces the quotient of an unsigned number and text, a
   # boolean, the time or a duration among the arguments before it checks their number (verified:
   # `abs(u / s, 1)` is the division's coercion error, `abs(u / s, 1) = 1` the arity with
   # `UInt64`).
-  defp signature(_name, arguments, %Opts{whole: whole}) do
+  defp signature(_name, arguments, %Opts{state: %Config{whole: whole}}) do
     with true <- whole,
          %Value{pending: {_class, body}} <- Enum.find(arguments, &pending?/1) do
       {:own_error, body}
@@ -583,7 +663,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
     do: {:ok, pending(:division, body, quotient.kind)}
 
   defp abs_call(%Value{pending: pending} = value, _bare) when pending != nil, do: {:ok, value}
-  defp abs_call(%Value{kind: kind}, _bare) when kind in @numbers, do: {:ok, %Value{kind: kind}}
+
+  defp abs_call(%Value{kind: kind, quotient: quotient}, _bare) when kind in @numbers,
+    do: {:ok, %Value{kind: kind, quotient: quotient}}
 
   defp abs_call(%Value{kind: kind}, _bare) when kind in @known_nulls,
     do: {:ok, %Value{kind: kind, named: :float}}
@@ -775,7 +857,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
     do: {:ok, %Value{kind: null_number(null, kind)}}
 
   defp with_null(_null, kind) when kind in @non_numeric or kind == :timestamp,
-    do: {:ok, %Value{kind: false}}
+    do: {:ok, %Value{kind: :false_constant}}
 
   defp known("/", :unsigned, right) when right in @divisors,
     do: {:ok, pending(:comparison, comparison_body(right))}

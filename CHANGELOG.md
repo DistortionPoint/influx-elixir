@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` SQL and InfluxQL: fifth review of the differential fuzz** (design document
+  `2026-10-09_sql-influxql-fuzz-fifth-review.md`; 20,688 statements compared with Core, none that
+  matched before differs now):
+  - SQL: the precedences of `||` (as `*`), `<<` and `>>` (as `^`), `&`, `|`, `^` and the regular
+    expression operators (as `=`) are the parser's, in one table that the right operand of every
+    operator and the low bound of a `BETWEEN` are read from (`'a' = 'b' || - - ... 1` refuses at 46
+    signs as Core does, `1 BETWEEN 1 & 2 AND 3` reads); `CEIL`, `FLOOR`, `SUBSTRING`, `SUBSTR`,
+    `OVERLAY`, `TRY_CAST`, `EXTRACT`, `POSITION` and `TRIM` are read, so that a nest in their
+    arguments is the recursion error where Core gives it (it was skipped), and a syntax error in
+    one is the parser's; the operand of an `INSERT`, `UPDATE` or `DELETE` is written without a pair
+    of parentheses per sign (`UPDATE ... SET v = - - ... 1` refused at 25 signs, Core answers to 48);
+    a text over 8 KB with a `/*` or a `$` is read whole, so that an unterminated comment after the
+    window is the tokenizer's error; the pattern of a `LIKE` that goes on with a comparison, `IN`
+    or `BETWEEN`, and `CEIL(x, <not a number>)`, are refused by name where they answered in
+    another way than Core.
+  - SQL: a run of blanks in a clause is read in linear time (`SELECT 1` + 32,000 blanks took 3.6 s,
+    a `WHERE` with them 15.8 s).
+  - InfluxQL: the quotient of two integers is an integer beside an unsigned number (`u + n / 1 = b`
+    is `UInt64 = Boolean`, its value the float cut to an integer: 502 of 1,120 comparisons
+    differed); across `AND`/`OR` the errors of building a comparison come first, then the first
+    `UInt64 = Boolean`, then the first division that waited (`u + u / s = b OR u + u / s > 1`);
+    `- + 'x'` is the unary error; `GROUP BY time(((1m)))` is refused by name (it was a parse error
+    Core does not give).
+  - InfluxQL: a select item nested or chained deeper than Core answers is refused by name, like a
+    `WHERE` (Core dies on `abs(abs(...))` past 625, parentheses past 1,604, a sum past 800 terms,
+    `n + (n + ...)` past 729, `-(-(...))` past 802 in the select list).
+  - Refactors: one state map for a SQL read (`with_state/1`), the time comparand on `InfluxQLWalk`,
+    `InfluxQLWalk.Opts` narrowed to `ctx`, `calls` and `state`, the kind `:false_constant`, the
+    dead `InfluxQLDepth.budget/0` and `message/0` removed.
 - **`Client.Local`: three more differences from Core found while covering this round's code**:
   - A chain ending at the bare `time` (`time > 5 < time`) is Core's 500 `expected Expr`.
   - A sign with no operand after a comparison (`n > - = 2`) is Core's `invalid conditional

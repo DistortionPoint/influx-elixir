@@ -53,7 +53,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # The one place a SELECT is cut into its parts. A measurement name is
   # quoted, or bare with escaped spaces ("my\ measurement") — everything up
   # to the first unescaped space. `rest` is whatever follows the table.
-  @select_pattern ~r/(?i)^\s*SELECT\s+(?<distinct>DISTINCT\s+)?(?<columns>.+?)\s+FROM\s+(?:"(?<quoted>[^"]+)"|(?<bare>(?:[^\s\\]|\\.)+))\s*(?<rest>.*)$/su
+  @select_pattern ~r/(?i)^\s*SELECT\s+(?<distinct>DISTINCT\s+)?(?<columns>.+?)(?<=\S)\s+FROM\s+(?:"(?<quoted>[^"]+)"|(?<bare>(?:[^\s\\]|\\.)+))\s*(?<rest>.*)$/su
 
   @typedoc false
   @typep split :: %{

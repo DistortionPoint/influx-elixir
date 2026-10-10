@@ -222,8 +222,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
 
   @doc "Whether a row (field name to value) satisfies a check."
   @spec holds?(check(), map()) :: boolean()
-  def holds?({:check, op, left, right}, row),
-    do: compare(op, eval(left, row), eval(right, row))
+  def holds?({:check, op, left, right}, row) do
+    {x, y} = cast_quotients(left, eval(left, row), right, eval(right, row))
+    compare(op, x, y)
+  end
 
   @doc """
   Whether a row makes a side of a check an unsigned division by zero (`1 / u` for `u = 0`,
@@ -235,8 +237,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   def zero_division?({:check, _op, left, right}, row),
     do: zero_division_side?(left, row) or zero_division_side?(right, row)
 
-  defp zero_division_side?({:op, "/", left, right}, row),
-    do: unsigned_zero_division?(eval(left, row), eval(right, row), right)
+  defp zero_division_side?({:op, "/", left, right}, row) do
+    {x, y} = cast_quotients(left, eval(left, row), right, eval(right, row))
+    unsigned_zero_division?(x, y, right)
+  end
 
   defp zero_division_side?(_expr, _row), do: false
 
@@ -247,10 +251,46 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
 
   defp eval({:op, op, left, right}, row) do
     if lowest_beside_unsigned?(left, right), do: throw(:closed_connection)
-    apply_op(op, eval(left, row), eval(right, row))
+    {x, y} = cast_quotients(left, eval(left, row), right, eval(right, row))
+    apply_op(op, x, y)
   end
 
   defp eval({:abs, operand}, row), do: absolute(eval(operand, row))
+
+  # The planner types the quotient of two integers as an integer, and the engine computes it as
+  # a float: where it meets an unsigned number, the float is cut to an integer (toward zero) and
+  # cast to unsigned like any integer (verified over 1,120 comparisons of `u + n / 2`,
+  # `n / 3 - u`, `u * (n / 5)`, ... against the double: `u + n / 2 = 3` is true for `u = 5`,
+  # `n = -3`).
+  @spec cast_quotients(expr(), value(), expr(), value()) :: {value(), value()}
+  defp cast_quotients(left, x, right, y),
+    do: {cut_beside(left, x, right), cut_beside(right, y, left)}
+
+  defp cut_beside(expr, {:float, float} = value, other) do
+    if integer_typed?(expr) and planner_kind(other) == :uint,
+      do: cut(float),
+      else: value
+  end
+
+  defp cut_beside(_expr, value, _other), do: value
+
+  defp cut(float) do
+    cut = trunc(float)
+    if SQLLimits.is_int64(cut), do: {:int, cut}, else: nil
+  end
+
+  # What the planner types an expression as: the quotient of two integers is an integer.
+  @spec planner_kind(expr()) :: :int | :uint | :float
+  defp planner_kind({:field, _name, kind}), do: kind
+  defp planner_kind({:lit, {kind, _n}}), do: kind
+  defp planner_kind({:abs, operand}), do: planner_kind(operand)
+
+  defp planner_kind({:op, _op, left, right}),
+    do: common_kind(planner_kind(left), planner_kind(right))
+
+  # Whether the value of an expression is a float that the planner types as an integer.
+  @spec integer_typed?(expr()) :: boolean()
+  defp integer_typed?(expr), do: planner_kind(expr) == :int and kind(expr) == :float
 
   # (A constant zero divisor is folded, `u / 0 = 0` keeps every point, and a division inside a
   # sum is not read so: `n + n / u > 1` answers.)

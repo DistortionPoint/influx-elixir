@@ -860,6 +860,18 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
           check_fix(ctx, InfluxQLNestedCases.integer_beside_quotient())
         end
 
+        test "the quotient of two integers beside an unsigned number", ctx do
+          check_fix(ctx, InfluxQLNestedCases.integer_quotients())
+        end
+
+        test "the error of a quotient that waits, beside another condition", ctx do
+          check_fix(ctx, InfluxQLNestedCases.pending_across_connectives())
+        end
+
+        test "select items nested and chained deep", ctx do
+          check_fix(ctx, InfluxQLNestedCases.deep_items())
+        end
+
         test "a null takes away the error of a quotient, and which of two is raised", ctx do
           check_fix(ctx, InfluxQLNestedCases.null_erases_quotient_errors())
         end

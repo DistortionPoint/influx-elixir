@@ -34,8 +34,8 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
 
   @limit_start SQLLimit.start_source()
 
-  @group_clause ~r/(?i)(\bGROUP\s+BY\s+)(.+?)(?=\s+HAVING\b|\s+ORDER\b|\s+#{@limit_start}|\s*$)/su
-  @order_clause ~r/(?i)(\bORDER\s+BY\s+)(.+?)(?=\s+#{@limit_start}|\s*$)/su
+  @group_clause ~r/(?i)(\bGROUP\s+BY\s+)(.+?)(?<=\S)(?=\s+HAVING\b|\s+ORDER\b|\s+#{@limit_start}|\s*$)/su
+  @order_clause ~r/(?i)(\bORDER\s+BY\s+)(.+?)(?<=\S)(?=\s+#{@limit_start}|\s*$)/su
 
   @doc """
   An expression of an `ORDER BY` with each name that is a select item's output name read as
@@ -183,7 +183,10 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   defp order_term(term, items) do
     # The direction and the placement of the nulls follow the target, each of them optional.
     {target, direction} =
-      case SQLMask.run(~r/^(.+?)((?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?)$/isu, term) do
+      case SQLMask.run(
+             ~r/^(.+?)(?<=\S)((?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?)$/isu,
+             term
+           ) do
         [_full, target, direction] -> {target, direction}
         nil -> {term, ""}
       end
@@ -499,7 +502,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   """
   @spec order_by(binary()) :: order_by()
   def order_by(rest) do
-    case SQLMask.run(~r/(?i)ORDER\s+BY\s+(.+?)\s*(?:\b#{@limit_start}.*)?$/su, rest) do
+    case SQLMask.run(~r/(?i)ORDER\s+BY\s+(.+?)(?<=\S)\s*(?:\b#{@limit_start}.*)?$/su, rest) do
       [_full_match, list] ->
         list
         |> SQLMask.split_commas()
@@ -517,7 +520,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   # last ascending and first descending (verified); the direction then
   # stays a bare atom and the executor applies that default.
   defp parse_order_term(term) do
-    case SQLMask.run(~r/^(.+?)(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?$/isu, term) do
+    case SQLMask.run(~r/^(.+?)(?<=\S)(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?$/isu, term) do
       [_full, target] ->
         {order_target(String.trim(target)), :asc}
 

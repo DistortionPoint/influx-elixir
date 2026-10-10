@@ -405,11 +405,29 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
 
   defp parse_like(left, tokens, kind, negated) do
     with {:ok, pattern, rest} <- parse_concat(tokens),
+         :ok <- like_ends(rest),
          ilike = kind == "ILIKE",
          {:ok, regex} <- literal_regex(pattern, ilike) do
       {:ok, {:like, left, pattern, negated, ilike, regex}, rest}
     end
   end
+
+  # `LIKE` binds looser than a comparison, `IN` and `BETWEEN` (sqlparser's precedences 19 and
+  # 20): the pattern of `a LIKE b = c` is `b = c`, where this reader applies the operators from
+  # the left. A pattern followed by one of them is the engine's, not the double's.
+  defp like_ends([{:tok, op} | _rest]) when is_map_key(@comparisons, op),
+    do: {:error, {:like_pattern, op}}
+
+  defp like_ends([{:word, word} | _rest]) when word in ["IN", "BETWEEN", "in", "between"],
+    do: {:error, {:like_pattern, String.upcase(word)}}
+
+  defp like_ends([{:word, not_word}, {:word, word} | _rest]) do
+    if String.upcase(not_word) == "NOT" and String.upcase(word) in ["IN", "BETWEEN"],
+      do: {:error, {:like_pattern, "NOT " <> String.upcase(word)}},
+      else: :ok
+  end
+
+  defp like_ends(_rest), do: :ok
 
   @spec literal_regex(t(), boolean()) :: {:ok, Regex.t() | nil} | {:error, term()}
   defp literal_regex({:lit, text}, ilike) when is_binary(text) do
@@ -678,6 +696,9 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
 
   defp describe({:named_argument, name}),
     do: "the argument #{name} is named, and the double reads no named argument"
+
+  defp describe({:like_pattern, token}),
+    do: "the pattern of a LIKE goes on with #{token}, which the engine reads into the pattern"
 
   defp describe({:unsupported_is, kind}),
     do: "IS #{kind} is not a test it reads"

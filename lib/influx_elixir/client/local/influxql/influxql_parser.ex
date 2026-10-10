@@ -126,7 +126,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
          {_from, rest} = split_at(after_from, size),
          {_masked_from, masked_rest} = split_at(masked_after_from, size),
          at = byte_size(head) - byte_size(rest),
-         :ok <- InfluxQLDepth.check(masked_rest),
+         :ok <- InfluxQLDepth.check(masked_items, masked_rest),
          :ok <- InfluxQLCheck.settle([InfluxQLCheck.check_empty_where(clean, at, masked_rest)]),
          masked_all = masked_rest,
          {group_result, masked_rest, rest} = InfluxQLGroup.extract(clean, at, masked_rest),

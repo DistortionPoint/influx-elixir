@@ -128,7 +128,8 @@ defmodule InfluxElixir.ConfigTest do
                    "got: #{port}"
       end
 
-      assert {:ok, _opts} = Config.validate(host: "h", port: 65_535, flight_port: 1)
+      assert {:ok, opts} = Config.validate(host: "h", port: 65_535, flight_port: 1)
+      assert {opts[:port], opts[:flight_port]} === {65_535, 1}
     end
 
     test "rejects :pool_size that is not a positive integer" do
@@ -192,7 +193,8 @@ defmodule InfluxElixir.ConfigTest do
       end
 
       for host <- ["localhost", "[::1]", "10.0.0.1", "xn--wgv71a.jp", "a.b."] do
-        assert {:ok, _opts} = Config.validate(host: host), host
+        assert {:ok, opts} = Config.validate(host: host), host
+        assert opts[:host] === host
       end
     end
 

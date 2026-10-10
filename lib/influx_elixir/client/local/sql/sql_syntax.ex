@@ -32,18 +32,13 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     SQLTokenizer
   }
 
-  @top {__MODULE__, :top}
-  @refusal {__MODULE__, :refusal}
-  @planner {__MODULE__, :planner}
-  @into {__MODULE__, :into}
-  @depth {__MODULE__, :depth}
-  @set_operation {__MODULE__, :set_operation}
-  @named {__MODULE__, :named}
-  @unknown_call {__MODULE__, :unknown_call}
-  @arrow {__MODULE__, :arrow}
-  @recursion {__MODULE__, :recursion}
-  @swallow {__MODULE__, :swallow}
-  @dml_read {__MODULE__, :dml_read}
+  # What a read of one text notes while it goes (a refusal, the planner's error to come, the
+  # depth of the parser's recursion, ...) is one map under one key of the process dictionary,
+  # made by `with_state/1` for the read and put back as it was when the read ends. `@credit` is
+  # the levels of recursion `credited/1` takes off every read inside it.
+  @state {__MODULE__, :state}
+  @credit {__MODULE__, :credit}
+  @early {__MODULE__, :early}
 
   # The engine's parser stops at 50 nested calls of its recursive descent (sqlparser-rs's
   # `RecursionCounter`, verified on 3.10.1): `parse_statement`, `parse_query` and every
@@ -121,31 +116,56 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     MICROSECOND MICROSECONDS NANOSECOND NANOSECONDS)
   @interval_units ~w(YEAR YEARS MONTH MONTHS WEEK WEEKS DAY DAYS HOUR HOURS MINUTE MINUTES SECOND
     SECONDS MILLISECOND MILLISECONDS MICROSECOND MICROSECONDS NANOSECOND NANOSECONDS)
-  @operators ~w(= == <=> <> != < > <= >= + - * / % || ~ !~ ~* !~* & | ^ << >> ~~ ~~* !~~ !~~* //)
   @predicate_words ~w(IS IN BETWEEN LIKE ILIKE)
   @negatable_words ~w(IN BETWEEN LIKE ILIKE)
   @join_words ~w(JOIN INNER LEFT RIGHT FULL CROSS NATURAL OUTER STRAIGHT_JOIN)
   @logical_words ~w(AND OR XOR)
-  @bound_operators ~w(+ - * / % ||)
-  @table_function {__MODULE__, :table_function}
-  @several {__MODULE__, :several}
-  @flags [
-    @several,
-    @table_function,
-    @top,
-    @refusal,
-    @planner,
-    @into,
-    @depth,
-    @set_operation,
-    @named,
-    @unknown_call,
-    @arrow,
-    @recursion,
-    @swallow,
-    @dml_read
-  ]
+  # The precedence the engine's parser gives each symbol that continues an expression
+  # (sqlparser `Precedence`, read from Core 3.10.1 by the value of `1 << 2 + 1`, `1 | 2 << 1`,
+  # `3 ^ 1 << 1`, `2 * 3 || 'y'`, `'a' ~ 'a' = true` and `'a' = 'a' ~ 'a'`, and by the
+  # recursion error of a nest after each): the one table, which the right operand of every
+  # operator and the low bound of a `BETWEEN` are both read from. Equal precedences associate
+  # to the left.
+  @symbol_precedence %{
+    "::" => 50,
+    "[" => 50,
+    "->" => 50,
+    ":" => 50,
+    "(" => 50,
+    "*" => 40,
+    "/" => 40,
+    "%" => 40,
+    "//" => 40,
+    "||" => 40,
+    "+" => 30,
+    "-" => 30,
+    "&" => 23,
+    "^" => 22,
+    "<<" => 22,
+    ">>" => 22,
+    "|" => 21,
+    "=" => 20,
+    "==" => 20,
+    "<" => 20,
+    ">" => 20,
+    "<=" => 20,
+    ">=" => 20,
+    "<>" => 20,
+    "!=" => 20,
+    "<=>" => 20,
+    "~" => 20,
+    "!~" => 20,
+    "~*" => 20,
+    "!~*" => 20,
+    "~~" => 20,
+    "~~*" => 20,
+    "!~~" => 20,
+    "!~~*" => 20
+  }
 
+  # The symbols that continue an expression without a right operand of their own.
+  @postfix_symbols ["::", "[", "->", ":", "("]
+  @operators Map.keys(@symbol_precedence) -- @postfix_symbols
   @doc """
   Runs `fun`, which checks a query the double builds from an operand of an `INSERT`, `UPDATE` or
   `DELETE` (`SELECT <operand>`), with one level of the parser's recursion credited: the
@@ -154,13 +174,41 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   """
   @spec credited((-> result)) :: result when result: term()
   def credited(fun) do
-    Process.put(@recursion, -1)
+    saved = Process.get(@credit)
+    Process.put(@credit, 1)
 
     try do
       fun.()
     after
-      Process.delete(@recursion)
+      restore(@credit, saved)
     end
+  end
+
+  # Runs `fun` with a state of its own: empty, but for the levels `credited/1` takes off. The
+  # state of the read that was open (a statement that changes data is read inside the check of
+  # a text) comes back when `fun` ends, whichever way it ends.
+  @spec with_state((-> result)) :: result when result: term()
+  defp with_state(fun) do
+    saved = Process.get(@state)
+    Process.put(@state, %{recursion: -Process.get(@credit, 0)})
+
+    try do
+      fun.()
+    after
+      restore(@state, saved)
+    end
+  end
+
+  defp restore(key, nil), do: Process.delete(key)
+  defp restore(key, value), do: Process.put(key, value)
+
+  @spec state(atom(), term()) :: term()
+  defp state(key, default \\ nil), do: Map.get(Process.get(@state, %{}), key, default)
+
+  @spec put_state(atom(), term()) :: :ok
+  defp put_state(key, value) do
+    Process.put(@state, Map.put(Process.get(@state, %{}), key, value))
+    :ok
   end
 
   @doc """
@@ -228,14 +276,28 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     end
   end
 
+  # (The verdict of the last long text is kept: one statement is asked for it by the check of
+  # the query, the check of its statements and the parser, and the windows are read once.)
   @spec early_verdict(binary()) :: {:error, SQLError.t()} | nil
   defp early_verdict(sql) do
-    if byte_size(sql) > hd(@windows) and query_start?(sql) and plain_text?(sql) do
-      Enum.find_value(@windows, fn window ->
-        if window < byte_size(sql), do: window_verdict(sql, window)
-      end)
+    if byte_size(sql) > hd(@windows) and query_start?(sql) and plain_text?(sql),
+      do: remembered_verdict(sql)
+  end
+
+  defp remembered_verdict(sql) do
+    case Process.get(@early) do
+      {^sql, verdict} ->
+        verdict
+
+      _other ->
+        verdict = Enum.find_value(@windows, &window_verdict_of(sql, &1))
+        Process.put(@early, {sql, verdict})
+        verdict
     end
   end
+
+  defp window_verdict_of(sql, window),
+    do: if(window < byte_size(sql), do: window_verdict(sql, window))
 
   defp query_start?(sql) do
     trimmed = String.trim_leading(sql)
@@ -244,10 +306,14 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   end
 
   # Whether every byte of the text is one that no tokenizer error can be about: no quote,
-  # comment opener, brace or byte outside ASCII.
+  # comment opener (`/*` may stand unterminated, and the engine's tokenizer reads the whole text
+  # before its parser reads any), `$` (a dollar-quoted string may stand unterminated), brace or
+  # byte outside ASCII.
+  defp plain_text?(<<"/*", _rest::binary>>), do: false
+
   defp plain_text?(<<byte, rest::binary>>)
        when byte in ?a..?z or byte in ?A..?Z or byte in ?0..?9 or
-              byte in ~c" \t\n\r(),.+-*/%=<>_;!|:$",
+              byte in ~c" \t\n\r(),.+-*/%=<>_;!|:",
        do: plain_text?(rest)
 
   defp plain_text?(<<>>), do: true
@@ -260,10 +326,11 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
          {:ok, tokens} <- SQLTokenizer.scan(binary_part(prefix, 0, window - at)),
          {kept, [eof]} <- Enum.split(tokens, -1),
          true <- length(kept) > @cut_tokens do
-      Process.put(@several, false)
       {kept, _dropped} = Enum.split(kept, -@cut_tokens)
 
-      try do
+      with_state(fn ->
+        put_state(:several, false)
+
         case read(kept ++ [eof]) do
           {:error, %{body: "SQL error: RecursionLimitExceeded" <> _rest}} = error ->
             error
@@ -274,9 +341,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
           _other ->
             nil
         end
-      after
-        Enum.each(@flags, &Process.delete/1)
-      end
+      end)
     else
       _unread -> nil
     end
@@ -286,24 +351,24 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   @spec check_tokens(SQLTokenizer.result(), boolean(), binary()) ::
           :ok | {:error, SQLError.t()}
   defp check_tokens(tokenized, several?, text) do
-    Process.put(@several, several?)
+    with_state(fn ->
+      put_state(:several, several?)
 
-    case tokenized do
-      {:ok, tokens} ->
-        tokens |> read() |> flagged(tokens)
+      case tokenized do
+        {:ok, tokens} ->
+          tokens |> read() |> flagged(tokens)
 
-      :bail ->
-        text_verdict(text)
+        :bail ->
+          text_verdict(text)
 
-      {:unread, char} ->
-        {:error,
-         SQLError.refusal(
-           "the character #{inspect(char)} in a name or outside quotes: the engine's parser error " <>
-             "for it is not modelled"
-         )}
-    end
-  after
-    Enum.each(@flags, &Process.delete/1)
+        {:unread, char} ->
+          {:error,
+           SQLError.refusal(
+             "the character #{inspect(char)} in a name or outside quotes: the engine's parser " <>
+               "error for it is not modelled"
+           )}
+      end
+    end)
   end
 
   @doc """
@@ -421,7 +486,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp unread_verdict([{:symbol, _p, "(", _l, _c} | _rest]), do: :ok
 
   defp unread_verdict(tokens) do
-    if Process.get(@dml_read), do: :ok, else: bail_verdict(tokens)
+    if state(:dml_read), do: :ok, else: bail_verdict(tokens)
   end
 
   # A statement that changes data, read whole by the grammar below: counted, so that it is
@@ -440,22 +505,17 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # reader's, and a statement that changes data has none of them.
   @spec dml_recursion(tokens()) :: :read | :unread | {:error, SQLError.t()}
   defp dml_recursion(tokens) do
-    saved = Enum.map(@flags, &{&1, Process.get(&1)})
-
-    try do
-      counted(fn -> tokens |> dml_expressions() |> dml_end() end)
-      :read
-    catch
-      :recursion -> {:error, SQLError.recursion()}
-      {:fail, error} -> {:error, error}
-      {:syntax, _expected, _token} -> :unread
-      :bail -> :unread
-    after
-      Enum.each(saved, fn
-        {flag, nil} -> Process.delete(flag)
-        {flag, value} -> Process.put(flag, value)
-      end)
-    end
+    with_state(fn ->
+      try do
+        counted(fn -> tokens |> dml_expressions() |> dml_end() end)
+        :read
+      catch
+        :recursion -> {:error, SQLError.recursion()}
+        {:fail, error} -> {:error, error}
+        {:syntax, _expected, _token} -> :unread
+        :bail -> :unread
+      end
+    end)
   end
 
   # What the parser reads of each statement, as far as its recursion goes: `parse_statement`
@@ -572,25 +632,25 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   @spec flagged(:ok | {:error, SQLError.t()}, tokens()) :: :ok | {:error, SQLError.t()}
   defp flagged(:ok, tokens) do
     cond do
-      Process.get(@top) ->
+      state(:top) ->
         {:error, %{status: 405, body: "This feature is not implemented: TOP"}}
 
-      reason = Process.get(@refusal) ->
+      reason = state(:refusal) ->
         {:error, SQLError.refusal(reason)}
 
-      named = Process.get(@named) ->
+      named = state(:named) ->
         {:error, named_verdict(named, tokens)}
 
-      message = Process.get(@arrow) ->
+      message = state(:arrow) ->
         {:error, arrow_verdict(message, tokens)}
 
-      Process.get(@table_function) ->
+      state(:table_function) ->
         {:error, SQLError.refusal("a table function in FROM: the engine has none")}
 
-      message = Process.get(@planner) ->
+      message = state(:planner) ->
         unsupported(message, tokens)
 
-      Process.get(@into) ->
+      state(:into) ->
         into_verdict(tokens)
 
       true ->
@@ -683,7 +743,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # answers the refusal, for a plain top-level `SELECT`; any other `INTO` is refused by name.
   @spec into_verdict(tokens()) :: :ok | {:error, SQLError.t()}
   defp into_verdict([{:word, _printed, "SELECT", _line, _col} | _rest]) do
-    if Process.get(@into) == :plain and not Process.get(@set_operation, false),
+    if state(:into) == :plain and not state(:set_operation, false),
       do: :ok,
       else: {:error, SQLError.refusal("an INTO clause outside a plain SELECT")}
   end
@@ -693,7 +753,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   @spec refuse(binary()) :: :ok
   defp refuse(reason) do
-    Process.put(@refusal, reason)
+    put_state(:refusal, reason)
     :ok
   end
 
@@ -715,7 +775,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # it is planned. The checks below only add what that reader does not say.
   defp statement([{:word, _p, word, _l, _c} | _rest] = tokens)
        when word in ["INSERT", "UPDATE", "DELETE"] do
-    case Process.get(@several, false) && SQLDml.parse_error(tokens) do
+    case state(:several, false) && SQLDml.parse_error(tokens) do
       error when error in [nil, false] -> counted_statement(tokens)
       error -> {:error, error}
     end
@@ -730,7 +790,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
         error
 
       read ->
-        if read == :read, do: Process.put(@dml_read, true)
+        if read == :read, do: put_state(:dml_read, true)
         dml_statement(tokens)
     end
   end
@@ -829,20 +889,20 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # one, whose answer the double did not probe, so it refuses by name there.
   @spec counted((-> result)) :: result when result: tokens()
   defp counted(fun) do
-    depth = Process.get(@recursion, 0)
+    depth = state(:recursion, 0)
     if depth >= @recursion_limit, do: overflow()
-    Process.put(@recursion, depth + 1)
+    put_state(:recursion, depth + 1)
 
     try do
       fun.()
     after
-      Process.put(@recursion, depth)
+      put_state(:recursion, depth)
     end
   end
 
   @spec overflow() :: no_return()
   defp overflow do
-    if Process.get(@swallow, 0) > 0,
+    if state(:swallow, 0) > 0,
       do: throw({:fail, nesting_refusal()}),
       else: throw(:recursion)
   end
@@ -860,9 +920,9 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   @spec query(tokens()) :: tokens()
   defp query(tokens) do
-    depth = Process.get(@depth, 0)
+    depth = state(:depth, 0)
     if depth >= @subquery_limit, do: throw({:fail, nesting_refusal()})
-    Process.put(@depth, depth + 1)
+    put_state(:depth, depth + 1)
 
     try do
       counted(fn ->
@@ -875,7 +935,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
         |> fetch_clause()
       end)
     after
-      Process.put(@depth, depth)
+      put_state(:depth, depth)
     end
   end
 
@@ -942,7 +1002,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
         throw(:bail)
 
       _end_of_name ->
-        Process.put(@planner, "Query TABLE #{SQLLiteral.unquoted(printed)} not implemented yet")
+        put_state(:planner, "Query TABLE #{SQLLiteral.unquoted(printed)} not implemented yet")
         rest
     end
   end
@@ -962,7 +1022,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp set_operations([{:word, _p, operator, _l, _c} | rest])
        when operator in ["UNION", "EXCEPT", "INTERSECT", "MINUS"] do
-    Process.put(@set_operation, true)
+    put_state(:set_operation, true)
 
     case rest do
       [{:word, _q, quantifier, _l2, _c2} | more] when quantifier in ["ALL", "DISTINCT"] ->
@@ -1003,7 +1063,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   end
 
   defp top_clause([{:word, _p, "TOP", _l, _c} | rest]) do
-    Process.put(@top, true)
+    put_state(:top, true)
     rest |> top_quantity() |> top_percent() |> top_ties()
   end
 
@@ -1042,7 +1102,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   # `INTO [TEMP] [UNLOGGED] [TABLE] name`, between the list and `FROM`.
   defp into_clause([{:word, _p, "INTO", _l, _c} | rest]) do
-    Process.put(@into, if(Process.get(@depth) == 1, do: :plain, else: :nested))
+    put_state(:into, if(state(:depth) == 1, do: :plain, else: :nested))
 
     rest
     |> into_option(["TEMP", "TEMPORARY"])
@@ -1163,7 +1223,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     case object_name(tokens) do
       # `FROM name(...)` calls a table function, which the engine does not have.
       [{:symbol, _p, "(", _l, _c} | args] ->
-        Process.put(@table_function, true)
+        put_state(:table_function, true)
         args |> call_arguments(nil) |> table_alias()
 
       after_name ->
@@ -1407,7 +1467,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp word_operand(upper, [_word, {:symbol, _p, "(", _l, _c} | rest])
        when upper in @special_calls,
-       do: skip_to_close(rest)
+       do: special_call(upper, rest)
 
   defp word_operand(upper, [_word | more] = tokens) when upper in @typed_literals do
     case typed_literal(more) do
@@ -1427,6 +1487,131 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   end
 
   defp word_operand(_upper, tokens), do: identifier(tokens)
+
+  # The calls the engine's parser reads with a syntax of their own (`EXTRACT(DAY FROM t)`,
+  # `SUBSTRING(s FROM 2 FOR 3)`, `TRIM(BOTH 'x' FROM s)`) and, when that fails, as any other call
+  # (`SUBSTRING(s, 2, 3)`, `CEIL(x, 2)`). Each expression in them is a `parse_expr`, counted as
+  # one is. A call open inside another (or inside a keyword that falls back to a name) is read
+  # twice by the engine's retry, so it is counted with those frames. A call with a construct
+  # this grammar does not read in it (`:bail`) is skipped to its closing parenthesis, with the
+  # state of the read the call found.
+  defp special_call(upper, args) do
+    saved = Process.get(@state)
+    {open, swallowed} = {state(:special, 0), state(:swallow, 0)}
+    if open > 0 or swallowed > 0, do: swallow(1)
+    put_state(:special, open + 1)
+
+    try do
+      read_special(upper, args)
+    catch
+      :bail ->
+        restore(@state, saved)
+        skip_to_close(args)
+    after
+      put_state(:special, open)
+      put_state(:swallow, swallowed)
+    end
+  end
+
+  # The parser tries the syntax of the call and, when that fails, reads it as a call of a
+  # function; the error it reports is the first one when both fail (`POSITION` is the exception:
+  # it swallows the error of its own syntax and reports the call's). A syntax error of the first
+  # read and a recursion error of the second is the parser's error for the syntax, which this
+  # grammar does not word: refused by name.
+  defp read_special(upper, args) do
+    special_syntax(upper, args)
+  catch
+    {:syntax, _expected, _token} = first ->
+      try do
+        call_arguments(args, nil)
+      catch
+        :recursion ->
+          throw({:fail, nesting_refusal()})
+
+        {:syntax, _other_expected, _other_token} = second ->
+          throw(if upper == "POSITION", do: second, else: first)
+      end
+  end
+
+  # (`CEIL(x, 2)` has a scale, which the planner refuses; any other second argument is no scale
+  # but the call of a function with two arguments, whose error is the planner's own.)
+  defp special_syntax(upper, args) when upper in ["CEIL", "FLOOR"] do
+    case expression(args) do
+      [{:word, _p, "TO", _l, _c}, {:word, _q, _field, _l2, _c2} | more] ->
+        close_paren(more)
+
+      [
+        {:symbol, _p, ",", _l, _c},
+        {:number, _q, _u, _l2, _c2},
+        {:symbol, _r, ")", _l3, _c3} | more
+      ] ->
+        more
+
+      [{:symbol, _p, ",", _l, _c} | _rest] = tokens ->
+        refuse(
+          "#{upper} with a second argument that is no number: the engine reads it as a call of " <>
+            "the function"
+        )
+
+        fail(")", tokens)
+
+      tokens ->
+        close_paren(tokens)
+    end
+  end
+
+  # (`SUBSTRING(s, from, for)` is the syntax of the call too: the parser reads the commas in it.)
+  defp special_syntax(upper, args) when upper in ["SUBSTRING", "SUBSTR"] do
+    case expression(args) do
+      [{:symbol, _p, ",", _l, _c} | rest] ->
+        rest |> expression_list() |> close_paren()
+
+      tokens ->
+        tokens |> keyword_expression("FROM") |> keyword_expression("FOR") |> close_paren()
+    end
+  end
+
+  defp special_syntax("OVERLAY", args) do
+    args
+    |> expression()
+    |> expect_word("PLACING")
+    |> expression()
+    |> expect_word("FROM")
+    |> expression()
+    |> keyword_expression("FOR")
+    |> close_paren()
+  end
+
+  defp special_syntax(upper, args) when upper in ["TRY_CAST", "SAFE_CAST"],
+    do: args |> expression() |> expect_word("AS") |> skip_to_close()
+
+  defp special_syntax("EXTRACT", [{kind, _p, _u, _l, _c} | rest]) when kind in [:word, :string],
+    do: rest |> expect_word("FROM") |> expression() |> close_paren()
+
+  defp special_syntax("POSITION", args) do
+    counted(fn -> args |> operand() |> infix(@between_precedence) end)
+    |> expect_word("IN")
+    |> expression()
+    |> close_paren()
+  end
+
+  defp special_syntax("TRIM", [{:word, _p, side, _l, _c} | rest])
+       when side in ["BOTH", "LEADING", "TRAILING"],
+       do: rest |> trim_operands() |> close_paren()
+
+  defp special_syntax("TRIM", args), do: args |> trim_operands() |> close_paren()
+  defp special_syntax("EXTRACT", args), do: fail("date/time field", args)
+
+  defp trim_operands(tokens) do
+    case expression(tokens) do
+      [{:word, _p, "FROM", _l, _c} | rest] -> expression(rest)
+      [{:symbol, _p, ",", _l, _c} | rest] -> expression_list(rest)
+      other -> other
+    end
+  end
+
+  defp keyword_expression([{:word, _p, word, _l, _c} | rest], word), do: expression(rest)
+  defp keyword_expression(tokens, _word), do: tokens
 
   # The string after a type name in `TIMESTAMP '...'`, the type with its precision and
   # `WITH [OUT] TIME ZONE` as the engine reads them; `nil` when the text is no typed literal.
@@ -1507,9 +1692,9 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp plain_operand?(_token, _rest), do: false
 
   defp swallow(step) do
-    level = Process.get(@swallow, 0) + step
+    level = state(:swallow, 0) + step
     if level > @swallow_limit, do: throw({:fail, nesting_refusal()})
-    Process.put(@swallow, level)
+    put_state(:swallow, level)
   end
 
   # `NOT` takes the operators that bind tighter than `AND`.
@@ -1613,8 +1798,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
       end
 
     with message when is_binary(message) <- SQLInterval.overflow(text, unit),
-         true <- is_nil(Process.get(@arrow)) do
-      Process.put(@arrow, message)
+         true <- is_nil(state(:arrow)) do
+      put_state(:arrow, message)
     end
 
     :ok
@@ -1675,7 +1860,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # The planner's refusal the text will get once it reads; the first one stands.
   @spec defer(binary()) :: :ok
   defp defer(message) do
-    if is_nil(Process.get(@planner)), do: Process.put(@planner, message)
+    if is_nil(state(:planner)), do: put_state(:planner, message)
     :ok
   end
 
@@ -1695,7 +1880,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     do: skip_to_close(rest, depth - 1)
 
   defp skip_to_close([{:symbol, _p, "(", _l, _c} | rest], depth) do
-    if depth + Process.get(@recursion, 0) > @unread_limit, do: throw({:fail, nesting_refusal()})
+    if depth + state(:recursion, 0) > @unread_limit, do: throw({:fail, nesting_refusal()})
     skip_to_close(rest, depth + 1)
   end
 
@@ -1716,8 +1901,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # A function the double does not know, called before any named argument, is noted: the
   # engine's error for it may come first.
   defp called({:word, printed, _upper, _l, _c}) do
-    if is_nil(Process.get(@named)) and not SQLNamedArg.known?(printed),
-      do: Process.put(@unknown_call, Process.get(@unknown_call) || printed)
+    if is_nil(state(:named)) and not SQLNamedArg.known?(printed),
+      do: put_state(:unknown_call, state(:unknown_call) || printed)
 
     :ok
   end
@@ -1771,7 +1956,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp named(nil), do: :ok
 
   defp named(name) do
-    if is_nil(Process.get(@named)), do: Process.put(@named, {name, Process.get(@unknown_call)})
+    if is_nil(state(:named)), do: put_state(:named, {name, state(:unknown_call)})
     :ok
   end
 
@@ -1808,20 +1993,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp step_precedence([{:word, _p, word, _l, _c} | _rest]),
     do: Map.get(@word_precedence, word, 0)
 
-  defp step_precedence([{:symbol, _p, symbol, _l, _c} | _rest]) do
-    cond do
-      symbol in ["::", "[", "->", ":", "("] -> 50
-      symbol in ["*", "/", "%", "//"] -> 40
-      symbol in ["+", "-"] -> 30
-      symbol == "&" -> 23
-      symbol == "^" -> 22
-      symbol == "|" -> 21
-      symbol in ["=", "==", "<", ">", "<=", ">=", "<>", "!=", "<=>"] -> 20
-      symbol in ["~~", "~~*", "!~~", "!~~*"] -> 19
-      symbol in ["||", "~", "!~", "~*", "!~*", "<<", ">>"] -> 16
-      true -> 0
-    end
-  end
+  defp step_precedence([{:symbol, _p, symbol, _l, _c} | _rest]),
+    do: Map.get(@symbol_precedence, symbol, 0)
 
   defp step_precedence(_tokens), do: 0
 
@@ -1872,7 +2045,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
        do: type_name(tl(tokens))
 
   defp infix_step([{:symbol, _p, symbol, _l, _c} | _rest], _precedence)
-       when symbol in ["::", "[", "->", ":", "("],
+       when symbol in @postfix_symbols,
        do: throw(:bail)
 
   defp infix_step(
@@ -1992,28 +2165,13 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     end
   end
 
-  # Each bound is a `parse_subexpr` of `BETWEEN`'s precedence.
+  # Each bound is a `parse_subexpr` of `BETWEEN`'s precedence, so the low bound takes every
+  # operator the table binds tighter (`BETWEEN 1 & 2 AND 3`) and stops at the `AND` that
+  # belongs to it.
   defp between(tokens) do
-    counted(fn -> tokens |> operand() |> before_and() end)
-    |> expect_word("AND")
-    |> between_high()
+    tokens |> between_bound() |> expect_word("AND") |> between_bound()
   end
 
-  defp between_high(tokens),
+  defp between_bound(tokens),
     do: counted(fn -> tokens |> operand() |> infix(@between_precedence) end)
-
-  # The low bound of a `BETWEEN` stops at the `AND` that belongs to it.
-  defp before_and([{:word, _p, "AND", _l, _c} | _rest] = tokens), do: tokens
-
-  defp before_and([{:symbol, _p, symbol, _l, _c} | rest]) when symbol in @bound_operators,
-    do: rest |> operand() |> before_and()
-
-  # A cast of the low bound (`BETWEEN 1::bigint AND 3`).
-  defp before_and([{:symbol, _p, "::", _l, _c}, {:word, _q, _u, _l2, _c2} | _rest] = tokens),
-    do: tokens |> tl() |> type_name() |> before_and()
-
-  defp before_and([{:symbol, _p, "::", _l, _c}, {:quoted, printed, _u, _l2, _c2} | rest]),
-    do: printed |> unsupported_type(rest) |> before_and()
-
-  defp before_and(tokens), do: tokens
 end
