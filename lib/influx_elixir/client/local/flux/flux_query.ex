@@ -9,6 +9,8 @@ defmodule InfluxElixir.Client.Local.FluxQuery do
 
   @type point_map :: LineProtocolParser.point()
 
+  @unsigned "iox::column_type::field::uinteger"
+
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_flux(%{table: table} = conn, flux, _opts \\ []) do
@@ -17,7 +19,9 @@ defmodule InfluxElixir.Client.Local.FluxQuery do
          :ok <- flux_bucket_exists(table, query.bucket) do
       points = Store.points_in_db(table, query.bucket, Flux.measurements(query))
 
-      case Flux.run(query, flux_typed(table, query, points)) do
+      {typed, unsigned} = flux_typed(table, query, points)
+
+      case Flux.run(query, typed, uint: unsigned) do
         {:ok, rows} -> {:ok, rows}
         {:error, message} -> {:error, flux_error(400, "invalid", message)}
       end
@@ -29,8 +33,10 @@ defmodule InfluxElixir.Client.Local.FluxQuery do
   # later group of another type: that group and every group after it are
   # not returned, whatever their type (verified). The cut is per measurement
   # and field, across all tag sets. A bucket's shard groups are as long as
-  # its retention makes them.
-  @spec flux_typed(Store.t(), Flux.query(), [point_map()]) :: [point_map()]
+  # its retention makes them. Also returns the `{measurement, field}` of the
+  # fields that are unsigned in the groups that are read.
+  @spec flux_typed(Store.t(), Flux.query(), [point_map()]) ::
+          {[point_map()], MapSet.t({binary(), binary()})}
   defp flux_typed(table, %{bucket: bucket} = query, points) do
     {start_ns, stop_ns} = Flux.range(query)
     shard_ns = Buckets.shard_group_seconds(Buckets.retention(table, bucket)) * 1_000_000_000
@@ -41,39 +47,53 @@ defmodule InfluxElixir.Client.Local.FluxQuery do
           group * shard_ns < stop_ns and (group + 1) * shard_ns > start_ns,
           do: {point, group}
 
-    case flux_cutoffs(table, bucket, touched) do
-      cutoffs when map_size(cutoffs) == 0 ->
-        Enum.map(touched, &elem(&1, 0))
+    kinds = flux_kinds(table, bucket, touched)
+    cutoffs = flux_cutoffs(kinds)
 
-      cutoffs ->
+    typed =
+      if map_size(cutoffs) == 0 do
+        Enum.map(touched, &elem(&1, 0))
+      else
         for {point, group} <- touched,
             fields = flux_typed_fields(point, group, cutoffs),
             map_size(fields) > 0,
             do: %{point | fields: fields}
-    end
+      end
+
+    unsigned =
+      for {{measurement, field, group}, @unsigned} <- kinds,
+          group < Map.get(cutoffs, {measurement, field}, group + 1),
+          into: MapSet.new(),
+          do: {measurement, field}
+
+    {typed, unsigned}
   end
 
-  # `{measurement, field} => group`: the first group that is not read. The
-  # store is asked for the kind of a field once per measurement, group and
-  # field, not once per point.
-  @spec flux_cutoffs(Store.t(), binary(), [{point_map(), integer()}]) :: %{
+  # `{measurement, field, group} => kind`. The store is asked for the kind of
+  # a field once per measurement, group and field, not once per point.
+  @spec flux_kinds(Store.t(), binary(), [{point_map(), integer()}]) :: %{
+          {binary(), binary(), integer()} => binary() | nil
+        }
+  defp flux_kinds(table, bucket, touched) do
+    Enum.reduce(touched, %{}, fn {point, group}, kinds ->
+      Enum.reduce(point.fields, kinds, fn {field, _value}, kinds ->
+        key = {point.measurement, field, group}
+
+        if is_map_key(kinds, key) do
+          kinds
+        else
+          kind = Store.column_kind(table, bucket, Buckets.scope(point, group), field)
+          Map.put(kinds, key, kind)
+        end
+      end)
+    end)
+  end
+
+  # `{measurement, field} => group`: the first group that is not read.
+  @spec flux_cutoffs(%{{binary(), binary(), integer()} => binary() | nil}) :: %{
           {binary(), binary()} => integer()
         }
-  defp flux_cutoffs(table, bucket, touched) do
-    kinds =
-      Enum.reduce(touched, %{}, fn {point, group}, kinds ->
-        Enum.reduce(point.fields, kinds, fn {field, _value}, kinds ->
-          key = {point.measurement, field, group}
-
-          if is_map_key(kinds, key) do
-            kinds
-          else
-            kind = Store.column_kind(table, bucket, Buckets.scope(point, group), field)
-            Map.put(kinds, key, kind)
-          end
-        end)
-      end)
-
+  defp flux_cutoffs(kinds) do
     kinds
     |> Enum.group_by(&series_of_kind/1, &group_and_kind/1)
     |> Enum.reduce(%{}, fn {series, group_kinds}, cutoffs ->

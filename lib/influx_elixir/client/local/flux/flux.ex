@@ -10,22 +10,56 @@ defmodule InfluxElixir.Client.Local.Flux do
   # Supported stages:
   #
   #   * `from(bucket: "b")` — first; the bucket must exist (404 otherwise)
-  #   * `range(start: s[, stop: s])` — required, as on the engine; `s` is
-  #     Unix seconds, an RFC3339 time, a duration from now (`-1h`, `-30m`,
-  #     `-7d`, `-10s`, `-2w`) or `now()`; `stop` defaults to now. Every row
-  #     carries `_start` and `_stop`. A range that is empty (`start` not
+  #   * `range(start: s[, stop: s])` — required, and the first stage after `from`
+  #     (any other stage before it is the engine's "cannot submit unbounded
+  #     read"); `s` is Unix seconds, an RFC3339 time, a duration from now (`-1h`,
+  #     `-30m`, `-7d`, `-10s`, `-2w`) or `now()`; `stop` defaults to now. Every
+  #     row carries `_start` and `_stop`. A range that is empty (`start` not
   #     before `stop`) is the engine's 400 "cannot query an empty range".
   #     Times are 64-bit nanoseconds as on the engine, so a time that does
   #     not fit wraps: `stop: 99999999999999` (seconds) is 1976-05-08 in
   #     `_stop`.
   #   * `filter(fn: (r) => ...)` — `r.key` or `r["key"]` compared with
   #     `== != < <= > >=` against a string, number or boolean, combined with
-  #     `and`, `or`, `not` and parentheses. A key the row lacks never matches.
+  #     `and`, `or`, `not` and parentheses. How a key the row lacks answers
+  #     depends on storage pushdown, see below.
   #   * `first() last() min() max()` — the selected row per table
   #   * `mean() sum() count()` — one row per table, without `_time`
   #     (`mean` is a float; `count` counts rows)
   #   * `limit(n: N[, offset: M])` — per table
-  #   * `yield(name: "x")` — names the result
+  #   * `yield(name: "x")` — names a result; every `yield` returns its own
+  #     result, tables numbered from 0 in each, and a last stage that is not a
+  #     `yield` returns the rest as `_result`. The engine returns the results
+  #     in no fixed order; the double returns them in pipeline order.
+  #
+  # Refused by name (the engine's answer is an error whose text holds a
+  # position in the query, or depends on the plan, or is not verified):
+  # a column compared with a literal of another type where Flux reads it, a
+  # time column compared in Flux, ordering against a boolean, ordering `_value`
+  # against a string, a `_value` comparison on an unsigned field, `min()` and
+  # `max()` of a string or boolean field, `sum()` and `mean()` of one where
+  # Flux reads it or storage may have dropped the series, a `yield` with no
+  # name.
+  #
+  # Pushdown (verified on 2.7, `docs/design/2026-10-10_local-flux-pushdown-and-yields.md`).
+  # The `filter`s right after `range` are pushed to storage, one after another,
+  # while each one is pushed whole. A filter is split at its top-level `and`s
+  # and a conjunct is pushable when it is `key == lit` (not `== ""`), `key != lit`,
+  # `_value` against a literal with any comparison, or an `and`/`or` of such
+  # (`not`, a comparison of any other key, a negative number and `== ""` are
+  # not). The pushable conjuncts run in storage: a key the series lacks, and
+  # `_time`, `_start` and `_stop`, which are not there yet, are the empty string
+  # for `!=` (`r.nosuch != "a"` keeps every row, `r.nosuch != ""` none) and equal
+  # to nothing for `==`; a literal of another type than the key matches nothing;
+  # a series every conjunct leaves out is not there for the stages after. The
+  # others, and every filter after the first one that was not pushed whole or
+  # after any other stage, run as Flux: a key the row lacks is null, only true
+  # keeps a row, `and` and `or` let the left side decide (see `matches?/3`) and a
+  # column compared with a literal of another type is an error.
+  #
+  # A selector or an aggregate right after pushed filters is read by storage
+  # too, which keeps the series order and decides the errors on a string or
+  # boolean field; one that Flux runs emits its tables sorted by group key.
   #
   # Tables are the series — measurement, tag set, field — numbered from `0`
   # in that order, rows in time order, as the engine numbers them. Time order
@@ -65,29 +99,42 @@ defmodule InfluxElixir.Client.Local.Flux do
     with {:ok, calls} <- split_pipeline(flux),
          {:ok, bucket, rest} <- parse_from(calls),
          {:ok, stages} <- parse_stages(rest, now_ns),
-         :ok <- require_range(stages, bucket) do
+         :ok <- require_range(stages, bucket),
+         :ok <- unique_yields(stages) do
       {:ok, %{bucket: bucket, stages: stages}}
     end
   end
 
   @doc "The `{start, stop}` nanoseconds of a query's `range` stage."
   @spec range(query()) :: {integer(), integer()}
-  def range(%{stages: stages}), do: stages |> split_range() |> elem(0)
+  def range(%{stages: [{:range, start_ns, stop_ns} | _rest]}), do: {start_ns, stop_ns}
 
   @doc """
-  The measurements a query reads: the ones its `filter` stages pin with
-  `r._measurement == "m"` (joined by `or`, narrowed by `and`), or `:all`.
-  A table never mixes measurements, so a point of any other one can only
-  be filtered out; `Client.Local` reads just these from the store.
+  The measurements a query reads: the ones the filters that storage
+  evaluates pin with `r._measurement == "m"` (joined by `or`, narrowed by
+  `and`), or `:all`. A series of any other one is not there for the stages
+  after them; `Client.Local` reads just these from the store.
   """
   @spec measurements(query()) :: :all | [term()]
-  def measurements(%{stages: stages}) do
-    for({:filter, predicate} <- stages, do: pinned(predicate))
-    |> Enum.reduce(:all, &intersect/2)
+  def measurements(%{stages: [_range | rest]}) do
+    rest |> pushed_conjuncts() |> Enum.map(&pinned/1) |> Enum.reduce(:all, &intersect/2)
   end
 
+  # The conjuncts storage evaluates: those of the filters right after `range`
+  # that it can, up to the first filter it cannot take whole. Nothing else
+  # may hide a series from the stages after it.
+  @spec pushed_conjuncts([stage()]) :: [predicate()]
+  defp pushed_conjuncts([{:filter, predicate} | rest]) do
+    case predicate |> conjuncts() |> Enum.split_with(&pushable?/1) do
+      {pushed, []} -> pushed ++ pushed_conjuncts(rest)
+      {pushed, _remainder} -> pushed
+    end
+  end
+
+  defp pushed_conjuncts(_stages), do: []
+
   @spec pinned(predicate()) :: :all | [term()]
-  defp pinned({:cmp, "_measurement", "==", literal}), do: [literal]
+  defp pinned({:cmp, "_measurement", "==", literal}) when is_binary(literal), do: [literal]
   defp pinned({:and, a, b}), do: intersect(pinned(a), pinned(b))
 
   defp pinned({:or, a, b}) do
@@ -107,13 +154,14 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   @doc """
   Runs a parsed query over the bucket's points (`%{measurement, tags,
-  fields, timestamp}` maps, duplicates already merged).
+  fields, timestamp}` maps, duplicates already merged). `opts[:uint]` is the
+  set of `{measurement, field}` whose column is unsigned.
   """
-  @spec run(query(), [map()]) :: {:ok, [map()]} | {:error, binary()}
-  def run(%{stages: stages}, points) do
-    {range, rest} = split_range(stages)
-    {start_ns, stop_ns} = range
+  @spec run(query(), [map()], keyword()) :: {:ok, [map()]} | {:error, binary()}
+  def run(%{stages: [{:range, start_ns, stop_ns} | rest]}, points, opts \\ []) do
+    check_results(rest)
     bounds = {datetime(start_ns), datetime(stop_ns)}
+    uints = Keyword.get(opts, :uint, MapSet.new())
 
     tables =
       points
@@ -121,19 +169,11 @@ defmodule InfluxElixir.Client.Local.Flux do
       |> Enum.flat_map(&timed_rows(&1, bounds))
       |> Enum.group_by(fn {key, _timed} -> key end, fn {_key, timed} -> timed end)
       |> Enum.sort_by(fn {key, _rows} -> key end)
-      |> Enum.map(fn {_key, timed} -> table_rows(timed) end)
-
-    {tables, result} = Enum.reduce(rest, {tables, "_result"}, &apply_stage/2)
-
-    rows =
-      tables
-      |> Enum.reject(&(&1 == []))
-      |> Enum.with_index()
-      |> Enum.flat_map(fn {rows, index} ->
-        Enum.map(rows, &Map.merge(&1, %{"table" => index, "result" => result}))
+      |> Enum.map(fn {{measurement, _tags, field}, timed} ->
+        timed |> table_rows() |> table(MapSet.member?(uints, {measurement, field}))
       end)
 
-    {:ok, rows}
+    {:ok, rest |> results(tables) |> result_rows()}
   catch
     {:flux_error, message} -> {:error, message}
   end
@@ -142,13 +182,417 @@ defmodule InfluxElixir.Client.Local.Flux do
   # Execution
   # ---------------------------------------------------------------------------
 
-  @spec split_range([stage()]) :: {{integer(), integer()}, [stage()]}
-  defp split_range([{:range, start_ns, stop_ns} | rest]), do: {{start_ns, stop_ns}, rest}
+  # A table: the series' rows, the kind of its `_value` (`:number`, `:uint`,
+  # `:string` or `:bool`), its column names and one of its rows as it was
+  # read. The kind and the columns stay when a filter takes every row out:
+  # the engine still knows the table.
+  @typep table :: %{
+           kind: :number | :uint | :string | :bool,
+           keys: MapSet.t(),
+           sample: map(),
+           rows: [map()]
+         }
 
-  defp split_range([stage | rest]) do
-    {range, others} = split_range(rest)
-    {range, [stage | others]}
+  # The columns of storage, which hold no `_time`, `_start` or `_stop` yet
+  # while a filter is pushed down.
+  @time_columns ["_start", "_stop", "_time"]
+
+  @spec table([map()], boolean()) :: table()
+  defp table([first | _rest] = rows, uint?) do
+    %{
+      kind: kind_of(first["_value"], uint?),
+      keys: first |> Map.keys() |> MapSet.new(),
+      sample: first,
+      rows: rows
+    }
   end
+
+  @spec kind_of(term(), boolean()) :: :number | :uint | :string | :bool
+  defp kind_of(value, _uint?) when is_boolean(value), do: :bool
+  defp kind_of(value, _uint?) when is_binary(value), do: :string
+  defp kind_of(_value, true), do: :uint
+  defp kind_of(_value, false), do: :number
+
+  # The engine builds a result for the plan before it reads anything, and a
+  # plan with a last stage that is not a `yield` has a result named `_result`.
+  @spec check_results([stage()]) :: :ok
+  defp check_results(stages) do
+    if not match?({:yield, _name}, List.last(stages)) and {:yield, "_result"} in stages do
+      throw(
+        {:flux_error,
+         "failed to initialize execute state: tried to produce more than one result " <>
+           "with the name \"_result\""}
+      )
+    end
+
+    :ok
+  end
+
+  # The results in pipeline order: one per `yield`, then `_result` when the
+  # last stage is not one. (The engine returns them in no fixed order.)
+  @spec results([stage()], [table()]) :: [{binary(), [table()]}]
+  defp results(stages, tables) do
+    {tables, rest, direct?} = read_region(tables, stages)
+    {tables, yields, _direct?} = Enum.reduce(rest, {tables, [], direct?}, &run_stage/2)
+
+    if match?({:yield, _name}, List.last(stages)),
+      do: Enum.reverse(yields),
+      else: Enum.reverse([{"_result", tables} | yields])
+  end
+
+  @spec result_rows([{binary(), [table()]}]) :: [map()]
+  defp result_rows(results) do
+    Enum.flat_map(results, fn {name, tables} ->
+      tables
+      |> Enum.reject(&(&1.rows == []))
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {table, index} ->
+        Enum.map(table.rows, &Map.merge(&1, %{"table" => index, "result" => name}))
+      end)
+    end)
+  end
+
+  @spec run_stage(stage(), {[table()], list(), boolean()}) :: {[table()], list(), boolean()}
+  defp run_stage({:yield, name}, {tables, yields, _direct?}),
+    do: {tables, [{name, tables} | yields], false}
+
+  defp run_stage(stage, {tables, yields, direct?}),
+    do: {apply_stage(stage, tables, direct?), yields, false}
+
+  # The filters right after `range` are pushed to storage while each one is
+  # pushed whole. Returns the tables, the stages left, and whether the tables
+  # are the output of a read that was pushed whole (an aggregate that follows
+  # is read by storage too).
+  @spec read_region([table()], [stage()]) :: {[table()], [stage()], boolean()}
+  defp read_region(tables, [{:filter, predicate} | rest]) do
+    {pushed, remainder} = predicate |> conjuncts() |> Enum.split_with(&pushable?/1)
+    tables = push_filter(tables, pushed)
+
+    case remainder do
+      [] -> read_region(tables, rest)
+      _remainder -> {flux_filter(tables, remainder), rest, false}
+    end
+  end
+
+  defp read_region(tables, rest), do: {tables, rest, true}
+
+  @spec conjuncts(predicate()) :: [predicate()]
+  defp conjuncts({:and, a, b}), do: conjuncts(a) ++ conjuncts(b)
+  defp conjuncts(other), do: [other]
+
+  # A conjunct storage can evaluate: `key == lit`, `key != lit`, `_value`
+  # against a literal with any comparison, and `and`/`or` of such. A negative
+  # number is a unary expression to the planner, `== ""` is left to Flux, and
+  # so are `not` and a comparison of any other key.
+  @spec pushable?(predicate()) :: boolean()
+  defp pushable?({:cmp, _key, _op, literal}) when is_number(literal) and literal < 0, do: false
+  defp pushable?({:cmp, _key, "==", ""}), do: false
+  defp pushable?({:cmp, _key, op, _literal}) when op in ["==", "!="], do: true
+  defp pushable?({:cmp, "_value", _op, _literal}), do: true
+  defp pushable?({:cmp, _key, _op, _literal}), do: false
+  defp pushable?({kind, a, b}) when kind in [:and, :or], do: pushable?(a) and pushable?(b)
+  defp pushable?({:not, _predicate}), do: false
+
+  @spec atoms(predicate()) :: [{binary(), binary(), term()}]
+  defp atoms({:cmp, key, op, literal}), do: [{key, op, literal}]
+  defp atoms({:not, predicate}), do: atoms(predicate)
+  defp atoms({_logic, a, b}), do: atoms(a) ++ atoms(b)
+
+  @spec push_filter([table()], [predicate()]) :: [table()]
+  defp push_filter(tables, []), do: tables
+
+  defp push_filter(tables, pushed) do
+    check_unsigned(tables, Enum.flat_map(pushed, &atoms/1))
+
+    tables
+    |> Enum.filter(fn table -> Enum.all?(pushed, &(series(&1, table.sample) != false)) end)
+    |> keep_rows(fn _table, row -> Enum.all?(pushed, &pushed?(&1, row)) end)
+  end
+
+  # What storage can tell of a series before it reads a value: true, false,
+  # or `:unknown` when only `_value` decides. A series that is false is not
+  # there at all, as far as the stages after the filter can see.
+  @spec series(predicate(), map()) :: boolean() | :unknown
+  defp series({:and, a, b}, sample) do
+    case {series(a, sample), series(b, sample)} do
+      {false, _b} -> false
+      {_a, false} -> false
+      {true, true} -> true
+      _unknown -> :unknown
+    end
+  end
+
+  defp series({:or, a, b}, sample) do
+    case {series(a, sample), series(b, sample)} do
+      {true, _b} -> true
+      {_a, true} -> true
+      {false, false} -> false
+      _unknown -> :unknown
+    end
+  end
+
+  defp series({:cmp, "_value", _op, _literal}, _sample), do: :unknown
+  defp series(comparison, sample), do: pushed?(comparison, sample)
+
+  @spec flux_filter([table()], [predicate()]) :: [table()]
+  defp flux_filter(tables, conjuncts) do
+    atoms = Enum.flat_map(conjuncts, &atoms/1)
+    # A table with no row is not handed to a Flux stage at all (verified).
+    reaching = Enum.reject(tables, &(&1.rows == []))
+    check_unsigned(reaching, atoms)
+    check_types(reaching, atoms)
+
+    keep_rows(tables, fn table, row ->
+      Enum.all?(conjuncts, &(matches?(&1, table, row) == true))
+    end)
+  end
+
+  @spec keep_rows([table()], (table(), map() -> boolean())) :: [table()]
+  defp keep_rows(tables, keep?) do
+    Enum.map(tables, fn table -> %{table | rows: Enum.filter(table.rows, &keep?.(table, &1))} end)
+  end
+
+  # Storage's answer: two-valued. A key the series lacks, and `_time`,
+  # `_start` and `_stop`, are the empty string for `!=` (`!= "a"` keeps the
+  # row, `!= ""` drops it) and equal to nothing for `==`; a literal of another
+  # type than the key matches nothing.
+  @spec pushed?(predicate(), map()) :: boolean()
+  defp pushed?({:and, a, b}, row), do: pushed?(a, row) and pushed?(b, row)
+  defp pushed?({:or, a, b}, row), do: pushed?(a, row) or pushed?(b, row)
+  defp pushed?({:cmp, "_value", op, literal}, row), do: same_type?(row["_value"], op, literal)
+
+  defp pushed?({:cmp, key, op, literal}, row) when is_binary(literal) do
+    case Map.fetch(row, key) do
+      {:ok, value} when key not in @time_columns -> ordered(op, value, literal)
+      _lacking -> op == "!=" and literal != ""
+    end
+  end
+
+  defp pushed?({:cmp, _key, _op, _literal}, _row), do: false
+
+  @spec same_type?(term(), binary(), term()) :: boolean()
+  defp same_type?(value, op, literal) when is_number(value) and is_number(literal),
+    do: ordered(op, value, literal)
+
+  defp same_type?(value, op, literal) when is_binary(value) and is_binary(literal),
+    do: ordered(op, value, literal)
+
+  defp same_type?(value, op, literal) when is_boolean(value) and is_boolean(literal),
+    do: ordered(op, value, literal)
+
+  defp same_type?(_value, _op, _literal), do: false
+
+  @spec apply_stage(stage(), [table()], boolean()) :: [table()]
+  defp apply_stage({:filter, predicate}, tables, _direct?), do: flux_filter(tables, [predicate])
+
+  defp apply_stage({:limit, n, offset}, tables, _direct?),
+    do: map_rows(tables, &(&1 |> Enum.drop(offset) |> Enum.take(n)))
+
+  defp apply_stage({:selector, kind}, tables, direct?) when kind in [:min, :max] do
+    if Enum.any?(tables, &(&1.kind in [:string, :bool] and (direct? or &1.rows != []))) do
+      refuse(
+        "#{kind}() of a string or boolean field is an engine error whose form depends on " <>
+          "the plan (a 500 \"panic: unsupported for aggregate #{kind}\" when storage reads " <>
+          "it, a positioned 400 otherwise)"
+      )
+    end
+
+    tables |> map_rows(&select(kind, &1)) |> in_group_key_order(direct?)
+  end
+
+  defp apply_stage({:selector, kind}, tables, direct?),
+    do: tables |> map_rows(&select(kind, &1)) |> in_group_key_order(direct?)
+
+  defp apply_stage({:aggregate, kind}, tables, direct?) do
+    check_aggregate(kind, tables, direct?)
+    tables |> Enum.map(&aggregate(kind, &1)) |> in_group_key_order(direct?)
+  end
+
+  # A selector or an aggregate that storage reads leaves the tables in series
+  # order; one that Flux runs emits them sorted by group key: the columns in
+  # label order (`_field`, `_measurement`, `_start`, `_stop`, then the tags),
+  # a key that is a prefix of another before it (verified).
+  @spec in_group_key_order([table()], boolean()) :: [table()]
+  defp in_group_key_order(tables, true), do: tables
+
+  defp in_group_key_order(tables, false),
+    do: Enum.sort_by(tables, &(&1.sample |> Map.drop(["_value", "_time"]) |> Enum.sort()))
+
+  @spec map_rows([table()], ([map()] -> [map()])) :: [table()]
+  defp map_rows(tables, fun), do: Enum.map(tables, &%{&1 | rows: fun.(&1.rows)})
+
+  @spec select(:first | :last | :min | :max, [map()]) :: [map()]
+  defp select(_kind, []), do: []
+  defp select(:first, [row | _rest]), do: [row]
+  defp select(:last, rows), do: [List.last(rows)]
+
+  # The first row with the extreme value wins a tie.
+  defp select(kind, rows) do
+    better? = if kind == :max, do: &Kernel.>/2, else: &Kernel.</2
+
+    [
+      Enum.reduce(rows, fn row, best ->
+        if better?.(row["_value"], best["_value"]), do: row, else: best
+      end)
+    ]
+  end
+
+  # `sum` and `mean` of a string or boolean field. Storage, when it reads the
+  # aggregate, refuses the table even when a filter took its rows out; Flux
+  # refuses it with a position, and takes no notice of an empty table.
+  @spec check_aggregate(:mean | :sum | :count, [table()], boolean()) :: :ok
+  defp check_aggregate(:count, _tables, _direct?), do: :ok
+
+  defp check_aggregate(kind, tables, direct?) do
+    offenders = Enum.filter(tables, &(&1.kind in [:string, :bool]))
+    kinds = offenders |> Enum.map(& &1.kind) |> Enum.uniq()
+    rows? = Enum.any?(offenders, &(&1.rows != []))
+
+    cond do
+      offenders == [] ->
+        :ok
+
+      direct? and rows? ->
+        throw(
+          {:flux_error,
+           "unsupported input type for #{kind} aggregate: #{type_name(first_error_kind(kinds))}"}
+        )
+
+      direct? or rows? ->
+        refuse(
+          "#{kind}() of a string or boolean field: the engine's error depends on the plan " <>
+            "(and on which series storage has dropped)"
+        )
+
+      true ->
+        :ok
+    end
+  end
+
+  # Storage names the boolean when a string and a boolean field are both there,
+  # whichever series it reads first (verified in three arrangements).
+  @spec first_error_kind([:string | :bool]) :: :string | :bool
+  defp first_error_kind(kinds), do: if(:bool in kinds, do: :bool, else: :string)
+
+  @spec aggregate(:mean | :sum | :count, table()) :: table()
+  defp aggregate(kind, %{rows: rows} = table) do
+    table = %{
+      table
+      | keys: MapSet.delete(table.keys, "_time"),
+        kind: aggregate_kind(kind, table.kind)
+    }
+
+    case rows do
+      [] ->
+        table
+
+      [first | _rest] ->
+        values = Enum.map(rows, & &1["_value"])
+
+        value =
+          case kind do
+            :count -> length(values)
+            :sum -> Enum.sum(values)
+            :mean -> Enum.sum(values) / length(values)
+          end
+
+        %{table | rows: [first |> Map.delete("_time") |> Map.put("_value", value)]}
+    end
+  end
+
+  @spec aggregate_kind(:mean | :sum | :count, atom()) :: atom()
+  defp aggregate_kind(:sum, kind), do: kind
+  defp aggregate_kind(_count_or_mean, _kind), do: :number
+
+  # Flux logic has a null: a key the table does not have is null, a
+  # comparison with null is null, `not null` is null, and filter keeps a
+  # row only when the predicate is true. `and` and `or` are not the three
+  # valued ones (verified): the left side decides whether the right one is
+  # read, and a left side that is not true counts as false. `a and b` is `b`
+  # when `a` is true and false otherwise (so null and true is false, true
+  # and null is null); `a or b` is true when `a` is true and `b` otherwise
+  # (so null or false is false, false or null is null).
+  @spec matches?(predicate(), table(), map()) :: boolean() | nil
+  defp matches?({:and, a, b}, table, row) do
+    if matches?(a, table, row) == true, do: matches?(b, table, row), else: false
+  end
+
+  defp matches?({:or, a, b}, table, row) do
+    if matches?(a, table, row) == true, do: true, else: matches?(b, table, row)
+  end
+
+  defp matches?({:not, a}, table, row) do
+    case matches?(a, table, row) do
+      nil -> nil
+      value -> not value
+    end
+  end
+
+  defp matches?({:cmp, key, op, literal}, table, row) do
+    if MapSet.member?(table.keys, key), do: compare(op, Map.fetch!(row, key), literal)
+  end
+
+  @spec compare(binary(), term(), term()) :: boolean()
+  defp compare(op, a, b) when is_number(a) and is_number(b), do: ordered(op, a, b)
+  defp compare(op, a, b) when is_binary(a) and is_binary(b), do: ordered(op, a, b)
+  defp compare("==", a, b), do: a === b
+  defp compare("!=", a, b), do: a !== b
+  defp compare(_op, _a, _b), do: false
+
+  @spec ordered(binary(), term(), term()) :: boolean()
+  defp ordered("==", a, b), do: a == b
+  defp ordered("!=", a, b), do: a != b
+  defp ordered("<", a, b), do: a < b
+  defp ordered("<=", a, b), do: a <= b
+  defp ordered(">", a, b), do: a > b
+  defp ordered(">=", a, b), do: a >= b
+
+  # A column compared with a literal of another type is an error on the
+  # engine (with the position in the query), and so is a time column with
+  # any literal: the double names it instead. A column the table lacks is
+  # null, whatever the literal.
+  @spec check_types([table()], [{binary(), binary(), term()}]) :: :ok
+  defp check_types(tables, atoms) do
+    for table <- tables, {key, op, literal} <- atoms, MapSet.member?(table.keys, key) do
+      column = column_type(table, key)
+
+      if key in @time_columns or column != literal_type(literal) do
+        refuse(
+          "comparing the #{column} column #{key} with a #{literal_type(literal)} (#{op}) is " <>
+            "an error on the engine (unsupported binary expression)"
+        )
+      end
+    end
+
+    :ok
+  end
+
+  @spec column_type(table(), binary()) :: :number | :string | :bool | :time
+  defp column_type(_table, key) when key in @time_columns, do: :time
+  defp column_type(%{kind: :bool}, "_value"), do: :bool
+  defp column_type(%{kind: :string}, "_value"), do: :string
+  defp column_type(_table, "_value"), do: :number
+  defp column_type(_table, _key), do: :string
+
+  @spec literal_type(term()) :: :number | :string | :bool
+  defp literal_type(literal) when is_number(literal), do: :number
+  defp literal_type(literal) when is_binary(literal), do: :string
+  defp literal_type(literal) when is_boolean(literal), do: :bool
+
+  # An unsigned column answers `_value` comparisons by rules of its own
+  # (none of an integer literal's `==` or ordering in storage), not verified.
+  @spec check_unsigned([table()], [{binary(), binary(), term()}]) :: :ok
+  defp check_unsigned(tables, atoms) do
+    if Enum.any?(tables, &(&1.kind == :uint)) and
+         Enum.any?(atoms, fn {key, _op, _literal} -> key == "_value" end) do
+      refuse("a comparison of the _value of an unsigned field is not modelled")
+    end
+
+    :ok
+  end
+
+  @spec refuse(binary()) :: no_return()
+  defp refuse(message), do: throw({:flux_error, "Client.Local: " <> message})
 
   # A table's rows in time order: by the stored nanoseconds, which a row's
   # microsecond `_time` cannot tell apart. The sort is stable, so points at
@@ -185,110 +629,9 @@ defmodule InfluxElixir.Client.Local.Flux do
     end
   end
 
-  @spec apply_stage(stage(), {[[map()]], binary()}) :: {[[map()]], binary()}
-  defp apply_stage({:yield, name}, {tables, _result}), do: {tables, name}
-
-  defp apply_stage(stage, {tables, result}),
-    do: {Enum.map(tables, &apply_to_table(stage, &1)), result}
-
-  @spec apply_to_table(stage(), [map()]) :: [map()]
-  defp apply_to_table({:filter, predicate}, rows),
-    do: Enum.filter(rows, &(matches?(predicate, &1) == true))
-
-  defp apply_to_table({:limit, n, offset}, rows), do: rows |> Enum.drop(offset) |> Enum.take(n)
-  defp apply_to_table({:selector, _kind}, []), do: []
-  defp apply_to_table({:selector, :first}, [row | _rest]), do: [row]
-  defp apply_to_table({:selector, :last}, rows), do: [List.last(rows)]
-
-  # The first row with the extreme value wins a tie.
-  defp apply_to_table({:selector, kind}, rows) do
-    better? = if kind == :max, do: &Kernel.>/2, else: &Kernel.</2
-
-    [
-      Enum.reduce(rows, fn row, best ->
-        if better?.(row["_value"], best["_value"]), do: row, else: best
-      end)
-    ]
-  end
-
-  defp apply_to_table({:aggregate, _kind}, []), do: []
-
-  defp apply_to_table({:aggregate, kind}, [first | _rest] = rows) do
-    values = Enum.map(rows, & &1["_value"])
-
-    if kind != :count and not Enum.all?(values, &is_number/1) do
-      throw({:flux_error, "unsupported input type for #{kind} aggregate: #{type_name(values)}"})
-    end
-
-    value =
-      case kind do
-        :count -> length(values)
-        :sum -> Enum.sum(values)
-        :mean -> Enum.sum(values) / length(values)
-      end
-
-    [first |> Map.delete("_time") |> Map.put("_value", value)]
-  end
-
-  # Flux logic is three-valued: a key the row does not have is null, a
-  # comparison with null is null, `not null` is null, and filter keeps a
-  # row only when the predicate is true.
-  @spec matches?(predicate(), map()) :: boolean() | nil
-  defp matches?({:and, a, b}, row) do
-    case {matches?(a, row), matches?(b, row)} do
-      {false, _b} -> false
-      {_a, false} -> false
-      {true, true} -> true
-      _null -> nil
-    end
-  end
-
-  defp matches?({:or, a, b}, row) do
-    case {matches?(a, row), matches?(b, row)} do
-      {true, _b} -> true
-      {_a, true} -> true
-      {false, false} -> false
-      _null -> nil
-    end
-  end
-
-  defp matches?({:not, a}, row) do
-    case matches?(a, row) do
-      nil -> nil
-      value -> not value
-    end
-  end
-
-  defp matches?({:cmp, key, op, literal}, row) do
-    case Map.fetch(row, key) do
-      {:ok, value} -> compare(op, value, literal)
-      :error -> nil
-    end
-  end
-
-  @spec compare(binary(), term(), term()) :: boolean()
-  defp compare(op, a, b) when is_number(a) and is_number(b), do: ordered(op, a, b)
-  defp compare(op, a, b) when is_binary(a) and is_binary(b), do: ordered(op, a, b)
-  defp compare("==", a, b), do: a === b
-  defp compare("!=", a, b), do: a !== b
-  defp compare(_op, _a, _b), do: false
-
-  @spec ordered(binary(), term(), term()) :: boolean()
-  defp ordered("==", a, b), do: a == b
-  defp ordered("!=", a, b), do: a != b
-  defp ordered("<", a, b), do: a < b
-  defp ordered("<=", a, b), do: a <= b
-  defp ordered(">", a, b), do: a > b
-  defp ordered(">=", a, b), do: a >= b
-
-  @spec type_name([term()]) :: binary()
-  defp type_name(values) do
-    case Enum.find(values, &(not is_number(&1))) do
-      value when is_binary(value) -> "string"
-      value when is_boolean(value) -> "boolean"
-      _other -> "unknown"
-    end
-  end
+  @spec type_name(:string | :bool) :: binary()
+  defp type_name(:string), do: "string"
+  defp type_name(:bool), do: "boolean"
 
   @spec datetime(integer()) :: DateTime.t()
   defp datetime(ns) do
@@ -381,6 +724,7 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   defp parse_stage({"yield", args}, _now_ns) do
     case named_args(args) do
+      %{"name" => "\"\""} -> {:error, "Client.Local: unsupported yield(): a result with no name"}
       %{"name" => "\"" <> _rest = quoted} -> {:ok, {:yield, String.trim(quoted, "\"")}}
       params when params == %{} -> {:ok, {:yield, "_result"}}
       _other -> {:error, "Client.Local: unsupported yield(): #{args}"}
@@ -405,17 +749,33 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   @spec require_range([stage()], binary()) :: :ok | {:error, binary()}
   defp require_range(stages, bucket) do
-    case Enum.count(stages, &match?({:range, _start, _stop}, &1)) do
-      1 ->
-        :ok
-
-      0 ->
+    cond do
+      not match?([{:range, _start, _stop} | _rest], stages) ->
         {:error,
          "error in building plan while starting program: cannot submit unbounded read to " <>
            "\"#{bucket}\"; try bounding 'from' with a call to 'range'"}
 
-      _many ->
+      Enum.count(stages, &match?({:range, _start, _stop}, &1)) > 1 ->
         {:error, "Client.Local: unsupported Flux: more than one range()"}
+
+      true ->
+        :ok
+    end
+  end
+
+  # Two `yield`s of one name are a plan error on the engine.
+  @spec unique_yields([stage()]) :: :ok | {:error, binary()}
+  defp unique_yields(stages) do
+    names = for {:yield, name} <- stages, do: name
+
+    case names -- Enum.uniq(names) do
+      [] ->
+        :ok
+
+      [name | _rest] ->
+        {:error,
+         "error in building plan while starting program: found more than one call to " <>
+           "yield() with the name \"#{name}\""}
     end
   end
 
@@ -531,11 +891,41 @@ defmodule InfluxElixir.Client.Local.Flux do
   @spec parse_predicate(binary()) :: {:ok, predicate()} | {:error, binary()}
   defp parse_predicate(text) do
     with {:ok, tokens} <- tokenize(text, []),
-         {:ok, predicate, []} <- parse_or(tokens) do
+         {:ok, predicate, []} <- parse_or(tokens),
+         :ok <- check_comparisons(predicate) do
       {:ok, predicate}
     else
-      _error -> {:error, "Client.Local: unsupported filter predicate: #{text}"}
+      {:refused, message} ->
+        {:error, "Client.Local: " <> message}
+
+      _error ->
+        {:error, "Client.Local: unsupported filter predicate: #{text}"}
     end
+  end
+
+  # Ordering a boolean is an error on the engine (`bool is not Comparable`),
+  # and ordering `_value` against a string is answered by storage with no
+  # row and by Flux with the strings' order: neither is modelled.
+  @spec check_comparisons(predicate()) :: :ok | {:refused, binary()}
+  defp check_comparisons({:cmp, key, op, literal}) when op not in ["==", "!="] do
+    cond do
+      is_boolean(literal) ->
+        {:refused,
+         "ordering against a boolean is an error on the engine (bool is not Comparable)"}
+
+      key == "_value" and is_binary(literal) ->
+        {:refused, "ordering _value against a string is not modelled"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp check_comparisons({:cmp, _key, _op, _literal}), do: :ok
+  defp check_comparisons({:not, predicate}), do: check_comparisons(predicate)
+
+  defp check_comparisons({_logic, a, b}) do
+    with :ok <- check_comparisons(a), do: check_comparisons(b)
   end
 
   @spec tokenize(binary(), list()) :: {:ok, list()} | :error

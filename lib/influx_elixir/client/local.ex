@@ -481,12 +481,34 @@ defmodule InfluxElixir.Client.Local do
     * `first()`, `last()`, `min()`, `max()` — the selected row per table
     * `mean()`, `sum()`, `count()` — one row per table, without `_time`
     * `limit(n:[, offset:])` — per table
-    * `yield(name: "x")` — names the result
+    * `yield(name: "x")` — names a result. Every `yield` returns its own
+      result (the rows carry its name in `"result"`, and their `"table"`
+      counts from 0 in each); a last stage that is not a `yield` returns the
+      rest as `_result`. InfluxDB returns the results in no fixed order, the
+      double in pipeline order, so compare them by name. Two results of one
+      name are the engine's 400.
+
+  What a filter does with a key a row lacks depends on where the engine runs
+  it, and the double does the same. The filters right after `range` are pushed
+  down to storage while each is pushed whole, and a conjunct of `==` or `!=`
+  (and of `_value` with any comparison) is evaluated there, where a missing
+  key is the empty string: `r.nosuch != "a"` keeps every row, `r.nosuch == "a"`
+  and `r.nosuch != ""` keep none. Anything else (`not`, `<` on a tag, a
+  negative number, `== ""`), every filter after another stage (`limit`,
+  `yield`, a selector, an aggregate) and every filter after one that was not
+  pushed whole, run as Flux, where a missing key is null and keeps nothing
+  (`limit(n: 10) |> filter(fn: (r) => r.nosuch != "a")` is empty).
 
   Any other function (`aggregateWindow`, `pivot`, `group`, `sort`, ...),
   arguments to the selectors and aggregates, or a predicate or time the
   double does not model is `{:error, %{status: 400, body: json}}` whose
-  message starts `Client.Local: unsupported Flux`.
+  message starts `Client.Local: unsupported Flux`. So is what the engine
+  answers with an error whose text holds a position in the query, or
+  depends on the plan: a column compared with a literal of another type
+  where Flux reads it, ordering against a boolean, `min()` or `max()` of a
+  string or boolean field (a 500 panic where storage reads it), `sum()` or
+  `mean()` of one where Flux reads it; those messages start `Client.Local:`
+  with the construct named.
 
   ## Write Bodies
 

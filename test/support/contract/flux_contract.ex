@@ -20,9 +20,12 @@ defmodule InfluxElixir.Contract.Flux do
     * `:pipeline` — absolute ranges and the stages: filter grammar, selectors,
       limit, mean, yield
     * `:ranges` — ranges relative to now, predicates and range units
+    * `:pushdown` — which filters storage evaluates and what a key it lacks is,
+      one result per `yield`, the aggregates of string and boolean fields, and the
+      order of the tables
   """
 
-  @parts [:pipeline, :ranges]
+  @parts [:pipeline, :ranges, :pushdown]
 
   @doc false
   defmacro __using__(opts) do
@@ -113,7 +116,13 @@ defmodule InfluxElixir.Contract.Flux do
       {:pipeline, selector_tests(client)},
       {:pipeline, range_bound_tests(client)},
       {:ranges, predicate_tests(client)},
-      {:ranges, range_unit_tests(client)}
+      {:ranges, range_unit_tests(client)},
+      {:pushdown, pushdown_helpers(client)},
+      {:pushdown, pushdown_tests(client)},
+      {:pushdown, flux_semantics_tests(client)},
+      {:pushdown, result_tests(client)},
+      {:pushdown, type_aggregate_tests(client)},
+      {:pushdown, table_order_tests(client)}
     ]
   end
 
@@ -563,6 +572,482 @@ defmodule InfluxElixir.Contract.Flux do
 
           assert InfluxElixir.Contract.Flux.rows_until_now(unquote(client), ctx, flux, 86_400) ===
                    [ctx.new]
+        end
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Pushdown, results, aggregates of non-numeric fields
+  # ---------------------------------------------------------------------------
+
+  @doc false
+  # `{status, message}` of an error answer.
+  @spec error_of(term()) :: {pos_integer(), binary()}
+  def error_of({:error, %{status: status, body: body}}),
+    do: {status, Jason.decode!(body)["message"]}
+
+  @doc false
+  # A multi-result answer as `%{result => [{table, host, value}]}`: the engine
+  # returns the results in no fixed order, so a test compares them by name.
+  @spec by_result({:ok, [map()]}) :: %{binary() => [{non_neg_integer(), binary(), term()}]}
+  def by_result({:ok, rows}) do
+    rows
+    |> Enum.group_by(& &1["result"], &{&1["table"], &1["h"], &1["_value"]})
+  end
+
+  # Three points of one measurement, two series, and the helpers that read them:
+  # `rows.(tail)` is the `{result, table, host, value}` of each row of the
+  # measurement's head followed by `tail`, or the error.
+  defp pushdown_setup(client) do
+    quote location: :keep do
+      setup ctx do
+        m = InfluxElixir.IntegrationHelper.unique_name("contract_fxd")
+
+        lp = """
+        #{m},h=a i=1i 1000000000
+        #{m},h=a i=3i 2000000000
+        #{m},h=b i=2i 3000000000
+        """
+
+        {:ok, :written} =
+          unquote(client).write(ctx.conn, String.trim(lp), database: ctx.database)
+
+        InfluxElixir.ClientContract.settle(ctx)
+        head = InfluxElixir.Contract.Flux.head(ctx, m, "start: 0, stop: 100")
+
+        rows = fn tail ->
+          case unquote(client).query_flux(ctx.conn, head <> tail) do
+            {:ok, rows} -> Enum.map(rows, &{&1["result"], &1["table"], &1["h"], &1["_value"]})
+            error -> error
+          end
+        end
+
+        all = [{"_result", 0, "a", 1}, {"_result", 0, "a", 3}, {"_result", 1, "b", 2}]
+
+        {:ok, m: m, head: head, rows: rows, all: all}
+      end
+    end
+  end
+
+  defp pushdown_helpers(client) do
+    quote location: :keep do
+      def fxd_local?, do: unquote(client) === InfluxElixir.Client.Local
+    end
+  end
+
+  defp pushdown_tests(client) do
+    quote location: :keep do
+      describe "query_flux/3 — storage pushdown of a filter" do
+        unquote(pushdown_setup(client))
+
+        test "pushed to storage, a key no series has is the empty string for !=", ctx do
+          InfluxElixir.TestSupport.Check.check_cases(
+            [
+              {~s| \|> filter(fn: (r) => r.nosuch != "a")|, ctx.all},
+              {~s| \|> filter(fn: (r) => r.nosuch != "a" or r.h == "zzz")|, ctx.all},
+              {~s| \|> filter(fn: (r) => r["nosuch"] != "a")|, ctx.all},
+              {~s| \|> filter(fn: (r) => r.nosuch != "a") \|> filter(fn: (r) => r.other != "b")|,
+               ctx.all},
+              {~s| \|> yield(name: "_result")|, ctx.all},
+              {~s| \|> filter(fn: (r) => r.nosuch != "a" and r.h == "a")|, Enum.take(ctx.all, 2)},
+              {~s| \|> filter(fn: (r) => r.nosuch != "a" and r._value > 1)|,
+               [{"_result", 0, "a", 3}, {"_result", 1, "b", 2}]},
+              {~s| \|> filter(fn: (r) => r.nosuch == "a" or r.h == "b")|,
+               [{"_result", 0, "b", 2}]},
+              {~s| \|> filter(fn: (r) => r.nosuch != "")|, []},
+              {~s| \|> filter(fn: (r) => r.nosuch == "")|, []},
+              {~s| \|> filter(fn: (r) => r.nosuch == "a")|, []}
+            ],
+            fn {tail, expected} ->
+              case ctx.rows.(tail) do
+                ^expected -> :ok
+                other -> {:mismatch, other}
+              end
+            end
+          )
+        end
+
+        test "the conjuncts storage cannot take stay in Flux, where a missing key is null", ctx do
+          InfluxElixir.TestSupport.Check.check_cases(
+            [
+              {~s| \|> filter(fn: (r) => r.nosuch != "a" and r.h < "z")|, ctx.all},
+              {~s| \|> filter(fn: (r) => r.h < "z" and r.nosuch != "a")|, ctx.all},
+              {~s| \|> filter(fn: (r) => r.nosuch != "a" and r.h > "a")|,
+               [{"_result", 0, "b", 2}]},
+              {~s| \|> filter(fn: (r) => r.nosuch != "a" and not (r.h == "a"))|,
+               [{"_result", 0, "b", 2}]},
+              {~s| \|> filter(fn: (r) => (r.nosuch != "a" and r.h < "z") or r.h == "b")|,
+               [{"_result", 0, "b", 2}]}
+            ],
+            fn {tail, expected} ->
+              case ctx.rows.(tail) do
+                ^expected -> :ok
+                other -> {:mismatch, other}
+              end
+            end
+          )
+        end
+
+        test "a filter not pushed whole, or after another stage, reads a missing key as null",
+             ctx do
+          InfluxElixir.TestSupport.Check.check_cases(
+            [
+              {~s| \|> limit(n: 10) \|> filter(fn: (r) => r.nosuch != "a")|, []},
+              {~s| \|> first() \|> filter(fn: (r) => r.nosuch != "a")|, []},
+              {~s| \|> sum() \|> filter(fn: (r) => r.nosuch != "a")|, []},
+              {~s| \|> filter(fn: (r) => r.h < "z") \|> filter(fn: (r) => r.nosuch != "a")|, []},
+              {~s| \|> filter(fn: (r) => r.nosuch != "a" or r.h < "z")|, ctx.all},
+              {~s| \|> filter(fn: (r) => r.nosuch != "a" or r.h > "z")|, []},
+              {~s| \|> filter(fn: (r) => not (r.nosuch == "a"))|, []},
+              {~s| \|> filter(fn: (r) => r.nosuch == "" or r.nosuch != "a")|, []},
+              {~s| \|> filter(fn: (r) => r.h != "")|, ctx.all}
+            ],
+            fn {tail, expected} ->
+              case ctx.rows.(tail) do
+                ^expected -> :ok
+                other -> {:mismatch, other}
+              end
+            end
+          )
+        end
+      end
+    end
+  end
+
+  defp flux_semantics_tests(client) do
+    quote location: :keep do
+      describe "query_flux/3 — what Flux reads where storage does not" do
+        unquote(pushdown_setup(client))
+
+        test "and and or are not three-valued: a left side that is not true counts as false",
+             ctx do
+          InfluxElixir.TestSupport.Check.check_cases(
+            [
+              # null or false is false, so its negation holds; null or null is null
+              {~s| \|> limit(n: 10) \|> filter(fn: (r) => not (r.nosuch == "a" or r.h == "q"))|,
+               ctx.all},
+              {~s| \|> limit(n: 10) \|> filter(fn: (r) => not (r.nosuch == "a" or r.nosuch2 == "a"))|,
+               []},
+              # null and anything is false; true and null is null (so a row whose left
+              # side is false is kept by the negation, one whose left side is true is not)
+              {~s| \|> limit(n: 10) \|> filter(fn: (r) => not (r.nosuch == "a" and r.h == "a"))|,
+               ctx.all},
+              {~s| \|> limit(n: 10) \|> filter(fn: (r) => not (r.h == "a" and r.nosuch == "a"))|,
+               [{"_result", 0, "b", 2}]},
+              {~s| \|> limit(n: 10) \|> filter(fn: (r) => r.nosuch == "a" or r.h == "b")|,
+               [{"_result", 0, "b", 2}]}
+            ],
+            fn {tail, expected} ->
+              case ctx.rows.(tail) do
+                ^expected -> :ok
+                other -> {:mismatch, other}
+              end
+            end
+          )
+        end
+
+        test "in storage a literal of another type matches nothing, and so does a time column",
+             ctx do
+          InfluxElixir.TestSupport.Check.check_cases(
+            [
+              {~s| \|> filter(fn: (r) => r.h != 1)|, []},
+              {~s| \|> filter(fn: (r) => r.h == true)|, []},
+              {~s| \|> filter(fn: (r) => r._field == 1.5)|, []},
+              {~s| \|> filter(fn: (r) => r._value == "x")|, []},
+              {~s| \|> filter(fn: (r) => r._value != "x")|, []},
+              {~s| \|> filter(fn: (r) => r._value == 3.0)|, [{"_result", 0, "a", 3}]},
+              {~s| \|> filter(fn: (r) => r._time != "x")|, ctx.all},
+              {~s| \|> filter(fn: (r) => r._time == "x")|, []}
+            ],
+            fn {tail, expected} ->
+              case ctx.rows.(tail) do
+                ^expected -> :ok
+                other -> {:mismatch, other}
+              end
+            end
+          )
+        end
+
+        @tag local_divergence:
+               "Local names the type error of Flux, whose message holds a position in the query"
+        test "in Flux a column compared with a literal of another type is an error", ctx do
+          for tail <- [
+                ~s| \|> limit(n: 10) \|> filter(fn: (r) => r.h != 1)|,
+                ~s| \|> filter(fn: (r) => r.h < 1)|,
+                ~s| \|> filter(fn: (r) => r.h != -1)|,
+                ~s| \|> filter(fn: (r) => r.h == "" or r.h != 1)|,
+                ~s| \|> filter(fn: (r) => r._time > 1)|,
+                ~s| \|> filter(fn: (r) => r._time < "x")|,
+                ~s| \|> limit(n: 10) \|> filter(fn: (r) => r._value == "x")|,
+                ~s| \|> filter(fn: (r) => r._value > false)|
+              ] do
+            {status, message} = InfluxElixir.Contract.Flux.error_of(ctx.rows.(tail))
+            assert status === 400, tail
+
+            if fxd_local?(),
+              do: assert(message =~ ~r/^Client\.Local: (comparing|ordering)/, tail),
+              else: assert(message =~ ~r/unsupported binary expression|is not Comparable/, tail)
+          end
+        end
+
+        test "a range that is not the first stage is an unbounded read", ctx do
+          flux =
+            ~s|from(bucket: "#{ctx.database}") \|> filter(fn: (r) => r._measurement == "#{ctx.m}") | <>
+              ~s|\|> range(start: 0, stop: 100)|
+
+          assert InfluxElixir.Contract.Flux.error_of(unquote(client).query_flux(ctx.conn, flux)) ===
+                   {400,
+                    "error in building plan while starting program: cannot submit unbounded " <>
+                      ~s|read to "#{ctx.database}"; try bounding 'from' with a call to 'range'|}
+        end
+      end
+    end
+  end
+
+  defp result_tests(client) do
+    quote location: :keep do
+      describe "query_flux/3 — every yield is a result" do
+        unquote(pushdown_setup(client))
+
+        test "two yields return two results, each numbering its tables from 0", ctx do
+          flux = ctx.head <> ~s| \|> yield(name: "a") \|> yield(name: "b")|
+          rows = [{0, "a", 1}, {0, "a", 3}, {1, "b", 2}]
+
+          assert InfluxElixir.Contract.Flux.by_result(unquote(client).query_flux(ctx.conn, flux)) ===
+                   %{"a" => rows, "b" => rows}
+        end
+
+        test "a yield that is not the last stage keeps the rest as _result", ctx do
+          flux = ctx.head <> ~s| \|> yield(name: "a") \|> sum()|
+
+          assert InfluxElixir.Contract.Flux.by_result(unquote(client).query_flux(ctx.conn, flux)) ===
+                   %{
+                     "a" => [{0, "a", 1}, {0, "a", 3}, {1, "b", 2}],
+                     "_result" => [{0, "a", 4}, {1, "b", 2}]
+                   }
+
+          flux =
+            ctx.head <>
+              ~s| \|> filter(fn: (r) => r.h == "a") \|> yield(name: "a") \|> filter(fn: (r) => r._value > 1)|
+
+          assert InfluxElixir.Contract.Flux.by_result(unquote(client).query_flux(ctx.conn, flux)) ===
+                   %{"a" => [{0, "a", 1}, {0, "a", 3}], "_result" => [{0, "a", 3}]}
+        end
+
+        test "a yield ends the pushdown, and a last yield leaves no _result", ctx do
+          flux = ctx.head <> ~s| \|> yield(name: "y") \|> filter(fn: (r) => r.nosuch != "a")|
+
+          assert InfluxElixir.Contract.Flux.by_result(unquote(client).query_flux(ctx.conn, flux)) ===
+                   %{"y" => [{0, "a", 1}, {0, "a", 3}, {1, "b", 2}]}
+
+          flux = ctx.head <> ~s| \|> sum() \|> yield(name: "s")|
+
+          assert InfluxElixir.Contract.Flux.by_result(unquote(client).query_flux(ctx.conn, flux)) ===
+                   %{"s" => [{0, "a", 4}, {1, "b", 2}]}
+
+          flux = ctx.head <> ~s| \|> filter(fn: (r) => r._value > 100) \|> yield(name: "none")|
+          assert unquote(client).query_flux(ctx.conn, flux) === {:ok, []}
+        end
+
+        test "two results of one name are a 400, and so is a yield named _result before a last stage",
+             ctx do
+          plan = "error in building plan while starting program: found more than one call to "
+          state = "failed to initialize execute state: tried to produce more than one result "
+
+          for {tail, message} <- [
+                {~s| \|> yield(name: "a") \|> yield(name: "a")|,
+                 plan <> ~s|yield() with the name "a"|},
+                {~s| \|> yield(name: "a") \|> sum() \|> yield(name: "a")|,
+                 plan <> ~s|yield() with the name "a"|},
+                {~s| \|> yield() \|> yield()|, plan <> ~s|yield() with the name "_result"|},
+                {~s| \|> yield() \|> sum()|, state <> ~s|with the name "_result"|},
+                {~s| \|> yield(name: "_result") \|> filter(fn: (r) => r._value > 100)|,
+                 state <> ~s|with the name "_result"|}
+              ] do
+            assert InfluxElixir.Contract.Flux.error_of(
+                     unquote(client).query_flux(ctx.conn, ctx.head <> tail)
+                   ) === {400, message}
+          end
+        end
+
+        @tag local_divergence:
+               "Local refuses a result with no name; the client drops the empty result column"
+        test "a result with no name", ctx do
+          result = unquote(client).query_flux(ctx.conn, ctx.head <> ~s| \|> yield(name: "")|)
+
+          if fxd_local?() do
+            assert InfluxElixir.Contract.Flux.error_of(result) ===
+                     {400, "Client.Local: unsupported yield(): a result with no name"}
+          else
+            assert {:ok, [_one, _two, _three] = rows} = result
+            refute Enum.any?(rows, &Map.has_key?(&1, "result"))
+          end
+        end
+      end
+    end
+  end
+
+  defp type_aggregate_tests(client) do
+    quote location: :keep do
+      describe "query_flux/3 — aggregates of a string or boolean field" do
+        setup ctx do
+          m = InfluxElixir.IntegrationHelper.unique_name("contract_fxt")
+
+          lp = """
+          #{m},h=a s="x",b=true 1000000000
+          #{m},h=a s="y",b=false 2000000000
+          #{m},h=b s="z",b=true 3000000000
+          """
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, String.trim(lp), database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+          head = InfluxElixir.Contract.Flux.head(ctx, m, "start: 0, stop: 100")
+
+          # `{table, host, value}` of each row of the field `field`
+          rows = fn field, tail ->
+            flux = head <> ~s| \|> filter(fn: (r) => r._field == "#{field}")| <> tail
+
+            case unquote(client).query_flux(ctx.conn, flux) do
+              {:ok, rows} -> Enum.map(rows, &{&1["table"], &1["h"], &1["_value"]})
+              error -> error
+            end
+          end
+
+          {:ok, m: m, head: head, rows: rows}
+        end
+
+        test "first, last and count take any type", ctx do
+          assert ctx.rows.("s", " |> first()") === [{0, "a", "x"}, {1, "b", "z"}]
+          assert ctx.rows.("s", " |> last()") === [{0, "a", "y"}, {1, "b", "z"}]
+          assert ctx.rows.("s", " |> count()") === [{0, "a", 2}, {1, "b", 1}]
+          assert ctx.rows.("b", " |> first()") === [{0, "a", true}, {1, "b", true}]
+          assert ctx.rows.("b", " |> last()") === [{0, "a", false}, {1, "b", true}]
+          assert ctx.rows.("b", " |> count()") === [{0, "a", 2}, {1, "b", 1}]
+          assert ctx.rows.("s", " |> limit(n: 9) |> count()") === [{0, "a", 2}, {1, "b", 1}]
+        end
+
+        test "sum and mean read by storage name the type", ctx do
+          for {field, type} <- [{"s", "string"}, {"b", "boolean"}], kind <- ["sum", "mean"] do
+            assert InfluxElixir.Contract.Flux.error_of(ctx.rows.(field, " |> #{kind}()")) ===
+                     {400, "unsupported input type for #{kind} aggregate: #{type}"}
+          end
+
+          # a string and a boolean field together: storage names the boolean
+          assert InfluxElixir.Contract.Flux.error_of(
+                   unquote(client).query_flux(ctx.conn, ctx.head <> " |> sum()")
+                 ) === {400, "unsupported input type for sum aggregate: boolean"}
+
+          # a series storage has dropped is not there to be refused
+          assert ctx.rows.("s", ~s| \|> filter(fn: (r) => r.h == "zzz") \|> sum()|) === []
+          assert ctx.rows.("s", ~s| \|> filter(fn: (r) => r.h == "zzz") \|> mean()|) === []
+          # and Flux takes no notice of a table with no row
+          assert ctx.rows.("s", ~s| \|> filter(fn: (r) => r.h < "a") \|> sum()|) === []
+
+          assert ctx.rows.("s", ~s| \|> limit(n: 9) \|> filter(fn: (r) => r.h < "a") \|> mean()|) ===
+                   []
+        end
+
+        @tag local_divergence: "Local refuses the errors whose form depends on the plan"
+        test "sum and mean in Flux, or of a series storage dropped the rows of, are refused",
+             ctx do
+          for {field, kind, tail} <- [
+                {"s", "sum", " |> limit(n: 9) |> sum()"},
+                {"b", "mean", " |> limit(n: 9) |> mean()"},
+                {"s", "sum", " |> first() |> sum()"},
+                {"s", "sum", ~s| \|> filter(fn: (r) => r._value == "q") \|> sum()|}
+              ] do
+            {status, message} = InfluxElixir.Contract.Flux.error_of(ctx.rows.(field, tail))
+            assert status === 400, tail
+
+            if fxd_local?(),
+              do:
+                assert(
+                  message ===
+                    "Client.Local: #{kind}() of a string or boolean field: the engine's error " <>
+                      "depends on the plan (and on which series storage has dropped)",
+                  tail
+                ),
+              else: assert(message =~ ~r/unsupported (input type|aggregate column type)/, tail)
+          end
+        end
+
+        @tag local_divergence:
+               "Local refuses what the engine answers by a panic or a positioned error"
+        @tag engine_bug: "min and max of a string or boolean field panic in storage (500)"
+        test "min and max of a string or boolean field are the engine's own bug (Local refuses it by name)",
+             ctx do
+          for {field, cursor} <- [{"s", "string"}, {"b", "boolean"}], kind <- ["min", "max"] do
+            result = ctx.rows.(field, " |> #{kind}()")
+
+            if fxd_local?() do
+              assert InfluxElixir.Contract.Flux.error_of(result) ===
+                       {400,
+                        "Client.Local: #{kind}() of a string or boolean field is an engine " <>
+                          "error whose form depends on the plan (a 500 \"panic: unsupported " <>
+                          "for aggregate #{kind}\" when storage reads it, a positioned 400 " <>
+                          "otherwise)"}
+            else
+              assert InfluxElixir.Contract.Flux.error_of(result) ===
+                       {500,
+                        "panic: unsupported for aggregate #{kind}: " <>
+                          "*reads.#{cursor}MultiShardArrayCursor"}
+            end
+          end
+
+          # Flux runs it when something stands between the read and the selector
+          {status, message} =
+            InfluxElixir.Contract.Flux.error_of(ctx.rows.("s", " |> limit(n: 9) |> max()"))
+
+          assert status === 400
+
+          if fxd_local?(),
+            do: assert(message =~ "Client.Local: max() of a string or boolean field"),
+            else: assert(message =~ "MaxSelector has no implementation for type string")
+        end
+      end
+    end
+  end
+
+  defp table_order_tests(client) do
+    quote location: :keep do
+      describe "query_flux/3 — the order of the tables" do
+        setup ctx do
+          m = InfluxElixir.IntegrationHelper.unique_name("contract_fxo")
+
+          lp = """
+          #{m},h=a x=1i,y=2i 1000000000
+          #{m},h=b x=3i,y=4i 1000000000
+          """
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, String.trim(lp), database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+          head = InfluxElixir.Contract.Flux.head(ctx, m, "start: 0, stop: 100")
+
+          tables = fn tail ->
+            {:ok, rows} = unquote(client).query_flux(ctx.conn, head <> tail)
+            Enum.map(rows, &{&1["table"], &1["_field"], &1["h"]})
+          end
+
+          {:ok, tables: tables}
+        end
+
+        test "storage reads series in tag then field order; Flux sorts what it aggregates by group key",
+             ctx do
+          series = [{0, "x", "a"}, {1, "y", "a"}, {2, "x", "b"}, {3, "y", "b"}]
+          grouped = [{0, "x", "a"}, {1, "x", "b"}, {2, "y", "a"}, {3, "y", "b"}]
+
+          assert ctx.tables.("") === series
+          assert ctx.tables.(" |> first()") === series
+          assert ctx.tables.(" |> count()") === series
+          assert ctx.tables.(" |> limit(n: 9)") === series
+          assert ctx.tables.(" |> limit(n: 9) |> first()") === grouped
+          assert ctx.tables.(" |> limit(n: 9) |> sum()") === grouped
+          assert ctx.tables.(" |> first() |> first()") === grouped
         end
       end
     end

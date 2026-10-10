@@ -8,6 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local.query_flux` answers as InfluxDB 2.7 does for filters on a key a row lacks, for
+  every `yield`, and for string and boolean fields** (design document
+  `2026-10-10_local-flux-pushdown-and-yields.md`; every rule below was read from 2.7.12):
+  - `filter(fn: (r) => r.nosuch != "a")` returns every row when it is pushed to storage (the
+    filters right after `range`, each pushed whole, split at their top-level `and`s: `==`/`!=`
+    of any key, `_value` against a literal, `and`/`or` of such), where a key the series lacks is
+    the empty string for `!=`; after `limit`, a selector, `yield`, or a filter that was not
+    pushed whole it is Flux, where it is null and keeps nothing. The old rule, "a key the row
+    lacks never matches", was true only for the second. Flux's `and`/`or` are no longer three-valued:
+    the left side decides (`null or false` is false, `null and x` is false). A literal of another
+    type than the key matches nothing in storage; in Flux it is an error, and so is a time
+    column in a comparison, so these are refused by name (`Client.Local: comparing the string
+    column h with a number ...`), as are ordering against a boolean, ordering `_value` against a
+    string and a `_value` comparison on an unsigned field.
+  - Every `yield` is a result of its own (its name in `"result"`, tables numbered from 0 in each),
+    and a last stage that is not a `yield` is `_result`: `yield(name: "a") |> sum()` returns the
+    rows before the sum as `a` and the sums as `_result`, where the double returned only the
+    sums. InfluxDB sends the results in no fixed order; the double in pipeline order. A name used
+    twice, or `_result` beside a last stage, is the engine's 400; a `yield` with no name is
+    refused by name. `range` must be the first stage, else the engine's "cannot submit unbounded
+    read".
+  - `min()` and `max()` of a string or boolean field returned rows; InfluxDB answers a 500
+    `panic: unsupported for aggregate max: *reads.stringMultiShardArrayCursor` (a positioned 400
+    after `limit`, a selector or a Flux filter), so they are refused by name. `sum()` and `mean()`
+    of one keep the engine's 400 `unsupported input type for sum aggregate: string` where storage
+    reads them (`boolean` when both kinds are there) and are refused by name where the engine's
+    error holds a position or depends on which series storage dropped. A selector or aggregate
+    that Flux runs emits its tables sorted by group key (`_field`, then the tags), where storage
+    reads the series order.
+  - The part `:pushdown` of the Flux contract (17 tests) runs on `Client.Local` and on 2.7.
 - **Two more raises on caller input**:
   - `InfluxElixir.ConnectionSupervisor.start_link/1` with a config that is not a keyword list
     holding an atom `:name` returns `{:error, {:invalid_options, config}}`.

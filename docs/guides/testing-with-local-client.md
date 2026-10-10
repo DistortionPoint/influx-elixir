@@ -587,8 +587,8 @@ The whole pipeline runs or is refused; a stage is never skipped (verified
 against InfluxDB 2.7). Supported stages: `range` (required, as on the
 engine; Unix seconds, RFC3339, `-1h`-style durations, `now()`; rows carry
 `_start` and `_stop`), `filter` (`r.key` / `r["key"]` with
-`== != < <= > >=`, `and`, `or`, `not`, parentheses; a key the row lacks
-never matches), `first`, `last`, `min`, `max` (the selected row per table),
+`== != < <= > >=`, `and`, `or`, `not`, parentheses; what a key the row lacks
+does is below), `first`, `last`, `min`, `max` (the selected row per table),
 `mean`, `sum`, `count` (one row per table, without `_time`), `limit(n:,
 offset:)` per table, and `yield(name:)`. Tables are numbered per series in
 measurement, tag, field order. Any other stage, such as `aggregateWindow`,
@@ -598,6 +598,49 @@ Flux function: pivot()`); so are arguments to `first`, `last`, `min`,
 or `range` time the double does not read, and a `yield` that is not
 `yield(name: "x")`. A missing bucket is the engine's 404. Against a real server, set `api_version: :v2` on the
 connection so writes go to `/api/v2/write`.
+
+**A key a row lacks.** It depends on where the engine runs the filter, and
+the double does the same (verified against InfluxDB 2.7):
+
+  * The filters right after `range` are pushed down to storage, one after
+    another, while each is pushed whole. A filter is split at its top-level
+    `and`s, and a conjunct of `==` (not `== ""`) or `!=`, of `_value` with any
+    comparison, or an `and`/`or` of such, is evaluated in storage. There a
+    missing key is the empty string: `r.nosuch != "a"` keeps **every** row (so
+    does `r.nosuch != "a" or r.host == "zzz"`), while `r.nosuch == "a"`,
+    `r.nosuch == ""` and `r.nosuch != ""` keep none. A literal of another
+    type than the key (`r.host != 1`) matches nothing.
+  * Whatever storage cannot take stays in Flux, where a missing key is null
+    and only true keeps a row: `not (...)`, `<`/`>` on a tag, a negative
+    number, `== ""`. `r.nosuch != "a" and r.host < "z"` still keeps every
+    row that has a `host` (the first conjunct is pushed down).
+  * A filter after any other stage (`limit`, `first`, `sum`, `yield`) or after
+    a filter that was not pushed whole is Flux: `limit(n: 10) |> filter(fn: (r)
+    => r.nosuch != "a")` is empty. In Flux `and` and `or` let the left side
+    decide: `null or false` is false (so `not (r.nosuch == "a" or r.host ==
+    "q")` keeps the row), `null and x` is false, `true and null` is null.
+  * Flux compares a column with a literal of another type as an error (a
+    positioned 400 that the double names instead: `Client.Local: comparing the
+    string column host with a number (!=) is an error on the engine`).
+
+**Results.** Every `yield` returns a result of its own, with its own table
+numbers, and a last stage that is not a `yield` is returned as `_result`:
+`|> yield(name: "raw") |> sum()` gives the rows before the sum with
+`"result" => "raw"` and the sums with `"result" => "_result"`. InfluxDB sends
+the results in no fixed order; the double sends them in pipeline order, so a
+test should group by `"result"`. A name used twice is the engine's 400, and a
+`yield` with an empty name is refused by name.
+
+**String and boolean fields.** `first`, `last` and `count` take any field.
+`sum()` and `mean()` of one are the engine's 400 `unsupported input type for
+sum aggregate: string` when they follow the pushed filters directly, and
+refused by name (`Client.Local: sum() of a string or boolean field ...`)
+where the engine's error holds a position or depends on which series storage
+dropped. `min()` and `max()` of one are a 500 `panic: unsupported for
+aggregate max: *reads.stringMultiShardArrayCursor` on InfluxDB 2.7, and
+refused by name in the double. After a `limit`, a `yield` or a selector the
+engine sorts what a selector or aggregate emits by group key (`_field`, then
+the tags), not in series order, and so does the double.
 
 ## Params
 

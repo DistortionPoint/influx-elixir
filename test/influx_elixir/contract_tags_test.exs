@@ -36,7 +36,7 @@ defmodule InfluxElixir.ContractTagsTest do
   @floors %{
     "client_contract" => 183,
     "client_contract/line_protocol.ex" => 15,
-    "contract/flux_contract.ex" => 27,
+    "contract/flux_contract.ex" => 44,
     "contract/influxql_flux_lp_contract.ex" => 88,
     "contract/sql_aggregates_contract.ex" => 26,
     "contract/sql_executor_contract.ex" => 130,
@@ -49,7 +49,7 @@ defmodule InfluxElixir.ContractTagsTest do
     "token_contract.ex" => 9
   }
 
-  @total_floor 727
+  @total_floor 744
 
   setup_all do
     files =
