@@ -21,7 +21,7 @@ defmodule InfluxElixir.Query.Flux do
 
   ## Options
 
-    * `:org` - organization name (required for v2)
+    * `:org` - organization name (InfluxDB 2); the connection's `:org` when omitted
   """
   @spec query(
           InfluxElixir.Client.connection(),

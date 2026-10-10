@@ -167,6 +167,7 @@ defmodule InfluxElixir.MixProject do
         "Public API": [InfluxElixir, InfluxElixir.Config, InfluxElixir.StreamError],
         Clients: [
           InfluxElixir.Client,
+          InfluxElixir.Client.HTTP,
           InfluxElixir.Client.Local,
           InfluxElixir.Client.QueryParams
         ],
@@ -197,6 +198,7 @@ defmodule InfluxElixir.MixProject do
           InfluxElixir.TestHelper
         ],
         "Arrow Flight": [
+          InfluxElixir.Flight.Client,
           InfluxElixir.Flight.Reader,
           InfluxElixir.Flight.FlatBuffer
         ]

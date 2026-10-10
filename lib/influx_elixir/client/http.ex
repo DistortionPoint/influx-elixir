@@ -231,9 +231,16 @@ defmodule InfluxElixir.Client.HTTP do
       InfluxElixir.Flight.Client.query(
         flight_conn,
         sql,
-        Keyword.take(opts, [:timeout, :connect_timeout, :tls])
+        flight_opts(opts, connection)
       )
     end
+  end
+
+  # The Flight call's options: the call's own `:timeout`, else the connection's, as for the
+  # HTTP request (`resolve_timeout/2`), with `:connect_timeout` and `:tls` as the call has them.
+  @spec flight_opts(keyword(), keyword()) :: keyword()
+  defp flight_opts(opts, connection) do
+    [{:timeout, resolve_timeout(opts, connection)} | Keyword.take(opts, [:connect_timeout, :tls])]
   end
 
   @spec reject_flight_params(keyword()) ::
@@ -292,7 +299,7 @@ defmodule InfluxElixir.Client.HTTP do
 
   @spec http_query_sql(keyword(), binary(), keyword()) :: InfluxElixir.Client.query_result()
   defp http_query_sql(connection, sql, opts) do
-    format = Keyword.get(opts, :format, :json)
+    format = Keyword.get(opts, :format) || :json
 
     with {:ok, database} <- resolve_database(opts, connection),
          {:ok, body} <- sql_request_body(database, sql, opts, format) do
@@ -315,10 +322,10 @@ defmodule InfluxElixir.Client.HTTP do
   def query_sql_stream(connection, sql, opts \\ []) do
     with :ok <- options(opts),
          {:ok, database} <- resolve_database(opts, connection),
-         {:ok, body} <- sql_request_body(database, sql, opts, "jsonl") do
+         {:ok, body} <- sql_request_body(database, sql, opts, "jsonl"),
+         {:ok, finch_name} <- resolve_finch(connection) do
       url = base_url(connection) <> "/api/v3/query_sql"
       headers = json_headers(connection)
-      finch_name = resolve_finch(connection)
       finch_opts = finch_opts(opts, connection)
 
       Stream.resource(
@@ -379,7 +386,7 @@ defmodule InfluxElixir.Client.HTTP do
         {:error, :no_database_specified} -> ""
       end
 
-    format = Keyword.get(opts, :format, :json)
+    format = Keyword.get(opts, :format) || :json
 
     body_map = %{"q" => influxql, "format" => to_string(format)}
 
@@ -816,21 +823,25 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: {:ok, Finch.Response.t()} | {:error, term()}
   defp do_request(method, url, headers, body, connection, opts) do
-    finch_name = resolve_finch(connection)
-    request = Finch.build(method, url, headers, body)
-    Finch.request(request, finch_name, finch_opts(opts, connection))
+    with {:ok, finch_name} <- resolve_finch(connection) do
+      request = Finch.build(method, url, headers, body)
+      Finch.request(request, finch_name, finch_opts(opts, connection))
+    end
   rescue
     # Finch does not return an error tuple when no connection can be checked
     # out within :pool_timeout — it converts NimblePool's exit into a
-    # RuntimeError. Map it back into the library's tagged-tuple contract.
-    error in RuntimeError -> {:error, classify_finch_error(error)}
+    # RuntimeError — nor when no pool of that name is running (`ArgumentError: unknown
+    # registry`). Map both back into the library's tagged-tuple contract.
+    error in [RuntimeError, ArgumentError] -> {:error, classify_finch_error(error)}
   end
 
   @pool_timeout_message "Finch was unable to provide a connection within the timeout"
 
-  @spec classify_finch_error(Exception.t()) :: :pool_timeout | Exception.t()
+  @spec classify_finch_error(Exception.t()) :: :pool_timeout | :no_pool | Exception.t()
   defp classify_finch_error(%RuntimeError{message: @pool_timeout_message <> _rest}),
     do: :pool_timeout
+
+  defp classify_finch_error(%ArgumentError{message: "unknown registry" <> _rest}), do: :no_pool
 
   defp classify_finch_error(error), do: error
 
@@ -867,15 +878,14 @@ defmodule InfluxElixir.Client.HTTP do
       @default_pool_timeout
   end
 
-  @spec resolve_finch(keyword()) :: atom()
+  # The pool of a connection: its `:finch_name`, else the pool the supervisor started for its
+  # `:name`. A keyword config with neither has no pool to name.
+  @spec resolve_finch(keyword()) :: {:ok, atom()} | {:error, :no_pool_name}
   defp resolve_finch(connection) do
-    case Keyword.get(connection, :finch_name) do
-      nil ->
-        name = Keyword.fetch!(connection, :name)
-        InfluxElixir.ConnectionSupervisor.finch_name(name)
-
-      finch_name ->
-        finch_name
+    case {Keyword.get(connection, :finch_name), Keyword.get(connection, :name)} do
+      {nil, nil} -> {:error, :no_pool_name}
+      {nil, name} -> {:ok, InfluxElixir.ConnectionSupervisor.finch_name(name)}
+      {finch_name, _name} -> {:ok, finch_name}
     end
   end
 
@@ -996,17 +1006,24 @@ defmodule InfluxElixir.Client.HTTP do
     # drops that connection without serving its queue (verified), so the
     # waiting request timed out.
     outcome =
-      Finch.stream_while(
-        request,
-        finch_name,
-        :streaming,
-        fn
-          {:status, status}, acc -> emit_and_wait(parent, consumer, ref, {:status, status}, acc)
-          {:data, data}, acc -> emit_and_wait(parent, consumer, ref, {:data, data}, acc)
-          {_headers_or_trailers, _value}, acc -> {:cont, acc}
-        end,
-        finch_opts
-      )
+      try do
+        Finch.stream_while(
+          request,
+          finch_name,
+          :streaming,
+          fn
+            {:status, status}, acc -> emit_and_wait(parent, consumer, ref, {:status, status}, acc)
+            {:data, data}, acc -> emit_and_wait(parent, consumer, ref, {:data, data}, acc)
+            {_headers_or_trailers, _value}, acc -> {:cont, acc}
+          end,
+          finch_opts
+        )
+      rescue
+        # No pool of that name, or none to check a connection out of: the consumer is told
+        # by name (as `do_request/6` tells a caller), not by a crashed process.
+        error in [RuntimeError, ArgumentError] ->
+          {:error, classify_finch_error(error), :streaming}
+      end
 
     # A consumer that cancelled, or died, is sent nothing more.
     case outcome do
@@ -1058,7 +1075,8 @@ defmodule InfluxElixir.Client.HTTP do
 
       # The producer crashed. A pool checkout timeout surfaces here because
       # Finch raises inside the producer; report it by name.
-      {:DOWN, ^monitor, :process, ^producer, {%RuntimeError{} = error, _stack}} ->
+      {:DOWN, ^monitor, :process, ^producer, {%error_module{} = error, _stack}}
+      when error_module in [RuntimeError, ArgumentError] ->
         raise InfluxElixir.StreamError, kind: :transport, reason: classify_finch_error(error)
 
       {:DOWN, ^monitor, :process, ^producer, reason} ->

@@ -80,7 +80,7 @@ setup do
 end
 ```
 
-See the [Testing with LocalClient](testing-with-local-client.html)
+See the [Testing with LocalClient](docs/guides/testing-with-local-client.md)
 guide for full setup instructions, shared case templates, and contract testing.
 
 ## Documentation

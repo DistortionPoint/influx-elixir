@@ -83,8 +83,10 @@ defmodule InfluxElixir do
   ## Parameters
 
     * `measurement` - measurement name
-    * `fields` - field key-value pairs
-    * `opts` - optional `:tags` and `:timestamp`
+    * `fields` - field key-value pairs (`nil` is none)
+    * `opts` - optional `:tags` (`nil` is none) and `:timestamp`
+
+  See `InfluxElixir.Write.Point.new/3`.
 
   ## Examples
 
@@ -92,7 +94,7 @@ defmodule InfluxElixir do
         tags: %{"host" => "server01"}
       )
   """
-  @spec point(String.t(), %{String.t() => Point.field_value()}, keyword()) ::
+  @spec point(String.t(), %{String.t() => Point.field_value()} | nil, keyword()) ::
           Point.t()
   def point(measurement, fields, opts \\ []) do
     Point.new(measurement, fields, opts)
@@ -134,19 +136,29 @@ defmodule InfluxElixir do
 
   # Wraps a query in a `[:influx_elixir, :query, ...]` span. The :stop event
   # carries `row_count` for list results and `result: :ok | :error`.
-  @spec query_span(InfluxElixir.Client.connection(), keyword(), (-> result)) :: result
+  @spec query_span(term(), keyword(), (-> result)) ::
+          result | {:error, {:invalid_connection, term()}}
         when result: term()
   defp query_span(connection, opts, fun) do
-    metadata = %{
-      database: option(opts, :database) || connection_database(connection),
-      transport: client()
-    }
+    if connection?(connection) do
+      metadata = %{
+        database: option(opts, :database) || connection_database(connection),
+        transport: client()
+      }
 
-    Telemetry.span_query(metadata, fun)
+      Telemetry.span_query(metadata, fun)
+    else
+      {:error, {:invalid_connection, connection}}
+    end
   end
 
+  # A connection is a keyword list (HTTP) or a map (Local); a host name, a number, a
+  # list of other things is the caller's error to name, not a raise from inside a span.
+  @spec connection?(term()) :: boolean()
+  defp connection?(connection), do: is_map(connection) or Keyword.keyword?(connection)
+
   # Keyword list (HTTP) or map (Local); Access handles both.
-  @spec connection_database(term()) :: binary() | nil
+  @spec connection_database(map() | keyword()) :: binary() | nil
   defp connection_database(connection), do: connection[:database]
 
   # Options that are not a keyword list are the client's error to name; the span reads none.
@@ -165,8 +177,9 @@ defmodule InfluxElixir do
   ## Common Options
 
     * `:database` — overrides the connection-level default database.
-    * `:timeout` — per-call receive timeout in milliseconds. Both the
-      HTTP and Flight transports honour this; default is `30_000` ms.
+    * `:timeout` — per-call timeout in milliseconds, else the connection's `:timeout`, else
+      `30_000`. Over HTTP it is Finch's receive timeout; over Flight it is a wall-clock
+      bound on the call and the streaming of the whole result (`{:error, :timeout}` past it).
     * `:pool_timeout` — per-call Finch pool checkout timeout in milliseconds
       (HTTP transport; default `5_000`). Applies before `:timeout`.
     * `:params` — map of `$name => value` placeholder substitutions
@@ -174,6 +187,16 @@ defmodule InfluxElixir do
     * `:transport` — `:http` (default) or `:flight` (Arrow Flight gRPC).
     * `:flight_port` — gRPC port for `:flight`; falls back to the connection's
       `:flight_port`, then `443`. Pass `tls: false` for plaintext ports.
+
+  ## Errors
+
+  A connection that is neither a keyword list nor a map is
+  `{:error, {:invalid_connection, connection}}`. A refused query is
+  `{:error, %{status: http_status, body: message}}` on both transports: Flight's gRPC
+  status is turned into the nearest HTTP one (see `InfluxElixir.Flight.Client.query/3`), but
+  the two do not always agree on the status (a schema error is 500 over HTTP and 400 over
+  Flight; a missing database is 404 and 500) and Flight's message keeps the engine's
+  prefix (`Error while logically planning query: ...`).
   """
   @spec query_sql(
           InfluxElixir.Client.connection(),

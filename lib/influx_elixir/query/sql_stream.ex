@@ -40,6 +40,10 @@ defmodule InfluxElixir.Query.SQLStream do
 
     * `:params` - parameter map for `$param` substitution
     * `:database` - override the default database
+    * `:timeout` - milliseconds to wait for each chunk of the response (the
+      connection's `:timeout` when omitted)
+    * `:pool_timeout` - milliseconds to wait for a connection from the pool (the
+      connection's `:pool_timeout` when omitted)
   """
   @spec stream(
           InfluxElixir.Client.connection(),

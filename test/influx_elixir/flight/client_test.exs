@@ -139,7 +139,8 @@ defmodule InfluxElixir.Flight.ClientTest do
   end
 
   # ---------------------------------------------------------------------------
-  # resolve_connect_timeout/1 precedence
+  # resolve_connect_timeout/1 precedence. Read from the function: through `query/3` the
+  # timeout chosen shows only as how long a connect that never answers takes to fail.
   # ---------------------------------------------------------------------------
 
   describe "resolve_connect_timeout/1" do

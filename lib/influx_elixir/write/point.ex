@@ -30,10 +30,13 @@ defmodule InfluxElixir.Write.Point do
   ## Parameters
 
     * `measurement` - measurement name (string)
-    * `fields` - field key-value pairs (map)
+    * `fields` - field key-value pairs (map); `nil` is no fields, `%{}`
     * `opts` - optional keyword list:
-      * `:tags` - tag key-value pairs (default: `%{}`)
+      * `:tags` - tag key-value pairs (default: `%{}`; `nil` is `%{}`)
       * `:timestamp` - point timestamp (default: `nil`)
+
+  A point with no fields is built, and `InfluxElixir.Write.LineProtocol.encode/2` refuses it
+  with `:empty_fields`, as it refuses every point no server accepts.
 
   ## Examples
 
@@ -44,6 +47,9 @@ defmodule InfluxElixir.Write.Point do
         tags: %{},
         timestamp: nil
       }
+
+      iex> InfluxElixir.Write.Point.new("cpu", nil, tags: nil)
+      %InfluxElixir.Write.Point{measurement: "cpu", fields: %{}, tags: %{}, timestamp: nil}
 
       iex> InfluxElixir.Write.Point.new("cpu", %{"value" => 0.64},
       ...>   tags: %{"host" => "server01"},
@@ -56,12 +62,12 @@ defmodule InfluxElixir.Write.Point do
         timestamp: 1_630_424_257_000_000_000
       }
   """
-  @spec new(String.t(), %{String.t() => field_value()}, keyword()) :: t()
+  @spec new(String.t(), %{String.t() => field_value()} | nil, keyword()) :: t()
   def new(measurement, fields, opts \\ []) do
     %__MODULE__{
       measurement: measurement,
-      fields: fields,
-      tags: Keyword.get(opts, :tags, %{}),
+      fields: fields || %{},
+      tags: Keyword.get(opts, :tags) || %{},
       timestamp: Keyword.get(opts, :timestamp)
     }
   end

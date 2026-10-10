@@ -384,7 +384,7 @@ defmodule InfluxElixir.Write.BatchWriter do
     max_buffer = state.batch_size * @backpressure_multiplier
 
     with false <- state.buffer_size >= max_buffer,
-         {:ok, line} <- encode_payload(payload, state.write_opts) do
+         {:ok, line} <- encode_payload(payload, state) do
       {:reply, :ok, state |> append_to_buffer(line) |> maybe_flush_on_batch()}
     else
       true -> {:reply, {:error, :buffer_full}, state}
@@ -397,7 +397,7 @@ defmodule InfluxElixir.Write.BatchWriter do
     max_buffer = state.batch_size * @backpressure_multiplier
 
     with false <- state.buffer_size >= max_buffer,
-         {:ok, line} <- encode_payload(payload, state.write_opts) do
+         {:ok, line} <- encode_payload(payload, state) do
       if state.no_sync,
         do: {:reply, :ok, state |> append_to_buffer(line) |> maybe_flush_on_batch()},
         else: {:noreply, do_flush(append_to_buffer(%{state | pending_sync: from}, line))}
@@ -513,12 +513,20 @@ defmodule InfluxElixir.Write.BatchWriter do
   # `LineProtocol.encode/2`), never a crash that loses every other caller's
   # buffered lines. It is encoded here, where the flushes' `:precision` is
   # known: a `DateTime` timestamp is written in that unit.
-  @spec encode_payload(InfluxElixir.Write.Point.t() | binary(), keyword()) ::
+  @spec encode_payload(InfluxElixir.Write.Point.t() | binary(), t()) ::
           {:ok, binary()} | {:error, term()}
-  defp encode_payload(payload, _write_opts) when is_binary(payload), do: {:ok, payload}
+  defp encode_payload(payload, _state) when is_binary(payload), do: {:ok, payload}
 
-  defp encode_payload(%InfluxElixir.Write.Point{} = point, write_opts),
-    do: InfluxElixir.Write.LineProtocol.encode(point, Keyword.take(write_opts, [:precision]))
+  # The connection's server decides the escaping of a backslash (InfluxDB 2 and 3 read it
+  # differently).
+  defp encode_payload(%InfluxElixir.Write.Point{} = point, state) do
+    opts =
+      state.write_opts
+      |> Keyword.take([:precision])
+      |> Keyword.put(:api_version, InfluxElixir.Connection.api_version(state.connection))
+
+    InfluxElixir.Write.LineProtocol.encode(point, opts)
+  end
 
   @spec append_to_buffer(t(), binary()) :: t()
   defp append_to_buffer(%__MODULE__{} = state, line) do

@@ -22,7 +22,8 @@ defmodule InfluxElixir.Flight.ReaderFixturesTest do
   end
 
   @names ~w(mixed_flat struct_selectors struct_literal list_strings list_floats list_literal
-            duration duration_forms utf8_view date decimal binary)
+            duration duration_forms utf8_view date decimal binary unsigned_ints unsigned_casts
+            float16 float32 float_lists dates)
 
   # One byte changed, the frame cut short, a length made huge, or zeros put in: a corrupt
   # frame (a metadata length, a row count, a list offset) is an answer, never a raise, a
@@ -94,15 +95,10 @@ defmodule InfluxElixir.Flight.ReaderFixturesTest do
              Reader.decode_flight_data(frames)
   end
 
-  test "durations render as HTTP renders them" do
-    for {ns, text} <- [
-          {0, "P0D"},
-          {60_000_000_000, "PT60S"},
-          {500_000_000, "PT0.5S"},
-          {-1, "-PT0.000000001S"},
-          {7_199_750_000_000, "PT7199.75S"}
-        ] do
-      assert Reader.render_duration(ns) === text
-    end
+  # The `duration` and `duration_forms` fixtures pin, through `decode_flight_data/1`, every
+  # rendering HTTP gives them (`PT60S`, `PT0.5S`, `-PT0.000000001S`, `PT7199.75S`); a zero
+  # duration is in none of them, so its rendering is read from the function that writes it.
+  test "a zero duration renders as HTTP renders it" do
+    assert Reader.render_duration(0) === "P0D"
   end
 end

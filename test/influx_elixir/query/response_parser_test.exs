@@ -121,9 +121,12 @@ defmodule InfluxElixir.Query.ResponseParserTest do
   describe "parse/2 with a body that is not CSV" do
     # A proxy's error page or a body cut off inside a quoted cell.
     test "is an error for both CSV formats, not a crash" do
-      for format <- [:csv, :flux_csv], body <- [~s("a\nb), ~s({"a":1}\n{)] do
-        assert {:error, {:csv_parse_error, message}} = ResponseParser.parse(body, format)
-        assert is_binary(message)
+      for format <- [:csv, :flux_csv],
+          {body, message} <- [
+            {~s("a\nb), ~s(expected escape character " but reached the end of file)},
+            {~s({"a":1}\n{), ~s(unexpected escape character " in "{\\"a\\":1}\\n")}
+          ] do
+        assert ResponseParser.parse(body, format) === {:error, {:csv_parse_error, message}}
       end
     end
   end

@@ -8,6 +8,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Documentation**:
+  - `Query.Flux` documents that `:org` defaults to the connection's.
+  - `Query.SQLStream` documents `:timeout` and `:pool_timeout`.
+  - `ConnectionSupervisor` no longer speaks of several writers per connection.
+  - The README's link to the testing guide works on GitHub.
+  - `Client.HTTP` and `Flight.Client` are listed in HexDocs' module groups.
+- **Review of 71e2b8c: Flight types, line-protocol escapes, Flight timeouts, raises** (design
+  document `2026-10-10_review-of-71e2b8c.md`; each verified against InfluxDB 3 Core 3.10.1 and
+  InfluxDB 2.7.12):
+  - Flight read every unsigned integer as signed (`UInt8` 200 was -56, `UInt64` 2^64-1 was -1):
+    FlatBuffers leave out a field that holds its default, and `Int.is_signed` defaults to
+    false. A `Float16` column was read as a double and dropped from the row; it is now read
+    (subnormals too), and a Float16 or Float32 is the shortest decimal that reads back, as HTTP
+    prints it (`0.1`, not `0.10000000149011612`). An infinity or a NaN is `nil` in the row (a
+    present key), as HTTP's `null`; a `Date64` is a `DateTime`, as over HTTP. Six fixtures were
+    captured from Core (`unsigned_ints`, `unsigned_casts`, `float16`, `float32`, `float_lists`,
+    `dates`).
+  - `LineProtocol.encode/2` takes `api_version: :v3 | :v2` (default `:v3`). InfluxDB 2.7 never
+    turns `\\` into one backslash in a name, so a tag value `a\b` written for v3 was stored there as
+    `a\\b`; with `:v2` a name's backslash is left as it is, and the characters 2.7 undoes are
+    escaped per position. 2.7 cannot keep a measurement with a backslash before a comma, space,
+    `=` or `"`, nor a field key with one before a comma, space or `=` (a `204` and no query returns
+    the points, or a parse error): `:v2` refuses them as `{:invalid_measurement, name}` and
+    `{:invalid_field_key, key}`. `BatchWriter` encodes a `Point` for its connection's
+    `api_version`. New `Connection.api_version/1`.
+  - `LineProtocol.encode/2` never raises: a term that is not a `Point`, or a list that is not
+    proper, is `{:error, {:invalid_point, term}}`, bad options are `{:error, {:invalid_options,
+    opts}}`; a point with `nil` tags has none, with `nil` fields is `:empty_fields`, and with
+    tags or fields that are not maps is an invalid point. `Point.new/3` takes `nil` fields and
+    `nil` tags as empty.
+  - Flight `:timeout` is a wall-clock bound on the call and its whole stream, run in a monitored
+    process: a peer that accepts and stays silent is `{:error, :timeout}` (it held the caller for
+    5 s, or 60 s until the peer closed). The connection's `:timeout` reaches the Flight transport
+    through `Client.HTTP.query_sql/3`. A failed Flight query is `{:error, %{status: http_status,
+    body: message}}` as over HTTP (gRPC 3 is 400; the statuses 3 and 13 checked on Core, the rest
+    the standard mapping; the differences are documented on `InfluxElixir.query_sql/3`). An empty
+    token sends no `authorization` metadata, and the ticket is encoded once.
+  - `Client.HTTP`: a Finch pool that is not running is `{:error, {:connection_error, :no_pool}}`
+    (it raised `ArgumentError: unknown registry`; a streaming query raises the `StreamError` with
+    that reason when enumerated), and a keyword connection with neither `:finch_name` nor `:name` is
+    `{:error, {:connection_error, :no_pool_name}}` (it raised `KeyError`). A query parameter Jason
+    cannot write (an improper list, a tuple map key) is `{:invalid_param, name, :unsupported_type}`.
+    `InfluxElixir.query_sql/3`, `execute_sql/3`, `query_influxql/3` and `query_flux/3` with a
+    connection that is neither a keyword list nor a map are `{:error, {:invalid_connection, term}}`
+    (they raised in the telemetry span). `format: nil` is the default format on both query
+    languages (InfluxQL sent `"format": ""` and got a 400; SQL sent none and failed to parse the
+    answer).
+  - `Client.Local` (`:v2`): undoing a backslash that precedes no escaped character copied the rest
+    of the text each time (200,000 of them took 1.0 s on a tag value, now 40 ms).
 - **`Client.Local` SQL and InfluxQL: fifth review of the differential fuzz** (design document
   `2026-10-09_sql-influxql-fuzz-fifth-review.md`; 20,688 statements compared with Core, none that
   matched before differs now):

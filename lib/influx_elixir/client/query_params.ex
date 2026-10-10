@@ -102,6 +102,11 @@ defmodule InfluxElixir.Client.QueryParams do
       {:ok, _json} -> {:ok, value}
       {:error, _exception} -> {:error, {:invalid_param, name, :unsupported_type}}
     end
+  rescue
+    # Jason raises instead of returning an error for an improper list and for a map key it
+    # cannot write (a tuple).
+    _error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError, ArgumentError] ->
+      {:error, {:invalid_param, name, :unsupported_type}}
   end
 
   @doc """

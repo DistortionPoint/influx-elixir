@@ -12,9 +12,9 @@ defmodule InfluxElixir.ConnectionSupervisor do
   `InfluxElixir.Connection` so it can be resolved by name
   from any process via `Connection.fetch!/1` or the facade.
 
-  If a Finch pool crashes, all BatchWriters under that connection
-  restart (they depend on the pool). A single BatchWriter crash
-  does NOT take down the pool or sibling writers.
+  If the Finch pool crashes, the connection's BatchWriter (at most one)
+  restarts with it, since it depends on the pool. A BatchWriter crash
+  does NOT take down the pool.
 
   Children stop in reverse start order, so on shutdown the BatchWriter
   writes its buffer while the Finch pool is still up.

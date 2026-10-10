@@ -18,10 +18,27 @@ defmodule InfluxElixir.Write.LineProtocol do
 
   ## Escaping Rules
 
+  The two servers read a backslash differently (verified against InfluxDB 3 Core 3.10.1
+  and InfluxDB 2.7.12), so the escapes depend on the `:api_version` option.
+
+  `api_version: :v3` (the default), InfluxDB 3 reads `\\\\` as one backslash everywhere:
+
   - Measurement names: spaces, commas, backslashes
   - Tag keys/values: spaces, commas, equals, backslashes
   - Field keys: spaces, commas, equals, backslashes
   - Field string values: double-quotes, backslashes
+
+  `api_version: :v2`, InfluxDB 2 never turns `\\\\` into one backslash in a name (it is
+  stored as two); a backslash is kept as it is unless it stands before a character the
+  name escapes, so a name's backslashes are not escaped:
+
+  - Measurement names: spaces, commas, equals, double-quotes
+  - Tag keys/values: spaces, commas, equals
+  - Field keys: spaces, commas, equals, double-quotes
+  - Field string values: double-quotes, backslashes (as on v3)
+
+  Encoded for the wrong server a name with a backslash is stored with different
+  text: `a\\b` as a tag value written for v3 is stored on InfluxDB 2 as `a\\\\b`.
 
   ## Validation
 
@@ -45,6 +62,14 @@ defmodule InfluxElixir.Write.LineProtocol do
   | Field value not an integer, float, string or boolean, or an integer outside 64 bits | `{:invalid_field_value, key, value}` |
   | Timestamp not a `DateTime`, integer or `nil` | `{:invalid_timestamp, value}` |
 
+  With `api_version: :v2` two more names are refused, because InfluxDB 2.7 cannot keep them
+  (verified: a write is answered `204` and no query returns the points, or it is a parse
+  error): a measurement with a backslash before a comma, a space, `=` or `"` is
+  `{:invalid_measurement, name}`, and a field key with a backslash before a comma, a space or
+  `=` is `{:invalid_field_key, key}`. Every other name, a tag with any backslash among them,
+  is stored as written (round trips of 25 strings in 5 positions, on 2.7 and on
+  `Client.Local`'s `:v2` profile).
+
   A measurement, tag key, tag value or field key that ends in a backslash
   is refused with the same error as the other problems with that name:
   both versions reject the line even though the backslash is escaped. A
@@ -67,9 +92,16 @@ defmodule InfluxElixir.Write.LineProtocol do
   Encodes a Point or list of Points into InfluxDB line protocol binary.
 
   Returns `{:ok, binary}` on success or `{:error, reason}` on failure; see
-  "Validation" in the moduledoc for the reasons.
+  "Validation" in the moduledoc for the reasons. It never raises on what it is given:
+  a term that is not a `Point` (or a list of them, proper) is
+  `{:error, {:invalid_point, term}}`, options that are not a keyword list or hold an
+  `:api_version` or `:precision` of the wrong kind are `{:error, {:invalid_options, opts}}`.
+  A point with `nil` tags has none; one with `nil` fields has `:empty_fields`.
 
   ## Options
+
+    * `:api_version` - `:v3` (the default) or `:v2`: whose escaping rules to write (see
+      "Escaping Rules"). `Writer` and `BatchWriter` pass the connection's.
 
     * `:precision` - the unit of the write the line is for (`:second`,
       `:millisecond`, `:microsecond`, `:nanosecond`, or the short spellings
@@ -100,32 +132,36 @@ defmodule InfluxElixir.Write.LineProtocol do
       {:error, {:invalid_tag_value, "host", ""}}
   """
   @spec encode(Point.t() | [Point.t()], keyword()) :: encode_result()
-  def encode(point_or_points, opts \\ [])
-
-  def encode(%Point{} = point, opts) do
-    with {:ok, line} <- encode_point(point, timestamp_divisor(opts)) do
-      {:ok, IO.iodata_to_binary(line)}
+  def encode(point_or_points, opts \\ []) do
+    with {:ok, context} <- read_options(opts) do
+      encode_all(point_or_points, context)
     end
   end
 
-  def encode(points, opts) when is_list(points) do
-    divisor = timestamp_divisor(opts)
+  @spec encode_all(term(), map()) :: encode_result()
+  defp encode_all(%Point{} = point, context) do
+    with {:ok, line} <- encode_point(point, context), do: {:ok, IO.iodata_to_binary(line)}
+  end
 
-    points
-    |> Enum.reduce_while({:ok, []}, fn point, {:ok, acc} ->
-      case encode_point(point, divisor) do
-        {:ok, line} -> {:cont, {:ok, [line | acc]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, lines} ->
-        {:ok, lines |> Enum.reverse() |> Enum.intersperse(?\n) |> IO.iodata_to_binary()}
-
-      {:error, reason} ->
-        {:error, reason}
+  defp encode_all(points, context) when is_list(points) do
+    with {:ok, lines} <- encode_list(points, context, []) do
+      {:ok, lines |> Enum.reverse() |> Enum.intersperse(?\n) |> IO.iodata_to_binary()}
     end
   end
+
+  defp encode_all(other, _context), do: {:error, {:invalid_point, other}}
+
+  # Newest line first. A list that does not end in `[]` names its tail as the invalid point.
+  @spec encode_list(term(), map(), [iodata()]) :: {:ok, [iodata()]} | {:error, term()}
+  defp encode_list([], _context, acc), do: {:ok, acc}
+
+  defp encode_list([%Point{} = point | rest], context, acc) do
+    with {:ok, line} <- encode_point(point, context),
+         do: encode_list(rest, context, [line | acc])
+  end
+
+  defp encode_list([other | _rest], _context, _acc), do: {:error, {:invalid_point, other}}
+  defp encode_list(improper_tail, _context, _acc), do: {:error, {:invalid_point, improper_tail}}
 
   @doc """
   Encodes a Point or list of Points into InfluxDB line protocol binary.
@@ -150,12 +186,48 @@ defmodule InfluxElixir.Write.LineProtocol do
   # Private helpers
   # ---------------------------------------------------------------------------
 
+  # The kind of escaping each name gets, by dialect (see `@escapes`).
+  #
+  # InfluxDB 2 cannot keep some names whose backslash stands before a character it escapes
+  # (verified on 2.7.12): a measurement with `\\,`, `\\ `, `\\=` or `\\"` is stored but no
+  # query returns its points, and a field key with `\\,`, `\\ ` or `\\=` is a parse error. They
+  # are listed in `:refuses`, per name, and refused rather than written.
+  @kinds %{
+    v3: %{
+      measurement: :measurement,
+      tag: :name,
+      field_key: :name,
+      measurement_refuses: [],
+      field_key_refuses: []
+    },
+    v2: %{
+      measurement: :measurement_v2,
+      tag: :tag_v2,
+      field_key: :field_key_v2,
+      measurement_refuses: ["\\,", "\\ ", "\\=", "\\\""],
+      field_key_refuses: ["\\,", "\\ ", "\\="]
+    }
+  }
+
+  # What an encode needs from its options, or the options as the error: a list that is not a
+  # keyword list, an `:api_version` that is not `:v3` or `:v2`, a `:precision` that is not an
+  # atom or a string.
+  @spec read_options(term()) :: {:ok, map()} | {:error, {:invalid_options, term()}}
+  defp read_options(opts) do
+    api_version = if Keyword.keyword?(opts), do: Keyword.get(opts, :api_version, :v3)
+    precision = if Keyword.keyword?(opts), do: Keyword.get(opts, :precision)
+
+    if api_version in [:v3, :v2] and (is_atom(precision) or is_binary(precision)),
+      do: {:ok, %{divisor: timestamp_divisor(precision), kinds: @kinds[api_version]}},
+      else: {:error, {:invalid_options, opts}}
+  end
+
   # Nanoseconds per unit of the write's precision; a `DateTime` is divided
   # by it. An unknown spelling is left to the server to refuse, with the
   # timestamp in nanoseconds.
-  @spec timestamp_divisor(keyword()) :: pos_integer()
-  defp timestamp_divisor(opts) do
-    case opts |> Keyword.get(:precision) |> to_string() do
+  @spec timestamp_divisor(atom() | binary()) :: pos_integer()
+  defp timestamp_divisor(precision) do
+    case to_string(precision) do
       unit when unit in ~w(second s) -> 1_000_000_000
       unit when unit in ~w(millisecond ms) -> 1_000_000
       unit when unit in ~w(microsecond us u) -> 1_000
@@ -163,20 +235,29 @@ defmodule InfluxElixir.Write.LineProtocol do
     end
   end
 
-  @spec encode_point(Point.t(), pos_integer()) :: {:ok, iodata()} | {:error, term()}
+  # A point whose fields or tags are not maps (`nil` tags are none) is not a point.
+  @spec encode_point(Point.t(), map()) :: {:ok, iodata()} | {:error, term()}
+  defp encode_point(%Point{tags: nil} = point, context),
+    do: encode_point(%Point{point | tags: %{}}, context)
+
+  defp encode_point(%Point{fields: nil}, _context), do: {:error, :empty_fields}
+
   defp encode_point(
          %Point{measurement: measurement, tags: tags, fields: fields, timestamp: ts},
-         divisor
-       ) do
+         %{divisor: divisor, kinds: kinds}
+       )
+       when is_map(tags) and not is_struct(tags) and is_map(fields) and not is_struct(fields) do
     with :ok <- validate_fields(fields),
-         {:ok, measurement_str} <- encode_measurement(measurement),
-         {:ok, tags_str} <- encode_tags(tags),
-         {:ok, fields_str} <- encode_fields(fields),
+         {:ok, measurement_str} <- encode_measurement(measurement, kinds),
+         {:ok, tags_str} <- encode_tags(tags, kinds),
+         {:ok, fields_str} <- encode_fields(fields, kinds),
          {:ok, timestamp_str} <- encode_timestamp(ts, divisor) do
       # iodata: the caller makes one binary of the line (or the batch).
       {:ok, [measurement_str, tags_str, ?\s, fields_str | timestamp_str]}
     end
   end
+
+  defp encode_point(%Point{} = point, _context), do: {:error, {:invalid_point, point}}
 
   @spec validate_fields(%{String.t() => Point.field_value()}) :: :ok | {:error, term()}
   defp validate_fields(fields) when map_size(fields) == 0,
@@ -187,32 +268,36 @@ defmodule InfluxElixir.Write.LineProtocol do
   # A name that can stand outside quotes: a non-empty string with no
   # newline (there is no escape for one, so it would end the line) that
   # does not end in a backslash (both versions refuse it, escaped or not).
-  @spec name?(term()) :: boolean()
-  defp name?(value) when is_binary(value) and value != "",
-    do: not String.contains?(value, "\n") and not String.ends_with?(value, "\\")
+  @spec name?(term(), [binary()]) :: boolean()
+  defp name?(value, refuses \\ [])
 
-  defp name?(_value), do: false
+  defp name?(value, refuses) when is_binary(value) and value != "",
+    do:
+      not String.contains?(value, "\n") and not String.ends_with?(value, "\\") and
+        (refuses == [] or :binary.match(value, refuses) == :nomatch)
 
-  @spec encode_measurement(term()) :: {:ok, binary()} | {:error, term()}
-  defp encode_measurement(""), do: {:error, :empty_measurement}
+  defp name?(_value, _refuses), do: false
 
-  defp encode_measurement(name) do
-    if name?(name) and not String.starts_with?(name, "#") do
-      {:ok, escape(name, :measurement)}
+  @spec encode_measurement(term(), map()) :: {:ok, binary()} | {:error, term()}
+  defp encode_measurement("", _kinds), do: {:error, :empty_measurement}
+
+  defp encode_measurement(name, kinds) do
+    if name?(name, kinds.measurement_refuses) and not String.starts_with?(name, "#") do
+      {:ok, escape(name, kinds.measurement)}
     else
       {:error, {:invalid_measurement, name}}
     end
   end
 
   # `,k=v` for each tag, sorted by key, or `[]` without tags.
-  @spec encode_tags(%{String.t() => String.t()}) :: {:ok, iodata()} | {:error, term()}
-  defp encode_tags(tags) when map_size(tags) == 0, do: {:ok, []}
+  @spec encode_tags(%{String.t() => String.t()}, map()) :: {:ok, iodata()} | {:error, term()}
+  defp encode_tags(tags, _kinds) when map_size(tags) == 0, do: {:ok, []}
 
-  defp encode_tags(tags) do
+  defp encode_tags(tags, kinds) do
     tags
     |> Enum.sort_by(fn {k, _v} -> k end)
     |> Enum.reduce_while({:ok, []}, fn {k, v}, {:ok, acc} ->
-      case encode_tag(k, v) do
+      case encode_tag(k, v, kinds) do
         {:ok, pair} -> {:cont, {:ok, [pair | acc]}}
         {:error, _reason} = error -> {:halt, error}
       end
@@ -223,23 +308,23 @@ defmodule InfluxElixir.Write.LineProtocol do
     end
   end
 
-  @spec encode_tag(term(), term()) :: {:ok, iodata()} | {:error, term()}
-  defp encode_tag("time", _value), do: {:error, {:reserved_tag_key, "time"}}
+  @spec encode_tag(term(), term(), map()) :: {:ok, iodata()} | {:error, term()}
+  defp encode_tag("time", _value, _kinds), do: {:error, {:reserved_tag_key, "time"}}
 
-  defp encode_tag(key, value) do
+  defp encode_tag(key, value, kinds) do
     cond do
       not name?(key) -> {:error, {:invalid_tag_key, key}}
       not name?(value) -> {:error, {:invalid_tag_value, key, value}}
-      true -> {:ok, [?,, escape(key, :name), ?=, escape(value, :name)]}
+      true -> {:ok, [?,, escape(key, kinds.tag), ?=, escape(value, kinds.tag)]}
     end
   end
 
-  @spec encode_fields(%{String.t() => Point.field_value()}) ::
+  @spec encode_fields(%{String.t() => Point.field_value()}, map()) ::
           {:ok, iodata()} | {:error, term()}
-  defp encode_fields(fields) do
+  defp encode_fields(fields, kinds) do
     fields
     |> Enum.reduce_while({:ok, []}, fn {k, v}, {:ok, acc} ->
-      case encode_field(k, v) do
+      case encode_field(k, v, kinds) do
         {:ok, pair} -> {:cont, {:ok, [pair | acc]}}
         {:error, _reason} = error -> {:halt, error}
       end
@@ -250,12 +335,12 @@ defmodule InfluxElixir.Write.LineProtocol do
     end
   end
 
-  @spec encode_field(term(), term()) :: {:ok, iodata()} | {:error, term()}
-  defp encode_field(key, value) do
+  @spec encode_field(term(), term(), map()) :: {:ok, iodata()} | {:error, term()}
+  defp encode_field(key, value, kinds) do
     cond do
-      not name?(key) -> {:error, {:invalid_field_key, key}}
+      not name?(key, kinds.field_key_refuses) -> {:error, {:invalid_field_key, key}}
       not field_value?(value) -> {:error, {:invalid_field_value, key, value}}
-      true -> {:ok, [escape(key, :name), ?=, encode_field_value(value)]}
+      true -> {:ok, [escape(key, kinds.field_key), ?=, encode_field_value(value)]}
     end
   end
 
@@ -291,9 +376,17 @@ defmodule InfluxElixir.Write.LineProtocol do
   # The bytes each kind of text backslash-escapes: tag keys, tag values and
   # field keys (`:name`), measurements, and string field values. All ASCII,
   # so no byte of a multi-byte UTF-8 character can match.
-  @escapes [name: ~c"\\,= ", measurement: ~c"\\, ", string: ~c"\\\""]
+  @escapes [
+    name: ~c"\\,= ",
+    measurement: ~c"\\, ",
+    string: ~c"\\\"",
+    tag_v2: ~c",= ",
+    measurement_v2: ~c", ",
+    field_key_v2: ~c",=\" "
+  ]
 
-  @typep escape_kind :: :name | :measurement | :string
+  @typep escape_kind ::
+           :name | :measurement | :string | :tag_v2 | :measurement_v2 | :field_key_v2
 
   # Most text needs no escape: one byte scan returns it as it is.
   @spec escape(binary(), escape_kind()) :: binary()

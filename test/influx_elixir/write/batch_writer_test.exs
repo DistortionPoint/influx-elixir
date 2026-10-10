@@ -193,6 +193,8 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     end
   end
 
+  # The delay is a pure function of the attempt, the jitter and the base: read from it, it is
+  # pinned exactly, where a retry run through the writer would wait on its timers.
   describe "backoff_delay/3" do
     test "base_retry_delay_ms controls the backoff scale" do
       # base=100, attempt=1, no jitter → 100 * 2 = 200

@@ -82,8 +82,13 @@ lib/influx_elixir/
 │       ├── sql/                        # SQL lexer, parser, planner, executor, query path
 │       ├── store/                      # ETS store, database rules, bucket derivations
 │       └── write/                      # write path and request-body (gzip/UTF-8) reading
-├── connection.ex                       # Named connection manager
-├── config.ex                           # Connection configuration
+├── application.ex                      # Starts InfluxElixir.Supervisor (configured connections only)
+├── supervisor.ex                       # One ConnectionSupervisor per configured connection
+├── connection_supervisor.ex            # A connection's Finch pool and optional BatchWriter
+├── connection.ex                       # Named connection registry (persistent_term)
+├── config.ex                           # Connection configuration (NimbleOptions)
+├── stream_error.ex                     # The error a lazy query stream raises when enumerated
+├── test_helper.ex                      # Helpers for consumers' own test suites
 ├── write/
 │   ├── line_protocol.ex                # Line protocol encoder
 │   ├── point.ex                        # Point struct
@@ -99,7 +104,13 @@ lib/influx_elixir/
 │   ├── databases.ex                    # v3 database CRUD
 │   ├── buckets.ex                      # v2 bucket CRUD (compat)
 │   ├── tokens.ex                       # v3 token management
+│   ├── token_request.ex                # Token request bodies, shared by both clients
 │   └── health.ex                       # Health/ping checks
+├── flight/
+│   ├── client.ex                       # Arrow Flight DoGet over gRPC (`transport: :flight`)
+│   ├── reader.ex                       # Arrow IPC record batches to rows
+│   ├── flat_buffer.ex                  # FlatBuffer reading for the Arrow schema and batches
+│   └── proto.ex, proto/                # Flight protobuf messages and the gRPC stub
 └── telemetry.ex                        # Telemetry event emission
 ```
 
@@ -109,7 +120,7 @@ keep every other Local module `@moduledoc false` (HexDocs lists only the modules
 `groups_for_modules`), and never reference a hidden module from a public `@doc`.
 
 ### Key Patterns
-1. **HTTP-Only (initially)**: Finch-based HTTP client, no Arrow Flight gRPC yet
+1. **HTTP, with Arrow Flight for SQL**: Finch-based HTTP client for every operation; `query_sql` can use Arrow Flight gRPC instead (`transport: :flight`)
 2. **Batch Writer GenServer**: Optional supervised process for buffered writes with flush/retry
 3. **Parameterized Queries**: SQL/InfluxQL with `$param` placeholders — no string interpolation
 4. **Streaming Results**: Lazy `Stream` from JSONL responses for large result sets
@@ -121,7 +132,9 @@ keep every other Local module `@moduledoc false` (HexDocs lists only the modules
 - **Jason** — JSON encoding/decoding
 - **NimbleCSV** — CSV parsing (query responses)
 - **Telemetry** — Observability
-- **NimbleOptions** — Config validation (optional)
+- **NimbleOptions** — Config and BatchWriter option validation
+- **gRPC + Protobuf** — Arrow Flight transport
+- **Decimal** (optional) — `%Decimal{}` SQL params
 
 No legacy deps. No hackney, poolboy, or HTTPoison.
 

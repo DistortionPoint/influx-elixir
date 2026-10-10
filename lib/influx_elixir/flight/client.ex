@@ -18,6 +18,9 @@ defmodule InfluxElixir.Flight.Client do
 
       Authorization: Bearer <token>
 
+  An empty token (`""`, a server started without auth) sends no `authorization` metadata,
+  as the HTTP transport sends no header.
+
   ## Example
 
       conn = %{host: "us-east-1.influxdb.io", token: "my-token",
@@ -27,7 +30,10 @@ defmodule InfluxElixir.Flight.Client do
 
   ## Options
 
-    * `:timeout` — per-call timeout in milliseconds (default: `30_000`)
+    * `:timeout` — wall-clock bound in milliseconds on the call and the streaming of its
+      whole result (default: `30_000`; through `InfluxElixir.query_sql/3` the call's, then
+      the connection's `:timeout`). A server that accepts the connection and stays silent,
+      or that stops sending, is `{:error, :timeout}` when it is spent.
     * `:connect_timeout` — bound on the gRPC channel establishment phase
       (default: same value as `:timeout`). Without this bound, a stuck TLS
       handshake against an unresponsive host can hang far longer than
@@ -71,7 +77,9 @@ defmodule InfluxElixir.Flight.Client do
 
   ## Options
 
-    * `:timeout` — milliseconds to wait for the full stream (default: `30_000`)
+    * `:timeout` — milliseconds the call and its whole stream may take (default: `30_000`);
+      the call runs in a monitored process that is killed at the bound
+    * `:connect_timeout` — milliseconds to establish the channel (default: `:timeout`)
     * `:tls` — force TLS on/off; inferred from port when omitted
 
   ## Returns
@@ -86,9 +94,23 @@ defmodule InfluxElixir.Flight.Client do
     * `{:error, {:unencodable_body, message}}` — the database or the statement is not
       what JSON can carry (text that is not UTF-8, a tuple)
 
+    * `{:error, :timeout}` — the call and its stream were not finished in `:timeout`
+      milliseconds, or the server's own deadline expired (gRPC status 4)
+    * `{:error, :connect_timeout}` — the channel was not open in `:connect_timeout`
+    * `{:error, %{status: http_status, body: message}}` — the server refused the query, in
+      the shape the HTTP transport gives. The gRPC status becomes the nearest HTTP one:
+      3 (`INVALID_ARGUMENT`) 400, 16 (`UNAUTHENTICATED`) 401, 7 (`PERMISSION_DENIED`) 403,
+      5 (`NOT_FOUND`) 404, 6 409, 8 429, 12 501, 14 503, any other 500. The statuses 3 and
+      13 were checked against InfluxDB 3 Core 3.10.1 with the same failing statements over
+      both transports; the others are the standard mapping, not observed.
+      The statuses do not always agree with HTTP's (a schema error, `select nosuch from
+      m`, is 500 over HTTP and 400 here; a database that does not exist is 404 over HTTP
+      and 500 here, as Flight answers it `INTERNAL`), and the Flight message keeps the
+      engine's prefix (`Error while logically planning query: ...`).
+    * `{:error, term()}` — any other transport or decode error
+
   A connection without `:host`, `:token` or `:database` raises `KeyError`: that is a
   programming error, not an answer.
-    * `{:error, term()}` — gRPC or decode error
 
   ## Example
 
@@ -97,7 +119,7 @@ defmodule InfluxElixir.Flight.Client do
   """
   @spec query(connection(), binary(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def query(connection, sql, opts \\ []) do
-    timeout = Keyword.get(opts, :timeout, @default_timeout)
+    timeout = Keyword.get(opts, :timeout) || @default_timeout
 
     # Validate required keys eagerly before attempting any network calls.
     # Map.fetch!/2 raises KeyError with a clear message if a key is missing.
@@ -109,10 +131,10 @@ defmodule InfluxElixir.Flight.Client do
     # a failed DoGet used to leak it.
     with :ok <- check_host(host),
          :ok <- check_token(token),
-         {:ok, _payload} <- ticket_payload(database, sql),
+         {:ok, payload} <- ticket_payload(database, sql),
          {:ok, channel} <- open_channel(host, connection, opts) do
       try do
-        with {:ok, flight_data_list} <- do_get(channel, connection, sql, timeout) do
+        with {:ok, flight_data_list} <- fetch(channel, token, payload, timeout) do
           Reader.decode_flight_data(flight_data_list)
         end
       after
@@ -204,7 +226,14 @@ defmodule InfluxElixir.Flight.Client do
   @spec bounded_connect((-> result), non_neg_integer()) ::
           result | {:error, :connect_timeout | {:connect_failed, binary()}}
         when result: term()
-  def bounded_connect(fun, timeout) when is_function(fun, 0) do
+  def bounded_connect(fun, timeout) when is_function(fun, 0),
+    do: bounded(fun, timeout, {:error, :connect_timeout}, :connect_failed)
+
+  # Runs `fun` in a monitored process for at most `timeout` ms: its result, `on_timeout` past
+  # the bound, or `{:error, {failure, message}}` when it raises, throws or exits.
+  @spec bounded((-> result), non_neg_integer(), term(), atom()) :: result | term()
+        when result: term()
+  defp bounded(fun, timeout, on_timeout, failure) do
     caller = self()
     tag = make_ref()
 
@@ -214,7 +243,7 @@ defmodule InfluxElixir.Flight.Client do
           try do
             fun.()
           catch
-            kind, reason -> {:error, {:connect_failed, Exception.format_banner(kind, reason)}}
+            kind, reason -> {:error, {failure, Exception.format_banner(kind, reason)}}
           end
 
         send(caller, {tag, result})
@@ -226,7 +255,7 @@ defmodule InfluxElixir.Flight.Client do
         result
 
       {:DOWN, ^monitor, :process, ^pid, reason} ->
-        {:error, {:connect_failed, Exception.format_exit(reason)}}
+        {:error, {failure, Exception.format_exit(reason)}}
     after
       timeout ->
         Process.exit(pid, :kill)
@@ -238,26 +267,61 @@ defmodule InfluxElixir.Flight.Client do
           0 -> :ok
         end
 
-        {:error, :connect_timeout}
+        on_timeout
     end
   end
 
-  @spec do_get(GRPC.Channel.t(), connection(), binary(), non_neg_integer()) ::
+  # The call and the collecting of its stream run in one monitored process (the adapter
+  # delivers the stream to the process that made the call), bounded by wall-clock time: the
+  # gRPC deadline is only a request header and a silent peer never answers it. Past the
+  # bound the process is killed and the answer is `{:error, :timeout}`; the caller closes the
+  # channel.
+  @spec fetch(GRPC.Channel.t(), binary(), binary(), non_neg_integer()) ::
           {:ok, [FlightData.t()]} | {:error, term()}
-  defp do_get(channel, connection, sql, timeout) do
-    database = Map.fetch!(connection, :database)
-    token = Map.fetch!(connection, :token)
+  defp fetch(channel, token, payload, timeout) do
+    fn -> do_get(channel, token, payload, timeout) end
+    |> bounded(timeout, {:error, :timeout}, :flight_failed)
+    |> normalize_error()
+  end
 
-    ticket = build_ticket(database, sql)
+  @spec do_get(GRPC.Channel.t(), binary(), binary(), non_neg_integer()) ::
+          {:ok, [FlightData.t()]} | {:error, term()}
+  defp do_get(channel, token, payload, timeout) do
+    call_opts = [timeout: timeout, metadata: auth_metadata(token)]
 
-    metadata = [{"authorization", "Bearer #{token}"}]
-    call_opts = [timeout: timeout, metadata: metadata]
-
-    case FlightService.Stub.do_get(channel, ticket, call_opts) do
+    case FlightService.Stub.do_get(channel, %Ticket{ticket: payload}, call_opts) do
       {:ok, stream} -> collect_stream(stream)
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # `Authorization: Bearer <token>` as over HTTP, and none for an empty token (a server
+  # without auth) rather than a header with nothing after `Bearer`.
+  @spec auth_metadata(binary()) :: [{binary(), binary()}]
+  defp auth_metadata(""), do: []
+  defp auth_metadata(token), do: [{"authorization", "Bearer " <> token}]
+
+  # A failed call is the shape the HTTP transport gives: `%{status: http_status, body: message}`.
+  # The gRPC status becomes the nearest HTTP one (see the moduledoc's "Errors"); an expired
+  # deadline is `:timeout`.
+  @spec normalize_error(term()) :: term()
+  defp normalize_error({:error, %GRPC.RPCError{status: 4}}), do: {:error, :timeout}
+
+  defp normalize_error({:error, %GRPC.RPCError{status: status, message: message}}),
+    do: {:error, %{status: http_status(status), body: message}}
+
+  defp normalize_error(other), do: other
+
+  @spec http_status(integer()) :: pos_integer()
+  defp http_status(3), do: 400
+  defp http_status(16), do: 401
+  defp http_status(7), do: 403
+  defp http_status(5), do: 404
+  defp http_status(6), do: 409
+  defp http_status(8), do: 429
+  defp http_status(12), do: 501
+  defp http_status(14), do: 503
+  defp http_status(_other), do: 500
 
   @spec collect_stream(Enumerable.t()) :: {:ok, [FlightData.t()]} | {:error, term()}
   defp collect_stream(stream) do

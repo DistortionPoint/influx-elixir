@@ -70,9 +70,12 @@ defmodule InfluxElixir.Flight.ReaderTest do
   # The type TABLE within the blob starts at vtable_size_bytes offset from blob start.
   defp build_type_blob(2, opts) do
     bit_width = Keyword.get(opts, :bit_width, 64)
-    is_signed_byte = if Keyword.get(opts, :is_signed, true), do: 1, else: 0
-    # vtable: 4 × u16 = 8 bytes, vtable_size=8, obj_size=10, s0=4, s1=8
-    vtable = <<8::little-16, 10::little-16, 4::little-16, 8::little-16>>
+    is_signed_byte = if Keyword.get(opts, :is_signed, true) === true, do: 1, else: 0
+    # vtable: 4 × u16 = 8 bytes, vtable_size=8, obj_size=10, s0=4, s1=8; an offset of 0 is a
+    # slot left out of the table, which is how a FlatBuffer writes a field holding its default
+    # (`is_signed: :omit` is `false`, the Arrow default).
+    is_signed_slot = if Keyword.get(opts, :is_signed, true) === :omit, do: 0, else: 8
+    vtable = <<8::little-16, 10::little-16, 4::little-16, is_signed_slot::little-16>>
     soffset = byte_size(vtable)
     inline = <<soffset::little-signed-32, bit_width::little-signed-32, is_signed_byte::8, 0::8>>
     {vtable <> inline, @int_vtable_size}
@@ -80,8 +83,11 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
   defp build_type_blob(3, opts) do
     precision = Keyword.get(opts, :precision, 2)
-    # vtable: 3 × u16 = 6 bytes, vtable_size=6, obj_size=8, s0=4
-    vtable = <<6::little-16, 8::little-16, 4::little-16>>
+    # vtable: 3 × u16 = 6 bytes, vtable_size=6, obj_size=8, s0=4 (0 when the precision is
+    # `:omit`: HALF, the Arrow default, which a FlatBuffer leaves out)
+    precision_slot = if precision === :omit, do: 0, else: 4
+    precision = if precision === :omit, do: 0, else: precision
+    vtable = <<6::little-16, 8::little-16, precision_slot::little-16>>
     soffset = byte_size(vtable)
     inline = <<soffset::little-signed-32, precision::little-signed-16, 0::16>>
     {vtable <> inline, @fp_vtable_size}
@@ -671,6 +677,32 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {:ok, [col]} = Reader.parse_schema(header)
       assert col.type_id === 7
     end
+
+    # FlatBuffers leave a field out when it holds its default, and Arrow's `is_signed` defaults
+    # to false: this is how InfluxDB 3 sends a UInt column.
+    test "an Int whose is_signed slot is left out is unsigned" do
+      for {width, type_id} <- [{8, 7}, {16, 8}, {32, 9}, {64, 10}] do
+        header = schema_msg([{"u", 2, [bit_width: width, is_signed: :omit]}])
+        assert {:ok, [col]} = Reader.parse_schema(header)
+        assert col.type_id === type_id
+      end
+    end
+
+    test "values of a UInt column with the slot left out are not read as signed" do
+      body = <<200, 255, 0>>
+      schema = schema_fd([{"u", 2, [bit_width: 8, is_signed: :omit]}])
+      batch = batch_fd(body, [{0, 0}, {0, 3}], 3)
+
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"u" => 200}, %{"u" => 255}, %{"u" => 0}]}
+
+      body = <<18_446_744_073_709_551_615::little-64>>
+      schema = schema_fd([{"u", 2, [bit_width: 64, is_signed: :omit]}])
+      batch = batch_fd(body, [{0, 0}, {0, 8}], 1)
+
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"u" => 18_446_744_073_709_551_615}]}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -690,10 +722,58 @@ defmodule InfluxElixir.Flight.ReaderTest do
       assert col.type_id === 11
     end
 
-    test "defaults to Float64 when precision not specified" do
-      header = schema_msg([{"f", 3, []}])
+    test "precision left out of the table is Float16, the Arrow default" do
+      header = schema_msg([{"f", 3, [precision: :omit]}])
       {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 12
+      assert col.type_id === 0
+      assert col.kind === :float16
+    end
+
+    test "Float16 cells decode as the shortest Float32 decimal, infinities and NaN as nil" do
+      # 1.5, 0.1, -0.0, the smallest subnormal, 65504 (the largest), +inf, -inf, NaN
+      body =
+        <<0x3E00::little-16, 0x2E66::little-16, 0x8000::little-16, 0x0001::little-16,
+          0x7BFF::little-16, 0x7C00::little-16, 0xFC00::little-16, 0x7E00::little-16>>
+
+      schema = schema_fd([{"f", 3, [precision: :omit]}])
+      batch = batch_fd(body, [{0, 0}, {0, byte_size(body)}], 8)
+
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok,
+                [
+                  %{"f" => 1.5},
+                  %{"f" => 0.099975586},
+                  %{"f" => -0.0},
+                  %{"f" => 5.9604645e-8},
+                  %{"f" => 65_504.0},
+                  %{"f" => nil},
+                  %{"f" => nil},
+                  %{"f" => nil}
+                ]}
+    end
+
+    test "Float32 cells decode as HTTP prints them, an infinity as nil" do
+      {body, specs} = float32_column([0.1, 3.14159, 1.0e30])
+      schema = schema_fd([{"f", 3, [precision: 1]}])
+      batch = batch_fd(body, specs, 3)
+
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"f" => 0.1}, %{"f" => 3.14159}, %{"f" => 1.0e30}]}
+
+      body = <<0x7F800000::little-32, 0x3F800000::little-32>>
+      batch = batch_fd(body, [{0, 0}, {0, 8}], 2)
+
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"f" => nil}, %{"f" => 1.0}]}
+    end
+
+    test "a Float64 infinity is nil and its neighbours keep their rows" do
+      body = <<1.5::little-float-64, 0x7FF0000000000000::little-64, 2.5::little-float-64>>
+      schema = schema_fd([{"f", 3, [precision: 2]}])
+      batch = batch_fd(body, [{0, 0}, {0, 24}], 3)
+
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"f" => 1.5}, %{"f" => nil}, %{"f" => 2.5}]}
     end
   end
 
@@ -734,10 +814,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
         ])
 
       {:ok, cols} = Reader.parse_schema(header)
-      assert length(cols) === 2
-      names = Enum.map(cols, & &1.name)
-      assert "time" in names
-      assert "value" in names
+      assert Enum.map(cols, & &1.name) === ["time", "value"]
     end
 
     test "preserves column order across three columns" do
@@ -1413,15 +1490,6 @@ defmodule InfluxElixir.Flight.ReaderTest do
     {vtable <> inline, @int_vtable_size}
   end
 
-  # Build a FP type blob with precision slot zeroed out.
-  defp build_fp_type_blob_absent_precision do
-    # vtable: size=6, obj_size=8, s0=0 (absent)
-    vtable = <<6::little-16, 8::little-16, 0::little-16>>
-    soffset = byte_size(vtable)
-    inline = <<soffset::little-signed-32, 2::little-signed-16, 0::16>>
-    {vtable <> inline, @fp_vtable_size}
-  end
-
   # Build a full schema FlatBuffer using a pre-built field blob directly.
   defp build_schema_fb_with_blob(field_blob) do
     num_cols = 1
@@ -1549,35 +1617,14 @@ defmodule InfluxElixir.Flight.ReaderTest do
   end
 
   describe "parse_schema/1 — FlatBuffer nil fallback: absent Int bitWidth" do
-    test "Int type with absent bitWidth slot defaults to 32 (Int32 signed → type_id 4)" do
+    # Schema.fbs gives `bitWidth` the default 0, which is no integer width: the column has no
+    # type id, as a type the reader does not decode has none.
+    test "Int type with absent bitWidth slot has no type id" do
       {type_blob, type_vtable_size} = build_int_type_blob_with_absent_slots(32, true, [0])
       fb = build_schema_fb_custom_type("val", 2, type_blob, type_vtable_size)
       header = schema_msg_from_fb(fb)
       {:ok, [col]} = Reader.parse_schema(header)
-      # nil bitWidth defaults to 32, is_signed=true → type_id 4
-      assert col.type_id === 4
-    end
-  end
-
-  describe "parse_schema/1 — FlatBuffer nil fallback: absent Int is_signed" do
-    test "Int type with absent is_signed slot defaults to true (signed)" do
-      {type_blob, type_vtable_size} = build_int_type_blob_with_absent_slots(64, false, [1])
-      fb = build_schema_fb_custom_type("val", 2, type_blob, type_vtable_size)
-      header = schema_msg_from_fb(fb)
-      {:ok, [col]} = Reader.parse_schema(header)
-      # nil is_signed defaults to true; bitWidth=64, signed → type_id 6
-      assert col.type_id === 6
-    end
-  end
-
-  describe "parse_schema/1 — FlatBuffer nil fallback: absent FloatingPoint precision" do
-    test "FloatingPoint with absent precision slot defaults to DOUBLE (type_id 12)" do
-      {type_blob, type_vtable_size} = build_fp_type_blob_absent_precision()
-      fb = build_schema_fb_custom_type("f", 3, type_blob, type_vtable_size)
-      header = schema_msg_from_fb(fb)
-      {:ok, [col]} = Reader.parse_schema(header)
-      # nil precision defaults to 2 (DOUBLE) → type_id 12
-      assert col.type_id === 12
+      assert col.type_id === 0
     end
   end
 

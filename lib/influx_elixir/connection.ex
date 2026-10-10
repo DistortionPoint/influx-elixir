@@ -130,6 +130,39 @@ defmodule InfluxElixir.Connection do
   end
 
   @doc """
+  The server generation a connection writes to: `:v2` or `:v3`.
+
+  Takes a connection (a keyword list with `:api_version`, a `Client.Local` connection, whose
+  `:v2` profile is InfluxDB 2) or the name of a registered one. Anything else, or a
+  connection that does not say, is `:v3`, the default.
+
+  ## Examples
+
+      iex> InfluxElixir.Connection.api_version(host: "h", api_version: :v2)
+      :v2
+
+      iex> InfluxElixir.Connection.api_version(host: "h")
+      :v3
+  """
+  @spec api_version(term()) :: :v2 | :v3
+  def api_version(name) when is_atom(name) and name not in [nil, true, false] do
+    case get(name) do
+      {:ok, connection} -> api_version(connection)
+      {:error, :not_found} -> :v3
+    end
+  end
+
+  def api_version(%{profile: :v2}), do: :v2
+
+  def api_version(connection) when is_list(connection) do
+    if Keyword.keyword?(connection) and Keyword.get(connection, :api_version) == :v2,
+      do: :v2,
+      else: :v3
+  end
+
+  def api_version(_other), do: :v3
+
+  @doc """
   Returns the Finch pool name for a given connection name.
 
   This is a convenience wrapper around

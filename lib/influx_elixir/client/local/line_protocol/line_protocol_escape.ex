@@ -87,10 +87,19 @@ defmodule InfluxElixir.Client.Local.LineProtocolEscape do
 
   defp unescape_v2(<<>>, _codes, acc), do: acc
 
-  defp unescape_v2(<<?\\, c, rest::binary>>, codes, acc) do
-    if c in codes,
-      do: unescape_v2(rest, codes, <<acc::binary, c>>),
-      else: unescape_v2(<<c, rest::binary>>, codes, <<acc::binary, ?\\>>)
+  # A backslash is kept unless a code follows it. The next byte is looked at without being
+  # taken off: matching `rest` again as `<<c, rest::binary>>` to rebuild it copied the whole
+  # remainder at every backslash that precedes no code, which is quadratic.
+  defp unescape_v2(<<?\\, after_backslash::binary>>, codes, acc) do
+    case after_backslash do
+      <<c, rest::binary>> ->
+        if c in codes,
+          do: unescape_v2(rest, codes, <<acc::binary, c>>),
+          else: unescape_v2(after_backslash, codes, <<acc::binary, ?\\>>)
+
+      <<>> ->
+        <<acc::binary, ?\\>>
+    end
   end
 
   defp unescape_v2(<<c, rest::binary>>, codes, acc),

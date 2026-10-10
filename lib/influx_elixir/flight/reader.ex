@@ -27,17 +27,23 @@ defmodule InfluxElixir.Flight.Reader do
   | Arrow Type | Elixir value |
   |------------|--------------|
   | Int8-64, UInt8-64 | `integer()` |
-  | Float16/32/64 | `float()` |
+  | Float16/32/64 | `float()`; Float16 and Float32 are the shortest decimal that reads back as the same bits (`0.1`), as HTTP prints them; an infinity or a NaN is `nil` in the row (a present key), as HTTP's `null` |
   | Bool | `boolean()` |
   | Utf8, LargeUtf8, Utf8View (string functions return it) | `binary()` |
   | Binary, LargeBinary, BinaryView | lowercase hex, as HTTP renders it |
   | Timestamp | `DateTime.t()` (microsecond precision, as on HTTP) |
-  | Date32/64 | `"YYYY-MM-DD"` |
+  | Date32 | `"YYYY-MM-DD"` |
+  | Date64 | `DateTime.t()` (HTTP renders a datetime, read as one) |
   | Duration | `"PT60S"`, `"PT0.5S"`, `"-PT0.000000001S"`, `"P0D"` |
   | Decimal128/256 | a number (integer at scale 0, else float) |
   | Struct (`selector_*` without a subscript) | a map of its members |
   | List, LargeList, FixedSizeList (`array_agg`) | a list |
   | Null | `nil` |
+
+  FlatBuffers leave out a field that holds its schema default, so a type table is read with
+  the defaults of `Schema.fbs`: an `Int` without `is_signed` is unsigned, a `FloatingPoint`
+  without `precision` is Float16, a `Duration` and a `Date` without `unit` are milliseconds
+  (Date64), a `Timestamp` without `unit` is seconds, a `Decimal` without `bitWidth` is 128.
 
   Nested types are read with the batch's field nodes and, for view types,
   its variadic buffer counts, in Arrow's depth-first layout.
@@ -59,6 +65,7 @@ defmodule InfluxElixir.Flight.Reader do
 
   alias InfluxElixir.Flight.FlatBuffer, as: FB
   alias InfluxElixir.Flight.Proto.FlightData
+  alias InfluxElixir.Query.ResponseParser
 
   # Arrow IPC stream continuation marker
   @continuation_marker <<0xFF, 0xFF, 0xFF, 0xFF>>
@@ -358,7 +365,8 @@ defmodule InfluxElixir.Flight.Reader do
     do: {:decimal, type_slot(fb, pos, 1, :int32, 0), div(type_slot(fb, pos, 2, :int32, 128), 8)}
 
   defp field_kind(fb, @fb_type_floating_point, pos, _type_id) do
-    if type_slot(fb, pos, 0, :int16, 2) == 0, do: :float16, else: {:unsupported, "FloatingPoint"}
+    # Precision HALF (0) is the default and is not on the wire.
+    if type_slot(fb, pos, 0, :int16, 0) == 0, do: :float16, else: {:unsupported, "FloatingPoint"}
   end
 
   defp field_kind(_fb, type_type, _pos, _type_id),
@@ -406,17 +414,21 @@ defmodule InfluxElixir.Flight.Reader do
   defp resolve_type_id(fb, @fb_type_int, type_pos) when type_pos != nil do
     {vt_pos, vt_size} = FB.read_vtable(fb, type_pos)
 
-    # Int slot 0: bitWidth (int32)
+    # FlatBuffers leave a field out when it holds its schema default, so each `nil` below is
+    # that default (Schema.fbs: `table Int { bitWidth: int; is_signed: bool; }`, both
+    # zero-valued). An unsigned column arrives without the `is_signed` slot.
+    #
+    # Int slot 0: bitWidth (int32, default 0)
     bit_width =
       case FB.field_pos(fb, type_pos, vt_pos, vt_size, 0) do
-        nil -> 32
+        nil -> 0
         pos -> FB.read_int32(fb, pos)
       end
 
     # Int slot 1: is_signed (bool)
     is_signed =
       case FB.field_pos(fb, type_pos, vt_pos, vt_size, 1) do
-        nil -> true
+        nil -> false
         pos -> FB.read_bool(fb, pos)
       end
 
@@ -427,16 +439,18 @@ defmodule InfluxElixir.Flight.Reader do
        when type_pos != nil do
     {vt_pos, vt_size} = FB.read_vtable(fb, type_pos)
 
-    # FloatingPoint slot 0: precision (int16 enum: HALF=0, SINGLE=1, DOUBLE=2)
+    # FloatingPoint slot 0: precision (int16 enum: HALF=0, SINGLE=1, DOUBLE=2). HALF is the
+    # default, so a Float16 column has no slot; it has no type id and decodes as `:float16`.
     precision =
       case FB.field_pos(fb, type_pos, vt_pos, vt_size, 0) do
-        nil -> 2
+        nil -> 0
         pos -> FB.read_int16(fb, pos)
       end
 
     case precision do
       1 -> @type_float32
-      _other -> @type_float64
+      2 -> @type_float64
+      _half_or_unknown -> 0
     end
   end
 
@@ -786,7 +800,7 @@ defmodule InfluxElixir.Flight.Reader do
     {specs, cursor} = pop_specs(cursor, 2)
     [validity, offsets] = pad_specs(specs, 2)
     {items, cursor} = decode_field(hd(col.children), cursor, body)
-    items = List.to_tuple(items)
+    items = items |> Enum.map(&finite_or_nil/1) |> List.to_tuple()
 
     lists =
       body
@@ -807,7 +821,7 @@ defmodule InfluxElixir.Flight.Reader do
     {specs, cursor} = pop_specs(cursor, 1)
     [validity] = pad_specs(specs, 1)
     {items, cursor} = decode_field(hd(col.children), cursor, body)
-    lists = items |> Enum.chunk_every(max(size, 1)) |> fit(len)
+    lists = items |> Enum.map(&finite_or_nil/1) |> Enum.chunk_every(max(size, 1)) |> fit(len)
     {apply_nulls(lists, slice_validity(body, validity), len), cursor}
   end
 
@@ -817,6 +831,10 @@ defmodule InfluxElixir.Flight.Reader do
   # ---------------------------------------------------------------------------
   # Private: the decoders for the non-primitive kinds
   # ---------------------------------------------------------------------------
+
+  @spec finite_or_nil(term()) :: term()
+  defp finite_or_nil(:non_finite), do: nil
+  defp finite_or_nil(value), do: value
 
   @spec pad_specs(list(), non_neg_integer()) :: list()
   defp pad_specs(specs, n), do: specs ++ List.duplicate(nil, n - length(specs))
@@ -868,7 +886,7 @@ defmodule InfluxElixir.Flight.Reader do
   end
 
   @spec decode_fixed_kind(term(), binary()) :: [term()]
-  defp decode_fixed_kind(:float16, data), do: for(<<v::little-float-16 <- data>>, do: v)
+  defp decode_fixed_kind(:float16, data), do: for(<<bits::little-16 <- data>>, do: half(bits))
 
   defp decode_fixed_kind({:duration, unit}, data) do
     for <<v::little-signed-64 <- data>>,
@@ -878,9 +896,11 @@ defmodule InfluxElixir.Flight.Reader do
   defp decode_fixed_kind({:date, :day}, data),
     do: for(<<d::little-signed-32 <- data>>, do: Date.to_iso8601(Date.add(~D[1970-01-01], d)))
 
+  # Date64 is milliseconds. HTTP renders it as a datetime without a zone
+  # (`1970-01-02T00:00:00.500`), which `ResponseParser` reads as a `DateTime`.
   defp decode_fixed_kind({:date, :millisecond}, data) do
     for <<ms::little-signed-64 <- data>>,
-      do: Date.to_iso8601(Date.add(~D[1970-01-01], Integer.floor_div(ms, 86_400_000)))
+      do: ms |> DateTime.from_unix!(:millisecond) |> ResponseParser.microsecond_precision()
   end
 
   defp decode_fixed_kind({:decimal, scale, bytes}, data) do
@@ -933,7 +953,7 @@ defmodule InfluxElixir.Flight.Reader do
       value ->
         value
         |> DateTime.from_unix!(unit || :nanosecond)
-        |> InfluxElixir.Query.ResponseParser.microsecond_precision()
+        |> ResponseParser.microsecond_precision()
     end)
   end
 
@@ -1055,11 +1075,64 @@ defmodule InfluxElixir.Flight.Reader do
     fit(for(<<v::little-unsigned-size(bits) <- data>>, do: v), n)
   end
 
-  @spec decode_floats(binary(), non_neg_integer(), pos_integer()) ::
-          [float() | nil]
-  defp decode_floats(data, n, width) do
-    bits = width * 8
-    fit(for(<<v::little-float-size(bits) <- data>>, do: v), n)
+  # An infinity or a NaN is JSON `null` over HTTP, a key that is present (a null cell has
+  # no key), so it is decoded to `:non_finite`, which `zip_columns/3` writes as `nil`.
+  # A comprehension skips what a float pattern does not match, so a column with one is
+  # read again by bits.
+  @spec decode_floats(binary(), non_neg_integer(), 4 | 8) :: [float() | :non_finite | nil]
+  defp decode_floats(data, n, 8) do
+    values = for <<v::little-float-64 <- data>>, do: v
+
+    if length(values) == div(byte_size(data), 8),
+      do: fit(values, n),
+      else: fit(for(<<bits::little-64 <- data>>, do: float64(bits)), n)
+  end
+
+  # HTTP prints a Float32 as the shortest decimal that reads back as the same 32 bits
+  # (`0.1`, not `0.10000000149011612`), so the value is the double that decimal reads as.
+  defp decode_floats(data, n, 4),
+    do: fit(for(<<bits::little-32 <- data>>, do: float32(bits)), n)
+
+  @spec float64(non_neg_integer()) :: float() | :non_finite
+  defp float64(bits) do
+    case <<bits::64>> do
+      <<v::float-64>> -> v
+      _non_finite -> :non_finite
+    end
+  end
+
+  @spec float32(non_neg_integer()) :: float() | :non_finite
+  defp float32(bits) do
+    case <<bits::32>> do
+      <<v::float-32>> -> shortest32(v)
+      _non_finite -> :non_finite
+    end
+  end
+
+  # IEEE half precision: 1 sign bit, 5 exponent bits (bias 15), 10 fraction bits. A zero
+  # exponent is a subnormal (`fraction * 2^-24`), 31 an infinity or a NaN.
+  @spec half(non_neg_integer()) :: float() | :non_finite
+  defp half(bits) do
+    sign = if bits >>> 15 == 1, do: -1.0, else: 1.0
+    exponent = bits >>> 10 &&& 0x1F
+    fraction = bits &&& 0x3FF
+
+    case exponent do
+      31 -> :non_finite
+      0 -> shortest32(sign * fraction * :math.pow(2.0, -24))
+      _normal -> shortest32(sign * (1024 + fraction) * :math.pow(2.0, exponent - 25))
+    end
+  end
+
+  # The fewest digits (1 to 9) whose decimal rounds to the same Float32, read as a double.
+  @spec shortest32(float()) :: float()
+  defp shortest32(value) do
+    Enum.find_value(1..8, value, fn digits ->
+      candidate =
+        value |> :erlang.float_to_binary(scientific: digits) |> :erlang.binary_to_float()
+
+      if <<candidate::float-32>> == <<value::float-32>>, do: candidate
+    end)
   end
 
   @spec fit([term()], non_neg_integer()) :: [term()]
@@ -1152,6 +1225,7 @@ defmodule InfluxElixir.Flight.Reader do
       Enum.reduce(named_tuples, %{}, fn {name, col}, row ->
         case cell(col, i) do
           nil -> row
+          :non_finite -> Map.put(row, name, nil)
           value -> Map.put(row, name, value)
         end
       end)
