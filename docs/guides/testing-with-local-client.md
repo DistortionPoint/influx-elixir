@@ -300,6 +300,46 @@ This lets you test your application code that uses `InfluxElixir.write/3`
 and `InfluxElixir.query_sql/3` without any code changes — just swap the
 client in config.
 
+### Points and batched writes
+
+`InfluxElixir.write/3` takes a `Point` (see `InfluxElixir.point/3`) or a list of
+them as well as line protocol, and encodes them for the call's `:precision` and the
+connection's `api_version`. A connection with a `batch_writer:` option buffers
+writes made with `InfluxElixir.write_batched/3`; `InfluxElixir.flush/2` writes the
+buffer and returns when the batch has been written, and `sync: true` waits for the
+batch holding the payload:
+
+```elixir
+# config/test.exs
+config :influx_elixir, :connections,
+  test_db: [
+    databases: ["myapp_test"],
+    batch_writer: [flush_interval_ms: 600_000, batch_size: 100]
+  ]
+```
+
+```elixir
+test "points, direct and batched" do
+  tags = %{"location" => "lab"}
+  first = InfluxElixir.point("sensors", %{"temp" => 22.5}, tags: tags, timestamp: 1_000_000_000)
+  second = InfluxElixir.point("sensors", %{"temp" => 23.5}, tags: tags, timestamp: 2_000_000_000)
+
+  {:ok, :written} = InfluxElixir.write(:test_db, first, database: "myapp_test")
+
+  # Buffered until the batch is full, the interval passes or a flush.
+  :ok = InfluxElixir.write_batched(:test_db, second)
+  :ok = InfluxElixir.flush(:test_db)
+
+  {:ok, rows} = InfluxElixir.query_sql(:test_db, "SELECT temp FROM sensors ORDER BY time")
+  assert Enum.map(rows, & &1["temp"]) === [22.5, 23.5]
+end
+```
+
+The batch writer makes its writes in a process of its own, so a test that writes
+with `write_batched/3` and reads at once must `flush/2` first (or write with
+`sync: true`). A point without a `:timestamp` is stamped with the time of the
+`write_batched/3` call, not left to the server's clock.
+
 ## Aggregate Queries
 
 LocalClient supports `DATE_BIN` time-bucketed aggregate queries — the same

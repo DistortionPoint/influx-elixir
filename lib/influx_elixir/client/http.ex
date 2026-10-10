@@ -77,20 +77,25 @@ defmodule InfluxElixir.Client.HTTP do
 
   @behaviour InfluxElixir.Client
 
+  import InfluxElixir.Client.HTTP.Request,
+    only: [
+      conn_val: 2,
+      conn_val: 3,
+      decode_json: 1,
+      delete_named: 4,
+      get: 3,
+      json_body: 1,
+      options: 1,
+      post_json: 5,
+      query_value: 1,
+      request: 7,
+      url_values: 1
+    ]
+
   alias InfluxElixir.Admin.TokenRequest
-  alias InfluxElixir.Client.QueryParams
+  alias InfluxElixir.Client.HTTP.{Buckets, Request}
+  alias InfluxElixir.Client.{Options, QueryParams}
   alias InfluxElixir.Query.ResponseParser
-
-  # Default `Finch.request/3` receive timeout, mirroring
-  # `InfluxElixir.Flight.Client`'s default so HTTP and Flight transports
-  # have parity. Finch's own default is 15s, which is too short for many
-  # production queries. Override with the `:timeout` opt on a per-call
-  # basis, or via a `:timeout` key on the connection config.
-  @default_timeout 30_000
-
-  # Finch's own default for waiting on a pool checkout. Kept as the default
-  # so behaviour is unchanged unless configured; see `:pool_timeout`.
-  @default_pool_timeout 5_000
 
   # ---------------------------------------------------------------------------
   # Connection lifecycle
@@ -130,7 +135,7 @@ defmodule InfluxElixir.Client.HTTP do
           InfluxElixir.Client.write_result()
   def write(connection, line_protocol, opts \\ []) do
     with :ok <- options(opts),
-         :ok <- iodata_body(line_protocol),
+         {:ok, body} <- iodata_body(line_protocol),
          {:ok, database} <- resolve_database(opts, connection),
          precision = Keyword.get(opts, :precision, "nanosecond"),
          :ok <- url_values(database: database, precision: precision) do
@@ -138,15 +143,24 @@ defmodule InfluxElixir.Client.HTTP do
 
       headers =
         if Keyword.get(opts, :gzip, false) do
-          [{"content-encoding", "gzip"} | auth_headers(connection)]
+          [{"content-encoding", "gzip"} | Request.auth_headers(connection)]
         else
-          auth_headers(connection)
+          Request.auth_headers(connection)
         end
 
-      with {:ok, _response} <-
-             request(:post, url, headers, line_protocol, connection, opts, [200, 204]) do
+      with {:ok, _response} <- request(:post, url, headers, body, connection, opts, [200, 204]) do
         {:ok, :written}
       end
+    end
+  end
+
+  # A write body is iodata (a binary, or a list of binaries and bytes): anything else has no
+  # bytes to send, the caller's error, never a raise.
+  @spec iodata_body(term()) :: {:ok, binary()} | {:error, {:invalid_body, term()}}
+  defp iodata_body(body) do
+    case Options.iodata(body) do
+      {:ok, text} -> {:ok, text}
+      :error -> {:error, {:invalid_body, body}}
     end
   end
 
@@ -160,12 +174,12 @@ defmodule InfluxElixir.Client.HTTP do
       :v2 ->
         org = conn_val(connection, :org, "")
 
-        base_url(connection) <>
+        Request.base_url(connection) <>
           "/api/v2/write?org=#{query_value(org)}&bucket=#{query_value(database)}" <>
           "&precision=#{query_value(v2_precision(precision))}"
 
       :v3 ->
-        base_url(connection) <>
+        Request.base_url(connection) <>
           "/api/v3/write_lp?db=#{query_value(database)}&precision=#{query_value(precision)}"
     end
   end
@@ -276,20 +290,6 @@ defmodule InfluxElixir.Client.HTTP do
     end
   end
 
-  # A request body is JSON, which holds only UTF-8 text: text that is not is
-  # the caller's error, returned as one, never a `Jason.EncodeError` raised.
-  @spec json_body(map()) :: {:ok, binary()} | {:error, {:unencodable_body, binary()}}
-  defp json_body(map) do
-    case Jason.encode(map) do
-      {:ok, body} -> {:ok, body}
-      {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
-    end
-  rescue
-    # Jason raises instead of returning for an improper list or a map key it cannot write.
-    error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError] ->
-      {:error, {:unencodable_body, Exception.message(error)}}
-  end
-
   @spec encodable_text(term()) :: :ok | {:error, {:unencodable_body, binary()}}
   # Whatever JSON cannot carry (text that is not UTF-8, a tuple, a pid) is the caller's error;
   # what it can (an atom, a number) is sent as it always was.
@@ -302,14 +302,10 @@ defmodule InfluxElixir.Client.HTTP do
     format = Keyword.get(opts, :format) || :json
 
     with {:ok, database} <- resolve_database(opts, connection),
-         {:ok, body} <- sql_request_body(database, sql, opts, format) do
-      url = base_url(connection) <> "/api/v3/query_sql"
-      headers = json_headers(connection)
-
-      with {:ok, %Finch.Response{body: resp_body}} <-
-             request(:post, url, headers, body, connection, opts, [200]) do
-        ResponseParser.parse(resp_body, format)
-      end
+         {:ok, body} <- sql_request_body(database, sql, opts, format),
+         {:ok, %Finch.Response{body: resp_body}} <-
+           post_json(connection, "/api/v3/query_sql", body, opts, [200]) do
+      ResponseParser.parse(resp_body, format)
     end
   end
 
@@ -323,15 +319,13 @@ defmodule InfluxElixir.Client.HTTP do
     with :ok <- options(opts),
          {:ok, database} <- resolve_database(opts, connection),
          {:ok, body} <- sql_request_body(database, sql, opts, "jsonl"),
-         {:ok, finch_name} <- resolve_finch(connection) do
-      url = base_url(connection) <> "/api/v3/query_sql"
-      headers = json_headers(connection)
-      finch_opts = finch_opts(opts, connection)
-
-      Stream.resource(
-        fn -> start_stream(finch_name, url, headers, body, finch_opts) end,
-        &stream_next/1,
-        &stream_cleanup/1
+         {:ok, finch_name} <- Request.resolve_finch(connection) do
+      InfluxElixir.Client.HTTP.Stream.resource(
+        finch_name,
+        Request.base_url(connection) <> "/api/v3/query_sql",
+        Request.json_headers(connection),
+        body,
+        Request.finch_opts(opts, connection)
       )
     else
       # The return type is Enumerable.t(), so we cannot return an error
@@ -348,19 +342,15 @@ defmodule InfluxElixir.Client.HTTP do
   def execute_sql(connection, sql, opts \\ []) do
     with :ok <- options(opts),
          {:ok, database} <- resolve_database(opts, connection),
-         {:ok, body} <- sql_request_body(database, sql, opts, nil) do
-      url = base_url(connection) <> "/api/v3/query_sql"
-      headers = json_headers(connection)
-
-      # A SELECT answers rows, typed like `query_sql/3` rows; a summary map
-      # passes through.
-      with {:ok, %Finch.Response{body: resp_body}} <-
-             request(:post, url, headers, body, connection, opts, [200]),
-           {:ok, decoded} <- decode_json(resp_body) do
-        if is_list(decoded),
-          do: {:ok, Enum.map(decoded, &ResponseParser.coerce_types/1)},
-          else: {:ok, decoded}
-      end
+         {:ok, body} <- sql_request_body(database, sql, opts, nil),
+         # A SELECT answers rows, typed like `query_sql/3` rows; a summary map
+         # passes through.
+         {:ok, %Finch.Response{body: resp_body}} <-
+           post_json(connection, "/api/v3/query_sql", body, opts, [200]),
+         {:ok, decoded} <- decode_json(resp_body) do
+      if is_list(decoded),
+        do: {:ok, Enum.map(decoded, &ResponseParser.coerce_types/1)},
+        else: {:ok, decoded}
     end
   end
 
@@ -397,12 +387,8 @@ defmodule InfluxElixir.Client.HTTP do
         body_map
       end
 
-    url = base_url(connection) <> "/api/v3/query_influxql"
-    headers = json_headers(connection)
-
-    with {:ok, body} <- json_body(body_map),
-         {:ok, %Finch.Response{body: resp_body}} <-
-           request(:post, url, headers, body, connection, opts, [200]) do
+    with {:ok, %Finch.Response{body: resp_body}} <-
+           post_json(connection, "/api/v3/query_influxql", body_map, opts, [200]) do
       ResponseParser.parse(resp_body, format)
     end
   end
@@ -431,12 +417,8 @@ defmodule InfluxElixir.Client.HTTP do
       "dialect" => %{"annotations" => ["datatype"], "header" => true, "delimiter" => ","}
     }
 
-    url = base_url(connection) <> "/api/v2/query?org=#{query_value(org)}"
-    headers = json_headers(connection)
-
-    with {:ok, body} <- json_body(body_map),
-         {:ok, %Finch.Response{body: resp_body}} <-
-           request(:post, url, headers, body, connection, opts, [200]) do
+    with {:ok, %Finch.Response{body: resp_body}} <-
+           post_json(connection, "/api/v2/query?org=#{query_value(org)}", body_map, opts, [200]) do
       ResponseParser.parse(resp_body, :flux_csv)
     end
   end
@@ -465,13 +447,9 @@ defmodule InfluxElixir.Client.HTTP do
         retention -> Map.put(body_map, "retention_period", retention)
       end
 
-    url = base_url(connection) <> "/api/v3/configure/database"
-    headers = json_headers(connection)
-
     # 409 = already exists, which is success for an idempotent create.
-    with {:ok, body} <- json_body(body_map),
-         {:ok, _response} <-
-           request(:post, url, headers, body, connection, opts, [200, 201, 409]) do
+    with {:ok, _response} <-
+           post_json(connection, "/api/v3/configure/database", body_map, opts, [200, 201, 409]) do
       :ok
     end
   end
@@ -480,11 +458,8 @@ defmodule InfluxElixir.Client.HTTP do
   @spec list_databases(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
   def list_databases(connection) do
-    url = base_url(connection) <> "/api/v3/configure/database?format=json"
-    headers = auth_headers(connection)
-
     with {:ok, %Finch.Response{body: resp_body}} <-
-           request(:get, url, headers, nil, connection, [], [200]),
+           get(connection, "/api/v3/configure/database?format=json", [200]),
          {:ok, rows} when is_list(rows) <- decode_json(resp_body) do
       {:ok, Enum.map(rows, fn row -> %{"name" => row["iox::database"]} end)}
     else
@@ -497,18 +472,11 @@ defmodule InfluxElixir.Client.HTTP do
   @spec delete_database(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_database(connection, name) do
-    url = base_url(connection) <> "/api/v3/configure/database?db="
-    headers = auth_headers(connection)
-
-    with :ok <- url_values(name: name),
-         {:ok, _response} <-
-           request(:delete, url <> query_value(name), headers, nil, connection, [], [200, 204]) do
-      :ok
-    end
+    delete_named(connection, "/api/v3/configure/database", "db", name)
   end
 
   # ---------------------------------------------------------------------------
-  # Admin — v2 buckets (compat)
+  # Admin — v2 buckets (compat), in `InfluxElixir.Client.HTTP.Buckets`
   # ---------------------------------------------------------------------------
 
   @impl true
@@ -518,160 +486,18 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: :ok | {:error, term()}
   def create_bucket(connection, name, opts \\ []) do
-    with :ok <- options(opts), do: create_bucket_request(connection, name, opts)
-  end
-
-  @spec create_bucket_request(keyword(), term(), keyword()) :: :ok | {:error, term()}
-  defp create_bucket_request(connection, name, opts) do
-    retention = Keyword.get(opts, :retention, 0)
-
-    with {:ok, org_id} <- resolve_org_id(connection, opts),
-         {:ok, body} <-
-           json_body(%{
-             "name" => name,
-             "orgID" => org_id,
-             "retentionRules" => [%{"everySeconds" => retention}]
-           }) do
-      url = base_url(connection) <> "/api/v2/buckets"
-      headers = json_headers(connection)
-
-      case request(:post, url, headers, body, connection, opts, [200, 201]) do
-        {:ok, _response} ->
-          :ok
-
-        # Creating a bucket that already exists is idempotent, matching
-        # Client.Local and the 409 handling in create_database/3.
-        {:error, %{status: 422, body: resp_body}} = error ->
-          if String.contains?(to_string(resp_body), "already exists"), do: :ok, else: error
-
-        error ->
-          error
-      end
-    end
-  end
-
-  # v2 buckets belong to an org by ID, not name. `opts[:org_id]` wins;
-  # otherwise the ID is looked up from the connection's `:org` name.
-  @spec resolve_org_id(keyword(), keyword()) :: {:ok, binary()} | {:error, term()}
-  defp resolve_org_id(connection, opts) do
-    case Keyword.get(opts, :org_id) do
-      nil -> lookup_org_id(connection, conn_val(connection, :org, ""))
-      org_id -> {:ok, org_id}
-    end
-  end
-
-  @spec lookup_org_id(keyword(), binary()) :: {:ok, binary()} | {:error, term()}
-  defp lookup_org_id(connection, org) do
-    url = base_url(connection) <> "/api/v2/orgs?org=#{query_value(org)}"
-
-    with {:ok, %Finch.Response{body: body}} <-
-           request(:get, url, auth_headers(connection), nil, connection, [], [200]),
-         {:ok, %{"orgs" => [%{"id" => id} | _rest]}} <- decode_json(body) do
-      {:ok, id}
-    else
-      {:ok, _no_orgs} -> {:error, {:org_not_found, org}}
-      {:error, _reason} = error -> error
-    end
+    with :ok <- options(opts), do: Buckets.create(connection, name, opts)
   end
 
   @impl true
   @spec list_buckets(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
-  def list_buckets(connection), do: list_bucket_pages(connection, 0, [])
-
-  # InfluxDB 2 answers at most 100 buckets a page (20 by default), so the pages are
-  # read until one is short (verified).
-  @bucket_page 100
-
-  @spec list_bucket_pages(keyword(), non_neg_integer(), [[map()]]) ::
-          {:ok, [map()]} | {:error, term()}
-  defp list_bucket_pages(connection, offset, pages) do
-    url =
-      base_url(connection) <>
-        "/api/v2/buckets?limit=#{@bucket_page}&offset=#{offset}" <> org_param(connection)
-
-    with {:ok, %Finch.Response{body: resp_body}} <-
-           request(:get, url, auth_headers(connection), nil, connection, [], [200]),
-         {:ok, %{"buckets" => page}} <- decode_json(resp_body) do
-      if length(page) == @bucket_page,
-        do: list_bucket_pages(connection, offset + @bucket_page, [page | pages]),
-        else: {:ok, [page | pages] |> Enum.reverse() |> Enum.concat()}
-    else
-      {:ok, other} -> {:error, {:unexpected_response, other}}
-      {:error, _reason} = error -> error
-    end
-  end
-
-  # Buckets are named per org: without the connection's org a name (or a
-  # listing) spans every org the token can read, and `delete_bucket/2`
-  # deleted another org's bucket of the same name (verified).
-  @spec org_param(keyword()) :: binary()
-  defp org_param(connection) do
-    case conn_val(connection, :org, "") do
-      "" -> ""
-      org -> "&org=" <> query_value(org)
-    end
-  end
+  def list_buckets(connection), do: Buckets.list(connection)
 
   @impl true
   @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_bucket(connection, bucket) do
-    with :ok <- url_values(bucket: bucket),
-         {:ok, bucket_id} <- resolve_bucket_id(connection, to_string(bucket)) do
-      url = base_url(connection) <> "/api/v2/buckets/#{path_segment(bucket_id)}"
-      headers = auth_headers(connection)
-
-      with {:ok, _response} <-
-             request(:delete, url, headers, nil, connection, [], [200, 204]) do
-        :ok
-      end
-    end
-  end
-
-  # The v2 API deletes by 16-hex bucket ID, while Client.Local deletes by
-  # name. Accept either so callers can pass the name against both clients.
-  @spec resolve_bucket_id(keyword(), binary()) :: {:ok, binary()} | {:error, term()}
-  defp resolve_bucket_id(connection, bucket) do
-    if String.match?(bucket, ~r/^[0-9a-f]{16}$/) do
-      {:ok, bucket}
-    else
-      lookup_bucket_id(connection, bucket)
-    end
-  end
-
-  @spec lookup_bucket_id_error(binary()) :: {:error, term()}
-  defp lookup_bucket_id_error(name),
-    do: {:error, %{status: 404, body: "bucket not found: #{name}"}}
-
-  @spec lookup_bucket_id(keyword(), binary()) :: {:ok, binary()} | {:error, term()}
-  defp lookup_bucket_id(connection, name) do
-    url =
-      base_url(connection) <> "/api/v2/buckets?name=#{query_value(name)}" <> org_param(connection)
-
-    # Scoped to an org, the server answers a missing name with a 404 of its
-    # own rather than an empty list; both are this client's "not found". A
-    # 404 for the org itself is passed on as the server's answer.
-    with {:ok, %Finch.Response{body: body}} <-
-           request(:get, url, auth_headers(connection), nil, connection, [], [200]),
-         {:ok, %{"buckets" => [%{"id" => id} | _rest]}} <- decode_json(body) do
-      {:ok, id}
-    else
-      {:ok, _no_buckets} ->
-        lookup_bucket_id_error(name)
-
-      {:error, %{status: 404, body: body}} = error ->
-        if bucket_not_found?(body), do: lookup_bucket_id_error(name), else: error
-
-      {:error, _reason} = error ->
-        error
-    end
-  end
-
-  @spec bucket_not_found?(binary()) :: boolean()
-  defp bucket_not_found?(body) do
-    match?({:ok, %{"message" => "bucket " <> _rest}}, Jason.decode(body))
-  end
+  def delete_bucket(connection, bucket), do: Buckets.delete(connection, bucket)
 
   # ---------------------------------------------------------------------------
   # Admin — v3 tokens
@@ -689,15 +515,7 @@ defmodule InfluxElixir.Client.HTTP do
     with :ok <- options(opts),
          {:ok, {_kind, path, body}} <- TokenRequest.build(name, opts),
          {:ok, %Finch.Response{body: resp_body}} <-
-           request(
-             :post,
-             base_url(connection) <> path,
-             json_headers(connection),
-             body,
-             connection,
-             opts,
-             [200, 201]
-           ) do
+           post_json(connection, path, body, opts, [200, 201]) do
       decode_json(resp_body)
     end
   end
@@ -706,14 +524,7 @@ defmodule InfluxElixir.Client.HTTP do
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_token(connection, name) do
-    url = base_url(connection) <> "/api/v3/configure/token?token_name="
-    headers = auth_headers(connection)
-
-    with :ok <- url_values(name: name),
-         {:ok, _response} <-
-           request(:delete, url <> query_value(name), headers, nil, connection, [], [200, 204]) do
-      :ok
-    end
+    delete_named(connection, "/api/v3/configure/token", "token_name", name)
   end
 
   # ---------------------------------------------------------------------------
@@ -724,11 +535,7 @@ defmodule InfluxElixir.Client.HTTP do
   @spec health(InfluxElixir.Client.connection()) ::
           {:ok, map()} | {:error, term()}
   def health(connection) do
-    url = base_url(connection) <> "/health"
-    headers = auth_headers(connection)
-
-    with {:ok, %Finch.Response{body: resp_body}} <-
-           request(:get, url, headers, nil, connection, [], [200]) do
+    with {:ok, %Finch.Response{body: resp_body}} <- get(connection, "/health", [200]) do
       # A 200 with a non-JSON body (older builds answer plain text) is
       # still a passing health check.
       case Jason.decode(resp_body) do
@@ -739,192 +546,22 @@ defmodule InfluxElixir.Client.HTTP do
   end
 
   # ---------------------------------------------------------------------------
-  # Private: HTTP helpers
+  # Private helpers
   # ---------------------------------------------------------------------------
-
-  # A value in a query string. `URI.encode_www_form/1` encodes `&`, `+`, `=` and `#`,
-  # which `URI.encode/1` leaves alone: a v2 bucket named `a&b` would be written to
-  # bucket `a` (verified against InfluxDB 2.7).
-  @spec query_value(term()) :: binary()
-  defp query_value(value), do: value |> to_string() |> URI.encode_www_form()
-
-  # Options that are not a keyword list have nothing a request could be built from: the
-  # caller's error, never a raise.
-  @spec options(term()) :: :ok | {:error, {:invalid_options, term()}}
-  defp options(opts) do
-    if is_list(opts) and Keyword.keyword?(opts),
-      do: :ok,
-      else: {:error, {:invalid_options, opts}}
-  end
-
-  # A value written into a URL is text (an atom or a number is written as its text); a map,
-  # a tuple or a list has no form there: the caller's error, never a raise.
-  @spec url_values(keyword()) :: :ok | {:error, {:invalid_value, atom(), term()}}
-  defp url_values(values) do
-    case Enum.find(values, fn {_key, value} -> not url_text?(value) end) do
-      nil -> :ok
-      {key, value} -> {:error, {:invalid_value, key, value}}
-    end
-  end
-
-  defp url_text?(value), do: is_binary(value) or is_atom(value) or is_number(value)
-
-  # A write body is iodata (a binary, or a list of binaries and bytes): anything else has no
-  # bytes to send, the caller's error, never a raise.
-  @spec iodata_body(term()) :: :ok | {:error, {:invalid_body, term()}}
-  defp iodata_body(body) when is_binary(body), do: :ok
-
-  defp iodata_body(body) when is_list(body) do
-    _length = IO.iodata_length(body)
-    :ok
-  rescue
-    ArgumentError -> {:error, {:invalid_body, body}}
-  end
-
-  defp iodata_body(body), do: {:error, {:invalid_body, body}}
-
-  # A path segment: everything but the unreserved characters is encoded.
-  @spec path_segment(term()) :: binary()
-  defp path_segment(value), do: value |> to_string() |> URI.encode(&URI.char_unreserved?/1)
-
-  # Runs a request and normalises the outcome: `{:ok, response}` when the
-  # status is one of `ok_statuses`, `{:error, %{status, body}}` for any other
-  # status, and `{:error, {:connection_error, reason}}` for a transport
-  # failure. Every public function shares this three-clause case.
-  @spec request(
-          :get | :post | :delete,
-          binary(),
-          [{binary(), binary()}],
-          binary() | nil,
-          keyword(),
-          keyword(),
-          [non_neg_integer()]
-        ) :: {:ok, Finch.Response.t()} | {:error, term()}
-  defp request(method, url, headers, body, connection, opts, ok_statuses) do
-    case do_request(method, url, headers, body, connection, opts) do
-      {:ok, %Finch.Response{status: status} = response} ->
-        if status in ok_statuses do
-          {:ok, response}
-        else
-          {:error, %{status: status, body: response.body}}
-        end
-
-      {:error, reason} ->
-        {:error, {:connection_error, reason}}
-    end
-  end
-
-  @spec do_request(
-          :get | :post | :delete,
-          binary(),
-          [{binary(), binary()}],
-          binary() | nil,
-          keyword(),
-          keyword()
-        ) :: {:ok, Finch.Response.t()} | {:error, term()}
-  defp do_request(method, url, headers, body, connection, opts) do
-    with {:ok, finch_name} <- resolve_finch(connection) do
-      request = Finch.build(method, url, headers, body)
-      Finch.request(request, finch_name, finch_opts(opts, connection))
-    end
-  rescue
-    # Finch does not return an error tuple when no connection can be checked
-    # out within :pool_timeout — it converts NimblePool's exit into a
-    # RuntimeError — nor when no pool of that name is running (`ArgumentError: unknown
-    # registry`). Map both back into the library's tagged-tuple contract.
-    error in [RuntimeError, ArgumentError] -> {:error, classify_finch_error(error)}
-  end
-
-  @pool_timeout_message "Finch was unable to provide a connection within the timeout"
-
-  @spec classify_finch_error(Exception.t()) :: :pool_timeout | :no_pool | Exception.t()
-  defp classify_finch_error(%RuntimeError{message: @pool_timeout_message <> _rest}),
-    do: :pool_timeout
-
-  defp classify_finch_error(%ArgumentError{message: "unknown registry" <> _rest}), do: :no_pool
-
-  defp classify_finch_error(error), do: error
-
-  # Both Finch timeouts, resolved with the same precedence. Without an
-  # explicit `pool_timeout` Finch waits at most 5 s to check a connection out
-  # of the pool, regardless of how generous `receive_timeout` is (#14).
-  @spec finch_opts(keyword(), keyword()) :: keyword()
-  defp finch_opts(opts, connection) do
-    [
-      receive_timeout: resolve_timeout(opts, connection),
-      pool_timeout: resolve_pool_timeout(opts, connection)
-    ]
-  end
 
   @doc false
   # Resolves the receive timeout in milliseconds. Precedence:
-  #   opts[:timeout] → connection[:timeout] → @default_timeout
+  #   opts[:timeout] → connection[:timeout] → 30_000
   # Exposed (with @doc false) for the default alone: the precedence is pinned
   # through the query functions, but a 30 second default is not waited for.
   @spec resolve_timeout(keyword(), keyword()) :: non_neg_integer()
-  def resolve_timeout(opts, connection) do
-    Keyword.get(opts, :timeout) ||
-      Keyword.get(connection, :timeout) ||
-      @default_timeout
-  end
+  defdelegate resolve_timeout(opts, connection), to: Request
 
   @doc false
   # Resolves the pool checkout timeout in milliseconds. Precedence:
-  #   opts[:pool_timeout] → connection[:pool_timeout] → @default_pool_timeout
+  #   opts[:pool_timeout] → connection[:pool_timeout] → 5_000
   @spec resolve_pool_timeout(keyword(), keyword()) :: non_neg_integer()
-  def resolve_pool_timeout(opts, connection) do
-    Keyword.get(opts, :pool_timeout) ||
-      Keyword.get(connection, :pool_timeout) ||
-      @default_pool_timeout
-  end
-
-  # The pool of a connection: its `:finch_name`, else the pool the supervisor started for its
-  # `:name`. A keyword config with neither has no pool to name.
-  @spec resolve_finch(keyword()) :: {:ok, atom()} | {:error, :no_pool_name}
-  defp resolve_finch(connection) do
-    case {Keyword.get(connection, :finch_name), Keyword.get(connection, :name)} do
-      {nil, nil} -> {:error, :no_pool_name}
-      {nil, name} -> {:ok, InfluxElixir.ConnectionSupervisor.finch_name(name)}
-      {finch_name, _name} -> {:ok, finch_name}
-    end
-  end
-
-  @spec base_url(keyword()) :: binary()
-  defp base_url(connection) do
-    scheme = conn_val(connection, :scheme, :https)
-    host = conn_val(connection, :host)
-    port = conn_val(connection, :port, 8086)
-    "#{scheme}://#{host}:#{port}"
-  end
-
-  @spec auth_headers(keyword()) :: [{binary(), binary()}]
-  defp auth_headers(connection) do
-    case conn_val(connection, :token) do
-      nil -> []
-      "" -> []
-      token -> [{"authorization", "Bearer #{token}"}]
-    end
-  end
-
-  @spec json_headers(keyword()) :: [{binary(), binary()}]
-  defp json_headers(connection) do
-    [{"content-type", "application/json"} | auth_headers(connection)]
-  end
-
-  @spec conn_val(keyword(), atom(), term()) :: term()
-  defp conn_val(connection, key, default \\ nil) do
-    Keyword.get(connection, key, default)
-  end
-
-  # A body that is not JSON (a proxy's HTML page, say) is the same error
-  # ResponseParser gives, not a bare Jason.DecodeError.
-  @spec decode_json(binary()) :: {:ok, term()} | {:error, {:json_parse_error, term()}}
-  defp decode_json(body) do
-    case Jason.decode(body) do
-      {:ok, decoded} -> {:ok, decoded}
-      {:error, reason} -> {:error, {:json_parse_error, reason}}
-    end
-  end
+  defdelegate resolve_pool_timeout(opts, connection), to: Request
 
   @spec resolve_database(keyword(), keyword()) ::
           {:ok, binary()} | {:error, :no_database_specified}
@@ -934,262 +571,6 @@ defmodule InfluxElixir.Client.HTTP do
     case Keyword.get(opts, :database) || conn_val(connection, :database) do
       nil -> {:error, :no_database_specified}
       db -> {:ok, db}
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private: streaming helpers
-  #
-  # True incremental streaming with constant memory. `Finch.stream/5` is
-  # push-based (it invokes a callback as chunks arrive), while `Stream.resource`
-  # is pull-based. We bridge the two with a producer process: the producer runs
-  # `Finch.stream/5` and, for each status/data chunk, sends a message to the
-  # consumer and blocks until the consumer acks. Because the callback blocks
-  # inside the HTTP receive loop, this gives real back-pressure — a chunk is
-  # only pulled off the socket when the downstream consumer asks for the next
-  # element. JSONL is decoded line-by-line as bytes arrive; only one chunk plus
-  # a partial-line buffer is ever held in memory.
-  #
-  # Errors are never swallowed: a non-2xx status or a transport error raises an
-  # `InfluxElixir.StreamError` when the stream is consumed, mirroring the
-  # `{:error, reason}` contract of `query_sql/3`.
-  # ---------------------------------------------------------------------------
-
-  @typep stream_state :: %{
-           producer: pid(),
-           ref: reference(),
-           monitor: reference(),
-           status: non_neg_integer() | nil,
-           buffer: binary(),
-           error_body: iodata(),
-           phase: :streaming | :halt
-         }
-
-  @spec start_stream(atom(), binary(), list(), binary(), keyword()) ::
-          stream_state()
-  defp start_stream(finch_name, url, headers, body, finch_opts) do
-    parent = self()
-    ref = make_ref()
-
-    producer =
-      spawn(fn ->
-        run_producer(parent, ref, finch_name, url, headers, body, finch_opts)
-      end)
-
-    monitor = Process.monitor(producer)
-
-    %{
-      producer: producer,
-      ref: ref,
-      monitor: monitor,
-      status: nil,
-      buffer: "",
-      error_body: [],
-      phase: :streaming
-    }
-  end
-
-  # Producer process body. Runs the blocking Finch stream, forwarding each
-  # chunk to the consumer with back-pressure, then signalling completion.
-  @spec run_producer(pid(), reference(), atom(), binary(), list(), binary(), keyword()) ::
-          :ok
-  defp run_producer(parent, ref, finch_name, url, headers, body, finch_opts) do
-    request = Finch.build(:post, url, headers, body)
-    # The consumer may die without running `stream_cleanup/1` (killed, or
-    # its task shut down brutally); the producer then waited for an ack
-    # that never came and kept its pool connection checked out for good.
-    consumer = Process.monitor(parent)
-
-    # The request is ended with `{:halt, _}`, never by killing this process:
-    # Finch then checks the connection back in, and a request already
-    # queued for the pool is served. A pool whose checked-out owner dies
-    # drops that connection without serving its queue (verified), so the
-    # waiting request timed out.
-    outcome =
-      try do
-        Finch.stream_while(
-          request,
-          finch_name,
-          :streaming,
-          fn
-            {:status, status}, acc -> emit_and_wait(parent, consumer, ref, {:status, status}, acc)
-            {:data, data}, acc -> emit_and_wait(parent, consumer, ref, {:data, data}, acc)
-            {_headers_or_trailers, _value}, acc -> {:cont, acc}
-          end,
-          finch_opts
-        )
-      rescue
-        # No pool of that name, or none to check a connection out of: the consumer is told
-        # by name (as `do_request/6` tells a caller), not by a crashed process.
-        error in [RuntimeError, ArgumentError] ->
-          {:error, classify_finch_error(error), :streaming}
-      end
-
-    # A consumer that cancelled, or died, is sent nothing more.
-    case outcome do
-      {:ok, :streaming} -> send(parent, {ref, :done})
-      {:ok, :cancelled} -> :ok
-      {:error, reason, :streaming} -> send(parent, {ref, {:transport_error, reason}})
-      {:error, _reason, :cancelled} -> :ok
-    end
-
-    :ok
-  end
-
-  # Send a chunk to the consumer and block until it acks. A consumer that
-  # stops early cancels (`stream_cleanup/1`), and one that dies is seen by
-  # its monitor; either way the request halts.
-  @spec emit_and_wait(pid(), reference(), reference(), term(), :streaming) ::
-          {:cont, :streaming} | {:halt, :cancelled}
-  defp emit_and_wait(parent, consumer, ref, msg, acc) do
-    send(parent, {ref, msg})
-
-    receive do
-      {:ack, ^ref} -> {:cont, acc}
-      {:cancel, ^ref} -> {:halt, :cancelled}
-      {:DOWN, ^consumer, :process, ^parent, _reason} -> {:halt, :cancelled}
-    end
-  end
-
-  @spec stream_next(stream_state()) :: {[map()], stream_state()} | {:halt, stream_state()}
-  defp stream_next(%{phase: :halt} = state), do: {:halt, state}
-
-  defp stream_next(%{ref: ref, producer: producer, monitor: monitor} = state) do
-    receive do
-      {^ref, {:status, status}} ->
-        ack(producer, ref)
-        {[], %{state | status: status}}
-
-      {^ref, {:data, data}} ->
-        ack(producer, ref)
-        handle_data(state, data)
-
-      {^ref, :done} ->
-        finish(state)
-
-      {^ref, {:transport_error, reason}} ->
-        raise InfluxElixir.StreamError, kind: :transport, reason: reason
-
-      {:DOWN, ^monitor, :process, ^producer, :normal} ->
-        {:halt, %{state | phase: :halt}}
-
-      # The producer crashed. A pool checkout timeout surfaces here because
-      # Finch raises inside the producer; report it by name.
-      {:DOWN, ^monitor, :process, ^producer, {%error_module{} = error, _stack}}
-      when error_module in [RuntimeError, ArgumentError] ->
-        raise InfluxElixir.StreamError, kind: :transport, reason: classify_finch_error(error)
-
-      {:DOWN, ^monitor, :process, ^producer, reason} ->
-        raise InfluxElixir.StreamError, kind: :transport, reason: reason
-    end
-  end
-
-  # Decode a data chunk. On a 200 response, complete JSONL lines are decoded
-  # and emitted while the trailing partial line is buffered. On a non-2xx
-  # response, the body is accumulated so it can be reported when the stream ends.
-  @spec handle_data(stream_state(), binary()) :: {[map()], stream_state()}
-  defp handle_data(%{status: 200, buffer: buffer} = state, data) do
-    {lines, rest} = split_lines(buffer <> data)
-    {Enum.map(lines, &decode_line/1), %{state | buffer: rest}}
-  end
-
-  defp handle_data(%{error_body: acc} = state, data) do
-    {[], %{state | error_body: [acc, data]}}
-  end
-
-  # Producer signalled a clean end-of-response.
-  @spec finish(stream_state()) :: {[map()], stream_state()}
-  defp finish(%{status: 200, buffer: buffer} = state) do
-    rows =
-      case String.trim(buffer) do
-        "" -> []
-        line -> [decode_line(line)]
-      end
-
-    {rows, %{state | buffer: "", phase: :halt}}
-  end
-
-  defp finish(%{status: status, error_body: acc}) do
-    raise InfluxElixir.StreamError,
-      kind: :http_status,
-      status: status,
-      body: IO.iodata_to_binary(acc)
-  end
-
-  # Split accumulated bytes into complete lines plus a trailing remainder that
-  # has not yet been terminated by a newline. Blank lines are dropped.
-  @spec split_lines(binary()) :: {[binary()], binary()}
-  defp split_lines(data) do
-    parts = String.split(data, "\n")
-    {complete, [rest]} = Enum.split(parts, length(parts) - 1)
-    {Enum.reject(complete, &(&1 == "")), rest}
-  end
-
-  # The same coercion `query_sql/3` applies (timestamps become DateTimes),
-  # so a row is the same map streamed or not.
-  @spec decode_line(binary()) :: map()
-  defp decode_line(line) do
-    case Jason.decode(line) do
-      {:ok, row} when is_map(row) ->
-        ResponseParser.coerce_types(row)
-
-      {:ok, other} ->
-        raise InfluxElixir.StreamError, kind: :decode, reason: {:unexpected_json, other}
-
-      {:error, reason} ->
-        raise InfluxElixir.StreamError, kind: :decode, reason: reason
-    end
-  end
-
-  @spec ack(pid(), reference()) :: :ok
-  defp ack(producer, ref) do
-    send(producer, {:ack, ref})
-    :ok
-  end
-
-  # Stop the producer and drain its messages from the consumer's mailbox:
-  # the stream runs in the caller's process, so a leftover chunk or :DOWN
-  # would otherwise pollute that mailbox. A producer still running is asked
-  # to cancel, so its request halts and the connection goes back to the
-  # pool (see `run_producer/7`); it notices at its next chunk. One that does
-  # not stop within the grace period (a server gone silent) is killed.
-  # Waiting for its :DOWN first means every message it sent is already in
-  # the mailbox when it is flushed.
-  @cancel_grace_ms 1_000
-
-  @spec stream_cleanup(stream_state() | term()) :: :ok
-  defp stream_cleanup(%{producer: producer, ref: ref, monitor: monitor}) do
-    if Process.alive?(producer) do
-      send(producer, {:cancel, ref})
-      await_down(producer, monitor)
-    end
-
-    Process.demonitor(monitor, [:flush])
-    flush_ref(ref)
-  end
-
-  defp stream_cleanup(_state), do: :ok
-
-  @spec await_down(pid(), reference()) :: :ok
-  defp await_down(producer, monitor) do
-    receive do
-      {:DOWN, ^monitor, :process, ^producer, _reason} -> :ok
-    after
-      @cancel_grace_ms ->
-        Process.exit(producer, :kill)
-
-        receive do
-          {:DOWN, ^monitor, :process, ^producer, _reason} -> :ok
-        end
-    end
-  end
-
-  @spec flush_ref(reference()) :: :ok
-  defp flush_ref(ref) do
-    receive do
-      {^ref, _msg} -> flush_ref(ref)
-    after
-      0 -> :ok
     end
   end
 

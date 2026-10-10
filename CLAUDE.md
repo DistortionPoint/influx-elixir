@@ -70,7 +70,9 @@ lib/influx_elixir.ex                    # Public API facade
 lib/influx_elixir/
 ├── client.ex                           # Client behaviour (HTTP and Local implement it)
 ├── client/
-│   ├── http.ex                         # HTTP client (Finch wrapper)
+│   ├── http.ex                         # HTTP client (Finch wrapper); `http/` holds its shared
+│   │                                   #   request helpers, v2 buckets and streaming producer
+│   ├── options.ex                      # `keyword?/1`, `iodata/1`, `database/1` shared by the clients
 │   ├── query_params.ex                 # `$param` normalisation shared by both clients
 │   ├── local.ex                        # PUBLIC in-memory test double: facade, docs, specs
 │   └── local/                          # Local's internals, all `@moduledoc false`
@@ -84,7 +86,8 @@ lib/influx_elixir/
 │       └── write/                      # write path and request-body (gzip/UTF-8) reading
 ├── application.ex                      # Starts InfluxElixir.Supervisor (configured connections only)
 ├── supervisor.ex                       # One ConnectionSupervisor per configured connection
-├── connection_supervisor.ex            # A connection's Finch pool and optional BatchWriter
+├── connection_supervisor.ex            # A connection's Finch pool and optional BatchWriter;
+│                                       #   `connection_supervisor/` holds its token wrapper and Registration child
 ├── connection.ex                       # Named connection registry (persistent_term)
 ├── config.ex                           # Connection configuration (NimbleOptions)
 ├── stream_error.ex                     # The error a lazy query stream raises when enumerated
@@ -93,7 +96,7 @@ lib/influx_elixir/
 │   ├── line_protocol.ex                # Line protocol encoder
 │   ├── point.ex                        # Point struct
 │   ├── writer.ex                       # Direct write (single request)
-│   └── batch_writer.ex                # GenServer batch writer with flush/retry
+│   └── batch_writer.ex                # GenServer batch writer: requests in a monitored process, retry classifier
 ├── query/
 │   ├── sql.ex                          # v3 SQL query builder + executor
 │   ├── sql_stream.ex                   # Streaming JSONL query results

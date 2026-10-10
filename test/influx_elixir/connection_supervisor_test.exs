@@ -1,6 +1,8 @@
 defmodule InfluxElixir.ConnectionSupervisorTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias InfluxElixir.{Connection, ConnectionSupervisor}
 
   defp unique_name do
@@ -75,7 +77,8 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       finch_name = ConnectionSupervisor.finch_name(name)
       finch = Process.whereis(finch_name)
       assert is_pid(finch) and Process.alive?(finch)
-      assert [{^finch_name, child, _type, _mods}] = Supervisor.which_children(sup)
+      children = Supervisor.which_children(sup)
+      assert {^finch_name, child, _type, _mods} = List.keyfind(children, finch_name, 0)
       assert is_pid(child) and Process.alive?(child)
     end
 
@@ -178,6 +181,92 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       assert_raise ArgumentError, fn ->
         Connection.fetch!(name)
       end
+    end
+  end
+
+  describe "the registration follows the supervisor" do
+    test "a supervisor that stops by itself erases its registration" do
+      # `remove_connection/1` erased it itself; a supervisor that gives up after too many
+      # restarts, or is stopped any other way, left a name that resolved to a dead connection.
+      name = unique_name()
+      {:ok, sup} = ConnectionSupervisor.start_link(name: name, databases: ["x"])
+
+      assert {:ok, _connection} = Connection.get(name)
+      :ok = Supervisor.stop(sup)
+
+      assert Connection.get(name) === {:error, :not_found}
+
+      assert_raise ArgumentError, ~r/no InfluxElixir connection named/, fn ->
+        InfluxElixir.health(name)
+      end
+    end
+
+    test "a connection that fails to start leaves nothing registered" do
+      name = unique_name()
+
+      assert {:error, _reason} =
+               InfluxElixir.add_connection(name, batch_writer: [batch_size: 0])
+
+      assert Connection.get(name) === {:error, :not_found}
+    end
+  end
+
+  describe "start_link/1 with a config that names no connection" do
+    test "is an error naming the config, never a raise" do
+      for config <- [:x, nil, [1], [host: "h"], [name: "not an atom"], [name: nil]] do
+        assert InfluxElixir.ConnectionSupervisor.start_link(config) ===
+                 {:error, {:invalid_options, config}}
+      end
+    end
+  end
+
+  describe "a failed start" do
+    test "holds the token neither in its error nor in the logs" do
+      name = unique_name()
+      token = "secret-token-#{System.unique_integer([:positive])}"
+
+      log =
+        capture_log(fn ->
+          assert {:error, reason} =
+                   InfluxElixir.add_connection(name,
+                     token: token,
+                     batch_writer: [batch_size: 0]
+                   )
+
+          send(self(), {:reason, reason})
+        end)
+
+      assert_received {:reason, reason}
+      assert inspect(reason) =~ "invalid value for :batch_size option"
+      refute inspect(reason, limit: :infinity, printable_limit: :infinity) =~ token
+      refute log =~ token
+    end
+
+    test "the child spec carries the token opaque" do
+      token = "secret-token-#{System.unique_integer([:positive])}"
+      spec = ConnectionSupervisor.child_spec(name: :spec_test, token: token, host: "h")
+
+      refute inspect(spec, limit: :infinity) =~ token
+      assert inspect(spec) =~ "host: \"h\""
+    end
+  end
+
+  describe "the batch writer of a connection" do
+    test "is reached by name from the facade" do
+      name = unique_name()
+
+      {:ok, _pid} =
+        InfluxElixir.add_connection(name,
+          database: "bw_name_db",
+          batch_writer: [flush_interval_ms: 60_000, batch_size: 10]
+        )
+
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+
+      point = InfluxElixir.point("cpu", %{"value" => 1}, timestamp: 1_000)
+      assert InfluxElixir.write_batched(name, point, sync: true) === :ok
+
+      assert InfluxElixir.query_sql(name, "SELECT value FROM cpu") === {:ok, [%{"value" => 1}]}
     end
   end
 end

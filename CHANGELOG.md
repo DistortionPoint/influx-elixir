@@ -8,6 +8,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Two more raises on caller input**:
+  - `InfluxElixir.ConnectionSupervisor.start_link/1` with a config that is not a keyword list
+    holding an atom `:name` returns `{:error, {:invalid_options, config}}`.
+  - `InfluxElixir.write/3` with a connection that is no connection (a host name, a number)
+    returns `{:error, {:invalid_connection, term}}`, as the query functions do.
+- **Review of 71e2b8c, second half: `BatchWriter`, the connection, `Client.HTTP`** (design
+  document `2026-10-10_review-of-71e2b8c.md`, "Second half"):
+  - `BatchWriter.write/3` and `write_sync/3` with a list of Points, iodata or `nil` raised a
+    `FunctionClauseError` in the writer, which killed it and exited every caller. They take a
+    Point, a list of Points, a binary or iodata; anything else is `{:error, {:invalid_payload,
+    payload}}` and the writer keeps running. A Point is encoded in the caller.
+  - The writer retried errors that can never succeed: a connection with no database retried
+    `{:error, :no_database_specified}` `max_retries` times, as did `{:invalid_*, _}`,
+    `{:unencodable_body, _}` and `{:invalid_options, _}`. One classifier decides, for the retry
+    handler and the first attempt alike: a transport error (`{:connection_error, _}`,
+    `:pool_timeout`, `:timeout`), a 5xx, 408 and 429 are retried; every other error is
+    discarded at once. The backoff (`base * 2^attempt`) was uncapped; `:max_retry_delay_ms`
+    (default 30 000) caps it before the jitter.
+  - The writer made each HTTP request inside its own callback, so `stats/1` exited with
+    `:timeout` against a slow server, `write/3` and `flush/2` queued behind the request, and a
+    `write/2` that completed a `batch_size: 1` batch blocked its caller until the server
+    answered. The requests are made by a monitored process (not linked), one at a time and in
+    the order the batches were taken, and the writer handles the answer as a message.
+    `flush/2` returns when the requests ahead of it, and its own first attempt, have finished;
+    `write_sync/3` when its batch has been written or has failed for good; `terminate/2` waits
+    for the request in flight, then writes the batches still to retry and the buffer as before.
+    `stats/2` takes a timeout (default 5 s). The `:hibernate` after every timer tick, which
+    forced a full garbage collection each interval, is gone.
+  - `batch_size` and the backpressure bound (`10 * batch_size`) counted writes, not lines, so a
+    write of many lines was one. They count lines.
+  - A retry re-sent an untimed point, which the server stamps with its own clock: a server that
+    committed a write that then timed out stored the retry again, at a later time. A Point
+    without a `:timestamp` is stamped in the caller (see Changed).
+  - A `BatchWriter` started with `connection: :name` crashed on its first flush
+    (`Access.get(:name, :database)`). `Writer.write/3` resolves a registered connection's name;
+    one that is not registered is `{:error, {:invalid_connection, name}}`.
+  - `InfluxElixir.write(conn, %Point{})` was `{:error, {:invalid_body, %Point{}}}`. It takes a
+    Point and a list of Points, encoded for the call's `:precision` and the connection's
+    `api_version`.
+  - `ConnectionSupervisor`: a client whose `init_connection/1` returned `{:error, reason}`
+    raised a `MatchError` in the supervisor's init; `start_link/1` returns `{:error, reason}`.
+    A supervisor that stopped (too many restarts, or any stop but `remove_connection/1`) left
+    its name resolving to a dead connection and, for `Client.Local`, its store allocated: a
+    first child, `Registration`, erases the name and releases the client's state whenever the
+    supervisor stops. The call that reaches a connection in the moment before its pool has
+    started is `{:error, {:connection_error, :no_pool}}`.
+  - A failed connection start returned its whole config, `:token` included, in the error and
+    printed it in the logs of the failure. The child spec and the supervisor's argument carry
+    the token opaque (it prints as `#InfluxElixir.ConnectionSupervisor.Secret<...>`); the
+    connection's own `:token` stays a binary. The connection's `BatchWriter` is started with the
+    connection's name, so its child spec holds no config.
+  - `Connection.finch_name/1` ignored a connection's `:finch_name`; it returns it.
+  - `Writer.write/3` split every body into lines to count them for the telemetry metadata, with
+    or without a handler. It counts newlines in the binary (`point_count` of a body with a
+    blank line in the middle is one more than before, a trailing newline is still not a line).
 - **Documentation**:
   - `Query.Flux` documents that `:org` defaults to the connection's.
   - `Query.SQLStream` documents `:timeout` and `:pool_timeout`.
@@ -240,6 +295,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (`InfluxQLNested` raises it first), `Typed.mismatch/3`, the `:never` outcome and the catch-all of
     `Typed.decide/2`, `:huge` numbers (the lexer refuses them), the missing-argument machinery of the
     walker (the parser refuses those statements) and the defaults of `typer/2` and `standalone/4`.
+
+### Added
+- `InfluxElixir.write_batched/3`: buffers a Point, a list of Points or line protocol on a
+  connection's `BatchWriter` (`sync: true` waits for the batch, `timeout:` bounds the call). The
+  writer was unreachable from the public API: the facade had `flush/2` and `stats/1` only.
+- `InfluxElixir.write/3` and `Writer.write/3` accept a `Point` and a list of Points.
+- `BatchWriter` option `:max_retry_delay_ms` (default 30 000), `BatchWriter.stats/2` and
+  `InfluxElixir.stats/2` with a timeout, and `BatchWriter.write/3` accepting iodata and Points.
+
+### Changed
+- A `Point` written through `BatchWriter` without a `:timestamp` is stamped with the time of the
+  `write/3` call (a `DateTime`, written in the writer's `:precision`), where it used to be left
+  for the server to stamp when the batch was sent. Points of one batch no longer share the
+  server's time and are not stored a second time by a retry. Line protocol you encode yourself is
+  sent as given.
+- `BatchWriter`: `batch_size` and the backpressure bound count lines. A permanent error is
+  discarded at the first attempt (see Fixed). Requests are made by a process of its own, so
+  tests that write with `batch_size` reached and read at once must `flush/2` (or write with
+  `write_sync/3`) first: a write that completes a batch returns before the request.
+- The six manual emitters of `InfluxElixir.Telemetry` (`write_start/1`, `write_stop/2`,
+  `write_exception/2`, `query_start/1`, `query_stop/2`, `query_exception/2`) are deprecated in the
+  documentation: the library never calls them and `span_write/2` and `span_query/2` emit the
+  same events, paired. They are not removed.
+- `InfluxElixir.Config.base_url/1` is the one place the request URL is built (`Client.HTTP` had a private
+  copy with its own defaults): a missing `:scheme` is `:https`, a missing `:port` is `8086`, and
+  it no longer raises on a missing key.
+- Internal: `Client.HTTP` is split into `Client.HTTP.Request` (shared request helpers),
+  `Client.HTTP.Buckets` and `Client.HTTP.Stream` (all `@moduledoc false`; its public functions
+  are unchanged), its seven JSON POSTs and two DELETEs share one function each, and
+  `Client.Options` holds the option, iodata and database reads that six modules repeated.
 
 ## [0.1.43] - 2026-10-09
 

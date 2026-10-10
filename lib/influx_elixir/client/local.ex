@@ -524,6 +524,8 @@ defmodule InfluxElixir.Client.Local do
     Writes
   }
 
+  alias InfluxElixir.Client.Options
+
   @typedoc "A parsed point: fields and tags as string-keyed maps, timestamp in ns."
   @type point_map :: %{
           required(:measurement) => binary(),
@@ -608,7 +610,7 @@ defmodule InfluxElixir.Client.Local do
   """
   @spec start(keyword()) :: {:ok, conn()}
   def start(opts \\ []) do
-    unless keyword?(opts) do
+    unless Options.keyword?(opts) do
       raise ArgumentError, "invalid options: expected a keyword list, got #{inspect(opts)}"
     end
 
@@ -863,7 +865,7 @@ defmodule InfluxElixir.Client.Local do
         when result: term()
   defp text(value, what, opts, run) do
     cond do
-      not keyword?(opts) -> refused("the options are not a keyword list")
+      not Options.keyword?(opts) -> refused("the options are not a keyword list")
       is_binary(value) -> run.(value)
       true -> refused("the #{what} is not a string")
     end
@@ -871,9 +873,8 @@ defmodule InfluxElixir.Client.Local do
 
   @spec options(term(), (-> result)) :: result | {:error, map()} when result: term()
   defp options(opts, run),
-    do: if(keyword?(opts), do: run.(), else: refused("the options are not a keyword list"))
-
-  defp keyword?(opts), do: is_list(opts) and Keyword.keyword?(opts)
+    do:
+      if(Options.keyword?(opts), do: run.(), else: refused("the options are not a keyword list"))
 
   # A proper list of strings (an improper list is none).
   defp names?([]), do: true
@@ -884,13 +885,12 @@ defmodule InfluxElixir.Client.Local do
 
   # A body may be iodata, as `Client.HTTP` sends it; anything else stays as given.
   @spec iodata(term()) :: term()
-  defp iodata(payload) when is_list(payload) do
-    IO.iodata_to_binary(payload)
-  rescue
-    ArgumentError -> payload
+  defp iodata(payload) do
+    case Options.iodata(payload) do
+      {:ok, text} -> text
+      :error -> payload
+    end
   end
-
-  defp iodata(payload), do: payload
 
   # ---------------------------------------------------------------------------
   # Database admin

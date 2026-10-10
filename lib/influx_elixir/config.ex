@@ -136,7 +136,7 @@ defmodule InfluxElixir.Config do
   @spec validate(keyword()) ::
           {:ok, keyword()} | {:error, NimbleOptions.ValidationError.t()}
   def validate(opts) do
-    if is_list(opts) and Keyword.keyword?(opts) do
+    if InfluxElixir.Client.Options.keyword?(opts) do
       NimbleOptions.validate(opts, @schema)
     else
       {:error,
@@ -195,18 +195,26 @@ defmodule InfluxElixir.Config do
   end
 
   @doc """
-  Builds the base URL from validated config options.
+  Builds the base URL (`scheme://host:port`) from connection options.
+
+  The one place the URL is built: `InfluxElixir.Client.HTTP` calls it for every request. A
+  missing `:scheme` is `:https` and a missing `:port` is `8086`, the defaults of
+  `validate/1`; it never raises, so a connection without a `:host` gets a URL the request
+  then fails on.
 
   ## Examples
 
       iex> InfluxElixir.Config.base_url(scheme: :https, host: "example.com", port: 443)
       "https://example.com:443"
+
+      iex> InfluxElixir.Config.base_url(host: "example.com")
+      "https://example.com:8086"
   """
   @spec base_url(keyword()) :: binary()
   def base_url(opts) do
-    scheme = Keyword.fetch!(opts, :scheme)
-    host = Keyword.fetch!(opts, :host)
-    port = Keyword.fetch!(opts, :port)
+    scheme = Keyword.get(opts, :scheme, :https)
+    host = Keyword.get(opts, :host)
+    port = Keyword.get(opts, :port, 8086)
     "#{scheme}://#{host}:#{port}"
   end
 end

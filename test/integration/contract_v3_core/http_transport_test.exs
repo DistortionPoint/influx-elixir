@@ -281,11 +281,36 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
     end
   end
 
+  # The first attempt is made by a process of its own, so `write/2` returns before it has
+  # failed. Releasing the holder then would let that attempt succeed: the tests below wait for
+  # the writer to schedule the retry, read from a trace of its `send_after` calls (which the
+  # writer makes only after the first attempt failed), and only then release the holder.
+  defp trace_retries(writer) do
+    session = :trace.session_create(:bw_int_retries, self(), [])
+    on_exit(fn -> :trace.session_destroy(session) end)
+
+    1 = :trace.process(session, writer, true, [:call])
+    2 = :trace.function(session, {:erlang, :send_after, :_}, true, [:global])
+    :ok
+  end
+
+  defp await_retry_scheduled(writer) do
+    receive do
+      {:trace, ^writer, :call,
+       {:erlang, :send_after, [_delay, _dest, {:retry, _chain, _attempt} | _opts]}} ->
+        :ok
+
+      {:trace, ^writer, :call, _other} ->
+        await_retry_scheduled(writer)
+    after
+      10_000 -> flunk("the first attempt did not fail")
+    end
+  end
+
   # A retry chain end to end: a pool of size 1 is held by a streaming request,
   # so the writer's first flush fails at checkout (a transport error, retried).
-  # `write/2` answers once that first attempt has failed, and only then does the
-  # test release the holder, so the retry reaches the server. No fake server is
-  # involved and nothing depends on timing.
+  # The test waits for that failure, and only then releases the holder, so the retry
+  # reaches the server. No fake server is involved and nothing depends on timing.
   describe "BatchWriter retry against the server" do
     setup ctx do
       finch = :"bw_int_finch_#{System.unique_integer([:positive])}"
@@ -311,7 +336,10 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
 
     test "a transport error is retried and the retry succeeds", ctx do
       # batch_size 1 flushes at once; the checkout times out; the chain starts.
+      :ok = trace_retries(ctx.writer)
       :ok = InfluxElixir.Write.BatchWriter.write(ctx.writer, "bw_retry value=1.0")
+
+      :ok = await_retry_scheduled(ctx.writer)
 
       assert {:ok, %{total_writes: 0, total_errors: 0}} =
                InfluxElixir.Write.BatchWriter.stats(ctx.writer)
@@ -335,7 +363,9 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
     end
 
     test "a 4xx answered on retry discards the batch instead of retrying again", ctx do
+      :ok = trace_retries(ctx.writer)
       :ok = InfluxElixir.Write.BatchWriter.write(ctx.writer, "not line protocol!!!")
+      :ok = await_retry_scheduled(ctx.writer)
       release(ctx.holder)
 
       Await.until(

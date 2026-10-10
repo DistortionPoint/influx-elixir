@@ -311,5 +311,11 @@ defmodule InfluxElixir.ConfigTest do
       validated = Config.validate!(host: "myhost.io", token: "tok", scheme: :https, port: 443)
       assert Config.base_url(validated) === "https://myhost.io:443"
     end
+
+    test "a missing scheme or port is the default one the HTTP client has always used" do
+      assert Config.base_url(host: "h") === "https://h:8086"
+      assert Config.base_url(host: "h", scheme: :http) === "http://h:8086"
+      assert Config.base_url(host: "h", port: 80) === "https://h:80"
+    end
   end
 end

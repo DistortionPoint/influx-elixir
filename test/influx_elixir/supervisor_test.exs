@@ -102,7 +102,7 @@ defmodule InfluxElixir.SupervisorTest do
 
       new_sup_a = await_restart(ConnectionSupervisor.via(name_a), sup_a)
       # The name is registered before init/1 returns; a call waits for it.
-      assert [_finch, _writer] = Supervisor.which_children(new_sup_a)
+      assert [_writer, _finch, _registration] = Supervisor.which_children(new_sup_a)
       # The top-level supervisor stayed up through the restart: same name, same live pid.
       assert Process.whereis(InfluxElixir.Supervisor) === top
       assert Process.alive?(top)

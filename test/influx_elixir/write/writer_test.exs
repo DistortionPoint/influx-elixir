@@ -2,8 +2,9 @@ defmodule InfluxElixir.Write.WriterTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
-  alias InfluxElixir.TestSupport.ClosedPort
-  alias InfluxElixir.Write.Writer
+  alias InfluxElixir.Connection
+  alias InfluxElixir.TestSupport.{ClosedPort, Telemetry}
+  alias InfluxElixir.Write.{Point, Writer}
 
   setup do
     {:ok, conn} = Local.start(databases: ["w"])
@@ -105,6 +106,118 @@ defmodule InfluxElixir.Write.WriterTest do
                client: InfluxElixir.Client.HTTP
              ) ===
                {:error, {:connection_error, %Mint.TransportError{reason: :econnrefused}}}
+    end
+  end
+
+  describe "write/3 — Points" do
+    defp point(value, ns), do: Point.new("cpu", %{"value" => value}, timestamp: ns)
+
+    defp row(value, us),
+      do: %{"time" => DateTime.from_unix!(us, :microsecond), "value" => value}
+
+    test "a Point, or a list of them, is encoded for the call", %{conn: conn} do
+      assert Writer.write(conn, point(1.0, 1_000), database: "w") === {:ok, :written}
+
+      assert Writer.write(conn, [point(2.0, 2_000), point(3.0, 3_000)], database: "w") ===
+               {:ok, :written}
+
+      assert Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time", database: "w") ===
+               {:ok, [row(1.0, 1), row(2.0, 2), row(3.0, 3)]}
+    end
+
+    test "a DateTime timestamp is written in the call's :precision", %{conn: conn} do
+      timestamp = ~U[2026-09-28 12:00:00.123456Z]
+      point = Point.new("cpu", %{"value" => 1}, timestamp: timestamp)
+
+      assert Writer.write(conn, point, database: "w", precision: :millisecond) ===
+               {:ok, :written}
+
+      assert Local.query_sql(conn, "SELECT * FROM cpu", database: "w") ===
+               {:ok, [%{"time" => ~U[2026-09-28 12:00:00.123000Z], "value" => 1}]}
+    end
+
+    test "a point is encoded for the connection's server" do
+      # InfluxDB 2 and 3 read a backslash in a tag value differently: the same point is two
+      # different lines, and each server stores the tag as it was given.
+      point = Point.new("m", %{"f" => 1}, tags: %{"t" => "a\\b"}, timestamp: 5)
+
+      {:ok, v3} = Local.start(profile: :v3_core, databases: ["w"])
+      assert Writer.write(v3, point, database: "w", precision: :second) === {:ok, :written}
+
+      assert Local.query_sql(v3, "SELECT t, f FROM m", database: "w") ===
+               {:ok, [%{"t" => "a\\b", "f" => 1}]}
+
+      {:ok, v2} = Local.start(profile: :v2, databases: ["b"])
+      assert Writer.write(v2, point, database: "b", precision: :second) === {:ok, :written}
+
+      assert {:ok, [%{"t" => "a\\b", "_value" => 1}]} =
+               Local.query_flux(v2, ~s[from(bucket: "b") |> range(start: 5, stop: 6)], [])
+    end
+
+    test "a point that cannot be encoded is the encoder's error, and nothing is sent",
+         %{conn: conn} do
+      assert Writer.write(conn, Point.new("cpu", %{}), database: "w") === {:error, :empty_fields}
+
+      assert Writer.write(conn, [point(1.0, 1_000), :not_a_point], database: "w") ===
+               {:error, {:invalid_point, :not_a_point}}
+
+      assert {:error, %{status: 400}} = Local.query_sql(conn, "SELECT * FROM cpu", database: "w")
+    end
+  end
+
+  describe "write/3 — a connection's name" do
+    setup %{conn: conn} do
+      name = :"writer_named_#{System.unique_integer([:positive])}"
+      :ok = Connection.put(name, conn)
+      on_exit(fn -> Connection.delete(name) end)
+      {:ok, name: name}
+    end
+
+    test "is the connection it names", %{conn: conn, name: name} do
+      assert Writer.write(name, "cpu value=1.0 1000", database: "w") === {:ok, :written}
+      assert Writer.write(name, point(2.0, 2_000), database: "w") === {:ok, :written}
+
+      assert Local.query_sql(conn, "SELECT * FROM cpu ORDER BY time", database: "w") ===
+               {:ok, [row(1.0, 1), row(2.0, 2)]}
+    end
+
+    test "a term that is no connection (a host name, a number) is invalid, never a raise" do
+      for connection <- ["hostname", 5, {:a}] do
+        assert Writer.write(connection, "m v=1") === {:error, {:invalid_connection, connection}}
+
+        assert InfluxElixir.write(connection, "m v=1") ===
+                 {:error, {:invalid_connection, connection}}
+      end
+    end
+
+    test "that is not registered is {:invalid_connection, name}, never a raise" do
+      name = :"writer_unregistered_#{System.unique_integer([:positive])}"
+
+      assert Writer.write(name, "cpu value=1.0 1000") === {:error, {:invalid_connection, name}}
+    end
+  end
+
+  describe "write/3 — telemetry" do
+    setup do
+      Telemetry.attach([[:influx_elixir, :write, :stop]])
+      :ok
+    end
+
+    test "point_count is the lines of the body, a trailing newline not one more",
+         %{conn: conn} do
+      for {body, count} <- [
+            {"cpu value=1i 1", 1},
+            {"cpu value=1i 1\ncpu value=2i 2", 2},
+            {"cpu value=1i 1\ncpu value=2i 2\n", 2},
+            {"cpu value=1i 1\ncpu value=2i 2\ncpu value=3i 3", 3}
+          ] do
+        assert {:ok, :written} = Writer.write(conn, body, database: "w")
+
+        assert_receive {:telemetry, [:influx_elixir, :write, :stop], _measurements,
+                        %{point_count: ^count, bytes: bytes}}
+
+        assert bytes === byte_size(body)
+      end
     end
   end
 end

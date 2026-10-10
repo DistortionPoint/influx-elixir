@@ -37,7 +37,14 @@ defmodule InfluxElixir.Connection do
   Uses `:persistent_term` for near-zero-cost reads. Writes happen only
   during connection setup/teardown (rare), so the copy-on-write cost
   of `:persistent_term` is acceptable.
+
+  A connection supervisor registers its connection when it starts and
+  erases it when it stops, whether `InfluxElixir.remove_connection/1`
+  stopped it or it gave up after too many restarts: a name never resolves
+  to a connection that is not running.
   """
+
+  alias InfluxElixir.Client.Options
 
   @doc """
   Stores a validated connection config under the given name.
@@ -155,7 +162,7 @@ defmodule InfluxElixir.Connection do
   def api_version(%{profile: :v2}), do: :v2
 
   def api_version(connection) when is_list(connection) do
-    if Keyword.keyword?(connection) and Keyword.get(connection, :api_version) == :v2,
+    if Options.keyword?(connection) and Keyword.get(connection, :api_version) == :v2,
       do: :v2,
       else: :v3
   end
@@ -165,8 +172,8 @@ defmodule InfluxElixir.Connection do
   @doc """
   Returns the Finch pool name for a given connection name.
 
-  This is a convenience wrapper around
-  the connection supervisor's pool naming (`:"influx_elixir_<name>_finch"`).
+  The pool a registered connection was given with `:finch_name`, else the one its
+  supervisor starts (`:"influx_elixir_<name>_finch"`).
 
   ## Parameters
 
@@ -174,6 +181,12 @@ defmodule InfluxElixir.Connection do
   """
   @spec finch_name(atom()) :: atom()
   def finch_name(name) when is_atom(name) do
-    InfluxElixir.ConnectionSupervisor.finch_name(name)
+    with {:ok, connection} when is_list(connection) <- get(name),
+         true <- Options.keyword?(connection),
+         finch when finch != nil <- Keyword.get(connection, :finch_name) do
+      finch
+    else
+      _derived -> InfluxElixir.ConnectionSupervisor.finch_name(name)
+    end
   end
 end

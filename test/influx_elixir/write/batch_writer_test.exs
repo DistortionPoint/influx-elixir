@@ -7,7 +7,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
   alias InfluxElixir.Client.Local
   alias InfluxElixir.TestServer
-  alias InfluxElixir.TestSupport.Await
+  alias InfluxElixir.TestSupport.{Await, ClosedPort}
   alias InfluxElixir.Write.{BatchWriter, Point}
 
   # The shared failure bound on waits for answers that will come: generous, so a loaded
@@ -96,9 +96,72 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       :ok = BatchWriter.write(pid, Enum.at(lines, 1))
       assert stored(conn, "cpu") === []
 
+      # The batch is written by a process of its own; a flush of the empty buffer returns
+      # once the request ahead of it has finished.
       :ok = BatchWriter.write(pid, Enum.at(lines, 2))
+      :ok = BatchWriter.flush(pid)
       assert stored(conn, "cpu") === [row(1.0, 1), row(2.0, 2), row(3.0, 3)]
       assert BatchWriter.stats(pid) === stats(1, 0, byte_size(Enum.join(lines, "\n")))
+    end
+
+    test "a payload that is no point and no line protocol is the caller's error",
+         %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000)
+
+      # These used to crash the writer (a FunctionClauseError in its encoder), which exits
+      # the caller and loses every buffered line.
+      for payload <- [nil, :cpu, 5, %{}, {:a}, [:a], [1.5], ["cpu value=1", :b], [?a | :improper]] do
+        assert BatchWriter.write(pid, payload) === {:error, {:invalid_payload, payload}}
+        assert BatchWriter.write_sync(pid, payload) === {:error, {:invalid_payload, payload}}
+      end
+
+      :ok = BatchWriter.write(pid, line(1.0, 1))
+      assert Process.alive?(pid)
+      :ok = BatchWriter.flush(pid)
+      assert stored(conn, "cpu") === [row(1.0, 1)]
+    end
+
+    test "takes a Point, a list of Points, a binary and iodata", %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000)
+
+      :ok = BatchWriter.write(pid, Point.new("cpu", %{"value" => 1.0}, timestamp: 1_000))
+      :ok = BatchWriter.write(pid, [Point.new("cpu", %{"value" => 2.0}, timestamp: 2_000)])
+
+      :ok =
+        BatchWriter.write(pid, [
+          Point.new("cpu", %{"value" => 3.0}, timestamp: 3_000),
+          Point.new("cpu", %{"value" => 4.0}, timestamp: 4_000)
+        ])
+
+      :ok = BatchWriter.write(pid, ["cpu value=5.0 ", ["5", "000"]])
+      :ok = BatchWriter.write(pid, [])
+      :ok = BatchWriter.write(pid, "")
+      :ok = BatchWriter.flush(pid)
+
+      assert stored(conn, "cpu") === [
+               row(1.0, 1),
+               row(2.0, 2),
+               row(3.0, 3),
+               row(4.0, 4),
+               row(5.0, 5)
+             ]
+    end
+
+    test "a point without a timestamp is stamped by the caller, a timed one is not",
+         %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000)
+
+      :ok = BatchWriter.write(pid, Point.new("cpu", %{"value" => 1.0}))
+      :ok = BatchWriter.write(pid, Point.new("cpu", %{"value" => 2.0}, timestamp: 2_000))
+      :ok = BatchWriter.flush(pid)
+
+      # Untimed, the server's clock would have given it a time near now; the stamp is the
+      # call's own, in the same unit, so it is a recent time and the timed point keeps its own.
+      assert [%{"time" => ~U[1970-01-01 00:00:00.000002Z], "value" => 2.0}, stamped] =
+               Enum.sort_by(stored(conn, "cpu"), &DateTime.to_unix(&1["time"]))
+
+      assert %{"value" => 1.0, "time" => %DateTime{year: year}} = stamped
+      assert year > 2000
     end
   end
 
@@ -162,6 +225,10 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
         assert {:timeout, {GenServer, :call, [^pid, {:write_sync, "cpu value=2.0 2"}, 1]}} =
                  catch_exit(BatchWriter.write_sync(pid, "cpu value=2.0 2", 1))
+
+        # stats/2 takes a bound of its own.
+        assert {:timeout, {GenServer, :call, [^pid, :stats, 1]}} =
+                 catch_exit(BatchWriter.stats(pid, 1))
       after
         :ok = :sys.resume(pid)
       end
@@ -267,10 +334,13 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       :ok = BatchWriter.write(pid, line(1.0, 1))
       :ok = BatchWriter.write(pid, line(2.0, 2))
+      # The batch is written by a process of its own: an empty flush returns once it has been.
+      :ok = BatchWriter.flush(pid)
       assert BatchWriter.stats(pid) === stats(1, 0, byte_size(first))
 
       :ok = BatchWriter.write(pid, line(3.0, 3))
       send(pid, :flush)
+      :ok = BatchWriter.flush(pid)
       assert BatchWriter.stats(pid) === stats(2, 0, byte_size(first) + byte_size(line(3.0, 3)))
       assert stored(conn, "cpu") === [row(1.0, 1), row(2.0, 2), row(3.0, 3)]
     end
@@ -334,6 +404,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       :ok = BatchWriter.write(pid, line(1.0, 1))
 
       assert_restarts_timer(pid, fn -> :ok = BatchWriter.write(pid, line(2.0, 2)) end)
+      :ok = BatchWriter.flush(pid)
       assert stored(conn, "cpu") === [row(1.0, 1), row(2.0, 2)]
     end
 
@@ -358,6 +429,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       assert_restarts_timer(pid, fn ->
         send(pid, :flush)
+        :ok = BatchWriter.flush(pid)
         assert BatchWriter.stats(pid) === stats(1, 0, byte_size(line(1.0, 1)))
       end)
     end
@@ -419,6 +491,23 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert next_retry_delay(pid) === 14_000
       :ok = stop_supervised!(BatchWriter)
     end
+
+    test "max_retry_delay_ms caps the backoff", %{finch: finch} do
+      pid =
+        start_http_writer(finch, TestServer.controlled(owner: answering_owner(503)),
+          batch_size: 1,
+          max_retries: 2,
+          base_retry_delay_ms: 7_000,
+          max_retry_delay_ms: 10_000
+        )
+
+      :ok = trace_timers(pid)
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
+
+      # 7_000 * 2 would be 14_000.
+      assert next_retry_delay(pid) === 10_000
+      :ok = stop_supervised!(BatchWriter)
+    end
   end
 
   describe "unexpected messages" do
@@ -477,6 +566,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
             {[batch_size: "10"], :batch_size},
             {[flush_interval_ms: 0], :flush_interval_ms},
             {[max_retries: -1], :max_retries},
+            {[max_retry_delay_ms: 0], :max_retry_delay_ms},
             {[shutdown: :later], :shutdown},
             {[flush_interval: 50], [:flush_interval]}
           ] do
@@ -527,6 +617,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       :ok = BatchWriter.write_sync(pid, line(1.0, 1))
       assert stored(conn, "cpu") === []
       :ok = BatchWriter.write_sync(pid, line(2.0, 2))
+      :ok = BatchWriter.flush(pid)
 
       assert BatchWriter.stats(pid) ===
                stats(1, 0, byte_size(line(1.0, 1) <> "\n" <> line(2.0, 2)))
@@ -572,34 +663,36 @@ defmodule InfluxElixir.Write.BatchWriterTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Retries, against a server the test controls
+  # Requests, against a server the test controls
   #
   # Every request the writer makes is announced to the test, which answers it,
-  # so the order of events is the test's and no clock is involved: no backoff
-  # is waited out and no stats are read while a retry could race them.
+  # so the order of events is the test's. The backoff of these tests is long enough
+  # that no retry timer fires by itself: the test reads the timer the writer sets (a
+  # trace on the writer) and sends its message where the timer would, so no clock
+  # decides the order and no stats are read while a retry could race them. A flush of
+  # an empty buffer, which returns once the request ahead of it has finished, tells the
+  # test the writer has handled an answer.
   # ---------------------------------------------------------------------------
 
-  # How many calls of `kind` sit unread in the writer's mailbox.
-  defp queued_calls(pid, kind) do
-    {:messages, messages} = Process.info(pid, :messages)
-
-    Enum.count(messages, fn
-      {:"$gen_call", _from, {^kind, _payload}} -> true
-      {:"$gen_call", _from, ^kind} -> true
-      _other -> false
-    end)
+  # Waits for the writer's next request, which must carry `body`, and answers it.
+  defp answer(body, status) do
+    assert_receive {:request, handler, ^body}, @await
+    TestServer.respond(handler, status)
   end
 
-  # Waits for the writer's next request, which must carry `body`, and answers
-  # it with `status`. A stats call is queued behind the request first, so it
-  # is the writer's very next message: the stats returned are exactly those
-  # after this answer was handled and before any retry timer could be.
-  defp answer_with_stats(pid, body, status) do
-    assert_receive {:request, handler, ^body}, @await
-    reader = Task.async(fn -> BatchWriter.stats(pid) end)
-    Await.until(fn -> queued_calls(pid, :stats) === 1 end)
-    TestServer.respond(handler, status)
-    Task.await(reader, @await)
+  # The retry the writer has scheduled next: the message its timer will deliver, read from the
+  # trace `trace_timers/1` started.
+  defp next_retry_message(pid) do
+    receive do
+      {:trace, ^pid, :call,
+       {:erlang, :send_after, [_delay, _dest, {:retry, _chain, _attempt} = message | _opts]}} ->
+        message
+
+      {:trace, ^pid, :call, _other_call} ->
+        next_retry_message(pid)
+    after
+      @await -> flunk("the writer scheduled no retry")
+    end
   end
 
   # An owner for a server that answers every request itself with `status`
@@ -651,11 +744,191 @@ defmodule InfluxElixir.Write.BatchWriterTest do
     refute_received {:request, _handler, _body}
   end
 
+  # No retry timer was set since the trace began.
+  defp refute_retry_scheduled(pid) do
+    refute_received {:trace, ^pid, :call,
+                     {:erlang, :send_after, [_delay, _dest, {:retry, _chain, _attempt} | _opts]}}
+  end
+
+  describe "requests are made outside the writer" do
+    setup do
+      finch = :"bw_async_finch_#{System.unique_integer([:positive])}"
+      start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
+      {:ok, finch: finch}
+    end
+
+    # The writer used to make each request inside its own callback: with the test as the
+    # server, none of these calls could return until the test answered, which it could not do
+    # while waiting for them.
+    test "write, stats and flush are answered while a request waits", %{finch: finch} do
+      pid = start_http_writer(finch, TestServer.controlled(), batch_size: 1)
+
+      # The write completes a batch and returns; the test holds its request.
+      assert :ok = BatchWriter.write(pid, "cpu value=1.0")
+      assert_receive {:request, first, "cpu value=1.0"}, @await
+
+      assert BatchWriter.stats(pid) === stats(0, 0, 0)
+      assert :ok = BatchWriter.write(pid, "cpu value=2.0")
+      assert BatchWriter.stats(pid) === stats(0, 0, 0)
+
+      # The flush returns once the requests ahead of it, and its own, have finished.
+      flush = Task.async(fn -> BatchWriter.flush(pid) end)
+      TestServer.respond(first, 204)
+      assert_receive {:request, second, "cpu value=2.0"}, @await
+      TestServer.respond(second, 204)
+
+      assert :ok = Task.await(flush, @await)
+      assert BatchWriter.stats(pid) === stats(2, 0, 26)
+    end
+
+    test "stopping the writer waits for the request in flight and does not write it twice",
+         %{finch: finch} do
+      pid =
+        start_http_writer(finch, TestServer.controlled(owner: answering_owner(204)),
+          batch_size: 1
+        )
+
+      assert :ok = BatchWriter.write(pid, "cpu value=1.0")
+      :ok = stop_supervised!(BatchWriter)
+
+      assert_receive {:seen, "cpu value=1.0"}, @await
+      assert seen_bodies() === []
+    end
+  end
+
+  describe "errors no retry can mend" do
+    setup do
+      finch = :"bw_permanent_finch_#{System.unique_integer([:positive])}"
+      start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
+      {:ok, finch: finch}
+    end
+
+    test "a connection with no database is not retried", %{finch: finch} do
+      # No :database anywhere: every attempt is {:error, :no_database_specified}, which
+      # waiting cannot change. It was retried max_retries times.
+      pid =
+        start_supervised!(
+          {BatchWriter,
+           connection: http_conn(finch, TestServer.controlled()),
+           client: InfluxElixir.Client.HTTP,
+           batch_size: 10,
+           flush_interval_ms: 600_000,
+           max_retries: 3,
+           base_retry_delay_ms: 1}
+        )
+
+      :ok = trace_timers(pid)
+
+      assert BatchWriter.write_sync(pid, "cpu value=1.0") === {:error, :no_database_specified}
+      assert BatchWriter.stats(pid) === stats(0, 1, 0)
+      refute_retry_scheduled(pid)
+      refute_request_after_stop()
+    end
+
+    test "options and bodies the client refuses are not retried", %{finch: finch} do
+      pid =
+        start_http_writer(finch, TestServer.controlled(),
+          max_retries: 3,
+          base_retry_delay_ms: 1,
+          write_opts: [precision: %{}]
+        )
+
+      :ok = trace_timers(pid)
+
+      assert BatchWriter.write_sync(pid, "cpu value=1.0") ===
+               {:error, {:invalid_value, :precision, %{}}}
+
+      assert BatchWriter.stats(pid) === stats(0, 1, 0)
+      refute_retry_scheduled(pid)
+      refute_request_after_stop()
+    end
+
+    test "a transport error is retried max_retries times", %{finch: finch} do
+      # A port nothing listens on.
+      port = ClosedPort.port()
+
+      pid = start_http_writer(finch, port, max_retries: 2, base_retry_delay_ms: 1)
+      :ok = trace_timers(pid)
+
+      assert {:error, {:connection_error, _reason}} =
+               BatchWriter.write_sync(pid, "cpu value=1.0")
+
+      assert {:retry, chain, 1} = next_retry_message(pid)
+      assert {:retry, ^chain, 2} = next_retry_message(pid)
+      refute_retry_scheduled(pid)
+      assert BatchWriter.stats(pid) === stats(0, 1, 0)
+    end
+
+    test "a retried point carries the timestamp it was stamped with", %{finch: finch} do
+      # A server that committed a write which then timed out would have stored the retry
+      # again at its own, later, time if the point had gone out without one.
+      pid =
+        start_http_writer(finch, TestServer.controlled(), max_retries: 1, base_retry_delay_ms: 1)
+
+      caller =
+        Task.async(fn -> BatchWriter.write_sync(pid, Point.new("cpu", %{"value" => 1})) end)
+
+      assert_receive {:request, first, first_body}, @await
+      TestServer.respond(first, 503)
+      assert_receive {:request, second, second_body}, @await
+      TestServer.respond(second, 204)
+
+      assert :ok = Task.await(caller, @await)
+      assert first_body =~ ~r/\Acpu value=1i \d{16,}\z/
+      assert second_body === first_body
+    end
+  end
+
+  describe "a registered connection's name" do
+    test "is the connection a writer writes through", %{conn: conn} do
+      name = :"bw_named_#{System.unique_integer([:positive])}"
+      :ok = InfluxElixir.Connection.put(name, conn)
+      on_exit(fn -> InfluxElixir.Connection.delete(name) end)
+
+      pid = start_writer(name, flush_interval_ms: 600_000)
+
+      assert :ok = BatchWriter.write_sync(pid, line(1.0, 1))
+
+      assert :ok =
+               BatchWriter.write_sync(pid, Point.new("cpu", %{"value" => 2.0}, timestamp: 2_000))
+
+      assert stored(conn, "cpu") === [row(1.0, 1), row(2.0, 2)]
+    end
+
+    test "that is not registered is a permanent error, and the writer carries on",
+         %{conn: conn} do
+      name = :"bw_unregistered_#{System.unique_integer([:positive])}"
+      pid = start_writer(name, flush_interval_ms: 600_000, max_retries: 3)
+
+      assert BatchWriter.write_sync(pid, line(1.0, 1)) === {:error, {:invalid_connection, name}}
+      assert BatchWriter.stats(pid) === stats(0, 1, 0)
+
+      :ok = InfluxElixir.Connection.put(name, conn)
+      on_exit(fn -> InfluxElixir.Connection.delete(name) end)
+      assert :ok = BatchWriter.write_sync(pid, line(1.0, 1))
+      assert stored(conn, "cpu") === [row(1.0, 1)]
+    end
+  end
+
   describe "retry path — server errors" do
     setup do
       finch = :"bw_retry_finch_#{System.unique_integer([:positive])}"
       start_supervised!({Finch, name: finch, pools: %{default: [size: 1]}})
       {:ok, finch: finch}
+    end
+
+    test "a batch of several lines fills batch_size by its lines", %{finch: finch} do
+      pid = start_http_writer(finch, TestServer.controlled(), batch_size: 3)
+
+      # Two lines are not a batch of three; the line after them completes it, with no flush
+      # called and no timer fired. Counting writes, this would wait for the timer.
+      :ok = BatchWriter.write(pid, "cpu value=1.0\ncpu value=2.0")
+      :ok = BatchWriter.write(pid, "cpu value=3.0")
+
+      assert_receive {:request, handler, "cpu value=1.0\ncpu value=2.0\ncpu value=3.0"}, @await
+      TestServer.respond(handler, 204)
+      :ok = BatchWriter.flush(pid)
+      assert BatchWriter.stats(pid) === stats(1, 0, 41)
     end
 
     test "a 503 is retried max_retries times, and the error is counted once the last fails",
@@ -664,16 +937,28 @@ defmodule InfluxElixir.Write.BatchWriterTest do
         start_http_writer(finch, TestServer.controlled(),
           batch_size: 1,
           max_retries: 2,
-          base_retry_delay_ms: 1
+          base_retry_delay_ms: 60_000
         )
 
-      # batch_size 1: the write flushes at once and its first attempt fails.
-      writer = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
+      :ok = trace_timers(pid)
 
-      assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 0, 0)
-      assert :ok = Task.await(writer, @await)
-      assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 0, 0)
-      assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 1, 0)
+      # batch_size 1: the write takes its batch at once and returns; the request is the
+      # writer's own.
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
+
+      answer("cpu value=1.0", 503)
+      retry = next_retry_message(pid)
+      assert BatchWriter.stats(pid) === stats(0, 0, 0)
+
+      send(pid, retry)
+      answer("cpu value=1.0", 503)
+      retry = next_retry_message(pid)
+      assert BatchWriter.stats(pid) === stats(0, 0, 0)
+
+      send(pid, retry)
+      answer("cpu value=1.0", 503)
+      :ok = BatchWriter.flush(pid)
+      assert BatchWriter.stats(pid) === stats(0, 1, 0)
 
       # 1 + max_retries requests were made, and no chain is left to make more.
       refute_request_after_stop()
@@ -684,14 +969,20 @@ defmodule InfluxElixir.Write.BatchWriterTest do
         start_http_writer(finch, TestServer.controlled(),
           batch_size: 1,
           max_retries: 2,
-          base_retry_delay_ms: 1
+          base_retry_delay_ms: 60_000
         )
 
-      writer = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
+      :ok = trace_timers(pid)
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
 
-      assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 0, 0)
-      assert :ok = Task.await(writer, @await)
-      assert answer_with_stats(pid, "cpu value=1.0", 204) === stats(1, 0, 13)
+      answer("cpu value=1.0", 503)
+      retry = next_retry_message(pid)
+      assert BatchWriter.stats(pid) === stats(0, 0, 0)
+
+      send(pid, retry)
+      answer("cpu value=1.0", 204)
+      :ok = BatchWriter.flush(pid)
+      assert BatchWriter.stats(pid) === stats(1, 0, 13)
 
       # The success ended the chain: no further request, even from the writer's last write.
       refute_request_after_stop()
@@ -705,14 +996,20 @@ defmodule InfluxElixir.Write.BatchWriterTest do
           start_http_writer(finch, TestServer.controlled(),
             batch_size: 1,
             max_retries: 2,
-            base_retry_delay_ms: 1
+            base_retry_delay_ms: 60_000
           )
 
-        writer = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
+        :ok = trace_timers(pid)
+        :ok = BatchWriter.write(pid, "cpu value=1.0")
 
-        assert answer_with_stats(pid, "cpu value=1.0", unquote(status)) === stats(0, 0, 0)
-        assert :ok = Task.await(writer, @await)
-        assert answer_with_stats(pid, "cpu value=1.0", 204) === stats(1, 0, 13)
+        answer("cpu value=1.0", unquote(status))
+        retry = next_retry_message(pid)
+        assert BatchWriter.stats(pid) === stats(0, 0, 0)
+
+        send(pid, retry)
+        answer("cpu value=1.0", 204)
+        :ok = BatchWriter.flush(pid)
+        assert BatchWriter.stats(pid) === stats(1, 0, 13)
         refute_request_after_stop()
       end
     end
@@ -726,10 +1023,14 @@ defmodule InfluxElixir.Write.BatchWriterTest do
             base_retry_delay_ms: 1
           )
 
-        writer = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
+        :ok = trace_timers(pid)
+        :ok = BatchWriter.write(pid, "cpu value=1.0")
 
-        assert answer_with_stats(pid, "cpu value=1.0", unquote(status)) === stats(0, 1, 0)
-        assert :ok = Task.await(writer, @await)
+        answer("cpu value=1.0", unquote(status))
+        :ok = BatchWriter.flush(pid)
+
+        assert BatchWriter.stats(pid) === stats(0, 1, 0)
+        refute_retry_scheduled(pid)
         refute_request_after_stop()
       end
     end
@@ -771,23 +1072,18 @@ defmodule InfluxElixir.Write.BatchWriterTest do
           base_retry_delay_ms: 1
         )
 
-      first = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
       assert_receive {:request, held, "cpu value=1.0"}, @await
 
-      # Queued behind the held attempt, so it is the writer's next message.
-      second = Task.async(fn -> BatchWriter.write(pid, "cpu value=2.0") end)
-      Await.until(fn -> queued_calls(pid, :write) === 1 end)
-
+      # Buffered, not taken: a batch is in flight, and this write returns at once.
+      :ok = BatchWriter.write(pid, "cpu value=2.0")
       TestServer.respond(held, 503)
-      assert :ok = Task.await(first, @await)
-      assert :ok = Task.await(second, @await)
 
       # Chain 1's one retry fails and ends it (error 1); the deferred line then
       # flushes into chain 2, which succeeds.
-      assert_receive {:request, retry, "cpu value=1.0"}, @await
-      TestServer.respond(retry, 503)
-      assert_receive {:request, deferred, "cpu value=2.0"}, @await
-      TestServer.respond(deferred, 204)
+      answer("cpu value=1.0", 503)
+      answer("cpu value=2.0", 204)
+      :ok = BatchWriter.flush(pid)
 
       assert BatchWriter.stats(pid) === stats(1, 1, 13)
     end
@@ -797,16 +1093,25 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       pid =
         start_http_writer(finch, TestServer.controlled(),
           max_retries: 2,
-          base_retry_delay_ms: 1
+          base_retry_delay_ms: 60_000
         )
 
+      :ok = trace_timers(pid)
       caller = Task.async(fn -> BatchWriter.write_sync(pid, "cpu value=1.0") end)
 
       # First attempt plus two retries all fail; the chain records one error,
       # and the caller is not answered before the last.
-      assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 0, 0)
-      assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 0, 0)
-      assert answer_with_stats(pid, "cpu value=1.0", 503) === stats(0, 1, 0)
+      answer("cpu value=1.0", 503)
+      retry = next_retry_message(pid)
+      assert BatchWriter.stats(pid) === stats(0, 0, 0)
+
+      send(pid, retry)
+      answer("cpu value=1.0", 503)
+      retry = next_retry_message(pid)
+      assert BatchWriter.stats(pid) === stats(0, 0, 0)
+
+      send(pid, retry)
+      answer("cpu value=1.0", 503)
 
       assert {:error, %{status: 503}} = Task.await(caller, @await)
       assert Process.alive?(pid)
@@ -842,66 +1147,59 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
     test "backpressure holds while any chain is in flight, not just the first",
          %{finch: finch} do
-      # The test is the server: it answers every request itself, so the order
-      # of events is its to decide and no clock is involved. Chain 1 ends on a
-      # 400 while chain 2 is mid-retry (its request held, the writer blocked
-      # on it); the writes queued meanwhile must then meet the bound.
+      # The test is the server and the clock: it answers every request itself and delivers
+      # every retry timer's message itself, so the order of events is its to decide. Chain 1
+      # ends on a 400 while chain 2 is mid-retry (its request held); the writes made
+      # meanwhile must then meet the bound.
       pid =
         start_http_writer(finch, TestServer.controlled(),
           batch_size: 1,
           max_retries: 3,
-          base_retry_delay_ms: 1
+          base_retry_delay_ms: 60_000
         )
 
-      # Chain 1's first attempt: held while the writer is blocked on it, so
-      # the next two calls are queued behind it in a known order.
-      first = Task.async(fn -> BatchWriter.write(pid, "cpu value=1.0") end)
-      assert_receive {:request, held, "cpu value=1.0"}, @await
+      :ok = trace_timers(pid)
 
-      second = Task.async(fn -> BatchWriter.write(pid, "cpu value=2.0") end)
-      Await.until(fn -> queued_calls(pid, :write) === 1 end)
+      # Chain 1's first attempt is held. The second line is buffered behind it, and the
+      # explicit flush takes it as chain 2, whose request waits its turn.
+      :ok = BatchWriter.write(pid, "cpu value=1.0")
+      assert_receive {:request, held, "cpu value=1.0"}, @await
+      :ok = BatchWriter.write(pid, "cpu value=2.0")
       flush = Task.async(fn -> BatchWriter.flush(pid) end)
-      Await.until(fn -> queued_calls(pid, :flush) === 1 end)
 
       TestServer.respond(held, 503)
-      assert :ok = Task.await(first, @await)
+      retry_one = next_retry_message(pid)
 
-      # Chain 2's first attempt, started by the queued flush before any retry.
-      assert_receive {:request, chain_two, "cpu value=2.0"}, @await
-      TestServer.respond(chain_two, 503)
-      assert :ok = Task.await(second, @await)
+      answer("cpu value=2.0", 503)
       assert :ok = Task.await(flush, @await)
+      retry_two = next_retry_message(pid)
 
-      held_retry = answer_until_chain_two_is_held(false)
+      # Chain 1's retry ends it on a 400; chain 2's is held.
+      send(pid, retry_one)
+      answer("cpu value=1.0", 400)
+      send(pid, retry_two)
+      assert_receive {:request, held_retry, "cpu value=2.0"}, @await
 
-      # Queued one at a time, so the order the writer takes them in is known.
-      writes =
-        for i <- 1..11 do
-          task = Task.async(fn -> BatchWriter.write(pid, "cpu value=#{i}.5") end)
-          Await.until(fn -> queued_calls(pid, :write) === i end)
-          task
-        end
+      # Ten lines are admitted and the eleventh meets the bound: chain 1's end did not
+      # make the writer forget chain 2.
+      writes = for i <- 1..11, do: BatchWriter.write(pid, "cpu value=#{i}.5")
+      assert writes === List.duplicate(:ok, 10) ++ [{:error, :buffer_full}]
 
       # The interval timer firing while chain 2 is held: it must wait for the
       # chain, not flush the buffer into a server that is failing.
       send(pid, :flush)
 
-      # Chain 2 stays in flight when its held attempt fails; everything the
-      # writer takes next sees that chain, and the end of chain 1 must not
-      # have forgotten it.
       TestServer.respond(held_retry, 503)
-
-      assert Enum.map(writes, &Task.await(&1, @await)) ===
-               List.duplicate(:ok, 10) ++ [{:error, :buffer_full}]
+      retry_three = next_retry_message(pid)
 
       # The next request is chain 2's retry, not a flush of the ten lines; it
       # succeeds, and only then do the ten buffered lines go out in one write.
-      assert_receive {:request, retry, "cpu value=2.0"}, @await
-      TestServer.respond(retry, 204)
+      send(pid, retry_three)
+      answer("cpu value=2.0", 204)
 
       accepted = Enum.map_join(1..10, "\n", &"cpu value=#{&1}.5")
-      assert_receive {:request, buffered, ^accepted}, @await
-      TestServer.respond(buffered, 204)
+      answer(accepted, 204)
+      :ok = BatchWriter.flush(pid)
 
       assert BatchWriter.stats(pid) === stats(2, 1, 13 + byte_size(accepted))
     end
@@ -917,8 +1215,7 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       caller = Task.async(fn -> BatchWriter.write_sync(pid, "cpu value=1.0") end)
 
       # The first attempt reached the server, so the writer has taken the
-      # call; the write below is queued behind it and lands in the buffer
-      # while the chain waits to retry.
+      # call; the write below lands in the buffer while the chain waits to retry.
       assert_receive {:seen, "cpu value=1.0"}, @await
       :ok = BatchWriter.write(pid, "cpu value=2.0")
 
@@ -941,27 +1238,6 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert {:error, %{status: 503}} = Task.await(caller, @await)
       assert BatchWriter.stats(pid) === stats(0, 1, 0)
       refute_request_after_stop()
-    end
-  end
-
-  # Chain 1's retry gets a 400, which ends it; chain 2's requests get 503
-  # until then. Returns the first chain 2 request that arrives afterwards,
-  # unanswered, so the writer stays blocked on it. Whichever chain's timer
-  # fires first, the outcome is the same.
-  defp answer_until_chain_two_is_held(chain_one_ended?) do
-    receive do
-      {:request, handler, "cpu value=1.0"} ->
-        TestServer.respond(handler, 400)
-        answer_until_chain_two_is_held(true)
-
-      {:request, handler, "cpu value=2.0"} when chain_one_ended? ->
-        handler
-
-      {:request, handler, "cpu value=2.0"} ->
-        TestServer.respond(handler, 503)
-        answer_until_chain_two_is_held(false)
-    after
-      @await -> flunk("no request arrived from the writer")
     end
   end
 end

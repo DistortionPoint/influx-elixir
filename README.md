@@ -45,8 +45,9 @@ connection name or a connection term:
 
 ```elixir
 point = InfluxElixir.point("cpu", %{"value" => 0.64}, tags: %{"host" => "web01"})
-{:ok, line} = InfluxElixir.Write.LineProtocol.encode(point)
-{:ok, :written} = InfluxElixir.write(:default, line)
+{:ok, :written} = InfluxElixir.write(:default, point)
+# Line protocol, or a list of points, writes the same way:
+{:ok, :written} = InfluxElixir.write(:default, "cpu,host=web01 value=0.64")
 
 {:ok, rows} =
   InfluxElixir.query_sql(:default, "SELECT * FROM cpu WHERE host = $host",
@@ -54,6 +55,22 @@ point = InfluxElixir.point("cpu", %{"value" => 0.64}, tags: %{"host" => "web01"}
   )
 
 # rows: [%{"host" => "web01", "value" => 0.64, "time" => ~U[...]}]
+```
+
+`InfluxElixir.write/3` sends one request per call and encodes `Point`s for the call's
+`:precision` and the connection's `api_version`. A connection started with a
+`batch_writer:` option also buffers writes: `InfluxElixir.write_batched/3` returns as soon
+as the point (or line protocol) is buffered, and the writer sends the buffer when it holds
+`batch_size` lines, when `flush_interval_ms` passes, or on `InfluxElixir.flush/2`.
+Failed requests are retried with backoff when a retry can help (network errors, 5xx, 408,
+429). A point without a timestamp is stamped when it is buffered, so a retry cannot store it
+twice at two times. `sync: true` waits until the payload's batch is written.
+
+```elixir
+:ok = InfluxElixir.write_batched(:default, point)
+:ok = InfluxElixir.write_batched(:default, "cpu value=0.5", sync: true)
+:ok = InfluxElixir.flush(:default)
+{:ok, %{total_writes: _, total_errors: _, total_bytes: _}} = InfluxElixir.stats(:default)
 ```
 
 Large result sets stream with `InfluxElixir.query_sql_stream/3`; Arrow Flight

@@ -47,6 +47,115 @@ defmodule InfluxElixirTest do
       assert {:ok, :written} =
                InfluxElixir.write(conn, "cpu value=2i", database: "test_db")
     end
+
+    test "takes a Point, and a list of Points, as line protocol it encodes", %{conn: conn} do
+      point = InfluxElixir.point("pts", %{"value" => 0.5}, tags: %{"h" => "a"}, timestamp: @ts)
+
+      later =
+        InfluxElixir.point("pts", %{"value" => 1.5}, tags: %{"h" => "a"}, timestamp: @ts + 1_000)
+
+      assert InfluxElixir.write(conn, point, database: "test_db") === {:ok, :written}
+      assert InfluxElixir.write(conn, [later], database: "test_db") === {:ok, :written}
+
+      assert InfluxElixir.query_sql(conn, "SELECT * FROM pts ORDER BY time", database: "test_db") ===
+               {:ok,
+                [
+                  %{"h" => "a", "time" => @time, "value" => 0.5},
+                  %{"h" => "a", "time" => DateTime.add(@time, 1, :microsecond), "value" => 1.5}
+                ]}
+    end
+
+    test "writes a Point's DateTime in the call's :precision", %{conn: conn} do
+      point = InfluxElixir.point("pts", %{"v" => 1}, timestamp: ~U[2026-09-28 12:00:00.123456Z])
+
+      assert InfluxElixir.write(conn, point, database: "test_db", precision: :second) ===
+               {:ok, :written}
+
+      assert InfluxElixir.query_sql(conn, "SELECT * FROM pts", database: "test_db") ===
+               {:ok, [%{"time" => ~U[2026-09-28 12:00:00.000000Z], "v" => 1}]}
+    end
+
+    test "a Point that cannot be encoded is its error, not an invalid body", %{conn: conn} do
+      assert InfluxElixir.write(conn, InfluxElixir.point("pts", %{}), database: "test_db") ===
+               {:error, :empty_fields}
+    end
+  end
+
+  describe "write_batched/3" do
+    setup do
+      name = :"write_batched_#{System.unique_integer([:positive])}"
+
+      {:ok, _pid} =
+        InfluxElixir.add_connection(name,
+          database: "wb",
+          batch_writer: [flush_interval_ms: 600_000, batch_size: 10]
+        )
+
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+      {:ok, name: name}
+    end
+
+    test "buffers Points and line protocol until the writer flushes", %{name: name} do
+      point = InfluxElixir.point("wb", %{"v" => 1}, timestamp: 1_000)
+
+      assert InfluxElixir.write_batched(name, point) === :ok
+
+      assert InfluxElixir.write_batched(name, [
+               InfluxElixir.point("wb", %{"v" => 2}, timestamp: 2_000)
+             ]) === :ok
+
+      assert InfluxElixir.write_batched(name, ["wb v=3i ", "3000"]) === :ok
+
+      # Nothing has been taken from the buffer yet.
+      assert InfluxElixir.stats(name) ===
+               {:ok, %{total_writes: 0, total_errors: 0, total_bytes: 0}}
+
+      assert InfluxElixir.flush(name) === :ok
+
+      assert InfluxElixir.query_sql(name, "SELECT v FROM wb ORDER BY v") ===
+               {:ok, [%{"v" => 1}, %{"v" => 2}, %{"v" => 3}]}
+
+      assert InfluxElixir.stats(name) ===
+               {:ok, %{total_writes: 1, total_errors: 0, total_bytes: 38}}
+    end
+
+    test "sync: true returns once the payload is written", %{name: name} do
+      assert InfluxElixir.write_batched(name, "wb v=1i 1000", sync: true) === :ok
+
+      assert InfluxElixir.query_sql(name, "SELECT v FROM wb") === {:ok, [%{"v" => 1}]}
+    end
+
+    test "sync: true is the write's own failure", %{name: name} do
+      assert {:error, %{status: 400}} = InfluxElixir.write_batched(name, "!!!", sync: true)
+    end
+
+    test "a payload that is none of the forms is an error and the writer keeps going",
+         %{name: name} do
+      assert InfluxElixir.write_batched(name, nil) === {:error, {:invalid_payload, nil}}
+
+      assert InfluxElixir.write_batched(name, [:a], sync: true) ===
+               {:error, {:invalid_payload, [:a]}}
+
+      assert InfluxElixir.write_batched(name, "wb v=1i 1000", timeout: 10_000) === :ok
+      assert InfluxElixir.flush(name) === :ok
+      assert InfluxElixir.query_sql(name, "SELECT v FROM wb") === {:ok, [%{"v" => 1}]}
+    end
+
+    test "options that are not a keyword list are an error", %{name: name} do
+      assert InfluxElixir.write_batched(name, "wb v=1i 1000", :sync) ===
+               {:error, {:invalid_options, :sync}}
+    end
+
+    test "a connection without a batch writer has none to write to" do
+      name = :"write_batched_none_#{System.unique_integer([:positive])}"
+      {:ok, _pid} = InfluxElixir.add_connection(name, database: "wb")
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+
+      assert InfluxElixir.write_batched(name, "wb v=1i 1000") === {:error, :no_batch_writer}
+
+      assert InfluxElixir.write_batched(:never_registered_for_batching, "x v=1i") ===
+               {:error, :no_batch_writer}
+    end
   end
 
   describe "query_sql/3" do

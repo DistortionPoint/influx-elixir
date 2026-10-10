@@ -2,18 +2,20 @@ defmodule InfluxElixir.Write.Writer do
   @moduledoc """
   Direct single-request write to InfluxDB.
 
-  Accepts pre-encoded line protocol binary and forwards it to the configured
-  client implementation. Automatically applies gzip compression for payloads
-  larger than 1 KB, and wraps every write in an
+  Accepts line protocol (a binary or iodata) or `InfluxElixir.Write.Point`s and forwards
+  them to the configured client implementation. Automatically applies gzip compression for
+  payloads larger than 1 KB, and wraps every write in an
   `[:influx_elixir, :write, ...]` telemetry span (see `InfluxElixir.Telemetry`).
   """
 
-  alias InfluxElixir.Telemetry
+  alias InfluxElixir.Client.Options
+  alias InfluxElixir.{Connection, Telemetry}
+  alias InfluxElixir.Write.{LineProtocol, Point}
 
   @gzip_threshold 1024
 
   @doc """
-  Writes line protocol binary to InfluxDB via the configured client.
+  Writes line protocol, or Points, to InfluxDB via the configured client.
 
   Gzips payloads larger than #{@gzip_threshold} bytes, and passes
   `gzip: true` to the client exactly when it has compressed the payload,
@@ -22,8 +24,13 @@ defmodule InfluxElixir.Write.Writer do
 
   ## Parameters
 
-    * `connection` - connection term (opaque, passed to client)
-    * `line_protocol` - encoded line protocol binary
+    * `connection` - connection term (opaque, passed to client), or the name of a
+      connection registered with `InfluxElixir.Connection` (a name that is not registered
+      is `{:error, {:invalid_connection, name}}`)
+    * `payload` - encoded line protocol (a binary or iodata), a `InfluxElixir.Write.Point`
+      or a list of them. Points are encoded with `InfluxElixir.Write.LineProtocol.encode/2`
+      for the call's `:precision` and the connection's `api_version`; a point that cannot
+      be encoded is that function's `{:error, reason}`, and nothing is sent.
     * `opts` - keyword options forwarded to the client, plus:
       * `:client` - client module to use instead of the configured one
         (`InfluxElixir.Client.impl/0`). Not forwarded to the client.
@@ -44,17 +51,30 @@ defmodule InfluxElixir.Write.Writer do
       iex> InfluxElixir.Write.Writer.write(conn, "cpu value=1.0")
       {:ok, :written}
   """
-  @spec write(InfluxElixir.Client.connection(), iodata(), keyword()) ::
+  @spec write(
+          InfluxElixir.Client.connection() | atom(),
+          iodata() | Point.t() | [Point.t()],
+          keyword()
+        ) :: InfluxElixir.Client.write_result()
+  def write(connection, payload, opts \\ []) do
+    with {:ok, connection} <- resolve(connection) do
+      write_resolved(connection, payload, opts)
+    end
+  end
+
+  @spec write_resolved(InfluxElixir.Client.connection(), term(), term()) ::
           InfluxElixir.Client.write_result()
-  def write(connection, line_protocol, opts \\ []) do
-    if is_list(opts) and Keyword.keyword?(opts) do
-      write_body(connection, text(line_protocol), opts)
+  defp write_resolved(connection, payload, opts) do
+    if Options.keyword?(opts) do
+      with {:ok, body} <- body(connection, payload, opts) do
+        write_body(connection, body, opts)
+      end
     else
       # Options that are not a keyword list are the client's error to name, never a raise
       # here: each client answers them its own way.
-      metadata = %{database: connection_database(connection), bytes: 0, point_count: 0}
+      metadata = %{database: Options.database(connection), bytes: 0, point_count: 0}
       client = InfluxElixir.Client.impl()
-      Telemetry.span_write(metadata, fn -> client.write(connection, line_protocol, opts) end)
+      Telemetry.span_write(metadata, fn -> client.write(connection, payload, opts) end)
     end
   end
 
@@ -66,7 +86,7 @@ defmodule InfluxElixir.Write.Writer do
     {payload, write_opts} = maybe_gzip(line_protocol, gzip, opts)
 
     metadata = %{
-      database: Keyword.get(opts, :database) || connection_database(connection),
+      database: Keyword.get(opts, :database) || Options.database(connection),
       bytes: if(is_binary(line_protocol), do: byte_size(line_protocol), else: 0),
       point_count: line_count(line_protocol)
     }
@@ -76,20 +96,51 @@ defmodule InfluxElixir.Write.Writer do
     end)
   end
 
-  # Iodata is the text it stands for; a body that is neither goes to the client as given,
-  # which names it.
-  @spec text(term()) :: term()
-  defp text(body) when is_list(body) do
-    IO.iodata_to_binary(body)
-  rescue
-    ArgumentError -> body
-  end
-
-  defp text(body), do: body
+  @doc false
+  # Whether a payload is a Point, or a list holding one: the forms `write/3` encodes.
+  @spec points?(term()) :: boolean()
+  def points?(%Point{}), do: true
+  def points?([%Point{} | _rest]), do: true
+  def points?([_other | rest]), do: points?(rest)
+  def points?(_other), do: false
 
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
+
+  # A registered connection's name is the connection: the same term `InfluxElixir.write/3`
+  # resolves, so a `BatchWriter` started with `connection: :name` writes through it.
+  @spec resolve(term()) :: {:ok, term()} | {:error, {:invalid_connection, atom()}}
+  defp resolve(name) when is_atom(name) and name not in [nil, true, false] do
+    case Connection.get(name) do
+      {:ok, connection} -> {:ok, connection}
+      {:error, :not_found} -> {:error, {:invalid_connection, name}}
+    end
+  end
+
+  # A connection is a keyword list (`Client.HTTP`) or a map (`Client.Local`); anything else (a
+  # host name, a number) is the caller's error, never a raise.
+  defp resolve(connection) when is_list(connection) or is_map(connection), do: {:ok, connection}
+  defp resolve(other), do: {:error, {:invalid_connection, other}}
+
+  # The body to send: Points are encoded for this call and connection; iodata is the text it
+  # stands for; a body that is neither goes to the client as given, which names it.
+  @spec body(term(), term(), keyword()) :: {:ok, term()} | {:error, term()}
+  defp body(connection, payload, opts) do
+    if points?(payload) do
+      encode_opts =
+        opts
+        |> Keyword.take([:precision])
+        |> Keyword.put(:api_version, Connection.api_version(connection))
+
+      LineProtocol.encode(payload, encode_opts)
+    else
+      case Options.iodata(payload) do
+        {:ok, text} -> {:ok, text}
+        :error -> {:ok, payload}
+      end
+    end
+  end
 
   @spec maybe_gzip(term(), term(), keyword()) :: {term(), keyword()}
   defp maybe_gzip(payload, gzip, opts)
@@ -99,17 +150,16 @@ defmodule InfluxElixir.Write.Writer do
 
   defp maybe_gzip(payload, _gzip, opts), do: {payload, opts}
 
-  # The connection is a keyword list (HTTP) or a map (Local); Access reads
-  # the connection-level default database from either.
-  @spec connection_database(term()) :: binary() | nil
-  defp connection_database(connection), do: connection[:database]
-
+  # The lines of a body: its newlines, one more for the last line, none for a trailing
+  # newline. A scan, not a split: it allocates nothing, so it costs a write nothing a
+  # telemetry handler would not.
   @spec line_count(term()) :: non_neg_integer()
-  defp line_count(line_protocol) when not is_binary(line_protocol), do: 0
+  defp line_count(""), do: 0
 
-  defp line_count(line_protocol) do
-    line_protocol
-    |> String.split("\n", trim: true)
-    |> length()
+  defp line_count(line_protocol) when is_binary(line_protocol) do
+    newlines = length(:binary.matches(line_protocol, "\n"))
+    if String.ends_with?(line_protocol, "\n"), do: newlines, else: newlines + 1
   end
+
+  defp line_count(_not_text), do: 0
 end

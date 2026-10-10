@@ -337,9 +337,7 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
       start_supervised!({Finch, name: finch})
       test = self()
 
-      # The writer flushes inside its own call when the batch is full, so the test is blocked
-      # in `write/2` while the request waits: an owner of its own answers it and passes the
-      # body on.
+      # An owner of its own answers the request and passes the body on.
       owner =
         start_supervised!(
           {Task,
@@ -355,7 +353,7 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
       {:ok, finch: finch, port: TestServer.controlled(owner: owner)}
     end
 
-    for {version, expected} <- [{:v2, ~S(m,t=a\b a=1i)}, {:v3, ~S(m,t=a\\b a=1i)}] do
+    for {version, expected} <- [{:v2, ~S(m,t=a\b a=1i 1)}, {:v3, ~S(m,t=a\\b a=1i 1)}] do
       test "an #{version} connection gets #{expected}", %{finch: finch, port: port} do
         connection = [
           host: "127.0.0.1",
@@ -380,11 +378,14 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
              max_retries: 0}
           )
 
-        assert BatchWriter.write(writer, Point.new("m", %{"a" => 1}, tags: %{"t" => "a\\b"})) ===
+        point = Point.new("m", %{"a" => 1}, tags: %{"t" => "a\\b"}, timestamp: 1)
+
+        assert BatchWriter.write(writer, point) ===
                  :ok
 
         assert_receive {:body, body}, TestSupport.Await.bound()
         assert body === unquote(expected)
+        :ok = BatchWriter.flush(writer)
         assert {:ok, %{total_writes: 1}} = BatchWriter.stats(writer)
       end
     end

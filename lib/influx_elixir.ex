@@ -35,14 +35,23 @@ defmodule InfluxElixir do
       # config/test.exs
       config :influx_elixir, :client, InfluxElixir.Client.Local
 
+  ## Writing
+
+  `write/3` sends line protocol, a `InfluxElixir.Write.Point` or a list of them in one
+  request. A connection with a `batch_writer:` option also takes `write_batched/3`, which
+  buffers the payload and returns; the writer sends the buffer in batches, retries the
+  failures a retry can mend, and answers `flush/2` and `stats/2` while it waits for the
+  server. See `InfluxElixir.Write.BatchWriter`.
+
   ## Telemetry
 
   `write/3` and the query functions emit `[:influx_elixir, :write | :query,
   :start | :stop | :exception]` events; see `InfluxElixir.Telemetry`.
   """
 
+  alias InfluxElixir.Client.Options
   alias InfluxElixir.Telemetry
-  alias InfluxElixir.Write.{Point, Writer}
+  alias InfluxElixir.Write.{BatchWriter, Point, Writer}
 
   # ---------- Connection Resolution ----------
 
@@ -101,14 +110,23 @@ defmodule InfluxElixir do
   end
 
   @doc """
-  Writes line protocol to InfluxDB using the configured client.
+  Writes line protocol, or Points, to InfluxDB using the configured client.
 
   Goes through `InfluxElixir.Write.Writer`, so payloads over 1 KB are
   gzipped and a `[:influx_elixir, :write, ...]` telemetry span is emitted.
-  The line protocol may be a binary or iodata (a list of binaries and
-  bytes). A body that is neither, or options that are not a keyword list,
-  is the client's error (`{:error, {:invalid_body, body}}` and
-  `{:error, {:invalid_options, opts}}` over HTTP), never a raise.
+  The payload may be:
+
+    * line protocol, a binary or iodata (a list of binaries and bytes);
+    * a `InfluxElixir.Write.Point` (see `point/3`), or a list of them. They are
+      encoded with `InfluxElixir.Write.LineProtocol.encode/2` for this call's
+      `:precision` (a `DateTime` timestamp is written in that unit) and the
+      connection's `:api_version`. A point no server accepts is that function's
+      `{:error, reason}` and nothing is sent.
+
+  Any other body, or options that are not a keyword list, is the client's error
+  (`{:error, {:invalid_body, body}}` and `{:error, {:invalid_options, opts}}` over
+  HTTP), never a raise. To buffer writes and send them in batches, see
+  `write_batched/3`.
 
   ## Options
 
@@ -127,9 +145,18 @@ defmodule InfluxElixir do
       after it may not see the points yet (verified).
     * `:gzip` — `true` compresses every payload, `false` none; by default
       only payloads over 1 KB (see `InfluxElixir.Write.Writer.write/3`).
+
+  ## Examples
+
+      point = InfluxElixir.point("cpu", %{"value" => 0.64}, tags: %{"host" => "web01"})
+      {:ok, :written} = InfluxElixir.write(:default, point)
+      {:ok, :written} = InfluxElixir.write(:default, [point], precision: :millisecond)
   """
-  @spec write(InfluxElixir.Client.connection(), iodata(), keyword()) ::
-          InfluxElixir.Client.write_result()
+  @spec write(
+          InfluxElixir.Client.connection(),
+          iodata() | Point.t() | [Point.t()],
+          keyword()
+        ) :: InfluxElixir.Client.write_result()
   def write(connection, line_protocol, opts \\ []) do
     Writer.write(resolve_connection(connection), line_protocol, opts)
   end
@@ -142,7 +169,7 @@ defmodule InfluxElixir do
   defp query_span(connection, opts, fun) do
     if connection?(connection) do
       metadata = %{
-        database: option(opts, :database) || connection_database(connection),
+        database: option(opts, :database) || Options.database(connection),
         transport: client()
       }
 
@@ -155,15 +182,11 @@ defmodule InfluxElixir do
   # A connection is a keyword list (HTTP) or a map (Local); a host name, a number, a
   # list of other things is the caller's error to name, not a raise from inside a span.
   @spec connection?(term()) :: boolean()
-  defp connection?(connection), do: is_map(connection) or Keyword.keyword?(connection)
-
-  # Keyword list (HTTP) or map (Local); Access handles both.
-  @spec connection_database(map() | keyword()) :: binary() | nil
-  defp connection_database(connection), do: connection[:database]
+  defp connection?(connection), do: is_map(connection) or Options.keyword?(connection)
 
   # Options that are not a keyword list are the client's error to name; the span reads none.
   defp option(opts, key) do
-    if is_list(opts) and Keyword.keyword?(opts), do: Keyword.get(opts, key)
+    if Options.keyword?(opts), do: Keyword.get(opts, key)
   end
 
   # ---------- Query — v3 SQL ----------
@@ -390,6 +413,57 @@ defmodule InfluxElixir do
   # ---------- Batch Writer ----------
 
   @doc """
+  Buffers a write on the batch writer of a connection.
+
+  `connection_name` is a connection with a `batch_writer:` option (see
+  `InfluxElixir.Config`). The payload is a `InfluxElixir.Write.Point`, a list of
+  them, or line protocol (a binary or iodata); Points are encoded for the writer's
+  `:precision` and the connection's `:api_version`, and one without a timestamp is
+  stamped with the time of this call. See `InfluxElixir.Write.BatchWriter.write/3`
+  for the buffering, the flush triggers and the backpressure.
+
+  Returns `:ok` once the payload is buffered. Other results:
+
+    * `{:error, :no_batch_writer}` - the connection has no writer running
+    * `{:error, :buffer_full}` - the writer holds as much as it admits while a
+      batch is being retried
+    * `{:error, reason}` - a point that cannot be encoded, a payload that is
+      none of the forms above (`{:invalid_payload, payload}`), or, with
+      `sync: true`, the write's own failure
+
+  ## Options
+
+    * `:sync` - `true` waits until the batch holding the payload has been written (or
+      has failed all its retries) and returns that result, as
+      `InfluxElixir.Write.BatchWriter.write_sync/3` does. Default `false`.
+    * `:timeout` - bound on the call in milliseconds (default `60_000`; `300_000`
+      with `sync: true`).
+
+  ## Examples
+
+      point = InfluxElixir.point("cpu", %{"value" => 0.64}, tags: %{"host" => "web01"})
+      :ok = InfluxElixir.write_batched(:default, point)
+      :ok = InfluxElixir.write_batched(:default, "cpu value=0.64", sync: true)
+      :ok = InfluxElixir.flush(:default)
+  """
+  @spec write_batched(atom(), iodata() | Point.t() | [Point.t()], keyword()) ::
+          :ok | {:error, term()}
+  def write_batched(connection_name, payload, opts \\ []) when is_atom(connection_name) do
+    if Options.keyword?(opts) do
+      sync = Keyword.get(opts, :sync, false)
+      timeout = Keyword.get(opts, :timeout) || if(sync, do: 300_000, else: 60_000)
+
+      with_batch_writer(connection_name, fn writer ->
+        if sync,
+          do: BatchWriter.write_sync(writer, payload, timeout),
+          else: BatchWriter.write(writer, payload, timeout)
+      end)
+    else
+      {:error, {:invalid_options, opts}}
+    end
+  end
+
+  @doc """
   Forces an immediate flush of the batch writer for a connection.
 
   Returns `:ok` on success or `{:error, :no_batch_writer}` if no
@@ -401,27 +475,34 @@ defmodule InfluxElixir do
   """
   @spec flush(atom(), timeout()) :: :ok | {:error, :no_batch_writer}
   def flush(connection_name, timeout \\ 60_000) do
-    bw = InfluxElixir.ConnectionSupervisor.batch_writer_name(connection_name)
-
-    if Process.whereis(bw) do
-      InfluxElixir.Write.BatchWriter.flush(bw, timeout)
-    else
-      {:error, :no_batch_writer}
-    end
+    with_batch_writer(connection_name, &BatchWriter.flush(&1, timeout))
   end
 
   @doc """
   Returns batch writer statistics for a connection.
 
   Returns `{:ok, stats_map}` or `{:error, :no_batch_writer}` if no
-  batch writer is configured for the given connection.
+  batch writer is configured for the given connection. The optional `timeout`
+  (default `5_000` ms) bounds the call.
   """
-  @spec stats(atom()) :: {:ok, map()} | {:error, :no_batch_writer}
-  def stats(connection_name) do
-    bw = InfluxElixir.ConnectionSupervisor.batch_writer_name(connection_name)
+  @spec stats(atom(), timeout()) :: {:ok, map()} | {:error, :no_batch_writer}
+  def stats(connection_name, timeout \\ 5_000) do
+    with_batch_writer(connection_name, &BatchWriter.stats(&1, timeout))
+  end
 
-    if Process.whereis(bw) do
-      InfluxElixir.Write.BatchWriter.stats(bw)
+  # Runs `fun` with the connection's batch writer, if it has one. A writer that stops between
+  # the lookup and the call is no writer.
+  @spec with_batch_writer(atom(), (atom() -> result)) :: result | {:error, :no_batch_writer}
+        when result: term()
+  defp with_batch_writer(connection_name, fun) do
+    writer = InfluxElixir.ConnectionSupervisor.batch_writer_name(connection_name)
+
+    if Process.whereis(writer) do
+      try do
+        fun.(writer)
+      catch
+        :exit, {:noproc, _call} -> {:error, :no_batch_writer}
+      end
     else
       {:error, :no_batch_writer}
     end
@@ -435,11 +516,11 @@ defmodule InfluxElixir do
   If the connection does not start — a `batch_writer:` option that
   `InfluxElixir.Write.BatchWriter` refuses, say — the error is returned
   and nothing is left behind: the name does not resolve and the client's
-  connection state is released.
+  connection state is released. The error never holds the `:token`.
   """
   @spec add_connection(atom(), keyword()) :: Supervisor.on_start_child()
   def add_connection(name, opts) do
-    if is_list(opts) and Keyword.keyword?(opts),
+    if Options.keyword?(opts),
       do: start_connection(name, opts),
       else: {:error, {:invalid_options, opts}}
   end
@@ -472,20 +553,6 @@ defmodule InfluxElixir do
     end
   end
 
-  # `ConnectionSupervisor.init/1` registers the connection and initialises
-  # the client before its children start; a child that then fails used to
-  # leave the name resolving to a connection that was not running (and,
-  # for `Client.Local`, its store allocated).
-  @spec release_connection(atom()) :: :ok
-  defp release_connection(name) do
-    case InfluxElixir.Connection.get(name) do
-      {:ok, conn} -> client().shutdown_connection(conn)
-      {:error, :not_found} -> :ok
-    end
-
-    InfluxElixir.Connection.delete(name)
-  end
-
   @doc """
   Removes a named connection dynamically at runtime.
 
@@ -499,17 +566,17 @@ defmodule InfluxElixir do
     case Supervisor.terminate_child(InfluxElixir.Supervisor, child_id) do
       :ok ->
         result = Supervisor.delete_child(InfluxElixir.Supervisor, child_id)
-
-        case InfluxElixir.Connection.get(name) do
-          {:ok, conn} -> client().shutdown_connection(conn)
-          {:error, :not_found} -> :ok
-        end
-
-        InfluxElixir.Connection.delete(name)
+        release_connection(name)
         result
 
       {:error, reason} ->
         {:error, reason}
     end
   end
+
+  # The supervisor's first child, `Registration`, erases the name and releases the client's
+  # state (the ETS store of `Client.Local`) as the supervisor stops, whether it stopped or
+  # failed to start the rest; the name is deleted here too, which is nothing when it did.
+  @spec release_connection(atom()) :: :ok
+  defp release_connection(name), do: InfluxElixir.Connection.delete(name)
 end

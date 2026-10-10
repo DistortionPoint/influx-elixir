@@ -57,7 +57,11 @@ defmodule InfluxElixir.Telemetry do
         nil
       )
 
-  To wrap operations automatically, use the span helpers:
+  To wrap operations automatically, use the span helpers (`span_write/2`, `span_query/2`).
+  The six manual emitters (`write_start/1`, `write_stop/2`, `write_exception/2`,
+  `query_start/1`, `query_stop/2`, `query_exception/2`) are deprecated in the docs: the library
+  never calls them, the spans do the same with the start and the end paired. They still work.
+  Example:
 
       InfluxElixir.Telemetry.span_write(%{database: "mydb", point_count: 1, bytes: 42},
         fn -> do_write() end
@@ -136,6 +140,8 @@ defmodule InfluxElixir.Telemetry do
 
   # ---------- Manual write events ----------
 
+  @doc deprecated:
+         "Emitting the events by hand is not used by the library; wrap the operation in span_write/2"
   @doc """
   Emits the `[:influx_elixir, :write, :start]` telemetry event.
 
@@ -160,6 +166,8 @@ defmodule InfluxElixir.Telemetry do
     %{system_time: System.system_time(), monotonic_time: System.monotonic_time()}
   end
 
+  @doc deprecated:
+         "Emitting the events by hand is not used by the library; wrap the operation in span_write/2"
   @doc """
   Emits the `[:influx_elixir, :write, :stop]` telemetry event.
 
@@ -186,6 +194,8 @@ defmodule InfluxElixir.Telemetry do
     )
   end
 
+  @doc deprecated:
+         "Emitting the events by hand is not used by the library; wrap the operation in span_write/2"
   @doc """
   Emits the `[:influx_elixir, :write, :exception]` telemetry event.
 
@@ -220,6 +230,8 @@ defmodule InfluxElixir.Telemetry do
 
   # ---------- Manual query events ----------
 
+  @doc deprecated:
+         "Emitting the events by hand is not used by the library; wrap the operation in span_query/2"
   @doc """
   Emits the `[:influx_elixir, :query, :start]` telemetry event.
 
@@ -236,6 +248,8 @@ defmodule InfluxElixir.Telemetry do
     :telemetry.execute(@query_event ++ [:start], start_measurements(), metadata)
   end
 
+  @doc deprecated:
+         "Emitting the events by hand is not used by the library; wrap the operation in span_query/2"
   @doc """
   Emits the `[:influx_elixir, :query, :stop]` telemetry event.
 
@@ -262,6 +276,8 @@ defmodule InfluxElixir.Telemetry do
     )
   end
 
+  @doc deprecated:
+         "Emitting the events by hand is not used by the library; wrap the operation in span_query/2"
   @doc """
   Emits the `[:influx_elixir, :query, :exception]` telemetry event.
 
