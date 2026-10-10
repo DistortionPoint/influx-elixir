@@ -171,7 +171,7 @@ defmodule InfluxElixir.Flight.Client do
   @spec ticket_payload(term(), term()) ::
           {:ok, binary()} | {:error, {:unencodable_body, binary()}}
   defp ticket_payload(database, sql) do
-    case Jason.encode(%{"database" => database, "sql_query" => sql, "query_type" => "sql"}) do
+    case Jason.encode(ticket(database, sql)) do
       {:ok, payload} -> {:ok, payload}
       {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
     end
@@ -227,13 +227,20 @@ defmodule InfluxElixir.Flight.Client do
           result | {:error, :connect_timeout | {:connect_failed, binary()}}
         when result: term()
   def bounded_connect(fun, timeout) when is_function(fun, 0),
-    do: bounded(fun, timeout, {:error, :connect_timeout}, :connect_failed)
+    do: bounded(fun, timeout, {:error, :connect_timeout}, :connect_failed, &release_channel/1)
+
+  # A channel opened just as the bound ran out is closed, never left open with no owner.
+  @spec release_channel(term()) :: :ok
+  defp release_channel({:ok, %GRPC.Channel{} = channel}), do: disconnect(channel)
+  defp release_channel(_result), do: :ok
 
   # Runs `fun` in a monitored process for at most `timeout` ms: its result, `on_timeout` past
-  # the bound, or `{:error, {failure, message}}` when it raises, throws or exits.
-  @spec bounded((-> result), non_neg_integer(), term(), atom()) :: result | term()
+  # the bound, or `{:error, {failure, message}}` when it raises, throws or exits. A result
+  # that comes too late is handed to `release` and dropped.
+  @spec bounded((-> result), non_neg_integer(), term(), atom(), (result -> :ok)) ::
+          result | term()
         when result: term()
-  defp bounded(fun, timeout, on_timeout, failure) do
+  defp bounded(fun, timeout, on_timeout, failure, release) do
     caller = self()
     tag = make_ref()
 
@@ -259,10 +266,15 @@ defmodule InfluxElixir.Flight.Client do
     after
       timeout ->
         Process.exit(pid, :kill)
-        Process.demonitor(monitor, [:flush])
-        # A result sent just before the kill is dropped with the rest.
+
+        # The :DOWN comes after every message the process sent, so a result sent just before
+        # the kill is in the mailbox by then: released, never left in the caller's mailbox.
         receive do
-          {^tag, _late} -> :ok
+          {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+        end
+
+        receive do
+          {^tag, late} -> release.(late)
         after
           0 -> :ok
         end
@@ -280,7 +292,7 @@ defmodule InfluxElixir.Flight.Client do
           {:ok, [FlightData.t()]} | {:error, term()}
   defp fetch(channel, token, payload, timeout) do
     fn -> do_get(channel, token, payload, timeout) end
-    |> bounded(timeout, {:error, :timeout}, :flight_failed)
+    |> bounded(timeout, {:error, :timeout}, :flight_failed, fn _rows -> :ok end)
     |> normalize_error()
   end
 
@@ -363,13 +375,12 @@ defmodule InfluxElixir.Flight.Client do
       %{"database" => "mydb", "sql_query" => "SELECT 1", "query_type" => "sql"}
   """
   @spec build_ticket_payload(binary(), binary()) :: binary()
-  def build_ticket_payload(database, sql) do
-    Jason.encode!(%{
-      "database" => database,
-      "sql_query" => sql,
-      "query_type" => "sql"
-    })
-  end
+  def build_ticket_payload(database, sql), do: Jason.encode!(ticket(database, sql))
+
+  # The JSON InfluxDB 3 reads from a ticket.
+  @spec ticket(term(), term()) :: map()
+  defp ticket(database, sql),
+    do: %{"database" => database, "sql_query" => sql, "query_type" => "sql"}
 
   @doc """
   Builds a `Ticket` struct for the given database and SQL query.

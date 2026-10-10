@@ -14,32 +14,24 @@ defmodule InfluxElixir.Client.HTTPTest do
 
   describe "init_connection/1 — :database resolution" do
     test "passes :database through unchanged" do
-      {:ok, conn} = HTTP.init_connection(host: "h", token: "t", database: "primary")
-      assert Keyword.get(conn, :database) === "primary"
+      config = [host: "h", token: "t", database: "primary"]
+      assert HTTP.init_connection(config) === {:ok, config}
     end
 
     test "defaults :database to first of :databases when singular missing" do
-      {:ok, conn} =
-        HTTP.init_connection(host: "h", token: "t", databases: ["a", "b"])
-
-      assert Keyword.get(conn, :database) === "a"
+      assert HTTP.init_connection(host: "h", token: "t", databases: ["a", "b"]) ===
+               {:ok, [database: "a", host: "h", token: "t", databases: ["a", "b"]]}
     end
 
     test "preserves :database when both keys are given" do
-      {:ok, conn} =
-        HTTP.init_connection(
-          host: "h",
-          token: "t",
-          database: "primary",
-          databases: ["a", "b"]
-        )
-
-      assert Keyword.get(conn, :database) === "primary"
+      config = [host: "h", token: "t", database: "primary", databases: ["a", "b"]]
+      assert HTTP.init_connection(config) === {:ok, config}
     end
 
-    test "leaves :database absent when neither key is given" do
-      {:ok, conn} = HTTP.init_connection(host: "h", token: "t")
-      assert Keyword.get(conn, :database) === nil
+    test "leaves :database absent when neither key is given, or :databases has no name" do
+      for config <- [[host: "h", token: "t"], [host: "h", databases: []], [databases: [:a]]] do
+        assert HTTP.init_connection(config) === {:ok, config}
+      end
     end
   end
 
@@ -294,6 +286,12 @@ defmodule InfluxElixir.Client.HTTPTest do
         assert HTTP.write(conn, "m f=1", precision: value) ===
                  {:error, {:invalid_value, :precision, value}}
 
+        assert HTTP.write(conn, "m f=1", accept_partial: value) ===
+                 {:error, {:invalid_value, :accept_partial, value}}
+
+        assert HTTP.write(conn, "m f=1", no_sync: value) ===
+                 {:error, {:invalid_value, :no_sync, value}}
+
         assert HTTP.query_flux(conn, "buckets()", org: value) ===
                  {:error, {:invalid_value, :org, value}}
 
@@ -301,6 +299,14 @@ defmodule InfluxElixir.Client.HTTPTest do
         assert HTTP.delete_token(conn, value) === {:error, {:invalid_value, :name, value}}
         assert HTTP.delete_bucket(conn, value) === {:error, {:invalid_value, :bucket, value}}
       end
+    end
+
+    # InfluxDB 2's write has neither flag: they are not sent, so not read.
+    test "a v2 write sends neither flag, whatever its value" do
+      conn = connection(ClosedPort.port(), api_version: :v2, org: "o")
+
+      assert HTTP.write(conn, "m f=1", accept_partial: %{}, no_sync: {1}) ===
+               {:error, {:connection_error, %Mint.TransportError{reason: :econnrefused}}}
     end
   end
 

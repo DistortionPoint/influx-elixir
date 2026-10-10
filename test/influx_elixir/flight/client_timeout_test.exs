@@ -127,7 +127,11 @@ defmodule InfluxElixir.Flight.ClientTimeoutTest do
         end)
 
       bytes = bytes_through_do_get()
-      Task.shutdown(task, :brutal_kill)
+
+      # The server going away ends the call, which closes its channel; killing the call would
+      # leave the channel open under the gRPC client's supervisor, which every test shares.
+      :ok = stop_supervised(Task)
+      assert {:error, _closed} = Task.await(task, Await.bound())
       bytes
     end
 

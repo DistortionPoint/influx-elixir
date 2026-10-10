@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **The Flight transport and the HTTP client** (design document
+  `2026-10-10_review-of-flight-and-http.md`):
+  - A decimal at a negative scale over Flight (`CAST(1234 AS DECIMAL(5,-2))`) is the integer
+    HTTP gives, `1200`. The whole query used to fail with a decode error.
+  - A decimal column of a width Arrow does not define is
+    `{:unsupported_arrow_type, "Decimal<width>", column}`. A width of 0 used to read the
+    body without end.
+  - A Flight channel opened just as `:connect_timeout` ran out is closed. It used to stay
+    open with no owner, and a result arriving late could be left in the caller's mailbox.
+  - `accept_partial:` or `no_sync:` with a value that is not text is
+    `{:error, {:invalid_value, key, value}}` from the HTTP client. It used to raise.
+  - `execute_sql/3`, `list_databases/1` and `list_buckets/1` return an error for an answer of
+    the wrong shape (an array holding something that is no object, a `buckets` that is no
+    list). They used to raise, and `execute_sql/3` returned a body such as `true` as
+    `{:ok, true}`.
 - **Connections, the batch writer facade and query parameters** (design document
   `2026-10-10_review-of-connections.md`):
   - `finch_name: nil` starts the connection's own Finch pool, which the HTTP client then

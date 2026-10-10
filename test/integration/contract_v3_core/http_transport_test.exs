@@ -256,7 +256,8 @@ defmodule InfluxElixir.Integration.ContractV3Core.HttpTransportTest do
       for sql <- [
             "SELECT selector_last(v, time) AS sl, array_agg(host ORDER BY host) AS hosts FROM #{m}",
             "SELECT time - LAG(time) OVER (ORDER BY time) AS gap FROM #{m} ORDER BY time",
-            "SELECT concat(host, '-', s) AS hs, CAST(time AS DATE) AS d, CAST(v AS DECIMAL(10,2)) AS dec FROM #{m} ORDER BY time"
+            "SELECT concat(host, '-', s) AS hs, CAST(time AS DATE) AS d, CAST(v AS DECIMAL(10,2)) AS dec FROM #{m} ORDER BY time",
+            "SELECT CAST(1234 AS DECIMAL(5,-2)) AS neg, CAST(-1234 AS DECIMAL(5,-2)) AS negs FROM #{m}"
           ] do
         assert {:ok, http_rows} = HTTP.query_sql(ctx.conn, sql, database: ctx.database)
 

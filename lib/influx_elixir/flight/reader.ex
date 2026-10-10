@@ -35,7 +35,7 @@ defmodule InfluxElixir.Flight.Reader do
   | Date32 | `"YYYY-MM-DD"` |
   | Date64 | `DateTime.t()` (HTTP renders a datetime, read as one) |
   | Duration | `"PT60S"`, `"PT0.5S"`, `"-PT0.000000001S"`, `"P0D"` |
-  | Decimal128/256 | a number (integer at scale 0, else float) |
+  | Decimal32/64/128/256 | a number (integer at a scale of 0 or below, else float) |
   | Struct (`selector_*` without a subscript) | a map of its members |
   | List, LargeList, FixedSizeList (`array_agg`) | a list |
   | Null | `nil` |
@@ -55,7 +55,8 @@ defmodule InfluxElixir.Flight.Reader do
   ## Limitations
 
   Interval, Time, Map, Union, FixedSizeBinary, run-end encoded and
-  list-view columns, dictionary-encoded fields and compressed IPC bodies
+  list-view columns, decimals of a width Arrow does not define, dictionary-encoded fields and
+  compressed IPC bodies
   are refused with `{:error, {:unsupported_arrow_type, type, column}}`
   rather than dropped. (InfluxDB 3 sends tag columns hydrated, so their
   `Dictionary(Int32, Utf8)` type does not reach the reader.)
@@ -361,8 +362,17 @@ defmodule InfluxElixir.Flight.Reader do
   defp field_kind(fb, @fb_type_date, pos, _type_id),
     do: {:date, if(type_slot(fb, pos, 0, :int16, 1) == 0, do: :day, else: :millisecond)}
 
-  defp field_kind(fb, @fb_type_decimal, pos, _type_id),
-    do: {:decimal, type_slot(fb, pos, 1, :int32, 0), div(type_slot(fb, pos, 2, :int32, 128), 8)}
+  # Arrow's decimals are 32, 64, 128 or 256 bits wide. Any other width is refused: a width of
+  # 0 would read the body forever, one value of no bits at a time.
+  defp field_kind(fb, @fb_type_decimal, pos, _type_id) do
+    case type_slot(fb, pos, 2, :int32, 128) do
+      width when width in [32, 64, 128, 256] ->
+        {:decimal, type_slot(fb, pos, 1, :int32, 0), div(width, 8)}
+
+      width ->
+        {:unsupported, "Decimal#{width}"}
+    end
+  end
 
   defp field_kind(fb, @fb_type_floating_point, pos, _type_id) do
     # Precision HALF (0) is the default and is not on the wire.
@@ -908,10 +918,11 @@ defmodule InfluxElixir.Flight.Reader do
     for <<v::little-signed-size(bits) <- data>>, do: scale_decimal(v, scale)
   end
 
-  # HTTP's JSON has the decimal as a number: an integer at scale 0, else a
-  # float (`CAST(v AS DECIMAL(10,2))` of 1.5 is 1.5).
+  # HTTP's JSON has the decimal as a number: an integer at a scale of 0 or below, else a
+  # float (`CAST(v AS DECIMAL(10,2))` of 1.5 is 1.5, `CAST(1234 AS DECIMAL(5,-2))` is 1200,
+  # verified against InfluxDB 3 Core 3.10.1).
   @spec scale_decimal(integer(), integer()) :: number()
-  defp scale_decimal(v, 0), do: v
+  defp scale_decimal(v, scale) when scale <= 0, do: v * Integer.pow(10, -scale)
   defp scale_decimal(v, scale), do: v / Integer.pow(10, scale)
 
   # InfluxDB 3's HTTP rendering of a Duration (verified): `P0D` for zero,
@@ -989,14 +1000,8 @@ defmodule InfluxElixir.Flight.Reader do
     decode_utf8_column(safe_slice(body, oo, ol), safe_slice(body, doff, dlen))
   end
 
-  defp decode_column_values(
-         @type_utf8,
-         [{oo, _off_len} | _rest],
-         body,
-         _n
-       ) do
-    decode_utf8_column(<<>>, safe_slice(body, oo, byte_size(body) - oo))
-  end
+  # A Utf8 column without its data buffer has no values: it is null, as `decode_fixed_column/4`
+  # makes any column it has no width for.
 
   defp decode_column_values(type_id, [{doff, dlen} | _rest], body, n) do
     data = safe_slice(body, doff, dlen)

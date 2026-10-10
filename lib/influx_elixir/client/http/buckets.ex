@@ -70,7 +70,7 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
     path = "/api/v2/buckets?limit=#{@bucket_page}&offset=#{offset}" <> org_param(connection)
 
     with {:ok, %Finch.Response{body: resp_body}} <- Request.get(connection, path, [200]),
-         {:ok, %{"buckets" => page}} <- Request.decode_json(resp_body) do
+         {:ok, %{"buckets" => page}} when is_list(page) <- Request.decode_json(resp_body) do
       if length(page) == @bucket_page,
         do: list_pages(connection, offset + @bucket_page, [page | pages]),
         else: {:ok, [page | pages] |> Enum.reverse() |> Enum.concat()}

@@ -6,61 +6,23 @@ defmodule InfluxElixir.Flight.ClientTest do
   alias InfluxElixir.TestSupport.{Await, ClosedPort}
 
   describe "build_ticket_payload/2" do
-    test "produces valid JSON with required fields" do
-      payload = Client.build_ticket_payload("mydb", "SELECT * FROM cpu")
-      decoded = Jason.decode!(payload)
-
-      assert decoded["database"] === "mydb"
-      assert decoded["sql_query"] === "SELECT * FROM cpu"
-      assert decoded["query_type"] === "sql"
-    end
-
-    test "encodes database name correctly" do
-      payload = Client.build_ticket_payload("metrics_prod", "SELECT 1")
-      assert Jason.decode!(payload)["database"] === "metrics_prod"
-    end
-
-    test "encodes complex SQL without modification" do
+    test "is the JSON InfluxDB 3 reads: the database, the statement as given, sql" do
       sql = "SELECT time, value FROM cpu WHERE host = $host ORDER BY time DESC LIMIT 100"
-      payload = Client.build_ticket_payload("db", sql)
-      assert Jason.decode!(payload)["sql_query"] === sql
-    end
 
-    test "query_type is always 'sql'" do
-      payload = Client.build_ticket_payload("db", "SELECT 1")
-      assert Jason.decode!(payload)["query_type"] === "sql"
+      assert "metrics_prod" |> Client.build_ticket_payload(sql) |> Jason.decode!() ===
+               %{"database" => "metrics_prod", "sql_query" => sql, "query_type" => "sql"}
     end
   end
 
   describe "build_ticket/2" do
-    test "returns a Ticket struct" do
-      ticket = Client.build_ticket("mydb", "SELECT 1")
-      assert %Ticket{} = ticket
-    end
-
-    test "ticket field contains JSON payload" do
-      ticket = Client.build_ticket("mydb", "SELECT 1")
-      decoded = Jason.decode!(ticket.ticket)
-      assert decoded["database"] === "mydb"
-      assert decoded["sql_query"] === "SELECT 1"
-    end
-
-    test "ticket can be protobuf-encoded" do
+    test "is a Ticket carrying that JSON, unchanged through protobuf encoding" do
       ticket = Client.build_ticket("sensors", "SELECT * FROM temp")
-      encoded = Protobuf.encode(ticket)
-      decoded = Protobuf.decode(encoded, Ticket)
-      assert Jason.decode!(decoded.ticket)["database"] === "sensors"
-    end
 
-    test "roundtrips database and query through protobuf encoding" do
-      db = "test_database"
-      sql = "SELECT measurement, value FROM readings LIMIT 10"
-      ticket = Client.build_ticket(db, sql)
-      encoded = Protobuf.encode(ticket)
-      decoded_ticket = Protobuf.decode(encoded, Ticket)
-      payload = Jason.decode!(decoded_ticket.ticket)
-      assert payload["database"] === db
-      assert payload["sql_query"] === sql
+      assert ticket === %Ticket{
+               ticket: Client.build_ticket_payload("sensors", "SELECT * FROM temp")
+             }
+
+      assert ticket |> Protobuf.encode() |> Protobuf.decode(Ticket) === ticket
     end
   end
 
@@ -107,10 +69,10 @@ defmodule InfluxElixir.Flight.ClientTest do
     test "a statement or a database JSON cannot carry is an error, before any connection" do
       conn = %{host: "localhost", port: ClosedPort.port(), token: "tok", database: "db"}
 
-      assert {:error, {:unencodable_body, _message}} =
-               Client.query(conn, <<0xFF>>, tls: false)
+      assert Client.query(conn, <<0xFF>>, tls: false) ===
+               {:error, {:unencodable_body, "invalid byte 0xFF in <<255>>"}}
 
-      assert {:error, {:unencodable_body, _message}} =
+      assert {:error, {:unencodable_body, "protocol Jason.Encoder not implemented for" <> _rest}} =
                Client.query(%{conn | database: {1}}, "SELECT 1", tls: false)
     end
 
@@ -161,15 +123,14 @@ defmodule InfluxElixir.Flight.ClientTest do
   # ---------------------------------------------------------------------------
   # bounded_connect/2 wall-clock guarantee
   #
-  # The grpc 0.11 adapter does not expose a connect-phase timeout, so we wrap
-  # the call in Task.async/yield. The bound applies regardless of what the
+  # The grpc 0.11 adapter does not expose a connect-phase timeout, so the call runs in a
+  # monitored process that is killed at the bound. The bound applies regardless of what the
   # underlying gRPC stub does internally.
   # ---------------------------------------------------------------------------
 
   describe "bounded_connect/2" do
     test "returns the fn's result when it completes in time" do
-      assert {:ok, :channel} =
-               Client.bounded_connect(fn -> {:ok, :channel} end, Await.bound())
+      assert Client.bounded_connect(fn -> {:ok, :channel} end, Await.bound()) === {:ok, :channel}
     end
 
     test "a raise, a throw or an exit inside the fn is an error tuple, not the caller's crash" do
@@ -193,13 +154,16 @@ defmodule InfluxElixir.Flight.ClientTest do
     end
 
     test "propagates the fn's error tuple" do
-      assert {:error, :nxdomain} =
-               Client.bounded_connect(fn -> {:error, :nxdomain} end, Await.bound())
+      assert Client.bounded_connect(fn -> {:error, :nxdomain} end, Await.bound()) ===
+               {:error, :nxdomain}
     end
 
-    test "returns {:error, :connect_timeout} when fn exceeds the bound" do
-      assert {:error, :connect_timeout} =
-               Client.bounded_connect(fn -> Process.sleep(:infinity) end, 50)
+    test "returns {:error, :connect_timeout} when fn exceeds the bound, and leaves nothing" do
+      assert Client.bounded_connect(fn -> Process.sleep(:infinity) end, 50) ===
+               {:error, :connect_timeout}
+
+      # The process is gone and the caller's mailbox holds nothing of it.
+      assert Process.info(self(), :messages) === {:messages, []}
     end
   end
 end

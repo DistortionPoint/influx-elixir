@@ -15,7 +15,6 @@ defmodule InfluxElixir.Flight.ReaderTest do
   #
   # Build strategy: emit sections in the order they appear in memory (low to
   # high), computing exact byte positions analytically before writing bytes.
-  # Validate everything with the companion debug script in tmp/.
   #
   # Key sizes (all in bytes):
   #
@@ -569,46 +568,58 @@ defmodule InfluxElixir.Flight.ReaderTest do
     Enum.map(specs, fn {off, len} -> {off + delta, len} end)
   end
 
+  # The schema entry of a column the reader decodes by type id.
+  defp primitive(name, type_id, unit \\ nil) do
+    %{name: name, type_id: type_id, unit: unit, kind: :primitive, children: []}
+  end
+
+  # The schema entry of a column of a type the reader does not decode.
+  defp undecoded(name, type) do
+    %{name: name, type_id: 0, unit: nil, kind: {:unsupported, type}, children: []}
+  end
+
   # ---------------------------------------------------------------------------
   # Tests: decode_flight_data/1 — empty input
   # ---------------------------------------------------------------------------
 
   describe "decode_flight_data/1 — empty input" do
-    test "returns {:ok, []} for empty list" do
-      assert {:ok, []} = Reader.decode_flight_data([])
+    test "an empty list of messages decodes to no rows" do
+      assert Reader.decode_flight_data([]) === {:ok, []}
     end
   end
 
   # ---------------------------------------------------------------------------
-  # Tests: parse_schema/1 — nil and degenerate inputs
+  # Tests: nil and degenerate inputs
   # ---------------------------------------------------------------------------
 
-  describe "parse_schema/1 — nil and degenerate inputs" do
-    test "returns {:ok, []} for nil" do
-      assert {:ok, []} = Reader.parse_schema(nil)
+  describe "parse_schema/1 and decode_flight_data/1 — nil and degenerate inputs" do
+    test "a nil header has no columns" do
+      assert Reader.parse_schema(nil) === {:ok, []}
     end
 
-    test "returns {:ok, []} for empty binary" do
-      assert {:ok, []} = Reader.parse_schema(<<>>)
+    test "an empty header has no columns" do
+      assert Reader.parse_schema(<<>>) === {:ok, []}
     end
 
-    test "returns {:ok, []} for too-short binary (< 8 bytes)" do
-      assert {:ok, []} = Reader.parse_schema(<<0, 1, 2>>)
+    test "a header shorter than 8 bytes has no columns" do
+      for short <- [<<0, 1, 2>>, <<0, 0, 0, 0>>] do
+        assert Reader.parse_schema(short) === {:ok, []}
+      end
     end
 
     test "schema-only stream with no batches returns no rows" do
       fd = schema_fd([{"value", 2, [bit_width: 64, is_signed: true]}])
-      assert {:ok, []} = Reader.decode_flight_data([fd])
+      assert Reader.decode_flight_data([fd]) === {:ok, []}
     end
 
-    test "FlightData with nil data_header returns {:ok, []}" do
+    test "FlightData with nil data_header returns no rows" do
       fd = %FlightData{data_header: nil, data_body: <<>>}
-      assert {:ok, []} = Reader.decode_flight_data([fd])
+      assert Reader.decode_flight_data([fd]) === {:ok, []}
     end
 
-    test "FlightData with empty data_header returns {:ok, []}" do
+    test "FlightData with empty data_header returns no rows" do
       fd = %FlightData{data_header: <<>>, data_body: <<>>}
-      assert {:ok, []} = Reader.decode_flight_data([fd])
+      assert Reader.decode_flight_data([fd]) === {:ok, []}
     end
   end
 
@@ -617,35 +628,24 @@ defmodule InfluxElixir.Flight.ReaderTest do
   # ---------------------------------------------------------------------------
 
   describe "parse_schema/1 — signed Int columns" do
-    test "extracts column name from Int64 schema" do
+    test "describes an Int64 column by name, type id, unit, kind and children" do
       header = schema_msg([{"value", 2, [bit_width: 64, is_signed: true]}])
-      {:ok, cols} = Reader.parse_schema(header)
-      assert length(cols) === 1
-      assert hd(cols).name === "value"
-    end
-
-    test "maps Int64 (bitWidth=64, signed) to type_id 6" do
-      header = schema_msg([{"value", 2, [bit_width: 64, is_signed: true]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 6
+      assert Reader.parse_schema(header) === {:ok, [primitive("value", 6)]}
     end
 
     test "maps Int32 (bitWidth=32, signed) to type_id 4" do
       header = schema_msg([{"count", 2, [bit_width: 32, is_signed: true]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 4
+      assert Reader.parse_schema(header) === {:ok, [primitive("count", 4)]}
     end
 
     test "maps Int16 (bitWidth=16, signed) to type_id 3" do
       header = schema_msg([{"small", 2, [bit_width: 16, is_signed: true]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 3
+      assert Reader.parse_schema(header) === {:ok, [primitive("small", 3)]}
     end
 
     test "maps Int8 (bitWidth=8, signed) to type_id 2" do
       header = schema_msg([{"tiny", 2, [bit_width: 8, is_signed: true]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 2
+      assert Reader.parse_schema(header) === {:ok, [primitive("tiny", 2)]}
     end
   end
 
@@ -656,26 +656,22 @@ defmodule InfluxElixir.Flight.ReaderTest do
   describe "parse_schema/1 — unsigned Int columns" do
     test "maps UInt64 (bitWidth=64, unsigned) to type_id 10" do
       header = schema_msg([{"u64", 2, [bit_width: 64, is_signed: false]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 10
+      assert Reader.parse_schema(header) === {:ok, [primitive("u64", 10)]}
     end
 
     test "maps UInt32 (bitWidth=32, unsigned) to type_id 9" do
       header = schema_msg([{"u32", 2, [bit_width: 32, is_signed: false]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 9
+      assert Reader.parse_schema(header) === {:ok, [primitive("u32", 9)]}
     end
 
     test "maps UInt16 (bitWidth=16, unsigned) to type_id 8" do
       header = schema_msg([{"u16", 2, [bit_width: 16, is_signed: false]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 8
+      assert Reader.parse_schema(header) === {:ok, [primitive("u16", 8)]}
     end
 
     test "maps UInt8 (bitWidth=8, unsigned) to type_id 7" do
       header = schema_msg([{"u8", 2, [bit_width: 8, is_signed: false]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 7
+      assert Reader.parse_schema(header) === {:ok, [primitive("u8", 7)]}
     end
 
     # FlatBuffers leave a field out when it holds its default, and Arrow's `is_signed` defaults
@@ -683,8 +679,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
     test "an Int whose is_signed slot is left out is unsigned" do
       for {width, type_id} <- [{8, 7}, {16, 8}, {32, 9}, {64, 10}] do
         header = schema_msg([{"u", 2, [bit_width: width, is_signed: :omit]}])
-        assert {:ok, [col]} = Reader.parse_schema(header)
-        assert col.type_id === type_id
+        assert Reader.parse_schema(header) === {:ok, [primitive("u", type_id)]}
       end
     end
 
@@ -712,21 +707,19 @@ defmodule InfluxElixir.Flight.ReaderTest do
   describe "parse_schema/1 — FloatingPoint columns" do
     test "maps Float64 (precision=2) to type_id 12" do
       header = schema_msg([{"temp", 3, [precision: 2]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 12
+      assert Reader.parse_schema(header) === {:ok, [primitive("temp", 12)]}
     end
 
     test "maps Float32 (precision=1) to type_id 11" do
       header = schema_msg([{"reading", 3, [precision: 1]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 11
+      assert Reader.parse_schema(header) === {:ok, [primitive("reading", 11)]}
     end
 
     test "precision left out of the table is Float16, the Arrow default" do
       header = schema_msg([{"f", 3, [precision: :omit]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 0
-      assert col.kind === :float16
+
+      assert Reader.parse_schema(header) ===
+               {:ok, [%{name: "f", type_id: 0, unit: nil, kind: :float16, children: []}]}
     end
 
     test "Float16 cells decode as the shortest Float32 decimal, infinities and NaN as nil" do
@@ -784,20 +777,17 @@ defmodule InfluxElixir.Flight.ReaderTest do
   describe "parse_schema/1 — Bool, Utf8, Timestamp columns" do
     test "maps Bool (type_type=6) to type_id 14" do
       header = schema_msg([{"active", 6, []}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 14
+      assert Reader.parse_schema(header) === {:ok, [primitive("active", 14)]}
     end
 
     test "maps Utf8 (type_type=5) to type_id 15" do
       header = schema_msg([{"host", 5, []}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 15
+      assert Reader.parse_schema(header) === {:ok, [primitive("host", 15)]}
     end
 
-    test "maps Timestamp (type_type=10) to type_id 20" do
+    test "maps Timestamp (type_type=10) to type_id 20 with its unit" do
       header = schema_msg([{"time", 10, []}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 20
+      assert Reader.parse_schema(header) === {:ok, [primitive("time", 20, :nanosecond)]}
     end
   end
 
@@ -813,8 +803,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
           {"value", 2, [bit_width: 64, is_signed: true]}
         ])
 
-      {:ok, cols} = Reader.parse_schema(header)
-      assert Enum.map(cols, & &1.name) === ["time", "value"]
+      assert Reader.parse_schema(header) ===
+               {:ok, [primitive("time", 20, :nanosecond), primitive("value", 6)]}
     end
 
     test "preserves column order across three columns" do
@@ -825,11 +815,9 @@ defmodule InfluxElixir.Flight.ReaderTest do
           {"cpu", 2, [bit_width: 64, is_signed: true]}
         ])
 
-      {:ok, cols} = Reader.parse_schema(header)
-      assert length(cols) === 3
-      assert Enum.at(cols, 0).name === "time"
-      assert Enum.at(cols, 1).name === "host"
-      assert Enum.at(cols, 2).name === "cpu"
+      assert Reader.parse_schema(header) ===
+               {:ok,
+                [primitive("time", 20, :nanosecond), primitive("host", 15), primitive("cpu", 6)]}
     end
 
     test "assigns correct type_ids to a mixed-type schema" do
@@ -841,22 +829,20 @@ defmodule InfluxElixir.Flight.ReaderTest do
           {"flag", 6, []}
         ])
 
-      {:ok, cols} = Reader.parse_schema(header)
-      assert length(cols) === 4
       # Timestamp=20, Utf8=15, Float64=12, Bool=14
-      assert Enum.map(cols, & &1.type_id) === [20, 15, 12, 14]
-    end
-
-    test "each column map has name and type_id keys" do
-      header = schema_msg([{"x", 2, [bit_width: 64, is_signed: true]}])
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert Map.has_key?(col, :name)
-      assert Map.has_key?(col, :type_id)
+      assert Reader.parse_schema(header) ===
+               {:ok,
+                [
+                  primitive("ts", 20, :nanosecond),
+                  primitive("tag", 15),
+                  primitive("val", 12),
+                  primitive("flag", 14)
+                ]}
     end
   end
 
   # ---------------------------------------------------------------------------
-  # Tests: decode_flight_data/1 — Int64 column round-trip
+  # Tests: decode_flight_data/1 — row counts a body cannot hold
   # ---------------------------------------------------------------------------
 
   describe "decode_flight_data/1 — a row count the body cannot hold" do
@@ -876,8 +862,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
     test "is decoded at the engine's batch size, and refused when its cells pass the bound" do
       nulls = fn count -> schema_fd(for i <- 1..count, do: {"c#{i}", 1, []}) end
 
-      assert {:answered, {:ok, rows}} = decode_bounded([nulls.(3), batch_fd(<<>>, [], 8192)])
-      assert length(rows) === 8192
+      assert decode_bounded([nulls.(3), batch_fd(<<>>, [], 8192)]) ===
+               {:answered, {:ok, List.duplicate(%{}, 8192)}}
 
       assert decode_bounded([nulls.(200), batch_fd(<<>>, [], 8192)]) ===
                {:answered,
@@ -889,9 +875,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       schema = schema_fd([int | for(i <- 1..80, do: {"c#{i}", 1, []})])
       {body, specs} = int64_column(Enum.to_list(1..8192))
 
-      assert {:answered, {:ok, rows}} = decode_bounded([schema, batch_fd(body, specs, 8192)])
-      assert length(rows) === 8192
-      assert List.last(rows)["v"] === 8192
+      assert decode_bounded([schema, batch_fd(body, specs, 8192)]) ===
+               {:answered, {:ok, Enum.map(1..8192, &%{"v" => &1})}}
     end
   end
 
@@ -918,11 +903,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = int64_column([10, 20, 30])
       batch = batch_fd(body, specs, 3)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) === 3
-      assert Enum.at(rows, 0)["value"] === 10
-      assert Enum.at(rows, 1)["value"] === 20
-      assert Enum.at(rows, 2)["value"] === 30
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"value" => 10}, %{"value" => 20}, %{"value" => 30}]}
     end
 
     test "decodes negative Int64 values" do
@@ -930,10 +912,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = int64_column([-1, -100, 0])
       batch = batch_fd(body, specs, 3)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["delta"] === -1
-      assert Enum.at(rows, 1)["delta"] === -100
-      assert Enum.at(rows, 2)["delta"] === 0
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"delta" => -1}, %{"delta" => -100}, %{"delta" => 0}]}
     end
 
     test "decodes a single-row Int64 batch" do
@@ -941,8 +921,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = int64_column([42])
       batch = batch_fd(body, specs, 1)
 
-      assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["n"] === 42
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{"n" => 42}]}
     end
   end
 
@@ -956,11 +935,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = float64_column([1.5, 2.5, 3.14])
       batch = batch_fd(body, specs, 3)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) === 3
-      assert_in_delta Enum.at(rows, 0)["temp"], 1.5, 1.0e-9
-      assert_in_delta Enum.at(rows, 1)["temp"], 2.5, 1.0e-9
-      assert_in_delta Enum.at(rows, 2)["temp"], 3.14, 1.0e-9
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"temp" => 1.5}, %{"temp" => 2.5}, %{"temp" => 3.14}]}
     end
 
     test "decodes a negative float value" do
@@ -968,8 +944,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = float64_column([-0.5])
       batch = batch_fd(body, specs, 1)
 
-      assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert_in_delta row["x"], -0.5, 1.0e-9
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{"x" => -0.5}]}
     end
   end
 
@@ -983,11 +958,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = bool_column([true, false, true])
       batch = batch_fd(body, specs, 3)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) === 3
-      assert Enum.at(rows, 0)["flag"] === true
-      assert Enum.at(rows, 1)["flag"] === false
-      assert Enum.at(rows, 2)["flag"] === true
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"flag" => true}, %{"flag" => false}, %{"flag" => true}]}
     end
 
     test "decodes all-false bool column" do
@@ -995,8 +967,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = bool_column([false, false])
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.all?(rows, fn r -> r["active"] === false end)
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"active" => false}, %{"active" => false}]}
     end
   end
 
@@ -1010,10 +982,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = utf8_column(["server01", "server02"])
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) === 2
-      assert Enum.at(rows, 0)["host"] === "server01"
-      assert Enum.at(rows, 1)["host"] === "server02"
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"host" => "server01"}, %{"host" => "server02"}]}
     end
 
     test "decodes empty strings alongside non-empty strings" do
@@ -1021,9 +991,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = utf8_column(["", "val"])
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["tag"] === ""
-      assert Enum.at(rows, 1)["tag"] === "val"
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"tag" => ""}, %{"tag" => "val"}]}
     end
   end
 
@@ -1039,9 +1008,12 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = int64_column([ts1, ts2])
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, [row1, row2]} = Reader.decode_flight_data([schema, batch])
-      assert row1["time"] === ~U[2021-08-31 15:37:37.123456Z]
-      assert row2["time"] === ~U[2021-08-31 15:37:38.000000Z]
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok,
+                [
+                  %{"time" => ~U[2021-08-31 15:37:37.123456Z]},
+                  %{"time" => ~U[2021-08-31 15:37:38.000000Z]}
+                ]}
     end
 
     test "honours the column's TimeUnit (milliseconds)" do
@@ -1049,16 +1021,16 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = int64_column([1_630_424_257_500])
       batch = batch_fd(body, specs, 1)
 
-      assert {:ok, [%{"time" => ~U[2021-08-31 15:37:37.500000Z]}]} =
-               Reader.decode_flight_data([schema, batch])
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"time" => ~U[2021-08-31 15:37:37.500000Z]}]}
     end
 
     test "parses the unit into the column schema" do
-      assert {:ok, [%{name: "time", type_id: 20, unit: :nanosecond}]} =
-               Reader.parse_schema(schema_fd([{"time", 10, [unit: 3]}]).data_header)
+      assert Reader.parse_schema(schema_fd([{"time", 10, [unit: 3]}]).data_header) ===
+               {:ok, [primitive("time", 20, :nanosecond)]}
 
-      assert {:ok, [%{name: "v", type_id: 6, unit: nil}]} =
-               Reader.parse_schema(schema_fd([{"v", 2, [bit_width: 64]}]).data_header)
+      assert Reader.parse_schema(schema_fd([{"v", 2, [bit_width: 64]}]).data_header) ===
+               {:ok, [primitive("v", 6)]}
     end
   end
 
@@ -1082,15 +1054,11 @@ defmodule InfluxElixir.Flight.ReaderTest do
       all_specs = int_specs ++ float_specs
       batch = batch_fd(body, all_specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) === 2
-      assert Enum.at(rows, 0)["count"] === 1
-      assert Enum.at(rows, 1)["count"] === 2
-      assert_in_delta Enum.at(rows, 0)["value"], 0.1, 1.0e-9
-      assert_in_delta Enum.at(rows, 1)["value"], 0.2, 1.0e-9
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"count" => 1, "value" => 0.1}, %{"count" => 2, "value" => 0.2}]}
     end
 
-    test "each row map contains all declared column keys" do
+    test "each row carries a key for every declared column" do
       schema = schema_fd([{"ts", 10, []}, {"flag", 6, []}])
       {ts_data, ts_specs} = int64_column([100])
       {bool_data, bool_specs_raw} = bool_column([true])
@@ -1100,9 +1068,9 @@ defmodule InfluxElixir.Flight.ReaderTest do
       all_specs = ts_specs ++ bool_specs
       batch = batch_fd(body, all_specs, 1)
 
-      assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert Map.has_key?(row, "ts")
-      assert Map.has_key?(row, "flag")
+      # 100 ns is 0 microseconds past the epoch
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"ts" => ~U[1970-01-01 00:00:00.000000Z], "flag" => true}]}
     end
   end
 
@@ -1118,9 +1086,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       batch1 = batch_fd(body1, specs1, 2)
       batch2 = batch_fd(body2, specs2, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch1, batch2])
-      assert length(rows) === 4
-      assert Enum.map(rows, fn r -> r["v"] end) === [1, 2, 3, 4]
+      assert Reader.decode_flight_data([schema, batch1, batch2]) ===
+               {:ok, [%{"v" => 1}, %{"v" => 2}, %{"v" => 3}, %{"v" => 4}]}
     end
 
     test "accumulates five single-row batches" do
@@ -1132,9 +1099,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
           batch_fd(body, specs, 1)
         end)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema | batches])
-      assert length(rows) === 5
-      assert Enum.map(rows, fn r -> r["n"] end) === [1, 2, 3, 4, 5]
+      assert Reader.decode_flight_data([schema | batches]) ===
+               {:ok, Enum.map(1..5, &%{"n" => &1})}
     end
   end
 
@@ -1143,25 +1109,22 @@ defmodule InfluxElixir.Flight.ReaderTest do
   # ---------------------------------------------------------------------------
 
   describe "decode_flight_data/1 — empty batch handling" do
-    test "handles batch with nil data_header" do
+    test "a batch with a nil data_header decodes no rows" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
       batch = %FlightData{data_header: nil, data_body: <<>>}
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert rows === []
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, []}
     end
 
-    test "handles batch with empty data_header" do
+    test "a batch with an empty data_header decodes no rows" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
       batch = %FlightData{data_header: <<>>, data_body: <<>>}
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert rows === []
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, []}
     end
 
-    test "handles batch with nil data_body" do
+    test "a zero-row batch with a nil data_body decodes no rows" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
       batch = %FlightData{data_header: batch_msg(0, [{0, 0}, {0, 0}]), data_body: nil}
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert rows === []
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, []}
     end
   end
 
@@ -1175,8 +1138,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = int32_column([100, -200, 0])
       batch = batch_fd(body, specs, 3)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["count"]) === [100, -200, 0]
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"count" => 100}, %{"count" => -200}, %{"count" => 0}]}
     end
   end
 
@@ -1186,8 +1149,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = int16_column([1, -1, 32_767])
       batch = batch_fd(body, specs, 3)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["small"]) === [1, -1, 32_767]
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"small" => 1}, %{"small" => -1}, %{"small" => 32_767}]}
     end
   end
 
@@ -1197,8 +1160,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = int8_column([1, -1, 127])
       batch = batch_fd(body, specs, 3)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["tiny"]) === [1, -1, 127]
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"tiny" => 1}, %{"tiny" => -1}, %{"tiny" => 127}]}
     end
   end
 
@@ -1208,9 +1171,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = uint64_column([0, 18_446_744_073_709_551_615])
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["big"] === 0
-      assert Enum.at(rows, 1)["big"] === 18_446_744_073_709_551_615
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"big" => 0}, %{"big" => 18_446_744_073_709_551_615}]}
     end
   end
 
@@ -1220,8 +1182,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = uint32_column([0, 4_294_967_295])
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["u"]) === [0, 4_294_967_295]
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"u" => 0}, %{"u" => 4_294_967_295}]}
     end
   end
 
@@ -1231,8 +1193,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = uint16_column([0, 65_535])
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["u16"]) === [0, 65_535]
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"u16" => 0}, %{"u16" => 65_535}]}
     end
   end
 
@@ -1242,8 +1204,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = uint8_column([0, 255])
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.map(rows, & &1["byte"]) === [0, 255]
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"byte" => 0}, %{"byte" => 255}]}
     end
   end
 
@@ -1257,10 +1219,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = float32_column([1.0, -2.5])
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) === 2
-      assert_in_delta Enum.at(rows, 0)["reading"], 1.0, 1.0e-5
-      assert_in_delta Enum.at(rows, 1)["reading"], -2.5, 1.0e-5
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"reading" => 1.0}, %{"reading" => -2.5}]}
     end
   end
 
@@ -1276,10 +1236,15 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = with_validity_bitmap({body, specs}, 3, MapSet.new([1]))
       batch = batch_fd(body, specs, 3)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] === 10
-      refute Map.has_key?(Enum.at(rows, 1), "v")
-      assert Enum.at(rows, 2)["v"] === 30
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"v" => 10}, %{}, %{"v" => 30}]}
+
+      # nulls at the first and the last row leave only the middle value
+      {body, specs} = int64_column([10, 20, 30])
+      {body, specs} = with_validity_bitmap({body, specs}, 3, MapSet.new([0, 2]))
+      batch = batch_fd(body, specs, 3)
+
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{}, %{"v" => 20}, %{}]}
     end
 
     test "marks null Float64 values based on validity bitmap" do
@@ -1288,10 +1253,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = with_validity_bitmap({body, specs}, 3, MapSet.new([0, 2]))
       batch = batch_fd(body, specs, 3)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      refute Map.has_key?(Enum.at(rows, 0), "f")
-      assert_in_delta Enum.at(rows, 1)["f"], 2.0, 1.0e-9
-      refute Map.has_key?(Enum.at(rows, 2), "f")
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{}, %{"f" => 2.0}, %{}]}
     end
 
     test "all-null column via validity bitmap" do
@@ -1300,8 +1262,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
       {body, specs} = with_validity_bitmap({body, specs}, 2, MapSet.new([0, 1]))
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert rows === [%{}, %{}]
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{}, %{}]}
     end
   end
 
@@ -1324,8 +1285,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       batch = batch_fd(body, specs, 1)
 
-      assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["n"] === 547_808
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{"n" => 547_808}]}
     end
 
     test "marks null Int64 value with 64-byte alignment padding" do
@@ -1337,10 +1297,8 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       batch = batch_fd(body, specs, 3)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] === 10
-      refute Map.has_key?(Enum.at(rows, 1), "v")
-      assert Enum.at(rows, 2)["v"] === 30
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{"v" => 10}, %{}, %{"v" => 30}]}
     end
 
     test "decodes Float64 values with 64-byte alignment padding" do
@@ -1352,9 +1310,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert_in_delta Enum.at(rows, 0)["f"], 1.5, 1.0e-9
-      assert_in_delta Enum.at(rows, 1)["f"], 2.5, 1.0e-9
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{"f" => 1.5}, %{"f" => 2.5}]}
     end
 
     test "decodes Int64 values with 8-byte alignment padding" do
@@ -1366,9 +1322,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] === 42
-      assert Enum.at(rows, 1)["v"] === 7
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{"v" => 42}, %{"v" => 7}]}
     end
   end
 
@@ -1376,16 +1330,10 @@ defmodule InfluxElixir.Flight.ReaderTest do
   # Tests: parse_schema/1 — error/edge cases
   # ---------------------------------------------------------------------------
 
-  describe "parse_schema/1 — error handling" do
-    test "returns {:error, :schema_parse_failed} for corrupt binary" do
-      # Binary long enough to attempt parsing but with invalid structure
+  describe "parse_schema/1 — a corrupt header" do
+    test "a header long enough to parse but structurally invalid is a schema parse failure" do
       corrupt = <<0xFF, 0xFF, 0xFF, 0xFF, 20::little-32>> <> :binary.copy(<<0xFF>>, 20)
-      assert {:error, :schema_parse_failed} = Reader.parse_schema(corrupt)
-    end
-
-    test "schema without continuation marker still parses" do
-      # A bare FlatBuffer < 8 bytes returns empty
-      assert {:ok, []} = Reader.parse_schema(<<0, 0, 0, 0>>)
+      assert Reader.parse_schema(corrupt) === {:error, :schema_parse_failed}
     end
   end
 
@@ -1400,18 +1348,59 @@ defmodule InfluxElixir.Flight.ReaderTest do
       schema = schema_fd([{"mystery", 99, []}])
       batch = batch_fd(:binary.copy(<<0>>, 16), [{0, 0}, {0, 16}], 2)
 
-      assert {:error, {:unsupported_arrow_type, "type 99", "mystery"}} =
-               Reader.decode_flight_data([schema, batch])
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:error, {:unsupported_arrow_type, "type 99", "mystery"}}
+    end
+  end
+
+  describe "decode_flight_data/1 — Decimal columns" do
+    # A Decimal type table: slot 0 precision, slot 1 scale, slot 2 bitWidth (all int32). The
+    # vtable is padded to 12 bytes, so the table starts 4-aligned.
+    defp decimal_schema(scale, width) do
+      vtable = <<10::little-16, 16::little-16, 4::little-16, 8::little-16, 12::little-16, 0::16>>
+
+      inline =
+        <<12::little-signed-32, 5::little-signed-32, scale::little-signed-32,
+          width::little-signed-32>>
+
+      fb = build_schema_fb_custom_type("d", 7, vtable <> inline, 12)
+      %FlightData{data_header: schema_msg_from_fb(fb), data_body: <<>>}
+    end
+
+    test "a negative scale is an integer, as HTTP gives CAST(1234 AS DECIMAL(5,-2))" do
+      body = <<12::little-signed-128, -3::little-signed-128>>
+      batch = batch_fd(body, [{0, 0}, {0, 32}], 2)
+
+      assert Reader.decode_flight_data([decimal_schema(-2, 128), batch]) ===
+               {:ok, [%{"d" => 1200}, %{"d" => -300}]}
+    end
+
+    test "a scale of 0 is an integer, a positive one a float" do
+      body = <<150::little-signed-128>>
+      batch = batch_fd(body, [{0, 0}, {0, 16}], 1)
+
+      assert Reader.decode_flight_data([decimal_schema(0, 128), batch]) ===
+               {:ok, [%{"d" => 150}]}
+
+      assert Reader.decode_flight_data([decimal_schema(2, 128), batch]) ===
+               {:ok, [%{"d" => 1.5}]}
+    end
+
+    test "a width Arrow does not define is refused, never read without end" do
+      batch = batch_fd(<<1, 2, 3, 4>>, [{0, 0}, {0, 4}], 1)
+
+      for width <- [0, 8, 100] do
+        assert Reader.decode_flight_data([decimal_schema(0, width), batch]) ===
+                 {:error, {:unsupported_arrow_type, "Decimal#{width}", "d"}}
+      end
     end
   end
 
   # ---------------------------------------------------------------------------
-  # FlatBuffer nil fallback paths
+  # Fields left out of a FlatBuffer
   #
-  # These tests exercise the `nil` branches in `FB.field_pos` calls during
-  # schema and field parsing.  A FlatBuffer vtable slot with value 0 means
-  # "field absent" and causes `field_pos` to return `nil`.  We build minimal
-  # FlatBuffers that deliberately omit specific optional fields.
+  # A FlatBuffer vtable slot with value 0 means "field absent": the reader uses the field's
+  # default. These tests build minimal FlatBuffers that deliberately omit specific fields.
   # ---------------------------------------------------------------------------
 
   # Build a field blob where the vtable has specific slots zeroed out.
@@ -1590,41 +1579,38 @@ defmodule InfluxElixir.Flight.ReaderTest do
     build_schema_fb_with_blob(field_blob)
   end
 
-  describe "parse_schema/1 — FlatBuffer nil fallback: absent name field" do
-    test "field with absent name slot defaults to empty string" do
-      # Build a field blob with slot 0 (name) zeroed in the vtable
+  describe "parse_schema/1 — a field whose name is left out" do
+    test "has the empty string as its name" do
       field_blob =
         build_field_blob_with_absent_slots("ignored", 2, [bit_width: 64, is_signed: true], [0])
 
       fb = build_schema_fb_with_blob(field_blob)
       header = schema_msg_from_fb(fb)
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.name === ""
+      assert Reader.parse_schema(header) === {:ok, [primitive("", 6)]}
     end
   end
 
-  describe "parse_schema/1 — FlatBuffer nil fallback: absent type_type field" do
-    test "field with absent type_type slot defaults to type_id 0" do
-      # Slot 2 (type_type) zeroed → type_type defaults to 0 → type_id 0
+  describe "parse_schema/1 — a field whose type_type is left out" do
+    test "has no type id and is a type the reader does not decode" do
       field_blob =
         build_field_blob_with_absent_slots("col", 2, [bit_width: 64, is_signed: true], [2])
 
       fb = build_schema_fb_with_blob(field_blob)
       header = schema_msg_from_fb(fb)
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 0
+
+      assert Reader.parse_schema(header) === {:ok, [undecoded("col", "type 0")]}
     end
   end
 
-  describe "parse_schema/1 — FlatBuffer nil fallback: absent Int bitWidth" do
+  describe "parse_schema/1 — an Int whose bitWidth is left out" do
     # Schema.fbs gives `bitWidth` the default 0, which is no integer width: the column has no
     # type id, as a type the reader does not decode has none.
-    test "Int type with absent bitWidth slot has no type id" do
+    test "has no type id" do
       {type_blob, type_vtable_size} = build_int_type_blob_with_absent_slots(32, true, [0])
       fb = build_schema_fb_custom_type("val", 2, type_blob, type_vtable_size)
       header = schema_msg_from_fb(fb)
-      {:ok, [col]} = Reader.parse_schema(header)
-      assert col.type_id === 0
+
+      assert Reader.parse_schema(header) === {:ok, [undecoded("val", "type 2")]}
     end
   end
 
@@ -1693,9 +1679,9 @@ defmodule InfluxElixir.Flight.ReaderTest do
   end
 
   # Build a RecordBatch IPC message where the Message vtable slot for
-  # header_type (slot 1) is absent, causing field_pos to return nil.
+  # header_type (slot 1) is absent.
   defp rb_msg_with_absent_header_type do
-    # Message vtable with slot 1 (header_type) zeroed → nil branch on line 299
+    # Message vtable with slot 1 (header_type) zeroed
     vtable_msg = <<
       @rb_msg_vtable_size::little-16,
       @rb_msg_inline_size::little-16,
@@ -1749,8 +1735,7 @@ defmodule InfluxElixir.Flight.ReaderTest do
   end
 
   # Build a RecordBatch IPC message where the Message header_type is 3
-  # (RecordBatch) but the header uoffset field (slot 2) is absent,
-  # triggering the nil branch on line 355.
+  # (RecordBatch) but the header uoffset field (slot 2) is absent.
   defp rb_msg_with_absent_header_uoffset do
     # Vtable with slot 2 (header uoffset) absent
     vtable_msg = <<
@@ -1849,106 +1834,128 @@ defmodule InfluxElixir.Flight.ReaderTest do
     <<0xFF, 0xFF, 0xFF, 0xFF, fb_size::little-32, fb::binary>>
   end
 
-  describe "parse_record_batch_header — non-recordbatch header_type" do
-    test "header_type 2 (not schema=1, not recordbatch=3) returns no rows" do
+  describe "decode_flight_data/1 — a message that is not a record batch" do
+    test "a header type other than schema or record batch decodes no rows" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      # Use a message whose header_type byte is 2 (Dictionary)
+      # A message whose header_type byte is 2 (Dictionary)
       msg_header = non_rb_header_msg(2)
       fd = %FlightData{data_header: msg_header, data_body: <<>>}
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert rows === []
+      assert Reader.decode_flight_data([schema, fd]) === {:ok, []}
     end
 
-    test "nil header_type (absent vtable slot) defaults to 0 and returns no rows" do
+    test "a message with no header type decodes no rows" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      # Message vtable slot 1 (header_type) is zeroed → field_pos returns nil
-      # → header_type defaults to 0 (line 299 nil branch)
       msg_header = rb_msg_with_absent_header_type()
       fd = %FlightData{data_header: msg_header, data_body: <<>>}
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert rows === []
+      assert Reader.decode_flight_data([schema, fd]) === {:ok, []}
     end
 
-    test "header_type=3 but absent header uoffset slot returns no rows" do
+    test "a record batch message with no header offset decodes no rows" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      # Message slot 2 (header uoffset) is absent → nil → {:ok, 0, []} (line 355)
       msg_header = rb_msg_with_absent_header_uoffset()
       fd = %FlightData{data_header: msg_header, data_body: <<>>}
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert rows === []
+      assert Reader.decode_flight_data([schema, fd]) === {:ok, []}
     end
   end
 
-  describe "parse_record_batch_header — absent row count slot" do
-    test "RecordBatch with absent length slot defaults to 0 rows" do
+  describe "decode_flight_data/1 — a record batch with parts of its header left out" do
+    test "a batch without a length has zero rows, whatever its buffers hold" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      # Build a RecordBatch header where slot 0 (length) is absent
       msg_header = build_rb_fb_with_absent_slots(5, [{0, 0}, {0, 8}], [0])
       {body, _specs} = int64_column([42])
       fd = %FlightData{data_header: msg_header, data_body: body}
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      # row_count defaults to 0 → no rows assembled
-      assert rows === []
+      assert Reader.decode_flight_data([schema, fd]) === {:ok, []}
     end
-  end
 
-  describe "parse_record_batch_header — absent buffers slot" do
-    test "RecordBatch with absent buffers slot returns empty buffer_specs" do
+    test "a batch without buffer metadata decodes every cell as null" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      # Build a RecordBatch header where slot 2 (buffers) is absent
-      msg_header = build_rb_fb_with_absent_slots(1, [], [2])
-      fd = %FlightData{data_header: msg_header, data_body: <<>>}
 
-      # With no buffer specs, decode_column gets [] and returns nils
-      assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert length(rows) === 1
-      assert hd(rows)["v"] === nil
+      empty_body = %FlightData{
+        data_header: build_rb_fb_with_absent_slots(1, [], [2]),
+        data_body: <<>>
+      }
+
+      assert Reader.decode_flight_data([schema, empty_body]) === {:ok, [%{}]}
+
+      # the body is there, but nothing says where a column's data starts
+      with_body = %FlightData{
+        data_header: build_rb_fb_with_absent_slots(2, [], [2]),
+        data_body: <<0::64, 0::64>>
+      }
+
+      assert Reader.decode_flight_data([schema, with_body]) === {:ok, [%{}, %{}]}
     end
-  end
 
-  describe "parse_record_batch_header — short FlatBuffer" do
-    test "header that after continuation strip is < 8 bytes returns zero rows" do
+    test "a header under 8 bytes after its continuation prefix has no rows" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      # Strip-continuation leaves only 4 bytes: too short to parse
       short_header = <<0xFF, 0xFF, 0xFF, 0xFF, 4::little-32, 0::32>>
       fd = %FlightData{data_header: short_header, data_body: <<>>}
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert rows === []
+      assert Reader.decode_flight_data([schema, fd]) === {:ok, []}
     end
-  end
 
-  describe "parse_record_batch_header — parse failure" do
-    test "corrupt batch header binary returns {:error, :batch_header_parse_failed}" do
+    test "a structurally invalid header is a batch header parse failure" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      # Enough bytes to pass the < 8 check, but the FlatBuffer content is
-      # structurally invalid (root_offset points far outside the buffer).
+      # Long enough to be parsed, but the root offset points far outside the buffer.
       corrupt = <<0xFF, 0xFF, 0xFF, 0xFF, 20::little-32>> <> :binary.copy(<<0xFF>>, 20)
       fd = %FlightData{data_header: corrupt, data_body: <<>>}
 
-      assert {:error, :batch_header_parse_failed} = Reader.decode_flight_data([schema, fd])
+      assert Reader.decode_flight_data([schema, fd]) === {:error, :batch_header_parse_failed}
     end
   end
 
   # ---------------------------------------------------------------------------
-  # Column decode — specs pointing beyond body bounds
+  # Buffers that cannot be read from the body
   # ---------------------------------------------------------------------------
 
-  describe "decode_columns — buffer specs beyond body bounds" do
-    test "buffer spec offset far beyond body size decodes to nil via safe_slice" do
+  describe "decode_flight_data/1 — a data buffer outside the body" do
+    test "decodes as null when its offset or length is outside the body" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      # Buffer spec points 10000 bytes past the actual body end.
-      # safe_slice returns <<>> → decode_int_chunk returns nil.
-      {body, _specs} = int64_column([99])
-      specs = [{0, 0}, {10_000, 8}]
-      batch = batch_fd(body, specs, 1)
+      body = <<99::little-signed-64>>
 
-      assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["v"] === nil
+      for spec <- [{10_000, 8}, {8, 8}, {-8, 8}, {0, -8}] do
+        batch = batch_fd(body, [{0, 0}, spec], 1)
+        assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{}]}
+      end
+    end
+
+    test "an empty body decodes every cell as null" do
+      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
+      batch = batch_fd(<<>>, [{0, 0}, {0, 0}], 1)
+
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{}]}
+    end
+
+    test "a data buffer shorter than one value decodes as null" do
+      body = <<0::8, 0::8, 0::8>>
+      specs = [{0, 0}, {0, 3}]
+
+      int32 = schema_fd([{"v", 2, [bit_width: 32, is_signed: true]}])
+      assert Reader.decode_flight_data([int32, batch_fd(body, specs, 1)]) === {:ok, [%{}]}
+
+      float64 = schema_fd([{"f", 3, [precision: 2]}])
+      assert Reader.decode_flight_data([float64, batch_fd(body, specs, 1)]) === {:ok, [%{}]}
+    end
+
+    test "a validity buffer outside the body leaves every value valid" do
+      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
+      body = <<7::little-signed-64, 8::little-signed-64>>
+      # the validity buffer starts at the end of the body, so there is no bitmap to read
+      batch = batch_fd(body, [{16, 1}, {0, 16}], 2)
+
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{"v" => 7}, %{"v" => 8}]}
+    end
+
+    test "a zero-length validity buffer leaves every value valid" do
+      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
+      {data, _raw_specs} = int64_column([7, 8])
+      batch = batch_fd(data, [{0, 0}, {0, byte_size(data)}], 2)
+
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{"v" => 7}, %{"v" => 8}]}
     end
   end
 
@@ -1956,209 +1963,46 @@ defmodule InfluxElixir.Flight.ReaderTest do
   # UTF8 edge cases
   # ---------------------------------------------------------------------------
 
-  describe "decode_column_values — UTF8 with only offset buffer (no data buffer spec)" do
-    test "UTF8 column with only one data spec (after validity) returns nil values" do
-      # Build a schema with one Utf8 column.
+  describe "decode_flight_data/1 — Utf8 columns with buffers left out" do
+    test "a Utf8 column given an offsets buffer but no data buffer decodes as null" do
       schema = schema_fd([{"s", 5, []}])
 
-      # Provide only 2 buffer specs (validity + offsets), NOT the separate data spec.
-      # allocate_buffers for utf8 takes up to 3 specs; if only 2 exist, it takes both.
-      # decode_column receives [{0,0}, {0,12}]:
-      #   validity spec: {voff=0, vlen=0} — vlen=0 → no bitmap
-      #   data_specs: [{0, 12}] — single element, NOT two
-      # decode_column_values(@type_utf8, [{0,12}], body, 2) hits line 484:
-      #   decode_utf8_column(<<>>, safe_slice(body, 0, byte_size(body)))
-      # decode_utf8_column(<<>>, _) always returns [] (empty offsets guard)
-      # zip_columns then uses Enum.at([], i) = nil for each row
       offsets_bin = <<0::little-32, 2::little-32, 5::little-32>>
-      char_data = "hibye"
-      body = offsets_bin <> char_data
+      body = offsets_bin <> "hibye"
 
+      # only the validity and offsets specs: a Utf8 column has three buffers
       specs = [{0, 0}, {0, byte_size(offsets_bin)}]
       batch = batch_fd(body, specs, 2)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert length(rows) === 2
-      assert Enum.at(rows, 0)["s"] === nil
-      assert Enum.at(rows, 1)["s"] === nil
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{}, %{}]}
     end
-  end
 
-  describe "decode_column_values — empty data_specs returns nils" do
-    test "decode_column with empty specs list returns all nils" do
-      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      # Build a batch header with 0 buffer specs but row_count=2.
-      # allocate_buffers takes 2 specs from []; gets [] → decode_column/4
-      # called with [] → List.duplicate(nil, n)
-      msg_header = build_rb_fb_with_absent_slots(2, [], [2])
-      fd = %FlightData{data_header: msg_header, data_body: <<0::64, 0::64>>}
-
-      assert {:ok, rows} = Reader.decode_flight_data([schema, fd])
-      assert length(rows) === 2
-      assert Enum.all?(rows, fn r -> r["v"] === nil end)
-    end
-  end
-
-  describe "decode_utf8_column — empty offsets binary" do
-    test "decode_utf8_column with empty offsets binary returns []" do
-      # Route through decode_flight_data: Utf8 column with validity spec
-      # pointing to zero-length bitmap AND offset spec pointing to empty
-      # region, so offsets_bin becomes <<>>.
+    test "a Utf8 column with empty buffers decodes as null, or as no rows in an empty batch" do
       schema = schema_fd([{"s", 5, []}])
-
-      # Empty offsets region and no char data
-      body = <<>>
-      # validity len=0, offset {0,0}, data {0,0} — all empty
       specs = [{0, 0}, {0, 0}, {0, 0}]
-      batch = batch_fd(body, specs, 0)
 
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert rows === []
+      assert Reader.decode_flight_data([schema, batch_fd(<<>>, specs, 0)]) === {:ok, []}
+      assert Reader.decode_flight_data([schema, batch_fd(<<>>, specs, 2)]) === {:ok, [%{}, %{}]}
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Misc decode paths
-  # ---------------------------------------------------------------------------
-
-  describe "decode_int_chunk — mismatched size returns nil" do
-    test "providing a 3-byte chunk for width=8 returns nil per value" do
-      # We cannot call decode_int_chunk directly (private), so we exercise it
-      # via decode_flight_data by constructing a body that is too short for
-      # the declared row_count.  safe_slice returns <<>> for out-of-bounds
-      # reads; a 3-byte chunk for width=4 hits the fallback nil clause.
-      schema = schema_fd([{"v", 2, [bit_width: 32, is_signed: true]}])
-
-      # Provide only 3 bytes of data for a 4-byte-per-value column with n=1.
-      # safe_slice(body, 0, 3) = <<0,0,0>> which is 3 bytes, not 4 → nil.
-      body = <<0::8, 0::8, 0::8>>
-      specs = [{0, 0}, {0, 3}]
-      batch = batch_fd(body, specs, 1)
-
-      assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["v"] === nil
-    end
-  end
-
-  describe "decode_float_chunk — wrong width returns nil" do
-    test "providing a 3-byte chunk for Float64 returns nil per value" do
-      schema = schema_fd([{"f", 3, [precision: 2]}])
-
-      # Only 3 bytes for a Float64 (8-byte) column → decode_float_chunk nil path
-      body = <<0::8, 0::8, 0::8>>
-      specs = [{0, 0}, {0, 3}]
-      batch = batch_fd(body, specs, 1)
-
-      assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["f"] === nil
-    end
-  end
-
-  describe "apply_nulls — nil validity (vlen=0)" do
-    test "zero-length validity spec results in nil validity and values pass through unchanged" do
-      # apply_nulls(values, nil, n) → values unchanged (line 628)
-      # Triggered when vlen=0 in the validity buffer spec.
-      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-
-      {data, _raw_specs} = int64_column([7, 8])
-      # Validity spec: {0, 0} means vlen=0 → validity stays nil
-      specs = [{0, 0}, {0, byte_size(data)}]
-      batch = batch_fd(data, specs, 2)
-
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] === 7
-      assert Enum.at(rows, 1)["v"] === 8
-    end
-  end
-
-  describe "apply_nulls — empty binary validity (safe_slice returns <<>>)" do
-    test "validity buffer at end of body returns <<>> and values pass through unchanged" do
-      # apply_nulls(values, <<>>, n) → values unchanged (line 629).
-      # Triggered when vlen > 0 but safe_slice(body, doff - vlen, vlen) = <<>>.
-      #
-      # body = two int64 values (16 bytes, indices 0..15).
-      # validity spec: {voff=0, vlen=1} — vlen=1 is nonzero, so the `when vlen > 0`
-      #   guard fires.  data spec: {doff=17, dlen=16}.
-      # decode_column computes: safe_slice(body, doff - vlen, vlen)
-      #   = safe_slice(body, 17-1, 1) = safe_slice(body, 16, 1)
-      #   offset=16, byte_size(body)=16, available=0 → returns <<>>
-      # apply_nulls(values, <<>>, 2) → values unchanged (line 629).
-      # (values are also nil since data spec is also out of bounds)
-      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-
-      body = <<7::little-signed-64, 8::little-signed-64>>
-      specs = [{0, 1}, {17, 16}]
-      batch = batch_fd(body, specs, 2)
-
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] === nil
-      refute Map.has_key?(Enum.at(rows, 1), "v")
-    end
-  end
-
-  describe "apply_nulls — non-empty validity bitmap" do
-    test "validity bitmap with a set bit marks the corresponding row non-null" do
-      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      {body, specs} = int64_column([10, 20, 30])
-      # Mark index 0 and 2 as null (bits 0 and 2 unset), index 1 as valid
-      {body, specs} = with_validity_bitmap({body, specs}, 3, MapSet.new([0, 2]))
-      batch = batch_fd(body, specs, 3)
-
-      assert {:ok, rows} = Reader.decode_flight_data([schema, batch])
-      assert Enum.at(rows, 0)["v"] === nil
-      assert Enum.at(rows, 1)["v"] === 20
-      assert Enum.at(rows, 2)["v"] === nil
-    end
-  end
-
-  describe "safe_slice — offset beyond buffer bounds" do
-    test "offset beyond body size returns empty binary (decoded as nil)" do
-      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      # Point data buffer far past actual body end
-      body = <<1::little-64>>
-      specs = [{0, 0}, {9999, 8}]
-      batch = batch_fd(body, specs, 1)
-
-      assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      # safe_slice returns <<>> because offset >= byte_size(body)
-      assert row["v"] === nil
-    end
-  end
-
-  describe "safe_slice — negative or invalid arguments" do
-    test "negative offset argument returns empty binary (decoded as nil)" do
-      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
-      # We cannot pass a negative offset through normal batch encoding
-      # (buffer offsets are int64 and would be interpreted as large unsigned
-      # by safe_slice's guard).  Instead confirm that an all-zero body with
-      # a zero-length data spec causes the fallback nil path via mismatched
-      # chunk size, not a crash.
-      body = <<>>
-      specs = [{0, 0}, {0, 0}]
-      batch = batch_fd(body, specs, 1)
-
-      assert {:ok, [row]} = Reader.decode_flight_data([schema, batch])
-      assert row["v"] === nil
-    end
-  end
-
-  describe "empty FlatBuffer vectors" do
+  describe "decode_flight_data/1 — empty FlatBuffer vectors" do
     # `0..(count - 1)` with count 0 is the descending range [0, -1] in Elixir,
     # so an empty vector used to be walked twice at bogus indices. The step
     # must be explicit.
     test "a schema with an empty fields vector has no columns and decodes no rows" do
       schema = schema_fd([])
-      assert {:ok, []} = Reader.parse_schema(schema.data_header)
+      assert Reader.parse_schema(schema.data_header) === {:ok, []}
 
       batch = batch_fd(<<>>, [], 0)
-      assert {:ok, []} = Reader.decode_flight_data([schema, batch])
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, []}
     end
 
     test "a record batch with an empty buffers vector decodes every column as null (absent)" do
       schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
       batch = batch_fd(<<>>, [], 2)
 
-      assert {:ok, [%{}, %{}]} = Reader.decode_flight_data([schema, batch])
+      assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{}, %{}]}
     end
   end
 end

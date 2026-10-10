@@ -138,8 +138,12 @@ defmodule InfluxElixir.Client.HTTP do
          {:ok, body} <- iodata_body(line_protocol),
          {:ok, database} <- resolve_database(opts, connection),
          precision = Keyword.get(opts, :precision, "nanosecond"),
-         :ok <- url_values(database: database, precision: precision) do
-      url = write_url(connection, database, precision) <> write_flags(connection, opts)
+         flags = write_flags(connection, opts),
+         :ok <- url_values([database: database, precision: precision] ++ flags) do
+      url =
+        for {key, value} <- flags,
+            into: write_url(connection, database, precision),
+            do: "&#{key}=#{query_value(value)}"
 
       headers =
         if Keyword.get(opts, :gzip, false) do
@@ -186,15 +190,16 @@ defmodule InfluxElixir.Client.HTTP do
 
   # InfluxDB 3's `accept_partial` (false: all-or-nothing) and `no_sync`
   # (acknowledge before the WAL is persisted) write parameters. Sent only
-  # when given, and only on v3 — InfluxDB 2's endpoint has neither.
-  @spec write_flags(keyword(), keyword()) :: binary()
+  # when given, and only on v3 — InfluxDB 2's endpoint has neither. A value
+  # is written into the URL, so one that is not text is refused with the others.
+  @spec write_flags(keyword(), keyword()) :: keyword()
   defp write_flags(connection, opts) do
     if api_version(connection) == :v3 do
-      for key <- [:accept_partial, :no_sync], Keyword.has_key?(opts, key), into: "" do
-        "&#{key}=#{query_value(Keyword.fetch!(opts, key))}"
-      end
+      for key <- [:accept_partial, :no_sync],
+          Keyword.has_key?(opts, key),
+          do: {key, Keyword.fetch!(opts, key)}
     else
-      ""
+      []
     end
   end
 
@@ -348,11 +353,23 @@ defmodule InfluxElixir.Client.HTTP do
          {:ok, %Finch.Response{body: resp_body}} <-
            post_json(connection, "/api/v3/query_sql", body, opts, [200]),
          {:ok, decoded} <- decode_json(resp_body) do
-      if is_list(decoded),
-        do: {:ok, Enum.map(decoded, &ResponseParser.coerce_types/1)},
-        else: {:ok, decoded}
+      execute_answer(decoded)
     end
   end
+
+  # A body that is neither rows nor a summary (a proxy's, a truncated one) is the error
+  # `query_sql/3` gives for it, never a raise.
+  @spec execute_answer(term()) :: {:ok, map() | [map()]} | {:error, {:unexpected_json, term()}}
+  defp execute_answer(summary) when is_map(summary), do: {:ok, summary}
+
+  defp execute_answer(rows) when is_list(rows) do
+    case Enum.reject(rows, &is_map/1) do
+      [] -> {:ok, Enum.map(rows, &ResponseParser.coerce_types/1)}
+      [other | _rest] -> {:error, {:unexpected_json, other}}
+    end
+  end
+
+  defp execute_answer(other), do: {:error, {:unexpected_json, other}}
 
   # ---------------------------------------------------------------------------
   # Query — v3 InfluxQL
@@ -460,13 +477,19 @@ defmodule InfluxElixir.Client.HTTP do
   def list_databases(connection) do
     with {:ok, %Finch.Response{body: resp_body}} <-
            get(connection, "/api/v3/configure/database?format=json", [200]),
-         {:ok, rows} when is_list(rows) <- decode_json(resp_body) do
-      {:ok, Enum.map(rows, fn row -> %{"name" => row["iox::database"]} end)}
-    else
-      {:ok, other} -> {:error, {:unexpected_response, other}}
-      {:error, _reason} = error -> error
+         {:ok, rows} <- decode_json(resp_body) do
+      database_names(rows)
     end
   end
+
+  @spec database_names(term()) :: {:ok, [map()]} | {:error, {:unexpected_response, term()}}
+  defp database_names(rows) when is_list(rows) do
+    if Enum.all?(rows, &is_map/1),
+      do: {:ok, Enum.map(rows, &%{"name" => &1["iox::database"]})},
+      else: {:error, {:unexpected_response, rows}}
+  end
+
+  defp database_names(other), do: {:error, {:unexpected_response, other}}
 
   @impl true
   @spec delete_database(InfluxElixir.Client.connection(), binary()) ::

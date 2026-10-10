@@ -167,6 +167,31 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
                {:ok, %{"status" => "pass", "version" => "3"}}
     end
 
+    # Each raised out of the client: a row that is no object, a listing that is no list.
+    test "an answer of the wrong shape is an error, never a raise", %{conn: conn} do
+      execute = fn -> HTTP.execute_sql(conn, "SELECT 1") end
+
+      assert answered(execute, 200, ~s([{"a":1},2])) === {:error, {:unexpected_json, 2}}
+      assert answered(execute, 200, "true") === {:error, {:unexpected_json, true}}
+
+      assert answered(execute, 200, ~s([{"time":"2023-11-14T22:13:20"}])) ===
+               {:ok, [%{"time" => ~U[2023-11-14 22:13:20.000000Z]}]}
+
+      assert answered(execute, 200, ~s({"rows_affected":0})) === {:ok, %{"rows_affected" => 0}}
+
+      databases = fn -> HTTP.list_databases(conn) end
+      assert answered(databases, 200, ~s(["a"])) === {:error, {:unexpected_response, ["a"]}}
+      assert answered(databases, 200, ~s({})) === {:error, {:unexpected_response, %{}}}
+
+      assert answered(databases, 200, ~s([{"iox::database":"a"}])) ===
+               {:ok, [%{"name" => "a"}]}
+
+      buckets = fn -> HTTP.list_buckets(conn ++ [api_version: :v2, org: "o"]) end
+
+      assert answered(buckets, 200, ~s({"buckets":null})) ===
+               {:error, {:unexpected_response, %{"buckets" => nil}}}
+    end
+
     test "a streamed row split over many chunks is one row, and CRLF ends a line as LF does",
          %{conn: conn} do
       # A blank CRLF line between the rows, and every chunk seven bytes long.
