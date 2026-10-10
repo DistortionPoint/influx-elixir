@@ -8,6 +8,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local`: three more differences from Core found while covering this round's code**:
+  - A chain ending at the bare `time` (`time > 5 < time`) is Core's 500 `expected Expr`.
+  - A sign with no operand after a comparison (`n > - = 2`) is Core's `invalid conditional
+    expression`.
+  - SQL `ANY`, `ALL` and `SOME` after an operand are read as Core reads them, as an alias or a
+    stray word. They were refused.
+- **`Client.Local` InfluxQL: a condition nested or chained deeper than Core answers is refused by
+  name** (design document `2026-10-09_influxql-fuzz-fourth-review.md`): InfluxDB 3 Core 3.10.1
+  overflows its stack (the server dies) on `abs(abs(...))` past about 480 deep, `(v + (v + ...))`
+  and `(ok = (ok = ...))` between 700 and 900, a sum of `v` past 820 terms, `-(-(...))` past 800 and
+  groups that alternate (`ok = (v > 0 AND ok = ...)`) past 406; the double answered all of them,
+  800 and 8,000 deep. `WHERE` is now read once before anything else, as a path whose nodes cost
+  what the measured depths say (a call 20, a sign 6, an arithmetic operator 10, a comparison 7,
+  `AND`/`OR` 7, a parenthesis 6), and one past 8,020 is `Client.Local: unsupported InfluxQL (a
+  condition nested or chained deeper than 8020 units, ...)`, status 400: 400 calls or 400
+  alternating groups, 802 added terms, 615 `(ok = ...)` groups and 1,146 `AND`s still answer as
+  Core does (the statements the contract pins, 400 groups and 800 `abs(1)`, are among them).
+- **`Client.Local` SQL: the parser's recursion limit** (design document
+  `2026-10-09_influxql-fuzz-fourth-review.md`): Core's SQL parser stops at 50 levels of recursion;
+  the double answered a statement nested 12,000 deep and was killed by 40 MB at 20,000. It now counts
+  as the parser does (`SQLSyntax`): a statement is `SQL error: RecursionLimitExceeded (current limit:
+  50)`, status 400, exactly where Core gives it: `(v + (v + ...))` of 24 operands answers, of 25
+  refuses; `- - v` and `abs(abs(...))` answer to 47 levels; an operator that binds tighter after
+  another climbs one level deeper (`(v + 2 * (...))`: 15 levels). 47 `NOT`s in a row end at the
+  parser error Core gives (the limit is swallowed by the retry of `NOT` as a name). `CASE`, `CAST`,
+  `NOT (...)` nested past 20, and subqueries past 22, are refused by name (the engine's time grows
+  with their depth, and its answer past the limit was not probed), as is a statement the double
+  does not parse (a call it skips, a shape of `INSERT`, `UPDATE`, `DELETE` it does not read whole)
+  whose parentheses or prefix operators nest past 40. A long text is refused from its first 8 KB: a statement 20,000 deep is refused in
+  milliseconds and little memory, in `query_sql`, `query_sql_stream`, `execute_sql` and `check_sql`.
+  `INSERT`, `UPDATE` and `DELETE` are counted too (the values, the query, the `SET` values and the
+  `WHERE`), at the depth Core gives: `INSERT ... VALUES (coalesce(..., 1))` answers `DML not
+  supported` to 47 levels and refuses at 48, `UPDATE ... SET v = ...` and `DELETE ... WHERE ...`
+  answer to 48 and refuse at 49 (`(v + (v + ...))`: 23 and 24 for an `INSERT`, 24 and 25 for the
+  others). `UPDATE ... WHERE n div 1` now gives the parser's own error, as Core does.
+- **`Client.Local` InfluxQL: fourth review of the differential fuzz** (design document
+  `2026-10-09_influxql-fuzz-fourth-review.md`):
+  - The errors of a comparison come in the order the planner builds them, calls and arithmetic
+    alike: `u + b > abs(s)`, `(u + b) * abs(s) > 1`, `time + 1 > abs(s)` and `(u + 's') / abs(s) <
+    1.5` are the coercion (they were the call's error), `(u + 's') + abs(s) * 2` the call.
+  - A comparison with the bare time beside a bare operand is the error of the planner's split
+    (`time > n AND b`: `found symbol 'n::integer', ...`, a boolean, a function, arithmetic of them,
+    a chain `time > 0 < 1`), not a 500 `invalid expr stack`; what is not verified is refused by name.
+  - An integer expression beside the quotient of an unsigned number and text (`n + (u / s) > 1`,
+    `(u / s) < n`, `abs(n) / (u / s)`, `(1 + 2) + (u / s)`) is `cannot use + between an integer and
+    unsigned, an explicit cast is required`; no null takes it away. A null does take away the error
+    of a quotient across a comparison (`u / 1h > nosuch`, `u / b > nosuch`), `abs()` of a quotient
+    included; of two such errors the engine's one is raised.
+  - Arithmetic of the time that comes to a null (`n + b + time + 1 > b`) keeps no point (it was the
+    SQL engine's coercion error).
+  - An unsigned division by zero fails the stream in the order the engine reads the points (series
+    by series, then by time), among the points the tags and times of the `WHERE` keep: it is refused
+    where the zero is not last, and answered (`t = 'b' and n / u > 1`) where those comparisons leave
+    it out.
+  - Changed: `SQLExpr` reads an expression in time linear in its length (a statement nested 4,000
+    deep took 638 ms, now 214); one walker and one typer for the arithmetic of a condition
+    (`InfluxQLWalk`, `InfluxQLArithType`; `InfluxQLCalls` removed).
 - **`Client.Local` InfluxQL: second review of the differential fuzz** (design document
   `2026-10-09_influxql-fuzz-second-review.md`):
   - Arithmetic with a column the measurement lacks is typed as Core types it, by the types of the

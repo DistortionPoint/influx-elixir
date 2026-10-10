@@ -194,6 +194,13 @@ defmodule InfluxElixir.Client.Local.SQLError do
   end
 
   @doc """
+  The engine's parser gives up on a statement nested deeper than its recursion limit of 50:
+  `SQL error: RecursionLimitExceeded (current limit: 50)` (verified on 3.10.1).
+  """
+  @spec recursion() :: t()
+  def recursion, do: %{status: 400, body: "SQL error: RecursionLimitExceeded (current limit: 50)"}
+
+  @doc """
   An error the optimizer's `simplify_expressions` pass raises while it folds
   a constant (an unparseable timestamp string, an invalid regular
   expression): `Optimizer rule 'simplify_expressions' failed\\ncaused by\\n<message>`,

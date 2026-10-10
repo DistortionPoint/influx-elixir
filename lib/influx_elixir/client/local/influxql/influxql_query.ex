@@ -290,7 +290,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
     types = field_types(table, database, name)
 
-    case influxql_where(spec.where, tags, types, Store.now_ns(), 0) do
+    case influxql_where(spec.where, tags, types, Store.now_ns(), 0, show: true) do
       {:error, %{body: body} = error} ->
         if InfluxQL.mentions_time?(spec.where),
           do: {:error, %{error | body: InfluxQL.unframe_split(body)}}
@@ -561,7 +561,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     do: {:ok, %{condition: @show_window, tags: MapSet.new(), checks: []}}
 
   defp show_plan(%{where: where}, tags, types) do
-    case influxql_where(where, tags, types, Store.now_ns(), 0) do
+    case influxql_where(where, tags, types, Store.now_ns(), 0, show: true) do
       {:ok, %{deferred: {status, body}}} ->
         {:error, %{status: status, body: body}}
 
@@ -807,7 +807,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     sql = ~s|SELECT * FROM "#{query.measurement}"| <> plan.where <> " ORDER BY time"
 
     table
-    |> run_influxql_sql(database, sql, plan.tags, plan.checks)
+    |> run_influxql_sql(database, sql, plan.tags, plan.checks, plan.prune)
     |> repeated(Map.get(query, :copies, 1), query)
     |> influxql_result(query, tags,
       lower: Enum.max(plan.lowers, fn -> nil end),
@@ -1018,7 +1018,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           MapSet.t(binary()),
           %{binary() => atom()},
           integer(),
-          non_neg_integer()
+          non_neg_integer(),
+          keyword()
         ) ::
           {:ok,
            %{
@@ -1026,13 +1027,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
              lowers: [InfluxQL.bound()],
              uppers: [InfluxQL.bound()],
              checks: [term()],
+             prune: InfluxQL.prune() | nil,
              tags: MapSet.t(binary()),
              deferred: {pos_integer(), binary()} | nil,
              clash: {pos_integer(), binary()} | nil
            }}
           | {:error, map()}
-  defp influxql_where(where, tags, types, now, extend, select_opts \\ [])
-
   defp influxql_where(nil, _tags, _types, _now, _extend, _select_opts) do
     {:ok,
      %{
@@ -1040,6 +1040,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
        lowers: [],
        uppers: [],
        checks: [],
+       prune: nil,
        tags: MapSet.new(),
        deferred: nil,
        clash: nil
@@ -1058,6 +1059,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
            lowers: plan.lowers,
            uppers: plan.uppers,
            checks: plan.checks,
+           prune: plan.prune,
            tags: MapSet.new(Enum.filter(tags, &MapSet.member?(plan.idents, &1))),
            deferred: plan.deferred,
            clash: plan.clash
@@ -1091,15 +1093,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           binary(),
           binary(),
           MapSet.t(binary()),
-          [{binary(), InfluxQL.check()}]
+          [{binary(), InfluxQL.check()}],
+          InfluxQL.prune() | nil
         ) :: {:ok, [map()]} | {:error, term()}
-  defp run_influxql_sql(table, database, sql, fill_tags, checks) do
+  defp run_influxql_sql(table, database, sql, fill_tags, checks, prune \\ nil) do
     blank_tags = Map.new(fill_tags, &{&1, ""})
     columns = Enum.map(checks, &elem(&1, 0))
 
     fetch = fn measurement ->
       with {:ok, points} <- Scope.point_source(table, database, measurement) do
-        {:ok, points |> fill_tags(blank_tags) |> answer_checks(checks)}
+        {:ok, points |> fill_tags(blank_tags) |> answer_checks(checks, prune)}
       end
     end
 
@@ -1123,12 +1126,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp fill_tags(points, blank_tags),
     do: Enum.map(points, &%{&1 | tags: Map.merge(blank_tags, &1.tags)})
 
-  @spec answer_checks([LineProtocolParser.point()], [{binary(), InfluxQL.check()}]) ::
-          [LineProtocolParser.point()]
-  defp answer_checks(points, []), do: points
+  @spec answer_checks(
+          [LineProtocolParser.point()],
+          [{binary(), InfluxQL.check()}],
+          InfluxQL.prune() | nil
+        ) :: [LineProtocolParser.point()]
+  defp answer_checks(points, [], _prune), do: points
 
-  defp answer_checks(points, checks) do
-    refuse_zero_divisions(points, checks)
+  defp answer_checks(points, checks, prune) do
+    refuse_zero_divisions(points, checks, prune)
 
     Enum.map(points, fn %{fields: fields} = point ->
       answers =
@@ -1138,19 +1144,67 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     end)
   end
 
-  # An unsigned division by zero that fails the engine's stream (over three points or more, at a
-  # point that is not the last) is refused by name.
-  @spec refuse_zero_divisions([LineProtocolParser.point()], [{binary(), InfluxQL.check()}]) ::
-          :ok
-  defp refuse_zero_divisions(points, _checks) when length(points) < 3, do: :ok
+  # An unsigned division by zero that fails the engine's stream is refused by name. The engine
+  # fails it over three points or more, at a point that is not the last of them in the order it
+  # reads them, series by series (the tag values, in the order of the tag keys) and each by time,
+  # the points that the tags and the time of the `WHERE` keep (verified over every position of
+  # the zero among two to four points, with two tags, and with the tags and the times of the
+  # `WHERE`; a comparison of a field in it is evaluated in a way the double does not tell, and
+  # does not narrow the points, so it is refused as well).
+  @spec refuse_zero_divisions(
+          [LineProtocolParser.point()],
+          [{binary(), InfluxQL.check()}],
+          InfluxQL.prune() | nil
+        ) :: :ok
+  defp refuse_zero_divisions(points, _checks, _prune) when length(points) < 3, do: :ok
 
-  defp refuse_zero_divisions(points, checks) do
-    points
-    |> Enum.drop(-1)
-    |> Enum.each(fn %{fields: fields} ->
-      if Enum.any?(checks, fn {_column, check} -> InfluxQL.zero_division?(check, fields) end),
+  defp refuse_zero_divisions(points, checks, prune) do
+    zero? = fn %{fields: fields} ->
+      Enum.any?(checks, fn {_column, check} -> InfluxQL.zero_division?(check, fields) end)
+    end
+
+    if Enum.any?(points, zero?) do
+      {order, kept} = points |> kept_by(prune) |> in_engine_order()
+
+      # (Points that do not all have the same tag keys are in an order the double does not
+      # tell: the zero fails the stream wherever it is.)
+      failing = if order == :known, do: Enum.drop(kept, -1), else: kept
+
+      if length(kept) >= 3 and Enum.any?(failing, zero?),
         do: throw({:refused, "unsupported InfluxQL (an unsigned division by zero)"})
+    end
+
+    :ok
+  end
+
+  defp kept_by(points, nil), do: points
+
+  defp kept_by(points, %{tags: tags, lower: lower, upper: upper}) do
+    Enum.filter(points, fn %{tags: point_tags, timestamp: time} ->
+      (lower == nil or time >= lower) and (upper == nil or time <= upper) and
+        Enum.all?(tags, fn {name, op, value} ->
+          equal? = Map.get(point_tags, name, "") == value
+          if op == "=", do: equal?, else: not equal?
+        end)
     end)
+  end
+
+  # The order of the stream: by series (the values of the tag keys, sorted by key), then by time.
+  # Points that do not all have the same tag keys (a tag a point lacks) are in an order the
+  # double does not tell: `:unknown`, as they are.
+  @spec in_engine_order([LineProtocolParser.point()]) ::
+          {:known | :unknown, [LineProtocolParser.point()]}
+  defp in_engine_order(points) do
+    case points |> Enum.map(&Enum.sort(Map.keys(&1.tags))) |> Enum.uniq() do
+      [key_list] ->
+        {:known,
+         Enum.sort_by(points, fn %{tags: tags, timestamp: time} ->
+           {Enum.map(key_list, &Map.fetch!(tags, &1)), time}
+         end)}
+
+      _no_points_or_mixed ->
+        {:unknown, points}
+    end
   end
 
   # The check columns and the tags filled with "" are the double's own: they do

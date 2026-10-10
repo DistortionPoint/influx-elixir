@@ -4117,6 +4117,46 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
     ]
   end
 
+  @doc "A bare time compared with a column, a tag, the time, a boolean, a function or arithmetic of them is the error of the planner's split of the time out of the condition (see `InfluxElixir.Client.Local.InfluxQLTimeComparand`)."
+  @spec time_comparand_errors() :: [{binary(), term()}]
+  def time_comparand_errors do
+    [
+      {"select n from ~g1 where time = time",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 'time::timestamp', expected now() or a literal duration, float, integer and timestamp string"}},
+      {"select n from ~g1 where time > time",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 'time::timestamp', expected now() or a literal duration, float, integer and timestamp string"}},
+      {"select n from ~g1 where time > v",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 'v::float', expected now() or a literal duration, float, integer and timestamp string"}},
+      {"select n from ~g1 where time > host",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 'host::tag', expected now() or a literal duration, float, integer and timestamp string"}},
+      {"select n from ~g1 where time > n",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 'n::integer', expected now() or a literal duration, float, integer and timestamp string"}},
+      {"select n from ~g1 where time > 1 + time",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"1 + time::timestamp\": found symbol 'time::timestamp', expected now() or a literal duration, float, integer and timestamp string"}},
+      {"select n from ~g1 where time > abs(1)",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid function call 'abs'"}},
+      {"select n from ~g1 where time > abs(v)",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid function call 'abs'"}},
+      {"select n from ~g1 where time = true",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found literal 'true', expected duration, float, integer, or timestamp string"}},
+      {"select n from ~g1 where time > true",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found literal 'true', expected duration, float, integer, or timestamp string"}},
+      {"select n from ~g1 where time > s",
+       {:error, 400,
+        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 's::string', expected now() or a literal duration, float, integer and timestamp string"}}
+    ]
+  end
+
   @doc "Statements the engine answers and the double refuses by name (`Client.Local: unsupported InfluxQL (...)`), with the engine's answer: a math function of a time or in a `WHERE`, a time in arithmetic beside a name, a selector with no value beside columns that have points, and the like."
   @spec refusals() :: [{binary(), term()}]
   def refusals do
@@ -4307,39 +4347,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
       {"show tag keys from ~g3 where time > time",
        {:error, 400,
         "Error during planning: found symbol 'time', expected now() or a literal duration, float, integer and timestamp string"}},
-      {"select n from ~g1 where time = time",
-       {:error, 400,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 'time::timestamp', expected now() or a literal duration, float, integer and timestamp string"}},
-      {"select n from ~g1 where time > time",
-       {:error, 400,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 'time::timestamp', expected now() or a literal duration, float, integer and timestamp string"}},
-      {"select n from ~g1 where time > v",
-       {:error, 400,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 'v::float', expected now() or a literal duration, float, integer and timestamp string"}},
-      {"select n from ~g1 where time > host",
-       {:error, 400,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 'host::tag', expected now() or a literal duration, float, integer and timestamp string"}},
-      {"select n from ~g1 where time > n",
-       {:error, 400,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 'n::integer', expected now() or a literal duration, float, integer and timestamp string"}},
-      {"select n from ~g1 where time > 1 + time",
-       {:error, 400,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid expression \"1 + time::timestamp\": found symbol 'time::timestamp', expected now() or a literal duration, float, integer and timestamp string"}},
-      {"select n from ~g1 where time > abs(1)",
-       {:error, 400,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid function call 'abs'"}},
-      {"select n from ~g1 where time > abs(v)",
-       {:error, 400,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: invalid function call 'abs'"}},
-      {"select n from ~g1 where time = true",
-       {:error, 400,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found literal 'true', expected duration, float, integer, or timestamp string"}},
-      {"select n from ~g1 where time > true",
-       {:error, 400,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found literal 'true', expected duration, float, integer, or timestamp string"}},
-      {"select n from ~g1 where time > s",
-       {:error, 400,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\nError during planning: found symbol 's::string', expected now() or a literal duration, float, integer and timestamp string"}},
       {"select max(v), abs(v) from ~g1",
        [{"2023-11-14 22:16:20", %{"abs" => 5.0, "max" => 5.0}}]},
       {"select max(v) + 1, v from ~g1", [{"2023-11-14 22:16:20", %{"max" => 6.0, "v" => 5.0}}]},
@@ -4591,28 +4598,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
         "unsupported InfluxQL (SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement with no tag)",
       "show tag keys from ~g3 where time > time" =>
         "unsupported InfluxQL (SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement with no tag)",
-      "select n from ~g1 where time = time" =>
-        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: time",
-      "select n from ~g1 where time > time" =>
-        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: time",
-      "select n from ~g1 where time > v" =>
-        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: v",
-      "select n from ~g1 where time > host" =>
-        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: host",
-      "select n from ~g1 where time > n" =>
-        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: n",
-      "select n from ~g1 where time > 1 + time" =>
-        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: 1 + time",
-      "select n from ~g1 where time > abs(1)" =>
-        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: abs ( 1 )",
-      "select n from ~g1 where time > abs(v)" =>
-        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: abs ( v )",
-      "select n from ~g1 where time = true" =>
-        "unsupported InfluxQL (a time compared with an expression)",
-      "select n from ~g1 where time > true" =>
-        "unsupported InfluxQL (a time compared with an expression)",
-      "select n from ~g1 where time > s" =>
-        "a `time` comparand must be a quoted ISO-8601 string, now() +/- INTERVAL 'N unit', NULL or a $parameter: s",
       "select max(v), abs(v) from ~g1" =>
         "unsupported InfluxQL (a function over a selector in that shape)",
       "select max(v) + 1, v from ~g1" =>

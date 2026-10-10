@@ -90,13 +90,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLLex do
   @operand_missing Regex.compile!("\\A(?:" <> @blank <> "|[(+\\-])*" <> @no_operand)
 
   # What can start no operand after a comparison operator (verified: the error is at the end
-  # of the operator): one of those characters, a connective or a dot with no digit after it.
+  # of the operator): one of those characters, a connective or a dot with no digit after it,
+  # and signs (with blanks between them) that end the text or stand before one of those
+  # characters (`n > - = 2`, `n > -+ > 2`, `n > -)`).
   # A connective with a quote, a carriage return or a glued character directly against it is
   # a name there, which starts an operand (see `InfluxQLTokens`).
   @cannot_start Regex.compile!(
                   "^(?:" <>
                     @no_operand <>
-                    "|[-+]?\\.(?!\\d)|(?:AND|OR)\\b(?!['\"\\r]|" <> @glued_set <> "))",
+                    "|[-+]?\\.(?!\\d)|[-+](?:" <>
+                    @blank <>
+                    "|[-+])*(?:" <>
+                    @no_operand <>
+                    "|\\z)|(?:AND|OR)\\b(?!['\"\\r]|" <> @glued_set <> "))",
                   "i"
                 )
 

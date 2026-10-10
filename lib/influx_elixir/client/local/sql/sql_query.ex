@@ -46,6 +46,23 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
   @spec answer_sql(conn(), binary(), binary(), QueryParams.t(), keyword()) ::
           InfluxElixir.Client.query_result()
   defp answer_sql(%{table: table} = conn, database, sql, params, opts) do
+    case SQLSyntax.deep_refusal(sql) do
+      nil ->
+        scrubbed_sql(conn, database, sql, params, opts)
+
+      error ->
+        Format.answer(
+          Scope.query_format(opts),
+          fn -> with :ok <- Scope.database_exists(table, database), do: {:error, error} end,
+          database,
+          params
+        )
+    end
+  end
+
+  @spec scrubbed_sql(conn(), binary(), binary(), QueryParams.t(), keyword()) ::
+          InfluxElixir.Client.query_result()
+  defp scrubbed_sql(%{table: table} = conn, database, sql, params, opts) do
     case SQLLexer.scrub(sql) do
       {:ok, statement} ->
         answer_statement(conn, {database, sql, statement}, params, opts)
@@ -200,8 +217,10 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
          {:ok, params} <- QueryParams.normalize(Keyword.get(opts, :params, %{})),
          :ok <- Format.check_params(params, nil, database),
          :ok <- Scope.database_exists(table, database),
+         :ok <- deep_statement(sql),
          {:ok, trimmed} <- scrubbed(sql),
-         :ok <- bare_statement(sql) do
+         :ok <- bare_statement(sql),
+         :ok <- dml_nesting(trimmed) do
       case statement_kind(trimmed) do
         :query ->
           query_sql(conn, sql, opts)
@@ -306,6 +325,28 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     case SQLLexer.scrub(sql) do
       {:ok, _statement} = ok -> ok
       {:error, reason} -> {:error, parsed(sql, reason)}
+    end
+  end
+
+  # A query nested past the parser's recursion limit is refused from its first bytes, before
+  # the text is scrubbed and tokenized whole.
+  @spec deep_statement(binary()) :: :ok | {:error, SQLError.t()}
+  defp deep_statement(sql) do
+    case SQLSyntax.deep_refusal(sql) do
+      nil -> :ok
+      error -> {:error, error}
+    end
+  end
+
+  # The statements that change data are not parsed as queries are: their nesting is bounded by
+  # the parentheses and prefix operators it holds.
+  @spec dml_nesting(binary()) :: :ok | {:error, SQLError.t()}
+  defp dml_nesting(trimmed) do
+    with kind when kind in [:delete, :insert, :update] <- statement_kind(trimmed),
+         %{} = error <- SQLSyntax.nesting_verdict(trimmed) do
+      {:error, error}
+    else
+      _no_nesting -> :ok
     end
   end
 

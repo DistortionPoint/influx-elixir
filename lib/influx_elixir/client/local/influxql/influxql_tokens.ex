@@ -24,6 +24,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   def time?({:ident, name}), do: String.downcase(name) == "time"
   def time?(_token), do: false
 
+  @doc "Whether a word is the boolean constant `true` or `false`, in any case."
+  @spec boolean_word?(binary()) :: boolean()
+  def boolean_word?(word), do: String.upcase(word) in ["TRUE", "FALSE"]
+
+  @doc "The tokens inside the parentheses around them, however many layers."
+  @spec strip_parens(list()) :: list()
+  def strip_parens(tokens), do: tokens |> unwrap_group() |> elem(0)
+
   @doc """
   Whether a comparison has the bare `time` on one side: `time op x` or `x op time`, the forms
   the planner splits the time out of the condition by (verified: `time > 0`, `time > now()`,
@@ -427,7 +435,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
 
   # A parenthesis after `now()` or a boolean is left over: neither names a call.
   defp leftover_token?({:raw, word}, <<?(, _rest::binary>>) when is_binary(word),
-    do: String.upcase(word) in ["NOW()", "TRUE", "FALSE"]
+    do: String.upcase(word) == "NOW()" or boolean_word?(word)
 
   defp leftover_token?(previous, text),
     do: operand_end?(previous) and Regex.match?(@after_operand, text) and not connective?(text)
@@ -435,7 +443,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   @spec operand_end?(term()) :: boolean()
   defp operand_end?({kind, _value}) when kind in [:ident, :number, :str, :param], do: true
   defp operand_end?({:duration, _total, _text}), do: true
-  defp operand_end?({:raw, word}), do: String.upcase(word) in ["TRUE", "FALSE", "NOW()", ")"]
+
+  defp operand_end?({:raw, word}),
+    do: word == ")" or String.upcase(word) == "NOW()" or boolean_word?(word)
+
   defp operand_end?(_token), do: false
 
   @spec connective?(binary()) :: boolean()
@@ -523,7 +534,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp unary_error?({:str, _content}, acc), do: negated?(acc)
 
   defp unary_error?({:raw, word}, acc),
-    do: String.upcase(word) in ["TRUE", "FALSE"] and negated?(acc)
+    do: boolean_word?(word) and negated?(acc)
 
   defp unary_error?({:ident, _name}, [{:raw, "-"}, {:raw, "-"} = first | before]),
     do: negated?([first | before])

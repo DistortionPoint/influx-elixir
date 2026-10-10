@@ -19,7 +19,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   # and `InfluxQLParens`, its words `InfluxQLText`, its sources `InfluxQLSources`, its
   # clauses `InfluxQLClauseScan`, its dimensions `InfluxQLGroup`, its regular expressions
   # `InfluxQLRegex`, its errors `InfluxQLError`), `InfluxQLWhere` plans the `WHERE`
-  # (`InfluxQLTokens`, `InfluxQLTyped`, `InfluxQLNested` and `InfluxQLFold` for a comparison
+  # (`InfluxQLTokens`, `InfluxQLTyped`, `InfluxQLNested` and `InfluxQLArithType` for a comparison
   # with a condition in parentheses or the false of arithmetic as an operand,
   # `InfluxQLArithmetic`, `InfluxQLTime`,
   # `InfluxQLSql`),
@@ -180,9 +180,17 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
           lowers: [bound()],
           uppers: [bound()],
           checks: [{binary(), check()}],
+          prune: prune() | nil,
           idents: MapSet.t(binary()),
           deferred: {pos_integer(), binary()} | nil,
           clash: {pos_integer(), binary()} | nil
+        }
+
+  @typedoc "The comparisons of the tags and the bounds of the time that the points are read by first, see `where_plan/0`: `{tag, operator, value}` for each tag comparison of the `AND`, and the lowest and highest time (inclusive) or `nil`."
+  @type prune :: %{
+          tags: [{binary(), binary(), binary()}],
+          lower: integer() | nil,
+          upper: integer() | nil
         }
 
   @typedoc "A comparison of numbers the SQL cannot make; see `where_plan/0`."

@@ -8,7 +8,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   #     1)`, `true = (w > 1)`), a boolean operand like `true`
   #   * the false of arithmetic of a column the measurement lacks and text, a boolean, a
   #     duration or the time (`nosuch + 'x'`, `s * nosuch`, `nosuch + 1h`, `-nosuch + 'x'`,
-  #     `nosuch + nosuch2 + 'x'`; see `InfluxQLFold`): the engine reads it as `false`, a boolean
+  #     `nosuch + nosuch2 + 'x'`; see `InfluxQLArithType`): the engine reads it as `false`, a
+  #     boolean
   #     that is no null (`nosuch + 'x' = ok` keeps the points `ok` is false for, `nosuch + 'x'
   #     <> true` all of them)
   #   * a comparison chained with another, `a = b = c`, which is `(a = b) = c` (verified): the
@@ -34,8 +35,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   # booleans beside a comparison of the time.
 
   alias InfluxElixir.Client.Local.{
+    InfluxQLArithType,
     InfluxQLError,
-    InfluxQLFold,
     InfluxQLText,
     InfluxQLTokens
   }
@@ -88,7 +89,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
     with {left, op, right} <- operands(tokens),
          {left, right} = {side(left, ctx), side(right, ctx)},
          false <- time_comparison?(left, right),
-         :ok <- InfluxQLFold.raise_coercion([elem(left, 2), elem(right, 2)]) do
+         :ok <- InfluxQLArithType.raise_first_error([elem(left, 2), elem(right, 2)]) do
       cond do
         timed_side?(left, right) -> timed_group(left, right, ctx)
         own_boolean?(left, right) -> against(left, op, right, ctx, flags)
@@ -126,13 +127,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   end
 
   # A side with what the engine makes of it: a condition in parentheses, the false of arithmetic
-  # (see `InfluxQLFold`), or neither, with the arithmetic it comes to.
+  # (see `InfluxQLArithType`), or neither, with the arithmetic it comes to.
   @spec side(list(), ctx()) :: side()
   defp side(tokens, ctx) do
     if boolean_group?(tokens) do
       {tokens, :group, :unread}
     else
-      case InfluxQLFold.kind(tokens, ctx) do
+      case InfluxQLArithType.kind(tokens, ctx) do
         {:ok, false} = fold -> {tokens, false, fold}
         fold -> {tokens, :other, fold}
       end
@@ -196,13 +197,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
     end
   end
 
-  defp nullish?({:ok, kind}), do: InfluxQLFold.null?(kind)
+  defp nullish?({:ok, kind}), do: InfluxQLArithType.null?(kind)
   defp nullish?(_fold), do: false
 
   # Whether a side is null only because a division is pending, and the other side is a number.
   defp pending?(tokens, fold, other_fold, ctx) do
     nullish?(fold) and numeric?(other_fold) and
-      match?({:late, _body}, InfluxQLFold.kind(tokens, ctx, mode: :strict))
+      match?({:late, _class, _body}, InfluxQLArithType.kind(tokens, ctx, mode: :strict))
   end
 
   defp numeric?({:ok, kind}), do: kind in [:integer, :float, :unsigned]
@@ -232,7 +233,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   defp boolean_operand?(tokens, types) do
     case unwrap(tokens) do
       [{:ident, name}] -> Map.get(types, name) == :boolean
-      [{:raw, word}] -> String.upcase(word) in ["TRUE", "FALSE"]
+      [{:raw, word}] -> InfluxQLTokens.boolean_word?(word)
       _expression -> false
     end
   end
@@ -395,7 +396,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   # A number written past the signed range is an unsigned constant (`9223372036854775808 =
   # (n > 1)` is the planner's `UInt64 = Boolean`).
   defp number(text, sign),
-    do: if(InfluxQLFold.number_kind(text, sign) == :unsigned, do: :unsigned, else: :constant)
+    do: if(InfluxQLArithType.number_kind(text, sign) == :unsigned, do: :unsigned, else: :constant)
 
   defp column(name, {tags, types}) do
     case {MapSet.member?(tags, name), Map.fetch(types, name)} do
@@ -406,7 +407,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   end
 
   # Arithmetic of numbers, strings, columns and the math functions. One that comes to a null
-  # (a column the measurement lacks in it, see `InfluxQLFold`) keeps no row; one with an
+  # (a column the measurement lacks in it, see `InfluxQLArithType`) keeps no row; one with an
   # unsigned column in it is refused (the planner's error differs by the other operand), and
   # so is arithmetic with any other operand, a duration or a boolean constant, when no column
   # the measurement lacks is in it (verified: its answer is no row or the planner's coercion

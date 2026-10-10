@@ -82,6 +82,7 @@ earlier one, the earlier one gets a banner at the top pointing forward (see
 | 2026-10-09 | [`influxql-fuzz-review`](2026-10-09_influxql-fuzz-review.md) | Review of the InfluxQL fuzz at 1596ed2: groups beside arithmetic (`Nom` and `Failure` as Core), comparisons with a boolean of their own, qualified `FROM` names and their database, `tz()` zones, escapes in quoted names, linear parenthesis scans, shared scans |
 | 2026-10-09 | [`influxql-fuzz-second-review`](2026-10-09_influxql-fuzz-second-review.md) | Second review of the InfluxQL fuzz at 9ae049e: the type of arithmetic with a missing column (the false of `nosuch + 1h = ok`), coercion errors of both sides, qualified names printed and read as Core does, wrapping constants, names of more than three parts, linear memory and time for deep conditions, many calls and long source lists |
 | 2026-10-09 | [`influxql-fuzz-third-review`](2026-10-09_influxql-fuzz-third-review.md) | Third review of the InfluxQL fuzz at af0670d: one typer and one walker for arithmetic (constants past the signed range, quotients of an unsigned number, a column the measurement lacks beside text, `abs()` of a boolean, the time inside arithmetic), an unsigned division by zero refused by name, calls and groups nested thousands deep read in one pass |
+| 2026-10-09 | [`influxql-fuzz-fourth-review`](2026-10-09_influxql-fuzz-fourth-review.md) | Fourth review of the InfluxQL fuzz at d7ecf77: one walker and one typer (`InfluxQLWalk`, `InfluxQLArithType`), errors raised in the order the planner builds them, the error of the split of the time, an integer beside an unsigned quotient, a null taking away the error of a quotient, arithmetic of the time that comes to a null, an unsigned division by zero read in the engine's order, a linear SQL expression tokenizer |
 | 2026-10-08 | [`eighteenth-review`](2026-10-08_eighteenth-review.md) | Review of 32bfbb6: hosts validated by the URL they make, non-binary names keep their path, Flight counts bounded by the body, Welford variance, ~* rewrites the textual check missed, InfluxQL blanks ASCII-only and errors ordered by position |
 | 2026-10-08 | [`seventeenth-review-client`](2026-10-08_seventeenth-review-client.md) | Review of the consumer-facing modules: bad input is a tuple, not a raise (HTTP bodies, ResponseParser, admin names); BatchWriter retries 408/429; Flight counts bounded by the frame; Config refuses unusable hosts and ports |
 | 2026-10-08 | [`seventeenth-review-influxql`](2026-10-08_seventeenth-review-influxql.md) | Review of 5b02165 (InfluxQL): one order of parse errors, lexer errors met when reached, carriage return after a keyword, dotted names, ASCII identifiers, linear tokenizing |
@@ -136,8 +137,11 @@ exactly the tests it always ran.
 # three times --wal-snapshot-size WAL files, and a snapshot of a point near
 # the largest timestamp panics ("timestamp wraparound"; writes then hang
 # until restart), which the contracts write; a large snapshot size keeps a
-# test run far from that.
-docker run -d --rm --name influx3_verify -p 8181:8181 influxdb:3.10.1-core \
+# test run far from that. --memory bounds Core: some deep statements make
+# it overflow its stack or grow without end (see the fourth fuzz review).
+# Leave its CPUs alone: the plans some cases pin name as many partitions
+# as Core sees CPUs (10 here); with --cpus 2 they name 2 and fail.
+docker run -d --rm --name influx3_verify --memory 2g -p 8181:8181 influxdb:3.10.1-core \
   influxdb3 serve --node-id node0 --object-store memory --without-auth \
   --wal-flush-interval 10ms --wal-snapshot-size 100000
 mix test test/integration/contract_v3_core --include v3_core --include integration

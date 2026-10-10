@@ -94,16 +94,49 @@ defmodule InfluxElixir.Client.Local.SQLDmlCostTest do
   end
 
   describe "a nest of calls" do
-    # Measured: 50 -> 200 costs about 4.3 times as much (it was 6), and each doubling
-    # from 100 to 800 a little more than the last (2.0, 2.1, 2.2, 2.4; it was 2.6, 2.9, 3.3).
+    # The engine's parser stops at 50 levels (`SQLCatalogCases.syntax/0` pins the last depth
+    # answered and the first refused of each statement), so the nests here stay under it: 10 and
+    # 40 deep, of 47 an INSERT answers. Measured: 40 deep costs 3.6 times as much as 10 deep for
+    # each statement (the work of a statement is a fixed part and a line in the depth; a
+    # square would make it 16, and the bounds below sit around the four of a line).
     # The call typed the kinds of its arguments at every level; it does so only beside no literal.
     test "in the values of an INSERT costs a line in its depth", %{conn: conn} do
       assert_linear(
         conn,
         &"INSERT INTO main (v) VALUES (#{nest("coalesce", &1)})",
         @insert_refusal,
-        sizes: {50, 200},
-        upper: 5.0
+        sizes: {10, 40},
+        upper: 4.5
+      )
+    end
+
+    test "in the select of an INSERT costs a line in its depth", %{conn: conn} do
+      assert_linear(
+        conn,
+        &"INSERT INTO main (v) SELECT #{nest("coalesce", &1)} FROM main",
+        @insert_refusal,
+        sizes: {10, 40},
+        upper: 4.5
+      )
+    end
+
+    test "in an UPDATE costs a line in its depth", %{conn: conn} do
+      assert_linear(
+        conn,
+        &"UPDATE main SET v = #{nest("coalesce", &1)}",
+        @update_refusal,
+        sizes: {10, 40},
+        upper: 4.5
+      )
+    end
+
+    test "in the WHERE of a DELETE costs a line in its depth", %{conn: conn} do
+      assert_linear(
+        conn,
+        &"DELETE FROM main WHERE #{nest("coalesce", &1)} = 1",
+        @delete_refusal,
+        sizes: {10, 40},
+        upper: 4.5
       )
     end
   end

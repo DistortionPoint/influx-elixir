@@ -97,7 +97,20 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   @number "(?:[0-9]+\\.[0-9]*|\\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?"
   @quoted ~S{"(?:[^"]|"")*"}
   @name "(?:\\w+|#{@quoted})"
-  @token ~r/\A\s*(?:(#{@number})|'((?:[^']|'')*)'|\$(\w+)|(#{@name}(?:\.#{@name})?)|(<=|>=|<>|!=|=>|\|\||::|[()+\-*\/%,=<>]))/u
+
+  @window 16_384
+
+  # The tokens at the end of a window that is cut may be other tokens in the whole text: a number
+  # cut inside its exponent (`1.5e+10` cut after `1.5e+` is `1.5`, `e`, `+`) is up to four.
+  @unsettled 4
+
+  # One token after any blanks, at the place the last one ended (`\G`): a number, a string, a
+  # `$name`, a (possibly qualified) name, or an operator.
+  @token Regex.compile!(
+           "\\G\\s*(?:(#{@number})|'((?:[^']|'')*)'|\\$(\\w+)|(#{@name}(?:\\.#{@name})?)|" <>
+             "(<=|>=|<>|!=|=>|\\|\\||::|[()+\\-*/%,=<>]))",
+           "u"
+         )
 
   @doc """
   Parses an expression, boolean operators included (recursive descent,
@@ -142,20 +155,45 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   end
 
   # Every non-blank byte must belong to a token; anything the scanner skipped
-  # (a quote, a stray symbol) makes the expression invalid.
+  # (a quote, a stray symbol) makes the expression invalid. The text is read in windows, each
+  # scanned once (a scan of what is left of the text for every token checks all of it as UTF-8
+  # every time, which is quadratic; a scan of the whole text keeps every match at once).
   @spec tokenize_expr(binary()) :: {:ok, [term()]} | {:error, term()}
-  defp tokenize_expr(str), do: tokenize(String.trim(str), [])
+  defp tokenize_expr(str), do: str |> String.trim() |> read_tokens(0, @window, [])
 
-  defp tokenize("", acc), do: {:ok, Enum.reverse(acc)}
+  # The tokens from `pos`, in a window of `width` bytes (widened while a token fills it). A
+  # window that stops before the end of the text may cut its last tokens, which are read again by
+  # the next one.
+  defp read_tokens(text, pos, width, acc) do
+    size = byte_size(text)
+    stop = char_end(text, min(pos + width, size))
+    matches = Regex.scan(@token, binary_part(text, pos, stop - pos))
+    complete = if stop == size, do: matches, else: Enum.drop(matches, -@unsettled)
 
-  defp tokenize(rest, acc) do
-    case Regex.run(@token, rest) do
-      [full | groups] ->
-        after_token = binary_part(rest, byte_size(full), byte_size(rest) - byte_size(full))
-        tokenize(String.trim_leading(after_token), [expr_token(groups) | acc])
+    cond do
+      complete != [] ->
+        read = Enum.reduce(complete, 0, fn [full | _groups], total -> total + byte_size(full) end)
+        tokens = Enum.reduce(complete, acc, fn [_full | g], all -> [expr_token(g) | all] end)
+        read_tokens(text, pos + read, width, tokens)
 
-      nil ->
-        {:error, {:unexpected_character, String.first(rest)}}
+      stop < size ->
+        read_tokens(text, pos, width * 2, acc)
+
+      true ->
+        case text |> binary_part(pos, size - pos) |> String.trim_leading() do
+          "" -> {:ok, Enum.reverse(acc)}
+          rest -> {:error, {:unexpected_character, String.first(rest)}}
+        end
+    end
+  end
+
+  # The end of the character a window would cut.
+  defp char_end(text, stop) when stop >= byte_size(text), do: byte_size(text)
+
+  defp char_end(text, stop) do
+    case :binary.at(text, stop) do
+      byte when byte >= 0x80 and byte < 0xC0 -> char_end(text, stop + 1)
+      _boundary -> stop
     end
   end
 

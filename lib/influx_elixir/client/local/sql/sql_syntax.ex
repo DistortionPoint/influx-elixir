@@ -41,6 +41,54 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   @named {__MODULE__, :named}
   @unknown_call {__MODULE__, :unknown_call}
   @arrow {__MODULE__, :arrow}
+  @recursion {__MODULE__, :recursion}
+  @swallow {__MODULE__, :swallow}
+  @dml_read {__MODULE__, :dml_read}
+
+  # The engine's parser stops at 50 nested calls of its recursive descent (sqlparser-rs's
+  # `RecursionCounter`, verified on 3.10.1): `parse_statement`, `parse_query` and every
+  # `parse_subexpr` count one while they run, so the 51st nested one fails.
+  @recursion_limit 50
+
+  # The precedences the parser reads a prefix operator's and a `BETWEEN` bound's operand with.
+  @unary_precedence 40
+  @not_precedence 15
+  @between_precedence 20
+
+  # The words that are operators, with their precedence (sqlparser `Precedence`).
+  @word_precedence %{
+    "OR" => 5,
+    "AND" => 10,
+    "IS" => 17,
+    "LIKE" => 19,
+    "ILIKE" => 19,
+    "SIMILAR" => 19,
+    "IN" => 20,
+    "BETWEEN" => 20,
+    "XOR" => 24,
+    "DIV" => 40,
+    "COLLATE" => 50,
+    "AT" => 50,
+    "ISNULL" => 50,
+    "NOTNULL" => 50,
+    "ESCAPE" => 50,
+    "NULL" => 50
+  }
+
+  # How far the double has verified the engine to answer what it cannot count exactly: a
+  # keyword that falls back to a name when its own syntax fails (`CASE`, `CAST`, `NOT (`)
+  # swallows the limit's error and parses the statement again at every level, so the engine's
+  # time grows with the depth and its answer past the limit was not probed. Core answered
+  # twenty of each, nested; the double refuses deeper.
+  @swallow_limit 20
+
+  # Core answered subqueries nested twenty-two deep (and was slow at twenty-three).
+  @subquery_limit 23
+
+  # A nest the double reads no further (the arguments of `EXTRACT`, a statement it does not
+  # parse) is bounded by its parentheses and its run of prefix operators: each costs the
+  # engine at least one level, so the double refuses past a bound well under the limit.
+  @unread_limit 40
 
   @typep token :: SQLTokenizer.token()
   @typep tokens :: SQLTokenizer.tokens()
@@ -92,19 +140,152 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     @set_operation,
     @named,
     @unknown_call,
-    @arrow
+    @arrow,
+    @recursion,
+    @swallow,
+    @dml_read
   ]
+
+  @doc """
+  Runs `fun`, which checks a query the double builds from an operand of an `INSERT`, `UPDATE` or
+  `DELETE` (`SELECT <operand>`), with one level of the parser's recursion credited: the
+  statement it stands for was counted whole (`nesting_verdict/1`), and the operand costs it
+  one level less than the query built from it (an `UPDATE` has no query of its own).
+  """
+  @spec credited((-> result)) :: result when result: term()
+  def credited(fun) do
+    Process.put(@recursion, -1)
+
+    try do
+      fun.()
+    after
+      Process.delete(@recursion)
+    end
+  end
 
   @doc """
   `:ok` when the text reads as a statement (or this grammar cannot say), else
   the engine's parser error.
   """
   @spec check(binary(), boolean()) :: :ok | {:error, SQLError.t()}
-  def check(sql, several? \\ false), do: check_tokens(SQLTokenizer.scan(sql), several?)
+  def check(sql, several? \\ false) do
+    case early_verdict(sql) do
+      {:error, _error} = error -> error
+      nil -> check_tokens(SQLTokenizer.scan(sql), several?, sql)
+    end
+  end
+
+  # A statement nested past the parser's limit is refused from the start of its text: the
+  # first windows of it are read (cut at a blank, the last tokens left out, so that nothing
+  # read stands near the cut), and the error the parser gives while still inside the window is
+  # the error of the whole text, which the double need not tokenize (a text a hundred
+  # kilobytes deep holds a hundred thousand tokens). Only a text whose later bytes are all
+  # ones the tokenizer reads is judged so: a character it does not read comes first on the
+  # engine, which tokenizes before it parses.
+  @windows [8_192, 65_536]
+  @cut_tokens 16
+
+  @doc """
+  The parser's refusal of an `INSERT`, `UPDATE` or `DELETE` nested past its recursion limit of 50,
+  or `nil`. The expressions of the statement are counted as a query's are (the values of an
+  `INSERT`, its query, the values and the `WHERE` of an `UPDATE`, the `WHERE` of a `DELETE`);
+  a statement of a shape this grammar does not read is bounded by the parentheses and prefix
+  operators it holds, well under the limit.
+  """
+  @spec nesting_verdict(binary()) :: SQLError.t() | nil
+  def nesting_verdict(sql) do
+    result =
+      case SQLTokenizer.scan(sql) do
+        {:ok, tokens} -> dml_verdict(tokens)
+        _unread -> text_verdict(sql)
+      end
+
+    case result do
+      {:error, error} -> error
+      :ok -> nil
+    end
+  end
+
+  @doc """
+  The parser's refusal of a long, single query nested past its recursion limit, read from the
+  first bytes of the text, or `nil` for any other text (which the whole check reads).
+  """
+  @spec deep_refusal(binary()) :: SQLError.t() | nil
+  def deep_refusal(sql) when is_binary(sql) do
+    with true <- single_statement?(sql),
+         {:error, error} <- early_verdict(sql) do
+      error
+    else
+      _read_whole -> nil
+    end
+  end
+
+  # One statement: no `;`, or only blanks after the first one.
+  defp single_statement?(sql) do
+    case :binary.match(sql, ";") do
+      :nomatch -> true
+      {at, 1} -> String.trim(binary_part(sql, at + 1, byte_size(sql) - at - 1)) == ""
+    end
+  end
+
+  @spec early_verdict(binary()) :: {:error, SQLError.t()} | nil
+  defp early_verdict(sql) do
+    if byte_size(sql) > hd(@windows) and query_start?(sql) and plain_text?(sql) do
+      Enum.find_value(@windows, fn window ->
+        if window < byte_size(sql), do: window_verdict(sql, window)
+      end)
+    end
+  end
+
+  defp query_start?(sql) do
+    trimmed = String.trim_leading(sql)
+    head = binary_part(trimmed, 0, min(6, byte_size(trimmed)))
+    String.starts_with?(String.upcase(head), ["SELECT", "WITH", "("])
+  end
+
+  # Whether every byte of the text is one that no tokenizer error can be about: no quote,
+  # comment opener, brace or byte outside ASCII.
+  defp plain_text?(<<byte, rest::binary>>)
+       when byte in ?a..?z or byte in ?A..?Z or byte in ?0..?9 or
+              byte in ~c" \t\n\r(),.+-*/%=<>_;!|:$",
+       do: plain_text?(rest)
+
+  defp plain_text?(<<>>), do: true
+  defp plain_text?(_other), do: false
+
+  defp window_verdict(sql, window) do
+    prefix = binary_part(sql, 0, window)
+
+    with {at, _length} <- :binary.match(String.reverse(prefix), [" ", "("]),
+         {:ok, tokens} <- SQLTokenizer.scan(binary_part(prefix, 0, window - at)),
+         {kept, [eof]} <- Enum.split(tokens, -1),
+         true <- length(kept) > @cut_tokens do
+      Process.put(@several, false)
+      {kept, _dropped} = Enum.split(kept, -@cut_tokens)
+
+      try do
+        case read(kept ++ [eof]) do
+          {:error, %{body: "SQL error: RecursionLimitExceeded" <> _rest}} = error ->
+            error
+
+          {:error, %{body: "Client.Local: unsupported SQL (statement nested" <> _rest}} = error ->
+            error
+
+          _other ->
+            nil
+        end
+      after
+        Enum.each(@flags, &Process.delete/1)
+      end
+    else
+      _unread -> nil
+    end
+  end
 
   # The same over a text that is already tokenized.
-  @spec check_tokens(SQLTokenizer.result(), boolean()) :: :ok | {:error, SQLError.t()}
-  defp check_tokens(tokenized, several?) do
+  @spec check_tokens(SQLTokenizer.result(), boolean(), binary()) ::
+          :ok | {:error, SQLError.t()}
+  defp check_tokens(tokenized, several?, text) do
     Process.put(@several, several?)
 
     case tokenized do
@@ -112,7 +293,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
         tokens |> read() |> flagged(tokens)
 
       :bail ->
-        :ok
+        text_verdict(text)
 
       {:unread, char} ->
         {:error,
@@ -135,6 +316,15 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     pieces = SQLTokenizer.split(sql)
     several? = match?([_one, _two | _more], pieces)
 
+    case if(several?, do: nil, else: early_verdict(sql)) do
+      {:error, _error} = error -> error
+      nil -> check_pieces(pieces, sql, several?)
+    end
+  end
+
+  @spec check_pieces([{non_neg_integer(), binary()}], binary(), boolean()) ::
+          :ok | {:error, SQLError.t()}
+  defp check_pieces(pieces, sql, several?) do
     pieces
     |> Enum.reduce_while(false, fn {offset, piece}, unread? ->
       positioned = SQLTokenizer.blank(binary_part(sql, 0, offset)) <> piece
@@ -169,7 +359,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
           :ok | {:error, SQLError.t()}
   defp statement_verdict(positioned, tokenized, several?) do
     case first_token_error(positioned, tokenized) do
-      nil -> check_tokens(tokenized, several?)
+      nil -> check_tokens(tokenized, several?, positioned)
       error -> {:error, error}
     end
   end
@@ -218,7 +408,163 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
             "which this double does not model"
         )
 
-    statement(tokens)
+    with :ok <- statement(tokens), do: unread_verdict(tokens)
+  end
+
+  # A query is counted as the parser counts it, and so is a statement that changes data of a
+  # shape read whole (`dml_recursion/1`); any other statement is not read here, so its nesting is
+  # bounded by its parentheses and prefix operators.
+  @spec unread_verdict(tokens()) :: :ok | {:error, SQLError.t()}
+  defp unread_verdict([{:word, _p, word, _l, _c} | _rest]) when word in ["SELECT", "WITH"],
+    do: :ok
+
+  defp unread_verdict([{:symbol, _p, "(", _l, _c} | _rest]), do: :ok
+
+  defp unread_verdict(tokens) do
+    if Process.get(@dml_read), do: :ok, else: bail_verdict(tokens)
+  end
+
+  # A statement that changes data, read whole by the grammar below: counted, so that it is
+  # refused at the engine's depth and no sooner. One that is not read whole is bounded by its
+  # parentheses.
+  @spec dml_verdict(tokens()) :: :ok | {:error, SQLError.t()}
+  defp dml_verdict(tokens) do
+    case dml_recursion(tokens) do
+      {:error, _error} = error -> error
+      :read -> :ok
+      :unread -> bail_verdict(tokens)
+    end
+  end
+
+  # The reading is isolated: the flags it sets (a refusal, a planner note) are the query
+  # reader's, and a statement that changes data has none of them.
+  @spec dml_recursion(tokens()) :: :read | :unread | {:error, SQLError.t()}
+  defp dml_recursion(tokens) do
+    saved = Enum.map(@flags, &{&1, Process.get(&1)})
+
+    try do
+      counted(fn -> tokens |> dml_expressions() |> dml_end() end)
+      :read
+    catch
+      :recursion -> {:error, SQLError.recursion()}
+      {:fail, error} -> {:error, error}
+      {:syntax, _expected, _token} -> :unread
+      :bail -> :unread
+    after
+      Enum.each(saved, fn
+        {flag, nil} -> Process.delete(flag)
+        {flag, value} -> Process.put(flag, value)
+      end)
+    end
+  end
+
+  # What the parser reads of each statement, as far as its recursion goes: `parse_statement`
+  # (the `counted` above), `parse_query` for what an `INSERT` inserts, and a `parse_subexpr` for
+  # every expression, as in a query.
+  @spec dml_expressions(tokens()) :: tokens()
+  defp dml_expressions([{:word, _p, "INSERT", _l, _c}, {:word, _q, "INTO", _l2, _c2} | rest]),
+    do: rest |> object_name() |> insert_columns() |> insert_body()
+
+  defp dml_expressions([{:word, _p, "UPDATE", _l, _c} | rest]),
+    do: rest |> object_name() |> update_alias() |> update_set() |> dml_where()
+
+  defp dml_expressions([{:word, _p, "DELETE", _l, _c}, {:word, _q, "FROM", _l2, _c2} | rest]),
+    do: rest |> object_name() |> dml_where()
+
+  defp dml_expressions(_tokens), do: throw(:bail)
+
+  defp dml_end([{:eof, _p, _u, _l, _c}] = tokens), do: tokens
+  defp dml_end([{:symbol, _p, ";", _l, _c}, {:eof, _q, _u, _l2, _c2}] = tokens), do: tokens
+  defp dml_end(_tokens), do: throw(:bail)
+
+  defp insert_columns([{:symbol, _p, "(", _l, _c}, {:word, _q, word, _l2, _c2} | _rest] = tokens)
+       when word in ["SELECT", "WITH", "VALUES"],
+       do: tokens
+
+  defp insert_columns([{:symbol, _p, "(", _l, _c} | rest]), do: column_names(rest)
+  defp insert_columns(tokens), do: tokens
+
+  # `VALUES` is a query body of its own, read by `parse_query`; each cell is a `parse_expr`.
+  defp insert_body([{:word, _p, "VALUES", _l, _c} | rest]) do
+    counted(fn -> rest |> value_rows() |> order_by() |> limit_offset() |> fetch_clause() end)
+  end
+
+  defp insert_body([{:word, _p, word, _l, _c} | _rest] = tokens) when word in ["SELECT", "WITH"],
+    do: query(tokens)
+
+  defp insert_body([{:symbol, _p, "(", _l, _c} | _rest] = tokens), do: query(tokens)
+  defp insert_body(_tokens), do: throw(:bail)
+
+  defp value_rows([{:symbol, _p, "(", _l, _c} | rest]) do
+    case rest |> expression_list() |> close_paren() do
+      [{:symbol, _q, ",", _l2, _c2} | more] -> value_rows(more)
+      after_rows -> after_rows
+    end
+  end
+
+  defp value_rows(tokens), do: fail("(", tokens)
+
+  defp update_alias([{:word, _p, "SET", _l, _c} | _rest] = tokens), do: tokens
+
+  defp update_alias([{:word, _p, "AS", _l, _c}, {kind, _q, _u, _l2, _c2} | rest])
+       when kind in [:word, :quoted],
+       do: rest
+
+  defp update_alias([{kind, _p, _u, _l, _c} | rest]) when kind in [:word, :quoted], do: rest
+  defp update_alias(tokens), do: tokens
+
+  defp update_set([{:word, _p, "SET", _l, _c} | rest]), do: assignments(rest)
+  defp update_set(_tokens), do: throw(:bail)
+
+  defp assignments(tokens) do
+    case tokens |> object_name() |> assignment_value() do
+      [{:symbol, _p, ",", _l, _c} | rest] -> assignments(rest)
+      after_assignments -> after_assignments
+    end
+  end
+
+  defp assignment_value([{:symbol, _p, "=", _l, _c} | rest]), do: expression(rest)
+  defp assignment_value(_tokens), do: throw(:bail)
+
+  defp dml_where([{:word, _p, "WHERE", _l, _c} | rest]), do: expression(rest)
+  defp dml_where(tokens), do: tokens
+
+  # A statement the parse of which was left half-way is bounded the same way.
+  @spec bail_verdict(tokens()) :: :ok | {:error, SQLError.t()}
+  defp bail_verdict(tokens) do
+    if deep?(tokens, 0, 0), do: {:error, nesting_refusal()}, else: :ok
+  end
+
+  defp deep?([], _depth, _run), do: false
+  defp deep?(_tokens, depth, run) when depth > @unread_limit or run > @unread_limit, do: true
+
+  defp deep?([{:symbol, _p, "(", _l, _c} | rest], depth, _run), do: deep?(rest, depth + 1, 0)
+
+  defp deep?([{:symbol, _p, ")", _l, _c} | rest], depth, _run),
+    do: deep?(rest, max(depth - 1, 0), 0)
+
+  defp deep?([{:symbol, _p, sign, _l, _c} | rest], depth, run) when sign in ["-", "+"],
+    do: deep?(rest, depth, run + 1)
+
+  defp deep?([{:word, _p, "NOT", _l, _c} | rest], depth, run), do: deep?(rest, depth, run + 1)
+  defp deep?([_token | rest], depth, _run), do: deep?(rest, depth, 0)
+
+  # The same over a text that could not be tokenized: its parentheses, quoted or not.
+  @spec text_verdict(binary()) :: :ok | {:error, SQLError.t()}
+  defp text_verdict(text), do: if(deep_text?(text, 0), do: {:error, nesting_refusal()}, else: :ok)
+
+  defp deep_text?(_text, depth) when depth > @unread_limit, do: true
+  defp deep_text?(<<"(", rest::binary>>, depth), do: deep_text?(rest, depth + 1)
+  defp deep_text?(<<")", rest::binary>>, depth), do: deep_text?(rest, max(depth - 1, 0))
+  defp deep_text?(<<_byte, rest::binary>>, depth), do: deep_text?(rest, depth)
+  defp deep_text?(<<>>, _depth), do: false
+
+  @spec nesting_refusal() :: SQLError.t()
+  defp nesting_refusal do
+    SQLError.refusal(
+      "unsupported SQL (statement nested deeper than Core was verified to answer): the " <>
+        "engine's parser stops at 50 levels of recursion"
+    )
   end
 
   # What a text that reads is still answered with: the engine's `TOP` is no feature of its
@@ -370,12 +716,24 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp statement([{:word, _p, word, _l, _c} | _rest] = tokens)
        when word in ["INSERT", "UPDATE", "DELETE"] do
     case Process.get(@several, false) && SQLDml.parse_error(tokens) do
-      error when error in [nil, false] -> dml_statement(tokens)
+      error when error in [nil, false] -> counted_statement(tokens)
       error -> {:error, error}
     end
   end
 
   defp statement(_tokens), do: :ok
+
+  @spec counted_statement(tokens()) :: :ok | {:error, SQLError.t()}
+  defp counted_statement(tokens) do
+    case dml_recursion(tokens) do
+      {:error, _error} = error ->
+        error
+
+      read ->
+        if read == :read, do: Process.put(@dml_read, true)
+        dml_statement(tokens)
+    end
+  end
 
   @spec dml_statement(tokens()) :: :ok | {:error, SQLError.t()}
   defp dml_statement([{:word, _p, "DELETE", _l, _c}, {:word, _q, "FROM", _l2, _c2} | rest]) do
@@ -452,7 +810,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   @spec read_query(tokens()) :: :ok | {:error, SQLError.t()}
   defp read_query(tokens) do
-    case query(tokens) do
+    case counted(fn -> query(tokens) end) do
       [{:eof, _printed, _upper, _line, _col}] -> :ok
       [{:symbol, _printed, ";", _line, _col}, {:eof, _p, _u, _l, _c}] -> :ok
       [{:word, _printed, upper, _line, _col} | _rest] when upper in @own_syntax -> :ok
@@ -461,7 +819,32 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   catch
     {:syntax, expected, token} -> {:error, parser_error(expected, token)}
     {:fail, error} -> {:error, error}
-    :bail -> :ok
+    :recursion -> {:error, SQLError.recursion()}
+    :bail -> bail_verdict(tokens)
+  end
+
+  # Runs `fun` one level deeper in the engine's recursion: `parse_statement`, `parse_query` and
+  # `parse_subexpr` each decrement the counter while they run, and the call that finds it at zero
+  # fails. Where a keyword that falls back to a name is open the error is the engine's swallowed
+  # one, whose answer the double did not probe, so it refuses by name there.
+  @spec counted((-> result)) :: result when result: tokens()
+  defp counted(fun) do
+    depth = Process.get(@recursion, 0)
+    if depth >= @recursion_limit, do: overflow()
+    Process.put(@recursion, depth + 1)
+
+    try do
+      fun.()
+    after
+      Process.put(@recursion, depth)
+    end
+  end
+
+  @spec overflow() :: no_return()
+  defp overflow do
+    if Process.get(@swallow, 0) > 0,
+      do: throw({:fail, nesting_refusal()}),
+      else: throw(:recursion)
   end
 
   @spec parser_error(binary(), token()) :: SQLError.t()
@@ -478,16 +861,19 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   @spec query(tokens()) :: tokens()
   defp query(tokens) do
     depth = Process.get(@depth, 0)
+    if depth >= @subquery_limit, do: throw({:fail, nesting_refusal()})
     Process.put(@depth, depth + 1)
 
     try do
-      tokens
-      |> with_clause()
-      |> select_term()
-      |> set_operations()
-      |> order_by()
-      |> limit_offset()
-      |> fetch_clause()
+      counted(fn ->
+        tokens
+        |> with_clause()
+        |> select_term()
+        |> set_operations()
+        |> order_by()
+        |> limit_offset()
+        |> fetch_clause()
+      end)
     after
       Process.put(@depth, depth)
     end
@@ -982,7 +1368,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     end
   end
 
-  defp expression(tokens), do: tokens |> operand() |> infix()
+  # `parse_expr`, which is `parse_subexpr(0)`.
+  defp expression(tokens), do: counted(fn -> tokens |> operand() |> infix(0) end)
 
   # What can start an expression.
   defp operand([{kind, _p, _u, _l, _c} | rest])
@@ -990,7 +1377,10 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
        do: rest
 
   defp operand([{:quoted, _p, _u, _l, _c} | _rest] = tokens), do: identifier(tokens)
-  defp operand([{:symbol, _p, sign, _l, _c} | rest]) when sign in ["-", "+"], do: operand(rest)
+
+  defp operand([{:symbol, _p, sign, _l, _c} | rest]) when sign in ["-", "+"],
+    do: counted(fn -> rest |> operand() |> infix(@unary_precedence) end)
+
   defp operand([{:symbol, _p, "(", _l, _c} | rest]), do: parenthesized(rest)
   defp operand([{:word, _p, upper, _l, _c} | _rest] = tokens), do: word_operand(upper, tokens)
 
@@ -1064,6 +1454,17 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # keyword's.
   @spec attempt(tokens(), (tokens() -> tokens())) :: tokens()
   defp attempt(tokens, special) do
+    counted? = swallows?(tokens)
+    if counted?, do: swallow(1)
+
+    try do
+      attempt_special(tokens, special)
+    after
+      if counted?, do: swallow(-1)
+    end
+  end
+
+  defp attempt_special(tokens, special) do
     special.(tokens)
   catch
     {:syntax, _expected, _token} = error ->
@@ -1072,10 +1473,48 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
       catch
         {:syntax, _other_expected, _other_token} -> throw(error)
       end
+
+    # The limit's error inside a `NOT` chain is swallowed the same way (verified: forty-seven
+    # `NOT`s are the parser error at the first token after the last one).
+    :recursion ->
+      identifier(tokens)
+  end
+
+  # The keywords that swallow the engine's errors and parse again are open frames, counted:
+  # `CASE`, `CAST`, and a `NOT` whose operand is more than a name or a literal. A chain of `NOT`s
+  # over a plain operand answers in linear time (verified to the limit), so it is not counted.
+  defp swallows?([{:word, _p, "NOT", _l, _c}, {:word, _q, "NOT", _l2, _c2} | _rest]), do: false
+
+  defp swallows?([{:word, _p, "NOT", _l, _c}, next | after_next]),
+    do: not plain_operand?(next, after_next)
+
+  defp swallows?(_tokens), do: true
+
+  defp plain_operand?({kind, _p, _u, _l, _c}, _rest)
+       when kind in [:number, :string, :literal, :placeholder, :quoted],
+       do: true
+
+  defp plain_operand?({:word, _p, upper, _l, _c}, [{:symbol, _q, "(", _l2, _c2} | _rest])
+       when is_binary(upper),
+       do: false
+
+  defp plain_operand?({:word, _p, upper, _l, _c}, _rest),
+    do:
+      upper not in @opaque_words and upper not in @special_calls and
+        upper not in @typed_literals and upper not in @niladic and
+        upper not in ["CASE", "CAST", "INTERVAL", "NOT"]
+
+  defp plain_operand?(_token, _rest), do: false
+
+  defp swallow(step) do
+    level = Process.get(@swallow, 0) + step
+    if level > @swallow_limit, do: throw({:fail, nesting_refusal()})
+    Process.put(@swallow, level)
   end
 
   # `NOT` takes the operators that bind tighter than `AND`.
-  defp not_operand([_not | rest]), do: rest |> operand() |> tight_infix()
+  defp not_operand([_not | rest]),
+    do: counted(fn -> rest |> operand() |> infix(@not_precedence) end)
 
   defp case_expression([_case | rest]) do
     rest |> case_operand() |> case_branches() |> case_else() |> expect_word("END")
@@ -1255,8 +1694,10 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp skip_to_close([{:symbol, _p, ")", _l, _c} | rest], depth),
     do: skip_to_close(rest, depth - 1)
 
-  defp skip_to_close([{:symbol, _p, "(", _l, _c} | rest], depth),
-    do: skip_to_close(rest, depth + 1)
+  defp skip_to_close([{:symbol, _p, "(", _l, _c} | rest], depth) do
+    if depth + Process.get(@recursion, 0) > @unread_limit, do: throw({:fail, nesting_refusal()})
+    skip_to_close(rest, depth + 1)
+  end
 
   defp skip_to_close([_token | rest], depth), do: skip_to_close(rest, depth)
 
@@ -1345,27 +1786,51 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp after_call(tokens), do: tokens
 
-  # What can follow an operand and go on with the expression.
-  defp infix(tokens) do
-    case infix_step(tokens) do
-      ^tokens -> tokens
-      after_step -> infix(after_step)
+  # What can follow an operand and go on with the expression, as `parse_subexpr(min)` reads
+  # it: an operator binds only if its precedence is above `min`, and the right operand of an
+  # operator is a `parse_subexpr` of its own precedence, one level deeper in the recursion.
+  defp infix(tokens, min) do
+    precedence = step_precedence(tokens)
+
+    if precedence > min,
+      do: tokens |> infix_step(precedence) |> infix(min),
+      else: tokens
+  end
+
+  # The precedence the engine's parser gives the operator at the head of the tokens (sqlparser
+  # `Precedence`), 0 where none continues an expression.
+  defp step_precedence([{:word, _p, "NOT", _l, _c}, {:word, _q, "NULL", _l2, _c2} | _more]),
+    do: 17
+
+  defp step_precedence([{:word, _p, "NOT", _l, _c}, {:word, _q, next, _l2, _c2} | _more]),
+    do: not_precedence(next)
+
+  defp step_precedence([{:word, _p, word, _l, _c} | _rest]),
+    do: Map.get(@word_precedence, word, 0)
+
+  defp step_precedence([{:symbol, _p, symbol, _l, _c} | _rest]) do
+    cond do
+      symbol in ["::", "[", "->", ":", "("] -> 50
+      symbol in ["*", "/", "%", "//"] -> 40
+      symbol in ["+", "-"] -> 30
+      symbol == "&" -> 23
+      symbol == "^" -> 22
+      symbol == "|" -> 21
+      symbol in ["=", "==", "<", ">", "<=", ">=", "<>", "!=", "<=>"] -> 20
+      symbol in ["~~", "~~*", "!~~", "!~~*"] -> 19
+      symbol in ["||", "~", "!~", "~*", "!~*", "<<", ">>"] -> 16
+      true -> 0
     end
   end
 
-  # The operators that bind tighter than `AND` and `OR`.
-  defp tight_infix([{:word, _p, word, _l, _c} | _rest] = tokens) when word in @logical_words,
-    do: tokens
+  defp step_precedence(_tokens), do: 0
 
-  defp tight_infix(tokens) do
-    case infix_step(tokens) do
-      ^tokens -> tokens
-      after_step -> tight_infix(after_step)
-    end
-  end
+  defp not_precedence(next) when next in ["IN", "BETWEEN"], do: 20
+  defp not_precedence(next) when next in ["LIKE", "ILIKE", "SIMILAR"], do: 19
+  defp not_precedence(_next), do: 0
 
   # `DIV` has a precedence on the engine's parser and no infix parser behind it.
-  defp infix_step([{:word, printed, "DIV", line, col} | _rest]) do
+  defp infix_step([{:word, printed, "DIV", line, col} | _rest], _precedence) do
     throw(
       {:fail,
        SQLError.parser(
@@ -1375,76 +1840,91 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     )
   end
 
-  defp infix_step([{:symbol, _p, "//", _l, _c} | rest]) do
+  defp infix_step([{:symbol, _p, "//", _l, _c} | rest], precedence) do
     defer("Operator DIV is not yet supported")
-    operand_after_operator(rest)
+    right_operand(rest, precedence)
   end
 
-  defp infix_step([{:symbol, _p, like, _l, _c} | rest])
+  defp infix_step([{:symbol, _p, like, _l, _c} | rest], precedence)
        when like in ["~~", "~~*", "!~~", "!~~*"] do
     refuse("the operators ~~, ~~*, !~~ and !~~*: write LIKE, ILIKE, NOT LIKE or NOT ILIKE")
-    operand_after_operator(rest)
+    right_operand(rest, precedence)
   end
 
-  defp infix_step([{:symbol, _p, "<=>", _l, _c} | rest]) do
+  defp infix_step([{:symbol, _p, "<=>", _l, _c} | rest], precedence) do
     refuse("the null-safe equality operator <=>: write IS NOT DISTINCT FROM")
-    operand_after_operator(rest)
+    right_operand(rest, precedence)
   end
 
-  defp infix_step([{:symbol, _p, symbol, _l, _c} | rest]) when symbol in @operators,
-    do: operand_after_operator(rest)
+  defp infix_step([{:symbol, _p, symbol, _l, _c} | rest], precedence) when symbol in @operators,
+    do: right_operand(rest, precedence)
 
-  defp infix_step([{:symbol, _p, "::", _l, _c}, {:quoted, printed, _u, _l2, _c2} | rest]),
-    do: unsupported_type(printed, rest)
+  defp infix_step(
+         [{:symbol, _p, "::", _l, _c}, {:quoted, printed, _u, _l2, _c2} | rest],
+         _precedence
+       ),
+       do: unsupported_type(printed, rest)
 
-  defp infix_step([{:symbol, _p, "::", _l, _c}, {:word, _q, _u, _l2, _c2} | _rest] = tokens),
-    do: type_name(tl(tokens))
+  defp infix_step(
+         [{:symbol, _p, "::", _l, _c}, {:word, _q, _u, _l2, _c2} | _rest] = tokens,
+         _precedence
+       ),
+       do: type_name(tl(tokens))
 
-  defp infix_step([{:symbol, _p, symbol, _l, _c} | _rest])
+  defp infix_step([{:symbol, _p, symbol, _l, _c} | _rest], _precedence)
        when symbol in ["::", "[", "->", ":", "("],
        do: throw(:bail)
 
-  defp infix_step([{:word, _p, "NOT", _l, _c}, {:word, _q, "NULL", _l2, _c2} | rest]), do: rest
+  defp infix_step(
+         [{:word, _p, "NOT", _l, _c}, {:word, _q, "NULL", _l2, _c2} | rest],
+         _precedence
+       ),
+       do: rest
 
-  defp infix_step([{:word, _p, word, _l, _c} | rest]) when word in @logical_words,
-    do: operand(rest)
+  defp infix_step([{:word, _p, word, _l, _c} | rest], precedence) when word in @logical_words,
+    do: right_operand(rest, precedence)
 
-  defp infix_step([{:word, _p, word, _l, _c} | rest]) when word in @predicate_words,
-    do: predicate(rest, word)
+  defp infix_step([{:word, _p, word, _l, _c} | rest], precedence) when word in @predicate_words,
+    do: predicate(rest, word, precedence)
 
-  defp infix_step([{:word, _p, "NOT", _l, _c}, {:word, _q, word, _l2, _c2} | rest])
+  defp infix_step(
+         [{:word, _p, "NOT", _l, _c}, {:word, _q, word, _l2, _c2} | rest],
+         precedence
+       )
        when word in @negatable_words,
-       do: predicate(rest, word)
+       do: predicate(rest, word, precedence)
 
   # `SIMILAR TO` is an operator the double does not read; a `SIMILAR` with no `TO` after it is
   # the engine's parse error, found at the word.
-  defp infix_step([{:word, _p, "SIMILAR", _l, _c}, {:word, _q, "TO", _l2, _c2} | _rest]),
+  defp infix_step([{:word, _p, "SIMILAR", _l, _c}, {:word, _q, "TO", _l2, _c2} | _rest], _prec),
     do: throw(:bail)
 
-  defp infix_step([{:word, _p, "SIMILAR", _l, _c} | _rest] = tokens),
+  defp infix_step([{:word, _p, "SIMILAR", _l, _c} | _rest] = tokens, _precedence),
     do: fail("IN or BETWEEN after NOT", tokens)
 
-  defp infix_step([
-         {:word, _p, "NOT", _l, _c},
-         {:word, _q, "SIMILAR", _l2, _c2},
-         {:word, _r, "TO", _l3, _c3} | _rest
-       ]),
+  defp infix_step(
+         [
+           {:word, _p, "NOT", _l, _c},
+           {:word, _q, "SIMILAR", _l2, _c2},
+           {:word, _r, "TO", _l3, _c3} | _rest
+         ],
+         _precedence
+       ),
        do: throw(:bail)
 
-  defp infix_step([
-         {:word, _p, "NOT", _l, _c} | [{:word, _q, "SIMILAR", _l2, _c2} | _more] = tokens
-       ]),
+  defp infix_step(
+         [{:word, _p, "NOT", _l, _c} | [{:word, _q, "SIMILAR", _l2, _c2} | _more] = tokens],
+         _precedence
+       ),
        do: fail("IN or BETWEEN after NOT", tokens)
 
-  defp infix_step([{:word, _p, word, _l, _c} | _rest])
+  defp infix_step([{:word, _p, word, _l, _c} | _rest], _precedence)
        when word in ["COLLATE", "AT", "ISNULL", "NOTNULL", "ESCAPE", "NULL"],
        do: throw(:bail)
 
-  defp infix_step([{:word, _p, word, _l, _c}, {:symbol, _q, "(", _l2, _c2} | _rest])
-       when word in ["ANY", "ALL", "SOME"],
-       do: throw(:bail)
-
-  defp infix_step(tokens), do: tokens
+  # The right operand of an operator: a `parse_subexpr` of the operator's precedence.
+  defp right_operand(tokens, precedence),
+    do: counted(fn -> tokens |> operand_after_operator() |> infix(precedence) end)
 
   defp operand_after_operator([{:word, _p, word, _l, _c}, {:symbol, _q, "(", _l2, _c2} | _rest])
        when word in ["ANY", "ALL", "SOME"],
@@ -1452,28 +1932,38 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp operand_after_operator(tokens), do: operand(tokens)
 
-  defp predicate(tokens, "IS"), do: predicate_tail(tokens)
-  defp predicate(tokens, "IN"), do: in_list(tokens)
-  defp predicate(tokens, "BETWEEN"), do: between(tokens)
-  defp predicate(tokens, _like), do: tokens |> operand() |> like_escape()
+  defp predicate(tokens, "IS", precedence), do: predicate_tail(tokens, precedence)
+  defp predicate(tokens, "IN", _precedence), do: in_list(tokens)
+  defp predicate(tokens, "BETWEEN", _precedence), do: between(tokens)
+
+  defp predicate(tokens, _like, precedence),
+    do: tokens |> like_pattern(precedence) |> like_escape()
+
+  defp like_pattern(tokens, precedence),
+    do: counted(fn -> tokens |> operand() |> infix(precedence) end)
 
   defp like_escape([{:word, _p, "ESCAPE", _l, _c}, {:string, _q, _u, _l2, _c2} | rest]), do: rest
   defp like_escape(tokens), do: tokens
 
   @is_expected "[NOT] NULL | TRUE | FALSE | DISTINCT | [form] NORMALIZED FROM after IS"
 
-  defp predicate_tail([{:word, _p, "NOT", _l, _c} | rest]), do: after_is(rest)
-  defp predicate_tail(tokens), do: after_is(tokens)
+  defp predicate_tail([{:word, _p, "NOT", _l, _c} | rest], precedence),
+    do: after_is(rest, precedence)
 
-  defp after_is([{:word, _p, word, _l, _c} | rest])
+  defp predicate_tail(tokens, precedence), do: after_is(tokens, precedence)
+
+  defp after_is([{:word, _p, word, _l, _c} | rest], _precedence)
        when word in ["NULL", "TRUE", "FALSE", "UNKNOWN"],
        do: rest
 
-  defp after_is([{:word, _p, "DISTINCT", _l, _c}, {:word, _q, "FROM", _l2, _c2} | rest]),
-    do: operand(rest)
+  defp after_is(
+         [{:word, _p, "DISTINCT", _l, _c}, {:word, _q, "FROM", _l2, _c2} | rest],
+         precedence
+       ),
+       do: right_operand(rest, precedence)
 
-  defp after_is([{:word, _p, "NORMALIZED", _l, _c} | _rest]), do: throw(:bail)
-  defp after_is(tokens), do: fail(@is_expected, tokens)
+  defp after_is([{:word, _p, "NORMALIZED", _l, _c} | _rest], _precedence), do: throw(:bail)
+  defp after_is(tokens, _precedence), do: fail(@is_expected, tokens)
 
   defp in_list([{:symbol, _p, "(", _l, _c} | rest]) do
     case rest do
@@ -1502,8 +1992,15 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     end
   end
 
-  defp between(tokens),
-    do: tokens |> operand() |> before_and() |> expect_word("AND") |> operand()
+  # Each bound is a `parse_subexpr` of `BETWEEN`'s precedence.
+  defp between(tokens) do
+    counted(fn -> tokens |> operand() |> before_and() end)
+    |> expect_word("AND")
+    |> between_high()
+  end
+
+  defp between_high(tokens),
+    do: counted(fn -> tokens |> operand() |> infix(@between_precedence) end)
 
   # The low bound of a `BETWEEN` stops at the `AND` that belongs to it.
   defp before_and([{:word, _p, "AND", _l, _c} | _rest] = tokens), do: tokens

@@ -1930,8 +1930,6 @@ defmodule InfluxElixir.Contract.SQLScalarRefusals do
        "UPDATE with an IS the double does not read: the engine's answer for it is not modelled"},
       {:raw, "update main set v = 1 where n xor 1",
        "UPDATE with xor as an operator: the engine's answer for it is not modelled"},
-      {:raw, "update main set v = 1 where n div 1",
-       "UPDATE with div as an operator: the engine's answer for it is not modelled"},
       {:raw, "update main set v = 1 where n mod 1",
        "UPDATE with mod as an operator: the engine's answer for it is not modelled"},
       {:raw, "update main set v = 1 where n overlaps 1",
@@ -2740,6 +2738,34 @@ defmodule InfluxElixir.Contract.SQLScalarRefusals do
        "UPDATE with a CAST without AS: the engine's answer for it is not modelled"},
       {:raw, "UPDATE main SET s = $0 + CAST(n, 1)",
        "UPDATE with a CAST without AS: the engine's answer for it is not modelled"}
+    ] ++ deep_refusable()
+  end
+
+  # The cases of `deep_refusable/0` of `SQLCatalogCases`.
+  defp deep_refusable do
+    deep =
+      "unsupported SQL (statement nested deeper than Core was verified to answer): the " <>
+        "engine's parser stops at 50 levels of recursion"
+
+    open = String.duplicate("(", 60)
+    close = String.duplicate(")", 60)
+    nest = String.duplicate("(v + ", 30) <> "v" <> String.duplicate(")", 30)
+
+    [
+      {:raw, "EXPLAIN SELECT " <> open <> "1" <> close, deep},
+      {:raw, "SELECT EXTRACT(YEAR FROM " <> open <> "now()" <> close <> ")", deep},
+      {:raw, "UPDATE main SET v = 1 RETURNING " <> open <> "v" <> close, deep},
+      {:raw, "SELECT N'a', " <> open <> "1" <> close, deep},
+      {:raw, "SELECT CAST(" <> nest <> " AS INT) AS x FROM ping", deep},
+      {:raw, "SELECT v FROM ping WHERE NOT (" <> nest <> " > 0)", deep},
+      {:raw, "SELECT CASE WHEN " <> nest <> " > 0 THEN 1 END AS x FROM ping", deep},
+      {:raw, "SELECT CASE WHEN true THEN " <> nest <> " END AS x FROM ping", deep},
+      {:raw, "SELECT v NOT NULL AS x FROM ping",
+       "unsupported column: v not null as x (it goes on at not, where an operator is expected)"},
+      {:raw, "SELECT v FROM ping WHERE v NOT NULL",
+       "unsupported WHERE clause: v NOT null (NOT of these operands: the double reads it only beside a column and a literal)"},
+      {:raw, "SELECT v IS NORMALIZED AS x FROM ping",
+       "unsupported column: v is normalized as x (IS NORMALIZED is not a test it reads)"}
     ]
   end
 

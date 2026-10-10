@@ -49,6 +49,7 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
       unquote(defects(client))
       unquote(glue(client))
       unquote(nested(client))
+      unquote(nested_planner(client))
       unquote(show_helpers(client))
       unquote(fix_helpers(client))
       unquote(helpers(client))
@@ -399,6 +400,11 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
 
         test "statements the double refused by name and now answers (shape)", ctx do
           check_fix(ctx, InfluxQLShapeCases.exact_answers())
+        end
+
+        test "a time compared with a column, a boolean or a function is the error of the split",
+             ctx do
+          check_fix(ctx, InfluxQLShapeCases.time_comparand_errors())
         end
 
         @tag local_divergence:
@@ -828,6 +834,42 @@ defmodule InfluxElixir.Contract.InfluxQLPlanner do
             InfluxQLNestedCases.refusals(),
             InfluxQLNestedCases.refusal_reasons()
           )
+        end
+      end
+    end
+  end
+
+  defp nested_planner(client) do
+    quote location: :keep do
+      describe "InfluxQL operands of a comparison: order of errors, quotients, nulls — contract" do
+        setup ctx do
+          names = InfluxQLNestedCases.names(InfluxElixir.IntegrationHelper.unique_name("ipq"))
+          write(ctx, unquote(client), InfluxQLNestedCases.fixture(names))
+          {:ok, names: Map.put(names, "db", ctx.database)}
+        end
+
+        test "the errors of a comparison in the order the planner builds the expressions", ctx do
+          check_fix(ctx, InfluxQLNestedCases.operand_order())
+        end
+
+        test "the error of the split of the time before every other error", ctx do
+          check_fix(ctx, InfluxQLNestedCases.time_comparands())
+        end
+
+        test "an integer expression beside the quotient of an unsigned number", ctx do
+          check_fix(ctx, InfluxQLNestedCases.integer_beside_quotient())
+        end
+
+        test "a null takes away the error of a quotient, and which of two is raised", ctx do
+          check_fix(ctx, InfluxQLNestedCases.null_erases_quotient_errors())
+        end
+
+        test "arithmetic of the time that comes to a null", ctx do
+          check_fix(ctx, InfluxQLNestedCases.timed_nulls())
+        end
+
+        test "an unsigned division by zero among the points the tags and times keep", ctx do
+          check_fix(ctx, InfluxQLNestedCases.closed_streams())
         end
       end
     end

@@ -5,13 +5,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   alias InfluxElixir.Client.Local.{
     InfluxQLArithmetic,
-    InfluxQLFold,
+    InfluxQLArithType,
     InfluxQLSql,
     InfluxQLTime,
     InfluxQLTokens,
+    InfluxQLWalk,
     InfluxQLWhereArith,
     SQLLimits
   }
+
+  alias InfluxElixir.Client.Local.InfluxQLWalk.Opts
 
   require SQLLimits
 
@@ -198,7 +201,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp literal_kind([{:str, _content}]), do: :string
 
   defp literal_kind([{:raw, word}]) do
-    if String.upcase(word) in ["TRUE", "FALSE"], do: :boolean
+    if InfluxQLTokens.boolean_word?(word), do: :boolean
   end
 
   defp literal_kind(tokens) do
@@ -215,14 +218,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   # the caller refuses.
   @spec constant_kind(list()) :: {:integer, integer()} | :float | :expression
   defp constant_kind(tokens) do
-    if unsigned_literals?(tokens) do
-      :expression
-    else
-      case InfluxQLFold.walk(tokens, constants()) do
-        {:ok, value, []} when is_float(value) -> :float
-        {:ok, value, []} when is_integer(value) -> {:integer, wrap_int64(value)}
-        _unfoldable -> :expression
-      end
+    case InfluxQLWalk.walk(tokens, __MODULE__.Constants, %Opts{calls: false}) do
+      {:ok, value, []} when is_float(value) -> :float
+      {:ok, value, []} when is_integer(value) -> {:integer, wrap_int64(value)}
+      _unfoldable -> :expression
     end
   rescue
     _out_of_range in [ArgumentError, ArithmeticError] -> :expression
@@ -244,39 +243,54 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp unsigned_literals?([{:number, text} = token | rest], previous) do
     sign = if previous == {:raw, "-"}, do: -1, else: 1
 
-    if InfluxQLFold.number_kind(text, sign) == :unsigned,
+    if InfluxQLArithType.number_kind(text, sign) == :unsigned,
       do: true,
       else: unsigned_literals?(rest, token)
   end
 
   defp unsigned_literals?([token | rest], _previous), do: unsigned_literals?(rest, token)
 
-  # The handlers of the walker for the value of a constant: the sum, difference and product of
-  # numbers. (A quotient is a float or an unsigned integer by its operands, which the double does
-  # not fold: it is unread, and the caller refuses.)
-  defp constants do
-    %{
-      number: fn text, sign -> {:ok, sign * constant_number(text)} end,
-      leaf: fn _tokens -> :unread end,
-      combine: &constant_op/3,
-      negate: fn value -> {:ok, -value} end
-    }
-  end
+  defmodule Constants do
+    @moduledoc false
+    # The value of a constant, for the walker (`InfluxQLWalk`): the sum, difference and product
+    # of numbers, the one place the double folds. It is the only walk that is not typing:
+    # its values are the numbers themselves. (A quotient is a float or an unsigned integer by its
+    # operands, which the double does not fold: it is unread, and the caller refuses; so is an
+    # integer written beyond the signed range, which the engine reads as an unsigned constant.)
 
-  defp constant_op("+", left, right), do: {:ok, left + right}
-  defp constant_op("-", left, right), do: {:ok, left - right}
-  defp constant_op("*", left, right), do: {:ok, left * right}
-  defp constant_op(_division, _left, _right), do: :unread
+    @behaviour InfluxElixir.Client.Local.InfluxQLWalk
 
-  defp constant_number(text) do
-    case Integer.parse(text) do
-      {n, ""} -> n
-      _fraction -> text |> number_text() |> String.to_float()
+    alias InfluxElixir.Client.Local.InfluxQLArithType
+
+    @impl true
+    def number(text, sign, _opts) do
+      if InfluxQLArithType.number_kind(text, sign) == :unsigned,
+        do: :unread,
+        else: {:ok, sign * constant_number(text)}
     end
-  end
 
-  defp number_text("." <> _fraction = text), do: "0" <> text
-  defp number_text(text), do: text
+    @impl true
+    def leaf(_tokens, _opts), do: :unread
+
+    @impl true
+    def combine("+", left, right, _opts), do: {:ok, left + right}
+    def combine("-", left, right, _opts), do: {:ok, left - right}
+    def combine("*", left, right, _opts), do: {:ok, left * right}
+    def combine(_division, _left, _right, _opts), do: :unread
+
+    @impl true
+    def negate(value, _opts), do: {:ok, -value}
+
+    defp constant_number(text) do
+      case Integer.parse(text) do
+        {n, ""} -> n
+        _fraction -> text |> number_text() |> String.to_float()
+      end
+    end
+
+    defp number_text("." <> _fraction = text), do: "0" <> text
+    defp number_text(text), do: text
+  end
 
   defp signed_kind(sign, {:number, text}) do
     case Integer.parse(text) do
@@ -379,7 +393,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   @spec filtered(term(), tuple(), {MapSet.t(binary()), map()}, %{table: binary()} | nil) ::
           term()
   defp filtered({400, _body}, {:cmp, tokens}, {tags, types}, %{table: table}) do
-    {printed, type} = filter_predicate(strip_parens(tokens), tags, types, table)
+    {printed, type} = filter_predicate(InfluxQLTokens.strip_parens(tokens), tags, types, table)
 
     {400,
      "Error during planning: Cannot create filter with non-boolean predicate " <>
@@ -396,7 +410,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   @spec filter_predicate(list(), MapSet.t(binary()), map(), binary()) ::
           {binary(), binary()} | no_return()
   defp filter_predicate([{:raw, "+"} | rest], tags, types, table) when rest != [],
-    do: filter_predicate(strip_parens(rest), tags, types, table)
+    do: filter_predicate(InfluxQLTokens.strip_parens(rest), tags, types, table)
 
   defp filter_predicate([{:raw, "-"}, {:number, text}], _tags, _types, _table) do
     # (A negative integer beyond the signed range is the lexer's error, before the condition.)
@@ -407,7 +421,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   end
 
   defp filter_predicate([{:raw, "-"} | rest], _tags, types, table) do
-    case strip_parens(rest) do
+    case InfluxQLTokens.strip_parens(rest) do
       [{:ident, name}] -> negated_field(name, types, table)
       _other -> unprintable()
     end
@@ -415,7 +429,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   # (An integer beyond the unsigned range is the lexer's error, before the condition.)
   defp filter_predicate([{:number, text}], _tags, _types, _table) do
-    case InfluxQLFold.number_kind(text, 1) do
+    case InfluxQLArithType.number_kind(text, 1) do
       :integer -> {"Int64(#{elem(Integer.parse(text), 0)})", "Int64"}
       :unsigned -> {"UInt64(#{elem(Integer.parse(text), 0)})", "UInt64"}
       :float -> {"Float64(#{float_text(text)})", "Float64"}
@@ -493,7 +507,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     do: Enum.any?(nodes, &operand_inside?(&1, ctx))
 
   defp operand_inside?({:cmp, tokens}, {tags, types}) do
-    stripped = strip_parens(tokens)
+    stripped = InfluxQLTokens.strip_parens(tokens)
 
     case standalone_field(stripped, tags, types) do
       nil -> bare_operand?(tokens, stripped)
@@ -514,7 +528,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
       (tokens != stripped or not boolean_constant?(stripped))
   end
 
-  defp boolean_constant?([{:raw, word}]), do: String.upcase(word) in ["TRUE", "FALSE"]
+  defp boolean_constant?([{:raw, word}]), do: InfluxQLTokens.boolean_word?(word)
   defp boolean_constant?(_tokens), do: false
 
   @spec bare_type(tuple(), {MapSet.t(binary()), map()}, (tuple(), boolean() -> term())) ::
@@ -522,7 +536,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp bare_type({:group, node}, ctx, leaf), do: bare_type(node, ctx, leaf)
 
   defp bare_type({:cmp, tokens}, {tags, types}, _leaf) do
-    case tokens |> strip_parens() |> standalone_field(tags, types, true) do
+    case tokens |> InfluxQLTokens.strip_parens() |> standalone_field(tags, types, true) do
       nil -> nil
       :boolean -> nil
       type -> {400, bare_error(type)}
@@ -565,7 +579,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp operand({:cmp, tokens} = node, {tags, types}, _top?, leaf) do
     leaf.(node)
 
-    case tokens |> strip_parens() |> standalone_field(tags, types) do
+    case tokens |> InfluxQLTokens.strip_parens() |> standalone_field(tags, types) do
       type when type in [nil, :boolean] -> {:bool, node, false}
       type -> {{:bare, type}, node, true}
     end
@@ -630,12 +644,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     do: InfluxQLWhereArith.null?(tokens, tags, types)
 
   defp bare_leaf?({:cmp, tokens}, {tags, types}),
-    do: standalone_field(strip_parens(tokens), tags, types) not in [nil, :boolean]
+    do: standalone_field(InfluxQLTokens.strip_parens(tokens), tags, types) not in [nil, :boolean]
 
   # A bare operand that is not a number (a string, a tag, an unsigned constant, a duration).
   defp other_bare_leaf?({:cmp, tokens}, {tags, types}),
     do:
-      standalone_field(strip_parens(tokens), tags, types) not in [nil, :boolean, :integer, :float]
+      standalone_field(InfluxQLTokens.strip_parens(tokens), tags, types) not in [
+        nil,
+        :boolean,
+        :integer,
+        :float
+      ]
 
   @spec logical_error(:and | :or, binary(), binary()) :: binary()
   defp logical_error(kind, left, right) do
@@ -693,14 +712,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   # range stays unsigned under them (verified: `-(9223372036854775808)` and
   # `-(-(9223372036854775808))` are `UInt64`).
   defp signed_operand([{:raw, "("} | _group] = tokens, _negative?, tags, types) do
-    case strip_parens(tokens) do
+    case InfluxQLTokens.strip_parens(tokens) do
       ^tokens -> :none
       inner -> signed_operand(inner, false, tags, types)
     end
   end
 
   defp signed_operand([{:number, text}], negative?, _tags, _types),
-    do: {:ok, InfluxQLFold.number_kind(text, if(negative?, do: -1, else: 1))}
+    do: {:ok, InfluxQLArithType.number_kind(text, if(negative?, do: -1, else: 1))}
 
   defp signed_operand([{:ident, name}], _negative?, tags, types) do
     case field_kind(name, tags, types) do
@@ -716,14 +735,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   # (The type of a constant that stands alone as a condition. One past the unsigned range is the
   # lexer's error, before the condition.)
-  defp bare_field([{:number, text}], _tags, _types), do: InfluxQLFold.number_kind(text, 1)
+  defp bare_field([{:number, text}], _tags, _types), do: InfluxQLArithType.number_kind(text, 1)
 
   defp bare_field([{:str, _content}], _tags, _types), do: :string
   defp bare_field(_tokens, _tags, _types), do: nil
-
-  # The tokens inside the parentheses around them, however many layers.
-  @spec strip_parens(list()) :: list()
-  defp strip_parens(tokens), do: tokens |> InfluxQLTokens.unwrap_group() |> elem(0)
 
   @spec bare_error(atom()) :: binary()
   defp bare_error(type) do
