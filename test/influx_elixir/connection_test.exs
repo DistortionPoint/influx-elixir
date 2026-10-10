@@ -1,6 +1,7 @@
 defmodule InfluxElixir.ConnectionTest do
   use ExUnit.Case, async: true
 
+  alias InfluxElixir.Client.Local
   alias InfluxElixir.Connection
 
   # Only api_version/1's examples run: the others put a fixed name (`:test`) in the registry
@@ -13,33 +14,25 @@ defmodule InfluxElixir.ConnectionTest do
     :"influx_conn_test_#{System.unique_integer([:positive])}_#{suffix}"
   end
 
+  defp missing_message(name) do
+    "no InfluxElixir connection named #{inspect(name)}: list it under " <>
+      "`config :influx_elixir, :connections` or add it with " <>
+      "InfluxElixir.add_connection/2"
+  end
+
   # ---------------------------------------------------------------------------
   # put/2 + get/1
   # ---------------------------------------------------------------------------
 
   describe "put/2 and get/1" do
-    test "stores a config and retrieves it by name" do
+    test "stores a config and retrieves it by name, verbatim as a keyword list" do
       name = unique_name(:put_get)
-      config = [host: "localhost", token: "abc", port: 8086]
-
-      on_exit(fn -> Connection.delete(name) end)
-
-      assert :ok = Connection.put(name, config)
-      assert {:ok, retrieved} = Connection.get(name)
-      assert retrieved[:host] === "localhost"
-      assert retrieved[:token] === "abc"
-      assert retrieved[:port] === 8086
-    end
-
-    test "stored config is returned verbatim as a keyword list" do
-      name = unique_name(:verbatim)
       config = [host: "h", token: "t", scheme: :http, port: 9999, pool_size: 5]
 
       on_exit(fn -> Connection.delete(name) end)
 
-      Connection.put(name, config)
-      assert {:ok, got} = Connection.get(name)
-      assert got === config
+      assert Connection.put(name, config) === :ok
+      assert Connection.get(name) === {:ok, config}
     end
 
     test "overwriting a name replaces the stored config" do
@@ -49,8 +42,7 @@ defmodule InfluxElixir.ConnectionTest do
       Connection.put(name, host: "first", token: "t")
       Connection.put(name, host: "second", token: "t")
 
-      assert {:ok, got} = Connection.get(name)
-      assert got[:host] === "second"
+      assert Connection.get(name) === {:ok, [host: "second", token: "t"]}
     end
 
     test "different names are stored independently" do
@@ -65,10 +57,8 @@ defmodule InfluxElixir.ConnectionTest do
       Connection.put(name_a, host: "alpha", token: "ta")
       Connection.put(name_b, host: "beta", token: "tb")
 
-      assert {:ok, a} = Connection.get(name_a)
-      assert {:ok, b} = Connection.get(name_b)
-      assert a[:host] === "alpha"
-      assert b[:host] === "beta"
+      assert Connection.get(name_a) === {:ok, [host: "alpha", token: "ta"]}
+      assert Connection.get(name_b) === {:ok, [host: "beta", token: "tb"]}
     end
   end
 
@@ -79,7 +69,7 @@ defmodule InfluxElixir.ConnectionTest do
   describe "get/1 — unknown name" do
     test "returns {:error, :not_found} for a name that was never stored" do
       name = unique_name(:not_found)
-      assert {:error, :not_found} = Connection.get(name)
+      assert Connection.get(name) === {:error, :not_found}
     end
 
     test "returns {:error, :not_found} after the entry has been deleted" do
@@ -88,7 +78,7 @@ defmodule InfluxElixir.ConnectionTest do
       Connection.put(name, host: "h", token: "t")
       Connection.delete(name)
 
-      assert {:error, :not_found} = Connection.get(name)
+      assert Connection.get(name) === {:error, :not_found}
     end
   end
 
@@ -102,18 +92,15 @@ defmodule InfluxElixir.ConnectionTest do
       on_exit(fn -> Connection.delete(name) end)
 
       Connection.put(name, host: "h", token: "t")
-      config = Connection.fetch!(name)
-      assert config[:host] === "h"
+      assert Connection.fetch!(name) === [host: "h", token: "t"]
     end
 
     test "raises an ArgumentError that names the missing connection" do
       name = unique_name(:fetch_raise)
 
-      assert_raise ArgumentError,
-                   ~r/no InfluxElixir connection named :influx_conn_test_.*_fetch_raise/,
-                   fn ->
-                     Connection.fetch!(name)
-                   end
+      assert_raise ArgumentError, missing_message(name), fn ->
+        Connection.fetch!(name)
+      end
     end
 
     test "raises ArgumentError after the entry has been deleted" do
@@ -122,7 +109,7 @@ defmodule InfluxElixir.ConnectionTest do
       Connection.put(name, host: "h", token: "t")
       Connection.delete(name)
 
-      assert_raise ArgumentError, fn ->
+      assert_raise ArgumentError, missing_message(name), fn ->
         Connection.fetch!(name)
       end
     end
@@ -137,21 +124,21 @@ defmodule InfluxElixir.ConnectionTest do
       name = unique_name(:delete_removes)
 
       Connection.put(name, host: "h", token: "t")
-      assert :ok = Connection.delete(name)
-      assert {:error, :not_found} = Connection.get(name)
+      assert Connection.delete(name) === :ok
+      assert Connection.get(name) === {:error, :not_found}
     end
 
     test "returns :ok when deleting a name that does not exist" do
       name = unique_name(:delete_nonexistent)
-      assert :ok = Connection.delete(name)
+      assert Connection.delete(name) === :ok
     end
 
     test "is idempotent — second delete also returns :ok" do
       name = unique_name(:delete_twice)
 
       Connection.put(name, host: "h", token: "t")
-      assert :ok = Connection.delete(name)
-      assert :ok = Connection.delete(name)
+      assert Connection.delete(name) === :ok
+      assert Connection.delete(name) === :ok
     end
 
     test "deleting one name does not affect another" do
@@ -165,9 +152,35 @@ defmodule InfluxElixir.ConnectionTest do
 
       Connection.delete(name_a)
 
-      assert {:error, :not_found} = Connection.get(name_a)
-      assert {:ok, b} = Connection.get(name_b)
-      assert b[:host] === "b"
+      assert Connection.get(name_a) === {:error, :not_found}
+      assert Connection.get(name_b) === {:ok, [host: "b", token: "tb"]}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # api_version/1
+  # ---------------------------------------------------------------------------
+
+  describe "api_version/1" do
+    test "reads a keyword connection, a Local connection and a registered name" do
+      assert Connection.api_version(host: "h", api_version: :v3) === :v3
+
+      {:ok, v2} = Local.start(profile: :v2)
+      {:ok, v3} = Local.start(profile: :v3_core)
+      assert Connection.api_version(v2) === :v2
+      assert Connection.api_version(v3) === :v3
+
+      name = unique_name(:api_version)
+      Connection.put(name, host: "h", api_version: :v2)
+      on_exit(fn -> Connection.delete(name) end)
+      assert Connection.api_version(name) === :v2
+    end
+
+    test "anything else, an unregistered name included, is v3" do
+      assert Connection.api_version(unique_name(:api_version_not_registered)) === :v3
+      assert Connection.api_version(nil) === :v3
+      assert Connection.api_version("host") === :v3
+      assert Connection.api_version([1, 2]) === :v3
     end
   end
 

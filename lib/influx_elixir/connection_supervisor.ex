@@ -8,14 +8,15 @@ defmodule InfluxElixir.ConnectionSupervisor do
   `:finch_name`) and a BatchWriter GenServer for a
   single named InfluxDB connection with crash isolation.
 
-  On init, registers the connection config in
+  On start, registers the connection the client initialised in
   `InfluxElixir.Connection` so it can be resolved by name
   from any process via `Connection.fetch!/1` or the facade. The
   registration is taken down, and the client's state for the connection
   released, whenever the supervisor stops, including when it gives up after
-  too many restarts: a name never resolves to a connection that is not
-  running. A call made in the moment between the registration and the pool
-  starting is `{:error, {:connection_error, :no_pool}}`, never a raise.
+  too many restarts or a child fails to start: a name never resolves to a
+  connection that is not running. A call made in the moment between the
+  registration and the pool starting is `{:error, {:connection_error, :no_pool}}`,
+  never a raise.
 
   If the Finch pool crashes, the connection's BatchWriter (at most one)
   restarts with it, since it depends on the pool. A BatchWriter crash
@@ -46,7 +47,6 @@ defmodule InfluxElixir.ConnectionSupervisor do
 
   use Supervisor
 
-  alias InfluxElixir.Connection
   alias InfluxElixir.ConnectionSupervisor.{Registration, Secret}
 
   @doc """
@@ -127,13 +127,13 @@ defmodule InfluxElixir.ConnectionSupervisor do
       &await_release/1
     )
 
-    # Initialize the connection via the configured client implementation
-    # and register it in the persistent_term registry so that callers can
-    # resolve it by name via Connection.fetch!/1.
+    # The configured client initialises the connection; the first child registers it under
+    # its name, so callers resolve it via Connection.fetch!/1, and releases it on the way down.
     case client.init_connection(config) do
       {:ok, conn} ->
-        Connection.put(name, conn)
-        Supervisor.init(children(config, name, finch_name, pool_size), strategy: :rest_for_one)
+        Supervisor.init(children(config, {name, client, conn}, finch_name, pool_size),
+          strategy: :rest_for_one
+        )
 
       {:error, reason} ->
         # A supervisor's init has no error return; an exit is how it fails with a reason,
@@ -143,17 +143,18 @@ defmodule InfluxElixir.ConnectionSupervisor do
   end
 
   # The registration first, so it stops last and takes the connection down after the writer's
-  # final flush. `:finch_name` points at a pool the consumer runs; starting another one
-  # here would leave an idle pool per connection and make the writer depend (rest_for_one)
-  # on a pool it never uses. The writer gets the connection's *name*: `Writer` resolves it
+  # final flush; a child that fails to start stops it too. `:finch_name` points at a pool the
+  # consumer runs; starting another one here would leave an idle pool per connection and make
+  # the writer depend (rest_for_one) on a pool it never uses. `finch_name: nil` names none, as
+  # the HTTP client reads it. The writer gets the connection's *name*: `Writer` resolves it
   # to the *initialised* connection (for Client.Local the ETS-backed map, which the raw
   # keyword list is not), and no child spec holds the config.
-  @spec children(keyword(), atom(), atom(), pos_integer()) :: [
+  @spec children(keyword(), {atom(), module(), term()}, atom(), pos_integer()) :: [
           Supervisor.child_spec() | {module(), term()}
         ]
-  defp children(config, name, finch_name, pool_size) do
+  defp children(config, {name, _client, _conn} = registration, finch_name, pool_size) do
     finch_children =
-      if Keyword.has_key?(config, :finch_name) do
+      if Keyword.get(config, :finch_name) do
         []
       else
         [{Finch, name: finch_name, pools: %{default: [size: pool_size]}}]
@@ -171,7 +172,7 @@ defmodule InfluxElixir.ConnectionSupervisor do
           ]
       end
 
-    [Registration.child_spec(name)] ++ finch_children ++ writer_children
+    [{Registration, registration}] ++ finch_children ++ writer_children
   end
 
   # A child left over from a killed predecessor still holds its name until

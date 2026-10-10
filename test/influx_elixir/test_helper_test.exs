@@ -12,14 +12,14 @@ defmodule InfluxElixir.TestHelperTest do
 
   describe "setup_influx/1" do
     test "returns a working connection with the requested databases", %{conn: conn} do
-      assert {:ok, :written} = InfluxElixir.write(conn, "cpu value=1.0 1")
+      assert InfluxElixir.write(conn, "cpu value=1.0 1") === {:ok, :written}
 
       assert InfluxElixir.query_sql(conn, "SELECT * FROM cpu") ===
                {:ok, [%{"time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 1.0}]}
     end
 
     test "each setup gets its own isolated instance", %{conn: conn} do
-      {:ok, :written} = InfluxElixir.write(conn, "cpu value=1.0 1")
+      assert InfluxElixir.write(conn, "cpu value=1.0 1") === {:ok, :written}
 
       {:ok, conn: other} = setup_influx(databases: ["helper_db"], database: "helper_db")
 
@@ -39,7 +39,7 @@ defmodule InfluxElixir.TestHelperTest do
 
     test "passes :profile through" do
       {:ok, conn: v2} = setup_influx(profile: :v2)
-      assert {:error, :unsupported_operation} = Local.query_sql(v2, "SELECT 1")
+      assert Local.query_sql(v2, "SELECT 1") === {:error, :unsupported_operation}
     end
   end
 end

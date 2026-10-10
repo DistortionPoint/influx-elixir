@@ -64,8 +64,9 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       assert InfluxElixir.health(conn) === {:ok, %{"status" => "pass"}}
     end
 
-    test "finch pool name is derivable from registered connection" do
+    test "the per-connection Finch pool is a child named after the connection" do
       name = unique_name()
+      finch_name = :"influx_elixir_#{name}_finch"
 
       {:ok, sup} =
         InfluxElixir.add_connection(name, host: "h", token: "t")
@@ -74,12 +75,27 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
         InfluxElixir.remove_connection(name)
       end)
 
-      finch_name = ConnectionSupervisor.finch_name(name)
-      finch = Process.whereis(finch_name)
-      assert is_pid(finch) and Process.alive?(finch)
-      children = Supervisor.which_children(sup)
-      assert {^finch_name, child, _type, _mods} = List.keyfind(children, finch_name, 0)
-      assert is_pid(child) and Process.alive?(child)
+      assert {^finch_name, child, :worker, [Finch]} =
+               List.keyfind(Supervisor.which_children(sup), finch_name, 0)
+
+      # Finch names its top supervisor `<name>.Supervisor`, and its registry `<name>`.
+      assert Process.whereis(:"#{finch_name}.Supervisor") === child
+    end
+
+    # `finch_name: nil` (an unset `Application.get_env/2`, say) names no pool: the HTTP client
+    # then uses the connection's own, which the supervisor did not start.
+    test "finch_name: nil starts the per-connection pool" do
+      name = unique_name()
+      finch_name = :"influx_elixir_#{name}_finch"
+
+      {:ok, sup} = InfluxElixir.add_connection(name, host: "h", token: "t", finch_name: nil)
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+
+      assert {^finch_name, child, :worker, [Finch]} =
+               List.keyfind(Supervisor.which_children(sup), finch_name, 0)
+
+      # Finch names its top supervisor `<name>.Supervisor`, and its registry `<name>`.
+      assert Process.whereis(:"#{finch_name}.Supervisor") === child
     end
 
     test "no per-connection Finch pool is started when :finch_name names an existing one" do
@@ -92,7 +108,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
 
       on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
-      assert Process.whereis(ConnectionSupervisor.finch_name(name)) === nil
+      assert Process.whereis(:"influx_elixir_#{name}_finch") === nil
       assert InfluxElixir.health(name) === {:ok, %{"status" => "pass"}}
     end
   end
@@ -111,7 +127,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
 
       on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
-      writer = ConnectionSupervisor.batch_writer_name(name)
+      writer = :"influx_elixir_#{name}_batch_writer"
       :ok = InfluxElixir.Write.BatchWriter.write_sync(writer, "cpu value=1.0 1")
 
       assert InfluxElixir.query_sql(name, "SELECT * FROM cpu", database: "bw_db") ===
@@ -120,7 +136,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       assert InfluxElixir.stats(name) ===
                {:ok, %{total_writes: 1, total_errors: 0, total_bytes: 15}}
 
-      assert :ok = InfluxElixir.flush(name)
+      assert InfluxElixir.flush(name) === :ok
     end
   end
 
@@ -132,7 +148,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
                InfluxElixir.add_connection(name, batch_writer: [batch_size: 0])
 
       assert inspect(reason) =~ "invalid value for :batch_size option"
-      assert {:error, :not_found} = Connection.get(name)
+      assert Connection.get(name) === {:error, :not_found}
 
       # Nothing was left behind, so the corrected config starts.
       assert {:ok, _pid} = InfluxElixir.add_connection(name, batch_writer: [batch_size: 10])
@@ -148,7 +164,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
         assert InfluxElixir.add_connection(name, opts) === {:error, {:invalid_options, opts}}
       end
 
-      assert {:error, :not_found} = Connection.get(name)
+      assert Connection.get(name) === {:error, :not_found}
     end
   end
 
@@ -167,7 +183,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       :ok = InfluxElixir.remove_connection(name)
 
       # Should no longer be in the registry
-      assert {:error, :not_found} = Connection.get(name)
+      assert Connection.get(name) === {:error, :not_found}
     end
 
     test "fetch!/1 raises after connection is removed" do
@@ -201,13 +217,11 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       end
     end
 
-    test "a connection that fails to start leaves nothing registered" do
-      name = unique_name()
-
-      assert {:error, _reason} =
-               InfluxElixir.add_connection(name, batch_writer: [batch_size: 0])
-
-      assert Connection.get(name) === {:error, :not_found}
+    # The facade erased the name after any failed start, which raised for a name that is not
+    # an atom, and could erase a connection another call had started under the name since.
+    test "add_connection/2 with a name that is not an atom is an error, never a raise" do
+      assert {:error, {{:invalid_options, [name: "not an atom", host: "h"]}, _child}} =
+               InfluxElixir.add_connection("not an atom", host: "h")
     end
   end
 

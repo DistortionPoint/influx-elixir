@@ -5,12 +5,8 @@ defmodule InfluxElixir.Write.PointTest do
 
   describe "new/3" do
     test "creates a point with only measurement and fields" do
-      point = Point.new("cpu", %{"value" => 0.64})
-
-      assert point.measurement === "cpu"
-      assert point.fields === %{"value" => 0.64}
-      assert point.tags === %{}
-      assert point.timestamp === nil
+      assert Point.new("cpu", %{"value" => 0.64}) ===
+               %Point{measurement: "cpu", fields: %{"value" => 0.64}, tags: %{}, timestamp: nil}
     end
 
     test "creates a point with tags" do
@@ -19,55 +15,68 @@ defmodule InfluxElixir.Write.PointTest do
           tags: %{"host" => "server01", "region" => "us-east-1"}
         )
 
-      assert point.tags === %{"host" => "server01", "region" => "us-east-1"}
+      assert point ===
+               %Point{
+                 measurement: "cpu",
+                 fields: %{"value" => 1.0},
+                 tags: %{"host" => "server01", "region" => "us-east-1"},
+                 timestamp: nil
+               }
     end
 
     test "creates a point with integer timestamp" do
       point = Point.new("cpu", %{"value" => 1.0}, timestamp: 1_630_424_257_000_000_000)
-      assert point.timestamp === 1_630_424_257_000_000_000
+
+      assert point ===
+               %Point{
+                 measurement: "cpu",
+                 fields: %{"value" => 1.0},
+                 tags: %{},
+                 timestamp: 1_630_424_257_000_000_000
+               }
     end
 
     test "creates a point with DateTime timestamp" do
       dt = ~U[2021-08-31 16:37:37Z]
       point = Point.new("cpu", %{"value" => 1.0}, timestamp: dt)
-      assert point.timestamp === dt
-    end
 
-    test "defaults tags to empty map when not provided" do
-      point = Point.new("cpu", %{"v" => 1})
-      assert point.tags === %{}
-    end
-
-    test "defaults timestamp to nil when not provided" do
-      point = Point.new("cpu", %{"v" => 1})
-      assert point.timestamp === nil
+      assert point ===
+               %Point{measurement: "cpu", fields: %{"value" => 1.0}, tags: %{}, timestamp: dt}
     end
 
     test "accepts integer field values" do
-      point = Point.new("cpu", %{"count" => 42})
-      assert point.fields["count"] === 42
+      assert Point.new("cpu", %{"count" => 42}) ===
+               %Point{measurement: "cpu", fields: %{"count" => 42}, tags: %{}, timestamp: nil}
     end
 
     test "accepts boolean field values" do
-      point = Point.new("status", %{"active" => true})
-      assert point.fields["active"] === true
+      assert Point.new("status", %{"active" => true}) ===
+               %Point{
+                 measurement: "status",
+                 fields: %{"active" => true},
+                 tags: %{},
+                 timestamp: nil
+               }
     end
 
     test "accepts string field values" do
-      point = Point.new("event", %{"msg" => "hello world"})
-      assert point.fields["msg"] === "hello world"
+      assert Point.new("event", %{"msg" => "hello world"}) ===
+               %Point{
+                 measurement: "event",
+                 fields: %{"msg" => "hello world"},
+                 tags: %{},
+                 timestamp: nil
+               }
     end
 
-    test "raises ArgumentError when measurement is missing" do
-      assert_raise ArgumentError, fn ->
-        struct!(Point, fields: %{"v" => 1})
-      end
-    end
+    test "nil tags and nil fields are empty" do
+      assert Point.new("m", nil) === %Point{measurement: "m", fields: %{}, tags: %{}}
 
-    test "raises ArgumentError when fields is missing" do
-      assert_raise ArgumentError, fn ->
-        struct!(Point, measurement: "cpu")
-      end
+      assert Point.new("m", %{"f" => 1}, tags: nil) ===
+               %Point{measurement: "m", fields: %{"f" => 1}, tags: %{}}
+
+      assert Point.new("m", nil, tags: nil, timestamp: 5) ===
+               %Point{measurement: "m", fields: %{}, tags: %{}, timestamp: 5}
     end
   end
 end

@@ -27,6 +27,8 @@ defmodule InfluxElixir.Client.QueryParams do
       encode (a tuple, a pid, a function)
     * `{:invalid_param, name, :unsupported_key}` — a name that is not a
       string, an atom or a number (a tuple), or a string that is not UTF-8
+    * `{:invalid_param, name, :duplicate_key}` — two parameters with one name, such as
+      `[a: 1, a: 2]` or `%{:a => 1, "a" => 2}`
     * `{:invalid_param, name, :unsupported_params}` — `params:` itself is
       neither a map nor a keyword list
 
@@ -39,7 +41,11 @@ defmodule InfluxElixir.Client.QueryParams do
 
   @typedoc "Why a parameter cannot be sent."
   @type reason ::
-          :non_finite_decimal | :unsupported_type | :unsupported_key | :unsupported_params
+          :non_finite_decimal
+          | :unsupported_type
+          | :unsupported_key
+          | :duplicate_key
+          | :unsupported_params
 
   @typedoc "The error `normalize/1` returns: the parameter's name and why it is refused."
   @type error :: {:invalid_param, binary(), reason()}
@@ -65,6 +71,7 @@ defmodule InfluxElixir.Client.QueryParams do
     Enum.reduce_while(params, {:ok, %{}}, fn entry, {:ok, acc} ->
       with {:ok, key, value} <- entry(entry),
            {:ok, name} <- key_name(key),
+           :ok <- unique(acc, name),
            {:ok, json} <- encodable(name, value) do
         {:cont, {:ok, Map.put(acc, name, json)}}
       else
@@ -89,6 +96,14 @@ defmodule InfluxElixir.Client.QueryParams do
 
   defp key_name(key) when is_atom(key) or is_number(key), do: {:ok, to_string(key)}
   defp key_name(key), do: {:error, {:invalid_param, inspect(key), :unsupported_key}}
+
+  # Two entries with one name (`[a: 1, a: 2]`, or `%{:a => 1, "a" => 2}`) would send one of
+  # them, picked by the order of the entries.
+  @spec unique(t(), binary()) :: :ok | {:error, error()}
+  defp unique(acc, name) when is_map_key(acc, name),
+    do: {:error, {:invalid_param, name, :duplicate_key}}
+
+  defp unique(_acc, _name), do: :ok
 
   @spec encodable(binary(), term()) :: {:ok, term()} | {:error, error()}
   defp encodable(name, %{__struct__: Decimal, coef: coef}) when coef in [:NaN, :inf],
@@ -285,7 +300,11 @@ defmodule InfluxElixir.Client.QueryParams do
 
   @spec take_digits(binary()) :: {binary(), binary()}
   defp take_digits(text) do
-    size = text |> :binary.bin_to_list() |> Enum.take_while(&(&1 in ?0..?9)) |> length()
+    size = digits(text, 0)
     {binary_part(text, 0, size), binary_part(text, size, byte_size(text) - size)}
   end
+
+  @spec digits(binary(), non_neg_integer()) :: non_neg_integer()
+  defp digits(<<digit, rest::binary>>, size) when digit in ?0..?9, do: digits(rest, size + 1)
+  defp digits(_text, size), do: size
 end

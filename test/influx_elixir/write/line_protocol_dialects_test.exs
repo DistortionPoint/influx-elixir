@@ -6,7 +6,7 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.{HTTP, Local}
-  alias InfluxElixir.{Connection, TestServer, TestSupport}
+  alias InfluxElixir.{TestServer, TestSupport}
   alias InfluxElixir.Write.{BatchWriter, LineProtocol, Point}
 
   defp encode(point, opts \\ []), do: LineProtocol.encode(point, opts)
@@ -46,22 +46,35 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
       assert encode(point, api_version: :v2) === {:ok, ~S(m,t=a\\,b f=1i)}
     end
 
-    test "v2 refuses the names InfluxDB 2.7 cannot keep" do
-      measurement = ["a\\,b", "a\\ b", "a\\=b", ~S(a\"b), "\\,"]
-      field_key = ["a\\,b", "a\\ b", "a\\=b", "\\,"]
+    test "v2 refuses the names InfluxDB 2.7 cannot keep, which v3 writes escaped" do
+      # `{name, the line v3 writes for it}`
+      measurement = [
+        {"a\\,b", ~S(a\\\,b f=1i)},
+        {"a\\ b", ~S(a\\\ b f=1i)},
+        {"a\\=b", ~S(a\\=b f=1i)},
+        {~S(a\"b), ~S(a\\"b f=1i)},
+        {"\\,", ~S(\\\, f=1i)}
+      ]
 
-      for name <- measurement do
+      field_key = [
+        {"a\\,b", ~S(m a\\\,b=1i)},
+        {"a\\ b", ~S(m a\\\ b=1i)},
+        {"a\\=b", ~S(m a\\\=b=1i)},
+        {"\\,", ~S(m \\\,=1i)}
+      ]
+
+      for {name, v3_line} <- measurement do
         assert encode(Point.new(name, %{"f" => 1}), api_version: :v2) ===
                  {:error, {:invalid_measurement, name}}
 
-        assert {:ok, _line} = encode(Point.new(name, %{"f" => 1}), api_version: :v3)
+        assert encode(Point.new(name, %{"f" => 1}), api_version: :v3) === {:ok, v3_line}
       end
 
-      for name <- field_key do
+      for {name, v3_line} <- field_key do
         assert encode(Point.new("m", %{name => 1}), api_version: :v2) ===
                  {:error, {:invalid_field_key, name}}
 
-        assert {:ok, _line} = encode(Point.new("m", %{name => 1}), api_version: :v3)
+        assert encode(Point.new("m", %{name => 1}), api_version: :v3) === {:ok, v3_line}
       end
 
       # A backslash before a quote is fine in a field key (`f\\"` reads `f\"`) and in a tag.
@@ -118,56 +131,24 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
       assert encode(%Point{measurement: "m", fields: %{"f" => 1}, tags: nil}) === {:ok, "m f=1i"}
     end
 
+    test "a point built from nil fields is refused by the encoder, not raised on" do
+      assert encode(Point.new("m", nil)) === {:error, :empty_fields}
+      assert encode(Point.new("m", nil, tags: nil)) === {:error, :empty_fields}
+    end
+
     test "an empty list is an empty batch, and options are still read" do
       assert encode([]) === {:ok, ""}
       assert encode([], api_version: :v2) === {:ok, ""}
     end
 
     test "encode!/2 raises ArgumentError for every one of them" do
-      assert_raise ArgumentError, fn -> LineProtocol.encode!(:x) end
-      assert_raise ArgumentError, fn -> LineProtocol.encode!(Point.new("m", %{"f" => 1}), :x) end
-    end
-  end
+      assert_raise ArgumentError, "LineProtocol encode failed: {:invalid_point, :x}", fn ->
+        LineProtocol.encode!(:x)
+      end
 
-  describe "Point.new/3" do
-    test "nil tags and nil fields are empty" do
-      assert Point.new("m", nil) === %Point{measurement: "m", fields: %{}, tags: %{}}
-
-      assert Point.new("m", %{"f" => 1}, tags: nil) ===
-               %Point{measurement: "m", fields: %{"f" => 1}, tags: %{}}
-
-      assert Point.new("m", nil, tags: nil, timestamp: 5) ===
-               %Point{measurement: "m", fields: %{}, tags: %{}, timestamp: 5}
-    end
-
-    test "a point built from nil is refused by the encoder, not raised on" do
-      assert encode(Point.new("m", nil)) === {:error, :empty_fields}
-      assert encode(Point.new("m", nil, tags: nil)) === {:error, :empty_fields}
-    end
-  end
-
-  describe "Connection.api_version/1" do
-    test "reads a keyword connection, a Local connection and a registered name" do
-      assert Connection.api_version(host: "h", api_version: :v2) === :v2
-      assert Connection.api_version(host: "h", api_version: :v3) === :v3
-      assert Connection.api_version(host: "h") === :v3
-
-      {:ok, v2} = Local.start(profile: :v2)
-      {:ok, v3} = Local.start(profile: :v3_core)
-      assert Connection.api_version(v2) === :v2
-      assert Connection.api_version(v3) === :v3
-
-      name = :"fxi30_api_version_#{System.unique_integer([:positive])}"
-      Connection.put(name, host: "h", api_version: :v2)
-      on_exit(fn -> Connection.delete(name) end)
-      assert Connection.api_version(name) === :v2
-    end
-
-    test "anything else, an unregistered name included, is v3" do
-      assert Connection.api_version(:fxi30_not_registered) === :v3
-      assert Connection.api_version(nil) === :v3
-      assert Connection.api_version("host") === :v3
-      assert Connection.api_version([1, 2]) === :v3
+      assert_raise ArgumentError, "LineProtocol encode failed: {:invalid_options, :x}", fn ->
+        LineProtocol.encode!(Point.new("m", %{"f" => 1}), :x)
+      end
     end
   end
 
@@ -241,11 +222,25 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
     # Writes `point` at second `at` and returns the one row Flux reads back for that second.
     defp round_trip(conn, point, at) do
       {:ok, line} = encode(%{point | timestamp: at}, api_version: :v2)
-      assert {:ok, :written} = Local.write(conn, line, database: "b", precision: :second)
+      assert Local.write(conn, line, database: "b", precision: :second) === {:ok, :written}
 
       flux = ~s[from(bucket: "b") |> range(start: #{at}, stop: #{at + 1})]
       assert {:ok, [row]} = Local.query_flux(conn, flux, [])
       row
+    end
+
+    # The row Flux reads back for a point written at second `at`: the range is that second.
+    defp flux_row(at, measurement, field, value, tags) do
+      Map.merge(tags, %{
+        "result" => "_result",
+        "table" => 0,
+        "_start" => DateTime.from_unix!(at * 1_000_000, :microsecond),
+        "_stop" => DateTime.from_unix!((at + 1) * 1_000_000, :microsecond),
+        "_time" => DateTime.from_unix!(at * 1_000_000, :microsecond),
+        "_measurement" => measurement,
+        "_field" => field,
+        "_value" => value
+      })
     end
 
     test "a measurement", %{conn: conn} do
@@ -256,26 +251,30 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
           assert encode(point, api_version: :v2) ===
                    {:error, {:invalid_measurement, "m#{at}" <> s}}
         else
-          row = round_trip(conn, point, at)
-          assert row["_measurement"] === "m#{at}" <> s, "measurement #{inspect(s)}"
-          assert row["_value"] === 1
-          assert row["t"] === "v"
+          assert round_trip(conn, point, at) ===
+                   flux_row(at, "m#{at}" <> s, "f", 1, %{"t" => "v"}),
+                 "measurement #{inspect(s)}"
         end
       end
     end
 
     test "a tag value", %{conn: conn} do
       for {s, at} <- Enum.with_index(@strings, 2_000) do
-        row = round_trip(conn, Point.new("m#{at}", %{"f" => 1}, tags: %{"t" => "v" <> s}), at)
-        assert row["t"] === "v" <> s, "tag value #{inspect(s)}"
-        assert row["_measurement"] === "m#{at}"
+        tags = %{"t" => "v" <> s}
+        point = Point.new("m#{at}", %{"f" => 1}, tags: tags)
+
+        assert round_trip(conn, point, at) === flux_row(at, "m#{at}", "f", 1, tags),
+               "tag value #{inspect(s)}"
       end
     end
 
     test "a tag key", %{conn: conn} do
       for {s, at} <- Enum.with_index(@strings, 3_000) do
-        row = round_trip(conn, Point.new("m#{at}", %{"f" => 1}, tags: %{("k" <> s) => "v"}), at)
-        assert row["k" <> s] === "v", "tag key #{inspect(s)}"
+        tags = %{("k" <> s) => "v"}
+        point = Point.new("m#{at}", %{"f" => 1}, tags: tags)
+
+        assert round_trip(conn, point, at) === flux_row(at, "m#{at}", "f", 1, tags),
+               "tag key #{inspect(s)}"
       end
     end
 
@@ -286,17 +285,18 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
         if s in @unkeepable_field_keys do
           assert encode(point, api_version: :v2) === {:error, {:invalid_field_key, "f" <> s}}
         else
-          row = round_trip(conn, point, at)
-          assert row["_field"] === "f" <> s, "field key #{inspect(s)}"
-          assert row["_value"] === 1
+          assert round_trip(conn, point, at) === flux_row(at, "m#{at}", "f" <> s, 1, %{}),
+                 "field key #{inspect(s)}"
         end
       end
     end
 
     test "a string field value", %{conn: conn} do
       for {s, at} <- Enum.with_index(@strings, 5_000) do
-        row = round_trip(conn, Point.new("m#{at}", %{"f" => "x" <> s}), at)
-        assert row["_value"] === "x" <> s, "string value #{inspect(s)}"
+        point = Point.new("m#{at}", %{"f" => "x" <> s})
+
+        assert round_trip(conn, point, at) === flux_row(at, "m#{at}", "f", "x" <> s, %{}),
+               "string value #{inspect(s)}"
       end
     end
 
@@ -306,8 +306,8 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
       # The unescape of an unescaped backslash used to copy the rest of the text at each one:
       # 200,000 of them took seconds. The value is read back whole.
       value = String.duplicate("\\x", 50_000)
-      row = round_trip(conn, Point.new("m", %{"f" => 1}, tags: %{"t" => value}), 7_000)
-      assert row["t"] === value
+      point = Point.new("m", %{"f" => 1}, tags: %{"t" => value})
+      assert round_trip(conn, point, 7_000) === flux_row(7_000, "m", "f", 1, %{"t" => value})
     end
   end
 
@@ -318,15 +318,27 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
     end
 
     test "a tag value and a string field keep their backslashes", %{conn: conn} do
-      for {s, at} <- Enum.with_index(["a\\b", "a\\\\b", "a\\,b", "a\\ b", "a\\=b", "\\\\x"], 1) do
+      # `{value, how v3 writes it as a tag value, how it writes it inside a string field}`
+      strings = [
+        {~S(a\b), ~S(a\\b), ~S(a\\b)},
+        {~S(a\\b), ~S(a\\\\b), ~S(a\\\\b)},
+        {~S(a\,b), ~S(a\\\,b), ~S(a\\,b)},
+        {~S(a\ b), ~S(a\\\ b), ~S(a\\ b)},
+        {~S(a\=b), ~S(a\\\=b), ~S(a\\=b)},
+        {~S(\\x), ~S(\\\\x), ~S(\\\\x)}
+      ]
+
+      for {{s, tag, string}, at} <- Enum.with_index(strings, 1) do
         point = Point.new("m#{at}", %{"f" => "x" <> s}, tags: %{"t" => "v" <> s}, timestamp: at)
-        assert {:ok, line} = encode(point, api_version: :v3, precision: :second)
-        assert {:ok, :written} = Local.write(conn, line, database: "db", precision: :second)
 
-        assert {:ok, [%{"t" => tag, "f" => field}]} =
-                 Local.query_sql(conn, "SELECT t, f FROM m#{at}", database: "db")
+        assert encode(point, api_version: :v3, precision: :second) ===
+                 {:ok, ~s(m#{at},t=v#{tag} f="x#{string}" #{at})}
 
-        assert {tag, field} === {"v" <> s, "x" <> s}
+        line = ~s(m#{at},t=v#{tag} f="x#{string}" #{at})
+        assert Local.write(conn, line, database: "db", precision: :second) === {:ok, :written}
+
+        assert Local.query_sql(conn, "SELECT t, f FROM m#{at}", database: "db") ===
+                 {:ok, [%{"t" => "v" <> s, "f" => "x" <> s}]}
       end
     end
   end
@@ -380,13 +392,15 @@ defmodule InfluxElixir.Write.LineProtocolDialectsTest do
 
         point = Point.new("m", %{"a" => 1}, tags: %{"t" => "a\\b"}, timestamp: 1)
 
-        assert BatchWriter.write(writer, point) ===
-                 :ok
+        assert BatchWriter.write(writer, point) === :ok
 
         assert_receive {:body, body}, TestSupport.Await.bound()
         assert body === unquote(expected)
         :ok = BatchWriter.flush(writer)
-        assert {:ok, %{total_writes: 1}} = BatchWriter.stats(writer)
+
+        assert BatchWriter.stats(writer) ===
+                 {:ok,
+                  %{total_writes: 1, total_errors: 0, total_bytes: byte_size(unquote(expected))}}
       end
     end
   end

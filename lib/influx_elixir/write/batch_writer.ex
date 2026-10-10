@@ -698,12 +698,9 @@ defmodule InfluxElixir.Write.BatchWriter do
     }
   end
 
-  # The newlines of a payload, one more for the last line, none for a trailing newline.
+  # The lines of a payload (see `Options.line_count/1`), at least one.
   @spec line_count(binary()) :: pos_integer()
-  defp line_count(payload) do
-    newlines = length(:binary.matches(payload, "\n"))
-    max(if(String.ends_with?(payload, "\n"), do: newlines, else: newlines + 1), 1)
-  end
+  defp line_count(payload), do: max(Options.line_count(payload), 1)
 
   # A batch-size flush is deferred while a batch is in flight or being retried; the
   # buffer keeps filling up to the backpressure bound instead.

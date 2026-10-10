@@ -424,7 +424,8 @@ defmodule InfluxElixir do
 
   Returns `:ok` once the payload is buffered. Other results:
 
-    * `{:error, :no_batch_writer}` - the connection has no writer running
+    * `{:error, :no_batch_writer}` - the connection has no writer running, or its writer
+      stopped (the connection was removed) before it took this call
     * `{:error, :buffer_full}` - the writer holds as much as it admits while a
       batch is being retried
     * `{:error, reason}` - a point that cannot be encoded, a payload that is
@@ -490,8 +491,14 @@ defmodule InfluxElixir do
     with_batch_writer(connection_name, &BatchWriter.stats(&1, timeout))
   end
 
+  # A process that is gone, or stopped as a supervisor stops it, rather than one that crashed.
+  defguardp stopped(reason)
+            when reason in [:noproc, :normal, :shutdown] or
+                   (is_tuple(reason) and tuple_size(reason) == 2 and elem(reason, 0) == :shutdown)
+
   # Runs `fun` with the connection's batch writer, if it has one. A writer that stops between
-  # the lookup and the call is no writer.
+  # the lookup and the call, or with the call in its mailbox (it answers the calls it has taken
+  # before it stops), is no writer. A timeout is the caller's bound, and exits as documented.
   @spec with_batch_writer(atom(), (atom() -> result)) :: result | {:error, :no_batch_writer}
         when result: term()
   defp with_batch_writer(connection_name, fun) do
@@ -501,7 +508,8 @@ defmodule InfluxElixir do
       try do
         fun.(writer)
       catch
-        :exit, {:noproc, _call} -> {:error, :no_batch_writer}
+        :exit, {reason, {GenServer, :call, _args}} when stopped(reason) ->
+          {:error, :no_batch_writer}
       end
     else
       {:error, :no_batch_writer}
@@ -535,22 +543,11 @@ defmodule InfluxElixir do
         id: {InfluxElixir.ConnectionSupervisor, name}
       )
 
-    # A name already running keeps its registration; any other failure
-    # releases what `ConnectionSupervisor.init/1` set up.
-    case Supervisor.start_child(InfluxElixir.Supervisor, child_spec) do
-      {:error, {:already_started, _pid}} = error ->
-        error
-
-      {:error, :already_present} = error ->
-        error
-
-      {:error, _reason} = error ->
-        release_connection(name)
-        error
-
-      started ->
-        started
-    end
+    # A connection that fails to start has released what it set up: the client's error
+    # registered nothing, and the registration a child's failure stopped took itself down.
+    # Erasing the name here as well could erase another call's connection, started under the
+    # same name in the meantime.
+    Supervisor.start_child(InfluxElixir.Supervisor, child_spec)
   end
 
   @doc """
@@ -564,19 +561,10 @@ defmodule InfluxElixir do
     child_id = {InfluxElixir.ConnectionSupervisor, name}
 
     case Supervisor.terminate_child(InfluxElixir.Supervisor, child_id) do
-      :ok ->
-        result = Supervisor.delete_child(InfluxElixir.Supervisor, child_id)
-        release_connection(name)
-        result
-
-      {:error, reason} ->
-        {:error, reason}
+      # The supervisor's first child erased the name and released the client's state (the ETS
+      # store of `Client.Local`) as the supervisor stopped.
+      :ok -> Supervisor.delete_child(InfluxElixir.Supervisor, child_id)
+      {:error, reason} -> {:error, reason}
     end
   end
-
-  # The supervisor's first child, `Registration`, erases the name and releases the client's
-  # state (the ETS store of `Client.Local`) as the supervisor stops, whether it stopped or
-  # failed to start the rest; the name is deleted here too, which is nothing when it did.
-  @spec release_connection(atom()) :: :ok
-  defp release_connection(name), do: InfluxElixir.Connection.delete(name)
 end

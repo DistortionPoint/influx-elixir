@@ -32,4 +32,24 @@ defmodule InfluxElixir.Client.Options do
   def database(connection) when is_list(connection) do
     if keyword?(connection), do: Keyword.get(connection, :database)
   end
+
+  @doc false
+  # The lines of a write body: its newlines, one more for the last line, none for a trailing
+  # newline. One scan for each newline, holding nothing but the count: the write path and the
+  # batch writer count every payload.
+  @spec line_count(binary()) :: non_neg_integer()
+  def line_count(""), do: 0
+
+  def line_count(text) when is_binary(text) do
+    newlines = newlines(text, 0, 0)
+    if :binary.last(text) == ?\n, do: newlines, else: newlines + 1
+  end
+
+  @spec newlines(binary(), non_neg_integer(), non_neg_integer()) :: non_neg_integer()
+  defp newlines(text, from, count) do
+    case :binary.match(text, "\n", scope: {from, byte_size(text) - from}) do
+      {at, 1} -> newlines(text, at + 1, count + 1)
+      :nomatch -> count
+    end
+  end
 end

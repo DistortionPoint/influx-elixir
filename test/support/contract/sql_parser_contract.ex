@@ -3919,6 +3919,15 @@ defmodule InfluxElixir.Contract.SQLParser do
           assert sp_query(ctx, "select 1", p: self()) ===
                    {:error, {:invalid_param, "p", :unsupported_type}}
         end
+
+        # One of the two would be sent, picked by the order of the entries.
+        test "two parameters with one name are refused", ctx do
+          assert sp_query(ctx, "select $a", a: 1, a: 2) ===
+                   {:error, {:invalid_param, "a", :duplicate_key}}
+
+          assert sp_query(ctx, "select $a", %{:a => 1, "a" => 2}) ===
+                   {:error, {:invalid_param, "a", :duplicate_key}}
+        end
       end
     end
   end

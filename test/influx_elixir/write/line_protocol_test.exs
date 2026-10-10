@@ -6,45 +6,37 @@ defmodule InfluxElixir.Write.LineProtocolTest do
   describe "encode/1 — basic encoding" do
     test "encodes a minimal point with float field" do
       point = Point.new("cpu", %{"value" => 0.64})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "cpu value=0.64"
+      assert LineProtocol.encode(point) === {:ok, "cpu value=0.64"}
     end
 
     test "encodes a point with integer field (i suffix)" do
       point = Point.new("cpu", %{"count" => 42})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "cpu count=42i"
+      assert LineProtocol.encode(point) === {:ok, "cpu count=42i"}
     end
 
     test "encodes a point with boolean true field" do
       point = Point.new("status", %{"active" => true})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "status active=true"
+      assert LineProtocol.encode(point) === {:ok, "status active=true"}
     end
 
     test "encodes a point with boolean false field" do
       point = Point.new("status", %{"active" => false})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "status active=false"
+      assert LineProtocol.encode(point) === {:ok, "status active=false"}
     end
 
     test "encodes a point with string field (double-quoted)" do
       point = Point.new("event", %{"msg" => "hello"})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === ~s(event msg="hello")
+      assert LineProtocol.encode(point) === {:ok, ~s(event msg="hello")}
     end
 
     test "encodes a point with integer timestamp" do
       point = Point.new("cpu", %{"value" => 1.0}, timestamp: 1_630_424_257_000_000_000)
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "cpu value=1.0 1630424257000000000"
+      assert LineProtocol.encode(point) === {:ok, "cpu value=1.0 1630424257000000000"}
     end
 
-    test "encodes a point with DateTime timestamp" do
-      dt = ~U[2021-08-31 16:37:37Z]
-      point = Point.new("cpu", %{"value" => 1.0}, timestamp: dt)
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert String.ends_with?(lp, "#{DateTime.to_unix(dt, :nanosecond)}")
+    test "encodes a point with DateTime timestamp in nanoseconds" do
+      point = Point.new("cpu", %{"value" => 1.0}, timestamp: ~U[2021-08-31 16:37:37Z])
+      assert LineProtocol.encode(point) === {:ok, "cpu value=1.0 1630427857000000000"}
     end
 
     test "a DateTime is written in the write's precision, truncated toward the past" do
@@ -60,156 +52,131 @@ defmodule InfluxElixir.Write.LineProtocolTest do
             {:nanosecond, "1790596800123456000"},
             {:auto, "1790596800123456000"}
           ] do
-        assert {:ok, "cpu v=1i " <> ^ts} = LineProtocol.encode(point, precision: precision)
+        assert LineProtocol.encode(point, precision: precision) === {:ok, "cpu v=1i " <> ts}
       end
 
       # Before 1970, truncating toward zero would move the time forward.
       early = Point.new("cpu", %{"v" => 1}, timestamp: ~U[1969-12-31 23:59:59.500Z])
-      assert {:ok, "cpu v=1i -1"} = LineProtocol.encode(early, precision: :second)
+      assert LineProtocol.encode(early, precision: :second) === {:ok, "cpu v=1i -1"}
     end
 
     test "an integer timestamp is already in the caller's unit, whatever the precision" do
       point = Point.new("cpu", %{"v" => 1}, timestamp: 1_790_596_800)
-      assert {:ok, "cpu v=1i 1790596800"} = LineProtocol.encode(point, precision: :second)
+      assert LineProtocol.encode(point, precision: :second) === {:ok, "cpu v=1i 1790596800"}
     end
 
     test "omits timestamp when nil" do
       point = Point.new("cpu", %{"value" => 1.0})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      refute String.contains?(lp, " 1")
+      assert LineProtocol.encode(point) === {:ok, "cpu value=1.0"}
     end
   end
 
   describe "encode/1 — tags" do
     test "encodes a single tag" do
       point = Point.new("cpu", %{"v" => 1.0}, tags: %{"host" => "server01"})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "cpu,host=server01 v=1.0"
+      assert LineProtocol.encode(point) === {:ok, "cpu,host=server01 v=1.0"}
     end
 
     test "sorts tags lexicographically by key" do
       point =
         Point.new("cpu", %{"v" => 1.0}, tags: %{"zone" => "a", "host" => "b", "app" => "c"})
 
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert String.starts_with?(lp, "cpu,app=c,host=b,zone=a ")
+      assert LineProtocol.encode(point) === {:ok, "cpu,app=c,host=b,zone=a v=1.0"}
     end
 
     test "encodes multiple tags" do
       point =
         Point.new("cpu", %{"v" => 1.0}, tags: %{"host" => "s1", "region" => "us-east"})
 
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "cpu,host=s1,region=us-east v=1.0"
+      assert LineProtocol.encode(point) === {:ok, "cpu,host=s1,region=us-east v=1.0"}
     end
   end
 
   describe "encode/1 — escaping" do
     test "escapes spaces in measurement name" do
       point = Point.new("my measurement", %{"v" => 1.0})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert String.starts_with?(lp, "my\\ measurement")
+      assert LineProtocol.encode(point) === {:ok, "my\\ measurement v=1.0"}
     end
 
     test "escapes commas in measurement name" do
       point = Point.new("my,measurement", %{"v" => 1.0})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert String.starts_with?(lp, "my\\,measurement")
+      assert LineProtocol.encode(point) === {:ok, "my\\,measurement v=1.0"}
     end
 
     test "escapes spaces in tag keys" do
       point = Point.new("cpu", %{"v" => 1.0}, tags: %{"my key" => "val"})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp =~ "my\\ key=val"
+      assert LineProtocol.encode(point) === {:ok, "cpu,my\\ key=val v=1.0"}
     end
 
     test "escapes equals in tag keys" do
       point = Point.new("cpu", %{"v" => 1.0}, tags: %{"k=ey" => "val"})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp =~ "k\\=ey=val"
+      assert LineProtocol.encode(point) === {:ok, "cpu,k\\=ey=val v=1.0"}
     end
 
     test "escapes commas in tag values" do
       point = Point.new("cpu", %{"v" => 1.0}, tags: %{"host" => "a,b"})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp =~ "host=a\\,b"
+      assert LineProtocol.encode(point) === {:ok, "cpu,host=a\\,b v=1.0"}
     end
 
     test "escapes spaces in tag values" do
       point = Point.new("cpu", %{"v" => 1.0}, tags: %{"host" => "a b"})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp =~ "host=a\\ b"
+      assert LineProtocol.encode(point) === {:ok, "cpu,host=a\\ b v=1.0"}
     end
 
     test "escapes backslashes in measurement" do
       point = Point.new("my\\measurement", %{"v" => 1.0})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert String.starts_with?(lp, "my\\\\measurement")
+      assert LineProtocol.encode(point) === {:ok, "my\\\\measurement v=1.0"}
     end
 
     test "escapes double-quotes in string field values" do
       point = Point.new("event", %{"msg" => ~s(say "hi")})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp =~ ~s(msg="say \\"hi\\"")
+      assert LineProtocol.encode(point) === {:ok, ~s(event msg="say \\"hi\\"")}
     end
 
     test "escapes backslashes in string field values" do
       point = Point.new("event", %{"path" => "C:\\Users"})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp =~ ~s(path="C:\\\\Users")
+      assert LineProtocol.encode(point) === {:ok, ~s(event path="C:\\\\Users")}
     end
 
     test "each kind of text escapes only its own bytes, beside multi-byte characters" do
       point =
         Point.new("m=é, ü", %{"f é=, k" => ~s(v é,= "q" \\ x)}, tags: %{"t é=, k" => "v ü=, x"})
 
-      assert {:ok, lp} = LineProtocol.encode(point)
-
-      assert lp ===
-               ~S(m=é\,\ ü,t\ é\=\,\ k=v\ ü\=\,\ x f\ é\=\,\ k="v é,= \"q\" \\ x")
+      assert LineProtocol.encode(point) ===
+               {:ok, ~S(m=é\,\ ü,t\ é\=\,\ k=v\ ü\=\,\ x f\ é\=\,\ k="v é,= \"q\" \\ x")}
     end
   end
 
   describe "encode/1 — field types" do
     test "large integer retains i suffix" do
-      large_int = 9_007_199_254_740_993
-      point = Point.new("cpu", %{"big" => large_int})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "cpu big=#{large_int}i"
+      point = Point.new("cpu", %{"big" => 9_007_199_254_740_993})
+      assert LineProtocol.encode(point) === {:ok, "cpu big=9007199254740993i"}
     end
 
-    test "very large integer (beyond 2^53) round-trips" do
-      # 2^63 - 1 (max int64)
-      max_int64 = 9_223_372_036_854_775_807
-      point = Point.new("cpu", %{"max" => max_int64})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "cpu max=#{max_int64}i"
+    test "the largest int64 is written in full with the i suffix" do
+      point = Point.new("cpu", %{"max" => 9_223_372_036_854_775_807})
+      assert LineProtocol.encode(point) === {:ok, "cpu max=9223372036854775807i"}
     end
 
     test "negative integer gets i suffix" do
       point = Point.new("cpu", %{"delta" => -5})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "cpu delta=-5i"
+      assert LineProtocol.encode(point) === {:ok, "cpu delta=-5i"}
     end
 
     test "zero integer gets i suffix" do
       point = Point.new("cpu", %{"count" => 0})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "cpu count=0i"
+      assert LineProtocol.encode(point) === {:ok, "cpu count=0i"}
     end
 
     test "float 0.64 is encoded as-is" do
       point = Point.new("cpu", %{"v" => 0.64})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp =~ "v=0.64"
+      assert LineProtocol.encode(point) === {:ok, "cpu v=0.64"}
     end
 
     test "encodes multiple fields" do
       point = Point.new("cpu", %{"int_v" => 1, "float_v" => 2.0, "bool_v" => true})
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp =~ "int_v=1i"
-      assert lp =~ "float_v=2.0"
-      assert lp =~ "bool_v=true"
+      # Map iteration order of the three keys is the sorted key order for small maps.
+      assert LineProtocol.encode(point) === {:ok, "cpu bool_v=true,float_v=2.0,int_v=1i"}
     end
   end
 
@@ -221,8 +188,8 @@ defmodule InfluxElixir.Write.LineProtocolTest do
           timestamp: 1_630_424_257_000_000_000
         )
 
-      assert {:ok, lp} = LineProtocol.encode(point)
-      assert lp === "cpu,host=server01 value=0.64 1630424257000000000"
+      assert LineProtocol.encode(point) ===
+               {:ok, "cpu,host=server01 value=0.64 1630424257000000000"}
     end
   end
 
@@ -230,17 +197,17 @@ defmodule InfluxElixir.Write.LineProtocolTest do
     test "returns {:error, :empty_fields} when fields map is empty" do
       # Use struct directly to bypass new/3 since it doesn't validate
       point = %Point{measurement: "cpu", fields: %{}}
-      assert {:error, :empty_fields} = LineProtocol.encode(point)
+      assert LineProtocol.encode(point) === {:error, :empty_fields}
     end
 
     test "returns {:error, :empty_measurement} for empty measurement" do
       point = %Point{measurement: "", fields: %{"v" => 1.0}}
-      assert {:error, :empty_measurement} = LineProtocol.encode(point)
+      assert LineProtocol.encode(point) === {:error, :empty_measurement}
     end
 
-    test "returns {:error, {:invalid_timestamp, _}} for invalid timestamp" do
+    test "returns {:error, {:invalid_timestamp, value}} for invalid timestamp" do
       point = %Point{measurement: "cpu", fields: %{"v" => 1.0}, timestamp: "bad"}
-      assert {:error, {:invalid_timestamp, "bad"}} = LineProtocol.encode(point)
+      assert LineProtocol.encode(point) === {:error, {:invalid_timestamp, "bad"}}
     end
   end
 
@@ -250,11 +217,11 @@ defmodule InfluxElixir.Write.LineProtocolTest do
   # (docs/design/2026-09-22_encoder-validation-and-reserved-time.md).
   describe "encode/1 — refuses what no server accepts" do
     test "an empty, non-string or newline-carrying measurement" do
-      assert {:error, {:invalid_measurement, "a\nb"}} =
-               LineProtocol.encode(%Point{measurement: "a\nb", fields: %{"v" => 1}})
+      newline = %Point{measurement: "a\nb", fields: %{"v" => 1}}
+      atom = %Point{measurement: :cpu, fields: %{"v" => 1}}
 
-      assert {:error, {:invalid_measurement, :cpu}} =
-               LineProtocol.encode(%Point{measurement: :cpu, fields: %{"v" => 1}})
+      assert LineProtocol.encode(newline) === {:error, {:invalid_measurement, "a\nb"}}
+      assert LineProtocol.encode(atom) === {:error, {:invalid_measurement, :cpu}}
     end
 
     test "an empty, non-string or newline-carrying tag key or value" do
@@ -267,84 +234,83 @@ defmodule InfluxElixir.Write.LineProtocolTest do
             {%{"host" => 1}, {:invalid_tag_value, "host", 1}}
           ] do
         point = Point.new("cpu", %{"v" => 1}, tags: tags)
-        assert {:error, ^error} = LineProtocol.encode(point)
+        assert LineProtocol.encode(point) === {:error, error}
       end
     end
 
     test "time as a tag key is reserved on every InfluxDB version" do
       point = Point.new("cpu", %{"v" => 1}, tags: %{"time" => "x"})
-      assert {:error, {:reserved_tag_key, "time"}} = LineProtocol.encode(point)
+      assert LineProtocol.encode(point) === {:error, {:reserved_tag_key, "time"}}
     end
 
     test "an empty, non-string or newline-carrying field key" do
       for key <- ["", "a\nb", :v] do
-        assert {:error, {:invalid_field_key, ^key}} =
-                 LineProtocol.encode(Point.new("cpu", %{key => 1}))
+        point = Point.new("cpu", %{key => 1})
+        assert LineProtocol.encode(point) === {:error, {:invalid_field_key, key}}
       end
     end
 
     test "a field value that is not an integer, float, string or boolean" do
       for value <- [nil, :up, [1], %{}, Decimal.new("1.5")] do
-        assert {:error, {:invalid_field_value, "v", ^value}} =
-                 LineProtocol.encode(Point.new("cpu", %{"v" => value}))
+        point = Point.new("cpu", %{"v" => value})
+        assert LineProtocol.encode(point) === {:error, {:invalid_field_value, "v", value}}
       end
     end
 
     test "an integer outside 64 bits; the int64 bounds themselves encode" do
       for value <- [9_223_372_036_854_775_808, -9_223_372_036_854_775_809] do
-        assert {:error, {:invalid_field_value, "v", ^value}} =
-                 LineProtocol.encode(Point.new("cpu", %{"v" => value}))
+        point = Point.new("cpu", %{"v" => value})
+        assert LineProtocol.encode(point) === {:error, {:invalid_field_value, "v", value}}
       end
 
-      assert {:ok, "cpu v=-9223372036854775808i"} =
-               LineProtocol.encode(Point.new("cpu", %{"v" => -9_223_372_036_854_775_808}))
+      min_point = Point.new("cpu", %{"v" => -9_223_372_036_854_775_808})
+      assert LineProtocol.encode(min_point) === {:ok, "cpu v=-9223372036854775808i"}
     end
 
     test "a measurement starting with # is a comment line to the server" do
-      assert {:error, {:invalid_measurement, "#cpu"}} =
-               LineProtocol.encode(Point.new("#cpu", %{"v" => 1}))
+      comment = Point.new("#cpu", %{"v" => 1})
+      assert LineProtocol.encode(comment) === {:error, {:invalid_measurement, "#cpu"}}
 
       # Anywhere else, and in a tag value, # is an ordinary character.
-      assert {:ok, "c#pu,h=#a v=1i"} =
-               LineProtocol.encode(Point.new("c#pu", %{"v" => 1}, tags: %{"h" => "#a"}))
+      ordinary = Point.new("c#pu", %{"v" => 1}, tags: %{"h" => "#a"})
+      assert LineProtocol.encode(ordinary) === {:ok, "c#pu,h=#a v=1i"}
     end
 
     test "a name ending in a backslash, which both versions refuse even escaped" do
-      assert {:error, {:invalid_measurement, "cpu\\"}} =
-               LineProtocol.encode(Point.new("cpu\\", %{"v" => 1}))
+      measurement = Point.new("cpu\\", %{"v" => 1})
+      tag_key = Point.new("cpu", %{"v" => 1}, tags: %{"h\\" => "a"})
+      tag_value = Point.new("cpu", %{"v" => 1}, tags: %{"h" => "a\\\\"})
+      field_key = Point.new("cpu", %{"v\\" => 1})
 
-      assert {:error, {:invalid_tag_key, "h\\"}} =
-               LineProtocol.encode(Point.new("cpu", %{"v" => 1}, tags: %{"h\\" => "a"}))
-
-      assert {:error, {:invalid_tag_value, "h", "a\\\\"}} =
-               LineProtocol.encode(Point.new("cpu", %{"v" => 1}, tags: %{"h" => "a\\\\"}))
-
-      assert {:error, {:invalid_field_key, "v\\"}} =
-               LineProtocol.encode(Point.new("cpu", %{"v\\" => 1}))
+      assert LineProtocol.encode(measurement) === {:error, {:invalid_measurement, "cpu\\"}}
+      assert LineProtocol.encode(tag_key) === {:error, {:invalid_tag_key, "h\\"}}
+      assert LineProtocol.encode(tag_value) === {:error, {:invalid_tag_value, "h", "a\\\\"}}
+      assert LineProtocol.encode(field_key) === {:error, {:invalid_field_key, "v\\"}}
 
       # Inside a name, or at the end of a string value, it is escaped and fine.
-      assert {:ok, ~S|cpu,h=a\\b s="x\\"|} =
-               LineProtocol.encode(Point.new("cpu", %{"s" => "x\\"}, tags: %{"h" => "a\\b"}))
+      inside = Point.new("cpu", %{"s" => "x\\"}, tags: %{"h" => "a\\b"})
+      assert LineProtocol.encode(inside) === {:ok, ~S|cpu,h=a\\b s="x\\"|}
     end
 
     test "a newline inside a string field value is quoted and accepted" do
-      assert {:ok, ~s|cpu s="a\nb"|} = LineProtocol.encode(Point.new("cpu", %{"s" => "a\nb"}))
+      point = Point.new("cpu", %{"s" => "a\nb"})
+      assert LineProtocol.encode(point) === {:ok, ~s|cpu s="a\nb"|}
     end
 
     test "a field named time is left to the server" do
-      assert {:ok, "cpu time=1i"} = LineProtocol.encode(Point.new("cpu", %{"time" => 1}))
+      point = Point.new("cpu", %{"time" => 1})
+      assert LineProtocol.encode(point) === {:ok, "cpu time=1i"}
     end
   end
 
   describe "encode/1 — list of points" do
     test "encodes an empty list to empty string" do
-      assert {:ok, ""} = LineProtocol.encode([])
+      assert LineProtocol.encode([]) === {:ok, ""}
     end
 
     test "encodes a single-element list" do
       point = Point.new("cpu", %{"v" => 1.0})
-      assert {:ok, lp} = LineProtocol.encode([point])
-      assert lp === "cpu v=1.0"
+      assert LineProtocol.encode([point]) === {:ok, "cpu v=1.0"}
     end
 
     test "encodes multiple points as newline-delimited" do
@@ -353,11 +319,7 @@ defmodule InfluxElixir.Write.LineProtocolTest do
         Point.new("mem", %{"free" => 512})
       ]
 
-      assert {:ok, lp} = LineProtocol.encode(points)
-      lines = String.split(lp, "\n")
-      assert length(lines) === 2
-      assert Enum.at(lines, 0) === "cpu v=1.0"
-      assert Enum.at(lines, 1) === "mem free=512i"
+      assert LineProtocol.encode(points) === {:ok, "cpu v=1.0\nmem free=512i"}
     end
 
     test "returns error when any point in list is invalid" do
@@ -366,7 +328,7 @@ defmodule InfluxElixir.Write.LineProtocolTest do
         %Point{measurement: "mem", fields: %{}}
       ]
 
-      assert {:error, :empty_fields} = LineProtocol.encode(points)
+      assert LineProtocol.encode(points) === {:error, :empty_fields}
     end
   end
 
@@ -375,20 +337,22 @@ defmodule InfluxElixir.Write.LineProtocolTest do
     # used so no precision is lost. Verified against InfluxDB 3 Core: these
     # exact literals write and read back as the same floats.
     test "large float keeps a decimal separator or exponent" do
-      assert {:ok, "cpu big=1.0e17"} = LineProtocol.encode(Point.new("cpu", %{"big" => 1.0e17}))
+      point = Point.new("cpu", %{"big" => 1.0e17})
+      assert LineProtocol.encode(point) === {:ok, "cpu big=1.0e17"}
     end
 
     test "tiny float is not rounded to zero" do
       # {:decimals, 17} formatting previously produced "0.0" here.
-      assert {:ok, "cpu tiny=1.0e-20"} =
-               LineProtocol.encode(Point.new("cpu", %{"tiny" => 1.0e-20}))
+      tiny = Point.new("cpu", %{"tiny" => 1.0e-20})
+      small = Point.new("cpu", %{"small" => 2.5e-7})
 
-      assert {:ok, "cpu small=2.5e-7"} =
-               LineProtocol.encode(Point.new("cpu", %{"small" => 2.5e-7}))
+      assert LineProtocol.encode(tiny) === {:ok, "cpu tiny=1.0e-20"}
+      assert LineProtocol.encode(small) === {:ok, "cpu small=2.5e-7"}
     end
 
     test "float precision round-trips exactly" do
       value = 123_456_789.123456789
+      # The digits are Erlang's shortest round-trip form; the invariant is the exact float.
       assert {:ok, "cpu v=" <> encoded} = LineProtocol.encode(Point.new("cpu", %{"v" => value}))
       assert String.to_float(encoded) === value
     end
@@ -403,7 +367,7 @@ defmodule InfluxElixir.Write.LineProtocolTest do
     test "raises ArgumentError on failure" do
       point = %Point{measurement: "cpu", fields: %{}}
 
-      assert_raise ArgumentError, ~r/LineProtocol encode failed/, fn ->
+      assert_raise ArgumentError, "LineProtocol encode failed: :empty_fields", fn ->
         LineProtocol.encode!(point)
       end
     end

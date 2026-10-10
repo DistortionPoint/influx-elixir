@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Connections, the batch writer facade and query parameters** (design document
+  `2026-10-10_review-of-connections.md`):
+  - `finch_name: nil` starts the connection's own Finch pool, which the HTTP client then
+    uses. It used to start none, so every request failed with no pool.
+  - A connection's registration is made and released by the connection's supervisor alone.
+    `add_connection/2` erased the name after a failed start and `remove_connection/1` after
+    a removal, which could erase a connection another call had just started under the same
+    name, and raised for a name that is not an atom. The release shuts down the connection
+    it registered with the client that made it, even if the name was erased or the
+    configured client changed in the meantime.
+  - `flush/2`, `stats/2` and `write_batched/3` return `{:error, :no_batch_writer}` when the
+    writer stops with the call still waiting in its mailbox. They used to exit the caller.
+  - Two query parameters with one name (`[a: 1, a: 2]`, `%{:a => 1, "a" => 2}`) are
+    `{:error, {:invalid_param, "a", :duplicate_key}}`. One of them used to be sent, picked
+    by the order of the entries.
+  - The line count of each write and batch is one scan that builds no list.
+  - `LineProtocol`'s docs listed `=` and `"` among the characters a v2 measurement escapes;
+    it escapes only spaces and commas, as the code does.
 - **`Client.Local`'s buckets, writes and stopped connections** (design document
   `2026-10-10_review-of-local-store-and-writes.md`):
   - `create_bucket` answers `retention:` as InfluxDB 2.7 does. A negative value is its 422,

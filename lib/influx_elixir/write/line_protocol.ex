@@ -32,7 +32,7 @@ defmodule InfluxElixir.Write.LineProtocol do
   stored as two); a backslash is kept as it is unless it stands before a character the
   name escapes, so a name's backslashes are not escaped:
 
-  - Measurement names: spaces, commas, equals, double-quotes
+  - Measurement names: spaces, commas
   - Tag keys/values: spaces, commas, equals
   - Field keys: spaces, commas, equals, double-quotes
   - Field string values: double-quotes, backslashes (as on v3)

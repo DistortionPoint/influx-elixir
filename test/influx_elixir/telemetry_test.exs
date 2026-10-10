@@ -28,6 +28,22 @@ defmodule InfluxElixir.TelemetryTest do
     end
   end
 
+  # `:telemetry.span/3` adds a generated `telemetry_span_context` reference to the metadata of
+  # every event it emits. Returns the metadata without it, once it is seen to be a reference.
+  defp without_span_context(metadata) do
+    {context, rest} = Map.pop(metadata, :telemetry_span_context)
+    assert is_reference(context)
+    rest
+  end
+
+  # The exception metadata also carries the raise's stacktrace, which is generated. Returns the
+  # metadata without it, once it is seen to be a non-empty list.
+  defp without_stacktrace(metadata) do
+    {stacktrace, rest} = Map.pop(metadata, :stacktrace)
+    assert [_frame | _frames] = stacktrace
+    rest
+  end
+
   defp assert_spans_function(duration) do
     assert_received {:inner_elapsed, inner_elapsed}
     assert duration >= inner_elapsed
@@ -66,9 +82,9 @@ defmodule InfluxElixir.TelemetryTest do
 
       assert_receive {:telemetry, [:influx_elixir, :write, :start], measurements, recv_meta}
       assert_wall_clock(measurements.system_time, before, later)
-      assert recv_meta.database === "testdb"
-      assert recv_meta.point_count === 1
-      assert recv_meta.bytes === 42
+
+      assert without_span_context(recv_meta) ===
+               %{database: "testdb", point_count: 1, bytes: 42}
     end
 
     test "emits :stop event after the function returns" do
@@ -79,7 +95,9 @@ defmodule InfluxElixir.TelemetryTest do
 
       assert_receive {:telemetry, [:influx_elixir, :write, :stop], measurements, recv_meta}
       assert_spans_function(measurements.duration)
-      assert recv_meta.database === "testdb"
+
+      assert without_span_context(recv_meta) ===
+               %{database: "testdb", point_count: 2, bytes: 100, result: :ok}
     end
 
     test "emits :exception event when the function raises" do
@@ -93,8 +111,15 @@ defmodule InfluxElixir.TelemetryTest do
       assert_receive {:telemetry, [:influx_elixir, :write, :exception], measurements, recv_meta}
 
       assert_spans_function(measurements.duration)
-      assert recv_meta.database === "testdb"
-      assert recv_meta.kind === :error
+
+      assert recv_meta |> without_span_context() |> without_stacktrace() ===
+               %{
+                 database: "testdb",
+                 point_count: 1,
+                 bytes: 10,
+                 kind: :error,
+                 reason: %RuntimeError{message: "boom"}
+               }
     end
 
     test "does not emit :stop event when the function raises" do
@@ -122,8 +147,7 @@ defmodule InfluxElixir.TelemetryTest do
 
       assert_receive {:telemetry, [:influx_elixir, :query, :start], measurements, recv_meta}
       assert_wall_clock(measurements.system_time, before, later)
-      assert recv_meta.database === "testdb"
-      assert recv_meta.transport === :http
+      assert without_span_context(recv_meta) === %{database: "testdb", transport: :http}
     end
 
     test "emits :stop event after the function returns" do
@@ -135,7 +159,9 @@ defmodule InfluxElixir.TelemetryTest do
 
       assert_receive {:telemetry, [:influx_elixir, :query, :stop], measurements, recv_meta}
       assert_spans_function(measurements.duration)
-      assert recv_meta.transport === :flight
+
+      assert without_span_context(recv_meta) ===
+               %{database: "testdb", transport: :flight, result: :ok, row_count: 1}
     end
 
     test "emits :exception event when the function raises" do
@@ -149,8 +175,14 @@ defmodule InfluxElixir.TelemetryTest do
       assert_receive {:telemetry, [:influx_elixir, :query, :exception], measurements, recv_meta}
 
       assert_spans_function(measurements.duration)
-      assert recv_meta.database === "testdb"
-      assert recv_meta.kind === :error
+
+      assert recv_meta |> without_span_context() |> without_stacktrace() ===
+               %{
+                 database: "testdb",
+                 transport: :http,
+                 kind: :error,
+                 reason: %ArgumentError{message: "bad query"}
+               }
     end
 
     test "does not emit :stop event when the function raises" do

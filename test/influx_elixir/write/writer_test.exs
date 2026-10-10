@@ -19,7 +19,13 @@ defmodule InfluxElixir.Write.WriterTest do
       assert Writer.write(conn, ["cpu value=2.0 2"], database: "w", gzip: true) ===
                {:ok, :written}
 
-      assert {:ok, [_one, _two]} = Local.query_sql(conn, "SELECT * FROM cpu", database: "w")
+      # Both timestamps (1ns and 2ns) read back as the same microsecond.
+      assert Local.query_sql(conn, "SELECT * FROM cpu ORDER BY value", database: "w") ===
+               {:ok,
+                [
+                  %{"time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 1.0},
+                  %{"time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 2.0}
+                ]}
     end
 
     test "a body that is not iodata is the client's answer, never a raise", %{conn: conn} do
@@ -41,7 +47,7 @@ defmodule InfluxElixir.Write.WriterTest do
 
   describe "write/3" do
     test "writes line protocol through the configured client", %{conn: conn} do
-      assert {:ok, :written} = Writer.write(conn, "cpu value=1.0 1", database: "w")
+      assert Writer.write(conn, "cpu value=1.0 1", database: "w") === {:ok, :written}
 
       assert Local.query_sql(conn, "SELECT * FROM cpu", database: "w") ===
                {:ok, [%{"time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 1.0}]}
@@ -60,7 +66,7 @@ defmodule InfluxElixir.Write.WriterTest do
 
       assert byte_size(lp) > 1024
 
-      assert {:ok, :written} = Writer.write(conn, lp, database: "w")
+      assert Writer.write(conn, lp, database: "w") === {:ok, :written}
 
       assert Local.query_sql(conn, "SELECT COUNT(value) AS n FROM cpu", database: "w") ===
                {:ok, [%{"n" => 100}]}
@@ -70,11 +76,11 @@ defmodule InfluxElixir.Write.WriterTest do
     # server refused it: "error decoding gzip stream" (verified).
     test "gzip: true compresses a payload of any size; false leaves a large one plain",
          %{conn: conn} do
-      assert {:ok, :written} = Writer.write(conn, "small v=1i 1", database: "w", gzip: true)
+      assert Writer.write(conn, "small v=1i 1", database: "w", gzip: true) === {:ok, :written}
 
       large = Enum.map_join(1..100, "\n", &"large v=#{&1}i #{&1}")
       assert byte_size(large) > 1024
-      assert {:ok, :written} = Writer.write(conn, large, database: "w", gzip: false)
+      assert Writer.write(conn, large, database: "w", gzip: false) === {:ok, :written}
 
       assert Local.query_sql(conn, "SELECT COUNT(v) AS n FROM small", database: "w") ===
                {:ok, [%{"n" => 1}]}
@@ -84,8 +90,8 @@ defmodule InfluxElixir.Write.WriterTest do
     end
 
     test "opts such as :precision reach the client", %{conn: conn} do
-      assert {:ok, :written} =
-               Writer.write(conn, "cpu value=1i 1700000000000", database: "w", precision: :ms)
+      assert Writer.write(conn, "cpu value=1i 1700000000000", database: "w", precision: :ms) ===
+               {:ok, :written}
 
       assert Local.query_sql(conn, "SELECT time FROM cpu", database: "w") ===
                {:ok, [%{"time" => ~U[2023-11-14 22:13:20.000000Z]}]}
@@ -150,8 +156,21 @@ defmodule InfluxElixir.Write.WriterTest do
       {:ok, v2} = Local.start(profile: :v2, databases: ["b"])
       assert Writer.write(v2, point, database: "b", precision: :second) === {:ok, :written}
 
-      assert {:ok, [%{"t" => "a\\b", "_value" => 1}]} =
-               Local.query_flux(v2, ~s[from(bucket: "b") |> range(start: 5, stop: 6)], [])
+      assert Local.query_flux(v2, ~s[from(bucket: "b") |> range(start: 5, stop: 6)], []) ===
+               {:ok,
+                [
+                  %{
+                    "result" => "_result",
+                    "table" => 0,
+                    "_measurement" => "m",
+                    "_field" => "f",
+                    "_start" => ~U[1970-01-01 00:00:05.000000Z],
+                    "_stop" => ~U[1970-01-01 00:00:06.000000Z],
+                    "_time" => ~U[1970-01-01 00:00:05.000000Z],
+                    "_value" => 1,
+                    "t" => "a\\b"
+                  }
+                ]}
     end
 
     test "a point that cannot be encoded is the encoder's error, and nothing is sent",
@@ -161,7 +180,9 @@ defmodule InfluxElixir.Write.WriterTest do
       assert Writer.write(conn, [point(1.0, 1_000), :not_a_point], database: "w") ===
                {:error, {:invalid_point, :not_a_point}}
 
-      assert {:error, %{status: 400}} = Local.query_sql(conn, "SELECT * FROM cpu", database: "w")
+      assert Local.query_sql(conn, "SELECT * FROM cpu", database: "w") ===
+               {:error,
+                %{status: 400, body: "Error during planning: table 'public.iox.cpu' not found"}}
     end
   end
 
@@ -211,13 +232,26 @@ defmodule InfluxElixir.Write.WriterTest do
             {"cpu value=1i 1\ncpu value=2i 2\n", 2},
             {"cpu value=1i 1\ncpu value=2i 2\ncpu value=3i 3", 3}
           ] do
-        assert {:ok, :written} = Writer.write(conn, body, database: "w")
+        assert Writer.write(conn, body, database: "w") === {:ok, :written}
 
-        assert_receive {:telemetry, [:influx_elixir, :write, :stop], _measurements,
-                        %{point_count: ^count, bytes: bytes}}
+        assert_receive {:telemetry, [:influx_elixir, :write, :stop], _measurements, metadata}
 
-        assert bytes === byte_size(body)
+        # The span context is a generated reference.
+        {context, rest} = Map.pop(metadata, :telemetry_span_context)
+        assert is_reference(context)
+
+        assert rest ===
+                 %{database: "w", point_count: count, bytes: byte_size(body), result: :ok}
       end
+    end
+
+    test "an empty body has no lines", %{conn: conn} do
+      assert Writer.write(conn, "", database: "w") ===
+               {:error, %{status: 400, body: "incoming write was empty"}}
+
+      assert_receive {:telemetry, [:influx_elixir, :write, :stop], _measurements, metadata}
+      {_context, rest} = Map.pop(metadata, :telemetry_span_context)
+      assert rest === %{database: "w", point_count: 0, bytes: 0, result: :error}
     end
   end
 end

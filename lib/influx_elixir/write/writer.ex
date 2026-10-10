@@ -150,16 +150,10 @@ defmodule InfluxElixir.Write.Writer do
 
   defp maybe_gzip(payload, _gzip, opts), do: {payload, opts}
 
-  # The lines of a body: its newlines, one more for the last line, none for a trailing
-  # newline. A scan, not a split: it allocates nothing, so it costs a write nothing a
-  # telemetry handler would not.
+  # The lines of a body (see `Options.line_count/1`); a body that is not text has none.
   @spec line_count(term()) :: non_neg_integer()
-  defp line_count(""), do: 0
-
-  defp line_count(line_protocol) when is_binary(line_protocol) do
-    newlines = length(:binary.matches(line_protocol, "\n"))
-    if String.ends_with?(line_protocol, "\n"), do: newlines, else: newlines + 1
-  end
+  defp line_count(line_protocol) when is_binary(line_protocol),
+    do: Options.line_count(line_protocol)
 
   defp line_count(_not_text), do: 0
 end

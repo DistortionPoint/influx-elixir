@@ -2,7 +2,7 @@ defmodule InfluxElixirTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
-  alias InfluxElixir.TestSupport.{Telemetry, Tokens}
+  alias InfluxElixir.TestSupport.{Await, Telemetry, Tokens}
 
   # The write's own time, so every row is compared whole, `time` included.
   @ts 1_700_000_000_000_000_000
@@ -12,6 +12,14 @@ defmodule InfluxElixirTest do
     {:ok, conn} = Local.start(databases: ["test_db"])
     Local.write(conn, "cpu value=1i #{@ts}", database: "test_db")
     {:ok, conn: conn}
+  end
+
+  # `:telemetry.span/3` adds a generated `telemetry_span_context` reference to the metadata of
+  # every event it emits. Returns the metadata without it, once it is seen to be a reference.
+  defp without_span_context(metadata) do
+    {context, rest} = Map.pop(metadata, :telemetry_span_context)
+    assert is_reference(context)
+    rest
   end
 
   describe "client/0" do
@@ -24,10 +32,12 @@ defmodule InfluxElixirTest do
     test "constructs a Point struct with defaults" do
       point = InfluxElixir.point("cpu", %{"value" => 0.64})
 
-      assert point.measurement === "cpu"
-      assert point.fields === %{"value" => 0.64}
-      assert point.tags === %{}
-      assert point.timestamp === nil
+      assert point === %InfluxElixir.Write.Point{
+               measurement: "cpu",
+               fields: %{"value" => 0.64},
+               tags: %{},
+               timestamp: nil
+             }
     end
 
     test "constructs a Point struct with tags and timestamp" do
@@ -37,15 +47,18 @@ defmodule InfluxElixirTest do
           timestamp: 1_630_424_257_000_000_000
         )
 
-      assert point.tags === %{"host" => "server01"}
-      assert point.timestamp === 1_630_424_257_000_000_000
+      assert point === %InfluxElixir.Write.Point{
+               measurement: "cpu",
+               fields: %{"value" => 0.64},
+               tags: %{"host" => "server01"},
+               timestamp: 1_630_424_257_000_000_000
+             }
     end
   end
 
   describe "write/3" do
     test "delegates to configured client", %{conn: conn} do
-      assert {:ok, :written} =
-               InfluxElixir.write(conn, "cpu value=2i", database: "test_db")
+      assert InfluxElixir.write(conn, "cpu value=2i", database: "test_db") === {:ok, :written}
     end
 
     test "takes a Point, and a list of Points, as line protocol it encodes", %{conn: conn} do
@@ -126,7 +139,22 @@ defmodule InfluxElixirTest do
     end
 
     test "sync: true is the write's own failure", %{name: name} do
-      assert {:error, %{status: 400}} = InfluxElixir.write_batched(name, "!!!", sync: true)
+      assert {:error, %{status: 400, body: body} = error} =
+               InfluxElixir.write_batched(name, "!!!", sync: true)
+
+      # Only the keys of the error are pinned here; the key order of its JSON body is not.
+      assert error === %{status: 400, body: body}
+
+      assert Jason.decode!(body) === %{
+               "error" => "partial write of line protocol occurred",
+               "data" => [
+                 %{
+                   "error_message" => "Expected at least one space character, got end of input",
+                   "line_number" => 1,
+                   "original_line" => "!!!"
+                 }
+               ]
+             }
     end
 
     test "a payload that is none of the forms is an error and the writer keeps going",
@@ -167,8 +195,8 @@ defmodule InfluxElixirTest do
 
   describe "execute_sql/3" do
     test "delegates to configured client", %{conn: conn} do
-      assert {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}} =
-               InfluxElixir.execute_sql(conn, "DELETE FROM cpu", database: "test_db")
+      assert InfluxElixir.execute_sql(conn, "DELETE FROM cpu", database: "test_db") ===
+               {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}}
     end
   end
 
@@ -184,7 +212,9 @@ defmodule InfluxElixirTest do
       {:ok, v2_conn} = Local.start(profile: :v2)
 
       :ok = InfluxElixir.create_bucket(v2_conn, "test")
-      {:ok, :written} = InfluxElixir.write(v2_conn, "cpu value=1.0 #{@ts}", database: "test")
+
+      assert InfluxElixir.write(v2_conn, "cpu value=1.0 #{@ts}", database: "test") ===
+               {:ok, :written}
 
       assert InfluxElixir.query_flux(
                v2_conn,
@@ -208,27 +238,28 @@ defmodule InfluxElixirTest do
 
   describe "create_database/3" do
     test "delegates to configured client", %{conn: conn} do
-      assert :ok = InfluxElixir.create_database(conn, "new_db")
+      assert InfluxElixir.create_database(conn, "new_db") === :ok
     end
   end
 
   describe "list_databases/1" do
     test "delegates to configured client", %{conn: conn} do
-      assert {:ok, dbs} = InfluxElixir.list_databases(conn)
-      assert %{"name" => "test_db"} in dbs
+      # The engine's own `_internal` database is always listed, sorted first.
+      assert InfluxElixir.list_databases(conn) ===
+               {:ok, [%{"name" => "_internal"}, %{"name" => "test_db"}]}
     end
   end
 
   describe "delete_database/2" do
     test "delegates to configured client", %{conn: conn} do
-      assert :ok = InfluxElixir.delete_database(conn, "test_db")
+      assert InfluxElixir.delete_database(conn, "test_db") === :ok
     end
   end
 
   describe "create_bucket/3" do
     test "delegates to configured client" do
       {:ok, v2_conn} = Local.start(profile: :v2)
-      assert :ok = InfluxElixir.create_bucket(v2_conn, "new_bucket")
+      assert InfluxElixir.create_bucket(v2_conn, "new_bucket") === :ok
     end
   end
 
@@ -237,8 +268,39 @@ defmodule InfluxElixirTest do
       {:ok, v2_conn} = Local.start(profile: :v2)
       :ok = InfluxElixir.create_bucket(v2_conn, "listed_bucket")
 
-      assert {:ok, buckets} = InfluxElixir.list_buckets(v2_conn)
-      assert "listed_bucket" in Enum.map(buckets, & &1["name"])
+      # The ids are derived from SHA-256 hashes (the bucket's, and the org's) and the two
+      # timestamps are the creation time: each is bound, then pinned by where it is used.
+      assert {:ok, [bucket]} = InfluxElixir.list_buckets(v2_conn)
+      %{"id" => id, "orgID" => org_id, "createdAt" => created_at} = bucket
+
+      assert byte_size(id) === 16
+      assert byte_size(org_id) === 16
+      assert byte_size(created_at) === 30
+
+      assert bucket === %{
+               "id" => id,
+               "orgID" => org_id,
+               "type" => "user",
+               "name" => "listed_bucket",
+               "retentionRules" => [
+                 %{
+                   "type" => "expire",
+                   "everySeconds" => 0,
+                   "shardGroupDurationSeconds" => 604_800
+                 }
+               ],
+               "createdAt" => created_at,
+               "updatedAt" => created_at,
+               "links" => %{
+                 "labels" => "/api/v2/buckets/#{id}/labels",
+                 "members" => "/api/v2/buckets/#{id}/members",
+                 "org" => "/api/v2/orgs/#{org_id}",
+                 "owners" => "/api/v2/buckets/#{id}/owners",
+                 "self" => "/api/v2/buckets/#{id}",
+                 "write" => "/api/v2/write?org=#{org_id}&bucket=#{id}"
+               },
+               "labels" => []
+             }
     end
   end
 
@@ -246,8 +308,10 @@ defmodule InfluxElixirTest do
     test "delegates to configured client" do
       {:ok, v2_conn} = Local.start(profile: :v2)
       :ok = InfluxElixir.create_bucket(v2_conn, "test_bucket")
-      assert :ok = InfluxElixir.delete_bucket(v2_conn, "test_bucket")
-      assert {:error, %{status: 404}} = InfluxElixir.delete_bucket(v2_conn, "test_bucket")
+      assert InfluxElixir.delete_bucket(v2_conn, "test_bucket") === :ok
+
+      assert InfluxElixir.delete_bucket(v2_conn, "test_bucket") ===
+               {:error, %{status: 404, body: "bucket not found: test_bucket"}}
     end
   end
 
@@ -258,10 +322,10 @@ defmodule InfluxElixirTest do
       assert conn |> InfluxElixir.create_token("facade") |> Tokens.public() ===
                {:ok, %{"id" => 1, "name" => "facade", "expiry" => nil}}
 
-      assert :ok = InfluxElixir.delete_token(conn, "facade")
+      assert InfluxElixir.delete_token(conn, "facade") === :ok
 
-      assert {:error, %{status: 404, body: "the requested resource was not found: facade"}} =
-               InfluxElixir.delete_token(conn, "facade")
+      assert InfluxElixir.delete_token(conn, "facade") ===
+               {:error, %{status: 404, body: "the requested resource was not found: facade"}}
     end
   end
 
@@ -279,35 +343,42 @@ defmodule InfluxElixirTest do
 
     test "write/3 emits a write span with database, bytes and point count", %{conn: conn} do
       lp = "cpu value=1i\ncpu value=2i"
-      assert {:ok, :written} = InfluxElixir.write(conn, lp, database: "test_db")
+      assert InfluxElixir.write(conn, lp, database: "test_db") === {:ok, :written}
 
-      assert_receive {:telemetry, [:influx_elixir, :write, :stop], _measurements,
-                      %{database: "test_db", bytes: bytes, point_count: 2, result: :ok}}
+      assert_receive {:telemetry, [:influx_elixir, :write, :stop], _measurements, metadata}
 
-      assert bytes === byte_size(lp)
+      assert without_span_context(metadata) ===
+               %{database: "test_db", bytes: byte_size(lp), point_count: 2, result: :ok}
     end
 
     test "query_sql/3 emits a query span with transport and row count", %{conn: conn} do
-      assert {:ok, [_row]} =
-               InfluxElixir.query_sql(conn, "SELECT * FROM cpu", database: "test_db")
+      assert InfluxElixir.query_sql(conn, "SELECT * FROM cpu", database: "test_db") ===
+               {:ok, [%{"time" => @time, "value" => 1}]}
 
-      assert_receive {:telemetry, [:influx_elixir, :query, :stop], _measurements,
-                      %{
-                        database: "test_db",
-                        transport: InfluxElixir.Client.Local,
-                        row_count: 1,
-                        result: :ok
-                      }}
+      assert_receive {:telemetry, [:influx_elixir, :query, :stop], _measurements, metadata}
+
+      assert without_span_context(metadata) ===
+               %{
+                 database: "test_db",
+                 transport: InfluxElixir.Client.Local,
+                 row_count: 1,
+                 result: :ok
+               }
     end
 
     test "a client error is a :stop with result: :error, not an exception", %{conn: conn} do
-      assert {:error, %{status: 400, body: "Error during planning: table " <> _rest}} =
-               InfluxElixir.query_sql(conn, "SELECT * FROM nope", database: "test_db")
+      assert InfluxElixir.query_sql(conn, "SELECT * FROM nope", database: "test_db") ===
+               {:error,
+                %{
+                  status: 400,
+                  body: "Error during planning: table 'public.iox.nope' not found"
+                }}
 
-      assert_receive {:telemetry, [:influx_elixir, :query, :stop], _measurements,
-                      %{result: :error} = metadata}
+      assert_receive {:telemetry, [:influx_elixir, :query, :stop], _measurements, metadata}
 
-      refute Map.has_key?(metadata, :row_count)
+      # No row_count: the result was an error, not a list of rows.
+      assert without_span_context(metadata) ===
+               %{database: "test_db", transport: InfluxElixir.Client.Local, result: :error}
     end
   end
 
@@ -317,16 +388,42 @@ defmodule InfluxElixirTest do
       {:ok, _pid} = InfluxElixir.add_connection(name, database: "no_writer_db")
       on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
-      assert {:ok, :written} = InfluxElixir.write(name, "cpu v=1i")
-      assert {:error, :no_batch_writer} = InfluxElixir.flush(name)
-      assert {:error, :no_batch_writer} = InfluxElixir.stats(name)
+      assert InfluxElixir.write(name, "cpu v=1i") === {:ok, :written}
+      assert InfluxElixir.flush(name) === {:error, :no_batch_writer}
+      assert InfluxElixir.stats(name) === {:error, :no_batch_writer}
     end
 
     test "an unregistered connection name has no batch writer" do
       name = :"never_registered_#{System.unique_integer([:positive])}"
 
-      assert {:error, :no_batch_writer} = InfluxElixir.flush(name)
-      assert {:error, :no_batch_writer} = InfluxElixir.stats(name)
+      assert InfluxElixir.flush(name) === {:error, :no_batch_writer}
+      assert InfluxElixir.stats(name) === {:error, :no_batch_writer}
+    end
+
+    # The writer answers the calls it has taken before it stops; a call still in its mailbox
+    # exited the caller with `{:shutdown, {GenServer, :call, _}}`.
+    test "a writer that stops with the call in its mailbox has none" do
+      name = :"stopping_writer_#{System.unique_integer([:positive])}"
+
+      {:ok, _pid} =
+        InfluxElixir.add_connection(name, batch_writer: [flush_interval_ms: 600_000])
+
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+
+      for call <- [&InfluxElixir.stats/1, &InfluxElixir.flush/1] do
+        # The supervisor restarts the writer each round stops.
+        writer = Await.until(fn -> Process.whereis(:"influx_elixir_#{name}_batch_writer") end)
+        :ok = :sys.suspend(writer)
+        task = Task.async(fn -> call.(name) end)
+
+        Await.until(fn ->
+          Process.info(writer, :message_queue_len) === {:message_queue_len, 1}
+        end)
+
+        :ok = GenServer.stop(writer, :shutdown)
+
+        assert Task.await(task, Await.bound()) === {:error, :no_batch_writer}
+      end
     end
   end
 
@@ -334,7 +431,7 @@ defmodule InfluxElixirTest do
     test "write and query functions fall back to it when opts omit :database" do
       {:ok, conn} = Local.start(database: "dflt_db")
 
-      assert {:ok, :written} = InfluxElixir.write(conn, "cpu value=1i #{@ts}")
+      assert InfluxElixir.write(conn, "cpu value=1i #{@ts}") === {:ok, :written}
 
       row = %{"time" => @time, "value" => 1}
 
@@ -352,7 +449,7 @@ defmodule InfluxElixirTest do
 
   describe "add_connection/2 and remove_connection/1" do
     test "remove_connection/1 for an unknown name returns {:error, :not_found}" do
-      assert {:error, :not_found} = InfluxElixir.remove_connection(:never_added_connection)
+      assert InfluxElixir.remove_connection(:never_added_connection) === {:error, :not_found}
     end
 
     test "remove_connection/1 succeeds when the registry entry is already gone" do
@@ -361,7 +458,7 @@ defmodule InfluxElixirTest do
 
       InfluxElixir.Connection.delete(name)
 
-      assert :ok = InfluxElixir.remove_connection(name)
+      assert InfluxElixir.remove_connection(name) === :ok
     end
 
     test "a connection added at runtime is usable by name until it is removed" do
@@ -369,14 +466,21 @@ defmodule InfluxElixirTest do
       # isolated from every other async module.
       name = :"dynamic_test_#{System.unique_integer([:positive])}"
 
+      # The pid of the connection's supervisor is generated.
       assert {:ok, pid} = InfluxElixir.add_connection(name, database: "dyn")
-      assert {:ok, :written} = InfluxElixir.write(name, "cpu v=1i")
+      assert is_pid(pid)
+      assert InfluxElixir.write(name, "cpu v=1i") === {:ok, :written}
       assert InfluxElixir.query_sql(name, "SELECT v FROM cpu") === {:ok, [%{"v" => 1}]}
 
-      assert :ok = InfluxElixir.remove_connection(name)
+      assert InfluxElixir.remove_connection(name) === :ok
       refute Process.alive?(pid)
 
-      assert_raise ArgumentError, ~r/no InfluxElixir connection named/, fn ->
+      message =
+        "no InfluxElixir connection named #{inspect(name)}: list it under " <>
+          "`config :influx_elixir, :connections` or add it with " <>
+          "InfluxElixir.add_connection/2"
+
+      assert_raise ArgumentError, message, fn ->
         InfluxElixir.write(name, "cpu v=2i")
       end
     end
@@ -394,12 +498,16 @@ defmodule InfluxElixirTest do
       InfluxElixir.Connection.put(name, config)
       on_exit(fn -> InfluxElixir.Connection.delete(name) end)
 
-      resolved = InfluxElixir.resolve_connection(name)
-      assert resolved[:host] === "resolve-host"
+      assert InfluxElixir.resolve_connection(name) === config
     end
 
     test "raises ArgumentError for unregistered atom name" do
-      assert_raise ArgumentError, fn ->
+      message =
+        "no InfluxElixir connection named :no_such_connection: list it under " <>
+          "`config :influx_elixir, :connections` or add it with " <>
+          "InfluxElixir.add_connection/2"
+
+      assert_raise ArgumentError, message, fn ->
         InfluxElixir.resolve_connection(:no_such_connection)
       end
     end
@@ -426,13 +534,15 @@ defmodule InfluxElixirTest do
       InfluxElixir.Connection.put(name, local_conn)
       on_exit(fn -> InfluxElixir.Connection.delete(name) end)
 
-      assert {:ok, :written} =
-               InfluxElixir.write(name, "cpu value=1.0", database: "facade_rw_db")
+      assert InfluxElixir.write(name, "cpu value=1.0", database: "facade_rw_db") ===
+               {:ok, :written}
 
       assert {:ok, [row]} =
                InfluxElixir.query_sql(name, "SELECT * FROM cpu", database: "facade_rw_db")
 
-      assert row["value"] === 1.0
+      # The write had no timestamp, so its `time` is assigned by the write.
+      assert {%DateTime{}, rest} = Map.pop(row, "time")
+      assert rest === %{"value" => 1.0}
     end
   end
 end
