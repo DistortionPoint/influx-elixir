@@ -37,6 +37,10 @@ defmodule InfluxElixir.Admin.TokensTest do
                  Tokens.create(conn, "bad", permissions: [permission])
       end
 
+      # Permissions that are not a list, even one well formed, are the same refusal.
+      assert Tokens.create(conn, "bad", permissions: "db:x:read") ===
+               {:error, {:invalid_permission, "db:x:read"}}
+
       # Nothing was created, so the name is still free.
       assert conn |> Tokens.create("bad") |> TokenShape.public() ===
                {:ok, %{"id" => 1, "name" => "bad", "expiry" => nil}}

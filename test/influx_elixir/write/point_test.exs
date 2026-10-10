@@ -40,7 +40,7 @@ defmodule InfluxElixir.Write.PointTest do
 
     test "defaults timestamp to nil when not provided" do
       point = Point.new("cpu", %{"v" => 1})
-      assert is_nil(point.timestamp)
+      assert point.timestamp === nil
     end
 
     test "accepts integer field values" do

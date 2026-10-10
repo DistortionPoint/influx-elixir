@@ -9,7 +9,7 @@ defmodule InfluxElixir.Client do
       # config/config.exs (default: production HTTP client)
       config :influx_elixir, :client, InfluxElixir.Client.HTTP
 
-      # config/test.exs (test: LocalClient)
+      # config/test.exs (the in-memory test double)
       config :influx_elixir, :client, InfluxElixir.Client.Local
 
   ## Implementations
@@ -52,7 +52,8 @@ defmodule InfluxElixir.Client do
   """
 
   @type connection :: term()
-  @type query_result :: {:ok, [map()]} | {:error, term()}
+  # Rows, or the response body as it came for `format: :parquet` (`Client.HTTP` only).
+  @type query_result :: {:ok, [map()] | binary()} | {:error, term()}
   @type write_result :: {:ok, :written} | {:error, term()}
 
   # Connection lifecycle

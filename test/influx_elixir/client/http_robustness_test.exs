@@ -138,4 +138,51 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
       assert body === %{"db" => "db", "format" => "json", "params" => %{}, "q" => "SELECT 1"}
     end
   end
+
+  # What the client makes of an answer's body, sent as the test decides.
+  describe "a body the server sends" do
+    setup do
+      finch = :"fxi30_http_finch_#{System.unique_integer([:positive])}"
+      start_supervised!({Finch, name: finch})
+      {:ok, conn: connection(port: TestServer.controlled(), finch_name: finch)}
+    end
+
+    defp answered(fun, status, body) do
+      task = Task.async(fun)
+      assert_receive {:request, handler, _request_body}, TestSupport.Await.bound()
+      TestServer.respond(handler, status, body)
+      Task.await(task, TestSupport.Await.bound())
+    end
+
+    test "a health body that is JSON but no object is a passing check, as plain text is",
+         %{conn: conn} do
+      # It was returned as it decoded (`{:ok, true}`), where the spec promises a map.
+      for body <- ["true", ~s("OK"), "[]", "1", "OK"] do
+        assert answered(fn -> HTTP.health(conn) end, 200, body) ===
+                 {:ok, %{"status" => "pass"}},
+               body
+      end
+
+      assert answered(fn -> HTTP.health(conn) end, 200, ~s({"status":"pass","version":"3"})) ===
+               {:ok, %{"status" => "pass", "version" => "3"}}
+    end
+
+    test "a streamed row split over many chunks is one row, and CRLF ends a line as LF does",
+         %{conn: conn} do
+      # A blank CRLF line between the rows, and every chunk seven bytes long.
+      body = ~s({"tag":"#{String.duplicate("x", 300)}","v":1}\r\n\r\n{"v":2}\r\n)
+
+      chunks =
+        body |> :binary.bin_to_list() |> Enum.chunk_every(7) |> Enum.map(&:binary.list_to_bin/1)
+
+      rows =
+        answered(
+          fn -> conn |> HTTP.query_sql_stream("SELECT tag, v FROM m") |> Enum.to_list() end,
+          200,
+          {:chunks, chunks}
+        )
+
+      assert rows === [%{"tag" => String.duplicate("x", 300), "v" => 1}, %{"v" => 2}]
+    end
+  end
 end

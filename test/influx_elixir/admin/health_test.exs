@@ -11,7 +11,7 @@ defmodule InfluxElixir.Admin.HealthTest do
 
   describe "check/1" do
     test "returns pass status from local client", %{conn: conn} do
-      assert {:ok, %{"status" => "pass"}} = Health.check(conn)
+      assert Health.check(conn) === {:ok, %{"status" => "pass"}}
     end
   end
 end

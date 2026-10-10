@@ -17,7 +17,7 @@ defmodule InfluxElixir do
       InfluxElixir.health(:trading)
       InfluxElixir.write(:trading, "cpu value=1.0", database: "prices")
 
-      # Using a raw config (e.g. LocalClient in tests)
+      # Using a raw config (e.g. a `Client.Local` connection in tests)
       InfluxElixir.health(conn)
 
   ## Configuration

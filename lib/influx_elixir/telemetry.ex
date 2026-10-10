@@ -126,7 +126,7 @@ defmodule InfluxElixir.Telemetry do
   ## Examples
 
       InfluxElixir.Telemetry.span_query(
-        %{database: "mydb", transport: :http},
+        %{database: "mydb", transport: InfluxElixir.Client.HTTP},
         fn -> SQL.query(conn, "SELECT * FROM cpu") end
       )
   """
@@ -241,7 +241,7 @@ defmodule InfluxElixir.Telemetry do
 
   ## Examples
 
-      InfluxElixir.Telemetry.query_start(%{database: "mydb", transport: :http})
+      InfluxElixir.Telemetry.query_start(%{database: "mydb", transport: InfluxElixir.Client.HTTP})
   """
   @spec query_start(map()) :: :ok
   def query_start(metadata) do
@@ -264,7 +264,7 @@ defmodule InfluxElixir.Telemetry do
       start = System.monotonic_time()
       # ... perform query ...
       InfluxElixir.Telemetry.query_stop(System.monotonic_time() - start,
-        %{database: "mydb", transport: :http, row_count: 42}
+        %{database: "mydb", transport: InfluxElixir.Client.HTTP, row_count: 42}
       )
   """
   @spec query_stop(integer(), map()) :: :ok
@@ -297,7 +297,7 @@ defmodule InfluxElixir.Telemetry do
         e ->
           InfluxElixir.Telemetry.query_exception(
             System.monotonic_time() - start,
-            %{database: "mydb", transport: :http, kind: :error,
+            %{database: "mydb", transport: InfluxElixir.Client.HTTP, kind: :error,
               reason: e, stacktrace: __STACKTRACE__}
           )
           reraise e, __STACKTRACE__

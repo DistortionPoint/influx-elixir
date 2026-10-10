@@ -172,12 +172,15 @@ defmodule InfluxElixir.ConnectionTest do
   # ---------------------------------------------------------------------------
 
   describe "finch_name/1" do
-    test "derives the pool name from the connection name" do
-      assert Connection.finch_name(:my_conn) === :influx_elixir_my_conn_finch
-    end
+    test "of a name registered without :finch_name, or not at all, is derived from the name" do
+      # Unique names: a fixed one is a key in the registry every test shares.
+      unregistered = :"finch_derived_#{System.unique_integer([:positive])}"
+      registered = :"finch_derived_#{System.unique_integer([:positive])}"
+      :ok = Connection.put(registered, host: "h")
+      on_exit(fn -> Connection.delete(registered) end)
 
-    test "returns different atoms for different connection names" do
-      refute Connection.finch_name(:conn_a) === Connection.finch_name(:conn_b)
+      assert Connection.finch_name(unregistered) === :"influx_elixir_#{unregistered}_finch"
+      assert Connection.finch_name(registered) === :"influx_elixir_#{registered}_finch"
     end
 
     test "is the pool a connection was given with :finch_name" do

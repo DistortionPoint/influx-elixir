@@ -38,8 +38,8 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       body =
         ~s([{"time":"2026-03-12T10:00:00Z","value":1}])
 
-      assert {:ok, [row]} = ResponseParser.parse(body, :json)
-      assert %DateTime{} = row["time"]
+      assert ResponseParser.parse(body, :json) ===
+               {:ok, [%{"time" => ~U[2026-03-12 10:00:00.000000Z], "value" => 1}]}
     end
   end
 
@@ -47,9 +47,8 @@ defmodule InfluxElixir.Query.ResponseParserTest do
     test "parses newline-delimited JSON" do
       body = ~s({"a":1}\n{"a":2}\n{"a":3})
 
-      assert {:ok, rows} = ResponseParser.parse(body, :jsonl)
-      assert length(rows) === 3
-      assert Enum.map(rows, & &1["a"]) === [1, 2, 3]
+      assert ResponseParser.parse(body, :jsonl) ===
+               {:ok, [%{"a" => 1}, %{"a" => 2}, %{"a" => 3}]}
     end
 
     test "handles trailing newline" do
@@ -148,12 +147,29 @@ defmodule InfluxElixir.Query.ResponseParserTest do
           ",_result,1,2023-11-14T22:13:20Z,42.5,value,probe_flux,a\r\n" <>
           "\r\n"
 
-      assert {:ok, [label_row, value_row]} = ResponseParser.parse(body, :flux_csv)
-
-      assert %{"table" => 0, "_value" => "x, y", "_field" => "label", "host" => "a"} = label_row
-      assert %{"table" => 1, "_value" => 42.5, "_field" => "value"} = value_row
-      assert value_row["_time"] === ~U[2023-11-14 22:13:20.000000Z]
-      refute Map.has_key?(value_row, "")
+      # The empty first column of the header names no cell.
+      assert ResponseParser.parse(body, :flux_csv) ===
+               {:ok,
+                [
+                  %{
+                    "result" => "_result",
+                    "table" => 0,
+                    "_time" => ~U[2023-11-14 22:13:20.000000Z],
+                    "_value" => "x, y",
+                    "_field" => "label",
+                    "_measurement" => "probe_flux",
+                    "host" => "a"
+                  },
+                  %{
+                    "result" => "_result",
+                    "table" => 1,
+                    "_time" => ~U[2023-11-14 22:13:20.000000Z],
+                    "_value" => 42.5,
+                    "_field" => "value",
+                    "_measurement" => "probe_flux",
+                    "host" => "a"
+                  }
+                ]}
     end
 
     test "a newline inside a quoted value comes back as the \\n it was stored as" do
@@ -172,7 +188,7 @@ defmodule InfluxElixir.Query.ResponseParserTest do
                {:ok, [%{"result" => "_result", "value" => "42.5"}]}
     end
 
-    test "a table with only annotation rows yields no rows" do
+    test "annotations a blank line ends belong to no table: the next one is untyped" do
       body = "#datatype,string,double\n\n,result,value\n,_result,1.5\n"
 
       assert ResponseParser.parse(body, :flux_csv) ===
@@ -241,9 +257,9 @@ defmodule InfluxElixir.Query.ResponseParserTest do
   describe "coerce_types/1" do
     test "converts time field to DateTime" do
       row = %{"time" => "2026-03-12T10:00:00Z", "value" => 42}
-      result = ResponseParser.coerce_types(row)
-      assert %DateTime{} = result["time"]
-      assert result["value"] === 42
+
+      assert ResponseParser.coerce_types(row) ===
+               %{"time" => ~U[2026-03-12 10:00:00.000000Z], "value" => 42}
     end
 
     test "leaves non-time fields unchanged" do

@@ -536,11 +536,11 @@ defmodule InfluxElixir.Client.HTTP do
           {:ok, map()} | {:error, term()}
   def health(connection) do
     with {:ok, %Finch.Response{body: resp_body}} <- get(connection, "/health", [200]) do
-      # A 200 with a non-JSON body (older builds answer plain text) is
+      # A 200 with a body that is no JSON object (older builds answer plain text, `OK`) is
       # still a passing health check.
       case Jason.decode(resp_body) do
-        {:ok, map} -> {:ok, map}
-        {:error, _json_err} -> {:ok, %{"status" => "pass"}}
+        {:ok, map} when is_map(map) -> {:ok, map}
+        _not_an_object -> {:ok, %{"status" => "pass"}}
       end
     end
   end

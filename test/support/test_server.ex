@@ -11,7 +11,7 @@ defmodule InfluxElixir.TestServer do
     * `black_hole/1` accepts connections and says nothing.
     * `controlled/1` announces each request to the test as
       `{:request, handler, body}` and answers it, and closes the
-      connection, when the test calls `respond/2`. Requests are served one
+      connection, when the test calls `respond/3`. Requests are served one
       at a time, which is how a single writer process issues them.
   """
 
@@ -51,9 +51,16 @@ defmodule InfluxElixir.TestServer do
     start_listener([{:packet, :http_bin} | @listen_options], &serve_requests(&1, owner))
   end
 
-  @doc "Answers the request `handler` announced with an empty response of `status`."
-  @spec respond(pid(), pos_integer()) :: {:respond, pos_integer()}
-  def respond(handler, status) when is_pid(handler), do: send(handler, {:respond, status})
+  @doc """
+  Answers the request `handler` announced with a response of `status`.
+
+  `body` is the whole body (empty by default), or `{:chunks, parts}`: a chunked response
+  whose every part is written to the socket on its own, as a streaming server sends it.
+  """
+  @spec respond(pid(), pos_integer(), binary() | {:chunks, [binary()]}) ::
+          {:respond, pos_integer(), binary() | {:chunks, [binary()]}}
+  def respond(handler, status, body \\ "") when is_pid(handler),
+    do: send(handler, {:respond, status, body})
 
   @spec start_listener(list(), (port() -> term())) :: :inet.port_number()
   defp start_listener(options, serve) do
@@ -99,7 +106,7 @@ defmodule InfluxElixir.TestServer do
     {:ok, socket} = :gen_tcp.accept(listener)
 
     case read_request(socket) do
-      {:ok, body} -> respond(socket, owner, body)
+      {:ok, body} -> answer(socket, owner, body)
       {:error, _closed} -> :ok = :gen_tcp.close(socket)
     end
 
@@ -116,21 +123,31 @@ defmodule InfluxElixir.TestServer do
     end
   end
 
-  @spec respond(port(), pid(), binary()) :: :ok
-  defp respond(socket, owner, body) do
+  @spec answer(port(), pid(), binary()) :: :ok
+  defp answer(socket, owner, body) do
     send(owner, {:request, self(), body})
 
     receive do
-      {:respond, status} ->
+      {:respond, status, body} ->
         # The client may have gone while the test decided; nothing to answer then.
-        _sent =
-          :gen_tcp.send(
-            socket,
-            "HTTP/1.1 #{status} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-          )
-
+        Enum.each(response(status, body), &:gen_tcp.send(socket, &1))
         :ok = :gen_tcp.close(socket)
     end
+  end
+
+  # The response as the writes that send it: one for a whole body, one per chunk otherwise.
+  @spec response(pos_integer(), binary() | {:chunks, [binary()]}) :: [iodata()]
+  defp response(status, {:chunks, parts}) do
+    head = "HTTP/1.1 #{status} X\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+    chunks = Enum.map(parts, &[Integer.to_string(byte_size(&1), 16), "\r\n", &1, "\r\n"])
+    [head | chunks] ++ ["0\r\n\r\n"]
+  end
+
+  defp response(status, body) do
+    [
+      "HTTP/1.1 #{status} X\r\ncontent-length: #{byte_size(body)}\r\n" <>
+        "connection: close\r\n\r\n" <> body
+    ]
   end
 
   @spec request_headers(port(), %{String.t() => String.t()}) ::

@@ -27,18 +27,18 @@ defmodule InfluxElixir.Query.InfluxQLTest do
                 ]}
     end
 
-    test "SHOW DATABASES works without database option", %{conn: conn} do
-      assert {:ok, dbs} = InfluxQL.query(conn, "SHOW DATABASES")
-      names = Enum.map(dbs, & &1["iox::database"])
-      assert "test_db" in names
+    test "SHOW DATABASES needs no database option", %{conn: conn} do
+      assert InfluxQL.query(conn, "SHOW DATABASES") ===
+               {:ok,
+                [
+                  %{"iox::database" => "_internal", "deleted" => false},
+                  %{"iox::database" => "test_db", "deleted" => false}
+                ]}
     end
 
-    test "SHOW MEASUREMENTS requires database option", %{conn: conn} do
-      assert {:ok, measurements} =
-               InfluxQL.query(conn, "SHOW MEASUREMENTS", database: "test_db")
-
-      names = Enum.map(measurements, & &1["name"])
-      assert "cpu" in names
+    test "SHOW MEASUREMENTS lists the measurements of the database option", %{conn: conn} do
+      assert InfluxQL.query(conn, "SHOW MEASUREMENTS", database: "test_db") ===
+               {:ok, [%{"iox::measurement" => "measurements", "name" => "cpu"}]}
     end
   end
 end

@@ -14,7 +14,7 @@ defmodule InfluxElixir.Config do
       unauthenticated instance, and no `Authorization` header is sent)
     * `:org` - Organization name (default: `""`)
     * `:database` - Default database name (default: `nil`)
-    * `:databases` - List of database names (LocalClient pre-creates them;
+    * `:databases` - List of database names (`Client.Local` pre-creates them;
       both clients default `:database` to the first item if `:database` is
       not set). Default: `[]`
     * `:port` - Port number (default: `8086`)
@@ -70,7 +70,7 @@ defmodule InfluxElixir.Config do
       type: {:list, :string},
       default: [],
       doc:
-        "List of database names. LocalClient pre-creates each; " <>
+        "List of database names. Client.Local pre-creates each; " <>
           "both clients default :database to the first item if :database is unset."
     ],
     port: [

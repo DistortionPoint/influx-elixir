@@ -20,7 +20,9 @@ defmodule InfluxElixir.Admin.BucketsTest do
                %{"type" => "expire", "everySeconds" => 0, "shardGroupDurationSeconds" => 604_800}
              ]
 
-      assert is_binary(bucket["id"])
+      # A bucket id is 16 lowercase hex digits, as InfluxDB 2's, and its links name it.
+      assert bucket["id"] =~ ~r/\A[0-9a-f]{16}\z/
+      assert bucket["links"]["self"] === "/api/v2/buckets/" <> bucket["id"]
       assert bucket["type"] === "user"
     end
 

@@ -27,8 +27,8 @@ defmodule InfluxElixir.Query.SQLStream do
   Each element in the stream is a parsed map representing one row.
 
   On the HTTP transport the response is decoded incrementally, so memory stays
-  constant regardless of result size. Error classes (missing database, non-2xx
-  status, transport failure) are raised as an `InfluxElixir.StreamError` when
+  constant regardless of result size. Error classes (missing database, a status other than 200,
+  transport failure) are raised as an `InfluxElixir.StreamError` when
   the stream is enumerated rather than surfacing as an empty result.
 
   A stream holds one pool connection while it is enumerated. Stopping early

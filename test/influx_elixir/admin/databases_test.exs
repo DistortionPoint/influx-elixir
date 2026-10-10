@@ -14,15 +14,16 @@ defmodule InfluxElixir.Admin.DatabasesTest do
       assert :ok = Databases.create(conn, "new_db")
       assert :ok = Databases.create(conn, "new_db")
 
-      assert {:ok, dbs} = Databases.list(conn)
-      assert "new_db" in Enum.map(dbs, & &1["name"])
+      assert Databases.list(conn) ===
+               {:ok, [%{"name" => "_internal"}, %{"name" => "new_db"}, %{"name" => "test_db"}]}
     end
 
     test "a valid retention duration is accepted and the database is created", %{conn: conn} do
       # Local validates the duration but keeps no retention, so none is observable.
       assert :ok = Databases.create(conn, "kept", retention: "30d")
-      assert {:ok, dbs} = Databases.list(conn)
-      assert %{"name" => "kept"} in dbs
+
+      assert Databases.list(conn) ===
+               {:ok, [%{"name" => "_internal"}, %{"name" => "kept"}, %{"name" => "test_db"}]}
     end
 
     test "an unreadable retention duration is the engine's 400 and creates nothing", %{conn: conn} do
@@ -35,8 +36,7 @@ defmodule InfluxElixir.Admin.DatabasesTest do
               }} =
                Databases.create(conn, "never", retention: "soon")
 
-      assert {:ok, dbs} = Databases.list(conn)
-      refute %{"name" => "never"} in dbs
+      assert Databases.list(conn) === {:ok, [%{"name" => "_internal"}, %{"name" => "test_db"}]}
     end
   end
 

@@ -34,7 +34,10 @@ defmodule InfluxElixir.Query.SQLTest do
 
       assert name |> SQL.query_stream("SELECT v FROM cpu") |> Enum.to_list() === [%{"v" => 1}]
       assert SQL.execute(name, "SELECT v FROM cpu") === {:ok, [%{"v" => 1}]}
-      assert {:ok, [_one, _two]} = InfluxElixir.Admin.Databases.list(name)
+
+      assert InfluxElixir.Admin.Databases.list(name) ===
+               {:ok, [%{"name" => "_internal"}, %{"name" => "named_db"}]}
+
       assert InfluxElixir.Admin.Health.check(name) === {:ok, %{"status" => "pass"}}
     end
   end

@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Query results, health and streams** (design document
+  `2026-10-10_review-of-query-and-admin.md`):
+  - `Client.query_result` includes the binary that `format: :parquet` returns, which its spec
+    did not allow.
+  - `Client.HTTP.health/1` returns a passing check for a 200 whose body is JSON but not an
+    object (`true`, `"OK"`). It used to return the decoded value, not the map its spec promises.
+  - A streamed SQL query splits only each new chunk into lines, so a long row sent in many
+    chunks is no longer re-scanned once per chunk. A blank CRLF line between rows is skipped
+    instead of raising a `:decode` `StreamError`.
+  - The telemetry examples show the client module as `transport:`, as the events carry it.
 - **`Client.Local.query_flux` answers as InfluxDB 2.7 does for filters on a key a row lacks, for
   every `yield`, and for string and boolean fields** (design document
   `2026-10-10_local-flux-pushdown-and-yields.md`; every rule below was read from 2.7.12):

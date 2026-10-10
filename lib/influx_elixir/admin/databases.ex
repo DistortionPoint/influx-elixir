@@ -6,7 +6,7 @@ defmodule InfluxElixir.Admin.Databases do
   it takes a connection or a connection name. Admin operations emit no
   telemetry span; only writes and queries do (see `InfluxElixir.Telemetry`).
 
-  In production this performs HTTP requests; in tests the `LocalClient`
+  In production this performs HTTP requests; in tests `InfluxElixir.Client.Local`
   is used for fast, isolated operation.
 
   ## Examples

@@ -10,15 +10,15 @@ defmodule InfluxElixir.Query.SQLStreamTest do
   end
 
   describe "stream/3" do
-    test "can be consumed with Enum.to_list", %{conn: conn} do
-      Local.write(conn, "cpu value=1i 1\ncpu value=2i 2", database: "test_db")
+    test "is the query's rows, in its order, when enumerated", %{conn: conn} do
+      {:ok, :written} = Local.write(conn, "cpu value=1i 1\ncpu value=2i 2", database: "test_db")
 
-      result =
-        conn
-        |> SQLStream.stream("SELECT * FROM cpu", database: "test_db")
-        |> Enum.to_list()
-
-      assert Enum.sort(Enum.map(result, & &1["value"])) === [1, 2]
+      assert conn
+             |> SQLStream.stream("SELECT * FROM cpu ORDER BY time", database: "test_db")
+             |> Enum.to_list() === [
+               %{"time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 1},
+               %{"time" => ~U[1970-01-01 00:00:00.000000Z], "value" => 2}
+             ]
     end
 
     test "without options reads the connection's default database" do
@@ -33,7 +33,10 @@ defmodule InfluxElixir.Query.SQLStreamTest do
     # an error, not a silent empty stream.
     test "raises StreamError when the table does not exist", %{conn: conn} do
       stream = SQLStream.stream(conn, "SELECT * FROM missing", database: "test_db")
-      assert_raise InfluxElixir.StreamError, fn -> Enum.to_list(stream) end
+      error = assert_raise InfluxElixir.StreamError, fn -> Enum.to_list(stream) end
+
+      assert {error.kind, error.status, error.body} ===
+               {:http_status, 400, "Error during planning: table 'public.iox.missing' not found"}
     end
   end
 end

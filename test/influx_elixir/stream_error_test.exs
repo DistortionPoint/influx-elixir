@@ -8,7 +8,10 @@ defmodule InfluxElixir.StreamErrorTest do
       error = StreamError.exception(kind: :no_database)
 
       assert error.kind === :no_database
-      assert error.message =~ "no database specified"
+
+      assert Exception.message(error) ===
+               "no database specified for streaming query: pass `database:` in opts " <>
+                 "or set `:database` on the connection"
     end
 
     test "builds an :http_status error carrying status and body" do
@@ -17,8 +20,7 @@ defmodule InfluxElixir.StreamErrorTest do
       assert error.kind === :http_status
       assert error.status === 404
       assert error.body === "not found"
-      assert error.message =~ "404"
-      assert error.message =~ "not found"
+      assert Exception.message(error) === "streaming query failed with HTTP status 404: not found"
     end
 
     test "builds a :transport error carrying the reason" do
@@ -27,14 +29,18 @@ defmodule InfluxElixir.StreamErrorTest do
 
       assert error.kind === :transport
       assert error.reason === reason
-      assert error.message =~ "transport error"
+
+      assert Exception.message(error) ===
+               "streaming query transport error: %Mint.TransportError{reason: :econnrefused}"
     end
 
     test "builds a :decode error carrying the reason" do
       error = StreamError.exception(kind: :decode, reason: :unexpected_byte)
 
       assert error.kind === :decode
-      assert error.message =~ "decode"
+
+      assert Exception.message(error) ===
+               "failed to decode JSONL row in streaming response: :unexpected_byte"
     end
 
     test "defaults to :transport when kind is omitted" do
@@ -44,7 +50,9 @@ defmodule InfluxElixir.StreamErrorTest do
 
     test "inspects a non-binary http body" do
       error = StreamError.exception(kind: :http_status, status: 500, body: %{"e" => 1})
-      assert error.message =~ ~s(%{"e" => 1})
+
+      assert Exception.message(error) ===
+               ~s(streaming query failed with HTTP status 500: %{"e" => 1})
     end
 
     test "builds an :unsupported error carrying the reason" do
@@ -52,7 +60,9 @@ defmodule InfluxElixir.StreamErrorTest do
 
       assert error.kind === :unsupported
       assert error.reason === :unsupported_operation
-      assert error.message =~ "not supported"
+
+      assert Exception.message(error) ===
+               "streaming query is not supported by this connection: :unsupported_operation"
     end
 
     test "is raisable and rescuable" do
@@ -63,21 +73,11 @@ defmodule InfluxElixir.StreamErrorTest do
   end
 
   describe "stream/1" do
-    test "returns an enumerable that does not raise on construction" do
-      stream = StreamError.stream(kind: :http_status, status: 500, body: "boom")
-      assert Enumerable.impl_for(stream)
-    end
-
-    test "raises the configured error when enumerated" do
+    test "raises the configured error when enumerated, not when built" do
+      # Building it raised nothing, or this line would not be reached.
       stream = StreamError.stream(kind: :http_status, status: 500, body: "boom")
 
-      error =
-        try do
-          Enum.to_list(stream)
-          nil
-        rescue
-          e in StreamError -> e
-        end
+      error = assert_raise StreamError, fn -> Enum.to_list(stream) end
 
       assert error.kind === :http_status
       assert error.status === 500

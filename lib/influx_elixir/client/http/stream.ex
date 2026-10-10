@@ -163,11 +163,11 @@ defmodule InfluxElixir.Client.HTTP.Stream do
   end
 
   # Decode a data chunk. On a 200 response, complete JSONL lines are decoded
-  # and emitted while the trailing partial line is buffered. On a non-2xx
+  # and emitted while the trailing partial line is buffered. On any other
   # response, the body is accumulated so it can be reported when the stream ends.
   @spec handle_data(stream_state(), binary()) :: {[map()], stream_state()}
   defp handle_data(%{status: 200, buffer: buffer} = state, data) do
-    {lines, rest} = split_lines(buffer <> data)
+    {lines, rest} = split_lines(buffer, data)
     {Enum.map(lines, &decode_line/1), %{state | buffer: rest}}
   end
 
@@ -194,13 +194,16 @@ defmodule InfluxElixir.Client.HTTP.Stream do
       body: IO.iodata_to_binary(acc)
   end
 
-  # Split accumulated bytes into complete lines plus a trailing remainder that
-  # has not yet been terminated by a newline. Blank lines are dropped.
-  @spec split_lines(binary()) :: {[binary()], binary()}
-  defp split_lines(data) do
-    parts = String.split(data, "\n")
-    {complete, [rest]} = Enum.split(parts, length(parts) - 1)
-    {Enum.reject(complete, &(&1 == "")), rest}
+  # Split a chunk into the lines it completes plus a trailing remainder that has not yet been
+  # terminated by a newline. Only the new chunk is scanned: the buffered start of a line is
+  # joined to the chunk's first piece, so a line arriving over many chunks costs its length
+  # once, not once per chunk. Blank lines (a `\r\n` terminator's lone `\r` among them) are
+  # dropped, as the end of the stream drops a blank remainder.
+  @spec split_lines(binary(), binary()) :: {[binary()], binary()}
+  defp split_lines(buffer, data) do
+    [first | parts] = :binary.split(data, "\n", [:global])
+    {complete, [rest]} = Enum.split([buffer <> first | parts], length(parts))
+    {Enum.reject(complete, &(String.trim(&1) == "")), rest}
   end
 
   # The same coercion `query_sql/3` applies (timestamps become DateTimes),
