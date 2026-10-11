@@ -309,14 +309,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # A `time` in arithmetic, beside a name or matched by a regular expression: the engine's
   # planning error is its own (`time = time`, `time - 1 > 0`), which the double does not word
   # for a measurement it fails to plan anyway.
+  # Each token is read in a window of the two either side (`nil` past the ends), one pass.
   @spec odd_time?(binary()) :: boolean()
   defp odd_time?(where) do
     case InfluxQLTokens.tokenize(where, []) do
       {:ok, tokens} ->
-        tokens
-        |> Enum.with_index()
-        |> Enum.any?(fn {token, at} ->
-          InfluxQLTokens.time?(token) and odd_neighbours?(tokens, at)
+        [[nil, nil], tokens, [nil, nil]]
+        |> Enum.concat()
+        |> Enum.chunk_every(5, 1, :discard)
+        |> Enum.any?(fn [before2, before, token, next, next2] ->
+          InfluxQLTokens.time?(token) and odd_neighbours?(before2, before, next, next2)
         end)
 
       _unread ->
@@ -324,12 +326,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     end
   end
 
-  defp odd_neighbours?(tokens, at) do
-    before = if at > 0, do: Enum.at(tokens, at - 1)
-    before2 = if at > 1, do: Enum.at(tokens, at - 2)
-    next = Enum.at(tokens, at + 1)
-    next2 = Enum.at(tokens, at + 2)
-
+  defp odd_neighbours?(before2, before, next, next2) do
     arithmetic?(before) or arithmetic?(next) or
       match?({:op, op} when op in ["=~", "!~"], next) or
       match?({:op, op} when op in ["=~", "!~"], before) or

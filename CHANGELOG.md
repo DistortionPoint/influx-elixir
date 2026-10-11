@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Local's `SHOW TAG KEYS ... WHERE` costs a line in its condition** (design document
+  `2026-10-11_review-of-influxql-show-cost.md`). Over a measurement with no tag, every
+  `time` in the condition was checked against its neighbours by a walk of the token list,
+  a square in the condition's length. Each token is now read in one pass. A chain of 500
+  `time` comparisons cost 7.6 times one of 125; it now grows as the condition does.
 - **Local's Flux engine, as InfluxDB 2.7** (design document `2026-10-10_review-of-local-flux.md`):
   - An integer or unsigned `sum()` wraps in 64 bits, and `mean()` divides the wrapped sum.
     They used to return the exact sum.
