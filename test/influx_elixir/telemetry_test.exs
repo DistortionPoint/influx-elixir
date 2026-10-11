@@ -80,7 +80,7 @@ defmodule InfluxElixir.TelemetryTest do
           Telemetry.span_write(metadata, fn -> :ok end)
         end)
 
-      assert_receive {:telemetry, [:influx_elixir, :write, :start], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :write, :start], measurements, recv_meta}
       assert_wall_clock(measurements.system_time, before, later)
 
       assert without_span_context(recv_meta) ===
@@ -93,7 +93,7 @@ defmodule InfluxElixir.TelemetryTest do
 
       assert Telemetry.span_write(metadata, timed(fn -> {:ok, :written} end)) === {:ok, :written}
 
-      assert_receive {:telemetry, [:influx_elixir, :write, :stop], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :write, :stop], measurements, recv_meta}
       assert_spans_function(measurements.duration)
 
       assert without_span_context(recv_meta) ===
@@ -108,7 +108,7 @@ defmodule InfluxElixir.TelemetryTest do
         Telemetry.span_write(metadata, timed(fn -> raise "boom" end))
       end
 
-      assert_receive {:telemetry, [:influx_elixir, :write, :exception], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :write, :exception], measurements, recv_meta}
 
       assert_spans_function(measurements.duration)
 
@@ -145,7 +145,7 @@ defmodule InfluxElixir.TelemetryTest do
           Telemetry.span_query(metadata, fn -> {:ok, []} end)
         end)
 
-      assert_receive {:telemetry, [:influx_elixir, :query, :start], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :query, :start], measurements, recv_meta}
       assert_wall_clock(measurements.system_time, before, later)
       assert without_span_context(recv_meta) === %{database: "testdb", transport: :http}
     end
@@ -157,7 +157,7 @@ defmodule InfluxElixir.TelemetryTest do
       assert Telemetry.span_query(metadata, timed(fn -> {:ok, [%{"col" => 1}]} end)) ===
                {:ok, [%{"col" => 1}]}
 
-      assert_receive {:telemetry, [:influx_elixir, :query, :stop], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :query, :stop], measurements, recv_meta}
       assert_spans_function(measurements.duration)
 
       assert without_span_context(recv_meta) ===
@@ -172,7 +172,7 @@ defmodule InfluxElixir.TelemetryTest do
         Telemetry.span_query(metadata, timed(fn -> raise ArgumentError, "bad query" end))
       end
 
-      assert_receive {:telemetry, [:influx_elixir, :query, :exception], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :query, :exception], measurements, recv_meta}
 
       assert_spans_function(measurements.duration)
 
@@ -206,7 +206,7 @@ defmodule InfluxElixir.TelemetryTest do
       {from_mono, to_mono} =
         bracketed(&System.monotonic_time/0, fn -> Telemetry.write_start(meta) end)
 
-      assert_receive {:telemetry, [:influx_elixir, :write, :start], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :write, :start], measurements, recv_meta}
       assert_wall_clock(measurements.system_time, from_mono, to_mono)
       assert measurements.monotonic_time >= from_mono and measurements.monotonic_time <= to_mono
       assert recv_meta === meta
@@ -221,7 +221,7 @@ defmodule InfluxElixir.TelemetryTest do
       {before, later} =
         bracketed(&System.monotonic_time/0, fn -> Telemetry.write_stop(12_345, meta) end)
 
-      assert_receive {:telemetry, [:influx_elixir, :write, :stop], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :write, :stop], measurements, recv_meta}
       assert measurements.duration === 12_345
       assert measurements.monotonic_time >= before and measurements.monotonic_time <= later
       assert recv_meta === meta
@@ -236,7 +236,7 @@ defmodule InfluxElixir.TelemetryTest do
       {before, later} =
         bracketed(&System.monotonic_time/0, fn -> Telemetry.write_exception(99_999, meta) end)
 
-      assert_receive {:telemetry, [:influx_elixir, :write, :exception], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :write, :exception], measurements, recv_meta}
 
       assert measurements.duration === 99_999
       assert measurements.monotonic_time >= before and measurements.monotonic_time <= later
@@ -252,7 +252,7 @@ defmodule InfluxElixir.TelemetryTest do
       {from_mono, to_mono} =
         bracketed(&System.monotonic_time/0, fn -> Telemetry.query_start(meta) end)
 
-      assert_receive {:telemetry, [:influx_elixir, :query, :start], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :query, :start], measurements, recv_meta}
       assert_wall_clock(measurements.system_time, from_mono, to_mono)
       assert measurements.monotonic_time >= from_mono and measurements.monotonic_time <= to_mono
       assert recv_meta === meta
@@ -267,7 +267,7 @@ defmodule InfluxElixir.TelemetryTest do
       {before, later} =
         bracketed(&System.monotonic_time/0, fn -> Telemetry.query_stop(55_000, meta) end)
 
-      assert_receive {:telemetry, [:influx_elixir, :query, :stop], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :query, :stop], measurements, recv_meta}
       assert measurements.duration === 55_000
       assert measurements.monotonic_time >= before and measurements.monotonic_time <= later
       assert recv_meta === meta
@@ -289,7 +289,7 @@ defmodule InfluxElixir.TelemetryTest do
       {before, later} =
         bracketed(&System.monotonic_time/0, fn -> Telemetry.query_exception(77_777, meta) end)
 
-      assert_receive {:telemetry, [:influx_elixir, :query, :exception], measurements, recv_meta}
+      assert_received {:telemetry, [:influx_elixir, :query, :exception], measurements, recv_meta}
 
       assert measurements.duration === 77_777
       assert measurements.monotonic_time >= before and measurements.monotonic_time <= later

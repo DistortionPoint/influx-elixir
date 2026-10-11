@@ -345,7 +345,7 @@ defmodule InfluxElixirTest do
       lp = "cpu value=1i\ncpu value=2i"
       assert InfluxElixir.write(conn, lp, database: "test_db") === {:ok, :written}
 
-      assert_receive {:telemetry, [:influx_elixir, :write, :stop], _measurements, metadata}
+      assert_received {:telemetry, [:influx_elixir, :write, :stop], _measurements, metadata}
 
       assert without_span_context(metadata) ===
                %{database: "test_db", bytes: byte_size(lp), point_count: 2, result: :ok}
@@ -355,7 +355,7 @@ defmodule InfluxElixirTest do
       assert InfluxElixir.query_sql(conn, "SELECT * FROM cpu", database: "test_db") ===
                {:ok, [%{"time" => @time, "value" => 1}]}
 
-      assert_receive {:telemetry, [:influx_elixir, :query, :stop], _measurements, metadata}
+      assert_received {:telemetry, [:influx_elixir, :query, :stop], _measurements, metadata}
 
       assert without_span_context(metadata) ===
                %{
@@ -374,7 +374,7 @@ defmodule InfluxElixirTest do
                   body: "Error during planning: table 'public.iox.nope' not found"
                 }}
 
-      assert_receive {:telemetry, [:influx_elixir, :query, :stop], _measurements, metadata}
+      assert_received {:telemetry, [:influx_elixir, :query, :stop], _measurements, metadata}
 
       # No row_count: the result was an error, not a list of rows.
       assert without_span_context(metadata) ===

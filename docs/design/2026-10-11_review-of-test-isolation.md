@@ -79,6 +79,24 @@ A sweep with no open GitHub issues, and with every library module reviewed in th
   - The line `each_case/2` gives for an exception is that exception's own message.
     Elixir words it, so the expected line is built with `Exception.message/1`.
 
+### Telemetry events asserted as already received
+
+- `TestSupport.Telemetry` forwards only the events emitted in the test's own process, so
+  each test sees its own events alone. A forwarded event is therefore in the mailbox
+  before the call that emitted it returns.
+- The telemetry tests waited for each event with `assert_receive`, up to its default
+  100 ms. They now assert it with `assert_received`, which states the guarantee exactly.
+  An event emitted late, or from another process, now fails the test instead of being
+  waited for.
+
+### Also checked, and left
+
+- **No fixed waits.** No test sleeps a fixed time, and every `receive ... after` and
+  `assert_receive` with a bound uses `Await.bound/0`.
+- **Tests with no assertion.** The only one is the Flight test that an empty token sends no
+  `Bearer`. It is a refutation by design: gRPC's header compression leaves the header name
+  unreadable in the bytes, and the helper already requires that the request was sent.
+
 ## Verification
 
 The unit tier, coverage and every gate were run one at a time.
