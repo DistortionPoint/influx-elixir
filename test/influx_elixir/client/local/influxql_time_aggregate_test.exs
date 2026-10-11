@@ -18,15 +18,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeAggregateTest do
   end
 
   for {statement, reason} <- [
-        {"SELECT percentile(time, 50), max(usage) FROM cpu", "percentile() of time"},
-        {"SELECT integral(time), max(usage) FROM cpu", "integral() of time"},
+        {"SELECT percentile(time, 50), max(usage) FROM cpu",
+         "percentile() of time beside a field"},
+        {"SELECT integral(time), max(usage) FROM cpu", "integral() of time beside a field"},
         {"SELECT mode(time), max(usage) FROM cpu", "mode() of values equally often there"}
       ] do
     test "#{statement} is refused by name", %{conn: conn} do
-      assert {:error, %{status: 400, body: "Client.Local: " <> body}} =
-               Local.query_influxql(conn, unquote(statement), database: "t_db")
-
-      assert body =~ unquote(reason)
+      assert Local.query_influxql(conn, unquote(statement), database: "t_db") ===
+               {:error,
+                %{status: 400, body: "Client.Local: unsupported InfluxQL (#{unquote(reason)})"}}
     end
   end
 end

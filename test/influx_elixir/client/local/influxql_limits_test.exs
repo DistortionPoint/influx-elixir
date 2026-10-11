@@ -58,23 +58,31 @@ defmodule InfluxElixir.Client.Local.InfluxQLLimitsTest do
 
   defp sources(name, count), do: "SELECT v FROM " <> Enum.join(List.duplicate(name, count), ", ")
 
+  @sources_refusal "Client.Local: unsupported InfluxQL (more than 2500 sources in FROM)"
+  @points_refusal "Client.Local: unsupported InfluxQL (a measurement named more than once in " <>
+                    "FROM over more than 20000 points)"
+
+  defp refused(body), do: {:error, %{status: 400, body: body}}
+
   describe "the list of sources of FROM" do
     test "a list of 2,500 sources is read, one of 2,501 is refused by name", %{conn: conn} do
       assert {:ok, rows} = capped(conn, sources("five_a", 2_500))
       assert length(rows) === 12_500
 
-      assert {:error, %{status: 400, body: body}} = capped(conn, sources("five_a", 2_501))
-      assert body =~ "Client.Local: unsupported InfluxQL (more than 2500 sources in FROM)"
+      statement = sources("five_a", 2_501)
+      assert capped(conn, statement) === refused(@sources_refusal <> ": " <> statement)
     end
 
     test "a list of forty thousand sources is refused before anything is read", %{conn: conn} do
-      assert {:error, %{status: 400, body: body}} = capped(conn, sources("nine", 40_000))
-      assert body =~ "more than 2500 sources in FROM"
+      statement = sources("nine", 40_000)
+      assert capped(conn, statement) === refused(@sources_refusal <> ": " <> statement)
     end
 
     test "a statement of more than 256 KiB is refused by name, unread", %{conn: conn} do
-      assert {:error, %{status: 400, body: body}} = capped(conn, sources("five_a", 100_001))
-      assert body =~ "Client.Local: unsupported InfluxQL (a statement of more than 262144 bytes)"
+      assert capped(conn, sources("five_a", 100_001)) ===
+               refused(
+                 "Client.Local: unsupported InfluxQL (a statement of more than 262144 bytes)"
+               )
     end
   end
 
@@ -84,15 +92,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLLimitsTest do
       assert {:ok, rows} = capped(conn, sources("nine", 2_222))
       assert length(rows) === 19_998
 
-      assert {:error, %{status: 400, body: body}} = capped(conn, sources("nine", 2_223))
-      assert body =~ "over more than 20000 points"
+      assert capped(conn, sources("nine", 2_223)) === refused(@points_refusal)
 
       # Three measurements of five points, each repeated 1,500 times: 7,500 points each is
       # under the bound, the 22,500 together are not.
       regex = "/^five_/"
       statement = "SELECT v FROM " <> Enum.join(List.duplicate(regex, 1_500), ", ")
-      assert {:error, %{status: 400, body: body}} = capped(conn, statement)
-      assert body =~ "over more than 20000 points"
+      assert capped(conn, statement) === refused(@points_refusal)
 
       two = "SELECT v FROM " <> Enum.join(List.duplicate("five_a, five_b", 1_000), ", ")
       assert {:ok, rows} = capped(conn, two)

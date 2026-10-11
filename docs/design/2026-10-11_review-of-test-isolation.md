@@ -62,6 +62,23 @@ A sweep with no open GitHub issues, and with every library module reviewed in th
   stamped by the write call asserted only `year > 2000`. It now asserts that the stamp lies
   between clock reads taken before and after that call.
 
+### Refusals and failure messages compared whole
+
+- **Local's refusals.** The InfluxQL limits, time-aggregate and SQL qualifier tests matched
+  a fragment of each refusal with `=~`. The whole message is fixed text, so each is now
+  compared whole, with `===`.
+  - The refusal of a statement with too many sources quotes the statement back after a
+    colon, which the fragment never showed. The test now pins it.
+  - The refusal of a statement over 256 KiB quotes nothing, so the statement is not read
+    back.
+- **`TestSupport.Check`.** Its tests matched pieces of the failure messages. Each is now
+  the exact message: the counts, the headings, and every case named in sorted order.
+  - `each_case/2` and `assert_rows_close/3` had no failure test, though the module says
+    their failure paths are pinned. Both have one now, including a map with other keys
+    and a list of another length.
+  - The line `each_case/2` gives for an exception is that exception's own message.
+    Elixir words it, so the expected line is built with `Exception.message/1`.
+
 ## Verification
 
 The unit tier, coverage and every gate were run one at a time.

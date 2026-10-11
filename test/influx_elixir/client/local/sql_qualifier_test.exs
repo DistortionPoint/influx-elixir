@@ -17,6 +17,9 @@ defmodule InfluxElixir.Client.Local.SqlQualifierTest do
     {:ok, conn: conn}
   end
 
+  @refusal "Client.Local: a column used as the relation of another (the engine reads it as a " <>
+             "field of that column and fails by the column's type and the clause)"
+
   for sql <- [
         "SELECT x.host FROM main",
         "SELECT n.y FROM main m",
@@ -24,10 +27,8 @@ defmodule InfluxElixir.Client.Local.SqlQualifierTest do
         "SELECT max(n.y) FROM main"
       ] do
     test "#{sql} is refused by name", %{conn: conn} do
-      assert {:error, %{status: 400, body: "Client.Local: " <> reason}} =
-               Local.query_sql(conn, unquote(sql), database: "q_db")
-
-      assert reason =~ "a column used as the relation of another"
+      assert Local.query_sql(conn, unquote(sql), database: "q_db") ===
+               {:error, %{status: 400, body: @refusal}}
     end
   end
 end
