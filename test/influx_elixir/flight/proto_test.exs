@@ -1,4 +1,7 @@
 defmodule InfluxElixir.Flight.ProtoTest do
+  # The Flight messages against the wire bytes Arrow's `Flight.proto` gives them. A round
+  # trip alone holds for any field numbering, so every message is pinned to its bytes: a tag
+  # byte is `field_number <<< 3 ||| wire_type` (0 varint, 2 length-delimited).
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Flight.Proto.{
@@ -13,204 +16,72 @@ defmodule InfluxElixir.Flight.ProtoTest do
     Ticket
   }
 
-  describe "Ticket" do
-    test "encodes and decodes ticket bytes round-trip" do
-      payload = ~s({"database":"mydb","sql_query":"SELECT 1","query_type":"sql"})
-      ticket = %Ticket{ticket: payload}
-      encoded = Protobuf.encode(ticket)
-      decoded = Protobuf.decode(encoded, Ticket)
-      assert decoded.ticket === payload
-    end
-
-    test "encodes empty ticket" do
-      ticket = %Ticket{ticket: ""}
-      encoded = Protobuf.encode(ticket)
-      decoded = Protobuf.decode(encoded, Ticket)
-      assert decoded.ticket === ""
-    end
-
-    test "struct defaults to empty bytes" do
-      assert %Ticket{}.ticket === ""
-    end
+  # Encodes `message` to exactly `bytes`, and decodes `bytes` back to `message`.
+  defp assert_wire(message, bytes) do
+    assert IO.iodata_to_binary(Protobuf.encode(message)) === bytes
+    assert Protobuf.decode(bytes, message.__struct__) === message
   end
 
-  describe "FlightDescriptor" do
-    test "encodes and decodes with type and cmd" do
-      desc = %FlightDescriptor{type: 2, cmd: "SELECT * FROM cpu"}
-      encoded = Protobuf.encode(desc)
-      decoded = Protobuf.decode(encoded, FlightDescriptor)
-      assert decoded.type === 2
-      assert decoded.cmd === "SELECT * FROM cpu"
-    end
-
-    test "encodes and decodes with path" do
-      desc = %FlightDescriptor{type: 1, path: ["bucket", "table"]}
-      encoded = Protobuf.encode(desc)
-      decoded = Protobuf.decode(encoded, FlightDescriptor)
-      assert decoded.path === ["bucket", "table"]
-    end
-
-    test "defaults to empty values" do
-      desc = %FlightDescriptor{}
-      assert desc.type === 0
-      assert desc.cmd === ""
-      assert desc.path === []
-    end
+  test "Ticket: the ticket is bytes field 1" do
+    assert_wire(%Ticket{ticket: ~s({"database":"db"})}, <<0x0A, 17, ~s({"database":"db"})>>)
   end
 
-  describe "Location" do
-    test "encodes and decodes URI" do
-      loc = %Location{uri: "grpc+tls://influxdb.example.com:443"}
-      encoded = Protobuf.encode(loc)
-      decoded = Protobuf.decode(encoded, Location)
-      assert decoded.uri === "grpc+tls://influxdb.example.com:443"
-    end
-
-    test "defaults to empty string" do
-      assert %Location{}.uri === ""
-    end
-  end
-
-  describe "FlightEndpoint" do
-    test "encodes and decodes ticket and locations" do
-      endpoint = %FlightEndpoint{
-        ticket: %Ticket{ticket: "tok"},
-        location: [%Location{uri: "grpc://host:443"}]
-      }
-
-      encoded = Protobuf.encode(endpoint)
-      decoded = Protobuf.decode(encoded, FlightEndpoint)
-      assert decoded.ticket.ticket === "tok"
-      assert length(decoded.location) === 1
-      assert hd(decoded.location).uri === "grpc://host:443"
-    end
-
-    test "defaults to nil ticket and empty locations" do
-      ep = %FlightEndpoint{}
-      assert ep.ticket === nil
-      assert ep.location === []
-    end
-  end
-
-  describe "FlightInfo" do
-    test "encodes and decodes all fields" do
-      info = %FlightInfo{
-        schema: <<1, 2, 3>>,
-        flight_descriptor: %FlightDescriptor{type: 2, cmd: "q"},
-        endpoint: [
-          %FlightEndpoint{ticket: %Ticket{ticket: "t"}}
-        ],
-        total_records: 1_000,
-        total_bytes: 512_000
-      }
-
-      encoded = Protobuf.encode(info)
-      decoded = Protobuf.decode(encoded, FlightInfo)
-      assert decoded.schema === <<1, 2, 3>>
-      assert decoded.flight_descriptor.cmd === "q"
-      assert decoded.total_records === 1_000
-      assert decoded.total_bytes === 512_000
-      assert length(decoded.endpoint) === 1
-    end
-
-    test "defaults correctly" do
-      info = %FlightInfo{}
-      assert info.schema === ""
-      assert info.total_records === 0
-      assert info.total_bytes === 0
-    end
-  end
-
-  describe "FlightData" do
-    test "encodes and decodes all fields" do
-      fd = %FlightData{
-        flight_descriptor: %FlightDescriptor{type: 0},
-        data_header: <<10, 20, 30>>,
-        app_metadata: "meta",
+  test "FlightData: descriptor 1, data_header 2, app_metadata 3, data_body 1000" do
+    # field 1000, wire type 2 is the tag 8002, the varint <<0xC2, 0x3E>>
+    assert_wire(
+      %FlightData{
+        flight_descriptor: %FlightDescriptor{type: 2},
+        data_header: <<10, 20>>,
+        app_metadata: "m",
         data_body: <<40, 50, 60>>
-      }
-
-      encoded = Protobuf.encode(fd)
-      decoded = Protobuf.decode(encoded, FlightData)
-      assert decoded.data_header === <<10, 20, 30>>
-      assert decoded.app_metadata === "meta"
-      assert decoded.data_body === <<40, 50, 60>>
-    end
-
-    test "data_body field number is 1000 (high field number survives round-trip)" do
-      fd = %FlightData{data_body: "body_content"}
-      encoded = Protobuf.encode(fd)
-      decoded = Protobuf.decode(encoded, FlightData)
-      assert decoded.data_body === "body_content"
-    end
-
-    test "defaults to empty binaries" do
-      fd = %FlightData{}
-      assert fd.data_header === ""
-      assert fd.app_metadata === ""
-      assert fd.data_body === ""
-    end
+      },
+      <<0x0A, 2, 0x08, 2, 0x12, 2, 10, 20, 0x1A, 1, "m", 0xC2, 0x3E, 3, 40, 50, 60>>
+    )
   end
 
-  describe "HandshakeRequest" do
-    test "encodes and decodes protocol_version and payload" do
-      req = %HandshakeRequest{protocol_version: 1, payload: "bearer-token"}
-      encoded = Protobuf.encode(req)
-      decoded = Protobuf.decode(encoded, HandshakeRequest)
-      assert decoded.protocol_version === 1
-      assert decoded.payload === "bearer-token"
-    end
-
-    test "defaults to zero version and empty payload" do
-      req = %HandshakeRequest{}
-      assert req.protocol_version === 0
-      assert req.payload === ""
-    end
+  test "FlightDescriptor: type 1 (a varint), cmd 2, path 3 repeated" do
+    assert_wire(
+      %FlightDescriptor{type: 2, cmd: "q", path: ["a", "b"]},
+      <<0x08, 2, 0x12, 1, "q", 0x1A, 1, "a", 0x1A, 1, "b">>
+    )
   end
 
-  describe "HandshakeResponse" do
-    test "encodes and decodes protocol_version and payload" do
-      resp = %HandshakeResponse{protocol_version: 2, payload: "session-token"}
-      encoded = Protobuf.encode(resp)
-      decoded = Protobuf.decode(encoded, HandshakeResponse)
-      assert decoded.protocol_version === 2
-      assert decoded.payload === "session-token"
-    end
+  test "Location, FlightEndpoint and FlightInfo nest by their field numbers" do
+    assert_wire(%Location{uri: "grpc://h:443"}, <<0x0A, 12, "grpc://h:443">>)
+
+    endpoint = %FlightEndpoint{ticket: %Ticket{ticket: "t"}, location: [%Location{uri: "u"}]}
+    endpoint_bytes = <<0x0A, 3, 0x0A, 1, "t", 0x12, 3, 0x0A, 1, "u">>
+    assert_wire(endpoint, endpoint_bytes)
+
+    # total_records 1000 is the varint <<0xE8, 0x07>>
+    assert_wire(
+      %FlightInfo{
+        schema: <<1, 2>>,
+        flight_descriptor: %FlightDescriptor{type: 2},
+        endpoint: [endpoint],
+        total_records: 1_000,
+        total_bytes: 5
+      },
+      <<0x0A, 2, 1, 2, 0x12, 2, 0x08, 2, 0x1A, byte_size(endpoint_bytes)>> <>
+        endpoint_bytes <> <<0x20, 0xE8, 0x07, 0x28, 5>>
+    )
   end
 
-  describe "FlightService.Service" do
-    test "has the correct gRPC service name" do
-      assert FlightService.Service.__meta__(:name) ===
-               "arrow.flight.protocol.FlightService"
-    end
+  test "Handshake messages: protocol_version 1 (a varint), payload 2" do
+    assert_wire(%HandshakeRequest{protocol_version: 1, payload: "p"}, <<0x08, 1, 0x12, 1, "p">>)
+    assert_wire(%HandshakeResponse{protocol_version: 2, payload: "s"}, <<0x08, 2, 0x12, 1, "s">>)
+  end
 
-    test "defines DoGet and GetFlightInfo RPC calls" do
-      rpc_names =
-        FlightService.Service.__rpc_calls__()
-        |> Enum.map(fn {name, _req, _resp, _opts} -> name end)
+  test "the service is Arrow's FlightService: DoGet streams, GetFlightInfo is unary" do
+    assert FlightService.Service.__meta__(:name) === "arrow.flight.protocol.FlightService"
 
-      assert :DoGet in rpc_names
-      assert :GetFlightInfo in rpc_names
-    end
+    calls =
+      for {name, request, reply, _opts} <- FlightService.Service.__rpc_calls__(),
+          do: {name, request, reply}
 
-    test "DoGet is a server-streaming call" do
-      rpc_call =
-        FlightService.Service.__rpc_calls__()
-        |> Enum.find(fn {name, _req, _resp, _opts} -> name === :DoGet end)
-
-      {_name, {_req, req_stream?}, {_resp, resp_stream?}, _opts} = rpc_call
-      assert req_stream? === false
-      assert resp_stream? === true
-    end
-
-    test "GetFlightInfo is a unary call" do
-      rpc_call =
-        FlightService.Service.__rpc_calls__()
-        |> Enum.find(fn {name, _req, _resp, _opts} -> name === :GetFlightInfo end)
-
-      {_name, {_req, req_stream?}, {_resp, resp_stream?}, _opts} = rpc_call
-      assert req_stream? === false
-      assert resp_stream? === false
-    end
+    assert Enum.sort(calls) === [
+             {:DoGet, {Ticket, false}, {FlightData, true}},
+             {:GetFlightInfo, {FlightDescriptor, false}, {FlightInfo, false}}
+           ]
   end
 end

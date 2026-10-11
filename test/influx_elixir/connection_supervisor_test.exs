@@ -207,7 +207,8 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       name = unique_name()
       {:ok, sup} = ConnectionSupervisor.start_link(name: name, databases: ["x"])
 
-      assert {:ok, _connection} = Connection.get(name)
+      {:ok, connection} = Connection.get(name)
+      assert Map.delete(connection, :table) === %{profile: :v3_core, database: "x", org: "local"}
       :ok = Supervisor.stop(sup)
 
       assert Connection.get(name) === {:error, :not_found}
@@ -239,18 +240,11 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       name = unique_name()
       token = "secret-token-#{System.unique_integer([:positive])}"
 
-      log =
-        capture_log(fn ->
-          assert {:error, reason} =
-                   InfluxElixir.add_connection(name,
-                     token: token,
-                     batch_writer: [batch_size: 0]
-                   )
-
-          send(self(), {:reason, reason})
+      {{:error, reason}, log} =
+        with_log(fn ->
+          InfluxElixir.add_connection(name, token: token, batch_writer: [batch_size: 0])
         end)
 
-      assert_received {:reason, reason}
       assert inspect(reason) =~ "invalid value for :batch_size option"
       refute inspect(reason, limit: :infinity, printable_limit: :infinity) =~ token
       refute log =~ token
