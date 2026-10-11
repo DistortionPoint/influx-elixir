@@ -29,15 +29,17 @@ defmodule InfluxElixir.Client.Local.FluxPushdownRefusalsTest do
     Jason.decode!(body)["message"]
   end
 
-  test "an unsigned field is read, summed and counted, but not compared", %{conn: conn} do
-    assert {:ok, [%{"_value" => 5}, %{"_value" => 6}]} =
-             Local.query_flux(conn, @head <> ~S[ |> filter(fn: (r) => r._field == "u")])
+  defp values(conn, tail) do
+    {:ok, rows} = Local.query_flux(conn, @head <> tail)
+    Enum.map(rows, & &1["_value"])
+  end
 
-    assert {:ok, [%{"_value" => 11}]} =
-             Local.query_flux(
-               conn,
-               @head <> ~S[ |> filter(fn: (r) => r._field == "u") |> sum()]
-             )
+  test "an unsigned field is read, summed and counted, but not compared", %{conn: conn} do
+    field = ~S[ |> filter(fn: (r) => r._field == "u")]
+
+    assert values(conn, field) === [5, 6]
+    assert values(conn, field <> " |> sum()") === [11]
+    assert values(conn, field <> " |> count()") === [2]
 
     assert message(conn, ~S[ |> filter(fn: (r) => r._field == "u" and r._value > 1)]) ===
              "Client.Local: a comparison of the _value of an unsigned field is not modelled"
@@ -87,22 +89,50 @@ defmodule InfluxElixir.Client.Local.FluxPushdownRefusalsTest do
                "on the plan (and on which series storage has dropped)"
   end
 
-  test "a result with no name, and two of one name, are refused", %{conn: conn} do
+  test "a result with no name, or named by an expression, is refused", %{conn: conn} do
     assert message(conn, ~S[ |> yield(name: "")]) ===
              "Client.Local: unsupported yield(): a result with no name"
 
-    assert message(conn, ~S[ |> yield(name: "a") |> yield(name: "a")]) ===
-             "error in building plan while starting program: found more than one call to " <>
-               "yield() with the name \"a\""
+    assert message(conn, ~S[ |> yield(name: "a" + "b")]) ===
+             ~S[Client.Local: unsupported yield(): name: "a" + "b"]
   end
 
-  test "a range after another stage is an unbounded read", %{conn: conn} do
-    flux = ~S[from(bucket: "b") |> limit(n: 1) |> range(start: 0, stop: 100)]
+  test "a comparison with a negative number, -0 among them, is not pushed", %{conn: conn} do
+    assert message(conn, ~S[ |> filter(fn: (r) => r._field == "s" and r._value > -0)]) ===
+             "Client.Local: comparing the string column _value with a number (>) is an error " <>
+               "on the engine (unsupported binary expression)"
 
-    assert {:error, %{status: 400, body: body}} = Local.query_flux(conn, flux)
+    assert values(conn, ~S[ |> filter(fn: (r) => r._field == "n" and r._value > -0.0)]) ===
+             [1, 2]
+  end
 
-    assert Jason.decode!(body)["message"] ===
-             "error in building plan while starting program: cannot submit unbounded read to " <>
-               "\"b\"; try bounding 'from' with a call to 'range'"
+  test "syntax the engine refuses with a position is refused by name", %{conn: conn} do
+    for {tail, refusal} <- [
+          {~S[ |> filter(fn: (r) => r._value > 1e5)],
+           ~S[unsupported filter predicate: r._value > 1e5]},
+          {~S[ |> filter(fn: (r) => r.h == "a\qb")],
+           ~S[unsupported filter predicate: r.h == "a\qb"]},
+          {~S[ |> filter(fn: (r) => r.h == "${x}")],
+           ~S[unsupported filter predicate: r.h == "${x}"]},
+          {" |> limit(n: 1, junk: 2)", "unsupported limit(): unexpected argument junk"},
+          {~S[ |> yield(name: "x", x: 1)], "unsupported yield(): unexpected argument x"}
+        ] do
+      assert message(conn, tail) === "Client.Local: " <> refusal
+    end
+
+    for {range, refusal} <- [
+          {"", "range() needs start"},
+          {"-1h", "unsupported range(): unexpected argument -1h"},
+          {"start: 0, foo: 1", "unsupported range(): unexpected argument foo"},
+          {"start: 1970-01-01 00:00:00Z", "unsupported range() time: 1970-01-01 00:00:00Z"}
+        ] do
+      assert {:error, %{status: 400, body: body}} =
+               Local.query_flux(conn, ~s[from(bucket: "b") |> range(#{range})])
+
+      assert Jason.decode!(body) === %{
+               "code" => "invalid",
+               "message" => "Client.Local: " <> refusal
+             }
+    end
   end
 end

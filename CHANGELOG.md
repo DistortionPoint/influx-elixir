@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Local's Flux engine, as InfluxDB 2.7** (design document `2026-10-10_review-of-local-flux.md`):
+  - An integer or unsigned `sum()` wraps in 64 bits, and `mean()` divides the wrapped sum.
+    They used to return the exact sum.
+  - String literals read Flux's escapes, so `r.t == "a\\b"` matches the tag `a\b`, and
+    `yield(name: "\"q\"")` names `"q"`. Other escapes and `${` interpolation are refused.
+  - An argument given twice is the engine's 400, `duplicate keyword parameter specified`.
+    An argument a stage does not take, a number with an exponent, an RFC3339 time without
+    its `T`, and a result named by an expression are refused by name. They used to be read.
+  - `-0` is not pushed to storage, as on the engine.
 - **The Flight transport and the HTTP client** (design document
   `2026-10-10_review-of-flight-and-http.md`):
   - A decimal at a negative scale over Flight (`CAST(1234 AS DECIMAL(5,-2))`) is the integer

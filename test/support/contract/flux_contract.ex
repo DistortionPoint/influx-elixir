@@ -18,7 +18,7 @@ defmodule InfluxElixir.Contract.Flux do
   everything is generated.
 
     * `:pipeline` — absolute ranges and the stages: filter grammar, selectors,
-      limit, mean, yield
+      limit, mean, yield, 64-bit sums, string escapes and repeated arguments
     * `:ranges` — ranges relative to now, predicates and range units
     * `:pushdown` — which filters storage evaluates and what a key it lacks is,
       one result per `yield`, the aggregates of string and boolean fields, and the
@@ -115,6 +115,7 @@ defmodule InfluxElixir.Contract.Flux do
       {:pipeline, filter_tests(client)},
       {:pipeline, selector_tests(client)},
       {:pipeline, range_bound_tests(client)},
+      {:pipeline, literal_tests(client)},
       {:ranges, predicate_tests(client)},
       {:ranges, range_unit_tests(client)},
       {:pushdown, pushdown_helpers(client)},
@@ -399,6 +400,81 @@ defmodule InfluxElixir.Contract.Flux do
           flux = InfluxElixir.Contract.Flux.head(ctx, m, "start: 0, stop: 1800000000")
 
           assert {:ok, [%{"_value" => "l1\nl2"}]} = unquote(client).query_flux(ctx.conn, flux)
+        end
+      end
+    end
+  end
+
+  defp literal_tests(client) do
+    quote location: :keep do
+      describe "query_flux/3 — 64-bit sums, string literals and arguments" do
+        test "an integer or unsigned sum wraps in 64 bits, and a mean divides the wrapped sum",
+             ctx do
+          m = InfluxElixir.IntegrationHelper.unique_name("contract_fxw")
+
+          lp = """
+          #{m},h=a i=9223372036854775807i,u=18446744073709551615u 1000000000
+          #{m},h=a i=9223372036854775807i,u=18446744073709551615u 2000000000
+          #{m},h=a i=5i,u=5u 3000000000
+          #{m},h=b i=-9223372036854775807i 1000000000
+          #{m},h=b i=-9223372036854775807i 2000000000
+          """
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, String.trim(lp), database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+          head = InfluxElixir.Contract.Flux.head(ctx, m, "start: 0, stop: 100")
+
+          values = fn tail ->
+            {:ok, rows} = unquote(client).query_flux(ctx.conn, head <> tail)
+            Enum.map(rows, &{&1["table"], &1["h"], &1["_field"], &1["_value"]})
+          end
+
+          # storage reads the series in order; after limit, Flux sorts by group key
+          assert values.(" |> sum()") === [{0, "a", "i", 3}, {1, "a", "u", 3}, {2, "b", "i", 2}]
+
+          assert values.(" |> limit(n: 3) |> sum()") ===
+                   [{0, "a", "i", 3}, {1, "b", "i", 2}, {2, "a", "u", 3}]
+
+          assert values.(" |> mean()") ===
+                   [{0, "a", "i", 1.0}, {1, "a", "u", 1.0}, {2, "b", "i", 1.0}]
+        end
+
+        test "a string literal reads its escapes, in a filter and in a result's name", ctx do
+          m = InfluxElixir.IntegrationHelper.unique_name("contract_fxe")
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, ~s|#{m},t=a\\b v=1i 1000000000|,
+              database: ctx.database
+            )
+
+          InfluxElixir.ClientContract.settle(ctx)
+          head = InfluxElixir.Contract.Flux.head(ctx, m, "start: 0, stop: 100")
+
+          names = fn tail ->
+            {:ok, rows} = unquote(client).query_flux(ctx.conn, head <> tail)
+            Enum.map(rows, &{&1["result"], &1["t"]})
+          end
+
+          assert names.(~S[ |> filter(fn: (r) => r.t == "a\\b")]) === [{"_result", "a\\b"}]
+          assert names.(~S{ |> filter(fn: (r) => r["t"] == "a\\b")}) === [{"_result", "a\\b"}]
+          assert names.(~S[ |> yield(name: "x\ty\\z")]) === [{"x\ty\\z", "a\\b"}]
+          assert names.(~S[ |> yield(name: "\"q\"")]) === [{~S("q"), "a\\b"}]
+        end
+
+        test "an argument given twice is a 400 that names it", ctx do
+          m = InfluxElixir.IntegrationHelper.unique_name("contract_fxa")
+
+          for {range, tail, key} <- [
+                {"start: 0, start: 1, stop: 100", "", "start"},
+                {"start: 0, stop: 100", " |> limit(n: 1, n: 2)", "n"}
+              ] do
+            flux = InfluxElixir.Contract.Flux.head(ctx, m, range) <> tail
+
+            assert InfluxElixir.Contract.Flux.error_of(unquote(client).query_flux(ctx.conn, flux)) ===
+                     {400, ~s(duplicate keyword parameter specified: "#{key}")}
+          end
         end
       end
     end
@@ -776,6 +852,7 @@ defmodule InfluxElixir.Contract.Flux do
                 ~s| \|> limit(n: 10) \|> filter(fn: (r) => r.h != 1)|,
                 ~s| \|> filter(fn: (r) => r.h < 1)|,
                 ~s| \|> filter(fn: (r) => r.h != -1)|,
+                ~s| \|> filter(fn: (r) => r.h != -0)|,
                 ~s| \|> filter(fn: (r) => r.h == "" or r.h != 1)|,
                 ~s| \|> filter(fn: (r) => r._time > 1)|,
                 ~s| \|> filter(fn: (r) => r._time < "x")|,
