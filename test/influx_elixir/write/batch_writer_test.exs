@@ -151,17 +151,21 @@ defmodule InfluxElixir.Write.BatchWriterTest do
          %{conn: conn} do
       pid = start_writer(conn, flush_interval_ms: 60_000)
 
+      before = DateTime.utc_now()
       :ok = BatchWriter.write(pid, Point.new("cpu", %{"value" => 1.0}))
+      later = DateTime.utc_now()
       :ok = BatchWriter.write(pid, Point.new("cpu", %{"value" => 2.0}, timestamp: 2_000))
       :ok = BatchWriter.flush(pid)
 
-      # Untimed, the server's clock would have given it a time near now; the stamp is the
-      # call's own, in the same unit, so it is a recent time and the timed point keeps its own.
+      # Untimed, the server's clock would have given it the flush's time; the stamp is the
+      # write call's own, so it lies between the clock read before and after that call, and
+      # the timed point keeps its own.
       assert [%{"time" => ~U[1970-01-01 00:00:00.000002Z], "value" => 2.0}, stamped] =
                Enum.sort_by(stored(conn, "cpu"), &DateTime.to_unix(&1["time"]))
 
-      assert %{"value" => 1.0, "time" => %DateTime{year: year}} = stamped
-      assert year > 2000
+      assert %{"value" => 1.0, "time" => time} = stamped
+      assert DateTime.compare(time, before) in [:gt, :eq]
+      assert DateTime.compare(time, later) in [:lt, :eq]
     end
   end
 

@@ -45,6 +45,22 @@ A sweep with no open GitHub issues, and with every library module reviewed in th
     `{:ok, _}`.
   - The log test takes its result from `with_log/1`. It used to send the result to itself
     from inside `capture_log/1`.
+- **The FlatBuffer tests rested on malformed fixtures and loose assertions.**
+  - Two fixtures declared a vtable larger than the bytes written, so a slot past the end
+    read the table's own soffset as a field offset. No test reached that slot.
+  - Most assertions were orderings: a position `> 0`, a vtable before its table, one vtable
+    larger than another. A vtable shared by several tables can lie after them, with a
+    negative soffset, so "before its table" was also wrong as a rule.
+  - One test read the vtable header back through the size it had just read, so it agreed
+    with itself whatever that size was.
+  - One hand-laid buffer now holds each kind of field, with every byte position in a
+    comment. Every reader is asserted against the exact position or value. This includes
+    a slot past the vtable, whose bytes are the soffset, so it is `nil` only because the
+    size is checked. It also includes two tables that share a vtable after them.
+  - Forty-one tests became six.
+- **`BatchWriter`: a Point's own stamp.** The test that a Point without a time is
+  stamped by the write call asserted only `year > 2000`. It now asserts that the stamp lies
+  between clock reads taken before and after that call.
 
 ## Verification
 
