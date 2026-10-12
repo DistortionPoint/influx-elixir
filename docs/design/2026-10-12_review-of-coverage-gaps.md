@@ -56,6 +56,37 @@ the unit tier, for behaviour no test pins and for dead code.
   - The other public functions of the hidden modules each have a caller.
   - Five that appear to have none are callbacks of the `InfluxQLWalk` behaviour.
 
+### An `and` inside an `or`, pushed to storage
+
+- **The gap.** A top-level `and` is split into conjuncts before pushdown, so the
+  pushdown evaluation (`pushed?/2`, and `pinned/1`, which finds the measurements a filter
+  names) meets an `and` only inside an `or`. Every such case in the contract held a
+  conjunct storage cannot take, so it went to Flux instead.
+- **Verified on InfluxDB 2.7**, over the contract's three points:
+  - `(r.h == "a" and r._value > 1) or r.h == "b"` keeps `a` 3 and `b` 2.
+  - `(r.nosuch != "a" and r.h == "a") or r.h == "zzz"` keeps both `a` rows. The missing
+    key is the empty string to storage, inside the `and` as well.
+- **Pinned.** Both are cases of the contract's pushdown table, which runs against the
+  double and 2.7.
+
+### Invalid UTF-8 of every lead width
+
+- **The gap.** `Body` gives Rust's `Utf8Error::error_len` for a body that is not UTF-8,
+  in Core's message `invalid utf-8 sequence of N bytes`. The contract covered only the
+  leads `0xFF`, `0xE0`, `0xED` and `0xF0`.
+- **Verified on Core 3.10.1:**
+  - a two-byte lead with a bad second byte (`C3 78`), and an overlong lead (`C0 80`), are
+    1 byte;
+  - a three-byte lead with a bad third byte (`E1 80 78`, `EF 80 78`) is 2 bytes;
+  - a four-byte lead with a bad fourth byte (`F1 80 80 78`) is 3 bytes;
+  - `F4` followed by a byte past `0x8F` (`F4 90 80 80`) is 1 byte.
+- **Pinned.** All six joined the write contract, which runs against the double and Core.
+
+### `InfluxQL.reserved?/1` removed
+
+Nothing called it. Its callers use `InfluxQLText.reserved?/1`, so the delegate and the
+alias it needed are gone.
+
 ### Gaps that stay
 
 - **`SQLLimits`, at 40%:** its uncovered lines are macros, which expand where they are
@@ -67,6 +98,8 @@ the unit tier, for behaviour no test pins and for dead code.
 ## Verification
 
 - The Local v3 Core contract passed, 738 tests.
-- The v3 Core integration contract passed against `influxdb:3.10.1-core`, 749 tests.
+- The v3 Core integration contract passed against `influxdb:3.10.1-core`, 749 tests, and the v2
+  integration contract against `influxdb:2.7`, 111 tests.
 - The unit tier, coverage and every gate were run one at a time. Total coverage rose
-  from 94.09% to 94.17%, and to 94.21% with the unused defaults removed.
+  from 94.09% to 94.17%, to 94.21% with the unused defaults removed, and to 94.28% with
+  the pushdown and UTF-8 cases.

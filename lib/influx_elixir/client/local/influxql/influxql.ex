@@ -123,7 +123,6 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
     InfluxQLPlan,
     InfluxQLRun,
     InfluxQLShow,
-    InfluxQLText,
     InfluxQLWhere,
     SQLLimits
   }
@@ -312,11 +311,6 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   """
   @spec lookback(query()) :: {:ok, non_neg_integer()} | {:error, binary()}
   defdelegate lookback(query), to: InfluxQLRun
-
-  @doc "Whether a bare word is one InfluxQL reserves (any case)."
-
-  @spec reserved?(binary()) :: boolean()
-  defdelegate reserved?(word), to: InfluxQLText
 
   @doc "Whether a tag key is one a `key_filter/0` lists."
   @spec key_listed?(binary(), key_filter()) :: boolean()

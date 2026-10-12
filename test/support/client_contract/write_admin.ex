@@ -950,7 +950,14 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
             {"u v=1i 1\xE2\x82", "incomplete utf-8 byte sequence from index 8"},
             {"u v=\xF0\x9F\x98x", "invalid utf-8 sequence of 3 bytes from index 4"},
             {"u v=\xE0\x80\x80", "invalid utf-8 sequence of 1 bytes from index 4"},
-            {"u v=\xED\xA0\x80", "invalid utf-8 sequence of 1 bytes from index 4"}
+            {"u v=\xED\xA0\x80", "invalid utf-8 sequence of 1 bytes from index 4"},
+            # A lead of each width, and the second byte each range allows
+            {"u v=\xC3x", "invalid utf-8 sequence of 1 bytes from index 4"},
+            {"u v=\xC0\x80", "invalid utf-8 sequence of 1 bytes from index 4"},
+            {"u v=\xE1\x80x", "invalid utf-8 sequence of 2 bytes from index 4"},
+            {"u v=\xEF\x80x", "invalid utf-8 sequence of 2 bytes from index 4"},
+            {"u v=\xF1\x80\x80x", "invalid utf-8 sequence of 3 bytes from index 4"},
+            {"u v=\xF4\x90\x80\x80", "invalid utf-8 sequence of 1 bytes from index 4"}
           ]
 
           InfluxElixir.TestSupport.Check.each_case(cases, fn {payload, reason} ->

@@ -731,6 +731,11 @@ defmodule InfluxElixir.Contract.Flux do
                [{"_result", 0, "a", 3}, {"_result", 1, "b", 2}]},
               {~s| \|> filter(fn: (r) => r.nosuch == "a" or r.h == "b")|,
                [{"_result", 0, "b", 2}]},
+              # An `and` inside an `or` storage takes whole
+              {~s| \|> filter(fn: (r) => (r.h == "a" and r._value > 1) or r.h == "b")|,
+               [{"_result", 0, "a", 3}, {"_result", 1, "b", 2}]},
+              {~s| \|> filter(fn: (r) => (r.nosuch != "a" and r.h == "a") or r.h == "zzz")|,
+               Enum.take(ctx.all, 2)},
               {~s| \|> filter(fn: (r) => r.nosuch != "")|, []},
               {~s| \|> filter(fn: (r) => r.nosuch == "")|, []},
               {~s| \|> filter(fn: (r) => r.nosuch == "a")|, []}
