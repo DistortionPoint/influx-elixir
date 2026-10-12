@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.44] - 2026-10-12
+
 ### Fixed
 - **Local's `SHOW TAG KEYS ... WHERE` costs a line in its condition** (design document
   `2026-10-11_review-of-influxql-show-cost.md`). Over a measurement with no tag, every
