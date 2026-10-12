@@ -142,6 +142,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlannerTest do
       assert refused(conn, statement) === "Client.Local: " <> why <> ": " <> statement
     end
 
+    # The engine breaks the connection on a remainder by zero, of any type.
+    test "a remainder by zero", %{conn: conn} do
+      for select <- ["i % 0", "u % 0", "f % 0.0", "i % (j - j)"] do
+        assert refused(conn, "SELECT #{select} FROM m") ===
+                 "Client.Local: unsupported InfluxQL (a remainder by zero)"
+      end
+    end
+
     test "a bind parameter in a condition, bound or not", %{conn: conn} do
       # The engine plans `$name` as an operand and says the first one has no value (or binds
       # it); its planning errors before and after that are not verified, so the double

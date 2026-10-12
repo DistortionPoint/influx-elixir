@@ -1731,6 +1731,11 @@ defmodule InfluxElixir.Contract.InfluxQLFluxLP do
                 {"mean(1)", "mean", "Integer(1)"},
                 {"mean(-1)", "mean", "Integer(-1)"},
                 {"mean(1.5)", "mean", "Float(1.5)"},
+                # Floats Elixir prints with an exponent, which the engine's Debug writes out
+                {"mean(100000000000000.0)", "mean", "Float(100000000000000.0)"},
+                {"mean(1234567890123456.5)", "mean", "Float(1234567890123456.5)"},
+                {"mean(0.0001)", "mean", "Float(0.0001)"},
+                {"mean(-0.00012)", "mean", "Float(-0.00012)"},
                 {"mean('a')", "mean", "String(\"a\")"},
                 {"mean('a b')", "mean", "String(\"a b\")"},
                 {"mean('')", "mean", "String(\"\")"},
