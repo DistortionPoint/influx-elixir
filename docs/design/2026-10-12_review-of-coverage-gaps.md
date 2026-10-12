@@ -100,6 +100,25 @@ alias it needed are gone.
   does not count compile-time calls, so a removal must be checked against every use,
   not against coverage.
 
+### The shipped usage rules, against the double
+
+- **Why they were checked.** `usage-rules.md` and `usage-rules/` ship in the Hex package,
+  and no earlier review read them against the code. Every function they name exists, and
+  their batch writer defaults match the option schema.
+- **What was stale.** Three claims described an older `Client.Local`:
+  - InfluxQL `GROUP BY time(...)` and `fill()` were said to be refused. The guide and the
+    contract pin them as answered.
+  - SQL `HAVING` was said to be rejected. It is a clause the parser reads, and the cost
+    tests run it.
+  - CTEs and `median` were sent to the integration tier. The contracts run both on the
+    double.
+- **What the rules now list as refused.** The constructs the parser does refuse:
+  - joins other than `CROSS JOIN`;
+  - `UNION`, `INTERSECT` and `EXCEPT`;
+  - a second `SELECT` (a subquery);
+  - `OVER (...)`;
+  - a `time` comparison inside an InfluxQL `OR`.
+
 ### Gaps that stay
 
 - **`SQLLimits`, at 40%:** its uncovered lines are macros, which expand where they are

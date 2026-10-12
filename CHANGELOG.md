@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The shipped usage rules described an older `Client.Local`.**
+  - `usage-rules/query.md` said the double refuses InfluxQL's `GROUP BY time(...)` and
+    `fill()`; it answers both, every `fill()` option included.
+  - It also listed SQL `HAVING` as rejected; the double answers it.
+  - `usage-rules/testing.md` sent CTEs and `median` to the integration tier, which the
+    double runs.
+
+  The rules now list what the double refuses: joins other than `CROSS JOIN`, set
+  operations, subqueries, window functions, and a `time` comparison inside an InfluxQL
+  `OR`.
+
 ## [0.1.44] - 2026-10-12
 
 ### Fixed
