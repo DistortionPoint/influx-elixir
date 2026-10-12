@@ -46,10 +46,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
     end
   end
 
-  @doc "Whether a `)` in `masked` closes nothing: the condition ends there."
-  @spec excess_close?(binary()) :: boolean()
-  def excess_close?(masked), do: excess_offset(masked) != nil
-
   @doc "Where the first `)` in `masked` that closes nothing stands, `nil` for none."
   @spec excess_offset(binary()) :: non_neg_integer() | nil
   def excess_offset(masked) do

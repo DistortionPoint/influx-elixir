@@ -15,7 +15,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   alias InfluxElixir.Client.Local.{InfluxQLBlankRegex, InfluxQLLex, SQLMask}
   @operator_glue ~w[( ) * , = / + - < > ! % & | ^]
   @operator_glue_escaped Regex.escape(Enum.join(@operator_glue))
-  @operator_glue_class "[" <> @operator_glue_escaped <> "]"
   @keyword_end "(?=\\z|[ \\t\\r\\n;" <> @operator_glue_escaped <> "])"
   @reserved_start Regex.compile!(
                     InfluxQLBlankRegex.blank_pattern("^([A-Za-z_]\\w*)(?![\\w:])" <> @keyword_end)
@@ -149,10 +148,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   @spec operator_glue() :: [binary()]
   def operator_glue, do: @operator_glue
 
-  @doc "`operator_glue/0` as a bracket class of a regular expression."
-  @spec operator_glue_class() :: binary()
-  def operator_glue_class, do: @operator_glue_class
-
   @doc "`operator_glue/0` escaped, for the inside of a bracket class."
   @spec operator_glue_chars() :: binary()
   def operator_glue_chars, do: @operator_glue_escaped
@@ -169,10 +164,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   @doc "The characters a condition may start with, as the inside of a bracket class."
   @spec operand_open_chars() :: binary()
   def operand_open_chars, do: @operand_open_chars
-
-  @doc "The characters a condition may start with, as a bracket class."
-  @spec operand_open_class() :: binary()
-  def operand_open_class, do: @operand_open_class
 
   @doc "The characters a select item may end with directly against `FROM`, as a bracket class."
   @spec item_end_class() :: binary()

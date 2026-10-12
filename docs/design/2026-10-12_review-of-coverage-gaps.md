@@ -87,6 +87,19 @@ the unit tier, for behaviour no test pins and for dead code.
 Nothing called it. Its callers use `InfluxQLText.reserved?/1`, so the delegate and the
 alias it needed are gone.
 
+### Unused accessors removed
+
+- **What was removed.**
+  - `InfluxQLText.operator_glue_class/0`, with the attribute only it read.
+  - `InfluxQLText.operand_open_class/0`. The attribute stays, because the module's own
+    clause regex uses it.
+  - `InfluxQLParens.excess_close?/1`. `InfluxQLSelectCheck` has a private function of the
+    same name, which is the one called.
+- **Kept, and why.** `InfluxQLText.item_end_class/0` also shows as never run, but it is
+  called once, at compile time, inside a regex attribute of `InfluxQLParser`. Coverage
+  does not count compile-time calls, so a removal must be checked against every use,
+  not against coverage.
+
 ### Gaps that stay
 
 - **`SQLLimits`, at 40%:** its uncovered lines are macros, which expand where they are
@@ -101,5 +114,5 @@ alias it needed are gone.
 - The v3 Core integration contract passed against `influxdb:3.10.1-core`, 749 tests, and the v2
   integration contract against `influxdb:2.7`, 111 tests.
 - The unit tier, coverage and every gate were run one at a time. Total coverage rose
-  from 94.09% to 94.17%, to 94.21% with the unused defaults removed, and to 94.28% with
-  the pushdown and UTF-8 cases.
+  from 94.09% to 94.17%, to 94.21% with the unused defaults removed, to 94.28% with
+  the pushdown and UTF-8 cases, and to 94.29% with the unused accessors removed.
