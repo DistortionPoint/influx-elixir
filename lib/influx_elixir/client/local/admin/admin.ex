@@ -12,7 +12,7 @@ defmodule InfluxElixir.Client.Local.Admin do
           binary(),
           keyword()
         ) :: :ok | {:error, term()}
-  def create_database(%{table: table} = conn, name, opts \\ []) do
+  def create_database(%{table: table} = conn, name, opts) do
     with :ok <- Scope.require_capability(conn, :create_database),
          :ok <- utf8_name(name, "database"),
          {:ok, retention} <- retention(Keyword.get(opts, :retention), name) do
@@ -124,7 +124,7 @@ defmodule InfluxElixir.Client.Local.Admin do
           binary(),
           keyword()
         ) :: :ok | {:error, term()}
-  def create_bucket(%{table: table} = conn, name, opts \\ []) do
+  def create_bucket(%{table: table} = conn, name, opts) do
     with :ok <- Scope.require_capability(conn, :create_bucket),
          :ok <- utf8_name(name, "bucket") do
       # InfluxDB 2.7's order (verified): the value's type, its sign, the name (a bucket that
@@ -213,7 +213,7 @@ defmodule InfluxElixir.Client.Local.Admin do
           binary(),
           keyword()
         ) :: {:ok, map()} | {:error, term()}
-  def create_token(%{table: table, profile: profile} = conn, name, opts \\ []) do
+  def create_token(%{table: table, profile: profile} = conn, name, opts) do
     with :ok <- Scope.require_capability(conn, :create_token),
          :ok <- utf8_name(name, "token"),
          {:ok, {kind, _path, body}} <- TokenRequest.build(name, opts),

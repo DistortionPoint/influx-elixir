@@ -37,7 +37,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       ...): a `SUM` wraps at the range of its type, as it does there
   """
   @spec run(InfluxQL.query(), [map()], MapSet.t(binary()), keyword()) :: [map()]
-  def run(query, rows, tags, opts \\ []) do
+  def run(query, rows, tags, opts) do
     types = Keyword.get(opts, :types, %{})
     plan = projection_plan(query, tags, types)
     expr_refs = for {:expr, ast, _name} <- query.items, ref <- InfluxQLExpr.refs(ast), do: ref

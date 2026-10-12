@@ -226,7 +226,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
       at the epoch; with `GROUP BY` every series carries it)
   """
   @spec run(query(), [map()], MapSet.t(binary()), keyword()) :: [map()]
-  defdelegate run(query, rows, tags, opts \\ []), to: InfluxQLRun
+  defdelegate run(query, rows, tags, opts), to: InfluxQLRun
 
   @doc """
   Rewrites an InfluxQL `WHERE` into the caller's SQL, given the

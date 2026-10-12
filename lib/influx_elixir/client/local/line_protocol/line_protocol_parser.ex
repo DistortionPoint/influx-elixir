@@ -101,7 +101,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
   """
   @spec parse_lines(binary(), precision(), dialect()) ::
           {:ok, [line_result()]} | {:error, map()}
-  def parse_lines(text, precision, dialect \\ :v3) do
+  def parse_lines(text, precision, dialect) do
     context = %{precision: precision, dialect: dialect}
 
     lines =
@@ -112,13 +112,6 @@ defmodule InfluxElixir.Client.Local.LineProtocolParser do
       results -> {:ok, results}
     end
   end
-
-  @doc """
-  Builds a `t:line_error/0` the way InfluxDB 3 reports one. The full line
-  is kept under `:line` for InfluxDB 2's report, which quotes it whole.
-  """
-  @spec line_error(binary(), pos_integer(), binary()) :: line_error()
-  defdelegate line_error(message, number, line), to: LineProtocolError
 
   @doc """
   Builds the `t:line_error/0` for a schema error. InfluxDB 3 does not echo

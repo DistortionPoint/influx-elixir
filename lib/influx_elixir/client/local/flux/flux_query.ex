@@ -13,7 +13,7 @@ defmodule InfluxElixir.Client.Local.FluxQuery do
 
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
-  def query_flux(%{table: table} = conn, flux, _opts \\ []) do
+  def query_flux(%{table: table} = conn, flux, _opts) do
     with :ok <- Scope.require_capability(conn, :query_flux),
          {:ok, query} <- flux_parse(flux),
          :ok <- flux_bucket_exists(table, query.bucket) do

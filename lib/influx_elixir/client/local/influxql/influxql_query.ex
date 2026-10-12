@@ -30,7 +30,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           binary(),
           keyword()
         ) :: InfluxElixir.Client.query_result()
-  def query_influxql(%{table: table} = conn, influxql, opts \\ []) do
+  def query_influxql(%{table: table} = conn, influxql, opts) do
     with :ok <- Scope.require_capability(conn, :query_influxql) do
       Format.answer(
         Scope.query_format(opts),

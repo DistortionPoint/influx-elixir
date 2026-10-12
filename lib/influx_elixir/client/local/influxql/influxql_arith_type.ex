@@ -462,7 +462,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   the tokens left (the walker reads one factor), or `:unread`, or the problem.
   """
   @spec operand(list(), ctx(), opts()) :: {:ok, value(), list()} | :unread | {:error, problem()}
-  def operand(tokens, ctx, opts \\ []),
+  def operand(tokens, ctx, opts),
     do: InfluxQLWalk.operand(tokens, __MODULE__, options(ctx, opts))
 
   @doc """
