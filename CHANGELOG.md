@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - It also listed SQL `HAVING` as rejected; the double answers it.
   - `usage-rules/testing.md` sent CTEs and `median` to the integration tier, which the
     double runs.
+  - `usage-rules.md` gave `point/3`'s arguments as measurement, tags, fields. It is
+    `point(measurement, fields, tags: ..., timestamp: ...)`.
+  - `usage-rules/write.md` said the batch writer discards every 4xx. It retries 408 and
+    429 as well.
 
   The rules now list what the double refuses: joins other than `CROSS JOIN`, set
   operations, subqueries, window functions, and a `time` comparison inside an InfluxQL

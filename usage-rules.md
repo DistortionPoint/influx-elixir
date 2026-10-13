@@ -9,7 +9,7 @@
 
 ## Writing Data
 - All write operations go through the `InfluxElixir` facade module
-- Use `InfluxElixir.point/3` to construct points (measurement, tags, fields)
+- Use `InfluxElixir.point/3` to construct points: `point(measurement, fields, tags: tags, timestamp: ts)`
 - Use `InfluxElixir.write/2,3` for direct writes; the first argument is a connection name or connection term
 - Batch writers are managed internally by the supervision tree — configure via `batch_writer:` in the connection config, not direct GenServer interaction
 - Integer fields are suffixed with `i` in line protocol — the library handles this
