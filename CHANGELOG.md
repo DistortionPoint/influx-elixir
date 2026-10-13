@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.45] - 2026-10-13
+
 ### Fixed
 - **The shipped usage rules described an older `Client.Local`.**
   - `usage-rules/query.md` said the double refuses InfluxQL's `GROUP BY time(...)` and
