@@ -1,6 +1,8 @@
 defmodule InfluxElixir.Write.PointTest do
   use ExUnit.Case, async: true
 
+  doctest InfluxElixir.Write.Point
+
   alias InfluxElixir.Write.Point
 
   describe "new/3" do

@@ -37,8 +37,26 @@ usage rules against the facade and the batch writer, the two places a consumer s
   takes any module that implements `InfluxElixir.Client`, whose `write/3` may answer any
   `{:error, term()}`.
 
+### The `iex>` examples run as doctests
+
+- **The gap.** Nine modules show `iex>` examples, and only `Config` and
+  `Connection.api_version/1` were doctested. An example that does not run can go stale
+  unnoticed.
+- **Now doctested, 14 examples:**
+  - `Point` and `LineProtocol`, which are pure;
+  - `Writer.write/3` and `Local.start/1`, on a connection of their own whose table the
+    doctest's process owns and frees when it exits;
+  - `Flight.Client`'s ticket builders and `Reader.decode_flight_data/1`.
+- **`BatchWriter`'s examples are plain code now.** They use a `conn` and a `pid` they never
+  set up, so they could not run. A self-contained example would start a linked writer
+  that flushes, as the doctest's process exits, into a table already freed.
+- **`Connection.put/2`, `get/1` and `fetch!/1` stay out.** Their examples put the fixed name
+  `:test` in the registry every test shares, which an async run cannot isolate. Their
+  test file says so.
+
 ## Verification
 
 - Each claim was read against the facade (`lib/influx_elixir.ex`), `BatchWriter`'s
   `classify/1` and the HTTP client's `classify_finch_error/1`.
-- `mix docs` builds with no warnings.
+- `mix docs` builds with no warnings. The unit tier runs 21 doctests (7 before), three times
+  and with coverage, and every gate passes.

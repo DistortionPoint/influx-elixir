@@ -1,6 +1,8 @@
 defmodule InfluxElixir.Flight.ClientTest do
   use ExUnit.Case, async: true
 
+  doctest InfluxElixir.Flight.Client, only: [build_ticket_payload: 2, build_ticket: 2]
+
   alias InfluxElixir.Flight.Client
   alias InfluxElixir.Flight.Proto.Ticket
   alias InfluxElixir.TestSupport.{Await, ClosedPort}

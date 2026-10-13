@@ -1,6 +1,8 @@
 defmodule InfluxElixir.Write.LineProtocolTest do
   use ExUnit.Case, async: true
 
+  doctest InfluxElixir.Write.LineProtocol
+
   alias InfluxElixir.Write.{LineProtocol, Point}
 
   describe "encode/1 — basic encoding" do

@@ -271,12 +271,7 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   ## Examples
 
-      iex> {:ok, pid} = InfluxElixir.Write.BatchWriter.start_link(
-      ...>   connection: conn,
-      ...>   database: "mydb"
-      ...> )
-      iex> is_pid(pid)
-      true
+      {:ok, pid} = InfluxElixir.Write.BatchWriter.start_link(connection: conn, database: "mydb")
   """
   @spec start_link(keyword()) ::
           GenServer.on_start() | {:error, NimbleOptions.ValidationError.t()}
@@ -328,8 +323,7 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   ## Examples
 
-      iex> InfluxElixir.Write.BatchWriter.write(pid, "cpu value=1.0")
-      :ok
+      :ok = InfluxElixir.Write.BatchWriter.write(pid, "cpu value=1.0")
   """
   @spec write(
           GenServer.server(),
@@ -362,8 +356,7 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   ## Examples
 
-      iex> InfluxElixir.Write.BatchWriter.write_sync(pid, "cpu value=1.0")
-      :ok
+      :ok = InfluxElixir.Write.BatchWriter.write_sync(pid, "cpu value=1.0")
   """
   @spec write_sync(
           GenServer.server(),
@@ -392,8 +385,7 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   ## Examples
 
-      iex> InfluxElixir.Write.BatchWriter.flush(pid)
-      :ok
+      :ok = InfluxElixir.Write.BatchWriter.flush(pid)
   """
   @spec flush(GenServer.server(), timeout()) :: :ok
   def flush(server, timeout \\ @default_flush_timeout) do
@@ -414,9 +406,8 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   ## Examples
 
-      iex> {:ok, stats} = InfluxElixir.Write.BatchWriter.stats(pid)
-      iex> Map.keys(stats)
-      [:total_bytes, :total_errors, :total_writes]
+      {:ok, %{total_writes: _, total_errors: _, total_bytes: _}} =
+        InfluxElixir.Write.BatchWriter.stats(pid)
   """
   @spec stats(GenServer.server(), timeout()) :: {:ok, stats()}
   def stats(server, timeout \\ @default_stats_timeout) do

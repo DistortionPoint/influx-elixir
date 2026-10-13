@@ -1,6 +1,8 @@
 defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
   use ExUnit.Case, async: true
 
+  doctest InfluxElixir.Client.Local, only: [start: 1]
+
   alias InfluxElixir.Client.Local
   alias InfluxElixir.TestSupport.Await
 

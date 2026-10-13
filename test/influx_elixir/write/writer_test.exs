@@ -1,6 +1,8 @@
 defmodule InfluxElixir.Write.WriterTest do
   use ExUnit.Case, async: true
 
+  doctest InfluxElixir.Write.Writer
+
   alias InfluxElixir.Client.Local
   alias InfluxElixir.Connection
   alias InfluxElixir.TestSupport.{ClosedPort, Telemetry}

@@ -1,6 +1,8 @@
 defmodule InfluxElixir.Flight.ReaderTest do
   use ExUnit.Case, async: true
 
+  doctest InfluxElixir.Flight.Reader
+
   import Bitwise
 
   alias InfluxElixir.Flight.Proto.FlightData
