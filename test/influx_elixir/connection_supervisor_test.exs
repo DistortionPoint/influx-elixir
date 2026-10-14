@@ -19,6 +19,15 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
     assert Map.delete(config, :table) === %{profile: :v3_core, database: nil, org: "local"}
   end
 
+  # A connection whose writer has `batch_size: 0` fails to start with the writer's own
+  # refusal, which `BatchWriter.start_link/1` gives before it starts anything.
+  defp writer_refusal(name) do
+    {:error, error} =
+      InfluxElixir.Write.BatchWriter.start_link(batch_size: 0, connection: name, name: name)
+
+    {:shutdown, {:failed_to_start_child, InfluxElixir.Write.BatchWriter, error}}
+  end
+
   describe "init/1 — registry population" do
     test "registers initialized connection in persistent_term on start" do
       name = unique_name()
@@ -144,10 +153,10 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
     test "a misconfigured writer fails the connection's start, naming the option" do
       name = unique_name()
 
-      assert {:error, reason} =
+      assert {:error, {reason, _child}} =
                InfluxElixir.add_connection(name, batch_writer: [batch_size: 0])
 
-      assert inspect(reason) =~ "invalid value for :batch_size option"
+      assert reason === writer_refusal(name)
       assert Connection.get(name) === {:error, :not_found}
 
       # Nothing was left behind, so the corrected config starts.
@@ -245,7 +254,8 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
           InfluxElixir.add_connection(name, token: token, batch_writer: [batch_size: 0])
         end)
 
-      assert inspect(reason) =~ "invalid value for :batch_size option"
+      assert {refusal, _child} = reason
+      assert refusal === writer_refusal(name)
       refute inspect(reason, limit: :infinity, printable_limit: :infinity) =~ token
       refute log =~ token
     end
@@ -255,7 +265,11 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       spec = ConnectionSupervisor.child_spec(name: :spec_test, token: token, host: "h")
 
       refute inspect(spec, limit: :infinity) =~ token
-      assert inspect(spec) =~ "host: \"h\""
+
+      # Only the token is hidden; the rest of the config is passed as it was given.
+      assert %{id: ConnectionSupervisor, type: :supervisor} = spec
+      assert {ConnectionSupervisor, :start_link, [config]} = spec.start
+      assert Keyword.delete(config, :token) === [name: :spec_test, host: "h"]
     end
   end
 

@@ -869,16 +869,24 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       pid =
         start_http_writer(finch, TestServer.controlled(), max_retries: 1, base_retry_delay_ms: 1)
 
+      before = DateTime.utc_now()
+
       caller =
         Task.async(fn -> BatchWriter.write_sync(pid, Point.new("cpu", %{"value" => 1})) end)
 
       assert_receive {:request, first, first_body}, @await
+      later = DateTime.utc_now()
       TestServer.respond(first, 503)
       assert_receive {:request, second, second_body}, @await
       TestServer.respond(second, 204)
 
       assert :ok = Task.await(caller, @await)
-      assert first_body =~ ~r/\Acpu value=1i \d{16,}\z/
+
+      # The stamp is the write call's clock, in the flush's nanoseconds.
+      assert "cpu value=1i " <> stamp = first_body
+      assert {nanoseconds, ""} = Integer.parse(stamp)
+      assert nanoseconds >= DateTime.to_unix(before, :nanosecond)
+      assert nanoseconds <= DateTime.to_unix(later, :nanosecond)
       assert second_body === first_body
     end
   end
