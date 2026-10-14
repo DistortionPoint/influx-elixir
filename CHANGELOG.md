@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The shipped usage rules said `Client.Local` ignores a database's retention.**
+  `usage-rules/testing.md` said the double "stores no retention, so nothing expires in
+  tests". The double applies it as InfluxDB 3 does:
+  - a write is never refused for a point's age;
+  - a query hides a 10-minute chunk of a table once its newest point is older than the
+    retention period.
+
+  The rule now says so, and how to write a point a test wants gone.
+
 ## [0.1.45] - 2026-10-13
 
 ### Fixed
