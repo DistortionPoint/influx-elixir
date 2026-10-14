@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.46] - 2026-10-14
+
 ### Fixed
 - **The shipped usage rules said `Client.Local` ignores a database's retention.**
   `usage-rules/testing.md` said the double "stores no retention, so nothing expires in
