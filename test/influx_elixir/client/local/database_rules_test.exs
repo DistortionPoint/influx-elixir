@@ -25,8 +25,8 @@ defmodule InfluxElixir.Client.Local.DatabaseRulesTest do
         # Core holds five databases: each name is made in a store of its own.
         {:ok, own} = Local.start(profile: :v3_core)
         assert Local.create_database(own, name, []) === :ok, inspect(name)
-        assert {:ok, listed} = Local.list_databases(own)
-        assert Enum.any?(listed, &(&1["name"] === name)), inspect(name)
+        listed = Enum.map(Enum.sort(["_internal", name]), &%{"name" => &1})
+        assert Local.list_databases(own) === {:ok, listed}, inspect(name)
       end
     end
 

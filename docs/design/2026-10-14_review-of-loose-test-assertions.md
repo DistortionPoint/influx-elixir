@@ -31,6 +31,23 @@ inside a loop.
     request, in nanoseconds (the flushes' default precision).
   - This follows the existing test of a stamped point.
 
+### Two `Enum.all?` and `Enum.any?` assertions compare the list
+
+A second sweep the same day made two more assertions exact:
+- **A database the engine accepts** (`database_rules_test.exs`).
+  - The test checked that the name was among the listed ones.
+  - Each name is made in a store of its own, so the list is known: that name and
+    `_internal`, sorted.
+- **Concurrent writers of one series** (`concurrency_test.exs`).
+  - The test checked that every result was `{:ok, :written}`.
+  - It now compares the whole list, so a failure shows which writer answered what.
+
+Some loose assertions stay because nothing more exact can be known:
+- The Flux wrapped start: `now` carries nanoseconds a row's time does not.
+- A supervisor's generated pids.
+- The scans that must find something to check.
+- Core's five winners out of sixteen concurrent creates: which five win is a race.
+
 ### Checked, and right as written
 
 - **Isolation.** Every unit module is async. The contract cases get it from their

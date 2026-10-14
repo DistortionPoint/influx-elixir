@@ -188,7 +188,7 @@ defmodule InfluxElixir.Client.Local.ConcurrencyTest do
       payload = Enum.map_join(1..500, "\n", &"m,h=a v=#{&1} #{&1}")
 
       results = at_once(@tasks, fn _n -> Local.write(conn, payload, database: "db") end)
-      assert Enum.all?(results, &(&1 === {:ok, :written}))
+      assert results === List.duplicate({:ok, :written}, @tasks)
 
       assert {:ok, rows} = Local.query_influxql(conn, "SELECT v FROM m", database: "db")
       assert Enum.map(rows, & &1["v"]) === Enum.map(1..500, &(&1 * 1.0))
