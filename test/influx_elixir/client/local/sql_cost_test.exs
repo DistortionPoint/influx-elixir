@@ -3,7 +3,7 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
   What a SQL text costs `Client.Local` to read, and what it never does to a text it cannot:
   the work of a query must not grow with the number of times a name is written in it
   (a `HAVING` alias), nor faster than linearly with the length of an expression it nests (a long
-  sum), and a name or a pattern too long for the regular expressions the double matches with is a
+  sum) or with the number of statements in a text, and a name or a pattern too long for the regular expressions the double matches with is a
   refusal by name, not an exception. The answers themselves are pinned by the SQL contracts.
   """
 
@@ -173,6 +173,42 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
                database: "cost_db",
                params: %{"p" => String.duplicate("a", 70_000)}
              ) === {:error, %{status: 400, body: @pattern_reason}}
+    end
+  end
+
+  describe "a text of many statements, the last of which does not read" do
+    # Each statement was read after the whole text before it, blanked again: a walk of
+    # everything before it for each statement. A text four times as long costs about four
+    # times as much when the work is a line in its length, sixteen when it is a square
+    # (measured 7.6 with only the lines before a statement kept); the bounds sit around four.
+    test "costs a line in the number of statements", %{conn: conn} do
+      text = fn count -> String.duplicate("SELECT 1;\n", count) <> "ANALYZE;" end
+
+      cost = fn count ->
+        answer =
+          {:error,
+           %{
+             status: 400,
+             body:
+               "SQL error: ParserError(\"Expected: identifier, found: ; at Line: " <>
+                 "#{count + 1}, Column: 8\")"
+           }}
+
+        1..3
+        |> Enum.map(fn _run ->
+          {reductions, answered} =
+            reductions(fn -> Local.query_sql(conn, text.(count), database: "cost_db") end)
+
+          assert answered === answer
+          reductions
+        end)
+        |> Enum.min()
+      end
+
+      short = cost.(100)
+      long = cost.(400)
+      assert long / short < 5.0, "100 statements cost #{short} reductions, 400 cost #{long}"
+      assert long / short > 2.5, "100 statements cost #{short} reductions, 400 cost #{long}"
     end
   end
 end

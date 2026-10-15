@@ -282,6 +282,7 @@ defmodule InfluxElixir.ContractCaseTablesTest do
     {:sql, "explain;"} => {@stop_place, 2},
     {:sql, "insert into;"} => {@stop_place, 2},
     {:sql, "select 1+;"} => {@stop_place, 2},
+    {:sql, "select 1;analyze;"} => {@stop_place, 3},
     {:sql, "select i from mext limit;"} => {@stop_place, 2},
     {:sql, "select i from mext order by i,;"} => {@stop_place, 2},
     {:sql, "select i from mext where;"} => {@stop_place, 2},

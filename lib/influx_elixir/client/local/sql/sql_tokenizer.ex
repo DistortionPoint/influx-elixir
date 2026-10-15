@@ -67,10 +67,16 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   """
   @type result :: {:ok, tokens()} | :bail | {:unread, binary()}
 
-  @doc "The tokens of a text, or `:bail` when it holds one this tokenizer does not read."
-  @spec tokenize(binary()) :: {:ok, tokens()} | :bail
-  def tokenize(sql) do
-    case scan(sql) do
+  @typedoc "A line and a column, each from 1."
+  @type position :: {pos_integer(), pos_integer()}
+
+  @doc """
+  The tokens of a text, or `:bail` when it holds one this tokenizer does not read. The text
+  starts at `at`: a statement after the first is read where it stands in the whole text.
+  """
+  @spec tokenize(binary(), position()) :: {:ok, tokens()} | :bail
+  def tokenize(sql, at \\ {1, 1}) do
+    case scan(sql, at) do
       {:unread, _char} -> :bail
       read -> read
     end
@@ -81,8 +87,8 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   script, a symbol the engine's tokenizer reads as a character) is told apart from a text that is
   not read at all.
   """
-  @spec scan(binary()) :: result()
-  def scan(sql), do: tokenize(sql, 1, 1, [])
+  @spec scan(binary(), position()) :: result()
+  def scan(sql, {line, column} \\ {1, 1}), do: tokenize(sql, line, column, [])
 
   @doc """
   Whether a token is a hexadecimal number (`0x1F`), which the engine reads as a binary value.
@@ -92,17 +98,10 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   def hex?(_token), do: false
 
   @doc """
-  The text with every character but a newline blank, so a statement keeps its line and column
-  in the whole text.
-  """
-  @spec blank(binary()) :: binary()
-  def blank(text), do: Regex.replace(~r/[^\n]/u, text, " ")
-
-  @doc """
-  The statements of a text, each with the byte at which it starts. A `;` inside a string, a
+  The statements of a text, in order and end to end. A `;` inside a string, a
   quoted name, a comment or a dollar-quoted string ends nothing.
   """
-  @spec split(binary()) :: [{non_neg_integer(), binary()}]
+  @spec split(binary()) :: [binary()]
   def split(sql), do: split(sql, 0, 0, [])
 
   defp split(sql, pos, start, acc) when pos >= byte_size(sql),
@@ -137,7 +136,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
     end
   end
 
-  defp piece(sql, start, stop), do: {start, binary_part(sql, start, stop - start)}
+  defp piece(sql, start, stop), do: binary_part(sql, start, stop - start)
 
   # The position after the quote that closes a quoted token, a doubled quote one inside.
   defp skip_quoted(sql, q, quoted) do

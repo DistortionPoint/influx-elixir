@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local` put the `;` after a bare statement word on the wrong line.** In a text of
+  several statements, a statement word with nothing after it but a `;` (`SELECT 1;\nANALYZE;`)
+  was answered with the `;` on line 1, at a column past the end of that line. InfluxDB 3 Core
+  3.10.1 answers `Expected: identifier, found: ; at Line: 2, Column: 8`, and the double now
+  does too.
+- **`Client.Local` read a text of many statements in quadratic time.** Each statement was
+  read after the whole text before it, blanked again. A statement is now read alone, from
+  the line and column it starts at.
+
 ## [0.1.46] - 2026-10-14
 
 ### Fixed

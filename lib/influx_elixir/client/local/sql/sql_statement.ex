@@ -161,9 +161,9 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   starts with, `nil` when it starts with a statement word or a `(`, or the
   refusal of a first token whose printing is not known.
   """
-  @spec parser_error(binary(), SQLTokenizer.result() | nil) ::
+  @spec parser_error(binary(), SQLTokenizer.result() | nil, SQLTokenizer.position()) ::
           SQLError.t() | nil
-  def parser_error(sql, tokenized \\ nil) do
+  def parser_error(sql, tokenized \\ nil, at \\ {1, 1}) do
     {blank, rest} = split_blank(sql)
 
     cond do
@@ -178,12 +178,12 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
         )
 
       statement_word?(rest) ->
-        phrase_error(sql, tokenized)
+        phrase_error(sql, tokenized, at)
 
       true ->
         case printed(rest) do
           {:ok, token} ->
-            {line, column} = position(blank)
+            {line, column} = position(at, blank)
 
             SQLError.parser(
               "Expected: an SQL statement, found: #{token} at Line: #{line}, Column: #{column}"
@@ -200,10 +200,10 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
 
   # The parser's error for a statement of one of these words whose next token is not one it
   # can go on with: a privilege (`GRANT x`), `AS` (`ATTACH x`), `USING` (`MERGE INTO t`).
-  @spec phrase_error(binary(), SQLTokenizer.result() | nil) ::
+  @spec phrase_error(binary(), SQLTokenizer.result() | nil, SQLTokenizer.position()) ::
           SQLError.t() | nil
-  defp phrase_error(sql, tokenized) do
-    case tokenized || SQLTokenizer.tokenize(sql) do
+  defp phrase_error(sql, tokenized, at) do
+    case tokenized || SQLTokenizer.tokenize(sql, at) do
       {:ok, [{:word, _printed, word, _line, _col} | rest]} -> phrase(word, rest)
       _unread -> nil
     end
@@ -387,43 +387,45 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   (`UPDATE`, `GRANT;`): the parser's error for the end of the text, or the
   answer of a statement that needs nothing more. `nil` for any other text.
   """
-  @spec bare_error(binary()) :: SQLError.t() | nil
-  def bare_error(sql) do
+  @spec bare_error(binary(), SQLTokenizer.position()) :: SQLError.t() | nil
+  def bare_error(sql, at \\ {1, 1}) do
     {blank, rest} = split_blank(sql)
 
     with true <- String.valid?(rest),
          [word, tail] <- Regex.run(~r/\A([A-Za-z]+)(\s*;?\s*)\z/, rest, capture: :all_but_first),
          upper = String.upcase(word),
          true <- upper in @statement_words do
-      bare(upper, String.length(blank), String.length(word), tail)
+      bare(upper, {at, blank}, String.length(word), tail)
     else
       _not_bare -> nil
     end
   end
 
-  @spec bare(binary(), non_neg_integer(), non_neg_integer(), binary()) :: SQLError.t() | nil
-  defp bare(word, _blank, _length, _tail) when is_map_key(@complete, word) do
+  @spec bare(binary(), {SQLTokenizer.position(), binary()}, non_neg_integer(), binary()) ::
+          SQLError.t() | nil
+  defp bare(word, _start, _length, _tail) when is_map_key(@complete, word) do
     {status, body} = Map.fetch!(@complete, word)
     %{status: status, body: body}
   end
 
-  defp bare(word, blank, length, tail) do
+  defp bare(word, start, length, tail) do
     case Map.fetch(@needs, word) do
-      {:ok, needs} -> SQLError.parser("Expected: #{needs}, found: #{found(blank, length, tail)}")
+      {:ok, needs} -> SQLError.parser("Expected: #{needs}, found: #{found(start, length, tail)}")
       :error -> nil
     end
   end
 
-  # `EOF`, or the `;` that ends the text, at its line and column.
-  @spec found(non_neg_integer(), non_neg_integer(), binary()) :: binary()
-  defp found(blank, length, tail) do
+  # `EOF`, or the `;` that ends the text, at its line and column: the blank before the word
+  # starts at `at`, and keeps its newlines.
+  @spec found({SQLTokenizer.position(), binary()}, non_neg_integer(), binary()) :: binary()
+  defp found({at, blank}, length, tail) do
     case :binary.match(tail, ";") do
       :nomatch ->
         "EOF"
 
-      {at, _length} ->
+      {semicolon, _length} ->
         {line, column} =
-          position(String.duplicate(" ", blank + length) <> binary_part(tail, 0, at))
+          position(at, blank <> String.duplicate(" ", length) <> binary_part(tail, 0, semicolon))
 
         "; at Line: #{line}, Column: #{column}"
     end
@@ -576,10 +578,12 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
     end
   end
 
-  # The line and column of the first character after `blank`.
-  @spec position(binary()) :: {pos_integer(), pos_integer()}
-  defp position(blank) do
-    lines = String.split(blank, "\n")
-    {length(lines), String.length(List.last(lines)) + 1}
+  # The line and column of the first character after `blank`, which starts at `at`.
+  @spec position(SQLTokenizer.position(), binary()) :: SQLTokenizer.position()
+  defp position({line, column}, blank) do
+    case String.split(blank, "\n") do
+      [same_line] -> {line, column + String.length(same_line)}
+      lines -> {line + length(lines) - 1, String.length(List.last(lines)) + 1}
+    end
   end
 end

@@ -383,20 +383,35 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
     case if(several?, do: nil, else: early_verdict(sql)) do
       {:error, _error} = error -> error
-      nil -> check_pieces(pieces, sql, several?)
+      nil -> check_pieces(pieces, several?)
     end
   end
 
-  @spec check_pieces([{non_neg_integer(), binary()}], binary(), boolean()) ::
-          :ok | {:error, SQLError.t()}
-  defp check_pieces(pieces, sql, several?) do
-    pieces
-    |> Enum.reduce_while(false, fn {offset, piece}, unread? ->
-      positioned = SQLTokenizer.blank(binary_part(sql, 0, offset)) <> piece
-      tokenized = SQLTokenizer.scan(positioned)
+  # The line and column after `piece`, read from `at`. A column counts characters, as the
+  # engine's does.
+  @spec advance(SQLTokenizer.position(), binary()) :: SQLTokenizer.position()
+  defp advance({line, column}, piece) do
+    case String.split(piece, "\n") do
+      [same_line] -> {line, column + characters(same_line)}
+      lines -> {line + length(lines) - 1, characters(List.last(lines)) + 1}
+    end
+  end
 
-      case statement_verdict(positioned, tokenized, several?) do
-        :ok -> {:cont, unread? or tokenized == :bail}
+  @spec characters(binary()) :: non_neg_integer()
+  defp characters(text), do: text |> String.codepoints() |> length()
+
+  @spec check_pieces([binary()], boolean()) ::
+          :ok | {:error, SQLError.t()}
+  defp check_pieces(pieces, several?) do
+    # A statement is read alone, from the line and column it starts at in the whole text, which
+    # the statement before it gives. Reading it after the text before it, blanked, read that
+    # text again for each statement: a text of many statements was quadratic.
+    pieces
+    |> Enum.reduce_while({false, {1, 1}}, fn piece, {unread?, at} ->
+      tokenized = SQLTokenizer.scan(piece, at)
+
+      case statement_verdict(piece, tokenized, several?, at) do
+        :ok -> {:cont, {unread? or tokenized == :bail, advance(at, piece)}}
         {:error, _error} = error -> {:halt, {:failed, error, unread?}}
       end
     end)
@@ -420,11 +435,11 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp after_unread(error), do: error
 
-  @spec statement_verdict(binary(), SQLTokenizer.result(), boolean()) ::
+  @spec statement_verdict(binary(), SQLTokenizer.result(), boolean(), SQLTokenizer.position()) ::
           :ok | {:error, SQLError.t()}
-  defp statement_verdict(positioned, tokenized, several?) do
-    case first_token_error(positioned, tokenized) do
-      nil -> check_tokens(tokenized, several?, positioned)
+  defp statement_verdict(piece, tokenized, several?, at) do
+    case first_token_error(piece, tokenized, at) do
+      nil -> check_tokens(tokenized, several?, piece)
       error -> {:error, error}
     end
   end
@@ -432,14 +447,16 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # The parser's error for a statement that starts with no statement, or is a statement word
   # with nothing after it (`DELETE`, `USE`); the other answers of a bare word (`BEGIN`, `END`)
   # are the planner's, which a text of several statements never reaches.
-  @spec first_token_error(binary(), SQLTokenizer.result()) :: SQLError.t() | nil
-  defp first_token_error(positioned, tokenized) do
+  @spec first_token_error(binary(), SQLTokenizer.result(), SQLTokenizer.position()) ::
+          SQLError.t() | nil
+  defp first_token_error(piece, tokenized, at) do
     # A `;` ends nothing the parser needs to read: it is the token it finds where the
     # statement has no more (verified: `SELECT ; FROM t` is "found: ;" at the `;`).
-    statement = String.replace_suffix(positioned, ";", "")
+    statement = String.replace_suffix(piece, ";", "")
+    tokens = without_semicolon(statement != piece, tokenized)
 
-    SQLStatement.parser_error(statement, without_semicolon(statement != positioned, tokenized)) ||
-      parse_only(SQLStatement.bare_error(positioned))
+    SQLStatement.parser_error(statement, tokens, at) ||
+      parse_only(SQLStatement.bare_error(piece, at))
   end
 
   # The tokens of the statement without its closing `;`, from the tokens of the text with it
