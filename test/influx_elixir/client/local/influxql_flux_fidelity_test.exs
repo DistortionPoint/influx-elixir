@@ -177,9 +177,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxFidelityTest do
       assert {:ok, [row]} = iql(conn, "SELECT * FROM o WHERE k = ''")
       refute Map.has_key?(row, "k")
 
-      assert {:ok, rows} = iql(conn, "SELECT * FROM o")
-      assert length(rows) === 6
-      refute Enum.any?(rows, &(&1["k"] === ""))
+      row = fn micros, columns ->
+        Map.merge(columns, %{
+          "iox::measurement" => "o",
+          "time" => DateTime.from_unix!(micros, :microsecond)
+        })
+      end
+
+      assert iql(conn, "SELECT * FROM o") ===
+               {:ok,
+                [
+                  row.(1, %{"k" => "a", "v" => 1.0, "w" => 10.0}),
+                  row.(2, %{"k" => "b", "v" => 2.0, "w" => 20.0}),
+                  row.(3, %{"k" => "a", "v" => 3.0, "w" => 30.0}),
+                  row.(4, %{"k" => "into", "v" => 4.0, "w" => 40.0}),
+                  row.(5, %{"k" => "c", "x" => 7}),
+                  row.(6, %{"v" => 9.0, "w" => 90.0})
+                ]}
     end
 
     test "SHOW MEASUREMENTS lists the measurements by name", %{conn: conn} do

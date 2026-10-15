@@ -60,8 +60,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   @join_words ~w(FROM JOIN INNER CROSS LEFT RIGHT FULL OUTER NATURAL)
 
   # Words that begin an expression the double does not read.
-  @refused_words ~w(CASE EXISTS INTERVAL ARRAY ROW EXTRACT POSITION SUBSTRING TRIM OVERLAY
-                    CURRENT_DATE CURRENT_TIME CURRENT_TIMESTAMP
+  @refused_words ~w(EXISTS INTERVAL ARRAY ROW EXTRACT POSITION SUBSTRING TRIM OVERLAY
+                    CURRENT_DATE CURRENT_TIME
                     UNNEST MAP STRUCT LATERAL SELECT WITH VALUES FROM WHERE SET RETURNING
                     LIMIT DEFAULT ANY SOME COLLATE GROUP ORDER HAVING JOIN ON USING UNION
                     EXCEPT INTERSECT AS)
@@ -397,7 +397,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
 
   def delete_clauses(tokens) do
     with {:ok, function, tokens} <- table_args(tokens),
-         {:ok, _alias, rest} <- delete_alias(plain_alias(tokens)),
+         {:ok, _alias, rest} <- alias_name(plain_alias(tokens)),
          {:ok, several, rest} <- several(rest),
          {:ok, using, rest} <- using(rest),
          {:ok, where, rest} <- optional(rest, "WHERE"),
@@ -422,12 +422,6 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   @spec several([token()]) :: parsed(boolean())
   defp several([{:symbol, ",", _u, _l, _c} | rest]), do: from_tables(rest)
   defp several(tokens), do: {:ok, false, tokens}
-
-  # The alias of a delete is dropped, and the names after it are read and dropped.
-  @spec delete_alias([token()]) :: parsed(binary() | nil)
-  defp delete_alias(tokens) do
-    with {:ok, name, _columns, rest} <- alias_with_columns(tokens), do: {:ok, name, rest}
-  end
 
   # A delete drops its alias, so any quoted one is read as a word.
   @spec plain_alias([token()]) :: [token()]

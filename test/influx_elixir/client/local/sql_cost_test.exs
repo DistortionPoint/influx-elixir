@@ -123,6 +123,29 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
       # typed once, about nine times when every subtree is typed again.
       assert long < short * 5, "900 terms cost #{long} reductions, 300 cost #{short}"
     end
+
+    # An assignment's operand was typed again at each operator to check the operator took its
+    # operands' types: four times the terms cost 10.1 times as much (8.1 with the comparisons
+    # of a timestamp alone typed). Typed once, on the way up, they cost 3.9 times as much.
+    test "assigned by an UPDATE, is typed once per operator", %{conn: conn} do
+      update = fn terms ->
+        sql = "UPDATE main SET n = " <> Enum.join(List.duplicate("n", terms), " + ")
+
+        {reductions, answer} =
+          reductions(fn -> Local.query_sql(conn, sql, database: "cost_db") end)
+
+        assert answer ===
+                 {:error,
+                  %{status: 400, body: "Error during planning: DML not supported: Update"}}
+
+        reductions
+      end
+
+      update.(10)
+      short = update.(100)
+      long = update.(400)
+      assert long < short * 5, "400 terms cost #{long} reductions, 100 cost #{short}"
+    end
   end
 
   describe "a name or a pattern past the size of the regular expression that matches it" do

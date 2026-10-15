@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local` printed a number in a DML `WHERE` the way Elixir does, not the engine.**
+  A `WHERE` that is a bare number is answered with the number printed in the error, and the
+  double wrote `1.5e-7` as `Float64(1.5e-7)`. InfluxDB 3 Core 3.10.1 prints
+  `Float64(0.00000015)`, never with an exponent. The double now prints numbers as Core does.
+  It also answers the numbers it used to refuse by name: a float of 1e15 or more, and an
+  integer past 18 digits.
+- **`Client.Local` accepted a `LIKE ... ESCAPE 'é'` in a DML statement.** InfluxDB 3 Core
+  counts the escape's bytes, so a character of two bytes is not a single character to it:
+  `Invalid escape character in LIKE expression`. The double now answers the same.
+- **`Client.Local` typed an `UPDATE`'s arithmetic in quadratic time.** Every operator typed
+  the whole chain beneath it again, so four times the terms cost ten times as much. Each
+  operand is now typed once, on the way up.
+
 ## [0.1.47] - 2026-10-15
 
 ### Fixed

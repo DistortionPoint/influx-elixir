@@ -332,10 +332,13 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
   @spec simple?(binary()) :: boolean()
   defp simple?(name), do: Regex.match?(~r/\A[a-z_][a-z0-9_.]*\z/, name)
 
-  # A number as the planner prints its literal: `Int64(7)`, `UInt64(...)` above the largest
-  # `Int64`, `Float64(1.5)` for any other (written to the digits Rust prints, with no exponent).
+  @doc """
+  A number as the planner prints its literal: `Int64(7)`, `UInt64(...)` above the largest
+  `Int64`, `Float64(1.5)` for any other (written to the digits Rust prints, with no exponent),
+  or `:unknown` for a text that is not a number.
+  """
   @spec number(binary()) :: binary() | :unknown
-  defp number(text) do
+  def number(text) do
     cond do
       Regex.match?(~r/\A-?[0-9]+\z/, text) -> integer(String.to_integer(text), text)
       Regex.match?(~r/\A-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\z/, text) -> float(text)

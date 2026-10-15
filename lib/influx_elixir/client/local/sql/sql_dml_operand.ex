@@ -33,6 +33,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     SQLCommonType,
     SQLDml,
     SQLDmlExpr,
+    SQLDmlItem,
     SQLDmlName,
     SQLDmlType,
     SQLError,
@@ -289,23 +290,34 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   # beside a constant, a placeholder or a column, and arithmetic, a comparison, `AND` and `OR`
   # of operands of types that share one. The double plans only what can be wrong.
   @spec trivially_typed?(SQLDmlExpr.ast(), ctx()) :: boolean()
-  defp trivially_typed?({:bin, "||", left, right}, ctx) do
+  defp trivially_typed?(operand, ctx), do: trivial_type(operand, ctx) != false
+
+  # The type of an operand that is trivially typed, else `false`: found on the way up, so a
+  # long chain of operators is walked once (`type_of/2` at each level walks it again).
+  @spec trivial_type(SQLDmlExpr.ast(), ctx()) :: type() | false
+  defp trivial_type({:bin, "||", left, right}, ctx) do
     plain_concat?({:bin, "||", stood_in(left), stood_in(right)}, ctx) and
-      trivially_typed?(left, ctx) and trivially_typed?(right, ctx)
+      trivial_type(left, ctx) != false and trivial_type(right, ctx) != false and :str
   end
 
-  defp trivially_typed?({:bin, op, left, right}, ctx)
+  defp trivial_type({:bin, op, left, right}, ctx)
        when op in @arithmetic or op in @compared or op in ~w(AND OR) do
-    trivially_typed?(left, ctx) and trivially_typed?(right, ctx) and
-      shared?(op, type_of(left, ctx), type_of(right, ctx))
+    with left_type when left_type != false <- trivial_type(left, ctx),
+         right_type when right_type != false <- trivial_type(right, ctx),
+         true <- shared?(op, left_type, right_type) do
+      if op in @arithmetic, do: arithmetic(left_type, right_type), else: :bool
+    end
   end
 
-  defp trivially_typed?({kind, _text}, _ctx) when kind in [:num, :str, :bool, :param],
-    do: true
+  defp trivial_type({kind, _text} = leaf, ctx) when kind in [:num, :str, :bool, :param],
+    do: type_of(leaf, ctx)
 
-  defp trivially_typed?(:null, _ctx), do: true
-  defp trivially_typed?({:ref, parts}, ctx), do: column?(parts, ctx)
-  defp trivially_typed?(_node, _ctx), do: false
+  defp trivial_type(:null, _ctx), do: :null
+
+  defp trivial_type({:ref, parts} = leaf, ctx),
+    do: column?(parts, ctx) and type_of(leaf, ctx)
+
+  defp trivial_type(_node, _ctx), do: false
 
   # The planner finds the type of an operand as it reads it (a placeholder in it has no type
   # yet: the planner gives it one once the statement is read). An arithmetic operator over two
@@ -314,20 +326,20 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   @spec early_top(SQLDmlExpr.ast(), ctx()) :: check()
   defp early_top(node, ctx), do: plan_top(node, Map.put(ctx, :infer, false))
 
-  # Calls the engine converts before it reads their arguments: `substr(x)` and `substring(x)`
-  # are a `SUBSTRING` with neither `FROM` nor `FOR` (an error that prints the parse tree),
-  # `floor` and `ceil` with a second argument a scale.
+  # Calls the engine converts before it reads their arguments: `substr(x)` is a `SUBSTRING`
+  # with neither `FROM` nor `FOR` (an error that prints the parse tree), `floor` and `ceil`
+  # with a second argument a scale. (`substring` never reaches here: the parser refuses it.)
   @spec converted_alone?(binary(), [SQLDmlExpr.ast()] | :star) :: boolean()
-  defp converted_alone?(name, [_one]) when name in ["substr", "substring"], do: true
+  defp converted_alone?("substr", [_one]), do: true
   defp converted_alone?(name, [_a, _b]) when name in ["floor", "ceil"], do: true
   defp converted_alone?(_name, _args), do: false
 
-  # The planner types the operand of a unary plus as it reads it.
+  # The planner counts the escape's bytes: `'é'` is two, and not a single character to it.
   @spec escape_length(binary() | nil) :: check()
   defp escape_length(nil), do: :ok
 
   defp escape_length(escape) do
-    if String.length(escape) == 1,
+    if byte_size(escape) == 1,
       do: :ok,
       else:
         {:error,
@@ -866,32 +878,15 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   @spec literal_predicate(binary()) :: check()
   defp literal_predicate(text) do
-    cond do
-      Regex.match?(~r/\A-?[0-9]{1,18}\z/, text) ->
-        non_boolean("Int64(#{String.to_integer(text)})", "Int64")
-
-      match?({value, ""} when abs(value) < 1.0e15, Float.parse(text)) and
-          Regex.match?(~r/\A-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\z/, text) ->
-        {value, ""} = Float.parse(text)
-        non_boolean("Float64(#{float_text(value)})", "Float64")
-
-      true ->
+    case SQLDmlItem.number(text) do
+      :unknown ->
         {:refuse, "a predicate that is a number the double does not print"}
+
+      printed ->
+        [type, _value] = String.split(printed, "(", parts: 2)
+        non_boolean(printed, type)
     end
   end
-
-  # A float as the engine prints it: no fraction when it has none, else the shortest digits.
-  @spec float_text(float()) :: binary()
-  defp float_text(value) do
-    cond do
-      negative_zero?(value) -> "-0"
-      value == Float.round(value) and abs(value) < 1.0e15 -> Integer.to_string(trunc(value))
-      true -> Float.to_string(value)
-    end
-  end
-
-  @spec negative_zero?(float()) :: boolean()
-  defp negative_zero?(value), do: value == 0.0 and match?(<<1::1, _rest::63>>, <<value::float>>)
 
   @spec non_boolean(binary(), binary() | nil) :: check()
   defp non_boolean(printed, type) do
@@ -1059,11 +1054,10 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   # operand; the double finds it only at the top, or takes it for the comparison of a timestamp
   # with a text.
   @spec unsigned_against_time?(SQLDmlExpr.ast(), ctx()) :: boolean()
-  defp unsigned_against_time?({:bin, op, left, right} = node, ctx) do
+  defp unsigned_against_time?({:bin, op, left, right} = node, ctx) when op in @compared do
     types = {type_of(left, ctx), type_of(right, ctx)}
 
-    (op in @compared and
-       (types in [{:uint, :time}, {:time, :uint}] or length_of_text?(types, left, right))) or
+    types in [{:uint, :time}, {:time, :uint}] or length_of_text?(types, left, right) or
       node |> SQLDmlExpr.children() |> Enum.any?(&unsigned_against_time?(&1, ctx))
   end
 
@@ -1373,13 +1367,13 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   # The calls of the operands the planner asks about, in order, up to the first that can be null.
   @spec asked([SQLDmlExpr.ast()], ctx()) :: [SQLDmlExpr.ast()]
   defp asked(operands, ctx) do
-    {asked, _stopped} =
-      Enum.reduce(operands, {[], false}, fn
-        _operand, {asked, true} -> {asked, true}
-        operand, {asked, false} -> {asked ++ calls(operand, ctx), nullable(operand, ctx) != false}
-      end)
-
-    asked
+    operands
+    |> Enum.reduce_while([], fn operand, asked ->
+      asked = [calls(operand, ctx) | asked]
+      if nullable(operand, ctx) != false, do: {:halt, asked}, else: {:cont, asked}
+    end)
+    |> Enum.reverse()
+    |> Enum.concat()
   end
 
   # ---------------------------------------------------------------------------

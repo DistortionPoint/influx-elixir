@@ -2028,8 +2028,6 @@ defmodule InfluxElixir.Contract.SQLScalarRefusals do
        "UPDATE with a WHERE that is a field of a column: the engine's answer for it is not modelled"},
       {:raw, "update main set v = 1 where time.a",
        "UPDATE with a WHERE that is a field of a column: the engine's answer for it is not modelled"},
-      {:raw, "update main set v = 1 where 12345678901234567890",
-       "UPDATE with a predicate that is a number the double does not print: the engine's answer for it is not modelled"},
       {:raw, "update main set v = 1 where 1e400",
        "UPDATE with a predicate that is a number the double does not print: the engine's answer for it is not modelled"},
       {:raw, "update main set v = 1 where 'a$b'",
