@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.47] - 2026-10-15
+
 ### Fixed
 - **`Client.Local` put the `;` after a bare statement word on the wrong line.** In a text of
   several statements, a statement word with nothing after it but a `;` (`SELECT 1;\nANALYZE;`)
