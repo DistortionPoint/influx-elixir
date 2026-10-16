@@ -1505,6 +1505,20 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
        [%{"r" => -4.5}, %{"r" => -5.5}, %{"r" => -7.0}]},
       {:raw, "SELECT avg(DISTINCT +n) AS r FROM main GROUP BY host ORDER BY host", :ok,
        [%{"r" => 4.5}, %{"r" => 5.5}, %{"r" => 7.0}]},
+      {:raw, "SELECT sum(n) AS s FROM main GROUP BY host ORDER BY host DESC", :ok,
+       [%{"s" => 21}, %{"s" => 22}, %{"s" => 18}]},
+      {:raw, "SELECT sum(n) AS s FROM main GROUP BY host ORDER BY host DESC LIMIT 1 OFFSET 1",
+       :ok, [%{"s" => 22}]},
+      {:raw,
+       "SELECT host, sum(n) AS s FROM main GROUP BY host, region ORDER BY region DESC, host", :ok,
+       [
+         %{"host" => "h0", "s" => 12},
+         %{"host" => "h1", "s" => 8},
+         %{"host" => "h2", "s" => 11},
+         %{"host" => "h0", "s" => 6},
+         %{"host" => "h1", "s" => 14},
+         %{"host" => "h2", "s" => 10}
+       ]},
       {:raw, "SELECT v FROM main WHERE 1 NOT LIKE host ORDER BY time", :ok,
        [
          %{"v" => -20},

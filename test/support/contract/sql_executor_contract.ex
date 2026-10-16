@@ -713,6 +713,17 @@ defmodule InfluxElixir.Contract.SQLExecutor do
                  ]
         end
 
+        # A row prints whole microseconds, but DISTINCT tells times apart by their nanoseconds.
+        test "SELECT DISTINCT time keeps times less than a microsecond apart", ctx do
+          m = sxc_name("sxc_distinct_time")
+          sxc_write(ctx, ["#{m} v=1 1000", "#{m} v=2 1500", "#{m} v=3 1500"])
+
+          assert sxc_rows(ctx, "SELECT DISTINCT time FROM #{m} ORDER BY time") === [
+                   %{"time" => ~U[1970-01-01 00:00:00.000001Z]},
+                   %{"time" => ~U[1970-01-01 00:00:00.000001Z]}
+                 ]
+        end
+
         test "a boolean column groups by its value, false included", ctx do
           m = sxc_mixed(ctx)
 

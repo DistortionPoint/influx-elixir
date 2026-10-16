@@ -3,8 +3,10 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
   What a SQL text costs `Client.Local` to read, and what it never does to a text it cannot:
   the work of a query must not grow with the number of times a name is written in it
   (a `HAVING` alias), nor faster than linearly with the length of an expression it nests (a long
-  sum) or with the number of statements in a text, and a name or a pattern too long for the regular expressions the double matches with is a
-  refusal by name, not an exception. The answers themselves are pinned by the SQL contracts.
+  sum) or with the number of statements in a text, and a name or a pattern too long for the
+  regular expressions the double matches with is a refusal by name, not an exception. The
+  answers themselves are pinned by the SQL contracts. What a DML statement costs is in
+  `SQLDmlCostTest`.
   """
 
   use ExUnit.Case, async: true
@@ -112,8 +114,8 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
 
       # Run both shapes once before measuring: the first call of a function loads its module,
       # which would be counted in `short` and in nothing else.
-      assert {:ok, [%{"r" => 300}]} = sum.(300)
-      assert {:ok, [%{"r" => 900}]} = sum.(900)
+      assert sum.(300) === {:ok, [%{"r" => 300}]}
+      assert sum.(900) === {:ok, [%{"r" => 900}]}
 
       {short, {:ok, [%{"r" => 300}]}} = reductions(fn -> sum.(300) end)
       {long, answer} = reductions(fn -> sum.(900) end)
@@ -122,29 +124,6 @@ defmodule InfluxElixir.Client.Local.SqlCostTest do
       # Three times the terms: about three times the work when each operator is
       # typed once, about nine times when every subtree is typed again.
       assert long < short * 5, "900 terms cost #{long} reductions, 300 cost #{short}"
-    end
-
-    # An assignment's operand was typed again at each operator to check the operator took its
-    # operands' types: four times the terms cost 10.1 times as much (8.1 with the comparisons
-    # of a timestamp alone typed). Typed once, on the way up, they cost 3.9 times as much.
-    test "assigned by an UPDATE, is typed once per operator", %{conn: conn} do
-      update = fn terms ->
-        sql = "UPDATE main SET n = " <> Enum.join(List.duplicate("n", terms), " + ")
-
-        {reductions, answer} =
-          reductions(fn -> Local.query_sql(conn, sql, database: "cost_db") end)
-
-        assert answer ===
-                 {:error,
-                  %{status: 400, body: "Error during planning: DML not supported: Update"}}
-
-        reductions
-      end
-
-      update.(10)
-      short = update.(100)
-      long = update.(400)
-      assert long < short * 5, "400 terms cost #{long} reductions, 100 cost #{short}"
     end
   end
 

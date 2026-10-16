@@ -18,8 +18,14 @@ defmodule InfluxElixir.Client.Local.FormatTest do
   end
 
   test "parquet is refused by name", %{conn: conn} do
-    assert {:error, %{status: 400, body: "Client.Local: format: :parquet" <> _rest}} =
-             Local.query_sql(conn, "SELECT v FROM m", database: "db", format: :parquet)
+    assert Local.query_sql(conn, "SELECT v FROM m", database: "db", format: :parquet) ===
+             {:error,
+              %{
+                status: 400,
+                body:
+                  "Client.Local: format: :parquet is not supported by the test double; " <>
+                    "cover Parquet in the integration tier"
+              }}
   end
 
   test "a format the engine answers but the client cannot parse is unsupported", %{conn: conn} do
@@ -32,16 +38,30 @@ defmodule InfluxElixir.Client.Local.FormatTest do
   test "a format the client cannot write into its request body is refused, not raised", %{
     conn: conn
   } do
-    for format <- [<<255>>, 5, %{}, [:csv]] do
-      assert {:error, %{status: 400, body: "Client.Local: format: a value that is " <> _why}} =
-               Local.query_sql(conn, "SELECT v FROM m", database: "db", format: format)
+    assert Local.query_sql(conn, "SELECT v FROM m", database: "db", format: <<255>>) ===
+             {:error,
+              %{
+                status: 400,
+                body:
+                  "Client.Local: format: a value that is not valid UTF-8 " <>
+                    "(the client cannot write it into the request body)"
+              }}
+
+    for format <- [5, %{}, [:csv]] do
+      assert Local.query_sql(conn, "SELECT v FROM m", database: "db", format: format) ===
+               {:error,
+                %{
+                  status: 400,
+                  body: "Client.Local: format: a value that is neither an atom nor a string"
+                }}
     end
   end
 
   test "a query error is answered before the format", %{conn: conn} do
     for format <- [:csv, :pretty] do
-      assert {:error, %{status: 400, body: "Error during planning: table" <> _rest}} =
-               Local.query_sql(conn, "SELECT v FROM nosuch", database: "db", format: format)
+      assert Local.query_sql(conn, "SELECT v FROM nosuch", database: "db", format: format) ===
+               {:error,
+                %{status: 400, body: "Error during planning: table 'public.iox.nosuch' not found"}}
     end
   end
 end

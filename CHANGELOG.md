@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Client.Local` typed an `UPDATE`'s arithmetic in quadratic time.** Every operator typed
   the whole chain beneath it again, so four times the terms cost ten times as much. Each
   operand is now typed once, on the way up.
+- **`Client.Local` ignored an `ORDER BY` on a grouped column the select list leaves out.**
+  `SELECT sum(n) AS s FROM main GROUP BY host ORDER BY host DESC` came back in ascending host
+  order, and with a `LIMIT` it kept the wrong group. The rows are now sorted by the group's
+  values, as InfluxDB 3 Core 3.10.1 sorts them.
+- **`Client.Local`'s `SELECT DISTINCT time` merged times less than a microsecond apart.**
+  Core keeps two rows for points at 1000 ns and 1500 ns. The double now tells them apart by
+  their nanoseconds, though each row still prints whole microseconds.
+- **`Client.Local` evaluated an `ORDER BY` expression at every comparison.** A sort by a
+  single expression, such as `ORDER BY abs(n - 3000)`, now reads each row's key once: a
+  fifth of the work over 6000 rows.
 
 ## [0.1.47] - 2026-10-15
 

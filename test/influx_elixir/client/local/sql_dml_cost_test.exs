@@ -93,6 +93,20 @@ defmodule InfluxElixir.Client.Local.SQLDmlCostTest do
     end
   end
 
+  describe "a chain of arithmetic" do
+    # Each operator typed both its operands again to check they shared a type: 400 terms cost
+    # 10.1 times 100 (8.1 with only comparisons with a timestamp typed again). Typed once, on
+    # the way up, 3.9 times.
+    test "in an UPDATE is typed once per operator", %{conn: conn} do
+      assert_linear(
+        conn,
+        &"UPDATE main SET n = #{Enum.map_join(1..&1, " + ", fn _position -> "n" end)}",
+        @update_refusal,
+        sizes: {100, 400}
+      )
+    end
+  end
+
   describe "a nest of calls" do
     # The engine's parser stops at 50 levels (`SQLCatalogCases.syntax/0` pins the last depth
     # answered and the first refused of each statement), so the nests here stay under it: 10 and

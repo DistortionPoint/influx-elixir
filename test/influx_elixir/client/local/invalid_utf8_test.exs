@@ -266,8 +266,15 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
     # Verified against Core: a byte that is not UTF-8 is written as U+FFFD in the reason.
     test "a :precision that is not UTF-8 is the engine's 400, the bad byte replaced",
          %{conn: c} do
-      assert {:error, %{status: 400, body: "serde error: unknown variant `a�b`, " <> _rest}} =
-               Local.write(c, "m v=1", database: "utf8_iql", precision: "a" <> @bad <> "b")
+      assert Local.write(c, "m v=1", database: "utf8_iql", precision: "a" <> @bad <> "b") ===
+               {:error,
+                %{
+                  status: 400,
+                  body:
+                    "serde error: unknown variant `a�b`, expected one of `auto`, `s`, " <>
+                      "`second`, `millisecond`, `ms`, `microsecond`, `u`, `us`, `n`, " <>
+                      "`nanosecond`, `ns`"
+                }}
     end
 
     test "a :retention that is not UTF-8 is refused by name", %{conn: c} do
@@ -283,7 +290,8 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
       assert Local.write(c, ["io,host=a v=", ["2", ?\s], "1"], database: "utf8_iql") ===
                {:ok, :written}
 
-      assert {:ok, [%{"v" => 2.0}]} = Local.query_sql(c, "SELECT v FROM io", database: "utf8_iql")
+      assert Local.query_sql(c, "SELECT v FROM io", database: "utf8_iql") ===
+               {:ok, [%{"v" => 2.0}]}
     end
   end
 end

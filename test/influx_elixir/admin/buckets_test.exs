@@ -94,8 +94,11 @@ defmodule InfluxElixir.Admin.BucketsTest do
       end
 
       assert Buckets.create(conn, "none", retention: nil) === :ok
-      assert {:ok, [%{"name" => "none", "retentionRules" => [rule]}]} = Buckets.list(conn)
-      assert rule["everySeconds"] === 0
+      assert {:ok, [%{"name" => "none", "retentionRules" => rules}]} = Buckets.list(conn)
+
+      assert rules === [
+               %{"type" => "expire", "everySeconds" => 0, "shardGroupDurationSeconds" => 604_800}
+             ]
     end
   end
 

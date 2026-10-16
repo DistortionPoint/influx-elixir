@@ -23,13 +23,6 @@ defmodule InfluxElixir.Client.Local.SQLSort do
   of a sort is its keys over the items and not over the comparisons.
   """
   @spec sort_by_keys([term()], [key()]) :: [term()]
-  # One key, the common case (`ORDER BY time`): its key functions are cheap
-  # field reads, and building a decorated list costs more than it saves.
-  def sort_by_keys(items, [{key_fn, direction}]) do
-    placement = null_placement(direction)
-    Enum.sort(items, fn a, b -> value_before?(key_fn.(a), key_fn.(b), placement) != :after end)
-  end
-
   def sort_by_keys(items, keys) do
     placements = Enum.map(keys, fn {_key_fn, direction} -> null_placement(direction) end)
 
@@ -58,11 +51,22 @@ defmodule InfluxElixir.Client.Local.SQLSort do
       is_nil(x) and is_nil(y) -> :tie
       is_nil(x) -> if nulls == :nulls_first, do: :before, else: :after
       is_nil(y) -> if nulls == :nulls_last, do: :before, else: :after
-      value_order(x, y) and value_order(y, x) -> :tie
-      value_order(x, y) == (dir == :asc) -> :before
+      true -> ordered(value_order(x, y), x, y, dir)
+    end
+  end
+
+  # One comparison of two values, the other read only when the first says `x` comes first.
+  @spec ordered(boolean(), term(), term(), :asc | :desc) :: :before | :after | :tie
+  defp ordered(true, x, y, dir) do
+    cond do
+      value_order(y, x) -> :tie
+      dir == :asc -> :before
       true -> :after
     end
   end
+
+  defp ordered(false, _x, _y, :asc), do: :after
+  defp ordered(false, _x, _y, :desc), do: :before
 
   # Where a direction puts nulls when the query does not say.
   @spec null_placement(SQLClauses.direction()) :: placement()

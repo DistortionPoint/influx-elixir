@@ -62,7 +62,7 @@ defmodule InfluxElixir.Client.Local.DatabaseRulesTest do
         assert Jason.decode!(body) === %{"error" => message}, inspect(name)
       end
 
-      assert {:ok, [%{"name" => "_internal"}]} = Local.list_databases(conn)
+      assert Local.list_databases(conn) === {:ok, [%{"name" => "_internal"}]}
     end
   end
 

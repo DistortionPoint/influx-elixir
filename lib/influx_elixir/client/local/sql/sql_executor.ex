@@ -796,19 +796,21 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # SELECT DISTINCT a[, b ...]: one row per distinct combination, sorted
   # unless ORDER BY (one of the selected columns) says otherwise. A
   # combination whose columns are all null is a row too (`%{}`), as the
-  # engine returns it (verified).
+  # engine returns it (verified). Points are told apart by their stored values: two times
+  # less than a microsecond apart are two rows (verified), though a row prints whole
+  # microseconds.
   @spec execute_distinct_query([point()], SQLParser.parsed_query()) :: [map()]
   defp execute_distinct_query(points, query) do
     columns = query.distinct_columns
 
     points
-    |> Enum.map(fn point -> Enum.map(columns, &SQLRow.column_value(point, &1)) end)
-    |> Enum.uniq()
-    |> Enum.sort()
-    |> Enum.map(fn values ->
-      columns
-      |> Enum.zip(values)
-      |> Enum.reduce(%{}, fn {column, value}, row -> put_column(row, column, value) end)
+    |> Enum.map(fn point -> {Enum.map(columns, &SQLRow.sort_value(point, &1)), point} end)
+    |> Enum.uniq_by(&elem(&1, 0))
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(fn {_stored, point} ->
+      Enum.reduce(columns, %{}, fn column, row ->
+        put_column(row, column, SQLRow.column_value(point, column))
+      end)
     end)
     |> apply_order_by_rows(query.order_by, nil)
     |> apply_limit(query.limit, query.offset)
@@ -854,15 +856,43 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     time_alias = if interval_ns, do: find_time_bucket_alias(query.select_columns)
     having = prepare_having(query)
 
+    hidden = hidden_group_columns(columns, query)
+
     points
     |> Enum.group_by(fn point ->
       {bucket_start(point, interval_ns), Enum.map(columns, &group_value(point, &1))}
     end)
-    |> Enum.flat_map(fn {{bucket_ts, _values}, bucket_points} ->
-      SQLAggregate.reduce_group(query.select_columns, having, bucket_points, bucket_ts)
+    |> Enum.flat_map(fn {{bucket_ts, values}, bucket_points} ->
+      query.select_columns
+      |> SQLAggregate.reduce_group(having, bucket_points, bucket_ts)
+      |> Enum.map(&with_hidden(&1, hidden, columns, values))
     end)
     |> apply_order_by_rows(query.order_by, time_alias)
+    |> Enum.map(&Map.drop(&1, hidden))
     |> apply_limit(query.limit, query.offset)
+  end
+
+  # The grouped columns an `ORDER BY` names that the select list does not: a group's rows
+  # carry their values while they are sorted (`GROUP BY host ORDER BY host DESC` with only
+  # an aggregate selected sorts by the host, verified), and lose them after.
+  @spec hidden_group_columns([binary() | {:expr, SQLExpr.t()}], SQLParser.parsed_query()) ::
+          [binary()]
+  defp hidden_group_columns(columns, query) do
+    outputs = for column <- query.select_columns, do: elem(column, tuple_size(column) - 1)
+    ordered = for {column, _direction} <- query.order_by, is_binary(column), do: column
+
+    Enum.filter(columns, &(is_binary(&1) and &1 in ordered and &1 not in outputs))
+  end
+
+  @spec with_hidden(map(), [binary()], [binary() | {:expr, SQLExpr.t()}], [term()]) :: map()
+  defp with_hidden(row, [], _columns, _values), do: row
+
+  defp with_hidden(row, hidden, columns, values) do
+    columns
+    |> Enum.zip(values)
+    |> Enum.reduce(row, fn {column, value}, row ->
+      if column in hidden, do: put_column(row, column, value), else: row
+    end)
   end
 
   @spec prepare_having(SQLParser.parsed_query()) :: SQLAggregate.prepared()
