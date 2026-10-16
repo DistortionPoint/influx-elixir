@@ -13,6 +13,8 @@ defmodule InfluxElixir.ClientContract.LineProtocolCases do
   @trailing "Could not parse entire line. Found trailing content: "
   @no_fields "No fields were provided"
   @need_space "Expected at least one space character, got end of input"
+  # An `e` and a combining acute accent: one grapheme, two code points, three bytes.
+  @decomposed_e "e" <> <<0x301::utf8>>
 
   @doc """
   A line or a payload without the name of the measurement its first line begins with,
@@ -35,6 +37,14 @@ defmodule InfluxElixir.ClientContract.LineProtocolCases do
       {"zz v=1,wwwwwwwwww", @trailing <> "`wwwwwwwwww`"},
       {"zz v=1,wwwwwwwwwwwwwww", @trailing <> "`wwwwwwwwww...`"},
       {"zz v=1 ééééééééééé", @trailing <> "` ééééééééé...`"},
+      # Ten code points, not ten graphemes: an `e` and its combining accent are two.
+      {"zz v=1 5 " <> String.duplicate(@decomposed_e, 12),
+       @trailing <> "`" <> String.duplicate(@decomposed_e, 5) <> "...`"},
+      {"zz," <> String.duplicate(@decomposed_e, 12) <> " v=1",
+       "Tag set malformed: could not find equals sign in `" <>
+         String.duplicate(@decomposed_e, 5) <> "...`"},
+      # Spaces may follow a timestamp, not the fields.
+      {"zz v=1 ", @trailing <> "` `"},
       {"zz,t= abcdefghijklmnop v=1 5", "Expected tag value, got ` abcdefghi...`"},
       {"zz,=abcdefghijklmnop v=1 5", "Expected tag key, got `=abcdefghi...`"},
       {"zz,t=1,uuuuuuuuuuuuuuuuuuuuu v=1",
@@ -127,6 +137,10 @@ defmodule InfluxElixir.ClientContract.LineProtocolCases do
       {"zz,t=1 ", @no_fields},
       {",t=1 v=1", "Invalid measurement was provided"},
       {",", "Invalid measurement was provided"},
+      # A NUL ends a measurement, and only a measurement.
+      {"\0zz v=1", "Invalid measurement was provided"},
+      {" \0zz v=1", "Invalid measurement was provided"},
+      {"zz\0y v=1", "Expected at least one space character, got `\0y v=1`"},
       {~s|m"x y" v=1|, @no_fields},
       {~s|zz,t="a b" v=1|, @no_fields},
       # A tab ends a name as a space does, but a space alone separates the sections.
@@ -188,6 +202,7 @@ defmodule InfluxElixir.ClientContract.LineProtocolCases do
       {"~m v=1E+3", [%{"v" => 1000.0}]},
       {"~m v=1.5E-3", [%{"v" => 0.0015}]},
       {"~m v=007", [%{"v" => 7.0}]},
+      {"~m v=1e-999", [%{"v" => 0.0}]},
       {"~m v=9223372036854775807i", [%{"v" => 9_223_372_036_854_775_807}]},
       {"~m v=1u", [%{"v" => 1}]},
       {"~m a=T,b=f,c=True,d=FALSE", [%{"a" => true, "b" => false, "c" => true, "d" => false}]},
@@ -215,6 +230,8 @@ defmodule InfluxElixir.ClientContract.LineProtocolCases do
       {"~m v=1.5e3 1000", [%{"v" => 1500.0, "time" => ~U[1970-01-01 00:00:00.000001Z]}]},
       # a carriage return is a tag value's byte
       {"~m,t=a\rb v=1i 5", [%{"t" => "a\rb", "v" => 1}]},
+      # so is a NUL, which would end the measurement
+      {"~m,t=\0a v=1i 5", [%{"t" => "\0a", "v" => 1}]},
       # a newline inside a string value is part of the value
       {~s|~m f="a\nb" 1\n~m g=2i 2|, [%{"f" => "a\nb"}, %{"g" => 2}]},
       # a quote means nothing in a tag key, a tag value or a field key
@@ -249,7 +266,12 @@ defmodule InfluxElixir.ClientContract.LineProtocolCases do
       {"\nBAD", [{1, @need_space, ""}]},
       {"BAD1\n#c\n\nBAD2\nBAD3",
        [{1, @need_space, "BAD1"}, {2, @need_space, "#c"}, {3, @need_space, ""}]},
-      # The echo is cut to 20 characters and loses a carriage return.
+      # The echo is cut to 20 bytes, back to the start of a character the 20th byte does
+      # not end, and loses a carriage return.
+      {"zz,t=x" <> String.duplicate("é", 12) <> " x",
+       [{1, @no_fields, "zz,t=x" <> String.duplicate("é", 7)}]},
+      {"zz,t=" <> String.duplicate(@decomposed_e, 12) <> " x",
+       [{1, @no_fields, "zz,t=" <> String.duplicate(@decomposed_e, 5)}]},
       {"zz v=1i\r\nBAD", [{1, @trailing <> "`\r`", "zz v=1i"}, {2, @need_space, "BAD"}]},
       {"zz v=1i\r", [{1, @trailing <> "`\r`", "zz v=1i\r"}]},
       {"abcdefghijklmnopqrstuvwxyz", [{1, @need_space, "abcdefghijklmnopqrst"}]},
@@ -383,6 +405,7 @@ defmodule InfluxElixir.ClientContract.LineProtocolCases do
       # values the Go parser reads as another type
       {"zz v=.e3", "invalid float"},
       {"zz v=1e999", "invalid float"},
+      {"zz v=" <> String.duplicate("9", 400), "invalid float"},
       {"zz v=tRUE", "invalid boolean"},
       {"zz v=+5", "invalid boolean"},
       {"zz v=1ii", "invalid number"},

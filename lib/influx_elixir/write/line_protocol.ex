@@ -54,13 +54,13 @@ defmodule InfluxElixir.Write.LineProtocol do
   |---|---|
   | No fields | `:empty_fields` |
   | Empty measurement | `:empty_measurement` |
-  | Measurement not a string, containing a newline, or starting with `#` | `{:invalid_measurement, value}` |
+  | Measurement not a string, containing a newline, or starting with `#` or a tab | `{:invalid_measurement, value}` |
   | Tag key empty, not a string, or containing a newline | `{:invalid_tag_key, key}` |
   | Tag value empty, not a string, or containing a newline | `{:invalid_tag_value, key, value}` |
   | Tag key `time` (reserved on every version) | `{:reserved_tag_key, "time"}` |
   | Field key empty, not a string, or containing a newline | `{:invalid_field_key, key}` |
   | Field value not an integer, float, string or boolean, or an integer outside 64 bits | `{:invalid_field_value, key, value}` |
-  | Timestamp not a `DateTime`, integer or `nil` | `{:invalid_timestamp, value}` |
+  | Timestamp not a `DateTime`, integer or `nil`, or a `DateTime` that `precision: :auto` would misread (see `:precision`) | `{:invalid_timestamp, value}` |
 
   With `api_version: :v2` two more names are refused, because InfluxDB 2.7 cannot keep them
   (verified: a write is answered `204` and no query returns the points, or it is a parse
@@ -74,7 +74,10 @@ defmodule InfluxElixir.Write.LineProtocol do
   is refused with the same error as the other problems with that name:
   both versions reject the line even though the backslash is escaped. A
   measurement starting with `#` is a comment line to both, which drop it
-  silently inside a batch, and escaping it (`\#`) stores the backslash. An
+  silently inside a batch, and escaping it (`\#`) stores the backslash. Both
+  strip a leading tab from the measurement, and InfluxDB 2 a leading NUL, so
+  `"\tcpu"` would be stored as `cpu`: it is refused, as is a measurement
+  starting with NUL when `api_version: :v2`. An
   integer field must fit in a signed 64-bit integer; there is no unsigned
   field type on a `Point`.
 
@@ -107,7 +110,11 @@ defmodule InfluxElixir.Write.LineProtocol do
       `:millisecond`, `:microsecond`, `:nanosecond`, or the short spellings
       `write/3` takes: `:s`, `"ms"`, `"us"`, `"u"`, `"n"`, ...). A
       `DateTime` timestamp is written in that unit, truncated; without it
-      (or for `:auto`) in nanoseconds. A `DateTime` written in nanoseconds
+      (or for `:auto`) in nanoseconds. InfluxDB 3's `auto` reads a number
+      under 5e15 as seconds, milliseconds or microseconds, so with `:auto` a
+      `DateTime` within 58 days of 1970 is written in seconds when it is
+      whole seconds and is `{:invalid_timestamp, datetime}` otherwise. A
+      `DateTime` written in nanoseconds
       to a write with `precision: :second` is out of range on the server
       (verified), so pass the write's precision here. An integer timestamp
       is written as given: it is already in the caller's unit.
@@ -192,12 +199,17 @@ defmodule InfluxElixir.Write.LineProtocol do
   # (verified on 2.7.12): a measurement with `\\,`, `\\ `, `\\=` or `\\"` is stored but no
   # query returns its points, and a field key with `\\,`, `\\ ` or `\\=` is a parse error. They
   # are listed in `:refuses`, per name, and refused rather than written.
+  #
+  # `:measurement_starts` lists what a measurement may not start with (verified on Core 3.10.1
+  # and 2.7): `#` makes the line a comment, both engines strip a leading tab and store the
+  # rest, and InfluxDB 2 strips a leading NUL too (Core refuses that line itself).
   @kinds %{
     v3: %{
       measurement: :measurement,
       tag: :name,
       field_key: :name,
       measurement_refuses: [],
+      measurement_starts: ["#", "\t"],
       field_key_refuses: []
     },
     v2: %{
@@ -205,6 +217,7 @@ defmodule InfluxElixir.Write.LineProtocol do
       tag: :tag_v2,
       field_key: :field_key_v2,
       measurement_refuses: ["\\,", "\\ ", "\\=", "\\\""],
+      measurement_starts: ["#", "\t", <<0>>],
       field_key_refuses: ["\\,", "\\ ", "\\="]
     }
   }
@@ -223,15 +236,17 @@ defmodule InfluxElixir.Write.LineProtocol do
   end
 
   # Nanoseconds per unit of the write's precision; a `DateTime` is divided
-  # by it. An unknown spelling is left to the server to refuse, with the
-  # timestamp in nanoseconds.
-  @spec timestamp_divisor(atom() | binary()) :: pos_integer()
+  # by it. `:auto` is the engine's guess of the unit from the size of the number.
+  # An unknown spelling is left to the server to refuse, with the timestamp in
+  # nanoseconds.
+  @spec timestamp_divisor(atom() | binary()) :: pos_integer() | :auto
   defp timestamp_divisor(precision) do
     case to_string(precision) do
       unit when unit in ~w(second s) -> 1_000_000_000
       unit when unit in ~w(millisecond ms) -> 1_000_000
       unit when unit in ~w(microsecond us u) -> 1_000
-      _nanosecond_auto_or_unknown -> 1
+      "auto" -> :auto
+      _nanosecond_or_unknown -> 1
     end
   end
 
@@ -282,7 +297,8 @@ defmodule InfluxElixir.Write.LineProtocol do
   defp encode_measurement("", _kinds), do: {:error, :empty_measurement}
 
   defp encode_measurement(name, kinds) do
-    if name?(name, kinds.measurement_refuses) and not String.starts_with?(name, "#") do
+    if name?(name, kinds.measurement_refuses) and
+         not String.starts_with?(name, kinds.measurement_starts) do
       {:ok, escape(name, kinds.measurement)}
     else
       {:error, {:invalid_measurement, name}}
@@ -352,9 +368,26 @@ defmodule InfluxElixir.Write.LineProtocol do
   defp field_value?(value), do: is_float(value) or is_binary(value) or is_boolean(value)
 
   # ` <timestamp>`, or `[]` without one.
-  @spec encode_timestamp(DateTime.t() | integer() | nil, pos_integer()) ::
+  @spec encode_timestamp(DateTime.t() | integer() | nil, pos_integer() | :auto) ::
           {:ok, iodata()} | {:error, term()}
   defp encode_timestamp(nil, _divisor), do: {:ok, []}
+
+  # InfluxDB 3's `auto` reads a number under 5e15 in size as seconds, milliseconds or
+  # microseconds (verified: `1000000000` is 2001-09-09). Nanoseconds that small are a time
+  # within 58 days of 1970; one of whole seconds is written in seconds, which `auto` reads
+  # back, and any other is refused.
+  defp encode_timestamp(%DateTime{} = dt, :auto) do
+    case DateTime.to_unix(dt, :nanosecond) do
+      ns when abs(ns) >= 5_000_000_000_000_000 ->
+        {:ok, [?\s, Integer.to_string(ns)]}
+
+      ns when rem(ns, 1_000_000_000) == 0 ->
+        {:ok, [?\s, Integer.to_string(div(ns, 1_000_000_000))]}
+
+      _ambiguous ->
+        {:error, {:invalid_timestamp, dt}}
+    end
+  end
 
   # Truncated toward the past, so a timestamp never moves forward.
   defp encode_timestamp(%DateTime{} = dt, divisor),

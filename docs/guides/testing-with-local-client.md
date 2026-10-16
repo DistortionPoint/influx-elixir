@@ -1326,7 +1326,10 @@ a string field (which then keeps its closing quote), a line of anything but
 spaces and tabs is not blank, a line starting with `#` is a comment, a
 timestamp that does not
 fit in 64 bits of nanoseconds once scaled by the precision is rejected in each
-version's words, and an empty payload is rejected.
+version's words, and an empty payload is rejected. A line without a timestamp
+is stamped with the time of the write, cut to the write's precision (whole
+seconds with `precision: :second`), as both engines stamp it.
+
 ### Pinning production's column types
 
 Every `Local.start/1` begins with an empty schema, so in a test the *first*

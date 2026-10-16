@@ -1,6 +1,6 @@
 defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   @moduledoc false
-  # The InfluxDB 3 line grammar: `series SP+ fields [SP+ timestamp] SP*`, with
+  # The InfluxDB 3 line grammar: `series SP+ fields [SP+ timestamp SP*]`, with
   # the engine's errors for what does not parse.
 
   alias InfluxElixir.Client.Local.{
@@ -16,7 +16,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   # ---------------------------------------------------------------------------
   # InfluxDB 3 grammar
   #
-  # `series SP+ fields [SP+ timestamp] SP*`, and what is left over is the
+  # `series SP+ fields [SP+ timestamp SP*]`, and what is left over is the
   # error "Could not parse entire line. Found trailing content". Every
   # rule below was probed against Core:
   #
@@ -72,7 +72,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
           {:ok, binary(), [{binary(), binary()}], binary()} | {:error, binary()}
   @doc false
   def v3_series(line) do
-    case name_end(line) do
+    case measurement_end(line) do
       :none ->
         if LineProtocolEscape.ends_in_backslash?(line),
           do: {:error, @trailing_backslash},
@@ -92,7 +92,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
             with {:ok, tags, after_series} <- v3_tags(rest, rest, []),
                  do: {:ok, measurement, tags, after_series}
 
-          separator == ?\t ->
+          separator in [?\t, 0] ->
             {:error, need_space(binary_part(line, pos, byte_size(line) - pos))}
 
           true ->
@@ -176,13 +176,20 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   defp tag_set_malformed(whole),
     do: "Tag set malformed: could not find equals sign in `#{excerpt(whole)}`"
 
-  # What the engine quotes of the rest of a line in an error: ten
-  # characters, and "..." when there is more. ("Expected at least one space
-  # character" quotes all of it.)
+  # What the engine quotes of the rest of a line in an error: ten code
+  # points (not graphemes: an `e` and a combining accent are two, verified),
+  # and "..." when there is more. ("Expected at least one space character"
+  # quotes all of it.)
   @spec excerpt(binary()) :: binary()
-  defp excerpt(text) do
-    if String.length(text) > 10, do: String.slice(text, 0, 10) <> "...", else: text
-  end
+  defp excerpt(text), do: excerpt(text, text, 0)
+
+  @spec excerpt(binary(), binary(), non_neg_integer()) :: binary()
+  defp excerpt(text, "", _count), do: text
+
+  defp excerpt(text, rest, 10),
+    do: binary_part(text, 0, byte_size(text) - byte_size(rest)) <> "..."
+
+  defp excerpt(text, <<_char::utf8, rest::binary>>, count), do: excerpt(text, rest, count + 1)
 
   # The tag map. Nearly every series has no escape, and then its names are
   # what was written.
@@ -369,6 +376,16 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   defp name_end(<<c, _rest::binary>>, pos) when c in [?,, ?\s, ?\t], do: pos
   defp name_end(<<_c, rest::binary>>, pos), do: name_end(rest, pos + 1)
   defp name_end(<<>>, _pos), do: :none
+
+  # A measurement also ends at a NUL that no backslash escapes, which tags and fields may
+  # hold (verified: `\0x` is an invalid measurement and `x\0y` wants a space after `x`).
+  @spec measurement_end(binary()) :: non_neg_integer() | :none
+  defp measurement_end(text), do: measurement_end(text, 0)
+
+  defp measurement_end(<<?\\, _escaped, rest::binary>>, pos), do: measurement_end(rest, pos + 2)
+  defp measurement_end(<<c, _rest::binary>>, pos) when c in [?,, ?\s, ?\t, 0], do: pos
+  defp measurement_end(<<_c, rest::binary>>, pos), do: measurement_end(rest, pos + 1)
+  defp measurement_end(<<>>, _pos), do: :none
 
   @spec key_end(binary()) :: non_neg_integer() | :none
   @doc false

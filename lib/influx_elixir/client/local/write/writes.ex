@@ -29,7 +29,7 @@ defmodule InfluxElixir.Client.Local.Writes do
       result =
         case text
              |> LineProtocolParser.parse_lines(precision, dialect(profile))
-             |> stamp_untimed() do
+             |> stamp_untimed(precision) do
           {:ok, lines} when profile != :v2 and not accept_partial ->
             store_lines_atomically(table, database, lines)
 
@@ -73,11 +73,15 @@ defmodule InfluxElixir.Client.Local.Writes do
   # Both engines give every line of one write that has no timestamp the
   # same one, the request's time (verified): untimed lines of one series in
   # one payload are one point, their fields merged and the last write
-  # winning.
-  @spec stamp_untimed({:ok, [LineProtocolParser.line_result()]} | {:error, term()}) ::
-          {:ok, [LineProtocolParser.line_result()]} | {:error, term()}
-  defp stamp_untimed({:ok, lines}) do
-    now = Store.now_ns()
+  # winning. That time is cut to the write's precision (`s` keeps whole
+  # seconds; `auto` keeps nanoseconds), verified on both engines.
+  @spec stamp_untimed(
+          {:ok, [LineProtocolParser.line_result()]} | {:error, term()},
+          LineProtocolParser.precision()
+        ) :: {:ok, [LineProtocolParser.line_result()]} | {:error, term()}
+  defp stamp_untimed({:ok, lines}, precision) do
+    unit = precision_ns(precision)
+    now = div(Store.now_ns(), unit) * unit
 
     {:ok,
      Enum.map(lines, fn
@@ -89,7 +93,13 @@ defmodule InfluxElixir.Client.Local.Writes do
      end)}
   end
 
-  defp stamp_untimed(error), do: error
+  defp stamp_untimed(error, _precision), do: error
+
+  @spec precision_ns(LineProtocolParser.precision()) :: pos_integer()
+  defp precision_ns(:second), do: 1_000_000_000
+  defp precision_ns(:millisecond), do: 1_000_000
+  defp precision_ns(:microsecond), do: 1_000
+  defp precision_ns(_nanosecond_or_auto), do: 1
 
   # What `HTTP.write/3` plus the engine accept for `:precision`, verified:
   # InfluxDB 3 takes the spellings below verbatim (case-sensitive) and

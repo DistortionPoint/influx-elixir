@@ -22,14 +22,27 @@ defmodule InfluxElixir.Client.Local.LineProtocolError do
   end
 
   # What InfluxDB 3 echoes of a line: without the `\r` of a CRLF ending (one
-  # inside the line stays, verified), cut to 20 characters.
+  # inside the line stays, verified), cut to 20 bytes.
   @spec echo(binary()) :: binary()
   @doc false
   def echo(line), do: line |> String.replace_suffix("\r", "") |> cut()
 
+  # The first 20 bytes, less the start of a character the 20th byte does not end
+  # (verified: a line of two-byte characters after five ASCII bytes echoes 19 bytes).
   @spec cut(binary()) :: binary()
   @doc false
-  def cut(line), do: String.slice(line, 0, 20)
+  def cut(line) when byte_size(line) <= 20, do: line
+  def cut(line), do: binary_part(line, 0, boundary(line, 20))
+
+  # The largest size up to `at` that does not end inside a UTF-8 character: a
+  # continuation byte (`10xxxxxx`) at `at` belongs to the character before it.
+  @spec boundary(binary(), non_neg_integer()) :: non_neg_integer()
+  defp boundary(line, at) do
+    case :binary.at(line, at) do
+      byte when Bitwise.band(byte, 0xC0) == 0x80 -> boundary(line, at - 1)
+      _start -> at
+    end
+  end
 
   @doc """
   Builds the `t:line_error/0` for a schema error. InfluxDB 3 does not echo

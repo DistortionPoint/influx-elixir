@@ -135,7 +135,9 @@ defmodule InfluxElixir.Client.Local.LineProtocolNumber do
   # The float a number's text means; `:error` when it does not fit a float.
   # Elixir reads most spellings as they are; `5.` and `.5` (which InfluxDB 2
   # reads too) it does not, so they are written the way it does (`5.0` and
-  # `0.5`) and tried again.
+  # `0.5`) and tried again. `Float.parse/1` raises for digits beyond a float
+  # with no point or exponent (400 nines), which InfluxDB 2 calls an invalid
+  # float (verified).
   @spec parse_float(binary()) :: {:ok, float()} | :error
   @doc false
   def parse_float(text) do
@@ -143,6 +145,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolNumber do
       {float, ""} -> {:ok, float}
       _unread -> parse_float_normalised(text)
     end
+  rescue
+    ArgumentError -> :error
   end
 
   defp parse_float_normalised(text) do

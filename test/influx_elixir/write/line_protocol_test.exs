@@ -62,6 +62,25 @@ defmodule InfluxElixir.Write.LineProtocolTest do
       assert LineProtocol.encode(early, precision: :second) === {:ok, "cpu v=1i -1"}
     end
 
+    # `auto` reads a number under 5e15 as seconds, milliseconds or microseconds.
+    test "with :auto, a DateTime near 1970 is whole seconds or refused" do
+      encode = fn dt ->
+        LineProtocol.encode(Point.new("cpu", %{"v" => 1}, timestamp: dt), precision: :auto)
+      end
+
+      assert encode.(~U[1970-01-01 00:00:01Z]) === {:ok, "cpu v=1i 1"}
+      assert encode.(~U[1969-12-31 23:59:59Z]) === {:ok, "cpu v=1i -1"}
+      assert encode.(~U[1970-01-01 00:00:00Z]) === {:ok, "cpu v=1i 0"}
+
+      for dt <- [~U[1970-01-01 00:00:01.5Z], ~U[1970-02-27 20:53:19.999999Z]] do
+        assert encode.(dt) === {:error, {:invalid_timestamp, dt}}
+      end
+
+      # 5e15 ns and more, either side of 1970, `auto` reads as nanoseconds.
+      assert encode.(~U[1970-02-27 20:53:20.000001Z]) === {:ok, "cpu v=1i 5000000000001000"}
+      assert encode.(~U[1969-11-04 03:06:39.999999Z]) === {:ok, "cpu v=1i -5000000000001000"}
+    end
+
     test "an integer timestamp is already in the caller's unit, whatever the precision" do
       point = Point.new("cpu", %{"v" => 1}, timestamp: 1_790_596_800)
       assert LineProtocol.encode(point, precision: :second) === {:ok, "cpu v=1i 1790596800"}
@@ -276,6 +295,24 @@ defmodule InfluxElixir.Write.LineProtocolTest do
       # Anywhere else, and in a tag value, # is an ordinary character.
       ordinary = Point.new("c#pu", %{"v" => 1}, tags: %{"h" => "#a"})
       assert LineProtocol.encode(ordinary) === {:ok, "c#pu,h=#a v=1i"}
+    end
+
+    test "a measurement starting with a tab, or with NUL for v2, the server would strip" do
+      tab = Point.new("\tcpu", %{"v" => 1})
+      nul = Point.new(<<0, "cpu">>, %{"v" => 1})
+
+      for api_version <- [:v3, :v2] do
+        assert LineProtocol.encode(tab, api_version: api_version) ===
+                 {:error, {:invalid_measurement, "\tcpu"}}
+      end
+
+      assert LineProtocol.encode(nul, api_version: :v2) ===
+               {:error, {:invalid_measurement, <<0, "cpu">>}}
+
+      # InfluxDB 3 refuses a line whose measurement starts with NUL, so it is the server's
+      # to answer, as a tab or a NUL further in is.
+      assert LineProtocol.encode(nul) === {:ok, <<0, "cpu v=1i">>}
+      assert LineProtocol.encode(Point.new("c\tpu", %{"v" => 1})) === {:ok, "c\tpu v=1i"}
     end
 
     test "a name ending in a backslash, which both versions refuse even escaped" do

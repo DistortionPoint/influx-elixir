@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`LineProtocol.encode/2` wrote a measurement that the server renames.** InfluxDB 3 Core
+  3.10.1 and InfluxDB 2.7 both strip a leading tab from a measurement, and 2.7 strips a
+  leading NUL too: `"\tcpu"` was stored as `cpu`, with a 204. A measurement starting with a
+  tab, or with NUL for `api_version: :v2`, is now `{:invalid_measurement, name}`.
+- **`LineProtocol.encode/2` with `precision: :auto` wrote a `DateTime` near 1970 that the
+  server misreads.** `auto` reads a number under 5e15 as seconds, milliseconds or
+  microseconds, so `~U[1970-01-01 00:00:01Z]` was stored as 2001-09-09. Such a `DateTime` is
+  now written in seconds when it is whole seconds, and is `{:invalid_timestamp, datetime}`
+  otherwise.
+- **`Client.Local` raised on an InfluxDB 2 write of a number too large for a float.**
+  `m v=` and 400 digits crashed the write. InfluxDB 2.7 answers `invalid float`, and now
+  the double does too.
+- **`Client.Local` stamped an untimed line in nanoseconds whatever the precision.** Both
+  engines cut the time of the write to the write's precision, so with `precision: :second` an
+  untimed point has whole seconds. The double now does the same.
+- **`Client.Local` cut its line-protocol error texts by grapheme.** InfluxDB 3 echoes the
+  first 20 bytes of a line, backing off to the start of a character. It quotes 10 code
+  points of the rest, and an `e` with a combining accent is two of them. The double now
+  cuts the same way.
+- **`Client.Local` stored an InfluxDB 3 line whose measurement starts with NUL.** Core
+  ends a measurement at a NUL: `\0x v=1` is `Invalid measurement was provided`, and `x\0y v=1`
+  wants a space after `x`. The double now answers both the same.
+
 ## [0.1.48] - 2026-10-16
 
 ### Fixed

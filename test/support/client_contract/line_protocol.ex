@@ -210,6 +210,27 @@ defmodule InfluxElixir.ClientContract.LineProtocol do
           )
         end
 
+        # The time of the write is a nanosecond count; a write's precision cuts it.
+        test "a line without a timestamp is stamped with the write's time, cut to its precision",
+             ctx do
+          alias InfluxElixir.ClientContract.LineProtocol, as: LP
+
+          for {precision, micros} <- [second: 1_000_000, millisecond: 1_000] do
+            m = LP.name("lpcut")
+
+            assert unquote(client).write(ctx.conn, "#{m} v=1",
+                     database: ctx.database,
+                     precision: precision
+                   ) === {:ok, :written}
+
+            assert {:ok, [%{"time" => %DateTime{microsecond: {us, _digits}}} = row]} =
+                     LP.v3_columns(unquote(client), ctx, m, true)
+
+            assert Map.delete(row, "time") === %{"v" => 1.0}
+            assert rem(us, micros) === 0, "#{precision}: #{us} µs"
+          end
+        end
+
         test "\\\\, \\, and \\<space> are undone everywhere, \\= outside a measurement", ctx do
           alias InfluxElixir.ClientContract.LineProtocol, as: LP
           escapes = unquote(Macro.escape(LineProtocolCases.v3_escapes()))
@@ -511,6 +532,27 @@ defmodule InfluxElixir.ClientContract.LineProtocol do
               end
             end
           )
+        end
+
+        # The time of the write is a nanosecond count; a write's precision cuts it.
+        test "a line without a timestamp is stamped with the write's time, cut to its precision",
+             ctx do
+          alias InfluxElixir.ClientContract.LineProtocol, as: LP
+
+          for {precision, micros} <- [second: 1_000_000, millisecond: 1_000] do
+            m = LP.name("lpcut")
+
+            assert unquote(client).write(ctx.conn, "#{m} v=1",
+                     database: ctx.database,
+                     precision: precision
+                   ) === {:ok, :written}
+
+            assert {:ok, [%{"_time" => %DateTime{microsecond: {us, _digits}}, "_value" => value}]} =
+                     LP.flux(unquote(client), ctx, m)
+
+            assert value === 1.0
+            assert rem(us, micros) === 0, "#{precision}: #{us} µs"
+          end
         end
 
         test "InfluxDB 2 undoes only an escape of its set and keeps every other backslash",
