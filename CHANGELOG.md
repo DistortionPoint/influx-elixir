@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.48] - 2026-10-16
+
 ### Fixed
 - **`Client.Local` printed a number in a DML `WHERE` the way Elixir does, not the engine.**
   A `WHERE` that is a bare number is answered with the number printed in the error, and the
