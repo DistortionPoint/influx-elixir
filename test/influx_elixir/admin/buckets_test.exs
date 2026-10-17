@@ -46,12 +46,16 @@ defmodule InfluxElixir.Admin.BucketsTest do
     end
 
     test "a retention under one hour is refused the way InfluxDB 2 refuses it", %{conn: conn} do
-      assert {:error, %{status: 500, body: body}} = Buckets.create(conn, "short", retention: 60)
+      assert Buckets.create(conn, "short", retention: 60) ===
+               {:error,
+                %{
+                  status: 500,
+                  body:
+                    ~s({"code":"internal error",) <>
+                      ~s("message":"retention policy duration must be at least 1h0m0s"})
+                }}
 
-      assert Jason.decode!(body)["message"] ===
-               "retention policy duration must be at least 1h0m0s"
-
-      assert {:ok, []} = Buckets.list(conn)
+      assert Buckets.list(conn) === {:ok, []}
     end
 
     # InfluxDB 2.7 answers a bucket that exists with a 422 conflict (verified), which is
@@ -82,7 +86,7 @@ defmodule InfluxElixir.Admin.BucketsTest do
                       ~s("message":"expiration seconds cannot be negative"})
                 }}
 
-      for retention <- [7200.5, "2h"] do
+      for retention <- [7200.5, "2h", false] do
         assert Buckets.create(conn, "odd", retention: retention) ===
                  {:error,
                   %{
@@ -107,7 +111,7 @@ defmodule InfluxElixir.Admin.BucketsTest do
       :ok = Buckets.create(conn, "my_bucket")
 
       assert :ok = Buckets.delete(conn, "my_bucket")
-      assert {:ok, []} = Buckets.list(conn)
+      assert Buckets.list(conn) === {:ok, []}
 
       assert {:error, %{status: 404, body: "bucket not found: my_bucket"}} =
                Buckets.delete(conn, "my_bucket")

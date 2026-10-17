@@ -37,7 +37,8 @@ defmodule InfluxElixir.Admin.Databases do
 
   ## Returns
 
-    * `:ok` on success
+    * `:ok` on success, and for a database that exists, which is left as it was (its
+      retention unchanged): InfluxDB 3 answers that with a 409 conflict
     * `{:error, reason}` on failure
   """
   @spec create(InfluxElixir.Client.connection(), binary(), keyword()) ::
@@ -74,7 +75,11 @@ defmodule InfluxElixir.Admin.Databases do
   ## Returns
 
     * `:ok` on success
-    * `{:error, reason}` on failure
+    * `{:error, %{status: 404, body: "the requested resource was not found: " <> name}}`
+      for a database that does not exist
+    * `{:error, %{status: 500, body: "cannot delete internal db"}}` for the engine's own
+      `_internal`
+    * `{:error, reason}` on any other failure
   """
   @spec delete(InfluxElixir.Client.connection(), binary()) :: :ok | {:error, term()}
   def delete(connection, name) do

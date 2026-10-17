@@ -35,8 +35,11 @@ defmodule InfluxElixir.Admin.Tokens do
       in that form is `{:error, {:invalid_permission, string}}`, before any
       request.
     * `:expiry_secs` - seconds until the token expires; omitted, it never
-      does. Anything but a non-negative integer is the server's 400
-      (`serde json error: ..., expected u64 at line 1 column N`).
+      does. Anything but an integer from 0 to 2^64 - 1 is the server's 400
+      (`serde json error: ..., expected u64 at line 1 column N`). An expiry
+      past `+262142-12-31T23:59:59.999Z`, the end of InfluxDB 3's calendar,
+      is `nil`: such a token never expires. A year past 9999 is printed with
+      its sign (`"+10056-10-16T17:45:45.943Z"`).
 
   ## Returns
 

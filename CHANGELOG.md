@@ -41,11 +41,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A JSONL body with a CRLF blank line was a parse error.** `ResponseParser.parse(body,
   :jsonl)` read the line's `\r` as JSON. It now skips a line of only whitespace, as the
   streaming path already did.
+- **`Client.Local` printed a token expiry that InfluxDB 3 does not.** Core 3.10.1 gives
+  `"expiry": null` for an expiry past `+262142-12-31T23:59:59.999Z`, the end of its calendar,
+  and that covers every `expiry_secs` up to 2^64 - 1. It signs a year past 9999
+  (`+10056-…`). The double now does both. It also accepts no integer past u64, which Core
+  reads as a float and refuses.
+- **`Client.Local` named a JSON value of the wrong type unlike InfluxDB 3.** This applied to
+  `retention:` on a database and `expiry_secs:` on a token. The double now reads the value
+  as the JSON the request carries, as Core 3.10.1 does:
+  - a list is `invalid type: sequence` and a map is `invalid type: map`, refused at the
+    byte before the value starts;
+  - a float is printed as Rust prints one (`1e+20`, `1.8446744073709552e+19`);
+  - an integer outside i64 and u64 is a float, and one past every float is `number out of
+    range`;
+  - an atom is the string it is sent as.
+
+  A retention that no JSON can hold is now `{:unencodable_body, message}`, as `Client.HTTP`
+  answers it.
+- **`Client.Local` created a v2 bucket for `retention: false`.** It read `false` as no
+  retention. InfluxDB 2.7 answers `everySeconds: false` with a 400, and the double now
+  refuses it as it refuses any other value that is not an integer.
 
 ### Documentation
 - **`BatchWriter`'s request order.** The moduledoc said requests go in the order the
   batches were taken. A batch waiting out its retry delay is overtaken by an explicit
   `flush/2` or `write_sync/3`, and the moduledoc now says so.
+- **The admin modules' answers.** `Admin.Databases` documents its answers: a create of a
+  database that exists is `:ok`, a delete of a missing one is a 404, and `_internal` is a
+  500. `Admin.Buckets.delete/2` documents its 404, and `:org_id` says that `Client.Local`
+  ignores it. `TestHelper.setup_influx/1` says that bad options raise.
 
 ## [0.1.48] - 2026-10-16
 

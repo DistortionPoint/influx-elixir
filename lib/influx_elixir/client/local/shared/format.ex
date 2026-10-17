@@ -206,6 +206,14 @@ defmodule InfluxElixir.Client.Local.Format do
   def render_float(value), do: signed(value, &render_abs/1)
 
   @doc """
+  A float as the engine's JSON parser names it in an error: `render_float/1` with a `+`
+  before a positive exponent (`1e+16`, `1.8446744073709552e+19`, `1.5e-7`, `-0.0`,
+  verified on Core 3.10.1).
+  """
+  @spec render_serde_float(float()) :: binary()
+  def render_serde_float(value), do: String.replace(render_float(value), ~r/e(?=\d)/, "e+")
+
+  @doc """
   A float as the planner prints a `Float64` literal, and as the engine writes
   a field in line protocol: positional notation, the shortest digits that
   read back, no `.0` for a whole number (`1`, `0.1`, `100000000000000000000`,

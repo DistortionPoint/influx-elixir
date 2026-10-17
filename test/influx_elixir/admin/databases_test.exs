@@ -32,14 +32,14 @@ defmodule InfluxElixir.Admin.DatabasesTest do
     end
 
     test "an unreadable retention duration is the engine's 400 and creates nothing", %{conn: conn} do
-      assert {:error,
-              %{
-                status: 400,
-                body:
-                  ~s|serde json error: invalid value: string "soon", expected a duration | <>
-                    "at line 1 column 39"
-              }} =
-               Databases.create(conn, "never", retention: "soon")
+      assert Databases.create(conn, "never", retention: "soon") ===
+               {:error,
+                %{
+                  status: 400,
+                  body:
+                    ~s|serde json error: invalid value: string "soon", expected a duration | <>
+                      "at line 1 column 39"
+                }}
 
       assert Databases.list(conn) === {:ok, [%{"name" => "_internal"}, %{"name" => "test_db"}]}
     end
@@ -47,12 +47,11 @@ defmodule InfluxElixir.Admin.DatabasesTest do
 
   describe "delete/2" do
     test "removes the database; deleting it again is the engine's 404", %{conn: conn} do
-      assert :ok = Databases.delete(conn, "test_db")
-      assert {:ok, dbs} = Databases.list(conn)
-      refute %{"name" => "test_db"} in dbs
+      assert Databases.delete(conn, "test_db") === :ok
+      assert Databases.list(conn) === {:ok, [%{"name" => "_internal"}]}
 
-      assert {:error, %{status: 404, body: "the requested resource was not found: test_db"}} =
-               Databases.delete(conn, "test_db")
+      assert Databases.delete(conn, "test_db") ===
+               {:error, %{status: 404, body: "the requested resource was not found: test_db"}}
     end
   end
 end

@@ -39,7 +39,9 @@ defmodule InfluxElixir.TestHelper do
   client when the test finishes.
 
   Returns `{:ok, conn: conn}` so it can be returned directly from an ExUnit
-  `setup` block, merging `conn` into the test context map.
+  `setup` block, merging `conn` into the test context map. Options that
+  `Client.Local.start/1` refuses raise its `ArgumentError`, failing the test
+  at its setup.
 
   ## Options
 

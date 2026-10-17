@@ -531,29 +531,49 @@ defmodule InfluxElixir.ClientContract.WriteAdmin do
             end
           )
 
-          # The position is the byte before the closing brace of the body
-          # {"db":<name>,"retention_period":<retention>}, so it follows the
-          # length of the name.
+          # The body is {"db":<name>,"retention_period":<retention>}. A scalar is refused at
+          # the byte before its closing brace, a list or a map at the byte before the value
+          # starts, so the position follows the length of the name. An integer past u64 is
+          # read as a float, printed as Rust prints one; one past every float is out of range.
           InfluxElixir.TestSupport.Check.each_case(
             [
-              {3600, "invalid type: integer `3600`"},
-              {"1H", ~s|invalid value: string "1H"|},
-              {"1", ~s|invalid value: string "1"|},
-              {"-1h", ~s|invalid value: string "-1h"|}
+              {3600, "invalid type: integer `3600`", :end},
+              {-5, "invalid type: integer `-5`", :end},
+              {"1H", ~s|invalid value: string "1H"|, :end},
+              {"1", ~s|invalid value: string "1"|, :end},
+              {"-1h", ~s|invalid value: string "-1h"|, :end},
+              {:soon, ~s|invalid value: string "soon"|, :end},
+              {false, "invalid type: boolean `false`", :end},
+              {1.5, "invalid type: floating point `1.5`", :end},
+              {1.0e16, "invalid type: floating point `1e+16`", :end},
+              {-9_223_372_036_854_775_809,
+               "invalid type: floating point `-9.223372036854776e+18`", :end},
+              {[1], "invalid type: sequence", :start},
+              {%{}, "invalid type: map", :start},
+              {String.to_integer(String.duplicate("1", 400)), :out_of_range, :end}
             ],
-            fn {retention, what} ->
+            fn {retention, what, at} ->
               name = InfluxElixir.IntegrationHelper.unique_name("contract_ret")
-              body = ~s|{"db":"#{name}","retention_period":#{Jason.encode!(retention)}}|
-              column = byte_size(body) - 1
+              json = Jason.encode!(retention)
+              finish = byte_size(~s|{"db":"#{name}","retention_period":#{json}}|) - 1
+              column = if at === :end, do: finish, else: finish - byte_size(json)
 
               expected =
-                "serde json error: #{what}, expected a duration at line 1 column #{column}"
+                if what === :out_of_range,
+                  do: "serde json error: number out of range at line 1 column #{column}",
+                  else:
+                    "serde json error: #{what}, expected a duration at line 1 column #{column}"
 
-              assert {:error, %{status: 400, body: ^expected}} =
-                       unquote(client).create_database(ctx.conn, name, retention: retention),
+              assert unquote(client).create_database(ctx.conn, name, retention: retention) ===
+                       {:error, %{status: 400, body: expected}},
                      inspect(retention)
             end
           )
+
+          # No JSON holds a tuple: the body is never sent.
+          assert {:error,
+                  {:unencodable_body, "protocol Jason.Encoder not implemented for" <> _rest}} =
+                   unquote(client).create_database(ctx.conn, "x", retention: {1, 2})
         end
 
         test "the engine's _internal is listed and cannot be dropped", ctx do

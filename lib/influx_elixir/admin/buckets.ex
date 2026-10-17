@@ -30,6 +30,7 @@ defmodule InfluxElixir.Admin.Buckets do
         duration must be at least 1h0m0s` (verified); the bucket lists its
         rule as `"retentionRules" => [%{"type" => "expire", "everySeconds" => n}]`
       * `:org_id` - the org ID; looked up from the connection's `:org` when omitted
+        (`Client.Local` holds one org and ignores it)
 
   ## Returns
 
@@ -74,7 +75,9 @@ defmodule InfluxElixir.Admin.Buckets do
   ## Returns
 
     * `:ok` on success
-    * `{:error, reason}` on failure
+    * `{:error, %{status: 404, body: "bucket not found: " <> name}}` for a bucket that
+      does not exist
+    * `{:error, reason}` on any other failure
   """
   @spec delete(InfluxElixir.Client.connection(), binary()) :: :ok | {:error, term()}
   def delete(connection, name) do

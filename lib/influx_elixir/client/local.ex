@@ -1021,7 +1021,7 @@ defmodule InfluxElixir.Client.Local do
   bucket's shard groups are. Creating a bucket that exists is `:ok` and leaves it as it was,
   its retention unchanged: InfluxDB 2 answers a 422 conflict, which `Client.HTTP` takes as
   success. A negative retention is the engine's 422 (verified), and one that is not an
-  integer is refused by name (`nil` is `0`).
+  integer is refused by name (`nil` is `0`; `false` is refused, as InfluxDB 2 refuses it).
   """
   @impl true
   @spec create_bucket(
