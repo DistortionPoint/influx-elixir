@@ -57,6 +57,12 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       assert ResponseParser.parse(body, :jsonl) === {:ok, [%{"a" => 1}]}
     end
 
+    test "a CRLF blank line is skipped, as the streaming path skips it" do
+      body = ~s({"a":1}\r\n\r\n{"a":2}\r\n)
+
+      assert ResponseParser.parse(body, :jsonl) === {:ok, [%{"a" => 1}, %{"a" => 2}]}
+    end
+
     test "returns error on invalid JSONL line" do
       body = ~s({"a":1}\nnot json\n{"a":3})
 
@@ -82,7 +88,15 @@ defmodule InfluxElixir.Query.ResponseParserTest do
     end
 
     test "returns empty list for empty body" do
-      assert {:ok, []} = ResponseParser.parse("", :csv)
+      assert ResponseParser.parse("", :csv) === {:ok, []}
+    end
+
+    test "a value's CRLF and newline come back as InfluxDB 3 sent them" do
+      # `SELECT 'a' || chr(13) || chr(10) || 'b' AS s, 'x' || chr(10) || 'y' AS n`
+      # from InfluxDB 3 Core, verbatim. Only InfluxDB 2's CSV turns "\n" into "\r\n".
+      body = "s,n\n\"a\r\nb\",\"x\ny\"\n"
+
+      assert ResponseParser.parse(body, :csv) === {:ok, [%{"s" => "a\r\nb", "n" => "x\ny"}]}
     end
 
     test "a one-column row that is null or empty is a row, not a table separator" do
@@ -104,16 +118,21 @@ defmodule InfluxElixir.Query.ResponseParserTest do
       body =
         "iox::measurement,time,v,b\nm,2023-11-14T22:13:20,1.5,true\nm,2023-11-14T22:14:20,0.0,\n"
 
-      assert {:ok, [first, second]} = ResponseParser.parse(body, :csv)
-
-      assert first === %{
-               "iox::measurement" => "m",
-               "time" => ~U[2023-11-14 22:13:20.000000Z],
-               "v" => "1.5",
-               "b" => "true"
-             }
-
-      refute Map.has_key?(second, "b")
+      assert ResponseParser.parse(body, :csv) ===
+               {:ok,
+                [
+                  %{
+                    "iox::measurement" => "m",
+                    "time" => ~U[2023-11-14 22:13:20.000000Z],
+                    "v" => "1.5",
+                    "b" => "true"
+                  },
+                  %{
+                    "iox::measurement" => "m",
+                    "time" => ~U[2023-11-14 22:14:20.000000Z],
+                    "v" => "0.0"
+                  }
+                ]}
     end
   end
 
@@ -132,7 +151,34 @@ defmodule InfluxElixir.Query.ResponseParserTest do
 
   describe "parse/2 with :flux_csv format (InfluxDB 2)" do
     test "returns empty list for empty body" do
-      assert {:ok, []} = ResponseParser.parse("", :flux_csv)
+      assert ResponseParser.parse("", :flux_csv) === {:ok, []}
+    end
+
+    test "a dateTime column is a DateTime whatever its name" do
+      # `map(fn: (r) => ({r with t: r._time})) |> keep(columns: ["_value", "t"])`
+      # from InfluxDB 2.7, verbatim: `t` was left a string.
+      body =
+        "#datatype,string,long,double,dateTime:RFC3339\r\n" <>
+          ",result,table,_value,t\r\n" <>
+          ",_result,0,1,2023-11-14T22:13:20Z\r\n\r\n"
+
+      assert ResponseParser.parse(body, :flux_csv) ===
+               {:ok,
+                [
+                  %{
+                    "result" => "_result",
+                    "table" => 0,
+                    "_value" => 1.0,
+                    "t" => ~U[2023-11-14 22:13:20.000000Z]
+                  }
+                ]}
+    end
+
+    test "a dateTime cell that is not a time falls back to the raw string" do
+      body = "#datatype,string,dateTime:RFC3339\n,result,t\n,_result,soon\n"
+
+      assert ResponseParser.parse(body, :flux_csv) ===
+               {:ok, [%{"result" => "_result", "t" => "soon"}]}
     end
 
     test "parses Flux annotated CSV: CRLF, multiple tables, quoted cells, typed columns" do

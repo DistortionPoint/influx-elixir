@@ -892,6 +892,31 @@ defmodule InfluxElixir.Contract.Flux do
       describe "query_flux/3 — every yield is a result" do
         unquote(pushdown_setup(client))
 
+        @tag local_divergence: "Local has no map(); the server's copy of _time is a DateTime"
+        test "a dateTime column is a DateTime whatever its name", ctx do
+          tail =
+            ~s/ |> filter(fn: (r) => r.h == "b") |> map(fn: (r) => ({r with t: r._time}))/ <>
+              ~s/ |> keep(columns: ["_value", "t"])/
+
+          result = unquote(client).query_flux(ctx.conn, ctx.head <> tail)
+
+          if fxd_local?() do
+            assert InfluxElixir.Contract.Flux.error_of(result) ===
+                     {400, "Client.Local: unsupported Flux function: map()"}
+          else
+            assert result ===
+                     {:ok,
+                      [
+                        %{
+                          "result" => "_result",
+                          "table" => 0,
+                          "_value" => 2,
+                          "t" => ~U[1970-01-01 00:00:03.000000Z]
+                        }
+                      ]}
+          end
+        end
+
         test "two yields return two results, each numbering its tables from 0", ctx do
           flux = ctx.head <> ~s| \|> yield(name: "a") \|> yield(name: "b")|
           rows = [{0, "a", 1}, {0, "a", 3}, {1, "b", 2}]

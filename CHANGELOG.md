@@ -30,6 +30,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Client.Local` stored an InfluxDB 3 line whose measurement starts with NUL.** Core
   ends a measurement at a NUL: `\0x v=1` is `Invalid measurement was provided`, and `x\0y v=1`
   wants a space after `x`. The double now answers both the same.
+- **A Flux `dateTime` column was a `DateTime` only under a time name.** `ResponseParser`
+  decoded `_time`, `_start`, `_stop` and `time`, so `map(fn: (r) => ({r with t: r._time}))`
+  returned `t` as a string, though InfluxDB 2.7 types it `dateTime:RFC3339`. A `dateTime`
+  column is now a `DateTime` whatever its name.
+- **InfluxDB 3's `format: :csv` lost the `\r` of a value's `\r\n`.** The parser turned every
+  `\r\n` in a CSV value into `\n`, which undoes InfluxDB 2's CSV writer. Core 3.10.1 sends
+  a value's text as it is, so `"a\r\nb"` came back as `"a\nb"`. Only Flux CSV is rewritten
+  now.
+- **A JSONL body with a CRLF blank line was a parse error.** `ResponseParser.parse(body,
+  :jsonl)` read the line's `\r` as JSON. It now skips a line of only whitespace, as the
+  streaming path already did.
+
+### Documentation
+- **`BatchWriter`'s request order.** The moduledoc said requests go in the order the
+  batches were taken. A batch waiting out its retry delay is overtaken by an explicit
+  `flush/2` or `write_sync/3`, and the moduledoc now says so.
 
 ## [0.1.48] - 2026-10-16
 

@@ -16,13 +16,16 @@ defmodule InfluxElixir.Query.ResponseParser do
     * JSON / JSONL numbers and booleans keep the types Jason decodes
     * Flux CSV cells are typed from the `#datatype` annotation row when the
       query requested one (`double`, `long`, `unsignedLong`, `boolean`,
-      `dateTime:RFC3339[Nano]`); InfluxDB 3's `format: :csv` has no
-      annotations, so every cell stays a string. An empty cell is left out
-      of the row, as a null column is in JSON: CSV writes a null and an
-      empty string alike (InfluxDB 3 writes a one-column row's as `""`,
-      an empty line to the parser, and that row is `%{}`).
-      A newline inside a value is restored: InfluxDB 2's CSV writer sends
-      it as `\\r\\n`
+      `dateTime:RFC3339[Nano]`); a `dateTime` column is a `DateTime` whatever
+      its name. InfluxDB 3's `format: :csv` has no annotations, so every cell
+      stays a string except a timestamp, decoded by its shape as in JSON.
+      An empty cell is left out of the row, as a null column is in JSON: CSV
+      writes a null and an empty string alike (InfluxDB 3 writes a one-column
+      row's as `""`, an empty line to the parser, and that row is `%{}`).
+    * A newline inside a Flux CSV value is restored: InfluxDB 2's CSV writer
+      sends it as `\\r\\n`. InfluxDB 3's CSV sends a value's text as it is, so
+      a `\\r\\n` there is kept.
+    * A JSONL line of only whitespace (a CRLF blank line) is skipped.
   """
 
   alias NimbleCSV.RFC4180, as: CSV
@@ -57,9 +60,12 @@ defmodule InfluxElixir.Query.ResponseParser do
     end
   end
 
+  # A line of only whitespace (the "\r" of a CRLF blank line) is skipped, as the streaming
+  # path skips it.
   def parse(body, :jsonl) do
     body
-    |> String.split("\n", trim: true)
+    |> String.split("\n")
+    |> Enum.reject(&(String.trim(&1) == ""))
     |> Enum.reduce_while({:ok, []}, fn line, {:ok, acc} ->
       case Jason.decode(line) do
         {:ok, row} when is_map(row) -> {:cont, {:ok, [coerce_types(row) | acc]}}
@@ -180,7 +186,7 @@ defmodule InfluxElixir.Query.ResponseParser do
     case CSV.parse_string(body, skip_headers: false) do
       [header | rows] ->
         columns = Enum.map(header, &{&1, nil})
-        Enum.map(rows, &csv_row(columns, &1))
+        Enum.map(rows, fn row -> csv_row(columns, row, &Function.identity/1) end)
 
       [] ->
         []
@@ -213,7 +219,7 @@ defmodule InfluxElixir.Query.ResponseParser do
       {annotations, [header | data]} ->
         datatypes = annotation(annotations, "#datatype")
         columns = Enum.zip(header, datatypes ++ List.duplicate(nil, length(header)))
-        Enum.map(data, &csv_row(columns, &1))
+        Enum.map(data, fn row -> csv_row(columns, row, &restore_newlines/1) end)
 
       {_annotations_only, []} ->
         []
@@ -234,19 +240,22 @@ defmodule InfluxElixir.Query.ResponseParser do
     end
   end
 
-  @spec csv_row([{binary(), binary() | nil}], [binary()]) :: map()
-  defp csv_row(columns, values) do
+  # `text` reads a cell's text as the server meant it (see `restore_newlines/1`).
+  @spec csv_row([{binary(), binary() | nil}], [binary()], (binary() -> binary())) :: map()
+  defp csv_row(columns, values, text) do
     columns
     |> Enum.zip(values)
     |> Enum.reject(fn {{name, _type}, value} -> name == "" or value == "" end)
-    |> Map.new(fn {{name, type}, value} -> {name, cast(type, name, restore_newlines(value))} end)
+    |> Map.new(fn {{name, type}, value} -> {name, cast(type, name, text.(value))} end)
   end
 
   # InfluxDB 2 writes its CSV with Go's csv.Writer in CRLF mode, which
   # turns every "\n" inside a quoted value into "\r\n" (and drops a bare
   # "\r"; verified). Undoing it gives back the stored string — `s="l1\nl2"`
   # reads as "l1\nl2", as Client.Local returns it — for any value that had
-  # no "\r" of its own; those the server has already altered.
+  # no "\r" of its own; those the server has already altered. InfluxDB 3
+  # sends a value's "\r\n" and "\n" as they are (verified), so its CSV is
+  # read as written.
   @spec restore_newlines(binary()) :: binary()
   defp restore_newlines(value) do
     if :binary.match(value, "\r\n") == :nomatch,
@@ -260,7 +269,15 @@ defmodule InfluxElixir.Query.ResponseParser do
   defp cast("unsignedLong", _key, value), do: parse_number(Integer.parse(value), value)
   defp cast("boolean", _key, "true"), do: true
   defp cast("boolean", _key, "false"), do: false
-  defp cast("dateTime:" <> _layout, key, value), do: coerce_value(key, value)
+  # A dateTime column is a time whatever its name (`map(fn: (r) => ({r with t: r._time}))`
+  # types `t` as `dateTime:RFC3339`, verified).
+  defp cast("dateTime:" <> _layout, _key, value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, dt, _offset} -> microsecond_precision(dt)
+      {:error, _not_a_time} -> value
+    end
+  end
+
   defp cast(_type, key, value), do: coerce_value(key, value)
 
   @spec parse_number({number(), binary()} | :error, binary()) :: number() | binary()

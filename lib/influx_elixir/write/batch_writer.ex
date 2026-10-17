@@ -129,7 +129,10 @@ defmodule InfluxElixir.Write.BatchWriter do
   ## Requests
 
   The HTTP requests are made by a process of their own, one at a time and in the
-  order the batches were taken, and the writer handles the answer as a message. The
+  order the batches were taken, and the writer handles the answer as a message. A batch
+  waiting out its retry delay is not in that order: an explicit `flush/2` or
+  `write_sync/3` meanwhile is written first, so a point it rewrites (same series and
+  time) can be overwritten by the older batch's retry. The
   writer therefore answers `write/3`, `flush/2` and `stats/2` while a request is
   in flight, whatever the server's speed, and a `write/3` that completes a batch
   returns at once instead of waiting for the request.
