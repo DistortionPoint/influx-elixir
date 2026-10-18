@@ -66,6 +66,43 @@ defmodule InfluxElixir.ConnectionSupervisorClientErrorTest do
     end
   end
 
+  # `Config.validate!/1` raised inside the supervisor's init/1: the caller got the exception
+  # wrapped with a stacktrace, and a crash report was logged.
+  describe "the HTTP client's config validation" do
+    setup do
+      Application.put_env(:influx_elixir, :client, InfluxElixir.Client.HTTP)
+    end
+
+    test "refuses a config Config.validate/1 refuses, with its error", %{name: name} do
+      {:error, %NimbleOptions.ValidationError{key: [:default_database]} = error} =
+        InfluxElixir.Config.validate(name: name, host: "h", default_database: "x")
+
+      # `Supervisor.start_child/2` pairs the reason with the child, in OTP's own record.
+      assert {:error, {^error, _child}} =
+               InfluxElixir.add_connection(name, host: "h", default_database: "x")
+
+      assert Connection.get(name) === {:error, :not_found}
+      assert Process.whereis(:"influx_elixir_#{name}_supervisor") === nil
+    end
+
+    # NimbleOptions' error holds the value it refused, and prints it in its message.
+    test "refuses a :token that is not a string without its value", %{name: name} do
+      token = ~c"secret-token-#{System.unique_integer([:positive])}"
+
+      assert {:error, {error, child}} = InfluxElixir.add_connection(name, host: "h", token: token)
+
+      assert error === %NimbleOptions.ValidationError{
+               key: :token,
+               value: nil,
+               keys_path: [],
+               message: "invalid value for :token option: expected string"
+             }
+
+      refute inspect(child, limit: :infinity, printable_limit: :infinity) =~ to_string(token)
+      assert Connection.get(name) === {:error, :not_found}
+    end
+  end
+
   describe "a connection's release" do
     setup do
       Application.put_env(:influx_elixir, :client, Recording)

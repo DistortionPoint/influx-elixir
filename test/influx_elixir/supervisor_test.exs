@@ -11,7 +11,7 @@ defmodule InfluxElixir.SupervisorTest do
   end
 
   # The names a connection's processes are registered under.
-  defp supervisor_name(name), do: :"influx_elixir_conn_#{name}"
+  defp supervisor_name(name), do: :"influx_elixir_#{name}_supervisor"
   defp finch_name(name), do: :"influx_elixir_#{name}_finch"
   defp writer_name(name), do: :"influx_elixir_#{name}_batch_writer"
 

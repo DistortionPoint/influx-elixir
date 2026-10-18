@@ -2,157 +2,134 @@ defmodule InfluxElixir.ConfigTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Config
+  alias NimbleOptions.ValidationError
 
   # The examples in the docs run; none touches global state.
   doctest InfluxElixir.Config
+
+  # The options the schema fills in when they are not given.
+  @defaults %{
+    token: "",
+    org: "",
+    databases: [],
+    port: 8086,
+    scheme: :https,
+    pool_size: 10,
+    api_version: :v3
+  }
+
+  # A validated config holds each key once, so its map is all of it.
+  defp validated(opts) do
+    {:ok, validated} = Config.validate(opts)
+    Map.new(validated)
+  end
+
+  defp host_error(host, message) do
+    {:error,
+     %ValidationError{
+       key: :host,
+       value: host,
+       message: "invalid value for :host option: " <> message
+     }}
+  end
 
   # ---------------------------------------------------------------------------
   # validate/1
   # ---------------------------------------------------------------------------
 
-  describe "validate/1 — required fields" do
-    test "returns {:ok, opts} when both :host and :token are present" do
-      assert {:ok, opts} = Config.validate(host: "localhost", token: "my-token")
-      assert opts[:host] === "localhost"
-      assert opts[:token] === "my-token"
+  describe "validate/1 — given values and defaults" do
+    test "fills in every default, and only those, around :host" do
+      assert validated(host: "localhost") === Map.put(@defaults, :host, "localhost")
     end
 
-    test "returns {:error, validation_error} when :host is missing" do
-      assert {:error,
-              %NimbleOptions.ValidationError{
-                key: :host,
-                message: "required :host option not found" <> _rest
-              }} =
-               Config.validate(token: "my-token")
+    test "keeps every value given" do
+      given = [
+        host: "h",
+        token: "t",
+        org: "my-org",
+        database: "metrics",
+        databases: ["a", "b"],
+        port: 9999,
+        scheme: :http,
+        pool_size: 50,
+        api_version: :v2,
+        timeout: 5_000,
+        pool_timeout: 1_000,
+        flight_port: 8181,
+        batch_writer: [batch_size: 10],
+        finch_name: :my_finch,
+        name: :conn
+      ]
+
+      assert validated(given) === Map.new(given)
     end
 
-    test "succeeds when :token is omitted (defaults to empty string)" do
-      assert {:ok, opts} = Config.validate(host: "localhost")
-      assert opts[:token] === ""
-    end
-
-    test "returns {:error, validation_error} when both required fields are missing" do
-      assert {:error,
-              %NimbleOptions.ValidationError{
-                key: :host,
-                message: "required :host option not found" <> _rest
-              }} = Config.validate([])
-    end
-  end
-
-  describe "validate/1 — defaults" do
-    setup do
-      {:ok, base_opts: [host: "localhost", token: "t"]}
-    end
-
-    test "applies :scheme default of :https", %{base_opts: base_opts} do
-      assert {:ok, opts} = Config.validate(base_opts)
-      assert opts[:scheme] === :https
-    end
-
-    test "applies :port default of 8086", %{base_opts: base_opts} do
-      assert {:ok, opts} = Config.validate(base_opts)
-      assert opts[:port] === 8086
-    end
-
-    test "applies :pool_size default of 10", %{base_opts: base_opts} do
-      assert {:ok, opts} = Config.validate(base_opts)
-      assert opts[:pool_size] === 10
-    end
-
-    test "applies :org default of empty string", %{base_opts: base_opts} do
-      assert {:ok, opts} = Config.validate(base_opts)
-      assert opts[:org] === ""
-    end
-
-    test ":database has no default and is absent when not provided", %{base_opts: base_opts} do
-      assert {:ok, opts} = Config.validate(base_opts)
-      refute Keyword.has_key?(opts, :database)
-    end
-
-    test "applies :api_version default of :v3", %{base_opts: base_opts} do
-      assert {:ok, opts} = Config.validate(base_opts)
-      assert opts[:api_version] === :v3
+    test ":host is required" do
+      for {opts, received} <- [{[token: "my-token"], "[:token]"}, {[], "[]"}] do
+        assert Config.validate(opts) ===
+                 {:error,
+                  %ValidationError{
+                    key: :host,
+                    message: "required :host option not found, received options: " <> received
+                  }}
+      end
     end
   end
 
   describe "validate/1 — type validation" do
-    test "rejects :scheme value that is not :http or :https" do
-      assert {:error,
-              %NimbleOptions.ValidationError{
-                key: :scheme,
-                message:
-                  "invalid value for :scheme option: expected one of [:http, :https], got: :ftp"
-              }} =
-               Config.validate(host: "h", token: "t", scheme: :ftp)
+    test "rejects an unknown option, as the typo that used to be silently ignored" do
+      assert {:error, %ValidationError{key: [:default_database], value: nil, message: message}} =
+               Config.validate(host: "h", default_database: "prices")
+
+      assert message ===
+               "unknown options [:default_database], valid options are: " <>
+                 "[:host, :token, :org, :database, :databases, :port, :scheme, :pool_size, " <>
+                 ":api_version, :timeout, :pool_timeout, :flight_port, :batch_writer, " <>
+                 ":finch_name, :name]"
     end
 
-    test "accepts the supervisor-level keys and rejects unknown ones" do
-      assert {:ok, opts} =
-               Config.validate(
-                 host: "h",
-                 token: "t",
-                 timeout: 5_000,
-                 batch_writer: [batch_size: 10],
-                 finch_name: :my_finch
-               )
-
-      assert opts[:batch_writer] === [batch_size: 10]
-
-      # The typo that used to be silently ignored.
-      assert {:error,
-              %NimbleOptions.ValidationError{
-                key: [:default_database],
-                message: "unknown options [:default_database]" <> _rest
-              }} =
-               Config.validate(host: "h", token: "t", default_database: "prices")
-    end
-
-    test "accepts :api_version :v2 and rejects anything else" do
-      assert {:ok, opts} = Config.validate(host: "h", token: "t", api_version: :v2)
-      assert opts[:api_version] === :v2
-
-      assert {:error,
-              %NimbleOptions.ValidationError{
-                key: :api_version,
-                message:
-                  "invalid value for :api_version option: expected one of [:v2, :v3], got: :v1"
-              }} =
-               Config.validate(host: "h", token: "t", api_version: :v1)
+    test "rejects a value outside its type, naming it" do
+      for {key, value, expected} <- [
+            {:scheme, :ftp, "expected one of [:http, :https], got: :ftp"},
+            {:api_version, :v1, "expected one of [:v2, :v3], got: :v1"},
+            {:pool_size, 0, "expected positive integer, got: 0"},
+            {:timeout, :infinity, "expected positive integer, got: :infinity"},
+            {:pool_timeout, 0, "expected positive integer, got: 0"},
+            {:token, :not_a_string, "expected string, got: :not_a_string"},
+            {:token, nil, "expected string, got: nil"},
+            {:org, 1, "expected string, got: 1"},
+            {:database, 1, "expected string, got: 1"},
+            {:databases, "x", "expected list, got: \"x\""},
+            {:batch_writer, [1], "expected keyword list, got: [1]"},
+            {:finch_name, "f", "expected atom, got: \"f\""},
+            {:name, "n", "expected atom, got: \"n\""}
+          ] do
+        assert Config.validate([{key, value}, host: "h"]) ===
+                 {:error,
+                  %ValidationError{
+                    key: key,
+                    value: value,
+                    message: "invalid value for #{inspect(key)} option: " <> expected
+                  }},
+               inspect({key, value})
+      end
     end
 
     test "rejects a :port or :flight_port outside 1..65535" do
       for key <- [:port, :flight_port], port <- [-1, 0, 65_536] do
-        assert {:error, %NimbleOptions.ValidationError{key: ^key, message: message}} =
-                 Config.validate([{key, port}, host: "h"])
-
-        assert message ===
-                 "invalid value for #{inspect(key)} option: expected one of 1..65535, " <>
-                   "got: #{port}"
+        assert Config.validate([{key, port}, host: "h"]) ===
+                 {:error,
+                  %ValidationError{
+                    key: key,
+                    value: port,
+                    message:
+                      "invalid value for #{inspect(key)} option: expected one of 1..65535, " <>
+                        "got: #{port}"
+                  }}
       end
 
-      assert {:ok, opts} = Config.validate(host: "h", port: 65_535, flight_port: 1)
-      assert {opts[:port], opts[:flight_port]} === {65_535, 1}
-    end
-
-    test "rejects :pool_size that is not a positive integer" do
-      assert {:error,
-              %NimbleOptions.ValidationError{
-                key: :pool_size,
-                message: "invalid value for :pool_size option: expected positive integer, got: 0"
-              }} =
-               Config.validate(host: "h", token: "t", pool_size: 0)
-    end
-
-    test "rejects :host that is not a string" do
-      assert {:error,
-              %NimbleOptions.ValidationError{
-                key: :host,
-                message:
-                  "invalid value for :host option: expected :host to be a non-empty " <>
-                    "string, got: 123"
-              }} =
-               Config.validate(host: 123, token: "t")
+      assert validated(host: "h", port: 65_535, flight_port: 1) ===
+               Map.merge(@defaults, %{host: "h", port: 65_535, flight_port: 1})
     end
 
     test "options that are not a keyword list are a validation error, from both functions" do
@@ -166,15 +143,25 @@ defmodule InfluxElixir.ConfigTest do
             [[host: "h"]],
             [{:host, "ok"} | :improper]
           ] do
-        assert {:error, %NimbleOptions.ValidationError{}} = Config.validate(opts)
-        assert_raise NimbleOptions.ValidationError, fn -> Config.validate!(opts) end
+        message = "expected the options to be a keyword list, got: #{inspect(opts)}"
+        assert Config.validate(opts) === {:error, %ValidationError{message: message}}
+        assert_raise ValidationError, message, fn -> Config.validate!(opts) end
+      end
+    end
+
+    test "rejects a :host that is not a non-empty string" do
+      for host <- [123, "", nil] do
+        assert Config.validate(host: host) ===
+                 host_error(
+                   host,
+                   "expected :host to be a non-empty string, got: #{inspect(host)}"
+                 )
       end
     end
 
     # A host the request URL would read as something else sends the request elsewhere.
     test "accepts only a host the request URL reads back as its host" do
       for host <- [
-            "",
             "a b",
             "h\nx",
             "h\tx",
@@ -191,55 +178,18 @@ defmodule InfluxElixir.ConfigTest do
             "[::1",
             "日本.jp"
           ] do
-        assert {:error, %NimbleOptions.ValidationError{key: :host}} = Config.validate(host: host),
+        assert Config.validate(host: host) ===
+                 host_error(
+                   host,
+                   "expected :host to be a host name or an IP address (IPv6 in brackets), " <>
+                     "got: #{inspect(host)}"
+                 ),
                inspect(host)
       end
 
       for host <- ["localhost", "[::1]", "10.0.0.1", "xn--wgv71a.jp", "a.b."] do
-        assert {:ok, opts} = Config.validate(host: host), host
-        assert opts[:host] === host
+        assert validated(host: host) === Map.put(@defaults, :host, host), host
       end
-    end
-
-    test "rejects :token that is not a string" do
-      assert {:error,
-              %NimbleOptions.ValidationError{
-                key: :token,
-                message: "invalid value for :token option: expected string, got: :not_a_string"
-              }} =
-               Config.validate(host: "h", token: :not_a_string)
-    end
-
-    test "accepts :scheme :http" do
-      assert {:ok, opts} = Config.validate(host: "h", token: "t", scheme: :http)
-      assert opts[:scheme] === :http
-    end
-
-    test "accepts :scheme :https" do
-      assert {:ok, opts} = Config.validate(host: "h", token: "t", scheme: :https)
-      assert opts[:scheme] === :https
-    end
-  end
-
-  describe "validate/1 — explicit values override defaults" do
-    test "explicit :port is preserved" do
-      assert {:ok, opts} = Config.validate(host: "h", token: "t", port: 9999)
-      assert opts[:port] === 9999
-    end
-
-    test "explicit :pool_size is preserved" do
-      assert {:ok, opts} = Config.validate(host: "h", token: "t", pool_size: 50)
-      assert opts[:pool_size] === 50
-    end
-
-    test "explicit :org is preserved" do
-      assert {:ok, opts} = Config.validate(host: "h", token: "t", org: "my-org")
-      assert opts[:org] === "my-org"
-    end
-
-    test "explicit :database is preserved" do
-      assert {:ok, opts} = Config.validate(host: "h", token: "t", database: "metrics")
-      assert opts[:database] === "metrics"
     end
   end
 
@@ -248,33 +198,18 @@ defmodule InfluxElixir.ConfigTest do
   # ---------------------------------------------------------------------------
 
   describe "validate!/1" do
-    test "returns keyword list for valid opts" do
-      opts = Config.validate!(host: "localhost", token: "my-token")
-      assert opts[:host] === "localhost"
-      # Defaults are filled in, as validate/1 does.
-      assert opts[:scheme] === :https and opts[:port] === 8086
+    test "returns what validate/1 returns for valid opts" do
+      opts = [host: "localhost", token: "my-token"]
+      assert {:ok, Config.validate!(opts)} === Config.validate(opts)
     end
 
-    test "raises NimbleOptions.ValidationError for missing :host" do
-      assert_raise NimbleOptions.ValidationError, ~r/required :host option not found/, fn ->
-        Config.validate!(token: "my-token")
-      end
-    end
+    test "raises the error validate/1 returns" do
+      for opts <- [[token: "my-token"], [host: "h", scheme: :ws], [host: "h", pool_size: 0]] do
+        {:error, error} = Config.validate(opts)
 
-    test "succeeds when :token is omitted" do
-      opts = Config.validate!(host: "localhost")
-      assert opts[:token] === ""
-    end
-
-    test "raises NimbleOptions.ValidationError for invalid :scheme" do
-      assert_raise NimbleOptions.ValidationError, ~r/invalid value for :scheme option/, fn ->
-        Config.validate!(host: "h", token: "t", scheme: :ws)
-      end
-    end
-
-    test "raises NimbleOptions.ValidationError for zero :pool_size" do
-      assert_raise NimbleOptions.ValidationError, ~r/invalid value for :pool_size option/, fn ->
-        Config.validate!(host: "h", token: "t", pool_size: 0)
+        assert_raise ValidationError, Exception.message(error), fn ->
+          Config.validate!(opts)
+        end
       end
     end
   end
@@ -284,30 +219,17 @@ defmodule InfluxElixir.ConfigTest do
   # ---------------------------------------------------------------------------
 
   describe "base_url/1" do
-    test "builds https URL with custom port" do
-      opts = [scheme: :https, host: "example.com", port: 443]
-      assert Config.base_url(opts) === "https://example.com:443"
-    end
-
-    test "builds http URL with default port" do
-      opts = [scheme: :http, host: "localhost", port: 8086]
-      assert Config.base_url(opts) === "http://localhost:8086"
-    end
-
-    test "includes non-standard port in URL" do
-      opts = [scheme: :https, host: "us-east-1.influxdb.io", port: 9999]
-      assert Config.base_url(opts) === "https://us-east-1.influxdb.io:9999"
-    end
-
-    test "builds URL for IP address host" do
-      opts = [scheme: :http, host: "192.168.1.100", port: 8086]
-      assert Config.base_url(opts) === "http://192.168.1.100:8086"
-    end
-
-    test "scheme atom is rendered without quotes in URL" do
-      opts = [scheme: :http, host: "h", port: 80]
-      url = Config.base_url(opts)
-      assert String.starts_with?(url, "http://")
+    test "builds scheme://host:port from the options" do
+      for {opts, url} <- [
+            {[scheme: :https, host: "example.com", port: 443], "https://example.com:443"},
+            {[scheme: :http, host: "localhost", port: 8086], "http://localhost:8086"},
+            {[scheme: :https, host: "us-east-1.influxdb.io", port: 9999],
+             "https://us-east-1.influxdb.io:9999"},
+            {[scheme: :http, host: "192.168.1.100", port: 80], "http://192.168.1.100:80"},
+            {[scheme: :http, host: "[::1]", port: 8181], "http://[::1]:8181"}
+          ] do
+        assert Config.base_url(opts) === url
+      end
     end
 
     test "works with opts produced by validate!/1" do

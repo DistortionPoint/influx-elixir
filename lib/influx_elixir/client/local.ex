@@ -571,7 +571,7 @@ defmodule InfluxElixir.Client.Local do
   # ---------------------------------------------------------------------------
 
   @impl true
-  @spec init_connection(keyword()) :: {:ok, conn()}
+  @spec init_connection(keyword()) :: {:ok, conn()} | {:error, Exception.t()}
   def init_connection(config) do
     start(
       database: Keyword.get(config, :database),
@@ -579,6 +579,10 @@ defmodule InfluxElixir.Client.Local do
       profile: Keyword.get(config, :profile, :v3_core),
       org: Keyword.get(config, :org)
     )
+  rescue
+    # The callback refuses with an error: `ConnectionSupervisor` returns it from its start,
+    # where the raise crashed the supervisor's `init/1`.
+    error in ArgumentError -> {:error, error}
   end
 
   @impl true

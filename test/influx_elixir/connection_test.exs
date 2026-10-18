@@ -171,8 +171,8 @@ defmodule InfluxElixir.ConnectionTest do
       assert Connection.api_version(v3) === :v3
 
       name = unique_name(:api_version)
-      Connection.put(name, host: "h", api_version: :v2)
       on_exit(fn -> Connection.delete(name) end)
+      :ok = Connection.put(name, host: "h", api_version: :v2)
       assert Connection.api_version(name) === :v2
     end
 
@@ -207,14 +207,6 @@ defmodule InfluxElixir.ConnectionTest do
 
       # It named the derived pool whatever the connection said.
       assert Connection.finch_name(name) === :given_pool
-    end
-
-    test "is the derived pool for a registered connection that names none" do
-      name = :"finch_derived_#{System.unique_integer([:positive])}"
-      :ok = Connection.put(name, host: "h")
-      on_exit(fn -> Connection.delete(name) end)
-
-      assert Connection.finch_name(name) === :"influx_elixir_#{name}_finch"
     end
   end
 end

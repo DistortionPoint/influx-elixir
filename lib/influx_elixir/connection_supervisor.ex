@@ -29,8 +29,11 @@ defmodule InfluxElixir.ConnectionSupervisor do
   writes its buffer while the Finch pool is still up.
 
   If this supervisor is killed outright, its children outlive it for a
-  moment (they stop when they see it exit, the writer after writing its
-  buffer) and still hold their registered names. A restart waits for
+  moment (they stop when they see it exit) and still hold their registered
+  names. They stop together, not in order, so the writer's last write can
+  find the connection already released and the pool gone, and then the
+  buffer is lost. `InfluxElixir.remove_connection/1` stops them in
+  order. A restart waits for
   those names to be released, up to `#{@release_timeout_ms}` ms each,
   before starting new children: starting at once failed with
   `:already_started`, and the repeated failures took the top-level
@@ -38,11 +41,21 @@ defmodule InfluxElixir.ConnectionSupervisor do
 
   ## Failures to start
 
-  A client whose `init_connection/1` returns `{:error, reason}` makes
-  `start_link/1` return `{:error, reason}`. The `:token` never appears in
-  that error or in the logs of a failed start: the child spec and the
-  supervisor's argument carry it opaque (`inspect/1` prints
-  `#InfluxElixir.ConnectionSupervisor.Secret<...>`).
+  A config the client refuses makes `start_link/1` return `{:error, reason}`,
+  and `InfluxElixir.add_connection/2` `{:error, {reason, child_spec}}`;
+  nothing is started or registered:
+
+    * `InfluxElixir.Client.HTTP`: the `%NimbleOptions.ValidationError{}` of
+      `InfluxElixir.Config.validate/1`;
+    * `InfluxElixir.Client.Local`: the `%ArgumentError{}` that
+      `InfluxElixir.Client.Local.start/1` raises for the same options;
+    * any client: the `reason` of an `init_connection/1` that returns
+      `{:error, reason}`.
+
+  The `:token` never appears in that error or in the logs of a failed start:
+  the child spec and the supervisor's argument carry it opaque (`inspect/1`
+  prints `#InfluxElixir.ConnectionSupervisor.Secret<...>`), and a `:token`
+  that is not a string is refused without its value.
   """
 
   use Supervisor
@@ -79,9 +92,11 @@ defmodule InfluxElixir.ConnectionSupervisor do
     * any other `InfluxElixir.Config` option (`:api_version`, `:scheme`, ...)
 
   When the configured client is `InfluxElixir.Client.HTTP` the config is
-  validated with `InfluxElixir.Config.validate!/1`, so a typo such as
-  `default_database:` fails at startup instead of being silently ignored.
-  `InfluxElixir.Client.Local` needs no host, so its config is not validated.
+  validated with `InfluxElixir.Config.validate/1`, so a typo such as
+  `default_database:` fails at startup instead of being silently ignored:
+  `start_link/1` returns the `{:error, %NimbleOptions.ValidationError{}}`
+  it gave (see "Failures to start"). `InfluxElixir.Client.Local` needs no
+  host, so its config is not validated against that schema.
   """
   @spec start_link(keyword()) :: Supervisor.on_start() | {:error, {:invalid_options, term()}}
   def start_link(config) do
@@ -108,15 +123,35 @@ defmodule InfluxElixir.ConnectionSupervisor do
           {:ok, {Supervisor.sup_flags(), [Supervisor.child_spec() | {module(), term()}]}}
   def init(config) do
     client = InfluxElixir.Client.impl()
-    config = config |> Secret.reveal() |> then(&validate_config(client, &1))
+    config = Secret.reveal(config)
     name = Keyword.fetch!(config, :name)
     finch_name = finch_name(name)
-    pool_size = Keyword.get(config, :pool_size, 10)
 
-    # Finch registers its own supervisor as `<name>.Supervisor`, the top of
-    # its tree and so the last of its names to go; the pool's registry
-    # (`<name>`) can be released before it. The registration is released last, and a
-    # predecessor's still-running one would take down what is registered below.
+    # A config the client cannot use is refused as the client's refusal is: an exit that
+    # `start_link/1` hands back as `{:error, reason}`, not a raise inside `init/1`.
+    with {:ok, config} <- validate_config(client, config),
+         :ok <- await_names(name, finch_name),
+         {:ok, conn} <- client.init_connection(config) do
+      # The configured client initialised the connection; the first child registers it under
+      # its name, so callers resolve it via Connection.fetch!/1, and releases it on the way
+      # down.
+      Supervisor.init(
+        children(config, {name, client, conn}, finch_name, Keyword.get(config, :pool_size, 10)),
+        strategy: :rest_for_one
+      )
+    else
+      # A supervisor's init has no error return; an exit is how it fails with a reason, and
+      # `start_link/1` hands the reason back as the client gave it.
+      {:error, reason} -> exit({:shutdown, {:init_connection, reason}})
+    end
+  end
+
+  # Finch registers its own supervisor as `<name>.Supervisor`, the top of its tree and so the
+  # last of its names to go; the pool's registry (`<name>`) can be released before it. The
+  # registration is released last, and a predecessor's still-running one would take down what
+  # is registered below.
+  @spec await_names(atom(), atom()) :: :ok
+  defp await_names(name, finch_name) do
     Enum.each(
       [
         :"#{finch_name}.Supervisor",
@@ -126,20 +161,6 @@ defmodule InfluxElixir.ConnectionSupervisor do
       ],
       &await_release/1
     )
-
-    # The configured client initialises the connection; the first child registers it under
-    # its name, so callers resolve it via Connection.fetch!/1, and releases it on the way down.
-    case client.init_connection(config) do
-      {:ok, conn} ->
-        Supervisor.init(children(config, {name, client, conn}, finch_name, pool_size),
-          strategy: :rest_for_one
-        )
-
-      {:error, reason} ->
-        # A supervisor's init has no error return; an exit is how it fails with a reason,
-        # and `start_link/1` hands the reason back as the client gave it.
-        exit({:shutdown, {:init_connection, reason}})
-    end
   end
 
   # The registration first, so it stops last and takes the connection down after the writer's
@@ -196,11 +217,22 @@ defmodule InfluxElixir.ConnectionSupervisor do
     end
   end
 
-  @spec validate_config(module(), keyword()) :: keyword()
-  defp validate_config(InfluxElixir.Client.HTTP, config),
-    do: InfluxElixir.Config.validate!(config)
+  # A wrong-typed `:token` is refused without its value: the error is returned and may be
+  # logged, and the value is the token.
+  @spec validate_config(module(), keyword()) ::
+          {:ok, keyword()} | {:error, NimbleOptions.ValidationError.t()}
+  defp validate_config(InfluxElixir.Client.HTTP, config) do
+    case InfluxElixir.Config.validate(config) do
+      {:error, %NimbleOptions.ValidationError{key: :token} = error} ->
+        {:error,
+         %{error | value: nil, message: "invalid value for :token option: expected string"}}
 
-  defp validate_config(_client, config), do: config
+      validated ->
+        validated
+    end
+  end
+
+  defp validate_config(_client, config), do: {:ok, config}
 
   @doc false
   @spec finch_name(atom()) :: atom()
@@ -217,6 +249,8 @@ defmodule InfluxElixir.ConnectionSupervisor do
   @doc false
   @spec via(atom()) :: atom()
   def via(name) do
-    :"influx_elixir_conn_#{name}"
+    # A suffix, as every other derived name has: as a prefix (`influx_elixir_conn_<name>`)
+    # the supervisor of `:a_finch` took the pool name of `:conn_a`.
+    :"influx_elixir_#{name}_supervisor"
   end
 end

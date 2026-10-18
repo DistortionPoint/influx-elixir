@@ -19,6 +19,19 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
     assert Map.delete(config, :table) === %{profile: :v3_core, database: nil, org: "local"}
   end
 
+  defp missing_message(name) do
+    "no InfluxElixir connection named #{inspect(name)}: list it under " <>
+      "`config :influx_elixir, :connections` or add it with " <>
+      "InfluxElixir.add_connection/2"
+  end
+
+  # Why `add_connection/2` failed. `Supervisor.start_child/2` pairs the reason with the child
+  # it could not start, in OTP's own record, which is not this library's to pin.
+  defp start_error(name, opts) do
+    {:error, {reason, _child}} = InfluxElixir.add_connection(name, opts)
+    reason
+  end
+
   # A connection whose writer has `batch_size: 0` fails to start with the writer's own
   # refusal, which `BatchWriter.start_link/1` gives before it starts anything.
   defp writer_refusal(name) do
@@ -29,82 +42,48 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
   end
 
   describe "init/1 — registry population" do
-    test "registers initialized connection in persistent_term on start" do
+    test "registers the initialised connection, which the client uses straight away" do
       name = unique_name()
 
-      config = [
-        name: name,
-        host: "localhost",
-        token: "test-token",
-        database: "mydb"
-      ]
-
       {:ok, pid} =
-        InfluxElixir.add_connection(name, config)
+        InfluxElixir.add_connection(name,
+          host: "localhost",
+          token: "test-token",
+          database: "mydb"
+        )
 
-      on_exit(fn ->
-        InfluxElixir.remove_connection(name)
-      end)
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
-      assert Process.alive?(pid)
+      assert Process.whereis(:"influx_elixir_#{name}_supervisor") === pid
 
-      # The registered term is an initialised connection the configured
-      # client can use straight away.
-      assert {:ok, registered} = Connection.get(name)
+      registered = Connection.fetch!(name)
+      assert %{table: table} = registered
+      assert is_reference(table)
+
+      assert Map.delete(registered, :table) ===
+               %{profile: :v3_core, database: "mydb", org: "local"}
+
       assert InfluxElixir.health(registered) === {:ok, %{"status" => "pass"}}
       assert InfluxElixir.health(name) === {:ok, %{"status" => "pass"}}
     end
 
-    test "fetch!/1 works for a started connection" do
-      name = unique_name()
-
-      {:ok, _pid} =
-        InfluxElixir.add_connection(name,
-          host: "influx.local",
-          token: "abc"
-        )
-
-      on_exit(fn ->
-        InfluxElixir.remove_connection(name)
-      end)
-
-      conn = Connection.fetch!(name)
-      # Returns an initialised connection, usable by the configured client
-      assert InfluxElixir.health(conn) === {:ok, %{"status" => "pass"}}
-    end
-
-    test "the per-connection Finch pool is a child named after the connection" do
-      name = unique_name()
-      finch_name = :"influx_elixir_#{name}_finch"
-
-      {:ok, sup} =
-        InfluxElixir.add_connection(name, host: "h", token: "t")
-
-      on_exit(fn ->
-        InfluxElixir.remove_connection(name)
-      end)
-
-      assert {^finch_name, child, :worker, [Finch]} =
-               List.keyfind(Supervisor.which_children(sup), finch_name, 0)
-
-      # Finch names its top supervisor `<name>.Supervisor`, and its registry `<name>`.
-      assert Process.whereis(:"#{finch_name}.Supervisor") === child
-    end
-
     # `finch_name: nil` (an unset `Application.get_env/2`, say) names no pool: the HTTP client
-    # then uses the connection's own, which the supervisor did not start.
-    test "finch_name: nil starts the per-connection pool" do
-      name = unique_name()
-      finch_name = :"influx_elixir_#{name}_finch"
+    # then uses the connection's own, which the supervisor starts.
+    for opts <- [[], [finch_name: nil]] do
+      test "the per-connection Finch pool is a child named after the connection, " <>
+             "with #{inspect(opts)}" do
+        name = unique_name()
+        finch_name = :"influx_elixir_#{name}_finch"
 
-      {:ok, sup} = InfluxElixir.add_connection(name, host: "h", token: "t", finch_name: nil)
-      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+        {:ok, sup} = InfluxElixir.add_connection(name, [host: "h", token: "t"] ++ unquote(opts))
+        on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
-      assert {^finch_name, child, :worker, [Finch]} =
-               List.keyfind(Supervisor.which_children(sup), finch_name, 0)
+        assert {^finch_name, child, :worker, [Finch]} =
+                 List.keyfind(Supervisor.which_children(sup), finch_name, 0)
 
-      # Finch names its top supervisor `<name>.Supervisor`, and its registry `<name>`.
-      assert Process.whereis(:"#{finch_name}.Supervisor") === child
+        # Finch names its top supervisor `<name>.Supervisor`, and its registry `<name>`.
+        assert Process.whereis(:"#{finch_name}.Supervisor") === child
+      end
     end
 
     test "no per-connection Finch pool is started when :finch_name names an existing one" do
@@ -178,34 +157,19 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
   end
 
   describe "remove_connection — registry cleanup" do
-    test "deregisters connection from persistent_term on removal" do
+    test "the name no longer resolves once the connection is removed" do
       name = unique_name()
 
-      {:ok, _pid} =
-        InfluxElixir.add_connection(name, host: "h", token: "t")
+      {:ok, _pid} = InfluxElixir.add_connection(name, host: "h", token: "t")
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
-      # Verify it's registered
       assert {:ok, config} = Connection.get(name)
       assert_local_config(config)
 
-      # Remove the connection
-      :ok = InfluxElixir.remove_connection(name)
+      assert InfluxElixir.remove_connection(name) === :ok
 
-      # Should no longer be in the registry
       assert Connection.get(name) === {:error, :not_found}
-    end
-
-    test "fetch!/1 raises after connection is removed" do
-      name = unique_name()
-
-      {:ok, _pid} =
-        InfluxElixir.add_connection(name, host: "h", token: "t")
-
-      :ok = InfluxElixir.remove_connection(name)
-
-      assert_raise ArgumentError, fn ->
-        Connection.fetch!(name)
-      end
+      assert_raise ArgumentError, missing_message(name), fn -> Connection.fetch!(name) end
     end
   end
 
@@ -222,16 +186,54 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
 
       assert Connection.get(name) === {:error, :not_found}
 
-      assert_raise ArgumentError, ~r/no InfluxElixir connection named/, fn ->
-        InfluxElixir.health(name)
-      end
+      assert_raise ArgumentError, missing_message(name), fn -> InfluxElixir.health(name) end
     end
 
     # The facade erased the name after any failed start, which raised for a name that is not
     # an atom, and could erase a connection another call had started under the name since.
     test "add_connection/2 with a name that is not an atom is an error, never a raise" do
-      assert {:error, {{:invalid_options, [name: "not an atom", host: "h"]}, _child}} =
-               InfluxElixir.add_connection("not an atom", host: "h")
+      assert start_error("not an atom", host: "h") ===
+               {:invalid_options, [name: "not an atom", host: "h"]}
+    end
+  end
+
+  describe "a config the client refuses" do
+    # `Client.Local.start/1` raised inside the supervisor's init/1: the caller got the
+    # exception wrapped with a stacktrace, and a crash report was logged.
+    test "is the client's error, with nothing started or registered" do
+      name = unique_name()
+
+      for {opts, message} <- [
+            {[profile: :bogus],
+             "invalid profile: :bogus. Must be one of: :v3_core, :v3_enterprise, :v2"},
+            {[databases: "x"],
+             "invalid databases: :databases must be a list of strings and :database a " <>
+               "string, got [database: nil, databases: \"x\"]"}
+          ] do
+        assert start_error(name, opts) === ArgumentError.exception(message)
+
+        assert Connection.get(name) === {:error, :not_found}
+        assert Process.whereis(:"influx_elixir_#{name}_supervisor") === nil
+      end
+    end
+  end
+
+  describe "derived process names" do
+    # The supervisor's name was a prefix (`influx_elixir_conn_<name>`), the others suffixes:
+    # the supervisor of `:<x>_finch` took the pool name of `:conn_<x>`.
+    test "of two connections never collide" do
+      base = System.unique_integer([:positive])
+      first = :"conn_names_#{base}"
+      second = :"names_#{base}_finch"
+
+      assert {:ok, first_sup} = InfluxElixir.add_connection(first, [])
+      on_exit(fn -> InfluxElixir.remove_connection(first) end)
+      assert {:ok, second_sup} = InfluxElixir.add_connection(second, [])
+      on_exit(fn -> InfluxElixir.remove_connection(second) end)
+
+      assert first_sup !== second_sup
+      assert InfluxElixir.health(first) === {:ok, %{"status" => "pass"}}
+      assert InfluxElixir.health(second) === {:ok, %{"status" => "pass"}}
     end
   end
 

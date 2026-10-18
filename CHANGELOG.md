@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`add_connection/2` crashed on a config the client refused.** Under `Client.HTTP`, an
+  unknown option such as `default_database:` raised `NimbleOptions.ValidationError` inside the
+  connection supervisor's `init/1`. The caller got the exception wrapped with a stacktrace,
+  and a crash report was logged. `Client.Local` did the same with its `ArgumentError`. Both are now `{:error, {reason, child}}` with
+  nothing started, and `ConnectionSupervisor.start_link/1` returns `{:error, reason}`.
+- **A `:token` that is not a string was printed in a failed start.** Only a string token was
+  hidden in the child spec, and NimbleOptions printed a refused value in its error. A
+  charlist token was in both. The token is now hidden whatever its type, and its error
+  names no value.
+- **Two connections could not start when their names derived the same process name.** The
+  supervisor of a connection was `influx_elixir_conn_<name>`, and the pool of another
+  `influx_elixir_<name>_finch`, so `:a_finch` and `:conn_a` collided. The supervisor is now
+  `influx_elixir_<name>_supervisor`.
 - **`LineProtocol.encode/2` wrote a measurement that the server renames.** InfluxDB 3 Core
   3.10.1 and InfluxDB 2.7 both strip a leading tab from a measurement, and 2.7 strips a
   leading NUL too: `"\tcpu"` was stored as `cpu`, with a 204. A measurement starting with a
@@ -89,6 +102,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database that exists is `:ok`, a delete of a missing one is a 404, and `_internal` is a
   500. `Admin.Buckets.delete/2` documents its 404, and `:org_id` says that `Client.Local`
   ignores it. `TestHelper.setup_influx/1` says that bad options raise.
+- **A killed connection supervisor.** `ConnectionSupervisor` said its writer writes its
+  buffer when the supervisor is killed. Its children then stop together, and the writer can
+  find the connection already released and lose the buffer. Only `remove_connection/1`
+  stops them in order, and the moduledoc now says so.
 
 ## [0.1.48] - 2026-10-16
 

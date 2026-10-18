@@ -9,15 +9,20 @@ defmodule InfluxElixir.ConnectionSupervisor.Secret do
   @derive {Inspect, only: []}
   defstruct [:reveal]
 
-  @type t :: %__MODULE__{reveal: (-> binary())}
+  @type t :: %__MODULE__{reveal: (-> term())}
 
   @doc false
-  # Hides the `:token` of a connection config (a keyword list, as `start_link/1` checks); a
-  # config without one is returned as it is.
+  # Hides the `:token` of a connection config (a keyword list, as `start_link/1` checks), of
+  # whatever type: a token given as a charlist is still the token, and the child spec of its
+  # refused start is printed. A config without one is returned as it is.
   @spec redact(keyword()) :: keyword()
   def redact(config) do
     case Keyword.fetch(config, :token) do
-      {:ok, token} when is_binary(token) ->
+      # Hidden already, by the child spec that started this.
+      {:ok, %__MODULE__{}} ->
+        config
+
+      {:ok, token} ->
         Keyword.put(config, :token, %__MODULE__{reveal: fn -> token end})
 
       _no_token ->

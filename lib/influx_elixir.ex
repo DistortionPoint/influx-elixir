@@ -526,6 +526,12 @@ defmodule InfluxElixir do
   `InfluxElixir.Write.BatchWriter` refuses, say — the error is returned
   and nothing is left behind: the name does not resolve and the client's
   connection state is released. The error never holds the `:token`.
+
+  A config the client refuses is `{:error, {reason, child_spec}}`, never a
+  raise: under `InfluxElixir.Client.HTTP` the `%NimbleOptions.ValidationError{}`
+  of `InfluxElixir.Config.validate/1` (an unknown option such as
+  `default_database:`, say), under `InfluxElixir.Client.Local` the
+  `%ArgumentError{}` of `InfluxElixir.Client.Local.start/1`.
   """
   @spec add_connection(atom(), keyword()) :: Supervisor.on_start_child()
   def add_connection(name, opts) do

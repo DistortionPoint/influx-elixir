@@ -26,7 +26,8 @@ defmodule InfluxElixir.Client do
     `ConnectionSupervisor` during startup.
     - `Client.HTTP` returns the keyword config, defaulting `:database` to
       the first of `:databases` when it is unset
-    - `Client.Local` creates an ETS table and returns a conn map
+    - `Client.Local` creates an ETS table and returns a conn map, or
+      `{:error, %ArgumentError{}}` for options `Client.Local.start/1` refuses
 
   - `shutdown_connection/1` — cleans up resources when a connection
     is removed. Called by `InfluxElixir.remove_connection/1`.

@@ -3,8 +3,6 @@ defmodule InfluxElixir.TestHelperTest do
 
   import InfluxElixir.TestHelper
 
-  alias InfluxElixir.Client.Local
-
   # The helper is used exactly as a consumer would use it.
   setup do
     setup_influx(databases: ["helper_db"], database: "helper_db")
@@ -38,8 +36,34 @@ defmodule InfluxElixir.TestHelperTest do
     end
 
     test "passes :profile through" do
-      {:ok, conn: v2} = setup_influx(profile: :v2)
-      assert Local.query_sql(v2, "SELECT 1") === {:error, :unsupported_operation}
+      {:ok, conn: v2} = setup_influx(profile: :v2, databases: ["b"])
+
+      assert InfluxElixir.query_sql(v2, "SELECT 1") === {:error, :unsupported_operation}
+      assert InfluxElixir.write(v2, "m v=1i 1000000000", database: "b") === {:ok, :written}
+
+      flux =
+        ~s|from(bucket: "b") \|> range(start: 1970-01-01T00:00:00Z, stop: 1970-01-01T00:00:02Z)|
+
+      assert InfluxElixir.query_flux(v2, flux) ===
+               {:ok,
+                [
+                  %{
+                    "_field" => "v",
+                    "_measurement" => "m",
+                    "_start" => ~U[1970-01-01 00:00:00.000000Z],
+                    "_stop" => ~U[1970-01-01 00:00:02.000000Z],
+                    "_time" => ~U[1970-01-01 00:00:01.000000Z],
+                    "_value" => 1,
+                    "result" => "_result",
+                    "table" => 0
+                  }
+                ]}
+    end
+
+    test "raises the ArgumentError Client.Local.start/1 raises for options it refuses" do
+      assert_raise ArgumentError,
+                   "invalid profile: :bogus. Must be one of: :v3_core, :v3_enterprise, :v2",
+                   fn -> setup_influx(profile: :bogus) end
     end
   end
 end
