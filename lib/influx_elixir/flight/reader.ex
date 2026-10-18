@@ -27,7 +27,7 @@ defmodule InfluxElixir.Flight.Reader do
   | Arrow Type | Elixir value |
   |------------|--------------|
   | Int8-64, UInt8-64 | `integer()` |
-  | Float16/32/64 | `float()`; Float16 and Float32 are the shortest decimal that reads back as the same bits (`0.1`), as HTTP prints them; an infinity or a NaN is `nil` in the row (a present key), as HTTP's `null` |
+  | Float16/32/64 | `float()`; Float16 and Float32 are the shortest decimal that reads back as the same Float32, as HTTP prints them (a Float32 `0.1` is `0.1`; a Float16 `0.1`, held as 0.0999755859375, is `0.099975586`); an infinity or a NaN is `nil` in the row (a present key), as HTTP's `null` |
   | Bool | `boolean()` |
   | Utf8, LargeUtf8, Utf8View (string functions return it) | `binary()` |
   | Binary, LargeBinary, BinaryView | lowercase hex, as HTTP renders it |
@@ -123,20 +123,17 @@ defmodule InfluxElixir.Flight.Reader do
   @type_utf8 15
   @type_timestamp 20
 
-  # Fixed byte widths per internal type ID (bool uses a bitmap — 0 here)
-  @byte_widths %{
-    @type_int8 => 1,
-    @type_int16 => 2,
-    @type_int32 => 4,
-    @type_int64 => 8,
-    @type_uint8 => 1,
-    @type_uint16 => 2,
-    @type_uint32 => 4,
-    @type_uint64 => 8,
-    @type_float32 => 4,
-    @type_float64 => 8,
-    @type_bool => 0,
-    @type_timestamp => 8
+  # The byte width and signedness of each integer type ID (a timestamp is an int64)
+  @int_layouts %{
+    @type_int8 => {1, :signed},
+    @type_int16 => {2, :signed},
+    @type_int32 => {4, :signed},
+    @type_int64 => {8, :signed},
+    @type_uint8 => {1, :unsigned},
+    @type_uint16 => {2, :unsigned},
+    @type_uint32 => {4, :unsigned},
+    @type_uint64 => {8, :unsigned},
+    @type_timestamp => {8, :signed}
   }
 
   # Arrow TimeUnit enum (Timestamp table slot 0)
@@ -920,10 +917,17 @@ defmodule InfluxElixir.Flight.Reader do
 
   # HTTP's JSON has the decimal as a number: an integer at a scale of 0 or below, else a
   # float (`CAST(v AS DECIMAL(10,2))` of 1.5 is 1.5, `CAST(1234 AS DECIMAL(5,-2))` is 1200,
-  # verified against InfluxDB 3 Core 3.10.1).
+  # verified against InfluxDB 3 Core 3.10.1). The float is read from the decimal's digits
+  # (`1.23456789012345664`), as the JSON decoder reads HTTP's, so it is rounded once.
   @spec scale_decimal(integer(), integer()) :: number()
   defp scale_decimal(v, scale) when scale <= 0, do: v * Integer.pow(10, -scale)
-  defp scale_decimal(v, scale), do: v / Integer.pow(10, scale)
+
+  defp scale_decimal(v, scale) do
+    sign = if v < 0, do: "-", else: ""
+    digits = v |> abs() |> Integer.to_string() |> String.pad_leading(scale + 1, "0")
+    {whole, fraction} = String.split_at(digits, -scale)
+    String.to_float(sign <> whole <> "." <> fraction)
+  end
 
   # InfluxDB 3's HTTP rendering of a Duration (verified): `P0D` for zero,
   # else `[-]PT<seconds>[.<fraction>]S` with the fraction's trailing zeros
@@ -1000,66 +1004,26 @@ defmodule InfluxElixir.Flight.Reader do
     decode_utf8_column(safe_slice(body, oo, ol), safe_slice(body, doff, dlen))
   end
 
-  # A Utf8 column without its data buffer has no values: it is null, as `decode_fixed_column/4`
-  # makes any column it has no width for.
-
-  defp decode_column_values(type_id, [{doff, dlen} | _rest], body, n) do
-    data = safe_slice(body, doff, dlen)
-    width = Map.get(@byte_widths, type_id, 0)
-    decode_fixed_column(type_id, data, width, n)
-  end
+  # One data buffer of fixed-width values. A Utf8 column without its data buffer lands here
+  # too and, like any type without a decoder, its cells are null.
+  defp decode_column_values(type_id, [{doff, dlen} | _rest], body, n),
+    do: decode_fixed_column(type_id, safe_slice(body, doff, dlen), n)
 
   defp decode_column_values(_type_id, [], _body, n) do
     List.duplicate(nil, n)
   end
 
-  @spec decode_fixed_column(
-          non_neg_integer(),
-          binary(),
-          non_neg_integer(),
-          non_neg_integer()
-        ) :: [term()]
-  defp decode_fixed_column(@type_int64, d, 8, n) do
-    decode_ints(d, n, 8, :signed)
+  @spec decode_fixed_column(non_neg_integer(), binary(), non_neg_integer()) :: [term()]
+  defp decode_fixed_column(@type_float64, d, n), do: decode_floats(d, n, 8)
+  defp decode_fixed_column(@type_float32, d, n), do: decode_floats(d, n, 4)
+  defp decode_fixed_column(@type_bool, d, n), do: decode_bools(d, n)
+
+  defp decode_fixed_column(type_id, d, n) do
+    case @int_layouts do
+      %{^type_id => {width, sign}} -> decode_ints(d, n, width, sign)
+      _no_decoder -> List.duplicate(nil, n)
+    end
   end
-
-  defp decode_fixed_column(@type_timestamp, d, 8, n) do
-    decode_ints(d, n, 8, :signed)
-  end
-
-  defp decode_fixed_column(@type_uint64, d, 8, n) do
-    decode_ints(d, n, 8, :unsigned)
-  end
-
-  defp decode_fixed_column(@type_float64, d, 8, n), do: decode_floats(d, n, 8)
-  defp decode_fixed_column(@type_float32, d, 4, n), do: decode_floats(d, n, 4)
-
-  defp decode_fixed_column(@type_int32, d, 4, n) do
-    decode_ints(d, n, 4, :signed)
-  end
-
-  defp decode_fixed_column(@type_uint32, d, 4, n) do
-    decode_ints(d, n, 4, :unsigned)
-  end
-
-  defp decode_fixed_column(@type_int16, d, 2, n) do
-    decode_ints(d, n, 2, :signed)
-  end
-
-  defp decode_fixed_column(@type_uint16, d, 2, n) do
-    decode_ints(d, n, 2, :unsigned)
-  end
-
-  defp decode_fixed_column(@type_int8, d, 1, n) do
-    decode_ints(d, n, 1, :signed)
-  end
-
-  defp decode_fixed_column(@type_uint8, d, 1, n) do
-    decode_ints(d, n, 1, :unsigned)
-  end
-
-  defp decode_fixed_column(@type_bool, d, 0, n), do: decode_bools(d, n)
-  defp decode_fixed_column(_type_id, _d, _w, n), do: List.duplicate(nil, n)
 
   # Fixed-width columns are decoded with a binary comprehension — one pass
   # over the buffer with no per-element slicing. A short buffer yields
@@ -1192,20 +1156,21 @@ defmodule InfluxElixir.Flight.Reader do
   defp apply_nulls(values, nil, _n), do: values
   defp apply_nulls(values, <<>>, _n), do: values
 
-  defp apply_nulls(values, validity, n) do
-    0..(n - 1)//1
-    |> Enum.zip(values)
-    |> Enum.map(fn {i, value} ->
-      byte_idx = div(i, 8)
-      bit_idx = rem(i, 8)
+  defp apply_nulls(values, validity, n), do: mask(values, validity, 0, n)
 
-      valid? =
-        byte_idx < byte_size(validity) and
-          (:binary.at(validity, byte_idx) >>> bit_idx &&& 1) == 1
+  # One walk of the values and the bitmap together (bit 0 of each byte first), for at most
+  # `n` cells. A cell past the bitmap's end is null.
+  @spec mask([term()], binary(), 0..7, integer()) :: [term()]
+  defp mask([value | rest], <<byte, more::binary>> = validity, bit, n) when n > 0 do
+    cell = if (byte >>> bit &&& 1) == 1, do: value, else: nil
 
-      if valid?, do: value, else: nil
-    end)
+    if bit == 7,
+      do: [cell | mask(rest, more, 0, n - 1)],
+      else: [cell | mask(rest, validity, bit + 1, n - 1)]
   end
+
+  defp mask([_value | rest], <<>>, bit, n) when n > 0, do: [nil | mask(rest, <<>>, bit, n - 1)]
+  defp mask(_values, _validity, _bit, _n), do: []
 
   # ---------------------------------------------------------------------------
   # Private: row assembly

@@ -200,14 +200,15 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
   # Maps a `query_sql/3` error reason to `InfluxElixir.StreamError` options,
   # mirroring how `Client.HTTP` classifies the same failures. Query errors that
   # a real InfluxDB surfaces as an HTTP status (bad SQL, missing table) map to
-  # `:http_status`; a missing database maps to `:no_database`.
+  # `:http_status`; a missing database maps to `:no_database`; a request the
+  # arguments cannot make (a parameter refused before any request) to `:invalid_request`.
   @spec stream_error_opts(term()) :: keyword()
   defp stream_error_opts(%{status: status, body: body}),
     do: [kind: :http_status, status: status, body: body]
 
   defp stream_error_opts(:no_database_specified), do: [kind: :no_database]
 
-  defp stream_error_opts(reason), do: [kind: :transport, reason: reason]
+  defp stream_error_opts(reason), do: [kind: :invalid_request, reason: reason]
 
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map() | [map()]} | {:error, term()}

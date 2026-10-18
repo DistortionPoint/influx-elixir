@@ -40,6 +40,45 @@ defmodule InfluxElixir.Integration.ContractV2.BucketsTest do
     end
   end
 
+  # A name of 16 hex digits was taken for an ID, so the bucket was never found.
+  describe "delete_bucket of 16 hex digits" do
+    test "deletes the bucket of that name, else the bucket of that ID", ctx do
+      hex = Base.encode16(:crypto.strong_rand_bytes(8), case: :lower)
+      other = H.unique_name("by_id")
+      on_exit(fn -> Enum.each([hex, other], &HTTP.delete_bucket(ctx.conn, &1)) end)
+
+      :ok = HTTP.create_bucket(ctx.conn, hex, [])
+      :ok = HTTP.create_bucket(ctx.conn, other, [])
+      %{"buckets" => [%{"id" => id}]} = api(ctx.conn, :get, "/api/v2/buckets?name=#{other}", nil)
+
+      assert HTTP.delete_bucket(ctx.conn, hex) === :ok
+      assert HTTP.delete_bucket(ctx.conn, id) === :ok
+
+      {:ok, listed} = HTTP.list_buckets(ctx.conn)
+      assert Enum.filter(listed, &(&1["name"] in [hex, other])) === []
+    end
+  end
+
+  # The empty org name lists every org the token can read, so its first was a
+  # guess: the bucket went to whichever org came first (verified).
+  describe "a connection without an org" do
+    test "create_bucket is the server's 400, and creates nothing in any org", ctx do
+      org_name = H.unique_name("aaa_org")
+      name = H.unique_name("orgless")
+      other_org = api(ctx.conn, :post, "/api/v2/orgs", %{"name" => org_name})
+      on_exit(fn -> api(ctx.conn, :delete, "/api/v2/orgs/#{other_org["id"]}", nil) end)
+
+      orgless = Keyword.put(ctx.conn, :org, "")
+
+      assert {:error, %{status: 400, body: body}} = HTTP.create_bucket(orgless, name, [])
+
+      assert Jason.decode(body) ===
+               {:ok, %{"code" => "invalid", "message" => "organization id must be provided"}}
+
+      assert %{"buckets" => []} = api(ctx.conn, :get, "/api/v2/buckets?name=#{name}", nil)
+    end
+  end
+
   # A raw v2 API call for what the client does not expose (orgs).
   defp api(conn, method, path, body) do
     request =

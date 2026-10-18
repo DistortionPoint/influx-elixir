@@ -61,8 +61,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`Client.Local` created a v2 bucket for `retention: false`.** It read `false` as no
   retention. InfluxDB 2.7 answers `everySeconds: false` with a 400, and the double now
   refuses it as it refuses any other value that is not an integer.
+- **A streaming query called a caller's error a transport error.** Options that are not a
+  keyword list, a parameter JSON cannot carry, unencodable text, and a keyword connection
+  without a pool name were all raised as `StreamError` `kind: :transport`, on both clients.
+  They are now `kind: :invalid_request`, with `reason` holding the error `query_sql/3`
+  returns for the same call. `:transport` is left for Finch and Mint failures.
+- **Flight read a decimal's float by rounding twice.** The unscaled integer was made a float
+  and then divided, so a Decimal128 of 17 digits at scale 17, `0.12345678901234567`, came
+  back as `0.12345678901234568`. HTTP prints the digits, which are read once. Flight now
+  reads them the same way.
+- **`create_bucket/3` on a v2 connection without an org used whichever org came first.**
+  With `:org` empty and no `:org_id`, the lookup asked for the empty name, which InfluxDB 2.7
+  answers with every org the token can read. No `orgID` is sent now, and the answer is the
+  server's 400, `organization id must be provided`.
+- **`delete_bucket/2` could not delete a bucket named with 16 hex digits.** Such a name was
+  taken for an ID, so the delete was a 404. A name is now looked up first, and 16 hex digits
+  are read as an ID only when no bucket has that name.
 
 ### Documentation
+- **Flight's Float16.** The reader's type table showed `0.1` for Float16 and Float32 alike.
+  A Float16 `0.1` is held as 0.0999755859375 and prints as `0.099975586`, over HTTP and
+  Flight alike. The table now gives both.
 - **`BatchWriter`'s request order.** The moduledoc said requests go in the order the
   batches were taken. A batch waiting out its retry delay is overtaken by an explicit
   `flush/2` or `write_sync/3`, and the moduledoc now says so.

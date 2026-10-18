@@ -314,7 +314,7 @@ defmodule InfluxElixir.Flight.Client do
   defp auth_metadata(token), do: [{"authorization", "Bearer " <> token}]
 
   # A failed call is the shape the HTTP transport gives: `%{status: http_status, body: message}`.
-  # The gRPC status becomes the nearest HTTP one (see the moduledoc's "Errors"); an expired
+  # The gRPC status becomes the nearest HTTP one (listed in `query/3`'s doc); an expired
   # deadline is `:timeout`.
   @spec normalize_error(term()) :: term()
   defp normalize_error({:error, %GRPC.RPCError{status: 4}}), do: {:error, :timeout}
@@ -361,7 +361,8 @@ defmodule InfluxElixir.Flight.Client do
   @doc """
   Builds the JSON-encoded ticket payload for an InfluxDB v3 SQL query.
 
-  Exposed for testing and introspection purposes.
+  Exposed for testing and introspection purposes. Text JSON cannot carry (a string
+  that is not UTF-8) raises `Jason.EncodeError`; `query/3` answers it as an error.
 
   ## Parameters
 

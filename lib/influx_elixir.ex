@@ -241,8 +241,9 @@ defmodule InfluxElixir do
 
   Because the return value is an `Enumerable.t()`, errors cannot be returned as
   an `{:error, reason}` tuple. Instead, failure classes — a missing database, a
-  non-success HTTP status, or a transport error — are raised as an
-  `InfluxElixir.StreamError` when the stream is enumerated. This mirrors the
+  request its arguments cannot make, a non-success HTTP status, or a transport
+  error — are raised as an `InfluxElixir.StreamError` when the stream is
+  enumerated. This mirrors the
   `{:error, reason}` contract of `query_sql/3`: an outage surfaces as an
   exception, never as a silent empty result.
 

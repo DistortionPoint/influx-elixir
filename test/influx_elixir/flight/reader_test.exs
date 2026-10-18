@@ -1249,6 +1249,18 @@ defmodule InfluxElixir.Flight.ReaderTest do
       assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{}, %{"v" => 20}, %{}]}
     end
 
+    test "a row past the end of a short bitmap is null; every bit of a byte is read" do
+      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
+      values = Enum.to_list(1..10)
+      {data, [_validity, {_off, len}]} = int64_column(values)
+      # One byte for ten rows: rows 0 and 7 are null, rows 8 and 9 have no bit.
+      body = <<0b01111110>> <> data
+      batch = batch_fd(body, [{0, 1}, {1, len}], 10)
+
+      assert Reader.decode_flight_data([schema, batch]) ===
+               {:ok, [%{} | Enum.map(2..7, &%{"v" => &1})] ++ [%{}, %{}, %{}]}
+    end
+
     test "marks null Float64 values based on validity bitmap" do
       schema = schema_fd([{"f", 3, [precision: 2]}])
       {body, specs} = float64_column([1.0, 2.0, 3.0])
@@ -1386,6 +1398,34 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert Reader.decode_flight_data([decimal_schema(2, 128), batch]) ===
                {:ok, [%{"d" => 1.5}]}
+    end
+
+    # HTTP prints the decimal's digits (`1.23456789012345664`, verified against Core 3.10.1),
+    # which the JSON decoder rounds once to the nearest float.
+    test "a positive scale is the nearest float to the decimal's digits" do
+      values = [123_456_789_012_345_664, 12_345_678_901_234_567, -5, 0, 7_000_000_000_000_000_001]
+      body = for v <- values, into: <<>>, do: <<v::little-signed-256>>
+      batch = batch_fd(body, [{0, 0}, {0, byte_size(body)}], length(values))
+
+      assert Reader.decode_flight_data([decimal_schema(17, 256), batch]) ===
+               {:ok,
+                [
+                  %{"d" => 1.23456789012345664},
+                  %{"d" => 0.12345678901234567},
+                  %{"d" => -0.00000000000000005},
+                  %{"d" => 0.0},
+                  %{"d" => 70.00000000000000001}
+                ]}
+
+      assert Reader.decode_flight_data([decimal_schema(2, 256), batch]) ===
+               {:ok,
+                [
+                  %{"d" => 1_234_567_890_123_456.64},
+                  %{"d" => 123_456_789_012_345.67},
+                  %{"d" => -0.05},
+                  %{"d" => 0.0},
+                  %{"d" => 70_000_000_000_000_000.01}
+                ]}
     end
 
     test "a width Arrow does not define is refused, never read without end" do

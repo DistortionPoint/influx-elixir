@@ -230,7 +230,7 @@ defmodule InfluxElixir.Client.HTTPTest do
       assert HTTP.create_database(conn, "x" <> bad) === unencodable.("x" <> bad)
       assert HTTP.create_token(conn, "t" <> bad) === unencodable.("t" <> bad)
 
-      assert %StreamError{kind: :transport, reason: {:unencodable_body, _message}} =
+      assert %StreamError{kind: :invalid_request, reason: {:unencodable_body, _message}} =
                assert_raise(StreamError, fn ->
                  conn |> HTTP.query_sql_stream(sql) |> Enum.to_list()
                end)
@@ -269,7 +269,7 @@ defmodule InfluxElixir.Client.HTTPTest do
         assert HTTP.create_bucket(conn, "x", opts) === invalid
         assert HTTP.create_token(conn, "x", opts) === invalid
 
-        assert %StreamError{kind: :transport, reason: {:invalid_options, ^opts}} =
+        assert %StreamError{kind: :invalid_request, reason: {:invalid_options, ^opts}} =
                  assert_raise(StreamError, fn ->
                    conn |> HTTP.query_sql_stream("SELECT 1", opts) |> Enum.to_list()
                  end)
@@ -339,7 +339,7 @@ defmodule InfluxElixir.Client.HTTPTest do
             conn |> HTTP.query_sql_stream("select 1", opts) |> Enum.to_list()
           end
 
-        assert %StreamError{kind: :transport, status: nil, body: nil, reason: ^error} =
+        assert %StreamError{kind: :invalid_request, status: nil, body: nil, reason: ^error} =
                  stream_error
       end
     end

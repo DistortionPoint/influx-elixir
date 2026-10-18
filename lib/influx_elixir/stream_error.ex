@@ -14,6 +14,10 @@ defmodule InfluxElixir.StreamError do
     * `:no_database` — no database was resolved from opts or the connection
     * `:http_status` — the server responded with a non-success status; the
       `:status` and `:body` fields carry the response
+    * `:invalid_request` — the request could not be built from the arguments (options
+      that are not a keyword list, a parameter or text JSON cannot carry, a keyword
+      connection with neither `:finch_name` nor `:name`); `:reason` carries the error
+      `InfluxElixir.query_sql/3` returns for the same call
     * `:transport` — a Finch/Mint transport error occurred; `:reason` carries it
     * `:decode` — a JSONL line could not be decoded as JSON, or is JSON but
       not an object; `:reason` carries the decode error, or
@@ -34,7 +38,8 @@ defmodule InfluxElixir.StreamError do
       end
   """
 
-  @type kind :: :no_database | :http_status | :transport | :decode | :unsupported
+  @type kind ::
+          :no_database | :invalid_request | :http_status | :transport | :decode | :unsupported
 
   @type t :: %__MODULE__{
           kind: kind(),
@@ -87,6 +92,10 @@ defmodule InfluxElixir.StreamError do
   defp build_message(:no_database, _status, _body, _reason) do
     "no database specified for streaming query: pass `database:` in opts " <>
       "or set `:database` on the connection"
+  end
+
+  defp build_message(:invalid_request, _status, _body, reason) do
+    "streaming query request is invalid: #{inspect(reason)}"
   end
 
   defp build_message(:http_status, status, body, _reason) do

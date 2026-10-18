@@ -13,16 +13,15 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
   def create(connection, name, opts) do
     retention = Keyword.get(opts, :retention, 0)
 
-    with {:ok, org_id} <- resolve_org_id(connection, opts),
+    with {:ok, org} <- resolve_org_id(connection, opts),
          {:ok, %Finch.Response{}} <-
            Request.post_json(
              connection,
              "/api/v2/buckets",
-             %{
+             Map.merge(org, %{
                "name" => name,
-               "orgID" => org_id,
                "retentionRules" => [%{"everySeconds" => retention}]
-             },
+             }),
              opts,
              [200, 201]
            ) do
@@ -39,21 +38,25 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
   end
 
   # v2 buckets belong to an org by ID, not name. `opts[:org_id]` wins;
-  # otherwise the ID is looked up from the connection's `:org` name.
-  @spec resolve_org_id(keyword(), keyword()) :: {:ok, binary()} | {:error, term()}
+  # otherwise the ID is looked up from the connection's `:org` name. Without
+  # either, no `orgID` is sent and the server's 400 is the answer: a lookup of
+  # the empty name lists every org the token can read (verified), and its first
+  # would be a guess.
+  @spec resolve_org_id(keyword(), keyword()) :: {:ok, map()} | {:error, term()}
   defp resolve_org_id(connection, opts) do
-    case Keyword.get(opts, :org_id) do
-      nil -> lookup_org_id(connection, Request.conn_val(connection, :org, ""))
-      org_id -> {:ok, org_id}
+    case {Keyword.get(opts, :org_id), Request.conn_val(connection, :org, "")} do
+      {nil, org} when org in [nil, ""] -> {:ok, %{}}
+      {nil, org} -> lookup_org_id(connection, org)
+      {org_id, _org} -> {:ok, %{"orgID" => org_id}}
     end
   end
 
-  @spec lookup_org_id(keyword(), binary()) :: {:ok, binary()} | {:error, term()}
+  @spec lookup_org_id(keyword(), binary()) :: {:ok, map()} | {:error, term()}
   defp lookup_org_id(connection, org) do
     with {:ok, %Finch.Response{body: body}} <-
            Request.get(connection, "/api/v2/orgs?org=#{Request.query_value(org)}", [200]),
          {:ok, %{"orgs" => [%{"id" => id} | _rest]}} <- Request.decode_json(body) do
-      {:ok, id}
+      {:ok, %{"orgID" => id}}
     else
       {:ok, _no_orgs} -> {:error, {:org_not_found, org}}
       {:error, _reason} = error -> error
@@ -111,13 +114,16 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
   end
 
   # The v2 API deletes by 16-hex bucket ID, while Client.Local deletes by
-  # name. Accept either so callers can pass the name against both clients.
+  # name. Accept either so callers can pass the name against both clients. A
+  # name is looked up first: `deadbeefdeadbeef` is a name a bucket may have.
   @spec resolve_bucket_id(keyword(), binary()) :: {:ok, binary()} | {:error, term()}
   defp resolve_bucket_id(connection, bucket) do
-    if String.match?(bucket, ~r/^[0-9a-f]{16}$/) do
-      {:ok, bucket}
-    else
-      lookup_bucket_id(connection, bucket)
+    case lookup_bucket_id(connection, bucket) do
+      {:error, %{status: 404, body: "bucket not found: " <> _name}} = not_found ->
+        if String.match?(bucket, ~r/^[0-9a-f]{16}$/), do: {:ok, bucket}, else: not_found
+
+      found_or_error ->
+        found_or_error
     end
   end
 

@@ -36,6 +36,8 @@ defmodule InfluxElixir.Admin.Buckets do
 
     * `:ok` on success, and for a bucket that exists, which is left as it was (its
       retention unchanged): InfluxDB 2 answers that with a 422 conflict
+    * `{:error, %{status: 400, body: body}}` - with neither `:org_id` nor a connection
+      `:org`: InfluxDB 2 answers `organization id must be provided` (verified)
     * `{:error, reason}` on failure
   """
   @spec create(InfluxElixir.Client.connection(), binary(), keyword()) ::

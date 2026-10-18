@@ -54,7 +54,7 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
     test "a streaming query raises the StreamError when it is enumerated" do
       stream = HTTP.query_sql_stream(connection([]), "SELECT 1")
 
-      assert %StreamError{kind: :transport, reason: :no_pool_name} =
+      assert %StreamError{kind: :invalid_request, reason: :no_pool_name} =
                catch_error(Enum.to_list(stream))
     end
   end
@@ -104,6 +104,99 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
         assert InfluxElixir.execute_sql(connection, "SELECT 1") ===
                  {:error, {:invalid_connection, connection}}
       end
+    end
+  end
+
+  # The server sees each request's method and path, and the test answers them in turn.
+  describe "v2 buckets" do
+    setup do
+      finch = :"fxi30_http_finch_#{System.unique_integer([:positive])}"
+      start_supervised!({Finch, name: finch})
+      port = TestServer.controlled(request_line: true)
+      {:ok, conn: connection(port: port, finch_name: finch, api_version: :v2, org: "o")}
+    end
+
+    # Runs `fun`, answering its requests with `answers` in order; returns its result and
+    # the requests it made.
+    defp served(fun, answers) do
+      task = Task.async(fun)
+
+      requests =
+        for {status, body} <- answers do
+          assert_receive {:request, handler, request}, TestSupport.Await.bound()
+          TestServer.respond(handler, status, body)
+          request
+        end
+
+      {Task.await(task, TestSupport.Await.bound()), requests}
+    end
+
+    # The empty org name lists every org the token can read, so its first org was
+    # a guess; InfluxDB 2 refuses a bucket without one (verified).
+    test "create_bucket without an org sends no orgID and answers the server's 400",
+         %{conn: conn} do
+      refusal = ~s|{"code":"invalid","message":"organization id must be provided"}|
+      body = ~s|{"name":"b","retentionRules":[{"everySeconds":0}]}|
+
+      for org <- ["", nil] do
+        create = fn -> HTTP.create_bucket(Keyword.put(conn, :org, org), "b") end
+
+        assert served(create, [{400, refusal}]) ===
+                 {{:error, %{status: 400, body: refusal}}, [{:POST, "/api/v2/buckets", body}]}
+      end
+    end
+
+    test "create_bucket looks up the connection's org by name and sends its ID", %{conn: conn} do
+      create = fn -> HTTP.create_bucket(conn, "b") end
+      body = ~s|{"name":"b","orgID":"0123456789abcdef","retentionRules":[{"everySeconds":0}]}|
+
+      assert served(create, [{200, ~s|{"orgs":[{"id":"0123456789abcdef"}]}|}, {201, "{}"}]) ===
+               {:ok, [{:GET, "/api/v2/orgs?org=o", ""}, {:POST, "/api/v2/buckets", body}]}
+
+      assert served(create, [{200, ~s|{"orgs":[]}|}]) ===
+               {{:error, {:org_not_found, "o"}}, [{:GET, "/api/v2/orgs?org=o", ""}]}
+    end
+
+    test "create_bucket with :org_id sends it and looks up no org", %{conn: conn} do
+      body = ~s|{"name":"b","orgID":"0123456789abcdef","retentionRules":[{"everySeconds":0}]}|
+      create = fn -> HTTP.create_bucket(conn, "b", org_id: "0123456789abcdef") end
+
+      assert served(create, [{201, "{}"}]) === {:ok, [{:POST, "/api/v2/buckets", body}]}
+    end
+
+    # A name of 16 hex digits was taken for an ID, so the bucket was never found.
+    test "delete_bucket of 16 hex digits deletes the bucket of that name", %{conn: conn} do
+      delete = fn -> HTTP.delete_bucket(conn, "deadbeefdeadbeef") end
+      found = ~s|{"buckets":[{"id":"0123456789abcdef","name":"deadbeefdeadbeef"}]}|
+
+      assert served(delete, [{200, found}, {204, ""}]) ===
+               {:ok,
+                [
+                  {:GET, "/api/v2/buckets?name=deadbeefdeadbeef&org=o", ""},
+                  {:DELETE, "/api/v2/buckets/0123456789abcdef", ""}
+                ]}
+    end
+
+    test "delete_bucket of 16 hex digits no bucket is named deletes that ID", %{conn: conn} do
+      delete = fn -> HTTP.delete_bucket(conn, "deadbeefdeadbeef") end
+      not_found = ~s|{"code":"not found","message":"bucket \\"deadbeefdeadbeef\\" not found"}|
+
+      assert served(delete, [{404, not_found}, {204, ""}]) ===
+               {:ok,
+                [
+                  {:GET, "/api/v2/buckets?name=deadbeefdeadbeef&org=o", ""},
+                  {:DELETE, "/api/v2/buckets/deadbeefdeadbeef", ""}
+                ]}
+    end
+
+    test "delete_bucket of any other name no bucket has is not found, and deletes nothing",
+         %{conn: conn} do
+      delete = fn -> HTTP.delete_bucket(conn, "gone") end
+      not_found = ~s|{"code":"not found","message":"bucket \\"gone\\" not found"}|
+
+      assert served(delete, [{404, not_found}]) ===
+               {{:error, %{status: 404, body: "bucket not found: gone"}},
+                [{:GET, "/api/v2/buckets?name=gone&org=o", ""}]}
     end
   end
 
@@ -208,6 +301,18 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
         )
 
       assert rows === [%{"tag" => String.duplicate("x", 300), "v" => 1}, %{"v" => 2}]
+    end
+
+    test "a stream stopped after its first row leaves nothing in the enumerating process",
+         %{conn: conn} do
+      take_one = fn ->
+        rows = conn |> HTTP.query_sql_stream("SELECT v FROM m") |> Enum.take(1)
+        {rows, Process.info(self(), :messages)}
+      end
+
+      chunks = [~s({"v":1}\n), ~s({"v":2}\n), ~s({"v":3}\n)]
+
+      assert answered(take_one, 200, {:chunks, chunks}) === {[%{"v" => 1}], {:messages, []}}
     end
   end
 end

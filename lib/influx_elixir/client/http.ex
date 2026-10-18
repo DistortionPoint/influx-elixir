@@ -34,7 +34,8 @@ defmodule InfluxElixir.Client.HTTP do
     * Flux: `POST /api/v2/query` (JSON body, `#datatype`-annotated CSV back)
     * Buckets: `GET/POST/DELETE /api/v2/buckets`. `create_bucket/3` resolves
       the org ID from the connection's `:org` name (override with `org_id:`);
-      `delete_bucket/2` accepts a bucket name or a 16-hex bucket ID. A name
+      `delete_bucket/2` accepts a bucket name or a 16-hex bucket ID (read as an
+      ID only when no bucket has it as its name). A name
       is looked up, and `list_buckets/1` lists, within the connection's
       `:org` (every org the token can read when it is `""`); the listing
       reads every page, not just the server's first 20 buckets.
@@ -337,7 +338,7 @@ defmodule InfluxElixir.Client.HTTP do
       # tuple. Surface the failure by raising when the stream is enumerated
       # rather than yielding an empty list that looks like "zero rows".
       {:error, :no_database_specified} -> raise_stream(kind: :no_database)
-      {:error, reason} -> raise_stream(kind: :transport, reason: reason)
+      {:error, reason} -> raise_stream(kind: :invalid_request, reason: reason)
     end
   end
 

@@ -44,11 +44,14 @@ defmodule InfluxElixir.TestServer do
   request waits until `respond(handler, status)`. The owner is the calling
   process unless `owner: pid` names another, for a test that must answer
   while it is itself blocked (stopping a writer that makes a final write).
+  With `request_line: true` the message is `{:request, handler, {method, path, body}}`,
+  for a test that checks where a request went.
   """
   @spec controlled(keyword()) :: :inet.port_number()
   def controlled(opts \\ []) do
     owner = Keyword.get(opts, :owner, self())
-    start_listener([{:packet, :http_bin} | @listen_options], &serve_requests(&1, owner))
+    line? = Keyword.get(opts, :request_line, false)
+    start_listener([{:packet, :http_bin} | @listen_options], &serve_requests(&1, owner, line?))
   end
 
   @doc """
@@ -101,29 +104,34 @@ defmodule InfluxElixir.TestServer do
 
   # A client that closes before it has sent a whole request (a probe, a
   # timed-out request) is dropped; the listener keeps serving the next one.
-  @spec serve_requests(port(), pid()) :: no_return()
-  defp serve_requests(listener, owner) do
+  @spec serve_requests(port(), pid(), boolean()) :: no_return()
+  defp serve_requests(listener, owner, line?) do
     {:ok, socket} = :gen_tcp.accept(listener)
 
     case read_request(socket) do
-      {:ok, body} -> answer(socket, owner, body)
-      {:error, _closed} -> :ok = :gen_tcp.close(socket)
+      {:ok, method, path, body} ->
+        answer(socket, owner, if(line?, do: {method, path, body}, else: body))
+
+      {:error, _closed} ->
+        :ok = :gen_tcp.close(socket)
     end
 
-    serve_requests(listener, owner)
+    serve_requests(listener, owner, line?)
   end
 
-  @spec read_request(port()) :: {:ok, binary()} | {:error, term()}
+  @spec read_request(port()) :: {:ok, atom() | binary(), term(), binary()} | {:error, term()}
   defp read_request(socket) do
-    with {:ok, {:http_request, _method, _path, _version}} <- :gen_tcp.recv(socket, 0),
+    with {:ok, {:http_request, method, {:abs_path, path}, _version}} <- :gen_tcp.recv(socket, 0),
          {:ok, headers} <- request_headers(socket, %{}) do
       length = headers |> Map.get("content-length", "0") |> String.to_integer()
       :ok = :inet.setopts(socket, packet: :raw)
-      if length == 0, do: {:ok, ""}, else: :gen_tcp.recv(socket, length)
+
+      with {:ok, body} <- if(length == 0, do: {:ok, ""}, else: :gen_tcp.recv(socket, length)),
+           do: {:ok, method, path, body}
     end
   end
 
-  @spec answer(port(), pid(), binary()) :: :ok
+  @spec answer(port(), pid(), term()) :: :ok
   defp answer(socket, owner, body) do
     send(owner, {:request, self(), body})
 

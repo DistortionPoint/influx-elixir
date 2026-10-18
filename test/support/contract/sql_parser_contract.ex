@@ -119,7 +119,8 @@ defmodule InfluxElixir.Contract.SQLParser do
       {:parameters, parameter_kind_tests()},
       {:parameters, parameter_type_tests()},
       {:parameters, request_param_tests()},
-      {:parameters, request_column_tests()}
+      {:parameters, request_column_tests()},
+      {:parameters, request_refusal_tests()}
     ]
   end
 
@@ -143,6 +144,10 @@ defmodule InfluxElixir.Contract.SQLParser do
         opts = if params, do: Keyword.put(opts, :params, params), else: opts
         unquote(client).query_sql(ctx.conn, sql, opts)
       end
+
+      def sp_stream(ctx, sql, params),
+        do:
+          unquote(client).query_sql_stream(ctx.conn, sql, database: ctx.database, params: params)
 
       def sp_raw(ctx, sql, opts),
         do: unquote(client).query_sql(ctx.conn, sql, [database: ctx.database] ++ opts)
@@ -3880,7 +3885,13 @@ defmodule InfluxElixir.Contract.SQLParser do
             assert sp_query(ctx, sql, %{p: value}) === {:ok, []}, inspect(value)
           end
         end
+      end
+    end
+  end
 
+  defp request_refusal_tests do
+    quote location: :keep do
+      describe "SQL parsing — contract: parameters refused before any request" do
         test "nil and [] are no parameters; a key or a value that makes no sense is refused",
              ctx do
           m = sp_measurement("sp_param_shape")
@@ -3918,6 +3929,18 @@ defmodule InfluxElixir.Contract.SQLParser do
 
           assert sp_query(ctx, "select 1", p: self()) ===
                    {:error, {:invalid_param, "p", :unsupported_type}}
+        end
+
+        test "a stream raises the refusal query_sql/3 returns, as an :invalid_request", ctx do
+          for {params, reason} <- [
+                {%{p: {:a, :tuple}}, {:invalid_param, "p", :unsupported_type}},
+                {5, {:invalid_param, "5", :unsupported_params}}
+              ] do
+            stream = sp_stream(ctx, "select 1", params)
+
+            assert assert_raise(InfluxElixir.StreamError, fn -> Enum.to_list(stream) end) ===
+                     InfluxElixir.StreamError.exception(kind: :invalid_request, reason: reason)
+          end
         end
 
         # One of the two would be sent, picked by the order of the entries.
