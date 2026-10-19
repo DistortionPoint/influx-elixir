@@ -74,7 +74,8 @@ defmodule InfluxElixir.Client.Local.Flux do
   alias InfluxElixir.Query.ResponseParser
 
   @typedoc """
-  A comparison operand: a row key compared against a literal. `{:unary, cmp}`
+  A filter predicate: comparisons of a row key with a literal (`{:cmp, key, op,
+  literal}`), joined by `and`, `or` and `not`. `{:unary, cmp}`
   is a comparison against a negative number, which the engine reads as a
   unary expression (`-0` among them).
   """
@@ -123,7 +124,7 @@ defmodule InfluxElixir.Client.Local.Flux do
   `and`), or `:all`. A series of any other one is not there for the stages
   after them; `Client.Local` reads just these from the store.
   """
-  @spec measurements(query()) :: :all | [term()]
+  @spec measurements(query()) :: :all | [binary()]
   def measurements(%{stages: [_range | rest]}) do
     rest |> pushed_conjuncts() |> Enum.map(&pinned/1) |> Enum.reduce(:all, &intersect/2)
   end
@@ -141,7 +142,7 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   defp pushed_conjuncts(_stages), do: []
 
-  @spec pinned(predicate()) :: :all | [term()]
+  @spec pinned(predicate()) :: :all | [binary()]
   defp pinned({:cmp, "_measurement", "==", literal}) when is_binary(literal), do: [literal]
   defp pinned({:and, a, b}), do: intersect(pinned(a), pinned(b))
 
@@ -155,7 +156,7 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   defp pinned(_predicate), do: :all
 
-  @spec intersect(:all | [term()], :all | [term()]) :: :all | [term()]
+  @spec intersect(:all | [binary()], :all | [binary()]) :: :all | [binary()]
   defp intersect(:all, other), do: other
   defp intersect(other, :all), do: other
   defp intersect(a, b), do: Enum.filter(a, &(&1 in b))
@@ -248,6 +249,8 @@ defmodule InfluxElixir.Client.Local.Flux do
       else: Enum.reverse([{"_result", tables} | yields])
   end
 
+  # A tag named `table` or `result` is a column of its own after the engine's (verified,
+  # 2.7), and a client reading the CSV by name keeps the later one: the tag.
   @spec result_rows([{binary(), [table()]}]) :: [map()]
   defp result_rows(results) do
     Enum.flat_map(results, fn {name, tables} ->
@@ -255,7 +258,7 @@ defmodule InfluxElixir.Client.Local.Flux do
       |> Enum.reject(&(&1.rows == []))
       |> Enum.with_index()
       |> Enum.flat_map(fn {table, index} ->
-        Enum.map(table.rows, &Map.merge(&1, %{"table" => index, "result" => name}))
+        Enum.map(table.rows, &Map.merge(%{"table" => index, "result" => name}, &1))
       end)
     end)
   end
@@ -310,11 +313,13 @@ defmodule InfluxElixir.Client.Local.Flux do
   defp push_filter(tables, []), do: tables
 
   defp push_filter(tables, pushed) do
-    check_unsigned(tables, Enum.flat_map(pushed, &atoms/1))
+    tables =
+      Enum.filter(tables, fn table -> Enum.all?(pushed, &(series(&1, table.sample) != false)) end)
 
-    tables
-    |> Enum.filter(fn table -> Enum.all?(pushed, &(series(&1, table.sample) != false)) end)
-    |> keep_rows(fn _table, row -> Enum.all?(pushed, &pushed?(&1, row)) end)
+    # Only a series the filter can reach compares its values: `_field == "n" and
+    # r._value > 0` next to an unsigned `u` is answered (verified, 2.7).
+    check_unsigned(tables, Enum.flat_map(pushed, &atoms/1))
+    keep_rows(tables, fn _table, row -> Enum.all?(pushed, &pushed?(&1, row)) end)
   end
 
   # What storage can tell of a series before it reads a value: true, false,
@@ -501,7 +506,7 @@ defmodule InfluxElixir.Client.Local.Flux do
           case kind do
             :count -> length(values)
             :sum -> total(values, input.kind)
-            :mean -> total(values, input.kind) / length(values)
+            :mean -> mean(total(values, input.kind), length(values))
           end
 
         %{table | rows: [first |> Map.delete("_time") |> Map.put("_value", value)]}
@@ -511,13 +516,32 @@ defmodule InfluxElixir.Client.Local.Flux do
   # The sum of a table's values as the engine adds them: integers in 64 bits,
   # so a sum that does not fit wraps, and a mean divides the wrapped sum
   # (verified: two `9223372036854775807i` and a `5i` sum to 3, mean 1).
-  @spec total([number()], :number | :uint) :: number()
+  @spec total([number()], :number | :uint) :: number() | binary()
   defp total(values, :uint), do: values |> Enum.sum() |> Bitwise.band(0xFFFFFFFFFFFFFFFF)
 
   defp total([value | _rest] = values, :number) when is_integer(value),
     do: wrap64(Enum.sum(values))
 
-  defp total(values, :number), do: Enum.sum(values)
+  defp total(values, :number), do: Enum.reduce(values, &add_float/2)
+
+  # Floats are added in order, and a sum past the float range is an infinity for good: the
+  # engine answers `+Inf` for two `1.7e308` and for those two and a `-1.7e308` after them,
+  # and `-Inf` for two `-1.7e308` (verified, 2.7). A client reads `+Inf` from the CSV as
+  # the text `"+Inf"`, which is what this answers; the stored values are finite, so the
+  # sum is never NaN.
+  @spec add_float(float(), float() | binary()) :: float() | binary()
+  defp add_float(_value, infinity) when is_binary(infinity), do: infinity
+
+  defp add_float(value, sum) do
+    value + sum
+  rescue
+    ArithmeticError -> if value > 0, do: "+Inf", else: "-Inf"
+  end
+
+  # The engine's mean is the sum over the count, so a sum that overflowed is its mean too.
+  @spec mean(number() | binary(), pos_integer()) :: number() | binary()
+  defp mean(infinity, _count) when is_binary(infinity), do: infinity
+  defp mean(sum, count), do: sum / count
 
   @spec aggregate_kind(:mean | :sum | :count, atom()) :: atom()
   defp aggregate_kind(:sum, kind), do: kind
@@ -686,9 +710,12 @@ defmodule InfluxElixir.Client.Local.Flux do
   @spec parse_from([{binary(), binary()}]) ::
           {:ok, binary(), [{binary(), binary()}]} | {:error, binary()}
   defp parse_from([{"from", args} | rest]) do
-    case Regex.run(~r/^\s*bucket\s*:\s*"([^"]*)"\s*$/, args) do
-      [_full, bucket] -> {:ok, bucket, rest}
-      nil -> {:error, "Client.Local: unsupported from(): #{args}"}
+    # The bucket is a string literal as any other: `"a\\b"` names `a\b` (verified, 2.7).
+    with [_full, quoted] <- Regex.run(~r/^\s*bucket\s*:\s*("(?:[^"\\]|\\.)*")\s*$/s, args),
+         {:ok, bucket} <- string_literal(quoted) do
+      {:ok, bucket, rest}
+    else
+      _unsupported -> {:error, "Client.Local: unsupported from(): #{args}"}
     end
   end
 
@@ -901,12 +928,17 @@ defmodule InfluxElixir.Client.Local.Flux do
     end
   end
 
-  # An RFC3339 time with its `T`: the engine reads `2026-10-10 00:00:00Z` as
-  # a date and then a syntax error, where `DateTime.from_iso8601/1` would
-  # take the space.
+  # An RFC3339 time with its `T`, a `.` before any fraction and an offset of `Z` or
+  # `+hh:mm`: the engine reads `2026-10-10 00:00:00Z` as a date and then a syntax error, and
+  # refuses `+0200`, `+02` and `00:00:00,5Z` (verified, 2.7), all of which
+  # `DateTime.from_iso8601/1` would take.
   @spec rfc3339(binary()) :: {:ok, {integer(), integer()}} | {:error, binary()}
   defp rfc3339(text) do
-    with true <- Regex.match?(~r/^\d{4}-\d{2}-\d{2}T/, text),
+    with true <-
+           Regex.match?(
+             ~r/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/,
+             text
+           ),
          {:ok, dt, _offset} <- DateTime.from_iso8601(text) do
       wrapped = wrap64(DateTime.to_unix(dt, :nanosecond))
       {:ok, {wrapped, wrapped}}
@@ -943,7 +975,7 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   # A number has no exponent in Flux: `1e5` is `1` and the identifier `e5`,
   # an error on the engine.
-  @token ~r/^\s*(?:(?<str>"(?:[^"\\]|\\.)*")|(?<num>-?\d+(?:\.\d+)?)|(?<key>r\.[A-Za-z_]\w*|r\s*\[\s*"(?:[^"\\]|\\.)*"\s*\])|(?<op>==|!=|<=|>=|<|>)|(?<paren>[()])|(?<word>[A-Za-z_]\w*))/
+  @token ~r/^(?<all>\s*(?:(?<str>"(?:[^"\\]|\\.)*")|(?<num>-?\d+(?:\.\d+)?)|(?<key>r\.[A-Za-z_]\w*|r\s*\[\s*"(?:[^"\\]|\\.)*"\s*\])|(?<op>==|!=|<=|>=|<|>)|(?<paren>[()])|(?<word>[A-Za-z_]\w*)))/
 
   @spec parse_predicate(binary()) :: {:ok, predicate()} | {:error, binary()}
   defp parse_predicate(text) do
@@ -986,10 +1018,11 @@ defmodule InfluxElixir.Client.Local.Flux do
   end
 
   @spec tokenize(binary(), list()) :: {:ok, list()} | :error
+  # One match per token; the blank check reads only up to the next token's first character.
   defp tokenize(text, acc) do
-    with false <- String.trim(text) == "",
-         [full] <- Regex.run(@token, text, capture: :first),
-         {:ok, token} <- token(Regex.named_captures(@token, text)) do
+    with false <- Regex.match?(~r/^\s*$/, text),
+         %{"all" => full} = captures <- Regex.named_captures(@token, text),
+         {:ok, token} <- token(captures) do
       rest = binary_part(text, byte_size(full), byte_size(text) - byte_size(full))
       tokenize(rest, [token | acc])
     else
@@ -1003,8 +1036,13 @@ defmodule InfluxElixir.Client.Local.Flux do
     with {:ok, text} <- string_literal(str), do: {:ok, {:lit, text}}
   end
 
-  defp token(%{"num" => "-" <> _digits = num}), do: {:ok, {:negative, number(num)}}
-  defp token(%{"num" => num}) when num != "", do: {:ok, {:lit, number(num)}}
+  defp token(%{"num" => "-" <> _digits = num}) do
+    with {:ok, n} <- number(num), do: {:ok, {:negative, n}}
+  end
+
+  defp token(%{"num" => num}) when num != "" do
+    with {:ok, n} <- number(num), do: {:ok, {:lit, n}}
+  end
 
   defp token(%{"key" => key}) when key != "" do
     with {:ok, name} <- key_name(key), do: {:ok, {:key, name}}
@@ -1046,12 +1084,17 @@ defmodule InfluxElixir.Client.Local.Flux do
   defp unescape(<<"${", _rest::binary>>, _acc), do: :error
   defp unescape(<<c, rest::binary>>, acc), do: unescape(rest, <<acc::binary, c>>)
 
-  @spec number(binary()) :: number()
+  # A float literal past the float range is an infinity on the engine (2.7 answers
+  # `r._value > 1<400 digits>.5` with no rows), which the BEAM has no float for: it is
+  # refused as an unsupported predicate. It raised.
+  @spec number(binary()) :: {:ok, number()} | :error
   defp number(text) do
     case Integer.parse(text) do
-      {n, ""} -> n
-      _float -> text |> Float.parse() |> elem(0)
+      {n, ""} -> {:ok, n}
+      _float -> {:ok, String.to_float(text)}
     end
+  rescue
+    ArgumentError -> :error
   end
 
   @spec parse_or(list()) :: {:ok, predicate(), list()} | :error

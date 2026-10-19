@@ -473,20 +473,25 @@ defmodule InfluxElixir.Client.Local do
 
     * `from(bucket: "b")` — first; a bucket that does not exist is the
       engine's 404
-    * `range(start:[, stop:])` — required, once; Unix seconds, RFC3339,
-      a duration from now (`-1h`, `-30m`, `-7d`, `-2w`) or `now()`
+    * `range(start:[, stop:])` — required, once; Unix seconds, RFC3339
+      (with `T`, and an offset of `Z` or `+hh:mm`, as Flux reads it), a
+      duration from now (`-1h`, `-30m`, `-7d`, `-2w`) or `now()`
     * `filter(fn: (r) => ...)` — `r.key` or `r["key"]` compared with
       `== != < <= > >=` against a string, number or boolean, combined with
       `and`, `or`, `not` and parentheses
     * `first()`, `last()`, `min()`, `max()` — the selected row per table
-    * `mean()`, `sum()`, `count()` — one row per table, without `_time`
+    * `mean()`, `sum()`, `count()` — one row per table, without `_time`; a
+      float sum past the float range is `"+Inf"` or `"-Inf"`, the text the
+      HTTP client reads from the engine's CSV
     * `limit(n:[, offset:])` — per table
     * `yield(name: "x")` — names a result. Every `yield` returns its own
       result (the rows carry its name in `"result"`, and their `"table"`
       counts from 0 in each); a last stage that is not a `yield` returns the
       rest as `_result`. InfluxDB returns the results in no fixed order, the
       double in pipeline order, so compare them by name. Two results of one
-      name are the engine's 400.
+      name are the engine's 400. A tag named `result` or `table` is a column
+      of its own on the engine, and a row holds the tag's value under that
+      name, as the HTTP client reads it.
 
   What a filter does with a key a row lacks depends on where the engine runs
   it, and the double does the same. The filters right after `range` are pushed

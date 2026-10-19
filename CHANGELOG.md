@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local` raised on a Flux float `sum()` or `mean()` past the float range.** Two
+  `1.7e308` crashed the query. InfluxDB 2.7 adds the values in order, keeps an infinity once
+  the running sum reaches it, and writes `+Inf` or `-Inf`, which the HTTP client reads as that
+  text. The double now answers `"+Inf"` or `"-Inf"`.
+- **`Client.Local` refused a Flux `_value` filter next to an unsigned field it does not
+  reach.** `r._field == "n" and r._value > 0` was refused because the measurement also holds
+  an unsigned `u`. 2.7 answers it, and so does the double now. A comparison that can reach
+  the unsigned series is still refused.
+- **A Flux tag named `table` or `result` was overwritten by the double.** 2.7 writes such a
+  tag as a column of its own after the engine's columns, and the HTTP client keeps the later
+  one. The double now does the same.
+- **`Client.Local` took RFC3339 times Flux refuses.** `range(start: ...+0200)` and `...+02`
+  were read through `DateTime.from_iso8601/1`. 2.7 refuses both, and the double now refuses
+  them by name.
+- **`Client.Local` raised on a Flux float literal past the float range.** A 400-digit
+  `r._value > 1000…0.5` crashed the filter. 2.7 reads the literal as an infinity, which the
+  BEAM has no float for, so the double now refuses the predicate by name.
+- **`Client.Local` read `from(bucket: ...)` without its escapes.** `"a\\b"` named the bucket
+  `a\\b`, where 2.7 reads `a\b`, as the double already did in filters and yields.
 - **`add_connection/2` crashed on a config the client refused.** Under `Client.HTTP`, an
   unknown option such as `default_database:` raised `NimbleOptions.ValidationError` inside the
   connection supervisor's `init/1`. The caller got the exception wrapped with a stacktrace,

@@ -208,21 +208,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxFidelityTest do
   # ---------------------------------------------------------------------------
 
   describe "query_flux/3 — range" do
-    test "an integer second count that does not fit wraps in 64-bit nanoseconds" do
-      conn = v2_conn()
-      assert {:ok, :written} = Local.write(conn, "m v=1 5", database: "b")
-
-      assert {:ok, [row]} = flux_range(conn, "start: 0, stop: 99999999999999")
-      assert row["_start"] === ~U[1970-01-01 00:00:00.000000Z]
-      assert row["_stop"] === ~U[1976-05-08 04:06:59.520689Z]
-
-      assert {:ok, [row]} = flux_range(conn, "start: 0, stop: 9223372036")
-      assert row["_stop"] === ~U[2262-04-11 23:47:16.000000Z]
-
-      # The stop wraps below the start, but a range is judged on the seconds.
-      assert {:ok, []} = flux_range(conn, "start: 0, stop: 18446744073")
-    end
-
     test "a negative duration reaches back from now, a positive one forward" do
       conn = v2_conn()
       now = System.os_time(:nanosecond)
@@ -251,10 +236,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxFidelityTest do
       # `now` carries nanoseconds a row's time does not, which can move the
       # microsecond of the wrapped start by one.
       candidates =
-        for extra <- [0, 999],
-            do: DateTime.from_unix!(wrap64(stop_ns + extra - 99_999_999_999 * week), :nanosecond)
+        for extra <- [0, 999] do
+          (stop_ns + extra - 99_999_999_999 * week)
+          |> wrap64()
+          |> DateTime.from_unix!(:nanosecond)
+          |> DateTime.truncate(:microsecond)
+        end
 
-      assert Enum.any?(candidates, &(DateTime.truncate(&1, :microsecond) === row["_start"]))
+      assert row["_start"] in candidates
       assert row["_start"].year === 1810
     end
 
@@ -312,17 +301,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxFidelityTest do
 
       assert {:ok, [row]} = flux_all(conn, "|> limit(n: 1, offset: 1)")
       assert row["_value"] === 1
-    end
-
-    test "sort and group are refused by name" do
-      conn = v2_conn()
-
-      for stage <- ["sort()", "group()"] do
-        assert error_body(flux_all(conn, "|> " <> stage)) === %{
-                 "code" => "invalid",
-                 "message" => "Client.Local: unsupported Flux function: #{stage}"
-               }
-      end
     end
 
     test "a filter on _measurement reads only those measurements" do

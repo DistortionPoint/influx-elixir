@@ -22,7 +22,8 @@ defmodule InfluxElixir.Contract.Flux do
     * `:ranges` — ranges relative to now, predicates and range units
     * `:pushdown` — which filters storage evaluates and what a key it lacks is,
       one result per `yield`, the aggregates of string and boolean fields, and the
-      order of the tables
+      order of the tables, a float sum past the float range, tags named as the
+      engine's columns and a `_value` filter beside an unsigned field
   """
 
   @parts [:pipeline, :ranges, :pushdown]
@@ -123,7 +124,8 @@ defmodule InfluxElixir.Contract.Flux do
       {:pushdown, flux_semantics_tests(client)},
       {:pushdown, result_tests(client)},
       {:pushdown, type_aggregate_tests(client)},
-      {:pushdown, table_order_tests(client)}
+      {:pushdown, table_order_tests(client)},
+      {:pushdown, edge_value_tests(client)}
     ]
   end
 
@@ -399,7 +401,20 @@ defmodule InfluxElixir.Contract.Flux do
 
           flux = InfluxElixir.Contract.Flux.head(ctx, m, "start: 0, stop: 1800000000")
 
-          assert {:ok, [%{"_value" => "l1\nl2"}]} = unquote(client).query_flux(ctx.conn, flux)
+          assert unquote(client).query_flux(ctx.conn, flux) ===
+                   {:ok,
+                    [
+                      %{
+                        "result" => "_result",
+                        "table" => 0,
+                        "_start" => ~U[1970-01-01 00:00:00.000000Z],
+                        "_stop" => ~U[2027-01-15 08:00:00.000000Z],
+                        "_time" => ~U[2023-11-14 22:13:20.000000Z],
+                        "_measurement" => m,
+                        "_field" => "s",
+                        "_value" => "l1\nl2"
+                      }
+                    ]}
         end
       end
     end
@@ -853,22 +868,38 @@ defmodule InfluxElixir.Contract.Flux do
         @tag local_divergence:
                "Local names the type error of Flux, whose message holds a position in the query"
         test "in Flux a column compared with a literal of another type is an error", ctx do
-          for tail <- [
-                ~s| \|> limit(n: 10) \|> filter(fn: (r) => r.h != 1)|,
-                ~s| \|> filter(fn: (r) => r.h < 1)|,
-                ~s| \|> filter(fn: (r) => r.h != -1)|,
-                ~s| \|> filter(fn: (r) => r.h != -0)|,
-                ~s| \|> filter(fn: (r) => r.h == "" or r.h != 1)|,
-                ~s| \|> filter(fn: (r) => r._time > 1)|,
-                ~s| \|> filter(fn: (r) => r._time < "x")|,
-                ~s| \|> limit(n: 10) \|> filter(fn: (r) => r._value == "x")|,
-                ~s| \|> filter(fn: (r) => r._value > false)|
+          mismatch = fn column, type, op ->
+            "Client.Local: comparing the #{column} with a #{type} (#{op}) is an error on the " <>
+              "engine (unsupported binary expression)"
+          end
+
+          for {tail, refusal} <- [
+                {~s| \|> limit(n: 10) \|> filter(fn: (r) => r.h != 1)|,
+                 mismatch.("string column h", "number", "!=")},
+                {~s| \|> filter(fn: (r) => r.h < 1)|,
+                 mismatch.("string column h", "number", "<")},
+                {~s| \|> filter(fn: (r) => r.h != -1)|,
+                 mismatch.("string column h", "number", "!=")},
+                {~s| \|> filter(fn: (r) => r.h != -0)|,
+                 mismatch.("string column h", "number", "!=")},
+                {~s| \|> filter(fn: (r) => r.h == "" or r.h != 1)|,
+                 mismatch.("string column h", "number", "!=")},
+                {~s| \|> filter(fn: (r) => r._time > 1)|,
+                 mismatch.("time column _time", "number", ">")},
+                {~s| \|> filter(fn: (r) => r._time < "x")|,
+                 mismatch.("time column _time", "string", "<")},
+                {~s| \|> limit(n: 10) \|> filter(fn: (r) => r._value == "x")|,
+                 mismatch.("number column _value", "string", "==")},
+                {~s| \|> filter(fn: (r) => r._value > false)|,
+                 "Client.Local: ordering against a boolean is an error on the engine " <>
+                   "(bool is not Comparable)"}
               ] do
             {status, message} = InfluxElixir.Contract.Flux.error_of(ctx.rows.(tail))
             assert status === 400, tail
 
+            # The engine's message holds the position of the expression in the query.
             if fxd_local?(),
-              do: assert(message =~ ~r/^Client\.Local: (comparing|ordering)/, tail),
+              do: assert(message === refusal, tail),
               else: assert(message =~ ~r/unsupported binary expression|is not Comparable/, tail)
           end
         end
@@ -987,8 +1018,10 @@ defmodule InfluxElixir.Contract.Flux do
             assert InfluxElixir.Contract.Flux.error_of(result) ===
                      {400, "Client.Local: unsupported yield(): a result with no name"}
           else
-            assert {:ok, [_one, _two, _three] = rows} = result
-            refute Enum.any?(rows, &Map.has_key?(&1, "result"))
+            # The rows of the default result, with no result column.
+            {:ok, named} = unquote(client).query_flux(ctx.conn, ctx.head)
+            assert length(named) === 3
+            assert result === {:ok, Enum.map(named, &Map.delete(&1, "result"))}
           end
         end
       end
@@ -1111,7 +1144,13 @@ defmodule InfluxElixir.Contract.Flux do
           assert status === 400
 
           if fxd_local?(),
-            do: assert(message =~ "Client.Local: max() of a string or boolean field"),
+            do:
+              assert(
+                message ===
+                  "Client.Local: max() of a string or boolean field is an engine error whose " <>
+                    "form depends on the plan (a 500 \"panic: unsupported for aggregate max\" " <>
+                    "when storage reads it, a positioned 400 otherwise)"
+              ),
             else: assert(message =~ "MaxSelector has no implementation for type string")
         end
       end
@@ -1155,6 +1194,117 @@ defmodule InfluxElixir.Contract.Flux do
           assert ctx.tables.(" |> limit(n: 9) |> first()") === grouped
           assert ctx.tables.(" |> limit(n: 9) |> sum()") === grouped
           assert ctx.tables.(" |> first() |> first()") === grouped
+        end
+      end
+    end
+  end
+
+  defp edge_value_tests(client) do
+    quote location: :keep do
+      describe "query_flux/3 — values at the edges" do
+        test "a float sum or mean past the float range is an infinity, kept once reached",
+             ctx do
+          m = InfluxElixir.IntegrationHelper.unique_name("contract_fxi")
+
+          lp = """
+          #{m},h=a f=1.7e308 1000000000
+          #{m},h=a f=1.7e308 2000000000
+          #{m},h=b f=-1.7e308 1000000000
+          #{m},h=b f=-1.7e308 2000000000
+          #{m},h=c f=1.7e308 1000000000
+          #{m},h=c f=1.7e308 2000000000
+          #{m},h=c f=-1.7e308 3000000000
+          """
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, String.trim(lp), database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+          head = InfluxElixir.Contract.Flux.head(ctx, m, "start: 0, stop: 100")
+
+          # InfluxDB 2's CSV writes an infinity as `+Inf` or `-Inf`, which reads as that text.
+          for aggregate <- ["sum", "mean"] do
+            expected =
+              for {h, value} <- [{"a", "+Inf"}, {"b", "-Inf"}, {"c", "+Inf"}] do
+                %{
+                  "result" => "_result",
+                  "table" => Map.fetch!(%{"a" => 0, "b" => 1, "c" => 2}, h),
+                  "_start" => ~U[1970-01-01 00:00:00.000000Z],
+                  "_stop" => ~U[1970-01-01 00:01:40.000000Z],
+                  "_measurement" => m,
+                  "_field" => "f",
+                  "_value" => value,
+                  "h" => h
+                }
+              end
+
+            assert unquote(client).query_flux(ctx.conn, head <> " |> #{aggregate}()") ===
+                     {:ok, expected},
+                   aggregate
+          end
+        end
+
+        test "a tag named table or result is the row's value under that name", ctx do
+          m = InfluxElixir.IntegrationHelper.unique_name("contract_fxn")
+
+          lp = """
+          #{m},table=x v=1i 1000000000
+          #{m},result=y v=2i 1000000000
+          """
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, String.trim(lp), database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+          flux = InfluxElixir.Contract.Flux.head(ctx, m, "start: 0, stop: 100")
+
+          base = %{
+            "_start" => ~U[1970-01-01 00:00:00.000000Z],
+            "_stop" => ~U[1970-01-01 00:01:40.000000Z],
+            "_time" => ~U[1970-01-01 00:00:01.000000Z],
+            "_measurement" => m,
+            "_field" => "v"
+          }
+
+          # The engine writes the tag as a column of its own after `result` and `table`; read
+          # by name, the later one is kept.
+          assert unquote(client).query_flux(ctx.conn, flux) ===
+                   {:ok,
+                    [
+                      Map.merge(base, %{"result" => "y", "table" => 0, "_value" => 2}),
+                      Map.merge(base, %{"result" => "_result", "table" => "x", "_value" => 1})
+                    ]}
+        end
+
+        test "a _value filter is answered beside an unsigned field it does not reach", ctx do
+          m = InfluxElixir.IntegrationHelper.unique_name("contract_fxu")
+
+          lp = """
+          #{m} u=5u,n=1i 1000000000
+          #{m} u=6u,n=2i 2000000000
+          """
+
+          {:ok, :written} =
+            unquote(client).write(ctx.conn, String.trim(lp), database: ctx.database)
+
+          InfluxElixir.ClientContract.settle(ctx)
+          head = InfluxElixir.Contract.Flux.head(ctx, m, "start: 0, stop: 100")
+          filter = ~S[ |> filter(fn: (r) => r._field == "n" and r._value > 1)]
+
+          assert unquote(client).query_flux(ctx.conn, head <> filter) ===
+                   {:ok,
+                    [
+                      %{
+                        "result" => "_result",
+                        "table" => 0,
+                        "_start" => ~U[1970-01-01 00:00:00.000000Z],
+                        "_stop" => ~U[1970-01-01 00:01:40.000000Z],
+                        "_time" => ~U[1970-01-01 00:00:02.000000Z],
+                        "_measurement" => m,
+                        "_field" => "n",
+                        "_value" => 2
+                      }
+                    ]}
         end
       end
     end
