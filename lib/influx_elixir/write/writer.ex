@@ -86,7 +86,7 @@ defmodule InfluxElixir.Write.Writer do
     {payload, write_opts} = maybe_gzip(line_protocol, gzip, opts)
 
     metadata = %{
-      database: Keyword.get(opts, :database) || Options.database(connection),
+      database: Options.database(opts, connection),
       bytes: if(is_binary(line_protocol), do: byte_size(line_protocol), else: 0),
       point_count: line_count(line_protocol)
     }

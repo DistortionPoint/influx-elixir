@@ -64,4 +64,35 @@ defmodule InfluxElixir.Client.Local.FormatTest do
                 %{status: 400, body: "Error during planning: table 'public.iox.nosuch' not found"}}
     end
   end
+
+  test "format: nil uses the default :json format on both SQL and InfluxQL", %{conn: conn} do
+    assert Local.query_sql(conn, "SELECT v FROM m", database: "db", format: nil) ===
+             {:ok, [%{"v" => 1.5}]}
+
+    assert Local.query_influxql(conn, "SELECT v FROM m", database: "db", format: nil) ===
+             {:ok,
+              [
+                %{
+                  "iox::measurement" => "m",
+                  "time" => ~U[1970-01-01 00:00:01.000000Z],
+                  "v" => 1.5
+                }
+              ]}
+  end
+
+  test "format: false is refused as an unknown variant, not treated as :json", %{conn: conn} do
+    expected =
+      {:error,
+       %{
+         status: 400,
+         body:
+           "serde json error: unknown variant `false`, expected one of `parquet`, `csv`, " <>
+             "`pretty`, `json`, `json_lines`, `jsonl` at line 1 column 27"
+       }}
+
+    assert Local.query_sql(conn, "SELECT v FROM m", database: "db", format: false) === expected
+
+    assert Local.query_influxql(conn, "SELECT v FROM m", database: "db", format: false) ===
+             expected
+  end
 end

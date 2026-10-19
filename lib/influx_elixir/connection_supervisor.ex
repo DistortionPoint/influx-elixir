@@ -103,7 +103,7 @@ defmodule InfluxElixir.ConnectionSupervisor do
     # A config that is not a keyword list holding an atom `:name` cannot name a connection:
     # the caller's error, never a raise.
     with true <- InfluxElixir.Client.Options.keyword?(config),
-         name when is_atom(name) and name != nil <- Keyword.get(config, :name) do
+         name when is_atom(name) and name not in [nil, true, false] <- Keyword.get(config, :name) do
       start_named(name, config)
     else
       _invalid -> {:error, {:invalid_options, config}}

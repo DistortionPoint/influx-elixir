@@ -183,7 +183,8 @@ defmodule InfluxElixir.Connection do
   def finch_name(name) when is_atom(name) do
     with {:ok, connection} when is_list(connection) <- get(name),
          true <- Options.keyword?(connection),
-         finch when finch != nil <- Keyword.get(connection, :finch_name) do
+         finch when is_atom(finch) and finch not in [nil, true, false] <-
+           Keyword.get(connection, :finch_name) do
       finch
     else
       _derived -> InfluxElixir.ConnectionSupervisor.finch_name(name)

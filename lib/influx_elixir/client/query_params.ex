@@ -136,7 +136,14 @@ defmodule InfluxElixir.Client.QueryParams do
   def request_body(database, sql, params, format) do
     body = %{"q" => sql, "params" => params}
     body = if database == nil, do: body, else: Map.put(body, "db", database)
-    body = if format == nil, do: body, else: Map.put(body, "format", to_string(format))
+
+    body =
+      case format do
+        nil -> body
+        atom when is_atom(atom) -> Map.put(body, "format", Atom.to_string(atom))
+        other -> Map.put(body, "format", other)
+      end
+
     Jason.encode!(body)
   end
 

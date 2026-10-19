@@ -208,5 +208,15 @@ defmodule InfluxElixir.ConnectionTest do
       # It named the derived pool whatever the connection said.
       assert Connection.finch_name(name) === :given_pool
     end
+
+    test "ignores a boolean or non-atom :finch_name and returns the derived pool name" do
+      for bad <- [false, true, "not_an_atom"] do
+        name = :"finch_bad_#{System.unique_integer([:positive])}"
+        :ok = Connection.put(name, host: "h", finch_name: bad)
+        on_exit(fn -> Connection.delete(name) end)
+
+        assert Connection.finch_name(name) === :"influx_elixir_#{name}_finch"
+      end
+    end
   end
 end

@@ -71,7 +71,7 @@ defmodule InfluxElixir.Write.PointTest do
                }
     end
 
-    test "nil tags and nil fields are empty" do
+    test "nil tags and nil fields are empty, while false is kept as given" do
       assert Point.new("m", nil) === %Point{measurement: "m", fields: %{}, tags: %{}}
 
       assert Point.new("m", %{"f" => 1}, tags: nil) ===
@@ -79,6 +79,18 @@ defmodule InfluxElixir.Write.PointTest do
 
       assert Point.new("m", nil, tags: nil, timestamp: 5) ===
                %Point{measurement: "m", fields: %{}, tags: %{}, timestamp: 5}
+
+      bad_fields = Point.new("m", false)
+      assert bad_fields === %Point{measurement: "m", fields: false, tags: %{}}
+
+      assert InfluxElixir.Write.LineProtocol.encode(bad_fields) ===
+               {:error, {:invalid_point, bad_fields}}
+
+      bad_tags = Point.new("m", %{"f" => 1}, tags: false)
+      assert bad_tags === %Point{measurement: "m", fields: %{"f" => 1}, tags: false}
+
+      assert InfluxElixir.Write.LineProtocol.encode(bad_tags) ===
+               {:error, {:invalid_point, bad_tags}}
     end
   end
 end

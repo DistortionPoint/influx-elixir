@@ -57,6 +57,13 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
       assert %StreamError{kind: :invalid_request, reason: :no_pool_name} =
                catch_error(Enum.to_list(stream))
     end
+
+    test "a boolean or non-atom :finch_name or :name is also :no_pool_name" do
+      for bad <- [false, true, "pool", 123] do
+        assert HTTP.query_sql(connection(finch_name: bad), "SELECT 1") === @no_pool_name
+        assert HTTP.query_sql(connection(name: bad), "SELECT 1") === @no_pool_name
+      end
+    end
   end
 
   describe "query parameters Jason cannot write" do
@@ -88,6 +95,18 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
         assert InfluxElixir.Client.Local.query_sql(local, "SELECT $a", params: %{"a" => value}) ===
                  {:error, {:invalid_param, "a", :unsupported_type}},
                label
+      end
+    end
+
+    test "a format Jason cannot encode is an unencodable_body error, never a raise" do
+      conn = connection(finch_name: absent_pool())
+
+      for bad_format <- [<<0xFF>>, {1}, self(), [1 | 2]] do
+        assert {:error, {:unencodable_body, _reason}} =
+                 HTTP.query_sql(conn, "SELECT 1", format: bad_format)
+
+        assert {:error, {:unencodable_body, _reason}} =
+                 HTTP.query_influxql(conn, "SELECT 1", format: bad_format)
       end
     end
   end
@@ -229,6 +248,28 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
     test "SQL sends the default format too", %{conn: conn} do
       body = request_body(fn -> HTTP.query_sql(conn, "SELECT 1", format: nil) end)
       assert body === %{"db" => "db", "format" => "json", "params" => %{}, "q" => "SELECT 1"}
+    end
+
+    test "format: false and database: false are sent as given, not replaced by defaults",
+         %{conn: conn} do
+      sql_body =
+        request_body(fn ->
+          HTTP.query_sql(conn, "SELECT 1", database: false, format: false)
+        end)
+
+      assert sql_body === %{
+               "db" => false,
+               "format" => "false",
+               "params" => %{},
+               "q" => "SELECT 1"
+             }
+
+      iql_body =
+        request_body(fn ->
+          HTTP.query_influxql(conn, "SELECT 1", database: false, format: false)
+        end)
+
+      assert iql_body === %{"db" => false, "format" => "false", "q" => "SELECT 1"}
     end
   end
 

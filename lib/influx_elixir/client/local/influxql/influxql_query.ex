@@ -31,12 +31,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(%{table: table} = conn, influxql, opts) do
-    with :ok <- Scope.require_capability(conn, :query_influxql) do
+    with :ok <- Scope.require_capability(conn, :query_influxql),
+         {:ok, database} <- request_database(opts, conn) do
       Format.answer(
         Scope.query_format(opts),
         fn -> do_query_influxql(table, conn, influxql, opts) end,
-        Keyword.get(opts, :database) || Map.get(conn, :database)
+        database
       )
+    end
+  end
+
+  @spec request_database(keyword(), map()) :: {:ok, binary() | nil} | {:error, map()}
+  defp request_database(opts, conn) do
+    case Scope.resolve_database(opts, conn) do
+      {:ok, database} -> {:ok, database}
+      {:error, :no_database_specified} -> {:ok, nil}
+      {:error, %{} = refusal} -> {:error, refusal}
     end
   end
 

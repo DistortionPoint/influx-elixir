@@ -26,11 +26,27 @@ defmodule InfluxElixir.Client.Options do
   @doc false
   # The connection-level default database of a keyword (`Client.HTTP`) or map (`Client.Local`)
   # connection: the callers refuse any other term first.
-  @spec database(keyword() | map()) :: binary() | nil
+  @spec database(keyword() | map()) :: term()
   def database(connection) when is_map(connection), do: Map.get(connection, :database)
 
   def database(connection) when is_list(connection) do
     if keyword?(connection), do: Keyword.get(connection, :database)
+  end
+
+  @doc false
+  # The database of a call: `opts[:database]` when given and non-nil, else the connection's
+  # default. A non-nil `opts[:database]` (such as `database: false`) is kept as-is rather than
+  # falling back via `||`.
+  @spec database(term(), keyword() | map()) :: term()
+  def database(opts, connection) do
+    if keyword?(opts) do
+      case Keyword.get(opts, :database) do
+        nil -> database(connection)
+        db -> db
+      end
+    else
+      database(connection)
+    end
   end
 
   @doc false

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`database: false` fell back to the connection's default database.** `Client.HTTP` and
+  `Client.Local` resolved `:database` with `Keyword.get(opts, :database) || ...`, so passing
+  `database: false` on a connection with a configured `:database` silently used the connection's
+  database instead of returning `{:error, %Error{reason: :invalid_database}}`. Only `nil` falls
+  back to the connection's database now, and `Client.Local.query_influxql/3` validates
+  `database:` even on `SHOW DATABASES` and before checking `format:`.
+- **`format: false` fell back to `:json` on `Client.HTTP`, and `format: nil` was a 400 on
+  `Client.Local`.** Both clients now default `:format` to `:json` only when `nil`, and refuse
+  `format: false` as an unknown format (`400`).
+- **An unencodable `:format` in `Client.HTTP` or `QueryParams.request_body/4` raised.** Passing
+  a tuple, pid, improper list, or invalid UTF-8 binary as `format:` raised
+  `Protocol.UndefinedError`, `ArgumentError`, or `Jason.EncodeError`. `Client.HTTP` now returns
+  `{:error, %Error{reason: {:unencodable_body, ...}}}` and `QueryParams.request_body/4` converts
+  only atoms with `Atom.to_string/1`.
+- **`Client.Local.start/1` and `Point.new/3` replaced `false` with defaults via `||`.**
+  `Client.Local.start(databases: false)` and `Client.Local.start(org: false)` now raise
+  `ArgumentError`, and `Point.new("m", false)` or `Point.new("m", %{"v" => 1}, tags: false)`
+  keeps `false` so `LineProtocol.encode/2` refuses the point with `{:error, {:invalid_point,
+  point}}`.
+- **Boolean `:name` and `:finch_name` values were accepted as process names.**
+  `ConnectionSupervisor.start_link/1` now rejects `name: false` and `name: true` with
+  `{:error, {:invalid_connection_name, ...}}`, and `Connection.finch_name/1` and
+  `Client.HTTP.Request` ignore boolean atoms.
+
 ## [0.1.49] - 2026-10-19
 
 ### Fixed

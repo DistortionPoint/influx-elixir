@@ -658,7 +658,7 @@ defmodule InfluxElixir.Client.Local do
     # operation that needs one is `{:error, :no_database_specified}` — no
     # "default" database the server does not have.
     # `databases: nil` is none listed, as a config without the key gives it.
-    listed = Keyword.get(opts, :databases) || []
+    listed = if is_nil(opts[:databases]), do: [], else: opts[:databases]
 
     unless names?(listed) and
              (is_binary(opts[:database]) or is_nil(opts[:database])) do
@@ -675,13 +675,17 @@ defmodule InfluxElixir.Client.Local do
     # A public ETS store: every
     # mutation is one insert or delete of its own key, so no process is
     # needed to make concurrent writers safe.
-    org = Keyword.get(opts, :org) || "local"
-
-    unless is_binary(org) do
-      raise ArgumentError, "invalid org: :org must be a string, got #{inspect(org)}"
-    end
+    org = start_org!(opts)
 
     {:ok, %{table: Store.new(databases), database: database, profile: profile, org: org}}
+  end
+
+  defp start_org!(opts) do
+    case Keyword.get(opts, :org) do
+      nil -> "local"
+      org when is_binary(org) -> org
+      org -> raise ArgumentError, "invalid org: :org must be a string, got #{inspect(org)}"
+    end
   end
 
   @doc """

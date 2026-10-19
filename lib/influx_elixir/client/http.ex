@@ -291,7 +291,8 @@ defmodule InfluxElixir.Client.HTTP do
   defp sql_request_body(database, sql, opts, format) do
     with {:ok, params} <- query_params(opts),
          :ok <- encodable_text(sql),
-         :ok <- encodable_text(database) do
+         :ok <- encodable_text(database),
+         :ok <- encodable_text(format) do
       {:ok, QueryParams.request_body(database, sql, params, format)}
     end
   end
@@ -303,9 +304,17 @@ defmodule InfluxElixir.Client.HTTP do
     with {:ok, _body} <- json_body(%{"text" => value}), do: :ok
   end
 
+  @spec query_format(keyword()) :: term()
+  defp query_format(opts) do
+    case Keyword.get(opts, :format) do
+      nil -> :json
+      format -> format
+    end
+  end
+
   @spec http_query_sql(keyword(), binary(), keyword()) :: InfluxElixir.Client.query_result()
   defp http_query_sql(connection, sql, opts) do
-    format = Keyword.get(opts, :format) || :json
+    format = query_format(opts)
 
     with {:ok, database} <- resolve_database(opts, connection),
          {:ok, body} <- sql_request_body(database, sql, opts, format),
@@ -394,9 +403,10 @@ defmodule InfluxElixir.Client.HTTP do
         {:error, :no_database_specified} -> ""
       end
 
-    format = Keyword.get(opts, :format) || :json
+    format = query_format(opts)
+    format_value = if is_atom(format), do: Atom.to_string(format), else: format
 
-    body_map = %{"q" => influxql, "format" => to_string(format)}
+    body_map = %{"q" => influxql, "format" => format_value}
 
     body_map =
       if database != "" do
@@ -588,11 +598,11 @@ defmodule InfluxElixir.Client.HTTP do
   defdelegate resolve_pool_timeout(opts, connection), to: Request
 
   @spec resolve_database(keyword(), keyword()) ::
-          {:ok, binary()} | {:error, :no_database_specified}
+          {:ok, term()} | {:error, :no_database_specified}
   # `database: nil` is no database given, as in Client.Local and the
   # facade's telemetry; the connection's default applies.
   defp resolve_database(opts, connection) do
-    case Keyword.get(opts, :database) || conn_val(connection, :database) do
+    case Options.database(opts, connection) do
       nil -> {:error, :no_database_specified}
       db -> {:ok, db}
     end

@@ -175,9 +175,15 @@ defmodule InfluxElixir.Client.HTTP.Request do
   @spec resolve_finch(keyword()) :: {:ok, atom()} | {:error, :no_pool_name}
   def resolve_finch(connection) do
     case {Keyword.get(connection, :finch_name), Keyword.get(connection, :name)} do
-      {nil, nil} -> {:error, :no_pool_name}
-      {nil, name} -> {:ok, ConnectionSupervisor.finch_name(name)}
-      {finch_name, _name} -> {:ok, finch_name}
+      {finch_name, _name}
+      when is_atom(finch_name) and finch_name not in [nil, true, false] ->
+        {:ok, finch_name}
+
+      {nil, name} when is_atom(name) and name not in [nil, true, false] ->
+        {:ok, ConnectionSupervisor.finch_name(name)}
+
+      _other ->
+        {:error, :no_pool_name}
     end
   end
 

@@ -63,7 +63,13 @@ defmodule InfluxElixir.Client.Local.Scope do
   @spec resolve_database(keyword(), map()) ::
           {:ok, binary()} | {:error, :no_database_specified | map()}
   def resolve_database(opts, conn) do
-    case Keyword.get(opts, :database) || Map.get(conn, :database) do
+    database =
+      case Keyword.get(opts, :database) do
+        nil -> Map.get(conn, :database)
+        db -> db
+      end
+
+    case database do
       nil ->
         {:error, :no_database_specified}
 
@@ -140,5 +146,10 @@ defmodule InfluxElixir.Client.Local.Scope do
 
   @doc "`format:` as `Client.HTTP` sends it; see `InfluxElixir.Client.Local.Format`."
   @spec query_format(keyword()) :: term()
-  def query_format(opts), do: Keyword.get(opts, :format, :json)
+  def query_format(opts) do
+    case Keyword.get(opts, :format) do
+      nil -> :json
+      format -> format
+    end
+  end
 end

@@ -239,7 +239,16 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
 
   describe "start_link/1 with a config that names no connection" do
     test "is an error naming the config, never a raise" do
-      for config <- [:x, nil, [1], [host: "h"], [name: "not an atom"], [name: nil]] do
+      for config <- [
+            :x,
+            nil,
+            [1],
+            [host: "h"],
+            [name: "not an atom"],
+            [name: nil],
+            [name: false],
+            [name: true]
+          ] do
         assert InfluxElixir.ConnectionSupervisor.start_link(config) ===
                  {:error, {:invalid_options, config}}
       end

@@ -66,8 +66,12 @@ defmodule InfluxElixir.Write.Point do
   def new(measurement, fields, opts \\ []) do
     %__MODULE__{
       measurement: measurement,
-      fields: fields || %{},
-      tags: Keyword.get(opts, :tags) || %{},
+      fields: if(is_nil(fields), do: %{}, else: fields),
+      tags:
+        case Keyword.get(opts, :tags) do
+          nil -> %{}
+          tags -> tags
+        end,
       timestamp: Keyword.get(opts, :timestamp)
     }
   end

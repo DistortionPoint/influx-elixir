@@ -169,7 +169,7 @@ defmodule InfluxElixir do
   defp query_span(connection, opts, fun) do
     if connection?(connection) do
       metadata = %{
-        database: option(opts, :database) || Options.database(connection),
+        database: Options.database(opts, connection),
         transport: client()
       }
 
@@ -183,11 +183,6 @@ defmodule InfluxElixir do
   # list of other things is the caller's error to name, not a raise from inside a span.
   @spec connection?(term()) :: boolean()
   defp connection?(connection), do: is_map(connection) or Options.keyword?(connection)
-
-  # Options that are not a keyword list are the client's error to name; the span reads none.
-  defp option(opts, key) do
-    if Options.keyword?(opts), do: Keyword.get(opts, key)
-  end
 
   # ---------- Query — v3 SQL ----------
 

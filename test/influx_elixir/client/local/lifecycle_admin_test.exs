@@ -105,10 +105,18 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
       end
     end
 
-    test "an :org that is not a string is an ArgumentError at start, as the other options are" do
+    test "an :org or :databases that is not valid is an ArgumentError at start, including false" do
       # It was stored, and list_buckets raised from :crypto hashing it.
-      error = assert_raise ArgumentError, fn -> Local.start(profile: :v2, org: :acme) end
-      assert error.message === "invalid org: :org must be a string, got :acme"
+      for bad_org <- [:acme, false] do
+        error = assert_raise ArgumentError, fn -> Local.start(profile: :v2, org: bad_org) end
+        assert error.message === "invalid org: :org must be a string, got #{inspect(bad_org)}"
+      end
+
+      error = assert_raise ArgumentError, fn -> Local.start(databases: false) end
+
+      assert error.message ===
+               "invalid databases: :databases must be a list of strings and :database a string, " <>
+                 "got [databases: false]"
     end
 
     test "a connection whose starting process has exited is stopped with it" do

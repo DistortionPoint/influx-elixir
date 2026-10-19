@@ -186,7 +186,7 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
         {:error, %{status: 400, body: "Client.Local: the #{what} is not a string"}}
       end
 
-      for value <- [nil, 5, 1.5, :atom, ~c"text", %{}, {1}] do
+      for value <- [nil, false, 5, 1.5, :atom, ~c"text", %{}, {1}] do
         assert Local.query_sql(c, value, database: "utf8_iql") === refused.("SQL text")
         assert Local.execute_sql(c, value, database: "utf8_iql") === refused.("SQL text")
         assert Local.query_influxql(c, value, database: "utf8_iql") === refused.("InfluxQL text")
@@ -194,6 +194,16 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
         # `database: nil` is no option: the connection's database applies.
         if value != nil do
           assert Local.query_sql(c, "SELECT 1", database: value) === refused.("database name")
+
+          assert Local.query_influxql(c, "SELECT 1 FROM m", database: value) ===
+                   refused.("database name")
+
+          assert Local.query_influxql(c, "SHOW DATABASES", database: value) ===
+                   refused.("database name")
+
+          assert Local.query_influxql(c, "SELECT 1 FROM m", database: value, format: :xml) ===
+                   refused.("database name")
+
           assert Local.write(c, "m v=1", database: value) === refused.("database name")
         end
 
@@ -214,7 +224,7 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
     end
 
     test "as a write body (neither a string nor iodata) is refused by name", %{conn: c} do
-      for value <- [nil, 5, 1.5, :atom, %{}, {1}, [:a], [1 | :b]] do
+      for value <- [nil, false, 5, 1.5, :atom, %{}, {1}, [:a], [1 | :b]] do
         assert Local.write(c, value, database: "utf8_iql") ===
                  {:error, %{status: 400, body: "Client.Local: the line protocol is not a string"}}
       end
