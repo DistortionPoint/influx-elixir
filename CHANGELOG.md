@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.50] - 2026-10-19
+
 ### Fixed
 - **`database: false` fell back to the connection's default database.** `Client.HTTP` and
   `Client.Local` resolved `:database` with `Keyword.get(opts, :database) || ...`, so passing
