@@ -204,8 +204,8 @@ defmodule InfluxElixir.Write.WriterTest do
                {:ok, [row(1.0, 1), row(2.0, 2)]}
     end
 
-    test "a term that is no connection (a host name, a number) is invalid, never a raise" do
-      for connection <- ["hostname", 5, {:a}] do
+    test "a term that is no connection (a host name, a charlist, a number) is invalid, never a raise" do
+      for connection <- ["hostname", ~c"localhost", [1, 2], [:a | :b], 5, {:a}] do
         assert Writer.write(connection, "m v=1") === {:error, {:invalid_connection, connection}}
 
         assert InfluxElixir.write(connection, "m v=1") ===

@@ -57,6 +57,9 @@ defmodule InfluxElixir.Client.Local.Admin do
       {:error, error} ->
         {:error, {:unencodable_body, Exception.message(error)}}
     end
+  rescue
+    error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError, ArgumentError] ->
+      {:error, {:unencodable_body, Exception.message(error)}}
   end
 
   # The engine's JSON parser (serde_json) refuses a value of the wrong type with a 400 that

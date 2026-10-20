@@ -100,6 +100,30 @@ defmodule InfluxElixir.Flight.ClientTest do
       assert Client.query(conn, "SELECT 1", tls: false, timeout: 30_000) ===
                {:error, :no_addresses}
     end
+
+    test "a non-map connection or non-keyword opts returns a tagged error, never a raise" do
+      for bad_conn <- [[host: "localhost"], "localhost", :conn, 123] do
+        assert Client.query(bad_conn, "SELECT 1") === {:error, {:invalid_connection, bad_conn}}
+      end
+
+      conn = %{host: "localhost", port: 8181, token: "tok", database: "db"}
+
+      for bad_opts <- [%{}, :bad, "opts", [:a | :b], [1, 2]] do
+        assert Client.query(conn, "SELECT 1", bad_opts) === {:error, {:invalid_options, bad_opts}}
+      end
+    end
+
+    test "an invalid port is {:error, {:invalid_port, port}}, while port: nil defaults to 443" do
+      base = %{host: "localhost", token: "tok", database: "db"}
+
+      for bad_port <- [0, -1, 65_536, "8181", false, :port, {443}] do
+        assert Client.query(Map.put(base, :port, bad_port), "SELECT 1", tls: false) ===
+                 {:error, {:invalid_port, bad_port}}
+      end
+
+      assert Client.query(%{base | host: ""}, "SELECT 1", tls: false) ===
+               {:error, {:invalid_host, ""}}
+    end
   end
 
   # ---------------------------------------------------------------------------

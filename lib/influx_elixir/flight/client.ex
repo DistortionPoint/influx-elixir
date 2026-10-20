@@ -41,6 +41,7 @@ defmodule InfluxElixir.Flight.Client do
     * `:tls` — `true` to use TLS (default: `true` when port is 443)
   """
 
+  alias InfluxElixir.Client.Options
   alias InfluxElixir.Flight.Proto.{FlightData, FlightService, Ticket}
   alias InfluxElixir.Flight.Reader
 
@@ -118,7 +119,21 @@ defmodule InfluxElixir.Flight.Client do
       {:ok, rows} = InfluxElixir.Flight.Client.query(conn, "SELECT * FROM cpu LIMIT 5")
   """
   @spec query(connection(), binary(), keyword()) :: {:ok, [map()]} | {:error, term()}
-  def query(connection, sql, opts \\ []) do
+  def query(connection, sql, opts \\ [])
+
+  def query(connection, _sql, _opts) when not is_map(connection),
+    do: {:error, {:invalid_connection, connection}}
+
+  def query(connection, sql, opts) do
+    if Options.keyword?(opts) do
+      query_with_opts(connection, sql, opts)
+    else
+      {:error, {:invalid_options, opts}}
+    end
+  end
+
+  @spec query_with_opts(connection(), term(), keyword()) :: {:ok, [map()]} | {:error, term()}
+  defp query_with_opts(connection, sql, opts) do
     timeout = Keyword.get(opts, :timeout) || @default_timeout
 
     # Validate required keys eagerly before attempting any network calls.
@@ -130,9 +145,10 @@ defmodule InfluxElixir.Flight.Client do
     # The channel is closed on every path after connect, a raise included;
     # a failed DoGet used to leak it.
     with :ok <- check_host(host),
+         {:ok, port} <- check_port(Map.get(connection, :port)),
          :ok <- check_token(token),
          {:ok, payload} <- ticket_payload(database, sql),
-         {:ok, channel} <- open_channel(host, connection, opts) do
+         {:ok, channel} <- open_channel(host, port, opts) do
       try do
         with {:ok, flight_data_list} <- fetch(channel, token, payload, timeout) do
           Reader.decode_flight_data(flight_data_list)
@@ -162,6 +178,11 @@ defmodule InfluxElixir.Flight.Client do
 
   defp check_host(host), do: {:error, {:invalid_host, host}}
 
+  @spec check_port(term()) :: {:ok, pos_integer()} | {:error, {:invalid_port, term()}}
+  defp check_port(nil), do: {:ok, @default_port}
+  defp check_port(port) when is_integer(port) and port in 1..65_535, do: {:ok, port}
+  defp check_port(port), do: {:error, {:invalid_port, port}}
+
   @spec check_token(term()) :: :ok | {:error, {:invalid_token, term()}}
   defp check_token(token) when is_binary(token), do: :ok
   defp check_token(token), do: {:error, {:invalid_token, token}}
@@ -176,14 +197,13 @@ defmodule InfluxElixir.Flight.Client do
       {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
     end
   rescue
-    error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError] ->
+    error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError, ArgumentError] ->
       {:error, {:unencodable_body, Exception.message(error)}}
   end
 
-  @spec open_channel(binary(), connection(), keyword()) ::
+  @spec open_channel(binary(), pos_integer(), keyword()) ::
           {:ok, GRPC.Channel.t()} | {:error, term()}
-  defp open_channel(host, connection, opts) do
-    port = Map.get(connection, :port, @default_port)
+  defp open_channel(host, port, opts) do
     use_tls = Keyword.get(opts, :tls, port == 443)
     connect_timeout = resolve_connect_timeout(opts)
 

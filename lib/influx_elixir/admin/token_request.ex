@@ -55,6 +55,9 @@ defmodule InfluxElixir.Admin.TokenRequest do
       {:ok, body} -> {:ok, body}
       {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
     end
+  rescue
+    error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError, ArgumentError] ->
+      {:error, {:unencodable_body, Exception.message(error)}}
   end
 
   @spec parse_permissions(term()) :: {:ok, [Jason.OrderedObject.t()]} | {:error, term()}

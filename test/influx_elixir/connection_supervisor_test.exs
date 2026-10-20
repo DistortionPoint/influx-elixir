@@ -301,5 +301,25 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
 
       assert InfluxElixir.query_sql(name, "SELECT value FROM cpu") === {:ok, [%{"value" => 1}]}
     end
+
+    test "non-keyword batch_writer opts or BatchWriter.start_link/1 opts return validation error, never a raise" do
+      for bad_opts <- [false, :bad, "opts", [1, 2], [:a | :b]] do
+        assert {:error, %NimbleOptions.ValidationError{}} =
+                 InfluxElixir.Write.BatchWriter.start_link(bad_opts)
+
+        spec = InfluxElixir.Write.BatchWriter.child_spec(bad_opts)
+        assert spec.shutdown === 5_000
+      end
+
+      name = unique_name()
+
+      assert {:error,
+              {{:shutdown, {:failed_to_start_child, InfluxElixir.Write.BatchWriter, error}},
+               _child}} =
+               InfluxElixir.add_connection(name, database: "bw_bad_db", batch_writer: false)
+
+      assert %NimbleOptions.ValidationError{} = error
+      assert InfluxElixir.Connection.get(name) === {:error, :not_found}
+    end
   end
 end

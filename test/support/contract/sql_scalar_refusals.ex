@@ -1689,7 +1689,7 @@ defmodule InfluxElixir.Contract.SQLScalarRefusals do
       {:raw, "SELECT DISTINCT ALL n FROM main ORDER BY n",
        "unsupported DISTINCT query: select distinct all n from main order by n"},
       {:raw, "SELECT ALL n FROM main UNION ALL SELECT ALL n FROM main ORDER BY n",
-       "unsupported SQL construct UNION: select  n from main union all select  n from main order by n"},
+       "unsupported SQL construct UNION: select n from main union all select n from main order by n"},
       {:raw, "SELECT * EXCLUDE (n, time) FROM main ORDER BY host, v LIMIT 1",
        "a wildcard option (EXCLUDE, EXCEPT, REPLACE, RENAME or ILIKE) after *"},
       {:raw, "SELECT * EXCLUDE n FROM main ORDER BY time LIMIT 1",

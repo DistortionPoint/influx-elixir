@@ -235,6 +235,13 @@ defmodule InfluxElixir.Client.HTTP.Request do
 
   defp url_text?(value), do: is_binary(value) or is_atom(value) or is_number(value)
 
+  # A connection for `Client.HTTP` is a keyword list; anything else (a `Client.Local` map, a
+  # host name, a number) has no config keys to read: the caller's error, never a raise.
+  @spec connection(term()) :: :ok | {:error, {:invalid_connection, term()}}
+  def connection(conn) do
+    if Options.keyword?(conn), do: :ok, else: {:error, {:invalid_connection, conn}}
+  end
+
   # Options that are not a keyword list have nothing a request could be built from: the
   # caller's error, never a raise.
   @spec options(term()) :: :ok | {:error, {:invalid_options, term()}}

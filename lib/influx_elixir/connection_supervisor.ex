@@ -60,6 +60,7 @@ defmodule InfluxElixir.ConnectionSupervisor do
 
   use Supervisor
 
+  alias InfluxElixir.Client.Options
   alias InfluxElixir.ConnectionSupervisor.{Registration, Secret}
 
   @doc """
@@ -175,10 +176,12 @@ defmodule InfluxElixir.ConnectionSupervisor do
         ]
   defp children(config, {name, _client, _conn} = registration, finch_name, pool_size) do
     finch_children =
-      if Keyword.get(config, :finch_name) do
-        []
-      else
-        [{Finch, name: finch_name, pools: %{default: [size: pool_size]}}]
+      case Keyword.get(config, :finch_name) do
+        pool when is_atom(pool) and pool not in [nil, true, false] ->
+          []
+
+        _no_external_pool ->
+          [{Finch, name: finch_name, pools: %{default: [size: pool_size]}}]
       end
 
     writer_children =
@@ -187,10 +190,12 @@ defmodule InfluxElixir.ConnectionSupervisor do
           []
 
         batch_opts ->
-          [
-            {InfluxElixir.Write.BatchWriter,
-             Keyword.merge(batch_opts, connection: name, name: batch_writer_name(name))}
-          ]
+          opts =
+            if Options.keyword?(batch_opts),
+              do: Keyword.merge(batch_opts, connection: name, name: batch_writer_name(name)),
+              else: batch_opts
+
+          [{InfluxElixir.Write.BatchWriter, opts}]
       end
 
     [{Registration, registration}] ++ finch_children ++ writer_children

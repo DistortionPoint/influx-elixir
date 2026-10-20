@@ -578,6 +578,10 @@ defmodule InfluxElixir.Client.Local do
   @impl true
   @spec init_connection(keyword()) :: {:ok, conn()} | {:error, Exception.t()}
   def init_connection(config) do
+    unless Options.keyword?(config) do
+      raise ArgumentError, "invalid options: expected a keyword list, got #{inspect(config)}"
+    end
+
     start(
       database: Keyword.get(config, :database),
       databases: Keyword.get(config, :databases, []),
@@ -718,7 +722,11 @@ defmodule InfluxElixir.Client.Local do
   Returns `true` if the given operation is supported by the connection's profile.
   """
   @spec supports?(conn(), atom()) :: boolean()
-  def supports?(%{profile: _profile} = conn, operation), do: Scope.supports?(conn, operation)
+  def supports?(%{table: _table, profile: profile} = conn, operation) do
+    valid_conn?(conn, profile) and Scope.supports?(conn, operation)
+  end
+
+  def supports?(_conn, _operation), do: false
 
   @doc """
   Stops a `Client.Local` instance and deletes its ETS table.
@@ -730,6 +738,7 @@ defmodule InfluxElixir.Client.Local do
   """
   @spec stop(conn()) :: :ok
   def stop(%{table: table}), do: Store.drop(table)
+  def stop(_conn), do: :ok
 
   # ---------------------------------------------------------------------------
   # Write
@@ -924,13 +933,29 @@ defmodule InfluxElixir.Client.Local do
   # with it) is refused by name, as `Client.HTTP` names a pool that is not running, never an
   # `ArgumentError` from ETS. A stop that lands while an operation runs is not covered.
   @spec live(term(), (-> result)) :: result | {:error, map()} when result: term()
-  defp live(%{table: table}, run) do
-    if Store.alive?(table), do: run.(), else: refused("the connection is stopped")
+  defp live(%{table: table, profile: profile} = conn, run) do
+    cond do
+      not valid_conn?(conn, profile) ->
+        refused("the connection is not one Client.Local.start/1 returned")
+
+      Store.alive?(table) ->
+        run.()
+
+      true ->
+        refused("the connection is stopped")
+    end
   end
 
   # A connection `start/1` did not return (a keyword list for `Client.HTTP`, a host name) has
   # no store to use: refused by name, never a FunctionClauseError.
   defp live(_conn, _run), do: refused("the connection is not one Client.Local.start/1 returned")
+
+  @spec valid_conn?(map(), term()) :: boolean()
+  defp valid_conn?(conn, profile) do
+    Scope.profile?(profile) and
+      is_binary(Map.get(conn, :org, "local")) and
+      (is_binary(Map.get(conn, :database)) or is_nil(Map.get(conn, :database)))
+  end
 
   @spec options(term(), (-> result)) :: result | {:error, map()} when result: term()
   defp options(opts, run),

@@ -40,7 +40,7 @@ description: Core InfluxElixir project rules, architecture, hygiene, and workflo
 
 ## Git, Releases & Documentation Hygiene
 
-- **Git & CI Safety**: NEVER commit or push to git without explicit user confirmation.
+- **Git & CI Safety**: **NEVER** push to git (`git push` is strictly forbidden — the user handles all pushes; do not run or offer `git push`). Never commit to git without explicit user confirmation.
   - **CRITICAL**: Pushing to `main` triggers `.github/workflows/ci.yml`, which automatically bumps the patch version in `mix.exs`, dates `CHANGELOG.md`, commits back to `main`, and publishes a new release to Hex.pm.
   - **Doc-Only Commits**: Any commit containing only documentation or markdown changes must include `[skip ci]` in the commit message so CI does not cut an empty Hex release.
   - **Sync Before Sweeps**: Before starting a sweep or updating `CHANGELOG.md`, run `git fetch` and `git log HEAD..origin/main` to check if CI published a `Release v...` commit and reconcile `(unreleased)` markers.

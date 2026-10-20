@@ -82,6 +82,7 @@ defmodule InfluxElixir.Client.HTTP do
     only: [
       conn_val: 2,
       conn_val: 3,
+      connection: 1,
       decode_json: 1,
       delete_named: 4,
       get: 3,
@@ -103,23 +104,25 @@ defmodule InfluxElixir.Client.HTTP do
   # ---------------------------------------------------------------------------
 
   @impl true
-  @spec init_connection(keyword()) :: {:ok, keyword()}
+  @spec init_connection(keyword()) :: {:ok, keyword()} | {:error, {:invalid_connection, term()}}
   def init_connection(config) do
     # Mirror Client.Local: when :database (singular) is absent but
     # :databases (list) is provided, default the connection-level
     # database to the first item so resolve_database/2 picks it up.
-    case Keyword.get(config, :database) do
-      nil ->
-        case Keyword.get(config, :databases) do
-          [first | _rest] when is_binary(first) ->
-            {:ok, Keyword.put(config, :database, first)}
+    with :ok <- connection(config) do
+      case Keyword.get(config, :database) do
+        nil ->
+          case Keyword.get(config, :databases) do
+            [first | _rest] when is_binary(first) ->
+              {:ok, Keyword.put(config, :database, first)}
 
-          _other ->
-            {:ok, config}
-        end
+            _other ->
+              {:ok, config}
+          end
 
-      _existing ->
-        {:ok, config}
+        _existing ->
+          {:ok, config}
+      end
     end
   end
 
@@ -135,7 +138,8 @@ defmodule InfluxElixir.Client.HTTP do
   @spec write(InfluxElixir.Client.connection(), iodata(), keyword()) ::
           InfluxElixir.Client.write_result()
   def write(connection, line_protocol, opts \\ []) do
-    with :ok <- options(opts),
+    with :ok <- connection(connection),
+         :ok <- options(opts),
          {:ok, body} <- iodata_body(line_protocol),
          {:ok, database} <- resolve_database(opts, connection),
          precision = Keyword.get(opts, :precision, "nanosecond"),
@@ -222,7 +226,8 @@ defmodule InfluxElixir.Client.HTTP do
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_sql(connection, sql, opts \\ []) do
-    with :ok <- options(opts) do
+    with :ok <- connection(connection),
+         :ok <- options(opts) do
       case Keyword.get(opts, :transport, :http) do
         :flight -> flight_query_sql(connection, sql, opts)
         :http -> http_query_sql(connection, sql, opts)
@@ -245,7 +250,7 @@ defmodule InfluxElixir.Client.HTTP do
         host: conn_val(connection, :host),
         token: conn_val(connection, :token, ""),
         database: database,
-        port: Keyword.get(opts, :flight_port, conn_val(connection, :flight_port, 443))
+        port: resolve_flight_port(opts, connection)
       }
 
       InfluxElixir.Flight.Client.query(
@@ -253,6 +258,14 @@ defmodule InfluxElixir.Client.HTTP do
         sql,
         flight_opts(opts, connection)
       )
+    end
+  end
+
+  @spec resolve_flight_port(keyword(), keyword()) :: term()
+  defp resolve_flight_port(opts, connection) do
+    case Keyword.get(opts, :flight_port) do
+      nil -> conn_val(connection, :flight_port, 443)
+      port -> port
     end
   end
 
@@ -331,7 +344,8 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: Enumerable.t()
   def query_sql_stream(connection, sql, opts \\ []) do
-    with :ok <- options(opts),
+    with :ok <- connection(connection),
+         :ok <- options(opts),
          {:ok, database} <- resolve_database(opts, connection),
          {:ok, body} <- sql_request_body(database, sql, opts, "jsonl"),
          {:ok, finch_name} <- Request.resolve_finch(connection) do
@@ -355,7 +369,8 @@ defmodule InfluxElixir.Client.HTTP do
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map() | [map()]} | {:error, term()}
   def execute_sql(connection, sql, opts \\ []) do
-    with :ok <- options(opts),
+    with :ok <- connection(connection),
+         :ok <- options(opts),
          {:ok, database} <- resolve_database(opts, connection),
          {:ok, body} <- sql_request_body(database, sql, opts, nil),
          # A SELECT answers rows, typed like `query_sql/3` rows; a summary map
@@ -392,7 +407,9 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: InfluxElixir.Client.query_result()
   def query_influxql(connection, influxql, opts \\ []) do
-    with :ok <- options(opts), do: influxql_request(connection, influxql, opts)
+    with :ok <- connection(connection),
+         :ok <- options(opts),
+         do: influxql_request(connection, influxql, opts)
   end
 
   @spec influxql_request(keyword(), term(), keyword()) :: InfluxElixir.Client.query_result()
@@ -429,7 +446,8 @@ defmodule InfluxElixir.Client.HTTP do
   @spec query_flux(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
   def query_flux(connection, flux, opts \\ []) do
-    with :ok <- options(opts),
+    with :ok <- connection(connection),
+         :ok <- options(opts),
          org = Keyword.get(opts, :org, conn_val(connection, :org, "")),
          :ok <- url_values(org: org),
          do: flux_request(connection, flux, org, opts)
@@ -462,7 +480,9 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: :ok | {:error, term()}
   def create_database(connection, name, opts \\ []) do
-    with :ok <- options(opts), do: create_database_request(connection, name, opts)
+    with :ok <- connection(connection),
+         :ok <- options(opts),
+         do: create_database_request(connection, name, opts)
   end
 
   @spec create_database_request(keyword(), term(), keyword()) :: :ok | {:error, term()}
@@ -486,7 +506,8 @@ defmodule InfluxElixir.Client.HTTP do
   @spec list_databases(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
   def list_databases(connection) do
-    with {:ok, %Finch.Response{body: resp_body}} <-
+    with :ok <- connection(connection),
+         {:ok, %Finch.Response{body: resp_body}} <-
            get(connection, "/api/v3/configure/database?format=json", [200]),
          {:ok, rows} <- decode_json(resp_body) do
       database_names(rows)
@@ -506,7 +527,8 @@ defmodule InfluxElixir.Client.HTTP do
   @spec delete_database(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_database(connection, name) do
-    delete_named(connection, "/api/v3/configure/database", "db", name)
+    with :ok <- connection(connection),
+         do: delete_named(connection, "/api/v3/configure/database", "db", name)
   end
 
   # ---------------------------------------------------------------------------
@@ -520,18 +542,24 @@ defmodule InfluxElixir.Client.HTTP do
           keyword()
         ) :: :ok | {:error, term()}
   def create_bucket(connection, name, opts \\ []) do
-    with :ok <- options(opts), do: Buckets.create(connection, name, opts)
+    with :ok <- connection(connection),
+         :ok <- options(opts),
+         do: Buckets.create(connection, name, opts)
   end
 
   @impl true
   @spec list_buckets(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
-  def list_buckets(connection), do: Buckets.list(connection)
+  def list_buckets(connection) do
+    with :ok <- connection(connection), do: Buckets.list(connection)
+  end
 
   @impl true
   @spec delete_bucket(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
-  def delete_bucket(connection, bucket), do: Buckets.delete(connection, bucket)
+  def delete_bucket(connection, bucket) do
+    with :ok <- connection(connection), do: Buckets.delete(connection, bucket)
+  end
 
   # ---------------------------------------------------------------------------
   # Admin — v3 tokens
@@ -546,7 +574,8 @@ defmodule InfluxElixir.Client.HTTP do
   # The token endpoints are the ones InfluxDB 3 Core and Enterprise serve
   # (verified); `InfluxElixir.Admin.TokenRequest` builds the request.
   def create_token(connection, name, opts \\ []) do
-    with :ok <- options(opts),
+    with :ok <- connection(connection),
+         :ok <- options(opts),
          {:ok, {_kind, path, body}} <- TokenRequest.build(name, opts),
          {:ok, %Finch.Response{body: resp_body}} <-
            post_json(connection, path, body, opts, [200, 201]) do
@@ -558,7 +587,8 @@ defmodule InfluxElixir.Client.HTTP do
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_token(connection, name) do
-    delete_named(connection, "/api/v3/configure/token", "token_name", name)
+    with :ok <- connection(connection),
+         do: delete_named(connection, "/api/v3/configure/token", "token_name", name)
   end
 
   # ---------------------------------------------------------------------------
@@ -569,7 +599,8 @@ defmodule InfluxElixir.Client.HTTP do
   @spec health(InfluxElixir.Client.connection()) ::
           {:ok, map()} | {:error, term()}
   def health(connection) do
-    with {:ok, %Finch.Response{body: resp_body}} <- get(connection, "/health", [200]) do
+    with :ok <- connection(connection),
+         {:ok, %Finch.Response{body: resp_body}} <- get(connection, "/health", [200]) do
       # A 200 with a body that is no JSON object (older builds answer plain text, `OK`) is
       # still a passing health check.
       case Jason.decode(resp_body) do

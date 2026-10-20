@@ -316,7 +316,7 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
 
   # The space that stood before `ALL` stands before what follows it, if anything did.
   @spec drop_space([token()], [token()]) :: [token()]
-  defp drop_space(blank, [{:space, _text} | _more] = more), do: blank ++ more
+  defp drop_space(blank, [{:space, _text} | more]), do: blank ++ more
   defp drop_space(blank, more), do: blank ++ more
 
   # ---------------------------------------------------------------------------

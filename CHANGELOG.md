@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.HTTP`, `Flight.Client`, and `Writer` raised on non-keyword connections or invalid Flight ports.**
+  `Client.HTTP` now checks `Options.keyword?(connection)` on every callback and returns
+  `{:error, {:invalid_connection, connection}}` (or raises `InfluxElixir.StreamError` on
+  enumeration for `query_sql_stream/3`). `Writer.write/3` rejects non-keyword list connections
+  such as charlists or improper lists, and `Flight.Client.query/3` validates `is_map(connection)`,
+  `Options.keyword?(opts)`, and `port in 1..65_535` (with `nil`-only fallback for `:flight_port`
+  in `Client.HTTP`).
+- **`TokenRequest.build/2` and `Client.Local.create_database/3` did not rescue `Jason.encode/1` raises.**
+  Passing an improper list or a map with non-string/atom keys in `expiry_secs:` or `retention:`
+  now returns `{:error, {:unencodable_body, message}}` instead of raising `FunctionClauseError` or
+  `Protocol.UndefinedError`.
+- **`Client.Local`, `BatchWriter`, and `ConnectionSupervisor` raised on malformed connections or non-keyword options.**
+  `Client.Local` now validates `:profile`, `:org`, and `:database` in `live/2`, `supports?/2`,
+  `stop/1`, and `init_connection/1`. `BatchWriter.start_link/1`, `BatchWriter.child_spec/1`, and
+  `ConnectionSupervisor` guard against non-keyword `batch_writer:` options and boolean
+  `:finch_name` values, and `Client.Local.SQLRewrite` drops the duplicate space after `SELECT ALL`.
+
 ## [0.1.50] - 2026-10-19
 
 ### Fixed

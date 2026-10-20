@@ -91,10 +91,21 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
                "Client.Local.start/1 returned"
          }}
 
-      for conn <- [[host: "h", token: "t"], :x, nil, %{profile: :v3_core}] do
+      for conn <- [
+            [host: "h", token: "t"],
+            :x,
+            nil,
+            %{profile: :v3_core},
+            %{table: :ets.new(:t, [:set])},
+            %{table: :ets.new(:t, [:set]), profile: :bad},
+            %{table: :ets.new(:t, [:set]), profile: :v2, org: 123},
+            %{table: :ets.new(:t, [:set]), profile: :v3_core, database: 123}
+          ] do
         assert Local.health(conn) === refused
         assert Local.write(conn, "m v=1i 1", database: "d") === refused
         assert Local.query_sql(conn, "SELECT 1", database: "d") === refused
+        assert Local.stop(conn) === :ok
+        refute Local.supports?(conn, :query_sql)
 
         error =
           assert_raise InfluxElixir.StreamError, fn ->
@@ -102,6 +113,20 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
           end
 
         assert {error.status, error.body} === {400, elem(refused, 1).body}
+      end
+    end
+
+    test "init_connection/1 with non-keyword config or unencodable retention returns {:error, _}, never a raise",
+         %{conn: conn} do
+      for bad_config <- [:bad, "config", %{}, [1, 2], [:a | :b]] do
+        assert {:error, %ArgumentError{}} = Local.init_connection(bad_config)
+      end
+
+      for bad_retention <- [[1 | 2], %{{1, 2} => 3}] do
+        assert {:error, {:unencodable_body, msg}} =
+                 Local.create_database(conn, "ret_db", retention: bad_retention)
+
+        assert is_binary(msg)
       end
     end
 

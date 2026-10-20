@@ -356,4 +356,53 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
       assert answered(take_one, 200, {:chunks, chunks}) === {[%{"v" => 1}], {:messages, []}}
     end
   end
+
+  describe "a connection that is not a keyword list" do
+    test "every Client.HTTP callback returns {:invalid_connection, conn}, never a raise" do
+      for conn <- [%{table: :local}, "localhost", 123, ~c"localhost", [:a | :b]] do
+        expected = {:error, {:invalid_connection, conn}}
+
+        assert HTTP.init_connection(conn) === expected
+        assert HTTP.write(conn, "m v=1i") === expected
+        assert HTTP.query_sql(conn, "SELECT 1") === expected
+        assert HTTP.execute_sql(conn, "SELECT 1") === expected
+        assert HTTP.query_influxql(conn, "SELECT 1") === expected
+        assert HTTP.query_flux(conn, ~s[from(bucket: "b")]) === expected
+        assert HTTP.create_database(conn, "db") === expected
+        assert HTTP.list_databases(conn) === expected
+        assert HTTP.delete_database(conn, "db") === expected
+        assert HTTP.create_bucket(conn, "b") === expected
+        assert HTTP.list_buckets(conn) === expected
+        assert HTTP.delete_bucket(conn, "b") === expected
+        assert HTTP.create_token(conn, "tok") === expected
+        assert HTTP.delete_token(conn, "tok") === expected
+        assert HTTP.health(conn) === expected
+
+        stream = HTTP.query_sql_stream(conn, "SELECT 1")
+
+        assert %StreamError{kind: :invalid_request, reason: {:invalid_connection, ^conn}} =
+                 catch_error(Enum.to_list(stream))
+      end
+    end
+
+    test "create_token with an improper list or non-string map key in expiry_secs returns unencodable_body" do
+      conn = connection(finch_name: absent_pool())
+
+      for bad <- [[1 | 2], %{{1, 2} => 3}] do
+        assert {:error, {:unencodable_body, msg}} =
+                 HTTP.create_token(conn, "tok", expiry_secs: bad)
+
+        assert is_binary(msg)
+      end
+    end
+
+    test "query_sql over flight rejects non-integer or out-of-range flight_port including false" do
+      conn = connection(finch_name: absent_pool())
+
+      for bad_port <- [false, 0, -1, 65_536, "8181"] do
+        assert HTTP.query_sql(conn, "SELECT 1", transport: :flight, flight_port: bad_port) ===
+                 {:error, {:invalid_port, bad_port}}
+      end
+    end
+  end
 end
