@@ -230,6 +230,20 @@ defmodule InfluxElixir.Write.LineProtocolTest do
       point = %Point{measurement: "cpu", fields: %{"v" => 1.0}, timestamp: "bad"}
       assert LineProtocol.encode(point) === {:error, {:invalid_timestamp, "bad"}}
     end
+
+    test "returns {:error, {:invalid_options, opts}} for boolean precision or invalid options" do
+      point = Point.new("cpu", %{"v" => 1.0})
+
+      for opts <- [
+            :bad,
+            [precision: false],
+            [precision: true],
+            [precision: 123],
+            [api_version: :v1]
+          ] do
+        assert LineProtocol.encode(point, opts) === {:error, {:invalid_options, opts}}
+      end
+    end
   end
 
   # Verified against InfluxDB 3: each of these lines is rejected by the

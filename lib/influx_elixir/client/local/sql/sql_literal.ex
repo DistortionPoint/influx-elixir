@@ -127,7 +127,7 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
         double_past_integers(n, text)
 
       _no_int ->
-        case Float.parse(text) do
+        case safe_float_parse(text) do
           {f, ""} -> f
           _no_parse -> text
         end
@@ -156,7 +156,7 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
       |> String.replace(~r/^(-?)\./u, "\\g{1}0.")
       |> String.replace(~r/\.(?=[eE]|$)/u, ".0")
 
-    case Float.parse(normal) do
+    case safe_float_parse(normal) do
       {value, ""} -> value
       _overflow -> :nonfinite
     end
@@ -172,8 +172,15 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
   @spec parse_float(binary()) :: {float(), binary()} | :error
   def parse_float(text) do
     if float?(text),
-      do: text |> String.replace(~r/^(-?)\./u, "\\g{1}0.") |> Float.parse(),
+      do: text |> String.replace(~r/^(-?)\./u, "\\g{1}0.") |> safe_float_parse(),
       else: :error
+  end
+
+  @spec safe_float_parse(binary()) :: {float(), binary()} | :error
+  defp safe_float_parse(text) do
+    Float.parse(text)
+  rescue
+    ArgumentError -> :error
   end
 
   @doc "Whether the text is an integer literal."

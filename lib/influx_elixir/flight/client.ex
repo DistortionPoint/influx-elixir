@@ -125,16 +125,32 @@ defmodule InfluxElixir.Flight.Client do
     do: {:error, {:invalid_connection, connection}}
 
   def query(connection, sql, opts) do
-    if Options.keyword?(opts) do
+    if Options.keyword?(opts) and valid_options?(opts) do
       query_with_opts(connection, sql, opts)
     else
       {:error, {:invalid_options, opts}}
     end
   end
 
+  @spec valid_options?(keyword()) :: boolean()
+  defp valid_options?(opts) do
+    valid_timeout_opt?(Keyword.get(opts, :timeout)) and
+      valid_timeout_opt?(Keyword.get(opts, :connect_timeout)) and
+      valid_tls_opt?(Keyword.get(opts, :tls))
+  end
+
+  @spec valid_timeout_opt?(term()) :: boolean()
+  defp valid_timeout_opt?(nil), do: true
+  defp valid_timeout_opt?(:infinity), do: true
+  defp valid_timeout_opt?(timeout), do: is_integer(timeout) and timeout >= 0
+
+  @spec valid_tls_opt?(term()) :: boolean()
+  defp valid_tls_opt?(nil), do: true
+  defp valid_tls_opt?(tls), do: is_boolean(tls)
+
   @spec query_with_opts(connection(), term(), keyword()) :: {:ok, [map()]} | {:error, term()}
   defp query_with_opts(connection, sql, opts) do
-    timeout = Keyword.get(opts, :timeout) || @default_timeout
+    timeout = resolve_timeout(opts)
 
     # Validate required keys eagerly before attempting any network calls.
     # Map.fetch!/2 raises KeyError with a clear message if a key is missing.
@@ -204,7 +220,12 @@ defmodule InfluxElixir.Flight.Client do
   @spec open_channel(binary(), pos_integer(), keyword()) ::
           {:ok, GRPC.Channel.t()} | {:error, term()}
   defp open_channel(host, port, opts) do
-    use_tls = Keyword.get(opts, :tls, port == 443)
+    use_tls =
+      case Keyword.get(opts, :tls) do
+        nil -> port == 443
+        tls -> tls
+      end
+
     connect_timeout = resolve_connect_timeout(opts)
 
     addr = "#{host}:#{port}"
@@ -224,13 +245,22 @@ defmodule InfluxElixir.Flight.Client do
     bounded_connect(fn -> GRPC.Stub.connect(addr, grpc_opts) end, connect_timeout)
   end
 
+  @spec resolve_timeout(keyword()) :: timeout()
+  defp resolve_timeout(opts) do
+    case Keyword.get(opts, :timeout) do
+      nil -> @default_timeout
+      timeout -> timeout
+    end
+  end
+
   @doc false
   # Resolves the connect-phase timeout: :connect_timeout → :timeout → default.
-  @spec resolve_connect_timeout(keyword()) :: non_neg_integer()
+  @spec resolve_connect_timeout(keyword()) :: timeout()
   def resolve_connect_timeout(opts) do
-    Keyword.get(opts, :connect_timeout) ||
-      Keyword.get(opts, :timeout) ||
-      @default_timeout
+    case Keyword.get(opts, :connect_timeout) do
+      nil -> resolve_timeout(opts)
+      connect_timeout -> connect_timeout
+    end
   end
 
   @doc false
@@ -243,7 +273,7 @@ defmodule InfluxElixir.Flight.Client do
   # The process is monitored, never linked: a raise, a throw or an exit inside `fun` (the
   # gRPC client raises on an address it cannot read) is the caller's
   # `{:error, {:connect_failed, message}}`, never its crash, whether or not it traps exits.
-  @spec bounded_connect((-> result), non_neg_integer()) ::
+  @spec bounded_connect((-> result), timeout()) ::
           result | {:error, :connect_timeout | {:connect_failed, binary()}}
         when result: term()
   def bounded_connect(fun, timeout) when is_function(fun, 0),
@@ -257,7 +287,7 @@ defmodule InfluxElixir.Flight.Client do
   # Runs `fun` in a monitored process for at most `timeout` ms: its result, `on_timeout` past
   # the bound, or `{:error, {failure, message}}` when it raises, throws or exits. A result
   # that comes too late is handed to `release` and dropped.
-  @spec bounded((-> result), non_neg_integer(), term(), atom(), (result -> :ok)) ::
+  @spec bounded((-> result), timeout(), term(), atom(), (result -> :ok)) ::
           result | term()
         when result: term()
   defp bounded(fun, timeout, on_timeout, failure, release) do
@@ -308,7 +338,7 @@ defmodule InfluxElixir.Flight.Client do
   # gRPC deadline is only a request header and a silent peer never answers it. Past the
   # bound the process is killed and the answer is `{:error, :timeout}`; the caller closes the
   # channel.
-  @spec fetch(GRPC.Channel.t(), binary(), binary(), non_neg_integer()) ::
+  @spec fetch(GRPC.Channel.t(), binary(), binary(), timeout()) ::
           {:ok, [FlightData.t()]} | {:error, term()}
   defp fetch(channel, token, payload, timeout) do
     fn -> do_get(channel, token, payload, timeout) end
@@ -316,7 +346,7 @@ defmodule InfluxElixir.Flight.Client do
     |> normalize_error()
   end
 
-  @spec do_get(GRPC.Channel.t(), binary(), binary(), non_neg_integer()) ::
+  @spec do_get(GRPC.Channel.t(), binary(), binary(), timeout()) ::
           {:ok, [FlightData.t()]} | {:error, term()}
   defp do_get(channel, token, payload, timeout) do
     call_opts = [timeout: timeout, metadata: auth_metadata(token)]
@@ -333,16 +363,17 @@ defmodule InfluxElixir.Flight.Client do
   defp auth_metadata(""), do: []
   defp auth_metadata(token), do: [{"authorization", "Bearer " <> token}]
 
+  @doc false
   # A failed call is the shape the HTTP transport gives: `%{status: http_status, body: message}`.
   # The gRPC status becomes the nearest HTTP one (listed in `query/3`'s doc); an expired
   # deadline is `:timeout`.
   @spec normalize_error(term()) :: term()
-  defp normalize_error({:error, %GRPC.RPCError{status: 4}}), do: {:error, :timeout}
+  def normalize_error({:error, %GRPC.RPCError{status: 4}}), do: {:error, :timeout}
 
-  defp normalize_error({:error, %GRPC.RPCError{status: status, message: message}}),
+  def normalize_error({:error, %GRPC.RPCError{status: status, message: message}}),
     do: {:error, %{status: http_status(status), body: message}}
 
-  defp normalize_error(other), do: other
+  def normalize_error(other), do: other
 
   @spec http_status(integer()) :: pos_integer()
   defp http_status(3), do: 400
@@ -355,8 +386,9 @@ defmodule InfluxElixir.Flight.Client do
   defp http_status(14), do: 503
   defp http_status(_other), do: 500
 
+  @doc false
   @spec collect_stream(Enumerable.t()) :: {:ok, [FlightData.t()]} | {:error, term()}
-  defp collect_stream(stream) do
+  def collect_stream(stream) do
     result =
       Enum.reduce_while(stream, {:ok, []}, fn
         {:ok, %FlightData{} = fd}, {:ok, acc} ->

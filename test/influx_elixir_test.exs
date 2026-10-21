@@ -169,20 +169,42 @@ defmodule InfluxElixirTest do
       assert InfluxElixir.query_sql(name, "SELECT v FROM wb") === {:ok, [%{"v" => 1}]}
     end
 
-    test "options that are not a keyword list are an error", %{name: name} do
-      assert InfluxElixir.write_batched(name, "wb v=1i 1000", :sync) ===
-               {:error, {:invalid_options, :sync}}
+    test "options that are not a keyword list or have invalid :sync or :timeout are an error",
+         %{name: name} do
+      for bad_opts <- [
+            :sync,
+            [sync: nil],
+            [sync: "false"],
+            [sync: :yes],
+            [timeout: false],
+            [timeout: -1],
+            [timeout: "60000"]
+          ] do
+        assert InfluxElixir.write_batched(name, "wb v=1i 1000", bad_opts) ===
+                 {:error, {:invalid_options, bad_opts}}
+      end
+
+      assert InfluxElixir.write_batched(name, "wb v=1i 1000", timeout: :infinity) === :ok
     end
 
-    test "a connection without a batch writer has none to write to" do
+    test "a connection without a batch writer, or a non-name connection, has none to write to",
+         %{conn: conn} do
       name = :"write_batched_none_#{System.unique_integer([:positive])}"
       {:ok, _pid} = InfluxElixir.add_connection(name, database: "wb")
       on_exit(fn -> InfluxElixir.remove_connection(name) end)
 
-      assert InfluxElixir.write_batched(name, "wb v=1i 1000") === {:error, :no_batch_writer}
-
-      assert InfluxElixir.write_batched(:never_registered_for_batching, "x v=1i") ===
-               {:error, :no_batch_writer}
+      for no_writer <- [
+            name,
+            :never_registered_for_batching,
+            nil,
+            true,
+            false,
+            conn,
+            [host: "h"]
+          ] do
+        assert InfluxElixir.write_batched(no_writer, "wb v=1i 1000") ===
+                 {:error, :no_batch_writer}
+      end
     end
   end
 
@@ -393,11 +415,33 @@ defmodule InfluxElixirTest do
       assert InfluxElixir.stats(name) === {:error, :no_batch_writer}
     end
 
-    test "an unregistered connection name has no batch writer" do
+    test "an unregistered connection name or non-name connection has no batch writer",
+         %{conn: conn} do
       name = :"never_registered_#{System.unique_integer([:positive])}"
 
-      assert InfluxElixir.flush(name) === {:error, :no_batch_writer}
-      assert InfluxElixir.stats(name) === {:error, :no_batch_writer}
+      for no_writer <- [name, nil, true, false, conn, [host: "h"]] do
+        assert InfluxElixir.flush(no_writer) === {:error, :no_batch_writer}
+        assert InfluxElixir.stats(no_writer) === {:error, :no_batch_writer}
+      end
+
+      for bad_timeout <- [false, nil, -1, "5000"] do
+        assert InfluxElixir.flush(name, bad_timeout) === {:error, {:invalid_timeout, bad_timeout}}
+        assert InfluxElixir.stats(name, bad_timeout) === {:error, {:invalid_timeout, bad_timeout}}
+      end
+    end
+
+    test "flush/2 and stats/2 accept :infinity as timeout" do
+      name = :"infinity_writer_#{System.unique_integer([:positive])}"
+
+      {:ok, _pid} =
+        InfluxElixir.add_connection(name, batch_writer: [flush_interval_ms: 600_000])
+
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+
+      assert InfluxElixir.flush(name, :infinity) === :ok
+
+      assert InfluxElixir.stats(name, :infinity) ===
+               {:ok, %{total_writes: 0, total_errors: 0, total_bytes: 0}}
     end
 
     # The writer answers the calls it has taken before it stops; a call still in its mailbox
@@ -487,8 +531,25 @@ defmodule InfluxElixirTest do
   end
 
   describe "resolve_connection/1" do
-    test "passes through a keyword config unchanged", %{conn: conn} do
-      assert InfluxElixir.resolve_connection(conn) === conn
+    test "passes through a keyword config, map, nil, or boolean unchanged", %{conn: conn} do
+      for passthrough <- [conn, [host: "h"], nil, true, false] do
+        assert InfluxElixir.resolve_connection(passthrough) === passthrough
+      end
+
+      for bad_conn <- [nil, true, false] do
+        assert InfluxElixir.write(bad_conn, "cpu v=1i") ===
+                 {:error, {:invalid_connection, bad_conn}}
+
+        assert InfluxElixir.query_sql(bad_conn, "SELECT 1") ===
+                 {:error, {:invalid_connection, bad_conn}}
+
+        assert InfluxElixir.health(bad_conn) ===
+                 {:error,
+                  %{
+                    status: 400,
+                    body: "Client.Local: the connection is not one Client.Local.start/1 returned"
+                  }}
+      end
     end
 
     test "resolves an atom name via Connection registry" do

@@ -230,9 +230,10 @@ defmodule InfluxElixir.Write.LineProtocol do
     api_version = if Keyword.keyword?(opts), do: Keyword.get(opts, :api_version, :v3)
     precision = if Keyword.keyword?(opts), do: Keyword.get(opts, :precision)
 
-    if api_version in [:v3, :v2] and (is_atom(precision) or is_binary(precision)),
-      do: {:ok, %{divisor: timestamp_divisor(precision), kinds: @kinds[api_version]}},
-      else: {:error, {:invalid_options, opts}}
+    if api_version in [:v3, :v2] and
+         ((is_atom(precision) and not is_boolean(precision)) or is_binary(precision)),
+       do: {:ok, %{divisor: timestamp_divisor(precision), kinds: @kinds[api_version]}},
+       else: {:error, {:invalid_options, opts}}
   end
 
   # Nanoseconds per unit of the write's precision; a `DateTime` is divided

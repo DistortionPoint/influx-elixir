@@ -4,7 +4,7 @@ defmodule InfluxElixir.Flight.ClientTest do
   doctest InfluxElixir.Flight.Client, only: [build_ticket_payload: 2, build_ticket: 2]
 
   alias InfluxElixir.Flight.Client
-  alias InfluxElixir.Flight.Proto.Ticket
+  alias InfluxElixir.Flight.Proto.{FlightData, Ticket}
   alias InfluxElixir.TestSupport.{Await, ClosedPort}
 
   describe "build_ticket_payload/2" do
@@ -101,16 +101,49 @@ defmodule InfluxElixir.Flight.ClientTest do
                {:error, :no_addresses}
     end
 
-    test "a non-map connection or non-keyword opts returns a tagged error, never a raise" do
+    test "a non-map connection or invalid options returns a tagged error, never a raise" do
       for bad_conn <- [[host: "localhost"], "localhost", :conn, 123] do
         assert Client.query(bad_conn, "SELECT 1") === {:error, {:invalid_connection, bad_conn}}
       end
 
       conn = %{host: "localhost", port: 8181, token: "tok", database: "db"}
 
-      for bad_opts <- [%{}, :bad, "opts", [:a | :b], [1, 2]] do
+      for bad_opts <- [
+            %{},
+            :bad,
+            "opts",
+            [:a | :b],
+            [1, 2],
+            [timeout: false],
+            [timeout: -1],
+            [timeout: "30s"],
+            [connect_timeout: false],
+            [connect_timeout: -1],
+            [connect_timeout: "5s"],
+            [tls: "false"],
+            [tls: 1]
+          ] do
         assert Client.query(conn, "SELECT 1", bad_opts) === {:error, {:invalid_options, bad_opts}}
       end
+    end
+
+    @tag :capture_log
+    test "tls: nil uses port-based TLS default and timeout: :infinity is accepted" do
+      conn = %{
+        host: "127.0.0.1",
+        token: "tok",
+        database: "db",
+        port: ClosedPort.port()
+      }
+
+      assert Client.query(conn, "SELECT 1", tls: nil, timeout: :infinity, connect_timeout: 5_000) ===
+               {:error, :no_addresses}
+
+      assert Client.query(conn, "SELECT 1", tls: true, timeout: :infinity, connect_timeout: 5_000) ===
+               {:error, :no_addresses}
+
+      assert Client.query(%{conn | host: "a" <> <<0xFF>>}, "SELECT 1", tls: false) ===
+               {:error, {:invalid_host, "a" <> <<0xFF>>}}
     end
 
     test "an invalid port is {:error, {:invalid_port, port}}, while port: nil defaults to 443" do
@@ -164,7 +197,8 @@ defmodule InfluxElixir.Flight.ClientTest do
             {fn -> raise "boom" end, "** (RuntimeError) boom"},
             {fn -> throw(:x) end, "** (throw) :x"},
             {fn -> exit(:boom) end, "** (exit) :boom"},
-            {fn -> exit(:normal) end, "** (exit) normal"}
+            {fn -> exit(:normal) end, "** (exit) normal"},
+            {fn -> Process.exit(self(), :kill) end, "killed"}
           ] do
         assert Client.bounded_connect(fun, Await.bound()) === {:error, {:connect_failed, banner}}
       end
@@ -188,8 +222,50 @@ defmodule InfluxElixir.Flight.ClientTest do
       assert Client.bounded_connect(fn -> Process.sleep(:infinity) end, 50) ===
                {:error, :connect_timeout}
 
+      assert Client.bounded_connect(fn -> {:ok, :late} end, 0) ===
+               {:error, :connect_timeout}
+
       # The process is gone and the caller's mailbox holds nothing of it.
       assert Process.info(self(), :messages) === {:messages, []}
+    end
+  end
+
+  describe "normalize_error/1 and collect_stream/1" do
+    test "maps gRPC status codes to HTTP equivalents and deadline exceeded to :timeout" do
+      assert Client.normalize_error({:error, %GRPC.RPCError{status: 4, message: "deadline"}}) ===
+               {:error, :timeout}
+
+      for {grpc_status, http_status} <- [
+            {3, 400},
+            {5, 404},
+            {6, 409},
+            {7, 403},
+            {8, 429},
+            {12, 501},
+            {13, 500},
+            {14, 503},
+            {16, 401},
+            {2, 500}
+          ] do
+        err = %GRPC.RPCError{status: grpc_status, message: "msg-#{grpc_status}"}
+
+        assert Client.normalize_error({:error, err}) ===
+                 {:error, %{status: http_status, body: "msg-#{grpc_status}"}}
+      end
+
+      assert Client.normalize_error({:ok, []}) === {:ok, []}
+      assert Client.normalize_error({:error, :timeout}) === {:error, :timeout}
+    end
+
+    test "collect_stream/1 accumulates FlightData chunks in order and halts on error" do
+      fd1 = %FlightData{data_header: "h1", data_body: "b1"}
+      fd2 = %FlightData{data_header: "h2", data_body: "b2"}
+
+      assert Client.collect_stream([{:ok, fd1}, {:ok, fd2}]) === {:ok, [fd1, fd2]}
+      assert Client.collect_stream([]) === {:ok, []}
+
+      assert Client.collect_stream([{:ok, fd1}, {:error, :stream_failed}, {:ok, fd2}]) ===
+               {:error, :stream_failed}
     end
   end
 end

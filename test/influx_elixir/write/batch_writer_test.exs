@@ -1251,5 +1251,21 @@ defmodule InfluxElixir.Write.BatchWriterTest do
       assert BatchWriter.stats(pid) === stats(0, 1, 0)
       refute_request_after_stop()
     end
+
+    test "child_spec non-keyword fallback, empty write_sync, direct non-binary admit, and default backoff_delay",
+         %{finch: finch} do
+      assert BatchWriter.child_spec(:not_keyword) === %{
+               id: BatchWriter,
+               start: {BatchWriter, :start_link, [:not_keyword]},
+               shutdown: 5_000
+             }
+
+      assert BatchWriter.backoff_delay(2, 0, 100) === 400
+
+      pid = start_http_writer(finch, TestServer.controlled(), max_retries: 0)
+      assert BatchWriter.write_sync(pid, "") === :ok
+      assert GenServer.call(pid, {:write, 123}) === {:error, {:invalid_payload, 123}}
+      assert GenServer.call(pid, {:write_sync, 123}) === {:error, {:invalid_payload, 123}}
+    end
   end
 end

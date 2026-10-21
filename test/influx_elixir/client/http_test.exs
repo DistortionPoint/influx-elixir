@@ -298,6 +298,13 @@ defmodule InfluxElixir.Client.HTTPTest do
         assert HTTP.delete_database(conn, value) === {:error, {:invalid_value, :name, value}}
         assert HTTP.delete_token(conn, value) === {:error, {:invalid_value, :name, value}}
         assert HTTP.delete_bucket(conn, value) === {:error, {:invalid_value, :bucket, value}}
+
+        bad_org_conn = conn ++ [api_version: :v2, org: value]
+
+        assert HTTP.write(bad_org_conn, "m f=1") === {:error, {:invalid_value, :org, value}}
+        assert HTTP.create_bucket(bad_org_conn, "b") === {:error, {:invalid_value, :org, value}}
+        assert HTTP.list_buckets(bad_org_conn) === {:error, {:invalid_value, :org, value}}
+        assert HTTP.delete_bucket(bad_org_conn, "b") === {:error, {:invalid_value, :org, value}}
       end
     end
 

@@ -362,6 +362,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
       {value, ""} -> "Float64(" <> plain(value) <> ")"
       _unreadable -> :unknown
     end
+  rescue
+    ArgumentError -> :unknown
   end
 
   # A float as Rust's `Display` writes it: the shortest digits that read back, never an exponent.

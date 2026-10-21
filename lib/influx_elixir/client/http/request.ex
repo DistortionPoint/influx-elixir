@@ -154,20 +154,34 @@ defmodule InfluxElixir.Client.HTTP.Request do
 
   # The receive timeout in milliseconds. Precedence:
   #   opts[:timeout] → connection[:timeout] → @default_timeout
-  @spec resolve_timeout(keyword(), keyword()) :: non_neg_integer()
+  @spec resolve_timeout(keyword(), keyword()) :: timeout()
   def resolve_timeout(opts, connection) do
-    Keyword.get(opts, :timeout) ||
-      Keyword.get(connection, :timeout) ||
-      @default_timeout
+    case Keyword.get(opts, :timeout) do
+      nil ->
+        case Keyword.get(connection, :timeout) do
+          nil -> @default_timeout
+          timeout -> timeout
+        end
+
+      timeout ->
+        timeout
+    end
   end
 
   # The pool checkout timeout in milliseconds. Precedence:
   #   opts[:pool_timeout] → connection[:pool_timeout] → @default_pool_timeout
-  @spec resolve_pool_timeout(keyword(), keyword()) :: non_neg_integer()
+  @spec resolve_pool_timeout(keyword(), keyword()) :: timeout()
   def resolve_pool_timeout(opts, connection) do
-    Keyword.get(opts, :pool_timeout) ||
-      Keyword.get(connection, :pool_timeout) ||
-      @default_pool_timeout
+    case Keyword.get(opts, :pool_timeout) do
+      nil ->
+        case Keyword.get(connection, :pool_timeout) do
+          nil -> @default_pool_timeout
+          pool_timeout -> pool_timeout
+        end
+
+      pool_timeout ->
+        pool_timeout
+    end
   end
 
   # The pool of a connection: its `:finch_name`, else the pool the supervisor started for its
@@ -239,15 +253,47 @@ defmodule InfluxElixir.Client.HTTP.Request do
   # host name, a number) has no config keys to read: the caller's error, never a raise.
   @spec connection(term()) :: :ok | {:error, {:invalid_connection, term()}}
   def connection(conn) do
-    if Options.keyword?(conn), do: :ok, else: {:error, {:invalid_connection, conn}}
+    if Options.keyword?(conn) and valid_connection?(conn),
+      do: :ok,
+      else: {:error, {:invalid_connection, conn}}
+  end
+
+  @spec valid_connection?(keyword()) :: boolean()
+  defp valid_connection?(conn) do
+    Keyword.get(conn, :api_version, :v3) in [nil, :v2, :v3] and
+      url_text?(Keyword.get(conn, :scheme)) and
+      url_text?(Keyword.get(conn, :host)) and
+      url_text?(Keyword.get(conn, :port)) and
+      url_text?(Keyword.get(conn, :token)) and
+      valid_timeout_opt?(Keyword.get(conn, :timeout)) and
+      valid_timeout_opt?(Keyword.get(conn, :pool_timeout))
   end
 
   # Options that are not a keyword list have nothing a request could be built from: the
   # caller's error, never a raise.
   @spec options(term()) :: :ok | {:error, {:invalid_options, term()}}
   def options(opts) do
-    if Options.keyword?(opts), do: :ok, else: {:error, {:invalid_options, opts}}
+    if Options.keyword?(opts) and valid_options?(opts),
+      do: :ok,
+      else: {:error, {:invalid_options, opts}}
   end
+
+  @spec valid_options?(keyword()) :: boolean()
+  defp valid_options?(opts) do
+    valid_timeout_opt?(Keyword.get(opts, :timeout)) and
+      valid_timeout_opt?(Keyword.get(opts, :pool_timeout)) and
+      valid_timeout_opt?(Keyword.get(opts, :connect_timeout)) and
+      valid_tls_opt?(Keyword.get(opts, :tls))
+  end
+
+  @spec valid_timeout_opt?(term()) :: boolean()
+  defp valid_timeout_opt?(nil), do: true
+  defp valid_timeout_opt?(:infinity), do: true
+  defp valid_timeout_opt?(timeout), do: is_integer(timeout) and timeout >= 0
+
+  @spec valid_tls_opt?(term()) :: boolean()
+  defp valid_tls_opt?(nil), do: true
+  defp valid_tls_opt?(tls), do: is_boolean(tls)
 
   # A request body is JSON, which holds only UTF-8 text: text that is not is
   # the caller's error, returned as one, never a `Jason.EncodeError` raised.

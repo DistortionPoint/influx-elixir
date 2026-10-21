@@ -40,12 +40,13 @@ description: Core InfluxElixir project rules, architecture, hygiene, and workflo
 
 ## Git, Releases & Documentation Hygiene
 
-- **Git & CI Safety**: **NEVER** push to git (`git push` is strictly forbidden — the user handles all pushes; do not run or offer `git push`). Never commit to git without explicit user confirmation.
+- **Git & CI Safety**: **NEVER** push to git (`git push` is strictly forbidden — the user handles all pushes; do not run or offer `git push`). Always commit to git (`git add -A && git commit ...`) automatically at the end of each unit of work or review sweep after all quality gates pass.
   - **CRITICAL**: Pushing to `main` triggers `.github/workflows/ci.yml`, which automatically bumps the patch version in `mix.exs`, dates `CHANGELOG.md`, commits back to `main`, and publishes a new release to Hex.pm.
   - **Doc-Only Commits**: Any commit containing only documentation or markdown changes must include `[skip ci]` in the commit message so CI does not cut an empty Hex release.
   - **Sync Before Sweeps**: Before starting a sweep or updating `CHANGELOG.md`, run `git fetch` and `git log HEAD..origin/main` to check if CI published a `Release v...` commit and reconcile `(unreleased)` markers.
-  - **Commit Carries Everything**: When committing (with user confirmation), stage the entire working tree (`git add -A`) so pre-existing working tree changes are never left behind.
+  - **Commit Carries Everything**: When committing, stage the entire working tree (`git add -A`) so pre-existing working tree changes are never left behind.
   - **One PR for All Open Issues**: When resolving open GitHub issues, resolve all open issues in a single PR rather than proposing to split by risk.
+- **No Planning/Review Docs for Bugs or Issues**: Never write `docs/design/` planning or review markdown files for bug fixes, routine review sweeps, or GitHub issues. Only update `CHANGELOG.md` and relevant API docs.
 - **Docs Are First-Class**: Stale documentation, `README.md`, `CHANGELOG.md`, or `usage-rules/` entries are bugs and must be fixed immediately alongside code changes.
 
 ## Project Overview & Context

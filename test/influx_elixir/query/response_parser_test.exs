@@ -242,10 +242,14 @@ defmodule InfluxElixir.Query.ResponseParserTest do
     end
 
     test "a typed cell that does not parse falls back to the raw string" do
-      body = "#datatype,string,double,long\n,result,ratio,count\n,_result,abc,1.5\n"
+      huge = String.duplicate("9", 310)
+
+      body =
+        "#datatype,string,double,double,long\n,result,ratio,huge,count\n,_result,abc,#{huge},1.5\n"
 
       assert ResponseParser.parse(body, :flux_csv) ===
-               {:ok, [%{"result" => "_result", "ratio" => "abc", "count" => "1.5"}]}
+               {:ok,
+                [%{"result" => "_result", "ratio" => "abc", "huge" => huge, "count" => "1.5"}]}
     end
 
     test "types long, unsignedLong and boolean columns" do
@@ -282,6 +286,13 @@ defmodule InfluxElixir.Query.ResponseParserTest do
     test "returns error" do
       assert {:error, {:unsupported_format, :xml}} =
                ResponseParser.parse("", :xml)
+    end
+
+    test "returns {:invalid_body, body} when body is not a binary across all formats" do
+      for format <- [:json, :jsonl, :csv, :flux_csv, :parquet],
+          body <- [nil, 123, %{"a" => 1}, [:list]] do
+        assert ResponseParser.parse(body, format) === {:error, {:invalid_body, body}}
+      end
     end
   end
 

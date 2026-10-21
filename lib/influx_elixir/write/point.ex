@@ -64,15 +64,18 @@ defmodule InfluxElixir.Write.Point do
   """
   @spec new(String.t(), %{String.t() => field_value()} | nil, keyword()) :: t()
   def new(measurement, fields, opts \\ []) do
+    {tags, timestamp} =
+      if InfluxElixir.Client.Options.keyword?(opts) do
+        {Keyword.get(opts, :tags), Keyword.get(opts, :timestamp)}
+      else
+        {{:invalid_options, opts}, nil}
+      end
+
     %__MODULE__{
       measurement: measurement,
       fields: if(is_nil(fields), do: %{}, else: fields),
-      tags:
-        case Keyword.get(opts, :tags) do
-          nil -> %{}
-          tags -> tags
-        end,
-      timestamp: Keyword.get(opts, :timestamp)
+      tags: if(is_nil(tags), do: %{}, else: tags),
+      timestamp: timestamp
     }
   end
 end

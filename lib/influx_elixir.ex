@@ -68,7 +68,7 @@ defmodule InfluxElixir do
   """
   @spec resolve_connection(atom() | InfluxElixir.Client.connection()) ::
           InfluxElixir.Client.connection()
-  def resolve_connection(name) when is_atom(name) do
+  def resolve_connection(name) when is_atom(name) and name not in [nil, true, false] do
     InfluxElixir.Connection.fetch!(name)
   end
 
@@ -445,20 +445,37 @@ defmodule InfluxElixir do
   """
   @spec write_batched(atom(), iodata() | Point.t() | [Point.t()], keyword()) ::
           :ok | {:error, term()}
-  def write_batched(connection_name, payload, opts \\ []) when is_atom(connection_name) do
-    if Options.keyword?(opts) do
-      sync = Keyword.get(opts, :sync, false)
-      timeout = Keyword.get(opts, :timeout) || if(sync, do: 300_000, else: 60_000)
-
+  def write_batched(connection_name, payload, opts \\ []) do
+    with {:ok, sync, timeout} <- batch_write_options(opts) do
       with_batch_writer(connection_name, fn writer ->
         if sync,
           do: BatchWriter.write_sync(writer, payload, timeout),
           else: BatchWriter.write(writer, payload, timeout)
       end)
-    else
-      {:error, {:invalid_options, opts}}
     end
   end
+
+  @spec batch_write_options(term()) ::
+          {:ok, boolean(), timeout()} | {:error, {:invalid_options, term()}}
+  defp batch_write_options(opts) do
+    with true <- Options.keyword?(opts),
+         sync when is_boolean(sync) <- Keyword.get(opts, :sync, false),
+         {:ok, timeout} <- resolve_batch_timeout(Keyword.get(opts, :timeout), sync) do
+      {:ok, sync, timeout}
+    else
+      _invalid -> {:error, {:invalid_options, opts}}
+    end
+  end
+
+  @spec resolve_batch_timeout(term(), boolean()) :: {:ok, timeout()} | :error
+  defp resolve_batch_timeout(nil, true), do: {:ok, 300_000}
+  defp resolve_batch_timeout(nil, false), do: {:ok, 60_000}
+  defp resolve_batch_timeout(:infinity, _sync), do: {:ok, :infinity}
+
+  defp resolve_batch_timeout(timeout, _sync) when is_integer(timeout) and timeout >= 0,
+    do: {:ok, timeout}
+
+  defp resolve_batch_timeout(_timeout, _sync), do: :error
 
   @doc """
   Forces an immediate flush of the batch writer for a connection.
@@ -470,9 +487,13 @@ defmodule InfluxElixir do
   bounds the underlying `GenServer.call`. See `BatchWriter.flush/2`
   for the default and semantics.
   """
-  @spec flush(atom(), timeout()) :: :ok | {:error, :no_batch_writer}
+  @spec flush(atom(), timeout()) :: :ok | {:error, :no_batch_writer | {:invalid_timeout, term()}}
   def flush(connection_name, timeout \\ 60_000) do
-    with_batch_writer(connection_name, &BatchWriter.flush(&1, timeout))
+    if valid_timeout?(timeout) do
+      with_batch_writer(connection_name, &BatchWriter.flush(&1, timeout))
+    else
+      {:error, {:invalid_timeout, timeout}}
+    end
   end
 
   @doc """
@@ -482,10 +503,19 @@ defmodule InfluxElixir do
   batch writer is configured for the given connection. The optional `timeout`
   (default `5_000` ms) bounds the call.
   """
-  @spec stats(atom(), timeout()) :: {:ok, map()} | {:error, :no_batch_writer}
+  @spec stats(atom(), timeout()) ::
+          {:ok, map()} | {:error, :no_batch_writer | {:invalid_timeout, term()}}
   def stats(connection_name, timeout \\ 5_000) do
-    with_batch_writer(connection_name, &BatchWriter.stats(&1, timeout))
+    if valid_timeout?(timeout) do
+      with_batch_writer(connection_name, &BatchWriter.stats(&1, timeout))
+    else
+      {:error, {:invalid_timeout, timeout}}
+    end
   end
+
+  @spec valid_timeout?(term()) :: boolean()
+  defp valid_timeout?(:infinity), do: true
+  defp valid_timeout?(timeout), do: is_integer(timeout) and timeout >= 0
 
   # A process that is gone, or stopped as a supervisor stops it, rather than one that crashed.
   defguardp stopped(reason)
@@ -495,9 +525,10 @@ defmodule InfluxElixir do
   # Runs `fun` with the connection's batch writer, if it has one. A writer that stops between
   # the lookup and the call, or with the call in its mailbox (it answers the calls it has taken
   # before it stops), is no writer. A timeout is the caller's bound, and exits as documented.
-  @spec with_batch_writer(atom(), (atom() -> result)) :: result | {:error, :no_batch_writer}
+  @spec with_batch_writer(term(), (atom() -> result)) :: result | {:error, :no_batch_writer}
         when result: term()
-  defp with_batch_writer(connection_name, fun) do
+  defp with_batch_writer(connection_name, fun)
+       when is_atom(connection_name) and connection_name not in [nil, true, false] do
     writer = InfluxElixir.ConnectionSupervisor.batch_writer_name(connection_name)
 
     if Process.whereis(writer) do
@@ -511,6 +542,8 @@ defmodule InfluxElixir do
       {:error, :no_batch_writer}
     end
   end
+
+  defp with_batch_writer(_connection_name, _fun), do: {:error, :no_batch_writer}
 
   # ---------- Dynamic Connections ----------
 

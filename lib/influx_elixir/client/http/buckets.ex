@@ -51,9 +51,10 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
     end
   end
 
-  @spec lookup_org_id(keyword(), binary()) :: {:ok, map()} | {:error, term()}
+  @spec lookup_org_id(keyword(), term()) :: {:ok, map()} | {:error, term()}
   defp lookup_org_id(connection, org) do
-    with {:ok, %Finch.Response{body: body}} <-
+    with :ok <- Request.url_values(org: org),
+         {:ok, %Finch.Response{body: body}} <-
            Request.get(connection, "/api/v2/orgs?org=#{Request.query_value(org)}", [200]),
          {:ok, %{"orgs" => [%{"id" => id} | _rest]}} <- Request.decode_json(body) do
       {:ok, %{"orgID" => id}}
@@ -65,17 +66,20 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
 
   @doc false
   @spec list(keyword()) :: {:ok, [map()]} | {:error, term()}
-  def list(connection), do: list_pages(connection, 0, [])
+  def list(connection) do
+    with {:ok, org_query} <- org_param(connection),
+         do: list_pages(connection, 0, org_query, [])
+  end
 
-  @spec list_pages(keyword(), non_neg_integer(), [[map()]]) ::
+  @spec list_pages(keyword(), non_neg_integer(), binary(), [[map()]]) ::
           {:ok, [map()]} | {:error, term()}
-  defp list_pages(connection, offset, pages) do
-    path = "/api/v2/buckets?limit=#{@bucket_page}&offset=#{offset}" <> org_param(connection)
+  defp list_pages(connection, offset, org_query, pages) do
+    path = "/api/v2/buckets?limit=#{@bucket_page}&offset=#{offset}" <> org_query
 
     with {:ok, %Finch.Response{body: resp_body}} <- Request.get(connection, path, [200]),
          {:ok, %{"buckets" => page}} when is_list(page) <- Request.decode_json(resp_body) do
       if length(page) == @bucket_page,
-        do: list_pages(connection, offset + @bucket_page, [page | pages]),
+        do: list_pages(connection, offset + @bucket_page, org_query, [page | pages]),
         else: {:ok, [page | pages] |> Enum.reverse() |> Enum.concat()}
     else
       {:ok, other} -> {:error, {:unexpected_response, other}}
@@ -86,11 +90,16 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
   # Buckets are named per org: without the connection's org a name (or a
   # listing) spans every org the token can read, and `delete_bucket/2`
   # deleted another org's bucket of the same name (verified).
-  @spec org_param(keyword()) :: binary()
+  @spec org_param(keyword()) :: {:ok, binary()} | {:error, term()}
   defp org_param(connection) do
     case Request.conn_val(connection, :org, "") do
-      "" -> ""
-      org -> "&org=" <> Request.query_value(org)
+      org when org in [nil, ""] ->
+        {:ok, ""}
+
+      org ->
+        with :ok <- Request.url_values(org: org) do
+          {:ok, "&org=" <> Request.query_value(org)}
+        end
     end
   end
 
@@ -133,12 +142,12 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
 
   @spec lookup_bucket_id(keyword(), binary()) :: {:ok, binary()} | {:error, term()}
   defp lookup_bucket_id(connection, name) do
-    path = "/api/v2/buckets?name=#{Request.query_value(name)}" <> org_param(connection)
-
     # Scoped to an org, the server answers a missing name with a 404 of its
     # own rather than an empty list; both are this client's "not found". A
     # 404 for the org itself is passed on as the server's answer.
-    with {:ok, %Finch.Response{body: body}} <- Request.get(connection, path, [200]),
+    with {:ok, org_query} <- org_param(connection),
+         path = "/api/v2/buckets?name=#{Request.query_value(name)}" <> org_query,
+         {:ok, %Finch.Response{body: body}} <- Request.get(connection, path, [200]),
          {:ok, %{"buckets" => [%{"id" => id} | _rest]}} <- Request.decode_json(body) do
       {:ok, id}
     else

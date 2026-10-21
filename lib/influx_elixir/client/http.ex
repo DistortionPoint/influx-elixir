@@ -144,7 +144,10 @@ defmodule InfluxElixir.Client.HTTP do
          {:ok, database} <- resolve_database(opts, connection),
          precision = Keyword.get(opts, :precision, "nanosecond"),
          flags = write_flags(connection, opts),
-         :ok <- url_values([database: database, precision: precision] ++ flags) do
+         :ok <-
+           url_values(
+             [database: database, precision: precision] ++ write_org(connection) ++ flags
+           ) do
       url =
         for {key, value} <- flags,
             into: write_url(connection, database, precision),
@@ -208,8 +211,22 @@ defmodule InfluxElixir.Client.HTTP do
     end
   end
 
+  @spec write_org(keyword()) :: keyword()
+  defp write_org(connection) do
+    if api_version(connection) == :v2 do
+      [org: conn_val(connection, :org, "")]
+    else
+      []
+    end
+  end
+
   @spec api_version(keyword()) :: :v2 | :v3
-  defp api_version(connection), do: conn_val(connection, :api_version, :v3)
+  defp api_version(connection) do
+    case conn_val(connection, :api_version, :v3) do
+      :v2 -> :v2
+      _v3_or_nil -> :v3
+    end
+  end
 
   @spec v2_precision(atom() | binary()) :: binary()
   defp v2_precision(p) when p in [:nanosecond, "nanosecond", :ns, "ns"], do: "ns"

@@ -91,6 +91,19 @@ defmodule InfluxElixir.Write.PointTest do
 
       assert InfluxElixir.Write.LineProtocol.encode(bad_tags) ===
                {:error, {:invalid_point, bad_tags}}
+
+      for bad_opts <- [:not_opts, 123, ~c"abc", [:a | :b]] do
+        bad_point = Point.new("m", %{"f" => 1}, bad_opts)
+
+        assert bad_point === %Point{
+                 measurement: "m",
+                 fields: %{"f" => 1},
+                 tags: {:invalid_options, bad_opts}
+               }
+
+        assert InfluxElixir.Write.LineProtocol.encode(bad_point) ===
+                 {:error, {:invalid_point, bad_point}}
+      end
     end
   end
 end

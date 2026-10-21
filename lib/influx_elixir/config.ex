@@ -212,9 +212,19 @@ defmodule InfluxElixir.Config do
   """
   @spec base_url(keyword()) :: binary()
   def base_url(opts) do
-    scheme = Keyword.get(opts, :scheme, :https)
-    host = Keyword.get(opts, :host)
-    port = Keyword.get(opts, :port, 8086)
-    "#{scheme}://#{host}:#{port}"
+    if InfluxElixir.Client.Options.keyword?(opts) do
+      scheme = url_piece(Keyword.get(opts, :scheme, :https))
+      host = url_piece(Keyword.get(opts, :host))
+      port = url_piece(Keyword.get(opts, :port, 8086))
+      "#{scheme}://#{host}:#{port}"
+    else
+      "https://:8086"
+    end
   end
+
+  @spec url_piece(term()) :: binary()
+  defp url_piece(value) when is_binary(value) or is_atom(value) or is_number(value),
+    do: to_string(value)
+
+  defp url_piece(_other), do: ""
 end

@@ -242,5 +242,10 @@ defmodule InfluxElixir.ConfigTest do
       assert Config.base_url(host: "h", scheme: :http) === "http://h:8086"
       assert Config.base_url(host: "h", port: 80) === "https://h:80"
     end
+
+    test "never raises when given non-keyword options or non-text values" do
+      assert Config.base_url(:not_a_keyword_list) === "https://:8086"
+      assert Config.base_url(host: %{}, scheme: {1}, port: [1]) === "://:"
+    end
   end
 end

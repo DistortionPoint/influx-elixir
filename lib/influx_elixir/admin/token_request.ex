@@ -14,6 +14,8 @@ defmodule InfluxElixir.Admin.TokenRequest do
   #     `{"token_name": ..., "permissions": [...], "expiry_secs": ...}`
   #     (Enterprise only; Core answers 404 `Not found`)
 
+  alias InfluxElixir.Client.Options
+
   @admin_path "/api/v3/configure/token/named_admin"
   @resource_path "/api/v3/enterprise/configure/token"
 
@@ -29,8 +31,22 @@ defmodule InfluxElixir.Admin.TokenRequest do
   """
   @spec build(binary(), keyword()) ::
           {:ok, {kind(), binary(), binary()}}
-          | {:error, {:invalid_permission, term()} | {:unencodable_body, binary()}}
+          | {:error,
+             {:invalid_options, term()}
+             | {:invalid_permission, term()}
+             | {:unencodable_body, binary()}}
   def build(name, opts) do
+    if Options.keyword?(opts) do
+      build_for_opts(name, opts)
+    else
+      {:error, {:invalid_options, opts}}
+    end
+  end
+
+  @spec build_for_opts(binary(), keyword()) ::
+          {:ok, {kind(), binary(), binary()}}
+          | {:error, {:invalid_permission, term()} | {:unencodable_body, binary()}}
+  defp build_for_opts(name, opts) do
     expiry = Keyword.get(opts, :expiry_secs)
 
     case Keyword.get(opts, :permissions, []) do

@@ -149,14 +149,6 @@ defmodule InfluxElixir.Client.HTTP.Stream do
       {:DOWN, ^monitor, :process, ^producer, :normal} ->
         {:halt, %{state | phase: :halt}}
 
-      # The producer crashed. A pool checkout timeout surfaces here because
-      # Finch raises inside the producer; report it by name.
-      {:DOWN, ^monitor, :process, ^producer, {%error_module{} = error, _stack}}
-      when error_module in [RuntimeError, ArgumentError] ->
-        raise InfluxElixir.StreamError,
-          kind: :transport,
-          reason: Request.classify_finch_error(error)
-
       {:DOWN, ^monitor, :process, ^producer, reason} ->
         raise InfluxElixir.StreamError, kind: :transport, reason: reason
     end
@@ -238,7 +230,7 @@ defmodule InfluxElixir.Client.HTTP.Stream do
   # the mailbox when it is flushed.
   @cancel_grace_ms 1_000
 
-  @spec stream_cleanup(stream_state() | term()) :: :ok
+  @spec stream_cleanup(stream_state()) :: :ok
   defp stream_cleanup(%{producer: producer, ref: ref, monitor: monitor}) do
     if Process.alive?(producer) do
       send(producer, {:cancel, ref})
@@ -248,8 +240,6 @@ defmodule InfluxElixir.Client.HTTP.Stream do
     Process.demonitor(monitor, [:flush])
     flush_ref(ref)
   end
-
-  defp stream_cleanup(_state), do: :ok
 
   @spec await_down(pid(), reference()) :: :ok
   defp await_down(producer, monitor) do

@@ -4,6 +4,7 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
   doctest InfluxElixir.Client.Local, only: [start: 1]
 
   alias InfluxElixir.Client.Local
+  alias InfluxElixir.Client.Local.{SQLDmlItem, SQLLiteral}
   alias InfluxElixir.TestSupport.Await
 
   setup do
@@ -384,6 +385,27 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
 
       assert Local.query_sql(conn, "SELECT host FROM m", database: db) ===
                {:ok, [%{"host" => "c"}]}
+    end
+
+    test "309+-digit integer literals and strings never raise ArgumentError in SQL helpers",
+         %{conn: conn, db: db} do
+      huge = String.duplicate("9", 310)
+      {:ok, :written} = Local.write(conn, "m,host=a v=1i", database: db)
+
+      assert SQLLiteral.float_value(huge) === :nonfinite
+      assert SQLLiteral.parse_float(huge <> ".0") === :error
+      assert SQLLiteral.coerce(huge <> "abc") === huge <> "abc"
+      assert SQLDmlItem.number(huge) === :unknown
+
+      assert {:ok, []} =
+               Local.query_sql(conn, "SELECT * FROM m WHERE v = #{huge}", database: db)
+
+      assert {:ok, []} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM m WHERE v IN ('#{huge}', '1') AND v IN (2, 3)",
+                 database: db
+               )
     end
   end
 

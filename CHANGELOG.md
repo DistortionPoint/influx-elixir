@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Float.parse/1` raised `ArgumentError` on >=309-digit integer strings in `SQLLiteral`, `SQLDmlItem`, `SQLContradict`, and `ResponseParser`.**
+  `SQLLiteral` (`float_value/1`, `coerce/1`, `parse_float/1`), `SQLDmlItem.number/1`,
+  `SQLContradict` (`texts?/2`, `textual?/2`), and `ResponseParser` (`:flux_csv` `"double"` cells)
+  now rescue `ArgumentError` when `Float.parse/1` overflows `f64`, returning `:nonfinite`,
+  `:unknown`, `false`, or the raw string instead of crashing.
+- **`ResponseParser.parse/2`, `Point.new/3`, and `LineProtocol.encode/2` raised or accepted invalid inputs.**
+  `ResponseParser.parse/2` now returns `{:error, {:invalid_body, body}}` when `body` is not a
+  binary across all formats. `Point.new/3` guards `Options.keyword?(opts)` so non-keyword `opts`
+  never raise `FunctionClauseError` and are rejected by `LineProtocol.encode/2` with
+  `{:error, {:invalid_point, point}}`. `LineProtocol.encode/2` now rejects `precision: false` and
+  `precision: true` with `{:error, {:invalid_options, opts}}`.
+- **`Config.base_url/1`, `Client.HTTP`, `Client.HTTP.Request`, and `Client.HTTP.Buckets` could raise on non-text connection or `:org` fields.**
+  `Config.base_url/1` now safely formats non-keyword options or non-text `:scheme`, `:host`, and
+  `:port` values without raising. `Request.connection/1` validates `:api_version`, `:scheme`,
+  `:host`, `:port`, and `:token`, `Client.HTTP.write/3` (`api_version: :v2`) and
+  `Client.HTTP.Buckets` validate `:org` with `Request.url_values/1` and treat `org: nil` as `""`,
+  and `Client.HTTP.Stream` drops two unreachable dead clauses.
+- **`InfluxElixir`, `Flight.Client`, `Client.HTTP.Request`, and `Admin.TokenRequest` raised or coalesced `false` on boundary connection names, timeouts, and options.**
+  `InfluxElixir.resolve_connection/1` now excludes `nil`, `true`, and `false` so facade calls return
+  `{:error, {:invalid_connection, conn}}` instead of raising `ArgumentError`. `write_batched/3`,
+  `flush/2`, and `stats/2` return `{:error, :no_batch_writer}` for non-name connections and validate
+  `:sync` and `:timeout` without raising. `Flight.Client` and `Client.HTTP.Request` validate
+  `:timeout`, `:pool_timeout`, `:connect_timeout`, and `:tls` with `nil`-only fallbacks, and
+  `TokenRequest.build/2` guards `Options.keyword?(opts)`.
+
 ## [0.1.51] - 2026-10-20
 
 ### Fixed

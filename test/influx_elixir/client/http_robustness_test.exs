@@ -4,7 +4,9 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
   # (docs/design/2026-10-10_review-of-71e2b8c.md).
   use ExUnit.Case, async: true
 
-  alias InfluxElixir.Client.HTTP
+  alias InfluxElixir.Admin.TokenRequest
+  alias InfluxElixir.Client.{HTTP, Local}
+  alias InfluxElixir.Client.HTTP.Request
   alias InfluxElixir.{StreamError, TestServer, TestSupport}
 
   defp connection(extra) do
@@ -89,10 +91,10 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
     end
 
     test "Client.Local answers the same" do
-      {:ok, local} = InfluxElixir.Client.Local.start(databases: ["db"])
+      {:ok, local} = Local.start(databases: ["db"])
 
       for {label, value} <- @bad_params do
-        assert InfluxElixir.Client.Local.query_sql(local, "SELECT $a", params: %{"a" => value}) ===
+        assert Local.query_sql(local, "SELECT $a", params: %{"a" => value}) ===
                  {:error, {:invalid_param, "a", :unsupported_type}},
                label
       end
@@ -216,6 +218,140 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
       assert served(delete, [{404, not_found}]) ===
                {{:error, %{status: 404, body: "bucket not found: gone"}},
                 [{:GET, "/api/v2/buckets?name=gone&org=o", ""}]}
+
+      assert served(delete, [{200, ~s|{"buckets":[]}|}]) ===
+               {{:error, %{status: 404, body: "bucket not found: gone"}},
+                [{:GET, "/api/v2/buckets?name=gone&org=o", ""}]}
+
+      org_404 = ~s|{"code":"not found","message":"organization name \\"o\\" not found"}|
+
+      assert served(delete, [{404, org_404}]) ===
+               {{:error, %{status: 404, body: org_404}},
+                [{:GET, "/api/v2/buckets?name=gone&org=o", ""}]}
+    end
+
+    test "create_bucket treats 422 already exists as :ok and passes other 422s through",
+         %{conn: conn} do
+      create = fn -> HTTP.create_bucket(conn, "b", org_id: "0123456789abcdef") end
+      body = ~s|{"name":"b","orgID":"0123456789abcdef","retentionRules":[{"everySeconds":0}]}|
+
+      assert served(create, [{422, ~s|{"message":"bucket with name b already exists"}|}]) ===
+               {:ok, [{:POST, "/api/v2/buckets", body}]}
+
+      other_422 = ~s|{"message":"retention rule invalid"}|
+
+      assert served(create, [{422, other_422}]) ===
+               {{:error, %{status: 422, body: other_422}}, [{:POST, "/api/v2/buckets", body}]}
+    end
+
+    test "list_buckets paginates 100-item pages and omits org when empty or nil",
+         %{conn: conn} do
+      page_1 = Enum.map(1..100, &%{"name" => "b#{&1}"})
+      page_2 = [%{"name" => "b101"}]
+      expected = page_1 ++ page_2
+
+      assert served(
+               fn -> HTTP.list_buckets(conn) end,
+               [
+                 {200, Jason.encode!(%{"buckets" => page_1})},
+                 {200, Jason.encode!(%{"buckets" => page_2})}
+               ]
+             ) ===
+               {{:ok, expected},
+                [
+                  {:GET, "/api/v2/buckets?limit=100&offset=0&org=o", ""},
+                  {:GET, "/api/v2/buckets?limit=100&offset=100&org=o", ""}
+                ]}
+
+      for empty_org <- ["", nil] do
+        conn_no_org = Keyword.put(conn, :org, empty_org)
+
+        assert served(
+                 fn -> HTTP.list_buckets(conn_no_org) end,
+                 [{200, ~s|{"buckets":[{"name":"b1"}]}|}]
+               ) ===
+                 {{:ok, [%{"name" => "b1"}]}, [{:GET, "/api/v2/buckets?limit=100&offset=0", ""}]}
+      end
+    end
+
+    test "write, admin, and query endpoints format flags, precisions, and bodies accurately",
+         %{conn: conn} do
+      v3_conn = Keyword.put(conn, :api_version, :v3)
+
+      assert HTTP.shutdown_connection(v3_conn) === :ok
+      assert HTTP.write(v3_conn, :not_iodata) === {:error, {:invalid_body, :not_iodata}}
+
+      assert served(
+               fn ->
+                 HTTP.write(v3_conn, "m v=1i",
+                   accept_partial: false,
+                   no_sync: true,
+                   gzip: true
+                 )
+               end,
+               [{204, ""}]
+             ) ===
+               {{:ok, :written},
+                [
+                  {:POST,
+                   "/api/v3/write_lp?db=db&precision=nanosecond&accept_partial=false&no_sync=true",
+                   "m v=1i"}
+                ]}
+
+      for {input, wire} <- [
+            {:microsecond, "us"},
+            {:millisecond, "ms"},
+            {:second, "s"},
+            {"custom", "custom"}
+          ] do
+        assert served(
+                 fn -> HTTP.write(conn, "m v=1i", precision: input) end,
+                 [{204, ""}]
+               ) ===
+                 {{:ok, :written},
+                  [{:POST, "/api/v2/write?org=o&bucket=db&precision=#{wire}", "m v=1i"}]}
+      end
+
+      assert served(
+               fn -> HTTP.create_database(v3_conn, "db", retention: "7d") end,
+               [{201, ""}]
+             ) ===
+               {:ok,
+                [{:POST, "/api/v3/configure/database", ~s|{"db":"db","retention_period":"7d"}|}]}
+
+      assert served(fn -> HTTP.delete_database(v3_conn, "db") end, [{204, ""}]) ===
+               {:ok, [{:DELETE, "/api/v3/configure/database?db=db", ""}]}
+
+      assert served(fn -> HTTP.create_token(v3_conn, "tok") end, [{201, ~s|{"token":"t1"}|}]) ===
+               {{:ok, %{"token" => "t1"}},
+                [
+                  {:POST, "/api/v3/configure/token/named_admin",
+                   ~s|{"token_name":"tok","expiry_secs":null}|}
+                ]}
+
+      assert served(fn -> HTTP.delete_token(v3_conn, "tok") end, [{204, ""}]) ===
+               {:ok, [{:DELETE, "/api/v3/configure/token?token_name=tok", ""}]}
+
+      no_db_conn = Keyword.delete(v3_conn, :database)
+
+      assert served(
+               fn -> HTTP.query_influxql(no_db_conn, "SHOW DATABASES") end,
+               [{200, "[]"}]
+             ) ===
+               {{:ok, []},
+                [{:POST, "/api/v3/query_influxql", ~s|{"format":"json","q":"SHOW DATABASES"}|}]}
+
+      flux_csv = "#datatype,string,long,double\r\n,result,table,_value\r\n,_result,0,2.5\r\n\r\n"
+
+      assert served(
+               fn -> HTTP.query_flux(conn, ~s[from(bucket: "b")]) end,
+               [{200, flux_csv}]
+             ) ===
+               {{:ok, [%{"result" => "_result", "table" => 0, "_value" => 2.5}]},
+                [
+                  {:POST, "/api/v2/query?org=o",
+                   ~s|{"dialect":{"annotations":["datatype"],"delimiter":",","header":true},"query":"from(bucket: \\"b\\")","type":"flux"}|}
+                ]}
     end
   end
 
@@ -355,11 +491,44 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
 
       assert answered(take_one, 200, {:chunks, chunks}) === {[%{"v" => 1}], {:messages, []}}
     end
+
+    test "a stream handles trailing non-newline JSONL, non-200 error bodies, and malformed JSONL",
+         %{conn: conn} do
+      stream_list = fn ->
+        conn |> HTTP.query_sql_stream("SELECT v FROM m") |> Enum.to_list()
+      end
+
+      assert answered(stream_list, 200, ~s({"v":1})) === [%{"v" => 1}]
+
+      assert %StreamError{kind: :http_status, status: 400, body: "bad sql"} =
+               answered(fn -> catch_error(stream_list.()) end, 400, "bad sql")
+
+      assert %StreamError{kind: :decode, reason: {:unexpected_json, 123}} =
+               answered(fn -> catch_error(stream_list.()) end, 200, "123\n")
+
+      assert %StreamError{kind: :decode, reason: %Jason.DecodeError{}} =
+               answered(fn -> catch_error(stream_list.()) end, 200, "not json\n")
+    end
   end
 
   describe "a connection that is not a keyword list" do
     test "every Client.HTTP callback returns {:invalid_connection, conn}, never a raise" do
-      for conn <- [%{table: :local}, "localhost", 123, ~c"localhost", [:a | :b]] do
+      for conn <- [
+            %{table: :local},
+            "localhost",
+            123,
+            ~c"localhost",
+            [:a | :b],
+            [api_version: :v4],
+            [host: %{}],
+            [port: {1}],
+            [scheme: [1]],
+            [token: %{}],
+            [timeout: false],
+            [timeout: -1],
+            [pool_timeout: false],
+            [pool_timeout: -1]
+          ] do
         expected = {:error, {:invalid_connection, conn}}
 
         assert HTTP.init_connection(conn) === expected
@@ -402,7 +571,50 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
       for bad_port <- [false, 0, -1, 65_536, "8181"] do
         assert HTTP.query_sql(conn, "SELECT 1", transport: :flight, flight_port: bad_port) ===
                  {:error, {:invalid_port, bad_port}}
+
+        conn_with_port = Keyword.put(conn, :flight_port, bad_port)
+
+        assert HTTP.query_sql(conn_with_port, "SELECT 1", transport: :flight) ===
+                 {:error, {:invalid_port, bad_port}}
       end
+
+      assert HTTP.query_sql(conn, "SELECT 1", transport: :bogus) ===
+               {:error, {:unknown_transport, :bogus}}
+
+      assert HTTP.query_sql(conn, "SELECT $a", transport: :flight, params: %{"a" => 1}) ===
+               {:error, :params_unsupported_over_flight}
+
+      assert HTTP.query_sql(conn, "SELECT $a", transport: :flight, params: %{"a" => self()}) ===
+               {:error, {:invalid_param, "a", :unsupported_type}}
+
+      for bad_opt <- [
+            [timeout: false],
+            [timeout: -1],
+            [timeout: "30s"],
+            [pool_timeout: false],
+            [pool_timeout: -1],
+            [connect_timeout: false],
+            [connect_timeout: -1],
+            [tls: "false"]
+          ] do
+        assert HTTP.query_sql(conn, "SELECT 1", bad_opt) ===
+                 {:error, {:invalid_options, bad_opt}}
+      end
+
+      assert TokenRequest.build("tok", :bad) ===
+               {:error, {:invalid_options, :bad}}
+
+      assert Request.resolve_timeout([timeout: :infinity], []) === :infinity
+      assert Request.resolve_pool_timeout([pool_timeout: :infinity], []) === :infinity
+
+      assert Request.auth_headers(token: nil) === []
+      assert Request.auth_headers(token: "") === []
+
+      other_err = %RuntimeError{message: "other"}
+      assert Request.classify_finch_error(other_err) === other_err
+
+      assert {:error, {:json_parse_error, %Jason.DecodeError{}}} =
+               Request.decode_json("not json")
     end
   end
 end

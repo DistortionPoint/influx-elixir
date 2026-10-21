@@ -672,7 +672,7 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
     strings = Enum.filter(values, &is_binary/1)
 
     class in [:i64, :u64, :f64] and match?([_, _ | _], values) and strings != [] and
-      Enum.all?(strings, &match?({_number, ""}, Float.parse(&1)))
+      Enum.all?(strings, &float_string?/1)
   end
 
   # A list of nothing but `NULL`, which shares no value with any list.
@@ -742,7 +742,14 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   @spec textual?(atom(), [term()]) :: boolean()
   defp textual?(class, literals) do
     class in [:i64, :u64, :f64] and
-      Enum.any?(literals, &(is_binary(&1) and not match?({_number, ""}, Float.parse(&1))))
+      Enum.any?(literals, &(is_binary(&1) and not float_string?(&1)))
+  end
+
+  @spec float_string?(binary()) :: boolean()
+  defp float_string?(text) do
+    match?({_number, ""}, Float.parse(text))
+  rescue
+    ArgumentError -> false
   end
 
   @spec form_of(keyed()) :: form() | keyed()

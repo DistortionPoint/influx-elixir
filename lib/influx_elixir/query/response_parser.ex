@@ -51,6 +51,8 @@ defmodule InfluxElixir.Query.ResponseParser do
   @spec parse(binary(), atom()) :: {:ok, [map()] | binary()} | {:error, term()}
   def parse(body, format \\ :json)
 
+  def parse(body, _format) when not is_binary(body), do: {:error, {:invalid_body, body}}
+
   def parse(body, :json) do
     case Jason.decode(body) do
       {:ok, data} when is_list(data) -> rows(data)
@@ -264,7 +266,7 @@ defmodule InfluxElixir.Query.ResponseParser do
   end
 
   @spec cast(binary() | nil, binary(), binary()) :: term()
-  defp cast("double", _key, value), do: parse_number(Float.parse(value), value)
+  defp cast("double", _key, value), do: parse_number(parse_float(value), value)
   defp cast("long", _key, value), do: parse_number(Integer.parse(value), value)
   defp cast("unsignedLong", _key, value), do: parse_number(Integer.parse(value), value)
   defp cast("boolean", _key, "true"), do: true
@@ -279,6 +281,13 @@ defmodule InfluxElixir.Query.ResponseParser do
   end
 
   defp cast(_type, key, value), do: coerce_value(key, value)
+
+  @spec parse_float(binary()) :: {float(), binary()} | :error
+  defp parse_float(value) do
+    Float.parse(value)
+  rescue
+    ArgumentError -> :error
+  end
 
   @spec parse_number({number(), binary()} | :error, binary()) :: number() | binary()
   defp parse_number({number, ""}, _raw), do: number
