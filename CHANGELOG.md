@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.52] - 2026-10-21
+
 ### Fixed
 - **`Float.parse/1` raised `ArgumentError` on >=309-digit integer strings in `SQLLiteral`, `SQLDmlItem`, `SQLContradict`, and `ResponseParser`.**
   `SQLLiteral` (`float_value/1`, `coerce/1`, `parse_float/1`), `SQLDmlItem.number/1`,
