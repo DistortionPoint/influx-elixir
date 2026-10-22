@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.53] - 2026-10-22
+
 ### Fixed
 - **`Flight.Reader`, `ConnectionSupervisor`, and `Supervisor` raised or allocated unboundedly on malformed views, decimal scales, and supervisor configs.**
   `Flight.Reader` now handles `nil` and negative lengths/offsets/indices in `BinaryView` and
