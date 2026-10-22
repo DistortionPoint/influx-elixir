@@ -1428,13 +1428,51 @@ defmodule InfluxElixir.Flight.ReaderTest do
                 ]}
     end
 
-    test "a width Arrow does not define is refused, never read without end" do
+    test "a width or scale Arrow does not define is refused, never read or padded without end" do
       batch = batch_fd(<<1, 2, 3, 4>>, [{0, 0}, {0, 4}], 1)
 
       for width <- [0, 8, 100] do
         assert Reader.decode_flight_data([decimal_schema(0, width), batch]) ===
                  {:error, {:unsupported_arrow_type, "Decimal#{width}", "d"}}
       end
+
+      body128 = <<1::little-signed-128>>
+      batch128 = batch_fd(body128, [{0, 0}, {0, 16}], 1)
+
+      for scale <- [-77, 77, -2_000_000_000, 2_000_000_000] do
+        assert decode_bounded([decimal_schema(scale, 128), batch128]) ===
+                 {:answered, {:error, {:unsupported_arrow_type, "Decimal128", "d"}}}
+      end
+    end
+  end
+
+  describe "decode_flight_data/1 — BinaryView and Utf8View columns" do
+    test "decodes inline and buffer BinaryView and Utf8View cells and masks out-of-bounds or negative views to null" do
+      # Type 23 is BinaryView, type 24 is Utf8View
+      bin_schema = schema_fd([{"bv", 23, []}])
+      utf8_schema = schema_fd([{"uv", 24, []}])
+
+      # View 0: inline 2 bytes <<0xAB, 0xCD>>
+      v0 = <<2::little-signed-32, 0xAB, 0xCD, 0::80>>
+      # View 1: out-of-range buffer index (10) with len > 12 -> nil (no crash in Base.encode16)
+      v1 = <<16::little-signed-32, "abcd", 10::little-signed-32, 0::little-signed-32>>
+      # View 2: negative length (-1) -> nil
+      v2 = <<-1::little-signed-32, 0::96>>
+      # View 3: negative buffer index (-1) with len > 12 -> nil
+      v3 = <<16::little-signed-32, "abcd", -1::little-signed-32, 0::little-signed-32>>
+
+      views = v0 <> v1 <> v2 <> v3
+      batch = batch_fd(views, [{0, 0}, {0, byte_size(views)}], 4)
+
+      assert Reader.decode_flight_data([bin_schema, batch]) ===
+               {:ok, [%{"bv" => "abcd"}, %{}, %{}, %{}]}
+
+      v0_utf8 = <<2::little-signed-32, "hi", 0::80>>
+      views_utf8 = v0_utf8 <> v1 <> v2 <> v3
+      batch_utf8 = batch_fd(views_utf8, [{0, 0}, {0, byte_size(views_utf8)}], 4)
+
+      assert Reader.decode_flight_data([utf8_schema, batch_utf8]) ===
+               {:ok, [%{"uv" => "hi"}, %{}, %{}, %{}]}
     end
   end
 

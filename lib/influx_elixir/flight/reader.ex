@@ -363,15 +363,17 @@ defmodule InfluxElixir.Flight.Reader do
   defp field_kind(fb, @fb_type_date, pos, _type_id),
     do: {:date, if(type_slot(fb, pos, 0, :int16, 1) == 0, do: :day, else: :millisecond)}
 
-  # Arrow's decimals are 32, 64, 128 or 256 bits wide. Any other width is refused: a width of
-  # 0 would read the body forever, one value of no bits at a time.
+  # Arrow's decimals are 32, 64, 128 or 256 bits wide, with precision at most 76 digits. Any
+  # other width or a scale outside Arrow's decimal range is refused: a width of 0 would read
+  # the body forever, and a corrupt scale of billions would allocate gigabytes of digits.
   defp field_kind(fb, @fb_type_decimal, pos, _type_id) do
-    case type_slot(fb, pos, 2, :int32, 128) do
-      width when width in [32, 64, 128, 256] ->
-        {:decimal, type_slot(fb, pos, 1, :int32, 0), div(width, 8)}
+    width = type_slot(fb, pos, 2, :int32, 128)
+    scale = type_slot(fb, pos, 1, :int32, 0)
 
-      width ->
-        {:unsupported, "Decimal#{width}"}
+    if width in [32, 64, 128, 256] and scale in -76..76//1 do
+      {:decimal, scale, div(width, 8)}
+    else
+      {:unsupported, "Decimal#{width}"}
     end
   end
 
@@ -776,14 +778,12 @@ defmodule InfluxElixir.Flight.Reader do
     {specs, cursor} = pop_specs(cursor, 2)
     [validity, views] = pad_specs(specs, 2)
     [count | rest] = if cursor.variadic == [], do: [0], else: cursor.variadic
-    {data_specs, cursor} = pop_specs(%{cursor | variadic: rest}, count)
+    {data_specs, cursor} = pop_specs(%{cursor | variadic: rest}, max(count, 0))
     buffers = Enum.map(data_specs, &slice(body, &1))
 
     values =
       for <<view::binary-16 <- slice(body, views)>> do
-        view
-        |> decode_view(buffers)
-        |> then(&if(kind == :binary_view, do: Base.encode16(&1, case: :lower), else: &1))
+        render_bytes(kind, decode_view(view, buffers))
       end
 
     {apply_nulls(fit(values, len), slice_validity(body, validity), len), cursor}
@@ -882,22 +882,27 @@ defmodule InfluxElixir.Flight.Reader do
   # HTTP renders binary as lowercase hex (`CAST(host AS BYTEA)` is "61").
   @spec render_bytes(atom(), binary() | nil) :: binary() | nil
   defp render_bytes(_kind, nil), do: nil
-  defp render_bytes(:large_utf8, value), do: value
+  defp render_bytes(kind, value) when kind in [:large_utf8, :utf8_view], do: value
   defp render_bytes(_binary, value), do: Base.encode16(value, case: :lower)
 
   # A view is 16 bytes: the length, then the bytes inline (12 or fewer) or
   # a 4-byte prefix, the data buffer's index and the offset in it.
   @spec decode_view(binary(), [binary()]) :: binary() | nil
-  defp decode_view(<<len::little-32, inline::binary-12>>, _buffers) when len <= 12,
-    do: binary_part(inline, 0, len)
+  defp decode_view(<<len::little-signed-32, inline::binary-12>>, _buffers)
+       when len in 0..12//1,
+       do: binary_part(inline, 0, len)
 
   defp decode_view(
-         <<len::little-32, _prefix::binary-4, index::little-32, offset::little-32>>,
+         <<len::little-signed-32, _prefix::binary-4, index::little-signed-32,
+           offset::little-signed-32>>,
          buffers
-       ) do
+       )
+       when len > 12 and index >= 0 and offset >= 0 do
     buffer = Enum.at(buffers, index, <<>>)
     if offset + len <= byte_size(buffer), do: binary_part(buffer, offset, len), else: nil
   end
+
+  defp decode_view(_view, _buffers), do: nil
 
   @spec decode_fixed_kind(term(), binary()) :: [term()]
   defp decode_fixed_kind(:float16, data), do: for(<<bits::little-16 <- data>>, do: half(bits))

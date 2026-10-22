@@ -281,6 +281,11 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       assert %{id: ConnectionSupervisor, type: :supervisor} = spec
       assert {ConnectionSupervisor, :start_link, [config]} = spec.start
       assert Keyword.delete(config, :token) === [name: :spec_test, host: "h"]
+
+      for bad_config <- [nil, :bad, "config", [1, 2], [:a | :b]] do
+        bad_spec = ConnectionSupervisor.child_spec(bad_config)
+        assert bad_spec.start === {ConnectionSupervisor, :start_link, [bad_config]}
+      end
     end
   end
 

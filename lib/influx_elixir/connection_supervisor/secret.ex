@@ -6,6 +6,8 @@ defmodule InfluxElixir.ConnectionSupervisor.Secret do
   # `inspect/1` and Erlang's `~p` both print a function without what it captured, where a
   # struct would print its fields.
 
+  alias InfluxElixir.Client.Options
+
   @derive {Inspect, only: []}
   defstruct [:reveal]
 
@@ -15,27 +17,24 @@ defmodule InfluxElixir.ConnectionSupervisor.Secret do
   # Hides the `:token` of a connection config (a keyword list, as `start_link/1` checks), of
   # whatever type: a token given as a charlist is still the token, and the child spec of its
   # refused start is printed. A config without one is returned as it is.
-  @spec redact(keyword()) :: keyword()
+  @spec redact(term()) :: term()
   def redact(config) do
-    case Keyword.fetch(config, :token) do
-      # Hidden already, by the child spec that started this.
-      {:ok, %__MODULE__{}} ->
-        config
-
-      {:ok, token} ->
-        Keyword.put(config, :token, %__MODULE__{reveal: fn -> token end})
-
-      _no_token ->
-        config
+    with true <- Options.keyword?(config),
+         {:ok, token} when not is_struct(token, __MODULE__) <- Keyword.fetch(config, :token) do
+      Keyword.put(config, :token, %__MODULE__{reveal: fn -> token end})
+    else
+      _unchanged -> config
     end
   end
 
   @doc false
   # The config as it was before `redact/1`.
-  @spec reveal(keyword()) :: keyword()
+  @spec reveal(term()) :: term()
   def reveal(config) do
-    case Keyword.fetch(config, :token) do
-      {:ok, %__MODULE__{reveal: reveal}} -> Keyword.put(config, :token, reveal.())
+    with true <- Options.keyword?(config),
+         {:ok, %__MODULE__{reveal: reveal}} <- Keyword.fetch(config, :token) do
+      Keyword.put(config, :token, reveal.())
+    else
       _no_secret -> config
     end
   end

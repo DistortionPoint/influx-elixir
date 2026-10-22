@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Flight.Reader`, `ConnectionSupervisor`, and `Supervisor` raised or allocated unboundedly on malformed views, decimal scales, and supervisor configs.**
+  `Flight.Reader` now handles `nil` and negative lengths/offsets/indices in `BinaryView` and
+  `Utf8View` cells without raising `FunctionClauseError` in `Base.encode16/2` or indexing from the
+  end of variadic buffers, and refuses `Decimal` scales outside Arrow's `-76..76` precision range
+  before allocating digits. `ConnectionSupervisor.Secret` and `InfluxElixir.Supervisor.init/1`
+  guard `Options.keyword?/1` and proper list shapes so non-keyword configs never raise
+  `FunctionClauseError`.
 - **`Client.HTTP.Request`, `Client.Local`, `Write.Writer`, `Write.BatchWriter`, `Write.LineProtocol`, and `Flight.Reader` raised or silently accepted invalid option and message shapes.**
   `Client.HTTP.Request.options/1` and `Client.Local.Write.Writes` now validate that `:gzip` is a
   boolean, and `Client.Local` rejects explicit `accept_partial: nil` and `no_sync: nil` on v3

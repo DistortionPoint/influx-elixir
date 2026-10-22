@@ -159,6 +159,23 @@ defmodule InfluxElixir.SupervisorTest do
                      type: :supervisor
                    }
                  ]}}
+
+      for bad_opts <- [:bad, nil, [connections: :bad], [connections: [:a | :b]]] do
+        assert InfluxElixir.Supervisor.init(bad_opts) ===
+                 {:ok,
+                  {%{strategy: :one_for_one, intensity: 3, period: 5, auto_shutdown: :never}, []}}
+      end
+
+      assert InfluxElixir.Supervisor.init(connections: [alpha: :bad_config]) ===
+               {:ok,
+                {%{strategy: :one_for_one, intensity: 3, period: 5, auto_shutdown: :never},
+                 [
+                   %{
+                     id: {ConnectionSupervisor, :alpha},
+                     start: {ConnectionSupervisor, :start_link, [:bad_config]},
+                     type: :supervisor
+                   }
+                 ]}}
     end
   end
 end
