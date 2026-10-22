@@ -190,11 +190,13 @@ defmodule InfluxElixir.Flight.Reader do
           {:ok, [map()]} | {:error, term()}
   def decode_flight_data([]), do: {:ok, []}
 
-  def decode_flight_data([schema_msg | batch_msgs]) do
-    with {:ok, columns} <- parse_schema(schema_msg.data_header) do
+  def decode_flight_data([%FlightData{data_header: header} | batch_msgs]) do
+    with {:ok, columns} <- parse_schema(header) do
       decode_batches(batch_msgs, columns)
     end
   end
+
+  def decode_flight_data(_other), do: {:error, :invalid_flight_data}
 
   # ---------------------------------------------------------------------------
   # Schema parsing (FlatBuffer-based)
@@ -224,6 +226,8 @@ defmodule InfluxElixir.Flight.Reader do
   rescue
     _err -> {:error, :schema_parse_failed}
   end
+
+  def parse_schema(_other), do: {:error, :schema_parse_failed}
 
   @spec parse_message_schema(binary()) ::
           {:ok, [column_schema()]} | {:error, term()}
@@ -481,32 +485,33 @@ defmodule InfluxElixir.Flight.Reader do
   # Record batch parsing (FlatBuffer-based)
   # ---------------------------------------------------------------------------
 
-  @spec decode_batches([FlightData.t()], [column_schema()]) ::
-          {:ok, [map()]} | {:error, term()}
-  defp decode_batches([], _columns), do: {:ok, []}
-
   # Batches are collected newest-first and concatenated once at the end;
   # appending each batch with `++` was quadratic in the number of batches.
-  defp decode_batches(batch_msgs, columns) do
-    batch_msgs
-    |> Enum.reduce_while({:ok, []}, fn msg, {:ok, acc} ->
-      case decode_batch(msg, columns) do
-        {:ok, rows} -> {:cont, {:ok, [rows | acc]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, batches} -> {:ok, batches |> Enum.reverse() |> Enum.concat()}
+  @spec decode_batches(term(), [column_schema()], [[map()]]) ::
+          {:ok, [map()]} | {:error, term()}
+  defp decode_batches(batch_msgs, columns, acc \\ [])
+
+  defp decode_batches([], _columns, acc),
+    do: {:ok, acc |> Enum.reverse() |> Enum.concat()}
+
+  defp decode_batches([msg | rest], columns, acc) do
+    case decode_batch(msg, columns) do
+      {:ok, rows} -> decode_batches(rest, columns, [rows | acc])
       {:error, _reason} = err -> err
     end
   end
+
+  defp decode_batches(_other, _columns, _acc), do: {:error, :invalid_flight_data}
 
   @spec decode_batch(FlightData.t(), [column_schema()]) ::
           {:ok, [map()]} | {:error, term()}
   defp decode_batch(
          %FlightData{data_header: header, data_body: body},
          columns
-       ) do
+       )
+       when is_binary(body) or is_nil(body) do
+    body = body || <<>>
+
     with {:ok, row_count, buffer_specs, meta} <-
            parse_record_batch_header(header),
          :ok <- check_uncompressed(meta),
@@ -520,6 +525,8 @@ defmodule InfluxElixir.Flight.Reader do
   catch
     {:unsupported_arrow_type, type, column} -> {:error, {:unsupported_arrow_type, type, column}}
   end
+
+  defp decode_batch(_other, _columns), do: {:error, :invalid_flight_data}
 
   @spec check_uncompressed(map()) :: :ok | {:error, term()}
   defp check_uncompressed(%{compressed: true}),

@@ -136,10 +136,10 @@ defmodule InfluxElixir.Flight.ClientTest do
         port: ClosedPort.port()
       }
 
-      assert Client.query(conn, "SELECT 1", tls: nil, timeout: :infinity, connect_timeout: 5_000) ===
+      assert Client.query(conn, "SELECT 1", tls: nil, timeout: :infinity) ===
                {:error, :no_addresses}
 
-      assert Client.query(conn, "SELECT 1", tls: true, timeout: :infinity, connect_timeout: 5_000) ===
+      assert Client.query(conn, "SELECT 1", tls: true, timeout: :infinity) ===
                {:error, :no_addresses}
 
       assert Client.query(%{conn | host: "a" <> <<0xFF>>}, "SELECT 1", tls: false) ===

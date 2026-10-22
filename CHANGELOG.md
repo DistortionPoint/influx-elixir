@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.HTTP.Request`, `Client.Local`, `Write.Writer`, `Write.BatchWriter`, `Write.LineProtocol`, and `Flight.Reader` raised or silently accepted invalid option and message shapes.**
+  `Client.HTTP.Request.options/1` and `Client.Local.Write.Writes` now validate that `:gzip` is a
+  boolean, and `Client.Local` rejects explicit `accept_partial: nil` and `no_sync: nil` on v3
+  with the engine's serde error (matching `Client.HTTP`). `Write.Writer` validates `:client` as a
+  loaded client module (treating `client: nil` as `Client.impl()`) and forwards non-boolean
+  `:gzip` values to the client for rejection. `Write.BatchWriter` validates `:client` at
+  `start_link/1` and keeps `child_spec/1`'s `:shutdown` valid when given `nil` or invalid values.
+  `Write.LineProtocol.encode/2` treats `api_version: nil` as `:v3`, and `Flight.Reader` returns
+  structured errors on non-list or non-`FlightData` inputs and handles `data_body: nil` cleanly.
+
 ## [0.1.52] - 2026-10-21
 
 ### Fixed

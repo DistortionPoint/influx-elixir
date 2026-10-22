@@ -315,6 +315,15 @@ defmodule InfluxElixir.Client.HTTPTest do
       assert HTTP.write(conn, "m f=1", accept_partial: %{}, no_sync: {1}) ===
                {:error, {:connection_error, %Mint.TransportError{reason: :econnrefused}}}
     end
+
+    test "a non-boolean :gzip option is refused before anything is sent" do
+      conn = connection(ClosedPort.port(), [])
+
+      for bad <- ["false", "true", :bad, 0, 1] do
+        opts = [gzip: bad]
+        assert HTTP.write(conn, "m f=1", opts) === {:error, {:invalid_options, opts}}
+      end
+    end
   end
 
   describe "a parameter that cannot be sent" do

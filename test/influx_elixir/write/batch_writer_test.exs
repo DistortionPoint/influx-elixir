@@ -572,6 +572,11 @@ defmodule InfluxElixir.Write.BatchWriterTest do
             {[max_retries: -1], :max_retries},
             {[max_retry_delay_ms: 0], :max_retry_delay_ms},
             {[shutdown: :later], :shutdown},
+            {[shutdown: nil], :shutdown},
+            {[client: :not_a_client], :client},
+            {[client: Enum], :client},
+            {[client: true], :client},
+            {[client: "HTTP"], :client},
             {[flush_interval: 50], [:flush_interval]}
           ] do
         assert {:error, %NimbleOptions.ValidationError{key: ^key}} =
@@ -1259,6 +1264,17 @@ defmodule InfluxElixir.Write.BatchWriterTest do
                start: {BatchWriter, :start_link, [:not_keyword]},
                shutdown: 5_000
              }
+
+      for {opts, expected_shutdown} <- [
+            {[shutdown: :infinity], :infinity},
+            {[shutdown: :brutal_kill], :brutal_kill},
+            {[shutdown: 0], 0},
+            {[shutdown: nil], 5_000},
+            {[shutdown: :later], 5_000},
+            {[shutdown: -1], 5_000}
+          ] do
+        assert BatchWriter.child_spec(opts).shutdown === expected_shutdown
+      end
 
       assert BatchWriter.backoff_delay(2, 0, 100) === 400
 

@@ -24,7 +24,8 @@ defmodule InfluxElixir.Client.Local.Writes do
          {:ok, precision} <- normalize_precision(Keyword.get(opts, :precision), profile),
          {:ok, accept_partial} <- write_flag(opts, :accept_partial, true, profile),
          {:ok, _no_sync} <- write_flag(opts, :no_sync, false, profile),
-         {:ok, text} <- Body.read(payload, Keyword.get(opts, :gzip, false) == true, profile),
+         {:ok, gzip?} <- gzip_flag(opts),
+         {:ok, text} <- Body.read(payload, gzip?, profile),
          :ok <- ensure_database(table, database, profile) do
       result =
         case text
@@ -468,6 +469,15 @@ defmodule InfluxElixir.Client.Local.Writes do
      }}
   end
 
+  @spec gzip_flag(keyword()) :: {:ok, boolean()} | {:error, map()}
+  defp gzip_flag(opts) do
+    case Keyword.get(opts, :gzip) do
+      nil -> {:ok, false}
+      gzip when is_boolean(gzip) -> {:ok, gzip}
+      _other -> {:error, %{status: 400, body: "Client.Local: the :gzip option is not a boolean"}}
+    end
+  end
+
   # `accept_partial: false` and `no_sync:` are InfluxDB 3 write parameters
 
   # (`HTTP.write/3` sends them as `&accept_partial=false`, `&no_sync=true`);
@@ -479,11 +489,14 @@ defmodule InfluxElixir.Client.Local.Writes do
   defp write_flag(_opts, _key, default, :v2), do: {:ok, default}
 
   defp write_flag(opts, key, default, _v3) do
-    case Keyword.get(opts, key, default) do
-      value when is_boolean(value) ->
+    case Keyword.fetch(opts, key) do
+      :error ->
+        {:ok, default}
+
+      {:ok, value} when is_boolean(value) ->
         {:ok, value}
 
-      _other ->
+      {:ok, _other} ->
         {:error, %{status: 400, body: "serde error: provided string was not `true` or `false`"}}
     end
   end

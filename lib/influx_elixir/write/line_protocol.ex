@@ -227,7 +227,14 @@ defmodule InfluxElixir.Write.LineProtocol do
   # atom or a string.
   @spec read_options(term()) :: {:ok, map()} | {:error, {:invalid_options, term()}}
   defp read_options(opts) do
-    api_version = if Keyword.keyword?(opts), do: Keyword.get(opts, :api_version, :v3)
+    api_version =
+      if Keyword.keyword?(opts) do
+        case Keyword.get(opts, :api_version) do
+          nil -> :v3
+          version -> version
+        end
+      end
+
     precision = if Keyword.keyword?(opts), do: Keyword.get(opts, :precision)
 
     if api_version in [:v3, :v2] and

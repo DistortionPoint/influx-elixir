@@ -80,4 +80,21 @@ defmodule InfluxElixir.Client.Local.WriteProfilesTest do
                Local.write(conn, "m v=1i 1", database: "b", accept_partial: "yes", no_sync: "yes")
     end
   end
+
+  describe "Client.Local: write flag and gzip option validation" do
+    test "refuses non-boolean :gzip options and nil :accept_partial or :no_sync on v3" do
+      {:ok, conn} = Local.start(databases: ["db"], profile: :v3_core)
+
+      for bad_gzip <- [:bad, "true", "false", 1] do
+        assert Local.write(conn, "m v=1i 1", database: "db", gzip: bad_gzip) ===
+                 {:error, %{status: 400, body: "Client.Local: the :gzip option is not a boolean"}}
+      end
+
+      for flag <- [:accept_partial, :no_sync] do
+        assert Local.write(conn, "m v=1i 1", [{:database, "db"}, {flag, nil}]) ===
+                 {:error,
+                  %{status: 400, body: "serde error: provided string was not `true` or `false`"}}
+      end
+    end
+  end
 end

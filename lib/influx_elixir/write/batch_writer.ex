@@ -71,7 +71,8 @@ defmodule InfluxElixir.Write.BatchWriter do
                           "timestamp must already be in that unit."
                     ],
                     client: [
-                      type: :atom,
+                      type: {:custom, __MODULE__, :validate_client, []},
+                      type_doc: "`t:module/0`",
                       doc:
                         "client module to write with instead of the configured one " <>
                           "(`InfluxElixir.Client.impl/0`)"
@@ -297,22 +298,41 @@ defmodule InfluxElixir.Write.BatchWriter do
     end
   end
 
+  @doc false
+  @spec validate_client(term()) :: {:ok, module()} | {:error, String.t()}
+  def validate_client(client) when is_atom(client) and client not in [nil, true, false] do
+    if Code.ensure_loaded?(client) and function_exported?(client, :write, 3),
+      do: {:ok, client},
+      else: {:error, "expected a client module implementing write/3, got: #{inspect(client)}"}
+  end
+
+  def validate_client(other),
+    do: {:error, "expected a client module implementing write/3, got: #{inspect(other)}"}
+
   @doc """
   The child spec a supervisor starts the writer with; `:shutdown` in
   `opts` sets how long it waits for the final flush.
   """
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
-    shutdown =
-      if Options.keyword?(opts),
-        do: Keyword.get(opts, :shutdown, @default_shutdown),
-        else: @default_shutdown
-
     %{
       id: __MODULE__,
       start: {__MODULE__, :start_link, [opts]},
-      shutdown: shutdown
+      shutdown: child_shutdown(opts)
     }
+  end
+
+  @spec child_shutdown(term()) :: non_neg_integer() | :infinity | :brutal_kill
+  defp child_shutdown(opts) do
+    if Options.keyword?(opts) do
+      case Keyword.get(opts, :shutdown) do
+        shutdown when is_integer(shutdown) and shutdown >= 0 -> shutdown
+        shutdown when shutdown in [:infinity, :brutal_kill] -> shutdown
+        _other -> @default_shutdown
+      end
+    else
+      @default_shutdown
+    end
   end
 
   @doc """

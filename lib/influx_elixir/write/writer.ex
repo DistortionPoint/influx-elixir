@@ -81,19 +81,37 @@ defmodule InfluxElixir.Write.Writer do
   @spec write_body(InfluxElixir.Client.connection(), term(), keyword()) ::
           InfluxElixir.Client.write_result()
   defp write_body(connection, line_protocol, opts) do
-    {client, opts} = Keyword.pop(opts, :client, InfluxElixir.Client.impl())
-    {gzip, opts} = Keyword.pop(opts, :gzip)
-    {payload, write_opts} = maybe_gzip(line_protocol, gzip, opts)
+    with {:ok, client, opts} <- resolve_client(opts) do
+      {gzip, opts} = Keyword.pop(opts, :gzip)
+      {payload, write_opts} = maybe_gzip(line_protocol, gzip, opts)
 
-    metadata = %{
-      database: Options.database(opts, connection),
-      bytes: if(is_binary(line_protocol), do: byte_size(line_protocol), else: 0),
-      point_count: line_count(line_protocol)
-    }
+      metadata = %{
+        database: Options.database(opts, connection),
+        bytes: if(is_binary(line_protocol), do: byte_size(line_protocol), else: 0),
+        point_count: line_count(line_protocol)
+      }
 
-    Telemetry.span_write(metadata, fn ->
-      client.write(connection, payload, write_opts)
-    end)
+      Telemetry.span_write(metadata, fn ->
+        client.write(connection, payload, write_opts)
+      end)
+    end
+  end
+
+  @spec resolve_client(keyword()) ::
+          {:ok, module(), keyword()} | {:error, {:invalid_options, keyword()}}
+  defp resolve_client(opts) do
+    case Keyword.pop(opts, :client) do
+      {nil, rest} ->
+        {:ok, InfluxElixir.Client.impl(), rest}
+
+      {client, rest} when is_atom(client) and not is_boolean(client) ->
+        if Code.ensure_loaded?(client) and function_exported?(client, :write, 3),
+          do: {:ok, client, rest},
+          else: {:error, {:invalid_options, opts}}
+
+      {_invalid, _rest} ->
+        {:error, {:invalid_options, opts}}
+    end
   end
 
   @doc false
@@ -155,7 +173,8 @@ defmodule InfluxElixir.Write.Writer do
               (gzip == true or (gzip == nil and byte_size(payload) > @gzip_threshold)),
        do: {:zlib.gzip(payload), Keyword.put(opts, :gzip, true)}
 
-  defp maybe_gzip(payload, _gzip, opts), do: {payload, opts}
+  defp maybe_gzip(payload, gzip, opts) when gzip in [nil, true, false], do: {payload, opts}
+  defp maybe_gzip(payload, gzip, opts), do: {payload, Keyword.put(opts, :gzip, gzip)}
 
   # The lines of a body (see `Options.line_count/1`); a body that is not text has none.
   @spec line_count(term()) :: non_neg_integer()

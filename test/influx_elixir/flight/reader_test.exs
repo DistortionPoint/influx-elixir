@@ -2046,5 +2046,32 @@ defmodule InfluxElixir.Flight.ReaderTest do
 
       assert Reader.decode_flight_data([schema, batch]) === {:ok, [%{}, %{}]}
     end
+
+    test "malformed inputs to decode_flight_data/1 and parse_schema/1 return errors" do
+      schema = schema_fd([{"v", 2, [bit_width: 64, is_signed: true]}])
+      batch = batch_fd(<<>>, [], 0)
+
+      bad_inputs = [
+        :not_a_list,
+        123,
+        [%{}],
+        [schema | :improper],
+        [schema, :not_flight_data]
+      ]
+
+      for bad_input <- bad_inputs do
+        assert Reader.decode_flight_data(bad_input) === {:error, :invalid_flight_data}
+      end
+
+      assert Reader.decode_flight_data([%FlightData{data_header: :bad}]) ===
+               {:error, :schema_parse_failed}
+
+      assert Reader.decode_flight_data([schema, %{batch | data_body: nil}]) === {:ok, []}
+
+      assert Reader.decode_flight_data([schema, %{batch | data_body: :not_binary}]) ===
+               {:error, :invalid_flight_data}
+
+      assert Reader.parse_schema(:not_binary) === {:error, :schema_parse_failed}
+    end
   end
 end

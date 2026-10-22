@@ -115,6 +115,21 @@ defmodule InfluxElixir.Write.WriterTest do
              ) ===
                {:error, {:connection_error, %Mint.TransportError{reason: :econnrefused}}}
     end
+
+    test "client: nil uses the configured default client, while a non-client module or value is refused",
+         %{conn: conn} do
+      assert Writer.write(conn, "cpu value=1.0", database: "w", client: nil) === {:ok, :written}
+
+      for bad_client <- [:not_a_client_module, Enum, true, false, "HTTP", 123] do
+        opts = [database: "w", client: bad_client]
+        assert Writer.write(conn, "cpu value=1.0", opts) === {:error, {:invalid_options, opts}}
+      end
+    end
+
+    test "a non-boolean :gzip option is forwarded to the client for rejection", %{conn: conn} do
+      assert Writer.write(conn, "cpu value=1.0", database: "w", gzip: :bad) ===
+               {:error, %{status: 400, body: "Client.Local: the :gzip option is not a boolean"}}
+    end
   end
 
   describe "write/3 — Points" do

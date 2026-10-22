@@ -283,7 +283,8 @@ defmodule InfluxElixir.Client.HTTP.Request do
     valid_timeout_opt?(Keyword.get(opts, :timeout)) and
       valid_timeout_opt?(Keyword.get(opts, :pool_timeout)) and
       valid_timeout_opt?(Keyword.get(opts, :connect_timeout)) and
-      valid_tls_opt?(Keyword.get(opts, :tls))
+      valid_boolean_opt?(Keyword.get(opts, :tls)) and
+      valid_boolean_opt?(Keyword.get(opts, :gzip))
   end
 
   @spec valid_timeout_opt?(term()) :: boolean()
@@ -291,9 +292,9 @@ defmodule InfluxElixir.Client.HTTP.Request do
   defp valid_timeout_opt?(:infinity), do: true
   defp valid_timeout_opt?(timeout), do: is_integer(timeout) and timeout >= 0
 
-  @spec valid_tls_opt?(term()) :: boolean()
-  defp valid_tls_opt?(nil), do: true
-  defp valid_tls_opt?(tls), do: is_boolean(tls)
+  @spec valid_boolean_opt?(term()) :: boolean()
+  defp valid_boolean_opt?(nil), do: true
+  defp valid_boolean_opt?(flag), do: is_boolean(flag)
 
   # A request body is JSON, which holds only UTF-8 text: text that is not is
   # the caller's error, returned as one, never a `Jason.EncodeError` raised.

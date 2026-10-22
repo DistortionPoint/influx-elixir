@@ -424,5 +424,10 @@ defmodule InfluxElixir.Write.LineProtocolTest do
         LineProtocol.encode!(point)
       end
     end
+
+    test "api_version: nil defaults to :v3" do
+      point = Point.new("cpu", %{"v" => 1.0}, tags: %{"t" => "a\\b"})
+      assert LineProtocol.encode(point, api_version: nil) === LineProtocol.encode(point)
+    end
   end
 end
