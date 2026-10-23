@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.54] - 2026-10-23
+
 ### Fixed
 - **`QueryParams`, `Client.Local.Flux`, and `Client.Local.SQLQuery` mishandled raw `Jason.Fragment` params, nanosecond RFC3339 `range()` bounds, and cross-delegated `format:` options.**
   `QueryParams.normalize/1` now rejects caller-supplied `%Jason.Fragment{}` values with
