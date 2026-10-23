@@ -197,6 +197,13 @@ defmodule InfluxElixir.Write.WriterTest do
       assert Writer.write(conn, [point(1.0, 1_000), :not_a_point], database: "w") ===
                {:error, {:invalid_point, :not_a_point}}
 
+      for bad_precision <- [false, true, 123, %{}, {:ns}] do
+        opts = [database: "w", precision: bad_precision]
+
+        assert Writer.write(conn, point(1.0, 1_000), opts) ===
+                 {:error, {:invalid_options, opts}}
+      end
+
       assert Local.query_sql(conn, "SELECT * FROM cpu", database: "w") ===
                {:error,
                 %{status: 400, body: "Error during planning: table 'public.iox.cpu' not found"}}

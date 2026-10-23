@@ -38,6 +38,8 @@ defmodule InfluxElixir.StreamError do
       end
   """
 
+  alias InfluxElixir.Client.Options
+
   @type kind ::
           :no_database | :invalid_request | :http_status | :transport | :decode | :unsupported
 
@@ -73,22 +75,44 @@ defmodule InfluxElixir.StreamError do
   end
 
   @impl true
-  def exception(opts) do
-    kind = Keyword.get(opts, :kind, :transport)
-    status = Keyword.get(opts, :status)
-    body = Keyword.get(opts, :body)
-    reason = Keyword.get(opts, :reason)
-
-    %__MODULE__{
-      kind: kind,
-      status: status,
-      body: body,
-      reason: reason,
-      message: build_message(kind, status, body, reason)
-    }
+  def exception(message) when is_binary(message) do
+    %__MODULE__{kind: :transport, message: message}
   end
 
-  @spec build_message(kind(), non_neg_integer() | nil, term(), term()) :: String.t()
+  def exception(opts) do
+    if Options.keyword?(opts) do
+      kind = Keyword.get(opts, :kind, :transport)
+      status = Keyword.get(opts, :status)
+      body = Keyword.get(opts, :body)
+      reason = Keyword.get(opts, :reason)
+      custom_message = Keyword.get(opts, :message)
+
+      message =
+        if is_binary(custom_message) do
+          custom_message
+        else
+          build_message(kind, status, body, reason)
+        end
+
+      %__MODULE__{
+        kind: kind,
+        status: status,
+        body: body,
+        reason: reason,
+        message: message
+      }
+    else
+      reason = {:invalid_options, opts}
+
+      %__MODULE__{
+        kind: :invalid_request,
+        reason: reason,
+        message: build_message(:invalid_request, nil, nil, reason)
+      }
+    end
+  end
+
+  @spec build_message(term(), non_neg_integer() | nil, term(), term()) :: String.t()
   defp build_message(:no_database, _status, _body, _reason) do
     "no database specified for streaming query: pass `database:` in opts " <>
       "or set `:database` on the connection"
@@ -112,6 +136,10 @@ defmodule InfluxElixir.StreamError do
 
   defp build_message(:unsupported, _status, _body, reason) do
     "streaming query is not supported by this connection: #{inspect(reason)}"
+  end
+
+  defp build_message(kind, _status, _body, reason) do
+    "streaming query error (#{inspect(kind)}): #{inspect(reason)}"
   end
 
   @spec format_body(term()) :: String.t()

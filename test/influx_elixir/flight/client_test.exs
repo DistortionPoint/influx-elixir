@@ -57,7 +57,19 @@ defmodule InfluxElixir.Flight.ClientTest do
 
     test "a host that is not a host name is an error that names it, before any connection" do
       # A port belongs in `:port`: one colon is no IPv6 address.
-      for host <- ["localhost:8181", nil, ~c"localhost", "", 1] do
+      for host <- [
+            "localhost:8181",
+            "host with spaces",
+            "host\nname",
+            "host/path",
+            "user@localhost",
+            "localhost?q=1",
+            "localhost#frag",
+            nil,
+            ~c"localhost",
+            "",
+            1
+          ] do
         conn = %{host: host, port: 8181, token: "tok", database: "db"}
         assert Client.query(conn, "SELECT 1", tls: false) === {:error, {:invalid_host, host}}
       end

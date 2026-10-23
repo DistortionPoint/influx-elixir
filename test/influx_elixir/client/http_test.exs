@@ -201,6 +201,41 @@ defmodule InfluxElixir.Client.HTTPTest do
                reason: %Mint.TransportError{reason: :econnrefused}
              } = error
     end
+
+    test "StreamError.exception/1 handles binary messages, custom :message, unknown kinds, and non-keyword inputs" do
+      assert StreamError.exception("connection reset") === %StreamError{
+               kind: :transport,
+               status: nil,
+               body: nil,
+               reason: nil,
+               message: "connection reset"
+             }
+
+      assert StreamError.exception(kind: :decode, reason: :eof, message: "custom") ===
+               %StreamError{
+                 kind: :decode,
+                 status: nil,
+                 body: nil,
+                 reason: :eof,
+                 message: "custom"
+               }
+
+      assert StreamError.exception(kind: :other_kind, reason: :bad) === %StreamError{
+               kind: :other_kind,
+               status: nil,
+               body: nil,
+               reason: :bad,
+               message: "streaming query error (:other_kind): :bad"
+             }
+
+      assert StreamError.exception(:not_opts) === %StreamError{
+               kind: :invalid_request,
+               status: nil,
+               body: nil,
+               reason: {:invalid_options, :not_opts},
+               message: "streaming query request is invalid: {:invalid_options, :not_opts}"
+             }
+    end
   end
 
   # ---------------------------------------------------------------------------

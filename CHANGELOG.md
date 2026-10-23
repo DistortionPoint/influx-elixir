@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`StreamError.exception/1`, `Flight.Client`, and `Write.Writer` raised or leaked internal options on boundary inputs.**
+  `StreamError.exception/1` now handles binary messages (`raise InfluxElixir.StreamError, "..."`),
+  explicit `:message` options, unknown `:kind` atoms, and non-keyword option terms without raising
+  `FunctionClauseError`. `Flight.Client` now validates non-IPv6 hostnames with `Config.host/1` so
+  malformed hosts containing whitespace, control characters, slashes, userinfo, queries, or
+  fragments return `{:error, {:invalid_host, host}}` before attempting a gRPC connection.
+  `Write.Writer.write/3` now preserves the caller's `opts` in `{:error, {:invalid_options, opts}}`
+  when `Point` encoding rejects an invalid `:precision` instead of leaking internal `encode_opts`.
+
 ## [0.1.53] - 2026-10-22
 
 ### Fixed

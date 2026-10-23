@@ -158,7 +158,10 @@ defmodule InfluxElixir.Write.Writer do
         |> Keyword.take([:precision])
         |> Keyword.put(:api_version, Connection.api_version(connection))
 
-      LineProtocol.encode(payload, encode_opts)
+      case LineProtocol.encode(payload, encode_opts) do
+        {:error, {:invalid_options, _encode_opts}} -> {:error, {:invalid_options, opts}}
+        result -> result
+      end
     else
       case Options.iodata(payload) do
         {:ok, text} -> {:ok, text}

@@ -42,6 +42,7 @@ defmodule InfluxElixir.Flight.Client do
   """
 
   alias InfluxElixir.Client.Options
+  alias InfluxElixir.Config
   alias InfluxElixir.Flight.Proto.{FlightData, FlightService, Ticket}
   alias InfluxElixir.Flight.Reader
 
@@ -184,11 +185,14 @@ defmodule InfluxElixir.Flight.Client do
   @spec check_host(term()) :: :ok | {:error, term()}
   defp check_host("[" <> _address = host), do: {:error, {:ipv6_unsupported, host}}
 
-  defp check_host(host) when is_binary(host) and host != "" do
-    case length(:binary.matches(host, ":")) do
-      0 -> if String.valid?(host), do: :ok, else: {:error, {:invalid_host, host}}
-      1 -> {:error, {:invalid_host, host}}
-      _ipv6 -> {:error, {:ipv6_unsupported, host}}
+  defp check_host(host) when is_binary(host) do
+    if length(:binary.matches(host, ":")) >= 2 do
+      {:error, {:ipv6_unsupported, host}}
+    else
+      case Config.host(host) do
+        {:ok, _host} -> :ok
+        {:error, _reason} -> {:error, {:invalid_host, host}}
+      end
     end
   end
 
