@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`QueryParams`, `Client.Local.Flux`, and `Client.Local.SQLQuery` mishandled raw `Jason.Fragment` params, nanosecond RFC3339 `range()` bounds, and cross-delegated `format:` options.**
+  `QueryParams.normalize/1` now rejects caller-supplied `%Jason.Fragment{}` values with
+  `{:error, {:invalid_param, name, :unsupported_type}}` instead of letting unvalidated fragments
+  through to `problem/1` or `engine_values/1` (and `number_text/1` handles empty binaries safely).
+  `Client.Local.Flux` now preserves nanosecond fractional digits (7–9 digits) in RFC3339 `range()`
+  bounds instead of truncating to microsecond precision via `DateTime`. `Client.Local.SQLQuery`
+  now validates `format:` and `params:` with `Scope.query_format(opts)` before delegating non-query
+  statements from `query_sql/3` to `execute_sql/3`, and strips `:format` when `execute_sql/3`
+  delegates `SELECT` queries to `query_sql/3` (matching `Client.HTTP`).
 - **`StreamError.exception/1`, `Flight.Client`, and `Write.Writer` raised or leaked internal options on boundary inputs.**
   `StreamError.exception/1` now handles binary messages (`raise InfluxElixir.StreamError, "..."`),
   explicit `:message` options, unknown `:kind` atoms, and non-keyword option terms without raising

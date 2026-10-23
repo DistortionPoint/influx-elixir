@@ -48,10 +48,20 @@ defmodule InfluxElixir.Client.Local.Format do
           QueryParams.t()
         ) :: {:ok, [map()]} | {:error, term()}
   def answer(format, run, database, params \\ %{}) do
-    with :ok <- accept(format, database),
-         :ok <- check_params(params, format, database),
+    with :ok <- check(format, database, params),
          {:ok, rows} <- run.() do
       render(rows, format)
+    end
+  end
+
+  @doc """
+  Checks `format` and `params` as the engine reads the request body before
+  planning the statement.
+  """
+  @spec check(term(), binary() | nil, QueryParams.t()) :: :ok | {:error, map()}
+  def check(format, database, params \\ %{}) do
+    with :ok <- accept(format, database) do
+      check_params(params, format, database)
     end
   end
 

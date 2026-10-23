@@ -101,7 +101,9 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
         )
 
       true ->
-        execute_sql(conn, sql, opts)
+        with :ok <- Format.check(Scope.query_format(opts), database, params) do
+          execute_sql(conn, sql, opts)
+        end
     end
   end
 
@@ -224,7 +226,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
          :ok <- dml_nesting(trimmed) do
       case statement_kind(trimmed) do
         :query ->
-          query_sql(conn, sql, opts)
+          query_sql(conn, sql, Keyword.delete(opts, :format))
 
         # The statement follows SQL's identifier rules, as a SELECT does:
         # `DELETE FROM "Cpu" WHERE "Host" = 'a'`.

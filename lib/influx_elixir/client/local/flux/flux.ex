@@ -934,18 +934,24 @@ defmodule InfluxElixir.Client.Local.Flux do
   # `DateTime.from_iso8601/1` would take.
   @spec rfc3339(binary()) :: {:ok, {integer(), integer()}} | {:error, binary()}
   defp rfc3339(text) do
-    with true <-
-           Regex.match?(
-             ~r/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/,
+    with [_all | fraction] <-
+           Regex.run(
+             ~r/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.(\d+))?(?:Z|[+-]\d{2}:\d{2})$/,
              text
            ),
          {:ok, dt, _offset} <- DateTime.from_iso8601(text) do
-      wrapped = wrap64(DateTime.to_unix(dt, :nanosecond))
+      wrapped = wrap64(DateTime.to_unix(dt, :second) * 1_000_000_000 + fraction_ns(fraction))
       {:ok, {wrapped, wrapped}}
     else
       _unsupported -> {:error, "Client.Local: unsupported range() time: #{text}"}
     end
   end
+
+  @spec fraction_ns([binary()]) :: non_neg_integer()
+  defp fraction_ns([]), do: 0
+
+  defp fraction_ns([digits]),
+    do: digits |> String.slice(0, 9) |> String.pad_trailing(9, "0") |> String.to_integer()
 
   # Two's-complement 64-bit wrap, which is what multiplying seconds by 1e9
   # does on the engine.

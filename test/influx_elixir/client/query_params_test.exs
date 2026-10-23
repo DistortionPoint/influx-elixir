@@ -25,6 +25,7 @@ defmodule InfluxElixir.Client.QueryParamsTest do
       for {params, {name, reason}} <- [
             {%{p: Decimal.new("NaN")}, {"p", :non_finite_decimal}},
             {%{p: Decimal.new("Infinity")}, {"p", :non_finite_decimal}},
+            {%{p: Jason.Fragment.new("invalid")}, {"p", :unsupported_type}},
             {%{p: {1, 2}}, {"p", :unsupported_type}},
             {[p: self()], {"p", :unsupported_type}},
             {%{{1, 2} => 1}, {"{1, 2}", :unsupported_key}},
@@ -130,7 +131,7 @@ defmodule InfluxElixir.Client.QueryParamsTest do
         assert QueryParams.problem(Jason.Fragment.new(text)) === :out_of_range, text
       end
 
-      for value <- [nil, true, 1, 1.5, "x", ~D[2024-01-02], :name] do
+      for value <- [nil, true, 1, 1.5, "x", ~D[2024-01-02], :name, Jason.Fragment.new("")] do
         assert QueryParams.problem(value) === nil, inspect(value)
       end
 

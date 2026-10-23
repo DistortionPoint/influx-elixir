@@ -21,12 +21,27 @@ defmodule InfluxElixir.Client.Local.SqlQueryMechanicsTest do
   @time ~U[2023-11-14 22:13:20.000000Z]
 
   describe "Client.Local: query_sql/3 given a statement that is not a query" do
-    test "answers as execute_sql does", %{conn: conn} do
+    test "answers as execute_sql does after checking format and params", %{conn: conn} do
       statement = "INSERT INTO cpu VALUES (1)"
       answer = Local.execute_sql(conn, statement, database: "test_db")
 
       assert {:error, %{status: 400}} = answer
       assert Local.query_sql(conn, statement, database: "test_db") === answer
+
+      assert Local.query_sql(conn, statement, database: "test_db", format: :parquet) ===
+               {:error,
+                %{
+                  status: 400,
+                  body:
+                    "Client.Local: format: :parquet is not supported by the test double; " <>
+                      "cover Parquet in the integration tier"
+                }}
+
+      assert Local.query_sql(conn, statement, database: "test_db", params: %{"p" => [1]}) ===
+               Local.query_sql(conn, "SELECT 1", database: "test_db", params: %{"p" => [1]})
+
+      assert Local.execute_sql(conn, "SELECT 1 AS a", database: "test_db", format: :parquet) ===
+               {:ok, [%{"a" => 1}]}
     end
   end
 

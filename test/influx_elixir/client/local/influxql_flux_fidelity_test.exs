@@ -255,6 +255,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxFidelityTest do
       assert Enum.map(rows, & &1["_start"]) === [~U[1754-08-30 22:43:41.128654Z]]
     end
 
+    test "an RFC3339 time keeps nanosecond fractional digits" do
+      conn = v2_conn()
+      assert {:ok, :written} = Local.write(conn, "m v=1 1\nm v=2 2", database: "b")
+
+      assert {:ok, [row]} =
+               flux_range(
+                 conn,
+                 "start: 1970-01-01T00:00:00.000000001Z, stop: 1970-01-01T00:00:00.000000002Z"
+               )
+
+      assert row["_value"] === 1.0
+    end
+
     test "a range with no time in it is the engine's plan error" do
       conn = v2_conn()
 

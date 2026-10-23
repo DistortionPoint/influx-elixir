@@ -112,6 +112,9 @@ defmodule InfluxElixir.Client.QueryParams do
   defp encodable(_name, %{__struct__: Decimal} = value),
     do: {:ok, Jason.Fragment.new(Decimal.to_string(value, :normal))}
 
+  defp encodable(name, %Jason.Fragment{}),
+    do: {:error, {:invalid_param, name, :unsupported_type}}
+
   defp encodable(name, value) do
     case Jason.encode(value) do
       {:ok, _json} -> {:ok, value}
@@ -183,6 +186,7 @@ defmodule InfluxElixir.Client.QueryParams do
 
   @spec number_text(binary()) :: boolean()
   defp number_text(<<c, _rest::binary>>), do: c in ?0..?9 or c == ?-
+  defp number_text(_other), do: false
 
   # ---------------------------------------------------------------------------
   # A JSON number as `serde_json` reads it
