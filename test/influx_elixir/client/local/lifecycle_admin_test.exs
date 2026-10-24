@@ -407,6 +407,21 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
                  database: db
                )
     end
+
+    test "malformed Jason.Fragment in retention or expiry_secs returns unencodable_body",
+         %{conn: conn} do
+      bad_fragment = Jason.Fragment.new("invalid json")
+
+      assert {:error, {:unencodable_body, msg1}} =
+               Local.create_database(conn, "bad_ret_db", retention: bad_fragment)
+
+      assert is_binary(msg1)
+
+      assert {:error, {:unencodable_body, msg2}} =
+               Local.create_token(conn, "bad_exp_tok", expiry_secs: bad_fragment)
+
+      assert is_binary(msg2)
+    end
   end
 
   # The instant `us` microseconds past 1_700_000_000 s.

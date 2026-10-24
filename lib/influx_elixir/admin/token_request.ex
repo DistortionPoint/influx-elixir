@@ -72,27 +72,39 @@ defmodule InfluxElixir.Admin.TokenRequest do
       {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
     end
   rescue
-    error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError, ArgumentError] ->
+    error in [
+      FunctionClauseError,
+      Protocol.UndefinedError,
+      Jason.EncodeError,
+      ArgumentError,
+      BadFunctionError,
+      BadArityError
+    ] ->
       {:error, {:unencodable_body, Exception.message(error)}}
   end
 
   @spec parse_permissions(term()) :: {:ok, [Jason.OrderedObject.t()]} | {:error, term()}
-  defp parse_permissions(permissions) when not is_list(permissions),
-    do: {:error, {:invalid_permission, permissions}}
-
-  defp parse_permissions(permissions) do
-    permissions
-    |> Enum.reduce_while({:ok, []}, fn permission, {:ok, acc} ->
-      case parse_permission(permission) do
-        {:ok, parsed} -> {:cont, {:ok, [parsed | acc]}}
-        :error -> {:halt, {:error, {:invalid_permission, permission}}}
-      end
-    end)
-    |> case do
-      {:ok, parsed} -> {:ok, Enum.reverse(parsed)}
-      error -> error
+  defp parse_permissions(permissions) when is_list(permissions) do
+    case parse_permission_items(permissions, []) do
+      :improper -> {:error, {:invalid_permission, permissions}}
+      result -> result
     end
   end
+
+  defp parse_permissions(permissions), do: {:error, {:invalid_permission, permissions}}
+
+  @spec parse_permission_items(term(), [Jason.OrderedObject.t()]) ::
+          {:ok, [Jason.OrderedObject.t()]} | {:error, term()} | :improper
+  defp parse_permission_items([], acc), do: {:ok, Enum.reverse(acc)}
+
+  defp parse_permission_items([permission | rest], acc) do
+    case parse_permission(permission) do
+      {:ok, parsed} -> parse_permission_items(rest, [parsed | acc])
+      :error -> {:error, {:invalid_permission, permission}}
+    end
+  end
+
+  defp parse_permission_items(_improper_tail, _acc), do: :improper
 
   # `db:db1,db2:read,write` is resource type `db`, names `db1` and `db2`,
   # actions `read` and `write`; every part non-empty.

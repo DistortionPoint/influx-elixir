@@ -58,7 +58,15 @@ defmodule InfluxElixir.Client.Local.Admin do
         {:error, {:unencodable_body, Exception.message(error)}}
     end
   rescue
-    error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError, ArgumentError] ->
+    error in [
+      FunctionClauseError,
+      Protocol.UndefinedError,
+      Jason.EncodeError,
+      Jason.DecodeError,
+      ArgumentError,
+      BadFunctionError,
+      BadArityError
+    ] ->
       {:error, {:unencodable_body, Exception.message(error)}}
   end
 
@@ -277,7 +285,7 @@ defmodule InfluxElixir.Client.Local.Admin do
   # of `body`); anything else is its JSON error (see `serde_error/4`). A negative integer
   # is an i64, a value of the right type that a u64 cannot hold.
   @spec check_expiry(term(), binary()) ::
-          {:ok, non_neg_integer() | nil} | {:error, map()}
+          {:ok, non_neg_integer() | nil} | {:error, term()}
   defp check_expiry(nil, _body), do: {:ok, nil}
 
   defp check_expiry(secs, body) do
@@ -293,6 +301,17 @@ defmodule InfluxElixir.Client.Local.Admin do
       sent ->
         serde_error(unexpected(sent), json, body, "u64")
     end
+  rescue
+    error in [
+      FunctionClauseError,
+      Protocol.UndefinedError,
+      Jason.EncodeError,
+      Jason.DecodeError,
+      ArgumentError,
+      BadFunctionError,
+      BadArityError
+    ] ->
+      {:error, {:unencodable_body, Exception.message(error)}}
   end
 
   @unix_epoch :calendar.datetime_to_gregorian_seconds({{1970, 1, 1}, {0, 0, 0}})

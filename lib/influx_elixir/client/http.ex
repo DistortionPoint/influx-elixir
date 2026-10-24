@@ -595,8 +595,11 @@ defmodule InfluxElixir.Client.HTTP do
          :ok <- options(opts),
          {:ok, {_kind, path, body}} <- TokenRequest.build(name, opts),
          {:ok, %Finch.Response{body: resp_body}} <-
-           post_json(connection, path, body, opts, [200, 201]) do
-      decode_json(resp_body)
+           post_json(connection, path, body, opts, [200, 201]),
+         {:ok, decoded} <- decode_json(resp_body) do
+      if is_map(decoded),
+        do: {:ok, decoded},
+        else: {:error, {:unexpected_response, decoded}}
     end
   end
 

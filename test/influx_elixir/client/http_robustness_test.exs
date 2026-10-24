@@ -460,6 +460,36 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
 
       assert answered(buckets, 200, ~s({"buckets":null})) ===
                {:error, {:unexpected_response, %{"buckets" => nil}}}
+
+      assert answered(buckets, 200, ~s({"buckets":["not_a_map"]})) ===
+               {:error, {:unexpected_response, %{"buckets" => ["not_a_map"]}}}
+
+      assert answered(buckets, 200, ~s({"buckets":[{"id":"b1","name":"n1"}]})) ===
+               {:ok, [%{"id" => "b1", "name" => "n1"}]}
+
+      create_tok = fn -> HTTP.create_token(conn, "tok") end
+
+      assert answered(create_tok, 200, ~s(["not_an_object"])) ===
+               {:error, {:unexpected_response, ["not_an_object"]}}
+
+      assert answered(create_tok, 200, ~s({"id":1,"name":"tok"})) ===
+               {:ok, %{"id" => 1, "name" => "tok"}}
+
+      create_bkt = fn -> HTTP.create_bucket(conn ++ [api_version: :v2, org: "o"], "b") end
+
+      assert answered(create_bkt, 200, ~s({"orgs":[{"id":null}]})) ===
+               {:error, {:org_not_found, "o"}}
+
+      assert answered(create_bkt, 200, ~s({"orgs":[{"id":""}]})) ===
+               {:error, {:org_not_found, "o"}}
+
+      delete_bkt = fn -> HTTP.delete_bucket(conn ++ [api_version: :v2, org: "o"], "b") end
+
+      assert answered(delete_bkt, 200, ~s({"buckets":[{"id":null}]})) ===
+               {:error, %{status: 404, body: "bucket not found: b"}}
+
+      assert answered(delete_bkt, 200, ~s({"buckets":[{"id":""}]})) ===
+               {:error, %{status: 404, body: "bucket not found: b"}}
     end
 
     test "a streamed row split over many chunks is one row, and CRLF ends a line as LF does",
@@ -615,6 +645,11 @@ defmodule InfluxElixir.Client.HTTPRobustnessTest do
 
       assert {:error, {:json_parse_error, %Jason.DecodeError{}}} =
                Request.decode_json("not json")
+
+      for bad_frag <- [%Jason.Fragment{encode: 123}, Jason.Fragment.new([1 | 2])] do
+        assert {:error, {:unencodable_body, msg}} = Request.json_body(%{"a" => bad_frag})
+        assert is_binary(msg)
+      end
     end
   end
 end

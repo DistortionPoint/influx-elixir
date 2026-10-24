@@ -56,7 +56,8 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
     with :ok <- Request.url_values(org: org),
          {:ok, %Finch.Response{body: body}} <-
            Request.get(connection, "/api/v2/orgs?org=#{Request.query_value(org)}", [200]),
-         {:ok, %{"orgs" => [%{"id" => id} | _rest]}} <- Request.decode_json(body) do
+         {:ok, %{"orgs" => [%{"id" => id} | _rest]}} when is_binary(id) and id != "" <-
+           Request.decode_json(body) do
       {:ok, %{"orgID" => id}}
     else
       {:ok, _no_orgs} -> {:error, {:org_not_found, org}}
@@ -77,10 +78,18 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
     path = "/api/v2/buckets?limit=#{@bucket_page}&offset=#{offset}" <> org_query
 
     with {:ok, %Finch.Response{body: resp_body}} <- Request.get(connection, path, [200]),
-         {:ok, %{"buckets" => page}} when is_list(page) <- Request.decode_json(resp_body) do
-      if length(page) == @bucket_page,
-        do: list_pages(connection, offset + @bucket_page, org_query, [page | pages]),
-        else: {:ok, [page | pages] |> Enum.reverse() |> Enum.concat()}
+         {:ok, %{"buckets" => page} = body} when is_list(page) <-
+           Request.decode_json(resp_body) do
+      cond do
+        not Enum.all?(page, &is_map/1) ->
+          {:error, {:unexpected_response, body}}
+
+        length(page) == @bucket_page ->
+          list_pages(connection, offset + @bucket_page, org_query, [page | pages])
+
+        true ->
+          {:ok, [page | pages] |> Enum.reverse() |> Enum.concat()}
+      end
     else
       {:ok, other} -> {:error, {:unexpected_response, other}}
       {:error, _reason} = error -> error
@@ -148,7 +157,8 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
     with {:ok, org_query} <- org_param(connection),
          path = "/api/v2/buckets?name=#{Request.query_value(name)}" <> org_query,
          {:ok, %Finch.Response{body: body}} <- Request.get(connection, path, [200]),
-         {:ok, %{"buckets" => [%{"id" => id} | _rest]}} <- Request.decode_json(body) do
+         {:ok, %{"buckets" => [%{"id" => id} | _rest]}} when is_binary(id) and id != "" <-
+           Request.decode_json(body) do
       {:ok, id}
     else
       {:ok, _no_buckets} ->

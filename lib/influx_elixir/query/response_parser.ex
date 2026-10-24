@@ -97,9 +97,11 @@ defmodule InfluxElixir.Query.ResponseParser do
   as-is.
   """
   @spec coerce_types(map()) :: map()
-  def coerce_types(row) when is_map(row) do
+  def coerce_types(row) when is_map(row) and not is_struct(row) do
     Map.new(row, fn {key, value} -> {key, coerce_value(key, value)} end)
   end
+
+  def coerce_types(row), do: row
 
   # Every element of a JSON array of rows must be an object: a proxy's or a
   # truncated body is an error for the caller, not a crash.

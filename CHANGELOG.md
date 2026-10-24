@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Admin.TokenRequest`, `Client.Local.Admin`, `Client.HTTP`, `Client.HTTP.Buckets`, `Client.HTTP.Request`, and `Query.ResponseParser` raised or accepted malformed shapes on boundary inputs.**
+  `Admin.TokenRequest` now rejects improper lists in `:permissions` (e.g. `["db:x:read" | "tail"]`)
+  with `{:error, {:invalid_permission, permissions}}` instead of raising `FunctionClauseError` in
+  `Enum.reduce_while/3`. `Client.Local.Admin` and `Client.HTTP.Request.json_body/1` now catch
+  `Jason.DecodeError` and `ArgumentError` on malformed `Jason.Fragment` payloads in `retention:`
+  and `expiry_secs:`, returning `{:error, {:unencodable_body, reason}}`. `Client.HTTP.create_token/3`
+  and `Client.HTTP.Buckets.list/1` now reject non-object token responses and non-map bucket entries
+  with `{:error, {:unexpected_response, body}}`, and `Client.HTTP.Buckets` requires non-empty binary
+  `"id"` values when resolving org and bucket IDs. `Query.ResponseParser.coerce_types/1` now guards
+  `not is_struct(row)` so structs and non-maps are returned unchanged instead of raising
+  `Protocol.UndefinedError`.
+
+
 ## [0.1.54] - 2026-10-23
 
 ### Fixed

@@ -394,5 +394,11 @@ defmodule InfluxElixir.Query.ResponseParserTest do
                "_stop" => ~U[2026-03-12 11:00:00.000000Z]
              } === ResponseParser.coerce_types(row)
     end
+
+    test "returns structs and non-map values unchanged without raising Protocol.UndefinedError" do
+      dt = ~U[2026-03-12 10:00:00.000000Z]
+      assert ResponseParser.coerce_types(dt) === dt
+      assert ResponseParser.coerce_types(:not_a_map) === :not_a_map
+    end
   end
 end

@@ -306,7 +306,14 @@ defmodule InfluxElixir.Client.HTTP.Request do
     end
   rescue
     # Jason raises instead of returning for an improper list or a map key it cannot write.
-    error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError] ->
+    error in [
+      FunctionClauseError,
+      Protocol.UndefinedError,
+      Jason.EncodeError,
+      ArgumentError,
+      BadFunctionError,
+      BadArityError
+    ] ->
       {:error, {:unencodable_body, Exception.message(error)}}
   end
 
