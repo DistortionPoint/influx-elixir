@@ -60,7 +60,7 @@ defmodule InfluxElixir.Connection do
       :ok
   """
   @spec put(atom(), term()) :: :ok
-  def put(name, connection) when is_atom(name) do
+  def put(name, connection) when is_atom(name) and name not in [nil, true, false] do
     :persistent_term.put({__MODULE__, name}, connection)
     :ok
   end
@@ -81,8 +81,8 @@ defmodule InfluxElixir.Connection do
       iex> conn[:host]
       "localhost"
   """
-  @spec get(atom()) :: {:ok, term()} | {:error, :not_found}
-  def get(name) when is_atom(name) do
+  @spec get(term()) :: {:ok, term()} | {:error, :not_found}
+  def get(name) when is_atom(name) and name not in [nil, true, false] do
     missing = make_ref()
 
     case :persistent_term.get({__MODULE__, name}, missing) do
@@ -90,6 +90,8 @@ defmodule InfluxElixir.Connection do
       connection -> {:ok, connection}
     end
   end
+
+  def get(_other), do: {:error, :not_found}
 
   @doc """
   Retrieves the connection config for the given name, raising an
@@ -106,8 +108,8 @@ defmodule InfluxElixir.Connection do
       iex> conn[:host]
       "localhost"
   """
-  @spec fetch!(atom()) :: term()
-  def fetch!(name) when is_atom(name) do
+  @spec fetch!(term()) :: term()
+  def fetch!(name) do
     case get(name) do
       {:ok, connection} ->
         connection
@@ -129,12 +131,14 @@ defmodule InfluxElixir.Connection do
 
     * `name` - atom identifying the connection
   """
-  @spec delete(atom()) :: :ok
-  def delete(name) when is_atom(name) do
+  @spec delete(term()) :: :ok
+  def delete(name) when is_atom(name) and name not in [nil, true, false] do
     # erase/1 returns false for a missing key; it never raises.
     :persistent_term.erase({__MODULE__, name})
     :ok
   end
+
+  def delete(_other), do: :ok
 
   @doc """
   The server generation a connection writes to: `:v2` or `:v3`.
@@ -180,7 +184,7 @@ defmodule InfluxElixir.Connection do
     * `name` - atom identifying the connection
   """
   @spec finch_name(atom()) :: atom()
-  def finch_name(name) when is_atom(name) do
+  def finch_name(name) when is_atom(name) and name not in [nil, true, false] do
     with {:ok, connection} when is_list(connection) <- get(name),
          true <- Options.keyword?(connection),
          finch when is_atom(finch) and finch not in [nil, true, false] <-

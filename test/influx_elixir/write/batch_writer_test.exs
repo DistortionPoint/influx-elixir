@@ -601,6 +601,18 @@ defmodule InfluxElixir.Write.BatchWriterTest do
 
       assert stored(conn, "cpu") === [%{"time" => ~U[2026-09-28 12:00:00.123000Z], "v" => 1}]
     end
+
+    test "does not leak internal :api_version when Point encoding rejects invalid :precision",
+         %{conn: conn} do
+      pid = start_writer(conn, flush_interval_ms: 60_000, write_opts: [precision: %{}])
+      point = Point.new("cpu", %{"v" => 1}, timestamp: 1_000)
+
+      assert BatchWriter.write(pid, point) ===
+               {:error, {:invalid_options, [precision: %{}]}}
+
+      assert BatchWriter.write_sync(pid, point) ===
+               {:error, {:invalid_options, [precision: %{}]}}
+    end
   end
 
   describe "invalid points" do

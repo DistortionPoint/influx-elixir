@@ -110,11 +110,11 @@ defmodule InfluxElixir.Config do
       doc: "InfluxElixir.Write.BatchWriter options; starts a writer under the connection"
     ],
     finch_name: [
-      type: :atom,
+      type: {:custom, __MODULE__, :finch_name, []},
       doc: "Finch pool to use instead of the one ConnectionSupervisor starts"
     ],
     name: [
-      type: :atom,
+      type: {:custom, __MODULE__, :name_atom, []},
       doc: "Connection name (set internally by ConnectionSupervisor)"
     ]
   ]
@@ -170,6 +170,16 @@ defmodule InfluxElixir.Config do
   end
 
   def host(host), do: {:error, "expected :host to be a non-empty string, got: #{inspect(host)}"}
+
+  @doc false
+  @spec finch_name(term()) :: {:ok, atom()} | {:error, binary()}
+  def finch_name(value) when is_atom(value) and not is_boolean(value), do: {:ok, value}
+  def finch_name(value), do: {:error, "expected atom, got: #{inspect(value)}"}
+
+  @doc false
+  @spec name_atom(term()) :: {:ok, atom()} | {:error, binary()}
+  def name_atom(value) when is_atom(value) and value not in [nil, true, false], do: {:ok, value}
+  def name_atom(value), do: {:error, "expected atom, got: #{inspect(value)}"}
 
   @doc """
   Validates connection options, raising on error.

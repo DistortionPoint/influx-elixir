@@ -99,6 +99,18 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       assert Process.whereis(:"influx_elixir_#{name}_finch") === nil
       assert InfluxElixir.health(name) === {:ok, %{"status" => "pass"}}
     end
+
+    test "falls back to pool_size 10 when :pool_size is nil or non-positive under Client.Local" do
+      for bad_size <- [nil, 0, -5, "10"] do
+        name = unique_name()
+
+        assert {:ok, _pid} =
+                 InfluxElixir.add_connection(name, host: "h", token: "t", pool_size: bad_size)
+
+        assert InfluxElixir.health(name) === {:ok, %{"status" => "pass"}}
+        assert InfluxElixir.remove_connection(name) === :ok
+      end
+    end
   end
 
   describe "init/1 — batch writer child" do

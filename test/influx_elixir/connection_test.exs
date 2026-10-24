@@ -80,6 +80,27 @@ defmodule InfluxElixir.ConnectionTest do
 
       assert Connection.get(name) === {:error, :not_found}
     end
+
+    test "rejects nil, booleans, and non-atoms cleanly across get/1, delete/1, and fetch!/1" do
+      for invalid <- [nil, true, false, "not_an_atom", 123, %{}] do
+        assert Connection.get(invalid) === {:error, :not_found}
+        assert Connection.delete(invalid) === :ok
+
+        assert_raise ArgumentError, missing_message(invalid), fn ->
+          Connection.fetch!(invalid)
+        end
+      end
+
+      for special_atom <- [nil, true, false] do
+        assert_raise FunctionClauseError, fn ->
+          Connection.put(special_atom, host: "h")
+        end
+
+        assert_raise FunctionClauseError, fn ->
+          Connection.finch_name(special_atom)
+        end
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------

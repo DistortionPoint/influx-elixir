@@ -469,13 +469,24 @@ defmodule InfluxElixir.Write.BatchWriter do
   defp prepare(server, payload, timeout) do
     if Writer.points?(payload) do
       with {:ok, encode_opts} <- GenServer.call(server, :encode_options, timeout) do
-        payload |> stamp(DateTime.utc_now()) |> LineProtocol.encode(encode_opts)
+        encode_points(payload, encode_opts)
       end
     else
       case Options.iodata(payload) do
         {:ok, lines} -> {:ok, lines}
         :error -> {:error, {:invalid_payload, payload}}
       end
+    end
+  end
+
+  @spec encode_points(term(), keyword()) :: {:ok, binary()} | {:error, term()}
+  defp encode_points(payload, encode_opts) do
+    case payload |> stamp(DateTime.utc_now()) |> LineProtocol.encode(encode_opts) do
+      {:error, {:invalid_options, _encode_opts}} ->
+        {:error, {:invalid_options, Keyword.take(encode_opts, [:precision])}}
+
+      result ->
+        result
     end
   end
 

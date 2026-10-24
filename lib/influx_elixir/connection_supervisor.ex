@@ -137,13 +137,21 @@ defmodule InfluxElixir.ConnectionSupervisor do
       # its name, so callers resolve it via Connection.fetch!/1, and releases it on the way
       # down.
       Supervisor.init(
-        children(config, {name, client, conn}, finch_name, Keyword.get(config, :pool_size, 10)),
+        children(config, {name, client, conn}, finch_name, pool_size(config)),
         strategy: :rest_for_one
       )
     else
       # A supervisor's init has no error return; an exit is how it fails with a reason, and
       # `start_link/1` hands the reason back as the client gave it.
       {:error, reason} -> exit({:shutdown, {:init_connection, reason}})
+    end
+  end
+
+  @spec pool_size(keyword()) :: pos_integer()
+  defp pool_size(config) do
+    case Keyword.get(config, :pool_size, 10) do
+      size when is_integer(size) and size > 0 -> size
+      _other -> 10
     end
   end
 

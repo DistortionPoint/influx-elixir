@@ -102,7 +102,12 @@ defmodule InfluxElixir.ConfigTest do
             {:databases, "x", "expected list, got: \"x\""},
             {:batch_writer, [1], "expected keyword list, got: [1]"},
             {:finch_name, "f", "expected atom, got: \"f\""},
-            {:name, "n", "expected atom, got: \"n\""}
+            {:finch_name, true, "expected atom, got: true"},
+            {:finch_name, false, "expected atom, got: false"},
+            {:name, "n", "expected atom, got: \"n\""},
+            {:name, nil, "expected atom, got: nil"},
+            {:name, true, "expected atom, got: true"},
+            {:name, false, "expected atom, got: false"}
           ] do
         assert Config.validate([{key, value}, host: "h"]) ===
                  {:error,
