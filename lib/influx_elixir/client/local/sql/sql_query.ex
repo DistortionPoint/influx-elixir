@@ -490,9 +490,11 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
         {:error, error}
 
       _planned ->
+        normalized = trimmed |> String.replace(~r/;\s*\z/, "") |> SQLIdentifiers.normalize()
+
         case Regex.run(
-               ~r/^(?i)DELETE\s+FROM\s+("[^"]+"|(?:[^\s\\]|\\.)+)(.*)$/s,
-               SQLIdentifiers.normalize(trimmed)
+               ~r/^(?i)DELETE\s+FROM\s+("(?:[^"]|"")+"|(?:[^\s\\;]|\\.)+)(.*)$/s,
+               normalized
              ) do
           [_full, measurement_raw, rest] ->
             execute_delete(table, database, measurement_raw, rest)
@@ -504,7 +506,10 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
   end
 
   @spec delete_target(binary()) :: binary()
-  defp delete_target("\"" <> _quoted = raw), do: String.trim(raw, "\"")
+  defp delete_target("\"" <> _quoted = raw) do
+    raw |> String.slice(1..-2//1) |> String.replace("\"\"", "\"")
+  end
+
   defp delete_target(bare), do: LineProtocolParser.unescape_measurement(bare)
 
   @spec execute_delete(Store.t(), binary(), binary(), binary()) ::

@@ -1474,6 +1474,20 @@ defmodule InfluxElixir.Flight.ReaderTest do
       assert Reader.decode_flight_data([utf8_schema, batch_utf8]) ===
                {:ok, [%{"uv" => "hi"}, %{}, %{}, %{}]}
     end
+
+    test "decodes List and FixedSizeList schemas that omit child fields without crashing" do
+      # Type 12 is List, type 16 is FixedSizeList
+      list_schema = schema_fd([{"lst", 12, []}])
+      offsets = <<0::little-signed-32, 0::little-signed-32>>
+      batch = batch_fd(offsets, [{0, 0}, {0, 8}], 1)
+
+      assert Reader.decode_flight_data([list_schema, batch]) === {:ok, [%{"lst" => []}]}
+
+      fsl_schema = schema_fd([{"fsl", 16, []}])
+      fsl_batch = batch_fd(<<>>, [{0, 0}], 1)
+
+      assert Reader.decode_flight_data([fsl_schema, fsl_batch]) === {:ok, [%{}]}
+    end
   end
 
   # ---------------------------------------------------------------------------

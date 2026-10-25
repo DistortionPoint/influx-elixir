@@ -23,8 +23,17 @@ defmodule InfluxElixirTest do
   end
 
   describe "client/0" do
-    test "returns the configured client implementation" do
+    test "returns the configured client implementation and falls back to Client.HTTP when nil or non-module" do
       assert InfluxElixir.client() === InfluxElixir.Client.Local
+
+      try do
+        for invalid <- [nil, true, false, "Local", 123] do
+          Application.put_env(:influx_elixir, :client, invalid)
+          assert InfluxElixir.client() === InfluxElixir.Client.HTTP
+        end
+      after
+        Application.put_env(:influx_elixir, :client, InfluxElixir.Client.Local)
+      end
     end
   end
 

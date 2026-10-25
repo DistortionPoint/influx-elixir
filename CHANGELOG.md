@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"id"` values when resolving org and bucket IDs. `Query.ResponseParser.coerce_types/1` now guards
   `not is_struct(row)` so structs and non-maps are returned unchanged instead of raising
   `Protocol.UndefinedError`.
+- **`Client.impl/0`, `Flight.Reader`, and `Client.Local.SQLQuery` mishandled non-module `:client` application env, childless list schemas, and quoted/semicolon-terminated `DELETE FROM` targets.**
+  `Client.impl/0` now falls back to `InfluxElixir.Client.HTTP` when `:client` in application env is `nil`, a boolean, or a non-atom instead of returning a non-module value and raising `UndefinedFunctionError`. `Flight.Reader` now guards list child decoding via `decode_child/3` so a malformed `List`, `LargeList`, or `FixedSizeList` schema with no child fields decodes an empty item list instead of raising `ArgumentError` in `hd([])`. `Client.Local.SQLQuery` now strips trailing semicolons before matching `DELETE FROM` targets and unescapes doubled quotes (`""` -> `"`) in quoted table identifiers on `:v3_enterprise`.
 
 
 ## [0.1.54] - 2026-10-23

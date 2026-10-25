@@ -813,7 +813,7 @@ defmodule InfluxElixir.Flight.Reader do
   defp decode_kind(kind, col, len, cursor, body) when kind in [:list, :large_list] do
     {specs, cursor} = pop_specs(cursor, 2)
     [validity, offsets] = pad_specs(specs, 2)
-    {items, cursor} = decode_field(hd(col.children), cursor, body)
+    {items, cursor} = decode_child(col.children, cursor, body)
     items = items |> Enum.map(&finite_or_nil/1) |> List.to_tuple()
 
     lists =
@@ -834,13 +834,17 @@ defmodule InfluxElixir.Flight.Reader do
   defp decode_kind({:fixed_size_list, size}, col, len, cursor, body) do
     {specs, cursor} = pop_specs(cursor, 1)
     [validity] = pad_specs(specs, 1)
-    {items, cursor} = decode_field(hd(col.children), cursor, body)
+    {items, cursor} = decode_child(col.children, cursor, body)
     lists = items |> Enum.map(&finite_or_nil/1) |> Enum.chunk_every(max(size, 1)) |> fit(len)
     {apply_nulls(lists, slice_validity(body, validity), len), cursor}
   end
 
   defp decode_kind({:unsupported, type}, col, _len, _cursor, _body),
     do: throw({:unsupported_arrow_type, type, col.name})
+
+  @spec decode_child([column_schema()], map(), binary()) :: {[term()], map()}
+  defp decode_child([child | _rest], cursor, body), do: decode_field(child, cursor, body)
+  defp decode_child([], cursor, _body), do: {[], cursor}
 
   # ---------------------------------------------------------------------------
   # Private: the decoders for the non-primitive kinds

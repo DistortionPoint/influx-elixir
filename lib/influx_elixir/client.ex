@@ -110,6 +110,9 @@ defmodule InfluxElixir.Client do
   """
   @spec impl() :: module()
   def impl do
-    Application.get_env(:influx_elixir, :client, InfluxElixir.Client.HTTP)
+    case Application.get_env(:influx_elixir, :client, InfluxElixir.Client.HTTP) do
+      client when is_atom(client) and client not in [nil, true, false] -> client
+      _other -> InfluxElixir.Client.HTTP
+    end
   end
 end

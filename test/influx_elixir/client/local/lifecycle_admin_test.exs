@@ -422,6 +422,30 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
 
       assert is_binary(msg2)
     end
+
+    test "DELETE FROM handles escaped double quotes and trailing semicolons",
+         %{conn: conn, db: db} do
+      point = InfluxElixir.Write.Point.new("a\"b", %{"v" => 1}, tags: %{"host" => "x"})
+      {:ok, lp} = InfluxElixir.Write.LineProtocol.encode(point)
+      {:ok, :written} = Local.write(conn, lp, database: db)
+
+      assert Local.execute_sql(conn, ~s|DELETE FROM "a""b" WHERE host = 'x';|, database: db) ===
+               {:ok, %{"rows_affected" => 1}}
+
+      {:ok, :written} = Local.write(conn, lp, database: db)
+
+      assert Local.execute_sql(conn, ~s|DELETE FROM "a""b";|, database: db) ===
+               {:ok, %{"rows_affected" => 1}}
+
+      assert Local.query_sql(conn, ~s|SELECT * FROM "a""b"|, database: db) === {:ok, []}
+
+      {:ok, :written} = Local.write(conn, "cpu,host=a v=1i", database: db)
+
+      assert Local.execute_sql(conn, "DELETE FROM cpu;", database: db) ===
+               {:ok, %{"rows_affected" => 1}}
+
+      assert Local.query_sql(conn, "SELECT * FROM cpu", database: db) === {:ok, []}
+    end
   end
 
   # The instant `us` microseconds past 1_700_000_000 s.
