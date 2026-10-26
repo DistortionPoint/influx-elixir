@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.55] - 2026-10-26
+
 ### Fixed
 - **`ConnectionSupervisor`, `Connection`, `Config`, and `Write.BatchWriter` mishandled non-connection atoms (`nil`, `true`, `false`), invalid `:pool_size` values under `Client.Local`, and invalid `:precision` options when encoding `Point` structs.**
   `ConnectionSupervisor` now falls back to `pool_size: 10` when `:pool_size` is `nil` or non-positive under `Client.Local` instead of crashing `Finch.start_link/1`. `Connection` now excludes `nil`, `true`, and `false` from `put/2`, `get/1`, `delete/1`, and `finch_name/1`, and returns `{:error, :not_found}`, `:ok`, or raises a descriptive `ArgumentError` from `get/1`, `delete/1`, and `fetch!/1` on non-connection terms instead of `FunctionClauseError`. `Config.validate/1` now rejects boolean `:finch_name` values and `nil`/boolean `:name` values. `Write.BatchWriter` now strips the internal `:api_version` option when `LineProtocol.encode/2` returns `{:error, {:invalid_options, ...}}` for `Point` payloads.
