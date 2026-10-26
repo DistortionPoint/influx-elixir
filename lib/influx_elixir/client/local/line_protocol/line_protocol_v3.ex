@@ -190,6 +190,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
     do: binary_part(text, 0, byte_size(text) - byte_size(rest)) <> "..."
 
   defp excerpt(text, <<_char::utf8, rest::binary>>, count), do: excerpt(text, rest, count + 1)
+  defp excerpt(text, <<_byte, rest::binary>>, count), do: excerpt(text, rest, count + 1)
 
   # The tag map. Nearly every series has no escape, and then its names are
   # what was written.

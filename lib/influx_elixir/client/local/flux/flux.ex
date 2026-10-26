@@ -105,13 +105,21 @@ defmodule InfluxElixir.Client.Local.Flux do
   """
   @spec parse(binary(), integer()) :: {:ok, query()} | {:error, binary()}
   def parse(flux, now_ns) do
-    with {:ok, calls} <- split_pipeline(flux),
+    with :ok <- valid_utf8(flux),
+         {:ok, calls} <- split_pipeline(flux),
          {:ok, bucket, rest} <- parse_from(calls),
          {:ok, stages} <- parse_stages(rest, now_ns),
          :ok <- require_range(stages, bucket),
          :ok <- unique_yields(stages) do
       {:ok, %{bucket: bucket, stages: stages}}
     end
+  end
+
+  @spec valid_utf8(binary()) :: :ok | {:error, binary()}
+  defp valid_utf8(flux) do
+    if String.valid?(flux),
+      do: :ok,
+      else: {:error, "Client.Local: the Flux text is not valid UTF-8"}
   end
 
   @doc "The `{start, stop}` nanoseconds of a query's `range` stage."
@@ -1154,14 +1162,14 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   defp do_split("", _sep, _depth, _quoted, current, acc), do: Enum.reverse([current | acc])
 
-  defp do_split(<<"\\", c::utf8, rest::binary>>, sep, depth, true, current, acc),
-    do: do_split(rest, sep, depth, true, current <> "\\" <> <<c::utf8>>, acc)
+  defp do_split(<<"\\", c, rest::binary>>, sep, depth, true, current, acc),
+    do: do_split(rest, sep, depth, true, current <> <<?\\, c>>, acc)
 
   defp do_split(<<"\"", rest::binary>>, sep, depth, quoted, current, acc),
     do: do_split(rest, sep, depth, not quoted, current <> "\"", acc)
 
-  defp do_split(<<c::utf8, rest::binary>>, sep, depth, true, current, acc),
-    do: do_split(rest, sep, depth, true, current <> <<c::utf8>>, acc)
+  defp do_split(<<c, rest::binary>>, sep, depth, true, current, acc),
+    do: do_split(rest, sep, depth, true, current <> <<c>>, acc)
 
   defp do_split(<<c, rest::binary>>, sep, depth, false, current, acc) when c in [?(, ?[],
     do: do_split(rest, sep, depth + 1, false, current <> <<c>>, acc)
@@ -1174,11 +1182,11 @@ defmodule InfluxElixir.Client.Local.Flux do
       rest = binary_part(text, byte_size(sep), byte_size(text) - byte_size(sep))
       do_split(rest, sep, 0, false, "", [current | acc])
     else
-      <<c::utf8, rest::binary>> = text
-      do_split(rest, sep, 0, false, current <> <<c::utf8>>, acc)
+      <<c, rest::binary>> = text
+      do_split(rest, sep, 0, false, current <> <<c>>, acc)
     end
   end
 
-  defp do_split(<<c::utf8, rest::binary>>, sep, depth, false, current, acc),
-    do: do_split(rest, sep, depth, false, current <> <<c::utf8>>, acc)
+  defp do_split(<<c, rest::binary>>, sep, depth, false, current, acc),
+    do: do_split(rest, sep, depth, false, current <> <<c>>, acc)
 end

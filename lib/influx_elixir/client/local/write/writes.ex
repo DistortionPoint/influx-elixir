@@ -213,7 +213,10 @@ defmodule InfluxElixir.Client.Local.Writes do
         "unable to parse '#{line}': #{reason}"
       end)
 
-    %{status: 400, body: Jason.encode!(%{"code" => "invalid", "message" => message})}
+    %{
+      status: 400,
+      body: Jason.encode!(%{"code" => "invalid", "message" => String.replace_invalid(message)})
+    }
   end
 
   # The lines InfluxDB 3 accepts, in order, and the errors of those it
@@ -362,7 +365,11 @@ defmodule InfluxElixir.Client.Local.Writes do
     {:error,
      %{
        status: 422,
-       body: Jason.encode!(%{"code" => "unprocessable entity", "message" => message})
+       body:
+         Jason.encode!(%{
+           "code" => "unprocessable entity",
+           "message" => String.replace_invalid(message)
+         })
      }}
   end
 
@@ -421,7 +428,11 @@ defmodule InfluxElixir.Client.Local.Writes do
     {:error,
      %{
        status: 422,
-       body: Jason.encode!(%{"code" => "unprocessable entity", "message" => message})
+       body:
+         Jason.encode!(%{
+           "code" => "unprocessable entity",
+           "message" => String.replace_invalid(message)
+         })
      }}
   end
 

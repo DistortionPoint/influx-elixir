@@ -11,6 +11,7 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
+  alias InfluxElixir.Client.Local.{Flux, LineProtocolV3}
 
   @bad <<0xFF>>
   @flux_head "from(bucket: \"utf8_flux\") |> range(start: 0)"
@@ -78,6 +79,8 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
                  {:error, %{status: 400, body: @flux_refusal}},
                inspect(script)
       end
+
+      assert Flux.parse(@bad, 0) === {:error, "Client.Local: the Flux text is not valid UTF-8"}
     end
   end
 
@@ -143,6 +146,48 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
                )
 
       assert row["host"] === "a" <> @bad <> "b"
+    end
+
+    test "v2 parse, conflict, and retention errors on non-UTF-8 lines replace invalid bytes without raising",
+         %{v2: c} do
+      # >20 continuation bytes exercises LineProtocolError.boundary/2 down to index 0
+      # and v2_parse_error/1 JSON encoding.
+      bad_line = String.duplicate(<<0x80>>, 25)
+
+      assert {:error, %{status: 400, body: parse_body}} =
+               Local.write(c, bad_line, database: "utf8_flux")
+
+      assert %{"code" => "invalid", "message" => "unable to parse '" <> _rest} =
+               Jason.decode!(parse_body)
+
+      # Field type conflict on a field name with invalid UTF-8 exercises v2_write_result/1.
+      bad_field = "f" <> @bad
+
+      assert {:ok, :written} =
+               Local.write(c, "u2 #{bad_field}=1i 1000000000", database: "utf8_flux")
+
+      assert {:error, %{status: 422, body: conflict_body}} =
+               Local.write(c, "u2 #{bad_field}=1.5 2000000000", database: "utf8_flux")
+
+      assert %{"code" => "unprocessable entity", "message" => conflict_msg} =
+               Jason.decode!(conflict_body)
+
+      assert conflict_msg =~ "field type conflict"
+
+      # Retention drop on a measurement with invalid UTF-8 exercises v2_retention_result/4.
+      :ok = Local.create_bucket(c, "ret_utf8", retention: 3600)
+
+      assert {:error, %{status: 422, body: ret_body}} =
+               Local.write(c, "m" <> @bad <> " v=1 1000", database: "ret_utf8")
+
+      assert %{"code" => "unprocessable entity", "message" => ret_msg} =
+               Jason.decode!(ret_body)
+
+      assert ret_msg =~ "outside retention policy"
+
+      # LineProtocolV3.excerpt/3 handles non-UTF-8 bytes when called directly.
+      assert {:error, "Tag set malformed: could not find equals sign in `" <> _excerpt} =
+               LineProtocolV3.parse("m," <> String.duplicate(@bad, 12) <> " v=1", :nanosecond)
     end
   end
 

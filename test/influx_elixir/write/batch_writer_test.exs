@@ -577,12 +577,23 @@ defmodule InfluxElixir.Write.BatchWriterTest do
             {[client: Enum], :client},
             {[client: true], :client},
             {[client: "HTTP"], :client},
+            {[name: true], :name},
+            {[name: false], :name},
+            {[name: "bad_name"], :name},
+            {[name: 123], :name},
+            {[name: {:via, "not_a_module", :key}], :name},
+            {[name: {:via, nil, :key}], :name},
             {[flush_interval: 50], [:flush_interval]}
           ] do
         assert {:error, %NimbleOptions.ValidationError{key: ^key}} =
                  BatchWriter.start_link([connection: conn, database: "test_db"] ++ bad),
                inspect(bad)
       end
+
+      assert {:ok, {:global, :bw_test}} = BatchWriter.validate_name({:global, :bw_test})
+
+      assert {:ok, {:via, Registry, {:reg, :bw}}} =
+               BatchWriter.validate_name({:via, Registry, {:reg, :bw}})
 
       assert {:error, %NimbleOptions.ValidationError{key: :connection}} =
                BatchWriter.start_link(database: "test_db")

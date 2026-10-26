@@ -37,6 +37,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolError do
   # The largest size up to `at` that does not end inside a UTF-8 character: a
   # continuation byte (`10xxxxxx`) at `at` belongs to the character before it.
   @spec boundary(binary(), non_neg_integer()) :: non_neg_integer()
+  defp boundary(_line, 0), do: 0
+
   defp boundary(line, at) do
     case :binary.at(line, at) do
       byte when Bitwise.band(byte, 0xC0) == 0x80 -> boundary(line, at - 1)

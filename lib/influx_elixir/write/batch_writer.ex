@@ -77,7 +77,11 @@ defmodule InfluxElixir.Write.BatchWriter do
                         "client module to write with instead of the configured one " <>
                           "(`InfluxElixir.Client.impl/0`)"
                     ],
-                    name: [type: :any, doc: "a `GenServer` name to register the writer under"],
+                    name: [
+                      type: {:custom, __MODULE__, :validate_name, []},
+                      type_doc: "`t:GenServer.name/0`",
+                      doc: "a `GenServer` name to register the writer under"
+                    ],
                     shutdown: [
                       type: {:or, [:non_neg_integer, {:in, [:infinity, :brutal_kill]}]},
                       default: @default_shutdown,
@@ -308,6 +312,21 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   def validate_client(other),
     do: {:error, "expected a client module implementing write/3, got: #{inspect(other)}"}
+
+  @doc false
+  @spec validate_name(term()) :: {:ok, GenServer.name()} | {:error, String.t()}
+  def validate_name(name) when is_atom(name) and name not in [true, false], do: {:ok, name}
+  def validate_name({:global, _term} = name), do: {:ok, name}
+
+  def validate_name({:via, module, _term} = name)
+      when is_atom(module) and module not in [nil, true, false],
+      do: {:ok, name}
+
+  def validate_name(other) do
+    {:error,
+     "expected a GenServer name (an atom, {:global, term}, or {:via, module, term}), " <>
+       "got: #{inspect(other)}"}
+  end
 
   @doc """
   The child spec a supervisor starts the writer with; `:shutdown` in
