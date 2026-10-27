@@ -489,6 +489,15 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
       %{body: "SQL error: ParserError" <> _rest} = error ->
         {:error, error}
 
+      %{body: "Error during planning: " <> reason} = error
+      when reason in [
+             "Using clause not supported",
+             "Delete-returning clause not yet supported",
+             "Delete-order-by clause not yet supported",
+             "Delete-limit clause not yet supported"
+           ] ->
+        {:error, error}
+
       _planned ->
         normalized = trimmed |> String.replace(~r/;\s*\z/, "") |> SQLIdentifiers.normalize()
 

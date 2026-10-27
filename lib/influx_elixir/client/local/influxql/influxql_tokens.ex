@@ -641,5 +641,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp take_until(<<?\\, c, rest::binary>>, q, acc), do: take_until(rest, q, [<<?\\, c>> | acc])
   defp take_until(<<q, rest::binary>>, q, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), rest}
   defp take_until(<<c::utf8, rest::binary>>, q, acc), do: take_until(rest, q, [<<c::utf8>> | acc])
+  defp take_until(<<c, rest::binary>>, q, acc), do: take_until(rest, q, [<<c>> | acc])
   defp take_until(<<>>, _q, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), <<>>}
 end

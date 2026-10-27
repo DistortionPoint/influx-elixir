@@ -77,18 +77,22 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   """
   @spec parse(binary()) :: {:ok, clause() | :always | :never} | {:error, map()}
   def parse(clause) do
-    trimmed = String.trim(clause)
+    if String.valid?(clause) do
+      trimmed = String.trim(clause)
 
-    with :nomatch <- null_predicate(trimmed),
-         :nomatch <- list_predicate(trimmed),
-         :nomatch <- between_predicate(trimmed),
-         :nomatch <- pattern_predicate(trimmed),
-         :nomatch <- constant_predicate(trimmed),
-         :nomatch <- column_predicate(trimmed),
-         :nomatch <- distinct_predicate(trimmed),
-         :nomatch <- boolean_test_predicate(trimmed),
-         :nomatch <- expression_predicate(trimmed) do
-      parse_binary_where_clause(trimmed)
+      with :nomatch <- null_predicate(trimmed),
+           :nomatch <- list_predicate(trimmed),
+           :nomatch <- between_predicate(trimmed),
+           :nomatch <- pattern_predicate(trimmed),
+           :nomatch <- constant_predicate(trimmed),
+           :nomatch <- column_predicate(trimmed),
+           :nomatch <- distinct_predicate(trimmed),
+           :nomatch <- boolean_test_predicate(trimmed),
+           :nomatch <- expression_predicate(trimmed) do
+        parse_binary_where_clause(trimmed)
+      end
+    else
+      {:error, SQLError.refusal("the SQL text is not valid UTF-8")}
     end
   end
 

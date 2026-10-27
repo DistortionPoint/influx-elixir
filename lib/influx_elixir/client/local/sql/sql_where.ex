@@ -47,6 +47,30 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   end
 
   @doc """
+  Parses a stand-alone `WHERE ...` clause where no trailing `GROUP BY`, `HAVING`,
+  `ORDER BY` or `LIMIT` clause may follow.
+  """
+  @spec only(binary()) :: {:ok, [node_t()]} | {:error, SQLError.t()}
+  def only(rest) do
+    if String.valid?(rest),
+      do: only_trimmed(String.trim(rest)),
+      else: {:error, SQLError.refusal("the SQL text is not valid UTF-8")}
+  end
+
+  @spec only_trimmed(binary()) :: {:ok, [node_t()]} | {:error, SQLError.t()}
+  defp only_trimmed(""), do: {:ok, []}
+
+  defp only_trimmed(trimmed) do
+    case Regex.run(~r/\AWHERE\s+(.+)\z/isu, trimmed) do
+      [_full, clauses_str] ->
+        with {:ok, conj, _tree} <- parse_clauses(clauses_str), do: {:ok, conj}
+
+      nil ->
+        {:error, SQLError.refusal("unsupported WHERE clause: #{trimmed}")}
+    end
+  end
+
+  @doc """
   Both readings of the `WHERE ...` clause out of one parse: the conjunction list of `nodes/1` and
   the tree of `tree/1`.
   """
@@ -69,12 +93,16 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
 
   @spec parse(binary()) :: {:ok, [node_t()], tree() | nil} | {:error, map()}
   defp parse(rest) do
-    case SQLMask.run(
-           ~r/(?i)WHERE\s+(.+?)(?<=\S)(?:\s+GROUP\b|\s+HAVING\b|\s+ORDER\b|\s+#{@limit_start}|\s*$)/su,
-           rest
-         ) do
-      [_full_match, clauses_str] -> parse_clauses(clauses_str)
-      _no_match -> {:ok, [], nil}
+    if String.valid?(rest) do
+      case SQLMask.run(
+             ~r/(?i)WHERE\s+(.+?)(?<=\S)(?:\s+GROUP\b|\s+HAVING\b|\s+ORDER\b|\s+#{@limit_start}|\s*$)/su,
+             rest
+           ) do
+        [_full_match, clauses_str] -> parse_clauses(clauses_str)
+        _no_match -> {:ok, [], nil}
+      end
+    else
+      {:error, SQLError.refusal("the SQL text is not valid UTF-8")}
     end
   end
 

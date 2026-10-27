@@ -816,7 +816,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       {:ok, []}
     else
       with {:ok, text} <- SQLLexer.scrub(rest),
-           {:ok, nodes} <- SQLWhere.nodes(text),
+           {:ok, nodes} <- SQLWhere.only(text),
            :ok <- SQLTime.first_type_error(nodes),
            :ok <- SQLBind.reject_placeholders(nodes),
            :ok <- SQLTime.first_invalid(nodes) do

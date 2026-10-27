@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`Client.Local.SQLQuery`, `Client.Local.SQLParser`, `Client.Local.SQLWhere`, `Client.Local.SQLPredicate`, `Client.Local.SQLExpr`, and `Client.Local.InfluxQLTokens` mishandled unsupported `DELETE` clauses on `:v3_enterprise` and direct non-UTF-8 helper calls.**
+  `Client.Local.SQLQuery` now surfaces `SQLDml`'s planning errors for `USING`, `RETURNING`, `ORDER BY`, and `LIMIT` clauses on `:v3_enterprise` `DELETE` statements instead of ignoring them and deleting rows, and `SQLParser.parse_where/1` now uses `SQLWhere.only/1` so trailing clauses or non-`WHERE` text after `DELETE FROM <table>` are rejected instead of stripped or treated as an empty filter. `SQLWhere.nodes/1`, `SQLWhere.only/1`, `SQLWhere.parsed/1`, `SQLWhere.tree/1`, `SQLPredicate.parse/1`, `SQLExpr.parse/1`, `SQLExpr.parse_arithmetic/1`, and `InfluxQLTokens.take_until/3` now handle non-UTF-8 binaries without raising.
 - **`Client.Local.SQLStatement`, `Client.Local.SQLTokenizer`, `Client.Local.InfluxQLParser`, and `Client.Local.InfluxQLShowParser` mishandled non-UTF-8 byte sequences in leading SQL comments or direct parser calls.**
   `SQLStatement.parser_error/3`, `SQLStatement.bare_error/2`, and `SQLTokenizer.scan/2` now check `String.valid?(sql)` on the full SQL input instead of only the post-comment substring so non-UTF-8 bytes inside leading `--` or `/* ... */` comments preserve `SQLLexer.scrub/1`'s `"Client.Local: the SQL text is not valid UTF-8"` refusal instead of returning a synthetic `ParserError`. `InfluxQLParser.parse/1` and `InfluxQLShowParser.parse/1` now validate `String.valid?/1` when called directly, returning `{:error, "the InfluxQL text is not valid UTF-8"}`.
 

@@ -4,7 +4,17 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
   doctest InfluxElixir.Client.Local, only: [start: 1]
 
   alias InfluxElixir.Client.Local
-  alias InfluxElixir.Client.Local.{SQLDmlItem, SQLLiteral}
+
+  alias InfluxElixir.Client.Local.{
+    InfluxQLTokens,
+    SQLDmlItem,
+    SQLExpr,
+    SQLLiteral,
+    SQLParser,
+    SQLPredicate,
+    SQLWhere
+  }
+
   alias InfluxElixir.TestSupport.Await
 
   setup do
@@ -445,6 +455,67 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
                {:ok, %{"rows_affected" => 1}}
 
       assert Local.query_sql(conn, "SELECT * FROM cpu", database: db) === {:ok, []}
+    end
+
+    test "DELETE FROM on :v3_enterprise rejects unsupported clauses and preserves rows",
+         %{conn: conn, db: db} do
+      {:ok, :written} = Local.write(conn, "cpu,host=a v=1i\ncpu,host=b v=2i", database: db)
+
+      assert Local.execute_sql(conn, "DELETE FROM cpu LIMIT 1", database: db) ===
+               {:error,
+                %{
+                  status: 400,
+                  body: "Error during planning: Delete-limit clause not yet supported"
+                }}
+
+      assert Local.execute_sql(conn, "DELETE FROM cpu WHERE host = 'a' LIMIT 1", database: db) ===
+               {:error,
+                %{
+                  status: 400,
+                  body: "Error during planning: Delete-limit clause not yet supported"
+                }}
+
+      assert Local.execute_sql(conn, "DELETE FROM cpu ORDER BY time", database: db) ===
+               {:error,
+                %{
+                  status: 400,
+                  body: "Error during planning: Delete-order-by clause not yet supported"
+                }}
+
+      assert Local.execute_sql(conn, "DELETE FROM cpu RETURNING *", database: db) ===
+               {:error,
+                %{
+                  status: 400,
+                  body: "Error during planning: Delete-returning clause not yet supported"
+                }}
+
+      assert Local.execute_sql(conn, "DELETE FROM cpu USING other", database: db) ===
+               {:error, %{status: 400, body: "Error during planning: Using clause not supported"}}
+
+      assert {:error, %{status: 400, body: "Client.Local: unsupported WHERE clause: b"}} =
+               Local.execute_sql(conn, "DELETE FROM cpu, b", database: db)
+
+      assert {:error, %{status: 400, body: "Client.Local: unsupported WHERE clause: LIMIT 1"}} =
+               SQLParser.parse_where(" LIMIT 1")
+
+      assert {:ok, rows} = Local.query_sql(conn, "SELECT host FROM cpu", database: db)
+      assert length(rows) == 2
+    end
+
+    test "direct SQLWhere, SQLPredicate, SQLExpr, and InfluxQLTokens calls handle invalid UTF-8" do
+      bad = <<0xFF, 0xFE>>
+
+      utf8_refusal =
+        {:error, %{status: 400, body: "Client.Local: the SQL text is not valid UTF-8"}}
+
+      assert SQLWhere.nodes(bad) === utf8_refusal
+      assert SQLWhere.only(bad) === utf8_refusal
+      assert SQLWhere.parsed(bad) === utf8_refusal
+      assert SQLWhere.tree(bad) === nil
+      assert SQLPredicate.parse(bad) === utf8_refusal
+      assert SQLExpr.parse(bad) === {:error, :invalid_utf8}
+      assert SQLExpr.parse_arithmetic(bad) === {:error, :invalid_utf8}
+      assert {:ok, [{:str, <<?a, 0xFF>>}]} = InfluxQLTokens.tokenize("'a" <> <<0xFF>> <> "'", [])
     end
   end
 

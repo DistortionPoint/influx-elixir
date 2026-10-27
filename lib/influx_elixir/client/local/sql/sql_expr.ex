@@ -145,7 +145,8 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   @spec parse_with(binary(), ([term()] -> {:ok, t(), [term()]} | {:error, term()})) ::
           {:ok, t()} | {:error, term()}
   defp parse_with(str, entry) do
-    with {:ok, tokens} <- tokenize_expr(str),
+    with true <- String.valid?(str) || {:error, :invalid_utf8},
+         {:ok, tokens} <- tokenize_expr(str),
          {:ok, ast, []} <- entry.(tokens) do
       {:ok, ast}
     else
