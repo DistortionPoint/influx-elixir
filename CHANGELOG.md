@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.56] - 2026-10-27
+
 ### Fixed
 - **`Client.Local.SQLQuery`, `Client.Local.SQLParser`, `Client.Local.SQLWhere`, `Client.Local.SQLPredicate`, `Client.Local.SQLExpr`, and `Client.Local.InfluxQLTokens` mishandled unsupported `DELETE` clauses on `:v3_enterprise` and direct non-UTF-8 helper calls.**
   `Client.Local.SQLQuery` now surfaces `SQLDml`'s planning errors for `USING`, `RETURNING`, `ORDER BY`, and `LIMIT` clauses on `:v3_enterprise` `DELETE` statements instead of ignoring them and deleting rows, and `SQLParser.parse_where/1` now uses `SQLWhere.only/1` so trailing clauses or non-`WHERE` text after `DELETE FROM <table>` are rejected instead of stripped or treated as an empty filter. `SQLWhere.nodes/1`, `SQLWhere.only/1`, `SQLWhere.parsed/1`, `SQLWhere.tree/1`, `SQLPredicate.parse/1`, `SQLExpr.parse/1`, `SQLExpr.parse_arithmetic/1`, and `InfluxQLTokens.take_until/3` now handle non-UTF-8 binaries without raising.
