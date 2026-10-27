@@ -11,7 +11,15 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
-  alias InfluxElixir.Client.Local.{Flux, LineProtocolV3}
+
+  alias InfluxElixir.Client.Local.{
+    Flux,
+    InfluxQL,
+    InfluxQLShowParser,
+    LineProtocolV3,
+    SQLStatement,
+    SQLTokenizer
+  }
 
   @bad <<0xFF>>
   @flux_head "from(bucket: \"utf8_flux\") |> range(start: 0)"
@@ -51,6 +59,12 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
                  {:error, %{status: 400, body: @iql_refusal}},
                inspect(statement)
       end
+
+      assert InfluxQL.parse("SELECT v FROM m -- " <> @bad) ===
+               {:error, "the InfluxQL text is not valid UTF-8"}
+
+      assert InfluxQLShowParser.parse("SHOW DATABASES -- " <> @bad) ===
+               {:error, "the InfluxQL text is not valid UTF-8"}
     end
 
     test "a database name that is not UTF-8 is refused by name, not quoted into a 404", %{
@@ -87,8 +101,25 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
   describe "SQL" do
     test "a statement, a database name or a format that is not UTF-8 is refused by name",
          %{conn: c} do
-      assert Local.query_sql(c, "SELECT '" <> @bad <> "' AS a", database: "utf8_iql") ===
-               {:error, %{status: 400, body: "Client.Local: the SQL text is not valid UTF-8"}}
+      for sql <- [
+            "SELECT '" <> @bad <> "' AS a",
+            "-- " <> @bad <> "\nFOO",
+            "/* " <> @bad <> " */ FOO",
+            "-- " <> @bad <> "\nGRANT x",
+            "-- " <> @bad <> "\nUPDATE"
+          ] do
+        assert Local.query_sql(c, sql, database: "utf8_iql") ===
+                 {:error, %{status: 400, body: "Client.Local: the SQL text is not valid UTF-8"}},
+               inspect(sql)
+
+        assert Local.check_sql(sql) ===
+                 {:error, %{status: 400, body: "Client.Local: the SQL text is not valid UTF-8"}},
+               inspect(sql)
+      end
+
+      assert SQLStatement.parser_error("-- " <> @bad <> "\nFOO") === nil
+      assert SQLStatement.bare_error("-- " <> @bad <> "\nUPDATE") === nil
+      assert SQLTokenizer.scan("-- " <> @bad <> "\nSELECT 1") === :bail
 
       assert Local.query_sql(c, "SELECT 1", database: "utf8_iql" <> @bad) ===
                {:error, %{status: 400, body: @name_refusal}}

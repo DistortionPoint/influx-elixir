@@ -68,6 +68,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
           {:ok, InfluxQL.query()}
           | {:error, binary() | {:engine, binary()} | {:engine, pos_integer(), binary()}}
   def parse(statement) do
+    if String.valid?(statement) do
+      do_parse(statement)
+    else
+      {:error, "the InfluxQL text is not valid UTF-8"}
+    end
+  end
+
+  defp do_parse(statement) do
     case parse_statement(statement) do
       {:error, :unread_shape} ->
         {:error, "unsupported InfluxQL (that shape of statement)"}

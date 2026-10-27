@@ -88,7 +88,9 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   not read at all.
   """
   @spec scan(binary(), position()) :: result()
-  def scan(sql, {line, column} \\ {1, 1}), do: tokenize(sql, line, column, [])
+  def scan(sql, {line, column} \\ {1, 1}) do
+    if String.valid?(sql), do: tokenize(sql, line, column, []), else: :bail
+  end
 
   @doc """
   Whether a token is a hexadecimal number (`0x1F`), which the engine reads as a binary value.

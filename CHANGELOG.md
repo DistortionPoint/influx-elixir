@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local.SQLStatement`, `Client.Local.SQLTokenizer`, `Client.Local.InfluxQLParser`, and `Client.Local.InfluxQLShowParser` mishandled non-UTF-8 byte sequences in leading SQL comments or direct parser calls.**
+  `SQLStatement.parser_error/3`, `SQLStatement.bare_error/2`, and `SQLTokenizer.scan/2` now check `String.valid?(sql)` on the full SQL input instead of only the post-comment substring so non-UTF-8 bytes inside leading `--` or `/* ... */` comments preserve `SQLLexer.scrub/1`'s `"Client.Local: the SQL text is not valid UTF-8"` refusal instead of returning a synthetic `ParserError`. `InfluxQLParser.parse/1` and `InfluxQLShowParser.parse/1` now validate `String.valid?/1` when called directly, returning `{:error, "the InfluxQL text is not valid UTF-8"}`.
+
 ## [0.1.55] - 2026-10-26
 
 ### Fixed

@@ -167,7 +167,7 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
     {blank, rest} = split_blank(sql)
 
     cond do
-      not String.valid?(rest) or rest == "" or String.starts_with?(rest, "(") ->
+      not String.valid?(sql) or rest == "" or String.starts_with?(rest, "(") ->
         nil
 
       # The parser reads a statement that begins with `CASE` as the start of an expression, and
@@ -391,7 +391,7 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   def bare_error(sql, at \\ {1, 1}) do
     {blank, rest} = split_blank(sql)
 
-    with true <- String.valid?(rest),
+    with true <- String.valid?(sql),
          [word, tail] <- Regex.run(~r/\A([A-Za-z]+)(\s*;?\s*)\z/, rest, capture: :all_but_first),
          upper = String.upcase(word),
          true <- upper in @statement_words do

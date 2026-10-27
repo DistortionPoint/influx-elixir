@@ -70,7 +70,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   """
   @spec parse(binary()) :: nil | {:ok, map()} | {:error, binary() | {:engine, binary()}}
   def parse(raw) do
-    if Regex.match?(@show_word, raw), do: read(raw)
+    cond do
+      not String.valid?(raw) -> {:error, "the InfluxQL text is not valid UTF-8"}
+      Regex.match?(@show_word, raw) -> read(raw)
+      true -> nil
+    end
   end
 
   @spec read(binary()) :: nil | {:ok, map()} | {:error, term()}
