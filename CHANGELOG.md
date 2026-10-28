@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.57] - 2026-10-28
+
 ### Fixed
 - **`Client.HTTP.Buckets.create/3`, `Client.HTTP.Request`, `ConnectionSupervisor.start_link/1`, `Flight.Client`, `Client.Options`, `Client.QueryParams`, and `Client.Local` SQL helpers mishandled per-call timeouts on org lookup, unredacted tokens on missing `:name`, or non-keyword/non-map inputs.**
   `Client.HTTP.Buckets.create/3` and `Client.HTTP.Request.get/4` now forward per-call `opts` (`:timeout`, `:pool_timeout`) to the `GET /api/v2/orgs` request when resolving an organization name to an ID, instead of ignoring per-call timeouts on the org lookup leg. `ConnectionSupervisor.start_link/1` now redacts `:token` via `Secret.redact/1` when returning `{:error, {:invalid_options, config}}` on a missing or invalid `:name`. `Flight.Client.collect_stream/1` now returns `{:error, {:unexpected_stream_item, item}}` on malformed stream elements instead of raising `FunctionClauseError`, and `Flight.Client.resolve_connect_timeout/1`, `Client.HTTP.Request.resolve_timeout/2`, `Client.HTTP.Request.resolve_pool_timeout/2`, `Client.Options.database/1`, `Client.QueryParams.engine_values/1`, and `Client.Local` SQL helpers (`SQLCoerce`, `SQLDml`, `SQLExecutor`, `SQLNullType`, `SQLSchema`, and `SQLTyping`) now guard argument shapes cleanly without raising `KeyError` or emitting Elixir 1.18+ runtime map-dot warnings.
