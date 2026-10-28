@@ -71,7 +71,7 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
   @spec expression_shape?(binary()) :: boolean()
   defp expression_shape?(body) do
     case SQLSelect.aggregate_spans(body) do
-      [] -> not Regex.match?(~r/\A(?:\w+|"(?:[^"]|"")*")\z/u, body)
+      [] -> not (String.valid?(body) and Regex.match?(~r/\A(?:\w+|"(?:[^"]|"")*")\z/u, body))
       [{0, length}] -> length != byte_size(body)
       _several -> true
     end

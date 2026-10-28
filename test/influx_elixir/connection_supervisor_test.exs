@@ -207,6 +207,30 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
       assert start_error("not an atom", host: "h") ===
                {:invalid_options, [name: "not an atom", host: "h"]}
     end
+
+    test "registration ignores stray messages and name helpers reject non-connection terms" do
+      name = unique_name()
+      {:ok, _sup} = ConnectionSupervisor.start_link(name: name, databases: ["x"])
+      on_exit(fn -> InfluxElixir.remove_connection(name) end)
+
+      reg_name = ConnectionSupervisor.Registration.process_name(name)
+      reg_pid = Process.whereis(reg_name)
+      assert is_pid(reg_pid)
+
+      send(reg_pid, :unexpected_message)
+      _state = :sys.get_state(reg_pid)
+      assert Process.alive?(reg_pid)
+      assert {:ok, _conn} = Connection.get(name)
+
+      for bad <- [nil, true, false, "str", 123] do
+        assert_raise FunctionClauseError, fn -> ConnectionSupervisor.finch_name(bad) end
+        assert_raise FunctionClauseError, fn -> ConnectionSupervisor.batch_writer_name(bad) end
+
+        assert_raise FunctionClauseError, fn ->
+          ConnectionSupervisor.Registration.process_name(bad)
+        end
+      end
+    end
   end
 
   describe "a config the client refuses" do

@@ -79,16 +79,20 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
 
   @spec scan(binary()) :: {[{non_neg_integer(), {binary(), token()}}], [{binary(), token()}]}
   defp scan(rest) do
-    found =
-      ~r/(?i)(?<![\w.])(LIMIT|OFFSET)\s+(\S+)/u
-      |> Regex.scan(rest, return: :index)
-      |> Enum.map(fn [{start, _len}, keyword, token] ->
-        {start,
-         {rest |> SQLMask.cut(keyword) |> String.upcase(), token(SQLMask.cut(rest, token))}}
-      end)
-      |> Enum.reject(&match?({_start, {_keyword, :not_a_clause}}, &1))
+    if String.valid?(rest) do
+      found =
+        ~r/(?i)(?<![\w.])(LIMIT|OFFSET)\s+(\S+)/u
+        |> Regex.scan(rest, return: :index)
+        |> Enum.map(fn [{start, _len}, keyword, token] ->
+          {start,
+           {rest |> SQLMask.cut(keyword) |> String.upcase(), token(SQLMask.cut(rest, token))}}
+        end)
+        |> Enum.reject(&match?({_start, {_keyword, :not_a_clause}}, &1))
 
-    {found, Enum.map(found, &elem(&1, 1))}
+      {found, Enum.map(found, &elem(&1, 1))}
+    else
+      {[], []}
+    end
   end
 
   @spec error(:ok | {:error, SQLError.t()}) :: SQLError.t() | nil

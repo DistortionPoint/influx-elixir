@@ -179,7 +179,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   quote; `:error` when the string is not closed or an escape is not one.
   """
   @spec escaped(binary()) :: {:ok, binary(), binary()} | :error
-  def escaped(body), do: take_escaped(body, [])
+  def escaped(body), do: if(String.valid?(body), do: take_escaped(body, []), else: :error)
 
   @spec take_escaped(binary(), [binary()]) :: {:ok, binary(), binary()} | :error
   defp take_escaped(<<?', ?', rest::binary>>, acc), do: take_escaped(rest, ["'" | acc])

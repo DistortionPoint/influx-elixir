@@ -168,23 +168,32 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   end
 
   # A dollar-quoted string, or the position after a placeholder's `$`.
-  defp skip_dollar(sql, pos, rest) do
-    case Regex.run(~r/\A\$([\p{L}\p{N}_]*)\$/u, rest) do
-      [open, _tag] ->
-        after_open = pos + byte_size(open)
+  defp skip_dollar(sql, pos, <<?$, after_dollar::binary>> = rest) do
+    size = tag_length(after_dollar, 0)
+
+    case after_dollar do
+      <<_tag::binary-size(size), ?$, _tail::binary>> ->
+        open = binary_part(rest, 0, size + 2)
+        after_open = pos + size + 2
 
         case :binary.match(sql, open, scope: {after_open, byte_size(sql) - after_open}) do
           {at, length} -> at + length
           :nomatch -> byte_size(sql)
         end
 
-      nil ->
+      _no_close ->
         pos + 1
     end
   end
 
   defp word_before?(_sql, 0), do: false
-  defp word_before?(sql, pos), do: Regex.match?(~r/[\p{L}\p{N}_]/u, last_character(sql, pos))
+
+  defp word_before?(sql, pos) do
+    case last_character(sql, pos) do
+      <<c::utf8>> -> SQLIdentifiers.word_char?(c)
+      _other -> false
+    end
+  end
 
   defp last_character(sql, pos) do
     sql |> binary_part(0, pos) |> String.last() |> Kernel.||("")

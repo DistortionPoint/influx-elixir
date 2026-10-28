@@ -90,9 +90,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   """
   @spec rust_debug(binary()) :: binary()
   def rust_debug(text) do
-    body = for <<cp::utf8 <- text>>, into: "", do: escape_char(cp)
-    ~s("#{body}")
+    ~s("#{escape_debug(text, [])}")
   end
+
+  defp escape_debug(<<>>, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
+
+  defp escape_debug(<<cp::utf8, rest::binary>>, acc),
+    do: escape_debug(rest, [escape_char(cp) | acc])
+
+  defp escape_debug(<<byte, rest::binary>>, acc),
+    do: escape_debug(rest, ["\\x" <> hex(byte) | acc])
 
   # The characters Rust's `{:?}` writes as `\u{..}`: control, separator and mark characters.
   @escaped ~q/\A[\p{C}\p{Zl}\p{Zp}\p{Zs}\p{Mn}\p{Me}]\z/u
@@ -122,11 +129,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   the size of the text.
   """
   @spec quoted_start(binary(), binary()) :: non_neg_integer() | nil
-  def quoted_start(quoted, whole) do
-    text = unquote_debug(binary_part(quoted, 1, byte_size(quoted) - 2), [])
-    pos = byte_size(whole) - byte_size(text)
-    if pos >= 0 and leftover(whole, pos) == text, do: pos
+  def quoted_start(<<"\"", _rest::binary>> = quoted, whole) when is_binary(whole) do
+    if byte_size(quoted) >= 2 and :binary.last(quoted) == ?" do
+      text = unquote_debug(binary_part(quoted, 1, byte_size(quoted) - 2), [])
+      pos = byte_size(whole) - byte_size(text)
+      if pos >= 0 and leftover(whole, pos) == text, do: pos
+    end
   end
+
+  def quoted_start(_quoted, _whole), do: nil
 
   # The inverse of `rust_debug/1`, inside its quotes.
   defp unquote_debug(<<>>, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
@@ -138,11 +149,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   defp unquote_debug(<<"\\\"", rest::binary>>, acc), do: unquote_debug(rest, ["\"" | acc])
 
   defp unquote_debug(<<"\\u{", rest::binary>>, acc) do
-    [hex, after_hex] = String.split(rest, "}", parts: 2)
-    unquote_debug(after_hex, [<<String.to_integer(hex, 16)::utf8>> | acc])
+    with [hex, after_hex] <- String.split(rest, "}", parts: 2),
+         {cp, ""} when cp >= 0 and cp <= 0x10FFFF <- Integer.parse(hex, 16),
+         true <- cp not in 0xD800..0xDFFF do
+      unquote_debug(after_hex, [<<cp::utf8>> | acc])
+    else
+      _other -> unquote_debug(rest, ["\\u{" | acc])
+    end
   end
 
   defp unquote_debug(<<c::utf8, rest::binary>>, acc), do: unquote_debug(rest, [<<c::utf8>> | acc])
+  defp unquote_debug(<<byte, rest::binary>>, acc), do: unquote_debug(rest, [<<byte>> | acc])
 
   # How many blanks (a space, a tab, a carriage return, a line feed) the statement starts with.
   @spec leading_blanks(binary()) :: non_neg_integer()

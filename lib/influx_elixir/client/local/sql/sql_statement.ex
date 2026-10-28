@@ -274,6 +274,10 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   """
   @spec display(binary()) :: {:ok, binary()} | :unknown
   def display(statement) do
+    if String.valid?(statement), do: do_display(statement), else: :unknown
+  end
+
+  defp do_display(statement) do
     text = statement |> String.trim() |> String.replace_suffix(";", "") |> String.trim()
 
     cond do

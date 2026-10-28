@@ -13,7 +13,8 @@ defmodule InfluxElixir.Client.Local.SQLDistinctOn do
   @doc "The text without its `DISTINCT ON (...)` list, and that list, or `nil`."
   @spec split(binary()) :: {binary(), binary() | nil}
   def split(sql) do
-    with [_full, select, after_open] <- Regex.run(@distinct_on, sql),
+    with true <- String.valid?(sql),
+         [_full, select, after_open] <- Regex.run(@distinct_on, sql),
          {:ok, on, rest} <- SQLMask.balanced(after_open) do
       {select <> String.trim_leading(rest), on}
     else
@@ -66,7 +67,7 @@ defmodule InfluxElixir.Client.Local.SQLDistinctOn do
       columns == [""] ->
         {:error, %{status: 400, body: "Error during planning: No `ON` expressions provided"}}
 
-      not Enum.all?(columns, &Regex.match?(~r/^(?:\w+|"[^"]+")$/u, &1)) ->
+      not String.valid?(on) or not Enum.all?(columns, &Regex.match?(~r/^(?:\w+|"[^"]+")$/u, &1)) ->
         {:error, SQLError.refusal("DISTINCT ON takes column names only: (#{on})")}
 
       true ->

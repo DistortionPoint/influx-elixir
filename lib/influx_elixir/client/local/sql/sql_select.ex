@@ -112,7 +112,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
 
   @doc "Whether a text calls an aggregate function."
   @spec aggregate_call?(binary()) :: boolean()
-  def aggregate_call?(text), do: Regex.match?(@aggregate_call, text)
+  def aggregate_call?(text), do: String.valid?(text) and Regex.match?(@aggregate_call, text)
 
   @doc "Whether a text calls an InfluxQL-only function (`FIRST`, `LAST`), which SQL does not have."
   @spec influxql_call?(binary()) :: boolean()
@@ -146,7 +146,11 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
 
     case SQLMask.balanced(after_open) do
       {:ok, _inside, tail} ->
-        tail = Regex.replace(~r/\A\s*\[\s*'(?:value|time)'\s*\]/u, tail, "")
+        tail =
+          if String.valid?(tail),
+            do: Regex.replace(~r/\A\s*\[\s*'(?:value|time)'\s*\]/u, tail, ""),
+            else: tail
+
         stop = byte_size(text) - byte_size(tail)
         {[{start, stop - start} | spans], stop}
 
@@ -231,10 +235,14 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   # on, and it does not end with an operator.
   @spec expression_end?(binary()) :: boolean()
   defp expression_end?(body) do
-    last = body |> String.split(~r/[^\w"]+/u, trim: true) |> List.last()
+    if String.valid?(body) do
+      last = body |> String.split(~r/[^\w"]+/u, trim: true) |> List.last()
 
-    not (is_nil(last) or
-           (Regex.match?(~r/\A\w+\z/u, last) and String.upcase(last) in @continuations))
+      not (is_nil(last) or
+             (Regex.match?(~r/\A\w+\z/u, last) and String.upcase(last) in @continuations))
+    else
+      false
+    end
   end
 
   @doc "A column name as written (a word, or a quoted identifier) as the name it holds."
@@ -253,7 +261,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   """
   @spec constant(binary()) :: {SQLExpr.t(), binary() | nil} | nil
   def constant(body) do
-    if Regex.match?(@constant, SQLMask.mask(body)) do
+    if String.valid?(body) and Regex.match?(@constant, SQLMask.mask(body)) do
       expr = constant_expr(body)
       {expr, rendered(expr, nil)}
     end
@@ -285,33 +293,37 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   @spec parse_single_column(binary(), binary() | nil) ::
           {:ok, column()} | {:error, term()}
   defp parse_single_column(col, qualifier) do
-    masked = SQLMask.mask(col)
-    {body, alias_name} = split_alias(col)
+    if String.valid?(col) do
+      masked = SQLMask.mask(col)
+      {body, alias_name} = split_alias(col)
 
-    cond do
-      String.match?(masked, ~r/(?i)DATE_BIN\s*\(/u) ->
-        parse_date_bin_column(col, body, alias_name, qualifier)
+      cond do
+        String.match?(masked, ~r/(?i)DATE_BIN\s*\(/u) ->
+          parse_date_bin_column(col, body, alias_name, qualifier)
 
-      String.match?(masked, ~r/(?i)\b(FIRST_VALUE|LAST_VALUE)\s*\(/u) ->
-        parse_ordered_agg_column(col, body, alias_name, qualifier)
+        String.match?(masked, ~r/(?i)\b(FIRST_VALUE|LAST_VALUE)\s*\(/u) ->
+          parse_ordered_agg_column(col, body, alias_name, qualifier)
 
-      String.match?(masked, ~r/(?i)\bSELECTOR_(FIRST|LAST|MIN|MAX)\s*\(/u) ->
-        parse_selector_column(col, body, alias_name, qualifier)
+        String.match?(masked, ~r/(?i)\bSELECTOR_(FIRST|LAST|MIN|MAX)\s*\(/u) ->
+          parse_selector_column(col, body, alias_name, qualifier)
 
-      match = Regex.run(@influxql_call, masked) ->
-        {:error, invalid_function(hd(match))}
+        match = Regex.run(@influxql_call, masked) ->
+          {:error, invalid_function(hd(match))}
 
-      String.match?(masked, ~r/(?i)\b(?:#{@plain_alternation})\s*\(/u) ->
-        parse_agg_column(col, body, alias_name, qualifier)
+        String.match?(masked, ~r/(?i)\b(?:#{@plain_alternation})\s*\(/u) ->
+          parse_agg_column(col, body, alias_name, qualifier)
 
-      constant = constant(body) ->
-        parse_constant_column(col, constant, alias_name)
+        constant = constant(body) ->
+          parse_constant_column(col, constant, alias_name)
 
-      String.match?(body, ~r/^#{@name}$/u) ->
-        parse_grouping_column(body, alias_name)
+        String.match?(body, ~r/^#{@name}$/u) ->
+          parse_grouping_column(body, alias_name)
 
-      true ->
-        {:error, SQLError.refusal("unsupported column expression: #{col}")}
+        true ->
+          {:error, SQLError.refusal("unsupported column expression: #{col}")}
+      end
+    else
+      {:error, SQLError.refusal("unsupported column expression: #{col}")}
     end
   end
 

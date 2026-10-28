@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`QueryParams`, `ConnectionSupervisor`, `ConnectionSupervisor.Registration`, and `Client.Local` helpers raised on direct `%Decimal{}` / unencodable values, non-atom connection names, stray messages, or non-UTF-8 / unterminated string inputs.**
+  `QueryParams.problem/1` and `QueryParams.engine_values/1` now encode `%Decimal{}` and arbitrary terms through `encode_json/1` so direct `Decimal` values (`NaN`, `Infinity`, `1e400`, or finite numbers) and non-UTF-8 binaries never raise `Jason.EncodeError` or misclassify `Decimal` structs as strings. `ConnectionSupervisor.finch_name/1`, `ConnectionSupervisor.batch_writer_name/1`, and `ConnectionSupervisor.Registration.process_name/1` now guard that `name` is a non-boolean, non-`nil` atom, and `ConnectionSupervisor.Registration` implements `handle_info/2` so stray messages do not log OTP warnings or crash the registration process. `Client.Local` internal helpers (`Retention`, `InfluxQLError`, `InfluxQLText`, `SQLLexer`, `SQLIdentifiers`, `SQLMask`, `SQLTokenizer`, `SQLStatement`, `SQLLiteral`, `SQLRewrite`, `SQLShow`, `SQLTime`, `SQLDistinctOn`, `SQLLimit`, `SQLClauses`, `SQLSelect`, and `SQLAggExpr`) now handle non-UTF-8 binaries and unterminated string literals without raising when called directly.
+
 ## [0.1.56] - 2026-10-27
 
 ### Fixed

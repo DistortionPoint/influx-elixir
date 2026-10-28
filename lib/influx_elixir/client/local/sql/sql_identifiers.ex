@@ -71,6 +71,8 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
     end
   end
 
+  defp scan(<<byte, rest::binary>>, acc), do: scan(rest, [byte | acc])
+
   # A number (`1e5`, `2.5`) is copied whole, so its exponent is not a word; the word after
   # it is set apart by a space, which the passes after this one read as the tokenizer does.
   # The `L` of `1L` is dropped: it changes nothing the passes after this one read.
@@ -94,8 +96,13 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
   """
   @spec take_number(binary()) :: {binary(), binary()}
   def take_number(text) do
-    [number] = Regex.run(@number, text)
-    {number, binary_part(text, byte_size(number), byte_size(text) - byte_size(number))}
+    case Regex.run(@number, text) do
+      [number] ->
+        {number, binary_part(text, byte_size(number), byte_size(text) - byte_size(number))}
+
+      nil ->
+        {"", text}
+    end
   end
 
   # What keeps the text after a number a token of its own: a space where a word follows, or
@@ -138,7 +145,7 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
     if word_char?(c), do: take_word(rest, [<<c::utf8>> | acc]), else: {Enum.reverse(acc), input}
   end
 
-  defp take_word(<<>>, acc), do: {Enum.reverse(acc), <<>>}
+  defp take_word(rest, acc), do: {Enum.reverse(acc), rest}
 
   # The characters beyond ASCII that are letters (`\p{L}`), and letters or numbers (`\p{L}` and
   # `\p{N}`), as ranges `{first, last}` found once, when this module is compiled, by the regular

@@ -34,7 +34,8 @@ defmodule InfluxElixir.ConnectionSupervisor.Registration do
 
   @doc false
   @spec process_name(atom()) :: atom()
-  def process_name(name), do: :"influx_elixir_#{name}_registration"
+  def process_name(name) when is_atom(name) and name not in [nil, true, false],
+    do: :"influx_elixir_#{name}_registration"
 
   @impl GenServer
   def init({name, _client, connection} = state) do
@@ -43,6 +44,9 @@ defmodule InfluxElixir.ConnectionSupervisor.Registration do
     Connection.put(name, connection.())
     {:ok, state}
   end
+
+  @impl GenServer
+  def handle_info(_message, state), do: {:noreply, state}
 
   @impl GenServer
   def terminate(_reason, {name, client, connection}) do

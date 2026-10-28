@@ -66,8 +66,14 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   defp scan(<<?/, rest::binary>>, %{regex: true} = config, acc, last) when last in ["=~", "!~"],
     do: literal(rest, ?/, config, acc, 0)
 
-  defp scan(<<byte, rest::binary>>, config, acc, last),
-    do: scan(rest, config, [byte | acc], next_last(config, last, byte))
+  defp scan(<<c::utf8, rest::binary>>, config, acc, last) when c < 128,
+    do: scan(rest, config, [c | acc], next_last(config, last, c))
+
+  defp scan(<<c::utf8, rest::binary>>, config, acc, last),
+    do: scan(rest, config, [<<c::utf8>> | acc], next_last(config, last, ?x))
+
+  defp scan(<<_byte, rest::binary>>, config, acc, _last),
+    do: scan(rest, config, [0x7F | acc], "")
 
   @spec next_last(config(), binary(), byte()) :: binary()
   defp next_last(%{regex: false}, _last, _byte), do: ""
@@ -80,7 +86,7 @@ defmodule InfluxElixir.Client.Local.SQLMask do
 
   # The body of a literal opened by `delimiter`, `blanks` bytes so far.
   @spec literal(binary(), byte(), config(), iodata(), non_neg_integer()) :: iodata()
-  defp literal(<<>>, delimiter, %{lenient: true} = config, acc, blanks),
+  defp literal(<<>>, delimiter, config, acc, blanks),
     do: scan(<<>>, config, [filler(config, blanks), delimiter | acc], "")
 
   defp literal(<<?\\, _byte, rest::binary>>, delimiter, %{backslash: true} = config, acc, blanks),
@@ -118,14 +124,18 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   """
   @spec hide_inner_from(binary()) :: binary()
   def hide_inner_from(masked) do
-    masked
-    |> hide_in_parentheses(0, [])
-    |> IO.iodata_to_binary()
-    |> then(
-      &Regex.replace(~r/\b(IS\s+(?:NOT\s+)?DISTINCT\s+)FROM\b/iu, &1, fn _all, head ->
-        head <> "xxxx"
-      end)
-    )
+    if String.valid?(masked) do
+      masked
+      |> hide_in_parentheses(0, [])
+      |> IO.iodata_to_binary()
+      |> then(
+        &Regex.replace(~r/\b(IS\s+(?:NOT\s+)?DISTINCT\s+)FROM\b/iu, &1, fn _all, head ->
+          head <> "xxxx"
+        end)
+      )
+    else
+      masked
+    end
   end
 
   @spec hide_in_parentheses(binary(), non_neg_integer(), iodata()) :: iodata()

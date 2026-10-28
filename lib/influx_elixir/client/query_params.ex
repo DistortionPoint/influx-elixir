@@ -159,11 +159,15 @@ defmodule InfluxElixir.Client.QueryParams do
   @spec engine_values(t()) :: %{binary() => term()}
   def engine_values(params) do
     Map.new(params, fn {name, value} ->
-      json = Jason.encode!(value)
+      case encode_json(value) do
+        {:ok, json} ->
+          case number_text(json) do
+            true -> {name, read_number(json)}
+            false -> {name, Jason.decode!(json)}
+          end
 
-      case number_text(json) do
-        true -> {name, read_number(json)}
-        false -> {name, Jason.decode!(json)}
+        :error ->
+          {name, nil}
       end
     end)
   end
@@ -173,15 +177,35 @@ defmodule InfluxElixir.Client.QueryParams do
   or a number it cannot read; `nil` when it reads it.
   """
   @spec problem(term()) :: problem() | nil
-  def problem(value) do
-    json = Jason.encode!(value)
+  def problem(%{__struct__: Decimal, coef: coef}) when coef in [:NaN, :inf], do: :out_of_range
 
-    cond do
-      String.starts_with?(json, "{") -> :object
-      String.starts_with?(json, "[") -> :array
-      number_text(json) and read_number(json) == :out_of_range -> :out_of_range
-      true -> nil
+  def problem(value) do
+    case encode_json(value) do
+      {:ok, json} ->
+        cond do
+          String.starts_with?(json, "{") -> :object
+          String.starts_with?(json, "[") -> :array
+          number_text(json) and read_number(json) == :out_of_range -> :out_of_range
+          true -> nil
+        end
+
+      :error ->
+        nil
     end
+  end
+
+  @spec encode_json(term()) :: {:ok, binary()} | :error
+  defp encode_json(%{__struct__: Decimal, coef: coef}) when coef in [:NaN, :inf], do: :error
+  defp encode_json(%{__struct__: Decimal} = value), do: {:ok, Decimal.to_string(value, :normal)}
+
+  defp encode_json(value) do
+    case Jason.encode(value) do
+      {:ok, json} -> {:ok, json}
+      {:error, _exception} -> :error
+    end
+  rescue
+    _error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError, ArgumentError] ->
+      :error
   end
 
   @spec number_text(binary()) :: boolean()

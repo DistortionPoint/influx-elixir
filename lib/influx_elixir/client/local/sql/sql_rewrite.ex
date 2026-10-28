@@ -53,24 +53,28 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   @doc "Whether the statement (a plain `SELECT`, once `SQLSyntax` has read it) has an `INTO`."
   @spec into?(binary()) :: boolean()
   def into?(sql) do
-    Regex.match?(~r/\binto\b/i, sql) and
+    String.valid?(sql) and Regex.match?(~r/\binto\b/i, sql) and
       sql |> tokens([]) |> without_into() |> elem(1)
   end
 
   @doc "The statement with the engine's other spellings written as the ones the double reads."
   @spec apply(binary()) :: binary()
   def apply(sql) do
-    sql
-    |> tokens([])
-    |> without_into()
-    |> elem(0)
-    |> Enum.map(&spelled/1)
-    |> keyword_aliases()
-    |> select_all()
-    |> offset_rows()
-    |> fetch()
-    |> from_lists(0, [], [])
-    |> Enum.map_join(fn {_kind, text} -> text end)
+    if String.valid?(sql) do
+      sql
+      |> tokens([])
+      |> without_into()
+      |> elem(0)
+      |> Enum.map(&spelled/1)
+      |> keyword_aliases()
+      |> select_all()
+      |> offset_rows()
+      |> fetch()
+      |> from_lists(0, [], [])
+      |> Enum.map_join(fn {_kind, text} -> text end)
+    else
+      sql
+    end
   end
 
   # ---------------------------------------------------------------------------

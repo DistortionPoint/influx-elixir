@@ -119,7 +119,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   # quoted.
   @spec identifier_text(binary()) :: binary()
   defp identifier_text(name) do
-    if Regex.match?(~r/\A[\p{L}_][\p{L}\p{N}_]*\z/u, name),
+    if String.valid?(name) and Regex.match?(~r/\A[\p{L}_][\p{L}\p{N}_]*\z/u, name),
       do: name,
       else: ~s|"#{String.replace(name, ~s("), ~s(""))}"|
   end
@@ -284,7 +284,8 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   end
 
   @spec squeeze(binary()) :: binary()
-  defp squeeze(text), do: String.replace(text, ~r/\s+/u, "")
+  defp squeeze(text),
+    do: if(String.valid?(text), do: String.replace(text, ~r/\s+/u, ""), else: text)
 
   @spec positional(binary(), [{binary(), binary()}]) ::
           {:ok, {binary(), binary()}} | :not_positional | {:error, map()}
@@ -374,10 +375,10 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   defp tuple?(_item), do: false
 
   @spec date_bin_item?(binary()) :: boolean()
-  defp date_bin_item?(item), do: Regex.match?(~r/^DATE_BIN\s*\(/iu, item)
+  defp date_bin_item?(item), do: String.valid?(item) and Regex.match?(~r/^DATE_BIN\s*\(/iu, item)
 
   @spec empty_tuple?(binary()) :: boolean()
-  defp empty_tuple?(item), do: Regex.match?(~r/\A\(\s*\)\z/u, item)
+  defp empty_tuple?(item), do: String.valid?(item) and Regex.match?(~r/\A\(\s*\)\z/u, item)
 
   @doc """
   The engine's 405 for a `GROUP BY` with an empty tuple (`GROUP BY ()`), or
@@ -416,7 +417,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
 
   @spec group_item(binary()) :: {:ok, binary() | {:expr, SQLExpr.t()}} | {:error, SQLError.t()}
   defp group_item(item) do
-    if Regex.match?(~r/\A(?:\w+|"(?:[^"]|"")*")\z/u, item) do
+    if String.valid?(item) and Regex.match?(~r/\A(?:\w+|"(?:[^"]|"")*")\z/u, item) do
       {:ok, SQLSelect.name(item)}
     else
       case SQLExpr.parse(item) do

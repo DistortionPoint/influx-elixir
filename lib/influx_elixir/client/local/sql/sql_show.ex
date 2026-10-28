@@ -36,18 +36,22 @@ defmodule InfluxElixir.Client.Local.SQLShow do
   """
   @spec rewrite(binary()) :: {:ok, binary(), binary() | nil} | {:error, map()} | :nomatch
   def rewrite(sql) do
-    case {Regex.run(@show, sql), Regex.run(@describe, sql)} do
-      {[_all, _tables], _no_describe} ->
-        {:ok, "SELECT * FROM information_schema.tables", nil}
+    if String.valid?(sql) do
+      case {Regex.run(@show, sql), Regex.run(@describe, sql)} do
+        {[_all, _tables], _no_describe} ->
+          {:ok, "SELECT * FROM information_schema.tables", nil}
 
-      {[_all, "", reference], _no_describe} ->
-        columns(String.downcase(reference), :show)
+        {[_all, "", reference], _no_describe} ->
+          columns(String.downcase(reference), :show)
 
-      {nil, [_all, modifier, reference]} ->
-        described(modifier, String.downcase(reference))
+        {nil, [_all, modifier, reference]} ->
+          described(modifier, String.downcase(reference))
 
-      {nil, nil} ->
-        :nomatch
+        {nil, nil} ->
+          :nomatch
+      end
+    else
+      :nomatch
     end
   end
 

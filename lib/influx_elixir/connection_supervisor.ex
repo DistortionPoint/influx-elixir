@@ -249,19 +249,21 @@ defmodule InfluxElixir.ConnectionSupervisor do
 
   @doc false
   @spec finch_name(atom()) :: atom()
-  def finch_name(connection_name) do
+  def finch_name(connection_name)
+      when is_atom(connection_name) and connection_name not in [nil, true, false] do
     :"influx_elixir_#{connection_name}_finch"
   end
 
   @doc false
   @spec batch_writer_name(atom()) :: atom()
-  def batch_writer_name(connection_name) do
+  def batch_writer_name(connection_name)
+      when is_atom(connection_name) and connection_name not in [nil, true, false] do
     :"influx_elixir_#{connection_name}_batch_writer"
   end
 
   @doc false
   @spec via(atom()) :: atom()
-  def via(name) do
+  def via(name) when is_atom(name) and name not in [nil, true, false] do
     # A suffix, as every other derived name has: as a prefix (`influx_elixir_conn_<name>`)
     # the supervisor of `:a_finch` took the pool name of `:conn_a`.
     :"influx_elixir_#{name}_supervisor"

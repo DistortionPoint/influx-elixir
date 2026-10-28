@@ -15,9 +15,24 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
   alias InfluxElixir.Client.Local.{
     Flux,
     InfluxQL,
+    InfluxQLError,
     InfluxQLShowParser,
+    InfluxQLText,
     LineProtocolV3,
+    Retention,
+    SQLAggExpr,
+    SQLClauses,
+    SQLDistinctOn,
+    SQLIdentifiers,
+    SQLLexer,
+    SQLLimit,
+    SQLLiteral,
+    SQLMask,
+    SQLRewrite,
+    SQLSelect,
+    SQLShow,
     SQLStatement,
+    SQLTime,
     SQLTokenizer
   }
 
@@ -378,6 +393,51 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
 
       assert Local.query_sql(c, "SELECT v FROM io", database: "utf8_iql") ===
                {:ok, [%{"v" => 2.0}]}
+    end
+
+    test "direct helper calls handle non-UTF-8 binaries and unterminated quotes without raising" do
+      refute Retention.valid?(@bad)
+      assert Retention.seconds(@bad) === 0
+
+      assert InfluxQLError.rust_debug("a" <> @bad <> "b") === ~s("a\\xffb")
+      assert InfluxQLError.quoted_start(~s("a\\u{110000}") <> @bad <> ~s("), "x") === nil
+      assert InfluxQLError.quoted_start(@bad, "x") === nil
+      assert InfluxQLText.reserved_start(@bad) === nil
+
+      assert SQLLexer.escaped(@bad) === :error
+      assert SQLIdentifiers.normalize(@bad) === @bad
+      assert SQLIdentifiers.take_number(@bad) === {"", @bad}
+
+      assert SQLMask.mask(@bad <> "e'") === <<0x7F, ?e, ?'>>
+      assert SQLMask.hide_inner_from(@bad) === @bad
+      assert SQLTokenizer.split("SELECT $a$" <> @bad <> "$a$; SELECT " <> @bad <> "e'x'") !== []
+      assert SQLStatement.display(@bad) === :unknown
+
+      refute SQLLiteral.string?(@bad)
+      refute SQLLiteral.string?("'")
+      refute SQLLiteral.identifier?(@bad)
+      refute SQLLiteral.identifier?("\"")
+      refute SQLLiteral.float?(@bad)
+      assert SQLLiteral.param_name(@bad) === nil
+      assert SQLLiteral.value(@bad) === @bad
+      assert SQLLiteral.float_value(@bad) === :nonfinite
+
+      refute SQLRewrite.into?(@bad)
+      assert SQLRewrite.apply(@bad) === @bad
+      assert SQLShow.rewrite(@bad) === :nomatch
+      assert {:error, _err} = SQLTime.comparand(@bad)
+
+      assert SQLDistinctOn.split(@bad) === {@bad, nil}
+      assert SQLLimit.limit(@bad <> "'") === nil
+      assert SQLLimit.offset(@bad <> "'") === nil
+      assert SQLClauses.group_columns(@bad <> "'") === {:ok, nil}
+      assert SQLClauses.order_by(@bad <> "'") === []
+      assert SQLClauses.interval(@bad <> "'") === {:ok, nil}
+      refute SQLSelect.aggregate_query?(@bad <> "'")
+      refute SQLSelect.influxql_call?(@bad <> "'")
+      assert SQLSelect.aggregate_spans(@bad <> "'") === []
+      assert {:error, _err} = SQLSelect.parse_list(@bad <> "'")
+      assert {:error, _err} = SQLAggExpr.parse_list(@bad <> "'")
     end
   end
 end

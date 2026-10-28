@@ -32,11 +32,12 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
 
   @doc "Whether the text is one `'...'` literal, not two joined by an operator."
   @spec string?(binary()) :: boolean()
-  def string?(text), do: Regex.match?(~r/\A'x*'\z/u, SQLMask.mask(text))
+  def string?(text), do: String.valid?(text) and Regex.match?(~r/\A'x*'\z/u, SQLMask.mask(text))
 
   @doc "Whether the text is one `\"...\"` identifier."
   @spec identifier?(binary()) :: boolean()
-  def identifier?(text), do: Regex.match?(~r/\A"x*"\z/u, SQLMask.mask(text))
+  def identifier?(text),
+    do: String.valid?(text) and Regex.match?(~r/\A"x*"\z/u, SQLMask.mask(text))
 
   @doc """
   The text between a literal's quotes, with a doubled quote one quote. The
@@ -81,9 +82,11 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
   @doc "The `$name` placeholder's name, or `nil`."
   @spec param_name(binary()) :: binary() | nil
   def param_name(text) do
-    case Regex.run(~r/\A\$(\w+)\z/u, text) do
-      [_full, name] -> name
-      nil -> nil
+    if String.valid?(text) do
+      case Regex.run(~r/\A\$(\w+)\z/u, text) do
+        [_full, name] -> name
+        nil -> nil
+      end
     end
   end
 
@@ -151,14 +154,18 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
   """
   @spec float_value(binary()) :: float() | :nonfinite
   def float_value(text) do
-    normal =
-      text
-      |> String.replace(~r/^(-?)\./u, "\\g{1}0.")
-      |> String.replace(~r/\.(?=[eE]|$)/u, ".0")
+    if String.valid?(text) do
+      normal =
+        text
+        |> String.replace(~r/^(-?)\./u, "\\g{1}0.")
+        |> String.replace(~r/\.(?=[eE]|$)/u, ".0")
 
-    case safe_float_parse(normal) do
-      {value, ""} -> value
-      _overflow -> :nonfinite
+      case safe_float_parse(normal) do
+        {value, ""} -> value
+        _overflow -> :nonfinite
+      end
+    else
+      :nonfinite
     end
   end
 
@@ -166,7 +173,7 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
 
   @doc "Whether the text is a float literal (`1.5`, `.5`, `1e5`); an integer is not."
   @spec float?(binary()) :: boolean()
-  def float?(text), do: Regex.match?(@float_literal, text)
+  def float?(text), do: String.valid?(text) and Regex.match?(@float_literal, text)
 
   @doc "A float literal's value, with the `{float, rest}` of `Float.parse/1`, or `:error`."
   @spec parse_float(binary()) :: {float(), binary()} | :error
@@ -185,5 +192,5 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
 
   @doc "Whether the text is an integer literal."
   @spec integer?(binary()) :: boolean()
-  def integer?(text), do: Regex.match?(~r/^-?[0-9]+$/u, text)
+  def integer?(text), do: String.valid?(text) and Regex.match?(~r/^-?[0-9]+$/u, text)
 end

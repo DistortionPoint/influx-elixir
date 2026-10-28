@@ -104,14 +104,20 @@ defmodule InfluxElixir.Client.QueryParamsTest do
                "c" => "x",
                "d" => ~D[2024-01-02],
                "e" => :name,
-               "f" => ~U[2024-01-02 03:04:05.000000Z]
+               "f" => ~U[2024-01-02 03:04:05.000000Z],
+               "g" => Decimal.new("12.5"),
+               "h" => Decimal.new("NaN"),
+               "i" => <<0xFF>>
              }) === %{
                "a" => nil,
                "b" => true,
                "c" => "x",
                "d" => "2024-01-02",
                "e" => "name",
-               "f" => "2024-01-02T03:04:05.000000Z"
+               "f" => "2024-01-02T03:04:05.000000Z",
+               "g" => 12.5,
+               "h" => nil,
+               "i" => nil
              }
     end
   end
@@ -131,7 +137,27 @@ defmodule InfluxElixir.Client.QueryParamsTest do
         assert QueryParams.problem(Jason.Fragment.new(text)) === :out_of_range, text
       end
 
-      for value <- [nil, true, 1, 1.5, "x", ~D[2024-01-02], :name, Jason.Fragment.new("")] do
+      for value <- [
+            Decimal.new("1e400"),
+            Decimal.new("NaN"),
+            Decimal.new("Infinity")
+          ] do
+        assert QueryParams.problem(value) === :out_of_range, inspect(value)
+      end
+
+      for value <- [
+            nil,
+            true,
+            1,
+            1.5,
+            "x",
+            ~D[2024-01-02],
+            :name,
+            Decimal.new("1.5"),
+            <<0xFF>>,
+            {1, 2},
+            Jason.Fragment.new("")
+          ] do
         assert QueryParams.problem(value) === nil, inspect(value)
       end
 

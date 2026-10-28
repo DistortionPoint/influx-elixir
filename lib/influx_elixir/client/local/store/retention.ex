@@ -65,7 +65,7 @@ defmodule InfluxElixir.Client.Local.Retention do
 
   @doc "Whether `text` is a duration the engine reads."
   @spec valid?(binary()) :: boolean()
-  def valid?(text), do: Regex.match?(@duration, text)
+  def valid?(text), do: String.valid?(text) and Regex.match?(@duration, text)
 
   @doc """
   The retention in whole seconds of a valid duration `text` (see `valid?/1`),
@@ -73,11 +73,15 @@ defmodule InfluxElixir.Client.Local.Retention do
   """
   @spec seconds(binary()) :: non_neg_integer()
   def seconds(text) do
-    @part
-    |> Regex.scan(text)
-    |> Enum.map(fn [_all, whole, fraction, unit] -> part_ns(whole, fraction, unit) end)
-    |> Enum.sum()
-    |> div(@second_ns)
+    if String.valid?(text) do
+      @part
+      |> Regex.scan(text)
+      |> Enum.map(fn [_all, whole, fraction, unit] -> part_ns(whole, fraction, unit) end)
+      |> Enum.sum()
+      |> div(@second_ns)
+    else
+      0
+    end
   end
 
   @spec part_ns(binary(), binary(), binary()) :: non_neg_integer()

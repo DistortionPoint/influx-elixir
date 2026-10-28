@@ -77,6 +77,7 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   @spec comparand(binary()) :: comparand()
   def comparand(text) do
     cond do
+      not String.valid?(text) -> {:error, unsupported(text)}
       SQLLiteral.string?(text) -> string_bound(SQLLiteral.body(text))
       String.upcase(text) == "NULL" -> {:ok, nil}
       match = Regex.run(@now_pattern, text) -> now_offset(match)
@@ -266,13 +267,13 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   """
   @spec interval(binary()) :: {:ok, pos_integer()} | {:error, SQLError.t()}
   def interval(text) do
-    case Regex.run(~r/^\s*([0-9]+)\s+(\w+)\s*$/u, text) do
-      [_full, count, unit] ->
-        case unit_ns(String.downcase(unit)) do
-          nil -> {:error, SQLError.refusal("unknown interval unit: #{unit}")}
-          ns -> {:ok, String.to_integer(count) * ns}
-        end
-
+    with true <- String.valid?(text),
+         [_full, count, unit] <- Regex.run(~r/^\s*([0-9]+)\s+(\w+)\s*$/u, text) do
+      case unit_ns(String.downcase(unit)) do
+        nil -> {:error, SQLError.refusal("unknown interval unit: #{unit}")}
+        ns -> {:ok, String.to_integer(count) * ns}
+      end
+    else
       _no_match ->
         {:error, SQLError.refusal("invalid interval: #{text}")}
     end

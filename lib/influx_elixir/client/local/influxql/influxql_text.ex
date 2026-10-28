@@ -48,7 +48,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   call).
   """
   @spec reserved_start(binary(), keyword()) :: {binary(), non_neg_integer()} | nil
-  def reserved_start(text, opts \\ []) do
+  def reserved_start(text, opts \\ []) when is_binary(text) and is_list(opts) do
     with [_all, word] <- Regex.run(@reserved_start, text),
          true <- reserved?(word),
          false <- Keyword.get(opts, :plain, false) and called?(text, word) do
