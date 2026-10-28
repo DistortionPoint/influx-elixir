@@ -95,7 +95,9 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   """
   @spec run(SQLParser.parsed_query(), fetch(), %{binary() => term()}, kinds() | nil) ::
           [map()] | {:error, term()}
-  def run(query, fetch, params, kinds \\ nil), do: run_query(query, fetch, params, kinds)
+  def run(%{} = query, fetch, params, kinds \\ nil)
+      when is_function(fetch, 1) and is_map(params),
+      do: run_query(query, fetch, params, kinds)
 
   @doc """
   Runs the SQL that an InfluxQL query is written as. The engine's InfluxQL
@@ -103,7 +105,8 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   (verified: it answers `[]`), so that failure is not raised here.
   """
   @spec run_influxql(SQLParser.parsed_query(), fetch()) :: [map()] | {:error, term()}
-  def run_influxql(query, fetch), do: run_query(query, fetch, %{}, :unchecked)
+  def run_influxql(%{} = query, fetch) when is_function(fetch, 1),
+    do: run_query(query, fetch, %{}, :unchecked)
 
   @doc "Whether a point satisfies a parsed `WHERE` conjunction (also used by `DELETE`)."
   @spec matches_all?(point(), [SQLParser.where_node()]) :: boolean()

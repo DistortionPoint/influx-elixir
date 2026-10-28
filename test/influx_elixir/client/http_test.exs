@@ -114,20 +114,21 @@ defmodule InfluxElixir.Client.HTTPTest do
       assert answer(fn -> HTTP.query_sql(conn, "SELECT 1", timeout: 40) end) === @timed_out
     end
 
-    test "every query function reads the option" do
-      conn = connection(TestServer.black_hole(), timeout: @never)
+    test "every query function and create_bucket org lookup reads the option" do
+      conn = connection(TestServer.black_hole(), timeout: @never, org: "org")
 
-      # Concurrent, so the three timeouts run their course in one wait.
+      # Concurrent, so the timeouts run their course in one wait.
       answers =
         [
           fn -> HTTP.query_sql(conn, "SELECT 1", timeout: 40) end,
           fn -> HTTP.execute_sql(conn, "SELECT 1", timeout: 40) end,
-          fn -> HTTP.query_influxql(conn, "SELECT 1", timeout: 40) end
+          fn -> HTTP.query_influxql(conn, "SELECT 1", timeout: 40) end,
+          fn -> HTTP.create_bucket(conn, "b", timeout: 40) end
         ]
         |> Enum.map(&Task.async(fn -> answer(&1) end))
         |> Enum.map(&Task.await(&1, 2 * Await.bound()))
 
-      assert answers === [@timed_out, @timed_out, @timed_out]
+      assert answers === [@timed_out, @timed_out, @timed_out, @timed_out]
     end
 
     test "the connection's applies when the option is absent or nil" do
@@ -162,8 +163,11 @@ defmodule InfluxElixir.Client.HTTPTest do
   describe "the timeout defaults" do
     test "are 30 seconds to receive and 5 to check out when nothing names one" do
       assert HTTP.resolve_timeout([], host: "h") === 30_000
+      assert HTTP.resolve_timeout(:bad, :bad) === 30_000
       assert HTTP.resolve_pool_timeout([], []) === 5_000
+      assert HTTP.resolve_pool_timeout(:bad, :bad) === 5_000
       assert HTTP.resolve_pool_timeout([timeout: 180_000], timeout: 180_000) === 5_000
+      assert InfluxElixir.Client.Options.database(:bad) === nil
     end
   end
 

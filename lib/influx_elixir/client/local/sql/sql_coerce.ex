@@ -19,7 +19,8 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
   """
   @spec apply(SQLParser.parsed_query(), [SQLPlan.point()], (binary() -> boolean())) ::
           SQLParser.parsed_query()
-  def apply(query, points, unsigned?) do
+  def apply(%{} = query, points, unsigned?)
+      when is_list(points) and is_function(unsigned?, 1) do
     if Enum.any?(expressions(query), fn expr ->
          SQLExpr.any?(expr, fn node -> coerced?(node) end)
        end) do

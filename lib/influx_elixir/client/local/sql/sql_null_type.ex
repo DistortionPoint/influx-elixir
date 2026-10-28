@@ -38,7 +38,7 @@ defmodule InfluxElixir.Client.Local.SQLNullType do
   that was verified one by one, and the wrong one is not worth guessing.
   """
   @spec duration_misuse?(map()) :: boolean()
-  def duration_misuse?(query) do
+  def duration_misuse?(%{} = query) do
     projected = for {expr, _output} <- query.projection_columns || [], is_tuple(expr), do: expr
     ordered = for {{:expr, expr}, _direction} <- query.order_by, do: expr
 

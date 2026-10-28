@@ -172,7 +172,7 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   @type table :: binary() | {:catalog, [SQLTable.column()]}
 
   @spec context(table(), [binary()], env()) :: SQLDmlOperand.ctx()
-  def context(table, relation, env) do
+  def context(table, relation, %{} = env) when is_list(relation) do
     {columns, types} = table_schema(table, env)
 
     %{
@@ -188,12 +188,12 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   # A table's columns in the order the engine lists them, and their Arrow types by name.
   @doc false
   @spec table_schema(table(), env()) :: {[binary()], %{binary() => binary()}}
-  def table_schema({:catalog, columns}, _env),
+  def table_schema({:catalog, columns}, _env) when is_list(columns),
     do:
       {Enum.map(columns, &elem(&1, 0)),
        Map.new(columns, fn {name, type, _nullable} -> {name, type} end)}
 
-  def table_schema(table, env),
+  def table_schema(table, %{} = env),
     do: {env.columns_of.(table), Map.new(env.columns_of.({:types, table}))}
 
   # The double has no rows for the engine's own tables: an operand over their columns is not
@@ -211,7 +211,7 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   # What operands are read against where there is no table (the cells of a `VALUES`).
   @doc false
   @spec empty_context(env()) :: SQLDmlOperand.ctx()
-  def empty_context(env) do
+  def empty_context(%{} = env) do
     %{
       table: nil,
       columns: [],

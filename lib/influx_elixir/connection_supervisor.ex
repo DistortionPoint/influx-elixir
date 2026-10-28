@@ -107,7 +107,7 @@ defmodule InfluxElixir.ConnectionSupervisor do
          name when is_atom(name) and name not in [nil, true, false] <- Keyword.get(config, :name) do
       start_named(name, config)
     else
-      _invalid -> {:error, {:invalid_options, config}}
+      _invalid -> {:error, {:invalid_options, Secret.redact(config)}}
     end
   end
 

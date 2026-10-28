@@ -46,16 +46,16 @@ defmodule InfluxElixir.Client.HTTP.Buckets do
   defp resolve_org_id(connection, opts) do
     case {Keyword.get(opts, :org_id), Request.conn_val(connection, :org, "")} do
       {nil, org} when org in [nil, ""] -> {:ok, %{}}
-      {nil, org} -> lookup_org_id(connection, org)
+      {nil, org} -> lookup_org_id(connection, org, opts)
       {org_id, _org} -> {:ok, %{"orgID" => org_id}}
     end
   end
 
-  @spec lookup_org_id(keyword(), term()) :: {:ok, map()} | {:error, term()}
-  defp lookup_org_id(connection, org) do
+  @spec lookup_org_id(keyword(), term(), keyword()) :: {:ok, map()} | {:error, term()}
+  defp lookup_org_id(connection, org, opts) do
     with :ok <- Request.url_values(org: org),
          {:ok, %Finch.Response{body: body}} <-
-           Request.get(connection, "/api/v2/orgs?org=#{Request.query_value(org)}", [200]),
+           Request.get(connection, "/api/v2/orgs?org=#{Request.query_value(org)}", [200], opts),
          {:ok, %{"orgs" => [%{"id" => id} | _rest]}} when is_binary(id) and id != "" <-
            Request.decode_json(body) do
       {:ok, %{"orgID" => id}}

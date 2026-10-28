@@ -33,6 +33,8 @@ defmodule InfluxElixir.Client.Options do
     if keyword?(connection), do: Keyword.get(connection, :database)
   end
 
+  def database(_connection), do: nil
+
   @doc false
   # The database of a call: `opts[:database]` when given and non-nil, else the connection's
   # default. A non-nil `opts[:database]` (such as `database: false`) is kept as-is rather than

@@ -274,7 +274,7 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
   end
 
   describe "start_link/1 with a config that names no connection" do
-    test "is an error naming the config, never a raise" do
+    test "is an error naming the config with any token redacted, never a raise" do
       for config <- [
             :x,
             nil,
@@ -287,6 +287,15 @@ defmodule InfluxElixir.ConnectionSupervisorTest do
           ] do
         assert InfluxElixir.ConnectionSupervisor.start_link(config) ===
                  {:error, {:invalid_options, config}}
+      end
+
+      token = "secret-token-#{System.unique_integer([:positive])}"
+
+      for bad <- [[host: "h", token: token], [name: nil, token: token]] do
+        assert {:error, {:invalid_options, redacted}} =
+                 InfluxElixir.ConnectionSupervisor.start_link(bad)
+
+        refute inspect(redacted, limit: :infinity, printable_limit: :infinity) =~ token
       end
     end
   end

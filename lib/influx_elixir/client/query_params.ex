@@ -157,7 +157,7 @@ defmodule InfluxElixir.Client.QueryParams do
   parameters must be free of `problem/1`s.
   """
   @spec engine_values(t()) :: %{binary() => term()}
-  def engine_values(params) do
+  def engine_values(params) when is_map(params) and not is_struct(params) do
     Map.new(params, fn {name, value} ->
       case encode_json(value) do
         {:ok, json} ->

@@ -251,7 +251,7 @@ defmodule InfluxElixir.Flight.Client do
 
   @spec resolve_timeout(keyword()) :: timeout()
   defp resolve_timeout(opts) do
-    case Keyword.get(opts, :timeout) do
+    case if(InfluxElixir.Client.Options.keyword?(opts), do: Keyword.get(opts, :timeout)) do
       nil -> @default_timeout
       timeout -> timeout
     end
@@ -261,7 +261,7 @@ defmodule InfluxElixir.Flight.Client do
   # Resolves the connect-phase timeout: :connect_timeout → :timeout → default.
   @spec resolve_connect_timeout(keyword()) :: timeout()
   def resolve_connect_timeout(opts) do
-    case Keyword.get(opts, :connect_timeout) do
+    case if(InfluxElixir.Client.Options.keyword?(opts), do: Keyword.get(opts, :connect_timeout)) do
       nil -> resolve_timeout(opts)
       connect_timeout -> connect_timeout
     end
@@ -400,6 +400,9 @@ defmodule InfluxElixir.Flight.Client do
 
         {:error, reason}, _acc ->
           {:halt, {:error, reason}}
+
+        other, _acc ->
+          {:halt, {:error, {:unexpected_stream_item, other}}}
       end)
 
     case result do

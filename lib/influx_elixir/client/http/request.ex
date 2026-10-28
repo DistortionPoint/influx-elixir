@@ -71,15 +71,15 @@ defmodule InfluxElixir.Client.HTTP.Request do
   end
 
   # GETs `path` (with its query string) as the connection's token.
-  @spec get(keyword(), binary(), [non_neg_integer()]) :: outcome()
-  def get(connection, path, ok_statuses) do
+  @spec get(keyword(), binary(), [non_neg_integer()], keyword()) :: outcome()
+  def get(connection, path, ok_statuses, opts \\ []) do
     request(
       :get,
       base_url(connection) <> path,
       auth_headers(connection),
       nil,
       connection,
-      [],
+      opts,
       ok_statuses
     )
   end
@@ -156,9 +156,9 @@ defmodule InfluxElixir.Client.HTTP.Request do
   #   opts[:timeout] → connection[:timeout] → @default_timeout
   @spec resolve_timeout(keyword(), keyword()) :: timeout()
   def resolve_timeout(opts, connection) do
-    case Keyword.get(opts, :timeout) do
+    case if(Options.keyword?(opts), do: Keyword.get(opts, :timeout)) do
       nil ->
-        case Keyword.get(connection, :timeout) do
+        case if(Options.keyword?(connection), do: Keyword.get(connection, :timeout)) do
           nil -> @default_timeout
           timeout -> timeout
         end
@@ -172,9 +172,9 @@ defmodule InfluxElixir.Client.HTTP.Request do
   #   opts[:pool_timeout] → connection[:pool_timeout] → @default_pool_timeout
   @spec resolve_pool_timeout(keyword(), keyword()) :: timeout()
   def resolve_pool_timeout(opts, connection) do
-    case Keyword.get(opts, :pool_timeout) do
+    case if(Options.keyword?(opts), do: Keyword.get(opts, :pool_timeout)) do
       nil ->
-        case Keyword.get(connection, :pool_timeout) do
+        case if(Options.keyword?(connection), do: Keyword.get(connection, :pool_timeout)) do
           nil -> @default_pool_timeout
           pool_timeout -> pool_timeout
         end

@@ -186,8 +186,9 @@ defmodule InfluxElixir.Flight.ClientTest do
       assert Client.resolve_connect_timeout(timeout: 5_000) === 5_000
     end
 
-    test "falls back to 30s default when neither is set" do
+    test "falls back to 30s default when neither is set or opts is not a keyword list" do
       assert Client.resolve_connect_timeout([]) === 30_000
+      assert Client.resolve_connect_timeout(:bad) === 30_000
     end
   end
 
@@ -278,6 +279,9 @@ defmodule InfluxElixir.Flight.ClientTest do
 
       assert Client.collect_stream([{:ok, fd1}, {:error, :stream_failed}, {:ok, fd2}]) ===
                {:error, :stream_failed}
+
+      assert Client.collect_stream([{:ok, fd1}, :unexpected, {:ok, fd2}]) ===
+               {:error, {:unexpected_stream_item, :unexpected}}
     end
   end
 end

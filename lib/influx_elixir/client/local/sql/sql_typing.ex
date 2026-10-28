@@ -23,7 +23,7 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
 
   @doc "The query with each read of an unsigned column in an expression retyped."
   @spec retype(SQLParser.parsed_query(), unsigned()) :: SQLParser.parsed_query()
-  def retype(query, unsigned?) do
+  def retype(%{} = query, unsigned?) when is_function(unsigned?, 1) do
     %{
       query
       | projection_columns: projection(query.projection_columns, unsigned?),
@@ -134,7 +134,7 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
   width.
   """
   @spec check_cte_outputs(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
-  def check_cte_outputs(query) do
+  def check_cte_outputs(%{} = query) do
     projected = for {expr, _output} <- query.projection_columns || [], is_tuple(expr), do: expr
     aggregated = for {:aggregate, _agg, expr, _output} <- query.select_columns || [], do: expr
 
@@ -161,7 +161,7 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
   """
   @spec unsigned_outputs(SQLParser.parsed_query(), [binary()] | nil, unsigned()) ::
           MapSet.t(binary())
-  def unsigned_outputs(query, columns, unsigned?) do
+  def unsigned_outputs(%{} = query, columns, unsigned?) when is_function(unsigned?, 1) do
     outputs =
       cond do
         query.distinct_columns ->

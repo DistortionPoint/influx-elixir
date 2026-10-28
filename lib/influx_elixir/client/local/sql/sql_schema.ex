@@ -40,8 +40,8 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
   @doc "A source (its points and, for a CTE, its columns) as the relation known by `qualifier`."
   @spec relation(binary(), %{points: [point()], columns: [binary()] | nil}) :: relation()
-  def relation(qualifier, source),
-    do: %{qualifier: qualifier, points: source.points, columns: source.columns}
+  def relation(qualifier, %{points: points, columns: columns}) when is_binary(qualifier),
+    do: %{qualifier: qualifier, points: points, columns: columns}
 
   # The clauses a reference stands in, in the order the engine plans them:
   # WHERE, the select list, ORDER BY, GROUP BY, DISTINCT ON. The select list
@@ -74,7 +74,8 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   `InfluxElixir.Client.Local.SQLSimplify.never?/1`).
   """
   @spec check([relation()], SQLParser.parsed_query(), boolean()) :: :ok | {:error, term()}
-  def check(relations, query, never? \\ false) do
+  def check(relations, %{} = query, never? \\ false)
+      when is_list(relations) and is_boolean(never?) do
     with :ok <- no_table_star(relations, query),
          :ok <- check_columns(relations, query, never?),
          do: check_order_ambiguous(relations, query)
@@ -631,7 +632,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   alias instead, which is not a source column.
   """
   @spec clause_refs(SQLParser.parsed_query()) :: [{clause(), SQLExpr.column_ref()}]
-  def clause_refs(query) do
+  def clause_refs(%{} = query) do
     aliases = if query.distinct_on, do: [], else: output_names(query)
     alias? = &alias_ref?(&1, aliases, query, :order)
 
@@ -706,7 +707,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
   @doc "Whether the query selects `*`."
   @spec star?(SQLParser.parsed_query()) :: boolean()
-  def star?(query) do
+  def star?(%{} = query) do
     is_nil(query.distinct_columns) and is_nil(query.select_columns) and
       is_nil(query.projection_columns)
   end
@@ -718,7 +719,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   """
   @spec resolve_ordinals(SQLParser.parsed_query(), [relation()]) ::
           {:ok, SQLParser.parsed_query()} | {:error, map()}
-  def resolve_ordinals(query, relations) do
+  def resolve_ordinals(%{} = query, relations) when is_list(relations) do
     if star?(query) and Enum.any?(query.order_by, &positional?/1),
       do: resolve_positions(query, output_columns(query, relations)),
       else: {:ok, query}
