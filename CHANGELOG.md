@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.58] - 2026-10-29
+
 ### Fixed
 - **`Client.Local.SQLPlan`, `Client.Local.SQLCompare`, `Client.Local.SQLExecutor`, `Client.Local.SQLCast`, and `Client.Local.InfluxQLBuckets` mishandled `%DateTime{}` and selector struct typing, `%DateTime{}` comparisons and `SELECT DISTINCT` ordering, `SQLCast.fold/2` error formatting, and invalid `:local_influxql_max_rows` config.**
   `SQLPlan.arrow_type/1` now types `%DateTime{}` values as `"Timestamp(ns)"` and unsubscripted selector results (`%{"value" => value, "time" => %DateTime{}}`) as `Struct("value": <type>, "time": Timestamp(ns))` instead of falling through to `"Utf8"`, and `SQLPlan.boolean_comparison/4` now checks timestamp string literals on the left-hand side of comparisons against `Timestamp(ns)` expressions. `SQLCompare.compare/3` now compares `%DateTime{}` values chronologically via `DateTime.compare/2` (instead of Elixir structural map comparison, which compares `:day` before `:month`) and parses string comparands against `%DateTime{}` values via `SQLTime.timestamp_ns/1`. `SQLExecutor` now sorts `SELECT DISTINCT` rows via `SQLSort.sort_by_keys/2` instead of `Enum.sort_by/2` when `ORDER BY` is omitted. `SQLCast.fold/2` and `SQLCast.convert/2` now format `%DateTime{}` and boolean values in `shown/1` and guard unknown target types without raising `FunctionClauseError`. `InfluxQLBuckets.max_rows/0` now falls back to `2_000_000` when `:local_influxql_max_rows` is `nil` or not a positive integer.
