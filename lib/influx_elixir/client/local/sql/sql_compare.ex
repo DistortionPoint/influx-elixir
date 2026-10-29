@@ -6,7 +6,7 @@ defmodule InfluxElixir.Client.Local.SQLCompare do
   # them, a number against a string by the number's text, strings and
   # booleans by their own order.
 
-  alias InfluxElixir.Client.Local.{Format, SQLCast, SQLError, SQLNumber}
+  alias InfluxElixir.Client.Local.{Format, SQLCast, SQLError, SQLNumber, SQLTime}
 
   # Both nil-actual (missing column) and nil-value (unparseable comparand)
   # short-circuit to false. Without this guard, Elixir term ordering would
@@ -70,6 +70,15 @@ defmodule InfluxElixir.Client.Local.SQLCompare do
   def compare(nil, _op, _value), do: false
   def compare(_actual, _op, nil), do: false
 
+  def compare(%DateTime{} = actual, op, %DateTime{} = value),
+    do: order_matches?(DateTime.compare(actual, value), op)
+
+  def compare(%DateTime{} = actual, op, value) when is_binary(value),
+    do: term_compare(DateTime.to_unix(actual, :nanosecond), op, timestamp_ns!(value))
+
+  def compare(actual, op, %DateTime{} = value) when is_binary(actual),
+    do: term_compare(timestamp_ns!(actual), op, DateTime.to_unix(value, :nanosecond))
+
   def compare(actual, op, value) when is_integer(actual) and is_integer(value),
     do: term_compare(actual, op, value)
 
@@ -89,16 +98,21 @@ defmodule InfluxElixir.Client.Local.SQLCompare do
 
   # Numbers of any type, ordered as the engine orders them.
   @spec ordered(SQLNumber.t(), atom(), SQLNumber.t()) :: boolean()
-  defp ordered(actual, op, value) do
-    order = SQLNumber.compare(actual, value)
+  defp ordered(actual, op, value), do: order_matches?(SQLNumber.compare(actual, value), op)
 
-    case op do
-      :eq -> order == :eq
-      :ne -> order != :eq
-      :gt -> order == :gt
-      :lt -> order == :lt
-      :gte -> order != :lt
-      :lte -> order != :gt
+  @spec order_matches?(:lt | :eq | :gt, atom()) :: boolean()
+  defp order_matches?(order, :eq), do: order == :eq
+  defp order_matches?(order, :ne), do: order != :eq
+  defp order_matches?(order, :gt), do: order == :gt
+  defp order_matches?(order, :lt), do: order == :lt
+  defp order_matches?(order, :gte), do: order != :lt
+  defp order_matches?(order, :lte), do: order != :gt
+
+  @spec timestamp_ns!(binary()) :: integer()
+  defp timestamp_ns!(text) do
+    case SQLTime.timestamp_ns(text) do
+      {:ok, ns} -> ns
+      {:error, error} -> throw({:query_error, error})
     end
   end
 

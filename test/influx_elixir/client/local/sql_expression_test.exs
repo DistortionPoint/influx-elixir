@@ -2,6 +2,7 @@ defmodule InfluxElixir.Client.Local.SqlExpressionTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
+  alias InfluxElixir.Client.Local.{SQLCast, SQLCompare, SQLPlan}
 
   setup do
     {:ok, conn} = Local.start(databases: ["test_db"])
@@ -106,6 +107,140 @@ defmodule InfluxElixir.Client.Local.SqlExpressionTest do
                   "Client.Local: unsupported column expression: * (* is a wildcard, not an expression)"
               }} =
                Local.query_sql(conn, ~s|SELECT * FROM "p" GROUP BY host|, database: "test_db")
+    end
+  end
+
+  describe "timestamp and selector typing, comparisons, DISTINCT order, and SQLCast.fold/2" do
+    setup %{conn: conn} do
+      # 2025-01-02T00:00:00Z (day 2, month 1) vs 2025-02-01T00:00:00Z (day 1, month 2):
+      # Elixir structural map comparison orders :day before :month, which would invert them.
+      t1 = DateTime.to_unix(~U[2025-01-02 00:00:00Z], :nanosecond)
+      t2 = DateTime.to_unix(~U[2025-02-01 00:00:00Z], :nanosecond)
+
+      lines = "m,host=a v=10i #{t1}\nm,host=b v=20i #{t2}"
+      {:ok, :written} = Local.write(conn, lines, database: "test_db", precision: :nanosecond)
+      :ok
+    end
+
+    test "SQLPlan.arrow_type/1 types DateTime and selector structs from CTEs", %{conn: conn} do
+      assert SQLPlan.arrow_type(~U[2025-01-02 00:00:00Z]) == "Timestamp(ns)"
+
+      assert SQLPlan.arrow_type(%{"value" => 10, "time" => ~U[2025-01-02 00:00:00Z]}) ==
+               ~s|Struct("value": Int64, "time": Timestamp(ns))|
+
+      assert {:error, %{status: 400, body: plus_body}} =
+               Local.query_sql(
+                 conn,
+                 "WITH c AS (SELECT time AS ts, v FROM m) SELECT ts + 1 FROM c",
+                 database: "test_db"
+               )
+
+      assert plus_body =~ "Cannot coerce arithmetic expression Timestamp(ns) + Int64"
+
+      assert {:error, %{status: 400, body: upper_ts_body}} =
+               Local.query_sql(
+                 conn,
+                 "WITH c AS (SELECT time AS ts, v FROM m) SELECT upper(ts) FROM c",
+                 database: "test_db"
+               )
+
+      assert upper_ts_body =~ "upper of a Timestamp(ns)"
+
+      assert {:error, %{status: 400, body: upper_struct_body}} =
+               Local.query_sql(
+                 conn,
+                 "WITH c AS (SELECT selector_first(v, time) AS s FROM m) SELECT upper(s) FROM c",
+                 database: "test_db"
+               )
+
+      assert upper_struct_body =~ ~s|DataType: Struct("value": Int64, "time": Timestamp(ns))|
+
+      assert {:error, %{status: 400, body: bad_time_body}} =
+               Local.query_sql(
+                 conn,
+                 "SELECT count(*) FROM m HAVING 'not-a-timestamp' < min(time)",
+                 database: "test_db"
+               )
+
+      assert bad_time_body =~
+               "a text the engine cannot read as a timestamp, beside a timestamp that is not the column time"
+    end
+
+    test "SQLCompare compares DateTime values chronologically and against timestamp strings",
+         %{conn: conn} do
+      assert {:ok, [%{"c" => 2}]} =
+               Local.query_sql(
+                 conn,
+                 "SELECT count(*) AS c FROM m HAVING min(time) < max(time)",
+                 database: "test_db"
+               )
+
+      assert {:ok, [%{"ok" => 1}]} =
+               Local.query_sql(
+                 conn,
+                 "WITH c AS (SELECT min(time) AS t1, max(time) AS t2 FROM m) " <>
+                   "SELECT 1 AS ok FROM c WHERE t1 < t2",
+                 database: "test_db"
+               )
+
+      assert {:ok, [%{"c" => 2}]} =
+               Local.query_sql(
+                 conn,
+                 "SELECT count(*) AS c FROM m " <>
+                   "HAVING min(time) = '2025-01-02T00:00:00Z' AND '2025-01-02T00:00:00Z' < max(time)",
+                 database: "test_db"
+               )
+
+      assert {:ok, [%{"c" => 1}]} =
+               Local.query_sql(
+                 conn,
+                 "WITH c AS (SELECT time AS t FROM m) " <>
+                   "SELECT count(*) AS c FROM c " <>
+                   "WHERE t > '2025-01-02T00:00:00Z' AND '2025-02-02T00:00:00Z' > t",
+                 database: "test_db"
+               )
+
+      assert catch_throw(SQLCompare.compare(~U[2025-01-02 00:00:00Z], :eq, "bad")) ==
+               {:query_error,
+                %{
+                  status: 500,
+                  body:
+                    "Optimizer rule 'simplify_expressions' failed\ncaused by\nArrow error: " <>
+                      "Parser error: Error parsing timestamp from 'bad': timestamp must contain " <>
+                      "at least 10 characters"
+                }}
+    end
+
+    test "SELECT DISTINCT without ORDER BY sorts DateTime columns chronologically", %{conn: conn} do
+      expected = [
+        %{"t" => ~U[2025-01-02 00:00:00.000000Z]},
+        %{"t" => ~U[2025-02-01 00:00:00.000000Z]}
+      ]
+
+      assert {:ok, ^expected} =
+               Local.query_sql(
+                 conn,
+                 "WITH c AS (SELECT time AS t FROM m) SELECT DISTINCT t FROM c",
+                 database: "test_db"
+               )
+
+      assert {:ok, ^expected} =
+               Local.query_sql(
+                 conn,
+                 "SELECT DISTINCT min(time) AS t FROM m GROUP BY host HAVING count(*) > 0",
+                 database: "test_db"
+               )
+    end
+
+    test "SQLCast.fold/2 and SQLCast.cast/2 handle DateTime, boolean, and unknown target types" do
+      assert SQLCast.fold(~U[2025-01-01 00:00:00Z], :int32) ==
+               {:error, "Can't cast value 2025-01-01T00:00:00Z to type Int32"}
+
+      assert SQLCast.fold(true, :decimal) ==
+               {:error, "Can't cast value true to type Decimal128(?)"}
+
+      assert catch_throw(SQLCast.cast(1, :unknown_type)) ==
+               {:query_error, {:connection_error, %Mint.TransportError{reason: :closed}}}
     end
   end
 end

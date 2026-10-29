@@ -805,12 +805,12 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec execute_distinct_query([point()], SQLParser.parsed_query()) :: [map()]
   defp execute_distinct_query(points, query) do
     columns = query.distinct_columns
+    keys = Enum.map(columns, fn column -> {&SQLRow.sort_value(&1, column), :asc} end)
 
     points
-    |> Enum.map(fn point -> {Enum.map(columns, &SQLRow.sort_value(point, &1)), point} end)
-    |> Enum.uniq_by(&elem(&1, 0))
-    |> Enum.sort_by(&elem(&1, 0))
-    |> Enum.map(fn {_stored, point} ->
+    |> Enum.uniq_by(fn point -> Enum.map(columns, &SQLRow.sort_value(point, &1)) end)
+    |> SQLSort.sort_by_keys(keys)
+    |> Enum.map(fn point ->
       Enum.reduce(columns, %{}, fn column, row ->
         put_column(row, column, SQLRow.column_value(point, column))
       end)
@@ -825,6 +825,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec execute_aggregate_query([point()], SQLParser.parsed_query()) :: [map()]
   defp execute_aggregate_query(points, %{distinct_rows: true} = query) do
     names = for column <- query.select_columns, do: elem(column, tuple_size(column) - 1)
+    keys = Enum.map(names, fn name -> {&Map.get(&1, name), :asc} end)
 
     rows =
       execute_aggregate_query(points, %{query | distinct_rows: false, limit: nil, offset: nil})
@@ -833,7 +834,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     |> Enum.uniq()
     |> then(fn rows ->
       if query.order_by == [],
-        do: Enum.sort_by(rows, fn row -> Enum.map(names, &Map.get(row, &1)) end),
+        do: SQLSort.sort_by_keys(rows, keys),
         else: rows
     end)
     |> apply_limit(query.limit, query.offset)

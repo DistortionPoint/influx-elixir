@@ -88,6 +88,7 @@ defmodule InfluxElixir.Client.Local.SQLCast do
   defp convert(value, :float), do: to_float(value)
   defp convert(value, :string), do: to_string_value(value)
   defp convert(value, :decimal), do: to_decimal(value)
+  defp convert(_value, _type), do: :error
 
   # An integer of either sign as the decimal the engine makes of it beside the other (`Int64`
   # with `UInt64`); only the coalescing functions make one, not a cast written in a query.
@@ -225,6 +226,8 @@ defmodule InfluxElixir.Client.Local.SQLCast do
   defp shown(:neg_inf), do: "-inf"
   defp shown(:nan), do: "NaN"
   defp shown(value) when is_integer(value), do: Integer.to_string(value)
+  defp shown(value) when is_boolean(value), do: Atom.to_string(value)
+  defp shown(%DateTime{} = value), do: DateTime.to_iso8601(value)
   defp shown({:dec, coefficient, scale}), do: decimal_text(coefficient, scale)
 
   # A timestamp is cast as its nanoseconds, which a `DateTime` keeps only to

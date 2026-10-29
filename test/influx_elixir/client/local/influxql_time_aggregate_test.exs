@@ -2,6 +2,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeAggregateTest do
   use ExUnit.Case, async: true
 
   alias InfluxElixir.Client.Local
+  alias InfluxElixir.Client.Local.InfluxQLBuckets
 
   # Aggregates of `time` beside a field: `percentile()`, `integral()` and `mode()` word their
   # outcome at length (or by the engine's choice among equals), so the double refuses them
@@ -27,6 +28,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeAggregateTest do
       assert Local.query_influxql(conn, unquote(statement), database: "t_db") ===
                {:error,
                 %{status: 400, body: "Client.Local: unsupported InfluxQL (#{unquote(reason)})"}}
+    end
+  end
+
+  test "InfluxQLBuckets.max_rows/0 falls back to 2_000_000 for non-positive or non-integer config" do
+    try do
+      for invalid <- [nil, 0, -10, :invalid, "2000000"] do
+        Application.put_env(:influx_elixir, :local_influxql_max_rows, invalid)
+        assert InfluxQLBuckets.max_rows() == 2_000_000
+      end
+
+      Application.put_env(:influx_elixir, :local_influxql_max_rows, 2_500_000)
+      assert InfluxQLBuckets.max_rows() == 2_500_000
+    after
+      Application.delete_env(:influx_elixir, :local_influxql_max_rows)
     end
   end
 end

@@ -145,10 +145,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLFluxFidelityTest do
 
       # `time > x` starts one nanosecond after x, and the row carries whole
       # microseconds: the stamp lies between the bounds of a bracket of the
-      # call, whatever the clock reads in it.
-      first = System.os_time(:nanosecond)
+      # call, whatever the clock (`Store.now_ns/0`) reads in it.
+      first = min(System.os_time(:nanosecond), System.system_time(:nanosecond))
       answer = iql(conn, "SELECT mean(v) FROM fresh WHERE time > now() - 1h")
-      last = System.os_time(:nanosecond)
+      last = max(System.os_time(:nanosecond), System.system_time(:nanosecond))
 
       assert {:ok, [%{"time" => time} = row]} = answer
       assert Map.delete(row, "time") === %{"iox::measurement" => "fresh", "mean" => 1.0}

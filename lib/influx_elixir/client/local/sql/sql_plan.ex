@@ -1657,6 +1657,10 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
           column == "Timestamp(ns)" and is_binary(right) ->
             timestamp_text(right)
 
+          value == "Timestamp(ns)" and match?({:lit, text} when is_binary(text), left) ->
+            {:lit, text} = left
+            timestamp_text(text)
+
           true ->
             :ok
         end
@@ -1922,5 +1926,10 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   def arrow_type({:u, _value}), do: "UInt64"
   def arrow_type({:int, bits, _value}), do: "Int#{bits}"
   def arrow_type({:dec, _coefficient, _scale}), do: @decimal
+  def arrow_type(%DateTime{}), do: "Timestamp(ns)"
+
+  def arrow_type(%{"value" => value, "time" => %DateTime{}}) when value != nil,
+    do: ~s|Struct("value": #{arrow_type(value)}, "time": Timestamp(ns))|
+
   def arrow_type(_string), do: "Utf8"
 end

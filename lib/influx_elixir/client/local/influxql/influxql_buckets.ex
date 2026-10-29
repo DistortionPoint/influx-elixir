@@ -44,8 +44,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   :local_influxql_max_rows, n`.
   """
   @spec max_rows() :: pos_integer()
-  def max_rows,
-    do: Application.get_env(:influx_elixir, :local_influxql_max_rows, @default_max_rows)
+  def max_rows do
+    case Application.get_env(:influx_elixir, :local_influxql_max_rows, @default_max_rows) do
+      n when is_integer(n) and n > 0 -> n
+      _other -> @default_max_rows
+    end
+  end
 
   @typedoc "How empty buckets are filled."
   @type fill :: :null | :none | :previous | :linear | {:number, integer() | float()}
