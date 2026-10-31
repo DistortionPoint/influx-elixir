@@ -199,8 +199,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
     do: {:aggregate, "percentile:" <> InfluxQLExpr.number_text(percent), field, column}
 
   defp call_item_of(name, extra, field, column) do
+    escaped_field =
+      String.replace(field, ["\\", "\"", "\n"], fn
+        "\n" -> "\\n"
+        char -> "\\" <> char
+      end)
+
     arguments =
-      Enum.map_join([~s("#{field}") | Enum.map(extra, &argument_text(name, &1))], ", ", & &1)
+      Enum.map_join(
+        [~s("#{escaped_field}") | Enum.map(extra, &argument_text(name, &1))],
+        ", ",
+        & &1
+      )
 
     case InfluxQLExpr.parse("#{name}(#{arguments})") do
       {:ok, ast} -> {:expr, ast, column}

@@ -1101,7 +1101,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     {valued, empty} = Enum.split_with(points, &orderable?(&1[field]))
 
     valued
-    |> Enum.sort_by(& &1[field], if(kind == "top", do: :desc, else: :asc))
+    |> Enum.sort_by(&order_key(&1[field]), if(kind == "top", do: :desc, else: :asc))
     |> Kernel.++(empty)
     |> Enum.take(limit)
     |> Enum.with_index()
@@ -1128,12 +1128,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     cond do
       not orderable?(value) -> false
       not orderable?(best) -> true
-      kind == "top" -> value > best
-      true -> value < best
+      kind == "top" -> order_key(value) > order_key(best)
+      true -> order_key(value) < order_key(best)
     end
   end
 
-  defp orderable?(value), do: is_number(value) or is_binary(value) or is_boolean(value)
+  defp orderable?(value),
+    do: is_number(value) or is_binary(value) or is_boolean(value) or is_struct(value, DateTime)
+
+  defp order_key(%DateTime{} = dt), do: DateTime.to_unix(dt, :nanosecond)
+  defp order_key(value), do: value
 
   # A transform of a field reads the points, not buckets.
   @spec raw_transform_item?(InfluxQL.item()) :: boolean()
