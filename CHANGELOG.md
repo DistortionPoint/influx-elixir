@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.59] - 2026-10-31
+
 ### Fixed
 - **`Client.Local.InfluxQLWild` and `Client.Local.InfluxQLRun` mishandled wildcard function expansion on field names containing `"` or `\` and multi-column `top(time, ...)` / `bottom(time, ...)` chronological ordering.**
   `InfluxQLWild.call_item_of/4` now escapes `\` and `"` in field names before re-parsing expanded function calls (`abs(*)`, `cumulative_sum(*)`, `top(*, N)`, etc.) via `InfluxQLExpr.parse/1`, preventing false `"unsupported InfluxQL"` errors when a measurement has quoted or backslash-containing field names. `InfluxQLRun.choose/5`, `InfluxQLRun.better?/3`, and `InfluxQLRun.orderable?/1` now treat `%DateTime{}` values as orderable and compare them by nanosecond Unix timestamp (`DateTime.to_unix(dt, :nanosecond)`) instead of Elixir structural map comparison so multi-column `SELECT top(time, N), v` and `SELECT bottom(time, N), v` queries (with or without tag arguments) order points chronologically.
