@@ -220,18 +220,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp constant_kind(tokens) do
     case InfluxQLWalk.walk(tokens, __MODULE__.Constants, %Opts{calls: false}) do
       {:ok, value, []} when is_float(value) -> :float
-      {:ok, value, []} when is_integer(value) -> {:integer, wrap_int64(value)}
+      {:ok, value, []} when is_integer(value) -> {:integer, SQLLimits.wrap_int64(value)}
       _unfoldable -> :expression
     end
   rescue
     _out_of_range in [ArgumentError, ArithmeticError] -> :expression
-  end
-
-  # The engine does its 64-bit integer arithmetic modulo 2^64 (verified: `9223372036854775807 +
-  # 1` is the lowest integer, `3037000500 * 3037000500` a negative one).
-  defp wrap_int64(value) do
-    wrapped = Bitwise.band(value, SQLLimits.uint64_max())
-    if wrapped > SQLLimits.int64_max(), do: wrapped - SQLLimits.uint64_max() - 1, else: wrapped
   end
 
   # Whether an integer is written beyond the signed range, which the engine reads as an unsigned
@@ -324,7 +317,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp decide(:integer, kind) when kind == :float or is_tuple(kind), do: :plain
   defp decide(:float, kind) when kind == :float or is_tuple(kind), do: :plain
 
-  defp decide(:unsigned, {:integer, n}) when n == -9_223_372_036_854_775_808,
+  defp decide(:unsigned, {:integer, n}) when n == SQLLimits.int64_min(),
     do: :refuse
 
   defp decide(:unsigned, {:integer, n}) when n < 0,

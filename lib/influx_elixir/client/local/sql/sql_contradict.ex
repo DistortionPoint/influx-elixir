@@ -35,7 +35,9 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   # says so (`unknown/3`, `uncertainty/2`, `grouped_overlap?/1`) instead of guessing: the caller
   # refuses by name a query whose answer depends on it.
 
-  alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLFold}
+  alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLFold, SQLLimits}
+
+  require SQLLimits
 
   @typep types :: %{binary() => binary()}
   @typep clause :: tuple()
@@ -43,9 +45,6 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   @typep form :: atom()
   @typep keyed :: {form(), term()} | :null | :unknown | :skip
 
-  @i64_min -9_223_372_036_854_775_808
-  @i64_max 9_223_372_036_854_775_807
-  @u64_max 18_446_744_073_709_551_615
   @text_types ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"]
 
   @doc """
@@ -779,18 +778,20 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   defp key(:other, _literal), do: :unknown
   defp key(class, {:uint, value}), do: key(class, value)
 
-  defp key(:i64, value) when is_integer(value) and value in @i64_min..@i64_max,
-    do: {:i64, value}
-
+  defp key(:i64, value) when SQLLimits.is_int64(value), do: {:i64, value}
   defp key(:i64, value) when is_integer(value), do: {:wide, value}
   defp key(:i64, value) when is_float(value), do: {:f64, value}
-  defp key(:i64, text) when is_binary(text), do: integer_text(text, @i64_min, @i64_max, :i64)
 
-  defp key(:u64, value) when is_integer(value) and value in 0..@u64_max, do: {:u64, value}
+  defp key(:i64, text) when is_binary(text),
+    do: integer_text(text, SQLLimits.int64_min(), SQLLimits.int64_max(), :i64)
+
+  defp key(:u64, value) when SQLLimits.is_uint64(value), do: {:u64, value}
   defp key(:u64, value) when is_integer(value) and value < 0, do: {:negative, value}
   defp key(:u64, value) when is_integer(value), do: {:wide, value}
   defp key(:u64, value) when is_float(value), do: {:f64, value}
-  defp key(:u64, text) when is_binary(text), do: integer_text(text, 0, @u64_max, :u64)
+
+  defp key(:u64, text) when is_binary(text),
+    do: integer_text(text, 0, SQLLimits.uint64_max(), :u64)
 
   defp key(:f64, value) when is_integer(value), do: {:f64, value * 1.0}
   defp key(:f64, value) when is_float(value), do: {:f64, value}

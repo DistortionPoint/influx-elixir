@@ -5,10 +5,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLShow do
   # order, and the part of them `LIMIT` and `OFFSET` keep. The store and the
   # SQL engine are asked by `InfluxQLQuery`; this module is pure.
 
-  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLShowParser, InfluxQLTokens, Retention}
+  alias InfluxElixir.Client.Local.{
+    InfluxQL,
+    InfluxQLShowParser,
+    InfluxQLTokens,
+    Retention,
+    SQLLimits
+  }
 
-  @int64_max 9_223_372_036_854_775_807
-  @two_64 18_446_744_073_709_551_616
+  require SQLLimits
 
   @doc "Whether a tag key is one a `key_filter/0` lists."
   @spec key_listed?(binary(), InfluxQL.key_filter()) :: boolean()
@@ -52,13 +57,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLShow do
   @spec window_error(non_neg_integer() | nil, non_neg_integer()) :: binary() | nil
   def window_error(limit, offset) do
     cond do
-      limit != nil and limit > @int64_max ->
+      limit != nil and limit > SQLLimits.int64_max() ->
         failed("eliminate_limit", "LIMIT must be >= 0", limit)
 
-      offset > @int64_max and limit != nil ->
+      offset > SQLLimits.int64_max() and limit != nil ->
         failed("push_down_limit", "OFFSET must be >=0", offset)
 
-      offset > @int64_max ->
+      offset > SQLLimits.int64_max() ->
         failed("eliminate_limit", "OFFSET must be >=0", offset)
 
       true ->
@@ -69,7 +74,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShow do
   @spec failed(binary(), binary(), non_neg_integer()) :: binary()
   defp failed(rule, message, value) do
     "Optimizer rule '#{rule}' failed\ncaused by\n" <>
-      "Error during planning: #{message}, '#{value - @two_64}' was provided"
+      "Error during planning: #{message}, '#{SQLLimits.wrap_int64(value)}' was provided"
   end
 
   @doc """

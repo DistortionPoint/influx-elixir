@@ -13,10 +13,12 @@ defmodule InfluxElixir.Client.Local.SQLInterval do
   # the error differ by unit. Only whole numbers of these units are read; a fraction, an
   # abbreviated unit or a clock time (`'1:30:00'`) is left to the rest of the double.
 
+  alias InfluxElixir.Client.Local.SQLLimits
+
+  require SQLLimits
+
   @i32_min -2_147_483_648
   @i32_max 2_147_483_647
-  @i64_min -9_223_372_036_854_775_808
-  @i64_max 9_223_372_036_854_775_807
 
   @nanoseconds %{
     "hour" => 3_600_000_000_000,
@@ -86,7 +88,7 @@ defmodule InfluxElixir.Client.Local.SQLInterval do
   @spec error({binary(), binary()}, binary()) :: binary() | nil
   defp error({number, unit}, text) do
     case Integer.parse(number) do
-      {value, ""} when value >= @i64_min and value <= @i64_max -> unit_error(value, unit)
+      {value, ""} when SQLLimits.is_int64(value) -> unit_error(value, unit)
       {_value, ""} -> "Parser error: Invalid input syntax for type interval: \"#{text}\""
       _fraction -> nil
     end
@@ -122,7 +124,7 @@ defmodule InfluxElixir.Client.Local.SQLInterval do
     scale = Map.fetch!(@nanoseconds, unit)
     product = value * scale
 
-    if product >= @i64_min and product <= @i64_max,
+    if SQLLimits.is_int64(product),
       do: nil,
       else: "Arithmetic overflow: Overflow happened on: #{value} * #{scale}"
   end

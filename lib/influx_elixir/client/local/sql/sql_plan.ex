@@ -30,6 +30,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     SQLExprType,
     SQLFunctions,
     SQLGrouping,
+    SQLLimits,
     SQLNativeType,
     SQLNullType,
     SQLParser,
@@ -1712,14 +1713,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp value_type(nil), do: nil
   defp value_type(value) when is_boolean(value), do: "Boolean"
   defp value_type({:uint, _value}), do: "UInt64"
-
-  defp value_type(value) when is_integer(value) and value > 9_223_372_036_854_775_807,
-    do: if(value <= 18_446_744_073_709_551_615, do: "UInt64", else: "Float64")
-
-  defp value_type(value) when is_integer(value) and value < -9_223_372_036_854_775_808,
-    do: "Float64"
-
-  defp value_type(value) when is_integer(value), do: "Int64"
+  defp value_type(value) when is_integer(value), do: SQLLimits.integer_type(value)
   defp value_type(value) when is_float(value), do: "Float64"
   defp value_type(value) when is_binary(value), do: "Utf8"
   defp value_type(_expression), do: :unknown

@@ -291,7 +291,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
           {:ok, {binary(), binary()}} | :not_positional | {:error, map()}
   defp positional(term, items) do
     case Integer.parse(term) do
-      {n, ""} when n > 9_223_372_036_854_775_807 ->
+      {n, ""} when n > SQLLimits.int64_max() ->
         :not_positional
 
       {n, ""} when n >= 1 and n <= length(items) ->

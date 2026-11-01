@@ -26,7 +26,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
   # items of one shape have the same name, and the error is refused by name, as its words cannot
   # be printed. Items of different shapes are taken to have different names.
 
-  alias InfluxElixir.Client.Local.{SQLDml, SQLDmlExpr, SQLDmlOperand, SQLError}
+  alias InfluxElixir.Client.Local.{SQLDml, SQLDmlExpr, SQLDmlOperand, SQLError, SQLLimits}
+
+  require SQLLimits
 
   @typep item :: {SQLDmlExpr.ast(), SQLDmlExpr.item_alias()}
   @typep mode :: :display | :name
@@ -347,13 +349,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
   end
 
   @spec integer(integer(), binary()) :: binary() | :unknown
-  defp integer(value, _text)
-       when value >= -9_223_372_036_854_775_808 and value <= 9_223_372_036_854_775_807,
-       do: "Int64(#{value})"
-
-  defp integer(value, _text) when value > 0 and value <= 18_446_744_073_709_551_615,
-    do: "UInt64(#{value})"
-
+  defp integer(value, _text) when SQLLimits.is_int64(value), do: "Int64(#{value})"
+  defp integer(value, _text) when SQLLimits.is_uint64(value), do: "UInt64(#{value})"
   defp integer(_value, text), do: float(text)
 
   @spec float(binary()) :: binary() | :unknown

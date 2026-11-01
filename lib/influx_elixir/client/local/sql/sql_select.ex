@@ -16,7 +16,15 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   # that depends on which side of a `CROSS JOIN` holds a column is refused by
   # name, and so is a cast, whose place in a name the double does not model.
 
-  alias InfluxElixir.Client.Local.{SQLCastType, SQLError, SQLExpr, SQLLiteral, SQLMask, SQLTime}
+  alias InfluxElixir.Client.Local.{
+    SQLCastType,
+    SQLError,
+    SQLExpr,
+    SQLLimits,
+    SQLLiteral,
+    SQLMask,
+    SQLTime
+  }
 
   @typedoc "Plain aggregates; `:stddev`/`:var` are the sample forms, as in InfluxDB."
   @type aggregate ::
@@ -824,18 +832,13 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   @spec literal_type(binary()) :: binary() | nil
   defp literal_type(text) do
     cond do
-      Regex.match?(~r/\A\d+\z/, text) -> integer_type(String.to_integer(text))
+      Regex.match?(~r/\A\d+\z/, text) -> SQLLimits.integer_type(String.to_integer(text))
       Regex.match?(~r/\A\d+[eE]\d+\z/, text) -> "Float64"
       String.downcase(text) == "null" -> "Null"
       String.downcase(text) in ["true", "false"] -> "Boolean"
       true -> nil
     end
   end
-
-  @spec integer_type(non_neg_integer()) :: binary()
-  defp integer_type(number) when number <= 9_223_372_036_854_775_807, do: "Int64"
-  defp integer_type(number) when number <= 18_446_744_073_709_551_615, do: "UInt64"
-  defp integer_type(_number), do: "Float64"
 
   @doc """
   The planner's error for a selector whose second argument is a constant, which it raises

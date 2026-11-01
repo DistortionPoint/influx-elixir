@@ -70,7 +70,7 @@ defmodule InfluxElixir.Client.Local.Flux do
   # carries, so `first()` and `last()` choose between points a microsecond
   # holds as the engine does.
 
-  alias InfluxElixir.Client.Local.Durations
+  alias InfluxElixir.Client.Local.{Durations, SQLLimits}
   alias InfluxElixir.Query.ResponseParser
 
   @typedoc """
@@ -525,10 +525,10 @@ defmodule InfluxElixir.Client.Local.Flux do
   # so a sum that does not fit wraps, and a mean divides the wrapped sum
   # (verified: two `9223372036854775807i` and a `5i` sum to 3, mean 1).
   @spec total([number()], :number | :uint) :: number() | binary()
-  defp total(values, :uint), do: values |> Enum.sum() |> Bitwise.band(0xFFFFFFFFFFFFFFFF)
+  defp total(values, :uint), do: values |> Enum.sum() |> SQLLimits.wrap_uint64()
 
   defp total([value | _rest] = values, :number) when is_integer(value),
-    do: wrap64(Enum.sum(values))
+    do: SQLLimits.wrap_int64(Enum.sum(values))
 
   defp total(values, :number), do: Enum.reduce(values, &add_float/2)
 
@@ -921,15 +921,15 @@ defmodule InfluxElixir.Client.Local.Flux do
       match = Regex.run(~r/^(-?)(\d+)(s|m|h|d|w)$/, text) ->
         [_full, sign, amount, unit] = match
         offset = String.to_integer(amount) * Durations.ns(unit)
-        wrapped = wrap64(now_ns + if(sign == "-", do: -offset, else: offset))
+        wrapped = SQLLimits.wrap_int64(now_ns + if(sign == "-", do: -offset, else: offset))
         {:ok, {wrapped, wrapped}}
 
       Regex.match?(~r/^-?\d+$/, text) ->
         seconds = String.to_integer(text)
 
         {:ok,
-         {wrap64(seconds * 1_000_000_000),
-          (wrap64(seconds + @year_one) - @year_one) * 1_000_000_000}}
+         {SQLLimits.wrap_int64(seconds * 1_000_000_000),
+          (SQLLimits.wrap_int64(seconds + @year_one) - @year_one) * 1_000_000_000}}
 
       true ->
         rfc3339(text)
@@ -948,7 +948,11 @@ defmodule InfluxElixir.Client.Local.Flux do
              text
            ),
          {:ok, dt, _offset} <- DateTime.from_iso8601(text) do
-      wrapped = wrap64(DateTime.to_unix(dt, :second) * 1_000_000_000 + fraction_ns(fraction))
+      wrapped =
+        SQLLimits.wrap_int64(
+          DateTime.to_unix(dt, :second) * 1_000_000_000 + fraction_ns(fraction)
+        )
+
       {:ok, {wrapped, wrapped}}
     else
       _unsupported -> {:error, "Client.Local: unsupported range() time: #{text}"}
@@ -960,14 +964,6 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   defp fraction_ns([digits]),
     do: digits |> String.slice(0, 9) |> String.pad_trailing(9, "0") |> String.to_integer()
-
-  # Two's-complement 64-bit wrap, which is what multiplying seconds by 1e9
-  # does on the engine.
-  @spec wrap64(integer()) :: integer()
-  defp wrap64(value) do
-    wrapped = Bitwise.band(value, 0xFFFFFFFFFFFFFFFF)
-    if wrapped >= 0x8000000000000000, do: wrapped - 0x10000000000000000, else: wrapped
-  end
 
   @spec fetch_int(map(), binary()) :: {:ok, non_neg_integer()} | {:error, binary()}
   defp fetch_int(params, key) do

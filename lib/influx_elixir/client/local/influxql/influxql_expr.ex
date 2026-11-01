@@ -180,7 +180,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   # A duration beyond 64 bits is the engine's parse error ("overflow"), at a
   # position the double does not track: refused by name.
-  defp duration(_rest, ns, _acc) when ns > 9_223_372_036_854_775_807, do: :error
+  defp duration(_rest, ns, _acc) when ns > SQLLimits.int64_max(), do: :error
   defp duration(rest, ns, acc), do: tokenize(rest, [{:duration, ns} | acc])
 
   defp duration_ns(text) do
@@ -1221,7 +1221,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   @spec compute(binary(), [value()]) :: value()
 
-  defp compute("abs", [{:int, n}]) when n == -9_223_372_036_854_775_808,
+  defp compute("abs", [{:int, n}]) when n == SQLLimits.int64_min(),
     do: throw({:refused, "unsupported InfluxQL (abs() of the smallest integer)"})
 
   defp compute("abs", [{:int, n}]), do: {:int, abs(n)}

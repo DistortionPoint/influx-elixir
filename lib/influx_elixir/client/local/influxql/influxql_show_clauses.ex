@@ -7,10 +7,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowClauses do
   # `{:ok, spec, end_of_clause}`, `:none` when the clause is not there, or the
   # engine's parse error. The conditions are `InfluxQLShowCondition`.
 
-  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLShowCondition}
+  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLShowCondition, SQLLimits}
   alias InfluxElixir.Client.Local.InfluxQLShowText, as: Text
 
-  @uint64_max 18_446_744_073_709_551_615
+  require SQLLimits
 
   @doc "Reads the clause `name` of a `SHOW` statement at `pos`."
   @spec clause(atom(), Text.ctx(), non_neg_integer(), map()) :: Text.step()
@@ -159,11 +159,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowClauses do
     to = from + byte_size(digits)
 
     cond do
-      value > @uint64_max ->
+      value > SQLLimits.uint64_max() ->
         {:error, {:engine, InfluxQLError.syntax_error_body(:unsigned, to, ctx.raw)}}
 
       # The largest LIMIT with an OFFSET after it keeps nothing (verified).
-      field == :offset and value > 0 and spec.limit == @uint64_max and
+      field == :offset and value > 0 and spec.limit == SQLLimits.uint64_max() and
           spec.kind != :measurements ->
         {:error, "unsupported InfluxQL (the largest LIMIT with an OFFSET)"}
 

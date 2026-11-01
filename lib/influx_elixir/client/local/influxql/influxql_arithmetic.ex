@@ -331,7 +331,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   defp common_kind(_int, _other), do: :int
 
   @spec absolute(value()) :: value()
-  defp absolute({:int, n}) when n == -9_223_372_036_854_775_808, do: throw(:closed_connection)
+  defp absolute({:int, n}) when n == SQLLimits.int64_min(), do: throw(:closed_connection)
 
   defp absolute({:int, n}), do: {:int, abs(n)}
   defp absolute({:float, x}), do: {:float, abs(x)}

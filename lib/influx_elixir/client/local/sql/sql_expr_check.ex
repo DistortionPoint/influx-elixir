@@ -24,11 +24,14 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     SQLError,
     SQLExpr,
     SQLExprType,
+    SQLLimits,
     SQLNativeType,
     SQLNullType,
     SQLTime,
     SQLTyped
   }
+
+  require SQLLimits
 
   @type context :: :select | :where | :order_by
 
@@ -449,7 +452,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   defp param?(left, right), do: bound?(left) or bound?(right)
 
   @spec bound?(SQLExpr.t()) :: boolean()
-  defp bound?({:uint, number}), do: number <= 9_223_372_036_854_775_807
+  defp bound?({:uint, number}), do: number <= SQLLimits.int64_max()
   defp bound?(_expr), do: false
 
   @spec comparison(

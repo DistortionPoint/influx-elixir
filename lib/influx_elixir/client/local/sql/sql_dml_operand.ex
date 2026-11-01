@@ -38,8 +38,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     SQLDmlType,
     SQLError,
     SQLFunctions,
+    SQLLimits,
     SQLNumber
   }
+
+  require SQLLimits
 
   @typedoc "What the operands of a statement are read against."
   @type ctx :: %{
@@ -1421,8 +1424,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   end
 
   @spec integer_type(non_neg_integer()) :: type()
-  defp integer_type(value) when value <= 9_223_372_036_854_775_807, do: :int
-  defp integer_type(value) when value <= 18_446_744_073_709_551_615, do: :uint
+  defp integer_type(value) when value <= SQLLimits.int64_max(), do: :int
+  defp integer_type(value) when value <= SQLLimits.uint64_max(), do: :uint
   defp integer_type(_value), do: :float
 
   @spec arithmetic(type(), type()) :: type()

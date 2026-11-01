@@ -31,7 +31,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   # clause) is a refusal by name once the steps before it have passed.
 
   alias InfluxElixir.Client.Local.{SQLDdl, SQLDml, SQLDmlExpr, SQLDmlItem, SQLDmlName}
-  alias InfluxElixir.Client.Local.{SQLDmlOperand, SQLError, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{SQLDmlOperand, SQLError, SQLLimits, SQLTokenizer}
+
+  require SQLLimits
 
   @query_body "SELECT, VALUES, or a subquery in the query body"
 
@@ -463,7 +465,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
       not Regex.match?(~r/\A\$[0-9]+\z/, text) ->
         "Can't parse placeholder: " <> text
 
-      String.to_integer(binary_part(text, 1, byte_size(text) - 1)) > 18_446_744_073_709_551_615 ->
+      String.to_integer(binary_part(text, 1, byte_size(text) - 1)) > SQLLimits.uint64_max() ->
         "Can't parse placeholder: " <> text
 
       index >= fields ->

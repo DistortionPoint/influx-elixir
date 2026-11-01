@@ -47,4 +47,10 @@ defmodule InfluxElixir.Client.Local.SQLLimits do
   @spec wrap_uint64(integer()) :: non_neg_integer()
   def wrap_uint64(value) when is_uint64(value), do: value
   def wrap_uint64(value), do: Integer.mod(value, @two_64)
+
+  @doc "The Arrow type of an integer literal (`Int64`, `UInt64`, or `Float64`)."
+  @spec integer_type(integer()) :: binary()
+  def integer_type(value) when is_int64(value), do: "Int64"
+  def integer_type(value) when is_uint64(value), do: "UInt64"
+  def integer_type(value) when is_integer(value), do: "Float64"
 end
