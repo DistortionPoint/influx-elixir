@@ -754,9 +754,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   @lookback ~w(derivative non_negative_derivative difference non_negative_difference
                moving_average)
 
-  @doc false
   @spec lookback?(map()) :: boolean()
-  def lookback?(%{transforms: transforms}), do: Enum.any?(transforms, &(&1.name in @lookback))
+  defp lookback?(%{transforms: transforms}), do: Enum.any?(transforms, &(&1.name in @lookback))
 
   @doc """
   How far before the range the scan of a `GROUP BY time` goes, in nanoseconds:

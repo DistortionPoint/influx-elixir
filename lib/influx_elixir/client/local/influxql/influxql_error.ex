@@ -25,7 +25,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
     limit: "invalid LIMIT clause, expected unsigned integer",
     offset: "invalid OFFSET clause, expected unsigned integer",
     slimit: "invalid SLIMIT clause, expected unsigned integer",
-    soffset: "invalid SOFFSET clause, expected unsigned integer",
     group_by: "invalid GROUP BY clause, expected BY",
     distinct: "invalid DISTINCT expression, expected identifier",
     unsigned: "unable to parse unsigned integer",
@@ -252,33 +251,28 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   defp where_key(:reserved_operator, pos, _where_at, whole), do: before_operand(whole, pos) - 1
   defp where_key(_kind, pos, _where_at, _whole), do: pos
 
-  @doc """
-  The body for a `WHERE` the tokens of which stop at `pos`
-  , by the `kind`
-  `InfluxElixir.Client.Local.InfluxQLTokens` gives: `where_at` is where the
-  `WHERE` starts.
-  """
+  # The body for a `WHERE` the tokens of which stop at `pos`, by the `kind`
+  # `InfluxElixir.Client.Local.InfluxQLTokens` gives: `where_at` is where the
+  # `WHERE` starts.
   @spec where_error_body(atom(), non_neg_integer(), non_neg_integer(), binary()) :: binary()
-  def where_error_body(:where_unparsed, _pos, where_at, whole),
+  defp where_error_body(:where_unparsed, _pos, where_at, whole),
     do: syntax_error_body(:nom, where_at, whole)
 
-  def where_error_body(:reserved_operand, pos, _where_at, whole),
+  defp where_error_body(:reserved_operand, pos, _where_at, whole),
     do: syntax_error_body(:operand, before_operand(whole, pos), whole)
 
-  def where_error_body(:reserved_operator, pos, _where_at, whole),
+  defp where_error_body(:reserved_operator, pos, _where_at, whole),
     do: syntax_error_body(:nom, before_operand(whole, pos) - 1, whole)
 
-  def where_error_body(:reserved_failure, pos, _where_at, whole),
+  defp where_error_body(:reserved_failure, pos, _where_at, whole),
     do: syntax_error_body(:failure, pos, whole)
 
-  def where_error_body(kind, pos, _where_at, whole), do: syntax_error_body(kind, pos, whole)
+  defp where_error_body(kind, pos, _where_at, whole), do: syntax_error_body(kind, pos, whole)
 
-  @doc """
-  The end of the operator before the operand that starts at `pos`:
-  whitespace, opening parentheses and unary signs between them are skipped.
-  """
+  # The end of the operator before the operand that starts at `pos`:
+  # whitespace, opening parentheses and unary signs between them are skipped.
   @spec before_operand(binary(), non_neg_integer()) :: non_neg_integer()
-  def before_operand(whole, pos) do
+  defp before_operand(whole, pos) do
     skipped = whole |> binary_part(0, pos) |> String.reverse()
     [spaces] = Regex.run(~q/^[\s(+\-]*/, skipped)
     pos - byte_size(spaces)

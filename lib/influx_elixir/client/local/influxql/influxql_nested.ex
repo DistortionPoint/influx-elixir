@@ -510,14 +510,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   # Groups
   # ---------------------------------------------------------------------------
 
-  @doc """
-  Whether tokens are one parenthesised group, however many layers deep, that holds a
-  comparison, an `AND`, an `OR` or a boolean constant.
-  """
+  # Whether tokens are one parenthesised group, however many layers deep, that holds a
+  # comparison, an `AND`, an `OR` or a boolean constant.
   @spec boolean_group?(list()) :: boolean()
-  def boolean_group?([{:cond_group, _node, _item}]), do: true
+  defp boolean_group?([{:cond_group, _node, _item}]), do: true
 
-  def boolean_group?(tokens) do
+  defp boolean_group?(tokens) do
     case strip_group(tokens) do
       {:ok, [{:raw, word}]} when is_binary(word) -> String.downcase(word) in ["true", "false"]
       {:ok, inner} -> connective_inside?(inner, true)
@@ -544,13 +542,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
     |> Enum.any?()
   end
 
-  @doc """
-  The tokens inside the layers of parentheses that wrap all of `tokens` (`((a))` is `a`),
-  `{:ok, inner}`, or `nil` when they are not one group (`(a) AND (b)`, `(a) + 1`, an unbalanced
-  list).
-  """
+  # The tokens inside the layers of parentheses that wrap all of `tokens` (`((a))` is `a`),
+  # `{:ok, inner}`, or `nil` when they are not one group (`(a) AND (b)`, `(a) + 1`, an unbalanced
+  # list).
   @spec strip_group(list()) :: {:ok, list()} | nil
-  def strip_group(tokens) do
+  defp strip_group(tokens) do
     case InfluxQLTokens.unwrap_group(tokens) do
       {_tokens, 0} -> nil
       {inner, _layers} -> {:ok, inner}

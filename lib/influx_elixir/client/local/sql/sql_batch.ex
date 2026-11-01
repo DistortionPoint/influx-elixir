@@ -72,14 +72,12 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
 
   @state_rank %{ok: 0, maybe: 1, fail: 2}
 
-  @doc """
-  Whether an operand that fails for some row of `points` stands beside another
-  one of a `WHERE`, so that the order the engine runs them in decides the
-  query. An operation that no row makes fail (a division whose divisor is
-  never zero) is not one: the conjunction is then answered row by row.
-  """
+  # Whether an operand that fails for some row of `points` stands beside another
+  # one of a `WHERE`, so that the order the engine runs them in decides the
+  # query. An operation that no row makes fail (a division whose divisor is
+  # never zero) is not one: the conjunction is then answered row by row.
   @spec guarded?([point()], [SQLParser.where_node()]) :: boolean()
-  def guarded?(points, conjunction) do
+  defp guarded?(points, conjunction) do
     (multiple?(conjunction) and Enum.any?(conjunction, &fails?(&1, points))) or
       Enum.any?(conjunction, &nested_guard?(&1, points))
   end
@@ -207,12 +205,10 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   defp can_fail?({:cast, _inner, _type}), do: true
   defp can_fail?(_other), do: false
 
-  @doc """
-  The refusal for a query whose outcome the engine's two storage states
-  settle differently.
-  """
+  # The refusal for a query whose outcome the engine's two storage states
+  # settle differently.
   @spec refusal() :: SQLError.t()
-  def refusal do
+  defp refusal do
     SQLError.refusal(
       "a WHERE whose AND or OR runs an operand that fails over a row the other operand " <>
         "leaves out: whether the engine fails the query depends on how the table is stored " <>

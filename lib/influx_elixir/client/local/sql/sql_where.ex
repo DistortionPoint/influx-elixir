@@ -39,14 +39,6 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   @limit_start SQLLimit.start_source()
 
   @doc """
-  Parses the `WHERE ...` clause (if any) out of the text after `FROM <table>`.
-  """
-  @spec nodes(binary()) :: {:ok, [node_t()]} | {:error, SQLError.t()}
-  def nodes(rest) do
-    with {:ok, conj, _tree} <- parse(rest), do: {:ok, conj}
-  end
-
-  @doc """
   Parses a stand-alone `WHERE ...` clause where no trailing `GROUP BY`, `HAVING`,
   `ORDER BY` or `LIMIT` clause may follow.
   """

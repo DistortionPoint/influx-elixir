@@ -1380,35 +1380,35 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   # The type of an operand
   # ---------------------------------------------------------------------------
 
-  @doc "The type of an operand, as far as the checks tell (`:unknown` when not)."
+  # The type of an operand, as far as the checks tell (`:unknown` when not).
   @spec type_of(SQLDmlExpr.ast(), ctx()) :: type()
-  def type_of({:num, text}, _ctx), do: number_type(text)
+  defp type_of({:num, text}, _ctx), do: number_type(text)
 
-  def type_of({:str, _body}, _ctx), do: :str
-  def type_of({:bool, _value}, _ctx), do: :bool
-  def type_of(:null, _ctx), do: :null
-  def type_of({:param, _text}, _ctx), do: :null
-  def type_of({:ref, parts}, ctx), do: column_type(ctx.types[parts |> List.last() |> elem(0)])
-  def type_of({:bin, op, _left, _right}, _ctx) when op in @comparisons, do: :bool
-  def type_of({kind, _inner}, _ctx) when kind == :not, do: :bool
-  def type_of({:is, _a, _b, _c}, _ctx), do: :bool
-  def type_of({:in, _a, _b, _c}, _ctx), do: :bool
-  def type_of({:between, _a, _b, _c, _d}, _ctx), do: :bool
-  def type_of({:like, _a, _b, _c, _d, _e}, _ctx), do: :bool
-  def type_of({sign, inner}, ctx) when sign in [:neg, :pos], do: type_of(inner, ctx)
-  def type_of({:bin, "||", _left, _right}, _ctx), do: :str
+  defp type_of({:str, _body}, _ctx), do: :str
+  defp type_of({:bool, _value}, _ctx), do: :bool
+  defp type_of(:null, _ctx), do: :null
+  defp type_of({:param, _text}, _ctx), do: :null
+  defp type_of({:ref, parts}, ctx), do: column_type(ctx.types[parts |> List.last() |> elem(0)])
+  defp type_of({:bin, op, _left, _right}, _ctx) when op in @comparisons, do: :bool
+  defp type_of({kind, _inner}, _ctx) when kind == :not, do: :bool
+  defp type_of({:is, _a, _b, _c}, _ctx), do: :bool
+  defp type_of({:in, _a, _b, _c}, _ctx), do: :bool
+  defp type_of({:between, _a, _b, _c, _d}, _ctx), do: :bool
+  defp type_of({:like, _a, _b, _c, _d, _e}, _ctx), do: :bool
+  defp type_of({sign, inner}, ctx) when sign in [:neg, :pos], do: type_of(inner, ctx)
+  defp type_of({:bin, "||", _left, _right}, _ctx), do: :str
 
-  def type_of({:bin, op, left, right}, ctx) when op in @arithmetic do
+  defp type_of({:bin, op, left, right}, ctx) when op in @arithmetic do
     case {type_of(left, ctx), type_of(right, ctx)} do
       {:time, :time} when op == "-" -> :duration
       {left_type, right_type} -> arithmetic(left_type, right_type)
     end
   end
 
-  def type_of({:cast, _inner, type, _try}, _ctx), do: cast_type(type)
-  def type_of({:ordered, call, _terms}, ctx), do: type_of(call, ctx)
-  def type_of({:call, name, args}, ctx), do: call_type(name, args, ctx)
-  def type_of(_other, _ctx), do: :unknown
+  defp type_of({:cast, _inner, type, _try}, _ctx), do: cast_type(type)
+  defp type_of({:ordered, call, _terms}, ctx), do: type_of(call, ctx)
+  defp type_of({:call, name, args}, ctx), do: call_type(name, args, ctx)
+  defp type_of(_other, _ctx), do: :unknown
 
   # A number is an `Int64`, a `UInt64` above the largest `Int64`, else a `Float64`.
   @spec number_type(binary()) :: type()

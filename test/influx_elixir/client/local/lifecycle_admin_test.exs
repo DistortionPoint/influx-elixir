@@ -508,7 +508,6 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
       utf8_refusal =
         {:error, %{status: 400, body: "Client.Local: the SQL text is not valid UTF-8"}}
 
-      assert SQLWhere.nodes(bad) === utf8_refusal
       assert SQLWhere.only(bad) === utf8_refusal
       assert SQLWhere.parsed(bad) === utf8_refusal
       assert SQLWhere.tree(bad) === nil

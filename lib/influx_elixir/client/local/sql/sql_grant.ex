@@ -38,9 +38,9 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   @unworded_objects ~w(PROCEDURE WAREHOUSE USER INTEGRATION CONNECTION FUTURE)
   @unworded_all ~w(VIEWS MATERIALIZED EXTERNAL)
 
-  @doc "Whether a word (in capitals) is a privilege the parser reads (`ROLE r` is one)."
+  # Whether a word (in capitals) is a privilege the parser reads (`ROLE r` is one).
   @spec privilege?(binary()) :: boolean()
-  def privilege?(word), do: word in ["ALL", "ROLE"] or word in @privileges
+  defp privilege?(word), do: word in ["ALL", "ROLE"] or word in @privileges
 
   @doc "Whether the tokens begin with a privilege the parser reads (`DATABASE ROLE r` is one)."
   @spec privilege_start?([SQLTokenizer.token()]) :: boolean()

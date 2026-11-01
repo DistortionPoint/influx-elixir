@@ -136,46 +136,44 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
     end
   end
 
-  @doc """
-  The type of the node from the types of its parts, without looking for the node itself.
-  """
+  # The type of the node from the types of its parts, without looking for the node itself.
   @spec node_type(SQLExpr.t(), columns(), SQLTyped.t(), phase()) :: type()
-  def node_type(expr, _columns, _memo, _phase)
-      when is_tuple(expr) and elem(expr, 0) in @booleans,
-      do: "Boolean"
+  defp node_type(expr, _columns, _memo, _phase)
+       when is_tuple(expr) and elem(expr, 0) in @booleans,
+       do: "Boolean"
 
   # An aggregate the planner types differently from the coercion has its planner type under
   # the key `SQLAggType.plan_key/1` gives.
-  def node_type({:field, ref}, columns, _memo, :plan) when is_binary(ref),
+  defp node_type({:field, ref}, columns, _memo, :plan) when is_binary(ref),
     do: Map.get(columns, SQLAggType.plan_key(ref)) || Map.get(columns, ref)
 
-  def node_type({:field, ref}, columns, _memo, _phase), do: Map.get(columns, ref)
-  def node_type({:lit, nil}, _columns, _memo, _phase), do: "Null"
-  def node_type({:lit, value}, _columns, _memo, _phase) when is_integer(value), do: "Int64"
-  def node_type({:lit, value}, _columns, _memo, _phase) when is_float(value), do: "Float64"
+  defp node_type({:field, ref}, columns, _memo, _phase), do: Map.get(columns, ref)
+  defp node_type({:lit, nil}, _columns, _memo, _phase), do: "Null"
+  defp node_type({:lit, value}, _columns, _memo, _phase) when is_integer(value), do: "Int64"
+  defp node_type({:lit, value}, _columns, _memo, _phase) when is_float(value), do: "Float64"
 
-  def node_type({:lit, value}, _columns, _memo, _phase) when value in [:inf, :neg_inf],
+  defp node_type({:lit, value}, _columns, _memo, _phase) when value in [:inf, :neg_inf],
     do: "Float64"
 
-  def node_type({:lit, value}, _columns, _memo, _phase) when is_binary(value), do: "Utf8"
-  def node_type({:lit, value}, _columns, _memo, _phase) when is_boolean(value), do: "Boolean"
-  def node_type({:uint, _value}, _columns, _memo, _phase), do: "UInt64"
-  def node_type({:uint_col, _name}, _columns, _memo, _phase), do: "UInt64"
-  def node_type({:cast, _inner, type}, _columns, _memo, _phase), do: SQLCast.arrow_type(type)
+  defp node_type({:lit, value}, _columns, _memo, _phase) when is_binary(value), do: "Utf8"
+  defp node_type({:lit, value}, _columns, _memo, _phase) when is_boolean(value), do: "Boolean"
+  defp node_type({:uint, _value}, _columns, _memo, _phase), do: "UInt64"
+  defp node_type({:uint_col, _name}, _columns, _memo, _phase), do: "UInt64"
+  defp node_type({:cast, _inner, type}, _columns, _memo, _phase), do: SQLCast.arrow_type(type)
 
-  def node_type({kind, inner}, columns, memo, phase) when kind in [:neg, :pos],
+  defp node_type({kind, inner}, columns, memo, phase) when kind in [:neg, :pos],
     do: type_of(inner, columns, memo, phase)
 
-  def node_type({:concat, left, right}, columns, memo, phase) do
+  defp node_type({:concat, left, right}, columns, memo, phase) do
     if "Utf8View" in [type_of(left, columns, memo, phase), type_of(right, columns, memo, phase)],
       do: "Utf8View",
       else: "Utf8"
   end
 
-  def node_type({:op, _op, left, right}, columns, memo, phase),
+  defp node_type({:op, _op, left, right}, columns, memo, phase),
     do: arithmetic(type_of(left, columns, memo, phase), type_of(right, columns, memo, phase))
 
-  def node_type({:case, _operand, whens, otherwise}, columns, memo, phase) do
+  defp node_type({:case, _operand, whens, otherwise}, columns, memo, phase) do
     thens = Enum.map(whens, &type_of(elem(&1, 1), columns, memo, phase))
     others = Enum.map(List.wrap(otherwise), &type_of(&1, columns, memo, phase))
 
@@ -186,25 +184,25 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
     end
   end
 
-  def node_type({:call, :nullif, [left, right]}, columns, memo, phase) do
+  defp node_type({:call, :nullif, [left, right]}, columns, memo, phase) do
     case {type_of(left, columns, memo, phase), type_of(right, columns, memo, phase)} do
       {"Null", "Null"} -> "Utf8View"
       types -> SQLCommonType.planned(Tuple.to_list(types), :nullif)
     end
   end
 
-  def node_type({:call, name, args}, columns, memo, phase)
-      when name in [:coalesce, :greatest, :least],
-      do: SQLCommonType.planned(Enum.map(args, &type_of(&1, columns, memo, phase)), :coalesce)
+  defp node_type({:call, name, args}, columns, memo, phase)
+       when name in [:coalesce, :greatest, :least],
+       do: SQLCommonType.planned(Enum.map(args, &type_of(&1, columns, memo, phase)), :coalesce)
 
-  def node_type({:call, :abs, [arg]}, columns, memo, phase) do
+  defp node_type({:call, :abs, [arg]}, columns, memo, phase) do
     case type_of(arg, columns, memo, phase) do
       "Null" -> "Float64"
       type -> type
     end
   end
 
-  def node_type({:call, name, args}, columns, memo, phase) do
+  defp node_type({:call, name, args}, columns, memo, phase) do
     arguments = Enum.map(args, &type_of(&1, columns, memo, phase))
 
     cond do
@@ -215,7 +213,7 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
     end
   end
 
-  def node_type(_other, _columns, _memo, _phase), do: nil
+  defp node_type(_other, _columns, _memo, _phase), do: nil
 
   # The type of a `CASE` once coerced: the type its results share. Results that share none are
   # the error of the `CASE` (found after the errors of what stands around it), so what stands

@@ -37,13 +37,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   """
   @type spec :: {:count | :other, column_type()}
 
-  @doc "Whether `fun` is an aggregate the double computes."
-  @spec function?(binary()) :: boolean()
-  def function?(fun),
-    do:
-      fun in ~w(mean sum count min max first last median spread stddev distinct mode) or
-        String.starts_with?(fun, "percentile:") or String.starts_with?(fun, "integral:")
-
   @doc """
   The `named` results of a row that is answered, with each `count` that found nothing zero
   (verified: `count(v), count(n)` over points that have an `n` and no `v` is `0` and the

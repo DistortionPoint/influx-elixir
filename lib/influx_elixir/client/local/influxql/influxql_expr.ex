@@ -740,14 +740,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   def text_literal?({:fn, _name, arguments}), do: Enum.any?(arguments, &text_literal?/1)
   def text_literal?(_other), do: false
 
-  @doc "Whether an expression divides (`/`) anywhere in it."
+  # Whether an expression divides (`/`) anywhere in it.
   @spec divides?(ast()) :: boolean()
-  def divides?({:bin, "/", _left, _right}), do: true
-  def divides?({:bin, _op, left, right}), do: divides?(left) or divides?(right)
-  def divides?({:neg, operand}), do: divides?(operand)
-  def divides?({:fn, _name, arguments}), do: Enum.any?(arguments, &divides?/1)
-  def divides?({:transform, _name, inner, _parameter}), do: divides?(inner)
-  def divides?(_other), do: false
+  defp divides?({:bin, "/", _left, _right}), do: true
+  defp divides?({:bin, _op, left, right}), do: divides?(left) or divides?(right)
+  defp divides?({:neg, operand}), do: divides?(operand)
+  defp divides?({:fn, _name, arguments}), do: Enum.any?(arguments, &divides?/1)
+  defp divides?({:transform, _name, inner, _parameter}), do: divides?(inner)
+  defp divides?(_other), do: false
 
   @doc """
   Whether an expression of aggregates is made of quotients: it divides, and every aggregate in

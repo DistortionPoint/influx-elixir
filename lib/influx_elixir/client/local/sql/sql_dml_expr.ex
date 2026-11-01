@@ -700,9 +700,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   # Operands
   # ---------------------------------------------------------------------------
 
-  @doc "One operand from the tokens, and the tokens after it."
+  # One operand from the tokens, and the tokens after it.
   @spec expr([token()]) :: parsed(ast())
-  def expr(tokens), do: subexpr(tokens, 0)
+  defp expr(tokens), do: subexpr(tokens, 0)
 
   @spec subexpr([token()], non_neg_integer()) :: parsed(ast())
   defp subexpr(tokens, precedence) do

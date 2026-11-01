@@ -8,12 +8,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
 
   # A duration next to `now()` is an interval in whole seconds, the unit
   # the SQL engine's INTERVAL takes; a finer one is refused by name.
-  @doc false
   @spec duration_sql(non_neg_integer(), binary()) :: binary()
-  def duration_sql(ns, _text) when rem(ns, 1_000_000_000) == 0,
+  defp duration_sql(ns, _text) when rem(ns, 1_000_000_000) == 0,
     do: "INTERVAL '#{div(ns, 1_000_000_000)} seconds'"
 
-  def duration_sql(_ns, text),
+  defp duration_sql(_ns, text),
     do: throw({:refused, "unsupported InfluxQL (sub-second duration #{text})"})
 
   @doc """

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Pruned dead map keys and tightened module-internal function visibility across `Client.Local` InfluxQL and SQL helpers.**
+  Removed the unused `:soffset` entry in `InfluxQLError`, `InfluxQLAggregate.function?/1`, and `SQLWhere.nodes/1`, and converted module-internal functions in `InfluxQLError`, `InfluxQLExpr`, `InfluxQLNames`, `InfluxQLNested`, `InfluxQLRun`, `InfluxQLSql`, `SQLAggregate`, `SQLBatch`, `SQLDmlExpr`, `SQLDmlOperand`, `SQLExprType`, and `SQLGrant` from `def` to `defp`.
+
 ## [0.1.59] - 2026-10-31
 
 ### Fixed

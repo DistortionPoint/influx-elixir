@@ -75,9 +75,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
   def time_item?({:column, column, _name}), do: String.downcase(column) == "time"
   def time_item?(_item), do: false
 
-  @doc "The name the time column leads the answer with."
+  # The name the time column leads the answer with.
   @spec time_name([item()]) :: binary()
-  def time_name(items) do
+  defp time_name(items) do
     case Enum.find(items, &time_item?/1) do
       {:column, _column, name} -> name
       nil -> "time"

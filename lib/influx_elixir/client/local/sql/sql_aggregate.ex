@@ -45,12 +45,10 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   @distinct_literal "a DISTINCT aggregate of a literal beside another aggregate over no row: " <>
                       "the engine's answer for it is not modelled"
 
-  @doc """
-  One output row of an aggregate or grouped select list: each column over the
-  group's `points`; `bucket_ts` is the group's `DATE_BIN` bucket start.
-  """
+  # One output row of an aggregate or grouped select list: each column over the
+  # group's `points`; `bucket_ts` is the group's `DATE_BIN` bucket start.
   @spec reduce_columns([SQLSelect.column()], points(), integer() | nil | :scalar) :: map()
-  def reduce_columns(columns, points, bucket_ts) do
+  defp reduce_columns(columns, points, bucket_ts) do
     if points == [] and distinct_literal_quirk?(columns) do
       throw({:query_error, SQLError.refusal(@distinct_literal)})
     end
