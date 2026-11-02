@@ -168,30 +168,12 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   end
 
   @doc """
-  One select item parsed as an aggregate item (see `parse_list/2`): the column,
-  or the error.
-  """
-  @spec parse_item(binary(), binary() | nil) :: {:ok, column()} | {:error, term()}
-  def parse_item(item, qualifier), do: parse_single_column(item, qualifier)
-
-  @doc """
-  The aggregate SELECT list as columns, or the first column's error.
+  One select item parsed as an aggregate item: the column, or the error.
   `qualifier` is the table, or its alias, that names a column in an unaliased
   item's name; `nil` when the table is joined.
   """
-  @spec parse_list(binary(), binary() | nil) :: {:ok, [column()]} | {:error, term()}
-  def parse_list(columns_str, qualifier \\ nil) do
-    columns =
-      columns_str
-      |> SQLMask.split_commas()
-      |> Enum.map(&String.trim/1)
-      |> Enum.map(&parse_single_column(&1, qualifier))
-
-    case Enum.find(columns, &match?({:error, _}, &1)) do
-      nil -> {:ok, Enum.map(columns, fn {:ok, col} -> col end)}
-      error -> error
-    end
-  end
+  @spec parse_item(binary(), binary() | nil) :: {:ok, column()} | {:error, term()}
+  def parse_item(item, qualifier), do: parse_single_column(item, qualifier)
 
   @doc """
   A select item as `{body, alias}`: the text before a final `AS name` and the

@@ -568,7 +568,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       %{
         measurement: measurement,
         where: where,
-        where_tree: Keyword.get_lazy(overrides, :where_tree, fn -> SQLWhere.tree(rest) end),
+        where_tree: nil,
         order_by: SQLClauses.order_by(rest),
         limit: SQLLimit.limit(rest),
         offset: SQLLimit.offset(rest),

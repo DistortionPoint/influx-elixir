@@ -130,9 +130,8 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
     text <> binary_part(body, last, byte_size(body) - last)
   end
 
-  @doc "The name an aggregate stands under in an expression."
   @spec placeholder(non_neg_integer()) :: binary()
-  def placeholder(index), do: "__ag#{index}__"
+  defp placeholder(index), do: "__ag#{index}__"
 
   # The engine's name for the expression: the aggregates by their own names.
   @spec default_name(SQLExpr.t(), [{binary(), SQLSelect.column()}], binary() | nil) :: binary()

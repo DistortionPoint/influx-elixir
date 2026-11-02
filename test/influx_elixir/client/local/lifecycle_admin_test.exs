@@ -510,7 +510,6 @@ defmodule InfluxElixir.Client.Local.LifecycleAdminTest do
 
       assert SQLWhere.only(bad) === utf8_refusal
       assert SQLWhere.parsed(bad) === utf8_refusal
-      assert SQLWhere.tree(bad) === nil
       assert SQLPredicate.parse(bad) === utf8_refusal
       assert SQLExpr.parse(bad) === {:error, :invalid_utf8}
       assert SQLExpr.parse_arithmetic(bad) === {:error, :invalid_utf8}

@@ -7,7 +7,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   # ones that fail only when a row meets them, and are gone before one does.
   #
   # Over the `WHERE` as written, in binary `AND` and `OR` nodes taken left to
-  # right (`InfluxElixir.Client.Local.SQLWhere.tree/1`):
+  # right (`InfluxElixir.Client.Local.SQLWhere.parsed/1`):
   #
   #   * `x AND false` is false and `x OR true` is true, in either order, and
   #     `x AND true` and `x OR false` are `x`; `NULL AND NULL` and `NULL OR NULL` are `NULL`

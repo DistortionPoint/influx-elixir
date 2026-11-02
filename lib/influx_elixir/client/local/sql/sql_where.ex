@@ -63,28 +63,11 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   end
 
   @doc """
-  Both readings of the `WHERE ...` clause out of one parse: the conjunction list of `nodes/1` and
-  the tree of `tree/1`.
+  Both readings of the `WHERE ...` clause out of one parse: the conjunction list and
+  the binary `AND`/`OR` tree (`nil` when there is no `WHERE`).
   """
   @spec parsed(binary()) :: {:ok, [node_t()], tree() | nil} | {:error, SQLError.t()}
-  def parsed(rest), do: parse(rest)
-
-  @doc """
-  The `WHERE ...` clause as written: the same predicates in binary `AND` and
-  `OR` nodes, left to right, parentheses kept as the grouping they make, which
-  the conjunction list of `nodes/1` does not keep. `nil` when there is no
-  `WHERE` or it does not parse.
-  """
-  @spec tree(binary()) :: tree() | nil
-  def tree(rest) do
-    case parse(rest) do
-      {:ok, _conj, tree} -> tree
-      {:error, _reason} -> nil
-    end
-  end
-
-  @spec parse(binary()) :: {:ok, [node_t()], tree() | nil} | {:error, map()}
-  defp parse(rest) do
+  def parsed(rest) do
     if String.valid?(rest) do
       case SQLMask.run(
              ~r/(?i)WHERE\s+(.+?)(?<=\S)(?:\s+GROUP\b|\s+HAVING\b|\s+ORDER\b|\s+#{@limit_start}|\s*$)/su,
@@ -419,9 +402,8 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   def exprs({op, left, right}),
     do: operand_exprs(left) ++ right_exprs(op, right)
 
-  @doc "The same as `exprs/1` for each node of a conjunction."
   @spec conjunction_exprs([node_t()]) :: [SQLExpr.t()]
-  def conjunction_exprs(conjunction), do: Enum.flat_map(conjunction, &exprs/1)
+  defp conjunction_exprs(conjunction), do: Enum.flat_map(conjunction, &exprs/1)
 
   @doc """
   The names of the columns a node reads: a predicate's column operands and the

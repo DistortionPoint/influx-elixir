@@ -32,19 +32,15 @@ defmodule InfluxElixir.Client.Local.SQLInformation do
   @spec relation_name(binary()) :: binary()
   def relation_name(name), do: @prefix <> name
 
-  @doc """
-  The points and the declared columns of an `information_schema` relation
-  (named as `relation_name/1` names it), or `:error` for any other name.
-  """
   @spec relation(binary(), Store.t(), binary()) ::
           {:ok, [map()], [binary()]} | :error
-  def relation(@prefix <> "tables", table, database),
+  defp relation(@prefix <> "tables", table, database),
     do: {:ok, tables(table, database), SQLTable.column_names("information_schema", "tables")}
 
-  def relation(@prefix <> "columns", table, database),
+  defp relation(@prefix <> "columns", table, database),
     do: {:ok, columns(table, database), SQLTable.column_names("information_schema", "columns")}
 
-  def relation(@prefix <> "schemata", _table, _database),
+  defp relation(@prefix <> "schemata", _table, _database),
     do:
       {:ok,
        [
@@ -52,8 +48,8 @@ defmodule InfluxElixir.Client.Local.SQLInformation do
          row("schemata", %{"catalog_name" => "public", "schema_name" => "system"})
        ], SQLTable.column_names("information_schema", "schemata")}
 
-  def relation(@dual, _table, _database), do: {:ok, [row("dual", %{})], []}
-  def relation(_other, _table, _database), do: :error
+  defp relation(@dual, _table, _database), do: {:ok, [row("dual", %{})], []}
+  defp relation(_other, _table, _database), do: :error
 
   @doc "The points a query reads for `measurement`: an `information_schema` relation or a table."
   @spec fetch(Store.t(), binary(), binary()) ::

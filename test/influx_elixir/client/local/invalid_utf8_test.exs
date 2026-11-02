@@ -436,7 +436,7 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
       refute SQLSelect.aggregate_query?(@bad <> "'")
       refute SQLSelect.influxql_call?(@bad <> "'")
       assert SQLSelect.aggregate_spans(@bad <> "'") === []
-      assert {:error, _err} = SQLSelect.parse_list(@bad <> "'")
+      assert {:error, _err} = SQLSelect.parse_item(@bad <> "'", nil)
       assert {:error, _err} = SQLAggExpr.parse_list(@bad <> "'")
     end
   end
