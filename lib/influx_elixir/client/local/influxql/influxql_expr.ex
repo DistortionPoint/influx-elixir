@@ -307,7 +307,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp literal(text, sign, rest) do
     if String.contains?(text, "."),
-      do: {:ok, {:lit, {:float, sign * String.to_float(float_text(text))}}, rest},
+      do: {:ok, {:lit, {:float, sign * String.to_float(InfluxQLText.leading_zero(text))}}, rest},
       else: integer_literal(String.to_integer(text), sign, rest)
   end
 
@@ -315,9 +315,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     do: {:ok, {:lit, {:int, sign * n}}, rest}
 
   defp integer_literal(_n, _sign, _rest), do: :error
-
-  defp float_text("." <> _fraction = text), do: "0" <> text
-  defp float_text(text), do: text
 
   # ---------------------------------------------------------------------------
   # Calls
@@ -610,7 +607,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @spec integral_unit([term()]) :: {:ok, pos_integer()} | {:planning, binary()} | :error
   def integral_unit([]), do: {:ok, 1_000_000_000}
   def integral_unit([duration]), do: positive_duration(duration)
-  def integral_unit(_other), do: :error
 
   # The engine's planning error for a duration argument that is not positive.
   defp positive_duration({:dur, ns}) when ns > 0, do: {:ok, ns}
@@ -666,12 +662,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     do: {:planning, "moving_average window must be greater than 1, got #{n}"}
 
   defp transform_parameter("moving_average", _other), do: :error
-  defp transform_parameter("cumulative_sum", []), do: {:ok, nil}
-  defp transform_parameter(name, []) when name in @transforms, do: {:ok, nil}
-  defp transform_parameter("cumulative_sum", _other), do: :error
-  defp transform_parameter("difference", _other), do: :error
-  defp transform_parameter("non_negative_difference", _other), do: :error
-  defp transform_parameter(_name, [duration]), do: positive_duration(duration)
+  defp transform_parameter(_name, []), do: {:ok, nil}
+
+  defp transform_parameter(name, [duration])
+       when name in ~w(derivative non_negative_derivative elapsed),
+       do: positive_duration(duration)
+
   defp transform_parameter(_name, _other), do: :error
 
   @doc "A number as it is written inside the name of an aggregate (`percentile:99.5`)."
@@ -733,8 +729,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   @doc "Whether a string or a boolean stands anywhere in an expression."
   @spec text_literal?(ast()) :: boolean()
-  def text_literal?({:bool, _value}), do: true
-  def text_literal?({:str, _content}), do: true
+  def text_literal?({kind, _value}) when kind in [:bool, :str], do: true
   def text_literal?({:neg, operand}), do: text_literal?(operand)
   def text_literal?({:bin, _op, left, right}), do: text_literal?(left) or text_literal?(right)
   def text_literal?({:fn, _name, arguments}), do: Enum.any?(arguments, &text_literal?/1)
@@ -921,14 +916,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     end
   end
 
-  defp infer({:cast, name, :float}, types, tags) do
+  defp infer({:cast, name, target}, types, tags) do
     with {:ok, {type, _literal}} <- infer({:ref, name}, types, tags),
-         do: cast_type_of(type, :float)
-  end
-
-  defp infer({:cast, name, :integer}, types, tags) do
-    with {:ok, {type, _literal}} <- infer({:ref, name}, types, tags),
-         do: cast_type_of(type, :integer)
+         do: cast_type_of(type, target)
   end
 
   defp infer({:agg, fun, "time"}, _types, _tags) when fun in ~w(min max first last mode),
@@ -1033,29 +1023,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       else: {:ok, {:float, false}}
   end
 
-  defp transform_type(name, type) when name in ["difference", "cumulative_sum"] do
-    if type in [:integer, :float, :unknown],
-      do: {:ok, {type, false}},
-      else: {:refuse, "#{name}() of a #{type}"}
-  end
+  defp transform_type("elapsed", type) when type not in [:tag, :timestamp],
+    do: {:ok, {:integer, false}}
 
-  defp transform_type("elapsed", type) do
-    if type in [:integer, :float, :unsigned, :string, :boolean, :unknown],
-      do: {:ok, {:integer, false}},
-      else: {:refuse, "elapsed() of a #{type}"}
-  end
+  defp transform_type(name, type)
+       when name in ~w(difference non_negative_difference cumulative_sum) and
+              type in [:integer, :float, :unknown],
+       do: {:ok, {type, false}}
 
-  defp transform_type("non_negative_difference", type) do
-    if type in [:integer, :float, :unknown],
-      do: {:ok, {type, false}},
-      else: {:refuse, "non_negative_difference() of a #{type}"}
-  end
+  defp transform_type(name, type)
+       when name in ~w(derivative non_negative_derivative moving_average) and
+              type in [:integer, :float, :unknown],
+       do: {:ok, {:float, false}}
 
-  defp transform_type(name, type) do
-    if type in [:integer, :float, :unknown],
-      do: {:ok, {:float, false}},
-      else: {:refuse, "#{name}() of a #{type}"}
-  end
+  defp transform_type(name, type), do: {:refuse, "#{name}() of a #{type}"}
 
   # Operands that take no part in arithmetic: the engine's `incompatible operands`.
   @no_arithmetic [:tag, :string, :boolean, :timestamp]

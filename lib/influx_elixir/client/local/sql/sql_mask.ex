@@ -138,7 +138,7 @@ defmodule InfluxElixir.Client.Local.SQLMask do
     end
   end
 
-  @spec hide_in_parentheses(binary(), non_neg_integer(), iodata()) :: iodata()
+  @spec hide_in_parentheses(binary(), non_neg_integer(), [byte()]) :: [byte()]
   defp hide_in_parentheses(<<>>, _depth, acc), do: Enum.reverse(acc)
 
   defp hide_in_parentheses(<<?(, rest::binary>>, depth, acc),
@@ -150,7 +150,7 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   defp hide_in_parentheses(<<word::binary-size(4), rest::binary>> = text, depth, acc)
        when depth > 0 do
     if String.upcase(word) == "FROM" and boundary?(acc) and not SQLIdentifiers.word_next?(rest),
-      do: hide_in_parentheses(rest, depth, ["xxxx" | acc]),
+      do: hide_in_parentheses(rest, depth, [?x, ?x, ?x, ?x | acc]),
       else: skip_byte(text, depth, acc)
   end
 
@@ -159,10 +159,8 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   defp skip_byte(<<byte, rest::binary>>, depth, acc),
     do: hide_in_parentheses(rest, depth, [byte | acc])
 
-  @spec boundary?(iodata()) :: boolean()
-  defp boundary?([]), do: true
-  defp boundary?([byte | _acc]) when is_integer(byte), do: not SQLIdentifiers.word_byte?(byte)
-  defp boundary?(_other), do: true
+  @spec boundary?([byte()]) :: boolean()
+  defp boundary?([byte | _acc]), do: not SQLIdentifiers.word_byte?(byte)
 
   @doc "The text a `{start, length}` capture covers, or `\"\"` for a group that did not match."
   @spec cut(binary(), {integer(), non_neg_integer()}) :: binary()

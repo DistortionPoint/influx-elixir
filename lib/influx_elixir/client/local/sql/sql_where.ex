@@ -44,21 +44,18 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   """
   @spec only(binary()) :: {:ok, [node_t()]} | {:error, SQLError.t()}
   def only(rest) do
-    if String.valid?(rest),
-      do: only_trimmed(String.trim(rest)),
-      else: {:error, SQLError.refusal("the SQL text is not valid UTF-8")}
-  end
+    if String.valid?(rest) do
+      trimmed = String.trim(rest)
 
-  @spec only_trimmed(binary()) :: {:ok, [node_t()]} | {:error, SQLError.t()}
-  defp only_trimmed(""), do: {:ok, []}
+      case Regex.run(~r/\AWHERE\s+(.+)\z/isu, trimmed) do
+        [_full, clauses_str] ->
+          with {:ok, conj, _tree} <- parse_clauses(clauses_str), do: {:ok, conj}
 
-  defp only_trimmed(trimmed) do
-    case Regex.run(~r/\AWHERE\s+(.+)\z/isu, trimmed) do
-      [_full, clauses_str] ->
-        with {:ok, conj, _tree} <- parse_clauses(clauses_str), do: {:ok, conj}
-
-      nil ->
-        {:error, SQLError.refusal("unsupported WHERE clause: #{trimmed}")}
+        nil ->
+          {:error, SQLError.refusal("unsupported WHERE clause: #{trimmed}")}
+      end
+    else
+      {:error, SQLError.refusal("the SQL text is not valid UTF-8")}
     end
   end
 

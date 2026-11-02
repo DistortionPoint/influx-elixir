@@ -31,29 +31,20 @@ defmodule InfluxElixir.Client.Local.SQLNamedArg do
 
   @doc """
   The engine's error for a call of `name` (as written, an unquoted word) with a named argument,
-  or the refusal of the calls it does not give an answer for.
+  for a function `known?/1` holds for.
   """
   @spec error(binary()) :: SQLError.t()
   def error(name) do
     lower = String.downcase(name)
 
-    cond do
-      lower in @scalar_same ->
-        SQLError.planning("Function '#{lower}' does not support named arguments")
-
-      is_map_key(@scalar, lower) ->
-        SQLError.planning("Function '#{@scalar[lower]}' does not support named arguments")
-
-      lower in @aggregate_same ->
-        SQLError.planning("Aggregate function '#{lower}' does not support named arguments")
-
-      is_map_key(@aggregate, lower) ->
-        SQLError.planning(
-          "Aggregate function '#{@aggregate[lower]}' does not support named arguments"
-        )
-
-      true ->
-        unknown_before(name)
+    if lower in @scalar_same or is_map_key(@scalar, lower) do
+      SQLError.planning(
+        "Function '#{Map.get(@scalar, lower, lower)}' does not support named arguments"
+      )
+    else
+      SQLError.planning(
+        "Aggregate function '#{Map.get(@aggregate, lower, lower)}' does not support named arguments"
+      )
     end
   end
 

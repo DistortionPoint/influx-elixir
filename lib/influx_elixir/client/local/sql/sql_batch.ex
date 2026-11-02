@@ -138,8 +138,6 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   # Whether `risky?` holds for the value an operand takes in some row (once,
   # when it reads no column). An operand that cannot be evaluated is `:error`.
   @spec any_value?(SQLExpr.t(), [point()], (term() -> boolean())) :: boolean()
-  defp any_value?(_operand, [], _risky?), do: false
-
   defp any_value?({:field, name}, points, risky?) when is_binary(name) and name != "time",
     do: any_field?(points, name, risky?)
 
@@ -165,32 +163,29 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   end
 
   @spec risky_divisor?(term()) :: boolean()
-  defp risky_divisor?(nil), do: false
-  defp risky_divisor?(value) when value == 0 or value == -1, do: true
-  defp risky_divisor?({:u, 0}), do: true
+  defp risky_divisor?(value) when value == 0 or value == -1 or value == {:u, 0}, do: true
   defp risky_divisor?({:int, _bits, value}), do: value in [0, -1]
   defp risky_divisor?({:dec, coefficient, _scale}), do: coefficient == 0
-  defp risky_divisor?(value) when is_number(value) or value in [:inf, :neg_inf, :nan], do: false
-  defp risky_divisor?({:u, _value}), do: false
-  defp risky_divisor?(_other), do: true
+
+  defp risky_divisor?(value) do
+    not (is_nil(value) or is_number(value) or value in [:inf, :neg_inf, :nan] or
+           match?({:u, _value}, value))
+  end
 
   @spec risky_minimum?(term()) :: boolean()
-  defp risky_minimum?(nil), do: false
   defp risky_minimum?(value) when is_integer(value), do: value == SQLNumber.minimum(:int64)
   defp risky_minimum?({:int, bits, value}), do: value == SQLNumber.minimum(bits)
-  defp risky_minimum?(value) when is_float(value) or value in [:inf, :neg_inf, :nan], do: false
-  defp risky_minimum?({:u, _value}), do: false
-  defp risky_minimum?({:dec, _coefficient, _scale}), do: false
-  defp risky_minimum?(_other), do: true
+
+  defp risky_minimum?(value) do
+    not (is_nil(value) or is_float(value) or value in [:inf, :neg_inf, :nan] or
+           match?({:u, _value}, value) or match?({:dec, _coefficient, _scale}, value))
+  end
 
   @spec risky_scale?(term()) :: boolean()
-  defp risky_scale?(nil), do: false
-
   defp risky_scale?(value) when is_integer(value),
     do: value > 2_147_483_647 or value < -2_147_483_648
 
-  defp risky_scale?({:int, _bits, _value}), do: false
-  defp risky_scale?(_other), do: true
+  defp risky_scale?(value), do: not (is_nil(value) or match?({:int, _bits, _value}, value))
 
   # The operations the engine can fail on, whatever the rows hold: where the
   # operands of a conjunct are run is counted for them alone.
@@ -224,7 +219,7 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   storage states, the refusal when the two differ.
   """
   @spec filter([point()], [SQLParser.where_node()]) :: [point()]
-  def filter(points, []), do: points
+  def filter(points, conjunction) when points == [] or conjunction == [], do: points
 
   def filter(points, conjunction) do
     if guarded?(points, conjunction),

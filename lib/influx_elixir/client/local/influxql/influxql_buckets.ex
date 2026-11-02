@@ -75,8 +75,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
           keyword(),
           ([map()] -> [{binary(), InfluxQLAggregate.result(), InfluxQLAggregate.spec()}])
         ) :: Enumerable.t({integer(), %{binary() => term()}})
-  def series([], _group, _fill, _opts, _compute), do: []
-
   def series(rows, {every, offset}, fill, opts, compute) do
     check_resolution(every, offset)
     timed = Enum.map(rows, &{time_ns(&1), &1})
@@ -384,7 +382,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   defp bounded_scan(rows), do: rows
 
   @spec transpose([[term()]]) :: [[term()]]
-  defp transpose([]), do: []
   defp transpose(rows), do: rows |> Enum.zip() |> Enum.map(&Tuple.to_list/1)
 
   @spec time_ns(map()) :: integer()

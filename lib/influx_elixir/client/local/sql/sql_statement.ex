@@ -211,15 +211,8 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
 
   @spec phrase(binary(), SQLTokenizer.tokens()) :: SQLError.t() | nil
   defp phrase(word, [next | _more] = tokens) when word in ["GRANT", "REVOKE", "DENY"] do
-    case next do
-      {:eof, _printed, _upper, _line, _col} ->
-        nil
-
-      token ->
-        if SQLGrant.privilege_start?(tokens),
-          do: nil,
-          else: expected("a privilege keyword", token)
-    end
+    if not (match?({:eof, _p, _u, _l, _c}, next) or SQLGrant.privilege_start?(tokens)),
+      do: expected("a privilege keyword", next)
   end
 
   defp phrase("ATTACH", [{:word, _p, "DATABASE", _l, _c}, name | rest]), do: attached(name, rest)
@@ -356,21 +349,13 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   defp condition_words(words), do: words
 
   @spec condition([binary()]) :: [binary()]
-  defp condition([word, second, third | rest] = words) do
-    case Enum.map([word, second, third], &String.upcase/1) do
-      ["IF", "NOT", "EXISTS"] -> ["IF", "NOT", "EXISTS" | rest]
-      ["IF", "EXISTS" | _name] -> ["IF", "EXISTS", third | rest]
+  defp condition(words) do
+    case Enum.map(words, &String.upcase/1) do
+      ["IF", "NOT", "EXISTS" | _rest] -> ["IF", "NOT", "EXISTS" | Enum.drop(words, 3)]
+      ["IF", "EXISTS" | _rest] -> ["IF", "EXISTS" | Enum.drop(words, 2)]
       _no_condition -> words
     end
   end
-
-  defp condition([word, second | rest] = words) do
-    if Enum.map([word, second], &String.upcase/1) == ["IF", "EXISTS"],
-      do: ["IF", "EXISTS" | rest],
-      else: words
-  end
-
-  defp condition(words), do: words
 
   # `RELEASE s` is named `RELEASE SAVEPOINT s`.
   @spec release(binary()) :: binary()
@@ -406,17 +391,14 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   end
 
   @spec bare(binary(), {SQLTokenizer.position(), binary()}, non_neg_integer(), binary()) ::
-          SQLError.t() | nil
+          SQLError.t()
   defp bare(word, _start, _length, _tail) when is_map_key(@complete, word) do
     {status, body} = Map.fetch!(@complete, word)
     %{status: status, body: body}
   end
 
   defp bare(word, start, length, tail) do
-    case Map.fetch(@needs, word) do
-      {:ok, needs} -> SQLError.parser("Expected: #{needs}, found: #{found(start, length, tail)}")
-      :error -> nil
-    end
+    SQLError.parser("Expected: #{Map.fetch!(@needs, word)}, found: #{found(start, length, tail)}")
   end
 
   # `EOF`, or the `;` that ends the text, at its line and column: the blank before the word

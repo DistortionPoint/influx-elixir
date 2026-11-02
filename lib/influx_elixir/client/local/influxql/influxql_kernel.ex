@@ -28,10 +28,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLKernel do
 
   @doc "The result of `op` (`+ - * / %`) over two values; null in, null out."
   @spec apply_op(binary(), value(), value()) :: value()
-  def apply_op(_op, nil, _right), do: nil
-  def apply_op(_op, _left, nil), do: nil
-  def apply_op(_op, :nan, _right), do: :nan
-  def apply_op(_op, _left, :nan), do: :nan
+  def apply_op(_op, left, right) when is_nil(left) or is_nil(right), do: nil
+  def apply_op(_op, left, right) when left == :nan or right == :nan, do: :nan
 
   def apply_op(op, left, right) do
     case common(left, right) do
@@ -44,10 +42,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLKernel do
 
   @doc "Whether the comparison `op` holds between two values; false with a null."
   @spec compare(binary(), value(), value()) :: boolean()
-  def compare(_op, nil, _right), do: false
-  def compare(_op, _left, nil), do: false
-  def compare(_op, :nan, _right), do: false
-  def compare(_op, _left, :nan), do: false
+  def compare(_op, left, right) when left in [nil, :nan] or right in [nil, :nan], do: false
 
   def compare(op, left, right) do
     case common(left, right) do
