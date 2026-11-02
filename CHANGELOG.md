@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.60] - 2026-11-02
+
 ### Changed
 - **Consolidated 64-bit integer bounds, two's-complement wrapping, and Arrow integer literal typing into `Client.Local.SQLLimits`, and pruned dead map keys, unreachable clauses, and module-internal `def` functions across `Client.Local`.**
   Added `SQLLimits.integer_type/1` (`"Int64"`, `"UInt64"`, or `"Float64"`) and replaced duplicate 64-bit wrapping, range guards, and literal type classifiers across `Flux`, `InfluxQLArithmetic`, `InfluxQLExpr`, `InfluxQLShow`, `InfluxQLShowClauses`, `InfluxQLTyped`, `SQLClauses`, `SQLContradict`, `SQLDmlInsert`, `SQLDmlItem`, `SQLDmlOperand`, `SQLExprCheck`, `SQLInterval`, `SQLPlan`, `SQLSelect`, and `SQLTime` with `SQLLimits` macros and helpers. Simplified duplicate/unreachable clauses in `InfluxQLBuckets`, `InfluxQLExpr`, `InfluxQLKernel`, `SQLBatch`, `SQLMask`, `SQLNamedArg`, `SQLStatement`, and `SQLWhere`, removed the unused `:soffset` entry in `InfluxQLError`, `InfluxQLAggregate.function?/1`, `SQLSelect.parse_list/2`, `SQLWhere.nodes/1`, and `SQLWhere.tree/1`, and converted module-internal functions in `InfluxQLError`, `InfluxQLExpr`, `InfluxQLNames`, `InfluxQLNested`, `InfluxQLRun`, `InfluxQLSql`, `SQLAggExpr`, `SQLAggregate`, `SQLBatch`, `SQLDmlExpr`, `SQLDmlOperand`, `SQLExprType`, `SQLGrant`, `SQLInformation`, and `SQLWhere` from `def` to `defp`.
