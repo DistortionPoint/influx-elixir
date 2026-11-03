@@ -93,7 +93,6 @@ defmodule InfluxElixir.Client.Local.SQLCast do
   # An integer of either sign as the decimal the engine makes of it beside the other (`Int64`
   # with `UInt64`); only the coalescing functions make one, not a cast written in a query.
   @spec to_decimal(term()) :: {:ok, SQLNumber.decimal()} | :error
-  defp to_decimal({:dec, _coefficient, _scale} = decimal), do: {:ok, decimal}
   defp to_decimal({:u, value}), do: {:ok, {:dec, value, 0}}
   defp to_decimal(value) when is_integer(value), do: {:ok, {:dec, value, 0}}
   defp to_decimal(_value), do: :error

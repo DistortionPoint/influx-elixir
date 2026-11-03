@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Removed unreachable clauses and dead default arguments in `Client.Local` (`LineProtocolTime`, `SQLNativeType`, `InfluxQLSql`, `SQLTokenizer`, `SQLRewrite`, `SQLScalarCheck`, and `SQLCast`).**
+  Combined `nil` and `""` timestamp clauses and replaced the unreachable `:nanosecond` / `:auto` fallback in `LineProtocolTime.precision_name/1` with `Map.fetch!/2`, simplified selector struct pattern matches in `SQLNativeType.native_struct/1` and `SQLScalarCheck.printed/1`, removed unreachable `token_sql({:regex, ...})`, `to_decimal({:dec, ...})`, and `tokenize/4` / `placeholder/4` / `dollar_string/1` fallback clauses in `InfluxQLSql`, `SQLCast`, and `SQLTokenizer`, simplified `digit_next?/1` and `drop_space/2` in `SQLTokenizer` and `SQLRewrite`, and dropped the unused default argument on `SQLScalarCheck.check/4`.
+
 ## [0.1.60] - 2026-11-02
 
 ### Changed

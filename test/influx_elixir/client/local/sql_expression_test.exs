@@ -239,6 +239,21 @@ defmodule InfluxElixir.Client.Local.SqlExpressionTest do
       assert SQLCast.fold(true, :decimal) ==
                {:error, "Can't cast value true to type Decimal128(?)"}
 
+      assert SQLCast.fold("x", :int32) ==
+               {:error, "Cannot cast string 'x' to value of Int32 type"}
+
+      assert SQLCast.fold(".", :float) ==
+               {:error, "Cannot cast string '.' to value of Float64 type"}
+
+      assert SQLCast.fold(:nan, :int32) ==
+               {:error, "Can't cast value NaN to type Int32"}
+
+      assert SQLCast.fold({:dec, 1_000, 0}, :int8) ==
+               {:error, "Can't cast value 1000 to type Int8"}
+
+      assert SQLCast.cast("inf", :float) == :inf
+      assert SQLCast.cast({:int, 32, 42}, :string) == "42"
+
       assert catch_throw(SQLCast.cast(1, :unknown_type)) ==
                {:query_error, {:connection_error, %Mint.TransportError{reason: :closed}}}
     end

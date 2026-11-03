@@ -252,11 +252,8 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
     end
   end
 
-  defp tokenize(_invalid, _line, _col, _acc), do: :bail
-
   @spec digit_next?(binary()) :: boolean()
-  defp digit_next?(<<?., d, _rest::binary>>), do: d in ?0..?9
-  defp digit_next?(_text), do: false
+  defp digit_next?(text), do: match?(<<?., d, _rest::binary>> when d in ?0..?9, text)
 
   @spec block_comment(binary(), pos_integer(), pos_integer(), pos_integer(), tokens()) ::
           result()
@@ -399,20 +396,14 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
 
   @spec placeholder(binary(), pos_integer(), pos_integer(), tokens()) ::
           result()
-  defp placeholder(text, line, col, acc) do
-    case dollar_string(text) do
+  defp placeholder(<<?$, rest::binary>> = text, line, col, acc) do
+    case dollar_string(text, rest) do
       {:ok, raw} ->
         raw_token(text, raw, :literal, raw, line, col, acc)
 
       :none ->
-        case text do
-          <<?$, rest::binary>> ->
-            literal = binary_part(text, 0, 1 + tag_length(rest, 0))
-            emit(text, literal, :placeholder, line, col, acc)
-
-          _no_dollar ->
-            :bail
-        end
+        literal = binary_part(text, 0, 1 + tag_length(rest, 0))
+        emit(text, literal, :placeholder, line, col, acc)
 
       :bail ->
         :bail
@@ -420,8 +411,8 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   end
 
   # `$$..$$` and `$tag$..$tag$`, as written.
-  @spec dollar_string(binary()) :: {:ok, binary()} | :none | :bail
-  defp dollar_string(<<?$, after_dollar::binary>> = text) do
+  @spec dollar_string(binary(), binary()) :: {:ok, binary()} | :none | :bail
+  defp dollar_string(text, after_dollar) do
     size = tag_length(after_dollar, 0)
 
     case after_dollar do
@@ -437,8 +428,6 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
         :none
     end
   end
-
-  defp dollar_string(_text), do: :none
 
   # The bytes of the tag or name at the start of `text`: letters, digits and `_` of any script.
   # Walked, not matched: a regex over the whole rest of the text validates all of it as UTF-8

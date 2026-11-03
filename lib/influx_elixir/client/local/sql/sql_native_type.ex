@@ -19,14 +19,10 @@ defmodule InfluxElixir.Client.Local.SQLNativeType do
 
   @spec native_struct(binary()) :: binary()
   defp native_struct(type) do
-    case Regex.run(@struct, type) do
-      [_all, value] ->
-        "Struct(LogicalFields([#{logical("value", native(value))}, " <>
-          "#{logical("time", "Timestamp(Nanosecond, None)")}]))"
+    [_all, value] = Regex.run(@struct, type)
 
-      nil ->
-        type
-    end
+    "Struct(LogicalFields([#{logical("value", native(value))}, " <>
+      "#{logical("time", "Timestamp(Nanosecond, None)")}]))"
   end
 
   @spec native_plain(binary()) :: binary()

@@ -118,8 +118,7 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   end
 
   @spec digit_next?(binary()) :: boolean()
-  defp digit_next?(<<?., d, _rest::binary>>), do: d in ?0..?9
-  defp digit_next?(_text), do: false
+  defp digit_next?(text), do: match?(<<?., d, _rest::binary>> when d in ?0..?9, text)
 
   @spec tail(binary(), binary()) :: binary()
   defp tail(text, taken),
@@ -320,8 +319,7 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
 
   # The space that stood before `ALL` stands before what follows it, if anything did.
   @spec drop_space([token()], [token()]) :: [token()]
-  defp drop_space(blank, [{:space, _text} | more]), do: blank ++ more
-  defp drop_space(blank, more), do: blank ++ more
+  defp drop_space(blank, more), do: blank ++ Enum.drop_while(more, &space?/1)
 
   # ---------------------------------------------------------------------------
   # OFFSET n ROWS

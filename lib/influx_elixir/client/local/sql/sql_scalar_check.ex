@@ -50,7 +50,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   integer's coercion) is not asked of it.
   """
   @spec check(atom(), [binary() | nil], context(), [boolean()]) :: :ok | {:error, map()}
-  def check(name, types, context, nulls \\ []) do
+  def check(name, types, context, nulls) do
     case problem(name, types, nulls) do
       :ok ->
         :ok
@@ -459,16 +459,12 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
 
   # A selector's struct, as the arrow type is debug printed there.
   defp printed("Struct(" <> _fields = type) do
-    case Regex.run(~r/\AStruct\("value": (.+), "time": Timestamp\(ns\)\)\z/, type) do
-      [_all, value] ->
-        ~S|Struct([Field { name: \"value\", data_type: | <>
-          value <>
-          ~S|, nullable: true }, Field { name: \"time\", data_type: | <>
-          "Timestamp(Nanosecond, None), nullable: true }])"
+    [_all, value] = Regex.run(~r/\AStruct\("value": (.+), "time": Timestamp\(ns\)\)\z/, type)
 
-      nil ->
-        type
-    end
+    ~S|Struct([Field { name: \"value\", data_type: | <>
+      value <>
+      ~S|, nullable: true }, Field { name: \"time\", data_type: | <>
+      "Timestamp(Nanosecond, None), nullable: true }])"
   end
 
   defp printed(type), do: type

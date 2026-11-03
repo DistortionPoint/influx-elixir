@@ -107,7 +107,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   @spec token_sql(tuple()) :: binary()
   defp token_sql({:ident, name}), do: ident_sql(name)
   defp token_sql({:str, content}), do: "'" <> content <> "'"
-  defp token_sql({:regex, pattern}), do: "'" <> String.replace(pattern, "'", "''") <> "'"
   defp token_sql({:op, op}), do: op
   defp token_sql({:raw, text}), do: text
   defp token_sql({:number, "." <> _fraction = text}), do: "0" <> text

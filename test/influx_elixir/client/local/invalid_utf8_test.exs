@@ -18,6 +18,7 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
     InfluxQLError,
     InfluxQLShowParser,
     InfluxQLText,
+    LineProtocolError,
     LineProtocolV3,
     Retention,
     SQLAggExpr,
@@ -400,9 +401,24 @@ defmodule InfluxElixir.Client.Local.InvalidUtf8Test do
       assert Retention.seconds(@bad) === 0
 
       assert InfluxQLError.rust_debug("a" <> @bad <> "b") === ~s("a\\xffb")
+
+      escaped_sample = <<0, ?\t, ?\r, ?\n, ?\\, ?", 1>>
+      quoted_sample = InfluxQLError.rust_debug(escaped_sample)
+      assert quoted_sample === ~s("\\0\\t\\r\\n\\\\\\"\\u{1}")
+      assert InfluxQLError.quoted_start(quoted_sample, "prefix" <> escaped_sample) === 6
       assert InfluxQLError.quoted_start(~s("a\\u{110000}") <> @bad <> ~s("), "x") === nil
       assert InfluxQLError.quoted_start(@bad, "x") === nil
       assert InfluxQLText.reserved_start(@bad) === nil
+      assert InfluxQLText.leading_zero("-.5") === "-0.5"
+      assert is_binary(InfluxQLText.operator_glue_chars())
+      assert is_binary(InfluxQLText.operand_open_chars())
+      assert is_binary(InfluxQLText.item_end_class())
+
+      assert %{original_line: "m,k\\,1=v\\=1 f\\,1=1u,"} =
+               LineProtocolError.schema_error("err", 1, "m,k\\,1=v\\=1 f\\,1=1u,b=true 1")
+
+      assert %{original_line: "unparseable"} =
+               LineProtocolError.schema_error("err", 1, "unparseable")
 
       assert SQLLexer.escaped(@bad) === :error
       assert SQLIdentifiers.normalize(@bad) === @bad

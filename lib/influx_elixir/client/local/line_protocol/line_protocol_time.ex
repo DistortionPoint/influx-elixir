@@ -15,8 +15,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolTime do
   @spec parse_timestamp(binary() | nil, precision(), dialect()) ::
           {:ok, integer() | nil} | {:error, binary()}
   @doc false
-  def parse_timestamp(nil, _prec, _dialect), do: {:ok, nil}
-  def parse_timestamp("", _prec, _dialect), do: {:ok, nil}
+  def parse_timestamp(ts, _prec, _dialect) when ts in [nil, ""], do: {:ok, nil}
 
   # The stored time is nanoseconds in a signed 64-bit integer. A timestamp
   # that does not fit once scaled to nanoseconds is refused, in each
@@ -54,10 +53,12 @@ defmodule InfluxElixir.Client.Local.LineProtocolTime do
     do: ~s|strconv.ParseInt: parsing "#{ts_str}": value out of range|
 
   @spec precision_name(precision()) :: binary()
-  defp precision_name(:second), do: "Second"
-  defp precision_name(:millisecond), do: "Millisecond"
-  defp precision_name(:microsecond), do: "Microsecond"
-  defp precision_name(_nanosecond_or_auto), do: "Nanosecond"
+  defp precision_name(precision),
+    do:
+      Map.fetch!(
+        %{second: "Second", millisecond: "Millisecond", microsecond: "Microsecond"},
+        precision
+      )
 
   # `:auto` is InfluxDB 3's guess from the magnitude, verified against the
   # engine: |ts| below 5e9 is seconds, below 5e12 milliseconds, below 5e15
