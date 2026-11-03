@@ -76,19 +76,17 @@ defmodule InfluxElixir.Client.Local.SQLDistinctOn do
     end
   end
 
-  @spec check_order(SQLParser.parsed_query(), [binary()]) :: SQLParser.parsed_query()
-  defp check_order(%{order_by: []} = query, _columns), do: query
-
   # Under DISTINCT ON the engine resolves ORDER BY against the table: a
   # select alias there is its schema error, which it reports before this
   # rule, so an aliased term is left to the executor's column check.
+  @spec check_order(SQLParser.parsed_query(), [binary()]) :: SQLParser.parsed_query()
   defp check_order(%{order_by: order_by} = query, columns) do
     leading = order_by |> Enum.take(length(columns)) |> Enum.map(&elem(&1, 0))
 
     aliases =
       for {source, output} <- query.projection_columns || [], source != output, do: output
 
-    if leading == columns or Enum.any?(leading, &(&1 in aliases)),
+    if order_by == [] or leading == columns or Enum.any?(leading, &(&1 in aliases)),
       do: query,
       else: %{
         query

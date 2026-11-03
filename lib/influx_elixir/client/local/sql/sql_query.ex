@@ -31,7 +31,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
 
   @spec query_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.query_result()
-  def query_sql(conn, sql, opts \\ []) do
+  def query_sql(conn, sql, opts) do
     with :ok <- Scope.require_capability(conn, :query_sql),
          {:ok, database} <- Scope.resolve_database(opts, conn),
          {:ok, params} <- QueryParams.normalize(Keyword.get(opts, :params, %{})) do
@@ -186,7 +186,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
           binary(),
           keyword()
         ) :: Enumerable.t()
-  def query_sql_stream(conn, sql, opts \\ []) do
+  def query_sql_stream(conn, sql, opts) do
     case Scope.require_capability(conn, :query_sql_stream) do
       :ok ->
         case query_sql(conn, sql, Keyword.delete(opts, :format)) do
@@ -214,7 +214,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
 
   @spec execute_sql(InfluxElixir.Client.connection(), binary(), keyword()) ::
           {:ok, map() | [map()]} | {:error, term()}
-  def execute_sql(%{table: table, profile: profile} = conn, sql, opts \\ []) do
+  def execute_sql(%{table: table, profile: profile} = conn, sql, opts) do
     with :ok <- Scope.require_capability(conn, :execute_sql),
          {:ok, database} <- Scope.resolve_database(opts, conn),
          {:ok, params} <- QueryParams.normalize(Keyword.get(opts, :params, %{})),

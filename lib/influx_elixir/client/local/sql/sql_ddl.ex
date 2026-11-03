@@ -62,24 +62,12 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
   @spec error(binary()) :: SQLError.t() | nil
   def error(sql) do
     case SQLTokenizer.tokenize(sql) do
-      {:ok, tokens} -> tokens |> single_statement() |> classify()
+      {:ok, tokens} -> classify(tokens)
       :bail -> nil
     end
   end
 
-  # The tokens of one statement without its closing `;` and end, or `:many`.
-  @spec single_statement(SQLTokenizer.tokens()) :: [SQLTokenizer.token()] | :many
-  defp single_statement(tokens) do
-    semicolons = Enum.count(tokens, &match?({:symbol, ";", _upper, _line, _col}, &1))
-
-    closing? =
-      match?([{:symbol, ";", _u, _l, _c}, {:eof, _p, _u2, _l2, _c2}], Enum.take(tokens, -2))
-
-    if semicolons == 0 or (semicolons == 1 and closing?), do: tokens, else: :many
-  end
-
-  @spec classify([SQLTokenizer.token()] | :many) :: SQLError.t() | nil
-  defp classify(:many), do: nil
+  @spec classify([SQLTokenizer.token()]) :: SQLError.t() | nil
   defp classify([{:word, _p, "CREATE", _l, _c} | rest]), do: create(rest)
   defp classify([{:word, _p, "DROP", _l, _c} | rest]), do: drop(rest)
 
@@ -217,10 +205,8 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
         end
 
       :none ->
-        case tokens do
-          [end_token | _rest] -> if end_of?(end_token), do: expected("identifier", end_token)
-          [] -> nil
-        end
+        [end_token | _rest] = tokens
+        if end_of?(end_token), do: expected("identifier", end_token)
     end
   end
 
@@ -355,10 +341,8 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
         unless end_of?(next), do: expected("end of statement", next)
 
       :none ->
-        case tokens do
-          [end_token | _rest] -> if end_of?(end_token), do: expected("identifier", end_token)
-          [] -> nil
-        end
+        [end_token | _rest] = tokens
+        if end_of?(end_token), do: expected("identifier", end_token)
     end
   end
 
@@ -366,8 +350,6 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
   defp attach([end_token | _rest]) do
     if end_of?(end_token), do: expected("an expression", end_token)
   end
-
-  defp attach(_tokens), do: nil
 
   # ---------------------------------------------------------------------------
   # Tokens

@@ -13,14 +13,12 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   alias InfluxElixir.Client.Local.{
     LineProtocolParser,
     SQLAggExpr,
-    SQLAggType,
     SQLClauses,
     SQLError,
     SQLExpr,
     SQLInformation,
     SQLLiteral,
-    SQLParser,
-    SQLWhere
+    SQLParser
   }
 
   @typedoc "A stored point, as `InfluxElixir.Client.Local` keeps it."
@@ -74,7 +72,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   `InfluxElixir.Client.Local.SQLSimplify.never?/1`).
   """
   @spec check([relation()], SQLParser.parsed_query(), boolean()) :: :ok | {:error, term()}
-  def check(relations, %{} = query, never? \\ false)
+  def check(relations, %{} = query, never?)
       when is_list(relations) and is_boolean(never?) do
     with :ok <- no_table_star(relations, query),
          :ok <- check_columns(relations, query, never?),
@@ -469,8 +467,6 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   """
   @spec check_order_available([relation()], SQLParser.parsed_query()) :: :ok | {:error, map()}
   def check_order_available(_relations, %{select_columns: nil}), do: :ok
-  def check_order_available(_relations, %{distinct_on: on}) when on != nil, do: :ok
-
   def check_order_available(_relations, %{order_by: []}), do: :ok
 
   def check_order_available(relations, query) do
@@ -836,38 +832,13 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   defp operand_fields(column) when is_binary(column), do: [column]
   defp operand_fields(operand), do: expr_fields(operand)
 
-  # The values of an IN list or a BETWEEN that are expressions (the others are literals).
-  @spec operand_exprs([term()]) :: [term()]
-  defp operand_exprs(values), do: for({:expr, _expr} = value <- values, do: value)
-
-  @doc "The columns an expression, or a plan item over expressions, reads."
+  @doc "The columns an expression reads."
   @spec expr_fields(term()) :: [SQLExpr.column_ref()]
   def expr_fields({:expr, expr}), do: expr_fields(expr)
   def expr_fields({:field, name}), do: [name]
   def expr_fields({:uint_col, name}), do: [name]
   def expr_fields(items) when is_list(items), do: Enum.flat_map(items, &expr_fields/1)
-  def expr_fields({:aggregate, _agg, expr}), do: expr_fields(expr)
-
-  def expr_fields({:aggs, aggs, item}),
-    do: Enum.flat_map(SQLAggType.arguments(aggs), &expr_fields/1) ++ expr_fields(item)
-
   def expr_fields({:agg_ref, _name}), do: []
-  def expr_fields({:selector_check, _selector, field, ordering, _grouped}), do: [field, ordering]
-  def expr_fields({:constant, _call, _ancestors}), do: []
-  def expr_fields({:cut, call}), do: expr_fields(call)
-  def expr_fields({:lazy_cut, call}), do: expr_fields(call)
-  def expr_fields({:null_cut, call}), do: expr_fields(call)
-  def expr_fields({:case_cut, call}), do: expr_fields(call)
-  def expr_fields({:expr_check, node}), do: expr_fields(node)
-  def expr_fields({:logical, tree}), do: SQLWhere.truthy_columns(tree)
-  def expr_fields({:logical_ops, tree}), do: SQLWhere.truthy_columns(tree)
-  def expr_fields({:pattern, _kind, expr, _rest}), do: expr_fields(expr)
-  def expr_fields({:compare, _op, left, right}), do: expr_fields([left | operand_exprs([right])])
-  def expr_fields({:in_list, left, values}), do: expr_fields([left | operand_exprs(values)])
-
-  def expr_fields({:range, left, low, high}),
-    do: expr_fields([left | operand_exprs([low, high])])
-
   def expr_fields(expr), do: Enum.flat_map(SQLExpr.children(expr), &expr_fields/1)
 
   @doc """

@@ -23,9 +23,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShow do
   def key_listed?(key, {:regex, regex, match?}), do: Regex.match?(regex, key) == match?
 
   @doc "Whether a `WHERE` names `time`: then it, not the default window, bounds the rows."
-  @spec mentions_time?(binary() | nil) :: boolean()
-  def mentions_time?(nil), do: false
-
+  @spec mentions_time?(binary()) :: boolean()
   def mentions_time?(where) do
     case InfluxQLTokens.tokenize(where, []) do
       {:ok, tokens} -> Enum.any?(tokens, &InfluxQLTokens.time?/1)

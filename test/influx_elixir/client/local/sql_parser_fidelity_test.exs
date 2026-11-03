@@ -97,6 +97,19 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
       assert SQLDdl.error("DROP TABLE a, 1") == nil
     end
 
+    test "refuses multi-statement INSERT when first statement cuts off inside an unmodelled cell" do
+      {:ok, conn} = Local.start(databases: ["utf8_db"], profile: :v3_core)
+
+      assert {:error, %{status: 400, body: body}} =
+               Local.query_sql(
+                 conn,
+                 "INSERT INTO m VALUES (INTERVAL 1; SELECT 1",
+                 database: "utf8_db"
+               )
+
+      assert body =~ "a statement that ends inside a value the double cannot read"
+    end
+
     test "SQLCondition.node_value handles non-boolean predicates, null timestamps, and pattern errors" do
       point = %{
         measurement: "cpu",

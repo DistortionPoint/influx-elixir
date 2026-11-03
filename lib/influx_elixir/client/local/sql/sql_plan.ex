@@ -647,6 +647,11 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp item_fields({:placeholder_check, _error}), do: []
   defp item_fields({:limit_check, _error}), do: []
   defp item_fields({:ordinal_check, _error}), do: []
+  defp item_fields({:constant, _call, _ancestors}), do: []
+  defp item_fields({:selector_check, _selector, field, ordering, _grouped}), do: [field, ordering]
+
+  defp item_fields({kind, tree}) when kind in [:logical, :logical_ops],
+    do: SQLWhere.truthy_columns(tree)
 
   defp item_fields({:aggregate, _agg, expr}), do: own_fields(expr)
   defp item_fields({:compare, _op, left, right}), do: own_fields([left, right])

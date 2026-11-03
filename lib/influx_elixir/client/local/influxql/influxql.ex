@@ -317,7 +317,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
   defdelegate key_listed?(key, filter), to: InfluxQLShow
 
   @doc "Whether a `WHERE` names `time`: then it, not the default window, bounds the rows."
-  @spec mentions_time?(binary() | nil) :: boolean()
+  @spec mentions_time?(binary()) :: boolean()
   defdelegate mentions_time?(where), to: InfluxQLShow
 
   @doc """

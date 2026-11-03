@@ -186,7 +186,9 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   defp integer_op(_division, _left, 0, _type), do: closed()
 
   defp integer_op(:/, left, right, type) do
-    if right == -1 and left == minimum(type), do: closed(), else: div(left, right)
+    if right == -1 and type != :uint64 and left == minimum(type),
+      do: closed(),
+      else: div(left, right)
   end
 
   defp integer_op(:rem, left, right, _type), do: rem(left, right)
@@ -200,10 +202,9 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
     Integer.mod(value + half, Bitwise.bsl(1, bits)) - half
   end
 
-  @doc "The smallest value of a signed integer type, or 0 for `:uint64`."
-  @spec minimum(:int64 | :uint64 | 8 | 16 | 32) :: integer()
+  @doc "The smallest value of a signed integer type."
+  @spec minimum(:int64 | 8 | 16 | 32) :: integer()
   def minimum(:int64), do: SQLLimits.int64_min()
-  def minimum(:uint64), do: 0
   def minimum(bits), do: -Bitwise.bsl(1, bits - 1)
 
   @spec closed() :: no_return()

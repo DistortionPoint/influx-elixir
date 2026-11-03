@@ -99,7 +99,7 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   to the table: the failure is refused rather than answered.
   """
   @spec check([term()], type_of(), keyword()) :: :ok | {:error, SQLError.t()}
-  def check(where, type_of, opts \\ []) do
+  def check(where, type_of, opts) do
     leaves = where |> SQLPredicates.flatten(false, leaf_spec(type_of)) |> fold_disablers()
 
     cte? = Keyword.get(opts, :cte, false)

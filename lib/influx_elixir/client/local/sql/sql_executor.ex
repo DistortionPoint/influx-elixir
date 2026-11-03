@@ -95,7 +95,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   """
   @spec run(SQLParser.parsed_query(), fetch(), %{binary() => term()}, kinds() | nil) ::
           [map()] | {:error, term()}
-  def run(%{} = query, fetch, params, kinds \\ nil)
+  def run(%{} = query, fetch, params, kinds)
       when is_function(fetch, 1) and is_map(params),
       do: run_query(query, fetch, params, kinds)
 
