@@ -515,9 +515,8 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   @spec having_items(SQLParser.parsed_query()) :: [{:having, term()}]
   defp having_items(%{having: nil}), do: []
 
-  defp having_items(%{having: %{nodes: nodes, aggs: aggs} = having} = query) do
+  defp having_items(%{having: %{nodes: nodes, tree: tree, aggs: aggs}} = query) do
     parts = for item <- SQLPlanItems.items(nodes), not match?({:agg_ref, _name}, item), do: item
-    tree = having[:tree] || having_tree(nodes)
 
     filter =
       {:filter, tree, filter_names(aggs, query.measurement), filter_outputs(query),
@@ -539,20 +538,6 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
       {elem(column, tuple_size(column) - 1), SQLGrouping.filter_term(column, query.measurement)}
     end
   end
-
-  # The conjunction of a `HAVING` as the tree of a `WHERE` is, to type its booleans as one.
-  @spec having_tree([SQLWhere.node_t()]) :: SQLWhere.tree() | nil
-  defp having_tree([]), do: {:const, true}
-  defp having_tree(nodes), do: nodes |> Enum.map(&node_tree/1) |> Enum.reduce(&{:and, &2, &1})
-
-  @spec node_tree(SQLWhere.node_t()) :: SQLWhere.tree()
-  defp node_tree({:or, []}), do: {:const, false}
-
-  defp node_tree({:or, branches}),
-    do: branches |> Enum.map(&having_tree/1) |> Enum.reduce(&{:or, &2, &1})
-
-  defp node_tree({:not, nodes}), do: {:not, having_tree(nodes)}
-  defp node_tree(predicate), do: {:leaf, predicate}
 
   @spec aggregate_items(SQLParser.select_column()) :: [term()]
   defp aggregate_items({:aggregate, agg, expr, _alias}),

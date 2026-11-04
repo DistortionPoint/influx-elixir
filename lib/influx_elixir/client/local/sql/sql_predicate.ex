@@ -742,9 +742,8 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
       value when is_binary(value) ->
         cond do
           SQLLiteral.string?(text) -> value
-          SQLLiteral.float?(text) and String.starts_with?(text, "-") -> :neg_inf
-          SQLLiteral.float?(text) -> :inf
-          true -> value
+          String.starts_with?(text, "-") -> :neg_inf
+          true -> :inf
         end
 
       value ->

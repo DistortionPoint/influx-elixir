@@ -392,14 +392,11 @@ defmodule InfluxElixir.Client.Local.Flux do
   defp pushed?({:cmp, _key, _op, _literal}, _row), do: false
 
   @spec same_type?(term(), binary(), term()) :: boolean()
-  defp same_type?(value, op, literal) when is_number(value) and is_number(literal),
-    do: ordered(op, value, literal)
-
-  defp same_type?(value, op, literal) when is_binary(value) and is_binary(literal),
-    do: ordered(op, value, literal)
-
-  defp same_type?(value, op, literal) when is_boolean(value) and is_boolean(literal),
-    do: ordered(op, value, literal)
+  defp same_type?(value, op, literal)
+       when (is_number(value) and is_number(literal)) or
+              (is_binary(value) and is_binary(literal)) or
+              (is_boolean(value) and is_boolean(literal)),
+       do: ordered(op, value, literal)
 
   defp same_type?(_value, _op, _literal), do: false
 
@@ -582,15 +579,8 @@ defmodule InfluxElixir.Client.Local.Flux do
   end
 
   defp matches?({:cmp, key, op, literal}, table, row) do
-    if MapSet.member?(table.keys, key), do: compare(op, Map.fetch!(row, key), literal)
+    if MapSet.member?(table.keys, key), do: same_type?(Map.fetch!(row, key), op, literal)
   end
-
-  @spec compare(binary(), term(), term()) :: boolean()
-  defp compare(op, a, b) when is_number(a) and is_number(b), do: ordered(op, a, b)
-  defp compare(op, a, b) when is_binary(a) and is_binary(b), do: ordered(op, a, b)
-  defp compare("==", a, b), do: a === b
-  defp compare("!=", a, b), do: a !== b
-  defp compare(_op, _a, _b), do: false
 
   @spec ordered(binary(), term(), term()) :: boolean()
   defp ordered("==", a, b), do: a == b

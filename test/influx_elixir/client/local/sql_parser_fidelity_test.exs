@@ -14,10 +14,15 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
 
   alias InfluxElixir.Client.Local.{
     InfluxQLRegex,
+    SQLBind,
     SQLCompare,
     SQLCondition,
     SQLDdl,
-    SQLPredicates
+    SQLParser,
+    SQLPredicate,
+    SQLPredicates,
+    SQLStatement,
+    SQLWhere
   }
 
   test "a query text that is not UTF-8 is refused by name" do
@@ -150,6 +155,50 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
                catch_throw(
                  SQLCondition.node_value(point, {:regex, "v", {~r/a/, "~", %{}, :other}})
                )
+    end
+
+    test "SQLWhere, SQLPredicate, SQLBind, and SQLStatement handle malformed clauses and parameter bindings" do
+      for clause <- [
+            "WHERE a = 1 )",
+            "WHERE a = 1 (",
+            "WHERE a = 1 AND",
+            "WHERE AND a = 1",
+            "WHERE OR a = 1",
+            "WHERE NOT",
+            "WHERE )",
+            "WHERE (a = 1",
+            "WHERE a = 'unterminated",
+            "WHERE (a = 'unterminated"
+          ] do
+        assert {:error, %{status: 400}} = SQLWhere.parsed(clause)
+      end
+
+      assert SQLPredicate.parse("false IS NULL") == {:ok, {:is_null, {:expr, {:lit, false}}, nil}}
+
+      assert SQLPredicate.parse("true IS NOT NULL") ==
+               {:ok, {:is_not_null, {:expr, {:lit, true}}, nil}}
+
+      assert {:ok, query} = SQLParser.parse_select("SELECT * FROM m WHERE $1 = a")
+
+      assert {:error, %{status: 400, body: "Client.Local: " <> _reason}} =
+               SQLBind.bind(query, %{"1" => true})
+
+      assert {:ok, bound_val} = SQLBind.bind(query, %{"1" => 42})
+      assert [{:eq, "a", {:uint, 42}}] = bound_val.where
+
+      assert {:ok, partial} = SQLBind.bind_partial(query, %{})
+      assert partial.where == query.where
+
+      assert {:ok, partial_val} = SQLBind.bind_partial(query, %{"1" => 42})
+      assert [{:eq, "a", {:uint, 42}}] = partial_val.where
+
+      assert {:error, %{status: 400, body: "Client.Local: " <> _reason}} =
+               SQLBind.bind_partial(query, %{"1" => false})
+
+      assert SQLStatement.display("RELEASE s") == {:ok, "RELEASE SAVEPOINT s"}
+      assert SQLStatement.display("RELEASE SAVEPOINT s") == {:ok, "RELEASE SAVEPOINT s"}
+      assert SQLStatement.display("DROP VIEW IF EXISTS v") == {:ok, "DROP VIEW IF EXISTS v"}
+      assert %{status: 400} = SQLStatement.bare_error("ATTACH ;")
     end
   end
 end

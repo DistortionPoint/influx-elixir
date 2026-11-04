@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Removed unreachable clauses and dead helpers across `Client.Local` (`SQLPlan`, `SQLGrant`, `SQLTime`, `SQLBind`, `SQLAggType`, `SQLPredicate`, and `Flux`).**
+  Removed the unreachable `having_tree/1` and `node_tree/1` helpers in `SQLPlan` (since `SQLAggExpr.having/4` always populates `having.tree`), simplified `object_error/1`, `bad_name/1`, `after_object/2`, and `after_direction/2` in `SQLGrant` by dropping unreachable empty-token and `nil` fallback clauses, removed unreachable `{:param, name, :left}` clauses from `SQLTime.param_bound?/1` and `SQLBind.resolve_time/2`, simplified `kept/2` in `SQLAggType` and `constant_value/1` in `SQLPredicate`, and consolidated duplicate type-guarded comparison clauses in `Flux.same_type?/3` and `Flux.matches?/3`.
+
 ## [0.1.61] - 2026-11-03
 
 ### Changed

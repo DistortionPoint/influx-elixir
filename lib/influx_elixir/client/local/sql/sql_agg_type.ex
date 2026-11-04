@@ -150,7 +150,7 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   # An aggregate of an argument it does not take (the engine fails the plan with its own
   # error, which `InfluxElixir.Client.Local.SQLPlan` words) has no type here.
   @spec kept(SQLSelect.aggregate(), binary() | nil) :: binary() | nil
-  defp kept(_agg, type) when type in [nil, :mixed], do: nil
+  defp kept(_agg, nil), do: nil
   defp kept(agg, @tag) when agg in [:min, :max], do: "Utf8"
   defp kept(agg, type) when agg in [:min, :max], do: type
   defp kept(_agg, type) when not is_numeric_type(type), do: nil

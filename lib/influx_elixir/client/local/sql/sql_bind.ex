@@ -435,6 +435,5 @@ defmodule InfluxElixir.Client.Local.SQLBind do
 
   @spec resolve_time(SQLTime.bound(), %{binary() => term()}) :: SQLTime.bound()
   defp resolve_time({:param, name}, params), do: SQLTime.param(Map.fetch!(params, name))
-  defp resolve_time({:param, name, :left}, params), do: SQLTime.param(Map.fetch!(params, name))
   defp resolve_time(bound, _params), do: bound
 end

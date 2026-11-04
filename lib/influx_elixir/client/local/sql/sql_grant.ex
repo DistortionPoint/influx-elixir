@@ -103,7 +103,7 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   end
 
   # The object after `ON` that does not read: the parser wants a name at its first bad token.
-  @spec object_error([SQLTokenizer.token()]) :: SQLError.t() | nil
+  @spec object_error([SQLTokenizer.token()]) :: SQLError.t()
   defp object_error([{:word, _p, "ON", _l, _c} | rest]) do
     names =
       case rest do
@@ -126,26 +126,18 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
           rest
       end
 
-    case bad_name(names) do
-      nil -> nil
-      token -> SQLDdl.expected("identifier", token)
-    end
+    SQLDdl.expected("identifier", bad_name(names))
   end
 
-  defp object_error(_tokens), do: nil
-
-  @spec bad_name([SQLTokenizer.token()]) :: SQLTokenizer.token() | nil
-  defp bad_name([{kind, _p, _u, _l, _c} | rest]) when kind in [:word, :quoted],
-    do: after_part(rest)
+  @spec bad_name([SQLTokenizer.token()]) :: SQLTokenizer.token()
+  defp bad_name([
+         {kind, _p, _u, _l, _c},
+         {:symbol, mark, _u2, _l2, _c2} | more
+       ])
+       when kind in [:word, :quoted] and mark in [".", ","],
+       do: bad_name(more)
 
   defp bad_name([token | _rest]), do: token
-  defp bad_name([]), do: nil
-
-  @spec after_part([SQLTokenizer.token()]) :: SQLTokenizer.token() | nil
-  defp after_part([{:symbol, mark, _u, _l, _c} | more]) when mark in [".", ","],
-    do: bad_name(more)
-
-  defp after_part(_rest), do: nil
 
   @spec after_object(binary(), [SQLTokenizer.token()]) ::
           SQLError.t() | nil
@@ -156,12 +148,8 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
     end
   end
 
-  defp after_object(_verb, []), do: nil
-
   @spec after_direction(binary(), [SQLTokenizer.token()]) ::
           SQLError.t() | nil
-  defp after_direction(_verb, []), do: nil
-
   defp after_direction(verb, rest) do
     case grantees(rest) do
       {:ok, _grantees, rest} ->

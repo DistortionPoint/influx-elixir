@@ -153,7 +153,6 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   @doc "Whether the bound is a `$name` still to bind."
   @spec param_bound?(term()) :: boolean()
   def param_bound?({:param, _name}), do: true
-  def param_bound?({:param, _name, :left}), do: true
   def param_bound?(_bound), do: false
 
   @doc """
