@@ -21,8 +21,6 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
   aggregate query that is not in its `GROUP BY`.
   """
   @spec check(SQLParser.parsed_query(), [SQLSchema.relation()]) :: :ok | {:error, term()}
-  def check(%{select_columns: nil}, _relations), do: :ok
-
   def check(query, relations) do
     with :ok <- check_select(query), do: check_having(query, grouped_columns(query), relations)
   end
@@ -33,8 +31,6 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
   resolves an `ORDER BY` column that is not an output.
   """
   @spec check_select(SQLParser.parsed_query()) :: :ok | {:error, term()}
-  def check_select(%{select_columns: nil}), do: :ok
-
   def check_select(query) do
     items = query.group_by_columns || []
     grouped = grouped_columns(query)
@@ -286,8 +282,6 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
   @spec aggregate_term(SQLParser.select_column(), binary()) :: binary() | nil | :unrenderable
   defp aggregate_term({:count_star, _alias}, _table), do: "count(Int64(1))"
 
-  defp aggregate_term({:expression, _expr, _aggs, _alias}, _table), do: :unrenderable
-
   defp aggregate_term({:count_distinct, column, _alias}, table),
     do: "count(DISTINCT #{table}.#{column})"
 
@@ -297,16 +291,13 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
     :unrenderable -> :unrenderable
   end
 
-  # The first or last in an order cannot be told from the other written
-  # with the opposite direction (the parser folds them), and a selector
-  # prints its access.
-  defp aggregate_term({:ordered_aggregate, _agg, _field, _ordering, _alias}, _table),
-    do: :unrenderable
+  defp aggregate_term(column, _table)
+       when elem(column, 0) in [:time_bucket, :grouping_column, :constant],
+       do: nil
 
-  defp aggregate_term({:selector, _kind, _field, _ordering, _access, _alias}, _table),
-    do: :unrenderable
-
-  defp aggregate_term(_group_or_constant, _table), do: nil
+  # An expression over aggregates, an ordered aggregate (whose first/last order the parser folds),
+  # or a selector (which prints its access).
+  defp aggregate_term(_unrenderable, _table), do: :unrenderable
 
   # The engine prints `count(DISTINCT x)` and `sum(DISTINCT x)`, where the double names the
   # aggregates `count_distinct` and `sum_distinct`.

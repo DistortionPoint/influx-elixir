@@ -16,7 +16,7 @@ defmodule InfluxElixir.Client.Local.Writes do
 
   @spec write(InfluxElixir.Client.connection(), binary(), keyword()) ::
           InfluxElixir.Client.write_result()
-  def write(%{table: table, profile: profile} = conn, payload, opts \\ []) do
+  def write(%{table: table, profile: profile} = conn, payload, opts) do
     with :ok <- Scope.require_capability(conn, :write),
          {:ok, database} <- Scope.resolve_database(opts, conn),
          # The engine's order (verified): the request's parameters, then

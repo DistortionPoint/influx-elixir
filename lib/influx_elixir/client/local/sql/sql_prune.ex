@@ -83,8 +83,6 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
     end
   end
 
-  def verdict(_item, _query, _types, _dead), do: :keep
-
   @doc """
   Whether the optimizer proves the filter of a query that negates something false, so that its
   plan is empty and no row is read, and an expression no row could evaluate cannot fail (a
@@ -243,7 +241,6 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
       Enum.flat_map(query.order_by, fn
         {{:expr, expr}, _direction} -> Enum.filter(SQLExpr.columns(expr), &is_binary/1)
         {name, _direction} when is_binary(name) -> [name]
-        {_other, _direction} -> []
       end)
     end
   end

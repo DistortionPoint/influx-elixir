@@ -161,7 +161,7 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
       Enum.any?(nodes, &gap?(&1, mode))
   end
 
-  defp gap?(%{nodes: nodes} = having, mode), do: gap?(having_nodes(having, nodes), mode)
+  defp gap?(%{nodes: nodes, aggs: aggs}, mode), do: gap?(having_nodes(aggs, nodes), mode)
 
   # Anything else is a value, however it stands in a filter: only a connective keeps a
   # missing row and a false one alike.
@@ -172,12 +172,10 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
 
   # The nodes of a `HAVING` with each `__agN__` replaced by the aggregate it stands for.
   @spec having_nodes(map(), [term()]) :: [term()]
-  defp having_nodes(%{aggs: aggs}, nodes) do
+  defp having_nodes(aggs, nodes) do
     names = Map.new(aggs, fn {name, column} -> {name, {:aggregate_of, column}} end)
     substitute(nodes, names)
   end
-
-  defp having_nodes(_having, nodes), do: nodes
 
   @spec substitute(term(), %{binary() => term()}) :: term()
   defp substitute(name, names) when is_binary(name), do: Map.get(names, name, name)
@@ -258,10 +256,8 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
 
   @spec listed_key(term()) :: term()
   defp listed_key(operand) do
-    case listed(fold_key(operand), false) do
-      {key, _negative} -> key
-      nil -> nil
-    end
+    key = fold_key(operand)
+    if key != "time", do: key
   end
 
   # `time` is never `NULL`: the folded constant is what three-valued logic says.
@@ -308,8 +304,6 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   @spec first?(term(), [clause()], types()) :: boolean()
   defp first?(operand, [first | _rest], types),
     do: Enum.any?(equality(first, types), &(elem(&1, 0) == operand))
-
-  defp first?(_operand, [], _types), do: false
 
   # Whether an expression is compared to different values where the double does not know that
   # the engine folds them (the first conjunct is not one of them).

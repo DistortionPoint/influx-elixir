@@ -205,19 +205,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
   defp piece({item, index}, taken, _star, schema) do
     case InfluxQLNames.item_name(item) do
       nil ->
-        {opaque(item, index), taken}
+        # An item whose names are known once the rows are (`count(*)`): it takes no part in the
+        # names.
+        {[entry(:field, :aggregate, nil, index, nil)], taken}
 
       name ->
         {written, taken} = InfluxQLNames.unique(name, taken)
         {[named(item, index, written, schema)], taken}
     end
   end
-
-  # An item whose names are known once the rows are (`count(*)`): it takes no part in the names.
-  defp opaque({:aggregate, _fun, _arg, _alias}, index),
-    do: [entry(:field, :aggregate, nil, index, nil)]
-
-  defp opaque(_item, _index), do: []
 
   defp named({:column, column, _name} = item, index, written, schema) do
     if InfluxQLNames.time_item?(item),
@@ -374,8 +370,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
 
   defp renamed({:multi, kind, field, tags, limit, _alias}, name, _schema),
     do: {:multi, kind, field, tags, limit, name}
-
-  defp renamed(item, _name, _schema), do: item
 
   # The columns a window counts: the fields, once each, under their names.
   @spec field_names([entry()]) :: [binary()]

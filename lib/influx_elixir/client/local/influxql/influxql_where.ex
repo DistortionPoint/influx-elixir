@@ -137,8 +137,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     :ok
   end
 
-  defp check_times(_node, _ctx, _times), do: :ok
-
   # The planner splits the bare time out of the condition first, and its error comes before
   # every other (see `InfluxQLTimeComparand`); one it words in a form the double does not tell
   # is refused by name, where the stack of the planner would break beside a bare operand.
@@ -219,12 +217,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp time_inside_or?({:group, node}), do: time_inside_or?(node)
   defp time_inside_or?(_leaf), do: false
 
-  defp tokens_of(where) do
-    case InfluxQLTokens.tokenize(where, []) do
-      {:ok, tokens} -> tokens
-      _error -> []
-    end
-  end
+  defp tokens_of(where), do: elem(InfluxQLTokens.tokenize(where, []), 1)
 
   # The condition as a tree: `OR` of `AND`s of comparisons and
   # parenthesised conditions, as InfluxQL binds them.

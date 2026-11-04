@@ -225,9 +225,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
     end
   end
 
-  @spec square_and_multiply(float(), non_neg_integer(), float()) :: float() | nil
-  defp square_and_multiply(_base, 0, acc), do: acc
-
+  @spec square_and_multiply(float(), pos_integer(), float()) :: float() | nil
   defp square_and_multiply(base, exponent, acc) do
     acc = if Bitwise.band(exponent, 1) == 1, do: acc * base, else: acc
     exponent = Bitwise.bsr(exponent, 1)

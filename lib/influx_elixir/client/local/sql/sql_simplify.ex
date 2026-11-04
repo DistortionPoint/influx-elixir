@@ -107,7 +107,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   columns the equalities read.
   """
   @spec empty?(SQLParser.parsed_query(), %{binary() => binary()}) :: boolean()
-  def empty?(query, types \\ %{}) do
+  def empty?(query, types) do
     query.limit == 0 or having_never?(query.having) or
       (filter_false?(query, types) and not one_group?(query))
   end
@@ -198,8 +198,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   defp null_pair_empty?(_tree, _types), do: false
 
   @spec tests?(SQLPredicate.clause(), term()) :: boolean()
-  defp tests?(clause, operand) when tuple_size(clause) == 3, do: elem(clause, 1) == operand
-  defp tests?(_clause, _operand), do: false
+  defp tests?({_op, left, _right}, operand), do: left == operand
 
   @doc """
   Whether the `WHERE` holds an `IN` list as the left side of an `AND` whose right side starts

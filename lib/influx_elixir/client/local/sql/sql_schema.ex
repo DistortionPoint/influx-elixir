@@ -838,7 +838,6 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   def expr_fields({:field, name}), do: [name]
   def expr_fields({:uint_col, name}), do: [name]
   def expr_fields(items) when is_list(items), do: Enum.flat_map(items, &expr_fields/1)
-  def expr_fields({:agg_ref, _name}), do: []
   def expr_fields(expr), do: Enum.flat_map(SQLExpr.children(expr), &expr_fields/1)
 
   @doc """

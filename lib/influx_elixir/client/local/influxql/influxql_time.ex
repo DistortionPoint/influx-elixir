@@ -282,7 +282,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
 
   # `(time) AND i > 1`: the engine types the two sides and refuses; the
   # double has seen that and only that.
-  @spec grouped_error(tuple()) :: :ok
+  @spec grouped_error(tuple()) :: no_return()
   defp grouped_error({:group, node}), do: grouped_error(node)
 
   defp grouped_error({kind, [left, right]}) when kind in [:and, :or] do
@@ -299,8 +299,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
     Enum.each(nodes, &grouped_error_inner/1)
     refuse_by_name()
   end
-
-  defp grouped_error(_node), do: :ok
 
   defp grouped_error_inner(node), do: if(grouped_in_connective?(node), do: grouped_error(node))
 

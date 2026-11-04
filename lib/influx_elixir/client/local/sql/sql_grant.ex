@@ -171,11 +171,8 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   # The parser wants a name at `token`. It says so for a symbol, a number or the end of the
   # text; for any other token the double has not read what it says.
   @spec identifier_error(SQLTokenizer.token()) :: SQLError.t() | nil
-  defp identifier_error({kind, _printed, _upper, _line, _col} = token)
-       when kind in [:symbol, :number, :eof],
-       do: SQLDdl.expected("identifier", token)
-
-  defp identifier_error(_token), do: nil
+  defp identifier_error(token),
+    do: if(elem(token, 0) in [:symbol, :number, :eof], do: SQLDdl.expected("identifier", token))
 
   @spec privileges([SQLTokenizer.token()]) ::
           {:ok, binary(), [SQLTokenizer.token()]}
@@ -332,7 +329,7 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
 
   # The token the parser wants a name at, when there is none, is `{:bad, token}`.
   @spec dotted([SQLTokenizer.token()]) ::
-          {:ok, binary(), [SQLTokenizer.token()]} | {:bad, SQLTokenizer.token()} | :refuse
+          {:ok, binary(), [SQLTokenizer.token()]} | {:bad, SQLTokenizer.token()}
   defp dotted([{kind, printed, _u, _l, _c} | rest]) when kind in [:word, :quoted] do
     case rest do
       [{:symbol, ".", _p, _l2, _c2} | more] ->
@@ -344,7 +341,6 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   end
 
   defp dotted([token | _rest]), do: {:bad, token}
-  defp dotted([]), do: :refuse
 
   @spec direction(binary(), [SQLTokenizer.token()]) ::
           {:ok, binary(), [SQLTokenizer.token()]} | :error
