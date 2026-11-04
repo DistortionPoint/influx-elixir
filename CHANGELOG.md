@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.62] - 2026-11-04
+
 ### Changed
 - **Removed unreachable clauses, unused default arguments, and dead helpers across `Client.Local` (`Writes`, `SQLGrouping`, `SQLSchema`, `SQLSimplify`, `SQLPrune`, `SQLGrant`, `SQLFunctions`, `SQLContradict`, `InfluxQLProjection`, `InfluxQLTime`, `InfluxQLWhere`, `SQLPlan`, `SQLTime`, `SQLBind`, `SQLAggType`, `SQLPredicate`, and `Flux`).**
   Dropped unused default arguments in `Writes.write/3` and `SQLSimplify.empty?/2`, removed unreachable `check/2` and `check_select/1` `nil` clauses and consolidated `aggregate_term/2` in `SQLGrouping`, removed the redundant `{:agg_ref, _}` clause in `SQLSchema.expr_fields/1`, removed unreachable `verdict/4`, `sort_refs/1`, `tests?/2`, `dotted/1`, `identifier_error/1`, `square_and_multiply/3`, `having_nodes/2`, `listed_key/1`, and `first?/3` clauses across `SQLPrune`, `SQLSimplify`, `SQLGrant`, `SQLFunctions`, and `SQLContradict`, removed unreachable `opaque/2`, `renamed/3`, `grouped_error/1`, `check_times/3`, and `tokens_of/1` clauses across `InfluxQLProjection`, `InfluxQLTime`, and `InfluxQLWhere`, removed the unreachable `having_tree/1` and `node_tree/1` helpers in `SQLPlan` (since `SQLAggExpr.having/4` always populates `having.tree`), simplified `object_error/1`, `bad_name/1`, `after_object/2`, and `after_direction/2` in `SQLGrant`, removed unreachable `{:param, name, :left}` clauses from `SQLTime.param_bound?/1` and `SQLBind.resolve_time/2`, simplified `kept/2` in `SQLAggType` and `constant_value/1` in `SQLPredicate`, and consolidated duplicate type-guarded comparison clauses in `Flux.same_type?/3` and `Flux.matches?/3`.
