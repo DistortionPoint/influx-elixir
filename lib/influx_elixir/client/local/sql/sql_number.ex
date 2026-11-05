@@ -105,8 +105,7 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   `"Decimal128(?)"` stands for a decimal whose precision is not tracked.
   """
   @spec result_type(binary(), binary()) :: binary()
-  def result_type("Float64", _right), do: "Float64"
-  def result_type(_left, "Float64"), do: "Float64"
+  def result_type(left, right) when "Float64" in [left, right], do: "Float64"
   def result_type("Int64", "Int64"), do: "Int64"
   def result_type("UInt64", "UInt64"), do: "UInt64"
 
@@ -134,16 +133,26 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   @spec arithmetic(op(), t(), t()) :: t()
   def arithmetic(op, left, right) do
     case {kind(left), kind(right)} do
-      {:float, _right} -> float_op(op, to_float(left), to_float(right))
-      {_left, :float} -> float_op(op, to_float(left), to_float(right))
-      {:int, :int} -> integer_op(op, left, right, :int64)
-      {:uint, :uint} -> {:u, integer_op(op, uint(left), uint(right), :uint64)}
-      {:narrow, :narrow} -> narrow_op(op, left, right)
-      {:narrow, :int} -> integer_op(op, integer_of(left), right, :int64)
-      {:int, :narrow} -> integer_op(op, left, integer_of(right), :int64)
-      {:narrow, _wide} -> refuse_narrow()
-      {_wide, :narrow} -> refuse_narrow()
-      _mixed -> decimal_op(op, decimal(left), decimal(right))
+      {lk, rk} when :float in [lk, rk] ->
+        float_op(op, to_float(left), to_float(right))
+
+      {:int, :int} ->
+        integer_op(op, left, right, :int64)
+
+      {:uint, :uint} ->
+        {:u, integer_op(op, uint(left), uint(right), :uint64)}
+
+      {:narrow, :narrow} ->
+        narrow_op(op, left, right)
+
+      {lk, rk} when {lk, rk} in [{:narrow, :int}, {:int, :narrow}] ->
+        integer_op(op, integer_of(left), integer_of(right), :int64)
+
+      {lk, rk} when :narrow in [lk, rk] ->
+        refuse_narrow()
+
+      _mixed ->
+        decimal_op(op, decimal(left), decimal(right))
     end
   end
 
@@ -265,14 +274,10 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   def negate_float(value), do: -value
 
   @spec add(float() | special(), float() | special()) :: float() | special()
-  defp add(:nan, _right), do: :nan
-  defp add(_left, :nan), do: :nan
-  defp add(:inf, :neg_inf), do: :nan
-  defp add(:neg_inf, :inf), do: :nan
-  defp add(:inf, _right), do: :inf
-  defp add(:neg_inf, _right), do: :neg_inf
-  defp add(_left, :inf), do: :inf
-  defp add(_left, :neg_inf), do: :neg_inf
+  defp add(left, right) when :nan in [left, right], do: :nan
+  defp add(left, right) when {left, right} in [{:inf, :neg_inf}, {:neg_inf, :inf}], do: :nan
+  defp add(left, right) when :inf in [left, right], do: :inf
+  defp add(left, right) when :neg_inf in [left, right], do: :neg_inf
 
   defp add(left, right) do
     left + right
@@ -281,8 +286,7 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   end
 
   @spec multiply(float() | special(), float() | special()) :: float() | special()
-  defp multiply(:nan, _right), do: :nan
-  defp multiply(_left, :nan), do: :nan
+  defp multiply(left, right) when :nan in [left, right], do: :nan
 
   defp multiply(left, right) when left in [:inf, :neg_inf] or right in [:inf, :neg_inf] do
     if zero?(left) or zero?(right), do: :nan, else: infinity(positive?(left) == positive?(right))
@@ -295,8 +299,7 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   end
 
   @spec divide(float() | special(), float() | special()) :: float() | special()
-  defp divide(:nan, _right), do: :nan
-  defp divide(_left, :nan), do: :nan
+  defp divide(left, right) when :nan in [left, right], do: :nan
   defp divide(left, right) when left in [:inf, :neg_inf] and right in [:inf, :neg_inf], do: :nan
 
   defp divide(left, right) when left in [:inf, :neg_inf],
@@ -316,8 +319,7 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   end
 
   @spec remainder(float() | special(), float() | special()) :: float() | special()
-  defp remainder(:nan, _right), do: :nan
-  defp remainder(_left, :nan), do: :nan
+  defp remainder(left, right) when :nan in [left, right], do: :nan
   defp remainder(left, _right) when left in [:inf, :neg_inf], do: :nan
   defp remainder(left, right) when right in [:inf, :neg_inf], do: left
   defp remainder(_left, right) when right == 0, do: :nan
@@ -375,10 +377,8 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   @spec compare(t(), t()) :: :lt | :eq | :gt
   def compare(left, right) do
     case {kind(left), kind(right)} do
-      {:float, _right} -> compare_floats(to_float(left), to_float(right))
-      {_left, :float} -> compare_floats(to_float(left), to_float(right))
-      {:dec, _right} -> compare_decimals(decimal(left), decimal(right))
-      {_left, :dec} -> compare_decimals(decimal(left), decimal(right))
+      {lk, rk} when :float in [lk, rk] -> compare_floats(to_float(left), to_float(right))
+      {lk, rk} when :dec in [lk, rk] -> compare_decimals(decimal(left), decimal(right))
       _integers -> compare_integers(integer_of(left), integer_of(right))
     end
   end

@@ -17,9 +17,6 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   #     as in InfluxQL (default `false`)
   #   * `:regex` — a `/.../` that follows `=~` or `!~` is masked too, as an
   #     InfluxQL regular expression (default `false`)
-  #   * `:lenient` — an unterminated literal is masked to the end of the text
-  #     instead of failing (default `false`; `InfluxElixir.Client.Local.SQLLexer`
-  #     refuses such a text first, so SQL never reaches one)
 
   alias InfluxElixir.Client.Local.SQLIdentifiers
 
@@ -29,14 +26,12 @@ defmodule InfluxElixir.Client.Local.SQLMask do
           | {:doubled, boolean()}
           | {:backslash, boolean()}
           | {:regex, boolean()}
-          | {:lenient, boolean()}
 
   @typep config :: %{
            blank: byte(),
            doubled: boolean(),
            backslash: boolean(),
-           regex: boolean(),
-           lenient: boolean()
+           regex: boolean()
          }
 
   @doc """
@@ -49,8 +44,7 @@ defmodule InfluxElixir.Client.Local.SQLMask do
       blank: Keyword.get(opts, :blank, ?x),
       doubled: Keyword.get(opts, :doubled, true),
       backslash: Keyword.get(opts, :backslash, false),
-      regex: Keyword.get(opts, :regex, false),
-      lenient: Keyword.get(opts, :lenient, false)
+      regex: Keyword.get(opts, :regex, false)
     }
 
     text |> scan(config, [], "") |> IO.iodata_to_binary()

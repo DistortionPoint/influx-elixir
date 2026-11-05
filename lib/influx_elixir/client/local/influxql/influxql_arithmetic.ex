@@ -324,10 +324,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   defp division_kind(:int, :int), do: :float
   defp division_kind(left, right), do: common_kind(left, right)
 
-  defp common_kind(:float, _other), do: :float
-  defp common_kind(_other, :float), do: :float
-  defp common_kind(:uint, _other), do: :uint
-  defp common_kind(_other, :uint), do: :uint
+  defp common_kind(left, right) when :float in [left, right], do: :float
+  defp common_kind(left, right) when :uint in [left, right], do: :uint
   defp common_kind(_int, _other), do: :int
 
   @spec absolute(value()) :: value()

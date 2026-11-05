@@ -791,12 +791,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   # `(u / s) / (s / u)` the first division's).
   defp both_pending(op, left, right) do
     chosen =
-      cond do
-        op != "/" -> left
-        match?(%Value{pending: {:comparison, _body}}, right) -> right
-        match?(%Value{pending: {:comparison, _body}}, left) -> left
-        true -> left
-      end
+      if op == "/" and match?(%Value{pending: {:comparison, _body}}, right),
+        do: right,
+        else: left
 
     {class, body} = chosen.pending
 

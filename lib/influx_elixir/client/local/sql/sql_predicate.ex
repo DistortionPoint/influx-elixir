@@ -440,12 +440,13 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
           {:ok, clause()} | {:error, map()}
   defp parse_between("time", negated, low, high) do
     op = if negated, do: :not_between, else: :between
-    low = low |> SQLTime.comparand() |> SQLTime.bound()
-    high = high |> SQLTime.comparand() |> SQLTime.bound()
 
-    if SQLTime.param_bound?(low) or SQLTime.param_bound?(high),
-      do: {:ok, {op, "time", {low, high}}},
-      else: op |> SQLTime.between(low, high) |> deferred()
+    with {:ok, low} <- low |> SQLTime.comparand() |> SQLTime.bound(),
+         {:ok, high} <- high |> SQLTime.comparand() |> SQLTime.bound() do
+      if SQLTime.param_bound?(low) or SQLTime.param_bound?(high),
+        do: {:ok, {op, "time", {low, high}}},
+        else: op |> SQLTime.between(low, high) |> deferred()
+    end
   end
 
   # Each bound is a comparand: a literal, NULL (the comparison is unknown),
@@ -872,10 +873,29 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   # reference or expression (`v IN (1, other)`). Source order is kept so
   # the schema check names the first unknown column, as the engine does.
   @spec parse_value_set([binary()]) :: {:ok, [term()]} | {:error, map()}
-  defp parse_value_set(items) do
+  defp parse_value_set(items), do: map_comparands(items, &parse_comparand/1)
+
+  @spec parse_time_set([binary()]) ::
+          {:ok, [SQLTime.bound()]} | {:error, map()} | {:type_error, map()}
+  defp parse_time_set(items) do
+    with {:ok, bounds} <- map_comparands(items, &(&1 |> SQLTime.comparand() |> SQLTime.bound())) do
+      if Enum.any?(bounds, &SQLTime.param_bound?/1) do
+        {:ok, bounds}
+      else
+        case SQLTime.in_list(bounds) do
+          {:error, error} -> {:type_error, error}
+          ok -> ok
+        end
+      end
+    end
+  end
+
+  @spec map_comparands([binary()], (binary() -> {:ok, term()} | {:error, map()})) ::
+          {:ok, [term()]} | {:error, map()}
+  defp map_comparands(items, parse) do
     items
     |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
-      case parse_comparand(item) do
+      case parse.(item) do
         {:ok, value} -> {:cont, {:ok, [value | acc]}}
         {:error, _reason} = error -> {:halt, error}
       end
@@ -883,20 +903,6 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     |> case do
       {:ok, values} -> {:ok, Enum.reverse(values)}
       {:error, _reason} = error -> error
-    end
-  end
-
-  @spec parse_time_set([binary()]) :: {:ok, [SQLTime.bound()]} | {:type_error, map()}
-  defp parse_time_set(items) do
-    bounds = Enum.map(items, &(&1 |> SQLTime.comparand() |> SQLTime.bound()))
-
-    if Enum.any?(bounds, &SQLTime.param_bound?/1) do
-      {:ok, bounds}
-    else
-      case SQLTime.in_list(bounds) do
-        {:error, error} -> {:type_error, error}
-        ok -> ok
-      end
     end
   end
 

@@ -89,13 +89,13 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   end
 
   @doc """
-  A comparand as a bound: a bare number stays `{:number, type}` and an
-  unreadable one becomes `{:invalid_time, error}`, for the clause to settle.
+  A comparand as a bound: a bare number becomes `{:ok, {:number, type}}` for the
+  clause to word, and an unsupported comparand keeps its `{:error, refusal}`.
   """
-  @spec bound(comparand()) :: bound()
-  def bound({:ok, value}), do: value
-  def bound({:error, {:number, type}}), do: {:number, type}
-  def bound({:error, error}), do: {:invalid_time, error}
+  @spec bound(comparand()) :: {:ok, bound()} | {:error, SQLError.t()}
+  def bound({:ok, value}), do: {:ok, value}
+  def bound({:error, {:number, type}}), do: {:ok, {:number, type}}
+  def bound({:error, _refusal} = error), do: error
 
   @spec string_bound(binary()) :: {:ok, bound()}
   defp string_bound(text) do

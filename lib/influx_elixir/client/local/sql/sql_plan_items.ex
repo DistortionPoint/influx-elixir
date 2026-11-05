@@ -406,7 +406,7 @@ defmodule InfluxElixir.Client.Local.SQLPlanItems do
   def planner_typed?({:compare, _op, _left, _right}), do: true
 
   def planner_typed?({:expr_check, {kind, _left, _right}})
-      when kind in [:cmp, :and, :or, :concat],
+      when kind in [:and, :or, :concat],
       do: true
 
   def planner_typed?({:expr_check, {:cmp, _op, _left, _right}}), do: true

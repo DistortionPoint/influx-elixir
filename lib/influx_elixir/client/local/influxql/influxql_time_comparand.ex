@@ -230,11 +230,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
      %{
        inner
        | text: "(" <> inner.text <> ")",
-         clear: inner.clear and not starts_with_group?(inner)
+         clear: inner.clear and not String.starts_with?(inner.text, "(")
      }}
   end
-
-  defp starts_with_group?(%Part{text: text}), do: String.starts_with?(text, "(")
 
   @impl InfluxQLWalk
   def call(name, arguments, _o) do

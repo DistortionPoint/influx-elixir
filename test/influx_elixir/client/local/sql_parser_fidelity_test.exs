@@ -238,6 +238,65 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
 
       assert {:ok, [%{"s" => nil}]} =
                Local.query_sql(conn, "SELECT sqrt(-1.0 / 0.0) AS s FROM m", database: "cte_db")
+
+      for sql <- [
+            ~s|SELECT * FROM m WHERE time BETWEEN "u" AND 1|,
+            ~s|SELECT * FROM m WHERE time IN ("u", 1)|
+          ] do
+        assert {:error, %{status: 400, body: "Client.Local: " <> _reason}} =
+                 Local.query_sql(conn, sql, database: "cte_db")
+      end
+
+      assert {:error, %{status: 400, body: in_null_body}} =
+               Local.query_sql(conn, "SELECT * FROM m WHERE time IN (NULL, 1)",
+                 database: "cte_db"
+               )
+
+      assert in_null_body =~
+               "Can not find compatible types to compare Timestamp(ns) with [Null, Int64]"
+
+      {:ok, ent} = Local.start(databases: ["ent_db"], profile: :v3_enterprise)
+
+      assert {:error, %{status: 400, body: del_body}} =
+               Local.execute_sql(ent, "DELETE FROM m WHERE time > 1", database: "ent_db")
+
+      assert del_body =~
+               "Cannot infer common argument type for comparison operation Timestamp(ns) > Int64"
+
+      {:ok, v2} = Local.start(databases: ["b"], profile: :v2)
+
+      assert {:ok, :written} =
+               Local.write(v2, "m,host=a flag=true,v=10i 1704067200000000000", bucket: "b")
+
+      assert {:ok, [%{"_value" => true}]} =
+               Local.query_flux(
+                 v2,
+                 ~S[from(bucket: "b") |> range(start: 0) |> filter(fn: (r) => r._field == "flag" and r._value == true)],
+                 org: "my-org"
+               )
+
+      assert {:ok, [%{"_value" => 10}]} =
+               Local.query_flux(
+                 v2,
+                 ~S[from(bucket: "b") |> range(start: 0) |> filter(fn: (r) => r._field == "v" and r._value >= 10 and r._value <= 10)],
+                 org: "my-org"
+               )
+
+      assert {:ok, []} =
+               Local.query_flux(
+                 v2,
+                 ~S[from(bucket: "b") |> range(start: 0) |> filter(fn: (r) => not (r._field == "v") and r._field == "v") |> first()],
+                 org: "my-org"
+               )
+
+      assert {:error, %{status: 400, body: flux_err}} =
+               Local.query_flux(
+                 v2,
+                 ~S[from(bucket: "b") |> range(start: 0) |> filter(bad: 1)],
+                 org: "my-org"
+               )
+
+      assert flux_err =~ "Client.Local: unsupported filter(): bad: 1"
     end
   end
 end

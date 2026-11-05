@@ -124,8 +124,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
       blank: ?_,
       doubled: false,
       backslash: true,
-      regex: true,
-      lenient: true
+      regex: true
     )
   end
 
