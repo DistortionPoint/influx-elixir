@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.63] - 2026-11-05
+
 ### Fixed
 - **`Client.Local.SQLTime` and `Client.Local.SQLPredicate` wrapped unsupported `time` comparand refusals inside `{:invalid_time, error}` in `BETWEEN` and `IN` predicates instead of returning the `Client.Local:` refusal.**
   `SQLTime.bound/1` now preserves `{:error, refusal}` for unsupported `time` comparands (such as identifiers or unmodelled expressions) while keeping `{:ok, {:invalid_time, error}}` for unreadable string literals, and `SQLPredicate.parse_between/4` and `SQLPredicate.parse_time_set/1` propagate `{:error, refusal}` immediately instead of misreporting unsupported comparands alongside numeric bounds as `"Utf8"` type-coercion errors.
