@@ -302,7 +302,9 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   # the message lists why each failed (verified against Core, each type in each place).
   @spec log_text_failure([binary()]) :: problem()
   defp log_text_failure(types) do
-    case Enum.find(types, &(&1 not in ["Null" | @numbers] and native(&1) == nil)) do
+    supported = ["Null", "Boolean", "Timestamp(ns)" | @numbers ++ @text_types]
+
+    case Enum.find(types, &(&1 not in supported)) do
       nil ->
         log_failure(types, signature_errors(types))
 
@@ -356,14 +358,8 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   @spec expectation(binary(), binary()) :: binary()
   defp expectation(class, type) do
     "Internal error: Expect TypeSignatureClass::#{class} but received NativeType::" <>
-      "#{native(type)}, DataType: #{type}.\n#{@bug}"
+      "#{SQLNativeType.native(type)}, DataType: #{type}.\n#{@bug}"
   end
-
-  @spec native(binary()) :: binary() | nil
-  defp native(type) when type in ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"], do: "String"
-  defp native("Boolean"), do: "Boolean"
-  defp native("Timestamp(ns)"), do: "Timestamp(Nanosecond, None)"
-  defp native(_type), do: nil
 
   @spec log_failure([binary()], [binary()]) :: problem()
   defp log_failure(_types, errors) do
@@ -519,27 +515,11 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
       " No function matches the given name and argument types '#{shown}(#{Enum.join(types, ", ")})'. " <>
         "You might need to add explicit type casts.\n\tCandidate functions:\n\t" <> candidates
 
-    case {context, types} do
-      {:select, _types} -> SQLError.planning(head <> tail)
-      {:where, _types} -> SQLError.coercion(head <> tail)
-      {cut, []} when kind == :execution -> constant(head, tail, cut)
-      {cut, _types} -> cut(kind, head, cut)
+    case context do
+      :select -> SQLError.planning(head <> tail)
+      :where -> SQLError.coercion(head <> tail)
+      cut -> cut(kind, head, cut)
     end
-  end
-
-  # A call with no argument is a constant, which the engine folds before it
-  # types anything: `ORDER BY` has the bare execution error, an `IS NULL` has
-  # the optimizer report it.
-  @spec constant(binary(), binary(), context()) :: map()
-  defp constant(head, _tail, :order_by), do: %{status: 500, body: head}
-
-  defp constant(head, tail, _context) do
-    %{
-      status: 400,
-      body:
-        "Optimizer rule 'simplify_expressions' failed\ncaused by\n" <>
-          "Error during planning: " <> head <> tail
-    }
   end
 
   @spec word(:planning | :matching | :internal | :execution, binary()) :: binary()

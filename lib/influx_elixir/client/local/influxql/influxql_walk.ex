@@ -76,7 +76,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWalk do
   """
   @callback lazy(Opts.t()) :: nil | Opts.t()
 
-  @optional_callbacks enter: 2, call: 3, group: 2, lazy: 1
+  @optional_callbacks enter: 2, call: 3, group: 2, lazy: 1, leaf: 2
 
   # An operation put off until the walk knows whether it is the last.
   @typep deferred :: {:lazy, binary(), value(), value()}
@@ -185,7 +185,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWalk do
          do: {:ok, value, after_call}
   end
 
-  defp factor(tokens, mod, o), do: mod.leaf(tokens, o)
+  defp factor(tokens, mod, o),
+    do: if(function_exported?(mod, :leaf, 2), do: mod.leaf(tokens, o), else: :unread)
 
   # (A module without `enter/2` takes every call.)
   defp entered(mod, name, o),

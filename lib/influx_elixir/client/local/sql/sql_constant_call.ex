@@ -31,18 +31,10 @@ defmodule InfluxElixir.Client.Local.SQLConstantCall do
   `:ok`, or the engine's error for the call with no argument, given what
   stands above it and the clause it stands in.
   """
-  @spec check(SQLExpr.t(), ancestors(), :select | :where | :order_by) :: :ok | {:error, map()}
+  @spec check(SQLExpr.t(), ancestors(), :select | :where | :order_by) :: {:error, map()}
   def check({:call, name, []} = call, ancestors, clause) do
-    case planned(name, call) do
-      :ok ->
-        :ok
-
-      {:error, %{body: "Client.Local: " <> _reason} = refusal} ->
-        {:error, refusal}
-
-      {:error, %{body: "Error during planning: " <> message}} ->
-        {:error, shape(message, ancestors, clause)}
-    end
+    {:error, %{body: "Error during planning: " <> message}} = planned(name, call)
+    {:error, shape(message, ancestors, clause)}
   end
 
   # The planner's error for the call, whole.

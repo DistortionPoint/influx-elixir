@@ -200,5 +200,44 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
       assert SQLStatement.display("DROP VIEW IF EXISTS v") == {:ok, "DROP VIEW IF EXISTS v"}
       assert %{status: 400} = SQLStatement.bare_error("ATTACH ;")
     end
+
+    test "CTE columns named time with IS DISTINCT FROM, unsigned CTE outputs, and power/sqrt edge cases" do
+      {:ok, conn} = Local.start(databases: ["cte_db"], profile: :v3_core)
+
+      assert {:ok, :written} =
+               Local.write(
+                 conn,
+                 "m,host=a u=10u,v=1.5 1704067200000000000",
+                 database: "cte_db"
+               )
+
+      assert {:ok, [%{"same" => false, "diff" => true}]} =
+               Local.query_sql(
+                 conn,
+                 "WITH t AS (SELECT '2024-01-01T00:00:00Z' AS time) " <>
+                   "SELECT time IS DISTINCT FROM '2024-01-01T00:00:00Z' AS same, " <>
+                   "'abc' IS DISTINCT FROM time AS diff FROM t",
+                 database: "cte_db"
+               )
+
+      for cte_sql <- [
+            "WITH t AS (SELECT DISTINCT u FROM m) SELECT * FROM t WHERE u < 0",
+            "WITH t AS (SELECT first_value(u ORDER BY time) AS u FROM m) " <>
+              "SELECT * FROM t WHERE u < 0",
+            "WITH t AS (SELECT selector_first(u, time)['value'] AS u FROM m) " <>
+              "SELECT * FROM t WHERE u < 0"
+          ] do
+        assert {:error, %{status: 400, body: body}} =
+                 Local.query_sql(conn, cte_sql, database: "cte_db")
+
+        assert body =~ "leaves a numeric column no value"
+      end
+
+      assert {:error, {:connection_error, %{reason: :closed}}} =
+               Local.query_sql(conn, "SELECT power(2, 65) FROM m", database: "cte_db")
+
+      assert {:ok, [%{"s" => nil}]} =
+               Local.query_sql(conn, "SELECT sqrt(-1.0 / 0.0) AS s FROM m", database: "cte_db")
+    end
   end
 end

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local.SQLEval` raised `CaseClauseError` or false timestamp parse errors when `IS [NOT] DISTINCT FROM` compared a string literal against a CTE column named `time` of type `Utf8`.**
+  `SQLEval.eval_boolean/2` now dispatches to nanosecond `time_distinct/2` only when `point.timestamp` is an integer (`Timestamp(ns)`), falling through to standard value comparison when a CTE defines a non-timestamp column named `time`.
+
+### Changed
+- **Removed unreachable clauses and dead helpers across `Client.Local` (`SQLConstantCall`, `SQLScalarCheck`, `SQLScalar`, `SQLAggType`, `SQLRange`, `SQLRewrite`, `InfluxQLWild`, `InfluxQLWalk`, and `InfluxQLTyped.Constants`).**
+  Removed unreachable `:ok` and refusal branches in `SQLConstantCall.check/3`, removed the dead `constant/3` and `native/1` helpers in `SQLScalarCheck` (delegating to `SQLNativeType.native/1`), removed unreachable `:greatest`/`:least` and `{:u, _}` clauses in `SQLScalar.type_of/2` and `SQLScalar.integer/1`, simplified `result/3` and `kept/2` in `SQLAggType`, `observe_field/4` in `SQLRange`, and `select_list?/1`, `clause?/1`, and `skip_only/1` in `SQLRewrite`, removed the unreachable `_other` branch in `InfluxQLWild.grouped/2`, and made `leaf/2` an optional callback on `InfluxQLWalk` so `InfluxQLTyped.Constants` no longer defines an unreachable `leaf/2`.
+
 ## [0.1.62] - 2026-11-04
 
 ### Changed

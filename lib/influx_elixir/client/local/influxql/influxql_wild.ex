@@ -89,9 +89,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
       {:regex, source} ->
         regex = InfluxQLRegex.compile(source, :expand)
         Enum.filter(tags, &Regex.match?(regex, &1))
-
-      _other ->
-        []
     end)
   end
 

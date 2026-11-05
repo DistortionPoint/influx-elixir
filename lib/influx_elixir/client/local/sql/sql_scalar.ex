@@ -87,8 +87,6 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
   def type_of(name, types) when name in [:pow, :power],
     do: if(types == ["Int64", "Int64"], do: "Int64", else: "Float64")
 
-  def type_of(name, _types) when name in [:greatest, :least], do: nil
-
   @doc """
   Evaluates a call the planner has accepted, its arguments already evaluated
   and none of them null.
@@ -185,7 +183,6 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
 
   @spec integer(term()) :: integer()
   defp integer({:int, _bits, value}), do: value
-  defp integer({:u, value}), do: value
   defp integer(value) when is_integer(value), do: value
 
   # ---------------------------------------------------------------------------

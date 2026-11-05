@@ -128,12 +128,12 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   # `time` beside a text literal: the engine reads the text as a timestamp, compared with the
   # instant the point holds to the nanosecond.
   defp eval_boolean({:is_distinct, {:field, "time"}, {:lit, text}, negated}, point)
-       when is_binary(text),
-       do: time_distinct(text, point) != negated
+       when is_binary(text) and is_integer(point.timestamp),
+       do: time_distinct(text, point.timestamp) != negated
 
   defp eval_boolean({:is_distinct, {:lit, text}, {:field, "time"}, negated}, point)
-       when is_binary(text),
-       do: time_distinct(text, point) != negated
+       when is_binary(text) and is_integer(point.timestamp),
+       do: time_distinct(text, point.timestamp) != negated
 
   defp eval_boolean({:is_distinct, left, right, negated}, point) do
     distinct =
@@ -147,13 +147,11 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     distinct != negated
   end
 
-  @spec time_distinct(binary(), SQLRow.point()) :: boolean()
-  defp time_distinct(text, point) do
-    case {SQLTime.timestamp_ns(text), SQLRow.sort_value(point, "time")} do
-      {{:ok, _instant}, nil} -> true
-      {{:ok, instant}, held} when is_integer(held) -> held != instant
-      {{:ok, instant}, %DateTime{} = held} -> DateTime.to_unix(held, :nanosecond) != instant
-      {{:error, error}, _held} -> throw({:query_error, error})
+  @spec time_distinct(binary(), integer()) :: boolean()
+  defp time_distinct(text, timestamp) do
+    case SQLTime.timestamp_ns(text) do
+      {:ok, instant} -> timestamp != instant
+      {:error, error} -> throw({:query_error, error})
     end
   end
 

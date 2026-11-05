@@ -129,10 +129,7 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
     do: "Timestamp(ns)"
 
   defp result({:selector, _selector, field, _ordering, :struct, _name}, columns, _phase) do
-    case Map.get(columns, field) do
-      nil -> nil
-      type -> ~s|Struct("value": #{type}, "time": Timestamp(ns))|
-    end
+    if type = Map.get(columns, field), do: ~s|Struct("value": #{type}, "time": Timestamp(ns))|
   end
 
   # An expression over aggregates (`sum(n) + 1`) has the type of its operators over the
@@ -150,15 +147,18 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   # An aggregate of an argument it does not take (the engine fails the plan with its own
   # error, which `InfluxElixir.Client.Local.SQLPlan` words) has no type here.
   @spec kept(SQLSelect.aggregate(), binary() | nil) :: binary() | nil
-  defp kept(_agg, nil), do: nil
   defp kept(agg, @tag) when agg in [:min, :max], do: "Utf8"
   defp kept(agg, type) when agg in [:min, :max], do: type
-  defp kept(_agg, type) when not is_numeric_type(type), do: nil
   defp kept(agg, type) when agg in [:sum, :avg] and is_decimal_type(type), do: @decimal
-  defp kept(agg, _type) when agg in [:avg, :stddev, :stddev_pop, :var, :var_pop], do: "Float64"
+
+  defp kept(agg, type)
+       when agg in [:avg, :stddev, :stddev_pop, :var, :var_pop] and is_numeric_type(type),
+       do: "Float64"
+
   defp kept(:sum, type) when type in @signed, do: "Int64"
   defp kept(:sum, type) when type in ["UInt64", "Float64"], do: type
-  defp kept(:median, type), do: type
+  defp kept(:median, type) when is_numeric_type(type), do: type
+  defp kept(_agg, _type), do: nil
 
   # The expression an aggregate reads.
   @spec argument(SQLSelect.column()) :: [SQLExpr.t()]

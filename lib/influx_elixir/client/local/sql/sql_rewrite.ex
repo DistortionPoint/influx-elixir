@@ -202,13 +202,10 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   # outside parentheses yet, and the last token not an `AS`.
   @spec select_list?([token()]) :: boolean()
   defp select_list?(tokens) do
-    case Enum.reject(tokens, &space?/1) do
-      [{:word, select} | _rest] = significant ->
-        String.upcase(select) == "SELECT" and open_list?(significant)
+    significant = Enum.reject(tokens, &space?/1)
 
-      _other ->
-        false
-    end
+    match?([{:word, _} | _], significant) and
+      String.upcase(elem(hd(significant), 1)) == "SELECT" and open_list?(significant)
   end
 
   @spec open_list?([token()]) :: boolean()
@@ -378,10 +375,14 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   @spec clause?([token()]) :: boolean()
   defp clause?(tokens) do
     case Enum.drop_while(tokens, &space?/1) do
-      [{:word, word} | _more] -> String.upcase(word) in ~w(FIRST NEXT ROW ROWS)
-      [{:other, number} | _more] -> Regex.match?(~r/\A\d/, number)
-      [{:string, _text} | _more] -> true
-      _other -> false
+      [{:word, word} | _more] ->
+        String.upcase(word) in ~w(FIRST NEXT ROW ROWS)
+
+      [{kind, text} | _more] ->
+        kind == :string or (kind == :other and Regex.match?(~r/\A\d/, text))
+
+      [] ->
+        false
     end
   end
 
@@ -415,16 +416,11 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
 
   @spec skip_only([token()]) :: [token()]
   defp skip_only(tokens) do
-    case Enum.drop_while(tokens, &space?/1) do
-      [{:word, word} | rest] ->
-        case String.upcase(word) do
-          "ONLY" -> rest
-          "WITH" -> skip_words(rest, ["TIES"])
-          _other -> tokens
-        end
-
-      _other ->
-        tokens
+    with [{:word, word} | rest] <- Enum.drop_while(tokens, &space?/1),
+         upper when upper in ["ONLY", "WITH"] <- String.upcase(word) do
+      if upper == "ONLY", do: rest, else: skip_words(rest, ["TIES"])
+    else
+      _other -> tokens
     end
   end
 

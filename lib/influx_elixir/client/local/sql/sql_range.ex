@@ -223,10 +223,9 @@ defmodule InfluxElixir.Client.Local.SQLRange do
           (binary() -> :int64 | :uint64)
         ) :: %{binary() => SQLBounds.column_type()}
   defp observe_field(types, fields, column, integer_type) do
-    case fields do
-      %{^column => nil} -> types
-      %{^column => value} -> Map.put(types, column, value_type(value, column, integer_type))
-      _missing -> types
+    case Map.get(fields, column) do
+      nil -> types
+      value -> Map.put(types, column, value_type(value, column, integer_type))
     end
   end
 

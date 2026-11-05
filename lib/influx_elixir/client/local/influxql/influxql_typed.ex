@@ -263,9 +263,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     end
 
     @impl true
-    def leaf(_tokens, _opts), do: :unread
-
-    @impl true
     def combine("+", left, right, _opts), do: {:ok, left + right}
     def combine("-", left, right, _opts), do: {:ok, left - right}
     def combine("*", left, right, _opts), do: {:ok, left * right}
