@@ -1151,7 +1151,8 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
        [{"1970-01-01 00:00:00", %{"count" => 5}}]},
       {"select count(distinct nosuch), count(v) from ~g1",
        [{"1970-01-01 00:00:00", %{"count_1" => 5}}]},
-      {"select count(v), count(nosuch) + 1 from ~g1", [{"1970-01-01 00:00:00", %{"count" => 5}}]}
+      {"select count(v), count(nosuch) + 1 from ~g1", [{"1970-01-01 00:00:00", %{"count" => 5}}]},
+      {"select max(v), abs(v) from ~g1", [{"2023-11-14 22:16:20", %{"abs" => 5.0, "max" => 5.0}}]}
     ]
   end
 
@@ -4347,8 +4348,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
       {"show tag keys from ~g3 where time > time",
        {:error, 400,
         "Error during planning: found symbol 'time', expected now() or a literal duration, float, integer and timestamp string"}},
-      {"select max(v), abs(v) from ~g1",
-       [{"2023-11-14 22:16:20", %{"abs" => 5.0, "max" => 5.0}}]},
       {"select max(v) + 1, v from ~g1", [{"2023-11-14 22:16:20", %{"max" => 6.0, "v" => 5.0}}]},
       {"select count(((*))) from ~g1",
        {:error, 400,
@@ -4598,8 +4597,6 @@ defmodule InfluxElixir.Contract.InfluxQLShapeCases do
         "unsupported InfluxQL (SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement with no tag)",
       "show tag keys from ~g3 where time > time" =>
         "unsupported InfluxQL (SHOW TAG KEYS WHERE with a time in arithmetic or beside a name over a measurement with no tag)",
-      "select max(v), abs(v) from ~g1" =>
-        "unsupported InfluxQL (a function over a selector in that shape)",
       "select max(v) + 1, v from ~g1" =>
         "unsupported InfluxQL (arithmetic on a selector beside columns)",
       "select count(((*))) from ~g1" => "unsupported InfluxQL (count() of that argument)",

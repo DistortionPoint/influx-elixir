@@ -105,10 +105,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   end
 
   defp column_type(%{kind: :expr, item: index}, plan, types, tags) do
-    case Enum.at(plan.items, index) do
-      {:expr, ast, _name} -> InfluxQLExpr.result_type(ast, types, tags)
-      _other -> nil
-    end
+    {:expr, ast, _name} = Enum.at(plan.items, index)
+    InfluxQLExpr.result_type(ast, types, tags)
   end
 
   defp column_type(%{source: source}, _plan, types, _tags), do: Map.get(types, source)
@@ -595,8 +593,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   defp expression_row([{_name, {:value, _value, point}, _spec}], base, values),
     do: [base |> Map.put("time", point["time"]) |> Map.merge(values)]
 
-  defp expression_row(_named, _base, _values), do: []
-
   # The point a lone selector chose, with its time and the columns beside it;
   # a selector with no result there answers nothing.
   @spec lone_selector_row([tuple()], [InfluxQL.item()], map(), map(), map()) :: [map()]
@@ -689,11 +685,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   end
 
   # A percentile in a bucket reads its rank one further than over a series.
-  defp mark_bucket({:aggregate, "percentile:" <> rest = fun, field, alias}) do
-    if String.ends_with?(rest, ":bucket"),
-      do: {:aggregate, fun, field, alias},
-      else: {:aggregate, fun <> ":bucket", field, alias}
-  end
+  defp mark_bucket({:aggregate, "percentile:" <> _rest = fun, field, alias}),
+    do: {:aggregate, fun <> ":bucket", field, alias}
 
   defp mark_bucket({:aggregate, "integral:" <> _flags = fun, field, alias}),
     do: {:aggregate, fun <> ":bucket", field, alias}

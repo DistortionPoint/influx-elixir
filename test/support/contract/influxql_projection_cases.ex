@@ -2028,7 +2028,8 @@ defmodule InfluxElixir.Contract.InfluxQLProjectionCases do
        [
          {"2023-10-01 00:10:00", %{"derivative" => 30.0}},
          {"2023-10-01 00:20:00", %{"derivative" => 30.0}}
-       ]}
+       ]},
+      {"select max(n), abs(n) from ~p1", [{"2023-10-01 00:29:00", %{"abs" => 77, "max" => 77}}]}
     ]
   end
 
@@ -2754,7 +2755,6 @@ defmodule InfluxElixir.Contract.InfluxQLProjectionCases do
       {"select top(n, 2), abs(s) from ~p1",
        {:error, 400,
         "Error during planning: Function 'abs' expects NativeType::Numeric but received NativeType::String No function matches the given name and argument types 'abs(Utf8)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"}},
-      {"select max(n), abs(n) from ~p1", [{"2023-10-01 00:29:00", %{"abs" => 77, "max" => 77}}]},
       {"select abs(s), max(n) from ~p1",
        {:error, 500, "External error: InfluxQL internal error: unexpected selector function: abs"}},
       {"select abs(n), max(u) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T01:00:00Z' group by time(30m)",
@@ -2860,8 +2860,6 @@ defmodule InfluxElixir.Contract.InfluxQLProjectionCases do
       "select top(n, 2), abs(time) from ~p1" =>
         "unsupported InfluxQL (a function of time beside an aggregate)",
       "select top(n, 2), abs(s) from ~p1" => "unsupported InfluxQL (abs() of a string)",
-      "select max(n), abs(n) from ~p1" =>
-        "unsupported InfluxQL (a function over a selector in that shape)",
       "select abs(s), max(n) from ~p1" => "unsupported InfluxQL (abs() of a string)",
       "select abs(n), max(u) from ~p1 where time >= '2023-10-01T00:00:00Z' and time < '2023-10-01T01:00:00Z' group by time(30m)" =>
         "unsupported InfluxQL (columns beside a selector in GROUP BY time)",

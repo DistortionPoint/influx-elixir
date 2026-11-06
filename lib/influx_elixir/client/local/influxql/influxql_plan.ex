@@ -441,30 +441,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
       {:multi, kind, field, _by, _limit, _alias} ->
         columns = for {:column, column, name} = item <- items, do: {column, name, item}
-        multi_columns(kind, field, columns, items, {table, types, tags})
+        multi_columns(kind, field, columns, {table, types, tags})
 
       nil ->
         :ok
     end
   end
 
-  # Arithmetic of the columns of the point `top()` chose is answered; one of aggregates or
-  # transforms (they read the series, not the point) is not.
-  defp aggregating_expression?({:expr, ast, _alias}),
-    do: InfluxQLExpr.aggregates(ast) != [] or InfluxQLExpr.transforms(ast) != []
-
-  defp aggregating_expression?(_item), do: false
-
-  defp multi_columns(kind, field, columns, items, {table, types, tags}) do
+  defp multi_columns(kind, field, columns, {table, types, tags}) do
     field_beside? =
       Enum.any?(columns, fn {column, _name, _item} -> field?(column, types, tags) end)
 
     aliased = Enum.find(columns, &aliased_time?/1)
 
     cond do
-      Enum.any?(items, &aggregating_expression?/1) ->
-        {:error, "unsupported InfluxQL (#{kind}() beside an expression)"}
-
       field_beside? and MapSet.member?(tags, field) ->
         {:error, "unsupported InfluxQL (#{kind}() of a tag beside a field)"}
 
@@ -501,28 +491,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   # are fine. An error found while a call was read comes first.
   @spec multi_rules([InfluxQL.item()]) :: :ok | {:error, {:engine, binary()}}
   defp multi_rules(items) do
-    multis = for {:multi, kind, _field, _tags, _limit, _alias} <- items, do: kind
+    has_multi? = Enum.any?(items, &match?({:multi, _k, _f, _t, _n, _a}, &1))
 
-    others =
-      Enum.filter(items, fn item ->
+    has_other? =
+      Enum.any?(items, fn item ->
         aggregate?(item) and not match?({:multi, _k, _f, _t, _n, _a}, item)
       end)
 
-    cond do
-      multis == [] ->
-        :ok
-
-      others != [] ->
-        planning("selector functions top and bottom cannot be combined with other functions")
-
-      length(multis) > 1 ->
-        planning(
-          "selector function #{Enum.at(multis, 1)}() cannot be combined with other functions"
-        )
-
-      true ->
-        :ok
-    end
+    if has_multi? and has_other?,
+      do: planning("selector functions top and bottom cannot be combined with other functions"),
+      else: :ok
   end
 
   @doc """
@@ -684,10 +662,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   defp selector_name?(fun), do: InfluxQLAggregate.selector?(fun)
 
   defp lone_selector_expression(items, fun) do
-    case Enum.find(items, &match?({:expr, _ast, _alias}, &1)) do
-      nil -> :ok
-      {:expr, ast, _alias} -> selector_in(ast, fun)
-    end
+    Enum.find_value(items, :ok, fn
+      {:expr, ast, _alias} ->
+        if InfluxQLExpr.aggregates(ast) != [], do: selector_in(ast, fun)
+
+      _item ->
+        nil
+    end)
   end
 
   defp selector_in({:fn, name, [{:agg, _call, _field} | _rest]}, _fun),
@@ -699,15 +680,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   defp selector_in({:fn, _name, _arguments}, _fun),
     do: {:error, "unsupported InfluxQL (a function over a selector in that shape)"}
 
-  defp selector_in({:bin, _op, _left, _right} = ast, "percentile:" <> _percent),
-    do:
-      if(InfluxQLExpr.aggregates(ast) != [],
-        do: {:error, "unsupported InfluxQL (arithmetic on percentile())"},
-        else: :ok
-      )
+  defp selector_in({:bin, _op, _left, _right}, "percentile:" <> _percent),
+    do: {:error, "unsupported InfluxQL (arithmetic on percentile())"}
 
   defp selector_in({:neg, _operand}, "percentile:" <> _percent),
     do: {:error, "unsupported InfluxQL (arithmetic on percentile())"}
+
+  defp selector_in({:neg, operand}, fun), do: selector_in(operand, fun)
 
   defp selector_in({:bin, _op, left, right}, fun) do
     with :ok <- selector_in(left, fun), do: selector_in(right, fun)

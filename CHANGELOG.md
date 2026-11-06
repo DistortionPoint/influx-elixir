@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local.InfluxQLPlan` falsely rejected plain field expressions and math calls beside a lone selector (`SELECT max(v), abs(v) FROM m`, `SELECT -v, percentile(v, 50) FROM m`) and skipped negated function calls over a lone selector.**
+  `InfluxQLPlan.lone_selector_expression/2` previously inspected the first `{:expr, ast, alias}` item in the select list regardless of whether that expression contained the selector, causing queries like `SELECT max(v), abs(v) FROM m` and `SELECT -v, percentile(v, 50) FROM m` to fail with `"unsupported InfluxQL (a function over a selector in that shape)"` or `"unsupported InfluxQL (arithmetic on percentile())"`. It now checks only expression items that contain an aggregate (`InfluxQLExpr.aggregates(ast) != []`), allowing plain field expressions and math calls after a lone selector to execute with full engine fidelity, and `selector_in/2` now recurses through `{:neg, operand}` so negated function calls over a lone selector (`SELECT -abs(max(v)) FROM m`) produce the engine's `"unexpected selector function"` error.
+
+### Changed
+- **Removed unreachable clauses and duplicate helpers across `Client.Local` (`InfluxQLArithmetic`, `InfluxQLPlan`, `InfluxQLRun`, and `SQLCast`).**
+  Replaced `InfluxQLArithmetic.fraction/1` with `InfluxQLText.leading_zero/1` and inlined `division_kind/2` into `InfluxQLArithmetic.kind/1`, removed unreachable `aggregating_expression?/1` and duplicate `length(multis) > 1` checks in `InfluxQLPlan` (already handled earlier in `item_errors/5` and `multi_rules/1`), simplified `column_type/4`, `expression_row/3`, and `mark_bucket/1` in `InfluxQLRun`, and removed the unreachable `to_string_value/1` fallback clause in `SQLCast`.
+
 ## [0.1.63] - 2026-11-05
 
 ### Fixed

@@ -14,6 +14,8 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
 
   alias InfluxElixir.Client.Local.{
     InfluxQLRegex,
+    InfluxQLTimeExpr,
+    InfluxQLTransform,
     SQLBind,
     SQLCompare,
     SQLCondition,
@@ -297,6 +299,139 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
                )
 
       assert flux_err =~ "Client.Local: unsupported filter(): bad: 1"
+    end
+
+    test "InfluxQL lone selector expressions, time expressions, transforms, and SQL WHERE/LIKE/bounds edges" do
+      {:ok, conn} = Local.start(databases: ["iq_db"], profile: :v3_core)
+
+      assert {:ok, :written} =
+               Local.write(
+                 conn,
+                 "m,host=a v=4.0,i=10i,u=5u 1704067200000000000\n" <>
+                   "m,host=a v=8.0,i=10i,u=5u 1704067201000000000",
+                 database: "iq_db"
+               )
+
+      assert {:ok, [%{"expr" => -4.0, "percentile" => 4.0}]} =
+               Local.query_influxql(
+                 conn,
+                 "SELECT -v AS expr, percentile(v, 50) FROM m",
+                 database: "iq_db"
+               )
+
+      assert {:error, %{status: 400, body: pct_err}} =
+               Local.query_influxql(
+                 conn,
+                 "SELECT -percentile(v, 50) FROM m",
+                 database: "iq_db"
+               )
+
+      assert pct_err =~ "arithmetic on percentile()"
+
+      assert {:error, %{status: 500, body: sel_err}} =
+               Local.query_influxql(
+                 conn,
+                 "SELECT -abs(max(v)) FROM m",
+                 database: "iq_db"
+               )
+
+      assert sel_err =~ "unexpected selector function: abs"
+
+      assert {:error, %{status: 400, body: shape_err}} =
+               Local.query_influxql(
+                 conn,
+                 "SELECT abs(max(v) + 1) FROM m",
+                 database: "iq_db"
+               )
+
+      assert shape_err =~ "a function over a selector in that shape"
+
+      for iql <- [
+            "SELECT * FROM m GROUP BY v",
+            "SELECT count(*) FROM m GROUP BY v"
+          ] do
+        assert {:error, %{status: 400, body: grp_err}} =
+                 Local.query_influxql(conn, iql, database: "iq_db")
+
+        assert grp_err =~ "GROUP BY a field that the select list reads"
+      end
+
+      assert {:error, %{status: 400, body: drv_err}} =
+               Local.query_influxql(conn, "SELECT derivative(mean(v)) FROM m", database: "iq_db")
+
+      assert drv_err =~ "derivative aggregate requires a GROUP BY interval"
+
+      assert InfluxQLTimeExpr.eval([{:raw, "+"}, {:duration, 10_000_000_000, "10s"}], 0) ==
+               10_000_000_000
+
+      for tokens <- [
+            [{:raw, "-"}, {:str, "2024-01-01T00:00:00Z"}],
+            [{:raw, "("}, {:duration, 10_000_000_000, "10s"}],
+            [{:raw, "*"}, {:duration, 10_000_000_000, "10s"}],
+            [
+              {:duration, 9_223_372_036_854_775_807, "max"},
+              {:raw, "+"},
+              {:duration, 1, "1ns"}
+            ]
+          ] do
+        assert {:refused, _msg} = catch_throw(InfluxQLTimeExpr.eval(tokens, 0))
+      end
+
+      assert InfluxQLTransform.run("elapsed", 1, [{10, nil}, {20, 1.0}, {35, 2.0}]) == [
+               nil,
+               0,
+               15
+             ]
+
+      assert InfluxQLTransform.run("derivative", 1, [{10, 1.0}, {10, 2.0}]) == [nil, nil]
+
+      assert catch_throw(InfluxQLTransform.run("moving_average", 1, [])) ==
+               {:refused, "unsupported InfluxQL (moving_average() with the parameter 1)"}
+
+      for bad_where <- [
+            "WHERE AND NOT x = 1",
+            "WHERE AND (x = 1)",
+            "WHERE x = 1 y = 2"
+          ] do
+        assert {:error, %{status: 400}} = SQLWhere.only(bad_where)
+      end
+
+      assert {:error, %{status: 400, body: ilike_err}} =
+               Local.query_sql(conn, "SELECT * FROM m WHERE i ILIKE '1%'", database: "iq_db")
+
+      assert ilike_err =~
+               "There isn't a common type to coerce Int64 and Utf8 in ILIKE expression"
+
+      big_pat = String.duplicate("a%", 20_000)
+
+      assert {:error, %{status: 400, body: pat_err}} =
+               Local.query_sql(
+                 conn,
+                 "SELECT host LIKE ('#{big_pat}' || 'b') FROM m",
+                 database: "iq_db"
+               )
+
+      assert pat_err =~ "a LIKE pattern of more than tens of thousands of characters"
+
+      for exact_sql <- [
+            "SELECT * FROM m WHERE -(-i) > 5 AND i < 5",
+            "SELECT * FROM m WHERE 10 - i > 5 AND i > 5"
+          ] do
+        assert {:error, %{status: 500, body: exact_err}} =
+                 Local.query_sql(conn, exact_sql, database: "iq_db")
+
+        assert exact_err =~
+                 "Internal error: Only intervals with the same data type are comparable"
+      end
+
+      assert {:error, %{status: 400, body: b_err}} =
+               Local.query_sql(
+                 conn,
+                 "SELECT * FROM m WHERE i * -2 > 4 AND i > -2",
+                 database: "iq_db"
+               )
+
+      assert b_err =~ "leaves it no value"
     end
   end
 end

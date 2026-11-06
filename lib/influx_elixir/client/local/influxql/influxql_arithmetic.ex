@@ -27,7 +27,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   #
   # The comparisons handled here are those of numbers: fields, constants,
   # `+ - * /`, signs and parentheses.
-  alias InfluxElixir.Client.Local.{InfluxQLKernel, SQLLimits}
+  alias InfluxElixir.Client.Local.{InfluxQLKernel, InfluxQLText, SQLLimits}
 
   require SQLLimits
 
@@ -193,13 +193,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   @spec number(binary(), 1 | -1) :: {:ok, value()} | :error
   defp number(text, sign) do
     case Integer.parse(text) do
-      {n, ""} -> integer(sign * n)
-      _fraction -> {:ok, {:float, sign * (text |> fraction() |> String.to_float())}}
+      {n, ""} ->
+        integer(sign * n)
+
+      _fraction ->
+        {:ok, {:float, sign * (text |> InfluxQLText.leading_zero() |> String.to_float())}}
     end
   end
-
-  defp fraction("." <> digits), do: "0." <> digits
-  defp fraction(text), do: text
 
   # A literal is signed when it fits, else unsigned.
   @spec integer(integer()) :: {:ok, value()} | :error
@@ -318,11 +318,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   defp kind({:field, _name, kind}), do: kind
   defp kind({:lit, {kind, _n}}), do: kind
   defp kind({:abs, operand}), do: kind(operand)
-  defp kind({:op, "/", left, right}), do: division_kind(kind(left), kind(right))
-  defp kind({:op, _op, left, right}), do: common_kind(kind(left), kind(right))
 
-  defp division_kind(:int, :int), do: :float
-  defp division_kind(left, right), do: common_kind(left, right)
+  defp kind({:op, "/", left, right}) do
+    case {kind(left), kind(right)} do
+      {:int, :int} -> :float
+      {lk, rk} -> common_kind(lk, rk)
+    end
+  end
+
+  defp kind({:op, _op, left, right}), do: common_kind(kind(left), kind(right))
 
   defp common_kind(left, right) when :float in [left, right], do: :float
   defp common_kind(left, right) when :uint in [left, right], do: :uint

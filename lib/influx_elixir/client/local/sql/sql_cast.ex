@@ -181,7 +181,7 @@ defmodule InfluxElixir.Client.Local.SQLCast do
     end
   end
 
-  @spec to_string_value(term()) :: {:ok, binary()} | :error
+  @spec to_string_value(term()) :: {:ok, binary()}
   defp to_string_value(value) when is_binary(value), do: {:ok, value}
   defp to_string_value(value) when is_float(value), do: {:ok, Format.render_float(value)}
   defp to_string_value(value) when is_integer(value), do: {:ok, Integer.to_string(value)}
@@ -195,7 +195,6 @@ defmodule InfluxElixir.Client.Local.SQLCast do
   defp to_string_value(:inf), do: {:ok, "inf"}
   defp to_string_value(:neg_inf), do: {:ok, "-inf"}
   defp to_string_value(:nan), do: {:ok, "NaN"}
-  defp to_string_value(_other), do: :error
 
   # `{:dec, 25000, 4}` is "2.5000"; `{:dec, -5, 4}` is "-0.0005".
   @spec decimal_text(integer(), non_neg_integer()) :: binary()
