@@ -22,7 +22,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
     InfluxQLError,
     InfluxQLExpr,
     InfluxQLNames,
-    InfluxQLRegex
+    InfluxQLRegex,
+    InfluxQLText
   }
 
   @numeric ~w(integer unsigned float)a
@@ -31,7 +32,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
                         non_negative_difference cumulative_sum moving_average top bottom)
   @every_type ~w(first last count mode elapsed)
   @aggregates ~w(mean sum median spread stddev min max first last count mode)
-  @known @every_type ++ ~w(min max) ++ @numeric_functions
 
   @doc """
   The query with its wildcards written out for a measurement with the given
@@ -44,26 +44,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
   def expand(%{items: items} = query, types, tags) do
     star_columns? = InfluxQLNames.star_written_out?(items)
 
-    cond do
-      not (star_columns? or Enum.any?(items, &wild?/1)) ->
-        {:ok, query}
+    if star_columns? or Enum.any?(items, &wild?/1) do
+      shown = shown_tags(query, tags)
+      stars = if star_columns?, do: star_columns(query, types, shown)
 
-      unknown = Enum.find(items, &unknown_call?/1) ->
-        {:wild_call, name, _extra, _target, _alias} = unknown
-        {:error, "unsupported InfluxQL (#{name}() of a wildcard)"}
+      case Enum.flat_map(items, &expand_item(&1, types, shown, stars)) do
+        [] ->
+          :empty
 
-      true ->
-        shown = shown_tags(query, tags)
-        stars = if star_columns?, do: star_columns(query, types, shown)
-
-        case Enum.flat_map(items, &expand_item(&1, types, shown, stars)) do
-          [] ->
-            :empty
-
-          expanded ->
-            with {:ok, named} <- InfluxQLNames.resolve(expanded),
-                 do: {:ok, %{query | items: named}}
-        end
+        expanded ->
+          with {:ok, named} <- InfluxQLNames.resolve(expanded),
+               do: {:ok, %{query | items: named}}
+      end
+    else
+      {:ok, query}
     end
   end
 
@@ -100,9 +94,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
     names = Map.keys(types) ++ (MapSet.to_list(tags) -- grouped(dimensions, tags))
     for name <- names |> Enum.uniq() |> Enum.sort(), do: {:column, name, name}
   end
-
-  defp unknown_call?({:wild_call, name, _extra, _target, _alias}), do: name not in @known
-  defp unknown_call?(_item), do: false
 
   defp wild?({:wild_column, _target}), do: true
   defp wild?({:wild_call, _name, _extra, _target, _alias}), do: true
@@ -196,15 +187,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
     do: {:aggregate, "percentile:" <> InfluxQLExpr.number_text(percent), field, column}
 
   defp call_item_of(name, extra, field, column) do
-    escaped_field =
-      String.replace(field, ["\\", "\"", "\n"], fn
-        "\n" -> "\\n"
-        char -> "\\" <> char
-      end)
-
     arguments =
       Enum.map_join(
-        [~s("#{escaped_field}") | Enum.map(extra, &argument_text(name, &1))],
+        [InfluxQLText.quote_ident(field) | Enum.map(extra, &argument_text(name, &1))],
         ", ",
         & &1
       )

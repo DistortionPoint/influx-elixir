@@ -95,8 +95,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   def quoted_if_needed(name) do
     if Regex.match?(~r/\A[A-Za-z_][A-Za-z0-9_]*\z/, name) and not reserved?(name),
       do: name,
-      else: "\"" <> String.replace(name, ["\\", "\"", "\n"], &escaped/1) <> "\""
+      else: quote_ident(name)
   end
+
+  @doc "A name in double quotes, with a backslash, a double quote and a line feed escaped."
+  @spec quote_ident(binary()) :: binary()
+  def quote_ident(name), do: "\"" <> String.replace(name, ["\\", "\"", "\n"], &escaped/1) <> "\""
 
   defp escaped("\n"), do: "\\n"
   defp escaped(char), do: "\\" <> char

@@ -182,14 +182,11 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   @spec order_term(binary(), [{binary(), binary()}]) :: {:ok, binary()} | {:error, map()}
   defp order_term(term, items) do
     # The direction and the placement of the nulls follow the target, each of them optional.
-    {target, direction} =
-      case SQLMask.run(
-             ~r/^(.+?)(?<=\S)((?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?)$/isu,
-             term
-           ) do
-        [_full, target, direction] -> {target, direction}
-        nil -> {term, ""}
-      end
+    [_full, target, direction] =
+      SQLMask.run(
+        ~r/^(.+?)(?<=\S)((?:\s+(?:ASC|DESC))?(?:\s+NULLS\s+(?:FIRST|LAST))?)$/isu,
+        term
+      )
 
     case order_position(target, length(items)) do
       {:ok, position} ->
@@ -367,7 +364,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   @spec tuple?(binary()) :: boolean()
   defp tuple?("(" <> inner) do
     case SQLMask.balanced(inner) do
-      {:ok, body, ""} -> match?([_, _ | _], SQLMask.split_commas(body)) and body != ""
+      {:ok, body, ""} -> match?([_, _ | _], SQLMask.split_commas(body))
       _other -> false
     end
   end

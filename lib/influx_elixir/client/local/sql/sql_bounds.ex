@@ -487,12 +487,12 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
       bounds == [] ->
         :ok
 
-      Enum.any?(Map.values(cast_columns), &empty?/1) or
-          Enum.any?(by_column, fn {column, group} -> column_empty?(leaves, column, group) end) ->
-        failure(leaves, groups, bounds, by_column, casts)
-
       mixed_empty?(by_column, casts) ->
         {:refuse, @mixed}
+
+      Enum.any?(Map.values(cast_columns), &empty?/1) or
+          Enum.any?(by_column, fn {column, group} -> column_empty?(leaves, column, group) end) ->
+        failure(leaves, groups, bounds)
 
       true ->
         :ok
@@ -501,13 +501,9 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
 
   # Some column is left no value: the engine fails unless what decides how
   # is not known.
-  @spec failure([leaf()], [[leaf()]], [leaf()], %{binary() => [leaf()]}, [leaf()]) ::
-          {:fail, leaf()} | {:refuse, binary()}
-  defp failure(leaves, groups, bounds, by_column, casts) do
+  @spec failure([leaf()], [[leaf()]], [leaf()]) :: {:fail, leaf()} | {:refuse, binary()}
+  defp failure(leaves, groups, bounds) do
     cond do
-      mixed_empty?(by_column, casts) ->
-        {:refuse, @mixed}
-
       unknown = Enum.find(leaves, &match?({:unknown, _what}, &1)) ->
         {:refuse, elem(unknown, 1)}
 

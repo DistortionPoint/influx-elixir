@@ -269,9 +269,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   # microsecond (its floor), so the double answers the same.
   @spec epoch_time(integer()) :: DateTime.t()
   defp epoch_time(ns) do
-    if SQLLimits.is_int64(ns),
-      do: DateTime.from_unix!(Integer.floor_div(ns, 1000), :microsecond),
-      else: refuse("fill() with a number outside the times the double holds")
+    DateTime.from_unix!(Integer.floor_div(ns, 1000), :microsecond)
   rescue
     ArgumentError -> refuse("fill() with a number outside the times the double holds")
   end
@@ -365,15 +363,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
     |> elem(0)
   end
 
-  @spec line(number() | nil, number() | nil, float(), InfluxQLAggregate.column_type()) :: term()
-  defp line(y0, y1, ratio, :float) when is_number(y0) and is_number(y1),
-    do: y0 + (y1 - y0) * ratio
-
-  defp line(y0, y1, ratio, type)
-       when type in [:integer, :unsigned] and is_number(y0) and is_number(y1),
-       do: trunc(y0 + (y1 - y0) * ratio)
-
-  defp line(_y0, _y1, _ratio, type), do: refuse("fill(linear) on a #{type} column")
+  @spec line(number(), number(), float(), InfluxQLAggregate.column_type()) :: number()
+  defp line(y0, y1, ratio, :float), do: y0 + (y1 - y0) * ratio
+  defp line(y0, y1, ratio, _int_type), do: trunc(y0 + (y1 - y0) * ratio)
 
   @spec bounded_scan(list()) :: list()
   defp bounded_scan(rows) when length(rows) > @max_scan,

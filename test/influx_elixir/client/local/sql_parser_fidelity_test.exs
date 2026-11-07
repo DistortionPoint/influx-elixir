@@ -14,6 +14,7 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
 
   alias InfluxElixir.Client.Local.{
     InfluxQLRegex,
+    InfluxQLText,
     InfluxQLTimeExpr,
     InfluxQLTransform,
     SQLBind,
@@ -432,6 +433,45 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
                )
 
       assert b_err =~ "leaves it no value"
+
+      assert InfluxQLText.quote_ident("a\nb") == "\"a\\nb\""
+
+      assert {:ok, :written} =
+               Local.write(conn, "notags x=1i 1704067200000000000", database: "iq_db")
+
+      assert {:error, %{status: 400, body: split_err}} =
+               Local.query_influxql(
+                 conn,
+                 "SHOW TAG KEYS FROM notags WHERE time != 0",
+                 database: "iq_db"
+               )
+
+      assert split_err =~ "invalid time comparison operator: !="
+
+      assert {:error, %{status: 400, body: meas_err}} =
+               Local.query_influxql(
+                 conn,
+                 "SHOW MEASUREMENTS WHERE time != 0",
+                 database: "iq_db"
+               )
+
+      assert meas_err =~ "invalid time comparison operator: !="
+
+      assert {:error, %{status: 400, body: pos_err}} =
+               Local.query_sql(
+                 conn,
+                 "SELECT i FROM m ORDER BY i + 1, 0",
+                 database: "iq_db"
+               )
+
+      assert pos_err =~ "Order by index starts at 1"
+
+      assert {:ok, _rows} =
+               Local.query_sql(
+                 conn,
+                 "SELECT (i) + 1 FROM m GROUP BY (i) + 1",
+                 database: "iq_db"
+               )
     end
   end
 end

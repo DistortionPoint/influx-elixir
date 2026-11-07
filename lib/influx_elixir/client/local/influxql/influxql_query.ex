@@ -261,7 +261,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
         )
 
       spec.where != nil and tagless?(table, database, names) ->
-        tagless_where(table, database, names, spec)
+        tagless_where(spec)
 
       true ->
         show_collect(names, &tag_key_rows(table, database, &1, spec))
@@ -278,18 +278,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # splits the `time` comparisons off the condition before that, so their errors (`time != x`,
   # a time that is no timestamp) come first; a `now()` in the rest of the condition is its
   # error first, which the double does not order.
-  @spec tagless_where(Store.t(), binary(), [binary()], map()) :: {:error, map()}
-  defp tagless_where(table, database, names, spec) do
-    case split_error(table, database, names, spec) do
-      {:error, _error} = error ->
-        error
-
-      nil ->
-        if Regex.match?(~q/\bnow\s*\(/i, spec.where) do
-          show_refusal(spec, "SHOW TAG KEYS WHERE now() over a measurement with no tag")
-        else
-          aggregate_of_nothing()
-        end
+  @spec tagless_where(map()) :: {:error, map()}
+  defp tagless_where(spec) do
+    if Regex.match?(~q/\bnow\s*\(/i, spec.where) do
+      show_refusal(spec, "SHOW TAG KEYS WHERE now() over a measurement with no tag")
+    else
+      aggregate_of_nothing()
     end
   end
 
