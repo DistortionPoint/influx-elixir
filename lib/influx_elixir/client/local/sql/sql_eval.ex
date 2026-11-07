@@ -179,8 +179,6 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     with value when value != nil <- eval(inner, point),
          %Regex{} = regex <- regex || pattern_regex(eval(pattern, point), ilike) do
       value |> like(ilike) |> then(&Regex.match?(regex, &1)) |> negate_if(negated)
-    else
-      nil -> nil
     end
   end
 

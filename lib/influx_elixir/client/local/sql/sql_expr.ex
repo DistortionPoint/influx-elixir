@@ -90,10 +90,6 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   @typedoc "How `render/3` treats a `CAST`: written as the engine names it (gone), or refused."
   @type casts :: :drop | :refuse | :display
 
-  @int64_min SQLLimits.int64_min()
-  @int64_max SQLLimits.int64_max()
-  @uint64_max SQLLimits.uint64_max()
-
   @number "(?:[0-9]+\\.[0-9]*|\\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?"
   @quoted ~S{"(?:[^"]|"")*"}
   @name "(?:\\w+|#{@quoted})"
@@ -140,7 +136,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   a `CASE` and a call all the same).
   """
   @spec parse_arithmetic(binary()) :: {:ok, t()} | {:error, term()}
-  def parse_arithmetic(str), do: parse_with(str, &parse_concat/1)
+  def parse_arithmetic(str), do: parse_with(str, &parse_sum/1)
 
   @spec parse_with(binary(), ([term()] -> {:ok, t(), [term()]} | {:error, term()})) ::
           {:ok, t()} | {:error, term()}
@@ -202,16 +198,11 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   # qualified) quoted name, or an operator; the groups after the last one
   # that matched are not in the list.
   @spec expr_token([binary()]) :: term()
-  defp expr_token(groups) do
-    case groups ++ List.duplicate("", 5 - length(groups)) do
-      [num, "", "", "", ""] when num != "" -> {:num, num}
-      ["", string, "", "", ""] when string != "" -> {:str, string}
-      ["", "", name, "", ""] when name != "" -> {:param, name}
-      ["", "", "", ident, ""] when ident != "" -> name_token(ident)
-      ["", "", "", "", op] when op != "" -> {:tok, op}
-      ["", "", "", "", ""] -> {:str, ""}
-    end
-  end
+  defp expr_token([num]), do: {:num, num}
+  defp expr_token(["", string]), do: {:str, string}
+  defp expr_token(["", "", name]), do: {:param, name}
+  defp expr_token(["", "", "", ident]), do: name_token(ident)
+  defp expr_token(["", "", "", "", op]), do: {:tok, op}
 
   @spec name_token(binary()) :: term()
   defp name_token(text) do
@@ -281,7 +272,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   # side, applied left to right.
   @spec parse_test([term()]) :: parsed()
   defp parse_test(tokens) do
-    with {:ok, left, rest} <- parse_concat(tokens), do: parse_test_tail(left, rest)
+    with {:ok, left, rest} <- parse_sum(tokens), do: parse_test_tail(left, rest)
   end
 
   @comparisons %{
@@ -295,7 +286,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   }
 
   defp parse_test_tail(left, [{:tok, op} | rest]) when is_map_key(@comparisons, op) do
-    with {:ok, right, rest} <- parse_concat(rest),
+    with {:ok, right, rest} <- parse_sum(rest),
          do: parse_test_tail({:cmp, Map.fetch!(@comparisons, op), left, right}, rest)
   end
 
@@ -394,9 +385,9 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   end
 
   defp parse_between(left, tokens, negated) do
-    with {:ok, low, [{:word, word} | rest]} <- parse_concat(tokens),
+    with {:ok, low, [{:word, word} | rest]} <- parse_sum(tokens),
          true <- keyword?(word, "AND"),
-         {:ok, high, rest} <- parse_concat(rest) do
+         {:ok, high, rest} <- parse_sum(rest) do
       {:ok, {:between, left, low, high, negated}, rest}
     else
       {:error, _reason} = error -> error
@@ -405,7 +396,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   end
 
   defp parse_like(left, tokens, kind, negated) do
-    with {:ok, pattern, rest} <- parse_concat(tokens),
+    with {:ok, pattern, rest} <- parse_sum(tokens),
          :ok <- like_ends(rest),
          ilike = kind == "ILIKE",
          {:ok, regex} <- literal_regex(pattern, ilike) do
@@ -436,11 +427,6 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   end
 
   defp literal_regex(_dynamic, _ilike), do: {:ok, nil}
-
-  # The operand of a comparison, `BETWEEN`, `LIKE` and `IN`: the sums. `||` is read
-  # with the products, as the engine's parser does.
-  @spec parse_concat([term()]) :: parsed()
-  defp parse_concat(tokens), do: parse_sum(tokens)
 
   @spec parse_sum([term()]) :: parsed()
   defp parse_sum(tokens) do
@@ -532,8 +518,8 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
     end
   end
 
-  defp parse_primary([{:word, word} | rest] = tokens) do
-    if keyword?(word, "CASE"), do: parse_case(rest), else: parse_word(word, rest, tokens)
+  defp parse_primary([{:word, word} | rest]) do
+    if keyword?(word, "CASE"), do: parse_case(rest), else: {:ok, word_value(word), rest}
   end
 
   defp parse_primary([{:tok, "("} | rest]) do
@@ -547,8 +533,6 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   defp parse_primary(tokens), do: unexpected(:unexpected_token, tokens)
 
   # A bare `true`, `false` or `null` is a literal; any other word a column.
-  defp parse_word(word, rest, _tokens), do: {:ok, word_value(word), rest}
-
   @spec word_value(binary()) :: t()
   defp word_value(word) do
     case String.downcase(word) do
@@ -719,8 +703,8 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
       value = if negative, do: -value, else: value
 
       cond do
-        value >= @int64_min and value <= @int64_max -> {:lit, value}
-        value > 0 and value <= @uint64_max -> {:uint, value}
+        SQLLimits.is_int64(value) -> {:lit, value}
+        SQLLimits.is_uint64(value) -> {:uint, value}
         true -> float_literal(text, negative)
       end
     else

@@ -472,6 +472,20 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
                  "SELECT (i) + 1 FROM m GROUP BY (i) + 1",
                  database: "iq_db"
                )
+
+      for sql <- ["SELECT AVG(\"time\") FROM m", "SELECT AVG((time)) FROM m"] do
+        assert {:error, %{status: 400, body: avg_time_err}} =
+                 Local.query_sql(conn, sql, database: "iq_db")
+
+        assert avg_time_err =~ "Avg does not support inputs of type Timestamp(ns)."
+      end
+
+      assert {:ok, [%{"a" => 10.0}]} =
+               Local.query_sql(
+                 conn,
+                 "WITH t AS (SELECT 10 AS time FROM m) SELECT AVG(time) AS a FROM t",
+                 database: "iq_db"
+               )
     end
   end
 end

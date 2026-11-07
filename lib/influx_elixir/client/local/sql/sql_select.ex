@@ -173,7 +173,40 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   item's name; `nil` when the table is joined.
   """
   @spec parse_item(binary(), binary() | nil) :: {:ok, column()} | {:error, term()}
-  def parse_item(item, qualifier), do: parse_single_column(item, qualifier)
+  def parse_item(col, qualifier) do
+    if String.valid?(col) do
+      masked = SQLMask.mask(col)
+      {body, alias_name} = split_alias(col)
+
+      cond do
+        String.match?(masked, ~r/(?i)DATE_BIN\s*\(/u) ->
+          parse_date_bin_column(col, body, alias_name, qualifier)
+
+        String.match?(masked, ~r/(?i)\b(FIRST_VALUE|LAST_VALUE)\s*\(/u) ->
+          parse_ordered_agg_column(col, body, alias_name, qualifier)
+
+        String.match?(masked, ~r/(?i)\bSELECTOR_(FIRST|LAST|MIN|MAX)\s*\(/u) ->
+          parse_selector_column(col, body, alias_name, qualifier)
+
+        match = Regex.run(@influxql_call, masked) ->
+          {:error, invalid_function(hd(match))}
+
+        String.match?(masked, ~r/(?i)\b(?:#{@plain_alternation})\s*\(/u) ->
+          parse_agg_column(col, body, alias_name, qualifier)
+
+        constant = constant(body) ->
+          parse_constant_column(col, constant, alias_name)
+
+        String.match?(body, ~r/^#{@name}$/u) ->
+          parse_grouping_column(body, alias_name)
+
+        true ->
+          {:error, SQLError.refusal("unsupported column expression: #{col}")}
+      end
+    else
+      {:error, SQLError.refusal("unsupported column expression: #{col}")}
+    end
+  end
 
   @doc """
   A select item as `{body, alias}`: the text before a final `AS name` and the
@@ -277,44 +310,6 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
     SQLExpr.render(expr, qualifier, :drop)
   catch
     :unrenderable -> nil
-  end
-
-  # Parse a single SELECT column expression
-  @spec parse_single_column(binary(), binary() | nil) ::
-          {:ok, column()} | {:error, term()}
-  defp parse_single_column(col, qualifier) do
-    if String.valid?(col) do
-      masked = SQLMask.mask(col)
-      {body, alias_name} = split_alias(col)
-
-      cond do
-        String.match?(masked, ~r/(?i)DATE_BIN\s*\(/u) ->
-          parse_date_bin_column(col, body, alias_name, qualifier)
-
-        String.match?(masked, ~r/(?i)\b(FIRST_VALUE|LAST_VALUE)\s*\(/u) ->
-          parse_ordered_agg_column(col, body, alias_name, qualifier)
-
-        String.match?(masked, ~r/(?i)\bSELECTOR_(FIRST|LAST|MIN|MAX)\s*\(/u) ->
-          parse_selector_column(col, body, alias_name, qualifier)
-
-        match = Regex.run(@influxql_call, masked) ->
-          {:error, invalid_function(hd(match))}
-
-        String.match?(masked, ~r/(?i)\b(?:#{@plain_alternation})\s*\(/u) ->
-          parse_agg_column(col, body, alias_name, qualifier)
-
-        constant = constant(body) ->
-          parse_constant_column(col, constant, alias_name)
-
-        String.match?(body, ~r/^#{@name}$/u) ->
-          parse_grouping_column(body, alias_name)
-
-        true ->
-          {:error, SQLError.refusal("unsupported column expression: #{col}")}
-      end
-    else
-      {:error, SQLError.refusal("unsupported column expression: #{col}")}
-    end
   end
 
   # An item with no alias is named by the engine; a name the double cannot write is refused,
@@ -539,9 +534,6 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
     distinct = ~r/(?i)^\s*(COUNT|SUM)\s*\(\s*DISTINCT\s+(.+?)(?<=\S)\s*\)\s*$/us
 
     cond do
-      error = time_aggregate_error(body) ->
-        {:error, error}
-
       Regex.match?(count_star, body) ->
         with {:ok, output} <- output_name(col, alias_name, fn -> "count(*)" end) do
           {:ok, {:count_star, output}}
@@ -652,101 +644,35 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
 
     # `DISTINCT +n` is the engine's `DISTINCT` of `+n`, which reads as the sum of a column
     # `distinct` and `n`: only `COUNT` and `SUM` take a `DISTINCT` (see `distinct_column/5`).
-    with [_full, func, expr_str] <- Regex.run(one_arg, body),
-         false <- Regex.match?(~r/\A\s*DISTINCT(?![\w$])/iu, expr_str),
-         {:ok, expr} <- SQLExpr.parse(expr_str),
-         agg = Map.fetch!(@plain_aggregates, String.downcase(func)),
-         :ok <- check_time_argument(agg, expr, col),
-         {:ok, output} <-
-           output_name(col, alias_name, fn ->
-             "#{String.downcase(func)}(#{SQLExpr.render(expr, qualifier, :drop)})"
-           end) do
-      {:ok, {:aggregate, agg, expr, output}}
-    else
-      {:error, %{status: 400}} = error -> error
-      {:error, _reason} -> {:error, SQLExpr.refusal("aggregate", col, call_argument(body))}
-      _no_match -> {:error, SQLError.refusal("invalid aggregate: #{col}")}
+    case Regex.run(one_arg, body) do
+      [_full, func, expr_str] ->
+        if Regex.match?(~r/\A\s*DISTINCT(?![\w$])/iu, expr_str),
+          do: {:error, SQLError.refusal("invalid aggregate: #{col}")},
+          else: parse_agg_expr(col, func, expr_str, alias_name, qualifier)
+
+      nil ->
+        {:error, SQLError.refusal("invalid aggregate: #{col}")}
     end
   end
 
-  # The text between the parentheses of a call.
-  @spec call_argument(binary()) :: binary()
-  defp call_argument(body) do
-    case Regex.run(~r/\((.+)\)\s*$/su, body) do
-      [_full, argument] -> argument
-      nil -> body
+  @spec parse_agg_expr(binary(), binary(), binary(), binary() | nil, binary() | nil) ::
+          {:ok, column()} | {:error, term()}
+  defp parse_agg_expr(col, func, expr_str, alias_name, qualifier) do
+    case SQLExpr.parse(expr_str) do
+      {:ok, expr} ->
+        agg = Map.fetch!(@plain_aggregates, String.downcase(func))
+
+        {:ok, output} =
+          output_name(col, alias_name, fn ->
+            "#{String.downcase(func)}(#{SQLExpr.render(expr, qualifier, :drop)})"
+          end)
+
+        {:ok, {:aggregate, agg, expr, output}}
+
+      {:error, _reason} ->
+        {:error, SQLExpr.refusal("aggregate", col, expr_str)}
     end
   end
-
-  # `time` is a Timestamp column. DataFusion computes MIN, MAX and COUNT over
-  # it but fails planning for AVG, SUM and the statistics, in the words
-  # `time_aggregate_error/1` reproduces. Arithmetic on it
-  # (`MAX(time - 1)`: "Cannot coerce arithmetic expression Timestamp(ns) -
-  # Int64 to valid types") is the executor's plan-time type check, in the
-  # engine's words.
-  @spec check_time_argument(aggregate(), SQLExpr.t(), binary()) :: :ok | {:error, term()}
-  defp check_time_argument(agg, {:field, "time"}, _col) when agg in [:min, :max, :count],
-    do: :ok
-
-  defp check_time_argument(_agg, expr, col) do
-    if expr == {:field, "time"} do
-      {:error,
-       SQLError.refusal(
-         "InfluxDB rejects this aggregate over `time` (Timestamp): only " <>
-           "MIN(time), MAX(time) and COUNT(time) are valid: #{col}"
-       )}
-    else
-      :ok
-    end
-  end
-
-  # The engine's planning error for `AVG(time)` and the like (verified, and
-  # the same with or without an alias). Each function words it its own way,
-  # and names itself canonically: `stddev_samp` is `stddev`, `var_samp` is
-  # `var`.
-  @spec time_aggregate_error(binary()) :: map() | nil
-  defp time_aggregate_error(col) do
-    with [_full, func] <-
-           Regex.run(~r/(?i)^\s*(#{@plain_alternation})\s*\(\s*time\s*\)/u, col),
-         agg when agg not in [:min, :max, :count] <-
-           Map.fetch!(@plain_aggregates, String.downcase(func)) do
-      name = Atom.to_string(agg)
-      call = "'#{name}(Timestamp(ns))'. You might need to add explicit type casts.\n\tCandidate "
-
-      %{
-        status: 400,
-        body:
-          "Error during planning: " <>
-            time_aggregate_head(agg, name) <>
-            call <> "functions:\n\t#{name}(#{time_aggregate_candidate(agg)})"
-      }
-    else
-      _no_error -> nil
-    end
-  end
-
-  @spec time_aggregate_head(aggregate(), binary()) :: binary()
-  defp time_aggregate_head(:avg, _name) do
-    "Execution error: Function 'avg' user-defined coercion failed with \"Error during " <>
-      "planning: Avg does not support inputs of type Timestamp(ns).\" No function matches " <>
-      "the given name and argument types "
-  end
-
-  defp time_aggregate_head(:sum, _name) do
-    "Execution error: Function 'sum' user-defined coercion failed with \"Execution error: " <>
-      "Sum not supported for Timestamp(ns)\" No function matches the given name and " <>
-      "argument types "
-  end
-
-  defp time_aggregate_head(_statistic, name) do
-    "Function '#{name}' expects NativeType::Numeric but received " <>
-      "NativeType::Timestamp(Nanosecond, None) No function matches the given name and " <>
-      "argument types "
-  end
-
-  @spec time_aggregate_candidate(aggregate()) :: binary()
-  defp time_aggregate_candidate(agg) when agg in [:avg, :sum], do: "UserDefined"
-  defp time_aggregate_candidate(_statistic), do: "Numeric(1)"
 
   # Parse: selector_first|last|min|max(field, time)[['value' | 'time']] [AS alias].
   # selector_first/last pick the row with the smallest/largest second

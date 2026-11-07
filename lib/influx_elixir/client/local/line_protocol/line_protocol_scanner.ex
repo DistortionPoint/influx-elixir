@@ -153,19 +153,17 @@ defmodule InfluxElixir.Client.Local.LineProtocolScanner do
 
   # InfluxDB 3 echoes the physical line with the error's number; the
   # `:line` field keeps the failing line itself, which InfluxDB 2 quotes.
+  # The last physical line has no newline to take a `\r` with it.
   @spec echoed_error(line_error(), tuple()) :: line_error()
   defp echoed_error(%{line_number: number} = error, physical) do
-    cond do
-      number < tuple_size(physical) ->
-        %{error | original_line: LineProtocolError.echo(elem(physical, number - 1))}
+    line = elem(physical, number - 1)
 
-      # The last physical line has no newline to take a `\r` with it.
-      number == tuple_size(physical) ->
-        %{error | original_line: LineProtocolError.cut(elem(physical, number - 1))}
+    echoed =
+      if number < tuple_size(physical),
+        do: LineProtocolError.echo(line),
+        else: LineProtocolError.cut(line)
 
-      true ->
-        error
-    end
+    %{error | original_line: echoed}
   end
 
   # A line of only spaces and tabs is blank, and a `#` after them starts a
@@ -218,8 +216,6 @@ defmodule InfluxElixir.Client.Local.LineProtocolScanner do
   end
 
   @spec split_from(binary(), non_neg_integer(), [binary()]) :: [binary()]
-  defp split_from(text, start, acc) when start > byte_size(text), do: Enum.reverse(acc)
-
   defp split_from(text, start, acc) do
     remaining = byte_size(text) - start
 

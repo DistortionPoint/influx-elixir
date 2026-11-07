@@ -1046,7 +1046,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   end
 
   defp engine_rank({:error, {:engine, _body}}), do: 1
-  defp engine_rank({:error, {:engine, _status, _body}}), do: 1
   defp engine_rank(_refusal), do: 0
 
   defp lexer_first?({:lexer, start, _error}, {pos, {:error, {:engine, _body}}}, whole),
@@ -1056,10 +1055,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
 
   defp lexer_error({:lexer, _start, error}), do: {0, error}
 
-  defp blanks?(whole, from, to) when to <= byte_size(whole),
+  defp blanks?(whole, from, to),
     do: binary_part(whole, from, to - from) =~ ~q/\A[ \t\r\n]*\z/
-
-  defp blanks?(_whole, _from, _to), do: false
 
   # `LIMIT` and `OFFSET` are unsigned 64-bit integers; a longer number is a
   # parse error at the end of its digits. One that fits but not the signed

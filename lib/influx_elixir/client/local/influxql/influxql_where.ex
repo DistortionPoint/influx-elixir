@@ -726,23 +726,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   # A minus sign before `time` is the planning error of `-1 * time` (verified), not the
   # SQL engine's broken connection.
-  defp negated_time([{:raw, "-"} | rest], previous)
+  defp negated_time([{:raw, "-"}, token | _more] = [_minus | rest], previous)
        when previous in [nil, "(", "+", "-", "*", "/", :op] do
-    case rest do
-      [token | _more] ->
-        if InfluxQLTokens.time?(token),
-          do:
-            throw(
-              {:refused,
-               {:engine, 400,
-                "Error during planning: Cannot coerce arithmetic expression " <>
-                  "Int64 * Timestamp(ns) to valid types"}}
-            ),
-          else: negated_time(rest, "-")
-
-      [] ->
-        :ok
-    end
+    if InfluxQLTokens.time?(token),
+      do:
+        throw(
+          {:refused,
+           {:engine, 400,
+            "Error during planning: Cannot coerce arithmetic expression " <>
+              "Int64 * Timestamp(ns) to valid types"}}
+        ),
+      else: negated_time(rest, "-")
   end
 
   defp negated_time([{:op, _op} | rest], _previous), do: negated_time(rest, :op)
