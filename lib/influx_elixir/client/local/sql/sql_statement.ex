@@ -228,9 +228,7 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
        when kind in [:word, :string, :quoted, :number] do
     case after_name do
       {:word, _printed, "AS", _line, _col} -> nil
-      {:eof, _printed, _upper, _line, _col} = token -> expected("AS", token)
-      {:symbol, ";", _upper, _line, _col} = token -> expected("AS", token)
-      {:symbol, _printed, _upper, _line, _col} -> nil
+      {:symbol, printed, _upper, _line, _col} when printed != ";" -> nil
       token -> expected("AS", token)
     end
   end
@@ -240,13 +238,10 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # What follows the one-token name of `MERGE [INTO] name`: nothing, where the parser wants
   # `USING`.
   @spec merged(SQLTokenizer.token(), SQLTokenizer.tokens()) :: SQLError.t() | nil
-  defp merged({kind, _p, _u, _l, _c}, [{:eof, _printed, _upper, _line, _col} = eof | _rest])
-       when kind in [:word, :quoted],
-       do: expected("USING", eof)
-
-  defp merged({kind, _p, _u, _l, _c}, [{:symbol, ";", _upper, _line, _col} = semi | _rest])
-       when kind in [:word, :quoted],
-       do: expected("USING", semi)
+  defp merged({kind, _p, _u, _l, _c}, [{next_kind, printed, _u2, _l2, _c2} = token | _rest])
+       when kind in [:word, :quoted] and
+              (next_kind == :eof or (next_kind == :symbol and printed == ";")),
+       do: expected("USING", token)
 
   defp merged(_name, _rest), do: nil
 
@@ -500,15 +495,11 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # a hexadecimal one as `X'<digits>'`.
   @spec number(binary()) :: {:ok, binary()} | nil
   defp number(<<c, _rest::binary>> = text) when c in ?0..?9 or c == ?. do
-    case Regex.match?(~r/\A\.\D|\A\.\z/, text) do
-      true ->
-        nil
-
-      false ->
-        case SQLIdentifiers.take_number(text) do
-          {"0x" <> digits, _rest} -> {:ok, "X'#{digits}'"}
-          {token, _rest} -> {:ok, token}
-        end
+    unless Regex.match?(~r/\A\.\D|\A\.\z/, text) do
+      case SQLIdentifiers.take_number(text) do
+        {"0x" <> digits, _rest} -> {:ok, "X'#{digits}'"}
+        {token, _rest} -> {:ok, token}
+      end
     end
   end
 

@@ -690,7 +690,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @doc "The column name the engine gives an expression: the names in it joined by `_`."
   @spec name(ast()) :: binary() | nil
   def name(ast) do
-    case ast |> names() |> Enum.reject(&is_nil/1) do
+    case names(ast) do
       [] -> nil
       [single] -> single
       names -> names |> Enum.map(&InfluxQLText.quoted_if_needed/1) |> Enum.join("_")
@@ -1094,14 +1094,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   def fold(ast, _types, _tags), do: ast
 
   defp incompatible(op, left, right) do
-    InfluxQLError.expand_error(
-      "incompatible operands for operator #{op}: #{type_name(left)} and #{type_name(right)}"
-    )
+    InfluxQLError.expand_error("incompatible operands for operator #{op}: #{left} and #{right}")
   end
 
-  defp type_name(type), do: Atom.to_string(type)
-
-  defp result(_op, {:unknown, _l}, {:unknown, _r}), do: {:unknown, false}
   defp result(_op, {:unknown, _l}, {type, _r}), do: {type, false}
   defp result(_op, {type, _l}, {:unknown, _r}), do: {type, false}
   defp result(_op, {:float, _l}, _right), do: {:float, false}
@@ -1155,7 +1150,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     do: value({:bin, "*", operand, {:lit, {:int, -1}}}, env, types)
 
   defp value({:bin, op, left, right}, env, types),
-    do: apply_op(op, value(left, env, types), value(right, env, types))
+    do: InfluxQLKernel.apply_op(op, value(left, env, types), value(right, env, types))
 
   # A string or a boolean has no value in arithmetic: the planner refuses such an expression
   # (`infer/3`) before any row is read, so this is a form the double has not seen.
@@ -1232,7 +1227,4 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   rescue
     ArithmeticError -> :nan
   end
-
-  @spec apply_op(binary(), value(), value()) :: value()
-  defp apply_op(op, left, right), do: InfluxQLKernel.apply_op(op, left, right)
 end

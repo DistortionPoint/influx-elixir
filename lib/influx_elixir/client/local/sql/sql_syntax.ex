@@ -759,14 +759,16 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # select has planned. The double plans the select without the clause (`SQLRewrite`) and
   # answers the refusal, for a plain top-level `SELECT`; any other `INTO` is refused by name.
   @spec into_verdict(tokens()) :: :ok | {:error, SQLError.t()}
-  defp into_verdict([{:word, _printed, "SELECT", _line, _col} | _rest]) do
-    if state(:into) == :plain and not state(:set_operation, false),
-      do: :ok,
-      else: {:error, SQLError.refusal("an INTO clause outside a plain SELECT")}
+  defp into_verdict(tokens) do
+    if match?([{:word, _printed, "SELECT", _line, _col} | _rest], tokens) and
+         state(:into) == :plain and not state(:set_operation, false),
+       do: :ok,
+       else: {:error, SQLError.refusal("an INTO clause outside a plain SELECT")}
   end
 
-  defp into_verdict(_tokens),
-    do: {:error, SQLError.refusal("an INTO clause outside a plain SELECT")}
+  defguardp is_statement_end(token)
+            when elem(token, 0) == :eof or
+                   (elem(token, 0) == :symbol and elem(token, 1) == ";")
 
   @spec refuse(binary()) :: :ok
   defp refuse(reason) do
@@ -831,8 +833,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # `UPDATE t SET` wants the column it assigns: a `;` or the end of the text is not one.
   defp dml_statement([{:word, _p, "UPDATE", _l, _c} | rest]) do
     case object_name(rest) do
-      [{:word, _q, "SET", _l2, _c2}, {kind, _r, _u, _l3, _c3} = token | _more]
-      when kind == :eof or (kind == :symbol and elem(token, 1) == ";") ->
+      [{:word, _q, "SET", _l2, _c2}, token | _more] when is_statement_end(token) ->
         {:error, parser_error("identifier", token)}
 
       _read ->
@@ -847,10 +848,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # What an `INSERT` inserts is a query: with the text ended there is none to read. (What
   # follows otherwise is read by the DML reader, with the rest of the statement.)
   @spec insert_source(tokens()) :: tokens()
-  defp insert_source([{:eof, _p, _u, _l, _c} | _rest] = tokens),
-    do: fail("SELECT, VALUES, or a subquery in the query body", tokens)
-
-  defp insert_source([{:symbol, _p, ";", _l, _c} | _rest] = tokens),
+  defp insert_source([token | _rest] = tokens) when is_statement_end(token),
     do: fail("SELECT, VALUES, or a subquery in the query body", tokens)
 
   defp insert_source(tokens), do: tokens
@@ -875,12 +873,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # `WHERE` wants an expression: with the statement ended there is none. (The expression
   # itself is read by the DML reader, which knows the engine's types.)
   @spec delete_where(tokens()) :: tokens()
-  defp delete_where([{:word, _p, "WHERE", _l, _c}, {:eof, _q, _u, _l2, _c2} | _rest] = tokens),
-    do: fail("an expression", tl(tokens))
-
-  defp delete_where(
-         [{:word, _p, "WHERE", _l, _c}, {:symbol, _q, ";", _l2, _c2} | _rest] = tokens
-       ),
+  defp delete_where([{:word, _p, "WHERE", _l, _c}, token | _rest] = tokens)
+       when is_statement_end(token),
        do: fail("an expression", tl(tokens))
 
   defp delete_where(tokens), do: tokens
@@ -1314,15 +1308,9 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp group_by([
          {:word, _p, "GROUP", _l, _c},
          {:word, _q, "BY", _l2, _c2},
-         {:word, _r, "ALL", _l3, _c3} | _rest
-       ]),
-       do: throw(:bail)
-
-  defp group_by([
-         {:word, _p, "GROUP", _l, _c},
-         {:word, _q, "BY", _l2, _c2},
-         {:word, _r, "GROUPING", _l3, _c3} | _rest
-       ]),
+         {:word, _r, word, _l3, _c3} | _rest
+       ])
+       when word in ["ALL", "GROUPING"],
        do: throw(:bail)
 
   defp group_by([{:word, _p, "GROUP", _l, _c}, {:word, _q, "BY", _l2, _c2} | rest]),
@@ -1407,10 +1395,9 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp fetch_quantity([{:word, _p, word, _l, _c} | _rest] = tokens) when word in ["ROW", "ROWS"],
     do: tokens
 
-  defp fetch_quantity([{kind, _p, _u, _l, _c} | rest]) when kind in [:number, :string, :literal],
-    do: rest
-
-  defp fetch_quantity([{:placeholder, _p, _u, _l, _c} | rest]), do: rest
+  defp fetch_quantity([{kind, _p, _u, _l, _c} | rest])
+       when kind in [:number, :string, :literal, :placeholder],
+       do: rest
 
   defp fetch_quantity([{:word, _p, word, _l, _c} | rest]) when word in ["TRUE", "FALSE", "NULL"],
     do: rest
@@ -1446,7 +1433,10 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   end
 
   # `parse_expr`, which is `parse_subexpr(0)`.
-  defp expression(tokens), do: counted(fn -> tokens |> operand() |> infix(0) end)
+  defp expression(tokens), do: subexpr(tokens, 0)
+
+  defp subexpr(tokens, precedence),
+    do: counted(fn -> tokens |> operand() |> infix(precedence) end)
 
   # What can start an expression.
   defp operand([{kind, _p, _u, _l, _c} | rest])
@@ -1456,7 +1446,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp operand([{:quoted, _p, _u, _l, _c} | _rest] = tokens), do: identifier(tokens)
 
   defp operand([{:symbol, _p, sign, _l, _c} | rest]) when sign in ["-", "+"],
-    do: counted(fn -> rest |> operand() |> infix(@unary_precedence) end)
+    do: subexpr(rest, @unary_precedence)
 
   defp operand([{:symbol, _p, "(", _l, _c} | rest]), do: parenthesized(rest)
   defp operand([{:word, _p, upper, _l, _c} | _rest] = tokens), do: word_operand(upper, tokens)
@@ -1606,7 +1596,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     do: rest |> expect_word("FROM") |> expression() |> close_paren()
 
   defp special_syntax("POSITION", args) do
-    counted(fn -> args |> operand() |> infix(@between_precedence) end)
+    args
+    |> subexpr(@between_precedence)
     |> expect_word("IN")
     |> expression()
     |> close_paren()
@@ -1715,8 +1706,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   end
 
   # `NOT` takes the operators that bind tighter than `AND`.
-  defp not_operand([_not | rest]),
-    do: counted(fn -> rest |> operand() |> infix(@not_precedence) end)
+  defp not_operand([_not | rest]), do: subexpr(rest, @not_precedence)
 
   defp case_expression([_case | rest]) do
     rest |> case_operand() |> case_branches() |> case_else() |> expect_word("END")
@@ -2093,20 +2083,10 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     do: fail("IN or BETWEEN after NOT", tokens)
 
   defp infix_step(
-         [
-           {:word, _p, "NOT", _l, _c},
-           {:word, _q, "SIMILAR", _l2, _c2},
-           {:word, _r, "TO", _l3, _c3} | _rest
-         ],
-         _precedence
+         [{:word, _p, "NOT", _l, _c} | [{:word, _q, "SIMILAR", _l2, _c2} | _more] = rest],
+         precedence
        ),
-       do: throw(:bail)
-
-  defp infix_step(
-         [{:word, _p, "NOT", _l, _c} | [{:word, _q, "SIMILAR", _l2, _c2} | _more] = tokens],
-         _precedence
-       ),
-       do: fail("IN or BETWEEN after NOT", tokens)
+       do: infix_step(rest, precedence)
 
   defp infix_step([{:word, _p, word, _l, _c} | _rest], _precedence)
        when word in ["COLLATE", "AT", "ISNULL", "NOTNULL", "ESCAPE", "NULL"],
@@ -2127,10 +2107,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp predicate(tokens, "BETWEEN", _precedence), do: between(tokens)
 
   defp predicate(tokens, _like, precedence),
-    do: tokens |> like_pattern(precedence) |> like_escape()
-
-  defp like_pattern(tokens, precedence),
-    do: counted(fn -> tokens |> operand() |> infix(precedence) end)
+    do: tokens |> subexpr(precedence) |> like_escape()
 
   defp like_escape([{:word, _p, "ESCAPE", _l, _c}, {:string, _q, _u, _l2, _c2} | rest]), do: rest
   defp like_escape(tokens), do: tokens
@@ -2189,6 +2166,5 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     tokens |> between_bound() |> expect_word("AND") |> between_bound()
   end
 
-  defp between_bound(tokens),
-    do: counted(fn -> tokens |> operand() |> infix(@between_precedence) end)
+  defp between_bound(tokens), do: subexpr(tokens, @between_precedence)
 end

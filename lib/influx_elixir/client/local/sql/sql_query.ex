@@ -130,12 +130,9 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     # and all; the text the lexer rewrote (dollar-quoted and escape strings) is read as
     # rewritten, by `SQLParser`.
     with :ok <- Scope.database_exists(table, database),
-         :ok <- written_syntax(original),
+         :ok <- SQLSyntax.check_statements(original),
          do: run_query(table, database, statement, params)
   end
-
-  @spec written_syntax(binary()) :: :ok | {:error, SQLError.t()}
-  defp written_syntax(original), do: SQLSyntax.check_statements(original)
 
   # `SELECT ... INTO name` plans the select and then fails to create the table.
   @spec into_or_rows([map()], binary()) :: {:ok, [map()]} | {:error, SQLError.t()}

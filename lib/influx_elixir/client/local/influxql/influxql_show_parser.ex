@@ -296,10 +296,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
       {word, to} when word in @kinds ->
         if keyword_end?(ctx, to), do: kind(ctx, at, word, to), else: error(@generic, at)
 
-      {_word, _to} ->
-        error(@generic, at)
-
-      nil ->
+      _other ->
         error(@generic, at)
     end
   end

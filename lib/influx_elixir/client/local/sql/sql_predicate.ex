@@ -337,19 +337,7 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   @spec expression_predicate(binary()) :: {:ok, clause()} | :nomatch
   defp expression_predicate(text) do
     case SQLExpr.parse_arithmetic(text) do
-      {:ok, {kind, _a} = expr} when kind == :neg ->
-        expression_clause(expr)
-
-      {:ok, {kind, _name, _args} = expr} when kind == :call ->
-        expression_clause(expr)
-
-      {:ok, {kind, _op, _left, _right} = expr} when kind == :op ->
-        expression_clause(expr)
-
-      {:ok, {kind, _operand, _whens, _otherwise} = expr} when kind == :case ->
-        expression_clause(expr)
-
-      {:ok, {kind, _left, _right} = expr} when kind == :concat ->
+      {:ok, expr} when elem(expr, 0) in [:neg, :call, :op, :case, :concat] ->
         expression_clause(expr)
 
       _other ->
@@ -655,10 +643,8 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
       SQLLiteral.literal?(left) and SQLLiteral.literal?(right) ->
         constant_comparison(op, left, right, trimmed)
 
-      SQLLiteral.param?(left) and (SQLLiteral.param?(right) or SQLLiteral.literal?(right)) ->
-        unsupported_where(trimmed, @placeholder_side)
-
-      SQLLiteral.literal?(left) and SQLLiteral.param?(right) ->
+      (SQLLiteral.param?(left) and (SQLLiteral.param?(right) or SQLLiteral.literal?(right))) or
+          (SQLLiteral.literal?(left) and SQLLiteral.param?(right)) ->
         unsupported_where(trimmed, @placeholder_side)
 
       SQLLiteral.literal?(left) or SQLLiteral.param?(left) ->

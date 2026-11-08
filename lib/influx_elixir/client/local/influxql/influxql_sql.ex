@@ -4,7 +4,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   # reads: a missing tag, a double-quoted identifier, a regular expression, a
   # duration next to `now()`.
 
-  alias InfluxElixir.Client.Local.InfluxQLRegex
+  alias InfluxElixir.Client.Local.{InfluxQLRegex, InfluxQLText}
 
   # A duration next to `now()` is an interval in whole seconds, the unit
   # the SQL engine's INTERVAL takes; a finer one is refused by name.
@@ -109,8 +109,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   defp token_sql({:str, content}), do: "'" <> content <> "'"
   defp token_sql({:op, op}), do: op
   defp token_sql({:raw, text}), do: text
-  defp token_sql({:number, "." <> _fraction = text}), do: "0" <> text
-  defp token_sql({:number, text}), do: text
+  defp token_sql({:number, text}), do: InfluxQLText.leading_zero(text)
   defp token_sql({:duration, ns, text}), do: duration_sql(ns, text)
 
   # Words the SQL the double hands on reads as keywords, though InfluxQL
