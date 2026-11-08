@@ -72,6 +72,7 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   @unclosed "unclosed counted repetition"
   @decimal_empty "repetition quantifier expects a valid decimal"
   @missing "repetition operator missing expression"
+  @incomplete_escape "incomplete escape sequence, reached end of pattern prematurely"
 
   @typep error :: {:error, non_neg_integer(), non_neg_integer(), binary()}
   @typep verdict :: :ok | {:unknown, binary()} | :differs | error()
@@ -368,10 +369,10 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
         ) ::
           verdict()
   defp escape([], at, _length, _groups, _cost),
-    do: {:error, at, at + 1, "incomplete escape sequence, reached end of pattern prematurely"}
+    do: {:error, at, at + 1, @incomplete_escape}
 
   defp escape([property | rest], at, length, groups, cost) when property in ["p", "P"] do
-    case unicode(property, rest, at, length) do
+    case unicode(rest, length) do
       {:ok, taken} ->
         scan(
           Enum.drop(rest, taken),
@@ -470,32 +471,26 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
 
   # `\p{Name}` or `\pL`: the property exists when it is a general category, which PCRE and the
   # crate read alike.
-  @spec unicode(binary(), [binary()], non_neg_integer(), non_neg_integer()) ::
+  @spec unicode([binary()], non_neg_integer()) ::
           {:ok, non_neg_integer()} | {:unknown, binary()} | error()
-  defp unicode(_kind, [], _at, length),
-    do:
-      {:error, length, length + 1,
-       "incomplete escape sequence, reached end of pattern prematurely"}
+  defp unicode([], length),
+    do: {:error, length, length + 1, @incomplete_escape}
 
-  defp unicode(kind, ["{" | rest], at, length) do
+  defp unicode(["{" | rest], length) do
     {name, tail} = Enum.split_while(rest, &(&1 != "}"))
 
     case tail do
-      [] ->
-        {:error, length, length + 1,
-         "incomplete escape sequence, reached end of pattern prematurely"}
-
-      ["}" | _more] ->
-        property(kind, name, at, Enum.count(name) + 2, @categories)
+      [] -> {:error, length, length + 1, @incomplete_escape}
+      ["}" | _more] -> property(name, Enum.count(name) + 2, @categories)
     end
   end
 
-  defp unicode(kind, [letter | _rest], at, _length),
-    do: property(kind, [letter], at, 1, @single)
+  defp unicode([letter | _rest], _length),
+    do: property([letter], 1, @single)
 
-  @spec property(binary(), [binary()], non_neg_integer(), pos_integer(), [binary()]) ::
-          {:ok, pos_integer()} | {:unknown, binary()} | error()
-  defp property(_kind, name, _at, taken, known) do
+  @spec property([binary()], pos_integer(), [binary()]) ::
+          {:ok, pos_integer()} | {:unknown, binary()}
+  defp property(name, taken, known) do
     if Enum.join(name) in known, do: {:ok, taken}, else: {:unknown, @property}
   end
 
@@ -605,7 +600,7 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
     do: class_items(rest, at + 2, taken + 2)
 
   defp class_items(["\\"], at, _taken),
-    do: {:error, at, at + 1, "incomplete escape sequence, reached end of pattern prematurely"}
+    do: {:error, at, at + 1, @incomplete_escape}
 
   defp class_items([_low, operator, operator | _rest], _at, _taken)
        when operator in ["&", "-", "~"],

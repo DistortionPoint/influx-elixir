@@ -466,14 +466,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # A minus is a sign, not a subtraction, at the start, after a comparison,
   # an opening parenthesis, a connective or another operator.
   @spec negated?(list()) :: boolean()
-  defp negated?([{:raw, "-"} | before]) do
-    case before do
-      [] -> true
-      [{:op, _op} | _more] -> true
-      [{:raw, word} | _more] -> String.upcase(word) in ["(", "AND", "OR", "+", "-", "*", "/"]
-      _operand -> false
-    end
-  end
+  defp negated?([{:raw, "-"} | before]), do: unary_sign?(before)
 
   # (A plus sign between is no relief: `- + 'x'` is the minus sign before the string.)
   defp negated?([{:raw, "+"} | before]), do: negated?(before)
@@ -633,14 +626,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   @spec take_regex(binary(), iodata()) :: {binary(), binary()}
   defp take_regex(<<?\\, ?/, rest::binary>>, acc), do: take_regex(rest, ["/" | acc])
   defp take_regex(<<?/, rest::binary>>, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), rest}
-  defp take_regex(<<c::utf8, rest::binary>>, acc), do: take_regex(rest, [<<c::utf8>> | acc])
   defp take_regex(<<c, rest::binary>>, acc), do: take_regex(rest, [<<c>> | acc])
   defp take_regex(<<>>, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), <<>>}
 
   @spec take_until(binary(), char(), iodata()) :: {binary(), binary()}
   defp take_until(<<?\\, c, rest::binary>>, q, acc), do: take_until(rest, q, [<<?\\, c>> | acc])
   defp take_until(<<q, rest::binary>>, q, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), rest}
-  defp take_until(<<c::utf8, rest::binary>>, q, acc), do: take_until(rest, q, [<<c::utf8>> | acc])
   defp take_until(<<c, rest::binary>>, q, acc), do: take_until(rest, q, [<<c>> | acc])
   defp take_until(<<>>, _q, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), <<>>}
 end

@@ -136,8 +136,8 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
           negative? = Enum.any?(literals, &(&1 < 0))
 
           case uncast(expr, literals, type_of) do
-            {:ok, _column, :uint64, _target} when negative? -> :unknown
-            {:ok, column, _type, _target} -> {:column, column}
+            {:ok, _column, :uint64} when negative? -> :unknown
+            {:ok, column, _type} -> {:column, column}
             :error -> :unknown
           end
       end
@@ -160,32 +160,26 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
   defp negative_cast(_op, _expr, _numbers, _type_of), do: :unknown
 
   # The column a cast of integer columns leaves when every cast goes: each
-  # one needs the literals to fit its type. The outermost cast's type is the
-  # one the engine names, and only a single cast is read that way.
+  # one needs the literals to fit its type.
   @spec uncast(SQLExpr.t(), [integer()], (binary() -> column_type() | nil)) ::
-          {:ok, binary(), column_type(), binary() | nil} | :error
-  defp uncast(expr, literals, type_of), do: uncast(expr, literals, type_of, nil, 0)
-
-  defp uncast({:cast, inner, type}, literals, type_of, target, depth) do
+          {:ok, binary(), column_type()} | :error
+  defp uncast({:cast, inner, type}, literals, type_of) do
     bits = SQLCast.bits(type)
 
     if bits != nil and Enum.all?(literals, &SQLCast.fits?(&1, bits)),
-      do: uncast(inner, literals, type_of, target || SQLCast.arrow_type(type), depth + 1),
+      do: uncast(inner, literals, type_of),
       else: :error
   end
 
-  defp uncast({kind, name}, _literals, type_of, target, depth)
+  defp uncast({kind, name}, _literals, type_of)
        when kind in [:field, :uint_col] and is_binary(name) do
     case type_of.(name) do
-      type when type in [:int64, :uint64] ->
-        {:ok, name, type, if(depth == 1, do: target)}
-
-      _other ->
-        :error
+      type when type in [:int64, :uint64] -> {:ok, name, type}
+      _other -> :error
     end
   end
 
-  defp uncast(_other, _literals, _type_of, _target, _depth), do: :error
+  defp uncast(_other, _literals, _type_of), do: :error
 
   # The integers a comparison sets its operand against, when it does so only
   # with integers.
@@ -196,15 +190,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
   defp integers(_op, _rhs), do: []
 
   @spec integers_in([term()]) :: [integer()]
-  defp integers_in(values) do
-    values =
-      Enum.map(values, fn
-        {:uint, n} -> n
-        other -> other
-      end)
-
-    if Enum.all?(values, &is_integer/1), do: values, else: []
-  end
+  defp integers_in(values), do: typed_values(values, &is_integer/1)
 
   # The numbers (integers or floats) of the comparison.
   @spec numbers(atom(), term()) :: [number()]
@@ -213,14 +199,17 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
   defp numbers(_op, _rhs), do: []
 
   @spec numbers_in([term()]) :: [number()]
-  defp numbers_in(values) do
+  defp numbers_in(values), do: typed_values(values, &is_number/1)
+
+  @spec typed_values([term()], (term() -> boolean())) :: [number()]
+  defp typed_values(values, pred) do
     values =
       Enum.map(values, fn
         {:uint, n} -> n
         other -> other
       end)
 
-    if Enum.all?(values, &is_number/1), do: values, else: []
+    if Enum.all?(values, pred), do: values, else: []
   end
 
   # ---------------------------------------------------------------------------

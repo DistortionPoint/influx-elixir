@@ -146,7 +146,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
             [dimension | acc],
             count + 1
           )
-          |> backtrack(ctx, after_blank, [dimension | acc], stop)
+          |> backtrack([dimension | acc], stop)
         else
           {:ok, Enum.reverse([dimension | acc]), stop}
         end
@@ -164,8 +164,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
   # A dimension after a comma that could not be read ends the list before the
   # comma: the comma is the first thing left over.
-  defp backtrack(:none, _ctx, _comma, acc, stop), do: {:ok, Enum.reverse(acc), stop}
-  defp backtrack(result, _ctx, _comma, _acc, _stop), do: result
+  defp backtrack(:none, acc, stop), do: {:ok, Enum.reverse(acc), stop}
+  defp backtrack(result, _acc, _stop), do: result
 
   @spec dimension(map(), non_neg_integer()) ::
           {:ok, term(), non_neg_integer()} | :none | {:error, term()}
@@ -510,10 +510,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
            rest
          ) do
       [word, keyword] when keyword != "" and byte_size(word) > 0 ->
-        case option_atom(String.downcase(keyword)) do
-          nil -> :error
-          fill -> {:ok, fill, byte_size(word)}
-        end
+        {:ok, option_atom(String.downcase(keyword)), byte_size(word)}
 
       [word, "", sign, number] ->
         number(sign, number, byte_size(word))
@@ -524,12 +521,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   end
 
   # The fill a keyword names, as a literal: an atom is never made from the statement's text.
-  @spec option_atom(binary()) :: :null | :none | :previous | :linear | nil
+  @spec option_atom(binary()) :: :null | :none | :previous | :linear
   defp option_atom("null"), do: :null
   defp option_atom("none"), do: :none
   defp option_atom("previous"), do: :previous
   defp option_atom("linear"), do: :linear
-  defp option_atom(_other), do: nil
 
   @spec number(binary(), binary(), non_neg_integer()) ::
           {:ok, InfluxQLBuckets.fill(), non_neg_integer()} | :error

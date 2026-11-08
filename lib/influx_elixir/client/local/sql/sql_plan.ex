@@ -194,25 +194,17 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
           []
       end
 
-    placeholder =
-      case Keyword.get(options, :placeholder) do
-        nil -> []
-        error -> [{:select, {:placeholder_check, error}}]
-      end
+    gates =
+      for {key, tag} <- [
+            placeholder: :placeholder_check,
+            limit: :limit_check,
+            ordinal: :ordinal_check
+          ],
+          error = Keyword.get(options, key),
+          error != nil,
+          do: {:select, {tag, error}}
 
-    limit =
-      case Keyword.get(options, :limit) do
-        nil -> []
-        error -> [{:select, {:limit_check, error}}]
-      end
-
-    ordinal =
-      case Keyword.get(options, :ordinal) do
-        nil -> []
-        error -> [{:select, {:ordinal_check, error}}]
-      end
-
-    group ++ placeholder ++ limit ++ ordinal
+    group ++ gates
   end
 
   # The predicate of a `WHERE` that is one expression or one column, which the planner makes
@@ -628,10 +620,11 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp item_fields({:expr_check, node}), do: node_fields(node)
 
   defp item_fields({:aggs, _aggs, item}), do: item_fields(item)
-  defp item_fields({:group_check, _check}), do: []
-  defp item_fields({:placeholder_check, _error}), do: []
-  defp item_fields({:limit_check, _error}), do: []
-  defp item_fields({:ordinal_check, _error}), do: []
+
+  defp item_fields({check, _arg})
+       when check in [:group_check, :placeholder_check, :limit_check, :ordinal_check],
+       do: []
+
   defp item_fields({:constant, _call, _ancestors}), do: []
   defp item_fields({:selector_check, _selector, field, ordering, _grouped}), do: [field, ordering]
 
@@ -1118,14 +1111,9 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp check_item({:case_cut, call}, :select, columns, memo),
     do: check_item(call, :select, columns, memo)
 
-  defp check_item({:case_cut, call}, context, columns, memo),
-    do: check_item({:cut, call}, context, columns, memo)
-
-  defp check_item({:lazy_cut, node}, context, columns, memo),
-    do: check_item({:cut, node}, context, columns, memo)
-
-  defp check_item({:null_cut, call}, context, columns, memo),
-    do: check_item({:cut, call}, context, columns, memo)
+  defp check_item({cut, node}, context, columns, memo)
+       when cut in [:case_cut, :lazy_cut, :null_cut],
+       do: check_item({:cut, node}, context, columns, memo)
 
   defp check_item({:constant, call, ancestors}, context, _columns, _memo),
     do: SQLConstantCall.check(call, ancestors, context)
@@ -1208,9 +1196,10 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   # The errors of the plan that are no expression's: the grouping, a placeholder with no
   # value, and a `HAVING` that is no boolean (its aggregates typed by their results).
   defp check_item({:group_check, check}, _context, _columns, _memo), do: check.()
-  defp check_item({:placeholder_check, error}, _context, _columns, _memo), do: {:error, error}
-  defp check_item({:limit_check, error}, _context, _columns, _memo), do: {:error, error}
-  defp check_item({:ordinal_check, error}, _context, _columns, _memo), do: {:error, error}
+
+  defp check_item({check, error}, _context, _columns, _memo)
+       when check in [:placeholder_check, :limit_check, :ordinal_check],
+       do: {:error, error}
 
   defp check_item({:filter, tree, names, measurement}, _context, columns, _memo),
     do: having_filter(tree, names, measurement, columns)
@@ -1295,18 +1284,11 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp check_where_item({:range, left, low, high}, _context, columns),
     do: check_range(left, low, high, columns)
 
-  defp check_where_item({:logical, tree}, _context, columns) do
-    case logical_type(tree, columns, :full) do
-      {:error, _reason} = error -> error
-      _type -> :ok
-    end
-  end
-
   # The errors of the operators and calls the planner types, and of the `AND`s and `OR`s
   # between them, in the order of the predicate, left to right (verified: `WHERE (1 AND 'a') OR
   # (n + 'a')` is the error of the `AND`, `WHERE (n + 'a') OR (1 AND 'a')` that of the sum).
-  defp check_where_item({:logical_ops, tree}, _context, columns) do
-    case logical_type(tree, columns, :planner) do
+  defp check_where_item({kind, tree}, _context, columns) when kind in [:logical, :logical_ops] do
+    case logical_type(tree, columns, if(kind == :logical, do: :full, else: :planner)) do
       {:error, _reason} = error -> error
       _type -> :ok
     end
@@ -1409,26 +1391,16 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
           %{binary() => binary()},
           SQLTyped.t()
         ) :: :ok | {:error, map()}
-  defp check_arithmetic(op, left, right, :select, columns, memo) do
-    # The planner types the operands as they are written; the type coercion types them again
-    # once they are coerced, and its errors are the wrapped ones.
+  # The planner types the operands as they are written; the type coercion types them again
+  # once they are coerced, and its errors are the wrapped ones.
+  defp check_arithmetic(op, left, right, context, columns, memo)
+       when context in [:select, :where] do
     {left_coerced, left_planned} = SQLExprType.pair(left, columns, memo)
     {right_coerced, right_planned} = SQLExprType.pair(right, columns, memo)
     planned = {left_planned, right_planned}
     coerced = {left_coerced, right_coerced}
 
-    with :ok <- arithmetic_error(op, planned, :select),
-         do: if(planned == coerced, do: :ok, else: arithmetic_error(op, coerced, :where))
-  end
-
-  # A `WHERE` types the operands of an operator the planner types as they are written first.
-  defp check_arithmetic(op, left, right, :where, columns, memo) do
-    {left_coerced, left_planned} = SQLExprType.pair(left, columns, memo)
-    {right_coerced, right_planned} = SQLExprType.pair(right, columns, memo)
-    planned = {left_planned, right_planned}
-    coerced = {left_coerced, right_coerced}
-
-    with :ok <- arithmetic_error(op, planned, :where),
+    with :ok <- arithmetic_error(op, planned, context),
          do: if(planned == coerced, do: :ok, else: arithmetic_error(op, coerced, :where))
   end
 
@@ -1482,12 +1454,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
          )}
 
       {"Timestamp(ns)", "Timestamp(ns)"} ->
-        planning_error(
-          "Cannot get result type for temporal operation Timestamp(ns) #{SQLExpr.symbol(op)} " <>
-            "Timestamp(ns): Invalid argument error: Invalid timestamp arithmetic operation: " <>
-            "Timestamp(ns) #{SQLExpr.symbol(op)} Timestamp(ns)",
-          context
-        )
+        null_operand(op, "Timestamp(ns)", context)
 
       {left_type, right_type}
       when is_binary(left_type) and is_binary(right_type) and

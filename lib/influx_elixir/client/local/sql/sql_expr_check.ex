@@ -59,21 +59,14 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   """
   @spec check(SQLExpr.t(), %{binary() => binary()}, context(), SQLTyped.t()) ::
           :ok | {:error, map()}
-  def check(node, columns, :select, known)
-      when elem(node, 0) in @planned or
-             (elem(node, 0) == :call and
-                elem(node, 1) in [:coalesce, :nullif]) do
-    with :ok <- check_node(node, {columns, known, :plan}, :select),
-         do: check_node(node, {columns, known, :coerced}, :where)
-  end
-
-  # A `WHERE` types the same operators by the types as written first (its errors are the
-  # coercion's whatever pass finds them).
-  def check(node, columns, :where, known)
-      when elem(node, 0) in @planned or
-             (elem(node, 0) == :call and
-                elem(node, 1) in [:coalesce, :nullif]) do
-    with :ok <- check_node(node, {columns, known, :plan}, :where),
+  # `SELECT` and `WHERE` type the planned operators by the types as written first (the
+  # coercion's errors are wrapped).
+  def check(node, columns, context, known)
+      when context in [:select, :where] and
+             (elem(node, 0) in @planned or
+                (elem(node, 0) == :call and
+                   elem(node, 1) in [:coalesce, :nullif])) do
+    with :ok <- check_node(node, {columns, known, :plan}, context),
          do: check_node(node, {columns, known, :coerced}, :where)
   end
 
@@ -135,7 +128,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   @spec check_logical(:and | :or, SQLExpr.t(), SQLExpr.t(), scope(), context()) ::
           :ok | {:error, map()}
   defp check_logical(kind, left, right, columns, context) do
-    case {logical_type(left, columns), logical_type(right, columns)} do
+    case {raw_type(left, columns), raw_type(right, columns)} do
       {l, r} when is_binary(l) and is_binary(r) and (l not in @logical or r not in @logical) ->
         planner(
           "Cannot infer common argument type for logical boolean operation #{l} #{word(kind)} #{r}",
@@ -350,7 +343,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   @spec check_concat(SQLExpr.t(), SQLExpr.t(), scope(), context()) ::
           :ok | {:error, map()}
   defp check_concat(left, right, columns, context) do
-    case {concat_type(left, columns), concat_type(right, columns)} do
+    case {raw_type(left, columns), raw_type(right, columns)} do
       {l, r} when is_binary(l) and is_binary(r) ->
         cond do
           not concatenable?(l, r) ->
@@ -385,10 +378,6 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   @spec plain_text?(binary()) :: boolean()
   defp plain_text?(type), do: type in ["Utf8", "Utf8View", "LargeUtf8"]
 
-  # The type of a `||` operand, where the engine types the null as `Null`.
-  @spec concat_type(SQLExpr.t(), scope()) :: SQLExprType.type()
-  defp concat_type(expr, columns), do: raw_type(expr, columns)
-
   @spec concat_error(binary(), binary(), context()) :: {:error, map()}
   defp concat_error(left, right, context) do
     planner(
@@ -420,10 +409,6 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   @spec raw_type(SQLExpr.t(), scope()) :: SQLExprType.type()
   defp raw_type(expr, {columns, known, phase}),
     do: SQLExprType.type_of(expr, columns, known, phase)
-
-  # The type of an operand of `AND` or `OR`, where the engine types the null as `Null`.
-  @spec logical_type(SQLExpr.t(), scope()) :: SQLExprType.type()
-  defp logical_type(expr, columns), do: raw_type(expr, columns)
 
   @spec text?(binary()) :: boolean()
   defp text?(type), do: type in ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"]
