@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.64] - 2026-11-09
+
 ### Fixed
 - **`Client.Local.InfluxQLPlan` falsely rejected plain field expressions and math calls beside a lone selector (`SELECT max(v), abs(v) FROM m`, `SELECT -v, percentile(v, 50) FROM m`) and skipped negated function calls over a lone selector.**
   `InfluxQLPlan.lone_selector_expression/2` previously inspected the first `{:expr, ast, alias}` item in the select list regardless of whether that expression contained the selector, causing queries like `SELECT max(v), abs(v) FROM m` and `SELECT -v, percentile(v, 50) FROM m` to fail with `"unsupported InfluxQL (a function over a selector in that shape)"` or `"unsupported InfluxQL (arithmetic on percentile())"`. It now checks only expression items that contain an aggregate (`InfluxQLExpr.aggregates(ast) != []`), allowing plain field expressions and math calls after a lone selector to execute with full engine fidelity, and `selector_in/2` now recurses through `{:neg, operand}` so negated function calls over a lone selector (`SELECT -abs(max(v)) FROM m`) produce the engine's `"unexpected selector function"` error.
