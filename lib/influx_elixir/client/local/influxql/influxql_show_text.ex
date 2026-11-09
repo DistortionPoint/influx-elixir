@@ -59,7 +59,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
 
   @doc "The position after the blanks that start at `at`."
   @spec skip_ws(ctx(), non_neg_integer()) :: non_neg_integer()
-  def skip_ws(ctx, at), do: if(ws?(ctx, at), do: skip_ws(ctx, at + 1), else: at)
+  def skip_ws(ctx, at), do: InfluxQLLex.skip_blanks(ctx.masked, at)
 
   @doc """
   The word at `at` (letters, digits, underscore) in lower case, and where it

@@ -198,11 +198,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowCondition do
         case Text.name_at(ctx, Text.skip_ws(ctx, at + 1)) do
           {:ok, name, after_name} -> key_names_more(ctx, after_name, [name | acc], spec)
           {:error, _reason} = error -> error
-          :none -> Text.error("invalid identifier list, expected ')'", to)
+          :none -> expected_close(to)
         end
 
       _other ->
-        Text.error("invalid identifier list, expected ')'", to)
+        expected_close(to)
     end
   end
+
+  defp expected_close(to), do: Text.error("invalid identifier list, expected ')'", to)
 end

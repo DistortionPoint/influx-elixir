@@ -125,7 +125,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
   defp glued(whole, at, masked_rest) do
     count = first_glue(@count_glue, masked_rest)
     where = first_glue(@where_glue, masked_rest)
-    lead = lead_glue(masked_rest)
+    lead = first_glue(@lead_glue, masked_rest)
 
     by =
       Enum.find_value(Regex.scan(@by_glue, masked_rest, return: :index), fn
@@ -141,18 +141,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
     ]
   end
 
-  @spec lead_glue(binary()) :: non_neg_integer() | nil
-  defp lead_glue(masked_rest) do
-    case Regex.run(@lead_glue, masked_rest, return: :index) do
-      [_all, {from, _size}] -> from
-      nil -> nil
-    end
-  end
-
   @spec first_glue(Regex.t(), binary()) :: non_neg_integer() | nil
   defp first_glue(regex, masked_rest) do
     case Regex.run(regex, masked_rest, return: :index) do
-      [{from, _size}] -> from
+      match when is_list(match) -> match |> List.last() |> elem(0)
       nil -> nil
     end
   end
@@ -163,9 +155,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
     by_at = char_at - 2
 
     cond do
-      group? and operator? -> InfluxQLCheck.fail(:nom, at + from, whole)
-      group? -> InfluxQLCheck.fail(:group_by, at + by_at, whole)
-      operator? -> nil
+      group? and not operator? -> InfluxQLCheck.fail(:group_by, at + by_at, whole)
+      not group? and operator? -> nil
       true -> InfluxQLCheck.fail(:nom, at + from, whole)
     end
   end

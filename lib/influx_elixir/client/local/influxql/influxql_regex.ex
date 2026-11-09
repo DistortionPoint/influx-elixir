@@ -88,7 +88,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
     do: unescape(rest, [<<c>> | acc])
 
   defp unescape(<<?\\, c::utf8, rest::binary>>, acc), do: unescape(rest, [<<?\\, c::utf8>> | acc])
-  defp unescape(<<c::utf8, rest::binary>>, acc), do: unescape(rest, [<<c::utf8>> | acc])
   defp unescape(<<c, rest::binary>>, acc), do: unescape(rest, [<<c>> | acc])
 
   # The first group the crate cannot read, left to right, outside character
@@ -111,11 +110,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
   defp scan(["(", "?", "<", c | _rest], index, 0, regex) when c in ["=", "!"],
     do: group_error(regex, index, 4, @look_around)
 
-  defp scan(["(", "?", c | rest], index, 0, regex) when c in ["#", "(", "|"],
-    do: scan_refuse(rest, index, c, regex)
+  defp scan(["(", "?", c | _rest], _index, 0, _regex) when c in ["#", "(", "|"],
+    do: scan_refuse(c)
 
-  defp scan(["(", "?", "P", "=" | rest], index, 0, regex),
-    do: scan_refuse(rest, index, "P=", regex)
+  defp scan(["(", "?", "P", "=" | _rest], _index, 0, _regex),
+    do: scan_refuse("P=")
 
   defp scan(["(", "?", c | rest], index, 0, regex) when c not in @not_flags do
     check_flags([c | rest], index + 2, [], "", regex)
@@ -160,7 +159,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
   defp check_flags([_other | _rest], at, _seen, _last, regex),
     do: group_error(regex, at, 1, "unrecognized flag")
 
-  defp scan_refuse(_rest, _index, group, _regex),
+  defp scan_refuse(group),
     do: throw({:refused, "unsupported InfluxQL (the regular expression group (?#{group})"})
 
   @spec unworded_flags() :: no_return()

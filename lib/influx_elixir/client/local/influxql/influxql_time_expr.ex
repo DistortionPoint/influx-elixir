@@ -61,9 +61,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeExpr do
   @spec unary(list(), integer()) :: {value(), list()}
   defp unary([{:raw, "-"} | rest], now) do
     case unary(rest, now) do
-      {{:dur, n}, after_term} -> {{:dur, -n}, after_term}
-      {{:int, n}, after_term} -> {{:int, -n}, after_term}
       {{:ts, _ns, _now?}, _rest} -> refuse("an instant negated")
+      {{kind, n}, after_term} -> {{kind, -n}, after_term}
     end
   end
 

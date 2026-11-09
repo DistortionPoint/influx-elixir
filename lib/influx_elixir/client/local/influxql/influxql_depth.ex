@@ -252,11 +252,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLDepth do
         {cost, rest} = expression(rest, above + paren, 1, costs, false)
         {paren + cost, close(rest)}
 
-      <<quote, rest::binary>> when quote in [?', ?"] ->
+      <<quote, rest::binary>> when quote in [?', ?", ?/] ->
         {0, after_quote(rest, quote)}
-
-      <<?/, rest::binary>> ->
-        {0, after_quote(rest, ?/)}
 
       <<c, _rest::binary>> = text when c in [?), ?,] ->
         {0, text}

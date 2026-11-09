@@ -485,7 +485,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   end
 
   defp plan_flat(tokens, {tags, types} = ctx, times, time?) do
-    check_coercion(tokens, tags, types, times.alone)
+    InfluxQLWhereArith.check_coercion(tokens, tags, types)
 
     cond do
       # Arithmetic of the time that comes to a null (`n + b + time + 1`: the planner reads
@@ -531,12 +531,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     present? = fn name -> InfluxQLTokens.time?({:ident, name}) or MapSet.member?(known, name) end
     InfluxQLTokens.lacking(tokens, present?) != []
   end
-
-  # An unsigned number under arithmetic with a string, a boolean, a tag or the time is the
-  # planner's coercion error.
-  @spec check_coercion(list(), MapSet.t(binary()), map(), boolean()) :: :ok
-  defp check_coercion(tokens, tags, types, alone),
-    do: InfluxQLWhereArith.check_coercion(tokens, tags, types, alone)
 
   # A comparison of a condition with a bare operand, planned for the error the planner raises
   # at it (see `late_clash`). A comparison the double refuses is found among the connectives'

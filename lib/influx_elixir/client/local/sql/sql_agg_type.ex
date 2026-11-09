@@ -101,8 +101,9 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
 
   @spec result(SQLSelect.column(), %{binary() => binary()}, SQLExprType.phase()) ::
           binary() | nil
-  defp result({:count_star, _name}, _columns, _phase), do: "Int64"
-  defp result({:count_distinct, _column, _name}, _columns, _phase), do: "Int64"
+  defp result(column, _columns, _phase)
+       when elem(column, 0) in [:count_star, :count_distinct],
+       do: "Int64"
 
   defp result({:aggregate, agg, _expr, _name}, _columns, _phase)
        when agg in [:count, :count_distinct],
@@ -163,10 +164,13 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   # The expression an aggregate reads.
   @spec argument(SQLSelect.column()) :: [SQLExpr.t()]
   defp argument({:aggregate, _agg, expr, _name}), do: [expr]
-  defp argument({:count_distinct, column, _name}), do: [{:field, column}]
-  defp argument({:ordered_aggregate, _end, field, _ordering, _name}), do: [{:field, field}]
-  defp argument({:selector, _selector, field, _ordering, _kind, _name}), do: [{:field, field}]
-  defp argument({:grouping_column, source, _name}), do: [{:field, source}]
+
+  defp argument({kind, column, _name}) when kind in [:count_distinct, :grouping_column],
+    do: [{:field, column}]
+
+  defp argument(column) when elem(column, 0) in [:ordered_aggregate, :selector],
+    do: [{:field, elem(column, 2)}]
+
   defp argument({:expression, _expr, aggs, _name}), do: arguments(aggs)
   defp argument(_other), do: []
 end

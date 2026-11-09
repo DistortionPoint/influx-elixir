@@ -154,9 +154,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   # parentheses and arithmetic too): an ordering of them keeps no point.
   defp clash?(_op, :tag, :tag), do: true
 
-  defp clash?(op, left, right) when op in ["<", "<=", ">", ">="] and left == right,
-    do: group(left) in [:text, :boolean]
-
   defp clash?(op, left, right) when op in ["<", "<=", ">", ">="],
     do: group(left) != group(right) or group(left) in [:text, :boolean]
 
@@ -417,8 +414,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
   does beside a boolean, and as one with text does beside anything else. Only a division has
   such an error, so a comparison with none is not read again. `:ok` when nothing is wrong.
   """
-  @spec check_coercion(list(), MapSet.t(binary()), map(), boolean()) :: :ok
-  def check_coercion(tokens, tags, types, _alone) do
+  @spec check_coercion(list(), MapSet.t(binary()), map()) :: :ok
+  def check_coercion(tokens, tags, types) do
     ctx = {tags, types}
 
     case if(InfluxQLTokens.time_comparison?(tokens), do: :error, else: sides(tokens)) do

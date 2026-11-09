@@ -127,10 +127,7 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
 
   defp fails_on?({:cast, _inner, :string}, _points), do: false
 
-  defp fails_on?({:cast, _inner, _type} = expr, points),
-    do: any_value?(expr, points, &(&1 == :error))
-
-  defp fails_on?({:call, _function, _args} = expr, points),
+  defp fails_on?(expr, points) when is_tuple(expr) and elem(expr, 0) in [:cast, :call],
     do: any_value?(expr, points, &(&1 == :error))
 
   defp fails_on?(_other, _points), do: false
@@ -195,10 +192,7 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
 
   @spec can_fail?(SQLExpr.t()) :: boolean()
   defp can_fail?({:op, op, _left, _right}), do: op in [:/, :rem]
-  defp can_fail?({:call, _function, _args}), do: true
-  defp can_fail?({:neg, _inner}), do: true
-  defp can_fail?({:cast, _inner, _type}), do: true
-  defp can_fail?(_other), do: false
+  defp can_fail?(expr), do: is_tuple(expr) and elem(expr, 0) in [:call, :neg, :cast]
 
   # The refusal for a query whose outcome the engine's two storage states
   # settle differently.

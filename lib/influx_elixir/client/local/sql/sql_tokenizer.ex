@@ -234,14 +234,8 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   defp tokenize(<<"/*", rest::binary>>, line, col, acc),
     do: block_comment(rest, 1, line, col + 2, acc)
 
-  defp tokenize(<<?', rest::binary>> = text, line, col, acc),
-    do: quoted(text, rest, ?', :string, line, col, acc)
-
-  defp tokenize(<<?", rest::binary>> = text, line, col, acc),
-    do: quoted(text, rest, ?", :quoted, line, col, acc)
-
-  defp tokenize(<<?`, rest::binary>> = text, line, col, acc),
-    do: quoted(text, rest, ?`, :quoted, line, col, acc)
+  defp tokenize(<<mark, rest::binary>> = text, line, col, acc) when mark in [?', ?", ?`],
+    do: quoted(text, rest, mark, if(mark == ?', do: :string, else: :quoted), line, col, acc)
 
   defp tokenize(<<c::utf8, _rest::binary>> = text, line, col, acc) do
     cond do

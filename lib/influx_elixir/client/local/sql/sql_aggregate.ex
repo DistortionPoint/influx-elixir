@@ -86,8 +86,9 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp aggregate?(column), do: elem(column, 0) not in [:grouping_column, :constant, :time_bucket]
 
   @spec safe_beside_literal?(SQLSelect.column()) :: boolean()
-  defp safe_beside_literal?({:count_star, _alias}), do: true
-  defp safe_beside_literal?({:count_distinct, _column, _alias}), do: true
+  defp safe_beside_literal?(column)
+       when elem(column, 0) in [:count_star, :count_distinct],
+       do: true
 
   defp safe_beside_literal?({:aggregate, agg, _expr, _alias}),
     do: agg in [:count, :count_distinct, :avg, :median]
@@ -239,8 +240,9 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   # The sum starts from the type's zero, so the sum of `-0.0` is `0.0`
   # (verified).
   @spec zero(SQLNumber.t()) :: SQLNumber.t()
-  defp zero(value) when is_integer(value), do: 0
-  defp zero({:int, _bits, _value}), do: 0
+  defp zero(value) when is_integer(value) or (is_tuple(value) and elem(value, 0) == :int),
+    do: 0
+
   defp zero({:u, _value}), do: {:u, 0}
   defp zero({:dec, _coefficient, scale}), do: {:dec, 0, scale}
   defp zero(_float), do: 0.0

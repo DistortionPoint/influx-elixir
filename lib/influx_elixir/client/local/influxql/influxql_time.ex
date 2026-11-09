@@ -136,14 +136,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   end
 
   @spec offset(binary()) :: integer()
-  defp offset(<<sign, h::binary-size(2), ":", m::binary-size(2)>>), do: offset(sign, h, m)
-  defp offset(<<sign, h::binary-size(2), m::binary-size(2)>>), do: offset(sign, h, m)
-  defp offset(_utc), do: 0
-
-  defp offset(sign, h, m) do
-    seconds = String.to_integer(h) * 3600 + String.to_integer(m) * 60
+  defp offset(<<sign, h::binary-size(2), rest::binary>>) when sign in [?+, ?-] do
+    minutes = rest |> String.trim_leading(":") |> String.to_integer()
+    seconds = String.to_integer(h) * 3600 + minutes * 60
     if sign == ?-, do: -seconds, else: seconds
   end
+
+  defp offset(_utc), do: 0
 
   # An offset of 24 hours or more, or of 60 minutes, is no time zone.
   @spec zone_valid?(binary()) :: boolean()

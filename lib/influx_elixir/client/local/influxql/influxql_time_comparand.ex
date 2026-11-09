@@ -169,7 +169,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
 
   # A number is clear when it is one integer; one behind a sign is not verified.
   @impl InfluxQLWalk
-  def number(text, 1, _o), do: {:ok, %Part{text: text, clear: Regex.match?(~r/\A\d+\z/, text)}}
+  def number(text, 1, _o), do: {:ok, %Part{text: text, clear: integer_text?(text)}}
   def number(_text, -1, _o), do: {:ok, %Part{text: "?"}}
 
   @impl InfluxQLWalk
@@ -197,10 +197,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
   end
 
   # (A string or a duration is a time or another error of the planner's, its text unverified.)
-  def leaf([{kind, _value} | rest], _o) when kind in [:str, :param, :regex],
-    do: {:ok, %Part{text: "?"}, rest}
+  def leaf([token | rest], _o)
+      when is_tuple(token) and elem(token, 0) in [:str, :param, :regex, :duration],
+      do: {:ok, %Part{text: "?"}, rest}
 
-  def leaf([{:duration, _total, _text} | rest], _o), do: {:ok, %Part{text: "?"}, rest}
   def leaf(_tokens, _o), do: :unread
 
   # An expression that holds an error is that error, with the expression it is in.
@@ -210,10 +210,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
     clear = left.clear and right.clear
 
     case left.error || right.error do
-      nil -> {:ok, %Part{text: text, clear: clear}}
-      :unclear -> {:ok, %Part{text: text, error: :unclear, clear: clear}}
-      error when clear -> {:ok, %Part{text: text, error: invalid(text, error), clear: clear}}
-      _unwordable -> {:ok, %Part{text: text, error: :unclear, clear: clear}}
+      nil ->
+        {:ok, %Part{text: text, clear: clear}}
+
+      error when is_binary(error) and clear ->
+        {:ok, %Part{text: text, error: invalid(text, error), clear: clear}}
+
+      _unclear ->
+        {:ok, %Part{text: text, error: :unclear, clear: clear}}
     end
   end
 
