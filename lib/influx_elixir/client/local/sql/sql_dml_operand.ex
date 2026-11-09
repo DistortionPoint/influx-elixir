@@ -528,14 +528,12 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   @spec pair_sibling(SQLDmlExpr.ast(), SQLDmlExpr.ast() | :param_beside, binary()) ::
           [{SQLDmlExpr.ast(), binary()}]
   defp pair_sibling(left, :param_beside, op), do: if(is_param(left), do: [], else: [{left, op}])
+  defp pair_sibling(left, right, op), do: Enum.map(param_peer(left, right), &{&1, op})
 
-  defp pair_sibling(left, right, op) do
-    cond do
-      is_param(left) and not is_param(right) -> [{right, op}]
-      is_param(right) and not is_param(left) -> [{left, op}]
-      true -> []
-    end
-  end
+  @spec param_peer(SQLDmlExpr.ast(), SQLDmlExpr.ast()) :: [SQLDmlExpr.ast()]
+  defp param_peer(param, other) when is_param(param) and not is_param(other), do: [other]
+  defp param_peer(other, param) when is_param(param) and not is_param(other), do: [other]
+  defp param_peer(_left, _right), do: []
 
   @spec beside_all([{SQLDmlExpr.ast(), binary()}], ctx(), boolean()) :: check()
   defp beside_all(siblings, ctx, cast?) do
@@ -584,11 +582,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   defp reachable({:ref, parts}, ctx), do: typed_name(parts, ctx)
   defp reachable({:is, _inner, what, _negated}, _ctx) when not is_tuple(what), do: :ok
-  defp reachable({:cast, _inner, _type, _try}, _ctx), do: :ok
-  defp reachable({:not, _inner}, _ctx), do: :ok
-  defp reachable({:in, _inner, _items, _negated}, _ctx), do: :ok
-  defp reachable({:between, _inner, _low, _high, _negated}, _ctx), do: :ok
-  defp reachable({:like, _inner, _pattern, _negated, _word, _escape}, _ctx), do: :ok
+  defp reachable(node, _ctx) when elem(node, 0) in [:cast, :not, :in, :between, :like], do: :ok
   defp reachable(node, ctx), do: reachable(SQLDmlExpr.children(node), ctx)
 
   @doc """
@@ -790,14 +784,13 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   @spec predicate_type(SQLDmlExpr.ast(), ctx()) :: check()
   defp predicate_type({:bin, op, _left, _right}, _ctx) when op in @comparisons, do: :ok
-  defp predicate_type({:not, _inner}, _ctx), do: :ok
-  defp predicate_type({:is, _inner, _what, _negated}, _ctx), do: :ok
-  defp predicate_type({:in, _inner, _items, _negated}, _ctx), do: :ok
-  defp predicate_type({:between, _inner, _low, _high, _negated}, _ctx), do: :ok
-  defp predicate_type({:like, _inner, _pattern, _negated, _word, _escape}, _ctx), do: :ok
-  defp predicate_type({:bool, _value}, _ctx), do: :ok
-  defp predicate_type(:null, _ctx), do: :ok
-  defp predicate_type({:param, _text}, _ctx), do: :ok
+
+  defp predicate_type(node, _ctx)
+       when node == :null or
+              (is_tuple(node) and
+                 elem(node, 0) in [:not, :is, :in, :between, :like, :bool, :param]),
+       do: :ok
+
   defp predicate_type({:call, name, _args}, _ctx) when name in @boolean_functions, do: :ok
   defp predicate_type({:ordered, _call, _terms} = call, ctx), do: untyped(call, ctx)
 
@@ -1026,11 +1019,10 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   functions, not through what `deep/2` reaches.
   """
   @spec plan_top(SQLDmlExpr.ast(), ctx()) :: check()
-  def plan_top({:num, _text}, _ctx), do: :ok
-  def plan_top({:str, _body}, _ctx), do: :ok
-  def plan_top({:bool, _value}, _ctx), do: :ok
-  def plan_top(:null, _ctx), do: :ok
-  def plan_top({:param, _text}, _ctx), do: :ok
+  def plan_top(node, _ctx)
+      when node == :null or (is_tuple(node) and elem(node, 0) in [:num, :str, :bool, :param]),
+      do: :ok
+
   def plan_top({:ref, parts}, ctx), do: typed_name(parts, ctx)
 
   def plan_top(operand, ctx) do
@@ -1155,20 +1147,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   # The operands a placeholder beside them takes its type from.
   @spec inferred_from(SQLDmlExpr.ast()) :: [SQLDmlExpr.ast()]
-  defp inferred_from({:bin, _op, param, other}) when is_param(param) and not is_param(other),
-    do: [other]
-
-  defp inferred_from({:bin, _op, other, param}) when is_param(param) and not is_param(other),
-    do: [other]
-
-  defp inferred_from({:is, param, {:distinct, other}, _negated})
-       when is_param(param) and not is_param(other),
-       do: [other]
-
-  defp inferred_from({:is, other, {:distinct, param}, _negated})
-       when is_param(param) and not is_param(other),
-       do: [other]
-
+  defp inferred_from({:bin, _op, left, right}), do: param_peer(left, right)
+  defp inferred_from({:is, left, {:distinct, right}, _negated}), do: param_peer(left, right)
   defp inferred_from(node), do: node |> SQLDmlExpr.children() |> Enum.flat_map(&inferred_from/1)
 
   @spec plan_text(SQLDmlExpr.ast(), ctx(), ([SQLDmlExpr.name()] -> binary())) :: check()
@@ -1217,10 +1197,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     {{:is, inner, {:distinct, other}, negated}, operands}
   end
 
-  defp lower({kind, _a} = node, ctx) when kind == :not, do: {@bool_dummy, calls(node, ctx)}
-  defp lower({:in, _a, _b, _c} = node, ctx), do: {@bool_dummy, calls(node, ctx)}
-  defp lower({:between, _a, _b, _c, _d} = node, ctx), do: {@bool_dummy, calls(node, ctx)}
-  defp lower({:like, _a, _b, _c, _d, _e} = node, ctx), do: {@bool_dummy, calls(node, ctx)}
+  defp lower(node, ctx) when elem(node, 0) in [:not, :in, :between, :like],
+    do: {@bool_dummy, calls(node, ctx)}
 
   # The planner types a cast as its type, and what it casts only when it builds the projection;
   # a `TRY_CAST` never types what it casts (only its names are read).
@@ -1336,10 +1314,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   # Whether a cast to such a type sits where the planner types it through an operator.
   @spec exotic_nested?(SQLDmlExpr.ast(), boolean()) :: boolean()
   defp exotic_nested?({:cast, _inner, type, _try}, root?), do: not root? and exotic?(type)
-  defp exotic_nested?({:not, _inner}, _root?), do: false
-  defp exotic_nested?({:in, _a, _b, _c}, _root?), do: false
-  defp exotic_nested?({:between, _a, _b, _c, _d}, _root?), do: false
-  defp exotic_nested?({:like, _a, _b, _c, _d, _e}, _root?), do: false
+  defp exotic_nested?(node, _root?) when elem(node, 0) in [:not, :in, :between, :like], do: false
   defp exotic_nested?({:is, _a, what, _c}, _root?) when not is_tuple(what), do: false
 
   defp exotic_nested?(node, _root?),
@@ -1393,11 +1368,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp type_of({:param, _text}, _ctx), do: :null
   defp type_of({:ref, parts}, ctx), do: column_type(ctx.types[parts |> List.last() |> elem(0)])
   defp type_of({:bin, op, _left, _right}, _ctx) when op in @comparisons, do: :bool
-  defp type_of({kind, _inner}, _ctx) when kind == :not, do: :bool
-  defp type_of({:is, _a, _b, _c}, _ctx), do: :bool
-  defp type_of({:in, _a, _b, _c}, _ctx), do: :bool
-  defp type_of({:between, _a, _b, _c, _d}, _ctx), do: :bool
-  defp type_of({:like, _a, _b, _c, _d, _e}, _ctx), do: :bool
+
+  defp type_of(node, _ctx)
+       when is_tuple(node) and elem(node, 0) in [:not, :is, :in, :between, :like],
+       do: :bool
+
   defp type_of({sign, inner}, ctx) when sign in [:neg, :pos], do: type_of(inner, ctx)
   defp type_of({:bin, "||", _left, _right}, _ctx), do: :str
 
@@ -1466,8 +1441,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     end
   end
 
-  defp call_type("length", _args, _ctx), do: :int
-  defp call_type("count", _args, _ctx), do: :int
+  defp call_type(name, _args, _ctx) when name in ["length", "count"], do: :int
   defp call_type(name, _args, _ctx) when name in @boolean_functions, do: :bool
   defp call_type(name, _args, _ctx) when name in @float_functions, do: :float
   defp call_type(name, _args, _ctx) when name in @text_functions, do: :str

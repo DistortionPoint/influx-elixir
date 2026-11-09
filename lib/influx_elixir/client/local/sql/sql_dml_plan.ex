@@ -8,7 +8,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlPlan do
   # 'simplify_expressions' failed`: a constant it cannot fold) is not an error of the statement,
   # which it refuses before it optimizes, so that error is let by here.
 
-  alias InfluxElixir.Client.Local.{SQLParser, SQLPlan, SQLSyntax, SQLTyping}
+  alias InfluxElixir.Client.Local.{SQLDmlName, SQLParser, SQLPlan, SQLSyntax, SQLTyping}
 
   @uinteger_kind "iox::column_type::field::uinteger"
 
@@ -55,7 +55,5 @@ defmodule InfluxElixir.Client.Local.SQLDmlPlan do
 
   @spec from(binary() | nil) :: binary()
   defp from(nil), do: ""
-
-  defp from(measurement),
-    do: " FROM " <> ~s|"| <> String.replace(measurement, ~s|"|, ~s|""|) <> ~s|"|
+  defp from(measurement), do: " FROM " <> SQLDmlName.quote_always(measurement)
 end

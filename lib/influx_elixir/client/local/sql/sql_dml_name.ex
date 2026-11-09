@@ -37,13 +37,14 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
 
   def reference(_tokens), do: {:refuse, "that spelling"}
 
+  @doc false
   @spec part(atom(), binary()) :: binary()
-  defp part(:word, printed), do: String.downcase(printed)
+  def part(:word, printed), do: String.downcase(printed)
 
-  defp part(:quoted, printed),
+  def part(:quoted, printed),
     do: printed |> String.slice(1..-2//1) |> String.replace("\"\"", "\"")
 
-  defp part(:string, printed), do: printed |> String.slice(1..-2//1) |> String.replace("''", "'")
+  def part(:string, printed), do: printed |> String.slice(1..-2//1) |> String.replace("''", "'")
 
   @doc """
   The table a statement names (verified against InfluxDB 3 Core, the same for `INSERT`, `UPDATE`
@@ -157,8 +158,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
     longest > 0 and edit_distance(left, right) * 2 <= longest
   end
 
+  @doc false
   @spec edit_distance(binary(), binary()) :: non_neg_integer()
-  defp edit_distance(left, right) do
+  def edit_distance(left, right) do
     initial = Enum.to_list(0..String.length(right))
 
     left

@@ -223,7 +223,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
 
   defp named({:expr, ast, _alias}, index, written, schema) do
     cond do
-      time_ref?(ast) -> entry(:time, :time_expr, "time", index, written)
+      time_expr?(ast) -> entry(:time, :time_expr, "time", index, written)
       constant?(ast, schema) -> entry(:field, :constant, nil, index, written)
       true -> entry(:field, :expr, nil, index, written)
     end
@@ -253,9 +253,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
   # string or a boolean. It is a column of every row that is kept, and keeps none.
   defp constant?(ast, %{types: types, tags: tags}),
     do: match?({:bool, _value}, InfluxQLExpr.fold(ast, types, tags))
-
-  defp time_ref?({:ref, name}), do: String.downcase(name) == "time"
-  defp time_ref?(_ast), do: false
 
   defp starred(source, schema),
     do: entry(source_role(source, schema), :star, source, 0, source)
@@ -445,5 +442,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
 
   @doc "Whether an expression is the `time` column in parentheses (a column of its own)."
   @spec time_expr?(InfluxQLExpr.ast()) :: boolean()
-  def time_expr?(ast), do: time_ref?(ast)
+  def time_expr?({:ref, name}), do: String.downcase(name) == "time"
+  def time_expr?(_ast), do: false
 end

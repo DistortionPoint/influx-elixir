@@ -22,9 +22,6 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   }
 
   @text "Coercion(TypeSignatureClass::Native(LogicalType(Native(String), String)))"
-  @internal_tail "\nThis issue was likely caused by a bug in DataFusion's code. Please help us " <>
-                   "to resolve this by filing a bug report in our issue tracker: " <>
-                   "https://github.com/apache/datafusion/issues"
   @log_candidates [
     "log(Coercion(TypeSignatureClass::Decimal))",
     "log(Coercion(TypeSignatureClass::Float, implicit_coercion=ImplicitCoercion([Numeric], default_type=Float64))",
@@ -193,21 +190,15 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   end
 
   @spec text_problem(atom(), [binary()]) :: problem()
-  defp text_problem(name, types) when name in [:lower, :upper] do
-    if length(types) != 1 do
-      {:planning, "Function '#{name}' expects 1 arguments but received #{length(types)}",
-       Atom.to_string(name), text_candidate(name)}
-    else
-      text_arguments(name, types)
-    end
-  end
+  defp text_problem(name, types) when name in [:lower, :upper, :starts_with] do
+    expected = if name == :starts_with, do: 2, else: 1
 
-  defp text_problem(:starts_with, types) do
-    if length(types) == 2,
-      do: text_arguments(:starts_with, types),
+    if length(types) == expected,
+      do: text_arguments(name, types),
       else:
-        {:planning, "Function 'starts_with' expects 2 arguments but received #{length(types)}",
-         "starts_with", text_candidate(:starts_with)}
+        {:planning,
+         "Function '#{name}' expects #{expected} arguments but received #{length(types)}",
+         Atom.to_string(name), text_candidate(name)}
   end
 
   # `left` and `right` take anything cast to text and an integer of 64 bits or fewer.
@@ -518,21 +509,20 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
     case context do
       :select -> SQLError.planning(head <> tail)
       :where -> SQLError.coercion(head <> tail)
-      cut -> cut(kind, head, cut)
+      _cut -> cut(kind, head)
     end
   end
 
   @spec word(:planning | :matching | :internal | :execution, binary()) :: binary()
-  defp word(:planning, head), do: head
-  defp word(:matching, head), do: head
-  defp word(:internal, head), do: "Internal error: " <> head <> @internal_tail
+  defp word(kind, head) when kind in [:planning, :matching], do: head
+  defp word(:internal, head), do: "Internal error: " <> head <> "\n" <> @bug
   defp word(:execution, head), do: "Execution error: " <> head
 
   # Under a `CAST`, an `ORDER BY` and the like the message is its first
   # sentence: a planning error keeps the planner's prefix, the others are a 500.
-  @spec cut(:planning | :matching | :internal | :execution, binary(), context()) :: map()
-  defp cut(:planning, head, _context), do: SQLError.coercion(head)
+  @spec cut(:planning | :matching | :internal | :execution, binary()) :: map()
+  defp cut(:planning, head), do: SQLError.coercion(head)
 
-  defp cut(_kind, head, _context),
+  defp cut(_kind, head),
     do: %{status: 500, body: "type_coercion\ncaused by\n" <> head}
 end

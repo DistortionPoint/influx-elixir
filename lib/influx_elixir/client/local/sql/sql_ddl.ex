@@ -83,9 +83,8 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
 
   # `MSCK [REPAIR] TABLE name`.
   @spec msck([SQLTokenizer.token()]) :: SQLError.t() | nil
-  defp msck([{:word, _p, "REPAIR", _l, _c}, {:word, _p2, "TABLE", _l2, _c2}, end_token | _rest]) do
-    if end_of?(end_token), do: expected("identifier", end_token)
-  end
+  defp msck([{:word, _p, "REPAIR", _l, _c} | [{:word, _p2, "TABLE", _l2, _c2} | _more] = rest]),
+    do: msck(rest)
 
   defp msck([{:word, _p, "REPAIR", _l, _c}, end_token | _rest]) do
     if end_of?(end_token), do: expected("TABLE", end_token)
@@ -182,11 +181,7 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
 
   # A kind with no name is `Expected: identifier`; with one the double words it itself.
   @spec bare_name([SQLTokenizer.token()]) :: SQLError.t() | nil
-  defp bare_name([end_token]) do
-    if end_of?(end_token), do: expected("identifier", end_token)
-  end
-
-  defp bare_name([end_token, _eof]) do
+  defp bare_name([end_token | _rest]) do
     if end_of?(end_token), do: expected("identifier", end_token)
   end
 
@@ -312,8 +307,7 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
   defp cascade_end?(tokens) do
     case {cascade(tokens), tokens} do
       {{:ok, _option, rest}, _tokens} -> cascade_end?(rest)
-      {:none, [token]} -> end_of?(token)
-      {:none, [token, {:eof, _p, _u, _l, _c}]} -> end_of?(token)
+      {:none, [token | _rest]} -> end_of?(token)
       {:none, _tokens} -> false
     end
   end

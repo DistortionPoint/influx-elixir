@@ -14,6 +14,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     LineProtocolParser,
     SQLAggExpr,
     SQLClauses,
+    SQLDmlName,
     SQLError,
     SQLExpr,
     SQLInformation,
@@ -267,7 +268,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
         do: fields,
         else: valid_fields(clause, written_with_relation?, output_name?, fields, query, listed)
 
-    printed = printed(ref, query.qualified)
+    printed = written_name(ref, query.qualified)
 
     case suggestion(clause, ref, query, listed) do
       {:refuse, why} ->
@@ -391,27 +392,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @spec close?(binary(), binary(), {pos_integer(), pos_integer()}) :: boolean()
   defp close?(left, right, {numerator, denominator}) do
     longest = max(String.length(left), String.length(right))
-    longest > 0 and edit_distance(left, right) * denominator <= longest * numerator
-  end
-
-  @spec edit_distance(binary(), binary()) :: non_neg_integer()
-  defp edit_distance(left, right) do
-    initial = Enum.to_list(0..String.length(right))
-
-    left
-    |> String.graphemes()
-    |> Enum.with_index(1)
-    |> Enum.reduce(initial, fn {a, row}, previous ->
-      right
-      |> String.graphemes()
-      |> Enum.zip(Enum.zip(previous, tl(previous)))
-      |> Enum.reduce([row], fn {b, {diagonal, above}}, [left_cell | _older] = acc ->
-        cost = if a == b, do: 0, else: 1
-        [min(min(above + 1, left_cell + 1), diagonal + cost) | acc]
-      end)
-      |> Enum.reverse()
-    end)
-    |> List.last()
+    longest > 0 and SQLDmlName.edit_distance(left, right) * denominator <= longest * numerator
   end
 
   @spec relation_field?(binary()) :: boolean()
@@ -513,11 +494,6 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
           Enum.join(known)
     }
   end
-
-  # The name as the query wrote it: a column written with its relation
-  # (`t.nosuch`) is named with it.
-  @spec printed(SQLExpr.column_ref(), %{binary() => binary()}) :: binary()
-  defp printed(ref, qualified), do: written_name(ref, qualified)
 
   @doc "The name of a column as the query wrote it: with its relation when it had one."
   @spec written_name(SQLExpr.column_ref(), %{binary() => binary()}) :: binary()
@@ -835,8 +811,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @doc "The columns an expression reads."
   @spec expr_fields(term()) :: [SQLExpr.column_ref()]
   def expr_fields({:expr, expr}), do: expr_fields(expr)
-  def expr_fields({:field, name}), do: [name]
-  def expr_fields({:uint_col, name}), do: [name]
+  def expr_fields({kind, name}) when kind in [:field, :uint_col], do: [name]
   def expr_fields(items) when is_list(items), do: Enum.flat_map(items, &expr_fields/1)
   def expr_fields(expr), do: Enum.flat_map(SQLExpr.children(expr), &expr_fields/1)
 

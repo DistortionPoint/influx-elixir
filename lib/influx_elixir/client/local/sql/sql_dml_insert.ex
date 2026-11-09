@@ -164,18 +164,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
 
   @spec listed([token()], [{binary(), boolean()}]) ::
           {:ok, [{binary(), boolean()}], [token()]} | {:error, SQLError.t()}
-  defp listed([{:word, printed, _u, _l, _c} | rest], found),
-    do: listed_next(rest, [{String.downcase(printed), false} | found])
-
-  defp listed([{:quoted, printed, _u, _l, _c} | rest], found) do
-    name = printed |> String.slice(1..-2//1) |> String.replace("\"\"", "\"")
-    listed_next(rest, [{name, true} | found])
-  end
-
-  defp listed([{:string, printed, _u, _l, _c} | rest], found) do
-    name = printed |> String.slice(1..-2//1) |> String.replace("''", "'")
-    listed_next(rest, [{name, true} | found])
-  end
+  defp listed([{kind, printed, _u, _l, _c} | rest], found)
+       when kind in [:word, :quoted, :string],
+       do: listed_next(rest, [{SQLDmlName.part(kind, printed), kind != :word} | found])
 
   defp listed([token | _rest], _found), do: {:error, SQLDdl.expected("identifier", token)}
 

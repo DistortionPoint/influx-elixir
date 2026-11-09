@@ -54,20 +54,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   @types ~w(float integer unsigned string boolean field tag)
   @param ~r/\A\$[\w"]/
   @param_token ~r/\A\$(?:\w+|"[^"]*"?)/
-  @no_operand ~w(# @ { } [ ] \\ ~ ` ; : ? % & | ^ < > = ! . $)
+  @no_operand ~w(# @ { } [ ] \\ ~ ` ; : ? % & | ^ < > = ! . $ , \) \f \v)
 
   @doc """
   Reads the arguments of the call whose `(` stands at `open_at` in `text`: `{:ok, stop}` where
   the `)` ends, or where the parser fails.
   """
   @spec read(binary(), non_neg_integer()) :: result()
-  def read(text, open_at) do
-    case arguments(text, open_at + 1, :where) do
-      {:ok, stop} -> {:ok, stop}
-      {:fail, at} -> {:fail, at}
-      _no_operand_or_unknown -> :unknown
-    end
-  end
+  def read(text, open_at), do: call(text, open_at, :where)
 
   @doc """
   Whether `text` (one item of a select list, masked) is an expression the engine's parser
@@ -294,8 +288,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   defp signed_operand(text, sign_at, mode) do
     case operand(text, InfluxQLLex.skip_blanks(text, sign_at + 1), mode) do
       {:ok, stop} -> {:ok, stop}
-      {:none, _at} -> {:soft, sign_at}
-      {:soft, _at} -> {:soft, sign_at}
+      {kind, _at} when kind in [:none, :soft] -> {:soft, sign_at}
       other -> other
     end
   end
@@ -320,14 +313,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   defp classify_symbol(symbol) when symbol in ["'", "\""], do: :string
   defp classify_symbol("("), do: :group
   defp classify_symbol("*"), do: :star
-  defp classify_symbol(symbol) when symbol in [",", ")", "\f", "\v"], do: :none
   # A character that starts no operand (verified for each: the parser fails where the operand
   # should start, or at the comma before it), a non-ASCII byte too.
   defp classify_symbol(<<byte>>) when byte >= 0x80, do: :none
   defp classify_symbol(symbol) when symbol in @no_operand, do: :none
   defp classify_symbol(_other), do: :other
 
-  defp primary(:end, _text, at, _rest, _mode), do: {:none, at}
+  defp primary(kind, _text, at, _rest, _mode) when kind in [:end, :none], do: {:none, at}
 
   # A bind parameter (`$a`, `$1`, `$"a b"`) is an operand.
   defp primary(:param, _text, at, rest, _mode) do
@@ -335,7 +327,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
     {:ok, at + byte_size(param)}
   end
 
-  defp primary(:none, _text, at, _rest, _mode), do: {:none, at}
   defp primary(:other, _text, _at, _rest, _mode), do: :unknown
 
   defp primary(:number, _text, at, rest, _mode) do

@@ -729,8 +729,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
 
   # The precedence of the operator the tokens begin with, and which it is.
   @spec operator([token()]) :: :none | {non_neg_integer(), term()} | {:refuse, SQLDml.reason()}
-  defp operator([{:word, _p, "OR", _l, _c} | _rest]), do: {5, :or}
-  defp operator([{:word, _p, "AND", _l, _c} | _rest]), do: {10, :and}
+  defp operator([{:word, _p, "OR", _l, _c} | _rest]), do: {5, {:bin, "OR"}}
+  defp operator([{:word, _p, "AND", _l, _c} | _rest]), do: {10, {:bin, "AND"}}
   defp operator([{:word, _p, "IS", _l, _c} | _rest]), do: {17, :is}
   defp operator([{:word, _p, "IN", _l, _c} | _rest]), do: {20, {:in, false}}
   defp operator([{:word, _p, "BETWEEN", _l, _c} | _rest]), do: {20, {:between, false}}
@@ -781,11 +781,6 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp operator(_tokens), do: :none
 
   @spec apply_infix(term(), ast(), [token()], non_neg_integer()) :: parsed(ast())
-  defp apply_infix(:or, left, [_or | rest], precedence), do: binary("OR", left, rest, precedence)
-
-  defp apply_infix(:and, left, [_and | rest], precedence),
-    do: binary("AND", left, rest, precedence)
-
   defp apply_infix({:bin, op}, left, [_op | rest], precedence),
     do: binary(op, left, rest, precedence)
 
@@ -919,22 +914,15 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
 
   defp prefix([{:literal, _printed, _u, _l, _c} | rest]), do: {:ok, {:str, "x"}, rest}
   # A placeholder has the type of what stands beside it, or none, as the null has none.
-  defp prefix([{:placeholder, "$" <> name = text, _u, _l, _c} | rest])
-       when name != "" and binary_part(name, 0, 1) == "0" do
-    if Regex.match?(~r/\A0+\z/, name),
-      do: {:ok, {:zero_param, text}, rest},
-      else: {:ok, {:param, text}, rest}
+  defp prefix([{:placeholder, "$" <> name = text, _u, _l, _c} | rest]) when name != "" do
+    kind = if Regex.match?(~r/\A0+\z/, name), do: :zero_param, else: :param
+    {:ok, {kind, text}, rest}
   end
-
-  defp prefix([{:placeholder, "$" <> name = text, _u, _l, _c} | rest]) when name != "",
-    do: {:ok, {:param, text}, rest}
 
   defp prefix([{:placeholder, _p, _u, _l, _c} | _rest]), do: {:refuse, "a placeholder"}
 
   defp prefix([{:word, _p, "CURRENT_TIMESTAMP", _l, _c} | rest]),
     do: {:ok, {:call, "current_timestamp", []}, rest}
-
-  defp prefix([{:quoted, _p, _u, _l, _c} | _rest] = tokens), do: reference(tokens)
 
   defp prefix([{:word, _p, "TRUE", _l, _c} | rest]), do: {:ok, {:bool, true}, rest}
   defp prefix([{:word, _p, "FALSE", _l, _c} | rest]), do: {:ok, {:bool, false}, rest}
@@ -972,7 +960,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp prefix([{:word, _p, upper, _l, _c} | _rest]) when upper in @refused_words,
     do: {:refuse, "#{String.downcase(upper)} in an operand"}
 
-  defp prefix([{:word, _p, _upper, _l, _c} | _rest] = tokens), do: reference(tokens)
+  defp prefix([{kind, _p, _upper, _l, _c} | _rest] = tokens) when kind in [:word, :quoted],
+    do: reference(tokens)
 
   defp prefix([{:symbol, sign, _u, _l, _c} | rest]) when sign in ["-", "+"] do
     with {:ok, inner, rest} <- subexpr(rest, 40),
@@ -1116,10 +1105,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
     {String.trim(dir <> " " <> nulls), rest}
   end
 
-  defp direction_words(rest) do
-    {nulls, rest} = nulls_words(rest)
-    {nulls, rest}
-  end
+  defp direction_words(rest), do: nulls_words(rest)
 
   @spec nulls_words([token()]) :: {binary(), [token()]}
   defp nulls_words([{:word, _p, "NULLS", _l, _c}, {:word, _p2, nulls, _l2, _c2} | rest])

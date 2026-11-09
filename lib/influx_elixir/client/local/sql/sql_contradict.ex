@@ -678,7 +678,6 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   # A column is the same operand however it is written (`n`, `m.n`).
   @spec operand_key(operand()) :: term()
   defp operand_key({:expr, {:field, name}}) when is_binary(name), do: name
-  defp operand_key({:expr, expr}), do: {:expr, expr}
   defp operand_key(column), do: column
 
   # ---------------------------------------------------------------------------
@@ -787,8 +786,7 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   defp key(:u64, text) when is_binary(text),
     do: integer_text(text, 0, SQLLimits.uint64_max(), :u64)
 
-  defp key(:f64, value) when is_integer(value), do: {:f64, value * 1.0}
-  defp key(:f64, value) when is_float(value), do: {:f64, value}
+  defp key(:f64, value) when is_number(value), do: {:f64, value * 1.0}
   defp key(:f64, text) when is_binary(text), do: {:text, text}
 
   defp key(:text, text) when is_binary(text), do: {:text, text}

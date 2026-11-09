@@ -253,7 +253,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
     @behaviour InfluxElixir.Client.Local.InfluxQLWalk
 
-    alias InfluxElixir.Client.Local.InfluxQLArithType
+    alias InfluxElixir.Client.Local.{InfluxQLArithType, InfluxQLText}
 
     @impl true
     def number(text, sign, _opts) do
@@ -274,12 +274,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     defp constant_number(text) do
       case Integer.parse(text) do
         {n, ""} -> n
-        _fraction -> text |> number_text() |> String.to_float()
+        _fraction -> text |> InfluxQLText.leading_zero() |> String.to_float()
       end
     end
-
-    defp number_text("." <> _fraction = text), do: "0" <> text
-    defp number_text(text), do: text
   end
 
   defp signed_kind(sign, {:number, text}) do
@@ -311,8 +308,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
           :plain | :check | :wrap | :refuse | {:unsigned, non_neg_integer()}
   defp decide(_type, :expression), do: :refuse
   defp decide(:integer, {:integer, n}) when n > SQLLimits.int64_max(), do: :wrap
-  defp decide(:integer, kind) when kind == :float or is_tuple(kind), do: :plain
-  defp decide(:float, kind) when kind == :float or is_tuple(kind), do: :plain
+
+  defp decide(type, kind) when type in [:integer, :float] and (kind == :float or is_tuple(kind)),
+    do: :plain
 
   defp decide(:unsigned, {:integer, n}) when n == SQLLimits.int64_min(),
     do: :refuse
@@ -324,10 +322,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp decide(:unsigned, :float), do: :check
   defp decide(:unsigned, :string), do: :refuse
   defp decide(:boolean, :boolean), do: :plain
-  defp decide(:string, :string), do: :plain
-  defp decide(:string, {:integer, n}) when n > SQLLimits.int64_max(), do: :refuse
-  defp decide(:tag, {:integer, n}) when n > SQLLimits.int64_max(), do: :refuse
-  defp decide(:tag, :string), do: :plain
+  defp decide(type, :string) when type in [:string, :tag], do: :plain
+
+  defp decide(type, {:integer, n}) when type in [:string, :tag] and n > SQLLimits.int64_max(),
+    do: :refuse
 
   # An integer field against an unsigned literal `n` (verified): a
   # non-negative value is itself, a negative one `2^64 + value - 1`, and the
