@@ -205,8 +205,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
   end
 
   # A `)` that closes nothing ends the condition, and so does a `,` outside every parenthesis.
-  defp read(<<?), _rest::binary>>, _at, _masked, %{stack: []} = state), do: state
-  defp read(<<?,, _rest::binary>>, _at, _masked, %{stack: []} = state), do: state
+  defp read(<<c, _rest::binary>>, _at, _masked, %{stack: []} = state) when c in [?), ?,],
+    do: state
 
   defp read(<<?(, _rest::binary>>, at, masked, state) do
     call? = match?({:word, _text}, state.prev)
@@ -286,12 +286,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLParens do
   end
 
   # A condition inside a group makes the group one (not through the arguments of a call).
-  defp pass_condition(state, _stack, false), do: state
-  defp pass_condition(state, [], true), do: state
-  defp pass_condition(state, [%{call?: true} | _outer], true), do: state
-
-  defp pass_condition(state, [outer | stack], true),
+  defp pass_condition(state, [%{call?: false} = outer | stack], true),
     do: %{state | stack: [%{outer | condition?: true} | stack]}
+
+  defp pass_condition(state, _stack, _condition?), do: state
 
   defp comparison(state, text) do
     state

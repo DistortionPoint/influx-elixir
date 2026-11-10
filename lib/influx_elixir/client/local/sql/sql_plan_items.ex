@@ -202,8 +202,8 @@ defmodule InfluxElixir.Client.Local.SQLPlanItems do
   defp plan_predicate_items({:op, _op, left, right} = op, state),
     do: [plan_items(left, state), plan_items(right, state), mark(op, state)]
 
-  defp plan_predicate_items({:neg, inner} = neg, state), do: [plan_items(inner, state), neg]
-  defp plan_predicate_items({:pos, inner} = pos, state), do: [plan_items(inner, state), pos]
+  defp plan_predicate_items({kind, inner} = unary, state) when kind in [:neg, :pos],
+    do: [plan_items(inner, state), unary]
 
   defp plan_predicate_items({:field, name}, _state) when is_binary(name),
     do: if(SQLAggExpr.placeholder?(name), do: [{:agg_ref, name}], else: [])

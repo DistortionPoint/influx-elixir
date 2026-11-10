@@ -102,8 +102,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlType do
     do: {:ok, {:decimal, decimal}, rest}
 
   defp base("FLOAT8", rest), do: {:ok, double(), rest}
-  defp base(real, rest) when real in ["REAL", "FLOAT4"], do: floating(real, rest)
-  defp base("FLOAT", rest), do: floating("FLOAT", rest)
+  defp base(real, rest) when real in ["REAL", "FLOAT4", "FLOAT"], do: floating(real, rest)
 
   defp base("DOUBLE", rest) do
     case rest do

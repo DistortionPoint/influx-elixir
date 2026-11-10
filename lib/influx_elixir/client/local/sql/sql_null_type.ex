@@ -45,8 +45,7 @@ defmodule InfluxElixir.Client.Local.SQLNullType do
     Enum.any?(projected ++ ordered, &misuse?(&1, true)) or
       misuse?(query.where, false) or
       misuse?(query.select_columns, false) or
-      misuse?(query.having, false) or
-      Enum.any?(ordered, &misuse?(&1, true))
+      misuse?(query.having, false)
   end
 
   @spec misuse?(term(), boolean()) :: boolean()

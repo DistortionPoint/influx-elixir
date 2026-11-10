@@ -764,22 +764,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
       {:null, _side} ->
         if erased_by_null?(quotient), do: {:ok, null_of(other)}, else: {:ok, quotient}
 
-      {:unsigned, :left} when op == "/" and other.kind in [:string, :tag] ->
-        {:ok, pending(:division, pending_body(quotient), derived_kind(quotient, other))}
-
-      {:unsigned, :left} ->
+      {:unsigned, :left} when not (op == "/" and other.kind in [:string, :tag]) ->
         plain(op, :unsigned, other.kind)
 
       {:division, :left} when op == "/" and other.kind in @divisors ->
         plain(op, :unsigned, other.kind)
 
-      {:unsigned, :right} when op == "/" ->
-        {:ok, pending(:division, pending_body(quotient), derived_kind(quotient, other))}
-
-      {:unsigned, :right} ->
+      {:unsigned, :right} when op != "/" ->
         plain(op, other.kind, :unsigned)
 
-      {:division, _side} ->
+      _division ->
         {:ok, pending(:division, pending_body(quotient), derived_kind(quotient, other))}
     end
   end
@@ -895,8 +889,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   # Two operands that are text, booleans, durations or numbers beside them: a tag beside a string
   # under `+` is the planner's error, a string beside a string is concatenated, any other pair
   # makes a null.
-  defp text("+", :tag, :string), do: coerce(:tag, "+", :string)
-  defp text("+", :string, :tag), do: coerce(:string, "+", :tag)
+  defp text("+", left, right) when {left, right} in [{:tag, :string}, {:string, :tag}],
+    do: coerce(left, "+", right)
+
   defp text("+", :string, :string), do: {:ok, %Value{kind: :string}}
   defp text(_op, _left, _right), do: {:ok, %Value{kind: :nz}}
 

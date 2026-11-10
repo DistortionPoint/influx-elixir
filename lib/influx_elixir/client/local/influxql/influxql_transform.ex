@@ -145,8 +145,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTransform do
   end
 
   @spec divide(extended(), float()) :: extended()
-  defp divide(:inf, divisor), do: if(divisor > 0, do: :inf, else: :neg_inf)
-  defp divide(:neg_inf, divisor), do: if(divisor > 0, do: :neg_inf, else: :inf)
+  defp divide(dividend, divisor) when dividend in [:inf, :neg_inf],
+    do: if(dividend == :inf == divisor > 0, do: :inf, else: :neg_inf)
 
   defp divide(dividend, divisor) do
     dividend / divisor

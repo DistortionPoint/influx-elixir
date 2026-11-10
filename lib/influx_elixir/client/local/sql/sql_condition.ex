@@ -356,19 +356,16 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   end
 
   @spec both(boolean() | nil, boolean() | nil) :: boolean() | nil
-  defp both(false, _other), do: false
-  defp both(_other, false), do: false
-  defp both(nil, _other), do: nil
-  defp both(_other, nil), do: nil
+  defp both(left, right) when false in [left, right], do: false
+  defp both(left, right) when nil in [left, right], do: nil
   defp both(true, true), do: true
 
   # The parser has already turned every `time` comparand into nanoseconds or
   # a `now()` offset; `now()` is resolved here, at execution, as the engine
   # does.
   @spec to_nanoseconds(SQLParser.time_value()) :: integer() | nil
-  defp to_nanoseconds(nil), do: nil
-  defp to_nanoseconds(value) when is_integer(value), do: value
   defp to_nanoseconds({:now, offset_ns}), do: Store.now_ns() + offset_ns
+  defp to_nanoseconds(value), do: value
 
   # A regular expression against a non-string column (verified). The planner
   # finds this first (`check_item/3`) when it knows the column's type; this

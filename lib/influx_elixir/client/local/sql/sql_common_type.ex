@@ -29,7 +29,7 @@ defmodule InfluxElixir.Client.Local.SQLCommonType do
     |> Enum.uniq()
     |> case do
       [] -> if types != [] and Enum.all?(types, &(&1 == "Null")), do: "Null"
-      [single] -> single |> single_type(types) |> text(types, mode, :single)
+      [single] -> single |> single_type() |> text(types, mode, :single)
       families -> families |> mixed(mode) |> text(types, mode, :mixed) |> tag_of(types, mode)
     end
   end
@@ -90,18 +90,15 @@ defmodule InfluxElixir.Client.Local.SQLCommonType do
 
   # A column's type, without the dictionary of a tag.
   @spec family(type()) :: binary() | :mixed
-  defp family("Dictionary(Int32, Utf8)"), do: "Utf8"
-  defp family("Utf8View"), do: "Utf8"
+  defp family(text) when text in ["Dictionary(Int32, Utf8)", "Utf8View"], do: "Utf8"
   defp family(type), do: type
 
-  @spec single_type(binary() | :mixed, [type()]) :: type()
-  defp single_type("Utf8", _types), do: "Utf8"
-
-  defp single_type(type, _types)
-       when type in ["Boolean", "Int64", "UInt64", "Float64"],
+  @spec single_type(binary() | :mixed) :: type()
+  defp single_type(type)
+       when type in ["Utf8", "Boolean", "Int64", "UInt64", "Float64"],
        do: type
 
-  defp single_type(_other, _types), do: :mixed
+  defp single_type(_other), do: :mixed
 
   @doc """
   The type the engine gives the mix, for the errors that name it: as `common/2`, and for
@@ -151,16 +148,13 @@ defmodule InfluxElixir.Client.Local.SQLCommonType do
   # The type of the engine's coercion of two numbers.
   @spec fold(binary(), binary()) :: binary()
   defp fold(same, same), do: same
-  defp fold(@d35, _other), do: @d35
-  defp fold(_other, @d35), do: @d35
-  defp fold(@d20, "Float64"), do: @d35
-  defp fold("Float64", @d20), do: @d35
-  defp fold(@d20, _integer), do: @d20
-  defp fold(_integer, @d20), do: @d20
-  defp fold("Float64", _integer), do: "Float64"
-  defp fold(_integer, "Float64"), do: "Float64"
-  defp fold("UInt64", _signed), do: @d20
-  defp fold(_signed, "UInt64"), do: @d20
+  defp fold(left, right) when @d35 in [left, right], do: @d35
+
+  defp fold(left, right) when @d20 in [left, right],
+    do: if("Float64" in [left, right], do: @d35, else: @d20)
+
+  defp fold(left, right) when "Float64" in [left, right], do: "Float64"
+  defp fold(left, right) when "UInt64" in [left, right], do: @d20
   defp fold(left, right), do: if(@signed[left] >= @signed[right], do: left, else: right)
 
   # A tag among text cast to a number makes a tag of numbers (`coalesce(host, 1)` is a

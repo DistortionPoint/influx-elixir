@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Consolidated duplicate clauses, redundant checks, and unused arguments across `Client.Local` (`InfluxQLArithType`, `InfluxQLNested`, `InfluxQLParens`, `InfluxQLTransform`, `SQLBind`, `SQLCastType`, `SQLCoerce`, `SQLCommonType`, `SQLCondition`, `SQLDmlItem`, `SQLDmlType`, `SQLExprType`, `SQLFunctions`, `SQLNativeType`, `SQLNullType`, `SQLPlanItems`, `SQLPrune`, `SQLRewrite`, `SQLSimplify`, `SQLTable`, `SQLTime`, and `SQLWhere`).**
+  Collapsed duplicate `:division` branches in `InfluxQLArithType.beside/5` and symmetric `:tag`/`:string` clauses in `InfluxQLArithType.text/3`, removed the redundant `constant?/1` helper and unified `:unsigned` column handling in `InfluxQLNested`, simplified `read/4` and `pass_condition/3` in `InfluxQLParens` and `divide/2` in `InfluxQLTransform`, unified `placeholders/1` and `bind_time_comparison/3` in `SQLBind`, consolidated `typed?/1` in `SQLCastType`, `family/1` and `cast/3` in `SQLCoerce`, and `family/1`, `single_type/1`, and pairwise `fold/2` in `SQLCommonType`, simplified `both/2` and `to_nanoseconds/1` in `SQLCondition`, `own_cause/1` and `pad_match/1` in `SQLDmlItem`, `base/2` in `SQLDmlType`, `node_type/4` in `SQLExprType`, `compute/2` in `SQLFunctions`, and `native_plain/1` in `SQLNativeType`, removed the duplicate `ordered` check in `SQLNullType.duration_misuse?/1`, combined unary `:neg`/`:pos` clauses in `SQLPlanItems`, simplified `nothing_read?/1`, `merge/2`, and `equality_columns/1` in `SQLPrune`, `skip_quantity/1` in `SQLRewrite`, `conjoin/3` and `disjoin/2` in `SQLSimplify`, `resolve/1` via `tails/2` in `SQLTable`, `zone/1` in `SQLTime`, and `"("` scanning in `SQLWhere.scan_where/2`.
+
 ## [0.1.64] - 2026-11-09
 
 ### Fixed

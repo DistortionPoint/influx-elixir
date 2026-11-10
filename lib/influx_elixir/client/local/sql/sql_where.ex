@@ -122,14 +122,11 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
     end
   end
 
-  defp scan_where(<<"(", rest::binary>>, %{depth: 0} = state) do
-    if String.trim(state.buf) == "" and grouping?(rest),
+  defp scan_where(<<"(", rest::binary>>, state) do
+    if state.depth == 0 and String.trim(state.buf) == "" and grouping?(rest),
       do: scan_where(rest, emit(state, :lparen)),
-      else: scan_where(rest, %{append(state, "(") | depth: 1})
+      else: scan_where(rest, %{append(state, "(") | depth: state.depth + 1})
   end
-
-  defp scan_where(<<"(", rest::binary>>, state),
-    do: scan_where(rest, %{append(state, "(") | depth: state.depth + 1})
 
   defp scan_where(<<")", rest::binary>>, %{depth: 0} = state),
     do: scan_where(rest, state |> flush_pred() |> emit(:rparen))

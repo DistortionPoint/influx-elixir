@@ -239,7 +239,7 @@ defmodule InfluxElixir.Client.Local.SQLTable do
         {:ok,
          %{
            measurement: SQLInformation.relation_name(name),
-           qualifiers: [name, "information_schema." <> name, "public.information_schema." <> name]
+           qualifiers: tails("information_schema", name)
          }}
 
       {:engine, "information_schema", name, _columns} ->

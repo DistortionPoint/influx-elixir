@@ -337,8 +337,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   defp simplify(other, _context), do: other
 
   @spec conjoin(tree(), tree(), context()) :: tree()
-  defp conjoin({:const, false} = never, _right, _context), do: never
-  defp conjoin(_left, {:const, false} = never, _context), do: never
+  defp conjoin(left, right, _context) when {:const, false} in [left, right], do: {:const, false}
   defp conjoin({:const, true}, right, _context), do: right
   defp conjoin(left, {:const, true}, _context), do: left
   defp conjoin(:null, :null, _context), do: :null
@@ -364,8 +363,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   end
 
   @spec disjoin(tree(), tree()) :: tree()
-  defp disjoin({:const, true} = always, _right), do: always
-  defp disjoin(_left, {:const, true} = always), do: always
+  defp disjoin(left, right) when {:const, true} in [left, right], do: {:const, true}
   defp disjoin({:const, false}, right), do: right
   defp disjoin(left, {:const, false}), do: left
   defp disjoin(:null, :null), do: :null

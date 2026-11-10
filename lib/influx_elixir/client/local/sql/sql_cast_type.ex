@@ -95,8 +95,7 @@ defmodule InfluxElixir.Client.Local.SQLCastType do
 
   # The tokens a type is made of: its words, a size and the punctuation of one.
   @spec typed?(expr_token()) :: boolean()
-  defp typed?({:word, _word}), do: true
-  defp typed?({:num, _text}), do: true
+  defp typed?({kind, _text}) when kind in [:word, :num], do: true
   defp typed?({:tok, symbol}), do: symbol in ["(", ")", ",", "<", ">"]
   defp typed?(_token), do: false
 

@@ -331,9 +331,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
       :never
     else
       case other_operand(other, fold, ctx) do
-        {:column, _name, :unsigned} ->
-          clash(op, side)
-
         :unsigned ->
           clash(op, side)
 
@@ -435,6 +432,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   defp column(name, {tags, types}) do
     case {MapSet.member?(tags, name), Map.fetch(types, name)} do
       {true, _type} -> {:column, name, :tag}
+      {false, {:ok, :unsigned}} -> :unsigned
       {false, {:ok, type}} -> {:column, name, type}
       {false, :error} -> {:column, name, :absent}
     end
@@ -447,26 +445,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   # the measurement lacks is in it (verified: its answer is no row or the planner's coercion
   # error, by operands the double does not tell).
   defp expression(tokens, {:ok, :unsigned}, {tags, types} = ctx) do
-    cond do
-      # An unsigned number made of a column the measurement lacks and an unsigned one is typed
-      # as an unsigned column is (verified: `(w > 1) = nosuch + 1 + u` is the planner's
-      # `Boolean = UInt64`), and so is one made of constants alone, an integer past the signed
-      # range in it (`9223372036854775808 + 1`, `-(9223372036854775808)`, `1 *
-      # 18446744073709551615`, `abs(9223372036854775808)`).
-      unsigned_null?(tokens, ctx) or constant?(tokens) -> :unsigned
-      # One made of no unsigned column (an integer past the signed range beside a tag, a
-      # quotient by text) is unsigned all the same; one with an unsigned column is refused.
-      not unsigned_column?(tokens, tags, types) -> :unsigned
-      true -> arithmetic_expression(tokens, tags, types)
-    end
+    # An unsigned number made of a column the measurement lacks and an unsigned one is typed
+    # as an unsigned column is (verified: `(w > 1) = nosuch + 1 + u` is the planner's
+    # `Boolean = UInt64`), and so is one made of no unsigned column (constants alone with an
+    # integer past the signed range, or beside a tag, or a quotient by text); one with an
+    # unsigned column is refused.
+    if unsigned_null?(tokens, ctx) or not unsigned_column?(tokens, tags, types),
+      do: :unsigned,
+      else: arithmetic_expression(tokens, tags, types)
   end
 
   defp expression(tokens, fold, {tags, types}) do
     if nullish?(fold), do: :expression, else: arithmetic_expression(tokens, tags, types)
   end
-
-  # Whether no column is read (the names of calls are no column).
-  defp constant?(tokens), do: match?({[], _calls}, InfluxQLTokens.split_names(tokens))
 
   defp arithmetic_expression(tokens, tags, types) do
     {columns, calls} = InfluxQLTokens.split_names(tokens)

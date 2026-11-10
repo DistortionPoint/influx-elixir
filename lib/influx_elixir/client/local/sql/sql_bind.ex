@@ -147,10 +147,12 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   # Every `$name` in a term, in order.
   @spec placeholders(term()) :: [binary()]
   defp placeholders(terms) when is_list(terms), do: Enum.flat_map(terms, &placeholders/1)
-  defp placeholders({:param, name}) when is_binary(name), do: [name]
-  defp placeholders({:param, name, :left}) when is_binary(name), do: [name]
-  defp placeholders({:like_param, name, _case_insensitive}), do: [name]
-  defp placeholders({:regex_param, name, _op}), do: [name]
+
+  defp placeholders(term)
+       when is_tuple(term) and elem(term, 0) in [:param, :like_param, :regex_param] and
+              is_binary(elem(term, 1)),
+       do: [elem(term, 1)]
+
   defp placeholders(%{__struct__: _module}), do: []
   defp placeholders(term) when is_tuple(term), do: term |> Tuple.to_list() |> placeholders()
   defp placeholders(_other), do: []
@@ -401,29 +403,18 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   # number or a boolean is the engine's type error.
   @spec bind_time_comparison(SQLPredicate.op(), term(), %{binary() => term()}) ::
           {:ok, SQLPredicate.clause()} | {:error, map()}
-  defp bind_time_comparison(op, {:param, name}, params) do
-    case SQLTime.param(Map.fetch!(params, name)) do
+  defp bind_time_comparison(op, param, params)
+       when is_tuple(param) and elem(param, 0) == :param do
+    case SQLTime.param(Map.fetch!(params, elem(param, 1))) do
       {:number, type} ->
+        {left, effective_op, right} =
+          if tuple_size(param) == 3,
+            do: {type, SQLPredicate.mirror(op), "Timestamp(ns)"},
+            else: {"Timestamp(ns)", op, type}
+
         {:ok,
          SQLPredicate.deferred_clause(
-           SQLTime.comparison_type_error("Timestamp(ns)", SQLExpr.symbol(op), type)
-         )}
-
-      bound ->
-        {:ok, {op, "time", bound}}
-    end
-  end
-
-  defp bind_time_comparison(op, {:param, name, :left}, params) do
-    case SQLTime.param(Map.fetch!(params, name)) do
-      {:number, type} ->
-        {:ok,
-         SQLPredicate.deferred_clause(
-           SQLTime.comparison_type_error(
-             type,
-             SQLExpr.symbol(SQLPredicate.mirror(op)),
-             "Timestamp(ns)"
-           )
+           SQLTime.comparison_type_error(left, SQLExpr.symbol(effective_op), right)
          )}
 
       bound ->

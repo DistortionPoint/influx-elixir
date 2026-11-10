@@ -150,15 +150,17 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
   defp node_type({:field, ref}, columns, _memo, _phase), do: Map.get(columns, ref)
   defp node_type({:lit, nil}, _columns, _memo, _phase), do: "Null"
   defp node_type({:lit, value}, _columns, _memo, _phase) when is_integer(value), do: "Int64"
-  defp node_type({:lit, value}, _columns, _memo, _phase) when is_float(value), do: "Float64"
 
-  defp node_type({:lit, value}, _columns, _memo, _phase) when value in [:inf, :neg_inf],
-    do: "Float64"
+  defp node_type({:lit, value}, _columns, _memo, _phase)
+       when is_float(value) or value in [:inf, :neg_inf],
+       do: "Float64"
 
   defp node_type({:lit, value}, _columns, _memo, _phase) when is_binary(value), do: "Utf8"
   defp node_type({:lit, value}, _columns, _memo, _phase) when is_boolean(value), do: "Boolean"
-  defp node_type({:uint, _value}, _columns, _memo, _phase), do: "UInt64"
-  defp node_type({:uint_col, _name}, _columns, _memo, _phase), do: "UInt64"
+
+  defp node_type({kind, _value}, _columns, _memo, _phase) when kind in [:uint, :uint_col],
+    do: "UInt64"
+
   defp node_type({:cast, _inner, type}, _columns, _memo, _phase), do: SQLCast.arrow_type(type)
 
   defp node_type({kind, inner}, columns, memo, phase) when kind in [:neg, :pos],

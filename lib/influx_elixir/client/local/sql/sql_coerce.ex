@@ -153,8 +153,7 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
   end
 
   @spec family(SQLExprType.type()) :: SQLExprType.type()
-  defp family("Dictionary(Int32, Utf8)"), do: "Utf8"
-  defp family("Utf8View"), do: "Utf8"
+  defp family(text) when text in ["Dictionary(Int32, Utf8)", "Utf8View"], do: "Utf8"
   defp family(type), do: type
 
   @spec target([SQLExpr.t()], :case | :coalesce, %{binary() => binary()}) :: SQLExprType.type()
@@ -162,24 +161,17 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
     do: results |> Enum.map(&SQLExprType.type_of(&1, types)) |> SQLExprType.common(mode)
 
   # An `Int64` result of a `Float64` whole is cast to `Float64`, a number of a
-  # `Utf8` one to text.
+  # `Utf8` one to text, and an integer beside one of the other sign to a decimal.
   @spec cast(SQLExpr.t(), SQLExprType.type(), %{binary() => binary()}) :: SQLExpr.t()
-  defp cast(expr, "Float64", types) do
+  defp cast(expr, target, types) when target in ["Float64", "Decimal128(?)"] do
     if SQLExprType.type_of(expr, types) in ["Int64", "UInt64"],
-      do: {:cast, expr, :float},
+      do: {:cast, expr, if(target == "Float64", do: :float, else: :decimal)},
       else: expr
   end
 
   defp cast(expr, text, types) when text in ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"] do
     if SQLExprType.type_of(expr, types) in @numbers,
       do: {:cast, expr, :string},
-      else: expr
-  end
-
-  # An integer beside one of the other sign is a decimal.
-  defp cast(expr, "Decimal128(?)", types) do
-    if SQLExprType.type_of(expr, types) in ["Int64", "UInt64"],
-      do: {:cast, expr, :decimal},
       else: expr
   end
 

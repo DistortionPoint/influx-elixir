@@ -55,7 +55,7 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
     if is_list(unused) and (:dead in unused or unplanned?(item, query, unused)) do
       :drop
     else
-      columns = types.(equality_columns(query.where, []))
+      columns = types.(equality_columns(query.where))
 
       cond do
         SQLSimplify.empty?(query, columns) ->
@@ -92,7 +92,7 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   @spec empty?(SQLParser.parsed_query(), types()) :: boolean()
   def empty?(query, types) do
     negations([query.where, query.projection_columns, query.order_by, query.having], []) != [] and
-      SQLSimplify.empty?(query, types.(equality_columns(query.where, [])))
+      SQLSimplify.empty?(query, types.(equality_columns(query.where)))
   end
 
   @doc """
@@ -183,9 +183,8 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   end
 
   @spec nothing_read?(:final | {:cte, reads()}) :: boolean()
-  defp nothing_read?({:cte, :all}), do: false
-  defp nothing_read?({:cte, read}), do: MapSet.size(read) == 0
-  defp nothing_read?(:final), do: false
+  defp nothing_read?({:cte, %MapSet{} = read}), do: MapSet.size(read) == 0
+  defp nothing_read?(_mode), do: false
 
   @spec live_sort(SQLParser.parsed_query(), :final | {:cte, reads()}) :: list()
   defp live_sort(query, :final), do: query.order_by
@@ -209,8 +208,7 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   defp live_columns(columns, unused), do: Enum.reject(columns, &(elem(&1, 1) in unused))
 
   @spec merge(reads(), reads()) :: reads()
-  defp merge(:all, _other), do: :all
-  defp merge(_read, :all), do: :all
+  defp merge(read, other) when :all in [read, other], do: :all
   defp merge(read, other), do: MapSet.union(read, other)
 
   # The computed outputs of a query that keeps its rows as they are, which no query after it
@@ -318,13 +316,11 @@ defmodule InfluxElixir.Client.Local.SQLPrune do
   defp predicates(_other, found), do: found
 
   # The columns the equalities of a `WHERE` read.
-  @spec equality_columns(term(), [binary()]) :: [binary()]
-  defp equality_columns(where, found) do
+  @spec equality_columns(term()) :: [binary()]
+  defp equality_columns(where) do
     where
     |> predicates([])
-    |> Enum.reduce(found, fn {_op, operand, _rest}, columns ->
-      operand_columns(operand) ++ columns
-    end)
+    |> Enum.flat_map(fn {_op, operand, _rest} -> operand_columns(operand) end)
     |> Enum.uniq()
   end
 

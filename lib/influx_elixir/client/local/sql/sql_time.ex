@@ -395,8 +395,7 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   defp take_digits(rest, acc), do: {Enum.reverse(acc), rest}
 
   @spec zone(binary()) :: {:ok, integer()} | {:zone, binary()} | {:refusal, binary()}
-  defp zone(""), do: {:ok, 0}
-  defp zone(zone) when zone in ["Z", "z"], do: {:ok, 0}
+  defp zone(zone) when zone in ["", "Z", "z"], do: {:ok, 0}
 
   defp zone(text) do
     zone = String.trim_leading(text)

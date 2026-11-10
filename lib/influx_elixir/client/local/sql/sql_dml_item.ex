@@ -162,8 +162,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
   defp own_cause({:cast, _inner, _type, _try}),
     do: "with a cast to a type the double does not print"
 
-  defp own_cause({:call, _name, _args}), do: "with a call the double does not print"
-  defp own_cause({:ordered, _call, _terms}), do: "with a call the double does not print"
+  defp own_cause({kind, _first, _second}) when kind in [:call, :ordered],
+    do: "with a call the double does not print"
+
   defp own_cause({:bin, _op, _left, _right}), do: "with an operator the double does not print"
   defp own_cause(_other), do: "with an expression of a kind the double does not print"
 
@@ -377,9 +378,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
 
   @spec pad_match([binary()]) :: [binary()]
   defp pad_match([all, sign, whole, fraction]), do: [all, sign, whole, fraction, "0"]
-
-  defp pad_match([all, sign, whole, fraction, exponent]),
-    do: [all, sign, whole, fraction, exponent]
+  defp pad_match(match), do: match
 
   @spec place(binary(), integer()) :: binary()
   defp place(digits, point) do

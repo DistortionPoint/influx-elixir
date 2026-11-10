@@ -397,10 +397,7 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   @spec skip_quantity([token()]) :: [token()]
   defp skip_quantity(tokens) do
     case Enum.drop_while(tokens, &space?/1) do
-      [{:other, _number} | rest] ->
-        rest
-
-      [{:string, _text} | rest] ->
+      [{kind, _text} | rest] when kind in [:other, :string] ->
         rest
 
       [{:word, word} | rest] ->

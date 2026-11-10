@@ -26,9 +26,9 @@ defmodule InfluxElixir.Client.Local.SQLNativeType do
   end
 
   @spec native_plain(binary()) :: binary()
-  defp native_plain("Utf8"), do: "String"
-  defp native_plain("Dictionary(Int32, Utf8)"), do: "String"
-  defp native_plain("Utf8View"), do: "String"
+  defp native_plain(text) when text in ["Utf8", "Dictionary(Int32, Utf8)", "Utf8View"],
+    do: "String"
+
   defp native_plain("Timestamp(ns)"), do: "Timestamp(Nanosecond, None)"
   defp native_plain(type), do: type
 

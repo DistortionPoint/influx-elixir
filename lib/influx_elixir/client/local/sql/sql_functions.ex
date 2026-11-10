@@ -126,8 +126,11 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   defp compute(:abs, [{:u, _value} = x]), do: x
   defp compute(:abs, [{:dec, coefficient, scale}]), do: {:dec, Kernel.abs(coefficient), scale}
   defp compute(:abs, [x]), do: absolute_float(x)
+
+  defp compute(name, [x, {:int, _bits, scale}]) when name in [:round, :trunc],
+    do: compute(name, [x, scale])
+
   defp compute(:round, [x]), do: x |> SQLNumber.to_float() |> round_away()
-  defp compute(:round, [x, {:int, _bits, scale}]), do: compute(:round, [x, scale])
   defp compute(:round, [x, 0]), do: x |> SQLNumber.to_float() |> round_away()
 
   # A scale past `Int32` closes the connection (verified, in both directions).
@@ -143,7 +146,6 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   # toward zero, and a zero it leaves keeps the sign of a fraction
   # (`trunc(-0.4)` is `-0.0`) but not of a zero (`trunc(-0.0)` is `0.0`).
   defp compute(:trunc, [x]), do: x |> SQLNumber.to_float() |> truncate()
-  defp compute(:trunc, [x, {:int, _bits, scale}]), do: compute(:trunc, [x, scale])
   defp compute(:trunc, [x, scale]), do: compute(:round, [x, wrap_int32(scale)])
   defp compute(:floor, [x]), do: x |> SQLNumber.to_float() |> floor_float()
   defp compute(:ceil, [x]), do: x |> SQLNumber.to_float() |> ceil_float()
