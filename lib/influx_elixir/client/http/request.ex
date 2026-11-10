@@ -155,32 +155,26 @@ defmodule InfluxElixir.Client.HTTP.Request do
   # The receive timeout in milliseconds. Precedence:
   #   opts[:timeout] → connection[:timeout] → @default_timeout
   @spec resolve_timeout(keyword(), keyword()) :: timeout()
-  def resolve_timeout(opts, connection) do
-    case if(Options.keyword?(opts), do: Keyword.get(opts, :timeout)) do
-      nil ->
-        case if(Options.keyword?(connection), do: Keyword.get(connection, :timeout)) do
-          nil -> @default_timeout
-          timeout -> timeout
-        end
-
-      timeout ->
-        timeout
-    end
-  end
+  def resolve_timeout(opts, connection),
+    do: resolve_opt(opts, connection, :timeout, @default_timeout)
 
   # The pool checkout timeout in milliseconds. Precedence:
   #   opts[:pool_timeout] → connection[:pool_timeout] → @default_pool_timeout
   @spec resolve_pool_timeout(keyword(), keyword()) :: timeout()
-  def resolve_pool_timeout(opts, connection) do
-    case if(Options.keyword?(opts), do: Keyword.get(opts, :pool_timeout)) do
+  def resolve_pool_timeout(opts, connection),
+    do: resolve_opt(opts, connection, :pool_timeout, @default_pool_timeout)
+
+  @spec resolve_opt(keyword(), keyword(), atom(), timeout()) :: timeout()
+  defp resolve_opt(opts, connection, key, default) do
+    case if(Options.keyword?(opts), do: Keyword.get(opts, key)) do
       nil ->
-        case if(Options.keyword?(connection), do: Keyword.get(connection, :pool_timeout)) do
-          nil -> @default_pool_timeout
-          pool_timeout -> pool_timeout
+        case if(Options.keyword?(connection), do: Keyword.get(connection, key)) do
+          nil -> default
+          value -> value
         end
 
-      pool_timeout ->
-        pool_timeout
+      value ->
+        value
     end
   end
 
@@ -211,8 +205,7 @@ defmodule InfluxElixir.Client.HTTP.Request do
   @spec auth_headers(keyword()) :: [{binary(), binary()}]
   def auth_headers(connection) do
     case conn_val(connection, :token) do
-      nil -> []
-      "" -> []
+      token when token in [nil, ""] -> []
       token -> [{"authorization", "Bearer #{token}"}]
     end
   end
@@ -288,13 +281,11 @@ defmodule InfluxElixir.Client.HTTP.Request do
   end
 
   @spec valid_timeout_opt?(term()) :: boolean()
-  defp valid_timeout_opt?(nil), do: true
-  defp valid_timeout_opt?(:infinity), do: true
-  defp valid_timeout_opt?(timeout), do: is_integer(timeout) and timeout >= 0
+  defp valid_timeout_opt?(timeout),
+    do: timeout in [nil, :infinity] or (is_integer(timeout) and timeout >= 0)
 
   @spec valid_boolean_opt?(term()) :: boolean()
-  defp valid_boolean_opt?(nil), do: true
-  defp valid_boolean_opt?(flag), do: is_boolean(flag)
+  defp valid_boolean_opt?(flag), do: is_nil(flag) or is_boolean(flag)
 
   # A request body is JSON, which holds only UTF-8 text: text that is not is
   # the caller's error, returned as one, never a `Jason.EncodeError` raised.

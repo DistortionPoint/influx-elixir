@@ -212,8 +212,7 @@ defmodule InfluxElixir.Flight.Reader do
   """
   @spec parse_schema(binary() | nil) ::
           {:ok, [column_schema()]} | {:error, term()}
-  def parse_schema(nil), do: {:ok, []}
-  def parse_schema(<<>>), do: {:ok, []}
+  def parse_schema(empty) when empty in [nil, <<>>], do: {:ok, []}
 
   def parse_schema(header) when is_binary(header) do
     fb = strip_continuation(header)
@@ -541,8 +540,8 @@ defmodule InfluxElixir.Flight.Reader do
   @spec parse_record_batch_header(binary() | nil) ::
           {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}], map()}
           | {:error, term()}
-  defp parse_record_batch_header(nil), do: {:ok, 0, [], @empty_meta}
-  defp parse_record_batch_header(<<>>), do: {:ok, 0, [], @empty_meta}
+  defp parse_record_batch_header(empty) when empty in [nil, <<>>],
+    do: {:ok, 0, [], @empty_meta}
 
   defp parse_record_batch_header(header) do
     fb = strip_continuation(header)
@@ -862,8 +861,7 @@ defmodule InfluxElixir.Flight.Reader do
   defp slice(body, {offset, len}), do: safe_slice(body, offset, len)
 
   @spec slice_validity(binary(), {non_neg_integer(), non_neg_integer()} | nil) :: binary() | nil
-  defp slice_validity(_body, nil), do: nil
-  defp slice_validity(_body, {_offset, 0}), do: nil
+  defp slice_validity(_body, spec) when spec == nil or elem(spec, 1) == 0, do: nil
   defp slice_validity(body, spec), do: slice(body, spec)
 
   @spec offsets_list(binary(), 4 | 8) :: [integer()]
@@ -1169,8 +1167,7 @@ defmodule InfluxElixir.Flight.Reader do
   end
 
   @spec apply_nulls([term()], binary() | nil, non_neg_integer()) :: [term()]
-  defp apply_nulls(values, nil, _n), do: values
-  defp apply_nulls(values, <<>>, _n), do: values
+  defp apply_nulls(values, empty, _n) when empty in [nil, <<>>], do: values
 
   defp apply_nulls(values, validity, n), do: mask(values, validity, 0, n)
 

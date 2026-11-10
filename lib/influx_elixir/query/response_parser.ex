@@ -213,9 +213,7 @@ defmodule InfluxElixir.Query.ResponseParser do
   end
 
   @spec blank_row?([binary()]) :: boolean()
-  defp blank_row?([]), do: true
-  defp blank_row?([""]), do: true
-  defp blank_row?(_row), do: false
+  defp blank_row?(row), do: row in [[], [""]]
 
   @spec parse_csv_table([[binary()]]) :: [map()]
   defp parse_csv_table(rows) do
@@ -269,8 +267,10 @@ defmodule InfluxElixir.Query.ResponseParser do
 
   @spec cast(binary() | nil, binary(), binary()) :: term()
   defp cast("double", _key, value), do: parse_number(parse_float(value), value)
-  defp cast("long", _key, value), do: parse_number(Integer.parse(value), value)
-  defp cast("unsignedLong", _key, value), do: parse_number(Integer.parse(value), value)
+
+  defp cast(type, _key, value) when type in ["long", "unsignedLong"],
+    do: parse_number(Integer.parse(value), value)
+
   defp cast("boolean", _key, "true"), do: true
   defp cast("boolean", _key, "false"), do: false
   # A dateTime column is a time whatever its name (`map(fn: (r) => ({r with t: r._time}))`

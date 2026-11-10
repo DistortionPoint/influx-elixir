@@ -141,13 +141,11 @@ defmodule InfluxElixir.Flight.Client do
   end
 
   @spec valid_timeout_opt?(term()) :: boolean()
-  defp valid_timeout_opt?(nil), do: true
-  defp valid_timeout_opt?(:infinity), do: true
-  defp valid_timeout_opt?(timeout), do: is_integer(timeout) and timeout >= 0
+  defp valid_timeout_opt?(timeout),
+    do: timeout in [nil, :infinity] or (is_integer(timeout) and timeout >= 0)
 
   @spec valid_tls_opt?(term()) :: boolean()
-  defp valid_tls_opt?(nil), do: true
-  defp valid_tls_opt?(tls), do: is_boolean(tls)
+  defp valid_tls_opt?(tls), do: is_nil(tls) or is_boolean(tls)
 
   @spec query_with_opts(connection(), term(), keyword()) :: {:ok, [map()]} | {:error, term()}
   defp query_with_opts(connection, sql, opts) do

@@ -354,8 +354,10 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   # The verdict a conjunct gives the others' reach: a failing one or one the
   # double declines to compute does not leave a row out.
   @spec verdict(entry()) :: verdict()
-  defp verdict({_value, :fail}), do: true
-  defp verdict({_value, {:refused, _error}}), do: true
+  defp verdict({_value, risk})
+       when risk == :fail or (is_tuple(risk) and elem(risk, 0) == :refused),
+       do: true
+
   defp verdict({value, _risk}), do: value
 
   @spec keep(acc(), point(), [entry()]) :: acc()

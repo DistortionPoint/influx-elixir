@@ -750,17 +750,11 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
 
   @doc "The expressions directly inside an expression, in the order written."
   @spec children(t()) :: [t()]
-  def children({:neg, inner}), do: [inner]
-  def children({:pos, inner}), do: [inner]
-  def children({:not, inner}), do: [inner]
-  def children({:cast, inner, _type}), do: [inner]
-  def children({:op, _op, left, right}), do: [left, right]
-  def children({:cmp, _op, left, right}), do: [left, right]
-  def children({:and, left, right}), do: [left, right]
-  def children({:or, left, right}), do: [left, right]
-  def children({:concat, left, right}), do: [left, right]
+  def children({kind, inner}) when kind in [:neg, :pos, :not], do: [inner]
+  def children({kind, inner, _arg}) when kind in [:cast, :is_null], do: [inner]
+  def children({kind, _op, left, right}) when kind in [:op, :cmp], do: [left, right]
+  def children({kind, left, right}) when kind in [:and, :or, :concat], do: [left, right]
   def children({:call, _name, args}), do: args
-  def children({:is_null, inner, _negated}), do: [inner]
   def children({:is_bool, inner, _value, _negated}), do: [inner]
   def children({:is_distinct, left, right, _negated}), do: [left, right]
   def children({:in, inner, items, _negated}), do: [inner | items]
@@ -830,8 +824,7 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
 
   @doc "The columns an expression reads, in order."
   @spec columns(t()) :: [column_ref()]
-  def columns({:field, ref}), do: [ref]
-  def columns({:uint_col, name}), do: [name]
+  def columns({kind, ref}) when kind in [:field, :uint_col], do: [ref]
   def columns(expr), do: Enum.flat_map(children(expr), &columns/1)
 
   @doc """
@@ -912,8 +905,8 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   def render(node, qualifier, casts), do: render_form(node, qualifier, casts)
 
   @spec render_leaf(t(), binary() | nil, casts()) :: binary()
-  defp render_leaf({:field, ref}, qualifier, _casts), do: qualified(ref, qualifier)
-  defp render_leaf({:uint_col, name}, qualifier, _casts), do: qualified(name, qualifier)
+  defp render_leaf({kind, ref}, qualifier, _casts) when kind in [:field, :uint_col],
+    do: qualified(ref, qualifier)
 
   defp render_leaf({:lit, value}, _qualifier, _casts) when is_integer(value),
     do: "Int64(#{value})"

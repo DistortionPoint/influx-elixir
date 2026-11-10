@@ -441,10 +441,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp classify_plain(call), do: classify_call(call)
 
-  defp nested_argument?({:paren, _inner}), do: true
-  defp nested_argument?({:neg, _operand}), do: true
-  defp nested_argument?({:bin, _op, _left, _right}), do: true
-  defp nested_argument?(_other), do: false
+  defp nested_argument?(arg), do: elem(arg, 0) in [:paren, :neg, :bin]
 
   # Inside another expression a call with `*` is no column of its own; a
   # planning error found in it is the error of the whole.
@@ -652,9 +649,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp transform(_name, []), do: :error
 
   # A transform reads a field or one aggregate of a field.
-  defp inner_ok?({:ref, _field}), do: true
-  defp inner_ok?({:agg, _fun, _field}), do: true
-  defp inner_ok?(_other), do: false
+  defp inner_ok?(inner), do: elem(inner, 0) in [:ref, :agg]
 
   defp transform_parameter("moving_average", [{:lit, {:int, n}}]) when n > 1, do: {:ok, n}
 
@@ -698,9 +693,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   end
 
   defp names({:ref, name}), do: [name]
-  defp names({:cast, name, _type}), do: [name]
+  defp names({kind, name, _detail}) when kind in [:cast, :fn], do: [name]
   defp names({:agg, fun, _arg}), do: [function_name(fun)]
-  defp names({:fn, name, _arguments}), do: [name]
   defp names({:transform, name, _inner, _parameter}), do: [name]
   defp names({:neg, operand}), do: names(operand)
   defp names({:bin, _op, left, right}), do: names(left) ++ names(right)
@@ -962,8 +956,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # operation when it rewrites the projection (`incompatible operands`), before the plan that
   # would reject the function (verified: `1 / abs(time)`, `true + abs(time)`, `-abs(time)`).
   @spec operand(inferred()) :: inferred()
-  defp operand({:physical, _body}), do: {:ok, {:timestamp, false}}
-  defp operand({:physical_refuse, _message}), do: {:ok, {:timestamp, false}}
+  defp operand({kind, _detail}) when kind in [:physical, :physical_refuse],
+    do: {:ok, {:timestamp, false}}
+
   defp operand(inferred), do: inferred
 
   defp cast_type_of(type, target) when type in [:integer, :float, :unknown],
@@ -1072,9 +1067,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp literal?({_lt, left}, {_rt, right}), do: left or right
 
-  defp absent_text?(:unknown, type), do: type in @text_types
-  defp absent_text?(type, :unknown), do: type in @text_types
-  defp absent_text?(_left, _right), do: false
+  defp absent_text?(left, right),
+    do:
+      (left == :unknown and right in @text_types) or
+        (right == :unknown and left in @text_types)
 
   @doc """
   `ast` with the operation that is a constant false (a column the measurement lacks beside a
@@ -1099,11 +1095,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp result(_op, {:unknown, _l}, {type, _r}), do: {type, false}
   defp result(_op, {type, _l}, {:unknown, _r}), do: {type, false}
-  defp result(_op, {:float, _l}, _right), do: {:float, false}
-  defp result(_op, _left, {:float, _r}), do: {:float, false}
+  defp result(_op, {lt, _l}, {rt, _r}) when :float in [lt, rt], do: {:float, false}
   defp result("/", {:integer, _l}, {:integer, _r}), do: {:float, false}
-  defp result(_op, {:unsigned, _l}, _right), do: {:unsigned, false}
-  defp result(_op, _left, {:unsigned, _r}), do: {:unsigned, false}
+  defp result(_op, {lt, _l}, {rt, _r}) when :unsigned in [lt, rt], do: {:unsigned, false}
   defp result(_op, _left, _right), do: {:integer, false}
 
   # ---------------------------------------------------------------------------

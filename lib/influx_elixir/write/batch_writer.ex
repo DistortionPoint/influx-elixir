@@ -894,8 +894,10 @@ defmodule InfluxElixir.Write.BatchWriter do
   defp classify(:ok), do: :ok
   defp classify({:error, {:connection_error, _reason}}), do: :retryable
   defp classify({:error, reason}) when reason in [:pool_timeout, :timeout], do: :retryable
-  defp classify({:error, %{status: status}}) when status in 500..599, do: :retryable
-  defp classify({:error, %{status: status}}) when status in [408, 429], do: :retryable
+
+  defp classify({:error, %{status: status}}) when status in 500..599 or status in [408, 429],
+    do: :retryable
+
   defp classify({:error, _reason}), do: :permanent
 
   @spec normalize(term()) :: :ok | {:error, term()}
