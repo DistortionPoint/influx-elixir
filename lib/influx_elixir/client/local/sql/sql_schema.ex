@@ -459,7 +459,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
       unavailable =
         query.order_by
-        |> Enum.flat_map(&order_refs(&1, query))
+        |> Enum.flat_map(&order_refs/1)
         |> Enum.find(fn ref ->
           is_binary(ref) and
             not (alias_ref?(ref, outputs, query, :order) or ref in grouped or
@@ -473,11 +473,11 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     end
   end
 
-  @spec order_refs({term(), term()}, SQLParser.parsed_query()) :: [SQLExpr.column_ref()]
-  defp order_refs({{:expr, expr}, _direction}, _query), do: expr_fields(expr)
+  @spec order_refs({term(), term()}) :: [SQLExpr.column_ref()]
+  defp order_refs({{:expr, expr}, _direction}), do: expr_fields(expr)
 
-  defp order_refs({column, _direction}, query),
-    do: if(ordinal?(query, column), do: [], else: [column])
+  defp order_refs({column, _direction}),
+    do: if(SQLClauses.position_term?(column), do: [], else: [column])
 
   defp unavailable_order(ref, query, listed) do
     known = ref |> known_fields(projection_fields(query, listed)) |> Enum.map(&(" " <> &1))
@@ -609,13 +609,9 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     alias? = &alias_ref?(&1, aliases, query, :order)
 
     order_by_refs =
-      Enum.flat_map(query.order_by, fn
-        {{:expr, expr}, _direction} ->
-          Enum.reject(expr_fields(expr), alias?)
-
-        {column, _direction} ->
-          if alias?.(column) or ordinal?(query, column), do: [], else: [column]
-      end)
+      query.order_by
+      |> Enum.flat_map(&order_refs/1)
+      |> Enum.reject(alias?)
 
     select_refs =
       Enum.flat_map(query.projection_columns || [], &projection_refs/1) ++
@@ -671,12 +667,6 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     end)
   end
 
-  # A number in `ORDER BY` is a position among the columns: in a `SELECT *` it is resolved with
-  # the columns, and in another select the parser has replaced the positions that name an item,
-  # so one that is left names none (the error of the plan, not of a column).
-  @spec ordinal?(SQLParser.parsed_query(), binary()) :: boolean()
-  defp ordinal?(_query, term), do: SQLClauses.order_position(term, 0) != :not_positional
-
   @doc "Whether the query selects `*`."
   @spec star?(SQLParser.parsed_query()) :: boolean()
   def star?(%{} = query) do
@@ -698,11 +688,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   end
 
   @spec positional?({term(), term()}) :: boolean()
-  defp positional?({target, _direction}) when is_binary(target),
-    do: SQLClauses.order_position(target, 0) != :not_positional
-
-  defp positional?({{:expr, {:lit, _value}}, _direction}), do: true
-  defp positional?(_term), do: false
+  defp positional?({target, _direction}), do: SQLClauses.position_term?(target)
 
   @spec resolve_positions(SQLParser.parsed_query(), [binary()] | nil) ::
           {:ok, SQLParser.parsed_query()} | {:error, map()}

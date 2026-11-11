@@ -183,7 +183,7 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
       true ->
         case printed(rest) do
           {:ok, token} ->
-            {line, column} = position(at, blank)
+            {line, column} = SQLTokenizer.advance(at, blank)
 
             SQLError.parser(
               "Expected: an SQL statement, found: #{token} at Line: #{line}, Column: #{column}"
@@ -215,10 +215,10 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
       do: expected("a privilege keyword", next)
   end
 
-  defp phrase("ATTACH", [{:word, _p, "DATABASE", _l, _c}, name | rest]), do: attached(name, rest)
+  defp phrase("ATTACH", [{:word, _p, "DATABASE", _l, _c} | rest]), do: phrase("ATTACH", rest)
   defp phrase("ATTACH", [name | rest]), do: attached(name, rest)
 
-  defp phrase("MERGE", [{:word, _p, "INTO", _l, _c}, name | rest]), do: merged(name, rest)
+  defp phrase("MERGE", [{:word, _p, "INTO", _l, _c} | rest]), do: phrase("MERGE", rest)
   defp phrase("MERGE", [name | rest]), do: merged(name, rest)
   defp phrase(_word, _rest), do: nil
 
@@ -406,7 +406,10 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
 
       {semicolon, _length} ->
         {line, column} =
-          position(at, blank <> String.duplicate(" ", length) <> binary_part(tail, 0, semicolon))
+          SQLTokenizer.advance(
+            at,
+            blank <> String.duplicate(" ", length) <> binary_part(tail, 0, semicolon)
+          )
 
         "; at Line: #{line}, Column: #{column}"
     end
@@ -465,7 +468,7 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
         &number/1,
         &quoted(&1, @single, "'"),
         &quoted(&1, @double, "\""),
-        &backtick/1,
+        &simple(&1, @backtick),
         &simple(&1, @dollar_string),
         &simple(&1, @placeholder),
         &simple(&1, @at),
@@ -517,14 +520,6 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
     end
   end
 
-  @spec backtick(binary()) :: {:ok, binary()} | nil
-  defp backtick(rest) do
-    case Regex.run(@backtick, rest) do
-      [token, _body] -> {:ok, token}
-      nil -> nil
-    end
-  end
-
   @spec simple(binary(), Regex.t()) :: {:ok, binary()} | nil
   defp simple(rest, pattern) do
     case Regex.run(pattern, rest) do
@@ -552,15 +547,6 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
           symbol == "!=" -> {:ok, "<>"}
           true -> {:ok, symbol}
         end
-    end
-  end
-
-  # The line and column of the first character after `blank`, which starts at `at`.
-  @spec position(SQLTokenizer.position(), binary()) :: SQLTokenizer.position()
-  defp position({line, column}, blank) do
-    case String.split(blank, "\n") do
-      [same_line] -> {line, column + String.length(same_line)}
-      lines -> {line + length(lines) - 1, String.length(List.last(lines)) + 1}
     end
   end
 end

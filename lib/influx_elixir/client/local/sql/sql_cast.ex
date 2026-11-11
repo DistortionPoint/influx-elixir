@@ -217,16 +217,12 @@ defmodule InfluxElixir.Client.Local.SQLCast do
   defp failure(value, type), do: "Can't cast value #{shown(value)} to type #{arrow_type(type)}"
 
   @spec shown(term()) :: binary()
-  defp shown(value) when is_float(value), do: Format.render_float(value)
-  defp shown({:u, value}), do: Integer.to_string(value)
-  defp shown({:int, _bits, value}), do: Integer.to_string(value)
-  defp shown(:inf), do: "inf"
-  defp shown(:neg_inf), do: "-inf"
-  defp shown(:nan), do: "NaN"
-  defp shown(value) when is_integer(value), do: Integer.to_string(value)
-  defp shown(value) when is_boolean(value), do: Atom.to_string(value)
   defp shown(%DateTime{} = value), do: DateTime.to_iso8601(value)
-  defp shown({:dec, coefficient, scale}), do: decimal_text(coefficient, scale)
+
+  defp shown(value) do
+    {:ok, text} = to_string_value(value)
+    text
+  end
 
   # A timestamp is cast as its nanoseconds, which a `DateTime` keeps only to
   # the microsecond. Into a type too narrow for them (every time after the

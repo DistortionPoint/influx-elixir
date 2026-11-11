@@ -526,9 +526,8 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
         {order_target(String.trim(target)), direction_atom(direction)}
 
       [_full, target, direction, nulls] ->
-        dir = if direction == "", do: :asc, else: direction_atom(direction)
         nulls = if String.upcase(nulls) == "FIRST", do: :nulls_first, else: :nulls_last
-        {order_target(String.trim(target)), {dir, nulls}}
+        {order_target(String.trim(target)), {direction_atom(direction), nulls}}
     end
   end
 

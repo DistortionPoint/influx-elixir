@@ -220,10 +220,13 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
 
   defp polarity({:not, [member]}), do: flip(polarity(member))
   defp polarity({:not, member}) when is_tuple(member), do: flip(polarity(member))
-  defp polarity({:eq, {:expr, inner}, true}), do: polarity(inner)
-  defp polarity({:eq, {:expr, inner}, false}), do: flip(polarity(inner))
-  defp polarity({:cmp, :eq, inner, {:lit, true}}), do: polarity(inner)
-  defp polarity({:cmp, :eq, inner, {:lit, false}}), do: flip(polarity(inner))
+
+  defp polarity({:eq, {:expr, inner}, bool}) when is_boolean(bool),
+    do: if(bool, do: polarity(inner), else: flip(polarity(inner)))
+
+  defp polarity({:cmp, :eq, inner, {:lit, bool}}) when is_boolean(bool),
+    do: if(bool, do: polarity(inner), else: flip(polarity(inner)))
+
   defp polarity({:or, _left, _right} = expr), do: merged(chain(expr, :or))
 
   defp polarity({:or, branches}) when is_list(branches) do
@@ -429,8 +432,8 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
        when op in [:in, :not_in] and is_list(literals),
        do: [{op, operand_key(operand), literals} | found]
 
-  defp collect_lists({:or, branches}, found), do: collect_lists(Enum.concat(branches), found)
-  defp collect_lists({:not, nodes}, found), do: collect_lists(nodes, found)
+  defp collect_lists({op, children}, found) when op in [:or, :not],
+    do: collect_lists(children, found)
 
   defp collect_lists(nodes, found) when is_list(nodes),
     do: Enum.reduce(nodes, found, &collect_lists/2)
@@ -503,12 +506,13 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   # `NULL`, a `NOT IN` of its operand and an `IN` list of its operand that is not beside it in
   # the tree (the double reads only the lists that are, `intersect/3`).
   @spec foldable_with_null(clause(), term(), [term()]) :: uncertainty() | nil
-  defp foldable_with_null({op, _operand, value}, _other, _literals)
-       when op in [:gt, :gte, :lt, :lte],
-       do: if(value == nil, do: :null_beside_null_comparison)
+  defp foldable_with_null({op, _operand, nil}, _other, _literals)
+       when op in [:eq, :gt, :gte, :lt, :lte],
+       do: :null_beside_null_comparison
 
-  defp foldable_with_null({:eq, _operand, nil}, _other, _literals),
-    do: :null_beside_null_comparison
+  defp foldable_with_null({op, _operand, _value}, _other, _literals)
+       when op in [:gt, :gte, :lt, :lte],
+       do: nil
 
   defp foldable_with_null({:eq, _operand, _literal}, _other, literals),
     do: if(nulls?(literals), do: :null_only_list_beside_equality)

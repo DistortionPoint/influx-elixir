@@ -161,21 +161,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   # An aggregate of a tag column answers nothing, alone: a query must select
   # a field to answer.
   @spec tag_argument?(InfluxQL.item(), MapSet.t(binary())) :: boolean()
-  defp tag_argument?({:aggregate, _fun, field, _alias}, tags) when is_binary(field),
-    do: MapSet.member?(tags, field)
-
-  defp tag_argument?({:aggregate, "count", {:distinct, field}, _alias}, tags),
-    do: MapSet.member?(tags, field)
-
-  defp tag_argument?(_item, _tags), do: false
+  defp tag_argument?(item, tags) do
+    case argument_field(item) do
+      nil -> false
+      field -> MapSet.member?(tags, field)
+    end
+  end
 
   # An aggregate of the `time` column answers nothing alone, as an aggregate of a tag does
   # (beside a field `count`, `first`, `last`, `min`, `max` and `mode` read the time of the
   # points, the others are the engine's planning error, see `InfluxQLPlan`).
   @spec time_argument?(InfluxQL.item()) :: boolean()
-  defp time_argument?({:aggregate, _fun, "time", _alias}), do: true
-  defp time_argument?({:aggregate, "count", {:distinct, "time"}, _alias}), do: true
-  defp time_argument?(_item), do: false
+  defp time_argument?(item), do: argument_field(item) == "time"
+
+  @spec argument_field(InfluxQL.item()) :: binary() | nil
+  defp argument_field({:aggregate, _fun, field, _alias}) when is_binary(field), do: field
+  defp argument_field({:aggregate, "count", {:distinct, field}, _alias}), do: field
+  defp argument_field(_item), do: nil
 
   # [{output_name, result, spec}]
   @spec compute(InfluxQL.item(), [map()], [binary()], MapSet.t(binary()), map()) ::

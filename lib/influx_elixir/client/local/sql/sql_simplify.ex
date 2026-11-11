@@ -163,8 +163,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
     do: bound |> simplify(context) |> finish(context) |> false_filter?()
 
   @spec false_filter?(tree()) :: boolean()
-  defp false_filter?({:const, false}), do: true
-  defp false_filter?(:null), do: true
+  defp false_filter?(tree) when tree in [{:const, false}, :null], do: true
 
   defp false_filter?({:leaf, {op, _operand, [nil | _more] = list}}) when op in [:in, :not_in],
     do: Enum.all?(list, &is_nil/1)

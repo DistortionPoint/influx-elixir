@@ -93,16 +93,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   @spec drop_unary_plus(list(), list()) :: list()
   @doc false
   def drop_unary_plus([], acc), do: Enum.reverse(acc)
-  def drop_unary_plus([{:raw, "+"} | rest], []), do: drop_unary_plus(rest, [])
 
-  def drop_unary_plus([{:raw, "+"} | rest], [{:op, _op} | _more] = acc),
-    do: drop_unary_plus(rest, acc)
-
-  def drop_unary_plus([{:raw, "+"} | rest], [{:raw, prev} | _more] = acc)
-      when prev in ["(", "+", "-", "*", "/"],
-      do: drop_unary_plus(rest, acc)
+  def drop_unary_plus([{:raw, "+"} | rest], acc) do
+    if unary_plus_before?(acc),
+      do: drop_unary_plus(rest, acc),
+      else: drop_unary_plus(rest, [{:raw, "+"} | acc])
+  end
 
   def drop_unary_plus([token | rest], acc), do: drop_unary_plus(rest, [token | acc])
+
+  @spec unary_plus_before?(list()) :: boolean()
+  defp unary_plus_before?([]), do: true
+  defp unary_plus_before?([{:op, _op} | _more]), do: true
+
+  defp unary_plus_before?([{:raw, prev} | _more]) when prev in ["(", "+", "-", "*", "/"],
+    do: true
+
+  defp unary_plus_before?(_acc), do: false
 
   @spec token_sql(tuple()) :: binary()
   defp token_sql({:ident, name}), do: ident_sql(name)

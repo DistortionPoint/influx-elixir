@@ -148,8 +148,6 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
     end
   end
 
-  defp skip_line(sql, pos) when pos >= byte_size(sql), do: byte_size(sql)
-
   defp skip_line(sql, pos) do
     case :binary.match(sql, "\n", scope: {pos, byte_size(sql) - pos}) do
       {at, _length} -> at
@@ -189,14 +187,10 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   defp word_before?(_sql, 0), do: false
 
   defp word_before?(sql, pos) do
-    case last_character(sql, pos) do
+    case sql |> binary_part(0, pos) |> String.last() do
       <<c::utf8>> -> SQLIdentifiers.word_char?(c)
       _other -> false
     end
-  end
-
-  defp last_character(sql, pos) do
-    sql |> binary_part(0, pos) |> String.last() |> Kernel.||("")
   end
 
   # The position after the closing quote of an escape string whose body starts at `pos`.
@@ -279,17 +273,16 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
         body = String.replace(raw_body, <<mark, mark>>, <<mark>>)
         raw = binary_part(text, 0, byte_size(text) - byte_size(after_quote))
         printed = <<mark>> <> body <> <<mark>>
-        {next_line, next_col} = advance(raw, line, col)
-        tokenize(after_quote, next_line, next_col, [{kind, printed, printed, line, col} | acc])
+        raw_token(text, raw, kind, printed, line, col, acc)
 
       :error ->
         :bail
     end
   end
 
-  # The line and column after `text`, which starts at `line`, `col`.
-  @spec advance(binary(), pos_integer(), pos_integer()) :: {pos_integer(), pos_integer()}
-  defp advance(text, line, col) do
+  @doc "The line and column after `text`, which starts at `{line, col}`."
+  @spec advance(position(), binary()) :: position()
+  def advance({line, col}, text) do
     case String.split(text, "\n") do
       [single] -> {line, col + String.length(single)}
       parts -> {line + length(parts) - 1, String.length(List.last(parts)) + 1}
@@ -313,7 +306,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   @spec raw_token(binary(), binary(), atom(), binary(), pos_integer(), pos_integer(), tokens()) ::
           result()
   defp raw_token(text, raw, kind, printed, line, col, acc) do
-    {next_line, next_col} = advance(raw, line, col)
+    {next_line, next_col} = advance({line, col}, raw)
     token = {kind, printed, printed, line, col}
     tokenize(binary_tail(text, raw), next_line, next_col, [token | acc])
   end
@@ -363,13 +356,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   # and `$`). Read by walking the bytes: a regex over the whole rest of the text validates all
   # of it as UTF-8 at every word, which makes a long statement cost the square of its length.
   @spec word_length(binary(), non_neg_integer()) :: non_neg_integer()
-  defp word_length(<<c::utf8, rest::binary>>, size) do
-    if SQLIdentifiers.word_char?(c) or c == ?$,
-      do: word_length(rest, size + byte_size(<<c::utf8>>)),
-      else: size
-  end
-
-  defp word_length(_end_or_invalid, size), do: size
+  defp word_length(text, size), do: span_length(text, true, size)
 
   @spec escape_string(binary(), binary(), pos_integer(), pos_integer(), tokens()) ::
           result()
@@ -427,13 +414,16 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   # Walked, not matched: a regex over the whole rest of the text validates all of it as UTF-8
   # at every `$`, which costs the square of the statement's length in placeholders.
   @spec tag_length(binary(), non_neg_integer()) :: non_neg_integer()
-  defp tag_length(<<c::utf8, rest::binary>>, size) do
-    if SQLIdentifiers.word_char?(c),
-      do: tag_length(rest, size + byte_size(<<c::utf8>>)),
+  defp tag_length(text, size), do: span_length(text, false, size)
+
+  @spec span_length(binary(), boolean(), non_neg_integer()) :: non_neg_integer()
+  defp span_length(<<c::utf8, rest::binary>>, allow_dollar?, size) do
+    if SQLIdentifiers.word_char?(c) or (allow_dollar? and c == ?$),
+      do: span_length(rest, allow_dollar?, size + byte_size(<<c::utf8>>)),
       else: size
   end
 
-  defp tag_length(_end_or_invalid, size), do: size
+  defp span_length(_end_or_invalid, _allow_dollar?, size), do: size
 
   @spec symbol(binary(), pos_integer(), pos_integer(), tokens()) :: result()
   defp symbol(text, line, col, acc) do

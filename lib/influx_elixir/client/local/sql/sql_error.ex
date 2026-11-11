@@ -174,11 +174,10 @@ defmodule InfluxElixir.Client.Local.SQLError do
   def tokenizer(message, line, column) do
     # The engine prints the error with Rust's Debug format, which escapes a
     # `"` or `\` inside the message (verified: `'\"'`).
-    debug = message |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")
-
     %{
       status: 400,
-      body: ~s|SQL error: TokenizerError("#{debug} at Line: #{line}, Column: #{column}")|
+      body:
+        ~s|SQL error: TokenizerError("#{debug_escape(message)} at Line: #{line}, Column: #{column}")|
     }
   end
 
@@ -189,9 +188,12 @@ defmodule InfluxElixir.Client.Local.SQLError do
   """
   @spec parser(binary()) :: t()
   def parser(message) do
-    debug = message |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")
-    %{status: 400, body: ~s|SQL error: ParserError("#{debug}")|}
+    %{status: 400, body: ~s|SQL error: ParserError("#{debug_escape(message)}")|}
   end
+
+  @spec debug_escape(binary()) :: binary()
+  defp debug_escape(message),
+    do: message |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")
 
   @doc """
   The engine's parser gives up on a statement nested deeper than its recursion limit of 50:

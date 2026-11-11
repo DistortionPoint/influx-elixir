@@ -182,19 +182,23 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
 
   @spec projected(SQLParser.projection(), unsigned()) :: [binary()]
   defp projected({source, output}, unsigned?) when is_binary(source),
-    do: if(unsigned?.(source), do: [output], else: [])
+    do: keep_unsigned(source, output, unsigned?)
 
   defp projected(_expression, _unsigned?), do: []
 
   @spec select_output(SQLParser.select_column(), unsigned()) :: [binary()]
   defp select_output({:grouping_column, source, output}, unsigned?),
-    do: if(unsigned?.(source), do: [output], else: [])
+    do: keep_unsigned(source, output, unsigned?)
 
   defp select_output({:ordered_aggregate, _agg, field, _ordering, output}, unsigned?),
-    do: if(unsigned?.(field), do: [output], else: [])
+    do: keep_unsigned(field, output, unsigned?)
 
   defp select_output({:selector, _kind, field, _ordering, :value, output}, unsigned?),
-    do: if(unsigned?.(field), do: [output], else: [])
+    do: keep_unsigned(field, output, unsigned?)
 
   defp select_output(_column, _unsigned?), do: []
+
+  @spec keep_unsigned(binary(), binary(), unsigned()) :: [binary()]
+  defp keep_unsigned(source, output, unsigned?),
+    do: if(unsigned?.(source), do: [output], else: [])
 end

@@ -60,11 +60,10 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   defp scan(<<?/, rest::binary>>, %{regex: true} = config, acc, last) when last in ["=~", "!~"],
     do: literal(rest, ?/, config, acc, 0)
 
-  defp scan(<<c::utf8, rest::binary>>, config, acc, last) when c < 128,
-    do: scan(rest, config, [c | acc], next_last(config, last, c))
-
-  defp scan(<<c::utf8, rest::binary>>, config, acc, last),
-    do: scan(rest, config, [<<c::utf8>> | acc], next_last(config, last, ?x))
+  defp scan(<<c::utf8, rest::binary>>, config, acc, last) do
+    byte = if c < 128, do: c, else: ?x
+    scan(rest, config, [<<c::utf8>> | acc], next_last(config, last, byte))
+  end
 
   defp scan(<<_byte, rest::binary>>, config, acc, _last),
     do: scan(rest, config, [0x7F | acc], "")
