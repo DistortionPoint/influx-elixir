@@ -142,11 +142,9 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
     start = integer(from)
     length = if count, do: integer(count)
 
-    cond do
-      not is_nil(length) and start == SQLLimits.int64_min() -> closed()
-      not is_nil(length) and length < 0 -> closed()
-      true -> slice(text, start, length)
-    end
+    if not is_nil(length) and (start == SQLLimits.int64_min() or length < 0),
+      do: closed(),
+      else: slice(text, start, length)
   end
 
   # The characters at positions `start` to `start + length - 1`, those the

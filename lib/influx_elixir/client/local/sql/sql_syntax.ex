@@ -497,10 +497,9 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # shape read whole (`dml_recursion/1`); any other statement is not read here, so its nesting is
   # bounded by its parentheses and prefix operators.
   @spec unread_verdict(tokens()) :: :ok | {:error, SQLError.t()}
-  defp unread_verdict([{:word, _p, word, _l, _c} | _rest]) when word in ["SELECT", "WITH"],
-    do: :ok
-
-  defp unread_verdict([{:symbol, _p, "(", _l, _c} | _rest]), do: :ok
+  defp unread_verdict([{_kind, _p, head, _l, _c} | _rest])
+       when head in ["SELECT", "WITH", "("],
+       do: :ok
 
   defp unread_verdict(tokens) do
     if state(:dml_read), do: :ok, else: bail_verdict(tokens)
@@ -566,10 +565,10 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     counted(fn -> rest |> value_rows() |> order_by() |> limit_offset() |> fetch_clause() end)
   end
 
-  defp insert_body([{:word, _p, word, _l, _c} | _rest] = tokens) when word in ["SELECT", "WITH"],
-    do: query(tokens)
+  defp insert_body([{_kind, _p, head, _l, _c} | _rest] = tokens)
+       when head in ["SELECT", "WITH", "("],
+       do: query(tokens)
 
-  defp insert_body([{:symbol, _p, "(", _l, _c} | _rest] = tokens), do: query(tokens)
   defp insert_body(_tokens), do: throw(:bail)
 
   defp value_rows([{:symbol, _p, "(", _l, _c} | rest]) do
@@ -620,10 +619,10 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp deep?([{:symbol, _p, ")", _l, _c} | rest], depth, _run),
     do: deep?(rest, max(depth - 1, 0), 0)
 
-  defp deep?([{:symbol, _p, sign, _l, _c} | rest], depth, run) when sign in ["-", "+"],
-    do: deep?(rest, depth, run + 1)
+  defp deep?([{_kind, _p, prefix, _l, _c} | rest], depth, run)
+       when prefix in ["-", "+", "NOT"],
+       do: deep?(rest, depth, run + 1)
 
-  defp deep?([{:word, _p, "NOT", _l, _c} | rest], depth, run), do: deep?(rest, depth, run + 1)
   defp deep?([_token | rest], depth, _run), do: deep?(rest, depth, 0)
 
   # The same over a text that could not be tokenized: its parentheses, quoted or not.
@@ -781,12 +780,9 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # ---------------------------------------------------------------------------
 
   @spec statement(tokens()) :: :ok | {:error, SQLError.t()}
-  defp statement([{:word, _printed, first, _line, _col} | _rest] = tokens)
-       when first in ["SELECT", "WITH"],
+  defp statement([{_kind, _printed, first, _line, _col} | _rest] = tokens)
+       when first in ["SELECT", "WITH", "("],
        do: read_query(tokens)
-
-  defp statement([{:symbol, _printed, "(", _line, _col} | _rest] = tokens),
-    do: read_query(tokens)
 
   # A statement that changes data is read whole by the DML reader, which has the parser's error
   # for it: where the text holds several statements (the parser reads each whole, the first with

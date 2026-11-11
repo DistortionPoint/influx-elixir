@@ -434,14 +434,12 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   defp dispatch_select(split, sql, qualifier) do
     cond do
-      split.columns == "*" and SQLClauses.empty_tuple_error(split.rest) ->
+      split.columns == "*" and
+          (SQLClauses.empty_tuple_error(split.rest) != nil or not SQLSelect.aggregate_query?(sql)) ->
         build_star_query(split.table, split.rest)
 
       SQLSelect.aggregate_query?(sql) ->
         parse_aggregate_select(split, sql, qualifier)
-
-      split.columns == "*" ->
-        build_star_query(split.table, split.rest)
 
       true ->
         build_columns_query(split.columns, split.table, split.rest, qualifier)
@@ -654,8 +652,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     do: expr |> SQLExpr.columns() |> Enum.reject(&(&1 in columns))
 
   @spec readable_expression?({binary() | {:expr, expr()}, direction()}) :: boolean()
-  defp readable_expression?({{:expr, {:unreadable, _text}}, _direction}), do: false
-  defp readable_expression?({{:expr, _expr}, _direction}), do: true
+  defp readable_expression?({{:expr, expr}, _direction}), do: elem(expr, 0) != :unreadable
   defp readable_expression?({_column, _direction}), do: false
 
   # Grouped rows have no source point to evaluate an expression against.
@@ -730,14 +727,10 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     columns =
       columns_str
       |> SQLMask.split_commas()
-      |> Enum.map(&String.trim/1)
-      |> Enum.map(&parse_projection_column(&1, qualifier))
+      |> Enum.map(&parse_projection_column(String.trim(&1), qualifier))
 
-    if Enum.any?(columns, &match?({:error, _}, &1)) do
-      Enum.find(columns, &match?({:error, _}, &1))
-    else
+    Enum.find(columns, &match?({:error, _}, &1)) ||
       {:ok, Enum.map(columns, fn {:ok, col} -> col end)}
-    end
   end
 
   # Parse a select item: a column (`name`, or a quoted `"a b"`), a constant,

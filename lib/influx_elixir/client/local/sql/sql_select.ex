@@ -370,8 +370,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   end
 
   @spec constant_value(SQLExpr.t()) :: term()
-  defp constant_value({:lit, value}), do: value
-  defp constant_value({:uint, value}), do: value
+  defp constant_value({kind, value}) when kind in [:lit, :uint], do: value
   defp constant_value({:param, _name} = param), do: param
 
   # FIRST()/LAST() are InfluxQL selectors, not SQL functions: the engine

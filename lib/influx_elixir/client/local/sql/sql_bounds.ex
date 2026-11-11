@@ -377,9 +377,8 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
 
   # The NULL literal as a condition (`NULL = NULL`) disables the analysis as the comparison of
   # `time` with NULL it stood for did, without reading a column of that name.
-  defp clause(_op, :null, _rhs, _type_of), do: [{:disabler, ["time"]}]
   defp clause(:is_not_null, "time", _rhs, _type_of), do: []
-  defp clause(_op, "time", _rhs, _type_of), do: [{:disabler, ["time"]}]
+  defp clause(_op, col, _rhs, _type_of) when col in [:null, "time"], do: [{:disabler, ["time"]}]
 
   defp clause(op, column, rhs, type_of) when is_binary(column) do
     case type_of.(column) do
@@ -414,8 +413,8 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   defp numeric(_op, _column, _type, _rhs), do: [{:unknown, "a predicate on a number"}]
 
   @spec bound(atom(), binary(), column_type(), term()) :: [leaf()]
-  defp bound(_op, column, _type, nil), do: [{:disabler, [column]}]
-  defp bound(_op, column, _type, text) when is_binary(text), do: [{:disabler, [column]}]
+  defp bound(_op, column, _type, rhs) when is_nil(rhs) or is_binary(rhs),
+    do: [{:disabler, [column]}]
 
   defp bound(_op, _column, _type, {:expr, _expr}),
     do: [{:unknown, "a column or expression compared"}]
@@ -441,8 +440,7 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   # The columns a predicate tree names; `:any` for what names none.
   @spec columns_of(term()) :: [binary() | :any]
   defp columns_of(nodes) when is_list(nodes), do: Enum.flat_map(nodes, &columns_of/1)
-  defp columns_of({:or, branches}), do: Enum.flat_map(branches, &columns_of/1)
-  defp columns_of({:not, nodes}), do: columns_of(nodes)
+  defp columns_of({kind, nodes}) when kind in [:or, :not], do: columns_of(nodes)
   defp columns_of({:truthy, column, _nil}), do: [column]
   defp columns_of({_op, {:expr, _expr}, _rhs}), do: [:any]
   defp columns_of({_op, column, _rhs}) when is_binary(column), do: [column]

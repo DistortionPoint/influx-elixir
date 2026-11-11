@@ -455,22 +455,21 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp rank(:where, {:pattern, kind, _operand, _rest}) when kind in [:like, :not_like],
     do: :where_coerced
 
-  defp rank(:where, {:cut, _call}), do: :where_coerced
-  defp rank(:where, {:lazy_cut, _call}), do: :where_coerced
-  defp rank(:where, {:null_cut, _call}), do: :where_coerced
-  defp rank(:where, {:case_cut, _call}), do: :where_coerced
+  defp rank(:where, {kind, _inner})
+       when kind in [:cut, :lazy_cut, :null_cut, :case_cut, :logical],
+       do: :where_coerced
+
   defp rank(:where, {:in_list, _operand, _values}), do: :where_coerced
-  defp rank(:where, {:logical, _tree}), do: :where_coerced
   defp rank(:where, {:logical_ops, _tree}), do: :where_logical
-  defp rank(:where, {:expr_check, {:is_bool, _inner, _value, _negated}}), do: :where_coerced
+
   # The cast of the operand of a `NOT` to a boolean fails after the errors of the operators and
   # calls over it (verified: `WHERE u % (NOT u)` is the error of the `%`).
-  defp rank(:where, {:expr_check, {:not, _inner}}), do: :where_coerced
   # The operators the type coercion types by themselves come after the operators and calls
   # that type their operands (verified: `WHERE floor(host IN (ok, NULL))` is the error of
   # `floor`, not of the `IN` under it).
-  defp rank(:where, {:expr_check, node}) when elem(node, 0) in [:in, :between, :like, :case],
-    do: :where_coerced
+  defp rank(:where, {:expr_check, node})
+       when elem(node, 0) in [:is_bool, :not, :in, :between, :like, :case],
+       do: :where_coerced
 
   defp rank(:where, {:range, _operand, _low, _high}), do: :where_coerced
   defp rank(:where, _item), do: :where_calls
@@ -641,9 +640,9 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp item_fields({:range, left, low, high}),
     do: own_fields([left | for({:expr, _expr} = value <- [low, high], do: value)])
 
-  defp item_fields({kind, _first} = node) when kind in [:neg, :pos], do: node_fields(node)
-  defp item_fields({:op, _op, _left, _right} = node), do: node_fields(node)
-  defp item_fields({:call, _name, _args} = node), do: node_fields(node)
+  defp item_fields(node) when is_tuple(node) and elem(node, 0) in [:neg, :pos, :op, :call],
+    do: node_fields(node)
+
   defp item_fields(item), do: SQLSchema.expr_fields(item)
 
   @spec node_fields(SQLExpr.t()) :: [SQLExpr.column_ref()]
@@ -653,8 +652,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   # not themselves items.
   @spec own_fields(term()) :: [SQLExpr.column_ref()]
   defp own_fields({:expr, expr}), do: own_fields(expr)
-  defp own_fields({:field, name}), do: [name]
-  defp own_fields({:uint_col, name}), do: [name]
+  defp own_fields({kind, name}) when kind in [:field, :uint_col], do: [name]
   defp own_fields(terms) when is_list(terms), do: Enum.flat_map(terms, &own_fields/1)
   defp own_fields(term) when is_tuple(term) and tuple_size(term) > 0, do: own_tuple_fields(term)
   defp own_fields(_leaf), do: []
@@ -666,20 +664,20 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   # The expressions `plan_items/2` makes an item of, wherever they stand.
   @spec item_term?(tuple()) :: boolean()
-  defp item_term?({:op, _op, _left, _right}), do: true
-  defp item_term?({:cmp, _op, _left, _right}), do: true
+  defp item_term?({kind, _first, _second, _third})
+       when kind in [:op, :cmp, :is_bool, :is_distinct, :case],
+       do: true
+
   defp item_term?({kind, _inner}) when kind in [:neg, :pos], do: true
   defp item_term?({:not, inner}), do: not is_list(inner)
-  defp item_term?({kind, _left, _right}) when kind in [:and, :or, :concat], do: true
-  defp item_term?({:cast, _inner, _type}), do: true
-  defp item_term?({:call, _name, _args}), do: true
-  defp item_term?({:constant, _call, _ancestors}), do: true
-  defp item_term?({:is_bool, _inner, _value, _negated}), do: true
-  defp item_term?({:is_distinct, _left, _right, _negated}), do: true
+
+  defp item_term?({kind, _first, _second})
+       when kind in [:and, :or, :concat, :cast, :call, :constant],
+       do: true
+
   defp item_term?({:in, _inner, items, _negated}), do: is_list(items)
   defp item_term?({:between, _inner, _low, _high, _negated}), do: true
   defp item_term?({:like, _inner, _pattern, _negated, _ilike, _regex}), do: true
-  defp item_term?({:case, _operand, _whens, _otherwise}), do: true
   defp item_term?(_other), do: false
 
   # The items are checked in order, each carrying what the ones before it typed (`memo`): an
@@ -1012,10 +1010,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp duration_use({kind, _first} = node) when kind in [:neg, :pos],
     do: if(Enum.any?(SQLExpr.children(node), &duration?/1), do: "a sign")
 
-  defp duration_use({:op, _op, _left, _right} = node),
-    do: if(Enum.any?(SQLExpr.children(node), &duration?/1), do: node_use(node))
-
-  defp duration_use({:call, _name, _args} = node),
+  defp duration_use(node) when is_tuple(node) and elem(node, 0) in [:op, :call],
     do: if(Enum.any?(SQLExpr.children(node), &duration?/1), do: node_use(node))
 
   defp duration_use(_item), do: nil
@@ -1098,12 +1093,9 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     do: check_item(call, context, columns, memo)
 
   # Only an IS NULL cuts the error of a call in the select list (verified against Core: a
-  # CAST, BETWEEN, IN, LIKE or NOT there leaves the planner's whole message).
-  defp check_item({:null_cut, call}, :select, columns, memo),
-    do: check_item(call, :select_cut, columns, memo)
-
-  # An operator the select list types only when it coerces the expression.
-  defp check_item({:lazy_cut, node}, :select, columns, memo),
+  # CAST, BETWEEN, IN, LIKE or NOT there leaves the planner's whole message); an operator the
+  # select list types only when it coerces the expression is cut the same way.
+  defp check_item({cut, node}, :select, columns, memo) when cut in [:null_cut, :lazy_cut],
     do: check_item(node, :select_cut, columns, memo)
 
   # A call among the later results of a `CASE` keeps the planner's words for its error, found

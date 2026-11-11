@@ -241,8 +241,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
 
   # A comparison with a null side is unknown.
   @spec compare(SQLExpr.comparison(), value(), value()) :: boolean() | nil
-  defp compare(_op, nil, _right), do: nil
-  defp compare(_op, _left, nil), do: nil
+  defp compare(_op, left, right) when is_nil(left) or is_nil(right), do: nil
 
   defp compare(op, left, right) do
     SQLCompare.wide_decimal_float(left, right)
@@ -252,8 +251,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   # SQL's three-valued logic: false decides an AND and true an OR; with
   # neither, a null on either side is unknown.
   @spec both(boolean() | nil, boolean() | nil) :: boolean() | nil
-  defp both(false, _right), do: false
-  defp both(_left, false), do: false
+  defp both(left, right) when false in [left, right], do: false
   defp both(true, true), do: true
   defp both(_left, _right), do: nil
 
@@ -343,8 +341,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   # cast above it can go: an integer type takes the literals that fit it, a
   # `UInt64` those that are not negative, and nothing else is unwrapped.
   @spec admits?(value(), [integer()]) :: boolean()
-  defp admits?(nil, _literals), do: true
-  defp admits?(value, _literals) when is_integer(value), do: true
+  defp admits?(value, _literals) when is_nil(value) or is_integer(value), do: true
   defp admits?({:u, _value}, literals), do: Enum.all?(literals, &(&1 >= 0))
   defp admits?({:int, bits, _value}, literals), do: Enum.all?(literals, &SQLCast.fits?(&1, bits))
   defp admits?(_other, _literals), do: false
@@ -362,8 +359,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
 
   @spec rewrite(SQLExpr.t()) :: SQLExpr.t()
   defp rewrite({:op, :*, {:lit, 1}, inner}), do: inner
-  defp rewrite({:op, :*, inner, {:lit, 1}}), do: inner
-  defp rewrite({:op, :/, inner, {:lit, 1}}), do: inner
+  defp rewrite({:op, op, inner, {:lit, 1}}) when op in [:*, :/], do: inner
 
   defp rewrite({:op, op, left, right}) when op in [:+, :*],
     do: if(left <= right, do: {:op, op, left, right}, else: {:op, op, right, left})
@@ -374,8 +370,10 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   # makes of an integer anyway.
   @spec outermost(SQLExpr.t()) :: SQLExpr.t()
   defp outermost({:op, :*, {:lit, one}, inner}) when one == 1.0, do: outermost(inner)
-  defp outermost({:op, :*, inner, {:lit, one}}) when one == 1.0, do: outermost(inner)
-  defp outermost({:op, :/, inner, {:lit, one}}) when one == 1.0, do: outermost(inner)
+
+  defp outermost({:op, op, inner, {:lit, one}}) when op in [:*, :/] and one == 1.0,
+    do: outermost(inner)
+
   defp outermost(expr), do: expr
 
   @spec without_cast(SQLExpr.t()) :: SQLExpr.t()

@@ -541,10 +541,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       after_by =~ ~q/^(?:time(?![\w])|(?:asc|desc)#{InfluxQLText.keyword_end()})/i ->
         unread()
 
-      after_by =~ ~q/^(?:asc|desc)(?![\w])/i ->
-        fail(:order_time, start + size, whole)
-
-      InfluxQLText.reserved_start(after_by) == nil and after_by =~ ~q/^[A-Za-z_]/ ->
+      after_by =~ ~q/^(?:asc|desc)(?![\w])/i or
+          (InfluxQLText.reserved_start(after_by) == nil and after_by =~ ~q/^[A-Za-z_]/) ->
         fail(:order_time, start + size, whole)
 
       true ->
@@ -573,13 +571,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
 
   # The clause a word names, as a literal: the words are matched by a fixed pattern, and an
   # atom is never made from the statement's text.
+  # A bad operand of `SOFFSET` is worded as one of `SLIMIT` (verified): the parser reads the
+  # two as one alternative.
   @spec count_clause(binary()) :: :limit | :offset | :slimit
   defp count_clause("limit"), do: :limit
   defp count_clause("offset"), do: :offset
-  defp count_clause("slimit"), do: :slimit
-  # A bad operand of `SOFFSET` is worded as one of `SLIMIT` (verified): the parser reads the
-  # two as one alternative.
-  defp count_clause("soffset"), do: :slimit
+  defp count_clause(clause) when clause in ["slimit", "soffset"], do: :slimit
 
   # `GROUP` must be followed by `BY`; `GROUP` or `GROUP BY` at the very end of
   # the text is unparsed, with blanks after it the dimension is wanted there.
@@ -862,10 +859,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
         Regex.match?(~q/\A[ \t\r\n(+\-]*\z/, before) ->
           :where_unparsed
 
-        Regex.match?(~q/(?:\A|[^\w])(?:AND|OR)\z/i, before) ->
-          {:operand_after, byte_size(before)}
-
-        Regex.match?(~q/(?:=~|!~|!=|<>|<=|>=|=|<|>)\z/, before) ->
+        Regex.match?(~q/(?:(?:\A|[^\w])(?:AND|OR)|=~|!~|!=|<>|<=|>=|=|<|>)\z/i, before) ->
           {:operand_after, byte_size(before)}
 
         true ->

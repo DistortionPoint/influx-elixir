@@ -1245,10 +1245,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
       {:ok, rows} ->
         run_select(query, rows, tags, opts)
 
-      {:error, %{body: "Error during planning: table " <> _rest}} ->
-        {:ok, []}
-
-      {:error, %{body: "Schema error: No field named" <> _rest}} ->
+      {:error, %{body: body}}
+      when binary_part(body, 0, min(byte_size(body), 28)) in [
+             "Error during planning: table",
+             "Schema error: No field named"
+           ] ->
         {:ok, []}
 
       # The planner raises its own coercion error of arithmetic or of a comparison (that of

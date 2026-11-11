@@ -522,9 +522,6 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # tables the query reads (not in a CTE, whose values carry their types).
   @spec unsigned_columns(SQLParser.parsed_query(), %{binary() => source()}, kinds_mode()) ::
           (binary() -> boolean())
-  defp unsigned_columns(_query, _sources, kinds) when kinds in [nil, :unchecked],
-    do: fn _column -> false end
-
   defp unsigned_columns(query, sources, kinds) do
     kind = column_kind(query, sources, kinds)
     fn column -> kind.(column) == @uinteger_kind end

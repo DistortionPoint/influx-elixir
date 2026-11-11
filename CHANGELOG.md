@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Consolidated duplicate clauses and redundant checks across `Client.Local` (`InfluxQLCheck`, `InfluxQLQuery`, `InfluxQLWhere`, `SQLBounds`, `SQLEval`, `SQLExecutor`, `SQLParser`, `SQLPlan`, `SQLScalar`, `SQLSelect`, and `SQLSyntax`).**
+  Combined duplicate `:order_time`, `count_clause/1`, and `:operand_after` branches in `InfluxQLCheck`, unified missing-table and missing-field result handling in `InfluxQLQuery.influxql_result/4`, simplified `engine_time_error/3`, `parse_atom/1`, `comparison/3`, and `string_partner?/2` in `InfluxQLWhere`, combined `clause/4`, `bound/4`, and `columns_of/1` clauses in `SQLBounds`, simplified `compare/3`, `both/2`, `admits?/2`, `rewrite/1`, and `outermost/1` in `SQLEval`, removed the redundant `unsigned_columns/3` guard in `SQLExecutor`, simplified `dispatch_select/3`, `readable_expression?/1`, and `parse_projection_columns/2` in `SQLParser`, consolidated `rank/2`, `item_fields/1`, `own_fields/1`, `item_term?/1`, `duration_use/1`, and `check_item/4` in `SQLPlan`, simplified `substring/3` in `SQLScalar` and `constant_value/1` in `SQLSelect`, and unified query-head and prefix-depth checks in `SQLSyntax`.
+
 ## [0.1.65] - 2026-11-10
 
 ### Changed

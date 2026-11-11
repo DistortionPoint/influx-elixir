@@ -154,9 +154,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp engine_time_error(tokens, tags, times) do
     time_plan(tokens, tags, times)
   catch
-    {:refused, {:engine, _status, _body}} = engine -> throw(engine)
-    {:refused, {:engine, _body}} = engine -> throw(engine)
-    {:refused, _message} -> :ok
+    {:refused, reason} = engine when is_tuple(reason) and elem(reason, 0) == :engine ->
+      throw(engine)
+
+    {:refused, _message} ->
+      :ok
   end
 
   defp late_clash(_where, _ctx, body, false), do: {:error, {:engine, body}}
@@ -312,16 +314,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   # A group opens a condition when it closes before an `AND`, an `OR` or the end and holds a
   # comparison or connective; `(a + b) > 1` is an expression and stays a comparison.
   defp parse_atom([{:nested, inside, condition?, _facts} | after_group] = items) do
-    case after_group do
-      [next | _more] when condition? ->
-        if boundary?(next), do: group(inside, after_group), else: comparison(items)
-
-      [] when condition? ->
-        group(inside, [])
-
-      _expression ->
-        comparison(items)
-    end
+    if condition? and (after_group == [] or boundary?(hd(after_group))),
+      do: group(inside, after_group),
+      else: comparison(items)
   end
 
   defp parse_atom(items), do: comparison(items)
@@ -339,14 +334,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   defp comparison([], _depth, acc), do: {{:cmp, Enum.reverse(acc)}, []}
 
-  defp comparison([{:raw, word} = token | rest], 0, acc) do
-    if String.upcase(word) in ["AND", "OR"],
+  defp comparison([{:raw, word} = token | rest], depth, acc) do
+    if depth == 0 and String.upcase(word) in ["AND", "OR"],
       do: {{:cmp, Enum.reverse(acc)}, [token | rest]},
-      else: comparison(rest, depth_after(word, 0), [token | acc])
+      else: comparison(rest, depth_after(word, depth), [token | acc])
   end
-
-  defp comparison([{:raw, word} = token | rest], depth, acc),
-    do: comparison(rest, depth_after(word, depth), [token | acc])
 
   # A condition in parentheses that holds nothing the comparison's own tokens are read for (no
   # time, duration, call or column the measurement lacks in it) is read here, once, and the
@@ -642,8 +634,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   defp absent_with_string_partner?(_tokens, _tags), do: false
 
-  defp string_partner?({:str, _content}, _tags), do: true
-  defp string_partner?({:regex, _pattern}, _tags), do: true
+  defp string_partner?({kind, _value}, _tags) when kind in [:str, :regex], do: true
   defp string_partner?({:raw, word}, _tags), do: InfluxQLTokens.boolean_word?(word)
   defp string_partner?({:ident, name}, tags), do: MapSet.member?(tags, name)
   defp string_partner?(_token, _tags), do: false
