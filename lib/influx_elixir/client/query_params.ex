@@ -116,15 +116,10 @@ defmodule InfluxElixir.Client.QueryParams do
     do: {:error, {:invalid_param, name, :unsupported_type}}
 
   defp encodable(name, value) do
-    case Jason.encode(value) do
+    case encode_json(value) do
       {:ok, _json} -> {:ok, value}
-      {:error, _exception} -> {:error, {:invalid_param, name, :unsupported_type}}
+      :error -> {:error, {:invalid_param, name, :unsupported_type}}
     end
-  rescue
-    # Jason raises instead of returning an error for an improper list and for a map key it
-    # cannot write (a tuple).
-    _error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError, ArgumentError] ->
-      {:error, {:invalid_param, name, :unsupported_type}}
   end
 
   @doc """
@@ -296,9 +291,8 @@ defmodule InfluxElixir.Client.QueryParams do
     magnitude = String.to_integer(text)
 
     cond do
-      magnitude > @i32_max and significand == 0 -> zero(positive)
-      magnitude > @i32_max and positive_exponent -> :out_of_range
-      magnitude > @i32_max -> zero(positive)
+      magnitude > @i32_max and (significand == 0 or not positive_exponent) -> zero(positive)
+      magnitude > @i32_max -> :out_of_range
       positive_exponent -> from_parts(positive, significand, exponent + magnitude)
       true -> from_parts(positive, significand, exponent - magnitude)
     end

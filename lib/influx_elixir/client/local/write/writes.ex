@@ -457,16 +457,9 @@ defmodule InfluxElixir.Client.Local.Writes do
   # valid target. Names seeded through `databases:` at start are accepted too,
   # so a v2 connection can be prepared either way.
   defp ensure_database(table, bucket, :v2) do
-    cond do
-      Store.bucket?(table, bucket) ->
-        :ok
-
-      Store.database?(table, bucket) ->
-        :ok
-
-      true ->
-        bucket_not_found(bucket)
-    end
+    if Store.bucket?(table, bucket) or Store.database?(table, bucket),
+      do: :ok,
+      else: bucket_not_found(bucket)
   end
 
   # The engine's answer for a bucket that does not exist (verified).

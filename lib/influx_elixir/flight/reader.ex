@@ -1011,11 +1011,11 @@ defmodule InfluxElixir.Flight.Reader do
         ) :: [term()]
   defp decode_column_values(
          @type_utf8,
-         [{oo, ol}, {doff, dlen} | _rest],
+         [offsets_spec, data_spec | _rest],
          body,
          _n
        ) do
-    decode_utf8_column(safe_slice(body, oo, ol), safe_slice(body, doff, dlen))
+    body |> slice(offsets_spec) |> offsets_list(4) |> var_width_values(slice(body, data_spec))
   end
 
   # One data buffer of fixed-width values. A Utf8 column without its data buffer lands here
@@ -1138,31 +1138,6 @@ defmodule InfluxElixir.Flight.Reader do
       else
         nil
       end
-    end
-  end
-
-  @spec decode_utf8_column(binary(), binary()) :: [binary() | nil]
-  defp decode_utf8_column(<<>>, _data), do: []
-
-  defp decode_utf8_column(offsets_bin, data_bin) do
-    n_offsets = div(byte_size(offsets_bin), 4)
-
-    if n_offsets < 2 do
-      []
-    else
-      offsets = for <<v::little-signed-32 <- offsets_bin>>, do: v
-
-      offsets
-      |> Enum.zip(Enum.drop(offsets, 1))
-      |> Enum.map(fn {start, stop} ->
-        len = stop - start
-
-        if len >= 0 and start >= 0 and start + len <= byte_size(data_bin) do
-          binary_part(data_bin, start, len)
-        else
-          nil
-        end
-      end)
     end
   end
 

@@ -138,20 +138,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLClauseScan do
     end
   end
 
-  defp blank_after?(rest, size) do
-    case rest do
-      <<_word::binary-size(size), c, _more::binary>> -> InfluxQLLex.is_blank(c)
-      _end -> false
-    end
-  end
+  defp blank_after?(rest, size),
+    do: match?(<<_word::binary-size(size), c, _more::binary>> when InfluxQLLex.is_blank(c), rest)
 
-  defp blank_or_open?(rest, size) do
-    case rest do
-      <<_word::binary-size(size), c, _more::binary>> ->
-        InfluxQLLex.is_blank(c) or c in [?(, ?+, ?-]
-
-      _end ->
-        false
-    end
-  end
+  defp blank_or_open?(rest, size),
+    do:
+      match?(
+        <<_word::binary-size(size), c, _more::binary>>
+        when InfluxQLLex.is_blank(c) or c in [?(, ?+, ?-],
+        rest
+      )
 end

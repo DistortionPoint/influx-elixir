@@ -156,8 +156,7 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   defp pinned({:or, a, b}) do
     case {pinned(a), pinned(b)} do
-      {:all, _b} -> :all
-      {_a, :all} -> :all
+      {left, right} when :all in [left, right] -> :all
       {a, b} -> Enum.uniq(a ++ b)
     end
   end
@@ -336,8 +335,7 @@ defmodule InfluxElixir.Client.Local.Flux do
   @spec series(predicate(), map()) :: boolean() | :unknown
   defp series({:and, a, b}, sample) do
     case {series(a, sample), series(b, sample)} do
-      {false, _b} -> false
-      {_a, false} -> false
+      {left, right} when false in [left, right] -> false
       {true, true} -> true
       _unknown -> :unknown
     end
@@ -345,8 +343,7 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   defp series({:or, a, b}, sample) do
     case {series(a, sample), series(b, sample)} do
-      {true, _b} -> true
-      {_a, true} -> true
+      {left, right} when true in [left, right] -> true
       {false, false} -> false
       _unknown -> :unknown
     end

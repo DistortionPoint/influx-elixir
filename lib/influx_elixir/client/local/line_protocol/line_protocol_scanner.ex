@@ -295,20 +295,18 @@ defmodule InfluxElixir.Client.Local.LineProtocolScanner do
   # outcome is the line as the engine quotes it.
   @spec parse_line(binary(), map()) ::
           {:ok, point(), binary()} | {:error, binary(), binary()}
-  defp parse_line(line, %{dialect: :v3, precision: precision}) do
-    case line |> LineProtocolEscape.trim_leading_blanks() |> LineProtocolV3.parse(precision) do
-      {:ok, point} -> {:ok, point, line}
-      {:error, message} -> {:error, message, line}
-    end
-  end
+  defp parse_line(line, %{dialect: :v3, precision: precision}),
+    do:
+      line
+      |> LineProtocolEscape.trim_leading_blanks()
+      |> LineProtocolV3.parse(precision)
+      |> with_shown(line)
 
   # InfluxDB 2 quotes the line after its leading whitespace in the error.
   defp parse_line(line, %{dialect: :v2, precision: precision}) do
     trimmed = skip_blanks(line, :v2)
-
-    case LineProtocolV2.parse(trimmed, precision) do
-      {:ok, point} -> {:ok, point, trimmed}
-      {:error, message} -> {:error, message, trimmed}
-    end
+    trimmed |> LineProtocolV2.parse(precision) |> with_shown(trimmed)
   end
+
+  defp with_shown({tag, payload}, shown), do: {tag, payload, shown}
 end

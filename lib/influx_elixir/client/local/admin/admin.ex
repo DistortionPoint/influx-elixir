@@ -4,8 +4,29 @@ defmodule InfluxElixir.Client.Local.Admin do
   # tokens and health. `Client.Local` is the public entry point and checks the
   # profile's capabilities before it calls here.
 
+  require InfluxElixir.Client.Local.SQLLimits
+
   alias InfluxElixir.Admin.TokenRequest
-  alias InfluxElixir.Client.Local.{Buckets, DatabaseRules, Format, Retention, Scope, Store}
+
+  alias InfluxElixir.Client.Local.{
+    Buckets,
+    DatabaseRules,
+    Format,
+    Retention,
+    Scope,
+    SQLLimits,
+    Store
+  }
+
+  @unencodable_errors [
+    FunctionClauseError,
+    Protocol.UndefinedError,
+    Jason.EncodeError,
+    Jason.DecodeError,
+    ArgumentError,
+    BadFunctionError,
+    BadArityError
+  ]
 
   @spec create_database(
           InfluxElixir.Client.connection(),
@@ -58,15 +79,7 @@ defmodule InfluxElixir.Client.Local.Admin do
         {:error, {:unencodable_body, Exception.message(error)}}
     end
   rescue
-    error in [
-      FunctionClauseError,
-      Protocol.UndefinedError,
-      Jason.EncodeError,
-      Jason.DecodeError,
-      ArgumentError,
-      BadFunctionError,
-      BadArityError
-    ] ->
+    error in @unencodable_errors ->
       {:error, {:unencodable_body, Exception.message(error)}}
   end
 
@@ -93,9 +106,6 @@ defmodule InfluxElixir.Client.Local.Admin do
     {:error, %{status: 400, body: "serde json error: " <> message}}
   end
 
-  @min_i64 -0x8000000000000000
-  @max_u64 0xFFFFFFFFFFFFFFFF
-
   # How serde names a JSON value its target type cannot take. An integer outside both i64
   # and u64 is parsed as a float, and one beyond every float is out of range.
   @spec unexpected(term()) :: what()
@@ -107,7 +117,8 @@ defmodule InfluxElixir.Client.Local.Admin do
   defp unexpected(value) when is_float(value),
     do: "invalid type: floating point `#{Format.render_serde_float(value)}`"
 
-  defp unexpected(value) when value in @min_i64..@max_u64, do: "invalid type: integer `#{value}`"
+  defp unexpected(value) when SQLLimits.is_int64(value) or SQLLimits.is_uint64(value),
+    do: "invalid type: integer `#{value}`"
 
   defp unexpected(value) do
     unexpected(:erlang.float(value))
@@ -292,25 +303,17 @@ defmodule InfluxElixir.Client.Local.Admin do
     json = Jason.encode!(secs)
 
     case Jason.decode!(json) do
-      sent when is_integer(sent) and sent in 0..@max_u64 ->
+      sent when SQLLimits.is_uint64(sent) ->
         {:ok, sent}
 
-      sent when is_integer(sent) and sent in @min_i64..-1//1 ->
+      sent when SQLLimits.is_int64(sent) ->
         serde_error("invalid value: integer `#{sent}`", json, body, "u64")
 
       sent ->
         serde_error(unexpected(sent), json, body, "u64")
     end
   rescue
-    error in [
-      FunctionClauseError,
-      Protocol.UndefinedError,
-      Jason.EncodeError,
-      Jason.DecodeError,
-      ArgumentError,
-      BadFunctionError,
-      BadArityError
-    ] ->
+    error in @unencodable_errors ->
       {:error, {:unencodable_body, Exception.message(error)}}
   end
 

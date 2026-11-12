@@ -152,21 +152,16 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
         {:error,
          SQLError.refusal("unsupported LIMIT (a non-negative integer is required): #{sql}")}
 
-      Enum.any?(clauses, &match?({"OFFSET", :other}, &1)) ->
-        {:error, offset_refusal(sql)}
-
-      garbage? or too_many?(clauses) ->
-        {:error, offset_refusal(sql)}
+      garbage? or too_many?(clauses) or Enum.any?(clauses, &match?({"OFFSET", :other}, &1)) ->
+        {:error,
+         SQLError.refusal(
+           "unsupported LIMIT / OFFSET (non-negative integers are required): #{sql}"
+         )}
 
       true ->
         :ok
     end
   end
-
-  @spec offset_refusal(binary()) :: SQLError.t()
-  defp offset_refusal(sql),
-    do:
-      SQLError.refusal("unsupported LIMIT / OFFSET (non-negative integers are required): #{sql}")
 
   # One LIMIT and one OFFSET at most.
   @spec too_many?([{binary(), token()}]) :: boolean()

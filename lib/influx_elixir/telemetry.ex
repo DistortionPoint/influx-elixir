@@ -166,6 +166,11 @@ defmodule InfluxElixir.Telemetry do
     %{system_time: System.system_time(), monotonic_time: System.monotonic_time()}
   end
 
+  @spec duration_measurements(integer()) :: %{duration: integer(), monotonic_time: integer()}
+  defp duration_measurements(duration) do
+    %{duration: duration, monotonic_time: System.monotonic_time()}
+  end
+
   @doc deprecated:
          "Emitting the events by hand is not used by the library; wrap the operation in span_write/2"
   @doc """
@@ -187,11 +192,7 @@ defmodule InfluxElixir.Telemetry do
   """
   @spec write_stop(integer(), map()) :: :ok
   def write_stop(duration, metadata) do
-    :telemetry.execute(
-      @write_event ++ [:stop],
-      %{duration: duration, monotonic_time: System.monotonic_time()},
-      metadata
-    )
+    :telemetry.execute(@write_event ++ [:stop], duration_measurements(duration), metadata)
   end
 
   @doc deprecated:
@@ -221,11 +222,7 @@ defmodule InfluxElixir.Telemetry do
   """
   @spec write_exception(integer(), map()) :: :ok
   def write_exception(duration, metadata) do
-    :telemetry.execute(
-      @write_event ++ [:exception],
-      %{duration: duration, monotonic_time: System.monotonic_time()},
-      metadata
-    )
+    :telemetry.execute(@write_event ++ [:exception], duration_measurements(duration), metadata)
   end
 
   # ---------- Manual query events ----------
@@ -269,11 +266,7 @@ defmodule InfluxElixir.Telemetry do
   """
   @spec query_stop(integer(), map()) :: :ok
   def query_stop(duration, metadata) do
-    :telemetry.execute(
-      @query_event ++ [:stop],
-      %{duration: duration, monotonic_time: System.monotonic_time()},
-      metadata
-    )
+    :telemetry.execute(@query_event ++ [:stop], duration_measurements(duration), metadata)
   end
 
   @doc deprecated:
@@ -305,10 +298,6 @@ defmodule InfluxElixir.Telemetry do
   """
   @spec query_exception(integer(), map()) :: :ok
   def query_exception(duration, metadata) do
-    :telemetry.execute(
-      @query_event ++ [:exception],
-      %{duration: duration, monotonic_time: System.monotonic_time()},
-      metadata
-    )
+    :telemetry.execute(@query_event ++ [:exception], duration_measurements(duration), metadata)
   end
 end

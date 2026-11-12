@@ -260,11 +260,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
     byte = at_byte(ctx, after_show)
 
     cond do
-      byte == nil or rest(ctx, after_show) == ";" -> :ok
-      byte != "\r" and ws?(ctx, after_show) -> :ok
-      scanned.unclosed == after_show + 2 -> :ok
-      byte in [";" | InfluxQLText.operator_glue()] -> many1(ctx, after_show)
-      true -> {:error, {:engine, show_fail(ctx, after_show)}}
+      byte == nil or rest(ctx, after_show) == ";" or (byte != "\r" and ws?(ctx, after_show)) or
+          scanned.unclosed == after_show + 2 ->
+        :ok
+
+      byte in [";" | InfluxQLText.operator_glue()] ->
+        many1(ctx, after_show)
+
+      true ->
+        {:error, {:engine, show_fail(ctx, after_show)}}
     end
   end
 
@@ -301,8 +305,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
     end
   end
 
-  defp kind(ctx, _at, "databases", to), do: clauses(ctx, to, new(:databases))
-  defp kind(ctx, _at, "measurements", to), do: clauses(ctx, to, new(:measurements))
+  defp kind(ctx, _at, word, to) when word in ["databases", "measurements"],
+    do: clauses(ctx, to, new(String.to_existing_atom(word)))
 
   defp kind(ctx, at, "retention", to),
     do:
