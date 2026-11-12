@@ -130,11 +130,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
 
   # The words of the error print both expressions: the refusal names the first that the double
   # does not print, by what it cannot print of it.
-  defp verdict({:duplicate, {_position, nil, first_operand}, _second}, ctx),
-    do: unprintable(first_operand, ctx)
-
-  defp verdict({:duplicate, _first, {_position, nil, second_operand}}, ctx),
-    do: unprintable(second_operand, ctx)
+  defp verdict(
+         {:duplicate, {_pos, first_shown, first_op}, {_pos2, _second_shown, second_op}},
+         ctx
+       ),
+       do: unprintable(if(is_nil(first_shown), do: first_op, else: second_op), ctx)
 
   defp verdict(%{}, _ctx), do: :ok
 
@@ -306,10 +306,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
   defp render(_other, _ctx, _mode), do: :unknown
 
   @spec test_word(:null | true | false | :unknown) :: binary()
-  defp test_word(:null), do: "NULL"
-  defp test_word(true), do: "TRUE"
-  defp test_word(false), do: "FALSE"
-  defp test_word(:unknown), do: "UNKNOWN"
+  defp test_word(what), do: what |> Atom.to_string() |> String.upcase()
 
   # An operand of an operator, in parentheses where it is an operator of a lower precedence.
   @spec child(SQLDmlExpr.ast(), binary(), SQLDmlOperand.ctx(), mode()) :: binary() | :unknown

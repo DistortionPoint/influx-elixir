@@ -13,7 +13,6 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
 
   require SQLLimits
 
-  @typep dialect :: LineProtocolParser.dialect()
   @typep precision :: LineProtocolParser.precision()
   @typep point :: LineProtocolParser.point()
 
@@ -55,7 +54,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
          {:ok, fields} <- v2_fields(binary_part(buf, fields_start, fields_end - fields_start)) do
       tags = Map.new(tags_raw, fn {k, v} -> {v2_tag_name(k), v2_tag_name(v)} end)
 
-      with {:ok, fields} <- check_columns(tags, fields, :v2) do
+      with {:ok, fields} <- check_columns(tags, fields) do
         point = %{
           measurement: v2_name(measurement_raw),
           tags: tags,
@@ -523,11 +522,11 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
 
   # InfluxDB 2 keeps tags and fields in separate namespaces, refuses a
   # `time` tag and drops a `time` field.
-  @spec check_columns(map(), map(), dialect()) :: {:ok, map()} | {:error, binary()}
-  defp check_columns(tags, _fields, :v2) when is_map_key(tags, "time"),
+  @spec check_columns(map(), map()) :: {:ok, map()} | {:error, binary()}
+  defp check_columns(tags, _fields) when is_map_key(tags, "time"),
     do: {:error, "cannot use reserved tag key \"time\""}
 
-  defp check_columns(_tags, fields, :v2), do: {:ok, Map.delete(fields, "time")}
+  defp check_columns(_tags, fields), do: {:ok, Map.delete(fields, "time")}
 
   @spec v2_tag_name(binary()) :: binary()
   defp v2_tag_name(str), do: LineProtocolEscape.unescape_v2(str, [?\s, ?,, ?=])

@@ -95,15 +95,11 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
 
   # A number is read whole (`SQLIdentifiers.take_number/1`), so a letter after it begins a
   # word of its own: `1e'a'` is `1` and the escape string `e'a'`.
-  defp scan(<<c, _rest::binary>> = input, state, chunk) when c in ?0..?9 do
-    {number, after_number} = SQLIdentifiers.take_number(input)
-    scan(after_number, state, [number | chunk])
-  end
+  defp scan(<<c, _rest::binary>> = input, state, chunk) when c in ?0..?9,
+    do: scan_number(input, state, chunk)
 
-  defp scan(<<?., d, _rest::binary>> = input, state, chunk) when d in ?0..?9 do
-    {number, after_number} = SQLIdentifiers.take_number(input)
-    scan(after_number, state, [number | chunk])
-  end
+  defp scan(<<?., d, _rest::binary>> = input, state, chunk) when d in ?0..?9,
+    do: scan_number(input, state, chunk)
 
   # A word is read whole, so an `E` that ends one (`name'...'`) opens no
   # escape string; `E'` or `e'` at the start of a token does.
@@ -126,11 +122,17 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
     end
   end
 
+  @spec scan_number(binary(), state(), iodata()) :: {:ok, [binary()]} | {:error, SQLError.t()}
+  defp scan_number(input, state, chunk) do
+    {number, after_number} = SQLIdentifiers.take_number(input)
+    scan(after_number, state, [number | chunk])
+  end
+
   # `$name`: the name is read whole, so a name ending in `e` opens no escape
   # string.
   @spec placeholder(binary(), state(), iodata()) :: {:ok, [binary()]} | {:error, SQLError.t()}
   defp placeholder(rest, state, chunk) do
-    {name, after_name} = take_tag(rest, [])
+    {name, after_name} = take_word_chars(rest, false, [])
     scan(after_name, state, [name, ?$ | chunk])
   end
 
@@ -287,7 +289,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   end
 
   defp dollar(rest) do
-    {tag, after_tag} = take_tag(rest, [])
+    {tag, after_tag} = take_word_chars(rest, false, [])
 
     case after_tag do
       <<?$, body_and_rest::binary>> ->
@@ -305,36 +307,26 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   # (`b$$` is one word, which opens no dollar-quoted string).
   @spec take_word(binary()) :: {binary(), binary()}
   defp take_word(<<first::utf8, rest::binary>>) do
-    {tail, after_word} = take_tail(rest, [])
+    {tail, after_word} = take_word_chars(rest, true, [])
     {<<first::utf8>> <> tail, after_word}
   end
 
-  defp take_tail(<<c::utf8, rest::binary>> = input, acc) do
-    if SQLIdentifiers.word_char?(c) or c == ?$,
-      do: take_tail(rest, [<<c::utf8>> | acc]),
+  @spec take_word_chars(binary(), boolean(), [binary()]) :: {binary(), binary()}
+  defp take_word_chars(<<c::utf8, rest::binary>> = input, allow_dollar?, acc) do
+    if SQLIdentifiers.word_char?(c) or (allow_dollar? and c == ?$),
+      do: take_word_chars(rest, allow_dollar?, [<<c::utf8>> | acc]),
       else: {acc |> Enum.reverse() |> IO.iodata_to_binary(), input}
   end
 
-  defp take_tail(<<>>, acc), do: {acc |> Enum.reverse() |> IO.iodata_to_binary(), <<>>}
-
-  @spec take_tag(binary(), [binary()]) :: {binary(), binary()}
-  defp take_tag(<<c::utf8, rest::binary>> = input, acc) do
-    if SQLIdentifiers.word_char?(c),
-      do: take_tag(rest, [<<c::utf8>> | acc]),
-      else: {acc |> Enum.reverse() |> IO.iodata_to_binary(), input}
-  end
-
-  defp take_tag(<<>>, acc), do: {acc |> Enum.reverse() |> IO.iodata_to_binary(), <<>>}
+  defp take_word_chars(<<>>, _allow_dollar?, acc),
+    do: {acc |> Enum.reverse() |> IO.iodata_to_binary(), <<>>}
 
   @spec unterminated(char(), binary(), binary()) :: SQLError.t()
   defp unterminated(?', whole, input),
     do: located(whole, input, "Unterminated string literal")
 
-  defp unterminated(?", whole, input),
-    do: located(whole, input, "Expected close delimiter '\"' before EOF.")
-
-  defp unterminated(?`, whole, input),
-    do: located(whole, input, "Expected close delimiter '`' before EOF.")
+  defp unterminated(q, whole, input) when q in [?", ?`],
+    do: located(whole, input, "Expected close delimiter '#{<<q>>}' before EOF.")
 
   # The position of the text `input`, a suffix of `whole`.
   @spec located(binary(), binary(), binary()) :: SQLError.t()

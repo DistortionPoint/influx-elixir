@@ -130,14 +130,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   a checkpoint needs the type of an operand that holds it.
   """
   @spec eager(SQLDmlExpr.ast() | [SQLDmlExpr.ast()], ctx()) :: check()
-  def eager(list, ctx) when is_list(list) do
-    Enum.reduce_while(list, :ok, fn item, :ok ->
-      case eager(item, ctx) do
-        :ok -> {:cont, :ok}
-        failure -> {:halt, failure}
-      end
-    end)
-  end
+  def eager(list, ctx) when is_list(list), do: check_all(list, &eager(&1, ctx))
 
   def eager({:ref, parts}, ctx), do: compound(parts, ctx)
 
@@ -407,11 +400,15 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   end
 
   defp nullable({kind, _text}, _ctx) when kind in [:num, :str, :bool], do: false
-  defp nullable(:null, _ctx), do: true
-  defp nullable({kind, _text}, _ctx) when kind in [:param, :zero_param], do: true
   defp nullable({kind, inner}, ctx) when kind in [:neg, :pos, :not], do: nullable(inner, ctx)
   defp nullable({:cast, inner, _type, false}, ctx), do: nullable(inner, ctx)
+
+  defp nullable(node, _ctx)
+       when node == :null or (is_tuple(node) and elem(node, 0) in [:param, :zero_param]),
+       do: true
+
   defp nullable({:cast, _inner, _type, true}, _ctx), do: true
+
   defp nullable({:is, _inner, what, _negated}, _ctx) when not is_tuple(what), do: false
   defp nullable({:bin, _op, left, right}, ctx), do: any_nullable([left, right], ctx)
   defp nullable({:in, inner, items, _negated}, ctx), do: any_nullable([inner | items], ctx)
@@ -448,15 +445,18 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   @spec column?([SQLDmlExpr.name()], ctx()) :: boolean()
   def column?(parts, ctx), do: resolve(parts, ctx) == :ok
 
-  @spec unresolved(SQLDmlExpr.ast() | [SQLDmlExpr.ast()], ctx()) :: check()
-  defp unresolved(list, ctx) when is_list(list) do
+  @spec check_all([term()], (term() -> check())) :: check()
+  defp check_all(list, fun) do
     Enum.reduce_while(list, :ok, fn item, :ok ->
-      case unresolved(item, ctx) do
+      case fun.(item) do
         :ok -> {:cont, :ok}
         failure -> {:halt, failure}
       end
     end)
   end
+
+  @spec unresolved(SQLDmlExpr.ast() | [SQLDmlExpr.ast()], ctx()) :: check()
+  defp unresolved(list, ctx) when is_list(list), do: check_all(list, &unresolved(&1, ctx))
 
   defp unresolved({:ref, parts}, ctx) do
     case resolve(parts, ctx) do
@@ -476,20 +476,13 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp inference(operand, ctx), do: if(param?(operand), do: infer(operand, ctx, false), else: :ok)
 
   @spec infer(SQLDmlExpr.ast() | [SQLDmlExpr.ast()], ctx(), boolean()) :: check()
-  defp infer(list, ctx, cast?) when is_list(list) do
-    Enum.reduce_while(list, :ok, fn item, :ok ->
-      case infer(item, ctx, cast?) do
-        :ok -> {:cont, :ok}
-        failure -> {:halt, failure}
-      end
-    end)
-  end
+  defp infer(list, ctx, cast?) when is_list(list), do: check_all(list, &infer(&1, ctx, cast?))
 
   defp infer({:cast, _inner, _type, _try} = node, ctx, _cast?),
     do: infer(SQLDmlExpr.children(node), ctx, true)
 
   defp infer(node, ctx, cast?) do
-    with :ok <- beside_all(siblings(node), ctx, cast?),
+    with :ok <- check_all(siblings(node), &beside(&1, ctx, cast?)),
          do: infer(SQLDmlExpr.children(node), ctx, cast?)
   end
 
@@ -535,16 +528,6 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp param_peer(other, param) when is_param(param) and not is_param(other), do: [other]
   defp param_peer(_left, _right), do: []
 
-  @spec beside_all([{SQLDmlExpr.ast(), binary()}], ctx(), boolean()) :: check()
-  defp beside_all(siblings, ctx, cast?) do
-    Enum.reduce_while(siblings, :ok, fn sibling, :ok ->
-      case beside(sibling, ctx, cast?) do
-        :ok -> {:cont, :ok}
-        failure -> {:halt, failure}
-      end
-    end)
-  end
-
   # A timestamp beside a placeholder in arithmetic is the planner's own error, in words the double
   # has; but not inside a cast, whose operand the planner does not type until later.
   @spec beside({SQLDmlExpr.ast(), binary()}, ctx(), boolean()) :: check()
@@ -571,14 +554,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   # The names the planner reaches by typing an operand: those of the whole of it but what a test
   # of a value (`IS NULL`, `IS TRUE`) holds.
   @spec reachable(SQLDmlExpr.ast() | [SQLDmlExpr.ast()], ctx()) :: check()
-  defp reachable(list, ctx) when is_list(list) do
-    Enum.reduce_while(list, :ok, fn item, :ok ->
-      case reachable(item, ctx) do
-        :ok -> {:cont, :ok}
-        failure -> {:halt, failure}
-      end
-    end)
-  end
+  defp reachable(list, ctx) when is_list(list), do: check_all(list, &reachable(&1, ctx))
 
   defp reachable({:ref, parts}, ctx), do: typed_name(parts, ctx)
   defp reachable({:is, _inner, what, _negated}, _ctx) when not is_tuple(what), do: :ok
@@ -627,14 +603,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   end
 
   @spec reaching(SQLDmlExpr.ast() | [SQLDmlExpr.ast()], ctx()) :: check()
-  defp reaching(list, ctx) when is_list(list) do
-    Enum.reduce_while(list, :ok, fn item, :ok ->
-      case reaching(item, ctx) do
-        :ok -> {:cont, :ok}
-        failure -> {:halt, failure}
-      end
-    end)
-  end
+  defp reaching(list, ctx) when is_list(list), do: check_all(list, &reaching(&1, ctx))
 
   defp reaching({:ref, parts}, ctx), do: typed_name(parts, ctx)
   defp reaching({:is, _inner, what, _negated}, _ctx) when not is_tuple(what), do: :ok
@@ -792,7 +761,6 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
        do: :ok
 
   defp predicate_type({:call, name, _args}, _ctx) when name in @boolean_functions, do: :ok
-  defp predicate_type({:ordered, _call, _terms} = call, ctx), do: untyped(call, ctx)
 
   defp predicate_type({:ref, parts}, ctx) do
     {column, _quoted} = List.last(parts)
@@ -831,8 +799,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   # A value the planner cannot type is let by, and one it can is no boolean: the double knows
   # the first by the select item's errors of the same operand.
-  defp predicate_type({:bin, _op, _left, _right} = operand, ctx), do: untyped(operand, ctx)
-  defp predicate_type({:call, _name, _args} = call, ctx), do: untyped(call, ctx)
+  defp predicate_type(operand, ctx) when elem(operand, 0) in [:ordered, :bin, :call],
+    do: untyped(operand, ctx)
 
   defp predicate_type({:cast, _inner, _type, _try}, _ctx),
     do: {:refuse, "a WHERE that is a cast, which the planner types as the cast type"}
@@ -1256,13 +1224,12 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   @spec inferred([SQLDmlExpr.ast()], ctx()) :: [SQLDmlExpr.ast()]
   defp inferred(pair, %{infer: false}), do: pair
 
-  defp inferred([param, other], _ctx) when is_param(param) and not is_param(other),
-    do: [other, other]
-
-  defp inferred([other, param], _ctx) when is_param(param) and not is_param(other),
-    do: [other, other]
-
-  defp inferred(pair, _ctx), do: pair
+  defp inferred([left, right] = pair, _ctx) do
+    case param_peer(left, right) do
+      [other] -> [other, other]
+      [] -> pair
+    end
+  end
 
   # A literal that is neither a time nor a boolean.
   @spec other_literal?(SQLDmlExpr.ast()) :: boolean()
@@ -1326,8 +1293,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp calls({:call, name, []}, _ctx) when name in @now, do: []
   defp calls({:call, name, _args}, _ctx) when name in @aggregates, do: []
   defp calls({:ordered, {:call, name, _args}, _terms}, _ctx) when name in @aggregates, do: []
-  defp calls({:call, _name, _args} = call, _ctx), do: [call]
-  defp calls({:ordered, _call, _terms} = call, _ctx), do: [call]
+  defp calls({kind, _first, _second} = call, _ctx) when kind in [:call, :ordered], do: [call]
   defp calls({:is, _inner, _what, _negated}, _ctx), do: []
 
   # The planner types the operand of an `IN`, a `BETWEEN` and a `LIKE`, and the list, the bounds

@@ -222,8 +222,7 @@ defmodule InfluxElixir.Client.Local.SQLRegexRewrite do
   @spec repeat(binary()) :: :once | :zero | :many
   defp repeat(count) do
     case count |> String.split(",") |> Enum.map(&Integer.parse/1) do
-      [{times, ""}] -> exactly(times)
-      [{times, ""}, {times, ""}] -> exactly(times)
+      [{times, ""} | rest] when rest in [[], [{times, ""}]] -> exactly(times)
       _other -> :many
     end
   end

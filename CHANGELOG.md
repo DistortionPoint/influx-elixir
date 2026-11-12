@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Consolidated duplicate helpers, clauses, and unused arguments across `Client.Local` (`InfluxQLParser`, `InfluxQLSelectCheck`, `InfluxQLShow`, `LineProtocolV2`, `LineProtocolV3`, `SQLCompare`, `SQLDecimal`, `SQLDmlExpr`, `SQLDmlItem`, `SQLDmlOperand`, `SQLGrant`, `SQLLexer`, `SQLRegexRewrite`, and `SQLRustRegex`).**
+  Extracted `parse_alias/1` in `InfluxQLParser`, merged the `InfluxQLBlankRegex` alias in `InfluxQLSelectCheck`, combined the `offset > SQLLimits.int64_max()` clauses in `InfluxQLShow.window_error/2`, dropped the redundant `dialect` parameter in `LineProtocolV2.check_columns/2` and unused `measurement` parameter in `LineProtocolV3.v3_tag_map/3`, delegated `SQLCompare.text/1` and `SQLDecimal.decimal/1` to `SQLCast.cast/2` and combined `SQLDecimal.unscaled/1` overflow guards, consolidated `alias_word/1`, `finished/1`, and `select_alias/1` in `SQLDmlExpr`, simplified `verdict/2` and `test_word/1` in `SQLDmlItem`, extracted `check_all/2` and consolidated `nullable/2`, `predicate_type/2`, `inferred/2`, and `calls/2` in `SQLDmlOperand`, extracted `role_privilege/3` and `named_grantee/2` in `SQLGrant`, unified `scan_number/3`, `take_word_chars/3`, and `unterminated/3` in `SQLLexer`, simplified `repeat/1` in `SQLRegexRewrite`, and combined the unrecognized-escape clauses in `SQLRustRegex.escape/5`.
+
 ## [0.1.66] - 2026-11-11
 
 ### Changed

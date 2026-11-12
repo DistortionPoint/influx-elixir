@@ -22,7 +22,7 @@ defmodule InfluxElixir.Client.Local.SQLDecimal do
   # is 35 for `/` and `%`, 36 for `+` and `-`, and 38 for `*`. The precision of
   # any other shape of expression is not modelled and is refused by name.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLExprType}
+  alias InfluxElixir.Client.Local.{SQLCast, SQLError, SQLExpr, SQLExprType}
 
   import SQLExprType, only: [is_decimal_type: 1]
 
@@ -100,8 +100,8 @@ defmodule InfluxElixir.Client.Local.SQLDecimal do
   # The float times 1e15, as the engine computes it, or `:overflow` once it
   # no longer fits 127 bits.
   @spec unscaled(float() | :inf | :neg_inf) :: integer() | :overflow
-  defp unscaled(literal) when literal in [:inf, :neg_inf], do: :overflow
-  defp unscaled(literal) when abs(literal) >= 1.0e290, do: :overflow
+  defp unscaled(literal) when literal in [:inf, :neg_inf] or abs(literal) >= 1.0e290,
+    do: :overflow
 
   defp unscaled(literal) do
     product = literal * @scale
@@ -126,12 +126,7 @@ defmodule InfluxElixir.Client.Local.SQLDecimal do
 
   # An unscaled integer with 15 decimals.
   @spec decimal(integer()) :: binary()
-  defp decimal(value) do
-    digits = value |> abs() |> Integer.to_string() |> String.pad_leading(16, "0")
-    {whole, fraction} = String.split_at(digits, -15)
-    sign = if value < 0, do: "-", else: ""
-    sign <> whole <> "." <> fraction
-  end
+  defp decimal(value), do: SQLCast.cast({:dec, value, 15}, :string)
 
   # A float as Rust prints it with `{:?}`: the shortest digits that read back,
   # in exponent form at this size.

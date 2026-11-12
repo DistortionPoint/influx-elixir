@@ -1,13 +1,14 @@
 defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   @moduledoc false
   import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
-  alias InfluxElixir.Client.Local.InfluxQLBlankRegex
+
   # The checks the engine's parser makes on the select list and `FROM`, each
   # reporting the position the engine reports (see
   # `InfluxElixir.Client.Local.InfluxQLError`).
 
   alias InfluxElixir.Client.Local.{
     InfluxQLArgs,
+    InfluxQLBlankRegex,
     InfluxQLCheck,
     InfluxQLError,
     InfluxQLLex,

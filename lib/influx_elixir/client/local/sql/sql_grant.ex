@@ -199,20 +199,12 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   defp privilege_list(
          [{:word, _p, "DATABASE", _l, _c}, {:word, _p2, "ROLE", _l2, _c2} | rest],
          found
-       ) do
-    case grantee_name(rest) do
-      {:ok, name, rest} -> more_privileges(["DATABASE ROLE " <> name | found], rest)
-      {:bad, _token} = bad -> bad
-    end
-  end
+       ),
+       do: role_privilege("DATABASE ROLE ", rest, found)
 
   # `ROLE r`: a role is a privilege here, with a name.
-  defp privilege_list([{:word, _p, "ROLE", _l, _c} | rest], found) do
-    case grantee_name(rest) do
-      {:ok, name, rest} -> more_privileges(["ROLE " <> name | found], rest)
-      {:bad, _token} = bad -> bad
-    end
-  end
+  defp privilege_list([{:word, _p, "ROLE", _l, _c} | rest], found),
+    do: role_privilege("ROLE ", rest, found)
 
   # After a comma the parser wants a privilege, and says so at the token that is none.
   defp privilege_list([{kind, _p, _u, _l, _c} = token | _rest], [_found | _more])
@@ -220,6 +212,18 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
        do: {:keyword, token}
 
   defp privilege_list(_tokens, _found), do: :error
+
+  @spec role_privilege(binary(), [SQLTokenizer.token()], [binary()]) ::
+          {:ok, binary(), [SQLTokenizer.token()]}
+          | :error
+          | {:bad, SQLTokenizer.token()}
+          | {:keyword, SQLTokenizer.token()}
+  defp role_privilege(prefix, rest, found) do
+    case grantee_name(rest) do
+      {:ok, name, rest} -> more_privileges([prefix <> name | found], rest)
+      {:bad, _token} = bad -> bad
+    end
+  end
 
   @spec more_privileges([binary()], [SQLTokenizer.token()]) ::
           {:ok, binary(), [SQLTokenizer.token()]}
@@ -382,16 +386,18 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
 
   # `DATABASE ROLE d` and `APPLICATION ROLE a` are kinds of grantee of two words.
   defp grantee([{:word, _p, first, _l, _c}, {:word, _p2, "ROLE", _l2, _c2}, next | rest])
-       when first in ["DATABASE", "APPLICATION"] do
-    with {:ok, name, rest} <- grantee_name([next | rest]),
-         do: {:ok, first <> " ROLE " <> name, rest}
-  end
+       when first in ["DATABASE", "APPLICATION"],
+       do: named_grantee(first <> " ROLE ", [next | rest])
 
-  defp grantee([{:word, _p, kind, _l, _c}, next | rest]) when kind in @grantee_kinds do
-    with {:ok, name, rest} <- grantee_name([next | rest]), do: {:ok, kind <> " " <> name, rest}
-  end
+  defp grantee([{:word, _p, kind, _l, _c}, next | rest]) when kind in @grantee_kinds,
+    do: named_grantee(kind <> " ", [next | rest])
 
   defp grantee(tokens), do: grantee_name(tokens)
+
+  @spec named_grantee(binary(), [SQLTokenizer.token()]) :: named_or_not()
+  defp named_grantee(prefix, tokens) do
+    with {:ok, name, rest} <- grantee_name(tokens), do: {:ok, prefix <> name, rest}
+  end
 
   @spec grantee_name([SQLTokenizer.token()]) :: named_or_not()
   defp grantee_name([{:string, printed, _u, _l, _c} | rest]), do: {:ok, printed, rest}

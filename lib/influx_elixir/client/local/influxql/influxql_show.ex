@@ -58,11 +58,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLShow do
       limit != nil and limit > SQLLimits.int64_max() ->
         failed("eliminate_limit", "LIMIT must be >= 0", limit)
 
-      offset > SQLLimits.int64_max() and limit != nil ->
-        failed("push_down_limit", "OFFSET must be >=0", offset)
-
       offset > SQLLimits.int64_max() ->
-        failed("eliminate_limit", "OFFSET must be >=0", offset)
+        rule = if limit != nil, do: "push_down_limit", else: "eliminate_limit"
+        failed(rule, "OFFSET must be >=0", offset)
 
       true ->
         nil

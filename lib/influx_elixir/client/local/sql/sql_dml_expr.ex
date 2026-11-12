@@ -214,10 +214,10 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp alias_word([{:word, printed, _u, _l, _c} | rest]),
     do: {:ok, String.downcase(printed), rest}
 
-  defp alias_word([{:quoted, printed, _u, _l, _c} | rest]), do: quoted_alias(printed, rest)
-
   # A string beside the table is read as its alias (verified: `UPDATE main 'a' SET v = 1`).
-  defp alias_word([{:string, printed, _u, _l, _c} | rest]), do: quoted_alias(printed, rest)
+  defp alias_word([{kind, printed, _u, _l, _c} | rest]) when kind in [:quoted, :string],
+    do: quoted_alias(printed, rest)
+
   defp alias_word(tokens), do: {:ok, nil, tokens}
 
   # A quoted alias in lower case is the alias unquoted; one with capitals has other rules.
@@ -361,9 +361,12 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp limit(tokens), do: {:ok, false, tokens}
 
   @spec finished([token()]) :: :ok | {:error, SQLError.t()}
-  defp finished([{:eof, _p, _u, _l, _c}]), do: :ok
-  defp finished([{:symbol, ";", _u, _l, _c}]), do: :ok
-  defp finished([token | _rest]), do: {:error, SQLDdl.expected("end of statement", token)}
+  defp finished([token | _rest]),
+    do:
+      if(SQLDdl.end_of?(token),
+        do: :ok,
+        else: {:error, SQLDdl.expected("end of statement", token)}
+      )
 
   @spec expect_symbol([token()], binary()) :: {:ok, [token()]} | {:error, SQLError.t()}
   defp expect_symbol([{:symbol, symbol, _u, _l, _c} | rest], symbol), do: {:ok, rest}
@@ -656,18 +659,15 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
        when upper in @alias_reserved or upper in @join_words,
        do: {nil, tokens}
 
-  defp select_alias([{:word, printed, _upper, _l, _c} | rest]),
-    do: {alias_of(:word, printed), rest}
-
-  defp select_alias([{:string, printed, _upper, _l, _c} | rest]),
-    do: {alias_of(:quoted, printed), rest}
+  defp select_alias([{kind, printed, _upper, _l, _c} | rest]) when kind in [:word, :string],
+    do: {alias_of(kind, printed), rest}
 
   defp select_alias(tokens), do: {nil, tokens}
 
   # An unquoted alias is folded to lower case, a quoted one is as written.
   @spec alias_of(atom(), binary()) :: name()
   defp alias_of(:word, printed), do: {String.downcase(printed), false}
-  defp alias_of(:quoted, printed), do: {String.slice(printed, 1..-2//1), true}
+  defp alias_of(_quoted_or_string, printed), do: {String.slice(printed, 1..-2//1), true}
 
   @spec select_more([token()], [term()]) :: parsed([term()])
   defp select_more([{:symbol, ",", _u, _l, _c} | rest], found) do

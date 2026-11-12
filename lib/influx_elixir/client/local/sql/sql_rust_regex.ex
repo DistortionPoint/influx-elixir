@@ -427,16 +427,13 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   defp escape([<<letter>> | _rest], _at, _length, _groups, _cost) when letter in ~c"uU",
     do: {:unknown, @escape}
 
-  defp escape([<<letter>> | _rest], at, _length, _groups, _cost)
-       when letter in ?a..?z or letter in ?A..?Z,
-       do: {:error, at, at + 2, "unrecognized escape sequence"}
-
   defp escape([<<char>> | _rest], _at, _length, _groups, _cost) when char in [?<, ?>],
     do: :differs
 
   # The crate escapes ASCII punctuation (and space and controls) and nothing else.
-  defp escape([char | _rest], at, _length, _groups, _cost) when byte_size(char) > 1,
-    do: {:error, at, at + 2, "unrecognized escape sequence"}
+  defp escape([<<byte, rest_bytes::binary>> | _rest], at, _length, _groups, _cost)
+       when rest_bytes != <<>> or byte in ?a..?z or byte in ?A..?Z,
+       do: {:error, at, at + 2, "unrecognized escape sequence"}
 
   defp escape([_punctuation | rest], at, length, groups, cost),
     do: scan(rest, at + 2, length, groups, true, SQLRegexCost.atom(cost, 1))

@@ -50,7 +50,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
          {:ok, fields_raw, rest} <- v3_fields(skip_spaces(after_series)),
          {:ok, timestamp_text} <- v3_timestamp(rest),
          {:ok, timestamp} <- LineProtocolTime.parse_timestamp(timestamp_text, precision, :v3),
-         tags = v3_tag_map(line, measurement, tags_raw, after_series),
+         tags = v3_tag_map(line, tags_raw, after_series),
          {:ok, fields, field_order} <- v3_check_fields(tags, fields_raw),
          :ok <- v3_distinct_tags(tags, tags_raw) do
       point = %{
@@ -194,12 +194,12 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
 
   # The tag map. Nearly every series has no escape, and then its names are
   # what was written.
-  @spec v3_tag_map(binary(), binary(), [{binary(), binary()}], binary()) :: %{
+  @spec v3_tag_map(binary(), [{binary(), binary()}], binary()) :: %{
           binary() => binary()
         }
-  defp v3_tag_map(_line, _measurement, [], _after_series), do: %{}
+  defp v3_tag_map(_line, [], _after_series), do: %{}
 
-  defp v3_tag_map(line, _measurement, tags_raw, after_series) do
+  defp v3_tag_map(line, tags_raw, after_series) do
     series_size = byte_size(line) - byte_size(after_series)
 
     if :binary.match(line, "\\", scope: {0, series_size}) == :nomatch,

@@ -592,7 +592,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
         {:ok,
          {:aggregate, "count",
           {:distinct, InfluxQLText.unquote_ident(captures["arg"] <> captures["bare"])},
-          InfluxQLText.blank_to_nil(InfluxQLText.unquote_ident(captures["alias"]))}}
+          parse_alias(captures["alias"])}}
 
       captures = Regex.named_captures(@function, text) ->
         function_item(captures, text)
@@ -616,7 +616,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
   @spec expression(term(), binary(), binary()) :: {:ok, InfluxQL.item()} | {:error, binary()}
   defp expression(parsed, alias, text) do
-    alias = InfluxQLText.blank_to_nil(InfluxQLText.unquote_ident(alias))
+    alias = parse_alias(alias)
 
     case parsed do
       {:ok, {:agg, fun, field}} -> {:ok, {:aggregate, fun, field, alias}}
@@ -701,8 +701,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   end
 
   @spec function_item(map(), binary()) :: {:ok, InfluxQL.item()} | {:error, binary()}
-  defp function_item(%{"fn" => fun, "arg" => arg, "alias" => alias}, text) do
+  defp function_item(%{"fn" => fun, "arg" => arg, "alias" => raw_alias}, text) do
     fun = String.downcase(fun)
+    alias = parse_alias(raw_alias)
 
     cond do
       fun not in @aggregates ->
@@ -712,30 +713,29 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
         {:error, "unsupported InfluxQL (distinct(*))"}
 
       arg == "*" and fun != "count" ->
-        {:ok,
-         {:wild_call, fun, [], {:star, nil},
-          InfluxQLText.blank_to_nil(InfluxQLText.unquote_ident(alias))}}
+        {:ok, {:wild_call, fun, [], {:star, nil}, alias}}
 
       arg == "*" ->
-        {:ok,
-         {:aggregate, fun, :star, InfluxQLText.blank_to_nil(InfluxQLText.unquote_ident(alias))}}
+        {:ok, {:aggregate, fun, :star, alias}}
 
       true ->
         aggregate_item(fun, arg, alias, text)
     end
   end
 
-  @spec aggregate_item(binary(), binary(), binary(), binary()) ::
+  @spec aggregate_item(binary(), binary(), binary() | nil, binary()) ::
           {:ok, InfluxQL.item()} | {:error, binary()}
   defp aggregate_item(fun, arg, alias, text) do
-    alias = InfluxQLText.blank_to_nil(InfluxQLText.unquote_ident(alias))
-
     case InfluxQLLiteral.debug(arg) do
       {:ok, debug} -> {:ok, {:aggregate, fun, {:literal, debug}, alias}}
       {:error, message} -> {:error, "unsupported InfluxQL (#{message})"}
       :none -> signed_or_column(fun, arg, alias, text)
     end
   end
+
+  @spec parse_alias(binary()) :: binary() | nil
+  defp parse_alias(alias),
+    do: alias |> InfluxQLText.unquote_ident() |> InfluxQLText.blank_to_nil()
 
   # An argument that is a name, not a signed non-number.
   @spec signed_or_column(binary(), binary(), binary() | nil, binary()) ::

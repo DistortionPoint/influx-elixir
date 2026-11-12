@@ -6,7 +6,7 @@ defmodule InfluxElixir.Client.Local.SQLCompare do
   # them, a number against a string by the number's text, strings and
   # booleans by their own order.
 
-  alias InfluxElixir.Client.Local.{Format, SQLCast, SQLError, SQLNumber, SQLTime}
+  alias InfluxElixir.Client.Local.{SQLCast, SQLError, SQLNumber, SQLTime}
 
   # Both nil-actual (missing column) and nil-value (unparseable comparand)
   # short-circuit to false. Without this guard, Elixir term ordering would
@@ -153,12 +153,6 @@ defmodule InfluxElixir.Client.Local.SQLCompare do
   # `inf`.
   @doc "A value as the engine casts it to text."
   @spec text(term()) :: binary()
-  def text(value) when is_float(value), do: Format.render_float(value)
-  def text({:u, value}), do: Integer.to_string(value)
-  def text({:int, _bits, value}), do: Integer.to_string(value)
-  def text({:dec, _coefficient, _scale} = value), do: SQLCast.cast(value, :string)
-  def text(:inf), do: "inf"
-  def text(:neg_inf), do: "-inf"
-  def text(:nan), do: "NaN"
-  def text(value), do: to_string(value)
+  def text(%DateTime{} = value), do: to_string(value)
+  def text(value), do: SQLCast.cast(value, :string)
 end
