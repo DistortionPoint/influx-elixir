@@ -280,7 +280,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   end
 
   @spec column_arrow([SQLDmlExpr.name()], ctx()) :: binary() | nil
-  defp column_arrow(parts, ctx), do: ctx.types[parts |> List.last() |> elem(0)]
+  defp column_arrow(parts, ctx), do: ctx.types[SQLDmlExpr.last_name(parts)]
 
   # An operand the planner cannot find fault with: a chain of `||` whose every link is a text
   # beside a constant, a placeholder or a column, and arithmetic, a comparison, `AND` and `OR`
@@ -389,7 +389,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   @spec nullable(SQLDmlExpr.ast(), ctx()) :: boolean() | {:fail, check()} | :unknown
   defp nullable({:ref, parts}, ctx) do
-    {column, _quoted} = List.last(parts)
+    column = SQLDmlExpr.last_name(parts)
 
     case resolve(parts, ctx) do
       {:field_of, type} -> {:fail, {:error, indexed_field(type)}}
@@ -711,7 +711,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   @spec missing([SQLDmlExpr.name()], ctx()) :: map()
   defp missing(parts, ctx) do
-    {name, _quoted} = List.last(parts)
+    name = SQLDmlExpr.last_name(parts)
     printed = Enum.map_join(parts, ".", &SQLDmlName.quote_name/1)
     SQLDmlName.no_field(printed, name, ctx.relation_text, ctx.columns)
   end
@@ -763,7 +763,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp predicate_type({:call, name, _args}, _ctx) when name in @boolean_functions, do: :ok
 
   defp predicate_type({:ref, parts}, ctx) do
-    {column, _quoted} = List.last(parts)
+    column = SQLDmlExpr.last_name(parts)
 
     case resolve(parts, ctx) do
       {:field_of, _type} ->
@@ -1149,7 +1149,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   end
 
   @spec field_text([SQLDmlExpr.name()]) :: binary()
-  defp field_text(parts), do: parts |> List.last() |> elem(0) |> SQLDmlName.quote_always()
+  defp field_text(parts), do: parts |> SQLDmlExpr.last_name() |> SQLDmlName.quote_always()
 
   # The operand with each node the planner does not type through replaced by a stand-in of its
   # type, and the operands it holds that are typed anyway, to be planned on their own first.
@@ -1332,7 +1332,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp type_of({:bool, _value}, _ctx), do: :bool
   defp type_of(:null, _ctx), do: :null
   defp type_of({:param, _text}, _ctx), do: :null
-  defp type_of({:ref, parts}, ctx), do: column_type(ctx.types[parts |> List.last() |> elem(0)])
+  defp type_of({:ref, parts}, ctx), do: column_type(column_arrow(parts, ctx))
   defp type_of({:bin, op, _left, _right}, _ctx) when op in @comparisons, do: :bool
 
   defp type_of(node, _ctx)

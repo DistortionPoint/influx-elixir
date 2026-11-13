@@ -274,11 +274,10 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   end
 
   @spec pattern_type_error(atom(), term(), term()) :: binary()
-  defp pattern_type_error(op, _regex, value) when op in [:like, :not_like],
-    do: like_type_error(value)
-
-  defp pattern_type_error(_op, {_regex, symbol, _guard, _shape}, value),
-    do: regex_type_error(value, symbol)
+  defp pattern_type_error(op, rest, value) do
+    "type_coercion\ncaused by\nError during planning: " <>
+      SQLPlan.pattern_error(op, SQLPlan.arrow_type(value), rest)
+  end
 
   # The planner's text of a filter that is no condition.
   @spec filter_text(SQLExpr.t(), point()) :: binary()
@@ -366,21 +365,4 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   @spec to_nanoseconds(SQLParser.time_value()) :: integer() | nil
   defp to_nanoseconds({:now, offset_ns}), do: Store.now_ns() + offset_ns
   defp to_nanoseconds(value), do: value
-
-  # A regular expression against a non-string column (verified). The planner
-  # finds this first (`check_item/3`) when it knows the column's type; this
-  # is the answer when it only learns it from a value.
-  @spec regex_type_error(term(), binary()) :: binary()
-  defp regex_type_error(value, op) do
-    "type_coercion\ncaused by\nError during planning: " <>
-      SQLPlan.pattern_error(:regex, SQLPlan.arrow_type(value), {nil, op, nil, nil})
-  end
-
-  # DataFusion: "There isn't a common type to coerce Float64 and Utf8 in
-  # LIKE expression", naming the column's real type.
-  @spec like_type_error(term()) :: binary()
-  defp like_type_error(value) do
-    "type_coercion\ncaused by\nError during planning: " <>
-      SQLPlan.pattern_error(:like, SQLPlan.arrow_type(value), nil)
-  end
 end

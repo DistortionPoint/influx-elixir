@@ -347,7 +347,7 @@ defmodule InfluxElixir.Client.Local.SQLDml do
         {:halt, {:error, SQLError.planning("Tuples are not supported")}}
 
       {names, _value}, :ok ->
-        {name, _quoted} = List.last(names)
+        name = SQLDmlExpr.last_name(names)
 
         if name in columns,
           do: {:cont, :ok},
@@ -361,7 +361,7 @@ defmodule InfluxElixir.Client.Local.SQLDml do
 
   defp values(assignments, ctx) do
     assigned =
-      Map.new(assignments, fn {names, value} -> {names |> List.last() |> elem(0), value} end)
+      Map.new(assignments, fn {names, value} -> {SQLDmlExpr.last_name(names), value} end)
 
     columns = Enum.filter(ctx.columns, &is_map_key(assigned, &1))
 

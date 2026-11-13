@@ -821,7 +821,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # otherwise), then `LIMIT`.
   @spec execute_aggregate_query([point()], SQLParser.parsed_query()) :: [map()]
   defp execute_aggregate_query(points, %{distinct_rows: true} = query) do
-    names = for column <- query.select_columns, do: elem(column, tuple_size(column) - 1)
+    names = Enum.map(query.select_columns, &SQLSelect.column_output/1)
     keys = Enum.map(names, fn name -> {&Map.get(&1, name), :asc} end)
 
     rows =
@@ -879,7 +879,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   @spec hidden_group_columns([binary() | {:expr, SQLExpr.t()}], SQLParser.parsed_query()) ::
           [binary()]
   defp hidden_group_columns(columns, query) do
-    outputs = for column <- query.select_columns, do: elem(column, tuple_size(column) - 1)
+    outputs = Enum.map(query.select_columns, &SQLSelect.column_output/1)
     ordered = for {column, _direction} <- query.order_by, is_binary(column), do: column
 
     Enum.filter(columns, &(is_binary(&1) and &1 in ordered and &1 not in outputs))

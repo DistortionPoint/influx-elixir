@@ -136,7 +136,11 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
   # The engine's name for the expression: the aggregates by their own names.
   @spec default_name(SQLExpr.t(), [{binary(), SQLSelect.column()}], binary() | nil) :: binary()
   defp default_name(expr, aggs, qualifier) do
-    names = Map.new(aggs, fn {placeholder, column} -> {placeholder, last(column)} end)
+    names =
+      Map.new(aggs, fn {placeholder, column} ->
+        {placeholder, SQLSelect.column_output(column)}
+      end)
+
     expr |> named(names) |> SQLExpr.render(qualifier, :drop)
   end
 
@@ -196,7 +200,11 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
           binary()
         ) :: :ok | {:error, SQLError.t()}
   defp check_having(nodes, aggs, groups, select_columns, text) do
-    outputs = for column <- select_columns, elem(column, 0) != :grouping_column, do: last(column)
+    outputs =
+      for column <- select_columns,
+          elem(column, 0) != :grouping_column,
+          do: SQLSelect.column_output(column)
+
     named? = Enum.any?(SQLWhere.conjunction_columns(nodes), &(&1 in outputs))
 
     cond do
@@ -225,7 +233,4 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
   @doc "Whether a column name is one of the aggregates' names."
   @spec placeholder?(binary()) :: boolean()
   def placeholder?(name), do: Regex.match?(~r/\A__ag\d+__\z/, name)
-
-  @spec last(tuple()) :: term()
-  defp last(tuple), do: elem(tuple, tuple_size(tuple) - 1)
 end

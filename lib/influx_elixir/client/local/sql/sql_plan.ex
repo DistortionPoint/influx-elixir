@@ -526,7 +526,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   @spec filter_outputs(SQLParser.parsed_query()) :: [{binary(), binary() | :unrenderable}]
   defp filter_outputs(query) do
     for column <- query.select_columns || [] do
-      {elem(column, tuple_size(column) - 1), SQLGrouping.filter_term(column, query.measurement)}
+      {SQLSelect.column_output(column), SQLGrouping.filter_term(column, query.measurement)}
     end
   end
 

@@ -1265,4 +1265,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp sql_operator("!="), do: "<>"
   defp sql_operator("<=>"), do: "IS NOT DISTINCT FROM"
   defp sql_operator(op), do: op
+
+  @doc "The last name of a dotted reference."
+  @spec last_name([name()]) :: binary()
+  def last_name(parts), do: parts |> List.last() |> elem(0)
 end

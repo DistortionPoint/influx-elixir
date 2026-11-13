@@ -238,17 +238,12 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
   # `[{column, qualifier}]` for the column that follows a qualifier.
   @spec written_with(binary(), binary()) :: [{binary(), binary()}]
   defp written_with(token, rest) do
-    qualifier = token |> String.trim_trailing(".") |> bare_identifier()
+    qualifier = token |> String.trim_trailing(".") |> SQLLiteral.unquoted()
 
     case Regex.run(~r/\A(?:("(?:[^"]|"")*")|(\w+))/u, rest) do
-      [_full, column] -> [{bare_identifier(column), qualifier}]
+      [_full, column] -> [{SQLLiteral.unquoted(column), qualifier}]
       [_full, "", column] -> [{column, qualifier}]
       nil -> []
     end
-  end
-
-  @spec bare_identifier(binary()) :: binary()
-  defp bare_identifier(text) do
-    if SQLLiteral.identifier?(text), do: SQLLiteral.identifier_name(text), else: text
   end
 end

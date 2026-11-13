@@ -553,15 +553,8 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
 
   @spec bound_intervals([leaf()], binary()) :: [SQLBoundsExpr.interval()]
   defp bound_intervals(leaves, column) do
-    for {:bound, ^column, _type, op, x} <- leaves, do: bound_interval(op, x * 1.0)
+    for {:bound, ^column, _type, op, x} <- leaves, do: SQLBoundsExpr.interval(op, x * 1.0)
   end
-
-  @spec bound_interval(atom(), float()) :: SQLBoundsExpr.interval()
-  defp bound_interval(:gt, x), do: {x, true, :inf, false}
-  defp bound_interval(:gte, x), do: {x, false, :inf, false}
-  defp bound_interval(:lt, x), do: {:neg_inf, false, x, true}
-  defp bound_interval(:lte, x), do: {:neg_inf, false, x, false}
-  defp bound_interval(:eq, x), do: {x, false, x, false}
 
   # A float literal against an integer column is a bound of the column cast
   # to a double.

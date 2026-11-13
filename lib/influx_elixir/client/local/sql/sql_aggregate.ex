@@ -54,7 +54,7 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     end
 
     Enum.reduce(columns, %{}, fn column, row ->
-      put(row, elem(column, tuple_size(column) - 1), column_result(column, points, bucket_ts))
+      put(row, SQLSelect.column_output(column), column_result(column, points, bucket_ts))
     end)
   end
 
@@ -134,7 +134,7 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   # Whether a `HAVING` reads the name of a select item (and so needs the row).
   @spec names_outputs?(SQLAggExpr.having_t(), [SQLSelect.column()]) :: boolean()
   defp names_outputs?(%{nodes: nodes}, columns) do
-    outputs = Enum.map(columns, &elem(&1, tuple_size(&1) - 1))
+    outputs = Enum.map(columns, &SQLSelect.column_output/1)
     Enum.any?(SQLWhere.conjunction_columns(nodes), &(&1 in outputs))
   end
 

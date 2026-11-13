@@ -518,17 +518,20 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   # last ascending and first descending (verified); the direction then
   # stays a bare atom and the executor applies that default.
   defp parse_order_term(term) do
-    case SQLMask.run(~r/^(.+?)(?<=\S)(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?$/isu, term) do
-      [_full, target] ->
-        {order_target(String.trim(target)), :asc}
+    [_full, target | tail] =
+      SQLMask.run(~r/^(.+?)(?<=\S)(?:\s+(ASC|DESC))?(?:\s+NULLS\s+(FIRST|LAST))?$/isu, term)
 
-      [_full, target, direction] ->
-        {order_target(String.trim(target)), direction_atom(direction)}
+    {order_target(String.trim(target)), order_direction(tail)}
+  end
 
-      [_full, target, direction, nulls] ->
-        nulls = if String.upcase(nulls) == "FIRST", do: :nulls_first, else: :nulls_last
-        {order_target(String.trim(target)), {direction_atom(direction), nulls}}
-    end
+  @spec order_direction([binary()]) ::
+          :asc | :desc | {:asc | :desc, :nulls_first | :nulls_last}
+  defp order_direction([]), do: :asc
+  defp order_direction([direction]), do: direction_atom(direction)
+
+  defp order_direction([direction, nulls]) do
+    nulls_atom = if String.upcase(nulls) == "FIRST", do: :nulls_first, else: :nulls_last
+    {direction_atom(direction), nulls_atom}
   end
 
   @spec order_target(binary()) :: binary() | {:expr, SQLExpr.t()}

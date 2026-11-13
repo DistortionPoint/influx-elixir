@@ -222,10 +222,10 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   defp polarity({:not, member}) when is_tuple(member), do: flip(polarity(member))
 
   defp polarity({:eq, {:expr, inner}, bool}) when is_boolean(bool),
-    do: if(bool, do: polarity(inner), else: flip(polarity(inner)))
+    do: bool_polarity(inner, bool)
 
   defp polarity({:cmp, :eq, inner, {:lit, bool}}) when is_boolean(bool),
-    do: if(bool, do: polarity(inner), else: flip(polarity(inner)))
+    do: bool_polarity(inner, bool)
 
   defp polarity({:or, _left, _right} = expr), do: merged(chain(expr, :or))
 
@@ -236,6 +236,10 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   end
 
   defp polarity(_member), do: nil
+
+  @spec bool_polarity(term(), boolean()) :: {term(), boolean()} | nil
+  defp bool_polarity(inner, true), do: polarity(inner)
+  defp bool_polarity(inner, false), do: flip(polarity(inner))
 
   # The members of an `OR` that are all equalities or `IN` lists of one operand: the engine
   # merges them into one `IN` list before it folds that with another.
@@ -776,19 +780,18 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   defp key(class, {:uint, value}), do: key(class, value)
 
   defp key(:i64, value) when SQLLimits.is_int64(value), do: {:i64, value}
-  defp key(:i64, value) when is_integer(value), do: {:wide, value}
-  defp key(:i64, value) when is_float(value), do: {:f64, value}
 
   defp key(:i64, text) when is_binary(text),
     do: integer_text(text, SQLLimits.int64_min(), SQLLimits.int64_max(), :i64)
 
   defp key(:u64, value) when SQLLimits.is_uint64(value), do: {:u64, value}
   defp key(:u64, value) when is_integer(value) and value < 0, do: {:negative, value}
-  defp key(:u64, value) when is_integer(value), do: {:wide, value}
-  defp key(:u64, value) when is_float(value), do: {:f64, value}
 
   defp key(:u64, text) when is_binary(text),
     do: integer_text(text, 0, SQLLimits.uint64_max(), :u64)
+
+  defp key(class, value) when class in [:i64, :u64] and is_integer(value), do: {:wide, value}
+  defp key(class, value) when class in [:i64, :u64] and is_float(value), do: {:f64, value}
 
   defp key(:f64, value) when is_number(value), do: {:f64, value * 1.0}
   defp key(:f64, text) when is_binary(text), do: {:text, text}

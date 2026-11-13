@@ -22,6 +22,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # answers it or refuses it by name.
 
   alias InfluxElixir.Client.Local.{
+    SQLDdl,
     SQLDml,
     SQLDmlType,
     SQLError,
@@ -915,12 +916,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   end
 
   @spec parser_error(binary(), token()) :: SQLError.t()
-  defp parser_error(expected, {:eof, _printed, _upper, _line, _col}),
-    do: SQLError.parser("Expected: #{expected}, found: EOF")
-
-  defp parser_error(expected, {_kind, printed, _upper, line, col}),
-    do:
-      SQLError.parser("Expected: #{expected}, found: #{printed} at Line: #{line}, Column: #{col}")
+  defp parser_error(expected, token), do: SQLDdl.expected(expected, token)
 
   @spec fail(binary(), tokens()) :: no_return()
   defp fail(expected, [token | _rest]), do: throw({:syntax, expected, token})

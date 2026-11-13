@@ -95,7 +95,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
     columns =
       for {{:ref, parts}, nil} <- items,
           SQLDmlOperand.column?(parts, ctx),
-          {column, _quoted} = List.last(parts),
+          column = SQLDmlExpr.last_name(parts),
           column in named,
           do: column
 
@@ -191,7 +191,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
 
   @spec own_name?(SQLDmlExpr.ast(), binary(), SQLDmlOperand.ctx()) :: boolean()
   defp own_name?({:ref, parts}, alias_name, ctx),
-    do: SQLDmlOperand.column?(parts, ctx) and parts |> List.last() |> elem(0) == alias_name
+    do: SQLDmlOperand.column?(parts, ctx) and SQLDmlExpr.last_name(parts) == alias_name
 
   defp own_name?(_operand, _alias_name, _ctx), do: false
 
@@ -236,7 +236,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
   end
 
   defp render({:ref, parts}, ctx, _mode) do
-    {column, _quoted} = List.last(parts)
+    column = SQLDmlExpr.last_name(parts)
 
     if SQLDmlOperand.column?(parts, ctx) and simple?(column) and simple?(ctx.relation_text),
       do: ctx.relation_text <> "." <> column,
@@ -405,7 +405,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
   # The expression with what does not change its name taken out: how a name is spelled (case,
   # quotes, the qualifier of a column, the spelling of a number), a cast and a unary plus.
   @spec shape(term()) :: term()
-  defp shape({:ref, parts}), do: {:ref, parts |> List.last() |> elem(0)}
+  defp shape({:ref, parts}), do: {:ref, SQLDmlExpr.last_name(parts)}
   defp shape({:cast, inner, _type, _try}), do: shape(inner)
   defp shape({:pos, inner}), do: shape(inner)
 

@@ -194,12 +194,9 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
 
   # The numbers (integers or floats) of the comparison.
   @spec numbers(atom(), term()) :: [number()]
-  defp numbers(op, rhs) when op in @bounds, do: numbers_in([rhs])
-  defp numbers(:in, [value]), do: numbers_in([value])
+  defp numbers(op, rhs) when op in @bounds, do: typed_values([rhs], &is_number/1)
+  defp numbers(:in, [value]), do: typed_values([value], &is_number/1)
   defp numbers(_op, _rhs), do: []
-
-  @spec numbers_in([term()]) :: [number()]
-  defp numbers_in(values), do: typed_values(values, &is_number/1)
 
   @spec typed_values([term()], (term() -> boolean())) :: [number()]
   defp typed_values(values, pred) do
@@ -376,12 +373,13 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
 
   defp compared(_op, _rhs), do: :error
 
+  @doc "The interval an operator and bound allow."
   @spec interval(atom(), number()) :: interval()
-  defp interval(:gt, x), do: {x, true, :inf, false}
-  defp interval(:gte, x), do: {x, false, :inf, false}
-  defp interval(:lt, x), do: {:neg_inf, false, x, true}
-  defp interval(:lte, x), do: {:neg_inf, false, x, false}
-  defp interval(:eq, x), do: {x, false, x, false}
+  def interval(:gt, x), do: {x, true, :inf, false}
+  def interval(:gte, x), do: {x, false, :inf, false}
+  def interval(:lt, x), do: {:neg_inf, false, x, true}
+  def interval(:lte, x), do: {:neg_inf, false, x, false}
+  def interval(:eq, x), do: {x, false, x, false}
 
   @spec number(term()) :: float() | nil
   defp number({:uint, n}), do: n * 1.0
@@ -428,9 +426,10 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
   # `k op x`.
   @spec solve_right(atom(), SQLExpr.t(), float(), interval(), function()) ::
           {:ok, binary(), column_type(), interval()} | :error
-  defp solve_right(:+, x, k, iv, type_of), do: solve(x, shift(iv, -k), type_of)
+  defp solve_right(op, x, k, iv, type_of) when op in [:+, :*],
+    do: solve_left(op, x, k, iv, type_of)
+
   defp solve_right(:-, x, k, iv, type_of), do: solve(x, negate(shift(iv, -k)), type_of)
-  defp solve_right(:*, x, k, iv, type_of) when k != 0.0, do: solve(x, scale(iv, 1 / k), type_of)
   defp solve_right(_op, _x, _k, _iv, _type_of), do: :error
 
   @spec constant(SQLExpr.t()) :: float() | nil

@@ -79,7 +79,7 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
         }
   def output_types(select_columns, names, columns) do
     for column <- select_columns,
-        name = output_name(column),
+        name = SQLSelect.column_output(column),
         name in names,
         type = result(column, columns, :coerced),
         into: %{},
@@ -89,14 +89,10 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   @doc "The expressions the select items output as one of `names` read."
   @spec output_arguments([SQLSelect.column()], [binary()]) :: [SQLExpr.t()]
   def output_arguments(select_columns, names) do
-    for column <- select_columns, output_name(column) in names, arg <- argument(column), do: arg
-  end
-
-  # The name a select item is output as: the last element of each of its shapes.
-  @spec output_name(SQLSelect.column()) :: binary() | nil
-  defp output_name(column) do
-    name = elem(column, tuple_size(column) - 1)
-    if is_binary(name), do: name
+    for column <- select_columns,
+        SQLSelect.column_output(column) in names,
+        arg <- argument(column),
+        do: arg
   end
 
   @spec result(SQLSelect.column(), %{binary() => binary()}, SQLExprType.phase()) ::

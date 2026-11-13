@@ -268,11 +268,13 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
     end
   end
 
+  @doc "The output name (last element) of a parsed select column tuple."
+  @spec column_output(tuple()) :: binary()
+  def column_output(column) when is_tuple(column), do: elem(column, tuple_size(column) - 1)
+
   @doc "A column name as written (a word, or a quoted identifier) as the name it holds."
   @spec name(binary()) :: binary()
-  def name(text) do
-    if SQLLiteral.identifier?(text), do: SQLLiteral.identifier_name(text), else: text
-  end
+  defdelegate name(text), to: SQLLiteral, as: :unquoted
 
   # A constant select item: a number, a string, a boolean, NULL or a `$name`.
   @constant ~r/^(?:-?(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+)(?:[eE][+-]?[0-9]+)?|'(?:[^']|'')*'|true|false|null|\$\w+)$/iu
@@ -341,7 +343,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   @spec check_named(map()) :: :ok | {:error, map()}
   def check_named(query) do
     names =
-      Enum.map(List.wrap(query.select_columns), &elem(&1, tuple_size(&1) - 1)) ++
+      Enum.map(List.wrap(query.select_columns), &column_output/1) ++
         Enum.map(List.wrap(query.projection_columns), &elem(&1, 1))
 
     case Enum.find(names, &(is_binary(&1) and String.starts_with?(&1, @unnamed))) do

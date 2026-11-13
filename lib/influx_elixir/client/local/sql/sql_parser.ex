@@ -343,7 +343,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
         else: parse_projection_column(item, qualifier)
 
     case parsed do
-      {:ok, [column]} -> elem(column, tuple_size(column) - 1)
+      {:ok, [column]} -> SQLSelect.column_output(column)
       {:ok, {_source, output}} -> output
       {:error, _reason} -> nil
     end
@@ -537,7 +537,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   defp parse_aggregate_select(%{table: measurement, rest: rest} = split, sql, qualifier, order) do
     with {:ok, columns} <- SQLAggExpr.parse_list(split.columns, qualifier),
-         :ok <- check_unique(Enum.map(columns, &elem(&1, tuple_size(&1) - 1))),
+         :ok <- check_unique(Enum.map(columns, &SQLSelect.column_output/1)),
          :ok <- SQLClauses.check_group_items(rest),
          {:ok, interval_ns} <- SQLClauses.interval(sql),
          :ok <- SQLClauses.check_date_bins(split.columns, interval_ns),

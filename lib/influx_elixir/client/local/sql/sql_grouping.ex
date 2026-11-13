@@ -13,6 +13,7 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
     SQLLiteral,
     SQLParser,
     SQLSchema,
+    SQLSelect,
     SQLWhere
   }
 
@@ -75,7 +76,7 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
   defp check_having(%{having: nil}, _grouped, _relations), do: :ok
 
   defp check_having(%{having: %{nodes: nodes}} = query, grouped, relations) do
-    outputs = for column <- query.select_columns, do: elem(column, tuple_size(column) - 1)
+    outputs = Enum.map(query.select_columns, &SQLSelect.column_output/1)
 
     qualified = for {:qualified, _relation, _name} = ref <- SQLSchema.where_refs(nodes), do: ref
 

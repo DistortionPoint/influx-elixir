@@ -19,7 +19,8 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     SQLExpr,
     SQLInformation,
     SQLLiteral,
-    SQLParser
+    SQLParser,
+    SQLSelect
   }
 
   @typedoc "A stored point, as `InfluxElixir.Client.Local` keeps it."
@@ -582,7 +583,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   defp select_field({:grouping_column, source, source}, listed), do: holder_field(source, listed)
 
   defp select_field(column, _listed),
-    do: SQLLiteral.render_identifier(elem(column, tuple_size(column) - 1))
+    do: SQLLiteral.render_identifier(SQLSelect.column_output(column))
 
   @spec projected_field(SQLParser.projection(), [{binary(), [binary()]}]) :: binary()
   defp projected_field({source, source}, listed) when is_binary(source),
@@ -737,7 +738,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @spec output_names(SQLParser.parsed_query()) :: [binary()]
   defp output_names(query) do
     Enum.map(query.projection_columns || [], fn {_source, output} -> output end) ++
-      Enum.map(query.select_columns || [], &elem(&1, tuple_size(&1) - 1)) ++
+      Enum.map(query.select_columns || [], &SQLSelect.column_output/1) ++
       (query.distinct_columns || [])
   end
 
@@ -811,7 +812,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     do: columns
 
   def output_columns(%{select_columns: columns}, _relations) when is_list(columns),
-    do: Enum.map(columns, &elem(&1, tuple_size(&1) - 1))
+    do: Enum.map(columns, &SQLSelect.column_output/1)
 
   def output_columns(%{projection_columns: columns}, _relations) when is_list(columns),
     do: Enum.map(columns, fn {_source, output} -> output end)
