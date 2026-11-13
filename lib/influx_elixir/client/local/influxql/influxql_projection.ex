@@ -127,24 +127,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
     # answers nothing, whatever the names.
     if Enum.any?(entries, &reads_field?(&1, items, schema)) do
       if captured?(pieces, schema),
-        do:
-          throw(
-            {:refused, "unsupported InfluxQL (a tag or a time aliased to a GROUP BY dimension)"}
-          )
+        do: refuse("a tag or a time aliased to a GROUP BY dimension")
 
       if absent_captured?(pieces, schema),
-        do:
-          throw(
-            {:refused,
-             "unsupported InfluxQL (a column the measurement lacks aliased to a GROUP BY dimension)"}
-          )
+        do: refuse("a column the measurement lacks aliased to a GROUP BY dimension")
 
       if dimension_renamed?(query, pieces, schema),
         do:
-          throw(
-            {:refused,
-             "unsupported InfluxQL (a GROUP BY tag selected under another name beside a second " <>
-               "dimension, with LIMIT or OFFSET)"}
+          refuse(
+            "a GROUP BY tag selected under another name beside a second " <>
+              "dimension, with LIMIT or OFFSET"
           )
 
       unique_names!(entries, table, schema)

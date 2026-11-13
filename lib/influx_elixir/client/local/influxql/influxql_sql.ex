@@ -4,7 +4,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   # reads: a missing tag, a double-quoted identifier, a regular expression, a
   # duration next to `now()`.
 
-  alias InfluxElixir.Client.Local.{InfluxQLRegex, InfluxQLText}
+  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLRegex, InfluxQLText}
 
   # A duration next to `now()` is an interval in whole seconds, the unit
   # the SQL engine's INTERVAL takes; a finer one is refused by name.
@@ -13,7 +13,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
     do: "INTERVAL '#{div(ns, 1_000_000_000)} seconds'"
 
   defp duration_sql(_ns, text),
-    do: throw({:refused, "unsupported InfluxQL (sub-second duration #{text})"})
+    do: InfluxQLError.refuse("sub-second duration #{text}")
 
   @doc """
   The tokens of a comparison as SQL. A regular expression is matched against

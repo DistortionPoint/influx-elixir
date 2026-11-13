@@ -705,10 +705,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
   defp reserved_alias(text, start) do
     # An alias is an identifier or a quoted one: a number, a single quote, a dot or a character of
     # an operator or a parenthesis (`AS /re/`, `AS*x`, `AS(x`) is not (verified).
-    case Regex.run(@bad_alias_start, text, return: :index) do
-      [_all, {as_at, as_length}] -> start + as_at + as_length
-      nil -> reserved_word_alias(text, start)
-    end
+    after_as(@bad_alias_start, text, start) ||
+      reserved_word_alias(text, start) ||
+      after_as(~q/\s(AS)(?![\w])\s*$/i, text, start)
   end
 
   defp reserved_word_alias(text, start) do
@@ -718,14 +717,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
         if InfluxQLText.reserved_start(alias_and_rest), do: start + as_at + as_length
 
       nil ->
-        last_as(text, start)
+        nil
     end
   end
 
-  # An `AS` last in the list: the word after it was cut off as `FROM`.
-  @spec last_as(binary(), non_neg_integer()) :: non_neg_integer() | nil
-  defp last_as(text, start) do
-    case Regex.run(~q/\s(AS)(?![\w])\s*$/i, text, return: :index) do
+  # An `AS` matched by `regex` (last in the list when the word after it was cut off as `FROM`,
+  # or followed by a character that cannot start an alias).
+  @spec after_as(Regex.t(), binary(), non_neg_integer()) :: non_neg_integer() | nil
+  defp after_as(regex, text, start) do
+    case Regex.run(regex, text, return: :index) do
       [_all, {as_at, as_length}] -> start + as_at + as_length
       nil -> nil
     end

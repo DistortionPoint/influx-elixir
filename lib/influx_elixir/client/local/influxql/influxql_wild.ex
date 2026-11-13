@@ -188,10 +188,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
 
   defp call_item_of(name, extra, field, column) do
     arguments =
-      Enum.map_join(
+      Enum.join(
         [InfluxQLText.quote_ident(field) | Enum.map(extra, &argument_text(name, &1))],
-        ", ",
-        & &1
+        ", "
       )
 
     case InfluxQLExpr.parse("#{name}(#{arguments})") do

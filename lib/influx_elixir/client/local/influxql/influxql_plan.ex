@@ -644,13 +644,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     calls = for item <- items, call <- item_aggregates(item), do: call
 
     case calls do
-      [{_fun, "time"}] ->
-        :ok
-
-      [{fun, _field}] ->
+      [{fun, field}] when field != "time" ->
         if selector_name?(fun), do: lone_selector_expression(items, fun), else: :ok
 
-      _several ->
+      _other ->
         :ok
     end
   end
@@ -680,10 +677,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   defp selector_in({:fn, _name, _arguments}, _fun),
     do: {:error, "unsupported InfluxQL (a function over a selector in that shape)"}
 
-  defp selector_in({:bin, _op, _left, _right}, "percentile:" <> _percent),
-    do: {:error, "unsupported InfluxQL (arithmetic on percentile())"}
-
-  defp selector_in({:neg, _operand}, "percentile:" <> _percent),
+  defp selector_in(ast, "percentile:" <> _percent) when elem(ast, 0) in [:bin, :neg],
     do: {:error, "unsupported InfluxQL (arithmetic on percentile())"}
 
   defp selector_in({:neg, operand}, fun), do: selector_in(operand, fun)

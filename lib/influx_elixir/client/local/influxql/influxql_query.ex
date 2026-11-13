@@ -9,6 +9,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   alias InfluxElixir.Client.Local.{
     Format,
     InfluxQL,
+    InfluxQLError,
     InfluxQLExpr,
     InfluxQLLex,
     InfluxQLPlan,
@@ -869,11 +870,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp influxql_items(query, types, tags) do
     case InfluxQL.plan_select(query, types, tags) do
       :ok -> :ok
-      {:error, {:engine, body}} -> {:error, %{status: 400, body: body}}
-      {:error, {:engine, status, body}} -> {:error, %{status: status, body: body}}
-      {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+      {:error, reason} -> plan_error(reason)
     end
   end
+
+  defp plan_error({:engine, body}), do: {:error, %{status: 400, body: body}}
+  defp plan_error({:engine, status, body}), do: {:error, %{status: status, body: body}}
+  defp plan_error(message), do: {:error, %{status: 400, body: "Client.Local: #{message}"}}
 
   # The type of each field of a measurement, as the WHERE reads it.
   @spec field_types(Store.t(), binary(), binary()) :: %{binary() => atom()}
@@ -992,20 +995,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # The error of a comparison of types that cannot be compared, which the engine raises before
   # it plans the LIMIT, of a measurement that exists.
   @spec influxql_clash(Store.t(), binary(), InfluxQL.query(), map()) :: :ok | {:error, map()}
-  defp influxql_clash(table, database, query, %{clash: {status, body}}) do
-    if query.measurement in Store.measurements(table, database),
-      do: {:error, %{status: status, body: body}},
-      else: :ok
-  end
-
-  defp influxql_clash(_table, _database, _query, _plan), do: :ok
+  defp influxql_clash(table, database, query, %{clash: error}),
+    do: measurement_error(table, database, query, error)
 
   # An error the engine raises after it has planned the LIMIT, of a
   # measurement that exists.
   @spec influxql_deferred(Store.t(), binary(), InfluxQL.query(), map()) :: :ok | {:error, map()}
-  defp influxql_deferred(_table, _database, _query, %{deferred: nil}), do: :ok
+  defp influxql_deferred(table, database, query, %{deferred: error}),
+    do: measurement_error(table, database, query, error)
 
-  defp influxql_deferred(table, database, query, %{deferred: {status, body}}) do
+  defp measurement_error(_table, _database, _query, nil), do: :ok
+
+  defp measurement_error(table, database, query, {status, body}) do
     if query.measurement in Store.measurements(table, database),
       do: {:error, %{status: status, body: body}},
       else: :ok
@@ -1066,14 +1067,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
            clash: plan.clash
          }}
 
-      {:error, {:engine, body}} ->
-        {:error, %{status: 400, body: body}}
-
-      {:error, {:engine, status, body}} ->
-        {:error, %{status: status, body: body}}
-
-      {:error, message} ->
-        {:error, %{status: 400, body: "Client.Local: #{message}"}}
+      {:error, reason} ->
+        plan_error(reason)
     end
   end
 
@@ -1116,9 +1111,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   catch
     # What a check finds in the points: the engine breaks the connection, or the double
     # refuses by name.
-    :closed_connection -> {:error, SQLError.closed()}
-    {:refused, {:engine, status, body}} -> {:error, %{status: status, body: body}}
-    {:refused, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+    reason -> caught_error(reason)
   end
 
   @spec fill_tags([LineProtocolParser.point()], map()) :: [LineProtocolParser.point()]
@@ -1172,7 +1165,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
       failing = if order == :known, do: Enum.drop(kept, -1), else: kept
 
       if length(kept) >= 3 and Enum.any?(failing, zero?),
-        do: throw({:refused, "unsupported InfluxQL (an unsigned division by zero)"})
+        do: InfluxQLError.refuse("an unsigned division by zero")
     end
 
     :ok
@@ -1271,10 +1264,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp run_select(query, rows, tags, opts) do
     {:ok, InfluxQL.run(query, rows, tags, opts)}
   catch
-    :closed_connection -> {:error, SQLError.closed()}
-    {:refused, {:engine, status, body}} -> {:error, %{status: status, body: body}}
-    {:refused, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+    reason -> caught_error(reason)
   end
+
+  defp caught_error(:closed_connection), do: {:error, SQLError.closed()}
+  defp caught_error({:refused, reason}), do: plan_error(reason)
 
   @spec influxql_parse(binary(), binary()) :: {:ok, InfluxQL.query()} | {:error, map()}
   defp influxql_parse(raw, influxql) do

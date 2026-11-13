@@ -44,7 +44,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
         regex
 
       {:error, _reason} ->
-        throw({:refused, "unsupported InfluxQL (the regular expression /#{source}/)"})
+        InfluxQLError.refuse("the regular expression /#{source}/")
     end
   end
 
@@ -79,7 +79,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
   defp unescape(<<>>, acc), do: acc |> Enum.reverse() |> IO.iodata_to_binary()
 
   defp unescape(<<?\\, c, _rest::binary>>, _acc) when c in ?0..?9 or c in [?u, ?U],
-    do: throw({:refused, "unsupported InfluxQL (the regular expression escape \\#{<<c>>})"})
+    do: InfluxQLError.refuse("the regular expression escape \\#{<<c>>}")
 
   defp unescape(<<?\\, c, rest::binary>>, acc) when c in @kept_letters,
     do: unescape(rest, [<<?\\, c>> | acc])
@@ -159,16 +159,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
   defp check_flags([_other | _rest], at, _seen, _last, regex),
     do: group_error(regex, at, 1, "unrecognized flag")
 
+  @spec scan_refuse(binary()) :: no_return()
   defp scan_refuse(group),
-    do: throw({:refused, "unsupported InfluxQL (the regular expression group (?#{group})"})
+    do: InfluxQLError.refuse("the regular expression group (?#{group}")
 
   @spec unworded_flags() :: no_return()
   defp unworded_flags,
-    do:
-      throw(
-        {:refused,
-         "unsupported InfluxQL (a regular expression flag group the double does not word)"}
-      )
+    do: InfluxQLError.refuse("a regular expression flag group the double does not word")
 
   @spec group_error(binary(), non_neg_integer(), pos_integer(), binary()) :: no_return()
   defp group_error(regex, column, width, message) do

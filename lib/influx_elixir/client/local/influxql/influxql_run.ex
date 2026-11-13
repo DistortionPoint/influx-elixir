@@ -8,6 +8,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     InfluxQL,
     InfluxQLAggregate,
     InfluxQLBuckets,
+    InfluxQLError,
     InfluxQLExpr,
     InfluxQLGroup,
     InfluxQLNames,
@@ -137,7 +138,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
 
   defp check_renamed_time(_plan, %{items: items}, _rows) do
     if Enum.any?(items, &(match?({:expr, _ast, _alias}, &1) and aggregate_item?(&1))),
-      do: throw({:refused, "unsupported InfluxQL (a renamed time column beside an aggregate)"}),
+      do: InfluxQLError.refuse("a renamed time column beside an aggregate"),
       else: :ok
   end
 
@@ -271,7 +272,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   @spec check_group_keys([binary()]) :: :ok
   defp check_group_keys(keys) do
     if Enum.any?(keys, &(String.downcase(&1) == "time")),
-      do: throw({:refused, "unsupported InfluxQL (GROUP BY a tag named time)"}),
+      do: InfluxQLError.refuse("GROUP BY a tag named time"),
       else: :ok
   end
 
@@ -541,11 +542,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     lone? = lone_selector?(for({:aggregate, _fun, _arg, _alias} = item <- items, do: item))
 
     if lone? and Enum.any?(beside, fn field -> Enum.any?(rows, &Map.has_key?(&1, field)) end),
-      do:
-        throw(
-          {:refused,
-           "unsupported InfluxQL (a selector with no value beside columns that have points)"}
-        ),
+      do: InfluxQLError.refuse("a selector with no value beside columns that have points"),
       else: []
   end
 
@@ -717,7 +714,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     lookback? = lookback?(plan)
 
     if lookback? and query.descending and phantom_value?(List.last(buckets)),
-      do: throw({:refused, "unsupported InfluxQL (a transform in descending order after data)"})
+      do: InfluxQLError.refuse("a transform in descending order after data")
 
     results =
       Enum.reduce(plan.transforms, buckets, fn transform, buckets ->
@@ -788,10 +785,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     rows = if query.descending, do: Enum.reverse(rows), else: rows
 
     if query.descending and Enum.any?(plan.transforms, &(&1.name == "elapsed")),
-      do: throw({:refused, "unsupported InfluxQL (elapsed() in descending order)"})
+      do: InfluxQLError.refuse("elapsed() in descending order")
 
     if length(Enum.uniq_by(rows, & &1["time"])) != length(rows),
-      do: throw({:refused, "unsupported InfluxQL (a transform over points that share a time)"})
+      do: InfluxQLError.refuse("a transform over points that share a time")
 
     time_name = projection.time
 
@@ -929,7 +926,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
 
     case Enum.take(rows, max + 1) do
       kept when length(kept) > max ->
-        throw({:refused, "unsupported InfluxQL (more than #{max} rows in a series)"})
+        InfluxQLError.refuse("more than #{max} rows in a series")
 
       kept ->
         kept
@@ -964,16 +961,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
         []
 
       true ->
-        throw({:refused, "unsupported InfluxQL (#{kind}() of a tag beside other arguments)"})
+        InfluxQLError.refuse("#{kind}() of a tag beside other arguments")
     end
   end
 
   defp multi_rows(rows, %{query: query} = context, base, {kind, field, tags, limit}) do
     if rows != [] and Enum.any?(tags, &(not MapSet.member?(context.tags, &1))),
-      do:
-        throw(
-          {:refused, "unsupported InfluxQL (#{kind}() by a tag the measurement does not have)"}
-        )
+      do: InfluxQLError.refuse("#{kind}() by a tag the measurement does not have")
 
     columns =
       for {:column, column, name} = item <- query.items,

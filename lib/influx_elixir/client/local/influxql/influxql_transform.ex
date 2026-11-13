@@ -24,7 +24,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTransform do
   #     turns it round, and the change is from the value that came before in
   #     that order (over a negative time)
 
-  alias InfluxElixir.Client.Local.SQLLimits
+  alias InfluxElixir.Client.Local.{InfluxQLError, SQLLimits}
 
   require SQLLimits
 
@@ -92,7 +92,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTransform do
   end
 
   def run(name, parameter, _inputs),
-    do: throw({:refused, "unsupported InfluxQL (#{name}() with the parameter #{parameter})"})
+    do: InfluxQLError.refuse("#{name}() with the parameter #{parameter}")
 
   # What a step comes to, an infinity written as a null in the row.
   @spec finite(extended() | number() | nil) :: result()

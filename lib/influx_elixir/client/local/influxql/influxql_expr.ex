@@ -1149,7 +1149,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # A string or a boolean has no value in arithmetic: the planner refuses such an expression
   # (`infer/3`) before any row is read, so this is a form the double has not seen.
   defp value(_other, _env, _types),
-    do: throw({:refused, "unsupported InfluxQL (a string or a boolean in an expression)"})
+    do: InfluxQLError.refuse("a string or a boolean in an expression")
 
   defp typed(_type, :nan), do: :nan
   defp typed(:integer, n) when is_integer(n), do: {:int, n}
@@ -1169,14 +1169,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       nil -> nil
       {:int, n} -> {:int, n}
       {:float, x} -> {:int, truncate(x)}
-      {:uint, _n} -> throw({:refused, "unsupported InfluxQL (an unsigned field cast to integer)"})
+      {:uint, _n} -> InfluxQLError.refuse("an unsigned field cast to integer")
     end
   end
 
   defp truncate(x) when x >= 0 or x == trunc(x) * 1.0, do: trunc(x)
 
   defp truncate(_negative_fraction),
-    do: throw({:refused, "unsupported InfluxQL (a negative fraction cast to integer)"})
+    do: InfluxQLError.refuse("a negative fraction cast to integer")
 
   # A math function of its argument values: null in, null out; a result that
   # is not a finite number is `:nan`.
@@ -1192,7 +1192,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @spec compute(binary(), [value()]) :: value()
 
   defp compute("abs", [{:int, n}]) when n == SQLLimits.int64_min(),
-    do: throw({:refused, "unsupported InfluxQL (abs() of the smallest integer)"})
+    do: InfluxQLError.refuse("abs() of the smallest integer")
 
   defp compute("abs", [{:int, n}]), do: {:int, abs(n)}
   defp compute("abs", [{:float, x}]), do: {:float, abs(x)}
@@ -1205,7 +1205,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
     if SQLLimits.is_int64(result),
       do: {:int, result},
-      else: throw({:refused, "unsupported InfluxQL (pow() beyond 64-bit integers)"})
+      else: InfluxQLError.refuse("pow() beyond 64-bit integers")
   end
 
   defp compute("pow", [{_k1, x}, {_k2, y}]), do: float(fn -> :math.pow(x * 1.0, y * 1.0) end)

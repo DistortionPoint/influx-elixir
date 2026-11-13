@@ -179,7 +179,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
     seconds = Integer.floor_div(ns, 1_000_000_000)
 
     if seconds < -62_135_596_800 or seconds > 253_402_300_799,
-      do: throw({:refused, "unsupported InfluxQL (a time beyond the year 9999)"})
+      do: InfluxQLError.refuse("a time beyond the year 9999")
 
     %DateTime{year: y, month: mo, day: d, hour: h, minute: mi, second: s} =
       DateTime.from_unix!(seconds)
@@ -216,10 +216,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   @spec check_operands(tuple()) :: :ok
   defp check_operands(tree) do
     cond do
-      stacked?(tree) ->
+      in_connective?(tree, :bare) ->
         refuse(500, "invalid expr stack")
 
-      not grouped_in_connective?(tree) ->
+      not in_connective?(tree, :grouped) ->
         :ok
 
       mentions_time_comparison?(tree) ->
@@ -252,19 +252,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   @spec grouped_bare?(tuple()) :: boolean()
   defp grouped_bare?(node), do: kind(node) == :grouped
 
-  @spec stacked?(tuple()) :: boolean()
-  defp stacked?({kind, nodes}) when kind in [:and, :or],
-    do: Enum.any?(nodes, &(bare?(&1) or stacked?(&1)))
+  @spec in_connective?(tuple(), :bare | :grouped) :: boolean()
+  defp in_connective?({connective, nodes}, target) when connective in [:and, :or],
+    do: Enum.any?(nodes, &(kind(&1) == target or in_connective?(&1, target)))
 
-  defp stacked?({:group, node}), do: stacked?(node)
-  defp stacked?(_node), do: false
-
-  @spec grouped_in_connective?(tuple()) :: boolean()
-  defp grouped_in_connective?({kind, nodes}) when kind in [:and, :or],
-    do: Enum.any?(nodes, &(grouped_bare?(&1) or grouped_in_connective?(&1)))
-
-  defp grouped_in_connective?({:group, node}), do: grouped_in_connective?(node)
-  defp grouped_in_connective?(_node), do: false
+  defp in_connective?({:group, node}, target), do: in_connective?(node, target)
+  defp in_connective?(_node, _target), do: false
 
   @doc """
   Whether a comparison with the bare `time` on a side stands anywhere in the condition tree: the
@@ -299,7 +292,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
     refuse_by_name()
   end
 
-  defp grouped_error_inner(node), do: if(grouped_in_connective?(node), do: grouped_error(node))
+  defp grouped_error_inner(node), do: if(in_connective?(node, :grouped), do: grouped_error(node))
 
   @spec boolean?(tuple()) :: boolean()
   defp boolean?({:cmp, tokens}), do: Enum.any?(tokens, &match?({:op, _op}, &1))

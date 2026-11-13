@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Standardized `InfluxQLError.refuse/1` and consolidated duplicate helpers across `Client.Local` (`InfluxQLAggregate`, `InfluxQLExpr`, `InfluxQLKernel`, `InfluxQLLiteral`, `InfluxQLPlan`, `InfluxQLProjection`, `InfluxQLQuery`, `InfluxQLRegex`, `InfluxQLRun`, `InfluxQLSelectCheck`, `InfluxQLSql`, `InfluxQLTime`, `InfluxQLTimeComparand`, `InfluxQLTokens`, `InfluxQLTransform`, `InfluxQLTyped`, `InfluxQLWhere`, `InfluxQLWild`, and `LineProtocolV3`).**
+  Replaced raw `throw({:refused, "unsupported InfluxQL (...)"})` tuples with `InfluxQLError.refuse/1` across `InfluxQLAggregate`, `InfluxQLExpr`, `InfluxQLKernel`, `InfluxQLProjection`, `InfluxQLQuery`, `InfluxQLRegex`, `InfluxQLRun`, `InfluxQLSql`, `InfluxQLTime`, `InfluxQLTransform`, `InfluxQLTyped`, and `InfluxQLWhere`, derived `InfluxQLLiteral.@display_units` from `Durations.ns/1`, simplified `lone_selector_calls/1` and combined duplicate `percentile` clauses in `InfluxQLPlan.selector_in/2`, extracted `plan_error/1`, `measurement_error/4`, and `caught_error/1` in `InfluxQLQuery`, extracted `after_as/3` in `InfluxQLSelectCheck`, consolidated `stacked?/1` and `grouped_in_connective?/1` via `in_connective?/2` in `InfluxQLTime`, delegated `InfluxQLTimeComparand.time_last?/1` to `InfluxQLTokens.time_last?/1`, combined duplicate `:nom` and `:operand` branches in `InfluxQLTokens.word_token/4` and `InfluxQLTokens.operand/3`, combined duplicate clauses in `InfluxQLTyped.binary_operator?/1`, simplified `InfluxQLWild.call_item_of/4`, and unified trailing-backslash key checking in `LineProtocolV3.v3_tags/3`.
+
 ## [0.1.67] - 2026-11-12
 
 ### Changed

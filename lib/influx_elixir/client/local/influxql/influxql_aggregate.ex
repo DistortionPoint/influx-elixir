@@ -18,7 +18,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   #   * the columns are named after the function, a name taken twice is
   #     `name_1`, `name_2`
 
-  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLArithmetic, InfluxQLExpr, SQLLimits}
+  alias InfluxElixir.Client.Local.{
+    InfluxQL,
+    InfluxQLArithmetic,
+    InfluxQLError,
+    InfluxQLExpr,
+    SQLLimits
+  }
 
   require SQLLimits
 
@@ -79,7 +85,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
         name_columns(aggregates, rows, fields, tags, types)
 
       true ->
-        throw({:refused, "unsupported InfluxQL (an aggregate of a tag beside others)"})
+        InfluxQLError.refuse("an aggregate of a tag beside others")
     end
   end
 
@@ -153,8 +159,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   defp null_percentile(:integer, true), do: throw(:closed_connection)
 
   defp null_percentile(:unsigned, true),
-    do:
-      throw({:refused, "unsupported InfluxQL (percentile() of an unsigned field with no value)"})
+    do: InfluxQLError.refuse("percentile() of an unsigned field with no value")
 
   defp null_percentile(_type, _beside), do: :ok
 
@@ -284,10 +289,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   defp integral(rows, field, flags, types) do
     cond do
       Map.get(types, field) in [:string, :boolean] ->
-        throw({:refused, "unsupported InfluxQL (integral() of a #{Map.get(types, field)} field)"})
+        InfluxQLError.refuse("integral() of a #{Map.get(types, field)} field")
 
       flags |> String.split(":") |> tl() == ["bucket"] ->
-        throw({:refused, "unsupported InfluxQL (integral() in a GROUP BY time)"})
+        InfluxQLError.refuse("integral() in a GROUP BY time")
 
       true ->
         unit = flags |> String.split(":") |> hd() |> String.to_integer()
@@ -331,7 +336,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
             {:value, best, nil}
 
           _tied ->
-            throw({:refused, "unsupported InfluxQL (mode() of values equally often there)"})
+            InfluxQLError.refuse("mode() of values equally often there")
         end
     end
   end
@@ -358,10 +363,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   defp distinct(rows, field, tags) do
     if MapSet.member?(tags, field) or not Enum.any?(rows, &Map.has_key?(&1, field)),
       do: :none,
-      else:
-        throw(
-          {:refused, "unsupported InfluxQL (distinct(): the values come in the engine's order)"}
-        )
+      else: InfluxQLError.refuse("distinct(): the values come in the engine's order")
   end
 
   @spec median([map()], binary()) :: result()
@@ -412,18 +414,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   @spec spread_of([number(), ...], atom()) :: number()
   defp spread_of(values, :integer) do
     if length(values) > 1 and Enum.all?(values, &(&1 < 0)),
-      do: throw({:refused, "unsupported InfluxQL (the spread of several negative integers)"})
+      do: InfluxQLError.refuse("the spread of several negative integers")
 
     spread = max(Enum.max(values), 0) - Enum.min(values)
 
     if spread > SQLLimits.int64_max(),
-      do: throw({:refused, "unsupported InfluxQL (a spread beyond 64-bit integers)"}),
+      do: InfluxQLError.refuse("a spread beyond 64-bit integers"),
       else: spread
   end
 
   defp spread_of(values, _type) do
     if Enum.any?(values, &(&1 < 0)),
-      do: throw({:refused, "unsupported InfluxQL (the spread of negative floats)"}),
+      do: InfluxQLError.refuse("the spread of negative floats"),
       else: Enum.max(values) - Enum.min(values)
   end
 

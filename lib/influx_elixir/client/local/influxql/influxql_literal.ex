@@ -104,16 +104,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
   defp split_sign("-" <> unsigned), do: {"-", unsigned}
   defp split_sign(unsigned), do: {"", unsigned}
 
-  @display_units [
-    {"w", 604_800_000_000_000},
-    {"d", 86_400_000_000_000},
-    {"h", 3_600_000_000_000},
-    {"m", 60_000_000_000},
-    {"s", 1_000_000_000},
-    {"ms", 1_000_000},
-    {"u", 1_000},
-    {"ns", 1}
-  ]
+  @display_units for unit <- ~w(w d h m s ms u ns), do: {unit, Durations.ns(unit)}
 
   @doc """
   A duration in nanoseconds as the engine words it in an error: `0s` for none,

@@ -16,7 +16,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLKernel do
   #   * a float result that overflows is null
   #   * a comparison with a null is false, and an unsigned and an integer compare as unsigned
 
-  alias InfluxElixir.Client.Local.SQLLimits
+  alias InfluxElixir.Client.Local.{InfluxQLError, SQLLimits}
 
   require SQLLimits
 
@@ -93,7 +93,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLKernel do
   end
 
   @spec refuse_remainder() :: no_return()
-  defp refuse_remainder, do: throw({:refused, "unsupported InfluxQL (a remainder by zero)"})
+  defp refuse_remainder, do: InfluxQLError.refuse("a remainder by zero")
 
   defp arith("+", x, y), do: x + y
   defp arith("-", x, y), do: x - y

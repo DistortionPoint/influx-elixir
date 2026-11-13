@@ -118,9 +118,16 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
       pos ->
         <<key::binary-size(pos), separator, rest::binary>> = tags
 
-        if separator == ?=,
-          do: v3_tag_value(key, rest, whole, acc),
-          else: {:error, name_error(key, tag_set_malformed(whole))}
+        cond do
+          LineProtocolEscape.ends_in_backslash?(key) ->
+            {:error, @trailing_backslash}
+
+          separator == ?= ->
+            v3_tag_value(key, rest, whole, acc)
+
+          true ->
+            {:error, tag_set_malformed(whole)}
+        end
     end
   end
 
@@ -132,10 +139,6 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
 
   @spec v3_tag_value(binary(), binary(), binary(), [{binary(), binary()}]) ::
           {:ok, [{binary(), binary()}], binary()} | {:error, binary()}
-  defp v3_tag_value(key, _rest, _whole, _acc)
-       when binary_part(key, byte_size(key) - 1, 1) == "\\",
-       do: {:error, @trailing_backslash}
-
   defp v3_tag_value(_key, "", _whole, _acc), do: {:error, "Expected tag value, got end of input"}
 
   defp v3_tag_value(key, rest, whole, acc) do

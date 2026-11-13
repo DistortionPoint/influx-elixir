@@ -6,6 +6,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   alias InfluxElixir.Client.Local.{
     InfluxQLArithmetic,
     InfluxQLArithType,
+    InfluxQLError,
     InfluxQLSql,
     InfluxQLTime,
     InfluxQLTokens,
@@ -116,10 +117,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     if unsigned_literals?(tokens) and
          not Enum.any?(tokens, &match?({:ident, _name}, &1)) and
          binary_operator?(tokens),
-       do:
-         throw(
-           {:refused, "unsupported InfluxQL (arithmetic of an integer beyond the signed range)"}
-         ),
+       do: InfluxQLError.refuse("arithmetic of an integer beyond the signed range"),
        else: :ok
   end
 
@@ -127,9 +125,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     tokens
     |> Enum.chunk_every(2, 1, :discard)
     |> Enum.any?(fn
-      [{:number, _text}, {:raw, op}] -> op in ["+", "-", "*", "/"]
-      [{:raw, ")"}, {:raw, op}] -> op in ["+", "-", "*", "/"]
-      _pair -> false
+      [left, {:raw, op}] when left == {:raw, ")"} or elem(left, 0) == :number ->
+        op in ["+", "-", "*", "/"]
+
+      _pair ->
+        false
     end)
   end
 
@@ -137,7 +137,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp unsigned_clash(nil), do: :ok
 
   defp unsigned_clash(:text),
-    do: throw({:refused, "unsupported InfluxQL (an unsigned number ordered against a string)"})
+    do: InfluxQLError.refuse("an unsigned number ordered against a string")
 
   @spec check_sql(InfluxQLArithmetic.check()) ::
           {binary(), [{binary(), InfluxQLArithmetic.check()}]}
@@ -295,7 +295,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
       :check -> nil
       {:unsigned, n} -> "#{column} #{op} #{n}"
       :wrap -> wrapped_sql(column, op, literal)
-      :refuse -> throw({:refused, "unsupported InfluxQL (#{refusal(type, literal)})"})
+      :refuse -> InfluxQLError.refuse(refusal(type, literal))
     end
   end
 
@@ -547,7 +547,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   @spec refuse_bare() :: no_return()
   defp refuse_bare,
-    do: throw({:refused, "unsupported InfluxQL (a bare non-boolean field inside AND/OR)"})
+    do: InfluxQLError.refuse("a bare non-boolean field inside AND/OR")
 
   # The engine types a condition from the leaves up (verified over every pair of operand types
   # and over chains of three and four): a comparison or a boolean field is a boolean, and so is

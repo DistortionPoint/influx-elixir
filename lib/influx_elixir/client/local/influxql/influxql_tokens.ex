@@ -44,14 +44,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
 
   def time_comparison?(tokens), do: time_last?(tokens)
 
-  defp time_last?(tokens) when length(tokens) > 2 do
+  @doc false
+  @spec time_last?(list()) :: boolean()
+  def time_last?(tokens) when length(tokens) > 2 do
     case Enum.take(tokens, -2) do
       [{:op, _op}, last] -> time?(last)
       _other -> false
     end
   end
 
-  defp time_last?(_tokens), do: false
+  def time_last?(_tokens), do: false
 
   @doc """
   The tokens inside the layers of parentheses that wrap all of them (`((a))` is `a`), and how
@@ -490,15 +492,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # whole group fails, which the double places at the `WHERE`.
   defp word_token(upcased, word, rest, acc) when upcased in ["AND", "OR"] do
     cond do
-      name_position?(acc, rest) -> operand_token({:ident, word}, rest, acc)
-      reserved_kind(acc) != :nom -> {:syntax_error, reserved_kind(acc), word <> rest}
-      InfluxQLLex.cr_after?(rest, 0) -> {:syntax_error, :nom, word <> rest}
-      InfluxQLLex.glued?(rest) -> {:syntax_error, :nom, word <> rest}
-      InfluxQLLex.trim_both_blanks(rest) == "" -> {:syntax_error, :operand, rest}
-      InfluxQLLex.operand_missing?(rest) -> {:syntax_error, :operand, rest}
-      Regex.match?(~q/\A['".]/, rest) -> {:syntax_error, :nom, word <> rest}
-      String.starts_with?(InfluxQLLex.trim_blanks(rest), "/") -> {:syntax_error, :operand, rest}
-      true -> tokenize(rest, [{:raw, word} | acc])
+      name_position?(acc, rest) ->
+        operand_token({:ident, word}, rest, acc)
+
+      reserved_kind(acc) != :nom ->
+        {:syntax_error, reserved_kind(acc), word <> rest}
+
+      InfluxQLLex.cr_after?(rest, 0) or InfluxQLLex.glued?(rest) or
+          Regex.match?(~q/\A['".]/, rest) ->
+        {:syntax_error, :nom, word <> rest}
+
+      InfluxQLLex.trim_both_blanks(rest) == "" or InfluxQLLex.operand_missing?(rest) or
+          String.starts_with?(InfluxQLLex.trim_blanks(rest), "/") ->
+        {:syntax_error, :operand, rest}
+
+      true ->
+        tokenize(rest, [{:raw, word} | acc])
     end
   end
 
@@ -576,16 +585,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
       op in ["=~", "!~"] and not String.starts_with?(trimmed, "/") ->
         {:syntax_error, :regex, rest}
 
-      trimmed == "" ->
-        {:syntax_error, :operand, rest}
-
-      InfluxQLLex.cannot_start_operand?(trimmed) and inside_call?(acc) ->
+      trimmed != "" and InfluxQLLex.cannot_start_operand?(trimmed) and inside_call?(acc) ->
         {:error, "unsupported InfluxQL WHERE: " <> rest}
 
-      InfluxQLLex.cannot_start_operand?(trimmed) ->
-        {:syntax_error, :operand, rest}
-
-      op not in ["=~", "!~"] and String.starts_with?(trimmed, "/") ->
+      trimmed == "" or InfluxQLLex.cannot_start_operand?(trimmed) or
+          (op not in ["=~", "!~"] and String.starts_with?(trimmed, "/")) ->
         {:syntax_error, :operand, rest}
 
       true ->

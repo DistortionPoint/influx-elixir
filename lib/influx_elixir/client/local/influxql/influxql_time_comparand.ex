@@ -64,17 +64,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
 
     case sides(left, op, right, ctx) do
       :ok ->
-        if time_last?(tokens), do: expected_expr(), else: chain(left, op, right)
+        if InfluxQLTokens.time_last?(tokens), do: expected_expr(), else: chain(left, op, right)
 
       other ->
         other
-    end
-  end
-
-  defp time_last?(tokens) do
-    case Enum.take(tokens, -2) do
-      [{:op, _op}, last] -> InfluxQLTokens.time?(last)
-      _other -> false
     end
   end
 

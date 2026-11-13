@@ -25,8 +25,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   require SQLLimits
 
-  @param_refusal "unsupported InfluxQL (a bind parameter in a condition)"
-
   # What a group holds that the tokens of a comparison are read for (see `nest/2`).
   @time 1
   @duration 2
@@ -47,7 +45,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
       {:ok, tokens} ->
         # The engine binds the parameters (or says the first one has no value) as it plans,
         # with planning errors of its own before and after that are not verified.
-        if Enum.any?(tokens, &match?({:param, _name}, &1)), do: throw({:refused, @param_refusal})
+        if Enum.any?(tokens, &match?({:param, _name}, &1)),
+          do: InfluxQLError.refuse("a bind parameter in a condition")
+
         ctx = {tags, types}
         {tree, _rest} = tokens |> nest(ctx) |> parse_or()
         InfluxQLTime.check_bare(tree)
@@ -422,7 +422,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     joined = join_plans(nodes, " OR ", ctx, %{times | alone: false})
 
     if Enum.any?(nodes, &mentions_time_node?/1),
-      do: throw({:refused, "unsupported InfluxQL (a time comparison inside OR)"})
+      do: InfluxQLError.refuse("a time comparison inside OR")
 
     joined
   end
@@ -552,10 +552,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
       throw(error)
 
     {:refused, _reason} ->
-      throw(
-        {:refused,
-         "unsupported InfluxQL (a bare non-boolean operand beside a comparison the engine refuses)"}
-      )
+      InfluxQLError.refuse("a bare non-boolean operand beside a comparison the engine refuses")
   end
 
   # A comparison has an operand on each side of its operator: a leaf that starts or ends with
@@ -580,10 +577,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
     if :other in kinds or
          (:arithmetic in kinds and (length(operands) > 1 or :bool in operands)),
-       do:
-         throw(
-           {:refused, "unsupported InfluxQL (a bare operand beside that comparison of constants)"}
-         ),
+       do: InfluxQLError.refuse("a bare operand beside that comparison of constants"),
        else: :ok
   end
 
@@ -619,10 +613,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     if absent_with_string_partner?(tokens, tags),
       do: :ok,
       else:
-        throw(
-          {:refused,
-           "unsupported InfluxQL (a bare string or tag beside a comparison of a column " <>
-             "the measurement lacks)"}
+        InfluxQLError.refuse(
+          "a bare string or tag beside a comparison of a column the measurement lacks"
         )
   end
 
@@ -762,7 +754,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   end
 
   defp time_comparison(op, _comparand, _now) when op not in ["=", "<", "<=", ">", ">="],
-    do: throw({:refused, "unsupported InfluxQL (time #{op} ...)"})
+    do: InfluxQLError.refuse("time #{op} ...")
 
   # A lower bound is read earlier by `extend` nanoseconds for the SQL (the
   # transforms that look back scan one bucket before the range, see
@@ -813,10 +805,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         throw({:refused, {:engine, 400, InfluxQLError.split_error(message)}})
 
       :unknown ->
-        throw(
-          {:refused,
-           "unsupported InfluxQL (the time '#{content}' in a form the double does not read)"}
-        )
+        InfluxQLError.refuse("the time '#{content}' in a form the double does not read")
     end
   end
 
@@ -844,8 +833,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   end
 
   defp iso_ns(ns) when ns < @arrow_min and ns >= SQLLimits.int64_min(),
-    do: throw({:refused, "unsupported InfluxQL (a time before 1677-09-21T00:12:44)"})
+    do: InfluxQLError.refuse("a time before 1677-09-21T00:12:44")
 
   defp iso_ns(_ns),
-    do: throw({:refused, "unsupported InfluxQL (a time outside 64-bit nanoseconds)"})
+    do: InfluxQLError.refuse("a time outside 64-bit nanoseconds")
 end
