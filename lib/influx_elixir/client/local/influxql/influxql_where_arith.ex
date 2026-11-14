@@ -99,14 +99,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
     with {:ok, [[{:ident, name}] = left, right], op} when op in [">", ">="] <- sides(tokens),
          true <- MapSet.member?(tags, name),
          true <- unsigned_valued?(right, types) do
-      right ++ [{:op, flipped(op)}] ++ left
+      right ++ [{:op, InfluxQLTokens.flip_op(op)}] ++ left
     else
       _other -> tokens
     end
   end
-
-  defp flipped(">"), do: "<"
-  defp flipped(">="), do: "<="
 
   defp text_clash(op, left, right, tags, types) do
     cond do

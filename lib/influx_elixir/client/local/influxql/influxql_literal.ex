@@ -128,11 +128,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
   end
 
   @spec duration(binary()) :: {:ok, binary()}
-  defp duration(text) do
-    [count, unit] = Regex.run(~r/^(\d+)(ns|ms|u|µ|s|m|h|d|w)$/, text, capture: :all_but_first)
-    ns = String.to_integer(count) * Durations.ns(unit)
-    {:ok, "Duration(Duration(#{ns}))"}
-  end
+  defp duration(text), do: {:ok, "Duration(Duration(#{Durations.total_ns(text)}))"}
 
   # A string constant, its `\'` undone; one with any other backslash, or with
   # a character Rust escapes in `Debug` beyond the quote and the backslash, is

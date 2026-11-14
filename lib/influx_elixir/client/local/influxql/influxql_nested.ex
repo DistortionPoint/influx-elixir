@@ -45,17 +45,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   @equality_ops ["=", "!=", "<>"]
   @connectives ["AND", "OR"]
 
-  # The operator a comparison has when its sides are turned round.
-  @flipped %{
-    "=" => "=",
-    "!=" => "!=",
-    "<>" => "<>",
-    "<" => ">",
-    "<=" => ">=",
-    ">" => "<",
-    ">=" => "<="
-  }
-
   @typedoc "A boolean of its own: the tokens inside a condition in parentheses, or the false."
   @type operand :: {:group, list()} | {:node, tuple()} | false
 
@@ -138,10 +127,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   # condition (its comparand is a time, `now()` or a duration, whatever else it holds), not by
   # the types of its arithmetic (verified: `time > 1 + time` is "found symbol", not a coercion).
   defp time_comparison?({left, _lk, _lf}, {right, _rk, _rf}),
-    do: Enum.any?([left, right], &(unwrap(&1) |> bare_time?()))
-
-  defp bare_time?([token]), do: InfluxQLTokens.time?(token)
-  defp bare_time?(_tokens), do: false
+    do: Enum.any?([left, right], &(unwrap(&1) |> InfluxQLTokens.bare_time?()))
 
   # The two sides of the comparison, split at the last operator outside every parenthesis: a
   # chain `a = b = c` is `(a = b) = c` (verified), so what is before the last operator is a
@@ -281,7 +267,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   @spec group_last(list()) :: list()
   def group_last(tokens) do
     with [{at, {:op, op}}] <- InfluxQLTokens.at_top_level(tokens, &match?({:op, _op}, &1)),
-         {:ok, flipped} <- Map.fetch(@flipped, op),
+         flipped when flipped != nil <- InfluxQLTokens.flip_op(op),
          {left, right} = {Enum.take(tokens, at), Enum.drop(tokens, at + 1)},
          true <- boolean_group?(left) and not boolean_group?(right) do
       right ++ [{:op, flipped}] ++ left

@@ -464,7 +464,5 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
     end
   end
 
-  @spec char(binary(), non_neg_integer()) :: byte() | nil
-  defp char(text, at) when at < byte_size(text), do: :binary.at(text, at)
-  defp char(_text, _at), do: nil
+  defp char(text, at), do: InfluxQLLex.byte_at(text, at)
 end

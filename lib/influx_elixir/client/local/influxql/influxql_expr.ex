@@ -144,7 +144,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     cond do
       match = Regex.run(~r/^(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+(?![\w.])/, text) ->
         [all] = match
-        duration(rest_after(text, all), duration_ns(all), acc)
+        duration(rest_after(text, all), Durations.total_ns(all), acc)
 
       match = Regex.run(~r/^(?:\d+\.\d+|\.\d+|\d+)(?![\w.])/, text) ->
         tokenize(rest_after(text, hd(match)), [{:number, hd(match)} | acc])
@@ -182,14 +182,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # position the double does not track: refused by name.
   defp duration(_rest, ns, _acc) when ns > SQLLimits.int64_max(), do: :error
   defp duration(rest, ns, acc), do: tokenize(rest, [{:duration, ns} | acc])
-
-  defp duration_ns(text) do
-    ~r/(\d+)(ns|ms|u|µ|s|m|h|d|w)/
-    |> Regex.scan(text)
-    |> Enum.reduce(0, fn [_all, count, unit], total ->
-      total + String.to_integer(count) * Durations.ns(unit)
-    end)
-  end
 
   defp rest_after(text, prefix),
     do: binary_part(text, byte_size(prefix), byte_size(text) - byte_size(prefix))
@@ -369,24 +361,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # `top(f, *::tag, n)`: the last argument is judged first (verified: a limit that is no
   # positive integer, or a wildcard), then the ones between, which must be fields or tags.
   defp wildcard_arguments(name, [_field | rest]) do
-    {between, last} = Enum.split(rest, -1)
+    {between, [last]} = Enum.split(rest, -1)
 
-    case {last, Enum.find(between, &wildcard?/1)} do
-      {[{kind, _target} = target], _between} when kind in [:star, :regex] ->
+    case {limit_error(name, last), last, Enum.find(between, &wildcard?/1)} do
+      {{:planning, _message} = error, _last, _between} ->
+        error
+
+      {nil, {kind, _target} = target, _between} when kind in [:star, :regex] ->
         {:planning, "expected integer as last argument for #{name}, got #{wildcard_text(target)}"}
 
-      {[{:lit, {:int, n}}], _between} when n <= 0 ->
-        {:planning, "limit (#{n}) for #{name} must be greater than 0"}
-
-      {[{:lit, {:float, x}}], _between} ->
-        {:planning,
-         "expected integer as last argument for #{name}, got Literal(Float(#{Float.to_string(x)}))"}
-
-      {[{:str, content}], _between} ->
-        {:planning,
-         "expected integer as last argument for #{name}, got Literal(String(#{InfluxQLError.rust_debug(content)}))"}
-
-      {[{:lit, {:int, _n}}], target} when target != nil ->
+      {nil, {:lit, {:int, _n}}, target} when target != nil ->
         {:planning, "only fields or tags are allow for #{name}(), got #{wildcard_text(target)}"}
 
       _other ->
@@ -463,25 +447,32 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp multi(name, [field | rest]) do
     {tags, [last]} = Enum.split(rest, -1)
 
-    case {field, last, Enum.all?(tags, &match?({:ref, _}, &1))} do
-      {{:ref, f}, {:lit, {:int, n}}, true} when n > 0 ->
+    case {limit_error(name, last), field, last, Enum.all?(tags, &match?({:ref, _}, &1))} do
+      {{:planning, _message} = error, _field, _last, _tags} ->
+        error
+
+      {nil, {:ref, f}, {:lit, {:int, n}}, true} when n > 0 ->
         {:multi, name, f, for({:ref, tag} <- tags, do: tag), n}
-
-      {_field, {:lit, {:int, n}}, _tags} when n <= 0 ->
-        {:planning, "limit (#{n}) for #{name} must be greater than 0"}
-
-      {_field, {:lit, {:float, x}}, _tags} ->
-        {:planning,
-         "expected integer as last argument for #{name}, got Literal(Float(#{Float.to_string(x)}))"}
-
-      {_field, {:str, content}, _tags} ->
-        {:planning,
-         "expected integer as last argument for #{name}, got Literal(String(#{InfluxQLError.rust_debug(content)}))"}
 
       _other ->
         :error
     end
   end
+
+  defp limit_error(name, {:lit, {:int, n}}) when n <= 0,
+    do: {:planning, "limit (#{n}) for #{name} must be greater than 0"}
+
+  defp limit_error(name, {:lit, {:float, x}}),
+    do:
+      {:planning,
+       "expected integer as last argument for #{name}, got Literal(Float(#{Float.to_string(x)}))"}
+
+  defp limit_error(name, {:str, content}),
+    do:
+      {:planning,
+       "expected integer as last argument for #{name}, got Literal(String(#{InfluxQLError.rust_debug(content)}))"}
+
+  defp limit_error(_name, _last), do: nil
 
   defp classify_call({:call, name, [argument]}) when name in @aggregates do
     case classify_inner(argument) do

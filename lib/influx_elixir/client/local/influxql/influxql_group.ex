@@ -33,6 +33,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     InfluxQLBuckets,
     InfluxQLError,
     InfluxQLLex,
+    InfluxQLRegex,
     InfluxQLText,
     InfluxQLTime,
     SQLLimits
@@ -421,7 +422,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
     case Regex.run(~q/^([+-]?)((?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+)/, rest) do
       [whole, sign, parts] ->
-        total = duration_total(parts)
+        total = Durations.total_ns(parts)
 
         if total > SQLLimits.int64_max(),
           do: :big,
@@ -433,14 +434,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
           nil -> :none
         end
     end
-  end
-
-  defp duration_total(parts) do
-    ~q/(\d+)(ns|ms|u|µ|s|m|h|d|w)/
-    |> Regex.scan(parts)
-    |> Enum.reduce(0, fn [_all, count, unit], total ->
-      total + String.to_integer(count) * Durations.ns(unit)
-    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -601,7 +594,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   defp fail(ctx, kind, pos, start \\ nil),
     do: {:error, {:engine, error(ctx, kind, pos), ctx.at + (start || pos)}}
 
-  @spec byte_at(binary(), non_neg_integer()) :: byte() | nil
-  defp byte_at(text, pos) when pos < byte_size(text), do: :binary.at(text, pos)
-  defp byte_at(_text, _pos), do: nil
+  @doc """
+  The tag columns a `GROUP BY` dimension expands to against `tags`: a literal
+  name, every tag (`*`), or the tags matching a regular expression.
+  """
+  @spec dimension_keys(dimension(), MapSet.t(binary())) :: [binary()]
+  def dimension_keys({:tag, name}, _tags), do: [name]
+  def dimension_keys(:wildcard, tags), do: MapSet.to_list(tags)
+
+  def dimension_keys({:regex, source}, tags) do
+    regex = InfluxQLRegex.compile(source, :expand)
+    Enum.filter(tags, &Regex.match?(regex, &1))
+  end
+
+  defp byte_at(text, pos), do: InfluxQLLex.byte_at(text, pos)
 end

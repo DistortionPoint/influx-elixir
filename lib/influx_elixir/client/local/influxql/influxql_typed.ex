@@ -61,15 +61,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   @never {:never, nil}
 
   @comparison_ops ["=", "!=", "<>", "<", "<=", ">", ">="]
-  @flipped_ops %{
-    "=" => "=",
-    "!=" => "!=",
-    "<>" => "<>",
-    "<" => ">",
-    "<=" => ">=",
-    ">" => "<",
-    ">=" => "<="
-  }
 
   # How a comparison is answered: the SQL of a field against a literal, typed
   # by the two; a comparison of numbers with an unsigned field in it that the
@@ -162,7 +153,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     with {name, op, literal, flipped?} <- comparison_parts(tokens),
          type when type != nil <- field_kind(name, tags, types),
          literal when literal != nil <- literal_kind(literal) do
-      op = if flipped?, do: Map.fetch!(@flipped_ops, op), else: op
+      op = if flipped?, do: InfluxQLTokens.flip_op(op), else: op
       typed_sql(type, literal, InfluxQLSql.ident_sql(name), op)
     else
       _untyped -> nil

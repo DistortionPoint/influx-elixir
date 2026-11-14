@@ -683,8 +683,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp mentions_time_node?({_kind, nodes}), do: Enum.any?(nodes, &mentions_time_node?/1)
 
   # A comparison with `time` on one side and a time on the other.
-  @flipped %{"=" => "=", "<" => ">", "<=" => ">=", ">" => "<", ">=" => "<="}
-
   defp time_plan(tokens, tags, times) do
     case time_sides(tokens) do
       {op, comparand} ->
@@ -733,10 +731,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   defp time_right(tokens) when length(tokens) > 2 do
     with {comparand, [{:op, op}, {:ident, _name} = last]} <- Enum.split(tokens, -2),
-         true <- InfluxQLTokens.time?(last) do
-      if op in ["=~", "!~"] or Enum.any?(comparand, &match?({:ident, _name}, &1)),
-        do: :other,
-        else: {Map.get(@flipped, op, op), comparand}
+         true <- InfluxQLTokens.time?(last),
+         flipped when flipped != nil <- InfluxQLTokens.flip_op(op),
+         false <- Enum.any?(comparand, &match?({:ident, _name}, &1)) do
+      {flipped, comparand}
     else
       _other -> :other
     end

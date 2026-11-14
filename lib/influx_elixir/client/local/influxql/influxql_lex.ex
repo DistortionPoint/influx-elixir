@@ -121,6 +121,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLLex do
   @spec spaced_connective?(binary()) :: boolean()
   def spaced_connective?(text), do: Regex.match?(@spaced_connective, text)
 
+  @doc "The byte at `at` in `text`, or `nil` when `at` is at or past the end."
+  @spec byte_at(binary(), non_neg_integer()) :: byte() | nil
+  def byte_at(text, at) when at < byte_size(text), do: :binary.at(text, at)
+  def byte_at(_text, _at), do: nil
+
   @doc """
   Whether a carriage return stands directly after the keyword that ends at `at` in `text`:
   the keyword is then not read as one.

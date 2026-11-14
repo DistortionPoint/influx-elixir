@@ -720,7 +720,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   # Whether the list holds no column beside its calls (a plain column makes it the mixing the
   # engine words).
-  defp only_calls?(items), do: Enum.all?(items, &(aggregate?(&1) or time?(&1) or constants?(&1)))
+  defp only_calls?(items),
+    do: Enum.all?(items, &(aggregate?(&1) or InfluxQLNames.time_item?(&1) or constants?(&1)))
 
   defp of_aggregate?({:transform, _name, inner, _parameter}),
     do: InfluxQLExpr.aggregates(inner) != []
@@ -766,7 +767,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   defp no_mix(items) do
     aggregates = Enum.filter(items, &aggregate?/1)
     calls = Enum.flat_map(items, &calls/1)
-    plain = Enum.reject(items, &(aggregate?(&1) or time?(&1) or constants?(&1)))
+
+    plain =
+      Enum.reject(items, &(aggregate?(&1) or InfluxQLNames.time_item?(&1) or constants?(&1)))
+
     mixed = Enum.filter(aggregates, &reads_beside_call?/1)
 
     cond do
@@ -862,7 +866,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   defp group_selector_columns(items, _group_time) do
     if Enum.any?(items, &aggregate?/1) and not Enum.any?(items, &multi?/1) and
-         Enum.any?(items, &(not (aggregate?(&1) or time?(&1)))),
+         Enum.any?(items, &(not (aggregate?(&1) or InfluxQLNames.time_item?(&1)))),
        do: {:error, "unsupported InfluxQL (columns beside a selector in GROUP BY time)"},
        else: :ok
   end
@@ -883,9 +887,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   defp selector?({:multi, _kind, _field, _tags, _limit, _alias}), do: true
   defp selector?(_item), do: false
-
-  defp time?({:column, column, _name}), do: String.downcase(column) == "time"
-  defp time?(_item), do: false
 
   defp planning(message), do: {:error, {:engine, InfluxQLError.select_error(message)}}
 end

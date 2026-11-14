@@ -84,7 +84,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
   defp sides(_left, op, _right, _ctx) when op in ["=~", "!~"], do: :ok
 
   defp sides(left, _op, right, ctx) do
-    comparand = if bare_time?(left), do: right, else: left
+    comparand = if InfluxQLTokens.bare_time?(left), do: right, else: left
 
     case comparand |> InfluxQLTokens.strip_parens() |> parse(ctx) do
       :valid ->
@@ -97,9 +97,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
         {:error, InfluxQLError.split_error("Error during planning: " <> message)}
     end
   end
-
-  defp bare_time?([token]), do: InfluxQLTokens.time?(token)
-  defp bare_time?(_tokens), do: false
 
   # `time > 0 < 1`: the comparison of the time with an integer literal, whose error the planner
   # raises as the type error it is. The comparand that is no integer literal is left to the

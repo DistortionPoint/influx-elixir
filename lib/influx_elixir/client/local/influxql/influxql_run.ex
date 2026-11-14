@@ -13,7 +13,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     InfluxQLGroup,
     InfluxQLNames,
     InfluxQLProjection,
-    InfluxQLRegex,
     InfluxQLTransform,
     SQLLimits
   }
@@ -280,7 +279,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   # `GROUP BY h, r`).
   @spec group_keys(InfluxQL.query(), MapSet.t(binary())) :: [binary()]
   defp group_keys(%{group_by: group_by}, tags),
-    do: group_by |> Enum.flat_map(&dimension_keys(&1, tags)) |> Enum.uniq() |> Enum.sort()
+    do:
+      group_by
+      |> Enum.flat_map(&InfluxQLGroup.dimension_keys(&1, tags))
+      |> Enum.uniq()
+      |> Enum.sort()
 
   # The projection plan of the statement: the columns, their names and roles. A dimension the
   # measurement does not have is a column all the same (null, and it takes its name: verified).
@@ -292,17 +295,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       dimensions: group_keys(query, tags),
       regex?: Enum.any?(group_by, &match?({:regex, _source}, &1))
     })
-  end
-
-  # The columns a dimension groups by: a name, every tag (`*`), the tags a
-  # regular expression matches.
-  @spec dimension_keys(InfluxQLGroup.dimension(), MapSet.t(binary())) :: [binary()]
-  defp dimension_keys({:tag, name}, _tags), do: [name]
-  defp dimension_keys(:wildcard, tags), do: MapSet.to_list(tags)
-
-  defp dimension_keys({:regex, source}, tags) do
-    regex = InfluxQLRegex.compile(source, :expand)
-    Enum.filter(tags, &Regex.match?(regex, &1))
   end
 
   # The series that lacks the tag comes after every tag value, as the engine lists it.
@@ -318,7 +310,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   # same.
   @spec lower_time(integer() | nil) :: DateTime.t()
   defp lower_time(nil), do: @epoch
-  defp lower_time(ns), do: DateTime.from_unix!(Integer.floor_div(ns, 1_000), :microsecond)
+  defp lower_time(ns), do: ns_time(ns)
 
   # ---------------------------------------------------------------------------
   # One series (one GROUP BY key)
@@ -1049,15 +1041,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   # An expression of the point: null is no column, a number that is not finite is a null that
   # is written.
   defp point_expression(ast, point, types) do
-    if InfluxQLProjection.time_expr?(ast) do
-      {:ok, point["time"]}
-    else
-      case InfluxQLExpr.eval(ast, point, types) do
-        nil -> :null
-        :nan -> {:ok, nil}
-        value -> {:ok, value}
-      end
-    end
+    if InfluxQLProjection.time_expr?(ast),
+      do: {:ok, point["time"]},
+      else: computed(ast, point, types)
   end
 
   defp put_value(row, _name, nil), do: row

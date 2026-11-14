@@ -18,4 +18,14 @@ defmodule InfluxElixir.Client.Local.Durations do
   @doc "The nanoseconds in one unit, given as text (`ms`, `h`, ...); raises for a unit that is none."
   @spec ns(binary()) :: pos_integer()
   def ns(unit), do: Map.fetch!(@units, unit)
+
+  @doc "The total nanoseconds in a compound duration literal (`1h30m`, `500ms`, ...)."
+  @spec total_ns(binary()) :: non_neg_integer()
+  def total_ns(text) do
+    ~r/(\d+)(ns|ms|u|µ|s|m|h|d|w)/
+    |> Regex.scan(text)
+    |> Enum.reduce(0, fn [_all, count, unit], total ->
+      total + String.to_integer(count) * ns(unit)
+    end)
+  end
 end

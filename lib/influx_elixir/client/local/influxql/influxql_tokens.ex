@@ -19,10 +19,29 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   require InfluxQLLex
   require SQLLimits
 
+  @flipped %{
+    "=" => "=",
+    "!=" => "!=",
+    "<>" => "<>",
+    "<" => ">",
+    "<=" => ">=",
+    ">" => "<",
+    ">=" => "<="
+  }
+
   @doc false
   @spec time?(term()) :: boolean()
   def time?({:ident, name}), do: String.downcase(name) == "time"
   def time?(_token), do: false
+
+  @doc "Whether a list of tokens is the single bare `time` identifier."
+  @spec bare_time?(list()) :: boolean()
+  def bare_time?([token]), do: time?(token)
+  def bare_time?(_tokens), do: false
+
+  @doc "The comparison operator when its two sides are swapped, or `nil` for `=~` / `!~`."
+  @spec flip_op(binary()) :: binary() | nil
+  def flip_op(op), do: Map.get(@flipped, op)
 
   @doc "Whether a word is the boolean constant `true` or `false`, in any case."
   @spec boolean_word?(binary()) :: boolean()

@@ -21,6 +21,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
     InfluxQL,
     InfluxQLError,
     InfluxQLExpr,
+    InfluxQLGroup,
     InfluxQLNames,
     InfluxQLRegex,
     InfluxQLText
@@ -71,20 +72,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
   end
 
   # The tags a `GROUP BY` names, which the rows carry as dimensions.
-  @spec grouped([term()], MapSet.t(binary())) :: [binary()]
-  defp grouped(dimensions, tags) do
-    Enum.flat_map(dimensions, fn
-      {:tag, name} ->
-        [name]
-
-      :wildcard ->
-        MapSet.to_list(tags)
-
-      {:regex, source} ->
-        regex = InfluxQLRegex.compile(source, :expand)
-        Enum.filter(tags, &Regex.match?(regex, &1))
-    end)
-  end
+  @spec grouped([InfluxQLGroup.dimension()], MapSet.t(binary())) :: [binary()]
+  defp grouped(dimensions, tags),
+    do: Enum.flat_map(dimensions, &InfluxQLGroup.dimension_keys(&1, tags))
 
   # `*` written out once for each time it is selected: every field and tag, the dimensions of
   # the `GROUP BY` apart (they are columns of the row already), each as a column of its
