@@ -135,14 +135,10 @@ defmodule InfluxElixir.Flight.Client do
 
   @spec valid_options?(keyword()) :: boolean()
   defp valid_options?(opts) do
-    valid_timeout_opt?(Keyword.get(opts, :timeout)) and
-      valid_timeout_opt?(Keyword.get(opts, :connect_timeout)) and
+    Options.timeout_opt?(Keyword.get(opts, :timeout)) and
+      Options.timeout_opt?(Keyword.get(opts, :connect_timeout)) and
       valid_tls_opt?(Keyword.get(opts, :tls))
   end
-
-  @spec valid_timeout_opt?(term()) :: boolean()
-  defp valid_timeout_opt?(timeout),
-    do: timeout in [nil, :infinity] or (is_integer(timeout) and timeout >= 0)
 
   @spec valid_tls_opt?(term()) :: boolean()
   defp valid_tls_opt?(tls), do: is_nil(tls) or is_boolean(tls)
@@ -209,15 +205,7 @@ defmodule InfluxElixir.Flight.Client do
   # a tuple) is the caller's error before any connection, as over HTTP.
   @spec ticket_payload(term(), term()) ::
           {:ok, binary()} | {:error, {:unencodable_body, binary()}}
-  defp ticket_payload(database, sql) do
-    case Jason.encode(ticket(database, sql)) do
-      {:ok, payload} -> {:ok, payload}
-      {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
-    end
-  rescue
-    error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError, ArgumentError] ->
-      {:error, {:unencodable_body, Exception.message(error)}}
-  end
+  defp ticket_payload(database, sql), do: database |> ticket(sql) |> Options.json_body()
 
   @spec open_channel(binary(), pos_integer(), keyword()) ::
           {:ok, GRPC.Channel.t()} | {:error, term()}
@@ -249,7 +237,7 @@ defmodule InfluxElixir.Flight.Client do
 
   @spec resolve_timeout(keyword()) :: timeout()
   defp resolve_timeout(opts) do
-    case if(InfluxElixir.Client.Options.keyword?(opts), do: Keyword.get(opts, :timeout)) do
+    case if(Options.keyword?(opts), do: Keyword.get(opts, :timeout)) do
       nil -> @default_timeout
       timeout -> timeout
     end
@@ -259,7 +247,7 @@ defmodule InfluxElixir.Flight.Client do
   # Resolves the connect-phase timeout: :connect_timeout → :timeout → default.
   @spec resolve_connect_timeout(keyword()) :: timeout()
   def resolve_connect_timeout(opts) do
-    case if(InfluxElixir.Client.Options.keyword?(opts), do: Keyword.get(opts, :connect_timeout)) do
+    case if(Options.keyword?(opts), do: Keyword.get(opts, :connect_timeout)) do
       nil -> resolve_timeout(opts)
       connect_timeout -> connect_timeout
     end

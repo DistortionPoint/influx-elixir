@@ -66,22 +66,7 @@ defmodule InfluxElixir.Admin.TokenRequest do
 
   # JSON holds only UTF-8 text: a name that is not is the caller's error, not a raise.
   @spec encode([{binary(), term()}]) :: {:ok, binary()} | {:error, {:unencodable_body, binary()}}
-  defp encode(pairs) do
-    case Jason.encode(Jason.OrderedObject.new(pairs)) do
-      {:ok, body} -> {:ok, body}
-      {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
-    end
-  rescue
-    error in [
-      FunctionClauseError,
-      Protocol.UndefinedError,
-      Jason.EncodeError,
-      ArgumentError,
-      BadFunctionError,
-      BadArityError
-    ] ->
-      {:error, {:unencodable_body, Exception.message(error)}}
-  end
+  defp encode(pairs), do: pairs |> Jason.OrderedObject.new() |> Options.json_body()
 
   @spec parse_permissions(term()) :: {:ok, [Jason.OrderedObject.t()]} | {:error, term()}
   defp parse_permissions(permissions) when is_list(permissions) do

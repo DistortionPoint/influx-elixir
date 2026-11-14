@@ -39,6 +39,8 @@ defmodule InfluxElixir.Client.QueryParams do
   @typedoc "The parameters as the request body carries them: string keys, JSON-encodable values."
   @type t :: %{binary() => term()}
 
+  alias InfluxElixir.Client.Options
+
   @typedoc "Why a parameter cannot be sent."
   @type reason ::
           :non_finite_decimal
@@ -194,13 +196,10 @@ defmodule InfluxElixir.Client.QueryParams do
   defp encode_json(%{__struct__: Decimal} = value), do: {:ok, Decimal.to_string(value, :normal)}
 
   defp encode_json(value) do
-    case Jason.encode(value) do
+    case Options.json_body(value) do
       {:ok, json} -> {:ok, json}
-      {:error, _exception} -> :error
+      {:error, _reason} -> :error
     end
-  rescue
-    _error in [FunctionClauseError, Protocol.UndefinedError, Jason.EncodeError, ArgumentError] ->
-      :error
   end
 
   @spec number_text(binary()) :: boolean()

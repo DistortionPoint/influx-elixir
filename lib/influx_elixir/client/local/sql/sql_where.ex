@@ -14,7 +14,14 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   # NULL` or a bare boolean column; a `$name` is kept as a node for
   # `InfluxElixir.Client.Local.SQLBind`.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLLimit, SQLMask, SQLPredicate}
+  alias InfluxElixir.Client.Local.{
+    SQLError,
+    SQLExpr,
+    SQLIdentifiers,
+    SQLLimit,
+    SQLMask,
+    SQLPredicate
+  }
 
   @typedoc "A predicate: operator, left operand, right side."
   @type clause :: SQLPredicate.clause()
@@ -116,8 +123,8 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
     do: {:ok, state |> flush_pred() |> Map.fetch!(:tokens) |> Enum.reverse()}
 
   defp scan_where(<<q, rest::binary>>, state) when q in [?', ?"] do
-    case take_literal(rest, q, []) do
-      {:ok, literal, after_quote} -> scan_where(after_quote, append(state, <<q>> <> literal))
+    case SQLIdentifiers.take_quoted(rest, q) do
+      {:ok, body, after_quote} -> scan_where(after_quote, append(state, <<q>> <> body <> <<q>>))
       :error -> {:error, SQLError.refusal("unterminated string literal in WHERE: #{rest}")}
     end
   end
@@ -174,37 +181,11 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   # otherwise it is part of the predicate's text (`(n + 1) > 5`, `(n) IS NULL`).
   @spec grouping?(binary()) :: boolean()
   defp grouping?(rest) do
-    case after_group(rest, 1) do
-      :unbalanced -> true
-      tail -> Regex.match?(~r/\A\s*(?:\z|\)|(?:AND|OR)(?=\s|\(|\z))/iu, tail)
+    case SQLMask.balanced(rest) do
+      :error -> true
+      {:ok, _body, tail} -> Regex.match?(~r/\A\s*(?:\z|\)|(?:AND|OR)(?=\s|\(|\z))/iu, tail)
     end
   end
-
-  @spec after_group(binary(), pos_integer()) :: binary() | :unbalanced
-  defp after_group(<<>>, _depth), do: :unbalanced
-
-  defp after_group(<<q, rest::binary>>, depth) when q in [?', ?"] do
-    case take_literal(rest, q, []) do
-      {:ok, _literal, after_quote} -> after_group(after_quote, depth)
-      :error -> :unbalanced
-    end
-  end
-
-  defp after_group(<<"(", rest::binary>>, depth), do: after_group(rest, depth + 1)
-  defp after_group(<<")", rest::binary>>, 1), do: rest
-  defp after_group(<<")", rest::binary>>, depth), do: after_group(rest, depth - 1)
-  defp after_group(<<_byte, rest::binary>>, depth), do: after_group(rest, depth)
-
-  # The rest of a quoted literal, through its closing quote; a doubled quote
-  # does not close it.
-  @spec take_literal(binary(), char(), iodata()) :: {:ok, binary(), binary()} | :error
-  defp take_literal(<<q, q, rest::binary>>, q, acc), do: take_literal(rest, q, [q, q | acc])
-
-  defp take_literal(<<q, rest::binary>>, q, acc),
-    do: {:ok, [q | acc] |> Enum.reverse() |> IO.iodata_to_binary(), rest}
-
-  defp take_literal(<<byte, rest::binary>>, q, acc), do: take_literal(rest, q, [byte | acc])
-  defp take_literal(<<>>, _q, _acc), do: :error
 
   @spec scan_keyword(binary(), binary(), map()) :: {:ok, [where_token()]} | {:error, map()}
   defp scan_keyword("AND", rest, %{between: true} = state),

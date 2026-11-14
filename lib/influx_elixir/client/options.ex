@@ -4,10 +4,43 @@ defmodule InfluxElixir.Client.Options do
   # are a keyword list or the caller's error, a write body is iodata or the caller's error, a
   # connection holds a default database or does not. None of them raises.
 
+  @unencodable_errors [
+    FunctionClauseError,
+    Protocol.UndefinedError,
+    Jason.EncodeError,
+    ArgumentError,
+    BadFunctionError,
+    BadArityError
+  ]
+
   @doc false
   # A keyword list: the only form options can take.
   @spec keyword?(term()) :: boolean()
   def keyword?(opts), do: is_list(opts) and Keyword.keyword?(opts)
+
+  @doc false
+  # A timeout value: a non-negative integer of milliseconds or `:infinity`.
+  @spec timeout?(term()) :: boolean()
+  def timeout?(timeout), do: timeout == :infinity or (is_integer(timeout) and timeout >= 0)
+
+  @doc false
+  # An optional timeout value in a keyword list: `nil` (unset) or a valid timeout.
+  @spec timeout_opt?(term()) :: boolean()
+  def timeout_opt?(timeout), do: is_nil(timeout) or timeout?(timeout)
+
+  @doc false
+  # Encodes `payload` as JSON, returning `{:error, {:unencodable_body, message}}` instead of
+  # raising when `payload` holds non-UTF-8 binaries, tuples, functions or improper lists.
+  @spec json_body(term()) :: {:ok, binary()} | {:error, {:unencodable_body, binary()}}
+  def json_body(payload) do
+    case Jason.encode(payload) do
+      {:ok, body} -> {:ok, body}
+      {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
+    end
+  rescue
+    error in @unencodable_errors ->
+      {:error, {:unencodable_body, Exception.message(error)}}
+  end
 
   @doc false
   # The text that iodata stands for (a binary is itself); anything that is not iodata is

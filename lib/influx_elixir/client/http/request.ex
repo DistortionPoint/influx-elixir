@@ -258,8 +258,8 @@ defmodule InfluxElixir.Client.HTTP.Request do
       url_text?(Keyword.get(conn, :host)) and
       url_text?(Keyword.get(conn, :port)) and
       url_text?(Keyword.get(conn, :token)) and
-      valid_timeout_opt?(Keyword.get(conn, :timeout)) and
-      valid_timeout_opt?(Keyword.get(conn, :pool_timeout))
+      Options.timeout_opt?(Keyword.get(conn, :timeout)) and
+      Options.timeout_opt?(Keyword.get(conn, :pool_timeout))
   end
 
   # Options that are not a keyword list have nothing a request could be built from: the
@@ -273,40 +273,20 @@ defmodule InfluxElixir.Client.HTTP.Request do
 
   @spec valid_options?(keyword()) :: boolean()
   defp valid_options?(opts) do
-    valid_timeout_opt?(Keyword.get(opts, :timeout)) and
-      valid_timeout_opt?(Keyword.get(opts, :pool_timeout)) and
-      valid_timeout_opt?(Keyword.get(opts, :connect_timeout)) and
+    Options.timeout_opt?(Keyword.get(opts, :timeout)) and
+      Options.timeout_opt?(Keyword.get(opts, :pool_timeout)) and
+      Options.timeout_opt?(Keyword.get(opts, :connect_timeout)) and
       valid_boolean_opt?(Keyword.get(opts, :tls)) and
       valid_boolean_opt?(Keyword.get(opts, :gzip))
   end
-
-  @spec valid_timeout_opt?(term()) :: boolean()
-  defp valid_timeout_opt?(timeout),
-    do: timeout in [nil, :infinity] or (is_integer(timeout) and timeout >= 0)
 
   @spec valid_boolean_opt?(term()) :: boolean()
   defp valid_boolean_opt?(flag), do: is_nil(flag) or is_boolean(flag)
 
   # A request body is JSON, which holds only UTF-8 text: text that is not is
   # the caller's error, returned as one, never a `Jason.EncodeError` raised.
-  @spec json_body(map()) :: {:ok, binary()} | {:error, {:unencodable_body, binary()}}
-  def json_body(map) do
-    case Jason.encode(map) do
-      {:ok, body} -> {:ok, body}
-      {:error, error} -> {:error, {:unencodable_body, Exception.message(error)}}
-    end
-  rescue
-    # Jason raises instead of returning for an improper list or a map key it cannot write.
-    error in [
-      FunctionClauseError,
-      Protocol.UndefinedError,
-      Jason.EncodeError,
-      ArgumentError,
-      BadFunctionError,
-      BadArityError
-    ] ->
-      {:error, {:unencodable_body, Exception.message(error)}}
-  end
+  @spec json_body(term()) :: {:ok, binary()} | {:error, {:unencodable_body, binary()}}
+  defdelegate json_body(map), to: Options
 
   # A body that is not JSON (a proxy's HTML page, say) is the same error
   # ResponseParser gives, not a bare Jason.DecodeError.

@@ -470,12 +470,10 @@ defmodule InfluxElixir do
   @spec resolve_batch_timeout(term(), boolean()) :: {:ok, timeout()} | :error
   defp resolve_batch_timeout(nil, true), do: {:ok, 300_000}
   defp resolve_batch_timeout(nil, false), do: {:ok, 60_000}
-  defp resolve_batch_timeout(:infinity, _sync), do: {:ok, :infinity}
 
-  defp resolve_batch_timeout(timeout, _sync) when is_integer(timeout) and timeout >= 0,
-    do: {:ok, timeout}
-
-  defp resolve_batch_timeout(_timeout, _sync), do: :error
+  defp resolve_batch_timeout(timeout, _sync) do
+    if Options.timeout?(timeout), do: {:ok, timeout}, else: :error
+  end
 
   @doc """
   Forces an immediate flush of the batch writer for a connection.
@@ -489,7 +487,7 @@ defmodule InfluxElixir do
   """
   @spec flush(atom(), timeout()) :: :ok | {:error, :no_batch_writer | {:invalid_timeout, term()}}
   def flush(connection_name, timeout \\ 60_000) do
-    if valid_timeout?(timeout) do
+    if Options.timeout?(timeout) do
       with_batch_writer(connection_name, &BatchWriter.flush(&1, timeout))
     else
       {:error, {:invalid_timeout, timeout}}
@@ -506,16 +504,12 @@ defmodule InfluxElixir do
   @spec stats(atom(), timeout()) ::
           {:ok, map()} | {:error, :no_batch_writer | {:invalid_timeout, term()}}
   def stats(connection_name, timeout \\ 5_000) do
-    if valid_timeout?(timeout) do
+    if Options.timeout?(timeout) do
       with_batch_writer(connection_name, &BatchWriter.stats(&1, timeout))
     else
       {:error, {:invalid_timeout, timeout}}
     end
   end
-
-  @spec valid_timeout?(term()) :: boolean()
-  defp valid_timeout?(:infinity), do: true
-  defp valid_timeout?(timeout), do: is_integer(timeout) and timeout >= 0
 
   # A process that is gone, or stopped as a supervisor stops it, rather than one that crashed.
   defguardp stopped(reason)

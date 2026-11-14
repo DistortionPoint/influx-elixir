@@ -420,7 +420,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
   defp table_columns(table, database, {:types, measurement}) do
     columns =
       for {^measurement, column, kind} <- Store.columns(table, database),
-          do: {column, arrow_type(kind)}
+          do: {column, SQLInformation.arrow_type(kind)}
 
     Enum.uniq([{"time", "Timestamp(ns)"} | columns])
   end
@@ -429,14 +429,6 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     columns = for {^measurement, column, _kind} <- Store.columns(table, database), do: column
     ["time" | columns] |> Enum.uniq() |> Enum.sort()
   end
-
-  @spec arrow_type(binary()) :: binary()
-  defp arrow_type("iox::column_type::tag"), do: "Dictionary(Int32, Utf8)"
-  defp arrow_type("iox::column_type::field::integer"), do: "Int64"
-  defp arrow_type("iox::column_type::field::uinteger"), do: "UInt64"
-  defp arrow_type("iox::column_type::field::float"), do: "Float64"
-  defp arrow_type("iox::column_type::field::string"), do: "Utf8"
-  defp arrow_type("iox::column_type::field::boolean"), do: "Boolean"
 
   # An operand of an `UPDATE` planned as a select item of the table (see `SQLDmlPlan`).
   @spec plan_operand(Store.t(), binary(), binary() | nil, binary()) ::

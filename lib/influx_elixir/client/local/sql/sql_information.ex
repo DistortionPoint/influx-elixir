@@ -134,13 +134,14 @@ defmodule InfluxElixir.Client.Local.SQLInformation do
 
   defp type_attributes(_type), do: %{}
 
+  @doc "The Arrow data type of a stored `iox::column_type::*` column kind."
   @spec arrow_type(binary()) :: binary()
-  defp arrow_type("iox::column_type::tag"), do: "Dictionary(Int32, Utf8)"
-  defp arrow_type("iox::column_type::field::integer"), do: "Int64"
-  defp arrow_type("iox::column_type::field::uinteger"), do: "UInt64"
-  defp arrow_type("iox::column_type::field::float"), do: "Float64"
-  defp arrow_type("iox::column_type::field::string"), do: "Utf8"
-  defp arrow_type("iox::column_type::field::boolean"), do: "Boolean"
+  def arrow_type("iox::column_type::tag"), do: "Dictionary(Int32, Utf8)"
+  def arrow_type("iox::column_type::field::integer"), do: "Int64"
+  def arrow_type("iox::column_type::field::uinteger"), do: "UInt64"
+  def arrow_type("iox::column_type::field::float"), do: "Float64"
+  def arrow_type("iox::column_type::field::string"), do: "Utf8"
+  def arrow_type("iox::column_type::field::boolean"), do: "Boolean"
 
   @spec row(binary(), map()) :: map()
   defp row(name, fields), do: %{measurement: name, tags: %{}, fields: fields, timestamp: nil}

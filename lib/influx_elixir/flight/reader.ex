@@ -228,32 +228,32 @@ defmodule InfluxElixir.Flight.Reader do
 
   def parse_schema(_other), do: {:error, :schema_parse_failed}
 
-  @spec parse_message_schema(binary()) ::
-          {:ok, [column_schema()]} | {:error, term()}
+  @spec parse_message_schema(binary()) :: {:ok, [column_schema()]}
   defp parse_message_schema(fb) do
-    # Read root Message table
+    case message_header(fb, @msg_header_schema) do
+      nil -> {:ok, []}
+      schema_pos -> parse_schema_table(fb, schema_pos)
+    end
+  end
+
+  # Reads the root Message table's header offset when its `header_type` (slot 1) matches
+  # `expected_type`.
+  @spec message_header(binary(), non_neg_integer()) :: non_neg_integer() | nil
+  defp message_header(fb, expected_type) do
     msg_pos = FB.root_table_pos(fb)
     {vt_pos, vt_size} = FB.read_vtable(fb, msg_pos)
 
-    # Message field 1: header_type (union discriminator, uint8)
     header_type =
       case FB.field_pos(fb, msg_pos, vt_pos, vt_size, 1) do
         nil -> 0
         pos -> FB.read_uint8(fb, pos)
       end
 
-    if header_type == @msg_header_schema do
-      # Message field 2: header (union value, offset to Schema table)
+    if header_type == expected_type do
       case FB.field_pos(fb, msg_pos, vt_pos, vt_size, 2) do
-        nil ->
-          {:ok, []}
-
-        header_offset_pos ->
-          schema_pos = FB.read_offset(fb, header_offset_pos)
-          parse_schema_table(fb, schema_pos)
+        nil -> nil
+        header_offset_pos -> FB.read_offset(fb, header_offset_pos)
       end
-    else
-      {:ok, []}
     end
   end
 
@@ -389,10 +389,10 @@ defmodule InfluxElixir.Flight.Reader do
           binary(),
           non_neg_integer() | nil,
           non_neg_integer(),
-          :int16 | :int32,
-          integer()
+          :bool | :int16 | :int32,
+          term()
         ) ::
-          integer()
+          term()
   defp type_slot(_fb, nil, _slot, _kind, default), do: default
 
   defp type_slot(fb, type_pos, slot, kind, default) do
@@ -400,6 +400,7 @@ defmodule InfluxElixir.Flight.Reader do
 
     case FB.field_pos(fb, type_pos, vt_pos, vt_size, slot) do
       nil -> default
+      pos when kind == :bool -> FB.read_bool(fb, pos)
       pos when kind == :int16 -> FB.read_int16(fb, pos)
       pos -> FB.read_int32(fb, pos)
     end
@@ -409,57 +410,28 @@ defmodule InfluxElixir.Flight.Reader do
   # the Arrow schema default; InfluxDB writes NANOSECOND explicitly.
   @spec timestamp_unit(binary(), non_neg_integer(), non_neg_integer() | nil) ::
           System.time_unit() | nil
-  defp timestamp_unit(fb, @fb_type_timestamp, type_pos) when type_pos != nil do
-    {vt_pos, vt_size} = FB.read_vtable(fb, type_pos)
-
-    case FB.field_pos(fb, type_pos, vt_pos, vt_size, 0) do
-      nil -> :second
-      pos -> Map.get(@time_units, FB.read_int16(fb, pos), :nanosecond)
-    end
+  defp timestamp_unit(fb, @fb_type_timestamp, type_pos) do
+    Map.get(@time_units, type_slot(fb, type_pos, 0, :int16, 0), :nanosecond)
   end
 
-  defp timestamp_unit(_fb, @fb_type_timestamp, nil), do: :second
   defp timestamp_unit(_fb, _type_type, _type_pos), do: nil
 
   @spec resolve_type_id(binary(), non_neg_integer(), non_neg_integer() | nil) ::
           non_neg_integer()
   defp resolve_type_id(fb, @fb_type_int, type_pos) when type_pos != nil do
-    {vt_pos, vt_size} = FB.read_vtable(fb, type_pos)
-
     # FlatBuffers leave a field out when it holds its schema default, so each `nil` below is
     # that default (Schema.fbs: `table Int { bitWidth: int; is_signed: bool; }`, both
     # zero-valued). An unsigned column arrives without the `is_signed` slot.
-    #
-    # Int slot 0: bitWidth (int32, default 0)
-    bit_width =
-      case FB.field_pos(fb, type_pos, vt_pos, vt_size, 0) do
-        nil -> 0
-        pos -> FB.read_int32(fb, pos)
-      end
-
-    # Int slot 1: is_signed (bool)
-    is_signed =
-      case FB.field_pos(fb, type_pos, vt_pos, vt_size, 1) do
-        nil -> false
-        pos -> FB.read_bool(fb, pos)
-      end
-
+    bit_width = type_slot(fb, type_pos, 0, :int32, 0)
+    is_signed = type_slot(fb, type_pos, 1, :bool, false)
     map_int_type(bit_width, is_signed)
   end
 
   defp resolve_type_id(fb, @fb_type_floating_point, type_pos)
        when type_pos != nil do
-    {vt_pos, vt_size} = FB.read_vtable(fb, type_pos)
-
     # FloatingPoint slot 0: precision (int16 enum: HALF=0, SINGLE=1, DOUBLE=2). HALF is the
     # default, so a Float16 column has no slot; it has no type id and decodes as `:float16`.
-    precision =
-      case FB.field_pos(fb, type_pos, vt_pos, vt_size, 0) do
-        nil -> 0
-        pos -> FB.read_int16(fb, pos)
-      end
-
-    case precision do
+    case type_slot(fb, type_pos, 0, :int16, 0) do
       1 -> @type_float32
       2 -> @type_float64
       _half_or_unknown -> 0
@@ -557,29 +529,10 @@ defmodule InfluxElixir.Flight.Reader do
 
   @spec parse_message_record_batch(binary()) ::
           {:ok, non_neg_integer(), [{non_neg_integer(), non_neg_integer()}], map()}
-          | {:error, term()}
   defp parse_message_record_batch(fb) do
-    msg_pos = FB.root_table_pos(fb)
-    {vt_pos, vt_size} = FB.read_vtable(fb, msg_pos)
-
-    # Message field 1: header_type
-    header_type =
-      case FB.field_pos(fb, msg_pos, vt_pos, vt_size, 1) do
-        nil -> 0
-        pos -> FB.read_uint8(fb, pos)
-      end
-
-    if header_type == @msg_header_record_batch do
-      case FB.field_pos(fb, msg_pos, vt_pos, vt_size, 2) do
-        nil ->
-          {:ok, 0, [], @empty_meta}
-
-        header_offset_pos ->
-          rb_pos = FB.read_offset(fb, header_offset_pos)
-          parse_record_batch_table(fb, rb_pos)
-      end
-    else
-      {:ok, 0, [], @empty_meta}
+    case message_header(fb, @msg_header_record_batch) do
+      nil -> {:ok, 0, [], @empty_meta}
+      rb_pos -> parse_record_batch_table(fb, rb_pos)
     end
   end
 
