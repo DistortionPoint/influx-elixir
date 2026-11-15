@@ -20,6 +20,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     InfluxQLLex,
     InfluxQLLiteral,
     InfluxQLNames,
+    InfluxQLRegex,
     InfluxQLSelectCheck,
     InfluxQLSources,
     InfluxQLText,
@@ -390,10 +391,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   defp unread({:lexer, _start, error}, _reason), do: error
 
   @spec blank({non_neg_integer(), non_neg_integer()}, binary()) :: binary()
-  defp blank({from, length}, text) do
-    <<before::binary-size(from), _comment::binary-size(length), rest::binary>> = text
-    before <> String.duplicate(" ", length) <> rest
-  end
+  defp blank({from, length}, text), do: InfluxQLText.blank_range(text, from, length)
 
   # The statement up to its first `;` outside a literal, with its mask, and
   # the offset just after the `;` (`nil` without one).
@@ -578,7 +576,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
   defp parse_item("/" <> _rest = text) do
     case Regex.run(~q/^\/((?:[^\/\\]|\\.)+)\/(?:\s*AS\s+(?:"[^"]+"|\w+))?$/is, text) do
-      [_all, source] -> {:ok, {:wild_column, {:regex, String.replace(source, "\\/", "/")}}}
+      [_all, source] -> {:ok, {:wild_column, {:regex, InfluxQLRegex.unescape_slashes(source)}}}
       nil -> unsupported_item(text, "a regular expression column in that shape")
     end
   end

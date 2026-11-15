@@ -15,7 +15,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSources do
   # for a later one the list ends at its comma). A fourth part is left over from its dot.
   # What the qualifiers mean is in `InfluxQLParser`.
 
-  alias InfluxElixir.Client.Local.{InfluxQLLex, InfluxQLText}
+  alias InfluxElixir.Client.Local.{InfluxQLLex, InfluxQLRegex, InfluxQLText}
 
   @name ~S{"(?:[^"\\]|\\.)*"|[A-Za-z_]\w*}
   @regex ~S{/(?:[^/\\]|\\.)*/}
@@ -164,7 +164,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSources do
     do: {:name, raw |> binary_part(at, size) |> InfluxQLText.unquote_ident()}
 
   defp value(:regex, raw, at, size) do
-    {:regex, raw |> binary_part(at + 1, size - 2) |> String.replace("\\/", "/")}
+    {:regex, raw |> binary_part(at + 1, size - 2) |> InfluxQLRegex.unescape_slashes()}
   end
 
   # A regular expression or a name (reserved or not, see `ended/4`) at `at`.

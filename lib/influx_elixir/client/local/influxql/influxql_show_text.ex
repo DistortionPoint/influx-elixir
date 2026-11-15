@@ -27,15 +27,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
   @typedoc "A parse result: the spec read so far and where the next clause starts."
   @type step :: {:ok, map(), non_neg_integer()} | :none | {:error, term()}
 
-  @prefix "error in InfluxQL statement: parsing error: "
-
   @doc "The start of every parse error body of the engine."
   @spec prefix() :: binary()
-  def prefix, do: @prefix
+  def prefix, do: InfluxQLError.prefix()
 
   @doc "The engine's parse error `message` at byte `at`."
   @spec error(binary(), non_neg_integer()) :: {:error, {:engine, binary()}}
-  def error(message, at), do: {:error, {:engine, "#{@prefix}#{message} at pos #{at}"}}
+  def error(message, at), do: {:error, {:engine, "#{prefix()}#{message} at pos #{at}"}}
+
+  @doc "The engine's syntax error of `kind` at `pos` (defaults to the end of `ctx`)."
+  @spec syntax_error(ctx(), atom(), non_neg_integer() | nil) :: {:error, {:engine, binary()}}
+  def syntax_error(ctx, kind, pos \\ nil),
+    do: {:error, {:engine, InfluxQLError.syntax_error_body(kind, pos || ctx.size, ctx.raw)}}
 
   @doc "The statement as sent from `at` on."
   @spec rest(ctx(), non_neg_integer()) :: binary()
@@ -147,12 +150,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
 
         case unescape(inside, at + 1, []) do
           {:ok, name} -> {:ok, name, close + 1}
-          {:bad, pos} -> error("invalid escape sequence, expected \\\\, \\\" or \\n", pos)
+          {:bad, pos} -> syntax_error(ctx, :escape_name, pos)
         end
 
       :nomatch ->
-        {:error,
-         {:engine, InfluxQLError.syntax_error_body(:unterminated_string, ctx.size, ctx.raw)}}
+        syntax_error(ctx, :unterminated_string)
     end
   end
 
@@ -164,7 +166,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
   """
   @spec lexer_error(ctx(), non_neg_integer()) :: {:error, {:engine, binary()}} | nil
   def lexer_error(%{bad: {kind, start}} = ctx, from) when start >= from,
-    do: {:error, {:engine, InfluxQLError.syntax_error_body(kind, ctx.size, ctx.raw)}}
+    do: syntax_error(ctx, kind)
 
   def lexer_error(_ctx, _from), do: nil
 
@@ -269,11 +271,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowText do
     case :binary.match(ctx.masked, "/", scope: {at + 1, ctx.size - at - 1}) do
       {close, 1} ->
         inside = binary_part(ctx.clean, at + 1, close - at - 1)
-        {:ok, String.replace(inside, "\\/", "/"), close + 1}
+        {:ok, InfluxQLRegex.unescape_slashes(inside), close + 1}
 
       :nomatch ->
-        {:error,
-         {:engine, InfluxQLError.syntax_error_body(:unterminated_regex, ctx.size, ctx.raw)}}
+        syntax_error(ctx, :unterminated_regex)
     end
   end
 end

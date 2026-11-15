@@ -638,9 +638,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   @spec logical_error(:and | :or, binary(), binary()) :: binary()
   defp logical_error(kind, left, right) do
     word = if kind == :and, do: "AND", else: "OR"
-
-    "Error during planning: Cannot infer common argument type for logical boolean " <>
-      "operation #{left} #{word} #{right}"
+    InfluxQLError.logical_boolean_error(left, word, right)
   end
 
   # Whether a comparison names `now()` outside a comparison with the bare `time` (verified:
@@ -720,8 +718,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
   defp bare_field(_tokens, _tags, _types), do: nil
 
   @spec bare_error(atom()) :: binary()
-  defp bare_error(type) do
-    "type_coercion\ncaused by\nError during planning: Cannot infer common argument type " <>
-      "for logical boolean operation Boolean AND #{Map.fetch!(@arrow_types, type)}"
-  end
+  defp bare_error(type),
+    do: InfluxQLError.bare_condition_error(Map.fetch!(@arrow_types, type))
 end

@@ -234,7 +234,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # quadratic otherwise).
   @spec reading_limit(binary(), binary()) :: non_neg_integer() | nil
   defp reading_limit(where, masked) do
-    [tokens_error_at(where), InfluxQLParens.excess_offset(masked), top_level_comma_at(masked)]
+    [
+      tokens_error_at(where),
+      InfluxQLParens.excess_offset(masked),
+      InfluxQLSelectCheck.top_level_comma(masked)
+    ]
     |> Enum.reject(&is_nil/1)
     |> Enum.min(fn -> nil end)
   end
@@ -246,21 +250,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
       {:ok, _tokens} -> nil
       {:syntax_error, _kind, rest} -> byte_size(where) - byte_size(rest)
       {:error, "unsupported InfluxQL WHERE: " <> rest} -> byte_size(where) - byte_size(rest)
-    end
-  end
-
-  # A `,` outside every parenthesis is where the condition ends: the engine leaves the rest
-  # over, so a call behind it is not read. Where the first one stands, `nil` for none.
-  defp top_level_comma_at(text), do: top_level_comma_at(text, 0, 0)
-
-  defp top_level_comma_at(text, at, _depth) when at >= byte_size(text), do: nil
-
-  defp top_level_comma_at(text, at, depth) do
-    case :binary.at(text, at) do
-      ?, when depth == 0 -> at
-      ?( -> top_level_comma_at(text, at + 1, depth + 1)
-      ?) -> top_level_comma_at(text, at + 1, max(depth - 1, 0))
-      _byte -> top_level_comma_at(text, at + 1, depth)
     end
   end
 
@@ -489,9 +478,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   # others.
   @spec after_fill(binary(), non_neg_integer(), binary(), non_neg_integer()) :: positioned() | nil
   defp after_fill(whole, at, masked_rest, stop) do
-    rest = binary_part(masked_rest, stop, byte_size(masked_rest) - stop)
-    text = InfluxQLLex.trim_blanks(rest)
-    from = stop + byte_size(rest) - byte_size(text)
+    from = InfluxQLLex.skip_blanks(masked_rest, stop)
+    text = binary_part(masked_rest, from, byte_size(masked_rest) - from)
 
     cond do
       text == "" ->
@@ -819,11 +807,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
 
   # A sign with no operand fails the parser where the operand should start: past the blanks
   # (verified: `WHERE (n + LIMIT 1` leaves `LIMIT 1`, `WHERE (n +` and `WHERE (n + ` leave "").
-  defp failure_start(:reserved_failure, pos, whole) do
-    rest = binary_part(whole, pos, byte_size(whole) - pos)
-    pos + byte_size(rest) - byte_size(InfluxQLLex.trim_blanks(rest))
-  end
-
+  defp failure_start(:reserved_failure, pos, whole), do: InfluxQLLex.skip_blanks(whole, pos)
   defp failure_start(_kind, pos, _whole), do: pos
 
   # A group that does not read is found where the parser gives up on it, not where its error
@@ -926,7 +910,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
           positioned() | nil
   defp group_dimension({{piece, at}, index}, whole) do
     text = InfluxQLLex.trim_blanks(piece)
-    start = at + byte_size(piece) - byte_size(text)
+    start = at + InfluxQLLex.skip_blanks(piece, 0)
 
     cond do
       text =~ ~q/^time\s*$/i ->

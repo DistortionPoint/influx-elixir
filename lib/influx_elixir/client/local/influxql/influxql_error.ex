@@ -9,6 +9,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
 
   @engine_error_prefix "error in InfluxQL statement: parsing error: "
 
+  @doc "The start of every parse error body of the engine."
+  @spec prefix() :: binary()
+  def prefix, do: @engine_error_prefix
+
   # What a parse error says, by kind; the position follows as `at pos N`.
   @messages %{
     operand: "invalid conditional expression",
@@ -162,7 +166,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
 
   # How many blanks (a space, a tab, a carriage return, a line feed) the statement starts with.
   @spec leading_blanks(binary()) :: non_neg_integer()
-  defp leading_blanks(whole), do: byte_size(whole) - byte_size(InfluxQLLex.trim_blanks(whole))
+  defp leading_blanks(whole), do: InfluxQLLex.skip_blanks(whole, 0)
 
   @spec leftover(binary(), non_neg_integer()) :: binary()
   defp leftover(whole, pos), do: binary_part(whole, pos, byte_size(whole) - pos)
@@ -226,6 +230,42 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   def invalid_timestamp(quoted) do
     "Error during planning: invalid expression #{rust_debug(quoted)}: " <>
       "#{quoted} is not a valid timestamp"
+  end
+
+  @doc """
+  The engine's planning error for a timestamp literal or folded instant outside the 64-bit
+  nanosecond range, wrapped in `rewriting statement` / `split condition`.
+  """
+  @spec timestamp_out_of_range(binary()) :: binary()
+  def timestamp_out_of_range(shown) do
+    split_error("Error during planning: timestamp out of range: #{shown}")
+  end
+
+  @doc """
+  The engine's planning error for arithmetic between a signed and an unsigned integer.
+  """
+  @spec cannot_use_int_unsigned(binary()) :: binary()
+  def cannot_use_int_unsigned(op) do
+    "Error during planning: cannot use #{op} between an integer and unsigned, " <>
+      "an explicit cast is required"
+  end
+
+  @doc """
+  The engine's planning error when the operands of `AND` or `OR` cannot be coerced to booleans.
+  """
+  @spec logical_boolean_error(binary(), binary(), binary()) :: binary()
+  def logical_boolean_error(left, connective, right) do
+    "Error during planning: Cannot infer common argument type for logical boolean " <>
+      "operation #{left} #{connective} #{right}"
+  end
+
+  @doc """
+  The analyser's `type_coercion` error when a bare non-boolean operand of Arrow type `type`
+  stands as the whole condition.
+  """
+  @spec bare_condition_error(binary()) :: binary()
+  def bare_condition_error(type) do
+    "type_coercion\ncaused by\n" <> logical_boolean_error("Boolean", "AND", type)
   end
 
   @doc "Moves the positions of a parse error body on by `by` bytes."

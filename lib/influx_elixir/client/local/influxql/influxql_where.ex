@@ -746,8 +746,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
     throw(
       {:refused,
        {:engine,
-        "rewriting statement\ncaused by\nsplit condition\ncaused by\n" <>
-          "Error during planning: invalid time comparison operator: !="}}
+        InfluxQLError.split_error("Error during planning: invalid time comparison operator: !=")}}
     )
   end
 
@@ -799,8 +798,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
         throw({:refused, {:engine, 400, InfluxQLError.split_error(message)}})
 
       {:out_of_range, shown} ->
-        message = "Error during planning: timestamp out of range: #{shown}"
-        throw({:refused, {:engine, 400, InfluxQLError.split_error(message)}})
+        throw({:refused, {:engine, 400, InfluxQLError.timestamp_out_of_range(shown)}})
 
       :unknown ->
         InfluxQLError.refuse("the time '#{content}' in a form the double does not read")

@@ -29,7 +29,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   require InfluxQLLex
 
   import InfluxElixir.Client.Local.InfluxQLShowText,
-    only: [at_byte: 2, error: 2, keyword_end?: 2, rest: 2, skip_ws: 2, word_at: 2, ws?: 2]
+    only: [
+      at_byte: 2,
+      error: 2,
+      keyword_end?: 2,
+      rest: 2,
+      skip_ws: 2,
+      syntax_error: 3,
+      word_at: 2,
+      ws?: 2
+    ]
 
   @type source :: {:name, binary()} | {:regex, Regex.t()}
 
@@ -118,7 +127,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   # (`InfluxQLShowText.lexer_error/2`); anywhere else the clause fails at the quote.
   @spec scanned_error(map(), ctx()) :: :ok | {:error, {:engine, binary()}}
   defp scanned_error(%{unclosed: at}, ctx) when is_integer(at),
-    do: {:error, {:engine, InfluxQLError.syntax_error_body(:comment, at, ctx.raw)}}
+    do: syntax_error(ctx, :comment, at)
 
   defp scanned_error(_scanned, _ctx), do: :ok
 
@@ -391,7 +400,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
     cond do
       at == ctx.size -> planned(spec)
       at_byte(ctx, at) == ";" -> after_semicolon(ctx, at + 1, spec)
-      true -> {:error, {:engine, InfluxQLError.syntax_error_body(:nom, at, ctx.raw)}}
+      true -> syntax_error(ctx, :nom, at)
     end
   end
 
@@ -426,7 +435,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   defp second_statement(ctx, text, next) do
     if Regex.match?(~q/^(?:SELECT|SHOW|EXPLAIN|CREATE|DELETE|DROP)(?![\w])/i, text),
       do: {:error, "unsupported InfluxQL (a second statement after `;`)"},
-      else: {:error, {:engine, InfluxQLError.syntax_error_body(:nom, next, ctx.raw)}}
+      else: syntax_error(ctx, :nom, next)
   end
 
   defp skip_blanks_and_semicolons(ctx, at) do

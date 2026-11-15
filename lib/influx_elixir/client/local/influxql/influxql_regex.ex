@@ -33,6 +33,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
   @flag_letters ["i", "m", "s", "U", "u", "x", "R"]
   @not_flags ["P", "<", "#", "(", "|", "=", "!"]
 
+  @doc "A regular expression literal's body with escaped slashes (`\\/`) unescaped to `/`."
+  @spec unescape_slashes(binary()) :: binary()
+  def unescape_slashes(pattern), do: String.replace(pattern, "\\/", "/")
+
   @doc "The pattern as the double's regex engine reads it, or a throw."
   @spec pattern(binary()) :: binary()
   def pattern(source) do

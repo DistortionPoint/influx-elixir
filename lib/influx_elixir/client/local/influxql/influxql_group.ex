@@ -108,10 +108,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
       text |> binary_part(start, byte_size(text) - start) |> InfluxQLLex.trim_both_blanks() == ""
 
   @spec blank(binary(), non_neg_integer(), non_neg_integer()) :: binary()
-  defp blank(masked_rest, from, stop) do
-    <<before::binary-size(from), _clause::binary-size(stop - from), rest::binary>> = masked_rest
-    before <> String.duplicate(" ", stop - from) <> rest
-  end
+  defp blank(masked_rest, from, stop),
+    do: InfluxQLText.blank_range(masked_rest, from, stop - from)
 
   # ---------------------------------------------------------------------------
   # Dimensions
@@ -207,7 +205,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
 
     case close_regex(rest, 0) do
       {:ok, size} ->
-        pattern = rest |> binary_part(0, size) |> String.replace("\\/", "/")
+        pattern = rest |> binary_part(0, size) |> InfluxQLRegex.unescape_slashes()
         {:ok, {:regex, pattern}, pos + 1 + size + 1}
 
       :unterminated ->

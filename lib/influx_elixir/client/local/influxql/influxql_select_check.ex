@@ -101,7 +101,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     |> comma_pieces(items_at)
     |> Enum.find_value(byte_size(masked), fn {piece, at} ->
       text = InfluxQLLex.trim_blanks(piece)
-      start = at + byte_size(piece) - byte_size(text)
+      start = at + InfluxQLLex.skip_blanks(piece, 0)
 
       with leftover when leftover != nil <-
              InfluxQLArgs.item_leftover(InfluxQLLex.trim_both_blanks(text)),
@@ -260,10 +260,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
     end
   end
 
+  @doc "The byte offset of the first comma outside parentheses in `text`, or `nil` when there is none."
   @spec top_level_comma(binary(), non_neg_integer(), non_neg_integer()) :: non_neg_integer() | nil
-  defp top_level_comma(text, at, _depth) when at >= byte_size(text), do: nil
+  def top_level_comma(text, at \\ 0, depth \\ 0)
 
-  defp top_level_comma(text, at, depth) do
+  def top_level_comma(text, at, _depth) when at >= byte_size(text), do: nil
+
+  def top_level_comma(text, at, depth) do
     case :binary.at(text, at) do
       ?, when depth == 0 -> at
       ?( -> top_level_comma(text, at + 1, depth + 1)
@@ -311,7 +314,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSelectCheck do
           InfluxQLCheck.positioned() | nil
   defp check_item(whole, piece, at, {index, last?, prior_read?}, from_keyword_at) do
     text = InfluxQLLex.trim_blanks(piece)
-    start = at + byte_size(piece) - byte_size(text)
+    start = at + InfluxQLLex.skip_blanks(piece, 0)
     text = InfluxQLLex.trim_trailing_blanks(text)
 
     eot = list_end(prior_read?, last?, from_keyword_at, at + byte_size(piece))

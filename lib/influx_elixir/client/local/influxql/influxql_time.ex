@@ -186,8 +186,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
 
     fraction = ns |> Integer.mod(1_000_000_000) |> fraction_digits()
     shown = shown(y, mo, d, {h, mi, s}, fraction)
-    message = "Error during planning: timestamp out of range: #{shown}"
-    throw({:refused, {:engine, 400, InfluxQLError.split_error(message)}})
+    throw({:refused, {:engine, 400, InfluxQLError.timestamp_out_of_range(shown)}})
   end
 
   @spec fraction_digits(non_neg_integer()) :: binary()
@@ -301,21 +300,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
 
   @spec refuse_types(binary(), binary(), binary()) :: no_return()
   defp refuse_types(left, connective, right) do
-    message =
-      "Error during planning: Cannot infer common argument type for logical boolean " <>
-        "operation #{left} #{connective} #{right}"
-
-    throw({:refused, {:engine, 400, message}})
+    throw(
+      {:refused, {:engine, 400, InfluxQLError.logical_boolean_error(left, connective, right)}}
+    )
   end
 
   @spec refuse_by_name() :: no_return()
   defp refuse_by_name, do: InfluxQLError.refuse("a bare time inside a condition of that shape")
 
   @spec type_coercion() :: binary()
-  defp type_coercion do
-    "type_coercion\ncaused by\nError during planning: Cannot infer common argument type " <>
-      "for logical boolean operation Boolean AND Timestamp(ns)"
-  end
+  defp type_coercion, do: InfluxQLError.bare_condition_error("Timestamp(ns)")
 
   @doc "The engine's error for a condition that splits its `time` from an operand that is no boolean."
   @spec refuse_stack() :: no_return()

@@ -342,9 +342,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
 
   defp cannot_use(op) do
     op = if op == "<>", do: "!=", else: op
-
-    "Error during planning: cannot use #{op} between an integer and unsigned, " <>
-      "an explicit cast is required"
+    InfluxQLError.cannot_use_int_unsigned(op)
   end
 
   defp arrow(kind), do: Map.fetch!(@arrow, kind)

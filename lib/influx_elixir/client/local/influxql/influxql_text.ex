@@ -116,6 +116,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLText do
   def blank_to_nil(""), do: nil
   def blank_to_nil(text), do: InfluxQLLex.trim_both_blanks(text)
 
+  @doc "Replaces `length` bytes at `start` in `text` with spaces."
+  @spec blank_range(binary(), non_neg_integer(), non_neg_integer()) :: binary()
+  def blank_range(text, start, length) do
+    <<before::binary-size(start), _span::binary-size(length), rest::binary>> = text
+    before <> String.duplicate(" ", length) <> rest
+  end
+
   @doc """
   The statement with the inside of every quoted string, quoted identifier
   and `=~ /regex/` blanked to underscores, byte for byte (spaces would let

@@ -7,7 +7,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowClauses do
   # `{:ok, spec, end_of_clause}`, `:none` when the clause is not there, or the
   # engine's parse error. The conditions are `InfluxQLShowCondition`.
 
-  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLShowCondition, SQLLimits}
+  alias InfluxElixir.Client.Local.{InfluxQLShowCondition, SQLLimits}
   alias InfluxElixir.Client.Local.InfluxQLShowText, as: Text
 
   require SQLLimits
@@ -149,7 +149,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowClauses do
 
       case Regex.run(~r/^\d+/, binary_part(ctx.masked, from, ctx.size - from)) do
         [digits] -> number(digits, from, field, ctx, spec)
-        nil -> {:error, {:engine, InfluxQLError.syntax_error_body(field, from, ctx.raw)}}
+        nil -> Text.syntax_error(ctx, field, from)
       end
     end
   end
@@ -160,7 +160,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowClauses do
 
     cond do
       value > SQLLimits.uint64_max() ->
-        {:error, {:engine, InfluxQLError.syntax_error_body(:unsigned, to, ctx.raw)}}
+        Text.syntax_error(ctx, :unsigned, to)
 
       # The largest LIMIT with an OFFSET after it keeps nothing (verified).
       field == :offset and value > 0 and spec.limit == SQLLimits.uint64_max() and

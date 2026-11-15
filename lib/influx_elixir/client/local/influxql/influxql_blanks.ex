@@ -167,7 +167,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
   # without a blank before it, after a name and a quoted name).
   @spec stray(binary(), non_neg_integer(), binary()) :: InfluxQLCheck.positioned() | nil
   defp stray(whole, at, masked_rest) do
-    blanks = byte_size(masked_rest) - byte_size(InfluxQLLex.trim_blanks(masked_rest))
+    blanks = InfluxQLLex.skip_blanks(masked_rest, 0)
 
     case binary_part(masked_rest, blanks, min(1, byte_size(masked_rest) - blanks)) do
       <<c>> when c >= 0x80 or c == 1 -> InfluxQLCheck.fail(:nom, at + blanks, whole)

@@ -518,7 +518,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @spec argument_error(binary(), term(), %{binary() => atom()}, MapSet.t(binary())) ::
           {:error, {:engine, binary()} | binary()}
   def argument_error(name, argument, types, tags) do
-    refusal = {:error, "unsupported InfluxQL (#{name}() of that argument)"}
+    refusal = refusal("#{name}() of that argument")
 
     with {:ok, plain} <- classify_inner(argument),
          :ok <- check(plain, types, tags),
@@ -830,7 +830,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       {:engine, body} -> {:error, {:engine, body}}
       {:physical, body} -> if physical?, do: {:error, {:engine, body}}, else: :ok
       {:physical_refuse, message} -> if physical?, do: refusal(message), else: :ok
-      {:refuse, message} -> {:error, "unsupported InfluxQL (#{message})"}
+      {:refuse, message} -> refusal(message)
       {:ok, _type} -> :ok
     end
   end
@@ -1047,9 +1047,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
         {:engine, incompatible(op, lt, rt)}
 
       {lt, rt} in [{:integer, :unsigned}, {:unsigned, :integer}] and not literal?(l, r) ->
-        {:engine,
-         "Error during planning: cannot use #{op} between an integer and unsigned, " <>
-           "an explicit cast is required"}
+        {:engine, InfluxQLError.cannot_use_int_unsigned(op)}
 
       true ->
         {:ok, result(op, l, r)}
