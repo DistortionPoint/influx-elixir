@@ -10,6 +10,7 @@ defmodule InfluxElixir.Client.Local.Writes do
     Buckets,
     DatabaseRules,
     LineProtocolParser,
+    Retention,
     Scope,
     Store
   }
@@ -58,7 +59,7 @@ defmodule InfluxElixir.Client.Local.Writes do
           :ok | {:error, term()}
   defp still_a_target(table, bucket, :v2) do
     cond do
-      Store.bucket?(table, bucket) or Store.database?(table, bucket) -> :ok
+      Buckets.exists?(table, bucket) -> :ok
       Store.discard_orphaned(table, bucket) == :kept -> :ok
       true -> bucket_not_found(bucket)
     end
@@ -358,7 +359,7 @@ defmodule InfluxElixir.Client.Local.Writes do
 
     message =
       "failure writing points to database: partial write: dropped #{length(expired)} points " <>
-        "outside retention policy of duration #{go_duration(retention)} - " <>
+        "outside retention policy of duration #{Retention.format(retention)} - " <>
         "#{drop.("oldest", oldest)}, #{drop.("newest", newest)} dropped=#{length(expired)} " <>
         "for database: #{Buckets.hex_id(database)} for retention policy: autogen"
 
@@ -371,13 +372,6 @@ defmodule InfluxElixir.Client.Local.Writes do
            "message" => String.replace_invalid(message)
          })
      }}
-  end
-
-  # Go's `time.Duration` string for a whole number of seconds of an hour or
-  # more: `2h0m0s`.
-  @spec go_duration(pos_integer()) :: binary()
-  defp go_duration(seconds) do
-    "#{div(seconds, 3600)}h#{div(rem(seconds, 3600), 60)}m#{rem(seconds, 60)}s"
   end
 
   # Go's RFC 3339 with nanoseconds: the fraction only as far as it is not
@@ -457,7 +451,7 @@ defmodule InfluxElixir.Client.Local.Writes do
   # valid target. Names seeded through `databases:` at start are accepted too,
   # so a v2 connection can be prepared either way.
   defp ensure_database(table, bucket, :v2) do
-    if Store.bucket?(table, bucket) or Store.database?(table, bucket),
+    if Buckets.exists?(table, bucket),
       do: :ok,
       else: bucket_not_found(bucket)
   end

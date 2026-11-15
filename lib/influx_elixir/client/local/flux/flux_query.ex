@@ -135,7 +135,7 @@ defmodule InfluxElixir.Client.Local.FluxQuery do
 
   @spec flux_bucket_exists(Store.t(), binary()) :: :ok | {:error, map()}
   defp flux_bucket_exists(table, bucket) do
-    if Store.bucket?(table, bucket) or Store.database?(table, bucket),
+    if Buckets.exists?(table, bucket),
       do: :ok,
       else:
         {:error,

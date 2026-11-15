@@ -74,9 +74,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   def v3_series(line) do
     case measurement_end(line) do
       :none ->
-        if LineProtocolEscape.ends_in_backslash?(line),
-          do: {:error, @trailing_backslash},
-          else: {:error, @need_space}
+        name_error(line, @need_space)
 
       0 ->
         {:error, "Invalid measurement was provided"}
@@ -110,7 +108,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   defp v3_tags(tags, whole, acc) do
     case key_end(tags) do
       :none ->
-        {:error, name_error(tags, tag_set_malformed(whole))}
+        name_error(tags, tag_set_malformed(whole))
 
       0 ->
         {:error, "Expected tag key, got `#{excerpt(tags)}`"}
@@ -133,9 +131,11 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
 
   # What a name that did not end properly is reported as: a name that ends
   # in a backslash is refused before anything else is said about it.
-  @spec name_error(binary(), binary()) :: binary()
+  @spec name_error(binary(), binary()) :: {:error, binary()}
   defp name_error(name, message),
-    do: if(LineProtocolEscape.ends_in_backslash?(name), do: @trailing_backslash, else: message)
+    do:
+      {:error,
+       if(LineProtocolEscape.ends_in_backslash?(name), do: @trailing_backslash, else: message)}
 
   @spec v3_tag_value(binary(), binary(), binary(), [{binary(), binary()}]) ::
           {:ok, [{binary(), binary()}], binary()} | {:error, binary()}
@@ -144,7 +144,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   defp v3_tag_value(key, rest, whole, acc) do
     case name_end(rest) do
       :none ->
-        {:error, name_error(rest, @need_space)}
+        name_error(rest, @need_space)
 
       0 ->
         {:error, "Expected tag value, got `#{excerpt(rest)}`"}

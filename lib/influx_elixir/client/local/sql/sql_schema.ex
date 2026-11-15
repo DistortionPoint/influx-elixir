@@ -500,11 +500,8 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @spec written_name(SQLExpr.column_ref(), %{binary() => binary()}) :: binary()
   def written_name(ref, qualified) when is_binary(ref) do
     case Map.fetch(qualified, ref) do
-      {:ok, relation} ->
-        SQLLiteral.render_qualifier(relation) <> "." <> SQLLiteral.render_identifier(ref)
-
-      :error ->
-        SQLExpr.ref_text(ref)
+      {:ok, relation} -> field_text(relation, ref)
+      :error -> SQLExpr.ref_text(ref)
     end
   end
 

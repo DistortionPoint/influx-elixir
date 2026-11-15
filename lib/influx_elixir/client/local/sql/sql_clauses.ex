@@ -414,7 +414,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
 
   @spec group_item(binary()) :: {:ok, binary() | {:expr, SQLExpr.t()}} | {:error, SQLError.t()}
   defp group_item(item) do
-    if String.valid?(item) and Regex.match?(~r/\A(?:\w+|"(?:[^"]|"")*")\z/u, item) do
+    if SQLLiteral.name_token?(item) do
       {:ok, SQLSelect.name(item)}
     else
       case SQLExpr.parse(item) do

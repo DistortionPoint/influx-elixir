@@ -55,6 +55,18 @@ defmodule InfluxElixir.Client.Local.Scope do
     if supports?(conn, operation), do: :ok, else: {:error, :unsupported_operation}
   end
 
+  @doc "Checks that a resource name is a valid UTF-8 string."
+  @spec utf8_name(term(), binary()) :: :ok | {:error, map()}
+  def utf8_name(name, kind) when is_binary(name) do
+    if String.valid?(name),
+      do: :ok,
+      else: {:error, %{status: 400, body: "Client.Local: the #{kind} name is not valid UTF-8"}}
+  end
+
+  # No engine answer exists for a name that is not text: refused by name, never raised.
+  def utf8_name(_name, kind),
+    do: {:error, %{status: 400, body: "Client.Local: the #{kind} name is not a string"}}
+
   @doc """
   The database of a call, as `Client.HTTP.resolve_database/2` has it:
   `opts[:database]`, then the connection-level default; neither is the HTTP
@@ -70,18 +82,8 @@ defmodule InfluxElixir.Client.Local.Scope do
       end
 
     case database do
-      nil ->
-        {:error, :no_database_specified}
-
-      database when is_binary(database) ->
-        if String.valid?(database),
-          do: {:ok, database},
-          else:
-            {:error, %{status: 400, body: "Client.Local: the database name is not valid UTF-8"}}
-
-      # No engine answer exists for a name that is not text: refused by name, never raised.
-      _not_text ->
-        {:error, %{status: 400, body: "Client.Local: the database name is not a string"}}
+      nil -> {:error, :no_database_specified}
+      database -> with :ok <- utf8_name(database, "database"), do: {:ok, database}
     end
   end
 
@@ -104,7 +106,7 @@ defmodule InfluxElixir.Client.Local.Scope do
          }}
 
       not String.valid?(database) ->
-        {:error, %{status: 400, body: "Client.Local: the database name is not valid UTF-8"}}
+        utf8_name(database, "database")
 
       true ->
         {:error,

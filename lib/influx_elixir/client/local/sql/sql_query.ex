@@ -9,7 +9,6 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
 
   alias InfluxElixir.Client.Local.{
     Format,
-    LineProtocolParser,
     Scope,
     SQLDml,
     SQLDmlPlan,
@@ -19,6 +18,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     SQLInformation,
     SQLLexer,
     SQLParser,
+    SQLQualifier,
     SQLRewrite,
     SQLShow,
     SQLStatement,
@@ -503,17 +503,10 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
     end
   end
 
-  @spec delete_target(binary()) :: binary()
-  defp delete_target("\"" <> _quoted = raw) do
-    raw |> String.slice(1..-2//1) |> String.replace("\"\"", "\"")
-  end
-
-  defp delete_target(bare), do: LineProtocolParser.unescape_measurement(bare)
-
   @spec execute_delete(Store.t(), binary(), binary(), binary()) ::
           {:ok, map()} | {:error, term()}
   defp execute_delete(table, database, measurement_raw, rest) do
-    measurement = delete_target(measurement_raw)
+    measurement = SQLQualifier.table_name(measurement_raw)
 
     with {:ok, where} <- SQLParser.parse_where(rest) do
       count =

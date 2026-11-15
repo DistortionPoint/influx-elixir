@@ -16,7 +16,15 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
   # An item with no alias is named as the engine names it: the expression with
   # each aggregate written as its own name (`sum(m.n) / count(m.n)`).
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLLimit, SQLMask, SQLSelect, SQLWhere}
+  alias InfluxElixir.Client.Local.{
+    SQLError,
+    SQLExpr,
+    SQLLimit,
+    SQLLiteral,
+    SQLMask,
+    SQLSelect,
+    SQLWhere
+  }
 
   @typedoc """
   An expression column: the expression with its aggregates as `__agN__`, the
@@ -71,7 +79,7 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
   @spec expression_shape?(binary()) :: boolean()
   defp expression_shape?(body) do
     case SQLSelect.aggregate_spans(body) do
-      [] -> not (String.valid?(body) and Regex.match?(~r/\A(?:\w+|"(?:[^"]|"")*")\z/u, body))
+      [] -> not SQLLiteral.name_token?(body)
       [{0, length}] -> length != byte_size(body)
       _several -> true
     end

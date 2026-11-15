@@ -23,6 +23,10 @@ defmodule InfluxElixir.Client.Local.Buckets do
   def shard_group_seconds(retention) when retention >= 172_800, do: 86_400
   def shard_group_seconds(_retention), do: 3_600
 
+  @doc "Whether a bucket or database exists in the store."
+  @spec exists?(Store.t(), binary()) :: boolean()
+  def exists?(table, bucket), do: Store.bucket?(table, bucket) or Store.database?(table, bucket)
+
   @doc "The retention of a bucket in seconds, 0 (infinite) for one that is not registered."
   @spec retention(Store.t(), binary()) :: non_neg_integer()
   def retention(table, bucket) do

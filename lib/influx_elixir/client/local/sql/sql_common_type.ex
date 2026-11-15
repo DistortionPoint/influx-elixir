@@ -88,10 +88,14 @@ defmodule InfluxElixir.Client.Local.SQLCommonType do
     typed != [] and Enum.all?(typed, &(&1 in @numbers))
   end
 
-  # A column's type, without the dictionary of a tag.
-  @spec family(type()) :: binary() | :mixed
-  defp family(text) when text in ["Dictionary(Int32, Utf8)", "Utf8View"], do: "Utf8"
-  defp family(type), do: type
+  @doc "A column's type, without the dictionary of a tag."
+  @spec family(type()) :: type()
+  def family(text) when text in ["Dictionary(Int32, Utf8)", "Utf8View"], do: "Utf8"
+  def family(type), do: type
+
+  @doc "Whether `type` is in the `Utf8` text family (`Utf8`, `Utf8View`, or tag dictionary)."
+  @spec text?(type()) :: boolean()
+  def text?(type), do: family(type) == "Utf8"
 
   @spec single_type(binary() | :mixed) :: type()
   defp single_type(type)

@@ -13,7 +13,15 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   # array, a window, a typed string, a placeholder) is a refusal by name: its answer was not
   # verified. The tree is typed and checked by `InfluxElixir.Client.Local.SQLDml`.
 
-  alias InfluxElixir.Client.Local.{SQLDdl, SQLDml, SQLDmlName, SQLDmlType, SQLError, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{
+    SQLDdl,
+    SQLDml,
+    SQLDmlName,
+    SQLDmlType,
+    SQLError,
+    SQLLiteral,
+    SQLTokenizer
+  }
 
   @typedoc "A name written in a statement: its text (lower case when unquoted) and whether quoted."
   @type name :: {binary(), boolean()}
@@ -1200,7 +1208,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   """
   @spec unparse(ast(), ([name()] -> binary())) :: binary()
   def unparse({:num, printed}, _names), do: printed
-  def unparse({:str, body}, _names), do: "'" <> String.replace(body, "'", "''") <> "'"
+  def unparse({:str, body}, _names), do: SQLLiteral.quote_text(body)
   def unparse({:bool, value}, _names), do: Atom.to_string(value)
   def unparse(:null, _names), do: "NULL"
   def unparse({:param, _text}, _names), do: "NULL"

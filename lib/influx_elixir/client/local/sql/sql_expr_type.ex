@@ -246,7 +246,7 @@ defmodule InfluxElixir.Client.Local.SQLExprType do
     typed = Enum.reject(types, &(is_nil(&1) or &1 == "Null"))
 
     "Timestamp(ns)" in typed and
-      Enum.all?(typed, &(&1 in ["Timestamp(ns)", "Utf8", "Utf8View", "Dictionary(Int32, Utf8)"]))
+      Enum.all?(typed, &(&1 == "Timestamp(ns)" or SQLCommonType.text?(&1)))
   end
 
   # The planner's type of a `CASE`: the first of its results that is not the null.

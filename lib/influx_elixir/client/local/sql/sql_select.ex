@@ -197,7 +197,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
         constant = constant(body) ->
           parse_constant_column(col, constant, alias_name)
 
-        String.match?(body, ~r/^#{@name}$/u) ->
+        SQLLiteral.name_token?(body) ->
           parse_grouping_column(body, alias_name)
 
         true ->
@@ -557,7 +557,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   defp distinct_column(col, "count", word, alias_name, qualifier) do
     case plus_expression(word) do
       {:ok, {:field, _name} = expr} ->
-        if Regex.match?(~r/\A#{@name}\z/u, word),
+        if SQLLiteral.name_token?(word),
           do: count_distinct_field(col, word, alias_name, qualifier),
           else: distinct_expression(col, :count_distinct, expr, alias_name, qualifier)
 

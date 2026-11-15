@@ -39,6 +39,11 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
   def identifier?(text),
     do: String.valid?(text) and Regex.match?(~r/\A"x*"\z/u, SQLMask.mask(text))
 
+  @doc "Whether the text is a single column or table token: a word or a quoted identifier."
+  @spec name_token?(binary()) :: boolean()
+  def name_token?(text),
+    do: String.valid?(text) and Regex.match?(~r/\A(?:\w+|"(?:[^"]|"")*")\z/u, text)
+
   @doc """
   The text between a literal's quotes, with a doubled quote one quote. The
   quotes are one byte each, so the cut is by bytes, as every offset here is.

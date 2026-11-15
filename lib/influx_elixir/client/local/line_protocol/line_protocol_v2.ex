@@ -493,8 +493,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
     {:ok, LineProtocolEscape.unescape_string_field(inner)}
   end
 
-  defp v2_value(<<c, _rest::binary>>) when c in [?t, ?T], do: {:ok, true}
-  defp v2_value(<<c, _rest::binary>>) when c in [?f, ?F], do: {:ok, false}
+  defp v2_value(<<c, _rest::binary>>) when c in [?t, ?T, ?f, ?F], do: {:ok, c in [?t, ?T]}
 
   defp v2_value(value) do
     body = binary_part(value, 0, byte_size(value) - 1)

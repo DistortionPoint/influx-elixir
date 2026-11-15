@@ -115,11 +115,10 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
   @spec hidden_mask(binary()) :: binary()
   defp hidden_mask(sql), do: sql |> SQLMask.mask() |> SQLMask.hide_inner_from()
 
-  # A table as the engine names it: a quoted one without its quotes, a
-  # doubled quote one quote.
+  @doc "A table as the engine names it: a quoted one without its quotes, a doubled quote one quote."
   @spec table_name(binary()) :: binary()
-  defp table_name("\"" <> _rest = quoted), do: SQLLiteral.identifier_name(quoted)
-  defp table_name(bare), do: LineProtocolParser.unescape_measurement(bare)
+  def table_name("\"" <> _rest = quoted), do: SQLLiteral.identifier_name(quoted)
+  def table_name(bare), do: LineProtocolParser.unescape_measurement(bare)
 
   # A qualifier is the table's name or its alias, bare or quoted; a quoted
   # one is dropped only when it is exactly the name (the engine reads

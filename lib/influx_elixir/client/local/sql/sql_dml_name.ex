@@ -12,7 +12,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
   #   * a qualified name that only differs from a field by case says so
   #     (`Column names are case sensitive. You can use double quotes ...`)
 
-  alias InfluxElixir.Client.Local.{SQLDml, SQLError, SQLTable, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{SQLDml, SQLError, SQLLiteral, SQLTable, SQLTokenizer}
 
   @typep token :: SQLTokenizer.token()
 
@@ -40,11 +40,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
   @doc false
   @spec part(atom(), binary()) :: binary()
   def part(:word, printed), do: String.downcase(printed)
-
-  def part(:quoted, printed),
-    do: printed |> String.slice(1..-2//1) |> String.replace("\"\"", "\"")
-
-  def part(:string, printed), do: printed |> String.slice(1..-2//1) |> String.replace("''", "'")
+  def part(:quoted, printed), do: SQLLiteral.identifier_name(printed)
+  def part(:string, printed), do: SQLLiteral.body(printed)
 
   @doc """
   The table a statement names (verified against InfluxDB 3 Core, the same for `INSERT`, `UPDATE`

@@ -9,7 +9,7 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
   # cast to the common one, so that the evaluator sees the types the engine
   # does. See `InfluxElixir.Client.Local.SQLExprType.common/2`.
 
-  alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLParser, SQLPlan}
+  alias InfluxElixir.Client.Local.{SQLCommonType, SQLExpr, SQLExprType, SQLParser, SQLPlan}
 
   @numbers ["Int64", "UInt64", "Float64"]
 
@@ -142,7 +142,11 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
 
   defp compared_as_text(operand, whens, types) do
     values = [operand | Enum.map(whens, &elem(&1, 0))]
-    families = values |> Enum.map(&SQLExprType.known_type(&1, types)) |> Enum.map(&family/1)
+
+    families =
+      values
+      |> Enum.map(&SQLExprType.known_type(&1, types))
+      |> Enum.map(&SQLCommonType.family/1)
 
     if "Utf8" in families and Enum.all?(families, &(&1 in [nil, "Utf8" | @numbers])) do
       {cast(operand, "Utf8", types),
@@ -151,10 +155,6 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
       {operand, whens}
     end
   end
-
-  @spec family(SQLExprType.type()) :: SQLExprType.type()
-  defp family(text) when text in ["Dictionary(Int32, Utf8)", "Utf8View"], do: "Utf8"
-  defp family(type), do: type
 
   @spec target([SQLExpr.t()], :case | :coalesce, %{binary() => binary()}) :: SQLExprType.type()
   defp target(results, mode, types),

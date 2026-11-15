@@ -411,7 +411,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     do: SQLExprType.type_of(expr, columns, known, phase)
 
   @spec text?(binary()) :: boolean()
-  defp text?(type), do: type in ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"]
+  defp text?(type), do: SQLCommonType.text?(type)
 
   # Two types the engine finds no common type for in an `IN`, a `BETWEEN` or an
   # `IS DISTINCT FROM`: a boolean with anything else, a timestamp with a number. The null
