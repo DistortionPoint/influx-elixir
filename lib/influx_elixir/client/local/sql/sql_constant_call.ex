@@ -59,8 +59,8 @@ defmodule InfluxElixir.Client.Local.SQLConstantCall do
       optimizer?(ancestors) -> :optimizer
       clause == :select and (:isnull in ancestors or :deferred in ancestors) -> :coercion
       clause == :select -> :planner
-      clause == :where and hd_or(ancestors) != :cast -> :coercion
-      clause == :order_by and hd_or(ancestors) not in [nil, :cast, :neg] -> :coercion
+      clause == :where and List.first(ancestors) != :cast -> :coercion
+      clause == :order_by and List.first(ancestors) not in [nil, :cast, :neg] -> :coercion
       true -> :bare
     end
   end
@@ -93,11 +93,8 @@ defmodule InfluxElixir.Client.Local.SQLConstantCall do
   # with only `CAST`s between.
   # It reports after the passes that type the query.
   @spec optimizer?(ancestors()) :: boolean()
-  defp optimizer?(ancestors), do: hd_or(Enum.drop_while(ancestors, &(&1 == :cast))) == :isnull
-
-  @spec hd_or([atom()]) :: atom() | nil
-  defp hd_or([]), do: nil
-  defp hd_or([nearest | _rest]), do: nearest
+  defp optimizer?(ancestors),
+    do: List.first(Enum.drop_while(ancestors, &(&1 == :cast))) == :isnull
 
   @spec simplify(binary()) :: map()
   defp simplify(message) do

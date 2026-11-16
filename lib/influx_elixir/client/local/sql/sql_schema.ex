@@ -19,6 +19,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     SQLExpr,
     SQLInformation,
     SQLLiteral,
+    SQLNumber,
     SQLParser,
     SQLSelect
   }
@@ -727,7 +728,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
   @spec positive_float?(term()) :: boolean()
   defp positive_float?(value),
-    do: is_float(value) and match?(<<0::1, _rest::63>>, <<value::float>>)
+    do: is_float(value) and not SQLNumber.negative_float?(value)
 
   @spec tagged(clause(), [SQLExpr.column_ref()]) :: [{clause(), SQLExpr.column_ref()}]
   defp tagged(clause, refs), do: Enum.map(refs, &{clause, &1})

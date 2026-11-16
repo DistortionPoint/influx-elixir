@@ -189,7 +189,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
         value
 
       other ->
-        throw({:query_error, %{status: 400, body: non_boolean_predicate(point, column, other)}})
+        throw({:query_error, non_boolean_predicate(point, column, other)})
     end
   end
 
@@ -239,7 +239,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
     do: pattern_match(op, rest, text)
 
   defp pattern_condition(other, op, rest),
-    do: throw({:query_error, %{status: 400, body: pattern_type_error(op, rest, other)}})
+    do: throw({:query_error, pattern_type_error(op, rest, other)})
 
   @spec pattern_match(atom(), term(), binary()) :: boolean()
   defp pattern_match(:like, regex, text), do: Regex.match?(regex, text)
@@ -273,10 +273,11 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
     Regex.match?(regex, text)
   end
 
-  @spec pattern_type_error(atom(), term(), term()) :: binary()
+  @spec pattern_type_error(atom(), term(), term()) :: SQLError.t()
   defp pattern_type_error(op, rest, value) do
-    "type_coercion\ncaused by\nError during planning: " <>
-      SQLPlan.pattern_error(op, SQLPlan.arrow_type(value), rest)
+    op
+    |> SQLPlan.pattern_error(SQLPlan.arrow_type(value), rest)
+    |> SQLError.coercion()
   end
 
   # The planner's text of a filter that is no condition.
@@ -303,15 +304,14 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   end
 
   # DataFusion refuses a non-boolean column as a filter at planning.
-  @spec non_boolean_predicate(point(), binary(), term()) :: binary()
+  @spec non_boolean_predicate(point(), binary(), term()) :: SQLError.t()
   defp non_boolean_predicate(point, column, value) do
     type =
       if is_map_key(point.tags, column),
         do: "Dictionary(Int32, Utf8)",
         else: SQLPlan.arrow_type(value)
 
-    "Error during planning: Cannot create filter with non-boolean predicate " <>
-      "'#{point.measurement}.#{column}' returning #{type}"
+    SQLPredicate.non_boolean_error("#{point.measurement}.#{column}", type)
   end
 
   # The left operand is a column name or an arithmetic expression; the right

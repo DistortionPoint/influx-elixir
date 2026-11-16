@@ -65,7 +65,7 @@ defmodule InfluxElixir.Client.Local.SQLDistinctOn do
 
     cond do
       columns == [""] ->
-        {:error, %{status: 400, body: "Error during planning: No `ON` expressions provided"}}
+        {:error, SQLError.planning("No `ON` expressions provided")}
 
       not String.valid?(on) or not Enum.all?(columns, &Regex.match?(~r/^(?:\w+|"[^"]+")$/u, &1)) ->
         {:error, SQLError.refusal("DISTINCT ON takes column names only: (#{on})")}

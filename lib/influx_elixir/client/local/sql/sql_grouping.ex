@@ -194,15 +194,13 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
   defp ungrouped_error(query, printed, clause) do
     case satisfying_terms(query) do
       {:ok, terms} ->
-        %{
-          status: 400,
-          body:
-            "Error during planning: Column in #{clause} must be in GROUP BY or an aggregate " <>
-              "function: While expanding wildcard, column \"#{printed}\" " <>
-              "must appear in the GROUP BY clause or must be part of an aggregate function, " <>
-              "currently only \"#{Enum.join(terms, ", ")}\" appears in the SELECT clause " <>
-              "satisfies this requirement"
-        }
+        SQLError.planning(
+          "Column in #{clause} must be in GROUP BY or an aggregate " <>
+            "function: While expanding wildcard, column \"#{printed}\" " <>
+            "must appear in the GROUP BY clause or must be part of an aggregate function, " <>
+            "currently only \"#{Enum.join(terms, ", ")}\" appears in the SELECT clause " <>
+            "satisfies this requirement"
+        )
 
       :unrenderable ->
         SQLError.refusal(

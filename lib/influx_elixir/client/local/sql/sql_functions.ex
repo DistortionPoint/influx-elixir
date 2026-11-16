@@ -33,6 +33,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   # argument are the engine's 405.
 
   alias InfluxElixir.Client.Local.{
+    SQLCast,
     SQLError,
     SQLExprType,
     SQLLimits,
@@ -64,10 +65,6 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
 
   # The null literal is typed `Null`, which every signature coerces.
   defguardp is_numeric_or_null(type) when is_numeric_type(type) or type == "Null"
-
-  @int32_min -2_147_483_648
-  @int32_max 2_147_483_647
-  @two_32 4_294_967_296
 
   @round_signature "OneOf([Exact([Float64, Int64]), Exact([Float32, Int64]), " <>
                      "Exact([Float64]), Exact([Float32])])"
@@ -134,10 +131,11 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   defp compute(:round, [x, 0]), do: x |> SQLNumber.to_float() |> round_away()
 
   # A scale past `Int32` closes the connection (verified, in both directions).
-  defp compute(:round, [_x, scale]) when scale > @int32_max or scale < @int32_min,
-    do: throw({:query_error, SQLError.closed()})
-
-  defp compute(:round, [x, scale]), do: scaled(SQLNumber.to_float(x), scale)
+  defp compute(:round, [x, scale]) do
+    if SQLCast.fits?(scale, 32),
+      do: scaled(SQLNumber.to_float(x), scale),
+      else: throw({:query_error, SQLError.closed()})
+  end
 
   # With a scale `trunc` rounds, exactly as `round` does (verified over a
   # range of values and scales), after the engine reads the scale as an
@@ -146,12 +144,9 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   # toward zero, and a zero it leaves keeps the sign of a fraction
   # (`trunc(-0.4)` is `-0.0`) but not of a zero (`trunc(-0.0)` is `0.0`).
   defp compute(:trunc, [x]), do: x |> SQLNumber.to_float() |> truncate()
-  defp compute(:trunc, [x, scale]), do: compute(:round, [x, wrap_int32(scale)])
+  defp compute(:trunc, [x, scale]), do: compute(:round, [x, SQLNumber.wrap(scale, 32)])
   defp compute(:floor, [x]), do: x |> SQLNumber.to_float() |> floor_float()
   defp compute(:ceil, [x]), do: x |> SQLNumber.to_float() |> ceil_float()
-
-  @spec wrap_int32(integer()) :: integer()
-  defp wrap_int32(scale), do: Integer.mod(scale - @int32_min, @two_32) + @int32_min
 
   @spec absolute_float(float() | SQLNumber.special()) :: float() | SQLNumber.special()
   defp absolute_float(x) when x in [:inf, :neg_inf], do: :inf
@@ -174,7 +169,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   @spec toward_zero(float()) :: float()
   defp toward_zero(x) do
     case Kernel.trunc(x) do
-      0 -> if negative?(x), do: -0.0, else: 0.0
+      0 -> if SQLNumber.negative_float?(x), do: -0.0, else: 0.0
       n -> n * 1.0
     end
   end
@@ -199,15 +194,12 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   @spec round_away(float() | SQLNumber.special()) :: float() | SQLNumber.special()
   defp round_away(x) when is_float(x) do
     case Kernel.round(x) do
-      0 -> if negative?(x), do: -0.0, else: 0.0
+      0 -> if SQLNumber.negative_float?(x), do: -0.0, else: 0.0
       n -> n * 1.0
     end
   end
 
   defp round_away(special), do: special
-
-  @spec negative?(float()) :: boolean()
-  defp negative?(x), do: match?(<<1::1, _rest::63>>, <<x::float>>)
 
   @spec signature(:round | :trunc) :: binary()
   defp signature(:round), do: @round_signature

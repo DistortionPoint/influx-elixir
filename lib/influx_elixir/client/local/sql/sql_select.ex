@@ -382,12 +382,9 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   defp invalid_function(call) do
     name = call |> String.replace(~r/\s*\($/u, "") |> String.downcase()
 
-    %{
-      status: 400,
-      body:
-        "Error during planning: Invalid function '#{name}'.\nDid you mean " <>
-          "'#{Map.fetch!(@influxql_only_functions, name)}'?"
-    }
+    SQLError.planning(
+      "Invalid function '#{name}'.\nDid you mean '#{Map.fetch!(@influxql_only_functions, name)}'?"
+    )
   end
 
   # Parse: first_value(field ORDER BY col [ASC|DESC])  (and last_value).

@@ -39,7 +39,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     SQLError,
     SQLFunctions,
     SQLLimits,
-    SQLNumber
+    SQLNumber,
+    SQLPredicate
   }
 
   require SQLLimits
@@ -853,12 +854,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   end
 
   @spec non_boolean(binary(), binary() | nil) :: check()
-  defp non_boolean(printed, type) do
-    {:error,
-     SQLError.planning(
-       "Cannot create filter with non-boolean predicate '#{printed}' returning #{type}"
-     )}
-  end
+  defp non_boolean(printed, type), do: {:error, SQLPredicate.non_boolean_error(printed, type)}
 
   # ---------------------------------------------------------------------------
   # The value assigned to a column

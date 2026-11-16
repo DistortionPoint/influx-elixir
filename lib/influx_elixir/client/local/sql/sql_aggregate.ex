@@ -104,7 +104,11 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   """
   @spec prepare(SQLAggExpr.having_t() | nil, [SQLSelect.column()]) :: prepared()
   def prepare(nil, _columns), do: nil
-  def prepare(having, columns), do: {having, names_outputs?(having, columns)}
+
+  def prepare(having, columns) do
+    outputs = Enum.map(columns, &SQLSelect.column_output/1)
+    {having, names_outputs?(having.nodes, outputs)}
+  end
 
   @doc """
   The output rows of one group: its row, unless a `HAVING` (as `prepare/2` read it, `nil` for
@@ -131,11 +135,10 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     end
   end
 
-  # Whether a `HAVING` reads the name of a select item (and so needs the row).
-  @spec names_outputs?(SQLAggExpr.having_t(), [SQLSelect.column()]) :: boolean()
-  defp names_outputs?(%{nodes: nodes}, columns) do
-    outputs = Enum.map(columns, &SQLSelect.column_output/1)
-    Enum.any?(SQLWhere.conjunction_columns(nodes), &(&1 in outputs))
+  @doc "Whether a `HAVING` conjunction reads any of the given select-item output names."
+  @spec names_outputs?([SQLWhere.node_t()], [binary()]) :: boolean()
+  def names_outputs?(nodes, outputs) do
+    outputs != [] and Enum.any?(SQLWhere.conjunction_columns(nodes), &(&1 in outputs))
   end
 
   @spec having_holds?(SQLAggExpr.having_t(), points(), integer() | nil | :scalar, map()) ::

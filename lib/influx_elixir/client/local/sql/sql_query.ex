@@ -244,7 +244,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
            )}
 
         {:planning, message} ->
-          {:error, %{status: 400, body: "Error during planning: " <> message}}
+          {:error, SQLError.planning(message)}
 
         {:refusal, message} ->
           {:error, SQLError.refusal(message)}
@@ -498,7 +498,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
             execute_delete(table, database, measurement_raw, rest)
 
           nil ->
-            {:error, %{status: 400, body: "Error during planning: DML not supported: Delete"}}
+            {:error, SQLError.planning("DML not supported: Delete")}
         end
     end
   end

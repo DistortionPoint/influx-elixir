@@ -17,6 +17,7 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
   # each aggregate written as its own name (`sum(m.n) / count(m.n)`).
 
   alias InfluxElixir.Client.Local.{
+    SQLAggregate,
     SQLError,
     SQLExpr,
     SQLLimit,
@@ -213,7 +214,7 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
           elem(column, 0) != :grouping_column,
           do: SQLSelect.column_output(column)
 
-    named? = Enum.any?(SQLWhere.conjunction_columns(nodes), &(&1 in outputs))
+    named? = SQLAggregate.names_outputs?(nodes, outputs)
 
     cond do
       Enum.any?(nodes, &match?({:truthy, _column, _nil}, &1)) ->

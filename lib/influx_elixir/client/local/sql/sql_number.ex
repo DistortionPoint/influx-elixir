@@ -202,11 +202,12 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
 
   defp integer_op(:rem, left, right, _type), do: rem(left, right)
 
+  @doc "The value wrapped in two's complement to `:int64`, `:uint64` or `bits` signed bits."
   @spec wrap(integer(), :int64 | :uint64 | 8 | 16 | 32) :: integer()
-  defp wrap(value, :int64), do: SQLLimits.wrap_int64(value)
-  defp wrap(value, :uint64), do: SQLLimits.wrap_uint64(value)
+  def wrap(value, :int64), do: SQLLimits.wrap_int64(value)
+  def wrap(value, :uint64), do: SQLLimits.wrap_uint64(value)
 
-  defp wrap(value, bits) do
+  def wrap(value, bits) do
     half = Bitwise.bsl(1, bits - 1)
     Integer.mod(value + half, Bitwise.bsl(1, bits)) - half
   end
@@ -329,11 +330,16 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   defp infinity(true), do: :inf
   defp infinity(false), do: :neg_inf
 
+  @doc "Whether a float's IEEE 754 sign bit is set (true for negative floats and `-0.0`)."
+  @spec negative_float?(float()) :: boolean()
+  def negative_float?(value) when is_float(value),
+    do: match?(<<1::1, _rest::63>>, <<value::float>>)
+
   # The sign bit, so that `-0.0` is negative.
   @spec positive?(float() | special()) :: boolean()
   defp positive?(:inf), do: true
   defp positive?(:neg_inf), do: false
-  defp positive?(value), do: not match?(<<1::1, _rest::63>>, <<value::float>>)
+  defp positive?(value), do: not negative_float?(value)
 
   @spec zero?(float() | special()) :: boolean()
   defp zero?(value) when value in @specials, do: false

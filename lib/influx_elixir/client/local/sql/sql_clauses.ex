@@ -296,12 +296,10 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
 
       {n, ""} ->
         {:error,
-         %{
-           status: 400,
-           body:
-             "Error during planning: Cannot find column with position #{n} in SELECT clause. " <>
-               "Valid columns: 1 to #{length(items)}"
-         }}
+         SQLError.planning(
+           "Cannot find column with position #{n} in SELECT clause. " <>
+             "Valid columns: 1 to #{length(items)}"
+         )}
 
       _not_integer ->
         :not_positional

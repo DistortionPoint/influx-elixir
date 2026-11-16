@@ -13,12 +13,9 @@ defmodule InfluxElixir.Client.Local.SQLInterval do
   # the error differ by unit. Only whole numbers of these units are read; a fraction, an
   # abbreviated unit or a clock time (`'1:30:00'`) is left to the rest of the double.
 
-  alias InfluxElixir.Client.Local.SQLLimits
+  alias InfluxElixir.Client.Local.{SQLCast, SQLLimits}
 
   require SQLLimits
-
-  @i32_min -2_147_483_648
-  @i32_max 2_147_483_647
 
   @nanoseconds %{
     "hour" => 3_600_000_000_000,
@@ -132,7 +129,7 @@ defmodule InfluxElixir.Client.Local.SQLInterval do
   defp unit_error(_value, _unit), do: nil
 
   @spec fits_32?(integer()) :: boolean()
-  defp fits_32?(value), do: value >= @i32_min and value <= @i32_max
+  defp fits_32?(value), do: SQLCast.fits?(value, 32)
 
   @spec unrepresentable(integer(), binary()) :: binary()
   defp unrepresentable(value, unit),
