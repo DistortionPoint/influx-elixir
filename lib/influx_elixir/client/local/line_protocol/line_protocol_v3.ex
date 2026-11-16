@@ -80,7 +80,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
         {:error, "Invalid measurement was provided"}
 
       pos ->
-        <<measurement::binary-size(pos), separator, rest::binary>> = line
+        <<measurement::binary-size(pos), from_sep::binary>> = line
+        <<separator, rest::binary>> = from_sep
 
         cond do
           LineProtocolEscape.ends_in_backslash?(measurement) ->
@@ -91,10 +92,10 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
                  do: {:ok, measurement, tags, after_series}
 
           separator in [?\t, 0] ->
-            {:error, need_space(binary_part(line, pos, byte_size(line) - pos))}
+            {:error, need_space(from_sep)}
 
           true ->
-            {:ok, measurement, [], binary_part(line, pos, byte_size(line) - pos)}
+            {:ok, measurement, [], from_sep}
         end
     end
   end
@@ -150,7 +151,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
         {:error, "Expected tag value, got `#{excerpt(rest)}`"}
 
       pos ->
-        <<value::binary-size(pos), separator, more::binary>> = rest
+        <<value::binary-size(pos), from_sep::binary>> = rest
+        <<separator, more::binary>> = from_sep
 
         cond do
           LineProtocolEscape.ends_in_backslash?(value) ->
@@ -160,11 +162,10 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
             v3_tags(more, whole, [{key, value} | acc])
 
           separator == ?\t ->
-            {:error, need_space(binary_part(rest, pos, byte_size(rest) - pos))}
+            {:error, need_space(from_sep)}
 
           true ->
-            {:ok, Enum.reverse([{key, value} | acc]),
-             binary_part(rest, pos, byte_size(rest) - pos)}
+            {:ok, Enum.reverse([{key, value} | acc]), from_sep}
         end
     end
   end
@@ -330,7 +331,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   def v3_timestamp(""), do: {:ok, nil}
 
   def v3_timestamp(<<?\s, _more::binary>> = rest) do
-    case rest |> skip_spaces() |> take_integer() do
+    case rest |> skip_spaces() |> LineProtocolNumber.take_integer() do
       {"", _after} ->
         trailing_error(rest)
 
@@ -348,21 +349,6 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   defp trailing_error(rest),
     do: {:error, "Could not parse entire line. Found trailing content: `#{excerpt(rest)}`"}
 
-  @spec take_integer(binary()) :: {binary(), binary()}
-  defp take_integer(text) do
-    sign = LineProtocolNumber.sign_size(text)
-    <<_sign::binary-size(sign), unsigned::binary>> = text
-
-    case LineProtocolNumber.digit_count(unsigned, 0) do
-      0 ->
-        {"", text}
-
-      digits ->
-        <<integer::binary-size(sign + digits), after_integer::binary>> = text
-        {integer, after_integer}
-    end
-  end
-
   @spec skip_spaces(binary()) :: binary()
   @doc false
   def skip_spaces(<<?\s, rest::binary>>), do: skip_spaces(rest)
@@ -372,42 +358,31 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   # `text` that no backslash escapes (a backslash takes the byte after it
   # with it), `:none` when there is none: a measurement or tag value ends
   # at a comma or a space, a tag or field key at an equals sign or a space,
-  # a string at a quote.
+  # a string at a quote. A measurement also ends at a NUL that no backslash
+  # escapes, which tags and fields may hold (verified: `\0x` is an invalid
+  # measurement and `x\0y` wants a space after `x`).
   @spec name_end(binary()) :: non_neg_integer() | :none
-  defp name_end(text), do: name_end(text, 0)
+  defp name_end(text), do: separator_end(text, [?,, ?\s, ?\t], 0)
 
-  defp name_end(<<?\\, _escaped, rest::binary>>, pos), do: name_end(rest, pos + 2)
-  defp name_end(<<c, _rest::binary>>, pos) when c in [?,, ?\s, ?\t], do: pos
-  defp name_end(<<_c, rest::binary>>, pos), do: name_end(rest, pos + 1)
-  defp name_end(<<>>, _pos), do: :none
-
-  # A measurement also ends at a NUL that no backslash escapes, which tags and fields may
-  # hold (verified: `\0x` is an invalid measurement and `x\0y` wants a space after `x`).
   @spec measurement_end(binary()) :: non_neg_integer() | :none
-  defp measurement_end(text), do: measurement_end(text, 0)
-
-  defp measurement_end(<<?\\, _escaped, rest::binary>>, pos), do: measurement_end(rest, pos + 2)
-  defp measurement_end(<<c, _rest::binary>>, pos) when c in [?,, ?\s, ?\t, 0], do: pos
-  defp measurement_end(<<_c, rest::binary>>, pos), do: measurement_end(rest, pos + 1)
-  defp measurement_end(<<>>, _pos), do: :none
+  defp measurement_end(text), do: separator_end(text, [?,, ?\s, ?\t, 0], 0)
 
   @spec key_end(binary()) :: non_neg_integer() | :none
   @doc false
-  def key_end(text), do: key_end(text, 0)
-
-  defp key_end(<<?\\, _escaped, rest::binary>>, pos), do: key_end(rest, pos + 2)
-  defp key_end(<<c, _rest::binary>>, pos) when c in [?=, ?\s, ?\t], do: pos
-  defp key_end(<<_c, rest::binary>>, pos), do: key_end(rest, pos + 1)
-  defp key_end(<<>>, _pos), do: :none
+  def key_end(text), do: separator_end(text, [?=, ?\s, ?\t], 0)
 
   @spec quote_end(binary()) :: non_neg_integer() | :none
   @doc false
-  def quote_end(text), do: quote_end(text, 0)
+  def quote_end(text), do: separator_end(text, [?"], 0)
 
-  defp quote_end(<<?\\, _escaped, rest::binary>>, pos), do: quote_end(rest, pos + 2)
-  defp quote_end(<<?", _rest::binary>>, pos), do: pos
-  defp quote_end(<<_c, rest::binary>>, pos), do: quote_end(rest, pos + 1)
-  defp quote_end(<<>>, _pos), do: :none
+  @spec separator_end(binary(), [byte()], non_neg_integer()) :: non_neg_integer() | :none
+  defp separator_end(<<?\\, _escaped, rest::binary>>, stops, pos),
+    do: separator_end(rest, stops, pos + 2)
+
+  defp separator_end(<<c, rest::binary>>, stops, pos),
+    do: if(c in stops, do: pos, else: separator_end(rest, stops, pos + 1))
+
+  defp separator_end(<<>>, _stops, _pos), do: :none
 
   # A key is one column, so a key used as both a tag and a field cannot be
   # typed — on InfluxDB 3 — and a field named twice is refused. They are

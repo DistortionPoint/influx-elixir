@@ -41,13 +41,7 @@ defmodule InfluxElixir.Supervisor do
          connections when is_list(connections) <- Keyword.get(opts, :connections, []),
          true <- proper_list?(connections) do
       for {name, config} <- connections do
-        child_config =
-          if Options.keyword?(config), do: Keyword.put(config, :name, name), else: config
-
-        Supervisor.child_spec(
-          {InfluxElixir.ConnectionSupervisor, child_config},
-          id: {InfluxElixir.ConnectionSupervisor, name}
-        )
+        InfluxElixir.ConnectionSupervisor.named_child_spec(name, config)
       end
     else
       _invalid -> []

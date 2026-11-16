@@ -195,7 +195,6 @@ defmodule InfluxElixir.Write.BatchWriter do
   require Logger
 
   alias InfluxElixir.Client.Options
-  alias InfluxElixir.Connection
   alias InfluxElixir.Write.{LineProtocol, Point, Writer}
 
   @backpressure_multiplier 10
@@ -304,14 +303,11 @@ defmodule InfluxElixir.Write.BatchWriter do
 
   @doc false
   @spec validate_client(term()) :: {:ok, module()} | {:error, String.t()}
-  def validate_client(client) when is_atom(client) and client not in [nil, true, false] do
-    if Code.ensure_loaded?(client) and function_exported?(client, :write, 3),
+  def validate_client(client) do
+    if Writer.client?(client),
       do: {:ok, client},
       else: {:error, "expected a client module implementing write/3, got: #{inspect(client)}"}
   end
-
-  def validate_client(other),
-    do: {:error, "expected a client module implementing write/3, got: #{inspect(other)}"}
 
   @doc false
   @spec validate_name(term()) :: {:ok, GenServer.name()} | {:error, String.t()}
@@ -569,12 +565,7 @@ defmodule InfluxElixir.Write.BatchWriter do
   # read a backslash differently).
   @impl GenServer
   def handle_call(:encode_options, _from, %__MODULE__{} = state) do
-    options =
-      state.write_opts
-      |> Keyword.take([:precision])
-      |> Keyword.put(:api_version, Connection.api_version(state.connection))
-
-    {:reply, {:ok, options}, state}
+    {:reply, {:ok, Writer.encode_options(state.connection, state.write_opts)}, state}
   end
 
   def handle_call({:write, payload}, _from, %__MODULE__{} = state) do

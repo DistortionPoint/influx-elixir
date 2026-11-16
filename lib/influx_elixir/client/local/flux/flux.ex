@@ -403,8 +403,9 @@ defmodule InfluxElixir.Client.Local.Flux do
   defp apply_stage({:limit, n, offset}, tables, _direct?),
     do: map_rows(tables, &(&1 |> Enum.drop(offset) |> Enum.take(n)))
 
-  defp apply_stage({:selector, kind}, tables, direct?) when kind in [:min, :max] do
-    if Enum.any?(tables, &(&1.kind in [:string, :bool] and (direct? or &1.rows != []))) do
+  defp apply_stage({:selector, kind}, tables, direct?) do
+    if kind in [:min, :max] and
+         Enum.any?(tables, &(&1.kind in [:string, :bool] and (direct? or &1.rows != []))) do
       refuse(
         "#{kind}() of a string or boolean field is an engine error whose form depends on " <>
           "the plan (a 500 \"panic: unsupported for aggregate #{kind}\" when storage reads " <>
@@ -414,9 +415,6 @@ defmodule InfluxElixir.Client.Local.Flux do
 
     tables |> map_rows(&select(kind, &1)) |> in_group_key_order(direct?)
   end
-
-  defp apply_stage({:selector, kind}, tables, direct?),
-    do: tables |> map_rows(&select(kind, &1)) |> in_group_key_order(direct?)
 
   defp apply_stage({:aggregate, kind}, tables, direct?) do
     check_aggregate(kind, tables, direct?)
@@ -1095,26 +1093,22 @@ defmodule InfluxElixir.Client.Local.Flux do
   end
 
   @spec parse_or(list()) :: {:ok, predicate(), list()} | :error
-  defp parse_or(tokens) do
-    with {:ok, left, rest} <- parse_and(tokens), do: or_tail(left, rest)
-  end
-
-  defp or_tail(left, [{:or} | rest]) do
-    with {:ok, right, rest} <- parse_and(rest), do: or_tail({:or, left, right}, rest)
-  end
-
-  defp or_tail(left, rest), do: {:ok, left, rest}
+  defp parse_or(tokens), do: parse_chain(tokens, :or, &parse_and/1)
 
   @spec parse_and(list()) :: {:ok, predicate(), list()} | :error
-  defp parse_and(tokens) do
-    with {:ok, left, rest} <- parse_not(tokens), do: and_tail(left, rest)
+  defp parse_and(tokens), do: parse_chain(tokens, :and, &parse_not/1)
+
+  @spec parse_chain(list(), :or | :and, (list() -> {:ok, predicate(), list()} | :error)) ::
+          {:ok, predicate(), list()} | :error
+  defp parse_chain(tokens, op, next) do
+    with {:ok, left, rest} <- next.(tokens), do: chain_tail(left, rest, op, next)
   end
 
-  defp and_tail(left, [{:and} | rest]) do
-    with {:ok, right, rest} <- parse_not(rest), do: and_tail({:and, left, right}, rest)
+  defp chain_tail(left, [{op} | rest], op, next) do
+    with {:ok, right, rest} <- next.(rest), do: chain_tail({op, left, right}, rest, op, next)
   end
 
-  defp and_tail(left, rest), do: {:ok, left, rest}
+  defp chain_tail(left, rest, _op, _next), do: {:ok, left, rest}
 
   @spec parse_not(list()) :: {:ok, predicate(), list()} | :error
   defp parse_not([{:not} | rest]) do

@@ -23,7 +23,7 @@ defmodule InfluxElixir.Client.Local.FluxQuery do
 
       case Flux.run(query, typed, uint: unsigned) do
         {:ok, rows} -> {:ok, rows}
-        {:error, message} -> {:error, flux_error(400, "invalid", message)}
+        {:error, message} -> {:error, Buckets.v2_error(400, "invalid", message)}
       end
     end
   end
@@ -129,7 +129,7 @@ defmodule InfluxElixir.Client.Local.FluxQuery do
     # the same instant.
     case Flux.parse(flux, Store.now_ns() + 1) do
       {:ok, query} -> {:ok, query}
-      {:error, message} -> {:error, flux_error(400, "invalid", message)}
+      {:error, message} -> {:error, Buckets.v2_error(400, "invalid", message)}
     end
   end
 
@@ -139,14 +139,10 @@ defmodule InfluxElixir.Client.Local.FluxQuery do
       do: :ok,
       else:
         {:error,
-         flux_error(
+         Buckets.v2_error(
            404,
            "not found",
            "failed to initialize execute state: could not find bucket \"#{bucket}\""
          )}
   end
-
-  @spec flux_error(pos_integer(), binary(), binary()) :: map()
-  defp flux_error(status, code, message),
-    do: %{status: status, body: Jason.encode!(%{"code" => code, "message" => message})}
 end

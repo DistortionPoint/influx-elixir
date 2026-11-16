@@ -44,4 +44,13 @@ defmodule InfluxElixir.Client.Local.Buckets do
   def hex_id(name) do
     :crypto.hash(:sha256, name) |> binary_part(0, 8) |> Base.encode16(case: :lower)
   end
+
+  @doc "An InfluxDB 2 JSON error response map (`%{status: status, body: ...}`)."
+  @spec v2_error(pos_integer(), binary(), binary()) :: %{status: pos_integer(), body: binary()}
+  def v2_error(status, code, message) do
+    %{
+      status: status,
+      body: Jason.encode!(%{"code" => code, "message" => String.replace_invalid(message)})
+    }
+  end
 end

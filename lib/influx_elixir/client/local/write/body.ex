@@ -17,6 +17,8 @@ defmodule InfluxElixir.Client.Local.Body do
   #     `body content is not valid utf8: ...`, naming the first bad byte as
   #     Rust's `Utf8Error` does. InfluxDB 2 stores the bytes as they are.
 
+  alias InfluxElixir.Client.Local.Buckets
+
   @gzip_header_size 10
 
   @doc """
@@ -39,16 +41,13 @@ defmodule InfluxElixir.Client.Local.Body do
   end
 
   @spec gzip_error(binary(), atom()) :: map()
-  defp gzip_error(_body, :v2) do
-    %{
-      status: 500,
-      body:
-        Jason.encode!(%{
-          "code" => "internal error",
-          "message" => "An internal error has occurred - check server logs"
-        })
-    }
-  end
+  defp gzip_error(_body, :v2),
+    do:
+      Buckets.v2_error(
+        500,
+        "internal error",
+        "An internal error has occurred - check server logs"
+      )
 
   defp gzip_error(body, _v3),
     do: %{status: 400, body: "error decoding gzip stream: " <> why(body)}

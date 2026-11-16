@@ -334,17 +334,9 @@ defmodule InfluxElixir.Client.HTTP do
     with {:ok, _body} <- json_body(%{"text" => value}), do: :ok
   end
 
-  @spec query_format(keyword()) :: term()
-  defp query_format(opts) do
-    case Keyword.get(opts, :format) do
-      nil -> :json
-      format -> format
-    end
-  end
-
   @spec http_query_sql(keyword(), binary(), keyword()) :: InfluxElixir.Client.query_result()
   defp http_query_sql(connection, sql, opts) do
-    format = query_format(opts)
+    format = Options.query_format(opts)
 
     with {:ok, database} <- resolve_database(opts, connection),
          {:ok, body} <- sql_request_body(database, sql, opts, format),
@@ -437,7 +429,7 @@ defmodule InfluxElixir.Client.HTTP do
         {:error, :no_database_specified} -> ""
       end
 
-    format = query_format(opts)
+    format = Options.query_format(opts)
     format_value = if is_atom(format), do: Atom.to_string(format), else: format
 
     body_map = %{"q" => influxql, "format" => format_value}

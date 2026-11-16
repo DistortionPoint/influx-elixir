@@ -142,14 +142,11 @@ defmodule InfluxElixir.Client.Local.Writes do
 
       :error ->
         {:error,
-         %{
-           status: 400,
-           body:
-             Jason.encode!(%{
-               "code" => "invalid",
-               "message" => "invalid precision; valid precision units are ns, us, ms, and s"
-             })
-         }}
+         Buckets.v2_error(
+           400,
+           "invalid",
+           "invalid precision; valid precision units are ns, us, ms, and s"
+         )}
     end
   end
 
@@ -214,10 +211,7 @@ defmodule InfluxElixir.Client.Local.Writes do
         "unable to parse '#{line}': #{reason}"
       end)
 
-    %{
-      status: 400,
-      body: Jason.encode!(%{"code" => "invalid", "message" => String.replace_invalid(message)})
-    }
+    Buckets.v2_error(400, "invalid", message)
   end
 
   # The lines InfluxDB 3 accepts, in order, and the errors of those it
@@ -363,15 +357,7 @@ defmodule InfluxElixir.Client.Local.Writes do
         "#{drop.("oldest", oldest)}, #{drop.("newest", newest)} dropped=#{length(expired)} " <>
         "for database: #{Buckets.hex_id(database)} for retention policy: autogen"
 
-    {:error,
-     %{
-       status: 422,
-       body:
-         Jason.encode!(%{
-           "code" => "unprocessable entity",
-           "message" => String.replace_invalid(message)
-         })
-     }}
+    {:error, Buckets.v2_error(422, "unprocessable entity", message)}
   end
 
   # Go's RFC 3339 with nanoseconds: the fraction only as far as it is not
@@ -419,15 +405,7 @@ defmodule InfluxElixir.Client.Local.Writes do
       "failure writing points to database: partial write: " <>
         v2_drop_reason(first) <> " dropped=#{length(reasons)}"
 
-    {:error,
-     %{
-       status: 422,
-       body:
-         Jason.encode!(%{
-           "code" => "unprocessable entity",
-           "message" => String.replace_invalid(message)
-         })
-     }}
+    {:error, Buckets.v2_error(422, "unprocessable entity", message)}
   end
 
   @spec v2_drop_reason(term()) :: binary()
@@ -458,14 +436,8 @@ defmodule InfluxElixir.Client.Local.Writes do
 
   # The engine's answer for a bucket that does not exist (verified).
   @spec bucket_not_found(binary()) :: {:error, map()}
-  defp bucket_not_found(bucket) do
-    {:error,
-     %{
-       status: 404,
-       body:
-         Jason.encode!(%{"code" => "not found", "message" => "bucket \"#{bucket}\" not found"})
-     }}
-  end
+  defp bucket_not_found(bucket),
+    do: {:error, Buckets.v2_error(404, "not found", "bucket \"#{bucket}\" not found")}
 
   @spec gzip_flag(keyword()) :: {:ok, boolean()} | {:error, map()}
   defp gzip_flag(opts) do

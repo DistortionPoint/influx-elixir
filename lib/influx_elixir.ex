@@ -564,13 +564,7 @@ defmodule InfluxElixir do
 
   @spec start_connection(atom(), keyword()) :: Supervisor.on_start_child()
   defp start_connection(name, opts) do
-    config = Keyword.put(opts, :name, name)
-
-    child_spec =
-      Supervisor.child_spec(
-        {InfluxElixir.ConnectionSupervisor, config},
-        id: {InfluxElixir.ConnectionSupervisor, name}
-      )
+    child_spec = InfluxElixir.ConnectionSupervisor.named_child_spec(name, opts)
 
     # A connection that fails to start has released what it set up: the client's error
     # registered nothing, and the registration a child's failure stopped took itself down.

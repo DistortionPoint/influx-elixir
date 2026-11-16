@@ -10,17 +10,25 @@ defmodule InfluxElixir.Client.Local.LineProtocolNumber do
 
   @spec scan(binary()) :: {:ok, term(), binary()} | :fail | {:error, binary()}
   def scan(text) do
+    case take_integer(text) do
+      {"", _after} -> :fail
+      {whole, tail} -> v3_number_tail(whole, tail, text, not String.starts_with?(whole, "-"))
+    end
+  end
+
+  @doc "The leading `-?digits` of `text` and what follows (`{\"\", text}` when there are none)."
+  @spec take_integer(binary()) :: {binary(), binary()}
+  def take_integer(text) do
     sign = sign_size(text)
     <<_sign::binary-size(sign), unsigned::binary>> = text
 
     case digit_count(unsigned, 0) do
       0 ->
-        :fail
+        {"", text}
 
       digits ->
-        int_end = sign + digits
-        <<whole::binary-size(int_end), tail::binary>> = text
-        v3_number_tail(whole, tail, text, sign == 0)
+        <<integer::binary-size(sign + digits), after_integer::binary>> = text
+        {integer, after_integer}
     end
   end
 

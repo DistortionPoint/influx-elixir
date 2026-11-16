@@ -27,7 +27,7 @@ defmodule InfluxElixir.Client.Local.Format do
   # where the engine's parser stops). The other formats are answered from the
   # query's result.
 
-  alias InfluxElixir.Client.Local.SQLError
+  alias InfluxElixir.Client.Local.{SQLError, SQLNumber}
   alias InfluxElixir.Client.QueryParams
 
   @engine_formats ~w(parquet csv pretty json json_lines jsonl)
@@ -234,7 +234,7 @@ defmodule InfluxElixir.Client.Local.Format do
 
   @spec signed(float(), ({binary(), integer()} -> binary())) :: binary()
   defp signed(value, render) do
-    sign = if match?(<<1::1, _rest::63>>, <<value::float>>), do: "-", else: ""
+    sign = if SQLNumber.negative_float?(value), do: "-", else: ""
     sign <> render.(digits(abs(value)))
   end
 

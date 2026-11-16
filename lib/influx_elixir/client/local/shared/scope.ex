@@ -5,6 +5,7 @@ defmodule InfluxElixir.Client.Local.Scope do
   # whether the engine has it.
 
   alias InfluxElixir.Client.Local.{DatabaseRules, LineProtocolParser, Retention, Store}
+  alias InfluxElixir.Client.Options
 
   # Operations supported by each profile.
   # An operation not in the list returns {:error, :unsupported_operation}. The two InfluxDB 3
@@ -75,13 +76,7 @@ defmodule InfluxElixir.Client.Local.Scope do
   @spec resolve_database(keyword(), map()) ::
           {:ok, binary()} | {:error, :no_database_specified | map()}
   def resolve_database(opts, conn) do
-    database =
-      case Keyword.get(opts, :database) do
-        nil -> Map.get(conn, :database)
-        db -> db
-      end
-
-    case database do
+    case Options.database(opts, conn) do
       nil -> {:error, :no_database_specified}
       database -> with :ok <- utf8_name(database, "database"), do: {:ok, database}
     end
@@ -148,10 +143,5 @@ defmodule InfluxElixir.Client.Local.Scope do
 
   @doc "`format:` as `Client.HTTP` sends it; see `InfluxElixir.Client.Local.Format`."
   @spec query_format(keyword()) :: term()
-  def query_format(opts) do
-    case Keyword.get(opts, :format) do
-      nil -> :json
-      format -> format
-    end
-  end
+  defdelegate query_format(opts), to: Options
 end

@@ -76,6 +76,15 @@ defmodule InfluxElixir.ConnectionSupervisor do
     }
   end
 
+  @doc false
+  @spec named_child_spec(term(), term()) :: Supervisor.child_spec()
+  def named_child_spec(name, config) do
+    child_config =
+      if Options.keyword?(config), do: Keyword.put(config, :name, name), else: config
+
+    Supervisor.child_spec({__MODULE__, child_config}, id: {__MODULE__, name})
+  end
+
   @doc """
   Starts a ConnectionSupervisor for a named connection.
 

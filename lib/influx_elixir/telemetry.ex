@@ -93,8 +93,11 @@ defmodule InfluxElixir.Telemetry do
       )
   """
   @spec span_write(map(), (-> result)) :: result when result: term()
-  def span_write(metadata, fun) do
-    :telemetry.span(@write_event, metadata, fn ->
+  def span_write(metadata, fun), do: span(@write_event, metadata, fun)
+
+  @spec span([atom()], map(), (-> result)) :: result when result: term()
+  defp span(event, metadata, fun) do
+    :telemetry.span(event, metadata, fn ->
       result = fun.()
       {result, stop_metadata(metadata, result)}
     end)
@@ -131,12 +134,7 @@ defmodule InfluxElixir.Telemetry do
       )
   """
   @spec span_query(map(), (-> result)) :: result when result: term()
-  def span_query(metadata, fun) do
-    :telemetry.span(@query_event, metadata, fn ->
-      result = fun.()
-      {result, stop_metadata(metadata, result)}
-    end)
-  end
+  def span_query(metadata, fun), do: span(@query_event, metadata, fun)
 
   # ---------- Manual write events ----------
 

@@ -104,14 +104,29 @@ defmodule InfluxElixir.Write.Writer do
       {nil, rest} ->
         {:ok, InfluxElixir.Client.impl(), rest}
 
-      {client, rest} when is_atom(client) and not is_boolean(client) ->
-        if Code.ensure_loaded?(client) and function_exported?(client, :write, 3),
+      {client, rest} ->
+        if client?(client),
           do: {:ok, client, rest},
           else: {:error, {:invalid_options, opts}}
-
-      {_invalid, _rest} ->
-        {:error, {:invalid_options, opts}}
     end
+  end
+
+  @doc false
+  # Whether `client` is a module implementing `write/3`.
+  @spec client?(term()) :: boolean()
+  def client?(client) when is_atom(client) and client not in [nil, true, false],
+    do: Code.ensure_loaded?(client) and function_exported?(client, :write, 3)
+
+  def client?(_other), do: false
+
+  @doc false
+  # The options `LineProtocol.encode/2` needs for `connection` and `opts`: the write's
+  # `:precision` and the connection's `:api_version`.
+  @spec encode_options(term(), keyword()) :: keyword()
+  def encode_options(connection, opts) do
+    opts
+    |> Keyword.take([:precision])
+    |> Keyword.put(:api_version, Connection.api_version(connection))
   end
 
   @doc false
@@ -153,12 +168,7 @@ defmodule InfluxElixir.Write.Writer do
   @spec body(term(), term(), keyword()) :: {:ok, term()} | {:error, term()}
   defp body(connection, payload, opts) do
     if points?(payload) do
-      encode_opts =
-        opts
-        |> Keyword.take([:precision])
-        |> Keyword.put(:api_version, Connection.api_version(connection))
-
-      case LineProtocol.encode(payload, encode_opts) do
+      case LineProtocol.encode(payload, encode_options(connection, opts)) do
         {:error, {:invalid_options, _encode_opts}} -> {:error, {:invalid_options, opts}}
         result -> result
       end

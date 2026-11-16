@@ -24,7 +24,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolTime do
   def parse_timestamp(ts_str, precision, dialect) do
     ts = :erlang.binary_to_integer(ts_str)
 
-    if ts in SQLLimits.int64_min()..SQLLimits.int64_max() do
+    if SQLLimits.is_int64(ts) do
       ns = to_nanoseconds(ts, precision)
 
       if in_range?(ns, dialect),
@@ -36,7 +36,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolTime do
   end
 
   @spec in_range?(integer(), dialect()) :: boolean()
-  defp in_range?(ns, :v3), do: ns in SQLLimits.int64_min()..SQLLimits.int64_max()
+  defp in_range?(ns, :v3), do: SQLLimits.is_int64(ns)
   defp in_range?(ns, :v2), do: ns in (SQLLimits.int64_min() + 2)..(SQLLimits.int64_max() - 1)
 
   @spec out_of_range(integer(), precision(), dialect()) :: binary()

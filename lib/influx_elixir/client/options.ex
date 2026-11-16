@@ -85,6 +85,16 @@ defmodule InfluxElixir.Client.Options do
   end
 
   @doc false
+  # The response format of a query: `opts[:format]` when given and non-nil, else `:json`.
+  @spec query_format(keyword()) :: term()
+  def query_format(opts) do
+    case Keyword.get(opts, :format) do
+      nil -> :json
+      format -> format
+    end
+  end
+
+  @doc false
   # The lines of a write body: its newlines, one more for the last line, none for a trailing
   # newline. One scan for each newline, holding nothing but the count: the write path and the
   # batch writer count every payload.

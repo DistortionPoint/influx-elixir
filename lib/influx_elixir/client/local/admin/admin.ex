@@ -219,9 +219,7 @@ defmodule InfluxElixir.Client.Local.Admin do
   end
 
   @spec v2_error(pos_integer(), binary(), binary()) :: {:error, map()}
-  defp v2_error(status, code, message) do
-    {:error, %{status: status, body: Jason.encode!(%{"code" => code, "message" => message})}}
-  end
+  defp v2_error(status, code, message), do: {:error, Buckets.v2_error(status, code, message)}
 
   @spec list_buckets(InfluxElixir.Client.connection()) ::
           {:ok, [map()]} | {:error, term()}
