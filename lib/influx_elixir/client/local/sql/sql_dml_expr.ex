@@ -816,18 +816,16 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp drop_not([{:word, _p, "NOT", _l, _c} | rest]), do: rest
   defp drop_not(tokens), do: tokens
 
+  @is_words %{"NULL" => :null, "TRUE" => true, "FALSE" => false, "UNKNOWN" => :unknown}
+
   @spec is(ast(), [token()]) :: parsed(ast())
   defp is(left, [{:word, _p, "NOT", _l, _c} | rest]) do
     with {:ok, {:is, inner, what, _negated}, rest} <- is(left, rest),
          do: {:ok, {:is, inner, what, true}, rest}
   end
 
-  defp is(left, [{:word, _p, "NULL", _l, _c} | rest]), do: {:ok, {:is, left, :null, false}, rest}
-  defp is(left, [{:word, _p, "TRUE", _l, _c} | rest]), do: {:ok, {:is, left, true, false}, rest}
-  defp is(left, [{:word, _p, "FALSE", _l, _c} | rest]), do: {:ok, {:is, left, false, false}, rest}
-
-  defp is(left, [{:word, _p, "UNKNOWN", _l, _c} | rest]),
-    do: {:ok, {:is, left, :unknown, false}, rest}
+  defp is(left, [{:word, _p, word, _l, _c} | rest]) when is_map_key(@is_words, word),
+    do: {:ok, {:is, left, Map.fetch!(@is_words, word), false}, rest}
 
   defp is(left, [{:word, _p, "DISTINCT", _l, _c}, {:word, _p2, "FROM", _l2, _c2} | rest]) do
     with {:ok, right, rest} <- expr(rest), do: {:ok, {:is, left, {:distinct, right}, false}, rest}

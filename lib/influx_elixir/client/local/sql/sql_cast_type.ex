@@ -60,12 +60,13 @@ defmodule InfluxElixir.Client.Local.SQLCastType do
     end
   end
 
+  @int_targets %{8 => :int8, 16 => :int16, 32 => :int32, 64 => :int64}
+
   @spec target(SQLDmlType.t(), [expr_token()], SQLExpr.t()) ::
           {:ok, SQLExpr.cast_type(), [expr_token()]} | {:error, {:cast_type, binary()}}
-  defp target(%{family: :int, bits: 8}, rest, _operand), do: {:ok, :int8, rest}
-  defp target(%{family: :int, bits: 16}, rest, _operand), do: {:ok, :int16, rest}
-  defp target(%{family: :int, bits: 32}, rest, _operand), do: {:ok, :int32, rest}
-  defp target(%{family: :int, bits: 64}, rest, _operand), do: {:ok, :int64, rest}
+  defp target(%{family: :int, bits: bits}, rest, _operand),
+    do: {:ok, Map.fetch!(@int_targets, bits), rest}
+
   defp target(%{family: :float, arrow: "Float64"}, rest, _operand), do: {:ok, :float, rest}
   defp target(%{family: :str}, rest, _operand), do: {:ok, :string, rest}
 

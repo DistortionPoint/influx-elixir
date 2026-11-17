@@ -783,7 +783,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
   defp predicate_type({:num, text}, _ctx), do: literal_predicate(text)
   defp predicate_type({:neg, {:num, text}}, _ctx), do: literal_predicate("-" <> text)
-  defp predicate_type({:pos, {:num, text}}, _ctx), do: literal_predicate(text)
+  defp predicate_type({:pos, {:num, _text} = num}, ctx), do: predicate_type(num, ctx)
 
   # A sign in front of a boolean is the boolean's type, which is all the planner checks.
   defp predicate_type({sign, inner}, ctx) when sign in [:neg, :pos] do
@@ -1387,11 +1387,10 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp arrow(:float), do: "Float64"
   defp arrow(:decimal), do: "Decimal128(?)"
 
+  @arrow_numeric %{"Int64" => :int, "UInt64" => :uint, "Float64" => :float}
+
   @spec from_arrow(binary()) :: type()
-  defp from_arrow("Int64"), do: :int
-  defp from_arrow("UInt64"), do: :uint
-  defp from_arrow("Float64"), do: :float
-  defp from_arrow(_decimal), do: :decimal
+  defp from_arrow(arrow), do: Map.get(@arrow_numeric, arrow, :decimal)
 
   @spec call_type(binary(), [SQLDmlExpr.ast()] | :star, ctx()) :: type()
   defp call_type(name, _args, _ctx) when name in @now, do: :time
@@ -1444,9 +1443,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   end
 
   @spec column_type(binary() | nil) :: type()
-  defp column_type("Int64"), do: :int
-  defp column_type("UInt64"), do: :uint
-  defp column_type("Float64"), do: :float
+  defp column_type(type) when is_map_key(@arrow_numeric, type),
+    do: Map.fetch!(@arrow_numeric, type)
+
   defp column_type("Boolean"), do: :bool
   defp column_type("Timestamp(ns)"), do: :time
   defp column_type(type) when type in ["Utf8", "Dictionary(Int32, Utf8)"], do: :str

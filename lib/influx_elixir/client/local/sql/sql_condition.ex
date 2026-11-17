@@ -67,14 +67,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
 
   @spec eval_node(point(), SQLParser.where_node()) :: boolean() | nil
   defp eval_node(point, {:or, branches}), do: any_of(branches, point, false)
-
-  defp eval_node(point, {:not, conjunction}) do
-    case eval_all(point, conjunction) do
-      nil -> nil
-      value -> not value
-    end
-  end
-
+  defp eval_node(point, {:not, conjunction}), do: negate(eval_all(point, conjunction))
   defp eval_node(point, clause), do: matches_condition?(point, clause)
 
   @spec any_of([[SQLParser.where_node()]], point(), boolean() | nil) :: boolean() | nil
@@ -114,8 +107,11 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   # the rows above 5).
   defp matches_condition?(point, {:between, left, {low, high}}) do
     case left_value(point, left, [low, high]) do
-      nil -> nil
-      actual -> both(compare3(point, actual, :gte, low), compare3(point, actual, :lte, high))
+      nil ->
+        nil
+
+      actual ->
+        SQLCompare.both(compare3(point, actual, :gte, low), compare3(point, actual, :lte, high))
     end
   end
 
@@ -127,7 +123,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   defp matches_condition?(point, {:in, key, values}) do
     case left_value(point, key, values) do
       nil -> nil
-      actual -> in_list(actual, Enum.map(values, &right_value(point, &1)))
+      actual -> SQLCompare.member(actual, Enum.map(values, &right_value(point, &1)))
     end
   end
 
@@ -197,7 +193,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   # time, makes it unknown, as for any other column.
   @spec time_condition(integer() | nil, atom(), term()) :: boolean() | nil
   defp time_condition(ts, :between, {low, high}),
-    do: both(time_compare(ts, :gte, low), time_compare(ts, :lte, high))
+    do: SQLCompare.both(time_compare(ts, :gte, low), time_compare(ts, :lte, high))
 
   defp time_condition(ts, :not_between, range), do: negate(time_condition(ts, :between, range))
   defp time_condition(ts, :in, values), do: time_in(ts, values)
@@ -215,16 +211,7 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
 
   @spec time_in(integer() | nil, [SQLParser.time_value()]) :: boolean() | nil
   defp time_in(nil, _values), do: nil
-
-  defp time_in(ts, values) do
-    bounds = Enum.map(values, &to_nanoseconds/1)
-
-    cond do
-      Enum.any?(bounds, &(&1 == ts)) -> true
-      Enum.any?(bounds, &is_nil/1) -> nil
-      true -> false
-    end
-  end
+  defp time_in(ts, values), do: SQLCompare.member(ts, Enum.map(values, &to_nanoseconds/1))
 
   # LIKE, ILIKE and the regular-expression operators over a text value; a
   # number or a boolean has no text to match.
@@ -337,15 +324,6 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
   defp right_value(_point, {:uint, value}), do: value
   defp right_value(_point, literal), do: literal
 
-  @spec in_list(term(), [term()]) :: boolean() | nil
-  defp in_list(actual, candidates) do
-    cond do
-      Enum.any?(candidates, &(not is_nil(&1) and SQLCompare.compare(actual, :eq, &1))) -> true
-      Enum.any?(candidates, &is_nil/1) -> nil
-      true -> false
-    end
-  end
-
   @spec compare3(point(), term(), atom(), term()) :: boolean() | nil
   defp compare3(point, actual, op, bound) do
     case right_value(point, bound) do
@@ -353,11 +331,6 @@ defmodule InfluxElixir.Client.Local.SQLCondition do
       value -> SQLCompare.compare(actual, op, value)
     end
   end
-
-  @spec both(boolean() | nil, boolean() | nil) :: boolean() | nil
-  defp both(left, right) when false in [left, right], do: false
-  defp both(left, right) when nil in [left, right], do: nil
-  defp both(true, true), do: true
 
   # The parser has already turned every `time` comparand into nanoseconds or
   # a `now()` offset; `now()` is resolved here, at execution, as the engine

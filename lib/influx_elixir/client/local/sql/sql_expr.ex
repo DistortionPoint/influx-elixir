@@ -228,34 +228,27 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   @typep parsed :: {:ok, t(), [term()]} | {:error, term()}
 
   @spec parse_or([term()]) :: parsed()
-  defp parse_or(tokens) do
-    with {:ok, left, rest} <- parse_and(tokens), do: parse_or_tail(left, rest)
-  end
-
-  defp parse_or_tail(left, [{:word, word} | rest] = tokens) do
-    if keyword?(word, "OR") do
-      with {:ok, right, rest} <- parse_and(rest), do: parse_or_tail({:or, left, right}, rest)
-    else
-      {:ok, left, tokens}
-    end
-  end
-
-  defp parse_or_tail(left, rest), do: {:ok, left, rest}
+  defp parse_or(tokens), do: parse_chain(tokens, "OR", :or, &parse_and/1)
 
   @spec parse_and([term()]) :: parsed()
-  defp parse_and(tokens) do
-    with {:ok, left, rest} <- parse_not(tokens), do: parse_and_tail(left, rest)
+  defp parse_and(tokens), do: parse_chain(tokens, "AND", :and, &parse_not/1)
+
+  @spec parse_chain([term()], binary(), :or | :and, ([term()] -> parsed())) :: parsed()
+  defp parse_chain(tokens, keyword, tag, next_fn) do
+    with {:ok, left, rest} <- next_fn.(tokens),
+         do: parse_chain_tail(left, rest, keyword, tag, next_fn)
   end
 
-  defp parse_and_tail(left, [{:word, word} | rest] = tokens) do
-    if keyword?(word, "AND") do
-      with {:ok, right, rest} <- parse_not(rest), do: parse_and_tail({:and, left, right}, rest)
+  defp parse_chain_tail(left, [{:word, word} | rest] = tokens, keyword, tag, next_fn) do
+    if keyword?(word, keyword) do
+      with {:ok, right, rest} <- next_fn.(rest),
+           do: parse_chain_tail({tag, left, right}, rest, keyword, tag, next_fn)
     else
       {:ok, left, tokens}
     end
   end
 
-  defp parse_and_tail(left, rest), do: {:ok, left, rest}
+  defp parse_chain_tail(left, rest, _keyword, _tag, _next_fn), do: {:ok, left, rest}
 
   @spec parse_not([term()]) :: parsed()
   defp parse_not([{:word, word} | rest] = tokens) do
@@ -774,15 +767,15 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   (a leaf is returned as it is).
   """
   @spec map_children(t(), (t() -> t())) :: t()
-  def map_children({:neg, inner}, fun), do: {:neg, fun.(inner)}
-  def map_children({:pos, inner}, fun), do: {:pos, fun.(inner)}
-  def map_children({:not, inner}, fun), do: {:not, fun.(inner)}
+  def map_children({kind, inner}, fun) when kind in [:neg, :pos, :not], do: {kind, fun.(inner)}
   def map_children({:cast, inner, type}, fun), do: {:cast, fun.(inner), type}
-  def map_children({:op, op, left, right}, fun), do: {:op, op, fun.(left), fun.(right)}
-  def map_children({:cmp, op, left, right}, fun), do: {:cmp, op, fun.(left), fun.(right)}
-  def map_children({:and, left, right}, fun), do: {:and, fun.(left), fun.(right)}
-  def map_children({:or, left, right}, fun), do: {:or, fun.(left), fun.(right)}
-  def map_children({:concat, left, right}, fun), do: {:concat, fun.(left), fun.(right)}
+
+  def map_children({kind, op, left, right}, fun) when kind in [:op, :cmp],
+    do: {kind, op, fun.(left), fun.(right)}
+
+  def map_children({kind, left, right}, fun) when kind in [:and, :or, :concat],
+    do: {kind, fun.(left), fun.(right)}
+
   def map_children({:call, name, args}, fun), do: {:call, name, Enum.map(args, fun)}
   def map_children({:is_null, inner, negated}, fun), do: {:is_null, fun.(inner), negated}
 

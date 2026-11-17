@@ -51,7 +51,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   def eval({:and, left, right}, point) do
     case eval(left, point) do
       false -> false
-      value -> both(value, eval(right, point))
+      value -> SQLCompare.both(value, eval(right, point))
     end
   end
 
@@ -158,8 +158,13 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   @spec eval_predicate(SQLExpr.t(), SQLRow.point()) :: value()
   defp eval_predicate({:in, inner, items, negated}, point) do
     case eval(inner, point) do
-      nil -> nil
-      value -> value |> member(Enum.map(items, &eval(&1, point))) |> negate_if(negated)
+      nil ->
+        nil
+
+      value ->
+        value
+        |> SQLCompare.member(Enum.map(items, &eval(&1, point)))
+        |> negate_if(negated)
     end
   end
 
@@ -248,13 +253,6 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     SQLCompare.compare(left, op, right)
   end
 
-  # SQL's three-valued logic: false decides an AND and true an OR; with
-  # neither, a null on either side is unknown.
-  @spec both(boolean() | nil, boolean() | nil) :: boolean() | nil
-  defp both(left, right) when false in [left, right], do: false
-  defp both(true, true), do: true
-  defp both(_left, _right), do: nil
-
   @spec either(boolean() | nil, boolean() | nil) :: boolean() | nil
   defp either(_left, true), do: true
   defp either(false, false), do: false
@@ -264,20 +262,9 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   defp negate_if(value, true), do: SQLCompare.negate(value)
   defp negate_if(value, false), do: value
 
-  # `v IN (...)`: true for a member, unknown when a null stands in the list
-  # and there is none, false otherwise.
-  @spec member(value(), [value()]) :: boolean() | nil
-  defp member(value, candidates) do
-    cond do
-      Enum.any?(candidates, &(not is_nil(&1) and SQLCompare.compare(value, :eq, &1))) -> true
-      Enum.any?(candidates, &is_nil/1) -> nil
-      true -> false
-    end
-  end
-
   @spec between(value(), value(), value()) :: boolean() | nil
   defp between(value, low, high),
-    do: both(compare(:gte, value, low), compare(:lte, value, high))
+    do: SQLCompare.both(compare(:gte, value, low), compare(:lte, value, high))
 
   # The text a `LIKE` matches: the value itself, which must be text.
   @spec like(value(), boolean()) :: binary()

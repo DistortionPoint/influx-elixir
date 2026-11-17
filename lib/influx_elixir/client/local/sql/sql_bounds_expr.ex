@@ -52,6 +52,8 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
 
   @bounds [:gt, :gte, :lt, :lte, :eq]
 
+  defguardp is_column(kind, name) when kind in [:field, :uint_col] and is_binary(name)
+
   @doc """
   Classifies the comparison `op` of `expr` with `rhs`: as a comparison of a
   bare column (the cast removed), one of the failures above, or unknown.
@@ -62,7 +64,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
     expr = collapse(expr, type_of, integral?)
 
     case {expr, bare(collapse(expr, type_of, true))} do
-      {{kind, name}, _bare} when kind in [:field, :uint_col] and is_binary(name) ->
+      {{kind, name}, _bare} when is_column(kind, name) ->
         {:column, name}
 
       {_expression, bare} when bare != nil and not integral? ->
@@ -78,7 +80,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
 
   # The column an expression is once what the optimizer removes is gone.
   @spec bare(SQLExpr.t()) :: binary() | nil
-  defp bare({kind, name}) when kind in [:field, :uint_col] and is_binary(name), do: name
+  defp bare({kind, name}) when is_column(kind, name), do: name
   defp bare(_expression), do: nil
 
   # What the optimizer removes before the analysis reads an expression: a
@@ -116,7 +118,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
   defp one?(_literal, _other, _type_of, _integral?), do: false
 
   @spec float_column?(SQLExpr.t(), (binary() -> column_type() | nil)) :: boolean()
-  defp float_column?({kind, name}, type_of) when kind in [:field, :uint_col] and is_binary(name),
+  defp float_column?({kind, name}, type_of) when is_column(kind, name),
     do: type_of.(name) == :float64
 
   defp float_column?(_other, _type_of), do: false
@@ -151,7 +153,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
   @spec negative_cast(atom(), SQLExpr.t(), [number()], (binary() -> column_type() | nil)) ::
           result()
   defp negative_cast(op, {:cast, {kind, name}, type}, numbers, type_of)
-       when kind in [:field, :uint_col] and is_binary(name) do
+       when is_column(kind, name) do
     if SQLCast.bits(type) != nil and type_of.(name) == :uint64 and Enum.any?(numbers, &(&1 < 0)),
       do: {:cast_null, op, SQLCast.arrow_type(type)},
       else: :unknown
@@ -171,8 +173,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
       else: :error
   end
 
-  defp uncast({kind, name}, _literals, type_of)
-       when kind in [:field, :uint_col] and is_binary(name) do
+  defp uncast({kind, name}, _literals, type_of) when is_column(kind, name) do
     case type_of.(name) do
       type when type in [:int64, :uint64] -> {:ok, name, type}
       _other -> :error
@@ -388,8 +389,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
 
   @spec solve(SQLExpr.t(), interval(), (binary() -> column_type() | nil)) ::
           {:ok, binary(), column_type(), interval()} | :error
-  defp solve({kind, name}, interval, type_of)
-       when kind in [:field, :uint_col] and is_binary(name) do
+  defp solve({kind, name}, interval, type_of) when is_column(kind, name) do
     case type_of.(name) do
       type when type in [:int64, :uint64, :float64] -> {:ok, name, type, interval}
       _other -> :error
@@ -400,7 +400,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
 
   # A cast of an `Int64` column to `Int64` changes nothing and is removed.
   defp solve({:cast, {kind, name} = inner, :int64}, interval, type_of)
-       when kind in [:field, :uint_col] and is_binary(name) do
+       when is_column(kind, name) do
     if type_of.(name) == :int64, do: solve(inner, interval, type_of), else: :error
   end
 
@@ -486,7 +486,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
   """
   @spec empty?(column_type(), [interval()]) :: boolean()
   def empty?(type, intervals) do
-    {lo, lo_open, hi, hi_open} = Enum.reduce(intervals, {:neg_inf, false, :inf, false}, &meet/2)
+    {lo, lo_open, hi, hi_open} = meet_all(intervals)
 
     cond do
       lo == :neg_inf or hi == :inf ->
@@ -506,11 +506,14 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
   """
   @spec contains?([interval()], interval()) :: boolean()
   def contains?(intervals, {value, _lo_open, value, _hi_open}) do
-    {lo, lo_open, hi, hi_open} = Enum.reduce(intervals, {:neg_inf, false, :inf, false}, &meet/2)
+    {lo, lo_open, hi, hi_open} = meet_all(intervals)
 
     (lo == :neg_inf or lo < value or (lo == value and not lo_open)) and
       (hi == :inf or hi > value or (hi == value and not hi_open))
   end
+
+  @spec meet_all([interval()]) :: interval()
+  defp meet_all(intervals), do: Enum.reduce(intervals, {:neg_inf, false, :inf, false}, &meet/2)
 
   @spec meet(interval(), interval()) :: interval()
   defp meet({l1, o1, h1, p1}, {l2, o2, h2, p2}) do

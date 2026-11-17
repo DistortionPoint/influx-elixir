@@ -39,6 +39,7 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   # the rows are.
 
   alias InfluxElixir.Client.Local.{
+    SQLCast,
     SQLCondition,
     SQLError,
     SQLEval,
@@ -179,9 +180,7 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   end
 
   @spec risky_scale?(term()) :: boolean()
-  defp risky_scale?(value) when is_integer(value),
-    do: value > 2_147_483_647 or value < -2_147_483_648
-
+  defp risky_scale?(value) when is_integer(value), do: not SQLCast.fits?(value, 32)
   defp risky_scale?(value), do: not (is_nil(value) or match?({:int, _bits, _value}, value))
 
   # The operations the engine can fail on, whatever the rows hold: where the

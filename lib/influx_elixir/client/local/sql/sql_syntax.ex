@@ -1026,14 +1026,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp set_operations([{:word, _p, operator, _l, _c} | rest])
        when operator in ["UNION", "EXCEPT", "INTERSECT", "MINUS"] do
     put_state(:set_operation, true)
-
-    case rest do
-      [{:word, _q, quantifier, _l2, _c2} | more] when quantifier in ["ALL", "DISTINCT"] ->
-        more |> select_term() |> set_operations()
-
-      _plain ->
-        rest |> select_term() |> set_operations()
-    end
+    rest |> optional_word(["ALL", "DISTINCT"]) |> select_term() |> set_operations()
   end
 
   defp set_operations(tokens), do: tokens
@@ -1049,9 +1042,9 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     |> projection()
     |> into_clause()
     |> from_clause()
-    |> condition_clause("WHERE")
+    |> keyword_expression("WHERE")
     |> group_by()
-    |> condition_clause("HAVING")
+    |> keyword_expression("HAVING")
   end
 
   # The quantifier and the `TOP` clause, in either order. The engine reads `TOP` and then
@@ -1067,7 +1060,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   defp top_clause([{:word, _p, "TOP", _l, _c} | rest]) do
     put_state(:top, true)
-    rest |> top_quantity() |> top_percent() |> top_ties()
+    rest |> top_quantity() |> optional_word(["PERCENT"]) |> with_ties()
   end
 
   defp top_clause(tokens), do: tokens
@@ -1078,11 +1071,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp top_quantity([{:number, _p, _u, _l, _c} | rest]), do: rest
   defp top_quantity(tokens), do: fail("literal int", tokens)
 
-  defp top_percent([{:word, _p, "PERCENT", _l, _c} | rest]), do: rest
-  defp top_percent(tokens), do: tokens
-
-  defp top_ties([{:word, _p, "WITH", _l, _c}, {:word, _q, "TIES", _l2, _c2} | rest]), do: rest
-  defp top_ties(tokens), do: tokens
+  defp with_ties([{:word, _p, "WITH", _l, _c}, {:word, _q, "TIES", _l2, _c2} | rest]), do: rest
+  defp with_ties(tokens), do: tokens
 
   defp select_quantifier([
          {:word, _p, "ALL", line, col},
@@ -1097,29 +1087,25 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp select_quantifier([{:word, _p, "DISTINCT", _l, _c}, {:word, _q, "ON", _l2, _c2} | _rest]),
     do: throw(:bail)
 
-  defp select_quantifier([{:word, _p, quantifier, _l, _c} | rest])
-       when quantifier in ["DISTINCT", "ALL"],
-       do: rest
-
-  defp select_quantifier(tokens), do: tokens
+  defp select_quantifier(tokens), do: optional_word(tokens, ["DISTINCT", "ALL"])
 
   # `INTO [TEMP] [UNLOGGED] [TABLE] name`, between the list and `FROM`.
   defp into_clause([{:word, _p, "INTO", _l, _c} | rest]) do
     put_state(:into, if(state(:depth) == 1, do: :plain, else: :nested))
 
     rest
-    |> into_option(["TEMP", "TEMPORARY"])
-    |> into_option(["UNLOGGED"])
-    |> into_option(["TABLE"])
+    |> optional_word(["TEMP", "TEMPORARY"])
+    |> optional_word(["UNLOGGED"])
+    |> optional_word(["TABLE"])
     |> into_name(1)
   end
 
   defp into_clause(tokens), do: tokens
 
-  defp into_option([{:word, _p, word, _l, _c} | rest] = tokens, words),
+  defp optional_word([{:word, _p, word, _l, _c} | rest] = tokens, words),
     do: if(word in words, do: rest, else: tokens)
 
-  defp into_option(tokens, _words), do: tokens
+  defp optional_word(tokens, _words), do: tokens
 
   defp into_name([{kind, _p, _u, _l, _c}, {:symbol, _q, ".", _l2, _c2} | rest], parts)
        when kind in [:word, :quoted, :string],
@@ -1294,9 +1280,6 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # The clauses after the select list
   # ---------------------------------------------------------------------------
 
-  defp condition_clause([{:word, _p, keyword, _l, _c} | rest], keyword), do: expression(rest)
-  defp condition_clause(tokens, _keyword), do: tokens
-
   defp group_by([
          {:word, _p, "GROUP", _l, _c},
          {:word, _q, "BY", _l2, _c2},
@@ -1333,11 +1316,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     end
   end
 
-  defp order_modifiers([{:word, _p, direction, _l, _c} | rest])
-       when direction in ["ASC", "DESC"],
-       do: nulls_placement(rest)
-
-  defp order_modifiers(tokens), do: nulls_placement(tokens)
+  defp order_modifiers(tokens),
+    do: tokens |> optional_word(["ASC", "DESC"]) |> nulls_placement()
 
   defp nulls_placement([{:word, _p, "NULLS", _l, _c}, {:word, _q, placement, _l2, _c2} | rest])
        when placement in ["FIRST", "LAST"],
@@ -1370,19 +1350,14 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   # The engine reads it and ignores it.
   defp fetch_clause([{:word, _p, "FETCH", _l, _c} | rest]) do
     rest
-    |> fetch_word(["FIRST", "NEXT"])
+    |> optional_word(["FIRST", "NEXT"])
     |> fetch_quantity()
-    |> fetch_word(["PERCENT"])
-    |> fetch_word(["ROW", "ROWS"])
+    |> optional_word(["PERCENT"])
+    |> optional_word(["ROW", "ROWS"])
     |> fetch_end()
   end
 
   defp fetch_clause(tokens), do: tokens
-
-  defp fetch_word([{:word, _p, word, _l, _c} | rest] = tokens, words),
-    do: if(word in words, do: rest, else: tokens)
-
-  defp fetch_word(tokens, _words), do: tokens
 
   defp fetch_quantity([{:word, _p, word, _l, _c} | _rest] = tokens) when word in ["ROW", "ROWS"],
     do: tokens
@@ -1400,16 +1375,10 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp fetch_quantity(tokens), do: fail("a value", tokens)
 
   defp fetch_end([{:word, _p, "ONLY", _l, _c} | rest]), do: rest
+  defp fetch_end(tokens), do: with_ties(tokens)
 
-  defp fetch_end([{:word, _p, "WITH", _l, _c}, {:word, _q, "TIES", _l2, _c2} | rest]), do: rest
-  defp fetch_end(tokens), do: tokens
-
-  defp offset_clause([{:word, _p, "OFFSET", _l, _c} | rest]) do
-    case expression(rest) do
-      [{:word, _q, rows, _l2, _c2} | more] when rows in ["ROW", "ROWS"] -> more
-      after_offset -> after_offset
-    end
-  end
+  defp offset_clause([{:word, _p, "OFFSET", _l, _c} | rest]),
+    do: rest |> expression() |> optional_word(["ROW", "ROWS"])
 
   defp offset_clause(tokens), do: tokens
 
@@ -1767,7 +1736,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp interval([_interval, {kind, printed, _u, _l, _c} | rest])
        when kind in [:string, :number] do
     interval_overflow(kind, printed, rest)
-    {unit_end, precision} = rest |> interval_unit() |> interval_precision()
+    {unit_end, precision} = rest |> optional_word(@interval_units) |> interval_precision()
 
     case interval_to(unit_end) do
       {:to, last_field, more} ->
@@ -1803,9 +1772,6 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
     :ok
   end
-
-  defp interval_unit([{:word, _q, unit, _l, _c} | more]) when unit in @interval_units, do: more
-  defp interval_unit(tokens), do: tokens
 
   defp interval_precision([{:symbol, _p, "(", _l, _c}, {:number, _q, digits, _l2, _c2} | more]) do
     case more do
@@ -2106,10 +2072,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   @is_expected "[NOT] NULL | TRUE | FALSE | DISTINCT | [form] NORMALIZED FROM after IS"
 
-  defp predicate_tail([{:word, _p, "NOT", _l, _c} | rest], precedence),
-    do: after_is(rest, precedence)
-
-  defp predicate_tail(tokens, precedence), do: after_is(tokens, precedence)
+  defp predicate_tail(tokens, precedence),
+    do: tokens |> optional_word(["NOT"]) |> after_is(precedence)
 
   defp after_is([{:word, _p, word, _l, _c} | rest], _precedence)
        when word in ["NULL", "TRUE", "FALSE", "UNKNOWN"],
@@ -2130,7 +2094,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
         rest |> subquery_or_list() |> close_paren()
 
       _list ->
-        rest |> in_expressions() |> close_paren()
+        rest |> expression_list() |> close_paren()
     end
   end
 
@@ -2141,14 +2105,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp subquery_or_list(tokens) do
     query(tokens)
   catch
-    {:syntax, _expected, _token} -> in_expressions(tokens)
-  end
-
-  defp in_expressions(tokens) do
-    case expression(tokens) do
-      [{:symbol, _p, ",", _l, _c} | rest] -> in_expressions(rest)
-      after_list -> after_list
-    end
+    {:syntax, _expected, _token} -> expression_list(tokens)
   end
 
   # Each bound is a `parse_subexpr` of `BETWEEN`'s precedence, so the low bound takes every

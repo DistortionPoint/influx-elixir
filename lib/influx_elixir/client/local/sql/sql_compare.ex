@@ -65,6 +65,22 @@ defmodule InfluxElixir.Client.Local.SQLCompare do
   def negate(_value),
     do: throw({:query_error, SQLError.refusal("NOT of a value the double has no type for")})
 
+  @doc "Three-valued SQL `AND`: `false` if either is `false`, `true` if both are `true`, `nil` otherwise."
+  @spec both(boolean() | nil, boolean() | nil) :: boolean() | nil
+  def both(left, right) when false in [left, right], do: false
+  def both(true, true), do: true
+  def both(_left, _right), do: nil
+
+  @doc "Three-valued `IN` membership: `true` for a member, `nil` when a null is in the list, `false` otherwise."
+  @spec member(term(), [term()]) :: boolean() | nil
+  def member(value, candidates) do
+    cond do
+      Enum.any?(candidates, &(not is_nil(&1) and compare(value, :eq, &1))) -> true
+      Enum.any?(candidates, &is_nil/1) -> nil
+      true -> false
+    end
+  end
+
   @doc "Whether `actual op value` holds; a null on either side is not true."
   @spec compare(term(), atom(), term()) :: boolean()
   def compare(nil, _op, _value), do: false
