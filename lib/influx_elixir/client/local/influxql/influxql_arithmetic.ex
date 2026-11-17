@@ -281,12 +281,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
 
   # What the planner types an expression as: the quotient of two integers is an integer.
   @spec planner_kind(expr()) :: :int | :uint | :float
-  defp planner_kind({:field, _name, kind}), do: kind
-  defp planner_kind({:lit, {kind, _n}}), do: kind
-  defp planner_kind({:abs, operand}), do: planner_kind(operand)
-
-  defp planner_kind({:op, _op, left, right}),
-    do: common_kind(planner_kind(left), planner_kind(right))
+  defp planner_kind(expr), do: kind(expr, false)
 
   # Whether the value of an expression is a float that the planner types as an integer.
   @spec integer_typed?(expr()) :: boolean()
@@ -314,19 +309,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
     (left == lowest and kind(right) == :uint) or (right == lowest and kind(left) == :uint)
   end
 
-  @spec kind(expr()) :: :int | :uint | :float
-  defp kind({:field, _name, kind}), do: kind
-  defp kind({:lit, {kind, _n}}), do: kind
-  defp kind({:abs, operand}), do: kind(operand)
+  @spec kind(expr(), boolean()) :: :int | :uint | :float
+  defp kind(expr, float_div? \\ true)
+  defp kind({:field, _name, kind}, _float_div?), do: kind
+  defp kind({:lit, {kind, _n}}, _float_div?), do: kind
+  defp kind({:abs, operand}, float_div?), do: kind(operand, float_div?)
 
-  defp kind({:op, "/", left, right}) do
-    case {kind(left), kind(right)} do
+  defp kind({:op, "/", left, right}, true) do
+    case {kind(left, true), kind(right, true)} do
       {:int, :int} -> :float
       {lk, rk} -> common_kind(lk, rk)
     end
   end
 
-  defp kind({:op, _op, left, right}), do: common_kind(kind(left), kind(right))
+  defp kind({:op, _op, left, right}, float_div?),
+    do: common_kind(kind(left, float_div?), kind(right, float_div?))
 
   defp common_kind(left, right) when :float in [left, right], do: :float
   defp common_kind(left, right) when :uint in [left, right], do: :uint

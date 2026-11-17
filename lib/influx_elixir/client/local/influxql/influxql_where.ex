@@ -210,7 +210,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
 
   defp tag_comparison({:cmp, [{:str, value}, {:op, op}, {:ident, name}]}, tags)
        when op in ["=", "!=", "<>"],
-       do: if(MapSet.member?(tags, name), do: [{name, op, value}], else: [])
+       do: tag_comparison({:cmp, [{:ident, name}, {:op, op}, {:str, value}]}, tags)
 
   defp tag_comparison(_node, _tags), do: []
 

@@ -467,10 +467,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   defp put_item({:time, name}, row, acc, _types), do: Map.put(acc, name, row["time"])
 
   defp put_item({:expr, ast, name}, row, acc, types) do
-    case InfluxQLExpr.eval(ast, row, types) do
-      nil -> acc
-      :nan -> Map.put(acc, name, nil)
-      value -> Map.put(acc, name, value)
+    case computed(ast, row, types) do
+      :null -> acc
+      {:ok, value} -> Map.put(acc, name, value)
     end
   end
 
@@ -571,11 +570,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   # The only selector of the list inside arithmetic still returns its point's
   # time (verified: `max(v) * 2`).
   @spec lone_selector_expression?(map()) :: boolean()
-  defp lone_selector_expression?(%{
-         aggregates: [{:aggregate, fun, arg, _alias}],
-         exprs: [_first | _more]
-       }),
-       do: InfluxQLAggregate.selector?(fun) and is_binary(arg)
+  defp lone_selector_expression?(%{aggregates: aggregates, exprs: [_first | _more]}),
+    do: lone_selector?(aggregates)
 
   defp lone_selector_expression?(_plan), do: false
 
@@ -674,11 +670,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   end
 
   # A percentile in a bucket reads its rank one further than over a series.
-  defp mark_bucket({:aggregate, "percentile:" <> _rest = fun, field, alias}),
-    do: {:aggregate, fun <> ":bucket", field, alias}
-
-  defp mark_bucket({:aggregate, "integral:" <> _flags = fun, field, alias}),
-    do: {:aggregate, fun <> ":bucket", field, alias}
+  defp mark_bucket({:aggregate, fun, field, alias} = aggregate) do
+    if String.starts_with?(fun, ["percentile:", "integral:"]),
+      do: {:aggregate, fun <> ":bucket", field, alias},
+      else: aggregate
+  end
 
   defp mark_bucket(aggregate), do: aggregate
 
@@ -898,10 +894,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   defp finish(values, plan) do
     computed =
       Enum.flat_map(plan.exprs, fn {name, ast} ->
-        case InfluxQLExpr.eval(ast, values, plan.types) do
-          nil -> []
-          :nan -> [{name, nil}]
-          value -> [{name, value}]
+        case computed(ast, values, plan.types) do
+          :null -> []
+          {:ok, value} -> [{name, value}]
         end
       end)
 

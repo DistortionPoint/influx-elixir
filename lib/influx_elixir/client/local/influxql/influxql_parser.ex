@@ -432,8 +432,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # Statements the engine reads in ways the double does not follow; any
   # other text is not a statement at all, and the engine fails it where it
   # starts (verified).
-  @known_statements ~q/^(?:(?:SELECT|SHOW|EXPLAIN|CREATE|DELETE)(?![\w])|DROP(?![\w])\s*\S)/i
-
   @spec next_statement_error(binary(), binary(), non_neg_integer()) :: {:error, term()}
   defp next_statement_error(statement, next, start) do
     case parse_statement(next) do
@@ -451,7 +449,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
           Regex.match?(@other_statements, next) ->
             {:error, {:engine, @only_one}}
 
-          Regex.match?(@known_statements, next) ->
+          Regex.match?(@statement_start, next) ->
             {:error, "unsupported InfluxQL (#{unread(reason)} after a `;`)"}
 
           true ->

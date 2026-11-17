@@ -446,17 +446,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   end
 
   defp arithmetic_expression(tokens, tags, types) do
-    {columns, calls} = InfluxQLTokens.split_names(tokens)
+    {_columns, calls} = InfluxQLTokens.split_names(tokens)
 
     cond do
       not Enum.all?(tokens, &arithmetic_token?/1) or
           not Enum.all?(calls, &InfluxQLText.math_function?/1) ->
         refuse_expression()
 
-      InfluxQLTokens.absent_columns(tokens, tags, types) != [] ->
-        :expression
-
-      Enum.any?(columns, &(Map.get(types, &1) == :unsigned and not MapSet.member?(tags, &1))) ->
+      InfluxQLTokens.absent_columns(tokens, tags, types) == [] and
+          unsigned_column?(tokens, tags, types) ->
         refuse_expression()
 
       true ->

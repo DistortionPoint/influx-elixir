@@ -367,9 +367,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
       {{:planning, _message} = error, _last, _between} ->
         error
 
-      {nil, {kind, _target} = target, _between} when kind in [:star, :regex] ->
-        {:planning, "expected integer as last argument for #{name}, got #{wildcard_text(target)}"}
-
       {nil, {:lit, {:int, _n}}, target} when target != nil ->
         {:planning, "only fields or tags are allow for #{name}(), got #{wildcard_text(target)}"}
 
@@ -395,7 +392,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
           | {:argument, binary(), term()}
           | :error
   defp classify_wild({:call, name, arguments} = call) do
-    case Enum.split_with(arguments, &match?({kind, _} when kind in [:star, :regex], &1)) do
+    case Enum.split_with(arguments, &wildcard?/1) do
       {[], _plain} ->
         classify_plain(call)
 
@@ -462,17 +459,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp limit_error(name, {:lit, {:int, n}}) when n <= 0,
     do: {:planning, "limit (#{n}) for #{name} must be greater than 0"}
 
-  defp limit_error(name, {:lit, {:float, x}}),
-    do:
-      {:planning,
-       "expected integer as last argument for #{name}, got Literal(Float(#{Float.to_string(x)}))"}
+  defp limit_error(name, last) do
+    with got when got != nil <- non_integer_limit(last),
+         do: {:planning, "expected integer as last argument for #{name}, got #{got}"}
+  end
 
-  defp limit_error(name, {:str, content}),
-    do:
-      {:planning,
-       "expected integer as last argument for #{name}, got Literal(String(#{InfluxQLError.rust_debug(content)}))"}
+  defp non_integer_limit({:lit, {:float, x}}), do: "Literal(Float(#{Float.to_string(x)}))"
 
-  defp limit_error(_name, _last), do: nil
+  defp non_integer_limit({:str, content}),
+    do: "Literal(String(#{InfluxQLError.rust_debug(content)}))"
+
+  defp non_integer_limit({kind, _target} = target) when kind in [:star, :regex],
+    do: wildcard_text(target)
+
+  defp non_integer_limit(_last), do: nil
 
   defp classify_call({:call, name, [argument]}) when name in @aggregates do
     case classify_inner(argument) do

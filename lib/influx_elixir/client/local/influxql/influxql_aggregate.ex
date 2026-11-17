@@ -71,23 +71,21 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   @spec columns([InfluxQL.item()], [map()], [binary()], MapSet.t(binary()), map(), boolean()) ::
           [{binary(), result(), spec()}]
   def columns(aggregates, rows, fields, tags, types, field_columns? \\ false) do
-    tagged = Enum.filter(aggregates, &tag_argument?(&1, tags))
-
     cond do
-      field_columns? and match?([{:aggregate, _fun, "time", _alias}], aggregates) and
-          selector?(elem(hd(aggregates), 1)) ->
-        name_columns(aggregates, rows, fields, tags, types)
-
-      Enum.all?(aggregates, &(tag_argument?(&1, tags) or time_argument?(&1))) ->
+      not (field_columns? and lone_time_selector?(aggregates)) and
+          Enum.all?(aggregates, &(tag_argument?(&1, tags) or time_argument?(&1))) ->
         name_columns(aggregates, [], fields, tags, types)
 
-      tagged == [] ->
-        name_columns(aggregates, rows, fields, tags, types)
+      Enum.any?(aggregates, &tag_argument?(&1, tags)) ->
+        InfluxQLError.refuse("an aggregate of a tag beside others")
 
       true ->
-        InfluxQLError.refuse("an aggregate of a tag beside others")
+        name_columns(aggregates, rows, fields, tags, types)
     end
   end
+
+  defp lone_time_selector?([{:aggregate, fun, "time", _alias}]), do: selector?(fun)
+  defp lone_time_selector?(_aggregates), do: false
 
   @spec name_columns([InfluxQL.item()], [map()], [binary()], MapSet.t(binary()), map()) ::
           [{binary(), result(), spec()}]
@@ -487,16 +485,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   defp pick("first", [point | _rest], field), do: {:value, point[field], point}
   defp pick("last", points, field), do: pick("first", Enum.reverse(points), field)
 
-  defp pick("max", points, field) do
+  defp pick(fun, points, field) when fun in ["max", "min"] do
     point =
-      Enum.reduce(points, fn p, best -> if after?(p[field], best[field]), do: p, else: best end)
-
-    {:value, point[field], point}
-  end
-
-  defp pick("min", points, field) do
-    point =
-      Enum.reduce(points, fn p, best -> if after?(best[field], p[field]), do: p, else: best end)
+      Enum.reduce(points, fn p, best ->
+        if (fun == "max" and after?(p[field], best[field])) or
+             (fun == "min" and after?(best[field], p[field])),
+           do: p,
+           else: best
+      end)
 
     {:value, point[field], point}
   end

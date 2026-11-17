@@ -26,10 +26,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   @numeric ~w(mean sum median spread stddev)
 
   # The type as the library words it: `{in a coercion, as a native type, in a signature}`.
-  @utf8 {"Utf8", "String", "Utf8"}
-  @dictionary {"Dictionary(Int32, Utf8)", "String", "Dictionary(Int32, Utf8)"}
-  @boolean {"Boolean", "Boolean", "Boolean"}
-  @timestamp {"Timestamp(ns)", "Timestamp(Nanosecond, None)", "Timestamp(ns)"}
+  @type_signatures %{
+    string: {"Utf8", "String", "Utf8"},
+    tag: {"Dictionary(Int32, Utf8)", "String", "Dictionary(Int32, Utf8)"},
+    boolean: {"Boolean", "Boolean", "Boolean"},
+    timestamp: {"Timestamp(ns)", "Timestamp(Nanosecond, None)", "Timestamp(ns)"}
+  }
 
   @doc """
   `:ok`, the engine's error as `{:error, {:engine, body}}` (or
@@ -295,19 +297,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     end
   end
 
-  defp text_aggregate_error({:aggregate, fun, _field, _alias}, :string) do
-    {:error, {:engine, "Error during planning: " <> text_signature(fun, @utf8)}}
-  end
-
-  defp text_aggregate_error({:aggregate, fun, _field, _alias}, :tag) do
-    {:error, {:engine, "Error during planning: " <> text_signature(fun, @dictionary)}}
-  end
-
-  defp text_aggregate_error({:aggregate, fun, _field, _alias}, :boolean) do
-    {:error, {:engine, "Error during planning: " <> text_signature(fun, @boolean)}}
-  end
+  defp text_aggregate_error({:aggregate, fun, _field, _alias}, type)
+       when type in [:string, :tag, :boolean],
+       do: signature_error(fun, type)
 
   defp text_aggregate_error(_item, _type), do: nil
+
+  defp signature_error(fun, type) do
+    {:error, {:engine, "Error during planning: " <> text_signature(fun, @type_signatures[type])}}
+  end
 
   @candidates " No function matches the given name and argument types"
   @casts "You might need to add explicit type casts.\n\tCandidate functions:\n\t"
@@ -358,7 +356,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   end
 
   defp time_error({:aggregate, fun, "time", _alias}) when fun in @numeric,
-    do: {:error, {:engine, "Error during planning: " <> text_signature(fun, @timestamp)}}
+    do: signature_error(fun, :timestamp)
 
   defp time_error({:aggregate, "percentile:" <> _rest, "time", _alias}),
     do: {:error, "unsupported InfluxQL (percentile() of time beside a field)"}
@@ -415,13 +413,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   defp column_type(_item, _types), do: nil
 
-  defp text_fill_error(:string, number), do: no_conversion(number, "Utf8")
-  defp text_fill_error(:boolean, number), do: no_conversion(number, "Boolean")
+  defp text_fill_error(type, number) do
+    {type_name, _native, _signature} = @type_signatures[type]
 
-  defp no_conversion(number, type) do
     {:error,
      {:engine, 500,
-      "External error: InfluxQL internal error: no conversion from #{number_text(number)} to #{type}"}}
+      "External error: InfluxQL internal error: no conversion from #{number_text(number)} to #{type_name}"}}
   end
 
   defp number_text(number) when is_integer(number), do: Integer.to_string(number)
@@ -720,8 +717,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   # Whether the list holds no column beside its calls (a plain column makes it the mixing the
   # engine words).
-  defp only_calls?(items),
-    do: Enum.all?(items, &(aggregate?(&1) or InfluxQLNames.time_item?(&1) or constants?(&1)))
+  defp only_calls?(items), do: Enum.all?(items, &call_or_time_or_constant?/1)
+
+  defp call_or_time_or_constant?(item),
+    do: aggregate?(item) or InfluxQLNames.time_item?(item) or constants?(item)
 
   defp of_aggregate?({:transform, _name, inner, _parameter}),
     do: InfluxQLExpr.aggregates(inner) != []
@@ -768,8 +767,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     aggregates = Enum.filter(items, &aggregate?/1)
     calls = Enum.flat_map(items, &calls/1)
 
-    plain =
-      Enum.reject(items, &(aggregate?(&1) or InfluxQLNames.time_item?(&1) or constants?(&1)))
+    plain = Enum.reject(items, &call_or_time_or_constant?/1)
 
     mixed = Enum.filter(aggregates, &reads_beside_call?/1)
 

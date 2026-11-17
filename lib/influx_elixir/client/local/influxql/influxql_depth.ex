@@ -153,24 +153,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLDepth do
     :too_deep -> {:error, message(place)}
   end
 
-  defp message(:where) do
-    costs = @places.where
-
-    "unsupported InfluxQL (a condition nested or chained deeper than " <>
-      "#{costs.budget} units, where InfluxDB 3 Core 3.10.1 overflows its stack: " <>
-      "a call counts #{costs.call}, a sign #{costs.sign}, an arithmetic operator #{costs.arith}, " <>
-      "a comparison #{costs.comparison}, AND/OR #{costs.connective}, " <>
-      "a parenthesis #{costs.paren})"
-  end
-
   defp message(place) do
     costs = @places[place]
 
     "unsupported InfluxQL (#{costs.subject} nested or chained deeper than " <>
       "#{costs.budget} units, where InfluxDB 3 Core 3.10.1 overflows its stack: " <>
       "a call counts #{costs.call}, a sign #{costs.sign}, an arithmetic operator #{costs.arith}, " <>
-      "a parenthesis #{costs.paren}, after an operator #{costs.after_operator})"
+      message_tail(place, costs)
   end
+
+  defp message_tail(:where, costs),
+    do:
+      "a comparison #{costs.comparison}, AND/OR #{costs.connective}, " <>
+        "a parenthesis #{costs.paren})"
+
+  defp message_tail(_place, costs),
+    do: "a parenthesis #{costs.paren}, after an operator #{costs.after_operator})"
 
   @spec where_start(binary()) :: binary() | nil
   defp where_start(<<w, h, e, r, e2, rest::binary>>)

@@ -114,8 +114,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
       {:ok, spec} ->
         {:ok, {:show, Map.put(spec, :statement, influxql)}}
 
-      {:error, {:engine, body}} ->
-        {:error, %{status: 400, body: body}}
+      {:error, {:engine, _body} = reason} ->
+        plan_error(reason)
 
       {:error, message} ->
         {:error, %{status: 400, body: "Client.Local: #{message}: #{influxql}"}}
@@ -662,8 +662,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     copies = Enum.frequencies(names)
     {:ok, names |> Enum.uniq() |> Enum.sort(), copies}
   catch
-    {:refused, {:engine, status, body}} -> {:error, %{status: status, body: body}}
-    {:refused, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+    {:refused, reason} -> plan_error(reason)
   end
 
   @spec influxql_select_one(Store.t(), binary(), InfluxQL.query()) ::
@@ -685,21 +684,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # What the engine raises while it rewrites the statement, before it reads
   # the `WHERE`.
   @spec influxql_early(InfluxQL.query()) :: :ok | {:error, map()}
-  defp influxql_early(query) do
-    case InfluxQL.early_error(query) do
-      :ok -> :ok
-      {:error, {:engine, body}} -> {:error, %{status: 400, body: body}}
-    end
-  end
+  defp influxql_early(query), do: check_step(InfluxQL.early_error(query))
 
   # What the engine raises while it expands the projection, before it splits the `WHERE`.
   @spec influxql_expanding(InfluxQL.query(), map(), MapSet.t(binary())) :: :ok | {:error, map()}
-  defp influxql_expanding(query, types, tags) do
-    case InfluxQL.expand_errors(query, types, tags) do
-      :ok -> :ok
-      {:error, {:engine, body}} -> {:error, %{status: 400, body: body}}
-    end
-  end
+  defp influxql_expanding(query, types, tags),
+    do: check_step(InfluxQL.expand_errors(query, types, tags))
 
   defp influxql_planned(table, database, query, types, tags, now) do
     with :ok <- influxql_expanding(query, types, tags),
@@ -765,12 +755,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
           {:ok, InfluxQL.query()} | :empty | {:error, map()}
   defp influxql_wild(query, types, tags) do
     case InfluxQLWild.expand(query, types, tags) do
-      {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+      {:error, message} -> plan_error(message)
       other -> other
     end
   catch
-    {:refused, {:engine, status, body}} -> {:error, %{status: status, body: body}}
-    {:refused, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+    {:refused, reason} -> plan_error(reason)
   end
 
   # The transforms that compare with the bucket before scan one bucket before
@@ -779,7 +768,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp influxql_lookback(query) do
     case InfluxQL.lookback(query) do
       {:ok, extend} -> {:ok, extend}
-      {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}"}}
+      {:error, message} -> plan_error(message)
     end
   end
 
@@ -867,12 +856,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   # The engine's planning error for a select item that is a constant, raised
   # after the `WHERE` is planned and before `LIMIT` is.
   @spec influxql_items(InfluxQL.query(), map(), MapSet.t(binary())) :: :ok | {:error, map()}
-  defp influxql_items(query, types, tags) do
-    case InfluxQL.plan_select(query, types, tags) do
-      :ok -> :ok
-      {:error, reason} -> plan_error(reason)
-    end
-  end
+  defp influxql_items(query, types, tags),
+    do: check_step(InfluxQL.plan_select(query, types, tags))
+
+  defp check_step(:ok), do: :ok
+  defp check_step({:error, reason}), do: plan_error(reason)
 
   defp plan_error({:engine, body}), do: {:error, %{status: 400, body: body}}
   defp plan_error({:engine, status, body}), do: {:error, %{status: status, body: body}}
@@ -1274,9 +1262,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp influxql_parse(raw, influxql) do
     case InfluxQL.parse(raw) do
       {:ok, query} -> {:ok, query}
-      {:error, {:engine, body}} -> {:error, %{status: 400, body: body}}
-      {:error, {:engine, status, body}} -> {:error, %{status: status, body: body}}
-      {:error, message} -> {:error, %{status: 400, body: "Client.Local: #{message}: #{influxql}"}}
+      {:error, message} when is_binary(message) -> plan_error("#{message}: #{influxql}")
+      {:error, reason} -> plan_error(reason)
     end
   end
 end

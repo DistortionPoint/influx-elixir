@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Consolidated duplicate helpers and clauses across `Client.Local` (`InfluxQLAggregate`, `InfluxQLArithmetic`, `InfluxQLDepth`, `InfluxQLExpr`, `InfluxQLNested`, `InfluxQLParser`, `InfluxQLPlan`, `InfluxQLQuery`, `InfluxQLRun`, and `InfluxQLWhere`).**
+  Unified `columns/6` via `lone_time_selector?/1` and combined `pick/3` for `"max"` and `"min"` in `InfluxQLAggregate`, delegated `planner_kind/1` to `kind(expr, false)` in `InfluxQLArithmetic`, unified `message/1` via `message_tail/2` in `InfluxQLDepth`, simplified `limit_error/2`, `wildcard_arguments/2`, and `classify_wild/1` in `InfluxQLExpr`, reused `unsigned_column?/3` and collapsed duplicate `:expression` branches in `InfluxQLNested`, removed the duplicate `@known_statements` regex attribute in `InfluxQLParser`, consolidated `@type_signatures`, `signature_error/2`, `text_fill_error/2`, and `call_or_time_or_constant?/1` in `InfluxQLPlan`, unified statement-error wrapping via `check_step/1` and `plan_error/1` in `InfluxQLQuery`, reused `computed/3` and `lone_selector?/1` and combined `mark_bucket/1` clauses in `InfluxQLRun`, and delegated symmetric `tag_comparison/2` clauses in `InfluxQLWhere`.
+
 ## [0.1.68] - 2026-11-16
 
 ### Changed
