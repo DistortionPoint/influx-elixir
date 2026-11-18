@@ -167,6 +167,36 @@ defmodule InfluxElixir.Client.Local.SQLError do
     do: %{status: 400, body: @coercion <> "caused by\nError during planning: " <> message}
 
   @doc """
+  The engine's type coercion error when a `CASE` `WHEN` condition cannot be converted to
+  `Boolean`.
+  """
+  @spec when_coercion(binary()) :: t()
+  def when_coercion(message) do
+    %{
+      status: 400,
+      body:
+        @coercion <>
+          "caused by\nWHEN expressions in CASE couldn't be converted to common type (Boolean)\n" <>
+          "caused by\nError during planning: " <> message
+    }
+  end
+
+  @doc """
+  Appends DataFusion's `No function matches the given name and argument types ...`
+  tail and candidate function list to `head`.
+  """
+  @spec no_function_matches(binary(), binary() | atom(), [binary()] | binary(), binary()) ::
+          binary()
+  def no_function_matches(head, name, types, candidates) when is_list(types),
+    do: no_function_matches(head, name, Enum.join(types, ", "), candidates)
+
+  def no_function_matches(head, name, types, candidates) when is_binary(types) do
+    head <>
+      " No function matches the given name and argument types '#{name}(#{types})'. " <>
+      "You might need to add explicit type casts.\n\tCandidate functions:\n\t" <> candidates
+  end
+
+  @doc """
   The engine's SQL tokenizer error at a position: `SQL error:
   TokenizerError("<message> at Line: <line>, Column: <column>")`.
   """

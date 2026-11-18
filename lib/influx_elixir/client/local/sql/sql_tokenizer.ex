@@ -220,15 +220,12 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
 
   defp tokenize(<<c::utf8, _rest::binary>> = text, line, col, acc) do
     cond do
-      c in ?0..?9 or (c == ?. and digit_next?(text)) -> number(text, line, col, acc)
+      SQLIdentifiers.number_start?(text) -> number(text, line, col, acc)
       SQLIdentifiers.word_start?(c) -> word(text, line, col, acc)
       c == ?$ -> placeholder(text, line, col, acc)
       true -> symbol(text, line, col, acc)
     end
   end
-
-  @spec digit_next?(binary()) :: boolean()
-  defp digit_next?(text), do: match?(<<?., d, _rest::binary>> when d in ?0..?9, text)
 
   @spec block_comment(binary(), pos_integer(), pos_integer(), pos_integer(), tokens()) ::
           result()

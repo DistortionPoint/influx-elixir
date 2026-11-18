@@ -104,10 +104,10 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   defp tokens(<<c::utf8, _rest::binary>> = text, acc) do
     cond do
       SQLIdentifiers.word_start?(c) ->
-        [word] = Regex.run(~r/\A[\p{L}_][\p{L}\p{N}_$]*/u, text)
-        tokens(tail(text, word), [{:word, word} | acc])
+        {word, rest} = SQLIdentifiers.take_span(text, true)
+        tokens(rest, [{:word, word} | acc])
 
-      c in ?0..?9 or (c == ?. and digit_next?(text)) ->
+      SQLIdentifiers.number_start?(text) ->
         {number, rest} = SQLIdentifiers.take_number(text)
         tokens(rest, [{:other, number} | acc])
 
@@ -116,9 +116,6 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
         tokens(tail(text, symbol), [{:symbol, symbol} | acc])
     end
   end
-
-  @spec digit_next?(binary()) :: boolean()
-  defp digit_next?(text), do: match?(<<?., d, _rest::binary>> when d in ?0..?9, text)
 
   @spec tail(binary(), binary()) :: binary()
   defp tail(text, taken),
@@ -232,18 +229,10 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   @spec drop_target([token()]) :: [token()]
   defp drop_target(tokens) do
     tokens
-    |> drop_words(["TEMP", "TEMPORARY"])
-    |> drop_words(["UNLOGGED"])
-    |> drop_words(["TABLE"])
+    |> skip_words(["TEMP", "TEMPORARY"])
+    |> skip_words(["UNLOGGED"])
+    |> skip_words(["TABLE"])
     |> drop_name()
-  end
-
-  @spec drop_words([token()], [binary()]) :: [token()]
-  defp drop_words(tokens, words) do
-    case Enum.drop_while(tokens, &space?/1) do
-      [{:word, word} | rest] = found -> if String.upcase(word) in words, do: rest, else: found
-      other -> other
-    end
   end
 
   @spec drop_name([token()]) :: [token()]

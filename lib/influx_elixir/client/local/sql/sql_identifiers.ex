@@ -89,6 +89,12 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
     end
   end
 
+  @doc "Whether `text` begins with a number token (a digit, or `.` followed by a digit)."
+  @spec number_start?(binary()) :: boolean()
+  def number_start?(<<c, _rest::binary>>) when c in ?0..?9, do: true
+  def number_start?(<<?., d, _rest::binary>>) when d in ?0..?9, do: true
+  def number_start?(_text), do: false
+
   @doc """
   The number token at the start of a text that begins with a digit, or with a `.` and a
   digit, and the text after it: the one definition of where a number ends (see the module

@@ -101,38 +101,33 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   end
 
   defp problem(name, []) when name in [:lower, :upper, :starts_with],
-    do:
-      {:planning, "'#{name}' does not support zero arguments", Atom.to_string(name),
-       text_candidate(name)}
+    do: zero_args_problem(Atom.to_string(name), text_candidate(name))
 
   defp problem(:length, []),
-    do:
-      {:planning, "'character_length' does not support zero arguments", "character_length",
-       length_candidate()}
+    do: zero_args_problem("character_length", length_candidate())
 
   defp problem(name, []) when name in [:left, :right],
-    do:
-      {:planning, "'#{name}' does not support zero arguments", Atom.to_string(name),
-       slice_candidates(name)}
+    do: zero_args_problem(Atom.to_string(name), slice_candidates(name))
 
   defp problem(name, []) when name in [:sqrt, :ln],
-    do:
-      {:planning, "'#{name}' does not support zero arguments", Atom.to_string(name),
-       "#{name}(Float64/Float32)"}
+    do: zero_args_problem(Atom.to_string(name), "#{name}(Float64/Float32)")
 
   defp problem(name, []) when name in [:pow, :power],
-    do: {:planning, "'power' does not support zero arguments", "power", power_candidates()}
+    do: zero_args_problem("power", power_candidates())
 
   defp problem(:log, []),
-    do:
-      {:planning, "'log' does not support zero arguments", "log",
-       Enum.join(@log_candidates, "\n\t")}
+    do: zero_args_problem("log", Enum.join(@log_candidates, "\n\t"))
 
   defp problem(:substr, types), do: substr_problem(types)
 
   defp problem(name, types) do
     if Enum.any?(types, &is_nil/1), do: unknown(name, types), else: typed_problem(name, types)
   end
+
+  @spec zero_args_problem(binary(), binary()) ::
+          {:planning, binary(), binary(), binary()}
+  defp zero_args_problem(shown, candidates),
+    do: {:planning, "'#{shown}' does not support zero arguments", shown, candidates}
 
   # The wrong number of arguments of a call whose types are not all known
   # cannot be worded.
@@ -211,9 +206,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
         :ok
 
       first == "Timestamp(ns)" ->
-        {:refuse,
-         "#{name} of a timestamp: the engine writes its nanoseconds as text, which the " <>
-           "double keeps only to the microsecond"}
+        timestamp_text_refusal(name)
 
       count in @integer_arguments or count == "Null" ->
         :ok
@@ -226,11 +219,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   defp text_problem(name, types) when name in [:left, :right], do: slice_failure(name, types)
 
   @spec length_problem([binary()]) :: problem()
-  defp length_problem(["Timestamp(ns)"]),
-    do:
-      {:refuse,
-       "length of a timestamp: the engine writes its nanoseconds as text, which the double " <>
-         "keeps only to the microsecond"}
+  defp length_problem(["Timestamp(ns)"]), do: timestamp_text_refusal(:length)
 
   defp length_problem([type]) do
     if SQLNativeType.struct?(type), do: {:convert, type}, else: :ok
@@ -241,6 +230,13 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
      "Failed to coerce arguments to satisfy a call to 'character_length' function: coercion " <>
        "from #{Enum.join(types, ", ")} to the signature Uniform(1, [Utf8, LargeUtf8, Utf8View]) " <>
        "failed", "character_length", length_candidate()}
+  end
+
+  @spec timestamp_text_refusal(atom()) :: {:refuse, binary()}
+  defp timestamp_text_refusal(name) do
+    {:refuse,
+     "#{name} of a timestamp: the engine writes its nanoseconds as text, which the double " <>
+       "keeps only to the microsecond"}
   end
 
   @spec math_problem(atom(), [binary()]) :: problem()
@@ -501,14 +497,11 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
         ) :: map()
   defp error(kind, head, shown, types, candidates, context) do
     head = word(kind, head)
-
-    tail =
-      " No function matches the given name and argument types '#{shown}(#{Enum.join(types, ", ")})'. " <>
-        "You might need to add explicit type casts.\n\tCandidate functions:\n\t" <> candidates
+    full = SQLError.no_function_matches(head, shown, types, candidates)
 
     case context do
-      :select -> SQLError.planning(head <> tail)
-      :where -> SQLError.coercion(head <> tail)
+      :select -> SQLError.planning(full)
+      :where -> SQLError.coercion(full)
       _cut -> cut(kind, head)
     end
   end

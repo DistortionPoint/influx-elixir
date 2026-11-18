@@ -1331,7 +1331,9 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
           "Boolean"
 
         true ->
-          logical_error("logical boolean operation #{left_type} #{word(kind)} #{right_type}")
+          logical_error(
+            "logical boolean operation #{left_type} #{SQLExpr.symbol(kind)} #{right_type}"
+          )
       end
     end
   end
@@ -1366,10 +1368,6 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   @spec regex?(term()) :: boolean()
   defp regex?({:pattern, kind, _operand, _rest}), do: kind in [:regex, :not_regex]
   defp regex?(_item), do: false
-
-  @spec word(:and | :or) :: binary()
-  defp word(:and), do: "AND"
-  defp word(:or), do: "OR"
 
   @spec logical_error(binary()) :: {:error, map()}
   defp logical_error(operation),
@@ -1597,7 +1595,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
           value_type(right, columns)} do
       {column, value} when is_binary(column) and is_binary(value) ->
         cond do
-          boolean_mismatch?(column, value) ->
+          SQLExprCheck.incompatible?(column, value) ->
             {:error,
              SQLError.coercion(
                "Cannot infer common argument type for comparison operation " <>
@@ -1673,23 +1671,6 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
     do: SQLExprType.known_type(expr, columns) || :unknown
 
   defp value_type(value, _columns), do: value_type(value)
-
-  @spec boolean_mismatch?(binary(), binary()) :: boolean()
-  defp boolean_mismatch?(left, right),
-    do:
-      left == "Boolean" != (right == "Boolean") or
-        SQLNativeType.struct?(left) != SQLNativeType.struct?(right) or
-        timestamp_and_number?(left, right)
-
-  # A number has no order against a timestamp (verified: `max(time) > 5`, `max(time) > count(*)`
-  # and `5 < min(time)` are all the type error).
-  @spec timestamp_and_number?(binary(), binary()) :: boolean()
-  defp timestamp_and_number?(left, right) do
-    numbers = ["Int64", "UInt64", "Float64"]
-
-    ("Timestamp(ns)" == left and right in numbers) or
-      ("Timestamp(ns)" == right and left in numbers)
-  end
 
   @spec timestamp_texts(SQLParser.expr(), [term()], %{binary() => binary()}) ::
           :ok | {:error, map()}
@@ -1769,13 +1750,13 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp aggregate_refusal(_agg, type) when is_numeric_type(type), do: :ok
 
   defp aggregate_refusal(agg, type) do
-    name = Atom.to_string(agg)
-
     planning_error(
-      aggregate_head(agg, type) <>
-        " No function matches the given name and argument types '#{name}(#{type})'. " <>
-        "You might need to add explicit type casts.\n\tCandidate functions:\n\t" <>
-        aggregate_candidate(agg),
+      SQLError.no_function_matches(
+        aggregate_head(agg, type),
+        agg,
+        [type],
+        aggregate_candidate(agg)
+      ),
       :select
     )
   end

@@ -924,11 +924,8 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   defp render_form({:cmp, op, left, right}, qualifier, casts),
     do: join([left, symbol(op), right], qualifier, casts)
 
-  defp render_form({:and, left, right}, qualifier, casts),
-    do: join([left, "AND", right], qualifier, casts)
-
-  defp render_form({:or, left, right}, qualifier, casts),
-    do: join([left, "OR", right], qualifier, casts)
+  defp render_form({kind, left, right}, qualifier, casts) when kind in [:and, :or],
+    do: join([left, symbol(kind), right], qualifier, casts)
 
   defp render_form({:concat, left, right}, qualifier, casts),
     do: join([left, "||", right], qualifier, casts)
@@ -1018,8 +1015,10 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   defp qualified({:qualified, qualifier, column}, _qualifier), do: qualifier <> "." <> column
   defp qualified(name, qualifier), do: qualifier <> "." <> name
 
-  @doc "The SQL symbol of an arithmetic or a comparison operator."
-  @spec symbol(:+ | :- | :* | :/ | :rem | comparison()) :: binary()
+  @doc "The SQL symbol of an arithmetic, comparison, or boolean operator."
+  @spec symbol(:+ | :- | :* | :/ | :rem | :and | :or | comparison()) :: binary()
+  def symbol(:and), do: "AND"
+  def symbol(:or), do: "OR"
   def symbol(:rem), do: "%"
   def symbol(:eq), do: "="
   def symbol(:ne), do: "!="

@@ -78,14 +78,7 @@ defmodule InfluxElixir.Client.Local.SQLConstantCall do
   # The type coercion's error. A call that is a `WHEN` condition by itself fails when the
   # condition is made a boolean, which the engine says.
   @spec coercion(binary(), ancestors()) :: map()
-  defp coercion(message, [:when | _above]) do
-    %{
-      status: 400,
-      body:
-        "type_coercion\ncaused by\nWHEN expressions in CASE couldn't be converted to common " <>
-          "type (Boolean)\ncaused by\nError during planning: " <> message
-    }
-  end
+  defp coercion(message, [:when | _above]), do: SQLError.when_coercion(message)
 
   defp coercion(message, _ancestors), do: SQLError.coercion(message)
 

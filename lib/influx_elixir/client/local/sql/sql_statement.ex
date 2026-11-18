@@ -493,16 +493,14 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # A number as the tokenizer prints it (see `SQLIdentifiers.take_number/1`): as written, and
   # a hexadecimal one as `X'<digits>'`.
   @spec number(binary()) :: {:ok, binary()} | nil
-  defp number(<<c, _rest::binary>> = text) when c in ?0..?9 or c == ?. do
-    unless Regex.match?(~r/\A\.\D|\A\.\z/, text) do
+  defp number(text) do
+    if SQLIdentifiers.number_start?(text) do
       case SQLIdentifiers.take_number(text) do
         {"0x" <> digits, _rest} -> {:ok, "X'#{digits}'"}
         {token, _rest} -> {:ok, token}
       end
     end
   end
-
-  defp number(_text), do: nil
 
   @spec quoted(binary(), Regex.t(), binary()) :: {:ok, binary()} | nil
   defp quoted(rest, pattern, quote_mark) do

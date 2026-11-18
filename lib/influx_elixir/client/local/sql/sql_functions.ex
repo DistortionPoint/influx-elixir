@@ -111,11 +111,11 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
 
   # The magnitude of the `Int64` minimum overflows, whether the engine folds
   # a constant or reads a column (verified): it closes the connection.
-  defp compute(:abs, [SQLLimits.int64_min()]), do: throw({:query_error, SQLError.closed()})
+  defp compute(:abs, [SQLLimits.int64_min()]), do: closed()
 
   defp compute(:abs, [{:int, bits, x}]) do
     if x == SQLNumber.minimum(bits),
-      do: throw({:query_error, SQLError.closed()}),
+      do: closed(),
       else: {:int, bits, Kernel.abs(x)}
   end
 
@@ -134,7 +134,7 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   defp compute(:round, [x, scale]) do
     if SQLCast.fits?(scale, 32),
       do: scaled(SQLNumber.to_float(x), scale),
-      else: throw({:query_error, SQLError.closed()})
+      else: closed()
   end
 
   # With a scale `trunc` rounds, exactly as `round` does (verified over a
@@ -313,29 +313,29 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
 
   @spec planning(name(), [binary()], binary(), context()) :: {:error, map()}
   defp planning(name, types, head, context) do
-    tail =
-      " No function matches the given name and argument types " <>
-        "'#{name}(#{Enum.join(types, ", ")})'. You might need to add explicit type casts.\n" <>
-        "\tCandidate functions:\n" <> candidates(name)
+    full = SQLError.no_function_matches(head, name, types, candidates(name))
 
     error =
       case context do
-        :where -> SQLError.coercion(head <> tail)
+        :where -> SQLError.coercion(full)
         cut when cut in [:order_by, :where_cut, :select_cut] -> SQLError.coercion(head)
-        :select -> SQLError.planning(head <> tail)
+        :select -> SQLError.planning(full)
       end
 
     {:error, error}
   end
 
   @spec candidates(name()) :: binary()
-  defp candidates(:abs), do: "\tabs(Numeric(1))"
+  defp candidates(:abs), do: "abs(Numeric(1))"
 
   defp candidates(:round),
-    do: "\tround(Float64, Int64)\n\tround(Float32, Int64)\n\tround(Float64)\n\tround(Float32)"
+    do: "round(Float64, Int64)\n\tround(Float32, Int64)\n\tround(Float64)\n\tround(Float32)"
 
   defp candidates(:trunc),
-    do: "\ttrunc(Float32, Int64)\n\ttrunc(Float64, Int64)\n\ttrunc(Float64)\n\ttrunc(Float32)"
+    do: "trunc(Float32, Int64)\n\ttrunc(Float64, Int64)\n\ttrunc(Float64)\n\ttrunc(Float32)"
 
-  defp candidates(name), do: "\t#{name}(Float64/Float32)"
+  defp candidates(name), do: "#{name}(Float64/Float32)"
+
+  @spec closed() :: no_return()
+  defp closed, do: throw({:query_error, SQLError.closed()})
 end

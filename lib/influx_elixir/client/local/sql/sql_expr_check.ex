@@ -131,7 +131,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     case {raw_type(left, columns), raw_type(right, columns)} do
       {l, r} when is_binary(l) and is_binary(r) and (l not in @logical or r not in @logical) ->
         planner(
-          "Cannot infer common argument type for logical boolean operation #{l} #{word(kind)} #{r}",
+          "Cannot infer common argument type for logical boolean operation #{l} #{SQLExpr.symbol(kind)} #{r}",
           context
         )
 
@@ -413,23 +413,21 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   @spec text?(binary()) :: boolean()
   defp text?(type), do: SQLCommonType.text?(type)
 
-  # Two types the engine finds no common type for in an `IN`, a `BETWEEN` or an
-  # `IS DISTINCT FROM`: a boolean with anything else, a timestamp with a number. The null
-  # has a common type with every type (verified: `b IN (NULL, NULL)` and `b IN (NULL, b)` plan).
+  @doc """
+  Whether two Arrow types have no common type in a comparison, `IN`, `BETWEEN`, or
+  `IS DISTINCT FROM`: a boolean with anything else, a struct with a non-struct, or a
+  timestamp with a number. `Null` is compatible with every type.
+  """
   @spec incompatible?(binary(), binary()) :: boolean()
-  defp incompatible?("Null", _right), do: false
-  defp incompatible?(_left, "Null"), do: false
+  def incompatible?("Null", _right), do: false
+  def incompatible?(_left, "Null"), do: false
 
-  defp incompatible?(left, right) do
+  def incompatible?(left, right) do
     left == "Boolean" != (right == "Boolean") or
       SQLNativeType.struct?(left) != SQLNativeType.struct?(right) or
       ("Timestamp(ns)" in [left, right] and
          Enum.any?([left, right], &SQLExprType.numeric?/1))
   end
-
-  @spec word(:and | :or) :: binary()
-  defp word(:and), do: "AND"
-  defp word(:or), do: "OR"
 
   # Whether either side of a comparison is a bound `$name`: a non-negative integer one is a
   # `{:uint, n}`, which no literal is unless it is past `Int64` (taken for a literal).
@@ -543,16 +541,8 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   end
 
   @spec uncastable_error(binary()) :: {:error, map()}
-  defp uncastable_error(type) do
-    {:error,
-     %{
-       status: 400,
-       body:
-         "type_coercion\ncaused by\nWHEN expressions in CASE couldn't be converted to common " <>
-           "type (Boolean)\ncaused by\nError during planning: Cannot automatically convert " <>
-           "#{type} to Boolean"
-     }}
-  end
+  defp uncastable_error(type),
+    do: {:error, SQLError.when_coercion("Cannot automatically convert #{type} to Boolean")}
 
   # The types a `CASE` condition cannot be cast to a boolean from (a number or text can).
   @spec uncastable_condition?(SQLExprType.type()) :: boolean()
@@ -614,10 +604,13 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
           :ok | {:error, map()}
   defp check_coalesce([], _columns, context) do
     planner(
-      "Execution error: Function 'coalesce' user-defined coercion failed with \"Execution error: " <>
-        "coalesce must have at least one argument\" No function matches the given name and " <>
-        "argument types 'coalesce()'. You might need to add explicit type casts.\n" <>
-        "\tCandidate functions:\n\tcoalesce(UserDefined)",
+      SQLError.no_function_matches(
+        "Execution error: Function 'coalesce' user-defined coercion failed with " <>
+          "\"Execution error: coalesce must have at least one argument\"",
+        :coalesce,
+        [],
+        "coalesce(UserDefined)"
+      ),
       context
     )
   end
@@ -672,11 +665,14 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
        when is_binary(first) and is_binary(second) and first != second do
     if "Boolean" in types and not (first == "Boolean" and second == "Boolean") do
       planner(
-        "Execution error: Function 'coalesce' user-defined coercion failed with " <>
-          "\"Execution error: Fail to find the coerced type, errors: Some(Execution(" <>
-          "\\\"Expect to get struct but got #{first}\\\"))\" No function matches the given " <>
-          "name and argument types 'coalesce(#{first}, #{second})'. You might need to add " <>
-          "explicit type casts.\n\tCandidate functions:\n\tcoalesce(UserDefined)",
+        SQLError.no_function_matches(
+          "Execution error: Function 'coalesce' user-defined coercion failed with " <>
+            "\"Execution error: Fail to find the coerced type, errors: Some(Execution(" <>
+            "\\\"Expect to get struct but got #{first}\\\"))\"",
+          :coalesce,
+          types,
+          "coalesce(UserDefined)"
+        ),
         context
       )
     else
@@ -715,11 +711,8 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   end
 
   @spec nullif_arity(binary(), binary()) :: binary()
-  defp nullif_arity(head, names) do
-    head <>
-      " No function matches the given name and argument types 'nullif(#{names})'. " <>
-      "You might need to add explicit type casts.\n\tCandidate functions:\n\tnullif(Comparable(2))"
-  end
+  defp nullif_arity(head, names),
+    do: SQLError.no_function_matches(head, :nullif, names, "nullif(Comparable(2))")
 
   @spec nullif_types([SQLExprType.type()], context()) :: :ok | {:error, map()}
   defp nullif_types([first, second] = types, context)
