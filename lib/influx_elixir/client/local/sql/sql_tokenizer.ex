@@ -122,8 +122,8 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
       <<"--", _after::binary>> ->
         split(sql, skip_line(sql, pos + 2), start, acc)
 
-      <<"/*", _after::binary>> ->
-        split(sql, skip_comment(sql, pos + 2, 1), start, acc)
+      <<"/*", after_open::binary>> ->
+        split(sql, skip_comment(sql, after_open), start, acc)
 
       <<?$, _after::binary>> ->
         split(sql, skip_dollar(sql, pos, rest), start, acc)
@@ -155,32 +155,19 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
     end
   end
 
-  defp skip_comment(sql, pos, _depth) when pos >= byte_size(sql), do: byte_size(sql)
-
-  defp skip_comment(sql, pos, depth) do
-    case binary_part(sql, pos, min(2, byte_size(sql) - pos)) do
-      "*/" -> if depth == 1, do: pos + 2, else: skip_comment(sql, pos + 2, depth - 1)
-      "/*" -> skip_comment(sql, pos + 2, depth + 1)
-      _other -> skip_comment(sql, pos + 1, depth)
+  defp skip_comment(sql, body) do
+    case SQLLexer.skip_block(body) do
+      {:ok, rest} -> byte_size(sql) - byte_size(rest)
+      :error -> byte_size(sql)
     end
   end
 
   # A dollar-quoted string, or the position after a placeholder's `$`.
   defp skip_dollar(sql, pos, <<?$, after_dollar::binary>> = rest) do
-    size = tag_length(after_dollar, 0)
-
-    case after_dollar do
-      <<_tag::binary-size(size), ?$, _tail::binary>> ->
-        open = binary_part(rest, 0, size + 2)
-        after_open = pos + size + 2
-
-        case :binary.match(sql, open, scope: {after_open, byte_size(sql) - after_open}) do
-          {at, length} -> at + length
-          :nomatch -> byte_size(sql)
-        end
-
-      _no_close ->
-        pos + 1
+    case dollar_string(rest, after_dollar) do
+      {:ok, raw} -> pos + byte_size(raw)
+      :none -> pos + 1
+      :bail -> byte_size(sql)
     end
   end
 
@@ -283,11 +270,14 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   @doc "The line and column after `text`, which starts at `{line, col}`."
   @spec advance(position(), binary()) :: position()
   def advance({line, col}, text) do
-    case String.split(text, "\n") do
-      [single] -> {line, col + String.length(single)}
-      parts -> {line + length(parts) - 1, String.length(List.last(parts)) + 1}
+    case :binary.split(text, "\n", [:global]) do
+      [single] -> {line, col + characters(single)}
+      parts -> {line + length(parts) - 1, characters(List.last(parts)) + 1}
     end
   end
+
+  @spec characters(binary()) :: non_neg_integer()
+  defp characters(text), do: text |> String.codepoints() |> length()
 
   # `0x1F` is a binary value to the engine, printed `X'1F'`, which the double refuses by
   # name once the text reads; any other number prints as written, with its `L`.
@@ -315,8 +305,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   # decoded, `E'a'b'` for `E'a''b'`), `N'..'` and the others are not.
   @spec word(binary(), pos_integer(), pos_integer(), tokens()) :: result()
   defp word(text, line, col, acc) do
-    literal = binary_part(text, 0, word_length(text, 0))
-    after_word = binary_tail(text, literal)
+    {literal, after_word} = SQLIdentifiers.take_span(text, true)
 
     cond do
       char = not_a_letter(literal) ->
@@ -352,12 +341,6 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   defp unread(<<c::utf8, _rest::binary>>) when c >= 128, do: {:unread, <<c::utf8>>}
   defp unread(_text), do: :bail
 
-  # The bytes of the word at the start of `text` (a letter or `_`, then letters, digits, `_`
-  # and `$`). Read by walking the bytes: a regex over the whole rest of the text validates all
-  # of it as UTF-8 at every word, which makes a long statement cost the square of its length.
-  @spec word_length(binary(), non_neg_integer()) :: non_neg_integer()
-  defp word_length(text, size), do: span_length(text, true, size)
-
   @spec escape_string(binary(), binary(), pos_integer(), pos_integer(), tokens()) ::
           result()
   defp escape_string(text, <<?', body::binary>>, line, col, acc) do
@@ -383,7 +366,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
         raw_token(text, raw, :literal, raw, line, col, acc)
 
       :none ->
-        literal = binary_part(text, 0, 1 + tag_length(rest, 0))
+        literal = binary_part(text, 0, 1 + SQLIdentifiers.span_length(rest))
         emit(text, literal, :placeholder, line, col, acc)
 
       :bail ->
@@ -394,7 +377,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   # `$$..$$` and `$tag$..$tag$`, as written.
   @spec dollar_string(binary(), binary()) :: {:ok, binary()} | :none | :bail
   defp dollar_string(text, after_dollar) do
-    size = tag_length(after_dollar, 0)
+    size = SQLIdentifiers.span_length(after_dollar)
 
     case after_dollar do
       <<_tag::binary-size(size), ?$, _rest::binary>> ->
@@ -409,21 +392,6 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
         :none
     end
   end
-
-  # The bytes of the tag or name at the start of `text`: letters, digits and `_` of any script.
-  # Walked, not matched: a regex over the whole rest of the text validates all of it as UTF-8
-  # at every `$`, which costs the square of the statement's length in placeholders.
-  @spec tag_length(binary(), non_neg_integer()) :: non_neg_integer()
-  defp tag_length(text, size), do: span_length(text, false, size)
-
-  @spec span_length(binary(), boolean(), non_neg_integer()) :: non_neg_integer()
-  defp span_length(<<c::utf8, rest::binary>>, allow_dollar?, size) do
-    if SQLIdentifiers.word_char?(c) or (allow_dollar? and c == ?$),
-      do: span_length(rest, allow_dollar?, size + byte_size(<<c::utf8>>)),
-      else: size
-  end
-
-  defp span_length(_end_or_invalid, _allow_dollar?, size), do: size
 
   @spec symbol(binary(), pos_integer(), pos_integer(), tokens()) :: result()
   defp symbol(text, line, col, acc) do

@@ -54,7 +54,7 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
   end
 
   defp scan(<<?$, rest::binary>>, acc) do
-    {name, rest} = take_word(rest, [])
+    {name, rest} = take_span(rest)
     scan(rest, [[?$, name] | acc])
   end
 
@@ -64,8 +64,8 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
 
   defp scan(<<c::utf8, rest::binary>> = sql, acc) do
     if word_start?(c) do
-      {word, rest} = take_word(sql, [])
-      scan(rest, [String.downcase(IO.iodata_to_binary(word), :ascii) | acc])
+      {word, rest} = take_span(sql)
+      scan(rest, [String.downcase(word, :ascii) | acc])
     else
       scan(rest, [<<c::utf8>> | acc])
     end
@@ -138,14 +138,30 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
 
   defp take_quoted(_text, _mark, _whole, _at), do: :error
 
-  # An identifier starts with a letter or `_` and goes on with letters,
-  # digits and `_`, in any script.
-  @spec take_word(binary(), iodata()) :: {iodata(), binary()}
-  defp take_word(<<c::utf8, rest::binary>> = input, acc) do
-    if word_char?(c), do: take_word(rest, [<<c::utf8>> | acc]), else: {Enum.reverse(acc), input}
+  @doc """
+  The byte length of the prefix of `text` made of characters `word_char?/1`
+  accepts (and `$` when `allow_dollar?` is `true`).
+  """
+  @spec span_length(binary(), boolean(), non_neg_integer()) :: non_neg_integer()
+  def span_length(text, allow_dollar? \\ false, size \\ 0)
+
+  def span_length(<<c::utf8, rest::binary>>, allow_dollar?, size) do
+    if word_char?(c) or (allow_dollar? and c == ?$),
+      do: span_length(rest, allow_dollar?, size + byte_size(<<c::utf8>>)),
+      else: size
   end
 
-  defp take_word(rest, acc), do: {Enum.reverse(acc), rest}
+  def span_length(_end_or_invalid, _allow_dollar?, size), do: size
+
+  @doc """
+  Splits `text` into the prefix of `word_char?/1` characters (and `$` when
+  `allow_dollar?` is `true`) and the remainder.
+  """
+  @spec take_span(binary(), boolean()) :: {binary(), binary()}
+  def take_span(text, allow_dollar? \\ false) do
+    size = span_length(text, allow_dollar?, 0)
+    {binary_part(text, 0, size), binary_part(text, size, byte_size(text) - size)}
+  end
 
   # The characters beyond ASCII that are letters (`\p{L}`), and letters or numbers (`\p{L}` and
   # `\p{N}`), as ranges `{first, last}` found once, when this module is compiled, by the regular
@@ -225,11 +241,8 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
   # Whether the name is one word: a start, then characters that go on a word (the same tables
   # that read a word in a text).
   @spec plain_word?(binary()) :: boolean()
-  defp plain_word?(<<first::utf8, rest::binary>>), do: word_start?(first) and word_chars?(rest)
-  defp plain_word?(_name), do: false
+  defp plain_word?(<<first::utf8, rest::binary>>),
+    do: word_start?(first) and span_length(rest) == byte_size(rest)
 
-  @spec word_chars?(binary()) :: boolean()
-  defp word_chars?(<<>>), do: true
-  defp word_chars?(<<char::utf8, rest::binary>>), do: word_char?(char) and word_chars?(rest)
-  defp word_chars?(_name), do: false
+  defp plain_word?(_name), do: false
 end

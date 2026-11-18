@@ -22,7 +22,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   # whose end is missing. A text with no statement is the planner's 400, and
   # one with several is the engine's 405.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLIdentifiers, SQLLiteral}
+  alias InfluxElixir.Client.Local.{SQLError, SQLIdentifiers, SQLLiteral, SQLTokenizer}
 
   @typep state :: %{whole: binary(), statements: [binary()]}
 
@@ -105,7 +105,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   # escape string; `E'` or `e'` at the start of a token does.
   defp scan(<<c::utf8, rest::binary>> = input, state, chunk) do
     if SQLIdentifiers.word_char?(c) do
-      {word, after_word} = take_word(input)
+      {word, after_word} = SQLIdentifiers.take_span(input, true)
 
       case after_word do
         <<?', body::binary>> when word in ["E", "e"] ->
@@ -132,7 +132,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   # string.
   @spec placeholder(binary(), state(), iodata()) :: {:ok, [binary()]} | {:error, SQLError.t()}
   defp placeholder(rest, state, chunk) do
-    {name, after_name} = take_word_chars(rest, false, [])
+    {name, after_name} = SQLIdentifiers.take_span(rest)
     scan(after_name, state, [name, ?$ | chunk])
   end
 
@@ -270,56 +270,39 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
   defp skip_line(<<_c::utf8, rest::binary>>), do: skip_line(rest)
   defp skip_line(<<>>), do: <<>>
 
+  @doc "The text after the closing `*/` of a nested block comment whose opening `/*` was read."
   @spec skip_block(binary(), pos_integer()) :: {:ok, binary()} | :error
-  defp skip_block(<<"*/", rest::binary>>, 1), do: {:ok, rest}
-  defp skip_block(<<"*/", rest::binary>>, depth), do: skip_block(rest, depth - 1)
-  defp skip_block(<<"/*", rest::binary>>, depth), do: skip_block(rest, depth + 1)
-  defp skip_block(<<_c::utf8, rest::binary>>, depth), do: skip_block(rest, depth)
-  defp skip_block(<<>>, _depth), do: :error
+  def skip_block(rest, depth \\ 1)
+  def skip_block(<<"*/", rest::binary>>, 1), do: {:ok, rest}
+  def skip_block(<<"*/", rest::binary>>, depth), do: skip_block(rest, depth - 1)
+  def skip_block(<<"/*", rest::binary>>, depth), do: skip_block(rest, depth + 1)
+  def skip_block(<<_byte, rest::binary>>, depth), do: skip_block(rest, depth)
+  def skip_block(<<>>, _depth), do: :error
 
   # What follows a `$`: `$...$` with an empty tag, `$tag$...$tag$`, or a
   # placeholder.
   @spec dollar(binary()) ::
           {:literal, binary(), binary()} | :placeholder | {:unterminated, binary()}
-  defp dollar(<<?$, rest::binary>>) do
-    case :binary.split(rest, "$$") do
-      [body, after_body] -> {:literal, SQLLiteral.quote_text(body), after_body}
-      [_unterminated] -> {:unterminated, "Unterminated dollar-quoted string"}
-    end
-  end
-
   defp dollar(rest) do
-    {tag, after_tag} = take_word_chars(rest, false, [])
+    {tag, after_tag} = SQLIdentifiers.take_span(rest)
 
     case after_tag do
       <<?$, body_and_rest::binary>> ->
         case :binary.split(body_and_rest, "$" <> tag <> "$") do
-          [body, after_body] -> {:literal, SQLLiteral.quote_text(body), after_body}
-          [_unterminated] -> {:unterminated, "Unterminated dollar-quoted, expected $"}
+          [body, after_body] ->
+            {:literal, SQLLiteral.quote_text(body), after_body}
+
+          [_unterminated] when tag == "" ->
+            {:unterminated, "Unterminated dollar-quoted string"}
+
+          [_unterminated] ->
+            {:unterminated, "Unterminated dollar-quoted, expected $"}
         end
 
       _placeholder ->
         :placeholder
     end
   end
-
-  # A word: the letters, digits and underscores of a name, and the `$` after the first of them
-  # (`b$$` is one word, which opens no dollar-quoted string).
-  @spec take_word(binary()) :: {binary(), binary()}
-  defp take_word(<<first::utf8, rest::binary>>) do
-    {tail, after_word} = take_word_chars(rest, true, [])
-    {<<first::utf8>> <> tail, after_word}
-  end
-
-  @spec take_word_chars(binary(), boolean(), [binary()]) :: {binary(), binary()}
-  defp take_word_chars(<<c::utf8, rest::binary>> = input, allow_dollar?, acc) do
-    if SQLIdentifiers.word_char?(c) or (allow_dollar? and c == ?$),
-      do: take_word_chars(rest, allow_dollar?, [<<c::utf8>> | acc]),
-      else: {acc |> Enum.reverse() |> IO.iodata_to_binary(), input}
-  end
-
-  defp take_word_chars(<<>>, _allow_dollar?, acc),
-    do: {acc |> Enum.reverse() |> IO.iodata_to_binary(), <<>>}
 
   @spec unterminated(char(), binary(), binary()) :: SQLError.t()
   defp unterminated(?', whole, input),
@@ -343,8 +326,5 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
 
   # The line and column (1-based, in characters) just after `text`.
   @spec position(binary()) :: {pos_integer(), pos_integer()}
-  defp position(text) do
-    lines = :binary.split(text, "\n", [:global])
-    {length(lines), length(String.to_charlist(List.last(lines))) + 1}
-  end
+  defp position(text), do: SQLTokenizer.advance({1, 1}, text)
 end

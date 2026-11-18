@@ -86,14 +86,8 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
   defp msck([{:word, _p, "REPAIR", _l, _c} | [{:word, _p2, "TABLE", _l2, _c2} | _more] = rest]),
     do: msck(rest)
 
-  defp msck([{:word, _p, "REPAIR", _l, _c}, end_token | _rest]) do
-    if end_of?(end_token), do: expected("TABLE", end_token)
-  end
-
-  defp msck([{:word, _p, "TABLE", _l, _c}, end_token | _rest]) do
-    if end_of?(end_token), do: expected("identifier", end_token)
-  end
-
+  defp msck([{:word, _p, "REPAIR", _l, _c} | rest]), do: expected_at_end("TABLE", rest)
+  defp msck([{:word, _p, "TABLE", _l, _c} | rest]), do: bare_name(rest)
   defp msck(_tokens), do: nil
 
   # `MERGE INTO` with no target, and `MERGE INTO a USING b` with no `ON`.
@@ -131,9 +125,8 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
     end
   end
 
-  defp create([{:word, _p, "OR", _l, _c}, {:word, _p2, "REPLACE", _l2, _c2}, end_token | _rest]) do
-    if end_of?(end_token), do: expected(@replaced, end_token)
-  end
+  defp create([{:word, _p, "OR", _l, _c}, {:word, _p2, "REPLACE", _l2, _c2} | rest]),
+    do: expected_at_end(@replaced, rest)
 
   defp create([{:word, _p, "OR", _l, _c} = token, end_token | _rest]) do
     if end_of?(end_token), do: expected(@create_kind, token)
@@ -181,11 +174,14 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
 
   # A kind with no name is `Expected: identifier`; with one the double words it itself.
   @spec bare_name([SQLTokenizer.token()]) :: SQLError.t() | nil
-  defp bare_name([end_token | _rest]) do
-    if end_of?(end_token), do: expected("identifier", end_token)
+  defp bare_name(tokens), do: expected_at_end("identifier", tokens)
+
+  @spec expected_at_end(binary(), [SQLTokenizer.token()]) :: SQLError.t() | nil
+  defp expected_at_end(what, [end_token | _rest]) do
+    if end_of?(end_token), do: expected(what, end_token)
   end
 
-  defp bare_name(_tokens), do: nil
+  defp expected_at_end(_what, _tokens), do: nil
 
   # The name, then a token that is not the one wanted: that token is where the parser stops.
   @spec after_name(binary(), binary(), [binary()], [SQLTokenizer.token()]) ::
@@ -200,8 +196,7 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
         end
 
       :none ->
-        [end_token | _rest] = tokens
-        if end_of?(end_token), do: expected("identifier", end_token)
+        bare_name(tokens)
     end
   end
 
@@ -331,19 +326,13 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
 
   defp describe_name(tokens) do
     case name(tokens) do
-      {:ok, [next | _rest]} ->
-        unless end_of?(next), do: expected("end of statement", next)
-
-      :none ->
-        [end_token | _rest] = tokens
-        if end_of?(end_token), do: expected("identifier", end_token)
+      {:ok, [next | _rest]} -> unless end_of?(next), do: expected("end of statement", next)
+      :none -> bare_name(tokens)
     end
   end
 
   @spec attach([SQLTokenizer.token()]) :: SQLError.t() | nil
-  defp attach([end_token | _rest]) do
-    if end_of?(end_token), do: expected("an expression", end_token)
-  end
+  defp attach(tokens), do: expected_at_end("an expression", tokens)
 
   # ---------------------------------------------------------------------------
   # Tokens

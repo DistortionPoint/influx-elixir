@@ -20,7 +20,14 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # the 405 or the planning error of a statement that needs nothing more
   # (`BEGIN`, `COMMIT`, `SHOW`).
 
-  alias InfluxElixir.Client.Local.{SQLDdl, SQLError, SQLGrant, SQLIdentifiers, SQLTokenizer}
+  alias InfluxElixir.Client.Local.{
+    SQLDdl,
+    SQLError,
+    SQLGrant,
+    SQLIdentifiers,
+    SQLLexer,
+    SQLTokenizer
+  }
 
   # The words a statement of the engine's parser may start with (every one
   # of them was checked: none is `Expected: an SQL statement`).
@@ -238,10 +245,9 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # What follows the one-token name of `MERGE [INTO] name`: nothing, where the parser wants
   # `USING`.
   @spec merged(SQLTokenizer.token(), SQLTokenizer.tokens()) :: SQLError.t() | nil
-  defp merged({kind, _p, _u, _l, _c}, [{next_kind, printed, _u2, _l2, _c2} = token | _rest])
-       when kind in [:word, :quoted] and
-              (next_kind == :eof or (next_kind == :symbol and printed == ";")),
-       do: expected("USING", token)
+  defp merged({kind, _p, _u, _l, _c}, [token | _rest]) when kind in [:word, :quoted] do
+    if SQLDdl.end_of?(token), do: expected("USING", token)
+  end
 
   defp merged(_name, _rest), do: nil
 
@@ -417,39 +423,29 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
 
   # The leading whitespace and comments, and what follows them.
   @spec split_blank(binary()) :: {binary(), binary()}
-  defp split_blank(sql), do: blank(sql, 0)
+  defp split_blank(sql) do
+    rest = skip_blank(sql)
+    {binary_part(sql, 0, byte_size(sql) - byte_size(rest)), rest}
+  end
 
-  @spec blank(binary(), non_neg_integer()) :: {binary(), binary()}
-  defp blank(sql, taken) do
-    case skip(binary_part(sql, taken, byte_size(sql) - taken)) do
-      0 ->
-        {binary_part(sql, 0, taken), binary_part(sql, taken, byte_size(sql) - taken)}
+  @spec skip_blank(binary()) :: binary()
+  defp skip_blank(<<c, rest::binary>>) when c in [?\s, ?\t, ?\r, ?\n], do: skip_blank(rest)
 
-      skipped ->
-        blank(sql, taken + skipped)
+  defp skip_blank(<<"--", rest::binary>>) do
+    case :binary.split(rest, "\n") do
+      [_comment] -> <<>>
+      [_comment, after_line] -> skip_blank(after_line)
     end
   end
 
-  # The bytes of one whitespace character or comment at the start of `text`.
-  @spec skip(binary()) :: non_neg_integer()
-  defp skip(<<c, _rest::binary>>) when c in [?\s, ?\t, ?\r, ?\n], do: 1
-
-  defp skip(<<"--", rest::binary>>) do
-    case :binary.match(rest, "\n") do
-      {at, _length} -> 2 + at + 1
-      :nomatch -> 2 + byte_size(rest)
+  defp skip_blank(<<"/*", rest::binary>>) do
+    case SQLLexer.skip_block(rest) do
+      {:ok, after_comment} -> skip_blank(after_comment)
+      :error -> <<>>
     end
   end
 
-  defp skip(<<"/*", rest::binary>>), do: block(rest, 1, 2)
-  defp skip(_text), do: 0
-
-  @spec block(binary(), pos_integer(), non_neg_integer()) :: non_neg_integer()
-  defp block(<<"*/", _rest::binary>>, 1, taken), do: taken + 2
-  defp block(<<"*/", rest::binary>>, depth, taken), do: block(rest, depth - 1, taken + 2)
-  defp block(<<"/*", rest::binary>>, depth, taken), do: block(rest, depth + 1, taken + 2)
-  defp block(<<_byte, rest::binary>>, depth, taken), do: block(rest, depth, taken + 1)
-  defp block(<<>>, _depth, taken), do: taken
+  defp skip_blank(rest), do: rest
 
   @spec statement_word?(binary()) :: boolean()
   defp statement_word?(rest) do
@@ -533,9 +529,7 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # double does not know.
   @spec symbol(binary()) :: {:ok, binary()} | nil
   defp symbol(rest) do
-    longest_first = Enum.sort_by(@symbols, &(-String.length(&1)))
-
-    case Enum.find(longest_first, &String.starts_with?(rest, &1)) do
+    case Enum.find(@symbols, &String.starts_with?(rest, &1)) do
       nil ->
         nil
 

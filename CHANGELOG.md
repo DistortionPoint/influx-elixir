@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Consolidated duplicate helpers across `Client.Local` (`SQLDdl`, `SQLGrant`, `SQLIdentifiers`, `SQLLexer`, `SQLStatement`, `SQLSyntax`, and `SQLTokenizer`).**
+  Added `SQLIdentifiers.span_length/3` and `SQLIdentifiers.take_span/2` for reuse across `SQLIdentifiers`, `SQLLexer`, and `SQLTokenizer` (removing `SQLIdentifiers.take_word/2`, `SQLIdentifiers.word_chars?/1`, `SQLLexer.take_word/1`, `SQLLexer.take_word_chars/3`, `SQLTokenizer.word_length/2`, `SQLTokenizer.tag_length/2`, and `SQLTokenizer.span_length/3`), shared `SQLLexer.skip_block/2` across `SQLLexer`, `SQLStatement`, and `SQLTokenizer`, delegated `SQLLexer.position/1` and `SQLSyntax.advance/2` to codepoint-counting `SQLTokenizer.advance/2`, delegated `SQLTokenizer.skip_dollar/3` to `dollar_string/2` and combined `SQLLexer.dollar/1` clauses, extracted `expected_at_end/2` in `SQLDdl`, delegated `SQLGrant.granted_by/1` to `named/2`, and simplified `merged/2`, `split_blank/1`, and `symbol/1` in `SQLStatement`.
+
 ## [0.1.69] - 2026-11-17
 
 ### Changed

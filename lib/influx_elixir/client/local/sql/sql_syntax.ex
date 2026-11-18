@@ -388,19 +388,6 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
     end
   end
 
-  # The line and column after `piece`, read from `at`. A column counts characters, as the
-  # engine's does.
-  @spec advance(SQLTokenizer.position(), binary()) :: SQLTokenizer.position()
-  defp advance({line, column}, piece) do
-    case String.split(piece, "\n") do
-      [same_line] -> {line, column + characters(same_line)}
-      lines -> {line + length(lines) - 1, characters(List.last(lines)) + 1}
-    end
-  end
-
-  @spec characters(binary()) :: non_neg_integer()
-  defp characters(text), do: text |> String.codepoints() |> length()
-
   @spec check_pieces([binary()], boolean()) ::
           :ok | {:error, SQLError.t()}
   defp check_pieces(pieces, several?) do
@@ -412,7 +399,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
       tokenized = SQLTokenizer.scan(piece, at)
 
       case statement_verdict(piece, tokenized, several?, at) do
-        :ok -> {:cont, {unread? or tokenized == :bail, advance(at, piece)}}
+        :ok -> {:cont, {unread? or tokenized == :bail, SQLTokenizer.advance(at, piece)}}
         {:error, _error} = error -> {:halt, {:failed, error, unread?}}
       end
     end)

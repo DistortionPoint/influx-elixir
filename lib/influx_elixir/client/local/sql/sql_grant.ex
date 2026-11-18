@@ -447,15 +447,10 @@ defmodule InfluxElixir.Client.Local.SQLGrant do
   @spec granted_by([SQLTokenizer.token()]) ::
           {:ok, [binary()], [SQLTokenizer.token()]} | {:bad, SQLTokenizer.token()}
   defp granted_by([
-         {:word, _p, "GRANTED", _l, _c},
-         {:word, _p2, "BY", _l2, _c2},
-         {kind, printed, _u, _l3, _c3} | rest
-       ])
-       when kind in [:word, :quoted, :string],
-       do: {:ok, ["GRANTED", "BY", printed], rest}
-
-  defp granted_by([{:word, _p, "GRANTED", _l, _c}, {:word, _p2, "BY", _l2, _c2}, token | _rest]),
-    do: {:bad, token}
+         {:word, _p, "GRANTED", _l, _c} | [{:word, _p2, "BY", _l2, _c2} | _more] = rest
+       ]) do
+    with {:ok, by, more} <- named(rest, "BY"), do: {:ok, ["GRANTED" | by], more}
+  end
 
   defp granted_by(tokens), do: {:ok, [], tokens}
 
