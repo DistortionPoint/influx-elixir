@@ -61,8 +61,9 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
     end
   end
 
+  @doc "The plain column names in a query's `GROUP BY` clause."
   @spec grouped_columns(SQLParser.parsed_query()) :: [binary()]
-  defp grouped_columns(query),
+  def grouped_columns(query),
     do: for(item <- query.group_by_columns || [], is_binary(item), do: item)
 
   # A column a `HAVING` reads that is neither grouped nor an aggregate's. A name the table
@@ -243,10 +244,8 @@ defmodule InfluxElixir.Client.Local.SQLGrouping do
   defp group_terms(_interval_ns, [_column | _rest], _table), do: :unrenderable
   defp group_terms(interval_ns, [], _table) when rem(interval_ns, @day_ns) == 0, do: :unrenderable
 
-  defp group_terms(interval_ns, [], table) do
-    interval = "IntervalMonthDayNano { months: 0, days: 0, nanoseconds: #{interval_ns} }"
-    {:ok, [~s|date_bin(IntervalMonthDayNano("#{interval}"),#{table}.time)|]}
-  end
+  defp group_terms(interval_ns, [], table),
+    do: {:ok, [SQLSelect.format_date_bin(0, interval_ns, table)]}
 
   # The aggregates a `HAVING` names, after those of the select list.
   @spec having_columns(SQLParser.parsed_query()) :: [SQLParser.select_column()]

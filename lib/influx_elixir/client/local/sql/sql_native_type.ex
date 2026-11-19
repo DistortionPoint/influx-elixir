@@ -7,6 +7,11 @@ defmodule InfluxElixir.Client.Local.SQLNativeType do
 
   @struct ~r/\AStruct\("value": (.+), "time": Timestamp\(ns\)\)\z/
 
+  @doc "The Arrow struct type for a selector over a field of `value_type`."
+  @spec struct_type(binary()) :: binary()
+  def struct_type(value_type),
+    do: ~s|Struct("value": #{value_type}, "time": Timestamp(ns))|
+
   @doc "Whether an Arrow type is a struct (the result of a selector), which has no common type."
   @spec struct?(binary() | nil | :mixed) :: boolean()
   def struct?(type), do: is_binary(type) and String.starts_with?(type, "Struct(")

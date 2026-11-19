@@ -26,7 +26,7 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   #
   # A type that is not known is `nil`, which is never refused.
 
-  alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLSelect}
+  alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLNativeType, SQLSelect}
 
   import SQLExprType, only: [is_decimal_type: 1, is_numeric_type: 1]
 
@@ -126,7 +126,7 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
     do: "Timestamp(ns)"
 
   defp result({:selector, _selector, field, _ordering, :struct, _name}, columns, _phase) do
-    if type = Map.get(columns, field), do: ~s|Struct("value": #{type}, "time": Timestamp(ns))|
+    if type = Map.get(columns, field), do: SQLNativeType.struct_type(type)
   end
 
   # An expression over aggregates (`sum(n) + 1`) has the type of its operators over the

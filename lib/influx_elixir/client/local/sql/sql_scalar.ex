@@ -101,9 +101,14 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
   def compute(:substr, [text, from]), do: substring(text, from, nil)
   def compute(:substr, [text, from, count]), do: substring(text, from, count)
   def compute(:starts_with, [text, prefix]), do: String.starts_with?(text, prefix)
-  def compute(:left, [value, count]), do: value |> SQLCompare.text() |> leading(integer(count))
-  def compute(:right, [value, count]), do: value |> SQLCompare.text() |> trailing(integer(count))
-  def compute(:sqrt, [x]), do: x |> SQLNumber.to_float() |> square_root()
+
+  def compute(:left, [value, count]),
+    do: value |> SQLCompare.text() |> leading(SQLNumber.integer_of(count))
+
+  def compute(:right, [value, count]),
+    do: value |> SQLCompare.text() |> trailing(SQLNumber.integer_of(count))
+
+  def compute(:sqrt, [x]), do: x |> SQLNumber.to_float() |> SQLNumber.square_root()
   def compute(:ln, [x]), do: x |> SQLNumber.to_float() |> natural_log()
   def compute(:log, [x]), do: compute(:log, [10, x])
 
@@ -139,8 +144,8 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
 
   @spec substring(binary(), term(), term()) :: binary()
   defp substring(text, from, count) do
-    start = integer(from)
-    length = if count, do: integer(count)
+    start = SQLNumber.integer_of(from)
+    length = if count, do: SQLNumber.integer_of(count)
 
     if not is_nil(length) and (start == SQLLimits.int64_min() or length < 0),
       do: closed(),
@@ -179,18 +184,9 @@ defmodule InfluxElixir.Client.Local.SQLScalar do
 
   defp trailing(text, count), do: String.slice(text, -count, String.length(text))
 
-  @spec integer(term()) :: integer()
-  defp integer({:int, _bits, value}), do: value
-  defp integer(value) when is_integer(value), do: value
-
   # ---------------------------------------------------------------------------
   # math
   # ---------------------------------------------------------------------------
-
-  @spec square_root(float() | SQLNumber.special()) :: float() | SQLNumber.special()
-  defp square_root(x) when is_float(x), do: if(x < 0, do: :nan, else: :math.sqrt(x))
-  defp square_root(:inf), do: :inf
-  defp square_root(_special), do: :nan
 
   @spec natural_log(float() | SQLNumber.special()) :: float() | SQLNumber.special()
   defp natural_log(x) when is_float(x) and x > 0, do: :math.log(x)

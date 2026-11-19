@@ -158,6 +158,11 @@ defmodule InfluxElixir.Client.Local.SQLError do
   @spec planning(binary()) :: t()
   def planning(message), do: %{status: 400, body: "Error during planning: " <> message}
 
+  @doc "The engine's planning error when a selector's second argument is not a timestamp."
+  @spec selector_second_arg(atom() | binary(), binary()) :: t()
+  def selector_second_arg(selector, type),
+    do: planning("selector_#{selector} second argument must be a timestamp, but got #{type}")
+
   @doc """
   A planning error found by the type coercion pass, which the engine wraps
   as `type_coercion\\ncaused by\\nError during planning: <message>`.

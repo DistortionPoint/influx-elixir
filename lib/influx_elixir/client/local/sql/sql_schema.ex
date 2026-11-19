@@ -17,6 +17,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     SQLDmlName,
     SQLError,
     SQLExpr,
+    SQLGrouping,
     SQLInformation,
     SQLLiteral,
     SQLNumber,
@@ -456,7 +457,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     if Enum.any?(relations, &unknown_schema?/1) do
       :ok
     else
-      grouped = for item <- query.group_by_columns || [], is_binary(item), do: item
+      grouped = SQLGrouping.grouped_columns(query)
       outputs = output_names(query)
 
       unavailable =

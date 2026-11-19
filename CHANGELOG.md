@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Consolidated duplicate helpers across `Client.Local` (`SQLAggType`, `SQLAggregate`, `SQLClauses`, `SQLError`, `SQLGrouping`, `SQLNativeType`, `SQLNumber`, `SQLPlan`, `SQLScalar`, `SQLSchema`, and `SQLSelect`).**
+  Shared `SQLNumber.integer_of/1` and `SQLNumber.square_root/1` across `SQLAggregate`, `SQLNumber`, and `SQLScalar` (removing `SQLAggregate.integer_of/1`, `SQLAggregate.square_root/1`, `SQLScalar.integer/1`, and `SQLScalar.square_root/1`), added `SQLSelect.date_bin_time_interval/1` and `SQLSelect.format_date_bin/3` for reuse across `SQLClauses`, `SQLGrouping`, and `SQLSelect`, shared `SQLGrouping.grouped_columns/1` with `SQLSchema.check_order_available/2`, added `SQLError.selector_second_arg/2` for reuse across `SQLPlan` and `SQLSelect`, and added `SQLNativeType.struct_type/1` for reuse across `SQLAggType` and `SQLPlan`.
+
 ## [0.1.70] - 2026-11-18
 
 ### Changed

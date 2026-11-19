@@ -483,17 +483,24 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   @spec parse_date_bin_column(binary(), binary(), binary() | nil, binary() | nil) ::
           {:ok, column()} | {:error, term()}
   defp parse_date_bin_column(col, body, alias_name, qualifier) do
-    pattern = ~r/(?i)^DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)$/u
-
-    case Regex.run(pattern, body) do
-      [_full, interval] ->
+    case date_bin_time_interval(body) do
+      interval when is_binary(interval) ->
         with {:ok, output} <-
                output_name(col, alias_name, fn -> date_bin_name(interval, qualifier) end) do
           {:ok, {:time_bucket, output}}
         end
 
-      _no_match ->
+      nil ->
         {:error, SQLError.refusal("invalid DATE_BIN: #{col}")}
+    end
+  end
+
+  @doc "Extracts the interval literal from `DATE_BIN(INTERVAL '<interval>', time)`, or `nil`."
+  @spec date_bin_time_interval(binary()) :: binary() | nil
+  def date_bin_time_interval(text) do
+    case Regex.run(~r/(?i)^DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)$/u, text) do
+      [_full, interval] -> interval
+      nil -> nil
     end
   end
 
@@ -507,6 +514,12 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
         nil -> {0, interval_nanoseconds(interval)}
       end
 
+    format_date_bin(days, nanoseconds, qualifier)
+  end
+
+  @doc "Formats DataFusion's `date_bin(IntervalMonthDayNano(...), <time>)` expression name."
+  @spec format_date_bin(non_neg_integer(), non_neg_integer(), binary() | nil) :: binary()
+  def format_date_bin(days, nanoseconds, qualifier) do
     interval_text =
       "IntervalMonthDayNano { months: 0, days: #{days}, nanoseconds: #{nanoseconds} }"
 
@@ -761,10 +774,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
     |> Enum.find_value(fn [call, selector, field, ordering] ->
       cond do
         type = literal_type(ordering) ->
-          SQLError.planning(
-            "selector_#{String.downcase(selector)} second argument must be a timestamp, " <>
-              "but got #{type}"
-          )
+          SQLError.selector_second_arg(String.downcase(selector), type)
 
         literal_type(field) ->
           SQLError.refusal(

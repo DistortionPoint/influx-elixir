@@ -1215,10 +1215,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
           :ok | {:error, failure()}
   defp check_selector(selector, _value, ordering, _grouped?)
        when ordering not in [nil, "Timestamp(ns)"] do
-    {:error,
-     SQLError.planning(
-       "selector_#{selector} second argument must be a timestamp, but got #{ordering}"
-     )}
+    {:error, SQLError.selector_second_arg(selector, ordering)}
   end
 
   defp check_selector(selector, @tag, _ordering, false) when selector in [:min, :max],
@@ -1853,7 +1850,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   def arrow_type(%DateTime{}), do: "Timestamp(ns)"
 
   def arrow_type(%{"value" => value, "time" => %DateTime{}}) when value != nil,
-    do: ~s|Struct("value": #{arrow_type(value)}, "time": Timestamp(ns))|
+    do: SQLNativeType.struct_type(arrow_type(value))
 
   def arrow_type(_string), do: "Utf8"
 end

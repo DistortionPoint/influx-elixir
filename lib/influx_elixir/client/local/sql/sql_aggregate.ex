@@ -278,7 +278,7 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
         )
 
       integer_values?(values) ->
-        values |> Enum.map(&integer_of/1) |> Enum.sum() |> Kernel./(length(values))
+        values |> Enum.map(&SQLNumber.integer_of/1) |> Enum.sum() |> Kernel./(length(values))
 
       true ->
         values |> sum_floats() |> divide(length(values) * 1.0)
@@ -288,11 +288,6 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   @spec integer_values?([SQLNumber.t()]) :: boolean()
   defp integer_values?(values),
     do: Enum.all?(values, &(is_integer(&1) or match?({:u, _}, &1) or match?({:int, _, _}, &1)))
-
-  @spec integer_of(integer() | {:u, non_neg_integer()} | SQLNumber.narrow()) :: integer()
-  defp integer_of({:u, value}), do: value
-  defp integer_of({:int, _bits, value}), do: value
-  defp integer_of(value), do: value
 
   @spec sum_floats([SQLNumber.t()]) :: float() | SQLNumber.special()
   defp sum_floats(values) do
@@ -332,7 +327,7 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
   defp spread(values, agg, scalar?) do
     divisor = if agg in [:var, :stddev], do: length(values) - 1, else: length(values)
     variance = variance(values, divisor, scalar?)
-    if agg in [:var, :var_pop], do: variance, else: square_root(variance)
+    if agg in [:var, :var_pop], do: variance, else: SQLNumber.square_root(variance)
   end
 
   # The variance of the values over `divisor`, by the engine's own one-pass accumulator
@@ -371,12 +366,6 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     second_distance = SQLNumber.arithmetic(:-, value, mean)
     {count, mean, add(squares, SQLNumber.arithmetic(:*, first_distance, second_distance))}
   end
-
-  @spec square_root(float() | SQLNumber.special()) :: float() | SQLNumber.special()
-  defp square_root(special) when special in [:inf, :nan], do: special
-  defp square_root(:neg_inf), do: :nan
-  defp square_root(value) when value < 0, do: :nan
-  defp square_root(value), do: :math.sqrt(value)
 
   # selector_first/last pick by the ordering column, selector_min/max by the
   # field itself; `['value']` returns the field, `['time']` the row's time.

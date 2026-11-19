@@ -389,10 +389,18 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
     end
   end
 
+  @doc "Unwraps an integer representation (`{:u, value}`, `{:int, bits, value}`, or bare integer)."
   @spec integer_of(integer() | {:u, non_neg_integer()} | narrow()) :: integer()
-  defp integer_of({:u, value}), do: value
-  defp integer_of({:int, _bits, value}), do: value
-  defp integer_of(value), do: value
+  def integer_of({:u, value}), do: value
+  def integer_of({:int, _bits, value}), do: value
+  def integer_of(value) when is_integer(value), do: value
+
+  @doc "The IEEE-754 square root of a float or special float value."
+  @spec square_root(float() | special()) :: float() | special()
+  def square_root(special) when special in [:inf, :nan], do: special
+  def square_root(:neg_inf), do: :nan
+  def square_root(value) when value < 0, do: :nan
+  def square_root(value), do: :math.sqrt(value)
 
   @spec compare_integers(integer(), integer()) :: :lt | :eq | :gt
   defp compare_integers(left, right) do

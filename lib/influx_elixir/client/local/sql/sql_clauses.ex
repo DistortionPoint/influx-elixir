@@ -479,12 +479,9 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   @spec parse_group_by_interval(binary()) ::
           {:ok, pos_integer()} | {:error, term()}
   defp parse_group_by_interval(item) do
-    pattern =
-      ~r/(?i)^DATE_BIN\s*\(\s*INTERVAL\s+'([^']+)'\s*,\s*time\s*\)$/u
-
-    case Regex.run(pattern, item) do
-      [_full, interval_str] -> SQLTime.interval(interval_str)
-      _no_match -> {:error, SQLError.refusal("missing GROUP BY DATE_BIN")}
+    case SQLSelect.date_bin_time_interval(item) do
+      interval_str when is_binary(interval_str) -> SQLTime.interval(interval_str)
+      nil -> {:error, SQLError.refusal("missing GROUP BY DATE_BIN")}
     end
   end
 
