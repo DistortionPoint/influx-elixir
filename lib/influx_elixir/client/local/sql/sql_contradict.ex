@@ -35,8 +35,16 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   # says so (`unknown/3`, `uncertainty/2`, `grouped_overlap?/1`) instead of guessing: the caller
   # refuses by name a query whose answer depends on it.
 
-  alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLFold, SQLLimits}
+  alias InfluxElixir.Client.Local.{
+    SQLCommonType,
+    SQLExpr,
+    SQLExprType,
+    SQLFold,
+    SQLLimits,
+    SQLLiteral
+  }
 
+  require SQLCommonType
   require SQLLimits
 
   @typep types :: %{binary() => binary()}
@@ -44,8 +52,6 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   @typep operand :: binary() | {:expr, SQLExpr.t()}
   @typep form :: atom()
   @typep keyed :: {form(), term()} | :null | :unknown | :skip
-
-  @text_types ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"]
 
   @doc """
   The two `IN` clauses of one `AND`, folded: `:none` when they do not fold, `:empty` when they
@@ -700,7 +706,7 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
       "Float64" -> :f64
       "Boolean" -> :bool
       "Timestamp(ns)" -> :ts
-      type when type in @text_types -> :text
+      type when SQLCommonType.is_text_type(type) -> :text
       _other -> :other
     end
   end
@@ -746,11 +752,7 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   end
 
   @spec float_string?(binary()) :: boolean()
-  defp float_string?(text) do
-    match?({_number, ""}, Float.parse(text))
-  rescue
-    ArgumentError -> false
-  end
+  defp float_string?(text), do: match?({_number, ""}, SQLLiteral.safe_float_parse(text))
 
   @spec form_of(keyed()) :: form() | keyed()
   defp form_of({form, _value}), do: form

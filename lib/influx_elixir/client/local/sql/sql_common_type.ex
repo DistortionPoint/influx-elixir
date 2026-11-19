@@ -93,9 +93,12 @@ defmodule InfluxElixir.Client.Local.SQLCommonType do
   def family(text) when text in ["Dictionary(Int32, Utf8)", "Utf8View"], do: "Utf8"
   def family(type), do: type
 
+  @doc "Guard for the `Utf8` text family (`Utf8`, `Utf8View`, or tag dictionary)."
+  defguard is_text_type(type) when type in ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"]
+
   @doc "Whether `type` is in the `Utf8` text family (`Utf8`, `Utf8View`, or tag dictionary)."
   @spec text?(type()) :: boolean()
-  def text?(type), do: family(type) == "Utf8"
+  def text?(type), do: is_text_type(type)
 
   @spec single_type(binary() | :mixed) :: type()
   defp single_type(type)

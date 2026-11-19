@@ -714,7 +714,7 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
 
     if (SQLNumber.numeric?(l) and SQLNumber.numeric?(r)) or (is_binary(l) and is_binary(r)) or
          (is_boolean(l) and is_boolean(r)),
-       do: {:ok, if(compare_constants(op, l, r), do: :always, else: :never)},
+       do: {:ok, if(SQLCompare.compare(l, op, r), do: :always, else: :never)},
        else:
          unsupported_where(
            trimmed,
@@ -737,29 +737,6 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
         value
     end
   end
-
-  @spec compare_constants(op(), term(), term()) :: boolean()
-  defp compare_constants(op, l, r) do
-    if SQLNumber.numeric?(l) and SQLNumber.numeric?(r),
-      do: ordered(op, SQLNumber.compare(l, r)),
-      else: compare_values(op, l, r)
-  end
-
-  @spec ordered(op(), :lt | :eq | :gt) :: boolean()
-  defp ordered(:eq, order), do: order == :eq
-  defp ordered(:ne, order), do: order != :eq
-  defp ordered(:gt, order), do: order == :gt
-  defp ordered(:lt, order), do: order == :lt
-  defp ordered(:gte, order), do: order != :lt
-  defp ordered(:lte, order), do: order != :gt
-
-  @spec compare_values(op(), term(), term()) :: boolean()
-  defp compare_values(:eq, l, r), do: l == r
-  defp compare_values(:ne, l, r), do: l != r
-  defp compare_values(:gt, l, r), do: l > r
-  defp compare_values(:lt, l, r), do: l < r
-  defp compare_values(:gte, l, r), do: l >= r
-  defp compare_values(:lte, l, r), do: l <= r
 
   @spec comparison(op(), binary(), binary()) :: {:ok, clause()} | {:error, map()}
   defp comparison(op, operand, comparand) do
@@ -859,12 +836,12 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   # reference or expression (`v IN (1, other)`). Source order is kept so
   # the schema check names the first unknown column, as the engine does.
   @spec parse_value_set([binary()]) :: {:ok, [term()]} | {:error, map()}
-  defp parse_value_set(items), do: map_comparands(items, &parse_comparand/1)
+  defp parse_value_set(items), do: map_ok(items, &parse_comparand/1)
 
   @spec parse_time_set([binary()]) ::
           {:ok, [SQLTime.bound()]} | {:error, map()} | {:type_error, map()}
   defp parse_time_set(items) do
-    with {:ok, bounds} <- map_comparands(items, &(&1 |> SQLTime.comparand() |> SQLTime.bound())) do
+    with {:ok, bounds} <- map_ok(items, &(&1 |> SQLTime.comparand() |> SQLTime.bound())) do
       if Enum.any?(bounds, &SQLTime.param_bound?/1) do
         {:ok, bounds}
       else
@@ -876,9 +853,10 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     end
   end
 
-  @spec map_comparands([binary()], (binary() -> {:ok, term()} | {:error, map()})) ::
+  @doc "Maps `parse` over `items`, halting at the first `{:error, reason}`."
+  @spec map_ok([term()], (term() -> {:ok, term()} | {:error, map()})) ::
           {:ok, [term()]} | {:error, map()}
-  defp map_comparands(items, parse) do
+  def map_ok(items, parse) do
     items
     |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
       case parse.(item) do

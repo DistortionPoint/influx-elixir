@@ -137,7 +137,7 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
   # when it reads no column). An operand that cannot be evaluated is `:error`.
   @spec any_value?(SQLExpr.t(), [point()], (term() -> boolean())) :: boolean()
   defp any_value?({:field, name}, points, risky?) when is_binary(name) and name != "time",
-    do: any_field?(points, name, risky?)
+    do: Enum.any?(points, &risky?.(SQLRow.column_value(&1, name)))
 
   defp any_value?(operand, [first | _rest] = points, risky?) do
     if SQLExpr.columns(operand) == [],
@@ -145,19 +145,6 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
       else: Enum.any?(points, &risky?.(SQLEval.eval(operand, &1)))
   catch
     {:query_error, _error} -> risky?.(:error)
-  end
-
-  @spec any_field?([point()], binary(), (term() -> boolean())) :: boolean()
-  defp any_field?([], _name, _risky?), do: false
-
-  defp any_field?([%{tags: tags, fields: fields} | rest], name, risky?) do
-    value =
-      case tags do
-        %{^name => tag} -> tag
-        _no_tag -> Map.get(fields, name)
-      end
-
-    risky?.(value) or any_field?(rest, name, risky?)
   end
 
   @spec risky_divisor?(term()) :: boolean()

@@ -271,14 +271,9 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   defp like(value, _ilike) when is_binary(value), do: value
 
   defp like(value, ilike) do
-    word = if ilike, do: "ILIKE", else: "LIKE"
-
     throw(
       {:query_error,
-       SQLError.coercion(
-         "There isn't a common type to coerce #{SQLPlan.arrow_type(value)} and Utf8 in #{word} " <>
-           "expression"
-       )}
+       SQLError.coercion(SQLPlan.pattern_error(:like, SQLPlan.arrow_type(value), ilike))}
     )
   end
 

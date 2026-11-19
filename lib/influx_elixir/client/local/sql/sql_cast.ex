@@ -93,17 +93,18 @@ defmodule InfluxElixir.Client.Local.SQLCast do
   # An integer of either sign as the decimal the engine makes of it beside the other (`Int64`
   # with `UInt64`); only the coalescing functions make one, not a cast written in a query.
   @spec to_decimal(term()) :: {:ok, SQLNumber.decimal()} | :error
-  defp to_decimal({:u, value}), do: {:ok, {:dec, value, 0}}
-  defp to_decimal(value) when is_integer(value), do: {:ok, {:dec, value, 0}}
+  defp to_decimal(value) when is_integer(value) or (is_tuple(value) and elem(value, 0) == :u),
+    do: {:ok, {:dec, SQLNumber.integer_of(value), 0}}
+
   defp to_decimal(_value), do: :error
 
   @spec to_integer(term(), 8 | 16 | 32 | 64) :: {:ok, term()} | :error
   defp to_integer(value, bits) when is_boolean(value),
     do: in_range(if(value, do: 1, else: 0), bits)
 
-  defp to_integer(value, bits) when is_integer(value), do: in_range(value, bits)
-  defp to_integer({:u, value}, bits), do: in_range(value, bits)
-  defp to_integer({:int, _width, value}, bits), do: in_range(value, bits)
+  defp to_integer(value, bits)
+       when is_integer(value) or (is_tuple(value) and elem(value, 0) in [:u, :int]),
+       do: in_range(SQLNumber.integer_of(value), bits)
 
   defp to_integer({:dec, coefficient, scale}, bits),
     do: in_range(div(coefficient, Integer.pow(10, scale)), bits)
@@ -184,10 +185,11 @@ defmodule InfluxElixir.Client.Local.SQLCast do
   @spec to_string_value(term()) :: {:ok, binary()}
   defp to_string_value(value) when is_binary(value), do: {:ok, value}
   defp to_string_value(value) when is_float(value), do: {:ok, Format.render_float(value)}
-  defp to_string_value(value) when is_integer(value), do: {:ok, Integer.to_string(value)}
   defp to_string_value(value) when is_boolean(value), do: {:ok, Atom.to_string(value)}
-  defp to_string_value({:u, value}), do: {:ok, Integer.to_string(value)}
-  defp to_string_value({:int, _bits, value}), do: {:ok, Integer.to_string(value)}
+
+  defp to_string_value(value)
+       when is_integer(value) or (is_tuple(value) and elem(value, 0) in [:u, :int]),
+       do: {:ok, Integer.to_string(SQLNumber.integer_of(value))}
 
   defp to_string_value({:dec, coefficient, scale}),
     do: {:ok, decimal_text(coefficient, scale)}

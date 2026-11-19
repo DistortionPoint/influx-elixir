@@ -177,30 +177,14 @@ defmodule InfluxElixir.Client.Local.SQLBind do
     end)
   end
 
-  @spec map_ok([term()], (term() -> {:ok, term()} | {:error, map()})) ::
-          {:ok, [term()]} | {:error, map()}
-  defp map_ok(items, fun) do
-    items
-    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
-      case fun.(item) do
-        {:ok, value} -> {:cont, {:ok, [value | acc]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, values} -> {:ok, Enum.reverse(values)}
-      {:error, _reason} = error -> error
-    end
-  end
-
   @spec bind_where_nodes([SQLWhere.node_t()], %{binary() => term()}) ::
           {:ok, [SQLWhere.node_t()]} | {:error, map()}
-  defp bind_where_nodes(nodes, params), do: map_ok(nodes, &bind_node(&1, params))
+  defp bind_where_nodes(nodes, params), do: SQLPredicate.map_ok(nodes, &bind_node(&1, params))
 
   @spec bind_node(SQLWhere.node_t(), %{binary() => term()}) ::
           {:ok, SQLWhere.node_t()} | {:error, map()}
   defp bind_node({:or, branches}, params) do
-    with {:ok, bound} <- map_ok(branches, &bind_where_nodes(&1, params)),
+    with {:ok, bound} <- SQLPredicate.map_ok(branches, &bind_where_nodes(&1, params)),
          do: {:ok, {:or, bound}}
   end
 
@@ -244,7 +228,7 @@ defmodule InfluxElixir.Client.Local.SQLBind do
   end
 
   defp bind_node({op, left, values}, params) when op in [:in, :not_in] do
-    with {:ok, bound} <- map_ok(values, &bind_comparand(&1, params)),
+    with {:ok, bound} <- SQLPredicate.map_ok(values, &bind_comparand(&1, params)),
          do: {:ok, {op, bind_operand(left, params), bound}}
   end
 

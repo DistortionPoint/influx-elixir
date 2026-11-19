@@ -188,8 +188,9 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
       else: :error
   end
 
+  @doc "`Float.parse/1` that returns `:error` instead of raising on overflow."
   @spec safe_float_parse(binary()) :: {float(), binary()} | :error
-  defp safe_float_parse(text) do
+  def safe_float_parse(text) do
     Float.parse(text)
   rescue
     ArgumentError -> :error

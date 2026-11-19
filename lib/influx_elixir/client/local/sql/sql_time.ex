@@ -78,7 +78,7 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   def comparand(text) do
     cond do
       not String.valid?(text) -> {:error, unsupported(text)}
-      SQLLiteral.string?(text) -> string_bound(SQLLiteral.body(text))
+      SQLLiteral.string?(text) -> {:ok, param(SQLLiteral.body(text))}
       String.upcase(text) == "NULL" -> {:ok, nil}
       match = Regex.run(@now_pattern, text) -> now_offset(match)
       SQLLiteral.param?(text) -> {:ok, {:param, SQLLiteral.param_name(text)}}
@@ -96,14 +96,6 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   def bound({:ok, value}), do: {:ok, value}
   def bound({:error, {:number, type}}), do: {:ok, {:number, type}}
   def bound({:error, _refusal} = error), do: error
-
-  @spec string_bound(binary()) :: {:ok, bound()}
-  defp string_bound(text) do
-    case literal(text) do
-      {:ok, ns} -> {:ok, ns}
-      {:error, error} -> {:ok, {:invalid_time, error}}
-    end
-  end
 
   @spec number_type(binary()) :: binary() | nil
   defp number_type(text) do

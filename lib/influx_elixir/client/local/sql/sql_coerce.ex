@@ -11,6 +11,8 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
 
   alias InfluxElixir.Client.Local.{SQLCommonType, SQLExpr, SQLExprType, SQLParser, SQLPlan}
 
+  require SQLCommonType
+
   @numbers ["Int64", "UInt64", "Float64"]
 
   @doc """
@@ -169,7 +171,7 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
       else: expr
   end
 
-  defp cast(expr, text, types) when text in ["Utf8", "Utf8View", "Dictionary(Int32, Utf8)"] do
+  defp cast(expr, text, types) when SQLCommonType.is_text_type(text) do
     if SQLExprType.type_of(expr, types) in @numbers,
       do: {:cast, expr, :string},
       else: expr

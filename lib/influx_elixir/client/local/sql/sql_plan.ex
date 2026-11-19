@@ -1733,6 +1733,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   # `ILIKE` is a `LIKE` whose pattern ignores case; the engine names it in
   # its message.
   @spec like_word(term()) :: binary()
+  defp like_word(true), do: "ILIKE"
   defp like_word({:like_param, _name, true}), do: "ILIKE"
 
   defp like_word(%Regex{} = regex),
