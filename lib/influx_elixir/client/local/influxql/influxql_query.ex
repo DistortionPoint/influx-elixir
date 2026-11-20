@@ -23,6 +23,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     SQLError,
     SQLExecutor,
     SQLParser,
+    SQLPredicate,
     Store
   }
 
@@ -419,17 +420,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   @spec show_collect([binary()], (binary() -> {:ok, [map()]} | {:error, map()})) ::
           {:ok, [map()]} | {:error, map()}
   defp show_collect(names, rows_of) do
-    names
-    |> Enum.reduce_while({:ok, []}, fn name, {:ok, acc} ->
-      case rows_of.(name) do
-        {:ok, rows} -> {:cont, {:ok, [rows | acc]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, groups} -> {:ok, groups |> Enum.reverse() |> Enum.concat()}
-      error -> error
-    end
+    with {:ok, groups} <- SQLPredicate.map_ok(names, rows_of), do: {:ok, Enum.concat(groups)}
   end
 
   @spec show_refusal(map(), binary()) :: {:error, map()}

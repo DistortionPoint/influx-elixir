@@ -921,7 +921,7 @@ defmodule InfluxElixir.Client.Local.Flux do
          {:ok, dt, _offset} <- DateTime.from_iso8601(text) do
       wrapped =
         SQLLimits.wrap_int64(
-          DateTime.to_unix(dt, :second) * 1_000_000_000 + fraction_ns(fraction)
+          DateTime.to_unix(dt, :second) * 1_000_000_000 + Durations.fraction_ns(fraction)
         )
 
       {:ok, {wrapped, wrapped}}
@@ -929,12 +929,6 @@ defmodule InfluxElixir.Client.Local.Flux do
       _unsupported -> {:error, "Client.Local: unsupported range() time: #{text}"}
     end
   end
-
-  @spec fraction_ns([binary()]) :: non_neg_integer()
-  defp fraction_ns([]), do: 0
-
-  defp fraction_ns([digits]),
-    do: digits |> String.slice(0, 9) |> String.pad_trailing(9, "0") |> String.to_integer()
 
   @spec fetch_int(map(), binary()) :: {:ok, non_neg_integer()} | {:error, binary()}
   defp fetch_int(params, key) do

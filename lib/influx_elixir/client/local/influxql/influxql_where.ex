@@ -743,11 +743,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   defp time_right(_tokens), do: :other
 
   defp time_comparison(op, _comparand, _now) when op in ["!=", "<>"] do
-    throw(
-      {:refused,
-       {:engine,
-        InfluxQLError.split_error("Error during planning: invalid time comparison operator: !=")}}
-    )
+    throw({:refused, {:engine, InfluxQLError.invalid_time_op_error()}})
   end
 
   defp time_comparison(op, _comparand, _now) when op not in ["=", "<", "<=", ">", ">="],

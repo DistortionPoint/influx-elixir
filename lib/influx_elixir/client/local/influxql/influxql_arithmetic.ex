@@ -247,7 +247,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   @spec eval(expr(), map()) :: value()
   defp eval({:lit, value}, _row), do: value
 
-  defp eval({:field, name, kind}, row), do: field_value(kind, Map.get(row, name))
+  defp eval({:field, name, kind}, row), do: InfluxQLKernel.typed_value(kind, Map.get(row, name))
 
   defp eval({:op, op, left, right}, row) do
     if lowest_beside_unsigned?(left, right), do: throw(:closed_connection)
@@ -335,11 +335,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithmetic do
   defp absolute({:int, n}), do: {:int, abs(n)}
   defp absolute({:float, x}), do: {:float, abs(x)}
   defp absolute(other), do: other
-
-  defp field_value(:int, n) when is_integer(n), do: {:int, n}
-  defp field_value(:uint, n) when is_integer(n), do: {:uint, n}
-  defp field_value(:float, x) when is_number(x), do: {:float, x * 1.0}
-  defp field_value(_kind, _value), do: nil
 
   @spec apply_op(binary(), value(), value()) :: value()
   defp apply_op(op, left, right), do: InfluxQLKernel.apply_op(op, left, right)

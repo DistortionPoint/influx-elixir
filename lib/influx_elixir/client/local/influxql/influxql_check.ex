@@ -397,13 +397,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   def check_swallowed(_whole, _at, _masked_rest, nil), do: nil
 
   def check_swallowed(whole, at, masked_rest, {:fill, from}) do
-    text = binary_part(whole, at, byte_size(masked_rest))
-
-    case InfluxQLGroup.read_fill(text, from) do
-      {:ok, stop} -> after_fill(whole, at, masked_rest, stop)
-      {:bad_option, pos} -> fail(:fill, at + pos, whole)
-      {:unclosed, pos} -> fail(:nom, at + pos, whole)
-    end
+    read_fill_error(whole, at, masked_rest, from, &after_fill(whole, at, masked_rest, &1))
   end
 
   def check_swallowed(whole, at, masked_rest, {from}) do
@@ -935,16 +929,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   def fill_error(whole, at, masked_rest) do
     case Regex.run(InfluxQLText.fill_call(), masked_rest, return: :index) do
       [{call_at, _size}] ->
-        read_fill_error(whole, at, binary_part(whole, at, byte_size(masked_rest)), call_at)
+        read_fill_error(whole, at, masked_rest, call_at, fn _stop -> nil end)
 
       nil ->
         nil
     end
   end
 
-  defp read_fill_error(whole, at, text, call_at) do
-    case InfluxQLGroup.read_fill(text, call_at) do
-      {:ok, _stop} -> nil
+  defp read_fill_error(whole, at, masked_rest, call_at, on_ok) do
+    case InfluxQLGroup.read_fill(binary_part(whole, at, byte_size(masked_rest)), call_at) do
+      {:ok, stop} -> on_ok.(stop)
       {:bad_option, pos} -> fail(:fill, at + pos, whole)
       {:unclosed, pos} -> fail(:nom, at + pos, whole)
     end

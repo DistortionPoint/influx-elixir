@@ -77,9 +77,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
   end
 
   defp sides(_left, op, _right, _ctx) when op in ["!=", "<>"],
-    do:
-      {:error,
-       InfluxQLError.split_error("Error during planning: invalid time comparison operator: !=")}
+    do: {:error, InfluxQLError.invalid_time_op_error()}
 
   defp sides(_left, op, _right, _ctx) when op in ["=~", "!~"], do: :ok
 

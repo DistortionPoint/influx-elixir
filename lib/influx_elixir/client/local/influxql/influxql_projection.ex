@@ -349,16 +349,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
   end
 
   defp renamed(item, nil, _schema), do: item
-  defp renamed({:column, column, _name}, name, _schema), do: {:column, column, name}
 
   defp renamed({:expr, ast, _alias}, name, %{types: types, tags: tags}),
     do: {:expr, InfluxQLExpr.fold(ast, types, tags), name}
 
-  defp renamed({:aggregate, fun, arg, _alias}, name, _schema),
-    do: {:aggregate, fun, arg, name}
-
-  defp renamed({:multi, kind, field, tags, limit, _alias}, name, _schema),
-    do: {:multi, kind, field, tags, limit, name}
+  defp renamed(item, name, _schema), do: InfluxQLNames.rename(item, name)
 
   # The columns a window counts: the fields, once each, under their names.
   @spec field_names([entry()]) :: [binary()]

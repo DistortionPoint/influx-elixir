@@ -117,8 +117,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp tokenize(<<?*, rest::binary>>, acc)
        when acc == [] or hd(acc) in [{:op, "("}, {:op, ","}] do
     case Regex.run(~r/^::(field|tag)(?![\w:])/i, rest) do
-      [all, kind] -> tokenize(rest_after(rest, all), [{:star, String.downcase(kind)} | acc])
-      nil -> tokenize(rest, [{:star, nil} | acc])
+      [all, kind] ->
+        tokenize(InfluxQLLex.rest_after(rest, all), [{:star, String.downcase(kind)} | acc])
+
+      nil ->
+        tokenize(rest, [{:star, nil} | acc])
     end
   end
 
@@ -135,7 +138,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp tokenize(<<?', _rest::binary>> = text, acc) do
     case Regex.run(~r/^'((?:[^'\\]|\\.)*)'/s, text) do
-      [all, content] -> tokenize(rest_after(text, all), [{:str, content} | acc])
+      [all, content] -> tokenize(InfluxQLLex.rest_after(text, all), [{:str, content} | acc])
       nil -> :error
     end
   end
@@ -144,15 +147,18 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     cond do
       match = Regex.run(~r/^(?:\d+(?:ns|ms|u|µ|s|m|h|d|w))+(?![\w.])/, text) ->
         [all] = match
-        duration(rest_after(text, all), Durations.total_ns(all), acc)
+        duration(InfluxQLLex.rest_after(text, all), Durations.total_ns(all), acc)
 
       match = Regex.run(~r/^(?:\d+\.\d+|\.\d+|\d+)(?![\w.])/, text) ->
-        tokenize(rest_after(text, hd(match)), [{:number, hd(match)} | acc])
+        tokenize(InfluxQLLex.rest_after(text, hd(match)), [{:number, hd(match)} | acc])
 
       match = Regex.run(~r/^("(?:[^"\\]|\\.)+"|[A-Za-z_][\w.]*)(?:::(float|integer))?/, text) ->
         [all, name | cast] = match
 
-        tokenize(rest_after(text, all), [name_token(name, List.first(cast)) | acc])
+        tokenize(
+          InfluxQLLex.rest_after(text, all),
+          [name_token(name, List.first(cast)) | acc]
+        )
 
       true ->
         :error
@@ -182,9 +188,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # position the double does not track: refused by name.
   defp duration(_rest, ns, _acc) when ns > SQLLimits.int64_max(), do: :error
   defp duration(rest, ns, acc), do: tokenize(rest, [{:duration, ns} | acc])
-
-  defp rest_after(text, prefix),
-    do: binary_part(text, byte_size(prefix), byte_size(text) - byte_size(prefix))
 
   @spec sum(list()) :: {:ok, term(), list()} | :error
   defp sum(tokens) do
@@ -1123,7 +1126,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp value({:lit, {:int, n}}, _env, _types), do: {:int, n}
   defp value({:lit, {:float, x}}, _env, _types), do: {:float, x}
   defp value({:bool, value}, _env, _types), do: {:bool, value}
-  defp value({:ref, name}, env, types), do: typed(Map.get(types, name), Map.get(env, name))
+
+  defp value({:ref, name}, env, types),
+    do: InfluxQLKernel.typed_value(Map.get(types, name), Map.get(env, name))
+
   defp value({:cast, name, target}, env, types), do: cast(name, target, env, types)
 
   defp value({:fn, name, arguments}, env, types),
@@ -1139,12 +1145,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # (`infer/3`) before any row is read, so this is a form the double has not seen.
   defp value(_other, _env, _types),
     do: InfluxQLError.refuse("a string or a boolean in an expression")
-
-  defp typed(_type, :nan), do: :nan
-  defp typed(:integer, n) when is_integer(n), do: {:int, n}
-  defp typed(:unsigned, n) when is_integer(n), do: {:uint, n}
-  defp typed(:float, x) when is_number(x), do: {:float, x * 1.0}
-  defp typed(_type, _value), do: nil
 
   defp cast(name, :float, env, types) do
     case value({:ref, name}, env, types) do

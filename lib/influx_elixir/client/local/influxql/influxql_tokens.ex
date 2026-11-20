@@ -356,16 +356,16 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp lex(text, acc) do
     case Regex.run(@lexeme, text) do
       [full, duration] ->
-        duration_token(duration, rest_after(text, full), acc)
+        duration_token(duration, InfluxQLLex.rest_after(text, full), acc)
 
       [full, "", number] ->
-        number_token(number, rest_after(text, full), acc)
+        number_token(number, InfluxQLLex.rest_after(text, full), acc)
 
       [full, "", "", _now] ->
-        tokenize(rest_after(text, full), [{:raw, "now()"} | acc])
+        tokenize(InfluxQLLex.rest_after(text, full), [{:raw, "now()"} | acc])
 
       [full, "", "", "", word] ->
-        word_token(String.upcase(word), word, rest_after(text, full), acc)
+        word_token(String.upcase(word), word, InfluxQLLex.rest_after(text, full), acc)
 
       nil ->
         {:error, "unsupported InfluxQL WHERE: #{text}"}
@@ -400,8 +400,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp duration_total(text, rest, total) do
     [part, n, unit] = Regex.run(~q/^(\d+)(ns|ms|u|µ|s|m|h|d|w)/, text)
     count = String.to_integer(n)
-    after_count = binary_part(text, byte_size(n), byte_size(text) - byte_size(n)) <> rest
-    after_part = binary_part(text, byte_size(part), byte_size(text) - byte_size(part))
+    after_count = InfluxQLLex.rest_after(text, n) <> rest
+    after_part = InfluxQLLex.rest_after(text, part)
 
     cond do
       count > SQLLimits.uint64_max() -> {:error, :overflow, after_count}
@@ -633,10 +633,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
       _token, depth -> depth
     end)
   end
-
-  @spec rest_after(binary(), binary()) :: binary()
-  defp rest_after(text, prefix),
-    do: binary_part(text, byte_size(prefix), byte_size(text) - byte_size(prefix))
 
   @spec plain_word(binary(), binary()) :: tuple()
   defp plain_word(upcased, word) do

@@ -242,6 +242,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   end
 
   @doc """
+  The engine's planning error for `time != ...` or `time <> ...`, wrapped in `rewriting
+  statement` / `split condition`.
+  """
+  @spec invalid_time_op_error() :: binary()
+  def invalid_time_op_error do
+    split_error("Error during planning: invalid time comparison operator: !=")
+  end
+
+  @doc """
   The engine's planning error for arithmetic between a signed and an unsigned integer.
   """
   @spec cannot_use_int_unsigned(binary()) :: binary()

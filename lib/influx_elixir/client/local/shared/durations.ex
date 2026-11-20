@@ -28,4 +28,12 @@ defmodule InfluxElixir.Client.Local.Durations do
       total + String.to_integer(count) * ns(unit)
     end)
   end
+
+  @doc "Converts a fractional-second digit string (or capture list) into nanoseconds (0..999_999_999)."
+  @spec fraction_ns(binary() | [binary()] | nil) :: non_neg_integer()
+  def fraction_ns(empty) when empty in ["", nil, []], do: 0
+  def fraction_ns([digits]), do: fraction_ns(digits)
+
+  def fraction_ns(digits) when is_binary(digits),
+    do: digits |> String.slice(0, 9) |> String.pad_trailing(9, "0") |> String.to_integer()
 end

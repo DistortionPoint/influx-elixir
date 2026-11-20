@@ -93,12 +93,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
   def item_name({:multi, kind, _field, _tags, _limit, alias}), do: alias || kind
   def item_name(_item), do: nil
 
+  @doc "Replaces the output name or alias of an item with `name`."
   @spec rename(item(), binary()) :: item()
-  defp rename({:column, column, _name}, name), do: {:column, column, name}
-  defp rename({:aggregate, fun, arg, _alias}, name), do: {:aggregate, fun, arg, name}
-  defp rename({:expr, ast, _alias}, name), do: {:expr, ast, name}
+  def rename({:column, column, _name}, name), do: {:column, column, name}
+  def rename({:aggregate, fun, arg, _alias}, name), do: {:aggregate, fun, arg, name}
+  def rename({:expr, ast, _alias}, name), do: {:expr, ast, name}
 
-  defp rename({:multi, kind, field, tags, limit, _alias}, name),
+  def rename({:multi, kind, field, tags, limit, _alias}, name),
     do: {:multi, kind, field, tags, limit, name}
 
   @doc "The name `name` becomes among those `taken`: itself, else `name_1`, `name_2`..."

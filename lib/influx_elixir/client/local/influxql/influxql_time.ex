@@ -19,7 +19,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   # `trailing_blank?/1`, which claims a refusal, reads the blank as the language does (`~q`).
   import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
 
-  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLTokens, SQLLimits}
+  alias InfluxElixir.Client.Local.{Durations, InfluxQLError, InfluxQLTokens, SQLLimits}
 
   require SQLLimits
 
@@ -126,7 +126,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
         :calendar.date_to_gregorian_days(1970, 1, 1)
 
     seconds = days * @day_seconds + hour * 3600 + minute * 60 + second - offset(zone)
-    ns = seconds * 1_000_000_000 + fraction_ns(fraction)
+    ns = seconds * 1_000_000_000 + Durations.fraction_ns(fraction)
 
     cond do
       SQLLimits.is_int64(ns) -> {:ok, ns}
@@ -152,12 +152,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   end
 
   defp zone_valid?(_z_or_utc), do: true
-
-  @spec fraction_ns(binary()) :: non_neg_integer()
-  defp fraction_ns(""), do: 0
-
-  defp fraction_ns(digits),
-    do: digits |> String.slice(0, 9) |> String.pad_trailing(9, "0") |> String.to_integer()
 
   @spec shown(integer(), integer(), integer(), tuple(), binary()) :: binary()
   defp shown(year, month, day, {hour, minute, second}, fraction) do

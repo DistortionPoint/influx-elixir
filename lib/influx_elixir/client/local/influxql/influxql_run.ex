@@ -310,7 +310,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   # same.
   @spec lower_time(integer() | nil) :: DateTime.t()
   defp lower_time(nil), do: @epoch
-  defp lower_time(ns), do: ns_time(ns)
+  defp lower_time(ns), do: InfluxQLBuckets.ns_time(ns)
 
   # ---------------------------------------------------------------------------
   # One series (one GROUP BY key)
@@ -652,7 +652,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     if plan.transforms == [] do
       Stream.map(buckets, fn {start, values} ->
         base
-        |> Map.put("time", ns_time(start))
+        |> Map.put("time", InfluxQLBuckets.ns_time(start))
         |> Map.merge(finish(values, plan))
         |> Map.put(:null_quotients, null_quotients(values, plan, quotients))
       end)
@@ -662,8 +662,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       |> transform_buckets(plan, query)
       |> Enum.flat_map(fn {start, values} ->
         case finish(values, plan) do
-          visible when map_size(visible) == 0 and drop_empty? -> []
-          visible -> [base |> Map.put("time", ns_time(start)) |> Map.merge(visible)]
+          visible when map_size(visible) == 0 and drop_empty? ->
+            []
+
+          visible ->
+            [base |> Map.put("time", InfluxQLBuckets.ns_time(start)) |> Map.merge(visible)]
         end
       end)
     end
@@ -1107,9 +1110,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     do: InfluxQLExpr.transforms(ast) != [] and InfluxQLExpr.aggregates(ast) == []
 
   defp raw_transform_item?(_item), do: false
-
-  @spec ns_time(integer()) :: DateTime.t()
-  defp ns_time(ns), do: DateTime.from_unix!(Integer.floor_div(ns, 1_000), :microsecond)
 
   @spec count_star?([InfluxQL.item()]) :: boolean()
   defp count_star?(aggregates),

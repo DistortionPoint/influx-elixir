@@ -269,7 +269,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   # microsecond (its floor), so the double answers the same.
   @spec epoch_time(integer()) :: DateTime.t()
   defp epoch_time(ns) do
-    DateTime.from_unix!(Integer.floor_div(ns, 1000), :microsecond)
+    ns_time(ns)
   rescue
     ArgumentError -> refuse("fill() with a number outside the times the double holds")
   end
@@ -381,6 +381,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   """
   @spec time_ns(map()) :: integer()
   def time_ns(%{"time" => time}), do: DateTime.to_unix(time, :microsecond) * 1000
+
+  @doc """
+  Converts a nanosecond Unix timestamp to its microsecond-floored `DateTime`.
+  """
+  @spec ns_time(integer()) :: DateTime.t()
+  def ns_time(ns), do: DateTime.from_unix!(Integer.floor_div(ns, 1_000), :microsecond)
 
   @doc false
   @spec bucket_start(integer(), pos_integer(), integer()) :: integer()

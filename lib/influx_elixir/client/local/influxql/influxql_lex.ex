@@ -74,6 +74,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLLex do
   @spec glued?(binary()) :: boolean()
   def glued?(text), do: Regex.match?(@glued, text)
 
+  @doc "The substring of `text` after `prefix`."
+  @spec rest_after(binary(), binary()) :: binary()
+  def rest_after(text, prefix),
+    do: binary_part(text, byte_size(prefix), byte_size(text) - byte_size(prefix))
+
   @doc """
   The bind parameter (`$name`, `$1`, `$"quoted name"`) the text starts with and what follows
   it, or `nil` when it starts with none.
@@ -81,7 +86,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLLex do
   @spec take_param(binary()) :: {binary(), binary()} | nil
   def take_param(text) do
     with [param] <- Regex.run(~r/\A\$(?:\w+|"(?:[^"\\]|\\.)*")/s, text) do
-      {param, binary_part(text, byte_size(param), byte_size(text) - byte_size(param))}
+      {param, rest_after(text, param)}
     end
   end
 

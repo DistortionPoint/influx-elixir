@@ -26,6 +26,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLKernel do
 
   @typep common :: {:float | :uint | :int, number(), number()} | :lowest
 
+  @doc "Tags a raw field value with its kernel arithmetic type (`:int`, `:uint`, `:float`, `:nan`, or `nil`)."
+  @spec typed_value(atom(), term()) :: value()
+  def typed_value(_type, :nan), do: :nan
+  def typed_value(type, n) when type in [:int, :integer] and is_integer(n), do: {:int, n}
+  def typed_value(type, n) when type in [:uint, :unsigned] and is_integer(n), do: {:uint, n}
+  def typed_value(:float, x) when is_number(x), do: {:float, x * 1.0}
+  def typed_value(_type, _value), do: nil
+
   @doc "The result of `op` (`+ - * / %`) over two values; null in, null out."
   @spec apply_op(binary(), value(), value()) :: value()
   def apply_op(_op, left, right) when is_nil(left) or is_nil(right), do: nil
