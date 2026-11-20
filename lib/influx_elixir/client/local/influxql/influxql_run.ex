@@ -12,6 +12,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     InfluxQLExpr,
     InfluxQLGroup,
     InfluxQLNames,
+    InfluxQLPlan,
     InfluxQLProjection,
     InfluxQLTransform,
     SQLLimits
@@ -207,8 +208,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
 
   defp row_window?(%{query: %{items: items}, plan: plan}) do
     Enum.any?(items, &(aggregate_item?(&1) or raw_transform_item?(&1))) and
-      not (Enum.any?(items, &match?({:multi, _k, _f, _t, _n, _a}, &1)) and
-             length(plan.fields) > 1)
+      not (Enum.any?(items, &InfluxQLPlan.multi?/1) and length(plan.fields) > 1)
   end
 
   # The fields are those of the plan, under the names the answer gives them.
@@ -324,7 +324,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       |> Map.put("iox::measurement", query.measurement)
 
     cond do
-      Enum.any?(query.items, &match?({:multi, _k, _f, _t, _n, _a}, &1)) ->
+      Enum.any?(query.items, &InfluxQLPlan.multi?/1) ->
         multi_selector(rows, context, base)
 
       Enum.any?(query.items, &raw_transform_item?/1) ->
@@ -688,7 +688,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       not lookback?(plan) -> context.lower_ns
       context.lower_ns != nil -> context.lower_ns - every
       rows == [] -> nil
-      true -> time_ns(hd(rows)) - every
+      true -> InfluxQLBuckets.time_ns(hd(rows)) - every
     end
   end
 
@@ -789,7 +789,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       end)
 
     for row <- rows,
-        values = row_values(plan.transforms, results, time_ns(row)),
+        values = row_values(plan.transforms, results, InfluxQLBuckets.time_ns(row)),
         values != %{},
         visible = finish(values, plan),
         visible != %{} do
@@ -802,11 +802,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   # field the select list reads, of whatever type (verified).
   @spec transform_inputs([map()], map(), [binary()]) :: [{integer(), number() | nil}]
   defp transform_inputs(rows, %{name: "elapsed"}, sources) do
-    for row <- rows, Enum.any?(sources, &(row[&1] != nil)), do: {time_ns(row), 0}
+    for row <- rows, Enum.any?(sources, &(row[&1] != nil)), do: {InfluxQLBuckets.time_ns(row), 0}
   end
 
   defp transform_inputs(rows, transform, _sources) do
-    for row <- rows, is_number(row[transform.source]), do: {time_ns(row), row[transform.source]}
+    for row <- rows,
+        is_number(row[transform.source]),
+        do: {InfluxQLBuckets.time_ns(row), row[transform.source]}
   end
 
   defp raw_results(inputs, transform) do
@@ -821,9 +823,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
         into: %{},
         do: {transform.key, result}
   end
-
-  @spec time_ns(map()) :: integer()
-  defp time_ns(%{"time" => time}), do: DateTime.to_unix(time, :microsecond) * 1000
 
   # The aggregates to compute for a select list: its own, and those inside
   # expressions (named apart, `"\0agg0"`...), with the expressions rewritten to
@@ -937,8 +936,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   # order of their ranks.
   @spec multi_selector([map()], map(), map()) :: [map()]
   defp multi_selector(rows, %{query: query} = context, base) do
-    {:multi, kind, field, tags, limit, _alias} =
-      Enum.find(query.items, &match?({:multi, _k, _f, _t, _n, _a}, &1))
+    {:multi, kind, field, tags, limit, _alias} = Enum.find(query.items, &InfluxQLPlan.multi?/1)
 
     cond do
       not MapSet.member?(context.tags, field) ->
@@ -997,7 +995,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       Enum.flat_map(groups, fn group ->
         group
         |> choose(kind, field, tags, {limit, query.descending})
-        |> Enum.sort_by(fn {rank, point} -> {time_ns(point), rank} end)
+        |> Enum.sort_by(fn {rank, point} -> {InfluxQLBuckets.time_ns(point), rank} end)
         |> Enum.map(&elem(&1, 1))
       end)
 
@@ -1049,7 +1047,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
 
   defp bucket_rows(rows, every, offset) do
     rows
-    |> Enum.group_by(&InfluxQLBuckets.bucket_start(time_ns(&1), every, offset))
+    |> Enum.group_by(&InfluxQLBuckets.bucket_start(InfluxQLBuckets.time_ns(&1), every, offset))
     |> Enum.sort_by(&elem(&1, 0))
     |> Enum.map(&elem(&1, 1))
   end
@@ -1065,7 +1063,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
         |> best_of_each(kind, field, descending?)
       end
 
-    {valued, empty} = Enum.split_with(points, &orderable?(&1[field]))
+    {valued, empty} = Enum.split_with(points, &InfluxQLAggregate.orderable?(&1[field]))
 
     valued
     |> Enum.sort_by(&order_key(&1[field]), if(kind == "top", do: :desc, else: :asc))
@@ -1088,20 +1086,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
         if better?(kind, point[field], best[field]), do: point, else: best
       end)
     end)
-    |> Enum.sort_by(&time_ns/1, if(descending?, do: :desc, else: :asc))
+    |> Enum.sort_by(&InfluxQLBuckets.time_ns/1, if(descending?, do: :desc, else: :asc))
   end
 
   defp better?(kind, value, best) do
     cond do
-      not orderable?(value) -> false
-      not orderable?(best) -> true
+      not InfluxQLAggregate.orderable?(value) -> false
+      not InfluxQLAggregate.orderable?(best) -> true
       kind == "top" -> order_key(value) > order_key(best)
       true -> order_key(value) < order_key(best)
     end
   end
-
-  defp orderable?(value),
-    do: is_number(value) or is_binary(value) or is_boolean(value) or is_struct(value, DateTime)
 
   defp order_key(%DateTime{} = dt), do: DateTime.to_unix(dt, :nanosecond)
   defp order_key(value), do: value

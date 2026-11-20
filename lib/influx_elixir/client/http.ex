@@ -395,14 +395,7 @@ defmodule InfluxElixir.Client.HTTP do
   # `query_sql/3` gives for it, never a raise.
   @spec execute_answer(term()) :: {:ok, map() | [map()]} | {:error, {:unexpected_json, term()}}
   defp execute_answer(summary) when is_map(summary), do: {:ok, summary}
-
-  defp execute_answer(rows) when is_list(rows) do
-    case Enum.reject(rows, &is_map/1) do
-      [] -> {:ok, Enum.map(rows, &ResponseParser.coerce_types/1)}
-      [other | _rest] -> {:error, {:unexpected_json, other}}
-    end
-  end
-
+  defp execute_answer(rows) when is_list(rows), do: ResponseParser.coerce_rows(rows)
   defp execute_answer(other), do: {:error, {:unexpected_json, other}}
 
   # ---------------------------------------------------------------------------

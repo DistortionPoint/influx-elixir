@@ -65,9 +65,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLBlanks do
     |> Enum.min_by(&elem(&1, 0), fn -> nil end)
   end
 
-  # The select list: the text up to the `FROM` that ends it, all of it without one.
+  @doc """
+  The select list: the text up to the `FROM` that ends it, all of it without one.
+  """
   @spec select_list(binary()) :: binary()
-  defp select_list(masked_head) do
+  def select_list(masked_head) do
     case Regex.run(InfluxQLText.from_keyword(), masked_head, return: :index) do
       [{from, _size}] -> binary_part(masked_head, 0, from)
       nil -> masked_head

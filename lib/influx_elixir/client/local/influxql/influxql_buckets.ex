@@ -376,8 +376,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   @spec transpose([[term()]]) :: [[term()]]
   defp transpose(rows), do: rows |> Enum.zip() |> Enum.map(&Tuple.to_list/1)
 
+  @doc """
+  Returns the nanosecond timestamp of a row map's `"time"` `DateTime`.
+  """
   @spec time_ns(map()) :: integer()
-  defp time_ns(%{"time" => time}), do: DateTime.to_unix(time, :microsecond) * 1000
+  def time_ns(%{"time" => time}), do: DateTime.to_unix(time, :microsecond) * 1000
 
   @doc false
   @spec bucket_start(integer(), pos_integer(), integer()) :: integer()

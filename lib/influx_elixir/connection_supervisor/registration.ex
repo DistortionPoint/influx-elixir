@@ -11,7 +11,10 @@ defmodule InfluxElixir.ConnectionSupervisor.Registration do
 
   use GenServer
 
+  alias InfluxElixir.Client.Options
   alias InfluxElixir.Connection
+
+  require Options
 
   # The connection travels as a closure: a child spec and a process's state are printed when a
   # start fails or the process crashes, and an HTTP connection holds its token.
@@ -34,7 +37,7 @@ defmodule InfluxElixir.ConnectionSupervisor.Registration do
 
   @doc false
   @spec process_name(atom()) :: atom()
-  def process_name(name) when is_atom(name) and name not in [nil, true, false],
+  def process_name(name) when Options.is_name_atom(name),
     do: :"influx_elixir_#{name}_registration"
 
   @impl GenServer

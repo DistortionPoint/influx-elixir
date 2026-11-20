@@ -471,9 +471,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
     end
   end
 
-  # `min` and `max` take numbers and strings (by bytes).
+  @doc """
+  Whether `value` is a non-null orderable scalar (`min`, `max`, `top`, and `bottom` take
+  numbers, strings by bytes, booleans, and `DateTime`s).
+  """
   @spec orderable?(term()) :: boolean()
-  defp orderable?(value),
+  def orderable?(value),
     do: is_number(value) or is_binary(value) or is_boolean(value) or is_struct(value, DateTime)
 
   # `>` on two times compares the structs, not the instants.

@@ -12,6 +12,8 @@ defmodule InfluxElixir.Write.Writer do
   alias InfluxElixir.{Connection, Telemetry}
   alias InfluxElixir.Write.{LineProtocol, Point}
 
+  require Options
+
   @gzip_threshold 1024
 
   @doc """
@@ -114,7 +116,7 @@ defmodule InfluxElixir.Write.Writer do
   @doc false
   # Whether `client` is a module implementing `write/3`.
   @spec client?(term()) :: boolean()
-  def client?(client) when is_atom(client) and client not in [nil, true, false],
+  def client?(client) when Options.is_name_atom(client),
     do: Code.ensure_loaded?(client) and function_exported?(client, :write, 3)
 
   def client?(_other), do: false
@@ -144,7 +146,7 @@ defmodule InfluxElixir.Write.Writer do
   # A registered connection's name is the connection: the same term `InfluxElixir.write/3`
   # resolves, so a `BatchWriter` started with `connection: :name` writes through it.
   @spec resolve(term()) :: {:ok, term()} | {:error, {:invalid_connection, atom()}}
-  defp resolve(name) when is_atom(name) and name not in [nil, true, false] do
+  defp resolve(name) when Options.is_name_atom(name) do
     case Connection.get(name) do
       {:ok, connection} -> {:ok, connection}
       {:error, :not_found} -> {:error, {:invalid_connection, name}}

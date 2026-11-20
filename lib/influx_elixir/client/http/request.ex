@@ -8,6 +8,8 @@ defmodule InfluxElixir.Client.HTTP.Request do
   alias InfluxElixir.Client.Options
   alias InfluxElixir.{Config, ConnectionSupervisor}
 
+  require Options
+
   # Default `Finch.request/3` receive timeout, mirroring
   # `InfluxElixir.Flight.Client`'s default so HTTP and Flight transports
   # have parity. Finch's own default is 15s, which is too short for many
@@ -183,11 +185,10 @@ defmodule InfluxElixir.Client.HTTP.Request do
   @spec resolve_finch(keyword()) :: {:ok, atom()} | {:error, :no_pool_name}
   def resolve_finch(connection) do
     case {Keyword.get(connection, :finch_name), Keyword.get(connection, :name)} do
-      {finch_name, _name}
-      when is_atom(finch_name) and finch_name not in [nil, true, false] ->
+      {finch_name, _name} when Options.is_name_atom(finch_name) ->
         {:ok, finch_name}
 
-      {nil, name} when is_atom(name) and name not in [nil, true, false] ->
+      {nil, name} when Options.is_name_atom(name) ->
         {:ok, ConnectionSupervisor.finch_name(name)}
 
       _other ->
@@ -234,13 +235,11 @@ defmodule InfluxElixir.Client.HTTP.Request do
   # a tuple or a list has no form there: the caller's error, never a raise.
   @spec url_values(keyword()) :: :ok | {:error, {:invalid_value, atom(), term()}}
   def url_values(values) do
-    case Enum.find(values, fn {_key, value} -> not url_text?(value) end) do
+    case Enum.find(values, fn {_key, value} -> not Options.is_url_text(value) end) do
       nil -> :ok
       {key, value} -> {:error, {:invalid_value, key, value}}
     end
   end
-
-  defp url_text?(value), do: is_binary(value) or is_atom(value) or is_number(value)
 
   # A connection for `Client.HTTP` is a keyword list; anything else (a `Client.Local` map, a
   # host name, a number) has no config keys to read: the caller's error, never a raise.
@@ -254,10 +253,10 @@ defmodule InfluxElixir.Client.HTTP.Request do
   @spec valid_connection?(keyword()) :: boolean()
   defp valid_connection?(conn) do
     Keyword.get(conn, :api_version, :v3) in [nil, :v2, :v3] and
-      url_text?(Keyword.get(conn, :scheme)) and
-      url_text?(Keyword.get(conn, :host)) and
-      url_text?(Keyword.get(conn, :port)) and
-      url_text?(Keyword.get(conn, :token)) and
+      Options.is_url_text(Keyword.get(conn, :scheme)) and
+      Options.is_url_text(Keyword.get(conn, :host)) and
+      Options.is_url_text(Keyword.get(conn, :port)) and
+      Options.is_url_text(Keyword.get(conn, :token)) and
       Options.timeout_opt?(Keyword.get(conn, :timeout)) and
       Options.timeout_opt?(Keyword.get(conn, :pool_timeout))
   end
@@ -276,12 +275,9 @@ defmodule InfluxElixir.Client.HTTP.Request do
     Options.timeout_opt?(Keyword.get(opts, :timeout)) and
       Options.timeout_opt?(Keyword.get(opts, :pool_timeout)) and
       Options.timeout_opt?(Keyword.get(opts, :connect_timeout)) and
-      valid_boolean_opt?(Keyword.get(opts, :tls)) and
-      valid_boolean_opt?(Keyword.get(opts, :gzip))
+      Options.boolean_opt?(Keyword.get(opts, :tls)) and
+      Options.boolean_opt?(Keyword.get(opts, :gzip))
   end
-
-  @spec valid_boolean_opt?(term()) :: boolean()
-  defp valid_boolean_opt?(flag), do: is_nil(flag) or is_boolean(flag)
 
   # A request body is JSON, which holds only UTF-8 text: text that is not is
   # the caller's error, returned as one, never a `Jason.EncodeError` raised.

@@ -202,12 +202,12 @@ defmodule InfluxElixir.Client.HTTP.Stream do
   # so a row is the same map streamed or not.
   @spec decode_line(binary()) :: map()
   defp decode_line(line) do
-    case Jason.decode(line) do
-      {:ok, row} when is_map(row) ->
-        ResponseParser.coerce_types(row)
+    case ResponseParser.decode_jsonl_line(line) do
+      {:ok, row} ->
+        row
 
-      {:ok, other} ->
-        raise InfluxElixir.StreamError, kind: :decode, reason: {:unexpected_json, other}
+      {:error, {:jsonl_parse_error, reason}} ->
+        raise InfluxElixir.StreamError, kind: :decode, reason: reason
 
       {:error, reason} ->
         raise InfluxElixir.StreamError, kind: :decode, reason: reason

@@ -166,10 +166,8 @@ defmodule InfluxElixir.Flight.FlatBuffer do
   """
   @spec read_string(binary(), non_neg_integer()) :: binary()
   def read_string(buf, offset_pos) do
-    <<rel_offset::little-unsigned-32>> = binary_part(buf, offset_pos, 4)
-    string_pos = offset_pos + rel_offset
-    <<str_len::little-32>> = binary_part(buf, string_pos, 4)
-    binary_part(buf, string_pos + 4, str_len)
+    {data_pos, str_len} = read_vector_header(buf, offset_pos)
+    binary_part(buf, data_pos, str_len)
   end
 
   @doc """

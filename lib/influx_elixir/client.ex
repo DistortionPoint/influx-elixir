@@ -52,6 +52,10 @@ defmodule InfluxElixir.Client do
   Implementations must not silently ignore the singular `:database` key.
   """
 
+  alias InfluxElixir.Client.Options
+
+  require Options
+
   @type connection :: term()
   # Rows, or the response body as it came for `format: :parquet` (`Client.HTTP` only).
   @type query_result :: {:ok, [map()] | binary()} | {:error, term()}
@@ -111,7 +115,7 @@ defmodule InfluxElixir.Client do
   @spec impl() :: module()
   def impl do
     case Application.get_env(:influx_elixir, :client, InfluxElixir.Client.HTTP) do
-      client when is_atom(client) and client not in [nil, true, false] -> client
+      client when Options.is_name_atom(client) -> client
       _other -> InfluxElixir.Client.HTTP
     end
   end

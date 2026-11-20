@@ -137,11 +137,8 @@ defmodule InfluxElixir.Flight.Client do
   defp valid_options?(opts) do
     Options.timeout_opt?(Keyword.get(opts, :timeout)) and
       Options.timeout_opt?(Keyword.get(opts, :connect_timeout)) and
-      valid_tls_opt?(Keyword.get(opts, :tls))
+      Options.boolean_opt?(Keyword.get(opts, :tls))
   end
-
-  @spec valid_tls_opt?(term()) :: boolean()
-  defp valid_tls_opt?(tls), do: is_nil(tls) or is_boolean(tls)
 
   @spec query_with_opts(connection(), term(), keyword()) :: {:ok, [map()]} | {:error, term()}
   defp query_with_opts(connection, sql, opts) do

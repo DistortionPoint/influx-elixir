@@ -70,7 +70,7 @@ defmodule InfluxElixir.Client.Local.Flux do
   # carries, so `first()` and `last()` choose between points a microsecond
   # holds as the engine does.
 
-  alias InfluxElixir.Client.Local.{Durations, SQLLimits}
+  alias InfluxElixir.Client.Local.{Durations, SQLLimits, SQLPredicate}
   alias InfluxElixir.Query.ResponseParser
 
   @typedoc """
@@ -685,19 +685,15 @@ defmodule InfluxElixir.Client.Local.Flux do
   defp split_pipeline(flux) do
     flux
     |> split_top_level("|>")
-    |> Enum.reduce_while({:ok, []}, fn text, {:ok, acc} ->
+    |> SQLPredicate.map_ok(fn text ->
       case Regex.run(~r/^\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$/s, text) do
         [_full, name, args] ->
-          {:cont, {:ok, [{name, args} | acc]}}
+          {:ok, {name, args}}
 
         nil ->
-          {:halt, {:error, "Client.Local: unsupported Flux expression: #{String.trim(text)}"}}
+          {:error, "Client.Local: unsupported Flux expression: #{String.trim(text)}"}
       end
     end)
-    |> case do
-      {:ok, calls} -> {:ok, Enum.reverse(calls)}
-      error -> error
-    end
   end
 
   @spec parse_from([{binary(), binary()}]) ::
@@ -717,17 +713,7 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   @spec parse_stages([{binary(), binary()}], integer()) :: {:ok, [stage()]} | {:error, binary()}
   defp parse_stages(calls, now_ns) do
-    calls
-    |> Enum.reduce_while({:ok, []}, fn call, {:ok, acc} ->
-      case parse_stage(call, now_ns) do
-        {:ok, stage} -> {:cont, {:ok, [stage | acc]}}
-        {:error, _message} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, stages} -> {:ok, Enum.reverse(stages)}
-      error -> error
-    end
+    SQLPredicate.map_ok(calls, &parse_stage(&1, now_ns))
   end
 
   @selectors %{"first" => :first, "last" => :last, "min" => :min, "max" => :max}

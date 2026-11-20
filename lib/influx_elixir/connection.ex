@@ -46,6 +46,8 @@ defmodule InfluxElixir.Connection do
 
   alias InfluxElixir.Client.Options
 
+  require Options
+
   @doc """
   Stores a validated connection config under the given name.
 
@@ -60,7 +62,7 @@ defmodule InfluxElixir.Connection do
       :ok
   """
   @spec put(atom(), term()) :: :ok
-  def put(name, connection) when is_atom(name) and name not in [nil, true, false] do
+  def put(name, connection) when Options.is_name_atom(name) do
     :persistent_term.put({__MODULE__, name}, connection)
     :ok
   end
@@ -82,7 +84,7 @@ defmodule InfluxElixir.Connection do
       "localhost"
   """
   @spec get(term()) :: {:ok, term()} | {:error, :not_found}
-  def get(name) when is_atom(name) and name not in [nil, true, false] do
+  def get(name) when Options.is_name_atom(name) do
     missing = make_ref()
 
     case :persistent_term.get({__MODULE__, name}, missing) do
@@ -132,7 +134,7 @@ defmodule InfluxElixir.Connection do
     * `name` - atom identifying the connection
   """
   @spec delete(term()) :: :ok
-  def delete(name) when is_atom(name) and name not in [nil, true, false] do
+  def delete(name) when Options.is_name_atom(name) do
     # erase/1 returns false for a missing key; it never raises.
     :persistent_term.erase({__MODULE__, name})
     :ok
@@ -156,7 +158,7 @@ defmodule InfluxElixir.Connection do
       :v3
   """
   @spec api_version(term()) :: :v2 | :v3
-  def api_version(name) when is_atom(name) and name not in [nil, true, false] do
+  def api_version(name) when Options.is_name_atom(name) do
     case get(name) do
       {:ok, connection} -> api_version(connection)
       {:error, :not_found} -> :v3
@@ -184,11 +186,10 @@ defmodule InfluxElixir.Connection do
     * `name` - atom identifying the connection
   """
   @spec finch_name(atom()) :: atom()
-  def finch_name(name) when is_atom(name) and name not in [nil, true, false] do
+  def finch_name(name) when Options.is_name_atom(name) do
     with {:ok, connection} when is_list(connection) <- get(name),
          true <- Options.keyword?(connection),
-         finch when is_atom(finch) and finch not in [nil, true, false] <-
-           Keyword.get(connection, :finch_name) do
+         finch when Options.is_name_atom(finch) <- Keyword.get(connection, :finch_name) do
       finch
     else
       _derived -> InfluxElixir.ConnectionSupervisor.finch_name(name)

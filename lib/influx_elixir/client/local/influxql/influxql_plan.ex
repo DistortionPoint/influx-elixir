@@ -418,11 +418,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
     {:error,
      {:engine, 500,
-      "External error: InfluxQL internal error: no conversion from #{number_text(number)} to #{type_name}"}}
+      "External error: InfluxQL internal error: no conversion from #{InfluxQLLiteral.display(number)} to #{type_name}"}}
   end
-
-  defp number_text(number) when is_integer(number), do: Integer.to_string(number)
-  defp number_text(number) when is_float(number), do: InfluxQLLiteral.display(number)
 
   # What `top()` and `bottom()` read beside other columns (verified): a field the measurement
   # lacks, with a field beside it, and a `time` that is aliased, are the schema error that lists
@@ -431,7 +428,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   @spec multi_schema(InfluxQL.query(), map(), MapSet.t(binary())) ::
           :ok | {:error, {:engine, 500, binary()} | binary()}
   defp multi_schema(%{items: items, measurement: table}, types, tags) do
-    case Enum.find(items, &match?({:multi, _kind, _field, _tags, _limit, _alias}, &1)) do
+    case Enum.find(items, &multi?/1) do
       # a measurement the double knows no columns of is no schema to name
       {:multi, _kind, _field, _by, _limit, _alias} when map_size(types) == 0 ->
         :ok
@@ -488,12 +485,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   # are fine. An error found while a call was read comes first.
   @spec multi_rules([InfluxQL.item()]) :: :ok | {:error, {:engine, binary()}}
   defp multi_rules(items) do
-    has_multi? = Enum.any?(items, &match?({:multi, _k, _f, _t, _n, _a}, &1))
-
-    has_other? =
-      Enum.any?(items, fn item ->
-        aggregate?(item) and not match?({:multi, _k, _f, _t, _n, _a}, item)
-      end)
+    has_multi? = Enum.any?(items, &multi?/1)
+    has_other? = Enum.any?(items, &(aggregate?(&1) and not multi?(&1)))
 
     if has_multi? and has_other?,
       do: planning("selector functions top and bottom cannot be combined with other functions"),
@@ -560,7 +553,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   defp item_errors([item | rest], types, tags, group_time, multis) do
     case item_error(item, types, tags) || transform_error(item, group_time) do
       nil ->
-        count = if match?({:multi, _k, _f, _t, _n, _a}, item), do: 1, else: 0
+        count = if multi?(item), do: 1, else: 0
         item_errors(rest, types, tags, group_time, multis + count)
 
       error ->
@@ -869,8 +862,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
        else: :ok
   end
 
-  defp multi?({:multi, _kind, _field, _tags, _limit, _alias}), do: true
-  defp multi?(_item), do: false
+  @doc """
+  Whether `item` is a multi-point selector (`top()` or `bottom()`).
+  """
+  @spec multi?(InfluxQL.item()) :: boolean()
+  def multi?({:multi, _kind, _field, _tags, _limit, _alias}), do: true
+  def multi?(_item), do: false
 
   defp aggregate?({:aggregate, _fun, _arg, _alias}), do: true
   defp aggregate?({:multi, _kind, _field, _tags, _limit, _alias}), do: true

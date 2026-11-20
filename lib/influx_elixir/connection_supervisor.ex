@@ -63,6 +63,8 @@ defmodule InfluxElixir.ConnectionSupervisor do
   alias InfluxElixir.Client.Options
   alias InfluxElixir.ConnectionSupervisor.{Registration, Secret}
 
+  require Options
+
   @doc """
   The child spec that starts a ConnectionSupervisor for `config`, with its `:token`
   made opaque (see "Failures to start").
@@ -112,8 +114,8 @@ defmodule InfluxElixir.ConnectionSupervisor do
   def start_link(config) do
     # A config that is not a keyword list holding an atom `:name` cannot name a connection:
     # the caller's error, never a raise.
-    with true <- InfluxElixir.Client.Options.keyword?(config),
-         name when is_atom(name) and name not in [nil, true, false] <- Keyword.get(config, :name) do
+    with true <- Options.keyword?(config),
+         name when Options.is_name_atom(name) <- Keyword.get(config, :name) do
       start_named(name, config)
     else
       _invalid -> {:error, {:invalid_options, Secret.redact(config)}}
@@ -194,7 +196,7 @@ defmodule InfluxElixir.ConnectionSupervisor do
   defp children(config, {name, _client, _conn} = registration, finch_name, pool_size) do
     finch_children =
       case Keyword.get(config, :finch_name) do
-        pool when is_atom(pool) and pool not in [nil, true, false] ->
+        pool when Options.is_name_atom(pool) ->
           []
 
         _no_external_pool ->
@@ -258,21 +260,19 @@ defmodule InfluxElixir.ConnectionSupervisor do
 
   @doc false
   @spec finch_name(atom()) :: atom()
-  def finch_name(connection_name)
-      when is_atom(connection_name) and connection_name not in [nil, true, false] do
+  def finch_name(connection_name) when Options.is_name_atom(connection_name) do
     :"influx_elixir_#{connection_name}_finch"
   end
 
   @doc false
   @spec batch_writer_name(atom()) :: atom()
-  def batch_writer_name(connection_name)
-      when is_atom(connection_name) and connection_name not in [nil, true, false] do
+  def batch_writer_name(connection_name) when Options.is_name_atom(connection_name) do
     :"influx_elixir_#{connection_name}_batch_writer"
   end
 
   @doc false
   @spec via(atom()) :: atom()
-  def via(name) when is_atom(name) and name not in [nil, true, false] do
+  def via(name) when Options.is_name_atom(name) do
     # A suffix, as every other derived name has: as a prefix (`influx_elixir_conn_<name>`)
     # the supervisor of `:a_finch` took the pool name of `:conn_a`.
     :"influx_elixir_#{name}_supervisor"

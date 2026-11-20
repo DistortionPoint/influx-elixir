@@ -185,9 +185,12 @@ defmodule InfluxElixir.Client.Local.LineProtocolNumber do
     end
   end
 
+  @doc """
+  Splits an optional leading `"-"` sign from `text`, returning `{sign, unsigned}`.
+  """
   @spec split_sign(binary()) :: {binary(), binary()}
-  defp split_sign("-" <> unsigned), do: {"-", unsigned}
-  defp split_sign(unsigned), do: {"", unsigned}
+  def split_sign("-" <> unsigned), do: {"-", unsigned}
+  def split_sign(unsigned), do: {"", unsigned}
 
   @spec split_point(binary()) :: {binary(), binary()}
   defp split_point(unsigned) do

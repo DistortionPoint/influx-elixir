@@ -24,7 +24,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
     InfluxQLSelectCheck,
     InfluxQLSources,
     InfluxQLText,
-    InfluxQLTokens
+    InfluxQLTokens,
+    SQLPredicate
   }
 
   @aggregates ~w(mean sum count min max first last median spread stddev distinct)
@@ -373,13 +374,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
 
   @spec lexer_in_list(InfluxQLCheck.lexer() | nil, binary()) :: InfluxQLCheck.lexer() | nil
   defp lexer_in_list({:lexer, start, _error} = lexer, masked_head) do
-    list_end =
-      case Regex.run(InfluxQLText.from_keyword(), masked_head, return: :index) do
-        [{from, _size}] -> from
-        nil -> byte_size(masked_head)
-      end
-
-    if start < list_end, do: lexer
+    if start < byte_size(InfluxQLBlanks.select_list(masked_head)), do: lexer
   end
 
   defp lexer_in_list(nil, _masked_head), do: nil
@@ -546,19 +541,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   defp parse_items(text, masked) do
     masked
     |> InfluxQLSelectCheck.comma_pieces(0)
-    |> Enum.map(fn {piece, at} ->
-      text |> binary_part(at, byte_size(piece)) |> InfluxQLLex.trim_both_blanks()
+    |> SQLPredicate.map_ok(fn {piece, at} ->
+      text |> binary_part(at, byte_size(piece)) |> InfluxQLLex.trim_both_blanks() |> parse_item()
     end)
-    |> Enum.reduce_while({:ok, []}, fn text, {:ok, acc} ->
-      case parse_item(text) do
-        {:ok, item} -> {:cont, {:ok, [item | acc]}}
-        {:error, _message} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, items} -> {:ok, Enum.reverse(items)}
-      error -> error
-    end
   end
 
   @spec parse_item(binary()) :: {:ok, InfluxQL.item()} | {:error, binary()}

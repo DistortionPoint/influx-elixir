@@ -55,7 +55,7 @@ defmodule InfluxElixir.Query.ResponseParser do
 
   def parse(body, :json) do
     case Jason.decode(body) do
-      {:ok, data} when is_list(data) -> rows(data)
+      {:ok, data} when is_list(data) -> coerce_rows(data)
       {:ok, data} when is_map(data) -> {:ok, [coerce_types(data)]}
       {:ok, other} -> {:error, {:unexpected_json, other}}
       {:error, reason} -> {:error, {:json_parse_error, reason}}
@@ -69,10 +69,9 @@ defmodule InfluxElixir.Query.ResponseParser do
     |> String.split("\n")
     |> Enum.reject(&(String.trim(&1) == ""))
     |> Enum.reduce_while({:ok, []}, fn line, {:ok, acc} ->
-      case Jason.decode(line) do
-        {:ok, row} when is_map(row) -> {:cont, {:ok, [coerce_types(row) | acc]}}
-        {:ok, other} -> {:halt, {:error, {:unexpected_json, other}}}
-        {:error, reason} -> {:halt, {:error, {:jsonl_parse_error, reason}}}
+      case decode_jsonl_line(line) do
+        {:ok, row} -> {:cont, {:ok, [row | acc]}}
+        {:error, _reason} = error -> {:halt, error}
       end
     end)
     |> case do
@@ -105,11 +104,29 @@ defmodule InfluxElixir.Query.ResponseParser do
 
   # Every element of a JSON array of rows must be an object: a proxy's or a
   # truncated body is an error for the caller, not a crash.
-  @spec rows(list()) :: {:ok, [map()]} | {:error, term()}
-  defp rows(data) do
-    if Enum.all?(data, &is_map/1),
-      do: {:ok, Enum.map(data, &coerce_types/1)},
-      else: {:error, {:unexpected_json, data |> Enum.reject(&is_map/1) |> hd()}}
+  @doc """
+  Coerces known value types in a list of row maps, or returns
+  `{:error, {:unexpected_json, element}}` when any element is not a map.
+  """
+  @spec coerce_rows(list()) :: {:ok, [map()]} | {:error, {:unexpected_json, term()}}
+  def coerce_rows(data) when is_list(data) do
+    case Enum.reject(data, &is_map/1) do
+      [] -> {:ok, Enum.map(data, &coerce_types/1)}
+      [other | _rest] -> {:error, {:unexpected_json, other}}
+    end
+  end
+
+  @doc """
+  Decodes a single JSONL line into a coerced row map.
+  """
+  @spec decode_jsonl_line(binary()) ::
+          {:ok, map()} | {:error, {:unexpected_json, term()} | {:jsonl_parse_error, term()}}
+  def decode_jsonl_line(line) do
+    case Jason.decode(line) do
+      {:ok, row} when is_map(row) -> {:ok, coerce_types(row)}
+      {:ok, other} -> {:error, {:unexpected_json, other}}
+      {:error, reason} -> {:error, {:jsonl_parse_error, reason}}
+    end
   end
 
   # A body CSV cannot read (a quote left open, a stray quote inside a cell) is an error. Text

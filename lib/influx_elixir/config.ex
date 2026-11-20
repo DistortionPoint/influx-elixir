@@ -45,6 +45,10 @@ defmodule InfluxElixir.Config do
       ...> )
   """
 
+  alias InfluxElixir.Client.Options
+
+  require Options
+
   @schema [
     host: [
       type: {:custom, __MODULE__, :host, []},
@@ -136,7 +140,7 @@ defmodule InfluxElixir.Config do
   @spec validate(keyword()) ::
           {:ok, keyword()} | {:error, NimbleOptions.ValidationError.t()}
   def validate(opts) do
-    if InfluxElixir.Client.Options.keyword?(opts) do
+    if Options.keyword?(opts) do
       NimbleOptions.validate(opts, @schema)
     else
       {:error,
@@ -178,7 +182,7 @@ defmodule InfluxElixir.Config do
 
   @doc false
   @spec name_atom(term()) :: {:ok, atom()} | {:error, binary()}
-  def name_atom(value) when is_atom(value) and value not in [nil, true, false], do: {:ok, value}
+  def name_atom(value) when Options.is_name_atom(value), do: {:ok, value}
   def name_atom(value), do: {:error, "expected atom, got: #{inspect(value)}"}
 
   @doc """
@@ -222,7 +226,7 @@ defmodule InfluxElixir.Config do
   """
   @spec base_url(keyword()) :: binary()
   def base_url(opts) do
-    if InfluxElixir.Client.Options.keyword?(opts) do
+    if Options.keyword?(opts) do
       scheme = url_piece(Keyword.get(opts, :scheme, :https))
       host = url_piece(Keyword.get(opts, :host))
       port = url_piece(Keyword.get(opts, :port, 8086))
@@ -233,8 +237,6 @@ defmodule InfluxElixir.Config do
   end
 
   @spec url_piece(term()) :: binary()
-  defp url_piece(value) when is_binary(value) or is_atom(value) or is_number(value),
-    do: to_string(value)
-
+  defp url_piece(value) when Options.is_url_text(value), do: to_string(value)
   defp url_piece(_other), do: ""
 end

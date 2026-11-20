@@ -26,7 +26,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
 
   import InfluxElixir.Client.Local.InfluxQLError, only: [refuse: 1]
 
-  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLExpr, InfluxQLNames}
+  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLExpr, InfluxQLNames, InfluxQLPlan}
 
   @same_name "select items that end up with the same name"
 
@@ -369,7 +369,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
   # The names of the value `top()` / `bottom()` answers and of the tags it chooses by.
   @spec multi([entry()], InfluxQL.query()) :: nil | %{value: binary(), tags: [binary()]}
   defp multi(entries, %{items: items}) do
-    case Enum.find_index(items, &match?({:multi, _k, _f, _t, _n, _a}, &1)) do
+    case Enum.find_index(items, &InfluxQLPlan.multi?/1) do
       nil ->
         nil
 

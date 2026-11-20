@@ -854,8 +854,8 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   end
 
   @doc "Maps `parse` over `items`, halting at the first `{:error, reason}`."
-  @spec map_ok([term()], (term() -> {:ok, term()} | {:error, map()})) ::
-          {:ok, [term()]} | {:error, map()}
+  @spec map_ok([term()], (term() -> {:ok, term()} | {:error, term()})) ::
+          {:ok, [term()]} | {:error, term()}
   def map_ok(items, parse) do
     items
     |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->

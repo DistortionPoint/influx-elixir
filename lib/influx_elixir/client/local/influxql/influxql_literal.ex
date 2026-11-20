@@ -8,7 +8,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
   # `Literal(Float(1.5))`, `Literal(String("a"))`,
   # `Literal(Duration(Duration(5000000000)))`).
 
-  alias InfluxElixir.Client.Local.{Durations, InfluxQLError, InfluxQLText, SQLLimits}
+  alias InfluxElixir.Client.Local.{
+    Durations,
+    InfluxQLError,
+    InfluxQLText,
+    LineProtocolNumber,
+    SQLLimits
+  }
 
   require SQLLimits
 
@@ -63,10 +69,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
   end
 
   @doc """
-  A float as Rust's `Display` writes it (`2.0` is `2`, `0.5` is `0.5`, never an
+  A number as Rust's `Display` writes it (`2.0` is `2`, `0.5` is `0.5`, never an
   exponent), the way the engine words a number in its errors.
   """
-  @spec display(float()) :: binary()
+  @spec display(number()) :: binary()
+  def display(value) when is_integer(value), do: Integer.to_string(value)
+
   def display(value) when is_float(value),
     do: value |> Float.to_string() |> plain() |> String.replace_suffix(".0", "")
 
@@ -82,7 +90,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
 
   @spec shift(binary(), integer()) :: binary()
   defp shift(mantissa, exponent) do
-    {sign, unsigned} = split_sign(mantissa)
+    {sign, unsigned} = LineProtocolNumber.split_sign(mantissa)
     [whole, fraction] = String.split(unsigned, ".")
     digits = whole <> String.trim_trailing(fraction, "0")
     point = byte_size(whole) + exponent
@@ -99,10 +107,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
         sign <> binary_part(digits, 0, point) <> "." <> binary_part(digits, point, size - point)
     end
   end
-
-  @spec split_sign(binary()) :: {binary(), binary()}
-  defp split_sign("-" <> unsigned), do: {"-", unsigned}
-  defp split_sign(unsigned), do: {"", unsigned}
 
   @display_units for unit <- ~w(w d h m s ms u ns), do: {unit, Durations.ns(unit)}
 

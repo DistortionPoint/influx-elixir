@@ -53,6 +53,8 @@ defmodule InfluxElixir do
   alias InfluxElixir.Telemetry
   alias InfluxElixir.Write.{BatchWriter, Point, Writer}
 
+  require Options
+
   # ---------- Connection Resolution ----------
 
   @doc """
@@ -68,7 +70,7 @@ defmodule InfluxElixir do
   """
   @spec resolve_connection(atom() | InfluxElixir.Client.connection()) ::
           InfluxElixir.Client.connection()
-  def resolve_connection(name) when is_atom(name) and name not in [nil, true, false] do
+  def resolve_connection(name) when Options.is_name_atom(name) do
     InfluxElixir.Connection.fetch!(name)
   end
 
@@ -522,7 +524,7 @@ defmodule InfluxElixir do
   @spec with_batch_writer(term(), (atom() -> result)) :: result | {:error, :no_batch_writer}
         when result: term()
   defp with_batch_writer(connection_name, fun)
-       when is_atom(connection_name) and connection_name not in [nil, true, false] do
+       when Options.is_name_atom(connection_name) do
     writer = InfluxElixir.ConnectionSupervisor.batch_writer_name(connection_name)
 
     if Process.whereis(writer) do

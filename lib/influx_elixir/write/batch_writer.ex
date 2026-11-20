@@ -192,10 +192,12 @@ defmodule InfluxElixir.Write.BatchWriter do
   """
 
   use GenServer
-  require Logger
 
   alias InfluxElixir.Client.Options
   alias InfluxElixir.Write.{LineProtocol, Point, Writer}
+
+  require Logger
+  require Options
 
   @backpressure_multiplier 10
 
@@ -314,9 +316,8 @@ defmodule InfluxElixir.Write.BatchWriter do
   def validate_name(name) when is_atom(name) and name not in [true, false], do: {:ok, name}
   def validate_name({:global, _term} = name), do: {:ok, name}
 
-  def validate_name({:via, module, _term} = name)
-      when is_atom(module) and module not in [nil, true, false],
-      do: {:ok, name}
+  def validate_name({:via, module, _term} = name) when Options.is_name_atom(module),
+    do: {:ok, name}
 
   def validate_name(other) do
     {:error,
@@ -964,18 +965,20 @@ defmodule InfluxElixir.Write.BatchWriter do
     base =
       if max_retry_delay_ms == :infinity, do: uncapped, else: min(uncapped, max_retry_delay_ms)
 
-    jitter = if jitter_ms > 0, do: :rand.uniform(jitter_ms), else: 0
-    base + jitter
+    base + jitter(jitter_ms)
   end
 
   @spec schedule_flush(t()) :: t()
   defp schedule_flush(%__MODULE__{} = state) do
     state = cancel_timer(state)
-    jitter = if state.jitter_ms > 0, do: :rand.uniform(state.jitter_ms), else: 0
-    delay = state.flush_interval_ms + jitter
+    delay = state.flush_interval_ms + jitter(state.jitter_ms)
     ref = Process.send_after(self(), :flush, delay)
     %{state | timer_ref: ref}
   end
+
+  @spec jitter(non_neg_integer()) :: non_neg_integer()
+  defp jitter(jitter_ms) when jitter_ms > 0, do: :rand.uniform(jitter_ms)
+  defp jitter(_jitter_ms), do: 0
 
   @spec cancel_timer(t()) :: t()
   defp cancel_timer(%__MODULE__{timer_ref: nil} = state), do: state

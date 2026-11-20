@@ -14,6 +14,14 @@ defmodule InfluxElixir.Client.Options do
   ]
 
   @doc false
+  # A named connection or module atom: any atom other than `nil`, `true`, or `false`.
+  defguard is_name_atom(value) when is_atom(value) and value not in [nil, true, false]
+
+  @doc false
+  # A scalar value that can be rendered directly in a URL piece or query string.
+  defguard is_url_text(value) when is_binary(value) or is_atom(value) or is_number(value)
+
+  @doc false
   # A keyword list: the only form options can take.
   @spec keyword?(term()) :: boolean()
   def keyword?(opts), do: is_list(opts) and Keyword.keyword?(opts)
@@ -27,6 +35,11 @@ defmodule InfluxElixir.Client.Options do
   # An optional timeout value in a keyword list: `nil` (unset) or a valid timeout.
   @spec timeout_opt?(term()) :: boolean()
   def timeout_opt?(timeout), do: is_nil(timeout) or timeout?(timeout)
+
+  @doc false
+  # An optional boolean value in a keyword list: `nil` (unset) or a boolean.
+  @spec boolean_opt?(term()) :: boolean()
+  def boolean_opt?(flag), do: is_nil(flag) or is_boolean(flag)
 
   @doc false
   # Encodes `payload` as JSON, returning `{:error, {:unencodable_body, message}}` instead of
