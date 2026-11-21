@@ -26,7 +26,7 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   #
   # A type that is not known is `nil`, which is never refused.
 
-  alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLNativeType, SQLSelect}
+  alias InfluxElixir.Client.Local.{SQLExpr, SQLExprType, SQLNativeType, SQLRow, SQLSelect}
 
   import SQLExprType, only: [is_decimal_type: 1, is_numeric_type: 1]
 
@@ -51,8 +51,8 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
       planned = result(column, columns, :plan)
 
       found
-      |> put_type(name, coerced)
-      |> put_type(plan_key(name), if(planned != coerced, do: planned))
+      |> SQLRow.put_non_nil(name, coerced)
+      |> SQLRow.put_non_nil(plan_key(name), if(planned != coerced, do: planned))
     end)
   end
 
@@ -65,10 +65,6 @@ defmodule InfluxElixir.Client.Local.SQLAggType do
   @doc "Whether a name in the types is the key of an aggregate's planner type."
   @spec plan_key?(binary()) :: boolean()
   def plan_key?(name), do: String.starts_with?(name, @plan_prefix)
-
-  @spec put_type(%{binary() => binary()}, binary(), binary() | nil) :: %{binary() => binary()}
-  defp put_type(found, _name, nil), do: found
-  defp put_type(found, name, type), do: Map.put(found, name, type)
 
   @doc """
   The types of the select items output as one of `names`, by that name; an item whose type

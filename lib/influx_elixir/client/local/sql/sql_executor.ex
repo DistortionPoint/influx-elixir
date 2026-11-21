@@ -815,7 +815,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   # otherwise), then `LIMIT`.
   @spec execute_aggregate_query([point()], SQLParser.parsed_query()) :: [map()]
   defp execute_aggregate_query(points, %{distinct_rows: true} = query) do
-    names = Enum.map(query.select_columns, &SQLSelect.column_output/1)
+    names = SQLSelect.output_names(query)
     keys = Enum.map(names, fn name -> {&Map.get(&1, name), :asc} end)
 
     rows =

@@ -231,7 +231,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   # A quoted alias in lower case is the alias unquoted; one with capitals has other rules.
   @spec quoted_alias(binary(), [token()]) :: parsed(binary())
   defp quoted_alias(printed, rest) do
-    alias_name = String.slice(printed, 1..-2//1)
+    alias_name = SQLDmlName.unquote_token(printed)
 
     if alias_name == String.downcase(alias_name) and alias_name != "",
       do: {:ok, alias_name, rest},
@@ -443,7 +443,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
 
   @spec plain_word(token()) :: token()
   defp plain_word({kind, printed, _u, line, col} = token) when kind in [:quoted, :string] do
-    name = String.slice(printed, 1..-2//1)
+    name = SQLDmlName.unquote_token(printed)
 
     if name == "",
       do: token,
@@ -674,8 +674,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
 
   # An unquoted alias is folded to lower case, a quoted one is as written.
   @spec alias_of(atom(), binary()) :: name()
-  defp alias_of(:word, printed), do: {String.downcase(printed), false}
-  defp alias_of(_quoted_or_string, printed), do: {String.slice(printed, 1..-2//1), true}
+  defp alias_of(kind, printed), do: {SQLDmlName.part(kind, printed), kind != :word}
 
   @spec select_more([token()], [term()]) :: parsed([term()])
   defp select_more([{:symbol, ",", _u, _l, _c} | rest], found) do
@@ -863,7 +862,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
     with {:ok, pattern, rest} <- subexpr(rest, precedence) do
       case rest do
         [{:word, _p2, "ESCAPE", _l2, _c2}, {:string, escape, _u, _l3, _c3} | more] ->
-          {:ok, {:like, left, pattern, negated, keyword, String.slice(escape, 1..-2//1)}, more}
+          {:ok, {:like, left, pattern, negated, keyword, SQLDmlName.unquote_token(escape)}, more}
 
         [{:word, _p2, "ESCAPE", _l2, _c2}, {:eof, _p3, _u3, _l3, _c3} = eof | _more] ->
           {:error, SQLDdl.expected("a value", eof)}
@@ -913,7 +912,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
   defp prefix([{:number, printed, _u, _l, _c} | rest]), do: {:ok, {:num, printed}, rest}
 
   defp prefix([{:string, printed, _u, _l, _c} | rest]),
-    do: {:ok, {:str, String.slice(printed, 1..-2//1)}, rest}
+    do: {:ok, {:str, SQLDmlName.unquote_token(printed)}, rest}
 
   defp prefix([{:literal, "X'" <> _digits, _u, _l, _c} | _rest]),
     do: {:refuse, "a hexadecimal string"}
@@ -1174,7 +1173,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlExpr do
     do: {:ok, {if(fold?, do: String.downcase(printed), else: printed), false}}
 
   defp ident({:quoted, printed, _upper, _l, _c}, _fold?),
-    do: {:ok, {String.slice(printed, 1..-2//1), true}}
+    do: {:ok, {SQLDmlName.unquote_token(printed), true}}
 
   defp ident(_token, _fold?), do: :error
 

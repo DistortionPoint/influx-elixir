@@ -69,8 +69,12 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
   def render_identifier(name) do
     if Regex.match?(~r/\A(?:[a-z_][a-z0-9_]*)?\z/, name),
       do: name,
-      else: ~s|"#{String.replace(name, "\"", "\"\"")}"|
+      else: quote_identifier(name)
   end
+
+  @doc "A name in double quotes, with any quote inside doubled."
+  @spec quote_identifier(binary()) :: binary()
+  def quote_identifier(name), do: ~s|"#{String.replace(name, "\"", "\"\"")}"|
 
   @doc """
   How the engine words the name of a relation in an error: a reference of

@@ -19,7 +19,15 @@ defmodule InfluxElixir.Client.Local.SQLFold do
   # `abs` or a negation of the smallest integer) is not folded; it fails when a
   # row is evaluated.
 
-  alias InfluxElixir.Client.Local.{SQLCast, SQLError, SQLEval, SQLExpr, SQLNumber, SQLParser}
+  alias InfluxElixir.Client.Local.{
+    SQLCast,
+    SQLError,
+    SQLEval,
+    SQLExpr,
+    SQLNumber,
+    SQLParser,
+    SQLSelect
+  }
 
   # An expression that reads no column reads no point.
   @no_point %{measurement: "", tags: %{}, fields: %{}, timestamp: nil}
@@ -137,14 +145,11 @@ defmodule InfluxElixir.Client.Local.SQLFold do
   # Every expression a query holds, in the order written.
   @spec expressions(SQLParser.parsed_query()) :: [SQLExpr.t()]
   defp expressions(query) do
-    projected = for {expr, _output} <- query.projection_columns || [], is_tuple(expr), do: expr
-
     aggregated =
       for {:aggregate, _agg, expr, _output} <- query.select_columns || [], do: expr
 
-    ordered = for {{:expr, expr}, _direction} <- query.order_by, do: expr
-
-    projected ++ aggregated ++ conditions(query.where) ++ ordered
+    SQLSelect.projected_exprs(query) ++
+      aggregated ++ conditions(query.where) ++ SQLSelect.ordered_exprs(query)
   end
 
   @spec conditions([SQLParser.where_node()]) :: [SQLExpr.t()]

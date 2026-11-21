@@ -16,7 +16,7 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
   # unsigned column through unchanged, which the executor tags in the CTE's
   # rows so the next query reads them as `UInt64` too.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLParser}
+  alias InfluxElixir.Client.Local.{SQLError, SQLExpr, SQLParser, SQLSelect}
 
   @typedoc "Says whether a column is `UInt64`."
   @type unsigned :: (binary() -> boolean())
@@ -135,7 +135,7 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
   """
   @spec check_cte_outputs(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
   def check_cte_outputs(%{} = query) do
-    projected = for {expr, _output} <- query.projection_columns || [], is_tuple(expr), do: expr
+    projected = SQLSelect.projected_exprs(query)
     aggregated = for {:aggregate, _agg, expr, _output} <- query.select_columns || [], do: expr
 
     if Enum.any?(projected ++ aggregated, &narrow_cast?/1),

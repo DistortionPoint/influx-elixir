@@ -529,7 +529,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
 
   defp parse_aggregate_select(%{table: measurement, rest: rest} = split, sql, qualifier, order) do
     with {:ok, columns} <- SQLAggExpr.parse_list(split.columns, qualifier),
-         :ok <- check_unique(Enum.map(columns, &SQLSelect.column_output/1)),
+         :ok <- check_unique(columns),
          :ok <- SQLClauses.check_group_items(rest),
          {:ok, interval_ns} <- SQLClauses.interval(sql),
          :ok <- SQLClauses.check_date_bins(split.columns, interval_ns),
@@ -688,7 +688,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
           {:ok, parsed_query()} | {:error, term()}
   defp build_columns_query(columns_str, measurement, rest, qualifier) do
     with {:ok, projection} <- parse_projection_columns(columns_str, qualifier),
-         :ok <- check_unique(Enum.map(projection, fn {_source, output} -> output end)),
+         :ok <- check_unique(projection),
          {:ok, where, tree} <- SQLWhere.parsed(rest) do
       {:ok, new_query(measurement, where, rest, where_tree: tree, projection_columns: projection)}
     end
@@ -698,8 +698,10 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   # ("Projections require unique expression names"), in words that print its
   # planner's rendering of each expression, which the double does not
   # reproduce: it refuses the list by name.
-  @spec check_unique([binary()]) :: :ok | {:error, map()}
-  defp check_unique(outputs) do
+  @spec check_unique([select_column() | projection()]) :: :ok | {:error, map()}
+  defp check_unique(items) do
+    outputs = Enum.map(items, &SQLSelect.column_output/1)
+
     case outputs -- Enum.uniq(outputs) do
       [] ->
         :ok

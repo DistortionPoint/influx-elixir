@@ -9,7 +9,7 @@ defmodule InfluxElixir.Client.Local.SQLNullType do
   # function of numbers or text with such an argument is null, so the planner's typing of
   # the other arguments decides nothing the double has to compute.
 
-  alias InfluxElixir.Client.Local.{SQLExpr, SQLScalar}
+  alias InfluxElixir.Client.Local.{SQLExpr, SQLScalar, SQLSelect}
 
   @doc """
   Whether an expression is the null whatever the rows: the null literal, and an operator,
@@ -39,10 +39,10 @@ defmodule InfluxElixir.Client.Local.SQLNullType do
   """
   @spec duration_misuse?(map()) :: boolean()
   def duration_misuse?(%{} = query) do
-    projected = for {expr, _output} <- query.projection_columns || [], is_tuple(expr), do: expr
-    ordered = for {{:expr, expr}, _direction} <- query.order_by, do: expr
-
-    Enum.any?(projected ++ ordered, &misuse?(&1, true)) or
+    Enum.any?(
+      SQLSelect.projected_exprs(query) ++ SQLSelect.ordered_exprs(query),
+      &misuse?(&1, true)
+    ) or
       misuse?(query.where, false) or
       misuse?(query.select_columns, false) or
       misuse?(query.having, false)

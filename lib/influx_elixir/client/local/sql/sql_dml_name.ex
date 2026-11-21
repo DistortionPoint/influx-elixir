@@ -40,8 +40,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
   @doc false
   @spec part(atom(), binary()) :: binary()
   def part(:word, printed), do: String.downcase(printed)
-  def part(:quoted, printed), do: SQLLiteral.identifier_name(printed)
-  def part(:string, printed), do: SQLLiteral.body(printed)
+  def part(kind, printed) when kind in [:quoted, :string], do: unquote_token(printed)
+
+  @doc "The text between the quotes of a `:quoted` or `:string` token."
+  @spec unquote_token(binary()) :: binary()
+  def unquote_token(printed), do: binary_part(printed, 1, byte_size(printed) - 2)
 
   @doc """
   The table a statement names (verified against InfluxDB 3 Core, the same for `INSERT`, `UPDATE`
@@ -81,7 +84,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
 
   @doc "A name in double quotes."
   @spec quote_always(binary()) :: binary()
-  def quote_always(name), do: ~s|"| <> String.replace(name, ~s|"|, ~s|""|) <> ~s|"|
+  def quote_always(name), do: SQLLiteral.quote_identifier(name)
 
   @doc "A name written in a statement (its text and whether it was quoted), as printed."
   @spec quote_name({binary(), boolean()} | binary()) :: binary()
@@ -119,17 +122,17 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
     }
   end
 
+  @doc "The engine's hint when a column name differs only by case."
+  @spec case_sensitive_hint(binary()) :: binary()
+  def case_sensitive_hint(printed) do
+    "Column names are case sensitive. You can use double quotes to refer to the " <>
+      ~s|"#{printed}" column or set the datafusion.sql_parser.enable_ident_normalization configuration.|
+  end
+
   @spec detail(binary(), binary(), [binary()], boolean()) :: binary()
   defp detail(printed, name, fields, folded?) do
     valid = Enum.join(fields, ", ")
-
-    hint =
-      if folded? do
-        " Column names are case sensitive. You can use double quotes to refer to the " <>
-          ~s|"#{printed}" column or set the datafusion.sql_parser.enable_ident_normalization configuration.|
-      else
-        ""
-      end
+    hint = if folded?, do: " " <> case_sensitive_hint(printed), else: ""
 
     case Enum.find(fields, &close?(name, &1)) do
       nil -> hint <> " Valid fields are #{valid}."
@@ -148,11 +151,11 @@ defmodule InfluxElixir.Client.Local.SQLDmlName do
     Enum.any?(fields, &(&1 |> String.replace(~s|"|, "") |> String.downcase() == flat))
   end
 
-  # Whether two names are within half the longer one's length of each other in edits.
-  @spec close?(binary(), binary()) :: boolean()
-  defp close?(left, right) do
+  @doc "Whether two names are within a share of the longer one's length of each other in edits."
+  @spec close?(binary(), binary(), {pos_integer(), pos_integer()}) :: boolean()
+  def close?(left, right, {numerator, denominator} \\ {1, 2}) do
     longest = max(String.length(left), String.length(right))
-    longest > 0 and edit_distance(left, right) * 2 <= longest
+    longest > 0 and edit_distance(left, right) * denominator <= longest * numerator
   end
 
   @doc false

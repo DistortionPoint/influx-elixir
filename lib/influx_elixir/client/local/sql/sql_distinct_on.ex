@@ -6,7 +6,7 @@ defmodule InfluxElixir.Client.Local.SQLDistinctOn do
   # and `OFFSET`. The `ON` list is taken out of the text so the rest parses as
   # that ordinary select, and put back on the parsed query.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLMask, SQLParser, SQLSelect}
+  alias InfluxElixir.Client.Local.{SQLError, SQLLiteral, SQLMask, SQLParser, SQLSelect}
 
   @distinct_on ~r/^(\s*SELECT\s+)DISTINCT\s+ON\s*\((.*)$/isu
 
@@ -67,11 +67,11 @@ defmodule InfluxElixir.Client.Local.SQLDistinctOn do
       columns == [""] ->
         {:error, SQLError.planning("No `ON` expressions provided")}
 
-      not String.valid?(on) or not Enum.all?(columns, &Regex.match?(~r/^(?:\w+|"[^"]+")$/u, &1)) ->
+      not Enum.all?(columns, &SQLLiteral.name_token?/1) ->
         {:error, SQLError.refusal("DISTINCT ON takes column names only: (#{on})")}
 
       true ->
-        columns = Enum.map(columns, &String.trim(&1, "\""))
+        columns = Enum.map(columns, &SQLLiteral.unquoted/1)
         {:ok, check_order(%{query | distinct_on: columns}, columns)}
     end
   end

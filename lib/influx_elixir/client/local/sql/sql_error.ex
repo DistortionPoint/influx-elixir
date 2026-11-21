@@ -243,10 +243,10 @@ defmodule InfluxElixir.Client.Local.SQLError do
   expression): `Optimizer rule 'simplify_expressions' failed\\ncaused by\\n<message>`,
   status 500. It comes after the planner's own errors.
   """
-  @spec simplify(binary()) :: t()
-  def simplify(message),
+  @spec simplify(binary(), pos_integer()) :: t()
+  def simplify(message, status \\ 500),
     do: %{
-      status: 500,
+      status: status,
       body: @optimizer <> "'simplify_expressions' failed\ncaused by\n" <> message
     }
 

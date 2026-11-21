@@ -9,7 +9,14 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
   # cast to the common one, so that the evaluator sees the types the engine
   # does. See `InfluxElixir.Client.Local.SQLExprType.common/2`.
 
-  alias InfluxElixir.Client.Local.{SQLCommonType, SQLExpr, SQLExprType, SQLParser, SQLPlan}
+  alias InfluxElixir.Client.Local.{
+    SQLCommonType,
+    SQLExpr,
+    SQLExprType,
+    SQLParser,
+    SQLPlan,
+    SQLSelect
+  }
 
   require SQLCommonType
 
@@ -43,10 +50,10 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
 
   @spec expressions(SQLParser.parsed_query()) :: [SQLExpr.t()]
   defp expressions(query) do
-    projected = for {expr, _output} <- query.projection_columns || [], is_tuple(expr), do: expr
     aggregated = Enum.flat_map(query.select_columns || [], &aggregate_expressions/1)
-    ordered = for {{:expr, expr}, _direction} <- query.order_by, do: expr
-    projected ++ aggregated ++ ordered ++ filter_expressions(query.where)
+
+    SQLSelect.projected_exprs(query) ++
+      aggregated ++ SQLSelect.ordered_exprs(query) ++ filter_expressions(query.where)
   end
 
   # The expressions a `WHERE` holds: its operands that are expressions.

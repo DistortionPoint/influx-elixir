@@ -259,7 +259,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
     # Under DISTINCT ON an ORDER BY term is resolved against the table, so
     # an output name there lists the table's fields alone (verified).
-    output_name? = query.distinct_on != nil and ref in output_names(query)
+    output_name? = query.distinct_on != nil and ref in SQLSelect.output_names(query)
 
     # A name written with its relation is looked up in the select list alone (verified).
     written_with_relation? =
@@ -288,7 +288,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
         outputs =
           if clause in [:order, :group, :on, :having] and not written_with_relation? and
                not output_name?,
-             do: output_names(query),
+             do: SQLSelect.output_names(query),
              else: []
 
         body =
@@ -315,7 +315,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   defp known_fields(ref, valid) do
     name = bare_name(ref)
 
-    case Enum.find(valid, &close?(name, &1, @field_ratio)) do
+    case Enum.find(valid, &SQLDmlName.close?(name, &1, @field_ratio)) do
       nil -> ["Valid fields are #{Enum.join(valid, ", ")}."]
       field -> ["Did you mean '#{field}'?."]
     end
@@ -369,7 +369,8 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     # Of a plain query the engine suggests a name that stands alone in its select list, not
     # a column it prints with its relation (verified); of an aggregate query, any item.
     outputs =
-      for {output, field} <- Enum.zip(output_names(query), projection_fields(query, listed)),
+      for {output, field} <-
+            Enum.zip(SQLSelect.output_names(query), projection_fields(query, listed)),
           query.select_columns != nil or not relation_field?(field),
           do: {output, field}
 
@@ -378,12 +379,14 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
         {:suggest, field}
 
       [] ->
-        if Enum.any?(outputs, fn {output, _field} -> close?(output, name, @item_ratio) end),
-          do:
-            {:refuse,
-             "an ORDER BY name close to a select item: the engine suggests the item by a " <>
-               "measure of closeness the double does not hold"},
-          else: nil
+        if Enum.any?(outputs, fn {output, _field} ->
+             SQLDmlName.close?(output, name, @item_ratio)
+           end),
+           do:
+             {:refuse,
+              "an ORDER BY name close to a select item: the engine suggests the item by a " <>
+                "measure of closeness the double does not hold"},
+           else: nil
 
       _several ->
         {:refuse, "an ORDER BY name that several select items are called"}
@@ -391,13 +394,6 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   end
 
   defp suggestion(_clause, _ref, _query, _listed), do: nil
-
-  # Whether two names are within a share of the longer one's length of each other in edits.
-  @spec close?(binary(), binary(), {pos_integer(), pos_integer()}) :: boolean()
-  defp close?(left, right, {numerator, denominator}) do
-    longest = max(String.length(left), String.length(right))
-    longest > 0 and SQLDmlName.edit_distance(left, right) * denominator <= longest * numerator
-  end
 
   @spec relation_field?(binary()) :: boolean()
   defp relation_field?(field),
@@ -418,7 +414,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
       :ok
     else
       listed = listed_columns(relations)
-      outputs = Enum.zip(output_names(query), projection_fields(query, listed))
+      outputs = Enum.zip(SQLSelect.output_names(query), projection_fields(query, listed))
 
       ambiguous =
         Enum.find(MapSet.to_list(written), fn name ->
@@ -459,7 +455,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
       :ok
     else
       grouped = SQLGrouping.grouped_columns(query)
-      outputs = output_names(query)
+      outputs = SQLSelect.output_names(query)
 
       unavailable =
         query.order_by
@@ -488,7 +484,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
     hint =
       ref
-      |> case_hint(holder_field(ref, listed), [], query.qualified, output_names(query))
+      |> case_hint(holder_field(ref, listed), [], query.qualified, SQLSelect.output_names(query))
       |> Enum.map(&(" " <> &1))
 
     %{
@@ -527,7 +523,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
         Enum.any?(columns, &(String.downcase(join_flat(qualifier, &1)) == flat))
       end) or Enum.any?(outputs, &(String.downcase(&1) == flat))
 
-    if folded?, do: [case_sensitive_hint(printed)], else: []
+    if folded?, do: [SQLDmlName.case_sensitive_hint(printed)], else: []
   end
 
   defp case_hint({:qualified, qualifier, column}, printed, listed, _qualified, _outputs) do
@@ -539,17 +535,11 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
           Enum.any?(columns, &(String.downcase(&1) == String.downcase(name)))
       end)
 
-    if folded?, do: [case_sensitive_hint(printed)], else: []
+    if folded?, do: [SQLDmlName.case_sensitive_hint(printed)], else: []
   end
 
   defp join_flat(nil, name), do: name
   defp join_flat(qualifier, name), do: qualifier <> "." <> name
-
-  defp case_sensitive_hint(printed) do
-    "Column names are case sensitive. You can use double quotes to refer to the " <>
-      "\"#{printed}\" column or set the datafusion.sql_parser.enable_ident_normalization " <>
-      "configuration."
-  end
 
   @spec qualify(binary(), [binary()]) :: [binary()]
   defp qualify(qualifier, columns),
@@ -606,7 +596,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   """
   @spec clause_refs(SQLParser.parsed_query()) :: [{clause(), SQLExpr.column_ref()}]
   def clause_refs(%{} = query) do
-    aliases = if query.distinct_on, do: [], else: output_names(query)
+    aliases = if query.distinct_on, do: [], else: SQLSelect.output_names(query)
     alias? = &alias_ref?(&1, aliases, query, :order)
 
     order_by_refs =
@@ -731,13 +721,6 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @spec tagged(clause(), [SQLExpr.column_ref()]) :: [{clause(), SQLExpr.column_ref()}]
   defp tagged(clause, refs), do: Enum.map(refs, &{clause, &1})
 
-  @spec output_names(SQLParser.parsed_query()) :: [binary()]
-  defp output_names(query) do
-    Enum.map(query.projection_columns || [], fn {_source, output} -> output end) ++
-      Enum.map(query.select_columns || [], &SQLSelect.column_output/1) ++
-      (query.distinct_columns || [])
-  end
-
   @spec projection_refs(SQLParser.projection()) :: [SQLExpr.column_ref()]
   defp projection_refs({source, _output}) when is_binary(source), do: [source]
   defp projection_refs({expr, _output}), do: expr_fields(expr)
@@ -804,20 +787,11 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   next query reads. `nil` when a relation's columns are not known.
   """
   @spec output_columns(SQLParser.parsed_query(), [relation()]) :: [binary()] | nil
-  def output_columns(%{distinct_columns: columns}, _relations) when is_list(columns),
-    do: columns
-
-  def output_columns(%{select_columns: columns}, _relations) when is_list(columns),
-    do: Enum.map(columns, &SQLSelect.column_output/1)
-
-  def output_columns(%{projection_columns: columns}, _relations) when is_list(columns),
-    do: Enum.map(columns, fn {_source, output} -> output end)
-
-  # `*` is every column of the relations in turn, or unknown when one of
-  # them is a table with no rows.
-  def output_columns(_select_star, relations) do
-    if Enum.any?(relations, &unknown_schema?/1),
-      do: nil,
-      else: Enum.flat_map(relations, &full_columns/1)
+  def output_columns(query, relations) do
+    cond do
+      not star?(query) -> SQLSelect.output_names(query)
+      Enum.any?(relations, &unknown_schema?/1) -> nil
+      true -> Enum.flat_map(relations, &full_columns/1)
+    end
   end
 end

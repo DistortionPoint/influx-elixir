@@ -486,6 +486,13 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
                  "WITH t AS (SELECT 10 AS time FROM m) SELECT AVG(time) AS a FROM t",
                  database: "iq_db"
                )
+
+      assert {:ok, [%{"a\"b" => 1}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|WITH t AS (SELECT 1 AS "a""b" FROM m) SELECT DISTINCT ON ("a""b") * FROM t|,
+                 database: "iq_db"
+               )
     end
   end
 end

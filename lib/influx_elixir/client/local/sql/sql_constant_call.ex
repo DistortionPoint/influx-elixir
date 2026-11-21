@@ -68,7 +68,7 @@ defmodule InfluxElixir.Client.Local.SQLConstantCall do
   @spec shape(binary(), ancestors(), :select | :where | :order_by) :: map()
   defp shape(message, ancestors, clause) do
     case phase(ancestors, clause) do
-      :optimizer -> simplify(message)
+      :optimizer -> SQLError.simplify("Error during planning: " <> message, 400)
       :coercion -> coercion(message, ancestors)
       :planner -> SQLError.planning(message)
       :bare -> first_sentence(message)
@@ -88,16 +88,6 @@ defmodule InfluxElixir.Client.Local.SQLConstantCall do
   @spec optimizer?(ancestors()) :: boolean()
   defp optimizer?(ancestors),
     do: List.first(Enum.drop_while(ancestors, &(&1 == :cast))) == :isnull
-
-  @spec simplify(binary()) :: map()
-  defp simplify(message) do
-    %{
-      status: 400,
-      body:
-        "Optimizer rule 'simplify_expressions' failed\ncaused by\n" <>
-          "Error during planning: " <> message
-    }
-  end
 
   # The error without the candidate signatures: a planning error keeps the planner's
   # prefix, an execution error is bare, with status 500.

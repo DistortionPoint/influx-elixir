@@ -336,17 +336,35 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
       {:ok, "#{@unnamed}#{System.unique_integer([:positive])}#{@unnamed}#{col}"}
   end
 
+  @doc "The output column names of a query's explicit select list (`[]` for `SELECT *`)."
+  @spec output_names(map()) :: [binary()]
+  def output_names(query) do
+    Enum.map(
+      (query.projection_columns || []) ++ (query.select_columns || []),
+      &column_output/1
+    ) ++
+      (query.distinct_columns || [])
+  end
+
+  @doc "The expressions in the query's projection list (`SELECT expr, ...`)."
+  @spec projected_exprs(map()) :: [SQLExpr.t()]
+  def projected_exprs(query) do
+    for {expr, _output} <- query.projection_columns || [], is_tuple(expr), do: expr
+  end
+
+  @doc "The expressions in the query's `ORDER BY` clause."
+  @spec ordered_exprs(map()) :: [SQLExpr.t()]
+  def ordered_exprs(query) do
+    for {{:expr, expr}, _direction} <- query.order_by, do: expr
+  end
+
   @doc """
   The refusal of a query with a select item whose name the engine gives and the double cannot
   write (see `output_name/3`), or `:ok`.
   """
   @spec check_named(map()) :: :ok | {:error, map()}
   def check_named(query) do
-    names =
-      Enum.map(List.wrap(query.select_columns), &column_output/1) ++
-        Enum.map(List.wrap(query.projection_columns), &elem(&1, 1))
-
-    case Enum.find(names, &(is_binary(&1) and String.starts_with?(&1, @unnamed))) do
+    case Enum.find(output_names(query), &(is_binary(&1) and String.starts_with?(&1, @unnamed))) do
       nil ->
         :ok
 
