@@ -9,6 +9,7 @@ defmodule InfluxElixir.Client.Local.Writes do
     Body,
     Buckets,
     DatabaseRules,
+    Durations,
     LineProtocolParser,
     Retention,
     Scope,
@@ -363,23 +364,7 @@ defmodule InfluxElixir.Client.Local.Writes do
   # Go's RFC 3339 with nanoseconds: the fraction only as far as it is not
   # zero.
   @spec rfc3339_nano(integer()) :: binary()
-  defp rfc3339_nano(ns) do
-    stamp =
-      ns
-      |> Integer.floor_div(1_000_000_000)
-      |> DateTime.from_unix!()
-      |> DateTime.to_iso8601()
-      |> String.trim_trailing("Z")
-
-    case Integer.mod(ns, 1_000_000_000) do
-      0 ->
-        stamp <> "Z"
-
-      fraction ->
-        digits = fraction |> Integer.to_string() |> String.pad_leading(9, "0")
-        stamp <> "." <> String.trim_trailing(digits, "0") <> "Z"
-    end
-  end
+  defp rfc3339_nano(ns), do: ns |> Durations.iso_ns() |> String.replace(~r/\.?0+Z\z/, "Z")
 
   # A point's series key as the engine prints it: the measurement and the
   # tags sorted by key, with the line protocol's escapes.

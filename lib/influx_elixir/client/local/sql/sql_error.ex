@@ -328,10 +328,12 @@ defmodule InfluxElixir.Client.Local.SQLError do
     }
   end
 
-  @spec interval_type(:int64 | :uint64 | :float64) :: binary()
-  defp interval_type(:int64), do: "Int64"
-  defp interval_type(:uint64), do: "UInt64"
-  defp interval_type(:float64), do: "Float64"
+  @doc "The Arrow type name for an interval-analysis numeric column type (`:int64`, `:uint64`, `:float64`), or `nil`."
+  @spec interval_type(:int64 | :uint64 | :float64 | term()) :: binary() | nil
+  def interval_type(:int64), do: "Int64"
+  def interval_type(:uint64), do: "UInt64"
+  def interval_type(:float64), do: "Float64"
+  def interval_type(_other), do: nil
 
   @doc """
   The Arrow kernel's error for an unsigned column cast to a signed type of

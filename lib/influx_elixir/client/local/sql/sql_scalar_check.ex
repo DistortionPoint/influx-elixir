@@ -442,7 +442,7 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
 
   # A selector's struct, as the arrow type is debug printed there.
   defp printed("Struct(" <> _fields = type) do
-    [_all, value] = Regex.run(~r/\AStruct\("value": (.+), "time": Timestamp\(ns\)\)\z/, type)
+    value = SQLNativeType.struct_value_type(type)
 
     ~S|Struct([Field { name: \"value\", data_type: | <>
       value <>

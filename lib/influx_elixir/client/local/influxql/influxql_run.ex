@@ -15,7 +15,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     InfluxQLPlan,
     InfluxQLProjection,
     InfluxQLTransform,
-    SQLLimits
+    SQLLimits,
+    SQLRow
   }
 
   require SQLLimits
@@ -1031,7 +1032,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     |> Map.put(context.plan.time, point["time"])
     |> Map.merge(beside)
     |> Map.merge(computed)
-    |> put_value(layout.value, point[layout.field])
+    |> SQLRow.put_non_nil(layout.value, point[layout.field])
   end
 
   # An expression of the point: null is no column, a number that is not finite is a null that
@@ -1041,9 +1042,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       do: {:ok, point["time"]},
       else: computed(ast, point, types)
   end
-
-  defp put_value(row, _name, nil), do: row
-  defp put_value(row, name, value), do: Map.put(row, name, value)
 
   defp field_value?(point, {column, _name}, types),
     do: Map.has_key?(types, column) and point[column] != nil

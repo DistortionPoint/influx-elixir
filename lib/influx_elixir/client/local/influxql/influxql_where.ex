@@ -7,6 +7,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   import Bitwise, only: [|||: 2]
 
   alias InfluxElixir.Client.Local.{
+    Durations,
     InfluxQL,
     InfluxQLArithmetic,
     InfluxQLArithType,
@@ -817,12 +818,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
   # engine reads exactly; from `@arrow_min` on, which it reads, to the 64-bit
   # end.
   @spec iso_ns(integer()) :: binary()
-  defp iso_ns(ns) when ns >= @arrow_min and ns <= SQLLimits.int64_max() do
-    seconds = Integer.floor_div(ns, 1_000_000_000)
-    nanos = Integer.mod(ns, 1_000_000_000)
-    stamp = seconds |> DateTime.from_unix!() |> DateTime.to_iso8601() |> String.trim_trailing("Z")
-    "#{stamp}.#{String.pad_leading(Integer.to_string(nanos), 9, "0")}Z"
-  end
+  defp iso_ns(ns) when ns >= @arrow_min and ns <= SQLLimits.int64_max(),
+    do: Durations.iso_ns(ns)
 
   defp iso_ns(ns) when ns < @arrow_min and ns >= SQLLimits.int64_min(),
     do: InfluxQLError.refuse("a time before 1677-09-21T00:12:44")

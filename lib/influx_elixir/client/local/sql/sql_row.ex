@@ -41,6 +41,11 @@ defmodule InfluxElixir.Client.Local.SQLRow do
     end
   end
 
+  @doc "Puts `key => value` into `row` when `value` is not `nil`."
+  @spec put_non_nil(map(), binary(), term()) :: map()
+  def put_non_nil(row, _key, nil), do: row
+  def put_non_nil(row, key, value), do: Map.put(row, key, value)
+
   @doc """
   What a point sorts, groups and picks on for a column: `time` by its stored
   nanoseconds (a DateTime has only microseconds), anything else by its

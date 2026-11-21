@@ -4,6 +4,7 @@ defmodule InfluxElixir.Client.Local.Admin do
   # tokens and health. `Client.Local` is the public entry point and checks the
   # profile's capabilities before it calls here.
 
+  import InfluxElixir.Client.Local.Durations, only: [pad: 2]
   require InfluxElixir.Client.Local.SQLLimits
 
   alias InfluxElixir.Admin.TokenRequest
@@ -11,6 +12,7 @@ defmodule InfluxElixir.Client.Local.Admin do
   alias InfluxElixir.Client.Local.{
     Buckets,
     DatabaseRules,
+    Durations,
     Format,
     Retention,
     Scope,
@@ -360,9 +362,6 @@ defmodule InfluxElixir.Client.Local.Admin do
       "#{pad(second, 2)}#{fraction}Z"
   end
 
-  @spec pad(non_neg_integer(), pos_integer()) :: binary()
-  defp pad(number, width), do: number |> Integer.to_string() |> String.pad_leading(width, "0")
-
   @spec delete_token(InfluxElixir.Client.connection(), binary()) ::
           :ok | {:error, term()}
   def delete_token(%{table: table} = conn, name) do
@@ -440,12 +439,5 @@ defmodule InfluxElixir.Client.Local.Admin do
 
   # The engine's timestamps: RFC 3339 with nine fractional digits.
   @spec nanosecond_timestamp() :: binary()
-  defp nanosecond_timestamp do
-    ns = System.os_time(:nanosecond)
-    seconds = Integer.floor_div(ns, 1_000_000_000)
-    stamp = seconds |> DateTime.from_unix!() |> DateTime.to_iso8601() |> String.trim_trailing("Z")
-
-    stamp <>
-      "." <> String.pad_leading(Integer.to_string(Integer.mod(ns, 1_000_000_000)), 9, "0") <> "Z"
-  end
+  defp nanosecond_timestamp, do: Durations.iso_ns(System.os_time(:nanosecond))
 end

@@ -3,6 +3,9 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   # The InfluxDB 2 line grammar, a port of Go's `models.ParsePoints` scanners,
   # whose errors name the scanner that failed.
 
+  import InfluxElixir.Client.Local.InfluxQLLex, only: [byte_at: 2]
+  require InfluxElixir.Client.Local.SQLLimits
+
   alias InfluxElixir.Client.Local.{
     LineProtocolEscape,
     LineProtocolNumber,
@@ -10,8 +13,6 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
     LineProtocolTime,
     SQLLimits
   }
-
-  require SQLLimits
 
   @typep precision :: LineProtocolParser.precision()
   @typep point :: LineProtocolParser.point()
@@ -37,10 +38,6 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   # Every failed line is reported, joined by newlines, in the frame
   # `unable to parse '<line>': <reason>`.
   # ---------------------------------------------------------------------------
-
-  @spec binary_at(binary(), integer()) :: byte() | nil
-  defp binary_at(text, i) when i >= 0 and i < byte_size(text), do: :binary.at(text, i)
-  defp binary_at(_text, _i), do: nil
 
   @spec parse(binary(), precision()) :: {:ok, point()} | {:error, binary()}
   def parse(buf, precision) do
@@ -114,8 +111,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   @spec v2_measurement(binary(), non_neg_integer()) ::
           :end | {:fields, non_neg_integer()} | {:tags, non_neg_integer(), non_neg_integer()}
   defp v2_measurement(buf, i) do
-    char = binary_at(buf, i)
-    escaped = binary_at(buf, i - 1) == ?\\
+    char = byte_at(buf, i)
+    escaped = byte_at(buf, i - 1) == ?\\
 
     cond do
       char == nil -> :end
@@ -143,14 +140,14 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   # The index of the `=` that ends the tag key starting at `i`.
   @spec v2_tag_key(binary(), non_neg_integer()) :: {:ok, non_neg_integer()} | {:error, binary()}
   defp v2_tag_key(buf, i) do
-    if binary_at(buf, i) in [nil, ?\s, ?,, ?=],
+    if byte_at(buf, i) in [nil, ?\s, ?,, ?=],
       do: {:error, "missing tag key"},
       else: v2_tag_key_scan(buf, i + 1)
   end
 
   defp v2_tag_key_scan(buf, i) do
-    char = binary_at(buf, i)
-    escaped = binary_at(buf, i - 1) == ?\\
+    char = byte_at(buf, i)
+    escaped = byte_at(buf, i - 1) == ?\\
 
     cond do
       char == nil or (char in [?\s, ?,] and not escaped) -> {:error, "missing tag value"}
@@ -165,14 +162,14 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
           {:ok, :key | :fields | :end, non_neg_integer(), non_neg_integer()}
           | {:error, binary()}
   defp v2_tag_value(buf, i) do
-    if binary_at(buf, i) in [nil, ?,, ?\s],
+    if byte_at(buf, i) in [nil, ?,, ?\s],
       do: {:error, "missing tag value"},
       else: v2_tag_value_scan(buf, i + 1)
   end
 
   defp v2_tag_value_scan(buf, i) do
-    char = binary_at(buf, i)
-    escaped = binary_at(buf, i - 1) == ?\\
+    char = byte_at(buf, i)
+    escaped = byte_at(buf, i - 1) == ?\\
 
     cond do
       char == nil -> {:ok, :end, i, i}
@@ -192,7 +189,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   # Go's `skipWhitespace`: spaces, tabs and NUL.
   @spec v2_skip(binary(), non_neg_integer()) :: non_neg_integer()
   defp v2_skip(buf, i) do
-    if binary_at(buf, i) in [?\s, ?\t, 0], do: v2_skip(buf, i + 1), else: i
+    if byte_at(buf, i) in [?\s, ?\t, 0], do: v2_skip(buf, i + 1), else: i
   end
 
   # The fields block: `{:ok, start, end}`.
@@ -204,7 +201,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   end
 
   defp v2_fields_loop(buf, start, i, quoted, equals, commas),
-    do: v2_fields_step(buf, start, i, binary_at(buf, i), quoted, equals, commas)
+    do: v2_fields_step(buf, start, i, byte_at(buf, i), quoted, equals, commas)
 
   # One byte of the fields block. `quoted` is whether a string is open; a
   # quote opens one only after an `=` that no comma has closed.
@@ -231,9 +228,9 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
 
   # An `=` outside a string: the key before it and the value after it.
   defp v2_field_value(buf, start, i, equals, commas) do
-    before = binary_at(buf, i - 1)
-    before_that = binary_at(buf, i - 2)
-    next = binary_at(buf, i + 1)
+    before = byte_at(buf, i - 1)
+    before_that = byte_at(buf, i - 2)
+    next = byte_at(buf, i + 1)
 
     cond do
       before in [?\s, ?,] and before_that != ?\\ ->
@@ -275,7 +272,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   @spec v2_scan_number(binary(), non_neg_integer()) ::
           {:ok, non_neg_integer()} | {:error, binary()}
   defp v2_scan_number(buf, start) do
-    i = if binary_at(buf, start) == ?-, do: start + 1, else: start
+    i = if byte_at(buf, start) == ?-, do: start + 1, else: start
 
     if i == byte_size(buf),
       do: {:error, "invalid number"},
@@ -283,7 +280,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   end
 
   defp v2_number_loop(buf, start, i, flags),
-    do: v2_number_step(buf, start, i, binary_at(buf, i), binary_at(buf, i - 1), flags)
+    do: v2_number_step(buf, start, i, byte_at(buf, i), byte_at(buf, i - 1), flags)
 
   # One byte of a number: digits go on, `i` and `u` end an integer's
   # digits, a point is allowed once, `e` only after the first byte and a
@@ -382,7 +379,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   @spec v2_scan_boolean(binary(), non_neg_integer()) ::
           {:ok, non_neg_integer()} | {:error, binary()}
   defp v2_scan_boolean(buf, start) do
-    if binary_at(buf, start) in [?t, ?T, ?f, ?F] do
+    if byte_at(buf, start) in [?t, ?T, ?f, ?F] do
       finish = v2_boolean_end(buf, start + 1)
       word = binary_part(buf, start, finish - start)
 
@@ -395,7 +392,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   end
 
   defp v2_boolean_end(buf, i) do
-    if binary_at(buf, i) in [nil, ?,, ?\s], do: i, else: v2_boolean_end(buf, i + 1)
+    if byte_at(buf, i) in [nil, ?,, ?\s], do: i, else: v2_boolean_end(buf, i + 1)
   end
 
   # The time block: `-?digits`, up to a space or the end.
@@ -407,7 +404,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   end
 
   defp v2_time_loop(buf, start, i) do
-    char = binary_at(buf, i)
+    char = byte_at(buf, i)
 
     cond do
       char in [nil, ?\n, ?\s] -> {:ok, start, i}
@@ -427,7 +424,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
 
   @spec v2_only_spaces(binary(), non_neg_integer()) :: :ok | {:error, binary()}
   defp v2_only_spaces(buf, from) do
-    case binary_at(buf, from) do
+    case byte_at(buf, from) do
       nil -> :ok
       ?\s -> v2_only_spaces(buf, from + 1)
       _other -> {:error, "point is invalid"}
@@ -469,7 +466,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
 
   # The `=` that ends a key: a backslash skips the byte after it.
   defp v2_to_equals(text, i) do
-    case binary_at(text, i) do
+    case byte_at(text, i) do
       nil -> byte_size(text)
       ?\\ -> v2_to_equals(text, i + 2)
       ?= -> i
@@ -478,7 +475,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   end
 
   defp v2_value_end(text, i, quoted) do
-    case {binary_at(text, i), binary_at(text, i + 1)} do
+    case {byte_at(text, i), byte_at(text, i + 1)} do
       {nil, _next} -> byte_size(text)
       {?\\, next} when next in [?", ?\\] -> v2_value_end(text, i + 2, quoted)
       {?", _next} -> v2_value_end(text, i + 1, not quoted)

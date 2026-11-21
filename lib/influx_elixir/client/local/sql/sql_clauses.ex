@@ -20,6 +20,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
     SQLLimits,
     SQLLiteral,
     SQLMask,
+    SQLPredicate,
     SQLSelect,
     SQLTime
   }
@@ -133,24 +134,15 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
         keyword = binary_part(clause, 0, kw_len)
         list = binary_part(clause, kw_len, len - kw_len)
 
-        list
-        |> SQLMask.split_commas()
-        |> Enum.reduce_while({:ok, []}, fn term, {:ok, acc} ->
-          case rewrite_term.(String.trim(term)) do
-            {:ok, term} -> {:cont, {:ok, [term | acc]}}
-            {:error, _reason} = error -> {:halt, error}
-          end
-        end)
-        |> case do
-          {:ok, terms} ->
-            new_clause = keyword <> (terms |> Enum.reverse() |> Enum.join(", "))
+        with {:ok, terms} <-
+               list
+               |> SQLMask.split_commas()
+               |> SQLPredicate.map_ok(&rewrite_term.(String.trim(&1))) do
+          new_clause = keyword <> Enum.join(terms, ", ")
 
-            {:ok,
-             binary_part(rest, 0, start) <>
-               new_clause <> binary_part(rest, start + len, byte_size(rest) - start - len)}
-
-          error ->
-            error
+          {:ok,
+           binary_part(rest, 0, start) <>
+             new_clause <> binary_part(rest, start + len, byte_size(rest) - start - len)}
         end
 
       nil ->
@@ -396,16 +388,9 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   def group_columns(sql) do
     items = sql |> group_by_items() |> Enum.reject(&(date_bin_item?(&1) or empty_tuple?(&1)))
 
-    items
-    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
-      case group_item(item) do
-        {:ok, parsed} -> {:cont, {:ok, [parsed | acc]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
+    case SQLPredicate.map_ok(items, &group_item/1) do
       {:ok, []} -> {:ok, nil}
-      {:ok, parsed} -> {:ok, Enum.reverse(parsed)}
+      {:ok, parsed} -> {:ok, parsed}
       {:error, _reason} = error -> error
     end
   end

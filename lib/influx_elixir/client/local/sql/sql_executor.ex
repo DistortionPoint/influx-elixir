@@ -780,18 +780,12 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
   defp project_point(point, projection) do
     Enum.reduce(projection, %{}, fn
       {source, output}, acc when is_binary(source) ->
-        put_column(acc, output, SQLRow.column_value(point, source))
+        SQLRow.put_non_nil(acc, output, SQLRow.column_value(point, source))
 
       {expr, output}, acc ->
-        put_column(acc, output, SQLEval.eval(expr, point))
+        SQLRow.put_non_nil(acc, output, SQLEval.eval(expr, point))
     end)
   end
-
-  # InfluxDB 3 omits a null column from the row entirely (verified on both
-  # the JSON and JSONL formats), so a nil never becomes a key here.
-  @spec put_column(map(), binary(), term()) :: map()
-  defp put_column(row, _key, nil), do: row
-  defp put_column(row, key, value), do: Map.put(row, key, value)
 
   # SELECT DISTINCT a[, b ...]: one row per distinct combination, sorted
   # unless ORDER BY (one of the selected columns) says otherwise. A
@@ -809,7 +803,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     |> SQLSort.sort_by_keys(keys)
     |> Enum.map(fn point ->
       Enum.reduce(columns, %{}, fn column, row ->
-        put_column(row, column, SQLRow.column_value(point, column))
+        SQLRow.put_non_nil(row, column, SQLRow.column_value(point, column))
       end)
     end)
     |> apply_order_by_rows(query.order_by, nil)
@@ -892,7 +886,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
     columns
     |> Enum.zip(values)
     |> Enum.reduce(row, fn {column, value}, row ->
-      if column in hidden, do: put_column(row, column, value), else: row
+      if column in hidden, do: SQLRow.put_non_nil(row, column, value), else: row
     end)
   end
 
@@ -986,6 +980,6 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
                _other -> value
              end}
 
-    put_column(row, "time", SQLRow.column_value(point, "time"))
+    SQLRow.put_non_nil(row, "time", SQLRow.column_value(point, "time"))
   end
 end

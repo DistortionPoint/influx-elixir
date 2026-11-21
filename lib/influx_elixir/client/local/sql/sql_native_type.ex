@@ -16,6 +16,13 @@ defmodule InfluxElixir.Client.Local.SQLNativeType do
   @spec struct?(binary() | nil | :mixed) :: boolean()
   def struct?(type), do: is_binary(type) and String.starts_with?(type, "Struct(")
 
+  @doc "Extracts the `value` field's Arrow type from a selector struct type."
+  @spec struct_value_type(binary()) :: binary()
+  def struct_value_type(type) do
+    [_all, value] = Regex.run(@struct, type)
+    value
+  end
+
   @doc "DataFusion's NativeType for an Arrow type, as its messages name it."
   @spec native(binary()) :: binary()
   def native(type) do
@@ -24,7 +31,7 @@ defmodule InfluxElixir.Client.Local.SQLNativeType do
 
   @spec native_struct(binary()) :: binary()
   defp native_struct(type) do
-    [_all, value] = Regex.run(@struct, type)
+    value = struct_value_type(type)
 
     "Struct(LogicalFields([#{logical("value", native(value))}, " <>
       "#{logical("time", "Timestamp(Nanosecond, None)")}]))"

@@ -243,17 +243,9 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_ctes([{binary(), binary()}]) ::
           {:ok, [{binary(), parsed_query()}]} | {:error, term()}
   defp parse_ctes(sources) do
-    sources
-    |> Enum.reduce_while({:ok, []}, fn {name, body}, {:ok, acc} ->
-      case parse_single_select(body) do
-        {:ok, query} -> {:cont, {:ok, [{name, query} | acc]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
+    SQLPredicate.map_ok(sources, fn {name, body} ->
+      with {:ok, query} <- parse_single_select(body), do: {:ok, {name, query}}
     end)
-    |> case do
-      {:ok, ctes} -> {:ok, Enum.reverse(ctes)}
-      {:error, _reason} = error -> error
-    end
   end
 
   @spec parse_single_select(binary()) :: {:ok, parsed_query()} | {:error, term()}
@@ -724,13 +716,9 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_projection_columns(binary(), binary() | nil) ::
           {:ok, [projection()]} | {:error, term()}
   defp parse_projection_columns(columns_str, qualifier) do
-    columns =
-      columns_str
-      |> SQLMask.split_commas()
-      |> Enum.map(&parse_projection_column(String.trim(&1), qualifier))
-
-    Enum.find(columns, &match?({:error, _}, &1)) ||
-      {:ok, Enum.map(columns, fn {:ok, col} -> col end)}
+    columns_str
+    |> SQLMask.split_commas()
+    |> SQLPredicate.map_ok(&parse_projection_column(String.trim(&1), qualifier))
   end
 
   # Parse a select item: a column (`name`, or a quoted `"a b"`), a constant,

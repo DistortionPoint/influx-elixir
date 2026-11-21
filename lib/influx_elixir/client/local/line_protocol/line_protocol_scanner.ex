@@ -180,7 +180,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolScanner do
     do: line
 
   defp content(line, dialect) do
-    case {skip_blanks(line, dialect), dialect} do
+    case {LineProtocolEscape.trim_leading_blanks(line, dialect), dialect} do
       {<<>>, _dialect} -> :skip
       {<<?#, _rest::binary>>, :v2} -> :skip
       {<<?#, comment::binary>>, :v3} -> after_comment(comment)
@@ -195,13 +195,6 @@ defmodule InfluxElixir.Client.Local.LineProtocolScanner do
       [_comment, rest] -> content(rest, :v3)
     end
   end
-
-  @spec skip_blanks(binary(), dialect()) :: binary()
-  defp skip_blanks(<<c, rest::binary>>, dialect) when c in [?\s, ?\t],
-    do: skip_blanks(rest, dialect)
-
-  defp skip_blanks(<<0, rest::binary>>, :v2), do: skip_blanks(rest, :v2)
-  defp skip_blanks(line, _dialect), do: line
 
   # Splits the payload into lines as both engines do (see `parse_lines/3`).
   # A payload with no quote and no backslash splits on newlines alone; in
@@ -304,7 +297,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolScanner do
 
   # InfluxDB 2 quotes the line after its leading whitespace in the error.
   defp parse_line(line, %{dialect: :v2, precision: precision}) do
-    trimmed = skip_blanks(line, :v2)
+    trimmed = LineProtocolEscape.trim_leading_blanks(line, :v2)
     trimmed |> LineProtocolV2.parse(precision) |> with_shown(trimmed)
   end
 

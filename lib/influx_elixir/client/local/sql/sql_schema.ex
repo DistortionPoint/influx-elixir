@@ -22,6 +22,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     SQLLiteral,
     SQLNumber,
     SQLParser,
+    SQLPredicate,
     SQLSelect
   }
 
@@ -695,17 +696,13 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   defp resolve_positions(query, nil), do: {:ok, query}
 
   defp resolve_positions(query, columns) do
-    query.order_by
-    |> Enum.reduce_while({:ok, []}, fn {target, direction}, {:ok, acc} ->
-      case resolve_ordinal(target, columns) do
-        {:ok, column} -> {:cont, {:ok, [{column, direction} | acc]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> then(fn
-      {:ok, terms} -> {:ok, %{query | order_by: Enum.reverse(terms)}}
-      {:error, _reason} = error -> error
-    end)
+    with {:ok, terms} <-
+           SQLPredicate.map_ok(query.order_by, fn {target, direction} ->
+             with {:ok, column} <- resolve_ordinal(target, columns),
+                  do: {:ok, {column, direction}}
+           end) do
+      {:ok, %{query | order_by: terms}}
+    end
   end
 
   @spec resolve_ordinal(term(), [binary()]) :: {:ok, term()} | {:error, map()}

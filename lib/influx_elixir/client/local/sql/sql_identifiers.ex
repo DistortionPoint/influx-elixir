@@ -24,6 +24,8 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
   # It also owns what the passes that read a SQL text share: the characters of a word and
   # the reader of a quoted token.
 
+  alias InfluxElixir.Client.Local.InfluxQLLex
+
   # Words the parser reads as structure: a quoted column of that name keeps
   # its quotes rather than turn into the keyword.
   @keywords ~w(select distinct on from where and or not in is null between like ilike
@@ -59,7 +61,6 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
   end
 
   defp scan(<<c, _rest::binary>> = sql, acc) when c in ?0..?9, do: scan_number(sql, acc)
-
   defp scan(<<?., d, _rest::binary>> = sql, acc) when d in ?0..?9, do: scan_number(sql, acc)
 
   defp scan(<<c::utf8, rest::binary>> = sql, acc) do
@@ -103,11 +104,8 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
   @spec take_number(binary()) :: {binary(), binary()}
   def take_number(text) do
     case Regex.run(@number, text) do
-      [number] ->
-        {number, binary_part(text, byte_size(number), byte_size(text) - byte_size(number))}
-
-      nil ->
-        {"", text}
+      [number] -> {number, InfluxQLLex.rest_after(text, number)}
+      nil -> {"", text}
     end
   end
 

@@ -26,7 +26,15 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
   # items of one shape have the same name, and the error is refused by name, as its words cannot
   # be printed. Items of different shapes are taken to have different names.
 
-  alias InfluxElixir.Client.Local.{SQLDml, SQLDmlExpr, SQLDmlOperand, SQLError, SQLLimits}
+  alias InfluxElixir.Client.Local.{
+    Format,
+    SQLDml,
+    SQLDmlExpr,
+    SQLDmlOperand,
+    SQLError,
+    SQLLimits,
+    SQLLiteral
+  }
 
   require SQLLimits
 
@@ -353,49 +361,10 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
 
   @spec float(binary()) :: binary() | :unknown
   defp float(text) do
-    case Float.parse(text) do
-      {value, ""} -> "Float64(" <> plain(value) <> ")"
+    case SQLLiteral.safe_float_parse(text) do
+      {value, ""} -> "Float64(" <> Format.render_decimal(value) <> ")"
       _unreadable -> :unknown
     end
-  rescue
-    ArgumentError -> :unknown
-  end
-
-  # A float as Rust's `Display` writes it: the shortest digits that read back, never an exponent.
-  @spec plain(float()) :: binary()
-  defp plain(value) do
-    [_all, sign, whole, fraction, exponent] =
-      Regex.run(~r/\A(-?)([0-9]+)(?:\.([0-9]+))?(?:e([+-]?[0-9]+))?\z/, Float.to_string(value))
-      |> pad_match()
-
-    digits = whole <> fraction
-    point = String.length(whole) + String.to_integer(exponent)
-    sign <> place(digits, point)
-  end
-
-  @spec pad_match([binary()]) :: [binary()]
-  defp pad_match([all, sign, whole, fraction]), do: [all, sign, whole, fraction, "0"]
-  defp pad_match(match), do: match
-
-  @spec place(binary(), integer()) :: binary()
-  defp place(digits, point) do
-    {integer_part, fraction_part} =
-      cond do
-        point <= 0 ->
-          {"0", String.duplicate("0", -point) <> digits}
-
-        point >= String.length(digits) ->
-          {digits <> String.duplicate("0", point - String.length(digits)), ""}
-
-        true ->
-          String.split_at(digits, point)
-      end
-
-    integer_part =
-      integer_part |> String.trim_leading("0") |> then(&if(&1 == "", do: "0", else: &1))
-
-    fraction_part = String.trim_trailing(fraction_part, "0")
-    if fraction_part == "", do: integer_part, else: integer_part <> "." <> fraction_part
   end
 
   # ---------------------------------------------------------------------------

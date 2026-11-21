@@ -21,6 +21,7 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # (`BEGIN`, `COMMIT`, `SHOW`).
 
   alias InfluxElixir.Client.Local.{
+    InfluxQLLex,
     SQLDdl,
     SQLError,
     SQLGrant,
@@ -532,7 +533,7 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
         nil
 
       symbol ->
-        tail = binary_part(rest, byte_size(symbol), byte_size(rest) - byte_size(symbol))
+        tail = InfluxQLLex.rest_after(rest, symbol)
 
         cond do
           Regex.match?(@symbol_char, tail) -> nil

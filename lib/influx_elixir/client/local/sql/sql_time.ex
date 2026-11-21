@@ -29,7 +29,15 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   # changes with the date — is the same marker carrying a `Client.Local:`
   # refusal.
 
-  alias InfluxElixir.Client.Local.{SQLError, SQLLimits, SQLLiteral}
+  import InfluxElixir.Client.Local.Durations, only: [pad: 2]
+
+  alias InfluxElixir.Client.Local.{
+    Durations,
+    LineProtocolNumber,
+    SQLError,
+    SQLLimits,
+    SQLLiteral
+  }
 
   require SQLLimits
 
@@ -368,23 +376,17 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   # Digits past the ninth are read and dropped.
   @spec fraction(binary()) :: {:ok, non_neg_integer(), binary()} | {:error, binary()}
   defp fraction(<<?., rest::binary>>) do
-    {digits, tail} = take_digits(rest, [])
-
-    case digits do
-      [] ->
+    case LineProtocolNumber.digit_count(rest, 0) do
+      0 ->
         {:error, "error parsing time"}
 
-      _digits ->
-        nanos = digits |> Enum.take(9) |> to_string() |> String.pad_trailing(9, "0")
-        {:ok, String.to_integer(nanos), tail}
+      count ->
+        <<digits::binary-size(count), tail::binary>> = rest
+        {:ok, Durations.fraction_ns(digits), tail}
     end
   end
 
   defp fraction(tail), do: {:ok, 0, tail}
-
-  @spec take_digits(binary(), [byte()]) :: {[byte()], binary()}
-  defp take_digits(<<d, rest::binary>>, acc) when d in ?0..?9, do: take_digits(rest, [d | acc])
-  defp take_digits(rest, acc), do: {Enum.reverse(acc), rest}
 
   @spec zone(binary()) :: {:ok, integer()} | {:zone, binary()} | {:refusal, binary()}
   defp zone(zone) when zone in ["", "Z", "z"], do: {:ok, 0}
@@ -489,13 +491,5 @@ defmodule InfluxElixir.Client.Local.SQLTime do
 
   @spec fraction_text(non_neg_integer()) :: binary()
   defp fraction_text(0), do: ""
-
-  defp fraction_text(nanos) when rem(nanos, 1_000_000) == 0,
-    do: "." <> pad(div(nanos, 1_000_000), 3)
-
-  defp fraction_text(nanos) when rem(nanos, 1000) == 0, do: "." <> pad(div(nanos, 1000), 6)
-  defp fraction_text(nanos), do: "." <> pad(nanos, 9)
-
-  @spec pad(non_neg_integer(), pos_integer()) :: binary()
-  defp pad(number, width), do: number |> Integer.to_string() |> String.pad_leading(width, "0")
+  defp fraction_text(nanos), do: "." <> Durations.fraction_digits(nanos)
 end

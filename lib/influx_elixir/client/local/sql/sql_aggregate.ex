@@ -54,7 +54,11 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     end
 
     Enum.reduce(columns, %{}, fn column, row ->
-      put(row, SQLSelect.column_output(column), column_result(column, points, bucket_ts))
+      SQLRow.put_non_nil(
+        row,
+        SQLSelect.column_output(column),
+        column_result(column, points, bucket_ts)
+      )
     end)
   end
 
@@ -162,11 +166,6 @@ defmodule InfluxElixir.Client.Local.SQLAggregate do
     items = Map.drop(outputs, Map.keys(base.tags) ++ Map.keys(base.fields))
     %{base | fields: base.fields |> Map.merge(items) |> Map.merge(values)}
   end
-
-  # A null result is no key.
-  @spec put(map(), binary(), term()) :: map()
-  defp put(row, _key, nil), do: row
-  defp put(row, key, value), do: Map.put(row, key, value)
 
   @spec column_result(SQLSelect.column(), points(), integer() | nil | :scalar) :: term()
   defp column_result({:time_bucket, _alias}, _points, bucket_ts),

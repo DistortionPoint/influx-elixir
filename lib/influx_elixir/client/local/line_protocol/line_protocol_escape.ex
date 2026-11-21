@@ -3,13 +3,18 @@ defmodule InfluxElixir.Client.Local.LineProtocolEscape do
   # Line-protocol text: the blanks a line may start with, and the escaping each
   # engine undoes in a name and in a string field, left to right.
 
-  # Leading spaces and tabs, by byte.
-  @spec trim_leading_blanks(binary()) :: binary()
+  # Leading spaces and tabs (plus NUL bytes in v2), by byte.
+  @spec trim_leading_blanks(binary(), :v2 | :v3) :: binary()
   @doc false
-  def trim_leading_blanks(<<c, rest::binary>>) when c in [?\s, ?\t],
-    do: trim_leading_blanks(rest)
+  def trim_leading_blanks(line, dialect \\ :v3)
 
-  def trim_leading_blanks(line), do: line
+  def trim_leading_blanks(<<c, rest::binary>>, dialect) when c in [?\s, ?\t],
+    do: trim_leading_blanks(rest, dialect)
+
+  def trim_leading_blanks(<<0, rest::binary>>, :v2),
+    do: trim_leading_blanks(rest, :v2)
+
+  def trim_leading_blanks(line, _dialect), do: line
 
   # A raw name whose last byte is a backslash: `\\` at the end, since a
   # single one would have escaped the separator.

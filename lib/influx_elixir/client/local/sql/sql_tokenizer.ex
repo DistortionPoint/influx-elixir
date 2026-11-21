@@ -10,7 +10,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   # unterminated string or comment) gives `:bail`, and leaves the text to the rest of the
   # double.
 
-  alias InfluxElixir.Client.Local.{SQLIdentifiers, SQLLexer}
+  alias InfluxElixir.Client.Local.{InfluxQLLex, SQLIdentifiers, SQLLexer}
 
   @typedoc "A token: kind, printed, upper case, line, column."
   @type token :: {atom(), binary(), binary(), pos_integer(), pos_integer()}
@@ -295,7 +295,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   defp raw_token(text, raw, kind, printed, line, col, acc) do
     {next_line, next_col} = advance({line, col}, raw)
     token = {kind, printed, printed, line, col}
-    tokenize(binary_tail(text, raw), next_line, next_col, [token | acc])
+    tokenize(InfluxQLLex.rest_after(text, raw), next_line, next_col, [token | acc])
   end
 
   # A one-letter word directly before a quote prefixes a string: `E'..'` is read (it prints
@@ -351,10 +351,6 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
     end
   end
 
-  @spec binary_tail(binary(), binary()) :: binary()
-  defp binary_tail(text, literal),
-    do: binary_part(text, byte_size(literal), byte_size(text) - byte_size(literal))
-
   @spec placeholder(binary(), pos_integer(), pos_integer(), tokens()) ::
           result()
   defp placeholder(<<?$, rest::binary>> = text, line, col, acc) do
@@ -380,7 +376,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
       <<_tag::binary-size(size), ?$, _rest::binary>> ->
         open = binary_part(text, 0, size + 2)
 
-        case :binary.split(binary_tail(text, open), open) do
+        case :binary.split(InfluxQLLex.rest_after(text, open), open) do
           [body, _after] -> {:ok, open <> body <> open}
           [_unterminated] -> :bail
         end
@@ -410,6 +406,9 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
         ) :: result()
   defp emit(text, literal, kind, line, col, acc, printed \\ nil) do
     token = {kind, printed || literal, String.upcase(literal), line, col}
-    tokenize(binary_tail(text, literal), line, col + String.length(literal), [token | acc])
+
+    tokenize(InfluxQLLex.rest_after(text, literal), line, col + String.length(literal), [
+      token | acc
+    ])
   end
 end

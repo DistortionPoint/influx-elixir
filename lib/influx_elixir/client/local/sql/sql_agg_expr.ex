@@ -23,6 +23,7 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
     SQLLimit,
     SQLLiteral,
     SQLMask,
+    SQLPredicate,
     SQLSelect,
     SQLWhere
   }
@@ -41,16 +42,9 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
   @spec parse_list(binary(), binary() | nil) ::
           {:ok, [SQLSelect.column() | column()]} | {:error, term()}
   def parse_list(columns_str, qualifier \\ nil) do
-    columns =
-      columns_str
-      |> SQLMask.split_commas()
-      |> Enum.map(&String.trim/1)
-      |> Enum.map(&parse_item(&1, qualifier))
-
-    case Enum.find(columns, &match?({:error, _}, &1)) do
-      nil -> {:ok, Enum.map(columns, fn {:ok, column} -> column end)}
-      error -> error
-    end
+    columns_str
+    |> SQLMask.split_commas()
+    |> SQLPredicate.map_ok(&parse_item(String.trim(&1), qualifier))
   end
 
   @spec parse_item(binary(), binary() | nil) ::
@@ -112,17 +106,15 @@ defmodule InfluxElixir.Client.Local.SQLAggExpr do
   defp replace_aggregates(body, qualifier) do
     spans = SQLSelect.aggregate_spans(body)
 
-    spans
-    |> Enum.with_index()
-    |> Enum.reduce_while({:ok, []}, fn {{start, length}, index}, {:ok, acc} ->
-      case SQLSelect.parse_item(binary_part(body, start, length), qualifier) do
-        {:ok, column} -> {:cont, {:ok, [{placeholder(index), column} | acc]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, aggs} -> {:ok, substitute(body, spans), Enum.reverse(aggs)}
-      {:error, _reason} = error -> error
+    with {:ok, aggs} <-
+           spans
+           |> Enum.with_index()
+           |> SQLPredicate.map_ok(fn {{start, length}, index} ->
+             with {:ok, column} <-
+                    SQLSelect.parse_item(binary_part(body, start, length), qualifier),
+                  do: {:ok, {placeholder(index), column}}
+           end) do
+      {:ok, substitute(body, spans), aggs}
     end
   end
 

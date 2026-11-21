@@ -17,6 +17,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
   # form feed in a time is not a form the double has verified, and `\s` taking it makes the
   # time `:unknown`, which is refused by name, rather than a claim that Core refuses it. Only
   # `trailing_blank?/1`, which claims a refusal, reads the blank as the language does (`~q`).
+  import InfluxElixir.Client.Local.Durations, only: [pad: 2]
   import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
 
   alias InfluxElixir.Client.Local.{Durations, InfluxQLError, InfluxQLTokens, SQLLimits}
@@ -160,8 +161,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
     "#{date} #{clock}#{if fraction == "", do: "", else: "." <> fraction} +00:00"
   end
 
-  defp pad(n, width), do: n |> Integer.to_string() |> String.pad_leading(width, "0")
-
   @doc """
   The planner's error for an instant that does not fit 64-bit nanoseconds,
   as it names it (`2297-10-16 00:00:00.500 +00:00`: the fraction in groups of
@@ -178,16 +177,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLTime do
     %DateTime{year: y, month: mo, day: d, hour: h, minute: mi, second: s} =
       DateTime.from_unix!(seconds)
 
-    fraction = ns |> Integer.mod(1_000_000_000) |> fraction_digits()
+    fraction = ns |> Integer.mod(1_000_000_000) |> Durations.fraction_digits()
     shown = shown(y, mo, d, {h, mi, s}, fraction)
     throw({:refused, {:engine, 400, InfluxQLError.timestamp_out_of_range(shown)}})
   end
-
-  @spec fraction_digits(non_neg_integer()) :: binary()
-  defp fraction_digits(0), do: ""
-  defp fraction_digits(nanos) when rem(nanos, 1_000_000) == 0, do: pad(div(nanos, 1_000_000), 3)
-  defp fraction_digits(nanos) when rem(nanos, 1_000) == 0, do: pad(div(nanos, 1_000), 6)
-  defp fraction_digits(nanos), do: pad(nanos, 9)
 
   # ---------------------------------------------------------------------------
   # `time` as a condition

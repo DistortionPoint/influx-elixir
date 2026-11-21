@@ -16,7 +16,7 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   #     to create the table, which `into?/1` says
   #   * a word of the grammar after `AS` (`AS having`) is a name: it is written quoted
 
-  alias InfluxElixir.Client.Local.SQLIdentifiers
+  alias InfluxElixir.Client.Local.{InfluxQLLex, SQLIdentifiers}
 
   @typep token :: {:space | :word | :quoted | :backtick | :string | :symbol | :other, binary()}
 
@@ -86,7 +86,7 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
 
   defp tokens(<<c, _rest::binary>> = text, acc) when c in [?\s, ?\t, ?\r, ?\n] do
     [space] = Regex.run(~r/\A\s+/, text)
-    tokens(tail(text, space), [{:space, space} | acc])
+    tokens(InfluxQLLex.rest_after(text, space), [{:space, space} | acc])
   end
 
   defp tokens(<<q, rest::binary>> = text, acc) when q in [?', ?", ?`] do
@@ -113,13 +113,9 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
 
       true ->
         symbol = Enum.find(@symbols, &String.starts_with?(text, &1)) || <<c::utf8>>
-        tokens(tail(text, symbol), [{:symbol, symbol} | acc])
+        tokens(InfluxQLLex.rest_after(text, symbol), [{:symbol, symbol} | acc])
     end
   end
-
-  @spec tail(binary(), binary()) :: binary()
-  defp tail(text, taken),
-    do: binary_part(text, byte_size(taken), byte_size(text) - byte_size(taken))
 
   # ---------------------------------------------------------------------------
   # The spellings of a token
