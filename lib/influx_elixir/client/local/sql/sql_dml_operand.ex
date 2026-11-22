@@ -1356,14 +1356,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
     cond do
       not Regex.match?(~r/\A[0-9]+\z/, text) -> :float
       byte_size(text) < 19 -> :int
-      true -> integer_type(String.to_integer(text))
+      true -> text |> String.to_integer() |> SQLLimits.integer_type() |> from_arrow()
     end
   end
-
-  @spec integer_type(non_neg_integer()) :: type()
-  defp integer_type(value) when value <= SQLLimits.int64_max(), do: :int
-  defp integer_type(value) when value <= SQLLimits.uint64_max(), do: :uint
-  defp integer_type(_value), do: :float
 
   @spec arithmetic(type(), type()) :: type()
   defp arithmetic(:null, :null), do: :int

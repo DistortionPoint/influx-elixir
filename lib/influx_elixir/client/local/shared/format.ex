@@ -68,12 +68,10 @@ defmodule InfluxElixir.Client.Local.Format do
   @spec accept(term(), binary() | nil) :: :ok | {:error, map()}
   defp accept(:parquet, _database) do
     {:error,
-     %{
-       status: 400,
-       body:
-         "Client.Local: format: :parquet is not supported by the test double; " <>
-           "cover Parquet in the integration tier"
-     }}
+     SQLError.refusal(
+       "format: :parquet is not supported by the test double; " <>
+         "cover Parquet in the integration tier"
+     )}
   end
 
   defp accept(format, database) when is_atom(format) or is_binary(format) do
@@ -82,7 +80,7 @@ defmodule InfluxElixir.Client.Local.Format do
     cond do
       not String.valid?(text) ->
         {:error,
-         refusal(
+         SQLError.refusal(
            "format: a value that is not valid UTF-8 (the client cannot write it into the " <>
              "request body)"
          )}
@@ -96,10 +94,7 @@ defmodule InfluxElixir.Client.Local.Format do
   end
 
   defp accept(_format, _database),
-    do: {:error, refusal("format: a value that is neither an atom nor a string")}
-
-  @spec refusal(binary()) :: map()
-  defp refusal(reason), do: %{status: 400, body: "Client.Local: " <> reason}
+    do: {:error, SQLError.refusal("format: a value that is neither an atom nor a string")}
 
   @doc """
   The engine's 400 for the request's parameters, or `:ok`. The engine reads

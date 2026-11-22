@@ -23,7 +23,8 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     SQLNumber,
     SQLParser,
     SQLPredicate,
-    SQLSelect
+    SQLSelect,
+    SQLWhere
   }
 
   @typedoc "A stored point, as `InfluxElixir.Client.Local` keeps it."
@@ -748,38 +749,13 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
   @doc "The columns a `WHERE` reads."
   @spec where_refs([SQLParser.where_node()]) :: [SQLExpr.column_ref()]
-  def where_refs(nodes) do
-    Enum.flat_map(nodes, fn
-      {:or, branches} ->
-        Enum.flat_map(branches, &where_refs/1)
-
-      {:not, conjunction} ->
-        where_refs(conjunction)
-
-      {:eq, :null, nil} ->
-        []
-
-      {op, left, {low, high}} when op in [:between, :not_between] ->
-        operand_fields(left) ++ expr_fields([low, high])
-
-      {_op, left, right} when is_binary(left) ->
-        [left | expr_fields(right)]
-
-      {_op, left, right} ->
-        expr_fields(left) ++ expr_fields(right)
-    end)
-  end
-
-  @spec operand_fields(SQLParser.operand()) :: [SQLExpr.column_ref()]
-  defp operand_fields(column) when is_binary(column), do: [column]
-  defp operand_fields(operand), do: expr_fields(operand)
+  defdelegate where_refs(nodes), to: SQLWhere, as: :conjunction_refs
 
   @doc "The columns an expression reads."
   @spec expr_fields(term()) :: [SQLExpr.column_ref()]
-  def expr_fields({:expr, expr}), do: expr_fields(expr)
-  def expr_fields({kind, name}) when kind in [:field, :uint_col], do: [name]
+  def expr_fields({:expr, expr}), do: SQLExpr.columns(expr)
   def expr_fields(items) when is_list(items), do: Enum.flat_map(items, &expr_fields/1)
-  def expr_fields(expr), do: Enum.flat_map(SQLExpr.children(expr), &expr_fields/1)
+  def expr_fields(expr), do: SQLExpr.columns(expr)
 
   @doc """
   The columns a query's rows are made of, whether or not any row has a value

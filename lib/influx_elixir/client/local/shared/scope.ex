@@ -4,7 +4,7 @@ defmodule InfluxElixir.Client.Local.Scope do
   # connection's profile has the operation, which database the call is for, and
   # whether the engine has it.
 
-  alias InfluxElixir.Client.Local.{DatabaseRules, LineProtocolParser, Retention, Store}
+  alias InfluxElixir.Client.Local.{DatabaseRules, LineProtocolParser, Retention, SQLError, Store}
   alias InfluxElixir.Client.Options
 
   # Operations supported by each profile.
@@ -61,12 +61,12 @@ defmodule InfluxElixir.Client.Local.Scope do
   def utf8_name(name, kind) when is_binary(name) do
     if String.valid?(name),
       do: :ok,
-      else: {:error, %{status: 400, body: "Client.Local: the #{kind} name is not valid UTF-8"}}
+      else: {:error, SQLError.refusal("the #{kind} name is not valid UTF-8")}
   end
 
   # No engine answer exists for a name that is not text: refused by name, never raised.
   def utf8_name(_name, kind),
-    do: {:error, %{status: 400, body: "Client.Local: the #{kind} name is not a string"}}
+    do: {:error, SQLError.refusal("the #{kind} name is not a string")}
 
   @doc """
   The database of a call, as `Client.HTTP.resolve_database/2` has it:
@@ -94,11 +94,7 @@ defmodule InfluxElixir.Client.Local.Scope do
         :ok
 
       database == DatabaseRules.internal() ->
-        {:error,
-         %{
-           status: 400,
-           body: "Client.Local: the _internal database's system tables are not modelled"
-         }}
+        {:error, SQLError.refusal("the _internal database's system tables are not modelled")}
 
       not String.valid?(database) ->
         utf8_name(database, "database")

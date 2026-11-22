@@ -103,17 +103,20 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   defp null_predicate(text) do
     cond do
       match = operand_match(@is_not_null_pattern, text) ->
-        [key] = match
-        {:ok, if(key == "time", do: :always, else: {:is_not_null, key, nil})}
+        null_clause(:is_not_null, :always, match)
 
       match = operand_match(@is_null_pattern, text) ->
-        [key] = match
-        {:ok, if(key == "time", do: :never, else: {:is_null, key, nil})}
+        null_clause(:is_null, :never, match)
 
       true ->
         :nomatch
     end
   end
+
+  @spec null_clause(:is_null | :is_not_null, :always | :never, [term()]) ::
+          {:ok, clause() | :always | :never}
+  defp null_clause(op, time_const, [key]),
+    do: {:ok, if(key == "time", do: time_const, else: {op, key, nil})}
 
   @spec list_predicate(binary()) :: {:ok, clause()} | {:error, map()} | :nomatch
   defp list_predicate(text) do

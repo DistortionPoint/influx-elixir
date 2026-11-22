@@ -29,7 +29,7 @@ defmodule InfluxElixir.Client.Local.SQLRange do
     SQLParser,
     SQLPredicates,
     SQLRow,
-    SQLSchema,
+    SQLWhere,
     Store
   }
 
@@ -159,7 +159,7 @@ defmodule InfluxElixir.Client.Local.SQLRange do
   def check_values(%{where: []}, _points, _kind, _integer_type, _cte?), do: :ok
 
   def check_values(query, points, kind, integer_type, cte?) do
-    columns = for column <- SQLSchema.where_refs(query.where), is_binary(column), do: column
+    columns = SQLWhere.conjunction_columns(query.where)
     types = column_types(points, Enum.uniq(columns), kind, integer_type)
     SQLBounds.check(query.where, &Map.get(types, &1), cte: cte?)
   end

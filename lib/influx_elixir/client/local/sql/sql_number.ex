@@ -224,10 +224,8 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   defp refused(message), do: throw({:query_error, SQLError.refusal(message)})
 
   @spec decimal_op(op(), decimal(), decimal()) :: decimal()
-  defp decimal_op(op, {:dec, c1, s1}, {:dec, c2, s2}) when op in [:+, :-] do
-    scale = max(s1, s2)
-    left = c1 * pow10(scale - s1)
-    right = c2 * pow10(scale - s2)
+  defp decimal_op(op, d1, d2) when op in [:+, :-] do
+    {left, right, scale} = align_decimals(d1, d2)
     fit({:dec, if(op == :+, do: left + right, else: left - right), scale})
   end
 
@@ -237,9 +235,15 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   defp decimal_op(:/, {:dec, c1, s1}, {:dec, c2, s2}),
     do: fit({:dec, div(c1 * pow10(@division_places + s2), c2), s1 + @division_places})
 
-  defp decimal_op(:rem, {:dec, c1, s1}, {:dec, c2, s2}) do
+  defp decimal_op(:rem, d1, d2) do
+    {left, right, scale} = align_decimals(d1, d2)
+    fit({:dec, rem(left, right), scale})
+  end
+
+  @spec align_decimals(decimal(), decimal()) :: {integer(), integer(), non_neg_integer()}
+  defp align_decimals({:dec, c1, s1}, {:dec, c2, s2}) do
     scale = max(s1, s2)
-    fit({:dec, rem(c1 * pow10(scale - s1), c2 * pow10(scale - s2)), scale})
+    {c1 * pow10(scale - s1), c2 * pow10(scale - s2), scale}
   end
 
   @spec pow10(non_neg_integer()) :: pos_integer()
@@ -412,9 +416,9 @@ defmodule InfluxElixir.Client.Local.SQLNumber do
   end
 
   @spec compare_decimals(decimal(), decimal()) :: :lt | :eq | :gt
-  defp compare_decimals({:dec, c1, s1}, {:dec, c2, s2}) do
-    scale = max(s1, s2)
-    compare_integers(c1 * pow10(scale - s1), c2 * pow10(scale - s2))
+  defp compare_decimals(d1, d2) do
+    {left, right, _scale} = align_decimals(d1, d2)
+    compare_integers(left, right)
   end
 
   @spec compare_floats(float() | special(), float() | special()) :: :lt | :eq | :gt

@@ -124,10 +124,13 @@ defmodule InfluxElixir.Client.Local.Store do
 
   @doc "A database's retention in whole seconds, or `nil` when it has none."
   @spec retention(t(), binary()) :: Retention.t()
-  def retention(table, name) do
-    case :ets.lookup(table, {:retention, name}) do
-      [{_key, seconds}] -> seconds
-      [] -> nil
+  def retention(table, name), do: lookup_value(table, {:retention, name})
+
+  @spec lookup_value(t(), term(), term()) :: term()
+  defp lookup_value(table, key, default \\ nil) do
+    case :ets.lookup(table, key) do
+      [{^key, value}] -> value
+      [] -> default
     end
   end
 
@@ -239,12 +242,7 @@ defmodule InfluxElixir.Client.Local.Store do
 
   @doc "A bucket's metadata, or `nil` when it is not registered."
   @spec bucket(t(), binary()) :: map() | nil
-  def bucket(table, name) do
-    case :ets.lookup(table, {:bucket, name}) do
-      [{_key, meta}] -> meta
-      [] -> nil
-    end
-  end
+  def bucket(table, name), do: lookup_value(table, {:bucket, name})
 
   @doc "The buckets as `{name, meta}`, sorted by name."
   @spec buckets(t()) :: [{binary(), map()}]
@@ -318,12 +316,7 @@ defmodule InfluxElixir.Client.Local.Store do
   end
 
   @spec last_token_id(t()) :: non_neg_integer()
-  defp last_token_id(table) do
-    case :ets.lookup(table, :token_id) do
-      [{:token_id, id}] -> id
-      [] -> 0
-    end
-  end
+  defp last_token_id(table), do: lookup_value(table, :token_id, 0)
 
   @doc "Removes the token named `name`: `:ok`, or `:error` when there is none."
   @spec delete_token(t(), binary()) :: :ok | :error
@@ -601,12 +594,8 @@ defmodule InfluxElixir.Client.Local.Store do
 
   @doc "A column's registered kind, or `nil` — a read that registers nothing."
   @spec column_kind(t(), binary(), binary(), binary()) :: binary() | nil
-  def column_kind(table, database, measurement, column) do
-    case :ets.lookup(table, {:column, database, measurement, column}) do
-      [{_key, kind}] -> kind
-      [] -> nil
-    end
-  end
+  def column_kind(table, database, measurement, column),
+    do: lookup_value(table, {:column, database, measurement, column})
 
   @doc "Whether the measurement has any column registered (the table exists)."
   @spec table?(t(), binary(), binary()) :: boolean()

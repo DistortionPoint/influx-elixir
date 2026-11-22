@@ -74,7 +74,7 @@ defmodule InfluxElixir.Client.Local.SQLShow do
       [name] -> columns("iox", name, form)
       [schema, name] -> columns(schema, name, form)
       ["public", schema, name] -> columns(schema, name, form)
-      _other -> unresolved(reference)
+      parts -> SQLTable.locate(parts)
     end
   end
 
@@ -85,29 +85,19 @@ defmodule InfluxElixir.Client.Local.SQLShow do
   # The engine describes the views of its other schemas from their definitions, not from the
   # `information_schema`, which the double does not hold.
   defp columns(schema, name, :describe) do
-    case unresolved(schema <> "." <> name) do
-      {:error, %{body: "Client.Local: " <> _refusal}} ->
+    case SQLTable.locate([schema, name]) do
+      {:engine, _schema, _name, _columns} ->
         {:error, SQLError.refusal("DESCRIBE of #{schema}.#{name}: only tables of the iox schema")}
 
-      other ->
-        other
+      {:error, _error} = error ->
+        error
     end
   end
 
   defp columns(schema, name, form) do
     if SQLTable.modelled?(schema, name),
       do: {:ok, columns_sql(schema, name, form), nil},
-      else: unresolved(schema <> "." <> name)
-  end
-
-  # A table the engine has not (or a view the double does not model): the
-  # error of reading it in a `FROM`.
-  @spec unresolved(binary()) :: {:error, map()}
-  defp unresolved(reference) do
-    case SQLTable.resolve(reference) do
-      {:error, error} -> {:error, error}
-      {:ok, _resolved} -> {:error, SQLError.refusal("SHOW COLUMNS FROM #{reference}")}
-    end
+      else: SQLTable.resolve(schema <> "." <> name)
   end
 
   @spec columns_sql(binary(), binary(), :show | :describe) :: binary()

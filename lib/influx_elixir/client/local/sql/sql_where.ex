@@ -377,8 +377,30 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   def exprs({op, left, right}),
     do: operand_exprs(left) ++ right_exprs(op, right)
 
+  @doc "The same as `exprs/1` for each node of a conjunction."
   @spec conjunction_exprs([node_t()]) :: [SQLExpr.t()]
-  defp conjunction_exprs(conjunction), do: Enum.flat_map(conjunction, &exprs/1)
+  def conjunction_exprs(conjunction), do: Enum.flat_map(conjunction, &exprs/1)
+
+  @doc """
+  The column references a node reads: a predicate's column operands and the
+  columns inside its expressions.
+  """
+  @spec refs(node_t()) :: [SQLExpr.column_ref()]
+  def refs({:or, branches}), do: Enum.flat_map(branches, &conjunction_refs/1)
+  def refs({:not, conjunction}), do: conjunction_refs(conjunction)
+
+  # The `NULL` literal read as a condition (`NULL = NULL`, `HAVING NULL`) never holds and reads
+  # no column (not even `time`, which a table made by a `WITH` may not have).
+  def refs({:eq, :null, nil}), do: []
+
+  def refs({_op, left, _right} = clause) do
+    own = if is_binary(left), do: [left], else: []
+    own ++ Enum.flat_map(exprs(clause), &SQLExpr.columns/1)
+  end
+
+  @doc "The same as `refs/1` for each node of a conjunction."
+  @spec conjunction_refs([node_t()]) :: [SQLExpr.column_ref()]
+  def conjunction_refs(conjunction), do: Enum.flat_map(conjunction, &refs/1)
 
   @doc """
   The names of the columns a node reads: a predicate's column operands and the
@@ -386,21 +408,12 @@ defmodule InfluxElixir.Client.Local.SQLWhere do
   not have is not one.
   """
   @spec columns(node_t()) :: [binary()]
-  def columns({:or, branches}), do: Enum.flat_map(branches, &conjunction_columns/1)
-  def columns({:not, conjunction}), do: conjunction_columns(conjunction)
-
-  # The `NULL` literal read as a condition (`NULL = NULL`, `HAVING NULL`) never holds and reads
-  # no column (not even `time`, which a table made by a `WITH` may not have).
-  def columns({:eq, :null, nil}), do: []
-
-  def columns({_op, left, _right} = clause) do
-    own = if is_binary(left), do: [left], else: []
-    own ++ for(expr <- exprs(clause), name <- SQLExpr.columns(expr), is_binary(name), do: name)
-  end
+  def columns(node), do: Enum.filter(refs(node), &is_binary/1)
 
   @doc "The same as `columns/1` for each node of a conjunction."
   @spec conjunction_columns([node_t()]) :: [binary()]
-  def conjunction_columns(conjunction), do: Enum.flat_map(conjunction, &columns/1)
+  def conjunction_columns(conjunction),
+    do: Enum.filter(conjunction_refs(conjunction), &is_binary/1)
 
   @spec operand_exprs(term()) :: [SQLExpr.t()]
   defp operand_exprs({:expr, expr}), do: [expr]

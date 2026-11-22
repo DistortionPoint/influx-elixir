@@ -26,7 +26,8 @@ defmodule InfluxElixir.Client.Local.SQLFold do
     SQLExpr,
     SQLNumber,
     SQLParser,
-    SQLSelect
+    SQLSelect,
+    SQLWhere
   }
 
   # An expression that reads no column reads no point.
@@ -149,27 +150,6 @@ defmodule InfluxElixir.Client.Local.SQLFold do
       for {:aggregate, _agg, expr, _output} <- query.select_columns || [], do: expr
 
     SQLSelect.projected_exprs(query) ++
-      aggregated ++ conditions(query.where) ++ SQLSelect.ordered_exprs(query)
+      aggregated ++ SQLWhere.conjunction_exprs(query.where) ++ SQLSelect.ordered_exprs(query)
   end
-
-  @spec conditions([SQLParser.where_node()]) :: [SQLExpr.t()]
-  defp conditions(nodes), do: Enum.flat_map(nodes, &condition/1)
-
-  @spec condition(SQLParser.where_node()) :: [SQLExpr.t()]
-  defp condition({:or, branches}), do: Enum.flat_map(branches, &conditions/1)
-  defp condition({:not, nodes}), do: conditions(nodes)
-
-  defp condition({op, left, {low, high}}) when op in [:between, :not_between],
-    do: operands([left, low, high])
-
-  defp condition({op, left, values}) when op in [:in, :not_in] and is_list(values),
-    do: operands([left | values])
-
-  defp condition({op, left, right}) when op in [:eq, :ne, :gt, :lt, :gte, :lte],
-    do: operands([left, right])
-
-  defp condition({_op, left, _rest}), do: operands([left])
-
-  @spec operands([term()]) :: [SQLExpr.t()]
-  defp operands(list), do: for({:expr, expr} <- list, do: expr)
 end

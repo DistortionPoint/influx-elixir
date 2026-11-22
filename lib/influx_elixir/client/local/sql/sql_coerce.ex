@@ -15,7 +15,8 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
     SQLExprType,
     SQLParser,
     SQLPlan,
-    SQLSelect
+    SQLSelect,
+    SQLWhere
   }
 
   require SQLCommonType
@@ -53,20 +54,8 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
     aggregated = Enum.flat_map(query.select_columns || [], &aggregate_expressions/1)
 
     SQLSelect.projected_exprs(query) ++
-      aggregated ++ SQLSelect.ordered_exprs(query) ++ filter_expressions(query.where)
+      aggregated ++ SQLSelect.ordered_exprs(query) ++ SQLWhere.conjunction_exprs(query.where)
   end
-
-  # The expressions a `WHERE` holds: its operands that are expressions.
-  @spec filter_expressions(term()) :: [SQLExpr.t()]
-  defp filter_expressions({:expr, expr}), do: [expr]
-
-  defp filter_expressions(terms) when is_list(terms),
-    do: Enum.flat_map(terms, &filter_expressions/1)
-
-  defp filter_expressions(term) when is_tuple(term),
-    do: term |> Tuple.to_list() |> filter_expressions()
-
-  defp filter_expressions(_other), do: []
 
   @spec coerce_filter(term(), %{binary() => binary()}) :: term()
   defp coerce_filter({:expr, expr}, types), do: {:expr, coerce(expr, types)}

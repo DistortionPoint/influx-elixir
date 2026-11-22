@@ -73,6 +73,9 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   @decimal_empty "repetition quantifier expects a valid decimal"
   @missing "repetition operator missing expression"
   @incomplete_escape "incomplete escape sequence, reached end of pattern prematurely"
+  @look_around "look-around, including look-ahead and look-behind, is not supported"
+  @backreference "backreferences are not supported"
+  @unrecognized_escape "unrecognized escape sequence"
 
   @typep error :: {:error, non_neg_integer(), non_neg_integer(), binary()}
   @typep verdict :: :ok | {:unknown, binary()} | :differs | error()
@@ -341,19 +344,16 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   @spec group([binary()], non_neg_integer()) ::
           {:ok, non_neg_integer()} | :flags | {:unknown, binary()} | error()
   defp group(["?", bang | _rest], at) when bang in ["=", "!"],
-    do: {:error, at, at + 3, look_around()}
+    do: {:error, at, at + 3, @look_around}
 
   defp group(["?", "<", bang | _rest], at) when bang in ["=", "!"],
-    do: {:error, at, at + 4, look_around()}
+    do: {:error, at, at + 4, @look_around}
 
   defp group(["?", ":" | _rest], _at), do: {:ok, 2}
   defp group(["?", flag, ")" | _rest], _at) when flag in ["i", "s", "m"], do: :flags
   defp group(["?", flag, ":" | _rest], _at) when flag in ["i", "s", "m"], do: {:ok, 3}
   defp group(["?" | _rest], _at), do: {:unknown, @group}
   defp group(_plain, _at), do: {:ok, 0}
-
-  @spec look_around() :: binary()
-  defp look_around, do: "look-around, including look-ahead and look-behind, is not supported"
 
   # ---------------------------------------------------------------------------
   # Escapes
@@ -408,7 +408,7 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   defp escape(["v" | _rest], _at, _length, _groups, _cost), do: {:unknown, @vertical}
 
   defp escape([<<digit>> | _rest], at, _length, _groups, _cost) when digit in ?0..?9,
-    do: {:error, at, at + 2, "backreferences are not supported"}
+    do: {:error, at, at + 2, @backreference}
 
   defp escape([<<letter>>, "{" | _rest], _at, _length, _groups, _cost) when letter in ~c"bB",
     do: {:unknown, @escape}
@@ -433,7 +433,7 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   # The crate escapes ASCII punctuation (and space and controls) and nothing else.
   defp escape([<<byte, rest_bytes::binary>> | _rest], at, _length, _groups, _cost)
        when rest_bytes != <<>> or byte in ?a..?z or byte in ?A..?Z,
-       do: {:error, at, at + 2, "unrecognized escape sequence"}
+       do: {:error, at, at + 2, @unrecognized_escape}
 
   defp escape([_punctuation | rest], at, length, groups, cost),
     do: scan(rest, at + 2, length, groups, true, SQLRegexCost.atom(cost, 1))
@@ -566,7 +566,7 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
 
   # The crate escapes ASCII punctuation (and space and controls) and nothing else.
   defp class_items(["\\", char | _rest], at, _taken) when byte_size(char) > 1,
-    do: {:error, at, at + 2, "unrecognized escape sequence"}
+    do: {:error, at, at + 2, @unrecognized_escape}
 
   defp class_items(["\\", <<letter>> | rest], at, taken) when letter in @class_escapes,
     do: class_items(rest, at + 2, taken + 2)
@@ -578,13 +578,13 @@ defmodule InfluxElixir.Client.Local.SQLRustRegex do
   end
 
   defp class_items(["\\", <<digit>> | _rest], at, _taken) when digit in ?0..?9,
-    do: {:error, at, at + 2, "backreferences are not supported"}
+    do: {:error, at, at + 2, @backreference}
 
   defp class_items(["\\", <<letter>> | _rest], at, _taken)
        when letter in ?a..?z or letter in ?A..?Z do
     if letter in ~c"bBAzxuUpPQEG",
       do: {:unknown, @class_escape},
-      else: {:error, at, at + 2, "unrecognized escape sequence"}
+      else: {:error, at, at + 2, @unrecognized_escape}
   end
 
   # `\<` and `\>` are word boundaries outside a class; what the crate does with them inside one

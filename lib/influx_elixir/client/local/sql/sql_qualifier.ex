@@ -134,7 +134,7 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
     names = qualifiers |> Enum.map_join("|", &Regex.escape/1)
 
     quoted =
-      Enum.map_join(qualifiers, "|", &Regex.escape(~s("#{String.replace(&1, ~s("), ~s(""))}")))
+      Enum.map_join(qualifiers, "|", &(&1 |> SQLLiteral.quote_identifier() |> Regex.escape()))
 
     # The names are in the pattern, which the regex engine bounds: a name past that is a
     # name the double does not match.
