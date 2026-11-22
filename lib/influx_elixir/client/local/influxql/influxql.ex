@@ -152,7 +152,7 @@ defmodule InfluxElixir.Client.Local.InfluxQL do
           # The database a three-part source (`db.rp.m`, `db..m`) names, else nil.
           database: binary() | nil,
           where: binary() | nil,
-          group_by: [binary()],
+          group_by: [InfluxElixir.Client.Local.InfluxQLGroup.dimension()],
           group_time: nil | {integer(), integer()},
           fill: InfluxElixir.Client.Local.InfluxQLBuckets.fill(),
           descending: boolean(),

@@ -708,9 +708,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhere do
       do:
         throw(
           {:refused,
-           {:engine, 400,
-            "Error during planning: Cannot coerce arithmetic expression " <>
-              "Int64 * Timestamp(ns) to valid types"}}
+           {:engine, 400, InfluxQLError.cannot_coerce_arithmetic("Int64", "*", "Timestamp(ns)")}}
         ),
       else: negated_time(rest, "-")
   end

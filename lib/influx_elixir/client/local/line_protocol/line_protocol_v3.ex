@@ -311,16 +311,15 @@ defmodule InfluxElixir.Client.Local.LineProtocolV3 do
   def v3_value(<<c, _rest::binary>> = text) when c in ?0..?9 or c == ?-,
     do: LineProtocolNumber.scan(text)
 
-  def v3_value("true" <> rest), do: {:ok, true, rest}
-  def v3_value("True" <> rest), do: {:ok, true, rest}
-  def v3_value("TRUE" <> rest), do: {:ok, true, rest}
-  def v3_value("t" <> rest), do: {:ok, true, rest}
-  def v3_value("T" <> rest), do: {:ok, true, rest}
-  def v3_value("false" <> rest), do: {:ok, false, rest}
-  def v3_value("False" <> rest), do: {:ok, false, rest}
-  def v3_value("FALSE" <> rest), do: {:ok, false, rest}
-  def v3_value("f" <> rest), do: {:ok, false, rest}
-  def v3_value("F" <> rest), do: {:ok, false, rest}
+  def v3_value(<<prefix::binary-size(4), rest::binary>>) when prefix in ~w(true True TRUE),
+    do: {:ok, true, rest}
+
+  def v3_value(<<prefix::binary-size(5), rest::binary>>) when prefix in ~w(false False FALSE),
+    do: {:ok, false, rest}
+
+  def v3_value(<<c, rest::binary>>) when c in [?t, ?T, ?f, ?F],
+    do: {:ok, c in [?t, ?T], rest}
+
   def v3_value(_other), do: :fail
 
   # Whitespace1 and a timestamp, then optional whitespace. Anything else

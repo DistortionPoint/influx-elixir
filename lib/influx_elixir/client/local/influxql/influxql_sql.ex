@@ -4,7 +4,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   # reads: a missing tag, a double-quoted identifier, a regular expression, a
   # duration next to `now()`.
 
-  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLRegex, InfluxQLText}
+  alias InfluxElixir.Client.Local.{InfluxQLError, InfluxQLRegex, InfluxQLText, SQLLiteral}
 
   # A duration next to `now()` is an interval in whole seconds, the unit
   # the SQL engine's INTERVAL takes; a finer one is refused by name.
@@ -128,7 +128,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
   def ident_sql(name) do
     if Regex.match?(~r/^[A-Za-z_]\w*\z/, name) and String.downcase(name) not in @sql_words,
       do: name,
-      else: ~s("#{String.replace(name, "\"", "\"\"")}")
+      else: SQLLiteral.quote_identifier(name)
   end
 
   @doc "The condition that no row meets, in the SQL the caller's engine reads."

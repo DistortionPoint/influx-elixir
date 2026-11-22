@@ -282,25 +282,23 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   end
 
   @spec show_fail(ctx(), non_neg_integer()) :: binary()
-  defp show_fail(ctx, after_show) do
-    InfluxQLShowText.prefix() <>
-      "invalid InfluxQL statement at pos #{skip_ws(ctx, 0)}. " <>
-      "Parsing Error: Nom(#{InfluxQLError.rust_debug(rest(ctx, after_show))}, Fail)"
-  end
+  defp show_fail(ctx, after_show),
+    do: nom_error(ctx, skip_ws(ctx, 0), after_show, "Fail")
 
   # `SHOW` and nothing after it: the statement list fails where it starts,
   # showing what follows `SHOW`.
   @spec many1(ctx(), non_neg_integer()) :: {:error, term()}
   defp many1(ctx, after_show) do
-    if skip_ws(ctx, 0) == 0 do
-      {:error,
-       {:engine,
-        InfluxQLShowText.prefix() <>
-          "invalid InfluxQL statement at pos 0. " <>
-          "Parsing Error: Nom(#{InfluxQLError.rust_debug(rest(ctx, after_show))}, Many1)"}}
-    else
-      {:error, "unsupported InfluxQL (SHOW with blanks before it and nothing after)"}
-    end
+    if skip_ws(ctx, 0) == 0,
+      do: {:error, {:engine, nom_error(ctx, 0, after_show, "Many1")}},
+      else: {:error, "unsupported InfluxQL (SHOW with blanks before it and nothing after)"}
+  end
+
+  @spec nom_error(ctx(), non_neg_integer(), non_neg_integer(), binary()) :: binary()
+  defp nom_error(ctx, pos, after_show, tag) do
+    InfluxQLShowText.prefix() <>
+      "invalid InfluxQL statement at pos #{pos}. " <>
+      "Parsing Error: Nom(#{InfluxQLError.rust_debug(rest(ctx, after_show))}, #{tag})"
   end
 
   @spec kind(ctx(), non_neg_integer()) :: {:ok, map()} | {:error, term()}

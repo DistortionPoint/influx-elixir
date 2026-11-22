@@ -251,12 +251,36 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   end
 
   @doc """
-  The engine's planning error for arithmetic between a signed and an unsigned integer.
+  The engine's planning error for arithmetic or comparison between a signed and an unsigned
+  integer (`<>` is normalized to `!=`).
   """
   @spec cannot_use_int_unsigned(binary()) :: binary()
   def cannot_use_int_unsigned(op) do
+    op = if op == "<>", do: "!=", else: op
+
     "Error during planning: cannot use #{op} between an integer and unsigned, " <>
       "an explicit cast is required"
+  end
+
+  @doc """
+  The engine's planning error for arithmetic that cannot be coerced to valid types.
+  """
+  @spec cannot_coerce_arithmetic(binary(), binary(), binary()) :: binary()
+  def cannot_coerce_arithmetic(left, op, right) do
+    "Error during planning: Cannot coerce arithmetic expression " <>
+      "#{left} #{op} #{right} to valid types"
+  end
+
+  @doc """
+  The engine's planning error when the operands of a comparison cannot be coerced to a common
+  type (`<>` is normalized to `!=`).
+  """
+  @spec cannot_infer_comparison(binary(), binary(), binary()) :: binary()
+  def cannot_infer_comparison(left, op, right) do
+    op = if op == "<>", do: "!=", else: op
+
+    "Error during planning: Cannot infer common argument type for comparison " <>
+      "operation #{left} #{op} #{right}"
   end
 
   @doc """

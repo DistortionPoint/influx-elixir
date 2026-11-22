@@ -67,21 +67,19 @@ defmodule InfluxElixir.Client.Local.InfluxQLWild do
   @spec shown_tags(InfluxQL.query(), MapSet.t(binary())) :: MapSet.t(binary())
   defp shown_tags(%{group_by: dimensions}, tags) do
     if Enum.any?(dimensions, &match?({:regex, _source}, &1)),
-      do: MapSet.intersection(tags, dimensions |> grouped(tags) |> MapSet.new()),
+      do:
+        MapSet.intersection(tags, dimensions |> InfluxQLGroup.grouped_tags(tags) |> MapSet.new()),
       else: tags
   end
-
-  # The tags a `GROUP BY` names, which the rows carry as dimensions.
-  @spec grouped([InfluxQLGroup.dimension()], MapSet.t(binary())) :: [binary()]
-  defp grouped(dimensions, tags),
-    do: Enum.flat_map(dimensions, &InfluxQLGroup.dimension_keys(&1, tags))
 
   # `*` written out once for each time it is selected: every field and tag, the dimensions of
   # the `GROUP BY` apart (they are columns of the row already), each as a column of its
   # own; a name taken twice is numbered by `InfluxQLNames`.
   @spec star_columns(InfluxQL.query(), %{binary() => atom()}, MapSet.t(binary())) :: [term()]
   defp star_columns(%{group_by: dimensions}, types, tags) do
-    names = Map.keys(types) ++ (MapSet.to_list(tags) -- grouped(dimensions, tags))
+    names =
+      Map.keys(types) ++ (MapSet.to_list(tags) -- InfluxQLGroup.grouped_tags(dimensions, tags))
+
     for name <- names |> Enum.uniq() |> Enum.sort(), do: {:column, name, name}
   end
 

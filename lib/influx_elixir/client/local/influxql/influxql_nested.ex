@@ -127,7 +127,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   # condition (its comparand is a time, `now()` or a duration, whatever else it holds), not by
   # the types of its arithmetic (verified: `time > 1 + time` is "found symbol", not a coercion).
   defp time_comparison?({left, _lk, _lf}, {right, _rk, _rf}),
-    do: Enum.any?([left, right], &(unwrap(&1) |> InfluxQLTokens.bare_time?()))
+    do:
+      Enum.any?([left, right], &(InfluxQLTokens.strip_parens(&1) |> InfluxQLTokens.bare_time?()))
 
   # The two sides of the comparison, split at the last operator outside every parenthesis: a
   # chain `a = b = c` is `(a = b) = c` (verified), so what is before the last operator is a
@@ -251,7 +252,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   end
 
   defp boolean_operand?(tokens, types) do
-    case unwrap(tokens) do
+    case InfluxQLTokens.strip_parens(tokens) do
       [{:ident, name}] -> Map.get(types, name) == :boolean
       [{:raw, word}] -> InfluxQLTokens.boolean_word?(word)
       _expression -> false
@@ -347,7 +348,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   defp operand([{:cond_group, node, _item}], :group), do: {:node, node}
 
   defp operand(tokens, :group) do
-    inner = unwrap(tokens)
+    inner = InfluxQLTokens.strip_parens(tokens)
 
     if Enum.any?(inner, &match?({:duration, _total, _text}, &1)),
       do: InfluxQLError.refuse("a duration beside a condition in parentheses"),
@@ -367,13 +368,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   @spec clash(binary(), :left | :right) :: no_return()
   defp clash(op, side) do
     {left, right} = if side == :left, do: {"Boolean", "UInt64"}, else: {"UInt64", "Boolean"}
-    op = if op == "<>", do: "!=", else: op
-
-    throw(
-      {:deferred,
-       "Error during planning: Cannot infer common argument type for comparison " <>
-         "operation #{left} #{op} #{right}"}
-    )
+    throw({:deferred, InfluxQLError.cannot_infer_comparison(left, op, right)})
   end
 
   # ---------------------------------------------------------------------------
@@ -386,7 +381,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   # arithmetic the engine reads as no boolean. (The columns of the measurement are `tags` and
   # `types`: the caller always knows them.)
   defp other_operand(tokens, fold, ctx) do
-    case unwrap(tokens) do
+    case InfluxQLTokens.strip_parens(tokens) do
       [{:ident, name}] ->
         column(name, ctx)
 
@@ -476,7 +471,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   # as it is anywhere else then.
   defp absent_group?(tokens, :group, {tags, types}) do
     InfluxQLTokens.absent_columns(tokens, tags, types) != [] and
-      not connective_inside?(unwrap(tokens), false)
+      not connective_inside?(InfluxQLTokens.strip_parens(tokens), false)
   end
 
   defp absent_group?(_tokens, _kind, _ctx), do: false
@@ -495,13 +490,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
       {:ok, [{:raw, word}]} when is_binary(word) -> String.downcase(word) in ["true", "false"]
       {:ok, inner} -> connective_inside?(inner, true)
       nil -> false
-    end
-  end
-
-  defp unwrap(tokens) do
-    case strip_group(tokens) do
-      {:ok, inner} -> inner
-      nil -> tokens
     end
   end
 

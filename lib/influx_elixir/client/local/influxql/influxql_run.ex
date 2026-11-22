@@ -282,7 +282,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   defp group_keys(%{group_by: group_by}, tags),
     do:
       group_by
-      |> Enum.flat_map(&InfluxQLGroup.dimension_keys(&1, tags))
+      |> InfluxQLGroup.grouped_tags(tags)
       |> Enum.uniq()
       |> Enum.sort()
 

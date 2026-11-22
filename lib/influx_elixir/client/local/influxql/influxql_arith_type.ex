@@ -327,7 +327,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   def check_pair(left, right, op) do
     if (unsigned_pending?(left) and integer_expression?(right)) or
          (unsigned_pending?(right) and integer_expression?(left)),
-       do: throw({:refused, {:engine, 400, cannot_use(op)}}),
+       do: throw({:refused, {:engine, 400, InfluxQLError.cannot_use_int_unsigned(op)}}),
        else: :ok
   end
 
@@ -340,19 +340,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   defp integer_expression?(%Value{kind: :integer, literal: false, pending: nil}), do: true
   defp integer_expression?(_value), do: false
 
-  defp cannot_use(op) do
-    op = if op == "<>", do: "!=", else: op
-    InfluxQLError.cannot_use_int_unsigned(op)
-  end
-
   defp arrow(kind), do: Map.fetch!(@arrow, kind)
 
   # The planning error for arithmetic the engine cannot coerce, worded with the Arrow type of
   # each operand as written (`UInt64 + Utf8`).
-  defp coercion_body(left, op, right) do
-    "Error during planning: Cannot coerce arithmetic expression " <>
-      "#{arrow(left)} #{op} #{arrow(right)} to valid types"
-  end
+  defp coercion_body(left, op, right),
+    do: InfluxQLError.cannot_coerce_arithmetic(arrow(left), op, arrow(right))
 
   # ---------------------------------------------------------------------------
   # Asking
@@ -746,7 +739,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
 
       (unsigned_pending?(left) and integer_expression?(right)) or
           (unsigned_pending?(right) and integer_expression?(left)) ->
-        {:error, {:engine, cannot_use(op)}}
+        {:error, {:engine, InfluxQLError.cannot_use_int_unsigned(op)}}
 
       pending?(left) ->
         beside(op, left, right, mode, :left)
@@ -879,10 +872,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   # Dividing an unsigned number by a boolean, the time or a duration is the planner's error of
   # comparing that operand with `UInt64` (verified, whatever the comparison and in a bare
   # condition: `u / b = 1`, `u / time`, `u / 1h > b`).
-  defp comparison_body(right) do
-    "Error during planning: Cannot infer common argument type for comparison operation " <>
-      "#{arrow(right)} = UInt64"
-  end
+  defp comparison_body(right),
+    do: InfluxQLError.cannot_infer_comparison(arrow(right), "=", "UInt64")
 
   # Two operands that are text, booleans, durations or numbers beside them: a tag beside a string
   # under `+` is the planner's error, a string beside a string is concatenated, any other pair

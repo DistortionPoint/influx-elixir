@@ -1,6 +1,7 @@
 defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   @moduledoc false
   import InfluxElixir.Client.Local.InfluxQLBlankRegex, only: [sigil_q: 2]
+  import InfluxElixir.Client.Local.InfluxQLLex, only: [byte_at: 2]
   # The `GROUP BY` clause of an InfluxQL `SELECT` and the `fill()` after it, read
   # the way the engine's parser reads them (verified), with its errors at its
   # positions:
@@ -593,6 +594,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     do: {:error, {:engine, error(ctx, kind, pos), ctx.at + (start || pos)}}
 
   @doc """
+  The tag columns a list of `GROUP BY` dimensions expands to against `tags`.
+  """
+  @spec grouped_tags([dimension()], MapSet.t(binary())) :: [binary()]
+  def grouped_tags(dimensions, tags),
+    do: Enum.flat_map(dimensions, &dimension_keys(&1, tags))
+
+  @doc """
   The tag columns a `GROUP BY` dimension expands to against `tags`: a literal
   name, every tag (`*`), or the tags matching a regular expression.
   """
@@ -604,6 +612,4 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
     regex = InfluxQLRegex.compile(source, :expand)
     Enum.filter(tags, &Regex.match?(regex, &1))
   end
-
-  defp byte_at(text, pos), do: InfluxQLLex.byte_at(text, pos)
 end
