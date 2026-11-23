@@ -20,6 +20,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
     SQLLimits,
     SQLLiteral,
     SQLMask,
+    SQLNumber,
     SQLPredicate,
     SQLSelect,
     SQLTime
@@ -122,7 +123,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   defp identifier_text(name) do
     if String.valid?(name) and Regex.match?(~r/\A[\p{L}_][\p{L}\p{N}_]*\z/u, name),
       do: name,
-      else: ~s|"#{String.replace(name, ~s("), ~s(""))}"|
+      else: SQLLiteral.quote_identifier(name)
   end
 
   @spec rewrite_clause(binary(), Regex.t(), (binary() -> {:ok, binary()} | {:error, map()})) ::
@@ -240,7 +241,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   end
 
   def position_error({:expr, {:lit, value}}, _count) do
-    if value == :inf or (is_float(value) and match?(<<0::1, _rest::63>>, <<value::float>>)),
+    if value == :inf or (is_float(value) and not SQLNumber.negative_float?(value)),
       do: SQLError.planning("invalid digit found in string")
   end
 
@@ -375,7 +376,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   @spec empty_tuple_error(binary()) :: SQLError.t() | nil
   def empty_tuple_error(sql) do
     if Enum.any?(group_by_items(sql), &empty_tuple?/1),
-      do: %{status: 405, body: "This feature is not implemented: Empty tuple not supported yet"}
+      do: SQLError.not_implemented("Empty tuple not supported yet")
   end
 
   @doc """
@@ -493,7 +494,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
     end
   end
 
-  @spec parse_order_term(binary()) :: {binary() | {:expr, SQLExpr.t()}, :asc | :desc}
+  @spec parse_order_term(binary()) :: {binary() | {:expr, SQLExpr.t()}, direction()}
   # `[ASC|DESC] [NULLS FIRST|LAST]`. Without NULLS, DataFusion puts nulls
   # last ascending and first descending (verified); the direction then
   # stays a bare atom and the executor applies that default.

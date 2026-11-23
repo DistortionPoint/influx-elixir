@@ -113,14 +113,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
 
       _clashing ->
         name = Enum.min(columns)
-
-        {:error,
-         %{
-           status: 500,
-           body:
-             "Schema error: Schema contains qualified field name #{ctx.relation_text}.#{name} " <>
-               "and unqualified field name #{name} which would be ambiguous"
-         }}
+        {:error, SQLError.ambiguous_field("#{ctx.relation_text}.#{name}", name)}
     end
   end
 

@@ -38,12 +38,9 @@ defmodule InfluxElixir.Client.Local.SQLDistinctOn do
     if SQLSelect.aggregate_call?(select_list.(masked)) or
          Regex.match?(~r/\bGROUP\s+BY\b/iu, masked) do
       {:error,
-       %{
-         status: 405,
-         body:
-           "This feature is not implemented: DISTINCT ON expressions with GROUP BY, " <>
-             "aggregation or window functions are not supported "
-       }}
+       SQLError.not_implemented(
+         "DISTINCT ON expressions with GROUP BY, aggregation or window functions are not supported "
+       )}
     else
       :ok
     end

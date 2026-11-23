@@ -261,10 +261,7 @@ defmodule InfluxElixir.Client.Local.SQLQuery do
   defp unsupported(statement) do
     case SQLStatement.display(statement) do
       {:ok, text} ->
-        %{
-          status: 405,
-          body: "This feature is not implemented: Unsupported SQL statement: " <> text
-        }
+        SQLError.not_implemented("Unsupported SQL statement: " <> text)
 
       :unknown ->
         SQLError.refusal(

@@ -195,15 +195,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
     duration: "Interval(MonthDayNano)"
   }
 
-  @native %{
-    false_constant: "Boolean",
-    string: "String",
-    boolean: "Boolean",
-    tag: "String",
-    timestamp: "Timestamp(Nanosecond, None)",
-    duration: "Interval(MonthDayNano)"
-  }
-
   # What an unsigned number divides when it is the divisor: the time and the kinds that are no
   # numbers.
   @udiv_dividends [:timestamp | @non_numeric]
@@ -660,34 +651,22 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
     do: {:ok, %Value{kind: kind, named: :float}}
 
   defp abs_call(%Value{kind: kind}, bare) do
-    case Map.fetch(@native, kind) do
-      {:ok, native} -> {:own_error, abs_body(kind, native, bare)}
-      :error -> {:ok, %Value{kind: :float}}
-    end
-  end
-
-  defp abs_body(kind, native, bare) do
-    head = "Function 'abs' expects NativeType::Numeric but received NativeType::#{native}"
-    abs_planning(head, [arrow(kind)], bare)
+    if kind in @udiv_dividends,
+      do: {:own_error, abs_planning([arrow(kind)], bare)},
+      else: {:ok, %Value{kind: :float}}
   end
 
   defp zero_arguments(outermost?) do
     if(outermost?, do: "type_coercion\ncaused by\n", else: "") <>
-      abs_planning("'abs' does not support zero arguments", [], false)
+      abs_planning([], false)
   end
 
   defp arity_error(arguments, whole?) do
-    head = "Function 'abs' expects 1 arguments but received #{length(arguments)}"
-    abs_planning(head, Enum.map(arguments, &argument_arrow/1), whole?)
+    abs_planning(Enum.map(arguments, &argument_arrow/1), whole?)
   end
 
-  defp abs_planning(head, types, bare?) do
-    "Error during planning: " <>
-      if(bare?,
-        do: head,
-        else: SQLError.no_function_matches(head, "abs", types, "abs(Numeric(1))")
-      )
-  end
+  defp abs_planning(types, bare?),
+    do: "Error during planning: " <> SQLError.abs_error(types, bare?)
 
   # The type the engine names an argument by (verified): `Null` for a column the measurement
   # lacks and for the nulls arithmetic of text and numbers makes, `UInt64` for the quotient of

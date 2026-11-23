@@ -16,7 +16,7 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   #     to create the table, which `into?/1` says
   #   * a word of the grammar after `AS` (`AS having`) is a name: it is written quoted
 
-  alias InfluxElixir.Client.Local.{InfluxQLLex, SQLIdentifiers}
+  alias InfluxElixir.Client.Local.{InfluxQLLex, SQLIdentifiers, SQLLiteral}
 
   @typep token :: {:space | :word | :quoted | :backtick | :string | :symbol | :other, binary()}
 
@@ -129,8 +129,10 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   # `` `a``b` `` names ``a`b``, which is written `"a`b"`.
   @spec double_quoted(binary()) :: binary()
   defp double_quoted(text) do
-    name = text |> binary_part(1, byte_size(text) - 2) |> String.replace("``", "`")
-    ~s|"| <> String.replace(name, ~s|"|, ~s|""|) <> ~s|"|
+    text
+    |> binary_part(1, byte_size(text) - 2)
+    |> String.replace("``", "`")
+    |> SQLLiteral.quote_identifier()
   end
 
   # ---------------------------------------------------------------------------

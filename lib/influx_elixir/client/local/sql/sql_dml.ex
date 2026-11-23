@@ -283,7 +283,7 @@ defmodule InfluxElixir.Client.Local.SQLDml do
 
   @spec limit_error() :: map()
   defp limit_error,
-    do: %{status: 405, body: "This feature is not implemented: Update-limit clause not supported"}
+    do: SQLError.not_implemented("Update-limit clause not supported")
 
   @spec updated([binary()], SQLDmlExpr.clauses(), env()) :: SQLError.t() | map()
   defp updated(reference, clauses, env) do

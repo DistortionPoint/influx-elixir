@@ -52,8 +52,7 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
   # `DROP` of these is the planner's "only TABLE/VIEW/SCHEMA" refusal.
   @only_drop ~w(INDEX ROLE USER TYPE SEQUENCE STAGE DATABASE)
   @named_drop ~w(EXTENSION TRIGGER PROCEDURE SECRET CONNECTOR DOMAIN FUNCTION)
-  @only_message "This feature is not implemented: Only `DROP TABLE/VIEW/SCHEMA  ...` " <>
-                  "statement is supported currently"
+  @only_message "Only `DROP TABLE/VIEW/SCHEMA  ...` statement is supported currently"
 
   @doc """
   The parser's error for a verified shape of these statements, a refusal for a shape of the
@@ -272,7 +271,7 @@ defmodule InfluxElixir.Client.Local.SQLDdl do
 
     cond do
       rest == :bad -> nil
-      cascade_end?(rest) -> %{status: 405, body: @only_message}
+      cascade_end?(rest) -> SQLError.not_implemented(@only_message)
       true -> nil
     end
   end

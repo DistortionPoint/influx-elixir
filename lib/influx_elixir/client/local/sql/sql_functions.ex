@@ -37,7 +37,6 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
     SQLError,
     SQLExprType,
     SQLLimits,
-    SQLNativeType,
     SQLNumber,
     SQLScalar,
     SQLScalarCheck
@@ -246,26 +245,10 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
   defp refusal(name, [], context),
     do: planning(name, [], "'#{name}' does not support zero arguments", context)
 
-  defp refusal(:abs, [type], context) do
-    if is_numeric_or_null(type),
-      do: :ok,
-      else:
-        planning(
-          :abs,
-          [type],
-          "Function 'abs' expects NativeType::Numeric but received NativeType::#{SQLNativeType.native(type)}",
-          context
-        )
-  end
+  defp refusal(:abs, [type], _context) when is_numeric_or_null(type), do: :ok
 
   defp refusal(:abs, types, context),
-    do:
-      planning(
-        :abs,
-        types,
-        "Function 'abs' expects 1 arguments but received #{length(types)}",
-        context
-      )
+    do: planning(:abs, types, SQLError.abs_error(types, true), context)
 
   defp refusal(name, [type], _context) when name in [:round, :trunc] and is_numeric_or_null(type),
     do: :ok
@@ -303,12 +286,9 @@ defmodule InfluxElixir.Client.Local.SQLFunctions do
 
   defp rounding_refusal(name, _types, _context) do
     {:error,
-     %{
-       status: 405,
-       body:
-         "This feature is not implemented: #{name |> Atom.to_string() |> String.upcase()} " <>
-           "with scale is not supported"
-     }}
+     SQLError.not_implemented(
+       "#{name |> Atom.to_string() |> String.upcase()} with scale is not supported"
+     )}
   end
 
   @spec planning(name(), [binary()], binary(), context()) :: {:error, map()}

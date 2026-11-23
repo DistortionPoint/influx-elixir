@@ -389,12 +389,9 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
     if SQLNativeType.struct?(type),
       do:
         {:error,
-         %{
-           status: 405,
-           body:
-             "This feature is not implemented: Unsupported CAST from #{type} to " <>
-               SQLCast.arrow_type(target)
-         }},
+         SQLError.not_implemented(
+           "Unsupported CAST from #{type} to #{SQLCast.arrow_type(target)}"
+         )},
       else: :ok
   end
 

@@ -24,6 +24,14 @@ defmodule InfluxElixir.Client.Local.SQLError do
   @spec refusal(binary()) :: t()
   def refusal(message), do: %{status: 400, body: "Client.Local: " <> message}
 
+  @doc """
+  The engine's 405 answer for a feature that is not implemented:
+  `This feature is not implemented: <message>`.
+  """
+  @spec not_implemented(binary()) :: t()
+  def not_implemented(message),
+    do: %{status: 405, body: "This feature is not implemented: " <> message}
+
   # The refusals of what the engine computes without a planning error: the double declines
   # to compute it (the cast of a number to text, of text to a timestamp), and the engine's
   # own answer is a value, or an error found when it runs the plan (the connection closes).
@@ -160,6 +168,33 @@ defmodule InfluxElixir.Client.Local.SQLError do
   @spec planning(binary()) :: t()
   def planning(message), do: %{status: 400, body: "Error during planning: " <> message}
 
+  @doc "The engine's planning error for a `$0` placeholder."
+  @spec zero_placeholder(binary()) :: t()
+  def zero_placeholder(text),
+    do: planning("Invalid placeholder, zero is not a valid index: " <> text)
+
+  @doc "The engine's planning error for `SELECT *` with no tables specified."
+  @spec no_table_star() :: t()
+  def no_table_star, do: planning("SELECT * with no tables specified is not valid")
+
+  @doc "DataFusion's error message for unary `+` on a non-numeric, non-interval, non-timestamp operand."
+  @spec unary_plus() :: binary()
+  def unary_plus, do: "Unary operator '+' only supports numeric, interval and timestamp types"
+
+  @doc """
+  The engine's schema error when both a qualified and an unqualified field with the same name
+  are present in a projection/ordering schema, status 500.
+  """
+  @spec ambiguous_field(binary(), binary()) :: t()
+  def ambiguous_field(qualified, unqualified) do
+    %{
+      status: 500,
+      body:
+        "Schema error: Schema contains qualified field name #{qualified} and unqualified " <>
+          "field name #{unqualified} which would be ambiguous"
+    }
+  end
+
   @doc "The engine's planning error when a selector's second argument is not a timestamp."
   @spec selector_second_arg(atom() | binary(), binary()) :: t()
   def selector_second_arg(selector, type),
@@ -235,6 +270,28 @@ defmodule InfluxElixir.Client.Local.SQLError do
           "caused by\nWHEN expressions in CASE couldn't be converted to common type (Boolean)\n" <>
           "caused by\nError during planning: " <> message
     }
+  end
+
+  @doc """
+  DataFusion's `abs(...)` signature mismatch message (or just its head sentence when `bare?`
+  is `true`).
+  """
+  @spec abs_error([binary()], boolean()) :: binary()
+  def abs_error(types, bare? \\ false) do
+    head =
+      case types do
+        [] ->
+          "'abs' does not support zero arguments"
+
+        [type] ->
+          "Function 'abs' expects NativeType::Numeric but received " <>
+            "NativeType::#{SQLNativeType.native(type)}"
+
+        many ->
+          "Function 'abs' expects 1 arguments but received #{length(many)}"
+      end
+
+    if bare?, do: head, else: no_function_matches(head, :abs, types, "abs(Numeric(1))")
   end
 
   @doc """

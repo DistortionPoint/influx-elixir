@@ -404,13 +404,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
           :ok | {:error, map()} | {:refuse, SQLDml.reason()}
   defp plan_source({:unmodelled, why}, _types, _env), do: {:refuse, why}
 
-  defp plan_source({:table, name}, _types, _env) do
-    {:error,
-     %{
-       status: 405,
-       body: "This feature is not implemented: Query TABLE #{name} not implemented yet"
-     }}
-  end
+  defp plan_source({:table, name}, _types, _env),
+    do: {:error, SQLError.not_implemented("Query TABLE #{name} not implemented yet")}
 
   defp plan_source({:values, rows}, types, env), do: plan_values(rows, types, env)
   defp plan_source({:select, select}, types, env), do: plan_select(select, types, env)
@@ -612,7 +607,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
           term()
         ) :: SQLDmlOperand.check()
   defp read_item(:star, _ctx, nil),
-    do: {:error, SQLError.planning("SELECT * with no tables specified is not valid")}
+    do: {:error, SQLError.no_table_star()}
 
   defp read_item(:star, _ctx, _from), do: :ok
 

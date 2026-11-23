@@ -82,7 +82,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlType do
   @doc "The engine's error for a type it cannot plan."
   @spec unsupported(binary()) :: map()
   def unsupported(printed),
-    do: %{status: 405, body: "This feature is not implemented: Unsupported SQL type " <> printed}
+    do: SQLError.not_implemented("Unsupported SQL type " <> printed)
 
   # ---------------------------------------------------------------------------
   # The name

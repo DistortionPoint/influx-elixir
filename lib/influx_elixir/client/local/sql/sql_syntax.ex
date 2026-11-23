@@ -637,7 +637,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   defp flagged(:ok, tokens) do
     cond do
       state(:top) ->
-        {:error, %{status: 405, body: "This feature is not implemented: TOP"}}
+        {:error, SQLError.not_implemented("TOP")}
 
       reason = state(:refusal) ->
         {:error, SQLError.refusal(reason)}
@@ -700,7 +700,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   @spec unsupported(binary(), tokens()) :: {:error, SQLError.t() | map()}
   defp unsupported(message, tokens) do
     if constant?(tokens),
-      do: {:error, %{status: 405, body: "This feature is not implemented: " <> message}},
+      do: {:error, SQLError.not_implemented(message)},
       else:
         {:error,
          SQLError.refusal(

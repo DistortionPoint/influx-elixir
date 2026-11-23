@@ -20,7 +20,6 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
     SQLGrouping,
     SQLInformation,
     SQLLiteral,
-    SQLNumber,
     SQLParser,
     SQLPredicate,
     SQLSelect,
@@ -89,7 +88,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
   @spec no_table_star([relation()], SQLParser.parsed_query()) :: :ok | {:error, term()}
   defp no_table_star(relations, query) do
     if star?(query) and Enum.any?(relations, &(&1.qualifier == SQLInformation.dual())),
-      do: {:error, SQLError.planning("SELECT * with no tables specified is not valid")},
+      do: {:error, SQLError.no_table_star()},
       else: :ok
   end
 
@@ -426,14 +425,7 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
       if ambiguous do
         printed = written_name(ambiguous, query.qualified)
-
-        {:error,
-         %{
-           status: 500,
-           body:
-             "Schema error: Schema contains qualified field name #{printed} and unqualified " <>
-               "field name #{ambiguous} which would be ambiguous"
-         }}
+        {:error, SQLError.ambiguous_field(printed, ambiguous)}
       else
         :ok
       end
@@ -707,17 +699,12 @@ defmodule InfluxElixir.Client.Local.SQLSchema do
 
   # A number with a fraction or an exponent reads as an expression, and is
   # taken for a position all the same (a sign makes it an expression).
-  defp resolve_ordinal({:expr, {:lit, value}} = target, _columns) do
-    if value == :inf or positive_float?(value),
-      do: {:error, SQLError.planning("invalid digit found in string")},
-      else: {:ok, target}
+  defp resolve_ordinal(target, columns) do
+    case SQLClauses.position_error(target, length(columns)) do
+      nil -> {:ok, target}
+      error -> {:error, error}
+    end
   end
-
-  defp resolve_ordinal(target, _columns), do: {:ok, target}
-
-  @spec positive_float?(term()) :: boolean()
-  defp positive_float?(value),
-    do: is_float(value) and not SQLNumber.negative_float?(value)
 
   @spec tagged(clause(), [SQLExpr.column_ref()]) :: [{clause(), SQLExpr.column_ref()}]
   defp tagged(clause, refs), do: Enum.map(refs, &{clause, &1})

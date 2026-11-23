@@ -73,7 +73,7 @@ defmodule InfluxElixir.Client.Local.SQLBind do
         :ok
 
       name ->
-        {:error, SQLError.planning("Invalid placeholder, zero is not a valid index: $#{name}")}
+        {:error, SQLError.zero_placeholder("$" <> name)}
     end
   end
 

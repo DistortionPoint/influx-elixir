@@ -105,14 +105,13 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
 
   # The statement words that need nothing more, and the engine's answer.
   @complete %{
-    "BEGIN" => {405, "This feature is not implemented: Unsupported SQL statement: BEGIN"},
-    "COMMIT" => {400, "Error during planning: Statement not supported: TransactionEnd"},
-    "END" => {405, "This feature is not implemented: COMMIT AND END not supported"},
-    "RETURN" => {405, "This feature is not implemented: Unsupported SQL statement: RETURN"},
-    "ROLLBACK" => {400, "Error during planning: Statement not supported: TransactionEnd"},
-    "SHOW" =>
-      {400, "Error during planning: '' is not a variable which can be viewed with 'SHOW'"},
-    "VACUUM" => {405, "This feature is not implemented: Unsupported SQL statement: VACUUM"}
+    "BEGIN" => SQLError.not_implemented("Unsupported SQL statement: BEGIN"),
+    "COMMIT" => SQLError.planning("Statement not supported: TransactionEnd"),
+    "END" => SQLError.not_implemented("COMMIT AND END not supported"),
+    "RETURN" => SQLError.not_implemented("Unsupported SQL statement: RETURN"),
+    "ROLLBACK" => SQLError.planning("Statement not supported: TransactionEnd"),
+    "SHOW" => SQLError.planning("'' is not a variable which can be viewed with 'SHOW'"),
+    "VACUUM" => SQLError.not_implemented("Unsupported SQL statement: VACUUM")
   }
 
   # The tokens of the engine's tokenizer that can start a text, in the order it
@@ -394,10 +393,8 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
 
   @spec bare(binary(), {SQLTokenizer.position(), binary()}, non_neg_integer(), binary()) ::
           SQLError.t()
-  defp bare(word, _start, _length, _tail) when is_map_key(@complete, word) do
-    {status, body} = Map.fetch!(@complete, word)
-    %{status: status, body: body}
-  end
+  defp bare(word, _start, _length, _tail) when is_map_key(@complete, word),
+    do: Map.fetch!(@complete, word)
 
   defp bare(word, start, length, tail) do
     SQLError.parser("Expected: #{Map.fetch!(@needs, word)}, found: #{found(start, length, tail)}")

@@ -52,12 +52,7 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
 
       [_first, _second | _more] ->
         {:error,
-         %{
-           status: 405,
-           body:
-             "This feature is not implemented: " <>
-               "The context currently only supports a single SQL statement"
-         }}
+         SQLError.not_implemented("The context currently only supports a single SQL statement")}
     end
   end
 

@@ -136,7 +136,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   def eager({:ref, parts}, ctx), do: compound(parts, ctx)
 
   def eager({:zero_param, text}, _ctx),
-    do: {:error, SQLError.planning("Invalid placeholder, zero is not a valid index: " <> text)}
+    do: {:error, SQLError.zero_placeholder(text)}
 
   def eager({:call, name, args}, ctx) do
     cond do
@@ -199,11 +199,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
       do: eager(items, ctx),
       else:
         {:error,
-         %{
-           status: 405,
-           body:
-             "This feature is not implemented: Only identifiers and literals are supported in tuples"
-         }}
+         SQLError.not_implemented("Only identifiers and literals are supported in tuples")}
   end
 
   def eager(node, ctx) do
@@ -614,10 +610,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp plus(inner, ctx) do
     case type_of(inner, ctx) do
       type when type in [:null, :str, :bool, :date, :clock, :binary, :list, :duration] ->
-        {:error,
-         SQLError.planning(
-           "Unary operator '+' only supports numeric, interval and timestamp types"
-         )}
+        {:error, SQLError.planning(SQLError.unary_plus())}
 
       :unknown ->
         {:refuse, "a unary plus of an operand whose type is not known"}
@@ -638,12 +631,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
 
       length(parts) == 5 ->
         {:error,
-         %{
-           status: 405,
-           body:
-             "This feature is not implemented: compound identifier: " <>
-               inspect(Enum.map(parts, &elem(&1, 0)))
-         }}
+         SQLError.not_implemented(
+           "compound identifier: " <> inspect(Enum.map(parts, &elem(&1, 0)))
+         )}
 
       true ->
         {:error,

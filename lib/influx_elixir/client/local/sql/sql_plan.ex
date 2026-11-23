@@ -1167,10 +1167,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
         :ok
 
       _not_numeric ->
-        planning_error(
-          "Unary operator '+' only supports numeric, interval and timestamp types",
-          :select
-        )
+        planning_error(SQLError.unary_plus(), :select)
     end
   end
 
