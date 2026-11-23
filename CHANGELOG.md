@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.71] - 2026-11-23
+
 ### Fixed
 - **`Client.Local.SQLDistinctOn` falsely rejected quoted column names containing escaped double quotes (`SELECT DISTINCT ON ("a""b") *`) and `Client.Local.SQLDmlName.part/2` double-unescaped already-undoubled `:quoted` and `:string` tokens.**
   `SQLDistinctOn.apply/2` now delegates identifier validation and unquoting to `SQLLiteral.name_token?/1` and `SQLLiteral.unquoted/1`, and `SQLDmlName.part/2` now strips outer quotes via `SQLDmlName.unquote_token/1` instead of re-unescaping tokens that `SQLTokenizer.quoted/7` already undoubled.
