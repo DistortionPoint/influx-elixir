@@ -1341,10 +1341,18 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
 
   defp logical_type({:not, inner}, columns, :full) do
     case logical_type(inner, columns, :full) do
-      "Null" -> "Boolean"
-      type when type in [nil, "Boolean"] -> type
-      {:error, _reason} = error -> error
-      type -> logical_error("comparison operation #{type} IS DISTINCT FROM Boolean")
+      "Null" ->
+        "Boolean"
+
+      type when type in [nil, "Boolean"] ->
+        type
+
+      {:error, _reason} = error ->
+        error
+
+      type ->
+        {:error,
+         SQLError.coercion(SQLError.comparison_message(type, "IS DISTINCT FROM", "Boolean"))}
     end
   end
 
@@ -1594,10 +1602,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
         cond do
           SQLExprCheck.incompatible?(column, value) ->
             {:error,
-             SQLError.coercion(
-               "Cannot infer common argument type for comparison operation " <>
-                 "#{column} #{SQLExpr.symbol(op)} #{value}"
-             )}
+             SQLError.coercion(SQLError.comparison_message(column, SQLExpr.symbol(op), value))}
 
           column == "Timestamp(ns)" and is_binary(right) ->
             timestamp_text(right)
@@ -1747,42 +1752,8 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   defp aggregate_refusal(agg, _type) when agg in [:count, :count_distinct, :min, :max], do: :ok
   defp aggregate_refusal(_agg, type) when is_numeric_type(type), do: :ok
 
-  defp aggregate_refusal(agg, type) do
-    planning_error(
-      SQLError.no_function_matches(
-        aggregate_head(agg, type),
-        agg,
-        [type],
-        aggregate_candidate(agg)
-      ),
-      :select
-    )
-  end
-
-  @spec aggregate_head(SQLParser.aggregate(), binary()) :: binary()
-  defp aggregate_head(:sum, type) do
-    "Execution error: Function 'sum' user-defined coercion failed with " <>
-      ~s|"Execution error: Sum not supported for #{unwrapped(type)}"|
-  end
-
-  defp aggregate_head(:avg, type) do
-    "Execution error: Function 'avg' user-defined coercion failed with " <>
-      ~s|"Error during planning: Avg does not support inputs of type #{unwrapped(type)}."|
-  end
-
-  defp aggregate_head(agg, type) do
-    "Function '#{agg}' expects NativeType::Numeric but received " <>
-      "NativeType::#{SQLNativeType.native(type)}"
-  end
-
-  @spec aggregate_candidate(SQLParser.aggregate()) :: binary()
-  defp aggregate_candidate(agg) when agg in [:sum, :avg], do: "#{agg}(UserDefined)"
-  defp aggregate_candidate(agg), do: "#{agg}(Numeric(1))"
-
-  # A tag is dictionary encoded; the engine's messages name the type inside.
-  @spec unwrapped(binary()) :: binary()
-  defp unwrapped("Dictionary(Int32, Utf8)"), do: "Utf8"
-  defp unwrapped(type), do: type
+  defp aggregate_refusal(agg, type),
+    do: planning_error(SQLError.aggregate_signature_error(agg, type), :select)
 
   # The Arrow type of the columns the checks name, as the engine has them: a
   # tag is dictionary encoded, a field typed by its values, `time` a

@@ -5,7 +5,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   # position it names in the statement as sent, and the planning errors it
   # raises while it rewrites the statement.
 
-  alias InfluxElixir.Client.Local.InfluxQLLex
+  alias InfluxElixir.Client.Local.{InfluxQLLex, SQLError}
 
   @engine_error_prefix "error in InfluxQL statement: parsing error: "
 
@@ -276,12 +276,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLError do
   type (`<>` is normalized to `!=`).
   """
   @spec cannot_infer_comparison(binary(), binary(), binary()) :: binary()
-  def cannot_infer_comparison(left, op, right) do
-    op = if op == "<>", do: "!=", else: op
-
-    "Error during planning: Cannot infer common argument type for comparison " <>
-      "operation #{left} #{op} #{right}"
-  end
+  def cannot_infer_comparison(left, op, right),
+    do: "Error during planning: " <> SQLError.comparison_message(left, op, right)
 
   @doc """
   The engine's planning error when the operands of `AND` or `OR` cannot be coerced to booleans.

@@ -86,13 +86,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   @spec length_of(binary()) :: :ok | {:error, map()}
   defp length_of(text) do
     if byte_size(text) > @max_statement_bytes do
-      {:error,
-       %{
-         status: 400,
-         body:
-           "Client.Local: unsupported InfluxQL (a statement of more than " <>
-             "#{@max_statement_bytes} bytes)"
-       }}
+      refusal("a statement of more than #{@max_statement_bytes} bytes")
     else
       :ok
     end
@@ -102,7 +96,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
   defp utf8(text) do
     if String.valid?(text),
       do: :ok,
-      else: {:error, %{status: 400, body: "Client.Local: the InfluxQL text is not valid UTF-8"}}
+      else: plan_error("the InfluxQL text is not valid UTF-8")
   end
 
   @spec influxql_statement(binary(), binary()) ::
@@ -119,7 +113,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
         plan_error(reason)
 
       {:error, message} ->
-        {:error, %{status: 400, body: "Client.Local: #{message}: #{influxql}"}}
+        plan_error("#{message}: #{influxql}")
     end
   end
 
@@ -425,9 +419,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
   @spec show_refusal(map(), binary()) :: {:error, map()}
   defp show_refusal(spec, what),
-    do:
-      {:error,
-       %{status: 400, body: "Client.Local: unsupported InfluxQL (#{what}): #{spec.statement}"}}
+    do: plan_error("unsupported InfluxQL (#{what}): #{spec.statement}")
 
   # The names with a point in range that satisfies the WHERE; all of them
   # without one.
@@ -825,8 +817,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
     )
   end
 
-  defp refusal(reason),
-    do: {:error, %{status: 400, body: "Client.Local: unsupported InfluxQL (#{reason})"}}
+  defp refusal(reason), do: plan_error("unsupported InfluxQL (#{reason})")
 
   defp stddev?(items) do
     Enum.any?(items, fn
@@ -855,7 +846,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLQuery do
 
   defp plan_error({:engine, body}), do: {:error, %{status: 400, body: body}}
   defp plan_error({:engine, status, body}), do: {:error, %{status: status, body: body}}
-  defp plan_error(message), do: {:error, %{status: 400, body: "Client.Local: #{message}"}}
+  defp plan_error(message), do: {:error, SQLError.refusal(message)}
 
   # The type of each field of a measurement, as the WHERE reads it.
   @spec field_types(Store.t(), binary(), binary()) :: %{binary() => atom()}

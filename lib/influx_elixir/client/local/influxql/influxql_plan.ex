@@ -20,17 +20,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     InfluxQLError,
     InfluxQLExpr,
     InfluxQLLiteral,
-    InfluxQLNames
+    InfluxQLNames,
+    SQLError
   }
 
   @numeric ~w(mean sum median spread stddev)
 
-  # The type as the library words it: `{in a coercion, as a native type, in a signature}`.
   @type_signatures %{
-    string: {"Utf8", "String", "Utf8"},
-    tag: {"Dictionary(Int32, Utf8)", "String", "Dictionary(Int32, Utf8)"},
-    boolean: {"Boolean", "Boolean", "Boolean"},
-    timestamp: {"Timestamp(ns)", "Timestamp(Nanosecond, None)", "Timestamp(ns)"}
+    string: "Utf8",
+    tag: "Dictionary(Int32, Utf8)",
+    boolean: "Boolean",
+    timestamp: "Timestamp(ns)"
   }
 
   @doc """
@@ -307,39 +307,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     {:error, {:engine, "Error during planning: " <> text_signature(fun, @type_signatures[type])}}
   end
 
-  @candidates " No function matches the given name and argument types"
-  @casts "You might need to add explicit type casts.\n\tCandidate functions:\n\t"
+  defp text_signature("mean", type), do: SQLError.aggregate_signature_error("avg", type)
 
-  # The type a function words inside a dictionary: its values'.
-  defp inner_type("Dictionary(Int32, Utf8)"), do: "Utf8"
-  defp inner_type(type), do: type
-
-  defp text_signature("mean", {type, _native, signature}) do
-    "Execution error: Function 'avg' user-defined coercion failed with " <>
-      "\"Error during planning: Avg does not support inputs of type #{inner_type(type)}.\"" <>
-      @candidates <> " 'avg(#{signature})'. " <> @casts <> "avg(UserDefined)"
-  end
-
-  defp text_signature("sum", {type, _native, signature}) do
-    "Execution error: Function 'sum' user-defined coercion failed with " <>
-      "\"Execution error: Sum not supported for #{inner_type(type)}\"" <>
-      @candidates <> " 'sum(#{signature})'. " <> @casts <> "sum(UserDefined)"
-  end
-
-  defp text_signature(fun, {_type, native, signature}) when fun in ["median", "stddev"] do
-    "Function '#{fun}' expects NativeType::Numeric but received NativeType::#{native}" <>
-      @candidates <> " '#{fun}(#{signature})'. " <> @casts <> "#{fun}(Numeric(1))"
-  end
-
-  defp text_signature("spread", {type, _native, signature}) do
-    "Failed to coerce arguments to satisfy a call to 'spread' function: coercion from " <>
-      "#{type} to the signature OneOf([Exact([Int64]), Exact([UInt64]), Exact([Float64])]) " <>
-      "failed" <>
-      @candidates <>
-      " 'spread(#{signature})'. " <>
-      @casts <>
+  defp text_signature("spread", type) do
+    SQLError.no_function_matches(
+      "Failed to coerce arguments to satisfy a call to 'spread' function: coercion from " <>
+        "#{type} to the signature OneOf([Exact([Int64]), Exact([UInt64]), Exact([Float64])]) " <>
+        "failed",
+      "spread",
+      type,
       "spread(Int64)\n\tspread(UInt64)\n\tspread(Float64)"
+    )
   end
+
+  defp text_signature(fun, type), do: SQLError.aggregate_signature_error(fun, type)
 
   # An aggregate of the `time` column that needs numbers is a planning error when a field is
   # aggregated beside it (verified; alone, or beside tags and other times, the engine answers
@@ -414,11 +395,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   defp column_type(_item, _types), do: nil
 
   defp text_fill_error(type, number) do
-    {type_name, _native, _signature} = @type_signatures[type]
-
     {:error,
      {:engine, 500,
-      "External error: InfluxQL internal error: no conversion from #{InfluxQLLiteral.display(number)} to #{type_name}"}}
+      "External error: InfluxQL internal error: no conversion from #{InfluxQLLiteral.display(number)} to #{@type_signatures[type]}"}}
   end
 
   # What `top()` and `bottom()` read beside other columns (verified): a field the measurement

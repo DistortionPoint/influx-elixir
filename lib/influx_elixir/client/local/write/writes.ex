@@ -13,6 +13,7 @@ defmodule InfluxElixir.Client.Local.Writes do
     LineProtocolParser,
     Retention,
     Scope,
+    SQLError,
     Store
   }
 
@@ -134,7 +135,7 @@ defmodule InfluxElixir.Client.Local.Writes do
   # A precision that is no word (a map, a tuple) has no spelling the engine could be sent.
   defp normalize_precision(precision, _profile)
        when not (is_atom(precision) or is_binary(precision)),
-       do: {:error, %{status: 400, body: "Client.Local: the precision is not a string"}}
+       do: {:error, SQLError.refusal("the precision is not a string")}
 
   defp normalize_precision(precision, :v2) do
     case Map.fetch(@v2_precisions, to_string(precision)) do
@@ -333,17 +334,10 @@ defmodule InfluxElixir.Client.Local.Writes do
   @spec v2_retention_result([LineProtocolParser.point()], binary(), pos_integer(), integer()) ::
           InfluxElixir.Client.write_result()
   defp v2_retention_result(expired, database, retention, lower_bound) do
-    expired = Enum.reverse(expired)
-
-    oldest =
-      Enum.reduce(expired, fn point, kept ->
-        if point.timestamp < kept.timestamp, do: point, else: kept
-      end)
-
-    newest =
-      Enum.reduce(expired, fn point, kept ->
-        if point.timestamp > kept.timestamp, do: point, else: kept
-      end)
+    {oldest, newest} =
+      expired
+      |> Enum.reverse()
+      |> Enum.min_max_by(& &1.timestamp)
 
     bound = rfc3339_nano(lower_bound)
 
@@ -429,7 +423,7 @@ defmodule InfluxElixir.Client.Local.Writes do
     case Keyword.get(opts, :gzip) do
       nil -> {:ok, false}
       gzip when is_boolean(gzip) -> {:ok, gzip}
-      _other -> {:error, %{status: 400, body: "Client.Local: the :gzip option is not a boolean"}}
+      _other -> {:error, SQLError.refusal("the :gzip option is not a boolean")}
     end
   end
 

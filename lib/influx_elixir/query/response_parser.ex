@@ -28,6 +28,7 @@ defmodule InfluxElixir.Query.ResponseParser do
     * A JSONL line of only whitespace (a CRLF blank line) is skipped.
   """
 
+  alias InfluxElixir.Client.Options
   alias NimbleCSV.RFC4180, as: CSV
 
   @time_keys ~w(time _time _start _stop)
@@ -68,16 +69,7 @@ defmodule InfluxElixir.Query.ResponseParser do
     body
     |> String.split("\n")
     |> Enum.reject(&(String.trim(&1) == ""))
-    |> Enum.reduce_while({:ok, []}, fn line, {:ok, acc} ->
-      case decode_jsonl_line(line) do
-        {:ok, row} -> {:cont, {:ok, [row | acc]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, rows} -> {:ok, Enum.reverse(rows)}
-      {:error, _reason} = error -> error
-    end
+    |> Options.map_ok(&decode_jsonl_line/1)
   end
 
   def parse(body, :csv), do: csv(&parse_csv/1, body)

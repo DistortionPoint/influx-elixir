@@ -28,8 +28,6 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
     "log(Coercion(TypeSignatureClass::Float, implicit_coercion=ImplicitCoercion([Numeric], default_type=Float64), Coercion(TypeSignatureClass::Decimal))",
     "log(Coercion(TypeSignatureClass::Float, implicit_coercion=ImplicitCoercion([Numeric], default_type=Float64), Coercion(TypeSignatureClass::Float, implicit_coercion=ImplicitCoercion([Numeric], default_type=Float64))"
   ]
-  @bug "This issue was likely caused by a bug in DataFusion's code. Please help us to resolve " <>
-         "this by filing a bug report in our issue tracker: https://github.com/apache/datafusion/issues"
   @numbers ["Int64", "Int32", "Int16", "Int8", "UInt64", "Float64"]
   @integer_arguments ["Int64", "Int32", "Int16", "Int8"]
   @integers ["Int64", "Int32", "Int16", "Int8", "UInt64"]
@@ -344,15 +342,18 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
   # `Internal error: Expect TypeSignatureClass::Float but received NativeType::String ...`.
   @spec expectation(binary(), binary()) :: binary()
   defp expectation(class, type) do
-    "Internal error: Expect TypeSignatureClass::#{class} but received NativeType::" <>
-      "#{SQLNativeType.native(type)}, DataType: #{type}.\n#{@bug}"
+    SQLError.internal_message(
+      "Expect TypeSignatureClass::#{class} but received NativeType::" <>
+        "#{SQLNativeType.native(type)}, DataType: #{type}."
+    )
   end
 
   @spec log_failure([binary()], [binary()]) :: problem()
   defp log_failure(_types, errors) do
     {:matching,
-     "Internal error: Function 'log' failed to match any signature, errors: " <>
-       Enum.join(errors, ",") <> ".\n" <> @bug, "log", Enum.join(@log_candidates, "\n\t")}
+     SQLError.internal_message(
+       "Function 'log' failed to match any signature, errors: #{Enum.join(errors, ",")}."
+     ), "log", Enum.join(@log_candidates, "\n\t")}
   end
 
   # An argument of a type that is not text, for a function of text.
@@ -508,14 +509,12 @@ defmodule InfluxElixir.Client.Local.SQLScalarCheck do
 
   @spec word(:planning | :matching | :internal | :execution, binary()) :: binary()
   defp word(kind, head) when kind in [:planning, :matching], do: head
-  defp word(:internal, head), do: "Internal error: " <> head <> "\n" <> @bug
+  defp word(:internal, head), do: SQLError.internal_message(head)
   defp word(:execution, head), do: "Execution error: " <> head
 
   # Under a `CAST`, an `ORDER BY` and the like the message is its first
   # sentence: a planning error keeps the planner's prefix, the others are a 500.
   @spec cut(:planning | :matching | :internal | :execution, binary()) :: map()
   defp cut(:planning, head), do: SQLError.coercion(head)
-
-  defp cut(_kind, head),
-    do: %{status: 500, body: "type_coercion\ncaused by\n" <> head}
+  defp cut(_kind, head), do: SQLError.type_coercion_500(head)
 end

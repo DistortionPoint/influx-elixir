@@ -23,6 +23,8 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     SQLTime
   }
 
+  alias InfluxElixir.Client.Options
+
   @typedoc "The comparison, set and pattern operators of a predicate."
   @type op ::
           :non_boolean
@@ -857,21 +859,9 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   end
 
   @doc "Maps `parse` over `items`, halting at the first `{:error, reason}`."
-  @spec map_ok([term()], (term() -> {:ok, term()} | {:error, term()})) ::
+  @spec map_ok(Enumerable.t(), (term() -> {:ok, term()} | {:error, term()})) ::
           {:ok, [term()]} | {:error, term()}
-  def map_ok(items, parse) do
-    items
-    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
-      case parse.(item) do
-        {:ok, value} -> {:cont, {:ok, [value | acc]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, values} -> {:ok, Enum.reverse(values)}
-      {:error, _reason} = error -> error
-    end
-  end
+  defdelegate map_ok(items, parse), to: Options
 
   # The planner finds a `time` compared with a number when it types the
   # query, after it has found the columns, so the clause is kept to be

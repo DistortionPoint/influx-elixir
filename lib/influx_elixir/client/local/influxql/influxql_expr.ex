@@ -42,6 +42,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     InfluxQLLex,
     InfluxQLLiteral,
     InfluxQLText,
+    SQLError,
     SQLLimits
   }
 
@@ -989,10 +990,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   @spec timestamp_function(binary()) :: inferred()
   defp timestamp_function("abs") do
     {:physical,
-     "Error during planning: Function 'abs' expects NativeType::Numeric but received " <>
-       "NativeType::Timestamp(Nanosecond, None) No function matches the given name and " <>
-       "argument types 'abs(Timestamp(ns))'. You might need to add explicit type casts." <>
-       "\n\tCandidate functions:\n\tabs(Numeric(1))"}
+     "Error during planning: " <> SQLError.aggregate_signature_error("abs", "Timestamp(ns)")}
   end
 
   defp timestamp_function(name), do: {:physical_refuse, "#{name}() of a timestamp"}

@@ -7,6 +7,8 @@ defmodule InfluxElixir.Client.Local.SQLError do
   # Every constructor returns `%{status: status, body: body}`, the shape
   # `Client.HTTP` returns for a non-success response.
 
+  alias InfluxElixir.Client.Local.SQLNativeType
+
   # How the bodies of the errors the engine's analyzer and optimizer find begin (`coercion/1`,
   # `between_coercion/2` and `simplify/1` write them with these, `analyzer?/1` reads them).
   @coercion "type_coercion\n"
@@ -172,6 +174,55 @@ defmodule InfluxElixir.Client.Local.SQLError do
     do: %{status: 400, body: @coercion <> "caused by\nError during planning: " <> message}
 
   @doc """
+  A non-planning error (an `Internal error:` or `Execution error:`) wrapped by the type
+  coercion pass (`type_coercion\\ncaused by\\n<message>`), status 500.
+  """
+  @spec type_coercion_500(binary()) :: t()
+  def type_coercion_500(message),
+    do: %{status: 500, body: @coercion <> "caused by\n" <> message}
+
+  @doc """
+  DataFusion's `Cannot infer common argument type for comparison operation <left> <op> <right>`
+  message (`<>` is normalized to `!=`).
+  """
+  @spec comparison_message(binary(), binary(), binary()) :: binary()
+  def comparison_message(left, op, right) do
+    op = if op == "<>", do: "!=", else: op
+    "Cannot infer common argument type for comparison operation #{left} #{op} #{right}"
+  end
+
+  @doc """
+  DataFusion's function-signature mismatch message for an aggregate `fun` (`"avg"`, `"sum"`,
+  `"median"`, `"stddev"`, `"var_samp"`, `"var_pop"`, ...) given an unsupported Arrow `type`.
+  """
+  @spec aggregate_signature_error(atom() | binary(), binary()) :: binary()
+  def aggregate_signature_error(fun, type) do
+    name = to_string(fun)
+    no_function_matches(aggregate_head(name, type), name, type, aggregate_candidate(name))
+  end
+
+  defp aggregate_head("sum", type) do
+    "Execution error: Function 'sum' user-defined coercion failed with " <>
+      ~s|"Execution error: Sum not supported for #{unwrapped_dictionary(type)}"|
+  end
+
+  defp aggregate_head("avg", type) do
+    "Execution error: Function 'avg' user-defined coercion failed with " <>
+      ~s|"Error during planning: Avg does not support inputs of type #{unwrapped_dictionary(type)}."|
+  end
+
+  defp aggregate_head(agg, type) do
+    "Function '#{agg}' expects NativeType::Numeric but received " <>
+      "NativeType::#{SQLNativeType.native(type)}"
+  end
+
+  defp aggregate_candidate(agg) when agg in ["sum", "avg"], do: "#{agg}(UserDefined)"
+  defp aggregate_candidate(agg), do: "#{agg}(Numeric(1))"
+
+  defp unwrapped_dictionary("Dictionary(Int32, Utf8)"), do: "Utf8"
+  defp unwrapped_dictionary(type), do: type
+
+  @doc """
   The engine's type coercion error when a `CASE` `WHEN` condition cannot be converted to
   `Boolean`.
   """
@@ -315,18 +366,20 @@ defmodule InfluxElixir.Client.Local.SQLError do
     )
   end
 
-  @spec internal(binary()) :: t()
-  defp internal(message) do
-    %{
-      status: 500,
-      body:
-        "Internal error: " <>
-          message <>
-          "\nThis issue was likely caused by a bug in DataFusion's code. Please help us to " <>
-          "resolve this by filing a bug report in our issue tracker: " <>
-          "https://github.com/apache/datafusion/issues"
-    }
+  @doc """
+  Formats a message as DataFusion's `Internal error: <message>\\nThis issue was likely caused by a bug...`.
+  """
+  @spec internal_message(binary()) :: binary()
+  def internal_message(message) do
+    "Internal error: " <>
+      message <>
+      "\nThis issue was likely caused by a bug in DataFusion's code. Please help us to " <>
+      "resolve this by filing a bug report in our issue tracker: " <>
+      "https://github.com/apache/datafusion/issues"
   end
+
+  @spec internal(binary()) :: t()
+  defp internal(message), do: %{status: 500, body: internal_message(message)}
 
   @doc "The Arrow type name for an interval-analysis numeric column type (`:int64`, `:uint64`, `:float64`), or `nil`."
   @spec interval_type(:int64 | :uint64 | :float64 | term()) :: binary() | nil
@@ -352,14 +405,10 @@ defmodule InfluxElixir.Client.Local.SQLError do
   """
   @spec between_coercion(binary(), binary()) :: t()
   def between_coercion(operand_type, bound_type) do
-    %{
-      status: 500,
-      body:
-        @coercion <>
-          "caused by\nInternal error: Failed to coerce types #{operand_type} and " <>
-          "#{bound_type} in BETWEEN expression.\nThis issue was likely caused by a bug in " <>
-          "DataFusion's code. Please help us to resolve this by filing a bug report in our " <>
-          "issue tracker: https://github.com/apache/datafusion/issues"
-    }
+    type_coercion_500(
+      internal_message(
+        "Failed to coerce types #{operand_type} and #{bound_type} in BETWEEN expression."
+      )
+    )
   end
 end

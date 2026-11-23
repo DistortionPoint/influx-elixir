@@ -155,15 +155,11 @@ defmodule InfluxElixir.Write.Writer do
 
   # A connection is a keyword list (`Client.HTTP`) or a map (`Client.Local`); anything else (a
   # host name, a charlist, a number) is the caller's error, never a raise.
-  defp resolve(connection) when is_map(connection), do: {:ok, connection}
-
-  defp resolve(connection) when is_list(connection) do
-    if Options.keyword?(connection),
+  defp resolve(connection) do
+    if Options.connection?(connection),
       do: {:ok, connection},
       else: {:error, {:invalid_connection, connection}}
   end
-
-  defp resolve(other), do: {:error, {:invalid_connection, other}}
 
   # The body to send: Points are encoded for this call and connection; iodata is the text it
   # stands for; a body that is neither goes to the client as given, which names it.

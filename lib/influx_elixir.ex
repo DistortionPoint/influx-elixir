@@ -169,7 +169,7 @@ defmodule InfluxElixir do
           result | {:error, {:invalid_connection, term()}}
         when result: term()
   defp query_span(connection, opts, fun) do
-    if connection?(connection) do
+    if Options.connection?(connection) do
       metadata = %{
         database: Options.database(opts, connection),
         transport: client()
@@ -180,11 +180,6 @@ defmodule InfluxElixir do
       {:error, {:invalid_connection, connection}}
     end
   end
-
-  # A connection is a keyword list (HTTP) or a map (Local); a host name, a number, a
-  # list of other things is the caller's error to name, not a raise from inside a span.
-  @spec connection?(term()) :: boolean()
-  defp connection?(connection), do: is_map(connection) or Options.keyword?(connection)
 
   # ---------- Query — v3 SQL ----------
 
@@ -488,13 +483,8 @@ defmodule InfluxElixir do
   for the default and semantics.
   """
   @spec flush(atom(), timeout()) :: :ok | {:error, :no_batch_writer | {:invalid_timeout, term()}}
-  def flush(connection_name, timeout \\ 60_000) do
-    if Options.timeout?(timeout) do
-      with_batch_writer(connection_name, &BatchWriter.flush(&1, timeout))
-    else
-      {:error, {:invalid_timeout, timeout}}
-    end
-  end
+  def flush(connection_name, timeout \\ 60_000),
+    do: with_batch_writer(connection_name, timeout, &BatchWriter.flush(&1, timeout))
 
   @doc """
   Returns batch writer statistics for a connection.
@@ -505,12 +495,13 @@ defmodule InfluxElixir do
   """
   @spec stats(atom(), timeout()) ::
           {:ok, map()} | {:error, :no_batch_writer | {:invalid_timeout, term()}}
-  def stats(connection_name, timeout \\ 5_000) do
-    if Options.timeout?(timeout) do
-      with_batch_writer(connection_name, &BatchWriter.stats(&1, timeout))
-    else
-      {:error, {:invalid_timeout, timeout}}
-    end
+  def stats(connection_name, timeout \\ 5_000),
+    do: with_batch_writer(connection_name, timeout, &BatchWriter.stats(&1, timeout))
+
+  defp with_batch_writer(connection_name, timeout, fun) do
+    if Options.timeout?(timeout),
+      do: with_batch_writer(connection_name, fun),
+      else: {:error, {:invalid_timeout, timeout}}
   end
 
   # A process that is gone, or stopped as a supervisor stops it, rather than one that crashed.

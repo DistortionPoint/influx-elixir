@@ -149,10 +149,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
       {l, r} when is_binary(l) and is_binary(r) ->
         cond do
           incompatible?(l, r) ->
-            planner(
-              "Cannot infer common argument type for comparison operation #{l} #{operation} #{r}",
-              context
-            )
+            planner(SQLError.comparison_message(l, operation, r), context)
 
           "Timestamp(ns)" in [l, r] and (text?(l) or text?(r)) ->
             time_with_text(left, right, negated)
@@ -455,11 +452,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
       left == "Boolean" != (right == "Boolean") or
           SQLNativeType.struct?(left) != SQLNativeType.struct?(right) ->
-        planner(
-          "Cannot infer common argument type for comparison operation #{left} " <>
-            "#{SQLExpr.symbol(op)} #{right}",
-          context
-        )
+        planner(SQLError.comparison_message(left, SQLExpr.symbol(op), right), context)
 
       true ->
         :ok
@@ -473,8 +466,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   @spec timestamp_comparison(SQLExpr.comparison(), binary(), binary(), context(), boolean()) ::
           {:error, map()}
   defp timestamp_comparison(op, left, right, context, param?) do
-    message =
-      "Cannot infer common argument type for comparison operation #{left} #{SQLExpr.symbol(op)} #{right}"
+    message = SQLError.comparison_message(left, SQLExpr.symbol(op), right)
 
     cond do
       param? and "UInt64" in [left, right] and left != right ->
@@ -491,10 +483,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
 
   @spec boolean_operand(SQLExprType.type()) :: :ok | {:error, map()}
   defp boolean_operand(type) when is_binary(type) and type != "Boolean",
-    do:
-      coercion(
-        "Cannot infer common argument type for comparison operation #{type} IS DISTINCT FROM Boolean"
-      )
+    do: coercion(SQLError.comparison_message(type, "IS DISTINCT FROM", "Boolean"))
 
   defp boolean_operand(_type), do: :ok
 
@@ -813,7 +802,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
         {:error, SQLError.planning(head)}
 
       String.starts_with?(head, "Execution error: ") ->
-        {:error, %{status: 500, body: "type_coercion\ncaused by\n" <> head}}
+        {:error, SQLError.type_coercion_500(head)}
 
       true ->
         coercion(head)

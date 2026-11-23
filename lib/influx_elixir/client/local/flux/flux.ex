@@ -70,7 +70,7 @@ defmodule InfluxElixir.Client.Local.Flux do
   # carries, so `first()` and `last()` choose between points a microsecond
   # holds as the engine does.
 
-  alias InfluxElixir.Client.Local.{Durations, SQLLimits, SQLPredicate}
+  alias InfluxElixir.Client.Local.{Durations, InfluxQLLex, SQLLimits, SQLPredicate}
   alias InfluxElixir.Query.ResponseParser
 
   @typedoc """
@@ -998,7 +998,7 @@ defmodule InfluxElixir.Client.Local.Flux do
     with false <- Regex.match?(~r/^\s*$/, text),
          %{"all" => full} = captures <- Regex.named_captures(@token, text),
          {:ok, token} <- token(captures) do
-      rest = binary_part(text, byte_size(full), byte_size(text) - byte_size(full))
+      rest = InfluxQLLex.rest_after(text, full)
       tokenize(rest, [token | acc])
     else
       true -> {:ok, Enum.reverse(acc)}
@@ -1136,7 +1136,7 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   defp do_split(text, sep, 0, false, current, acc) do
     if String.starts_with?(text, sep) do
-      rest = binary_part(text, byte_size(sep), byte_size(text) - byte_size(sep))
+      rest = InfluxQLLex.rest_after(text, sep)
       do_split(rest, sep, 0, false, "", [current | acc])
     else
       <<c, rest::binary>> = text

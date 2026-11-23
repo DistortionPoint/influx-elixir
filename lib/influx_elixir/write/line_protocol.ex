@@ -87,6 +87,7 @@ defmodule InfluxElixir.Write.LineProtocol do
   value* is fine — it is quoted, and both versions store it.
   """
 
+  alias InfluxElixir.Client.Options
   alias InfluxElixir.Write.Point
 
   @type encode_result :: {:ok, binary()} | {:error, term()}
@@ -227,20 +228,14 @@ defmodule InfluxElixir.Write.LineProtocol do
   # atom or a string.
   @spec read_options(term()) :: {:ok, map()} | {:error, {:invalid_options, term()}}
   defp read_options(opts) do
-    api_version =
-      if Keyword.keyword?(opts) do
-        case Keyword.get(opts, :api_version) do
-          nil -> :v3
-          version -> version
-        end
-      end
-
-    precision = if Keyword.keyword?(opts), do: Keyword.get(opts, :precision)
-
-    if api_version in [:v3, :v2] and
-         ((is_atom(precision) and not is_boolean(precision)) or is_binary(precision)),
-       do: {:ok, %{divisor: timestamp_divisor(precision), kinds: @kinds[api_version]}},
-       else: {:error, {:invalid_options, opts}}
+    with true <- Options.keyword?(opts),
+         api_version when api_version in [nil, :v3, :v2] <- Keyword.get(opts, :api_version),
+         precision = Keyword.get(opts, :precision),
+         true <- (is_atom(precision) and not is_boolean(precision)) or is_binary(precision) do
+      {:ok, %{divisor: timestamp_divisor(precision), kinds: @kinds[api_version || :v3]}}
+    else
+      _invalid -> {:error, {:invalid_options, opts}}
+    end
   end
 
   # Nanoseconds per unit of the write's precision; a `DateTime` is divided
@@ -320,16 +315,7 @@ defmodule InfluxElixir.Write.LineProtocol do
   defp encode_tags(tags, kinds) do
     tags
     |> Enum.sort_by(fn {k, _v} -> k end)
-    |> Enum.reduce_while({:ok, []}, fn {k, v}, {:ok, acc} ->
-      case encode_tag(k, v, kinds) do
-        {:ok, pair} -> {:cont, {:ok, [pair | acc]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, pairs} -> {:ok, Enum.reverse(pairs)}
-      {:error, _reason} = error -> error
-    end
+    |> Options.map_ok(fn {k, v} -> encode_tag(k, v, kinds) end)
   end
 
   @spec encode_tag(term(), term(), map()) :: {:ok, iodata()} | {:error, term()}
@@ -346,16 +332,8 @@ defmodule InfluxElixir.Write.LineProtocol do
   @spec encode_fields(%{String.t() => Point.field_value()}, map()) ::
           {:ok, iodata()} | {:error, term()}
   defp encode_fields(fields, kinds) do
-    fields
-    |> Enum.reduce_while({:ok, []}, fn {k, v}, {:ok, acc} ->
-      case encode_field(k, v, kinds) do
-        {:ok, pair} -> {:cont, {:ok, [pair | acc]}}
-        {:error, _reason} = error -> {:halt, error}
-      end
-    end)
-    |> case do
-      {:ok, pairs} -> {:ok, pairs |> Enum.reverse() |> Enum.intersperse(?,)}
-      {:error, _reason} = error -> error
+    with {:ok, pairs} <- Options.map_ok(fields, fn {k, v} -> encode_field(k, v, kinds) end) do
+      {:ok, Enum.intersperse(pairs, ?,)}
     end
   end
 

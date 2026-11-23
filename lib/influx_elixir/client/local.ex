@@ -545,6 +545,7 @@ defmodule InfluxElixir.Client.Local do
     FluxQuery,
     InfluxQLQuery,
     Scope,
+    SQLError,
     SQLParser,
     SQLQuery,
     Store,
@@ -967,7 +968,7 @@ defmodule InfluxElixir.Client.Local do
   defp names?([name | rest]) when is_binary(name), do: names?(rest)
   defp names?(_other), do: false
 
-  defp refused(why), do: {:error, %{status: 400, body: "Client.Local: " <> why}}
+  defp refused(why), do: {:error, SQLError.refusal(why)}
 
   # A body may be iodata, as `Client.HTTP` sends it; anything else stays as given.
   @spec iodata(term()) :: term()

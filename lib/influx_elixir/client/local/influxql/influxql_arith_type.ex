@@ -83,7 +83,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   }
 
   alias InfluxElixir.Client.Local.InfluxQLWalk.Opts
-  alias InfluxElixir.Client.Local.SQLLimits
+  alias InfluxElixir.Client.Local.{SQLError, SQLLimits}
 
   require SQLLimits
 
@@ -213,8 +213,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
 
   # The classes of pending error that a null beside the value takes away.
   @erasable [:quotient, :division, :comparison]
-
-  @signature "You might need to add explicit type casts.\n\tCandidate functions:\n\tabs(Numeric(1))"
 
   # What two nulls come to, the first kind down the left and the second across: a null number
   # of the type a float makes when either is one, a null of its own beside the other nulls but
@@ -669,32 +667,25 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   end
 
   defp abs_body(kind, native, bare) do
-    "Error during planning: Function 'abs' expects NativeType::Numeric but received " <>
-      "NativeType::#{native}" <>
-      if(bare,
-        do: "",
-        else:
-          " No function matches the given name and argument types " <>
-            "'abs(#{arrow(kind)})'. " <> @signature
-      )
+    head = "Function 'abs' expects NativeType::Numeric but received NativeType::#{native}"
+    abs_planning(head, [arrow(kind)], bare)
   end
 
   defp zero_arguments(outermost?) do
     if(outermost?, do: "type_coercion\ncaused by\n", else: "") <>
-      "Error during planning: 'abs' does not support zero arguments No function matches the " <>
-      "given name and argument types 'abs()'. " <> @signature
+      abs_planning("'abs' does not support zero arguments", [], false)
   end
 
   defp arity_error(arguments, whole?) do
-    names = Enum.map_join(arguments, ", ", &argument_arrow/1)
+    head = "Function 'abs' expects 1 arguments but received #{length(arguments)}"
+    abs_planning(head, Enum.map(arguments, &argument_arrow/1), whole?)
+  end
 
-    "Error during planning: Function 'abs' expects 1 arguments but received " <>
-      "#{length(arguments)}" <>
-      if(whole?,
-        do: "",
-        else:
-          " No function matches the given name and argument types 'abs(#{names})'. " <>
-            @signature
+  defp abs_planning(head, types, bare?) do
+    "Error during planning: " <>
+      if(bare?,
+        do: head,
+        else: SQLError.no_function_matches(head, "abs", types, "abs(Numeric(1))")
       )
   end
 

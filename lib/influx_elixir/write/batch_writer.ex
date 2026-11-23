@@ -285,21 +285,8 @@ defmodule InfluxElixir.Write.BatchWriter do
   @spec start_link(keyword()) ::
           GenServer.on_start() | {:error, NimbleOptions.ValidationError.t()}
   def start_link(opts) do
-    with {:ok, opts} <- validate_opts(opts) do
+    with {:ok, opts} <- Options.validate_nimble(opts, @options_schema) do
       GenServer.start_link(__MODULE__, opts, name: opts[:name])
-    end
-  end
-
-  @spec validate_opts(term()) ::
-          {:ok, keyword()} | {:error, NimbleOptions.ValidationError.t()}
-  defp validate_opts(opts) do
-    if Options.keyword?(opts) do
-      NimbleOptions.validate(opts, @options_schema)
-    else
-      {:error,
-       %NimbleOptions.ValidationError{
-         message: "expected the options to be a keyword list, got: #{inspect(opts)}"
-       }}
     end
   end
 

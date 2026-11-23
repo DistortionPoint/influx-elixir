@@ -27,6 +27,47 @@ defmodule InfluxElixir.Client.Options do
   def keyword?(opts), do: is_list(opts) and Keyword.keyword?(opts)
 
   @doc false
+  # Whether `connection` has the shape of a resolved connection: a map (`Client.Local`) or a
+  # keyword list (`Client.HTTP`).
+  @spec connection?(term()) :: boolean()
+  def connection?(connection), do: is_map(connection) or keyword?(connection)
+
+  @doc false
+  # Validates `opts` against `schema` with `NimbleOptions.validate/2`, returning a
+  # `%NimbleOptions.ValidationError{}` instead of raising `FunctionClauseError` when `opts` is
+  # not a keyword list (or holds improper list tails).
+  @spec validate_nimble(term(), NimbleOptions.t() | NimbleOptions.schema()) ::
+          {:ok, keyword()} | {:error, NimbleOptions.ValidationError.t()}
+  def validate_nimble(opts, schema) do
+    if keyword?(opts) do
+      NimbleOptions.validate(opts, schema)
+    else
+      {:error,
+       %NimbleOptions.ValidationError{
+         message: "expected the options to be a keyword list, got: #{inspect(opts)}"
+       }}
+    end
+  end
+
+  @doc false
+  # Maps `parse` over `items`, halting at the first `{:error, reason}`.
+  @spec map_ok(Enumerable.t(), (term() -> {:ok, term()} | {:error, term()})) ::
+          {:ok, [term()]} | {:error, term()}
+  def map_ok(items, parse) do
+    items
+    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+      case parse.(item) do
+        {:ok, value} -> {:cont, {:ok, [value | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, values} -> {:ok, Enum.reverse(values)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc false
   # A timeout value: a non-negative integer of milliseconds or `:infinity`.
   @spec timeout?(term()) :: boolean()
   def timeout?(timeout), do: timeout == :infinity or (is_integer(timeout) and timeout >= 0)

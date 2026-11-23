@@ -139,16 +139,7 @@ defmodule InfluxElixir.Config do
   """
   @spec validate(keyword()) ::
           {:ok, keyword()} | {:error, NimbleOptions.ValidationError.t()}
-  def validate(opts) do
-    if Options.keyword?(opts) do
-      NimbleOptions.validate(opts, @schema)
-    else
-      {:error,
-       %NimbleOptions.ValidationError{
-         message: "expected the options to be a keyword list, got: #{inspect(opts)}"
-       }}
-    end
-  end
+  def validate(opts), do: Options.validate_nimble(opts, @schema)
 
   # A host is written into every request's URL: an empty one, or one with a
   # blank or control character, cannot be (Mint refuses it at the request,

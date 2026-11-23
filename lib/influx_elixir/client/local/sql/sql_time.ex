@@ -127,13 +127,8 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   timestamp.
   """
   @spec comparison_type_error(binary(), binary(), binary()) :: SQLError.t()
-  def comparison_type_error(left, operator, right) do
-    operator = if operator == "<>", do: "!=", else: operator
-
-    SQLError.coercion(
-      "Cannot infer common argument type for comparison operation #{left} #{operator} #{right}"
-    )
-  end
+  def comparison_type_error(left, operator, right),
+    do: SQLError.coercion(SQLError.comparison_message(left, operator, right))
 
   @doc "What a bound parameter is as a `time` comparand."
   @spec param(term()) :: bound()
