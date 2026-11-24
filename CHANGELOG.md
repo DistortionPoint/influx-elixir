@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.72] - 2026-11-24
+
 ### Fixed
 - **`Client.Local.InfluxQLPlan` compiled `GROUP BY /regex/` patterns with raw PCRE (`Regex.compile/2`) instead of InfluxQL regex escaping rules when checking numeric aggregates on tag columns.**
   `InfluxQLPlan.group_tags/2` now delegates to `InfluxQLGroup.grouped_tags/2` (which compiles patterns via `InfluxQLRegex.compile/2`), so InfluxQL backslash escapes such as `\b` (`b`, not a word boundary) are respected when determining whether a tag column is already a `GROUP BY` dimension in `SELECT mean(host), mean(usage) FROM m GROUP BY /\bhost/`.
