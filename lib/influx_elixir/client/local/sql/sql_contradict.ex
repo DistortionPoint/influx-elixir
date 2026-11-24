@@ -807,7 +807,7 @@ defmodule InfluxElixir.Client.Local.SQLContradict do
   # An expression of the literal's place: its value when it reads no column, and no equality
   # to a constant when it does (`n = v`).
   defp key(class, {:expr, expr}) do
-    if SQLExpr.columns(expr) == [],
+    if SQLExpr.constant?(expr),
       do: constant_key(class, SQLFold.constant(expr)),
       else: :skip
   end

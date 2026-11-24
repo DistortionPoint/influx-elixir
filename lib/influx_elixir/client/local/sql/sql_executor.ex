@@ -582,7 +582,7 @@ defmodule InfluxElixir.Client.Local.SQLExecutor do
           column
       end)
       |> Enum.reject(fn
-        {{:expr, expr}, _direction} -> SQLExpr.columns(expr) == []
+        {{:expr, expr}, _direction} -> SQLExpr.constant?(expr)
         _column -> false
       end)
 

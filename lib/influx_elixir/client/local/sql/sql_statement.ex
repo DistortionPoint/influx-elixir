@@ -119,9 +119,6 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
   # printed with its prefix in capitals and its quotes undoubled; a hexadecimal
   # number as `X'<digits>'`.
   @prefixed ~r/\A([Uu]&|[NEXBRnexbr])'((?:[^']|'')*)'/u
-  @single ~r/\A'((?:[^']|'')*)'/u
-  @double ~r/\A"((?:[^"]|"")*)"/u
-  @backtick ~r/\A`([^`]*)`/u
   @dollar_string ~r/\A(?:\$\$.*?\$\$|\$([A-Za-z_]\w*)\$.*?\$\1\$)/su
   @placeholder ~r/\A\$\w*/u
   @at ~r/\A@@?[\p{L}\p{N}_$]*/u
@@ -460,9 +457,7 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
       [
         &prefixed/1,
         &number/1,
-        &quoted(&1, @single, "'"),
-        &quoted(&1, @double, "\""),
-        &simple(&1, @backtick),
+        &quoted/1,
         &simple(&1, @dollar_string),
         &simple(&1, @placeholder),
         &simple(&1, @at),
@@ -500,17 +495,15 @@ defmodule InfluxElixir.Client.Local.SQLStatement do
     end
   end
 
-  @spec quoted(binary(), Regex.t(), binary()) :: {:ok, binary()} | nil
-  defp quoted(rest, pattern, quote_mark) do
-    case Regex.run(pattern, rest) do
-      [_all, body] ->
-        {:ok,
-         quote_mark <> String.replace(body, quote_mark <> quote_mark, quote_mark) <> quote_mark}
-
-      nil ->
-        nil
+  @spec quoted(binary()) :: {:ok, binary()} | nil
+  defp quoted(<<mark, rest::binary>>) when mark in [?', ?", ?`] do
+    case SQLIdentifiers.take_quoted(rest, mark) do
+      {:ok, raw_body, _after} -> {:ok, SQLIdentifiers.printed_quoted(raw_body, mark)}
+      :error -> nil
     end
   end
+
+  defp quoted(_rest), do: nil
 
   @spec simple(binary(), Regex.t()) :: {:ok, binary()} | nil
   defp simple(rest, pattern) do

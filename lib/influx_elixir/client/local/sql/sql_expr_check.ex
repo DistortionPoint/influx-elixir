@@ -789,7 +789,7 @@ defmodule InfluxElixir.Client.Local.SQLExprCheck do
   # finds, by an execution error, is a 500 inside its wrapper.
   @spec order_by_error(binary()) :: {:error, map()}
   defp order_by_error(message) do
-    head = message |> String.split(" No function matches", parts: 2) |> hd()
+    head = SQLError.strip_candidates(message)
 
     cond do
       String.contains?(head, "coalesce must have at least one argument") ->

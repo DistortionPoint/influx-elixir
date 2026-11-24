@@ -107,7 +107,7 @@ defmodule InfluxElixir.Client.Local.SQLPlanItems do
 
   @spec constant_operand?(SQLExpr.t()) :: boolean()
   defp constant_operand?({:is_null, _inner, _negated}), do: true
-  defp constant_operand?(operand), do: SQLExpr.columns(operand) == []
+  defp constant_operand?(operand), do: SQLExpr.constant?(operand)
 
   @spec ancestor(atom()) :: :cast | :neg | :isnull | :other
   defp ancestor(:cast), do: :cast

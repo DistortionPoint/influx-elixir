@@ -90,37 +90,31 @@ defmodule InfluxElixir.Client.Local.SQLLexer do
 
   # A number is read whole (`SQLIdentifiers.take_number/1`), so a letter after it begins a
   # word of its own: `1e'a'` is `1` and the escape string `e'a'`.
-  defp scan(<<c, _rest::binary>> = input, state, chunk) when c in ?0..?9,
-    do: scan_number(input, state, chunk)
-
-  defp scan(<<?., d, _rest::binary>> = input, state, chunk) when d in ?0..?9,
-    do: scan_number(input, state, chunk)
-
   # A word is read whole, so an `E` that ends one (`name'...'`) opens no
   # escape string; `E'` or `e'` at the start of a token does.
   defp scan(<<c::utf8, rest::binary>> = input, state, chunk) do
-    if SQLIdentifiers.word_char?(c) do
-      {word, after_word} = SQLIdentifiers.take_span(input, true)
+    cond do
+      SQLIdentifiers.number_start?(input) ->
+        {number, after_number} = SQLIdentifiers.take_number(input)
+        scan(after_number, state, [number | chunk])
 
-      case after_word do
-        <<?', body::binary>> when word in ["E", "e"] ->
-          escape_string(body, input, state, chunk)
+      SQLIdentifiers.word_char?(c) ->
+        {word, after_word} = SQLIdentifiers.take_span(input, true)
 
-        <<?', body::binary>> when word in ["X", "x"] ->
-          hex_string(body, after_word, state, [word | chunk])
+        case after_word do
+          <<?', body::binary>> when word in ["E", "e"] ->
+            escape_string(body, input, state, chunk)
 
-        _no_escape_string ->
-          scan(after_word, state, [word | chunk])
-      end
-    else
-      scan(rest, state, [<<c::utf8>> | chunk])
+          <<?', body::binary>> when word in ["X", "x"] ->
+            hex_string(body, after_word, state, [word | chunk])
+
+          _no_escape_string ->
+            scan(after_word, state, [word | chunk])
+        end
+
+      true ->
+        scan(rest, state, [<<c::utf8>> | chunk])
     end
-  end
-
-  @spec scan_number(binary(), state(), iodata()) :: {:ok, [binary()]} | {:error, SQLError.t()}
-  defp scan_number(input, state, chunk) do
-    {number, after_number} = SQLIdentifiers.take_number(input)
-    scan(after_number, state, [number | chunk])
   end
 
   # `$name`: the name is read whole, so a name ending in `e` opens no escape

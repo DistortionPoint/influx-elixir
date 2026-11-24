@@ -326,6 +326,11 @@ defmodule InfluxElixir.Client.Local.SQLError do
       "You might need to add explicit type casts.\n\tCandidate functions:\n\t" <> candidates
   end
 
+  @doc "The head sentence of a function error, without any `No function matches...` candidate tail."
+  @spec strip_candidates(binary()) :: binary()
+  def strip_candidates(message),
+    do: message |> String.split(" No function matches", parts: 2) |> hd()
+
   @doc """
   The engine's SQL tokenizer error at a position: `SQL error:
   TokenizerError("<message> at Line: <line>, Column: <column>")`.

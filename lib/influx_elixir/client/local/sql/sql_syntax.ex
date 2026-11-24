@@ -24,10 +24,10 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
   alias InfluxElixir.Client.Local.{
     SQLDdl,
     SQLDml,
+    SQLDmlName,
     SQLDmlType,
     SQLError,
     SQLInterval,
-    SQLLiteral,
     SQLNamedArg,
     SQLStatement,
     SQLTokenizer
@@ -992,7 +992,8 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
         throw(:bail)
 
       _end_of_name ->
-        put_state(:planner, "Query TABLE #{SQLLiteral.unquoted(printed)} not implemented yet")
+        name = if kind == :quoted, do: SQLDmlName.unquote_token(printed), else: printed
+        put_state(:planner, "Query TABLE #{name} not implemented yet")
         rest
     end
   end
@@ -1744,7 +1745,7 @@ defmodule InfluxElixir.Client.Local.SQLSyntax do
 
   # An interval literal that does not fit one is the engine's error as the literal is read.
   defp interval_overflow(kind, printed, rest) do
-    text = if kind == :string, do: String.slice(printed, 1..-2//1), else: printed
+    text = if kind == :string, do: SQLDmlName.unquote_token(printed), else: printed
 
     unit =
       case rest do

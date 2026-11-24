@@ -1706,6 +1706,12 @@ defmodule InfluxElixir.Contract.SQLCatalogCases do
        "SQL error: ParserError(\"Expected: identifier, found: EOF\")"},
       {:raw, "DELETE FROM", :error, 400,
        "SQL error: ParserError(\"Expected: identifier, found: EOF\")"},
+      {:raw, ~s|with a as (select 1) table "a""""b"|, :error, 405,
+       ~s|This feature is not implemented: Query TABLE a""b not implemented yet|},
+      {:raw, "with a as (select 1) table `A`", :error, 405,
+       "This feature is not implemented: Query TABLE A not implemented yet"},
+      {:raw, "SELECT 1; `a``b`", :error, 400,
+       "SQL error: ParserError(\"Expected: an SQL statement, found: `a`b` at Line: 1, Column: 11\")"},
       {:raw, "SELECT n FROM main ORDER BY time -- trailing comment", :ok,
        [
          %{"n" => 0},

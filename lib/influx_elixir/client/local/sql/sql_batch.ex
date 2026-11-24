@@ -140,7 +140,7 @@ defmodule InfluxElixir.Client.Local.SQLBatch do
     do: Enum.any?(points, &risky?.(SQLRow.column_value(&1, name)))
 
   defp any_value?(operand, [first | _rest] = points, risky?) do
-    if SQLExpr.columns(operand) == [],
+    if SQLExpr.constant?(operand),
       do: risky?.(SQLEval.eval(operand, first)),
       else: Enum.any?(points, &risky?.(SQLEval.eval(operand, &1)))
   catch

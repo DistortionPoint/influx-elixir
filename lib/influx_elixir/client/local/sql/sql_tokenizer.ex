@@ -254,9 +254,8 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   defp quoted(text, rest, mark, kind, line, col, acc) do
     case SQLIdentifiers.take_quoted(rest, mark) do
       {:ok, raw_body, after_quote} ->
-        body = String.replace(raw_body, <<mark, mark>>, <<mark>>)
         raw = binary_part(text, 0, byte_size(text) - byte_size(after_quote))
-        printed = <<mark>> <> body <> <<mark>>
+        printed = SQLIdentifiers.printed_quoted(raw_body, mark)
         raw_token(text, raw, kind, printed, line, col, acc)
 
       :error ->
@@ -323,9 +322,7 @@ defmodule InfluxElixir.Client.Local.SQLTokenizer do
   # name reads on (a digit of any script goes on a word). The double does not model that error.
   @spec not_a_letter(binary()) :: binary() | nil
   defp not_a_letter(literal) do
-    if byte_size(literal) == String.length(literal) do
-      nil
-    else
+    unless SQLIdentifiers.ascii?(literal) do
       Enum.find(String.codepoints(literal), fn <<c::utf8>> ->
         c >= 128 and not SQLIdentifiers.word_start?(c)
       end)

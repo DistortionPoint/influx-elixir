@@ -1553,7 +1553,7 @@ defmodule InfluxElixir.Client.Local.SQLPlan do
   # aggregates of a null are null).
   @spec unknown_aggregate(SQLParser.expr()) :: :ok | {:error, map()}
   defp unknown_aggregate(expr) do
-    if SQLExpr.columns(expr) == [] do
+    if SQLExpr.constant?(expr) do
       {:error,
        SQLError.refusal(
          "an aggregate of a NULL expression whose type the double does not know: the " <>

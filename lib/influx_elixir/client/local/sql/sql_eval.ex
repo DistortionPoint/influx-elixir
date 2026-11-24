@@ -109,7 +109,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
     cond do
       log_of_one?(argument, point) -> log_zero(call, base, point)
       typed_null_base?(base, point) -> typed_null_log(argument, point)
-      constant?(base) -> call_function(call, point)
+      SQLExpr.constant?(base) -> call_function(call, point)
       base == argument -> 1.0
       without_cast(base) == without_cast(argument) -> throw({:query_error, log_cast_refusal()})
       true -> call_function(call, point)
@@ -220,7 +220,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
       nil -> nil
       # The engine cannot negate a timestamp and closes the connection (verified).
       %DateTime{} -> throw({:query_error, SQLError.closed()})
-      value -> if SQLNumber.numeric?(value), do: SQLNumber.negate(value, constant?(inner))
+      value -> if SQLNumber.numeric?(value), do: SQLNumber.negate(value, SQLExpr.constant?(inner))
     end
   end
 
@@ -375,7 +375,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   # Whether the argument of a `log` is the number one, once the optimizer has folded it.
   @spec log_of_one?(SQLExpr.t(), SQLRow.point()) :: boolean()
   defp log_of_one?(argument, point) do
-    constant?(argument) and
+    SQLExpr.constant?(argument) and
       case eval(argument, point) do
         nil -> false
         value -> SQLNumber.numeric?(value) and SQLNumber.to_float(value) == 1.0
@@ -389,7 +389,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   @spec log_zero(SQLExpr.t(), SQLExpr.t(), SQLRow.point()) :: value()
   defp log_zero(call, base, point) do
     cond do
-      not constant?(base) ->
+      not SQLExpr.constant?(base) ->
         0.0
 
       not is_nil(eval(base, point)) ->
@@ -407,7 +407,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   # A typed null base beside a number that is not one.
   @spec typed_null_base?(SQLExpr.t(), SQLRow.point()) :: boolean()
   defp typed_null_base?(base, point) do
-    constant?(base) and is_nil(eval(base, point)) and
+    SQLExpr.constant?(base) and is_nil(eval(base, point)) and
       SQLExprType.constant_type(base) not in ["Null", :unknown]
   end
 
@@ -415,7 +415,7 @@ defmodule InfluxElixir.Client.Local.SQLEval do
   # argument, one (verified); with any other number the connection closes.
   @spec typed_null_log(SQLExpr.t(), SQLRow.point()) :: value()
   defp typed_null_log(argument, point) do
-    if constant?(argument) and is_nil(eval(argument, point)) do
+    if SQLExpr.constant?(argument) and is_nil(eval(argument, point)) do
       case SQLExprType.constant_type(argument) do
         "Null" -> nil
         :unknown -> throw({:query_error, log_null_refusal()})
@@ -433,7 +433,4 @@ defmodule InfluxElixir.Client.Local.SQLEval do
         "or folds it in a way the double has not read"
     )
   end
-
-  @spec constant?(SQLExpr.t()) :: boolean()
-  defp constant?(expr), do: SQLExpr.columns(expr) == []
 end

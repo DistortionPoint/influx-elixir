@@ -820,6 +820,11 @@ defmodule InfluxElixir.Client.Local.SQLExpr do
   def columns({kind, ref}) when kind in [:field, :uint_col], do: [ref]
   def columns(expr), do: Enum.flat_map(children(expr), &columns/1)
 
+  @doc "Whether the expression reads no columns."
+  @spec constant?(t()) :: boolean()
+  def constant?(expr),
+    do: not any?(expr, &match?({kind, _ref} when kind in [:field, :uint_col], &1))
+
   @doc """
   A column reference as the engine prints it in a message: a name bare when
   it is a lower case word, otherwise quoted; a reference to another relation

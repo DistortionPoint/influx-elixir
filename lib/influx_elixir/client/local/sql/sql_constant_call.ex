@@ -93,7 +93,7 @@ defmodule InfluxElixir.Client.Local.SQLConstantCall do
   # prefix, an execution error is bare, with status 500.
   @spec first_sentence(binary()) :: map()
   defp first_sentence(message) do
-    head = message |> String.split(" No function matches", parts: 2) |> hd()
+    head = SQLError.strip_candidates(message)
 
     if String.starts_with?(head, "Execution error: "),
       do: %{status: 500, body: head},

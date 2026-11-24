@@ -3,6 +3,8 @@ defmodule InfluxElixir.Client.Local.SQLRegexGuard do
   # What of a pattern PCRE and the crate read differently for some texts: the double matches
   # with PCRE, so a text one of them reads another way is declined, not answered.
 
+  alias InfluxElixir.Client.Local.SQLIdentifiers
+
   @typedoc """
   What a compiled pattern can tell about a text without running it: whether a text with a newline
   (`:newline`) or with a character that is not ASCII (`:unicode`) is read another way by PCRE
@@ -37,16 +39,11 @@ defmodule InfluxElixir.Client.Local.SQLRegexGuard do
   def differs?(%{newline: true, unicode: false}, text), do: newline?(text)
 
   def differs?(%{newline: false, unicode: true}, text),
-    do: not newline?(text) and not ascii?(text)
+    do: not newline?(text) and not SQLIdentifiers.ascii?(text)
 
   def differs?(%{newline: true, unicode: true}, text),
-    do: newline?(text) or not ascii?(text)
+    do: newline?(text) or not SQLIdentifiers.ascii?(text)
 
   @spec newline?(binary()) :: boolean()
   defp newline?(text), do: :binary.match(text, "\n") != :nomatch
-
-  @spec ascii?(binary()) :: boolean()
-  defp ascii?(<<byte, rest::binary>>) when byte < 128, do: ascii?(rest)
-  defp ascii?(<<>>), do: true
-  defp ascii?(_text), do: false
 end

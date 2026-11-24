@@ -441,9 +441,6 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   @spec null_constant?(SQLExpr.t()) :: boolean()
   defp null_constant?(expr), do: SQLFold.constant(expr) == {:ok, nil}
 
-  @spec constant?(SQLExpr.t()) :: boolean()
-  defp constant?(expr), do: SQLExpr.columns(expr) == []
-
   # A NULL conjunct makes the filter false: the conjuncts that read a column
   # are not run (a conjunct that reads none is folded, and its failure stays).
   @spec top_level_null(tree()) :: tree()
@@ -480,7 +477,7 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
   defp survives_null?(_other), do: false
 
   @spec constant_operand?(term()) :: boolean()
-  defp constant_operand?({:expr, expr}), do: constant?(expr)
+  defp constant_operand?({:expr, expr}), do: SQLExpr.constant?(expr)
   defp constant_operand?(operand) when is_binary(operand), do: false
   defp constant_operand?(list) when is_list(list), do: Enum.all?(list, &constant_operand?/1)
   defp constant_operand?({low, high}), do: constant_operand?(low) and constant_operand?(high)
@@ -515,5 +512,5 @@ defmodule InfluxElixir.Client.Local.SQLSimplify do
 
   @spec nullify(SQLExpr.t(), SQLExpr.t()) :: SQLExpr.t()
   defp nullify(operation, other),
-    do: if(constant?(other), do: operation, else: {:lit, nil})
+    do: if(SQLExpr.constant?(other), do: operation, else: {:lit, nil})
 end

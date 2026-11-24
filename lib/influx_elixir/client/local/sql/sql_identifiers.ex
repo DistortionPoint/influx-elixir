@@ -60,10 +60,12 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
     scan(rest, [[?$, name] | acc])
   end
 
-  defp scan(<<c, _rest::binary>> = sql, acc) when c in ?0..?9, do: scan_number(sql, acc)
-  defp scan(<<?., d, _rest::binary>> = sql, acc) when d in ?0..?9, do: scan_number(sql, acc)
+  defp scan(sql, acc) do
+    if number_start?(sql), do: scan_number(sql, acc), else: scan_token(sql, acc)
+  end
 
-  defp scan(<<c::utf8, rest::binary>> = sql, acc) do
+  @spec scan_token(binary(), iodata()) :: iodata()
+  defp scan_token(<<c::utf8, rest::binary>> = sql, acc) do
     if word_start?(c) do
       {word, rest} = take_span(sql)
       scan(rest, [String.downcase(word, :ascii) | acc])
@@ -72,7 +74,7 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
     end
   end
 
-  defp scan(<<byte, rest::binary>>, acc), do: scan(rest, [byte | acc])
+  defp scan_token(<<byte, rest::binary>>, acc), do: scan(rest, [byte | acc])
 
   # A number (`1e5`, `2.5`) is copied whole, so its exponent is not a word; the word after
   # it is set apart by a space, which the passes after this one read as the tokenizer does.
@@ -141,6 +143,20 @@ defmodule InfluxElixir.Client.Local.SQLIdentifiers do
     do: take_quoted(rest, mark, whole, at + byte_size(<<c::utf8>>))
 
   defp take_quoted(_text, _mark, _whole, _at), do: :error
+
+  @doc """
+  The engine's printed form of a quoted token whose raw `body` was read by
+  `take_quoted/2`: wrapped in `mark`, with doubled `mark`s undoubled.
+  """
+  @spec printed_quoted(binary(), byte()) :: binary()
+  def printed_quoted(raw_body, mark),
+    do: <<mark>> <> String.replace(raw_body, <<mark, mark>>, <<mark>>) <> <<mark>>
+
+  @doc "Whether every byte of `text` is ASCII (`< 128`)."
+  @spec ascii?(binary()) :: boolean()
+  def ascii?(<<byte, rest::binary>>) when byte < 128, do: ascii?(rest)
+  def ascii?(<<>>), do: true
+  def ascii?(_text), do: false
 
   @doc """
   The byte length of the prefix of `text` made of characters `word_char?/1`

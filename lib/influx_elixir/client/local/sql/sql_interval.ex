@@ -13,7 +13,7 @@ defmodule InfluxElixir.Client.Local.SQLInterval do
   # the error differ by unit. Only whole numbers of these units are read; a fraction, an
   # abbreviated unit or a clock time (`'1:30:00'`) is left to the rest of the double.
 
-  alias InfluxElixir.Client.Local.{SQLCast, SQLLimits}
+  alias InfluxElixir.Client.Local.{SQLCast, SQLIdentifiers, SQLLimits}
 
   require SQLLimits
 
@@ -50,16 +50,15 @@ defmodule InfluxElixir.Client.Local.SQLInterval do
   # ASCII text is judged, since the error names the text as Rust escapes it.
   @spec exact?(binary(), [binary()]) :: boolean()
   defp exact?(text, words),
-    do: not (String.printable?(text) and ascii?(text)) or exact_words?(text, words)
+    do:
+      not (String.printable?(text) and SQLIdentifiers.ascii?(text)) or
+        exact_words?(text, words)
 
   @spec exact_words?(binary(), [binary()]) :: boolean()
   defp exact_words?(text, words),
     do:
       text == String.trim(text) and not String.contains?(text, "  ") and
         not Enum.any?(words, &String.starts_with?(&1, "+"))
-
-  @spec ascii?(binary()) :: boolean()
-  defp ascii?(text), do: byte_size(text) == String.length(text)
 
   @spec invalid(binary()) :: binary()
   defp invalid(text), do: "Parser error: Invalid input syntax for type interval: #{inspect(text)}"

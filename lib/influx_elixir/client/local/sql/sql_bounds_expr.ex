@@ -280,7 +280,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
   end
 
   @spec column_dividend?(SQLExpr.t()) :: boolean()
-  defp column_dividend?({:op, :/, dividend, _divisor}), do: SQLExpr.columns(dividend) != []
+  defp column_dividend?({:op, :/, dividend, _divisor}), do: not SQLExpr.constant?(dividend)
 
   @spec shape(SQLExpr.t()) :: :bare | :additive | :other
   defp shape({kind, _name}) when kind in [:field, :uint_col], do: :bare
@@ -435,7 +435,7 @@ defmodule InfluxElixir.Client.Local.SQLBoundsExpr do
 
   @spec constant(SQLExpr.t()) :: float() | nil
   defp constant(expr) do
-    with [] <- SQLExpr.columns(expr),
+    with true <- SQLExpr.constant?(expr),
          {:ok, value} <- SQLFold.constant(expr),
          true <- SQLNumber.numeric?(value),
          float when is_float(float) <- SQLNumber.to_float(value) do
