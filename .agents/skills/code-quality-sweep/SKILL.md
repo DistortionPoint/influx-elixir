@@ -8,17 +8,23 @@ description: Run the complete InfluxElixir quality gate suite (warnings-as-error
 Every change in `influx_elixir` must pass all static analysis, security, formatting, unit, and contract test gates with zero warnings or errors.
 
 > [!IMPORTANT]
-> - Run test and Dialyzer commands **strictly sequentially, one at a time**, from the main agent only. Subagents must NEVER run `mix test` or `mix dialyzer`.
+> - Run all `mix` commands **strictly sequentially, one single `mix` command per `run_command` call**, from the main agent only.
+> - **NEVER** chain multiple `mix` commands with `&&` or `;` in a single shell command, and **NEVER** run `mix` commands in parallel or from subagents.
 
 ## 1. Full Quality Gate Sequence
 
-### Step 1: Compile with Warnings as Errors (Dev & Test)
+### Step 1: Compile with Warnings as Errors (Dev & Test — run as separate commands)
 
-Always run both dev and `:test` compilation (`test/support/` only compiles in `:test`):
+Always run dev and `:test` compilation one at a time (`test/support/` only compiles in `:test`):
 
 ```bash
 mix compile --warnings-as-errors
-MIX_ENV=test mix compile --force --warnings-as-errors
+```
+
+Then in a separate command:
+
+```bash
+MIX_ENV=test mix compile --warnings-as-errors
 ```
 
 ### Step 2: Check Formatting

@@ -7,7 +7,7 @@ description: Core InfluxElixir project rules, architecture, hygiene, and workflo
 
 ## Execution & Repository Hygiene
 
-1. **Batch Operations**: Always batch parallel tool calls, file reads, searches, and edits in a single turn whenever possible (except test runs, which are strictly sequential — one at a time).
+1. **Batch Operations**: Always batch parallel tool calls, file reads, searches, and edits in a single turn whenever possible (except `mix` commands — compile, format, Credo, Sobelow, Dialyzer, and test runs — which MUST run strictly one at a time, one single `mix` command per `run_command` call, never chained with `&&` or `;` and never in parallel).
 2. **Clean Root Directory**: NEVER save working files, scratch scripts, temporary markdowns, or test files to the root folder.
 3. **Temporary Files**: NEVER use the system `/tmp` directory. Always use the project's `tmp/` directory (`/Volumes/Dev/development/influx-elixir/tmp/`, which is gitignored) and clean up temporary subdirectories after use.
 4. **Native Tooling Only**: NEVER use Perl or Python. Use Elixir, Mix tasks, or built-in tools for all scripting, data inspection, and code manipulation. Use file edit tools (`replace_file_content` / `write_to_file`) for multi-line edits in `CHANGELOG.md` and docs — never inline `~S"""` heredoc scripts.
@@ -20,11 +20,12 @@ description: Core InfluxElixir project rules, architecture, hygiene, and workflo
 
 ## Test & Quality Command Execution
 
+- **CRITICAL — One `mix` Command at a Time**: NEVER run multiple `mix` commands in parallel and NEVER chain multiple `mix` commands in a single shell invocation (`mix a && mix b`). Each `mix` command starts its own BEAM VM; chaining or overlapping them (especially `MIX_ENV=test mix compile`, `mix credo`, `mix dialyzer`, and `mix test`) spikes CPU and memory and can overwhelm the system. Run one single `mix` command per `run_command` call and wait for it to complete before invoking the next.
 - Run `mix` commands directly (never via `mise exec --`):
   - Unit tests with coverage: `MIX_ENV=test mix test --cover` (or `mix test --cover`)
   - Unit tests: `mix test`
   - Single test file / line: `mix test test/path/to/test.exs` / `mix test test/path/to/test.exs:123`
-  - Test-env compilation: `MIX_ENV=test mix compile --force --warnings-as-errors`
+  - Test-env compilation: `MIX_ENV=test mix compile --warnings-as-errors`
   - Full quality check: `mix quality`
 - Note: In non-interactive shells where `~/.zshrc` has not been sourced yet, ensure `~/.zshrc` is sourced in the persistent terminal session so `mix`, `elixir`, and `erl` are on `PATH`.
 
@@ -68,10 +69,10 @@ description: Core InfluxElixir project rules, architecture, hygiene, and workflo
 
 ## Code Quality Gates
 
-All code must pass every check in `mix quality` and CI with zero warnings or issues (always run test and Dialyzer gates sequentially, one at a time, from the main agent only):
+All code must pass every check in `mix quality` and CI with zero warnings or issues (always run every `mix` gate strictly sequentially, one single `mix` command per `run_command` call, from the main agent only — never chain `mix` commands with `&&`):
 
 - `mix compile --warnings-as-errors` — Zero dev compiler warnings.
-- `MIX_ENV=test mix compile --force --warnings-as-errors` — Zero test-env compiler warnings (`test/support/` only compiles in `:test`).
+- `MIX_ENV=test mix compile --warnings-as-errors` — Zero test-env compiler warnings (`test/support/` only compiles in `:test`).
 - `mix format --check-formatted` — Formatted per `.formatter.exs`.
 - `mix credo --strict` — Zero Credo issues (see `.credo.exs`):
   - Every public function must have `@spec` and `@doc`; every module must have `@moduledoc`.
