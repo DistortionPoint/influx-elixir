@@ -11,6 +11,7 @@ defmodule InfluxElixir.Client.Local.Writes do
     DatabaseRules,
     Durations,
     LineProtocolParser,
+    LineProtocolTime,
     Retention,
     Scope,
     SQLError,
@@ -84,7 +85,7 @@ defmodule InfluxElixir.Client.Local.Writes do
           LineProtocolParser.precision()
         ) :: {:ok, [LineProtocolParser.line_result()]} | {:error, term()}
   defp stamp_untimed({:ok, lines}, precision) do
-    unit = precision_ns(precision)
+    unit = LineProtocolTime.precision_ns(precision)
     now = div(Store.now_ns(), unit) * unit
 
     {:ok,
@@ -98,12 +99,6 @@ defmodule InfluxElixir.Client.Local.Writes do
   end
 
   defp stamp_untimed(error, _precision), do: error
-
-  @spec precision_ns(LineProtocolParser.precision()) :: pos_integer()
-  defp precision_ns(:second), do: 1_000_000_000
-  defp precision_ns(:millisecond), do: 1_000_000
-  defp precision_ns(:microsecond), do: 1_000
-  defp precision_ns(_nanosecond_or_auto), do: 1
 
   # What `HTTP.write/3` plus the engine accept for `:precision`, verified:
   # InfluxDB 3 takes the spellings below verbatim (case-sensitive) and

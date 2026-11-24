@@ -201,6 +201,23 @@ defmodule InfluxElixir.Client.Local.SQLError do
     do: planning("selector_#{selector} second argument must be a timestamp, but got #{type}")
 
   @doc """
+  The engine's planning error when two projected expressions have the same output name.
+  """
+  @spec duplicate_projection_name(
+          binary(),
+          non_neg_integer(),
+          binary(),
+          non_neg_integer()
+        ) :: t()
+  def duplicate_projection_name(first_shown, first_pos, second_shown, second_pos) do
+    planning(
+      "Projections require unique expression names but the expression \"#{first_shown}\" " <>
+        "at position #{first_pos} and \"#{second_shown}\" at position #{second_pos} have the " <>
+        "same name. Consider aliasing (\"AS\") one of them."
+    )
+  end
+
+  @doc """
   A planning error found by the type coercion pass, which the engine wraps
   as `type_coercion\\ncaused by\\nError during planning: <message>`.
   """

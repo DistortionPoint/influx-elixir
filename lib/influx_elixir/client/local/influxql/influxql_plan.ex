@@ -19,6 +19,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
     InfluxQLAggregate,
     InfluxQLError,
     InfluxQLExpr,
+    InfluxQLGroup,
     InfluxQLLiteral,
     InfluxQLNames,
     SQLError
@@ -264,27 +265,11 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   # The tags a `GROUP BY` makes dimensions: the engine takes an aggregate of one for the
   # dimension (verified: `mean(host), first(b) ... GROUP BY host` answers).
-  @spec group_tags(list(), MapSet.t(binary())) :: MapSet.t(binary())
+  @spec group_tags(list(), MapSet.t(binary())) :: [binary()]
   defp group_tags(group_by, tags) do
-    Enum.reduce(group_by, MapSet.new(), fn
-      {:tag, name}, acc ->
-        MapSet.put(acc, name)
-
-      :wildcard, acc ->
-        MapSet.union(acc, tags)
-
-      {:regex, source}, acc ->
-        case Regex.compile(source, "u") do
-          {:ok, regex} ->
-            tags |> Enum.filter(&Regex.match?(regex, &1)) |> MapSet.new() |> MapSet.union(acc)
-
-          {:error, _reason} ->
-            acc
-        end
-
-      _other, acc ->
-        acc
-    end)
+    InfluxQLGroup.grouped_tags(group_by, tags)
+  catch
+    {:refused, _reason} -> []
   end
 
   # A tag is an argument of the engine's own when the list reads a field (it is read at all);
@@ -292,7 +277,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   defp argument_type(field, types, tags, reads?, grouped) do
     cond do
       Map.has_key?(types, field) -> Map.get(types, field)
-      reads? and MapSet.member?(tags, field) and not MapSet.member?(grouped, field) -> :tag
+      reads? and MapSet.member?(tags, field) and field not in grouped -> :tag
       true -> nil
     end
   end
@@ -801,7 +786,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   # An expression over fields that reads the time column (the engine's own schema error).
   defp time_expression?({:expr, ast, _alias}),
-    do: Enum.any?(InfluxQLExpr.refs(ast), &(String.downcase(&1) == "time"))
+    do: Enum.any?(InfluxQLExpr.refs(ast), &InfluxQLNames.time_name?/1)
 
   defp time_expression?(_item), do: false
 

@@ -204,20 +204,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLGroup do
   defp regex(ctx, pos) do
     rest = binary_part(ctx.text, pos + 1, byte_size(ctx.text) - pos - 1)
 
-    case close_regex(rest, 0) do
-      {:ok, size} ->
-        pattern = rest |> binary_part(0, size) |> InfluxQLRegex.unescape_slashes()
-        {:ok, {:regex, pattern}, pos + 1 + size + 1}
+    case InfluxQLRegex.take_regex(rest) do
+      {:ok, pattern, size, _after_regex} ->
+        {:ok, {:regex, pattern}, pos + size + 2}
 
       :unterminated ->
         fail(ctx, :unterminated_regex, byte_size(ctx.whole) - ctx.at, pos)
     end
   end
-
-  defp close_regex(<<?\\, ?/, rest::binary>>, size), do: close_regex(rest, size + 2)
-  defp close_regex(<<?/, _rest::binary>>, size), do: {:ok, size}
-  defp close_regex(<<_byte, rest::binary>>, size), do: close_regex(rest, size + 1)
-  defp close_regex(<<>>, _size), do: :unterminated
 
   defp quoted(ctx, pos) do
     rest = binary_part(ctx.text, pos, byte_size(ctx.text) - pos)

@@ -11,6 +11,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
     Durations,
     InfluxQLExpr,
     InfluxQLLex,
+    InfluxQLNames,
+    InfluxQLRegex,
     InfluxQLText,
     SQLIdentifiers,
     SQLLimits
@@ -31,7 +33,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
 
   @doc false
   @spec time?(term()) :: boolean()
-  def time?({:ident, name}), do: String.downcase(name) == "time"
+  def time?({:ident, name}), do: InfluxQLNames.time_name?(name)
   def time?(_token), do: false
 
   @doc "Whether a list of tokens is the single bare `time` identifier."
@@ -269,7 +271,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   defp lex(<<?/, _rest::binary>> = text, []), do: {:syntax_error, :where_unparsed, text}
 
   defp lex(<<?/, rest::binary>>, [{:op, op} | _tokens] = acc) when op in ["=~", "!~"] do
-    {pattern, rest} = take_regex(rest, [])
+    {pattern, rest} = take_regex(rest)
 
     if SQLIdentifiers.word_next?(rest) and not connective?(rest),
       do: {:syntax_error, :nom, rest},
@@ -642,11 +644,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
   # A regular expression ends at the first `/` that no backslash escapes; only
   # `\/` is an escape (it is the slash), any other backslash is the regular
   # expression's own.
-  @spec take_regex(binary(), iodata()) :: {binary(), binary()}
-  defp take_regex(<<?\\, ?/, rest::binary>>, acc), do: take_regex(rest, ["/" | acc])
-  defp take_regex(<<?/, rest::binary>>, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), rest}
-  defp take_regex(<<c, rest::binary>>, acc), do: take_regex(rest, [<<c>> | acc])
-  defp take_regex(<<>>, acc), do: {IO.iodata_to_binary(Enum.reverse(acc)), <<>>}
+  @spec take_regex(binary()) :: {binary(), binary()}
+  defp take_regex(rest) do
+    case InfluxQLRegex.take_regex(rest) do
+      {:ok, pattern, _size, after_regex} -> {pattern, after_regex}
+      :unterminated -> {InfluxQLRegex.unescape_slashes(rest), <<>>}
+    end
+  end
 
   @spec take_until(binary(), char(), iodata()) :: {binary(), binary()}
   defp take_until(<<?\\, c, rest::binary>>, q, acc), do: take_until(rest, q, [<<?\\, c>> | acc])

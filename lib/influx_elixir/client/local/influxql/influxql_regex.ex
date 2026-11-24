@@ -37,6 +37,30 @@ defmodule InfluxElixir.Client.Local.InfluxQLRegex do
   @spec unescape_slashes(binary()) :: binary()
   def unescape_slashes(pattern), do: String.replace(pattern, "\\/", "/")
 
+  @doc """
+  Finds the closing `/` of a regular expression literal body `text` (skipping `\\/`),
+  returning `{:ok, byte_size_of_body, rest_after_slash}` or `:unterminated`.
+  """
+  @spec close_offset(binary(), non_neg_integer()) ::
+          {:ok, non_neg_integer(), binary()} | :unterminated
+  def close_offset(text, size \\ 0)
+  def close_offset(<<?\\, ?/, rest::binary>>, size), do: close_offset(rest, size + 2)
+  def close_offset(<<?/, rest::binary>>, size), do: {:ok, size, rest}
+  def close_offset(<<_byte, rest::binary>>, size), do: close_offset(rest, size + 1)
+  def close_offset(<<>>, _size), do: :unterminated
+
+  @doc """
+  Reads the body of a regular expression literal up to its closing `/`, unescaping `\\/` to `/`.
+  Returns `{:ok, pattern, raw_size, rest_after_slash}` or `:unterminated`.
+  """
+  @spec take_regex(binary()) :: {:ok, binary(), non_neg_integer(), binary()} | :unterminated
+  def take_regex(text) do
+    case close_offset(text) do
+      {:ok, size, rest} -> {:ok, text |> binary_part(0, size) |> unescape_slashes(), size, rest}
+      :unterminated -> :unterminated
+    end
+  end
+
   @doc "The pattern as the double's regex engine reads it, or a throw."
   @spec pattern(binary()) :: binary()
   def pattern(source) do

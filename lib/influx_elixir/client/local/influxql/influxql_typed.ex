@@ -12,6 +12,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
     InfluxQLTokens,
     InfluxQLWalk,
     InfluxQLWhereArith,
+    SQLError,
     SQLLimits
   }
 
@@ -359,9 +360,12 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
           {pos_integer(), binary()} | :empty | {:tree, tuple()} | nil
   @doc false
   def bare_condition(tree, ctx, filter, leaf) do
-    if now_outside_time?(tree),
-      do: {405, "This feature is not implemented: now"},
-      else: tree |> bare_type(ctx, leaf) |> filtered(tree, ctx, filter)
+    if now_outside_time?(tree) do
+      %{status: status, body: body} = SQLError.not_implemented("now")
+      {status, body}
+    else
+      tree |> bare_type(ctx, leaf) |> filtered(tree, ctx, filter)
+    end
   end
 
   # With a `tz()` clause the engine plans the condition as a filter of its own and does not

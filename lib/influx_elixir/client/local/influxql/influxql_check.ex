@@ -14,6 +14,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
     InfluxQLGroup,
     InfluxQLLex,
     InfluxQLParens,
+    InfluxQLRegex,
     InfluxQLSelectCheck,
     InfluxQLText,
     InfluxQLTokens,
@@ -638,8 +639,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
   end
 
   defp unterminated(<<?/, rest::binary>>, at, :operand) do
-    case skip_regex(rest, at + 1) do
-      {:ok, after_at, after_literal} -> unterminated(after_literal, after_at, :after)
+    case InfluxQLRegex.close_offset(rest) do
+      {:ok, size, after_literal} -> unterminated(after_literal, at + size + 2, :after)
       :unterminated -> {:unterminated_regex, at, nil}
     end
   end
@@ -682,15 +683,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLCheck do
 
   defp after_word(word, _state),
     do: if(InfluxQLText.reserved?(word), do: :operand, else: :after)
-
-  # Only `\/` escapes in a regular expression: `\\/` is a backslash and the
-  # slash of an expression that goes on (verified).
-  @spec skip_regex(binary(), non_neg_integer()) ::
-          {:ok, non_neg_integer(), binary()} | :unterminated
-  defp skip_regex(<<?\\, ?/, rest::binary>>, at), do: skip_regex(rest, at + 2)
-  defp skip_regex(<<?/, rest::binary>>, at), do: {:ok, at + 1, rest}
-  defp skip_regex(<<_byte, rest::binary>>, at), do: skip_regex(rest, at + 1)
-  defp skip_regex(<<>>, _at), do: :unterminated
 
   @spec skip_literal(binary(), byte(), non_neg_integer()) ::
           {:ok, non_neg_integer(), binary()}

@@ -26,7 +26,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
 
   import InfluxElixir.Client.Local.InfluxQLError, only: [refuse: 1]
 
-  alias InfluxElixir.Client.Local.{InfluxQL, InfluxQLExpr, InfluxQLNames, InfluxQLPlan}
+  alias InfluxElixir.Client.Local.{
+    InfluxQL,
+    InfluxQLExpr,
+    InfluxQLNames,
+    InfluxQLPlan,
+    SQLError
+  }
 
   @same_name "select items that end up with the same name"
 
@@ -386,13 +392,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
         :ok
 
       {{first, index_a}, {second, index_b}} ->
-        body =
-          "Error during planning: Projections require unique expression names but the " <>
-            "expression \"#{expression(first, table, schema)}\" at position #{index_a} and " <>
-            "\"#{expression(second, table, schema)}\" at position #{index_b} have the same " <>
-            "name. Consider aliasing (\"AS\") one of them."
+        %{status: status, body: body} =
+          SQLError.duplicate_projection_name(
+            expression(first, table, schema),
+            index_a,
+            expression(second, table, schema),
+            index_b
+          )
 
-        throw({:refused, {:engine, 400, body}})
+        throw({:refused, {:engine, status, body}})
     end
   end
 
@@ -429,6 +437,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
 
   @doc "Whether an expression is the `time` column in parentheses (a column of its own)."
   @spec time_expr?(InfluxQLExpr.ast()) :: boolean()
-  def time_expr?({:ref, name}), do: String.downcase(name) == "time"
+  def time_expr?({:ref, name}), do: InfluxQLNames.time_name?(name)
   def time_expr?(_ast), do: false
 end

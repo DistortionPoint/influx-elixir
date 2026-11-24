@@ -660,7 +660,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   defp column_or_expression(ast, alias) do
     case ast do
       {:ref, name} ->
-        if String.downcase(name) == "time",
+        if InfluxQLNames.time_name?(name),
           do: {:expr, ast, alias},
           else: {:column, name, alias || name}
 
@@ -677,7 +677,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLParser do
   # The time column is named `time` unless it is aliased, whatever its case.
   @spec column_item(binary(), binary()) :: InfluxQL.item()
   defp column_item(column, alias) do
-    default = if String.downcase(column) == "time", do: "time", else: column
+    default = if InfluxQLNames.time_name?(column), do: "time", else: column
     {:column, column, alias_or(alias, default)}
   end
 

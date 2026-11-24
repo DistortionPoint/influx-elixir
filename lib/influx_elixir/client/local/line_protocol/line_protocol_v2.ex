@@ -316,7 +316,10 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
 
   defp v2_number_done(buf, start, i, flags) do
     text = binary_part(buf, start, i - start)
-    digits = byte_size(text) - bool_int(flags.int) - bool_int(flags.decimal) - negative(text)
+
+    digits =
+      byte_size(text) - bool_int(flags.int) - bool_int(flags.decimal) -
+        LineProtocolNumber.sign_size(text)
 
     cond do
       (flags.int or flags.uint) and (flags.decimal or flags.exp) ->
@@ -370,10 +373,6 @@ defmodule InfluxElixir.Client.Local.LineProtocolV2 do
   @spec bool_int(boolean()) :: 0 | 1
   defp bool_int(true), do: 1
   defp bool_int(false), do: 0
-
-  @spec negative(binary()) :: 0 | 1
-  defp negative("-" <> _rest), do: 1
-  defp negative(_text), do: 0
 
   # Go's `scanBoolean`: `t`, `T`, `true`, `True`, `TRUE` and the `f` forms.
   @spec v2_scan_boolean(binary(), non_neg_integer()) ::

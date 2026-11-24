@@ -271,7 +271,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   # in an order that is the engine's hash order (verified): refused.
   @spec check_group_keys([binary()]) :: :ok
   defp check_group_keys(keys) do
-    if Enum.any?(keys, &(String.downcase(&1) == "time")),
+    if Enum.any?(keys, &InfluxQLNames.time_name?/1),
       do: InfluxQLError.refuse("GROUP BY a tag named time"),
       else: :ok
   end
@@ -390,7 +390,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
     operands = for {:expr, ast, _name} <- query.items, ref <- InfluxQLExpr.refs(ast), do: ref
 
     for ref <- columns ++ operands,
-        not time_column?(ref),
+        not InfluxQLNames.time_name?(ref),
         InfluxQLExpr.absent?(ref, types, context.tags),
         into: %{},
         do: {ref, number}
@@ -487,9 +487,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
   # A column a statement reads is a field unless it is a tag or the time.
   @spec source_field?(binary(), map()) :: boolean()
   defp source_field?(column, %{tags: tags}),
-    do: not (MapSet.member?(tags, column) or time_column?(column))
-
-  defp time_column?(column), do: byte_size(column) == 4 and String.downcase(column) == "time"
+    do: not (MapSet.member?(tags, column) or InfluxQLNames.time_name?(column))
 
   @spec aggregate([map()], [InfluxQL.item()], map(), map()) :: [map()]
   defp aggregate(rows, items, %{tags: tags, lower_ns: lower, types: types}, base) do

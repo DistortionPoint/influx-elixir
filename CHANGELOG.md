@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local.InfluxQLPlan` compiled `GROUP BY /regex/` patterns with raw PCRE (`Regex.compile/2`) instead of InfluxQL regex escaping rules when checking numeric aggregates on tag columns.**
+  `InfluxQLPlan.group_tags/2` now delegates to `InfluxQLGroup.grouped_tags/2` (which compiles patterns via `InfluxQLRegex.compile/2`), so InfluxQL backslash escapes such as `\b` (`b`, not a word boundary) are respected when determining whether a tag column is already a `GROUP BY` dimension in `SELECT mean(host), mean(usage) FROM m GROUP BY /\bhost/`.
+
+### Changed
+- **Consolidated duplicate helpers across `Client.Local` (`InfluxQLCheck`, `InfluxQLExpr`, `InfluxQLGroup`, `InfluxQLNames`, `InfluxQLParser`, `InfluxQLPlan`, `InfluxQLProjection`, `InfluxQLRegex`, `InfluxQLRun`, `InfluxQLShowParser`, `InfluxQLTimeComparand`, `InfluxQLTokens`, `InfluxQLTyped`, `LineProtocolTime`, `LineProtocolV2`, `SQLDmlItem`, `SQLError`, and `Writes`).**
+  Added `InfluxQLRegex.close_offset/2` and `InfluxQLRegex.take_regex/1` for reuse across `InfluxQLCheck`, `InfluxQLExpr`, `InfluxQLGroup`, and `InfluxQLTokens` (removing `InfluxQLCheck.skip_regex/2`, `InfluxQLExpr.regex_end/2`, `InfluxQLGroup.close_regex/2`, and the recursive `InfluxQLTokens.take_regex/2`), added `InfluxQLNames.time_name?/1` for reuse across `InfluxQLExpr`, `InfluxQLNames`, `InfluxQLParser`, `InfluxQLPlan`, `InfluxQLProjection`, `InfluxQLRun`, and `InfluxQLTokens` (removing `InfluxQLRun.time_column?/1`), delegated `InfluxQLPlan.group_tags/2` to `InfluxQLGroup.grouped_tags/2`, added `SQLError.duplicate_projection_name/4` for reuse across `InfluxQLProjection` and `SQLDmlItem`, reused `SQLError.planning/1` and `SQLError.not_implemented/1` in `InfluxQLShowParser` and `InfluxQLTyped`, reused `InfluxQLError.cannot_infer_comparison/3` in `InfluxQLTimeComparand.chain/3` (removing `cannot_infer/1`), reused `LineProtocolNumber.sign_size/1` in `LineProtocolV2` (removing `negative/1`), and added `LineProtocolTime.precision_ns/1` for reuse across `LineProtocolTime` and `Writes` (removing `Writes.precision_ns/1`).
+
 ## [0.1.71] - 2026-11-23
 
 ### Fixed

@@ -70,9 +70,14 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
     check(named, explicit_time?)
   end
 
+  @doc "Whether a column name is `time` (in any case)."
+  @spec time_name?(binary()) :: boolean()
+  def time_name?(name) when is_binary(name),
+    do: byte_size(name) == 4 and String.downcase(name) == "time"
+
   @doc "Whether an item is the `time` column (in any case)."
   @spec time_item?(item()) :: boolean()
-  def time_item?({:column, column, _name}), do: String.downcase(column) == "time"
+  def time_item?({:column, column, _name}), do: time_name?(column)
   def time_item?(_item), do: false
 
   # The name the time column leads the answer with.
@@ -136,7 +141,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNames do
   defp star_companion?(:star), do: true
   defp star_companion?({:column, _column, _name}), do: true
   defp star_companion?({:wild_column, _target}), do: true
-  defp star_companion?({:expr, {:ref, name}, _alias}), do: String.downcase(name) == "time"
+  defp star_companion?({:expr, {:ref, name}, _alias}), do: time_name?(name)
   defp star_companion?(_item), do: false
 
   @spec check([item()], boolean()) :: {:ok, [item()]} | {:error, binary()}

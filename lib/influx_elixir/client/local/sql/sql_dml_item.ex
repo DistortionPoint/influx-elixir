@@ -121,12 +121,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlItem do
           SQLDmlOperand.check()
   defp verdict({:duplicate, {first, first_shown, _operand}, {second, second_shown, _other}}, _ctx)
        when is_binary(first_shown) and is_binary(second_shown) do
-    {:error,
-     SQLError.planning(
-       "Projections require unique expression names but the expression \"#{first_shown}\" " <>
-         "at position #{first} and \"#{second_shown}\" at position #{second} have the same " <>
-         "name. Consider aliasing (\"AS\") one of them."
-     )}
+    {:error, SQLError.duplicate_projection_name(first_shown, first, second_shown, second)}
   end
 
   # The words of the error print both expressions: the refusal names the first that the double

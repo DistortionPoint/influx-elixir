@@ -41,6 +41,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     InfluxQLKernel,
     InfluxQLLex,
     InfluxQLLiteral,
+    InfluxQLNames,
+    InfluxQLRegex,
     InfluxQLText,
     SQLError,
     SQLLimits
@@ -128,9 +130,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   defp tokenize(<<?/, rest::binary>>, acc)
        when acc == [] or hd(acc) in [{:op, "("}, {:op, ","}] do
-    case regex_end(rest, []) do
-      {:ok, source, after_regex} -> tokenize(after_regex, [{:regex, source} | acc])
-      :error -> :error
+    case InfluxQLRegex.take_regex(rest) do
+      {:ok, source, _size, after_regex} -> tokenize(after_regex, [{:regex, source} | acc])
+      :unterminated -> :error
     end
   end
 
@@ -174,16 +176,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   end
 
   defp name_token(name, cast), do: {:name, InfluxQLText.unquote_ident(name), cast}
-
-  # The body of a regular expression up to its closing slash; `\/` is a slash.
-  @spec regex_end(binary(), iodata()) :: {:ok, binary(), binary()} | :error
-  defp regex_end(<<?\\, ?/, rest::binary>>, acc), do: regex_end(rest, ["/" | acc])
-
-  defp regex_end(<<?/, rest::binary>>, acc),
-    do: {:ok, acc |> Enum.reverse() |> IO.iodata_to_binary(), rest}
-
-  defp regex_end(<<c, rest::binary>>, acc), do: regex_end(rest, [<<c>> | acc])
-  defp regex_end(<<>>, _acc), do: :error
 
   # A duration beyond 64 bits is the engine's parse error ("overflow"), at a
   # position the double does not track: refused by name.
@@ -554,7 +546,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp render({:ref, name}, types, tags) do
     type =
       cond do
-        String.downcase(name) == "time" -> "Some(Timestamp)"
+        InfluxQLNames.time_name?(name) -> "Some(Timestamp)"
         MapSet.member?(tags, name) -> "Some(Tag)"
         true -> type_text(Map.get(types, name))
       end
@@ -888,10 +880,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     cond do
       # A measurement that does not exist has no schema to type the time by (verified: `time + 1`
       # over one answers nothing, over a measurement that exists it is the engine's error).
-      String.downcase(name) == "time" and map_size(types) == 0 and MapSet.size(tags) == 0 ->
+      InfluxQLNames.time_name?(name) and map_size(types) == 0 and MapSet.size(tags) == 0 ->
         {:ok, {:unknown, false}}
 
-      String.downcase(name) == "time" ->
+      InfluxQLNames.time_name?(name) ->
         {:ok, {:timestamp, false}}
 
       MapSet.member?(tags, name) ->

@@ -101,19 +101,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLTimeComparand do
   # caller.
   defp chain([time], op, [{:number, text}]) do
     if InfluxQLTokens.time?(time) and integer_text?(text),
-      do: cannot_infer("Timestamp(ns) #{op} Int64"),
+      do: {:error, InfluxQLError.cannot_infer_comparison("Timestamp(ns)", op, "Int64")},
       else: :ok
   end
 
   defp chain(_left, _op, _right), do: :ok
 
   defp integer_text?(text), do: Regex.match?(~r/\A\d+\z/, text)
-
-  defp cannot_infer(operation) do
-    {:error,
-     "Error during planning: Cannot infer common argument type for comparison operation " <>
-       operation}
-  end
 
   # ---------------------------------------------------------------------------
   # The comparand

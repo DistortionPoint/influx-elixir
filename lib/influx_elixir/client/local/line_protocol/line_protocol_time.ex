@@ -72,9 +72,12 @@ defmodule InfluxElixir.Client.Local.LineProtocolTime do
   defp to_nanoseconds(ts, :auto) when abs(ts) < 5_000_000_000_000_000,
     do: to_nanoseconds(ts, :microsecond)
 
-  defp to_nanoseconds(ts, :auto), do: ts
-  defp to_nanoseconds(ts, :nanosecond), do: ts
-  defp to_nanoseconds(ts, :microsecond), do: ts * 1_000
-  defp to_nanoseconds(ts, :millisecond), do: ts * 1_000_000
-  defp to_nanoseconds(ts, :second), do: ts * 1_000_000_000
+  defp to_nanoseconds(ts, precision), do: ts * precision_ns(precision)
+
+  @doc "The nanoseconds in one unit of `precision` (`1` for `:nanosecond` or `:auto`)."
+  @spec precision_ns(precision()) :: pos_integer()
+  def precision_ns(:second), do: 1_000_000_000
+  def precision_ns(:millisecond), do: 1_000_000
+  def precision_ns(:microsecond), do: 1_000
+  def precision_ns(_nanosecond_or_auto), do: 1
 end

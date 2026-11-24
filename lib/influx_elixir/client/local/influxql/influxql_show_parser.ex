@@ -23,7 +23,8 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
     InfluxQLLex,
     InfluxQLShowClauses,
     InfluxQLShowText,
-    InfluxQLText
+    InfluxQLText,
+    SQLError
   }
 
   require InfluxQLLex
@@ -461,8 +462,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLShowParser do
   defp planning([]), do: nil
 
   defp planning([{:planning, message} | _rest]),
-    do: {:engine, "Error during planning: " <> message}
+    do: {:engine, SQLError.planning(message).body}
 
-  defp planning([{:not_implemented, message} | _rest]),
-    do: {:engine, 405, "This feature is not implemented: " <> message}
+  defp planning([{:not_implemented, message} | _rest]) do
+    %{status: status, body: body} = SQLError.not_implemented(message)
+    {:engine, status, body}
+  end
 end
