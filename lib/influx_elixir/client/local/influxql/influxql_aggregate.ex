@@ -210,7 +210,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLAggregate do
   # takes its name, the next `count` being `count_1`).
   @spec count_spec(binary(), MapSet.t(binary()), map()) :: spec()
   defp count_spec(field, tags, types) do
-    if field == "time" or MapSet.member?(tags, field) or Map.has_key?(types, field),
+    if field == "time" or not InfluxQLExpr.absent?(field, types, tags),
       do: {:count, :integer},
       else: {:other, :integer}
   end

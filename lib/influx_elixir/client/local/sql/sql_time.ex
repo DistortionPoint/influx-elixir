@@ -133,7 +133,7 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   @doc "What a bound parameter is as a `time` comparand."
   @spec param(term()) :: bound()
   def param(value) when is_binary(value) do
-    case literal(value) do
+    case timestamp_ns(value) do
       {:ok, ns} -> ns
       {:error, error} -> {:invalid_time, error}
     end
@@ -279,12 +279,7 @@ defmodule InfluxElixir.Client.Local.SQLTime do
   A quoted timestamp's text as nanoseconds since the epoch, or the optimizer's error for it.
   """
   @spec timestamp_ns(binary()) :: {:ok, integer()} | {:error, SQLError.t()}
-  def timestamp_ns(text), do: literal(text)
-
-  # A quoted timestamp's text as nanoseconds since the epoch, or the
-  # optimizer's error for it.
-  @spec literal(binary()) :: {:ok, integer()} | {:error, SQLError.t()}
-  defp literal(text) do
+  def timestamp_ns(text) do
     with {:ok, instant, leap} <- timestamp(text),
          :ok <- in_range(instant, leap) do
       {:ok, instant}

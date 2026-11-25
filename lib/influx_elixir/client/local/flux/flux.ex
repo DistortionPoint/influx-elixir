@@ -758,7 +758,8 @@ defmodule InfluxElixir.Client.Local.Flux do
 
   defp parse_stage({name, args}, _now_ns) do
     cond do
-      String.trim(args) != "" and Map.has_key?(Map.merge(@selectors, @aggregates), name) ->
+      String.trim(args) != "" and
+          (Map.has_key?(@selectors, name) or Map.has_key?(@aggregates, name)) ->
         {:error, "Client.Local: unsupported Flux arguments: #{name}(#{args})"}
 
       kind = @selectors[name] ->
@@ -1011,12 +1012,9 @@ defmodule InfluxElixir.Client.Local.Flux do
     with {:ok, text} <- string_literal(str), do: {:ok, {:lit, text}}
   end
 
-  defp token(%{"num" => "-" <> _digits = num}) do
-    with {:ok, n} <- number(num), do: {:ok, {:negative, n}}
-  end
-
   defp token(%{"num" => num}) when num != "" do
-    with {:ok, n} <- number(num), do: {:ok, {:lit, n}}
+    kind = if String.starts_with?(num, "-"), do: :negative, else: :lit
+    with {:ok, n} <- number(num), do: {:ok, {kind, n}}
   end
 
   defp token(%{"key" => key}) when key != "" do

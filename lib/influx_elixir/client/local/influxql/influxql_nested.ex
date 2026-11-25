@@ -443,27 +443,17 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
   defp arithmetic_expression(tokens, tags, types) do
     {_columns, calls} = InfluxQLTokens.split_names(tokens)
 
-    cond do
-      not Enum.all?(tokens, &arithmetic_token?/1) or
-          not Enum.all?(calls, &InfluxQLText.math_function?/1) ->
-        refuse_expression()
-
-      InfluxQLTokens.absent_columns(tokens, tags, types) == [] and
-          unsigned_column?(tokens, tags, types) ->
-        refuse_expression()
-
-      true ->
-        :expression
-    end
+    if not Enum.all?(tokens, &arithmetic_token?/1) or
+         not Enum.all?(calls, &InfluxQLText.math_function?/1) or
+         (InfluxQLTokens.absent_columns(tokens, tags, types) == [] and
+            unsigned_column?(tokens, tags, types)),
+       do: InfluxQLError.refuse("an expression compared with a condition in parentheses"),
+       else: :expression
   end
 
   defp arithmetic_token?({kind, _value}) when kind in [:number, :str, :ident], do: true
   defp arithmetic_token?({:raw, op}), do: op in ["+", "-", "*", "/", "%", "(", ")", ","]
   defp arithmetic_token?(_token), do: false
-
-  @spec refuse_expression() :: no_return()
-  defp refuse_expression,
-    do: InfluxQLError.refuse("an expression compared with a condition in parentheses")
 
   # A group that is one comparison of a column the measurement lacks (`(nosuch > 1)`) is a null
   # (verified: `ok = (nosuch > 1)` keeps no point), where in `AND` or `OR` such a comparison is
@@ -487,7 +477,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLNested do
 
   defp boolean_group?(tokens) do
     case strip_group(tokens) do
-      {:ok, [{:raw, word}]} when is_binary(word) -> String.downcase(word) in ["true", "false"]
+      {:ok, [{:raw, word}]} when is_binary(word) -> InfluxQLTokens.boolean_word?(word)
       {:ok, inner} -> connective_inside?(inner, true)
       nil -> false
     end

@@ -129,8 +129,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   defp group_field_read(%{group_by: dimensions, items: items}, types, tags) do
     fields =
       for {:tag, name} <- dimensions,
-          Map.has_key?(types, name),
-          not MapSet.member?(tags, name),
+          field?(name, types, tags),
           do: name
 
     if fields != [] and reads_any?(items, fields),
@@ -358,7 +357,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
   defp field_read?(_item, _types, _tags), do: false
 
-  defp field?(name, types, tags), do: Map.has_key?(types, name) and not MapSet.member?(tags, name)
+  @doc "Whether `name` is a field of the measurement (in `types` and not a tag)."
+  @spec field?(binary(), map(), MapSet.t(binary())) :: boolean()
+  def field?(name, types, tags), do: Map.has_key?(types, name) and not MapSet.member?(tags, name)
 
   # A number given to `fill()` cannot become the value of a text or boolean column of a selector
   # (`mode` included), grouped by time or not (verified).
@@ -421,15 +422,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
       aliased != nil ->
         {_column, name, _item} = aliased
-        if known_column?(name, types, tags), do: :ok, else: schema_error(table, name, types, tags)
+
+        if InfluxQLExpr.absent?(name, types, tags),
+          do: schema_error(table, name, types, tags),
+          else: :ok
 
       true ->
         :ok
     end
   end
-
-  defp known_column?(name, types, tags),
-    do: name == "time" or Map.has_key?(types, name) or MapSet.member?(tags, name)
 
   defp aliased_time?({_column, name, item}),
     do: InfluxQLNames.time_item?(item) and name != "time"
@@ -599,7 +600,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
 
     case calls do
       [{fun, field}] when field != "time" ->
-        if selector_name?(fun), do: lone_selector_expression(items, fun), else: :ok
+        if InfluxQLAggregate.selector?(fun), do: lone_selector_expression(items, fun), else: :ok
 
       _other ->
         :ok
@@ -609,8 +610,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLPlan do
   defp item_aggregates({:aggregate, fun, arg, _alias}) when is_binary(arg), do: [{fun, arg}]
   defp item_aggregates({:expr, ast, _alias}), do: InfluxQLExpr.aggregates(ast)
   defp item_aggregates(_item), do: []
-
-  defp selector_name?(fun), do: InfluxQLAggregate.selector?(fun)
 
   defp lone_selector_expression(items, fun) do
     Enum.find_value(items, :ok, fn

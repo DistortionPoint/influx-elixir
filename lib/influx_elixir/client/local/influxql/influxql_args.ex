@@ -23,7 +23,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   # The text is masked: the inside of the literals and the comments are blanks of the same
   # size.
 
-  alias InfluxElixir.Client.Local.{InfluxQLLex, InfluxQLText}
+  alias InfluxElixir.Client.Local.{InfluxQLLex, InfluxQLText, InfluxQLTokens}
 
   require InfluxQLLex
 
@@ -410,8 +410,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArgs do
   # `abs(true (1))` fails at the parenthesis).
   defp boolean_word?(text, name_at, stop, mode),
     do:
-      mode == :where and
-        String.downcase(binary_part(text, name_at, stop - name_at)) in ["true", "false"]
+      mode == :where and InfluxQLTokens.boolean_word?(binary_part(text, name_at, stop - name_at))
 
   # The names after a `.` (blanks may stand after the dot: `m. f` is `m.f`, verified): a dot
   # with no name after it is no operand, a name read to its end is an operand (a call or a type

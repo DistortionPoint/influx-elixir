@@ -545,7 +545,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLRun do
       {:expr, ast, _name} -> if plain_expression?(ast), do: InfluxQLExpr.refs(ast), else: []
       _item -> []
     end)
-    |> Enum.filter(&(Map.has_key?(types, &1) and not MapSet.member?(tags, &1)))
+    |> Enum.filter(&InfluxQLPlan.field?(&1, types, tags))
     |> Enum.uniq()
   end
 

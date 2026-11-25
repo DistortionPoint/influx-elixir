@@ -421,8 +421,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLProjection do
   defp expression(%{kind: kind, source: source, name: name}, table, %{tags: tags, types: types})
        when kind in [:time, :time_expr, :dimension, :column, :star, :chosen, :value] do
     cond do
-      kind in [:column, :chosen, :star] and
-          not (MapSet.member?(tags, source) or Map.has_key?(types, source)) ->
+      kind in [:column, :chosen, :star] and InfluxQLExpr.absent?(source, types, tags) ->
         "NULL AS #{name}"
 
       source != name ->

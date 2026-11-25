@@ -435,16 +435,6 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
     end
   end
 
-  # Whether the text of an argument is a column: a quoted name, or a word that begins with a
-  # letter or an underscore and is no literal.
-  @spec column_token?(binary()) :: boolean()
-  defp column_token?("\"" <> _quoted), do: true
-
-  defp column_token?(token),
-    do:
-      Regex.match?(~r/\A[A-Za-z_]/, token) and
-        String.downcase(token) not in ["true", "false", "null"]
-
   # A number or a keyword is no column (`first_value(1e3 ORDER BY time)` takes a constant,
   # which the double does not model).
   @spec ordered_aggregate(
@@ -454,7 +444,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
           binary() | nil
         ) :: {:ok, column()} | {:error, term()}
   defp ordered_aggregate(col, {func, field, ordering, direction}, alias_name, qualifier) do
-    if column_token?(field) and column_token?(ordering) do
+    if SQLLiteral.column_token?(field) and SQLLiteral.column_token?(ordering) do
       {field, ordering} = {name(field), name(ordering)}
 
       with {:ok, output} <-

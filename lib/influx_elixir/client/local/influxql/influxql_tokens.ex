@@ -638,7 +638,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLTokens do
 
   @spec plain_word(binary(), binary()) :: tuple()
   defp plain_word(upcased, word) do
-    if upcased in ~w(TRUE FALSE), do: {:raw, word}, else: {:ident, word}
+    if boolean_word?(upcased), do: {:raw, word}, else: {:ident, word}
   end
 
   # A regular expression ends at the first `/` that no backslash escapes; only

@@ -520,15 +520,15 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   defp bare_type({:cmp, tokens}, {tags, types}, _leaf) do
     case tokens |> InfluxQLTokens.strip_parens() |> standalone_field(tags, types, true) do
-      nil -> nil
-      :boolean -> nil
-      type -> {400, bare_error(type)}
+      type when type in [nil, :boolean] -> nil
+      type -> {400, InfluxQLError.bare_condition_error(Map.fetch!(@arrow_types, type))}
     end
   end
 
   defp bare_type({kind, _nodes} = tree, ctx, leaf) when kind in [:and, :or] do
     if bare_inside?(tree, ctx) do
-      if null_beside_bare?(tree, ctx), do: refuse_bare()
+      if null_beside_bare?(tree, ctx),
+        do: InfluxQLError.refuse("a bare non-boolean field inside AND/OR")
 
       other? = any_leaf?(tree, &other_bare_leaf?(&1, ctx))
 
@@ -539,10 +539,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
       end
     end
   end
-
-  @spec refuse_bare() :: no_return()
-  defp refuse_bare,
-    do: InfluxQLError.refuse("a bare non-boolean field inside AND/OR")
 
   # The engine types a condition from the leaves up (verified over every pair of operand types
   # and over chains of three and four): a comparison or a boolean field is a boolean, and so is
@@ -668,17 +664,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
        when sign in ["-", "+"] do
     case signed_operand(tokens, false, tags, types) do
       {:ok, type} -> type
-      :none -> arithmetic_field(tokens, tags, types, alone)
+      :none -> InfluxQLWhereArith.standalone(tokens, tags, types, alone)
     end
   end
 
   defp standalone_field(tokens, tags, types, alone),
-    do: bare_field(tokens, tags, types) || arithmetic_field(tokens, tags, types, alone)
-
-  # Arithmetic and signs over several operands: the type it comes to. (`alone`: the condition is
-  # that operand and nothing else.)
-  defp arithmetic_field(tokens, tags, types, alone),
-    do: InfluxQLWhereArith.standalone(tokens, tags, types, alone)
+    do:
+      bare_field(tokens, tags, types) || InfluxQLWhereArith.standalone(tokens, tags, types, alone)
 
   # The type of an operand after signs: a number, or a numeric field. A minus anywhere in the
   # signs makes the number a negative one (verified: `- 9223372036854775808` and `+ -
@@ -720,8 +712,4 @@ defmodule InfluxElixir.Client.Local.InfluxQLTyped do
 
   defp bare_field([{:str, _content}], _tags, _types), do: :string
   defp bare_field(_tokens, _tags, _types), do: nil
-
-  @spec bare_error(atom()) :: binary()
-  defp bare_error(type),
-    do: InfluxQLError.bare_condition_error(Map.fetch!(@arrow_types, type))
 end

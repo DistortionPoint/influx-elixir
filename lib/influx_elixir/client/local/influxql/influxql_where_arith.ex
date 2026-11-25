@@ -255,16 +255,13 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
     case sides(tokens) do
       {:ok, parts, _op} ->
         Enum.any?(parts, fn part ->
-          match?({:ok, :null}, part |> InfluxQLArithType.kind({tags, types}) |> shape())
+          match?({:ok, :null}, part |> InfluxQLArithType.kind({tags, types}) |> shaped())
         end)
 
       :error ->
         false
     end
   end
-
-  defp shape({:ok, kind}), do: shaped(kind)
-  defp shape(_other), do: :error
 
   # The sides of a comparison, or the whole as one side, with the operator. (A comparison with a
   # side missing never gets here: the parser of the statement fails it first.) Two comparisons
@@ -293,21 +290,20 @@ defmodule InfluxElixir.Client.Local.InfluxQLWhereArith do
 
   defp side_kind(tokens, tags, types) do
     with [] <- InfluxQLTokens.absent_columns(tokens, tags, types),
-         false <- Enum.any?(tokens, &InfluxQLTokens.time?/1),
-         {:ok, kind} <- InfluxQLArithType.kind(tokens, {tags, types}) do
-      shaped(kind)
+         false <- Enum.any?(tokens, &InfluxQLTokens.time?/1) do
+      tokens |> InfluxQLArithType.kind({tags, types}) |> shaped()
     else
       _undecided -> :error
     end
   end
 
-  defp shaped(kind) when kind in [:integer, :float, :unsigned, :string, :tag, :boolean],
+  defp shaped({:ok, kind}) when kind in [:integer, :float, :unsigned, :string, :tag, :boolean],
     do: {:ok, kind}
 
-  defp shaped(kind) when kind in [:unknown, :nn, :nnf, :nz, :abs_null, :false_constant],
+  defp shaped({:ok, kind}) when kind in [:unknown, :nn, :nnf, :nz, :abs_null, :false_constant],
     do: {:ok, :null}
 
-  defp shaped(_duration_or_time), do: :error
+  defp shaped(_other), do: :error
 
   @doc """
   Raises the first problem of the operands of a comparison, or of the condition on its own: the

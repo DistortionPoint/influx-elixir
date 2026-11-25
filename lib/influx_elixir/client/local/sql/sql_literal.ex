@@ -44,6 +44,20 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
   def name_token?(text),
     do: String.valid?(text) and Regex.match?(~r/\A(?:\w+|"(?:[^"]|"")*")\z/u, text)
 
+  @doc "Whether `name` can be written as an unquoted column identifier."
+  @spec bare_column_name?(binary()) :: boolean()
+  def bare_column_name?(name) do
+    String.valid?(name) and Regex.match?(~r/\A[\p{L}_]\w*\z/u, name) and
+      String.upcase(name) not in ~w(TRUE FALSE NULL)
+  end
+
+  @doc """
+  Whether the text is a column token: a `\"...\"` identifier, or an unquoted column name
+  (`bare_column_name?/1`).
+  """
+  @spec column_token?(binary()) :: boolean()
+  def column_token?(text), do: identifier?(text) or bare_column_name?(text)
+
   @doc """
   The text between a literal's quotes, with a doubled quote one quote. The
   quotes are one byte each, so the cut is by bytes, as every offset here is.

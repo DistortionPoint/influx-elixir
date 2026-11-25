@@ -202,9 +202,6 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   # What an unsigned number divided is compared with `UInt64` at once.
   @divisors [:boolean, :false_constant, :timestamp, :duration]
 
-  # The classes of pending error that a null beside the value takes away.
-  @erasable [:quotient, :division, :comparison]
-
   # What two nulls come to, the first kind down the left and the second across: a null number
   # of the type a float makes when either is one, a null of its own beside the other nulls but
   # a null number, which the double does not tell (`:unread`).
@@ -723,7 +720,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
   defp beside(op, quotient, other, mode, side) do
     case {beside_quotient(other.kind, mode), side} do
       {:null, _side} ->
-        if erased_by_null?(quotient), do: {:ok, null_of(other)}, else: {:ok, quotient}
+        {:ok, null_of(other)}
 
       {:unsigned, :left} when not (op == "/" and other.kind in [:string, :tag]) ->
         plain(op, :unsigned, other.kind)
@@ -903,9 +900,4 @@ defmodule InfluxElixir.Client.Local.InfluxQLArithType do
        "#{type} #{op} #{type}: Invalid argument error: Invalid #{word} arithmetic " <>
        "operation: #{type} #{op} #{type}"}
   end
-
-  # The one rule of what a null takes away: the pending error of a value (an error that is not
-  # raised yet) is taken away by a null beside it, whatever the operator, when its class is one of
-  # `@erasable`. (What is raised at once is no pending error, the rewriter's `cannot_use/1`.)
-  defp erased_by_null?(%Value{pending: {class, _body}}), do: class in @erasable
 end

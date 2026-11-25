@@ -121,7 +121,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   # quoted.
   @spec identifier_text(binary()) :: binary()
   defp identifier_text(name) do
-    if String.valid?(name) and Regex.match?(~r/\A[\p{L}_][\p{L}\p{N}_]*\z/u, name),
+    if SQLLiteral.bare_column_name?(name),
       do: name,
       else: SQLLiteral.quote_identifier(name)
   end
@@ -160,8 +160,11 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
         {:ok, expr}
 
       :not_positional ->
+        unquoted = SQLLiteral.unquoted(term)
+
         case Enum.find(items, fn {expr, name} ->
-               name == term and expr != term and not MapSet.member?(qualified, term)
+               name == unquoted and SQLLiteral.unquoted(expr) != unquoted and
+                 not MapSet.member?(qualified, unquoted)
              end) do
           {expr, _name} -> {:ok, expr}
           nil -> {:ok, term}
@@ -517,12 +520,9 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
 
   @spec order_target(binary()) :: binary() | {:expr, SQLExpr.t()}
   defp order_target(target) do
-    cond do
-      String.upcase(target) in ~w(NULL TRUE FALSE) -> order_expression(target)
-      Regex.match?(~r/^\w+$/u, target) -> target
-      SQLLiteral.identifier?(target) -> SQLLiteral.identifier_name(target)
-      true -> order_expression(target)
-    end
+    if String.upcase(target) not in ~w(NULL TRUE FALSE) and SQLLiteral.name_token?(target),
+      do: SQLLiteral.unquoted(target),
+      else: order_expression(target)
   end
 
   @spec order_expression(binary()) :: {:expr, SQLExpr.t()}

@@ -291,16 +291,9 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   # predicate (`WHERE b`, `NOT b`).
   @spec column_predicate(binary()) :: {:ok, clause()} | :nomatch
   defp column_predicate(text) do
-    cond do
-      Regex.match?(~r/^[\p{L}_]\w*$/u, text) and String.upcase(text) not in ~w(TRUE FALSE NULL) ->
-        {:ok, {:truthy, text, nil}}
-
-      SQLLiteral.identifier?(text) ->
-        {:ok, {:truthy, SQLLiteral.identifier_name(text), nil}}
-
-      true ->
-        :nomatch
-    end
+    if SQLLiteral.column_token?(text),
+      do: {:ok, {:truthy, SQLLiteral.unquoted(text), nil}},
+      else: :nomatch
   end
 
   @distinct_pattern ~r/^(.+?)(?<=\S)\s+IS\s+(NOT\s+)?DISTINCT\s+FROM\s+(.+)$/isu
@@ -770,11 +763,8 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
       String.downcase(text) in ["null", "true", "false"] ->
         {:ok, {:expr, {:lit, keyword(text)}}}
 
-      Regex.match?(~r/^[\p{L}_]\w*$/u, text) ->
-        {:ok, text}
-
-      SQLLiteral.identifier?(text) ->
-        {:ok, SQLLiteral.identifier_name(text)}
+      SQLLiteral.column_token?(text) ->
+        {:ok, SQLLiteral.unquoted(text)}
 
       true ->
         arithmetic_operand(text)

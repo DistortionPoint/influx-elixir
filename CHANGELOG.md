@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local.SQLClauses` failed to resolve double-quoted select aliases in `GROUP BY` (`SELECT upper(host) AS "Host", count(*) FROM m GROUP BY "Host"`) and rewrote positional `ORDER BY` references to aliases named `"true"`, `"false"`, or `"null"` without quotes (`SELECT n AS "true" FROM m ORDER BY 1 DESC`), and `Client.Local.SQLSelect` rejected non-ASCII unquoted column names in `first_value` / `last_value`.**
+  `SQLClauses.group_term/3` now unquotes `GROUP BY` terms via `SQLLiteral.unquoted/1` before matching select aliases and table-qualified column sets, `SQLClauses.identifier_text/1` quotes `"true"`, `"false"`, and `"null"` via `SQLLiteral.bare_column_name?/1` so `order_target/1` resolves them as column names rather than boolean/null literals, and `SQLSelect.ordered_aggregate/4` uses Unicode-aware `SQLLiteral.column_token?/1`.
+
+### Changed
+- **Consolidated duplicate helpers across `Client.Local` (`Flux`, `InfluxQLAggregate`, `InfluxQLArgs`, `InfluxQLArithType`, `InfluxQLExpr`, `InfluxQLLiteral`, `InfluxQLNested`, `InfluxQLPlan`, `InfluxQLProjection`, `InfluxQLRun`, `InfluxQLTokens`, `InfluxQLTyped`, `InfluxQLWhereArith`, `SQLClauses`, `SQLLiteral`, `SQLMask`, `SQLPredicate`, `SQLSelect`, and `SQLTime`).**
+  Added `SQLLiteral.bare_column_name?/1` and `SQLLiteral.column_token?/1` for reuse across `SQLClauses`, `SQLPredicate`, and `SQLSelect` (removing `SQLSelect.column_token?/1` and simplifying `SQLClauses.order_target/1`, `SQLPredicate.column_predicate/1`, and `SQLPredicate.parse_operand/1`), delegated quote skipping in `SQLMask.closing_paren/3` to `SQLIdentifiers.take_quoted/2` (removing `SQLMask.skip_literal/3`), merged `SQLTime.timestamp_ns/1` and `SQLTime.literal/1`, exposed `InfluxQLPlan.field?/3` and reused `InfluxQLExpr.absent?/3` across `InfluxQLAggregate`, `InfluxQLPlan`, `InfluxQLProjection`, and `InfluxQLRun` (removing `InfluxQLPlan.known_column?/3` and `InfluxQLPlan.selector_name?/1`), reused `InfluxQLTokens.boolean_word?/1` across `InfluxQLArgs`, `InfluxQLExpr`, `InfluxQLLiteral`, `InfluxQLNested`, and `InfluxQLTokens`, reused `InfluxQLExpr.number_text/1` in `InfluxQLExpr.non_integer_limit/1` and `InfluxQLExpr.render/3`, simplified `InfluxQLNested.arithmetic_expression/3` (removing `refuse_expression/0`), inlined `bare_error/1`, `refuse_bare/0`, and `arithmetic_field/4` in `InfluxQLTyped`, removed the redundant `@erasable` and `erased_by_null?/1` in `InfluxQLArithType`, unified `shape/1` and `shaped/1` in `InfluxQLWhereArith`, and simplified `parse_stage/2` and `token/1` in `Flux`.
+
 ## [0.1.72] - 2026-11-24
 
 ### Fixed

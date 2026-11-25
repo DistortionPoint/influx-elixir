@@ -12,6 +12,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
     Durations,
     InfluxQLError,
     InfluxQLText,
+    InfluxQLTokens,
     LineProtocolNumber,
     SQLLimits
   }
@@ -28,7 +29,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLLiteral do
   @spec debug(binary()) :: {:ok, binary()} | :none | {:error, binary()}
   def debug(text) do
     cond do
-      String.downcase(text) in ["true", "false"] ->
+      InfluxQLTokens.boolean_word?(text) ->
         {:ok, "Boolean(#{String.downcase(text)})"}
 
       Regex.match?(~r/^[+-]?\d+$/, text) ->

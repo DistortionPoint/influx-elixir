@@ -44,6 +44,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
     InfluxQLNames,
     InfluxQLRegex,
     InfluxQLText,
+    InfluxQLTokens,
     SQLError,
     SQLLimits
   }
@@ -170,7 +171,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
 
   # An unquoted `true` or `false` is a boolean, a quoted one a name.
   defp name_token(name, nil) do
-    if String.downcase(name) in ["true", "false"],
+    if InfluxQLTokens.boolean_word?(name),
       do: {:bool, String.downcase(name) == "true"},
       else: {:name, InfluxQLText.unquote_ident(name), nil}
   end
@@ -460,7 +461,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
          do: {:planning, "expected integer as last argument for #{name}, got #{got}"}
   end
 
-  defp non_integer_limit({:lit, {:float, x}}), do: "Literal(Float(#{Float.to_string(x)}))"
+  defp non_integer_limit({:lit, {:float, x}}), do: "Literal(Float(#{number_text(x)}))"
 
   defp non_integer_limit({:str, content}),
     do: "Literal(String(#{InfluxQLError.rust_debug(content)}))"
@@ -532,7 +533,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp render({:lit, {:int, n}}, _types, _tags), do: {:ok, "Literal(Integer(#{n}))"}
 
   defp render({:lit, {:float, x}}, _types, _tags) do
-    text = Float.to_string(x)
+    text = number_text(x)
     if String.contains?(text, "e"), do: :error, else: {:ok, "Literal(Float(#{text}))"}
   end
 

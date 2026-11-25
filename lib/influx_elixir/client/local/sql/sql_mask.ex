@@ -208,8 +208,8 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   defp closing_paren(<<>>, _depth, _at), do: nil
 
   defp closing_paren(<<q, rest::binary>>, depth, at) when q in [?', ?"] do
-    case skip_literal(rest, q, at + 1) do
-      {rest, at} -> closing_paren(rest, depth, at)
+    case SQLIdentifiers.take_quoted(rest, q) do
+      {:ok, body, after_quote} -> closing_paren(after_quote, depth, at + byte_size(body) + 2)
       :error -> nil
     end
   end
@@ -218,11 +218,4 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   defp closing_paren(<<?), rest::binary>>, depth, at), do: closing_paren(rest, depth - 1, at + 1)
   defp closing_paren(<<?(, rest::binary>>, depth, at), do: closing_paren(rest, depth + 1, at + 1)
   defp closing_paren(<<_byte, rest::binary>>, depth, at), do: closing_paren(rest, depth, at + 1)
-
-  @spec skip_literal(binary(), byte(), non_neg_integer()) ::
-          {binary(), non_neg_integer()} | :error
-  defp skip_literal(<<d, d, rest::binary>>, d, at), do: skip_literal(rest, d, at + 2)
-  defp skip_literal(<<d, rest::binary>>, d, at), do: {rest, at + 1}
-  defp skip_literal(<<_byte, rest::binary>>, d, at), do: skip_literal(rest, d, at + 1)
-  defp skip_literal(<<>>, _d, _at), do: :error
 end
