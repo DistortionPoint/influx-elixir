@@ -140,11 +140,7 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
 
   defp compared_as_text(operand, whens, types) do
     values = [operand | Enum.map(whens, &elem(&1, 0))]
-
-    families =
-      values
-      |> Enum.map(&SQLExprType.known_type(&1, types))
-      |> Enum.map(&SQLCommonType.family/1)
+    families = Enum.map(values, &(&1 |> SQLExprType.known_type(types) |> SQLCommonType.family()))
 
     if "Utf8" in families and Enum.all?(families, &(&1 in [nil, "Utf8" | @numbers])) do
       {cast(operand, "Utf8", types),

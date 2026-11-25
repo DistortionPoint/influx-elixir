@@ -151,7 +151,7 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   @spec divzero([leaf()], boolean()) :: :ok | {:error, SQLError.t()}
   defp divzero(leaves, cte?) do
     bounds = for {:bound, _column, _type, _op, _value} = leaf <- leaves, do: leaf
-    bounded = for {:bound, column, _type, _op, _value} <- bounds, into: MapSet.new(), do: column
+    bounded = MapSet.new(bounds, &elem(&1, 1))
 
     divisions = for {:divzero, _columns, _point} = leaf <- leaves, do: leaf
     read = Enum.flat_map(divisions, &elem(&1, 1))
@@ -522,11 +522,13 @@ defmodule InfluxElixir.Client.Local.SQLBounds do
   @spec column_empty?([leaf()], binary(), [leaf()]) :: boolean()
   defp column_empty?(leaves, column, group) do
     empty?(group) or
-      (match?([_ | _], additive_intervals(leaves, column)) and
-         SQLBoundsExpr.empty?(
-           elem(hd(group), 2),
-           bound_intervals(leaves, column) ++ additive_intervals(leaves, column)
-         ))
+      case additive_intervals(leaves, column) do
+        [] ->
+          false
+
+        additive ->
+          SQLBoundsExpr.empty?(elem(hd(group), 2), bound_intervals(leaves, column) ++ additive)
+      end
   end
 
   @spec additive_intervals([leaf()], binary()) :: [SQLBoundsExpr.interval()]

@@ -37,6 +37,16 @@ defmodule InfluxElixir.Client.Local.SqlAggregateRefusalsTest do
                Local.query_sql(conn, sql, database: "test_db")
 
       assert {:error, %{status: 400, body: ^refusal}} = Local.check_sql(sql)
+
+      for literal <- ["1", "true", "false", "null"] do
+        literal_sql = "SELECT DISTINCT ON (#{literal}) v FROM m"
+        literal_refusal = "Client.Local: DISTINCT ON takes column names only: (#{literal})"
+
+        assert {:error, %{status: 400, body: ^literal_refusal}} =
+                 Local.query_sql(conn, literal_sql, database: "test_db")
+
+        assert {:error, %{status: 400, body: ^literal_refusal}} = Local.check_sql(literal_sql)
+      end
     end
   end
 

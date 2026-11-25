@@ -64,7 +64,7 @@ defmodule InfluxElixir.Client.Local.SQLDistinctOn do
       columns == [""] ->
         {:error, SQLError.planning("No `ON` expressions provided")}
 
-      not Enum.all?(columns, &SQLLiteral.name_token?/1) ->
+      not Enum.all?(columns, &SQLLiteral.column_token?/1) ->
         {:error, SQLError.refusal("DISTINCT ON takes column names only: (#{on})")}
 
       true ->

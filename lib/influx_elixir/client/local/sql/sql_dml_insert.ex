@@ -433,15 +433,15 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   defp placeholders(rows, fields) do
     rows
     |> Enum.flat_map(&Enum.with_index/1)
-    |> Enum.reduce_while(:ok, fn
-      {{:bare_placeholder, text}, index}, :ok ->
+    |> SQLDmlOperand.check_all(fn
+      {{:bare_placeholder, text}, index} ->
         case placeholder(text, index, fields) do
-          nil -> {:cont, :ok}
-          message -> {:halt, {:error, SQLError.planning(message)}}
+          nil -> :ok
+          message -> {:error, SQLError.planning(message)}
         end
 
-      {_cell, _index}, :ok ->
-        {:cont, :ok}
+      {_cell, _index} ->
+        :ok
     end)
   end
 
@@ -475,16 +475,12 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   defp read_cells(rows, ctx) do
     rows
     |> Enum.concat()
-    |> Enum.reduce_while(:ok, fn
-      {:opaque, why}, :ok ->
-        {:halt, {:refuse, why}}
+    |> SQLDmlOperand.check_all(fn
+      {:opaque, why} ->
+        {:refuse, why}
 
-      cell, :ok ->
-        with :ok <- SQLDmlOperand.eager(cell, ctx), :ok <- SQLDmlOperand.lazy(cell, ctx) do
-          {:cont, :ok}
-        else
-          failure -> {:halt, failure}
-        end
+      cell ->
+        with :ok <- SQLDmlOperand.eager(cell, ctx), do: SQLDmlOperand.lazy(cell, ctx)
     end)
   end
 
@@ -512,24 +508,15 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
     rows
     |> Enum.zip_with(& &1)
     |> Enum.zip(target_types)
-    |> Enum.reduce_while(:ok, fn {cells, target}, :ok ->
-      case type_column(cells, target, ctx) do
-        :ok -> {:cont, :ok}
-        failure -> {:halt, failure}
-      end
-    end)
+    |> SQLDmlOperand.check_all(fn {cells, target} -> type_column(cells, target, ctx) end)
   end
 
   @spec type_column([SQLDmlExpr.ast()], binary() | nil, SQLDmlOperand.ctx()) ::
           SQLDmlOperand.check()
   defp type_column(cells, target, ctx) do
-    Enum.reduce_while(cells, :ok, fn cell, :ok ->
+    SQLDmlOperand.check_all(cells, fn cell ->
       with :ok <- SQLDmlOperand.plan_top(cell, ctx),
-           :ok <- SQLDmlOperand.convert(cell, target, ctx, :values) do
-        {:cont, :ok}
-      else
-        failure -> {:halt, failure}
-      end
+           do: SQLDmlOperand.convert(cell, target, ctx, :values)
     end)
   end
 
@@ -647,14 +634,10 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   # counts the items against the columns.
   @spec project_items([SQLDmlExpr.ast()], SQLDmlOperand.ctx()) :: SQLDmlOperand.check()
   defp project_items(operands, ctx) do
-    Enum.reduce_while(operands, :ok, fn operand, :ok ->
+    SQLDmlOperand.check_all(operands, fn operand ->
       with :ok <- SQLDmlOperand.plan_top(operand, ctx),
            :ok <- SQLDmlOperand.deep(operand, ctx),
-           :ok <- SQLDmlOperand.late(operand, ctx) do
-        {:cont, :ok}
-      else
-        failure -> {:halt, failure}
-      end
+           do: SQLDmlOperand.late(operand, ctx)
     end)
   end
 
@@ -670,11 +653,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlInsert do
   defp convert_items(operands, types, ctx) do
     operands
     |> Enum.zip(types)
-    |> Enum.reduce_while(:ok, fn {operand, target}, :ok ->
-      case SQLDmlOperand.convert(operand, target, ctx, :planning) do
-        :ok -> {:cont, :ok}
-        failure -> {:halt, failure}
-      end
+    |> SQLDmlOperand.check_all(fn {operand, target} ->
+      SQLDmlOperand.convert(operand, target, ctx, :planning)
     end)
   end
 end

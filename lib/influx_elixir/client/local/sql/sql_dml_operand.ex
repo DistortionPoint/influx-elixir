@@ -442,8 +442,9 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   @spec column?([SQLDmlExpr.name()], ctx()) :: boolean()
   def column?(parts, ctx), do: resolve(parts, ctx) == :ok
 
+  @doc "Runs `fun` over `list`, halting at the first result other than `:ok`."
   @spec check_all([term()], (term() -> check())) :: check()
-  defp check_all(list, fun) do
+  def check_all(list, fun) do
     Enum.reduce_while(list, :ok, fn item, :ok ->
       case fun.(item) do
         :ok -> {:cont, :ok}
@@ -869,12 +870,8 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   def deep(operand, ctx) do
     {_lowered, deferred} = lower(operand, ctx)
 
-    Enum.reduce_while(deferred, :ok, fn part, :ok ->
-      with :ok <- plan_top(part, ctx), :ok <- deep(part, ctx) do
-        {:cont, :ok}
-      else
-        failure -> {:halt, failure}
-      end
+    check_all(deferred, fn part ->
+      with :ok <- plan_top(part, ctx), do: deep(part, ctx)
     end)
   end
 

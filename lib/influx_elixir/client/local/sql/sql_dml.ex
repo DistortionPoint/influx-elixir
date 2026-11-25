@@ -342,16 +342,13 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   defp targets(assignments, reference, columns) do
     qualifier = Enum.map_join(reference, ".", &SQLDmlName.quote_name/1)
 
-    Enum.reduce_while(assignments, :ok, fn
-      {:tuple, _value}, :ok ->
-        {:halt, {:error, SQLError.planning("Tuples are not supported")}}
+    SQLDmlOperand.check_all(assignments, fn
+      {:tuple, _value} ->
+        {:error, SQLError.planning("Tuples are not supported")}
 
-      {names, _value}, :ok ->
+      {names, _value} ->
         name = SQLDmlExpr.last_name(names)
-
-        if name in columns,
-          do: {:cont, :ok},
-          else: {:halt, {:error, no_target(name, qualifier, columns)}}
+        if name in columns, do: :ok, else: {:error, no_target(name, qualifier, columns)}
     end)
   end
 
@@ -366,16 +363,12 @@ defmodule InfluxElixir.Client.Local.SQLDml do
     columns = Enum.filter(ctx.columns, &is_map_key(assigned, &1))
 
     columns
-    |> Enum.reduce_while(:ok, fn column, :ok ->
+    |> SQLDmlOperand.check_all(fn column ->
       value = Map.fetch!(assigned, column)
 
       with :ok <- SQLDmlOperand.eager(value, ctx),
            :ok <- SQLDmlOperand.lazy(value, ctx),
-           :ok <- SQLDmlOperand.value(value, column, ctx) do
-        {:cont, :ok}
-      else
-        failure -> {:halt, failure}
-      end
+           do: SQLDmlOperand.value(value, column, ctx)
     end)
     |> case do
       :ok -> deep_values(columns, assigned, ctx)
@@ -386,14 +379,9 @@ defmodule InfluxElixir.Client.Local.SQLDml do
   # What typing the top of each value did not reach, as the projection of the update finds it.
   @spec deep_values([binary()], map(), SQLDmlOperand.ctx()) :: SQLDmlOperand.check()
   defp deep_values(columns, assigned, ctx) do
-    Enum.reduce_while(columns, :ok, fn column, :ok ->
+    SQLDmlOperand.check_all(columns, fn column ->
       value = Map.fetch!(assigned, column)
-
-      with :ok <- SQLDmlOperand.deep(value, ctx), :ok <- SQLDmlOperand.late(value, ctx) do
-        {:cont, :ok}
-      else
-        failure -> {:halt, failure}
-      end
+      with :ok <- SQLDmlOperand.deep(value, ctx), do: SQLDmlOperand.late(value, ctx)
     end)
   end
 end
