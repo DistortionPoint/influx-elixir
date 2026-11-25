@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.73] - 2026-11-25
+
 ### Fixed
 - **`Client.Local.SQLDistinctOn` treated unquoted numeric (`1`), boolean (`true`, `false`), and `null` literals in `SELECT DISTINCT ON (...)` as column names instead of refusing them as non-column expressions, `Client.Local.SQLClauses` failed to resolve double-quoted select aliases in `GROUP BY` (`SELECT upper(host) AS "Host", count(*) FROM m GROUP BY "Host"`) and rewrote positional `ORDER BY` references to aliases named `"true"`, `"false"`, or `"null"` without quotes (`SELECT n AS "true" FROM m ORDER BY 1 DESC`), and `Client.Local.SQLSelect` rejected non-ASCII unquoted column names in `first_value` / `last_value`.**
   `SQLDistinctOn.apply/2` and `SQLSelect.ordered_aggregate/4` now use `SQLLiteral.column_token?/1` so non-column literals are rejected while double-quoted and non-ASCII column names are accepted, `SQLClauses.group_term/3` unquotes `GROUP BY` terms via `SQLLiteral.unquoted/1` before matching select aliases and table-qualified column sets, and `SQLClauses.identifier_text/1` quotes `"true"`, `"false"`, and `"null"` via `SQLLiteral.bare_column_name?/1` so `order_target/1` resolves them as column names rather than boolean/null literals.
