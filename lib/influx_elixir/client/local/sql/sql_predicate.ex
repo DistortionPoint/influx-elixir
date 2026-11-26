@@ -194,16 +194,10 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   # A `LIKE` pattern that is one literal, or literals joined by `||` (`s LIKE 'w' || '%'`, which
   # the engine folds to the one literal, verified).
   @spec like_literal([binary()]) :: {:ok, clause()} | {:error, map()}
-  defp like_literal([full, left, negated, kind, body] = match) do
-    cond do
-      single_literal?(body) ->
-        like_clause(match)
-
-      joined = joined_literals(body) ->
-        like_clause([full, left, negated, kind, joined])
-
-      true ->
-        {:error, more_than_one_literal()}
+  defp like_literal([full, left, negated, kind, body]) do
+    case joined_literals(body) do
+      nil -> {:error, more_than_one_literal()}
+      pattern -> like_clause([full, left, negated, kind, pattern])
     end
   end
 
@@ -215,16 +209,16 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
     )
   end
 
-  # The pattern of literals joined by `||`, as the body of one literal (a quote doubled), or nil.
+  # The pattern of one literal or literals joined by `||`, as the body of one literal (a quote
+  # doubled), or nil.
   @spec joined_literals(binary()) :: binary() | nil
   defp joined_literals(body) do
     quoted = "'" <> body <> "'"
 
-    if Regex.match?(~r/\A'x*'(?:\s*\|\|\s*'x*')+\z/, SQLMask.mask(quoted)) do
+    if SQLMask.match?(~r/\A'x*'(?:\s*\|\|\s*'x*')*\z/, quoted) do
       ~r/'((?:[^']|'')*)'/u
       |> Regex.scan(quoted, capture: :all_but_first)
-      |> Enum.map_join(fn [piece] -> SQLLiteral.unescape(piece) end)
-      |> String.replace("'", "''")
+      |> Enum.map_join(fn [piece] -> piece end)
     end
   end
 
@@ -233,14 +227,10 @@ defmodule InfluxElixir.Client.Local.SQLPredicate do
   @spec literal_clause([binary()], ([binary()] -> {:ok, clause()} | {:error, map()})) ::
           {:ok, clause()} | {:error, map()}
   defp literal_clause(match, read) do
-    if single_literal?(List.last(match)),
+    if SQLLiteral.string?("'" <> List.last(match) <> "'"),
       do: read.(match),
       else: {:error, more_than_one_literal()}
   end
-
-  # Whether the text between the quotes of a match is the body of one string literal.
-  @spec single_literal?(binary()) :: boolean()
-  defp single_literal?(body), do: Regex.match?(~r/\A'x*'\z/, SQLMask.mask("'" <> body <> "'"))
 
   @spec like_clause([binary()]) :: {:ok, clause()} | {:error, map()}
   defp like_clause([_full, left, negated, kind, pattern]) do

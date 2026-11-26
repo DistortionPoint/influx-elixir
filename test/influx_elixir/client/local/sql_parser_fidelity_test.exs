@@ -493,6 +493,23 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
                  ~s|WITH t AS (SELECT 1 AS "a""b" FROM m) SELECT DISTINCT ON ("a""b") * FROM t|,
                  database: "iq_db"
                )
+
+      assert {:ok, [%{"a b" => 1, "order" => 2, "a\"b" => 3}]} =
+               Local.query_sql(
+                 conn,
+                 ~s|WITH t AS (SELECT 1 AS "a b", 2 AS "order", 3 AS "a""b" FROM m) | <>
+                   ~s|SELECT DISTINCT "a b", "order", "a""b" FROM t ORDER BY "a b"|,
+                 database: "iq_db"
+               )
+
+      for note <- ["'limit -1 '", "'limit foo '", "'limit 1.5 '", "'offset -1 '"] do
+        assert {:ok, []} =
+                 Local.query_sql(
+                   conn,
+                   "SELECT * FROM m WHERE host = #{note}",
+                   database: "iq_db"
+                 )
+      end
     end
   end
 end

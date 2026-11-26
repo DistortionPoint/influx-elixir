@@ -120,11 +120,11 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
 
   @doc "Whether a text calls an aggregate function."
   @spec aggregate_call?(binary()) :: boolean()
-  def aggregate_call?(text), do: String.valid?(text) and Regex.match?(@aggregate_call, text)
+  def aggregate_call?(text), do: SQLMask.match?(@aggregate_call, text)
 
   @doc "Whether a text calls an InfluxQL-only function (`FIRST`, `LAST`), which SQL does not have."
   @spec influxql_call?(binary()) :: boolean()
-  def influxql_call?(text), do: Regex.match?(@influxql_call, SQLMask.mask(text))
+  def influxql_call?(text), do: SQLMask.match?(@influxql_call, text)
 
   @call_start ~r/(?i)(?<![\w."])(?:#{@aggregate_alternation})\s*\(/u
 
@@ -286,7 +286,7 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   """
   @spec constant(binary()) :: {SQLExpr.t(), binary() | nil} | nil
   def constant(body) do
-    if String.valid?(body) and Regex.match?(@constant, SQLMask.mask(body)) do
+    if SQLMask.match?(@constant, body) do
       expr = constant_expr(body)
       {expr, rendered(expr, nil)}
     end
@@ -777,9 +777,11 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   def selector_error(columns) do
     masked = SQLMask.mask(columns)
 
-    ~r/(?i)\bSELECTOR_(FIRST|LAST|MIN|MAX)\s*\(\s*#{@name}\s*,\s*(\w+)\s*\)/u
-    |> Regex.scan(masked)
-    |> Enum.find_value(fn [call, selector, field, ordering] ->
+    ~r/(?i)\bSELECTOR_(FIRST|LAST|MIN|MAX)\s*\(\s*#{@name}\s*,\s*#{@name}\s*\)/u
+    |> Regex.scan(masked, return: :index)
+    |> Enum.find_value(fn spans ->
+      [call, selector, field, ordering] = Enum.map(spans, &SQLMask.cut(columns, &1))
+
       cond do
         type = literal_type(ordering) ->
           SQLError.selector_second_arg(String.downcase(selector), type)

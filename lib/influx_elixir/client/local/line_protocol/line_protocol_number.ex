@@ -134,9 +134,8 @@ defmodule InfluxElixir.Client.Local.LineProtocolNumber do
   def sign_size(<<?-, _rest::binary>>), do: 1
   def sign_size(_text), do: 0
 
-  # The number of ASCII digits at the start of `text`.
+  @doc "The number of ASCII digits at the start of `text`."
   @spec digit_count(binary(), non_neg_integer()) :: non_neg_integer()
-  @doc false
   def digit_count(<<c, rest::binary>>, count) when c in ?0..?9, do: digit_count(rest, count + 1)
   def digit_count(_text, count), do: count
 

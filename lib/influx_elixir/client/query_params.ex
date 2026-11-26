@@ -39,6 +39,7 @@ defmodule InfluxElixir.Client.QueryParams do
   @typedoc "The parameters as the request body carries them: string keys, JSON-encodable values."
   @type t :: %{binary() => term()}
 
+  alias InfluxElixir.Client.Local.LineProtocolNumber
   alias InfluxElixir.Client.Options
 
   @typedoc "Why a parameter cannot be sent."
@@ -328,11 +329,8 @@ defmodule InfluxElixir.Client.QueryParams do
 
   @spec take_digits(binary()) :: {binary(), binary()}
   defp take_digits(text) do
-    size = digits(text, 0)
-    {binary_part(text, 0, size), binary_part(text, size, byte_size(text) - size)}
+    size = LineProtocolNumber.digit_count(text, 0)
+    <<digits::binary-size(size), rest::binary>> = text
+    {digits, rest}
   end
-
-  @spec digits(binary(), non_neg_integer()) :: non_neg_integer()
-  defp digits(<<digit, rest::binary>>, size) when digit in ?0..?9, do: digits(rest, size + 1)
-  defp digits(_text, size), do: size
 end

@@ -25,18 +25,13 @@ defmodule InfluxElixir.Client.Local.SQLDistinctOn do
   @doc """
   The engine's 405 for a `DISTINCT ON` with an aggregate in the select list or
   a `GROUP BY`, answered before the select list is read (verified). A
-  `DATE_BIN` in `ORDER BY` is neither. `select_list` reads the select list out
-  of the masked text.
+  `DATE_BIN` in `ORDER BY` is neither. `columns` is the select list of `sql`.
   """
-  @spec check_grouping(binary() | nil, binary(), (binary() -> binary())) ::
-          :ok | {:error, map()}
-  def check_grouping(nil, _sql, _select_list), do: :ok
+  @spec check_grouping(binary() | nil, binary(), binary()) :: :ok | {:error, map()}
+  def check_grouping(nil, _sql, _columns), do: :ok
 
-  def check_grouping(_on, sql, select_list) do
-    masked = SQLMask.mask(sql)
-
-    if SQLSelect.aggregate_call?(select_list.(masked)) or
-         Regex.match?(~r/\bGROUP\s+BY\b/iu, masked) do
+  def check_grouping(_on, sql, columns) do
+    if SQLSelect.aggregate_call?(columns) or SQLMask.match?(~r/\bGROUP\s+BY\b/iu, sql) do
       {:error,
        SQLError.not_implemented(
          "DISTINCT ON expressions with GROUP BY, aggregation or window functions are not supported "

@@ -82,7 +82,7 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
     if String.valid?(rest) do
       found =
         ~r/(?i)(?<![\w.])(LIMIT|OFFSET)\s+(\S+)/u
-        |> Regex.scan(rest, return: :index)
+        |> Regex.scan(SQLMask.mask(rest), return: :index)
         |> Enum.map(fn [{start, _len}, keyword, token] ->
           {start,
            {rest |> SQLMask.cut(keyword) |> String.upcase(), token(SQLMask.cut(rest, token))}}
@@ -141,7 +141,7 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
   defp trailing_garbage?([], _rest), do: false
 
   defp trailing_garbage?([{start, _clause} | _more], rest) do
-    tail = binary_part(rest, start, byte_size(rest) - start)
+    tail = rest |> SQLMask.mask() |> binary_part(start, byte_size(rest) - start)
     not Regex.match?(~r/(?i)^(?:(?:LIMIT|OFFSET)\s+\S+\s*)+$/u, tail)
   end
 
@@ -239,7 +239,7 @@ defmodule InfluxElixir.Client.Local.SQLLimit do
 
   @spec count(Regex.t(), binary()) :: clause()
   defp count(pattern, rest) do
-    case Regex.run(pattern, SQLMask.mask(rest)) do
+    case SQLMask.run(pattern, rest) do
       [_full_match, n_str] -> String.to_integer(n_str)
       [_full_match, "", name] -> {:param, name}
       _no_match -> nil

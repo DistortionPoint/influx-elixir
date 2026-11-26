@@ -419,14 +419,7 @@ defmodule InfluxElixir.Client.Local.SQLDmlOperand do
   defp nullable(_other, _ctx), do: :unknown
 
   @spec any_nullable([SQLDmlExpr.ast()], ctx()) :: boolean() | {:fail, check()} | :unknown
-  defp any_nullable(operands, ctx) do
-    Enum.reduce_while(operands, false, fn operand, false ->
-      case nullable(operand, ctx) do
-        false -> {:cont, false}
-        decided -> {:halt, decided}
-      end
-    end)
-  end
+  defp any_nullable(operands, ctx), do: Enum.find_value(operands, false, &nullable(&1, ctx))
 
   @spec indexed_field(binary() | nil) :: map()
   defp indexed_field(type) do

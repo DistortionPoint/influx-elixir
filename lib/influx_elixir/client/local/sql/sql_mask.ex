@@ -98,6 +98,10 @@ defmodule InfluxElixir.Client.Local.SQLMask do
   @spec filler(config(), non_neg_integer()) :: binary()
   defp filler(%{blank: blank}, width), do: String.duplicate(<<blank>>, width)
 
+  @doc "Whether `pattern` matches the masked `text` (and `text` is valid UTF-8)."
+  @spec match?(Regex.t(), binary()) :: boolean()
+  def match?(pattern, text), do: String.valid?(text) and Regex.match?(pattern, mask(text))
+
   @doc """
   `Regex.run/2` over the masked text, with the captures cut from `text` (an
   unmatched optional group is `""`); `nil` when the pattern does not match.
@@ -109,6 +113,13 @@ defmodule InfluxElixir.Client.Local.SQLMask do
       indexes -> Enum.map(indexes, &cut(text, &1))
     end
   end
+
+  @doc """
+  Masks `sql` and blanks every `FROM` that is not a clause's (`EXTRACT(minute
+  FROM time)`, `IS [NOT] DISTINCT FROM`).
+  """
+  @spec hidden_from(binary()) :: binary()
+  def hidden_from(sql), do: sql |> mask() |> hide_inner_from()
 
   @doc """
   A masked text with the `FROM` that is not a clause's blanked: one inside

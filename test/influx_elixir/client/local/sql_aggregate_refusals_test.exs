@@ -23,7 +23,7 @@ defmodule InfluxElixir.Client.Local.SqlAggregateRefusalsTest do
   # double's own limit.
   describe "query_sql/3 — SELECT DISTINCT ON" do
     test "an expression in ON is refused by name, not answered wrongly", %{conn: conn} do
-      {:ok, :written} = Local.write(conn, "m v=1i 1", database: "test_db")
+      {:ok, :written} = Local.write(conn, ~S|m a\ b=1i,v=1i 1|, database: "test_db")
 
       sql =
         "SELECT DISTINCT ON (date_bin(INTERVAL '2 seconds', time)) v FROM m " <>
@@ -46,7 +46,25 @@ defmodule InfluxElixir.Client.Local.SqlAggregateRefusalsTest do
                  Local.query_sql(conn, literal_sql, database: "test_db")
 
         assert {:error, %{status: 400, body: ^literal_refusal}} = Local.check_sql(literal_sql)
+
+        distinct_sql = "SELECT DISTINCT #{literal} FROM m"
+
+        distinct_refusal =
+          "Client.Local: unsupported DISTINCT query: select distinct #{literal} from m"
+
+        assert {:error, %{status: 400, body: ^distinct_refusal}} =
+                 Local.query_sql(conn, distinct_sql, database: "test_db")
+
+        assert {:error, %{status: 400, body: ^distinct_refusal}} = Local.check_sql(distinct_sql)
       end
+
+      selector_sql = ~s|SELECT selector_first(1, "a b") FROM m|
+
+      selector_refusal =
+        ~s|Client.Local: a selector over a constant instead of a column is not modelled: selector_first(1, "a b")|
+
+      assert {:error, %{status: 400, body: ^selector_refusal}} =
+               Local.query_sql(conn, selector_sql, database: "test_db")
     end
   end
 

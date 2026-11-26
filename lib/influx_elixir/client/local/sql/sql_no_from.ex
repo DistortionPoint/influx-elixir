@@ -17,7 +17,7 @@ defmodule InfluxElixir.Client.Local.SQLNoFrom do
   """
   @spec add_table(binary()) :: binary()
   def add_table(sql) do
-    masked = sql |> SQLMask.mask() |> SQLMask.hide_inner_from()
+    masked = SQLMask.hidden_from(sql)
 
     if Regex.match?(~r/\A\s*SELECT\b/iu, masked) do
       case scan(masked, 0, 0, nil, nil) do

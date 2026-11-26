@@ -14,6 +14,7 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
   # host`: one row per bucket per host).
 
   alias InfluxElixir.Client.Local.{
+    SQLDmlOperand,
     SQLError,
     SQLExpr,
     SQLLimit,
@@ -447,11 +448,11 @@ defmodule InfluxElixir.Client.Local.SQLClauses do
     columns
     |> SQLMask.split_commas()
     |> Enum.flat_map(&date_bin_interval/1)
-    |> Enum.reduce_while(:ok, fn interval, :ok ->
+    |> SQLDmlOperand.check_all(fn interval ->
       case SQLTime.interval(interval) do
-        {:ok, ns} when ns == group_interval -> {:cont, :ok}
-        {:ok, _ns} -> {:halt, {:error, SQLError.refusal(@date_bin_mismatch <> columns)}}
-        {:error, _reason} = error -> {:halt, error}
+        {:ok, ^group_interval} -> :ok
+        {:ok, _ns} -> {:error, SQLError.refusal(@date_bin_mismatch <> columns)}
+        {:error, _reason} = error -> error
       end
     end)
   end

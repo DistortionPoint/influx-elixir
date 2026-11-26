@@ -32,12 +32,11 @@ defmodule InfluxElixir.Client.Local.SQLLiteral do
 
   @doc "Whether the text is one `'...'` literal, not two joined by an operator."
   @spec string?(binary()) :: boolean()
-  def string?(text), do: String.valid?(text) and Regex.match?(~r/\A'x*'\z/u, SQLMask.mask(text))
+  def string?(text), do: SQLMask.match?(~r/\A'x*'\z/u, text)
 
   @doc "Whether the text is one `\"...\"` identifier."
   @spec identifier?(binary()) :: boolean()
-  def identifier?(text),
-    do: String.valid?(text) and Regex.match?(~r/\A"x*"\z/u, SQLMask.mask(text))
+  def identifier?(text), do: SQLMask.match?(~r/\A"x*"\z/u, text)
 
   @doc "Whether the text is a single column or table token: a word or a quoted identifier."
   @spec name_token?(binary()) :: boolean()

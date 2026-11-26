@@ -26,7 +26,7 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
   """
   @spec split_cross_join(binary()) :: {binary(), {binary(), [binary()]} | nil}
   def split_cross_join(sql) do
-    case Regex.run(@cross_join_pattern, hidden_mask(sql), return: :index) do
+    case Regex.run(@cross_join_pattern, SQLMask.hidden_from(sql), return: :index) do
       [{start, length}, left, table | alias_name] ->
         name = sql |> SQLMask.cut(table) |> table_name()
         names = [name | Enum.map(alias_name, &SQLMask.cut(sql, &1))]
@@ -77,7 +77,7 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
         nil -> []
       end
 
-    case Regex.run(@from_alias_pattern, hidden_mask(sql), return: :index) do
+    case Regex.run(@from_alias_pattern, SQLMask.hidden_from(sql), return: :index) do
       [{start, length}, from_clause, _table, alias_name] ->
         # The alias (with its `AS`) is whatever follows the table in the match.
         {from_start, from_length} = from_clause
@@ -109,11 +109,6 @@ defmodule InfluxElixir.Client.Local.SQLQualifier do
   @spec table_qualifiers(binary(), binary()) :: [binary()]
   defp table_qualifiers("\"" <> _quoted, _table_text), do: []
   defp table_qualifiers(_raw, table_text), do: SQLTable.qualifiers(table_text)
-
-  # The text with its strings blanked and the `FROM` of a function and of
-  # `IS DISTINCT FROM` hidden: what is left is the `FROM` of the query.
-  @spec hidden_mask(binary()) :: binary()
-  defp hidden_mask(sql), do: sql |> SQLMask.mask() |> SQLMask.hide_inner_from()
 
   @doc "A table as the engine names it: a quoted one without its quotes, a doubled quote one quote."
   @spec table_name(binary()) :: binary()

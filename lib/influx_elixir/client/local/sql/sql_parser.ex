@@ -39,6 +39,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     SQLIdentifiers,
     SQLLexer,
     SQLLimit,
+    SQLLiteral,
     SQLMask,
     SQLNoFrom,
     SQLPredicate,
@@ -273,9 +274,8 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     # which a text cannot tell: no name is written for it.
     naming = if cross_join, do: nil, else: qualifier
 
-    with :ok <- check_clauses(normalised),
-         :ok <- SQLDistinctOn.check_grouping(on, normalised, &select_list/1),
-         {:ok, split} <- split_select(normalised),
+    with {:ok, split} <- check_clauses(normalised),
+         :ok <- SQLDistinctOn.check_grouping(on, normalised, split.columns),
          {:ok, split, normalised} <- resolve_references(split, normalised, naming, zones),
          {:ok, query} <- dispatch_select(split, normalised, naming),
          {:ok, query} <- SQLDistinctOn.apply(query, on) do
@@ -341,22 +341,13 @@ defmodule InfluxElixir.Client.Local.SQLParser do
     end
   end
 
-  # The select list of a masked statement, or nothing when it has none.
-  @spec select_list(binary()) :: binary()
-  defp select_list(masked) do
-    case split_select(masked) do
-      {:ok, %{columns: columns}} -> columns
-      {:error, _reason} -> ""
-    end
-  end
-
   @spec split_select(binary()) :: {:ok, split()} | {:error, term()}
   defp split_select(sql) do
-    masked = sql |> SQLMask.mask() |> SQLMask.hide_inner_from()
+    masked = SQLMask.hidden_from(sql)
 
     case Regex.named_captures(@select_pattern, masked, return: :index) do
       nil ->
-        unsupported(sql)
+        unsupported(SQLMask.mask(sql))
 
       indexes ->
         part = fn name -> SQLMask.cut(sql, Map.fetch!(indexes, name)) end
@@ -439,7 +430,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   end
 
   @spec having?(binary()) :: boolean()
-  defp having?(rest), do: rest |> SQLMask.mask() |> then(&Regex.match?(~r/(?i)\bHAVING\b/u, &1))
+  defp having?(rest), do: SQLMask.match?(~r/(?i)\bHAVING\b/u, rest)
 
   # `SELECT DISTINCT a, b FROM t GROUP BY ... HAVING ...`: the groups the `HAVING` keeps
   # (with its checks), then the distinct rows of them, then `ORDER BY` and `LIMIT`. A
@@ -447,18 +438,18 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @spec parse_distinct_having(split(), binary(), binary() | nil) ::
           {:ok, parsed_query()} | {:error, term()}
   defp parse_distinct_having(%{columns: columns, rest: rest} = split, sql, qualifier) do
-    plain? = Regex.match?(~r/^[\p{L}_]\w*(\s*,\s*[\p{L}_]\w*)*$/u, columns)
+    plain = plain_distinct_columns(columns)
 
     cond do
       columns == "" ->
         {:error, SQLError.refusal("unsupported DISTINCT query: #{sql}")}
 
-      not plain? and SQLClauses.order_by(rest) != [] ->
+      plain == nil and SQLClauses.order_by(rest) != [] ->
         {:error, SQLError.refusal("unsupported DISTINCT query: #{sql}")}
 
       true ->
         with {:ok, query} <- parse_aggregate_select(split, sql, qualifier, :allowed) do
-          {_order_by, error} = parse_distinct_order_by(split_columns(columns), split.table, rest)
+          {_order_by, error} = parse_distinct_order_by(plain || [], split.table, rest)
           {:ok, %{query | distinct_rows: true, plan_error: error || query.plan_error}}
         end
     end
@@ -474,16 +465,19 @@ defmodule InfluxElixir.Client.Local.SQLParser do
   @unsupported_construct ~r/(?i)\b(JOIN|UNION|EXCEPT|INTERSECT)\b|\b(OVER)\s*\(|\b(ROLLUP|CUBE)\s*\(|\b(GROUPING)\s+SETS\b|\bFROM\s*\(\s*(VALUES)\b/u
   @clause_keywords ~w(WHERE GROUP HAVING ORDER LIMIT OFFSET)
 
-  @spec check_clauses(binary()) :: :ok | {:error, term()}
+  @spec check_clauses(binary()) :: {:ok, split()} | {:error, term()}
   defp check_clauses(sql) do
     scannable = SQLMask.mask(sql)
 
     with :ok <- check_constructs(scannable, sql),
          :ok <- check_single_select(scannable, sql),
-         {:ok, %{rest: rest}} <- split_select(scannable),
+         {:ok, %{rest: rest} = split} <- split_select(sql),
          :ok <- SQLLimit.check(rest, sql) do
       [next] = Regex.run(~r/^\w*/u, rest)
-      if next == "" or String.upcase(next) in @clause_keywords, do: :ok, else: unsupported(sql)
+
+      if next == "" or String.upcase(next) in @clause_keywords,
+        do: {:ok, split},
+        else: unsupported(sql)
     end
   end
 
@@ -594,16 +588,21 @@ defmodule InfluxElixir.Client.Local.SQLParser do
       columns == "" ->
         build_distinct_query([], table, rest, qualifier)
 
-      Regex.match?(~r/^[\p{L}_]\w*(\s*,\s*[\p{L}_]\w*)*$/u, columns) ->
-        build_distinct_query(split_columns(columns), table, rest, qualifier)
+      names = plain_distinct_columns(columns) ->
+        build_distinct_query(names, table, rest, qualifier)
 
       true ->
         {:error, SQLError.refusal("unsupported DISTINCT query: #{sql}")}
     end
   end
 
-  @spec split_columns(binary()) :: [binary()]
-  defp split_columns(columns), do: columns |> String.split(",") |> Enum.map(&String.trim/1)
+  @spec plain_distinct_columns(binary()) :: [binary()] | nil
+  defp plain_distinct_columns(columns) do
+    items = columns |> SQLMask.split_commas() |> Enum.map(&String.trim/1)
+
+    if items != [""] and Enum.all?(items, &SQLLiteral.column_token?/1),
+      do: Enum.map(items, &SQLLiteral.unquoted/1)
+  end
 
   # DataFusion: "For SELECT DISTINCT, ORDER BY expressions <table>.<column>
   # must appear in select list" (verified). Several missing columns are
@@ -763,7 +762,7 @@ defmodule InfluxElixir.Client.Local.SQLParser do
          true <-
            String.length(opens |> String.replace(~r/\s/, "")) ==
              String.length(String.replace(closes, ~r/\s/, "")),
-         nil <- SQLSelect.constant(name) do
+         true <- SQLLiteral.column_token?(name) do
       SQLSelect.name(name)
     else
       _not_a_column -> nil

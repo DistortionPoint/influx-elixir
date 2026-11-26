@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`Client.Local.SQLLimit` scanned unmasked query tails for `LIMIT` and `OFFSET` tokens, `Client.Local.SQLParser` rejected double-quoted column names (`"a b"`, `"order"`, `"a""b"`) while accepting unquoted `true`, `false`, and `null` literals as column names in `SELECT DISTINCT`, and `Client.Local.SQLSelect.selector_error/1` missed selector calls with a constant first argument and a quoted second argument (`SELECT selector_first(1, "v")`).**
+  `SQLLimit.scan/1` and `SQLLimit.trailing_garbage?/2` now mask `rest` with `SQLMask.mask/1` before scanning so string literals containing `'limit -1 '` or `'limit foo '` in `WHERE` are not mistaken for `LIMIT` clauses, `SQLParser.parse_distinct_select/3` and `SQLParser.parse_distinct_having/3` now validate and unquote plain column lists via `SQLMask.split_commas/1`, `SQLLiteral.column_token?/1`, and `SQLLiteral.unquoted/1`, `SQLSelect.aggregate_call?/1` now masks quoted text via `SQLMask.match?/2`, and `SQLSelect.selector_error/1` matches `@name` for both arguments and cuts matched spans from the unmasked select list via `SQLMask.cut/2`.
+
+### Changed
+- **Consolidated duplicate helpers across `Client.QueryParams` and `Client.Local` (`LineProtocolNumber`, `SQLClauses`, `SQLDistinctOn`, `SQLDmlOperand`, `SQLLimit`, `SQLLiteral`, `SQLMask`, `SQLNoFrom`, `SQLParser`, `SQLPredicate`, `SQLQualifier`, and `SQLSelect`).**
+  Added `SQLMask.match?/2` and `SQLMask.hidden_from/1` for reuse across `SQLDistinctOn`, `SQLLiteral`, `SQLNoFrom`, `SQLParser`, `SQLPredicate`, `SQLQualifier`, and `SQLSelect` (removing `SQLQualifier.hidden_mask/1` and `SQLPredicate.single_literal?/1`), returned the parsed `split()` directly from `SQLParser.check_clauses/1` and passed `split.columns` to `SQLDistinctOn.check_grouping/3` (avoiding duplicate `split_select/1` passes and removing `SQLParser.select_list/1`), reused `SQLLiteral.column_token?/1` in `SQLParser.plain_column/1`, reused `SQLMask.run/2` in `SQLLimit.count/2`, reused `SQLDmlOperand.check_all/2` in `SQLClauses.check_date_bins/2`, simplified `SQLDmlOperand.any_nullable/2` with `Enum.find_value/3`, and reused `LineProtocolNumber.digit_count/2` in `QueryParams.take_digits/1` (removing `QueryParams.digits/2`).
+
 ## [0.1.73] - 2026-11-25
 
 ### Fixed
