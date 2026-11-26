@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.74] - 2026-11-26
+
 ### Fixed
 - **`Client.Local.SQLLimit` scanned unmasked query tails for `LIMIT` and `OFFSET` tokens, `Client.Local.SQLParser` rejected double-quoted column names (`"a b"`, `"order"`, `"a""b"`) while accepting unquoted `true`, `false`, and `null` literals as column names in `SELECT DISTINCT`, `Client.Local.SQLSelect.selector_error/1` missed selector calls with a constant first argument and a quoted second argument (`SELECT selector_first(1, "a b")`), and `Client.Local.SQLFold`, `Client.Local.SQLCoerce`, and `Client.Local.SQLTyping.check_cte_outputs/1` missed aggregate expressions (`{:expression, expr, aggs, output}`) and `HAVING` clauses.**
   `SQLLimit.scan/1` and `SQLLimit.trailing_garbage?/2` now mask `rest` with `SQLMask.mask/1` before scanning so string literals containing `'limit -1 '` or `'limit foo '` in `WHERE` are not mistaken for `LIMIT` clauses, `SQLParser.parse_distinct_select/3` and `SQLParser.parse_distinct_having/3` now validate and unquote plain column lists via `SQLMask.split_commas/1`, `SQLLiteral.column_token?/1`, and `SQLLiteral.unquoted/1`, `SQLSelect.aggregate_call?/1` now masks quoted text via `SQLMask.match?/2`, `SQLSelect.selector_error/1` matches `@name` for both arguments and cuts matched spans from the unmasked select list via `SQLMask.cut/2`, and `SQLSelect.select_exprs/1` and `SQLSelect.having_exprs/1` now include expressions and inner aggregate arguments from `{:expression, expr, aggs, output}` columns and `HAVING` clauses across `SQLFold`, `SQLCoerce`, and `SQLTyping.check_cte_outputs/1`.
