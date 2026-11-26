@@ -135,10 +135,9 @@ defmodule InfluxElixir.Client.Local.SQLTyping do
   """
   @spec check_cte_outputs(SQLParser.parsed_query()) :: :ok | {:error, SQLError.t()}
   def check_cte_outputs(%{} = query) do
-    projected = SQLSelect.projected_exprs(query)
-    aggregated = for {:aggregate, _agg, expr, _output} <- query.select_columns || [], do: expr
+    exprs = SQLSelect.projected_exprs(query) ++ SQLSelect.select_exprs(query)
 
-    if Enum.any?(projected ++ aggregated, &narrow_cast?/1),
+    if Enum.any?(exprs, &narrow_cast?/1),
       do:
         {:error,
          SQLError.refusal(

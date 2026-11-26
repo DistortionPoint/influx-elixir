@@ -23,7 +23,8 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
     SQLLimits,
     SQLLiteral,
     SQLMask,
-    SQLTime
+    SQLTime,
+    SQLWhere
   }
 
   @typedoc "Plain aggregates; `:stddev`/`:var` are the sample forms, as in InfluxDB."
@@ -351,6 +352,27 @@ defmodule InfluxElixir.Client.Local.SQLSelect do
   def projected_exprs(query) do
     for {expr, _output} <- query.projection_columns || [], is_tuple(expr), do: expr
   end
+
+  @doc "The expressions in the query's aggregate select list (`query.select_columns`)."
+  @spec select_exprs(map()) :: [SQLExpr.t()]
+  def select_exprs(query), do: Enum.flat_map(query.select_columns || [], &column_exprs/1)
+
+  @doc "The expressions in the query's `HAVING` clause (`query.having`)."
+  @spec having_exprs(map()) :: [SQLExpr.t()]
+  def having_exprs(%{having: %{nodes: nodes, aggs: aggs}}) do
+    Enum.flat_map(aggs, fn {_name, column} -> column_exprs(column) end) ++
+      SQLWhere.conjunction_exprs(nodes)
+  end
+
+  def having_exprs(_query), do: []
+
+  @spec column_exprs(tuple()) :: [SQLExpr.t()]
+  defp column_exprs({:aggregate, _agg, expr, _output}), do: [expr]
+
+  defp column_exprs({:expression, expr, aggs, _output}),
+    do: Enum.flat_map(aggs, fn {_name, column} -> column_exprs(column) end) ++ [expr]
+
+  defp column_exprs(_column), do: []
 
   @doc "The expressions in the query's `ORDER BY` clause."
   @spec ordered_exprs(map()) :: [SQLExpr.t()]

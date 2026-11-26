@@ -76,7 +76,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLSql do
     regex = if regex == ".*", do: "(?:.*)", else: regex
 
     operator = if op == "=~", do: "~", else: "!~"
-    "#{ident_sql(name)} #{operator} '#{String.replace(regex, "'", "''")}'"
+    "#{ident_sql(name)} #{operator} #{SQLLiteral.quote_text(regex)}"
   end
 
   # The engine's optimizer folds `!~ /.*/` on a string field into `= ''`

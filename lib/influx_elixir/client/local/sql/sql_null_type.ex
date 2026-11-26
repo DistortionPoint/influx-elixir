@@ -74,13 +74,5 @@ defmodule InfluxElixir.Client.Local.SQLNullType do
 
   # A null that reads no column (`NULL - time` is null too, but is a duration itself).
   @spec constant_null?(SQLExpr.t()) :: boolean()
-  defp constant_null?(expr), do: not reads_column?(expr) and null_valued?(expr)
-
-  # Whether an expression reads a column (so that this module need not call the module of the
-  # expressions, which calls the functions that call this one).
-  @spec reads_column?(term()) :: boolean()
-  defp reads_column?({kind, _name}) when kind in [:field, :uint_col], do: true
-  defp reads_column?(term) when is_tuple(term), do: term |> Tuple.to_list() |> reads_column?()
-  defp reads_column?(terms) when is_list(terms), do: Enum.any?(terms, &reads_column?/1)
-  defp reads_column?(_other), do: false
+  defp constant_null?(expr), do: SQLExpr.constant?(expr) and null_valued?(expr)
 end

@@ -425,9 +425,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   # planning error found in it is the error of the whole.
   defp classify_inner(ast) do
     case classify(ast) do
-      {:ok, classified} -> {:ok, classified}
-      {:planning, _message} = planning -> planning
-      {:argument, _n, _a} = argument -> argument
+      result when is_tuple(result) and elem(result, 0) in [:ok, :planning, :argument] -> result
       _other -> :error
     end
   end
@@ -607,19 +605,10 @@ defmodule InfluxElixir.Client.Local.InfluxQLExpr do
   defp function(name, arguments) do
     classified = Enum.map(arguments, &classify_inner/1)
 
-    cond do
-      Enum.all?(classified, &match?({:ok, _ast}, &1)) ->
-        {:ok, {:fn, name, for({:ok, ast} <- classified, do: ast)}}
-
-      planning = Enum.find(classified, &match?({:planning, _message}, &1)) ->
-        planning
-
-      argument = Enum.find(classified, &match?({:argument, _name, _argument}, &1)) ->
-        argument
-
-      true ->
-        :error
-    end
+    if Enum.all?(classified, &match?({:ok, _ast}, &1)),
+      do: {:ok, {:fn, name, for({:ok, ast} <- classified, do: ast)}},
+      else:
+        Enum.find(classified, :error, &(is_tuple(&1) and elem(&1, 0) in [:planning, :argument]))
   end
 
   defp transform(name, [argument | options]) do

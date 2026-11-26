@@ -26,19 +26,7 @@ defmodule InfluxElixir.Client.Local.LineProtocolEscape do
   # A string field's inner text with `\"` and `\\` undone, left to right.
   @spec unescape_string_field(binary()) :: binary()
   @doc false
-  def unescape_string_field(inner) do
-    if :binary.match(inner, "\\") == :nomatch,
-      do: inner,
-      else: do_unescape_string(inner, <<>>)
-  end
-
-  defp do_unescape_string(<<>>, acc), do: acc
-
-  defp do_unescape_string(<<?\\, c, rest::binary>>, acc) when c in [?\\, ?"],
-    do: do_unescape_string(rest, <<acc::binary, c>>)
-
-  defp do_unescape_string(<<c, rest::binary>>, acc),
-    do: do_unescape_string(rest, <<acc::binary, c>>)
+  def unescape_string_field(inner), do: unescape_v3(inner, [?"])
 
   # ---------------------------------------------------------------------------
   # Unescaping
@@ -56,26 +44,25 @@ defmodule InfluxElixir.Client.Local.LineProtocolEscape do
 
   @doc "Undoes line-protocol escaping in a measurement name (`\\ `, `\\,`, `\\\\`)."
   @spec unescape_measurement(binary()) :: binary()
-  def unescape_measurement(str) do
-    if :binary.match(str, "\\") == :nomatch,
-      do: str,
-      else: unescape_v3(str, [?\s, ?,], <<>>)
-  end
+  def unescape_measurement(str), do: unescape_v3(str, [?\s, ?,])
 
   # A tag key or value, or a field key, of InfluxDB 3.
   @spec unescape_tag(binary()) :: binary()
   @doc false
-  def unescape_tag(str) do
+  def unescape_tag(str), do: unescape_v3(str, [?\s, ?,, ?=])
+
+  @spec unescape_v3(binary(), [byte()]) :: binary()
+  defp unescape_v3(str, codes) do
     if :binary.match(str, "\\") == :nomatch,
       do: str,
-      else: unescape_v3(str, [?\s, ?,, ?=], <<>>)
+      else: unescape_v3(str, [?\\ | codes], <<>>)
   end
 
   @spec unescape_v3(binary(), [byte()], binary()) :: binary()
   defp unescape_v3(<<>>, _codes, acc), do: acc
 
   defp unescape_v3(<<?\\, c, rest::binary>>, codes, acc) do
-    if c == ?\\ or c in codes,
+    if c in codes,
       do: unescape_v3(rest, codes, <<acc::binary, c>>),
       else: unescape_v3(rest, codes, <<acc::binary, ?\\, c>>)
   end

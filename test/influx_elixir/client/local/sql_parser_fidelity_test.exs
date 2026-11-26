@@ -510,6 +510,34 @@ defmodule InfluxElixir.Client.Local.SQLParserFidelityTest do
                    database: "iq_db"
                  )
       end
+
+      for fold_sql <- [
+            "SELECT sum(i) + CAST('abc' AS INT) FROM m WHERE false",
+            "SELECT sum(CAST('abc' AS INT)) + 1 FROM m WHERE false",
+            "SELECT count(*) FROM m WHERE false GROUP BY host HAVING count(*) > CAST('abc' AS INT)"
+          ] do
+        assert {:error, %{status: 500, body: fold_err}} =
+                 Local.query_sql(conn, fold_sql, database: "iq_db")
+
+        assert fold_err =~ "Optimizer rule 'simplify_expressions' failed"
+        assert fold_err =~ "Cannot cast string 'abc' to value of Int32 type"
+      end
+
+      assert {:ok, [%{"s" => 3.0}]} =
+               Local.query_sql(
+                 conn,
+                 "SELECT sum(CASE WHEN i > 0 THEN 1 ELSE 2.5 END) + 1.0 AS s FROM m",
+                 database: "iq_db"
+               )
+
+      assert {:error, %{status: 400, body: cte_cast_err}} =
+               Local.query_sql(
+                 conn,
+                 "WITH t AS (SELECT CAST(sum(i) AS INT) AS x FROM m) SELECT x FROM t",
+                 database: "iq_db"
+               )
+
+      assert cte_cast_err =~ "a CTE that casts to INT, SMALLINT or TINYINT"
     end
   end
 end

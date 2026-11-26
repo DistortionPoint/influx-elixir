@@ -289,11 +289,9 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
       last = last || Enum.map(cells, fn _cell -> :null end)
 
       filled =
-        cells
-        |> Enum.zip(last)
-        |> Enum.map(fn
-          {:null, previous} -> previous
-          {cell, _previous} -> cell
+        Enum.zip_with(cells, last, fn
+          :null, previous -> previous
+          cell, _previous -> cell
         end)
 
       {[{index, {present?, filled}}], filled}
@@ -374,7 +372,7 @@ defmodule InfluxElixir.Client.Local.InfluxQLBuckets do
   defp bounded_scan(rows), do: rows
 
   @spec transpose([[term()]]) :: [[term()]]
-  defp transpose(rows), do: rows |> Enum.zip() |> Enum.map(&Tuple.to_list/1)
+  defp transpose(rows), do: Enum.zip_with(rows, &Function.identity/1)
 
   @doc """
   Returns the nanosecond timestamp of a row map's `"time"` `DateTime`.

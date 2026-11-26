@@ -146,10 +146,10 @@ defmodule InfluxElixir.Client.Local.SQLFold do
   # Every expression a query holds, in the order written.
   @spec expressions(SQLParser.parsed_query()) :: [SQLExpr.t()]
   defp expressions(query) do
-    aggregated =
-      for {:aggregate, _agg, expr, _output} <- query.select_columns || [], do: expr
-
     SQLSelect.projected_exprs(query) ++
-      aggregated ++ SQLWhere.conjunction_exprs(query.where) ++ SQLSelect.ordered_exprs(query)
+      SQLSelect.select_exprs(query) ++
+      SQLWhere.conjunction_exprs(query.where) ++
+      SQLSelect.having_exprs(query) ++
+      SQLSelect.ordered_exprs(query)
   end
 end

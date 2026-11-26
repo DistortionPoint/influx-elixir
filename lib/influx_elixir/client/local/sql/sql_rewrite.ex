@@ -16,7 +16,7 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   #     to create the table, which `into?/1` says
   #   * a word of the grammar after `AS` (`AS having`) is a name: it is written quoted
 
-  alias InfluxElixir.Client.Local.{InfluxQLLex, SQLIdentifiers, SQLLiteral}
+  alias InfluxElixir.Client.Local.{InfluxQLLex, SQLDmlName, SQLIdentifiers, SQLLiteral}
 
   @typep token :: {:space | :word | :quoted | :backtick | :string | :symbol | :other, binary()}
 
@@ -130,10 +130,14 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   @spec double_quoted(binary()) :: binary()
   defp double_quoted(text) do
     text
-    |> binary_part(1, byte_size(text) - 2)
+    |> SQLDmlName.unquote_token()
     |> String.replace("``", "`")
     |> SQLLiteral.quote_identifier()
   end
+
+  @spec word_is?(token() | nil, binary()) :: boolean()
+  defp word_is?({:word, word}, expected), do: String.upcase(word) == expected
+  defp word_is?(_token, _expected), do: false
 
   # ---------------------------------------------------------------------------
   # INTO
@@ -161,7 +165,7 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
 
   defp split_into([token | rest], before, previous) do
     cond do
-      into_word?(token) and (item_end?(previous) or previous == {:symbol, ","}) ->
+      word_is?(token, "INTO") and (item_end?(previous) or previous == {:symbol, ","}) ->
         {Enum.reverse(before), rest}
 
       space?(token) ->
@@ -171,10 +175,6 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
         split_into(rest, [token | before], following(token, previous))
     end
   end
-
-  @spec into_word?(token()) :: boolean()
-  defp into_word?({:word, word}), do: String.upcase(word) == "INTO"
-  defp into_word?(_token), do: false
 
   # What the next token is read after: a `*` is the wildcard of an item where no expression
   # ends before it (that wildcard ends the item), and a multiplication otherwise.
@@ -198,9 +198,7 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
   @spec select_list?([token()]) :: boolean()
   defp select_list?(tokens) do
     significant = Enum.reject(tokens, &space?/1)
-
-    match?([{:word, _} | _], significant) and
-      String.upcase(elem(hd(significant), 1)) == "SELECT" and open_list?(significant)
+    word_is?(List.first(significant), "SELECT") and open_list?(significant)
   end
 
   @spec open_list?([token()]) :: boolean()
@@ -209,19 +207,12 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
       Enum.reduce(significant, {0, false}, fn
         {:symbol, "("}, {depth, from?} -> {depth + 1, from?}
         {:symbol, ")"}, {depth, from?} -> {depth - 1, from?}
-        {:word, word}, {0, _from?} = state -> if from?(word), do: {0, true}, else: state
+        token, {0, _from?} = state -> if word_is?(token, "FROM"), do: {0, true}, else: state
         _other, state -> state
       end)
 
-    depth == 0 and not from? and not as?(List.last(significant))
+    depth == 0 and not from? and not word_is?(List.last(significant), "AS")
   end
-
-  @spec from?(binary()) :: boolean()
-  defp from?(word), do: String.upcase(word) == "FROM"
-
-  @spec as?(token()) :: boolean()
-  defp as?({:word, word}), do: String.upcase(word) == "AS"
-  defp as?(_token), do: false
 
   # The target's tokens: `[TEMP[ORARY]] [UNLOGGED] [TABLE] name[.name]*`.
   @spec drop_target([token()]) :: [token()]
@@ -454,12 +445,8 @@ defmodule InfluxElixir.Client.Local.SQLRewrite do
 
   # The `FROM` of `IS [NOT] DISTINCT FROM` starts no list.
   @spec distinct_before?([token()]) :: boolean()
-  defp distinct_before?(acc) do
-    case Enum.drop_while(acc, &space?/1) do
-      [{:word, word} | _before] -> String.upcase(word) == "DISTINCT"
-      _other -> false
-    end
-  end
+  defp distinct_before?(acc),
+    do: acc |> Enum.drop_while(&space?/1) |> List.first() |> word_is?("DISTINCT")
 
   # `( name )` after `FROM`, `JOIN` or a comma, in any depth of parentheses, written `name`.
   @spec unparenthesized([token()]) :: [token()]

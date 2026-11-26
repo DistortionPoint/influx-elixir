@@ -51,10 +51,11 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
 
   @spec expressions(SQLParser.parsed_query()) :: [SQLExpr.t()]
   defp expressions(query) do
-    aggregated = Enum.flat_map(query.select_columns || [], &aggregate_expressions/1)
-
     SQLSelect.projected_exprs(query) ++
-      aggregated ++ SQLSelect.ordered_exprs(query) ++ SQLWhere.conjunction_exprs(query.where)
+      SQLSelect.select_exprs(query) ++
+      SQLSelect.ordered_exprs(query) ++
+      SQLWhere.conjunction_exprs(query.where) ++
+      SQLSelect.having_exprs(query)
   end
 
   @spec coerce_filter(term(), %{binary() => binary()}) :: term()
@@ -68,10 +69,17 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
 
   defp coerce_filter(other, _types), do: other
 
-  @spec aggregate_expressions(SQLParser.select_column()) :: [SQLExpr.t()]
-  defp aggregate_expressions({:aggregate, _agg, expr, _output}), do: [expr]
-  defp aggregate_expressions({:expression, expr, _aggs, _output}), do: [expr]
-  defp aggregate_expressions(_column), do: []
+  @spec coerce_column(SQLParser.select_column(), %{binary() => binary()}) ::
+          SQLParser.select_column()
+  defp coerce_column({:aggregate, agg, expr, output}, types),
+    do: {:aggregate, agg, coerce(expr, types), output}
+
+  defp coerce_column({:expression, expr, aggs, output}, types) do
+    aggs = Enum.map(aggs, fn {name, col} -> {name, coerce_column(col, types)} end)
+    {:expression, coerce(expr, types), aggs, output}
+  end
+
+  defp coerce_column(column, _types), do: column
 
   @spec coerce_query(SQLParser.parsed_query(), %{binary() => binary()}) ::
           SQLParser.parsed_query()
@@ -85,17 +93,18 @@ defmodule InfluxElixir.Client.Local.SQLCoerce do
               {expr, output} -> {coerce(expr, types), output}
             end),
         select_columns:
-          query.select_columns &&
-            Enum.map(query.select_columns, fn
-              {:aggregate, agg, expr, output} ->
-                {:aggregate, agg, coerce(expr, types), output}
-
-              {:expression, expr, aggs, output} ->
-                {:expression, coerce(expr, types), aggs, output}
-
-              column ->
-                column
-            end),
+          query.select_columns && Enum.map(query.select_columns, &coerce_column(&1, types)),
+        having:
+          query.having &&
+            %{
+              query.having
+              | nodes: coerce_filter(query.having.nodes, types),
+                tree: coerce_filter(query.having.tree, types),
+                aggs:
+                  Enum.map(query.having.aggs, fn {name, col} ->
+                    {name, coerce_column(col, types)}
+                  end)
+            },
         order_by:
           Enum.map(query.order_by, fn
             {{:expr, expr}, direction} -> {{:expr, coerce(expr, types)}, direction}
